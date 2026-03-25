@@ -24,7 +24,7 @@
 
 LocalStack recently moved its core services behind a paid plan. If you relied on LocalStack Community for local development and CI/CD pipelines, MiniStack is your free alternative.
 
-- **20 AWS services** emulated on a single port (4566)
+- **21 AWS services** emulated on a single port (4566)
 - **Drop-in compatible** — works with `boto3`, AWS CLI, Terraform, CDK, Pulumi, any SDK
 - **Real infrastructure** — RDS spins up actual Postgres/MySQL containers, ElastiCache spins up real Redis, Athena runs real SQL via DuckDB, ECS runs real Docker containers
 - **Tiny footprint** — ~150MB image, ~30MB RAM at idle vs LocalStack's ~1GB image and ~500MB RAM
@@ -167,36 +167,37 @@ sfn.create_state_machine(
 
 | Service | Operations | Notes |
 |---------|-----------|-------|
-| **S3** | CreateBucket, DeleteBucket, ListBuckets, HeadBucket, PutObject, GetObject, DeleteObject, HeadObject, CopyObject, ListObjects v1/v2, DeleteObjects | Optional disk persistence via `S3_PERSIST=1` |
-| **SQS** | CreateQueue, DeleteQueue, ListQueues, GetQueueUrl, GetQueueAttributes, SetQueueAttributes, PurgeQueue, SendMessage, ReceiveMessage, DeleteMessage, ChangeMessageVisibility, SendMessageBatch, DeleteMessageBatch | Both Query API and JSON protocol |
-| **SNS** | CreateTopic, DeleteTopic, ListTopics, GetTopicAttributes, SetTopicAttributes, Subscribe, Unsubscribe, ListSubscriptions, ListSubscriptionsByTopic, Publish | |
-| **DynamoDB** | CreateTable, DeleteTable, DescribeTable, ListTables, PutItem, GetItem, DeleteItem, UpdateItem, Query, Scan, BatchWriteItem, BatchGetItem | |
-| **Lambda** | CreateFunction, DeleteFunction, GetFunction, ListFunctions, Invoke, UpdateFunctionCode, UpdateFunctionConfiguration | Python runtimes actually execute; others return mock |
-| **IAM** | CreateUser, GetUser, ListUsers, DeleteUser, CreateRole, GetRole, ListRoles, DeleteRole, CreatePolicy, AttachRolePolicy, PutRolePolicy, CreateAccessKey, ListAccessKeys | |
+| **S3** | CreateBucket, DeleteBucket, ListBuckets, HeadBucket, PutObject, GetObject, DeleteObject, HeadObject, CopyObject, ListObjects v1/v2, DeleteObjects, GetBucketVersioning, PutBucketVersioning, GetBucketEncryption, PutBucketEncryption, DeleteBucketEncryption, GetBucketLifecycleConfiguration, PutBucketLifecycleConfiguration, DeleteBucketLifecycle, GetBucketCors, PutBucketCors, DeleteBucketCors, GetBucketAcl, PutBucketAcl, GetBucketTagging, PutBucketTagging, DeleteBucketTagging, GetBucketPolicy, PutBucketPolicy, DeleteBucketPolicy, GetBucketNotificationConfiguration, PutBucketNotificationConfiguration, GetBucketLogging, PutBucketLogging, ListObjectVersions, CreateMultipartUpload, UploadPart, CompleteMultipartUpload, AbortMultipartUpload | Optional disk persistence via `S3_PERSIST=1` |
+| **SQS** | CreateQueue, DeleteQueue, ListQueues, GetQueueUrl, GetQueueAttributes, SetQueueAttributes, PurgeQueue, SendMessage, ReceiveMessage, DeleteMessage, ChangeMessageVisibility, ChangeMessageVisibilityBatch, SendMessageBatch, DeleteMessageBatch, TagQueue, UntagQueue, ListQueueTags | Both Query API and JSON protocol; FIFO queues with deduplication; DLQ support |
+| **SNS** | CreateTopic, DeleteTopic, ListTopics, GetTopicAttributes, SetTopicAttributes, Subscribe, Unsubscribe, ListSubscriptions, ListSubscriptionsByTopic, GetSubscriptionAttributes, SetSubscriptionAttributes, ConfirmSubscription, Publish, PublishBatch, TagResource, UntagResource, ListTagsForResource, CreatePlatformApplication, CreatePlatformEndpoint | SNS→SQS fanout delivery; SNS→Lambda fanout (synchronous invocation) |
+| **DynamoDB** | CreateTable, UpdateTable, DeleteTable, DescribeTable, ListTables, PutItem, GetItem, DeleteItem, UpdateItem, Query, Scan, BatchWriteItem, BatchGetItem, TransactWriteItems, TransactGetItems, DescribeTimeToLive, UpdateTimeToLive, DescribeContinuousBackups, UpdateContinuousBackups, DescribeEndpoints, TagResource, UntagResource, ListTagsOfResource | TTL enforced via background reaper (60s cadence) |
+| **Lambda** | CreateFunction, DeleteFunction, GetFunction, ListFunctions, Invoke, UpdateFunctionCode, UpdateFunctionConfiguration, AddPermission, RemovePermission, ListVersionsByFunction, PublishVersion, TagResource, UntagResource, ListTags, CreateEventSourceMapping, DeleteEventSourceMapping, GetEventSourceMapping, ListEventSourceMappings, UpdateEventSourceMapping, CreateFunctionUrlConfig, GetFunctionUrlConfig, UpdateFunctionUrlConfig, DeleteFunctionUrlConfig, ListFunctionUrlConfigs | Python runtimes actually execute with warm worker pool; SQS event source mapping; Function URL CRUD |
+| **IAM** | CreateUser, GetUser, ListUsers, DeleteUser, CreateRole, GetRole, ListRoles, DeleteRole, CreatePolicy, GetPolicy, DeletePolicy, AttachRolePolicy, DetachRolePolicy, PutRolePolicy, GetRolePolicy, DeleteRolePolicy, ListRolePolicies, ListAttachedRolePolicies, CreateAccessKey, ListAccessKeys, DeleteAccessKey, CreateInstanceProfile, GetInstanceProfile, DeleteInstanceProfile, AddRoleToInstanceProfile, RemoveRoleFromInstanceProfile, ListInstanceProfiles, CreateGroup, GetGroup, AddUserToGroup, RemoveUserFromGroup, CreateServiceLinkedRole, CreateOpenIDConnectProvider, TagRole, UntagRole, TagUser, UntagUser, TagPolicy, UntagPolicy | |
 | **STS** | GetCallerIdentity, AssumeRole, GetSessionToken | |
-| **SecretsManager** | CreateSecret, GetSecretValue, ListSecrets, DeleteSecret, UpdateSecret, DescribeSecret, PutSecretValue | |
-| **CloudWatch Logs** | CreateLogGroup, DeleteLogGroup, DescribeLogGroups, CreateLogStream, DeleteLogStream, DescribeLogStreams, PutLogEvents, GetLogEvents, FilterLogEvents | |
+| **SecretsManager** | CreateSecret, GetSecretValue, ListSecrets, DeleteSecret, UpdateSecret, DescribeSecret, PutSecretValue, RestoreSecret, RotateSecret, GetRandomPassword, ListSecretVersionIds, TagResource, UntagResource, PutResourcePolicy, GetResourcePolicy, DeleteResourcePolicy, ValidateResourcePolicy | |
+| **CloudWatch Logs** | CreateLogGroup, DeleteLogGroup, DescribeLogGroups, CreateLogStream, DeleteLogStream, DescribeLogStreams, PutLogEvents, GetLogEvents, FilterLogEvents, PutRetentionPolicy, DeleteRetentionPolicy, PutSubscriptionFilter, DeleteSubscriptionFilter, DescribeSubscriptionFilters, PutMetricFilter, DeleteMetricFilter, DescribeMetricFilters, TagLogGroup, UntagLogGroup, ListTagsLogGroup, TagResource, UntagResource, ListTagsForResource, StartQuery, GetQueryResults, StopQuery, PutDestination, DeleteDestination, DescribeDestinations | |
 
 ### Extended Services
 
 | Service | Operations | Notes |
 |---------|-----------|-------|
-| **SSM Parameter Store** | PutParameter, GetParameter, GetParameters, GetParametersByPath, DeleteParameter, DeleteParameters, DescribeParameters | Supports String, SecureString, StringList |
-| **EventBridge** | CreateEventBus, DeleteEventBus, ListEventBuses, PutRule, DeleteRule, ListRules, DescribeRule, EnableRule, DisableRule, PutTargets, RemoveTargets, ListTargetsByRule, PutEvents | |
-| **Kinesis** | CreateStream, DeleteStream, DescribeStream, ListStreams, ListShards, PutRecord, PutRecords, GetShardIterator, GetRecords | Partition key → shard routing |
-| **CloudWatch Metrics** | PutMetricData, GetMetricStatistics, ListMetrics, PutMetricAlarm, DescribeAlarms, DeleteAlarms, SetAlarmState | |
-| **SES** | SendEmail, SendRawEmail, VerifyEmailIdentity, ListIdentities, GetIdentityVerificationAttributes, DeleteIdentity, GetSendQuota, GetSendStatistics | Emails stored in-memory, not sent |
-| **Step Functions** | CreateStateMachine, DeleteStateMachine, DescribeStateMachine, UpdateStateMachine, ListStateMachines, StartExecution, StopExecution, DescribeExecution, ListExecutions, GetExecutionHistory | |
+| **SSM Parameter Store** | PutParameter, GetParameter, GetParameters, GetParametersByPath, DeleteParameter, DeleteParameters, DescribeParameters, GetParameterHistory, LabelParameterVersion, AddTagsToResource, RemoveTagsFromResource, ListTagsForResource | Supports String, SecureString, StringList |
+| **EventBridge** | CreateEventBus, DeleteEventBus, ListEventBuses, PutRule, DeleteRule, ListRules, DescribeRule, EnableRule, DisableRule, PutTargets, RemoveTargets, ListTargetsByRule, PutEvents, TagResource, UntagResource, ListTagsForResource, CreateArchive, DeleteArchive, DescribeArchive, ListArchives, PutPermission, RemovePermission, CreateConnection, DescribeConnection, DeleteConnection, ListConnections, CreateApiDestination, DescribeApiDestination, DeleteApiDestination, ListApiDestinations | Lambda target dispatch on PutEvents |
+| **Kinesis** | CreateStream, DeleteStream, DescribeStream, ListStreams, ListShards, PutRecord, PutRecords, GetShardIterator, GetRecords, MergeShards, SplitShard, UpdateShardCount, StartStreamEncryption, StopStreamEncryption, EnableEnhancedMonitoring, DisableEnhancedMonitoring, RegisterStreamConsumer, DeregisterStreamConsumer, ListStreamConsumers, DescribeStreamConsumer, AddTagsToStream, RemoveTagsFromStream, ListTagsForStream | Partition key → shard routing |
+| **CloudWatch Metrics** | PutMetricData, GetMetricStatistics, GetMetricData, ListMetrics, PutMetricAlarm, PutCompositeAlarm, DescribeAlarms, DescribeAlarmsForMetric, DescribeAlarmHistory, DeleteAlarms, SetAlarmState, EnableAlarmActions, DisableAlarmActions, TagResource, UntagResource, ListTagsForResource, PutDashboard, GetDashboard, DeleteDashboards, ListDashboards | CBOR and JSON protocol |
+| **SES** | SendEmail, SendRawEmail, SendTemplatedEmail, SendBulkTemplatedEmail, VerifyEmailIdentity, VerifyEmailAddress, VerifyDomainIdentity, VerifyDomainDkim, ListIdentities, GetIdentityVerificationAttributes, GetIdentityDkimAttributes, DeleteIdentity, GetSendQuota, GetSendStatistics, CreateConfigurationSet, DeleteConfigurationSet, DescribeConfigurationSet, ListConfigurationSets, CreateTemplate, GetTemplate, UpdateTemplate, DeleteTemplate, ListTemplates | Emails stored in-memory, not sent |
+| **Step Functions** | CreateStateMachine, DeleteStateMachine, DescribeStateMachine, UpdateStateMachine, ListStateMachines, StartExecution, StartSyncExecution, StopExecution, DescribeExecution, DescribeStateMachineForExecution, ListExecutions, GetExecutionHistory, SendTaskSuccess, SendTaskFailure, SendTaskHeartbeat, TagResource, UntagResource, ListTagsForResource | Full ASL interpreter; Retry/Catch; waitForTaskToken; Pass/Task/Choice/Wait/Succeed/Fail/Map/Parallel |
+| **API Gateway v2** | CreateApi, GetApi, GetApis, UpdateApi, DeleteApi, CreateRoute, GetRoute, GetRoutes, UpdateRoute, DeleteRoute, CreateIntegration, GetIntegration, GetIntegrations, UpdateIntegration, DeleteIntegration, CreateStage, GetStage, GetStages, UpdateStage, DeleteStage, CreateDeployment, GetDeployment, GetDeployments, DeleteDeployment, CreateAuthorizer, GetAuthorizer, GetAuthorizers, UpdateAuthorizer, DeleteAuthorizer, TagResource, UntagResource, GetTags | HTTP API (v2) protocol; Lambda proxy (AWS_PROXY) and HTTP proxy (HTTP_PROXY) integrations; data plane via `{apiId}.execute-api.localhost`; `{param}` and `{proxy+}` path matching; JWT/Lambda authorizer CRUD |
 
 ### Infrastructure Services (with real Docker execution)
 
 | Service | Operations | Real Execution |
 |---------|-----------|----------------|
-| **ECS** | CreateCluster, DeleteCluster, DescribeClusters, ListClusters, RegisterTaskDefinition, DeregisterTaskDefinition, ListTaskDefinitions, CreateService, DeleteService, DescribeServices, UpdateService, ListServices, RunTask, StopTask, DescribeTasks, ListTasks | `RunTask` starts real Docker containers via Docker socket |
-| **RDS** | CreateDBInstance, DeleteDBInstance, DescribeDBInstances, StartDBInstance, StopDBInstance, RebootDBInstance, ModifyDBInstance, CreateDBCluster, DeleteDBCluster, DescribeDBClusters, CreateDBSubnetGroup, DescribeDBSubnetGroups, CreateDBParameterGroup, DescribeDBParameterGroups, DescribeDBEngineVersions | `CreateDBInstance` spins up real Postgres/MySQL Docker container, returns actual `host:port` endpoint |
-| **ElastiCache** | CreateCacheCluster, DeleteCacheCluster, DescribeCacheClusters, ModifyCacheCluster, CreateReplicationGroup, DeleteReplicationGroup, DescribeReplicationGroups, CreateCacheSubnetGroup, DescribeCacheSubnetGroups, CreateCacheParameterGroup, DescribeCacheParameterGroups, DescribeCacheEngineVersions | `CreateCacheCluster` spins up real Redis/Memcached Docker container |
-| **Glue** | CreateDatabase, DeleteDatabase, GetDatabase, GetDatabases, CreateTable, DeleteTable, GetTable, GetTables, UpdateTable, BatchDeleteTable, CreatePartition, GetPartitions, BatchCreatePartition, CreateConnection, GetConnections, CreateCrawler, GetCrawler, StartCrawler, CreateJob, GetJob, GetJobs, StartJobRun, GetJobRun, GetJobRuns | Python shell jobs actually execute via subprocess |
-| **Athena** | StartQueryExecution, GetQueryExecution, GetQueryResults, StopQueryExecution, ListQueryExecutions, CreateWorkGroup, DeleteWorkGroup, GetWorkGroup, ListWorkGroups, CreateNamedQuery, DeleteNamedQuery, GetNamedQuery, ListNamedQueries | Real SQL via **DuckDB** when installed (`pip install duckdb`), otherwise returns mock results |
+| **ECS** | CreateCluster, UpdateCluster, DeleteCluster, DescribeClusters, ListClusters, RegisterTaskDefinition, DeregisterTaskDefinition, DescribeTaskDefinition, ListTaskDefinitions, CreateService, DeleteService, DescribeServices, UpdateService, ListServices, RunTask, StopTask, DescribeTasks, ListTasks, CreateCapacityProvider, DeleteCapacityProvider, DescribeCapacityProviders, PutClusterCapacityProviders, TagResource, UntagResource, ListTagsForResource | `RunTask` starts real Docker containers via Docker socket |
+| **RDS** | CreateDBInstance, DeleteDBInstance, DescribeDBInstances, StartDBInstance, StopDBInstance, RebootDBInstance, ModifyDBInstance, CreateDBCluster, DeleteDBCluster, DescribeDBClusters, StartDBCluster, StopDBCluster, CreateDBSubnetGroup, DescribeDBSubnetGroups, ModifyDBSubnetGroup, DeleteDBSubnetGroup, CreateDBParameterGroup, DescribeDBParameterGroups, ModifyDBParameterGroup, DeleteDBParameterGroup, DescribeDBParameters, CreateDBClusterParameterGroup, DescribeDBEngineVersions, DescribeOrderableDBInstanceOptions, CreateDBSnapshot, DeleteDBSnapshot, DescribeDBSnapshots, CreateDBClusterSnapshot, DeleteDBClusterSnapshot, DescribeDBClusterSnapshots, CreateDBInstanceReadReplica, RestoreDBInstanceFromDBSnapshot, CreateOptionGroup, DescribeOptionGroups, AddTagsToResource, RemoveTagsFromResource, ListTagsForResource | `CreateDBInstance` spins up real Postgres/MySQL Docker container, returns actual `host:port` endpoint |
+| **ElastiCache** | CreateCacheCluster, DeleteCacheCluster, DescribeCacheClusters, ModifyCacheCluster, RebootCacheCluster, CreateReplicationGroup, DeleteReplicationGroup, DescribeReplicationGroups, ModifyReplicationGroup, IncreaseReplicaCount, DecreaseReplicaCount, CreateCacheSubnetGroup, DescribeCacheSubnetGroups, ModifyCacheSubnetGroup, DeleteCacheSubnetGroup, CreateCacheParameterGroup, DescribeCacheParameterGroups, ModifyCacheParameterGroup, ResetCacheParameterGroup, DeleteCacheParameterGroup, DescribeCacheParameters, DescribeCacheEngineVersions, CreateUser, DescribeUsers, DeleteUser, ModifyUser, CreateUserGroup, DescribeUserGroups, DeleteUserGroup, ModifyUserGroup, CreateSnapshot, DeleteSnapshot, DescribeSnapshots, DescribeEvents | `CreateCacheCluster` spins up real Redis/Memcached Docker container |
+| **Glue** | CreateDatabase, DeleteDatabase, GetDatabase, GetDatabases, CreateTable, DeleteTable, GetTable, GetTables, UpdateTable, BatchDeleteTable, CreatePartition, GetPartitions, BatchCreatePartition, BatchGetPartition, CreatePartitionIndex, GetPartitionIndexes, CreateConnection, GetConnections, CreateCrawler, UpdateCrawler, GetCrawler, GetCrawlerMetrics, StartCrawler, CreateJob, GetJob, GetJobs, StartJobRun, GetJobRun, GetJobRuns, CreateTrigger, GetTrigger, DeleteTrigger, UpdateTrigger, StartTrigger, StopTrigger, ListTriggers, GetTriggers, CreateWorkflow, GetWorkflow, DeleteWorkflow, UpdateWorkflow, StartWorkflowRun, CreateSecurityConfiguration, GetSecurityConfiguration, GetSecurityConfigurations, DeleteSecurityConfiguration, CreateClassifier, GetClassifier, GetClassifiers, DeleteClassifier, TagResource, UntagResource, GetTags | Python shell jobs actually execute via subprocess |
+| **Athena** | StartQueryExecution, GetQueryExecution, GetQueryResults, StopQueryExecution, ListQueryExecutions, BatchGetQueryExecution, CreateWorkGroup, DeleteWorkGroup, GetWorkGroup, ListWorkGroups, UpdateWorkGroup, CreateNamedQuery, DeleteNamedQuery, GetNamedQuery, ListNamedQueries, BatchGetNamedQuery, CreateDataCatalog, GetDataCatalog, ListDataCatalogs, DeleteDataCatalog, UpdateDataCatalog, CreatePreparedStatement, GetPreparedStatement, DeletePreparedStatement, ListPreparedStatements, GetTableMetadata, ListTableMetadata, TagResource, UntagResource, ListTagsForResource | Real SQL via **DuckDB** when installed (`pip install duckdb`), otherwise returns mock results; result pagination; column type metadata |
 
 ---
 
@@ -337,6 +338,26 @@ ecs.stop_task(cluster="dev", task=task_arn)
 | `REDIS_PORT` | `6379` | Redis port for ElastiCache fallback |
 | `RDS_BASE_PORT` | `15432` | Starting host port for RDS containers |
 | `ELASTICACHE_BASE_PORT` | `16379` | Starting host port for ElastiCache containers |
+| `PERSIST_STATE` | `0` | Set `1` to persist service state across restarts |
+| `STATE_DIR` | `/tmp/ministack-state` | Directory for persisted state files |
+
+### State Persistence
+
+When `PERSIST_STATE=1`, MiniStack saves service state to `STATE_DIR` on shutdown and reloads it on startup. Writes are atomic (write-to-tmp then rename) to prevent corruption on crash.
+
+Services currently supporting persistence: **API Gateway**
+
+```bash
+docker run -p 4566:4566 \
+  -e PERSIST_STATE=1 \
+  -e STATE_DIR=/data/ministack-state \
+  -v /tmp/ministack-data:/data \
+  nahuelnucera/ministack
+```
+
+### Lambda Warm Starts
+
+MiniStack keeps Python Lambda functions warm between invocations. After the first call (cold start), the handler module stays imported in a persistent subprocess. Subsequent calls skip the import step, matching real AWS warm-start behaviour and making test suites significantly faster.
 
 ---
 
@@ -363,7 +384,7 @@ ecs.stop_task(cluster="dev", task=task_arn)
                     │  │  SSM  EventBridge  Kinesis        │    │
                     │  │  CloudWatch  SES  StepFunctions  │    │
                     │  │  ECS   RDS   ElastiCache          │    │
-                    │  │  Glue  Athena                     │    │
+                    │  │  Glue  Athena  API Gateway        │    │
                     │  └──────────────────────────────────┘    │
                     │                                          │
                     │  In-Memory Storage + Optional Docker     │
@@ -386,20 +407,19 @@ pip install boto3 pytest duckdb docker cbor2
 # Start MiniStack
 docker compose up -d
 
-# Run the full test suite (56 tests across all 20 services)
+# Run the full test suite (377 tests across all 21 services)
 pytest tests/ -v
 ```
 
 Expected output:
 ```
-collected 54 items
+collected 377 items
 
 tests/test_services.py::test_s3_create_bucket PASSED
-tests/test_services.py::test_s3_put_get PASSED
 ...
-tests/test_services.py::test_athena_workgroup PASSED
+tests/test_services.py::test_lambda_function_url_config PASSED
 
-56 passed in 7.6s
+377 passed in ~12s
 ```
 
 ---
@@ -438,6 +458,7 @@ provider "aws" {
     logs           = "http://localhost:4566"
     events         = "http://localhost:4566"
     ses            = "http://localhost:4566"
+    apigateway     = "http://localhost:4566"
   }
 }
 ```
@@ -482,7 +503,7 @@ config:
 | **ECS (real Docker containers)** | ✅ | ❌ | ✅ |
 | **Athena (real SQL via DuckDB)** | ✅ | ❌ | ✅ |
 | **Glue Data Catalog + Jobs** | ✅ | ❌ | ✅ |
-| API Gateway | ❌ | ✅ | ✅ |
+| **API Gateway v2 (HTTP API)** | ✅ | ✅ | ✅ |
 | Cognito | ❌ | ✅ | ✅ |
 | CloudFormation | ❌ | partial | ✅ |
 | Cost | **Free** | Was free, now paid | $35+/mo |

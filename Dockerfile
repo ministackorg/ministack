@@ -3,16 +3,12 @@ FROM python:3.12-alpine
 LABEL maintainer="MiniStack" \
       description="Local AWS Service Emulator — drop-in LocalStack replacement"
 
-# Upgrade all base packages to pick up latest security patches,
-# then install nothing extra — curl/unzip removed to eliminate CVEs.
-# Upgrade base packages and remove busybox wget (CVE-2025-60876 - HTTP header injection)
-# wget is not used in this image; removing it eliminates the attack surface entirely.
+# Upgrade base packages to pick up latest security patches.
 RUN apk upgrade --no-cache && rm -f /usr/bin/wget /bin/wget
 
 WORKDIR /opt/ministack
 
-# Upgrade pip to latest to clear pip CVEs, then install app deps.
-# httptools/duckdb require C compilation on musl — excluded intentionally.
+# Install all Python dependencies.
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir \
         uvicorn==0.30.6 \
@@ -23,10 +19,10 @@ COPY core/ core/
 COPY services/ services/
 COPY app.py .
 
-RUN mkdir -p /tmp/localstack-data/s3
-
-# Run as non-root
 RUN addgroup -S ministack && adduser -S ministack -G ministack
+RUN mkdir -p /tmp/localstack-data/s3 && chown -R ministack:ministack /tmp/localstack-data
+RUN mkdir -p /docker-entrypoint-initaws.d && chown ministack:ministack /docker-entrypoint-initaws.d
+VOLUME /docker-entrypoint-initaws.d
 USER ministack
 
 ENV GATEWAY_PORT=4566 \
@@ -37,6 +33,7 @@ ENV GATEWAY_PORT=4566 \
     REDIS_PORT=6379 \
     RDS_BASE_PORT=15432 \
     ELASTICACHE_BASE_PORT=16379 \
+    LAMBDA_EXECUTOR=local \
     PYTHONUNBUFFERED=1
 
 EXPOSE 4566
