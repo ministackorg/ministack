@@ -81,6 +81,20 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
 
+def now_rfc7231() -> str:
+    """Current time in RFC 7231 format for HTTP headers (e.g. Last-Modified)."""
+    return datetime.now(timezone.utc).strftime("%a, %d %b %Y %H:%M:%S GMT")
+
+
+def iso_to_rfc7231(iso_str: str) -> str:
+    """Convert an ISO 8601 timestamp to RFC 7231 format."""
+    try:
+        dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
+        return dt.strftime("%a, %d %b %Y %H:%M:%S GMT")
+    except (ValueError, AttributeError):
+        return iso_str
+
+
 def now_epoch() -> float:
     return datetime.now(timezone.utc).timestamp()
 

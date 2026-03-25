@@ -3,7 +3,13 @@ Kinesis Data Streams Emulator.
 JSON-based API via X-Amz-Target (Kinesis_20131202).
 Supports: CreateStream, DeleteStream, DescribeStream, DescribeStreamSummary,
           ListStreams, PutRecord, PutRecords, GetShardIterator, GetRecords,
-          MergeShards, SplitShard, ListShards.
+          MergeShards, SplitShard, UpdateShardCount, ListShards,
+          IncreaseStreamRetentionPeriod, DecreaseStreamRetentionPeriod,
+          AddTagsToStream, RemoveTagsFromStream, ListTagsForStream,
+          RegisterStreamConsumer, DeregisterStreamConsumer, ListStreamConsumers,
+          DescribeStreamConsumer,
+          StartStreamEncryption, StopStreamEncryption,
+          EnableEnhancedMonitoring, DisableEnhancedMonitoring.
 """
 
 import json
@@ -11,6 +17,7 @@ import time
 import base64
 import hashlib
 import logging
+import threading
 
 from core.responses import json_response, error_response_json, new_uuid
 
@@ -18,10 +25,99 @@ logger = logging.getLogger("kinesis")
 
 ACCOUNT_ID = "000000000000"
 REGION = "us-east-1"
+MAX_HASH_KEY = (2**128) - 1
+ITERATOR_EXPIRY_SECONDS = 300
 
-_streams: dict = {}  # stream_name -> {arn, shards: {shard_id: {records: [...]}}, status, retention}
-_shard_iterators: dict = {}  # iterator_token -> {stream, shard_id, position}
+_streams: dict = {}
+_shard_iterators: dict = {}
+_consumers: dict = {}
+_sequence_counter = 0
+_sequence_lock = threading.Lock()
 
+
+def _next_sequence_number():
+    global _sequence_counter
+    with _sequence_lock:
+        _sequence_counter += 1
+        ts_millis = int(time.time() * 1000)
+        return f"{ts_millis:020d}{_sequence_counter:010d}"
+
+
+def _compute_hash_ranges(shard_count):
+    range_size = (MAX_HASH_KEY + 1) // shard_count
+    ranges = []
+    for i in range(shard_count):
+        start = i * range_size
+        end = ((i + 1) * range_size - 1) if i < shard_count - 1 else MAX_HASH_KEY
+        ranges.append((str(start), str(end)))
+    return ranges
+
+
+def _build_shards(shard_count, start_index=0):
+    ranges = _compute_hash_ranges(shard_count)
+    shards = {}
+    for i in range(shard_count):
+        sid = f"shardId-{start_index + i:012d}"
+        shards[sid] = {
+            "records": [],
+            "starting_hash_key": ranges[i][0],
+            "ending_hash_key": ranges[i][1],
+            "starting_sequence_number": _next_sequence_number(),
+            "parent_shard_id": None,
+            "adjacent_parent_shard_id": None,
+        }
+    return shards
+
+
+def _partition_key_to_hash(partition_key: str) -> int:
+    return int(hashlib.md5(partition_key.encode("utf-8")).hexdigest(), 16)
+
+
+def _route_to_shard(hash_key_int: int, stream: dict) -> str:
+    for sid, shard in stream["shards"].items():
+        if int(shard["starting_hash_key"]) <= hash_key_int <= int(shard["ending_hash_key"]):
+            return sid
+    return next(iter(stream["shards"]))
+
+
+def _expire_records(stream):
+    cutoff = time.time() - stream["RetentionPeriodHours"] * 3600
+    for shard in stream["shards"].values():
+        shard["records"] = [r for r in shard["records"] if r["ApproximateArrivalTimestamp"] >= cutoff]
+
+
+def _expire_iterators():
+    now = time.time()
+    expired = [tok for tok, st in _shard_iterators.items()
+               if now - st["created_at"] > ITERATOR_EXPIRY_SECONDS]
+    for tok in expired:
+        del _shard_iterators[tok]
+
+
+def _ensure_active(stream):
+    if stream["StreamStatus"] == "CREATING":
+        stream["StreamStatus"] = "ACTIVE"
+
+
+def _resolve_stream(data):
+    name = data.get("StreamName")
+    arn = data.get("StreamARN")
+    if name and name in _streams:
+        return name, _streams[name]
+    if arn:
+        for n, s in _streams.items():
+            if s["StreamARN"] == arn:
+                return n, s
+    return name or arn, None
+
+
+def _max_shard_index(stream):
+    return max((int(sid.split("-")[1]) for sid in stream["shards"]), default=-1)
+
+
+# ---------------------------------------------------------------------------
+# Request dispatcher
+# ---------------------------------------------------------------------------
 
 async def handle_request(method, path, headers, body, query_params):
     target = headers.get("x-amz-target", "")
@@ -31,6 +127,8 @@ async def handle_request(method, path, headers, body, query_params):
         data = json.loads(body) if body else {}
     except json.JSONDecodeError:
         return error_response_json("SerializationException", "Invalid JSON", 400)
+
+    _expire_iterators()
 
     handlers = {
         "CreateStream": _create_stream,
@@ -46,7 +144,19 @@ async def handle_request(method, path, headers, body, query_params):
         "IncreaseStreamRetentionPeriod": _increase_retention,
         "DecreaseStreamRetentionPeriod": _decrease_retention,
         "AddTagsToStream": _add_tags,
+        "RemoveTagsFromStream": _remove_tags,
         "ListTagsForStream": _list_tags,
+        "MergeShards": _merge_shards,
+        "SplitShard": _split_shard,
+        "UpdateShardCount": _update_shard_count,
+        "RegisterStreamConsumer": _register_consumer,
+        "DeregisterStreamConsumer": _deregister_consumer,
+        "ListStreamConsumers": _list_consumers,
+        "DescribeStreamConsumer": _describe_stream_consumer,
+        "StartStreamEncryption": _start_stream_encryption,
+        "StopStreamEncryption": _stop_stream_encryption,
+        "EnableEnhancedMonitoring": _enable_enhanced_monitoring,
+        "DisableEnhancedMonitoring": _disable_enhanced_monitoring,
     }
 
     handler = handlers.get(action)
@@ -55,6 +165,10 @@ async def handle_request(method, path, headers, body, query_params):
     return handler(data)
 
 
+# ---------------------------------------------------------------------------
+# Stream lifecycle
+# ---------------------------------------------------------------------------
+
 def _create_stream(data):
     name = data.get("StreamName")
     shard_count = data.get("ShardCount", 1)
@@ -62,240 +176,689 @@ def _create_stream(data):
         return error_response_json("ValidationException", "StreamName is required", 400)
     if name in _streams:
         return error_response_json("ResourceInUseException", f"Stream {name} already exists", 400)
+    if shard_count < 1:
+        return error_response_json("ValidationException", "ShardCount must be at least 1", 400)
 
     arn = f"arn:aws:kinesis:{REGION}:{ACCOUNT_ID}:stream/{name}"
-    shards = {}
-    for i in range(shard_count):
-        shard_id = f"shardId-{i:012d}"
-        shards[shard_id] = {
-            "records": [],
-            "sequence_counter": 0,
-            "tags": {},
-        }
-
+    mode = data.get("StreamModeDetails", {}).get("StreamMode", "PROVISIONED")
     _streams[name] = {
         "StreamName": name,
         "StreamARN": arn,
         "StreamStatus": "ACTIVE",
+        "StreamModeDetails": {"StreamMode": mode},
         "RetentionPeriodHours": 24,
-        "shards": shards,
+        "shards": _build_shards(shard_count),
         "tags": {},
         "CreationTimestamp": time.time(),
+        "EncryptionType": "NONE",
     }
     return json_response({})
 
 
 def _delete_stream(data):
-    name = data.get("StreamName")
-    if name not in _streams:
+    name, stream = _resolve_stream(data)
+    if not stream:
         return error_response_json("ResourceNotFoundException", f"Stream {name} not found", 400)
+    stream["StreamStatus"] = "DELETING"
+    for tok in [t for t, s in _shard_iterators.items() if s["stream"] == name]:
+        del _shard_iterators[tok]
+    for carn in [a for a, c in _consumers.items() if c["StreamARN"] == stream["StreamARN"]]:
+        del _consumers[carn]
     del _streams[name]
     return json_response({})
 
 
+# ---------------------------------------------------------------------------
+# Describe / List
+# ---------------------------------------------------------------------------
+
 def _describe_stream(data):
-    name = data.get("StreamName")
-    stream = _streams.get(name)
+    name, stream = _resolve_stream(data)
     if not stream:
         return error_response_json("ResourceNotFoundException", f"Stream {name} not found", 400)
-    return json_response({"StreamDescription": _stream_desc(stream)})
+    _ensure_active(stream)
+    _expire_records(stream)
+
+    limit = data.get("Limit", 100)
+    exclusive_start = data.get("ExclusiveStartShardId")
+    shard_ids = sorted(stream["shards"].keys())
+    if exclusive_start:
+        shard_ids = [s for s in shard_ids if s > exclusive_start]
+    page = shard_ids[:limit]
+    has_more = len(shard_ids) > limit
+
+    desc = _stream_desc(stream, page)
+    desc["HasMoreShards"] = has_more
+    return json_response({"StreamDescription": desc})
 
 
 def _describe_stream_summary(data):
-    name = data.get("StreamName")
-    stream = _streams.get(name)
+    name, stream = _resolve_stream(data)
     if not stream:
         return error_response_json("ResourceNotFoundException", f"Stream {name} not found", 400)
-    desc = _stream_desc(stream)
-    desc.pop("Shards", None)
-    return json_response({"StreamDescriptionSummary": {**desc, "OpenShardCount": len(stream["shards"])}})
+    _ensure_active(stream)
+    consumer_count = sum(1 for c in _consumers.values() if c["StreamARN"] == stream["StreamARN"])
+    return json_response({"StreamDescriptionSummary": {
+        "StreamName": stream["StreamName"],
+        "StreamARN": stream["StreamARN"],
+        "StreamStatus": stream["StreamStatus"],
+        "StreamModeDetails": stream.get("StreamModeDetails", {"StreamMode": "PROVISIONED"}),
+        "RetentionPeriodHours": stream["RetentionPeriodHours"],
+        "StreamCreationTimestamp": stream["CreationTimestamp"],
+        "EnhancedMonitoring": [{"ShardLevelMetrics": []}],
+        "EncryptionType": stream.get("EncryptionType", "NONE"),
+        "OpenShardCount": len(stream["shards"]),
+        "ConsumerCount": consumer_count,
+    }})
 
 
 def _list_streams(data):
-    names = list(_streams.keys())
-    return json_response({"StreamNames": names, "HasMoreStreams": False})
+    limit = data.get("Limit", 100)
+    exclusive_start = data.get("ExclusiveStartStreamName")
+    names = sorted(_streams.keys())
+    if exclusive_start:
+        names = [n for n in names if n > exclusive_start]
+    page = names[:limit]
+    has_more = len(names) > limit
+    summaries = []
+    for n in page:
+        s = _streams[n]
+        summaries.append({
+            "StreamName": n,
+            "StreamARN": s["StreamARN"],
+            "StreamStatus": s["StreamStatus"],
+            "StreamModeDetails": s.get("StreamModeDetails", {"StreamMode": "PROVISIONED"}),
+            "StreamCreationTimestamp": s["CreationTimestamp"],
+        })
+    return json_response({"StreamNames": page, "StreamSummaries": summaries, "HasMoreStreams": has_more})
 
 
 def _list_shards(data):
-    name = data.get("StreamName")
-    stream = _streams.get(name)
+    name, stream = _resolve_stream(data)
     if not stream:
         return error_response_json("ResourceNotFoundException", f"Stream {name} not found", 400)
-    shards = [_shard_out(sid, s) for sid, s in stream["shards"].items()]
-    return json_response({"Shards": shards})
+    _ensure_active(stream)
 
+    max_results = data.get("MaxResults", 10000)
+    next_token = data.get("NextToken")
+    exclusive_start = data.get("ExclusiveStartShardId")
+
+    shard_ids = sorted(stream["shards"].keys())
+    if exclusive_start:
+        shard_ids = [s for s in shard_ids if s > exclusive_start]
+    if next_token:
+        shard_ids = [s for s in shard_ids if s > next_token]
+
+    page = shard_ids[:max_results]
+    result = {"Shards": [_shard_out(sid, stream["shards"][sid]) for sid in page]}
+    if len(shard_ids) > max_results:
+        result["NextToken"] = page[-1]
+    return json_response(result)
+
+
+# ---------------------------------------------------------------------------
+# Put records
+# ---------------------------------------------------------------------------
 
 def _put_record(data):
-    name = data.get("StreamName")
-    stream = _streams.get(name)
+    name, stream = _resolve_stream(data)
     if not stream:
         return error_response_json("ResourceNotFoundException", f"Stream {name} not found", 400)
+    if stream["StreamStatus"] != "ACTIVE":
+        return error_response_json("ResourceInUseException", f"Stream {name} is {stream['StreamStatus']}", 400)
+
+    _expire_records(stream)
 
     partition_key = data.get("PartitionKey", "")
     record_data = data.get("Data", "")
+    explicit_hash = data.get("ExplicitHashKey")
+    if not partition_key:
+        return error_response_json("ValidationException", "PartitionKey is required", 400)
 
-    # Route to shard based on partition key hash
-    shard_id = _get_shard_for_key(partition_key, len(stream["shards"]))
-    shard = stream["shards"][shard_id]
-    shard["sequence_counter"] += 1
-    seq = f"{int(time.time() * 1000):020d}{shard['sequence_counter']:010d}"
+    hash_int = int(explicit_hash) if explicit_hash else _partition_key_to_hash(partition_key)
+    shard_id = _route_to_shard(hash_int, stream)
+    seq = _next_sequence_number()
 
-    shard["records"].append({
+    stream["shards"][shard_id]["records"].append({
         "SequenceNumber": seq,
         "ApproximateArrivalTimestamp": time.time(),
         "Data": record_data,
         "PartitionKey": partition_key,
     })
-
-    return json_response({"ShardId": shard_id, "SequenceNumber": seq})
+    return json_response({
+        "ShardId": shard_id,
+        "SequenceNumber": seq,
+        "EncryptionType": stream.get("EncryptionType", "NONE"),
+    })
 
 
 def _put_records(data):
-    name = data.get("StreamName")
-    stream = _streams.get(name)
+    name, stream = _resolve_stream(data)
     if not stream:
         return error_response_json("ResourceNotFoundException", f"Stream {name} not found", 400)
+    if stream["StreamStatus"] != "ACTIVE":
+        return error_response_json("ResourceInUseException", f"Stream {name} is {stream['StreamStatus']}", 400)
 
-    records = data.get("Records", [])
+    _expire_records(stream)
+
     results = []
-    failed = 0
-
-    for rec in records:
-        partition_key = rec.get("PartitionKey", "")
-        record_data = rec.get("Data", "")
-        shard_id = _get_shard_for_key(partition_key, len(stream["shards"]))
-        shard = stream["shards"][shard_id]
-        shard["sequence_counter"] += 1
-        seq = f"{int(time.time() * 1000):020d}{shard['sequence_counter']:010d}"
-        shard["records"].append({
+    for rec in data.get("Records", []):
+        pk = rec.get("PartitionKey", "")
+        rd = rec.get("Data", "")
+        eh = rec.get("ExplicitHashKey")
+        hash_int = int(eh) if eh else _partition_key_to_hash(pk)
+        sid = _route_to_shard(hash_int, stream)
+        seq = _next_sequence_number()
+        stream["shards"][sid]["records"].append({
             "SequenceNumber": seq,
             "ApproximateArrivalTimestamp": time.time(),
-            "Data": record_data,
-            "PartitionKey": partition_key,
+            "Data": rd,
+            "PartitionKey": pk,
         })
-        results.append({"SequenceNumber": seq, "ShardId": shard_id})
+        results.append({
+            "SequenceNumber": seq,
+            "ShardId": sid,
+            "EncryptionType": stream.get("EncryptionType", "NONE"),
+        })
+    return json_response({
+        "FailedRecordCount": 0,
+        "Records": results,
+        "EncryptionType": stream.get("EncryptionType", "NONE"),
+    })
 
-    return json_response({"FailedRecordCount": failed, "Records": results})
 
+# ---------------------------------------------------------------------------
+# Shard iterators / GetRecords
+# ---------------------------------------------------------------------------
 
 def _get_shard_iterator(data):
-    name = data.get("StreamName")
-    shard_id = data.get("ShardId")
-    iterator_type = data.get("ShardIteratorType", "LATEST")
-    seq = data.get("StartingSequenceNumber", "")
-
-    stream = _streams.get(name)
+    name, stream = _resolve_stream(data)
     if not stream:
         return error_response_json("ResourceNotFoundException", f"Stream {name} not found", 400)
+
+    shard_id = data.get("ShardId")
     if shard_id not in stream["shards"]:
         return error_response_json("ResourceNotFoundException", f"Shard {shard_id} not found", 400)
 
+    _expire_records(stream)
     shard = stream["shards"][shard_id]
-    if iterator_type == "TRIM_HORIZON":
-        position = 0
-    elif iterator_type == "LATEST":
-        position = len(shard["records"])
-    elif iterator_type in ("AT_SEQUENCE_NUMBER", "AFTER_SEQUENCE_NUMBER"):
-        records = shard["records"]
-        position = next((i for i, r in enumerate(records) if r["SequenceNumber"] >= seq), len(records))
-        if iterator_type == "AFTER_SEQUENCE_NUMBER":
-            position += 1
-    else:
-        position = len(shard["records"])
+    records = shard["records"]
+    it_type = data.get("ShardIteratorType", "LATEST")
+    seq = data.get("StartingSequenceNumber", "")
+    at_ts = data.get("Timestamp")
 
+    if it_type == "TRIM_HORIZON":
+        position = 0
+    elif it_type == "LATEST":
+        position = len(records)
+    elif it_type == "AT_SEQUENCE_NUMBER":
+        position = next((i for i, r in enumerate(records) if r["SequenceNumber"] >= seq), len(records))
+    elif it_type == "AFTER_SEQUENCE_NUMBER":
+        position = next((i for i, r in enumerate(records) if r["SequenceNumber"] > seq), len(records))
+    elif it_type == "AT_TIMESTAMP":
+        if at_ts is None:
+            return error_response_json("ValidationException", "Timestamp required for AT_TIMESTAMP", 400)
+        ts_val = float(at_ts)
+        position = next((i for i, r in enumerate(records) if r["ApproximateArrivalTimestamp"] >= ts_val), len(records))
+    else:
+        return error_response_json("ValidationException", f"Invalid ShardIteratorType: {it_type}", 400)
+
+    resolved_name = name if name else next((n for n, s in _streams.items() if s is stream), "")
     token = new_uuid()
-    _shard_iterators[token] = {"stream": name, "shard_id": shard_id, "position": position}
+    _shard_iterators[token] = {
+        "stream": resolved_name,
+        "shard_id": shard_id,
+        "position": position,
+        "created_at": time.time(),
+    }
     return json_response({"ShardIterator": token})
+
+
+def _ensure_base64(value):
+    """Return a base64-encoded string regardless of input format."""
+    if isinstance(value, bytes):
+        return base64.b64encode(value).decode("ascii")
+    if isinstance(value, str):
+        try:
+            base64.b64decode(value, validate=True)
+            return value
+        except Exception:
+            return base64.b64encode(value.encode("utf-8")).decode("ascii")
+    return base64.b64encode(str(value).encode("utf-8")).decode("ascii")
 
 
 def _get_records(data):
     iterator = data.get("ShardIterator")
-    limit = data.get("Limit", 10000)
+    limit = min(data.get("Limit", 10000), 10000)
 
-    state = _shard_iterators.get(iterator)
+    state = _shard_iterators.pop(iterator, None)
     if not state:
-        return error_response_json("ExpiredIteratorException", "Shard iterator has expired", 400)
+        return error_response_json("ExpiredIteratorException", "Iterator has expired or is invalid", 400)
+    if time.time() - state["created_at"] > ITERATOR_EXPIRY_SECONDS:
+        return error_response_json("ExpiredIteratorException", "Iterator has expired", 400)
 
     stream = _streams.get(state["stream"])
     if not stream:
         return error_response_json("ResourceNotFoundException", "Stream not found", 400)
 
+    _expire_records(stream)
     shard = stream["shards"].get(state["shard_id"])
     if not shard:
         return error_response_json("ResourceNotFoundException", "Shard not found", 400)
 
-    pos = state["position"]
-    records = shard["records"][pos:pos + limit]
-    new_pos = pos + len(records)
-    state["position"] = new_pos
+    pos = min(state["position"], len(shard["records"]))
+    raw = shard["records"][pos:pos + limit]
+    new_pos = pos + len(raw)
+
+    out_records = [{
+        "SequenceNumber": r["SequenceNumber"],
+        "ApproximateArrivalTimestamp": r["ApproximateArrivalTimestamp"],
+        "Data": _ensure_base64(r["Data"]),
+        "PartitionKey": r["PartitionKey"],
+        "EncryptionType": stream.get("EncryptionType", "NONE"),
+    } for r in raw]
+
+    millis_behind = 0
+    if shard["records"] and new_pos < len(shard["records"]):
+        millis_behind = max(0, int((time.time() - shard["records"][new_pos]["ApproximateArrivalTimestamp"]) * 1000))
 
     next_token = new_uuid()
-    _shard_iterators[next_token] = {"stream": state["stream"], "shard_id": state["shard_id"], "position": new_pos}
-
+    _shard_iterators[next_token] = {
+        "stream": state["stream"],
+        "shard_id": state["shard_id"],
+        "position": new_pos,
+        "created_at": time.time(),
+    }
     return json_response({
-        "Records": records,
+        "Records": out_records,
         "NextShardIterator": next_token,
-        "MillisBehindLatest": 0,
+        "MillisBehindLatest": millis_behind,
     })
 
 
+# ---------------------------------------------------------------------------
+# Retention period
+# ---------------------------------------------------------------------------
+
 def _increase_retention(data):
-    name = data.get("StreamName")
-    hours = data.get("RetentionPeriodHours", 24)
-    if name in _streams:
-        _streams[name]["RetentionPeriodHours"] = hours
+    name, stream = _resolve_stream(data)
+    if not stream:
+        return error_response_json("ResourceNotFoundException", f"Stream {name} not found", 400)
+    hours = data.get("RetentionPeriodHours")
+    if hours is None:
+        return error_response_json("ValidationException", "RetentionPeriodHours is required", 400)
+    hours = int(hours)
+    if hours <= stream["RetentionPeriodHours"]:
+        return error_response_json("ValidationException",
+                                   "RetentionPeriodHours must be greater than current value", 400)
+    if hours > 8760:
+        return error_response_json("ValidationException",
+                                   "RetentionPeriodHours cannot exceed 8760", 400)
+    stream["RetentionPeriodHours"] = hours
     return json_response({})
 
 
 def _decrease_retention(data):
-    name = data.get("StreamName")
-    hours = data.get("RetentionPeriodHours", 24)
-    if name in _streams:
-        _streams[name]["RetentionPeriodHours"] = hours
+    name, stream = _resolve_stream(data)
+    if not stream:
+        return error_response_json("ResourceNotFoundException", f"Stream {name} not found", 400)
+    hours = data.get("RetentionPeriodHours")
+    if hours is None:
+        return error_response_json("ValidationException", "RetentionPeriodHours is required", 400)
+    hours = int(hours)
+    if hours >= stream["RetentionPeriodHours"]:
+        return error_response_json("ValidationException",
+                                   "RetentionPeriodHours must be less than current value", 400)
+    if hours < 24:
+        return error_response_json("ValidationException",
+                                   "RetentionPeriodHours cannot be less than 24", 400)
+    stream["RetentionPeriodHours"] = hours
     return json_response({})
 
 
+# ---------------------------------------------------------------------------
+# Tags
+# ---------------------------------------------------------------------------
+
 def _add_tags(data):
-    name = data.get("StreamName")
-    tags = data.get("Tags", {})
-    if name in _streams:
-        _streams[name]["tags"].update(tags)
+    name, stream = _resolve_stream(data)
+    if not stream:
+        return error_response_json("ResourceNotFoundException", f"Stream {name} not found", 400)
+    stream["tags"].update(data.get("Tags", {}))
+    return json_response({})
+
+
+def _remove_tags(data):
+    name, stream = _resolve_stream(data)
+    if not stream:
+        return error_response_json("ResourceNotFoundException", f"Stream {name} not found", 400)
+    for key in data.get("TagKeys", []):
+        stream["tags"].pop(key, None)
     return json_response({})
 
 
 def _list_tags(data):
-    name = data.get("StreamName")
-    stream = _streams.get(name)
+    name, stream = _resolve_stream(data)
     if not stream:
         return error_response_json("ResourceNotFoundException", f"Stream {name} not found", 400)
-    tags = [{"Key": k, "Value": v} for k, v in stream["tags"].items()]
-    return json_response({"Tags": tags, "HasMoreTags": False})
+    limit = data.get("Limit", 50)
+    exclusive_start = data.get("ExclusiveStartTagKey")
+    items = sorted(stream["tags"].items())
+    if exclusive_start:
+        items = [(k, v) for k, v in items if k > exclusive_start]
+    page = items[:limit]
+    return json_response({
+        "Tags": [{"Key": k, "Value": v} for k, v in page],
+        "HasMoreTags": len(items) > limit,
+    })
 
 
-# --- Helpers ---
+# ---------------------------------------------------------------------------
+# MergeShards / SplitShard / UpdateShardCount
+# ---------------------------------------------------------------------------
 
-def _get_shard_for_key(partition_key: str, shard_count: int) -> str:
-    h = int(hashlib.md5(partition_key.encode()).hexdigest(), 16)
-    idx = h % shard_count
-    return f"shardId-{idx:012d}"
+def _merge_shards(data):
+    name, stream = _resolve_stream(data)
+    if not stream:
+        return error_response_json("ResourceNotFoundException", f"Stream {name} not found", 400)
+    s1_id = data.get("ShardToMerge")
+    s2_id = data.get("AdjacentShardToMerge")
+    if s1_id not in stream["shards"]:
+        return error_response_json("ResourceNotFoundException", f"Shard {s1_id} not found", 400)
+    if s2_id not in stream["shards"]:
+        return error_response_json("ResourceNotFoundException", f"Shard {s2_id} not found", 400)
 
+    s1, s2 = stream["shards"][s1_id], stream["shards"][s2_id]
+    new_start = str(min(int(s1["starting_hash_key"]), int(s2["starting_hash_key"])))
+    new_end = str(max(int(s1["ending_hash_key"]), int(s2["ending_hash_key"])))
+
+    new_idx = _max_shard_index(stream) + 1
+    new_sid = f"shardId-{new_idx:012d}"
+    stream["shards"][new_sid] = {
+        "records": [],
+        "starting_hash_key": new_start,
+        "ending_hash_key": new_end,
+        "starting_sequence_number": _next_sequence_number(),
+        "parent_shard_id": s1_id,
+        "adjacent_parent_shard_id": s2_id,
+    }
+    del stream["shards"][s1_id]
+    del stream["shards"][s2_id]
+    return json_response({})
+
+
+def _split_shard(data):
+    name, stream = _resolve_stream(data)
+    if not stream:
+        return error_response_json("ResourceNotFoundException", f"Stream {name} not found", 400)
+    shard_id = data.get("ShardToSplit")
+    new_hash = data.get("NewStartingHashKey")
+    if shard_id not in stream["shards"]:
+        return error_response_json("ResourceNotFoundException", f"Shard {shard_id} not found", 400)
+    if not new_hash:
+        return error_response_json("ValidationException", "NewStartingHashKey is required", 400)
+
+    old = stream["shards"][shard_id]
+    split_pt = int(new_hash)
+    old_start, old_end = int(old["starting_hash_key"]), int(old["ending_hash_key"])
+    if split_pt <= old_start or split_pt > old_end:
+        return error_response_json("ValidationException",
+                                   "NewStartingHashKey must be within the shard range", 400)
+
+    base = _max_shard_index(stream) + 1
+    c1 = f"shardId-{base:012d}"
+    c2 = f"shardId-{base + 1:012d}"
+    stream["shards"][c1] = {
+        "records": [],
+        "starting_hash_key": str(old_start),
+        "ending_hash_key": str(split_pt - 1),
+        "starting_sequence_number": _next_sequence_number(),
+        "parent_shard_id": shard_id,
+        "adjacent_parent_shard_id": None,
+    }
+    stream["shards"][c2] = {
+        "records": [],
+        "starting_hash_key": str(split_pt),
+        "ending_hash_key": str(old_end),
+        "starting_sequence_number": _next_sequence_number(),
+        "parent_shard_id": shard_id,
+        "adjacent_parent_shard_id": None,
+    }
+    del stream["shards"][shard_id]
+    return json_response({})
+
+
+def _update_shard_count(data):
+    name, stream = _resolve_stream(data)
+    if not stream:
+        return error_response_json("ResourceNotFoundException", f"Stream {name} not found", 400)
+    target = data.get("TargetShardCount")
+    if target is None:
+        return error_response_json("ValidationException", "TargetShardCount is required", 400)
+    target = int(target)
+    if target < 1:
+        return error_response_json("ValidationException", "TargetShardCount must be >= 1", 400)
+
+    current = len(stream["shards"])
+    stream["shards"] = _build_shards(target)
+    return json_response({
+        "StreamName": stream["StreamName"],
+        "CurrentShardCount": current,
+        "TargetShardCount": target,
+        "StreamARN": stream["StreamARN"],
+    })
+
+
+# ---------------------------------------------------------------------------
+# Enhanced fan-out consumers
+# ---------------------------------------------------------------------------
+
+def _register_consumer(data):
+    stream_arn = data.get("StreamARN")
+    consumer_name = data.get("ConsumerName")
+    if not stream_arn or not consumer_name:
+        return error_response_json("ValidationException",
+                                   "StreamARN and ConsumerName are required", 400)
+    stream = next((s for s in _streams.values() if s["StreamARN"] == stream_arn), None)
+    if not stream:
+        return error_response_json("ResourceNotFoundException",
+                                   f"Stream with ARN {stream_arn} not found", 400)
+    for c in _consumers.values():
+        if c["StreamARN"] == stream_arn and c["ConsumerName"] == consumer_name:
+            return error_response_json("ResourceInUseException",
+                                       f"Consumer {consumer_name} already exists", 400)
+
+    consumer_arn = f"{stream_arn}/consumer/{consumer_name}:{int(time.time())}"
+    now = time.time()
+    _consumers[consumer_arn] = {
+        "ConsumerName": consumer_name,
+        "ConsumerARN": consumer_arn,
+        "ConsumerStatus": "ACTIVE",
+        "ConsumerCreationTimestamp": now,
+        "StreamARN": stream_arn,
+    }
+    return json_response({"Consumer": {
+        "ConsumerName": consumer_name,
+        "ConsumerARN": consumer_arn,
+        "ConsumerStatus": "ACTIVE",
+        "ConsumerCreationTimestamp": now,
+    }})
+
+
+def _deregister_consumer(data):
+    consumer_arn = data.get("ConsumerARN")
+    stream_arn = data.get("StreamARN")
+    consumer_name = data.get("ConsumerName")
+    if consumer_arn:
+        if consumer_arn not in _consumers:
+            return error_response_json("ResourceNotFoundException", "Consumer not found", 400)
+        del _consumers[consumer_arn]
+    elif stream_arn and consumer_name:
+        found = next((a for a, c in _consumers.items()
+                       if c["StreamARN"] == stream_arn and c["ConsumerName"] == consumer_name), None)
+        if not found:
+            return error_response_json("ResourceNotFoundException", "Consumer not found", 400)
+        del _consumers[found]
+    else:
+        return error_response_json("ValidationException",
+                                   "ConsumerARN or StreamARN+ConsumerName required", 400)
+    return json_response({})
+
+
+def _list_consumers(data):
+    stream_arn = data.get("StreamARN")
+    if not stream_arn:
+        return error_response_json("ValidationException", "StreamARN is required", 400)
+    max_results = data.get("MaxResults", 100)
+    next_token = data.get("NextToken")
+
+    items = [{
+        "ConsumerName": c["ConsumerName"],
+        "ConsumerARN": c["ConsumerARN"],
+        "ConsumerStatus": c["ConsumerStatus"],
+        "ConsumerCreationTimestamp": c["ConsumerCreationTimestamp"],
+    } for c in _consumers.values() if c["StreamARN"] == stream_arn]
+
+    start = 0
+    if next_token:
+        try:
+            start = int(next_token)
+        except ValueError:
+            start = 0
+    page = items[start:start + max_results]
+    result = {"Consumers": page}
+    if start + max_results < len(items):
+        result["NextToken"] = str(start + max_results)
+    return json_response(result)
+
+
+def _describe_stream_consumer(data):
+    consumer_arn = data.get("ConsumerARN")
+    stream_arn = data.get("StreamARN")
+    consumer_name = data.get("ConsumerName")
+
+    consumer = None
+    if consumer_arn:
+        consumer = _consumers.get(consumer_arn)
+    elif stream_arn and consumer_name:
+        consumer = next(
+            (c for c in _consumers.values()
+             if c["StreamARN"] == stream_arn and c["ConsumerName"] == consumer_name),
+            None,
+        )
+
+    if not consumer:
+        return error_response_json("ResourceNotFoundException", "Consumer not found", 400)
+
+    return json_response({"ConsumerDescription": {
+        "ConsumerName": consumer["ConsumerName"],
+        "ConsumerARN": consumer["ConsumerARN"],
+        "ConsumerStatus": consumer["ConsumerStatus"],
+        "ConsumerCreationTimestamp": consumer["ConsumerCreationTimestamp"],
+        "StreamARN": consumer["StreamARN"],
+    }})
+
+
+# ---------------------------------------------------------------------------
+# Stream encryption
+# ---------------------------------------------------------------------------
+
+def _start_stream_encryption(data):
+    name, stream = _resolve_stream(data)
+    if not stream:
+        return error_response_json("ResourceNotFoundException", f"Stream {name} not found", 400)
+    encryption_type = data.get("EncryptionType", "KMS")
+    key_id = data.get("KeyId", "")
+    stream["EncryptionType"] = encryption_type
+    stream["KeyId"] = key_id
+    return json_response({})
+
+
+def _stop_stream_encryption(data):
+    name, stream = _resolve_stream(data)
+    if not stream:
+        return error_response_json("ResourceNotFoundException", f"Stream {name} not found", 400)
+    stream["EncryptionType"] = "NONE"
+    stream.pop("KeyId", None)
+    return json_response({})
+
+
+# ---------------------------------------------------------------------------
+# Enhanced monitoring
+# ---------------------------------------------------------------------------
+
+def _enable_enhanced_monitoring(data):
+    name, stream = _resolve_stream(data)
+    if not stream:
+        return error_response_json("ResourceNotFoundException", f"Stream {name} not found", 400)
+    desired = data.get("ShardLevelMetrics", [])
+    current = stream.get("ShardLevelMetrics", [])
+    merged = list(set(current) | set(desired))
+    stream["ShardLevelMetrics"] = merged
+    return json_response({
+        "StreamName": stream["StreamName"],
+        "StreamARN": stream["StreamARN"],
+        "CurrentShardLevelMetrics": current,
+        "DesiredShardLevelMetrics": merged,
+    })
+
+
+def _disable_enhanced_monitoring(data):
+    name, stream = _resolve_stream(data)
+    if not stream:
+        return error_response_json("ResourceNotFoundException", f"Stream {name} not found", 400)
+    to_disable = set(data.get("ShardLevelMetrics", []))
+    current = stream.get("ShardLevelMetrics", [])
+    remaining = [m for m in current if m not in to_disable]
+    stream["ShardLevelMetrics"] = remaining
+    return json_response({
+        "StreamName": stream["StreamName"],
+        "StreamARN": stream["StreamARN"],
+        "CurrentShardLevelMetrics": current,
+        "DesiredShardLevelMetrics": remaining,
+    })
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 def _shard_out(shard_id, shard):
-    return {
+    result = {
         "ShardId": shard_id,
-        "HashKeyRange": {"StartingHashKey": "0", "EndingHashKey": "340282366920938463463374607431768211455"},
-        "SequenceNumberRange": {"StartingSequenceNumber": "0"},
+        "HashKeyRange": {
+            "StartingHashKey": shard["starting_hash_key"],
+            "EndingHashKey": shard["ending_hash_key"],
+        },
+        "SequenceNumberRange": {
+            "StartingSequenceNumber": shard["starting_sequence_number"],
+        },
     }
+    if shard.get("parent_shard_id"):
+        result["ParentShardId"] = shard["parent_shard_id"]
+    if shard.get("adjacent_parent_shard_id"):
+        result["AdjacentParentShardId"] = shard["adjacent_parent_shard_id"]
+    return result
 
 
-def _stream_desc(stream):
+def _stream_desc(stream, shard_ids=None):
+    if shard_ids is None:
+        shard_ids = sorted(stream["shards"].keys())
     return {
         "StreamName": stream["StreamName"],
         "StreamARN": stream["StreamARN"],
         "StreamStatus": stream["StreamStatus"],
+        "StreamModeDetails": stream.get("StreamModeDetails", {"StreamMode": "PROVISIONED"}),
         "RetentionPeriodHours": stream["RetentionPeriodHours"],
         "StreamCreationTimestamp": stream["CreationTimestamp"],
-        "Shards": [_shard_out(sid, s) for sid, s in stream["shards"].items()],
+        "Shards": [_shard_out(sid, stream["shards"][sid]) for sid in shard_ids],
         "HasMoreShards": False,
         "EnhancedMonitoring": [{"ShardLevelMetrics": []}],
+        "EncryptionType": stream.get("EncryptionType", "NONE"),
     }
+
+
+def reset():
+    _streams.clear()
+    _shard_iterators.clear()
+    _consumers.clear()

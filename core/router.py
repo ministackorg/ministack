@@ -96,6 +96,10 @@ SERVICE_PATTERNS = {
         "target_prefixes": ["AmazonAthena"],
         "host_patterns": [r"athena\."],
     },
+    "apigateway": {
+        "host_patterns": [r"apigateway\.", r"execute-api\."],
+        "path_patterns": [r"^/v2/apis"],
+    },
 }
 
 
@@ -123,7 +127,7 @@ def detect_service(method: str, path: str, headers: dict, query_params: dict) ->
             # Map common credential scope names
             scope_map = {
                 "monitoring": "monitoring",
-                "execute-api": "lambda",
+                "execute-api": "apigateway",
                 "ses": "ses",
                 "states": "states",
                 "kinesis": "kinesis",
@@ -147,18 +151,42 @@ def detect_service(method: str, path: str, headers: dict, query_params: dict) ->
             "CreateQueue": "sqs", "DeleteQueue": "sqs", "ListQueues": "sqs",
             "GetQueueUrl": "sqs", "GetQueueAttributes": "sqs", "SetQueueAttributes": "sqs",
             "PurgeQueue": "sqs", "ChangeMessageVisibility": "sqs",
+            "ChangeMessageVisibilityBatch": "sqs",
             "SendMessageBatch": "sqs", "DeleteMessageBatch": "sqs",
+            "ListQueueTags": "sqs", "TagQueue": "sqs", "UntagQueue": "sqs",
             # SNS actions
             "Publish": "sns", "Subscribe": "sns", "Unsubscribe": "sns",
             "CreateTopic": "sns", "DeleteTopic": "sns", "ListTopics": "sns",
             "ListSubscriptions": "sns", "ConfirmSubscription": "sns",
             "SetTopicAttributes": "sns", "GetTopicAttributes": "sns",
             "ListSubscriptionsByTopic": "sns",
+            "GetSubscriptionAttributes": "sns", "SetSubscriptionAttributes": "sns",
+            "PublishBatch": "sns",
+            "ListTagsForResource": "sns", "TagResource": "sns", "UntagResource": "sns",
+            "CreatePlatformApplication": "sns", "CreatePlatformEndpoint": "sns",
             # IAM actions
             "CreateRole": "iam", "GetRole": "iam", "ListRoles": "iam",
             "DeleteRole": "iam", "CreateUser": "iam", "GetUser": "iam",
-            "ListUsers": "iam", "CreatePolicy": "iam", "AttachRolePolicy": "iam",
-            "PutRolePolicy": "iam", "CreateAccessKey": "iam",
+            "ListUsers": "iam", "DeleteUser": "iam",
+            "CreatePolicy": "iam", "GetPolicy": "iam", "DeletePolicy": "iam",
+            "GetPolicyVersion": "iam", "ListPolicyVersions": "iam",
+            "CreatePolicyVersion": "iam", "DeletePolicyVersion": "iam",
+            "ListPolicies": "iam",
+            "AttachRolePolicy": "iam", "DetachRolePolicy": "iam",
+            "ListAttachedRolePolicies": "iam",
+            "PutRolePolicy": "iam", "GetRolePolicy": "iam",
+            "DeleteRolePolicy": "iam", "ListRolePolicies": "iam",
+            "CreateAccessKey": "iam", "ListAccessKeys": "iam", "DeleteAccessKey": "iam",
+            "CreateInstanceProfile": "iam", "DeleteInstanceProfile": "iam",
+            "GetInstanceProfile": "iam", "AddRoleToInstanceProfile": "iam",
+            "RemoveRoleFromInstanceProfile": "iam",
+            "ListInstanceProfiles": "iam", "ListInstanceProfilesForRole": "iam",
+            "UpdateAssumeRolePolicy": "iam",
+            "AttachUserPolicy": "iam", "DetachUserPolicy": "iam",
+            "ListAttachedUserPolicies": "iam",
+            "TagRole": "iam", "UntagRole": "iam", "ListRoleTags": "iam",
+            "TagUser": "iam", "UntagUser": "iam", "ListUserTags": "iam",
+            "SimulatePrincipalPolicy": "iam", "SimulateCustomPolicy": "iam",
             # STS actions
             "GetCallerIdentity": "sts", "AssumeRole": "sts",
             "GetSessionToken": "sts",
@@ -167,33 +195,63 @@ def detect_service(method: str, path: str, headers: dict, query_params: dict) ->
             "ListMetrics": "monitoring", "PutMetricAlarm": "monitoring",
             "DescribeAlarms": "monitoring", "DeleteAlarms": "monitoring",
             "GetMetricStatistics": "monitoring", "SetAlarmState": "monitoring",
+            "EnableAlarmActions": "monitoring", "DisableAlarmActions": "monitoring",
+            "DescribeAlarmsForMetric": "monitoring", "DescribeAlarmHistory": "monitoring",
+            "PutCompositeAlarm": "monitoring",
             # SES actions
             "SendEmail": "ses", "SendRawEmail": "ses",
             "VerifyEmailIdentity": "ses", "VerifyEmailAddress": "ses",
+            "VerifyDomainIdentity": "ses", "VerifyDomainDkim": "ses",
             "ListIdentities": "ses", "DeleteIdentity": "ses",
             "GetSendQuota": "ses", "GetSendStatistics": "ses",
             "ListVerifiedEmailAddresses": "ses",
+            "GetIdentityVerificationAttributes": "ses",
+            "GetIdentityDkimAttributes": "ses",
+            "SetIdentityNotificationTopic": "ses",
+            "SetIdentityFeedbackForwardingEnabled": "ses",
+            "CreateConfigurationSet": "ses", "DeleteConfigurationSet": "ses",
+            "DescribeConfigurationSet": "ses", "ListConfigurationSets": "ses",
+            "CreateTemplate": "ses", "GetTemplate": "ses",
+            "DeleteTemplate": "ses", "ListTemplates": "ses", "UpdateTemplate": "ses",
+            "SendTemplatedEmail": "ses", "SendBulkTemplatedEmail": "ses",
             # RDS actions
             "CreateDBInstance": "rds", "DeleteDBInstance": "rds", "DescribeDBInstances": "rds",
             "StartDBInstance": "rds", "StopDBInstance": "rds", "RebootDBInstance": "rds",
             "ModifyDBInstance": "rds", "CreateDBCluster": "rds", "DeleteDBCluster": "rds",
+            "ModifyDBCluster": "rds",
             "DescribeDBClusters": "rds", "CreateDBSubnetGroup": "rds", "DescribeDBSubnetGroups": "rds",
+            "DeleteDBSubnetGroup": "rds",
             "CreateDBParameterGroup": "rds", "DescribeDBParameterGroups": "rds",
+            "DeleteDBParameterGroup": "rds", "DescribeDBParameters": "rds",
             "DescribeDBEngineVersions": "rds",
+            "DescribeOrderableDBInstanceOptions": "rds",
+            "CreateDBSnapshot": "rds", "DeleteDBSnapshot": "rds", "DescribeDBSnapshots": "rds",
+            "CreateDBInstanceReadReplica": "rds", "RestoreDBInstanceFromDBSnapshot": "rds",
+            "AddTagsToResource": "rds", "RemoveTagsFromResource": "rds",
+            "ListTagsForResource": "rds",
             # ElastiCache actions
             "CreateCacheCluster": "elasticache", "DeleteCacheCluster": "elasticache",
             "DescribeCacheClusters": "elasticache", "ModifyCacheCluster": "elasticache",
+            "RebootCacheCluster": "elasticache",
             "CreateReplicationGroup": "elasticache", "DeleteReplicationGroup": "elasticache",
-            "DescribeReplicationGroups": "elasticache",
+            "DescribeReplicationGroups": "elasticache", "ModifyReplicationGroup": "elasticache",
             "CreateCacheSubnetGroup": "elasticache", "DescribeCacheSubnetGroups": "elasticache",
+            "DeleteCacheSubnetGroup": "elasticache",
             "CreateCacheParameterGroup": "elasticache", "DescribeCacheParameterGroups": "elasticache",
+            "DeleteCacheParameterGroup": "elasticache",
+            "DescribeCacheParameters": "elasticache", "ModifyCacheParameterGroup": "elasticache",
             "DescribeCacheEngineVersions": "elasticache",
+            "CreateSnapshot": "elasticache", "DeleteSnapshot": "elasticache",
+            "DescribeSnapshots": "elasticache",
+            "IncreaseReplicaCount": "elasticache", "DecreaseReplicaCount": "elasticache",
         }
         if action in action_service_map:
             return action_service_map[action]
 
     # 4. Check URL path patterns
     path_lower = path.lower()
+    if path_lower.startswith("/v2/apis"):
+        return "apigateway"
     if path_lower.startswith("/2015-03-31/functions"):
         return "lambda"
     if path_lower.startswith(("/clusters", "/taskdefinitions", "/tasks", "/services", "/stoptask")):

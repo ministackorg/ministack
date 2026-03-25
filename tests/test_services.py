@@ -532,6 +532,38 @@ def test_ecs_list_task_defs(ecs):
     assert len(resp["taskDefinitionArns"]) >= 1
 
 
+def test_ecs_run_task_stops_after_exit(ecs):
+    """DescribeTasks transitions to STOPPED after Docker container exits."""
+    ecs.create_cluster(clusterName="task-lifecycle")
+    ecs.register_task_definition(
+        family="short-lived",
+        containerDefinitions=[{
+            "name": "worker",
+            "image": "alpine:latest",
+            "command": ["sh", "-c", "echo done"],
+            "essential": True,
+        }],
+    )
+    resp = ecs.run_task(cluster="task-lifecycle", taskDefinition="short-lived")
+    task_arn = resp["tasks"][0]["taskArn"]
+    assert resp["tasks"][0]["lastStatus"] == "RUNNING"
+
+    # Poll until STOPPED (container exits almost immediately)
+    stopped = False
+    for _ in range(10):
+        time.sleep(1)
+        desc = ecs.describe_tasks(cluster="task-lifecycle", tasks=[task_arn])
+        task = desc["tasks"][0]
+        if task["lastStatus"] == "STOPPED":
+            stopped = True
+            assert task["desiredStatus"] == "STOPPED"
+            assert task["stopCode"] == "EssentialContainerExited"
+            assert task["containers"][0]["lastStatus"] == "STOPPED"
+            assert task["containers"][0]["exitCode"] == 0
+            break
+    assert stopped, "Task should transition to STOPPED after container exits"
+
+
 def test_ecs_service(ecs):
     ecs.create_service(
         cluster="test-cluster",

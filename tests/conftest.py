@@ -2,6 +2,7 @@
 Pytest fixtures for MiniStack integration tests.
 """
 import os
+import urllib.request
 import pytest
 import boto3
 from botocore.config import Config
@@ -20,6 +21,20 @@ _kwargs = dict(
 
 def make_client(service):
     return boto3.client(service, **_kwargs)
+
+
+@pytest.fixture(scope="session", autouse=True)
+def reset_server():
+    """Reset all server state once before the test session starts."""
+    req = urllib.request.Request(
+        f"{ENDPOINT}/_ministack/reset",
+        data=b"",
+        method="POST",
+    )
+    try:
+        urllib.request.urlopen(req, timeout=5)
+    except Exception:
+        pass  # server may not be up yet; individual tests will fail naturally
 
 
 @pytest.fixture(scope="session")
@@ -101,3 +116,24 @@ def glue():
 @pytest.fixture(scope="session")
 def athena():
     return make_client("athena")
+
+@pytest.fixture(scope="session")
+def apigw():
+    return make_client("apigatewayv2")
+
+@pytest.fixture(scope="session")
+def sfn_sync():
+    """SFN client for StartSyncExecution — forces same endpoint (boto3 normally prefixes sync-)."""
+    from botocore.config import Config as BotoConfig
+    return boto3.client(
+        "stepfunctions",
+        endpoint_url=ENDPOINT,
+        aws_access_key_id="test",
+        aws_secret_access_key="test",
+        region_name=REGION,
+        config=BotoConfig(
+            region_name=REGION,
+            retries={"max_attempts": 0},
+            inject_host_prefix=False,
+        ),
+    )

@@ -1,10 +1,15 @@
 """
 ECS (Elastic Container Service) Emulator.
-REST JSON API — path-based routing like real ECS.
-Supports: CreateCluster, DeleteCluster, DescribeCluster, ListClusters,
+REST JSON API — X-Amz-Target header routing with path-based fallback.
+Supports: CreateCluster, DeleteCluster, DescribeClusters, ListClusters,
+          UpdateCluster, UpdateClusterSettings,
           RegisterTaskDefinition, DeregisterTaskDefinition, DescribeTaskDefinition, ListTaskDefinitions,
           CreateService, DeleteService, DescribeServices, UpdateService, ListServices,
-          RunTask, StopTask, DescribeTasks, ListTasks.
+          RunTask, StopTask, DescribeTasks, ListTasks,
+          TagResource, UntagResource, ListTagsForResource,
+          ExecuteCommand, ListAccountSettings, PutAccountSetting,
+          CreateCapacityProvider, DeleteCapacityProvider, DescribeCapacityProviders,
+          PutClusterCapacityProviders.
 
 Container execution: if Docker socket is available, RunTask actually runs containers.
 """
@@ -14,21 +19,25 @@ import json
 import time
 import logging
 
-from core.responses import json_response, error_response_json, new_uuid
+from core.responses import json_response, error_response_json, new_uuid, now_iso
 
 logger = logging.getLogger("ecs")
 
-ACCOUNT_ID = "000000000000"
-REGION = "us-east-1"
+ACCOUNT_ID = os.environ.get("MINISTACK_ACCOUNT_ID", "000000000000")
+REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 
-_clusters: dict = {}        # cluster_name -> cluster dict
-_task_defs: dict = {}       # family:revision -> task def dict
-_task_def_latest: dict = {} # family -> latest revision number
-_services: dict = {}        # cluster_name/service_name -> service dict
-_tasks: dict = {}           # task_arn -> task dict
+_clusters: dict = {}
+_task_defs: dict = {}
+_task_def_latest: dict = {}
+_services: dict = {}
+_tasks: dict = {}
+_tags: dict = {}
+_account_settings: dict = {}
+_capacity_providers: dict = {}
 
-# Docker client (optional)
 _docker = None
+
+
 def _get_docker():
     global _docker
     if _docker is None:
@@ -40,58 +49,73 @@ def _get_docker():
     return _docker
 
 
+def _ts():
+    return time.time()
+
+
+def _iso():
+    return now_iso()
+
+
+# ---------------------------------------------------------------------------
+# Request routing
+# ---------------------------------------------------------------------------
+
 async def handle_request(method, path, headers, body, query_params):
     try:
         data = json.loads(body) if body else {}
     except json.JSONDecodeError:
         data = {}
 
-    # ECS uses path-based routing: /clusters, /taskdefinitions, etc.
-    # Strip leading slash and split
-    parts = [p for p in path.strip("/").split("/") if p]
+    if method == "GET":
+        for k, v in query_params.items():
+            if k not in data:
+                data[k] = v[0] if isinstance(v, list) and len(v) == 1 else v
 
-    # Also support X-Amz-Target for some SDKs
-    target = headers.get("x-amz-target", "")
+    target = headers.get("x-amz-target", "") or headers.get("X-Amz-Target", "")
     if target:
         action = target.split(".")[-1]
-        return _dispatch_action(action, data, parts, method)
+        return _dispatch_action(action, data)
 
-    # Path-based dispatch
+    parts = [p for p in path.strip("/").split("/") if p]
     if not parts:
         return error_response_json("InvalidRequest", "Missing path", 400)
 
+    return _dispatch_path(method, parts, data)
+
+
+def _dispatch_action(action, data):
+    handler = _ACTION_MAP.get(action)
+    if not handler:
+        return error_response_json("InvalidAction", f"Unknown ECS action: {action}", 400)
+    return handler(data)
+
+
+def _dispatch_path(method, parts, data):
     resource = parts[0]
 
-    # POST /clusters -> CreateCluster
-    # GET  /clusters -> ListClusters
     if resource == "clusters":
-        if method == "POST" and len(parts) == 1:
-            return _create_cluster(data)
         if method == "GET" and len(parts) == 1:
             return _list_clusters(data)
         if method == "POST" and len(parts) == 2 and parts[1] == "delete":
             return _delete_cluster(data)
-        if method == "POST" and len(parts) == 1 and "describe" in data:
-            return _describe_clusters(data)
-        # POST /clusters with clusters key = describe
-        if method == "POST" and "clusters" in data:
-            return _describe_clusters(data)
+        if method == "POST" and len(parts) == 1:
+            if "clusters" in data and isinstance(data["clusters"], list):
+                return _describe_clusters(data)
+            return _create_cluster(data)
 
-    # /taskdefinitions
     if resource == "taskdefinitions":
         if method == "POST" and len(parts) == 1:
             return _register_task_definition(data)
         if method == "GET" and len(parts) == 1:
             return _list_task_definitions(data)
         if method == "GET" and len(parts) == 2:
-            return _describe_task_definition(parts[1])
+            return _describe_task_definition({"taskDefinition": parts[1]})
         if method == "DELETE" and len(parts) == 2:
-            return _deregister_task_definition(parts[1])
+            return _deregister_task_definition({"taskDefinition": parts[1]})
 
-    # /tasks
     if resource == "tasks":
         if method == "POST" and len(parts) == 1:
-            # Could be RunTask or DescribeTasks depending on body
             if "taskDefinition" in data:
                 return _run_task(data)
             if "tasks" in data:
@@ -99,271 +123,577 @@ async def handle_request(method, path, headers, body, query_params):
         if method == "GET" and len(parts) == 1:
             return _list_tasks(data)
 
-    # /services
     if resource == "services":
-        if method == "POST" and len(parts) == 1:
-            if "serviceName" in data and "taskDefinition" in data:
-                return _create_service(data)
-            if "services" in data:
-                return _describe_services(data)
         if method == "GET" and len(parts) == 1:
             return _list_services(data)
+        if method == "POST" and len(parts) == 1:
+            if "services" in data and isinstance(data["services"], list):
+                return _describe_services(data)
+            if "serviceName" in data:
+                return _create_service(data)
         if method == "PUT" and len(parts) == 2:
-            return _update_service(parts[1], data)
+            data.setdefault("service", parts[1])
+            return _update_service(data)
         if method == "DELETE" and len(parts) == 2:
-            return _delete_service(parts[1], data)
+            data.setdefault("service", parts[1])
+            return _delete_service(data)
 
-    # /stoptask
     if resource == "stoptask":
         return _stop_task(data)
 
-    return error_response_json("InvalidRequest", f"Unknown ECS path: {path}", 400)
+    if resource == "tags":
+        if method == "POST":
+            return _tag_resource(data)
+        if method == "DELETE":
+            return _untag_resource(data)
+        if method == "GET":
+            return _list_tags_for_resource(data)
+
+    return error_response_json("InvalidRequest", f"Unknown ECS path: /{'/'.join(parts)}", 400)
 
 
-def _dispatch_action(action, data, parts, method):
-    """Handle X-Amz-Target based dispatch."""
-    handlers = {
-        "CreateCluster": _create_cluster,
-        "DeleteCluster": _delete_cluster,
-        "DescribeClusters": _describe_clusters,
-        "ListClusters": _list_clusters,
-        "RegisterTaskDefinition": _register_task_definition,
-        "DeregisterTaskDefinition": lambda d: _deregister_task_definition(d.get("taskDefinition", "")),
-        "DescribeTaskDefinition": lambda d: _describe_task_definition(d.get("taskDefinition", "")),
-        "ListTaskDefinitions": _list_task_definitions,
-        "CreateService": _create_service,
-        "DeleteService": lambda d: _delete_service(d.get("service", ""), d),
-        "DescribeServices": _describe_services,
-        "UpdateService": lambda d: _update_service(d.get("service", ""), d),
-        "ListServices": _list_services,
-        "RunTask": _run_task,
-        "StopTask": _stop_task,
-        "DescribeTasks": _describe_tasks,
-        "ListTasks": _list_tasks,
-    }
-    handler = handlers.get(action)
-    if not handler:
-        return error_response_json("InvalidAction", f"Unknown ECS action: {action}", 400)
-    return handler(data)
-
-
-# ---- Clusters ----
+# ---------------------------------------------------------------------------
+# Clusters
+# ---------------------------------------------------------------------------
 
 def _create_cluster(data):
     name = data.get("clusterName", "default")
+    if name in _clusters and _clusters[name]["status"] == "ACTIVE":
+        return json_response({"cluster": _clusters[name]})
+
     arn = f"arn:aws:ecs:{REGION}:{ACCOUNT_ID}:cluster/{name}"
-    _clusters[name] = {
-        "clusterArn": arn, "clusterName": name,
-        "status": "ACTIVE", "registeredContainerInstancesCount": 0,
-        "runningTasksCount": 0, "pendingTasksCount": 0,
-        "activeServicesCount": 0, "tags": data.get("tags", []),
-        "settings": data.get("settings", []),
+    cluster = {
+        "clusterArn": arn,
+        "clusterName": name,
+        "status": "ACTIVE",
+        "registeredContainerInstancesCount": 0,
+        "runningTasksCount": 0,
+        "pendingTasksCount": 0,
+        "activeServicesCount": 0,
+        "tags": data.get("tags", []),
+        "settings": data.get("settings", [
+            {"name": "containerInsights", "value": "disabled"},
+        ]),
         "capacityProviders": data.get("capacityProviders", []),
+        "defaultCapacityProviderStrategy": data.get("defaultCapacityProviderStrategy", []),
+        "statistics": [],
+        "attachments": [],
+        "attachmentsStatus": "",
     }
-    return json_response({"cluster": _clusters[name]})
+    _clusters[name] = cluster
+    if cluster["tags"]:
+        _tags[arn] = list(cluster["tags"])
+    return json_response({"cluster": cluster})
 
 
 def _delete_cluster(data):
-    name = data.get("cluster", "default")
-    name = _resolve_cluster_name(name)
+    name = _resolve_cluster_name(data.get("cluster", "default"))
     cluster = _clusters.pop(name, None)
     if not cluster:
-        return error_response_json("ClusterNotFoundException", f"Cluster {name} not found", 400)
+        return error_response_json("ClusterNotFoundException", f"Cluster not found.", 400)
+    cluster["status"] = "INACTIVE"
+    _tags.pop(cluster["clusterArn"], None)
     return json_response({"cluster": cluster})
 
 
 def _describe_clusters(data):
     names = data.get("clusters", ["default"])
+    include = set(data.get("include", []))
     result = []
     failures = []
-    for name in names:
-        n = _resolve_cluster_name(name)
+    for ref in names:
+        n = _resolve_cluster_name(ref)
         if n in _clusters:
-            result.append(_clusters[n])
+            c = dict(_clusters[n])
+            if "TAGS" in include:
+                c["tags"] = _tags.get(c["clusterArn"], [])
+            _recount_cluster(n)
+            c.update({
+                "runningTasksCount": _clusters[n]["runningTasksCount"],
+                "pendingTasksCount": _clusters[n]["pendingTasksCount"],
+                "activeServicesCount": _clusters[n]["activeServicesCount"],
+            })
+            result.append(c)
         else:
-            failures.append({"arn": name, "reason": "MISSING"})
+            arn = ref if ref.startswith("arn:") else f"arn:aws:ecs:{REGION}:{ACCOUNT_ID}:cluster/{ref}"
+            failures.append({"arn": arn, "reason": "MISSING"})
     return json_response({"clusters": result, "failures": failures})
 
 
 def _list_clusters(data):
-    arns = [c["clusterArn"] for c in _clusters.values()]
+    arns = [c["clusterArn"] for c in _clusters.values() if c["status"] == "ACTIVE"]
     return json_response({"clusterArns": arns})
 
 
-# ---- Task Definitions ----
+def _recount_cluster(cluster_name):
+    """Recompute cluster-level counts from live tasks and services."""
+    cluster = _clusters.get(cluster_name)
+    if not cluster:
+        return
+    cluster_arn = cluster["clusterArn"]
+    running = 0
+    pending = 0
+    for t in _tasks.values():
+        if t.get("clusterArn") != cluster_arn:
+            continue
+        if t["lastStatus"] == "RUNNING":
+            running += 1
+        elif t["lastStatus"] == "PENDING":
+            pending += 1
+    cluster["runningTasksCount"] = running
+    cluster["pendingTasksCount"] = pending
+    active_svcs = sum(
+        1 for k, s in _services.items()
+        if k.startswith(f"{cluster_name}/") and s["status"] == "ACTIVE"
+    )
+    cluster["activeServicesCount"] = active_svcs
+
+
+# ---------------------------------------------------------------------------
+# Task Definitions
+# ---------------------------------------------------------------------------
 
 def _register_task_definition(data):
     family = data.get("family")
     if not family:
-        return error_response_json("ValidationException", "family is required", 400)
+        return error_response_json("ClientException", "family is required", 400)
+
+    container_defs = data.get("containerDefinitions", [])
+    if not container_defs:
+        return error_response_json("ClientException",
+            "TaskDefinition must contain at least one container definition.", 400)
+    for idx, cdef in enumerate(container_defs):
+        if "name" not in cdef:
+            return error_response_json("ClientException",
+                f"Container definition {idx}: name is required.", 400)
+        if "image" not in cdef:
+            return error_response_json("ClientException",
+                f"Container definition {idx} ({cdef['name']}): image is required.", 400)
+        cdef.setdefault("cpu", 0)
+        cdef.setdefault("memory", 0)
+        cdef.setdefault("memoryReservation", 0)
+        cdef.setdefault("essential", True)
+        cdef.setdefault("portMappings", [])
+        cdef.setdefault("environment", [])
+        cdef.setdefault("mountPoints", [])
+        cdef.setdefault("volumesFrom", [])
+        cdef.setdefault("logConfiguration", None)
 
     rev = _task_def_latest.get(family, 0) + 1
     _task_def_latest[family] = rev
     td_key = f"{family}:{rev}"
     arn = f"arn:aws:ecs:{REGION}:{ACCOUNT_ID}:task-definition/{td_key}"
 
+    compat = data.get("requiresCompatibilities", ["EC2"])
+    network_mode = data.get("networkMode", "awsvpc" if "FARGATE" in compat else "bridge")
+
     td = {
         "taskDefinitionArn": arn,
         "family": family,
         "revision": rev,
         "status": "ACTIVE",
-        "containerDefinitions": data.get("containerDefinitions", []),
+        "containerDefinitions": container_defs,
         "volumes": data.get("volumes", []),
-        "networkMode": data.get("networkMode", "bridge"),
-        "requiresCompatibilities": data.get("requiresCompatibilities", ["EC2"]),
+        "placementConstraints": data.get("placementConstraints", []),
+        "networkMode": network_mode,
+        "requiresCompatibilities": compat,
         "cpu": data.get("cpu", "256"),
         "memory": data.get("memory", "512"),
         "executionRoleArn": data.get("executionRoleArn", ""),
         "taskRoleArn": data.get("taskRoleArn", ""),
-        "registeredAt": time.time(),
+        "pidMode": data.get("pidMode", ""),
+        "ipcMode": data.get("ipcMode", ""),
+        "proxyConfiguration": data.get("proxyConfiguration", None),
+        "runtimePlatform": data.get("runtimePlatform", None),
+        "ephemeralStorage": data.get("ephemeralStorage", None),
+        "registeredAt": _iso(),
+        "registeredBy": f"arn:aws:iam::{ACCOUNT_ID}:root",
+        "compatibilities": compat + (["EC2"] if "FARGATE" in compat and "EC2" not in compat else []),
     }
     _task_defs[td_key] = td
-    return json_response({"taskDefinition": td, "tags": data.get("tags", [])})
+
+    req_tags = data.get("tags", [])
+    if req_tags:
+        _tags[arn] = list(req_tags)
+    return json_response({"taskDefinition": td, "tags": req_tags})
 
 
-def _deregister_task_definition(td_ref):
+def _deregister_task_definition(data):
+    td_ref = data.get("taskDefinition", "")
     key = _resolve_td_key(td_ref)
     td = _task_defs.get(key)
     if not td:
-        return error_response_json("InvalidParameterException", f"Task definition {td_ref} not found", 400)
+        return error_response_json("ClientException",
+            f"Unable to describe task definition: {td_ref}", 400)
     td["status"] = "INACTIVE"
+    td["deregisteredAt"] = _iso()
     return json_response({"taskDefinition": td})
 
 
-def _describe_task_definition(td_ref):
-    if isinstance(td_ref, dict):
-        td_ref = td_ref.get("taskDefinition", "")
+def _describe_task_definition(data):
+    td_ref = data.get("taskDefinition", "") if isinstance(data, dict) else data
     key = _resolve_td_key(td_ref)
     td = _task_defs.get(key)
     if not td:
-        return error_response_json("InvalidParameterException", f"Task definition {td_ref} not found", 400)
-    return json_response({"taskDefinition": td, "tags": []})
+        return error_response_json("ClientException",
+            f"Unable to describe task definition: {td_ref}", 400)
+    include = set(data.get("include", [])) if isinstance(data, dict) else set()
+    resp = {"taskDefinition": td}
+    if "TAGS" in include:
+        resp["tags"] = _tags.get(td["taskDefinitionArn"], [])
+    else:
+        resp["tags"] = []
+    return json_response(resp)
 
 
 def _list_task_definitions(data):
-    family = data.get("familyPrefix", "")
-    status = data.get("status", "ACTIVE")
+    family_prefix = data.get("familyPrefix", "")
+    status_filter = data.get("status", "ACTIVE")
+    sort = data.get("sort", "ASC")
     arns = [
         td["taskDefinitionArn"] for td in _task_defs.values()
-        if (not family or td["family"].startswith(family)) and td["status"] == status
+        if (not family_prefix or td["family"].startswith(family_prefix))
+        and td["status"] == status_filter
     ]
-    return json_response({"taskDefinitionArns": arns})
+    if sort == "DESC":
+        arns.reverse()
+    max_results = data.get("maxResults", 100)
+    next_token = data.get("nextToken")
+    start = int(next_token) if next_token else 0
+    page = arns[start:start + max_results]
+    resp = {"taskDefinitionArns": page}
+    if start + max_results < len(arns):
+        resp["nextToken"] = str(start + max_results)
+    return json_response(resp)
 
 
-# ---- Services ----
+# ---------------------------------------------------------------------------
+# Services
+# ---------------------------------------------------------------------------
+
+def _make_deployment(task_definition, desired_count, status="PRIMARY"):
+    dep_id = f"ecs-svc/{new_uuid().replace('-', '')[:20]}"
+    now = _iso()
+    return {
+        "id": dep_id,
+        "status": status,
+        "taskDefinition": task_definition,
+        "desiredCount": desired_count,
+        "runningCount": desired_count if status == "PRIMARY" else 0,
+        "pendingCount": 0,
+        "failedTasks": 0,
+        "launchType": "EC2",
+        "createdAt": now,
+        "updatedAt": now,
+        "rolloutState": "COMPLETED" if status == "PRIMARY" else "IN_PROGRESS",
+        "rolloutStateReason": "ECS deployment completed." if status == "PRIMARY" else "",
+    }
+
 
 def _create_service(data):
-    cluster = _resolve_cluster_name(data.get("cluster", "default"))
-    if cluster not in _clusters:
-        _create_cluster({"clusterName": cluster})
+    cluster_name = _resolve_cluster_name(data.get("cluster", "default"))
+    if cluster_name not in _clusters:
+        _create_cluster({"clusterName": cluster_name})
 
     name = data.get("serviceName")
-    td_key = _resolve_td_key(data.get("taskDefinition", ""))
-    arn = f"arn:aws:ecs:{REGION}:{ACCOUNT_ID}:service/{cluster}/{name}"
-    svc_key = f"{cluster}/{name}"
+    if not name:
+        return error_response_json("ClientException", "serviceName is required", 400)
 
-    _services[svc_key] = {
-        "serviceArn": arn, "serviceName": name, "clusterArn": _clusters[cluster]["clusterArn"],
-        "taskDefinition": _task_defs.get(td_key, {}).get("taskDefinitionArn", data.get("taskDefinition", "")),
-        "desiredCount": data.get("desiredCount", 1),
-        "runningCount": 0, "pendingCount": 0,
+    svc_key = f"{cluster_name}/{name}"
+    if svc_key in _services and _services[svc_key]["status"] == "ACTIVE":
+        return error_response_json("ServiceAlreadyExists",
+            f"Creation of service was not idempotent.", 400)
+
+    td_ref = data.get("taskDefinition", "")
+    td_key = _resolve_td_key(td_ref)
+    td_arn = _task_defs[td_key]["taskDefinitionArn"] if td_key in _task_defs else td_ref
+
+    desired = data.get("desiredCount", 1)
+    arn = f"arn:aws:ecs:{REGION}:{ACCOUNT_ID}:service/{cluster_name}/{name}"
+    now = _iso()
+    launch_type = data.get("launchType", "EC2")
+
+    deployment = _make_deployment(td_arn, desired)
+    deployment["launchType"] = launch_type
+
+    svc = {
+        "serviceArn": arn,
+        "serviceName": name,
+        "clusterArn": _clusters[cluster_name]["clusterArn"],
+        "taskDefinition": td_arn,
+        "desiredCount": desired,
+        "runningCount": desired,
+        "pendingCount": 0,
         "status": "ACTIVE",
-        "launchType": data.get("launchType", "EC2"),
+        "launchType": launch_type,
+        "platformVersion": data.get("platformVersion", ""),
+        "platformFamily": data.get("platformFamily", ""),
         "networkConfiguration": data.get("networkConfiguration", {}),
         "loadBalancers": data.get("loadBalancers", []),
-        "createdAt": time.time(),
-        "deployments": [],
-        "events": [],
+        "serviceRegistries": data.get("serviceRegistries", []),
+        "healthCheckGracePeriodSeconds": data.get("healthCheckGracePeriodSeconds", 0),
+        "schedulingStrategy": data.get("schedulingStrategy", "REPLICA"),
+        "deploymentController": data.get("deploymentController", {"type": "ECS"}),
+        "deploymentConfiguration": data.get("deploymentConfiguration", {
+            "maximumPercent": 200,
+            "minimumHealthyPercent": 100,
+            "deploymentCircuitBreaker": {"enable": False, "rollback": False},
+        }),
+        "deployments": [deployment],
+        "events": [{
+            "id": new_uuid(),
+            "createdAt": now,
+            "message": f"(service {name}) has started 1 tasks: (task placeholder).",
+        }],
+        "roleArn": data.get("role", ""),
+        "createdAt": now,
+        "createdBy": f"arn:aws:iam::{ACCOUNT_ID}:root",
+        "enableECSManagedTags": data.get("enableECSManagedTags", False),
+        "propagateTags": data.get("propagateTags", "NONE"),
+        "enableExecuteCommand": data.get("enableExecuteCommand", False),
+        "tags": data.get("tags", []),
     }
-    _clusters[cluster]["activeServicesCount"] += 1
-    return json_response({"service": _services[svc_key]})
+    _services[svc_key] = svc
+
+    if svc["tags"]:
+        _tags[arn] = list(svc["tags"])
+
+    _recount_cluster(cluster_name)
+    return json_response({"service": _sanitize(svc)})
 
 
-def _delete_service(service_name, data):
-    cluster = _resolve_cluster_name(data.get("cluster", "default"))
-    svc_key = f"{cluster}/{service_name}"
-    svc = _services.pop(svc_key, None)
+def _delete_service(data):
+    cluster_name = _resolve_cluster_name(data.get("cluster", "default"))
+    service_ref = data.get("service", "")
+    svc_name = _resolve_service_name(service_ref)
+    svc_key = f"{cluster_name}/{svc_name}"
+    svc = _services.get(svc_key)
     if not svc:
-        return error_response_json("ServiceNotFoundException", f"Service {service_name} not found", 400)
-    if cluster in _clusters:
-        _clusters[cluster]["activeServicesCount"] = max(0, _clusters[cluster]["activeServicesCount"] - 1)
-    return json_response({"service": svc})
+        return error_response_json("ServiceNotFoundException",
+            f"Service not found.", 400)
+
+    force = data.get("force", False)
+    if not force and svc.get("desiredCount", 0) > 0:
+        return error_response_json("InvalidParameterException",
+            "The service cannot be stopped while it is scaled above 0.", 400)
+
+    svc["status"] = "DRAINING"
+    svc["runningCount"] = 0
+    svc["desiredCount"] = 0
+    _tags.pop(svc["serviceArn"], None)
+    del _services[svc_key]
+
+    _recount_cluster(cluster_name)
+    return json_response({"service": _sanitize(svc)})
 
 
 def _describe_services(data):
-    cluster = _resolve_cluster_name(data.get("cluster", "default"))
-    services = data.get("services", [])
+    cluster_name = _resolve_cluster_name(data.get("cluster", "default"))
+    refs = data.get("services", [])
+    include = set(data.get("include", []))
     result = []
     failures = []
-    for svc_name in services:
-        svc_key = f"{cluster}/{_resolve_service_name(svc_name)}"
+    for ref in refs:
+        svc_name = _resolve_service_name(ref)
+        svc_key = f"{cluster_name}/{svc_name}"
         if svc_key in _services:
-            result.append(_services[svc_key])
+            s = dict(_services[svc_key])
+            if "TAGS" in include:
+                s["tags"] = _tags.get(s["serviceArn"], [])
+            result.append(_sanitize(s))
         else:
-            failures.append({"arn": svc_name, "reason": "MISSING"})
+            arn = ref if ref.startswith("arn:") else \
+                f"arn:aws:ecs:{REGION}:{ACCOUNT_ID}:service/{cluster_name}/{ref}"
+            failures.append({"arn": arn, "reason": "MISSING"})
     return json_response({"services": result, "failures": failures})
 
 
-def _update_service(service_name, data):
-    cluster = _resolve_cluster_name(data.get("cluster", "default"))
-    svc_key = f"{cluster}/{_resolve_service_name(service_name)}"
+def _update_service(data):
+    cluster_name = _resolve_cluster_name(data.get("cluster", "default"))
+    service_ref = data.get("service", "")
+    svc_name = _resolve_service_name(service_ref)
+    svc_key = f"{cluster_name}/{svc_name}"
     svc = _services.get(svc_key)
     if not svc:
-        return error_response_json("ServiceNotFoundException", f"Service {service_name} not found", 400)
-    if "desiredCount" in data:
-        svc["desiredCount"] = data["desiredCount"]
-    if "taskDefinition" in data:
-        svc["taskDefinition"] = data["taskDefinition"]
-    return json_response({"service": svc})
+        return error_response_json("ServiceNotFoundException", "Service not found.", 400)
+
+    changed = False
+    new_td = data.get("taskDefinition")
+    new_desired = data.get("desiredCount")
+
+    if new_td is not None:
+        td_key = _resolve_td_key(new_td)
+        td_arn = _task_defs[td_key]["taskDefinitionArn"] if td_key in _task_defs else new_td
+        if td_arn != svc["taskDefinition"]:
+            for dep in svc["deployments"]:
+                if dep["status"] == "PRIMARY":
+                    dep["status"] = "ACTIVE"
+            new_dep = _make_deployment(td_arn, svc["desiredCount"])
+            svc["deployments"].insert(0, new_dep)
+            svc["taskDefinition"] = td_arn
+            changed = True
+
+    if new_desired is not None:
+        svc["desiredCount"] = new_desired
+        svc["runningCount"] = new_desired
+        if svc["deployments"]:
+            svc["deployments"][0]["desiredCount"] = new_desired
+            svc["deployments"][0]["runningCount"] = new_desired
+            svc["deployments"][0]["updatedAt"] = _iso()
+        changed = True
+
+    if "networkConfiguration" in data:
+        svc["networkConfiguration"] = data["networkConfiguration"]
+    if "healthCheckGracePeriodSeconds" in data:
+        svc["healthCheckGracePeriodSeconds"] = data["healthCheckGracePeriodSeconds"]
+    if "enableExecuteCommand" in data:
+        svc["enableExecuteCommand"] = data["enableExecuteCommand"]
+    if "deploymentConfiguration" in data:
+        svc["deploymentConfiguration"] = data["deploymentConfiguration"]
+    if "platformVersion" in data:
+        svc["platformVersion"] = data["platformVersion"]
+    if "loadBalancers" in data:
+        svc["loadBalancers"] = data["loadBalancers"]
+    if "capacityProviderStrategy" in data:
+        svc["capacityProviderStrategy"] = data["capacityProviderStrategy"]
+
+    if changed:
+        svc["events"].insert(0, {
+            "id": new_uuid(),
+            "createdAt": _iso(),
+            "message": f"(service {svc['serviceName']}) has begun draining connections on 1 tasks.",
+        })
+
+    _recount_cluster(cluster_name)
+    return json_response({"service": _sanitize(svc)})
 
 
 def _list_services(data):
-    cluster = _resolve_cluster_name(data.get("cluster", "default"))
-    arns = [s["serviceArn"] for k, s in _services.items() if k.startswith(f"{cluster}/")]
+    cluster_name = _resolve_cluster_name(data.get("cluster", "default"))
+    launch_type = data.get("launchType")
+    scheduling = data.get("schedulingStrategy")
+    arns = []
+    for k, s in _services.items():
+        if not k.startswith(f"{cluster_name}/"):
+            continue
+        if s["status"] != "ACTIVE":
+            continue
+        if launch_type and s.get("launchType") != launch_type:
+            continue
+        if scheduling and s.get("schedulingStrategy") != scheduling:
+            continue
+        arns.append(s["serviceArn"])
     return json_response({"serviceArns": arns})
 
 
-# ---- Tasks ----
+# ---------------------------------------------------------------------------
+# Tasks
+# ---------------------------------------------------------------------------
+
+def _build_task_containers(td, container_overrides):
+    """Build the containers list for a task from its task definition."""
+    containers = []
+    if not td:
+        return containers
+    for cdef in td.get("containerDefinitions", []):
+        env_override = {}
+        for ov in container_overrides:
+            if ov.get("name") == cdef["name"]:
+                for e in ov.get("environment", []):
+                    env_override[e["name"]] = e["value"]
+
+        env = {e["name"]: e["value"] for e in cdef.get("environment", [])}
+        env.update(env_override)
+
+        containers.append({
+            "containerArn": f"arn:aws:ecs:{REGION}:{ACCOUNT_ID}:container/{new_uuid()}",
+            "taskArn": "",
+            "name": cdef["name"],
+            "image": cdef.get("image", ""),
+            "lastStatus": "RUNNING",
+            "exitCode": None,
+            "networkBindings": [],
+            "networkInterfaces": [],
+            "cpu": str(cdef.get("cpu", 0)),
+            "memory": str(cdef.get("memory") or cdef.get("memoryReservation", 0)),
+            "runtimeId": new_uuid()[:12],
+            "healthStatus": "UNKNOWN",
+        })
+    return containers
+
 
 def _run_task(data):
-    cluster = _resolve_cluster_name(data.get("cluster", "default"))
-    if cluster not in _clusters:
-        _create_cluster({"clusterName": cluster})
+    cluster_name = _resolve_cluster_name(data.get("cluster", "default"))
+    if cluster_name not in _clusters:
+        _create_cluster({"clusterName": cluster_name})
 
     td_ref = data.get("taskDefinition", "")
     td_key = _resolve_td_key(td_ref)
     td = _task_defs.get(td_key)
+    if not td:
+        return error_response_json("ClientException",
+            f"Unable to find task definition: {td_ref}", 400)
 
     count = data.get("count", 1)
+    container_overrides = data.get("overrides", {}).get("containerOverrides", [])
+    launch_type = data.get("launchType", "EC2")
+    group = data.get("group", "")
+    started_by = data.get("startedBy", "")
+    enable_exec = data.get("enableExecuteCommand", False)
+    network_cfg = data.get("networkConfiguration", {})
+    req_tags = data.get("tags", [])
+
     tasks = []
     failures = []
 
     for _ in range(count):
         task_id = new_uuid()
-        task_arn = f"arn:aws:ecs:{REGION}:{ACCOUNT_ID}:task/{cluster}/{task_id}"
-        container_overrides = data.get("overrides", {}).get("containerOverrides", [])
+        task_arn = f"arn:aws:ecs:{REGION}:{ACCOUNT_ID}:task/{cluster_name}/{task_id}"
+        now = _iso()
+
+        containers = _build_task_containers(td, container_overrides)
+        for c in containers:
+            c["taskArn"] = task_arn
 
         task = {
             "taskArn": task_arn,
-            "clusterArn": f"arn:aws:ecs:{REGION}:{ACCOUNT_ID}:cluster/{cluster}",
-            "taskDefinitionArn": td["taskDefinitionArn"] if td else td_ref,
+            "clusterArn": _clusters[cluster_name]["clusterArn"],
+            "taskDefinitionArn": td["taskDefinitionArn"],
+            "containerInstanceArn": f"arn:aws:ecs:{REGION}:{ACCOUNT_ID}:container-instance/{cluster_name}/{new_uuid()}",
+            "overrides": data.get("overrides", {"containerOverrides": [], "inferenceAcceleratorOverrides": []}),
             "lastStatus": "RUNNING",
             "desiredStatus": "RUNNING",
-            "launchType": data.get("launchType", "EC2"),
-            "cpu": td.get("cpu", "256") if td else "256",
-            "memory": td.get("memory", "512") if td else "512",
-            "createdAt": time.time(),
-            "startedAt": time.time(),
-            "group": data.get("group", ""),
-            "containers": [],
+            "launchType": launch_type,
+            "cpu": td.get("cpu", "256"),
+            "memory": td.get("memory", "512"),
+            "platformVersion": data.get("platformVersion", ""),
+            "platformFamily": "",
+            "connectivity": "CONNECTED",
+            "connectivityAt": now,
+            "pullStartedAt": now,
+            "pullStoppedAt": now,
+            "createdAt": now,
+            "startedAt": now,
+            "stoppingAt": None,
+            "stoppedAt": None,
+            "stoppedReason": "",
+            "stopCode": "",
+            "group": group,
+            "startedBy": started_by,
+            "version": 1,
+            "containers": containers,
+            "attachments": [],
+            "availabilityZone": f"{REGION}a",
+            "enableExecuteCommand": enable_exec,
+            "tags": req_tags,
+            "healthStatus": "UNKNOWN",
+            "ephemeralStorage": td.get("ephemeralStorage", {"sizeInGiB": 20}),
             "_docker_ids": [],
         }
 
-        # Try to actually run containers via Docker
         docker_client = _get_docker()
         if docker_client and td:
-            for cdef in td.get("containerDefinitions", []):
-                # Apply overrides
+            for i, cdef in enumerate(td.get("containerDefinitions", [])):
                 env_override = {}
                 for ov in container_overrides:
                     if ov.get("name") == cdef["name"]:
@@ -380,140 +710,465 @@ def _run_task(data):
 
                 try:
                     container = docker_client.containers.run(
-                        cdef["image"],
-                        detach=True,
+                        cdef["image"], detach=True,
                         environment=env,
-                        ports=port_bindings if port_bindings else None,
+                        ports=port_bindings or None,
                         name=f"ministack-ecs-{task_id[:8]}-{cdef['name']}",
                         labels={"ministack": "ecs", "task_arn": task_arn},
                     )
-                    task["containers"].append({
-                        "name": cdef["name"], "image": cdef["image"],
-                        "lastStatus": "RUNNING", "exitCode": None,
-                        "networkBindings": [],
-                        "containerArn": f"arn:aws:ecs:{REGION}:{ACCOUNT_ID}:container/{new_uuid()}",
-                        "_docker_id": container.id,
-                    })
                     task["_docker_ids"].append(container.id)
+                    if i < len(task["containers"]):
+                        task["containers"][i]["runtimeId"] = container.id[:12]
                     logger.info(f"ECS: started container {cdef['image']} for task {task_id[:8]}")
                 except Exception as e:
                     logger.warning(f"ECS: Docker run failed for {cdef.get('image')}: {e}")
-                    task["containers"].append({
-                        "name": cdef["name"], "image": cdef["image"],
-                        "lastStatus": "RUNNING", "exitCode": None,
-                        "networkBindings": [],
-                        "containerArn": f"arn:aws:ecs:{REGION}:{ACCOUNT_ID}:container/{new_uuid()}",
-                    })
-        elif td:
-            for cdef in td.get("containerDefinitions", []):
-                task["containers"].append({
-                    "name": cdef["name"], "image": cdef["image"],
-                    "lastStatus": "RUNNING", "exitCode": None,
-                    "networkBindings": [],
-                    "containerArn": f"arn:aws:ecs:{REGION}:{ACCOUNT_ID}:container/{new_uuid()}",
-                })
 
         _tasks[task_arn] = task
-        _clusters[cluster]["runningTasksCount"] += 1
-        tasks.append({k: v for k, v in task.items() if not k.startswith("_")})
+        if req_tags:
+            _tags[task_arn] = list(req_tags)
+        tasks.append(_sanitize(task))
 
+    _recount_cluster(cluster_name)
     return json_response({"tasks": tasks, "failures": failures})
 
 
 def _stop_task(data):
     task_ref = data.get("task", "")
-    cluster = _resolve_cluster_name(data.get("cluster", "default"))
-    reason = data.get("reason", "")
+    cluster_name = _resolve_cluster_name(data.get("cluster", "default"))
+    reason = data.get("reason", "Task stopped by user")
 
-    # Resolve by ARN or short ID
-    task = _tasks.get(task_ref)
+    task = _resolve_task(task_ref, cluster_name)
     if not task:
-        for arn, t in _tasks.items():
-            if arn.endswith(task_ref):
-                task = t
-                task_ref = arn
-                break
+        return error_response_json("InvalidParameterException",
+            f"The referenced task was not found.", 400)
 
-    if not task:
-        return error_response_json("InvalidParameterException", f"Task {task_ref} not found", 400)
+    if task["lastStatus"] == "STOPPED":
+        return json_response({"task": _sanitize(task)})
 
-    # Stop Docker containers
     docker_client = _get_docker()
     if docker_client:
         for docker_id in task.get("_docker_ids", []):
             try:
-                container = docker_client.containers.get(docker_id)
-                container.stop(timeout=5)
-                container.remove()
+                c = docker_client.containers.get(docker_id)
+                c.stop(timeout=5)
+                c.remove()
             except Exception as e:
                 logger.warning(f"ECS: failed to stop container {docker_id}: {e}")
 
+    now = _iso()
     task["lastStatus"] = "STOPPED"
     task["desiredStatus"] = "STOPPED"
-    task["stoppedAt"] = time.time()
+    task["stoppingAt"] = now
+    task["stoppedAt"] = now
     task["stoppedReason"] = reason
+    task["stopCode"] = "UserInitiated"
+    for c in task.get("containers", []):
+        c["lastStatus"] = "STOPPED"
+        c["exitCode"] = 0
 
-    cluster_name = _resolve_cluster_name(cluster)
-    if cluster_name in _clusters:
-        _clusters[cluster_name]["runningTasksCount"] = max(0, _clusters[cluster_name]["runningTasksCount"] - 1)
+    cname = _cluster_name_from_arn(task.get("clusterArn", ""))
+    if cname:
+        _recount_cluster(cname)
 
-    return json_response({"task": {k: v for k, v in task.items() if not k.startswith("_")}})
+    return json_response({"task": _sanitize(task)})
 
 
 def _describe_tasks(data):
-    cluster = _resolve_cluster_name(data.get("cluster", "default"))
+    cluster_name = _resolve_cluster_name(data.get("cluster", "default"))
     task_refs = data.get("tasks", [])
+    include = set(data.get("include", []))
     result = []
     failures = []
     for ref in task_refs:
-        task = _tasks.get(ref)
-        if not task:
-            for arn, t in _tasks.items():
-                if arn.endswith(ref):
-                    task = t
-                    break
+        task = _resolve_task(ref, cluster_name)
         if task:
-            result.append({k: v for k, v in task.items() if not k.startswith("_")})
+            t = _sanitize(task)
+            if "TAGS" in include:
+                t["tags"] = _tags.get(task["taskArn"], [])
+            result.append(t)
         else:
-            failures.append({"arn": ref, "reason": "MISSING"})
+            arn = ref if ref.startswith("arn:") else \
+                f"arn:aws:ecs:{REGION}:{ACCOUNT_ID}:task/{cluster_name}/{ref}"
+            failures.append({"arn": arn, "reason": "MISSING"})
     return json_response({"tasks": result, "failures": failures})
 
 
 def _list_tasks(data):
-    cluster = _resolve_cluster_name(data.get("cluster", "default"))
-    cluster_arn = f"arn:aws:ecs:{REGION}:{ACCOUNT_ID}:cluster/{cluster}"
-    status = data.get("desiredStatus", "RUNNING")
-    arns = [
-        arn for arn, t in _tasks.items()
-        if t.get("clusterArn") == cluster_arn and t.get("desiredStatus") == status
+    cluster_name = _resolve_cluster_name(data.get("cluster", "default"))
+    cluster_arn = f"arn:aws:ecs:{REGION}:{ACCOUNT_ID}:cluster/{cluster_name}"
+    status_filter = data.get("desiredStatus", "RUNNING")
+    family = data.get("family", "")
+    service_name = data.get("serviceName", "")
+    started_by = data.get("startedBy", "")
+
+    arns = []
+    for arn, t in _tasks.items():
+        if t.get("clusterArn") != cluster_arn:
+            continue
+        if t.get("desiredStatus") != status_filter:
+            continue
+        if family:
+            td_arn = t.get("taskDefinitionArn", "")
+            if f"/{family}:" not in td_arn:
+                continue
+        if service_name and t.get("group") != f"service:{service_name}":
+            if t.get("startedBy") != service_name:
+                continue
+        if started_by and t.get("startedBy") != started_by:
+            continue
+        arns.append(arn)
+
+    max_results = data.get("maxResults", 100)
+    next_token = data.get("nextToken")
+    start = int(next_token) if next_token else 0
+    page = arns[start:start + max_results]
+    resp = {"taskArns": page}
+    if start + max_results < len(arns):
+        resp["nextToken"] = str(start + max_results)
+    return json_response(resp)
+
+
+# ---------------------------------------------------------------------------
+# Tags
+# ---------------------------------------------------------------------------
+
+def _tag_resource(data):
+    arn = data.get("resourceArn", "")
+    new_tags = data.get("tags", [])
+    if not arn:
+        return error_response_json("InvalidParameterException", "resourceArn is required", 400)
+    existing = _tags.get(arn, [])
+    existing_keys = {t["key"]: i for i, t in enumerate(existing)}
+    for tag in new_tags:
+        k = tag.get("key", "")
+        if k in existing_keys:
+            existing[existing_keys[k]] = tag
+        else:
+            existing.append(tag)
+            existing_keys[k] = len(existing) - 1
+    _tags[arn] = existing
+    return json_response({})
+
+
+def _untag_resource(data):
+    arn = data.get("resourceArn", "")
+    keys_to_remove = set(data.get("tagKeys", []))
+    if not arn:
+        return error_response_json("InvalidParameterException", "resourceArn is required", 400)
+    existing = _tags.get(arn, [])
+    _tags[arn] = [t for t in existing if t.get("key") not in keys_to_remove]
+    return json_response({})
+
+
+def _list_tags_for_resource(data):
+    arn = data.get("resourceArn", "")
+    if not arn:
+        return error_response_json("InvalidParameterException", "resourceArn is required", 400)
+    return json_response({"tags": _tags.get(arn, [])})
+
+
+# ---------------------------------------------------------------------------
+# Stubs
+# ---------------------------------------------------------------------------
+
+def _execute_command(data):
+    cluster_name = _resolve_cluster_name(data.get("cluster", "default"))
+    task_ref = data.get("task", "")
+    task = _resolve_task(task_ref, cluster_name)
+    if not task:
+        return error_response_json("InvalidParameterException",
+            "The referenced task was not found.", 400)
+    container_name = data.get("container", "")
+    if not container_name and task.get("containers"):
+        container_name = task["containers"][0]["name"]
+    return json_response({
+        "clusterArn": task["clusterArn"],
+        "taskArn": task["taskArn"],
+        "containerArn": next(
+            (c["containerArn"] for c in task.get("containers", []) if c["name"] == container_name),
+            "",
+        ),
+        "containerName": container_name,
+        "interactive": data.get("interactive", True),
+        "session": {
+            "sessionId": new_uuid(),
+            "streamUrl": f"wss://ssmmessages.{REGION}.amazonaws.com/v1/data-channel/{new_uuid()}",
+            "tokenValue": new_uuid(),
+        },
+    })
+
+
+def _list_account_settings(data):
+    name = data.get("name", "")
+    effective = data.get("effectiveSettings", False)
+    settings = []
+    all_names = [
+        "serviceLongArnFormat", "taskLongArnFormat",
+        "containerInstanceLongArnFormat", "awsvpcTrunking",
+        "containerInsights", "fargateTaskRetirementWaitPeriod",
+        "dualStackIPv6", "fargateFIPSMode", "tagResourceAuthorization",
+        "guardDutyActivate",
     ]
-    return json_response({"taskArns": arns})
+    for setting_name in all_names:
+        if name and setting_name != name:
+            continue
+        settings.append({
+            "name": setting_name,
+            "value": _account_settings.get(setting_name, "enabled"),
+            "principalArn": f"arn:aws:iam::{ACCOUNT_ID}:root",
+            "type": "user" if setting_name in _account_settings else "aws",
+        })
+    return json_response({"settings": settings})
 
 
-# ---- Helpers ----
+def _put_account_setting(data):
+    name = data.get("name", "")
+    value = data.get("value", "enabled")
+    if not name:
+        return error_response_json("InvalidParameterException", "name is required", 400)
+    _account_settings[name] = value
+    return json_response({"setting": {
+        "name": name,
+        "value": value,
+        "principalArn": f"arn:aws:iam::{ACCOUNT_ID}:root",
+        "type": "user",
+    }})
+
+
+def _describe_capacity_providers(data):
+    names = data.get("capacityProviders", [])
+    include = data.get("include", [])
+    providers = []
+    defaults = [
+        {"name": "FARGATE", "status": "ACTIVE", "autoScalingGroupProvider": {}},
+        {"name": "FARGATE_SPOT", "status": "ACTIVE", "autoScalingGroupProvider": {}},
+    ]
+    for p in defaults:
+        if not names or p["name"] in names:
+            cp = {
+                "capacityProviderArn": f"arn:aws:ecs:{REGION}:{ACCOUNT_ID}:capacity-provider/{p['name']}",
+                "name": p["name"],
+                "status": p["status"],
+                "autoScalingGroupProvider": p["autoScalingGroupProvider"],
+                "updateStatus": "UPDATE_COMPLETE",
+            }
+            if "TAGS" in include:
+                cp["tags"] = _tags.get(cp["capacityProviderArn"], [])
+            providers.append(cp)
+
+    for cp_name, cp in _capacity_providers.items():
+        if not names or cp_name in names:
+            entry = dict(cp)
+            if "TAGS" in include:
+                entry["tags"] = _tags.get(cp["capacityProviderArn"], [])
+            providers.append(entry)
+
+    return json_response({"capacityProviders": providers})
+
+
+def _create_capacity_provider(data):
+    name = data.get("name", "")
+    if not name:
+        return error_response_json("InvalidParameterException", "name is required", 400)
+    if name in _capacity_providers:
+        return error_response_json("InvalidParameterException",
+            f"Capacity provider {name} already exists.", 400)
+
+    arn = f"arn:aws:ecs:{REGION}:{ACCOUNT_ID}:capacity-provider/{name}"
+    asg_provider = data.get("autoScalingGroupProvider", {})
+
+    cp = {
+        "capacityProviderArn": arn,
+        "name": name,
+        "status": "ACTIVE",
+        "autoScalingGroupProvider": {
+            "autoScalingGroupArn": asg_provider.get("autoScalingGroupArn", ""),
+            "managedScaling": asg_provider.get("managedScaling", {
+                "status": "DISABLED",
+                "targetCapacity": 100,
+                "minimumScalingStepSize": 1,
+                "maximumScalingStepSize": 10000,
+                "instanceWarmupPeriod": 300,
+            }),
+            "managedTerminationProtection": asg_provider.get("managedTerminationProtection", "DISABLED"),
+        },
+        "updateStatus": "UPDATE_COMPLETE",
+        "tags": data.get("tags", []),
+    }
+    _capacity_providers[name] = cp
+
+    if cp["tags"]:
+        _tags[arn] = list(cp["tags"])
+
+    return json_response({"capacityProvider": cp})
+
+
+def _delete_capacity_provider(data):
+    name = data.get("capacityProvider", "")
+    if name.startswith("arn:"):
+        name = name.split("/")[-1]
+
+    cp = _capacity_providers.pop(name, None)
+    if not cp:
+        return error_response_json("InvalidParameterException",
+            f"Capacity provider {name} not found.", 400)
+
+    _tags.pop(cp.get("capacityProviderArn", ""), None)
+    cp["status"] = "INACTIVE"
+    return json_response({"capacityProvider": cp})
+
+
+def _put_cluster_capacity_providers(data):
+    cluster_name = _resolve_cluster_name(data.get("cluster", "default"))
+    cluster = _clusters.get(cluster_name)
+    if not cluster:
+        return error_response_json("ClusterNotFoundException", "Cluster not found.", 400)
+
+    cluster["capacityProviders"] = data.get("capacityProviders", [])
+    cluster["defaultCapacityProviderStrategy"] = data.get("defaultCapacityProviderStrategy", [])
+
+    return json_response({"cluster": cluster})
+
+
+def _update_cluster(data):
+    cluster_name = _resolve_cluster_name(data.get("cluster", "default"))
+    cluster = _clusters.get(cluster_name)
+    if not cluster:
+        return error_response_json("ClusterNotFoundException", "Cluster not found.", 400)
+
+    if "configuration" in data:
+        cluster["configuration"] = data["configuration"]
+    if "settings" in data:
+        cluster["settings"] = data["settings"]
+    if "serviceConnectDefaults" in data:
+        cluster["serviceConnectDefaults"] = data["serviceConnectDefaults"]
+
+    return json_response({"cluster": cluster})
+
+
+def _update_cluster_settings(data):
+    cluster_name = _resolve_cluster_name(data.get("cluster", "default"))
+    cluster = _clusters.get(cluster_name)
+    if not cluster:
+        return error_response_json("ClusterNotFoundException", "Cluster not found.", 400)
+
+    settings = data.get("settings", [])
+    if settings:
+        cluster["settings"] = settings
+
+    return json_response({"cluster": cluster})
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 def _resolve_cluster_name(ref):
     if not ref:
         return "default"
+    if ref.startswith("arn:"):
+        return ref.split("/")[-1]
     if "/" in ref:
         return ref.split("/")[-1]
     return ref
 
 
 def _resolve_service_name(ref):
+    if ref.startswith("arn:"):
+        return ref.split("/")[-1]
     if "/" in ref:
         return ref.split("/")[-1]
     return ref
 
 
 def _resolve_td_key(ref):
-    """Resolve task definition ARN or family[:revision] to internal key."""
     if not ref:
         return ""
     if "task-definition/" in ref:
         ref = ref.split("task-definition/")[-1]
     if ":" not in ref:
-        # Latest revision
-        rev = _task_def_latest.get(ref, 1)
+        rev = _task_def_latest.get(ref)
+        if rev is None:
+            return ref
         return f"{ref}:{rev}"
     return ref
+
+
+def _resolve_task(ref, cluster_name="default"):
+    """Look up a task by full ARN or short ID, optionally scoped to a cluster."""
+    task = _tasks.get(ref)
+    if task:
+        return task
+    cluster_arn = f"arn:aws:ecs:{REGION}:{ACCOUNT_ID}:cluster/{cluster_name}"
+    for arn, t in _tasks.items():
+        if t.get("clusterArn") != cluster_arn:
+            continue
+        if arn.endswith(f"/{ref}") or arn.endswith(ref):
+            return t
+    for arn, t in _tasks.items():
+        if arn.endswith(f"/{ref}") or arn.endswith(ref):
+            return t
+    return None
+
+
+def _cluster_name_from_arn(arn):
+    if not arn:
+        return ""
+    return arn.split("/")[-1] if "/" in arn else arn
+
+
+def _sanitize(obj):
+    """Remove internal keys (prefixed with _) from a dict for API responses."""
+    if isinstance(obj, dict):
+        return {k: _sanitize(v) for k, v in obj.items() if not k.startswith("_")}
+    if isinstance(obj, list):
+        return [_sanitize(i) for i in obj]
+    return obj
+
+
+# ---------------------------------------------------------------------------
+# Action map (X-Amz-Target dispatch)
+# ---------------------------------------------------------------------------
+
+_ACTION_MAP = {
+    "CreateCluster": _create_cluster,
+    "DeleteCluster": _delete_cluster,
+    "DescribeClusters": _describe_clusters,
+    "ListClusters": _list_clusters,
+    "UpdateCluster": _update_cluster,
+    "UpdateClusterSettings": _update_cluster_settings,
+    "RegisterTaskDefinition": _register_task_definition,
+    "DeregisterTaskDefinition": _deregister_task_definition,
+    "DescribeTaskDefinition": _describe_task_definition,
+    "ListTaskDefinitions": _list_task_definitions,
+    "CreateService": _create_service,
+    "DeleteService": _delete_service,
+    "DescribeServices": _describe_services,
+    "UpdateService": _update_service,
+    "ListServices": _list_services,
+    "RunTask": _run_task,
+    "StopTask": _stop_task,
+    "DescribeTasks": _describe_tasks,
+    "ListTasks": _list_tasks,
+    "TagResource": _tag_resource,
+    "UntagResource": _untag_resource,
+    "ListTagsForResource": _list_tags_for_resource,
+    "ExecuteCommand": _execute_command,
+    "ListAccountSettings": _list_account_settings,
+    "PutAccountSetting": _put_account_setting,
+    "CreateCapacityProvider": _create_capacity_provider,
+    "DeleteCapacityProvider": _delete_capacity_provider,
+    "DescribeCapacityProviders": _describe_capacity_providers,
+    "PutClusterCapacityProviders": _put_cluster_capacity_providers,
+}
+
+
+def reset():
+    _clusters.clear()
+    _task_defs.clear()
+    _task_def_latest.clear()
+    _services.clear()
+    _tasks.clear()
+    _tags.clear()
+    _account_settings.clear()
+    _capacity_providers.clear()
