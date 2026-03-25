@@ -18,6 +18,9 @@ from botocore.exceptions import ClientError
 _endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
 _EXECUTE_PORT = urlparse(_endpoint).port or 4566
 
+import pytest
+from botocore.exceptions import ClientError
+
 
 # ========== S3 ==========
 
@@ -111,6 +114,12 @@ def test_s3_delete_object_idempotent(s3):
     resp = s3.delete_object(Bucket="intg-s3-delidempotent", Key="nonexistent.txt")
     assert resp["ResponseMetadata"]["HTTPStatusCode"] == 204
 
+def test_s3_delete_object(s3):
+    s3.create_bucket(Bucket="intg-s3-delobj")
+    s3.put_object(Bucket="intg-s3-delobj", Key="bye.txt", Body=b"bye")
+    s3.delete_object(Bucket="intg-s3-delobj", Key="bye.txt")
+    with pytest.raises(ClientError):
+        s3.get_object(Bucket="intg-s3-delobj", Key="bye.txt")
 
 def test_s3_copy_object(s3):
     s3.create_bucket(Bucket="intg-s3-copysrc")
@@ -359,6 +368,33 @@ def test_sqs_list_queues(sqs):
     assert any("intg-sqs-list-alpha" in u for u in urls)
     assert any("intg-sqs-list-beta" in u for u in urls)
 
+def test_sqs_create_queue(sqs):
+    resp = sqs.create_queue(QueueName="intg-sqs-create")
+    assert "QueueUrl" in resp
+    assert "intg-sqs-create" in resp["QueueUrl"]
+
+
+def test_sqs_delete_queue(sqs):
+    url = sqs.create_queue(QueueName="intg-sqs-delete")["QueueUrl"]
+    sqs.delete_queue(QueueUrl=url)
+    with pytest.raises(ClientError):
+        sqs.get_queue_attributes(QueueUrl=url, AttributeNames=["All"])
+
+
+def test_sqs_list_queues(sqs):
+    sqs.create_queue(QueueName="intg-sqs-list-alpha")
+    sqs.create_queue(QueueName="intg-sqs-list-beta")
+    resp = sqs.list_queues(QueueNamePrefix="intg-sqs-list-")
+    urls = resp.get("QueueUrls", [])
+    assert len(urls) >= 2
+    assert any("intg-sqs-list-alpha" in u for u in urls)
+    assert any("intg-sqs-list-beta" in u for u in urls)
+
+
+def test_sqs_get_queue_url(sqs):
+    sqs.create_queue(QueueName="intg-sqs-geturl")
+    resp = sqs.get_queue_url(QueueName="intg-sqs-geturl")
+    assert "intg-sqs-geturl" in resp["QueueUrl"]
 
 def test_sqs_get_queue_url(sqs):
     sqs.create_queue(QueueName="intg-sqs-geturl")
@@ -1185,6 +1221,38 @@ def test_ecs_task_def(ecs):
 def test_ecs_list_task_defs(ecs):
     resp = ecs.list_task_definitions(familyPrefix="test-task")
     assert len(resp["taskDefinitionArns"]) >= 1
+
+
+def test_ecs_run_task_stops_after_exit(ecs):
+    """DescribeTasks transitions to STOPPED after Docker container exits."""
+    ecs.create_cluster(clusterName="task-lifecycle")
+    ecs.register_task_definition(
+        family="short-lived",
+        containerDefinitions=[{
+            "name": "worker",
+            "image": "alpine:latest",
+            "command": ["sh", "-c", "echo done"],
+            "essential": True,
+        }],
+    )
+    resp = ecs.run_task(cluster="task-lifecycle", taskDefinition="short-lived")
+    task_arn = resp["tasks"][0]["taskArn"]
+    assert resp["tasks"][0]["lastStatus"] == "RUNNING"
+
+    # Poll until STOPPED (container exits almost immediately)
+    stopped = False
+    for _ in range(10):
+        time.sleep(1)
+        desc = ecs.describe_tasks(cluster="task-lifecycle", tasks=[task_arn])
+        task = desc["tasks"][0]
+        if task["lastStatus"] == "STOPPED":
+            stopped = True
+            assert task["desiredStatus"] == "STOPPED"
+            assert task["stopCode"] == "EssentialContainerExited"
+            assert task["containers"][0]["lastStatus"] == "STOPPED"
+            assert task["containers"][0]["exitCode"] == 0
+            break
+    assert stopped, "Task should transition to STOPPED after container exits"
 
 
 def test_ecs_service(ecs):
