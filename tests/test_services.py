@@ -117,6 +117,27 @@ def test_sns_subscribe(sns):
     assert len(subs.get("Subscriptions", [])) >= 1
 
 
+def test_sns_sqs_fanout(sns, sqs):
+    # Create topic and queue
+    topic_arn = sns.create_topic(Name="fanout-topic")["TopicArn"]
+    q_url = sqs.create_queue(QueueName="fanout-queue")["QueueUrl"]
+    q_arn = sqs.get_queue_attributes(QueueUrl=q_url, AttributeNames=["QueueArn"])["Attributes"]["QueueArn"]
+
+    # Subscribe SQS queue to SNS topic
+    sns.subscribe(TopicArn=topic_arn, Protocol="sqs", Endpoint=q_arn)
+
+    # Publish to topic
+    sns.publish(TopicArn=topic_arn, Message="hello fanout", Subject="test")
+
+    # Message should appear in SQS queue
+    msgs = sqs.receive_message(QueueUrl=q_url, MaxNumberOfMessages=1)
+    assert len(msgs.get("Messages", [])) == 1
+    import json
+    body = json.loads(msgs["Messages"][0]["Body"])
+    assert body["Message"] == "hello fanout"
+    assert body["TopicArn"] == topic_arn
+
+
 # ========== DynamoDB ==========
 
 def test_dynamodb_basic(ddb):
@@ -244,6 +265,67 @@ def test_lambda_create_invoke(lam):
 
 
 # ========== IAM ==========
+
+def test_lambda_esm_sqs(lam, sqs):
+    """SQS → Lambda event source mapping: messages sent to SQS trigger Lambda."""
+    import io, zipfile as zf
+
+    # Clean up from previous runs
+    try:
+        lam.delete_function(FunctionName="esm-test-func")
+    except Exception:
+        pass
+
+    # Lambda that records what it received
+    code = (
+        b"import json\n"
+        b"received = []\n"
+        b"def handler(event, context):\n"
+        b"    received.extend(event.get('Records', []))\n"
+        b"    return {'processed': len(event.get('Records', []))}\n"
+    )
+    buf = io.BytesIO()
+    with zf.ZipFile(buf, "w") as z:
+        z.writestr("index.py", code)
+
+    lam.create_function(
+        FunctionName="esm-test-func",        Runtime="python3.9",
+        Role="arn:aws:iam::000000000000:role/test-role",
+        Handler="index.handler",
+        Code={"ZipFile": buf.getvalue()},
+    )
+
+    q_url = sqs.create_queue(QueueName="esm-test-queue")["QueueUrl"]
+    q_arn = sqs.get_queue_attributes(QueueUrl=q_url, AttributeNames=["QueueArn"])["Attributes"]["QueueArn"]
+
+    # Create event source mapping
+    resp = lam.create_event_source_mapping(
+        EventSourceArn=q_arn,
+        FunctionName="esm-test-func",
+        BatchSize=5,
+        Enabled=True,
+    )
+    esm_uuid = resp["UUID"]
+    assert resp["State"] == "Enabled"
+
+    # Send a message to SQS
+    sqs.send_message(QueueUrl=q_url, MessageBody="trigger-lambda")
+
+    # Wait for poller to pick it up (max 5s)
+    import time
+    for _ in range(10):
+        time.sleep(0.5)
+        msgs = sqs.receive_message(QueueUrl=q_url, MaxNumberOfMessages=1)
+        if not msgs.get("Messages"):
+            break  # message was consumed by Lambda
+
+    # Queue should be empty — Lambda consumed the message
+    msgs = sqs.receive_message(QueueUrl=q_url, MaxNumberOfMessages=1)
+    assert not msgs.get("Messages"), "Message should have been consumed by Lambda via ESM"
+
+    # Cleanup
+    lam.delete_event_source_mapping(UUID=esm_uuid)
+
 
 def test_iam_role_user(iam):
     iam.create_role(

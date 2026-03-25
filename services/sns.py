@@ -167,10 +167,61 @@ def _publish(params):
             "id": msg_id, "message": message, "subject": subject,
             "timestamp": time.time(),
         })
-        # In real LocalStack, this would fan out to subscribers
+        _fanout(topic_arn, msg_id, message, subject)
         logger.info(f"SNS publish to {topic_arn}: {message[:100]}")
 
     return _xml(200, "PublishResponse", f"<PublishResult><MessageId>{msg_id}</MessageId></PublishResult>")
+
+
+def _fanout(topic_arn: str, msg_id: str, message: str, subject: str):
+    """Deliver SNS message to all confirmed subscribers."""
+    import json as _json
+    from services import sqs as _sqs
+
+    topic = _topics.get(topic_arn)
+    if not topic:
+        return
+
+    # SNS wraps the message in an envelope when delivering to SQS
+    envelope = _json.dumps({
+        "Type": "Notification",
+        "MessageId": msg_id,
+        "TopicArn": topic_arn,
+        "Subject": subject or "",
+        "Message": message,
+        "Timestamp": time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime()),
+        "SignatureVersion": "1",
+        "Signature": "FAKE",
+        "SigningCertURL": "",
+        "UnsubscribeURL": "",
+    })
+
+    for sub in topic["subscriptions"]:
+        if not sub.get("confirmed"):
+            continue
+        protocol = sub.get("protocol", "")
+        endpoint = sub.get("endpoint", "")
+
+        if protocol == "sqs":
+            # endpoint is the SQS queue ARN: arn:aws:sqs:region:account:queue-name
+            queue_name = endpoint.split(":")[-1]
+            queue_url = _sqs._queue_url(queue_name)
+            queue = _sqs._queues.get(queue_url)
+            if queue:
+                import hashlib as _hashlib
+                queue["messages"].append({
+                    "id": new_uuid(),
+                    "body": envelope,
+                    "md5": _hashlib.md5(envelope.encode()).hexdigest(),
+                    "receipt_handle": None,
+                    "sent_at": time.time(),
+                    "visible_at": time.time(),
+                    "receive_count": 0,
+                    "attributes": {},
+                })
+                logger.info(f"SNS fanout → SQS {queue_name}")
+            else:
+                logger.warning(f"SNS fanout: SQS queue {queue_name} not found")
 
 
 def _p(params, key, default=""):

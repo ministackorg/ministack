@@ -1,0 +1,277 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MiniStack — Free Open-Source Local AWS Emulator</title>
+<meta name="description" content="Free, open-source LocalStack alternative. 20 AWS services on a single port. Real Postgres, Redis, Docker containers. MIT licensed, no account required.">
+<meta property="og:title" content="MiniStack — Free Local AWS Emulator">
+<meta property="og:description" content="LocalStack is no longer free. MiniStack is. 20 AWS services, real database containers, 2-second startup. MIT licensed.">
+<meta property="og:url" content="https://ministack.org">
+<meta property="og:image" content="https://ministack.org/og-image.png">
+<meta property="og:type" content="website">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="MiniStack — Free Local AWS Emulator">
+<meta name="twitter:description" content="Free, open-source LocalStack alternative. 20 AWS services, real infrastructure, MIT licensed.">
+<meta name="twitter:image" content="https://ministack.org/og-image.png">
+<link rel="canonical" href="https://ministack.org">
+<link rel="icon" href="logo.png" type="image/png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Outfit:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{--bg:#080a0f;--bg2:#0d1017;--bg3:#141820;--surface:#1a1f2b;--border:#1e2433;--border-b:#2a3040;--tx:#e4e8f0;--tx2:#8891a5;--tx3:#4d5568;--blue:#2d9bd6;--blueL:#45b8f0;--blueG:rgba(45,155,214,.15);--green:#22c55e;--red:#ef4444;--yellow:#eab308;--cyan:#06b6d4;--mono:'JetBrains Mono',monospace;--sans:'Outfit',system-ui,sans-serif}
+html{scroll-behavior:smooth}
+body{background:var(--bg);color:var(--tx);font-family:var(--sans);line-height:1.6;overflow-x:hidden;-webkit-font-smoothing:antialiased}
+body::before{content:'';position:fixed;inset:0;background-image:url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.85' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");opacity:.025;pointer-events:none;z-index:9999}
+.gridbg{position:fixed;inset:0;background-image:linear-gradient(rgba(45,155,214,.04) 1px,transparent 1px),linear-gradient(90deg,rgba(45,155,214,.04) 1px,transparent 1px);background-size:80px 80px;pointer-events:none;z-index:0;mask-image:radial-gradient(ellipse 60% 40% at 50% 20%,#000 10%,transparent 70%)}
+.glow{position:absolute;top:-100px;left:50%;transform:translateX(-50%);width:700px;height:500px;background:radial-gradient(ellipse,rgba(45,155,214,.12) 0%,rgba(45,155,214,.03) 40%,transparent 70%);pointer-events:none;z-index:0}
+@keyframes fadeUp{from{opacity:0;transform:translateY(20px)}to{opacity:1;transform:translateY(0)}}
+@keyframes pulse{0%,100%{box-shadow:0 0 6px var(--green)}50%{box-shadow:0 0 14px var(--green),0 0 28px rgba(34,197,94,.2)}}
+.a{opacity:0;animation:fadeUp .6s cubic-bezier(.16,1,.3,1) forwards}
+.d1{animation-delay:.05s}.d2{animation-delay:.1s}.d3{animation-delay:.18s}.d4{animation-delay:.26s}.d5{animation-delay:.34s}.d6{animation-delay:.42s}.d7{animation-delay:.5s}.d8{animation-delay:.6s}
+
+nav{position:fixed;top:0;left:0;right:0;z-index:100;padding:0 2rem;height:60px;display:flex;align-items:center;justify-content:space-between;background:rgba(8,10,15,.85);backdrop-filter:blur(16px) saturate(1.4);border-bottom:1px solid var(--border)}
+.nlogo{display:flex;align-items:center;gap:10px;text-decoration:none}
+.nlogo img{height:32px}.nlogo span{font-family:var(--mono);font-weight:700;font-size:1rem;color:var(--tx)}
+.nr{display:flex;align-items:center;gap:1.5rem}
+.nr a{color:var(--tx2);text-decoration:none;font-size:.88rem;font-weight:500;transition:color .2s}
+.nr a:hover{color:var(--tx)}
+.ghb{display:inline-flex;align-items:center;gap:7px;padding:7px 14px;background:var(--surface);border:1px solid var(--border-b);border-radius:8px;color:var(--tx);font-size:.82rem;font-weight:600;transition:all .2s}
+.ghb:hover{border-color:var(--blue);background:var(--bg3)}
+.ghb svg{width:16px;height:16px;fill:currentColor}
+
+.hero{position:relative;z-index:1;padding:150px 2rem 80px;max-width:1000px;margin:0 auto;text-align:center}
+.badge{display:inline-flex;align-items:center;gap:8px;padding:5px 14px;border-radius:100px;border:1px solid var(--border-b);background:var(--bg2);font-size:.8rem;font-family:var(--mono);color:var(--tx2);margin-bottom:1.8rem}
+.badge .dot{width:7px;height:7px;border-radius:50%;background:var(--green);animation:pulse 2s infinite}
+h1{font-size:clamp(2.5rem,6.5vw,4.5rem);font-weight:800;line-height:1.08;letter-spacing:-.035em;margin-bottom:1.2rem}
+.bl{color:var(--blueL)}
+.hsub{font-size:1.15rem;color:var(--tx2);max-width:580px;margin:0 auto 2.2rem;line-height:1.7}
+.hsub strong{color:var(--tx);font-weight:600}
+.hacts{display:flex;align-items:center;justify-content:center;gap:1rem;flex-wrap:wrap;margin-bottom:2rem}
+.btn{display:inline-flex;align-items:center;gap:8px;padding:12px 24px;border-radius:9px;font-weight:700;font-size:.92rem;text-decoration:none;transition:all .25s;border:none;cursor:pointer}
+.btn-b{background:var(--blue);color:#fff}.btn-b:hover{background:var(--blueL);transform:translateY(-2px);box-shadow:0 8px 30px rgba(45,155,214,.3)}
+.btn-g{background:transparent;color:var(--tx);border:1px solid var(--border-b)}.btn-g:hover{background:var(--surface);border-color:var(--tx3);transform:translateY(-2px)}
+.btn svg{width:17px;height:17px;fill:currentColor}
+.cmd{display:inline-flex;align-items:center;gap:12px;padding:12px 20px;background:var(--bg2);border:1px solid var(--border);border-radius:9px;font-family:var(--mono);font-size:.88rem;cursor:pointer;transition:all .2s}
+.cmd:hover{border-color:var(--blue)}
+.cmd .p{color:var(--blue)}.cmd .c{color:var(--tx)}
+.cmd .tg{font-family:var(--sans);font-size:.72rem;color:var(--tx3);padding:2px 8px;background:var(--surface);border-radius:4px}
+.cmd.copied .tg{color:var(--green)}
+
+.stats{display:flex;justify-content:center;gap:3rem;flex-wrap:wrap;padding:2rem 2rem 3rem;max-width:950px;margin:0 auto}
+.sv{font-family:var(--mono);font-size:1.8rem;font-weight:700;color:var(--blueL)}
+.sl{font-size:.78rem;color:var(--tx3);text-transform:uppercase;letter-spacing:.1em;margin-top:2px}
+
+.callout{position:relative;z-index:1;max-width:800px;margin:0 auto 4rem;padding:0 2rem}
+.cbox{display:flex;align-items:flex-start;gap:16px;padding:20px 24px;background:rgba(239,68,68,.06);border:1px solid rgba(239,68,68,.15);border-radius:10px}
+.cbox-i{font-size:1.4rem;flex-shrink:0;margin-top:2px}
+.cbox-t{font-size:.92rem;color:var(--tx2);line-height:1.6}.cbox-t strong{color:var(--tx)}
+
+.tw{position:relative;z-index:1;max-width:800px;margin:0 auto 5rem;padding:0 2rem}
+.term{background:var(--bg2);border:1px solid var(--border);border-radius:12px;overflow:hidden;box-shadow:0 20px 60px rgba(0,0,0,.4)}
+.tb{display:flex;align-items:center;gap:7px;padding:12px 16px;background:var(--bg3);border-bottom:1px solid var(--border)}
+.td{width:11px;height:11px;border-radius:50%}.td.r{background:#ff5f57}.td.y{background:#febc2e}.td.g{background:#28c840}
+.tt{flex:1;text-align:center;font-family:var(--mono);font-size:.75rem;color:var(--tx3)}
+.tc{padding:20px;font-family:var(--mono);font-size:.82rem;line-height:1.9;overflow-x:auto;white-space:pre}
+.cm{color:var(--tx3)}.pr{color:var(--blue)}.fl{color:var(--cyan)}.st{color:var(--yellow)}.out{color:var(--tx2)}.ok{color:var(--green)}
+
+.sec{position:relative;z-index:1;max-width:1060px;margin:0 auto;padding:4.5rem 2rem}
+.stag{font-family:var(--mono);font-size:.75rem;text-transform:uppercase;letter-spacing:.14em;color:var(--blue);margin-bottom:.8rem}
+.sec h2{font-size:clamp(1.7rem,3.5vw,2.5rem);font-weight:800;letter-spacing:-.02em;margin-bottom:.8rem}
+.sdesc{color:var(--tx2);font-size:1rem;max-width:560px;margin-bottom:2.5rem}
+.div{border:none;border-top:1px solid var(--border);margin:0 auto;max-width:1020px}
+
+.sg{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:1px;background:var(--border);border:1px solid var(--border);border-radius:12px;overflow:hidden}
+.sc{background:var(--bg2);padding:22px 20px;transition:background .2s}.sc:hover{background:var(--bg3)}
+.si{font-size:1.3rem;margin-bottom:8px}.sn{font-weight:700;font-size:.92rem;margin-bottom:4px}
+.sd{font-size:.76rem;color:var(--tx3);line-height:1.5}
+.sp{display:inline-block;margin-top:8px;padding:2px 8px;background:var(--surface);border-radius:4px;font-family:var(--mono);font-size:.68rem;color:var(--tx2)}
+.sp.real{background:rgba(45,155,214,.1);color:var(--blue);border:1px solid rgba(45,155,214,.2)}
+
+.ct{width:100%;border-collapse:separate;border-spacing:0;border:1px solid var(--border);border-radius:12px;overflow:hidden;font-size:.88rem}
+.ct th,.ct td{padding:14px 18px;text-align:left;border-bottom:1px solid var(--border)}
+.ct th{background:var(--bg3);font-weight:600;font-size:.78rem;text-transform:uppercase;letter-spacing:.06em;color:var(--tx2)}
+.ct th.hl{color:var(--blueL)}
+.ct td{background:var(--bg2)}.ct tr:last-child td{border-bottom:none}
+.w{color:var(--blueL);font-family:var(--mono);font-weight:700}.dm{color:var(--tx3)}
+
+.fg{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:1.2rem}
+.fc{padding:28px;background:var(--bg2);border:1px solid var(--border);border-radius:12px;transition:all .25s}
+.fc:hover{border-color:var(--border-b);transform:translateY(-2px)}
+.fi{width:40px;height:40px;background:var(--blueG);border:1px solid rgba(45,155,214,.15);border-radius:9px;display:flex;align-items:center;justify-content:center;font-size:1.1rem;margin-bottom:14px}
+.ft{font-weight:700;margin-bottom:6px;font-size:.95rem}
+.fd{font-size:.84rem;color:var(--tx2);line-height:1.6}
+
+.fcta{position:relative;z-index:1;text-align:center;padding:5rem 2rem;max-width:650px;margin:0 auto}
+.fcta h2{font-size:clamp(1.6rem,3.5vw,2.3rem);font-weight:800;letter-spacing:-.02em;margin-bottom:.8rem}
+.fcta p{color:var(--tx2);margin-bottom:2rem;font-size:1rem}
+footer{position:relative;z-index:1;border-top:1px solid var(--border);padding:1.8rem 2rem;text-align:center;font-size:.8rem;color:var(--tx3)}
+footer a{color:var(--tx2);text-decoration:none}footer a:hover{color:var(--blue)}
+
+@media(max-width:768px){.nr a:not(.ghb){display:none}.hero{padding:120px 1.5rem 50px}.stats{gap:1.5rem}.sv{font-size:1.4rem}.hacts{flex-direction:column}.sg{grid-template-columns:repeat(auto-fill,minmax(160px,1fr))}.ct{font-size:.78rem}.ct th,.ct td{padding:10px 12px}.tc{font-size:.72rem;padding:14px}}
+@media(max-width:480px){.cmd{font-size:.76rem;padding:10px 14px}.sg{grid-template-columns:1fr 1fr}}
+</style>
+</head>
+<body>
+<div class="gridbg"></div>
+
+<nav>
+  <a href="/" class="nlogo"><img src="logo.png" alt="MiniStack"><span>MiniStack</span></a>
+  <div class="nr">
+    <a href="#services">Services</a>
+    <a href="#comparison">Compare</a>
+    <a href="#features">Features</a>
+    <a href="https://github.com/Nahuel990/ministack" target="_blank" class="ghb">
+      <svg viewBox="0 0 16 16"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+      Star
+    </a>
+  </div>
+</nav>
+
+<section class="hero">
+  <div class="glow"></div>
+  <div class="badge a d1"><span class="dot"></span>v1.0.11 · MIT licensed · free forever</div>
+  <h1 class="a d2">The <span class="bl">free</span> LocalStack<br>replacement</h1>
+  <p class="hsub a d3">LocalStack is no longer free. <strong>MiniStack is.</strong><br>20 AWS services on a single port — with <strong>real Postgres, Redis, and Docker containers</strong>. No account, no license key, no telemetry.</p>
+  <div class="hacts a d4">
+    <a href="https://github.com/Nahuel990/ministack" target="_blank" class="btn btn-b">
+      <svg viewBox="0 0 16 16"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+      View on GitHub</a>
+    <a href="https://hub.docker.com/r/nahuelnucera/ministack" target="_blank" class="btn btn-g">🐳 Docker Hub</a>
+  </div>
+  <div class="cmd a d5" onclick="cp(this)"><span class="p">$</span><span class="c">docker run -p 4566:4566 nahuelnucera/ministack</span><span class="tg">copy</span></div>
+</section>
+
+<div class="stats a d6">
+  <div><div class="sv">20</div><div class="sl">AWS Services</div></div>
+  <div><div class="sv">~2s</div><div class="sl">Startup</div></div>
+  <div><div class="sv">~30MB</div><div class="sl">RAM at idle</div></div>
+  <div><div class="sv">150MB</div><div class="sl">Docker Image</div></div>
+  <div><div class="sv">56</div><div class="sl">Tests passing</div></div>
+</div>
+
+<div class="callout a d7">
+  <div class="cbox">
+    <span class="cbox-i">⚠️</span>
+    <div class="cbox-t"><strong>LocalStack moved core services behind a paid plan.</strong> If you relied on LocalStack Community for local dev and CI/CD, MiniStack is your free, MIT-licensed drop-in replacement. No sign-up, no API key, no telemetry.</div>
+  </div>
+</div>
+
+<div class="tw a d8">
+  <div class="term">
+    <div class="tb"><span class="td r"></span><span class="td y"></span><span class="td g"></span><span class="tt">ministack — bash</span></div>
+    <div class="tc"><span class="cm"># Start MiniStack</span>
+<span class="pr">$</span> docker run <span class="fl">-p</span> <span class="st">4566:4566</span> nahuelnucera/ministack
+
+<span class="cm"># Works with any AWS tool — no config changes</span>
+<span class="pr">$</span> aws <span class="fl">--endpoint-url=</span><span class="st">http://localhost:4566</span> s3 mb s3://my-bucket
+<span class="out">make_bucket: my-bucket</span>
+
+<span class="cm"># Real database — RDS spins up actual Postgres</span>
+<span class="pr">$</span> aws <span class="fl">--endpoint-url=</span><span class="st">http://localhost:4566</span> rds create-db-instance \
+    <span class="fl">--db-instance-identifier</span> mydb <span class="fl">--engine</span> postgres \
+    <span class="fl">--master-username</span> admin <span class="fl">--master-user-password</span> secret
+<span class="ok">✓ Real Postgres container running on localhost:15432</span>
+
+<span class="cm"># Real Redis via ElastiCache</span>
+<span class="pr">$</span> aws <span class="fl">--endpoint-url=</span><span class="st">http://localhost:4566</span> elasticache \
+    create-cache-cluster <span class="fl">--cache-cluster-id</span> my-redis <span class="fl">--engine</span> redis
+<span class="ok">✓ Real Redis container running on localhost:16379</span></div>
+  </div>
+</div>
+
+<hr class="div">
+
+<section class="sec" id="services">
+  <div class="stag">20 Services</div>
+  <h2>Everything you need, locally</h2>
+  <p class="sdesc">Core AWS services plus real infrastructure — RDS runs actual databases, ElastiCache runs real Redis, ECS starts real Docker containers, Athena executes real SQL via DuckDB (when installed).</p>
+  <div class="sg">
+    <div class="sc"><div class="si">🪣</div><div class="sn">S3</div><div class="sd">Buckets, objects, copy, list, batch</div><span class="sp">REST/XML</span></div>
+    <div class="sc"><div class="si">📨</div><div class="sn">SQS</div><div class="sd">Queues, send/receive, batch, visibility</div><span class="sp">JSON+Query</span></div>
+    <div class="sc"><div class="si">📢</div><div class="sn">SNS</div><div class="sd">Topics, subscriptions, publish</div><span class="sp">Query/XML</span></div>
+    <div class="sc"><div class="si">🗃️</div><div class="sn">DynamoDB</div><div class="sd">Tables, CRUD, query, scan, batch</div><span class="sp">JSON</span></div>
+    <div class="sc"><div class="si">⚡</div><div class="sn">Lambda</div><div class="sd">Real Python execution from zip</div><span class="sp">REST/JSON</span></div>
+    <div class="sc"><div class="si">🔐</div><div class="sn">IAM</div><div class="sd">Users, roles, policies, keys</div><span class="sp">Query/XML</span></div>
+    <div class="sc"><div class="si">🎫</div><div class="sn">STS</div><div class="sd">CallerIdentity, AssumeRole</div><span class="sp">Query/XML</span></div>
+    <div class="sc"><div class="si">🔑</div><div class="sn">Secrets Manager</div><div class="sd">CRUD with versioning</div><span class="sp">JSON</span></div>
+    <div class="sc"><div class="si">📊</div><div class="sn">CW Logs</div><div class="sd">Groups, streams, events, filter</div><span class="sp">JSON</span></div>
+    <div class="sc"><div class="si">📐</div><div class="sn">SSM Params</div><div class="sd">String, SecureString, paths</div><span class="sp">JSON</span></div>
+    <div class="sc"><div class="si">🚌</div><div class="sn">EventBridge</div><div class="sd">Buses, rules, targets, events</div><span class="sp">JSON</span></div>
+    <div class="sc"><div class="si">🌊</div><div class="sn">Kinesis</div><div class="sd">Streams, shards, put/get records</div><span class="sp">JSON</span></div>
+    <div class="sc"><div class="si">📈</div><div class="sn">CW Metrics</div><div class="sd">Metrics, alarms, statistics</div><span class="sp">Query/XML</span></div>
+    <div class="sc"><div class="si">✉️</div><div class="sn">SES</div><div class="sd">Send email, identities, quotas</div><span class="sp">Query/XML</span></div>
+    <div class="sc"><div class="si">🔄</div><div class="sn">Step Functions</div><div class="sd">State machines, executions</div><span class="sp">JSON</span></div>
+    <div class="sc"><div class="si">🐘</div><div class="sn">RDS</div><div class="sd">Real Postgres/MySQL containers</div><span class="sp real">Real Docker</span></div>
+    <div class="sc"><div class="si">🔴</div><div class="sn">ElastiCache</div><div class="sd">Real Redis/Memcached containers</div><span class="sp real">Real Docker</span></div>
+    <div class="sc"><div class="si">🐳</div><div class="sn">ECS</div><div class="sd">RunTask starts real containers</div><span class="sp real">Real Docker</span></div>
+    <div class="sc"><div class="si">🧪</div><div class="sn">Glue</div><div class="sd">Catalog, crawlers, jobs</div><span class="sp real">Real Exec</span></div>
+    <div class="sc"><div class="si">🔍</div><div class="sn">Athena</div><div class="sd">Real SQL via DuckDB (optional)</div><span class="sp real">DuckDB</span></div>
+  </div>
+</section>
+
+<hr class="div">
+
+<section class="sec" id="comparison">
+  <div class="stag">Comparison</div>
+  <h2>LocalStack vs MiniStack</h2>
+  <p class="sdesc">Same developer experience. Fraction of the cost and footprint.</p>
+  <table class="ct">
+    <thead><tr><th>Feature</th><th>LocalStack Free</th><th>LocalStack Pro</th><th class="hl">MiniStack ⚡</th></tr></thead>
+    <tbody>
+      <tr><td>Core services (S3, SQS, DDB…)</td><td class="dm">Now paid</td><td>✅</td><td class="w">✅ Free</td></tr>
+      <tr><td>Lambda, IAM, SSM, EventBridge</td><td class="dm">Paid</td><td>✅</td><td class="w">✅ Free</td></tr>
+      <tr><td>RDS (real DB containers)</td><td class="dm">❌</td><td>✅</td><td class="w">✅ Real Postgres/MySQL</td></tr>
+      <tr><td>ElastiCache (real Redis)</td><td class="dm">❌</td><td>✅</td><td class="w">✅ Real Redis</td></tr>
+      <tr><td>ECS (real Docker)</td><td class="dm">❌</td><td>✅</td><td class="w">✅ Real Docker</td></tr>
+      <tr><td>Athena (real SQL)</td><td class="dm">❌</td><td>✅</td><td class="w">✅ DuckDB (optional)</td></tr>
+      <tr><td>Glue Catalog + Jobs</td><td class="dm">❌</td><td>✅</td><td class="w">✅</td></tr>
+      <tr><td>Startup time</td><td class="dm">~15-30s</td><td class="dm">~15-30s</td><td class="w">~2s</td></tr>
+      <tr><td>Memory at idle</td><td class="dm">~500MB</td><td class="dm">~500MB</td><td class="w">~30MB</td></tr>
+      <tr><td>Docker image</td><td class="dm">~1 GB</td><td class="dm">~1 GB</td><td class="w">150 MB</td></tr>
+      <tr><td>License</td><td class="dm">BSL (restricted)</td><td class="dm">Proprietary</td><td class="w">MIT</td></tr>
+      <tr><td>Price</td><td class="dm">Now paid</td><td class="dm">$35+/mo</td><td class="w">$0 forever</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<hr class="div">
+
+<section class="sec" id="features">
+  <div class="stag">Built different</div>
+  <h2>Real infrastructure, not mocks</h2>
+  <p class="sdesc">Where it matters most — RDS, ElastiCache, and ECS run real Docker containers. No fake endpoints, no stubbed responses.</p>  <div class="fg">
+    <div class="fc"><div class="fi">🐘</div><div class="ft">Real databases via RDS</div><div class="fd">CreateDBInstance spins up an actual Postgres or MySQL Docker container. Connect with psycopg2 — it's a real database.</div></div>
+    <div class="fc"><div class="fi">🔴</div><div class="ft">Real Redis via ElastiCache</div><div class="fd">CreateCacheCluster starts an actual Redis container. Use redis-py, run SUBSCRIBE, use it as your session store.</div></div>
+    <div class="fc"><div class="fi">🐳</div><div class="ft">Real containers via ECS</div><div class="fd">RunTask pulls and starts real Docker containers via the Docker socket. Test your ECS task definitions locally.</div></div>
+    <div class="fc"><div class="fi">🔍</div><div class="ft">Real SQL via Athena</div><div class="fd">Queries execute via DuckDB when installed. Query S3 data with actual SQL, get actual result sets back. Falls back to mock results without it.</div></div>
+    <div class="fc"><div class="fi">🔌</div><div class="ft">Full SDK compatibility</div><div class="fd">Works with boto3, AWS CLI, Terraform, CDK, Pulumi — any tool that speaks the AWS API.</div></div>
+    <div class="fc"><div class="fi">🔓</div><div class="ft">MIT licensed forever</div><div class="fd">No BSL, no feature gates, no "community" vs "pro". Every service is free. Fork it, embed it. MIT is MIT.</div></div>
+  </div>
+</section>
+
+<hr class="div">
+
+<section class="fcta">
+  <h2>Stop paying for local development</h2>
+  <p>One command. 20 services. Real infrastructure. Free.</p>
+  <div class="hacts" style="margin-bottom:1.5rem">
+    <a href="https://github.com/Nahuel990/ministack" target="_blank" class="btn btn-b">
+      <svg width="17" height="17" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+      GitHub</a>
+    <a href="https://hub.docker.com/r/nahuelnucera/ministack" target="_blank" class="btn btn-g">🐳 Docker Hub</a>
+  </div>
+  <div class="cmd" onclick="cp(this)"><span class="p">$</span><span class="c">docker run -p 4566:4566 nahuelnucera/ministack</span><span class="tg">copy</span></div>
+</section>
+
+<footer>Built by <a href="https://github.com/Nahuel990" target="_blank">Nahuel</a> · <a href="https://github.com/Nahuel990/ministack" target="_blank">GitHub</a> · MIT License · 2025</footer>
+
+<script>
+function cp(e){navigator.clipboard.writeText(e.querySelector('.c').textContent).then(()=>{const t=e.querySelector('.tg');t.textContent='copied!';e.classList.add('copied');setTimeout(()=>{t.textContent='copy';e.classList.remove('copied')},2e3)})}
+const o=new IntersectionObserver(e=>{e.forEach(x=>{if(x.isIntersecting){x.target.classList.add('a');o.unobserve(x.target)}})},{threshold:.08,rootMargin:'0px 0px -30px 0px'});
+document.querySelectorAll('.sec .stag,.sec h2,.sdesc,.sc,.fc,.ct,.cbox').forEach(e=>{if(!e.classList.contains('a')){e.style.opacity='0';o.observe(e)}});
+</script>
+</body>
+</html>

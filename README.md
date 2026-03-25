@@ -386,7 +386,7 @@ pip install boto3 pytest duckdb docker cbor2
 # Start MiniStack
 docker compose up -d
 
-# Run the full test suite (54 tests across all 20 services)
+# Run the full test suite (56 tests across all 20 services)
 pytest tests/ -v
 ```
 
@@ -399,7 +399,7 @@ tests/test_services.py::test_s3_put_get PASSED
 ...
 tests/test_services.py::test_athena_workgroup PASSED
 
-54 passed in 7.6s
+56 passed in 7.6s
 ```
 
 ---
