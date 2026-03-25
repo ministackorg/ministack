@@ -473,10 +473,51 @@ def _describe_tasks(data):
                     task = t
                     break
         if task:
+            _maybe_mark_stopped(task)
             result.append({k: v for k, v in task.items() if not k.startswith("_")})
         else:
             failures.append({"arn": ref, "reason": "MISSING"})
     return json_response({"tasks": result, "failures": failures})
+
+
+def _maybe_mark_stopped(task):
+    """Check Docker containers and transition task to STOPPED if all have exited."""
+    if task.get("lastStatus") != "RUNNING" or not task.get("_docker_ids"):
+        return
+
+    docker_client = _get_docker()
+    if not docker_client:
+        return
+
+    all_stopped = True
+    exit_code = 0
+    for docker_id in task["_docker_ids"]:
+        try:
+            container = docker_client.containers.get(docker_id)
+            if container.status != "exited":
+                all_stopped = False
+                break
+            result = container.wait()
+            exit_code = max(exit_code, result.get("StatusCode", 0))
+        except Exception:
+            # Container removed or unreachable — treat as stopped
+            pass
+
+    if not all_stopped:
+        return
+
+    task["lastStatus"] = "STOPPED"
+    task["desiredStatus"] = "STOPPED"
+    task["stoppedAt"] = time.time()
+    task["stoppedReason"] = "Essential container exited"
+    task["stopCode"] = "EssentialContainerExited"
+    for c in task.get("containers", []):
+        c["lastStatus"] = "STOPPED"
+        c["exitCode"] = exit_code
+
+    cluster_name = _resolve_cluster_name(task.get("clusterArn", "").split("/")[-1] if "/" in task.get("clusterArn", "") else "")
+    if cluster_name in _clusters:
+        _clusters[cluster_name]["runningTasksCount"] = max(0, _clusters[cluster_name]["runningTasksCount"] - 1)
 
 
 def _list_tasks(data):
