@@ -5799,3 +5799,426 @@ def test_lambda_function_url_config(lam):
     with pytest.raises(ClientError) as exc:
         lam.get_function_url_config(FunctionName=fn)
     assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
+# -----------------------------------------------------------------------
+# Step Functions — Service Integration Tests
+# -----------------------------------------------------------------------
+
+
+def _wait_sfn(sfn, exec_arn, timeout=10):
+    """Poll DescribeExecution until terminal state."""
+    for _ in range(int(timeout / 0.1)):
+        time.sleep(0.1)
+        desc = sfn.describe_execution(executionArn=exec_arn)
+        if desc["status"] != "RUNNING":
+            return desc
+    return desc
+
+
+def test_sfn_integration_sqs_send_message(sfn, sqs):
+    """Task state sends a message to SQS via arn:aws:states:::sqs:sendMessage."""
+    queue_name = "sfn-integ-sqs-test"
+    q = sqs.create_queue(QueueName=queue_name)
+    queue_url = q["QueueUrl"]
+
+    definition = json.dumps(
+        {
+            "StartAt": "Send",
+            "States": {
+                "Send": {
+                    "Type": "Task",
+                    "Resource": "arn:aws:states:::sqs:sendMessage",
+                    "Parameters": {
+                        "QueueUrl": queue_url,
+                        "MessageBody.$": "$.body",
+                    },
+                    "End": True,
+                },
+            },
+        }
+    )
+    sm = sfn.create_state_machine(
+        name="sfn-sqs-integ",
+        definition=definition,
+        roleArn="arn:aws:iam::000000000000:role/R",
+    )
+    ex = sfn.start_execution(
+        stateMachineArn=sm["stateMachineArn"],
+        input=json.dumps({"body": "hello from sfn"}),
+    )
+
+    desc = _wait_sfn(sfn, ex["executionArn"])
+    assert desc["status"] == "SUCCEEDED"
+    output = json.loads(desc["output"])
+    assert "MessageId" in output
+
+    # Verify the message actually landed in the queue
+    msgs = sqs.receive_message(QueueUrl=queue_url, MaxNumberOfMessages=1)
+    assert len(msgs.get("Messages", [])) == 1
+    assert msgs["Messages"][0]["Body"] == "hello from sfn"
+
+
+def test_sfn_integration_sns_publish(sfn, sns):
+    """Task state publishes to SNS via arn:aws:states:::sns:publish."""
+    topic = sns.create_topic(Name="sfn-integ-sns-test")
+    topic_arn = topic["TopicArn"]
+
+    definition = json.dumps(
+        {
+            "StartAt": "Publish",
+            "States": {
+                "Publish": {
+                    "Type": "Task",
+                    "Resource": "arn:aws:states:::sns:publish",
+                    "Parameters": {
+                        "TopicArn": topic_arn,
+                        "Message.$": "$.msg",
+                    },
+                    "End": True,
+                },
+            },
+        }
+    )
+    sm = sfn.create_state_machine(
+        name="sfn-sns-integ",
+        definition=definition,
+        roleArn="arn:aws:iam::000000000000:role/R",
+    )
+    ex = sfn.start_execution(
+        stateMachineArn=sm["stateMachineArn"],
+        input=json.dumps({"msg": "hello from sfn"}),
+    )
+
+    desc = _wait_sfn(sfn, ex["executionArn"])
+    assert desc["status"] == "SUCCEEDED"
+    output = json.loads(desc["output"])
+    assert "MessageId" in output
+
+
+def test_sfn_integration_dynamodb_put_get(sfn, ddb):
+    """Task states write and read from DynamoDB."""
+    table_name = "sfn-integ-ddb-test"
+    ddb.create_table(
+        TableName=table_name,
+        KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+        AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "S"}],
+        BillingMode="PAY_PER_REQUEST",
+    )
+
+    # State machine: PutItem then GetItem
+    definition = json.dumps(
+        {
+            "StartAt": "Put",
+            "States": {
+                "Put": {
+                    "Type": "Task",
+                    "Resource": "arn:aws:states:::dynamodb:putItem",
+                    "Parameters": {
+                        "TableName": table_name,
+                        "Item": {
+                            "pk": {"S.$": "$.id"},
+                            "data": {"S.$": "$.value"},
+                        },
+                    },
+                    "ResultPath": "$.putResult",
+                    "Next": "Get",
+                },
+                "Get": {
+                    "Type": "Task",
+                    "Resource": "arn:aws:states:::dynamodb:getItem",
+                    "Parameters": {
+                        "TableName": table_name,
+                        "Key": {"pk": {"S.$": "$.id"}},
+                    },
+                    "ResultPath": "$.getResult",
+                    "End": True,
+                },
+            },
+        }
+    )
+    sm = sfn.create_state_machine(
+        name="sfn-ddb-integ",
+        definition=definition,
+        roleArn="arn:aws:iam::000000000000:role/R",
+    )
+    ex = sfn.start_execution(
+        stateMachineArn=sm["stateMachineArn"],
+        input=json.dumps({"id": "item-1", "value": "test-value"}),
+    )
+
+    desc = _wait_sfn(sfn, ex["executionArn"])
+    assert desc["status"] == "SUCCEEDED"
+    output = json.loads(desc["output"])
+    item = output["getResult"]["Item"]
+    assert item["pk"]["S"] == "item-1"
+    assert item["data"]["S"] == "test-value"
+
+
+def test_sfn_integration_dynamodb_error_catch(sfn, ddb):
+    """Task state catches DynamoDB error and routes to fallback."""
+    definition = json.dumps(
+        {
+            "StartAt": "GetMissing",
+            "States": {
+                "GetMissing": {
+                    "Type": "Task",
+                    "Resource": "arn:aws:states:::dynamodb:getItem",
+                    "Parameters": {
+                        "TableName": "nonexistent-table-sfn",
+                        "Key": {"pk": {"S": "x"}},
+                    },
+                    "Catch": [
+                        {
+                            "ErrorEquals": ["States.ALL"],
+                            "Next": "Fallback",
+                            "ResultPath": "$.error",
+                        }
+                    ],
+                    "End": True,
+                },
+                "Fallback": {
+                    "Type": "Pass",
+                    "Result": "caught",
+                    "ResultPath": "$.recovered",
+                    "End": True,
+                },
+            },
+        }
+    )
+    sm = sfn.create_state_machine(
+        name="sfn-ddb-catch",
+        definition=definition,
+        roleArn="arn:aws:iam::000000000000:role/R",
+    )
+    ex = sfn.start_execution(stateMachineArn=sm["stateMachineArn"], input="{}")
+
+    desc = _wait_sfn(sfn, ex["executionArn"])
+    assert desc["status"] == "SUCCEEDED"
+    output = json.loads(desc["output"])
+    assert output["recovered"] == "caught"
+    assert "Error" in output["error"]
+
+
+def test_sfn_integration_ecs_run_task(sfn, ecs):
+    """Task state triggers ecs:runTask (fire-and-forget, no Docker needed)."""
+    ecs.create_cluster(clusterName="sfn-ecs-test")
+    ecs.register_task_definition(
+        family="sfn-task",
+        containerDefinitions=[
+            {
+                "name": "main",
+                "image": "alpine:latest",
+                "command": ["echo", "hi"],
+                "memory": 128,
+            }
+        ],
+    )
+
+    definition = json.dumps(
+        {
+            "StartAt": "RunTask",
+            "States": {
+                "RunTask": {
+                    "Type": "Task",
+                    "Resource": "arn:aws:states:::ecs:runTask",
+                    "Parameters": {
+                        "Cluster": "sfn-ecs-test",
+                        "TaskDefinition": "sfn-task",
+                        "LaunchType": "FARGATE",
+                    },
+                    "End": True,
+                },
+            },
+        }
+    )
+    sm = sfn.create_state_machine(
+        name="sfn-ecs-integ",
+        definition=definition,
+        roleArn="arn:aws:iam::000000000000:role/R",
+    )
+    ex = sfn.start_execution(stateMachineArn=sm["stateMachineArn"], input="{}")
+
+    desc = _wait_sfn(sfn, ex["executionArn"])
+    assert desc["status"] == "SUCCEEDED"
+    output = json.loads(desc["output"])
+    assert "tasks" in output
+
+
+def test_sfn_integration_ecs_run_task_sync_success(sfn, ecs):
+    """ecs:runTask.sync waits for task STOPPED, then returns task result."""
+    import threading
+
+    ecs.create_cluster(clusterName="sfn-ecs-sync-ok")
+    ecs.register_task_definition(
+        family="sfn-sync-ok",
+        containerDefinitions=[{
+            "name": "main", "image": "alpine", "memory": 128,
+        }])
+
+    definition = json.dumps({
+        "StartAt": "Run",
+        "States": {
+            "Run": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::ecs:runTask.sync",
+                "Parameters": {
+                    "Cluster": "sfn-ecs-sync-ok",
+                    "TaskDefinition": "sfn-sync-ok",
+                    "LaunchType": "FARGATE",
+                },
+                "End": True,
+            },
+        },
+    })
+    sm = sfn.create_state_machine(
+        name="sfn-ecs-sync-ok", definition=definition,
+        roleArn="arn:aws:iam::000000000000:role/R")
+
+    # Background thread: poll list_tasks until task appears, then stop it
+    def stop_task_when_ready():
+        for _ in range(30):
+            time.sleep(0.5)
+            try:
+                tasks = ecs.list_tasks(cluster="sfn-ecs-sync-ok")
+                if tasks.get("taskArns"):
+                    ecs.stop_task(
+                        cluster="sfn-ecs-sync-ok",
+                        task=tasks["taskArns"][0],
+                        reason="Test: simulating completion")
+                    return
+            except Exception:
+                pass
+
+    stopper = threading.Thread(target=stop_task_when_ready, daemon=True)
+    stopper.start()
+
+    ex = sfn.start_execution(stateMachineArn=sm["stateMachineArn"], input="{}")
+
+    desc = _wait_sfn(sfn, ex["executionArn"], timeout=20)
+    stopper.join(timeout=5)
+    assert desc["status"] == "SUCCEEDED"
+    output = json.loads(desc["output"])
+    assert "tasks" in output
+    task_out = output["tasks"][0]
+    assert task_out["lastStatus"] == "STOPPED"
+    # Containers should have exitCode 0 (stop_task sets this)
+    for c in task_out.get("containers", []):
+        assert c.get("exitCode") == 0
+
+
+def test_sfn_integration_ecs_run_task_output_contains_status(sfn, ecs):
+    """Fire-and-forget ecs:runTask output contains task status and container info."""
+    ecs.create_cluster(clusterName="sfn-ecs-status")
+    ecs.register_task_definition(
+        family="sfn-status-task",
+        containerDefinitions=[{
+            "name": "app", "image": "nginx:latest", "memory": 256,
+        }])
+
+    definition = json.dumps({
+        "StartAt": "Run",
+        "States": {
+            "Run": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::ecs:runTask",
+                "Parameters": {
+                    "Cluster": "sfn-ecs-status",
+                    "TaskDefinition": "sfn-status-task",
+                    "LaunchType": "FARGATE",
+                },
+                "End": True,
+            },
+        },
+    })
+    sm = sfn.create_state_machine(
+        name="sfn-ecs-status", definition=definition,
+        roleArn="arn:aws:iam::000000000000:role/R")
+    ex = sfn.start_execution(stateMachineArn=sm["stateMachineArn"], input="{}")
+
+    desc = _wait_sfn(sfn, ex["executionArn"])
+    assert desc["status"] == "SUCCEEDED"
+    output = json.loads(desc["output"])
+    assert "tasks" in output
+    assert len(output["tasks"]) == 1
+    task_out = output["tasks"][0]
+    assert "taskArn" in task_out
+    assert "containers" in task_out
+    assert task_out["containers"][0]["name"] == "app"
+    assert task_out["lastStatus"] == "RUNNING"
+    assert "failures" in output
+
+
+def test_sfn_integration_multi_service_pipeline(sfn, sqs, ddb):
+    """End-to-end: Pass → DynamoDB putItem → SQS sendMessage → Succeed."""
+    table_name = "sfn-pipeline-test"
+    ddb.create_table(
+        TableName=table_name,
+        KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+        AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "S"}],
+        BillingMode="PAY_PER_REQUEST",
+    )
+
+    queue_name = "sfn-pipeline-queue"
+    q = sqs.create_queue(QueueName=queue_name)
+    queue_url = q["QueueUrl"]
+
+    definition = json.dumps(
+        {
+            "StartAt": "Enrich",
+            "States": {
+                "Enrich": {
+                    "Type": "Pass",
+                    "Result": "enriched",
+                    "ResultPath": "$.status",
+                    "Next": "SaveToDB",
+                },
+                "SaveToDB": {
+                    "Type": "Task",
+                    "Resource": "arn:aws:states:::dynamodb:putItem",
+                    "Parameters": {
+                        "TableName": table_name,
+                        "Item": {
+                            "pk": {"S.$": "$.id"},
+                            "status": {"S.$": "$.status"},
+                        },
+                    },
+                    "ResultPath": "$.dbResult",
+                    "Next": "Notify",
+                },
+                "Notify": {
+                    "Type": "Task",
+                    "Resource": "arn:aws:states:::sqs:sendMessage",
+                    "Parameters": {
+                        "QueueUrl": queue_url,
+                        "MessageBody.$": "$.id",
+                    },
+                    "ResultPath": "$.sqsResult",
+                    "Next": "Done",
+                },
+                "Done": {
+                    "Type": "Succeed",
+                },
+            },
+        }
+    )
+    sm = sfn.create_state_machine(
+        name="sfn-pipeline",
+        definition=definition,
+        roleArn="arn:aws:iam::000000000000:role/R",
+    )
+    ex = sfn.start_execution(
+        stateMachineArn=sm["stateMachineArn"], input=json.dumps({"id": "order-42"})
+    )
+
+    desc = _wait_sfn(sfn, ex["executionArn"])
+    assert desc["status"] == "SUCCEEDED"
+
+    # Verify DynamoDB
+    item = ddb.get_item(TableName=table_name, Key={"pk": {"S": "order-42"}})
+    assert item["Item"]["status"]["S"] == "enriched"
+
+    # Verify SQS
+    msgs = sqs.receive_message(QueueUrl=queue_url, MaxNumberOfMessages=1)
+    assert len(msgs.get("Messages", [])) == 1
+    assert msgs["Messages"][0]["Body"] == "order-42"

@@ -699,6 +699,12 @@ def _invoke_resource(resource, input_data):
     if func_name:
         return _call_lambda(func_name, input_data)
 
+    # Service integration dispatch
+    clean = resource.replace(".sync", "").replace(".waitForTaskToken", "")
+    for prefix, handler in _SERVICE_DISPATCH.items():
+        if clean.startswith(prefix):
+            return handler(resource, input_data)
+
     return input_data
 
 
@@ -1218,6 +1224,137 @@ def _parse_ts(v):
         except (ValueError, TypeError):
             pass
     return None
+
+
+# ===================================================================
+# Service integrations (Task state dispatch)
+# ===================================================================
+
+
+def _invoke_sqs_send_message(resource, input_data):
+    """arn:aws:states:::sqs:sendMessage"""
+    try:
+        from services import sqs
+    except ImportError:
+        logger.warning("sqs module unavailable; returning passthrough")
+        return input_data
+    try:
+        url = input_data.get("QueueUrl", "")
+        result = sqs._act_send_message(input_data, url)
+        return result
+    except sqs._Err as e:
+        raise _ExecutionError(f"SQS.{e.code}", e.message)
+
+
+def _invoke_sns_publish(resource, input_data):
+    """arn:aws:states:::sns:publish"""
+    try:
+        from services import sns
+    except ImportError:
+        logger.warning("sns module unavailable; returning passthrough")
+        return input_data
+    status, _, body = sns._publish(input_data)
+    if status >= 400:
+        raise _ExecutionError(
+            "SNS.PublishFailed",
+            body.decode("utf-8", "replace") if isinstance(body, bytes) else str(body),
+        )
+    decoded = body.decode() if isinstance(body, bytes) else body
+    m = re.search(r"<MessageId>(.+?)</MessageId>", decoded)
+    msg_id = m.group(1) if m else new_uuid()
+    return {"MessageId": msg_id}
+
+
+def _invoke_dynamodb(op_name, input_data):
+    """arn:aws:states:::dynamodb:{putItem,getItem,deleteItem,updateItem}"""
+    try:
+        from services import dynamodb
+    except ImportError:
+        logger.warning("dynamodb module unavailable; returning passthrough")
+        return input_data
+    fn_map = {
+        "putItem": dynamodb._put_item,
+        "getItem": dynamodb._get_item,
+        "deleteItem": dynamodb._delete_item,
+        "updateItem": dynamodb._update_item,
+    }
+    fn = fn_map.get(op_name)
+    if not fn:
+        raise _ExecutionError(
+            "States.Runtime", f"Unsupported DynamoDB operation: {op_name}"
+        )
+    status, _, body = fn(input_data)
+    result = json.loads(body) if body else {}
+    if status >= 400:
+        error_type = result.get("__type", "DynamoDB.AmazonDynamoDBException")
+        raise _ExecutionError(error_type, result.get("message", ""))
+    return result
+
+
+def _invoke_ecs_run_task(resource, input_data):
+    """arn:aws:states:::ecs:runTask[.sync]"""
+    try:
+        from services import ecs
+    except ImportError:
+        logger.warning("ecs module unavailable; returning passthrough")
+        return input_data
+    ecs_data = _pascal_to_camel(input_data)
+    status, _, body = ecs._run_task(ecs_data)
+    result = json.loads(body) if body else {}
+    if status >= 400:
+        raise _ExecutionError("ECS.RunTaskFailed", result.get("message", str(result)))
+
+    is_sync = resource.rstrip("/").endswith(".sync")
+    if is_sync and result.get("tasks"):
+        task_arns = [t["taskArn"] for t in result["tasks"]]
+        cluster = ecs_data.get("cluster", "default")
+        result = _poll_ecs_tasks(cluster, task_arns)
+
+    return result
+
+
+def _poll_ecs_tasks(cluster, task_arns):
+    """Poll DescribeTasks until all tasks are STOPPED (max 10 min).
+
+    Returns the full DescribeTasks result including exit codes — the state
+    machine definition decides how to handle success/failure via Choice or Catch.
+    """
+    from services import ecs
+
+    for _ in range(600):
+        time.sleep(1)
+        status, _, body = ecs._describe_tasks({"cluster": cluster, "tasks": task_arns})
+        result = json.loads(body) if body else {}
+        tasks = result.get("tasks", [])
+        if tasks and all(t.get("lastStatus") == "STOPPED" for t in tasks):
+            return result
+    raise _ExecutionError("States.Timeout", "ECS tasks did not complete in time")
+
+
+def _pascal_to_camel(d):
+    """Convert top-level PascalCase keys to camelCase for ECS internals."""
+    if not isinstance(d, dict):
+        return d
+    out = {}
+    for k, v in d.items():
+        new_key = k[0].lower() + k[1:] if k else k
+        out[new_key] = v
+    return out
+
+
+_SERVICE_DISPATCH = {
+    "arn:aws:states:::sqs:sendMessage": _invoke_sqs_send_message,
+    "arn:aws:states:::sns:publish": _invoke_sns_publish,
+    "arn:aws:states:::dynamodb:putItem": lambda r, d: _invoke_dynamodb("putItem", d),
+    "arn:aws:states:::dynamodb:getItem": lambda r, d: _invoke_dynamodb("getItem", d),
+    "arn:aws:states:::dynamodb:deleteItem": lambda r, d: _invoke_dynamodb(
+        "deleteItem", d
+    ),
+    "arn:aws:states:::dynamodb:updateItem": lambda r, d: _invoke_dynamodb(
+        "updateItem", d
+    ),
+    "arn:aws:states:::ecs:runTask": _invoke_ecs_run_task,
+}
 
 
 def reset():
