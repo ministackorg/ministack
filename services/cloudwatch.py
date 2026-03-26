@@ -38,6 +38,7 @@ _dashboards: dict = {}  # dashboard_name -> {DashboardName, DashboardBody, LastM
 # Timestamp helpers
 # ---------------------------------------------------------------------------
 
+
 def _parse_ts(value):
     """Parse ISO-8601 string, epoch float, or None into a Unix timestamp."""
     if value is None:
@@ -52,9 +53,13 @@ def _parse_ts(value):
             return float(value)
         except ValueError:
             pass
-        for fmt in ("%Y-%m-%dT%H:%M:%S.%fZ", "%Y-%m-%dT%H:%M:%SZ",
-                    "%Y-%m-%dT%H:%M:%S.%f%z", "%Y-%m-%dT%H:%M:%S%z",
-                    "%Y-%m-%dT%H:%M:%S"):
+        for fmt in (
+            "%Y-%m-%dT%H:%M:%S.%fZ",
+            "%Y-%m-%dT%H:%M:%SZ",
+            "%Y-%m-%dT%H:%M:%S.%f%z",
+            "%Y-%m-%dT%H:%M:%S%z",
+            "%Y-%m-%dT%H:%M:%S",
+        ):
             try:
                 dt = datetime.strptime(value, fmt)
                 if dt.tzinfo is None:
@@ -73,6 +78,7 @@ def _ts_iso(epoch):
 # Metric eviction
 # ---------------------------------------------------------------------------
 
+
 def _evict_old_metrics():
     cutoff = time.time() - TWO_WEEKS_SECONDS
     empty_keys = []
@@ -87,6 +93,7 @@ def _evict_old_metrics():
 # ---------------------------------------------------------------------------
 # Statistics helpers
 # ---------------------------------------------------------------------------
+
 
 def _calc_stats(values):
     if not values:
@@ -112,6 +119,7 @@ def _stat_value(stats, stat_name):
 # ---------------------------------------------------------------------------
 # Alarm evaluation
 # ---------------------------------------------------------------------------
+
 
 def _evaluate_alarm(alarm):
     ns = alarm.get("Namespace")
@@ -167,23 +175,28 @@ def _evaluate_all_alarms():
 
 
 def _record_history(alarm_name, old_state, new_state, reason):
-    _alarm_history.append({
-        "AlarmName": alarm_name,
-        "AlarmType": "MetricAlarm",
-        "Timestamp": _ts_iso(time.time()),
-        "HistoryItemType": "StateUpdate",
-        "HistorySummary": f"Alarm updated from {old_state} to {new_state}",
-        "HistoryData": json.dumps({
-            "version": "1.0",
-            "oldState": {"stateValue": old_state},
-            "newState": {"stateValue": new_state, "stateReason": reason},
-        }),
-    })
+    _alarm_history.append(
+        {
+            "AlarmName": alarm_name,
+            "AlarmType": "MetricAlarm",
+            "Timestamp": _ts_iso(time.time()),
+            "HistoryItemType": "StateUpdate",
+            "HistorySummary": f"Alarm updated from {old_state} to {new_state}",
+            "HistoryData": json.dumps(
+                {
+                    "version": "1.0",
+                    "oldState": {"stateValue": old_state},
+                    "newState": {"stateValue": new_state, "stateReason": reason},
+                }
+            ),
+        }
+    )
 
 
 # ---------------------------------------------------------------------------
 # Request dispatcher
 # ---------------------------------------------------------------------------
+
 
 async def handle_request(method, path, headers, body, query_params):
     content_type = headers.get("content-type", "")
@@ -198,6 +211,7 @@ async def handle_request(method, path, headers, body, query_params):
         if is_cbor:
             try:
                 import cbor2
+
                 cbor_data = cbor2.loads(body) or {}
             except Exception as e:
                 logger.error(f"CBOR decode error: {e}")
@@ -249,13 +263,16 @@ async def handle_request(method, path, headers, body, query_params):
 
     handler = handlers.get(action)
     if not handler:
-        return _error("InvalidAction", f"Unknown action: {action}", 400, is_cbor or is_json)
+        return _error(
+            "InvalidAction", f"Unknown action: {action}", 400, is_cbor or is_json
+        )
     return handler(params, cbor_data, is_cbor, is_json)
 
 
 # ---------------------------------------------------------------------------
 # PutMetricData
 # ---------------------------------------------------------------------------
+
 
 def _put_metric_data(params, cbor_data, is_cbor, is_json=False):
     if is_cbor or is_json:
@@ -269,28 +286,35 @@ def _put_metric_data(params, cbor_data, is_cbor, is_json=False):
                 counts = md.get("Counts", [1.0] * len(values))
                 for v, c in zip(values, counts):
                     for _ in range(int(c)):
-                        _metrics[(namespace, mn, _dims_key(dims))].append({
-                            "Timestamp": _parse_ts(md.get("Timestamp")) or time.time(),
-                            "Value": float(v),
-                            "Unit": md.get("Unit", "None"),
-                            "Dimensions": dims,
-                        })
+                        _metrics[(namespace, mn, _dims_key(dims))].append(
+                            {
+                                "Timestamp": _parse_ts(md.get("Timestamp"))
+                                or time.time(),
+                                "Value": float(v),
+                                "Unit": md.get("Unit", "None"),
+                                "Dimensions": dims,
+                            }
+                        )
             elif "StatisticValues" in md:
                 sv = md["StatisticValues"]
-                _metrics[(namespace, mn, _dims_key(dims))].append({
-                    "Timestamp": _parse_ts(md.get("Timestamp")) or time.time(),
-                    "Value": sv.get("Sum", 0) / max(sv.get("SampleCount", 1), 1),
-                    "Unit": md.get("Unit", "None"),
-                    "Dimensions": dims,
-                    "_stat": sv,
-                })
+                _metrics[(namespace, mn, _dims_key(dims))].append(
+                    {
+                        "Timestamp": _parse_ts(md.get("Timestamp")) or time.time(),
+                        "Value": sv.get("Sum", 0) / max(sv.get("SampleCount", 1), 1),
+                        "Unit": md.get("Unit", "None"),
+                        "Dimensions": dims,
+                        "_stat": sv,
+                    }
+                )
             else:
-                _metrics[(namespace, mn, _dims_key(dims))].append({
-                    "Timestamp": _parse_ts(md.get("Timestamp")) or time.time(),
-                    "Value": float(md.get("Value", 0)),
-                    "Unit": md.get("Unit", "None"),
-                    "Dimensions": dims,
-                })
+                _metrics[(namespace, mn, _dims_key(dims))].append(
+                    {
+                        "Timestamp": _parse_ts(md.get("Timestamp")) or time.time(),
+                        "Value": float(md.get("Value", 0)),
+                        "Unit": md.get("Unit", "None"),
+                        "Dimensions": dims,
+                    }
+                )
     else:
         namespace = _p(params, "Namespace")
         i = 1
@@ -303,12 +327,18 @@ def _put_metric_data(params, cbor_data, is_cbor, is_json=False):
             dims = {}
             j = 1
             while _p(params, f"MetricData.member.{i}.Dimensions.member.{j}.Name"):
-                dims[_p(params, f"MetricData.member.{i}.Dimensions.member.{j}.Name")] = \
-                    _p(params, f"MetricData.member.{i}.Dimensions.member.{j}.Value")
+                dims[
+                    _p(params, f"MetricData.member.{i}.Dimensions.member.{j}.Name")
+                ] = _p(params, f"MetricData.member.{i}.Dimensions.member.{j}.Value")
                 j += 1
-            _metrics[(namespace, mn, _dims_key(dims))].append({
-                "Timestamp": ts, "Value": value, "Unit": unit, "Dimensions": dims,
-            })
+            _metrics[(namespace, mn, _dims_key(dims))].append(
+                {
+                    "Timestamp": ts,
+                    "Value": value,
+                    "Unit": unit,
+                    "Dimensions": dims,
+                }
+            )
             i += 1
 
     _evaluate_all_alarms()
@@ -323,6 +353,7 @@ def _put_metric_data(params, cbor_data, is_cbor, is_json=False):
 # ---------------------------------------------------------------------------
 # ListMetrics
 # ---------------------------------------------------------------------------
+
 
 def _list_metrics(params, cbor_data, is_cbor, is_json=False):
     if is_cbor or is_json:
@@ -345,13 +376,18 @@ def _list_metrics(params, cbor_data, is_cbor, is_json=False):
         if key in seen:
             continue
         seen.add(key)
-        dims = [{"Name": k, "Value": v}
-                for k, v in (points[0].get("Dimensions", {}) if points else {}).items()]
+        dims = [
+            {"Name": k, "Value": v}
+            for k, v in (points[0].get("Dimensions", {}) if points else {}).items()
+        ]
 
         if req_dims:
             match = all(
-                any(d["Name"] == rd.get("Name") and (not rd.get("Value") or d["Value"] == rd["Value"])
-                    for d in dims)
+                any(
+                    d["Name"] == rd.get("Name")
+                    and (not rd.get("Value") or d["Value"] == rd["Value"])
+                    for d in dims
+                )
                 for rd in req_dims
             )
             if not match:
@@ -368,17 +404,24 @@ def _list_metrics(params, cbor_data, is_cbor, is_json=False):
     for item in result:
         dims_xml = "".join(
             f"<member><Name>{d['Name']}</Name><Value>{d['Value']}</Value></member>"
-            for d in item["Dimensions"])
-        members += (f"<member><Namespace>{item['Namespace']}</Namespace>"
-                    f"<MetricName>{item['MetricName']}</MetricName>"
-                    f"<Dimensions>{dims_xml}</Dimensions></member>")
-    return _xml(200, "ListMetricsResponse",
-                f"<ListMetricsResult><Metrics>{members}</Metrics></ListMetricsResult>")
+            for d in item["Dimensions"]
+        )
+        members += (
+            f"<member><Namespace>{item['Namespace']}</Namespace>"
+            f"<MetricName>{item['MetricName']}</MetricName>"
+            f"<Dimensions>{dims_xml}</Dimensions></member>"
+        )
+    return _xml(
+        200,
+        "ListMetricsResponse",
+        f"<ListMetricsResult><Metrics>{members}</Metrics></ListMetricsResult>",
+    )
 
 
 # ---------------------------------------------------------------------------
 # GetMetricStatistics — with time-range filtering + period aggregation
 # ---------------------------------------------------------------------------
+
 
 def _get_metric_statistics(params, cbor_data, is_cbor, is_json=False):
     if is_cbor or is_json:
@@ -422,7 +465,10 @@ def _get_metric_statistics(params, cbor_data, is_cbor, is_json=False):
     for ts in sorted(buckets):
         vals = buckets[ts]
         stats = _calc_stats(vals)
-        dp = {"Timestamp": _ts_iso(ts), "Unit": all_points[0]["Unit"] if all_points else "None"}
+        dp = {
+            "Timestamp": _ts_iso(ts),
+            "Unit": all_points[0]["Unit"] if all_points else "None",
+        }
         for s in req_stats:
             if s in stats:
                 dp[s] = stats[s]
@@ -434,9 +480,12 @@ def _get_metric_statistics(params, cbor_data, is_cbor, is_json=False):
         return _json_ok({"Datapoints": datapoints, "Label": metric_name})
 
     if not datapoints:
-        return _xml(200, "GetMetricStatisticsResponse",
-                    f"<GetMetricStatisticsResult><Datapoints/><Label>{metric_name}</Label>"
-                    f"</GetMetricStatisticsResult>")
+        return _xml(
+            200,
+            "GetMetricStatisticsResponse",
+            f"<GetMetricStatisticsResult><Datapoints/><Label>{metric_name}</Label>"
+            f"</GetMetricStatisticsResult>",
+        )
     dps = ""
     for dp in datapoints:
         inner = f"<Timestamp>{dp['Timestamp']}</Timestamp>"
@@ -444,23 +493,64 @@ def _get_metric_statistics(params, cbor_data, is_cbor, is_json=False):
             if k not in ("Timestamp",):
                 inner += f"<{k}>{v}</{k}>"
         dps += f"<member>{inner}</member>"
-    return _xml(200, "GetMetricStatisticsResponse",
-                f"<GetMetricStatisticsResult><Datapoints>{dps}</Datapoints>"
-                f"<Label>{metric_name}</Label></GetMetricStatisticsResult>")
+    return _xml(
+        200,
+        "GetMetricStatisticsResponse",
+        f"<GetMetricStatisticsResult><Datapoints>{dps}</Datapoints>"
+        f"<Label>{metric_name}</Label></GetMetricStatisticsResult>",
+    )
 
 
 # ---------------------------------------------------------------------------
 # GetMetricData — modern multi-query API
 # ---------------------------------------------------------------------------
 
-def _get_metric_data(params, cbor_data, is_cbor, is_json=False):
-    if not (is_cbor or is_json):
-        return _error("InvalidParameterValue",
-                      "GetMetricData is only supported via JSON/CBOR", 400, False)
 
-    queries = cbor_data.get("MetricDataQueries", [])
-    start_time = _parse_ts(cbor_data.get("StartTime"))
-    end_time = _parse_ts(cbor_data.get("EndTime"))
+def _get_metric_data(params, cbor_data, is_cbor, is_json=False):
+    if is_cbor or is_json:
+        queries = cbor_data.get("MetricDataQueries", [])
+        start_time = _parse_ts(cbor_data.get("StartTime"))
+        end_time = _parse_ts(cbor_data.get("EndTime"))
+    else:
+        # Query protocol (form-encoded). Support the subset used by our tests.
+        queries = []
+        qi = 1
+        while _p(params, f"MetricDataQueries.member.{qi}.Id"):
+            qid = _p(params, f"MetricDataQueries.member.{qi}.Id")
+            label = _p(params, f"MetricDataQueries.member.{qi}.Label") or qid
+            return_data = _p(params, f"MetricDataQueries.member.{qi}.ReturnData")
+            return_data = return_data != "false"
+            ns = _p(
+                params,
+                f"MetricDataQueries.member.{qi}.MetricStat.Metric.Namespace",
+            )
+            mn = _p(
+                params,
+                f"MetricDataQueries.member.{qi}.MetricStat.Metric.MetricName",
+            )
+            period = int(
+                _p(params, f"MetricDataQueries.member.{qi}.MetricStat.Period") or "60"
+            )
+            stat_name = (
+                _p(params, f"MetricDataQueries.member.{qi}.MetricStat.Stat")
+                or "Average"
+            )
+            queries.append(
+                {
+                    "Id": qid,
+                    "Label": label,
+                    "ReturnData": return_data,
+                    "MetricStat": {
+                        "Metric": {"Namespace": ns, "MetricName": mn},
+                        "Period": period,
+                        "Stat": stat_name,
+                    },
+                }
+            )
+            qi += 1
+
+        start_time = _parse_ts(_p(params, "StartTime"))
+        end_time = _parse_ts(_p(params, "EndTime"))
 
     results = []
     for q in queries:
@@ -469,12 +559,18 @@ def _get_metric_data(params, cbor_data, is_cbor, is_json=False):
         return_data = q.get("ReturnData", True)
 
         if q.get("Expression"):
-            results.append({
-                "Id": qid, "Label": label,
-                "StatusCode": "InternalError",
-                "Messages": [{"Code": "Unsupported", "Value": "Expressions not implemented"}],
-                "Timestamps": [], "Values": [],
-            })
+            results.append(
+                {
+                    "Id": qid,
+                    "Label": label,
+                    "StatusCode": "InternalError",
+                    "Messages": [
+                        {"Code": "Unsupported", "Value": "Expressions not implemented"}
+                    ],
+                    "Timestamps": [],
+                    "Values": [],
+                }
+            )
             continue
 
         ms = q.get("MetricStat", {})
@@ -506,20 +602,45 @@ def _get_metric_data(params, cbor_data, is_cbor, is_json=False):
             values.append(_stat_value(stats, stat_name))
 
         if return_data:
-            results.append({
-                "Id": qid, "Label": label,
-                "Timestamps": timestamps, "Values": values,
-                "StatusCode": "Complete",
-            })
+            results.append(
+                {
+                    "Id": qid,
+                    "Label": label,
+                    "Timestamps": timestamps,
+                    "Values": values,
+                    "StatusCode": "Complete",
+                }
+            )
 
     if is_cbor:
         return _cbor_ok({"MetricDataResults": results})
-    return _json_ok({"MetricDataResults": results})
+    if is_json:
+        return _json_ok({"MetricDataResults": results})
+
+    members = ""
+    for r in results:
+        ts_members = "".join(f"<member>{t}</member>" for t in r.get("Timestamps", []))
+        val_members = "".join(f"<member>{v}</member>" for v in r.get("Values", []))
+        members += (
+            "<member>"
+            f"<Id>{r.get('Id','')}</Id>"
+            f"<Label>{r.get('Label','')}</Label>"
+            f"<StatusCode>{r.get('StatusCode','Complete')}</StatusCode>"
+            f"<Timestamps>{ts_members}</Timestamps>"
+            f"<Values>{val_members}</Values>"
+            "</member>"
+        )
+    return _xml(
+        200,
+        "GetMetricDataResponse",
+        f"<GetMetricDataResult><MetricDataResults>{members}</MetricDataResults></GetMetricDataResult>",
+    )
 
 
 # ---------------------------------------------------------------------------
 # Alarms
 # ---------------------------------------------------------------------------
+
 
 def _put_metric_alarm(params, cbor_data, is_cbor, is_json=False):
     if is_cbor or is_json:
@@ -534,13 +655,19 @@ def _put_metric_alarm(params, cbor_data, is_cbor, is_json=False):
             "ExtendedStatistic": cbor_data.get("ExtendedStatistic"),
             "Period": int(cbor_data.get("Period", 60)),
             "EvaluationPeriods": int(cbor_data.get("EvaluationPeriods", 1)),
-            "DatapointsToAlarm": int(cbor_data.get("DatapointsToAlarm")
-                                     or cbor_data.get("EvaluationPeriods", 1)),
+            "DatapointsToAlarm": int(
+                cbor_data.get("DatapointsToAlarm")
+                or cbor_data.get("EvaluationPeriods", 1)
+            ),
             "Threshold": float(cbor_data.get("Threshold", 0)),
             "ComparisonOperator": cbor_data.get("ComparisonOperator"),
             "TreatMissingData": cbor_data.get("TreatMissingData", "missing"),
-            "StateValue": _alarms[name]["StateValue"] if name in _alarms else "INSUFFICIENT_DATA",
-            "StateReason": _alarms[name]["StateReason"] if name in _alarms else "Unchecked: Initial alarm creation",
+            "StateValue": _alarms[name]["StateValue"]
+            if name in _alarms
+            else "INSUFFICIENT_DATA",
+            "StateReason": _alarms[name]["StateReason"]
+            if name in _alarms
+            else "Unchecked: Initial alarm creation",
             "StateUpdatedTimestamp": time.time(),
             "ActionsEnabled": cbor_data.get("ActionsEnabled", True),
             "AlarmActions": cbor_data.get("AlarmActions", []),
@@ -555,10 +682,12 @@ def _put_metric_alarm(params, cbor_data, is_cbor, is_json=False):
         dims = []
         di = 1
         while _p(params, f"Dimensions.member.{di}.Name"):
-            dims.append({
-                "Name": _p(params, f"Dimensions.member.{di}.Name"),
-                "Value": _p(params, f"Dimensions.member.{di}.Value"),
-            })
+            dims.append(
+                {
+                    "Name": _p(params, f"Dimensions.member.{di}.Name"),
+                    "Value": _p(params, f"Dimensions.member.{di}.Value"),
+                }
+            )
             di += 1
         alarm_actions = []
         ai = 1
@@ -580,13 +709,20 @@ def _put_metric_alarm(params, cbor_data, is_cbor, is_json=False):
             "ExtendedStatistic": _p(params, "ExtendedStatistic") or None,
             "Period": int(_p(params, "Period") or "60"),
             "EvaluationPeriods": int(_p(params, "EvaluationPeriods") or "1"),
-            "DatapointsToAlarm": int(_p(params, "DatapointsToAlarm")
-                                     or _p(params, "EvaluationPeriods") or "1"),
+            "DatapointsToAlarm": int(
+                _p(params, "DatapointsToAlarm")
+                or _p(params, "EvaluationPeriods")
+                or "1"
+            ),
             "Threshold": float(_p(params, "Threshold") or "0"),
             "ComparisonOperator": _p(params, "ComparisonOperator"),
             "TreatMissingData": _p(params, "TreatMissingData") or "missing",
-            "StateValue": _alarms[name]["StateValue"] if name in _alarms else "INSUFFICIENT_DATA",
-            "StateReason": _alarms[name]["StateReason"] if name in _alarms else "Unchecked: Initial alarm creation",
+            "StateValue": _alarms[name]["StateValue"]
+            if name in _alarms
+            else "INSUFFICIENT_DATA",
+            "StateReason": _alarms[name]["StateReason"]
+            if name in _alarms
+            else "Unchecked: Initial alarm creation",
             "StateUpdatedTimestamp": time.time(),
             "ActionsEnabled": _p(params, "ActionsEnabled") != "false",
             "AlarmActions": alarm_actions,
@@ -601,8 +737,12 @@ def _put_metric_alarm(params, cbor_data, is_cbor, is_json=False):
     _alarms[name] = alarm
 
     if is_new:
-        _record_history(name, "INSUFFICIENT_DATA", "INSUFFICIENT_DATA",
-                        "Unchecked: Initial alarm creation")
+        _record_history(
+            name,
+            "INSUFFICIENT_DATA",
+            "INSUFFICIENT_DATA",
+            "Unchecked: Initial alarm creation",
+        )
 
     _evaluate_alarm(alarm)
 
@@ -614,32 +754,60 @@ def _put_metric_alarm(params, cbor_data, is_cbor, is_json=False):
 
 
 def _put_composite_alarm(params, cbor_data, is_cbor, is_json=False):
-    if not (is_cbor or is_json):
-        return _error("InvalidParameterValue",
-                      "PutCompositeAlarm only supported via JSON/CBOR", 400, False)
-    name = cbor_data.get("AlarmName", "")
+    if is_cbor or is_json:
+        name = cbor_data.get("AlarmName", "")
+        alarm_rule = cbor_data.get("AlarmRule", "")
+        desc = cbor_data.get("AlarmDescription", "")
+        actions_enabled = cbor_data.get("ActionsEnabled", True)
+        alarm_actions = cbor_data.get("AlarmActions", [])
+        ok_actions = cbor_data.get("OKActions", [])
+        insuff_actions = cbor_data.get("InsufficientDataActions", [])
+    else:
+        name = _p(params, "AlarmName")
+        alarm_rule = _p(params, "AlarmRule")
+        desc = _p(params, "AlarmDescription")
+        actions_enabled = _p(params, "ActionsEnabled") != "false"
+        alarm_actions = []
+        ai = 1
+        while _p(params, f"AlarmActions.member.{ai}"):
+            alarm_actions.append(_p(params, f"AlarmActions.member.{ai}"))
+            ai += 1
+        ok_actions = []
+        oi = 1
+        while _p(params, f"OKActions.member.{oi}"):
+            ok_actions.append(_p(params, f"OKActions.member.{oi}"))
+            oi += 1
+        insuff_actions = []
+        ii = 1
+        while _p(params, f"InsufficientDataActions.member.{ii}"):
+            insuff_actions.append(_p(params, f"InsufficientDataActions.member.{ii}"))
+            ii += 1
+
     _composite_alarms[name] = {
         "AlarmName": name,
         "AlarmArn": f"arn:aws:cloudwatch:{REGION}:{ACCOUNT_ID}:alarm:{name}",
-        "AlarmDescription": cbor_data.get("AlarmDescription", ""),
-        "AlarmRule": cbor_data.get("AlarmRule", ""),
+        "AlarmDescription": desc,
+        "AlarmRule": alarm_rule,
         "StateValue": "INSUFFICIENT_DATA",
         "StateReason": "Unchecked: Initial alarm creation",
         "StateUpdatedTimestamp": time.time(),
-        "ActionsEnabled": cbor_data.get("ActionsEnabled", True),
-        "AlarmActions": cbor_data.get("AlarmActions", []),
-        "OKActions": cbor_data.get("OKActions", []),
-        "InsufficientDataActions": cbor_data.get("InsufficientDataActions", []),
+        "ActionsEnabled": actions_enabled,
+        "AlarmActions": alarm_actions,
+        "OKActions": ok_actions,
+        "InsufficientDataActions": insuff_actions,
         "AlarmConfigurationUpdatedTimestamp": time.time(),
     }
     if is_cbor:
         return _cbor_ok({})
-    return _json_ok({})
+    if is_json:
+        return _json_ok({})
+    return _xml(200, "PutCompositeAlarmResponse", "<PutCompositeAlarmResult/>")
 
 
 # ---------------------------------------------------------------------------
 # DescribeAlarms
 # ---------------------------------------------------------------------------
+
 
 def _describe_alarms(params, cbor_data, is_cbor, is_json=False):
     if is_cbor or is_json:
@@ -649,11 +817,18 @@ def _describe_alarms(params, cbor_data, is_cbor, is_json=False):
         alarm_types = cbor_data.get("AlarmTypes", ["MetricAlarm", "CompositeAlarm"])
         max_records = cbor_data.get("MaxRecords", 100)
     else:
-        names = [_p(params, f"AlarmNames.member.{i}")
-                 for i in range(1, 101) if _p(params, f"AlarmNames.member.{i}")]
+        names = [
+            _p(params, f"AlarmNames.member.{i}")
+            for i in range(1, 101)
+            if _p(params, f"AlarmNames.member.{i}")
+        ]
         prefix = _p(params, "AlarmNamePrefix")
         state = _p(params, "StateValue")
-        alarm_types = ["MetricAlarm", "CompositeAlarm"]
+        alarm_types = [
+            _p(params, f"AlarmTypes.member.{i}")
+            for i in range(1, 11)
+            if _p(params, f"AlarmTypes.member.{i}")
+        ] or ["MetricAlarm", "CompositeAlarm"]
         max_records = int(_p(params, "MaxRecords") or "100")
 
     metric_alarms = []
@@ -682,24 +857,46 @@ def _describe_alarms(params, cbor_data, is_cbor, is_json=False):
     metric_alarms = metric_alarms[:max_records]
 
     if is_cbor:
-        return _cbor_ok({"MetricAlarms": metric_alarms, "CompositeAlarms": composite_results})
+        return _cbor_ok(
+            {"MetricAlarms": metric_alarms, "CompositeAlarms": composite_results}
+        )
     if is_json:
-        return _json_ok({"MetricAlarms": metric_alarms, "CompositeAlarms": composite_results})
+        return _json_ok(
+            {"MetricAlarms": metric_alarms, "CompositeAlarms": composite_results}
+        )
 
-    members = "".join(
+    metric_members = "".join(
         f"<member><AlarmName>{a['AlarmName']}</AlarmName><AlarmArn>{a['AlarmArn']}</AlarmArn>"
         f"<StateValue>{a['StateValue']}</StateValue><MetricName>{a.get('MetricName','')}</MetricName>"
         f"<Namespace>{a.get('Namespace','')}</Namespace><Threshold>{a.get('Threshold','')}</Threshold>"
-        f"<ComparisonOperator>{a.get('ComparisonOperator','')}</ComparisonOperator></member>"
+        f"<ComparisonOperator>{a.get('ComparisonOperator','')}</ComparisonOperator>"
+        f"<EvaluationPeriods>{a.get('EvaluationPeriods','')}</EvaluationPeriods>"
+        f"<StateReason>{a.get('StateReason','')}</StateReason>"
+        f"</member>"
         for a in metric_alarms
     )
-    return _xml(200, "DescribeAlarmsResponse",
-                f"<DescribeAlarmsResult><MetricAlarms>{members}</MetricAlarms></DescribeAlarmsResult>")
+    comp_members = "".join(
+        f"<member><AlarmName>{a['AlarmName']}</AlarmName><AlarmArn>{a['AlarmArn']}</AlarmArn>"
+        f"<AlarmRule>{a.get('AlarmRule','')}</AlarmRule>"
+        f"<StateValue>{a.get('StateValue','')}</StateValue>"
+        f"<StateReason>{a.get('StateReason','')}</StateReason>"
+        f"</member>"
+        for a in composite_results
+    )
+    return _xml(
+        200,
+        "DescribeAlarmsResponse",
+        f"<DescribeAlarmsResult>"
+        f"<MetricAlarms>{metric_members}</MetricAlarms>"
+        f"<CompositeAlarms>{comp_members}</CompositeAlarms>"
+        f"</DescribeAlarmsResult>",
+    )
 
 
 # ---------------------------------------------------------------------------
 # DescribeAlarmsForMetric
 # ---------------------------------------------------------------------------
+
 
 def _describe_alarms_for_metric(params, cbor_data, is_cbor, is_json=False):
     if is_cbor or is_json:
@@ -709,8 +906,11 @@ def _describe_alarms_for_metric(params, cbor_data, is_cbor, is_json=False):
         namespace = _p(params, "Namespace")
         metric_name = _p(params, "MetricName")
 
-    result = [a for a in _alarms.values()
-              if a.get("Namespace") == namespace and a.get("MetricName") == metric_name]
+    result = [
+        a
+        for a in _alarms.values()
+        if a.get("Namespace") == namespace and a.get("MetricName") == metric_name
+    ]
 
     if is_cbor:
         return _cbor_ok({"MetricAlarms": result})
@@ -722,14 +922,18 @@ def _describe_alarms_for_metric(params, cbor_data, is_cbor, is_json=False):
         f"<StateValue>{a['StateValue']}</StateValue></member>"
         for a in result
     )
-    return _xml(200, "DescribeAlarmsForMetricResponse",
-                f"<DescribeAlarmsForMetricResult><MetricAlarms>{members}</MetricAlarms>"
-                f"</DescribeAlarmsForMetricResult>")
+    return _xml(
+        200,
+        "DescribeAlarmsForMetricResponse",
+        f"<DescribeAlarmsForMetricResult><MetricAlarms>{members}</MetricAlarms>"
+        f"</DescribeAlarmsForMetricResult>",
+    )
 
 
 # ---------------------------------------------------------------------------
 # DescribeAlarmHistory
 # ---------------------------------------------------------------------------
+
 
 def _describe_alarm_history(params, cbor_data, is_cbor, is_json=False):
     if is_cbor or is_json:
@@ -768,14 +972,18 @@ def _describe_alarm_history(params, cbor_data, is_cbor, is_json=False):
         f"<HistorySummary>{h['HistorySummary']}</HistorySummary></member>"
         for h in items
     )
-    return _xml(200, "DescribeAlarmHistoryResponse",
-                f"<DescribeAlarmHistoryResult><AlarmHistoryItems>{members}</AlarmHistoryItems>"
-                f"</DescribeAlarmHistoryResult>")
+    return _xml(
+        200,
+        "DescribeAlarmHistoryResponse",
+        f"<DescribeAlarmHistoryResult><AlarmHistoryItems>{members}</AlarmHistoryItems>"
+        f"</DescribeAlarmHistoryResult>",
+    )
 
 
 # ---------------------------------------------------------------------------
 # DeleteAlarms / Enable / Disable
 # ---------------------------------------------------------------------------
+
 
 def _delete_alarms(params, cbor_data, is_cbor, is_json=False):
     if is_cbor or is_json:
@@ -803,8 +1011,11 @@ def _enable_alarm_actions(params, cbor_data, is_cbor, is_json=False):
     if is_cbor or is_json:
         names = cbor_data.get("AlarmNames", [])
     else:
-        names = [_p(params, f"AlarmNames.member.{i}")
-                 for i in range(1, 101) if _p(params, f"AlarmNames.member.{i}")]
+        names = [
+            _p(params, f"AlarmNames.member.{i}")
+            for i in range(1, 101)
+            if _p(params, f"AlarmNames.member.{i}")
+        ]
     for n in names:
         if n in _alarms:
             _alarms[n]["ActionsEnabled"] = True
@@ -821,8 +1032,11 @@ def _disable_alarm_actions(params, cbor_data, is_cbor, is_json=False):
     if is_cbor or is_json:
         names = cbor_data.get("AlarmNames", [])
     else:
-        names = [_p(params, f"AlarmNames.member.{i}")
-                 for i in range(1, 101) if _p(params, f"AlarmNames.member.{i}")]
+        names = [
+            _p(params, f"AlarmNames.member.{i}")
+            for i in range(1, 101)
+            if _p(params, f"AlarmNames.member.{i}")
+        ]
     for n in names:
         if n in _alarms:
             _alarms[n]["ActionsEnabled"] = False
@@ -839,6 +1053,7 @@ def _disable_alarm_actions(params, cbor_data, is_cbor, is_json=False):
 # SetAlarmState — with history recording
 # ---------------------------------------------------------------------------
 
+
 def _set_alarm_state(params, cbor_data, is_cbor, is_json=False):
     if is_cbor or is_json:
         name = cbor_data.get("AlarmName", "")
@@ -853,7 +1068,9 @@ def _set_alarm_state(params, cbor_data, is_cbor, is_json=False):
 
     alarm = _alarms.get(name) or _composite_alarms.get(name)
     if not alarm:
-        return _error("ResourceNotFound", f"Alarm {name} not found", 404, is_cbor or is_json)
+        return _error(
+            "ResourceNotFound", f"Alarm {name} not found", 404, is_cbor or is_json
+        )
 
     old_state = alarm["StateValue"]
     alarm["StateValue"] = new_state
@@ -876,6 +1093,7 @@ def _set_alarm_state(params, cbor_data, is_cbor, is_json=False):
 # TagResource / UntagResource / ListTagsForResource
 # ---------------------------------------------------------------------------
 
+
 def _tag_resource(params, cbor_data, is_cbor, is_json=False):
     if is_cbor or is_json:
         arn = cbor_data.get("ResourceARN", "")
@@ -885,10 +1103,12 @@ def _tag_resource(params, cbor_data, is_cbor, is_json=False):
         tags = []
         i = 1
         while _p(params, f"Tags.member.{i}.Key"):
-            tags.append({
-                "Key": _p(params, f"Tags.member.{i}.Key"),
-                "Value": _p(params, f"Tags.member.{i}.Value"),
-            })
+            tags.append(
+                {
+                    "Key": _p(params, f"Tags.member.{i}.Key"),
+                    "Value": _p(params, f"Tags.member.{i}.Value"),
+                }
+            )
             i += 1
 
     if arn not in _resource_tags:
@@ -900,7 +1120,7 @@ def _tag_resource(params, cbor_data, is_cbor, is_json=False):
         return _cbor_ok({})
     if is_json:
         return _json_ok({})
-    return _xml(200, "TagResourceResponse", "")
+    return _xml(200, "TagResourceResponse", "<TagResourceResult/>")
 
 
 def _untag_resource(params, cbor_data, is_cbor, is_json=False):
@@ -923,7 +1143,7 @@ def _untag_resource(params, cbor_data, is_cbor, is_json=False):
         return _cbor_ok({})
     if is_json:
         return _json_ok({})
-    return _xml(200, "UntagResourceResponse", "")
+    return _xml(200, "UntagResourceResponse", "<UntagResourceResult/>")
 
 
 def _list_tags_for_resource(params, cbor_data, is_cbor, is_json=False):
@@ -940,14 +1160,20 @@ def _list_tags_for_resource(params, cbor_data, is_cbor, is_json=False):
         return _json_ok({"Tags": tags})
 
     members = "".join(
-        f"<member><Key>{t['Key']}</Key><Value>{t['Value']}</Value></member>" for t in tags)
-    return _xml(200, "ListTagsForResourceResponse",
-                f"<ListTagsForResourceResult><Tags>{members}</Tags></ListTagsForResourceResult>")
+        f"<member><Key>{t['Key']}</Key><Value>{t['Value']}</Value></member>"
+        for t in tags
+    )
+    return _xml(
+        200,
+        "ListTagsForResourceResponse",
+        f"<ListTagsForResourceResult><Tags>{members}</Tags></ListTagsForResourceResult>",
+    )
 
 
 # ---------------------------------------------------------------------------
 # Dashboards
 # ---------------------------------------------------------------------------
+
 
 def _put_dashboard(params, cbor_data, is_cbor, is_json=False):
     if is_cbor or is_json:
@@ -958,7 +1184,12 @@ def _put_dashboard(params, cbor_data, is_cbor, is_json=False):
         body = _p(params, "DashboardBody")
 
     if not name:
-        return _error("InvalidParameterValue", "DashboardName is required", 400, is_cbor or is_json)
+        return _error(
+            "InvalidParameterValue",
+            "DashboardName is required",
+            400,
+            is_cbor or is_json,
+        )
 
     _dashboards[name] = {
         "DashboardName": name,
@@ -972,8 +1203,11 @@ def _put_dashboard(params, cbor_data, is_cbor, is_json=False):
         return _cbor_ok({"DashboardValidationMessages": []})
     if is_json:
         return _json_ok({"DashboardValidationMessages": []})
-    return _xml(200, "PutDashboardResponse",
-                "<PutDashboardResult><DashboardValidationMessages/></PutDashboardResult>")
+    return _xml(
+        200,
+        "PutDashboardResponse",
+        "<PutDashboardResult><DashboardValidationMessages/></PutDashboardResult>",
+    )
 
 
 def _get_dashboard(params, cbor_data, is_cbor, is_json=False):
@@ -984,26 +1218,38 @@ def _get_dashboard(params, cbor_data, is_cbor, is_json=False):
 
     dash = _dashboards.get(name)
     if not dash:
-        return _error("ResourceNotFound", f"Dashboard {name} does not exist", 404, is_cbor or is_json)
+        return _error(
+            "ResourceNotFound",
+            f"Dashboard {name} does not exist",
+            404,
+            is_cbor or is_json,
+        )
 
     if is_cbor:
-        return _cbor_ok({
-            "DashboardArn": dash["DashboardArn"],
-            "DashboardBody": dash["DashboardBody"],
-            "DashboardName": dash["DashboardName"],
-        })
+        return _cbor_ok(
+            {
+                "DashboardArn": dash["DashboardArn"],
+                "DashboardBody": dash["DashboardBody"],
+                "DashboardName": dash["DashboardName"],
+            }
+        )
     if is_json:
-        return _json_ok({
-            "DashboardArn": dash["DashboardArn"],
-            "DashboardBody": dash["DashboardBody"],
-            "DashboardName": dash["DashboardName"],
-        })
-    return _xml(200, "GetDashboardResponse",
-                f"<GetDashboardResult>"
-                f"<DashboardArn>{dash['DashboardArn']}</DashboardArn>"
-                f"<DashboardBody>{dash['DashboardBody']}</DashboardBody>"
-                f"<DashboardName>{dash['DashboardName']}</DashboardName>"
-                f"</GetDashboardResult>")
+        return _json_ok(
+            {
+                "DashboardArn": dash["DashboardArn"],
+                "DashboardBody": dash["DashboardBody"],
+                "DashboardName": dash["DashboardName"],
+            }
+        )
+    return _xml(
+        200,
+        "GetDashboardResponse",
+        f"<GetDashboardResult>"
+        f"<DashboardArn>{dash['DashboardArn']}</DashboardArn>"
+        f"<DashboardBody>{dash['DashboardBody']}</DashboardBody>"
+        f"<DashboardName>{dash['DashboardName']}</DashboardName>"
+        f"</GetDashboardResult>",
+    )
 
 
 def _delete_dashboards(params, cbor_data, is_cbor, is_json=False):
@@ -1023,7 +1269,7 @@ def _delete_dashboards(params, cbor_data, is_cbor, is_json=False):
         return _cbor_ok({})
     if is_json:
         return _json_ok({})
-    return _xml(200, "DeleteDashboardsResponse", "")
+    return _xml(200, "DeleteDashboardsResponse", "<DeleteDashboardsResult/>")
 
 
 def _list_dashboards(params, cbor_data, is_cbor, is_json=False):
@@ -1037,12 +1283,14 @@ def _list_dashboards(params, cbor_data, is_cbor, is_json=False):
         if prefix and not name.startswith(prefix):
             continue
         dash = _dashboards[name]
-        entries.append({
-            "DashboardName": dash["DashboardName"],
-            "DashboardArn": dash["DashboardArn"],
-            "Size": dash["Size"],
-            "LastModified": _ts_iso(dash["LastModified"]),
-        })
+        entries.append(
+            {
+                "DashboardName": dash["DashboardName"],
+                "DashboardArn": dash["DashboardArn"],
+                "Size": dash["Size"],
+                "LastModified": _ts_iso(dash["LastModified"]),
+            }
+        )
 
     if is_cbor:
         return _cbor_ok({"DashboardEntries": entries})
@@ -1051,19 +1299,25 @@ def _list_dashboards(params, cbor_data, is_cbor, is_json=False):
 
     members = ""
     for e in entries:
-        members += (f"<member>"
-                    f"<DashboardName>{e['DashboardName']}</DashboardName>"
-                    f"<DashboardArn>{e['DashboardArn']}</DashboardArn>"
-                    f"<Size>{e['Size']}</Size>"
-                    f"<LastModified>{e['LastModified']}</LastModified>"
-                    f"</member>")
-    return _xml(200, "ListDashboardsResponse",
-                f"<ListDashboardsResult><DashboardEntries>{members}</DashboardEntries></ListDashboardsResult>")
+        members += (
+            f"<member>"
+            f"<DashboardName>{e['DashboardName']}</DashboardName>"
+            f"<DashboardArn>{e['DashboardArn']}</DashboardArn>"
+            f"<Size>{e['Size']}</Size>"
+            f"<LastModified>{e['LastModified']}</LastModified>"
+            f"</member>"
+        )
+    return _xml(
+        200,
+        "ListDashboardsResponse",
+        f"<ListDashboardsResult><DashboardEntries>{members}</DashboardEntries></ListDashboardsResult>",
+    )
 
 
 # ---------------------------------------------------------------------------
 # Protocol / encoding helpers
 # ---------------------------------------------------------------------------
+
 
 def _dims_key(dims: dict) -> str:
     return "|".join(f"{k}={v}" for k, v in sorted(dims.items()))
@@ -1077,10 +1331,15 @@ def _p(params, key, default=""):
 def _cbor_ok(data: dict):
     try:
         import cbor2
+
         body = cbor2.dumps(data)
     except Exception:
         body = json.dumps(data).encode()
-    return 200, {"Content-Type": "application/cbor", "smithy-protocol": "rpc-v2-cbor"}, body
+    return (
+        200,
+        {"Content-Type": "application/cbor", "smithy-protocol": "rpc-v2-cbor"},
+        body,
+    )
 
 
 def _json_ok(data: dict):
@@ -1088,11 +1347,13 @@ def _json_ok(data: dict):
 
 
 def _xml(status, root_tag, inner):
-    body = (f'<?xml version="1.0" encoding="UTF-8"?>\n'
-            f'<{root_tag} xmlns="http://monitoring.amazonaws.com/doc/2010-08-01/">\n'
-            f'    {inner}\n'
-            f'    <ResponseMetadata><RequestId>{new_uuid()}</RequestId></ResponseMetadata>\n'
-            f'</{root_tag}>').encode("utf-8")
+    body = (
+        f'<?xml version="1.0" encoding="UTF-8"?>\n'
+        f'<{root_tag} xmlns="http://monitoring.amazonaws.com/doc/2010-08-01/">\n'
+        f"    {inner}\n"
+        f"    <ResponseMetadata><RequestId>{new_uuid()}</RequestId></ResponseMetadata>\n"
+        f"</{root_tag}>"
+    ).encode("utf-8")
     return status, {"Content-Type": "application/xml"}, body
 
 
@@ -1100,17 +1361,23 @@ def _error(code, message, status, use_json=False):
     if use_json:
         try:
             import cbor2
+
             body = cbor2.dumps({"__type": code, "message": message})
             return status, {"Content-Type": "application/cbor"}, body
         except Exception:
             pass
-        return status, {"Content-Type": "application/json"}, \
-            json.dumps({"__type": code, "message": message}).encode()
-    body = (f'<?xml version="1.0" encoding="UTF-8"?>\n'
-            f'<ErrorResponse xmlns="http://monitoring.amazonaws.com/doc/2010-08-01/">\n'
-            f'    <Error><Code>{code}</Code><Message>{message}</Message></Error>\n'
-            f'    <RequestId>{new_uuid()}</RequestId>\n'
-            f'</ErrorResponse>').encode("utf-8")
+        return (
+            status,
+            {"Content-Type": "application/json"},
+            json.dumps({"__type": code, "message": message}).encode(),
+        )
+    body = (
+        f'<?xml version="1.0" encoding="UTF-8"?>\n'
+        f'<ErrorResponse xmlns="http://monitoring.amazonaws.com/doc/2010-08-01/">\n'
+        f"    <Error><Code>{code}</Code><Message>{message}</Message></Error>\n"
+        f"    <RequestId>{new_uuid()}</RequestId>\n"
+        f"</ErrorResponse>"
+    ).encode("utf-8")
     return status, {"Content-Type": "application/xml"}, body
 
 

@@ -808,7 +808,12 @@ def _maybe_mark_stopped(task):
     for docker_id in task["_docker_ids"]:
         try:
             container = docker_client.containers.get(docker_id)
-            if container.status != "exited":
+            # docker SDK caches status; refresh before checking lifecycle
+            try:
+                container.reload()
+            except Exception:
+                pass
+            if getattr(container, "status", None) != "exited":
                 all_stopped = False
                 break
             result = container.wait()
@@ -820,18 +825,20 @@ def _maybe_mark_stopped(task):
     if not all_stopped:
         return
 
+    now = _iso()
     task["lastStatus"] = "STOPPED"
     task["desiredStatus"] = "STOPPED"
-    task["stoppedAt"] = time.time()
+    task["stoppingAt"] = task.get("stoppingAt") or now
+    task["stoppedAt"] = now
     task["stoppedReason"] = "Essential container exited"
     task["stopCode"] = "EssentialContainerExited"
     for c in task.get("containers", []):
         c["lastStatus"] = "STOPPED"
         c["exitCode"] = exit_code
 
-    cluster_name = _resolve_cluster_name(task.get("clusterArn", "").split("/")[-1] if "/" in task.get("clusterArn", "") else "")
-    if cluster_name in _clusters:
-        _clusters[cluster_name]["runningTasksCount"] = max(0, _clusters[cluster_name]["runningTasksCount"] - 1)
+    cname = _cluster_name_from_arn(task.get("clusterArn", ""))
+    if cname:
+        _recount_cluster(cname)
 
 
 def _list_tasks(data):

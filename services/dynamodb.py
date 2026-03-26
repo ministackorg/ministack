@@ -304,8 +304,9 @@ def _get_item(data):
         return error_response_json("ResourceNotFoundException", f"Requested resource not found: Table: {name} not found", 400)
 
     key = data.get("Key", {})
-    pk_val = _extract_key_val(key.get(table["pk_name"]))
-    sk_val = _extract_key_val(key.get(table["sk_name"])) if table["sk_name"] else "__no_sort__"
+    pk_val, sk_val, key_err = _resolve_table_key_values(table, key, allow_extra=False)
+    if key_err:
+        return key_err
     item = table["items"].get(pk_val, {}).get(sk_val)
 
     result = {}
@@ -322,8 +323,9 @@ def _delete_item(data):
         return error_response_json("ResourceNotFoundException", f"Requested resource not found: Table: {name} not found", 400)
 
     key = data.get("Key", {})
-    pk_val = _extract_key_val(key.get(table["pk_name"]))
-    sk_val = _extract_key_val(key.get(table["sk_name"])) if table["sk_name"] else "__no_sort__"
+    pk_val, sk_val, key_err = _resolve_table_key_values(table, key, allow_extra=False)
+    if key_err:
+        return key_err
     old_item = table["items"].get(pk_val, {}).get(sk_val)
 
     cond_expr = data.get("ConditionExpression")
@@ -349,8 +351,9 @@ def _update_item(data):
         return error_response_json("ResourceNotFoundException", f"Requested resource not found: Table: {name} not found", 400)
 
     key = data.get("Key", {})
-    pk_val = _extract_key_val(key.get(table["pk_name"]))
-    sk_val = _extract_key_val(key.get(table["sk_name"])) if table["sk_name"] else "__no_sort__"
+    pk_val, sk_val, key_err = _resolve_table_key_values(table, key, allow_extra=False)
+    if key_err:
+        return key_err
 
     existing = table["items"].get(pk_val, {}).get(sk_val)
     old_item = copy.deepcopy(existing) if existing else None
@@ -358,7 +361,8 @@ def _update_item(data):
 
     cond_expr = data.get("ConditionExpression")
     if cond_expr:
-        if not _evaluate_condition(cond_expr, item, data.get("ExpressionAttributeValues", {}), data.get("ExpressionAttributeNames", {})):
+        cond_target = existing or {}
+        if not _evaluate_condition(cond_expr, cond_target, data.get("ExpressionAttributeValues", {}), data.get("ExpressionAttributeNames", {})):
             return error_response_json("ConditionalCheckFailedException", "The conditional request failed", 400)
 
     update_expr = data.get("UpdateExpression", "")
@@ -530,13 +534,15 @@ def _batch_write_item(data):
         for req in requests:
             if "PutRequest" in req:
                 item = req["PutRequest"]["Item"]
-                pk_val = _extract_key_val(item.get(table["pk_name"]))
-                sk_val = _extract_key_val(item.get(table["sk_name"])) if table["sk_name"] else "__no_sort__"
+                pk_val, sk_val, key_err = _resolve_table_key_values(table, item, allow_extra=True)
+                if key_err:
+                    return key_err
                 table["items"][pk_val][sk_val] = item
             elif "DeleteRequest" in req:
                 key = req["DeleteRequest"]["Key"]
-                pk_val = _extract_key_val(key.get(table["pk_name"]))
-                sk_val = _extract_key_val(key.get(table["sk_name"])) if table["sk_name"] else "__no_sort__"
+                pk_val, sk_val, key_err = _resolve_table_key_values(table, key, allow_extra=False)
+                if key_err:
+                    return key_err
                 table["items"].get(pk_val, {}).pop(sk_val, None)
         _update_counts(table)
     return json_response({"UnprocessedItems": unprocessed})
@@ -555,8 +561,9 @@ def _batch_get_item(data):
         proj = config.get("ProjectionExpression")
         config_ean = config.get("ExpressionAttributeNames", {})
         for key in config.get("Keys", []):
-            pk_val = _extract_key_val(key.get(table["pk_name"]))
-            sk_val = _extract_key_val(key.get(table["sk_name"])) if table["sk_name"] else "__no_sort__"
+            pk_val, sk_val, key_err = _resolve_table_key_values(table, key, allow_extra=False)
+            if key_err:
+                return key_err
             item = table["items"].get(pk_val, {}).get(sk_val)
             if item:
                 if proj:
@@ -1476,6 +1483,29 @@ def _extract_key_val(attr):
         if "N" in attr: return attr["N"]
         if "B" in attr: return attr["B"]
     return str(attr)
+
+
+def _resolve_table_key_values(table, attrs, allow_extra):
+    attrs = attrs if isinstance(attrs, dict) else {}
+    expected_names = {table["pk_name"]}
+    if table["sk_name"]:
+        expected_names.add(table["sk_name"])
+    if not allow_extra and set(attrs.keys()) != expected_names:
+        return "", "", _key_schema_validation_error()
+    for key_name in expected_names:
+        if key_name not in attrs:
+            return "", "", _key_schema_validation_error()
+        expected_type = _get_attr_type(table, key_name)
+        raw_value = attrs.get(key_name)
+        if not isinstance(raw_value, dict) or set(raw_value.keys()) != {expected_type}:
+            return "", "", _key_schema_validation_error()
+    pk_val = _extract_key_val(attrs.get(table["pk_name"]))
+    sk_val = _extract_key_val(attrs.get(table["sk_name"])) if table["sk_name"] else "__no_sort__"
+    return pk_val, sk_val, None
+
+
+def _key_schema_validation_error():
+    return error_response_json("ValidationException", "The provided key element does not match the schema", 400)
 
 
 def _resolve_index_keys(table, index_name):

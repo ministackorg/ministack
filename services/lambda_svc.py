@@ -23,6 +23,9 @@ SQS event source mappings poll the queue in a background thread.
 """
 
 import os
+import asyncio
+import importlib
+from typing import Any
 import copy
 import json
 import time
@@ -46,9 +49,10 @@ LAMBDA_EXECUTOR = os.environ.get("LAMBDA_EXECUTOR", "local").lower()
 LAMBDA_DOCKER_VOLUME_MOUNT = os.environ.get("LAMBDA_REMOTE_DOCKER_VOLUME_MOUNT", "")
 
 try:
-    import docker as docker_lib
+    docker_lib: Any = importlib.import_module("docker")
     _docker_available = True
 except ImportError:
+    docker_lib = None
     _docker_available = False
 
 _functions: dict = {}   # function_name -> FunctionRecord
@@ -66,6 +70,11 @@ _WRAPPER_SCRIPT = """\
 import sys, os, json
 
 sys.path.insert(0, os.environ["_LAMBDA_CODE_DIR"])
+
+_REAL_STDOUT = sys.__stdout__
+# Match AWS Lambda semantics: logs go to CloudWatch (stderr here),
+# while the Invoke response payload must be clean JSON on stdout.
+sys.stdout = sys.stderr
 
 for _ld in filter(None, os.environ.get("_LAMBDA_LAYERS_DIRS", "").split(os.pathsep)):
     _py = os.path.join(_ld, "python")
@@ -95,7 +104,8 @@ for _part in _mod_path.split(".")[1:]:
     _mod = getattr(_mod, _part)
 _result = getattr(_mod, _fn_name)(event, LambdaContext())
 if _result is not None:
-    print(json.dumps(_result))
+    _REAL_STDOUT.write(json.dumps(_result))
+    _REAL_STDOUT.flush()
 """
 
 # Docker variant: paths fixed to /var/task (code) and /opt (layers).
@@ -103,6 +113,11 @@ _DOCKER_WRAPPER_SCRIPT = """\
 import sys, os, json
 
 sys.path.insert(0, "/var/task")
+
+_REAL_STDOUT = sys.__stdout__
+# Match AWS Lambda semantics: logs go to CloudWatch (stderr here),
+# while the Invoke response payload must be clean JSON on stdout.
+sys.stdout = sys.stderr
 
 for _ld in filter(None, os.environ.get("_LAMBDA_LAYERS_DIRS", "").split(":")):
     _py = os.path.join(_ld, "python")
@@ -132,7 +147,8 @@ for _part in _mod_path.split(".")[1:]:
     _mod = getattr(_mod, _part)
 _result = getattr(_mod, _fn_name)(event, LambdaContext())
 if _result is not None:
-    print(json.dumps(_result))
+    _REAL_STDOUT.write(json.dumps(_result))
+    _REAL_STDOUT.flush()
 """
 
 
@@ -184,6 +200,18 @@ def _layer_arn(name: str) -> str:
 
 def _now_iso() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%S.000+0000")
+
+
+def _normalize_endpoint_url(value: str) -> str:
+    v = (value or "").strip()
+    if not v:
+        return ""
+    if v.startswith("http://") or v.startswith("https://"):
+        return v
+    host = v.rstrip("/")
+    if ":" not in host:
+        host = f"{host}:4566"
+    return f"http://{host}"
 
 
 def _build_config(name: str, data: dict, code_zip: bytes | None = None) -> dict:
@@ -408,7 +436,7 @@ async def handle_request(method: str, path: str, headers: dict,
 
         # Invoke
         if method == "POST" and sub == "invocations":
-            return _invoke(func_name, data, headers, path_qualifier)
+            return await _invoke(func_name, data, headers, path_qualifier)
 
         # PublishVersion
         if method == "POST" and sub == "versions":
@@ -641,8 +669,8 @@ def _update_config(name: str, data: dict):
 # Invoke
 # ---------------------------------------------------------------------------
 
-def _invoke(name: str, event: dict, headers: dict,
-            path_qualifier: str | None = None):
+async def _invoke(name: str, event: dict, headers: dict,
+                  path_qualifier: str | None = None):
     if name not in _functions:
         return error_response_json(
             "ResourceNotFoundException",
@@ -684,8 +712,9 @@ def _invoke(name: str, event: dict, headers: dict,
         ).start()
         return 202, {"X-Amz-Executed-Version": executed_version}, b""
 
-    # RequestResponse — synchronous execution
-    result = _execute_function(exec_record, event)
+    # RequestResponse — execute in worker thread so nested SDK calls
+    # from the Lambda process can still reach this ASGI server.
+    result = await asyncio.to_thread(_execute_function, exec_record, event)
 
     resp_headers: dict = {
         "Content-Type": "application/json",
@@ -851,7 +880,11 @@ def _execute_function_docker(func: dict, event: dict) -> dict:
                 "_LAMBDA_TIMEOUT": str(timeout),
                 "_LAMBDA_LAYERS_DIRS": ":".join(container_layer_dirs),
             }
-            endpoint = os.environ.get("AWS_ENDPOINT_URL", "")
+            endpoint = _normalize_endpoint_url(os.environ.get("AWS_ENDPOINT_URL", ""))
+            if not endpoint:
+                endpoint = _normalize_endpoint_url(env_vars.get("AWS_ENDPOINT_URL", ""))
+            if not endpoint:
+                endpoint = _normalize_endpoint_url(env_vars.get("LOCALSTACK_HOSTNAME", ""))
             if endpoint:
                 container_env["AWS_ENDPOINT_URL"] = endpoint
             container_env.update(env_vars)
@@ -1000,7 +1033,11 @@ def _execute_function_local(func: dict, event: dict) -> dict:
                 "_LAMBDA_TIMEOUT": str(timeout),
                 "_LAMBDA_LAYERS_DIRS": os.pathsep.join(layers_dirs),
             })
-            endpoint = os.environ.get("AWS_ENDPOINT_URL", "")
+            endpoint = _normalize_endpoint_url(os.environ.get("AWS_ENDPOINT_URL", ""))
+            if not endpoint:
+                endpoint = _normalize_endpoint_url(env_vars.get("AWS_ENDPOINT_URL", ""))
+            if not endpoint:
+                endpoint = _normalize_endpoint_url(env_vars.get("LOCALSTACK_HOSTNAME", ""))
             if endpoint:
                 env["AWS_ENDPOINT_URL"] = endpoint
             env.update(env_vars)
@@ -1034,14 +1071,31 @@ def _execute_function_local(func: dict, event: dict) -> dict:
                     "log": log_tail,
                 }
 
-    except subprocess.TimeoutExpired:
+    except subprocess.TimeoutExpired as exc:
+        try:
+            _stdout = getattr(exc, "stdout", None) or ""
+            if isinstance(_stdout, bytes):
+                _stdout = _stdout.decode("utf-8", errors="replace")
+            _stdout = str(_stdout).strip()
+        except Exception:
+            _stdout = ""
+        try:
+            _stderr = getattr(exc, "stderr", None) or ""
+            if isinstance(_stderr, bytes):
+                _stderr = _stderr.decode("utf-8", errors="replace")
+            _stderr = str(_stderr).strip()
+        except Exception:
+            _stderr = ""
+        _log = "\n".join([p for p in (_stderr, _stdout) if p])
+        if not _log:
+            _log = "Lambda timed out (no stderr/stdout captured)."
         return {
             "body": {
                 "errorMessage": f"Task timed out after {timeout}.00 seconds",
                 "errorType": "Runtime.ExitError",
             },
             "error": True,
-            "log": "",
+            "log": _log,
         }
     except Exception as e:
         logger.error(f"Lambda execution error: {e}")
@@ -1751,22 +1805,15 @@ def _poll_once():
         batch_size = esm.get("BatchSize", 10)
         now = time.time()
 
-        batch = []
-        for msg in list(queue["messages"]):
-            if len(batch) >= batch_size:
-                break
-            if msg["visible_at"] <= now and msg.get("receipt_handle") is None:
-                batch.append(msg)
 
+        batch = _sqs._receive_messages_for_esm(queue_url, batch_size)
         if not batch:
             continue
 
-        for msg in batch:
-            msg["receipt_handle"] = new_uuid()
-            msg["visible_at"] = now + 30
-
         records = []
         for msg in batch:
+            # sqs._collect_msgs already increments receive_count and sets first_receive_at
+            first_recv = msg.get("first_receive_at") or now
             records.append({
                 "messageId": msg["id"],
                 "receiptHandle": msg["receipt_handle"],
@@ -1775,10 +1822,10 @@ def _poll_once():
                     "ApproximateReceiveCount": str(msg.get("receive_count", 1)),
                     "SentTimestamp": str(int(msg["sent_at"] * 1000)),
                     "SenderId": ACCOUNT_ID,
-                    "ApproximateFirstReceiveTimestamp": str(int(now * 1000)),
+                    "ApproximateFirstReceiveTimestamp": str(int(first_recv * 1000)),
                 },
-                "messageAttributes": msg.get("attributes", {}),
-                "md5OfBody": msg["md5"],
+                "messageAttributes": msg.get("message_attributes", {}),
+                "md5OfBody": msg.get("md5_body") or msg.get("md5") or "",
                 "eventSource": "aws:sqs",
                 "eventSourceARN": source_arn,
                 "awsRegion": REGION,
@@ -1788,19 +1835,29 @@ def _poll_once():
         result = _execute_function(_functions[func_name], event)
 
         if result.get("error"):
-            for msg in batch:
-                msg["receipt_handle"] = None
-                msg["visible_at"] = now
+            # Surface Lambda failure details (otherwise debugging is impossible).
+            # `result` follows the shape returned by `_execute_function_*`:
+            # - body: Lambda payload (often contains errorType/errorMessage on failure)
+            # - log:  stderr / traceback tail (best signal for root cause)
+            err_body = result.get("body") or {}
+            err_type = None
+            err_msg = None
+            if isinstance(err_body, dict):
+                err_type = err_body.get("errorType")
+                err_msg = err_body.get("errorMessage")
+            err_log = result.get("log") or ""
             esm["LastProcessingResult"] = "FAILED"
             logger.warning(
-                f"ESM: Lambda {func_name} failed processing batch from {queue_name}",
+                "ESM: Lambda %s failed processing batch from %s (errorType=%s errorMessage=%s)\n%s",
+                func_name,
+                queue_name,
+                err_type,
+                err_msg,
+                err_log,
             )
         else:
-            receipt_handles = {msg["receipt_handle"] for msg in batch}
-            queue["messages"] = [
-                m for m in queue["messages"]
-                if m.get("receipt_handle") not in receipt_handles
-            ]
+            receipt_handles = {msg["receipt_handle"] for msg in batch if msg.get("receipt_handle")}
+            _sqs._delete_messages_for_esm(queue_url, receipt_handles)
             esm["LastProcessingResult"] = f"OK - {len(batch)} records"
             logger.info(
                 f"ESM: Lambda {func_name} processed {len(batch)} messages from {queue_name}",
