@@ -16,6 +16,9 @@ from urllib.parse import parse_qs, urlparse
 
 # Matches host headers like "{apiId}.execute-api.localhost" or "{apiId}.execute-api.localhost:4566"
 _EXECUTE_API_RE = re.compile(r"^([a-f0-9]{8})\.execute-api\.localhost(?::\d+)?$")
+# Matches virtual-hosted S3: "{bucket}.localhost" or "{bucket}.localhost:4566"
+# Must not match execute-api or other known sub-services
+_S3_VHOST_RE = re.compile(r"^([^.]+)\.localhost(?::\d+)?$")
 
 from core.router import detect_service, extract_region, extract_account_id
 from core.persistence import save_all, load_state, PERSIST_STATE
@@ -23,6 +26,7 @@ from services import s3, sqs, sns, dynamodb, lambda_svc, secretsmanager, cloudwa
 from services import ssm, eventbridge, kinesis, cloudwatch, ses, stepfunctions
 from services import ecs, rds, elasticache, glue, athena
 from services import apigateway
+from services import firehose
 from services import apigateway_v1
 from services.iam_sts import handle_iam_request, handle_sts_request
 
@@ -56,6 +60,7 @@ SERVICE_HANDLERS = {
     "glue": glue.handle_request,
     "athena": athena.handle_request,
     "apigateway": apigateway.handle_request,
+    "firehose": firehose.handle_request,
 }
 
 SERVICE_NAME_ALIASES = {
@@ -66,6 +71,7 @@ SERVICE_NAME_ALIASES = {
     "stepfunctions": "states",
     "execute-api": "apigateway",
     "apigatewayv2": "apigateway",
+    "kinesis-firehose": "firehose",
 }
 
 
@@ -101,7 +107,7 @@ BANNER = r"""
  Local AWS Service Emulator — Port {port}
  Services: S3, SQS, SNS, DynamoDB, Lambda, IAM, STS, SecretsManager, CloudWatch Logs,
           SSM, EventBridge, Kinesis, CloudWatch, SES, Step Functions,
-          ECS, RDS, ElastiCache, Glue, Athena, API Gateway
+          ECS, RDS, ElastiCache, Glue, Athena, API Gateway, Firehose
 """
 
 
@@ -189,6 +195,34 @@ async def app(scope, receive, send):
         })
         await _send_response(send, status, resp_headers, resp_body)
         return
+
+    # Virtual-hosted S3: {bucket}.localhost[:{port}] — rewrite to path-style and forward to S3
+    _s3_vhost = _S3_VHOST_RE.match(host)
+    if _s3_vhost and not _execute_match:
+        bucket = _s3_vhost.group(1)
+        _non_s3_hosts = {"s3", "sqs", "sns", "dynamodb", "lambda", "iam", "sts",
+                         "secretsmanager", "logs", "ssm", "events", "kinesis",
+                         "monitoring", "ses", "states", "ecs", "rds", "elasticache",
+                         "glue", "athena", "apigateway"}
+        if bucket not in _non_s3_hosts:
+            vhost_path = "/" + bucket + path if path != "/" else "/" + bucket + "/"
+            try:
+                status, resp_headers, resp_body = await s3.handle_request(
+                    method, vhost_path, headers, body, query_params
+                )
+            except Exception as e:
+                logger.exception(f"Error handling virtual-hosted S3 request: {e}")
+                status, resp_headers, resp_body = 500, {"Content-Type": "application/xml"}, (
+                    f"<Error><Code>InternalError</Code><Message>{e}</Message></Error>".encode()
+                )
+            resp_headers.update({
+                "Access-Control-Allow-Origin": "*",
+                "x-amzn-requestid": request_id,
+                "x-amz-request-id": request_id,
+                "x-amz-id-2": request_id,
+            })
+            await _send_response(send, status, resp_headers, resp_body)
+            return
 
     service = detect_service(method, path, headers, query_params)
     region = extract_region(headers)
@@ -317,6 +351,7 @@ def _reset_all_state():
         (glue, glue.reset), (athena, athena.reset),
         (apigateway, apigateway.reset),
         (apigateway_v1, apigateway_v1.reset),
+        (firehose, firehose.reset),
     ]:
         try:
             fn()

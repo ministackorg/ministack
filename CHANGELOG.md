@@ -7,6 +7,27 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [1.0.7] — 2026-03-27
+
+### Added
+- **Amazon Data Firehose** (`services/firehose.py`) — full control and data plane
+  - `CreateDeliveryStream`, `DeleteDeliveryStream`, `DescribeDeliveryStream`, `ListDeliveryStreams`
+  - `PutRecord`, `PutRecordBatch` — base64-encoded record ingestion; S3-destination streams write records synchronously to the local S3 emulator
+  - `UpdateDestination` — concurrency-safe via `CurrentDeliveryStreamVersionId` / `VersionId`
+  - `TagDeliveryStream`, `UntagDeliveryStream`, `ListTagsForDeliveryStream`
+  - `StartDeliveryStreamEncryption`, `StopDeliveryStreamEncryption`
+  - Destination types: `ExtendedS3`, `S3` (deprecated alias), `HttpEndpoint`, `Redshift`, `OpenSearch`, `Splunk`, `Snowflake`, `Iceberg`
+  - Credential scope: `kinesis-firehose`; target prefix: `Firehose_20150804`
+  - AWS-compliant `DescribeDeliveryStream` response: `EncryptionConfiguration` always present in `ExtendedS3DestinationDescription` (default `NoEncryption`); `DeliveryStreamEncryptionConfiguration` only included when encryption is configured; `Source` block populated for `KinesisStreamAsSource` streams
+  - `UpdateDestination` merges fields when destination type is unchanged; replaces fully on type change — matching AWS behaviour
+  - 16 integration tests, all passing
+- **Virtual-hosted style S3**: `{bucket}.localhost[:{port}]` host header routing — requests are rewritten to path-style and forwarded to the S3 handler; compatible with AWS SDK virtual-hosted endpoint configuration
+
+### Fixed
+- **DynamoDB expression evaluator short-circuit bug**: `OR`/`AND` operators in `ConditionExpression` and `FilterExpression` now always consume both operands' tokens before applying the logical result — Python's boolean short-circuit was skipping right-hand token consumption when the left operand was already truthy/falsy, causing `Invalid expression: Expected RPAREN, got NAME_REF` on expressions like `attribute_not_exists(#0) OR #1 <= :0` (reported by PynamoDB users with numeric `ExpressionAttributeNames` keys)
+
+---
+
 ## [1.0.6] — 2026-03-27
 
 ### Added
@@ -211,6 +232,5 @@ Initial public release. Built as a free, open-source alternative to LocalStack.
 - Cognito (user pools, sign-up/sign-in)
 - Route53 (hosted zones, record sets)
 - ACM (certificate management)
-- Firehose
 - Virtual-hosted style S3 (`bucket.localhost:4566` routing)
 

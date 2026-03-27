@@ -883,14 +883,16 @@ class _ExprEval:
         left = self._and_expr()
         while self._is_kw('OR'):
             self.advance()
-            left = left or self._and_expr()
+            right = self._and_expr()
+            left = left or right
         return left
 
     def _and_expr(self):
         left = self._not_expr()
         while self._is_kw('AND'):
             self.advance()
-            left = self._not_expr() and left
+            right = self._not_expr()
+            left = left and right
         return left
 
     def _not_expr(self):

@@ -24,7 +24,7 @@
 
 LocalStack recently moved its core services behind a paid plan. If you relied on LocalStack Community for local development and CI/CD pipelines, MiniStack is your free alternative.
 
-- **22 AWS services** emulated on a single port (4566)
+- **23 AWS services** emulated on a single port (4566)
 - **Drop-in compatible** — works with `boto3`, AWS CLI, Terraform, CDK, Pulumi, any SDK
 - **Real infrastructure** — RDS spins up actual Postgres/MySQL containers, ElastiCache spins up real Redis, Athena runs real SQL via DuckDB, ECS runs real Docker containers
 - **Tiny footprint** — ~150MB image, ~30MB RAM at idle vs LocalStack's ~1GB image and ~500MB RAM
@@ -199,6 +199,7 @@ sfn.create_state_machine(
 | **ElastiCache** | CreateCacheCluster, DeleteCacheCluster, DescribeCacheClusters, ModifyCacheCluster, RebootCacheCluster, CreateReplicationGroup, DeleteReplicationGroup, DescribeReplicationGroups, ModifyReplicationGroup, IncreaseReplicaCount, DecreaseReplicaCount, CreateCacheSubnetGroup, DescribeCacheSubnetGroups, ModifyCacheSubnetGroup, DeleteCacheSubnetGroup, CreateCacheParameterGroup, DescribeCacheParameterGroups, ModifyCacheParameterGroup, ResetCacheParameterGroup, DeleteCacheParameterGroup, DescribeCacheParameters, DescribeCacheEngineVersions, CreateUser, DescribeUsers, DeleteUser, ModifyUser, CreateUserGroup, DescribeUserGroups, DeleteUserGroup, ModifyUserGroup, CreateSnapshot, DeleteSnapshot, DescribeSnapshots, DescribeEvents | `CreateCacheCluster` spins up real Redis/Memcached Docker container |
 | **Glue** | CreateDatabase, DeleteDatabase, GetDatabase, GetDatabases, CreateTable, DeleteTable, GetTable, GetTables, UpdateTable, BatchDeleteTable, CreatePartition, GetPartitions, BatchCreatePartition, BatchGetPartition, CreatePartitionIndex, GetPartitionIndexes, CreateConnection, GetConnections, CreateCrawler, UpdateCrawler, GetCrawler, GetCrawlerMetrics, StartCrawler, CreateJob, GetJob, GetJobs, StartJobRun, GetJobRun, GetJobRuns, CreateTrigger, GetTrigger, DeleteTrigger, UpdateTrigger, StartTrigger, StopTrigger, ListTriggers, GetTriggers, CreateWorkflow, GetWorkflow, DeleteWorkflow, UpdateWorkflow, StartWorkflowRun, CreateSecurityConfiguration, GetSecurityConfiguration, GetSecurityConfigurations, DeleteSecurityConfiguration, CreateClassifier, GetClassifier, GetClassifiers, DeleteClassifier, TagResource, UntagResource, GetTags | Python shell jobs actually execute via subprocess |
 | **Athena** | StartQueryExecution, GetQueryExecution, GetQueryResults, StopQueryExecution, ListQueryExecutions, BatchGetQueryExecution, CreateWorkGroup, DeleteWorkGroup, GetWorkGroup, ListWorkGroups, UpdateWorkGroup, CreateNamedQuery, DeleteNamedQuery, GetNamedQuery, ListNamedQueries, BatchGetNamedQuery, CreateDataCatalog, GetDataCatalog, ListDataCatalogs, DeleteDataCatalog, UpdateDataCatalog, CreatePreparedStatement, GetPreparedStatement, DeletePreparedStatement, ListPreparedStatements, GetTableMetadata, ListTableMetadata, TagResource, UntagResource, ListTagsForResource | Real SQL via **DuckDB** when installed (`pip install duckdb`), otherwise returns mock results; result pagination; column type metadata |
+| **Firehose** | CreateDeliveryStream, DeleteDeliveryStream, DescribeDeliveryStream, ListDeliveryStreams, PutRecord, PutRecordBatch, UpdateDestination, TagDeliveryStream, UntagDeliveryStream, ListTagsForDeliveryStream, StartDeliveryStreamEncryption, StopDeliveryStreamEncryption | S3 destinations write records to the local S3 emulator; all other destination types buffer in-memory; concurrency-safe `UpdateDestination` via `VersionId` |
 
 ---
 
@@ -409,19 +410,19 @@ pip install boto3 pytest duckdb docker cbor2
 # Start MiniStack
 docker compose up -d
 
-# Run the full test suite (434 tests across all 21 services)
+# Run the full test suite (450 tests across all 23 services)
 pytest tests/ -v
 ```
 
 Expected output:
 ```
-collected 434 items
+collected 450 items
 
 tests/test_services.py::test_s3_create_bucket PASSED
 ...
 tests/test_services.py::test_apigwv1_execute_mock_response_parameters PASSED
 
-434 passed in ~60s
+450 passed in ~60s
 ```
 
 ---
@@ -507,6 +508,7 @@ config:
 | **Glue Data Catalog + Jobs** | ✅ | ❌ | ✅ |
 | **API Gateway v2 (HTTP API)** | ✅ | ✅ | ✅ |
 | **API Gateway v1 (REST API)** | ✅ | ✅ | ✅ |
+| **Firehose** | ✅ | ✅ | ✅ |
 | Cognito | ❌ | ✅ | ✅ |
 | CloudFormation | ❌ | partial | ✅ |
 | Cost | **Free** | Was free, now paid | $35+/mo |

@@ -96,6 +96,10 @@ SERVICE_PATTERNS = {
         "target_prefixes": ["AmazonAthena"],
         "host_patterns": [r"athena\."],
     },
+    "firehose": {
+        "target_prefixes": ["Firehose_20150804"],
+        "host_patterns": [r"firehose\.", r"kinesis-firehose\."],
+    },
     "apigateway": {
         "host_patterns": [r"apigateway\.", r"execute-api\."],
         "path_patterns": [r"^/v2/apis"],
@@ -138,6 +142,7 @@ def detect_service(method: str, path: str, headers: dict, query_params: dict) ->
                 "elasticache": "elasticache",
                 "glue": "glue",
                 "athena": "athena",
+                "kinesis-firehose": "firehose",
             }
             if svc_name in scope_map:
                 return scope_map[svc_name]

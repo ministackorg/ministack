@@ -118,6 +118,10 @@ def athena():
     return make_client("athena")
 
 @pytest.fixture(scope="session")
+def fh():
+    return make_client("firehose")
+
+@pytest.fixture(scope="session")
 def apigw():
     return make_client("apigatewayv2")
 
