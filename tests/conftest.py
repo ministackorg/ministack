@@ -122,6 +122,10 @@ def apigw():
     return make_client("apigatewayv2")
 
 @pytest.fixture(scope="session")
+def apigw_v1():
+    return make_client("apigateway")
+
+@pytest.fixture(scope="session")
 def sfn_sync():
     """SFN client for StartSyncExecution — forces same endpoint (boto3 normally prefixes sync-)."""
     from botocore.config import Config as BotoConfig

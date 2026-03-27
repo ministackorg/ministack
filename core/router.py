@@ -252,6 +252,9 @@ def detect_service(method: str, path: str, headers: dict, query_params: dict) ->
     path_lower = path.lower()
     if path_lower.startswith("/v2/apis"):
         return "apigateway"
+    if (path_lower.startswith("/restapis") or path_lower.startswith("/apikeys")
+            or path_lower.startswith("/usageplans") or path_lower.startswith("/domainnames")):
+        return "apigateway"
     if path_lower.startswith("/2015-03-31/functions"):
         return "lambda"
     if path_lower.startswith(("/clusters", "/taskdefinitions", "/tasks", "/services", "/stoptask")):

@@ -7,6 +7,40 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [1.0.6] — 2026-03-27
+
+### Added
+- **API Gateway REST API v1** (`services/apigateway_v1.py`) — complete control plane and data plane
+  - Full resource tree: `CreateRestApi`, `GetRestApi`, `GetRestApis`, `UpdateRestApi`, `DeleteRestApi`
+  - Resources: `CreateResource`, `GetResource`, `GetResources`, `UpdateResource`, `DeleteResource`
+  - Methods: `PutMethod`, `GetMethod`, `DeleteMethod`, `UpdateMethod`
+  - Method responses: `PutMethodResponse`, `GetMethodResponse`, `DeleteMethodResponse`
+  - Integrations: `PutIntegration`, `GetIntegration`, `DeleteIntegration`, `UpdateIntegration`
+  - Integration responses: `PutIntegrationResponse`, `GetIntegrationResponse`, `DeleteIntegrationResponse`
+  - Stages: `CreateStage`, `GetStage`, `GetStages`, `UpdateStage`, `DeleteStage`
+  - Deployments: `CreateDeployment`, `GetDeployment`, `GetDeployments`, `UpdateDeployment`, `DeleteDeployment`
+  - Authorizers: `CreateAuthorizer`, `GetAuthorizer`, `GetAuthorizers`, `UpdateAuthorizer`, `DeleteAuthorizer`
+  - Models: `CreateModel`, `GetModel`, `GetModels`, `DeleteModel`
+  - API keys: `CreateApiKey`, `GetApiKey`, `GetApiKeys`, `UpdateApiKey`, `DeleteApiKey`
+  - Usage plans: `CreateUsagePlan`, `GetUsagePlan`, `GetUsagePlans`, `UpdateUsagePlan`, `DeleteUsagePlan`, `CreateUsagePlanKey`, `GetUsagePlanKeys`, `DeleteUsagePlanKey`
+  - Domain names: `CreateDomainName`, `GetDomainName`, `GetDomainNames`, `DeleteDomainName`
+  - Base path mappings: `CreateBasePathMapping`, `GetBasePathMapping`, `GetBasePathMappings`, `DeleteBasePathMapping`
+  - Tags: `TagResource`, `UntagResource`, `GetTags`
+  - Data plane: execute-api requests routed by host header (`{apiId}.execute-api.localhost`)
+  - Lambda proxy format 1.0 (AWS_PROXY) — full `requestContext` with `requestTime`, `requestTimeEpoch`, `path`, `protocol`, `multiValueHeaders`; supports both apigateway URI form and plain `arn:aws:lambda:` ARN
+  - HTTP proxy (HTTP_PROXY) forwarding to arbitrary HTTP backends
+  - MOCK integration — selects response by `selectionPattern`, applies `responseParameters` to HTTP response headers, returns `responseTemplates` body
+  - Resource tree path matching with `{param}` placeholders and `{proxy+}` greedy segments
+  - JSON Patch support for all `PATCH` operations (`patchOperations`)
+  - `CreateDeployment` populates `apiSummary` from all configured resources and methods
+  - All timestamps (`createdDate`, `lastUpdatedDate`) returned as ISO 8601 strings — boto3 parses them as `datetime` objects
+  - Error responses use `type` field matching AWS API Gateway v1 format
+  - State persistence via `get_state()` / `load_persisted_state()`
+  - v1 and v2 APIs coexist on the same port without conflict
+- 434 integration tests — all passing, including against Docker image
+
+---
+
 ## [1.0.5] — 2026-03-26
 
 ### Fixed
@@ -174,7 +208,6 @@ Initial public release. Built as a free, open-source alternative to LocalStack.
 ## Roadmap
 
 ### Planned
-- API Gateway REST API (v1) — resource trees, methods, integration types, deployment stages
 - Cognito (user pools, sign-up/sign-in)
 - Route53 (hosted zones, record sets)
 - ACM (certificate management)

@@ -107,12 +107,17 @@ def load_persisted_state(data: dict) -> None:
 
 async def handle_request(method, path, headers, body, query_params):
     """Route API Gateway v2 control plane requests."""
+    # Dispatch v1 REST API requests first
+    parts = [p for p in path.strip("/").split("/") if p]
+    if parts and parts[0] in ("restapis", "apikeys", "usageplans", "domainnames", "tags"):
+        from services import apigateway_v1
+        return await apigateway_v1.handle_request(method, path, headers, body, query_params)
+
     try:
         data = json.loads(body) if body else {}
     except json.JSONDecodeError:
         data = {}
 
-    parts = [p for p in path.strip("/").split("/") if p]
     # Minimum expected: ["v2", <resource>]
 
     if not parts or parts[0] != "v2":

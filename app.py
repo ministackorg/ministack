@@ -23,6 +23,7 @@ from services import s3, sqs, sns, dynamodb, lambda_svc, secretsmanager, cloudwa
 from services import ssm, eventbridge, kinesis, cloudwatch, ses, stepfunctions
 from services import ecs, rds, elasticache, glue, athena
 from services import apigateway
+from services import apigateway_v1
 from services.iam_sts import handle_iam_request, handle_sts_request
 
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
@@ -170,9 +171,14 @@ async def app(scope, receive, send):
         stage = path_parts[0] if path_parts else "$default"
         execute_path = "/" + path_parts[1] if len(path_parts) > 1 else "/"
         try:
-            status, resp_headers, resp_body = await apigateway.handle_execute(
-                api_id, stage, execute_path, method, headers, body, query_params
-            )
+            if api_id in apigateway_v1._rest_apis:
+                status, resp_headers, resp_body = await apigateway_v1.handle_execute(
+                    api_id, stage, method, execute_path, headers, body, query_params
+                )
+            else:
+                status, resp_headers, resp_body = await apigateway.handle_execute(
+                    api_id, stage, execute_path, method, headers, body, query_params
+                )
         except Exception as e:
             logger.exception(f"Error in execute-api dispatch: {e}")
             status, resp_headers, resp_body = 500, {"Content-Type": "application/json"}, json.dumps({"message": str(e)}).encode()
@@ -244,7 +250,10 @@ async def _handle_lifespan(scope, receive, send):
         elif message["type"] == "lifespan.shutdown":
             logger.info("MiniStack shutting down...")
             if PERSIST_STATE:
-                save_all({"apigateway": apigateway.get_state})
+                save_all({
+                    "apigateway": apigateway.get_state,
+                    "apigateway_v1": apigateway_v1.get_state,
+                })
             await send({"type": "lifespan.shutdown.complete"})
             return
 
@@ -255,6 +264,10 @@ def _load_persisted_state():
     if data:
         apigateway.load_persisted_state(data)
         logger.info("Loaded persisted state for apigateway")
+    data_v1 = load_state("apigateway_v1")
+    if data_v1:
+        apigateway_v1.load_persisted_state(data_v1)
+        logger.info("Loaded persisted state for apigateway_v1")
 
 
 def _run_init_scripts():
@@ -303,6 +316,7 @@ def _reset_all_state():
         (rds, rds.reset), (elasticache, elasticache.reset),
         (glue, glue.reset), (athena, athena.reset),
         (apigateway, apigateway.reset),
+        (apigateway_v1, apigateway_v1.reset),
     ]:
         try:
             fn()
