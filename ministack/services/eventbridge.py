@@ -21,7 +21,7 @@ import logging
 import re
 from datetime import datetime, timezone
 
-from core.responses import json_response, error_response_json, new_uuid
+from ministack.core.responses import json_response, error_response_json, new_uuid
 
 logger = logging.getLogger("events")
 
@@ -593,7 +593,7 @@ def _apply_input_transformer(transformer, event):
 
 
 def _dispatch_to_lambda(arn, payload):
-    from services import lambda_svc
+    from ministack.services import lambda_svc
 
     parts = arn.split(":")
     func_name = parts[-1].split("/")[-1] if "/" in parts[-1] else parts[-1]
@@ -611,7 +611,7 @@ def _dispatch_to_lambda(arn, payload):
 
 
 def _dispatch_to_sqs(arn, payload):
-    from services import sqs as _sqs
+    from ministack.services import sqs as _sqs
 
     queue_name = arn.split(":")[-1]
     queue_url = _sqs._queue_url(queue_name)
@@ -636,7 +636,7 @@ def _dispatch_to_sqs(arn, payload):
 
 
 def _dispatch_to_sns(arn, payload):
-    from services import sns as _sns
+    from ministack.services import sns as _sns
 
     topic = _sns._topics.get(arn)
     if not topic:

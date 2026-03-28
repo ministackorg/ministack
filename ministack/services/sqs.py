@@ -31,7 +31,7 @@ import struct
 from urllib.parse import parse_qs
 from xml.sax.saxutils import escape as _esc
 
-from core.responses import new_uuid, now_iso, md5_hash
+from ministack.core.responses import new_uuid, now_iso, md5_hash
 
 logger = logging.getLogger("sqs")
 

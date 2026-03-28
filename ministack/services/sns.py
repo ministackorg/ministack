@@ -17,9 +17,9 @@ import logging
 import time
 from urllib.parse import parse_qs
 
-from core.responses import new_uuid
-from services import sqs as _sqs
-import services.lambda_svc as _lambda_svc
+from ministack.core.responses import new_uuid
+from ministack.services import sqs as _sqs
+import ministack.services.lambda_svc as _lambda_svc
 
 logger = logging.getLogger("sns")
 

@@ -18,7 +18,7 @@ import threading
 from collections import defaultdict
 from decimal import Decimal, InvalidOperation
 
-from core.responses import json_response, error_response_json, new_uuid, now_iso
+from ministack.core.responses import json_response, error_response_json, new_uuid, now_iso
 
 logger = logging.getLogger("dynamodb")
 

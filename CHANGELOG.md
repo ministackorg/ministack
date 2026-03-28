@@ -7,6 +7,38 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [1.1.0] — 2026-03-28
+
+### Added
+- **Amazon Cognito** (`ministack/services/cognito.py`) — full User Pool and Identity Pool emulation
+  - **User Pools (cognito-idp)**: CreateUserPool, DeleteUserPool, DescribeUserPool, ListUserPools, UpdateUserPool
+  - **User Pool Clients**: CreateUserPoolClient, DeleteUserPoolClient, DescribeUserPoolClient, ListUserPoolClients, UpdateUserPoolClient
+  - **User management**: AdminCreateUser, AdminDeleteUser, AdminGetUser, ListUsers (with filter support: `=`, `^=`, `!=`), AdminSetUserPassword, AdminUpdateUserAttributes, AdminConfirmSignUp, AdminDisableUser, AdminEnableUser, AdminResetUserPassword, AdminUserGlobalSignOut
+  - **Auth flows**: AdminInitiateAuth, AdminRespondToAuthChallenge, InitiateAuth, RespondToAuthChallenge — ADMIN_USER_PASSWORD_AUTH, ADMIN_NO_SRP_AUTH, USER_PASSWORD_AUTH, REFRESH_TOKEN_AUTH / REFRESH_TOKEN (both accepted), USER_SRP_AUTH (returns PASSWORD_VERIFIER challenge); FORCE_CHANGE_PASSWORD challenge on first login
+  - **Self-service**: SignUp (always UNCONFIRMED — AutoVerifiedAttributes verifies the attribute, not the account), ConfirmSignUp, ForgotPassword, ConfirmForgotPassword, ChangePassword (decodes access token and updates stored password), GetUser, UpdateUserAttributes, DeleteUser, GlobalSignOut, RevokeToken
+  - **Groups**: CreateGroup, DeleteGroup, GetGroup, ListGroups, ListUsersInGroup, AdminAddUserToGroup, AdminRemoveUserFromGroup, AdminListGroupsForUser, AdminListUserAuthEvents
+  - **Domain**: CreateUserPoolDomain, DeleteUserPoolDomain, DescribeUserPoolDomain
+  - **MFA**: GetUserPoolMfaConfig, SetUserPoolMfaConfig, AssociateSoftwareToken, VerifySoftwareToken
+  - **Tags**: TagResource, UntagResource, ListTagsForResource
+  - **Identity Pools (cognito-identity)**: CreateIdentityPool, DeleteIdentityPool, DescribeIdentityPool, ListIdentityPools, UpdateIdentityPool, GetId, GetCredentialsForIdentity, GetOpenIdToken, SetIdentityPoolRoles, GetIdentityPoolRoles, ListIdentities, DescribeIdentity, MergeDeveloperIdentities, UnlinkDeveloperIdentity, UnlinkIdentity, TagResource, UntagResource, ListTagsForResource
+  - **OAuth2**: `POST /oauth2/token` — client_credentials flow; returns stub Bearer token
+  - Stub JWT tokens: structurally valid base64url JWTs (non-cryptographic); IDP pool ARN format `arn:aws:cognito-idp:region:account:userpool/{id}`; Identity pool ID format `region:{uuid}`
+  - `_user_from_token` shared helper — decodes stub JWT payload to find user by `sub`, used by GetUser, UpdateUserAttributes, DeleteUser, ChangePassword, and REFRESH_TOKEN_AUTH
+  - Wired into router, SERVICE_HANDLERS, SERVICE_NAME_ALIASES, `_reset_all_state()`, and both credential scopes (`cognito-idp`, `cognito-identity`)
+  - 43 integration tests covering full CRUD lifecycle for User Pools, Pool Clients, Users, Auth flows, Refresh tokens, Groups, Domains, MFA, Tags, and Identity Pools
+
+### Changed
+- **Package restructure**: all source code moved into `ministack/` package (`ministack/app.py`, `ministack/core/`, `ministack/services/`) — fixes `pip install ministack` entrypoint crash (`app:main` was unresolvable because `app.py` was not included in the wheel)
+- **Entrypoint**: `ministack = "app:main"` → `ministack = "ministack.app:main"`
+- **ASGI module**: `app:app` → `ministack.app:app` in Dockerfile and CI
+- **PyPI trusted publishing**: OIDC workflow added (`pypi-publish.yml`) — no API token needed, publishes on `v*.*.*` tag push
+
+### Tests
+- 3 package structure tests: `test_package_core_importable`, `test_package_services_importable`, `test_app_asgi_callable`
+- 525 integration tests — all passing against Docker image
+
+---
+
 ## [1.0.8] — 2026-03-28
 
 ### Added

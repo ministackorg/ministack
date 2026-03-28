@@ -33,7 +33,7 @@ from email import message_from_bytes
 from email.policy import default as default_policy
 from urllib.parse import parse_qs, unquote
 
-from core.responses import new_uuid
+from ministack.core.responses import new_uuid
 
 logger = logging.getLogger("ses")
 

@@ -26,7 +26,7 @@ import time
 import logging
 from urllib.parse import parse_qs
 
-from core.responses import new_uuid
+from ministack.core.responses import new_uuid
 
 logger = logging.getLogger("rds")
 

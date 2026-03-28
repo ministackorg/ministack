@@ -39,7 +39,7 @@ import logging
 import re
 from urllib.parse import unquote
 
-from core.responses import json_response, error_response_json, new_uuid
+from ministack.core.responses import json_response, error_response_json, new_uuid
 
 logger = logging.getLogger("lambda")
 
@@ -1776,7 +1776,7 @@ def _poll_loop():
 
 
 def _poll_once():
-    from services import sqs as _sqs
+    from ministack.services import sqs as _sqs
 
     for esm in list(_esms.values()):
         if not esm.get("Enabled", True):
@@ -1925,7 +1925,7 @@ def _list_function_url_configs(func_name: str, query_params: dict):
 
 
 def reset():
-    from core import lambda_runtime
+    from ministack.core import lambda_runtime
     _functions.clear()
     _layers.clear()
     _esms.clear()

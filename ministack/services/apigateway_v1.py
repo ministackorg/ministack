@@ -72,7 +72,7 @@ import time
 import datetime
 import logging
 
-from core.responses import new_uuid
+from ministack.core.responses import new_uuid
 
 
 def _now_iso():
@@ -220,8 +220,8 @@ def _match_recursive(resources, parent_id, segments, params):
 
 async def _call_lambda(func_name, event):
     """Invoke a Lambda function and return the parsed response dict."""
-    from services import lambda_svc
-    from core.lambda_runtime import get_or_create_worker
+    from ministack.services import lambda_svc
+    from ministack.core.lambda_runtime import get_or_create_worker
 
     if func_name not in lambda_svc._functions:
         return None, f"Lambda function '{func_name}' not found"

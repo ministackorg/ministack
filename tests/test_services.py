@@ -8116,3 +8116,870 @@ def test_sfn_integration_lambda_invoke(sfn, lam):
     assert desc["status"] == "SUCCEEDED"
     output = json.loads(desc["output"])
     assert output["result"]["doubled"] == 42
+
+
+# ========== Package structure ==========
+
+_ministack_installed = True
+try:
+    import ministack  # noqa: F401
+except ModuleNotFoundError:
+    _ministack_installed = False
+
+_requires_package = pytest.mark.skipif(
+    not _ministack_installed,
+    reason="ministack not installed locally (runs in CI via pip install -e .)",
+)
+
+
+@_requires_package
+def test_package_core_importable():
+    """ministack.core modules must all be importable."""
+    from ministack.core.responses import json_response, error_response_json, new_uuid
+    from ministack.core.router import detect_service
+    from ministack.core.lambda_runtime import get_or_create_worker, reset as lr_reset
+    from ministack.core.persistence import save_all, load_state
+    assert callable(json_response)
+    assert callable(detect_service)
+    assert callable(get_or_create_worker)
+    assert callable(save_all)
+
+
+@_requires_package
+def test_package_services_importable():
+    """All 25 ministack.services modules must be importable and expose handle_request."""
+    from ministack.services import (
+        s3, sqs, sns, dynamodb, lambda_svc, secretsmanager, cloudwatch_logs,
+        ssm, eventbridge, kinesis, cloudwatch, ses, stepfunctions,
+        ecs, rds, elasticache, glue, athena, apigateway, apigateway_v1,
+        firehose, route53, cognito,
+    )
+    from ministack.services.iam_sts import handle_iam_request, handle_sts_request
+    for mod in [s3, sqs, sns, dynamodb, lambda_svc, secretsmanager,
+                cloudwatch_logs, ssm, eventbridge, kinesis, cloudwatch,
+                ses, stepfunctions, ecs, rds, elasticache, glue, athena,
+                apigateway, firehose, route53, cognito]:
+        assert callable(getattr(mod, "handle_request", None)), \
+            f"{mod.__name__} missing handle_request"
+    assert callable(handle_iam_request)
+    assert callable(handle_sts_request)
+
+
+@_requires_package
+def test_app_asgi_callable():
+    """ministack.app:app must be an async callable (ASGI entry point)."""
+    import inspect
+    from ministack import app as app_module
+    assert callable(app_module.app)
+    assert inspect.iscoroutinefunction(app_module.app)
+    assert callable(app_module.main)
+
+
+# ========== Cognito ==========
+
+
+def test_cognito_create_and_describe_user_pool(cognito_idp):
+    resp = cognito_idp.create_user_pool(PoolName="TestPool")
+    pool = resp["UserPool"]
+    pid = pool["Id"]
+    assert pool["Name"] == "TestPool"
+    assert pid.startswith("us-east-1_")
+
+    desc = cognito_idp.describe_user_pool(UserPoolId=pid)["UserPool"]
+    assert desc["Id"] == pid
+    assert desc["Name"] == "TestPool"
+
+
+def test_cognito_list_user_pools(cognito_idp):
+    cognito_idp.create_user_pool(PoolName="ListPoolA")
+    cognito_idp.create_user_pool(PoolName="ListPoolB")
+    resp = cognito_idp.list_user_pools(MaxResults=60)
+    names = [p["Name"] for p in resp["UserPools"]]
+    assert "ListPoolA" in names
+    assert "ListPoolB" in names
+
+
+def test_cognito_update_user_pool(cognito_idp):
+    resp = cognito_idp.create_user_pool(PoolName="UpdatePool")
+    pid = resp["UserPool"]["Id"]
+    cognito_idp.update_user_pool(UserPoolId=pid, UserPoolTags={"env": "test"})
+    desc = cognito_idp.describe_user_pool(UserPoolId=pid)["UserPool"]
+    assert desc["UserPoolTags"].get("env") == "test"
+
+
+def test_cognito_delete_user_pool(cognito_idp):
+    resp = cognito_idp.create_user_pool(PoolName="DeletePool")
+    pid = resp["UserPool"]["Id"]
+    cognito_idp.delete_user_pool(UserPoolId=pid)
+    pools = cognito_idp.list_user_pools(MaxResults=60)["UserPools"]
+    assert not any(p["Id"] == pid for p in pools)
+
+
+def test_cognito_create_and_describe_user_pool_client(cognito_idp):
+    pid = cognito_idp.create_user_pool(PoolName="ClientPool")["UserPool"]["Id"]
+    client_resp = cognito_idp.create_user_pool_client(
+        UserPoolId=pid,
+        ClientName="MyApp",
+        ExplicitAuthFlows=["ALLOW_USER_PASSWORD_AUTH", "ALLOW_REFRESH_TOKEN_AUTH"],
+    )
+    client = client_resp["UserPoolClient"]
+    cid = client["ClientId"]
+    assert client["ClientName"] == "MyApp"
+
+    desc = cognito_idp.describe_user_pool_client(UserPoolId=pid, ClientId=cid)["UserPoolClient"]
+    assert desc["ClientId"] == cid
+    assert desc["ClientName"] == "MyApp"
+
+
+def test_cognito_list_user_pool_clients(cognito_idp):
+    pid = cognito_idp.create_user_pool(PoolName="MultiClientPool")["UserPool"]["Id"]
+    cognito_idp.create_user_pool_client(UserPoolId=pid, ClientName="App1")
+    cognito_idp.create_user_pool_client(UserPoolId=pid, ClientName="App2")
+    clients = cognito_idp.list_user_pool_clients(UserPoolId=pid, MaxResults=60)["UserPoolClients"]
+    names = [c["ClientName"] for c in clients]
+    assert "App1" in names
+    assert "App2" in names
+
+
+def test_cognito_admin_create_and_get_user(cognito_idp):
+    pid = cognito_idp.create_user_pool(PoolName="AdminUserPool")["UserPool"]["Id"]
+    cognito_idp.admin_create_user(
+        UserPoolId=pid,
+        Username="alice",
+        UserAttributes=[{"Name": "email", "Value": "alice@example.com"}],
+    )
+    user = cognito_idp.admin_get_user(UserPoolId=pid, Username="alice")
+    assert user["Username"] == "alice"
+    attrs = {a["Name"]: a["Value"] for a in user["UserAttributes"]}
+    assert attrs["email"] == "alice@example.com"
+
+
+def test_cognito_list_users(cognito_idp):
+    pid = cognito_idp.create_user_pool(PoolName="ListUsersPool")["UserPool"]["Id"]
+    for name in ["user1", "user2", "user3"]:
+        cognito_idp.admin_create_user(UserPoolId=pid, Username=name)
+    users = cognito_idp.list_users(UserPoolId=pid)["Users"]
+    usernames = [u["Username"] for u in users]
+    assert "user1" in usernames
+    assert "user2" in usernames
+    assert "user3" in usernames
+
+
+def test_cognito_list_users_filter(cognito_idp):
+    pid = cognito_idp.create_user_pool(PoolName="FilterUsersPool")["UserPool"]["Id"]
+    cognito_idp.admin_create_user(
+        UserPoolId=pid,
+        Username="bob",
+        UserAttributes=[{"Name": "email", "Value": "bob@example.com"}],
+    )
+    cognito_idp.admin_create_user(
+        UserPoolId=pid,
+        Username="charlie",
+        UserAttributes=[{"Name": "email", "Value": "charlie@example.com"}],
+    )
+    resp = cognito_idp.list_users(UserPoolId=pid, Filter='username = "bob"')
+    users = resp["Users"]
+    assert len(users) == 1
+    assert users[0]["Username"] == "bob"
+
+
+def test_cognito_admin_set_user_password(cognito_idp):
+    pid = cognito_idp.create_user_pool(PoolName="PwdPool")["UserPool"]["Id"]
+    cid = cognito_idp.create_user_pool_client(
+        UserPoolId=pid, ClientName="PwdApp",
+        ExplicitAuthFlows=["ALLOW_USER_PASSWORD_AUTH", "ALLOW_REFRESH_TOKEN_AUTH"],
+    )["UserPoolClient"]["ClientId"]
+    cognito_idp.admin_create_user(UserPoolId=pid, Username="dave")
+    cognito_idp.admin_set_user_password(
+        UserPoolId=pid, Username="dave", Password="NewPass123!", Permanent=True
+    )
+    auth = cognito_idp.admin_initiate_auth(
+        UserPoolId=pid,
+        ClientId=cid,
+        AuthFlow="ADMIN_USER_PASSWORD_AUTH",
+        AuthParameters={"USERNAME": "dave", "PASSWORD": "NewPass123!"},
+    )
+    assert "AuthenticationResult" in auth
+
+
+def test_cognito_admin_initiate_auth_wrong_password(cognito_idp):
+    import botocore.exceptions
+    pid = cognito_idp.create_user_pool(PoolName="AuthFailPool")["UserPool"]["Id"]
+    cid = cognito_idp.create_user_pool_client(
+        UserPoolId=pid, ClientName="AuthFailApp",
+        ExplicitAuthFlows=["ALLOW_USER_PASSWORD_AUTH", "ALLOW_REFRESH_TOKEN_AUTH"],
+    )["UserPoolClient"]["ClientId"]
+    cognito_idp.admin_create_user(UserPoolId=pid, Username="eve")
+    cognito_idp.admin_set_user_password(
+        UserPoolId=pid, Username="eve", Password="Correct1!", Permanent=True
+    )
+    with pytest.raises(botocore.exceptions.ClientError) as exc_info:
+        cognito_idp.admin_initiate_auth(
+            UserPoolId=pid,
+            ClientId=cid,
+            AuthFlow="ADMIN_USER_PASSWORD_AUTH",
+            AuthParameters={"USERNAME": "eve", "PASSWORD": "Wrong1!"},
+        )
+    assert exc_info.value.response["Error"]["Code"] == "NotAuthorizedException"
+
+
+def test_cognito_initiate_auth_user_password(cognito_idp):
+    pid = cognito_idp.create_user_pool(PoolName="InitiateAuthPool")["UserPool"]["Id"]
+    cid = cognito_idp.create_user_pool_client(
+        UserPoolId=pid, ClientName="InitiateApp",
+        ExplicitAuthFlows=["ALLOW_USER_PASSWORD_AUTH", "ALLOW_REFRESH_TOKEN_AUTH"],
+    )["UserPoolClient"]["ClientId"]
+    cognito_idp.admin_create_user(UserPoolId=pid, Username="frank")
+    cognito_idp.admin_set_user_password(
+        UserPoolId=pid, Username="frank", Password="FrankPass1!", Permanent=True
+    )
+    auth = cognito_idp.initiate_auth(
+        ClientId=cid,
+        AuthFlow="USER_PASSWORD_AUTH",
+        AuthParameters={"USERNAME": "frank", "PASSWORD": "FrankPass1!"},
+    )
+    assert "AuthenticationResult" in auth
+    result = auth["AuthenticationResult"]
+    assert "AccessToken" in result
+    assert "IdToken" in result
+    assert "RefreshToken" in result
+
+
+def test_cognito_signup_and_confirm(cognito_idp):
+    pid = cognito_idp.create_user_pool(PoolName="SignupPool")["UserPool"]["Id"]
+    cid = cognito_idp.create_user_pool_client(
+        UserPoolId=pid, ClientName="SignupApp"
+    )["UserPoolClient"]["ClientId"]
+
+    resp = cognito_idp.sign_up(
+        ClientId=cid,
+        Username="grace",
+        Password="GracePass1!",
+        UserAttributes=[{"Name": "email", "Value": "grace@example.com"}],
+    )
+    assert resp["UserSub"]
+
+    cognito_idp.confirm_sign_up(
+        ClientId=cid,
+        Username="grace",
+        ConfirmationCode="123456",
+    )
+    user = cognito_idp.admin_get_user(UserPoolId=pid, Username="grace")
+    assert user["UserStatus"] == "CONFIRMED"
+
+
+def test_cognito_forgot_password_and_confirm(cognito_idp):
+    pid = cognito_idp.create_user_pool(PoolName="ForgotPwdPool")["UserPool"]["Id"]
+    cid = cognito_idp.create_user_pool_client(
+        UserPoolId=pid, ClientName="ForgotApp"
+    )["UserPoolClient"]["ClientId"]
+    cognito_idp.admin_create_user(UserPoolId=pid, Username="henry")
+    cognito_idp.admin_set_user_password(
+        UserPoolId=pid, Username="henry", Password="OldPass1!", Permanent=True
+    )
+
+    cognito_idp.forgot_password(ClientId=cid, Username="henry")
+
+    cognito_idp.confirm_forgot_password(
+        ClientId=cid,
+        Username="henry",
+        ConfirmationCode="654321",
+        Password="NewPass2!",
+    )
+    cognito_idp.admin_set_user_password(
+        UserPoolId=pid, Username="henry", Password="NewPass2!", Permanent=True
+    )
+    auth = cognito_idp.admin_initiate_auth(
+        UserPoolId=pid,
+        ClientId=cid,
+        AuthFlow="ADMIN_USER_PASSWORD_AUTH",
+        AuthParameters={"USERNAME": "henry", "PASSWORD": "NewPass2!"},
+    )
+    assert "AuthenticationResult" in auth
+
+
+def test_cognito_admin_update_user_attributes(cognito_idp):
+    pid = cognito_idp.create_user_pool(PoolName="UpdateAttrPool")["UserPool"]["Id"]
+    cognito_idp.admin_create_user(
+        UserPoolId=pid,
+        Username="irene",
+        UserAttributes=[{"Name": "email", "Value": "irene@example.com"}],
+    )
+    cognito_idp.admin_update_user_attributes(
+        UserPoolId=pid,
+        Username="irene",
+        UserAttributes=[{"Name": "email", "Value": "irene@updated.com"}],
+    )
+    user = cognito_idp.admin_get_user(UserPoolId=pid, Username="irene")
+    attrs = {a["Name"]: a["Value"] for a in user["UserAttributes"]}
+    assert attrs["email"] == "irene@updated.com"
+
+
+def test_cognito_admin_disable_enable_user(cognito_idp):
+    pid = cognito_idp.create_user_pool(PoolName="DisablePool")["UserPool"]["Id"]
+    cognito_idp.admin_create_user(UserPoolId=pid, Username="jack")
+
+    cognito_idp.admin_disable_user(UserPoolId=pid, Username="jack")
+    user = cognito_idp.admin_get_user(UserPoolId=pid, Username="jack")
+    assert user["Enabled"] is False
+
+    cognito_idp.admin_enable_user(UserPoolId=pid, Username="jack")
+    user = cognito_idp.admin_get_user(UserPoolId=pid, Username="jack")
+    assert user["Enabled"] is True
+
+
+def test_cognito_admin_delete_user(cognito_idp):
+    import botocore.exceptions
+    pid = cognito_idp.create_user_pool(PoolName="DeleteUserPool")["UserPool"]["Id"]
+    cognito_idp.admin_create_user(UserPoolId=pid, Username="kate")
+    cognito_idp.admin_delete_user(UserPoolId=pid, Username="kate")
+    with pytest.raises(botocore.exceptions.ClientError) as exc_info:
+        cognito_idp.admin_get_user(UserPoolId=pid, Username="kate")
+    assert exc_info.value.response["Error"]["Code"] == "UserNotFoundException"
+
+
+def test_cognito_groups_crud(cognito_idp):
+    pid = cognito_idp.create_user_pool(PoolName="GroupPool")["UserPool"]["Id"]
+
+    resp = cognito_idp.create_group(UserPoolId=pid, GroupName="admins", Description="Admins")
+    assert resp["Group"]["GroupName"] == "admins"
+
+    group = cognito_idp.get_group(UserPoolId=pid, GroupName="admins")["Group"]
+    assert group["Description"] == "Admins"
+
+    groups = cognito_idp.list_groups(UserPoolId=pid)["Groups"]
+    assert any(g["GroupName"] == "admins" for g in groups)
+
+    cognito_idp.delete_group(UserPoolId=pid, GroupName="admins")
+    groups = cognito_idp.list_groups(UserPoolId=pid)["Groups"]
+    assert not any(g["GroupName"] == "admins" for g in groups)
+
+
+def test_cognito_admin_add_remove_user_from_group(cognito_idp):
+    pid = cognito_idp.create_user_pool(PoolName="GroupMemberPool")["UserPool"]["Id"]
+    cognito_idp.admin_create_user(UserPoolId=pid, Username="liam")
+    cognito_idp.create_group(UserPoolId=pid, GroupName="editors")
+
+    cognito_idp.admin_add_user_to_group(UserPoolId=pid, Username="liam", GroupName="editors")
+    members = cognito_idp.list_users_in_group(UserPoolId=pid, GroupName="editors")["Users"]
+    assert any(u["Username"] == "liam" for u in members)
+
+    groups_for_user = cognito_idp.admin_list_groups_for_user(
+        UserPoolId=pid, Username="liam"
+    )["Groups"]
+    assert any(g["GroupName"] == "editors" for g in groups_for_user)
+
+    cognito_idp.admin_remove_user_from_group(
+        UserPoolId=pid, Username="liam", GroupName="editors"
+    )
+    members = cognito_idp.list_users_in_group(UserPoolId=pid, GroupName="editors")["Users"]
+    assert not any(u["Username"] == "liam" for u in members)
+
+
+def test_cognito_domain_crud(cognito_idp):
+    pid = cognito_idp.create_user_pool(PoolName="DomainPool")["UserPool"]["Id"]
+    resp = cognito_idp.create_user_pool_domain(UserPoolId=pid, Domain="my-test-domain")
+    assert "CloudFrontDomain" in resp
+
+    desc = cognito_idp.describe_user_pool_domain(Domain="my-test-domain")
+    assert desc["DomainDescription"]["UserPoolId"] == pid
+    assert desc["DomainDescription"]["Status"] == "ACTIVE"
+
+    cognito_idp.delete_user_pool_domain(UserPoolId=pid, Domain="my-test-domain")
+    desc2 = cognito_idp.describe_user_pool_domain(Domain="my-test-domain")
+    assert desc2["DomainDescription"] == {}
+
+
+def test_cognito_mfa_config(cognito_idp):
+    pid = cognito_idp.create_user_pool(PoolName="MfaPool")["UserPool"]["Id"]
+    resp = cognito_idp.get_user_pool_mfa_config(UserPoolId=pid)
+    assert resp["MfaConfiguration"] == "OFF"
+
+    cognito_idp.set_user_pool_mfa_config(
+        UserPoolId=pid,
+        SoftwareTokenMfaConfiguration={"Enabled": True},
+        MfaConfiguration="OPTIONAL",
+    )
+    resp = cognito_idp.get_user_pool_mfa_config(UserPoolId=pid)
+    assert resp["MfaConfiguration"] == "OPTIONAL"
+    assert resp["SoftwareTokenMfaConfiguration"]["Enabled"] is True
+
+
+def test_cognito_tags(cognito_idp):
+    resp = cognito_idp.create_user_pool(PoolName="TagPool")
+    pid = resp["UserPool"]["Id"]
+    arn = resp["UserPool"]["Arn"]
+
+    cognito_idp.tag_resource(ResourceArn=arn, Tags={"project": "ministack"})
+    tags = cognito_idp.list_tags_for_resource(ResourceArn=arn)["Tags"]
+    assert tags["project"] == "ministack"
+
+    cognito_idp.untag_resource(ResourceArn=arn, TagKeys=["project"])
+    tags = cognito_idp.list_tags_for_resource(ResourceArn=arn)["Tags"]
+    assert "project" not in tags
+
+
+def test_cognito_get_user_from_token(cognito_idp):
+    pid = cognito_idp.create_user_pool(PoolName="GetUserPool")["UserPool"]["Id"]
+    cid = cognito_idp.create_user_pool_client(
+        UserPoolId=pid, ClientName="GetUserApp",
+        ExplicitAuthFlows=["ALLOW_USER_PASSWORD_AUTH", "ALLOW_REFRESH_TOKEN_AUTH"],
+    )["UserPoolClient"]["ClientId"]
+    cognito_idp.admin_create_user(
+        UserPoolId=pid,
+        Username="maya",
+        UserAttributes=[{"Name": "email", "Value": "maya@example.com"}],
+    )
+    cognito_idp.admin_set_user_password(
+        UserPoolId=pid, Username="maya", Password="MayaPass1!", Permanent=True
+    )
+    auth = cognito_idp.admin_initiate_auth(
+        UserPoolId=pid,
+        ClientId=cid,
+        AuthFlow="ADMIN_USER_PASSWORD_AUTH",
+        AuthParameters={"USERNAME": "maya", "PASSWORD": "MayaPass1!"},
+    )
+    access_token = auth["AuthenticationResult"]["AccessToken"]
+    user = cognito_idp.get_user(AccessToken=access_token)
+    assert user["Username"] == "maya"
+
+
+def test_cognito_global_sign_out(cognito_idp):
+    pid = cognito_idp.create_user_pool(PoolName="SignOutPool")["UserPool"]["Id"]
+    cid = cognito_idp.create_user_pool_client(
+        UserPoolId=pid, ClientName="SignOutApp",
+        ExplicitAuthFlows=["ALLOW_USER_PASSWORD_AUTH", "ALLOW_REFRESH_TOKEN_AUTH"],
+    )["UserPoolClient"]["ClientId"]
+    cognito_idp.admin_create_user(UserPoolId=pid, Username="noah")
+    cognito_idp.admin_set_user_password(
+        UserPoolId=pid, Username="noah", Password="NoahPass1!", Permanent=True
+    )
+    auth = cognito_idp.admin_initiate_auth(
+        UserPoolId=pid,
+        ClientId=cid,
+        AuthFlow="ADMIN_USER_PASSWORD_AUTH",
+        AuthParameters={"USERNAME": "noah", "PASSWORD": "NoahPass1!"},
+    )
+    access_token = auth["AuthenticationResult"]["AccessToken"]
+    cognito_idp.global_sign_out(AccessToken=access_token)  # must not raise
+
+
+def test_cognito_admin_confirm_signup(cognito_idp):
+    pid = cognito_idp.create_user_pool(PoolName="AdminConfirmPool")["UserPool"]["Id"]
+    cid = cognito_idp.create_user_pool_client(
+        UserPoolId=pid, ClientName="AdminConfirmApp"
+    )["UserPoolClient"]["ClientId"]
+    cognito_idp.sign_up(
+        ClientId=cid,
+        Username="olivia",
+        Password="OliviaPass1!",
+    )
+    cognito_idp.admin_confirm_sign_up(UserPoolId=pid, Username="olivia")
+    user = cognito_idp.admin_get_user(UserPoolId=pid, Username="olivia")
+    assert user["UserStatus"] == "CONFIRMED"
+
+
+# Identity Pools (cognito-identity)
+
+def test_cognito_identity_pool_crud(cognito_identity):
+    resp = cognito_identity.create_identity_pool(
+        IdentityPoolName="TestIdPool",
+        AllowUnauthenticatedIdentities=False,
+    )
+    iid = resp["IdentityPoolId"]
+    assert resp["IdentityPoolName"] == "TestIdPool"
+    assert iid.startswith("us-east-1:")
+
+    desc = cognito_identity.describe_identity_pool(IdentityPoolId=iid)
+    assert desc["IdentityPoolId"] == iid
+    assert desc["IdentityPoolName"] == "TestIdPool"
+
+    pools = cognito_identity.list_identity_pools(MaxResults=60)["IdentityPools"]
+    assert any(p["IdentityPoolId"] == iid for p in pools)
+
+    cognito_identity.update_identity_pool(
+        IdentityPoolId=iid,
+        IdentityPoolName="TestIdPool",
+        AllowUnauthenticatedIdentities=True,
+    )
+    desc2 = cognito_identity.describe_identity_pool(IdentityPoolId=iid)
+    assert desc2["AllowUnauthenticatedIdentities"] is True
+
+    cognito_identity.delete_identity_pool(IdentityPoolId=iid)
+    pools2 = cognito_identity.list_identity_pools(MaxResults=60)["IdentityPools"]
+    assert not any(p["IdentityPoolId"] == iid for p in pools2)
+
+
+def test_cognito_get_id_and_credentials(cognito_identity):
+    resp = cognito_identity.create_identity_pool(
+        IdentityPoolName="CredsPool",
+        AllowUnauthenticatedIdentities=True,
+    )
+    iid = resp["IdentityPoolId"]
+
+    id_resp = cognito_identity.get_id(IdentityPoolId=iid, AccountId="000000000000")
+    identity_id = id_resp["IdentityId"]
+    assert identity_id
+
+    creds = cognito_identity.get_credentials_for_identity(IdentityId=identity_id)
+    assert creds["IdentityId"] == identity_id
+    assert "AccessKeyId" in creds["Credentials"]
+    assert creds["Credentials"]["AccessKeyId"].startswith("ASIA")
+    assert "SecretKey" in creds["Credentials"]
+    assert "SessionToken" in creds["Credentials"]
+
+
+def test_cognito_identity_pool_roles(cognito_identity):
+    resp = cognito_identity.create_identity_pool(
+        IdentityPoolName="RolesPool",
+        AllowUnauthenticatedIdentities=True,
+    )
+    iid = resp["IdentityPoolId"]
+
+    cognito_identity.set_identity_pool_roles(
+        IdentityPoolId=iid,
+        Roles={
+            "authenticated": "arn:aws:iam::000000000000:role/AuthRole",
+            "unauthenticated": "arn:aws:iam::000000000000:role/UnauthRole",
+        },
+    )
+    roles = cognito_identity.get_identity_pool_roles(IdentityPoolId=iid)
+    assert roles["Roles"]["authenticated"] == "arn:aws:iam::000000000000:role/AuthRole"
+    assert roles["Roles"]["unauthenticated"] == "arn:aws:iam::000000000000:role/UnauthRole"
+
+
+def test_cognito_list_identities(cognito_identity):
+    resp = cognito_identity.create_identity_pool(
+        IdentityPoolName="ListIdPool",
+        AllowUnauthenticatedIdentities=True,
+    )
+    iid = resp["IdentityPoolId"]
+
+    id1 = cognito_identity.get_id(IdentityPoolId=iid, AccountId="000000000000")["IdentityId"]
+    id2 = cognito_identity.get_id(IdentityPoolId=iid, AccountId="000000000000")["IdentityId"]
+
+    identities = cognito_identity.list_identities(IdentityPoolId=iid, MaxResults=60)["Identities"]
+    ids = [i["IdentityId"] for i in identities]
+    assert id1 in ids
+    assert id2 in ids
+
+
+def test_cognito_get_open_id_token(cognito_identity):
+    resp = cognito_identity.create_identity_pool(
+        IdentityPoolName="OidcPool",
+        AllowUnauthenticatedIdentities=True,
+    )
+    iid = resp["IdentityPoolId"]
+    identity_id = cognito_identity.get_id(
+        IdentityPoolId=iid, AccountId="000000000000"
+    )["IdentityId"]
+
+    token_resp = cognito_identity.get_open_id_token(IdentityId=identity_id)
+    assert token_resp["IdentityId"] == identity_id
+    token = token_resp["Token"]
+    # Verify stub JWT structure: header.payload.sig
+    parts = token.split(".")
+    assert len(parts) == 3
+
+
+def test_cognito_signup_always_unconfirmed(cognito_idp):
+    """SignUp always returns UNCONFIRMED regardless of AutoVerifiedAttributes."""
+    # Pool with AutoVerifiedAttributes — user still starts UNCONFIRMED
+    pid = cognito_idp.create_user_pool(
+        PoolName="AutoVerifyPool",
+        AutoVerifiedAttributes=["email"],
+    )["UserPool"]["Id"]
+    cid = cognito_idp.create_user_pool_client(
+        UserPoolId=pid, ClientName="AutoVerifyApp"
+    )["UserPoolClient"]["ClientId"]
+    resp = cognito_idp.sign_up(
+        ClientId=cid,
+        Username="testuser",
+        Password="TestPass1!",
+        UserAttributes=[{"Name": "email", "Value": "test@example.com"}],
+    )
+    assert resp["UserConfirmed"] is False
+    user = cognito_idp.admin_get_user(UserPoolId=pid, Username="testuser")
+    assert user["UserStatus"] == "UNCONFIRMED"
+
+    # Pool with NO AutoVerifiedAttributes — user also starts UNCONFIRMED
+    pid2 = cognito_idp.create_user_pool(PoolName="NoAutoVerifyPool")["UserPool"]["Id"]
+    cid2 = cognito_idp.create_user_pool_client(
+        UserPoolId=pid2, ClientName="NoAutoVerifyApp"
+    )["UserPoolClient"]["ClientId"]
+    resp2 = cognito_idp.sign_up(
+        ClientId=cid2, Username="testuser2", Password="TestPass1!"
+    )
+    assert resp2["UserConfirmed"] is False
+    user2 = cognito_idp.admin_get_user(UserPoolId=pid2, Username="testuser2")
+    assert user2["UserStatus"] == "UNCONFIRMED"
+
+
+def test_cognito_change_password(cognito_idp):
+    """ChangePassword decodes the access token and updates the stored password."""
+    pid = cognito_idp.create_user_pool(PoolName="ChangePwdPool")["UserPool"]["Id"]
+    cid = cognito_idp.create_user_pool_client(
+        UserPoolId=pid, ClientName="ChangePwdApp",
+        ExplicitAuthFlows=["ALLOW_USER_PASSWORD_AUTH", "ALLOW_REFRESH_TOKEN_AUTH"],
+    )["UserPoolClient"]["ClientId"]
+    cognito_idp.admin_create_user(UserPoolId=pid, Username="pwduser")
+    cognito_idp.admin_set_user_password(
+        UserPoolId=pid, Username="pwduser", Password="OldPass1!", Permanent=True
+    )
+    auth = cognito_idp.admin_initiate_auth(
+        UserPoolId=pid, ClientId=cid,
+        AuthFlow="ADMIN_USER_PASSWORD_AUTH",
+        AuthParameters={"USERNAME": "pwduser", "PASSWORD": "OldPass1!"},
+    )
+    access_token = auth["AuthenticationResult"]["AccessToken"]
+
+    cognito_idp.change_password(
+        AccessToken=access_token,
+        PreviousPassword="OldPass1!",
+        ProposedPassword="NewPass2!",
+    )
+
+    # New password must work
+    auth2 = cognito_idp.admin_initiate_auth(
+        UserPoolId=pid, ClientId=cid,
+        AuthFlow="ADMIN_USER_PASSWORD_AUTH",
+        AuthParameters={"USERNAME": "pwduser", "PASSWORD": "NewPass2!"},
+    )
+    assert "AuthenticationResult" in auth2
+
+    # Old password must fail
+    import botocore.exceptions
+    with pytest.raises(botocore.exceptions.ClientError) as exc_info:
+        cognito_idp.admin_initiate_auth(
+            UserPoolId=pid, ClientId=cid,
+            AuthFlow="ADMIN_USER_PASSWORD_AUTH",
+            AuthParameters={"USERNAME": "pwduser", "PASSWORD": "OldPass1!"},
+        )
+    assert exc_info.value.response["Error"]["Code"] == "NotAuthorizedException"
+
+
+def test_cognito_refresh_token_auth_correct_user(cognito_idp):
+    """REFRESH_TOKEN_AUTH returns tokens for the correct user, not the first user in the pool."""
+    pid = cognito_idp.create_user_pool(PoolName="RefreshPool")["UserPool"]["Id"]
+    cid = cognito_idp.create_user_pool_client(
+        UserPoolId=pid, ClientName="RefreshApp",
+        ExplicitAuthFlows=["ALLOW_USER_PASSWORD_AUTH", "ALLOW_REFRESH_TOKEN_AUTH"],
+    )["UserPoolClient"]["ClientId"]
+
+    for name, pw in [("first", "First1!"), ("second", "Second1!")]:
+        cognito_idp.admin_create_user(UserPoolId=pid, Username=name)
+        cognito_idp.admin_set_user_password(
+            UserPoolId=pid, Username=name, Password=pw, Permanent=True
+        )
+
+    # Auth as "second" user and refresh
+    auth = cognito_idp.admin_initiate_auth(
+        UserPoolId=pid, ClientId=cid,
+        AuthFlow="ADMIN_USER_PASSWORD_AUTH",
+        AuthParameters={"USERNAME": "second", "PASSWORD": "Second1!"},
+    )
+    refresh_token = auth["AuthenticationResult"]["RefreshToken"]
+
+    refresh = cognito_idp.admin_initiate_auth(
+        UserPoolId=pid, ClientId=cid,
+        AuthFlow="REFRESH_TOKEN_AUTH",
+        AuthParameters={"REFRESH_TOKEN": refresh_token},
+    )
+    assert "AuthenticationResult" in refresh
+    # New access token should resolve back to "second" via GetUser
+    new_access = refresh["AuthenticationResult"]["AccessToken"]
+    user = cognito_idp.get_user(AccessToken=new_access)
+    assert user["Username"] == "second"
+
+
+def test_cognito_refresh_token_alias(cognito_idp):
+    """REFRESH_TOKEN (without _AUTH suffix) is accepted as an alias."""
+    pid = cognito_idp.create_user_pool(PoolName="RefreshAliasPool")["UserPool"]["Id"]
+    cid = cognito_idp.create_user_pool_client(
+        UserPoolId=pid, ClientName="RefreshAliasApp",
+        ExplicitAuthFlows=["ALLOW_USER_PASSWORD_AUTH", "ALLOW_REFRESH_TOKEN_AUTH"],
+    )["UserPoolClient"]["ClientId"]
+    cognito_idp.admin_create_user(UserPoolId=pid, Username="aliasuser")
+    cognito_idp.admin_set_user_password(
+        UserPoolId=pid, Username="aliasuser", Password="AliasPass1!", Permanent=True
+    )
+    auth = cognito_idp.admin_initiate_auth(
+        UserPoolId=pid, ClientId=cid,
+        AuthFlow="ADMIN_USER_PASSWORD_AUTH",
+        AuthParameters={"USERNAME": "aliasuser", "PASSWORD": "AliasPass1!"},
+    )
+    refresh_token = auth["AuthenticationResult"]["RefreshToken"]
+    refresh = cognito_idp.initiate_auth(
+        ClientId=cid,
+        AuthFlow="REFRESH_TOKEN",
+        AuthParameters={"REFRESH_TOKEN": refresh_token},
+    )
+    assert "AuthenticationResult" in refresh
+    assert "AccessToken" in refresh["AuthenticationResult"]
+    assert "RefreshToken" not in refresh["AuthenticationResult"]
+
+
+def test_cognito_respond_to_auth_challenge_new_password(cognito_idp):
+    """RespondToAuthChallenge with NEW_PASSWORD_REQUIRED confirms the user."""
+    pid = cognito_idp.create_user_pool(PoolName="ChallengePool")["UserPool"]["Id"]
+    cid = cognito_idp.create_user_pool_client(
+        UserPoolId=pid, ClientName="ChallengeApp",
+        ExplicitAuthFlows=["ALLOW_USER_PASSWORD_AUTH", "ALLOW_REFRESH_TOKEN_AUTH"],
+    )["UserPoolClient"]["ClientId"]
+    cognito_idp.admin_create_user(UserPoolId=pid, Username="newpwduser")
+    # Set a temp password — Permanent=False keeps FORCE_CHANGE_PASSWORD status
+    cognito_idp.admin_set_user_password(
+        UserPoolId=pid, Username="newpwduser", Password="TempPass1!", Permanent=False
+    )
+    # Initiate auth — FORCE_CHANGE_PASSWORD triggers NEW_PASSWORD_REQUIRED challenge
+    auth = cognito_idp.initiate_auth(
+        ClientId=cid,
+        AuthFlow="USER_PASSWORD_AUTH",
+        AuthParameters={"USERNAME": "newpwduser", "PASSWORD": "TempPass1!"},
+    )
+    assert auth.get("ChallengeName") == "NEW_PASSWORD_REQUIRED"
+    session = auth["Session"]
+    result = cognito_idp.respond_to_auth_challenge(
+        ClientId=cid,
+        ChallengeName="NEW_PASSWORD_REQUIRED",
+        Session=session,
+        ChallengeResponses={"USERNAME": "newpwduser", "NEW_PASSWORD": "FinalPass1!"},
+    )
+    assert "AuthenticationResult" in result
+    user = cognito_idp.admin_get_user(UserPoolId=pid, Username="newpwduser")
+    assert user["UserStatus"] == "CONFIRMED"
+
+
+def test_cognito_update_user_attributes_via_token(cognito_idp):
+    """UpdateUserAttributes (self-service) updates attributes using access token."""
+    pid = cognito_idp.create_user_pool(PoolName="UpdateAttrTokenPool")["UserPool"]["Id"]
+    cid = cognito_idp.create_user_pool_client(
+        UserPoolId=pid, ClientName="UpdateAttrApp",
+        ExplicitAuthFlows=["ALLOW_USER_PASSWORD_AUTH", "ALLOW_REFRESH_TOKEN_AUTH"],
+    )["UserPoolClient"]["ClientId"]
+    cognito_idp.admin_create_user(
+        UserPoolId=pid, Username="attrupdate",
+        UserAttributes=[{"Name": "email", "Value": "old@example.com"}],
+    )
+    cognito_idp.admin_set_user_password(
+        UserPoolId=pid, Username="attrupdate", Password="AttrPass1!", Permanent=True
+    )
+    access_token = cognito_idp.admin_initiate_auth(
+        UserPoolId=pid, ClientId=cid,
+        AuthFlow="ADMIN_USER_PASSWORD_AUTH",
+        AuthParameters={"USERNAME": "attrupdate", "PASSWORD": "AttrPass1!"},
+    )["AuthenticationResult"]["AccessToken"]
+
+    cognito_idp.update_user_attributes(
+        AccessToken=access_token,
+        UserAttributes=[{"Name": "email", "Value": "new@example.com"}],
+    )
+    user = cognito_idp.admin_get_user(UserPoolId=pid, Username="attrupdate")
+    attrs = {a["Name"]: a["Value"] for a in user["UserAttributes"]}
+    assert attrs["email"] == "new@example.com"
+
+
+def test_cognito_delete_user_via_token(cognito_idp):
+    """DeleteUser (self-service) removes the user using access token."""
+    import botocore.exceptions
+    pid = cognito_idp.create_user_pool(PoolName="DeleteSelfPool")["UserPool"]["Id"]
+    cid = cognito_idp.create_user_pool_client(
+        UserPoolId=pid, ClientName="DeleteSelfApp",
+        ExplicitAuthFlows=["ALLOW_USER_PASSWORD_AUTH", "ALLOW_REFRESH_TOKEN_AUTH"],
+    )["UserPoolClient"]["ClientId"]
+    cognito_idp.admin_create_user(UserPoolId=pid, Username="selfdelete")
+    cognito_idp.admin_set_user_password(
+        UserPoolId=pid, Username="selfdelete", Password="DelPass1!", Permanent=True
+    )
+    access_token = cognito_idp.admin_initiate_auth(
+        UserPoolId=pid, ClientId=cid,
+        AuthFlow="ADMIN_USER_PASSWORD_AUTH",
+        AuthParameters={"USERNAME": "selfdelete", "PASSWORD": "DelPass1!"},
+    )["AuthenticationResult"]["AccessToken"]
+
+    cognito_idp.delete_user(AccessToken=access_token)
+
+    with pytest.raises(botocore.exceptions.ClientError) as exc_info:
+        cognito_idp.admin_get_user(UserPoolId=pid, Username="selfdelete")
+    assert exc_info.value.response["Error"]["Code"] == "UserNotFoundException"
+
+
+def test_cognito_update_user_pool_client(cognito_idp):
+    pid = cognito_idp.create_user_pool(PoolName="UpdateClientPool")["UserPool"]["Id"]
+    cid = cognito_idp.create_user_pool_client(
+        UserPoolId=pid, ClientName="OriginalName"
+    )["UserPoolClient"]["ClientId"]
+    updated = cognito_idp.update_user_pool_client(
+        UserPoolId=pid, ClientId=cid, ClientName="UpdatedName",
+        RefreshTokenValidity=14,
+    )["UserPoolClient"]
+    assert updated["ClientName"] == "UpdatedName"
+    assert updated["RefreshTokenValidity"] == 14
+    # Verify persisted
+    desc = cognito_idp.describe_user_pool_client(UserPoolId=pid, ClientId=cid)["UserPoolClient"]
+    assert desc["ClientName"] == "UpdatedName"
+
+
+def test_cognito_admin_reset_user_password(cognito_idp):
+    pid = cognito_idp.create_user_pool(PoolName="ResetPwdPool")["UserPool"]["Id"]
+    cognito_idp.admin_create_user(UserPoolId=pid, Username="resetuser")
+    cognito_idp.admin_set_user_password(
+        UserPoolId=pid, Username="resetuser", Password="Pass1!", Permanent=True
+    )
+    cognito_idp.admin_reset_user_password(UserPoolId=pid, Username="resetuser")
+    user = cognito_idp.admin_get_user(UserPoolId=pid, Username="resetuser")
+    assert user["UserStatus"] == "RESET_REQUIRED"
+
+
+def test_cognito_admin_user_global_sign_out(cognito_idp):
+    pid = cognito_idp.create_user_pool(PoolName="GlobalSignOutAdminPool")["UserPool"]["Id"]
+    cognito_idp.admin_create_user(UserPoolId=pid, Username="signoutuser")
+    cognito_idp.admin_user_global_sign_out(UserPoolId=pid, Username="signoutuser")
+
+
+def test_cognito_revoke_token(cognito_idp):
+    pid = cognito_idp.create_user_pool(PoolName="RevokePool")["UserPool"]["Id"]
+    cid = cognito_idp.create_user_pool_client(
+        UserPoolId=pid, ClientName="RevokeApp",
+        ExplicitAuthFlows=["ALLOW_USER_PASSWORD_AUTH", "ALLOW_REFRESH_TOKEN_AUTH"],
+    )["UserPoolClient"]["ClientId"]
+    cognito_idp.admin_create_user(UserPoolId=pid, Username="revokeuser")
+    cognito_idp.admin_set_user_password(
+        UserPoolId=pid, Username="revokeuser", Password="RevokePass1!", Permanent=True
+    )
+    auth = cognito_idp.admin_initiate_auth(
+        UserPoolId=pid, ClientId=cid,
+        AuthFlow="ADMIN_USER_PASSWORD_AUTH",
+        AuthParameters={"USERNAME": "revokeuser", "PASSWORD": "RevokePass1!"},
+    )
+    refresh_token = auth["AuthenticationResult"]["RefreshToken"]
+    cognito_idp.revoke_token(Token=refresh_token, ClientId=cid)
+
+
+def test_cognito_describe_identity(cognito_identity):
+    resp = cognito_identity.create_identity_pool(
+        IdentityPoolName="DescribeIdPool",
+        AllowUnauthenticatedIdentities=True,
+    )
+    iid = resp["IdentityPoolId"]
+    identity_id = cognito_identity.get_id(
+        IdentityPoolId=iid, AccountId="000000000000"
+    )["IdentityId"]
+    desc = cognito_identity.describe_identity(IdentityId=identity_id)
+    assert desc["IdentityId"] == identity_id
+
+
+def test_cognito_merge_developer_identities(cognito_identity):
+    resp = cognito_identity.create_identity_pool(
+        IdentityPoolName="MergePool",
+        AllowUnauthenticatedIdentities=True,
+        DeveloperProviderName="login.myapp",
+    )
+    iid = resp["IdentityPoolId"]
+    result = cognito_identity.merge_developer_identities(
+        SourceUserIdentifier="user-a",
+        DestinationUserIdentifier="user-b",
+        DeveloperProviderName="login.myapp",
+        IdentityPoolId=iid,
+    )
+    assert "IdentityId" in result
