@@ -190,7 +190,7 @@ def reset():
     """Terminate all warm workers and clear the pool."""
     for worker in list(_workers.values()):
         try:
-            worker.proc.terminate()
+            worker._proc.terminate()
         except Exception:
             pass
     _workers.clear()

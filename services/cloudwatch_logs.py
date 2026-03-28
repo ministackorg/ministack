@@ -389,9 +389,43 @@ def _get_log_events(data):
     })
 
 
+def _compile_filter_pattern(raw: str):
+    """Convert a CloudWatch Logs filterPattern to a matcher function.
+    Supports: empty (match all), quoted phrases, term inclusion (+term),
+    term exclusion (-term), and glob wildcards (* and ?)."""
+    if not raw:
+        return lambda msg: True
+    raw = raw.strip()
+    # JSON-style patterns (starts with {) — treat as match-all for emulation
+    if raw.startswith("{"):
+        return lambda msg: True
+    import fnmatch
+    terms = raw.split()
+    include = []
+    exclude = []
+    for t in terms:
+        if t.startswith("-"):
+            exclude.append(t[1:].strip('"').lower())
+        else:
+            include.append(t.lstrip("+").strip('"').lower())
+
+    def _matches(msg: str) -> bool:
+        m = msg.lower()
+        for p in include:
+            if not fnmatch.fnmatch(m, f"*{p}*") and p not in m:
+                return False
+        for p in exclude:
+            if fnmatch.fnmatch(m, f"*{p}*") or p in m:
+                return False
+        return True
+
+    return _matches
+
+
 def _filter_log_events(data):
     group = data.get("logGroupName")
-    pattern = data.get("filterPattern", "").lower()
+    raw_pattern = data.get("filterPattern", "")
+    pattern_fn = _compile_filter_pattern(raw_pattern)
     limit = min(data.get("limit", 10000), 10000)
     start_time = data.get("startTime")
     end_time = data.get("endTime")
@@ -418,7 +452,7 @@ def _filter_log_events(data):
                 continue
             if end_time is not None and ts > end_time:
                 continue
-            if pattern and pattern not in e.get("message", "").lower():
+            if not pattern_fn(e.get("message", "")):
                 continue
             events.append({**e, "logStreamName": sn})
             if len(events) >= limit:

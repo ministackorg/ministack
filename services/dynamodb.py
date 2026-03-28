@@ -26,6 +26,7 @@ _tables: dict = {}
 _tags: dict = {}
 _ttl_settings: dict = {}
 _pitr_settings: dict = {}
+_lock = threading.Lock()
 
 # ---------------------------------------------------------------------------
 # TTL background reaper
@@ -37,30 +38,31 @@ def _ttl_reaper():
         time.sleep(60)
         now = time.time()
         try:
-            for table_name, setting in list(_ttl_settings.items()):
-                if setting.get("TimeToLiveStatus") != "ENABLED":
-                    continue
-                attr = setting.get("AttributeName", "")
-                if not attr:
-                    continue
-                table = _tables.get(table_name)
-                if not table:
-                    continue
-                for pk_val, sk_map in list(table["items"].items()):
-                    for sk_val, item in list(sk_map.items()):
-                        ttl_attr = item.get(attr)
-                        if ttl_attr is None:
-                            continue
-                        ttl_val = _extract_key_val(ttl_attr)
-                        try:
-                            if float(ttl_val) <= now:
-                                del sk_map[sk_val]
-                                logger.debug(f"TTL expired item {pk_val}/{sk_val} from {table_name}")
-                        except (ValueError, TypeError):
-                            pass
-                    if not sk_map:
-                        del table["items"][pk_val]
-                _update_counts(table)
+            with _lock:
+                for table_name, setting in list(_ttl_settings.items()):
+                    if setting.get("TimeToLiveStatus") != "ENABLED":
+                        continue
+                    attr = setting.get("AttributeName", "")
+                    if not attr:
+                        continue
+                    table = _tables.get(table_name)
+                    if not table:
+                        continue
+                    for pk_val, sk_map in list(table["items"].items()):
+                        for sk_val, item in list(sk_map.items()):
+                            ttl_attr = item.get(attr)
+                            if ttl_attr is None:
+                                continue
+                            ttl_val = _extract_key_val(ttl_attr)
+                            try:
+                                if float(ttl_val) <= now:
+                                    del sk_map[sk_val]
+                                    logger.debug(f"TTL expired item {pk_val}/{sk_val} from {table_name}")
+                            except (ValueError, TypeError):
+                                pass
+                        if not sk_map:
+                            del table["items"][pk_val]
+                    _update_counts(table)
         except Exception as exc:
             logger.error(f"TTL reaper error: {exc}")
 
@@ -1573,8 +1575,17 @@ def _extract_pk_from_condition(condition, attr_values, attr_names, pk_name):
 def _apply_exclusive_start_key(candidates, esk, pk_name, sk_name, scan_forward=True):
     if not esk or not candidates:
         return candidates
+    # Hash-only table: no sort key — find the item matching the PK and return everything after it
     if not sk_name or sk_name not in esk:
-        return []
+        start_pk = _extract_key_val(esk.get(pk_name, {}))
+        found = False
+        result = []
+        for item in candidates:
+            if found:
+                result.append(item)
+            elif _extract_key_val(item.get(pk_name, {})) == start_pk:
+                found = True
+        return result
     start_sk = esk[sk_name]
     result = []
     for item in candidates:
@@ -1683,7 +1694,8 @@ def _diff_attributes(old_item, new_item, return_old=True):
 
 
 def reset():
-    _tables.clear()
-    _tags.clear()
-    _ttl_settings.clear()
-    _pitr_settings.clear()
+    with _lock:
+        _tables.clear()
+        _tags.clear()
+        _ttl_settings.clear()
+        _pitr_settings.clear()

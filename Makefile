@@ -10,6 +10,7 @@ build:
 run: build
 	docker run -d --name $(CONTAINER_NAME) -p $(PORT):4566 \
 		-e LOG_LEVEL=INFO \
+		-v /var/run/docker.sock:/var/run/docker.sock \
 		$(IMAGE_NAME)
 	@echo "MiniStack running on http://localhost:$(PORT)"
 	@echo "Health: http://localhost:$(PORT)/_localstack/health"

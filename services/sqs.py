@@ -485,7 +485,12 @@ def _act_delete_message_batch(data: dict, qurl: str) -> dict:
         if len(q["messages"]) < before:
             ok.append({"Id": eid})
         else:
-            ok.append({"Id": eid})
+            fail.append({
+                "Id": eid,
+                "Code": "ReceiptHandleIsInvalid",
+                "Message": "The input receipt handle is invalid.",
+                "SenderFault": True,
+            })
     return {"Successful": ok, "Failed": fail}
 
 

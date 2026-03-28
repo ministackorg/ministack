@@ -438,7 +438,7 @@ def _create_bucket(name: str, body: bytes):
     _buckets[name] = {"created": now_iso(), "objects": {}, "region": region}
     if PERSIST:
         os.makedirs(os.path.join(DATA_DIR, name), exist_ok=True)
-    return 200, {"Content-Type": "application/xml", "Location": f"/{name}"}, b""
+    return 200, {"Location": f"/{name}"}, b""
 
 
 def _delete_bucket(name: str):
@@ -1060,7 +1060,7 @@ def _put_object(bucket_name: str, key: str, body: bytes, headers: dict):
     _fire_s3_event_async(bucket_name, key, "s3:ObjectCreated:Put",
                          size=obj["size"], etag=obj["etag"])
 
-    return 200, {"ETag": obj["etag"], "Content-Type": "application/xml"}, b""
+    return 200, {"ETag": obj["etag"]}, b""
 
 
 def _get_object(bucket_name: str, key: str, headers: dict):
@@ -1122,7 +1122,10 @@ def _delete_object(bucket_name: str, key: str):
     if existed:
         _fire_s3_event_async(bucket_name, key, "s3:ObjectRemoved:Delete")
 
-    return 204, {"x-amz-delete-marker": "false"}, b""
+    versioning = _bucket_versioning.get(bucket_name, {}).get("Status", "")
+    if versioning in ("Enabled", "Suspended"):
+        return 204, {"x-amz-delete-marker": "true", "x-amz-version-id": "null"}, b""
+    return 204, {}, b""
 
 
 def _copy_object(bucket_name: str, dest_key: str, headers: dict):

@@ -48,7 +48,7 @@ def _dict_to_xml(parent: Element, data):
 
 def json_response(data: dict, status: int = 200) -> tuple:
     """Build an AWS-style JSON response."""
-    body = json.dumps(data).encode("utf-8")
+    body = json.dumps(data, ensure_ascii=False).encode("utf-8")
     return status, {"Content-Type": "application/x-amz-json-1.0"}, body
 
 

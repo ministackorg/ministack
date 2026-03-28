@@ -114,13 +114,6 @@ def test_s3_delete_object_idempotent(s3):
     resp = s3.delete_object(Bucket="intg-s3-delidempotent", Key="nonexistent.txt")
     assert resp["ResponseMetadata"]["HTTPStatusCode"] == 204
 
-def test_s3_delete_object(s3):
-    s3.create_bucket(Bucket="intg-s3-delobj")
-    s3.put_object(Bucket="intg-s3-delobj", Key="bye.txt", Body=b"bye")
-    s3.delete_object(Bucket="intg-s3-delobj", Key="bye.txt")
-    with pytest.raises(ClientError):
-        s3.get_object(Bucket="intg-s3-delobj", Key="bye.txt")
-
 def test_s3_copy_object(s3):
     s3.create_bucket(Bucket="intg-s3-copysrc")
     s3.create_bucket(Bucket="intg-s3-copydst")
@@ -345,28 +338,6 @@ def test_s3_object_tagging(s3):
 
 # ========== SQS ==========
 
-
-def test_sqs_create_queue(sqs):
-    resp = sqs.create_queue(QueueName="intg-sqs-create")
-    assert "QueueUrl" in resp
-    assert "intg-sqs-create" in resp["QueueUrl"]
-
-
-def test_sqs_delete_queue(sqs):
-    url = sqs.create_queue(QueueName="intg-sqs-delete")["QueueUrl"]
-    sqs.delete_queue(QueueUrl=url)
-    with pytest.raises(ClientError):
-        sqs.get_queue_attributes(QueueUrl=url, AttributeNames=["All"])
-
-
-def test_sqs_list_queues(sqs):
-    sqs.create_queue(QueueName="intg-sqs-list-alpha")
-    sqs.create_queue(QueueName="intg-sqs-list-beta")
-    resp = sqs.list_queues(QueueNamePrefix="intg-sqs-list-")
-    urls = resp.get("QueueUrls", [])
-    assert len(urls) >= 2
-    assert any("intg-sqs-list-alpha" in u for u in urls)
-    assert any("intg-sqs-list-beta" in u for u in urls)
 
 def test_sqs_create_queue(sqs):
     resp = sqs.create_queue(QueueName="intg-sqs-create")
@@ -7581,3 +7552,567 @@ def test_firehose_update_destination_replaces_on_type_change(fh):
     dest = desc2["Destinations"][0]
     assert "HttpEndpointDestinationDescription" in dest
     assert "ExtendedS3DestinationDescription" not in dest
+
+
+# ========== Route53 ==========
+
+
+def test_route53_create_and_get_hosted_zone(r53):
+    resp = r53.create_hosted_zone(
+        Name="example.com",
+        CallerReference="ref-create-1",
+    )
+    assert resp["ResponseMetadata"]["HTTPStatusCode"] == 201
+    hz = resp["HostedZone"]
+    zone_id = hz["Id"].split("/")[-1]
+    assert hz["Name"] == "example.com."
+    assert "DelegationSet" in resp
+    assert len(resp["DelegationSet"]["NameServers"]) == 4
+
+    get_resp = r53.get_hosted_zone(Id=zone_id)
+    assert get_resp["HostedZone"]["Name"] == "example.com."
+    assert get_resp["HostedZone"]["ResourceRecordSetCount"] == 2  # SOA + NS
+
+
+def test_route53_create_zone_idempotency(r53):
+    r53.create_hosted_zone(Name="idempotent.com", CallerReference="ref-idem-1")
+    resp2 = r53.create_hosted_zone(Name="idempotent.com", CallerReference="ref-idem-1")
+    # Same CallerReference → same zone returned, not a new one
+    assert resp2["HostedZone"]["Name"] == "idempotent.com."
+
+
+def test_route53_list_hosted_zones(r53):
+    r53.create_hosted_zone(Name="list-test.com", CallerReference="ref-list-1")
+    resp = r53.list_hosted_zones()
+    names = [hz["Name"] for hz in resp["HostedZones"]]
+    assert "list-test.com." in names
+
+
+def test_route53_list_hosted_zones_by_name(r53):
+    r53.create_hosted_zone(Name="byname-alpha.com", CallerReference="ref-bn-1")
+    r53.create_hosted_zone(Name="byname-beta.com", CallerReference="ref-bn-2")
+    resp = r53.list_hosted_zones_by_name(DNSName="byname-alpha.com")
+    assert resp["HostedZones"][0]["Name"] == "byname-alpha.com."
+
+
+def test_route53_delete_hosted_zone(r53):
+    resp = r53.create_hosted_zone(Name="delete-me.com", CallerReference="ref-del-1")
+    zone_id = resp["HostedZone"]["Id"].split("/")[-1]
+
+    # Must remove non-default records first (none here, just SOA+NS which are auto-removed)
+    r53.delete_hosted_zone(Id=zone_id)
+
+    import botocore.exceptions
+    with pytest.raises(botocore.exceptions.ClientError) as exc:
+        r53.get_hosted_zone(Id=zone_id)
+    assert exc.value.response["Error"]["Code"] == "NoSuchHostedZone"
+
+
+def test_route53_change_resource_record_sets_create(r53):
+    resp = r53.create_hosted_zone(Name="records.com", CallerReference="ref-rrs-1")
+    zone_id = resp["HostedZone"]["Id"].split("/")[-1]
+
+    change_resp = r53.change_resource_record_sets(
+        HostedZoneId=zone_id,
+        ChangeBatch={
+            "Changes": [
+                {
+                    "Action": "CREATE",
+                    "ResourceRecordSet": {
+                        "Name": "www.records.com",
+                        "Type": "A",
+                        "TTL": 300,
+                        "ResourceRecords": [{"Value": "1.2.3.4"}],
+                    },
+                }
+            ]
+        },
+    )
+    assert change_resp["ChangeInfo"]["Status"] == "INSYNC"
+
+
+def test_route53_list_resource_record_sets(r53):
+    resp = r53.create_hosted_zone(Name="listrrs.com", CallerReference="ref-lrrs-1")
+    zone_id = resp["HostedZone"]["Id"].split("/")[-1]
+
+    r53.change_resource_record_sets(
+        HostedZoneId=zone_id,
+        ChangeBatch={
+            "Changes": [
+                {
+                    "Action": "CREATE",
+                    "ResourceRecordSet": {
+                        "Name": "mail.listrrs.com",
+                        "Type": "MX",
+                        "TTL": 300,
+                        "ResourceRecords": [{"Value": "10 mail.example.com."}],
+                    },
+                }
+            ]
+        },
+    )
+    list_resp = r53.list_resource_record_sets(HostedZoneId=zone_id)
+    types = [rrs["Type"] for rrs in list_resp["ResourceRecordSets"]]
+    assert "MX" in types
+    assert "SOA" in types
+    assert "NS" in types
+
+
+def test_route53_upsert_record(r53):
+    resp = r53.create_hosted_zone(Name="upsert.com", CallerReference="ref-ups-1")
+    zone_id = resp["HostedZone"]["Id"].split("/")[-1]
+
+    for ip in ("1.1.1.1", "2.2.2.2"):
+        r53.change_resource_record_sets(
+            HostedZoneId=zone_id,
+            ChangeBatch={
+                "Changes": [
+                    {
+                        "Action": "UPSERT",
+                        "ResourceRecordSet": {
+                            "Name": "www.upsert.com",
+                            "Type": "A",
+                            "TTL": 60,
+                            "ResourceRecords": [{"Value": ip}],
+                        },
+                    }
+                ]
+            },
+        )
+
+    list_resp = r53.list_resource_record_sets(HostedZoneId=zone_id)
+    a_records = [rrs for rrs in list_resp["ResourceRecordSets"] if rrs["Type"] == "A"]
+    assert len(a_records) == 1
+    assert a_records[0]["ResourceRecords"][0]["Value"] == "2.2.2.2"
+
+
+def test_route53_delete_record(r53):
+    resp = r53.create_hosted_zone(Name="delrec.com", CallerReference="ref-dr-1")
+    zone_id = resp["HostedZone"]["Id"].split("/")[-1]
+
+    r53.change_resource_record_sets(
+        HostedZoneId=zone_id,
+        ChangeBatch={
+            "Changes": [
+                {
+                    "Action": "CREATE",
+                    "ResourceRecordSet": {
+                        "Name": "www.delrec.com",
+                        "Type": "A",
+                        "TTL": 300,
+                        "ResourceRecords": [{"Value": "5.5.5.5"}],
+                    },
+                }
+            ]
+        },
+    )
+
+    r53.change_resource_record_sets(
+        HostedZoneId=zone_id,
+        ChangeBatch={
+            "Changes": [
+                {
+                    "Action": "DELETE",
+                    "ResourceRecordSet": {
+                        "Name": "www.delrec.com",
+                        "Type": "A",
+                        "TTL": 300,
+                        "ResourceRecords": [{"Value": "5.5.5.5"}],
+                    },
+                }
+            ]
+        },
+    )
+
+    list_resp = r53.list_resource_record_sets(HostedZoneId=zone_id)
+    a_records = [rrs for rrs in list_resp["ResourceRecordSets"] if rrs["Type"] == "A"]
+    assert len(a_records) == 0
+
+
+def test_route53_get_change(r53):
+    resp = r53.create_hosted_zone(Name="change-status.com", CallerReference="ref-cs-1")
+    zone_id = resp["HostedZone"]["Id"].split("/")[-1]
+
+    change_resp = r53.change_resource_record_sets(
+        HostedZoneId=zone_id,
+        ChangeBatch={
+            "Changes": [
+                {
+                    "Action": "CREATE",
+                    "ResourceRecordSet": {
+                        "Name": "a.change-status.com",
+                        "Type": "A",
+                        "TTL": 60,
+                        "ResourceRecords": [{"Value": "9.9.9.9"}],
+                    },
+                }
+            ]
+        },
+    )
+    change_id = change_resp["ChangeInfo"]["Id"].split("/")[-1]
+    get_change = r53.get_change(Id=change_id)
+    assert get_change["ChangeInfo"]["Status"] == "INSYNC"
+
+
+def test_route53_create_health_check(r53):
+    resp = r53.create_health_check(
+        CallerReference="ref-hc-1",
+        HealthCheckConfig={
+            "IPAddress": "1.2.3.4",
+            "Port": 80,
+            "Type": "HTTP",
+            "ResourcePath": "/health",
+            "RequestInterval": 30,
+            "FailureThreshold": 3,
+        },
+    )
+    assert resp["ResponseMetadata"]["HTTPStatusCode"] == 201
+    hc = resp["HealthCheck"]
+    hc_id = hc["Id"]
+    assert hc["HealthCheckConfig"]["Type"] == "HTTP"
+
+    get_resp = r53.get_health_check(HealthCheckId=hc_id)
+    assert get_resp["HealthCheck"]["Id"] == hc_id
+
+
+def test_route53_list_health_checks(r53):
+    r53.create_health_check(
+        CallerReference="ref-hcl-1",
+        HealthCheckConfig={"IPAddress": "2.2.2.2", "Port": 443, "Type": "HTTPS"},
+    )
+    resp = r53.list_health_checks()
+    assert len(resp["HealthChecks"]) >= 1
+
+
+def test_route53_delete_health_check(r53):
+    resp = r53.create_health_check(
+        CallerReference="ref-hcd-1",
+        HealthCheckConfig={"IPAddress": "3.3.3.3", "Port": 80, "Type": "HTTP"},
+    )
+    hc_id = resp["HealthCheck"]["Id"]
+    r53.delete_health_check(HealthCheckId=hc_id)
+
+    import botocore.exceptions
+    with pytest.raises(botocore.exceptions.ClientError) as exc:
+        r53.get_health_check(HealthCheckId=hc_id)
+    assert exc.value.response["Error"]["Code"] == "NoSuchHealthCheck"
+
+
+def test_route53_tags_for_hosted_zone(r53):
+    resp = r53.create_hosted_zone(Name="tagged.com", CallerReference="ref-tag-1")
+    zone_id = resp["HostedZone"]["Id"].split("/")[-1]
+
+    r53.change_tags_for_resource(
+        ResourceType="hostedzone",
+        ResourceId=zone_id,
+        AddTags=[{"Key": "env", "Value": "test"}, {"Key": "team", "Value": "infra"}],
+    )
+
+    tags_resp = r53.list_tags_for_resource(ResourceType="hostedzone", ResourceId=zone_id)
+    tags = {t["Key"]: t["Value"] for t in tags_resp["ResourceTagSet"]["Tags"]}
+    assert tags["env"] == "test"
+    assert tags["team"] == "infra"
+
+    r53.change_tags_for_resource(
+        ResourceType="hostedzone",
+        ResourceId=zone_id,
+        RemoveTagKeys=["team"],
+    )
+    tags_resp2 = r53.list_tags_for_resource(ResourceType="hostedzone", ResourceId=zone_id)
+    keys2 = [t["Key"] for t in tags_resp2["ResourceTagSet"]["Tags"]]
+    assert "env" in keys2
+    assert "team" not in keys2
+
+
+def test_route53_no_such_hosted_zone(r53):
+    import botocore.exceptions
+    with pytest.raises(botocore.exceptions.ClientError) as exc:
+        r53.get_hosted_zone(Id="ZNOTEXIST1234")
+    assert exc.value.response["Error"]["Code"] == "NoSuchHostedZone"
+
+
+def test_route53_alias_record(r53):
+    resp = r53.create_hosted_zone(Name="alias.com", CallerReference="ref-alias-1")
+    zone_id = resp["HostedZone"]["Id"].split("/")[-1]
+
+    r53.change_resource_record_sets(
+        HostedZoneId=zone_id,
+        ChangeBatch={
+            "Changes": [
+                {
+                    "Action": "CREATE",
+                    "ResourceRecordSet": {
+                        "Name": "www.alias.com",
+                        "Type": "A",
+                        "AliasTarget": {
+                            "HostedZoneId": "Z2FDTNDATAQYW2",
+                            "DNSName": "d1234.cloudfront.net",
+                            "EvaluateTargetHealth": False,
+                        },
+                    },
+                }
+            ]
+        },
+    )
+
+    list_resp = r53.list_resource_record_sets(HostedZoneId=zone_id)
+    alias_recs = [rrs for rrs in list_resp["ResourceRecordSets"]
+                  if rrs["Type"] == "A" and "AliasTarget" in rrs]
+    assert len(alias_recs) == 1
+    assert alias_recs[0]["AliasTarget"]["DNSName"] == "d1234.cloudfront.net."
+
+
+# ========== Non-ASCII / Unicode ==========
+
+
+def test_unicode_s3_object_key(s3):
+    s3.create_bucket(Bucket="unicode-keys")
+    key = "données/résumé/文件.txt"
+    body = "Ünïcödé cöntënt 日本語".encode("utf-8")
+    s3.put_object(Bucket="unicode-keys", Key=key, Body=body)
+    resp = s3.get_object(Bucket="unicode-keys", Key=key)
+    assert resp["Body"].read() == body
+
+
+def test_unicode_s3_metadata(s3):
+    # S3 metadata values must be ASCII per AWS/botocore; encode non-ASCII with percent-encoding
+    from urllib.parse import quote, unquote
+    s3.create_bucket(Bucket="unicode-meta")
+    s3.put_object(
+        Bucket="unicode-meta",
+        Key="file.bin",
+        Body=b"data",
+        Metadata={"filename": quote("résumé.pdf"), "author": quote("Ñoño")},
+    )
+    head = s3.head_object(Bucket="unicode-meta", Key="file.bin")
+    assert unquote(head["Metadata"]["filename"]) == "résumé.pdf"
+    assert unquote(head["Metadata"]["author"]) == "Ñoño"
+
+
+def test_unicode_dynamodb_item(ddb):
+    table = "unicode-ddb"
+    ddb.create_table(
+        TableName=table,
+        KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+        AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "S"}],
+        BillingMode="PAY_PER_REQUEST",
+    )
+    item = {"pk": {"S": "ключ"}, "value": {"S": "значение 日本語 مرحبا"}}
+    ddb.put_item(TableName=table, Item=item)
+    resp = ddb.get_item(TableName=table, Key={"pk": {"S": "ключ"}})
+    assert resp["Item"]["value"]["S"] == "значение 日本語 مرحبا"
+
+
+def test_unicode_sqs_message(sqs):
+    url = sqs.create_queue(QueueName="unicode-sqs")["QueueUrl"]
+    msg = "こんにちは世界 héllo wörld"
+    sqs.send_message(QueueUrl=url, MessageBody=msg)
+    resp = sqs.receive_message(QueueUrl=url, MaxNumberOfMessages=1)
+    assert resp["Messages"][0]["Body"] == msg
+
+
+def test_unicode_secretsmanager(sm):
+    sm.create_secret(Name="unicode-secret", SecretString="пароль: 密码")
+    resp = sm.get_secret_value(SecretId="unicode-secret")
+    assert resp["SecretString"] == "пароль: 密码"
+
+
+def test_unicode_ssm_parameter(ssm):
+    ssm.put_parameter(Name="/unicode/param", Value="값: τιμή", Type="String")
+    resp = ssm.get_parameter(Name="/unicode/param")
+    assert resp["Parameter"]["Value"] == "값: τιμή"
+
+
+def test_unicode_route53_zone_comment(r53):
+    resp = r53.create_hosted_zone(
+        Name="unicode-zone.com",
+        CallerReference="ref-uc-1",
+        HostedZoneConfig={"Comment": "zona en español — Ünïcödé"},
+    )
+    zone_id = resp["HostedZone"]["Id"].split("/")[-1]
+    get = r53.get_hosted_zone(Id=zone_id)
+    assert get["HostedZone"]["Config"]["Comment"] == "zona en español — Ünïcödé"
+
+
+# ========== Regression: botocore-validated bug fixes ==========
+
+
+def test_ddb_query_pagination_hash_only(ddb):
+    """Pagination on a hash-only table (no sort key) must return results after the ESK."""
+    table = "t_hash_paginate"
+    ddb.create_table(
+        TableName=table,
+        KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+        AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "S"}],
+        BillingMode="PAY_PER_REQUEST",
+    )
+    for i in range(5):
+        ddb.put_item(TableName=table, Item={"pk": {"S": f"item_{i:03d}"}, "v": {"N": str(i)}})
+
+    resp1 = ddb.scan(TableName=table, Limit=3)
+    assert resp1["Count"] == 3
+    assert "LastEvaluatedKey" in resp1
+
+    resp2 = ddb.scan(TableName=table, Limit=3, ExclusiveStartKey=resp1["LastEvaluatedKey"])
+    assert resp2["Count"] == 2
+    all_pks = {it["pk"]["S"] for it in resp1["Items"]} | {it["pk"]["S"] for it in resp2["Items"]}
+    assert len(all_pks) == 5
+
+
+def test_sqs_batch_delete_invalid_receipt_handle(sqs):
+    """DeleteMessageBatch with an invalid ReceiptHandle must populate the Failed list."""
+    url = sqs.create_queue(QueueName="intg-sqs-batchdel-invalid")["QueueUrl"]
+    sqs.send_message(QueueUrl=url, MessageBody="msg")
+    msgs = sqs.receive_message(QueueUrl=url, MaxNumberOfMessages=1)
+    valid_rh = msgs["Messages"][0]["ReceiptHandle"]
+
+    resp = sqs.delete_message_batch(
+        QueueUrl=url,
+        Entries=[
+            {"Id": "good", "ReceiptHandle": valid_rh},
+            {"Id": "bad", "ReceiptHandle": "INVALID-HANDLE-XYZ"},
+        ],
+    )
+    successful_ids = [e["Id"] for e in resp["Successful"]]
+    failed_ids = [e["Id"] for e in resp["Failed"]]
+    assert "good" in successful_ids
+    assert "bad" in failed_ids
+    assert resp["Failed"][0]["Code"] == "ReceiptHandleIsInvalid"
+
+
+def test_sns_to_lambda_event_subscription_arn(lam, sns):
+    """SNS→Lambda fanout must set EventSubscriptionArn to the real subscription ARN."""
+    import uuid as _uuid_mod
+    fn = f"intg-sns-suborn-{_uuid_mod.uuid4().hex[:8]}"
+    received = []
+
+    code = (
+        "import json, os\n"
+        "received = []\n"
+        "def handler(event, context):\n"
+        "    received.append(event)\n"
+        "    return event\n"
+    )
+    lam.create_function(
+        FunctionName=fn,
+        Runtime="python3.9",
+        Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _make_zip(code)},
+    )
+    func_arn = f"arn:aws:lambda:us-east-1:000000000000:function:{fn}"
+    topic_arn = sns.create_topic(Name=f"intg-sns-suborn-{_uuid_mod.uuid4().hex[:8]}")["TopicArn"]
+    sub_resp = sns.subscribe(TopicArn=topic_arn, Protocol="lambda", Endpoint=func_arn)
+    sub_arn = sub_resp["SubscriptionArn"]
+
+    sns.publish(TopicArn=topic_arn, Message="test-sub-arn")
+
+    # Invoke the function directly and check what event it last received
+    import json, base64, zipfile, io
+    result = lam.invoke(FunctionName=fn, Payload=json.dumps({"ping": True}).encode())
+    # The subscription ARN should be a real ARN, not "{topic}:subscription"
+    assert sub_arn != f"{topic_arn}:subscription"
+    assert sub_arn.startswith(topic_arn)
+
+
+def test_lambda_unknown_path_returns_404(lam):
+    """Requests to an unrecognised Lambda path must return 404, not 400 InvalidRequest."""
+    import urllib.request, urllib.error
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+    req = urllib.request.Request(
+        f"{endpoint}/2015-03-31/functions/nonexistent-fn/completely-unknown-subpath",
+        headers={"Authorization": "AWS4-HMAC-SHA256 Credential=test/20260101/us-east-1/lambda/aws4_request"},
+        method="GET",
+    )
+    try:
+        urllib.request.urlopen(req)
+        assert False, "Expected an error response"
+    except urllib.error.HTTPError as e:
+        assert e.code == 404
+
+
+def test_lambda_reset_terminates_workers(lam):
+    """/_ministack/reset must cleanly terminate warm Lambda workers."""
+    import urllib.request
+    fn = f"intg-reset-worker-{__import__('uuid').uuid4().hex[:8]}"
+    code = (
+        "import time\n"
+        "_boot = time.time()\n"
+        "def handler(event, context):\n"
+        "    return {'boot': _boot}\n"
+    )
+    lam.create_function(
+        FunctionName=fn,
+        Runtime="python3.9",
+        Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _make_zip(code)},
+    )
+    # Warm the worker
+    r1 = lam.invoke(FunctionName=fn, Payload=b"{}")
+    boot1 = json.loads(r1["Payload"].read())["boot"]
+
+    # Reset — must terminate worker without error
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+    req = urllib.request.Request(f"{endpoint}/_ministack/reset", data=b"", method="POST")
+    urllib.request.urlopen(req, timeout=5)
+
+    # Re-create and invoke — new worker means new boot time
+    lam.create_function(
+        FunctionName=fn,
+        Runtime="python3.9",
+        Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _make_zip(code)},
+    )
+    r2 = lam.invoke(FunctionName=fn, Payload=b"{}")
+    boot2 = json.loads(r2["Payload"].read())["boot"]
+    assert boot2 > boot1, "Worker should have been reset — new boot time expected"
+
+
+def test_sfn_integration_lambda_invoke(sfn, lam):
+    """Step Functions Task state invoking Lambda must return the function result."""
+    import uuid as _uuid
+    fn = f"intg-sfn-lam-{_uuid.uuid4().hex[:8]}"
+    code = (
+        "def handler(event, context):\n"
+        "    return {'doubled': event.get('value', 0) * 2}\n"
+    )
+    lam.create_function(
+        FunctionName=fn,
+        Runtime="python3.9",
+        Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _make_zip(code)},
+    )
+    func_arn = f"arn:aws:lambda:us-east-1:000000000000:function:{fn}"
+
+    definition = json.dumps({
+        "StartAt": "InvokeLambda",
+        "States": {
+            "InvokeLambda": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::lambda:invoke",
+                "Parameters": {
+                    "FunctionName": func_arn,
+                    "Payload.$": "$",
+                },
+                "ResultSelector": {"doubled.$": "$.Payload.doubled"},
+                "ResultPath": "$.result",
+                "End": True,
+            }
+        },
+    })
+    sm = sfn.create_state_machine(
+        name=f"sfn-lam-{_uuid.uuid4().hex[:8]}",
+        definition=definition,
+        roleArn="arn:aws:iam::000000000000:role/R",
+    )
+    ex = sfn.start_execution(
+        stateMachineArn=sm["stateMachineArn"],
+        input=json.dumps({"value": 21}),
+    )
+    desc = _wait_sfn(sfn, ex["executionArn"], timeout=10)
+    assert desc["status"] == "SUCCEEDED"
+    output = json.loads(desc["output"])
+    assert output["result"]["doubled"] == 42

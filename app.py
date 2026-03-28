@@ -28,6 +28,7 @@ from services import ecs, rds, elasticache, glue, athena
 from services import apigateway
 from services import firehose
 from services import apigateway_v1
+from services import route53
 from services.iam_sts import handle_iam_request, handle_sts_request
 
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
@@ -61,6 +62,7 @@ SERVICE_HANDLERS = {
     "athena": athena.handle_request,
     "apigateway": apigateway.handle_request,
     "firehose": firehose.handle_request,
+    "route53": route53.handle_request,
 }
 
 SERVICE_NAME_ALIASES = {
@@ -72,6 +74,7 @@ SERVICE_NAME_ALIASES = {
     "execute-api": "apigateway",
     "apigatewayv2": "apigateway",
     "kinesis-firehose": "firehose",
+    "route53": "route53",
 }
 
 
@@ -107,7 +110,7 @@ BANNER = r"""
  Local AWS Service Emulator — Port {port}
  Services: S3, SQS, SNS, DynamoDB, Lambda, IAM, STS, SecretsManager, CloudWatch Logs,
           SSM, EventBridge, Kinesis, CloudWatch, SES, Step Functions,
-          ECS, RDS, ElastiCache, Glue, Athena, API Gateway, Firehose
+          ECS, RDS, ElastiCache, Glue, Athena, API Gateway, Firehose, Route53
 """
 
 
@@ -127,7 +130,10 @@ async def app(scope, receive, send):
 
     headers = {}
     for name, value in scope.get("headers", []):
-        headers[name.decode("latin-1").lower()] = value.decode("latin-1")
+        try:
+            headers[name.decode("latin-1").lower()] = value.decode("utf-8")
+        except UnicodeDecodeError:
+            headers[name.decode("latin-1").lower()] = value.decode("latin-1")
 
     body = b""
     while True:
@@ -258,7 +264,13 @@ async def app(scope, receive, send):
 
 async def _send_response(send, status, headers, body):
     """Send ASGI HTTP response."""
-    header_list = [(k.encode("latin-1"), str(v).encode("latin-1")) for k, v in headers.items()]
+    def _encode_header_value(v: str) -> bytes:
+        try:
+            return v.encode("latin-1")
+        except UnicodeEncodeError:
+            return v.encode("utf-8")
+
+    header_list = [(k.encode("latin-1"), _encode_header_value(str(v))) for k, v in headers.items()]
     await send({
         "type": "http.response.start",
         "status": status,
@@ -352,6 +364,7 @@ def _reset_all_state():
         (apigateway, apigateway.reset),
         (apigateway_v1, apigateway_v1.reset),
         (firehose, firehose.reset),
+        (route53, route53.reset),
     ]:
         try:
             fn()

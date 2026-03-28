@@ -13,6 +13,7 @@ Supports: CreateEventBus, DeleteEventBus, ListEventBuses, DescribeEventBus,
           ListApiDestinations, UpdateApiDestination.
 """
 
+import asyncio
 import json
 import time
 import hashlib
@@ -605,7 +606,7 @@ def _dispatch_to_lambda(arn, payload):
         event = {"body": payload}
 
     headers = {"x-amz-invocation-type": "Event"}
-    result = lambda_svc._invoke(func_name, event, headers)
+    result = asyncio.run(lambda_svc._invoke(func_name, event, headers))
     logger.info(f"EventBridge → Lambda {func_name}: status={result[0] if result else 'unknown'}")
 
 

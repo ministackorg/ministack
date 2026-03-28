@@ -104,6 +104,10 @@ SERVICE_PATTERNS = {
         "host_patterns": [r"apigateway\.", r"execute-api\."],
         "path_patterns": [r"^/v2/apis"],
     },
+    "route53": {
+        "host_patterns": [r"route53\."],
+        "path_patterns": [r"^/2013-04-01/"],
+    },
 }
 
 
@@ -143,6 +147,7 @@ def detect_service(method: str, path: str, headers: dict, query_params: dict) ->
                 "glue": "glue",
                 "athena": "athena",
                 "kinesis-firehose": "firehose",
+                "route53": "route53",
             }
             if svc_name in scope_map:
                 return scope_map[svc_name]
@@ -255,6 +260,8 @@ def detect_service(method: str, path: str, headers: dict, query_params: dict) ->
 
     # 4. Check URL path patterns
     path_lower = path.lower()
+    if path_lower.startswith("/2013-04-01/"):
+        return "route53"
     if path_lower.startswith("/v2/apis"):
         return "apigateway"
     if (path_lower.startswith("/restapis") or path_lower.startswith("/apikeys")

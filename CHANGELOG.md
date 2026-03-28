@@ -7,6 +7,54 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [1.0.8] — 2026-03-28
+
+### Added
+- **Amazon Route53** (`services/route53.py`) — full hosted zone and DNS record management
+  - Hosted zones: `CreateHostedZone`, `GetHostedZone`, `DeleteHostedZone`, `ListHostedZones`, `ListHostedZonesByName`, `UpdateHostedZoneComment`
+  - Record sets: `ChangeResourceRecordSets` (CREATE / UPSERT / DELETE, atomic batch), `ListResourceRecordSets`
+  - Changes: `GetChange` — changes are immediately `INSYNC`
+  - Health checks: `CreateHealthCheck`, `GetHealthCheck`, `DeleteHealthCheck`, `ListHealthChecks`, `UpdateHealthCheck`
+  - Tags: `ChangeTagsForResource`, `ListTagsForResource` (hostedzone and healthcheck resource types)
+  - REST/XML protocol with namespace `https://route53.amazonaws.com/doc/2013-04-01/`; credential scope `route53`
+  - SOA + NS records auto-created on zone creation with 4 default AWS nameservers
+  - `CallerReference` idempotency for `CreateHostedZone` and `CreateHealthCheck`
+  - Alias records (AliasTarget), weighted, failover, latency, geolocation, multi-value routing attributes stored and returned
+  - Zone ID format `/hostedzone/Z{13chars}`, Change ID `/change/C{13chars}`
+  - Marker-based pagination for `ListHostedZones` and `ListHealthChecks`; name/type pagination for `ListResourceRecordSets`
+  - 16 integration tests
+- **Non-ASCII / Unicode support** — seamless end-to-end handling of UTF-8 content across all services
+  - Inbound header values decoded as UTF-8 (with latin-1 fallback) so `x-amz-meta-*` fields containing non-ASCII are stored correctly
+  - Outbound header encoding falls back to UTF-8 when a value cannot be encoded as latin-1 — prevents `UnicodeEncodeError` on `Content-Disposition` or metadata round-trips
+  - All JSON responses use `ensure_ascii=False` — raw UTF-8 characters in DynamoDB items, SQS messages, Secrets Manager values, SSM parameters, and Lambda payloads are returned as-is rather than `\uXXXX` escaped
+  - 7 integration tests covering S3 keys, S3 metadata, DynamoDB, SQS, Secrets Manager, SSM, and Route53 zone comments
+
+### Fixed
+- **DynamoDB TTL reaper thread-safety**: the background reaper thread now holds `_lock` while scanning and deleting expired items — eliminates a race condition with concurrent request handlers that could corrupt table state or crash the reaper under load
+- **S3 `PutObject` / `CreateBucket` spurious `Content-Type`**: these operations no longer return `Content-Type: application/xml` on success (AWS returns no Content-Type for empty 200 bodies) — prevents SDK response-parsing warnings
+- **S3 `DeleteObject` delete-marker header**: non-versioned buckets now return an empty 204 with no extra headers; versioned/suspended buckets return `x-amz-delete-marker: true` — previously all buckets unconditionally returned `x-amz-delete-marker: false`
+- **CloudWatch Logs `FilterLogEvents` pattern matching**: upgraded from plain substring search to proper CloudWatch filter syntax — supports `*`/`?` glob wildcards, multi-term AND (`TERM1 TERM2`), term exclusion (`-TERM`), and JSON-style patterns (matched as pass-all); previously only exact substring matches worked
+- **JSON responses `ensure_ascii`**: all JSON service responses now use `ensure_ascii=False` so non-ASCII strings (Cyrillic, CJK, Arabic, etc.) are returned as raw UTF-8 rather than `\uXXXX` escape sequences — matches real AWS behaviour
+- **Inbound header UTF-8 decoding**: request header values are now decoded as UTF-8 with latin-1 fallback — `x-amz-meta-*` headers containing multi-byte characters are stored and round-tripped correctly
+- **Outbound header UTF-8 encoding**: response headers that cannot be encoded as latin-1 (e.g. metadata containing non-ASCII) now fall back to UTF-8 encoding instead of raising `UnicodeEncodeError`
+- **API Gateway v2 / v1 Lambda response encoding**: Lambda invocation response bodies serialised via `json.dumps` now use `ensure_ascii=False` and explicit `utf-8` encoding — non-ASCII characters in Lambda responses are preserved end-to-end
+- **DynamoDB `Query` pagination on hash-only tables**: `_apply_exclusive_start_key` was returning `[]` for any table without a sort key (`sk_name=None`) because `not sk_name` short-circuited to an empty-result path — hash-only tables now paginate correctly by resuming after the matching partition key value (validated against botocore `dynamodb` service model)
+- **SQS `DeleteMessageBatch` silent success on invalid receipt handle**: both the found and not-found branches were appending to `Successful` (copy-paste error) — an unmatched `ReceiptHandle` now correctly populates the `Failed` list with `ReceiptHandleIsInvalid` (validated against botocore `BatchResultErrorEntry` shape)
+- **SNS→Lambda `EventSubscriptionArn` hardcoded suffix**: the SNS-to-Lambda fanout envelope was setting `EventSubscriptionArn` to `"{topic_arn}:subscription"` instead of the actual subscription ARN — Lambda functions inspecting `event['Records'][0]['EventSubscriptionArn']` now receive the correct value
+- **Lambda error codes**: internal path-routing fallbacks now use `InvalidParameterValueException` (400) for missing function name and `ResourceNotFoundException` (404) for unrecognised paths — previously both used the non-existent `InvalidRequest` code which is absent from the botocore Lambda model
+
+- **Lambda worker reset**: `core/lambda_runtime.reset()` was calling `worker.proc.terminate()` (typo) instead of `worker._proc.terminate()` — the `AttributeError` was silently swallowed, leaving orphaned worker subprocesses after `/_ministack/reset`
+- **Step Functions → Lambda async invocation**: `stepfunctions._call_lambda` was calling `lambda_svc._invoke` synchronously — `_invoke` is `async`, so it returned a coroutine object instead of executing; Task states invoking Lambda now use `asyncio.run()` to execute the coroutine from the background thread
+- **EventBridge → Lambda async invocation**: same bug in `eventbridge._dispatch_to_lambda` — fixed with `asyncio.run()`
+- **`make run` Docker socket mount**: added `-v /var/run/docker.sock:/var/run/docker.sock` so ECS `RunTask` works when running via `make run`
+
+### Tests
+- 4 regression tests added, one per botocore-confirmed bug: `test_ddb_query_pagination_hash_only`, `test_sqs_batch_delete_invalid_receipt_handle`, `test_sns_to_lambda_event_subscription_arn`, `test_lambda_unknown_path_returns_404`
+- 2 regression tests for runtime fixes: `test_lambda_reset_terminates_workers`, `test_sfn_integration_lambda_invoke`
+- 479 integration tests — all passing, including against Docker image
+
+---
+
 ## [1.0.7] — 2026-03-27
 
 ### Added
@@ -230,7 +278,5 @@ Initial public release. Built as a free, open-source alternative to LocalStack.
 
 ### Planned
 - Cognito (user pools, sign-up/sign-in)
-- Route53 (hosted zones, record sets)
 - ACM (certificate management)
-- Virtual-hosted style S3 (`bucket.localhost:4566` routing)
 

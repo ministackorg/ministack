@@ -428,7 +428,7 @@ async def handle_request(method: str, path: str, headers: dict,
 
         raw_name = parts[3] if len(parts) > 3 else None
         if not raw_name:
-            return error_response_json("InvalidRequest", "Missing function name", 400)
+            return error_response_json("InvalidParameterValueException", "Missing function name", 400)
 
         func_name, path_qualifier = _resolve_name_and_qualifier(raw_name)
         sub = parts[4] if len(parts) > 4 else None
@@ -501,13 +501,7 @@ async def handle_request(method: str, path: str, headers: dict,
         if method == "PUT" and sub == "configuration":
             return _update_config(func_name, data)
 
-        if method == "GET":
-            return json_response({})
-
-    if method == "GET":
-        return json_response({})
-
-    return error_response_json("InvalidRequest", f"Unhandled Lambda path: {path}", 400)
+    return error_response_json("ResourceNotFoundException", f"Function not found: {path}", 404)
 
 
 # ---------------------------------------------------------------------------
@@ -736,7 +730,7 @@ async def _invoke(name: str, event: dict, headers: dict,
     if isinstance(payload, (str, bytes)):
         raw = payload.encode("utf-8") if isinstance(payload, str) else payload
         return 200, resp_headers, raw
-    return 200, resp_headers, json.dumps(payload).encode("utf-8")
+    return 200, resp_headers, json.dumps(payload, ensure_ascii=False).encode("utf-8")
 
 
 # ---------------------------------------------------------------------------

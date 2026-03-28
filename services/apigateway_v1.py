@@ -108,11 +108,11 @@ def _new_id():
 
 def _v1_response(data, status=200):
     """API Gateway v1 uses application/json."""
-    return status, {"Content-Type": "application/json"}, json.dumps(data).encode()
+    return status, {"Content-Type": "application/json"}, json.dumps(data, ensure_ascii=False).encode("utf-8")
 
 
 def _v1_error(code, message, status):
-    return status, {"Content-Type": "application/json"}, json.dumps({"message": message, "type": code}).encode()
+    return status, {"Content-Type": "application/json"}, json.dumps({"message": message, "type": code}, ensure_ascii=False).encode("utf-8")
 
 
 def _rest_api_arn(api_id):
@@ -662,9 +662,9 @@ async def _invoke_lambda_proxy_v1(integration, api_id, stage_name, stage, resour
     resp_headers.update(lambda_response.get("headers", {}))
     resp_body = lambda_response.get("body", "")
     if isinstance(resp_body, str):
-        resp_body = resp_body.encode()
+        resp_body = resp_body.encode("utf-8")
     elif isinstance(resp_body, dict):
-        resp_body = json.dumps(resp_body).encode()
+        resp_body = json.dumps(resp_body, ensure_ascii=False).encode("utf-8")
 
     return status, resp_headers, resp_body
 

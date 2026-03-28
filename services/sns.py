@@ -483,7 +483,7 @@ def _fanout(topic_arn: str, msg_id: str, message: str, subject: str,
                 _deliver_to_http(endpoint, envelope)
             )
         elif protocol == "lambda":
-            _deliver_to_lambda(endpoint, envelope, topic_arn, msg_id, effective_message, message_attributes or {})
+            _deliver_to_lambda(endpoint, envelope, topic_arn, sub["arn"], msg_id, effective_message, message_attributes or {})
         elif protocol == "email" or protocol == "email-json":
             logger.info(f"SNS fanout → email {endpoint} (stub)")
         elif protocol == "sms":
@@ -516,8 +516,8 @@ def _deliver_to_sqs(endpoint: str, envelope: str, raw: bool, raw_message: str):
     logger.info(f"SNS fanout → SQS {queue_name}")
 
 
-def _deliver_to_lambda(endpoint: str, envelope: str, topic_arn: str, msg_id: str,
-                       raw_message: str, message_attributes: dict):
+def _deliver_to_lambda(endpoint: str, envelope: str, topic_arn: str, sub_arn: str,
+                       msg_id: str, raw_message: str, message_attributes: dict):
     """Invoke a Lambda function with the SNS Records envelope (AWS format)."""
     # endpoint is a Lambda ARN: arn:aws:lambda:region:account:function:name
     func_name = endpoint.split(":")[-1]
@@ -529,7 +529,7 @@ def _deliver_to_lambda(endpoint: str, envelope: str, topic_arn: str, msg_id: str
         "Records": [
             {
                 "EventVersion": "1.0",
-                "EventSubscriptionArn": f"{topic_arn}:subscription",
+                "EventSubscriptionArn": sub_arn,
                 "EventSource": "aws:sns",
                 "Sns": json.loads(envelope),
             }

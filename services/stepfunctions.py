@@ -16,6 +16,7 @@ Executions run in background threads and transition through RUNNING ->
 SUCCEEDED / FAILED / TIMED_OUT / ABORTED.
 """
 
+import asyncio
 import copy
 import json
 import logging
@@ -753,7 +754,7 @@ def _call_lambda(func_name, event):
         logger.warning("lambda_svc unavailable; returning passthrough for %s", func_name)
         return event
 
-    status, headers, body = lambda_svc._invoke(func_name, event, {})
+    status, headers, body = asyncio.run(lambda_svc._invoke(func_name, event, {}))
 
     if headers.get("X-Amz-Function-Error"):
         try:

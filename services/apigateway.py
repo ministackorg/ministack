@@ -66,11 +66,11 @@ _api_tags: dict = {}      # resource_arn -> {key -> value}
 
 def _apigw_response(data: dict, status: int = 200) -> tuple:
     """API Gateway v2 uses application/json (not application/x-amz-json-1.0)."""
-    return status, {"Content-Type": "application/json"}, json.dumps(data).encode()
+    return status, {"Content-Type": "application/json"}, json.dumps(data, ensure_ascii=False).encode("utf-8")
 
 
 def _apigw_error(code: str, message: str, status: int) -> tuple:
-    return status, {"Content-Type": "application/json"}, json.dumps({"message": message, "__type": code}).encode()
+    return status, {"Content-Type": "application/json"}, json.dumps({"message": message, "__type": code}, ensure_ascii=False).encode("utf-8")
 
 
 def _api_arn(api_id: str) -> str:
@@ -373,9 +373,9 @@ async def _invoke_lambda_proxy(integration, api_id, stage, path, method, headers
     resp_headers.update(lambda_response.get("headers", {}))
     resp_body = lambda_response.get("body", "")
     if isinstance(resp_body, str):
-        resp_body = resp_body.encode()
+        resp_body = resp_body.encode("utf-8")
     elif isinstance(resp_body, dict):
-        resp_body = json.dumps(resp_body).encode()
+        resp_body = json.dumps(resp_body, ensure_ascii=False).encode("utf-8")
 
     return status, resp_headers, resp_body
 
