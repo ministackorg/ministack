@@ -45,7 +45,7 @@ import time
 import logging
 import re
 
-from core.responses import new_uuid, error_response_json
+from ministack.core.responses import new_uuid, error_response_json
 
 logger = logging.getLogger("apigateway")
 
@@ -110,7 +110,7 @@ async def handle_request(method, path, headers, body, query_params):
     # Dispatch v1 REST API requests first
     parts = [p for p in path.strip("/").split("/") if p]
     if parts and parts[0] in ("restapis", "apikeys", "usageplans", "domainnames", "tags"):
-        from services import apigateway_v1
+        from ministack.services import apigateway_v1
         return await apigateway_v1.handle_request(method, path, headers, body, query_params)
 
     try:
@@ -314,8 +314,8 @@ def _path_matches(route_path: str, request_path: str) -> bool:
 
 async def _invoke_lambda_proxy(integration, api_id, stage, path, method, headers, body, query_params, route_key="$default"):
     """Invoke a Lambda function using the API Gateway v2 proxy event format."""
-    from services import lambda_svc
-    from core.lambda_runtime import get_or_create_worker
+    from ministack.services import lambda_svc
+    from ministack.core.lambda_runtime import get_or_create_worker
 
     uri = integration.get("integrationUri", "")
     # integrationUri is a Lambda ARN; the function name is the last segment

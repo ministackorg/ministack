@@ -24,7 +24,7 @@
 
 LocalStack recently moved its core services behind a paid plan. If you relied on LocalStack Community for local development and CI/CD pipelines, MiniStack is your free alternative.
 
-- **24 AWS services** emulated on a single port (4566)
+- **25 AWS services** emulated on a single port (4566)
 - **Drop-in compatible** — works with `boto3`, AWS CLI, Terraform, CDK, Pulumi, any SDK
 - **Real infrastructure** — RDS spins up actual Postgres/MySQL containers, ElastiCache spins up real Redis, Athena runs real SQL via DuckDB, ECS runs real Docker containers
 - **Tiny footprint** — ~150MB image, ~30MB RAM at idle vs LocalStack's ~1GB image and ~500MB RAM
@@ -36,17 +36,20 @@ LocalStack recently moved its core services behind a paid plan. If you relied on
 ## Quick Start
 
 ```bash
-# Option 1: Docker Hub (recommended)
+# Option 1: PyPI (simplest)
+pip install ministack
+ministack
+# Runs on http://localhost:4566 — use GATEWAY_PORT=XXXX to change
+
+# Option 2: Docker Hub
 docker run -p 4566:4566 nahuelnucera/ministack
 
-# Option 2: Clone and build
+# Option 3: Clone and build
 git clone https://github.com/Nahuel990/ministack
 cd ministack
-
-# Start with Docker Compose (includes Redis sidecar)
 docker compose up -d
 
-# Verify
+# Verify (any option)
 curl http://localhost:4566/_localstack/health
 ```
 
@@ -57,24 +60,28 @@ That's it. No account, no API key, no sign-up.
 ## Using with AWS CLI
 
 ```bash
-# Configure a local profile (one-time)
+# Option A — environment variables (no profile needed)
+export AWS_ACCESS_KEY_ID=test
+export AWS_SECRET_ACCESS_KEY=test
+export AWS_DEFAULT_REGION=us-east-1
+
+aws --endpoint-url=http://localhost:4566 s3 mb s3://my-bucket
+aws --endpoint-url=http://localhost:4566 sqs create-queue --queue-name my-queue
+aws --endpoint-url=http://localhost:4566 dynamodb list-tables
+aws --endpoint-url=http://localhost:4566 sts get-caller-identity
+
+# Option B — named profile (must pass --profile on every command)
 aws configure --profile local
 # AWS Access Key ID: test
 # AWS Secret Access Key: test
 # Default region: us-east-1
 # Default output format: json
 
-# Use --endpoint-url on any command
-aws --endpoint-url=http://localhost:4566 s3 mb s3://my-bucket
-aws --endpoint-url=http://localhost:4566 s3 cp ./file.txt s3://my-bucket/
-aws --endpoint-url=http://localhost:4566 sqs create-queue --queue-name my-queue
-aws --endpoint-url=http://localhost:4566 dynamodb list-tables
-aws --endpoint-url=http://localhost:4566 sts get-caller-identity
-
-# Or set the endpoint globally for a session
-export AWS_ENDPOINT_URL=http://localhost:4566
-aws s3 ls
-aws sqs list-queues
+aws --profile local --endpoint-url=http://localhost:4566 s3 mb s3://my-bucket
+aws --profile local --endpoint-url=http://localhost:4566 s3 cp ./file.txt s3://my-bucket/
+aws --profile local --endpoint-url=http://localhost:4566 sqs create-queue --queue-name my-queue
+aws --profile local --endpoint-url=http://localhost:4566 dynamodb list-tables
+aws --profile local --endpoint-url=http://localhost:4566 sts get-caller-identity
 ```
 
 ### awslocal wrapper
@@ -201,6 +208,7 @@ sfn.create_state_machine(
 | **Athena** | StartQueryExecution, GetQueryExecution, GetQueryResults, StopQueryExecution, ListQueryExecutions, BatchGetQueryExecution, CreateWorkGroup, DeleteWorkGroup, GetWorkGroup, ListWorkGroups, UpdateWorkGroup, CreateNamedQuery, DeleteNamedQuery, GetNamedQuery, ListNamedQueries, BatchGetNamedQuery, CreateDataCatalog, GetDataCatalog, ListDataCatalogs, DeleteDataCatalog, UpdateDataCatalog, CreatePreparedStatement, GetPreparedStatement, DeletePreparedStatement, ListPreparedStatements, GetTableMetadata, ListTableMetadata, TagResource, UntagResource, ListTagsForResource | Real SQL via **DuckDB** when installed (`pip install duckdb`), otherwise returns mock results; result pagination; column type metadata |
 | **Firehose** | CreateDeliveryStream, DeleteDeliveryStream, DescribeDeliveryStream, ListDeliveryStreams, PutRecord, PutRecordBatch, UpdateDestination, TagDeliveryStream, UntagDeliveryStream, ListTagsForDeliveryStream, StartDeliveryStreamEncryption, StopDeliveryStreamEncryption | S3 destinations write records to the local S3 emulator; all other destination types buffer in-memory; concurrency-safe `UpdateDestination` via `VersionId` |
 | **Route53** | CreateHostedZone, GetHostedZone, DeleteHostedZone, ListHostedZones, ListHostedZonesByName, UpdateHostedZoneComment, ChangeResourceRecordSets (CREATE/UPSERT/DELETE), ListResourceRecordSets, GetChange, CreateHealthCheck, GetHealthCheck, DeleteHealthCheck, ListHealthChecks, UpdateHealthCheck, ChangeTagsForResource, ListTagsForResource | REST/XML protocol; SOA + NS records auto-created; CallerReference idempotency; alias records, weighted/failover/latency routing; marker-based pagination |
+| **Cognito** | **User Pools**: CreateUserPool, DeleteUserPool, DescribeUserPool, ListUserPools, UpdateUserPool, CreateUserPoolClient, DeleteUserPoolClient, DescribeUserPoolClient, ListUserPoolClients, UpdateUserPoolClient, AdminCreateUser, AdminDeleteUser, AdminGetUser, ListUsers, AdminSetUserPassword, AdminUpdateUserAttributes, AdminConfirmSignUp, AdminDisableUser, AdminEnableUser, AdminResetUserPassword, AdminUserGlobalSignOut, AdminAddUserToGroup, AdminRemoveUserFromGroup, AdminListGroupsForUser, AdminListUserAuthEvents, AdminInitiateAuth, AdminRespondToAuthChallenge, InitiateAuth, RespondToAuthChallenge, GlobalSignOut, RevokeToken, SignUp, ConfirmSignUp, ForgotPassword, ConfirmForgotPassword, ChangePassword, GetUser, UpdateUserAttributes, DeleteUser, CreateGroup, DeleteGroup, GetGroup, ListGroups, ListUsersInGroup, CreateUserPoolDomain, DeleteUserPoolDomain, DescribeUserPoolDomain, GetUserPoolMfaConfig, SetUserPoolMfaConfig, AssociateSoftwareToken, VerifySoftwareToken, TagResource, UntagResource, ListTagsForResource; **Identity Pools**: CreateIdentityPool, DeleteIdentityPool, DescribeIdentityPool, ListIdentityPools, UpdateIdentityPool, GetId, GetCredentialsForIdentity, GetOpenIdToken, SetIdentityPoolRoles, GetIdentityPoolRoles, ListIdentities, DescribeIdentity, MergeDeveloperIdentities, UnlinkDeveloperIdentity, UnlinkIdentity, TagResource, UntagResource, ListTagsForResource; **OAuth2**: /oauth2/token (client_credentials) | Stub JWT tokens (structurally valid base64url JWTs); SRP auth returns PASSWORD_VERIFIER challenge; confirmation codes hardcoded (signup: 123456, forgot-password: 654321); MFA config stored in-memory |
 
 ---
 
@@ -383,12 +391,14 @@ MiniStack keeps Python Lambda functions warm between invocations. After the firs
                     │  ┌──────────────▼──────────────────┐    │
                     │  │         Service Handlers         │    │
                     │  │                                  │    │
-                    │  │  S3   SQS   SNS   DynamoDB       │    │
-                    │  │  Lambda  IAM  STS  Secrets       │    │
-                    │  │  SSM  EventBridge  Kinesis        │    │
-                    │  │  CloudWatch  SES  StepFunctions  │    │
-                    │  │  ECS   RDS   ElastiCache          │    │
-                    │  │  Glue  Athena  API Gateway        │    │
+                    │  │  S3    SQS    SNS    DynamoDB     │    │
+                    │  │  Lambda   IAM   STS   Secrets    │    │
+                    │  │  SSM   EventBridge   Kinesis     │    │
+                    │  │  CW Logs  CW Metrics  SES        │    │
+                    │  │  Step Functions  API GW v1/v2    │    │
+                    │  │  ECS   RDS   ElastiCache  Glue   │    │
+                    │  │  Athena  Firehose  Route53        │    │
+                    │  │  Cognito                         │    │
                     │  └──────────────────────────────────┘    │
                     │                                          │
                     │  In-Memory Storage + Optional Docker     │
@@ -411,19 +421,19 @@ pip install boto3 pytest duckdb docker cbor2
 # Start MiniStack
 docker compose up -d
 
-# Run the full test suite (479 tests across all 24 services)
+# Run the full test suite (613 tests across all 25 services)
 pytest tests/ -v
 ```
 
 Expected output:
 ```
-collected 479 items
+collected 613 items
 
 tests/test_services.py::test_s3_create_bucket PASSED
 ...
-tests/test_services.py::test_apigwv1_execute_mock_response_parameters PASSED
+tests/test_services.py::test_app_asgi_callable PASSED
 
-479 passed in ~60s
+613 passed in ~60s
 ```
 
 ---
@@ -463,6 +473,10 @@ provider "aws" {
     events         = "http://localhost:4566"
     ses            = "http://localhost:4566"
     apigateway     = "http://localhost:4566"
+    firehose       = "http://localhost:4566"
+    route53        = "http://localhost:4566"
+    cognitoidp     = "http://localhost:4566"
+    cognitoidentity = "http://localhost:4566"
   }
 }
 ```
@@ -511,7 +525,7 @@ config:
 | **API Gateway v1 (REST API)** | ✅ | ✅ | ✅ |
 | **Firehose** | ✅ | ✅ | ✅ |
 | **Route53** | ✅ | ✅ | ✅ |
-| Cognito | ❌ | ✅ | ✅ |
+| **Cognito** | ✅ | ✅ | ✅ |
 | CloudFormation | ❌ | partial | ✅ |
 | Cost | **Free** | Was free, now paid | $35+/mo |
 | Docker image size | ~150MB | ~1GB | ~1GB |
@@ -523,12 +537,14 @@ config:
 
 ## Contributing
 
-PRs welcome. The codebase is intentionally simple — each service is a single self-contained Python file in `services/`. Adding a new service means:
+PRs welcome. The codebase is intentionally simple — each service is a single self-contained Python file in `ministack/services/`. Adding a new service means:
 
-1. Create `services/myservice.py` with an `async def handle_request(...)` function
-2. Add it to `SERVICE_HANDLERS` in `app.py`
-3. Add detection patterns to `core/router.py`
-4. Add tests to `tests/test_services.py`
+1. Create `ministack/services/myservice.py` with an `async def handle_request(...)` function and a `reset()` function
+2. Add it to `SERVICE_HANDLERS` in `ministack/app.py`
+3. Add detection patterns to `ministack/core/router.py`
+4. Add a fixture to `tests/conftest.py` and tests to `tests/test_services.py`
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for a full walkthrough.
 
 ---
 

@@ -19,7 +19,7 @@ import json
 import time
 import logging
 
-from core.responses import json_response, error_response_json, new_uuid, now_iso
+from ministack.core.responses import json_response, error_response_json, new_uuid, now_iso
 
 logger = logging.getLogger("ecs")
 
@@ -751,7 +751,7 @@ def _stop_task(data):
             try:
                 c = docker_client.containers.get(docker_id)
                 c.stop(timeout=5)
-                c.remove()
+                c.remove(v=True)
             except Exception as e:
                 logger.warning(f"ECS: failed to stop container {docker_id}: {e}")
 
@@ -1212,6 +1212,16 @@ _ACTION_MAP = {
 
 
 def reset():
+    docker_client = _get_docker()
+    if docker_client:
+        for task in _tasks.values():
+            for cid in task.get("_docker_ids", []):
+                try:
+                    c = docker_client.containers.get(cid)
+                    c.stop(timeout=2)
+                    c.remove(v=True)
+                except Exception:
+                    pass
     _clusters.clear()
     _task_defs.clear()
     _task_def_latest.clear()

@@ -108,6 +108,14 @@ SERVICE_PATTERNS = {
         "host_patterns": [r"route53\."],
         "path_patterns": [r"^/2013-04-01/"],
     },
+    "cognito-idp": {
+        "target_prefixes": ["AWSCognitoIdentityProviderService"],
+        "host_patterns": [r"cognito-idp\."],
+    },
+    "cognito-identity": {
+        "target_prefixes": ["AWSCognitoIdentityService"],
+        "host_patterns": [r"cognito-identity\."],
+    },
 }
 
 
@@ -148,6 +156,8 @@ def detect_service(method: str, path: str, headers: dict, query_params: dict) ->
                 "athena": "athena",
                 "kinesis-firehose": "firehose",
                 "route53": "route53",
+                "cognito-idp": "cognito-idp",
+                "cognito-identity": "cognito-identity",
             }
             if svc_name in scope_map:
                 return scope_map[svc_name]
@@ -269,6 +279,8 @@ def detect_service(method: str, path: str, headers: dict, query_params: dict) ->
         return "apigateway"
     if path_lower.startswith("/2015-03-31/functions"):
         return "lambda"
+    if path_lower.startswith("/oauth2/token"):
+        return "cognito-idp"
     if path_lower.startswith(("/clusters", "/taskdefinitions", "/tasks", "/services", "/stoptask")):
         return "ecs"
     # smithy-rpc-v2-cbor path: /service/ServiceName/operation/ActionName

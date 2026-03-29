@@ -33,7 +33,7 @@ import logging
 import time
 from urllib.parse import parse_qs, quote as _url_quote
 
-from core.responses import new_uuid
+from ministack.core.responses import new_uuid
 
 logger = logging.getLogger("iam")
 

@@ -76,3 +76,9 @@ test: run
 
 clean: stop
 	docker rmi $(IMAGE_NAME) 2>/dev/null || true
+
+purge: stop-compose
+	docker rm -f $$(docker ps -aq --filter "label=ministack") 2>/dev/null || true
+	docker volume prune -f
+	rm -rf ./data/s3/*
+	@echo "Orphaned ministack containers, dangling volumes, and S3 data cleared"

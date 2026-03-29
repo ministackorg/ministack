@@ -15,9 +15,7 @@ RUN pip install --no-cache-dir --upgrade pip && \
         "cbor2>=5.4.0" \
         "docker>=7.0.0"
 
-COPY core/ core/
-COPY services/ services/
-COPY app.py .
+COPY ministack/ ministack/
 
 RUN addgroup -S ministack && adduser -S ministack -G ministack
 RUN mkdir -p /tmp/localstack-data/s3 && chown -R ministack:ministack /tmp/localstack-data
@@ -41,4 +39,4 @@ EXPOSE 4566
 HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=3 \
     CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:4566/_localstack/health')" || exit 1
 
-ENTRYPOINT ["python", "-m", "uvicorn", "app:app", "--host", "0.0.0.0", "--port", "4566"]
+ENTRYPOINT ["python", "-m", "uvicorn", "ministack.app:app", "--host", "0.0.0.0", "--port", "4566"]

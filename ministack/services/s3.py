@@ -28,7 +28,7 @@ import time
 from urllib.parse import quote as url_quote, unquote as url_unquote
 from xml.etree.ElementTree import Element, SubElement, tostring, fromstring
 
-from core.responses import md5_hash, sha256_hash, now_iso, new_uuid, iso_to_rfc7231
+from ministack.core.responses import md5_hash, sha256_hash, now_iso, new_uuid, iso_to_rfc7231
 
 logger = logging.getLogger("s3")
 
@@ -970,7 +970,7 @@ def _fire_s3_event(bucket_name: str, key: str, event_name: str,
 
 
 def _deliver_event_to_sqs(arn: str, event_payload: dict) -> None:
-    from services import sqs as _sqs
+    from ministack.services import sqs as _sqs
 
     queue_name = arn.rsplit(":", 1)[-1]
     queue_url = _sqs._queue_url(queue_name)
@@ -996,7 +996,7 @@ def _deliver_event_to_sqs(arn: str, event_payload: dict) -> None:
 
 
 def _deliver_event_to_sns(arn: str, event_payload: dict) -> None:
-    from services import sns as _sns
+    from ministack.services import sns as _sns
 
     topic = _sns._topics.get(arn)
     if not topic:
@@ -1010,7 +1010,7 @@ def _deliver_event_to_sns(arn: str, event_payload: dict) -> None:
 
 
 def _deliver_event_to_lambda(arn: str, event_payload: dict) -> None:
-    from services import lambda_svc as _lambda
+    from ministack.services import lambda_svc as _lambda
 
     func_name = arn.rsplit(":", 1)[-1]
     if func_name not in _lambda._functions:

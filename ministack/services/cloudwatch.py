@@ -18,7 +18,7 @@ from datetime import datetime, timezone
 from urllib.parse import parse_qs
 from collections import defaultdict
 
-from core.responses import new_uuid
+from ministack.core.responses import new_uuid
 
 logger = logging.getLogger("cloudwatch")
 

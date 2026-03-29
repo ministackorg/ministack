@@ -8055,7 +8055,13 @@ def test_lambda_reset_terminates_workers(lam):
     # Reset — must terminate worker without error
     endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
     req = urllib.request.Request(f"{endpoint}/_ministack/reset", data=b"", method="POST")
-    urllib.request.urlopen(req, timeout=5)
+    for _attempt in range(3):
+        try:
+            urllib.request.urlopen(req, timeout=15)
+            break
+        except Exception:
+            if _attempt == 2:
+                raise
 
     # Re-create and invoke — new worker means new boot time
     lam.create_function(
@@ -8116,3 +8122,2512 @@ def test_sfn_integration_lambda_invoke(sfn, lam):
     assert desc["status"] == "SUCCEEDED"
     output = json.loads(desc["output"])
     assert output["result"]["doubled"] == 42
+
+
+# ========== Package structure ==========
+
+_ministack_installed = True
+try:
+    import ministack  # noqa: F401
+except ModuleNotFoundError:
+    _ministack_installed = False
+
+_requires_package = pytest.mark.skipif(
+    not _ministack_installed,
+    reason="ministack not installed locally (runs in CI via pip install -e .)",
+)
+
+
+@_requires_package
+def test_package_core_importable():
+    """ministack.core modules must all be importable."""
+    from ministack.core.responses import json_response, error_response_json, new_uuid
+    from ministack.core.router import detect_service
+    from ministack.core.lambda_runtime import get_or_create_worker, reset as lr_reset
+    from ministack.core.persistence import save_all, load_state
+    assert callable(json_response)
+    assert callable(detect_service)
+    assert callable(get_or_create_worker)
+    assert callable(save_all)
+
+
+@_requires_package
+def test_package_services_importable():
+    """All 25 ministack.services modules must be importable and expose handle_request."""
+    from ministack.services import (
+        s3, sqs, sns, dynamodb, lambda_svc, secretsmanager, cloudwatch_logs,
+        ssm, eventbridge, kinesis, cloudwatch, ses, stepfunctions,
+        ecs, rds, elasticache, glue, athena, apigateway, apigateway_v1,
+        firehose, route53, cognito,
+    )
+    from ministack.services.iam_sts import handle_iam_request, handle_sts_request
+    for mod in [s3, sqs, sns, dynamodb, lambda_svc, secretsmanager,
+                cloudwatch_logs, ssm, eventbridge, kinesis, cloudwatch,
+                ses, stepfunctions, ecs, rds, elasticache, glue, athena,
+                apigateway, firehose, route53, cognito]:
+        assert callable(getattr(mod, "handle_request", None)), \
+            f"{mod.__name__} missing handle_request"
+    assert callable(handle_iam_request)
+    assert callable(handle_sts_request)
+
+
+@_requires_package
+def test_app_asgi_callable():
+    """ministack.app:app must be an async callable (ASGI entry point)."""
+    import inspect
+    from ministack import app as app_module
+    assert callable(app_module.app)
+    assert inspect.iscoroutinefunction(app_module.app)
+    assert callable(app_module.main)
+
+
+# ========== Cognito ==========
+
+
+def test_cognito_create_and_describe_user_pool(cognito_idp):
+    resp = cognito_idp.create_user_pool(PoolName="TestPool")
+    pool = resp["UserPool"]
+    pid = pool["Id"]
+    assert pool["Name"] == "TestPool"
+    assert pid.startswith("us-east-1_")
+
+    desc = cognito_idp.describe_user_pool(UserPoolId=pid)["UserPool"]
+    assert desc["Id"] == pid
+    assert desc["Name"] == "TestPool"
+
+
+def test_cognito_list_user_pools(cognito_idp):
+    cognito_idp.create_user_pool(PoolName="ListPoolA")
+    cognito_idp.create_user_pool(PoolName="ListPoolB")
+    resp = cognito_idp.list_user_pools(MaxResults=60)
+    names = [p["Name"] for p in resp["UserPools"]]
+    assert "ListPoolA" in names
+    assert "ListPoolB" in names
+
+
+def test_cognito_update_user_pool(cognito_idp):
+    resp = cognito_idp.create_user_pool(PoolName="UpdatePool")
+    pid = resp["UserPool"]["Id"]
+    cognito_idp.update_user_pool(UserPoolId=pid, UserPoolTags={"env": "test"})
+    desc = cognito_idp.describe_user_pool(UserPoolId=pid)["UserPool"]
+    assert desc["UserPoolTags"].get("env") == "test"
+
+
+def test_cognito_delete_user_pool(cognito_idp):
+    resp = cognito_idp.create_user_pool(PoolName="DeletePool")
+    pid = resp["UserPool"]["Id"]
+    cognito_idp.delete_user_pool(UserPoolId=pid)
+    pools = cognito_idp.list_user_pools(MaxResults=60)["UserPools"]
+    assert not any(p["Id"] == pid for p in pools)
+
+
+def test_cognito_create_and_describe_user_pool_client(cognito_idp):
+    pid = cognito_idp.create_user_pool(PoolName="ClientPool")["UserPool"]["Id"]
+    client_resp = cognito_idp.create_user_pool_client(
+        UserPoolId=pid,
+        ClientName="MyApp",
+        ExplicitAuthFlows=["ALLOW_USER_PASSWORD_AUTH", "ALLOW_REFRESH_TOKEN_AUTH"],
+    )
+    client = client_resp["UserPoolClient"]
+    cid = client["ClientId"]
+    assert client["ClientName"] == "MyApp"
+
+    desc = cognito_idp.describe_user_pool_client(UserPoolId=pid, ClientId=cid)["UserPoolClient"]
+    assert desc["ClientId"] == cid
+    assert desc["ClientName"] == "MyApp"
+
+
+def test_cognito_list_user_pool_clients(cognito_idp):
+    pid = cognito_idp.create_user_pool(PoolName="MultiClientPool")["UserPool"]["Id"]
+    cognito_idp.create_user_pool_client(UserPoolId=pid, ClientName="App1")
+    cognito_idp.create_user_pool_client(UserPoolId=pid, ClientName="App2")
+    clients = cognito_idp.list_user_pool_clients(UserPoolId=pid, MaxResults=60)["UserPoolClients"]
+    names = [c["ClientName"] for c in clients]
+    assert "App1" in names
+    assert "App2" in names
+
+
+def test_cognito_admin_create_and_get_user(cognito_idp):
+    pid = cognito_idp.create_user_pool(PoolName="AdminUserPool")["UserPool"]["Id"]
+    cognito_idp.admin_create_user(
+        UserPoolId=pid,
+        Username="alice",
+        UserAttributes=[{"Name": "email", "Value": "alice@example.com"}],
+    )
+    user = cognito_idp.admin_get_user(UserPoolId=pid, Username="alice")
+    assert user["Username"] == "alice"
+    attrs = {a["Name"]: a["Value"] for a in user["UserAttributes"]}
+    assert attrs["email"] == "alice@example.com"
+
+
+def test_cognito_list_users(cognito_idp):
+    pid = cognito_idp.create_user_pool(PoolName="ListUsersPool")["UserPool"]["Id"]
+    for name in ["user1", "user2", "user3"]:
+        cognito_idp.admin_create_user(UserPoolId=pid, Username=name)
+    users = cognito_idp.list_users(UserPoolId=pid)["Users"]
+    usernames = [u["Username"] for u in users]
+    assert "user1" in usernames
+    assert "user2" in usernames
+    assert "user3" in usernames
+
+
+def test_cognito_list_users_filter(cognito_idp):
+    pid = cognito_idp.create_user_pool(PoolName="FilterUsersPool")["UserPool"]["Id"]
+    cognito_idp.admin_create_user(
+        UserPoolId=pid,
+        Username="bob",
+        UserAttributes=[{"Name": "email", "Value": "bob@example.com"}],
+    )
+    cognito_idp.admin_create_user(
+        UserPoolId=pid,
+        Username="charlie",
+        UserAttributes=[{"Name": "email", "Value": "charlie@example.com"}],
+    )
+    resp = cognito_idp.list_users(UserPoolId=pid, Filter='username = "bob"')
+    users = resp["Users"]
+    assert len(users) == 1
+    assert users[0]["Username"] == "bob"
+
+
+def test_cognito_admin_set_user_password(cognito_idp):
+    pid = cognito_idp.create_user_pool(PoolName="PwdPool")["UserPool"]["Id"]
+    cid = cognito_idp.create_user_pool_client(
+        UserPoolId=pid, ClientName="PwdApp",
+        ExplicitAuthFlows=["ALLOW_USER_PASSWORD_AUTH", "ALLOW_REFRESH_TOKEN_AUTH"],
+    )["UserPoolClient"]["ClientId"]
+    cognito_idp.admin_create_user(UserPoolId=pid, Username="dave")
+    cognito_idp.admin_set_user_password(
+        UserPoolId=pid, Username="dave", Password="NewPass123!", Permanent=True
+    )
+    auth = cognito_idp.admin_initiate_auth(
+        UserPoolId=pid,
+        ClientId=cid,
+        AuthFlow="ADMIN_USER_PASSWORD_AUTH",
+        AuthParameters={"USERNAME": "dave", "PASSWORD": "NewPass123!"},
+    )
+    assert "AuthenticationResult" in auth
+
+
+def test_cognito_admin_initiate_auth_wrong_password(cognito_idp):
+    import botocore.exceptions
+    pid = cognito_idp.create_user_pool(PoolName="AuthFailPool")["UserPool"]["Id"]
+    cid = cognito_idp.create_user_pool_client(
+        UserPoolId=pid, ClientName="AuthFailApp",
+        ExplicitAuthFlows=["ALLOW_USER_PASSWORD_AUTH", "ALLOW_REFRESH_TOKEN_AUTH"],
+    )["UserPoolClient"]["ClientId"]
+    cognito_idp.admin_create_user(UserPoolId=pid, Username="eve")
+    cognito_idp.admin_set_user_password(
+        UserPoolId=pid, Username="eve", Password="Correct1!", Permanent=True
+    )
+    with pytest.raises(botocore.exceptions.ClientError) as exc_info:
+        cognito_idp.admin_initiate_auth(
+            UserPoolId=pid,
+            ClientId=cid,
+            AuthFlow="ADMIN_USER_PASSWORD_AUTH",
+            AuthParameters={"USERNAME": "eve", "PASSWORD": "Wrong1!"},
+        )
+    assert exc_info.value.response["Error"]["Code"] == "NotAuthorizedException"
+
+
+def test_cognito_initiate_auth_user_password(cognito_idp):
+    pid = cognito_idp.create_user_pool(PoolName="InitiateAuthPool")["UserPool"]["Id"]
+    cid = cognito_idp.create_user_pool_client(
+        UserPoolId=pid, ClientName="InitiateApp",
+        ExplicitAuthFlows=["ALLOW_USER_PASSWORD_AUTH", "ALLOW_REFRESH_TOKEN_AUTH"],
+    )["UserPoolClient"]["ClientId"]
+    cognito_idp.admin_create_user(UserPoolId=pid, Username="frank")
+    cognito_idp.admin_set_user_password(
+        UserPoolId=pid, Username="frank", Password="FrankPass1!", Permanent=True
+    )
+    auth = cognito_idp.initiate_auth(
+        ClientId=cid,
+        AuthFlow="USER_PASSWORD_AUTH",
+        AuthParameters={"USERNAME": "frank", "PASSWORD": "FrankPass1!"},
+    )
+    assert "AuthenticationResult" in auth
+    result = auth["AuthenticationResult"]
+    assert "AccessToken" in result
+    assert "IdToken" in result
+    assert "RefreshToken" in result
+
+
+def test_cognito_signup_and_confirm(cognito_idp):
+    pid = cognito_idp.create_user_pool(PoolName="SignupPool")["UserPool"]["Id"]
+    cid = cognito_idp.create_user_pool_client(
+        UserPoolId=pid, ClientName="SignupApp"
+    )["UserPoolClient"]["ClientId"]
+
+    resp = cognito_idp.sign_up(
+        ClientId=cid,
+        Username="grace",
+        Password="GracePass1!",
+        UserAttributes=[{"Name": "email", "Value": "grace@example.com"}],
+    )
+    assert resp["UserSub"]
+
+    cognito_idp.confirm_sign_up(
+        ClientId=cid,
+        Username="grace",
+        ConfirmationCode="123456",
+    )
+    user = cognito_idp.admin_get_user(UserPoolId=pid, Username="grace")
+    assert user["UserStatus"] == "CONFIRMED"
+
+
+def test_cognito_forgot_password_and_confirm(cognito_idp):
+    pid = cognito_idp.create_user_pool(PoolName="ForgotPwdPool")["UserPool"]["Id"]
+    cid = cognito_idp.create_user_pool_client(
+        UserPoolId=pid, ClientName="ForgotApp"
+    )["UserPoolClient"]["ClientId"]
+    cognito_idp.admin_create_user(UserPoolId=pid, Username="henry")
+    cognito_idp.admin_set_user_password(
+        UserPoolId=pid, Username="henry", Password="OldPass1!", Permanent=True
+    )
+
+    cognito_idp.forgot_password(ClientId=cid, Username="henry")
+
+    cognito_idp.confirm_forgot_password(
+        ClientId=cid,
+        Username="henry",
+        ConfirmationCode="654321",
+        Password="NewPass2!",
+    )
+    cognito_idp.admin_set_user_password(
+        UserPoolId=pid, Username="henry", Password="NewPass2!", Permanent=True
+    )
+    auth = cognito_idp.admin_initiate_auth(
+        UserPoolId=pid,
+        ClientId=cid,
+        AuthFlow="ADMIN_USER_PASSWORD_AUTH",
+        AuthParameters={"USERNAME": "henry", "PASSWORD": "NewPass2!"},
+    )
+    assert "AuthenticationResult" in auth
+
+
+def test_cognito_admin_update_user_attributes(cognito_idp):
+    pid = cognito_idp.create_user_pool(PoolName="UpdateAttrPool")["UserPool"]["Id"]
+    cognito_idp.admin_create_user(
+        UserPoolId=pid,
+        Username="irene",
+        UserAttributes=[{"Name": "email", "Value": "irene@example.com"}],
+    )
+    cognito_idp.admin_update_user_attributes(
+        UserPoolId=pid,
+        Username="irene",
+        UserAttributes=[{"Name": "email", "Value": "irene@updated.com"}],
+    )
+    user = cognito_idp.admin_get_user(UserPoolId=pid, Username="irene")
+    attrs = {a["Name"]: a["Value"] for a in user["UserAttributes"]}
+    assert attrs["email"] == "irene@updated.com"
+
+
+def test_cognito_admin_disable_enable_user(cognito_idp):
+    pid = cognito_idp.create_user_pool(PoolName="DisablePool")["UserPool"]["Id"]
+    cognito_idp.admin_create_user(UserPoolId=pid, Username="jack")
+
+    cognito_idp.admin_disable_user(UserPoolId=pid, Username="jack")
+    user = cognito_idp.admin_get_user(UserPoolId=pid, Username="jack")
+    assert user["Enabled"] is False
+
+    cognito_idp.admin_enable_user(UserPoolId=pid, Username="jack")
+    user = cognito_idp.admin_get_user(UserPoolId=pid, Username="jack")
+    assert user["Enabled"] is True
+
+
+def test_cognito_admin_delete_user(cognito_idp):
+    import botocore.exceptions
+    pid = cognito_idp.create_user_pool(PoolName="DeleteUserPool")["UserPool"]["Id"]
+    cognito_idp.admin_create_user(UserPoolId=pid, Username="kate")
+    cognito_idp.admin_delete_user(UserPoolId=pid, Username="kate")
+    with pytest.raises(botocore.exceptions.ClientError) as exc_info:
+        cognito_idp.admin_get_user(UserPoolId=pid, Username="kate")
+    assert exc_info.value.response["Error"]["Code"] == "UserNotFoundException"
+
+
+def test_cognito_groups_crud(cognito_idp):
+    pid = cognito_idp.create_user_pool(PoolName="GroupPool")["UserPool"]["Id"]
+
+    resp = cognito_idp.create_group(UserPoolId=pid, GroupName="admins", Description="Admins")
+    assert resp["Group"]["GroupName"] == "admins"
+
+    group = cognito_idp.get_group(UserPoolId=pid, GroupName="admins")["Group"]
+    assert group["Description"] == "Admins"
+
+    groups = cognito_idp.list_groups(UserPoolId=pid)["Groups"]
+    assert any(g["GroupName"] == "admins" for g in groups)
+
+    cognito_idp.delete_group(UserPoolId=pid, GroupName="admins")
+    groups = cognito_idp.list_groups(UserPoolId=pid)["Groups"]
+    assert not any(g["GroupName"] == "admins" for g in groups)
+
+
+def test_cognito_admin_add_remove_user_from_group(cognito_idp):
+    pid = cognito_idp.create_user_pool(PoolName="GroupMemberPool")["UserPool"]["Id"]
+    cognito_idp.admin_create_user(UserPoolId=pid, Username="liam")
+    cognito_idp.create_group(UserPoolId=pid, GroupName="editors")
+
+    cognito_idp.admin_add_user_to_group(UserPoolId=pid, Username="liam", GroupName="editors")
+    members = cognito_idp.list_users_in_group(UserPoolId=pid, GroupName="editors")["Users"]
+    assert any(u["Username"] == "liam" for u in members)
+
+    groups_for_user = cognito_idp.admin_list_groups_for_user(
+        UserPoolId=pid, Username="liam"
+    )["Groups"]
+    assert any(g["GroupName"] == "editors" for g in groups_for_user)
+
+    cognito_idp.admin_remove_user_from_group(
+        UserPoolId=pid, Username="liam", GroupName="editors"
+    )
+    members = cognito_idp.list_users_in_group(UserPoolId=pid, GroupName="editors")["Users"]
+    assert not any(u["Username"] == "liam" for u in members)
+
+
+def test_cognito_domain_crud(cognito_idp):
+    pid = cognito_idp.create_user_pool(PoolName="DomainPool")["UserPool"]["Id"]
+    resp = cognito_idp.create_user_pool_domain(UserPoolId=pid, Domain="my-test-domain")
+    assert "CloudFrontDomain" in resp
+
+    desc = cognito_idp.describe_user_pool_domain(Domain="my-test-domain")
+    assert desc["DomainDescription"]["UserPoolId"] == pid
+    assert desc["DomainDescription"]["Status"] == "ACTIVE"
+
+    cognito_idp.delete_user_pool_domain(UserPoolId=pid, Domain="my-test-domain")
+    desc2 = cognito_idp.describe_user_pool_domain(Domain="my-test-domain")
+    assert desc2["DomainDescription"] == {}
+
+
+def test_cognito_mfa_config(cognito_idp):
+    pid = cognito_idp.create_user_pool(PoolName="MfaPool")["UserPool"]["Id"]
+    resp = cognito_idp.get_user_pool_mfa_config(UserPoolId=pid)
+    assert resp["MfaConfiguration"] == "OFF"
+
+    cognito_idp.set_user_pool_mfa_config(
+        UserPoolId=pid,
+        SoftwareTokenMfaConfiguration={"Enabled": True},
+        MfaConfiguration="OPTIONAL",
+    )
+    resp = cognito_idp.get_user_pool_mfa_config(UserPoolId=pid)
+    assert resp["MfaConfiguration"] == "OPTIONAL"
+    assert resp["SoftwareTokenMfaConfiguration"]["Enabled"] is True
+
+
+def test_cognito_tags(cognito_idp):
+    resp = cognito_idp.create_user_pool(PoolName="TagPool")
+    pid = resp["UserPool"]["Id"]
+    arn = resp["UserPool"]["Arn"]
+
+    cognito_idp.tag_resource(ResourceArn=arn, Tags={"project": "ministack"})
+    tags = cognito_idp.list_tags_for_resource(ResourceArn=arn)["Tags"]
+    assert tags["project"] == "ministack"
+
+    cognito_idp.untag_resource(ResourceArn=arn, TagKeys=["project"])
+    tags = cognito_idp.list_tags_for_resource(ResourceArn=arn)["Tags"]
+    assert "project" not in tags
+
+
+def test_cognito_get_user_from_token(cognito_idp):
+    pid = cognito_idp.create_user_pool(PoolName="GetUserPool")["UserPool"]["Id"]
+    cid = cognito_idp.create_user_pool_client(
+        UserPoolId=pid, ClientName="GetUserApp",
+        ExplicitAuthFlows=["ALLOW_USER_PASSWORD_AUTH", "ALLOW_REFRESH_TOKEN_AUTH"],
+    )["UserPoolClient"]["ClientId"]
+    cognito_idp.admin_create_user(
+        UserPoolId=pid,
+        Username="maya",
+        UserAttributes=[{"Name": "email", "Value": "maya@example.com"}],
+    )
+    cognito_idp.admin_set_user_password(
+        UserPoolId=pid, Username="maya", Password="MayaPass1!", Permanent=True
+    )
+    auth = cognito_idp.admin_initiate_auth(
+        UserPoolId=pid,
+        ClientId=cid,
+        AuthFlow="ADMIN_USER_PASSWORD_AUTH",
+        AuthParameters={"USERNAME": "maya", "PASSWORD": "MayaPass1!"},
+    )
+    access_token = auth["AuthenticationResult"]["AccessToken"]
+    user = cognito_idp.get_user(AccessToken=access_token)
+    assert user["Username"] == "maya"
+
+
+def test_cognito_global_sign_out(cognito_idp):
+    pid = cognito_idp.create_user_pool(PoolName="SignOutPool")["UserPool"]["Id"]
+    cid = cognito_idp.create_user_pool_client(
+        UserPoolId=pid, ClientName="SignOutApp",
+        ExplicitAuthFlows=["ALLOW_USER_PASSWORD_AUTH", "ALLOW_REFRESH_TOKEN_AUTH"],
+    )["UserPoolClient"]["ClientId"]
+    cognito_idp.admin_create_user(UserPoolId=pid, Username="noah")
+    cognito_idp.admin_set_user_password(
+        UserPoolId=pid, Username="noah", Password="NoahPass1!", Permanent=True
+    )
+    auth = cognito_idp.admin_initiate_auth(
+        UserPoolId=pid,
+        ClientId=cid,
+        AuthFlow="ADMIN_USER_PASSWORD_AUTH",
+        AuthParameters={"USERNAME": "noah", "PASSWORD": "NoahPass1!"},
+    )
+    access_token = auth["AuthenticationResult"]["AccessToken"]
+    cognito_idp.global_sign_out(AccessToken=access_token)  # must not raise
+
+
+def test_cognito_admin_confirm_signup(cognito_idp):
+    pid = cognito_idp.create_user_pool(PoolName="AdminConfirmPool")["UserPool"]["Id"]
+    cid = cognito_idp.create_user_pool_client(
+        UserPoolId=pid, ClientName="AdminConfirmApp"
+    )["UserPoolClient"]["ClientId"]
+    cognito_idp.sign_up(
+        ClientId=cid,
+        Username="olivia",
+        Password="OliviaPass1!",
+    )
+    cognito_idp.admin_confirm_sign_up(UserPoolId=pid, Username="olivia")
+    user = cognito_idp.admin_get_user(UserPoolId=pid, Username="olivia")
+    assert user["UserStatus"] == "CONFIRMED"
+
+
+# Identity Pools (cognito-identity)
+
+def test_cognito_identity_pool_crud(cognito_identity):
+    resp = cognito_identity.create_identity_pool(
+        IdentityPoolName="TestIdPool",
+        AllowUnauthenticatedIdentities=False,
+    )
+    iid = resp["IdentityPoolId"]
+    assert resp["IdentityPoolName"] == "TestIdPool"
+    assert iid.startswith("us-east-1:")
+
+    desc = cognito_identity.describe_identity_pool(IdentityPoolId=iid)
+    assert desc["IdentityPoolId"] == iid
+    assert desc["IdentityPoolName"] == "TestIdPool"
+
+    pools = cognito_identity.list_identity_pools(MaxResults=60)["IdentityPools"]
+    assert any(p["IdentityPoolId"] == iid for p in pools)
+
+    cognito_identity.update_identity_pool(
+        IdentityPoolId=iid,
+        IdentityPoolName="TestIdPool",
+        AllowUnauthenticatedIdentities=True,
+    )
+    desc2 = cognito_identity.describe_identity_pool(IdentityPoolId=iid)
+    assert desc2["AllowUnauthenticatedIdentities"] is True
+
+    cognito_identity.delete_identity_pool(IdentityPoolId=iid)
+    pools2 = cognito_identity.list_identity_pools(MaxResults=60)["IdentityPools"]
+    assert not any(p["IdentityPoolId"] == iid for p in pools2)
+
+
+def test_cognito_get_id_and_credentials(cognito_identity):
+    resp = cognito_identity.create_identity_pool(
+        IdentityPoolName="CredsPool",
+        AllowUnauthenticatedIdentities=True,
+    )
+    iid = resp["IdentityPoolId"]
+
+    id_resp = cognito_identity.get_id(IdentityPoolId=iid, AccountId="000000000000")
+    identity_id = id_resp["IdentityId"]
+    assert identity_id
+
+    creds = cognito_identity.get_credentials_for_identity(IdentityId=identity_id)
+    assert creds["IdentityId"] == identity_id
+    assert "AccessKeyId" in creds["Credentials"]
+    assert creds["Credentials"]["AccessKeyId"].startswith("ASIA")
+    assert "SecretKey" in creds["Credentials"]
+    assert "SessionToken" in creds["Credentials"]
+
+
+def test_cognito_identity_pool_roles(cognito_identity):
+    resp = cognito_identity.create_identity_pool(
+        IdentityPoolName="RolesPool",
+        AllowUnauthenticatedIdentities=True,
+    )
+    iid = resp["IdentityPoolId"]
+
+    cognito_identity.set_identity_pool_roles(
+        IdentityPoolId=iid,
+        Roles={
+            "authenticated": "arn:aws:iam::000000000000:role/AuthRole",
+            "unauthenticated": "arn:aws:iam::000000000000:role/UnauthRole",
+        },
+    )
+    roles = cognito_identity.get_identity_pool_roles(IdentityPoolId=iid)
+    assert roles["Roles"]["authenticated"] == "arn:aws:iam::000000000000:role/AuthRole"
+    assert roles["Roles"]["unauthenticated"] == "arn:aws:iam::000000000000:role/UnauthRole"
+
+
+def test_cognito_list_identities(cognito_identity):
+    resp = cognito_identity.create_identity_pool(
+        IdentityPoolName="ListIdPool",
+        AllowUnauthenticatedIdentities=True,
+    )
+    iid = resp["IdentityPoolId"]
+
+    id1 = cognito_identity.get_id(IdentityPoolId=iid, AccountId="000000000000")["IdentityId"]
+    id2 = cognito_identity.get_id(IdentityPoolId=iid, AccountId="000000000000")["IdentityId"]
+
+    identities = cognito_identity.list_identities(IdentityPoolId=iid, MaxResults=60)["Identities"]
+    ids = [i["IdentityId"] for i in identities]
+    assert id1 in ids
+    assert id2 in ids
+
+
+def test_cognito_get_open_id_token(cognito_identity):
+    resp = cognito_identity.create_identity_pool(
+        IdentityPoolName="OidcPool",
+        AllowUnauthenticatedIdentities=True,
+    )
+    iid = resp["IdentityPoolId"]
+    identity_id = cognito_identity.get_id(
+        IdentityPoolId=iid, AccountId="000000000000"
+    )["IdentityId"]
+
+    token_resp = cognito_identity.get_open_id_token(IdentityId=identity_id)
+    assert token_resp["IdentityId"] == identity_id
+    token = token_resp["Token"]
+    # Verify stub JWT structure: header.payload.sig
+    parts = token.split(".")
+    assert len(parts) == 3
+
+
+def test_cognito_signup_always_unconfirmed(cognito_idp):
+    """SignUp always returns UNCONFIRMED regardless of AutoVerifiedAttributes."""
+    # Pool with AutoVerifiedAttributes — user still starts UNCONFIRMED
+    pid = cognito_idp.create_user_pool(
+        PoolName="AutoVerifyPool",
+        AutoVerifiedAttributes=["email"],
+    )["UserPool"]["Id"]
+    cid = cognito_idp.create_user_pool_client(
+        UserPoolId=pid, ClientName="AutoVerifyApp"
+    )["UserPoolClient"]["ClientId"]
+    resp = cognito_idp.sign_up(
+        ClientId=cid,
+        Username="testuser",
+        Password="TestPass1!",
+        UserAttributes=[{"Name": "email", "Value": "test@example.com"}],
+    )
+    assert resp["UserConfirmed"] is False
+    user = cognito_idp.admin_get_user(UserPoolId=pid, Username="testuser")
+    assert user["UserStatus"] == "UNCONFIRMED"
+
+    # Pool with NO AutoVerifiedAttributes — user also starts UNCONFIRMED
+    pid2 = cognito_idp.create_user_pool(PoolName="NoAutoVerifyPool")["UserPool"]["Id"]
+    cid2 = cognito_idp.create_user_pool_client(
+        UserPoolId=pid2, ClientName="NoAutoVerifyApp"
+    )["UserPoolClient"]["ClientId"]
+    resp2 = cognito_idp.sign_up(
+        ClientId=cid2, Username="testuser2", Password="TestPass1!"
+    )
+    assert resp2["UserConfirmed"] is False
+    user2 = cognito_idp.admin_get_user(UserPoolId=pid2, Username="testuser2")
+    assert user2["UserStatus"] == "UNCONFIRMED"
+
+
+def test_cognito_change_password(cognito_idp):
+    """ChangePassword decodes the access token and updates the stored password."""
+    pid = cognito_idp.create_user_pool(PoolName="ChangePwdPool")["UserPool"]["Id"]
+    cid = cognito_idp.create_user_pool_client(
+        UserPoolId=pid, ClientName="ChangePwdApp",
+        ExplicitAuthFlows=["ALLOW_USER_PASSWORD_AUTH", "ALLOW_REFRESH_TOKEN_AUTH"],
+    )["UserPoolClient"]["ClientId"]
+    cognito_idp.admin_create_user(UserPoolId=pid, Username="pwduser")
+    cognito_idp.admin_set_user_password(
+        UserPoolId=pid, Username="pwduser", Password="OldPass1!", Permanent=True
+    )
+    auth = cognito_idp.admin_initiate_auth(
+        UserPoolId=pid, ClientId=cid,
+        AuthFlow="ADMIN_USER_PASSWORD_AUTH",
+        AuthParameters={"USERNAME": "pwduser", "PASSWORD": "OldPass1!"},
+    )
+    access_token = auth["AuthenticationResult"]["AccessToken"]
+
+    cognito_idp.change_password(
+        AccessToken=access_token,
+        PreviousPassword="OldPass1!",
+        ProposedPassword="NewPass2!",
+    )
+
+    # New password must work
+    auth2 = cognito_idp.admin_initiate_auth(
+        UserPoolId=pid, ClientId=cid,
+        AuthFlow="ADMIN_USER_PASSWORD_AUTH",
+        AuthParameters={"USERNAME": "pwduser", "PASSWORD": "NewPass2!"},
+    )
+    assert "AuthenticationResult" in auth2
+
+    # Old password must fail
+    import botocore.exceptions
+    with pytest.raises(botocore.exceptions.ClientError) as exc_info:
+        cognito_idp.admin_initiate_auth(
+            UserPoolId=pid, ClientId=cid,
+            AuthFlow="ADMIN_USER_PASSWORD_AUTH",
+            AuthParameters={"USERNAME": "pwduser", "PASSWORD": "OldPass1!"},
+        )
+    assert exc_info.value.response["Error"]["Code"] == "NotAuthorizedException"
+
+
+def test_cognito_refresh_token_auth_correct_user(cognito_idp):
+    """REFRESH_TOKEN_AUTH returns tokens for the correct user, not the first user in the pool."""
+    pid = cognito_idp.create_user_pool(PoolName="RefreshPool")["UserPool"]["Id"]
+    cid = cognito_idp.create_user_pool_client(
+        UserPoolId=pid, ClientName="RefreshApp",
+        ExplicitAuthFlows=["ALLOW_USER_PASSWORD_AUTH", "ALLOW_REFRESH_TOKEN_AUTH"],
+    )["UserPoolClient"]["ClientId"]
+
+    for name, pw in [("first", "First1!"), ("second", "Second1!")]:
+        cognito_idp.admin_create_user(UserPoolId=pid, Username=name)
+        cognito_idp.admin_set_user_password(
+            UserPoolId=pid, Username=name, Password=pw, Permanent=True
+        )
+
+    # Auth as "second" user and refresh
+    auth = cognito_idp.admin_initiate_auth(
+        UserPoolId=pid, ClientId=cid,
+        AuthFlow="ADMIN_USER_PASSWORD_AUTH",
+        AuthParameters={"USERNAME": "second", "PASSWORD": "Second1!"},
+    )
+    refresh_token = auth["AuthenticationResult"]["RefreshToken"]
+
+    refresh = cognito_idp.admin_initiate_auth(
+        UserPoolId=pid, ClientId=cid,
+        AuthFlow="REFRESH_TOKEN_AUTH",
+        AuthParameters={"REFRESH_TOKEN": refresh_token},
+    )
+    assert "AuthenticationResult" in refresh
+    # New access token should resolve back to "second" via GetUser
+    new_access = refresh["AuthenticationResult"]["AccessToken"]
+    user = cognito_idp.get_user(AccessToken=new_access)
+    assert user["Username"] == "second"
+
+
+def test_cognito_refresh_token_alias(cognito_idp):
+    """REFRESH_TOKEN (without _AUTH suffix) is accepted as an alias."""
+    pid = cognito_idp.create_user_pool(PoolName="RefreshAliasPool")["UserPool"]["Id"]
+    cid = cognito_idp.create_user_pool_client(
+        UserPoolId=pid, ClientName="RefreshAliasApp",
+        ExplicitAuthFlows=["ALLOW_USER_PASSWORD_AUTH", "ALLOW_REFRESH_TOKEN_AUTH"],
+    )["UserPoolClient"]["ClientId"]
+    cognito_idp.admin_create_user(UserPoolId=pid, Username="aliasuser")
+    cognito_idp.admin_set_user_password(
+        UserPoolId=pid, Username="aliasuser", Password="AliasPass1!", Permanent=True
+    )
+    auth = cognito_idp.admin_initiate_auth(
+        UserPoolId=pid, ClientId=cid,
+        AuthFlow="ADMIN_USER_PASSWORD_AUTH",
+        AuthParameters={"USERNAME": "aliasuser", "PASSWORD": "AliasPass1!"},
+    )
+    refresh_token = auth["AuthenticationResult"]["RefreshToken"]
+    refresh = cognito_idp.initiate_auth(
+        ClientId=cid,
+        AuthFlow="REFRESH_TOKEN",
+        AuthParameters={"REFRESH_TOKEN": refresh_token},
+    )
+    assert "AuthenticationResult" in refresh
+    assert "AccessToken" in refresh["AuthenticationResult"]
+    assert "RefreshToken" not in refresh["AuthenticationResult"]
+
+
+def test_cognito_respond_to_auth_challenge_new_password(cognito_idp):
+    """RespondToAuthChallenge with NEW_PASSWORD_REQUIRED confirms the user."""
+    pid = cognito_idp.create_user_pool(PoolName="ChallengePool")["UserPool"]["Id"]
+    cid = cognito_idp.create_user_pool_client(
+        UserPoolId=pid, ClientName="ChallengeApp",
+        ExplicitAuthFlows=["ALLOW_USER_PASSWORD_AUTH", "ALLOW_REFRESH_TOKEN_AUTH"],
+    )["UserPoolClient"]["ClientId"]
+    cognito_idp.admin_create_user(UserPoolId=pid, Username="newpwduser")
+    # Set a temp password — Permanent=False keeps FORCE_CHANGE_PASSWORD status
+    cognito_idp.admin_set_user_password(
+        UserPoolId=pid, Username="newpwduser", Password="TempPass1!", Permanent=False
+    )
+    # Initiate auth — FORCE_CHANGE_PASSWORD triggers NEW_PASSWORD_REQUIRED challenge
+    auth = cognito_idp.initiate_auth(
+        ClientId=cid,
+        AuthFlow="USER_PASSWORD_AUTH",
+        AuthParameters={"USERNAME": "newpwduser", "PASSWORD": "TempPass1!"},
+    )
+    assert auth.get("ChallengeName") == "NEW_PASSWORD_REQUIRED"
+    session = auth["Session"]
+    result = cognito_idp.respond_to_auth_challenge(
+        ClientId=cid,
+        ChallengeName="NEW_PASSWORD_REQUIRED",
+        Session=session,
+        ChallengeResponses={"USERNAME": "newpwduser", "NEW_PASSWORD": "FinalPass1!"},
+    )
+    assert "AuthenticationResult" in result
+    user = cognito_idp.admin_get_user(UserPoolId=pid, Username="newpwduser")
+    assert user["UserStatus"] == "CONFIRMED"
+
+
+def test_cognito_update_user_attributes_via_token(cognito_idp):
+    """UpdateUserAttributes (self-service) updates attributes using access token."""
+    pid = cognito_idp.create_user_pool(PoolName="UpdateAttrTokenPool")["UserPool"]["Id"]
+    cid = cognito_idp.create_user_pool_client(
+        UserPoolId=pid, ClientName="UpdateAttrApp",
+        ExplicitAuthFlows=["ALLOW_USER_PASSWORD_AUTH", "ALLOW_REFRESH_TOKEN_AUTH"],
+    )["UserPoolClient"]["ClientId"]
+    cognito_idp.admin_create_user(
+        UserPoolId=pid, Username="attrupdate",
+        UserAttributes=[{"Name": "email", "Value": "old@example.com"}],
+    )
+    cognito_idp.admin_set_user_password(
+        UserPoolId=pid, Username="attrupdate", Password="AttrPass1!", Permanent=True
+    )
+    access_token = cognito_idp.admin_initiate_auth(
+        UserPoolId=pid, ClientId=cid,
+        AuthFlow="ADMIN_USER_PASSWORD_AUTH",
+        AuthParameters={"USERNAME": "attrupdate", "PASSWORD": "AttrPass1!"},
+    )["AuthenticationResult"]["AccessToken"]
+
+    cognito_idp.update_user_attributes(
+        AccessToken=access_token,
+        UserAttributes=[{"Name": "email", "Value": "new@example.com"}],
+    )
+    user = cognito_idp.admin_get_user(UserPoolId=pid, Username="attrupdate")
+    attrs = {a["Name"]: a["Value"] for a in user["UserAttributes"]}
+    assert attrs["email"] == "new@example.com"
+
+
+def test_cognito_delete_user_via_token(cognito_idp):
+    """DeleteUser (self-service) removes the user using access token."""
+    import botocore.exceptions
+    pid = cognito_idp.create_user_pool(PoolName="DeleteSelfPool")["UserPool"]["Id"]
+    cid = cognito_idp.create_user_pool_client(
+        UserPoolId=pid, ClientName="DeleteSelfApp",
+        ExplicitAuthFlows=["ALLOW_USER_PASSWORD_AUTH", "ALLOW_REFRESH_TOKEN_AUTH"],
+    )["UserPoolClient"]["ClientId"]
+    cognito_idp.admin_create_user(UserPoolId=pid, Username="selfdelete")
+    cognito_idp.admin_set_user_password(
+        UserPoolId=pid, Username="selfdelete", Password="DelPass1!", Permanent=True
+    )
+    access_token = cognito_idp.admin_initiate_auth(
+        UserPoolId=pid, ClientId=cid,
+        AuthFlow="ADMIN_USER_PASSWORD_AUTH",
+        AuthParameters={"USERNAME": "selfdelete", "PASSWORD": "DelPass1!"},
+    )["AuthenticationResult"]["AccessToken"]
+
+    cognito_idp.delete_user(AccessToken=access_token)
+
+    with pytest.raises(botocore.exceptions.ClientError) as exc_info:
+        cognito_idp.admin_get_user(UserPoolId=pid, Username="selfdelete")
+    assert exc_info.value.response["Error"]["Code"] == "UserNotFoundException"
+
+
+def test_cognito_update_user_pool_client(cognito_idp):
+    pid = cognito_idp.create_user_pool(PoolName="UpdateClientPool")["UserPool"]["Id"]
+    cid = cognito_idp.create_user_pool_client(
+        UserPoolId=pid, ClientName="OriginalName"
+    )["UserPoolClient"]["ClientId"]
+    updated = cognito_idp.update_user_pool_client(
+        UserPoolId=pid, ClientId=cid, ClientName="UpdatedName",
+        RefreshTokenValidity=14,
+    )["UserPoolClient"]
+    assert updated["ClientName"] == "UpdatedName"
+    assert updated["RefreshTokenValidity"] == 14
+    # Verify persisted
+    desc = cognito_idp.describe_user_pool_client(UserPoolId=pid, ClientId=cid)["UserPoolClient"]
+    assert desc["ClientName"] == "UpdatedName"
+
+
+def test_cognito_admin_reset_user_password(cognito_idp):
+    pid = cognito_idp.create_user_pool(PoolName="ResetPwdPool")["UserPool"]["Id"]
+    cognito_idp.admin_create_user(UserPoolId=pid, Username="resetuser")
+    cognito_idp.admin_set_user_password(
+        UserPoolId=pid, Username="resetuser", Password="Pass1!", Permanent=True
+    )
+    cognito_idp.admin_reset_user_password(UserPoolId=pid, Username="resetuser")
+    user = cognito_idp.admin_get_user(UserPoolId=pid, Username="resetuser")
+    assert user["UserStatus"] == "RESET_REQUIRED"
+
+
+def test_cognito_admin_user_global_sign_out(cognito_idp):
+    pid = cognito_idp.create_user_pool(PoolName="GlobalSignOutAdminPool")["UserPool"]["Id"]
+    cognito_idp.admin_create_user(UserPoolId=pid, Username="signoutuser")
+    cognito_idp.admin_user_global_sign_out(UserPoolId=pid, Username="signoutuser")
+
+
+def test_cognito_revoke_token(cognito_idp):
+    pid = cognito_idp.create_user_pool(PoolName="RevokePool")["UserPool"]["Id"]
+    cid = cognito_idp.create_user_pool_client(
+        UserPoolId=pid, ClientName="RevokeApp",
+        ExplicitAuthFlows=["ALLOW_USER_PASSWORD_AUTH", "ALLOW_REFRESH_TOKEN_AUTH"],
+    )["UserPoolClient"]["ClientId"]
+    cognito_idp.admin_create_user(UserPoolId=pid, Username="revokeuser")
+    cognito_idp.admin_set_user_password(
+        UserPoolId=pid, Username="revokeuser", Password="RevokePass1!", Permanent=True
+    )
+    auth = cognito_idp.admin_initiate_auth(
+        UserPoolId=pid, ClientId=cid,
+        AuthFlow="ADMIN_USER_PASSWORD_AUTH",
+        AuthParameters={"USERNAME": "revokeuser", "PASSWORD": "RevokePass1!"},
+    )
+    refresh_token = auth["AuthenticationResult"]["RefreshToken"]
+    cognito_idp.revoke_token(Token=refresh_token, ClientId=cid)
+
+
+def test_cognito_describe_identity(cognito_identity):
+    resp = cognito_identity.create_identity_pool(
+        IdentityPoolName="DescribeIdPool",
+        AllowUnauthenticatedIdentities=True,
+    )
+    iid = resp["IdentityPoolId"]
+    identity_id = cognito_identity.get_id(
+        IdentityPoolId=iid, AccountId="000000000000"
+    )["IdentityId"]
+    desc = cognito_identity.describe_identity(IdentityId=identity_id)
+    assert desc["IdentityId"] == identity_id
+
+
+def test_cognito_merge_developer_identities(cognito_identity):
+    resp = cognito_identity.create_identity_pool(
+        IdentityPoolName="MergePool",
+        AllowUnauthenticatedIdentities=True,
+        DeveloperProviderName="login.myapp",
+    )
+    iid = resp["IdentityPoolId"]
+    result = cognito_identity.merge_developer_identities(
+        SourceUserIdentifier="user-a",
+        DestinationUserIdentifier="user-b",
+        DeveloperProviderName="login.myapp",
+        IdentityPoolId=iid,
+    )
+    assert "IdentityId" in result
+
+
+# ===========================================================================
+# QA — Edge cases and regression tests (merged from test_qa_comprehensive.py)
+# ===========================================================================
+
+def _zip_lambda(code: str) -> bytes:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("index.py", code)
+    return buf.getvalue()
+
+
+# ---------------------------------------------------------------------------
+# COGNITO — fix regressions + edge cases
+# ---------------------------------------------------------------------------
+
+def test_cognito_credentials_secret_access_key(cognito_identity):
+    """GetCredentialsForIdentity must return SecretKey (boto3 wire name)."""
+    iid = cognito_identity.create_identity_pool(
+        IdentityPoolName="qa-creds-pool",
+        AllowUnauthenticatedIdentities=True,
+    )["IdentityPoolId"]
+    identity_id = cognito_identity.get_id(
+        IdentityPoolId=iid, AccountId="000000000000"
+    )["IdentityId"]
+    creds = cognito_identity.get_credentials_for_identity(IdentityId=identity_id)
+    c = creds["Credentials"]
+    assert "SecretKey" in c
+    assert c["AccessKeyId"].startswith("ASIA")
+    assert "SessionToken" in c
+    assert c["Expiration"] is not None
+
+
+def test_cognito_change_password_actually_changes(cognito_idp):
+    """ChangePassword must update the stored password so old one stops working."""
+    pid = cognito_idp.create_user_pool(PoolName="qa-changepwd")["UserPool"]["Id"]
+    cid = cognito_idp.create_user_pool_client(
+        UserPoolId=pid, ClientName="qa-changepwd-app",
+        ExplicitAuthFlows=["ALLOW_USER_PASSWORD_AUTH", "ALLOW_REFRESH_TOKEN_AUTH"],
+    )["UserPoolClient"]["ClientId"]
+    cognito_idp.admin_create_user(UserPoolId=pid, Username="qa-cpwd-user")
+    cognito_idp.admin_set_user_password(
+        UserPoolId=pid, Username="qa-cpwd-user", Password="OldPwd1!", Permanent=True
+    )
+    token = cognito_idp.admin_initiate_auth(
+        UserPoolId=pid, ClientId=cid,
+        AuthFlow="ADMIN_USER_PASSWORD_AUTH",
+        AuthParameters={"USERNAME": "qa-cpwd-user", "PASSWORD": "OldPwd1!"},
+    )["AuthenticationResult"]["AccessToken"]
+    cognito_idp.change_password(
+        AccessToken=token, PreviousPassword="OldPwd1!", ProposedPassword="NewPwd2!"
+    )
+    auth2 = cognito_idp.admin_initiate_auth(
+        UserPoolId=pid, ClientId=cid,
+        AuthFlow="ADMIN_USER_PASSWORD_AUTH",
+        AuthParameters={"USERNAME": "qa-cpwd-user", "PASSWORD": "NewPwd2!"},
+    )
+    assert "AuthenticationResult" in auth2
+    with pytest.raises(ClientError) as exc:
+        cognito_idp.admin_initiate_auth(
+            UserPoolId=pid, ClientId=cid,
+            AuthFlow="ADMIN_USER_PASSWORD_AUTH",
+            AuthParameters={"USERNAME": "qa-cpwd-user", "PASSWORD": "OldPwd1!"},
+        )
+    assert exc.value.response["Error"]["Code"] == "NotAuthorizedException"
+
+
+def test_cognito_refresh_token_returns_correct_user(cognito_idp):
+    """REFRESH_TOKEN_AUTH must return tokens for the refreshing user, not users[0]."""
+    pid = cognito_idp.create_user_pool(PoolName="qa-refresh-pool")["UserPool"]["Id"]
+    cid = cognito_idp.create_user_pool_client(
+        UserPoolId=pid, ClientName="qa-refresh-app",
+        ExplicitAuthFlows=["ALLOW_USER_PASSWORD_AUTH", "ALLOW_REFRESH_TOKEN_AUTH"],
+    )["UserPoolClient"]["ClientId"]
+    for name, pw in [("qa-first", "First1!"), ("qa-second", "Second1!")]:
+        cognito_idp.admin_create_user(UserPoolId=pid, Username=name)
+        cognito_idp.admin_set_user_password(
+            UserPoolId=pid, Username=name, Password=pw, Permanent=True
+        )
+    auth = cognito_idp.admin_initiate_auth(
+        UserPoolId=pid, ClientId=cid,
+        AuthFlow="ADMIN_USER_PASSWORD_AUTH",
+        AuthParameters={"USERNAME": "qa-second", "PASSWORD": "Second1!"},
+    )
+    refresh_token = auth["AuthenticationResult"]["RefreshToken"]
+    refresh = cognito_idp.admin_initiate_auth(
+        UserPoolId=pid, ClientId=cid,
+        AuthFlow="REFRESH_TOKEN_AUTH",
+        AuthParameters={"REFRESH_TOKEN": refresh_token},
+    )
+    new_token = refresh["AuthenticationResult"]["AccessToken"]
+    user = cognito_idp.get_user(AccessToken=new_token)
+    assert user["Username"] == "qa-second", "Refresh must return tokens for qa-second not qa-first"
+
+
+def test_cognito_signup_unconfirmed_with_auto_verify(cognito_idp):
+    """SignUp with AutoVerifiedAttributes must return UserConfirmed=False."""
+    pid = cognito_idp.create_user_pool(
+        PoolName="qa-autoverify", AutoVerifiedAttributes=["email"]
+    )["UserPool"]["Id"]
+    cid = cognito_idp.create_user_pool_client(
+        UserPoolId=pid, ClientName="qa-autoverify-app"
+    )["UserPoolClient"]["ClientId"]
+    resp = cognito_idp.sign_up(
+        ClientId=cid, Username="qa-signup-user", Password="SignUp1!",
+        UserAttributes=[{"Name": "email", "Value": "qa@example.com"}],
+    )
+    assert resp["UserConfirmed"] is False
+    user = cognito_idp.admin_get_user(UserPoolId=pid, Username="qa-signup-user")
+    assert user["UserStatus"] == "UNCONFIRMED"
+
+
+def test_cognito_disabled_user_auth_fails(cognito_idp):
+    """Disabled user must get NotAuthorizedException."""
+    pid = cognito_idp.create_user_pool(PoolName="qa-disabled-pool")["UserPool"]["Id"]
+    cid = cognito_idp.create_user_pool_client(
+        UserPoolId=pid, ClientName="qa-disabled-app",
+        ExplicitAuthFlows=["ALLOW_USER_PASSWORD_AUTH", "ALLOW_REFRESH_TOKEN_AUTH"],
+    )["UserPoolClient"]["ClientId"]
+    cognito_idp.admin_create_user(UserPoolId=pid, Username="qa-disabled")
+    cognito_idp.admin_set_user_password(
+        UserPoolId=pid, Username="qa-disabled", Password="Dis1!", Permanent=True
+    )
+    cognito_idp.admin_disable_user(UserPoolId=pid, Username="qa-disabled")
+    with pytest.raises(ClientError) as exc:
+        cognito_idp.admin_initiate_auth(
+            UserPoolId=pid, ClientId=cid,
+            AuthFlow="ADMIN_USER_PASSWORD_AUTH",
+            AuthParameters={"USERNAME": "qa-disabled", "PASSWORD": "Dis1!"},
+        )
+    assert exc.value.response["Error"]["Code"] == "NotAuthorizedException"
+
+
+def test_cognito_list_users_in_group(cognito_idp):
+    """ListUsersInGroup must return members added via AdminAddUserToGroup."""
+    pid = cognito_idp.create_user_pool(PoolName="qa-group-members")["UserPool"]["Id"]
+    cognito_idp.create_group(UserPoolId=pid, GroupName="qa-grp")
+    for u in ["qa-u1", "qa-u2", "qa-u3"]:
+        cognito_idp.admin_create_user(UserPoolId=pid, Username=u)
+        cognito_idp.admin_add_user_to_group(UserPoolId=pid, Username=u, GroupName="qa-grp")
+    members = cognito_idp.list_users_in_group(UserPoolId=pid, GroupName="qa-grp")["Users"]
+    names = {u["Username"] for u in members}
+    assert {"qa-u1", "qa-u2", "qa-u3"} == names
+
+
+def test_cognito_duplicate_username_error(cognito_idp):
+    """AdminCreateUser with duplicate username must raise UsernameExistsException."""
+    pid = cognito_idp.create_user_pool(PoolName="qa-dup-user")["UserPool"]["Id"]
+    cognito_idp.admin_create_user(UserPoolId=pid, Username="qa-dup")
+    with pytest.raises(ClientError) as exc:
+        cognito_idp.admin_create_user(UserPoolId=pid, Username="qa-dup")
+    assert exc.value.response["Error"]["Code"] == "UsernameExistsException"
+
+
+def test_cognito_client_secret_generated(cognito_idp):
+    """CreateUserPoolClient with GenerateSecret=True must return a ClientSecret."""
+    pid = cognito_idp.create_user_pool(PoolName="qa-secret-client")["UserPool"]["Id"]
+    client = cognito_idp.create_user_pool_client(
+        UserPoolId=pid, ClientName="qa-secret-app", GenerateSecret=True
+    )["UserPoolClient"]
+    assert "ClientSecret" in client
+    assert len(client["ClientSecret"]) > 20
+
+
+def test_cognito_force_change_password_challenge(cognito_idp):
+    """AdminCreateUser with TemporaryPassword triggers NEW_PASSWORD_REQUIRED challenge."""
+    pid = cognito_idp.create_user_pool(PoolName="qa-force-change")["UserPool"]["Id"]
+    cid = cognito_idp.create_user_pool_client(
+        UserPoolId=pid, ClientName="qa-force-app",
+        ExplicitAuthFlows=["ALLOW_USER_PASSWORD_AUTH", "ALLOW_REFRESH_TOKEN_AUTH"],
+    )["UserPoolClient"]["ClientId"]
+    cognito_idp.admin_create_user(
+        UserPoolId=pid, Username="qa-force-user",
+        TemporaryPassword="TempPwd1!",
+    )
+    auth = cognito_idp.admin_initiate_auth(
+        UserPoolId=pid, ClientId=cid,
+        AuthFlow="ADMIN_USER_PASSWORD_AUTH",
+        AuthParameters={"USERNAME": "qa-force-user", "PASSWORD": "TempPwd1!"},
+    )
+    assert auth.get("ChallengeName") == "NEW_PASSWORD_REQUIRED"
+    assert "Session" in auth
+
+
+# ---------------------------------------------------------------------------
+# DYNAMODB — edge cases
+# ---------------------------------------------------------------------------
+
+def test_ddb_update_item_updated_new(ddb):
+    """UpdateItem ReturnValues=UPDATED_NEW returns only changed attributes."""
+    ddb.create_table(
+        TableName="qa-ddb-updated-new",
+        KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+        AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "S"}],
+        BillingMode="PAY_PER_REQUEST",
+    )
+    ddb.put_item(TableName="qa-ddb-updated-new", Item={
+        "pk": {"S": "k1"}, "a": {"S": "old"}, "b": {"N": "1"}
+    })
+    resp = ddb.update_item(
+        TableName="qa-ddb-updated-new",
+        Key={"pk": {"S": "k1"}},
+        UpdateExpression="SET a = :new",
+        ExpressionAttributeValues={":new": {"S": "new"}},
+        ReturnValues="UPDATED_NEW",
+    )
+    assert "Attributes" in resp
+    assert resp["Attributes"]["a"]["S"] == "new"
+    assert "b" not in resp["Attributes"]
+
+
+def test_ddb_update_item_updated_old(ddb):
+    """UpdateItem ReturnValues=UPDATED_OLD returns old values of changed attributes."""
+    ddb.create_table(
+        TableName="qa-ddb-updated-old",
+        KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+        AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "S"}],
+        BillingMode="PAY_PER_REQUEST",
+    )
+    ddb.put_item(TableName="qa-ddb-updated-old", Item={
+        "pk": {"S": "k1"}, "score": {"N": "10"}
+    })
+    resp = ddb.update_item(
+        TableName="qa-ddb-updated-old",
+        Key={"pk": {"S": "k1"}},
+        UpdateExpression="SET score = :new",
+        ExpressionAttributeValues={":new": {"N": "20"}},
+        ReturnValues="UPDATED_OLD",
+    )
+    assert resp["Attributes"]["score"]["N"] == "10"
+
+
+def test_ddb_conditional_put_fails(ddb):
+    """PutItem with attribute_not_exists condition fails if item already exists."""
+    ddb.create_table(
+        TableName="qa-ddb-cond-put",
+        KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+        AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "S"}],
+        BillingMode="PAY_PER_REQUEST",
+    )
+    ddb.put_item(TableName="qa-ddb-cond-put", Item={"pk": {"S": "exists"}})
+    with pytest.raises(ClientError) as exc:
+        ddb.put_item(
+            TableName="qa-ddb-cond-put",
+            Item={"pk": {"S": "exists"}, "data": {"S": "new"}},
+            ConditionExpression="attribute_not_exists(pk)",
+        )
+    assert exc.value.response["Error"]["Code"] == "ConditionalCheckFailedException"
+
+
+def test_ddb_query_with_filter_expression(ddb):
+    """Query with FilterExpression reduces Count but not ScannedCount."""
+    ddb.create_table(
+        TableName="qa-ddb-filter",
+        KeySchema=[
+            {"AttributeName": "pk", "KeyType": "HASH"},
+            {"AttributeName": "sk", "KeyType": "RANGE"},
+        ],
+        AttributeDefinitions=[
+            {"AttributeName": "pk", "AttributeType": "S"},
+            {"AttributeName": "sk", "AttributeType": "N"},
+        ],
+        BillingMode="PAY_PER_REQUEST",
+    )
+    for i in range(5):
+        ddb.put_item(TableName="qa-ddb-filter", Item={
+            "pk": {"S": "user1"}, "sk": {"N": str(i)}, "active": {"BOOL": i % 2 == 0}
+        })
+    resp = ddb.query(
+        TableName="qa-ddb-filter",
+        KeyConditionExpression="pk = :pk",
+        FilterExpression="active = :t",
+        ExpressionAttributeValues={":pk": {"S": "user1"}, ":t": {"BOOL": True}},
+    )
+    assert resp["Count"] == 3
+    assert resp["ScannedCount"] == 5
+
+
+def test_ddb_scan_with_limit_and_pagination(ddb):
+    """Scan with Limit returns LastEvaluatedKey and pagination works."""
+    ddb.create_table(
+        TableName="qa-ddb-scan-page",
+        KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+        AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "S"}],
+        BillingMode="PAY_PER_REQUEST",
+    )
+    for i in range(10):
+        ddb.put_item(TableName="qa-ddb-scan-page", Item={"pk": {"S": f"item{i:02d}"}})
+    all_items = []
+    lek = None
+    while True:
+        kwargs = {"TableName": "qa-ddb-scan-page", "Limit": 3}
+        if lek:
+            kwargs["ExclusiveStartKey"] = lek
+        resp = ddb.scan(**kwargs)
+        all_items.extend(resp["Items"])
+        lek = resp.get("LastEvaluatedKey")
+        if not lek:
+            break
+    assert len(all_items) == 10
+
+
+def test_ddb_transact_write_condition_cancel(ddb):
+    """TransactWriteItems cancels entire transaction if one condition fails."""
+    ddb.create_table(
+        TableName="qa-ddb-transact",
+        KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+        AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "S"}],
+        BillingMode="PAY_PER_REQUEST",
+    )
+    ddb.put_item(TableName="qa-ddb-transact", Item={"pk": {"S": "existing"}})
+    with pytest.raises(ClientError) as exc:
+        ddb.transact_write_items(TransactItems=[
+            {"Put": {
+                "TableName": "qa-ddb-transact",
+                "Item": {"pk": {"S": "new-item"}},
+            }},
+            {"Put": {
+                "TableName": "qa-ddb-transact",
+                "Item": {"pk": {"S": "existing"}, "data": {"S": "x"}},
+                "ConditionExpression": "attribute_not_exists(pk)",
+            }},
+        ])
+    assert exc.value.response["Error"]["Code"] == "TransactionCanceledException"
+    resp = ddb.get_item(TableName="qa-ddb-transact", Key={"pk": {"S": "new-item"}})
+    assert "Item" not in resp
+
+
+def test_ddb_batch_get_missing_table(ddb):
+    """BatchGetItem with non-existent table returns it in UnprocessedKeys."""
+    resp = ddb.batch_get_item(RequestItems={
+        "qa-ddb-nonexistent-xyz": {"Keys": [{"pk": {"S": "k1"}}]}
+    })
+    assert "qa-ddb-nonexistent-xyz" in resp["UnprocessedKeys"]
+
+
+# ---------------------------------------------------------------------------
+# S3 — edge cases
+# ---------------------------------------------------------------------------
+
+def test_s3_range_suffix(s3):
+    """Range: bytes=-N returns last N bytes."""
+    s3.create_bucket(Bucket="qa-s3-range-suffix")
+    s3.put_object(Bucket="qa-s3-range-suffix", Key="data.txt", Body=b"0123456789")
+    resp = s3.get_object(Bucket="qa-s3-range-suffix", Key="data.txt", Range="bytes=-3")
+    assert resp["Body"].read() == b"789"
+    assert resp["ResponseMetadata"]["HTTPStatusCode"] == 206
+
+
+def test_s3_range_beyond_end(s3):
+    """Range start beyond file size returns 416."""
+    s3.create_bucket(Bucket="qa-s3-range-beyond")
+    s3.put_object(Bucket="qa-s3-range-beyond", Key="small.txt", Body=b"hello")
+    with pytest.raises(ClientError) as exc:
+        s3.get_object(Bucket="qa-s3-range-beyond", Key="small.txt", Range="bytes=100-200")
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 416
+
+
+def test_s3_list_v1_marker_pagination(s3):
+    """ListObjects v1 Marker pagination returns correct pages."""
+    s3.create_bucket(Bucket="qa-s3-marker")
+    keys = [f"file{i:03d}.txt" for i in range(10)]
+    for k in keys:
+        s3.put_object(Bucket="qa-s3-marker", Key=k, Body=b"x")
+    # NextMarker only returned when Delimiter is set (AWS spec)
+    resp1 = s3.list_objects(Bucket="qa-s3-marker", MaxKeys=4, Delimiter="/")
+    assert resp1["IsTruncated"] is True
+    assert len(resp1["Contents"]) == 4
+    marker = resp1["NextMarker"]
+    resp2 = s3.list_objects(Bucket="qa-s3-marker", MaxKeys=4, Marker=marker, Delimiter="/")
+    page2_keys = [o["Key"] for o in resp2["Contents"]]
+    page1_keys = [o["Key"] for o in resp1["Contents"]]
+    assert not any(k in page1_keys for k in page2_keys)
+
+
+def test_s3_delete_objects_returns_deleted(s3):
+    """DeleteObjects returns each deleted key in Deleted list."""
+    s3.create_bucket(Bucket="qa-s3-batch-del")
+    for i in range(3):
+        s3.put_object(Bucket="qa-s3-batch-del", Key=f"obj{i}.txt", Body=b"x")
+    resp = s3.delete_objects(
+        Bucket="qa-s3-batch-del",
+        Delete={"Objects": [{"Key": f"obj{i}.txt"} for i in range(3)]},
+    )
+    assert len(resp["Deleted"]) == 3
+    assert not resp.get("Errors")
+
+
+def test_s3_put_object_content_type_preserved(s3):
+    """Content-Type set on PutObject is returned on GetObject."""
+    s3.create_bucket(Bucket="qa-s3-ct")
+    s3.put_object(
+        Bucket="qa-s3-ct", Key="page.html",
+        Body=b"<html/>", ContentType="text/html; charset=utf-8"
+    )
+    resp = s3.get_object(Bucket="qa-s3-ct", Key="page.html")
+    assert "text/html" in resp["ContentType"]
+
+
+def test_s3_head_object_returns_content_length(s3):
+    """HeadObject must return correct ContentLength."""
+    s3.create_bucket(Bucket="qa-s3-head-len")
+    body = b"exactly twenty bytes"
+    s3.put_object(Bucket="qa-s3-head-len", Key="f.bin", Body=body)
+    resp = s3.head_object(Bucket="qa-s3-head-len", Key="f.bin")
+    assert resp["ContentLength"] == len(body)
+
+
+def test_s3_copy_preserves_metadata(s3):
+    """CopyObject with MetadataDirective=COPY preserves source metadata."""
+    s3.create_bucket(Bucket="qa-s3-copy-meta")
+    s3.put_object(
+        Bucket="qa-s3-copy-meta", Key="src.txt", Body=b"data",
+        Metadata={"x-custom": "value123"},
+    )
+    s3.copy_object(
+        CopySource={"Bucket": "qa-s3-copy-meta", "Key": "src.txt"},
+        Bucket="qa-s3-copy-meta", Key="dst.txt",
+        MetadataDirective="COPY",
+    )
+    resp = s3.head_object(Bucket="qa-s3-copy-meta", Key="dst.txt")
+    assert resp["Metadata"].get("x-custom") == "value123"
+
+
+def test_s3_multipart_list_parts(s3):
+    """ListParts returns uploaded parts before completion."""
+    s3.create_bucket(Bucket="qa-s3-listparts")
+    mpu = s3.create_multipart_upload(Bucket="qa-s3-listparts", Key="big.bin")
+    uid = mpu["UploadId"]
+    p1 = s3.upload_part(Bucket="qa-s3-listparts", Key="big.bin",
+                        UploadId=uid, PartNumber=1, Body=b"A" * 50)
+    p2 = s3.upload_part(Bucket="qa-s3-listparts", Key="big.bin",
+                        UploadId=uid, PartNumber=2, Body=b"B" * 50)
+    parts = s3.list_parts(Bucket="qa-s3-listparts", Key="big.bin", UploadId=uid)["Parts"]
+    assert len(parts) == 2
+    assert parts[0]["PartNumber"] == 1
+    assert parts[1]["PartNumber"] == 2
+    s3.complete_multipart_upload(
+        Bucket="qa-s3-listparts", Key="big.bin", UploadId=uid,
+        MultipartUpload={"Parts": [
+            {"PartNumber": 1, "ETag": p1["ETag"]},
+            {"PartNumber": 2, "ETag": p2["ETag"]},
+        ]},
+    )
+
+
+def test_s3_list_multipart_uploads(s3):
+    """ListMultipartUploads returns in-progress uploads."""
+    s3.create_bucket(Bucket="qa-s3-list-mpu")
+    uid1 = s3.create_multipart_upload(Bucket="qa-s3-list-mpu", Key="a.bin")["UploadId"]
+    uid2 = s3.create_multipart_upload(Bucket="qa-s3-list-mpu", Key="b.bin")["UploadId"]
+    resp = s3.list_multipart_uploads(Bucket="qa-s3-list-mpu")
+    upload_ids = {u["UploadId"] for u in resp.get("Uploads", [])}
+    assert uid1 in upload_ids
+    assert uid2 in upload_ids
+    s3.abort_multipart_upload(Bucket="qa-s3-list-mpu", Key="a.bin", UploadId=uid1)
+    s3.abort_multipart_upload(Bucket="qa-s3-list-mpu", Key="b.bin", UploadId=uid2)
+
+
+# ---------------------------------------------------------------------------
+# SQS — edge cases
+# ---------------------------------------------------------------------------
+
+def test_sqs_receive_max_10(sqs):
+    """ReceiveMessage with MaxNumberOfMessages > 10 is capped at 10."""
+    url = sqs.create_queue(QueueName="qa-sqs-max10")["QueueUrl"]
+    for i in range(15):
+        sqs.send_message(QueueUrl=url, MessageBody=f"msg{i}")
+    msgs = sqs.receive_message(QueueUrl=url, MaxNumberOfMessages=15)
+    assert len(msgs.get("Messages", [])) <= 10
+
+
+def test_sqs_visibility_timeout_zero_makes_visible(sqs):
+    """ChangeMessageVisibility to 0 makes message immediately visible again."""
+    url = sqs.create_queue(QueueName="qa-sqs-vis0")["QueueUrl"]
+    sqs.send_message(QueueUrl=url, MessageBody="vis-test")
+    msgs = sqs.receive_message(QueueUrl=url, MaxNumberOfMessages=1, VisibilityTimeout=30)
+    rh = msgs["Messages"][0]["ReceiptHandle"]
+    sqs.change_message_visibility(QueueUrl=url, ReceiptHandle=rh, VisibilityTimeout=0)
+    msgs2 = sqs.receive_message(QueueUrl=url, MaxNumberOfMessages=1)
+    assert len(msgs2.get("Messages", [])) == 1
+
+
+def test_sqs_batch_delete_invalid_receipt_handle_in_failed(sqs):
+    """DeleteMessageBatch with invalid receipt handle puts entry in Failed."""
+    url = sqs.create_queue(QueueName="qa-sqs-batchdel-fail")["QueueUrl"]
+    resp = sqs.delete_message_batch(
+        QueueUrl=url,
+        Entries=[{"Id": "bad1", "ReceiptHandle": "totally-invalid-handle"}],
+    )
+    assert len(resp.get("Failed", [])) == 1
+    assert resp["Failed"][0]["Id"] == "bad1"
+    assert len(resp.get("Successful", [])) == 0
+
+
+def test_sqs_fifo_group_ordering(sqs):
+    """FIFO queue delivers messages in send order within a group."""
+    url = sqs.create_queue(
+        QueueName="qa-sqs-fifo-order.fifo",
+        Attributes={"FifoQueue": "true", "ContentBasedDeduplication": "true"},
+    )["QueueUrl"]
+    for i in range(3):
+        sqs.send_message(QueueUrl=url, MessageBody=f"msg{i}", MessageGroupId="g1")
+    msgs = sqs.receive_message(QueueUrl=url, MaxNumberOfMessages=1)
+    assert msgs["Messages"][0]["Body"] == "msg0"
+
+
+def test_sqs_approximate_message_count(sqs):
+    """ApproximateNumberOfMessages reflects messages in queue."""
+    url = sqs.create_queue(QueueName="qa-sqs-count")["QueueUrl"]
+    for i in range(5):
+        sqs.send_message(QueueUrl=url, MessageBody=f"m{i}")
+    attrs = sqs.get_queue_attributes(QueueUrl=url, AttributeNames=["ApproximateNumberOfMessages"])
+    count = int(attrs["Attributes"]["ApproximateNumberOfMessages"])
+    assert count == 5
+
+
+def test_sqs_purge_empties_queue(sqs):
+    """PurgeQueue removes all messages."""
+    url = sqs.create_queue(QueueName="qa-sqs-purge2")["QueueUrl"]
+    for i in range(5):
+        sqs.send_message(QueueUrl=url, MessageBody=f"m{i}")
+    sqs.purge_queue(QueueUrl=url)
+    msgs = sqs.receive_message(QueueUrl=url, MaxNumberOfMessages=10, WaitTimeSeconds=0)
+    assert len(msgs.get("Messages", [])) == 0
+
+
+# ---------------------------------------------------------------------------
+# SNS — edge cases
+# ---------------------------------------------------------------------------
+
+def test_sns_filter_policy_blocks_non_matching(sns, sqs):
+    """SNS filter policy prevents delivery when message attributes don't match."""
+    topic_arn = sns.create_topic(Name="qa-sns-filter")["TopicArn"]
+    q_url = sqs.create_queue(QueueName="qa-sns-filter-q")["QueueUrl"]
+    q_arn = sqs.get_queue_attributes(
+        QueueUrl=q_url, AttributeNames=["QueueArn"]
+    )["Attributes"]["QueueArn"]
+    sub_arn = sns.subscribe(
+        TopicArn=topic_arn, Protocol="sqs", Endpoint=q_arn
+    )["SubscriptionArn"]
+    sns.set_subscription_attributes(
+        SubscriptionArn=sub_arn,
+        AttributeName="FilterPolicy",
+        AttributeValue=json.dumps({"color": ["blue"]}),
+    )
+    sns.publish(
+        TopicArn=topic_arn, Message="red message",
+        MessageAttributes={"color": {"DataType": "String", "StringValue": "red"}},
+    )
+    msgs = sqs.receive_message(QueueUrl=q_url, MaxNumberOfMessages=1, WaitTimeSeconds=0)
+    assert len(msgs.get("Messages", [])) == 0, "Filtered message must not be delivered"
+    sns.publish(
+        TopicArn=topic_arn, Message="blue message",
+        MessageAttributes={"color": {"DataType": "String", "StringValue": "blue"}},
+    )
+    msgs2 = sqs.receive_message(QueueUrl=q_url, MaxNumberOfMessages=1, WaitTimeSeconds=1)
+    assert len(msgs2.get("Messages", [])) == 1
+    body = json.loads(msgs2["Messages"][0]["Body"])
+    assert body["Message"] == "blue message"
+
+
+def test_sns_raw_message_delivery(sns, sqs):
+    """RawMessageDelivery=true delivers raw message body, not SNS envelope."""
+    topic_arn = sns.create_topic(Name="qa-sns-raw")["TopicArn"]
+    q_url = sqs.create_queue(QueueName="qa-sns-raw-q")["QueueUrl"]
+    q_arn = sqs.get_queue_attributes(
+        QueueUrl=q_url, AttributeNames=["QueueArn"]
+    )["Attributes"]["QueueArn"]
+    sub_arn = sns.subscribe(
+        TopicArn=topic_arn, Protocol="sqs", Endpoint=q_arn
+    )["SubscriptionArn"]
+    sns.set_subscription_attributes(
+        SubscriptionArn=sub_arn,
+        AttributeName="RawMessageDelivery",
+        AttributeValue="true",
+    )
+    sns.publish(TopicArn=topic_arn, Message="raw-body")
+    msgs = sqs.receive_message(QueueUrl=q_url, MaxNumberOfMessages=1, WaitTimeSeconds=1)
+    assert len(msgs["Messages"]) == 1
+    assert msgs["Messages"][0]["Body"] == "raw-body"
+
+
+def test_sns_publish_batch_distinct_ids(sns):
+    """PublishBatch with duplicate IDs must fail with BatchEntryIdsNotDistinct."""
+    arn = sns.create_topic(Name="qa-sns-batch-dup")["TopicArn"]
+    with pytest.raises(ClientError) as exc:
+        sns.publish_batch(
+            TopicArn=arn,
+            PublishBatchRequestEntries=[
+                {"Id": "same", "Message": "msg1"},
+                {"Id": "same", "Message": "msg2"},
+            ],
+        )
+    assert exc.value.response["Error"]["Code"] == "BatchEntryIdsNotDistinct"
+
+
+# ---------------------------------------------------------------------------
+# LAMBDA — edge cases
+# ---------------------------------------------------------------------------
+
+def test_lambda_alias_crud(lam):
+    """CreateAlias, GetAlias, UpdateAlias, DeleteAlias."""
+    code = _zip_lambda("def handler(e,c): return {'v': 1}")
+    lam.create_function(
+        FunctionName="qa-lam-alias",
+        Runtime="python3.9",
+        Role="arn:aws:iam::000000000000:role/r",
+        Handler="index.handler",
+        Code={"ZipFile": code},
+    )
+    lam.publish_version(FunctionName="qa-lam-alias")
+    lam.create_alias(
+        FunctionName="qa-lam-alias",
+        Name="prod",
+        FunctionVersion="1",
+        Description="production alias",
+    )
+    alias = lam.get_alias(FunctionName="qa-lam-alias", Name="prod")
+    assert alias["Name"] == "prod"
+    assert alias["FunctionVersion"] == "1"
+    lam.update_alias(FunctionName="qa-lam-alias", Name="prod", Description="updated")
+    alias2 = lam.get_alias(FunctionName="qa-lam-alias", Name="prod")
+    assert alias2["Description"] == "updated"
+    aliases = lam.list_aliases(FunctionName="qa-lam-alias")["Aliases"]
+    assert any(a["Name"] == "prod" for a in aliases)
+    lam.delete_alias(FunctionName="qa-lam-alias", Name="prod")
+    aliases2 = lam.list_aliases(FunctionName="qa-lam-alias")["Aliases"]
+    assert not any(a["Name"] == "prod" for a in aliases2)
+
+
+def test_lambda_publish_version(lam):
+    """PublishVersion creates a numbered version snapshot."""
+    code = _zip_lambda("def handler(e,c): return 'v1'")
+    lam.create_function(
+        FunctionName="qa-lam-version",
+        Runtime="python3.9",
+        Role="arn:aws:iam::000000000000:role/r",
+        Handler="index.handler",
+        Code={"ZipFile": code},
+    )
+    ver = lam.publish_version(FunctionName="qa-lam-version")
+    assert ver["Version"] == "1"
+    versions = lam.list_versions_by_function(FunctionName="qa-lam-version")["Versions"]
+    version_nums = [v["Version"] for v in versions]
+    assert "1" in version_nums
+    assert "$LATEST" in version_nums
+
+
+def test_lambda_function_concurrency(lam):
+    """PutFunctionConcurrency / GetFunctionConcurrency / DeleteFunctionConcurrency."""
+    code = _zip_lambda("def handler(e,c): return {}")
+    lam.create_function(
+        FunctionName="qa-lam-concurrency",
+        Runtime="python3.9",
+        Role="arn:aws:iam::000000000000:role/r",
+        Handler="index.handler",
+        Code={"ZipFile": code},
+    )
+    lam.put_function_concurrency(
+        FunctionName="qa-lam-concurrency",
+        ReservedConcurrentExecutions=5,
+    )
+    resp = lam.get_function_concurrency(FunctionName="qa-lam-concurrency")
+    assert resp["ReservedConcurrentExecutions"] == 5
+    lam.delete_function_concurrency(FunctionName="qa-lam-concurrency")
+    resp2 = lam.get_function_concurrency(FunctionName="qa-lam-concurrency")
+    assert resp2.get("ReservedConcurrentExecutions") is None
+
+
+def test_lambda_add_remove_permission(lam):
+    """AddPermission / RemovePermission / GetPolicy."""
+    code = _zip_lambda("def handler(e,c): return {}")
+    lam.create_function(
+        FunctionName="qa-lam-policy",
+        Runtime="python3.9",
+        Role="arn:aws:iam::000000000000:role/r",
+        Handler="index.handler",
+        Code={"ZipFile": code},
+    )
+    lam.add_permission(
+        FunctionName="qa-lam-policy",
+        StatementId="allow-s3",
+        Action="lambda:InvokeFunction",
+        Principal="s3.amazonaws.com",
+    )
+    policy = json.loads(lam.get_policy(FunctionName="qa-lam-policy")["Policy"])
+    assert any(s["Sid"] == "allow-s3" for s in policy["Statement"])
+    lam.remove_permission(FunctionName="qa-lam-policy", StatementId="allow-s3")
+    policy2 = json.loads(lam.get_policy(FunctionName="qa-lam-policy")["Policy"])
+    assert not any(s["Sid"] == "allow-s3" for s in policy2["Statement"])
+
+
+def test_lambda_list_functions_pagination(lam):
+    """ListFunctions pagination with Marker works correctly."""
+    for i in range(5):
+        code = _zip_lambda("def handler(e,c): return {}")
+        try:
+            lam.create_function(
+                FunctionName=f"qa-lam-page-{i}",
+                Runtime="python3.9",
+                Role="arn:aws:iam::000000000000:role/r",
+                Handler="index.handler",
+                Code={"ZipFile": code},
+            )
+        except ClientError:
+            pass
+    resp1 = lam.list_functions(MaxItems=2)
+    assert len(resp1["Functions"]) <= 2
+    if "NextMarker" in resp1:
+        resp2 = lam.list_functions(MaxItems=2, Marker=resp1["NextMarker"])
+        names1 = {f["FunctionName"] for f in resp1["Functions"]}
+        names2 = {f["FunctionName"] for f in resp2["Functions"]}
+        assert not names1 & names2
+
+
+def test_lambda_invoke_event_type_returns_202(lam):
+    """Invoke with InvocationType=Event returns 202 immediately."""
+    code = _zip_lambda("def handler(e,c): return {}")
+    try:
+        lam.create_function(
+            FunctionName="qa-lam-event-invoke",
+            Runtime="python3.9",
+            Role="arn:aws:iam::000000000000:role/r",
+            Handler="index.handler",
+            Code={"ZipFile": code},
+        )
+    except ClientError:
+        pass
+    resp = lam.invoke(
+        FunctionName="qa-lam-event-invoke",
+        InvocationType="Event",
+        Payload=json.dumps({}),
+    )
+    assert resp["StatusCode"] == 202
+
+
+def test_lambda_invoke_dry_run_returns_204(lam):
+    """Invoke with InvocationType=DryRun returns 204."""
+    code = _zip_lambda("def handler(e,c): return {}")
+    try:
+        lam.create_function(
+            FunctionName="qa-lam-dryrun",
+            Runtime="python3.9",
+            Role="arn:aws:iam::000000000000:role/r",
+            Handler="index.handler",
+            Code={"ZipFile": code},
+        )
+    except ClientError:
+        pass
+    resp = lam.invoke(
+        FunctionName="qa-lam-dryrun",
+        InvocationType="DryRun",
+        Payload=json.dumps({}),
+    )
+    assert resp["StatusCode"] == 204
+
+
+# ---------------------------------------------------------------------------
+# IAM — edge cases
+# ---------------------------------------------------------------------------
+
+def test_iam_policy_version_crud(iam):
+    """CreatePolicyVersion, GetPolicyVersion, ListPolicyVersions, DeletePolicyVersion."""
+    doc1 = json.dumps({"Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Action": "s3:*", "Resource": "*"}]})
+    doc2 = json.dumps({"Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Action": "sqs:*", "Resource": "*"}]})
+    arn = iam.create_policy(PolicyName="qa-iam-versions", PolicyDocument=doc1)["Policy"]["Arn"]
+    iam.create_policy_version(PolicyArn=arn, PolicyDocument=doc2, SetAsDefault=True)
+    versions = iam.list_policy_versions(PolicyArn=arn)["Versions"]
+    assert len(versions) == 2
+    default = next(v for v in versions if v["IsDefaultVersion"])
+    assert default["VersionId"] == "v2"
+    v1 = iam.get_policy_version(PolicyArn=arn, VersionId="v1")["PolicyVersion"]
+    assert v1["IsDefaultVersion"] is False
+    iam.delete_policy_version(PolicyArn=arn, VersionId="v1")
+    versions2 = iam.list_policy_versions(PolicyArn=arn)["Versions"]
+    assert len(versions2) == 1
+
+
+def test_iam_inline_user_policy(iam):
+    """PutUserPolicy / GetUserPolicy / ListUserPolicies / DeleteUserPolicy."""
+    iam.create_user(UserName="qa-iam-inline-user")
+    doc = json.dumps({"Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Action": "s3:GetObject", "Resource": "*"}]})
+    iam.put_user_policy(UserName="qa-iam-inline-user", PolicyName="qa-inline", PolicyDocument=doc)
+    policies = iam.list_user_policies(UserName="qa-iam-inline-user")["PolicyNames"]
+    assert "qa-inline" in policies
+    got = iam.get_user_policy(UserName="qa-iam-inline-user", PolicyName="qa-inline")
+    # boto3 deserialises PolicyDocument as a dict
+    assert "s3:GetObject" in json.dumps(got["PolicyDocument"])
+    iam.delete_user_policy(UserName="qa-iam-inline-user", PolicyName="qa-inline")
+    policies2 = iam.list_user_policies(UserName="qa-iam-inline-user")["PolicyNames"]
+    assert "qa-inline" not in policies2
+
+
+def test_iam_instance_profile_crud(iam):
+    """CreateInstanceProfile, AddRoleToInstanceProfile, GetInstanceProfile, ListInstanceProfiles."""
+    iam.create_role(
+        RoleName="qa-iam-ip-role",
+        AssumeRolePolicyDocument=json.dumps({"Version": "2012-10-17", "Statement": []}),
+    )
+    iam.create_instance_profile(InstanceProfileName="qa-iam-ip")
+    iam.add_role_to_instance_profile(InstanceProfileName="qa-iam-ip", RoleName="qa-iam-ip-role")
+    ip = iam.get_instance_profile(InstanceProfileName="qa-iam-ip")["InstanceProfile"]
+    assert ip["InstanceProfileName"] == "qa-iam-ip"
+    assert any(r["RoleName"] == "qa-iam-ip-role" for r in ip["Roles"])
+    profiles = iam.list_instance_profiles()["InstanceProfiles"]
+    assert any(p["InstanceProfileName"] == "qa-iam-ip" for p in profiles)
+    iam.remove_role_from_instance_profile(InstanceProfileName="qa-iam-ip", RoleName="qa-iam-ip-role")
+    iam.delete_instance_profile(InstanceProfileName="qa-iam-ip")
+
+
+def test_iam_attach_detach_user_policy(iam):
+    """AttachUserPolicy / DetachUserPolicy / ListAttachedUserPolicies."""
+    iam.create_user(UserName="qa-iam-attach-user")
+    doc = json.dumps({"Version": "2012-10-17", "Statement": []})
+    policy_arn = iam.create_policy(PolicyName="qa-iam-attach-pol", PolicyDocument=doc)["Policy"]["Arn"]
+    iam.attach_user_policy(UserName="qa-iam-attach-user", PolicyArn=policy_arn)
+    attached = iam.list_attached_user_policies(UserName="qa-iam-attach-user")["AttachedPolicies"]
+    assert any(p["PolicyArn"] == policy_arn for p in attached)
+    iam.detach_user_policy(UserName="qa-iam-attach-user", PolicyArn=policy_arn)
+    attached2 = iam.list_attached_user_policies(UserName="qa-iam-attach-user")["AttachedPolicies"]
+    assert not any(p["PolicyArn"] == policy_arn for p in attached2)
+
+
+# ---------------------------------------------------------------------------
+# SECRETS MANAGER — edge cases
+# ---------------------------------------------------------------------------
+
+def test_sm_put_secret_value_stages(sm):
+    """PutSecretValue stages manage AWSCURRENT/AWSPREVIOUS correctly."""
+    sm.create_secret(Name="qa-sm-stages", SecretString="v1")
+    sm.put_secret_value(SecretId="qa-sm-stages", SecretString="v2")
+    sm.put_secret_value(SecretId="qa-sm-stages", SecretString="v3")
+    current = sm.get_secret_value(SecretId="qa-sm-stages", VersionStage="AWSCURRENT")
+    assert current["SecretString"] == "v3"
+    previous = sm.get_secret_value(SecretId="qa-sm-stages", VersionStage="AWSPREVIOUS")
+    assert previous["SecretString"] == "v2"
+
+
+def test_sm_list_secret_version_ids(sm):
+    """ListSecretVersionIds returns all versions."""
+    sm.create_secret(Name="qa-sm-versions", SecretString="initial")
+    sm.put_secret_value(SecretId="qa-sm-versions", SecretString="second")
+    resp = sm.list_secret_version_ids(SecretId="qa-sm-versions")
+    assert len(resp["Versions"]) >= 2
+
+
+def test_sm_delete_and_restore(sm):
+    """DeleteSecret schedules deletion; RestoreSecret cancels it."""
+    sm.create_secret(Name="qa-sm-restore", SecretString="data")
+    sm.delete_secret(SecretId="qa-sm-restore", RecoveryWindowInDays=7)
+    with pytest.raises(ClientError) as exc:
+        sm.get_secret_value(SecretId="qa-sm-restore")
+    assert exc.value.response["Error"]["Code"] == "InvalidRequestException"
+    sm.restore_secret(SecretId="qa-sm-restore")
+    val = sm.get_secret_value(SecretId="qa-sm-restore")
+    assert val["SecretString"] == "data"
+
+
+def test_sm_get_random_password(sm):
+    """GetRandomPassword returns a password of the requested length."""
+    resp = sm.get_random_password(PasswordLength=24, ExcludeNumbers=True)
+    pwd = resp["RandomPassword"]
+    assert len(pwd) == 24
+    assert not any(c.isdigit() for c in pwd)
+
+
+# ---------------------------------------------------------------------------
+# SSM — edge cases
+# ---------------------------------------------------------------------------
+
+def test_ssm_get_parameter_history(ssm):
+    """GetParameterHistory returns all versions of a parameter."""
+    ssm.put_parameter(Name="/qa/ssm/hist", Value="v1", Type="String")
+    ssm.put_parameter(Name="/qa/ssm/hist", Value="v2", Type="String", Overwrite=True)
+    ssm.put_parameter(Name="/qa/ssm/hist", Value="v3", Type="String", Overwrite=True)
+    history = ssm.get_parameter_history(Name="/qa/ssm/hist")["Parameters"]
+    assert len(history) == 3
+    values = [h["Value"] for h in history]
+    assert "v1" in values and "v2" in values and "v3" in values
+
+
+def test_ssm_describe_parameters_filter(ssm):
+    """DescribeParameters with ParameterFilters filters by path prefix."""
+    ssm.put_parameter(Name="/qa/ssm/filter/a", Value="1", Type="String")
+    ssm.put_parameter(Name="/qa/ssm/filter/b", Value="2", Type="String")
+    ssm.put_parameter(Name="/qa/ssm/other/c", Value="3", Type="String")
+    resp = ssm.describe_parameters(
+        ParameterFilters=[{"Key": "Path", "Values": ["/qa/ssm/filter"]}]
+    )
+    names = [p["Name"] for p in resp["Parameters"]]
+    assert "/qa/ssm/filter/a" in names
+    assert "/qa/ssm/filter/b" in names
+    assert "/qa/ssm/other/c" not in names
+
+
+def test_ssm_secure_string_not_decrypted_by_default(ssm):
+    """SecureString value is not returned in plaintext without WithDecryption=True."""
+    ssm.put_parameter(Name="/qa/ssm/secure", Value="mysecret", Type="SecureString")
+    resp = ssm.get_parameter(Name="/qa/ssm/secure", WithDecryption=False)
+    assert resp["Parameter"]["Value"] != "mysecret"
+    resp2 = ssm.get_parameter(Name="/qa/ssm/secure", WithDecryption=True)
+    assert resp2["Parameter"]["Value"] == "mysecret"
+
+
+# ---------------------------------------------------------------------------
+# EVENTBRIDGE — edge cases
+# ---------------------------------------------------------------------------
+
+def test_eb_content_filter_prefix(eb, sqs):
+    """EventBridge prefix content filter matches events correctly."""
+    bus_name = "qa-eb-prefix-bus"
+    eb.create_event_bus(Name=bus_name)
+    q_url = sqs.create_queue(QueueName="qa-eb-prefix-q")["QueueUrl"]
+    q_arn = sqs.get_queue_attributes(QueueUrl=q_url, AttributeNames=["QueueArn"])["Attributes"]["QueueArn"]
+    eb.put_rule(
+        Name="qa-eb-prefix-rule", EventBusName=bus_name,
+        EventPattern=json.dumps({"source": ["myapp"], "detail": {"env": [{"prefix": "prod"}]}}),
+        State="ENABLED",
+    )
+    eb.put_targets(Rule="qa-eb-prefix-rule", EventBusName=bus_name,
+                   Targets=[{"Id": "t1", "Arn": q_arn}])
+    eb.put_events(Entries=[{
+        "Source": "myapp", "DetailType": "test",
+        "Detail": json.dumps({"env": "production"}), "EventBusName": bus_name,
+    }])
+    msgs = sqs.receive_message(QueueUrl=q_url, MaxNumberOfMessages=1, WaitTimeSeconds=1)
+    assert len(msgs.get("Messages", [])) == 1
+    eb.put_events(Entries=[{
+        "Source": "myapp", "DetailType": "test",
+        "Detail": json.dumps({"env": "staging"}), "EventBusName": bus_name,
+    }])
+    msgs2 = sqs.receive_message(QueueUrl=q_url, MaxNumberOfMessages=1, WaitTimeSeconds=0)
+    assert len(msgs2.get("Messages", [])) == 0
+
+
+def test_eb_anything_but_filter(eb, sqs):
+    """EventBridge anything-but filter excludes specified values."""
+    bus_name = "qa-eb-anybut-bus"
+    eb.create_event_bus(Name=bus_name)
+    q_url = sqs.create_queue(QueueName="qa-eb-anybut-q")["QueueUrl"]
+    q_arn = sqs.get_queue_attributes(QueueUrl=q_url, AttributeNames=["QueueArn"])["Attributes"]["QueueArn"]
+    eb.put_rule(
+        Name="qa-eb-anybut-rule", EventBusName=bus_name,
+        EventPattern=json.dumps({"source": ["myapp"], "detail": {"status": [{"anything-but": ["error", "failed"]}]}}),
+        State="ENABLED",
+    )
+    eb.put_targets(Rule="qa-eb-anybut-rule", EventBusName=bus_name,
+                   Targets=[{"Id": "t1", "Arn": q_arn}])
+    eb.put_events(Entries=[{
+        "Source": "myapp", "DetailType": "t",
+        "Detail": json.dumps({"status": "success"}), "EventBusName": bus_name,
+    }])
+    msgs = sqs.receive_message(QueueUrl=q_url, MaxNumberOfMessages=1, WaitTimeSeconds=1)
+    assert len(msgs.get("Messages", [])) == 1
+    eb.put_events(Entries=[{
+        "Source": "myapp", "DetailType": "t",
+        "Detail": json.dumps({"status": "error"}), "EventBusName": bus_name,
+    }])
+    msgs2 = sqs.receive_message(QueueUrl=q_url, MaxNumberOfMessages=1, WaitTimeSeconds=0)
+    assert len(msgs2.get("Messages", [])) == 0
+
+
+def test_eb_input_transformer(eb, sqs):
+    """InputTransformer rewrites event payload before delivery."""
+    bus_name = "qa-eb-transform-bus"
+    eb.create_event_bus(Name=bus_name)
+    q_url = sqs.create_queue(QueueName="qa-eb-transform-q")["QueueUrl"]
+    q_arn = sqs.get_queue_attributes(QueueUrl=q_url, AttributeNames=["QueueArn"])["Attributes"]["QueueArn"]
+    eb.put_rule(
+        Name="qa-eb-transform-rule", EventBusName=bus_name,
+        EventPattern=json.dumps({"source": ["myapp"]}), State="ENABLED",
+    )
+    eb.put_targets(
+        Rule="qa-eb-transform-rule", EventBusName=bus_name,
+        Targets=[{"Id": "t1", "Arn": q_arn, "InputTransformer": {
+            "InputPathsMap": {"src": "$.source"},
+            "InputTemplate": '{"transformed": "<src>"}',
+        }}],
+    )
+    eb.put_events(Entries=[{
+        "Source": "myapp", "DetailType": "t", "Detail": "{}", "EventBusName": bus_name,
+    }])
+    msgs = sqs.receive_message(QueueUrl=q_url, MaxNumberOfMessages=1, WaitTimeSeconds=1)
+    assert len(msgs.get("Messages", [])) == 1
+    body = json.loads(msgs["Messages"][0]["Body"])
+    assert body.get("transformed") == "myapp"
+
+
+# ---------------------------------------------------------------------------
+# KINESIS — edge cases
+# ---------------------------------------------------------------------------
+
+def test_kinesis_at_timestamp_iterator(kin):
+    """AT_TIMESTAMP shard iterator returns records after the given timestamp."""
+    kin.create_stream(StreamName="qa-kin-ts", ShardCount=1)
+    time.sleep(0.1)
+    before = time.time()
+    kin.put_record(StreamName="qa-kin-ts", Data=b"after-ts", PartitionKey="pk")
+    shards = kin.describe_stream(StreamName="qa-kin-ts")["StreamDescription"]["Shards"]
+    shard_id = shards[0]["ShardId"]
+    it = kin.get_shard_iterator(
+        StreamName="qa-kin-ts", ShardId=shard_id,
+        ShardIteratorType="AT_TIMESTAMP", Timestamp=before,
+    )["ShardIterator"]
+    records = kin.get_records(ShardIterator=it, Limit=10)["Records"]
+    assert len(records) >= 1
+    assert any(r["Data"] == b"after-ts" for r in records)
+
+
+def test_kinesis_retention_period(kin):
+    """IncreaseStreamRetentionPeriod / DecreaseStreamRetentionPeriod."""
+    kin.create_stream(StreamName="qa-kin-retention", ShardCount=1)
+    kin.increase_stream_retention_period(StreamName="qa-kin-retention", RetentionPeriodHours=48)
+    desc = kin.describe_stream(StreamName="qa-kin-retention")["StreamDescription"]
+    assert desc["RetentionPeriodHours"] == 48
+    kin.decrease_stream_retention_period(StreamName="qa-kin-retention", RetentionPeriodHours=24)
+    desc2 = kin.describe_stream(StreamName="qa-kin-retention")["StreamDescription"]
+    assert desc2["RetentionPeriodHours"] == 24
+
+
+def test_kinesis_stream_encryption(kin):
+    """StartStreamEncryption / StopStreamEncryption."""
+    kin.create_stream(StreamName="qa-kin-enc", ShardCount=1)
+    kin.start_stream_encryption(
+        StreamName="qa-kin-enc", EncryptionType="KMS", KeyId="alias/aws/kinesis",
+    )
+    desc = kin.describe_stream(StreamName="qa-kin-enc")["StreamDescription"]
+    assert desc["EncryptionType"] == "KMS"
+    kin.stop_stream_encryption(
+        StreamName="qa-kin-enc", EncryptionType="KMS", KeyId="alias/aws/kinesis",
+    )
+    desc2 = kin.describe_stream(StreamName="qa-kin-enc")["StreamDescription"]
+    assert desc2["EncryptionType"] == "NONE"
+
+
+# ---------------------------------------------------------------------------
+# STEP FUNCTIONS — edge cases
+# ---------------------------------------------------------------------------
+
+def test_sfn_choice_state(sfn):
+    """Choice state routes to correct branch based on input."""
+    definition = json.dumps({
+        "StartAt": "Check",
+        "States": {
+            "Check": {
+                "Type": "Choice",
+                "Choices": [
+                    {"Variable": "$.value", "NumericGreaterThan": 10, "Next": "High"},
+                    {"Variable": "$.value", "NumericLessThanEquals": 10, "Next": "Low"},
+                ],
+            },
+            "High": {"Type": "Pass", "Result": {"result": "high"}, "End": True},
+            "Low": {"Type": "Pass", "Result": {"result": "low"}, "End": True},
+        },
+    })
+    arn = sfn.create_state_machine(
+        name="qa-sfn-choice", definition=definition,
+        roleArn="arn:aws:iam::000000000000:role/r",
+    )["stateMachineArn"]
+    exec_arn = sfn.start_execution(stateMachineArn=arn, input=json.dumps({"value": 15}))["executionArn"]
+    time.sleep(0.5)
+    desc = sfn.describe_execution(executionArn=exec_arn)
+    assert desc["status"] == "SUCCEEDED"
+    assert json.loads(desc["output"])["result"] == "high"
+    exec_arn2 = sfn.start_execution(stateMachineArn=arn, input=json.dumps({"value": 5}))["executionArn"]
+    time.sleep(0.5)
+    desc2 = sfn.describe_execution(executionArn=exec_arn2)
+    assert desc2["status"] == "SUCCEEDED"
+    assert json.loads(desc2["output"])["result"] == "low"
+
+
+def test_sfn_pass_state_result(sfn):
+    """Pass state with Result injects static data into output."""
+    definition = json.dumps({
+        "StartAt": "Inject",
+        "States": {"Inject": {"Type": "Pass", "Result": {"injected": True, "count": 42}, "End": True}},
+    })
+    arn = sfn.create_state_machine(
+        name="qa-sfn-pass-result", definition=definition,
+        roleArn="arn:aws:iam::000000000000:role/r",
+    )["stateMachineArn"]
+    exec_arn = sfn.start_execution(stateMachineArn=arn, input="{}")["executionArn"]
+    time.sleep(0.5)
+    desc = sfn.describe_execution(executionArn=exec_arn)
+    assert desc["status"] == "SUCCEEDED"
+    output = json.loads(desc["output"])
+    assert output["injected"] is True
+    assert output["count"] == 42
+
+
+def test_sfn_fail_state(sfn):
+    """Fail state transitions execution to FAILED."""
+    definition = json.dumps({
+        "StartAt": "Boom",
+        "States": {"Boom": {"Type": "Fail", "Error": "CustomError", "Cause": "Something went wrong"}},
+    })
+    arn = sfn.create_state_machine(
+        name="qa-sfn-fail", definition=definition,
+        roleArn="arn:aws:iam::000000000000:role/r",
+    )["stateMachineArn"]
+    exec_arn = sfn.start_execution(stateMachineArn=arn, input="{}")["executionArn"]
+    time.sleep(0.5)
+    desc = sfn.describe_execution(executionArn=exec_arn)
+    assert desc["status"] == "FAILED"
+
+
+def test_sfn_stop_execution(sfn):
+    """StopExecution transitions a RUNNING execution to ABORTED."""
+    definition = json.dumps({
+        "StartAt": "Wait",
+        "States": {"Wait": {"Type": "Wait", "Seconds": 60, "End": True}},
+    })
+    arn = sfn.create_state_machine(
+        name="qa-sfn-stop", definition=definition,
+        roleArn="arn:aws:iam::000000000000:role/r",
+    )["stateMachineArn"]
+    exec_arn = sfn.start_execution(stateMachineArn=arn, input="{}")["executionArn"]
+    time.sleep(0.2)
+    sfn.stop_execution(executionArn=exec_arn, cause="test stop")
+    desc = sfn.describe_execution(executionArn=exec_arn)
+    assert desc["status"] == "ABORTED"
+
+
+def test_sfn_list_executions_filter(sfn):
+    """ListExecutions with statusFilter returns only matching executions."""
+    definition = json.dumps({
+        "StartAt": "Done",
+        "States": {"Done": {"Type": "Succeed"}},
+    })
+    arn = sfn.create_state_machine(
+        name="qa-sfn-list-filter", definition=definition,
+        roleArn="arn:aws:iam::000000000000:role/r",
+    )["stateMachineArn"]
+    sfn.start_execution(stateMachineArn=arn, input="{}")
+    time.sleep(0.5)
+    succeeded = sfn.list_executions(stateMachineArn=arn, statusFilter="SUCCEEDED")["executions"]
+    assert all(e["status"] == "SUCCEEDED" for e in succeeded)
+
+
+# ---------------------------------------------------------------------------
+# CLOUDWATCH — edge cases
+# ---------------------------------------------------------------------------
+
+def test_cw_get_metric_data_time_range(cw):
+    """GetMetricData respects StartTime/EndTime filtering."""
+    import datetime
+    now = datetime.datetime.utcnow()
+    past = now - datetime.timedelta(hours=2)
+    cw.put_metric_data(
+        Namespace="qa/cw",
+        MetricData=[{"MetricName": "Requests", "Value": 100.0, "Unit": "Count"}],
+    )
+    resp = cw.get_metric_data(
+        MetricDataQueries=[{"Id": "m1", "MetricStat": {
+            "Metric": {"Namespace": "qa/cw", "MetricName": "Requests"},
+            "Period": 60, "Stat": "Sum",
+        }}],
+        StartTime=past,
+        EndTime=now + datetime.timedelta(minutes=5),
+    )
+    result = next((r for r in resp["MetricDataResults"] if r["Id"] == "m1"), None)
+    assert result is not None
+    assert result["StatusCode"] == "Complete"
+    assert len(result["Values"]) >= 1
+    assert sum(result["Values"]) >= 100.0
+
+
+def test_cw_alarm_state_transitions(cw):
+    """SetAlarmState changes alarm state correctly."""
+    cw.put_metric_alarm(
+        AlarmName="qa-cw-state-alarm", MetricName="Errors", Namespace="qa/cw",
+        Statistic="Sum", Period=60, EvaluationPeriods=1, Threshold=10.0,
+        ComparisonOperator="GreaterThanThreshold",
+    )
+    cw.set_alarm_state(AlarmName="qa-cw-state-alarm", StateValue="ALARM", StateReason="Testing")
+    alarms = cw.describe_alarms(AlarmNames=["qa-cw-state-alarm"])["MetricAlarms"]
+    assert alarms[0]["StateValue"] == "ALARM"
+    cw.set_alarm_state(AlarmName="qa-cw-state-alarm", StateValue="OK", StateReason="Resolved")
+    alarms2 = cw.describe_alarms(AlarmNames=["qa-cw-state-alarm"])["MetricAlarms"]
+    assert alarms2[0]["StateValue"] == "OK"
+
+
+def test_cw_list_metrics_namespace_filter(cw):
+    """ListMetrics with Namespace filter returns only matching metrics."""
+    cw.put_metric_data(Namespace="qa/ns-a", MetricData=[{"MetricName": "MetA", "Value": 1.0}])
+    cw.put_metric_data(Namespace="qa/ns-b", MetricData=[{"MetricName": "MetB", "Value": 1.0}])
+    resp = cw.list_metrics(Namespace="qa/ns-a")
+    names = [m["MetricName"] for m in resp["Metrics"]]
+    assert "MetA" in names
+    assert "MetB" not in names
+
+
+def test_cw_put_metric_data_statistics_values(cw):
+    """PutMetricData with Values/Counts array stores multiple data points."""
+    cw.put_metric_data(
+        Namespace="qa/cw-multi",
+        MetricData=[{"MetricName": "Latency", "Values": [10.0, 20.0, 30.0],
+                     "Counts": [1.0, 2.0, 1.0], "Unit": "Milliseconds"}],
+    )
+    resp = cw.list_metrics(Namespace="qa/cw-multi")
+    assert any(m["MetricName"] == "Latency" for m in resp["Metrics"])
+
+
+# ---------------------------------------------------------------------------
+# CLOUDWATCH LOGS — edge cases
+# ---------------------------------------------------------------------------
+
+def test_logs_filter_with_wildcard(logs):
+    """FilterLogEvents with wildcard pattern matches correctly."""
+    logs.create_log_group(logGroupName="/qa/logs/wildcard")
+    logs.create_log_stream(logGroupName="/qa/logs/wildcard", logStreamName="stream1")
+    logs.put_log_events(
+        logGroupName="/qa/logs/wildcard", logStreamName="stream1",
+        logEvents=[
+            {"timestamp": int(time.time() * 1000), "message": "ERROR: disk full"},
+            {"timestamp": int(time.time() * 1000), "message": "INFO: all good"},
+            {"timestamp": int(time.time() * 1000), "message": "ERROR: timeout"},
+        ],
+    )
+    resp = logs.filter_log_events(logGroupName="/qa/logs/wildcard", filterPattern="ERROR*")
+    messages = [e["message"] for e in resp["events"]]
+    assert all("ERROR" in m for m in messages)
+    assert len(messages) == 2
+
+
+def test_logs_describe_log_groups_prefix(logs):
+    """DescribeLogGroups with logGroupNamePrefix filters correctly."""
+    logs.create_log_group(logGroupName="/qa/logs/prefix/alpha")
+    logs.create_log_group(logGroupName="/qa/logs/prefix/beta")
+    logs.create_log_group(logGroupName="/qa/logs/other/gamma")
+    resp = logs.describe_log_groups(logGroupNamePrefix="/qa/logs/prefix")
+    names = [g["logGroupName"] for g in resp["logGroups"]]
+    assert "/qa/logs/prefix/alpha" in names
+    assert "/qa/logs/prefix/beta" in names
+    assert "/qa/logs/other/gamma" not in names
+
+
+def test_logs_retention_policy_invalid_value(logs):
+    """PutRetentionPolicy with invalid days raises InvalidParameterException."""
+    logs.create_log_group(logGroupName="/qa/logs/retention-invalid")
+    with pytest.raises(ClientError) as exc:
+        logs.put_retention_policy(logGroupName="/qa/logs/retention-invalid", retentionInDays=999)
+    assert exc.value.response["Error"]["Code"] == "InvalidParameterException"
+
+
+# ---------------------------------------------------------------------------
+# FIREHOSE — edge cases
+# ---------------------------------------------------------------------------
+
+def test_firehose_put_record_batch_failure_count(fh):
+    """PutRecordBatch with valid records returns FailedPutCount=0."""
+    fh.create_delivery_stream(
+        DeliveryStreamName="qa-fh-batch-fail",
+        ExtendedS3DestinationConfiguration={
+            "BucketARN": "arn:aws:s3:::qa-fh-bucket",
+            "RoleARN": "arn:aws:iam::000000000000:role/r",
+        },
+    )
+    resp = fh.put_record_batch(
+        DeliveryStreamName="qa-fh-batch-fail",
+        Records=[{"Data": "aGVsbG8="}, {"Data": "d29ybGQ="}],
+    )
+    assert resp["FailedPutCount"] == 0
+    assert len(resp["RequestResponses"]) == 2
+
+
+def test_firehose_update_destination_version_mismatch(fh):
+    """UpdateDestination with wrong version raises ConcurrentModificationException."""
+    fh.create_delivery_stream(
+        DeliveryStreamName="qa-fh-version-check",
+        ExtendedS3DestinationConfiguration={
+            "BucketARN": "arn:aws:s3:::qa-fh-bucket2",
+            "RoleARN": "arn:aws:iam::000000000000:role/r",
+        },
+    )
+    desc = fh.describe_delivery_stream(DeliveryStreamName="qa-fh-version-check")
+    dest_id = desc["DeliveryStreamDescription"]["Destinations"][0]["DestinationId"]
+    with pytest.raises(ClientError) as exc:
+        fh.update_destination(
+            DeliveryStreamName="qa-fh-version-check",
+            CurrentDeliveryStreamVersionId="999",
+            DestinationId=dest_id,
+            ExtendedS3DestinationUpdate={
+                "BucketARN": "arn:aws:s3:::qa-fh-bucket2-updated",
+                "RoleARN": "arn:aws:iam::000000000000:role/r",
+            },
+        )
+    assert exc.value.response["Error"]["Code"] == "ConcurrentModificationException"
+
+
+# ---------------------------------------------------------------------------
+# ROUTE53 — edge cases
+# ---------------------------------------------------------------------------
+
+def test_r53_delete_zone_with_records_fails(r53):
+    """DeleteHostedZone fails if non-default records exist."""
+    zone_id = r53.create_hosted_zone(
+        Name="qa-r53-nonempty.com.",
+        CallerReference=f"qa-nonempty-{int(time.time())}",
+    )["HostedZone"]["Id"].split("/")[-1]
+    r53.change_resource_record_sets(
+        HostedZoneId=zone_id,
+        ChangeBatch={"Changes": [{"Action": "CREATE", "ResourceRecordSet": {
+            "Name": "www.qa-r53-nonempty.com.", "Type": "A", "TTL": 300,
+            "ResourceRecords": [{"Value": "1.2.3.4"}],
+        }}]},
+    )
+    with pytest.raises(ClientError) as exc:
+        r53.delete_hosted_zone(Id=zone_id)
+    assert exc.value.response["Error"]["Code"] == "HostedZoneNotEmpty"
+
+
+def test_r53_upsert_is_idempotent(r53):
+    """UPSERT on existing record updates it without error."""
+    zone_id = r53.create_hosted_zone(
+        Name="qa-r53-upsert.com.",
+        CallerReference=f"qa-upsert-{int(time.time())}",
+    )["HostedZone"]["Id"].split("/")[-1]
+    for ip in ["1.1.1.1", "2.2.2.2"]:
+        r53.change_resource_record_sets(
+            HostedZoneId=zone_id,
+            ChangeBatch={"Changes": [{"Action": "UPSERT", "ResourceRecordSet": {
+                "Name": "api.qa-r53-upsert.com.", "Type": "A", "TTL": 60,
+                "ResourceRecords": [{"Value": ip}],
+            }}]},
+        )
+    records = r53.list_resource_record_sets(HostedZoneId=zone_id)["ResourceRecordSets"]
+    a_records = [r for r in records if r["Name"] == "api.qa-r53-upsert.com." and r["Type"] == "A"]
+    assert len(a_records) == 1
+    assert a_records[0]["ResourceRecords"][0]["Value"] == "2.2.2.2"
+
+
+def test_r53_create_record_duplicate_fails(r53):
+    """CREATE on existing record raises InvalidChangeBatch."""
+    zone_id = r53.create_hosted_zone(
+        Name="qa-r53-dup.com.",
+        CallerReference=f"qa-dup-{int(time.time())}",
+    )["HostedZone"]["Id"].split("/")[-1]
+    r53.change_resource_record_sets(
+        HostedZoneId=zone_id,
+        ChangeBatch={"Changes": [{"Action": "CREATE", "ResourceRecordSet": {
+            "Name": "dup.qa-r53-dup.com.", "Type": "A", "TTL": 60,
+            "ResourceRecords": [{"Value": "1.1.1.1"}],
+        }}]},
+    )
+    with pytest.raises(ClientError) as exc:
+        r53.change_resource_record_sets(
+            HostedZoneId=zone_id,
+            ChangeBatch={"Changes": [{"Action": "CREATE", "ResourceRecordSet": {
+                "Name": "dup.qa-r53-dup.com.", "Type": "A", "TTL": 60,
+                "ResourceRecords": [{"Value": "2.2.2.2"}],
+            }}]},
+        )
+    assert exc.value.response["Error"]["Code"] == "InvalidChangeBatch"
+
+
+# ---------------------------------------------------------------------------
+# API GATEWAY v2 — edge cases
+# ---------------------------------------------------------------------------
+
+def test_apigw_update_integration(apigw):
+    """UpdateIntegration changes integrationUri."""
+    api_id = apigw.create_api(Name="qa-apigw-update-integ", ProtocolType="HTTP")["ApiId"]
+    integ_id = apigw.create_integration(
+        ApiId=api_id, IntegrationType="AWS_PROXY",
+        IntegrationUri="arn:aws:lambda:us-east-1:000000000000:function:old-fn",
+    )["IntegrationId"]
+    apigw.update_integration(
+        ApiId=api_id, IntegrationId=integ_id,
+        IntegrationUri="arn:aws:lambda:us-east-1:000000000000:function:new-fn",
+    )
+    integ = apigw.get_integration(ApiId=api_id, IntegrationId=integ_id)
+    assert "new-fn" in integ["IntegrationUri"]
+
+
+def test_apigw_delete_route(apigw):
+    """DeleteRoute removes the route from GetRoutes."""
+    api_id = apigw.create_api(Name="qa-apigw-del-route", ProtocolType="HTTP")["ApiId"]
+    route_id = apigw.create_route(ApiId=api_id, RouteKey="GET /qa")["RouteId"]
+    apigw.delete_route(ApiId=api_id, RouteId=route_id)
+    routes = apigw.get_routes(ApiId=api_id)["Items"]
+    assert not any(r["RouteId"] == route_id for r in routes)
+
+
+def test_apigw_stage_variables(apigw):
+    """CreateStage with stageVariables stores and returns them."""
+    api_id = apigw.create_api(Name="qa-apigw-stage-vars", ProtocolType="HTTP")["ApiId"]
+    apigw.create_stage(
+        ApiId=api_id, StageName="dev",
+        StageVariables={"env": "development", "version": "1"},
+    )
+    stage = apigw.get_stage(ApiId=api_id, StageName="dev")
+    assert stage["StageVariables"]["env"] == "development"
+    assert stage["StageVariables"]["version"] == "1"
+
+
+# ---------------------------------------------------------------------------
+# API GATEWAY v1 — edge cases
+# ---------------------------------------------------------------------------
+
+def test_apigwv1_usage_plan_key_crud(apigw_v1):
+    """CreateUsagePlanKey / GetUsagePlanKeys / DeleteUsagePlanKey."""
+    api_key = apigw_v1.create_api_key(name="qa-v1-key", enabled=True)
+    key_id = api_key["id"]
+    plan = apigw_v1.create_usage_plan(
+        name="qa-v1-plan", throttle={"rateLimit": 100, "burstLimit": 200},
+    )
+    plan_id = plan["id"]
+    apigw_v1.create_usage_plan_key(usagePlanId=plan_id, keyId=key_id, keyType="API_KEY")
+    keys = apigw_v1.get_usage_plan_keys(usagePlanId=plan_id)["items"]
+    assert any(k["id"] == key_id for k in keys)
+    apigw_v1.delete_usage_plan_key(usagePlanId=plan_id, keyId=key_id)
+    keys2 = apigw_v1.get_usage_plan_keys(usagePlanId=plan_id)["items"]
+    assert not any(k["id"] == key_id for k in keys2)
+
+
+# ---------------------------------------------------------------------------
+# GLUE — edge cases
+# ---------------------------------------------------------------------------
+
+def test_glue_partition_crud(glue):
+    """CreatePartition / GetPartition / GetPartitions / DeletePartition."""
+    glue.create_database(DatabaseInput={"Name": "qa-glue-partdb"})
+    glue.create_table(
+        DatabaseName="qa-glue-partdb",
+        TableInput={
+            "Name": "qa-glue-parttbl",
+            "StorageDescriptor": {"Columns": [], "Location": "s3://bucket/key",
+                                  "InputFormat": "", "OutputFormat": "", "SerdeInfo": {}},
+            "PartitionKeys": [{"Name": "dt", "Type": "string"}],
+        },
+    )
+    glue.create_partition(
+        DatabaseName="qa-glue-partdb", TableName="qa-glue-parttbl",
+        PartitionInput={
+            "Values": ["2024-01-01"],
+            "StorageDescriptor": {"Columns": [], "Location": "s3://bucket/key/dt=2024-01-01",
+                                  "InputFormat": "", "OutputFormat": "", "SerdeInfo": {}},
+        },
+    )
+    part = glue.get_partition(
+        DatabaseName="qa-glue-partdb", TableName="qa-glue-parttbl",
+        PartitionValues=["2024-01-01"],
+    )["Partition"]
+    assert part["Values"] == ["2024-01-01"]
+    parts = glue.get_partitions(DatabaseName="qa-glue-partdb", TableName="qa-glue-parttbl")["Partitions"]
+    assert len(parts) == 1
+    glue.delete_partition(
+        DatabaseName="qa-glue-partdb", TableName="qa-glue-parttbl",
+        PartitionValues=["2024-01-01"],
+    )
+    parts2 = glue.get_partitions(DatabaseName="qa-glue-partdb", TableName="qa-glue-parttbl")["Partitions"]
+    assert len(parts2) == 0
+
+
+def test_glue_duplicate_partition_error(glue):
+    """CreatePartition with duplicate values raises AlreadyExistsException."""
+    glue.create_database(DatabaseInput={"Name": "qa-glue-duppartdb"})
+    glue.create_table(
+        DatabaseName="qa-glue-duppartdb",
+        TableInput={
+            "Name": "qa-glue-dupparttbl",
+            "StorageDescriptor": {"Columns": [], "Location": "s3://b/k",
+                                  "InputFormat": "", "OutputFormat": "", "SerdeInfo": {}},
+            "PartitionKeys": [{"Name": "dt", "Type": "string"}],
+        },
+    )
+    part_input = {
+        "Values": ["2024-01-01"],
+        "StorageDescriptor": {"Columns": [], "Location": "s3://b/k/dt=2024-01-01",
+                              "InputFormat": "", "OutputFormat": "", "SerdeInfo": {}},
+    }
+    glue.create_partition(DatabaseName="qa-glue-duppartdb", TableName="qa-glue-dupparttbl",
+                          PartitionInput=part_input)
+    with pytest.raises(ClientError) as exc:
+        glue.create_partition(DatabaseName="qa-glue-duppartdb", TableName="qa-glue-dupparttbl",
+                              PartitionInput=part_input)
+    assert exc.value.response["Error"]["Code"] == "AlreadyExistsException"
+
+
+# ---------------------------------------------------------------------------
+# ATHENA — edge cases
+# ---------------------------------------------------------------------------
+
+def test_athena_stop_query(athena):
+    """StopQueryExecution cancels a running query."""
+    resp = athena.start_query_execution(
+        QueryString="SELECT 1",
+        ResultConfiguration={"OutputLocation": "s3://qa-athena-results/"},
+    )
+    qid = resp["QueryExecutionId"]
+    athena.stop_query_execution(QueryExecutionId=qid)
+    desc = athena.get_query_execution(QueryExecutionId=qid)["QueryExecution"]
+    assert desc["Status"]["State"] in ("CANCELLED", "SUCCEEDED")
+
+
+def test_athena_prepared_statement_crud(athena):
+    """CreatePreparedStatement / GetPreparedStatement / DeletePreparedStatement."""
+    athena.create_prepared_statement(
+        StatementName="qa-athena-stmt", WorkGroup="primary",
+        QueryStatement="SELECT * FROM tbl WHERE id = ?",
+        Description="test stmt",
+    )
+    stmt = athena.get_prepared_statement(StatementName="qa-athena-stmt", WorkGroup="primary")["PreparedStatement"]
+    assert stmt["StatementName"] == "qa-athena-stmt"
+    assert "SELECT" in stmt["QueryStatement"]
+    stmts = athena.list_prepared_statements(WorkGroup="primary")["PreparedStatements"]
+    assert any(s["StatementName"] == "qa-athena-stmt" for s in stmts)
+    athena.delete_prepared_statement(StatementName="qa-athena-stmt", WorkGroup="primary")
+    stmts2 = athena.list_prepared_statements(WorkGroup="primary")["PreparedStatements"]
+    assert not any(s["StatementName"] == "qa-athena-stmt" for s in stmts2)
+
+
+def test_athena_data_catalog_crud(athena):
+    """CreateDataCatalog / GetDataCatalog / ListDataCatalogs / DeleteDataCatalog."""
+    athena.create_data_catalog(Name="qa-athena-catalog", Type="HIVE", Description="test catalog")
+    catalog = athena.get_data_catalog(Name="qa-athena-catalog")["DataCatalog"]
+    assert catalog["Name"] == "qa-athena-catalog"
+    assert catalog["Type"] == "HIVE"
+    catalogs = athena.list_data_catalogs()["DataCatalogsSummary"]
+    assert any(c["CatalogName"] == "qa-athena-catalog" for c in catalogs)
+    athena.delete_data_catalog(Name="qa-athena-catalog")
+    catalogs2 = athena.list_data_catalogs()["DataCatalogsSummary"]
+    assert not any(c["CatalogName"] == "qa-athena-catalog" for c in catalogs2)
+
+
+# ---------------------------------------------------------------------------
+# RDS — edge cases
+# ---------------------------------------------------------------------------
+
+def test_rds_snapshot_crud(rds):
+    """CreateDBSnapshot / DescribeDBSnapshots / DeleteDBSnapshot."""
+    rds.create_db_instance(
+        DBInstanceIdentifier="qa-rds-snap-db", DBInstanceClass="db.t3.micro",
+        Engine="postgres", MasterUsername="admin", MasterUserPassword="password",
+        AllocatedStorage=20,
+    )
+    try:
+        rds.create_db_snapshot(DBSnapshotIdentifier="qa-rds-snap-1", DBInstanceIdentifier="qa-rds-snap-db")
+        snaps = rds.describe_db_snapshots(DBSnapshotIdentifier="qa-rds-snap-1")["DBSnapshots"]
+        assert len(snaps) == 1
+        assert snaps[0]["DBSnapshotIdentifier"] == "qa-rds-snap-1"
+        assert snaps[0]["Status"] == "available"
+        rds.delete_db_snapshot(DBSnapshotIdentifier="qa-rds-snap-1")
+        snaps2 = rds.describe_db_snapshots()["DBSnapshots"]
+        assert not any(s["DBSnapshotIdentifier"] == "qa-rds-snap-1" for s in snaps2)
+    finally:
+        rds.delete_db_instance(DBInstanceIdentifier="qa-rds-snap-db", SkipFinalSnapshot=True)
+
+
+def test_rds_deletion_protection(rds):
+    """DeleteDBInstance fails when DeletionProtection=True."""
+    rds.create_db_instance(
+        DBInstanceIdentifier="qa-rds-protected", DBInstanceClass="db.t3.micro",
+        Engine="postgres", MasterUsername="admin", MasterUserPassword="password",
+        AllocatedStorage=20, DeletionProtection=True,
+    )
+    try:
+        with pytest.raises(ClientError) as exc:
+            rds.delete_db_instance(DBInstanceIdentifier="qa-rds-protected")
+        assert exc.value.response["Error"]["Code"] == "InvalidParameterCombination"
+    finally:
+        rds.modify_db_instance(DBInstanceIdentifier="qa-rds-protected", DeletionProtection=False, ApplyImmediately=True)
+        rds.delete_db_instance(DBInstanceIdentifier="qa-rds-protected", SkipFinalSnapshot=True)
+
+
+# ---------------------------------------------------------------------------
+# ELASTICACHE — edge cases
+# ---------------------------------------------------------------------------
+
+def test_ec_describe_cache_parameters(ec):
+    """DescribeCacheParameters returns parameters for a parameter group."""
+    ec.create_cache_parameter_group(
+        CacheParameterGroupName="qa-ec-params",
+        CacheParameterGroupFamily="redis7.0",
+        Description="test",
+    )
+    resp = ec.describe_cache_parameters(CacheParameterGroupName="qa-ec-params")
+    assert "Parameters" in resp
+    assert len(resp["Parameters"]) > 0
+
+
+def test_ec_modify_cache_parameter_group(ec):
+    """ModifyCacheParameterGroup updates parameter values."""
+    ec.create_cache_parameter_group(
+        CacheParameterGroupName="qa-ec-modify-params",
+        CacheParameterGroupFamily="redis7.0",
+        Description="test",
+    )
+    ec.modify_cache_parameter_group(
+        CacheParameterGroupName="qa-ec-modify-params",
+        ParameterNameValues=[{"ParameterName": "maxmemory-policy", "ParameterValue": "allkeys-lru"}],
+    )
+    params = ec.describe_cache_parameters(CacheParameterGroupName="qa-ec-modify-params")["Parameters"]
+    maxmem = next((p for p in params if p["ParameterName"] == "maxmemory-policy"), None)
+    assert maxmem is not None
+    assert maxmem["ParameterValue"] == "allkeys-lru"
+
+
+# ---------------------------------------------------------------------------
+# SES — edge cases
+# ---------------------------------------------------------------------------
+
+def test_ses_send_templated_email(ses):
+    """SendTemplatedEmail renders template and stores email."""
+    ses.verify_email_identity(EmailAddress="sender@example.com")
+    ses.create_template(Template={
+        "TemplateName": "qa-ses-tmpl",
+        "SubjectPart": "Hello {{name}}",
+        "TextPart": "Hi {{name}}, welcome!",
+        "HtmlPart": "<p>Hi {{name}}</p>",
+    })
+    resp = ses.send_templated_email(
+        Source="sender@example.com",
+        Destination={"ToAddresses": ["user@example.com"]},
+        Template="qa-ses-tmpl",
+        TemplateData=json.dumps({"name": "Alice"}),
+    )
+    assert "MessageId" in resp
+
+
+def test_ses_verify_domain(ses):
+    """VerifyDomainIdentity returns a verification token."""
+    resp = ses.verify_domain_identity(Domain="example.com")
+    assert "VerificationToken" in resp
+    assert len(resp["VerificationToken"]) > 0
+    identities = ses.list_identities(IdentityType="Domain")["Identities"]
+    assert "example.com" in identities
+
+
+def test_ses_configuration_set_crud(ses):
+    """CreateConfigurationSet / DescribeConfigurationSet / DeleteConfigurationSet."""
+    ses.create_configuration_set(ConfigurationSet={"Name": "qa-ses-config"})
+    desc = ses.describe_configuration_set(ConfigurationSetName="qa-ses-config")
+    assert desc["ConfigurationSet"]["Name"] == "qa-ses-config"
+    sets = ses.list_configuration_sets()["ConfigurationSets"]
+    assert any(s["Name"] == "qa-ses-config" for s in sets)
+    ses.delete_configuration_set(ConfigurationSetName="qa-ses-config")
+    sets2 = ses.list_configuration_sets()["ConfigurationSets"]
+    assert not any(s["Name"] == "qa-ses-config" for s in sets2)

@@ -13,7 +13,7 @@ import logging
 import base64
 from datetime import datetime, timezone
 
-from core.responses import json_response, error_response_json, new_uuid
+from ministack.core.responses import json_response, error_response_json, new_uuid
 
 logger = logging.getLogger("ssm")
 

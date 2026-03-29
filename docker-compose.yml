@@ -2,6 +2,7 @@ version: "3.8"
 
 services:
   ministack:
+    build: .
     image: nahuelnucera/ministack:latest
     container_name: ministack
     ports:

@@ -26,7 +26,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, wait as futures_wait
 from datetime import datetime, timezone
 
-from core.responses import json_response, error_response_json, new_uuid, now_iso
+from ministack.core.responses import json_response, error_response_json, new_uuid, now_iso
 
 logger = logging.getLogger("states")
 
@@ -749,7 +749,7 @@ def _invoke_with_callback(resource, input_data, token, state_def):
 def _call_lambda(func_name, event):
     """Invoke a Lambda via the co-located lambda_svc module."""
     try:
-        from services import lambda_svc
+        from ministack.services import lambda_svc
     except ImportError:
         logger.warning("lambda_svc unavailable; returning passthrough for %s", func_name)
         return event
@@ -1235,7 +1235,7 @@ def _parse_ts(v):
 def _invoke_sqs_send_message(resource, input_data):
     """arn:aws:states:::sqs:sendMessage"""
     try:
-        from services import sqs
+        from ministack.services import sqs
     except ImportError:
         logger.warning("sqs module unavailable; returning passthrough")
         return input_data
@@ -1250,7 +1250,7 @@ def _invoke_sqs_send_message(resource, input_data):
 def _invoke_sns_publish(resource, input_data):
     """arn:aws:states:::sns:publish"""
     try:
-        from services import sns
+        from ministack.services import sns
     except ImportError:
         logger.warning("sns module unavailable; returning passthrough")
         return input_data
@@ -1269,7 +1269,7 @@ def _invoke_sns_publish(resource, input_data):
 def _invoke_dynamodb(op_name, input_data):
     """arn:aws:states:::dynamodb:{putItem,getItem,deleteItem,updateItem}"""
     try:
-        from services import dynamodb
+        from ministack.services import dynamodb
     except ImportError:
         logger.warning("dynamodb module unavailable; returning passthrough")
         return input_data
@@ -1295,7 +1295,7 @@ def _invoke_dynamodb(op_name, input_data):
 def _invoke_ecs_run_task(resource, input_data):
     """arn:aws:states:::ecs:runTask[.sync]"""
     try:
-        from services import ecs
+        from ministack.services import ecs
     except ImportError:
         logger.warning("ecs module unavailable; returning passthrough")
         return input_data
@@ -1320,7 +1320,7 @@ def _poll_ecs_tasks(cluster, task_arns):
     Returns the full DescribeTasks result including exit codes — the state
     machine definition decides how to handle success/failure via Choice or Catch.
     """
-    from services import ecs
+    from ministack.services import ecs
 
     for _ in range(600):
         time.sleep(1)

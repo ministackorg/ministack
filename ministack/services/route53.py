@@ -26,7 +26,7 @@ import random
 from datetime import datetime, timezone
 from xml.etree.ElementTree import Element, SubElement, tostring, fromstring
 
-from core.responses import new_uuid
+from ministack.core.responses import new_uuid
 
 logger = logging.getLogger("route53")
 

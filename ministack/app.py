@@ -20,16 +20,17 @@ _EXECUTE_API_RE = re.compile(r"^([a-f0-9]{8})\.execute-api\.localhost(?::\d+)?$"
 # Must not match execute-api or other known sub-services
 _S3_VHOST_RE = re.compile(r"^([^.]+)\.localhost(?::\d+)?$")
 
-from core.router import detect_service, extract_region, extract_account_id
-from core.persistence import save_all, load_state, PERSIST_STATE
-from services import s3, sqs, sns, dynamodb, lambda_svc, secretsmanager, cloudwatch_logs
-from services import ssm, eventbridge, kinesis, cloudwatch, ses, stepfunctions
-from services import ecs, rds, elasticache, glue, athena
-from services import apigateway
-from services import firehose
-from services import apigateway_v1
-from services import route53
-from services.iam_sts import handle_iam_request, handle_sts_request
+from ministack.core.router import detect_service, extract_region, extract_account_id
+from ministack.core.persistence import save_all, load_state, PERSIST_STATE
+from ministack.services import s3, sqs, sns, dynamodb, lambda_svc, secretsmanager, cloudwatch_logs
+from ministack.services import ssm, eventbridge, kinesis, cloudwatch, ses, stepfunctions
+from ministack.services import ecs, rds, elasticache, glue, athena
+from ministack.services import apigateway
+from ministack.services import firehose
+from ministack.services import apigateway_v1
+from ministack.services import route53
+from ministack.services import cognito
+from ministack.services.iam_sts import handle_iam_request, handle_sts_request
 
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
@@ -63,6 +64,8 @@ SERVICE_HANDLERS = {
     "apigateway": apigateway.handle_request,
     "firehose": firehose.handle_request,
     "route53": route53.handle_request,
+    "cognito-idp": cognito.handle_request,
+    "cognito-identity": cognito.handle_request,
 }
 
 SERVICE_NAME_ALIASES = {
@@ -75,6 +78,8 @@ SERVICE_NAME_ALIASES = {
     "apigatewayv2": "apigateway",
     "kinesis-firehose": "firehose",
     "route53": "route53",
+    "cognito-idp": "cognito-idp",
+    "cognito-identity": "cognito-identity",
 }
 
 
@@ -110,7 +115,8 @@ BANNER = r"""
  Local AWS Service Emulator — Port {port}
  Services: S3, SQS, SNS, DynamoDB, Lambda, IAM, STS, SecretsManager, CloudWatch Logs,
           SSM, EventBridge, Kinesis, CloudWatch, SES, Step Functions,
-          ECS, RDS, ElastiCache, Glue, Athena, API Gateway, Firehose, Route53
+          ECS, RDS, ElastiCache, Glue, Athena, API Gateway, Firehose, Route53,
+          Cognito
 """
 
 
@@ -348,9 +354,9 @@ def _run_init_scripts():
 def _reset_all_state():
     """Wipe all in-memory state across every service module, and persisted files if enabled."""
     import shutil
-    from services.iam_sts import reset as _iam_reset
-    from core.persistence import STATE_DIR, PERSIST_STATE
-    from services.s3 import DATA_DIR as S3_DATA_DIR, PERSIST as S3_PERSIST
+    from ministack.services.iam_sts import reset as _iam_reset
+    from ministack.core.persistence import STATE_DIR, PERSIST_STATE
+    from ministack.services.s3 import DATA_DIR as S3_DATA_DIR, PERSIST as S3_PERSIST
 
     for mod, fn in [
         (s3, s3.reset), (sqs, sqs.reset), (sns, sns.reset),
@@ -365,6 +371,7 @@ def _reset_all_state():
         (apigateway_v1, apigateway_v1.reset),
         (firehose, firehose.reset),
         (route53, route53.reset),
+        (cognito, cognito.reset),
     ]:
         try:
             fn()
@@ -402,8 +409,15 @@ def _reset_all_state():
 
 def main():
     import uvicorn
+    import socket
     port = int(_resolve_port())
-    uvicorn.run("app:app", host="0.0.0.0", port=port, log_level=LOG_LEVEL.lower())
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        if s.connect_ex(("127.0.0.1", port)) == 0:
+            print(f"ERROR: Port {port} is already in use. Is MiniStack already running (Docker or another process)?\n"
+                  f"  Stop it with: docker compose down\n"
+                  f"  Or use a different port: GATEWAY_PORT=4567 ministack")
+            raise SystemExit(1)
+    uvicorn.run("ministack.app:app", host="0.0.0.0", port=port, log_level=LOG_LEVEL.lower())
 
 
 if __name__ == "__main__":

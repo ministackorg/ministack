@@ -21,7 +21,7 @@ import logging
 import threading
 import time
 
-from core.responses import json_response, error_response_json, new_uuid, now_epoch
+from ministack.core.responses import json_response, error_response_json, new_uuid, now_epoch
 
 logger = logging.getLogger("firehose")
 
@@ -174,7 +174,7 @@ def _deliver_to_s3(stream: dict, dest: dict, record_data: bytes):
     Schedules a coroutine on the running loop (fire-and-forget).
     """
     try:
-        from services import s3 as s3_svc
+        from ministack.services import s3 as s3_svc
 
         cfg = dest["config"]
         bucket_arn = cfg.get("BucketARN", "")

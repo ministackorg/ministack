@@ -1,23 +1,45 @@
 # Contributing to MiniStack
 
-Thanks for wanting to contribute. The codebase is intentionally simple — each AWS service is a single self-contained Python file. Adding a new service or fixing a bug should take minutes, not hours.
+Thanks for wanting to contribute. The codebase is intentionally simple — each AWS service is a single self-contained Python file inside `ministack/services/`. Adding a new service or fixing a bug should take minutes, not hours.
+
+## Project Structure
+
+```
+ministack/
+├── ministack/
+│   ├── app.py              # ASGI entry point, service routing, reset endpoint
+│   ├── core/
+│   │   ├── responses.py    # json_response, error_response_json, new_uuid
+│   │   ├── router.py       # detect_service(), SERVICE_PATTERNS
+│   │   ├── lambda_runtime.py
+│   │   └── persistence.py
+│   └── services/
+│       ├── s3.py, sqs.py, sns.py, dynamodb.py, ...
+│       └── cognito.py      # example of a two-client service file
+├── tests/
+│   ├── conftest.py         # pytest fixtures (boto3 clients)
+│   └── test_services.py    # all integration tests
+├── Dockerfile
+├── pyproject.toml
+└── CHANGELOG.md
+```
 
 ## Adding a New Service
 
 Every service follows the same 4-step pattern:
 
-### 1. Create `services/myservice.py`
+### 1. Create `ministack/services/myservice.py`
 
 ```python
 """
 MyService Emulator.
-JSON-based API via X-Amz-Target (or Query API).
+JSON-based API via X-Amz-Target.
 Supports: OperationOne, OperationTwo, ...
 """
 
 import json
 import logging
-from core.responses import json_response, error_response_json, new_uuid
+from ministack.core.responses import json_response, error_response_json, new_uuid
 
 logger = logging.getLogger("myservice")
 
@@ -48,24 +70,26 @@ async def handle_request(method, path, headers, body, query_params):
 
 
 def _operation_one(data):
-    # implement
     return json_response({"result": "ok"})
 
 
 def _operation_two(data):
-    # implement
     return json_response({})
+
+
+def reset():
+    _state.clear()
 ```
 
 **Protocol guide:**
-- JSON services (DynamoDB, SecretsManager, Glue, Athena, etc.) — use `json_response` / `error_response_json`, route via `X-Amz-Target`
+- JSON services (DynamoDB, SecretsManager, Glue, Athena, Cognito, etc.) — use `json_response` / `error_response_json`, route via `X-Amz-Target`
 - XML services (S3, SQS, SNS, IAM, RDS, ElastiCache) — build XML responses, route via `Action` query param
-- REST services (Lambda, ECS) — route via URL path
+- REST services (Lambda, ECS, Route53) — route via URL path
 
-### 2. Register in `app.py`
+### 2. Register in `ministack/app.py`
 
 ```python
-from services import myservice
+from ministack.services import myservice
 
 SERVICE_HANDLERS = {
     # ... existing ...
@@ -73,7 +97,9 @@ SERVICE_HANDLERS = {
 }
 ```
 
-### 3. Add detection to `core/router.py`
+Also add `(myservice, myservice.reset)` to the list in `_reset_all_state()`.
+
+### 3. Add detection to `ministack/core/router.py`
 
 ```python
 SERVICE_PATTERNS = {
@@ -85,19 +111,23 @@ SERVICE_PATTERNS = {
 }
 ```
 
-And add any `Action`-based operations to `action_service_map` in `detect_service()`.
+Add any credential scope or `Action`-based routing as needed.
 
-### 4. Add tests to `tests/test_services.py`
+### 4. Add a fixture to `tests/conftest.py`
 
 ```python
-@test("MyService: basic operation")
-def test_myservice_basic():
-    svc = boto3.client("myservice", **kwargs)
-    resp = svc.operation_one(Param="value")
-    assert resp["result"] == "ok"
+@pytest.fixture(scope="session")
+def mysvc():
+    return make_client("myservice")
 ```
 
-Add your test function to the `tests` list in `main()`.
+### 5. Add tests to `tests/test_services.py`
+
+```python
+def test_myservice_operation_one(mysvc):
+    resp = mysvc.operation_one(Param="value")
+    assert resp["result"] == "ok"
+```
 
 ---
 
@@ -107,34 +137,37 @@ Add your test function to the `tests` list in `main()`.
 # Start the stack
 docker compose up -d
 
-# Install deps
-pip install boto3 pytest pytest-cov duckdb
+# Install test dependencies
+pip install boto3 pytest duckdb docker cbor2
 
 # Run all tests
 pytest tests/ -v
 
-# Run a specific test
-pytest tests/ -v -k "test_myservice"
+# Run a specific service
+pytest tests/ -v -k "cognito"
 ```
 
 ---
 
 ## Code Conventions
 
-- **One file per service** — keep everything for a service in `services/myservice.py`
+- **One file per service** — keep everything for a service in `ministack/services/myservice.py`
+- **Imports** — always `from ministack.core.responses import ...`, never `from core.responses import ...`
 - **In-memory state** — use module-level dicts (`_things: dict = {}`)
+- **reset()** — every service must expose a `reset()` that clears all module-level state; it's called by `/_ministack/reset`
 - **No external AWS deps** — no `boto3`, `botocore`, or `aws-sdk` in service code
-- **Minimal dependencies** — `duckdb` and `docker` are optional; guard with try/except
+- **Minimal dependencies** — `duckdb` and `docker` are optional; guard with `try/except ImportError`
 - **Error responses** — match real AWS error codes and HTTP status codes as closely as possible
-- **Logging** — use `logger = logging.getLogger("servicename")` and log at DEBUG for request details, INFO for significant events, WARNING for degraded behavior
+- **Logging** — `logger = logging.getLogger("servicename")`; DEBUG for request details, INFO for significant events
 
 ---
 
 ## Pull Request Checklist
 
-- [ ] New service file in `services/`
-- [ ] Registered in `app.py` SERVICE_HANDLERS
-- [ ] Detection patterns added to `core/router.py`
+- [ ] New service file in `ministack/services/`
+- [ ] Registered in `ministack/app.py` SERVICE_HANDLERS and `_reset_all_state()`
+- [ ] Detection patterns added to `ministack/core/router.py`
+- [ ] Fixture added to `tests/conftest.py`
 - [ ] Tests added and passing (`pytest tests/ -v`)
 - [ ] Service added to the table in `README.md`
 - [ ] Entry added to `CHANGELOG.md`
@@ -145,14 +178,13 @@ pytest tests/ -v -k "test_myservice"
 
 High-value contributions right now:
 
-- **API Gateway REST API (v1)** — resource trees, methods, integration types, deployment stages; HTTP API v2 is already implemented
-- **Cognito** — user pools, sign-up/sign-in, token issuance
-- **Route53** — hosted zones, record sets, health checks
 - **ACM** — certificate provisioning and validation stubs
-- **Firehose** — delivery streams to S3/Elasticsearch
-- **More S3 operations** — object lock, replication configuration, website hosting
-- **Virtual-hosted style S3** — `bucket.localhost:4566` routing in addition to path-style
+- **CloudFormation** — basic stack CRUD with resource mapping to existing services
+- **More S3 operations** — object lock, replication configuration, website hosting, object tagging
 - **Athena without DuckDB** — graceful degradation or lighter SQL engine option
+- **SES v2** — `ses:SendEmail` with the v2 API shapes
+- **Lambda layers** — `PublishLayerVersion`, `GetLayerVersion`, `ListLayerVersions`
+- **More Cognito flows** — hosted UI, federated identity providers
 
 ---
 

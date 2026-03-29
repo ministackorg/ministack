@@ -25,7 +25,7 @@ import time
 import logging
 from urllib.parse import parse_qs
 
-from core.responses import new_uuid
+from ministack.core.responses import new_uuid
 
 logger = logging.getLogger("elasticache")
 
@@ -184,6 +184,7 @@ def _create_cache_cluster(p):
                 ports={f"{container_port}/tcp": host_port},
                 name=f"ministack-elasticache-{cluster_id}",
                 labels={"ministack": "elasticache", "cluster_id": cluster_id},
+                volumes={},
             )
             docker_container_id = container.id
             logger.info(f"ElastiCache: started {engine} container for {cluster_id} on port {host_port}")
@@ -658,9 +659,9 @@ def _modify_cache_parameter_group(p):
     params = _param_group_params.setdefault(name, {})
 
     idx = 1
-    while _p(p, f"ParameterNameValues.member.{idx}.ParameterName"):
-        pname = _p(p, f"ParameterNameValues.member.{idx}.ParameterName")
-        pvalue = _p(p, f"ParameterNameValues.member.{idx}.ParameterValue")
+    while _p(p, f"ParameterNameValues.ParameterNameValue.{idx}.ParameterName"):
+        pname = _p(p, f"ParameterNameValues.ParameterNameValue.{idx}.ParameterName")
+        pvalue = _p(p, f"ParameterNameValues.ParameterNameValue.{idx}.ParameterValue")
         if pname in params:
             params[pname]["Value"] = pvalue
             params[pname]["Source"] = "user"
@@ -690,8 +691,8 @@ def _reset_cache_parameter_group(p):
         defaults = _default_params_for_family(family)
         params = _param_group_params.get(name, {})
         idx = 1
-        while _p(p, f"ParameterNameValues.member.{idx}.ParameterName"):
-            pname = _p(p, f"ParameterNameValues.member.{idx}.ParameterName")
+        while _p(p, f"ParameterNameValues.ParameterNameValue.{idx}.ParameterName"):
+            pname = _p(p, f"ParameterNameValues.ParameterNameValue.{idx}.ParameterName")
             if pname in defaults:
                 params[pname] = dict(defaults[pname])
             idx += 1
@@ -1266,6 +1267,17 @@ def _error(code, message, status):
 
 
 def reset():
+    docker_client = _get_docker()
+    if docker_client:
+        for cluster in _clusters.values():
+            cid = cluster.get("_docker_container_id")
+            if cid:
+                try:
+                    c = docker_client.containers.get(cid)
+                    c.stop(timeout=2)
+                    c.remove(v=True)
+                except Exception:
+                    pass
     _clusters.clear()
     _replication_groups.clear()
     _subnet_groups.clear()
