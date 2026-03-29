@@ -60,24 +60,28 @@ That's it. No account, no API key, no sign-up.
 ## Using with AWS CLI
 
 ```bash
-# Configure a local profile (one-time)
+# Option A — environment variables (no profile needed)
+export AWS_ACCESS_KEY_ID=test
+export AWS_SECRET_ACCESS_KEY=test
+export AWS_DEFAULT_REGION=us-east-1
+
+aws --endpoint-url=http://localhost:4566 s3 mb s3://my-bucket
+aws --endpoint-url=http://localhost:4566 sqs create-queue --queue-name my-queue
+aws --endpoint-url=http://localhost:4566 dynamodb list-tables
+aws --endpoint-url=http://localhost:4566 sts get-caller-identity
+
+# Option B — named profile (must pass --profile on every command)
 aws configure --profile local
 # AWS Access Key ID: test
 # AWS Secret Access Key: test
 # Default region: us-east-1
 # Default output format: json
 
-# Use --endpoint-url on any command
-aws --endpoint-url=http://localhost:4566 s3 mb s3://my-bucket
-aws --endpoint-url=http://localhost:4566 s3 cp ./file.txt s3://my-bucket/
-aws --endpoint-url=http://localhost:4566 sqs create-queue --queue-name my-queue
-aws --endpoint-url=http://localhost:4566 dynamodb list-tables
-aws --endpoint-url=http://localhost:4566 sts get-caller-identity
-
-# Or set the endpoint globally for a session
-export AWS_ENDPOINT_URL=http://localhost:4566
-aws s3 ls
-aws sqs list-queues
+aws --profile local --endpoint-url=http://localhost:4566 s3 mb s3://my-bucket
+aws --profile local --endpoint-url=http://localhost:4566 s3 cp ./file.txt s3://my-bucket/
+aws --profile local --endpoint-url=http://localhost:4566 sqs create-queue --queue-name my-queue
+aws --profile local --endpoint-url=http://localhost:4566 dynamodb list-tables
+aws --profile local --endpoint-url=http://localhost:4566 sts get-caller-identity
 ```
 
 ### awslocal wrapper
@@ -417,19 +421,19 @@ pip install boto3 pytest duckdb docker cbor2
 # Start MiniStack
 docker compose up -d
 
-# Run the full test suite (525 tests across all 25 services)
+# Run the full test suite (613 tests across all 25 services)
 pytest tests/ -v
 ```
 
 Expected output:
 ```
-collected 525 items
+collected 613 items
 
 tests/test_services.py::test_s3_create_bucket PASSED
 ...
 tests/test_services.py::test_app_asgi_callable PASSED
 
-525 passed in ~60s
+613 passed in ~60s
 ```
 
 ---

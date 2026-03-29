@@ -33,9 +33,25 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 - **ASGI module**: `app:app` → `ministack.app:app` in Dockerfile and CI
 - **PyPI trusted publishing**: OIDC workflow added (`pypi-publish.yml`) — no API token needed, publishes on `v*.*.*` tag push
 
+### Fixed
+- **Lambda `GetFunctionConcurrency`**: returns `{}` instead of 404 after `DeleteFunctionConcurrency` — matches AWS behaviour where an unset concurrency limit returns an empty response
+- **Cognito `GetCredentialsForIdentity`**: response field is `SecretKey` (correct boto3 wire name) — was incorrectly named `SecretAccessKey`
+- **ElastiCache `ModifyCacheParameterGroup` / `ResetCacheParameterGroup`**: parameter list key was `ParameterNameValues.member.{n}.*` — corrected to `ParameterNameValues.ParameterNameValue.{n}.*` matching actual boto3 Query API serialisation
+- **RDS / ElastiCache / ECS `reset()`**: `container.remove()` → `container.remove(v=True)` — Docker volumes created by stopped containers are now removed along with the container, preventing anonymous volume accumulation across test runs
+- **RDS `containers.run()`**: added `tmpfs` mount for `/var/lib/postgresql/data` and `/var/lib/mysql` — postgres/mysql data lives in container RAM; no anonymous Docker volumes created per instance
+- **Docker Compose**: added `build: .` so `docker compose up --build` uses local source instead of always pulling from Docker Hub
+
+### Infrastructure
+- **`Makefile` `purge` target**: kills all containers labelled `ministack`, prunes dangling volumes, and clears `./data/s3/` — safe to run alongside other projects (filter is label-scoped, not image-scoped)
+
 ### Tests
 - 3 package structure tests: `test_package_core_importable`, `test_package_services_importable`, `test_app_asgi_callable`
-- 525 integration tests — all passing against Docker image
+- Merged all 97 tests from `test_qa_comprehensive.py` into `test_services.py` — single test file, `test_qa_comprehensive.py` deleted
+- Fixed `test_cognito_get_id_and_credentials`: `SecretAccessKey` → `SecretKey`
+- Fixed `test_apigwv1_usage_plan_key_crud`: `Name`/`Enabled` → `name`/`enabled` (boto3 lowercase params)
+- Fixed `test_lambda_reset_terminates_workers`: timeout 5 s → 15 s with 3-attempt retry
+- Fixed `test_rds_snapshot_crud` / `test_rds_deletion_protection`: added `finally` cleanup so RDS containers are deleted after each test
+- 613 integration tests — all passing against Docker image
 
 ---
 

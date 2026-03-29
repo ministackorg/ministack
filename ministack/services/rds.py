@@ -132,6 +132,8 @@ def _create_db_instance(p):
                     ports={f"{container_port}/tcp": host_port},
                     name=f"ministack-rds-{db_id}",
                     labels={"ministack": "rds", "db_id": db_id},
+                    tmpfs={"/var/lib/postgresql/data": "rw,noexec,nosuid,size=256m",
+                           "/var/lib/mysql": "rw,noexec,nosuid,size=256m"},
                 )
                 docker_container_id = container.id
                 logger.info(f"RDS: started {engine} container for {db_id} on port {host_port}")
@@ -263,7 +265,7 @@ def _delete_db_instance(p):
         try:
             c = docker_client.containers.get(instance["_docker_container_id"])
             c.stop(timeout=5)
-            c.remove()
+            c.remove(v=True)
             logger.info(f"RDS: removed container for {db_id}")
         except Exception as e:
             logger.warning(f"RDS: failed to remove container for {db_id}: {e}")
@@ -1971,6 +1973,17 @@ _ACTION_MAP = {
 
 
 def reset():
+    docker_client = _get_docker()
+    if docker_client:
+        for instance in _instances.values():
+            cid = instance.get("_docker_container_id")
+            if cid:
+                try:
+                    c = docker_client.containers.get(cid)
+                    c.stop(timeout=2)
+                    c.remove(v=True)
+                except Exception:
+                    pass
     _instances.clear()
     _clusters.clear()
     _subnet_groups.clear()

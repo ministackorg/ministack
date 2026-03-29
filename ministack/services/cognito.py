@@ -1118,15 +1118,17 @@ def _sign_up(data):
     pool["_users"][username] = user
     pool["EstimatedNumberOfUsers"] = len(pool["_users"])
 
-    return json_response({
+    resp = {
         "UserConfirmed": status == "CONFIRMED",
         "UserSub": attr_dict["sub"],
-        "CodeDeliveryDetails": {
-            "Destination": attr_dict.get("email", ""),
+    }
+    if "email" in attr_dict:
+        resp["CodeDeliveryDetails"] = {
+            "Destination": attr_dict["email"],
             "DeliveryMedium": "EMAIL",
             "AttributeName": "email",
-        } if "email" in attr_dict else {},
-    })
+        }
+    return json_response(resp)
 
 
 def _confirm_sign_up(data):

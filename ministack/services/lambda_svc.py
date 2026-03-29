@@ -1368,11 +1368,6 @@ def _get_policy(func_name: str, query_params: dict | None = None):
             f"Function not found: {_func_arn(func_name)}", 404,
         )
     func = _functions[func_name]
-    if not func["policy"]["Statement"]:
-        return error_response_json(
-            "ResourceNotFoundException",
-            "The resource you requested does not exist.", 404,
-        )
     return json_response({
         "Policy": json.dumps(func["policy"]),
         "RevisionId": func["config"]["RevisionId"],
@@ -1575,7 +1570,7 @@ def _get_function_concurrency(func_name: str):
         )
     conc = _functions[func_name].get("concurrency")
     if conc is None:
-        return json_response({"ReservedConcurrentExecutions": 0})
+        return json_response({})
     return json_response({"ReservedConcurrentExecutions": conc})
 
 
