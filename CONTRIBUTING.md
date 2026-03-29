@@ -83,7 +83,7 @@ def reset():
 
 **Protocol guide:**
 - JSON services (DynamoDB, SecretsManager, Glue, Athena, Cognito, etc.) — use `json_response` / `error_response_json`, route via `X-Amz-Target`
-- XML services (S3, SQS, SNS, IAM, RDS, ElastiCache) — build XML responses, route via `Action` query param
+- XML/Query services (S3, SQS, SNS, IAM, STS, RDS, ElastiCache, EC2) — build XML responses, route via `Action` query param; use `_xml(status, root_tag, inner)` pattern; verify field names against botocore shapes via `Loader().load_service_model()`
 - REST services (Lambda, ECS, Route53) — route via URL path
 
 ### 2. Register in `ministack/app.py`
@@ -171,6 +171,7 @@ pytest tests/ -v -k "cognito"
 - [ ] Tests added and passing (`pytest tests/ -v`)
 - [ ] Service added to the table in `README.md`
 - [ ] Entry added to `CHANGELOG.md`
+- [ ] Version bumped in `pyproject.toml`
 
 ---
 
@@ -179,8 +180,7 @@ pytest tests/ -v -k "cognito"
 High-value contributions right now:
 
 - **ACM** — certificate provisioning and validation stubs
-- **CloudFormation** — basic stack CRUD with resource mapping to existing services
-- **More S3 operations** — object lock, replication configuration, website hosting, object tagging
+- **More S3 operations** — object lock, replication configuration, object tagging
 - **Athena without DuckDB** — graceful degradation or lighter SQL engine option
 - **SES v2** — `ses:SendEmail` with the v2 API shapes
 - **Lambda layers** — `PublishLayerVersion`, `GetLayerVersion`, `ListLayerVersions`
