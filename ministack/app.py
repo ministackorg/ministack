@@ -409,7 +409,14 @@ def _reset_all_state():
 
 def main():
     import uvicorn
+    import socket
     port = int(_resolve_port())
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        if s.connect_ex(("127.0.0.1", port)) == 0:
+            print(f"ERROR: Port {port} is already in use. Is MiniStack already running (Docker or another process)?\n"
+                  f"  Stop it with: docker compose down\n"
+                  f"  Or use a different port: GATEWAY_PORT=4567 ministack")
+            raise SystemExit(1)
     uvicorn.run("ministack.app:app", host="0.0.0.0", port=port, log_level=LOG_LEVEL.lower())
 
 
