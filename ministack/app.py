@@ -124,7 +124,7 @@ BANNER = r"""
  Services: S3, SQS, SNS, DynamoDB, Lambda, IAM, STS, SecretsManager, CloudWatch Logs,
           SSM, EventBridge, Kinesis, CloudWatch, SES, Step Functions,
           ECS, RDS, ElastiCache, Glue, Athena, API Gateway, Firehose, Route53,
-          Cognito, EC2, EMR, ALB/ELBv2
+          Cognito, EC2, EMR, EBS, EFS, ALB/ELBv2
 """
 
 

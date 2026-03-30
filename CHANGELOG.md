@@ -7,7 +7,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
-## [1.1.3] — 2026-03-30
+## [1.1.4] — 2026-03-30
 
 ### Added
 - **Amazon ELBv2 / ALB** (`ministack/services/alb.py`) — full control plane + data plane
@@ -29,7 +29,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
   - 10 control-plane integration tests + 7 data-plane integration tests
 
 ### Tests
-- 673 integration tests — all passing
+- 688 integration tests — all passing
 
 ---
 

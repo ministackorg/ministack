@@ -19,6 +19,8 @@ import base64
 import fnmatch
 import json
 import os
+import random
+import string
 import time
 import logging
 from urllib.parse import parse_qs
@@ -143,7 +145,6 @@ def _now_iso():
 
 
 def _short_id():
-    import random, string
     return "".join(random.choices(string.ascii_lowercase + string.digits, k=16))
 
 # ---------------------------------------------------------------------------
@@ -862,7 +863,8 @@ def _match_condition(cond, method, path, headers, query_params):
         actual = headers.get(hname, "")
         return any(fnmatch.fnmatch(actual, v) for v in hvals)
 
-    # source-ip and unknown conditions: treat as always-match
+    # source-ip is not implemented (no real network in emulator) — always matches.
+    # Unknown condition types also always match to avoid silently dropping traffic.
     return True
 
 
