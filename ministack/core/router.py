@@ -120,6 +120,11 @@ SERVICE_PATTERNS = {
         "target_prefixes": ["ElasticMapReduce"],
         "host_patterns": [r"elasticmapreduce\."],
     },
+    "elasticfilesystem": {
+        "host_patterns": [r"elasticfilesystem\."],
+        "path_prefixes": ["/2015-02-01/"],
+        "credential_scope": "elasticfilesystem",
+    },
     "ec2": {
         "host_patterns": [r"ec2\."],
         "path_patterns": [r"Action=.*Instance", r"Action=.*Security", r"Action=.*KeyPair",
@@ -170,6 +175,7 @@ def detect_service(method: str, path: str, headers: dict, query_params: dict) ->
                 "cognito-idp": "cognito-idp",
                 "cognito-identity": "cognito-identity",
                 "elasticmapreduce": "elasticmapreduce",
+                "elasticfilesystem": "elasticfilesystem",
             }
             if svc_name in scope_map:
                 return scope_map[svc_name]
@@ -305,6 +311,16 @@ def detect_service(method: str, path: str, headers: dict, query_params: dict) ->
             "AttachNetworkInterface": "ec2", "DetachNetworkInterface": "ec2",
             "CreateVpcEndpoint": "ec2", "DeleteVpcEndpoints": "ec2",
             "DescribeVpcEndpoints": "ec2",
+            # EBS Volumes
+            "CreateVolume": "ec2", "DeleteVolume": "ec2", "DescribeVolumes": "ec2",
+            "DescribeVolumeStatus": "ec2", "AttachVolume": "ec2", "DetachVolume": "ec2",
+            "ModifyVolume": "ec2", "DescribeVolumesModifications": "ec2",
+            "EnableVolumeIO": "ec2", "ModifyVolumeAttribute": "ec2",
+            "DescribeVolumeAttribute": "ec2",
+            # EBS Snapshots
+            "CreateSnapshot": "ec2", "DeleteSnapshot": "ec2", "DescribeSnapshots": "ec2",
+            "CopySnapshot": "ec2", "ModifySnapshotAttribute": "ec2",
+            "DescribeSnapshotAttribute": "ec2",
         }
         if action in action_service_map:
             return action_service_map[action]

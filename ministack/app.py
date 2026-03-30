@@ -32,6 +32,7 @@ from ministack.services import apigateway_v1
 from ministack.services import route53
 from ministack.services import cognito
 from ministack.services import emr
+from ministack.services import efs
 from ministack.services.iam_sts import handle_iam_request, handle_sts_request
 
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
@@ -70,6 +71,7 @@ SERVICE_HANDLERS = {
     "cognito-identity": cognito.handle_request,
     "ec2": ec2.handle_request,
     "elasticmapreduce": emr.handle_request,
+    "elasticfilesystem": efs.handle_request,
 }
 
 SERVICE_NAME_ALIASES = {
@@ -120,7 +122,7 @@ BANNER = r"""
  Services: S3, SQS, SNS, DynamoDB, Lambda, IAM, STS, SecretsManager, CloudWatch Logs,
           SSM, EventBridge, Kinesis, CloudWatch, SES, Step Functions,
           ECS, RDS, ElastiCache, Glue, Athena, API Gateway, Firehose, Route53,
-          Cognito, EC2, EMR
+          Cognito, EC2, EMR, EFS
 """
 
 
@@ -378,6 +380,7 @@ def _reset_all_state():
         (cognito, cognito.reset),
         (ec2, ec2.reset),
         (emr, emr.reset),
+        (efs, efs.reset),
     ]:
         try:
             fn()

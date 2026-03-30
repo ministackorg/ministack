@@ -11345,3 +11345,219 @@ def test_emr_instance_groups(emr):
     assert len(new_group_resp["InstanceGroupIds"]) == 1
     groups2 = emr.list_instance_groups(ClusterId=cluster_id)
     assert len(groups2["InstanceGroups"]) == 3
+
+
+# ---------------------------------------------------------------------------
+# EBS (Elastic Block Store) — uses ec2 client
+# ---------------------------------------------------------------------------
+
+def test_ebs_create_and_describe_volume(ebs):
+    resp = ebs.create_volume(
+        AvailabilityZone="us-east-1a",
+        Size=20,
+        VolumeType="gp3",
+    )
+    vol_id = resp["VolumeId"]
+    assert vol_id.startswith("vol-")
+    assert resp["State"] == "available"
+    assert resp["Size"] == 20
+    assert resp["VolumeType"] == "gp3"
+
+    desc = ebs.describe_volumes(VolumeIds=[vol_id])
+    assert len(desc["Volumes"]) == 1
+    assert desc["Volumes"][0]["VolumeId"] == vol_id
+
+
+def test_ebs_attach_detach_volume(ebs):
+    inst = ebs.run_instances(ImageId="ami-00000001", MinCount=1, MaxCount=1)
+    instance_id = inst["Instances"][0]["InstanceId"]
+
+    vol = ebs.create_volume(AvailabilityZone="us-east-1a", Size=10, VolumeType="gp2")
+    vol_id = vol["VolumeId"]
+
+    ebs.attach_volume(VolumeId=vol_id, InstanceId=instance_id, Device="/dev/xvdf")
+    desc = ebs.describe_volumes(VolumeIds=[vol_id])
+    assert desc["Volumes"][0]["State"] == "in-use"
+    assert desc["Volumes"][0]["Attachments"][0]["InstanceId"] == instance_id
+
+    ebs.detach_volume(VolumeId=vol_id)
+    desc2 = ebs.describe_volumes(VolumeIds=[vol_id])
+    assert desc2["Volumes"][0]["State"] == "available"
+    assert desc2["Volumes"][0]["Attachments"] == []
+
+
+def test_ebs_delete_volume(ebs):
+    vol = ebs.create_volume(AvailabilityZone="us-east-1a", Size=5, VolumeType="gp2")
+    vol_id = vol["VolumeId"]
+    ebs.delete_volume(VolumeId=vol_id)
+    desc = ebs.describe_volumes(VolumeIds=[vol_id])
+    assert len(desc["Volumes"]) == 0
+
+
+def test_ebs_modify_volume(ebs):
+    vol = ebs.create_volume(AvailabilityZone="us-east-1a", Size=10, VolumeType="gp2")
+    vol_id = vol["VolumeId"]
+    resp = ebs.modify_volume(VolumeId=vol_id, Size=50, VolumeType="gp3")
+    assert resp["VolumeModification"]["TargetSize"] == 50
+    assert resp["VolumeModification"]["TargetVolumeType"] == "gp3"
+
+
+def test_ebs_volume_status(ebs):
+    vol = ebs.create_volume(AvailabilityZone="us-east-1a", Size=8, VolumeType="gp2")
+    vol_id = vol["VolumeId"]
+    resp = ebs.describe_volume_status(VolumeIds=[vol_id])
+    assert len(resp["VolumeStatuses"]) == 1
+    assert resp["VolumeStatuses"][0]["VolumeStatus"]["Status"] == "ok"
+
+
+def test_ebs_create_and_describe_snapshot(ebs):
+    vol = ebs.create_volume(AvailabilityZone="us-east-1a", Size=10, VolumeType="gp2")
+    vol_id = vol["VolumeId"]
+    snap = ebs.create_snapshot(VolumeId=vol_id, Description="test snapshot")
+    snap_id = snap["SnapshotId"]
+    assert snap_id.startswith("snap-")
+    assert snap["State"] == "completed"
+
+    desc = ebs.describe_snapshots(SnapshotIds=[snap_id])
+    assert len(desc["Snapshots"]) == 1
+    assert desc["Snapshots"][0]["VolumeId"] == vol_id
+    assert desc["Snapshots"][0]["Description"] == "test snapshot"
+
+
+def test_ebs_delete_snapshot(ebs):
+    vol = ebs.create_volume(AvailabilityZone="us-east-1a", Size=10, VolumeType="gp2")
+    snap = ebs.create_snapshot(VolumeId=vol["VolumeId"])
+    snap_id = snap["SnapshotId"]
+    ebs.delete_snapshot(SnapshotId=snap_id)
+    desc = ebs.describe_snapshots(SnapshotIds=[snap_id])
+    assert len(desc["Snapshots"]) == 0
+
+
+def test_ebs_copy_snapshot(ebs):
+    vol = ebs.create_volume(AvailabilityZone="us-east-1a", Size=10, VolumeType="gp2")
+    snap = ebs.create_snapshot(VolumeId=vol["VolumeId"], Description="original")
+    snap_id = snap["SnapshotId"]
+    copy = ebs.copy_snapshot(SourceRegion="us-east-1", SourceSnapshotId=snap_id, Description="copy")
+    new_snap_id = copy["SnapshotId"]
+    assert new_snap_id != snap_id
+    assert new_snap_id.startswith("snap-")
+
+
+# ---------------------------------------------------------------------------
+# EFS (Elastic File System)
+# ---------------------------------------------------------------------------
+
+def test_efs_create_and_describe_filesystem(efs):
+    resp = efs.create_file_system(
+        PerformanceMode="generalPurpose",
+        ThroughputMode="bursting",
+        Encrypted=False,
+        Tags=[{"Key": "Name", "Value": "test-fs"}],
+    )
+    fs_id = resp["FileSystemId"]
+    assert fs_id.startswith("fs-")
+    assert resp["LifeCycleState"] == "available"
+    assert resp["ThroughputMode"] == "bursting"
+
+    desc = efs.describe_file_systems(FileSystemId=fs_id)
+    assert len(desc["FileSystems"]) == 1
+    assert desc["FileSystems"][0]["FileSystemId"] == fs_id
+    assert desc["FileSystems"][0]["Name"] == "test-fs"
+
+
+def test_efs_creation_token_idempotency(efs):
+    token = "unique-token-abc123"
+    r1 = efs.create_file_system(CreationToken=token)
+    r2 = efs.create_file_system(CreationToken=token)
+    assert r1["FileSystemId"] == r2["FileSystemId"]
+
+
+def test_efs_delete_filesystem(efs):
+    resp = efs.create_file_system()
+    fs_id = resp["FileSystemId"]
+    efs.delete_file_system(FileSystemId=fs_id)
+    desc = efs.describe_file_systems(FileSystemId=fs_id)
+    assert len(desc["FileSystems"]) == 0
+
+
+def test_efs_mount_target(efs):
+    fs = efs.create_file_system()
+    fs_id = fs["FileSystemId"]
+    mt = efs.create_mount_target(FileSystemId=fs_id, SubnetId="subnet-00000001")
+    mt_id = mt["MountTargetId"]
+    assert mt_id.startswith("fsmt-")
+    assert mt["LifeCycleState"] == "available"
+
+    desc = efs.describe_mount_targets(FileSystemId=fs_id)
+    assert len(desc["MountTargets"]) == 1
+    assert desc["MountTargets"][0]["MountTargetId"] == mt_id
+
+    import botocore.exceptions
+    try:
+        efs.delete_file_system(FileSystemId=fs_id)
+        assert False, "should raise"
+    except botocore.exceptions.ClientError as e:
+        assert e.response["Error"]["Code"] in ("FileSystemInUse", "400") or "mount targets" in str(e).lower()
+
+    efs.delete_mount_target(MountTargetId=mt_id)
+    desc2 = efs.describe_mount_targets(FileSystemId=fs_id)
+    assert len(desc2["MountTargets"]) == 0
+
+
+def test_efs_access_point(efs):
+    fs = efs.create_file_system()
+    fs_id = fs["FileSystemId"]
+    ap = efs.create_access_point(
+        FileSystemId=fs_id,
+        Tags=[{"Key": "Name", "Value": "my-ap"}],
+        RootDirectory={"Path": "/data"},
+    )
+    ap_id = ap["AccessPointId"]
+    assert ap_id.startswith("fsap-")
+    assert ap["LifeCycleState"] == "available"
+
+    desc = efs.describe_access_points(FileSystemId=fs_id)
+    assert any(a["AccessPointId"] == ap_id for a in desc["AccessPoints"])
+
+    efs.delete_access_point(AccessPointId=ap_id)
+    desc2 = efs.describe_access_points(FileSystemId=fs_id)
+    assert not any(a["AccessPointId"] == ap_id for a in desc2["AccessPoints"])
+
+
+def test_efs_tags(efs):
+    fs = efs.create_file_system(Tags=[{"Key": "env", "Value": "test"}])
+    fs_arn = fs["FileSystemArn"]
+    efs.tag_resource(ResourceId=fs_arn, Tags=[{"Key": "team", "Value": "data"}])
+    tags_resp = efs.list_tags_for_resource(ResourceId=fs_arn)
+    tag_map = {t["Key"]: t["Value"] for t in tags_resp["Tags"]}
+    assert tag_map["env"] == "test"
+    assert tag_map["team"] == "data"
+
+    efs.untag_resource(ResourceId=fs_arn, TagKeys=["env"])
+    tags_resp2 = efs.list_tags_for_resource(ResourceId=fs_arn)
+    keys = [t["Key"] for t in tags_resp2["Tags"]]
+    assert "env" not in keys
+    assert "team" in keys
+
+
+def test_efs_lifecycle_configuration(efs):
+    fs = efs.create_file_system()
+    fs_id = fs["FileSystemId"]
+    efs.put_lifecycle_configuration(
+        FileSystemId=fs_id,
+        LifecyclePolicies=[{"TransitionToIA": "AFTER_30_DAYS"}],
+    )
+    resp = efs.describe_lifecycle_configuration(FileSystemId=fs_id)
+    assert len(resp["LifecyclePolicies"]) == 1
+    assert resp["LifecyclePolicies"][0]["TransitionToIA"] == "AFTER_30_DAYS"
+
+
+def test_efs_backup_policy(efs):
+    fs = efs.create_file_system()
+    fs_id = fs["FileSystemId"]
+    efs.put_backup_policy(
+        FileSystemId=fs_id,
+        BackupPolicy={"Status": "ENABLED"},
+    )
+    resp = efs.describe_backup_policy(FileSystemId=fs_id)
+    assert resp["BackupPolicy"]["Status"] == "ENABLED"

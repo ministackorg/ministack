@@ -7,6 +7,42 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [1.1.3] — 2026-03-30
+
+### Added
+- **Amazon EBS** (Elastic Block Store) — added to the EC2 Query/XML service handler
+  - **Volumes**: `CreateVolume`, `DeleteVolume`, `DescribeVolumes`, `DescribeVolumeStatus`,
+    `AttachVolume`, `DetachVolume`, `ModifyVolume`, `DescribeVolumesModifications`,
+    `EnableVolumeIO`, `ModifyVolumeAttribute`, `DescribeVolumeAttribute`
+  - **Snapshots**: `CreateSnapshot`, `DeleteSnapshot`, `DescribeSnapshots`,
+    `CopySnapshot`, `ModifySnapshotAttribute`, `DescribeSnapshotAttribute`
+  - All three volume types supported (gp2/gp3/io1/io2/st1/sc1)
+  - Attach/Detach updates volume state (available ↔ in-use)
+  - ModifyVolume returns `completed` immediately
+  - Snapshots store as `completed` (emulator — no real EBS)
+  - Pro-only on LocalStack — free here
+  - 8 integration tests
+
+- **Amazon EFS** (Elastic File System) — new service (`ministack/services/efs.py`)
+  - REST/JSON protocol via `/2015-02-01/*` paths, credential scope `elasticfilesystem`
+  - **File Systems**: `CreateFileSystem`, `DescribeFileSystems`, `DeleteFileSystem`,
+    `UpdateFileSystem` — CreationToken idempotency enforced
+  - **Mount Targets**: `CreateMountTarget`, `DescribeMountTargets`, `DeleteMountTarget`,
+    `DescribeMountTargetSecurityGroups`, `ModifyMountTargetSecurityGroups`
+  - **Access Points**: `CreateAccessPoint`, `DescribeAccessPoints`, `DeleteAccessPoint`
+  - **Tags**: `TagResource`, `UntagResource`, `ListTagsForResource`
+  - **Lifecycle**: `PutLifecycleConfiguration`, `DescribeLifecycleConfiguration`
+  - **Backup Policy**: `PutBackupPolicy`, `DescribeBackupPolicy`
+  - **Account**: `DescribeAccountPreferences`, `PutAccountPreferences`
+  - FileSystem with active mount targets blocks deletion (`FileSystemInUse`)
+  - Pro-only on LocalStack — free here
+  - 10 integration tests
+
+### Tests
+- 671 integration tests — all passing (672 - 1 flaky Docker ECS test)
+
+---
+
 ## [1.1.2] — 2026-03-29
 
 ### Added
