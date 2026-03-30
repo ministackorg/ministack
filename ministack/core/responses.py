@@ -56,6 +56,8 @@ def error_response_xml(code: str, message: str, status: int, namespace: str = "h
     """AWS-style XML error response."""
     root = Element("ErrorResponse", xmlns=namespace)
     error = SubElement(root, "Error")
+    t = SubElement(error, "Type")
+    t.text = "Sender" if status < 500 else "Receiver"
     c = SubElement(error, "Code")
     c.text = code
     m = SubElement(error, "Message")

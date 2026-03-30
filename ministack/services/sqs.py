@@ -801,10 +801,11 @@ def _xml_resp(status: int, root: str, inner: str) -> tuple:
 
 
 def _xml_err_resp(code: str, msg: str, status: int = 400) -> tuple:
+    sender_type = "Sender" if status < 500 else "Receiver"
     body = (
         f'<?xml version="1.0" encoding="UTF-8"?>'
         f'<ErrorResponse xmlns="http://queue.amazonaws.com/doc/2012-11-05/">'
-        f'<Error><Code>{_esc(code)}</Code><Message>{_esc(msg)}</Message></Error>'
+        f'<Error><Type>{sender_type}</Type><Code>{_esc(code)}</Code><Message>{_esc(msg)}</Message></Error>'
         f'<RequestId>{new_uuid()}</RequestId>'
         f'</ErrorResponse>'
     ).encode("utf-8")
