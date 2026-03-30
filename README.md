@@ -378,36 +378,22 @@ ecs.stop_task(cluster="dev", task=task_arn)
 | `ELASTICACHE_BASE_PORT` | `16379` | Starting host port for ElastiCache containers |
 | `PERSIST_STATE` | `0` | Set `1` to persist service state across restarts |
 | `STATE_DIR` | `/tmp/ministack-state` | Directory for persisted state files |
-| `ATHENA_ENGINE` | `auto` | SQL engine for Athena: `auto`, `duckdb`, `sqlite`, `mock` |
+| `ATHENA_ENGINE` | `auto` | SQL engine for Athena: `auto`, `duckdb`, `mock` |
 
 ### Athena SQL Engines
 
-MiniStack supports three SQL engine tiers for Athena. Set `ATHENA_ENGINE` to control selection (`auto` picks the best available).
+Set `ATHENA_ENGINE` to control Athena's SQL execution engine. In `auto` mode, DuckDB is used if installed, otherwise queries return mock results.
 
-| Capability | `duckdb` | `sqlite` | `mock` |
-|---|---|---|---|
-| Simple SELECT / expressions | Yes | Yes | Partial (regex) |
-| Arithmetic & string ops | Yes | Yes | No |
-| Aggregations (COUNT, SUM, AVG...) | Yes | Yes | No |
-| JOINs | Yes | Yes | No |
-| CTEs (WITH ... AS) | Yes | Yes | No |
-| Window functions | Yes | Yes (SQLite 3.25+) | No |
-| Subqueries | Yes | Yes | No |
-| JSON functions | Yes | Yes (`json_extract`) | No |
-| CSV file queries (S3 data) | Yes | Yes (auto-loaded) | No |
-| Parquet file queries | Yes | No\* | No |
-| JSON file queries | Yes | No\* | No |
-| UNNEST / ARRAY functions | Yes | No\* | No |
-| REGEXP\_EXTRACT / REGEXP\_LIKE | Yes | No\* | No |
-| CONCAT(a, b) | Yes | No\* (use `a \|\| b`) | No |
-| DATE\_FORMAT / DATE\_ADD | Yes | No\* (use strftime) | No |
-| APPROX\_DISTINCT | Yes | No\* | No |
-| read\_csv() / read\_parquet() | Yes | No\* | No |
-| CREATE EXTERNAL TABLE | Yes | No\* | No |
+| Capability | `duckdb` | `mock` |
+|---|---|---|
+| Simple SELECT / expressions | Yes | Partial (regex) |
+| Arithmetic, aggregations, JOINs, CTEs | Yes | No |
+| Window functions, subqueries | Yes | No |
+| Parquet / CSV / JSON file queries | Yes | No |
+| UNNEST, ARRAY, MAP functions | Yes | No |
+| APPROX\_DISTINCT, REGEXP\_EXTRACT | Yes | No |
 
-\*Queries using unsupported features fail with a clear error message suggesting `pip install duckdb`.
-
-**Engine selection (`auto` mode):** DuckDB → sqlite3 → mock. Install DuckDB for full Athena SQL compatibility. The sqlite3 engine (Python stdlib, zero deps) covers standard SQL — ideal for CI/testing without heavy dependencies.
+Install DuckDB for full Athena SQL compatibility: `pip install ministack[full]`.
 
 ### State Persistence
 

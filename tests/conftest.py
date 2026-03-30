@@ -130,14 +130,6 @@ def _ministack_config(settings):
     urllib.request.urlopen(req, timeout=5)
 
 
-@pytest.fixture
-def athena_sqlite(athena):
-    """Athena client with SQLite engine. Restores original engine after test."""
-    _ministack_config({"athena.ATHENA_ENGINE": "sqlite"})
-    yield athena
-    _ministack_config({"athena.ATHENA_ENGINE": "auto"})
-
-
 @pytest.fixture(scope="session")
 def fh():
     return make_client("firehose")

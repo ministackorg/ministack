@@ -27,7 +27,7 @@ logger = logging.getLogger("athena")
 ACCOUNT_ID = "000000000000"
 REGION = "us-east-1"
 S3_DATA_DIR = os.environ.get("S3_DATA_DIR", "/tmp/localstack-data/s3")
-ATHENA_ENGINE = os.environ.get("ATHENA_ENGINE", "auto")  # "auto" | "duckdb" | "sqlite" | "mock"
+ATHENA_ENGINE = os.environ.get("ATHENA_ENGINE", "auto")  # "auto" | "duckdb" | "mock"
 
 
 def get_athena_engine():
@@ -35,12 +35,7 @@ def get_athena_engine():
     can be overridden at runtime via POST /_ministack/config."""
     engine = ATHENA_ENGINE
     if engine == "auto":
-        if _duckdb_available:
-            engine = "duckdb"
-        elif _sqlite_available:
-            engine = "sqlite"
-        else:
-            engine = "mock"
+        engine = "duckdb" if _duckdb_available else "mock"
     logger.debug("Athena engine: %s (ATHENA_ENGINE=%s)", engine, ATHENA_ENGINE)
     return engine
 
@@ -76,12 +71,6 @@ try:
 except ImportError:
     _duckdb_available = False
 
-try:
-    import sqlite3
-
-    _sqlite_available = True
-except ImportError:
-    _sqlite_available = False
 
 
 _DUCKDB_TYPE_MAP = {
@@ -106,16 +95,6 @@ _DUCKDB_TYPE_MAP = {
     "LIST": "array",
     "STRUCT": "row",
     "MAP": "map",
-}
-
-_SQLITE_TYPE_MAP = {
-    "TEXT": "varchar",
-    "INTEGER": "integer",
-    "INT": "integer",
-    "REAL": "double",
-    "BLOB": "varbinary",
-    "NULL": "varchar",
-    "NUMERIC": "decimal",
 }
 
 
@@ -249,8 +228,6 @@ def _execute_query(query_id, query, database):
 
         if engine == "duckdb":
             results = _run_duckdb(query, database)
-        elif engine == "sqlite":
-            results = _run_sqlite(query, database)
         else:
             results = _mock_query_results(query)
 
@@ -341,127 +318,6 @@ def _rewrite_s3_paths(query):
         flags=re.IGNORECASE,
     )
     return result
-
-
-def _run_sqlite(query, database):  # noqa: ARG001
-    import sqlite3
-
-    conn = sqlite3.connect(":memory:")
-    rewritten = _rewrite_s3_paths(query)
-    rewritten = _adapt_sql_for_sqlite(rewritten)
-
-    rewritten = _load_csv_tables(conn, rewritten)
-
-    try:
-        cursor = conn.execute(rewritten)
-        columns = []
-        column_types = []
-        rows = [list(r) for r in cursor.fetchall()]
-        if cursor.description:
-            for desc in cursor.description:
-                columns.append(desc[0])
-                # SQLite cursor.description doesn't provide types (PEP 249),
-                # so infer from actual values in the result set.
-                column_types.append(_infer_sqlite_column_type(rows, len(columns) - 1))
-        conn.close()
-        return {"columns": columns, "column_types": column_types, "rows": rows}
-    except Exception as e:
-        msg = str(e)
-        hint = (
-            f"sqlite3 engine error: {msg}. "
-            "The sqlite3 engine supports standard SQL (SELECT, JOIN, aggregations, "
-            "CTEs, window functions) but not Athena/Presto-specific syntax. "
-            "Install DuckDB for full compatibility: pip install duckdb"
-        )
-        conn.close()
-        raise RuntimeError(hint) from e
-
-
-def _infer_sqlite_column_type(rows, col_idx):
-    """Infer Athena type from actual values in a SQLite result column."""
-    for row in rows:
-        if col_idx < len(row) and row[col_idx] is not None:
-            val = row[col_idx]
-            if isinstance(val, int):
-                return "integer"
-            if isinstance(val, float):
-                return "double"
-            if isinstance(val, bytes):
-                return "varbinary"
-            return "varchar"
-    return "varchar"
-
-
-def _adapt_sql_for_sqlite(query):
-    """Minimal dialect translation from Athena/Presto SQL to SQLite SQL.
-
-    Only handles safe type-cast rewrites. Does NOT attempt full transpilation —
-    unsupported syntax will fail with a clear error suggesting DuckDB.
-    """
-    result = re.sub(
-        r"CAST\s*\((.+?)\s+AS\s+DOUBLE\)",
-        r"CAST(\1 AS REAL)",
-        query,
-        flags=re.IGNORECASE,
-    )
-    result = re.sub(
-        r"CAST\s*\((.+?)\s+AS\s+VARCHAR\)",
-        r"CAST(\1 AS TEXT)",
-        result,
-        flags=re.IGNORECASE,
-    )
-    result = re.sub(
-        r"CAST\s*\((.+?)\s+AS\s+BIGINT\)",
-        r"CAST(\1 AS INTEGER)",
-        result,
-        flags=re.IGNORECASE,
-    )
-    return result
-
-
-def _load_csv_tables(conn, query):
-    """Detect file path references in the query, load CSV files as SQLite tables,
-    and return a rewritten query with file paths replaced by table names."""
-    import csv
-
-    rewritten = query
-
-    # Check for unsupported file formats first and raise a clear error
-    parquet_refs = re.findall(r"""['"]([^'"]+\.parquet)['"]""", query, re.IGNORECASE)
-    json_refs = re.findall(r"""['"]([^'"]+\.json)['"]""", query, re.IGNORECASE)
-    if parquet_refs or json_refs:
-        fmt = "Parquet" if parquet_refs else "JSON"
-        raise RuntimeError(
-            f"{fmt} file queries require DuckDB. The sqlite3 engine only supports CSV files. "
-            "Install DuckDB for full file format support: pip install duckdb"
-        )
-
-    paths = re.findall(r"""['"]([^'"]+\.csv)['"]""", query, re.IGNORECASE)
-    for path in paths:
-        if not os.path.isfile(path):
-            continue
-        table_name = os.path.splitext(os.path.basename(path))[0]
-        table_name = re.sub(r"[^a-zA-Z0-9_]", "_", table_name)
-        try:
-            with open(path, newline="") as f:
-                reader = csv.reader(f)
-                headers = next(reader, None)
-                if not headers:
-                    continue
-                cols = ", ".join(f'"{h}" TEXT' for h in headers)
-                conn.execute(f'CREATE TABLE IF NOT EXISTS "{table_name}" ({cols})')
-                placeholders = ", ".join("?" * len(headers))
-                conn.executemany(
-                    f'INSERT INTO "{table_name}" VALUES ({placeholders})',
-                    reader,
-                )
-            # Replace the file path reference in the query with the table name
-            rewritten = rewritten.replace(f"'{path}'", f'"{table_name}"')
-            rewritten = rewritten.replace(f'"{path}"', f'"{table_name}"')
-        except Exception as e:
-            logger.warning(f"Athena sqlite3: failed to load CSV {path}: {e}")
-
-    return rewritten
 
 
 def _mock_query_results(query):
