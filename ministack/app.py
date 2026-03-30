@@ -160,6 +160,26 @@ async def app(scope, receive, send):
                              json.dumps({"reset": "ok"}).encode())
         return
 
+    if path == "/_ministack/config" and method == "POST":
+        try:
+            config = json.loads(body) if body else {}
+        except json.JSONDecodeError:
+            config = {}
+        applied = {}
+        for key, value in config.items():
+            # Set module-level variables on service modules: "athena.ATHENA_ENGINE" -> "sqlite"
+            if "." in key:
+                mod_name, var_name = key.rsplit(".", 1)
+                try:
+                    mod = __import__(f"ministack.services.{mod_name}", fromlist=[var_name])
+                    setattr(mod, var_name, value)
+                    applied[key] = value
+                except (ImportError, AttributeError) as e:
+                    logger.warning("/_ministack/config: failed to set %s: %s", key, e)
+        await _send_response(send, 200, {"Content-Type": "application/json"},
+                             json.dumps({"applied": applied}).encode())
+        return
+
     if path in ("/_localstack/health", "/health", "/_ministack/health"):
         await _send_response(send, 200, {
             "Content-Type": "application/json",

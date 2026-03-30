@@ -27,6 +27,23 @@ logger = logging.getLogger("athena")
 ACCOUNT_ID = "000000000000"
 REGION = "us-east-1"
 S3_DATA_DIR = os.environ.get("S3_DATA_DIR", "/tmp/localstack-data/s3")
+ATHENA_ENGINE = os.environ.get("ATHENA_ENGINE", "auto")  # "auto" | "duckdb" | "sqlite" | "mock"
+
+
+def get_athena_engine():
+    """Resolve the effective SQL engine. Reads module-level ATHENA_ENGINE which
+    can be overridden at runtime via POST /_ministack/config."""
+    engine = ATHENA_ENGINE
+    if engine == "auto":
+        if _duckdb_available:
+            engine = "duckdb"
+        elif _sqlite_available:
+            engine = "sqlite"
+        else:
+            engine = "mock"
+    logger.debug("Athena engine: %s (ATHENA_ENGINE=%s)", engine, ATHENA_ENGINE)
+    return engine
+
 
 _executions: dict = {}
 _workgroups: dict = {
@@ -35,7 +52,9 @@ _workgroups: dict = {
         "State": "ENABLED",
         "Description": "Primary workgroup",
         "CreationTime": time.time(),
-        "Configuration": {"ResultConfiguration": {"OutputLocation": "s3://athena-results/"}},
+        "Configuration": {
+            "ResultConfiguration": {"OutputLocation": "s3://athena-results/"}
+        },
     }
 }
 _named_queries: dict = {}
@@ -52,11 +71,18 @@ _tags: dict = {}  # arn -> {key: value, ...}
 
 try:
     import duckdb
+
     _duckdb_available = True
-    logger.info("Athena: DuckDB available — real SQL execution enabled")
 except ImportError:
     _duckdb_available = False
-    logger.warning("Athena: DuckDB not available — install with: pip install duckdb")
+
+try:
+    import sqlite3
+
+    _sqlite_available = True
+except ImportError:
+    _sqlite_available = False
+
 
 _DUCKDB_TYPE_MAP = {
     "BOOLEAN": "boolean",
@@ -80,6 +106,16 @@ _DUCKDB_TYPE_MAP = {
     "LIST": "array",
     "STRUCT": "row",
     "MAP": "map",
+}
+
+_SQLITE_TYPE_MAP = {
+    "TEXT": "varchar",
+    "INTEGER": "integer",
+    "INT": "integer",
+    "REAL": "double",
+    "BLOB": "varbinary",
+    "NULL": "varchar",
+    "NUMERIC": "decimal",
 }
 
 
@@ -139,21 +175,24 @@ async def handle_request(method, path, headers, body, query_params):
 
     handler = handlers.get(action)
     if not handler:
-        return error_response_json("InvalidAction", f"Unknown Athena action: {action}", 400)
+        return error_response_json(
+            "InvalidAction", f"Unknown Athena action: {action}", 400
+        )
     return handler(data)
 
 
 # ---- Query Execution ----
 
+
 def _start_query_execution(data):
     query = data.get("QueryString", "")
     query_id = new_uuid()
     workgroup = data.get("WorkGroup", "primary")
-    output_location = (
-        data.get("ResultConfiguration", {}).get("OutputLocation")
-        or _workgroups.get(workgroup, {}).get("Configuration", {})
-            .get("ResultConfiguration", {}).get("OutputLocation", "s3://athena-results/")
-    )
+    output_location = data.get("ResultConfiguration", {}).get(
+        "OutputLocation"
+    ) or _workgroups.get(workgroup, {}).get("Configuration", {}).get(
+        "ResultConfiguration", {}
+    ).get("OutputLocation", "s3://athena-results/")
     db = data.get("QueryExecutionContext", {}).get("Database", "default")
     catalog = data.get("QueryExecutionContext", {}).get("Catalog", "AwsDataCatalog")
 
@@ -179,15 +218,19 @@ def _start_query_execution(data):
             "ServiceProcessingTimeInMillis": 0,
         },
         "WorkGroup": workgroup,
-        "EngineVersion": {"SelectedEngineVersion": "Athena engine version 3",
-                          "EffectiveEngineVersion": "Athena engine version 3"},
+        "EngineVersion": {
+            "SelectedEngineVersion": "Athena engine version 3",
+            "EffectiveEngineVersion": "Athena engine version 3",
+        },
         "_results": None,
         "_column_types": None,
         "_error": None,
     }
     _executions[query_id] = execution
 
-    thread = threading.Thread(target=_execute_query, args=(query_id, query, db), daemon=True)
+    thread = threading.Thread(
+        target=_execute_query, args=(query_id, query, db), daemon=True
+    )
     thread.start()
 
     return json_response({"QueryExecutionId": query_id})
@@ -202,13 +245,19 @@ def _execute_query(query_id, query, database):
     start = time.time()
 
     try:
-        if _duckdb_available:
+        engine = get_athena_engine()
+
+        if engine == "duckdb":
             results = _run_duckdb(query, database)
+        elif engine == "sqlite":
+            results = _run_sqlite(query, database)
         else:
             results = _mock_query_results(query)
 
         execution["_results"] = {"columns": results["columns"], "rows": results["rows"]}
-        execution["_column_types"] = results.get("column_types", ["varchar"] * len(results["columns"]))
+        execution["_column_types"] = results.get(
+            "column_types", ["varchar"] * len(results["columns"])
+        )
         execution["Status"]["State"] = "SUCCEEDED"
         elapsed_ms = int((time.time() - start) * 1000)
         execution["Statistics"]["EngineExecutionTimeInMillis"] = elapsed_ms
@@ -249,8 +298,11 @@ def _run_duckdb(query, database):
                 column_types.append(athena_type)
         rows = result.fetchall()
         conn.close()
-        return {"columns": columns, "column_types": column_types,
-                "rows": [list(r) for r in rows]}
+        return {
+            "columns": columns,
+            "column_types": column_types,
+            "rows": [list(r) for r in rows],
+        }
     except Exception as e:
         conn.close()
         raise e
@@ -261,6 +313,7 @@ def _rewrite_s3_paths(query):
     Handles: quoted strings, read_csv/read_parquet/read_json function args,
     and FROM clauses with s3 paths.
     """
+
     def replace_s3(match):
         prefix = match.group(1)
         s3_uri = match.group(2)
@@ -290,6 +343,127 @@ def _rewrite_s3_paths(query):
     return result
 
 
+def _run_sqlite(query, database):  # noqa: ARG001
+    import sqlite3
+
+    conn = sqlite3.connect(":memory:")
+    rewritten = _rewrite_s3_paths(query)
+    rewritten = _adapt_sql_for_sqlite(rewritten)
+
+    rewritten = _load_csv_tables(conn, rewritten)
+
+    try:
+        cursor = conn.execute(rewritten)
+        columns = []
+        column_types = []
+        rows = [list(r) for r in cursor.fetchall()]
+        if cursor.description:
+            for desc in cursor.description:
+                columns.append(desc[0])
+                # SQLite cursor.description doesn't provide types (PEP 249),
+                # so infer from actual values in the result set.
+                column_types.append(_infer_sqlite_column_type(rows, len(columns) - 1))
+        conn.close()
+        return {"columns": columns, "column_types": column_types, "rows": rows}
+    except Exception as e:
+        msg = str(e)
+        hint = (
+            f"sqlite3 engine error: {msg}. "
+            "The sqlite3 engine supports standard SQL (SELECT, JOIN, aggregations, "
+            "CTEs, window functions) but not Athena/Presto-specific syntax. "
+            "Install DuckDB for full compatibility: pip install duckdb"
+        )
+        conn.close()
+        raise RuntimeError(hint) from e
+
+
+def _infer_sqlite_column_type(rows, col_idx):
+    """Infer Athena type from actual values in a SQLite result column."""
+    for row in rows:
+        if col_idx < len(row) and row[col_idx] is not None:
+            val = row[col_idx]
+            if isinstance(val, int):
+                return "integer"
+            if isinstance(val, float):
+                return "double"
+            if isinstance(val, bytes):
+                return "varbinary"
+            return "varchar"
+    return "varchar"
+
+
+def _adapt_sql_for_sqlite(query):
+    """Minimal dialect translation from Athena/Presto SQL to SQLite SQL.
+
+    Only handles safe type-cast rewrites. Does NOT attempt full transpilation —
+    unsupported syntax will fail with a clear error suggesting DuckDB.
+    """
+    result = re.sub(
+        r"CAST\s*\((.+?)\s+AS\s+DOUBLE\)",
+        r"CAST(\1 AS REAL)",
+        query,
+        flags=re.IGNORECASE,
+    )
+    result = re.sub(
+        r"CAST\s*\((.+?)\s+AS\s+VARCHAR\)",
+        r"CAST(\1 AS TEXT)",
+        result,
+        flags=re.IGNORECASE,
+    )
+    result = re.sub(
+        r"CAST\s*\((.+?)\s+AS\s+BIGINT\)",
+        r"CAST(\1 AS INTEGER)",
+        result,
+        flags=re.IGNORECASE,
+    )
+    return result
+
+
+def _load_csv_tables(conn, query):
+    """Detect file path references in the query, load CSV files as SQLite tables,
+    and return a rewritten query with file paths replaced by table names."""
+    import csv
+
+    rewritten = query
+
+    # Check for unsupported file formats first and raise a clear error
+    parquet_refs = re.findall(r"""['"]([^'"]+\.parquet)['"]""", query, re.IGNORECASE)
+    json_refs = re.findall(r"""['"]([^'"]+\.json)['"]""", query, re.IGNORECASE)
+    if parquet_refs or json_refs:
+        fmt = "Parquet" if parquet_refs else "JSON"
+        raise RuntimeError(
+            f"{fmt} file queries require DuckDB. The sqlite3 engine only supports CSV files. "
+            "Install DuckDB for full file format support: pip install duckdb"
+        )
+
+    paths = re.findall(r"""['"]([^'"]+\.csv)['"]""", query, re.IGNORECASE)
+    for path in paths:
+        if not os.path.isfile(path):
+            continue
+        table_name = os.path.splitext(os.path.basename(path))[0]
+        table_name = re.sub(r"[^a-zA-Z0-9_]", "_", table_name)
+        try:
+            with open(path, newline="") as f:
+                reader = csv.reader(f)
+                headers = next(reader, None)
+                if not headers:
+                    continue
+                cols = ", ".join(f'"{h}" TEXT' for h in headers)
+                conn.execute(f'CREATE TABLE IF NOT EXISTS "{table_name}" ({cols})')
+                placeholders = ", ".join("?" * len(headers))
+                conn.executemany(
+                    f'INSERT INTO "{table_name}" VALUES ({placeholders})',
+                    reader,
+                )
+            # Replace the file path reference in the query with the table name
+            rewritten = rewritten.replace(f"'{path}'", f'"{table_name}"')
+            rewritten = rewritten.replace(f'"{path}"', f'"{table_name}"')
+        except Exception as e:
+            logger.warning(f"Athena sqlite3: failed to load CSV {path}: {e}")
+
+    return rewritten
+
+
 def _mock_query_results(query):
     query_upper = query.strip().upper()
     if query_upper.startswith("SELECT"):
@@ -299,15 +473,19 @@ def _mock_query_results(query):
             return {"columns": [val], "column_types": ["varchar"], "rows": [[val]]}
         alias_pattern = re.findall(
             r"""(?:(\d+(?:\.\d+)?)|'([^']*)')\s+AS\s+(\w+)""",
-            query.strip(), re.IGNORECASE,
+            query.strip(),
+            re.IGNORECASE,
         )
         if alias_pattern:
             cols = [m[2] for m in alias_pattern]
             types = ["integer" if m[0] else "varchar" for m in alias_pattern]
             vals = [m[0] if m[0] else m[1] for m in alias_pattern]
             return {"columns": cols, "column_types": types, "rows": [vals]}
-        return {"columns": ["result"], "column_types": ["varchar"],
-                "rows": [["mock_value"]]}
+        return {
+            "columns": ["result"],
+            "column_types": ["varchar"],
+            "rows": [["mock_value"]],
+        }
     return {"columns": [], "column_types": [], "rows": []}
 
 
@@ -326,7 +504,9 @@ def _get_query_execution(data):
     query_id = data.get("QueryExecutionId")
     execution = _executions.get(query_id)
     if not execution:
-        return error_response_json("InvalidRequestException", f"Query {query_id} not found", 400)
+        return error_response_json(
+            "InvalidRequestException", f"Query {query_id} not found", 400
+        )
     return json_response({"QueryExecution": _execution_out(execution)})
 
 
@@ -336,15 +516,21 @@ def _get_query_results(data):
     next_token = data.get("NextToken")
     execution = _executions.get(query_id)
     if not execution:
-        return error_response_json("InvalidRequestException", f"Query {query_id} not found", 400)
+        return error_response_json(
+            "InvalidRequestException", f"Query {query_id} not found", 400
+        )
 
     state = execution["Status"]["State"]
     if state == "FAILED":
-        return error_response_json("InvalidRequestException",
-            f"Query has failed: {execution['Status'].get('StateChangeReason', 'Unknown')}", 400)
+        return error_response_json(
+            "InvalidRequestException",
+            f"Query has failed: {execution['Status'].get('StateChangeReason', 'Unknown')}",
+            400,
+        )
     if state != "SUCCEEDED":
-        return error_response_json("InvalidRequestException",
-            f"Query is in state {state}", 400)
+        return error_response_json(
+            "InvalidRequestException", f"Query is in state {state}", 400
+        )
 
     results = execution.get("_results") or {"columns": [], "rows": []}
     columns = results.get("columns", [])
@@ -358,31 +544,33 @@ def _get_query_results(data):
         except ValueError:
             pass
 
-    page_rows = rows[start_idx:start_idx + max_results]
+    page_rows = rows[start_idx : start_idx + max_results]
 
     result_rows = []
     result_rows.append({"Data": [{"VarCharValue": col} for col in columns]})
     for row in page_rows:
-        result_rows.append({
-            "Data": [{"VarCharValue": str(v) if v is not None else ""} for v in row]
-        })
+        result_rows.append(
+            {"Data": [{"VarCharValue": str(v) if v is not None else ""} for v in row]}
+        )
 
     column_info = []
     for i, col in enumerate(columns):
         ctype = column_types[i] if i < len(column_types) else "varchar"
         precision, scale = _type_precision_scale(ctype)
-        column_info.append({
-            "CatalogName": "hive",
-            "SchemaName": "",
-            "TableName": "",
-            "Name": col,
-            "Label": col,
-            "Type": ctype,
-            "Precision": precision,
-            "Scale": scale,
-            "Nullable": "UNKNOWN",
-            "CaseSensitive": ctype == "varchar",
-        })
+        column_info.append(
+            {
+                "CatalogName": "hive",
+                "SchemaName": "",
+                "TableName": "",
+                "Name": col,
+                "Label": col,
+                "Type": ctype,
+                "Precision": precision,
+                "Scale": scale,
+                "Nullable": "UNKNOWN",
+                "CaseSensitive": ctype == "varchar",
+            }
+        )
 
     response = {
         "ResultSet": {
@@ -437,10 +625,13 @@ def _list_query_executions(data):
 
 # ---- WorkGroups ----
 
+
 def _create_workgroup(data):
     name = data.get("Name")
     if name in _workgroups:
-        return error_response_json("InvalidRequestException", f"WorkGroup {name} already exists", 400)
+        return error_response_json(
+            "InvalidRequestException", f"WorkGroup {name} already exists", 400
+        )
     _workgroups[name] = {
         "Name": name,
         "State": "ENABLED",
@@ -458,7 +649,9 @@ def _create_workgroup(data):
 def _delete_workgroup(data):
     name = data.get("WorkGroup")
     if name == "primary":
-        return error_response_json("InvalidRequestException", "Cannot delete primary workgroup", 400)
+        return error_response_json(
+            "InvalidRequestException", "Cannot delete primary workgroup", 400
+        )
     _workgroups.pop(name, None)
     _tags.pop(_arn_workgroup(name), None)
     return json_response({})
@@ -468,26 +661,37 @@ def _get_workgroup(data):
     name = data.get("WorkGroup")
     wg = _workgroups.get(name)
     if not wg:
-        return error_response_json("InvalidRequestException", f"WorkGroup {name} not found", 400)
+        return error_response_json(
+            "InvalidRequestException", f"WorkGroup {name} not found", 400
+        )
     out = dict(wg)
     out.setdefault("WorkGroupConfiguration", out.get("Configuration", {}))
     return json_response({"WorkGroup": out})
 
 
 def _list_workgroups(data):
-    return json_response({
-        "WorkGroups": [{"Name": wg["Name"], "State": wg["State"],
-                        "Description": wg.get("Description", ""),
-                        "CreationTime": wg.get("CreationTime", 0)}
-                       for wg in _workgroups.values()]
-    })
+    return json_response(
+        {
+            "WorkGroups": [
+                {
+                    "Name": wg["Name"],
+                    "State": wg["State"],
+                    "Description": wg.get("Description", ""),
+                    "CreationTime": wg.get("CreationTime", 0),
+                }
+                for wg in _workgroups.values()
+            ]
+        }
+    )
 
 
 def _update_workgroup(data):
     name = data.get("WorkGroup")
     wg = _workgroups.get(name)
     if not wg:
-        return error_response_json("InvalidRequestException", f"WorkGroup {name} not found", 400)
+        return error_response_json(
+            "InvalidRequestException", f"WorkGroup {name} not found", 400
+        )
     if "ConfigurationUpdates" in data:
         updates = data["ConfigurationUpdates"]
         config = wg.setdefault("Configuration", {})
@@ -502,9 +706,13 @@ def _update_workgroup(data):
                 rc.pop("OutputLocation", None)
             if rcu.get("RemoveEncryptionConfiguration"):
                 rc.pop("EncryptionConfiguration", None)
-        for ck in ("EnforceWorkGroupConfiguration", "PublishCloudWatchMetricsEnabled",
-                    "BytesScannedCutoffPerQuery", "RequesterPaysEnabled",
-                    "EngineVersion"):
+        for ck in (
+            "EnforceWorkGroupConfiguration",
+            "PublishCloudWatchMetricsEnabled",
+            "BytesScannedCutoffPerQuery",
+            "RequesterPaysEnabled",
+            "EngineVersion",
+        ):
             if ck in updates:
                 config[ck] = updates[ck]
     if "Description" in data:
@@ -515,6 +723,7 @@ def _update_workgroup(data):
 
 
 # ---- Named Queries ----
+
 
 def _create_named_query(data):
     query_id = new_uuid()
@@ -538,45 +747,70 @@ def _get_named_query(data):
     query_id = data.get("NamedQueryId")
     nq = _named_queries.get(query_id)
     if not nq:
-        return error_response_json("InvalidRequestException", f"Named query {query_id} not found", 400)
+        return error_response_json(
+            "InvalidRequestException", f"Named query {query_id} not found", 400
+        )
     return json_response({"NamedQuery": nq})
 
 
 def _list_named_queries(data):
     workgroup = data.get("WorkGroup", "primary")
-    ids = [qid for qid, nq in _named_queries.items() if nq.get("WorkGroup") == workgroup]
+    ids = [
+        qid for qid, nq in _named_queries.items() if nq.get("WorkGroup") == workgroup
+    ]
     return json_response({"NamedQueryIds": ids})
 
 
 def _batch_get_named_query(data):
     ids = data.get("NamedQueryIds", [])
     queries = [_named_queries[qid] for qid in ids if qid in _named_queries]
-    unprocessed = [{"NamedQueryId": qid, "ErrorCode": "INTERNAL_FAILURE", "ErrorMessage": "Not found"}
-                   for qid in ids if qid not in _named_queries]
-    return json_response({"NamedQueries": queries, "UnprocessedNamedQueryIds": unprocessed})
+    unprocessed = [
+        {
+            "NamedQueryId": qid,
+            "ErrorCode": "INTERNAL_FAILURE",
+            "ErrorMessage": "Not found",
+        }
+        for qid in ids
+        if qid not in _named_queries
+    ]
+    return json_response(
+        {"NamedQueries": queries, "UnprocessedNamedQueryIds": unprocessed}
+    )
 
 
 def _batch_get_query_execution(data):
     ids = data.get("QueryExecutionIds", [])
     execs = [_execution_out(_executions[qid]) for qid in ids if qid in _executions]
-    unprocessed = [{"QueryExecutionId": qid, "ErrorCode": "INTERNAL_FAILURE", "ErrorMessage": "Not found"}
-                   for qid in ids if qid not in _executions]
-    return json_response({"QueryExecutions": execs, "UnprocessedQueryExecutionIds": unprocessed})
+    unprocessed = [
+        {
+            "QueryExecutionId": qid,
+            "ErrorCode": "INTERNAL_FAILURE",
+            "ErrorMessage": "Not found",
+        }
+        for qid in ids
+        if qid not in _executions
+    ]
+    return json_response(
+        {"QueryExecutions": execs, "UnprocessedQueryExecutionIds": unprocessed}
+    )
 
 
 # ---- Data Catalogs ----
+
 
 def _create_data_catalog(data):
     name = data.get("Name")
     if not name:
         return error_response_json("InvalidRequestException", "Name is required", 400)
     if name in _data_catalogs:
-        return error_response_json("InvalidRequestException",
-            f"Data catalog {name} already exists", 400)
+        return error_response_json(
+            "InvalidRequestException", f"Data catalog {name} already exists", 400
+        )
     catalog_type = data.get("Type", "HIVE")
     if catalog_type not in ("HIVE", "LAMBDA", "GLUE"):
-        return error_response_json("InvalidRequestException",
-            f"Invalid catalog type: {catalog_type}", 400)
+        return error_response_json(
+            "InvalidRequestException", f"Invalid catalog type: {catalog_type}", 400
+        )
     _data_catalogs[name] = {
         "Name": name,
         "Description": data.get("Description", ""),
@@ -594,25 +828,29 @@ def _get_data_catalog(data):
     name = data.get("Name")
     catalog = _data_catalogs.get(name)
     if not catalog:
-        return error_response_json("InvalidRequestException",
-            f"Data catalog {name} not found", 400)
+        return error_response_json(
+            "InvalidRequestException", f"Data catalog {name} not found", 400
+        )
     return json_response({"DataCatalog": catalog})
 
 
 def _list_data_catalogs(data):
-    summaries = [{"CatalogName": c["Name"], "Type": c["Type"]}
-                 for c in _data_catalogs.values()]
+    summaries = [
+        {"CatalogName": c["Name"], "Type": c["Type"]} for c in _data_catalogs.values()
+    ]
     return json_response({"DataCatalogsSummary": summaries})
 
 
 def _delete_data_catalog(data):
     name = data.get("Name")
     if name == "AwsDataCatalog":
-        return error_response_json("InvalidRequestException",
-            "Cannot delete the default AWS data catalog", 400)
+        return error_response_json(
+            "InvalidRequestException", "Cannot delete the default AWS data catalog", 400
+        )
     if name not in _data_catalogs:
-        return error_response_json("InvalidRequestException",
-            f"Data catalog {name} not found", 400)
+        return error_response_json(
+            "InvalidRequestException", f"Data catalog {name} not found", 400
+        )
     del _data_catalogs[name]
     _tags.pop(_arn_datacatalog(name), None)
     return json_response({})
@@ -622,8 +860,9 @@ def _update_data_catalog(data):
     name = data.get("Name")
     catalog = _data_catalogs.get(name)
     if not catalog:
-        return error_response_json("InvalidRequestException",
-            f"Data catalog {name} not found", 400)
+        return error_response_json(
+            "InvalidRequestException", f"Data catalog {name} not found", 400
+        )
     if "Description" in data:
         catalog["Description"] = data["Description"]
     if "Type" in data:
@@ -635,16 +874,22 @@ def _update_data_catalog(data):
 
 # ---- Prepared Statements ----
 
+
 def _create_prepared_statement(data):
     name = data.get("StatementName")
     workgroup = data.get("WorkGroup", "primary")
     query = data.get("QueryStatement", "")
     if not name:
-        return error_response_json("InvalidRequestException", "StatementName is required", 400)
+        return error_response_json(
+            "InvalidRequestException", "StatementName is required", 400
+        )
     key = f"{workgroup}/{name}"
     if key in _prepared_statements:
-        return error_response_json("InvalidRequestException",
-            f"Prepared statement {name} already exists in {workgroup}", 400)
+        return error_response_json(
+            "InvalidRequestException",
+            f"Prepared statement {name} already exists in {workgroup}",
+            400,
+        )
     _prepared_statements[key] = {
         "StatementName": name,
         "WorkGroupName": workgroup,
@@ -661,8 +906,11 @@ def _get_prepared_statement(data):
     key = f"{workgroup}/{name}"
     stmt = _prepared_statements.get(key)
     if not stmt:
-        return error_response_json("ResourceNotFoundException",
-            f"Prepared statement {name} not found in {workgroup}", 400)
+        return error_response_json(
+            "ResourceNotFoundException",
+            f"Prepared statement {name} not found in {workgroup}",
+            400,
+        )
     return json_response({"PreparedStatement": stmt})
 
 
@@ -671,8 +919,9 @@ def _delete_prepared_statement(data):
     workgroup = data.get("WorkGroup") or data.get("WorkGroupName", "primary")
     key = f"{workgroup}/{name}"
     if key not in _prepared_statements:
-        return error_response_json("ResourceNotFoundException",
-            f"Prepared statement {name} not found", 400)
+        return error_response_json(
+            "ResourceNotFoundException", f"Prepared statement {name} not found", 400
+        )
     del _prepared_statements[key]
     return json_response({})
 
@@ -689,21 +938,24 @@ def _list_prepared_statements(data):
 
 # ---- Table Metadata (stubs) ----
 
+
 def _get_table_metadata(data):
     catalog = data.get("CatalogName", "AwsDataCatalog")
     db = data.get("DatabaseName", "default")
     table = data.get("TableName", "")
-    return json_response({
-        "TableMetadata": {
-            "Name": table,
-            "CreateTime": time.time(),
-            "LastAccessTime": time.time(),
-            "TableType": "EXTERNAL_TABLE",
-            "Columns": [],
-            "PartitionKeys": [],
-            "Parameters": {"classification": "csv"},
+    return json_response(
+        {
+            "TableMetadata": {
+                "Name": table,
+                "CreateTime": time.time(),
+                "LastAccessTime": time.time(),
+                "TableType": "EXTERNAL_TABLE",
+                "Columns": [],
+                "PartitionKeys": [],
+                "Parameters": {"classification": "csv"},
+            }
         }
-    })
+    )
 
 
 def _list_table_metadata(data):
@@ -711,6 +963,7 @@ def _list_table_metadata(data):
 
 
 # ---- Tags ----
+
 
 def _tag_resource(data):
     arn = data.get("ResourceARN", "")
@@ -739,12 +992,14 @@ def _list_tags_for_resource(data):
 
 # ---- Helpers ----
 
+
 def _execution_out(ex):
     return {k: v for k, v in ex.items() if not k.startswith("_")}
 
 
 def reset():
     import time as _time
+
     global _workgroups, _data_catalogs
     _executions.clear()
     _named_queries.clear()
@@ -755,7 +1010,9 @@ def reset():
             "State": "ENABLED",
             "Description": "Primary workgroup",
             "CreationTime": _time.time(),
-            "Configuration": {"ResultConfiguration": {"OutputLocation": "s3://athena-results/"}},
+            "Configuration": {
+                "ResultConfiguration": {"OutputLocation": "s3://athena-results/"}
+            },
         }
     }
     _data_catalogs = {
