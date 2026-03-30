@@ -427,7 +427,7 @@ MiniStack keeps Python Lambda functions warm between invocations. After the firs
                     │  │  Step Functions  API GW v1/v2    │    │
                     │  │  ECS   RDS   ElastiCache  Glue   │    │
                     │  │  Athena  Firehose  Route53        │    │
-                    │  │  Cognito  EC2                    │    │
+                    │  │  Cognito  EC2  ALB                    │    │
                     │  └──────────────────────────────────┘    │
                     │                                          │
                     │  In-Memory Storage + Optional Docker     │
@@ -508,6 +508,7 @@ provider "aws" {
     cognitoidentity = "http://localhost:4566"
     ec2             = "http://localhost:4566"
     emr             = "http://localhost:4566"
+    alb             = "http://localhost:4566" 
   }
 }
 ```
@@ -559,6 +560,10 @@ config:
 | **Cognito** | ✅ | ✅ | ✅ |
 | **EC2** | ✅ | ✅ | ✅ |
 | **EMR** | ✅ | Paid | ✅ |
+<<<<<<< Updated upstream
+=======
+| **ELBv2 / ALB** | ✅ | Paid | ✅ |
+>>>>>>> Stashed changes
 | CloudFormation | ❌ | partial | ✅ |
 | Cost | **Free** | Was free, now paid | $35+/mo |
 | Docker image size | ~150MB | ~1GB | ~1GB |
