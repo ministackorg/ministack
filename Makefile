@@ -4,6 +4,12 @@ IMAGE_NAME := ministack
 CONTAINER_NAME := ministack
 PORT := 4566
 
+# Override any shell AWS credentials so make test is self-contained
+export AWS_ACCESS_KEY_ID := test
+export AWS_SECRET_ACCESS_KEY := test
+export AWS_DEFAULT_REGION := us-east-1
+unexport AWS_PROFILE
+
 build:
 	docker build -t $(IMAGE_NAME) .
 
@@ -32,8 +38,16 @@ logs:
 health:
 	@curl -s http://localhost:$(PORT)/_localstack/health | python3 -m json.tool
 
-test: run
-	@sleep 2
+test: stop run
+	@echo "Waiting for ministack to be ready..."
+	@READY=0; \
+	for i in $$(seq 1 30); do \
+		if curl -sf http://localhost:$(PORT)/_localstack/health > /dev/null 2>&1; then \
+			echo "Ready after $$i second(s)."; READY=1; break; \
+		fi; \
+		sleep 1; \
+	done; \
+	if [ "$$READY" = "0" ]; then echo "ERROR: ministack did not start within 30s" >&2; exit 1; fi
 	@echo "=== S3 ==="
 	aws --endpoint-url=http://localhost:$(PORT) s3 mb s3://test-bucket
 	echo "hello" | aws --endpoint-url=http://localhost:$(PORT) s3 cp - s3://test-bucket/hello.txt
@@ -71,6 +85,35 @@ test: run
 	@echo ""
 	@echo "=== Lambda ==="
 	aws --endpoint-url=http://localhost:$(PORT) lambda list-functions
+	@echo ""
+	@echo "=== ALB/ELBv2 ==="
+	@python3 -c "\
+import zipfile; \
+z = zipfile.ZipFile('/tmp/ms-alb-test.zip', 'w'); \
+z.writestr('index.py', 'import json\ndef handler(event, context):\n    return {\"statusCode\": 200, \"headers\": {\"Content-Type\": \"application/json\"}, \"body\": json.dumps({\"ok\": True, \"path\": event[\"path\"]})}\n'); \
+z.close(); \
+print('Lambda zip created')"
+	aws --endpoint-url=http://localhost:$(PORT) lambda create-function \
+		--function-name alb-test-fn --runtime python3.9 \
+		--handler index.handler \
+		--role arn:aws:iam::000000000000:role/role \
+		--zip-file fileb:///tmp/ms-alb-test.zip
+	@LB_ARN=$$(aws --endpoint-url=http://localhost:$(PORT) elbv2 create-load-balancer \
+		--name test-alb --query 'LoadBalancers[0].LoadBalancerArn' --output text) && \
+	TG_ARN=$$(aws --endpoint-url=http://localhost:$(PORT) elbv2 create-target-group \
+		--name test-tg --target-type lambda --protocol HTTP --port 80 \
+		--vpc-id vpc-00000001 --query 'TargetGroups[0].TargetGroupArn' --output text) && \
+	FN_ARN=$$(aws --endpoint-url=http://localhost:$(PORT) lambda get-function \
+		--function-name alb-test-fn --query 'Configuration.FunctionArn' --output text) && \
+	aws --endpoint-url=http://localhost:$(PORT) elbv2 register-targets \
+		--target-group-arn $$TG_ARN --targets Id=$$FN_ARN && \
+	aws --endpoint-url=http://localhost:$(PORT) elbv2 create-listener \
+		--load-balancer-arn $$LB_ARN --protocol HTTP --port 80 \
+		--default-actions Type=forward,TargetGroupArn=$$TG_ARN && \
+	RESULT=$$(curl -sf http://localhost:$(PORT)/_alb/test-alb/ping) && \
+	echo "ALB response: $$RESULT" && \
+	echo "$$RESULT" | python3 -c "import sys,json; d=json.load(sys.stdin); assert d['ok'] and d['path']=='/ping', f'Unexpected response: {d}'" && \
+	echo "ALB -> Lambda routing: OK"
 	@echo ""
 	@echo "=== All tests passed ==="
 

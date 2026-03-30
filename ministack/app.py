@@ -25,6 +25,7 @@ from ministack.core.persistence import save_all, load_state, PERSIST_STATE
 from ministack.services import s3, sqs, sns, dynamodb, lambda_svc, secretsmanager, cloudwatch_logs
 from ministack.services import ssm, eventbridge, kinesis, cloudwatch, ses, stepfunctions
 from ministack.services import ecs, rds, elasticache, glue, athena
+from ministack.services import alb
 from ministack.services import ec2
 from ministack.services import apigateway
 from ministack.services import firehose
@@ -32,6 +33,7 @@ from ministack.services import apigateway_v1
 from ministack.services import route53
 from ministack.services import cognito
 from ministack.services import emr
+from ministack.services import efs
 from ministack.services.iam_sts import handle_iam_request, handle_sts_request
 
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
@@ -70,6 +72,8 @@ SERVICE_HANDLERS = {
     "cognito-identity": cognito.handle_request,
     "ec2": ec2.handle_request,
     "elasticmapreduce": emr.handle_request,
+    "elasticloadbalancing": alb.handle_request,
+    "elasticfilesystem": efs.handle_request,
 }
 
 SERVICE_NAME_ALIASES = {
@@ -84,6 +88,8 @@ SERVICE_NAME_ALIASES = {
     "route53": "route53",
     "cognito-idp": "cognito-idp",
     "cognito-identity": "cognito-identity",
+    "elbv2": "elasticloadbalancing",
+    "elb": "elasticloadbalancing",
 }
 
 
@@ -120,7 +126,7 @@ BANNER = r"""
  Services: S3, SQS, SNS, DynamoDB, Lambda, IAM, STS, SecretsManager, CloudWatch Logs,
           SSM, EventBridge, Kinesis, CloudWatch, SES, Step Functions,
           ECS, RDS, ElastiCache, Glue, Athena, API Gateway, Firehose, Route53,
-          Cognito, EC2, EMR
+          Cognito, EC2, EMR, EBS, EFS, ALB/ELBv2
 """
 
 
@@ -204,6 +210,41 @@ async def app(scope, receive, send):
         except Exception as e:
             logger.exception(f"Error in execute-api dispatch: {e}")
             status, resp_headers, resp_body = 500, {"Content-Type": "application/json"}, json.dumps({"message": str(e)}).encode()
+        resp_headers.update({
+            "Access-Control-Allow-Origin": "*",
+            "x-amzn-requestid": request_id,
+            "x-amz-request-id": request_id,
+        })
+        await _send_response(send, status, resp_headers, resp_body)
+        return
+
+    # ALB data-plane — two addressing modes:
+    #   1. Host header matches a configured ALB DNS name or {lb-name}.alb.localhost
+    #   2. Path prefix /_alb/{lb-name}/...  (no DNS config needed for local testing)
+    _alb_lb = alb.find_lb_for_host(host)
+    if _alb_lb is None and path.startswith("/_alb/"):
+        _alb_path_parts = path[6:].split("/", 1)
+        _alb_lb = alb._find_lb_by_name(_alb_path_parts[0])
+        if _alb_lb:
+            path = "/" + _alb_path_parts[1] if len(_alb_path_parts) > 1 else "/"
+
+    if _alb_lb:
+        _alb_port = 80
+        if ":" in host:
+            try:
+                _alb_port = int(host.rsplit(":", 1)[-1])
+            except ValueError:
+                pass
+        try:
+            status, resp_headers, resp_body = await alb.dispatch_request(
+                _alb_lb, method, path, headers, body, query_params, _alb_port
+            )
+        except Exception as e:
+            logger.exception(f"Error in ALB data-plane dispatch: {e}")
+            status, resp_headers, resp_body = (
+                500, {"Content-Type": "application/json"},
+                json.dumps({"message": str(e)}).encode(),
+            )
         resp_headers.update({
             "Access-Control-Allow-Origin": "*",
             "x-amzn-requestid": request_id,
@@ -378,6 +419,8 @@ def _reset_all_state():
         (cognito, cognito.reset),
         (ec2, ec2.reset),
         (emr, emr.reset),
+        (alb, alb.reset),
+        (efs, efs.reset),
     ]:
         try:
             fn()

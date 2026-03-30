@@ -7,6 +7,68 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [1.1.4] — 2026-03-30
+
+### Added
+- **Amazon ELBv2 / ALB** (`ministack/services/alb.py`) — full control plane + data plane
+  - **Load Balancers**: `CreateLoadBalancer`, `DescribeLoadBalancers`, `DeleteLoadBalancer`, `DescribeLoadBalancerAttributes`, `ModifyLoadBalancerAttributes`
+  - **Target Groups**: `CreateTargetGroup`, `DescribeTargetGroups`, `ModifyTargetGroup`, `DeleteTargetGroup`, `DescribeTargetGroupAttributes`, `ModifyTargetGroupAttributes`
+  - **Listeners**: `CreateListener`, `DescribeListeners`, `ModifyListener`, `DeleteListener`
+  - **Rules**: `CreateRule`, `DescribeRules`, `ModifyRule`, `DeleteRule`, `SetRulePriorities`
+  - **Targets**: `RegisterTargets`, `DeregisterTargets`, `DescribeTargetHealth`
+  - **Tags**: `AddTags`, `RemoveTags`, `DescribeTags`
+  - **Data plane — ALB→Lambda live traffic routing**
+    - Incoming HTTP requests matched against configured listener rules (priority order)
+    - Rule conditions supported: `path-pattern`, `host-header`, `http-method`, `query-string`, `http-header` (fnmatch glob matching)
+    - Actions supported: `forward` (to target group), `fixed-response`, `redirect` (301/302 with `#{host}`/`#{path}`/`#{port}` substitution)
+    - `TargetType=lambda` target groups: builds ALB event payload (httpMethod, path, queryStringParameters, multiValueQueryStringParameters, headers, multiValueHeaders, body, isBase64Encoded, requestContext.elb) and invokes Lambda via the in-process Lambda runtime; translates Lambda response (statusCode, headers, multiValueHeaders, body, isBase64Encoded) back to HTTP
+    - Two addressing modes — no DNS or `/etc/hosts` changes required for local testing:
+      - **Host-header**: `Host: {lb-name}.alb.localhost[:{port}]` or the ALB's exact `DNSName`
+      - **Path prefix**: `/_alb/{lb-name}/path` (rewrites path before rule evaluation)
+  - Query/XML protocol via `Action=` parameter; credential scope `elasticloadbalancing`
+  - 10 control-plane integration tests + 7 data-plane integration tests
+
+### Tests
+- 688 integration tests — all passing
+
+---
+
+## [1.1.3] — 2026-03-30
+
+### Added
+- **Amazon EBS** (Elastic Block Store) — added to the EC2 Query/XML service handler
+  - **Volumes**: `CreateVolume`, `DeleteVolume`, `DescribeVolumes`, `DescribeVolumeStatus`,
+    `AttachVolume`, `DetachVolume`, `ModifyVolume`, `DescribeVolumesModifications`,
+    `EnableVolumeIO`, `ModifyVolumeAttribute`, `DescribeVolumeAttribute`
+  - **Snapshots**: `CreateSnapshot`, `DeleteSnapshot`, `DescribeSnapshots`,
+    `CopySnapshot`, `ModifySnapshotAttribute`, `DescribeSnapshotAttribute`
+  - All three volume types supported (gp2/gp3/io1/io2/st1/sc1)
+  - Attach/Detach updates volume state (available ↔ in-use)
+  - ModifyVolume returns `completed` immediately
+  - Snapshots store as `completed` (emulator — no real EBS)
+  - Pro-only on LocalStack — free here
+  - 8 integration tests
+
+- **Amazon EFS** (Elastic File System) — new service (`ministack/services/efs.py`)
+  - REST/JSON protocol via `/2015-02-01/*` paths, credential scope `elasticfilesystem`
+  - **File Systems**: `CreateFileSystem`, `DescribeFileSystems`, `DeleteFileSystem`,
+    `UpdateFileSystem` — CreationToken idempotency enforced
+  - **Mount Targets**: `CreateMountTarget`, `DescribeMountTargets`, `DeleteMountTarget`,
+    `DescribeMountTargetSecurityGroups`, `ModifyMountTargetSecurityGroups`
+  - **Access Points**: `CreateAccessPoint`, `DescribeAccessPoints`, `DeleteAccessPoint`
+  - **Tags**: `TagResource`, `UntagResource`, `ListTagsForResource`
+  - **Lifecycle**: `PutLifecycleConfiguration`, `DescribeLifecycleConfiguration`
+  - **Backup Policy**: `PutBackupPolicy`, `DescribeBackupPolicy`
+  - **Account**: `DescribeAccountPreferences`, `PutAccountPreferences`
+  - FileSystem with active mount targets blocks deletion (`FileSystemInUse`)
+  - Pro-only on LocalStack — free here
+  - 10 integration tests
+
+### Tests
+- 671 integration tests — all passing (672 - 1 flaky Docker ECS test)
+
+---
+
 ## [1.1.2] — 2026-03-29
 
 ### Added

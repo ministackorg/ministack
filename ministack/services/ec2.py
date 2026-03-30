@@ -24,6 +24,11 @@ Supports:
   ENI:             CreateNetworkInterface, DeleteNetworkInterface, DescribeNetworkInterfaces,
                    AttachNetworkInterface, DetachNetworkInterface
   VPC Endpoints:   CreateVpcEndpoint, DeleteVpcEndpoints, DescribeVpcEndpoints
+  EBS Volumes:     CreateVolume, DeleteVolume, DescribeVolumes, DescribeVolumeStatus,
+                   AttachVolume, DetachVolume, ModifyVolume, DescribeVolumesModifications,
+                   EnableVolumeIO, ModifyVolumeAttribute, DescribeVolumeAttribute
+  EBS Snapshots:   CreateSnapshot, DeleteSnapshot, DescribeSnapshots,
+                   ModifySnapshotAttribute, DescribeSnapshotAttribute, CopySnapshot
 """
 
 import os
@@ -55,6 +60,8 @@ _tags: dict = {}            # resource_id -> [{"Key": ..., "Value": ...}]
 _route_tables: dict = {}    # rtb_id -> route table record
 _network_interfaces: dict = {}  # eni_id -> ENI record
 _vpc_endpoints: dict = {}   # vpce_id -> endpoint record
+_volumes: dict = {}         # vol_id -> volume record
+_snapshots: dict = {}       # snap_id -> snapshot record
 
 # Default VPC / subnet created at import time so DescribeVpcs always returns something
 _DEFAULT_VPC_ID = "vpc-00000001"
@@ -1010,6 +1017,302 @@ def _describe_tags(p):
 
 
 # ---------------------------------------------------------------------------
+# EBS Volumes
+# ---------------------------------------------------------------------------
+
+def _new_volume_id():
+    return "vol-" + "".join(random.choices(string.hexdigits[:16], k=17))
+
+def _new_snapshot_id():
+    return "snap-" + "".join(random.choices(string.hexdigits[:16], k=17))
+
+
+def _create_volume(p):
+    vol_id = _new_volume_id()
+    az = _p(p, "AvailabilityZone") or f"{REGION}a"
+    size = int(_p(p, "Size") or "8")
+    vol_type = _p(p, "VolumeType") or "gp2"
+    snapshot_id = _p(p, "SnapshotId") or ""
+    iops = _p(p, "Iops") or ""
+    encrypted = _p(p, "Encrypted") or "false"
+    now = _now_ts()
+    _volumes[vol_id] = {
+        "VolumeId": vol_id,
+        "Size": size,
+        "AvailabilityZone": az,
+        "State": "available",
+        "VolumeType": vol_type,
+        "SnapshotId": snapshot_id,
+        "Iops": int(iops) if iops else (3000 if vol_type in ("gp3", "io1", "io2") else 0),
+        "Encrypted": encrypted.lower() == "true",
+        "CreateTime": now,
+        "Attachments": [],
+        "MultiAttachEnabled": False,
+        "Throughput": 125 if vol_type == "gp3" else 0,
+    }
+    return _xml(200, "CreateVolumeResponse", _volume_inner_xml(_volumes[vol_id]))
+
+
+def _delete_volume(p):
+    vol_id = _p(p, "VolumeId")
+    if vol_id not in _volumes:
+        return _error("InvalidVolume.NotFound", f"The volume '{vol_id}' does not exist.", 400)
+    vol = _volumes[vol_id]
+    if vol["Attachments"]:
+        return _error("VolumeInUse", f"Volume {vol_id} is currently attached.", 400)
+    del _volumes[vol_id]
+    return _xml(200, "DeleteVolumeResponse", "<return>true</return>")
+
+
+def _describe_volumes(p):
+    filter_ids = _parse_member_list(p, "VolumeId")
+    items = ""
+    for vol in _volumes.values():
+        if filter_ids and vol["VolumeId"] not in filter_ids:
+            continue
+        items += f"<item>{_volume_inner_xml(vol)}</item>"
+    return _xml(200, "DescribeVolumesResponse", f"<volumeSet>{items}</volumeSet>")
+
+
+def _describe_volume_status(p):
+    filter_ids = _parse_member_list(p, "VolumeId")
+    items = ""
+    for vol in _volumes.values():
+        if filter_ids and vol["VolumeId"] not in filter_ids:
+            continue
+        items += f"""<item>
+            <volumeId>{vol['VolumeId']}</volumeId>
+            <availabilityZone>{vol['AvailabilityZone']}</availabilityZone>
+            <volumeStatus>
+                <status>ok</status>
+                <details><item><name>io-enabled</name><status>passed</status></item></details>
+            </volumeStatus>
+            <actionsSet/>
+            <eventsSet/>
+        </item>"""
+    return _xml(200, "DescribeVolumeStatusResponse", f"<volumeStatusSet>{items}</volumeStatusSet>")
+
+
+def _attach_volume(p):
+    vol_id = _p(p, "VolumeId")
+    instance_id = _p(p, "InstanceId")
+    device = _p(p, "Device") or "/dev/xvdf"
+    vol = _volumes.get(vol_id)
+    if not vol:
+        return _error("InvalidVolume.NotFound", f"The volume '{vol_id}' does not exist.", 400)
+    if not _instances.get(instance_id):
+        return _error("InvalidInstanceID.NotFound", f"The instance ID '{instance_id}' does not exist.", 400)
+    now = _now_ts()
+    attachment = {
+        "VolumeId": vol_id,
+        "InstanceId": instance_id,
+        "Device": device,
+        "State": "attached",
+        "AttachTime": now,
+        "DeleteOnTermination": False,
+    }
+    vol["Attachments"] = [attachment]
+    vol["State"] = "in-use"
+    return _xml(200, "AttachVolumeResponse", f"""
+        <volumeId>{vol_id}</volumeId>
+        <instanceId>{instance_id}</instanceId>
+        <device>{device}</device>
+        <status>attached</status>
+        <attachTime>{now}</attachTime>
+        <deleteOnTermination>false</deleteOnTermination>""")
+
+
+def _detach_volume(p):
+    vol_id = _p(p, "VolumeId")
+    vol = _volumes.get(vol_id)
+    if not vol:
+        return _error("InvalidVolume.NotFound", f"The volume '{vol_id}' does not exist.", 400)
+    vol["Attachments"] = []
+    vol["State"] = "available"
+    return _xml(200, "DetachVolumeResponse", f"""
+        <volumeId>{vol_id}</volumeId>
+        <status>detached</status>""")
+
+
+def _modify_volume(p):
+    vol_id = _p(p, "VolumeId")
+    vol = _volumes.get(vol_id)
+    if not vol:
+        return _error("InvalidVolume.NotFound", f"The volume '{vol_id}' does not exist.", 400)
+    if _p(p, "Size"):
+        vol["Size"] = int(_p(p, "Size"))
+    if _p(p, "VolumeType"):
+        vol["VolumeType"] = _p(p, "VolumeType")
+    if _p(p, "Iops"):
+        vol["Iops"] = int(_p(p, "Iops"))
+    now = _now_ts()
+    return _xml(200, "ModifyVolumeResponse", f"""
+        <volumeModification>
+            <volumeId>{vol_id}</volumeId>
+            <modificationState>completed</modificationState>
+            <targetSize>{vol['Size']}</targetSize>
+            <targetVolumeType>{vol['VolumeType']}</targetVolumeType>
+            <targetIops>{vol['Iops']}</targetIops>
+            <startTime>{now}</startTime>
+            <endTime>{now}</endTime>
+            <progress>100</progress>
+        </volumeModification>""")
+
+
+def _describe_volumes_modifications(p):
+    filter_ids = _parse_member_list(p, "VolumeId")
+    items = ""
+    for vol in _volumes.values():
+        if filter_ids and vol["VolumeId"] not in filter_ids:
+            continue
+        now = _now_ts()
+        items += f"""<item>
+            <volumeId>{vol['VolumeId']}</volumeId>
+            <modificationState>completed</modificationState>
+            <targetSize>{vol['Size']}</targetSize>
+            <targetVolumeType>{vol['VolumeType']}</targetVolumeType>
+            <targetIops>{vol['Iops']}</targetIops>
+            <startTime>{now}</startTime>
+            <endTime>{now}</endTime>
+            <progress>100</progress>
+        </item>"""
+    return _xml(200, "DescribeVolumesModificationsResponse", f"<volumeModificationSet>{items}</volumeModificationSet>")
+
+
+def _enable_volume_io(p):
+    return _xml(200, "EnableVolumeIOResponse", "<return>true</return>")
+
+
+def _modify_volume_attribute(p):
+    return _xml(200, "ModifyVolumeAttributeResponse", "<return>true</return>")
+
+
+def _describe_volume_attribute(p):
+    vol_id = _p(p, "VolumeId")
+    attribute = _p(p, "Attribute") or "autoEnableIO"
+    return _xml(200, "DescribeVolumeAttributeResponse", f"""
+        <volumeId>{vol_id}</volumeId>
+        <autoEnableIO><value>false</value></autoEnableIO>""")
+
+
+def _volume_inner_xml(vol):
+    attachments = "".join(f"""<item>
+        <volumeId>{a['VolumeId']}</volumeId>
+        <instanceId>{a['InstanceId']}</instanceId>
+        <device>{a['Device']}</device>
+        <status>{a['State']}</status>
+        <attachTime>{a['AttachTime']}</attachTime>
+        <deleteOnTermination>{'true' if a['DeleteOnTermination'] else 'false'}</deleteOnTermination>
+    </item>""" for a in vol.get("Attachments", []))
+    snap = f"<snapshotId>{vol['SnapshotId']}</snapshotId>" if vol.get("SnapshotId") else "<snapshotId/>"
+    iops = f"<iops>{vol['Iops']}</iops>" if vol.get("Iops") else ""
+    return f"""
+        <volumeId>{vol['VolumeId']}</volumeId>
+        <size>{vol['Size']}</size>
+        <availabilityZone>{vol['AvailabilityZone']}</availabilityZone>
+        <status>{vol['State']}</status>
+        <createTime>{vol['CreateTime']}</createTime>
+        <volumeType>{vol['VolumeType']}</volumeType>
+        {snap}
+        {iops}
+        <encrypted>{'true' if vol['Encrypted'] else 'false'}</encrypted>
+        <multiAttachEnabled>{'true' if vol['MultiAttachEnabled'] else 'false'}</multiAttachEnabled>
+        <attachmentSet>{attachments}</attachmentSet>
+        <tagSet/>"""
+
+
+# ---------------------------------------------------------------------------
+# EBS Snapshots
+# ---------------------------------------------------------------------------
+
+def _create_snapshot(p):
+    vol_id = _p(p, "VolumeId")
+    description = _p(p, "Description") or ""
+    vol = _volumes.get(vol_id)
+    if not vol:
+        return _error("InvalidVolume.NotFound", f"The volume '{vol_id}' does not exist.", 400)
+    snap_id = _new_snapshot_id()
+    now = _now_ts()
+    _snapshots[snap_id] = {
+        "SnapshotId": snap_id,
+        "VolumeId": vol_id,
+        "VolumeSize": vol["Size"],
+        "Description": description,
+        "State": "completed",
+        "StartTime": now,
+        "Progress": "100%",
+        "OwnerId": ACCOUNT_ID,
+        "Encrypted": vol["Encrypted"],
+        "StorageTier": "standard",
+    }
+    return _xml(200, "CreateSnapshotResponse", _snapshot_inner_xml(_snapshots[snap_id]))
+
+
+def _delete_snapshot(p):
+    snap_id = _p(p, "SnapshotId")
+    if snap_id not in _snapshots:
+        return _error("InvalidSnapshot.NotFound", f"The snapshot '{snap_id}' does not exist.", 400)
+    del _snapshots[snap_id]
+    return _xml(200, "DeleteSnapshotResponse", "<return>true</return>")
+
+
+def _describe_snapshots(p):
+    filter_ids = _parse_member_list(p, "SnapshotId")
+    owner_ids = _parse_member_list(p, "Owner")
+    items = ""
+    for snap in _snapshots.values():
+        if filter_ids and snap["SnapshotId"] not in filter_ids:
+            continue
+        if owner_ids and snap["OwnerId"] not in owner_ids and "self" not in owner_ids:
+            continue
+        items += f"<item>{_snapshot_inner_xml(snap)}</item>"
+    return _xml(200, "DescribeSnapshotsResponse", f"<snapshotSet>{items}</snapshotSet>")
+
+
+def _copy_snapshot(p):
+    source_snap_id = _p(p, "SourceSnapshotId")
+    description = _p(p, "Description") or ""
+    source = _snapshots.get(source_snap_id)
+    if not source:
+        return _error("InvalidSnapshot.NotFound", f"The snapshot '{source_snap_id}' does not exist.", 400)
+    new_snap_id = _new_snapshot_id()
+    now = _now_ts()
+    _snapshots[new_snap_id] = {
+        **source,
+        "SnapshotId": new_snap_id,
+        "Description": description or source["Description"],
+        "StartTime": now,
+    }
+    return _xml(200, "CopySnapshotResponse", f"<snapshotId>{new_snap_id}</snapshotId>")
+
+
+def _modify_snapshot_attribute(p):
+    return _xml(200, "ModifySnapshotAttributeResponse", "<return>true</return>")
+
+
+def _describe_snapshot_attribute(p):
+    snap_id = _p(p, "SnapshotId")
+    return _xml(200, "DescribeSnapshotAttributeResponse", f"""
+        <snapshotId>{snap_id}</snapshotId>
+        <createVolumePermission/>""")
+
+
+def _snapshot_inner_xml(snap):
+    return f"""
+        <snapshotId>{snap['SnapshotId']}</snapshotId>
+        <volumeId>{snap['VolumeId']}</volumeId>
+        <status>{snap['State']}</status>
+        <startTime>{snap['StartTime']}</startTime>
+        <progress>{snap['Progress']}</progress>
+        <ownerId>{snap['OwnerId']}</ownerId>
+        <volumeSize>{snap['VolumeSize']}</volumeSize>
+        <description>{snap['Description']}</description>
+        <encrypted>{'true' if snap['Encrypted'] else 'false'}</encrypted>
+        <storageTier>{snap['StorageTier']}</storageTier>
+        <tagSet/>"""
+
+
+# ---------------------------------------------------------------------------
 # XML helpers
 # ---------------------------------------------------------------------------
 
@@ -1364,6 +1667,10 @@ def _guess_resource_type(resource_id):
         return "network-interface"
     if resource_id.startswith("vpce-"):
         return "vpc-endpoint"
+    if resource_id.startswith("vol-"):
+        return "volume"
+    if resource_id.startswith("snap-"):
+        return "snapshot"
     return "resource"
 
 
@@ -1410,6 +1717,8 @@ def reset():
     _route_tables.clear()
     _network_interfaces.clear()
     _vpc_endpoints.clear()
+    _volumes.clear()
+    _snapshots.clear()
     _init_defaults()
 
 
@@ -1474,4 +1783,23 @@ _ACTION_MAP = {
     "CreateVpcEndpoint": _create_vpc_endpoint,
     "DeleteVpcEndpoints": _delete_vpc_endpoints,
     "DescribeVpcEndpoints": _describe_vpc_endpoints,
+    # EBS Volumes
+    "CreateVolume": _create_volume,
+    "DeleteVolume": _delete_volume,
+    "DescribeVolumes": _describe_volumes,
+    "DescribeVolumeStatus": _describe_volume_status,
+    "AttachVolume": _attach_volume,
+    "DetachVolume": _detach_volume,
+    "ModifyVolume": _modify_volume,
+    "DescribeVolumesModifications": _describe_volumes_modifications,
+    "EnableVolumeIO": _enable_volume_io,
+    "ModifyVolumeAttribute": _modify_volume_attribute,
+    "DescribeVolumeAttribute": _describe_volume_attribute,
+    # EBS Snapshots
+    "CreateSnapshot": _create_snapshot,
+    "DeleteSnapshot": _delete_snapshot,
+    "DescribeSnapshots": _describe_snapshots,
+    "CopySnapshot": _copy_snapshot,
+    "ModifySnapshotAttribute": _modify_snapshot_attribute,
+    "DescribeSnapshotAttribute": _describe_snapshot_attribute,
 }
