@@ -152,6 +152,14 @@ def emr():
 @pytest.fixture(scope="session")
 def elbv2():
     return make_client("elbv2")
+                                                                                                          
+@pytest.fixture(scope="session")
+def ebs():
+    return make_client("ec2")
+
+@pytest.fixture(scope="session")
+def efs():
+    return make_client("efs")
 
 @pytest.fixture(scope="session")
 def sfn_sync():

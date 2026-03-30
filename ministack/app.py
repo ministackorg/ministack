@@ -33,6 +33,7 @@ from ministack.services import apigateway_v1
 from ministack.services import route53
 from ministack.services import cognito
 from ministack.services import emr
+from ministack.services import efs
 from ministack.services.iam_sts import handle_iam_request, handle_sts_request
 
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
@@ -72,6 +73,7 @@ SERVICE_HANDLERS = {
     "ec2": ec2.handle_request,
     "elasticmapreduce": emr.handle_request,
     "elasticloadbalancing": alb.handle_request,
+    "elasticfilesystem": efs.handle_request,
 }
 
 SERVICE_NAME_ALIASES = {
@@ -418,6 +420,7 @@ def _reset_all_state():
         (ec2, ec2.reset),
         (emr, emr.reset),
         (alb, alb.reset),
+        (efs, efs.reset),
     ]:
         try:
             fn()
