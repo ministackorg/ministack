@@ -8,15 +8,15 @@ Job execution runs Python scripts via subprocess in background threads.
 Crawlers transition through RUNNING state with a configurable timer.
 """
 
-import os
 import json
-import time
+import logging
+import os
 import subprocess
 import tempfile
 import threading
-import logging
+import time
 
-from ministack.core.responses import json_response, error_response_json, new_uuid
+from ministack.core.responses import error_response_json, json_response, new_uuid
 
 logger = logging.getLogger("glue")
 
@@ -353,7 +353,7 @@ def _batch_create_partition(data):
         if dupe:
             errors.append({"PartitionValues": values, "ErrorDetail": {
                 "ErrorCode": "AlreadyExistsException",
-                "ErrorMessage": f"Partition already exists"}})
+                "ErrorMessage": "Partition already exists"}})
         else:
             _partitions[key].append({
                 **pi,

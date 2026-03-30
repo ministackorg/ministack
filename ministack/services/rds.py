@@ -21,9 +21,9 @@ When Docker is available, CreateDBInstance spins up a real Postgres/MySQL contai
 and returns the actual host:port as the endpoint.
 """
 
+import logging
 import os
 import time
-import logging
 from urllib.parse import parse_qs
 
 from ministack.core.responses import new_uuid

@@ -4,9 +4,9 @@ Handles XML responses (S3, SQS, SNS, IAM, STS, CloudWatch) and
 JSON responses (DynamoDB, Lambda, SecretsManager, CloudWatch Logs).
 """
 
+import hashlib
 import json
 import uuid
-import hashlib
 from datetime import datetime, timezone
 from xml.etree.ElementTree import Element, SubElement, tostring
 

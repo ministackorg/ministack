@@ -31,7 +31,8 @@ STS actions:
 import json
 import logging
 import time
-from urllib.parse import parse_qs, quote as _url_quote
+from urllib.parse import parse_qs
+from urllib.parse import quote as _url_quote
 
 from ministack.core.responses import new_uuid
 

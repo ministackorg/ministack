@@ -41,11 +41,11 @@ Data plane:
 """
 
 import json
-import time
 import logging
 import re
+import time
 
-from ministack.core.responses import new_uuid, error_response_json
+from ministack.core.responses import error_response_json, new_uuid
 
 logger = logging.getLogger("apigateway")
 
@@ -314,8 +314,8 @@ def _path_matches(route_path: str, request_path: str) -> bool:
 
 async def _invoke_lambda_proxy(integration, api_id, stage, path, method, headers, body, query_params, route_key="$default"):
     """Invoke a Lambda function using the API Gateway v2 proxy event format."""
-    from ministack.services import lambda_svc
     from ministack.core.lambda_runtime import get_or_create_worker
+    from ministack.services import lambda_svc
 
     uri = integration.get("integrationUri", "")
     # integrationUri is a Lambda ARN; the function name is the last segment
@@ -382,8 +382,8 @@ async def _invoke_lambda_proxy(integration, api_id, stage, path, method, headers
 
 async def _invoke_http_proxy(integration, path, method, headers, body, query_params):
     """Forward a request to an HTTP backend."""
-    import urllib.request
     import urllib.error
+    import urllib.request
 
     uri = integration.get("integrationUri", "")
     url = uri.rstrip("/") + path

@@ -15,13 +15,13 @@ Supports:
   Account:        DescribeAccountPreferences, PutAccountPreferences
 """
 
-import os
 import json
-import random
-import string
 import logging
-import time
+import os
+import random
 import re
+import string
+import time
 
 logger = logging.getLogger("efs")
 

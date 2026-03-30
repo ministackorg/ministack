@@ -20,9 +20,9 @@ When Docker is available, CreateCacheCluster spins up a real Redis/Memcached con
 Otherwise returns localhost:6379 (assumes Redis sidecar in docker-compose).
 """
 
+import logging
 import os
 import time
-import logging
 from urllib.parse import parse_qs
 
 from ministack.core.responses import new_uuid

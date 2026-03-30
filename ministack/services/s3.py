@@ -17,18 +17,25 @@ Supports: CreateBucket, DeleteBucket, ListBuckets, HeadBucket,
 Storage: In-memory (optionally backed by S3_DATA_DIR).
 """
 
-import os
-import re
 import base64
 import hashlib
 import json
 import logging
+import os
+import re
 import threading
 import time
-from urllib.parse import quote as url_quote, unquote as url_unquote
-from xml.etree.ElementTree import Element, SubElement, tostring, fromstring
+from urllib.parse import quote as url_quote
+from urllib.parse import unquote as url_unquote
+from xml.etree.ElementTree import Element, SubElement, fromstring, tostring
 
-from ministack.core.responses import md5_hash, sha256_hash, now_iso, new_uuid, iso_to_rfc7231
+from ministack.core.responses import (
+    iso_to_rfc7231,
+    md5_hash,
+    new_uuid,
+    now_iso,
+    sha256_hash,
+)
 
 logger = logging.getLogger("s3")
 

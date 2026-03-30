@@ -7,8 +7,8 @@ Routes incoming requests to the correct service handler based on:
   - URL path patterns (e.g., /2015-03-31/functions for Lambda)
 """
 
-import re
 import logging
+import re
 
 logger = logging.getLogger("localstack-clone")
 

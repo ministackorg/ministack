@@ -21,7 +21,6 @@ _EXECUTE_PORT = urlparse(_endpoint).port or 4566
 import pytest
 from botocore.exceptions import ClientError
 
-
 # ========== S3 ==========
 
 
@@ -1031,7 +1030,8 @@ def test_lambda_create_invoke(lam):
 
 def test_lambda_esm_sqs(lam, sqs):
     """SQS → Lambda event source mapping: messages sent to SQS trigger Lambda."""
-    import io, zipfile as zf
+    import io
+    import zipfile as zf
 
     # Clean up from previous runs
     try:
@@ -2578,24 +2578,24 @@ def test_iam_create_policy(iam):
 
 
 def test_iam_get_policy(iam):
-    arn = f"arn:aws:iam::000000000000:policy/iam-test-policy"
+    arn = "arn:aws:iam::000000000000:policy/iam-test-policy"
     resp = iam.get_policy(PolicyArn=arn)
     assert resp["Policy"]["PolicyName"] == "iam-test-policy"
 
 
 def test_iam_attach_role_policy(iam):
-    policy_arn = f"arn:aws:iam::000000000000:policy/iam-test-policy"
+    policy_arn = "arn:aws:iam::000000000000:policy/iam-test-policy"
     iam.attach_role_policy(RoleName="iam-test-role", PolicyArn=policy_arn)
 
 
 def test_iam_list_attached_role_policies(iam):
     resp = iam.list_attached_role_policies(RoleName="iam-test-role")
     arns = [p["PolicyArn"] for p in resp["AttachedPolicies"]]
-    assert f"arn:aws:iam::000000000000:policy/iam-test-policy" in arns
+    assert "arn:aws:iam::000000000000:policy/iam-test-policy" in arns
 
 
 def test_iam_detach_role_policy(iam):
-    policy_arn = f"arn:aws:iam::000000000000:policy/iam-test-policy"
+    policy_arn = "arn:aws:iam::000000000000:policy/iam-test-policy"
     iam.detach_role_policy(RoleName="iam-test-role", PolicyArn=policy_arn)
     resp = iam.list_attached_role_policies(RoleName="iam-test-role")
     arns = [p["PolicyArn"] for p in resp["AttachedPolicies"]]
@@ -4663,7 +4663,7 @@ def test_athena_tags_v2(athena):
     arn = athena.get_work_group(WorkGroup="ath-tag-v2wg")["WorkGroup"]["Configuration"][
         "ResultConfiguration"
     ]["OutputLocation"]
-    wg_arn = f"arn:aws:athena:us-east-1:000000000000:workgroup/ath-tag-v2wg"
+    wg_arn = "arn:aws:athena:us-east-1:000000000000:workgroup/ath-tag-v2wg"
 
     athena.tag_resource(ResourceARN=wg_arn, Tags=[{"Key": "env", "Value": "dev"}])
     resp = athena.list_tags_for_resource(ResourceARN=wg_arn)
@@ -5665,8 +5665,8 @@ def test_ddb_ttl(ddb):
 
 def test_lambda_warm_start(lam, apigw):
     """Warm worker via API Gateway execute-api: module-level state persists across invocations."""
-    import uuid as _uuid
     import urllib.request as _urlreq
+    import uuid as _uuid
 
     fname = f"intg-warm-{_uuid.uuid4().hex[:8]}"
     code = (
@@ -5718,9 +5718,9 @@ def test_lambda_warm_start(lam, apigw):
 
 def test_apigw_execute_lambda_proxy(apigw, lam):
     """API Gateway execute-api routes a request through Lambda proxy integration."""
-    import uuid as _uuid
-    import urllib.request as _urlreq
     import urllib.error as _urlerr
+    import urllib.request as _urlreq
+    import uuid as _uuid
 
     fname = f"intg-apigw-fn-{_uuid.uuid4().hex[:8]}"
     code = (
@@ -5774,8 +5774,8 @@ def test_apigw_execute_lambda_proxy(apigw, lam):
 
 def test_apigw_execute_no_route(apigw):
     """execute-api returns 404 when no matching route exists."""
-    import urllib.request as _urlreq
     import urllib.error as _urlerr
+    import urllib.request as _urlreq
 
     api_id = apigw.create_api(Name="no-route-api", ProtocolType="HTTP")["ApiId"]
     apigw.create_stage(ApiId=api_id, StageName="$default")
@@ -5792,8 +5792,8 @@ def test_apigw_execute_no_route(apigw):
 
 def test_apigw_execute_default_route(apigw, lam):
     """$default catch-all route matches any path."""
-    import uuid as _uuid
     import urllib.request as _urlreq
+    import uuid as _uuid
 
     fname = f"intg-default-fn-{_uuid.uuid4().hex[:8]}"
     code = (
@@ -5901,8 +5901,8 @@ def test_eventbridge_lambda_target(eb, lam):
 
 def test_apigw_path_param_route(apigw, lam):
     """Route with {id} path parameter matches requests correctly."""
-    import uuid as _uuid
     import urllib.request as _urlreq
+    import uuid as _uuid
 
     fname = f"intg-param-fn-{_uuid.uuid4().hex[:8]}"
     code = (
@@ -5946,8 +5946,8 @@ def test_apigw_path_param_route(apigw, lam):
 
 def test_apigw_greedy_path_param(apigw, lam):
     """{proxy+} greedy path parameter matches paths with multiple segments."""
-    import uuid as _uuid_mod
     import urllib.request as _urlreq
+    import uuid as _uuid_mod
 
     fname = f"intg-greedy-{_uuid_mod.uuid4().hex[:8]}"
     code = 'def handler(event, context):\n    return {"statusCode": 200, "body": event["rawPath"]}\n'
@@ -6032,8 +6032,8 @@ def test_apigw_authorizer_crud(apigw):
 
 def test_apigw_routekey_in_lambda_event(apigw, lam):
     """routeKey in Lambda event should reflect the matched route, not hardcoded $default."""
-    import uuid as _uuid_mod
     import urllib.request as _urlreq
+    import uuid as _uuid_mod
 
     fname = f"intg-rk-{_uuid_mod.uuid4().hex[:8]}"
     code = 'def handler(event, context):\n    return {"statusCode": 200, "body": event["routeKey"]}\n'
@@ -7500,8 +7500,8 @@ def test_apigwv1_usage_plan_crud(apigw_v1):
 
 def test_apigwv1_execute_lambda_proxy(apigw_v1, lam):
     """End-to-end: create API + resource + method + integration + deploy + invoke Lambda."""
-    import uuid as _uuid
     import urllib.request as _urlreq
+    import uuid as _uuid
 
     fname = f"intg-v1-proxy-{_uuid.uuid4().hex[:8]}"
     code = (
@@ -7560,8 +7560,8 @@ def test_apigwv1_execute_lambda_proxy(apigw_v1, lam):
 
 def test_apigwv1_execute_path_params(apigw_v1, lam):
     """Path parameter {userId} is passed correctly in event['pathParameters']."""
-    import uuid as _uuid
     import urllib.request as _urlreq
+    import uuid as _uuid
 
     fname = f"intg-v1-params-{_uuid.uuid4().hex[:8]}"
     code = (
@@ -7681,8 +7681,8 @@ def test_apigwv1_execute_mock_integration(apigw_v1):
 
 def test_apigwv1_execute_missing_resource_404(apigw_v1):
     """Request to non-existent path returns 404 with AWS-style message."""
-    import urllib.request as _urlreq
     import urllib.error as _urlerr
+    import urllib.request as _urlreq
 
     api_id = apigw_v1.create_rest_api(name="v1-missing-resource")["id"]
     dep_id = apigw_v1.create_deployment(restApiId=api_id)["id"]
@@ -7702,8 +7702,8 @@ def test_apigwv1_execute_missing_resource_404(apigw_v1):
 
 def test_apigwv1_no_conflict_with_v2(apigw_v1, apigw, lam):
     """v1 and v2 APIs can coexist; execute-api routes them independently."""
-    import uuid as _uuid
     import urllib.request as _urlreq
+    import uuid as _uuid
 
     # Create v1 Lambda
     fname_v1 = f"intg-coexist-v1-{_uuid.uuid4().hex[:8]}"
@@ -8048,8 +8048,8 @@ def test_apigwv1_base_path_mapping_crud(apigw_v1):
 
 def test_apigwv1_execute_missing_stage_404(apigw_v1):
     """execute-api returns 404 when stage does not exist."""
-    import urllib.request as _urlreq
     import urllib.error as _urlerr
+    import urllib.request as _urlreq
 
     api_id = apigw_v1.create_rest_api(name="v1-no-stage")["id"]
     root_id = next(
@@ -8077,8 +8077,8 @@ def test_apigwv1_execute_missing_stage_404(apigw_v1):
 
 def test_apigwv1_execute_missing_method_405(apigw_v1):
     """execute-api returns 405 when resource exists but method is not configured."""
-    import urllib.request as _urlreq
     import urllib.error as _urlerr
+    import urllib.request as _urlreq
 
     api_id = apigw_v1.create_rest_api(name="v1-no-method")["id"]
     root_id = next(
@@ -8113,8 +8113,8 @@ def test_apigwv1_execute_missing_method_405(apigw_v1):
 
 def test_apigwv1_execute_lambda_arn_uri(apigw_v1, lam):
     """execute-api Lambda proxy works with plain arn:aws:lambda ARN as integration URI."""
-    import uuid as _uuid
     import urllib.request as _urlreq
+    import uuid as _uuid
 
     fname = f"v1-arn-uri-{_uuid.uuid4().hex[:8]}"
     code = (
@@ -8173,8 +8173,8 @@ def test_apigwv1_execute_lambda_arn_uri(apigw_v1, lam):
 
 def test_apigwv1_execute_lambda_requestcontext(apigw_v1, lam):
     """execute-api Lambda event includes required requestContext fields."""
-    import uuid as _uuid
     import urllib.request as _urlreq
+    import uuid as _uuid
 
     fname = f"v1-reqctx-{_uuid.uuid4().hex[:8]}"
     code = (
@@ -9084,7 +9084,10 @@ def test_sns_to_lambda_event_subscription_arn(lam, sns):
     sns.publish(TopicArn=topic_arn, Message="test-sub-arn")
 
     # Invoke the function directly and check what event it last received
-    import json, base64, zipfile, io
+    import base64
+    import io
+    import json
+    import zipfile
 
     result = lam.invoke(FunctionName=fn, Payload=json.dumps({"ping": True}).encode())
     # The subscription ARN should be a real ARN, not "{topic}:subscription"
@@ -9094,7 +9097,8 @@ def test_sns_to_lambda_event_subscription_arn(lam, sns):
 
 def test_lambda_unknown_path_returns_404(lam):
     """Requests to an unrecognised Lambda path must return 404, not 400 InvalidRequest."""
-    import urllib.request, urllib.error
+    import urllib.error
+    import urllib.request
 
     endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
     req = urllib.request.Request(
@@ -9227,10 +9231,11 @@ _requires_package = pytest.mark.skipif(
 @_requires_package
 def test_package_core_importable():
     """ministack.core modules must all be importable."""
-    from ministack.core.responses import json_response, error_response_json, new_uuid
+    from ministack.core.lambda_runtime import get_or_create_worker
+    from ministack.core.lambda_runtime import reset as lr_reset
+    from ministack.core.persistence import load_state, save_all
+    from ministack.core.responses import error_response_json, json_response, new_uuid
     from ministack.core.router import detect_service
-    from ministack.core.lambda_runtime import get_or_create_worker, reset as lr_reset
-    from ministack.core.persistence import save_all, load_state
 
     assert callable(json_response)
     assert callable(detect_service)
@@ -9242,29 +9247,29 @@ def test_package_core_importable():
 def test_package_services_importable():
     """All 25 ministack.services modules must be importable and expose handle_request."""
     from ministack.services import (
-        s3,
-        sqs,
-        sns,
-        dynamodb,
-        lambda_svc,
-        secretsmanager,
-        cloudwatch_logs,
-        ssm,
-        eventbridge,
-        kinesis,
-        cloudwatch,
-        ses,
-        stepfunctions,
-        ecs,
-        rds,
-        elasticache,
-        glue,
-        athena,
         apigateway,
         apigateway_v1,
-        firehose,
-        route53,
+        athena,
+        cloudwatch,
+        cloudwatch_logs,
         cognito,
+        dynamodb,
+        ecs,
+        elasticache,
+        eventbridge,
+        firehose,
+        glue,
+        kinesis,
+        lambda_svc,
+        rds,
+        route53,
+        s3,
+        secretsmanager,
+        ses,
+        sns,
+        sqs,
+        ssm,
+        stepfunctions,
     )
     from ministack.services.iam_sts import handle_iam_request, handle_sts_request
 
@@ -9303,6 +9308,7 @@ def test_package_services_importable():
 def test_app_asgi_callable():
     """ministack.app:app must be an async callable (ASGI entry point)."""
     import inspect
+
     from ministack import app as app_module
 
     assert callable(app_module.app)
@@ -12209,7 +12215,8 @@ def test_athena_data_catalog_crud(athena):
 
 def test_athena_engine_mock_via_config(athena):
     """Switching ATHENA_ENGINE to 'mock' via /_ministack/config returns mock results."""
-    import urllib.request, json as _json
+    import json as _json
+    import urllib.request
     endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
     req = urllib.request.Request(
         f"{endpoint}/_ministack/config",
@@ -12245,7 +12252,8 @@ def test_athena_engine_mock_via_config(athena):
 
 def test_ministack_config_invalid_key_ignored():
     """/_ministack/config silently ignores unknown keys and only applies valid ones."""
-    import urllib.request, json as _json
+    import json as _json
+    import urllib.request
     endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
     req = urllib.request.Request(
         f"{endpoint}/_ministack/config",
@@ -13538,8 +13546,8 @@ def test_alb_dataplane_forward_lambda(elbv2, lam):
 
 def test_alb_dataplane_event_shape(elbv2, lam):
     """ALB event passed to Lambda contains all required fields."""
-    import urllib.request as _req
     import urllib.parse as _parse
+    import urllib.request as _req
 
     fn_code = (
         "import json\n"
@@ -13570,8 +13578,8 @@ def test_alb_dataplane_event_shape(elbv2, lam):
 
 def test_alb_dataplane_fixed_response(elbv2, lam):
     """ALB fixed-response action returns configured status/body without invoking Lambda."""
-    import urllib.request as _req
     import urllib.error as _err
+    import urllib.request as _req
 
     fn_code = "def handler(event, context):\n    return {'statusCode': 200, 'body': 'should-not-reach'}\n"
     lb_arn = elbv2.create_load_balancer(Name="dp-alb-fixed")["LoadBalancers"][0]["LoadBalancerArn"]
@@ -13715,8 +13723,8 @@ def test_alb_dataplane_path_pattern_rule(elbv2, lam):
 
 def test_alb_dataplane_no_listener_returns_503(elbv2):
     """Request to an ALB with no listeners returns 503."""
-    import urllib.request as _req
     import urllib.error as _err
+    import urllib.request as _req
 
     lb_arn = elbv2.create_load_balancer(Name="dp-alb-empty")["LoadBalancers"][0]["LoadBalancerArn"]
     try:

@@ -42,16 +42,16 @@ Wire protocol:
   Routing is handled in app.py via two separate SERVICE_HANDLERS entries.
 """
 
-import json
-import time
 import base64
+import json
 import logging
 import secrets
 import string
+import time
 from datetime import datetime, timezone
 from urllib.parse import parse_qs
 
-from ministack.core.responses import json_response, error_response_json, new_uuid
+from ministack.core.responses import error_response_json, json_response, new_uuid
 
 logger = logging.getLogger("cognito")
 
@@ -595,7 +595,7 @@ def _admin_create_user(data):
     if username in pool["_users"]:
         return error_response_json(
             "UsernameExistsException",
-            f"User account already exists.", 400,
+            "User account already exists.", 400,
         )
 
     now = _now_epoch()

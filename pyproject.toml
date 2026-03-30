@@ -37,6 +37,7 @@ dev = [
     "pytest-cov>=5.0",
     "duckdb>=0.10.0",
     "docker>=7.0.0",
+    "ruff>=0.4",
 ]
 
 [project.urls]
@@ -54,6 +55,25 @@ include = ["ministack*"]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
 python_functions = ["test_*"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
+ignore = [
+    "E501",   # line too long — XML templates and service tables make this impractical
+    "E402",   # module import not at top — intentional lazy imports in service files
+    "F401",   # unused import — needs manual review; some are re-exports
+    "F811",   # redefined while unused — needs manual review
+    "F841",   # unused variable — needs manual review
+    "E741",   # ambiguous variable name — too noisy for emulator code
+    "F601",   # multi-value repeated key — needs manual review
+]
+
+[tool.ruff.lint.per-file-ignores]
+"ministack/services/dynamodb.py" = ["E701", "E702"]  # compact tokenizer style is intentional
 
 [tool.coverage.run]
 source = ["ministack"]

@@ -67,10 +67,10 @@ Data plane:
   when api_id is found in _rest_apis.
 """
 
-import json
-import time
 import datetime
+import json
 import logging
+import time
 
 from ministack.core.responses import new_uuid
 
@@ -222,8 +222,8 @@ def _match_recursive(resources, parent_id, segments, params):
 
 async def _call_lambda(func_name, event):
     """Invoke a Lambda function and return the parsed response dict."""
-    from ministack.services import lambda_svc
     from ministack.core.lambda_runtime import get_or_create_worker
+    from ministack.services import lambda_svc
 
     if func_name not in lambda_svc._functions:
         return None, f"Lambda function '{func_name}' not found"
@@ -673,8 +673,8 @@ async def _invoke_lambda_proxy_v1(integration, api_id, stage_name, stage, resour
 
 async def _invoke_http_proxy_v1(integration, path, method, headers, body, query_params):
     """Forward a request to an HTTP backend."""
-    import urllib.request
     import urllib.error
+    import urllib.request
 
     uri = integration.get("uri", "")
     url = uri.rstrip("/") + path
@@ -784,7 +784,7 @@ def _create_rest_api(data):
 def _get_rest_api(api_id):
     api = _rest_apis.get(api_id)
     if not api:
-        return _v1_error("NotFoundException", f"Invalid API identifier specified", 404)
+        return _v1_error("NotFoundException", "Invalid API identifier specified", 404)
     return _v1_response(api)
 
 
@@ -795,7 +795,7 @@ def _get_rest_apis():
 def _update_rest_api(api_id, data):
     api = _rest_apis.get(api_id)
     if not api:
-        return _v1_error("NotFoundException", f"Invalid API identifier specified", 404)
+        return _v1_error("NotFoundException", "Invalid API identifier specified", 404)
     patch_ops = data.get("patchOperations", [])
     _apply_patch(api, patch_ops)
     return _v1_response(api)
@@ -803,7 +803,7 @@ def _update_rest_api(api_id, data):
 
 def _delete_rest_api(api_id):
     if api_id not in _rest_apis:
-        return _v1_error("NotFoundException", f"Invalid API identifier specified", 404)
+        return _v1_error("NotFoundException", "Invalid API identifier specified", 404)
     _rest_apis.pop(api_id, None)
     _resources.pop(api_id, None)
     _stages_v1.pop(api_id, None)
@@ -818,22 +818,22 @@ def _delete_rest_api(api_id):
 
 def _get_resources(api_id):
     if api_id not in _rest_apis:
-        return _v1_error("NotFoundException", f"Invalid API identifier specified", 404)
+        return _v1_error("NotFoundException", "Invalid API identifier specified", 404)
     return _v1_response({"item": list(_resources.get(api_id, {}).values())})
 
 
 def _get_resource(api_id, resource_id):
     resource = _resources.get(api_id, {}).get(resource_id)
     if not resource:
-        return _v1_error("NotFoundException", f"Invalid Resource identifier specified", 404)
+        return _v1_error("NotFoundException", "Invalid Resource identifier specified", 404)
     return _v1_response(resource)
 
 
 def _create_resource(api_id, parent_id, data):
     if api_id not in _rest_apis:
-        return _v1_error("NotFoundException", f"Invalid API identifier specified", 404)
+        return _v1_error("NotFoundException", "Invalid API identifier specified", 404)
     if parent_id not in _resources.get(api_id, {}):
-        return _v1_error("NotFoundException", f"Invalid Resource identifier specified", 404)
+        return _v1_error("NotFoundException", "Invalid Resource identifier specified", 404)
     path_part = data.get("pathPart", "")
     resource_id = _new_id()[:8]
     resource = {
@@ -852,7 +852,7 @@ def _create_resource(api_id, parent_id, data):
 def _update_resource(api_id, resource_id, data):
     resource = _resources.get(api_id, {}).get(resource_id)
     if not resource:
-        return _v1_error("NotFoundException", f"Invalid Resource identifier specified", 404)
+        return _v1_error("NotFoundException", "Invalid Resource identifier specified", 404)
     patch_ops = data.get("patchOperations", [])
     _apply_patch(resource, patch_ops)
     # Recompute path if pathPart changed
@@ -862,7 +862,7 @@ def _update_resource(api_id, resource_id, data):
 
 def _delete_resource(api_id, resource_id):
     if resource_id not in _resources.get(api_id, {}):
-        return _v1_error("NotFoundException", f"Invalid Resource identifier specified", 404)
+        return _v1_error("NotFoundException", "Invalid Resource identifier specified", 404)
     _resources[api_id].pop(resource_id, None)
     return 202, {}, b""
 
@@ -872,7 +872,7 @@ def _delete_resource(api_id, resource_id):
 def _put_method(api_id, resource_id, http_method, data):
     resource = _resources.get(api_id, {}).get(resource_id)
     if not resource:
-        return _v1_error("NotFoundException", f"Invalid Resource identifier specified", 404)
+        return _v1_error("NotFoundException", "Invalid Resource identifier specified", 404)
     method_obj = {
         "httpMethod": http_method,
         "authorizationType": data.get("authorizationType", "NONE"),
@@ -891,17 +891,17 @@ def _put_method(api_id, resource_id, http_method, data):
 def _get_method(api_id, resource_id, http_method):
     resource = _resources.get(api_id, {}).get(resource_id)
     if not resource:
-        return _v1_error("NotFoundException", f"Invalid Resource identifier specified", 404)
+        return _v1_error("NotFoundException", "Invalid Resource identifier specified", 404)
     method_obj = resource["resourceMethods"].get(http_method)
     if not method_obj:
-        return _v1_error("NotFoundException", f"Invalid Method identifier specified", 404)
+        return _v1_error("NotFoundException", "Invalid Method identifier specified", 404)
     return _v1_response(method_obj)
 
 
 def _delete_method(api_id, resource_id, http_method):
     resource = _resources.get(api_id, {}).get(resource_id)
     if not resource:
-        return _v1_error("NotFoundException", f"Invalid Resource identifier specified", 404)
+        return _v1_error("NotFoundException", "Invalid Resource identifier specified", 404)
     resource["resourceMethods"].pop(http_method, None)
     return 204, {}, b""
 
@@ -909,10 +909,10 @@ def _delete_method(api_id, resource_id, http_method):
 def _update_method(api_id, resource_id, http_method, data):
     resource = _resources.get(api_id, {}).get(resource_id)
     if not resource:
-        return _v1_error("NotFoundException", f"Invalid Resource identifier specified", 404)
+        return _v1_error("NotFoundException", "Invalid Resource identifier specified", 404)
     method_obj = resource["resourceMethods"].get(http_method)
     if not method_obj:
-        return _v1_error("NotFoundException", f"Invalid Method identifier specified", 404)
+        return _v1_error("NotFoundException", "Invalid Method identifier specified", 404)
     patch_ops = data.get("patchOperations", [])
     _apply_patch(method_obj, patch_ops)
     return _v1_response(method_obj)
@@ -923,10 +923,10 @@ def _update_method(api_id, resource_id, http_method, data):
 def _put_method_response(api_id, resource_id, http_method, status_code, data):
     resource = _resources.get(api_id, {}).get(resource_id)
     if not resource:
-        return _v1_error("NotFoundException", f"Invalid Resource identifier specified", 404)
+        return _v1_error("NotFoundException", "Invalid Resource identifier specified", 404)
     method_obj = resource["resourceMethods"].get(http_method)
     if not method_obj:
-        return _v1_error("NotFoundException", f"Invalid Method identifier specified", 404)
+        return _v1_error("NotFoundException", "Invalid Method identifier specified", 404)
     method_response = {
         "statusCode": status_code,
         "responseParameters": data.get("responseParameters", {}),
@@ -939,20 +939,20 @@ def _put_method_response(api_id, resource_id, http_method, status_code, data):
 def _get_method_response(api_id, resource_id, http_method, status_code):
     resource = _resources.get(api_id, {}).get(resource_id)
     if not resource:
-        return _v1_error("NotFoundException", f"Invalid Resource identifier specified", 404)
+        return _v1_error("NotFoundException", "Invalid Resource identifier specified", 404)
     method_obj = resource["resourceMethods"].get(http_method)
     if not method_obj:
-        return _v1_error("NotFoundException", f"Invalid Method identifier specified", 404)
+        return _v1_error("NotFoundException", "Invalid Method identifier specified", 404)
     resp = method_obj["methodResponses"].get(status_code)
     if not resp:
-        return _v1_error("NotFoundException", f"Invalid Response status code specified", 404)
+        return _v1_error("NotFoundException", "Invalid Response status code specified", 404)
     return _v1_response(resp)
 
 
 def _delete_method_response(api_id, resource_id, http_method, status_code):
     resource = _resources.get(api_id, {}).get(resource_id)
     if not resource:
-        return _v1_error("NotFoundException", f"Invalid Resource identifier specified", 404)
+        return _v1_error("NotFoundException", "Invalid Resource identifier specified", 404)
     method_obj = resource["resourceMethods"].get(http_method)
     if method_obj:
         method_obj["methodResponses"].pop(status_code, None)
@@ -964,10 +964,10 @@ def _delete_method_response(api_id, resource_id, http_method, status_code):
 def _put_integration(api_id, resource_id, http_method, data):
     resource = _resources.get(api_id, {}).get(resource_id)
     if not resource:
-        return _v1_error("NotFoundException", f"Invalid Resource identifier specified", 404)
+        return _v1_error("NotFoundException", "Invalid Resource identifier specified", 404)
     method_obj = resource["resourceMethods"].get(http_method)
     if not method_obj:
-        return _v1_error("NotFoundException", f"Invalid Method identifier specified", 404)
+        return _v1_error("NotFoundException", "Invalid Method identifier specified", 404)
     integration = {
         "type": data.get("type", "AWS_PROXY"),
         "httpMethod": data.get("httpMethod", "POST"),
@@ -989,20 +989,20 @@ def _put_integration(api_id, resource_id, http_method, data):
 def _get_integration(api_id, resource_id, http_method):
     resource = _resources.get(api_id, {}).get(resource_id)
     if not resource:
-        return _v1_error("NotFoundException", f"Invalid Resource identifier specified", 404)
+        return _v1_error("NotFoundException", "Invalid Resource identifier specified", 404)
     method_obj = resource["resourceMethods"].get(http_method)
     if not method_obj:
-        return _v1_error("NotFoundException", f"Invalid Method identifier specified", 404)
+        return _v1_error("NotFoundException", "Invalid Method identifier specified", 404)
     integration = method_obj.get("methodIntegration")
     if not integration:
-        return _v1_error("NotFoundException", f"Invalid Integration identifier specified", 404)
+        return _v1_error("NotFoundException", "Invalid Integration identifier specified", 404)
     return _v1_response(integration)
 
 
 def _delete_integration(api_id, resource_id, http_method):
     resource = _resources.get(api_id, {}).get(resource_id)
     if not resource:
-        return _v1_error("NotFoundException", f"Invalid Resource identifier specified", 404)
+        return _v1_error("NotFoundException", "Invalid Resource identifier specified", 404)
     method_obj = resource["resourceMethods"].get(http_method)
     if method_obj:
         method_obj["methodIntegration"] = None
@@ -1012,13 +1012,13 @@ def _delete_integration(api_id, resource_id, http_method):
 def _update_integration(api_id, resource_id, http_method, data):
     resource = _resources.get(api_id, {}).get(resource_id)
     if not resource:
-        return _v1_error("NotFoundException", f"Invalid Resource identifier specified", 404)
+        return _v1_error("NotFoundException", "Invalid Resource identifier specified", 404)
     method_obj = resource["resourceMethods"].get(http_method)
     if not method_obj:
-        return _v1_error("NotFoundException", f"Invalid Method identifier specified", 404)
+        return _v1_error("NotFoundException", "Invalid Method identifier specified", 404)
     integration = method_obj.get("methodIntegration")
     if not integration:
-        return _v1_error("NotFoundException", f"Invalid Integration identifier specified", 404)
+        return _v1_error("NotFoundException", "Invalid Integration identifier specified", 404)
     patch_ops = data.get("patchOperations", [])
     _apply_patch(integration, patch_ops)
     return _v1_response(integration)
@@ -1029,13 +1029,13 @@ def _update_integration(api_id, resource_id, http_method, data):
 def _put_integration_response(api_id, resource_id, http_method, status_code, data):
     resource = _resources.get(api_id, {}).get(resource_id)
     if not resource:
-        return _v1_error("NotFoundException", f"Invalid Resource identifier specified", 404)
+        return _v1_error("NotFoundException", "Invalid Resource identifier specified", 404)
     method_obj = resource["resourceMethods"].get(http_method)
     if not method_obj:
-        return _v1_error("NotFoundException", f"Invalid Method identifier specified", 404)
+        return _v1_error("NotFoundException", "Invalid Method identifier specified", 404)
     integration = method_obj.get("methodIntegration")
     if not integration:
-        return _v1_error("NotFoundException", f"Invalid Integration identifier specified", 404)
+        return _v1_error("NotFoundException", "Invalid Integration identifier specified", 404)
     int_response = {
         "statusCode": status_code,
         "selectionPattern": data.get("selectionPattern", ""),
@@ -1050,23 +1050,23 @@ def _put_integration_response(api_id, resource_id, http_method, status_code, dat
 def _get_integration_response(api_id, resource_id, http_method, status_code):
     resource = _resources.get(api_id, {}).get(resource_id)
     if not resource:
-        return _v1_error("NotFoundException", f"Invalid Resource identifier specified", 404)
+        return _v1_error("NotFoundException", "Invalid Resource identifier specified", 404)
     method_obj = resource["resourceMethods"].get(http_method)
     if not method_obj:
-        return _v1_error("NotFoundException", f"Invalid Method identifier specified", 404)
+        return _v1_error("NotFoundException", "Invalid Method identifier specified", 404)
     integration = method_obj.get("methodIntegration")
     if not integration:
-        return _v1_error("NotFoundException", f"Invalid Integration identifier specified", 404)
+        return _v1_error("NotFoundException", "Invalid Integration identifier specified", 404)
     resp = integration["integrationResponses"].get(status_code)
     if not resp:
-        return _v1_error("NotFoundException", f"Invalid Response status code specified", 404)
+        return _v1_error("NotFoundException", "Invalid Response status code specified", 404)
     return _v1_response(resp)
 
 
 def _delete_integration_response(api_id, resource_id, http_method, status_code):
     resource = _resources.get(api_id, {}).get(resource_id)
     if not resource:
-        return _v1_error("NotFoundException", f"Invalid Resource identifier specified", 404)
+        return _v1_error("NotFoundException", "Invalid Resource identifier specified", 404)
     method_obj = resource["resourceMethods"].get(http_method)
     if method_obj and method_obj.get("methodIntegration"):
         method_obj["methodIntegration"]["integrationResponses"].pop(status_code, None)
@@ -1094,7 +1094,7 @@ def _build_api_summary(api_id):
 
 def _create_deployment(api_id, data):
     if api_id not in _rest_apis:
-        return _v1_error("NotFoundException", f"Invalid API identifier specified", 404)
+        return _v1_error("NotFoundException", "Invalid API identifier specified", 404)
     deployment_id = _new_id()[:8]
     deployment = {
         "id": deployment_id,
@@ -1134,21 +1134,21 @@ def _create_deployment(api_id, data):
 
 def _get_deployments(api_id):
     if api_id not in _rest_apis:
-        return _v1_error("NotFoundException", f"Invalid API identifier specified", 404)
+        return _v1_error("NotFoundException", "Invalid API identifier specified", 404)
     return _v1_response({"item": list(_deployments_v1.get(api_id, {}).values())})
 
 
 def _get_deployment(api_id, deployment_id):
     deployment = _deployments_v1.get(api_id, {}).get(deployment_id)
     if not deployment:
-        return _v1_error("NotFoundException", f"Invalid Deployment identifier specified", 404)
+        return _v1_error("NotFoundException", "Invalid Deployment identifier specified", 404)
     return _v1_response(deployment)
 
 
 def _update_deployment(api_id, deployment_id, data):
     deployment = _deployments_v1.get(api_id, {}).get(deployment_id)
     if not deployment:
-        return _v1_error("NotFoundException", f"Invalid Deployment identifier specified", 404)
+        return _v1_error("NotFoundException", "Invalid Deployment identifier specified", 404)
     patch_ops = data.get("patchOperations", [])
     _apply_patch(deployment, patch_ops)
     return _v1_response(deployment)
@@ -1156,7 +1156,7 @@ def _update_deployment(api_id, deployment_id, data):
 
 def _delete_deployment(api_id, deployment_id):
     if deployment_id not in _deployments_v1.get(api_id, {}):
-        return _v1_error("NotFoundException", f"Invalid Deployment identifier specified", 404)
+        return _v1_error("NotFoundException", "Invalid Deployment identifier specified", 404)
     _deployments_v1[api_id].pop(deployment_id, None)
     return 202, {}, b""
 
@@ -1165,7 +1165,7 @@ def _delete_deployment(api_id, deployment_id):
 
 def _create_stage(api_id, data):
     if api_id not in _rest_apis:
-        return _v1_error("NotFoundException", f"Invalid API identifier specified", 404)
+        return _v1_error("NotFoundException", "Invalid API identifier specified", 404)
     stage_name = data.get("stageName", "")
     if not stage_name:
         return _v1_error("BadRequestException", "Stage name is required", 400)
@@ -1190,21 +1190,21 @@ def _create_stage(api_id, data):
 
 def _get_stages(api_id):
     if api_id not in _rest_apis:
-        return _v1_error("NotFoundException", f"Invalid API identifier specified", 404)
+        return _v1_error("NotFoundException", "Invalid API identifier specified", 404)
     return _v1_response({"item": list(_stages_v1.get(api_id, {}).values())})
 
 
 def _get_stage(api_id, stage_name):
     stage = _stages_v1.get(api_id, {}).get(stage_name)
     if not stage:
-        return _v1_error("NotFoundException", f"Invalid Stage identifier specified", 404)
+        return _v1_error("NotFoundException", "Invalid Stage identifier specified", 404)
     return _v1_response(stage)
 
 
 def _update_stage(api_id, stage_name, data):
     stage = _stages_v1.get(api_id, {}).get(stage_name)
     if not stage:
-        return _v1_error("NotFoundException", f"Invalid Stage identifier specified", 404)
+        return _v1_error("NotFoundException", "Invalid Stage identifier specified", 404)
     patch_ops = data.get("patchOperations", [])
     _apply_patch(stage, patch_ops)
     stage["lastUpdatedDate"] = _now_unix()
@@ -1213,7 +1213,7 @@ def _update_stage(api_id, stage_name, data):
 
 def _delete_stage(api_id, stage_name):
     if stage_name not in _stages_v1.get(api_id, {}):
-        return _v1_error("NotFoundException", f"Invalid Stage identifier specified", 404)
+        return _v1_error("NotFoundException", "Invalid Stage identifier specified", 404)
     _stages_v1[api_id].pop(stage_name, None)
     return 202, {}, b""
 
@@ -1222,7 +1222,7 @@ def _delete_stage(api_id, stage_name):
 
 def _create_authorizer(api_id, data):
     if api_id not in _rest_apis:
-        return _v1_error("NotFoundException", f"Invalid API identifier specified", 404)
+        return _v1_error("NotFoundException", "Invalid API identifier specified", 404)
     auth_id = _new_id()[:8]
     authorizer = {
         "id": auth_id,
@@ -1241,21 +1241,21 @@ def _create_authorizer(api_id, data):
 
 def _get_authorizers(api_id):
     if api_id not in _rest_apis:
-        return _v1_error("NotFoundException", f"Invalid API identifier specified", 404)
+        return _v1_error("NotFoundException", "Invalid API identifier specified", 404)
     return _v1_response({"item": list(_authorizers_v1.get(api_id, {}).values())})
 
 
 def _get_authorizer(api_id, auth_id):
     authorizer = _authorizers_v1.get(api_id, {}).get(auth_id)
     if not authorizer:
-        return _v1_error("NotFoundException", f"Invalid Authorizer identifier specified", 404)
+        return _v1_error("NotFoundException", "Invalid Authorizer identifier specified", 404)
     return _v1_response(authorizer)
 
 
 def _update_authorizer(api_id, auth_id, data):
     authorizer = _authorizers_v1.get(api_id, {}).get(auth_id)
     if not authorizer:
-        return _v1_error("NotFoundException", f"Invalid Authorizer identifier specified", 404)
+        return _v1_error("NotFoundException", "Invalid Authorizer identifier specified", 404)
     patch_ops = data.get("patchOperations", [])
     _apply_patch(authorizer, patch_ops)
     return _v1_response(authorizer)
@@ -1263,7 +1263,7 @@ def _update_authorizer(api_id, auth_id, data):
 
 def _delete_authorizer(api_id, auth_id):
     if auth_id not in _authorizers_v1.get(api_id, {}):
-        return _v1_error("NotFoundException", f"Invalid Authorizer identifier specified", 404)
+        return _v1_error("NotFoundException", "Invalid Authorizer identifier specified", 404)
     _authorizers_v1[api_id].pop(auth_id, None)
     return 202, {}, b""
 
@@ -1272,7 +1272,7 @@ def _delete_authorizer(api_id, auth_id):
 
 def _create_model(api_id, data):
     if api_id not in _rest_apis:
-        return _v1_error("NotFoundException", f"Invalid API identifier specified", 404)
+        return _v1_error("NotFoundException", "Invalid API identifier specified", 404)
     model_name = data.get("name", "")
     if not model_name:
         return _v1_error("BadRequestException", "Model name is required", 400)
@@ -1289,20 +1289,20 @@ def _create_model(api_id, data):
 
 def _get_models(api_id):
     if api_id not in _rest_apis:
-        return _v1_error("NotFoundException", f"Invalid API identifier specified", 404)
+        return _v1_error("NotFoundException", "Invalid API identifier specified", 404)
     return _v1_response({"item": list(_models.get(api_id, {}).values())})
 
 
 def _get_model(api_id, model_name):
     model = _models.get(api_id, {}).get(model_name)
     if not model:
-        return _v1_error("NotFoundException", f"Invalid Model identifier specified", 404)
+        return _v1_error("NotFoundException", "Invalid Model identifier specified", 404)
     return _v1_response(model)
 
 
 def _delete_model(api_id, model_name):
     if model_name not in _models.get(api_id, {}):
-        return _v1_error("NotFoundException", f"Invalid Model identifier specified", 404)
+        return _v1_error("NotFoundException", "Invalid Model identifier specified", 404)
     _models[api_id].pop(model_name, None)
     return 202, {}, b""
 
@@ -1334,14 +1334,14 @@ def _get_api_keys():
 def _get_api_key(key_id):
     key = _api_keys.get(key_id)
     if not key:
-        return _v1_error("NotFoundException", f"Invalid API Key identifier specified", 404)
+        return _v1_error("NotFoundException", "Invalid API Key identifier specified", 404)
     return _v1_response(key)
 
 
 def _update_api_key(key_id, data):
     key = _api_keys.get(key_id)
     if not key:
-        return _v1_error("NotFoundException", f"Invalid API Key identifier specified", 404)
+        return _v1_error("NotFoundException", "Invalid API Key identifier specified", 404)
     patch_ops = data.get("patchOperations", [])
     _apply_patch(key, patch_ops)
     key["lastUpdatedDate"] = _now_unix()
@@ -1350,7 +1350,7 @@ def _update_api_key(key_id, data):
 
 def _delete_api_key(key_id):
     if key_id not in _api_keys:
-        return _v1_error("NotFoundException", f"Invalid API Key identifier specified", 404)
+        return _v1_error("NotFoundException", "Invalid API Key identifier specified", 404)
     _api_keys.pop(key_id, None)
     return 202, {}, b""
 
@@ -1380,14 +1380,14 @@ def _get_usage_plans():
 def _get_usage_plan(plan_id):
     plan = _usage_plans.get(plan_id)
     if not plan:
-        return _v1_error("NotFoundException", f"Invalid Usage Plan identifier specified", 404)
+        return _v1_error("NotFoundException", "Invalid Usage Plan identifier specified", 404)
     return _v1_response(plan)
 
 
 def _update_usage_plan(plan_id, data):
     plan = _usage_plans.get(plan_id)
     if not plan:
-        return _v1_error("NotFoundException", f"Invalid Usage Plan identifier specified", 404)
+        return _v1_error("NotFoundException", "Invalid Usage Plan identifier specified", 404)
     patch_ops = data.get("patchOperations", [])
     _apply_patch(plan, patch_ops)
     return _v1_response(plan)
@@ -1395,7 +1395,7 @@ def _update_usage_plan(plan_id, data):
 
 def _delete_usage_plan(plan_id):
     if plan_id not in _usage_plans:
-        return _v1_error("NotFoundException", f"Invalid Usage Plan identifier specified", 404)
+        return _v1_error("NotFoundException", "Invalid Usage Plan identifier specified", 404)
     _usage_plans.pop(plan_id, None)
     _usage_plan_keys.pop(plan_id, None)
     return 202, {}, b""
@@ -1403,7 +1403,7 @@ def _delete_usage_plan(plan_id):
 
 def _create_usage_plan_key(plan_id, data):
     if plan_id not in _usage_plans:
-        return _v1_error("NotFoundException", f"Invalid Usage Plan identifier specified", 404)
+        return _v1_error("NotFoundException", "Invalid Usage Plan identifier specified", 404)
     key_id = data.get("keyId", "")
     key_type = data.get("keyType", "API_KEY")
     plan_key = {
@@ -1418,13 +1418,13 @@ def _create_usage_plan_key(plan_id, data):
 
 def _get_usage_plan_keys(plan_id):
     if plan_id not in _usage_plans:
-        return _v1_error("NotFoundException", f"Invalid Usage Plan identifier specified", 404)
+        return _v1_error("NotFoundException", "Invalid Usage Plan identifier specified", 404)
     return _v1_response({"item": list(_usage_plan_keys.get(plan_id, {}).values())})
 
 
 def _delete_usage_plan_key(plan_id, key_id):
     if plan_id not in _usage_plans:
-        return _v1_error("NotFoundException", f"Invalid Usage Plan identifier specified", 404)
+        return _v1_error("NotFoundException", "Invalid Usage Plan identifier specified", 404)
     _usage_plan_keys.get(plan_id, {}).pop(key_id, None)
     return 202, {}, b""
 
@@ -1457,13 +1457,13 @@ def _get_domain_names():
 def _get_domain_name(domain_name):
     dn = _domain_names.get(domain_name)
     if not dn:
-        return _v1_error("NotFoundException", f"Invalid domain name identifier specified", 404)
+        return _v1_error("NotFoundException", "Invalid domain name identifier specified", 404)
     return _v1_response(dn)
 
 
 def _delete_domain_name(domain_name):
     if domain_name not in _domain_names:
-        return _v1_error("NotFoundException", f"Invalid domain name identifier specified", 404)
+        return _v1_error("NotFoundException", "Invalid domain name identifier specified", 404)
     _domain_names.pop(domain_name, None)
     _base_path_mappings.pop(domain_name, None)
     return 202, {}, b""
@@ -1471,7 +1471,7 @@ def _delete_domain_name(domain_name):
 
 def _create_base_path_mapping(domain_name, data):
     if domain_name not in _domain_names:
-        return _v1_error("NotFoundException", f"Invalid domain name identifier specified", 404)
+        return _v1_error("NotFoundException", "Invalid domain name identifier specified", 404)
     base_path = data.get("basePath", "(none)")
     mapping = {
         "basePath": base_path,
@@ -1484,14 +1484,14 @@ def _create_base_path_mapping(domain_name, data):
 
 def _get_base_path_mappings(domain_name):
     if domain_name not in _domain_names:
-        return _v1_error("NotFoundException", f"Invalid domain name identifier specified", 404)
+        return _v1_error("NotFoundException", "Invalid domain name identifier specified", 404)
     return _v1_response({"item": list(_base_path_mappings.get(domain_name, {}).values())})
 
 
 def _get_base_path_mapping(domain_name, base_path):
     mapping = _base_path_mappings.get(domain_name, {}).get(base_path)
     if not mapping:
-        return _v1_error("NotFoundException", f"Invalid base path mapping identifier specified", 404)
+        return _v1_error("NotFoundException", "Invalid base path mapping identifier specified", 404)
     return _v1_response(mapping)
 
 

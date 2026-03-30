@@ -42,11 +42,11 @@ Supports:
                    DeleteEgressOnlyInternetGateway
 """
 
+import logging
 import os
-import time
 import random
 import string
-import logging
+import time
 from urllib.parse import parse_qs
 
 from ministack.core.responses import new_uuid

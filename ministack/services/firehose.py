@@ -21,7 +21,12 @@ import logging
 import threading
 import time
 
-from ministack.core.responses import json_response, error_response_json, new_uuid, now_epoch
+from ministack.core.responses import (
+    error_response_json,
+    json_response,
+    new_uuid,
+    now_epoch,
+)
 
 logger = logging.getLogger("firehose")
 

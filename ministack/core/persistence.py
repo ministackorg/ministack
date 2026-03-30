@@ -4,9 +4,9 @@ When PERSIST_STATE=1, service state is saved to STATE_DIR on shutdown
 and reloaded on startup.
 """
 
-import os
 import json
 import logging
+import os
 import tempfile
 
 logger = logging.getLogger("persistence")
