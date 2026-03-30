@@ -6640,15 +6640,18 @@ def test_athena_sqlite_type_inference(athena_sqlite):
     assert types["str_col"] == "varchar"
 
 
-def test_athena_adapt_sql_for_sqlite():
-    """Unit test for SQL dialect adaptation."""
-    from ministack.services.athena import _adapt_sql_for_sqlite
-
-    assert "REAL" in _adapt_sql_for_sqlite("SELECT CAST(x AS DOUBLE)")
-    assert "TEXT" in _adapt_sql_for_sqlite("SELECT CAST(name AS VARCHAR)")
-    assert "INTEGER" in _adapt_sql_for_sqlite("SELECT CAST(id AS BIGINT)")
-    # Passthrough for standard SQL
-    assert _adapt_sql_for_sqlite("SELECT 1 + 2") == "SELECT 1 + 2"
+def test_athena_sqlite_dialect_adaptation(athena_sqlite):
+    """Verify SQLite engine adapts CAST(x AS DOUBLE/VARCHAR/BIGINT) correctly."""
+    resp = athena_sqlite.start_query_execution(
+        QueryString="SELECT CAST(3.14 AS DOUBLE) AS d, CAST(42 AS VARCHAR) AS v, CAST(99 AS BIGINT) AS b",
+        ResultConfiguration={"OutputLocation": "s3://athena-results/"},
+    )
+    _poll_athena_query(athena_sqlite, resp["QueryExecutionId"], "SQLite dialect adaptation")
+    results = athena_sqlite.get_query_results(QueryExecutionId=resp["QueryExecutionId"])
+    rows = results["ResultSet"]["Rows"]
+    assert rows[1]["Data"][0]["VarCharValue"] == "3.14"
+    assert rows[1]["Data"][1]["VarCharValue"] == "42"
+    assert rows[1]["Data"][2]["VarCharValue"] == "99"
 
 
 # ===================================================================
