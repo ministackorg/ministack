@@ -7,6 +7,23 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [1.1.9] — 2026-03-31
+
+### Added
+- **S3 Object Lock** — full WORM enforcement on top of versioned buckets
+  - `PutObjectLockConfiguration` / `GetObjectLockConfiguration` — enable Object Lock on a bucket with `COMPLIANCE` or `GOVERNANCE` default retention (days or years)
+  - `PutObjectRetention` / `GetObjectRetention` — per-object retention with `COMPLIANCE` (always blocks delete) and `GOVERNANCE` (`x-amz-bypass-governance-retention` header bypasses)
+  - `PutObjectLegalHold` / `GetObjectLegalHold` — `ON` status unconditionally blocks deletion regardless of retention mode
+  - Default retention auto-applied on `PutObject` when bucket lock configuration is present
+- **S3 Replication** — bucket-level replication configuration CRUD
+  - `PutBucketReplication` / `GetBucketReplication` / `DeleteBucketReplication`
+- **S3 Tagging improvements** — URL-encoded tagging header parsing now correctly handles `x-amz-tagging` on `PutObject` and `CopyObject`
+
+### Tests
+- 16 new integration tests covering Object Lock, Replication, and Tagging — 730 tests total, all passing
+
+---
+
 ## [1.1.8] — 2026-03-30
 
 ### Added
