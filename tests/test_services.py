@@ -1738,6 +1738,51 @@ def test_ecs_run_task_stops_after_exit(ecs):
     assert stopped, "Task should transition to STOPPED after container exits"
 
 
+def test_ecs_run_task_network_connectivity(ecs):
+    """ECS container can reach Ministack (proves network detection works)."""
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+    # When Ministack runs on the host (CI), containers need host.docker.internal.
+    # When Ministack runs in Docker (compose), network detection handles it.
+    host = os.environ.get("MINISTACK_HOST_FROM_CONTAINER", "host.docker.internal")
+    parsed = urlparse(endpoint)
+    container_endpoint = f"{parsed.scheme}://{host}:{parsed.port}"
+
+    ecs.create_cluster(clusterName="net-test")
+    ecs.register_task_definition(
+        family="net-probe",
+        containerDefinitions=[
+            {
+                "name": "probe",
+                "image": "alpine:latest",
+                "command": [
+                    "sh", "-c",
+                    f"wget -q -O /dev/null {container_endpoint}/_localstack/health"
+                ],
+                "essential": True,
+            }
+        ],
+    )
+    resp = ecs.run_task(cluster="net-test", taskDefinition="net-probe")
+    task_arn = resp["tasks"][0]["taskArn"]
+    assert resp["tasks"][0]["lastStatus"] == "RUNNING"
+
+    # Poll until STOPPED — wget should succeed (exit 0) if network is correct
+    success = False
+    for _ in range(30):
+        time.sleep(2)
+        desc = ecs.describe_tasks(cluster="net-test", tasks=[task_arn])
+        task = desc["tasks"][0]
+        if task["lastStatus"] == "STOPPED":
+            exit_code = task["containers"][0].get("exitCode")
+            assert exit_code == 0, (
+                f"Container could not reach Ministack at {container_endpoint} "
+                f"(exit code {exit_code}) — network detection may be broken"
+            )
+            success = True
+            break
+    assert success, "Task should transition to STOPPED"
+
+
 def test_ecs_service(ecs):
     ecs.create_service(
         cluster="test-cluster",
