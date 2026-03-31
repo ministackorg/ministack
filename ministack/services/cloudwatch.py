@@ -10,13 +10,13 @@ Operations: PutMetricData, GetMetricStatistics, GetMetricData, ListMetrics,
             PutDashboard, GetDashboard, DeleteDashboards, ListDashboards.
 """
 
-import re
 import json
-import time
 import logging
+import re
+import time
+from collections import defaultdict
 from datetime import datetime, timezone
 from urllib.parse import parse_qs
-from collections import defaultdict
 
 from ministack.core.responses import new_uuid
 

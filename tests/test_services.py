@@ -21,7 +21,6 @@ _EXECUTE_PORT = urlparse(_endpoint).port or 4566
 import pytest
 from botocore.exceptions import ClientError
 
-
 # ========== S3 ==========
 
 
@@ -1048,7 +1047,7 @@ def test_sqs_message_system_attributes(sqs):
 def test_sqs_nonexistent_queue(sqs):
     with pytest.raises(ClientError) as exc:
         sqs.get_queue_url(QueueName="intg-sqs-does-not-exist")
-    assert exc.value.response["Error"]["Code"] == "QueueDoesNotExist"
+    assert exc.value.response["Error"]["Code"] == "AWS.SimpleQueueService.NonExistentQueue"
 
 
 def test_sqs_receive_empty(sqs):
@@ -1162,7 +1161,7 @@ def test_sns_publish_nonexistent_topic(sns):
     fake_arn = "arn:aws:sns:us-east-1:000000000000:intg-sns-nonexist"
     with pytest.raises(ClientError) as exc:
         sns.publish(TopicArn=fake_arn, Message="fail")
-    assert exc.value.response["Error"]["Code"] == "NotFound"
+    assert exc.value.response["Error"]["Code"] == "NotFoundException"
 
 
 def test_sns_sqs_fanout(sns, sqs):
@@ -1388,7 +1387,8 @@ def test_lambda_create_invoke(lam):
 
 def test_lambda_esm_sqs(lam, sqs):
     """SQS → Lambda event source mapping: messages sent to SQS trigger Lambda."""
-    import io, zipfile as zf
+    import io
+    import zipfile as zf
 
     # Clean up from previous runs
     try:
@@ -2935,24 +2935,24 @@ def test_iam_create_policy(iam):
 
 
 def test_iam_get_policy(iam):
-    arn = f"arn:aws:iam::000000000000:policy/iam-test-policy"
+    arn = "arn:aws:iam::000000000000:policy/iam-test-policy"
     resp = iam.get_policy(PolicyArn=arn)
     assert resp["Policy"]["PolicyName"] == "iam-test-policy"
 
 
 def test_iam_attach_role_policy(iam):
-    policy_arn = f"arn:aws:iam::000000000000:policy/iam-test-policy"
+    policy_arn = "arn:aws:iam::000000000000:policy/iam-test-policy"
     iam.attach_role_policy(RoleName="iam-test-role", PolicyArn=policy_arn)
 
 
 def test_iam_list_attached_role_policies(iam):
     resp = iam.list_attached_role_policies(RoleName="iam-test-role")
     arns = [p["PolicyArn"] for p in resp["AttachedPolicies"]]
-    assert f"arn:aws:iam::000000000000:policy/iam-test-policy" in arns
+    assert "arn:aws:iam::000000000000:policy/iam-test-policy" in arns
 
 
 def test_iam_detach_role_policy(iam):
-    policy_arn = f"arn:aws:iam::000000000000:policy/iam-test-policy"
+    policy_arn = "arn:aws:iam::000000000000:policy/iam-test-policy"
     iam.detach_role_policy(RoleName="iam-test-role", PolicyArn=policy_arn)
     resp = iam.list_attached_role_policies(RoleName="iam-test-role")
     arns = [p["PolicyArn"] for p in resp["AttachedPolicies"]]
@@ -5020,7 +5020,7 @@ def test_athena_tags_v2(athena):
     arn = athena.get_work_group(WorkGroup="ath-tag-v2wg")["WorkGroup"]["Configuration"][
         "ResultConfiguration"
     ]["OutputLocation"]
-    wg_arn = f"arn:aws:athena:us-east-1:000000000000:workgroup/ath-tag-v2wg"
+    wg_arn = "arn:aws:athena:us-east-1:000000000000:workgroup/ath-tag-v2wg"
 
     athena.tag_resource(ResourceARN=wg_arn, Tags=[{"Key": "env", "Value": "dev"}])
     resp = athena.list_tags_for_resource(ResourceARN=wg_arn)
@@ -6022,8 +6022,8 @@ def test_ddb_ttl(ddb):
 
 def test_lambda_warm_start(lam, apigw):
     """Warm worker via API Gateway execute-api: module-level state persists across invocations."""
-    import uuid as _uuid
     import urllib.request as _urlreq
+    import uuid as _uuid
 
     fname = f"intg-warm-{_uuid.uuid4().hex[:8]}"
     code = (
@@ -6075,9 +6075,9 @@ def test_lambda_warm_start(lam, apigw):
 
 def test_apigw_execute_lambda_proxy(apigw, lam):
     """API Gateway execute-api routes a request through Lambda proxy integration."""
-    import uuid as _uuid
-    import urllib.request as _urlreq
     import urllib.error as _urlerr
+    import urllib.request as _urlreq
+    import uuid as _uuid
 
     fname = f"intg-apigw-fn-{_uuid.uuid4().hex[:8]}"
     code = (
@@ -6131,8 +6131,8 @@ def test_apigw_execute_lambda_proxy(apigw, lam):
 
 def test_apigw_execute_no_route(apigw):
     """execute-api returns 404 when no matching route exists."""
-    import urllib.request as _urlreq
     import urllib.error as _urlerr
+    import urllib.request as _urlreq
 
     api_id = apigw.create_api(Name="no-route-api", ProtocolType="HTTP")["ApiId"]
     apigw.create_stage(ApiId=api_id, StageName="$default")
@@ -6149,8 +6149,8 @@ def test_apigw_execute_no_route(apigw):
 
 def test_apigw_execute_default_route(apigw, lam):
     """$default catch-all route matches any path."""
-    import uuid as _uuid
     import urllib.request as _urlreq
+    import uuid as _uuid
 
     fname = f"intg-default-fn-{_uuid.uuid4().hex[:8]}"
     code = (
@@ -6258,8 +6258,8 @@ def test_eventbridge_lambda_target(eb, lam):
 
 def test_apigw_path_param_route(apigw, lam):
     """Route with {id} path parameter matches requests correctly."""
-    import uuid as _uuid
     import urllib.request as _urlreq
+    import uuid as _uuid
 
     fname = f"intg-param-fn-{_uuid.uuid4().hex[:8]}"
     code = (
@@ -6303,8 +6303,8 @@ def test_apigw_path_param_route(apigw, lam):
 
 def test_apigw_greedy_path_param(apigw, lam):
     """{proxy+} greedy path parameter matches paths with multiple segments."""
-    import uuid as _uuid_mod
     import urllib.request as _urlreq
+    import uuid as _uuid_mod
 
     fname = f"intg-greedy-{_uuid_mod.uuid4().hex[:8]}"
     code = 'def handler(event, context):\n    return {"statusCode": 200, "body": event["rawPath"]}\n'
@@ -6389,8 +6389,8 @@ def test_apigw_authorizer_crud(apigw):
 
 def test_apigw_routekey_in_lambda_event(apigw, lam):
     """routeKey in Lambda event should reflect the matched route, not hardcoded $default."""
-    import uuid as _uuid_mod
     import urllib.request as _urlreq
+    import uuid as _uuid_mod
 
     fname = f"intg-rk-{_uuid_mod.uuid4().hex[:8]}"
     code = 'def handler(event, context):\n    return {"statusCode": 200, "body": event["routeKey"]}\n'
@@ -7857,8 +7857,8 @@ def test_apigwv1_usage_plan_crud(apigw_v1):
 
 def test_apigwv1_execute_lambda_proxy(apigw_v1, lam):
     """End-to-end: create API + resource + method + integration + deploy + invoke Lambda."""
-    import uuid as _uuid
     import urllib.request as _urlreq
+    import uuid as _uuid
 
     fname = f"intg-v1-proxy-{_uuid.uuid4().hex[:8]}"
     code = (
@@ -7917,8 +7917,8 @@ def test_apigwv1_execute_lambda_proxy(apigw_v1, lam):
 
 def test_apigwv1_execute_path_params(apigw_v1, lam):
     """Path parameter {userId} is passed correctly in event['pathParameters']."""
-    import uuid as _uuid
     import urllib.request as _urlreq
+    import uuid as _uuid
 
     fname = f"intg-v1-params-{_uuid.uuid4().hex[:8]}"
     code = (
@@ -8038,8 +8038,8 @@ def test_apigwv1_execute_mock_integration(apigw_v1):
 
 def test_apigwv1_execute_missing_resource_404(apigw_v1):
     """Request to non-existent path returns 404 with AWS-style message."""
-    import urllib.request as _urlreq
     import urllib.error as _urlerr
+    import urllib.request as _urlreq
 
     api_id = apigw_v1.create_rest_api(name="v1-missing-resource")["id"]
     dep_id = apigw_v1.create_deployment(restApiId=api_id)["id"]
@@ -8059,8 +8059,8 @@ def test_apigwv1_execute_missing_resource_404(apigw_v1):
 
 def test_apigwv1_no_conflict_with_v2(apigw_v1, apigw, lam):
     """v1 and v2 APIs can coexist; execute-api routes them independently."""
-    import uuid as _uuid
     import urllib.request as _urlreq
+    import uuid as _uuid
 
     # Create v1 Lambda
     fname_v1 = f"intg-coexist-v1-{_uuid.uuid4().hex[:8]}"
@@ -8405,8 +8405,8 @@ def test_apigwv1_base_path_mapping_crud(apigw_v1):
 
 def test_apigwv1_execute_missing_stage_404(apigw_v1):
     """execute-api returns 404 when stage does not exist."""
-    import urllib.request as _urlreq
     import urllib.error as _urlerr
+    import urllib.request as _urlreq
 
     api_id = apigw_v1.create_rest_api(name="v1-no-stage")["id"]
     root_id = next(
@@ -8434,8 +8434,8 @@ def test_apigwv1_execute_missing_stage_404(apigw_v1):
 
 def test_apigwv1_execute_missing_method_405(apigw_v1):
     """execute-api returns 405 when resource exists but method is not configured."""
-    import urllib.request as _urlreq
     import urllib.error as _urlerr
+    import urllib.request as _urlreq
 
     api_id = apigw_v1.create_rest_api(name="v1-no-method")["id"]
     root_id = next(
@@ -8470,8 +8470,8 @@ def test_apigwv1_execute_missing_method_405(apigw_v1):
 
 def test_apigwv1_execute_lambda_arn_uri(apigw_v1, lam):
     """execute-api Lambda proxy works with plain arn:aws:lambda ARN as integration URI."""
-    import uuid as _uuid
     import urllib.request as _urlreq
+    import uuid as _uuid
 
     fname = f"v1-arn-uri-{_uuid.uuid4().hex[:8]}"
     code = (
@@ -8530,8 +8530,8 @@ def test_apigwv1_execute_lambda_arn_uri(apigw_v1, lam):
 
 def test_apigwv1_execute_lambda_requestcontext(apigw_v1, lam):
     """execute-api Lambda event includes required requestContext fields."""
-    import uuid as _uuid
     import urllib.request as _urlreq
+    import uuid as _uuid
 
     fname = f"v1-reqctx-{_uuid.uuid4().hex[:8]}"
     code = (
@@ -9441,7 +9441,10 @@ def test_sns_to_lambda_event_subscription_arn(lam, sns):
     sns.publish(TopicArn=topic_arn, Message="test-sub-arn")
 
     # Invoke the function directly and check what event it last received
-    import json, base64, zipfile, io
+    import base64
+    import io
+    import json
+    import zipfile
 
     result = lam.invoke(FunctionName=fn, Payload=json.dumps({"ping": True}).encode())
     # The subscription ARN should be a real ARN, not "{topic}:subscription"
@@ -9451,7 +9454,8 @@ def test_sns_to_lambda_event_subscription_arn(lam, sns):
 
 def test_lambda_unknown_path_returns_404(lam):
     """Requests to an unrecognised Lambda path must return 404, not 400 InvalidRequest."""
-    import urllib.request, urllib.error
+    import urllib.error
+    import urllib.request
 
     endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
     req = urllib.request.Request(
@@ -9584,10 +9588,11 @@ _requires_package = pytest.mark.skipif(
 @_requires_package
 def test_package_core_importable():
     """ministack.core modules must all be importable."""
-    from ministack.core.responses import json_response, error_response_json, new_uuid
+    from ministack.core.lambda_runtime import get_or_create_worker
+    from ministack.core.lambda_runtime import reset as lr_reset
+    from ministack.core.persistence import load_state, save_all
+    from ministack.core.responses import error_response_json, json_response, new_uuid
     from ministack.core.router import detect_service
-    from ministack.core.lambda_runtime import get_or_create_worker, reset as lr_reset
-    from ministack.core.persistence import save_all, load_state
 
     assert callable(json_response)
     assert callable(detect_service)
@@ -9599,29 +9604,29 @@ def test_package_core_importable():
 def test_package_services_importable():
     """All 25 ministack.services modules must be importable and expose handle_request."""
     from ministack.services import (
-        s3,
-        sqs,
-        sns,
-        dynamodb,
-        lambda_svc,
-        secretsmanager,
-        cloudwatch_logs,
-        ssm,
-        eventbridge,
-        kinesis,
-        cloudwatch,
-        ses,
-        stepfunctions,
-        ecs,
-        rds,
-        elasticache,
-        glue,
-        athena,
         apigateway,
         apigateway_v1,
-        firehose,
-        route53,
+        athena,
+        cloudwatch,
+        cloudwatch_logs,
         cognito,
+        dynamodb,
+        ecs,
+        elasticache,
+        eventbridge,
+        firehose,
+        glue,
+        kinesis,
+        lambda_svc,
+        rds,
+        route53,
+        s3,
+        secretsmanager,
+        ses,
+        sns,
+        sqs,
+        ssm,
+        stepfunctions,
     )
     from ministack.services.iam_sts import handle_iam_request, handle_sts_request
 
@@ -9660,6 +9665,7 @@ def test_package_services_importable():
 def test_app_asgi_callable():
     """ministack.app:app must be an async callable (ASGI entry point)."""
     import inspect
+
     from ministack import app as app_module
 
     assert callable(app_module.app)
@@ -10733,6 +10739,161 @@ def test_cognito_force_change_password_challenge(cognito_idp):
     )
     assert auth.get("ChallengeName") == "NEW_PASSWORD_REQUIRED"
     assert "Session" in auth
+
+
+# ---------------------------------------------------------------------------
+# Cognito TOTP MFA
+# ---------------------------------------------------------------------------
+
+
+def test_cognito_totp_full_flow(cognito_idp):
+    """Full TOTP MFA flow: SetUserPoolMfaConfig ON → AssociateSoftwareToken →
+    VerifySoftwareToken → InitiateAuth returns SOFTWARE_TOKEN_MFA challenge →
+    RespondToAuthChallenge with any code returns tokens."""
+    pid = cognito_idp.create_user_pool(PoolName="qa-totp-full")["UserPool"]["Id"]
+    cid = cognito_idp.create_user_pool_client(
+        UserPoolId=pid,
+        ClientName="qa-totp-app",
+        ExplicitAuthFlows=["ALLOW_USER_PASSWORD_AUTH", "ALLOW_REFRESH_TOKEN_AUTH"],
+    )["UserPoolClient"]["ClientId"]
+
+    # Enable TOTP MFA on the pool
+    cognito_idp.set_user_pool_mfa_config(
+        UserPoolId=pid,
+        SoftwareTokenMfaConfiguration={"Enabled": True},
+        MfaConfiguration="ON",
+    )
+    cfg = cognito_idp.get_user_pool_mfa_config(UserPoolId=pid)
+    assert cfg["MfaConfiguration"] == "ON"
+    assert cfg["SoftwareTokenMfaConfiguration"]["Enabled"] is True
+
+    # Create and confirm user
+    cognito_idp.admin_create_user(UserPoolId=pid, Username="totp-user", TemporaryPassword="Tmp1!")
+    cognito_idp.admin_set_user_password(UserPoolId=pid, Username="totp-user", Password="Perm1!", Permanent=True)
+
+    # Enroll TOTP: associate → get tokens first (MFA not yet enrolled, pool is ON but no enrollment)
+    # Pool ON with no enrollment → auth succeeds so user can enroll
+    auth = cognito_idp.admin_initiate_auth(
+        UserPoolId=pid, ClientId=cid,
+        AuthFlow="ADMIN_USER_PASSWORD_AUTH",
+        AuthParameters={"USERNAME": "totp-user", "PASSWORD": "Perm1!"},
+    )
+    access_token = auth["AuthenticationResult"]["AccessToken"]
+
+    # Associate software token
+    assoc = cognito_idp.associate_software_token(AccessToken=access_token)
+    assert "SecretCode" in assoc
+    assert len(assoc["SecretCode"]) > 0
+
+    # Verify (accept any code)
+    verify = cognito_idp.verify_software_token(AccessToken=access_token, UserCode="123456")
+    assert verify["Status"] == "SUCCESS"
+
+    # Now auth should return SOFTWARE_TOKEN_MFA challenge
+    auth2 = cognito_idp.admin_initiate_auth(
+        UserPoolId=pid, ClientId=cid,
+        AuthFlow="ADMIN_USER_PASSWORD_AUTH",
+        AuthParameters={"USERNAME": "totp-user", "PASSWORD": "Perm1!"},
+    )
+    assert auth2.get("ChallengeName") == "SOFTWARE_TOKEN_MFA"
+    assert "Session" in auth2
+
+    # Respond with any TOTP code → get tokens
+    result = cognito_idp.admin_respond_to_auth_challenge(
+        UserPoolId=pid, ClientId=cid,
+        ChallengeName="SOFTWARE_TOKEN_MFA",
+        ChallengeResponses={"USERNAME": "totp-user", "SOFTWARE_TOKEN_MFA_CODE": "123456"},
+    )
+    assert "AuthenticationResult" in result
+    assert "AccessToken" in result["AuthenticationResult"]
+
+
+def test_cognito_totp_optional_mfa(cognito_idp):
+    """OPTIONAL MFA: users without TOTP enrolled go straight to tokens;
+    users with TOTP enrolled get the challenge."""
+    pid = cognito_idp.create_user_pool(PoolName="qa-totp-optional")["UserPool"]["Id"]
+    cid = cognito_idp.create_user_pool_client(
+        UserPoolId=pid, ClientName="qa-totp-opt-app",
+        ExplicitAuthFlows=["ALLOW_USER_PASSWORD_AUTH", "ALLOW_REFRESH_TOKEN_AUTH"],
+    )["UserPoolClient"]["ClientId"]
+
+    cognito_idp.set_user_pool_mfa_config(
+        UserPoolId=pid,
+        SoftwareTokenMfaConfiguration={"Enabled": True},
+        MfaConfiguration="OPTIONAL",
+    )
+
+    # User without MFA enrolled
+    cognito_idp.admin_create_user(UserPoolId=pid, Username="no-mfa-user", TemporaryPassword="Tmp1!")
+    cognito_idp.admin_set_user_password(UserPoolId=pid, Username="no-mfa-user", Password="Perm1!", Permanent=True)
+    auth = cognito_idp.admin_initiate_auth(
+        UserPoolId=pid, ClientId=cid,
+        AuthFlow="ADMIN_USER_PASSWORD_AUTH",
+        AuthParameters={"USERNAME": "no-mfa-user", "PASSWORD": "Perm1!"},
+    )
+    assert "AuthenticationResult" in auth  # no challenge — not enrolled
+
+    # User with MFA enrolled via AdminSetUserMFAPreference
+    cognito_idp.admin_create_user(UserPoolId=pid, Username="mfa-user", TemporaryPassword="Tmp1!")
+    cognito_idp.admin_set_user_password(UserPoolId=pid, Username="mfa-user", Password="Perm1!", Permanent=True)
+    cognito_idp.admin_set_user_mfa_preference(
+        UserPoolId=pid, Username="mfa-user",
+        SoftwareTokenMfaSettings={"Enabled": True, "PreferredMfa": True},
+    )
+    auth2 = cognito_idp.admin_initiate_auth(
+        UserPoolId=pid, ClientId=cid,
+        AuthFlow="ADMIN_USER_PASSWORD_AUTH",
+        AuthParameters={"USERNAME": "mfa-user", "PASSWORD": "Perm1!"},
+    )
+    assert auth2.get("ChallengeName") == "SOFTWARE_TOKEN_MFA"
+
+
+def test_cognito_admin_get_user_mfa_fields(cognito_idp):
+    """AdminGetUser returns correct UserMFASettingList and PreferredMfaSetting."""
+    pid = cognito_idp.create_user_pool(PoolName="qa-totp-getuser")["UserPool"]["Id"]
+    cognito_idp.admin_create_user(UserPoolId=pid, Username="mfa-check-user", TemporaryPassword="Tmp1!")
+    cognito_idp.admin_set_user_password(UserPoolId=pid, Username="mfa-check-user", Password="Perm1!", Permanent=True)
+
+    # Before enrollment
+    u = cognito_idp.admin_get_user(UserPoolId=pid, Username="mfa-check-user")
+    assert u["UserMFASettingList"] == []
+    assert u["PreferredMfaSetting"] == ""
+
+    # After enrollment
+    cognito_idp.admin_set_user_mfa_preference(
+        UserPoolId=pid, Username="mfa-check-user",
+        SoftwareTokenMfaSettings={"Enabled": True, "PreferredMfa": True},
+    )
+    u2 = cognito_idp.admin_get_user(UserPoolId=pid, Username="mfa-check-user")
+    assert "SOFTWARE_TOKEN_MFA" in u2["UserMFASettingList"]
+    assert u2["PreferredMfaSetting"] == "SOFTWARE_TOKEN_MFA"
+
+
+def test_cognito_set_user_mfa_preference_via_token(cognito_idp):
+    """SetUserMFAPreference (public, uses AccessToken) enrolls TOTP on the user."""
+    pid = cognito_idp.create_user_pool(PoolName="qa-totp-selfenroll")["UserPool"]["Id"]
+    cid = cognito_idp.create_user_pool_client(
+        UserPoolId=pid, ClientName="qa-totp-self-app",
+        ExplicitAuthFlows=["ALLOW_USER_PASSWORD_AUTH", "ALLOW_REFRESH_TOKEN_AUTH"],
+    )["UserPoolClient"]["ClientId"]
+    cognito_idp.admin_create_user(UserPoolId=pid, Username="self-enroll", TemporaryPassword="Tmp1!")
+    cognito_idp.admin_set_user_password(UserPoolId=pid, Username="self-enroll", Password="Perm1!", Permanent=True)
+
+    auth = cognito_idp.admin_initiate_auth(
+        UserPoolId=pid, ClientId=cid,
+        AuthFlow="ADMIN_USER_PASSWORD_AUTH",
+        AuthParameters={"USERNAME": "self-enroll", "PASSWORD": "Perm1!"},
+    )
+    access_token = auth["AuthenticationResult"]["AccessToken"]
+
+    cognito_idp.set_user_mfa_preference(
+        AccessToken=access_token,
+        SoftwareTokenMfaSettings={"Enabled": True, "PreferredMfa": True},
+    )
+
+    u = cognito_idp.admin_get_user(UserPoolId=pid, Username="self-enroll")
+    assert "SOFTWARE_TOKEN_MFA" in u["UserMFASettingList"]
+    assert u["PreferredMfaSetting"] == "SOFTWARE_TOKEN_MFA"
 
 
 # ---------------------------------------------------------------------------
@@ -12405,6 +12566,67 @@ def test_athena_data_catalog_crud(athena):
 
 
 # ---------------------------------------------------------------------------
+# Athena engine control + /_ministack/config endpoint
+# ---------------------------------------------------------------------------
+
+
+def test_athena_engine_mock_via_config(athena):
+    """Switching ATHENA_ENGINE to 'mock' via /_ministack/config returns mock results."""
+    import json as _json
+    import urllib.request
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+    req = urllib.request.Request(
+        f"{endpoint}/_ministack/config",
+        data=_json.dumps({"athena.ATHENA_ENGINE": "mock"}).encode(),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    resp = _json.loads(urllib.request.urlopen(req, timeout=5).read())
+    assert resp["applied"].get("athena.ATHENA_ENGINE") == "mock"
+
+    # Query executes and succeeds in mock mode
+    qid = athena.start_query_execution(
+        QueryString="SELECT 1",
+        ResultConfiguration={"OutputLocation": "s3://athena-results/"},
+    )["QueryExecutionId"]
+    import time as _time
+    for _ in range(10):
+        state = athena.get_query_execution(QueryExecutionId=qid)["QueryExecution"]["Status"]["State"]
+        if state in ("SUCCEEDED", "FAILED"):
+            break
+        _time.sleep(0.2)
+    assert state == "SUCCEEDED"
+
+    # Reset back to auto
+    req2 = urllib.request.Request(
+        f"{endpoint}/_ministack/config",
+        data=_json.dumps({"athena.ATHENA_ENGINE": "auto"}).encode(),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    urllib.request.urlopen(req2, timeout=5)
+
+
+def test_ministack_config_invalid_key_ignored():
+    """/_ministack/config silently ignores unknown keys and only applies valid ones."""
+    import json as _json
+    import urllib.request
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+    req = urllib.request.Request(
+        f"{endpoint}/_ministack/config",
+        data=_json.dumps({
+            "nonexistent_module.VAR": "val",
+            "athena.ATHENA_ENGINE": "auto",
+        }).encode(),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    resp = _json.loads(urllib.request.urlopen(req, timeout=5).read())
+    assert "nonexistent_module.VAR" not in resp["applied"]
+    assert resp["applied"].get("athena.ATHENA_ENGINE") == "auto"
+
+
+# ---------------------------------------------------------------------------
 # RDS — edge cases
 # ---------------------------------------------------------------------------
 
@@ -13681,8 +13903,8 @@ def test_alb_dataplane_forward_lambda(elbv2, lam):
 
 def test_alb_dataplane_event_shape(elbv2, lam):
     """ALB event passed to Lambda contains all required fields."""
-    import urllib.request as _req
     import urllib.parse as _parse
+    import urllib.request as _req
 
     fn_code = (
         "import json\n"
@@ -13713,8 +13935,8 @@ def test_alb_dataplane_event_shape(elbv2, lam):
 
 def test_alb_dataplane_fixed_response(elbv2, lam):
     """ALB fixed-response action returns configured status/body without invoking Lambda."""
-    import urllib.request as _req
     import urllib.error as _err
+    import urllib.request as _req
 
     fn_code = "def handler(event, context):\n    return {'statusCode': 200, 'body': 'should-not-reach'}\n"
     lb_arn = elbv2.create_load_balancer(Name="dp-alb-fixed")["LoadBalancers"][0]["LoadBalancerArn"]
@@ -13858,8 +14080,8 @@ def test_alb_dataplane_path_pattern_rule(elbv2, lam):
 
 def test_alb_dataplane_no_listener_returns_503(elbv2):
     """Request to an ALB with no listeners returns 503."""
-    import urllib.request as _req
     import urllib.error as _err
+    import urllib.request as _req
 
     lb_arn = elbv2.create_load_balancer(Name="dp-alb-empty")["LoadBalancers"][0]["LoadBalancerArn"]
     try:
@@ -14171,7 +14393,7 @@ def test_sqs_send_message_batch_limit(sqs):
     entries = [{"Id": str(i), "MessageBody": f"msg {i}"} for i in range(11)]
     with pytest.raises(ClientError) as exc_info:
         sqs.send_message_batch(QueueUrl=q, Entries=entries)
-    assert exc_info.value.response["Error"]["Code"] == "TooManyEntriesInBatchRequest"
+    assert exc_info.value.response["Error"]["Code"] == "AWS.SimpleQueueService.TooManyEntriesInBatchRequest"
     sqs.delete_queue(QueueUrl=q)
 
 
@@ -14212,3 +14434,270 @@ def test_sqs_typed_exception_queue_not_found(sqs):
     import pytest
     with pytest.raises(sqs.exceptions.QueueDoesNotExist):
         sqs.get_queue_url(QueueName="queue-that-does-not-exist-typed-exc")
+
+
+# ---------------------------------------------------------------------------
+# Regression: SQS awsQueryCompatible — x-amzn-query-error header
+# botocore reads this header and overrides Error.Code with the legacy
+# AWS.SimpleQueueService.* code so callers checking the old namespaced
+# strings still work against MiniStack exactly as they do against real AWS.
+# ---------------------------------------------------------------------------
+
+def test_sqs_query_compat_header_nonexistent_queue(sqs):
+    """Error.Code must be the legacy 'AWS.SimpleQueueService.NonExistentQueue'
+    (not 'QueueDoesNotExist') when x-amzn-query-error header is present."""
+    with pytest.raises(ClientError) as exc:
+        sqs.get_queue_url(QueueName="queue-compat-header-test-xyz")
+    code = exc.value.response["Error"]["Code"]
+    assert code == "AWS.SimpleQueueService.NonExistentQueue", (
+        f"Expected legacy query-compat code, got '{code}'"
+    )
+
+
+def test_sqs_query_compat_header_batch_limit(sqs):
+    """TooManyEntriesInBatchRequest must surface as the legacy namespaced code."""
+    q = sqs.create_queue(QueueName="compat-batch-limit-q")["QueueUrl"]
+    entries = [{"Id": str(i), "MessageBody": f"m{i}"} for i in range(11)]
+    with pytest.raises(ClientError) as exc:
+        sqs.send_message_batch(QueueUrl=q, Entries=entries)
+    code = exc.value.response["Error"]["Code"]
+    assert code == "AWS.SimpleQueueService.TooManyEntriesInBatchRequest", (
+        f"Expected legacy query-compat code, got '{code}'"
+    )
+    sqs.delete_queue(QueueUrl=q)
+
+
+# ---------------------------------------------------------------------------
+# VPC gaps: NAT Gateways
+# ---------------------------------------------------------------------------
+
+def test_ec2_nat_gateway_crud(ec2):
+    vpc = ec2.create_vpc(CidrBlock="10.100.0.0/16")
+    vpc_id = vpc["Vpc"]["VpcId"]
+    subnet = ec2.create_subnet(VpcId=vpc_id, CidrBlock="10.100.1.0/24")
+    subnet_id = subnet["Subnet"]["SubnetId"]
+
+    resp = ec2.create_nat_gateway(SubnetId=subnet_id, ConnectivityType="private")
+    nat_id = resp["NatGateway"]["NatGatewayId"]
+    assert nat_id.startswith("nat-")
+    assert resp["NatGateway"]["State"] == "available"
+
+    desc = ec2.describe_nat_gateways(NatGatewayIds=[nat_id])
+    assert len(desc["NatGateways"]) == 1
+    assert desc["NatGateways"][0]["NatGatewayId"] == nat_id
+    assert desc["NatGateways"][0]["SubnetId"] == subnet_id
+
+    ec2.delete_nat_gateway(NatGatewayId=nat_id)
+    desc2 = ec2.describe_nat_gateways(NatGatewayIds=[nat_id])
+    assert desc2["NatGateways"][0]["State"] == "deleted"
+
+
+def test_ec2_nat_gateway_filter_by_vpc(ec2):
+    vpc = ec2.create_vpc(CidrBlock="10.101.0.0/16")
+    vpc_id = vpc["Vpc"]["VpcId"]
+    subnet = ec2.create_subnet(VpcId=vpc_id, CidrBlock="10.101.1.0/24")
+    subnet_id = subnet["Subnet"]["SubnetId"]
+    ec2.create_nat_gateway(SubnetId=subnet_id, ConnectivityType="private")
+
+    desc = ec2.describe_nat_gateways(
+        Filters=[{"Name": "vpc-id", "Values": [vpc_id]}]
+    )
+    assert all(n["VpcId"] == vpc_id for n in desc["NatGateways"])
+
+
+# ---------------------------------------------------------------------------
+# VPC gaps: Network ACLs
+# ---------------------------------------------------------------------------
+
+def test_ec2_network_acl_crud(ec2):
+    vpc = ec2.create_vpc(CidrBlock="10.102.0.0/16")
+    vpc_id = vpc["Vpc"]["VpcId"]
+
+    resp = ec2.create_network_acl(VpcId=vpc_id)
+    acl_id = resp["NetworkAcl"]["NetworkAclId"]
+    assert acl_id.startswith("acl-")
+    assert resp["NetworkAcl"]["VpcId"] == vpc_id
+    assert resp["NetworkAcl"]["IsDefault"] is False
+
+    desc = ec2.describe_network_acls(NetworkAclIds=[acl_id])
+    assert len(desc["NetworkAcls"]) == 1
+    assert desc["NetworkAcls"][0]["NetworkAclId"] == acl_id
+
+    ec2.create_network_acl_entry(
+        NetworkAclId=acl_id,
+        RuleNumber=100,
+        Protocol="-1",
+        RuleAction="allow",
+        Egress=False,
+        CidrBlock="0.0.0.0/0",
+    )
+    desc2 = ec2.describe_network_acls(NetworkAclIds=[acl_id])
+    assert len(desc2["NetworkAcls"][0]["Entries"]) == 1
+
+    ec2.delete_network_acl_entry(NetworkAclId=acl_id, RuleNumber=100, Egress=False)
+    desc3 = ec2.describe_network_acls(NetworkAclIds=[acl_id])
+    assert len(desc3["NetworkAcls"][0]["Entries"]) == 0
+
+    ec2.delete_network_acl(NetworkAclId=acl_id)
+    desc4 = ec2.describe_network_acls(NetworkAclIds=[acl_id])
+    assert len(desc4["NetworkAcls"]) == 0
+
+
+def test_ec2_network_acl_replace_entry(ec2):
+    vpc = ec2.create_vpc(CidrBlock="10.103.0.0/16")
+    vpc_id = vpc["Vpc"]["VpcId"]
+    resp = ec2.create_network_acl(VpcId=vpc_id)
+    acl_id = resp["NetworkAcl"]["NetworkAclId"]
+
+    ec2.create_network_acl_entry(
+        NetworkAclId=acl_id, RuleNumber=200, Protocol="-1",
+        RuleAction="deny", Egress=False, CidrBlock="10.0.0.0/8"
+    )
+    ec2.replace_network_acl_entry(
+        NetworkAclId=acl_id, RuleNumber=200, Protocol="-1",
+        RuleAction="allow", Egress=False, CidrBlock="10.0.0.0/8"
+    )
+    desc = ec2.describe_network_acls(NetworkAclIds=[acl_id])
+    entries = desc["NetworkAcls"][0]["Entries"]
+    assert len(entries) == 1
+    assert entries[0]["RuleAction"] == "allow"
+
+
+# ---------------------------------------------------------------------------
+# VPC gaps: Flow Logs
+# ---------------------------------------------------------------------------
+
+def test_ec2_flow_logs_crud(ec2):
+    vpc = ec2.create_vpc(CidrBlock="10.104.0.0/16")
+    vpc_id = vpc["Vpc"]["VpcId"]
+
+    resp = ec2.create_flow_logs(
+        ResourceIds=[vpc_id],
+        ResourceType="VPC",
+        TrafficType="ALL",
+        LogDestinationType="cloud-watch-logs",
+        LogGroupName="/aws/vpc/flowlogs",
+    )
+    assert resp["Unsuccessful"] == []
+    fl_ids = resp["FlowLogIds"]
+    assert len(fl_ids) == 1
+    assert fl_ids[0].startswith("fl-")
+
+    desc = ec2.describe_flow_logs(FlowLogIds=fl_ids)
+    assert len(desc["FlowLogs"]) == 1
+    assert desc["FlowLogs"][0]["FlowLogId"] == fl_ids[0]
+    assert desc["FlowLogs"][0]["FlowLogStatus"] == "ACTIVE"
+
+    ec2.delete_flow_logs(FlowLogIds=fl_ids)
+    desc2 = ec2.describe_flow_logs(FlowLogIds=fl_ids)
+    assert len(desc2["FlowLogs"]) == 0
+
+
+# ---------------------------------------------------------------------------
+# VPC gaps: VPC Peering Connections
+# ---------------------------------------------------------------------------
+
+def test_ec2_vpc_peering_crud(ec2):
+    vpc1 = ec2.create_vpc(CidrBlock="10.105.0.0/16")
+    vpc2 = ec2.create_vpc(CidrBlock="10.106.0.0/16")
+    vpc_id1 = vpc1["Vpc"]["VpcId"]
+    vpc_id2 = vpc2["Vpc"]["VpcId"]
+
+    resp = ec2.create_vpc_peering_connection(VpcId=vpc_id1, PeerVpcId=vpc_id2)
+    pcx = resp["VpcPeeringConnection"]
+    pcx_id = pcx["VpcPeeringConnectionId"]
+    assert pcx_id.startswith("pcx-")
+    assert pcx["Status"]["Code"] == "pending-acceptance"
+
+    accepted = ec2.accept_vpc_peering_connection(VpcPeeringConnectionId=pcx_id)
+    assert accepted["VpcPeeringConnection"]["Status"]["Code"] == "active"
+
+    desc = ec2.describe_vpc_peering_connections(VpcPeeringConnectionIds=[pcx_id])
+    assert len(desc["VpcPeeringConnections"]) == 1
+    assert desc["VpcPeeringConnections"][0]["Status"]["Code"] == "active"
+
+    ec2.delete_vpc_peering_connection(VpcPeeringConnectionId=pcx_id)
+    desc2 = ec2.describe_vpc_peering_connections(VpcPeeringConnectionIds=[pcx_id])
+    assert desc2["VpcPeeringConnections"][0]["Status"]["Code"] == "deleted"
+
+
+def test_ec2_vpc_peering_not_found(ec2):
+    from botocore.exceptions import ClientError
+    with pytest.raises(ClientError) as exc:
+        ec2.accept_vpc_peering_connection(VpcPeeringConnectionId="pcx-nonexistent")
+    assert "NotFound" in exc.value.response["Error"]["Code"]
+
+
+# ---------------------------------------------------------------------------
+# VPC gaps: DHCP Options
+# ---------------------------------------------------------------------------
+
+def test_ec2_dhcp_options_crud(ec2):
+    resp = ec2.create_dhcp_options(
+        DhcpConfigurations=[
+            {"Key": "domain-name", "Values": ["example.internal"]},
+            {"Key": "domain-name-servers", "Values": ["10.0.0.1", "10.0.0.2"]},
+        ]
+    )
+    dopt = resp["DhcpOptions"]
+    dopt_id = dopt["DhcpOptionsId"]
+    assert dopt_id.startswith("dopt-")
+
+    desc = ec2.describe_dhcp_options(DhcpOptionsIds=[dopt_id])
+    assert len(desc["DhcpOptions"]) == 1
+    configs = {c["Key"]: [v["Value"] for v in c["Values"]]
+               for c in desc["DhcpOptions"][0]["DhcpConfigurations"]}
+    assert configs["domain-name"] == ["example.internal"]
+    assert "10.0.0.1" in configs["domain-name-servers"]
+
+    vpc = ec2.create_vpc(CidrBlock="10.107.0.0/16")
+    vpc_id = vpc["Vpc"]["VpcId"]
+    ec2.associate_dhcp_options(DhcpOptionsId=dopt_id, VpcId=vpc_id)
+
+    ec2.delete_dhcp_options(DhcpOptionsId=dopt_id)
+    desc2 = ec2.describe_dhcp_options(DhcpOptionsIds=[dopt_id])
+    assert len(desc2["DhcpOptions"]) == 0
+
+
+def test_ec2_dhcp_options_not_found(ec2):
+    from botocore.exceptions import ClientError
+    with pytest.raises(ClientError) as exc:
+        ec2.delete_dhcp_options(DhcpOptionsId="dopt-nonexistent")
+    assert "NotFound" in exc.value.response["Error"]["Code"]
+
+
+# ---------------------------------------------------------------------------
+# VPC gaps: Egress-Only Internet Gateways
+# ---------------------------------------------------------------------------
+
+def test_ec2_egress_only_igw_crud(ec2):
+    vpc = ec2.create_vpc(CidrBlock="10.108.0.0/16")
+    vpc_id = vpc["Vpc"]["VpcId"]
+
+    resp = ec2.create_egress_only_internet_gateway(VpcId=vpc_id)
+    eigw = resp["EgressOnlyInternetGateway"]
+    eigw_id = eigw["EgressOnlyInternetGatewayId"]
+    assert eigw_id.startswith("eigw-")
+    assert eigw["Attachments"][0]["State"] == "attached"
+    assert eigw["Attachments"][0]["VpcId"] == vpc_id
+
+    desc = ec2.describe_egress_only_internet_gateways(
+        EgressOnlyInternetGatewayIds=[eigw_id]
+    )
+    assert len(desc["EgressOnlyInternetGateways"]) == 1
+    assert desc["EgressOnlyInternetGateways"][0]["EgressOnlyInternetGatewayId"] == eigw_id
+
+    ec2.delete_egress_only_internet_gateway(EgressOnlyInternetGatewayId=eigw_id)
+    desc2 = ec2.describe_egress_only_internet_gateways(
+        EgressOnlyInternetGatewayIds=[eigw_id]
+    )
+    assert len(desc2["EgressOnlyInternetGateways"]) == 0
+
+
+def test_ec2_egress_only_igw_not_found(ec2):
+    from botocore.exceptions import ClientError
+    with pytest.raises(ClientError) as exc:
+        ec2.delete_egress_only_internet_gateway(
+            EgressOnlyInternetGatewayId="eigw-nonexistent"
+        )
+    assert "NotFound" in exc.value.response["Error"]["Code"]

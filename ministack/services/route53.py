@@ -18,13 +18,13 @@ Wire protocol:
   Paths are under /2013-04-01/
 """
 
+import logging
+import random
 import re
 import string
-import logging
 import threading
-import random
 from datetime import datetime, timezone
-from xml.etree.ElementTree import Element, SubElement, tostring, fromstring
+from xml.etree.ElementTree import Element, SubElement, fromstring, tostring
 
 from ministack.core.responses import new_uuid
 

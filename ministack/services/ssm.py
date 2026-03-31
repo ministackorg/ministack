@@ -7,13 +7,13 @@ Supports: PutParameter, GetParameter, GetParameters, GetParametersByPath,
           AddTagsToResource, RemoveTagsFromResource, ListTagsForResource.
 """
 
-import json
-import time
-import logging
 import base64
+import json
+import logging
+import time
 from datetime import datetime, timezone
 
-from ministack.core.responses import json_response, error_response_json, new_uuid
+from ministack.core.responses import error_response_json, json_response, new_uuid
 
 logger = logging.getLogger("ssm")
 
@@ -91,7 +91,7 @@ def _put_parameter(data):
     if name in _parameters and not overwrite:
         return error_response_json(
             "ParameterAlreadyExists",
-            f"The parameter already exists. To overwrite this value, set the overwrite option in the request to true.",
+            "The parameter already exists. To overwrite this value, set the overwrite option in the request to true.",
             400,
         )
 

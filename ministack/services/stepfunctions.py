@@ -25,10 +25,16 @@ import logging
 import re
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, wait as futures_wait
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import wait as futures_wait
 from datetime import datetime, timezone
 
-from ministack.core.responses import json_response, error_response_json, new_uuid, now_iso
+from ministack.core.responses import (
+    error_response_json,
+    json_response,
+    new_uuid,
+    now_iso,
+)
 
 logger = logging.getLogger("states")
 
@@ -380,7 +386,7 @@ def _send_task_success(data):
     info = _task_tokens.get(token)
     if not info:
         return error_response_json(
-            "TaskDoesNotExist", f"Task token not found", 400)
+            "TaskDoesNotExist", "Task token not found", 400)
     info["result"] = output
     info["event"].set()
     return json_response({})
@@ -391,7 +397,7 @@ def _send_task_failure(data):
     info = _task_tokens.get(token)
     if not info:
         return error_response_json(
-            "TaskDoesNotExist", f"Task token not found", 400)
+            "TaskDoesNotExist", "Task token not found", 400)
     info["error"] = {
         "Error": data.get("error", "TaskFailed"),
         "Cause": data.get("cause", ""),
@@ -405,7 +411,7 @@ def _send_task_heartbeat(data):
     info = _task_tokens.get(token)
     if not info:
         return error_response_json(
-            "TaskDoesNotExist", f"Task token not found", 400)
+            "TaskDoesNotExist", "Task token not found", 400)
     info["heartbeat"] = now_iso()
     return json_response({})
 

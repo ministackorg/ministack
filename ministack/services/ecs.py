@@ -14,12 +14,17 @@ Supports: CreateCluster, DeleteCluster, DescribeClusters, ListClusters,
 Container execution: if Docker socket is available, RunTask actually runs containers.
 """
 
-import os
 import json
-import time
 import logging
+import os
+import time
 
-from ministack.core.responses import json_response, error_response_json, new_uuid, now_iso
+from ministack.core.responses import (
+    error_response_json,
+    json_response,
+    new_uuid,
+    now_iso,
+)
 
 logger = logging.getLogger("ecs")
 
@@ -190,7 +195,7 @@ def _delete_cluster(data):
     name = _resolve_cluster_name(data.get("cluster", "default"))
     cluster = _clusters.pop(name, None)
     if not cluster:
-        return error_response_json("ClusterNotFoundException", f"Cluster not found.", 400)
+        return error_response_json("ClusterNotFoundException", "Cluster not found.", 400)
     cluster["status"] = "INACTIVE"
     _tags.pop(cluster["clusterArn"], None)
     return json_response({"cluster": cluster})
@@ -402,7 +407,7 @@ def _create_service(data):
     svc_key = f"{cluster_name}/{name}"
     if svc_key in _services and _services[svc_key]["status"] == "ACTIVE":
         return error_response_json("ServiceAlreadyExists",
-            f"Creation of service was not idempotent.", 400)
+            "Creation of service was not idempotent.", 400)
 
     td_ref = data.get("taskDefinition", "")
     td_key = _resolve_td_key(td_ref)
@@ -470,7 +475,7 @@ def _delete_service(data):
     svc = _services.get(svc_key)
     if not svc:
         return error_response_json("ServiceNotFoundException",
-            f"Service not found.", 400)
+            "Service not found.", 400)
 
     force = data.get("force", False)
     if not force and svc.get("desiredCount", 0) > 0:
@@ -740,7 +745,7 @@ def _stop_task(data):
     task = _resolve_task(task_ref, cluster_name)
     if not task:
         return error_response_json("InvalidParameterException",
-            f"The referenced task was not found.", 400)
+            "The referenced task was not found.", 400)
 
     if task["lastStatus"] == "STOPPED":
         return json_response({"task": _sanitize(task)})

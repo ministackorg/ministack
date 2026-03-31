@@ -42,16 +42,16 @@ Wire protocol:
   Routing is handled in app.py via two separate SERVICE_HANDLERS entries.
 """
 
-import json
-import time
 import base64
+import json
 import logging
 import secrets
 import string
+import time
 from datetime import datetime, timezone
 from urllib.parse import parse_qs
 
-from ministack.core.responses import json_response, error_response_json, new_uuid
+from ministack.core.responses import error_response_json, json_response, new_uuid
 
 logger = logging.getLogger("cognito")
 
@@ -301,6 +301,8 @@ def _dispatch_idp(action: str, data: dict):
         "SetUserPoolMfaConfig": _set_user_pool_mfa_config,
         "AssociateSoftwareToken": _associate_software_token,
         "VerifySoftwareToken": _verify_software_token,
+        "AdminSetUserMFAPreference": _admin_set_user_mfa_preference,
+        "SetUserMFAPreference": _set_user_mfa_preference,
         # Tags
         "TagResource": _idp_tag_resource,
         "UntagResource": _idp_untag_resource,
@@ -593,7 +595,7 @@ def _admin_create_user(data):
     if username in pool["_users"]:
         return error_response_json(
             "UsernameExistsException",
-            f"User account already exists.", 400,
+            "User account already exists.", 400,
         )
 
     now = _now_epoch()
@@ -649,8 +651,8 @@ def _admin_get_user(data):
     out = _user_out(user)
     # AdminGetUser uses UserAttributes, not Attributes (per AWS API shape)
     out["UserAttributes"] = out.pop("Attributes", [])
-    out["UserMFASettingList"] = []
-    out["PreferredMfaSetting"] = ""
+    out["UserMFASettingList"] = user.get("_mfa_enabled", [])
+    out["PreferredMfaSetting"] = user.get("_preferred_mfa", "")
     return json_response(out)
 
 
@@ -854,6 +856,30 @@ def _admin_remove_user_from_group(data):
 # AUTH FLOWS
 # ===========================================================================
 
+def _mfa_challenge_for_user(pool: dict, user: dict, pid: str, username: str) -> dict | None:
+    """Return a SOFTWARE_TOKEN_MFA challenge dict if the pool+user require it, else None."""
+    mfa_config = pool.get("MfaConfiguration", "OFF")
+    if mfa_config == "OFF":
+        return None
+    preferred = user.get("_preferred_mfa", "")
+    enabled_mfa = user.get("_mfa_enabled", [])
+    # OPTIONAL: only challenge if user has TOTP set up
+    if mfa_config == "OPTIONAL" and "SOFTWARE_TOKEN_MFA" not in enabled_mfa:
+        return None
+    # ON: challenge if TOTP is set up; if not set up yet, skip (let them enroll)
+    if mfa_config == "ON" and "SOFTWARE_TOKEN_MFA" not in enabled_mfa:
+        return None
+    session = base64.b64encode(secrets.token_bytes(32)).decode()
+    return {
+        "ChallengeName": "SOFTWARE_TOKEN_MFA",
+        "Session": session,
+        "ChallengeParameters": {
+            "USER_ID_FOR_SRP": username,
+            "FRIENDLY_DEVICE_NAME": "TOTP device",
+        },
+    }
+
+
 def _build_auth_result(pool_id: str, client_id: str, user: dict) -> dict:
     sub = _attr_list_to_dict(user.get("Attributes", [])).get("sub", user["Username"])
     return {
@@ -898,6 +924,9 @@ def _admin_initiate_auth(data):
                     "userAttributes": json.dumps(_attr_list_to_dict(user.get("Attributes", []))),
                 },
             })
+        mfa_challenge = _mfa_challenge_for_user(pool, user, pid, username)
+        if mfa_challenge:
+            return json_response(mfa_challenge)
         return json_response({"AuthenticationResult": _build_auth_result(pid, cid, user)})
 
     if auth_flow in ("REFRESH_TOKEN_AUTH", "REFRESH_TOKEN"):
@@ -953,6 +982,15 @@ def _admin_respond_to_auth_challenge(data):
         user = pool["_users"].get(username)
         if not user:
             return error_response_json("UserNotFoundException", "User does not exist.", 400)
+        # Accept any TOTP code in emulator — no real TOTP validation
+        return json_response({"AuthenticationResult": _build_auth_result(pid, cid, user)})
+
+    if challenge_name == "MFA_SETUP":
+        # Triggered when pool MFA=ON but user hasn't enrolled yet
+        username = responses.get("USERNAME")
+        user = pool["_users"].get(username)
+        if not user:
+            return error_response_json("UserNotFoundException", "User does not exist.", 400)
         return json_response({"AuthenticationResult": _build_auth_result(pid, cid, user)})
 
     return error_response_json("InvalidParameterException", f"Unsupported challenge: {challenge_name}", 400)
@@ -996,6 +1034,9 @@ def _initiate_auth(data):
                     "userAttributes": json.dumps(_attr_list_to_dict(user.get("Attributes", []))),
                 },
             })
+        mfa_challenge = _mfa_challenge_for_user(pool, user, pid, username)
+        if mfa_challenge:
+            return json_response(mfa_challenge)
         return json_response({"AuthenticationResult": _build_auth_result(pid, cid, user)})
 
     if auth_flow in ("REFRESH_TOKEN_AUTH", "REFRESH_TOKEN"):
@@ -1055,6 +1096,14 @@ def _respond_to_auth_challenge(data):
             user["_password"] = new_password
         user["UserStatus"] = "CONFIRMED"
         user["UserLastModifiedDate"] = _now_epoch()
+        return json_response({"AuthenticationResult": _build_auth_result(pid, cid, user)})
+
+    if challenge_name in ("SOFTWARE_TOKEN_MFA", "MFA_SETUP"):
+        username = responses.get("USERNAME")
+        user = pool["_users"].get(username)
+        if not user:
+            return error_response_json("UserNotFoundException", "User does not exist.", 400)
+        # Accept any TOTP code in emulator
         return json_response({"AuthenticationResult": _build_auth_result(pid, cid, user)})
 
     return error_response_json("InvalidParameterException", f"Unsupported challenge: {challenge_name}", 400)
@@ -1230,8 +1279,8 @@ def _get_user(data):
             out = _user_out(user)
             # GetUser uses UserAttributes, not Attributes (per AWS API shape)
             out["UserAttributes"] = out.pop("Attributes", [])
-            out["UserMFASettingList"] = []
-            out["PreferredMfaSetting"] = ""
+            out["UserMFASettingList"] = user.get("_mfa_enabled", [])
+            out["PreferredMfaSetting"] = user.get("_preferred_mfa", "")
             return json_response(out)
     return error_response_json("NotAuthorizedException", "Invalid access token.", 400)
 
@@ -1431,6 +1480,59 @@ def _get_user_pool_mfa_config(data):
     })
 
 
+def _admin_set_user_mfa_preference(data):
+    pid = data.get("UserPoolId")
+    pool, err = _resolve_pool(pid)
+    if err:
+        return err
+    username = data.get("Username")
+    user, err = _resolve_user(pool, username)
+    if err:
+        return err
+    _apply_mfa_preference(user, data)
+    return json_response({})
+
+
+def _set_user_mfa_preference(data):
+    """Public (user-facing) version — resolves user from AccessToken."""
+    access_token = data.get("AccessToken")
+    if not access_token:
+        return error_response_json("NotAuthorizedException", "Missing access token.", 400)
+    for pool in _user_pools.values():
+        user = _user_from_token(access_token, pool)
+        if user:
+            _apply_mfa_preference(user, data)
+            return json_response({})
+    return error_response_json("NotAuthorizedException", "Invalid access token.", 400)
+
+
+def _apply_mfa_preference(user: dict, data: dict):
+    """Shared logic for Admin and user-facing SetUserMFAPreference."""
+    totp_settings = data.get("SoftwareTokenMfaSettings", {})
+    sms_settings = data.get("SMSMfaSettings", {})
+    enabled_mfa = user.setdefault("_mfa_enabled", [])
+
+    if totp_settings.get("Enabled"):
+        if "SOFTWARE_TOKEN_MFA" not in enabled_mfa:
+            enabled_mfa.append("SOFTWARE_TOKEN_MFA")
+        if totp_settings.get("PreferredMfa"):
+            user["_preferred_mfa"] = "SOFTWARE_TOKEN_MFA"
+    elif "Enabled" in totp_settings and not totp_settings["Enabled"]:
+        enabled_mfa[:] = [m for m in enabled_mfa if m != "SOFTWARE_TOKEN_MFA"]
+        if user.get("_preferred_mfa") == "SOFTWARE_TOKEN_MFA":
+            user["_preferred_mfa"] = ""
+
+    if sms_settings.get("Enabled"):
+        if "SMS_MFA" not in enabled_mfa:
+            enabled_mfa.append("SMS_MFA")
+        if sms_settings.get("PreferredMfa"):
+            user["_preferred_mfa"] = "SMS_MFA"
+    elif "Enabled" in sms_settings and not sms_settings["Enabled"]:
+        enabled_mfa[:] = [m for m in enabled_mfa if m != "SMS_MFA"]
+        if user.get("_preferred_mfa") == "SMS_MFA":
+            user["_preferred_mfa"] = ""
+
+
 def _set_user_pool_mfa_config(data):
     pid = data.get("UserPoolId")
     pool, err = _resolve_pool(pid)
@@ -1451,13 +1553,29 @@ def _set_user_pool_mfa_config(data):
 
 
 def _associate_software_token(data):
-    # Return a stub TOTP secret
+    """Issue a stub TOTP secret. Works with both AccessToken and Session."""
     secret = base64.b32encode(secrets.token_bytes(20)).decode()
-    return json_response({"SecretCode": secret})
+    session = base64.b64encode(secrets.token_bytes(32)).decode()
+    return json_response({"SecretCode": secret, "Session": session})
 
 
 def _verify_software_token(data):
-    # Accept any code in emulation
+    """Accept any TOTP code. Mark the user as TOTP-enrolled so auth flow issues the challenge."""
+    access_token = data.get("AccessToken")
+    user_code = data.get("UserCode", "")  # accepted regardless of value in emulator
+    friendly_name = data.get("FriendlyDeviceName", "TOTP device")
+
+    if access_token:
+        # Find the user by token across all pools
+        for pool in _user_pools.values():
+            user = _user_from_token(access_token, pool)
+            if user:
+                user.setdefault("_mfa_enabled", [])
+                if "SOFTWARE_TOKEN_MFA" not in user["_mfa_enabled"]:
+                    user["_mfa_enabled"].append("SOFTWARE_TOKEN_MFA")
+                user["_preferred_mfa"] = "SOFTWARE_TOKEN_MFA"
+                break
+
     return json_response({"Status": "SUCCESS"})
 
 

@@ -7,6 +7,44 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [1.1.8] — 2026-03-30
+
+### Added
+- **Cognito TOTP MFA** — full end-to-end Software Token MFA flow now works with CDK and boto3
+  - `AssociateSoftwareToken` returns a stub TOTP secret + session (accepts `AccessToken` or `Session`)
+  - `VerifySoftwareToken` accepts any code and marks the user as TOTP-enrolled (`_mfa_enabled`, `_preferred_mfa`)
+  - `AdminSetUserMFAPreference` — new: enables/disables TOTP or SMS MFA per user and sets preferred method
+  - `SetUserMFAPreference` — new: public (AccessToken-based) equivalent of the above
+  - `AdminInitiateAuth` / `InitiateAuth` now issue `SOFTWARE_TOKEN_MFA` challenge after password auth when pool `MfaConfiguration` is `ON` or `OPTIONAL` and user has TOTP enrolled
+  - `AdminRespondToAuthChallenge` / `RespondToAuthChallenge` accept any TOTP code for `SOFTWARE_TOKEN_MFA` and return tokens (emulator — no real TOTP validation)
+  - `AdminGetUser` / `GetUser` now return real `UserMFASettingList` and `PreferredMfaSetting` fields
+  - `MFA_SETUP` challenge handled in both respond endpoints (for pool `ON` + unenrolled users)
+
+### Tests
+- 4 new integration tests: full TOTP flow, OPTIONAL MFA, AdminGetUser MFA fields, SetUserMFAPreference via token — 714 tests total, all passing
+
+---
+
+## [1.1.7] — 2026-03-30
+
+### Added
+- **Athena engine control** — new `ATHENA_ENGINE` env var (`auto` | `duckdb` | `mock`) to select the SQL backend at startup; `auto` keeps existing behaviour (DuckDB if installed, mock otherwise). New `/_ministack/config` endpoint accepts `POST {"athena.ATHENA_ENGINE": "mock"}` to switch engines at runtime without restart — useful in CI to force mock mode without DuckDB installed. Contributed by @jespinoza-shippo.
+- **VPC gap coverage** — 6 new EC2 resource types, 22 new actions, 11 new tests
+  - **NAT Gateways**: `CreateNatGateway`, `DescribeNatGateways`, `DeleteNatGateway` — supports `SubnetId`, `ConnectivityType` (public/private), state transitions, `vpc-id`/`subnet-id`/`state` filters
+  - **Network ACLs**: `CreateNetworkAcl`, `DescribeNetworkAcls`, `DeleteNetworkAcl`, `CreateNetworkAclEntry`, `DeleteNetworkAclEntry`, `ReplaceNetworkAclEntry`, `ReplaceNetworkAclAssociation` — full CRUD with rule entries and subnet associations
+  - **Flow Logs**: `CreateFlowLogs`, `DescribeFlowLogs`, `DeleteFlowLogs` — supports VPC/subnet/ENI resource targets, CloudWatch Logs and S3 destinations, `resource-id` filter
+  - **VPC Peering**: `CreateVpcPeeringConnection`, `AcceptVpcPeeringConnection`, `DescribeVpcPeeringConnections`, `DeleteVpcPeeringConnection` — full lifecycle from `pending-acceptance` → `active` → `deleted`, cross-account/cross-region params accepted
+  - **DHCP Options**: `CreateDhcpOptions`, `AssociateDhcpOptions`, `DescribeDhcpOptions`, `DeleteDhcpOptions` — arbitrary key/value configurations, association updates `VpcId.DhcpOptionsId`
+  - **Egress-Only Internet Gateways**: `CreateEgressOnlyInternetGateway`, `DescribeEgressOnlyInternetGateways`, `DeleteEgressOnlyInternetGateway` — IPv6 egress-only IGW for VPCs
+
+### Fixed
+- **SQS `awsQueryCompatible` header** — all SQS JSON error responses now include the `x-amzn-query-error: <legacy_code>;<fault>` header required by the `awsQueryCompatible` service trait. botocore reads this header and overrides `Error.Code` with the legacy `AWS.SimpleQueueService.*` namespaced code (e.g. `AWS.SimpleQueueService.NonExistentQueue` instead of `QueueDoesNotExist`). Without this header, any SDK code that matched against the legacy string worked against real AWS but silently failed against MiniStack. Full mapping of all 28 SQS error shapes sourced from `aws-sdk-go` ErrCode constants.
+
+### Tests
+- 708 integration tests — all passing
+
+---
+
 ## [1.1.6] — 2026-03-30
 
 ### Fixed

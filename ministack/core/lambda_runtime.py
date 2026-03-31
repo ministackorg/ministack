@@ -4,16 +4,16 @@ Each function gets a persistent Python worker process that imports the handler
 once (cold start) and then handles subsequent invocations without re-importing (warm).
 """
 
-import os
-import sys
-import json
-import time
 import base64
-import zipfile
+import json
+import logging
+import os
+import subprocess
+import sys
 import tempfile
 import threading
-import subprocess
-import logging
+import time
+import zipfile
 
 logger = logging.getLogger("lambda_runtime")
 

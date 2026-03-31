@@ -3,8 +3,9 @@ Pytest fixtures for MiniStack integration tests.
 """
 import os
 import urllib.request
-import pytest
+
 import boto3
+import pytest
 from botocore.config import Config
 
 ENDPOINT = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")

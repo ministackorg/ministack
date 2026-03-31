@@ -22,16 +22,16 @@ Actions:
 """
 
 import asyncio
-import os
-import time
-import json
 import hashlib
+import json
 import logging
+import os
 import struct
+import time
 from urllib.parse import parse_qs
 from xml.sax.saxutils import escape as _esc
 
-from ministack.core.responses import new_uuid, now_iso, md5_hash
+from ministack.core.responses import md5_hash, new_uuid, now_iso
 
 logger = logging.getLogger("sqs")
 
@@ -785,10 +785,52 @@ def _json_ok(data: dict, status: int = 200) -> tuple:
             json.dumps(data).encode("utf-8"))
 
 
+# Mapping from JSON protocol shape names to legacy Query-protocol error codes.
+# SQS has the awsQueryCompatible trait: botocore reads x-amzn-query-error and
+# overrides Error.Code with the legacy code so SDK callers using the old
+# namespaced strings (e.g. "AWS.SimpleQueueService.NonExistentQueue") still work.
+_QUERY_COMPAT_CODES: dict[str, str] = {
+    # Source: aws-sdk-go service/sqs/errors.go ErrCode* constants (authoritative)
+    "QueueDoesNotExist":              "AWS.SimpleQueueService.NonExistentQueue",
+    "QueueNameExists":                "QueueAlreadyExists",
+    "TooManyEntriesInBatchRequest":   "AWS.SimpleQueueService.TooManyEntriesInBatchRequest",
+    "EmptyBatchRequest":              "AWS.SimpleQueueService.EmptyBatchRequest",
+    "BatchEntryIdsNotDistinct":       "AWS.SimpleQueueService.BatchEntryIdsNotDistinct",
+    "BatchRequestTooLong":            "AWS.SimpleQueueService.BatchRequestTooLong",
+    "InvalidBatchEntryId":            "AWS.SimpleQueueService.InvalidBatchEntryId",
+    "MessageNotInflight":             "AWS.SimpleQueueService.MessageNotInflight",
+    "PurgeQueueInProgress":           "AWS.SimpleQueueService.PurgeQueueInProgress",
+    "QueueDeletedRecently":           "AWS.SimpleQueueService.QueueDeletedRecently",
+    "UnsupportedOperation":           "AWS.SimpleQueueService.UnsupportedOperation",
+    "OverLimit":                      "OverLimit",
+    "InvalidIdFormat":                "InvalidIdFormat",
+    "InvalidMessageContents":         "InvalidMessageContents",
+    "ReceiptHandleIsInvalid":         "ReceiptHandleIsInvalid",
+    "InvalidAttributeName":           "InvalidAttributeName",
+    "InvalidAttributeValue":          "InvalidAttributeValue",
+    "InvalidSecurity":                "InvalidSecurity",
+    "InvalidAddress":                 "InvalidAddress",
+    "RequestThrottled":               "RequestThrottled",
+    "ResourceNotFoundException":      "ResourceNotFoundException",
+    # KMS errors — no namespace prefix
+    "KmsAccessDenied":                "KmsAccessDenied",
+    "KmsDisabled":                    "KmsDisabled",
+    "KmsInvalidKeyUsage":             "KmsInvalidKeyUsage",
+    "KmsInvalidState":                "KmsInvalidState",
+    "KmsNotFound":                    "KmsNotFound",
+    "KmsOptInRequired":               "KmsOptInRequired",
+    "KmsThrottled":                   "KmsThrottled",
+}
+
+
 def _json_err_resp(code: str, msg: str, status: int = 400) -> tuple:
-    return (status,
-            {"Content-Type": "application/x-amz-json-1.0"},
-            json.dumps({"__type": code, "message": msg}).encode("utf-8"))
+    fault = "Sender" if status < 500 else "Receiver"
+    legacy = _QUERY_COMPAT_CODES.get(code, code)
+    headers = {
+        "Content-Type": "application/x-amz-json-1.0",
+        "x-amzn-query-error": f"{legacy};{fault}",
+    }
+    return (status, headers, json.dumps({"__type": code, "message": msg}).encode("utf-8"))
 
 
 # ── XML ─────────────────────────────────────────────────────

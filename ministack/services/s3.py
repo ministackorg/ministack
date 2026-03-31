@@ -29,6 +29,8 @@ import base64
 import hashlib
 import json
 import logging
+import os
+import re
 import threading
 import time
 from urllib.parse import quote as url_quote, unquote as url_unquote, parse_qs as _parse_qs

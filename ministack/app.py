@@ -5,13 +5,13 @@ Routes requests to service handlers based on AWS headers, paths, and query param
 Compatible with AWS CLI, boto3, and any AWS SDK via --endpoint-url.
 """
 
+import asyncio
+import json
+import logging
 import os
 import re
-import json
-import uuid
-import asyncio
-import logging
 import subprocess
+import uuid
 from urllib.parse import parse_qs, urlparse
 
 # Matches host headers like "{apiId}.execute-api.localhost" or "{apiId}.execute-api.localhost:4566"
@@ -23,20 +23,37 @@ _EXECUTE_API_RE = re.compile(r"^([a-f0-9]{8})\.execute-api\.localhost(?::\d+)?$"
 _S3_VHOST_RE = re.compile(r"^([^.]+)(?:\.s3)?\.localhost(?::\d+)?$")
 _S3_VHOST_EXCLUDE_RE = re.compile(r"\.(execute-api|alb|emr|efs|elasticache)\.")
 
-from ministack.core.router import detect_service, extract_region, extract_account_id
-from ministack.core.persistence import save_all, load_state, PERSIST_STATE
-from ministack.services import s3, sqs, sns, dynamodb, lambda_svc, secretsmanager, cloudwatch_logs
-from ministack.services import ssm, eventbridge, kinesis, cloudwatch, ses, stepfunctions
-from ministack.services import ecs, rds, elasticache, glue, athena
-from ministack.services import alb
-from ministack.services import ec2
-from ministack.services import apigateway
-from ministack.services import firehose
-from ministack.services import apigateway_v1
-from ministack.services import route53
-from ministack.services import cognito
-from ministack.services import emr
-from ministack.services import efs
+from ministack.core.persistence import PERSIST_STATE, load_state, save_all
+from ministack.core.router import detect_service, extract_account_id, extract_region
+from ministack.services import (
+    alb,
+    apigateway,
+    apigateway_v1,
+    athena,
+    cloudwatch,
+    cloudwatch_logs,
+    cognito,
+    dynamodb,
+    ec2,
+    ecs,
+    efs,
+    elasticache,
+    emr,
+    eventbridge,
+    firehose,
+    glue,
+    kinesis,
+    lambda_svc,
+    rds,
+    route53,
+    s3,
+    secretsmanager,
+    ses,
+    sns,
+    sqs,
+    ssm,
+    stepfunctions,
+)
 from ministack.services.iam_sts import handle_iam_request, handle_sts_request
 
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
@@ -422,9 +439,11 @@ def _run_init_scripts():
 def _reset_all_state():
     """Wipe all in-memory state across every service module, and persisted files if enabled."""
     import shutil
+
+    from ministack.core.persistence import PERSIST_STATE, STATE_DIR
     from ministack.services.iam_sts import reset as _iam_reset
-    from ministack.core.persistence import STATE_DIR, PERSIST_STATE
-    from ministack.services.s3 import DATA_DIR as S3_DATA_DIR, PERSIST as S3_PERSIST
+    from ministack.services.s3 import DATA_DIR as S3_DATA_DIR
+    from ministack.services.s3 import PERSIST as S3_PERSIST
 
     for mod, fn in [
         (s3, s3.reset), (sqs, sqs.reset), (sns, sns.reset),
@@ -480,8 +499,9 @@ def _reset_all_state():
 
 
 def main():
-    import uvicorn
     import socket
+
+    import uvicorn
     port = int(_resolve_port())
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         if s.connect_ex(("127.0.0.1", port)) == 0:

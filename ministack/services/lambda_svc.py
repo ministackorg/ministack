@@ -22,24 +22,24 @@ with the event piped through stdin (safe from injection).
 SQS event source mappings poll the queue in a background thread.
 """
 
-import os
 import asyncio
-import importlib
-from typing import Any
-import copy
-import json
-import time
 import base64
+import copy
 import hashlib
-import zipfile
-import tempfile
-import subprocess
-import threading
+import importlib
+import json
 import logging
+import os
 import re
+import subprocess
+import tempfile
+import threading
+import time
+import zipfile
+from typing import Any
 from urllib.parse import unquote
 
-from ministack.core.responses import json_response, error_response_json, new_uuid
+from ministack.core.responses import error_response_json, json_response, new_uuid
 
 logger = logging.getLogger("lambda")
 

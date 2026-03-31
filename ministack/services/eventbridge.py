@@ -14,14 +14,14 @@ Supports: CreateEventBus, DeleteEventBus, ListEventBuses, DescribeEventBus,
 """
 
 import asyncio
-import json
-import time
 import hashlib
+import json
 import logging
 import re
+import time
 from datetime import datetime, timezone
 
-from ministack.core.responses import json_response, error_response_json, new_uuid
+from ministack.core.responses import error_response_json, json_response, new_uuid
 
 logger = logging.getLogger("events")
 
@@ -196,7 +196,7 @@ def _put_rule(data):
     if schedule and not _validate_schedule_expression(schedule):
         return error_response_json(
             "ValidationException",
-            f"Parameter ScheduleExpression is not valid.",
+            "Parameter ScheduleExpression is not valid.",
             400,
         )
 

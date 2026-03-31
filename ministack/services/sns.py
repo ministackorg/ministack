@@ -17,9 +17,9 @@ import logging
 import time
 from urllib.parse import parse_qs
 
+import ministack.services.lambda_svc as _lambda_svc
 from ministack.core.responses import new_uuid
 from ministack.services import sqs as _sqs
-import ministack.services.lambda_svc as _lambda_svc
 
 logger = logging.getLogger("sns")
 
@@ -75,7 +75,7 @@ async def handle_request(method: str, path: str, headers: dict, body: bytes, que
 def _create_topic(params):
     name = _p(params, "Name")
     if not name:
-        return _error("InvalidParameter", "Name is required", 400)
+        return _error("InvalidParameterException", "Name is required", 400)
 
     arn = f"arn:aws:sns:{REGION}:{ACCOUNT_ID}:{name}"
     if arn not in _topics:
@@ -149,7 +149,7 @@ def _get_topic_attributes(params):
     arn = _p(params, "TopicArn")
     topic = _topics.get(arn)
     if not topic:
-        return _error("NotFound", f"Topic does not exist: {arn}", 404)
+        return _error("NotFoundException", f"Topic does not exist: {arn}", 404)
     _refresh_subscription_counts(topic)
     attrs = "".join(
         f"<entry><key>{k}</key><value>{_xml_escape(v)}</value></entry>"
@@ -163,7 +163,7 @@ def _set_topic_attributes(params):
     arn = _p(params, "TopicArn")
     topic = _topics.get(arn)
     if not topic:
-        return _error("NotFound", f"Topic does not exist: {arn}", 404)
+        return _error("NotFoundException", f"Topic does not exist: {arn}", 404)
     attr_name = _p(params, "AttributeName")
     attr_val = _p(params, "AttributeValue")
     if attr_name:
@@ -182,10 +182,10 @@ def _subscribe(params):
 
     topic = _topics.get(topic_arn)
     if not topic:
-        return _error("NotFound", f"Topic does not exist: {topic_arn}", 404)
+        return _error("NotFoundException", f"Topic does not exist: {topic_arn}", 404)
 
     if not protocol:
-        return _error("InvalidParameter", "Protocol is required", 400)
+        return _error("InvalidParameterException", "Protocol is required", 400)
 
     for existing in topic["subscriptions"]:
         if existing["protocol"] == protocol and existing["endpoint"] == endpoint:
@@ -233,10 +233,10 @@ def _confirm_subscription(params):
 
     topic = _topics.get(topic_arn)
     if not topic:
-        return _error("NotFound", f"Topic does not exist: {topic_arn}", 404)
+        return _error("NotFoundException", f"Topic does not exist: {topic_arn}", 404)
 
     if not token:
-        return _error("InvalidParameter", "Token is required", 400)
+        return _error("InvalidParameterException", "Token is required", 400)
 
     for sub in topic["subscriptions"]:
         if sub.get("token") == token:
@@ -248,7 +248,7 @@ def _confirm_subscription(params):
             return _xml(200, "ConfirmSubscriptionResponse",
                         f"<ConfirmSubscriptionResult><SubscriptionArn>{sub['arn']}</SubscriptionArn></ConfirmSubscriptionResult>")
 
-    return _error("InvalidParameter", "Invalid token", 400)
+    return _error("InvalidParameterException", "Invalid token", 400)
 
 
 def _unsubscribe(params):
@@ -283,7 +283,7 @@ def _list_subscriptions_by_topic(params):
     topic_arn = _p(params, "TopicArn")
     topic = _topics.get(topic_arn)
     if not topic:
-        return _error("NotFound", f"Topic does not exist: {topic_arn}", 404)
+        return _error("NotFoundException", f"Topic does not exist: {topic_arn}", 404)
     members = ""
     for sub in topic["subscriptions"]:
         members += (
@@ -303,11 +303,11 @@ def _get_subscription_attributes(params):
     sub_arn = _p(params, "SubscriptionArn")
     topic_arn = _sub_arn_to_topic.get(sub_arn)
     if not topic_arn or topic_arn not in _topics:
-        return _error("NotFound", f"Subscription does not exist: {sub_arn}", 404)
+        return _error("NotFoundException", f"Subscription does not exist: {sub_arn}", 404)
 
     sub = _find_subscription(topic_arn, sub_arn)
     if not sub:
-        return _error("NotFound", f"Subscription does not exist: {sub_arn}", 404)
+        return _error("NotFoundException", f"Subscription does not exist: {sub_arn}", 404)
 
     attrs = "".join(
         f"<entry><key>{k}</key><value>{_xml_escape(v)}</value></entry>"
@@ -321,11 +321,11 @@ def _set_subscription_attributes(params):
     sub_arn = _p(params, "SubscriptionArn")
     topic_arn = _sub_arn_to_topic.get(sub_arn)
     if not topic_arn or topic_arn not in _topics:
-        return _error("NotFound", f"Subscription does not exist: {sub_arn}", 404)
+        return _error("NotFoundException", f"Subscription does not exist: {sub_arn}", 404)
 
     sub = _find_subscription(topic_arn, sub_arn)
     if not sub:
-        return _error("NotFound", f"Subscription does not exist: {sub_arn}", 404)
+        return _error("NotFoundException", f"Subscription does not exist: {sub_arn}", 404)
 
     attr_name = _p(params, "AttributeName")
     attr_val = _p(params, "AttributeValue")
@@ -333,14 +333,14 @@ def _set_subscription_attributes(params):
     allowed = {"DeliveryPolicy", "FilterPolicy", "FilterPolicyScope",
                "RawMessageDelivery", "RedrivePolicy"}
     if attr_name not in allowed:
-        return _error("InvalidParameter",
+        return _error("InvalidParameterException",
                       f"Invalid attribute name: {attr_name}", 400)
 
     if attr_name == "FilterPolicy" and attr_val:
         try:
             json.loads(attr_val)
         except json.JSONDecodeError:
-            return _error("InvalidParameter", "Invalid JSON in FilterPolicy", 400)
+            return _error("InvalidParameterException", "Invalid JSON in FilterPolicy", 400)
 
     sub["attributes"][attr_name] = attr_val
     return _xml(200, "SetSubscriptionAttributesResponse", "")
@@ -364,11 +364,11 @@ def _publish(params):
                     f"<PublishResult><MessageId>{msg_id}</MessageId></PublishResult>")
 
     if not topic_arn:
-        return _error("InvalidParameter",
+        return _error("InvalidParameterException",
                       "TopicArn, TargetArn, or PhoneNumber is required", 400)
 
     if topic_arn not in _topics:
-        return _error("NotFound", f"Topic does not exist: {topic_arn}", 404)
+        return _error("NotFoundException", f"Topic does not exist: {topic_arn}", 404)
 
     msg_attrs = _parse_message_attributes(params)
     msg_id = new_uuid()
@@ -392,13 +392,13 @@ def _publish(params):
 def _publish_batch(params):
     topic_arn = _p(params, "TopicArn")
     if not topic_arn:
-        return _error("InvalidParameter", "TopicArn is required", 400)
+        return _error("InvalidParameterException", "TopicArn is required", 400)
     if topic_arn not in _topics:
-        return _error("NotFound", f"Topic does not exist: {topic_arn}", 404)
+        return _error("NotFoundException", f"Topic does not exist: {topic_arn}", 404)
 
     entries = _parse_batch_entries(params)
     if not entries:
-        return _error("InvalidParameter",
+        return _error("InvalidParameterException",
                       "PublishBatchRequestEntries is required", 400)
     if len(entries) > 10:
         return _error("TooManyEntriesInBatchRequest",
@@ -645,7 +645,7 @@ def _create_platform_application(params):
     name = _p(params, "Name")
     platform = _p(params, "Platform")
     if not name or not platform:
-        return _error("InvalidParameter", "Name and Platform are required", 400)
+        return _error("InvalidParameterException", "Name and Platform are required", 400)
 
     arn = f"arn:aws:sns:{REGION}:{ACCOUNT_ID}:app/{platform}/{name}"
     attrs = {}
@@ -673,9 +673,9 @@ def _create_platform_endpoint(params):
     token = _p(params, "Token")
 
     if app_arn not in _platform_applications:
-        return _error("NotFound", f"PlatformApplication does not exist: {app_arn}", 404)
+        return _error("NotFoundException", f"PlatformApplication does not exist: {app_arn}", 404)
     if not token:
-        return _error("InvalidParameter", "Token is required", 400)
+        return _error("InvalidParameterException", "Token is required", 400)
 
     endpoint_arn = f"{app_arn}/{new_uuid()}"
 
@@ -719,10 +719,11 @@ def _xml(status, root_tag, inner):
 
 
 def _error(code, message, status):
+    error_type = "Sender" if status < 500 else "Receiver"
     body = (
         f'<?xml version="1.0" encoding="UTF-8"?>'
         f'<ErrorResponse xmlns="http://sns.amazonaws.com/doc/2010-03-31/">'
-        f'<Error><Code>{code}</Code><Message>{_xml_escape(message)}</Message></Error>'
+        f'<Error><Type>{error_type}</Type><Code>{code}</Code><Message>{_xml_escape(message)}</Message></Error>'
         f'<RequestId>{new_uuid()}</RequestId>'
         f'</ErrorResponse>'
     ).encode("utf-8")

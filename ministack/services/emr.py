@@ -14,14 +14,14 @@ Supports:
   Block Public Access: GetBlockPublicAccessConfiguration, PutBlockPublicAccessConfiguration
 """
 
-import os
 import json
+import logging
+import os
 import random
 import string
-import logging
 import time
 
-from ministack.core.responses import json_response, error_response_json, new_uuid
+from ministack.core.responses import error_response_json, json_response, new_uuid
 
 logger = logging.getLogger("emr")
 
@@ -176,7 +176,7 @@ def _run_job_flow(data):
         "Tags": tags,
         "ServiceRole": service_role,
         "NormalizedInstanceHours": 0,
-        "MasterPublicDnsName": f"ec2-0-0-0-0.compute-1.amazonaws.com",
+        "MasterPublicDnsName": "ec2-0-0-0-0.compute-1.amazonaws.com",
         "StepConcurrencyLevel": data.get("StepConcurrencyLevel", 1),
         "BootstrapActions": bootstrap_actions,
         "InstanceFleets": instance_fleets,
