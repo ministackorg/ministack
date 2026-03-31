@@ -10,7 +10,7 @@ Routes incoming requests to the correct service handler based on:
 import logging
 import re
 
-logger = logging.getLogger("localstack-clone")
+logger = logging.getLogger("ministack")
 
 # Service detection patterns
 SERVICE_PATTERNS = {
@@ -231,7 +231,8 @@ def detect_service(method: str, path: str, headers: dict, query_params: dict) ->
             "SimulatePrincipalPolicy": "iam", "SimulateCustomPolicy": "iam",
             # STS actions
             "GetCallerIdentity": "sts", "AssumeRole": "sts",
-            "GetSessionToken": "sts",
+            "GetSessionToken": "sts", "AssumeRoleWithWebIdentity": "sts",
+            "AssumeRoleWithSAML": "sts",
             # CloudWatch actions
             "PutMetricData": "monitoring", "GetMetricData": "monitoring",
             "ListMetrics": "monitoring", "PutMetricAlarm": "monitoring",

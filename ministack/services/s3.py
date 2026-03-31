@@ -76,7 +76,7 @@ _object_legal_hold: dict = {}
 
 _multipart_uploads: dict = {}
 
-DATA_DIR = os.environ.get("S3_DATA_DIR", "/tmp/localstack-data/s3")
+DATA_DIR = os.environ.get("S3_DATA_DIR", "/tmp/ministack-data/s3")
 PERSIST = os.environ.get("S3_PERSIST", "0") == "1"
 
 # Headers preserved from PUT requests and returned on GET/HEAD.
@@ -404,6 +404,10 @@ def _dispatch(
             return _get_object_lock_configuration(bucket)
         if "replication" in query_params:
             return _get_bucket_replication(bucket)
+        if "ownershipControls" in query_params:
+            return _get_bucket_ownership_controls(bucket)
+        if "publicAccessBlock" in query_params:
+            return _get_public_access_block(bucket)
         return _list_objects_v1(bucket, query_params)
 
     if method == "PUT":
@@ -435,6 +439,10 @@ def _dispatch(
             return _put_object_lock_configuration(bucket, body)
         if "replication" in query_params:
             return _put_bucket_replication(bucket, body)
+        if "ownershipControls" in query_params:
+            return _put_bucket_ownership_controls(bucket, body)
+        if "publicAccessBlock" in query_params:
+            return _put_public_access_block(bucket, body)
         return _create_bucket(bucket, body, headers)
 
     if method == "DELETE":
@@ -452,6 +460,10 @@ def _dispatch(
             return _delete_bucket_website(bucket)
         if "replication" in query_params:
             return _delete_bucket_replication(bucket)
+        if "ownershipControls" in query_params:
+            return _delete_bucket_ownership_controls(bucket)
+        if "publicAccessBlock" in query_params:
+            return _delete_public_access_block(bucket)
         return _delete_bucket(bucket)
 
     if method == "HEAD":
@@ -498,12 +510,8 @@ def _create_bucket(name: str, body: bytes, headers: dict = None):
             "InvalidBucketName", "The specified bucket is not valid.", 400, f"/{name}"
         )
     if name in _buckets:
-        return _error(
-            "BucketAlreadyOwnedByYou",
-            "Your previous request to create the named bucket succeeded and you already own it.",
-            409,
-            f"/{name}",
-        )
+        # Idempotent: same account already owns it — return 200 like real AWS
+        return 200, {"Location": f"/{name}"}, b""
 
     region = None
     if body:
@@ -781,6 +789,61 @@ def _delete_bucket_tagging(name: str):
     if name not in _buckets:
         return _no_such_bucket(name)
     _bucket_tags.pop(name, None)
+    return 204, {}, b""
+
+
+def _put_bucket_ownership_controls(name: str, body: bytes):
+    if name not in _buckets:
+        return _no_such_bucket(name)
+    _buckets[name]["_ownership_controls"] = body
+    return 200, {}, b""
+
+
+def _get_bucket_ownership_controls(name: str):
+    if name not in _buckets:
+        return _no_such_bucket(name)
+    stored = _buckets[name].get("_ownership_controls")
+    if stored:
+        return 200, {"Content-Type": "application/xml"}, stored
+    root = Element("OwnershipControls", xmlns=S3_NS)
+    rule = SubElement(root, "Rule")
+    SubElement(rule, "ObjectOwnership").text = "BucketOwnerEnforced"
+    return 200, {"Content-Type": "application/xml"}, _xml_body(root)
+
+
+def _delete_bucket_ownership_controls(name: str):
+    if name not in _buckets:
+        return _no_such_bucket(name)
+    _buckets[name].pop("_ownership_controls", None)
+    return 204, {}, b""
+
+
+def _put_public_access_block(name: str, body: bytes):
+    if name not in _buckets:
+        return _no_such_bucket(name)
+    _buckets[name]["_public_access_block"] = body
+    return 200, {}, b""
+
+
+def _get_public_access_block(name: str):
+    if name not in _buckets:
+        return _no_such_bucket(name)
+    stored = _buckets[name].get("_public_access_block")
+    if stored:
+        return 200, {"Content-Type": "application/xml"}, stored
+    # Default: all public access blocked
+    root = Element("PublicAccessBlockConfiguration", xmlns=S3_NS)
+    SubElement(root, "BlockPublicAcls").text = "true"
+    SubElement(root, "IgnorePublicAcls").text = "true"
+    SubElement(root, "BlockPublicPolicy").text = "true"
+    SubElement(root, "RestrictPublicBuckets").text = "true"
+    return 200, {"Content-Type": "application/xml"}, _xml_body(root)
+
+
+def _delete_public_access_block(name: str):
+    if name not in _buckets:
+        return _no_such_bucket(name)
+    _buckets[name].pop("_public_access_block", None)
     return 204, {}, b""
 
 

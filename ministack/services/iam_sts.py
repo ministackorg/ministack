@@ -211,6 +211,18 @@ def _delete_role(p):
     return _xml(200, "DeleteRoleResponse", "", ns="iam")
 
 
+def _update_role(p):
+    name = _p(p, "RoleName")
+    role = _roles.get(name)
+    if not role:
+        return _error(404, "NoSuchEntity", f"Role {name} not found.", ns="iam")
+    if "Description" in p:
+        role["Description"] = _p(p, "Description")
+    if "MaxSessionDuration" in p:
+        role["MaxSessionDuration"] = int(_p(p, "MaxSessionDuration", "3600"))
+    return _xml(200, "UpdateRoleResponse", "<UpdateRoleResult></UpdateRoleResult>", ns="iam")
+
+
 def _update_assume_role_policy(p):
     name = _p(p, "RoleName")
     if name not in _roles:
@@ -1241,6 +1253,35 @@ async def handle_sts_request(method, path, headers, body, query_params):
                     f"</AssumeRoleResult>",
                     ns="sts")
 
+    if action == "AssumeRoleWithWebIdentity":
+        role_arn = _p(params, "RoleArn")
+        session = _p(params, "RoleSessionName", "session")
+        duration = int(_p(params, "DurationSeconds") or 3600)
+        access_key = _gen_session_access_key()
+        secret_key = _gen_secret()
+        session_token = _gen_session_token()
+        assumed_arn = role_arn.replace(":role/", ":assumed-role/", 1)
+        if not assumed_arn.endswith(f"/{session}"):
+            assumed_arn = f"{assumed_arn}/{session}"
+        role_id = "AROA" + new_uuid().replace("-", "")[:17].upper()
+        return _xml(200, "AssumeRoleWithWebIdentityResponse",
+                    f"<AssumeRoleWithWebIdentityResult>"
+                    f"<Credentials>"
+                    f"<AccessKeyId>{access_key}</AccessKeyId>"
+                    f"<SecretAccessKey>{secret_key}</SecretAccessKey>"
+                    f"<SessionToken>{session_token}</SessionToken>"
+                    f"<Expiration>{_future(duration)}</Expiration>"
+                    f"</Credentials>"
+                    f"<AssumedRoleUser>"
+                    f"<AssumedRoleId>{role_id}:{session}</AssumedRoleId>"
+                    f"<Arn>{assumed_arn}</Arn>"
+                    f"</AssumedRoleUser>"
+                    f"<SubjectFromWebIdentityToken>test-subject</SubjectFromWebIdentityToken>"
+                    f"<Audience>sts.amazonaws.com</Audience>"
+                    f"<Provider>accounts.google.com</Provider>"
+                    f"</AssumeRoleWithWebIdentityResult>",
+                    ns="sts")
+
     if action == "GetSessionToken":
         duration = int(_p(params, "DurationSeconds") or 43200)
         expiration = _future(duration)
@@ -1431,6 +1472,7 @@ _IAM_HANDLERS = {
     "GetRole": _get_role,
     "ListRoles": _list_roles,
     "DeleteRole": _delete_role,
+    "UpdateRole": _update_role,
     "CreatePolicy": _create_policy,
     "GetPolicy": _get_policy,
     "GetPolicyVersion": _get_policy_version,

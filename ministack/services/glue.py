@@ -23,7 +23,7 @@ logger = logging.getLogger("glue")
 ACCOUNT_ID = "000000000000"
 REGION = "us-east-1"
 CRAWLER_RUN_SECONDS = int(os.environ.get("GLUE_CRAWLER_RUN_SECONDS", "5"))
-S3_DATA_DIR = os.environ.get("S3_DATA_DIR", "/tmp/localstack-data/s3")
+S3_DATA_DIR = os.environ.get("S3_DATA_DIR", "/tmp/ministack-data/s3")
 
 _databases: dict = {}
 _tables: dict = {}       # "db_name/table_name" -> table dict

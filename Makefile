@@ -19,7 +19,7 @@ run: build
 		-v /var/run/docker.sock:/var/run/docker.sock \
 		$(IMAGE_NAME)
 	@echo "MiniStack running on http://localhost:$(PORT)"
-	@echo "Health: http://localhost:$(PORT)/_localstack/health"
+	@echo "Health: http://localhost:$(PORT)/_ministack/health"
 
 run-compose:
 	docker compose up -d --build
@@ -36,13 +36,13 @@ logs:
 	docker logs -f $(CONTAINER_NAME)
 
 health:
-	@curl -s http://localhost:$(PORT)/_localstack/health | python3 -m json.tool
+	@curl -s http://localhost:$(PORT)/_ministack/health | python3 -m json.tool
 
 test: stop run
 	@echo "Waiting for ministack to be ready..."
 	@READY=0; \
 	for i in $$(seq 1 30); do \
-		if curl -sf http://localhost:$(PORT)/_localstack/health > /dev/null 2>&1; then \
+		if curl -sf http://localhost:$(PORT)/_ministack/health > /dev/null 2>&1; then \
 			echo "Ready after $$i second(s)."; READY=1; break; \
 		fi; \
 		sleep 1; \

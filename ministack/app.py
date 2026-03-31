@@ -206,6 +206,22 @@ async def app(scope, receive, send):
                              json.dumps({"applied": applied}).encode())
         return
 
+    # S3 Control API — /v20180820/... with x-amz-account-id header
+    if path.startswith("/v20180820/"):
+        if method == "GET" and path.startswith("/v20180820/tags/"):
+            # ListTagsForResource — return empty tag set
+            await _send_response(send, 200, {
+                "Content-Type": "application/json",
+                "x-amzn-requestid": request_id,
+            }, json.dumps({"Tags": []}).encode())
+        else:
+            # All other S3 Control operations — accept silently
+            await _send_response(send, 200, {
+                "Content-Type": "application/json",
+                "x-amzn-requestid": request_id,
+            }, b"{}")
+        return
+
     if path in ("/_localstack/health", "/health", "/_ministack/health"):
         await _send_response(send, 200, {
             "Content-Type": "application/json",
@@ -321,7 +337,15 @@ async def app(scope, receive, send):
             await _send_response(send, status, resp_headers, resp_body)
             return
 
-    service = detect_service(method, path, headers, query_params)
+    # For unsigned form-encoded requests (e.g. STS AssumeRoleWithWebIdentity),
+    # Action is in the body not the query string — merge it in for routing only.
+    routing_params = query_params
+    if not query_params.get("Action") and headers.get("content-type", "").startswith("application/x-www-form-urlencoded"):
+        body_params = parse_qs(body.decode("utf-8", errors="replace"), keep_blank_values=True)
+        if body_params.get("Action"):
+            routing_params = {**query_params, "Action": body_params["Action"]}
+
+    service = detect_service(method, path, headers, routing_params)
     region = extract_region(headers)
 
     logger.debug(f"{method} {path} -> service={service} region={region}")

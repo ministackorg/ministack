@@ -374,7 +374,7 @@ ecs.stop_task(cluster="dev", task=task_arn)
 | `MINISTACK_HOST` | `localhost` | Hostname used in SQS queue URLs returned to clients |
 | `LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR` |
 | `S3_PERSIST` | `0` | Set `1` to persist S3 objects to disk |
-| `S3_DATA_DIR` | `/tmp/localstack-data/s3` | S3 persistence directory |
+| `S3_DATA_DIR` | `/tmp/ministack-data/s3` | S3 persistence directory |
 | `REDIS_HOST` | `redis` | Redis host for ElastiCache fallback |
 | `REDIS_PORT` | `6379` | Redis port for ElastiCache fallback |
 | `RDS_BASE_PORT` | `15432` | Starting host port for RDS containers |
@@ -467,20 +467,20 @@ pip install boto3 pytest duckdb docker cbor2
 # Start MiniStack
 docker compose up -d
 
-# Run the full test suite (730 tests across all 30 services)
+# Run the full test suite (737 tests across all 30 services)
 pytest tests/ -v
 ```
 
 Expected output:
 
 ```
-collected 730 items
+collected 737 items
 
 tests/test_services.py::test_s3_create_bucket PASSED
 ...
 tests/test_services.py::test_app_asgi_callable PASSED
 
-730 passed in ~60s
+737 passed in ~60s
 ```
 
 ---

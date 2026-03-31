@@ -26,7 +26,7 @@ logger = logging.getLogger("athena")
 
 ACCOUNT_ID = "000000000000"
 REGION = "us-east-1"
-S3_DATA_DIR = os.environ.get("S3_DATA_DIR", "/tmp/localstack-data/s3")
+S3_DATA_DIR = os.environ.get("S3_DATA_DIR", "/tmp/ministack-data/s3")
 ATHENA_ENGINE = os.environ.get("ATHENA_ENGINE", "auto")  # "auto" | "duckdb" | "mock"
 
 

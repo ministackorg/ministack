@@ -300,7 +300,7 @@ def _put_item(data):
     result = {}
     if data.get("ReturnValues") == "ALL_OLD" and old_item:
         result["Attributes"] = old_item
-    _add_consumed_capacity(result, data, name)
+    _add_consumed_capacity(result, data, name, write=True)
     return json_response(result)
 
 
@@ -347,7 +347,7 @@ def _delete_item(data):
     result = {}
     if data.get("ReturnValues") == "ALL_OLD" and old_item:
         result["Attributes"] = old_item
-    _add_consumed_capacity(result, data, name)
+    _add_consumed_capacity(result, data, name, write=True)
     return json_response(result)
 
 
@@ -392,7 +392,7 @@ def _update_item(data):
         result["Attributes"] = _diff_attributes(old_item, item, return_old=True)
     elif rv == "UPDATED_NEW":
         result["Attributes"] = _diff_attributes(old_item or {}, item, return_old=False)
-    _add_consumed_capacity(result, data, name)
+    _add_consumed_capacity(result, data, name, write=True)
     return json_response(result)
 
 
@@ -555,11 +555,20 @@ def _batch_write_item(data):
     result = {"UnprocessedItems": unprocessed}
     rc = data.get("ReturnConsumedCapacity", "NONE")
     if rc != "NONE":
-        result["ConsumedCapacity"] = [
-            {"TableName": t, "CapacityUnits": 1.0}
-            for t in request_items
-            if t in _tables
-        ]
+        consumed = []
+        for t, reqs in request_items.items():
+            if t not in _tables:
+                continue
+            gsi_count = len(_tables[t].get("GlobalSecondaryIndexes", []))
+            units = len(reqs) * (1.0 + gsi_count)
+            entry = {"TableName": t, "CapacityUnits": units}
+            if rc == "INDEXES" and gsi_count:
+                entry["GlobalSecondaryIndexes"] = {
+                    gsi["IndexName"]: {"CapacityUnits": float(len(reqs))}
+                    for gsi in _tables[t].get("GlobalSecondaryIndexes", [])
+                }
+            consumed.append(entry)
+        result["ConsumedCapacity"] = consumed
     return json_response(result)
 
 
@@ -1670,13 +1679,21 @@ def _update_counts(table):
     table["TableSizeBytes"] = count * 200
 
 
-def _add_consumed_capacity(result, data, table_name):
+def _add_consumed_capacity(result, data, table_name, write=False):
     rc = data.get("ReturnConsumedCapacity", "NONE")
     if rc == "NONE":
         return
-    cap = {"TableName": table_name, "CapacityUnits": 1.0}
+    table = _tables.get(table_name, {})
+    gsi_count = len(table.get("GlobalSecondaryIndexes", [])) if write else 0
+    units = 1.0 + gsi_count
+    cap = {"TableName": table_name, "CapacityUnits": units}
     if rc == "INDEXES":
         cap["Table"] = {"CapacityUnits": 1.0}
+        if write and gsi_count:
+            cap["GlobalSecondaryIndexes"] = {
+                gsi["IndexName"]: {"CapacityUnits": 1.0}
+                for gsi in table.get("GlobalSecondaryIndexes", [])
+            }
     result["ConsumedCapacity"] = cap
 
 

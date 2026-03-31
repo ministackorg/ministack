@@ -18,14 +18,14 @@ RUN pip install --no-cache-dir --upgrade pip && \
 COPY ministack/ ministack/
 
 RUN addgroup -S ministack && adduser -S ministack -G ministack
-RUN mkdir -p /tmp/localstack-data/s3 && chown -R ministack:ministack /tmp/localstack-data
+RUN mkdir -p /tmp/ministack-data/s3 && chown -R ministack:ministack /tmp/ministack-data
 RUN mkdir -p /docker-entrypoint-initaws.d && chown ministack:ministack /docker-entrypoint-initaws.d
 VOLUME /docker-entrypoint-initaws.d
 
 ENV GATEWAY_PORT=4566 \
     LOG_LEVEL=INFO \
     S3_PERSIST=0 \
-    S3_DATA_DIR=/tmp/localstack-data/s3 \
+    S3_DATA_DIR=/tmp/ministack-data/s3 \
     REDIS_HOST=redis \
     REDIS_PORT=6379 \
     RDS_BASE_PORT=15432 \
@@ -37,6 +37,6 @@ EXPOSE 4566
 
 # Pure Python healthcheck — no curl dependency
 HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=3 \
-    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:4566/_localstack/health')" || exit 1
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:4566/_ministack/health')" || exit 1
 
 ENTRYPOINT ["python", "-m", "uvicorn", "ministack.app:app", "--host", "0.0.0.0", "--port", "4566"]

@@ -16,13 +16,13 @@ services:
       - RDS_BASE_PORT=15432
       - ELASTICACHE_BASE_PORT=16379
     volumes:
-      - ./data/s3:/tmp/localstack-data/s3
+      - ./data/s3:/tmp/ministack-data/s3
       - /var/run/docker.sock:/var/run/docker.sock
     depends_on:
       redis:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:4566/_localstack/health')"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:4566/_ministack/health')"]
       interval: 10s
       timeout: 3s
       retries: 3

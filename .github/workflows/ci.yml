@@ -37,7 +37,7 @@ jobs:
         run: |
           REDIS_HOST=localhost python -m uvicorn ministack.app:app --host 0.0.0.0 --port 4566 &
           sleep 3
-          curl -sf http://localhost:4566/_localstack/health
+          curl -sf http://localhost:4566/_ministack/health
 
       - name: Run tests
         run: pytest tests/ -v --tb=short

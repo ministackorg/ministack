@@ -7,6 +7,24 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [1.1.10] — 2026-03-31
+
+### Fixed
+- **ECS Docker network detection** — ECS containers now automatically join the same Docker network that MiniStack is running on, so containers can reach sibling services (S3, SQS, etc.) without manual network configuration
+- **Internal naming cleanup** — replaced all internal `localstack-*` references (logger name, default data dir `/tmp/localstack-data/s3` → `/tmp/ministack-data/s3`, healthcheck URLs, CI config) with `ministack` equivalents; `LOCALSTACK_PERSISTENCE` / `LOCALSTACK_HOSTNAME` env vars kept for migration compatibility
+- **DynamoDB GSI capacity accounting** — `PutItem`, `DeleteItem`, `UpdateItem`, `GetItem`, `Query`, `Scan`, and `BatchWriteItem` now return correct `ConsumedCapacity.CapacityUnits` when a table has Global Secondary Indexes: `1 + gsi_count` per write (matching real AWS); `INDEXES` mode also returns per-GSI breakdown. Contributed by @jespinoza-shippo.
+- **S3 `CreateBucket` idempotency** — creating a bucket you already own now returns 200 instead of 409 `BucketAlreadyOwnedByYou`, matching real AWS and fixing Terraform re-apply failures
+- **S3 `OwnershipControls`** — `PutBucketOwnershipControls`, `GetBucketOwnershipControls`, `DeleteBucketOwnershipControls` now implemented; Terraform calls these immediately after `CreateBucket`
+- **S3 Control `ListTagsForResource`** — S3 Control API (`/v20180820/tags/{arn}`) now returns empty tag list instead of 404; Terraform uses this for S3 bucket tag lookups
+- **S3 `PublicAccessBlock`** — `PutPublicAccessBlock`, `GetPublicAccessBlock`, `DeletePublicAccessBlock` now implemented; CDK and Terraform call these on every bucket
+- **STS `AssumeRoleWithWebIdentity`** — now implemented; CDK OIDC deployments (GitHub Actions, etc.) use this; also fixed router to detect unsigned form-encoded STS actions from request body
+- **IAM `UpdateRole`** — now implemented; Terraform calls this to set role description and max session duration
+
+### Tests
+- 737 tests total, all passing
+
+---
+
 ## [1.1.9] — 2026-03-31
 
 ### Added
@@ -45,7 +63,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 ## [1.1.7] — 2026-03-30
 
 ### Added
-- **Athena engine control** — new `ATHENA_ENGINE` env var (`auto` | `duckdb` | `mock`) to select the SQL backend at startup; `auto` keeps existing behaviour (DuckDB if installed, mock otherwise). New `/_ministack/config` endpoint accepts `POST {"athena.ATHENA_ENGINE": "mock"}` to switch engines at runtime without restart — useful in CI to force mock mode without DuckDB installed. Contributed by @jespinoza-shippo.
+- **Athena engine control** — new `ATHENA_ENGINE` env var (`auto` | `duckdb` | `mock`) to select the SQL backend at startup; `auto` keeps existing behaviour (DuckDB if installed, mock otherwise). New `/_ministack/config` endpoint accepts `POST {"athena.ATHENA_ENGINE": "mock"}` to switch engines at runtime without restart — useful in CI to force mock mode without DuckDB installed. 
 - **VPC gap coverage** — 6 new EC2 resource types, 22 new actions, 11 new tests
   - **NAT Gateways**: `CreateNatGateway`, `DescribeNatGateways`, `DeleteNatGateway` — supports `SubnetId`, `ConnectivityType` (public/private), state transitions, `vpc-id`/`subnet-id`/`state` filters
   - **Network ACLs**: `CreateNetworkAcl`, `DescribeNetworkAcls`, `DeleteNetworkAcl`, `CreateNetworkAclEntry`, `DeleteNetworkAclEntry`, `ReplaceNetworkAclEntry`, `ReplaceNetworkAclAssociation` — full CRUD with rule entries and subnet associations
@@ -55,7 +73,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
   - **Egress-Only Internet Gateways**: `CreateEgressOnlyInternetGateway`, `DescribeEgressOnlyInternetGateways`, `DeleteEgressOnlyInternetGateway` — IPv6 egress-only IGW for VPCs
 
 ### Fixed
-- **SQS `awsQueryCompatible` header** — all SQS JSON error responses now include the `x-amzn-query-error: <legacy_code>;<fault>` header required by the `awsQueryCompatible` service trait. botocore reads this header and overrides `Error.Code` with the legacy `AWS.SimpleQueueService.*` namespaced code (e.g. `AWS.SimpleQueueService.NonExistentQueue` instead of `QueueDoesNotExist`). Without this header, any SDK code that matched against the legacy string worked against real AWS but silently failed against MiniStack. Full mapping of all 28 SQS error shapes sourced from `aws-sdk-go` ErrCode constants.
+- **SQS `awsQueryCompatible` header** — all SQS JSON error responses now include the `x-amzn-query-error: <legacy_code>;<fault>` header required by the `awsQueryCompatible` service trait. botocore reads this header and overrides `Error.Code` with the legacy `AWS.SimpleQueueService.*` namespaced code (e.g. `AWS.SimpleQueueService.NonExistentQueue` instead of `QueueDoesNotExist`). Without this header, any SDK code that matched against the legacy string worked against real AWS but silently failed against MiniStack. Full mapping of all 28 SQS error shapes sourced from `aws-sdk-go` ErrCode constants. Contributed by @jespinoza-shippo.
 
 ### Tests
 - 708 integration tests — all passing

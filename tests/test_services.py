@@ -31,10 +31,9 @@ def test_s3_create_bucket(s3):
 
 
 def test_s3_create_bucket_already_exists(s3):
+    # Real AWS: creating a bucket you already own is idempotent — returns 200
     s3.create_bucket(Bucket="intg-s3-dup")
-    with pytest.raises(ClientError) as exc:
-        s3.create_bucket(Bucket="intg-s3-dup")
-    assert exc.value.response["Error"]["Code"] == "BucketAlreadyOwnedByYou"
+    s3.create_bucket(Bucket="intg-s3-dup")  # must not raise
 
 
 def test_s3_delete_bucket(s3):
@@ -370,6 +369,37 @@ def test_s3_object_tagging(s3):
     tags = {t["Key"]: t["Value"] for t in resp["TagSet"]}
     assert tags["status"] == "active"
     assert tags["priority"] == "high"
+
+
+def test_s3_public_access_block(s3):
+    bkt = "intg-s3-pab"
+    s3.create_bucket(Bucket=bkt)
+    s3.put_public_access_block(
+        Bucket=bkt,
+        PublicAccessBlockConfiguration={
+            "BlockPublicAcls": True,
+            "IgnorePublicAcls": True,
+            "BlockPublicPolicy": False,
+            "RestrictPublicBuckets": False,
+        },
+    )
+    resp = s3.get_public_access_block(Bucket=bkt)
+    cfg = resp["PublicAccessBlockConfiguration"]
+    assert cfg["BlockPublicAcls"] is True
+    assert cfg["BlockPublicPolicy"] is False
+    s3.delete_public_access_block(Bucket=bkt)
+
+
+def test_s3_ownership_controls(s3):
+    bkt = "intg-s3-ownership"
+    s3.create_bucket(Bucket=bkt)
+    s3.put_bucket_ownership_controls(
+        Bucket=bkt,
+        OwnershipControls={"Rules": [{"ObjectOwnership": "BucketOwnerPreferred"}]},
+    )
+    resp = s3.get_bucket_ownership_controls(Bucket=bkt)
+    assert resp["OwnershipControls"]["Rules"][0]["ObjectOwnership"] == "BucketOwnerPreferred"
+    s3.delete_bucket_ownership_controls(Bucket=bkt)
 
 
 def test_s3_object_lock_configuration(s3):
@@ -1756,7 +1786,7 @@ def test_ecs_run_task_network_connectivity(ecs):
                 "image": "alpine:latest",
                 "command": [
                     "sh", "-c",
-                    f"wget -q -O /dev/null {container_endpoint}/_localstack/health"
+                    f"wget -q -O /dev/null {container_endpoint}/_ministack/health"
                 ],
                 "essential": True,
             }
@@ -5998,7 +6028,7 @@ def test_apigw_http_protocol_type(apigw):
 def test_health_endpoint():
     import urllib.request
 
-    resp = urllib.request.urlopen("http://localhost:4566/_localstack/health")
+    resp = urllib.request.urlopen("http://localhost:4566/_ministack/health")
     assert resp.status == 200
     data = json.loads(resp.read())
     assert "services" in data
@@ -6024,6 +6054,35 @@ def test_sts_get_session_token(sts):
     assert "SecretAccessKey" in creds
     assert "SessionToken" in creds
     assert "Expiration" in creds
+
+
+def test_sts_assume_role_with_web_identity(sts, iam):
+    iam.create_role(
+        RoleName="test-oidc-role",
+        AssumeRolePolicyDocument='{"Version":"2012-10-17","Statement":[]}',
+    )
+    role_arn = f"arn:aws:iam::000000000000:role/test-oidc-role"
+    resp = sts.assume_role_with_web_identity(
+        RoleArn=role_arn,
+        RoleSessionName="ci-session",
+        WebIdentityToken="fake-oidc-token-value",
+    )
+    creds = resp["Credentials"]
+    assert "AccessKeyId" in creds
+    assert "SecretAccessKey" in creds
+    assert "SessionToken" in creds
+    assert "Expiration" in creds
+
+
+def test_iam_update_role(iam):
+    iam.create_role(
+        RoleName="test-update-role",
+        AssumeRolePolicyDocument='{"Version":"2012-10-17","Statement":[]}',
+    )
+    iam.update_role(RoleName="test-update-role", Description="updated desc", MaxSessionDuration=7200)
+    resp = iam.get_role(RoleName="test-update-role")
+    assert resp["Role"]["Description"] == "updated desc"
+    assert resp["Role"]["MaxSessionDuration"] == 7200
 
 
 # ========== DynamoDB TTL ==========
@@ -14465,6 +14524,66 @@ def test_dynamodb_batch_write_consumed_capacity(ddb):
     assert resp["ConsumedCapacity"][0]["TableName"] == "batch-cap-regression"
     assert resp["ConsumedCapacity"][0]["CapacityUnits"] == 1.0
     ddb.delete_table(TableName="batch-cap-regression")
+
+
+def test_dynamodb_put_item_gsi_capacity(ddb):
+    """PutItem on a table with 1 GSI must return CapacityUnits=2.0 (table + GSI)."""
+    ddb.create_table(
+        TableName="gsi-cap-put",
+        AttributeDefinitions=[
+            {"AttributeName": "pk", "AttributeType": "S"},
+            {"AttributeName": "sk", "AttributeType": "S"},
+            {"AttributeName": "last_name", "AttributeType": "S"},
+        ],
+        KeySchema=[
+            {"AttributeName": "pk", "KeyType": "HASH"},
+            {"AttributeName": "sk", "KeyType": "RANGE"},
+        ],
+        GlobalSecondaryIndexes=[{
+            "IndexName": "last_name-index",
+            "KeySchema": [{"AttributeName": "last_name", "KeyType": "HASH"}],
+            "Projection": {"ProjectionType": "ALL"},
+        }],
+        BillingMode="PAY_PER_REQUEST",
+    )
+    resp = ddb.put_item(
+        TableName="gsi-cap-put",
+        Item={"pk": {"S": "p1"}, "sk": {"S": "s1"}, "last_name": {"S": "Smith"}},
+        ReturnConsumedCapacity="TOTAL",
+    )
+    assert resp["ConsumedCapacity"]["CapacityUnits"] == 2.0
+    ddb.delete_table(TableName="gsi-cap-put")
+
+
+def test_dynamodb_batch_write_gsi_capacity(ddb):
+    """BatchWriteItem with 2 items on a table with 1 GSI must return CapacityUnits=4.0."""
+    ddb.create_table(
+        TableName="gsi-cap-batch",
+        AttributeDefinitions=[
+            {"AttributeName": "pk", "AttributeType": "S"},
+            {"AttributeName": "sk", "AttributeType": "S"},
+            {"AttributeName": "age", "AttributeType": "N"},
+        ],
+        KeySchema=[
+            {"AttributeName": "pk", "KeyType": "HASH"},
+            {"AttributeName": "sk", "KeyType": "RANGE"},
+        ],
+        GlobalSecondaryIndexes=[{
+            "IndexName": "age-index",
+            "KeySchema": [{"AttributeName": "age", "KeyType": "HASH"}],
+            "Projection": {"ProjectionType": "ALL"},
+        }],
+        BillingMode="PAY_PER_REQUEST",
+    )
+    resp = ddb.batch_write_item(
+        RequestItems={"gsi-cap-batch": [
+            {"PutRequest": {"Item": {"pk": {"S": "p2"}, "sk": {"S": "s2"}, "age": {"N": "25"}}}},
+            {"PutRequest": {"Item": {"pk": {"S": "p3"}, "sk": {"S": "s3"}, "age": {"N": "26"}}}},
+        ]},
+        ReturnConsumedCapacity="TOTAL",
+    )
+    assert resp["ConsumedCapacity"][0]["CapacityUnits"] == 4.0
+    ddb.delete_table(TableName="gsi-cap-batch")
 
 
 # ---------------------------------------------------------------------------
