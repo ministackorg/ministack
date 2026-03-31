@@ -615,7 +615,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for a full walkthrough.
 MIT — free to use, modify, and distribute. No restrictions.
 
 ```
-Copyright (c) 2024 MiniStack Contributors
+Copyright (c) 2026 MiniStack Contributors
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal

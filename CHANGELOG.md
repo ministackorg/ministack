@@ -7,6 +7,13 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [1.1.12] — 2026-03-31
+
+### Changed
+- Updated LICENSE copyright year to 2026. Contributed by @kay_o (HackerNews)
+
+---
+
 ## [1.1.11] — 2026-03-31
 
 ### Added
