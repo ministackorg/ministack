@@ -4,7 +4,7 @@ JSON-based API via X-Amz-Target: AWSWAF_20190729.
 Supports: CreateWebACL, GetWebACL, UpdateWebACL, DeleteWebACL, ListWebACLs,
           AssociateWebACL, DisassociateWebACL, GetWebACLForResource, ListResourcesForWebACL,
           CreateIPSet, GetIPSet, UpdateIPSet, DeleteIPSet, ListIPSets,
-          CreateRuleGroup, GetRuleGroup, DeleteRuleGroup, ListRuleGroups,
+          CreateRuleGroup, GetRuleGroup, UpdateRuleGroup, DeleteRuleGroup, ListRuleGroups,
           TagResource, UntagResource, ListTagsForResource,
           CheckCapacity, DescribeManagedRuleGroup.
 """
@@ -68,6 +68,7 @@ async def handle_request(method, path, headers, body, query_params):
         "ListIPSets": _list_ip_sets,
         "CreateRuleGroup": _create_rule_group,
         "GetRuleGroup": _get_rule_group,
+        "UpdateRuleGroup": _update_rule_group,
         "DeleteRuleGroup": _delete_rule_group,
         "ListRuleGroups": _list_rule_groups,
         "TagResource": _tag_resource,
@@ -175,12 +176,12 @@ def _get_web_acl_for_resource(data):
     resource_arn = data.get("ResourceArn", "")
     web_acl_arn = _associations.get(resource_arn)
     if not web_acl_arn:
-        return json_response({})
-    # Find the WebACL by ARN
+        return _waf_err("WAFNonexistentItemException", f"No WebACL associated with {resource_arn}")
     for acl in _web_acls.values():
         if acl["ARN"] == web_acl_arn:
-            return json_response({"WebACL": acl})
-    return json_response({})
+            acl_body = {k: v for k, v in acl.items() if k != "LockToken"}
+            return json_response({"WebACL": acl_body})
+    return _waf_err("WAFNonexistentItemException", f"WebACL {web_acl_arn} not found")
 
 
 def _list_resources_for_web_acl(data):
@@ -278,6 +279,17 @@ def _get_rule_group(data):
         return _waf_err("WAFNonexistentItemException", f"RuleGroup {uid} not found")
     rg_body = {k: v for k, v in rg.items() if k != "LockToken"}
     return json_response({"RuleGroup": rg_body, "LockToken": rg["LockToken"]})
+
+
+def _update_rule_group(data):
+    uid = data.get("Id", "")
+    rg = _rule_groups.get(uid)
+    if not rg:
+        return _waf_err("WAFNonexistentItemException", f"RuleGroup {uid} not found")
+    rg["Rules"] = data.get("Rules", rg["Rules"])
+    rg["VisibilityConfig"] = data.get("VisibilityConfig", rg["VisibilityConfig"])
+    rg["LockToken"] = new_uuid()
+    return json_response({"NextLockToken": rg["LockToken"]})
 
 
 def _delete_rule_group(data):

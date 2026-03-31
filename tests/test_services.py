@@ -15114,8 +15114,11 @@ def test_waf_associate_disassociate(wafv2):
     get_resp = wafv2.get_web_acl_for_resource(ResourceArn=resource_arn)
     assert get_resp["WebACL"]["ARN"] == acl_arn
     wafv2.disassociate_web_acl(ResourceArn=resource_arn)
-    get_resp2 = wafv2.get_web_acl_for_resource(ResourceArn=resource_arn)
-    assert "WebACL" not in get_resp2
+    try:
+        wafv2.get_web_acl_for_resource(ResourceArn=resource_arn)
+        assert False, "expected WAFNonexistentItemException"
+    except wafv2.exceptions.WAFNonexistentItemException:
+        pass
 
 
 def test_waf_ip_set_crud(wafv2):
@@ -15156,12 +15159,19 @@ def test_waf_rule_group_crud(wafv2):
 
     get_resp = wafv2.get_rule_group(Name="test-rg", Scope="REGIONAL", Id=uid)
     assert get_resp["RuleGroup"]["Name"] == "test-rg"
+    assert "LockToken" not in get_resp["RuleGroup"]
+
+    upd = wafv2.update_rule_group(
+        Name="test-rg", Scope="REGIONAL", Id=uid, LockToken=lock,
+        VisibilityConfig={"SampledRequestsEnabled": False, "CloudWatchMetricsEnabled": False, "MetricName": "m2"},
+    )
+    assert "NextLockToken" in upd
 
     lst = wafv2.list_rule_groups(Scope="REGIONAL")
     ids = [r["Id"] for r in lst["RuleGroups"]]
     assert uid in ids
 
-    wafv2.delete_rule_group(Name="test-rg", Scope="REGIONAL", Id=uid, LockToken=lock)
+    wafv2.delete_rule_group(Name="test-rg", Scope="REGIONAL", Id=uid, LockToken=upd["NextLockToken"])
     lst2 = wafv2.list_rule_groups(Scope="REGIONAL")
     ids2 = [r["Id"] for r in lst2["RuleGroups"]]
     assert uid not in ids2
