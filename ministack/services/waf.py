@@ -118,7 +118,8 @@ def _get_web_acl(data):
     acl = _web_acls.get(uid)
     if not acl:
         return _waf_err("WAFNonexistentItemException", f"WebACL {uid} not found")
-    return json_response({"WebACL": acl, "LockToken": acl["LockToken"]})
+    acl_body = {k: v for k, v in acl.items() if k != "LockToken"}
+    return json_response({"WebACL": acl_body, "LockToken": acl["LockToken"]})
 
 
 def _update_web_acl(data):
@@ -214,7 +215,8 @@ def _get_ip_set(data):
     ipset = _ip_sets.get(uid)
     if not ipset:
         return _waf_err("WAFNonexistentItemException", f"IPSet {uid} not found")
-    return json_response({"IPSet": ipset, "LockToken": ipset["LockToken"]})
+    ipset_body = {k: v for k, v in ipset.items() if k != "LockToken"}
+    return json_response({"IPSet": ipset_body, "LockToken": ipset["LockToken"]})
 
 
 def _update_ip_set(data):
@@ -274,7 +276,8 @@ def _get_rule_group(data):
     rg = _rule_groups.get(uid)
     if not rg:
         return _waf_err("WAFNonexistentItemException", f"RuleGroup {uid} not found")
-    return json_response({"RuleGroup": rg, "LockToken": rg["LockToken"]})
+    rg_body = {k: v for k, v in rg.items() if k != "LockToken"}
+    return json_response({"RuleGroup": rg_body, "LockToken": rg["LockToken"]})
 
 
 def _delete_rule_group(data):

@@ -16,7 +16,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 - **Lambda Layers** — already implemented: `PublishLayerVersion`, `GetLayerVersion`, `GetLayerVersionByArn`, `ListLayerVersions`, `ListLayers`, `DeleteLayerVersion`, `GetLayerVersionPolicy`, `AddLayerVersionPermission`, `RemoveLayerVersionPermission`
 
 ### Tests
-- 760 tests total, all passing
+- 763 tests total, all passing
 
 ---
 
