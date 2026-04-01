@@ -28,7 +28,7 @@ from ministack.services import sqs as _sqs
 logger = logging.getLogger("sns")
 
 ACCOUNT_ID = "000000000000"
-REGION = "us-east-1"
+REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 
 _topics: dict = {}
 _sub_arn_to_topic: dict = {}
