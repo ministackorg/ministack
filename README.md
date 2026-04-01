@@ -505,7 +505,7 @@ pip install boto3 pytest duckdb docker cbor2
 # Start MiniStack
 docker compose up -d
 
-# Run the full test suite (788 tests across all 34 services)
+# Run the full test suite (794 tests across all 34 services)
 pytest tests/ -v
 ```
 

@@ -2248,9 +2248,130 @@ def reset():
 # Action map
 # ---------------------------------------------------------------------------
 
+def _describe_instance_attribute(p):
+    instance_id = _p(p, "InstanceId")
+    attribute = _p(p, "Attribute")
+    inst = _instances.get(instance_id)
+    if not inst:
+        return _error("InvalidInstanceID.NotFound",
+                      f"The instance ID '{instance_id}' does not exist", 400)
+
+    if attribute == "instanceInitiatedShutdownBehavior":
+        value_xml = "<instanceInitiatedShutdownBehavior><value>stop</value></instanceInitiatedShutdownBehavior>"
+    elif attribute == "disableApiTermination":
+        value_xml = "<disableApiTermination><value>false</value></disableApiTermination>"
+    elif attribute == "instanceType":
+        value_xml = f"<instanceType><value>{inst.get('InstanceType', 't2.micro')}</value></instanceType>"
+    elif attribute == "userData":
+        value_xml = "<userData/>"
+    elif attribute == "rootDeviceName":
+        value_xml = f"<rootDeviceName><value>{inst.get('RootDeviceName', '/dev/xvda')}</value></rootDeviceName>"
+    elif attribute == "blockDeviceMapping":
+        value_xml = "<blockDeviceMapping/>"
+    elif attribute == "sourceDestCheck":
+        value_xml = "<sourceDestCheck><value>true</value></sourceDestCheck>"
+    elif attribute == "groupSet":
+        sgs = "".join(
+            f"<item><groupId>{sg['GroupId']}</groupId><groupName>{sg['GroupName']}</groupName></item>"
+            for sg in inst.get("SecurityGroups", [])
+        )
+        value_xml = f"<groupSet>{sgs}</groupSet>"
+    elif attribute == "ebsOptimized":
+        value_xml = "<ebsOptimized><value>false</value></ebsOptimized>"
+    elif attribute == "enaSupport":
+        value_xml = "<enaSupport><value>true</value></enaSupport>"
+    elif attribute == "sriovNetSupport":
+        value_xml = "<sriovNetSupport><value>simple</value></sriovNetSupport>"
+    else:
+        value_xml = f"<{attribute}/>"
+
+    return _xml(200, "DescribeInstanceAttributeResponse",
+                f"<instanceId>{instance_id}</instanceId>{value_xml}")
+
+
+def _describe_instance_types(p):
+    # Collect requested types
+    requested = _parse_member_list(p, "InstanceType")
+    # Common types Terraform provider v6+ queries
+    all_types = requested or [
+        "t2.micro", "t2.small", "t2.medium", "t2.large",
+        "t3.micro", "t3.small", "t3.medium", "t3.large",
+        "m5.large", "m5.xlarge", "c5.large", "c5.xlarge",
+    ]
+    items = ""
+    for itype in all_types:
+        family = itype.split(".")[0]
+        vcpus = 2 if "micro" in itype else 4 if "small" in itype else 8
+        mem_mib = 1024 if "micro" in itype else 2048 if "small" in itype else 4096
+        items += f"""<item>
+            <instanceType>{itype}</instanceType>
+            <currentGeneration>true</currentGeneration>
+            <freeTierEligible>{'true' if itype == 't2.micro' else 'false'}</freeTierEligible>
+            <supportedUsageClasses><item>on-demand</item><item>spot</item></supportedUsageClasses>
+            <supportedRootDeviceTypes><item>ebs</item></supportedRootDeviceTypes>
+            <supportedVirtualizationTypes><item>hvm</item></supportedVirtualizationTypes>
+            <bareMetal>false</bareMetal>
+            <hypervisor>xen</hypervisor>
+            <processorInfo>
+                <supportedArchitectures><item>x86_64</item></supportedArchitectures>
+                <sustainedClockSpeedInGhz>2.5</sustainedClockSpeedInGhz>
+            </processorInfo>
+            <vCpuInfo>
+                <defaultVCpus>{vcpus}</defaultVCpus>
+                <defaultCores>{vcpus}</defaultCores>
+                <defaultThreadsPerCore>1</defaultThreadsPerCore>
+            </vCpuInfo>
+            <memoryInfo><sizeInMiB>{mem_mib}</sizeInMiB></memoryInfo>
+            <instanceStorageSupported>false</instanceStorageSupported>
+            <ebsInfo>
+                <ebsOptimizedSupport>unsupported</ebsOptimizedSupport>
+                <encryptionSupport>supported</encryptionSupport>
+                <ebsOptimizedInfo>
+                    <baselineBandwidthInMbps>256</baselineBandwidthInMbps>
+                    <baselineThroughputInMBps>32.0</baselineThroughputInMBps>
+                    <baselineIops>2000</baselineIops>
+                    <maximumBandwidthInMbps>256</maximumBandwidthInMbps>
+                    <maximumThroughputInMBps>32.0</maximumThroughputInMBps>
+                    <maximumIops>2000</maximumIops>
+                </ebsOptimizedInfo>
+                <nvmeSupport>unsupported</nvmeSupport>
+            </ebsInfo>
+            <networkInfo>
+                <networkPerformance>Low to Moderate</networkPerformance>
+                <maximumNetworkInterfaces>2</maximumNetworkInterfaces>
+                <maximumNetworkCards>1</maximumNetworkCards>
+                <defaultNetworkCardIndex>0</defaultNetworkCardIndex>
+                <networkCards><item>
+                    <networkCardIndex>0</networkCardIndex>
+                    <networkPerformance>Low to Moderate</networkPerformance>
+                    <maximumNetworkInterfaces>2</maximumNetworkInterfaces>
+                    <baselineBandwidthInGbps>0.1</baselineBandwidthInGbps>
+                    <peakBandwidthInGbps>0.5</peakBandwidthInGbps>
+                </item></networkCards>
+                <ipv4AddressesPerInterface>2</ipv4AddressesPerInterface>
+                <ipv6AddressesPerInterface>2</ipv6AddressesPerInterface>
+                <ipv6Supported>true</ipv6Supported>
+                <enaSupport>required</enaSupport>
+                <efaSupported>false</efaSupported>
+            </networkInfo>
+            <placementGroupInfo>
+                <supportedStrategies><item>partition</item><item>spread</item></supportedStrategies>
+            </placementGroupInfo>
+            <hibernationSupported>false</hibernationSupported>
+            <burstablePerformanceSupported>{'true' if family in ('t2','t3','t4g') else 'false'}</burstablePerformanceSupported>
+            <dedicatedHostsSupported>false</dedicatedHostsSupported>
+            <autoRecoverySupported>true</autoRecoverySupported>
+        </item>"""
+
+    return _xml(200, "DescribeInstanceTypesResponse",
+                f"<instanceTypeSet>{items}</instanceTypeSet>")
+
+
 _ACTION_MAP = {
     "RunInstances": _run_instances,
     "DescribeInstances": _describe_instances,
+    "DescribeInstanceAttribute": _describe_instance_attribute,
+    "DescribeInstanceTypes": _describe_instance_types,
     "TerminateInstances": _terminate_instances,
     "StopInstances": _stop_instances,
     "StartInstances": _start_instances,

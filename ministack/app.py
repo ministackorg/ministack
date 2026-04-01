@@ -14,13 +14,20 @@ import subprocess
 import uuid
 from urllib.parse import parse_qs, urlparse
 
-# Matches host headers like "{apiId}.execute-api.localhost" or "{apiId}.execute-api.localhost:4566"
-_EXECUTE_API_RE = re.compile(r"^([a-f0-9]{8})\.execute-api\.localhost(?::\d+)?$")
+_MINISTACK_HOST = os.environ.get("MINISTACK_HOST", "localhost")
+_MINISTACK_PORT = os.environ.get("GATEWAY_PORT", "4566")
+
+# Matches host headers like "{apiId}.execute-api.<host>" or "{apiId}.execute-api.<host>:4566"
+_EXECUTE_API_RE = re.compile(
+    r"^([a-f0-9]{8})\.execute-api\." + re.escape(_MINISTACK_HOST) + r"(?::\d+)?$"
+)
 # Matches virtual-hosted S3:
-#   "{bucket}.localhost" or "{bucket}.localhost:4566"          (boto3/SDK default)
-#   "{bucket}.s3.localhost" or "{bucket}.s3.localhost:4566"    (Terraform AWS provider v4+)
+#   "{bucket}.<host>" or "{bucket}.<host>:4566"          (boto3/SDK default)
+#   "{bucket}.s3.<host>" or "{bucket}.s3.<host>:4566"    (Terraform AWS provider v4+)
 # Does NOT match execute-api, alb, or other sub-service hostnames.
-_S3_VHOST_RE = re.compile(r"^([^.]+)(?:\.s3)?\.localhost(?::\d+)?$")
+_S3_VHOST_RE = re.compile(
+    r"^([^.]+)(?:\.s3)?\." + re.escape(_MINISTACK_HOST) + r"(?::\d+)?$"
+)
 _S3_VHOST_EXCLUDE_RE = re.compile(r"\.(execute-api|alb|emr|efs|elasticache)\.")
 
 from ministack.core.persistence import PERSIST_STATE, load_state, save_all
@@ -215,12 +222,60 @@ async def app(scope, receive, send):
 
     # S3 Control API — /v20180820/... with x-amz-account-id header
     if path.startswith("/v20180820/"):
-        if method == "GET" and path.startswith("/v20180820/tags/"):
-            # ListTagsForResource — return empty tag set
-            await _send_response(send, 200, {
-                "Content-Type": "application/json",
-                "x-amzn-requestid": request_id,
-            }, json.dumps({"Tags": []}).encode())
+        if path.startswith("/v20180820/tags/"):
+            from urllib.parse import unquote
+            raw_arn = path[len("/v20180820/tags/"):]
+            arn = unquote(raw_arn)
+            # ARN format: arn:aws:s3:::bucket-name  or  arn:aws:s3:::bucket-name/object-key
+            bucket_name = arn.split(":::")[-1].split("/")[0] if ":::" in arn else arn.split("/")[0]
+
+            if method == "GET":
+                # ListTagsForResource — return real tags from s3._bucket_tags
+                tags = s3._bucket_tags.get(bucket_name, {})
+                tag_members = "".join(
+                    f"<member><Key>{k}</Key><Value>{v}</Value></member>"
+                    for k, v in tags.items()
+                )
+                xml_body = (
+                    '<?xml version="1.0" encoding="UTF-8"?>'
+                    '<ListTagsForResourceResult xmlns="https://awss3control.amazonaws.com/doc/2018-08-20/">'
+                    f"<Tags>{tag_members}</Tags>"
+                    "</ListTagsForResourceResult>"
+                ).encode()
+                await _send_response(send, 200, {
+                    "Content-Type": "application/xml",
+                    "x-amzn-requestid": request_id,
+                }, xml_body)
+            elif method == "PUT":
+                # TagResource — merge tags into s3._bucket_tags
+                try:
+                    payload = json.loads(body) if body else {}
+                    new_tags = {t["Key"]: t["Value"] for t in payload.get("Tags", [])}
+                    existing = s3._bucket_tags.get(bucket_name, {})
+                    existing.update(new_tags)
+                    s3._bucket_tags[bucket_name] = existing
+                except Exception:
+                    pass
+                await _send_response(send, 204, {
+                    "x-amzn-requestid": request_id,
+                }, b"")
+            elif method == "DELETE":
+                # UntagResource — remove specified keys
+                keys_to_remove = query_params.get("tagKeys", [])
+                if isinstance(keys_to_remove, str):
+                    keys_to_remove = [keys_to_remove]
+                tags = s3._bucket_tags.get(bucket_name, {})
+                for k in keys_to_remove:
+                    tags.pop(k, None)
+                s3._bucket_tags[bucket_name] = tags
+                await _send_response(send, 204, {
+                    "x-amzn-requestid": request_id,
+                }, b"")
+            else:
+                await _send_response(send, 200, {
+                    "Content-Type": "application/json",
+                    "x-amzn-requestid": request_id,
+                }, b"{}")
         else:
             # All other S3 Control operations — accept silently
             await _send_response(send, 200, {

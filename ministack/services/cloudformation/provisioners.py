@@ -98,7 +98,7 @@ def _s3_delete(physical_id, props):
 def _sqs_create(logical_id, props, stack_name):
     name = props.get("QueueName") or f"{stack_name}-{logical_id}-{new_uuid()[:8]}"
     is_fifo = name.endswith(".fifo")
-    url = f"http://localhost:4566/{ACCOUNT_ID}/{name}"
+    url = f"http://{_sqs.DEFAULT_HOST}:{_sqs.DEFAULT_PORT}/{ACCOUNT_ID}/{name}"
     arn = f"arn:aws:sqs:{REGION}:{ACCOUNT_ID}:{name}"
     now_ts = str(int(time.time()))
 

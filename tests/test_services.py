@@ -328,6 +328,29 @@ def test_s3_bucket_tagging(s3):
     assert exc.value.response["Error"]["Code"] == "NoSuchTagSet"
 
 
+def test_s3_control_list_tags_for_resource(s3):
+    """S3 Control ListTagsForResource must return tags set via PutBucketTagging.
+
+    Regression: Terraform AWS Provider >= 5 calls s3control:ListTagsForResource
+    when a `tags` block is set on aws_s3_bucket. The handler was returning an
+    empty list regardless of bucket tags, causing perpetual drift.
+    """
+    from conftest import make_client
+    bkt = "intg-s3control-tags"
+    account_id = "123456789012"
+    s3.create_bucket(Bucket=bkt)
+    s3.put_bucket_tagging(
+        Bucket=bkt,
+        Tagging={"TagSet": [{"Key": "name", "Value": "ministack-test"}]},
+    )
+
+    s3control = make_client("s3control")
+    arn = f"arn:aws:s3:::{bkt}"
+    resp = s3control.list_tags_for_resource(AccountId=account_id, ResourceArn=arn)
+    tags = {t["Key"]: t["Value"] for t in resp.get("Tags", [])}
+    assert tags.get("name") == "ministack-test"
+
+
 def test_s3_bucket_policy(s3):
     bkt = "intg-s3-policy"
     s3.create_bucket(Bucket=bkt)
@@ -15671,3 +15694,257 @@ def test_cfn_update_rollback_on_failure(cfn, s3):
     assert stack["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE"
 
     s3.head_bucket(Bucket="cfn-t18-orig")
+
+
+# ========== EC2 — DescribeInstanceAttribute / DescribeInstanceTypes ==========
+
+
+def test_ec2_describe_instance_attribute_instance_type(ec2):
+    resp = ec2.run_instances(ImageId="ami-00000000", MinCount=1, MaxCount=1, InstanceType="t3.micro")
+    iid = resp["Instances"][0]["InstanceId"]
+
+    attr = ec2.describe_instance_attribute(InstanceId=iid, Attribute="instanceType")
+    assert attr["InstanceId"] == iid
+    assert attr["InstanceType"]["Value"] == "t3.micro"
+
+    ec2.terminate_instances(InstanceIds=[iid])
+
+
+def test_ec2_describe_instance_attribute_shutdown_behavior(ec2):
+    resp = ec2.run_instances(ImageId="ami-00000000", MinCount=1, MaxCount=1)
+    iid = resp["Instances"][0]["InstanceId"]
+
+    attr = ec2.describe_instance_attribute(InstanceId=iid, Attribute="instanceInitiatedShutdownBehavior")
+    assert attr["InstanceId"] == iid
+    assert attr["InstanceInitiatedShutdownBehavior"]["Value"] == "stop"
+
+    ec2.terminate_instances(InstanceIds=[iid])
+
+
+def test_ec2_describe_instance_attribute_not_found(ec2):
+    from botocore.exceptions import ClientError
+    with pytest.raises(ClientError) as exc:
+        ec2.describe_instance_attribute(InstanceId="i-000000000000nonex", Attribute="instanceType")
+    assert exc.value.response["Error"]["Code"] == "InvalidInstanceID.NotFound"
+
+
+def test_ec2_describe_instance_types_defaults(ec2):
+    resp = ec2.describe_instance_types()
+    types = [t["InstanceType"] for t in resp["InstanceTypes"]]
+    assert "t2.micro" in types
+    assert "t3.micro" in types
+    assert len(resp["InstanceTypes"]) >= 4
+    # Spot-check shape
+    sample = resp["InstanceTypes"][0]
+    assert "VCpuInfo" in sample
+    assert "MemoryInfo" in sample
+    assert sample["VCpuInfo"]["DefaultVCpus"] >= 1
+    assert sample["MemoryInfo"]["SizeInMiB"] >= 512
+
+
+def test_ec2_describe_instance_types_filter(ec2):
+    resp = ec2.describe_instance_types(InstanceTypes=["t2.micro", "m5.large"])
+    types = {t["InstanceType"] for t in resp["InstanceTypes"]}
+    assert types == {"t2.micro", "m5.large"}
+
+
+# ========== CloudFormation — End-to-End ==========
+
+_E2E_STACK = "e2e-test"
+_E2E_TEMPLATE = """
+AWSTemplateFormatVersion: '2010-09-09'
+Description: E2E test stack — verifies CFN resources are functional
+
+Parameters:
+  Env:
+    Type: String
+    Default: e2etest
+
+Resources:
+  Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${AWS::StackName}-${Env}-assets"
+
+  Queue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${AWS::StackName}-${Env}-events"
+      VisibilityTimeout: 120
+
+  Topic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${AWS::StackName}-${Env}-alerts"
+
+  Role:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-${Env}-role"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+
+  Processor:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-${Env}-processor"
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt Role.Arn
+      Code:
+        ZipFile: |
+          def handler(event, context):
+              return {"statusCode": 200}
+
+  QueueUrlParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${AWS::StackName}/${Env}/queue-url"
+      Type: String
+      Value: !Ref Queue
+
+Outputs:
+  BucketName:
+    Value: !Ref Bucket
+    Export:
+      Name: !Sub "${AWS::StackName}-bucket"
+  QueueUrl:
+    Value: !Ref Queue
+  TopicArn:
+    Value: !Ref Topic
+  ProcessorArn:
+    Value: !GetAtt Processor.Arn
+  RoleArn:
+    Value: !GetAtt Role.Arn
+"""
+
+
+@pytest.fixture(scope="module")
+def cfn_e2e_stack(cfn):
+    """Deploy the e2e stack once for all e2e tests in this module."""
+    # Clean up from a previous run
+    try:
+        cfn.delete_stack(StackName=_E2E_STACK)
+        _wait_stack(cfn, _E2E_STACK)
+    except Exception:
+        pass
+
+    cfn.create_stack(StackName=_E2E_STACK, TemplateBody=_E2E_TEMPLATE)
+    s = _wait_stack(cfn, _E2E_STACK)
+    assert s["StackStatus"] == "CREATE_COMPLETE", f"Stack failed: {s.get('StackStatusReason')}"
+
+    outputs = {o["OutputKey"]: o["OutputValue"] for o in s.get("Outputs", [])}
+    yield outputs
+
+    cfn.delete_stack(StackName=_E2E_STACK)
+    _wait_stack(cfn, _E2E_STACK)
+
+
+def test_cfn_e2e_s3_put_and_get(cfn_e2e_stack, s3):
+    bucket = cfn_e2e_stack["BucketName"]
+    body = json.dumps({"id": "001", "total": 99.99})
+    s3.put_object(Bucket=bucket, Key="orders/order-001.json", Body=body.encode())
+    obj = s3.get_object(Bucket=bucket, Key="orders/order-001.json")
+    data = json.loads(obj["Body"].read())
+    assert data["id"] == "001"
+    assert data["total"] == 99.99
+
+
+def test_cfn_e2e_s3_list_objects(cfn_e2e_stack, s3):
+    bucket = cfn_e2e_stack["BucketName"]
+    s3.put_object(Bucket=bucket, Key="docs/readme.txt", Body=b"hello")
+    listing = s3.list_objects_v2(Bucket=bucket)
+    assert listing["KeyCount"] >= 1
+    keys = [o["Key"] for o in listing["Contents"]]
+    assert "docs/readme.txt" in keys
+
+
+def test_cfn_e2e_sqs_send_receive_delete(cfn_e2e_stack, sqs):
+    url = cfn_e2e_stack["QueueUrl"]
+    sqs.send_message(QueueUrl=url, MessageBody=json.dumps({"event": "order.created"}))
+    sqs.send_message(QueueUrl=url, MessageBody=json.dumps({"event": "order.shipped"}))
+    msgs = sqs.receive_message(QueueUrl=url, MaxNumberOfMessages=10, WaitTimeSeconds=1)
+    received = msgs.get("Messages", [])
+    assert len(received) == 2
+    events = sorted(json.loads(m["Body"])["event"] for m in received)
+    assert events == ["order.created", "order.shipped"]
+    for m in received:
+        sqs.delete_message(QueueUrl=url, ReceiptHandle=m["ReceiptHandle"])
+    empty = sqs.receive_message(QueueUrl=url, MaxNumberOfMessages=10, WaitTimeSeconds=1)
+    assert len(empty.get("Messages", [])) == 0
+
+
+def test_cfn_e2e_sns_publish(cfn_e2e_stack, sns):
+    topic_arn = cfn_e2e_stack["TopicArn"]
+    resp = sns.publish(TopicArn=topic_arn, Subject="Test Alert",
+                       Message=json.dumps({"alert": "test", "severity": "low"}))
+    assert "MessageId" in resp
+
+
+def test_cfn_e2e_ssm_read_cfn_param(cfn_e2e_stack, ssm):
+    param = ssm.get_parameter(Name=f"/{_E2E_STACK}/e2etest/queue-url")["Parameter"]
+    assert param["Value"] == cfn_e2e_stack["QueueUrl"]
+
+
+def test_cfn_e2e_ssm_write_and_read(cfn_e2e_stack, ssm):
+    ssm.put_parameter(Name=f"/{_E2E_STACK}/e2etest/flags", Type="String",
+                      Value=json.dumps({"dark_mode": True}))
+    flags = json.loads(ssm.get_parameter(Name=f"/{_E2E_STACK}/e2etest/flags")["Parameter"]["Value"])
+    assert flags["dark_mode"] is True
+
+
+def test_cfn_e2e_lambda_invoke(cfn_e2e_stack, lam):
+    resp = lam.invoke(FunctionName=f"{_E2E_STACK}-e2etest-processor",
+                      Payload=json.dumps({"action": "test"}).encode())
+    assert resp["StatusCode"] == 200
+
+
+def test_cfn_e2e_lambda_role_matches_iam_role(cfn_e2e_stack, lam, iam):
+    fn = lam.get_function(FunctionName=f"{_E2E_STACK}-e2etest-processor")["Configuration"]
+    role = iam.get_role(RoleName=f"{_E2E_STACK}-e2etest-role")["Role"]
+    assert fn["Role"] == role["Arn"]
+
+
+def test_cfn_e2e_pipeline(cfn_e2e_stack, s3, sqs, sns):
+    """S3 upload → SQS queue → read back from S3 → SNS alert."""
+    bucket = cfn_e2e_stack["BucketName"]
+    url = cfn_e2e_stack["QueueUrl"]
+    topic_arn = cfn_e2e_stack["TopicArn"]
+
+    for i in range(3):
+        order = {"id": f"pipe-{i}", "item": f"widget-{i}", "qty": (i + 1) * 5}
+        s3.put_object(Bucket=bucket, Key=f"pipeline/order-{i}.json",
+                      Body=json.dumps(order).encode())
+
+    for i in range(3):
+        sqs.send_message(QueueUrl=url,
+                         MessageBody=json.dumps({"event": "process", "key": f"pipeline/order-{i}.json"}))
+
+    msgs = sqs.receive_message(QueueUrl=url, MaxNumberOfMessages=10, WaitTimeSeconds=1)
+    assert len(msgs.get("Messages", [])) == 3
+
+    total_qty = 0
+    for m in msgs["Messages"]:
+        body = json.loads(m["Body"])
+        obj = s3.get_object(Bucket=bucket, Key=body["key"])
+        order = json.loads(obj["Body"].read())
+        total_qty += order["qty"]
+        sqs.delete_message(QueueUrl=url, ReceiptHandle=m["ReceiptHandle"])
+
+    assert total_qty == 5 + 10 + 15
+
+    resp = sns.publish(TopicArn=topic_arn, Subject="Pipeline Done",
+                       Message=json.dumps({"processed": 3, "total_qty": total_qty}))
+    assert "MessageId" in resp
+
+
+def test_cfn_e2e_exports_available(cfn_e2e_stack, cfn):
+    exports = cfn.list_exports()["Exports"]
+    names = {e["Name"]: e["Value"] for e in exports}
+    assert f"{_E2E_STACK}-bucket" in names
+    assert names[f"{_E2E_STACK}-bucket"] == cfn_e2e_stack["BucketName"]

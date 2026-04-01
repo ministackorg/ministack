@@ -42,10 +42,14 @@ Data plane:
 
 import json
 import logging
+import os
 import re
 import time
 
 from ministack.core.responses import error_response_json, new_uuid
+
+_HOST = os.environ.get("MINISTACK_HOST", "localhost")
+_PORT = os.environ.get("GATEWAY_PORT", "4566")
 
 logger = logging.getLogger("apigateway")
 
@@ -338,7 +342,7 @@ async def _invoke_lambda_proxy(integration, api_id, stage, path, method, headers
         "requestContext": {
             "accountId": ACCOUNT_ID,
             "apiId": api_id,
-            "domainName": f"{api_id}.execute-api.localhost",
+            "domainName": f"{api_id}.execute-api.{_HOST}",
             "http": {
                 "method": method,
                 "path": path,
@@ -411,7 +415,7 @@ def _create_api(data):
         "apiId": api_id,
         "name": data.get("name", "unnamed"),
         "protocolType": data.get("protocolType", "HTTP"),
-        "apiEndpoint": f"http://{api_id}.execute-api.localhost:4566",
+        "apiEndpoint": f"http://{api_id}.execute-api.{_HOST}:{_PORT}",
         "createdDate": int(time.time()),
         "routeSelectionExpression": data.get("routeSelectionExpression", "$request.method $request.path"),
         "tags": data.get("tags", {}),

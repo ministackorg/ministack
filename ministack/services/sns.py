@@ -14,8 +14,12 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
 import time
 from urllib.parse import parse_qs
+
+_HOST = os.environ.get("MINISTACK_HOST", "localhost")
+_PORT = os.environ.get("GATEWAY_PORT", "4566")
 
 import ministack.services.lambda_svc as _lambda_svc
 from ministack.core.responses import new_uuid
@@ -572,7 +576,7 @@ async def _send_subscription_confirmation(topic_arn: str, sub: dict):
         "Token": token,
         "Message": f"You have chosen to subscribe to the topic {topic_arn}. "
                    f"To confirm the subscription, visit the SubscribeURL included in this message.",
-        "SubscribeURL": f"http://localhost:4566/?Action=ConfirmSubscription&TopicArn={topic_arn}&Token={token}",
+        "SubscribeURL": f"http://{_HOST}:{_PORT}/?Action=ConfirmSubscription&TopicArn={topic_arn}&Token={token}",
         "Timestamp": time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime()),
         "SignatureVersion": "1",
         "Signature": "FAKE",
@@ -923,7 +927,7 @@ def _build_envelope(topic_arn: str, msg_id: str, message: str, subject: str,
         "SignatureVersion": "1",
         "Signature": "FAKE",
         "SigningCertURL": "https://sns.us-east-1.amazonaws.com/SimpleNotificationService-fake.pem",
-        "UnsubscribeURL": f"http://localhost:4566/?Action=Unsubscribe&SubscriptionArn=arn:aws:sns:{REGION}:{ACCOUNT_ID}:example",
+        "UnsubscribeURL": f"http://{_HOST}:{_PORT}/?Action=Unsubscribe&SubscriptionArn=arn:aws:sns:{REGION}:{ACCOUNT_ID}:example",
     }
 
     if message_attributes:
