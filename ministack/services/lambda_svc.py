@@ -46,7 +46,7 @@ from ministack.core.responses import error_response_json, json_response, new_uui
 logger = logging.getLogger("lambda")
 
 ACCOUNT_ID = "000000000000"
-REGION = os.environ.get("AWS_DEFAULT_REGION", "us-east-1")
+REGION = os.environ.get("MINISTACK_REGION", os.environ.get("AWS_DEFAULT_REGION", "us-east-1"))
 LAMBDA_EXECUTOR = os.environ.get("LAMBDA_EXECUTOR", "local").lower()
 LAMBDA_DOCKER_VOLUME_MOUNT = os.environ.get("LAMBDA_REMOTE_DOCKER_VOLUME_MOUNT", "")
 

@@ -10,6 +10,7 @@ Supports: CreateSecret, GetSecretValue, ListSecrets, DeleteSecret,
 """
 
 import base64
+import os
 import json
 import logging
 import secrets as stdlib_secrets
@@ -21,7 +22,7 @@ from ministack.core.responses import error_response_json, json_response, new_uui
 logger = logging.getLogger("secretsmanager")
 
 ACCOUNT_ID = "000000000000"
-REGION = "us-east-1"
+REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 
 _secrets: dict = {}
 _resource_policies: dict = {}

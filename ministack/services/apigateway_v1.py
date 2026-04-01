@@ -70,6 +70,7 @@ Data plane:
 import datetime
 import json
 import logging
+import os
 import re
 import time
 import urllib.error
@@ -87,7 +88,7 @@ def _now_unix():
 logger = logging.getLogger("apigateway_v1")
 
 ACCOUNT_ID = "000000000000"
-REGION = "us-east-1"
+REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 
 # ---- Module-level state ----
 _rest_apis: dict = {}           # rest_api_id -> RestApi

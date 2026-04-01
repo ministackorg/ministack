@@ -15,6 +15,7 @@ in-memory (accessible for testing via PutRecord/PutRecordBatch round-trip).
 """
 
 import asyncio
+import os
 import base64
 import json
 import logging
@@ -31,7 +32,7 @@ from ministack.core.responses import (
 logger = logging.getLogger("firehose")
 
 ACCOUNT_ID = "000000000000"
-REGION = "us-east-1"
+REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 
 # ─── in-memory state ──────────────────────────────────────────────────────────
 

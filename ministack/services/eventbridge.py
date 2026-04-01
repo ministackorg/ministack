@@ -14,6 +14,7 @@ Supports: CreateEventBus, DeleteEventBus, ListEventBuses, DescribeEventBus,
 """
 
 import asyncio
+import os
 import hashlib
 import json
 import logging
@@ -26,7 +27,7 @@ from ministack.core.responses import error_response_json, json_response, new_uui
 logger = logging.getLogger("events")
 
 ACCOUNT_ID = "000000000000"
-REGION = "us-east-1"
+REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 
 
 def _now_iso() -> str:

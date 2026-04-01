@@ -8,6 +8,7 @@ Supports: PutParameter, GetParameter, GetParameters, GetParametersByPath,
 """
 
 import base64
+import os
 import json
 import logging
 import time
@@ -18,7 +19,7 @@ from ministack.core.responses import error_response_json, json_response, new_uui
 logger = logging.getLogger("ssm")
 
 ACCOUNT_ID = "000000000000"
-REGION = "us-east-1"
+REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 DEFAULT_PAGE_SIZE = 10
 
 _parameters: dict = {}

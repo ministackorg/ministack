@@ -4,6 +4,7 @@ condition evaluation, intrinsic function resolution, and topological sorting.
 """
 
 import base64
+import os
 import heapq
 import json
 import re
@@ -17,7 +18,7 @@ from ministack.core.responses import new_uuid
 _NO_VALUE = object()
 
 ACCOUNT_ID = "000000000000"
-REGION = "us-east-1"
+REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 # Note: ACCOUNT_ID/REGION duplicated here to keep engine.py free of __init__ imports (avoids circular deps)
 
 

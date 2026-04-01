@@ -10,12 +10,13 @@ Uses Query API (Action=...) with form-encoded body.
 """
 
 import logging
+import os
 from urllib.parse import parse_qs
 
 logger = logging.getLogger("cloudformation")
 
 ACCOUNT_ID = "000000000000"
-REGION = "us-east-1"
+REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 
 # In-memory state (shared across all submodules)
 _stacks: dict = {}          # stack_name -> stack dict

@@ -29,6 +29,7 @@ STS actions:
 """
 
 import json
+import os
 import logging
 import time
 from urllib.parse import parse_qs
@@ -39,7 +40,7 @@ from ministack.core.responses import new_uuid
 logger = logging.getLogger("iam")
 
 ACCOUNT_ID = "000000000000"
-REGION = "us-east-1"
+REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 
 # ---------------------------------------------------------------------------
 # Module-level state

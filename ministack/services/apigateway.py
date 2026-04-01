@@ -56,7 +56,7 @@ _PORT = os.environ.get("GATEWAY_PORT", "4566")
 logger = logging.getLogger("apigateway")
 
 ACCOUNT_ID = "000000000000"
-REGION = "us-east-1"
+REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 
 # ---- Module-level state ----
 _apis: dict = {}          # api_id -> api object

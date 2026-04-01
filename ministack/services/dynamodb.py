@@ -10,6 +10,7 @@ Uses X-Amz-Target header for action routing (JSON API).
 """
 
 import copy
+import os
 import json
 import logging
 import re
@@ -74,7 +75,7 @@ def _ttl_reaper():
 
 threading.Thread(target=_ttl_reaper, daemon=True, name="dynamodb-ttl-reaper").start()
 
-REGION = "us-east-1"
+REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 ACCOUNT_ID = "000000000000"
 
 

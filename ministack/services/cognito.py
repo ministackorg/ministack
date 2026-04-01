@@ -43,6 +43,7 @@ Wire protocol:
 """
 
 import base64
+import os
 import json
 import logging
 import re
@@ -57,7 +58,7 @@ from ministack.core.responses import error_response_json, json_response, new_uui
 logger = logging.getLogger("cognito")
 
 ACCOUNT_ID = "000000000000"
-REGION = "us-east-1"
+REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 
 # ---------------------------------------------------------------------------
 # In-memory state — User Pools (cognito-idp)

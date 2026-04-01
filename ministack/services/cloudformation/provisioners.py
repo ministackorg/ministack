@@ -3,6 +3,7 @@ CloudFormation provisioners — resource create/delete handlers for each AWS res
 """
 
 import io
+import os
 import json
 import logging
 import random
@@ -27,7 +28,7 @@ import ministack.services.iam_sts as _iam_sts
 logger = logging.getLogger("cloudformation")
 
 ACCOUNT_ID = "000000000000"
-REGION = "us-east-1"
+REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 
 
 def _physical_name(stack_name: str, logical_id: str, *,

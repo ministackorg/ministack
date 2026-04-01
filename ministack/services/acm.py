@@ -8,6 +8,7 @@ Supports: RequestCertificate, DescribeCertificate, ListCertificates,
 """
 
 import json
+import os
 import logging
 import time
 
@@ -16,7 +17,7 @@ from ministack.core.responses import error_response_json, json_response, new_uui
 logger = logging.getLogger("acm")
 
 ACCOUNT_ID = "000000000000"
-REGION = "us-east-1"
+REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 
 _certificates: dict = {}  # arn -> certificate dict
 

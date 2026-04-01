@@ -19,6 +19,7 @@ SUCCEEDED / FAILED / TIMED_OUT / ABORTED.
 """
 
 import asyncio
+import os
 import copy
 import json
 import logging
@@ -39,7 +40,7 @@ from ministack.core.responses import (
 logger = logging.getLogger("states")
 
 ACCOUNT_ID = "000000000000"
-REGION = "us-east-1"
+REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 
 _state_machines: dict = {}
 _executions: dict = {}

@@ -10,6 +10,7 @@ Supports: CreateWebACL, GetWebACL, UpdateWebACL, DeleteWebACL, ListWebACLs,
 """
 
 import json
+import os
 import logging
 
 from ministack.core.responses import error_response_json, json_response, new_uuid, now_iso
@@ -17,7 +18,7 @@ from ministack.core.responses import error_response_json, json_response, new_uui
 logger = logging.getLogger("wafv2")
 
 ACCOUNT_ID = "000000000000"
-REGION = "us-east-1"
+REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 
 _web_acls: dict = {}       # id -> webacl
 _ip_sets: dict = {}        # id -> ipset

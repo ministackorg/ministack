@@ -10,6 +10,7 @@ Supports: SendEmail, CreateEmailIdentity, GetEmailIdentity, DeleteEmailIdentity,
 
 import json
 import logging
+import os
 import re
 
 from ministack.core.responses import json_response, new_uuid, now_iso
@@ -17,7 +18,7 @@ from ministack.core.responses import json_response, new_uuid, now_iso
 logger = logging.getLogger("ses-v2")
 
 ACCOUNT_ID = "000000000000"
-REGION = "us-east-1"
+REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 
 _identities: dict = {}        # identity -> dict
 _config_sets: dict = {}       # name -> dict

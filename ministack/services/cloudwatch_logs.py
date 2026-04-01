@@ -15,6 +15,7 @@ Supports: CreateLogGroup, DeleteLogGroup, DescribeLogGroups,
 """
 
 import base64
+import os
 import fnmatch
 import json
 import logging
@@ -25,7 +26,7 @@ from ministack.core.responses import error_response_json, json_response, new_uui
 logger = logging.getLogger("logs")
 
 ACCOUNT_ID = "000000000000"
-REGION = "us-east-1"
+REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 
 _log_groups: dict = {}
 # group_name -> {

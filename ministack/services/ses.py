@@ -23,6 +23,7 @@ Send statistics aggregated into 15-minute buckets per AWS spec.
 """
 
 import base64
+import os
 import hashlib
 import json
 import logging
@@ -38,7 +39,7 @@ from ministack.core.responses import new_uuid
 logger = logging.getLogger("ses")
 
 ACCOUNT_ID = "000000000000"
-REGION = "us-east-1"
+REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 
 _identities: dict = {}
 _sent_emails: list = []

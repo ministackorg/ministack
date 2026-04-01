@@ -11,6 +11,7 @@ Operations: PutMetricData, GetMetricStatistics, GetMetricData, ListMetrics,
 """
 
 import json
+import os
 import logging
 import re
 import time
@@ -23,7 +24,7 @@ from ministack.core.responses import new_uuid
 logger = logging.getLogger("cloudwatch")
 
 ACCOUNT_ID = "000000000000"
-REGION = "us-east-1"
+REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 TWO_WEEKS_SECONDS = 14 * 24 * 3600
 
 _metrics: dict = defaultdict(list)

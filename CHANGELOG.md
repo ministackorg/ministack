@@ -7,6 +7,16 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [1.1.16] — 2026-04-01
+
+### Added
+- **`MINISTACK_REGION` environment variable** — all 25 services now read region from `MINISTACK_REGION` (defaulting to `us-east-1`); previously all services hardcoded the region in ARNs and response metadata. Lambda also checks `AWS_DEFAULT_REGION` as a secondary fallback. Contributed by @xingzihai and @santiagodoldan
+
+### Tests
+- 815 tests total, all passing
+
+---
+
 ## [1.1.15] — 2026-04-01
 
 ### Added
