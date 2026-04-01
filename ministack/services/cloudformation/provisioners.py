@@ -28,6 +28,23 @@ ACCOUNT_ID = "000000000000"
 REGION = "us-east-1"
 
 
+def _physical_name(stack_name: str, logical_id: str, *,
+                   lowercase: bool = False, max_len: int = 128) -> str:
+    """Generate an AWS-style physical resource name: {stack}-{logicalId}-{SUFFIX}.
+
+    Matches the pattern AWS CloudFormation uses for auto-named resources so that
+    local testing with CDK (which omits explicit names) produces names that are
+    immediately traceable back to the stack and logical resource.
+    """
+    import random
+    import string
+    suffix = "".join(random.choices(string.ascii_uppercase + string.digits, k=13))
+    base = f"{stack_name}-{logical_id}-{suffix}"
+    if lowercase:
+        base = base.lower()
+    return base[:max_len]
+
+
 # ===========================================================================
 # Resource Provisioner Framework
 # ===========================================================================
@@ -63,7 +80,7 @@ def _delete_resource(resource_type: str, physical_id: str, props: dict):
 # --- S3 Bucket ---
 
 def _s3_create(logical_id, props, stack_name):
-    name = props.get("BucketName") or f"{stack_name}-{logical_id.lower()}-{new_uuid()[:8]}"
+    name = props.get("BucketName") or _physical_name(stack_name, logical_id, lowercase=True, max_len=63)
     _s3._buckets[name] = {
         "created": now_iso(),
         "objects": {},
@@ -96,7 +113,7 @@ def _s3_delete(physical_id, props):
 # --- SQS Queue ---
 
 def _sqs_create(logical_id, props, stack_name):
-    name = props.get("QueueName") or f"{stack_name}-{logical_id}-{new_uuid()[:8]}"
+    name = props.get("QueueName") or _physical_name(stack_name, logical_id, max_len=80)
     is_fifo = name.endswith(".fifo")
     url = f"http://{_sqs.DEFAULT_HOST}:{_sqs.DEFAULT_PORT}/{ACCOUNT_ID}/{name}"
     arn = f"arn:aws:sqs:{REGION}:{ACCOUNT_ID}:{name}"
@@ -141,7 +158,7 @@ def _sqs_delete(physical_id, props):
 # --- SNS Topic ---
 
 def _sns_create(logical_id, props, stack_name):
-    name = props.get("TopicName") or f"{stack_name}-{logical_id}-{new_uuid()[:8]}"
+    name = props.get("TopicName") or _physical_name(stack_name, logical_id, max_len=256)
     arn = f"arn:aws:sns:{REGION}:{ACCOUNT_ID}:{name}"
     default_policy = json.dumps({
         "Version": "2008-10-17",
@@ -247,7 +264,7 @@ def _sns_sub_delete(physical_id, props):
 # --- DynamoDB Table ---
 
 def _ddb_create(logical_id, props, stack_name):
-    name = props.get("TableName") or f"{stack_name}-{logical_id}-{new_uuid()[:8]}"
+    name = props.get("TableName") or _physical_name(stack_name, logical_id, max_len=255)
     arn = f"arn:aws:dynamodb:{REGION}:{ACCOUNT_ID}:table/{name}"
 
     key_schema = props.get("KeySchema", [])
@@ -322,7 +339,7 @@ def _zip_inline(source: str | None, handler: str) -> bytes | None:
 
 
 def _lambda_create(logical_id, props, stack_name):
-    name = props.get("FunctionName") or f"{stack_name}-{logical_id}-{new_uuid()[:8]}"
+    name = props.get("FunctionName") or _physical_name(stack_name, logical_id, max_len=64)
     arn = f"arn:aws:lambda:{REGION}:{ACCOUNT_ID}:function:{name}"
     runtime = props.get("Runtime", "python3.9")
     handler = props.get("Handler", "index.handler")
@@ -379,7 +396,7 @@ def _lambda_delete(physical_id, props):
 # --- IAM Role ---
 
 def _iam_role_create(logical_id, props, stack_name):
-    name = props.get("RoleName") or f"{stack_name}-{logical_id}-{new_uuid()[:8]}"
+    name = props.get("RoleName") or _physical_name(stack_name, logical_id, max_len=64)
     arn = f"arn:aws:iam::{ACCOUNT_ID}:role/{name}"
     role_id = "AROA" + new_uuid().replace("-", "")[:17].upper()
     assume_doc = props.get("AssumeRolePolicyDocument", {})
@@ -433,7 +450,7 @@ def _iam_role_delete(physical_id, props):
 # --- IAM Policy ---
 
 def _iam_policy_create(logical_id, props, stack_name):
-    name = props.get("PolicyName") or f"{stack_name}-{logical_id}-{new_uuid()[:8]}"
+    name = props.get("PolicyName") or _physical_name(stack_name, logical_id, max_len=128)
     path = props.get("Path", "/")
     arn = f"arn:aws:iam::{ACCOUNT_ID}:policy{path}{name}"
     pol_doc = props.get("PolicyDocument", {})
@@ -482,7 +499,7 @@ def _iam_policy_delete(physical_id, props):
 # --- IAM InstanceProfile ---
 
 def _iam_ip_create(logical_id, props, stack_name):
-    name = props.get("InstanceProfileName") or f"{stack_name}-{logical_id}-{new_uuid()[:8]}"
+    name = props.get("InstanceProfileName") or _physical_name(stack_name, logical_id, max_len=128)
     path = props.get("Path", "/")
     arn = f"arn:aws:iam::{ACCOUNT_ID}:instance-profile{path}{name}"
     ip_id = new_uuid().replace("-", "")[:21].upper()
@@ -570,7 +587,7 @@ def _cwlogs_delete(physical_id, props):
 # --- EventBridge Rule ---
 
 def _eb_rule_create(logical_id, props, stack_name):
-    name = props.get("Name") or f"{stack_name}-{logical_id}-{new_uuid()[:8]}"
+    name = props.get("Name") or _physical_name(stack_name, logical_id, max_len=64)
     bus = props.get("EventBusName", "default")
     key = f"{name}|{bus}"
     arn = f"arn:aws:events:{REGION}:{ACCOUNT_ID}:rule/{bus}/{name}"

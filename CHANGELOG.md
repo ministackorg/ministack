@@ -7,6 +7,16 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [1.1.15] — 2026-04-01
+
+### Fixed
+- **CloudFormation auto-generated physical names** — resources without explicit names now follow the AWS pattern `{stackName}-{logicalId}-{SUFFIX}` with a 13-char uppercase alphanumeric suffix; service-specific rules applied (S3: lowercase, max 63; SQS: max 80; DynamoDB: max 255; Lambda/IAM/EventBridge: max 64). Fixes CDK stacks that omit explicit resource names producing untraceable `cfn-xxx` names
+
+### Tests
+- 808 tests total, all passing
+
+---
+
 ## [1.1.14] — 2026-04-01
 
 ### Added
