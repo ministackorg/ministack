@@ -313,6 +313,7 @@ class Worker:
         handler = self.config.get("Handler", "index.handler")
         module_name, handler_name = handler.rsplit(".", 1)
         env_vars = self.config.get("Environment", {}).get("Variables", {})
+        spawn_env = {**os.environ, **env_vars}
 
         self._proc = subprocess.Popen(
             [binary, worker_path],
@@ -321,6 +322,7 @@ class Worker:
             stderr=subprocess.PIPE,
             text=True,
             bufsize=1,
+            env=spawn_env,
         )
 
         init = {

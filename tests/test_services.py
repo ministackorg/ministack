@@ -6285,6 +6285,47 @@ def test_lambda_nodejs_callback_handler(lam):
     assert payload["val"] == 7
 
 
+def test_lambda_nodejs_env_vars_at_spawn(lam):
+    """Lambda env vars are available at process startup (NODE_OPTIONS, etc.)."""
+    code = (
+        "exports.handler = async (event) => ({"
+        " myVar: process.env.MY_CUSTOM_VAR,"
+        " region: process.env.AWS_REGION"
+        "});"
+    )
+    lam.create_function(
+        FunctionName="lam-node-env-spawn",
+        Runtime="nodejs20.x",
+        Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _make_zip_js(code, "index.js")},
+        Environment={"Variables": {"MY_CUSTOM_VAR": "from-spawn"}},
+    )
+    resp = lam.invoke(FunctionName="lam-node-env-spawn", Payload=b"{}")
+    payload = json.loads(resp["Payload"].read())
+    assert payload["myVar"] == "from-spawn"
+
+
+def test_lambda_python_env_vars_at_spawn(lam):
+    """Python Lambda env vars are available at process startup."""
+    code = (
+        "import os\n"
+        "def handler(event, context):\n"
+        "    return {'myVar': os.environ.get('MY_PY_VAR', 'missing')}\n"
+    )
+    lam.create_function(
+        FunctionName="lam-py-env-spawn",
+        Runtime="python3.11",
+        Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _make_zip(code)},
+        Environment={"Variables": {"MY_PY_VAR": "from-spawn-py"}},
+    )
+    resp = lam.invoke(FunctionName="lam-py-env-spawn", Payload=b"{}")
+    payload = json.loads(resp["Payload"].read())
+    assert payload["myVar"] == "from-spawn-py"
+
+
 # ========== Lambda — DynamoDB Streams ESM ==========
 
 def test_lambda_dynamodb_stream_esm(lam, ddb):
@@ -11538,6 +11579,18 @@ def test_sm_get_random_password(sm):
     pwd = resp["RandomPassword"]
     assert len(pwd) == 24
     assert not any(c.isdigit() for c in pwd)
+
+
+def test_sm_kms_key_id_on_create_and_describe(sm):
+    sm.create_secret(Name="kms-test-secret", SecretString="val", KmsKeyId="alias/my-key")
+    resp = sm.describe_secret(SecretId="kms-test-secret")
+    assert resp["KmsKeyId"] == "alias/my-key"
+
+
+def test_sm_kms_key_id_on_update(sm):
+    sm.update_secret(SecretId="kms-test-secret", KmsKeyId="alias/other-key")
+    resp = sm.describe_secret(SecretId="kms-test-secret")
+    assert resp["KmsKeyId"] == "alias/other-key"
 
 
 # ---------------------------------------------------------------------------

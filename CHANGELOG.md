@@ -7,6 +7,17 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [1.1.20] — 2026-04-02
+
+### Fixed
+- **SecretsManager `KmsKeyId`** — `CreateSecret` and `UpdateSecret` now store `KmsKeyId`; `DescribeSecret` returns it. Previously always null.
+- **Lambda env vars applied at process spawn** — Lambda environment variables are now passed to the worker subprocess at startup (`env=` on `Popen`) instead of after via `Object.assign`. `NODE_OPTIONS=--require ./init.js` and similar process-level env vars now work correctly, matching real AWS Lambda behaviour. Contributed by @jv2222
+
+### Tests
+- 838 tests total, all passing
+
+---
+
 ## [1.1.19] — 2026-04-02
 
 - Version bump from v1.1.18 — no code changes, re-tag for PyPI publish
