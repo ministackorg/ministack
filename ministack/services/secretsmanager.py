@@ -172,6 +172,7 @@ def _create_secret(data):
         "RotationEnabled": False,
         "RotationLambdaARN": data.get("RotationLambdaARN"),
         "RotationRules": data.get("RotationRules"),
+        "KmsKeyId": data.get("KmsKeyId"),
         "ReplicationStatus": [],
         "Versions": {
             vid: {
@@ -361,6 +362,8 @@ def _update_secret(data):
 
     if "Description" in data:
         secret["Description"] = data["Description"]
+    if "KmsKeyId" in data:
+        secret["KmsKeyId"] = data["KmsKeyId"]
 
     has_new_value = "SecretString" in data or "SecretBinary" in data
     if not has_new_value:
@@ -402,6 +405,8 @@ def _describe_secret(data):
     }
     if secret.get("DeletedDate"):
         result["DeletedDate"] = secret["DeletedDate"]
+    if secret.get("KmsKeyId"):
+        result["KmsKeyId"] = secret["KmsKeyId"]
     if secret.get("RotationLambdaARN"):
         result["RotationLambdaARN"] = secret["RotationLambdaARN"]
     if secret.get("RotationRules"):
