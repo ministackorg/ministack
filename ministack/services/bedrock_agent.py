@@ -301,23 +301,28 @@ async def _get_knowledge_base_documents(kb_id: str, ds_id: str, body: bytes):
     try:
         results = []
         for doc_id_obj in document_identifiers:
-            # doc_id_obj can have "s3" location or a custom identifier
+            # AWS format: {"dataSourceType": "S3", "s3": {"uri": "..."}}
+            # Also accept: {"s3": {"uri": "..."}} for backwards compat
+            ds_type = doc_id_obj.get("dataSourceType", "S3")
             s3_loc = doc_id_obj.get("s3", {})
             s3_uri = s3_loc.get("uri", "")
-            if s3_uri:
+            custom_loc = doc_id_obj.get("custom", {})
+            custom_id = custom_loc.get("id", "") or doc_id_obj.get("id", "")
+
+            if ds_type == "S3" and s3_uri:
                 row = await conn.fetchrow(
                     "SELECT id, s3_uri, content, metadata, status, created_at, updated_at "
                     "FROM kb_documents WHERE knowledge_base_id = $1 AND data_source_id = $2 AND s3_uri = $3",
                     kb_id, ds_id, s3_uri,
                 )
-            else:
-                # Try by document ID
-                doc_id = doc_id_obj.get("id", "")
+            elif custom_id:
                 row = await conn.fetchrow(
                     "SELECT id, s3_uri, content, metadata, status, created_at, updated_at "
                     "FROM kb_documents WHERE knowledge_base_id = $1 AND data_source_id = $2 AND id::text = $3",
-                    kb_id, ds_id, doc_id,
+                    kb_id, ds_id, custom_id,
                 )
+            else:
+                row = None
 
             if row:
                 results.append({
@@ -401,18 +406,21 @@ async def _delete_knowledge_base_documents(kb_id: str, ds_id: str, body: bytes):
     try:
         deleted = []
         for doc_id_obj in document_identifiers:
+            ds_type = doc_id_obj.get("dataSourceType", "S3")
             s3_loc = doc_id_obj.get("s3", {})
             s3_uri = s3_loc.get("uri", "")
-            if s3_uri:
-                result = await conn.execute(
+            custom_loc = doc_id_obj.get("custom", {})
+            custom_id = custom_loc.get("id", "") or doc_id_obj.get("id", "")
+
+            if ds_type == "S3" and s3_uri:
+                await conn.execute(
                     "DELETE FROM kb_documents WHERE knowledge_base_id = $1 AND data_source_id = $2 AND s3_uri = $3",
                     kb_id, ds_id, s3_uri,
                 )
-            else:
-                doc_id = doc_id_obj.get("id", "")
-                result = await conn.execute(
+            elif custom_id:
+                await conn.execute(
                     "DELETE FROM kb_documents WHERE knowledge_base_id = $1 AND data_source_id = $2 AND id::text = $3",
-                    kb_id, ds_id, doc_id,
+                    kb_id, ds_id, custom_id,
                 )
             deleted.append({
                 "documentIdentifier": doc_id_obj,
