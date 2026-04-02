@@ -28,7 +28,7 @@ _EXECUTE_API_RE = re.compile(
 _S3_VHOST_RE = re.compile(
     r"^([^.]+)(?:\.s3)?\." + re.escape(_MINISTACK_HOST) + r"(?::\d+)?$"
 )
-_S3_VHOST_EXCLUDE_RE = re.compile(r"\.(execute-api|alb|emr|efs|elasticache)\.")
+_S3_VHOST_EXCLUDE_RE = re.compile(r"\.(execute-api|alb|emr|efs|elasticache|s3-control)\.")
 
 from ministack.core.persistence import PERSIST_STATE, load_state, save_all
 from ministack.core.router import detect_service, extract_account_id, extract_region
@@ -191,6 +191,31 @@ async def app(scope, receive, send):
         body += message.get("body", b"")
         if not message.get("more_body", False):
             break
+
+    # AWS SDK v2 sends PutObject with Transfer-Encoding: chunked and
+    # x-amz-content-sha256: STREAMING-AWS4-HMAC-SHA256-PAYLOAD[-TRAILER].
+    # Decode the AWS chunked format: each chunk is "<hex>;chunk-signature=...\r\n<data>\r\n"
+    # terminated by "0;chunk-signature=...\r\n".
+    sha256_header = headers.get("x-amz-content-sha256", "")
+    if sha256_header.startswith("STREAMING-"):
+        decoded = b""
+        remaining = body
+        while remaining:
+            crlf = remaining.find(b"\r\n")
+            if crlf == -1:
+                break
+            chunk_header = remaining[:crlf].decode("ascii", errors="replace")
+            size_hex = chunk_header.split(";")[0].strip()
+            try:
+                chunk_size = int(size_hex, 16)
+            except ValueError:
+                break
+            if chunk_size == 0:
+                break
+            data_start = crlf + 2
+            decoded += remaining[data_start:data_start + chunk_size]
+            remaining = remaining[data_start + chunk_size + 2:]  # skip trailing \r\n
+        body = decoded
 
     request_id = str(uuid.uuid4())
 
@@ -390,7 +415,7 @@ async def app(scope, receive, send):
     _s3_vhost = _S3_VHOST_RE.match(host)
     if _s3_vhost and not _execute_match and not _S3_VHOST_EXCLUDE_RE.search(host):
         bucket = _s3_vhost.group(1)
-        _non_s3_hosts = {"s3", "sqs", "sns", "dynamodb", "lambda", "iam", "sts",
+        _non_s3_hosts = {"s3", "s3-control", "sqs", "sns", "dynamodb", "lambda", "iam", "sts",
                          "secretsmanager", "logs", "ssm", "events", "kinesis",
                          "monitoring", "ses", "states", "ecs", "rds", "elasticache",
                          "glue", "athena", "apigateway", "cloudformation"}

@@ -7,14 +7,38 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
-## [1.1.17] — 2026-04-02
+## [1.1.18] — 2026-04-02
 
 ### Added
 - **EC2 `DescribeInstanceCreditSpecifications`** — returns `standard` CPU credits; fixes Terraform v6 provider compatibility
-- **EC2 Terraform v6 stubs** — `DescribeInstanceMaintenanceOptions`, `DescribeInstanceAutoRecoveryAttribute`, `ModifyInstanceMaintenanceOptions`, `DescribeInstanceTopology`, `DescribeSpotInstanceRequests`, `DescribeCapacityReservations` all return sensible empty/default responses to prevent Terraform v6 from failing on unknown actions
+- **EC2 Terraform v6 stubs** — `DescribeInstanceMaintenanceOptions`, `DescribeInstanceAutoRecoveryAttribute`, `ModifyInstanceMaintenanceOptions`, `DescribeInstanceTopology`, `DescribeSpotInstanceRequests`, `DescribeCapacityReservations` all return sensible empty/default responses
+- **Lambda Node.js warm worker pool** — Node.js functions now use the same persistent warm worker as Python; supports async/await, Promise, and callback handlers; AWS SDK v2 endpoint patching for local development
+- **Docker image includes Node.js** — `nodejs` added to Alpine base image so container-based Node.js Lambda execution works out of the box in Docker Compose / CI environments
+- **Lambda S3 code fetch** — `CreateFunction` and `UpdateFunctionCode` now accept `S3Bucket`/`S3Key` in addition to `ZipFile`; returns error if S3 object not found
+- **Lambda versioning** — `Publish=True` on `CreateFunction` and `UpdateFunctionCode` now creates immutable numbered versions with their own `code_zip`
+- **DynamoDB Streams** — `StreamSpecification` on `CreateTable` now emits INSERT/MODIFY/REMOVE records on all write operations (`PutItem`, `UpdateItem`, `DeleteItem`, `BatchWriteItem`, `TransactWriteItems`); respects `StreamViewType`
+- **Kinesis ESM polling** — Lambda event source mappings now support Kinesis streams in addition to SQS
+
+### Fixed
+- **SNS `Subscribe` ignores `Attributes` parameter** — `RawMessageDelivery`, `FilterPolicy`, `FilterPolicyScope`, `DeliveryPolicy`, and `RedrivePolicy` passed at subscription creation time are now applied immediately
+- **Lambda warm worker not invalidated on code update** — `UpdateFunctionCode` and `DeleteFunction` now invalidate the warm worker pool so the next invocation picks up the new code
+- **Lambda module-level imports** — removed lazy `from ministack.core.lambda_runtime import` inside functions; moved to module top level
+- **S3 chunked transfer encoding** — AWS SDK v2 sends `PutObject` with `STREAMING-AWS4-HMAC-SHA256-PAYLOAD` chunked encoding; body was stored with chunk headers causing corrupt `GetObject` responses; now decoded before storage
+- **Kinesis validation limits** — `PutRecord` and `PutRecords` now enforce AWS limits: max 1 MB per record, max 500 records per batch, max 5 MB total payload, max 256-char partition key
+- **S3 Control routing via `s3-control.localhost` host** — requests with host header `s3-control.localhost` were intercepted by the S3 virtual-hosted bucket handler instead of reaching the S3 Control API; fixes Terraform `ListTagsForResource` returning 404 `NoSuchResource`
+- **EC2 security group rule deduplication** — `AuthorizeSecurityGroupIngress/Egress` no longer appends duplicate rules; fixes Terraform showing constant drift
+- **EC2 default egress rule on created security groups** — non-default security groups now include the standard allow-all egress rule matching AWS behaviour
+- **EC2 VPC Peering missing Region field** — `requesterVpcInfo` and `accepterVpcInfo` now include `<region>` in all responses; fixes Terraform failing to parse peering connections
+- **Lambda `PublishVersion` FunctionArn** — no longer appends version number to FunctionArn (version is in the Version field); fixes Terraform ARN comparison drift
+- **Lambda `FunctionUrlConfig` hardcoded region** — now uses `MINISTACK_REGION` instead of hardcoded `us-east-1`
+- **Lambda handler validation** — returns proper `Runtime.InvalidEntrypoint` error if handler name has no `.` separator instead of crashing
+- **RDS error code** — `DBInstanceAlreadyExists` corrected to `DBInstanceAlreadyExistsFault` matching AWS error codes
+
+- Thanks to @lubond @jimmyd-be @abedurftig @mig_mit for reporting issues and testing                       
+- Thanks to @jv2222 and @santiagodoldan for their massive contributions
 
 ### Tests
-- 818 tests total, all passing
+- 834 tests total, all passing
 
 ---
 

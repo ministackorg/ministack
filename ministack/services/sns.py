@@ -219,11 +219,14 @@ def _subscribe(params):
         },
     }
 
+    allowed_attrs = {"DeliveryPolicy", "FilterPolicy", "FilterPolicyScope",
+                     "RawMessageDelivery", "RedrivePolicy"}
     i = 1
     while _p(params, f"Attributes.entry.{i}.key"):
         key = _p(params, f"Attributes.entry.{i}.key")
         val = _p(params, f"Attributes.entry.{i}.value")
-        sub["attributes"][key] = val
+        if key in allowed_attrs:
+            sub["attributes"][key] = val or ""
         i += 1
 
     topic["subscriptions"].append(sub)

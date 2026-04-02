@@ -315,6 +315,19 @@ def _put_record(data):
     explicit_hash = data.get("ExplicitHashKey")
     if not partition_key:
         return error_response_json("ValidationException", "PartitionKey is required", 400)
+    if len(partition_key) > 256:
+        return error_response_json("ValidationException",
+            "1 validation error detected: Value at 'partitionKey' failed to satisfy constraint: "
+            "Member must have length less than or equal to 256", 400)
+    if record_data:
+        try:
+            raw = base64.b64decode(record_data)
+        except Exception:
+            raw = record_data.encode() if isinstance(record_data, str) else record_data
+        if len(raw) > 1_048_576:
+            return error_response_json("ValidationException",
+                "1 validation error detected: Value at 'data' failed to satisfy constraint: "
+                "Member must have length less than or equal to 1048576", 400)
 
     hash_int = int(explicit_hash) if explicit_hash else _partition_key_to_hash(partition_key)
     shard_id = _route_to_shard(hash_int, stream)
@@ -342,8 +355,35 @@ def _put_records(data):
 
     _expire_records(stream)
 
+    records = data.get("Records", [])
+    if len(records) > 500:
+        return error_response_json("ValidationException",
+            "1 validation error detected: Value at 'records' failed to satisfy constraint: "
+            "Member must have length less than or equal to 500", 400)
+    total_size = 0
+    for rec in records:
+        pk = rec.get("PartitionKey", "")
+        rd = rec.get("Data", "")
+        if len(pk) > 256:
+            return error_response_json("ValidationException",
+                "1 validation error detected: Value at 'partitionKey' failed to satisfy constraint: "
+                "Member must have length less than or equal to 256", 400)
+        try:
+            raw = base64.b64decode(rd) if rd else b""
+        except Exception:
+            raw = rd.encode() if isinstance(rd, str) else rd
+        rec_size = len(raw) + len(pk.encode())
+        if len(raw) > 1_048_576:
+            return error_response_json("ValidationException",
+                "1 validation error detected: Value at 'data' failed to satisfy constraint: "
+                "Member must have length less than or equal to 1048576", 400)
+        total_size += rec_size
+    if total_size > 5_242_880:
+        return error_response_json("ValidationException",
+            "Records total payload size exceeds 5 MB limit", 400)
+
     results = []
-    for rec in data.get("Records", []):
+    for rec in records:
         pk = rec.get("PartitionKey", "")
         rd = rec.get("Data", "")
         eh = rec.get("ExplicitHashKey")

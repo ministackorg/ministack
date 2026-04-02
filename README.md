@@ -47,7 +47,7 @@ cd ministack
 docker compose up -d
 
 # Verify (any option)
-curl http://localhost:4566/_localstack/health
+curl http://localhost:4566/_ministack/health
 ```
 
 That's it. No account, no API key, no sign-up.
@@ -201,8 +201,8 @@ subnet = ec2.create_subnet(
 | **S3** | CreateBucket, DeleteBucket, ListBuckets, HeadBucket, PutObject, GetObject, DeleteObject, HeadObject, CopyObject, ListObjects v1/v2, DeleteObjects, GetBucketVersioning, PutBucketVersioning, GetBucketEncryption, PutBucketEncryption, DeleteBucketEncryption, GetBucketLifecycleConfiguration, PutBucketLifecycleConfiguration, DeleteBucketLifecycle, GetBucketCors, PutBucketCors, DeleteBucketCors, GetBucketAcl, PutBucketAcl, GetBucketTagging, PutBucketTagging, DeleteBucketTagging, GetBucketPolicy, PutBucketPolicy, DeleteBucketPolicy, GetBucketNotificationConfiguration, PutBucketNotificationConfiguration, GetBucketLogging, PutBucketLogging, ListObjectVersions, CreateMultipartUpload, UploadPart, CompleteMultipartUpload, AbortMultipartUpload, PutObjectLockConfiguration, GetObjectLockConfiguration, PutObjectRetention, GetObjectRetention, PutObjectLegalHold, GetObjectLegalHold, PutBucketReplication, GetBucketReplication, DeleteBucketReplication | Optional disk persistence via `S3_PERSIST=1`; Object Lock with retention & legal hold enforcement on delete |
 | **SQS** | CreateQueue, DeleteQueue, ListQueues, GetQueueUrl, GetQueueAttributes, SetQueueAttributes, PurgeQueue, SendMessage, ReceiveMessage, DeleteMessage, ChangeMessageVisibility, ChangeMessageVisibilityBatch, SendMessageBatch, DeleteMessageBatch, TagQueue, UntagQueue, ListQueueTags | Both Query API and JSON protocol; FIFO queues with deduplication; DLQ support |
 | **SNS** | CreateTopic, DeleteTopic, ListTopics, GetTopicAttributes, SetTopicAttributes, Subscribe, Unsubscribe, ListSubscriptions, ListSubscriptionsByTopic, GetSubscriptionAttributes, SetSubscriptionAttributes, ConfirmSubscription, Publish, PublishBatch, TagResource, UntagResource, ListTagsForResource, CreatePlatformApplication, CreatePlatformEndpoint | SNS→SQS fanout delivery; SNS→Lambda fanout (synchronous invocation) |
-| **DynamoDB** | CreateTable, UpdateTable, DeleteTable, DescribeTable, ListTables, PutItem, GetItem, DeleteItem, UpdateItem, Query, Scan, BatchWriteItem, BatchGetItem, TransactWriteItems, TransactGetItems, DescribeTimeToLive, UpdateTimeToLive, DescribeContinuousBackups, UpdateContinuousBackups, DescribeEndpoints, TagResource, UntagResource, ListTagsOfResource | TTL enforced via thread-safe background reaper (60s cadence) |
-| **Lambda** | CreateFunction, DeleteFunction, GetFunction, ListFunctions, Invoke, UpdateFunctionCode, UpdateFunctionConfiguration, AddPermission, RemovePermission, ListVersionsByFunction, PublishVersion, TagResource, UntagResource, ListTags, CreateEventSourceMapping, DeleteEventSourceMapping, GetEventSourceMapping, ListEventSourceMappings, UpdateEventSourceMapping, CreateFunctionUrlConfig, GetFunctionUrlConfig, UpdateFunctionUrlConfig, DeleteFunctionUrlConfig, ListFunctionUrlConfigs, PublishLayerVersion, GetLayerVersion, ListLayerVersions, DeleteLayerVersion, ListLayers | Python runtimes execute with warm worker pool; Node.js runtimes (`nodejs14.x`–`nodejs22.x`) execute via local `node` subprocess or Docker; SQS event source mapping; Function URL CRUD; Lambda Layers CRUD |
+| **DynamoDB** | CreateTable, UpdateTable, DeleteTable, DescribeTable, ListTables, PutItem, GetItem, DeleteItem, UpdateItem, Query, Scan, BatchWriteItem, BatchGetItem, TransactWriteItems, TransactGetItems, DescribeTimeToLive, UpdateTimeToLive, DescribeContinuousBackups, UpdateContinuousBackups, DescribeEndpoints, TagResource, UntagResource, ListTagsOfResource | TTL enforced via thread-safe background reaper (60s cadence); DynamoDB Streams — `StreamSpecification` emits INSERT/MODIFY/REMOVE records on all write operations, respects `StreamViewType` |
+| **Lambda** | CreateFunction, DeleteFunction, GetFunction, ListFunctions, Invoke, UpdateFunctionCode, UpdateFunctionConfiguration, AddPermission, RemovePermission, ListVersionsByFunction, PublishVersion, TagResource, UntagResource, ListTags, CreateEventSourceMapping, DeleteEventSourceMapping, GetEventSourceMapping, ListEventSourceMappings, UpdateEventSourceMapping, CreateFunctionUrlConfig, GetFunctionUrlConfig, UpdateFunctionUrlConfig, DeleteFunctionUrlConfig, ListFunctionUrlConfigs, PublishLayerVersion, GetLayerVersion, ListLayerVersions, DeleteLayerVersion, ListLayers | Python and Node.js runtimes execute with warm worker pool; `Publish=True` creates immutable numbered versions; Code via `ZipFile` or `S3Bucket`/`S3Key`; SQS, Kinesis, and DynamoDB Streams event source mappings; Function URL CRUD; Lambda Layers CRUD |
 | **IAM** | CreateUser, GetUser, ListUsers, DeleteUser, CreateRole, GetRole, ListRoles, DeleteRole, CreatePolicy, GetPolicy, DeletePolicy, AttachRolePolicy, DetachRolePolicy, PutRolePolicy, GetRolePolicy, DeleteRolePolicy, ListRolePolicies, ListAttachedRolePolicies, CreateAccessKey, ListAccessKeys, DeleteAccessKey, CreateInstanceProfile, GetInstanceProfile, DeleteInstanceProfile, AddRoleToInstanceProfile, RemoveRoleFromInstanceProfile, ListInstanceProfiles, CreateGroup, GetGroup, AddUserToGroup, RemoveUserFromGroup, CreateServiceLinkedRole, CreateOpenIDConnectProvider, TagRole, UntagRole, TagUser, UntagUser, TagPolicy, UntagPolicy | |
 | **STS** | GetCallerIdentity, AssumeRole, GetSessionToken, AssumeRoleWithWebIdentity | |
 | **SecretsManager** | CreateSecret, GetSecretValue, ListSecrets, DeleteSecret, UpdateSecret, DescribeSecret, PutSecretValue, RestoreSecret, RotateSecret, GetRandomPassword, ListSecretVersionIds, TagResource, UntagResource, PutResourcePolicy, GetResourcePolicy, DeleteResourcePolicy, ValidateResourcePolicy | |
@@ -214,7 +214,7 @@ subnet = ec2.create_subnet(
 |---------|-----------|-------|
 | **SSM Parameter Store** | PutParameter, GetParameter, GetParameters, GetParametersByPath, DeleteParameter, DeleteParameters, DescribeParameters, GetParameterHistory, LabelParameterVersion, AddTagsToResource, RemoveTagsFromResource, ListTagsForResource | Supports String, SecureString, StringList |
 | **EventBridge** | CreateEventBus, DeleteEventBus, ListEventBuses, PutRule, DeleteRule, ListRules, DescribeRule, EnableRule, DisableRule, PutTargets, RemoveTargets, ListTargetsByRule, PutEvents, TagResource, UntagResource, ListTagsForResource, CreateArchive, DeleteArchive, DescribeArchive, ListArchives, PutPermission, RemovePermission, CreateConnection, DescribeConnection, DeleteConnection, ListConnections, CreateApiDestination, DescribeApiDestination, DeleteApiDestination, ListApiDestinations | Lambda target dispatch on PutEvents |
-| **Kinesis** | CreateStream, DeleteStream, DescribeStream, ListStreams, ListShards, PutRecord, PutRecords, GetShardIterator, GetRecords, MergeShards, SplitShard, UpdateShardCount, StartStreamEncryption, StopStreamEncryption, EnableEnhancedMonitoring, DisableEnhancedMonitoring, RegisterStreamConsumer, DeregisterStreamConsumer, ListStreamConsumers, DescribeStreamConsumer, AddTagsToStream, RemoveTagsFromStream, ListTagsForStream | Partition key → shard routing |
+| **Kinesis** | CreateStream, DeleteStream, DescribeStream, ListStreams, ListShards, PutRecord, PutRecords, GetShardIterator, GetRecords, MergeShards, SplitShard, UpdateShardCount, StartStreamEncryption, StopStreamEncryption, EnableEnhancedMonitoring, DisableEnhancedMonitoring, RegisterStreamConsumer, DeregisterStreamConsumer, ListStreamConsumers, DescribeStreamConsumer, AddTagsToStream, RemoveTagsFromStream, ListTagsForStream | Partition key → shard routing; AWS limits enforced (1 MB/record, 500 records/batch, 5 MB payload, 256-char partition key) |
 | **CloudWatch Metrics** | PutMetricData, GetMetricStatistics, GetMetricData, ListMetrics, PutMetricAlarm, PutCompositeAlarm, DescribeAlarms, DescribeAlarmsForMetric, DescribeAlarmHistory, DeleteAlarms, SetAlarmState, EnableAlarmActions, DisableAlarmActions, TagResource, UntagResource, ListTagsForResource, PutDashboard, GetDashboard, DeleteDashboards, ListDashboards | CBOR and JSON protocol |
 | **SES** | SendEmail, SendRawEmail, SendTemplatedEmail, SendBulkTemplatedEmail, VerifyEmailIdentity, VerifyEmailAddress, VerifyDomainIdentity, VerifyDomainDkim, ListIdentities, GetIdentityVerificationAttributes, GetIdentityDkimAttributes, DeleteIdentity, GetSendQuota, GetSendStatistics, CreateConfigurationSet, DeleteConfigurationSet, DescribeConfigurationSet, ListConfigurationSets, CreateTemplate, GetTemplate, UpdateTemplate, DeleteTemplate, ListTemplates | Emails stored in-memory, not sent |
 | **SES v2** | SendEmail, CreateEmailIdentity, GetEmailIdentity, DeleteEmailIdentity, ListEmailIdentities, CreateConfigurationSet, GetConfigurationSet, DeleteConfigurationSet, ListConfigurationSets, GetAccount, PutAccountSuppressionAttributes, ListSuppressedDestinations | REST API (`/v2/email/`); identities auto-verified; emails stored in-memory, not sent |
@@ -270,7 +270,7 @@ Unsupported resource types fail with `CREATE_FAILED` (or `ROLLBACK_COMPLETE` if 
 | **Athena** | StartQueryExecution, GetQueryExecution, GetQueryResults, StopQueryExecution, ListQueryExecutions, BatchGetQueryExecution, CreateWorkGroup, DeleteWorkGroup, GetWorkGroup, ListWorkGroups, UpdateWorkGroup, CreateNamedQuery, DeleteNamedQuery, GetNamedQuery, ListNamedQueries, BatchGetNamedQuery, CreateDataCatalog, GetDataCatalog, ListDataCatalogs, DeleteDataCatalog, UpdateDataCatalog, CreatePreparedStatement, GetPreparedStatement, DeletePreparedStatement, ListPreparedStatements, GetTableMetadata, ListTableMetadata, TagResource, UntagResource, ListTagsForResource | Real SQL via **DuckDB** when installed (`pip install duckdb`), otherwise returns mock results; result pagination; column type metadata |
 | **Firehose** | CreateDeliveryStream, DeleteDeliveryStream, DescribeDeliveryStream, ListDeliveryStreams, PutRecord, PutRecordBatch, UpdateDestination, TagDeliveryStream, UntagDeliveryStream, ListTagsForDeliveryStream, StartDeliveryStreamEncryption, StopDeliveryStreamEncryption | S3 destinations write records to the local S3 emulator; all other destination types buffer in-memory; concurrency-safe `UpdateDestination` via `VersionId` |
 | **Route53** | CreateHostedZone, GetHostedZone, DeleteHostedZone, ListHostedZones, ListHostedZonesByName, UpdateHostedZoneComment, ChangeResourceRecordSets (CREATE/UPSERT/DELETE), ListResourceRecordSets, GetChange, CreateHealthCheck, GetHealthCheck, DeleteHealthCheck, ListHealthChecks, UpdateHealthCheck, ChangeTagsForResource, ListTagsForResource | REST/XML protocol; SOA + NS records auto-created; CallerReference idempotency; alias records, weighted/failover/latency routing; marker-based pagination |
-| **EC2** | RunInstances, DescribeInstances, TerminateInstances, StopInstances, StartInstances, RebootInstances, DescribeImages, CreateSecurityGroup, DeleteSecurityGroup, DescribeSecurityGroups, AuthorizeSecurityGroupIngress, RevokeSecurityGroupIngress, AuthorizeSecurityGroupEgress, RevokeSecurityGroupEgress, CreateKeyPair, DeleteKeyPair, DescribeKeyPairs, ImportKeyPair, CreateVpc, DeleteVpc, DescribeVpcs, ModifyVpcAttribute, CreateSubnet, DeleteSubnet, DescribeSubnets, ModifySubnetAttribute, CreateInternetGateway, DeleteInternetGateway, DescribeInternetGateways, AttachInternetGateway, DetachInternetGateway, CreateRouteTable, DeleteRouteTable, DescribeRouteTables, AssociateRouteTable, DisassociateRouteTable, CreateRoute, ReplaceRoute, DeleteRoute, CreateNetworkInterface, DeleteNetworkInterface, DescribeNetworkInterfaces, AttachNetworkInterface, DetachNetworkInterface, CreateVpcEndpoint, DeleteVpcEndpoints, DescribeVpcEndpoints, DescribeAvailabilityZones, AllocateAddress, ReleaseAddress, AssociateAddress, DisassociateAddress, DescribeAddresses, CreateTags, DeleteTags, DescribeTags, CreateNatGateway, DescribeNatGateways, DeleteNatGateway, CreateNetworkAcl, DescribeNetworkAcls, DeleteNetworkAcl, CreateNetworkAclEntry, DeleteNetworkAclEntry, ReplaceNetworkAclEntry, ReplaceNetworkAclAssociation, CreateFlowLogs, DescribeFlowLogs, DeleteFlowLogs, CreateVpcPeeringConnection, AcceptVpcPeeringConnection, DescribeVpcPeeringConnections, DeleteVpcPeeringConnection, CreateDhcpOptions, AssociateDhcpOptions, DescribeDhcpOptions, DeleteDhcpOptions, CreateEgressOnlyInternetGateway, DescribeEgressOnlyInternetGateways, DeleteEgressOnlyInternetGateway, DescribeInstanceCreditSpecifications, DescribeInstanceMaintenanceOptions, DescribeInstanceAutoRecoveryAttribute, ModifyInstanceMaintenanceOptions, DescribeInstanceTopology, DescribeSpotInstanceRequests, DescribeCapacityReservations | In-memory state only — no real VMs; default VPC, subnet, security group, internet gateway, and route table always present; rules stored but not enforced (matches LocalStack); Terraform v6 compatible |
+| **EC2** | RunInstances, DescribeInstances, DescribeInstanceAttribute, DescribeInstanceTypes, TerminateInstances, StopInstances, StartInstances, RebootInstances, DescribeImages, CreateSecurityGroup, DeleteSecurityGroup, DescribeSecurityGroups, AuthorizeSecurityGroupIngress, RevokeSecurityGroupIngress, AuthorizeSecurityGroupEgress, RevokeSecurityGroupEgress, CreateKeyPair, DeleteKeyPair, DescribeKeyPairs, ImportKeyPair, CreateVpc, DeleteVpc, DescribeVpcs, ModifyVpcAttribute, CreateSubnet, DeleteSubnet, DescribeSubnets, ModifySubnetAttribute, CreateInternetGateway, DeleteInternetGateway, DescribeInternetGateways, AttachInternetGateway, DetachInternetGateway, CreateRouteTable, DeleteRouteTable, DescribeRouteTables, AssociateRouteTable, DisassociateRouteTable, CreateRoute, ReplaceRoute, DeleteRoute, CreateNetworkInterface, DeleteNetworkInterface, DescribeNetworkInterfaces, AttachNetworkInterface, DetachNetworkInterface, CreateVpcEndpoint, DeleteVpcEndpoints, DescribeVpcEndpoints, DescribeAvailabilityZones, AllocateAddress, ReleaseAddress, AssociateAddress, DisassociateAddress, DescribeAddresses, CreateTags, DeleteTags, DescribeTags, CreateNatGateway, DescribeNatGateways, DeleteNatGateway, CreateNetworkAcl, DescribeNetworkAcls, DeleteNetworkAcl, CreateNetworkAclEntry, DeleteNetworkAclEntry, ReplaceNetworkAclEntry, ReplaceNetworkAclAssociation, CreateFlowLogs, DescribeFlowLogs, DeleteFlowLogs, CreateVpcPeeringConnection, AcceptVpcPeeringConnection, DescribeVpcPeeringConnections, DeleteVpcPeeringConnection, CreateDhcpOptions, AssociateDhcpOptions, DescribeDhcpOptions, DeleteDhcpOptions, CreateEgressOnlyInternetGateway, DescribeEgressOnlyInternetGateways, DeleteEgressOnlyInternetGateway, DescribeInstanceCreditSpecifications, DescribeInstanceMaintenanceOptions, DescribeInstanceAutoRecoveryAttribute, ModifyInstanceMaintenanceOptions, DescribeInstanceTopology, DescribeSpotInstanceRequests, DescribeCapacityReservations | In-memory state only — no real VMs; default VPC, subnet, security group, internet gateway, and route table always present; rules stored but not enforced (matches LocalStack); Terraform v6 compatible |
 | **EBS** | CreateVolume, DeleteVolume, DescribeVolumes, DescribeVolumeStatus, AttachVolume, DetachVolume, ModifyVolume, DescribeVolumesModifications, EnableVolumeIO, ModifyVolumeAttribute, DescribeVolumeAttribute, CreateSnapshot, DeleteSnapshot, DescribeSnapshots, CopySnapshot, ModifySnapshotAttribute, DescribeSnapshotAttribute | Part of EC2 Query/XML service; attach/detach updates volume state; snapshots stored as completed immediately; Pro-only on LocalStack — free here |
 | **EFS** | CreateFileSystem, DescribeFileSystems, DeleteFileSystem, UpdateFileSystem, CreateMountTarget, DescribeMountTargets, DeleteMountTarget, DescribeMountTargetSecurityGroups, ModifyMountTargetSecurityGroups, CreateAccessPoint, DescribeAccessPoints, DeleteAccessPoint, TagResource, UntagResource, ListTagsForResource, PutLifecycleConfiguration, DescribeLifecycleConfiguration, PutBackupPolicy, DescribeBackupPolicy, DescribeAccountPreferences, PutAccountPreferences | REST/JSON `/2015-02-01/*`; CreationToken idempotency; FileSystem deletion blocked when mount targets exist; Pro-only on LocalStack — free here |
 | **EMR** | RunJobFlow, DescribeCluster, ListClusters, TerminateJobFlows, ModifyCluster, SetTerminationProtection, SetVisibleToAllUsers, AddJobFlowSteps, DescribeStep, ListSteps, CancelSteps, AddInstanceFleet, ListInstanceFleets, ModifyInstanceFleet, AddInstanceGroups, ListInstanceGroups, ModifyInstanceGroups, ListBootstrapActions, AddTags, RemoveTags, GetBlockPublicAccessConfiguration, PutBlockPublicAccessConfiguration | Control plane only — no real Spark/Hadoop; clusters start in WAITING (KeepAlive=true) or TERMINATED (KeepAlive=false); steps stored as COMPLETED immediately; all three instance modes (simple, InstanceGroups, InstanceFleets); TerminationProtected enforced; Pro-only on LocalStack — free here |
@@ -408,7 +408,7 @@ ecs.stop_task(cluster="dev", task=task_arn)
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `GATEWAY_PORT` | `4566` | Port to listen on |
-| `MINISTACK_HOST` | `localhost` | Hostname used in SQS queue URLs returned to clients |
+| `MINISTACK_HOST` | `localhost` | Hostname used in response URLs (SQS queues, SNS subscriptions, API Gateway endpoints, Lambda layers) |
 | `MINISTACK_REGION` | `us-east-1` | AWS region reported in ARNs and service responses across all services |
 | `LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR` |
 | `S3_PERSIST` | `0` | Set `1` to persist S3 objects to disk |
@@ -419,6 +419,7 @@ ecs.stop_task(cluster="dev", task=task_arn)
 | `ELASTICACHE_BASE_PORT` | `16379` | Starting host port for ElastiCache containers |
 | `PERSIST_STATE` | `0` | Set `1` to persist service state across restarts |
 | `STATE_DIR` | `/tmp/ministack-state` | Directory for persisted state files |
+| `LAMBDA_EXECUTOR` | `local` | Lambda execution mode: `local` (subprocess) or `docker` (container) |
 | `ATHENA_ENGINE` | `auto` | SQL engine for Athena: `auto`, `duckdb`, `mock` |
 
 ### Athena SQL Engines
@@ -452,11 +453,11 @@ docker run -p 4566:4566 \
 
 ### Lambda Warm Starts
 
-MiniStack keeps Python Lambda functions warm between invocations. After the first call (cold start), the handler module stays imported in a persistent subprocess. Subsequent calls skip the import step, matching real AWS warm-start behaviour and making test suites significantly faster.
+MiniStack keeps Python and Node.js Lambda functions warm between invocations. After the first call (cold start), the handler module stays loaded in a persistent subprocess. Subsequent calls skip the import/require step, matching real AWS warm-start behaviour and making test suites significantly faster.
 
 ### Lambda Node.js Runtimes
 
-MiniStack supports Node.js Lambda runtimes (`nodejs14.x`, `nodejs16.x`, `nodejs18.x`, `nodejs20.x`, `nodejs22.x`). Functions execute via a local `node` subprocess (or Docker when `LAMBDA_USE_DOCKER=1`) — no mocking, real JS execution.
+MiniStack supports Node.js Lambda runtimes (`nodejs14.x`, `nodejs16.x`, `nodejs18.x`, `nodejs20.x`, `nodejs22.x`). Functions execute via a local `node` subprocess (or Docker when `LAMBDA_EXECUTOR=docker`) — no mocking, real JS execution.
 
 ```python
 import boto3, json, zipfile, io
@@ -535,20 +536,20 @@ pip install boto3 pytest duckdb docker cbor2
 # Start MiniStack
 docker compose up -d
 
-# Run the full test suite (818 tests across all 34 services)
+# Run the full test suite (834 tests across all 34 services)
 pytest tests/ -v
 ```
 
 Expected output:
 
 ```
-collected 760 items
+collected 834 items
 
 tests/test_services.py::test_s3_create_bucket PASSED
 ...
 tests/test_services.py::test_app_asgi_callable PASSED
 
-760 passed in ~60s
+834 passed in ~100s
 ```
 
 ---
@@ -557,45 +558,53 @@ tests/test_services.py::test_app_asgi_callable PASSED
 
 ### Terraform
 
+Works with both Terraform AWS Provider v5 and v6.
+
 ```hcl
 provider "aws" {
   region                      = "us-east-1"
   access_key                  = "test"
   secret_key                  = "test"
+  s3_use_path_style           = true
   skip_credentials_validation = true
   skip_metadata_api_check     = true
   skip_requesting_account_id  = true
 
   endpoints {
-    s3             = "http://localhost:4566"
-    sqs            = "http://localhost:4566"
-    dynamodb       = "http://localhost:4566"
-    lambda         = "http://localhost:4566"
-    iam            = "http://localhost:4566"
-    sts            = "http://localhost:4566"
-    secretsmanager = "http://localhost:4566"
-    ssm            = "http://localhost:4566"
-    kinesis        = "http://localhost:4566"
-    sns            = "http://localhost:4566"
-    rds            = "http://localhost:4566"
-    ecs            = "http://localhost:4566"
-    glue           = "http://localhost:4566"
-    athena         = "http://localhost:4566"
-    elasticache    = "http://localhost:4566"
-    stepfunctions  = "http://localhost:4566"
-    cloudwatch     = "http://localhost:4566"
-    logs           = "http://localhost:4566"
-    events         = "http://localhost:4566"
-    ses            = "http://localhost:4566"
-    apigateway     = "http://localhost:4566"
-    firehose       = "http://localhost:4566"
-    route53        = "http://localhost:4566"
-    cognitoidp     = "http://localhost:4566"
+    acm             = "http://localhost:4566"
+    apigateway      = "http://localhost:4566"
+    athena          = "http://localhost:4566"
+    cloudformation  = "http://localhost:4566"
+    cloudwatch      = "http://localhost:4566"
     cognitoidentity = "http://localhost:4566"
+    cognitoidp      = "http://localhost:4566"
+    dynamodb        = "http://localhost:4566"
     ec2             = "http://localhost:4566"
-    emr             = "http://localhost:4566"
+    ecs             = "http://localhost:4566"
     efs             = "http://localhost:4566"
+    elasticache     = "http://localhost:4566"
     elbv2           = "http://localhost:4566"
+    emr             = "http://localhost:4566"
+    events          = "http://localhost:4566"
+    firehose        = "http://localhost:4566"
+    glue            = "http://localhost:4566"
+    iam             = "http://localhost:4566"
+    kinesis         = "http://localhost:4566"
+    lambda          = "http://localhost:4566"
+    logs            = "http://localhost:4566"
+    rds             = "http://localhost:4566"
+    route53         = "http://localhost:4566"
+    s3              = "http://localhost:4566"
+    s3control       = "http://localhost:4566"
+    secretsmanager  = "http://localhost:4566"
+    ses             = "http://localhost:4566"
+    sesv2           = "http://localhost:4566"
+    sns             = "http://localhost:4566"
+    sqs             = "http://localhost:4566"
+    ssm             = "http://localhost:4566"
+    stepfunctions   = "http://localhost:4566"
+    sts             = "http://localhost:4566"
+    wafv2           = "http://localhost:4566"
   }
 }
 ```
@@ -620,6 +629,10 @@ config:
       # ... etc
 ```
 
+### Testcontainers (Java / Go)
+
+See [`examples/java-testcontainers`](examples/java-testcontainers) and [`examples/go-testcontainers`](examples/go-testcontainers) for ready-to-run integration tests using Testcontainers with the AWS SDK v2.
+
 ---
 
 ## Comparison
@@ -627,7 +640,7 @@ config:
 | Feature | MiniStack | LocalStack Free | LocalStack Pro |
 |---------|-----------|-----------------|----------------|
 | S3, SQS, SNS, DynamoDB | ✅ | ✅ | ✅ |
-| Lambda (Python execution) | ✅ | ✅ | ✅ |
+| Lambda (Python + Node.js execution) | ✅ | ✅ | ✅ |
 | IAM, STS, SecretsManager | ✅ | ✅ | ✅ |
 | CloudWatch Logs | ✅ | ✅ | ✅ |
 | SSM Parameter Store | ✅ | ✅ | ✅ |

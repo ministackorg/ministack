@@ -364,7 +364,10 @@ def _create_security_group(p):
         "VpcId": vpc_id,
         "OwnerId": ACCOUNT_ID,
         "IpPermissions": [],
-        "IpPermissionsEgress": [],
+        "IpPermissionsEgress": [
+            {"IpProtocol": "-1", "IpRanges": [{"CidrIp": "0.0.0.0/0"}],
+             "Ipv6Ranges": [], "PrefixListIds": [], "UserIdGroupPairs": []},
+        ],
     }
     return _xml(200, "CreateSecurityGroupResponse",
                 f"<return>true</return><groupId>{sg_id}</groupId>")
@@ -397,7 +400,9 @@ def _authorize_sg_ingress(p):
     if not sg:
         return _error("InvalidGroup.NotFound", f"Security group {sg_id} not found", 400)
     rules = _parse_ip_permissions(p, "IpPermissions")
-    sg["IpPermissions"].extend(rules)
+    for r in rules:
+        if r not in sg["IpPermissions"]:
+            sg["IpPermissions"].append(r)
     return _xml(200, "AuthorizeSecurityGroupIngressResponse", "<return>true</return>")
 
 
@@ -421,7 +426,9 @@ def _authorize_sg_egress(p):
     if not sg:
         return _error("InvalidGroup.NotFound", f"Security group {sg_id} not found", 400)
     rules = _parse_ip_permissions(p, "IpPermissions")
-    sg["IpPermissionsEgress"].extend(rules)
+    for r in rules:
+        if r not in sg["IpPermissionsEgress"]:
+            sg["IpPermissionsEgress"].append(r)
     return _xml(200, "AuthorizeSecurityGroupEgressResponse", "<return>true</return>")
 
 
@@ -2015,8 +2022,8 @@ def _create_vpc_peering_connection(params):
     _vpc_peering[pcx_id] = record
     inner = f"""<vpcPeeringConnection>
         <vpcPeeringConnectionId>{pcx_id}</vpcPeeringConnectionId>
-        <requesterVpcInfo><vpcId>{vpc_id}</vpcId><ownerId>{ACCOUNT_ID}</ownerId></requesterVpcInfo>
-        <accepterVpcInfo><vpcId>{peer_vpc_id}</vpcId><ownerId>{peer_owner_id}</ownerId></accepterVpcInfo>
+        <requesterVpcInfo><vpcId>{vpc_id}</vpcId><ownerId>{ACCOUNT_ID}</ownerId><region>{REGION}</region></requesterVpcInfo>
+        <accepterVpcInfo><vpcId>{peer_vpc_id}</vpcId><ownerId>{peer_owner_id}</ownerId><region>{peer_region}</region></accepterVpcInfo>
         <status><code>pending-acceptance</code></status>
         <tagSet/>
     </vpcPeeringConnection>"""
@@ -2032,8 +2039,8 @@ def _accept_vpc_peering_connection(params):
     pcx = _vpc_peering[pcx_id]
     inner = f"""<vpcPeeringConnection>
         <vpcPeeringConnectionId>{pcx_id}</vpcPeeringConnectionId>
-        <requesterVpcInfo><vpcId>{pcx['RequesterVpcInfo']['VpcId']}</vpcId></requesterVpcInfo>
-        <accepterVpcInfo><vpcId>{pcx['AccepterVpcInfo']['VpcId']}</vpcId></accepterVpcInfo>
+        <requesterVpcInfo><vpcId>{pcx['RequesterVpcInfo']['VpcId']}</vpcId><ownerId>{pcx['RequesterVpcInfo']['OwnerId']}</ownerId><region>{pcx['RequesterVpcInfo']['Region']}</region></requesterVpcInfo>
+        <accepterVpcInfo><vpcId>{pcx['AccepterVpcInfo']['VpcId']}</vpcId><ownerId>{pcx['AccepterVpcInfo']['OwnerId']}</ownerId><region>{pcx['AccepterVpcInfo']['Region']}</region></accepterVpcInfo>
         <status><code>active</code></status>
         <tagSet/>
     </vpcPeeringConnection>"""
@@ -2051,8 +2058,8 @@ def _describe_vpc_peering_connections(params):
             continue
         items += f"""<item>
             <vpcPeeringConnectionId>{pcx['VpcPeeringConnectionId']}</vpcPeeringConnectionId>
-            <requesterVpcInfo><vpcId>{pcx['RequesterVpcInfo']['VpcId']}</vpcId><ownerId>{pcx['RequesterVpcInfo']['OwnerId']}</ownerId></requesterVpcInfo>
-            <accepterVpcInfo><vpcId>{pcx['AccepterVpcInfo']['VpcId']}</vpcId><ownerId>{pcx['AccepterVpcInfo']['OwnerId']}</ownerId></accepterVpcInfo>
+            <requesterVpcInfo><vpcId>{pcx['RequesterVpcInfo']['VpcId']}</vpcId><ownerId>{pcx['RequesterVpcInfo']['OwnerId']}</ownerId><region>{pcx['RequesterVpcInfo']['Region']}</region></requesterVpcInfo>
+            <accepterVpcInfo><vpcId>{pcx['AccepterVpcInfo']['VpcId']}</vpcId><ownerId>{pcx['AccepterVpcInfo']['OwnerId']}</ownerId><region>{pcx['AccepterVpcInfo']['Region']}</region></accepterVpcInfo>
             <status><code>{pcx['Status']['Code']}</code><message>{pcx['Status']['Message']}</message></status>
             <tagSet/>
         </item>"""
