@@ -7,6 +7,19 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [1.1.21] — 2026-04-02
+
+### Added
+- **S3 → EventBridge notifications** — buckets with `EventBridgeConfiguration` enabled now publish events to the default EventBridge bus on object create/delete/copy; EventBridge rules with `InputTransformer` route and reshape events to downstream targets (SQS, Lambda, etc.)
+
+### Fixed
+- **S3 `PutObject` missing `VersionId` in response** — versioned buckets now return `VersionId` in the `PutObject`, `GetObject`, `HeadObject`, and `CopyObject` responses; each put generates a unique version ID. Reported by @McDoit
+
+### Tests
+- 841 tests total, all passing
+
+---
+
 ## [1.1.20] — 2026-04-02
 
 ### Fixed

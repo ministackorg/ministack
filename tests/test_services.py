@@ -5161,6 +5161,43 @@ def test_s3_event_notification_delete(s3, sqs):
     assert "ObjectRemoved" in body["Records"][0]["eventName"]
 
 
+def test_s3_eventbridge_notification(s3, sqs, eb):
+    """S3 EventBridgeConfiguration sends events to EventBridge, routed to SQS via rule."""
+    s3.create_bucket(Bucket="s3-eb-bkt")
+    queue_url = sqs.create_queue(QueueName="s3-eb-target-q")["QueueUrl"]
+    queue_arn = sqs.get_queue_attributes(
+        QueueUrl=queue_url, AttributeNames=["QueueArn"],
+    )["Attributes"]["QueueArn"]
+
+    # Enable EventBridge on bucket
+    s3.put_bucket_notification_configuration(
+        Bucket="s3-eb-bkt",
+        NotificationConfiguration={"EventBridgeConfiguration": {}},
+    )
+
+    # Create EventBridge rule matching S3 events → SQS target
+    eb.put_rule(
+        Name="s3-to-sqs-rule",
+        EventPattern=json.dumps({"source": ["aws.s3"]}),
+        State="ENABLED",
+    )
+    eb.put_targets(
+        Rule="s3-to-sqs-rule",
+        Targets=[{"Id": "sqs-target", "Arn": queue_arn}],
+    )
+
+    # Upload object — should trigger S3 → EventBridge → SQS
+    s3.put_object(Bucket="s3-eb-bkt", Key="hello.txt", Body=b"world")
+    time.sleep(0.5)
+
+    msgs = sqs.receive_message(QueueUrl=queue_url, MaxNumberOfMessages=10, WaitTimeSeconds=2)
+    assert "Messages" in msgs and len(msgs["Messages"]) > 0
+    body = json.loads(msgs["Messages"][0]["Body"])
+    assert body["source"] == "aws.s3"
+    assert body["detail"]["bucket"]["name"] == "s3-eb-bkt"
+    assert body["detail"]["object"]["key"] == "hello.txt"
+
+
 # ========== S3 ListObjectVersions / Website / Logging ==========
 
 
@@ -7049,6 +7086,27 @@ def test_s3_bucket_versioning(s3):
     )
     resp = s3.get_bucket_versioning(Bucket="intg-s3-versioning")
     assert resp["Status"] == "Enabled"
+
+
+def test_s3_put_object_returns_version_id(s3):
+    s3.create_bucket(Bucket="intg-s3-ver-put")
+    s3.put_bucket_versioning(
+        Bucket="intg-s3-ver-put",
+        VersioningConfiguration={"Status": "Enabled"},
+    )
+    resp = s3.put_object(Bucket="intg-s3-ver-put", Key="hello.txt", Body=b"v1")
+    assert "VersionId" in resp
+    assert len(resp["VersionId"]) > 0
+
+    # Second put should get a different version
+    resp2 = s3.put_object(Bucket="intg-s3-ver-put", Key="hello.txt", Body=b"v2")
+    assert resp2["VersionId"] != resp["VersionId"]
+
+
+def test_s3_put_object_no_version_id_without_versioning(s3):
+    s3.create_bucket(Bucket="intg-s3-nover-put")
+    resp = s3.put_object(Bucket="intg-s3-nover-put", Key="hello.txt", Body=b"data")
+    assert "VersionId" not in resp
 
 
 def test_s3_bucket_encryption(s3):

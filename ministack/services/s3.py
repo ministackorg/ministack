@@ -275,6 +275,8 @@ def _object_response_headers(obj: dict, bucket_name: str = "", key: str = "") ->
     for k, val in obj.get("preserved_headers", {}).items():
         h[k] = val
     h.update(obj.get("metadata", {}))
+    if obj.get("version_id"):
+        h["x-amz-version-id"] = obj["version_id"]
     if bucket_name and key:
         retention = _object_retention.get((bucket_name, key))
         if retention:
@@ -1105,7 +1107,9 @@ def _fire_s3_event(
     """Build and deliver an S3 event notification. Best-effort — errors are logged."""
     try:
         configs = _parse_notification_config(bucket_name)
-        if not configs:
+        raw_xml = _bucket_notifications.get(bucket_name, b"")
+        has_eventbridge = b"EventBridgeConfiguration" in raw_xml
+        if not configs and not has_eventbridge:
             return
 
         short_event = event_name.replace("s3:", "", 1)
@@ -1170,6 +1174,34 @@ def _fire_s3_event(
                 logger.exception(
                     "S3 notification delivery failed for config %s", cfg.get("id")
                 )
+
+        # S3 → EventBridge delivery (if EventBridgeConfiguration is enabled)
+        try:
+            if has_eventbridge:
+                from ministack.services import eventbridge as _eb
+                eb_event = {
+                    "EventId": request_id,
+                    "Source": "aws.s3",
+                    "DetailType": event_name.replace("s3:", "Object ").replace(":", " ").replace("*", ""),
+                    "Detail": json.dumps({
+                        "version": "0",
+                        "bucket": {"name": bucket_name},
+                        "object": {"key": key, "size": size, "etag": clean_etag, "sequencer": "0"},
+                        "request-id": request_id,
+                        "requester": "000000000000",
+                        "source-ip-address": "127.0.0.1",
+                        "reason": "PutObject",
+                    }),
+                    "EventBusName": "default",
+                    "Time": event_time,
+                    "Resources": [f"arn:aws:s3:::{bucket_name}"],
+                    "Account": "000000000000",
+                    "Region": os.environ.get("MINISTACK_REGION", "us-east-1"),
+                }
+                _eb._dispatch_event(eb_event)
+                logger.debug("S3→EventBridge: %s for %s/%s", event_name, bucket_name, key)
+        except Exception:
+            logger.exception("S3→EventBridge delivery failed for %s/%s", bucket_name, key)
 
     except Exception:
         logger.exception(
@@ -1282,7 +1314,12 @@ def _put_object(bucket_name: str, key: str, body: bytes, headers: dict):
         bucket_name, key, "s3:ObjectCreated:Put", size=obj["size"], etag=obj["etag"]
     )
 
-    return 200, {"ETag": obj["etag"]}, b""
+    resp_headers = {"ETag": obj["etag"]}
+    if _bucket_versioning.get(bucket_name) in ("Enabled", "Suspended"):
+        version_id = new_uuid()
+        obj["version_id"] = version_id
+        resp_headers["x-amz-version-id"] = version_id
+    return 200, resp_headers, b""
 
 
 def _apply_object_lock_from_headers(bucket_name: str, key: str, headers: dict):
@@ -1555,10 +1592,16 @@ def _copy_object(bucket_name: str, dest_key: str, headers: dict):
         etag=new_etag,
     )
 
+    resp_headers = {"Content-Type": "application/xml"}
+    if _bucket_versioning.get(bucket_name) in ("Enabled", "Suspended"):
+        version_id = new_uuid()
+        dest_obj["version_id"] = version_id
+        resp_headers["x-amz-version-id"] = version_id
+
     root = Element("CopyObjectResult", xmlns=S3_NS)
     SubElement(root, "LastModified").text = last_modified
     SubElement(root, "ETag").text = new_etag
-    return 200, {"Content-Type": "application/xml"}, _xml_body(root)
+    return 200, resp_headers, _xml_body(root)
 
 
 # ---------------------------------------------------------------------------

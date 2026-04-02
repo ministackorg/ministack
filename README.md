@@ -270,10 +270,10 @@ subnet = ec2.create_subnet(
 
 Unsupported resource types fail with `CREATE_FAILED` (or `ROLLBACK_COMPLETE` if rollback is enabled), so templates with unsupported types won't silently succeed.
 
-### Infrastructure Services (with real Docker execution)
+### Infrastructure Services
 
-| Service | Operations | Real Execution |
-|---------|-----------|----------------|
+| Service | Operations | Notes |
+|---------|-----------|-------|
 | **ECS** | CreateCluster, UpdateCluster, DeleteCluster, DescribeClusters, ListClusters, RegisterTaskDefinition, DeregisterTaskDefinition, DescribeTaskDefinition, ListTaskDefinitions, CreateService, DeleteService, DescribeServices, UpdateService, ListServices, RunTask, StopTask, DescribeTasks, ListTasks, CreateCapacityProvider, DeleteCapacityProvider, DescribeCapacityProviders, PutClusterCapacityProviders, TagResource, UntagResource, ListTagsForResource | `RunTask` starts real Docker containers via Docker socket |
 | **RDS** | CreateDBInstance, DeleteDBInstance, DescribeDBInstances, StartDBInstance, StopDBInstance, RebootDBInstance, ModifyDBInstance, CreateDBCluster, DeleteDBCluster, DescribeDBClusters, StartDBCluster, StopDBCluster, CreateDBSubnetGroup, DescribeDBSubnetGroups, ModifyDBSubnetGroup, DeleteDBSubnetGroup, CreateDBParameterGroup, DescribeDBParameterGroups, ModifyDBParameterGroup, DeleteDBParameterGroup, DescribeDBParameters, CreateDBClusterParameterGroup, DescribeDBEngineVersions, DescribeOrderableDBInstanceOptions, CreateDBSnapshot, DeleteDBSnapshot, DescribeDBSnapshots, CreateDBClusterSnapshot, DeleteDBClusterSnapshot, DescribeDBClusterSnapshots, CreateDBInstanceReadReplica, RestoreDBInstanceFromDBSnapshot, CreateOptionGroup, DescribeOptionGroups, AddTagsToResource, RemoveTagsFromResource, ListTagsForResource | `CreateDBInstance` spins up real Postgres/MySQL Docker container, returns actual `host:port` endpoint |
 | **ElastiCache** | CreateCacheCluster, DeleteCacheCluster, DescribeCacheClusters, ModifyCacheCluster, RebootCacheCluster, CreateReplicationGroup, DeleteReplicationGroup, DescribeReplicationGroups, ModifyReplicationGroup, IncreaseReplicaCount, DecreaseReplicaCount, CreateCacheSubnetGroup, DescribeCacheSubnetGroups, ModifyCacheSubnetGroup, DeleteCacheSubnetGroup, CreateCacheParameterGroup, DescribeCacheParameterGroups, ModifyCacheParameterGroup, ResetCacheParameterGroup, DeleteCacheParameterGroup, DescribeCacheParameters, DescribeCacheEngineVersions, CreateUser, DescribeUsers, DeleteUser, ModifyUser, CreateUserGroup, DescribeUserGroups, DeleteUserGroup, ModifyUserGroup, CreateSnapshot, DeleteSnapshot, DescribeSnapshots, DescribeEvents | `CreateCacheCluster` spins up real Redis/Memcached Docker container |
@@ -547,20 +547,20 @@ pip install boto3 pytest duckdb docker cbor2
 # Start MiniStack
 docker compose up -d
 
-# Run the full test suite (838 tests across all 34 services)
+# Run the full test suite (841 tests across all 34 services)
 pytest tests/ -v
 ```
 
 Expected output:
 
 ```
-collected 838 items
+collected 841 items
 
 tests/test_services.py::test_s3_create_bucket PASSED
 ...
 tests/test_services.py::test_app_asgi_callable PASSED
 
-838 passed in ~100s
+841 passed in ~100s
 ```
 
 ---
