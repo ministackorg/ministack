@@ -2367,10 +2367,65 @@ def _describe_instance_types(p):
                 f"<instanceTypeSet>{items}</instanceTypeSet>")
 
 
+def _describe_instance_credit_specifications(p):
+    instance_ids = _parse_member_list(p, "InstanceId")
+    items = "".join(
+        f"<item><instanceId>{iid}</instanceId><cpuCredits>standard</cpuCredits></item>"
+        for iid in (instance_ids or list(_instances.keys()))
+    )
+    return _xml(200, "DescribeInstanceCreditSpecificationsResponse",
+                f"<instanceCreditSpecificationSet>{items}</instanceCreditSpecificationSet>")
+
+
+def _describe_instance_maintenance_options(p):
+    instance_ids = _parse_member_list(p, "InstanceId")
+    items = "".join(
+        f"<item><instanceId>{iid}</instanceId><autoRecovery>default</autoRecovery></item>"
+        for iid in (instance_ids or list(_instances.keys()))
+    )
+    return _xml(200, "DescribeInstanceMaintenanceOptionsResponse",
+                f"<instanceMaintenanceOptionSet>{items}</instanceMaintenanceOptionSet>")
+
+
+def _describe_instance_auto_recovery_attribute(p):
+    instance_ids = _parse_member_list(p, "InstanceId")
+    items = "".join(
+        f"<item><instanceId>{iid}</instanceId><autoRecovery><value>default</value></autoRecovery></item>"
+        for iid in (instance_ids or list(_instances.keys()))
+    )
+    return _xml(200, "DescribeInstanceAutoRecoveryAttributeResponse",
+                f"<instanceAutoRecoveryAttributeSet>{items}</instanceAutoRecoveryAttributeSet>")
+
+
+def _modify_instance_maintenance_options(p):
+    instance_id = _p(p, "InstanceId")
+    return _xml(200, "ModifyInstanceMaintenanceOptionsResponse",
+                f"<instanceId>{instance_id}</instanceId><autoRecovery>default</autoRecovery>")
+
+
+def _describe_instance_topology(p):
+    return _xml(200, "DescribeInstanceTopologyResponse", "<instanceSet/>")
+
+
+def _describe_spot_instance_requests(p):
+    return _xml(200, "DescribeSpotInstanceRequestsResponse", "<spotInstanceRequestSet/>")
+
+
+def _describe_capacity_reservations(p):
+    return _xml(200, "DescribeCapacityReservationsResponse", "<capacityReservationSet/>")
+
+
 _ACTION_MAP = {
     "RunInstances": _run_instances,
     "DescribeInstances": _describe_instances,
     "DescribeInstanceAttribute": _describe_instance_attribute,
+    "DescribeInstanceCreditSpecifications": _describe_instance_credit_specifications,
+    "DescribeInstanceMaintenanceOptions": _describe_instance_maintenance_options,
+    "DescribeInstanceAutoRecoveryAttribute": _describe_instance_auto_recovery_attribute,
+    "ModifyInstanceMaintenanceOptions": _modify_instance_maintenance_options,
+    "DescribeInstanceTopology": _describe_instance_topology,
+    "DescribeSpotInstanceRequests": _describe_spot_instance_requests,
+    "DescribeCapacityReservations": _describe_capacity_reservations,
     "DescribeInstanceTypes": _describe_instance_types,
     "TerminateInstances": _terminate_instances,
     "StopInstances": _stop_instances,

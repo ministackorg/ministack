@@ -7,6 +7,17 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [1.1.17] — 2026-04-02
+
+### Added
+- **EC2 `DescribeInstanceCreditSpecifications`** — returns `standard` CPU credits; fixes Terraform v6 provider compatibility
+- **EC2 Terraform v6 stubs** — `DescribeInstanceMaintenanceOptions`, `DescribeInstanceAutoRecoveryAttribute`, `ModifyInstanceMaintenanceOptions`, `DescribeInstanceTopology`, `DescribeSpotInstanceRequests`, `DescribeCapacityReservations` all return sensible empty/default responses to prevent Terraform v6 from failing on unknown actions
+
+### Tests
+- 818 tests total, all passing
+
+---
+
 ## [1.1.16] — 2026-04-01
 
 ### Added

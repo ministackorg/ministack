@@ -15415,6 +15415,25 @@ def test_ec2_describe_instance_attribute_not_found(ec2):
     assert exc.value.response["Error"]["Code"] == "InvalidInstanceID.NotFound"
 
 
+def test_ec2_describe_instance_credit_specifications(ec2):
+    iid = ec2.run_instances(ImageId="ami-test", MinCount=1, MaxCount=1)["Instances"][0]["InstanceId"]
+    resp = ec2.describe_instance_credit_specifications(InstanceIds=[iid])
+    specs = resp["InstanceCreditSpecifications"]
+    assert len(specs) == 1
+    assert specs[0]["InstanceId"] == iid
+    assert specs[0]["CpuCredits"] == "standard"
+
+
+def test_ec2_describe_spot_instance_requests(ec2):
+    resp = ec2.describe_spot_instance_requests()
+    assert "SpotInstanceRequests" in resp
+
+
+def test_ec2_describe_capacity_reservations(ec2):
+    resp = ec2.describe_capacity_reservations()
+    assert "CapacityReservations" in resp
+
+
 def test_ec2_describe_instance_types_defaults(ec2):
     resp = ec2.describe_instance_types()
     types = [t["InstanceType"] for t in resp["InstanceTypes"]]
