@@ -42,6 +42,7 @@ from typing import Any
 from urllib.parse import unquote
 
 from ministack.core.responses import error_response_json, json_response, new_uuid
+from ministack.core.lambda_runtime import get_or_create_worker, invalidate_worker
 
 logger = logging.getLogger("lambda")
 
@@ -718,6 +719,7 @@ def _delete_function(name: str, query_params: dict):
         _functions[name]["versions"].pop(qualifier, None)
     else:
         del _functions[name]
+        invalidate_worker(name)
     return 204, {}, b""
 
 
@@ -734,6 +736,12 @@ def _update_code(name: str, data: dict):
         code_zip = base64.b64decode(data["ZipFile"])
     elif "S3Bucket" in data and "S3Key" in data:
         code_zip = _fetch_code_from_s3(data["S3Bucket"], data["S3Key"])
+        if code_zip is None:
+            return error_response_json(
+                "InvalidParameterValueException",
+                f"Failed to fetch code from s3://{data['S3Bucket']}/{data['S3Key']}",
+                400,
+            )
     if code_zip:
         func["code_zip"] = code_zip
         func["config"]["CodeSize"] = len(code_zip)
@@ -743,6 +751,9 @@ def _update_code(name: str, data: dict):
     func["config"]["LastModified"] = _now_iso()
     func["config"]["LastUpdateStatus"] = "Successful"
     func["config"]["RevisionId"] = new_uuid()
+
+    # Invalidate warm worker so next invocation picks up the new code
+    invalidate_worker(name)
 
     if data.get("Publish"):
         ver_num = func["next_version"]
@@ -972,6 +983,8 @@ def _execute_function_docker(func: dict, event: dict) -> dict:
                         lzf.extractall(layer_dir)
                     layers_dirs.append(layer_dir)
 
+            if "." not in handler:
+                return {"body": {"errorMessage": f"Invalid handler format: {handler}", "errorType": "Runtime.InvalidEntrypoint"}, "error": True}
             module_name, func_name = handler.rsplit(".", 1)
 
             # Build volume mounts
@@ -1104,8 +1117,6 @@ def _execute_function(func: dict, event: dict) -> dict:
 
 def _execute_function_warm(func: dict, event: dict) -> dict:
     """Execute a Lambda function using the warm worker pool (Python + Node.js)."""
-    from ministack.core.lambda_runtime import get_or_create_worker
-
     config = func.get("config") or func
     code_zip = func.get("code_zip")
     if not code_zip:
@@ -1180,6 +1191,8 @@ def _execute_function_local(func: dict, event: dict) -> dict:
                         lzf.extractall(layer_dir)
                     layers_dirs.append(layer_dir)
 
+            if "." not in handler:
+                return {"body": {"errorMessage": f"Invalid handler format: {handler}", "errorType": "Runtime.InvalidEntrypoint"}, "error": True}
             module_name, func_name = handler.rsplit(".", 1)
 
             if is_node:
@@ -1322,7 +1335,7 @@ def _publish_version(name: str, data: dict):
 
     ver_config = copy.deepcopy(func["config"])
     ver_config["Version"] = str(ver_num)
-    ver_config["FunctionArn"] = f"{_func_arn(name)}:{ver_num}"
+    ver_config["FunctionArn"] = _func_arn(name)
     ver_config["RevisionId"] = new_uuid()
     if data.get("Description"):
         ver_config["Description"] = data["Description"]
@@ -2204,6 +2217,7 @@ def _delete_esm(esm_id: str):
 _kinesis_positions: dict = {}
 # Per-ESM DynamoDB stream tracking: esm_uuid -> {shard_id: position}
 _dynamodb_stream_positions: dict = {}
+_dynamodb_stream_positions_lock = threading.Lock()
 
 
 def _ensure_poller():
@@ -2418,14 +2432,15 @@ def _poll_dynamodb_streams():
             continue
 
         esm_id = esm["UUID"]
-        if esm_id not in _dynamodb_stream_positions:
-            starting = esm.get("StartingPosition", "LATEST")
-            if starting == "TRIM_HORIZON":
-                _dynamodb_stream_positions[esm_id] = 0
-            else:
-                _dynamodb_stream_positions[esm_id] = len(table_records)
+        with _dynamodb_stream_positions_lock:
+            if esm_id not in _dynamodb_stream_positions:
+                starting = esm.get("StartingPosition", "LATEST")
+                if starting == "TRIM_HORIZON":
+                    _dynamodb_stream_positions[esm_id] = 0
+                else:
+                    _dynamodb_stream_positions[esm_id] = len(table_records)
+            pos = _dynamodb_stream_positions[esm_id]
 
-        pos = _dynamodb_stream_positions[esm_id]
         batch_size = esm.get("BatchSize", 100)
         batch = table_records[pos:pos + batch_size]
         if not batch:
@@ -2444,7 +2459,8 @@ def _poll_dynamodb_streams():
                 func_name, table_name, err_type, err_msg, result.get("log", ""),
             )
         else:
-            _dynamodb_stream_positions[esm_id] = pos + len(batch)
+            with _dynamodb_stream_positions_lock:
+                _dynamodb_stream_positions[esm_id] = pos + len(batch)
             esm["LastProcessingResult"] = f"OK - {len(batch)} records"
             logger.info(
                 "ESM: Lambda %s processed %d DynamoDB stream records from %s",
@@ -2470,7 +2486,7 @@ def _create_function_url_config(func_name: str, data: dict, qualifier: str | Non
             "ResourceConflictException", f"Function URL config already exists for {func_name}", 409
         )
     cfg = {
-        "FunctionUrl": f"https://{new_uuid()}.lambda-url.us-east-1.on.aws/",
+        "FunctionUrl": f"https://{new_uuid()}.lambda-url.{REGION}.on.aws/",
         "FunctionArn": _func_arn(func_name),
         "AuthType": data.get("AuthType", "NONE"),
         "Cors": data.get("Cors", {}),

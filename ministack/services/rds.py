@@ -99,7 +99,7 @@ def _create_db_instance(p):
     if not db_id:
         return _error("MissingParameter", "DBInstanceIdentifier is required", 400)
     if db_id in _instances:
-        return _error("DBInstanceAlreadyExists", f"DB instance {db_id} already exists", 400)
+        return _error("DBInstanceAlreadyExistsFault", f"DB instance {db_id} already exists", 400)
 
     engine = _p(p, "Engine") or "postgres"
     engine_version = _p(p, "EngineVersion") or _default_engine_version(engine)
@@ -407,7 +407,7 @@ def _create_read_replica(p):
     if not source:
         return _error("DBInstanceNotFound", f"DBInstance {source_id} not found.", 404)
     if replica_id in _instances:
-        return _error("DBInstanceAlreadyExists", f"DBInstance {replica_id} already exists.", 400)
+        return _error("DBInstanceAlreadyExistsFault", f"DBInstance {replica_id} already exists.", 400)
 
     arn = f"arn:aws:rds:{REGION}:{ACCOUNT_ID}:db:{replica_id}"
     replica = dict(source)
@@ -448,7 +448,7 @@ def _restore_from_snapshot(p):
     snap_id = _p(p, "DBSnapshotIdentifier")
 
     if db_id in _instances:
-        return _error("DBInstanceAlreadyExists", f"DBInstance {db_id} already exists.", 400)
+        return _error("DBInstanceAlreadyExistsFault", f"DBInstance {db_id} already exists.", 400)
 
     snap = _snapshots.get(snap_id)
     if not snap:

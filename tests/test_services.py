@@ -80,6 +80,36 @@ def test_s3_put_object_no_bucket(s3):
     assert exc.value.response["Error"]["Code"] == "NoSuchBucket"
 
 
+def test_s3_put_get_json_chunked(s3):
+    """AWS SDK v2 sends PutObject with chunked Transfer-Encoding — body must be decoded cleanly."""
+    import urllib.request, urllib.parse, json as _json
+    bucket = "intg-s3-chunked"
+    s3.create_bucket(Bucket=bucket)
+
+    payload = _json.dumps({"hello": "world", "number": 42})
+    # Simulate AWS chunked encoding: one chunk + terminator
+    chunk_body = payload.encode()
+    chunk_size = f"{len(chunk_body):x}".encode()
+    fake_sig = b"abc123"
+    chunked = (
+        chunk_size + b";chunk-signature=" + fake_sig + b"\r\n" +
+        chunk_body + b"\r\n" +
+        b"0;chunk-signature=" + fake_sig + b"\r\n\r\n"
+    )
+    endpoint = "http://localhost:4566/" + bucket + "/test.json"
+    req = urllib.request.Request(endpoint, data=chunked, method="PUT", headers={
+        "x-amz-content-sha256": "STREAMING-AWS4-HMAC-SHA256-PAYLOAD",
+        "Content-Type": "application/json",
+        "Authorization": "AWS4-HMAC-SHA256 Credential=test/20240101/us-east-1/s3/aws4_request, SignedHeaders=host, Signature=fake",
+    })
+    with urllib.request.urlopen(req) as r:
+        assert r.status == 200
+
+    resp = s3.get_object(Bucket=bucket, Key="test.json")
+    body = resp["Body"].read().decode()
+    assert _json.loads(body) == {"hello": "world", "number": 42}
+
+
 def test_s3_head_object(s3):
     s3.create_bucket(Bucket="intg-s3-headobj")
     s3.put_object(
@@ -349,6 +379,31 @@ def test_s3_control_list_tags_for_resource(s3):
     resp = s3control.list_tags_for_resource(AccountId=account_id, ResourceArn=arn)
     tags = {t["Key"]: t["Value"] for t in resp.get("Tags", [])}
     assert tags.get("name") == "ministack-test"
+
+
+def test_s3_control_list_tags_via_s3_control_host(s3):
+    """S3 Control requests via s3-control.localhost host must not be intercepted by S3 vhost."""
+    import urllib.request, urllib.parse
+    bkt = "intg-s3control-host"
+    s3.create_bucket(Bucket=bkt)
+    s3.put_bucket_tagging(
+        Bucket=bkt,
+        Tagging={"TagSet": [{"Key": "env", "Value": "test"}]},
+    )
+    arn = urllib.parse.quote(f"arn:aws:s3:::{bkt}", safe="")
+    req = urllib.request.Request(
+        f"http://localhost:4566/v20180820/tags/{arn}",
+        method="GET",
+        headers={
+            "x-amz-account-id": "000000000000",
+            "Host": "s3-control.localhost:4566",
+        },
+    )
+    with urllib.request.urlopen(req) as r:
+        assert r.status == 200
+        body = r.read().decode()
+    assert "env" in body
+    assert "test" in body
 
 
 def test_s3_bucket_policy(s3):
@@ -1265,21 +1320,31 @@ def test_sns_subscription_attributes(sns):
     assert resp["Attributes"]["RawMessageDelivery"] == "true"
 
 
-def test_sns_subscribe_with_attributes(sns):
-    arn = sns.create_topic(Name="intg-sns-subwithattr")["TopicArn"]
+def test_sns_subscribe_with_raw_message_delivery(sns):
+    arn = sns.create_topic(Name="intg-sns-sub-raw")["TopicArn"]
     sub = sns.subscribe(
         TopicArn=arn,
-        Protocol="sqs",
-        Endpoint="arn:aws:sqs:us-east-1:000000000000:intg-sns-subwithattr-q",
-        Attributes={
-            "RawMessageDelivery": "true",
-            "FilterPolicy": json.dumps({"event": ["OrderCreated"]}),
-        },
+        Protocol="email",
+        Endpoint="raw@example.com",
+        Attributes={"RawMessageDelivery": "true"},
     )
     sub_arn = sub["SubscriptionArn"]
-    resp = sns.get_subscription_attributes(SubscriptionArn=sub_arn)
-    assert resp["Attributes"]["RawMessageDelivery"] == "true"
-    assert json.loads(resp["Attributes"]["FilterPolicy"]) == {"event": ["OrderCreated"]}
+    attrs = sns.get_subscription_attributes(SubscriptionArn=sub_arn)["Attributes"]
+    assert attrs["RawMessageDelivery"] == "true"
+
+
+def test_sns_subscribe_with_filter_policy(sns):
+    arn = sns.create_topic(Name="intg-sns-sub-filter")["TopicArn"]
+    filter_policy = json.dumps({"event": ["MyEvent"]})
+    sub = sns.subscribe(
+        TopicArn=arn,
+        Protocol="email",
+        Endpoint="filter@example.com",
+        Attributes={"FilterPolicy": filter_policy},
+    )
+    sub_arn = sub["SubscriptionArn"]
+    attrs = sns.get_subscription_attributes(SubscriptionArn=sub_arn)["Attributes"]
+    assert attrs["FilterPolicy"] == filter_policy
 
 
 def test_sns_sqs_fanout_raw_message_delivery(sns, sqs):
@@ -6091,6 +6156,182 @@ def test_lambda_nodejs_update_code(lam):
     assert resp["StatusCode"] == 200
     payload = json.loads(resp["Payload"].read())
     assert payload["body"] == "v2"
+
+
+# ========== Lambda — S3 code fetch ==========
+
+def test_lambda_create_from_s3(lam, s3):
+    bucket = "lambda-code-bucket"
+    s3.create_bucket(Bucket=bucket)
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("index.py", "def handler(event, context): return {'s3': True}")
+    s3.put_object(Bucket=bucket, Key="fn.zip", Body=buf.getvalue())
+
+    lam.create_function(
+        FunctionName="lam-s3-code",
+        Runtime="python3.11",
+        Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"S3Bucket": bucket, "S3Key": "fn.zip"},
+    )
+    resp = lam.invoke(FunctionName="lam-s3-code", Payload=b"{}")
+    assert resp["StatusCode"] == 200
+    assert json.loads(resp["Payload"].read())["s3"] is True
+
+
+def test_lambda_update_code_from_s3(lam, s3):
+    bucket = "lambda-code-bucket"
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("index.py", "def handler(event, context): return {'v': 's3v2'}")
+    s3.put_object(Bucket=bucket, Key="fn-v2.zip", Body=buf.getvalue())
+
+    lam.update_function_code(
+        FunctionName="lam-s3-code",
+        S3Bucket=bucket,
+        S3Key="fn-v2.zip",
+    )
+    resp = lam.invoke(FunctionName="lam-s3-code", Payload=b"{}")
+    assert json.loads(resp["Payload"].read())["v"] == "s3v2"
+
+
+def test_lambda_update_code_s3_missing_returns_error(lam):
+    from botocore.exceptions import ClientError
+    with pytest.raises(ClientError) as exc:
+        lam.update_function_code(
+            FunctionName="lam-s3-code",
+            S3Bucket="lambda-code-bucket",
+            S3Key="does-not-exist.zip",
+        )
+    assert exc.value.response["Error"]["Code"] == "InvalidParameterValueException"
+
+
+# ========== Lambda — versioning ==========
+
+def test_lambda_publish_version(lam):
+    code = "def handler(event, context): return {'ver': 1}"
+    lam.create_function(
+        FunctionName="lam-versioned",
+        Runtime="python3.11",
+        Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _make_zip(code)},
+        Publish=True,
+    )
+    resp = lam.list_versions_by_function(FunctionName="lam-versioned")
+    versions = [v["Version"] for v in resp["Versions"]]
+    assert "$LATEST" in versions
+    assert any(v != "$LATEST" for v in versions)
+
+
+def test_lambda_update_code_publish_version(lam):
+    # Ensure function exists (may have been cleaned up)
+    try:
+        lam.get_function(FunctionName="lam-versioned")
+    except Exception:
+        lam.create_function(
+            FunctionName="lam-versioned",
+            Runtime="python3.11",
+            Role=_LAMBDA_ROLE,
+            Handler="index.handler",
+            Code={"ZipFile": _make_zip("def handler(event, context): return {'ver': 1}")},
+            Publish=True,
+        )
+    v2 = "def handler(event, context): return {'ver': 2}"
+    lam.update_function_code(
+        FunctionName="lam-versioned",
+        ZipFile=_make_zip(v2),
+        Publish=True,
+    )
+    resp = lam.list_versions_by_function(FunctionName="lam-versioned")
+    versions = [v["Version"] for v in resp["Versions"] if v["Version"] != "$LATEST"]
+    assert len(versions) >= 1
+
+
+# ========== Lambda — Node.js promise and callback handlers ==========
+
+def test_lambda_nodejs_promise_handler(lam):
+    code = (
+        "exports.handler = (event) => Promise.resolve({ promise: true, val: event.x });"
+    )
+    lam.create_function(
+        FunctionName="lam-node-promise",
+        Runtime="nodejs20.x",
+        Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _make_zip_js(code, "index.js")},
+    )
+    resp = lam.invoke(FunctionName="lam-node-promise", Payload=json.dumps({"x": 42}))
+    payload = json.loads(resp["Payload"].read())
+    assert payload["promise"] is True
+    assert payload["val"] == 42
+
+
+def test_lambda_nodejs_callback_handler(lam):
+    code = (
+        "exports.handler = (event, context, cb) => cb(null, { cb: true, val: event.y });"
+    )
+    lam.create_function(
+        FunctionName="lam-node-cb",
+        Runtime="nodejs20.x",
+        Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _make_zip_js(code, "index.js")},
+    )
+    resp = lam.invoke(FunctionName="lam-node-cb", Payload=json.dumps({"y": 7}))
+    payload = json.loads(resp["Payload"].read())
+    assert payload["cb"] is True
+    assert payload["val"] == 7
+
+
+# ========== Lambda — DynamoDB Streams ESM ==========
+
+def test_lambda_dynamodb_stream_esm(lam, ddb):
+    # Create table with streams enabled
+    ddb.create_table(
+        TableName="stream-test-table",
+        KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+        AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "S"}],
+        BillingMode="PAY_PER_REQUEST",
+        StreamSpecification={"StreamEnabled": True, "StreamViewType": "NEW_AND_OLD_IMAGES"},
+    )
+    stream_arn = ddb.describe_table(TableName="stream-test-table")["Table"]["LatestStreamArn"]
+
+    # Create Lambda that captures stream records
+    code = "def handler(event, context): return len(event['Records'])"
+    lam.create_function(
+        FunctionName="lam-ddb-stream",
+        Runtime="python3.11",
+        Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _make_zip(code)},
+    )
+
+    esm = lam.create_event_source_mapping(
+        FunctionName="lam-ddb-stream",
+        EventSourceArn=stream_arn,
+        StartingPosition="TRIM_HORIZON",
+        BatchSize=10,
+    )
+    assert esm["EventSourceArn"] == stream_arn
+    assert esm["FunctionArn"].endswith("lam-ddb-stream")
+
+    # Verify ESM is registered and retrievable
+    esm_resp = lam.get_event_source_mapping(UUID=esm["UUID"])
+    assert esm_resp["EventSourceArn"] == stream_arn
+    assert esm_resp["StartingPosition"] == "TRIM_HORIZON"
+
+    # Write items — stream should capture them
+    ddb.put_item(TableName="stream-test-table", Item={"pk": {"S": "k1"}, "val": {"S": "v1"}})
+    ddb.put_item(TableName="stream-test-table", Item={"pk": {"S": "k2"}, "val": {"S": "v2"}})
+    ddb.delete_item(TableName="stream-test-table", Key={"pk": {"S": "k1"}})
+
+    # Verify table still has expected state
+    scan = ddb.scan(TableName="stream-test-table")
+    pks = [item["pk"]["S"] for item in scan["Items"]]
+    assert "k2" in pks
+    assert "k1" not in pks
 
 
 # ========== API Gateway execute-api data plane ==========
@@ -11526,6 +11767,44 @@ def test_kinesis_stream_encryption(kin):
     )
     desc2 = kin.describe_stream(StreamName="qa-kin-enc")["StreamDescription"]
     assert desc2["EncryptionType"] == "NONE"
+
+
+# ── Kinesis validation limits ────────────────────────────────────────────────
+
+def test_kinesis_put_record_oversized(kin):
+    kin.create_stream(StreamName="kin-limits", ShardCount=1)
+    from botocore.exceptions import ClientError
+    with pytest.raises(ClientError) as exc:
+        kin.put_record(StreamName="kin-limits", Data=b"x" * (1024 * 1024 + 1), PartitionKey="pk")
+    assert "1048576" in str(exc.value)
+
+
+def test_kinesis_put_record_partition_key_too_long(kin):
+    from botocore.exceptions import ClientError
+    with pytest.raises(ClientError) as exc:
+        kin.put_record(StreamName="kin-limits", Data=b"ok", PartitionKey="k" * 257)
+    assert "256" in str(exc.value)
+
+
+def test_kinesis_put_records_batch_over_500(kin):
+    from botocore.exceptions import ClientError
+    with pytest.raises(ClientError) as exc:
+        kin.put_records(
+            StreamName="kin-limits",
+            Records=[{"Data": b"x", "PartitionKey": "pk"} for _ in range(501)],
+        )
+    assert "500" in str(exc.value)
+
+
+def test_kinesis_put_records_total_payload_over_5mb(kin):
+    from botocore.exceptions import ClientError
+    # 6 records of ~1MB each = ~6MB > 5MB limit
+    with pytest.raises(ClientError) as exc:
+        kin.put_records(
+            StreamName="kin-limits",
+            Records=[{"Data": b"x" * (1024 * 1024), "PartitionKey": "pk"} for _ in range(6)],
+        )
+    assert "5 MB" in str(exc.value)
 
 
 # ---------------------------------------------------------------------------

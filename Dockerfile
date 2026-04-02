@@ -4,7 +4,7 @@ LABEL maintainer="MiniStack" \
       description="Local AWS Service Emulator — drop-in LocalStack replacement"
 
 # Upgrade base packages to pick up latest security patches.
-RUN apk upgrade --no-cache && rm -f /usr/bin/wget /bin/wget
+RUN apk upgrade --no-cache && apk add --no-cache nodejs && rm -f /usr/bin/wget /bin/wget
 
 WORKDIR /opt/ministack
 
