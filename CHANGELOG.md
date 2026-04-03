@@ -10,6 +10,13 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- **AWS Bedrock** (4 services, 58 operations) — Full Bedrock emulation with local LLM inference via Ollama + LiteLLM and vector storage via pgvector:
+  - **Bedrock (control plane)** — ListFoundationModels, GetFoundationModel, ListInferenceProfiles, GetInferenceProfile, CreateGuardrail, GetGuardrail, ListGuardrails, UpdateGuardrail, DeleteGuardrail, CreateGuardrailVersion, ListCustomModels, GetCustomModel, CreateModelInvocationJob, GetModelInvocationJob, ListModelInvocationJobs, PutModelInvocationLoggingConfiguration, GetModelInvocationLoggingConfiguration, TagResource, UntagResource, ListTagsForResource
+  - **Bedrock Runtime** — Converse, InvokeModel (Anthropic/Titan/Llama formats), ApplyGuardrail (regex + dynamic), CountTokens, StartAsyncInvoke, GetAsyncInvoke, ListAsyncInvokes
+  - **Bedrock Agent** — CreateAgent, GetAgent, ListAgents, UpdateAgent, DeleteAgent, PrepareAgent, CreateAgentAlias, GetAgentAlias, ListAgentAliases, UpdateAgentAlias, DeleteAgentAlias, CreateKnowledgeBase, GetKnowledgeBase, ListKnowledgeBases, UpdateKnowledgeBase, DeleteKnowledgeBase, CreateDataSource, GetDataSource, ListDataSources, UpdateDataSource, DeleteDataSource, StartIngestionJob, GetIngestionJob, ListIngestionJobs, StopIngestionJob, GetKnowledgeBaseDocuments, ListKnowledgeBaseDocuments, DeleteKnowledgeBaseDocuments
+  - **Bedrock Agent Runtime** — Retrieve (semantic vector search), RetrieveAndGenerate (RAG with citations), Rerank (document reranking via embeddings)
+  - Model mapping config at `config/bedrock_models.yaml` (maps Bedrock model IDs to local Ollama models)
+  - Docker Compose stack: ollama (LLM), litellm (proxy), pgvector (vector DB)
 - **KMS service** — CreateKey (RSA_2048, RSA_4096, SYMMETRIC_DEFAULT), ListKeys, DescribeKey, GetPublicKey, Sign, Verify, Encrypt, Decrypt, GenerateDataKey, GenerateDataKeyWithoutPlaintext. In-memory key storage with RSA signing via the `cryptography` package (optional dependency, guarded import). Supports JWT signing flows and S3 SSE-KMS encryption patterns.
 
 ---

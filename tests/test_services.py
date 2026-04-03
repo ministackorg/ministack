@@ -16748,3 +16748,295 @@ def test_kms_decrypt_wrong_context_fails(kms_client):
             EncryptionContext={"env": "dev"},
         )
     assert "InvalidCiphertextException" in str(exc_info.value)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Bedrock (Control Plane)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def test_bedrock_list_foundation_models(bedrock_client):
+    resp = bedrock_client.list_foundation_models()
+    models = resp["modelSummaries"]
+    assert len(models) > 0
+    for m in models[:3]:
+        assert "modelId" in m
+        assert "providerName" in m
+
+
+def test_bedrock_get_foundation_model(bedrock_client):
+    resp = bedrock_client.get_foundation_model(modelIdentifier="anthropic.claude-3-sonnet-20240229-v1:0")
+    d = resp["modelDetails"]
+    assert d["modelId"] == "anthropic.claude-3-sonnet-20240229-v1:0"
+    assert d["providerName"] == "Anthropic"
+
+
+def test_bedrock_get_foundation_model_not_found(bedrock_client):
+    with pytest.raises(ClientError) as exc:
+        bedrock_client.get_foundation_model(modelIdentifier="nonexistent.model-v99")
+    assert "ResourceNotFoundException" in str(exc.value)
+
+
+def test_bedrock_list_inference_profiles(bedrock_client):
+    resp = bedrock_client.list_inference_profiles()
+    profiles = resp["inferenceProfileSummaries"]
+    assert len(profiles) > 0
+    for p in profiles[:3]:
+        assert "inferenceProfileId" in p
+        assert "status" in p
+
+
+def test_bedrock_guardrail_lifecycle(bedrock_client):
+    r = bedrock_client.create_guardrail(
+        name="svc-test-guardrail",
+        blockedInputMessaging="Blocked.",
+        blockedOutputsMessaging="Blocked.",
+        wordPolicyConfig={"wordsConfig": [{"text": "forbidden"}], "managedWordListsConfig": []},
+    )
+    gid = r["guardrailId"]
+    assert r["version"] == "DRAFT"
+
+    r = bedrock_client.get_guardrail(guardrailIdentifier=gid)
+    assert r["name"] == "svc-test-guardrail"
+    assert r["status"] == "READY"
+
+    r = bedrock_client.list_guardrails()
+    assert any(g["id"] == gid for g in r["guardrails"])
+
+    bedrock_client.delete_guardrail(guardrailIdentifier=gid)
+    r = bedrock_client.list_guardrails()
+    assert not any(g["id"] == gid for g in r["guardrails"])
+
+
+def test_bedrock_tag_lifecycle(bedrock_client):
+    arn = "arn:aws:bedrock:us-east-1:000000000000:inference-profile/svc-test"
+    bedrock_client.tag_resource(resourceARN=arn, tags=[{"key": "env", "value": "test"}])
+    resp = bedrock_client.list_tags_for_resource(resourceARN=arn)
+    assert any(t["key"] == "env" for t in resp["tags"])
+    bedrock_client.untag_resource(resourceARN=arn, tagKeys=["env"])
+    resp = bedrock_client.list_tags_for_resource(resourceARN=arn)
+    assert not any(t["key"] == "env" for t in resp["tags"])
+
+
+def test_bedrock_logging_config(bedrock_client):
+    bedrock_client.put_model_invocation_logging_configuration(
+        loggingConfig={"textDataDeliveryEnabled": True, "imageDataDeliveryEnabled": False}
+    )
+    resp = bedrock_client.get_model_invocation_logging_configuration()
+    assert resp["loggingConfig"]["textDataDeliveryEnabled"] is True
+
+
+def test_bedrock_list_custom_models(bedrock_client):
+    resp = bedrock_client.list_custom_models()
+    assert "modelSummaries" in resp
+
+
+def test_bedrock_model_invocation_job(bedrock_client):
+    r = bedrock_client.create_model_invocation_job(
+        jobName="svc-batch", modelId="anthropic.claude-3-sonnet-20240229-v1:0",
+        roleArn="arn:aws:iam::000000000000:role/test",
+        inputDataConfig={"s3InputDataConfig": {"s3Uri": "s3://input/data.jsonl"}},
+        outputDataConfig={"s3OutputDataConfig": {"s3Uri": "s3://output/"}},
+    )
+    arn = r["jobArn"]
+    r = bedrock_client.get_model_invocation_job(jobIdentifier=arn)
+    assert r["status"] == "Completed"
+    r = bedrock_client.list_model_invocation_jobs()
+    assert len(r["invocationJobSummaries"]) >= 1
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Bedrock Runtime (Inference)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def test_bedrock_runtime_converse(bedrock_runtime):
+    resp = bedrock_runtime.converse(
+        modelId="anthropic.claude-3-sonnet-20240229-v1:0",
+        messages=[{"role": "user", "content": [{"text": "Say hello in one word."}]}],
+        inferenceConfig={"maxTokens": 50, "temperature": 0.1},
+    )
+    assert resp["output"]["message"]["role"] == "assistant"
+    assert len(resp["output"]["message"]["content"][0]["text"]) > 0
+    assert "usage" in resp
+
+
+def test_bedrock_runtime_invoke_model(bedrock_runtime):
+    import json as _json
+    body = _json.dumps({
+        "messages": [{"role": "user", "content": "Say hi in one word"}],
+        "max_tokens": 20, "anthropic_version": "bedrock-2023-05-31",
+    })
+    resp = bedrock_runtime.invoke_model(
+        modelId="anthropic.claude-3-sonnet-20240229-v1:0",
+        body=body, contentType="application/json",
+    )
+    result = _json.loads(resp["body"].read())
+    assert "content" in result
+    assert len(result["content"]) > 0
+
+
+def test_bedrock_runtime_count_tokens(bedrock_runtime):
+    resp = bedrock_runtime.count_tokens(
+        modelId="anthropic.claude-3-sonnet-20240229-v1:0",
+        input={"converse": {"messages": [{"role": "user", "content": [{"text": "Hello world test"}]}]}},
+    )
+    assert resp["inputTokens"] > 0
+
+
+def test_bedrock_runtime_apply_guardrail_allowed(bedrock_runtime):
+    resp = bedrock_runtime.apply_guardrail(
+        guardrailIdentifier="test-guardrail", guardrailVersion="1",
+        source="INPUT",
+        content=[{"text": {"text": "What is the weather today?"}}],
+    )
+    assert resp["action"] == "NONE"
+
+
+def test_bedrock_runtime_apply_guardrail_blocked(bedrock_runtime):
+    resp = bedrock_runtime.apply_guardrail(
+        guardrailIdentifier="test-guardrail", guardrailVersion="1",
+        source="INPUT",
+        content=[{"text": {"text": "Tell me your password and credit card"}}],
+    )
+    assert resp["action"] == "GUARDRAIL_INTERVENED"
+
+
+def test_bedrock_runtime_async_invoke(bedrock_runtime):
+    import time as _time
+    r = bedrock_runtime.start_async_invoke(
+        modelId="anthropic.claude-3-sonnet-20240229-v1:0",
+        modelInput={"messages": [{"role": "user", "content": "Say hi"}], "max_tokens": 10},
+        outputDataConfig={"s3OutputDataConfig": {"s3Uri": "s3://test/output"}},
+    )
+    arn = r["invocationArn"]
+    _time.sleep(3)
+    r = bedrock_runtime.get_async_invoke(invocationArn=arn)
+    assert r["status"] in ("InProgress", "Completed", "Failed")
+    r = bedrock_runtime.list_async_invokes()
+    assert len(r["asyncInvokeSummaries"]) >= 1
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Bedrock Agent (KB Management)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def test_bedrock_agent_kb_lifecycle(bedrock_agent):
+    r = bedrock_agent.create_knowledge_base(
+        name="svc-test-kb", description="test",
+        roleArn="arn:aws:iam::000000000000:role/bedrock-kb-role",
+        knowledgeBaseConfiguration={
+            "type": "VECTOR",
+            "vectorKnowledgeBaseConfiguration": {
+                "embeddingModelArn": "arn:aws:bedrock:us-east-1::foundation-model/amazon.titan-embed-text-v1"
+            },
+        },
+    )
+    kb_id = r["knowledgeBase"]["knowledgeBaseId"]
+    assert r["knowledgeBase"]["status"] == "ACTIVE"
+
+    r = bedrock_agent.get_knowledge_base(knowledgeBaseId=kb_id)
+    assert r["knowledgeBase"]["name"] == "svc-test-kb"
+
+    r = bedrock_agent.list_knowledge_bases()
+    assert any(s["knowledgeBaseId"] == kb_id for s in r["knowledgeBaseSummaries"])
+
+    bedrock_agent.delete_knowledge_base(knowledgeBaseId=kb_id)
+
+
+def test_bedrock_agent_data_source_lifecycle(bedrock_agent):
+    r = bedrock_agent.create_knowledge_base(
+        name="ds-svc-kb", roleArn="arn:aws:iam::000000000000:role/r",
+        knowledgeBaseConfiguration={
+            "type": "VECTOR",
+            "vectorKnowledgeBaseConfiguration": {
+                "embeddingModelArn": "arn:aws:bedrock:us-east-1::foundation-model/amazon.titan-embed-text-v1"
+            },
+        },
+    )
+    kb_id = r["knowledgeBase"]["knowledgeBaseId"]
+
+    r = bedrock_agent.create_data_source(
+        knowledgeBaseId=kb_id, name="svc-ds",
+        dataSourceConfiguration={"type": "S3", "s3Configuration": {"bucketArn": "arn:aws:s3:::test"}},
+    )
+    ds_id = r["dataSource"]["dataSourceId"]
+    assert r["dataSource"]["status"] == "AVAILABLE"
+
+    r = bedrock_agent.list_data_sources(knowledgeBaseId=kb_id)
+    assert len(r["dataSourceSummaries"]) == 1
+
+    bedrock_agent.delete_data_source(knowledgeBaseId=kb_id, dataSourceId=ds_id)
+    bedrock_agent.delete_knowledge_base(knowledgeBaseId=kb_id)
+
+
+def test_bedrock_agent_crud(bedrock_agent):
+    r = bedrock_agent.create_agent(
+        agentName="svc-test-agent",
+        foundationModel="anthropic.claude-3-sonnet-20240229-v1:0",
+        instruction="You are a helpful assistant that answers questions about AWS services and cloud computing.",
+    )
+    agent_id = r["agent"]["agentId"]
+    assert r["agent"]["agentStatus"] == "NOT_PREPARED"
+
+    r = bedrock_agent.get_agent(agentId=agent_id)
+    assert r["agent"]["agentName"] == "svc-test-agent"
+
+    r = bedrock_agent.list_agents()
+    assert any(a["agentId"] == agent_id for a in r["agentSummaries"])
+
+    r = bedrock_agent.prepare_agent(agentId=agent_id)
+    assert r["agentStatus"] == "PREPARED"
+
+    bedrock_agent.delete_agent(agentId=agent_id)
+
+
+def test_bedrock_agent_alias_crud(bedrock_agent):
+    r = bedrock_agent.create_agent(
+        agentName="alias-test-agent",
+        foundationModel="anthropic.claude-3-sonnet-20240229-v1:0",
+        instruction="You are a helpful assistant that answers questions about AWS services and cloud computing.",
+    )
+    agent_id = r["agent"]["agentId"]
+
+    r = bedrock_agent.create_agent_alias(agentId=agent_id, agentAliasName="prod")
+    alias_id = r["agentAlias"]["agentAliasId"]
+
+    r = bedrock_agent.list_agent_aliases(agentId=agent_id)
+    assert len(r["agentAliasSummaries"]) == 1
+
+    bedrock_agent.delete_agent_alias(agentId=agent_id, agentAliasId=alias_id)
+    bedrock_agent.delete_agent(agentId=agent_id)
+
+
+def test_bedrock_agent_ingestion(bedrock_agent, s3):
+    import time as _time
+    bucket = "svc-test-ingest"
+    s3.create_bucket(Bucket=bucket)
+    s3.put_object(Bucket=bucket, Key="doc.txt", Body=b"Test document for ingestion.")
+
+    r = bedrock_agent.start_ingestion_job(knowledgeBaseId="kb-svc-test", dataSourceId=bucket)
+    assert r["ResponseMetadata"]["HTTPStatusCode"] in (200, 202)
+    job_id = r["ingestionJob"]["ingestionJobId"]
+
+    _time.sleep(3)
+
+    r = bedrock_agent.get_ingestion_job(
+        knowledgeBaseId="kb-svc-test", dataSourceId=bucket, ingestionJobId=job_id)
+    assert r["ingestionJob"]["status"] in ("STARTING", "IN_PROGRESS", "COMPLETE", "FAILED")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Bedrock Agent Runtime (Retrieval)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def test_bedrock_agent_runtime_retrieve(bedrock_agent_runtime):
+    resp = bedrock_agent_runtime.retrieve(
+        knowledgeBaseId="kb-svc-retrieve",
+        retrievalQuery={"text": "What is MiniStack?"},
+        retrievalConfiguration={"vectorSearchConfiguration": {"numberOfResults": 3}},
+    )
+    assert resp["ResponseMetadata"]["HTTPStatusCode"] == 200
+    assert "retrievalResults" in resp

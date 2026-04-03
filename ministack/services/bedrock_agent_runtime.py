@@ -380,3 +380,8 @@ async def _rerank(body: bytes):
 def reset():
     """Clear all in-memory state (pgvector data persists separately)."""
     pass
+
+
+def get_state():
+    """Return serializable state for persistence."""
+    return {}

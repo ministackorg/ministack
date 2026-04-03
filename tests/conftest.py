@@ -206,6 +206,8 @@ def bedrock_agent():
 @pytest.fixture(scope="session")
 def bedrock_agent_runtime():
     return make_client("bedrock-agent-runtime")
+
+@pytest.fixture(scope="session")
 def kms_client():
     return make_client("kms")
 

@@ -9,14 +9,18 @@ RUN apk upgrade --no-cache && apk add --no-cache nodejs && rm -f /usr/bin/wget /
 WORKDIR /opt/ministack
 
 # Install all Python dependencies.
-RUN pip install --no-cache-dir --upgrade pip && \
+# cryptography needs build deps on Alpine — install, build, then remove to keep image small.
+RUN apk add --no-cache --virtual .build-deps gcc musl-dev libffi-dev openssl-dev && \
+    pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir \
         uvicorn==0.30.6 \
         "cbor2>=5.4.0" \
         "docker>=7.0.0" \
         "pyyaml==6.0.3" \
         "aiohttp==3.13.5" \
-        "asyncpg==0.31.0"
+        "asyncpg==0.31.0" \
+        "cryptography>=41.0" && \
+    apk del .build-deps
 
 COPY ministack/ ministack/
 COPY config/ config/

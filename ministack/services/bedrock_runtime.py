@@ -572,3 +572,9 @@ def reset():
     _guardrails.clear()
     with _async_lock:
         _async_invocations.clear()
+
+
+def get_state():
+    """Return serializable state for persistence."""
+    return {"async_invocations": {k: {kk: vv for kk, vv in v.items() if not kk.startswith("_")}
+                                  for k, v in _async_invocations.items()}}

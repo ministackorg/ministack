@@ -575,3 +575,9 @@ async def handle_request(method, path, headers, body, query_params):
 
 def reset():
     _keys.clear()
+
+
+def get_state():
+    """Return serializable state for persistence."""
+    return {"keys": {k: {kk: vv for kk, vv in v.items() if kk != "_private_key"}
+                     for k, v in _keys.items()}}
