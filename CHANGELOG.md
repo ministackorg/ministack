@@ -7,6 +7,13 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [Unreleased]
+
+### Added
+- **KMS service** — CreateKey (RSA_2048, RSA_4096, SYMMETRIC_DEFAULT), ListKeys, DescribeKey, GetPublicKey, Sign, Verify, Encrypt, Decrypt, GenerateDataKey, GenerateDataKeyWithoutPlaintext. In-memory key storage with RSA signing via the `cryptography` package (optional dependency, guarded import). Supports JWT signing flows and S3 SSE-KMS encryption patterns.
+
+---
+
 ## [1.1.22] — 2026-04-03
 
 ### Added

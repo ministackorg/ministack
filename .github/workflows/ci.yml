@@ -31,7 +31,7 @@ jobs:
           cache: "pip"
 
       - name: Install dependencies
-        run: pip install -r requirements.txt boto3 pytest duckdb docker cbor2 pyyaml
+        run: pip install -r requirements.txt boto3 pytest duckdb docker cbor2 pyyaml cryptography
 
       - name: Start MiniStack
         run: |

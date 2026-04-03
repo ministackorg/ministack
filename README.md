@@ -235,6 +235,7 @@ subnet = ec2.create_subnet(
 | **Bedrock Agent Runtime** | Retrieve, RetrieveAndGenerate, Rerank | Semantic vector search via **pgvector**; RAG with citations; document reranking via embeddings |
 
 > **Bedrock stack**: requires `docker compose up` to start Ollama (local LLMs), LiteLLM (proxy), and pgvector (vector DB). See `config/bedrock_models.yaml` for model mappings (e.g. `anthropic.claude-3-sonnet` → `qwen2.5:3b`). Run `docker exec ministack-ollama ollama pull qwen2.5:3b && docker exec ministack-ollama ollama pull nomic-embed-text` to download models.
+| **KMS** | CreateKey, ListKeys, DescribeKey, GetPublicKey, Sign, Verify, Encrypt, Decrypt, GenerateDataKey, GenerateDataKeyWithoutPlaintext | RSA (2048/4096) and symmetric keys; PKCS1v15 and PSS signing; envelope encryption; requires `cryptography` package (optional) |
 
 ### CloudFormation
 
@@ -524,7 +525,7 @@ Layers that ship npm packages work too — MiniStack resolves the `nodejs/node_m
                     │  │  Athena   Firehose   Route53       │  │
                     │  │  Cognito  EC2   EMR   EBS   EFS    │  │
                     │  │  ALB/ELBv2   ACM   WAF v2          │  │
-                    │  │  CloudFormation                    │  │
+                    │  │  CloudFormation   KMS              │  │
                     │  └────────────────────────────────────┘  │
                     │                                          │
                     │  In-Memory Storage + Optional Docker     │
@@ -678,6 +679,7 @@ See [`examples/java-testcontainers`](examples/java-testcontainers) and [`example
 | **SES v2** | ✅ | ✅ | ✅ |
 | **WAF v2** | ✅ | Paid | ✅ |
 | **CloudFormation** | **partial** | partial | ✅ Free |
+| **KMS** | ✅ | Paid | ✅ Free |
 | Cost | **Free** | Was free, now paid | $35+/mo |
 | Docker image size | ~150MB | ~1GB | ~1GB |
 | Memory at idle | ~30MB | ~500MB | ~500MB |

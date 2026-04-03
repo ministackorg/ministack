@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ministack"
-version = "1.1.22"
+version = "1.1.23"
 description = "Free, open-source local AWS emulator — drop-in LocalStack replacement"
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -33,6 +33,7 @@ full = [
     "docker>=7.0.0",
     "aiohttp>=3.9.0",
     "asyncpg>=0.29.0",
+    "cryptography>=41.0",
 ]
 bedrock = [
     "aiohttp>=3.9.0",
@@ -46,6 +47,7 @@ dev = [
     "docker>=7.0.0",
     "aiohttp>=3.9.0",
     "asyncpg>=0.29.0",
+    "cryptography>=41.0",
     "ruff>=0.4",
 ]
 

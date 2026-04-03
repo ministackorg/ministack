@@ -56,6 +56,7 @@ from ministack.services import (
     firehose,
     glue,
     kinesis,
+    kms,
     lambda_svc,
     rds,
     route53,
@@ -116,6 +117,7 @@ SERVICE_HANDLERS = {
     "bedrock-runtime": bedrock_runtime.handle_request,
     "bedrock-agent": bedrock_agent.handle_request,
     "bedrock-agent-runtime": bedrock_agent_runtime.handle_request,
+    "kms": kms.handle_request,
 }
 
 SERVICE_NAME_ALIASES = {
@@ -169,7 +171,7 @@ BANNER = r"""
  Services: S3, SQS, SNS, DynamoDB, Lambda, IAM, STS, SecretsManager, CloudWatch Logs,
           SSM, EventBridge, Kinesis, CloudWatch, SES, SES v2, ACM, WAF v2, Step Functions,
           ECS, RDS, ElastiCache, Glue, Athena, API Gateway, Firehose, Route53,
-          Cognito, EC2, EMR, EBS, EFS, ALB/ELBv2, CloudFormation,
+          Cognito, EC2, EMR, EBS, EFS, ALB/ELBv2, CloudFormation, KMS
           Bedrock, Bedrock Runtime, Bedrock Agent, Bedrock Agent Runtime
 """
 
@@ -615,6 +617,7 @@ def _reset_all_state():
         (bedrock_runtime, bedrock_runtime.reset),
         (bedrock_agent, bedrock_agent.reset),
         (bedrock_agent_runtime, bedrock_agent_runtime.reset),
+        (kms, kms.reset),
     ]:
         try:
             fn()

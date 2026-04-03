@@ -168,6 +168,10 @@ SERVICE_PATTERNS = {
         "host_patterns": [r"bedrock-agent-runtime\."],
         "path_patterns": [r"^/knowledgebases/.*/retrieve", r"^/rerank"],
     },
+    "kms": {
+        "target_prefixes": ["TrentService"],
+        "host_patterns": [r"kms\."],
+    },
 }
 
 
@@ -232,6 +236,7 @@ def detect_service(method: str, path: str, headers: dict, query_params: dict) ->
                 "bedrock-runtime": "bedrock-runtime",
                 "bedrock-agent": "bedrock-agent",
                 "bedrock-agent-runtime": "bedrock-agent-runtime",
+                "kms": "kms",
             }
             if svc_name in scope_map:
                 return scope_map[svc_name]

@@ -16451,3 +16451,300 @@ def test_cfn_explicit_name_not_overridden(cfn, s3):
 
     cfn.delete_stack(StackName="cfn-explicit-name")
     _wait_stack(cfn, "cfn-explicit-name")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# KMS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def test_kms_create_symmetric_key(kms_client):
+    resp = kms_client.create_key(
+        KeySpec="SYMMETRIC_DEFAULT",
+        KeyUsage="ENCRYPT_DECRYPT",
+        Description="test symmetric key",
+    )
+    meta = resp["KeyMetadata"]
+    assert meta["KeyId"]
+    assert meta["Arn"].startswith("arn:aws:kms:")
+    assert meta["KeySpec"] == "SYMMETRIC_DEFAULT"
+    assert meta["KeyUsage"] == "ENCRYPT_DECRYPT"
+    assert meta["Enabled"] is True
+    assert meta["KeyState"] == "Enabled"
+
+
+def test_kms_create_rsa_2048_sign_key(kms_client):
+    resp = kms_client.create_key(
+        KeySpec="RSA_2048",
+        KeyUsage="SIGN_VERIFY",
+        Description="test RSA signing key",
+    )
+    meta = resp["KeyMetadata"]
+    assert meta["KeySpec"] == "RSA_2048"
+    assert meta["KeyUsage"] == "SIGN_VERIFY"
+    assert "RSASSA_PKCS1_V1_5_SHA_256" in meta["SigningAlgorithms"]
+
+
+def test_kms_create_rsa_4096_encrypt_key(kms_client):
+    resp = kms_client.create_key(
+        KeySpec="RSA_4096",
+        KeyUsage="ENCRYPT_DECRYPT",
+    )
+    meta = resp["KeyMetadata"]
+    assert meta["KeySpec"] == "RSA_4096"
+    assert "RSAES_OAEP_SHA_256" in meta["EncryptionAlgorithms"]
+
+
+def test_kms_list_keys(kms_client):
+    created = kms_client.create_key(KeySpec="SYMMETRIC_DEFAULT")
+    key_id = created["KeyMetadata"]["KeyId"]
+    resp = kms_client.list_keys()
+    key_ids = [k["KeyId"] for k in resp["Keys"]]
+    assert key_id in key_ids
+
+
+def test_kms_describe_key(kms_client):
+    created = kms_client.create_key(
+        KeySpec="SYMMETRIC_DEFAULT", Description="describe me"
+    )
+    key_id = created["KeyMetadata"]["KeyId"]
+    resp = kms_client.describe_key(KeyId=key_id)
+    assert resp["KeyMetadata"]["Description"] == "describe me"
+    assert resp["KeyMetadata"]["KeyId"] == key_id
+
+
+def test_kms_describe_key_by_arn(kms_client):
+    created = kms_client.create_key(KeySpec="SYMMETRIC_DEFAULT")
+    arn = created["KeyMetadata"]["Arn"]
+    resp = kms_client.describe_key(KeyId=arn)
+    assert resp["KeyMetadata"]["Arn"] == arn
+
+
+def test_kms_describe_nonexistent_key(kms_client):
+    with pytest.raises(ClientError) as exc_info:
+        kms_client.describe_key(KeyId="nonexistent-key-id")
+    assert "NotFoundException" in str(exc_info.value)
+
+
+def test_kms_sign_and_verify_pkcs1(kms_client):
+    key = kms_client.create_key(KeySpec="RSA_2048", KeyUsage="SIGN_VERIFY")
+    key_id = key["KeyMetadata"]["KeyId"]
+    message = b"header.payload"
+
+    sign_resp = kms_client.sign(
+        KeyId=key_id,
+        Message=message,
+        MessageType="RAW",
+        SigningAlgorithm="RSASSA_PKCS1_V1_5_SHA_256",
+    )
+    assert sign_resp["KeyId"] == key_id
+    assert sign_resp["SigningAlgorithm"] == "RSASSA_PKCS1_V1_5_SHA_256"
+    assert len(sign_resp["Signature"]) > 0
+
+    verify_resp = kms_client.verify(
+        KeyId=key_id,
+        Message=message,
+        MessageType="RAW",
+        Signature=sign_resp["Signature"],
+        SigningAlgorithm="RSASSA_PKCS1_V1_5_SHA_256",
+    )
+    assert verify_resp["SignatureValid"] is True
+
+
+def test_kms_sign_and_verify_pss(kms_client):
+    key = kms_client.create_key(KeySpec="RSA_2048", KeyUsage="SIGN_VERIFY")
+    key_id = key["KeyMetadata"]["KeyId"]
+    message = b"test-pss-message"
+
+    sign_resp = kms_client.sign(
+        KeyId=key_id,
+        Message=message,
+        MessageType="RAW",
+        SigningAlgorithm="RSASSA_PSS_SHA_256",
+    )
+    verify_resp = kms_client.verify(
+        KeyId=key_id,
+        Message=message,
+        MessageType="RAW",
+        Signature=sign_resp["Signature"],
+        SigningAlgorithm="RSASSA_PSS_SHA_256",
+    )
+    assert verify_resp["SignatureValid"] is True
+
+
+def test_kms_verify_wrong_message(kms_client):
+    key = kms_client.create_key(KeySpec="RSA_2048", KeyUsage="SIGN_VERIFY")
+    key_id = key["KeyMetadata"]["KeyId"]
+
+    sign_resp = kms_client.sign(
+        KeyId=key_id,
+        Message=b"original",
+        MessageType="RAW",
+        SigningAlgorithm="RSASSA_PKCS1_V1_5_SHA_256",
+    )
+    verify_resp = kms_client.verify(
+        KeyId=key_id,
+        Message=b"tampered",
+        MessageType="RAW",
+        Signature=sign_resp["Signature"],
+        SigningAlgorithm="RSASSA_PKCS1_V1_5_SHA_256",
+    )
+    assert verify_resp["SignatureValid"] is False
+
+
+def test_kms_jwt_signing_flow(kms_client):
+    """Sign a JWT-style header.payload string and verify the signature."""
+    import base64
+    key = kms_client.create_key(KeySpec="RSA_2048", KeyUsage="SIGN_VERIFY")
+    key_id = key["KeyMetadata"]["KeyId"]
+
+    header = base64.urlsafe_b64encode(
+        b'{"alg":"RS256","typ":"JWT"}'
+    ).rstrip(b"=").decode()
+    payload = base64.urlsafe_b64encode(
+        b'{"sub":"user-2001","iss":"auth-service"}'
+    ).rstrip(b"=").decode()
+    signing_input = f"{header}.{payload}"
+
+    sign_resp = kms_client.sign(
+        KeyId=key_id,
+        Message=signing_input.encode(),
+        MessageType="RAW",
+        SigningAlgorithm="RSASSA_PKCS1_V1_5_SHA_256",
+    )
+    assert sign_resp["Signature"]
+
+    verify_resp = kms_client.verify(
+        KeyId=key_id,
+        Message=signing_input.encode(),
+        MessageType="RAW",
+        Signature=sign_resp["Signature"],
+        SigningAlgorithm="RSASSA_PKCS1_V1_5_SHA_256",
+    )
+    assert verify_resp["SignatureValid"] is True
+
+
+def test_kms_encrypt_decrypt_roundtrip(kms_client):
+    key = kms_client.create_key(
+        KeySpec="SYMMETRIC_DEFAULT", KeyUsage="ENCRYPT_DECRYPT"
+    )
+    key_id = key["KeyMetadata"]["KeyId"]
+    plaintext = b"sensitive document content"
+
+    enc_resp = kms_client.encrypt(KeyId=key_id, Plaintext=plaintext)
+    assert enc_resp["KeyId"] == key_id
+
+    dec_resp = kms_client.decrypt(CiphertextBlob=enc_resp["CiphertextBlob"])
+    assert dec_resp["Plaintext"] == plaintext
+
+
+def test_kms_encrypt_decrypt_with_explicit_key(kms_client):
+    key = kms_client.create_key(
+        KeySpec="SYMMETRIC_DEFAULT", KeyUsage="ENCRYPT_DECRYPT"
+    )
+    key_id = key["KeyMetadata"]["KeyId"]
+    plaintext = b"another secret"
+
+    enc_resp = kms_client.encrypt(KeyId=key_id, Plaintext=plaintext)
+    dec_resp = kms_client.decrypt(
+        KeyId=key_id, CiphertextBlob=enc_resp["CiphertextBlob"]
+    )
+    assert dec_resp["Plaintext"] == plaintext
+
+
+def test_kms_generate_data_key_aes_256(kms_client):
+    key = kms_client.create_key(
+        KeySpec="SYMMETRIC_DEFAULT", KeyUsage="ENCRYPT_DECRYPT"
+    )
+    key_id = key["KeyMetadata"]["KeyId"]
+
+    resp = kms_client.generate_data_key(KeyId=key_id, KeySpec="AES_256")
+    assert resp["KeyId"] == key_id
+    assert len(resp["Plaintext"]) == 32
+    assert resp["CiphertextBlob"]
+
+
+def test_kms_generate_data_key_aes_128(kms_client):
+    key = kms_client.create_key(
+        KeySpec="SYMMETRIC_DEFAULT", KeyUsage="ENCRYPT_DECRYPT"
+    )
+    key_id = key["KeyMetadata"]["KeyId"]
+
+    resp = kms_client.generate_data_key(KeyId=key_id, KeySpec="AES_128")
+    assert len(resp["Plaintext"]) == 16
+
+
+def test_kms_generate_data_key_decrypt_roundtrip(kms_client):
+    """Encrypted data key should be decryptable back to the plaintext."""
+    key = kms_client.create_key(
+        KeySpec="SYMMETRIC_DEFAULT", KeyUsage="ENCRYPT_DECRYPT"
+    )
+    key_id = key["KeyMetadata"]["KeyId"]
+
+    gen_resp = kms_client.generate_data_key(KeyId=key_id, KeySpec="AES_256")
+    dec_resp = kms_client.decrypt(CiphertextBlob=gen_resp["CiphertextBlob"])
+    assert dec_resp["Plaintext"] == gen_resp["Plaintext"]
+
+
+def test_kms_generate_data_key_without_plaintext(kms_client):
+    key = kms_client.create_key(
+        KeySpec="SYMMETRIC_DEFAULT", KeyUsage="ENCRYPT_DECRYPT"
+    )
+    key_id = key["KeyMetadata"]["KeyId"]
+
+    resp = kms_client.generate_data_key_without_plaintext(
+        KeyId=key_id, KeySpec="AES_256"
+    )
+    assert resp["KeyId"] == key_id
+    assert resp["CiphertextBlob"]
+    assert "Plaintext" not in resp
+
+
+def test_kms_get_public_key(kms_client):
+    key = kms_client.create_key(KeySpec="RSA_2048", KeyUsage="SIGN_VERIFY")
+    key_id = key["KeyMetadata"]["KeyId"]
+
+    resp = kms_client.get_public_key(KeyId=key_id)
+    assert resp["KeyId"] == key_id
+    assert resp["KeySpec"] == "RSA_2048"
+    assert resp["PublicKey"]
+
+
+def test_kms_encrypt_decrypt_with_encryption_context(kms_client):
+    """EncryptionContext must match between encrypt and decrypt."""
+    key = kms_client.create_key(
+        KeySpec="SYMMETRIC_DEFAULT", KeyUsage="ENCRYPT_DECRYPT"
+    )
+    key_id = key["KeyMetadata"]["KeyId"]
+    plaintext = b"context-sensitive data"
+    context = {"service": "storage", "bucket": "documents"}
+
+    enc_resp = kms_client.encrypt(
+        KeyId=key_id, Plaintext=plaintext, EncryptionContext=context
+    )
+
+    dec_resp = kms_client.decrypt(
+        CiphertextBlob=enc_resp["CiphertextBlob"],
+        EncryptionContext=context,
+    )
+    assert dec_resp["Plaintext"] == plaintext
+
+
+def test_kms_decrypt_wrong_context_fails(kms_client):
+    """Decrypt with wrong EncryptionContext should fail."""
+    key = kms_client.create_key(
+        KeySpec="SYMMETRIC_DEFAULT", KeyUsage="ENCRYPT_DECRYPT"
+    )
+    key_id = key["KeyMetadata"]["KeyId"]
+
+    enc_resp = kms_client.encrypt(
+        KeyId=key_id,
+        Plaintext=b"secret",
+        EncryptionContext={"env": "prod"},
+    )
+
+    with pytest.raises(ClientError) as exc_info:
+        kms_client.decrypt(
+            CiphertextBlob=enc_resp["CiphertextBlob"],
+            EncryptionContext={"env": "dev"},
+        )
+    assert "InvalidCiphertextException" in str(exc_info.value)
