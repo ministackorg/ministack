@@ -7,6 +7,13 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [1.1.28] — 2026-04-03
+
+### Fixed
+- **S3 aws-chunked decoding** — chunked body decoder now also triggers on `Content-Encoding: aws-chunked` and `x-amz-decoded-content-length` header, not only `STREAMING-*`; fixes AWS SDK Java v2 and Spring Boot S3Template storing raw chunk metadata in object bodies. Strips `aws-chunked` from Content-Encoding before passing to S3 handler. Contributed by @moabukar
+
+---
+
 ## [1.1.27] — 2026-04-03
 
 ### Fixed
