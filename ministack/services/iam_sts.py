@@ -28,6 +28,7 @@ STS actions:
   GetCallerIdentity, AssumeRole, GetSessionToken.
 """
 
+import copy
 import json
 import os
 import logging
@@ -45,6 +46,8 @@ REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 # ---------------------------------------------------------------------------
 # Module-level state
 # ---------------------------------------------------------------------------
+from ministack.core.persistence import load_state, PERSIST_STATE
+
 _users: dict = {}
 _roles: dict = {}
 _policies: dict = {}
@@ -53,6 +56,36 @@ _instance_profiles: dict = {}
 _groups: dict = {}
 _user_inline_policies: dict = {}
 _oidc_providers: dict = {}
+
+
+# ── Persistence ────────────────────────────────────────────
+
+def get_state():
+    return {
+        "users": copy.deepcopy(_users),
+        "roles": copy.deepcopy(_roles),
+        "policies": copy.deepcopy(_policies),
+        "groups": copy.deepcopy(_groups),
+        "instance_profiles": copy.deepcopy(_instance_profiles),
+        "access_keys": copy.deepcopy(_access_keys),
+        "oidc_providers": copy.deepcopy(_oidc_providers),
+    }
+
+
+def restore_state(data):
+    if data:
+        _users.update(data.get("users", {}))
+        _roles.update(data.get("roles", {}))
+        _policies.update(data.get("policies", {}))
+        _groups.update(data.get("groups", {}))
+        _instance_profiles.update(data.get("instance_profiles", {}))
+        _access_keys.update(data.get("access_keys", {}))
+        _oidc_providers.update(data.get("oidc_providers", {}))
+
+
+_restored = load_state("iam")
+if _restored:
+    restore_state(_restored)
 
 
 # ===================================================================== IAM

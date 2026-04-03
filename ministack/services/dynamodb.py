@@ -31,11 +31,31 @@ logger = logging.getLogger("dynamodb")
 ACCOUNT_ID = "000000000000"
 REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 
+from ministack.core.persistence import load_state, PERSIST_STATE
+
 _tables: dict = {}
 _tags: dict = {}
 _ttl_settings: dict = {}
 _pitr_settings: dict = {}
 _lock = threading.Lock()
+
+
+# ── Persistence ────────────────────────────────────────────
+
+def get_state():
+    return {"tables": copy.deepcopy(_tables), "tags": copy.deepcopy(_tags), "ttl_settings": copy.deepcopy(_ttl_settings)}
+
+
+def restore_state(data):
+    if data:
+        _tables.update(data.get("tables", {}))
+        _tags.update(data.get("tags", {}))
+        _ttl_settings.update(data.get("ttl_settings", {}))
+
+
+_restored = load_state("dynamodb")
+if _restored:
+    restore_state(_restored)
 
 # DynamoDB Streams: table_name -> list of stream records
 # Each record follows the DynamoDB Streams event format consumed by Lambda ESMs.

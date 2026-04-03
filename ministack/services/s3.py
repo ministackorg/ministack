@@ -302,7 +302,7 @@ async def handle_request(
 
     status, resp_headers, resp_body = result
     resp_headers.setdefault("x-amz-request-id", new_uuid())
-    resp_headers.setdefault("x-amz-id-2", new_uuid())
+    resp_headers.setdefault("x-amz-id-2", base64.b64encode(os.urandom(48)).decode())
 
     # HEAD responses must not carry a body per HTTP/1.1 spec.
     if method == "HEAD":

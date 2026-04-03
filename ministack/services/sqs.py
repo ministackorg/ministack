@@ -23,6 +23,7 @@ Actions:
 
 import asyncio
 import base64
+import copy
 import hashlib
 import json
 import logging
@@ -33,6 +34,7 @@ import time
 from urllib.parse import parse_qs
 from xml.sax.saxutils import escape as _esc
 
+from ministack.core.persistence import load_state, PERSIST_STATE
 from ministack.core.responses import md5_hash, new_uuid, now_iso
 
 logger = logging.getLogger("sqs")
@@ -42,6 +44,23 @@ logger = logging.getLogger("sqs")
 _queues: dict = {}
 _queue_name_to_url: dict = {}
 _queues_lock = threading.Lock()
+
+
+# ── Persistence ────────────────────────────────────────────
+
+def get_state():
+    return {"queues": copy.deepcopy(_queues), "queue_name_to_url": dict(_queue_name_to_url)}
+
+
+def restore_state(data):
+    if data:
+        _queues.update(data.get("queues", {}))
+        _queue_name_to_url.update(data.get("queue_name_to_url", {}))
+
+
+_restored = load_state("sqs")
+if _restored:
+    restore_state(_restored)
 
 ACCOUNT_ID = "000000000000"
 REGION = os.environ.get("MINISTACK_REGION", "us-east-1")

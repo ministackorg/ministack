@@ -34,6 +34,8 @@ except ImportError:
 ACCOUNT_ID = "000000000000"
 REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 
+from ministack.core.persistence import load_state, PERSIST_STATE
+
 _keys: dict = {}
 # key_id -> {
 #     KeyId, Arn, KeyState, KeyUsage, KeySpec, Description,
@@ -43,6 +45,40 @@ _keys: dict = {}
 #     _symmetric_key (bytes, SYMMETRIC_DEFAULT only),
 # }
 _aliases: dict = {}  # alias_name -> key_id (e.g. "alias/my-key" -> "uuid")
+
+
+# ── Persistence ────────────────────────────────────────────
+
+def get_state():
+    """Return JSON-serializable state. Symmetric keys are base64-encoded;
+    RSA private keys are stripped (not serializable)."""
+    serializable_keys = {}
+    for kid, rec in _keys.items():
+        entry = {k: v for k, v in rec.items()
+                 if k not in ("_private_key", "_public_key_der", "_symmetric_key")}
+        if "_symmetric_key" in rec:
+            entry["_symmetric_key_b64"] = base64.b64encode(rec["_symmetric_key"]).decode()
+        if "_public_key_der" in rec:
+            entry["_public_key_der_b64"] = base64.b64encode(rec["_public_key_der"]).decode()
+        # RSA private keys are skipped — not JSON-serializable
+        serializable_keys[kid] = entry
+    return {"keys": serializable_keys, "aliases": _aliases}
+
+
+def restore_state(data):
+    if data:
+        for kid, entry in data.get("keys", {}).items():
+            if "_symmetric_key_b64" in entry:
+                entry["_symmetric_key"] = base64.b64decode(entry.pop("_symmetric_key_b64"))
+            if "_public_key_der_b64" in entry:
+                entry["_public_key_der"] = base64.b64decode(entry.pop("_public_key_der_b64"))
+            _keys[kid] = entry
+        _aliases.update(data.get("aliases", {}))
+
+
+_restored = load_state("kms")
+if _restored:
+    restore_state(_restored)
 
 
 def _arn(key_id):

@@ -11,6 +11,7 @@ SNS → Lambda fanout dispatches via _execute_function (synchronous).
 """
 
 import asyncio
+import copy
 import hashlib
 import json
 import logging
@@ -30,10 +31,29 @@ logger = logging.getLogger("sns")
 ACCOUNT_ID = "000000000000"
 REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 
+from ministack.core.persistence import load_state, PERSIST_STATE
+
 _topics: dict = {}
 _sub_arn_to_topic: dict = {}
 _platform_applications: dict = {}
 _platform_endpoints: dict = {}
+
+
+# ── Persistence ────────────────────────────────────────────
+
+def get_state():
+    return {"topics": copy.deepcopy(_topics), "sub_arn_to_topic": copy.deepcopy(_sub_arn_to_topic)}
+
+
+def restore_state(data):
+    if data:
+        _topics.update(data.get("topics", {}))
+        _sub_arn_to_topic.update(data.get("sub_arn_to_topic", {}))
+
+
+_restored = load_state("sns")
+if _restored:
+    restore_state(_restored)
 
 
 async def handle_request(method: str, path: str, headers: dict, body: bytes, query_params: dict) -> tuple:

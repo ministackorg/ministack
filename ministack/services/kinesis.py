@@ -13,6 +13,7 @@ Supports: CreateStream, DeleteStream, DescribeStream, DescribeStreamSummary,
 """
 
 import base64
+import copy
 import os
 import hashlib
 import json
@@ -29,11 +30,29 @@ REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 MAX_HASH_KEY = (2**128) - 1
 ITERATOR_EXPIRY_SECONDS = 300
 
+from ministack.core.persistence import load_state, PERSIST_STATE
+
 _streams: dict = {}
 _shard_iterators: dict = {}
 _consumers: dict = {}
 _sequence_counter = 0
 _sequence_lock = threading.Lock()
+
+
+# ── Persistence ────────────────────────────────────────────
+
+def get_state():
+    return {"streams": copy.deepcopy(_streams)}
+
+
+def restore_state(data):
+    if data:
+        _streams.update(data.get("streams", {}))
+
+
+_restored = load_state("kinesis")
+if _restored:
+    restore_state(_restored)
 
 
 def _next_sequence_number():

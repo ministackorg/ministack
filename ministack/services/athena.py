@@ -854,8 +854,6 @@ def _execution_out(ex):
 
 
 def reset():
-    import time as _time
-
     global _workgroups, _data_catalogs
     _executions.clear()
     _named_queries.clear()
@@ -865,7 +863,7 @@ def reset():
             "Name": "primary",
             "State": "ENABLED",
             "Description": "Primary workgroup",
-            "CreationTime": _time.time(),
+            "CreationTime": time.time(),
             "Configuration": {
                 "ResultConfiguration": {"OutputLocation": "s3://athena-results/"}
             },

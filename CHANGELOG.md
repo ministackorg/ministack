@@ -7,6 +7,27 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [1.1.25] — 2026-04-03
+
+### Added
+- **State persistence for 10 services** — SQS, SNS, SSM, SecretsManager, IAM, DynamoDB, KMS, EventBridge, CloudWatch Logs, and Kinesis now persist state when `PERSIST_STATE=1`; state is saved on shutdown and restored on startup via atomic JSON files
+- **Python Testcontainers example** — `Testcontainers/python-testcontainers/` with pytest tests for S3, SQS, DynamoDB using the `testcontainers` package
+- **Detached mode** — `ministack -d` starts the server in the background with logs to `/tmp/ministack-{port}.log`; `ministack --stop` stops it. Cross-platform via `subprocess.Popen`. PID file with signal cleanup. Reported by @UdayKiranPadhy
+
+### Fixed
+- **Renamed `examples/` to `Testcontainers/`** — clearer folder name for Testcontainers examples (Java, Go, Python)
+- **EventBridge SQS dispatch message schema** — fixed field names (`md5_body`, `sys`, `message_attributes`) to match SQS internal format
+- **Lambda `_now_iso()` millisecond precision** — now includes real milliseconds instead of always `.000`
+- **`x-amz-id-2` header** — now returns base64-encoded random bytes instead of a UUID, matching AWS format
+- **Route53 `ListResourceRecordSets` ordering and pagination** — DNS names now sorted by reversed labels (`com.example.www`) matching AWS; pagination cursors point to next page start instead of current page end; fixes Terraform infinite loop on `aws_route53_record`. Contributed by @jgrumboe
+- **Lazy stdlib imports removed** — moved `shutil`, `tempfile`, `argparse`, `signal`, `socket`, `sys`, `datetime` to module level across `app.py`, `lambda_svc.py`, `athena.py`
+- **Flaky ESM visibility timeout test** — increased timeout headroom for CI environments
+
+### Tests
+- 887 tests total, all passing
+
+---
+
 ## [1.1.24] — 2026-04-03
 
 ### Fixed

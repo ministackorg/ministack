@@ -5,12 +5,19 @@ Routes requests to service handlers based on AWS headers, paths, and query param
 Compatible with AWS CLI, boto3, and any AWS SDK via --endpoint-url.
 """
 
+import argparse
 import asyncio
+import base64
 import json
 import logging
 import os
 import re
+import shutil
+import signal
+import socket
 import subprocess
+import sys
+import tempfile
 import uuid
 from urllib.parse import parse_qs, urlparse
 
@@ -66,6 +73,7 @@ from ministack.services import (
     stepfunctions,
     waf,
 )
+from ministack.services import iam_sts
 from ministack.services.iam_sts import handle_iam_request, handle_sts_request
 
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
@@ -443,7 +451,7 @@ async def app(scope, receive, send):
                 "Access-Control-Allow-Origin": "*",
                 "x-amzn-requestid": request_id,
                 "x-amz-request-id": request_id,
-                "x-amz-id-2": request_id,
+                "x-amz-id-2": base64.b64encode(os.urandom(48)).decode(),
             })
             await _send_response(send, status, resp_headers, resp_body)
             return
@@ -482,7 +490,7 @@ async def app(scope, receive, send):
         "Access-Control-Expose-Headers": "*",
         "x-amzn-requestid": request_id,
         "x-amz-request-id": request_id,
-        "x-amz-id-2": request_id,
+        "x-amz-id-2": base64.b64encode(os.urandom(48)).decode(),
     })
 
     await _send_response(send, status, resp_headers, resp_body)
@@ -525,6 +533,16 @@ async def _handle_lifespan(scope, receive, send):
                 save_all({
                     "apigateway": apigateway.get_state,
                     "apigateway_v1": apigateway_v1.get_state,
+                    "sqs": sqs.get_state,
+                    "sns": sns.get_state,
+                    "ssm": ssm.get_state,
+                    "secretsmanager": secretsmanager.get_state,
+                    "iam": iam_sts.get_state,
+                    "dynamodb": dynamodb.get_state,
+                    "kms": kms.get_state,
+                    "eventbridge": eventbridge.get_state,
+                    "cloudwatch_logs": cloudwatch_logs.get_state,
+                    "kinesis": kinesis.get_state,
                 })
             await send({"type": "lifespan.shutdown.complete"})
             return
@@ -573,7 +591,6 @@ def _run_init_scripts():
 
 def _reset_all_state():
     """Wipe all in-memory state across every service module, and persisted files if enabled."""
-    import shutil
 
     from ministack.core.persistence import PERSIST_STATE, STATE_DIR
     from ministack.services.iam_sts import reset as _iam_reset
@@ -638,18 +655,76 @@ def _reset_all_state():
     logger.info("State reset complete")
 
 
-def main():
-    import socket
+def _pid_file(port: int) -> str:
+    return os.path.join(tempfile.gettempdir(), f"ministack-{port}.pid")
 
+
+def main():
     import uvicorn
+
+    parser = argparse.ArgumentParser(description="MiniStack — Local AWS Service Emulator")
+    parser.add_argument("-d", "--detach", action="store_true", help="Run in the background (detached mode)")
+    parser.add_argument("--stop", action="store_true", help="Stop a detached MiniStack server")
+    args = parser.parse_args()
+
     port = int(_resolve_port())
+
+    if args.stop:
+        pf = _pid_file(port)
+        if not os.path.exists(pf):
+            print(f"No MiniStack PID file found for port {port}. Is it running?")
+            raise SystemExit(1)
+        with open(pf) as f:
+            pid = int(f.read().strip())
+        try:
+            os.kill(pid, signal.SIGTERM)
+            print(f"MiniStack (PID {pid}) on port {port} stopped.")
+        except ProcessLookupError:
+            print(f"MiniStack (PID {pid}) was not running. Cleaning up PID file.")
+        os.remove(pf)
+        return
+
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         if s.connect_ex(("127.0.0.1", port)) == 0:
-            print(f"ERROR: Port {port} is already in use. Is MiniStack already running (Docker or another process)?\n"
-                  f"  Stop it with: docker compose down\n"
+            print(f"ERROR: Port {port} is already in use. Is MiniStack already running?\n"
+                  f"  Stop it with: ministack --stop\n"
                   f"  Or use a different port: GATEWAY_PORT=4567 ministack")
             raise SystemExit(1)
-    uvicorn.run("ministack.app:app", host="0.0.0.0", port=port, log_level=LOG_LEVEL.lower())
+
+    if args.detach:
+        log_file = os.path.join(os.environ.get("TMPDIR", "/tmp"), f"ministack-{port}.log")
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "uvicorn", "ministack.app:app",
+             "--host", "0.0.0.0", "--port", str(port),
+             "--log-level", LOG_LEVEL.lower()],
+            stdout=open(log_file, "w"),
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+        pf = _pid_file(port)
+        with open(pf, "w") as f:
+            f.write(str(proc.pid))
+        print(f"MiniStack started in background (PID {proc.pid}) on port {port}.")
+        print(f"  Logs: {log_file}")
+        print(f"  Stop: ministack --stop")
+        return
+
+    # Foreground — write PID file and clean up on exit
+    pf = _pid_file(port)
+    with open(pf, "w") as f:
+        f.write(str(os.getpid()))
+
+    def _cleanup(*_):
+        try:
+            os.remove(pf)
+        except OSError:
+            pass
+
+    signal.signal(signal.SIGTERM, lambda *_: (_cleanup(), sys.exit(0)))
+    try:
+        uvicorn.run("ministack.app:app", host="0.0.0.0", port=port, log_level=LOG_LEVEL.lower())
+    finally:
+        _cleanup()
 
 
 if __name__ == "__main__":

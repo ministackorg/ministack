@@ -539,20 +539,20 @@ pip install boto3 pytest duckdb docker cbor2
 # Start MiniStack
 docker compose up -d
 
-# Run the full test suite (851 tests across all 34 services)
+# Run the full test suite (887 tests across all 35 services)
 pytest tests/ -v
 ```
 
 Expected output:
 
 ```
-collected 851 items
+collected 879 items
 
 tests/test_services.py::test_s3_create_bucket PASSED
 ...
 tests/test_services.py::test_app_asgi_callable PASSED
 
-851 passed in ~100s
+879 passed in ~100s
 ```
 
 ---
@@ -633,9 +633,9 @@ config:
       # ... etc
 ```
 
-### Testcontainers (Java / Go)
+### Testcontainers (Java / Go / Python)
 
-See [`examples/java-testcontainers`](examples/java-testcontainers) and [`examples/go-testcontainers`](examples/go-testcontainers) for ready-to-run integration tests using Testcontainers with the AWS SDK v2.
+See [`Testcontainers/java-testcontainers`](Testcontainers/java-testcontainers), [`Testcontainers/go-testcontainers`](Testcontainers/go-testcontainers), and [`Testcontainers/python-testcontainers`](Testcontainers/python-testcontainers) for ready-to-run integration tests using Testcontainers with the AWS SDK v2.
 
 ---
 

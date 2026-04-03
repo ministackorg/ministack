@@ -15,6 +15,7 @@ Supports: CreateLogGroup, DeleteLogGroup, DescribeLogGroups,
 """
 
 import base64
+import copy
 import os
 import fnmatch
 import json
@@ -27,6 +28,8 @@ logger = logging.getLogger("logs")
 
 ACCOUNT_ID = "000000000000"
 REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
+
+from ministack.core.persistence import load_state, PERSIST_STATE
 
 _log_groups: dict = {}
 # group_name -> {
@@ -46,6 +49,22 @@ _metric_filters: dict = {}
 
 _queries: dict = {}
 # query_id -> {queryId, logGroupName, startTime, endTime, queryString, status}
+
+
+# ── Persistence ────────────────────────────────────────────
+
+def get_state():
+    return {"log_groups": copy.deepcopy(_log_groups)}
+
+
+def restore_state(data):
+    if data:
+        _log_groups.update(data.get("log_groups", {}))
+
+
+_restored = load_state("cloudwatch_logs")
+if _restored:
+    restore_state(_restored)
 
 
 # ---------------------------------------------------------------------------
