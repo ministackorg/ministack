@@ -50,3 +50,7 @@ data/
 
 # Logs
 *.log
+
+# claude
+CLAUDE.md
+.claude/
