@@ -7,6 +7,13 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [1.1.27] — 2026-04-03
+
+### Fixed
+- **Dockerfile missing `defusedxml`** — added `defusedxml>=0.7` to pip install in Dockerfile; container was crashing on startup due to missing dependency introduced in v1.1.26
+
+---
+
 ## [1.1.26] — 2026-04-03
 
 ### Added
