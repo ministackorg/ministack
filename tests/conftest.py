@@ -16,7 +16,7 @@ _kwargs = dict(
     aws_access_key_id="test",
     aws_secret_access_key="test",
     region_name=REGION,
-    config=Config(region_name=REGION, retries={"max_attempts": 0}),
+    config=Config(region_name=REGION, retries={"max_attempts": 0}, read_timeout=300),
 )
 
 

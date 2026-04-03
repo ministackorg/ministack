@@ -15,9 +15,9 @@ model_list:
       model: "ollama/qwen3.5:2b"
       api_base: "http://ollama:11434"
 
-  - model_name: "qwen3.5:0.8b"
+  - model_name: "gemma3:1b"
     litellm_params:
-      model: "ollama/qwen3.5:0.8b"
+      model: "ollama/gemma3:1b"
       api_base: "http://ollama:11434"
 
   # Qwen 2.5 (default / fallback)

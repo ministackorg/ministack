@@ -240,16 +240,15 @@ subnet = ec2.create_subnet(
 > |---|---|---|---|
 > | Opus (`claude-opus-4-6`) | `qwen3.5:4b` | 2.6 GB | Best quality |
 > | Sonnet (`claude-3-sonnet`, `claude-sonnet-4-6`) | `qwen3.5:2b` | 1.5 GB | Balanced |
-> | Haiku (`claude-3-haiku`) | `qwen3.5:0.8b` | 530 MB | Fast prototyping |
+> | Haiku (`claude-3-haiku`) | `gemma3:1b` | 815 MB | Fast prototyping |
 >
 > ```bash
-> # Pull required models (embeddings + default fallback)
-> docker exec ministack-ollama ollama pull qwen2.5:3b        # fallback (2 GB)
+> # Models are auto-pulled on startup from bedrock_models.yaml.
+> # To pull manually:
+> docker exec ministack-ollama ollama pull qwen3.5:2b         # default / Sonnet (1.5 GB)
 > docker exec ministack-ollama ollama pull nomic-embed-text   # embeddings (274 MB)
-> # Pull Claude-tier models (optional — falls back to qwen2.5:3b if missing)
 > docker exec ministack-ollama ollama pull qwen3.5:4b         # Opus tier (2.6 GB)
-> docker exec ministack-ollama ollama pull qwen3.5:2b         # Sonnet tier (1.5 GB)
-> docker exec ministack-ollama ollama pull qwen3.5:0.8b       # Haiku tier (530 MB)
+> docker exec ministack-ollama ollama pull gemma3:1b           # Haiku tier (815 MB)
 > ```
 | **KMS** | CreateKey, ListKeys, DescribeKey, GetPublicKey, Sign, Verify, Encrypt, Decrypt, GenerateDataKey, GenerateDataKeyWithoutPlaintext | RSA (2048/4096) and symmetric keys; PKCS1v15 and PSS signing; envelope encryption; requires `cryptography` package (optional) |
 

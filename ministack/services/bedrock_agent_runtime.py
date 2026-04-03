@@ -277,41 +277,26 @@ async def _retrieve_and_generate(kb_id: str, body: bytes):
     context = "\n\n".join(context_parts)
 
     # Step 3: Generate response via LiteLLM
-    import aiohttp
     from ministack.services.bedrock import resolve_model
+    from ministack.services.bedrock_runtime import _call_llm
 
-    local_model = resolve_model(model_id) if model_id else "qwen2.5:3b"
+    local_model = resolve_model(model_id) if model_id else "qwen3.5:2b"
     system_prompt = (
         "You are a helpful assistant. Answer the user's question based on the following context. "
         "If the context doesn't contain relevant information, say so.\n\n"
         f"Context:\n{context}"
     )
 
-    litellm_payload = {
-        "model": local_model,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": query_text},
-        ],
-        "temperature": 0.3,
-        "max_tokens": 1024,
-    }
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": query_text},
+    ]
 
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                f"{LITELLM_BASE_URL}/v1/chat/completions",
-                json=litellm_payload,
-                timeout=aiohttp.ClientTimeout(total=300),
-            ) as resp:
-                if resp.status != 200:
-                    error_body = await resp.text()
-                    return error_response_json("ModelErrorException",
-                                               f"Inference backend error: {error_body}", 500)
-                result = await resp.json()
-    except (aiohttp.ClientError, OSError) as e:
+        result = await _call_llm(local_model, messages, max_tokens=1024, temperature=0.3)
+    except Exception as e:
         return error_response_json("ServiceUnavailableException",
-                                   f"Inference backend (LiteLLM) is unavailable: {e}", 503)
+                                   f"Inference backend is unavailable: {e}", 503)
 
     response_text = result.get("choices", [{}])[0].get("message", {}).get("content", "")
 

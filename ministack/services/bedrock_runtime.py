@@ -20,6 +20,7 @@ from ministack.core.responses import error_response_json, json_response, new_uui
 logger = logging.getLogger("bedrock-runtime")
 
 LITELLM_BASE_URL = os.environ.get("LITELLM_BASE_URL", "http://litellm:4000")
+OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://ollama:11434")
 ACCOUNT_ID = os.environ.get("MINISTACK_ACCOUNT_ID", "000000000000")
 REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 
@@ -27,6 +28,61 @@ REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 _guardrails: dict = {}
 _async_invocations: dict = {}  # invocation_arn -> metadata
 _async_lock = threading.Lock()
+
+
+async def _call_llm(model: str, messages: list, max_tokens: int = 1024,
+                    temperature: float = 0.7, top_p: float = 1.0) -> dict:
+    """Call the LLM backend. Uses Ollama directly for qwen3 (to disable thinking mode),
+    LiteLLM for everything else."""
+    import aiohttp
+
+    if "qwen3" in model:
+        # Ollama direct — with think=false to disable thinking mode
+        ollama_messages = [{"role": m["role"], "content": m["content"]} for m in messages]
+        payload = {
+            "model": model,
+            "messages": ollama_messages,
+            "stream": False,
+            "think": False,
+            "options": {"num_predict": max_tokens, "temperature": temperature, "top_p": top_p},
+        }
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f"{OLLAMA_BASE_URL}/api/chat",
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=300),
+            ) as resp:
+                if resp.status != 200:
+                    error_body = await resp.text()
+                    raise RuntimeError(f"Ollama returned {resp.status}: {error_body}")
+                data = await resp.json()
+        return {
+            "choices": [{"message": {"content": data.get("message", {}).get("content", ""),
+                                     "role": "assistant"},
+                         "finish_reason": "stop" if data.get("done") else "length"}],
+            "usage": {"prompt_tokens": data.get("prompt_eval_count", 0),
+                      "completion_tokens": data.get("eval_count", 0),
+                      "total_tokens": data.get("prompt_eval_count", 0) + data.get("eval_count", 0)},
+        }
+    else:
+        # LiteLLM proxy
+        payload = {
+            "model": model,
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "top_p": top_p,
+        }
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f"{LITELLM_BASE_URL}/v1/chat/completions",
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=300),
+            ) as resp:
+                if resp.status != 200:
+                    error_body = await resp.text()
+                    raise RuntimeError(f"LiteLLM returned {resp.status}: {error_body}")
+                return await resp.json()
 
 # ---------------------------------------------------------------------------
 # Path routing patterns
@@ -122,38 +178,19 @@ async def _converse(model_id: str, body: bytes):
     max_tokens = inference_config.get("maxTokens", 1024)
     top_p = inference_config.get("topP", 1.0)
 
-    # Call LiteLLM
-    import aiohttp
-    litellm_payload = {
-        "model": local_model,
-        "messages": openai_messages,
-        "temperature": temperature,
-        "max_tokens": max_tokens,
-        "top_p": top_p,
-    }
-
+    # Call LLM backend (Ollama direct for qwen3, LiteLLM for others)
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                f"{LITELLM_BASE_URL}/v1/chat/completions",
-                json=litellm_payload,
-                timeout=aiohttp.ClientTimeout(total=300),
-            ) as resp:
-                if resp.status != 200:
-                    error_body = await resp.text()
-                    logger.error("LiteLLM returned %d: %s", resp.status, error_body)
-                    return error_response_json("ModelErrorException",
-                                               f"Inference backend error: {error_body}", 500)
-                result = await resp.json()
-    except (aiohttp.ClientError, OSError) as e:
-        logger.error("Failed to connect to LiteLLM at %s: %s", LITELLM_BASE_URL, e)
+        result = await _call_llm(local_model, openai_messages, max_tokens, temperature, top_p)
+    except Exception as e:
+        logger.error("LLM call failed for model %s: %s", local_model, e)
         return error_response_json("ServiceUnavailableException",
-                                   f"Inference backend (LiteLLM) is unavailable at {LITELLM_BASE_URL}: {e}", 503)
+                                   f"Inference backend is unavailable: {e}", 503)
 
     # Transform OpenAI response to Bedrock Converse format
     choice = result.get("choices", [{}])[0]
     message = choice.get("message", {})
-    response_text = message.get("content", "")
+    response_text = message.get("content", "") or ""
+
     finish_reason = choice.get("finish_reason", "end_turn")
 
     # Map OpenAI finish reasons to Bedrock stop reasons
@@ -237,27 +274,9 @@ async def _invoke_model(model_id: str, body: bytes, headers: dict):
     else:
         openai_messages.append({"role": "user", "content": json.dumps(data)})
 
-    import aiohttp
-    litellm_payload = {
-        "model": local_model,
-        "messages": openai_messages,
-        "temperature": temperature,
-        "max_tokens": max_tokens,
-    }
-
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                f"{LITELLM_BASE_URL}/v1/chat/completions",
-                json=litellm_payload,
-                timeout=aiohttp.ClientTimeout(total=300),
-            ) as resp:
-                if resp.status != 200:
-                    error_body = await resp.text()
-                    return error_response_json("ModelErrorException",
-                                               f"Inference backend error: {error_body}", 500)
-                result = await resp.json()
-    except (aiohttp.ClientError, OSError) as e:
+        result = await _call_llm(local_model, openai_messages, max_tokens, temperature)
+    except Exception as e:
         return error_response_json("ServiceUnavailableException",
                                    f"Inference backend unavailable: {e}", 503)
 
@@ -510,13 +529,7 @@ async def _run_async_invoke(invocation_arn: str, model_id: str, model_input: dic
                 content = " ".join(b.get("text", "") for b in content if isinstance(b, dict))
             messages.append({"role": role, "content": content})
 
-    async with aiohttp.ClientSession() as session:
-        async with session.post(
-            f"{LITELLM_BASE_URL}/v1/chat/completions",
-            json={"model": local_model, "messages": messages, "max_tokens": 1024},
-            timeout=aiohttp.ClientTimeout(total=300),
-        ) as resp:
-            result = await resp.json()
+    result = await _call_llm(local_model, messages, max_tokens=1024)
 
     response_text = result.get("choices", [{}])[0].get("message", {}).get("content", "")
 

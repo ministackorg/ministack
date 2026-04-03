@@ -10,12 +10,11 @@ echo "Pulling models for MiniStack Bedrock..."
 # Embedding model for Knowledge Base (~274 MB)
 ollama pull nomic-embed-text
 
-# Default fallback model (~2 GB)
-ollama pull qwen2.5:3b
+# Default model — Sonnet tier (~1.5 GB)
+ollama pull qwen3.5:2b
 
-# Claude-tier models (Opus / Sonnet / Haiku)
+# Claude-tier models (Opus / Haiku)
 ollama pull qwen3.5:4b     # Opus tier   (~2.6 GB)
-ollama pull qwen3.5:2b     # Sonnet tier (~1.5 GB)
-ollama pull qwen3.5:0.8b   # Haiku tier  (~530 MB)
+ollama pull gemma3:1b      # Haiku tier  (~815 MB)
 
 echo "All models pulled successfully."
