@@ -21,6 +21,7 @@ When Docker is available, CreateDBInstance spins up a real Postgres/MySQL contai
 and returns the actual host:port as the endpoint.
 """
 
+import copy
 import datetime
 import logging
 import os
@@ -28,6 +29,7 @@ import time
 from urllib.parse import parse_qs
 from xml.sax.saxutils import escape as _esc
 
+from ministack.core.persistence import load_state
 from ministack.core.responses import new_uuid
 
 logger = logging.getLogger("rds")
@@ -48,6 +50,63 @@ _tags: dict = {}
 _port_counter = [BASE_PORT]
 
 _docker = None
+
+
+# ── Persistence ────────────────────────────────────────────
+
+def get_state():
+    state = {
+        "instances": {},
+        "clusters": copy.deepcopy(_clusters),
+        "subnet_groups": copy.deepcopy(_subnet_groups),
+        "param_groups": copy.deepcopy(_param_groups),
+        "snapshots": copy.deepcopy(_snapshots),
+        "db_cluster_param_groups": copy.deepcopy(_db_cluster_param_groups),
+        "db_cluster_snapshots": copy.deepcopy(_db_cluster_snapshots),
+        "option_groups": copy.deepcopy(_option_groups),
+        "tags": copy.deepcopy(_tags),
+        "port_counter": _port_counter[0],
+    }
+    for name, inst in _instances.items():
+        i = copy.deepcopy(inst)
+        i.pop("_docker_container_id", None)
+        state["instances"][name] = i
+    return state
+
+
+def restore_state(data):
+    if not data:
+        return
+    _clusters.update(data.get("clusters", {}))
+    _subnet_groups.update(data.get("subnet_groups", {}))
+    _param_groups.update(data.get("param_groups", {}))
+    _snapshots.update(data.get("snapshots", {}))
+    _db_cluster_param_groups.update(data.get("db_cluster_param_groups", {}))
+    _db_cluster_snapshots.update(data.get("db_cluster_snapshots", {}))
+    _option_groups.update(data.get("option_groups", {}))
+    _tags.update(data.get("tags", {}))
+    if "port_counter" in data:
+        _port_counter[0] = data["port_counter"]
+    # Restore instances and try to reconnect Docker containers
+    docker_client = _get_docker()
+    for name, inst in data.get("instances", {}).items():
+        inst["_docker_container_id"] = None
+        if docker_client:
+            try:
+                c = docker_client.containers.get(f"ministack-rds-{name}")
+                if c.status == "running":
+                    inst["_docker_container_id"] = c.id
+                    inst["DBInstanceStatus"] = "available"
+                else:
+                    inst["DBInstanceStatus"] = "stopped"
+            except Exception:
+                inst["DBInstanceStatus"] = "stopped"
+        _instances[name] = inst
+
+
+_restored = load_state("rds")
+if _restored:
+    restore_state(_restored)
 
 
 def _get_docker():

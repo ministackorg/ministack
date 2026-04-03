@@ -42,6 +42,7 @@ Supports:
                    DeleteEgressOnlyInternetGateway
 """
 
+import copy
 import logging
 import os
 import random
@@ -50,6 +51,7 @@ import time
 from urllib.parse import parse_qs
 from xml.sax.saxutils import escape as _esc
 
+from ministack.core.persistence import load_state, PERSIST_STATE
 from ministack.core.responses import new_uuid
 
 logger = logging.getLogger("ec2")
@@ -80,6 +82,61 @@ _flow_logs: dict = {}       # flow_log_id -> flow log record
 _vpc_peering: dict = {}     # pcx_id -> peering connection record
 _dhcp_options: dict = {}    # dopt_id -> DHCP options record
 _egress_igws: dict = {}     # eigw_id -> egress-only internet gateway record
+
+
+# ── Persistence ────────────────────────────────────────────
+
+def get_state():
+    return {
+        "instances": copy.deepcopy(_instances),
+        "security_groups": copy.deepcopy(_security_groups),
+        "key_pairs": copy.deepcopy(_key_pairs),
+        "vpcs": copy.deepcopy(_vpcs),
+        "subnets": copy.deepcopy(_subnets),
+        "internet_gateways": copy.deepcopy(_internet_gateways),
+        "addresses": copy.deepcopy(_addresses),
+        "tags": copy.deepcopy(_tags),
+        "route_tables": copy.deepcopy(_route_tables),
+        "network_interfaces": copy.deepcopy(_network_interfaces),
+        "vpc_endpoints": copy.deepcopy(_vpc_endpoints),
+        "volumes": copy.deepcopy(_volumes),
+        "snapshots": copy.deepcopy(_snapshots),
+        "nat_gateways": copy.deepcopy(_nat_gateways),
+        "network_acls": copy.deepcopy(_network_acls),
+        "flow_logs": copy.deepcopy(_flow_logs),
+        "vpc_peering": copy.deepcopy(_vpc_peering),
+        "dhcp_options": copy.deepcopy(_dhcp_options),
+        "egress_igws": copy.deepcopy(_egress_igws),
+    }
+
+
+def restore_state(data):
+    if data:
+        _instances.update(data.get("instances", {}))
+        _security_groups.update(data.get("security_groups", {}))
+        _key_pairs.update(data.get("key_pairs", {}))
+        _vpcs.update(data.get("vpcs", {}))
+        _subnets.update(data.get("subnets", {}))
+        _internet_gateways.update(data.get("internet_gateways", {}))
+        _addresses.update(data.get("addresses", {}))
+        _tags.update(data.get("tags", {}))
+        _route_tables.update(data.get("route_tables", {}))
+        _network_interfaces.update(data.get("network_interfaces", {}))
+        _vpc_endpoints.update(data.get("vpc_endpoints", {}))
+        _volumes.update(data.get("volumes", {}))
+        _snapshots.update(data.get("snapshots", {}))
+        _nat_gateways.update(data.get("nat_gateways", {}))
+        _network_acls.update(data.get("network_acls", {}))
+        _flow_logs.update(data.get("flow_logs", {}))
+        _vpc_peering.update(data.get("vpc_peering", {}))
+        _dhcp_options.update(data.get("dhcp_options", {}))
+        _egress_igws.update(data.get("egress_igws", {}))
+
+
+_restored = load_state("ec2")
+if _restored:
+    restore_state(_restored)
+
 
 # Default VPC / subnet created at import time so DescribeVpcs always returns something
 _DEFAULT_VPC_ID = "vpc-00000001"

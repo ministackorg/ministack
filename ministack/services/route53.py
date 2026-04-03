@@ -18,14 +18,17 @@ Wire protocol:
   Paths are under /2013-04-01/
 """
 
+import copy
 import logging
 import random
 import re
 import string
 import threading
 from datetime import datetime, timezone
-from xml.etree.ElementTree import Element, SubElement, fromstring, tostring
+from defusedxml.ElementTree import fromstring
+from xml.etree.ElementTree import Element, SubElement, tostring
 
+from ministack.core.persistence import load_state, PERSIST_STATE
 from ministack.core.responses import new_uuid
 
 logger = logging.getLogger("route53")
@@ -43,6 +46,42 @@ _tags: dict = {}            # (resource_type, resource_id) -> {key: value}
 _caller_refs: dict = {}     # caller_reference -> zone_id (idempotency)
 _hc_caller_refs: dict = {}  # caller_reference -> hc_id
 _lock = threading.Lock()
+
+
+# ── Persistence ────────────────────────────────────────────
+
+def get_state():
+    with _lock:
+        return {
+            "zones": copy.deepcopy(_zones),
+            "records": copy.deepcopy(_records),
+            "health_checks": copy.deepcopy(_health_checks),
+            "tags": {f"{k[0]}|{k[1]}": v for k, v in copy.deepcopy(_tags).items()},
+            "caller_refs": copy.deepcopy(_caller_refs),
+            "hc_caller_refs": copy.deepcopy(_hc_caller_refs),
+            "changes": copy.deepcopy(_changes),
+        }
+
+
+def restore_state(data):
+    if data:
+        with _lock:
+            _zones.update(data.get("zones", {}))
+            _records.update(data.get("records", {}))
+            _health_checks.update(data.get("health_checks", {}))
+            raw_tags = data.get("tags", {})
+            for k, v in raw_tags.items():
+                parts = k.split("|", 1)
+                if len(parts) == 2:
+                    _tags[(parts[0], parts[1])] = v
+            _caller_refs.update(data.get("caller_refs", {}))
+            _hc_caller_refs.update(data.get("hc_caller_refs", {}))
+            _changes.update(data.get("changes", {}))
+
+
+_restored = load_state("route53")
+if _restored:
+    restore_state(_restored)
 
 
 def reset():

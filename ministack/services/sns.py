@@ -162,11 +162,23 @@ def _delete_topic(params):
 
 
 def _list_topics(params):
+    all_arns = list(_topics.keys())
+    next_token = _p(params, "NextToken")
+    start = 0
+    if next_token:
+        try:
+            start = int(next_token)
+        except ValueError:
+            start = 0
+    page = all_arns[start:start + 100]
     members = "".join(
-        f"<member><TopicArn>{arn}</TopicArn></member>" for arn in _topics
+        f"<member><TopicArn>{arn}</TopicArn></member>" for arn in page
     )
+    next_token_xml = ""
+    if start + 100 < len(all_arns):
+        next_token_xml = f"<NextToken>{start + 100}</NextToken>"
     return _xml(200, "ListTopicsResponse",
-                f"<ListTopicsResult><Topics>{members}</Topics></ListTopicsResult>")
+                f"<ListTopicsResult><Topics>{members}</Topics>{next_token_xml}</ListTopicsResult>")
 
 
 def _get_topic_attributes(params):
@@ -297,20 +309,34 @@ def _unsubscribe(params):
 
 
 def _list_subscriptions(params):
-    members = ""
+    all_subs = []
     for topic in _topics.values():
         for sub in topic["subscriptions"]:
-            members += (
-                "<member>"
-                f"<SubscriptionArn>{sub['arn']}</SubscriptionArn>"
-                f"<Owner>{sub.get('owner', ACCOUNT_ID)}</Owner>"
-                f"<TopicArn>{sub['topic_arn']}</TopicArn>"
-                f"<Protocol>{sub['protocol']}</Protocol>"
-                f"<Endpoint>{sub['endpoint']}</Endpoint>"
-                "</member>"
-            )
+            all_subs.append(sub)
+    next_token = _p(params, "NextToken")
+    start = 0
+    if next_token:
+        try:
+            start = int(next_token)
+        except ValueError:
+            start = 0
+    page = all_subs[start:start + 100]
+    members = ""
+    for sub in page:
+        members += (
+            "<member>"
+            f"<SubscriptionArn>{sub['arn']}</SubscriptionArn>"
+            f"<Owner>{sub.get('owner', ACCOUNT_ID)}</Owner>"
+            f"<TopicArn>{sub['topic_arn']}</TopicArn>"
+            f"<Protocol>{sub['protocol']}</Protocol>"
+            f"<Endpoint>{sub['endpoint']}</Endpoint>"
+            "</member>"
+        )
+    next_token_xml = ""
+    if start + 100 < len(all_subs):
+        next_token_xml = f"<NextToken>{start + 100}</NextToken>"
     return _xml(200, "ListSubscriptionsResponse",
-                f"<ListSubscriptionsResult><Subscriptions>{members}</Subscriptions></ListSubscriptionsResult>")
+                f"<ListSubscriptionsResult><Subscriptions>{members}</Subscriptions>{next_token_xml}</ListSubscriptionsResult>")
 
 
 def _list_subscriptions_by_topic(params):

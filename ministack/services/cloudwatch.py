@@ -10,6 +10,7 @@ Operations: PutMetricData, GetMetricStatistics, GetMetricData, ListMetrics,
             PutDashboard, GetDashboard, DeleteDashboards, ListDashboards.
 """
 
+import copy
 import json
 import os
 import logging
@@ -19,6 +20,7 @@ from collections import defaultdict
 from datetime import datetime, timezone
 from urllib.parse import parse_qs
 
+from ministack.core.persistence import load_state, PERSIST_STATE
 from ministack.core.responses import new_uuid
 
 logger = logging.getLogger("cloudwatch")
@@ -33,6 +35,33 @@ _composite_alarms: dict = {}
 _alarm_history: list = []
 _resource_tags: dict = {}
 _dashboards: dict = {}  # dashboard_name -> {DashboardName, DashboardBody, LastModified}
+
+
+# ── Persistence ────────────────────────────────────────────
+
+def get_state():
+    return {
+        "metrics": copy.deepcopy(dict(_metrics)),
+        "alarms": copy.deepcopy(_alarms),
+        "composite_alarms": copy.deepcopy(_composite_alarms),
+        "dashboards": copy.deepcopy(_dashboards),
+        "resource_tags": copy.deepcopy(_resource_tags),
+    }
+
+
+def restore_state(data):
+    if data:
+        for k, v in data.get("metrics", {}).items():
+            _metrics[k].extend(v)
+        _alarms.update(data.get("alarms", {}))
+        _composite_alarms.update(data.get("composite_alarms", {}))
+        _dashboards.update(data.get("dashboards", {}))
+        _resource_tags.update(data.get("resource_tags", {}))
+
+
+_restored = load_state("cloudwatch")
+if _restored:
+    restore_state(_restored)
 
 
 # ---------------------------------------------------------------------------

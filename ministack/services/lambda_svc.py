@@ -42,6 +42,7 @@ from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import unquote
 
+from ministack.core.persistence import load_state, PERSIST_STATE
 from ministack.core.responses import error_response_json, json_response, new_uuid
 from ministack.core.lambda_runtime import get_or_create_worker, invalidate_worker
 
@@ -65,6 +66,47 @@ _esms: dict = {}  # uuid -> esm dict
 _function_urls: dict = {}  # function_name -> FunctionUrlConfig dict
 _poller_started = False
 _poller_lock = threading.Lock()
+
+
+# ── Persistence ────────────────────────────────────────────
+
+def get_state():
+    """Return JSON-serializable state. code_zip bytes are base64-encoded."""
+    funcs = {}
+    for name, func in _functions.items():
+        f = copy.deepcopy(func)
+        if f.get("code_zip") and isinstance(f["code_zip"], bytes):
+            f["code_zip"] = base64.b64encode(f["code_zip"]).decode()
+        for ver in f.get("versions", {}).values():
+            if ver.get("code_zip") and isinstance(ver["code_zip"], bytes):
+                ver["code_zip"] = base64.b64encode(ver["code_zip"]).decode()
+        funcs[name] = f
+    return {
+        "functions": funcs,
+        "layers": copy.deepcopy(_layers),
+        "esms": copy.deepcopy(_esms),
+        "function_urls": copy.deepcopy(_function_urls),
+    }
+
+
+def restore_state(data):
+    if data:
+        for name, func in data.get("functions", {}).items():
+            if func.get("code_zip") and isinstance(func["code_zip"], str):
+                func["code_zip"] = base64.b64decode(func["code_zip"])
+            for ver in func.get("versions", {}).values():
+                if ver.get("code_zip") and isinstance(ver["code_zip"], str):
+                    ver["code_zip"] = base64.b64decode(ver["code_zip"])
+            _functions[name] = func
+        _layers.update(data.get("layers", {}))
+        _esms.update(data.get("esms", {}))
+        _function_urls.update(data.get("function_urls", {}))
+
+
+_restored = load_state("lambda")
+if _restored:
+    restore_state(_restored)
+
 
 # ---------------------------------------------------------------------------
 # Wrapper script executed inside the subprocess.

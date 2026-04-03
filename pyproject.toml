@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ministack"
-version = "1.1.25"
+version = "1.1.26"
 description = "Free, open-source local AWS emulator — drop-in LocalStack replacement"
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -25,6 +25,7 @@ dependencies = [
     "uvicorn[standard]>=0.30.6",
     "httptools>=0.6.1",
     "pyyaml>=6.0",
+    "defusedxml>=0.7",
 ]
 
 [project.optional-dependencies]

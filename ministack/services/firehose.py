@@ -55,6 +55,7 @@ def _stream_arn(name: str) -> str:
 
 
 def _next_dest_id() -> str:
+    """Must be called while holding _lock."""
     global _dest_counter
     _dest_counter += 1
     return f"destinationId-{_dest_counter:012d}"

@@ -17445,3 +17445,409 @@ def test_cloudfront_get_invalidation(cloudfront):
     assert inv["Id"] == inv_id
     assert inv["Status"] == "Completed"
     assert "/getinv-path" in inv["InvalidationBatch"]["Paths"]["Items"]
+
+# ========== Persistence roundtrip — EC2, Route53, Cognito, ECR, CloudWatch, S3 ==========
+
+
+def test_persist_ec2_roundtrip():
+    from ministack.services import ec2 as _ec2
+    _ec2._instances["i-persist01"] = {"InstanceId": "i-persist01", "State": {"Name": "running"}}
+    state = _ec2.get_state()
+    assert "instances" in state
+    _ec2._instances.pop("i-persist01")
+    _ec2.restore_state(state)
+    assert "i-persist01" in _ec2._instances
+    _ec2._instances.pop("i-persist01")
+
+
+def test_persist_route53_roundtrip():
+    from ministack.services import route53 as _r53
+    _r53._zones["Z00PERSIST"] = {"Id": "Z00PERSIST", "Name": "persist.test."}
+    state = _r53.get_state()
+    assert "zones" in state
+    _r53._zones.pop("Z00PERSIST")
+    _r53.restore_state(state)
+    assert "Z00PERSIST" in _r53._zones
+    _r53._zones.pop("Z00PERSIST")
+
+
+def test_persist_cognito_roundtrip():
+    from ministack.services import cognito as _cog
+    _cog._user_pools["us-east-1_PERSIST"] = {"Id": "us-east-1_PERSIST", "Name": "persist-pool"}
+    state = _cog.get_state()
+    assert "user_pools" in state
+    _cog._user_pools.pop("us-east-1_PERSIST")
+    _cog.restore_state(state)
+    assert "us-east-1_PERSIST" in _cog._user_pools
+    _cog._user_pools.pop("us-east-1_PERSIST")
+
+
+def test_persist_ecr_roundtrip():
+    from ministack.services import ecr as _ecr
+    _ecr._repositories["persist-repo"] = {"repositoryName": "persist-repo", "repositoryArn": "arn:test"}
+    state = _ecr.get_state()
+    assert "repositories" in state
+    _ecr._repositories.pop("persist-repo")
+    _ecr.restore_state(state)
+    assert "persist-repo" in _ecr._repositories
+    _ecr._repositories.pop("persist-repo")
+
+
+def test_persist_cloudwatch_roundtrip():
+    from ministack.services import cloudwatch as _cw
+    _cw._alarms["persist-alarm"] = {"AlarmName": "persist-alarm", "StateValue": "OK"}
+    state = _cw.get_state()
+    assert "alarms" in state
+    _cw._alarms.pop("persist-alarm")
+    _cw.restore_state(state)
+    assert "persist-alarm" in _cw._alarms
+    _cw._alarms.pop("persist-alarm")
+
+
+def test_persist_s3_metadata_roundtrip():
+    from ministack.services import s3 as _s3
+    _s3._buckets["persist-bkt"] = {"created": "2025-01-01T00:00:00Z", "objects": {"k": {"body": b"v"}}, "region": "us-east-1"}
+    _s3._bucket_versioning["persist-bkt"] = "Enabled"
+    state = _s3.get_state()
+    assert "buckets_meta" in state
+    # Object bodies must NOT be in the persisted metadata
+    assert "objects" not in state["buckets_meta"].get("persist-bkt", {})
+    assert "bucket_versioning" in state
+    _s3._buckets.pop("persist-bkt")
+    _s3._bucket_versioning.pop("persist-bkt")
+    _s3.restore_state(state)
+    assert "persist-bkt" in _s3._buckets
+    assert _s3._buckets["persist-bkt"]["objects"] == {}  # objects not restored
+    assert _s3._bucket_versioning["persist-bkt"] == "Enabled"
+    _s3._buckets.pop("persist-bkt")
+    _s3._bucket_versioning.pop("persist-bkt")
+
+
+def test_persist_lambda_roundtrip():
+    from ministack.services import lambda_svc as _lam
+    _lam._functions["persist-fn"] = {
+        "config": {"FunctionName": "persist-fn", "Runtime": "python3.11"},
+        "code_zip": b"fake-zip-bytes",
+        "versions": {},
+        "next_version": 1,
+    }
+    state = _lam.get_state()
+    assert "functions" in state
+    # code_zip should be base64-encoded in state
+    assert isinstance(state["functions"]["persist-fn"]["code_zip"], str)
+    _lam._functions.pop("persist-fn")
+    _lam.restore_state(state)
+    assert "persist-fn" in _lam._functions
+    # code_zip should be decoded back to bytes
+    assert _lam._functions["persist-fn"]["code_zip"] == b"fake-zip-bytes"
+    _lam._functions.pop("persist-fn")
+
+
+def test_persist_rds_roundtrip():
+    from ministack.services import rds as _rds
+    _rds._instances["persist-db"] = {
+        "DBInstanceIdentifier": "persist-db",
+        "Engine": "postgres",
+        "DBInstanceStatus": "available",
+        "_docker_container_id": "fake-container-id",
+    }
+    state = _rds.get_state()
+    assert "instances" in state
+    assert "_docker_container_id" not in state["instances"]["persist-db"]
+    _rds._instances.pop("persist-db")
+    _rds.restore_state(state)
+    assert "persist-db" in _rds._instances
+    assert _rds._instances["persist-db"]["Engine"] == "postgres"
+    _rds._instances.pop("persist-db")
+
+
+def test_persist_ecs_roundtrip():
+    from ministack.services import ecs as _ecs
+    _ecs._clusters["persist-cluster"] = {"clusterName": "persist-cluster", "status": "ACTIVE"}
+    _ecs._tasks["arn:persist-task"] = {
+        "taskArn": "arn:persist-task",
+        "lastStatus": "RUNNING",
+        "_docker_ids": ["fake-id"],
+    }
+    state = _ecs.get_state()
+    assert "clusters" in state
+    assert "tasks" in state
+    assert "_docker_ids" not in state["tasks"]["arn:persist-task"]
+    _ecs._clusters.pop("persist-cluster")
+    _ecs._tasks.pop("arn:persist-task")
+    _ecs.restore_state(state)
+    assert "persist-cluster" in _ecs._clusters
+    assert "arn:persist-task" in _ecs._tasks
+    assert _ecs._tasks["arn:persist-task"]["lastStatus"] == "STOPPED"
+    _ecs._clusters.pop("persist-cluster")
+    _ecs._tasks.pop("arn:persist-task")
+
+
+def test_persist_elasticache_roundtrip():
+    from ministack.services import elasticache as _ec
+    _ec._clusters["persist-cache"] = {
+        "CacheClusterId": "persist-cache",
+        "Engine": "redis",
+        "CacheClusterStatus": "available",
+        "_docker_container_id": "fake-id",
+    }
+    state = _ec.get_state()
+    assert "clusters" in state
+    assert "_docker_container_id" not in state["clusters"]["persist-cache"]
+    _ec._clusters.pop("persist-cache")
+    _ec.restore_state(state)
+    assert "persist-cache" in _ec._clusters
+    assert _ec._clusters["persist-cache"]["Engine"] == "redis"
+    _ec._clusters.pop("persist-cache")
+
+
+# ========== DynamoDB Streams record content ==========
+
+
+def test_dynamodb_streams_table_has_stream_arn(ddb):
+    """Table with StreamSpecification returns LatestStreamArn and operations succeed."""
+    table_name = "stream-arn-test"
+    resp = ddb.create_table(
+        TableName=table_name,
+        KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+        AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "S"}],
+        BillingMode="PAY_PER_REQUEST",
+        StreamSpecification={"StreamEnabled": True, "StreamViewType": "NEW_AND_OLD_IMAGES"},
+    )
+    desc = ddb.describe_table(TableName=table_name)["Table"]
+    assert desc.get("LatestStreamArn") or desc.get("StreamSpecification", {}).get("StreamEnabled")
+
+    # All write operations should succeed with streams enabled
+    ddb.put_item(TableName=table_name, Item={"pk": {"S": "k1"}, "val": {"S": "v1"}})
+    ddb.update_item(
+        TableName=table_name,
+        Key={"pk": {"S": "k1"}},
+        UpdateExpression="SET val = :v",
+        ExpressionAttributeValues={":v": {"S": "v2"}},
+    )
+    ddb.delete_item(TableName=table_name, Key={"pk": {"S": "k1"}})
+    # Verify item is gone
+    get_resp = ddb.get_item(TableName=table_name, Key={"pk": {"S": "k1"}})
+    assert "Item" not in get_resp
+
+
+# ========== S3 GetObject with VersionId ==========
+
+
+def test_s3_get_object_with_version_id(s3):
+    """Enable versioning, put 2 versions of same key, verify version IDs differ."""
+    bucket = "s3-version-get-test"
+    s3.create_bucket(Bucket=bucket)
+    s3.put_bucket_versioning(
+        Bucket=bucket,
+        VersioningConfiguration={"Status": "Enabled"},
+    )
+
+    # Put version 1
+    r1 = s3.put_object(Bucket=bucket, Key="file.txt", Body=b"version-1")
+    vid1 = r1.get("VersionId")
+    assert vid1 is not None
+
+    # Put version 2
+    r2 = s3.put_object(Bucket=bucket, Key="file.txt", Body=b"version-2")
+    vid2 = r2.get("VersionId")
+    assert vid2 is not None
+    assert vid1 != vid2
+
+    # GetObject returns latest version with its VersionId
+    get_resp = s3.get_object(Bucket=bucket, Key="file.txt")
+    assert get_resp["Body"].read() == b"version-2"
+    assert get_resp.get("VersionId") == vid2
+
+
+# ========== Lambda warm worker invalidation ==========
+
+
+def test_lambda_warm_worker_invalidation(lam):
+    """Create function with code v1, invoke, update code to v2, invoke again — must see v2."""
+    import io as _io
+    import zipfile as _zf
+
+    fname = "lambda-worker-invalidation-test"
+    try:
+        lam.delete_function(FunctionName=fname)
+    except Exception:
+        pass
+
+    # v1 code
+    code_v1 = b'def handler(event, context):\n    return {"version": 1}\n'
+    buf1 = _io.BytesIO()
+    with _zf.ZipFile(buf1, "w") as z:
+        z.writestr("index.py", code_v1)
+    lam.create_function(
+        FunctionName=fname,
+        Runtime="python3.9",
+        Role="arn:aws:iam::000000000000:role/test-role",
+        Handler="index.handler",
+        Code={"ZipFile": buf1.getvalue()},
+    )
+
+    # Invoke v1
+    resp1 = lam.invoke(FunctionName=fname, Payload=json.dumps({}))
+    payload1 = json.loads(resp1["Payload"].read())
+    assert payload1["version"] == 1
+
+    # Update to v2
+    code_v2 = b'def handler(event, context):\n    return {"version": 2}\n'
+    buf2 = _io.BytesIO()
+    with _zf.ZipFile(buf2, "w") as z:
+        z.writestr("index.py", code_v2)
+    lam.update_function_code(FunctionName=fname, ZipFile=buf2.getvalue())
+
+    # Invoke v2
+    resp2 = lam.invoke(FunctionName=fname, Payload=json.dumps({}))
+    payload2 = json.loads(resp2["Payload"].read())
+    assert payload2["version"] == 2
+
+
+# ========== SFN UpdateStateMachine ==========
+
+
+def test_sfn_update_state_machine(sfn):
+    """Create SM, update definition, describe and verify new definition."""
+    defn_v1 = json.dumps({
+        "StartAt": "A",
+        "States": {"A": {"Type": "Pass", "Result": "v1", "End": True}},
+    })
+    create = sfn.create_state_machine(
+        name="sfn-update-test",
+        definition=defn_v1,
+        roleArn="arn:aws:iam::000000000000:role/R",
+    )
+    arn = create["stateMachineArn"]
+
+    defn_v2 = json.dumps({
+        "StartAt": "B",
+        "States": {"B": {"Type": "Pass", "Result": "v2", "End": True}},
+    })
+    sfn.update_state_machine(stateMachineArn=arn, definition=defn_v2)
+
+    desc = sfn.describe_state_machine(stateMachineArn=arn)
+    assert desc["definition"] == defn_v2
+
+
+# ========== SFN error paths ==========
+
+
+def test_sfn_create_duplicate_name(sfn):
+    """CreateStateMachine with duplicate name should fail."""
+    defn = json.dumps({
+        "StartAt": "X",
+        "States": {"X": {"Type": "Pass", "End": True}},
+    })
+    sfn.create_state_machine(
+        name="sfn-dup-err-test",
+        definition=defn,
+        roleArn="arn:aws:iam::000000000000:role/R",
+    )
+    with pytest.raises(ClientError) as exc:
+        sfn.create_state_machine(
+            name="sfn-dup-err-test",
+            definition=defn,
+            roleArn="arn:aws:iam::000000000000:role/R",
+        )
+    assert "StateMachineAlreadyExists" in str(exc.value) or "Conflict" in str(exc.value) or exc.value.response["Error"]["Code"]
+
+
+def test_sfn_describe_not_found(sfn):
+    """DescribeStateMachine on non-existent ARN should fail."""
+    with pytest.raises(ClientError) as exc:
+        sfn.describe_state_machine(stateMachineArn="arn:aws:states:us-east-1:000000000000:stateMachine:nonexistent-99")
+    err = exc.value.response["Error"]["Code"]
+    assert "StateMachineDoesNotExist" in err or "NotFound" in err or "ResourceNotFound" in err
+
+
+def test_sfn_start_execution_not_found(sfn):
+    """StartExecution on non-existent SM should fail."""
+    with pytest.raises(ClientError) as exc:
+        sfn.start_execution(stateMachineArn="arn:aws:states:us-east-1:000000000000:stateMachine:nonexistent-99")
+    err = exc.value.response["Error"]["Code"]
+    assert "StateMachineDoesNotExist" in err or "NotFound" in err or "ResourceNotFound" in err
+
+
+# ========== DynamoDB TagResource / UntagResource ==========
+
+
+def test_dynamodb_tag_untag_resource(ddb):
+    """Create table, tag it, list tags, untag, verify."""
+    table_name = "ddb-tag-test"
+    try:
+        ddb.delete_table(TableName=table_name)
+    except Exception:
+        pass
+    resp = ddb.create_table(
+        TableName=table_name,
+        KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+        AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "S"}],
+        BillingMode="PAY_PER_REQUEST",
+    )
+    arn = resp["TableDescription"]["TableArn"]
+
+    # Tag
+    ddb.tag_resource(ResourceArn=arn, Tags=[
+        {"Key": "env", "Value": "test"},
+        {"Key": "team", "Value": "platform"},
+    ])
+    tags = ddb.list_tags_of_resource(ResourceArn=arn)["Tags"]
+    tag_keys = {t["Key"] for t in tags}
+    assert "env" in tag_keys
+    assert "team" in tag_keys
+
+    # Untag
+    ddb.untag_resource(ResourceArn=arn, TagKeys=["team"])
+    tags2 = ddb.list_tags_of_resource(ResourceArn=arn)["Tags"]
+    tag_keys2 = {t["Key"] for t in tags2}
+    assert "env" in tag_keys2
+    assert "team" not in tag_keys2
+
+
+# ========== S3 EventBridge on delete ==========
+
+
+def test_s3_eventbridge_notification_on_delete(s3, sqs, eb):
+    """S3 delete_object should send EventBridge event when EventBridgeConfiguration is enabled."""
+    bucket = "s3-eb-del-bkt"
+    s3.create_bucket(Bucket=bucket)
+    queue_url = sqs.create_queue(QueueName="s3-eb-del-target-q")["QueueUrl"]
+    queue_arn = sqs.get_queue_attributes(
+        QueueUrl=queue_url, AttributeNames=["QueueArn"],
+    )["Attributes"]["QueueArn"]
+
+    # Enable EventBridge on bucket
+    s3.put_bucket_notification_configuration(
+        Bucket=bucket,
+        NotificationConfiguration={"EventBridgeConfiguration": {}},
+    )
+
+    # Create EventBridge rule matching S3 events -> SQS target
+    eb.put_rule(
+        Name="s3-del-to-sqs-rule",
+        EventPattern=json.dumps({"source": ["aws.s3"]}),
+        State="ENABLED",
+    )
+    eb.put_targets(
+        Rule="s3-del-to-sqs-rule",
+        Targets=[{"Id": "sqs-del-target", "Arn": queue_arn}],
+    )
+
+    # Put then delete object
+    s3.put_object(Bucket=bucket, Key="del-test.txt", Body=b"data")
+    # Drain the put event
+    time.sleep(0.5)
+    sqs.receive_message(QueueUrl=queue_url, MaxNumberOfMessages=10, WaitTimeSeconds=1)
+
+    # Now delete
+    s3.delete_object(Bucket=bucket, Key="del-test.txt")
+    time.sleep(0.5)
+
+    msgs = sqs.receive_message(QueueUrl=queue_url, MaxNumberOfMessages=10, WaitTimeSeconds=2)
+    assert "Messages" in msgs and len(msgs["Messages"]) > 0
+    body = json.loads(msgs["Messages"][0]["Body"])
+    assert body["source"] == "aws.s3"
+    assert body["detail"]["bucket"]["name"] == bucket
+    assert body["detail"]["object"]["key"] == "del-test.txt"

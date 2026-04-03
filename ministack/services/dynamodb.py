@@ -349,6 +349,11 @@ def _table_description(name):
         desc["LatestStreamArn"] = f"{t['TableArn']}/stream/{now_iso()}"
     if t.get("SSEDescription"):
         desc["SSEDescription"] = t["SSEDescription"]
+    desc["WarmThroughput"] = t.get("WarmThroughput", {
+        "ReadUnitsPerSecond": 0,
+        "WriteUnitsPerSecond": 0,
+        "Status": "ACTIVE",
+    })
     return desc
 
 

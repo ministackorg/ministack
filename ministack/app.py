@@ -243,6 +243,7 @@ async def app(scope, receive, send):
             await _send_response(send, status, resp_headers, resp_body)
             return
 
+    # Admin endpoints — no wildcard CORS headers (return early, before CORS block)
     if path == "/_ministack/reset" and method == "POST":
         _reset_all_state()
         await _send_response(send, 200, {"Content-Type": "application/json"},
@@ -548,6 +549,16 @@ async def _handle_lifespan(scope, receive, send):
                     "eventbridge": eventbridge.get_state,
                     "cloudwatch_logs": cloudwatch_logs.get_state,
                     "kinesis": kinesis.get_state,
+                    "ec2": ec2.get_state,
+                    "route53": route53.get_state,
+                    "cognito": cognito.get_state,
+                    "ecr": ecr.get_state,
+                    "cloudwatch": cloudwatch.get_state,
+                    "s3": s3.get_state,
+                    "lambda": lambda_svc.get_state,
+                    "rds": rds.get_state,
+                    "ecs": ecs.get_state,
+                    "elasticache": elasticache.get_state,
                 })
             await send({"type": "lifespan.shutdown.complete"})
             return
@@ -626,6 +637,7 @@ def _reset_all_state():
         (cloudformation, cloudformation.reset),
         (kms, kms.reset),
         (cloudfront, cloudfront.reset),
+        (ecr, ecr.reset),
     ]:
         try:
             fn()

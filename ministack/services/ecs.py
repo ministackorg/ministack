@@ -14,11 +14,13 @@ Supports: CreateCluster, DeleteCluster, DescribeClusters, ListClusters,
 Container execution: if Docker socket is available, RunTask actually runs containers.
 """
 
+import copy
 import json
 import logging
 import os
 import time
 
+from ministack.core.persistence import load_state
 from ministack.core.responses import (
     error_response_json,
     json_response,
@@ -41,6 +43,49 @@ _account_settings: dict = {}
 _capacity_providers: dict = {}
 
 _docker = None
+
+
+# ── Persistence ────────────────────────────────────────────
+
+def get_state():
+    state = {
+        "clusters": copy.deepcopy(_clusters),
+        "task_defs": copy.deepcopy(_task_defs),
+        "task_def_latest": copy.deepcopy(_task_def_latest),
+        "services": copy.deepcopy(_services),
+        "tags": copy.deepcopy(_tags),
+        "account_settings": copy.deepcopy(_account_settings),
+        "capacity_providers": copy.deepcopy(_capacity_providers),
+    }
+    # Save tasks but strip Docker container IDs
+    tasks = {}
+    for arn, task in _tasks.items():
+        t = copy.deepcopy(task)
+        t.pop("_docker_ids", None)
+        tasks[arn] = t
+    state["tasks"] = tasks
+    return state
+
+
+def restore_state(data):
+    if not data:
+        return
+    _clusters.update(data.get("clusters", {}))
+    _task_defs.update(data.get("task_defs", {}))
+    _task_def_latest.update(data.get("task_def_latest", {}))
+    _services.update(data.get("services", {}))
+    _tags.update(data.get("tags", {}))
+    _account_settings.update(data.get("account_settings", {}))
+    _capacity_providers.update(data.get("capacity_providers", {}))
+    for arn, task in data.get("tasks", {}).items():
+        task["_docker_ids"] = []
+        task["lastStatus"] = "STOPPED"
+        _tasks[arn] = task
+
+
+_restored = load_state("ecs")
+if _restored:
+    restore_state(_restored)
 
 
 def _get_docker():

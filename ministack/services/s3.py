@@ -23,6 +23,7 @@ Storage: In-memory (optionally backed by S3_DATA_DIR).
 """
 
 import base64
+import copy
 import datetime as _dt
 import hashlib
 import json
@@ -32,8 +33,10 @@ import re
 import threading
 import time
 from urllib.parse import quote as url_quote, unquote as url_unquote, parse_qs as _parse_qs
-from xml.etree.ElementTree import Element, SubElement, tostring, fromstring
+from defusedxml.ElementTree import fromstring
+from xml.etree.ElementTree import Element, SubElement, tostring
 
+from ministack.core.persistence import load_state, PERSIST_STATE
 from ministack.core.responses import (
     md5_hash,
     sha256_hash,
@@ -73,6 +76,53 @@ _object_retention: dict = {}
 _object_legal_hold: dict = {}
 
 _multipart_uploads: dict = {}
+
+# ── Persistence (metadata only — object bodies are NOT persisted here) ────
+
+def get_state():
+    # Persist bucket metadata without object bodies
+    buckets_meta = {}
+    for name, bkt in _buckets.items():
+        meta = {k: v for k, v in bkt.items() if k != "objects"}
+        buckets_meta[name] = meta
+    return {
+        "buckets_meta": copy.deepcopy(buckets_meta),
+        "bucket_versioning": copy.deepcopy(_bucket_versioning),
+        "bucket_notifications": copy.deepcopy(_bucket_notifications),
+        "bucket_tags": copy.deepcopy(_bucket_tags),
+        "bucket_policies": copy.deepcopy(_bucket_policies),
+        "bucket_encryption": copy.deepcopy(_bucket_encryption),
+        "bucket_lifecycle": copy.deepcopy(_bucket_lifecycle),
+        "bucket_cors": copy.deepcopy(_bucket_cors),
+        "bucket_acl": copy.deepcopy(_bucket_acl),
+        "bucket_websites": copy.deepcopy(_bucket_websites),
+        "bucket_object_lock": copy.deepcopy(_bucket_object_lock),
+        "bucket_replication": copy.deepcopy(_bucket_replication),
+    }
+
+
+def restore_state(data):
+    if data:
+        for name, meta in data.get("buckets_meta", {}).items():
+            if name not in _buckets:
+                _buckets[name] = {**meta, "objects": {}}
+        _bucket_versioning.update(data.get("bucket_versioning", {}))
+        _bucket_notifications.update(data.get("bucket_notifications", {}))
+        _bucket_tags.update(data.get("bucket_tags", {}))
+        _bucket_policies.update(data.get("bucket_policies", {}))
+        _bucket_encryption.update(data.get("bucket_encryption", {}))
+        _bucket_lifecycle.update(data.get("bucket_lifecycle", {}))
+        _bucket_cors.update(data.get("bucket_cors", {}))
+        _bucket_acl.update(data.get("bucket_acl", {}))
+        _bucket_websites.update(data.get("bucket_websites", {}))
+        _bucket_object_lock.update(data.get("bucket_object_lock", {}))
+        _bucket_replication.update(data.get("bucket_replication", {}))
+
+
+_restored = load_state("s3")
+if _restored:
+    restore_state(_restored)
+
 
 DATA_DIR = os.environ.get("S3_DATA_DIR", "/tmp/ministack-data/s3")
 PERSIST = os.environ.get("S3_PERSIST", "0") == "1"

@@ -225,12 +225,24 @@ def _update_state_machine(data):
 
 
 def _list_state_machines(data):
-    machines = [
+    all_machines = [
         {"stateMachineArn": sm["stateMachineArn"], "name": sm["name"],
          "type": sm["type"], "creationDate": sm["creationDate"]}
         for sm in _state_machines.values()
     ]
-    return json_response({"stateMachines": machines})
+    max_results = int(data.get("maxResults", 1000))
+    next_token = data.get("nextToken")
+    start = 0
+    if next_token:
+        try:
+            start = int(next_token)
+        except ValueError:
+            start = 0
+    page = all_machines[start:start + max_results]
+    resp = {"stateMachines": page}
+    if start + max_results < len(all_machines):
+        resp["nextToken"] = str(start + max_results)
+    return json_response(resp)
 
 
 # ---------------------------------------------------------------------------
@@ -333,13 +345,13 @@ def _describe_execution(data):
 def _list_executions(data):
     sm_arn = data.get("stateMachineArn")
     status_filter = data.get("statusFilter")
-    execs = []
+    all_execs = []
     for ex in _executions.values():
         if sm_arn and ex["stateMachineArn"] != sm_arn:
             continue
         if status_filter and ex["status"] != status_filter:
             continue
-        execs.append({
+        all_execs.append({
             "executionArn": ex["executionArn"],
             "stateMachineArn": ex["stateMachineArn"],
             "name": ex["name"],
@@ -347,7 +359,19 @@ def _list_executions(data):
             "startDate": ex["startDate"],
             "stopDate": ex.get("stopDate"),
         })
-    return json_response({"executions": execs})
+    max_results = int(data.get("maxResults", 1000))
+    next_token = data.get("nextToken")
+    start = 0
+    if next_token:
+        try:
+            start = int(next_token)
+        except ValueError:
+            start = 0
+    page = all_execs[start:start + max_results]
+    resp = {"executions": page}
+    if start + max_results < len(all_execs):
+        resp["nextToken"] = str(start + max_results)
+    return json_response(resp)
 
 
 def _get_execution_history(data):

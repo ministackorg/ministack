@@ -7,6 +7,27 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [1.1.26] — 2026-04-03
+
+### Added
+- **CloudFront service** — CreateDistribution, GetDistribution, GetDistributionConfig, ListDistributions, UpdateDistribution, DeleteDistribution, CreateInvalidation, ListInvalidations, GetInvalidation; ETag-based concurrency control. Contributed by @Nikhiladiga
+- **ECR service** — CreateRepository, DescribeRepositories, DeleteRepository, PutImage, BatchGetImage, BatchDeleteImage, ListImages, DescribeImages, GetAuthorizationToken, lifecycle policies, repository policies, tags, layer upload flow. Contributed by @moabukar
+- **IAM DeleteServiceLinkedRole / GetServiceLinkedRoleDeletionStatus** — Contributed by @jgrumboe
+- **State persistence for 10 more services** — Lambda (config + code_zip as base64), EC2, Route53, Cognito, ECR, CloudWatch Metrics, S3 metadata, RDS (reconnects Docker containers), ECS (tasks restored as stopped), ElastiCache (reconnects Docker containers) now persist when `PERSIST_STATE=1` (20 services total)
+- **SNS/SFN pagination** — ListTopics, ListSubscriptions, ListStateMachines, ListExecutions now support NextToken/maxResults
+- **defusedxml** — S3 and Route53 XML parsing now uses `defusedxml` to protect against billion-laughs DoS
+
+### Fixed
+- **DynamoDB `WarmThroughput`** — DescribeTable now returns `WarmThroughput` field; fixes latest Terraform AWS provider compatibility. Reported by @chad-bekmezian-snap
+- **Firehose deadlock** — `_next_dest_id` no longer acquires lock (always called within `_lock` context)
+- **Redis bound to localhost** — docker-compose.yml Redis port now `127.0.0.1:6379:6379`
+- **EDGE_PORT documented** — added to README Configuration table as LocalStack alias
+
+### Tests
+- 926 tests total, all passing
+
+---
+
 ## [1.1.25] — 2026-04-03
 
 ### Added

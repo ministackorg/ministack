@@ -20,11 +20,13 @@ When Docker is available, CreateCacheCluster spins up a real Redis/Memcached con
 Otherwise returns localhost:6379 (assumes Redis sidecar in docker-compose).
 """
 
+import copy
 import logging
 import os
 import time
 from urllib.parse import parse_qs
 
+from ministack.core.persistence import load_state
 from ministack.core.responses import new_uuid
 
 logger = logging.getLogger("elasticache")
@@ -48,6 +50,63 @@ _events: list = []
 _port_counter = [BASE_PORT]
 
 _docker = None
+
+
+# ── Persistence ────────────────────────────────────────────
+
+def get_state():
+    state = {
+        "replication_groups": copy.deepcopy(_replication_groups),
+        "subnet_groups": copy.deepcopy(_subnet_groups),
+        "param_groups": copy.deepcopy(_param_groups),
+        "param_group_params": copy.deepcopy(_param_group_params),
+        "tags": copy.deepcopy(_tags),
+        "snapshots": copy.deepcopy(_snapshots),
+        "users": copy.deepcopy(_users),
+        "user_groups": copy.deepcopy(_user_groups),
+        "port_counter": _port_counter[0],
+    }
+    clusters = {}
+    for name, cl in _clusters.items():
+        c = copy.deepcopy(cl)
+        c.pop("_docker_container_id", None)
+        clusters[name] = c
+    state["clusters"] = clusters
+    return state
+
+
+def restore_state(data):
+    if not data:
+        return
+    _replication_groups.update(data.get("replication_groups", {}))
+    _subnet_groups.update(data.get("subnet_groups", {}))
+    _param_groups.update(data.get("param_groups", {}))
+    _param_group_params.update(data.get("param_group_params", {}))
+    _tags.update(data.get("tags", {}))
+    _snapshots.update(data.get("snapshots", {}))
+    _users.update(data.get("users", {}))
+    _user_groups.update(data.get("user_groups", {}))
+    if "port_counter" in data:
+        _port_counter[0] = data["port_counter"]
+    docker_client = _get_docker()
+    for name, cl in data.get("clusters", {}).items():
+        cl["_docker_container_id"] = None
+        if docker_client:
+            try:
+                c = docker_client.containers.get(f"ministack-ec-{name}")
+                if c.status == "running":
+                    cl["_docker_container_id"] = c.id
+                    cl["CacheClusterStatus"] = "available"
+                else:
+                    cl["CacheClusterStatus"] = "stopped"
+            except Exception:
+                cl["CacheClusterStatus"] = "stopped"
+        _clusters[name] = cl
+
+
+_restored = load_state("elasticache")
+if _restored:
+    restore_state(_restored)
 
 
 def _get_docker():

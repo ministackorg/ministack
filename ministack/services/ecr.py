@@ -4,12 +4,14 @@ JSON-based API via X-Amz-Target (prefix: AmazonEC2ContainerRegistry_V20150921).
 """
 
 import base64
+import copy
 import hashlib
 import json
 import logging
 import os
 import time
 
+from ministack.core.persistence import load_state, PERSIST_STATE
 from ministack.core.responses import error_response_json, json_response, new_uuid
 
 logger = logging.getLogger("ecr")
@@ -21,6 +23,30 @@ _repositories: dict = {}
 _images: dict = {}
 _lifecycle_policies: dict = {}
 _repo_policies: dict = {}
+
+
+# ── Persistence ────────────────────────────────────────────
+
+def get_state():
+    return {
+        "repositories": copy.deepcopy(_repositories),
+        "images": copy.deepcopy(_images),
+        "lifecycle_policies": copy.deepcopy(_lifecycle_policies),
+        "repo_policies": copy.deepcopy(_repo_policies),
+    }
+
+
+def restore_state(data):
+    if data:
+        _repositories.update(data.get("repositories", {}))
+        _images.update(data.get("images", {}))
+        _lifecycle_policies.update(data.get("lifecycle_policies", {}))
+        _repo_policies.update(data.get("repo_policies", {}))
+
+
+_restored = load_state("ecr")
+if _restored:
+    restore_state(_restored)
 
 
 def _repo_arn(name):

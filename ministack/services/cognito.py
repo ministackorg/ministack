@@ -43,6 +43,7 @@ Wire protocol:
 """
 
 import base64
+import copy
 import os
 import json
 import logging
@@ -53,6 +54,7 @@ import time
 from datetime import datetime, timezone
 from urllib.parse import parse_qs
 
+from ministack.core.persistence import load_state, PERSIST_STATE
 from ministack.core.responses import error_response_json, json_response, new_uuid
 
 logger = logging.getLogger("cognito")
@@ -93,6 +95,30 @@ _identity_pools: dict = {}
 # }
 
 _identity_tags: dict = {}   # identity_pool_id -> {key: value}
+
+
+# ── Persistence ────────────────────────────────────────────
+
+def get_state():
+    return {
+        "user_pools": copy.deepcopy(_user_pools),
+        "pool_domain_map": copy.deepcopy(_pool_domain_map),
+        "identity_pools": copy.deepcopy(_identity_pools),
+        "identity_tags": copy.deepcopy(_identity_tags),
+    }
+
+
+def restore_state(data):
+    if data:
+        _user_pools.update(data.get("user_pools", {}))
+        _pool_domain_map.update(data.get("pool_domain_map", {}))
+        _identity_pools.update(data.get("identity_pools", {}))
+        _identity_tags.update(data.get("identity_tags", {}))
+
+
+_restored = load_state("cognito")
+if _restored:
+    restore_state(_restored)
 
 
 # ---------------------------------------------------------------------------

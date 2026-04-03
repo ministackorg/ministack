@@ -14,7 +14,8 @@ import random
 import re
 import string
 from datetime import datetime, timezone
-from xml.etree.ElementTree import Element, SubElement, fromstring, tostring
+from defusedxml.ElementTree import fromstring
+from xml.etree.ElementTree import Element, SubElement, tostring
 
 from ministack.core.responses import new_uuid
 
