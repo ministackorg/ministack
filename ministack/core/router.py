@@ -156,7 +156,11 @@ SERVICE_PATTERNS = {
     },
     "kms": {
         "target_prefixes": ["TrentService"],
-        "host_patterns": [r"kms\."],
+        "host_patterns": [r"kms\."]
+    },
+    "cloudfront": {
+        "host_patterns": [r"cloudfront\."],
+        "credential_scope": "cloudfront",
     },
 }
 
@@ -208,6 +212,7 @@ def detect_service(method: str, path: str, headers: dict, query_params: dict) ->
                 "elasticfilesystem": "elasticfilesystem",
                 "cloudformation": "cloudformation",
                 "kms": "kms",
+                "cloudfront": "cloudfront",
             }
             if svc_name in scope_map:
                 return scope_map[svc_name]
@@ -402,6 +407,8 @@ def detect_service(method: str, path: str, headers: dict, query_params: dict) ->
 
     # 4. Check URL path patterns
     path_lower = path.lower()
+    if path_lower.startswith("/2020-05-31/"):
+        return "cloudfront"
     if path_lower.startswith("/2013-04-01/"):
         return "route53"
     if path_lower.startswith("/v2/apis"):
