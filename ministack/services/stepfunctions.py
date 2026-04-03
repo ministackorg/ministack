@@ -42,6 +42,54 @@ logger = logging.getLogger("states")
 ACCOUNT_ID = "000000000000"
 REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 
+# SFN mock config — compatible with LocalStack's SFN_MOCK_CONFIG / LOCALSTACK_SFN_MOCK_CONFIG
+_sfn_mock_config: dict = {}
+_sfn_mock_config_path = (
+    os.environ.get("SFN_MOCK_CONFIG")
+    or os.environ.get("LOCALSTACK_SFN_MOCK_CONFIG")
+    or ""
+)
+if _sfn_mock_config_path:
+    try:
+        with open(_sfn_mock_config_path) as f:
+            _sfn_mock_config = json.load(f)
+        logger.info("SFN mock config loaded from %s", _sfn_mock_config_path)
+    except Exception as e:
+        logger.warning("Failed to load SFN mock config from %s: %s", _sfn_mock_config_path, e)
+
+
+def _get_mock_response(sm_name: str, test_case: str, state_name: str, attempt: int) -> dict | None:
+    """Look up a mock response for a state using the AWS SFN Local mock config format.
+
+    Format: StateMachines.<SM>.TestCases.<TC>.<State> -> response name
+            MockedResponses.<name>.<attempt> -> {Return: ...} or {Throw: ...}
+    Attempt keys can be "0", "1", "1-3", etc.
+    """
+    sm_cfg = _sfn_mock_config.get("StateMachines", {}).get(sm_name, {})
+    if not test_case or not sm_cfg:
+        return None
+    tc = sm_cfg.get("TestCases", {}).get(test_case, {})
+    response_name = tc.get(state_name)
+    if not response_name:
+        return None
+    mocked = _sfn_mock_config.get("MockedResponses", {}).get(response_name, {})
+    if not mocked:
+        return None
+    # Match attempt: exact ("0") or range ("1-3")
+    str_attempt = str(attempt)
+    if str_attempt in mocked:
+        return mocked[str_attempt]
+    for key, val in mocked.items():
+        if "-" in key:
+            parts = key.split("-", 1)
+            try:
+                lo, hi = int(parts[0]), int(parts[1])
+                if lo <= attempt <= hi:
+                    return val
+            except ValueError:
+                continue
+    return None
+
 _state_machines: dict = {}
 _executions: dict = {}
 _task_tokens: dict = {}
@@ -87,6 +135,7 @@ async def handle_request(method, path, headers, body, query_params):
         "DescribeActivity": _describe_activity,
         "ListActivities": _list_activities,
         "GetActivityTask": _get_activity_task,
+        "TestState": _test_state,
     }
 
     handler = handlers.get(action)
@@ -185,7 +234,13 @@ def _list_state_machines(data):
 # ---------------------------------------------------------------------------
 
 def _start_execution(data):
-    sm_arn = data.get("stateMachineArn")
+    sm_arn_raw = data.get("stateMachineArn", "")
+    # Support #TestCaseName suffix for mock config
+    test_case = ""
+    if "#" in sm_arn_raw:
+        sm_arn, test_case = sm_arn_raw.rsplit("#", 1)
+    else:
+        sm_arn = sm_arn_raw
     if sm_arn not in _state_machines:
         return error_response_json(
             "StateMachineDoesNotExist",
@@ -210,6 +265,8 @@ def _start_execution(data):
         "inputDetails": {"included": True},
         "output": None,
         "outputDetails": {"included": True},
+        "testCase": test_case,
+        "mockAttempts": {},
         "events": [
             {"id": 1, "type": "ExecutionStarted", "timestamp": start_date,
              "executionStartedEventDetails": {
@@ -304,7 +361,12 @@ def _get_execution_history(data):
 
 
 def _start_sync_execution(data):
-    sm_arn = data.get("stateMachineArn")
+    sm_arn_raw = data.get("stateMachineArn", "")
+    test_case = ""
+    if "#" in sm_arn_raw:
+        sm_arn, test_case = sm_arn_raw.rsplit("#", 1)
+    else:
+        sm_arn = sm_arn_raw
     if sm_arn not in _state_machines:
         return error_response_json(
             "StateMachineDoesNotExist",
@@ -329,6 +391,8 @@ def _start_sync_execution(data):
         "inputDetails": {"included": True},
         "output": None,
         "outputDetails": {"included": True},
+        "testCase": test_case,
+        "mockAttempts": {},
         "events": [
             {"id": 1, "type": "ExecutionStarted", "timestamp": start_date,
              "executionStartedEventDetails": {
@@ -535,6 +599,220 @@ def _add_event(execution, event_type, details=None):
     return event
 
 
+# ---------------------------------------------------------------------------
+# TestState API
+# ---------------------------------------------------------------------------
+
+def _test_state(data):
+    """Execute a single state in isolation — AWS TestState API."""
+    definition_str = data.get("definition")
+    if not definition_str:
+        return error_response_json("InvalidDefinition", "definition is required", 400)
+
+    try:
+        definition = json.loads(definition_str) if isinstance(definition_str, str) else definition_str
+    except json.JSONDecodeError:
+        return error_response_json("InvalidDefinition", "Invalid JSON in definition", 400)
+
+    input_str = data.get("input", "{}")
+    try:
+        input_data = json.loads(input_str) if isinstance(input_str, str) else input_str
+    except json.JSONDecodeError:
+        return error_response_json("InvalidExecutionInput", "Invalid JSON in input", 400)
+
+    inspection_level = data.get("inspectionLevel", "INFO")
+    state_name = data.get("stateName")
+    mock_raw = data.get("mock")
+    if isinstance(mock_raw, str):
+        try:
+            mock = json.loads(mock_raw)
+        except json.JSONDecodeError:
+            mock = None
+    else:
+        mock = mock_raw
+
+    # If definition has States (full SM definition), extract the target state
+    if "States" in definition:
+        if not state_name:
+            state_name = definition.get("StartAt")
+        states = definition.get("States", {})
+        if state_name not in states:
+            return error_response_json("InvalidDefinition",
+                f"State '{state_name}' not found in definition", 400)
+        state_def = states[state_name]
+    else:
+        # Single state definition
+        state_def = definition
+        if not state_name:
+            state_name = "TestState"
+
+    state_type = state_def.get("Type")
+    if not state_type:
+        return error_response_json("InvalidDefinition", "State must have a Type", 400)
+
+    # Build context
+    user_ctx = data.get("context")
+    if user_ctx:
+        try:
+            ctx = json.loads(user_ctx) if isinstance(user_ctx, str) else user_ctx
+        except json.JSONDecodeError:
+            ctx = {}
+    else:
+        ctx = {}
+    ctx.setdefault("Execution", {"Id": f"arn:aws:states:{REGION}:{ACCOUNT_ID}:execution:test:{new_uuid()}", "Name": "test", "StartTime": now_iso()})
+    ctx.setdefault("StateMachine", {"Id": "test", "Name": "test"})
+    ctx["State"] = {"Name": state_name, "EnteredTime": now_iso()}
+
+    inspection_data = {}
+    if inspection_level in ("DEBUG", "TRACE"):
+        inspection_data["input"] = json.dumps(input_data)
+
+    result = {}
+    try:
+        if state_type == "Pass":
+            output, next_state = _execute_pass(state_def, input_data)
+            result = {"status": "SUCCEEDED", "output": json.dumps(output)}
+            if next_state:
+                result["nextState"] = next_state
+
+        elif state_type == "Choice":
+            output, next_state = _execute_choice(state_def, input_data)
+            result = {"status": "SUCCEEDED", "output": json.dumps(output)}
+            if next_state:
+                result["nextState"] = next_state
+
+        elif state_type == "Wait":
+            output, next_state = _execute_wait(state_def, input_data)
+            result = {"status": "SUCCEEDED", "output": json.dumps(output)}
+            if next_state:
+                result["nextState"] = next_state
+
+        elif state_type == "Succeed":
+            output = _apply_input_path(state_def, input_data)
+            output = _apply_output_path(state_def, output)
+            result = {"status": "SUCCEEDED", "output": json.dumps(output)}
+
+        elif state_type == "Fail":
+            result = {
+                "status": "FAILED",
+                "error": state_def.get("Error", "States.Fail"),
+                "cause": state_def.get("Cause", ""),
+            }
+
+        elif state_type == "Task":
+            effective = _apply_input_path(state_def, input_data)
+            effective = _apply_parameters(state_def, effective, ctx)
+
+            if inspection_level in ("DEBUG", "TRACE"):
+                inspection_data["afterInputPath"] = json.dumps(_apply_input_path(state_def, input_data))
+                inspection_data["afterParameters"] = json.dumps(effective)
+
+            # Mock support
+            if mock:
+                if "errorOutput" in mock:
+                    err = mock["errorOutput"]
+                    error_code = err.get("error", "MockError")
+                    cause = err.get("cause", "Mocked failure")
+                    # Check Catch
+                    catchers = state_def.get("Catch", [])
+                    catcher = _find_matching_catcher(catchers, error_code)
+                    if catcher:
+                        error_output = {"Error": error_code, "Cause": cause}
+                        output = _apply_result_path_raw(
+                            catcher.get("ResultPath", "$"), input_data, error_output)
+                        result = {
+                            "status": "CAUGHT_ERROR",
+                            "output": json.dumps(output),
+                            "error": error_code,
+                            "cause": cause,
+                            "nextState": catcher["Next"],
+                        }
+                    else:
+                        # Check Retry
+                        retriers = state_def.get("Retry", [])
+                        retrier, _ = _find_matching_retrier(retriers, error_code, {})
+                        if retrier is not None:
+                            retry_config = data.get("stateConfiguration", {})
+                            retry_count = retry_config.get("retrierRetryCount", 0)
+                            max_attempts = retrier.get("MaxAttempts", 3)
+                            if retry_count < max_attempts:
+                                interval = retrier.get("IntervalSeconds", 1)
+                                backoff = retrier.get("BackoffRate", 2.0)
+                                result = {
+                                    "status": "RETRIABLE",
+                                    "error": error_code,
+                                    "cause": cause,
+                                }
+                                if inspection_level in ("DEBUG", "TRACE"):
+                                    inspection_data["errorDetails"] = {
+                                        "retryBackoffIntervalSeconds": interval * (backoff ** retry_count),
+                                        "retryIndex": 0,
+                                    }
+                            else:
+                                result = {"status": "FAILED", "error": error_code, "cause": cause}
+                        else:
+                            result = {"status": "FAILED", "error": error_code, "cause": cause}
+                elif "result" in mock:
+                    try:
+                        mock_result = json.loads(mock["result"]) if isinstance(mock["result"], str) else mock["result"]
+                    except json.JSONDecodeError:
+                        mock_result = mock["result"]
+                    task_result = _apply_result_selector(state_def, mock_result)
+                    output = _apply_result_path(state_def, input_data, task_result)
+                    output = _apply_output_path(state_def, output)
+                    result = {"status": "SUCCEEDED", "output": json.dumps(output)}
+                    next_state = _next_or_end(state_def)
+                    if next_state:
+                        result["nextState"] = next_state
+            else:
+                # Real execution
+                resource = state_def.get("Resource", "")
+                try:
+                    task_result = _invoke_resource(resource, effective)
+                    task_result = _apply_result_selector(state_def, task_result)
+
+                    if inspection_level in ("DEBUG", "TRACE"):
+                        inspection_data["result"] = json.dumps(task_result)
+                        inspection_data["afterResultSelector"] = json.dumps(task_result)
+
+                    output = _apply_result_path(state_def, input_data, task_result)
+
+                    if inspection_level in ("DEBUG", "TRACE"):
+                        inspection_data["afterResultPath"] = json.dumps(output)
+
+                    output = _apply_output_path(state_def, output)
+                    result = {"status": "SUCCEEDED", "output": json.dumps(output)}
+                    next_state = _next_or_end(state_def)
+                    if next_state:
+                        result["nextState"] = next_state
+                except _ExecutionError as err:
+                    catchers = state_def.get("Catch", [])
+                    catcher = _find_matching_catcher(catchers, err.error)
+                    if catcher:
+                        error_output = {"Error": err.error, "Cause": err.cause}
+                        output = _apply_result_path_raw(
+                            catcher.get("ResultPath", "$"), input_data, error_output)
+                        result = {
+                            "status": "CAUGHT_ERROR",
+                            "output": json.dumps(output),
+                            "error": err.error,
+                            "cause": err.cause,
+                            "nextState": catcher["Next"],
+                        }
+                    else:
+                        result = {"status": "FAILED", "error": err.error, "cause": err.cause}
+        else:
+            return error_response_json("InvalidDefinition", f"Unsupported state type: {state_type}", 400)
+
+    except _ExecutionError as err:
+        result = {"status": "FAILED", "error": err.error, "cause": err.cause}
+
+    if inspection_level in ("DEBUG", "TRACE") and inspection_data:
+        result["inspectionData"] = inspection_data
+
+    return json_response(result)
+
+
 # ===================================================================
 # ASL Execution Engine
 # ===================================================================
@@ -702,6 +980,26 @@ def _execute_pass(state_def, raw_input):
 def _execute_task(state_def, raw_input, execution, ctx):
     resource = state_def.get("Resource", "")
     is_callback = ".waitForTaskToken" in resource
+
+    # SFN mock config — return canned response if configured (AWS SFN Local format)
+    if _sfn_mock_config and execution:
+        test_case = execution.get("testCase", "")
+        sm_name = ctx.get("StateMachine", {}).get("Name", "")
+        state_name = ctx.get("State", {}).get("Name", "")
+        attempts = execution.get("mockAttempts", {})
+        attempt = attempts.get(state_name, 0)
+        mock = _get_mock_response(sm_name, test_case, state_name, attempt)
+        if mock is not None:
+            attempts[state_name] = attempt + 1
+            if "Throw" in mock:
+                raise _ExecutionError(
+                    mock["Throw"].get("Error", "MockError"),
+                    mock["Throw"].get("Cause", "Mocked failure"))
+            mock_result = mock.get("Return", {})
+            result = _apply_result_selector(state_def, mock_result)
+            output = _apply_result_path(state_def, raw_input, result)
+            output = _apply_output_path(state_def, output)
+            return output, _next_or_end(state_def)
 
     if is_callback:
         ctx["Task"] = {"Token": new_uuid()}
@@ -871,32 +1169,38 @@ def _invoke_with_callback(resource, input_data, token, state_def):
 
 
 def _call_lambda(func_name, event):
-    """Invoke a Lambda via the co-located lambda_svc module."""
+    """Invoke a Lambda via the co-located lambda_svc module (synchronous)."""
     try:
         from ministack.services import lambda_svc
     except ImportError:
         logger.warning("lambda_svc unavailable; returning passthrough for %s", func_name)
         return event
 
-    status, headers, body = asyncio.run(lambda_svc._invoke(func_name, event, {}))
+    func = lambda_svc._functions.get(func_name)
+    if not func:
+        raise _ExecutionError(
+            "Lambda.ResourceNotFoundException",
+            f"Function not found: {func_name}")
 
-    if headers.get("X-Amz-Function-Error"):
-        try:
-            err = json.loads(body)
-            raise _ExecutionError(
-                err.get("errorType", "Lambda.Unknown"),
-                err.get("errorMessage", body.decode("utf-8", errors="replace")
-                         if isinstance(body, bytes) else str(body)))
-        except (json.JSONDecodeError, UnicodeDecodeError):
-            raise _ExecutionError(
-                "Lambda.Unknown",
-                body.decode("utf-8", errors="replace")
-                if isinstance(body, bytes) else str(body))
+    result = lambda_svc._execute_function(func, event)
 
+    if result.get("error"):
+        body = result.get("body", {})
+        if isinstance(body, dict):
+            raise _ExecutionError(
+                body.get("errorType", "Lambda.Unknown"),
+                body.get("errorMessage", str(body)))
+        raise _ExecutionError("Lambda.Unknown", str(body))
+
+    body = result.get("body")
+    if body is None:
+        return {}
+    if isinstance(body, (dict, list)):
+        return body
     try:
-        return json.loads(body) if body else {}
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        return body.decode("utf-8", errors="replace") if isinstance(body, bytes) else body
+        return json.loads(body) if isinstance(body, (str, bytes)) else body
+    except (json.JSONDecodeError, TypeError):
+        return body
 
 
 # ---------------------------------------------------------------------------

@@ -2643,7 +2643,10 @@ def _list_parts(bucket_name: str, key: str, query_params: dict):
 
 def _persist_object(bucket: str, key: str, obj):
     try:
-        fpath = os.path.join(DATA_DIR, bucket, key)
+        fpath = os.path.realpath(os.path.join(DATA_DIR, bucket, key))
+        if not fpath.startswith(os.path.realpath(DATA_DIR)):
+            logger.warning("S3 persist: path traversal blocked for %s/%s", bucket, key)
+            return
         os.makedirs(os.path.dirname(fpath), exist_ok=True)
         data = obj["body"] if isinstance(obj, dict) else obj
         with open(fpath, "wb") as f:

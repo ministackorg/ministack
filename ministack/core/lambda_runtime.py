@@ -427,10 +427,8 @@ def invalidate_worker(func_name: str):
 
 
 def reset():
-    """Terminate all warm workers and clear the pool."""
-    for worker in list(_workers.values()):
-        try:
-            worker._proc.terminate()
-        except Exception:
-            pass
-    _workers.clear()
+    """Terminate all warm workers, clean up temp dirs, and clear the pool."""
+    with _lock:
+        for worker in list(_workers.values()):
+            worker.kill()
+        _workers.clear()

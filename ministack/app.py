@@ -245,13 +245,20 @@ async def app(scope, receive, send):
         return
 
     if path == "/_ministack/config" and method == "POST":
+        _ALLOWED_CONFIG_KEYS = {
+            "athena.ATHENA_ENGINE", "athena.ATHENA_DATA_DIR",
+            "stepfunctions._sfn_mock_config",
+            "lambda_svc.LAMBDA_EXECUTOR",
+        }
         try:
             config = json.loads(body) if body else {}
         except json.JSONDecodeError:
             config = {}
         applied = {}
         for key, value in config.items():
-            # Set module-level variables on service modules: "athena.ATHENA_ENGINE" -> "sqlite"
+            if key not in _ALLOWED_CONFIG_KEYS:
+                logger.warning("/_ministack/config: rejected key %s (not in whitelist)", key)
+                continue
             if "." in key:
                 mod_name, var_name = key.rsplit(".", 1)
                 try:

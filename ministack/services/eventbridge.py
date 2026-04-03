@@ -13,12 +13,12 @@ Supports: CreateEventBus, DeleteEventBus, ListEventBuses, DescribeEventBus,
           ListApiDestinations, UpdateApiDestination.
 """
 
-import asyncio
-import os
 import hashlib
 import json
 import logging
+import os
 import re
+import threading
 import time
 from datetime import datetime, timezone
 
@@ -606,9 +606,14 @@ def _dispatch_to_lambda(arn, payload):
     except (json.JSONDecodeError, TypeError):
         event = {"body": payload}
 
-    headers = {"x-amz-invocation-type": "Event"}
-    result = asyncio.run(lambda_svc._invoke(func_name, event, headers))
-    logger.info(f"EventBridge → Lambda {func_name}: status={result[0] if result else 'unknown'}")
+    func = lambda_svc._functions.get(func_name)
+    if not func:
+        logger.warning(f"EventBridge → Lambda: function {func_name} not found")
+        return
+    threading.Thread(
+        target=lambda_svc._execute_function, args=(func, event), daemon=True
+    ).start()
+    logger.info(f"EventBridge → Lambda {func_name}: dispatched")
 
 
 def _dispatch_to_sqs(arn, payload):

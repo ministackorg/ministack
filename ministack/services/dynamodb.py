@@ -1807,3 +1807,4 @@ def reset():
         _tags.clear()
         _ttl_settings.clear()
         _pitr_settings.clear()
+        _stream_records.clear()

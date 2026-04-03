@@ -362,6 +362,7 @@ def _get_log_events(data):
     start_from_head = data.get("startFromHead", False)
     start_time = data.get("startTime")
     end_time = data.get("endTime")
+    next_token = data.get("nextToken")
 
     if group not in _log_groups:
         return error_response_json(
@@ -382,15 +383,34 @@ def _get_log_events(data):
     if end_time is not None:
         filtered = [e for e in filtered if e["timestamp"] <= end_time]
 
-    if start_from_head:
-        page = filtered[:limit]
+    # Parse offset from token: f/<offset> for forward, b/<offset> for backward
+    offset = 0
+    if next_token:
+        try:
+            offset = int(next_token.split("/", 1)[1])
+        except (IndexError, ValueError):
+            offset = 0
+
+    if start_from_head or (next_token and next_token.startswith("f/")):
+        page = filtered[offset:offset + limit]
+        new_forward = f"f/{offset + len(page)}"
+        new_backward = f"b/{offset}"
     else:
-        page = filtered[-limit:]
+        end = len(filtered) - offset if next_token and next_token.startswith("b/") else len(filtered)
+        start = max(0, end - limit)
+        page = filtered[start:end]
+        new_forward = f"f/{end}"
+        new_backward = f"b/{len(filtered) - start}"
+
+    # AWS behaviour: when at end of stream, return the caller's token
+    # so SDK clients stop paginating
+    forward_token = next_token if (next_token and len(page) < limit) else new_forward
+    backward_token = next_token if (next_token and offset == 0 and next_token.startswith("b/")) else new_backward
 
     return json_response({
         "events": page,
-        "nextForwardToken": f"f/{len(all_events)}",
-        "nextBackwardToken": "b/0",
+        "nextForwardToken": forward_token,
+        "nextBackwardToken": backward_token,
     })
 
 

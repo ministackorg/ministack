@@ -12865,6 +12865,238 @@ def test_sfn_activity_worker_failure(sfn):
     assert sfn.describe_execution(executionArn=exec_arn)["status"] == "FAILED"
 
 
+def test_sfn_mock_config_return(sfn):
+    """SFN_MOCK_CONFIG Return — AWS SFN Local format with #TestCase ARN suffix."""
+    from conftest import _ministack_config
+
+    mock_cfg = {
+        "StateMachines": {
+            "qa-sfn-mock": {
+                "TestCases": {
+                    "HappyPath": {
+                        "CallService": "MockedSuccess",
+                    }
+                }
+            }
+        },
+        "MockedResponses": {
+            "MockedSuccess": {
+                "0": {"Return": {"status": "mocked", "value": 42}},
+            }
+        },
+    }
+    _ministack_config({"stepfunctions._sfn_mock_config": mock_cfg})
+
+    definition = json.dumps({
+        "StartAt": "CallService",
+        "States": {
+            "CallService": {
+                "Type": "Task",
+                "Resource": "arn:aws:lambda:us-east-1:000000000000:function:nonexistent",
+                "End": True,
+            }
+        },
+    })
+    sm_arn = sfn.create_state_machine(
+        name="qa-sfn-mock",
+        definition=definition,
+        roleArn="arn:aws:iam::000000000000:role/r",
+    )["stateMachineArn"]
+
+    # Execute with #HappyPath test case
+    exec_arn = sfn.start_execution(
+        stateMachineArn=sm_arn + "#HappyPath", input="{}",
+    )["executionArn"]
+    for _ in range(20):
+        time.sleep(0.3)
+        desc = sfn.describe_execution(executionArn=exec_arn)
+        if desc["status"] != "RUNNING":
+            break
+
+    assert desc["status"] == "SUCCEEDED"
+    output = json.loads(desc["output"])
+    assert output["status"] == "mocked"
+    assert output["value"] == 42
+    _ministack_config({"stepfunctions._sfn_mock_config": {}})
+
+
+def test_sfn_mock_config_throw(sfn):
+    """SFN_MOCK_CONFIG Throw — AWS SFN Local format with invocation indexing."""
+    from conftest import _ministack_config
+
+    mock_cfg = {
+        "StateMachines": {
+            "qa-sfn-mock-throw": {
+                "TestCases": {
+                    "FailPath": {
+                        "CallService": "MockedFailure",
+                    }
+                }
+            }
+        },
+        "MockedResponses": {
+            "MockedFailure": {
+                "0": {"Throw": {"Error": "ServiceDown", "Cause": "mocked failure"}},
+            }
+        },
+    }
+    _ministack_config({"stepfunctions._sfn_mock_config": mock_cfg})
+
+    definition = json.dumps({
+        "StartAt": "CallService",
+        "States": {
+            "CallService": {
+                "Type": "Task",
+                "Resource": "arn:aws:lambda:us-east-1:000000000000:function:nonexistent",
+                "End": True,
+            }
+        },
+    })
+    sm_arn = sfn.create_state_machine(
+        name="qa-sfn-mock-throw",
+        definition=definition,
+        roleArn="arn:aws:iam::000000000000:role/r",
+    )["stateMachineArn"]
+
+    exec_arn = sfn.start_execution(
+        stateMachineArn=sm_arn + "#FailPath", input="{}",
+    )["executionArn"]
+    for _ in range(20):
+        time.sleep(0.3)
+        desc = sfn.describe_execution(executionArn=exec_arn)
+        if desc["status"] != "RUNNING":
+            break
+
+    assert desc["status"] == "FAILED"
+    _ministack_config({"stepfunctions._sfn_mock_config": {}})
+
+
+def test_sfn_test_state_pass(sfn_sync):
+    """TestState API — Pass state returns transformed output."""
+    resp = sfn_sync.test_state(
+        definition=json.dumps({
+            "Type": "Pass",
+            "Result": {"greeting": "hello"},
+            "ResultPath": "$.result",
+            "Next": "NextStep",
+        }),
+        input=json.dumps({"existing": "data"}),
+        roleArn="arn:aws:iam::000000000000:role/r",
+    )
+    assert resp["status"] == "SUCCEEDED"
+    output = json.loads(resp["output"])
+    assert output["result"]["greeting"] == "hello"
+    assert output["existing"] == "data"
+    assert resp["nextState"] == "NextStep"
+
+
+def test_sfn_test_state_choice(sfn_sync):
+    """TestState API — Choice state routes to correct next state."""
+    resp = sfn_sync.test_state(
+        definition=json.dumps({
+            "Type": "Choice",
+            "Choices": [
+                {"Variable": "$.val", "NumericEquals": 1, "Next": "One"},
+                {"Variable": "$.val", "NumericEquals": 2, "Next": "Two"},
+            ],
+            "Default": "Other",
+        }),
+        input=json.dumps({"val": 2}),
+        roleArn="arn:aws:iam::000000000000:role/r",
+    )
+    assert resp["status"] == "SUCCEEDED"
+    assert resp["nextState"] == "Two"
+
+
+def test_sfn_test_state_fail(sfn_sync):
+    """TestState API — Fail state returns FAILED status."""
+    resp = sfn_sync.test_state(
+        definition=json.dumps({
+            "Type": "Fail",
+            "Error": "CustomError",
+            "Cause": "Something went wrong",
+        }),
+        input="{}",
+        roleArn="arn:aws:iam::000000000000:role/r",
+    )
+    assert resp["status"] == "FAILED"
+    assert resp["error"] == "CustomError"
+    assert resp["cause"] == "Something went wrong"
+
+
+def test_sfn_test_state_task_with_mock_return(sfn_sync):
+    """TestState API — Task state with mock.result returns mocked output."""
+    resp = sfn_sync.test_state(
+        definition=json.dumps({
+            "Type": "Task",
+            "Resource": "arn:aws:lambda:us-east-1:000000000000:function:MyFunc",
+            "End": True,
+        }),
+        input=json.dumps({"key": "value"}),
+        roleArn="arn:aws:iam::000000000000:role/r",
+        inspectionLevel="DEBUG",
+        mock={"result": json.dumps({"Payload": {"statusCode": 200, "body": "mocked"}})},
+    )
+    assert resp["status"] == "SUCCEEDED"
+    output = json.loads(resp["output"])
+    assert output["Payload"]["body"] == "mocked"
+
+
+def test_sfn_test_state_task_with_mock_error(sfn_sync):
+    """TestState API — Task state with mock.errorOutput and Catch."""
+    resp = sfn_sync.test_state(
+        definition=json.dumps({
+            "Type": "Task",
+            "Resource": "arn:aws:lambda:us-east-1:000000000000:function:MyFunc",
+            "Catch": [{"ErrorEquals": ["Lambda.ServiceException"], "Next": "HandleError"}],
+            "Next": "Done",
+        }),
+        input=json.dumps({"key": "value"}),
+        roleArn="arn:aws:iam::000000000000:role/r",
+        mock={"errorOutput": {"error": "Lambda.ServiceException", "cause": "Service unavailable"}},
+    )
+    assert resp["status"] == "CAUGHT_ERROR"
+    assert resp["nextState"] == "HandleError"
+    assert resp["error"] == "Lambda.ServiceException"
+
+
+def test_sfn_test_state_debug_inspection(sfn_sync):
+    """TestState API — DEBUG inspectionLevel returns data transformation details."""
+    resp = sfn_sync.test_state(
+        definition=json.dumps({
+            "Type": "Pass",
+            "InputPath": "$.payload",
+            "Result": {"data": 1},
+            "ResultPath": "$.result",
+            "Next": "Done",
+        }),
+        input=json.dumps({"payload": {"foo": "bar"}}),
+        roleArn="arn:aws:iam::000000000000:role/r",
+        inspectionLevel="DEBUG",
+    )
+    assert resp["status"] == "SUCCEEDED"
+    assert "inspectionData" in resp
+    assert "input" in resp["inspectionData"]
+
+
+def test_sfn_test_state_from_full_definition(sfn_sync):
+    """TestState API — extract specific state from full state machine definition."""
+    resp = sfn_sync.test_state(
+        definition=json.dumps({
+            "StartAt": "First",
+            "States": {
+                "First": {"Type": "Pass", "Result": "first", "Next": "Second"},
+                "Second": {"Type": "Pass", "Result": "second", "End": True},
+            }
+        }),
+        input="{}",
+        roleArn="arn:aws:iam::000000000000:role/r",
+        stateName="Second",
+    )
+    assert resp["status"] == "SUCCEEDED"
+    assert json.loads(resp["output"]) == "second"
+
+
 # ---------------------------------------------------------------------------
 # EC2
 # ---------------------------------------------------------------------------
@@ -14357,6 +14589,31 @@ def test_logs_list_tags_for_resource_arn_without_star(logs):
     resp = logs.list_tags_for_resource(resourceArn=arn_no_star)
     assert resp["tags"]["env"] == "test"
     logs.delete_log_group(logGroupName=name)
+
+
+def test_logs_get_log_events_pagination_stops(logs):
+    """GetLogEvents must return the caller's token when at end of stream to stop SDK pagination."""
+    group = "/test/pagination-stop"
+    stream = "s1"
+    logs.create_log_group(logGroupName=group)
+    logs.create_log_stream(logGroupName=group, logStreamName=stream)
+    logs.put_log_events(
+        logGroupName=group, logStreamName=stream,
+        logEvents=[
+            {"timestamp": 1000, "message": "msg1"},
+            {"timestamp": 2000, "message": "msg2"},
+        ],
+    )
+
+    # First call — get all events
+    resp = logs.get_log_events(logGroupName=group, logStreamName=stream, startFromHead=True)
+    assert len(resp["events"]) == 2
+    fwd_token = resp["nextForwardToken"]
+
+    # Second call with forward token — no more events, token must match what we sent
+    resp2 = logs.get_log_events(logGroupName=group, logStreamName=stream, nextToken=fwd_token)
+    assert len(resp2["events"]) == 0
+    assert resp2["nextForwardToken"] == fwd_token  # same token = stop paginating
 
 
 # ---------------------------------------------------------------------------

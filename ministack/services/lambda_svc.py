@@ -2538,4 +2538,6 @@ def reset():
     _layers.clear()
     _esms.clear()
     _function_urls.clear()
+    _kinesis_positions.clear()
+    _dynamodb_stream_positions.clear()
     lambda_runtime.reset()

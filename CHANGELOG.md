@@ -7,6 +7,28 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [1.1.22] — 2026-04-03
+
+### Added
+- **Step Functions mock config** — `SFN_MOCK_CONFIG` (or `LOCALSTACK_SFN_MOCK_CONFIG`) env var pointing to a JSON file that mocks Task state responses; fully compatible with the AWS Step Functions Local mock config format: `MockedResponses` with invocation indexing (`"0"`, `"1-2"`, etc.), `#TestCaseName` ARN suffix on `StartExecution`, `Return` and `Throw` per attempt. Contributed by @maxence-leblanc (issue)
+- **Step Functions `TestState` API** — execute a single state in isolation without creating a state machine; supports Pass, Task, Choice, Wait, Succeed, Fail state types; `inspectionLevel` (INFO/DEBUG) returns data transformation details; `mock` parameter for Task states with `result`/`errorOutput`; `stateName` to extract a state from a full definition; Retry/Catch evaluation with `RETRIABLE`/`CAUGHT_ERROR` status
+
+### Fixed
+- **CloudWatch Logs `GetLogEvents` pagination** — `nextForwardToken` and `nextBackwardToken` now return the caller's token when at end of stream, preventing SDK clients from looping infinitely; token-based offset pagination now works correctly
+- **EventBridge → Lambda crash** — `asyncio.run()` inside the running event loop replaced with direct synchronous dispatch; PutEvents with Lambda targets no longer crashes
+- **Step Functions StartSyncExecution crash** — `_call_lambda` replaced `asyncio.run()` with direct `_execute_function()` call; sync Lambda Task states no longer crash
+- **`/_ministack/config` endpoint hardened** — now whitelists allowed config keys instead of accepting arbitrary `__import__` + `setattr` on any module
+- **S3 path traversal in persistence** — `_persist_object` validates paths stay within `DATA_DIR` using `os.path.realpath()` prefix check; blocks `../` in S3 keys
+- **Lambda worker reset** — `reset()` now acquires lock and calls `worker.kill()` (cleans up temp dirs) instead of bare `_proc.terminate()`
+- **DynamoDB `_stream_records` cleared on reset** — stream records no longer accumulate unboundedly across resets
+- **Lambda ESM position tracking cleared on reset** — `_kinesis_positions` and `_dynamodb_stream_positions` now cleared on `reset()`
+- **License** — updated year 2026
+
+### Tests
+- 851 tests total, all passing
+
+---
+
 ## [1.1.21] — 2026-04-02
 
 ### Added
