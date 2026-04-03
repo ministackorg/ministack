@@ -38,6 +38,7 @@ import tempfile
 import threading
 import time
 import zipfile
+from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import unquote
 
@@ -246,7 +247,9 @@ def _layer_arn(name: str) -> str:
 
 
 def _now_iso() -> str:
-    return time.strftime("%Y-%m-%dT%H:%M:%S.000+0000")
+    now = datetime.now(timezone.utc)
+    ms = now.microsecond // 1000
+    return now.strftime(f"%Y-%m-%dT%H:%M:%S.{ms:03d}+0000")
 
 
 def _normalize_endpoint_url(value: str) -> str:

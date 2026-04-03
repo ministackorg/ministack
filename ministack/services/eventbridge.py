@@ -13,6 +13,7 @@ Supports: CreateEventBus, DeleteEventBus, ListEventBuses, DescribeEventBus,
           ListApiDestinations, UpdateApiDestination.
 """
 
+import copy
 import hashlib
 import json
 import logging
@@ -34,6 +35,8 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
 
+from ministack.core.persistence import load_state, PERSIST_STATE
+
 _event_buses: dict = {
     "default": {
         "Name": "default",
@@ -49,6 +52,31 @@ _archives: dict = {}
 _event_bus_policies: dict = {}  # bus_name -> {Statement: [...]}
 _connections: dict = {}         # connection_name -> {...}
 _api_destinations: dict = {}    # destination_name -> {...}
+
+
+# ── Persistence ────────────────────────────────────────────
+
+def get_state():
+    return {
+        "buses": copy.deepcopy(_event_buses),
+        "rules": copy.deepcopy(_rules),
+        "targets": copy.deepcopy(_targets),
+        "tags": copy.deepcopy(_tags),
+    }
+
+
+def restore_state(data):
+    global _event_buses
+    if data:
+        _event_buses.update(data.get("buses", {}))
+        _rules.update(data.get("rules", {}))
+        _targets.update(data.get("targets", {}))
+        _tags.update(data.get("tags", {}))
+
+
+_restored = load_state("eventbridge")
+if _restored:
+    restore_state(_restored)
 
 
 async def handle_request(method, path, headers, body, query_params):
@@ -628,15 +656,21 @@ def _dispatch_to_sqs(arn, payload):
 
     msg_id = new_uuid()
     md5 = hashlib.md5(payload.encode()).hexdigest()
+    now = time.time()
     queue["messages"].append({
         "id": msg_id,
         "body": payload,
-        "md5": md5,
+        "md5_body": md5,
         "receipt_handle": None,
-        "sent_at": time.time(),
-        "visible_at": time.time(),
+        "sent_at": now,
+        "visible_at": now,
         "receive_count": 0,
         "attributes": {},
+        "message_attributes": {},
+        "sys": {
+            "SenderId": "AROAEXAMPLE",
+            "SentTimestamp": str(int(now * 1000)),
+        },
     })
     logger.info(f"EventBridge → SQS {queue_name}")
 

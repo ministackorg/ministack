@@ -8,6 +8,7 @@ Supports: PutParameter, GetParameter, GetParameters, GetParametersByPath,
 """
 
 import base64
+import copy
 import os
 import json
 import logging
@@ -22,9 +23,27 @@ ACCOUNT_ID = "000000000000"
 REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 DEFAULT_PAGE_SIZE = 10
 
+from ministack.core.persistence import load_state, PERSIST_STATE
+
 _parameters: dict = {}
 _parameter_history: dict = {}
 _tags: dict = {}
+
+
+# ── Persistence ────────────────────────────────────────────
+
+def get_state():
+    return {"parameters": copy.deepcopy(_parameters)}
+
+
+def restore_state(data):
+    if data:
+        _parameters.update(data.get("parameters", {}))
+
+
+_restored = load_state("ssm")
+if _restored:
+    restore_state(_restored)
 
 
 def _now_iso() -> str:

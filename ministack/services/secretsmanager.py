@@ -10,6 +10,7 @@ Supports: CreateSecret, GetSecretValue, ListSecrets, DeleteSecret,
 """
 
 import base64
+import copy
 import os
 import json
 import logging
@@ -24,6 +25,8 @@ logger = logging.getLogger("secretsmanager")
 ACCOUNT_ID = "000000000000"
 REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 
+from ministack.core.persistence import load_state, PERSIST_STATE
+
 _secrets: dict = {}
 _resource_policies: dict = {}
 # name -> {
@@ -34,6 +37,22 @@ _resource_policies: dict = {}
 #   ReplicationStatus: [{Region, Status, StatusMessage}],
 #   Versions: { version_id: {SecretString, SecretBinary, CreatedDate, Stages: [str]} }
 # }
+
+
+# ── Persistence ────────────────────────────────────────────
+
+def get_state():
+    return {"secrets": copy.deepcopy(_secrets)}
+
+
+def restore_state(data):
+    if data:
+        _secrets.update(data.get("secrets", {}))
+
+
+_restored = load_state("secretsmanager")
+if _restored:
+    restore_state(_restored)
 
 
 # ---------------------------------------------------------------------------

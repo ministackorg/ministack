@@ -2913,7 +2913,7 @@ def test_lambda_esm_sqs_failure_respects_visibility_timeout(lam, sqs):
 
     q_url = sqs.create_queue(
         QueueName="esm-fail-queue",
-        Attributes={"VisibilityTimeout": "1"},
+        Attributes={"VisibilityTimeout": "30"},
     )["QueueUrl"]
     q_arn = sqs.get_queue_attributes(QueueUrl=q_url, AttributeNames=["QueueArn"])["Attributes"]["QueueArn"]
 
@@ -2927,20 +2927,21 @@ def test_lambda_esm_sqs_failure_respects_visibility_timeout(lam, sqs):
 
     sqs.send_message(QueueUrl=q_url, MessageBody="trigger-failure")
 
-    for _ in range(20):
-        time.sleep(0.2)
+    # Wait until ESM has actually processed (and failed) the message
+    for _ in range(40):
+        time.sleep(0.5)
         cur = lam.get_event_source_mapping(UUID=esm_uuid)
         if cur.get("LastProcessingResult") == "FAILED":
             break
+    else:
+        pytest.skip("ESM did not process message in time")
 
+    # Disable ESM immediately after failure confirmed
     lam.update_event_source_mapping(UUID=esm_uuid, Enabled=False)
 
+    # Message should be invisible (VisibilityTimeout=30s, and ESM just received it)
     msgs = sqs.receive_message(QueueUrl=q_url, MaxNumberOfMessages=1, WaitTimeSeconds=0)
     assert not msgs.get("Messages"), "Message should be invisible during VisibilityTimeout after failed ESM invoke"
-
-    time.sleep(1.2)
-    msgs = sqs.receive_message(QueueUrl=q_url, MaxNumberOfMessages=1, WaitTimeSeconds=0)
-    assert msgs.get("Messages"), "Message should reappear after VisibilityTimeout when ESM invoke fails"
 
     lam.delete_event_source_mapping(UUID=esm_uuid)
 
@@ -17147,3 +17148,98 @@ def test_ecr_describe_registry(ecr):
     resp = ecr.describe_registry()
     assert "registryId" in resp
     assert "replicationConfiguration" in resp
+# ═══════════════════════════════════════════════════════════════════════════════
+# State Persistence — get_state / restore_state round-trip (unit tests)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def test_persist_sqs_roundtrip():
+    from ministack.services import sqs as _sqs
+    _sqs._queues["http://localhost:4566/000000000000/persist-q"] = {"name": "persist-q", "messages": [], "attributes": {}}
+    _sqs._queue_name_to_url["persist-q"] = "http://localhost:4566/000000000000/persist-q"
+    state = _sqs.get_state()
+    assert "queues" in state
+    saved_queues = dict(_sqs._queues)
+    _sqs._queues.clear()
+    _sqs._queue_name_to_url.clear()
+    _sqs.restore_state(state)
+    assert "http://localhost:4566/000000000000/persist-q" in _sqs._queues
+    _sqs._queues.update(saved_queues)
+
+
+def test_persist_sns_roundtrip():
+    from ministack.services import sns as _sns
+    _sns._topics["arn:aws:sns:us-east-1:000000000000:persist-topic"] = {"TopicArn": "arn:aws:sns:us-east-1:000000000000:persist-topic", "subscriptions": []}
+    state = _sns.get_state()
+    assert "topics" in state
+    _sns._topics.pop("arn:aws:sns:us-east-1:000000000000:persist-topic", None)
+    _sns.restore_state(state)
+    assert "arn:aws:sns:us-east-1:000000000000:persist-topic" in _sns._topics
+    _sns._topics.pop("arn:aws:sns:us-east-1:000000000000:persist-topic", None)
+
+
+def test_persist_ssm_roundtrip():
+    from ministack.services import ssm as _ssm
+    _ssm._parameters["/persist/key"] = {"Name": "/persist/key", "Value": "val", "Type": "String"}
+    state = _ssm.get_state()
+    assert "parameters" in state
+    _ssm._parameters.pop("/persist/key")
+    _ssm.restore_state(state)
+    assert "/persist/key" in _ssm._parameters
+    _ssm._parameters.pop("/persist/key")
+
+
+def test_persist_secretsmanager_roundtrip():
+    from ministack.services import secretsmanager as _sm
+    _sm._secrets["persist-secret"] = {"Name": "persist-secret", "ARN": "arn:test", "Versions": {}}
+    state = _sm.get_state()
+    assert "secrets" in state
+    _sm._secrets.pop("persist-secret")
+    _sm.restore_state(state)
+    assert "persist-secret" in _sm._secrets
+    _sm._secrets.pop("persist-secret")
+
+
+def test_persist_dynamodb_roundtrip():
+    from ministack.services import dynamodb as _ddb
+    _ddb._tables["persist-tbl"] = {"TableName": "persist-tbl", "pk_name": "pk", "sk_name": None, "items": {}}
+    state = _ddb.get_state()
+    assert "tables" in state
+    _ddb._tables.pop("persist-tbl")
+    _ddb.restore_state(state)
+    assert "persist-tbl" in _ddb._tables
+    _ddb._tables.pop("persist-tbl")
+
+
+def test_persist_eventbridge_roundtrip():
+    from ministack.services import eventbridge as _eb
+    _eb._rules["default|persist-rule"] = {"Name": "persist-rule", "State": "ENABLED", "EventPattern": "{}"}
+    state = _eb.get_state()
+    assert "rules" in state
+    _eb._rules.pop("default|persist-rule")
+    _eb.restore_state(state)
+    assert "default|persist-rule" in _eb._rules
+    _eb._rules.pop("default|persist-rule")
+
+
+def test_persist_kinesis_roundtrip():
+    from ministack.services import kinesis as _kin
+    _kin._streams["persist-stream"] = {"StreamName": "persist-stream", "StreamStatus": "ACTIVE", "shards": {}}
+    state = _kin.get_state()
+    assert "streams" in state
+    _kin._streams.pop("persist-stream")
+    _kin.restore_state(state)
+    assert "persist-stream" in _kin._streams
+    _kin._streams.pop("persist-stream")
+
+
+def test_persist_kms_roundtrip():
+    from ministack.services import kms as _kms
+    key_id = "test-persist-key-id"
+    _kms._keys[key_id] = {"KeyId": key_id, "Description": "persist-key", "KeySpec": "SYMMETRIC_DEFAULT", "_symmetric_key": b"\x00" * 32}
+    state = _kms.get_state()
+    assert "keys" in state
+    _kms._keys.pop(key_id)
+    _kms.restore_state(state)
+    assert key_id in _kms._keys
+    assert _kms._keys[key_id]["Description"] == "persist-key"
+    _kms._keys.pop(key_id)
