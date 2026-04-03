@@ -215,3 +215,7 @@ def sfn_sync():
             inject_host_prefix=False,
         ),
     )
+
+@pytest.fixture(scope="session")
+def cloudfront():
+    return make_client("cloudfront")
