@@ -134,6 +134,12 @@ def _normalise_name(name: str) -> str:
     return name if name.endswith(".") else name + "."
 
 
+def _name_sort_key(name: str) -> tuple[str, ...]:
+    """Route53 sorts names by labels reversed (e.g. com.example.www.)."""
+    labels = _normalise_name(name).rstrip(".").split(".")
+    return tuple(reversed(labels))
+
+
 # ─── default records (SOA + NS) ───────────────────────────────────────────────
 
 _DEFAULT_NS = [
@@ -616,17 +622,36 @@ def _list_resource_record_sets(zone_id: str, query_params: dict):
             return _error_response("NoSuchHostedZone", f"No hosted zone found with ID: {zone_id}", 404)
         records = list(_records.get(zone_id, []))
 
-    records.sort(key=lambda r: (r["Name"], r["Type"], r.get("SetIdentifier", "")))
+    records.sort(
+        key=lambda r: (
+            _name_sort_key(r["Name"]),
+            r["Type"],
+            r.get("SetIdentifier", ""),
+        )
+    )
 
     if start_name:
-        records = [r for r in records if (r["Name"], r["Type"], r.get("SetIdentifier", ""))
-                   >= (start_name, start_type, start_id)]
+        start_key = (
+            _name_sort_key(start_name),
+            start_type,
+            start_id,
+        )
+        records = [
+            r
+            for r in records
+            if (
+                _name_sort_key(r["Name"]),
+                r["Type"],
+                r.get("SetIdentifier", ""),
+            )
+            >= start_key
+        ]
 
     is_truncated = len(records) > max_items
     page = records[:max_items]
-    next_name = page[-1]["Name"] if is_truncated else None
-    next_type = page[-1]["Type"] if is_truncated else None
-    next_id = page[-1].get("SetIdentifier", "") if is_truncated else None
+    next_name = records[max_items]["Name"] if is_truncated else None
+    next_type = records[max_items]["Type"] if is_truncated else None
+    next_id = records[max_items].get("SetIdentifier", "") if is_truncated else None
 
     def build(root):
         rrs_list = SubElement(root, "ResourceRecordSets")

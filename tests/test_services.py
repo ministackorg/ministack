@@ -9203,6 +9203,169 @@ def test_route53_list_resource_record_sets(r53):
     assert "NS" in types
 
 
+def test_route53_list_resource_record_sets_start_name_uses_reversed_label_order(r53):
+    parent = r53.create_hosted_zone(
+        Name="parent-zone.com", CallerReference="ref-parent-zone"
+    )
+    parent_zone_id = parent["HostedZone"]["Id"].split("/")[-1]
+
+    child = r53.create_hosted_zone(
+        Name="child.parent-zone.com",
+        CallerReference="ref-child-zone",
+    )
+    child_zone_id = child["HostedZone"]["Id"].split("/")[-1]
+
+    child_ns = [
+        rrs
+        for rrs in r53.list_resource_record_sets(HostedZoneId=child_zone_id)["ResourceRecordSets"]
+        if rrs["Name"] == "child.parent-zone.com."
+        and rrs["Type"] == "NS"
+    ][0]
+
+    r53.change_resource_record_sets(
+        HostedZoneId=parent_zone_id,
+        ChangeBatch={
+            "Changes": [
+                {
+                    "Action": "CREATE",
+                    "ResourceRecordSet": {
+                        "Name": "child.parent-zone.com",
+                        "Type": "NS",
+                        "TTL": child_ns["TTL"],
+                        "ResourceRecords": child_ns["ResourceRecords"],
+                    },
+                }
+            ]
+        },
+    )
+
+    list_resp = r53.list_resource_record_sets(
+        HostedZoneId=parent_zone_id,
+        StartRecordName="child.parent-zone.com.",
+        StartRecordType="NS",
+    )
+    returned = list_resp["ResourceRecordSets"]
+
+    assert returned[0]["Name"] == "child.parent-zone.com."
+    assert returned[0]["Type"] == "NS"
+    assert all(
+        not (rrs["Name"] == "parent-zone.com." and rrs["Type"] == "NS")
+        for rrs in returned
+    )
+
+
+def test_route53_list_resource_record_sets_truncated_next_record_uses_next_page_start(r53):
+    resp = r53.create_hosted_zone(
+        Name="pagination-zone.com", CallerReference="ref-next-record"
+    )
+    zone_id = resp["HostedZone"]["Id"].split("/")[-1]
+
+    r53.change_resource_record_sets(
+        HostedZoneId=zone_id,
+        ChangeBatch={
+            "Changes": [
+                {
+                    "Action": "CREATE",
+                    "ResourceRecordSet": {
+                        "Name": "token.pagination-zone.com",
+                        "Type": "TXT",
+                        "TTL": 60,
+                        "ResourceRecords": [{"Value": '"target.pagination-zone.com"'}],
+                    },
+                },
+                {
+                    "Action": "CREATE",
+                    "ResourceRecordSet": {
+                        "Name": "zz-next.pagination-zone.com",
+                        "Type": "NS",
+                        "TTL": 120,
+                        "ResourceRecords": [
+                            {"Value": "ns-1.example.com."},
+                            {"Value": "ns-2.example.com."},
+                            {"Value": "ns-3.example.com."},
+                            {"Value": "ns-4.example.com."},
+                        ],
+                    },
+                }
+            ]
+        },
+    )
+
+    list_resp = r53.list_resource_record_sets(
+        HostedZoneId=zone_id,
+        StartRecordName="token.pagination-zone.com.",
+        StartRecordType="TXT",
+        MaxItems="1",
+    )
+
+    assert list_resp["ResourceRecordSets"][0]["Name"] == "token.pagination-zone.com."
+    assert list_resp["ResourceRecordSets"][0]["Type"] == "TXT"
+    assert list_resp["IsTruncated"] is True
+    assert list_resp["NextRecordName"] == "zz-next.pagination-zone.com."
+    assert list_resp["NextRecordType"] == "NS"
+
+
+def test_route53_list_resource_record_sets_pagination_advances_with_next_record_cursor(r53):
+    resp = r53.create_hosted_zone(
+        Name="cursor-zone.com", CallerReference="ref-cursor-pagination"
+    )
+    zone_id = resp["HostedZone"]["Id"].split("/")[-1]
+
+    r53.change_resource_record_sets(
+        HostedZoneId=zone_id,
+        ChangeBatch={
+            "Changes": [
+                {
+                    "Action": "CREATE",
+                    "ResourceRecordSet": {
+                        "Name": "token.cursor-zone.com",
+                        "Type": "TXT",
+                        "TTL": 60,
+                        "ResourceRecords": [{"Value": '"target.cursor-zone.com"'}],
+                    },
+                },
+                {
+                    "Action": "CREATE",
+                    "ResourceRecordSet": {
+                        "Name": "zz-next.cursor-zone.com",
+                        "Type": "NS",
+                        "TTL": 120,
+                        "ResourceRecords": [
+                            {"Value": "ns-1.example.com."},
+                            {"Value": "ns-2.example.com."},
+                            {"Value": "ns-3.example.com."},
+                            {"Value": "ns-4.example.com."},
+                        ],
+                    },
+                },
+            ]
+        },
+    )
+
+    first_page = r53.list_resource_record_sets(
+        HostedZoneId=zone_id,
+        StartRecordName="token.cursor-zone.com.",
+        StartRecordType="TXT",
+        MaxItems="1",
+    )
+
+    assert first_page["ResourceRecordSets"][0]["Name"] == "token.cursor-zone.com."
+    assert first_page["ResourceRecordSets"][0]["Type"] == "TXT"
+    assert first_page["IsTruncated"] is True
+
+    second_page = r53.list_resource_record_sets(
+        HostedZoneId=zone_id,
+        StartRecordName=first_page["NextRecordName"],
+        StartRecordType=first_page["NextRecordType"],
+        MaxItems="1",
+    )
+
+    assert second_page["ResourceRecordSets"][0]["Name"] == "zz-next.cursor-zone.com."
+    assert second_page["ResourceRecordSets"][0]["Type"] == "NS"
+    assert second_page["ResourceRecordSets"][0]["Name"] != first_page["ResourceRecordSets"][0]["Name"]
+    assert second_page["IsTruncated"] is False
+
+
 def test_route53_upsert_record(r53):
     resp = r53.create_hosted_zone(Name="upsert.com", CallerReference="ref-ups-1")
     zone_id = resp["HostedZone"]["Id"].split("/")[-1]
