@@ -11,6 +11,7 @@ import logging
 import os
 import re
 import subprocess
+import tempfile
 import uuid
 from urllib.parse import parse_qs, urlparse
 
@@ -635,17 +636,69 @@ def _reset_all_state():
     logger.info("State reset complete")
 
 
+def _pid_file(port: int) -> str:
+    return os.path.join(tempfile.gettempdir(), f"ministack-{port}.pid")
+
+
+def _stop_server(port: int) -> None:
+    """Stop a detached MiniStack server by reading its PID file."""
+    import signal
+    pf = _pid_file(port)
+    if not os.path.exists(pf):
+        print(f"No MiniStack PID file found for port {port}. Is it running?")
+        raise SystemExit(1)
+    with open(pf) as f:
+        pid = int(f.read().strip())
+    try:
+        os.kill(pid, signal.SIGTERM)
+        print(f"MiniStack (PID {pid}) on port {port} stopped.")
+    except ProcessLookupError:
+        print(f"MiniStack (PID {pid}) was not running. Cleaning up PID file.")
+    os.remove(pf)
+
+
 def main():
+    import argparse
     import socket
 
     import uvicorn
+
+    parser = argparse.ArgumentParser(description="MiniStack — Local AWS Service Emulator")
+    parser.add_argument("-d", "--detach", action="store_true", help="Run server in the background (detached mode)")
+    parser.add_argument("--stop", action="store_true", help="Stop a detached MiniStack server")
+    args = parser.parse_args()
+
     port = int(_resolve_port())
+
+    if args.stop:
+        _stop_server(port)
+        return
+
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         if s.connect_ex(("127.0.0.1", port)) == 0:
             print(f"ERROR: Port {port} is already in use. Is MiniStack already running (Docker or another process)?\n"
-                  f"  Stop it with: docker compose down\n"
+                  f"  Stop it with: ministack --stop\n"
                   f"  Or use a different port: GATEWAY_PORT=4567 ministack")
             raise SystemExit(1)
+
+    if args.detach:
+        pid = os.fork()
+        if pid > 0:
+            # Parent — write PID file and exit
+            pf = _pid_file(port)
+            with open(pf, "w") as f:
+                f.write(str(pid))
+            print(f"MiniStack started in background (PID {pid}) on port {port}.")
+            print(f"  Stop with: ministack --stop")
+            return
+        # Child — detach from terminal
+        os.setsid()
+        devnull = os.open(os.devnull, os.O_RDWR)
+        os.dup2(devnull, 0)
+        os.dup2(devnull, 1)
+        os.dup2(devnull, 2)
+        os.close(devnull)
+
     uvicorn.run("ministack.app:app", host="0.0.0.0", port=port, log_level=LOG_LEVEL.lower())
 
 
