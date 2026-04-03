@@ -17,7 +17,7 @@ IAM actions:
   UpdateAssumeRolePolicy,
   CreateGroup, GetGroup, DeleteGroup, ListGroups,
   AddUserToGroup, RemoveUserFromGroup, ListGroupsForUser,
-  CreateServiceLinkedRole,
+    CreateServiceLinkedRole, DeleteServiceLinkedRole,
   CreateOpenIDConnectProvider, GetOpenIDConnectProvider, DeleteOpenIDConnectProvider,
   TagRole, UntagRole, ListRoleTags,
   TagUser, UntagUser, ListUserTags,
@@ -1120,6 +1120,23 @@ def _create_service_linked_role(p):
                 ns="iam")
 
 
+def _delete_service_linked_role(p):
+    role_name = _p(p, "RoleName")
+    role = _roles.get(role_name)
+    if not role:
+        return _error(404, "NoSuchEntity",
+                      f"Role {role_name} not found.", ns="iam")
+
+    if not role.get("Path", "").startswith("/aws-service-role/"):
+        return _error(400, "InvalidInput",
+                      f"Role {role_name} is not a service-linked role.", ns="iam")
+
+    _roles.pop(role_name, None)
+    return _xml(200, "DeleteServiceLinkedRoleResponse",
+                f"<DeleteServiceLinkedRoleResult><DeletionTaskId>{new_uuid()}</DeletionTaskId></DeleteServiceLinkedRoleResult>",
+                ns="iam")
+
+
 # -------------------- OIDC providers --------------------
 
 def _create_oidc_provider(p):
@@ -1556,6 +1573,7 @@ _IAM_HANDLERS = {
     "DeleteUserPolicy": _delete_user_policy,
     "ListUserPolicies": _list_user_policies,
     "CreateServiceLinkedRole": _create_service_linked_role,
+    "DeleteServiceLinkedRole": _delete_service_linked_role,
     "CreateOpenIDConnectProvider": _create_oidc_provider,
     "GetOpenIDConnectProvider": _get_oidc_provider,
     "DeleteOpenIDConnectProvider": _delete_oidc_provider,

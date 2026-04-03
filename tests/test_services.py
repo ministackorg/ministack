@@ -5315,6 +5315,13 @@ def test_iam_service_linked_role(iam):
     assert "AWSServiceRoleFor" in role["RoleName"]
     assert role["Path"].startswith("/aws-service-role/")
 
+    del_resp = iam.delete_service_linked_role(RoleName=role["RoleName"])
+    assert "DeletionTaskId" in del_resp
+
+    with pytest.raises(ClientError) as exc:
+        iam.get_role(RoleName=role["RoleName"])
+    assert exc.value.response["Error"]["Code"] == "NoSuchEntity"
+
 
 def test_iam_oidc_provider(iam):
     resp = iam.create_open_id_connect_provider(
