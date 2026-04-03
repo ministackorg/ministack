@@ -330,7 +330,7 @@ async def _run_ingestion_job(job_id: str, kb_id: str, ds_id: str):
     objects = []
     if bucket_name in s3_svc._buckets:
         for key, obj_data in s3_svc._buckets[bucket_name].get("objects", {}).items():
-            objects.append((key, obj_data.get("data", b"")))
+            objects.append((key, obj_data.get("body", b"")))
 
     stats = job["statistics"]
     stats["numberOfDocumentsScanned"] = len(objects)

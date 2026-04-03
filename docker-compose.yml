@@ -24,6 +24,7 @@ services:
     volumes:
       - ./data/s3:/tmp/ministack-data/s3
       - /var/run/docker.sock:/var/run/docker.sock
+      - ./config/bedrock_models.yaml:/opt/ministack/config/bedrock_models.yaml
     depends_on:
       redis:
         condition: service_healthy
@@ -72,6 +73,7 @@ services:
     restart: unless-stopped
 
   # Ollama for local LLM inference (Bedrock models)
+  # Auto-pulls models listed in bedrock_models.yaml on startup
   ollama:
     image: ollama/ollama:0.20.0
     container_name: ministack-ollama
@@ -79,12 +81,15 @@ services:
       - "11434:11434"
     volumes:
       - ollama_data:/root/.ollama
+      - ./config/bedrock_models.yaml:/config/bedrock_models.yaml:ro
+      - ./config/ollama_entrypoint.sh:/entrypoint.sh:ro
+    entrypoint: ["/bin/bash", "/entrypoint.sh"]
     healthcheck:
       test: ["CMD", "ollama", "list"]
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 10s
+      start_period: 30s
     restart: unless-stopped
 
   # LiteLLM proxy — routes inference requests to Ollama (or GitHub Copilot)

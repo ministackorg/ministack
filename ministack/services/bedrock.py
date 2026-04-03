@@ -26,19 +26,33 @@ MODELS_CONFIG_PATH = os.environ.get("BEDROCK_MODELS_CONFIG", "config/bedrock_mod
 _tags: dict = {}  # resource_arn -> {key: value}
 _tags_lock = threading.Lock()
 _models_config: dict = {}
+_models_config_mtime: float = 0  # last modified time of the config file
+_models_config_path: str = ""  # resolved path of the loaded config file
 _guardrails: dict = {}  # guardrail_id -> guardrail metadata
 _guardrails_lock = threading.Lock()
 
 
 def _load_models_config():
-    """Load model mapping config from YAML file."""
-    global _models_config
-    if _models_config:
-        return _models_config
+    """Load model mapping config from YAML file. Auto-reloads when file changes."""
+    global _models_config, _models_config_mtime, _models_config_path
+
+    # Check for file changes (hot-reload)
+    if _models_config and _models_config_path:
+        try:
+            current_mtime = os.path.getmtime(_models_config_path)
+            if current_mtime == _models_config_mtime:
+                return _models_config
+            # File changed — reload
+            logger.info("Bedrock models config changed, reloading from %s", _models_config_path)
+        except OSError:
+            return _models_config
+
     for path in [MODELS_CONFIG_PATH, "/app/config/bedrock_models.yaml", "config/bedrock_models.yaml"]:
         try:
             with open(path) as f:
                 _models_config = yaml.safe_load(f) or {}
+                _models_config_path = path
+                _models_config_mtime = os.path.getmtime(path)
                 logger.info("Loaded Bedrock models config from %s", path)
                 return _models_config
         except FileNotFoundError:

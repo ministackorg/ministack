@@ -3,6 +3,24 @@
 
 model_list:
   # --- Ollama local models ---
+
+  # Qwen 3.5 family (Claude tier mapping)
+  - model_name: "qwen3.5:4b"
+    litellm_params:
+      model: "ollama/qwen3.5:4b"
+      api_base: "http://ollama:11434"
+
+  - model_name: "qwen3.5:2b"
+    litellm_params:
+      model: "ollama/qwen3.5:2b"
+      api_base: "http://ollama:11434"
+
+  - model_name: "qwen3.5:0.8b"
+    litellm_params:
+      model: "ollama/qwen3.5:0.8b"
+      api_base: "http://ollama:11434"
+
+  # Qwen 2.5 (default / fallback)
   - model_name: "qwen2.5:3b"
     litellm_params:
       model: "ollama/qwen2.5:3b"
@@ -13,11 +31,7 @@ model_list:
       model: "ollama/qwen2.5:1.5b"
       api_base: "http://ollama:11434"
 
-  - model_name: "llama3.2:3b"
-    litellm_params:
-      model: "ollama/llama3.2:3b"
-      api_base: "http://ollama:11434"
-
+  # Embeddings
   - model_name: "nomic-embed-text"
     litellm_params:
       model: "ollama/nomic-embed-text"

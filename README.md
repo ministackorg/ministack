@@ -234,7 +234,23 @@ subnet = ec2.create_subnet(
 | **Bedrock Agent** | CreateAgent, GetAgent, ListAgents, UpdateAgent, DeleteAgent, PrepareAgent, CreateAgentAlias, GetAgentAlias, ListAgentAliases, UpdateAgentAlias, DeleteAgentAlias, CreateKnowledgeBase, GetKnowledgeBase, ListKnowledgeBases, UpdateKnowledgeBase, DeleteKnowledgeBase, CreateDataSource, GetDataSource, ListDataSources, UpdateDataSource, DeleteDataSource, StartIngestionJob, GetIngestionJob, ListIngestionJobs, StopIngestionJob, GetKnowledgeBaseDocuments, ListKnowledgeBaseDocuments, DeleteKnowledgeBaseDocuments | Full Agent lifecycle with aliases; KB + data source CRUD; S3 → **pgvector** ingestion |
 | **Bedrock Agent Runtime** | Retrieve, RetrieveAndGenerate, Rerank | Semantic vector search via **pgvector**; RAG with citations; document reranking via embeddings |
 
-> **Bedrock stack**: requires `docker compose up` to start Ollama (local LLMs), LiteLLM (proxy), and pgvector (vector DB). See `config/bedrock_models.yaml` for model mappings (e.g. `anthropic.claude-3-sonnet` → `qwen2.5:3b`). Run `docker exec ministack-ollama ollama pull qwen2.5:3b && docker exec ministack-ollama ollama pull nomic-embed-text` to download models.
+> **Bedrock stack**: requires `docker compose up` to start Ollama (local LLMs), LiteLLM (proxy), and pgvector (vector DB). See `config/bedrock_models.yaml` for model mappings. Three Claude tiers map to different local model sizes:
+>
+> | Claude Model | Local Model | Size | Use Case |
+> |---|---|---|---|
+> | Opus (`claude-opus-4-6`) | `qwen3.5:4b` | 2.6 GB | Best quality |
+> | Sonnet (`claude-3-sonnet`, `claude-sonnet-4-6`) | `qwen3.5:2b` | 1.5 GB | Balanced |
+> | Haiku (`claude-3-haiku`) | `qwen3.5:0.8b` | 530 MB | Fast prototyping |
+>
+> ```bash
+> # Pull required models (embeddings + default fallback)
+> docker exec ministack-ollama ollama pull qwen2.5:3b        # fallback (2 GB)
+> docker exec ministack-ollama ollama pull nomic-embed-text   # embeddings (274 MB)
+> # Pull Claude-tier models (optional — falls back to qwen2.5:3b if missing)
+> docker exec ministack-ollama ollama pull qwen3.5:4b         # Opus tier (2.6 GB)
+> docker exec ministack-ollama ollama pull qwen3.5:2b         # Sonnet tier (1.5 GB)
+> docker exec ministack-ollama ollama pull qwen3.5:0.8b       # Haiku tier (530 MB)
+> ```
 | **KMS** | CreateKey, ListKeys, DescribeKey, GetPublicKey, Sign, Verify, Encrypt, Decrypt, GenerateDataKey, GenerateDataKeyWithoutPlaintext | RSA (2048/4096) and symmetric keys; PKCS1v15 and PSS signing; envelope encryption; requires `cryptography` package (optional) |
 
 ### CloudFormation

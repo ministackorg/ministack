@@ -82,7 +82,11 @@ def make_client(service, endpoint=None, region=DEFAULT_REGION):
     """Créer un client boto3, configuré pour MiniStack ou AWS."""
     kwargs = dict(
         region_name=region,
-        config=Config(retries={"max_attempts": 2}),
+        config=Config(
+            retries={"max_attempts": 2},
+            read_timeout=120,
+            connect_timeout=10,
+        ),
     )
     if endpoint:
         kwargs["endpoint_url"] = endpoint
