@@ -450,7 +450,6 @@ def _reboot_db_instance(p):
     instance = _instances.get(db_id)
     if not instance:
         return _error("DBInstanceNotFound", f"DBInstance {db_id} not found.", 404)
-    instance["DBInstanceStatus"] = "rebooting"
     instance["DBInstanceStatus"] = "available"
     return _single_instance_response("RebootDBInstanceResponse", "RebootDBInstanceResult", instance)
 
@@ -2053,3 +2052,4 @@ def reset():
     _db_cluster_snapshots.clear()
     _option_groups.clear()
     _tags.clear()
+    _port_counter[0] = BASE_PORT

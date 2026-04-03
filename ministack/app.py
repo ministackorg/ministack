@@ -319,8 +319,8 @@ async def app(scope, receive, send):
                     existing = s3._bucket_tags.get(bucket_name, {})
                     existing.update(new_tags)
                     s3._bucket_tags[bucket_name] = existing
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.warning("S3 Control TagResource parse error: %s", e)
                 await _send_response(send, 204, {
                     "x-amzn-requestid": request_id,
                 }, b"")
@@ -397,7 +397,7 @@ async def app(scope, receive, send):
                     api_id, stage, execute_path, method, headers, body, query_params
                 )
         except Exception as e:
-            logger.exception(f"Error in execute-api dispatch: {e}")
+            logger.exception("Error in execute-api dispatch: %s", e)
             status, resp_headers, resp_body = 500, {"Content-Type": "application/json"}, json.dumps({"message": str(e)}).encode()
         resp_headers.update({
             "Access-Control-Allow-Origin": "*",
@@ -429,7 +429,7 @@ async def app(scope, receive, send):
                 _alb_lb, method, path, headers, body, query_params, _alb_port
             )
         except Exception as e:
-            logger.exception(f"Error in ALB data-plane dispatch: {e}")
+            logger.exception("Error in ALB data-plane dispatch: %s", e)
             status, resp_headers, resp_body = (
                 500, {"Content-Type": "application/json"},
                 json.dumps({"message": str(e)}).encode(),
@@ -457,9 +457,10 @@ async def app(scope, receive, send):
                     method, vhost_path, headers, body, query_params
                 )
             except Exception as e:
-                logger.exception(f"Error handling virtual-hosted S3 request: {e}")
+                logger.exception("Error handling virtual-hosted S3 request: %s", e)
+                from xml.sax.saxutils import escape as _xml_esc
                 status, resp_headers, resp_body = 500, {"Content-Type": "application/xml"}, (
-                    f"<Error><Code>InternalError</Code><Message>{e}</Message></Error>".encode()
+                    f"<Error><Code>InternalError</Code><Message>{_xml_esc(str(e))}</Message></Error>".encode()
                 )
             resp_headers.update({
                 "Access-Control-Allow-Origin": "*",
@@ -481,7 +482,7 @@ async def app(scope, receive, send):
     service = detect_service(method, path, headers, routing_params)
     region = extract_region(headers)
 
-    logger.debug(f"{method} {path} -> service={service} region={region}")
+    logger.debug("%s %s -> service=%s region=%s", method, path, service, region)
 
     handler = SERVICE_HANDLERS.get(service)
     if not handler:
@@ -492,7 +493,7 @@ async def app(scope, receive, send):
     try:
         status, resp_headers, resp_body = await handler(method, path, headers, body, query_params)
     except Exception as e:
-        logger.exception(f"Error handling {service} request: {e}")
+        logger.exception("Error handling %s request: %s", service, e)
         await _send_response(send, 500, {"Content-Type": "application/json"},
             json.dumps({"__type": "InternalError", "message": str(e)}).encode())
         return

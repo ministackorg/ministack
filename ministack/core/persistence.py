@@ -22,12 +22,20 @@ def save_state(service: str, data: dict) -> None:
         os.makedirs(STATE_DIR, exist_ok=True)
         path = os.path.join(STATE_DIR, f"{service}.json")
         tmp = path + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump(data, f)
-        os.replace(tmp, path)
-        logger.info(f"Persistence: saved {service} state to {path}")
+        try:
+            with open(tmp, "w") as f:
+                json.dump(data, f)
+            os.replace(tmp, path)
+        except BaseException:
+            # Clean up temp file on any failure to avoid stale partial writes
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            raise
+        logger.info("Persistence: saved %s state to %s", service, path)
     except Exception as e:
-        logger.error(f"Persistence: failed to save {service}: {e}")
+        logger.error("Persistence: failed to save %s: %s", service, e)
 
 
 def load_state(service: str) -> dict | None:
@@ -39,10 +47,10 @@ def load_state(service: str) -> dict | None:
     try:
         with open(path) as f:
             data = json.load(f)
-        logger.info(f"Persistence: loaded {service} state from {path}")
+        logger.info("Persistence: loaded %s state from %s", service, path)
         return data
-    except Exception as e:
-        logger.error(f"Persistence: failed to load {service}: {e}")
+    except (json.JSONDecodeError, OSError) as e:
+        logger.error("Persistence: failed to load %s: %s", service, e)
         return None
 
 
@@ -52,4 +60,4 @@ def save_all(services: dict) -> None:
         try:
             save_state(name, get_state())
         except Exception as e:
-            logger.error(f"Persistence: error getting state for {name}: {e}")
+            logger.error("Persistence: error getting state for %s: %s", name, e)

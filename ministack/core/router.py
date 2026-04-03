@@ -398,7 +398,9 @@ def detect_service(method: str, path: str, headers: dict, query_params: dict) ->
             "UpdateTerminationProtection": "cloudformation",
             "SetStackPolicy": "cloudformation", "GetStackPolicy": "cloudformation",
             # EBS Snapshots
-            "CreateSnapshot": "ec2", "DeleteSnapshot": "ec2", "DescribeSnapshots": "ec2",
+            # Note: CreateSnapshot, DeleteSnapshot, DescribeSnapshots are intentionally
+            # omitted here because they conflict with ElastiCache actions of the same
+            # name. These are routed via credential scope or host header instead.
             "CopySnapshot": "ec2", "ModifySnapshotAttribute": "ec2",
             "DescribeSnapshotAttribute": "ec2",
         }
