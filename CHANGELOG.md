@@ -18,6 +18,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 - **EC2 VPN Route Propagation** — `EnableVgwRoutePropagation`, `DisableVgwRoutePropagation`; tracks propagating VGWs on route tables
 - **EC2 Customer Gateways** — `CreateCustomerGateway`, `DescribeCustomerGateways`, `DeleteCustomerGateway`
 - **Lambda `provided` runtime support** — `provided.al2023`, `provided.al2` runtimes now execute via Docker using the AWS Lambda RIE; code is mounted to `/var/task` matching real AWS behavior; Go, Rust, and C++ Lambda functions work correctly with companion files accessible at `LAMBDA_TASK_ROOT`
+- **KMS Terraform support** — `EnableKeyRotation`, `DisableKeyRotation`, `GetKeyRotationStatus`, `GetKeyPolicy`, `PutKeyPolicy`, `ListKeyPolicies`, `EnableKey`, `DisableKey`, `ScheduleKeyDeletion`, `CancelKeyDeletion`, `TagResource`, `UntagResource`, `ListResourceTags`; KMS now has 27 actions (was 14). Fixes Terraform `aws_kms_key` with `enable_key_rotation = true`. Reported by @betorvs
 - **Docker image: `cryptography` package included** — KMS RSA Sign/Verify/GetPublicKey now work out of the box in the Docker image (+20MB image size, 211MB → 231MB)
 
 ### Stats
@@ -25,7 +26,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 - Full Terraform VPC module coverage: 98/98 actions for 20 resource types
 
 ### Tests
-- 982 tests total, all passing
+- 988 tests total, all passing
 
 ---
 

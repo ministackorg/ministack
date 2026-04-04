@@ -19019,3 +19019,94 @@ def test_ec2_full_terraform_vpc_flow(ec2):
             ec2.delete_subnet(SubnetId=sid)
     finally:
         ec2.delete_vpc(VpcId=vpc_id)
+
+
+# ---------------------------------------------------------------------------
+# KMS v1.1.36 — Terraform key rotation, policy, tags, lifecycle
+# ---------------------------------------------------------------------------
+
+def test_kms_enable_disable_key_rotation(kms_client):
+    """EnableKeyRotation / DisableKeyRotation / GetKeyRotationStatus."""
+    key = kms_client.create_key(KeyUsage="ENCRYPT_DECRYPT")
+    key_id = key["KeyMetadata"]["KeyId"]
+    status = kms_client.get_key_rotation_status(KeyId=key_id)
+    assert status["KeyRotationEnabled"] is False
+    kms_client.enable_key_rotation(KeyId=key_id)
+    status = kms_client.get_key_rotation_status(KeyId=key_id)
+    assert status["KeyRotationEnabled"] is True
+    kms_client.disable_key_rotation(KeyId=key_id)
+    status = kms_client.get_key_rotation_status(KeyId=key_id)
+    assert status["KeyRotationEnabled"] is False
+    kms_client.schedule_key_deletion(KeyId=key_id, PendingWindowInDays=7)
+
+
+def test_kms_get_put_key_policy(kms_client):
+    """GetKeyPolicy / PutKeyPolicy."""
+    key = kms_client.create_key()
+    key_id = key["KeyMetadata"]["KeyId"]
+    policy = kms_client.get_key_policy(KeyId=key_id, PolicyName="default")
+    assert "Statement" in policy["Policy"]
+    custom = '{"Version":"2012-10-17","Statement":[]}'
+    kms_client.put_key_policy(KeyId=key_id, PolicyName="default", Policy=custom)
+    got = kms_client.get_key_policy(KeyId=key_id, PolicyName="default")
+    assert got["Policy"] == custom
+    kms_client.schedule_key_deletion(KeyId=key_id, PendingWindowInDays=7)
+
+
+def test_kms_tag_untag_list_v2(kms_client):
+    """TagResource / UntagResource / ListResourceTags."""
+    key = kms_client.create_key()
+    key_id = key["KeyMetadata"]["KeyId"]
+    kms_client.tag_resource(KeyId=key_id, Tags=[
+        {"TagKey": "env", "TagValue": "test"},
+        {"TagKey": "team", "TagValue": "platform"},
+    ])
+    tags = kms_client.list_resource_tags(KeyId=key_id)
+    tag_map = {t["TagKey"]: t["TagValue"] for t in tags["Tags"]}
+    assert tag_map["env"] == "test"
+    assert tag_map["team"] == "platform"
+    kms_client.untag_resource(KeyId=key_id, TagKeys=["team"])
+    tags = kms_client.list_resource_tags(KeyId=key_id)
+    assert len(tags["Tags"]) == 1
+    assert tags["Tags"][0]["TagKey"] == "env"
+    kms_client.schedule_key_deletion(KeyId=key_id, PendingWindowInDays=7)
+
+
+def test_kms_enable_disable_key(kms_client):
+    """EnableKey / DisableKey."""
+    key = kms_client.create_key()
+    key_id = key["KeyMetadata"]["KeyId"]
+    assert key["KeyMetadata"]["KeyState"] == "Enabled"
+    kms_client.disable_key(KeyId=key_id)
+    desc = kms_client.describe_key(KeyId=key_id)
+    assert desc["KeyMetadata"]["KeyState"] == "Disabled"
+    kms_client.enable_key(KeyId=key_id)
+    desc = kms_client.describe_key(KeyId=key_id)
+    assert desc["KeyMetadata"]["KeyState"] == "Enabled"
+    kms_client.schedule_key_deletion(KeyId=key_id, PendingWindowInDays=7)
+
+
+def test_kms_schedule_cancel_deletion(kms_client):
+    """ScheduleKeyDeletion / CancelKeyDeletion."""
+    key = kms_client.create_key()
+    key_id = key["KeyMetadata"]["KeyId"]
+    resp = kms_client.schedule_key_deletion(KeyId=key_id, PendingWindowInDays=7)
+    assert resp["KeyState"] == "PendingDeletion"
+    kms_client.cancel_key_deletion(KeyId=key_id)
+    desc = kms_client.describe_key(KeyId=key_id)
+    assert desc["KeyMetadata"]["KeyState"] == "Disabled"
+
+
+def test_kms_terraform_full_flow(kms_client):
+    """Full Terraform aws_kms_key lifecycle."""
+    key = kms_client.create_key(KeySpec="SYMMETRIC_DEFAULT", KeyUsage="ENCRYPT_DECRYPT", Description="RDS key")
+    key_id = key["KeyMetadata"]["KeyId"]
+    kms_client.enable_key_rotation(KeyId=key_id)
+    assert kms_client.get_key_rotation_status(KeyId=key_id)["KeyRotationEnabled"] is True
+    pol = kms_client.get_key_policy(KeyId=key_id, PolicyName="default")
+    assert len(pol["Policy"]) > 0
+    kms_client.tag_resource(KeyId=key_id, Tags=[{"TagKey": "Name", "TagValue": "rds-key"}])
+    assert kms_client.list_resource_tags(KeyId=key_id)["Tags"][0]["TagValue"] == "rds-key"
+    desc = kms_client.describe_key(KeyId=key_id)
+    assert desc["KeyMetadata"]["Description"] == "RDS key"
+    kms_client.schedule_key_deletion(KeyId=key_id, PendingWindowInDays=7)
