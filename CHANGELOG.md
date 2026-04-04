@@ -7,6 +7,27 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [1.1.35] — 2026-04-04
+
+### Fixed
+- **EC2 `CreateVpc` creates per-VPC default resources** — each new VPC now gets its own main route table, default network ACL (with standard allow/deny rules), and default security group. Previously all VPCs shared global defaults, so Terraform couldn't find VPC-specific resources
+- **EC2 `DescribeNetworkAcls` `default` filter** — Terraform looks up `default_network_acl_id` via `DescribeNetworkAcls` with `vpc-id` + `default=true`, not from the VPC object. Now works
+- **EC2 `DescribeSecurityGroups` `vpc-id`/`group-name` filters** — Terraform looks up `default_security_group_id` via these filters. Now works
+- **EC2 `DescribeRouteTables` `association.main` filter** — Terraform finds the main route table for a VPC using this filter. Now works
+- **EC2 route target types preserved** — `CreateRoute`/`ReplaceRoute` now store `NatGatewayId`, `InstanceId`, `VpcPeeringConnectionId`, `TransitGatewayId` as distinct fields; XML output uses correct element names
+
+### Reported by
+- @betorvs — Terraform VPC module v6.6.0 `default_network_acl_id` missing (#107, #108)
+
+---
+
+## [1.1.34] — 2026-04-04
+
+### Fixed
+- **EC2 `DescribeRouteTables` filter by association ID** — `association.route-table-association-id`, `association.subnet-id`, `vpc-id` filters now supported. Fixes Terraform 5-minute timeout polling route table associations after `AssociateRouteTable`. Reported by @betorvs (#107, #108)
+
+---
+
 ## [1.1.33] — 2026-04-04
 
 ### Added

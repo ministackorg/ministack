@@ -456,9 +456,16 @@ def _delete_security_group(p):
 
 def _describe_security_groups(p):
     filter_ids = _parse_member_list(p, "GroupId")
+    filters = _parse_filters(p)
     items = ""
     for sg in _security_groups.values():
         if filter_ids and sg["GroupId"] not in filter_ids:
+            continue
+        vpc_filter = filters.get("vpc-id", [])
+        if vpc_filter and sg.get("VpcId", "") not in vpc_filter:
+            continue
+        name_filter = filters.get("group-name", [])
+        if name_filter and sg.get("GroupName", "") not in name_filter:
             continue
         items += _sg_xml(sg)
     return _xml(200, "DescribeSecurityGroupsResponse",
@@ -595,18 +602,42 @@ def _describe_vpcs(p):
 def _create_vpc(p):
     cidr = _p(p, "CidrBlock") or "10.0.0.0/16"
     vpc_id = _new_vpc_id()
+    # Per-VPC default network ACL
     acl_id = "acl-" + "".join(random.choices(string.hexdigits[:16], k=17))
+    _network_acls[acl_id] = {
+        "NetworkAclId": acl_id, "VpcId": vpc_id, "IsDefault": True,
+        "Entries": [
+            {"RuleNumber": 100, "Protocol": "-1", "RuleAction": "allow", "Egress": False, "CidrBlock": "0.0.0.0/0"},
+            {"RuleNumber": 32767, "Protocol": "-1", "RuleAction": "deny", "Egress": False, "CidrBlock": "0.0.0.0/0"},
+            {"RuleNumber": 100, "Protocol": "-1", "RuleAction": "allow", "Egress": True, "CidrBlock": "0.0.0.0/0"},
+            {"RuleNumber": 32767, "Protocol": "-1", "RuleAction": "deny", "Egress": True, "CidrBlock": "0.0.0.0/0"},
+        ],
+        "Associations": [], "Tags": [], "OwnerId": ACCOUNT_ID,
+    }
+    # Per-VPC main route table
+    rtb_id = "rtb-" + "".join(random.choices(string.hexdigits[:16], k=17))
+    rtb_assoc_id = "rtbassoc-" + "".join(random.choices(string.hexdigits[:16], k=17))
+    _route_tables[rtb_id] = {
+        "RouteTableId": rtb_id, "VpcId": vpc_id, "OwnerId": ACCOUNT_ID,
+        "Routes": [{"DestinationCidrBlock": cidr, "GatewayId": "local", "State": "active", "Origin": "CreateRouteTable"}],
+        "Associations": [{"RouteTableAssociationId": rtb_assoc_id, "RouteTableId": rtb_id, "Main": True,
+                          "AssociationState": {"State": "associated"}}],
+    }
+    # Per-VPC default security group
+    sg_id = _new_sg_id()
+    _security_groups[sg_id] = {
+        "GroupId": sg_id, "GroupName": "default", "Description": "default VPC security group",
+        "VpcId": vpc_id, "OwnerId": ACCOUNT_ID, "IpPermissions": [],
+        "IpPermissionsEgress": [
+            {"IpProtocol": "-1", "IpRanges": [{"CidrIp": "0.0.0.0/0"}],
+             "Ipv6Ranges": [], "PrefixListIds": [], "UserIdGroupPairs": []},
+        ],
+    }
     _vpcs[vpc_id] = {
-        "VpcId": vpc_id,
-        "CidrBlock": cidr,
-        "State": "available",
-        "IsDefault": False,
-        "DhcpOptionsId": "dopt-00000001",
-        "InstanceTenancy": _p(p, "InstanceTenancy") or "default",
-        "OwnerId": ACCOUNT_ID,
-        "DefaultNetworkAclId": acl_id,
-        "DefaultSecurityGroupId": _DEFAULT_SG_ID,
-        "MainRouteTableId": _DEFAULT_RTB_ID,
+        "VpcId": vpc_id, "CidrBlock": cidr, "State": "available", "IsDefault": False,
+        "DhcpOptionsId": "dopt-00000001", "InstanceTenancy": _p(p, "InstanceTenancy") or "default",
+        "OwnerId": ACCOUNT_ID, "DefaultNetworkAclId": acl_id,
+        "DefaultSecurityGroupId": sg_id, "MainRouteTableId": rtb_id,
     }
     return _xml(200, "CreateVpcResponse", _vpc_fields_xml(_vpcs[vpc_id], tag="vpc"))
 
@@ -811,6 +842,13 @@ def _describe_route_tables(p):
             subnet_ids = [a.get("SubnetId", "") for a in rtb.get("Associations", [])]
             if not any(sf in subnet_ids for sf in subnet_filter):
                 continue
+        # Filter by association.main
+        main_filter = filters.get("association.main", [])
+        if main_filter:
+            want_main = main_filter[0].lower() == "true"
+            has_main = any(a.get("Main") for a in rtb.get("Associations", []))
+            if has_main != want_main:
+                continue
         # Filter by vpc-id
         vpc_filter = filters.get("vpc-id", [])
         if vpc_filter and rtb.get("VpcId", "") not in vpc_filter:
@@ -857,13 +895,20 @@ def _create_route(p):
         return _error("InvalidRouteTableID.NotFound",
                       f"The route table '{rtb_id}' does not exist", 400)
     dest = _p(p, "DestinationCidrBlock")
-    gw = _p(p, "GatewayId") or _p(p, "NatGatewayId") or _p(p, "InstanceId") or "local"
-    rtb["Routes"].append({
-        "DestinationCidrBlock": dest,
-        "GatewayId": gw,
-        "State": "active",
-        "Origin": "CreateRoute",
-    })
+    route = {"DestinationCidrBlock": dest, "State": "active", "Origin": "CreateRoute"}
+    if _p(p, "GatewayId"):
+        route["GatewayId"] = _p(p, "GatewayId")
+    elif _p(p, "NatGatewayId"):
+        route["NatGatewayId"] = _p(p, "NatGatewayId")
+    elif _p(p, "InstanceId"):
+        route["InstanceId"] = _p(p, "InstanceId")
+    elif _p(p, "VpcPeeringConnectionId"):
+        route["VpcPeeringConnectionId"] = _p(p, "VpcPeeringConnectionId")
+    elif _p(p, "TransitGatewayId"):
+        route["TransitGatewayId"] = _p(p, "TransitGatewayId")
+    else:
+        route["GatewayId"] = "local"
+    rtb["Routes"].append(route)
     return _xml(200, "CreateRouteResponse", "<return>true</return>")
 
 
@@ -874,10 +919,19 @@ def _replace_route(p):
         return _error("InvalidRouteTableID.NotFound",
                       f"The route table '{rtb_id}' does not exist", 400)
     dest = _p(p, "DestinationCidrBlock")
-    gw = _p(p, "GatewayId") or _p(p, "NatGatewayId") or _p(p, "InstanceId") or "local"
     for route in rtb["Routes"]:
         if route.get("DestinationCidrBlock") == dest:
-            route["GatewayId"] = gw
+            route.pop("GatewayId", None)
+            route.pop("NatGatewayId", None)
+            route.pop("InstanceId", None)
+            if _p(p, "GatewayId"):
+                route["GatewayId"] = _p(p, "GatewayId")
+            elif _p(p, "NatGatewayId"):
+                route["NatGatewayId"] = _p(p, "NatGatewayId")
+            elif _p(p, "InstanceId"):
+                route["InstanceId"] = _p(p, "InstanceId")
+            else:
+                route["GatewayId"] = "local"
             break
     return _xml(200, "ReplaceRouteResponse", "<return>true</return>")
 
@@ -1582,12 +1636,25 @@ def _igw_xml(igw):
 
 
 def _rtb_fields_xml(rtb, tag="item"):
-    routes = "".join(f"""<item>
+    def _route_xml(r):
+        target = ""
+        if r.get("GatewayId"):
+            target = f"<gatewayId>{r['GatewayId']}</gatewayId>"
+        if r.get("NatGatewayId"):
+            target += f"<natGatewayId>{r['NatGatewayId']}</natGatewayId>"
+        if r.get("InstanceId"):
+            target += f"<instanceId>{r['InstanceId']}</instanceId>"
+        if r.get("VpcPeeringConnectionId"):
+            target += f"<vpcPeeringConnectionId>{r['VpcPeeringConnectionId']}</vpcPeeringConnectionId>"
+        if r.get("TransitGatewayId"):
+            target += f"<transitGatewayId>{r['TransitGatewayId']}</transitGatewayId>"
+        return f"""<item>
         <destinationCidrBlock>{r.get('DestinationCidrBlock','')}</destinationCidrBlock>
-        <gatewayId>{r.get('GatewayId','')}</gatewayId>
+        {target}
         <state>{r.get('State','active')}</state>
         <origin>{r.get('Origin','')}</origin>
-    </item>""" for r in rtb.get("Routes", []))
+    </item>"""
+    routes = "".join(_route_xml(r) for r in rtb.get("Routes", []))
     assocs = "".join(f"""<item>
         <routeTableAssociationId>{a['RouteTableAssociationId']}</routeTableAssociationId>
         <routeTableId>{a['RouteTableId']}</routeTableId>
@@ -1961,6 +2028,10 @@ def _describe_network_acls(params):
             continue
         if filters.get("vpc-id") and acl["VpcId"] not in filters["vpc-id"]:
             continue
+        if filters.get("default"):
+            want_default = filters["default"][0].lower() == "true"
+            if acl.get("IsDefault", False) != want_default:
+                continue
         entries = "".join(f"""<item>
             <ruleNumber>{e['RuleNumber']}</ruleNumber>
             <protocol>{e['Protocol']}</protocol>
