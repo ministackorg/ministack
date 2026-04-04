@@ -7,6 +7,18 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [1.1.31] — 2026-04-04
+
+### Fixed
+- **S3→Lambda notifications silently failing** — `_invoke` is async but was called from sync context; coroutine was never awaited. Now uses direct `_execute_function` in background thread
+- **SNS HTTP delivery crash from background threads** — `asyncio.ensure_future` fails with no event loop when `_fanout` called from S3/EventBridge threads. Now uses `threading.Thread(target=asyncio.run, ...)`
+- **ACCOUNT_ID configurable across all services** — `MINISTACK_ACCOUNT_ID` env var now respected by all 37 services and router; previously only 6 services read it
+- **EventBridge SQS dispatch missing message fields** — now calls `_ensure_msg_fields` after appending, preventing KeyError on ReceiveMessage
+- **README: stale test count and service count** — updated to 948 tests, 37 services
+- **README: CloudFront in Terraform endpoints, architecture diagram, comparison table**
+
+---
+
 ## [1.1.30] — 2026-04-03
 
 ### Added

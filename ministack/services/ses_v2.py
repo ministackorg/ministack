@@ -17,7 +17,7 @@ from ministack.core.responses import json_response, new_uuid, now_iso
 
 logger = logging.getLogger("ses-v2")
 
-ACCOUNT_ID = "000000000000"
+ACCOUNT_ID = os.environ.get("MINISTACK_ACCOUNT_ID", "000000000000")
 REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 
 _identities: dict = {}        # identity -> dict

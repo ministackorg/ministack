@@ -11,6 +11,7 @@ SNS → Lambda fanout dispatches via _execute_function (synchronous).
 """
 
 import asyncio
+import threading as _threading
 import copy
 import hashlib
 import json
@@ -28,7 +29,7 @@ from ministack.services import sqs as _sqs
 
 logger = logging.getLogger("sns")
 
-ACCOUNT_ID = "000000000000"
+ACCOUNT_ID = os.environ.get("MINISTACK_ACCOUNT_ID", "000000000000")
 REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 
 from ministack.core.persistence import load_state, PERSIST_STATE
@@ -539,9 +540,11 @@ def _fanout(topic_arn: str, msg_id: str, message: str, subject: str,
         if protocol == "sqs":
             _deliver_to_sqs(endpoint, envelope, raw, effective_message)
         elif protocol in ("http", "https"):
-            asyncio.ensure_future(
-                _deliver_to_http(endpoint, envelope)
-            )
+            _threading.Thread(
+                target=asyncio.run,
+                args=(_deliver_to_http(endpoint, envelope),),
+                daemon=True,
+            ).start()
         elif protocol == "lambda":
             _deliver_to_lambda(endpoint, envelope, topic_arn, sub["arn"], msg_id, effective_message, message_attributes or {})
         elif protocol == "email" or protocol == "email-json":

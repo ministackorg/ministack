@@ -27,7 +27,7 @@ from ministack.core.responses import error_response_json, json_response, new_uui
 
 logger = logging.getLogger("events")
 
-ACCOUNT_ID = "000000000000"
+ACCOUNT_ID = os.environ.get("MINISTACK_ACCOUNT_ID", "000000000000")
 REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 
 
@@ -672,6 +672,8 @@ def _dispatch_to_sqs(arn, payload):
             "SentTimestamp": str(int(now * 1000)),
         },
     })
+    if hasattr(_sqs, "_ensure_msg_fields"):
+        _sqs._ensure_msg_fields(queue["messages"][-1])
     logger.info("EventBridge → SQS %s", queue_name)
 
 
