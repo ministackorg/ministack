@@ -15,7 +15,7 @@ from urllib.parse import parse_qs
 
 logger = logging.getLogger("cloudformation")
 
-ACCOUNT_ID = "000000000000"
+ACCOUNT_ID = os.environ.get("MINISTACK_ACCOUNT_ID", "000000000000")
 REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 
 # In-memory state (shared across all submodules)

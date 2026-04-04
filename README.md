@@ -21,7 +21,7 @@
 
 LocalStack recently moved its core services behind a paid plan. If you relied on LocalStack Community for local development and CI/CD pipelines, MiniStack is your free alternative.
 
-- **36 AWS services** emulated on a single port (4566)
+- **37 AWS services** emulated on a single port (4566)
 - **Drop-in compatible** — works with `boto3`, AWS CLI, Terraform, CDK, Pulumi, any SDK
 - **Real infrastructure** — RDS spins up actual Postgres/MySQL containers, ElastiCache spins up real Redis, Athena runs real SQL via DuckDB, ECS runs real Docker containers
 - **Tiny footprint** — ~200MB image, ~30MB RAM at idle vs LocalStack's ~1GB image and ~500MB RAM
@@ -517,7 +517,8 @@ Layers that ship npm packages work too — MiniStack resolves the `nodejs/node_m
                     │  │  Athena   Firehose   Route53       │  │
                     │  │  Cognito  EC2   EMR   EBS   EFS    │  │
                     │  │  ALB/ELBv2   ACM   WAF v2          │  │
-                    │  │  CloudFormation   KMS   ECR        │  │
+                    │  │  CloudFormation  KMS  ECR          │  │
+                    │  │  CloudFront                        │  │
                     │  └────────────────────────────────────┘  │
                     │                                          │
                     │  In-Memory Storage + Optional Docker     │
@@ -540,20 +541,20 @@ pip install boto3 pytest duckdb docker cbor2
 # Start MiniStack
 docker compose up -d
 
-# Run the full test suite (887 tests across all 36 services)
+# Run the full test suite (948 tests across all 37 services)
 pytest tests/ -v
 ```
 
 Expected output:
 
 ```
-collected 879 items
+collected 948 items
 
 tests/test_services.py::test_s3_create_bucket PASSED
 ...
 tests/test_services.py::test_app_asgi_callable PASSED
 
-879 passed in ~100s
+948 passed in ~100s
 ```
 
 ---
@@ -611,6 +612,7 @@ provider "aws" {
     stepfunctions   = "http://localhost:4566"
     sts             = "http://localhost:4566"
     wafv2           = "http://localhost:4566"
+    cloudfront      = "http://localhost:4566"
   }
 }
 ```
@@ -675,6 +677,7 @@ See [`Testcontainers/java-testcontainers`](Testcontainers/java-testcontainers), 
 | **CloudFormation** | **partial** | partial | ✅ Free |
 | **KMS** | ✅ | Paid | ✅ Free |
 | **ECR** | ✅ | ✅ | ✅ |
+| **CloudFront** | ✅ | Paid | ✅ |
 | Cost | **Free** | Was free, now paid | $35+/mo |
 | Docker image size | ~200MB | ~1GB | ~1GB |
 | Memory at idle | ~30MB | ~500MB | ~500MB |

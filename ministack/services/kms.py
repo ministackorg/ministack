@@ -31,7 +31,7 @@ except ImportError:
         "Install with: pip install cryptography"
     )
 
-ACCOUNT_ID = "000000000000"
+ACCOUNT_ID = os.environ.get("MINISTACK_ACCOUNT_ID", "000000000000")
 REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 
 from ministack.core.persistence import load_state, PERSIST_STATE

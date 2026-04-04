@@ -25,7 +25,7 @@ from ministack.core.responses import new_uuid
 
 logger = logging.getLogger("cloudwatch")
 
-ACCOUNT_ID = "000000000000"
+ACCOUNT_ID = os.environ.get("MINISTACK_ACCOUNT_ID", "000000000000")
 REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 TWO_WEEKS_SECONDS = 14 * 24 * 3600
 

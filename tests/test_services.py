@@ -17993,3 +17993,108 @@ def test_s3_eventbridge_notification_on_delete(s3, sqs, eb):
     assert body["source"] == "aws.s3"
     assert body["detail"]["bucket"]["name"] == bucket
     assert body["detail"]["object"]["key"] == "del-test.txt"
+
+
+# ========== Kinesis ESM polling ==========
+
+
+def test_kinesis_esm_creates_and_lists(lam, kin):
+    """Kinesis ESM can be created and listed."""
+    kin.create_stream(StreamName="esm-kin-stream", ShardCount=1)
+    stream = kin.describe_stream(StreamName="esm-kin-stream")["StreamDescription"]
+    stream_arn = stream["StreamARN"]
+
+    code = "def handler(event, context): return len(event.get('Records', []))"
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("index.py", code)
+    lam.create_function(
+        FunctionName="esm-kin-fn", Runtime="python3.11",
+        Role=_LAMBDA_ROLE, Handler="index.handler",
+        Code={"ZipFile": buf.getvalue()},
+    )
+
+    esm = lam.create_event_source_mapping(
+        FunctionName="esm-kin-fn",
+        EventSourceArn=stream_arn,
+        StartingPosition="TRIM_HORIZON",
+        BatchSize=10,
+    )
+    assert esm["EventSourceArn"] == stream_arn
+    assert esm["FunctionArn"].endswith("esm-kin-fn")
+
+    esms = lam.list_event_source_mappings(FunctionName="esm-kin-fn")["EventSourceMappings"]
+    assert any(e["UUID"] == esm["UUID"] for e in esms)
+
+    lam.delete_event_source_mapping(UUID=esm["UUID"])
+    lam.delete_function(FunctionName="esm-kin-fn")
+
+
+# ========== Lambda EventInvokeConfig ==========
+
+
+def test_lambda_event_invoke_config_crud(lam):
+    """Put/Get/Delete EventInvokeConfig lifecycle."""
+    code = "def handler(e,c): return {}"
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("index.py", code)
+    lam.create_function(
+        FunctionName="eic-fn", Runtime="python3.11",
+        Role=_LAMBDA_ROLE, Handler="index.handler",
+        Code={"ZipFile": buf.getvalue()},
+    )
+
+    lam.put_function_event_invoke_config(
+        FunctionName="eic-fn",
+        MaximumRetryAttempts=1,
+        MaximumEventAgeInSeconds=300,
+    )
+    cfg = lam.get_function_event_invoke_config(FunctionName="eic-fn")
+    assert cfg["MaximumRetryAttempts"] == 1
+    assert cfg["MaximumEventAgeInSeconds"] == 300
+
+    lam.delete_function_event_invoke_config(FunctionName="eic-fn")
+    from botocore.exceptions import ClientError
+    with pytest.raises(ClientError):
+        lam.get_function_event_invoke_config(FunctionName="eic-fn")
+
+    lam.delete_function(FunctionName="eic-fn")
+
+
+# ========== Lambda ProvisionedConcurrency ==========
+
+
+def test_lambda_provisioned_concurrency_crud(lam):
+    """Put/Get/Delete ProvisionedConcurrencyConfig lifecycle."""
+    code = "def handler(e,c): return {}"
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("index.py", code)
+    lam.create_function(
+        FunctionName="pc-fn", Runtime="python3.11",
+        Role=_LAMBDA_ROLE, Handler="index.handler",
+        Code={"ZipFile": buf.getvalue()},
+        Publish=True,
+    )
+    versions = lam.list_versions_by_function(FunctionName="pc-fn")["Versions"]
+    ver = [v for v in versions if v["Version"] != "$LATEST"][0]["Version"]
+
+    lam.put_provisioned_concurrency_config(
+        FunctionName="pc-fn",
+        Qualifier=ver,
+        ProvisionedConcurrentExecutions=5,
+    )
+    cfg = lam.get_provisioned_concurrency_config(
+        FunctionName="pc-fn", Qualifier=ver,
+    )
+    assert cfg["RequestedProvisionedConcurrentExecutions"] == 5
+
+    lam.delete_provisioned_concurrency_config(
+        FunctionName="pc-fn", Qualifier=ver,
+    )
+    from botocore.exceptions import ClientError
+    with pytest.raises(ClientError):
+        lam.get_provisioned_concurrency_config(FunctionName="pc-fn", Qualifier=ver)
+
+    lam.delete_function(FunctionName="pc-fn")

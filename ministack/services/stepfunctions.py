@@ -39,7 +39,7 @@ from ministack.core.responses import (
 
 logger = logging.getLogger("states")
 
-ACCOUNT_ID = "000000000000"
+ACCOUNT_ID = os.environ.get("MINISTACK_ACCOUNT_ID", "000000000000")
 REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 
 # SFN mock config — compatible with LocalStack's SFN_MOCK_CONFIG / LOCALSTACK_SFN_MOCK_CONFIG

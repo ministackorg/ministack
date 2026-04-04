@@ -21,7 +21,7 @@ from ministack.core.responses import error_response_json, json_response, new_uui
 
 logger = logging.getLogger("glue")
 
-ACCOUNT_ID = "000000000000"
+ACCOUNT_ID = os.environ.get("MINISTACK_ACCOUNT_ID", "000000000000")
 REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 CRAWLER_RUN_SECONDS = int(os.environ.get("GLUE_CRAWLER_RUN_SECONDS", "5"))
 S3_DATA_DIR = os.environ.get("S3_DATA_DIR", "/tmp/ministack-data/s3")

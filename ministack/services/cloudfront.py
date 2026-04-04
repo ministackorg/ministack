@@ -10,6 +10,7 @@ Supports:
 """
 
 import logging
+import os
 import random
 import re
 import string
@@ -21,7 +22,7 @@ from ministack.core.responses import new_uuid
 
 logger = logging.getLogger("cloudfront")
 
-ACCOUNT_ID = "000000000000"
+ACCOUNT_ID = os.environ.get("MINISTACK_ACCOUNT_ID", "000000000000")
 NS = "http://cloudfront.amazonaws.com/doc/2020-05-31/"
 
 # ---------------------------------------------------------------------------

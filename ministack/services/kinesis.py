@@ -25,7 +25,7 @@ from ministack.core.responses import error_response_json, json_response, new_uui
 
 logger = logging.getLogger("kinesis")
 
-ACCOUNT_ID = "000000000000"
+ACCOUNT_ID = os.environ.get("MINISTACK_ACCOUNT_ID", "000000000000")
 REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 MAX_HASH_KEY = (2**128) - 1
 ITERATOR_EXPIRY_SECONDS = 300

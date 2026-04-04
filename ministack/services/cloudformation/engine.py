@@ -17,7 +17,7 @@ from ministack.core.responses import new_uuid
 # Sentinel for AWS::NoValue
 _NO_VALUE = object()
 
-ACCOUNT_ID = "000000000000"
+ACCOUNT_ID = os.environ.get("MINISTACK_ACCOUNT_ID", "000000000000")
 REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 # Note: ACCOUNT_ID/REGION duplicated here to keep engine.py free of __init__ imports (avoids circular deps)
 

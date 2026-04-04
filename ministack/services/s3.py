@@ -47,6 +47,7 @@ from ministack.core.responses import (
 
 logger = logging.getLogger("s3")
 
+ACCOUNT_ID = os.environ.get("MINISTACK_ACCOUNT_ID", "000000000000")
 S3_NS = "http://s3.amazonaws.com/doc/2006-03-01/"
 XML_DECL = b'<?xml version="1.0" encoding="UTF-8"?>'
 
@@ -1238,14 +1239,14 @@ def _fire_s3_event(
                         "bucket": {"name": bucket_name},
                         "object": {"key": key, "size": size, "etag": clean_etag, "sequencer": "0"},
                         "request-id": request_id,
-                        "requester": "000000000000",
+                        "requester": ACCOUNT_ID,
                         "source-ip-address": "127.0.0.1",
                         "reason": "PutObject",
                     }),
                     "EventBusName": "default",
                     "Time": event_time,
                     "Resources": [f"arn:aws:s3:::{bucket_name}"],
-                    "Account": "000000000000",
+                    "Account": ACCOUNT_ID,
                     "Region": os.environ.get("MINISTACK_REGION", "us-east-1"),
                 }
                 _eb._dispatch_event(eb_event)
@@ -1303,15 +1304,14 @@ def _deliver_event_to_lambda(arn: str, event_payload: dict) -> None:
     from ministack.services import lambda_svc as _lambda
 
     func_name = arn.rsplit(":", 1)[-1]
-    if func_name not in _lambda._functions:
+    func = _lambda._functions.get(func_name)
+    if not func:
         logger.warning("S3 notification: Lambda function %s not found", func_name)
         return
 
-    _lambda._invoke(
-        func_name,
-        event_payload,
-        headers={"x-amz-invocation-type": "Event"},
-    )
+    threading.Thread(
+        target=_lambda._execute_function, args=(func, event_payload), daemon=True
+    ).start()
     logger.info("S3 notification → Lambda %s", func_name)
 
 

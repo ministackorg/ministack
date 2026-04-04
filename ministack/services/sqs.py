@@ -62,7 +62,7 @@ _restored = load_state("sqs")
 if _restored:
     restore_state(_restored)
 
-ACCOUNT_ID = "000000000000"
+ACCOUNT_ID = os.environ.get("MINISTACK_ACCOUNT_ID", "000000000000")
 REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 DEFAULT_HOST = os.environ.get("MINISTACK_HOST", "localhost")
 DEFAULT_PORT = os.environ.get("GATEWAY_PORT", "4566")

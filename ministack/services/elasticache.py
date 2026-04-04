@@ -31,7 +31,7 @@ from ministack.core.responses import new_uuid
 
 logger = logging.getLogger("elasticache")
 
-ACCOUNT_ID = "000000000000"
+ACCOUNT_ID = os.environ.get("MINISTACK_ACCOUNT_ID", "000000000000")
 REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 REDIS_DEFAULT_HOST = os.environ.get("REDIS_HOST", "redis")
 REDIS_DEFAULT_PORT = int(os.environ.get("REDIS_PORT", "6379"))

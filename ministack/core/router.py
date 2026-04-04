@@ -453,4 +453,4 @@ def extract_region(headers: dict) -> str:
 
 def extract_account_id(headers: dict) -> str:
     """Extract or generate account ID."""
-    return "000000000000"
+    return os.environ.get("MINISTACK_ACCOUNT_ID", "000000000000")
