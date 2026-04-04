@@ -7,6 +7,30 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [1.1.33] — 2026-04-04
+
+### Added
+- **DynamoDB `ScanFilter` / `QueryFilter`** — legacy filter conditions (EQ, NE, NOT_NULL, NULL, CONTAINS, BEGINS_WITH) now supported alongside FilterExpression
+- **CFN `AWS::AppSync::*`** — GraphQLApi, DataSource, Resolver, GraphQLSchema, ApiKey provisioners for CDK/Amplify stacks
+- **CFN `AWS::SecretsManager::Secret`** — with `GenerateSecretString` support (PasswordLength, ExcludeCharacters, SecretStringTemplate, GenerateStringKey)
+- **S3 `UploadPartCopy`** — copy a range from an existing object as a multipart upload part; supports `x-amz-copy-source-range`
+- **SNS FIFO dedup passthrough** — `MessageGroupId` and `MessageDeduplicationId` from SNS Publish now forwarded to SQS FIFO queues via fanout
+- **AppSync GraphQL data plane** — `POST /v1/apis/{apiId}/graphql` executes queries and mutations against DynamoDB resolvers; supports create/get/list/update/delete operations, nested input objects, field selection, Lambda resolvers; enables Amplify Data runtime
+- **CFN Cognito resource types** — `AWS::Cognito::UserPool`, `AWS::Cognito::UserPoolClient`, `AWS::Cognito::IdentityPool`, `AWS::Cognito::UserPoolDomain` for Amplify/CDK auth stacks
+
+### Fixed
+- **DynamoDB persistence crash** — `defaultdict(dict)` deserialized as plain `dict` after restart, causing `KeyError` on new partition keys. Now converts back to `defaultdict` on restore
+- **DynamoDB `_pitr_settings` not persisted** — `DescribeContinuousBackups` now survives restarts
+- **Cognito JWT `kid` mismatch** — tokens now use `kid: ministack-key-1` matching the JWKS endpoint; fixes client-side JWT validation
+- **KMS RSA private keys persisted** — private keys now PEM-encoded in state; Sign/Verify work after restart (requires `cryptography` package)
+- **4 duplicate test function names** — `test_lambda_publish_version`, `test_kinesis_stream_encryption`, `test_apigw_delete_route` renamed to unique names; previously only last definition ran
+- **EC2 Terraform VPC module fixes** — `DescribeAddressesAttribute`, `DescribeSecurityGroupRules`, route table association state (`associated`), VPC `defaultNetworkAclId`/`defaultSecurityGroupId`/`mainRouteTableId` in CreateVpc/DescribeVpcs responses. Reported by @betorvs
+
+### Tests
+- 971 tests total, all passing
+
+---
+
 ## [1.1.32] — 2026-04-04
 
 ### Added

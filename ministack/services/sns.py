@@ -443,7 +443,10 @@ def _publish(params):
         "timestamp": time.time(),
     })
 
-    _fanout(topic_arn, msg_id, message, subject, message_structure, msg_attrs)
+    group_id = _p(params, "MessageGroupId") or ""
+    dedup_id = _p(params, "MessageDeduplicationId") or ""
+    _fanout(topic_arn, msg_id, message, subject, message_structure, msg_attrs,
+            message_group_id=group_id, message_dedup_id=dedup_id)
     logger.info("SNS publish to %s: %s", topic_arn, message[:100])
 
     return _xml(200, "PublishResponse",
@@ -512,7 +515,8 @@ def _publish_batch(params):
 # ---------------------------------------------------------------------------
 
 def _fanout(topic_arn: str, msg_id: str, message: str, subject: str,
-            message_structure: str = "", message_attributes: dict | None = None):
+            message_structure: str = "", message_attributes: dict | None = None,
+            message_group_id: str = "", message_dedup_id: str = ""):
     topic = _topics.get(topic_arn)
     if not topic:
         return
@@ -538,7 +542,8 @@ def _fanout(topic_arn: str, msg_id: str, message: str, subject: str,
         )
 
         if protocol == "sqs":
-            _deliver_to_sqs(endpoint, envelope, raw, effective_message)
+            _deliver_to_sqs(endpoint, envelope, raw, effective_message,
+                           message_group_id=message_group_id, message_dedup_id=message_dedup_id)
         elif protocol in ("http", "https"):
             _threading.Thread(
                 target=asyncio.run,
@@ -555,7 +560,8 @@ def _fanout(topic_arn: str, msg_id: str, message: str, subject: str,
             logger.info("SNS fanout → application %s (stub)", endpoint)
 
 
-def _deliver_to_sqs(endpoint: str, envelope: str, raw: bool, raw_message: str):
+def _deliver_to_sqs(endpoint: str, envelope: str, raw: bool, raw_message: str,
+                    message_group_id: str = "", message_dedup_id: str = ""):
     queue_name = endpoint.split(":")[-1]
     queue_url = _sqs._queue_url(queue_name)
     queue = _sqs._queues.get(queue_url)
@@ -574,6 +580,10 @@ def _deliver_to_sqs(endpoint: str, envelope: str, raw: bool, raw_message: str):
         "visible_at": now,
         "receive_count": 0,
     }
+    if message_group_id:
+        msg["group_id"] = message_group_id
+    if message_dedup_id:
+        msg["dedup_id"] = message_dedup_id
     _sqs._ensure_msg_fields(msg)
     queue["messages"].append(msg)
     logger.info("SNS fanout → SQS %s", queue_name)

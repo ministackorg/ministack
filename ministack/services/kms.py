@@ -51,7 +51,7 @@ _aliases: dict = {}  # alias_name -> key_id (e.g. "alias/my-key" -> "uuid")
 
 def get_state():
     """Return JSON-serializable state. Symmetric keys are base64-encoded;
-    RSA private keys are stripped (not serializable)."""
+    RSA private keys are PEM-encoded if cryptography is available."""
     serializable_keys = {}
     for kid, rec in _keys.items():
         entry = {k: v for k, v in rec.items()
@@ -60,7 +60,16 @@ def get_state():
             entry["_symmetric_key_b64"] = base64.b64encode(rec["_symmetric_key"]).decode()
         if "_public_key_der" in rec:
             entry["_public_key_der_b64"] = base64.b64encode(rec["_public_key_der"]).decode()
-        # RSA private keys are skipped — not JSON-serializable
+        if "_private_key" in rec and HAS_CRYPTO:
+            try:
+                pem = rec["_private_key"].private_bytes(
+                    serialization.Encoding.PEM,
+                    serialization.PrivateFormat.PKCS8,
+                    serialization.NoEncryption(),
+                )
+                entry["_private_key_pem"] = base64.b64encode(pem).decode()
+            except Exception:
+                pass
         serializable_keys[kid] = entry
     return {"keys": serializable_keys, "aliases": _aliases}
 
@@ -72,6 +81,12 @@ def restore_state(data):
                 entry["_symmetric_key"] = base64.b64decode(entry.pop("_symmetric_key_b64"))
             if "_public_key_der_b64" in entry:
                 entry["_public_key_der"] = base64.b64decode(entry.pop("_public_key_der_b64"))
+            if "_private_key_pem" in entry and HAS_CRYPTO:
+                try:
+                    pem_bytes = base64.b64decode(entry.pop("_private_key_pem"))
+                    entry["_private_key"] = serialization.load_pem_private_key(pem_bytes, password=None)
+                except Exception:
+                    pass
             _keys[kid] = entry
         _aliases.update(data.get("aliases", {}))
 

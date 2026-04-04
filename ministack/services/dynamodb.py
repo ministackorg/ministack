@@ -43,14 +43,19 @@ _lock = threading.Lock()
 # ── Persistence ────────────────────────────────────────────
 
 def get_state():
-    return {"tables": copy.deepcopy(_tables), "tags": copy.deepcopy(_tags), "ttl_settings": copy.deepcopy(_ttl_settings)}
+    return {"tables": copy.deepcopy(_tables), "tags": copy.deepcopy(_tags), "ttl_settings": copy.deepcopy(_ttl_settings), "pitr_settings": copy.deepcopy(_pitr_settings)}
 
 
 def restore_state(data):
     if data:
         _tables.update(data.get("tables", {}))
+        # Restore items as defaultdict(dict) — JSON deserializes as plain dict
+        for tbl in _tables.values():
+            if isinstance(tbl.get("items"), dict) and not isinstance(tbl["items"], defaultdict):
+                tbl["items"] = defaultdict(dict, tbl["items"])
         _tags.update(data.get("tags", {}))
         _ttl_settings.update(data.get("ttl_settings", {}))
+        _pitr_settings.update(data.get("pitr_settings", {}))
 
 
 _restored = load_state("dynamodb")
@@ -536,7 +541,10 @@ def _query(data):
         candidates = candidates[:limit]
 
     scanned_count = len(candidates)
-    if filter_expr:
+    query_filter = data.get("QueryFilter")
+    if query_filter and not filter_expr:
+        filtered = [it for it in candidates if _evaluate_legacy_filter(it, query_filter)]
+    elif filter_expr:
         filtered = [it for it in candidates if _evaluate_condition(filter_expr, it, eav, ean)]
     else:
         filtered = candidates
@@ -595,7 +603,12 @@ def _scan(data):
         all_items = all_items[:limit]
 
     scanned_count = len(all_items)
-    if filter_expr:
+
+    # Legacy ScanFilter / QueryFilter support
+    scan_filter = data.get("ScanFilter") or data.get("QueryFilter")
+    if scan_filter and not filter_expr:
+        filtered = [it for it in all_items if _evaluate_legacy_filter(it, scan_filter)]
+    elif filter_expr:
         filtered = [it for it in all_items if _evaluate_condition(filter_expr, it, eav, ean)]
     else:
         filtered = all_items
@@ -1780,6 +1793,37 @@ def _update_counts(table):
     count = sum(len(v) for v in table["items"].values())
     table["ItemCount"] = count
     table["TableSizeBytes"] = count * 200
+
+
+def _evaluate_legacy_filter(item, scan_filter):
+    """Evaluate legacy ScanFilter/QueryFilter conditions."""
+    for attr_name, condition in scan_filter.items():
+        op = condition.get("ComparisonOperator", "")
+        attr_vals = condition.get("AttributeValueList", [])
+        item_val = item.get(attr_name)
+        if op == "EQ":
+            if item_val is None or item_val != attr_vals[0]:
+                return False
+        elif op == "NE":
+            if item_val is not None and item_val == attr_vals[0]:
+                return False
+        elif op == "NOT_NULL":
+            if item_val is None:
+                return False
+        elif op == "NULL":
+            if item_val is not None:
+                return False
+        elif op == "CONTAINS":
+            val = _extract_key_val(item_val) if item_val else ""
+            target = _extract_key_val(attr_vals[0]) if attr_vals else ""
+            if target not in str(val):
+                return False
+        elif op == "BEGINS_WITH":
+            val = _extract_key_val(item_val) if item_val else ""
+            target = _extract_key_val(attr_vals[0]) if attr_vals else ""
+            if not str(val).startswith(str(target)):
+                return False
+    return True
 
 
 def _add_consumed_capacity(result, data, table_name, write=False):

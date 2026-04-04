@@ -489,6 +489,22 @@ async def handle_request(method, path, headers, body, query_params):
         else:  # GET
             return _list_tags_for_resource(arn)
 
+    # GraphQL data plane: POST /graphql or POST /v1/apis/{apiId}/graphql
+    if path == "/graphql" and method == "POST":
+        api_key = headers.get("x-api-key", "")
+        api_id = _resolve_api_by_key(api_key)
+        if not api_id:
+            return error_response_json("UnauthorizedException", "Valid API key required", 401)
+        data = json.loads(body) if body else {}
+        return _execute_graphql(api_id, data)
+
+    if path.startswith("/v1/apis/") and path.endswith("/graphql") and method == "POST":
+        parts = path.split("/")
+        if len(parts) >= 5:
+            api_id = parts[3]
+            data = json.loads(body) if body else {}
+            return _execute_graphql(api_id, data)
+
     m = _PATH_RE.match(path)
     if not m:
         return error_response_json("NotFoundException", f"Unknown path: {path}", 404)
@@ -608,3 +624,372 @@ def restore_state(data):
     _resolvers.update(data.get("resolvers", {}))
     _types.update(data.get("types", {}))
     _tags.update(data.get("tags", {}))
+
+
+# ---------------------------------------------------------------------------
+# GraphQL Data Plane — parse and execute queries against DynamoDB
+# ---------------------------------------------------------------------------
+
+import re as _re
+
+# Simple GraphQL parser — handles queries/mutations that Amplify generates
+_GQL_OP_RE = _re.compile(
+    r'(?:query|mutation|subscription)\s+(\w+)?\s*(?:\(([^)]*)\))?\s*\{(.*)\}',
+    _re.DOTALL,
+)
+_GQL_FIELD_RE = _re.compile(r'(\w+)\s*(?:\(([^)]*)\))?\s*(?:\{([^}]*)\})?')
+
+
+def _resolve_api_by_key(api_key_value):
+    """Find the API ID that owns this API key."""
+    for api_id, keys in _api_keys.items():
+        for kid, key in keys.items():
+            if kid == api_key_value or key.get("id") == api_key_value:
+                return api_id
+    # Fallback: if only one API exists, use it
+    if len(_apis) == 1:
+        return next(iter(_apis))
+    return None
+
+
+def _execute_graphql(api_id, data):
+    """Execute a GraphQL query/mutation against the configured resolvers."""
+    query = data.get("query", "")
+    variables = data.get("variables", {})
+    operation_name = data.get("operationName")
+
+    if not query.strip():
+        return _json(400, {"errors": [{"message": "Query is required"}]})
+
+    if api_id not in _apis:
+        return _json(404, {"errors": [{"message": f"API {api_id} not found"}]})
+
+    # Parse the top-level operation
+    # Strip __typename fields — Amplify adds these everywhere
+    query_clean = _re.sub(r'__typename\s*', '', query)
+
+    m = _GQL_OP_RE.search(query_clean)
+    if not m:
+        # Try bare field query: { getUser(id: "1") { name } }
+        inner = query_clean.strip().strip("{}")
+        fields = _parse_fields(inner, variables)
+    else:
+        op_name, op_args, body = m.groups()
+        fields = _parse_fields(body, variables)
+
+    # Determine operation type
+    is_mutation = query_clean.strip().startswith("mutation")
+
+    results = {}
+    errors = []
+    for field_name, args, sub_fields in fields:
+        resolver = _find_resolver(api_id, "Mutation" if is_mutation else "Query", field_name)
+        if resolver:
+            try:
+                result = _resolve_field(api_id, resolver, args, sub_fields, variables)
+                results[field_name] = result
+            except Exception as e:
+                errors.append({"message": str(e), "path": [field_name]})
+                results[field_name] = None
+        else:
+            # No resolver — return mock empty result
+            results[field_name] = None
+
+    response = {"data": results}
+    if errors:
+        response["errors"] = errors
+    return _json(200, response)
+
+
+def _parse_fields(body, variables):
+    """Parse GraphQL field selections into (name, args_dict, sub_fields) tuples."""
+    fields = []
+    for m in _GQL_FIELD_RE.finditer(body.strip()):
+        name = m.group(1)
+        args_str = m.group(2) or ""
+        sub = m.group(3) or ""
+        args = _parse_args(args_str, variables)
+        sub_fields = [s.strip() for s in sub.split() if s.strip() and s.strip() != "__typename"]
+        fields.append((name, args, sub_fields))
+    return fields
+
+
+def _parse_args(args_str, variables):
+    """Parse GraphQL arguments like (id: "1") or (id: $id) into a dict."""
+    args = {}
+    if not args_str.strip():
+        return args
+    # Match key: value pairs
+    for pair in _re.finditer(r'(\w+)\s*:\s*("(?:[^"\\]|\\.)*"|\$\w+|\d+(?:\.\d+)?|true|false|null|\{[^}]*\}|\[[^\]]*\])', args_str):
+        key = pair.group(1)
+        val = pair.group(2)
+        if val.startswith("$"):
+            val = variables.get(val[1:], val)
+        elif val.startswith('"') and val.endswith('"'):
+            val = val[1:-1]
+        elif val == "true":
+            val = True
+        elif val == "false":
+            val = False
+        elif val == "null":
+            val = None
+        elif val.startswith("{") and val.endswith("}"):
+            val = _parse_args(val[1:-1], variables)
+        elif val.startswith("[") and val.endswith("]"):
+            val = val  # Keep as string for now
+        elif val.replace(".", "").isdigit():
+            val = float(val) if "." in val else int(val)
+        args[key] = val
+    return args
+
+
+def _find_resolver(api_id, type_name, field_name):
+    """Find a resolver for Query.fieldName or Mutation.fieldName."""
+    resolvers = _resolvers.get(api_id, {})
+    # Try exact match
+    if type_name in resolvers and field_name in resolvers[type_name]:
+        return resolvers[type_name][field_name]
+    # Try generic match (some setups use "Query" or "Mutation" type)
+    for tn in resolvers:
+        if field_name in resolvers[tn]:
+            return resolvers[tn][field_name]
+    return None
+
+
+def _resolve_field(api_id, resolver, args, sub_fields, variables):
+    """Execute a resolver against its data source (DynamoDB)."""
+    ds_name = resolver.get("dataSourceName", "")
+    data_source = _data_sources.get(api_id, {}).get(ds_name)
+
+    if not data_source:
+        # No data source — return args as mock
+        return args or {}
+
+    ds_type = data_source.get("type", "NONE")
+
+    if ds_type == "AMAZON_DYNAMODB":
+        return _resolve_dynamodb(data_source, resolver, args, sub_fields)
+    elif ds_type == "AWS_LAMBDA":
+        return _resolve_lambda(data_source, args)
+    else:
+        return args or {}
+
+
+def _resolve_dynamodb(data_source, resolver, args, sub_fields):
+    """Execute a DynamoDB resolver — auto-detect operation from field name and args."""
+    import ministack.services.dynamodb as _ddb
+
+    config = data_source.get("dynamodbConfig", {})
+    table_name = config.get("tableName", "")
+    if not table_name:
+        return None
+
+    table = _ddb._tables.get(table_name)
+    if not table:
+        return None
+
+    field_name = resolver.get("fieldName", "")
+
+    # Auto-detect: get* → GetItem, list* → Scan, create*/update*/put* → PutItem, delete* ��� DeleteItem
+    if field_name.startswith("get") or "id" in args:
+        return _ddb_get_item(table, table_name, args, sub_fields)
+    elif field_name.startswith("list"):
+        return _ddb_scan(table, table_name, args, sub_fields)
+    elif field_name.startswith("create") or field_name.startswith("put"):
+        return _ddb_put_item(table, table_name, args)
+    elif field_name.startswith("update"):
+        return _ddb_update_item(table, table_name, args)
+    elif field_name.startswith("delete"):
+        return _ddb_delete_item(table, table_name, args)
+    else:
+        # Default: try scan
+        return _ddb_scan(table, table_name, args, sub_fields)
+
+
+def _ddb_get_item(table, table_name, args, sub_fields):
+    """Get a single item by primary key."""
+    pk_name = table["pk_name"]
+    sk_name = table.get("sk_name")
+
+    pk_val = args.get("id") or args.get(pk_name) or next(iter(args.values()), None)
+    if pk_val is None:
+        return None
+
+    items = table["items"]
+    pk_bucket = items.get(str(pk_val), {})
+
+    if sk_name:
+        sk_val = args.get(sk_name, "")
+        item = pk_bucket.get(str(sk_val))
+    else:
+        # No sort key — get the single item
+        item = next(iter(pk_bucket.values()), None) if pk_bucket else None
+
+    if not item:
+        return None
+
+    return _strip_ddb_types(item, sub_fields)
+
+
+def _ddb_scan(table, table_name, args, sub_fields):
+    """Scan/list items, optionally with filters and pagination."""
+    items = []
+    limit = args.get("limit", 100)
+    next_token = args.get("nextToken")
+
+    count = 0
+    for pk in sorted(table["items"].keys()):
+        for sk in sorted(table["items"][pk].keys()):
+            if count >= limit:
+                break
+            items.append(_strip_ddb_types(table["items"][pk][sk], sub_fields))
+            count += 1
+
+    # Filter if filter arg provided
+    filter_arg = args.get("filter", {})
+    if filter_arg and isinstance(filter_arg, dict):
+        filtered = []
+        for item in items:
+            match = True
+            for fk, fv in filter_arg.items():
+                if isinstance(fv, dict) and "eq" in fv:
+                    if item.get(fk) != fv["eq"]:
+                        match = False
+                elif item.get(fk) != fv:
+                    match = False
+            if match:
+                filtered.append(item)
+        items = filtered
+
+    return {"items": items, "nextToken": None}
+
+
+def _ddb_put_item(table, table_name, args):
+    """Create/put an item."""
+    import ministack.services.dynamodb as _ddb
+    from collections import defaultdict
+
+    input_data = args.get("input", args)
+    pk_name = table["pk_name"]
+    sk_name = table.get("sk_name")
+
+    # Build DynamoDB-typed item
+    ddb_item = {}
+    for k, v in input_data.items():
+        if isinstance(v, str):
+            ddb_item[k] = {"S": v}
+        elif isinstance(v, (int, float)):
+            ddb_item[k] = {"N": str(v)}
+        elif isinstance(v, bool):
+            ddb_item[k] = {"BOOL": v}
+        elif isinstance(v, list):
+            ddb_item[k] = {"L": [{"S": str(i)} for i in v]}
+        elif v is None:
+            ddb_item[k] = {"NULL": True}
+        else:
+            ddb_item[k] = {"S": str(v)}
+
+    # Auto-generate ID if not provided
+    if pk_name not in ddb_item and "id" not in ddb_item:
+        ddb_item["id" if pk_name == "id" else pk_name] = {"S": new_uuid()}
+
+    pk_val = _ddb._extract_key_val(ddb_item.get(pk_name, {}))
+    sk_val = _ddb._extract_key_val(ddb_item.get(sk_name, {})) if sk_name else ""
+
+    if not isinstance(table["items"], defaultdict):
+        table["items"] = defaultdict(dict, table["items"])
+
+    table["items"][pk_val][sk_val] = ddb_item
+    table["ItemCount"] = sum(len(v) for v in table["items"].values())
+
+    return _strip_ddb_types(ddb_item, [])
+
+
+def _ddb_update_item(table, table_name, args):
+    """Update an existing item — merge input fields."""
+    input_data = args.get("input", args)
+    pk_name = table["pk_name"]
+    pk_val = str(input_data.get("id") or input_data.get(pk_name, ""))
+
+    if pk_val in table["items"]:
+        sk = next(iter(table["items"][pk_val]), "")
+        existing = table["items"][pk_val].get(sk, {})
+        for k, v in input_data.items():
+            if isinstance(v, str):
+                existing[k] = {"S": v}
+            elif isinstance(v, (int, float)):
+                existing[k] = {"N": str(v)}
+            elif isinstance(v, bool):
+                existing[k] = {"BOOL": v}
+        return _strip_ddb_types(existing, [])
+    return None
+
+
+def _ddb_delete_item(table, table_name, args):
+    """Delete an item and return it."""
+    input_data = args.get("input", args)
+    pk_name = table["pk_name"]
+    pk_val = str(input_data.get("id") or input_data.get(pk_name, ""))
+
+    if pk_val in table["items"]:
+        sk = next(iter(table["items"][pk_val]), "")
+        item = table["items"][pk_val].pop(sk, None)
+        if not table["items"][pk_val]:
+            table["items"].pop(pk_val, None)
+        if item:
+            return _strip_ddb_types(item, [])
+    return None
+
+
+def _strip_ddb_types(item, sub_fields):
+    """Convert DynamoDB typed attributes to plain values for GraphQL response."""
+    if not item:
+        return None
+    result = {}
+    for k, v in item.items():
+        if isinstance(v, dict):
+            if "S" in v:
+                result[k] = v["S"]
+            elif "N" in v:
+                val = v["N"]
+                result[k] = int(val) if "." not in val else float(val)
+            elif "BOOL" in v:
+                result[k] = v["BOOL"]
+            elif "NULL" in v:
+                result[k] = None
+            elif "L" in v:
+                result[k] = [_strip_ddb_types(i, []) if isinstance(i, dict) and not any(t in i for t in ("S", "N", "BOOL")) else (i.get("S") or i.get("N") or i.get("BOOL")) for i in v["L"]]
+            elif "M" in v:
+                result[k] = _strip_ddb_types(v["M"], [])
+            else:
+                result[k] = v
+        else:
+            result[k] = v
+    if sub_fields:
+        result = {k: v for k, v in result.items() if k in sub_fields or k == "id" or k == "__typename"}
+    return result
+
+
+def _resolve_lambda(data_source, args):
+    """Execute a Lambda resolver."""
+    config = data_source.get("lambdaConfig", {})
+    func_arn = config.get("lambdaFunctionArn", "")
+    if not func_arn:
+        return args
+
+    import ministack.services.lambda_svc as _lambda_svc
+    func_name = func_arn.rsplit(":", 1)[-1]
+    func = _lambda_svc._functions.get(func_name)
+    if not func:
+        return args
+
+    result = _lambda_svc._execute_function(func, args)
+    body = result.get("body")
+    if isinstance(body, dict):
+        return body
+    if isinstance(body, (str, bytes)):
+        try:
+            return json.loads(body)
+        except Exception:
+            return {"result": body}
+    return args

@@ -223,7 +223,7 @@ def _identity_id(pool_id: str) -> str:
 def _fake_token(sub: str, pool_id: str, client_id: str, token_type: str = "access") -> str:
     """Return a plausible-looking but non-cryptographic JWT stub."""
     header = base64.urlsafe_b64encode(
-        json.dumps({"alg": "RS256", "kid": "ministack"}).encode()
+        json.dumps({"alg": "RS256", "kid": "ministack-key-1"}).encode()
     ).rstrip(b"=").decode()
     now = int(time.time())
     payload = base64.urlsafe_b64encode(

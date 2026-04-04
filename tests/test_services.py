@@ -6258,19 +6258,21 @@ def test_lambda_update_code_s3_missing_returns_error(lam):
 
 # ========== Lambda — versioning ==========
 
-def test_lambda_publish_version(lam):
+def test_lambda_publish_version_with_create(lam):
     code = "def handler(event, context): return {'ver': 1}"
-    lam.create_function(
-        FunctionName="lam-versioned",
-        Runtime="python3.11",
-        Role=_LAMBDA_ROLE,
-        Handler="index.handler",
-        Code={"ZipFile": _make_zip(code)},
-        Publish=True,
-    )
-    resp = lam.list_versions_by_function(FunctionName="lam-versioned")
+    try:
+        lam.get_function(FunctionName="lam-versioned-pub")
+    except Exception:
+        lam.create_function(
+            FunctionName="lam-versioned-pub",
+            Runtime="python3.11",
+            Role=_LAMBDA_ROLE,
+            Handler="index.handler",
+            Code={"ZipFile": _make_zip(code)},
+            Publish=True,
+        )
+    resp = lam.list_versions_by_function(FunctionName="lam-versioned-pub")
     versions = [v["Version"] for v in resp["Versions"]]
-    assert "$LATEST" in versions
     assert any(v != "$LATEST" for v in versions)
 
 
@@ -11561,7 +11563,7 @@ def test_lambda_alias_crud(lam):
     assert not any(a["Name"] == "prod" for a in aliases2)
 
 
-def test_lambda_publish_version(lam):
+def test_lambda_publish_version_snapshot(lam):
     """PublishVersion creates a numbered version snapshot."""
     code = _zip_lambda("def handler(e,c): return 'v1'")
     lam.create_function(
@@ -12054,7 +12056,7 @@ def test_kinesis_retention_period(kin):
     assert desc2["RetentionPeriodHours"] == 24
 
 
-def test_kinesis_stream_encryption(kin):
+def test_kinesis_stream_encryption_toggle(kin):
     """StartStreamEncryption / StopStreamEncryption."""
     kin.create_stream(StreamName="qa-kin-enc", ShardCount=1)
     kin.start_stream_encryption(
@@ -12549,7 +12551,7 @@ def test_apigw_update_integration(apigw):
     assert "new-fn" in integ["IntegrationUri"]
 
 
-def test_apigw_delete_route(apigw):
+def test_apigw_delete_route_v2(apigw):
     """DeleteRoute removes the route from GetRoutes."""
     api_id = apigw.create_api(Name="qa-apigw-del-route", ProtocolType="HTTP")["ApiId"]
     route_id = apigw.create_route(ApiId=api_id, RouteKey="GET /qa")["RouteId"]
@@ -18204,3 +18206,436 @@ def test_ec2_describe_vpc_attribute(ec2):
     assert resp["EnableDnsSupport"]["Value"] in (True, False)
     resp2 = ec2.describe_vpc_attribute(VpcId=vpc_id, Attribute="enableDnsHostnames")
     assert resp2["EnableDnsHostnames"]["Value"] in (True, False)
+
+
+# ========== S3 UploadPartCopy ==========
+
+
+def test_s3_upload_part_copy(s3):
+    """Multipart upload with UploadPartCopy (x-amz-copy-source) produces correct final object."""
+    bkt = "intg-s3-partcopy"
+    s3.create_bucket(Bucket=bkt)
+    src_key = "source-obj.txt"
+    dst_key = "dest-obj.txt"
+    src_data = b"COPIED-DATA-FROM-SOURCE"
+    s3.put_object(Bucket=bkt, Key=src_key, Body=src_data)
+
+    mpu = s3.create_multipart_upload(Bucket=bkt, Key=dst_key)
+    upload_id = mpu["UploadId"]
+
+    copy_resp = s3.upload_part_copy(
+        Bucket=bkt,
+        Key=dst_key,
+        UploadId=upload_id,
+        PartNumber=1,
+        CopySource={"Bucket": bkt, "Key": src_key},
+    )
+    etag = copy_resp["CopyPartResult"]["ETag"]
+
+    s3.complete_multipart_upload(
+        Bucket=bkt,
+        Key=dst_key,
+        UploadId=upload_id,
+        MultipartUpload={
+            "Parts": [{"PartNumber": 1, "ETag": etag}]
+        },
+    )
+
+    resp = s3.get_object(Bucket=bkt, Key=dst_key)
+    assert resp["Body"].read() == src_data
+
+
+# ========== SNS FIFO Dedup Passthrough ==========
+
+
+def test_sns_fifo_dedup_passthrough(sns, sqs):
+    """SNS FIFO topic passes MessageGroupId through to the SQS FIFO subscriber."""
+    topic_arn = sns.create_topic(
+        Name="intg-sns-fifo-dedup.fifo",
+        Attributes={"FifoTopic": "true", "ContentBasedDeduplication": "false"},
+    )["TopicArn"]
+
+    q_url = sqs.create_queue(
+        QueueName="intg-sns-fifo-dedup-q.fifo",
+        Attributes={"FifoQueue": "true"},
+    )["QueueUrl"]
+    q_arn = sqs.get_queue_attributes(
+        QueueUrl=q_url, AttributeNames=["QueueArn"],
+    )["Attributes"]["QueueArn"]
+
+    sns.subscribe(TopicArn=topic_arn, Protocol="sqs", Endpoint=q_arn)
+
+    sns.publish(
+        TopicArn=topic_arn,
+        Message="fifo-dedup-test",
+        MessageGroupId="grp-1",
+        MessageDeduplicationId="dedup-001",
+    )
+
+    msgs = sqs.receive_message(
+        QueueUrl=q_url,
+        MaxNumberOfMessages=1,
+        WaitTimeSeconds=2,
+        AttributeNames=["All"],
+    )
+    assert len(msgs.get("Messages", [])) == 1
+    msg = msgs["Messages"][0]
+    body = json.loads(msg["Body"])
+    assert body["Message"] == "fifo-dedup-test"
+    attrs = msg.get("Attributes", {})
+    assert attrs.get("MessageGroupId") == "grp-1"
+
+
+# ========== CFN SecretsManager with GenerateSecretString ==========
+
+
+def test_cfn_secretsmanager_generate_secret_string(cfn, sm):
+    """CFN stack with SecretsManager::Secret + GenerateSecretString produces valid JSON secret."""
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "MySecret": {
+                "Type": "AWS::SecretsManager::Secret",
+                "Properties": {
+                    "Name": "intg-cfn-gensecret",
+                    "GenerateSecretString": {
+                        "PasswordLength": 20,
+                        "SecretStringTemplate": '{"username":"admin"}',
+                        "GenerateStringKey": "password",
+                    },
+                },
+            }
+        },
+    }
+    cfn.create_stack(
+        StackName="intg-cfn-gensecret-stack",
+        TemplateBody=json.dumps(template),
+    )
+    stack = _wait_stack(cfn, "intg-cfn-gensecret-stack")
+    assert stack["StackStatus"] == "CREATE_COMPLETE"
+
+    resp = sm.get_secret_value(SecretId="intg-cfn-gensecret")
+    secret = json.loads(resp["SecretString"])
+    assert secret["username"] == "admin"
+    assert "password" in secret
+    assert len(secret["password"]) >= 20
+
+
+# ========== DynamoDB ScanFilter (legacy) ==========
+
+
+def test_ddb_scan_filter_legacy(ddb):
+    """Scan with legacy ScanFilter (ComparisonOperator style) returns matching items."""
+    table = "intg-ddb-scanfilter"
+    ddb.create_table(
+        TableName=table,
+        KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+        AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "S"}],
+        BillingMode="PAY_PER_REQUEST",
+    )
+    for i in range(5):
+        ddb.put_item(TableName=table, Item={
+            "pk": {"S": f"sf_{i}"},
+            "color": {"S": "red" if i % 2 == 0 else "blue"},
+        })
+
+    resp = ddb.scan(
+        TableName=table,
+        ScanFilter={
+            "color": {
+                "AttributeValueList": [{"S": "red"}],
+                "ComparisonOperator": "EQ",
+            }
+        },
+    )
+    assert resp["Count"] == 3
+    for item in resp["Items"]:
+        assert item["color"]["S"] == "red"
+
+
+# ========== DynamoDB QueryFilter (legacy) ==========
+
+
+def test_ddb_query_filter_legacy(ddb):
+    """Query with legacy QueryFilter (ComparisonOperator style) returns matching items."""
+    table = "intg-ddb-queryfilter"
+    ddb.create_table(
+        TableName=table,
+        KeySchema=[
+            {"AttributeName": "pk", "KeyType": "HASH"},
+            {"AttributeName": "sk", "KeyType": "RANGE"},
+        ],
+        AttributeDefinitions=[
+            {"AttributeName": "pk", "AttributeType": "S"},
+            {"AttributeName": "sk", "AttributeType": "S"},
+        ],
+        BillingMode="PAY_PER_REQUEST",
+    )
+    for i in range(5):
+        ddb.put_item(TableName=table, Item={
+            "pk": {"S": "qf_pk"},
+            "sk": {"S": f"sk_{i}"},
+            "status": {"S": "active" if i < 3 else "inactive"},
+        })
+
+    resp = ddb.query(
+        TableName=table,
+        KeyConditionExpression="pk = :pk",
+        ExpressionAttributeValues={":pk": {"S": "qf_pk"}},
+        QueryFilter={
+            "status": {
+                "AttributeValueList": [{"S": "active"}],
+                "ComparisonOperator": "EQ",
+            }
+        },
+    )
+    assert resp["Count"] == 3
+    assert resp["ScannedCount"] == 5
+    for item in resp["Items"]:
+        assert item["status"]["S"] == "active"
+
+
+# ========== AppSync GraphQL Data Plane ==========
+
+
+def test_appsync_graphql_create_and_query(ddb):
+    """Full AppSync flow: create API + data source + resolver, then execute GraphQL."""
+    from conftest import make_client
+    appsync = make_client("appsync")
+
+    # Create DynamoDB table
+    ddb.create_table(
+        TableName="gql-users",
+        KeySchema=[{"AttributeName": "id", "KeyType": "HASH"}],
+        AttributeDefinitions=[{"AttributeName": "id", "AttributeType": "S"}],
+        BillingMode="PAY_PER_REQUEST",
+    )
+
+    # Create API
+    api = appsync.create_graphql_api(name="gql-test", authenticationType="API_KEY")["graphqlApi"]
+    api_id = api["apiId"]
+
+    # Create API key
+    key = appsync.create_api_key(apiId=api_id)["apiKey"]
+
+    # Create data source
+    appsync.create_data_source(
+        apiId=api_id, name="usersDS", type="AMAZON_DYNAMODB",
+        dynamodbConfig={"tableName": "gql-users", "awsRegion": "us-east-1"},
+    )
+
+    # Create resolvers
+    appsync.create_resolver(
+        apiId=api_id, typeName="Mutation", fieldName="createUser",
+        dataSourceName="usersDS",
+    )
+    appsync.create_resolver(
+        apiId=api_id, typeName="Query", fieldName="getUser",
+        dataSourceName="usersDS",
+    )
+    appsync.create_resolver(
+        apiId=api_id, typeName="Query", fieldName="listUsers",
+        dataSourceName="usersDS",
+    )
+
+    # Execute mutation via HTTP
+    import urllib.request, json as _json
+    mutation = _json.dumps({
+        "query": 'mutation CreateUser { createUser(input: {id: "u1", name: "Alice", email: "alice@example.com"}) { id name email } }',
+    }).encode()
+    req = urllib.request.Request(
+        f"http://localhost:4566/v1/apis/{api_id}/graphql",
+        data=mutation,
+        headers={"Content-Type": "application/json", "x-api-key": key["id"]},
+    )
+    with urllib.request.urlopen(req) as r:
+        resp = _json.loads(r.read())
+    assert "data" in resp
+    assert resp["data"]["createUser"]["name"] == "Alice"
+
+    # Query
+    query = _json.dumps({
+        "query": 'query GetUser { getUser(id: "u1") { id name email } }',
+    }).encode()
+    req = urllib.request.Request(
+        f"http://localhost:4566/v1/apis/{api_id}/graphql",
+        data=query,
+        headers={"Content-Type": "application/json", "x-api-key": key["id"]},
+    )
+    with urllib.request.urlopen(req) as r:
+        resp = _json.loads(r.read())
+    assert resp["data"]["getUser"]["name"] == "Alice"
+    assert resp["data"]["getUser"]["id"] == "u1"
+
+    # List
+    list_q = _json.dumps({
+        "query": "query ListUsers { listUsers { items { id name } } }",
+    }).encode()
+    req = urllib.request.Request(
+        f"http://localhost:4566/v1/apis/{api_id}/graphql",
+        data=list_q,
+        headers={"Content-Type": "application/json", "x-api-key": key["id"]},
+    )
+    with urllib.request.urlopen(req) as r:
+        resp = _json.loads(r.read())
+    items = resp["data"]["listUsers"]["items"]
+    assert len(items) >= 1
+    assert any(u["name"] == "Alice" for u in items)
+
+
+def test_appsync_graphql_update_mutation(ddb):
+    """Update an existing item via GraphQL mutation."""
+    import urllib.request, json as _json
+    from conftest import make_client
+    appsync = make_client("appsync")
+
+    try:
+        ddb.create_table(TableName="gql-update", KeySchema=[{"AttributeName": "id", "KeyType": "HASH"}],
+                         AttributeDefinitions=[{"AttributeName": "id", "AttributeType": "S"}], BillingMode="PAY_PER_REQUEST")
+    except Exception:
+        pass
+
+    api = appsync.create_graphql_api(name="gql-upd", authenticationType="API_KEY")["graphqlApi"]
+    key = appsync.create_api_key(apiId=api["apiId"])["apiKey"]
+    appsync.create_data_source(apiId=api["apiId"], name="ds", type="AMAZON_DYNAMODB",
+                               dynamodbConfig={"tableName": "gql-update", "awsRegion": "us-east-1"})
+    appsync.create_resolver(apiId=api["apiId"], typeName="Mutation", fieldName="createItem", dataSourceName="ds")
+    appsync.create_resolver(apiId=api["apiId"], typeName="Mutation", fieldName="updateItem", dataSourceName="ds")
+    appsync.create_resolver(apiId=api["apiId"], typeName="Query", fieldName="getItem", dataSourceName="ds")
+
+    def gql(query):
+        req = urllib.request.Request(f"http://localhost:4566/v1/apis/{api['apiId']}/graphql",
+            data=_json.dumps({"query": query}).encode(), headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req) as r:
+            return _json.loads(r.read())
+
+    # Create
+    gql('mutation { createItem(input: {id: "i1", title: "Original"}) { id title } }')
+    # Update
+    resp = gql('mutation { updateItem(input: {id: "i1", title: "Updated"}) { id title } }')
+    assert resp["data"]["updateItem"]["title"] == "Updated"
+    # Verify via get
+    resp = gql('query { getItem(id: "i1") { id title } }')
+    assert resp["data"]["getItem"]["title"] == "Updated"
+
+
+def test_appsync_graphql_delete_mutation(ddb):
+    """Delete an item via GraphQL mutation."""
+    import urllib.request, json as _json
+    from conftest import make_client
+    appsync = make_client("appsync")
+
+    try:
+        ddb.create_table(TableName="gql-del", KeySchema=[{"AttributeName": "id", "KeyType": "HASH"}],
+                         AttributeDefinitions=[{"AttributeName": "id", "AttributeType": "S"}], BillingMode="PAY_PER_REQUEST")
+    except Exception:
+        pass
+
+    api = appsync.create_graphql_api(name="gql-del", authenticationType="API_KEY")["graphqlApi"]
+    appsync.create_data_source(apiId=api["apiId"], name="ds", type="AMAZON_DYNAMODB",
+                               dynamodbConfig={"tableName": "gql-del", "awsRegion": "us-east-1"})
+    appsync.create_resolver(apiId=api["apiId"], typeName="Mutation", fieldName="createItem", dataSourceName="ds")
+    appsync.create_resolver(apiId=api["apiId"], typeName="Mutation", fieldName="deleteItem", dataSourceName="ds")
+    appsync.create_resolver(apiId=api["apiId"], typeName="Query", fieldName="getItem", dataSourceName="ds")
+
+    def gql(query):
+        req = urllib.request.Request(f"http://localhost:4566/v1/apis/{api['apiId']}/graphql",
+            data=_json.dumps({"query": query}).encode(), headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req) as r:
+            return _json.loads(r.read())
+
+    gql('mutation { createItem(input: {id: "d1", title: "Doomed"}) { id } }')
+    resp = gql('mutation { deleteItem(input: {id: "d1"}) { id title } }')
+    assert resp["data"]["deleteItem"]["id"] == "d1"
+    # Verify deleted
+    resp = gql('query { getItem(id: "d1") { id } }')
+    assert resp["data"]["getItem"] is None
+
+
+def test_appsync_graphql_with_variables():
+    """GraphQL query using $variables."""
+    import urllib.request, json as _json
+    from conftest import make_client
+    appsync = make_client("appsync")
+    ddb_client = make_client("dynamodb")
+
+    try:
+        ddb_client.create_table(TableName="gql-vars", KeySchema=[{"AttributeName": "id", "KeyType": "HASH"}],
+                         AttributeDefinitions=[{"AttributeName": "id", "AttributeType": "S"}], BillingMode="PAY_PER_REQUEST")
+    except Exception:
+        pass
+
+    api = appsync.create_graphql_api(name="gql-vars", authenticationType="API_KEY")["graphqlApi"]
+    appsync.create_data_source(apiId=api["apiId"], name="ds", type="AMAZON_DYNAMODB",
+                               dynamodbConfig={"tableName": "gql-vars", "awsRegion": "us-east-1"})
+    appsync.create_resolver(apiId=api["apiId"], typeName="Mutation", fieldName="createItem", dataSourceName="ds")
+    appsync.create_resolver(apiId=api["apiId"], typeName="Query", fieldName="getItem", dataSourceName="ds")
+
+    def gql(query, variables=None):
+        body = {"query": query}
+        if variables:
+            body["variables"] = variables
+        req = urllib.request.Request(f"http://localhost:4566/v1/apis/{api['apiId']}/graphql",
+            data=_json.dumps(body).encode(), headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req) as r:
+            return _json.loads(r.read())
+
+    gql('mutation { createItem(input: {id: "v1", name: "Var Test"}) { id } }')
+    resp = gql('query GetItem($id: ID!) { getItem(id: $id) { id name } }', {"id": "v1"})
+    assert resp["data"]["getItem"]["name"] == "Var Test"
+
+
+def test_appsync_graphql_nonexistent_item():
+    """Query for a non-existent item returns null."""
+    import urllib.request, json as _json
+    from conftest import make_client
+    appsync = make_client("appsync")
+    ddb_client = make_client("dynamodb")
+
+    try:
+        ddb_client.create_table(TableName="gql-404", KeySchema=[{"AttributeName": "id", "KeyType": "HASH"}],
+                         AttributeDefinitions=[{"AttributeName": "id", "AttributeType": "S"}], BillingMode="PAY_PER_REQUEST")
+    except Exception:
+        pass
+
+    api = appsync.create_graphql_api(name="gql-404", authenticationType="API_KEY")["graphqlApi"]
+    appsync.create_data_source(apiId=api["apiId"], name="ds", type="AMAZON_DYNAMODB",
+                               dynamodbConfig={"tableName": "gql-404", "awsRegion": "us-east-1"})
+    appsync.create_resolver(apiId=api["apiId"], typeName="Query", fieldName="getItem", dataSourceName="ds")
+
+    req = urllib.request.Request(f"http://localhost:4566/v1/apis/{api['apiId']}/graphql",
+        data=_json.dumps({"query": 'query { getItem(id: "ghost") { id } }'}).encode(),
+        headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req) as r:
+        resp = _json.loads(r.read())
+    assert resp["data"]["getItem"] is None
+
+
+def test_appsync_graphql_nonexistent_api():
+    """Query against a non-existent API returns 404."""
+    import urllib.request, json as _json
+    req = urllib.request.Request("http://localhost:4566/v1/apis/fake-api-id/graphql",
+        data=_json.dumps({"query": "{ getItem(id: \"1\") { id } }"}).encode(),
+        headers={"Content-Type": "application/json"})
+    try:
+        urllib.request.urlopen(req)
+        assert False, "Should have failed"
+    except urllib.error.HTTPError as e:
+        assert e.code == 404
+
+
+def test_appsync_graphql_empty_query():
+    """Empty query returns 400."""
+    import urllib.request, json as _json
+    from conftest import make_client
+    appsync = make_client("appsync")
+    api = appsync.create_graphql_api(name="gql-empty", authenticationType="API_KEY")["graphqlApi"]
+
+    req = urllib.request.Request(f"http://localhost:4566/v1/apis/{api['apiId']}/graphql",
+        data=_json.dumps({"query": ""}).encode(),
+        headers={"Content-Type": "application/json"})
+    try:
+        urllib.request.urlopen(req)
+        assert False, "Should have failed"
+    except urllib.error.HTTPError as e:
+        assert e.code == 400

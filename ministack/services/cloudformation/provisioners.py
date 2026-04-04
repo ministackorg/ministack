@@ -24,6 +24,9 @@ import ministack.services.cloudwatch_logs as _cw_logs
 import ministack.services.eventbridge as _eb
 import ministack.services.iam_sts as _iam_sts
 import ministack.services.apigateway_v1 as _apigw_v1
+import ministack.services.appsync as _appsync
+import ministack.services.secretsmanager as _sm
+import ministack.services.cognito as _cognito
 
 
 logger = logging.getLogger("cloudformation")
@@ -972,6 +975,301 @@ def _sns_topic_policy_delete(physical_id, props):
             topic["attributes"].pop("Policy", None)
 
 
+# --- AppSync resource provisioners ---
+
+def _appsync_api_create(logical_id, props, stack_name):
+    import time as _time
+    name = props.get("Name") or _physical_name(stack_name, logical_id)
+    auth_type = props.get("AuthenticationType", "API_KEY")
+    api_id = new_uuid()[:8]
+    arn = f"arn:aws:appsync:{REGION}:{ACCOUNT_ID}:apis/{api_id}"
+    now = _time.time()
+    _appsync._apis[api_id] = {
+        "apiId": api_id, "name": name, "authenticationType": auth_type,
+        "arn": arn,
+        "uris": {"GRAPHQL": f"https://{api_id}.appsync-api.{REGION}.amazonaws.com/graphql"},
+        "createdAt": now, "lastUpdatedAt": now,
+        "additionalAuthenticationProviders": props.get("AdditionalAuthenticationProviders", []),
+        "xrayEnabled": False,
+    }
+    _appsync._api_keys[api_id] = {}
+    _appsync._data_sources[api_id] = {}
+    _appsync._resolvers[api_id] = {}
+    _appsync._types[api_id] = {}
+    return api_id, {"ApiId": api_id, "Arn": arn, "GraphQLUrl": f"https://{api_id}.appsync-api.{REGION}.amazonaws.com/graphql"}
+
+
+def _appsync_api_delete(physical_id, props):
+    _appsync._apis.pop(physical_id, None)
+    _appsync._api_keys.pop(physical_id, None)
+    _appsync._data_sources.pop(physical_id, None)
+    _appsync._resolvers.pop(physical_id, None)
+    _appsync._types.pop(physical_id, None)
+
+
+def _appsync_ds_create(logical_id, props, stack_name):
+    api_id = props.get("ApiId", "")
+    name = props.get("Name") or logical_id
+    ds_type = props.get("Type", "NONE")
+    body = {"name": name, "type": ds_type}
+    if props.get("DynamoDBConfig"):
+        body["dynamodbConfig"] = props["DynamoDBConfig"]
+    if props.get("LambdaConfig"):
+        body["lambdaConfig"] = props["LambdaConfig"]
+    if props.get("ServiceRoleArn"):
+        body["serviceRoleArn"] = props["ServiceRoleArn"]
+    _appsync._data_sources.setdefault(api_id, {})[name] = {
+        "name": name, "type": ds_type, **body,
+        "dataSourceArn": f"arn:aws:appsync:{REGION}:{ACCOUNT_ID}:apis/{api_id}/datasources/{name}",
+    }
+    return f"{api_id}/{name}", {"Name": name, "DataSourceArn": f"arn:aws:appsync:{REGION}:{ACCOUNT_ID}:apis/{api_id}/datasources/{name}"}
+
+
+def _appsync_ds_delete(physical_id, props):
+    parts = physical_id.split("/", 1)
+    if len(parts) == 2:
+        _appsync._data_sources.get(parts[0], {}).pop(parts[1], None)
+
+
+def _appsync_resolver_create(logical_id, props, stack_name):
+    api_id = props.get("ApiId", "")
+    type_name = props.get("TypeName", "Query")
+    field_name = props.get("FieldName", logical_id)
+    ds_name = props.get("DataSourceName", "")
+    resolver = {
+        "typeName": type_name, "fieldName": field_name,
+        "dataSourceName": ds_name,
+        "resolverArn": f"arn:aws:appsync:{REGION}:{ACCOUNT_ID}:apis/{api_id}/types/{type_name}/resolvers/{field_name}",
+    }
+    if props.get("RequestMappingTemplate"):
+        resolver["requestMappingTemplate"] = props["RequestMappingTemplate"]
+    if props.get("ResponseMappingTemplate"):
+        resolver["responseMappingTemplate"] = props["ResponseMappingTemplate"]
+    _appsync._resolvers.setdefault(api_id, {}).setdefault(type_name, {})[field_name] = resolver
+    return f"{api_id}/{type_name}/{field_name}", {"ResolverArn": resolver["resolverArn"]}
+
+
+def _appsync_resolver_delete(physical_id, props):
+    parts = physical_id.split("/", 2)
+    if len(parts) == 3:
+        _appsync._resolvers.get(parts[0], {}).get(parts[1], {}).pop(parts[2], None)
+
+
+def _appsync_schema_create(logical_id, props, stack_name):
+    api_id = props.get("ApiId", "")
+    definition = props.get("Definition", "")
+    _appsync._types.setdefault(api_id, {})["__schema__"] = {
+        "typeName": "__schema__", "definition": definition, "format": "SDL",
+    }
+    return f"{api_id}/schema", {}
+
+
+def _appsync_apikey_create(logical_id, props, stack_name):
+    api_id = props.get("ApiId", "")
+    key_id = new_uuid()[:8]
+    import time
+    key = {
+        "id": key_id, "apiKeyId": key_id,
+        "expires": props.get("Expires", int(time.time()) + 604800),
+    }
+    _appsync._api_keys.setdefault(api_id, {})[key_id] = key
+    return key_id, {"ApiKey": key_id, "Arn": f"arn:aws:appsync:{REGION}:{ACCOUNT_ID}:apis/{api_id}/apikeys/{key_id}"}
+
+
+def _appsync_apikey_delete(physical_id, props):
+    api_id = props.get("ApiId", "")
+    _appsync._api_keys.get(api_id, {}).pop(physical_id, None)
+
+
+# --- SecretsManager resource provisioners ---
+
+def _sm_secret_create(logical_id, props, stack_name):
+    import string as _string
+    name = props.get("Name") or _physical_name(stack_name, logical_id)
+    secret_string = props.get("SecretString", "")
+    gen = props.get("GenerateSecretString")
+    if gen and not secret_string:
+        length = gen.get("PasswordLength", 32)
+        exclude = gen.get("ExcludeCharacters", "")
+        chars = _string.ascii_letters + _string.digits + _string.punctuation
+        chars = "".join(c for c in chars if c not in exclude)
+        import random
+        generated = "".join(random.choices(chars, k=length))
+        template = gen.get("SecretStringTemplate")
+        gen_key = gen.get("GenerateStringKey", "password")
+        if template:
+            import json
+            try:
+                obj = json.loads(template)
+                obj[gen_key] = generated
+                secret_string = json.dumps(obj)
+            except Exception:
+                secret_string = generated
+        else:
+            secret_string = generated
+
+    arn = f"arn:aws:secretsmanager:{REGION}:{ACCOUNT_ID}:secret:{name}-{new_uuid()[:6]}"
+    import time as _time
+    _sm._secrets[name] = {
+        "ARN": arn, "Name": name, "Description": props.get("Description", ""),
+        "Tags": props.get("Tags", []),
+        "CreatedDate": _time.time(), "LastChangedDate": _time.time(),
+        "LastAccessedDate": None, "DeletedDate": None,
+        "RotationEnabled": False, "RotationLambdaARN": None,
+        "RotationRules": None, "ReplicationStatus": [],
+        "KmsKeyId": props.get("KmsKeyId"),
+        "Versions": {
+            new_uuid(): {
+                "SecretString": secret_string,
+                "SecretBinary": None,
+                "CreatedDate": _time.time(),
+                "Stages": ["AWSCURRENT"],
+            }
+        },
+    }
+    return name, {"Arn": arn}
+
+
+def _sm_secret_delete(physical_id, props):
+    _sm._secrets.pop(physical_id, None)
+
+
+# --- Cognito UserPool ---
+
+def _cognito_user_pool_create(logical_id, props, stack_name):
+    name = props.get("PoolName") or _physical_name(stack_name, logical_id, max_len=128)
+    pid = _cognito._pool_id()
+    now = _cognito._now_epoch()
+    pool = {
+        "Id": pid,
+        "Name": name,
+        "Arn": _cognito._pool_arn(pid),
+        "CreationDate": now,
+        "LastModifiedDate": now,
+        "Policies": props.get("Policies", {
+            "PasswordPolicy": {
+                "MinimumLength": 8,
+                "RequireUppercase": True,
+                "RequireLowercase": True,
+                "RequireNumbers": True,
+                "RequireSymbols": True,
+                "TemporaryPasswordValidityDays": 7,
+            }
+        }),
+        "Schema": props.get("Schema", []),
+        "AutoVerifiedAttributes": props.get("AutoVerifiedAttributes", []),
+        "AliasAttributes": props.get("AliasAttributes", []),
+        "UsernameAttributes": props.get("UsernameAttributes", []),
+        "MfaConfiguration": props.get("MfaConfiguration", "OFF"),
+        "EstimatedNumberOfUsers": 0,
+        "UserPoolTags": props.get("UserPoolTags", {}),
+        "AdminCreateUserConfig": props.get("AdminCreateUserConfig", {
+            "AllowAdminCreateUserOnly": False,
+            "UnusedAccountValidityDays": 7,
+        }),
+        "Domain": None,
+        "_clients": {},
+        "_users": {},
+        "_groups": {},
+    }
+    _cognito._user_pools[pid] = pool
+    arn = _cognito._pool_arn(pid)
+    provider_name = f"cognito-idp.{REGION}.amazonaws.com/{pid}"
+    return pid, {"Arn": arn, "ProviderName": provider_name}
+
+
+def _cognito_user_pool_delete(physical_id, props):
+    pool = _cognito._user_pools.pop(physical_id, None)
+    if pool and pool.get("Domain"):
+        _cognito._pool_domain_map.pop(pool["Domain"], None)
+
+
+# --- Cognito UserPoolClient ---
+
+def _cognito_user_pool_client_create(logical_id, props, stack_name):
+    pid = props.get("UserPoolId", "")
+    pool = _cognito._user_pools.get(pid)
+    if not pool:
+        raise ValueError(f"UserPool {pid} not found for UserPoolClient")
+
+    cid = _cognito._client_id()
+    now = _cognito._now_epoch()
+    client = {
+        "UserPoolId": pid,
+        "ClientName": props.get("ClientName", ""),
+        "ClientId": cid,
+        "ClientSecret": None,
+        "CreationDate": now,
+        "LastModifiedDate": now,
+        "ExplicitAuthFlows": props.get("ExplicitAuthFlows", []),
+        "AllowedOAuthFlows": props.get("AllowedOAuthFlows", []),
+        "AllowedOAuthScopes": props.get("AllowedOAuthScopes", []),
+        "CallbackURLs": props.get("CallbackURLs", []),
+        "LogoutURLs": props.get("LogoutURLs", []),
+        "SupportedIdentityProviders": props.get("SupportedIdentityProviders", []),
+    }
+    pool["_clients"][cid] = client
+    return cid, {}
+
+
+def _cognito_user_pool_client_delete(physical_id, props):
+    pid = props.get("UserPoolId", "")
+    pool = _cognito._user_pools.get(pid)
+    if pool:
+        pool["_clients"].pop(physical_id, None)
+
+
+# --- Cognito IdentityPool ---
+
+def _cognito_identity_pool_create(logical_id, props, stack_name):
+    name = props.get("IdentityPoolName") or _physical_name(stack_name, logical_id, max_len=128)
+    iid = _cognito._identity_pool_id()
+    pool = {
+        "IdentityPoolId": iid,
+        "IdentityPoolName": name,
+        "AllowUnauthenticatedIdentities": props.get("AllowUnauthenticatedIdentities", False),
+        "AllowClassicFlow": props.get("AllowClassicFlow", False),
+        "SupportedLoginProviders": props.get("SupportedLoginProviders", {}),
+        "DeveloperProviderName": props.get("DeveloperProviderName", ""),
+        "OpenIdConnectProviderARNs": props.get("OpenIdConnectProviderARNs", []),
+        "CognitoIdentityProviders": props.get("CognitoIdentityProviders", []),
+        "SamlProviderARNs": props.get("SamlProviderARNs", []),
+        "IdentityPoolTags": props.get("IdentityPoolTags", {}),
+        "_roles": {},
+        "_identities": {},
+    }
+    _cognito._identity_pools[iid] = pool
+    return iid, {}
+
+
+def _cognito_identity_pool_delete(physical_id, props):
+    _cognito._identity_pools.pop(physical_id, None)
+    _cognito._identity_tags.pop(physical_id, None)
+
+
+# --- Cognito UserPoolDomain ---
+
+def _cognito_user_pool_domain_create(logical_id, props, stack_name):
+    pid = props.get("UserPoolId", "")
+    domain = props.get("Domain", "")
+    pool = _cognito._user_pools.get(pid)
+    if not pool:
+        raise ValueError(f"UserPool {pid} not found for UserPoolDomain")
+    pool["Domain"] = domain
+    _cognito._pool_domain_map[domain] = pid
+    phys_id = f"{pid}-domain-{domain}"
+    return phys_id, {}
+
+
+def _cognito_user_pool_domain_delete(physical_id, props):
+    domain = props.get("Domain", "")
+    pid = _cognito._pool_domain_map.pop(domain, None)
+    if pid:
+        pool = _cognito._user_pools.get(pid)
+        if pool:
+            pool["Domain"] = None
+
+
 # ===========================================================================
 # Resource Handler Registry
 # ===========================================================================
@@ -1003,4 +1301,14 @@ _RESOURCE_HANDLERS = {
     "AWS::Lambda::Alias": {"create": _lambda_alias_create, "delete": _lambda_alias_delete},
     "AWS::SQS::QueuePolicy": {"create": _sqs_queue_policy_create, "delete": _sqs_queue_policy_delete},
     "AWS::SNS::TopicPolicy": {"create": _sns_topic_policy_create, "delete": _sns_topic_policy_delete},
+    "AWS::AppSync::GraphQLApi": {"create": _appsync_api_create, "delete": _appsync_api_delete},
+    "AWS::AppSync::DataSource": {"create": _appsync_ds_create, "delete": _appsync_ds_delete},
+    "AWS::AppSync::Resolver": {"create": _appsync_resolver_create, "delete": _appsync_resolver_delete},
+    "AWS::AppSync::GraphQLSchema": {"create": _appsync_schema_create},
+    "AWS::AppSync::ApiKey": {"create": _appsync_apikey_create, "delete": _appsync_apikey_delete},
+    "AWS::SecretsManager::Secret": {"create": _sm_secret_create, "delete": _sm_secret_delete},
+    "AWS::Cognito::UserPool": {"create": _cognito_user_pool_create, "delete": _cognito_user_pool_delete},
+    "AWS::Cognito::UserPoolClient": {"create": _cognito_user_pool_client_create, "delete": _cognito_user_pool_client_delete},
+    "AWS::Cognito::IdentityPool": {"create": _cognito_identity_pool_create, "delete": _cognito_identity_pool_delete},
+    "AWS::Cognito::UserPoolDomain": {"create": _cognito_user_pool_domain_create, "delete": _cognito_user_pool_domain_delete},
 }

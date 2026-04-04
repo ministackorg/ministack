@@ -383,6 +383,8 @@ def _dispatch(
 
         if method == "PUT":
             if "partNumber" in query_params and "uploadId" in query_params:
+                if "x-amz-copy-source" in headers:
+                    return _upload_part_copy(bucket, key, query_params, headers)
                 return _upload_part(bucket, key, body, query_params, headers)
             if "tagging" in query_params:
                 return _put_object_tagging(bucket, key, body)
@@ -2434,6 +2436,50 @@ def _upload_part(
         "last_modified": now_iso(),
     }
     return 200, {"ETag": etag}, b""
+
+
+def _upload_part_copy(bucket_name: str, dest_key: str, query_params: dict, headers: dict):
+    """UploadPartCopy — copy a range from an existing object as a multipart part."""
+    upload_id = _qp(query_params, "uploadId")
+    part_number = int(_qp(query_params, "partNumber", "1"))
+
+    if upload_id not in _multipart_uploads:
+        return _error("NoSuchUpload", "The specified multipart upload does not exist.", 404)
+
+    source = url_unquote(headers.get("x-amz-copy-source", "").lstrip("/"))
+    src_parts = source.split("?", 1)[0].split("/", 1)
+    if len(src_parts) < 2:
+        return _error("InvalidArgument", "Copy Source must mention the source bucket and key", 400)
+
+    src_bucket_name, src_key = src_parts
+    src_bucket = _ensure_bucket(src_bucket_name)
+    if src_bucket is None:
+        return _no_such_bucket(src_bucket_name)
+    if src_key not in src_bucket["objects"]:
+        return _error("NoSuchKey", "The specified key does not exist.", 404)
+
+    src_obj = src_bucket["objects"][src_key]
+    src_body = src_obj["body"]
+
+    # Handle x-amz-copy-source-range
+    copy_range = headers.get("x-amz-copy-source-range", "")
+    if copy_range and copy_range.startswith("bytes="):
+        rng = copy_range[6:]
+        start, end = rng.split("-")
+        src_body = src_body[int(start):int(end) + 1]
+
+    etag = f'"{md5_hash(src_body)}"'
+    _multipart_uploads[upload_id]["parts"][part_number] = {
+        "body": src_body,
+        "etag": etag,
+        "size": len(src_body),
+        "last_modified": now_iso(),
+    }
+
+    root = Element("CopyPartResult", xmlns=S3_NS)
+    SubElement(root, "ETag").text = etag
+    SubElement(root, "LastModified").text = now_iso()
+    return 200, {"Content-Type": "application/xml"}, _xml_body(root)
 
 
 def _complete_multipart_upload(

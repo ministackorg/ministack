@@ -142,6 +142,8 @@ if _restored:
 _DEFAULT_VPC_ID = "vpc-00000001"
 _DEFAULT_SUBNET_ID = "subnet-00000001"
 _DEFAULT_SG_ID = "sg-00000001"
+_DEFAULT_RTB_ID = "rtb-00000001"
+_DEFAULT_ACL_ID = "acl-00000001"
 _DEFAULT_IGW_ID = "igw-00000001"
 
 
@@ -155,6 +157,9 @@ def _init_defaults():
             "DhcpOptionsId": "dopt-00000001",
             "InstanceTenancy": "default",
             "OwnerId": ACCOUNT_ID,
+            "DefaultNetworkAclId": _DEFAULT_ACL_ID,
+            "DefaultSecurityGroupId": _DEFAULT_SG_ID,
+            "MainRouteTableId": _DEFAULT_RTB_ID,
         }
     if _DEFAULT_SUBNET_ID not in _subnets:
         _subnets[_DEFAULT_SUBNET_ID] = {
@@ -590,6 +595,7 @@ def _describe_vpcs(p):
 def _create_vpc(p):
     cidr = _p(p, "CidrBlock") or "10.0.0.0/16"
     vpc_id = _new_vpc_id()
+    acl_id = "acl-" + "".join(random.choices(string.hexdigits[:16], k=17))
     _vpcs[vpc_id] = {
         "VpcId": vpc_id,
         "CidrBlock": cidr,
@@ -598,6 +604,9 @@ def _create_vpc(p):
         "DhcpOptionsId": "dopt-00000001",
         "InstanceTenancy": _p(p, "InstanceTenancy") or "default",
         "OwnerId": ACCOUNT_ID,
+        "DefaultNetworkAclId": acl_id,
+        "DefaultSecurityGroupId": _DEFAULT_SG_ID,
+        "MainRouteTableId": _DEFAULT_RTB_ID,
     }
     return _xml(200, "CreateVpcResponse", _vpc_fields_xml(_vpcs[vpc_id], tag="vpc"))
 
@@ -1506,6 +1515,9 @@ def _vpc_fields_xml(vpc, tag="item"):
         <instanceTenancy>{vpc['InstanceTenancy']}</instanceTenancy>
         <isDefault>{'true' if vpc['IsDefault'] else 'false'}</isDefault>
         <ownerId>{vpc['OwnerId']}</ownerId>
+        {'<defaultNetworkAclId>' + vpc.get('DefaultNetworkAclId', '') + '</defaultNetworkAclId>' if vpc.get('DefaultNetworkAclId') else ''}
+        {'<defaultSecurityGroupId>' + vpc.get('DefaultSecurityGroupId', '') + '</defaultSecurityGroupId>' if vpc.get('DefaultSecurityGroupId') else ''}
+        {'<mainRouteTableId>' + vpc.get('MainRouteTableId', '') + '</mainRouteTableId>' if vpc.get('MainRouteTableId') else ''}
         <tagSet/>
     </{tag}>"""
 
@@ -1563,6 +1575,7 @@ def _rtb_fields_xml(rtb, tag="item"):
         <routeTableId>{a['RouteTableId']}</routeTableId>
         <main>{'true' if a.get('Main') else 'false'}</main>
         {'<subnetId>' + a['SubnetId'] + '</subnetId>' if a.get('SubnetId') else ''}
+        <associationState><state>associated</state></associationState>
     </item>""" for a in rtb.get("Associations", []))
     return f"""<{tag}>
         <routeTableId>{rtb['RouteTableId']}</routeTableId>
@@ -2508,6 +2521,58 @@ def _describe_capacity_reservations(p):
     return _xml(200, "DescribeCapacityReservationsResponse", "<capacityReservationSet/>")
 
 
+def _describe_addresses_attribute(p):
+    alloc_id = _p(p, "AllocationId") or _parse_member_list(p, "AllocationId")
+    items = ""
+    if isinstance(alloc_id, list):
+        for aid in alloc_id:
+            items += f"<item><allocationId>{aid}</allocationId><ptrRecord></ptrRecord></item>"
+    elif alloc_id:
+        items = f"<item><allocationId>{alloc_id}</allocationId><ptrRecord></ptrRecord></item>"
+    return _xml(200, "DescribeAddressesAttributeResponse", f"<addressSet>{items}</addressSet>")
+
+
+def _describe_security_group_rules(p):
+    sg_ids = _parse_member_list(p, "SecurityGroupId") or []
+    filters = _parse_filters(p)
+    sg_id_filter = filters.get("group-id", [])
+    if sg_id_filter:
+        sg_ids = sg_id_filter
+
+    items = ""
+    for sg_id in sg_ids:
+        sg = _security_groups.get(sg_id)
+        if not sg:
+            continue
+        for i, rule in enumerate(sg.get("IpPermissions", [])):
+            rule_id = f"sgr-{sg_id[3:]}-ingress-{i}"
+            for cidr in rule.get("IpRanges", []):
+                items += f"""<item>
+                    <securityGroupRuleId>{rule_id}</securityGroupRuleId>
+                    <groupId>{sg_id}</groupId>
+                    <groupOwnerId>{ACCOUNT_ID}</groupOwnerId>
+                    <isEgress>false</isEgress>
+                    <ipProtocol>{rule.get('IpProtocol', '-1')}</ipProtocol>
+                    <fromPort>{rule.get('FromPort', -1)}</fromPort>
+                    <toPort>{rule.get('ToPort', -1)}</toPort>
+                    <cidrIpv4>{cidr.get('CidrIp', '')}</cidrIpv4>
+                </item>"""
+        for i, rule in enumerate(sg.get("IpPermissionsEgress", [])):
+            rule_id = f"sgr-{sg_id[3:]}-egress-{i}"
+            for cidr in rule.get("IpRanges", []):
+                items += f"""<item>
+                    <securityGroupRuleId>{rule_id}</securityGroupRuleId>
+                    <groupId>{sg_id}</groupId>
+                    <groupOwnerId>{ACCOUNT_ID}</groupOwnerId>
+                    <isEgress>true</isEgress>
+                    <ipProtocol>{rule.get('IpProtocol', '-1')}</ipProtocol>
+                    <fromPort>{rule.get('FromPort', -1)}</fromPort>
+                    <toPort>{rule.get('ToPort', -1)}</toPort>
+                    <cidrIpv4>{cidr.get('CidrIp', '')}</cidrIpv4>
+                </item>"""
+    return _xml(200, "DescribeSecurityGroupRulesResponse", f"<securityGroupRuleSet>{items}</securityGroupRuleSet>")
+
+
 _ACTION_MAP = {
     "RunInstances": _run_instances,
     "DescribeInstances": _describe_instances,
@@ -2558,6 +2623,8 @@ _ACTION_MAP = {
     "DescribeTags": _describe_tags,
     "ModifyVpcAttribute": _modify_vpc_attribute,
     "DescribeVpcAttribute": _describe_vpc_attribute,
+    "DescribeAddressesAttribute": _describe_addresses_attribute,
+    "DescribeSecurityGroupRules": _describe_security_group_rules,
     "ModifySubnetAttribute": _modify_subnet_attribute,
     "CreateRouteTable": _create_route_table,
     "DeleteRouteTable": _delete_route_table,
