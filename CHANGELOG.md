@@ -7,6 +7,29 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [1.1.36] — 2026-04-04
+
+### Added
+- **EC2 `ReplaceRouteTableAssociation`** — moves a subnet association from one route table to another; completes full Terraform route table association lifecycle
+- **EC2 `ModifyVpcEndpoint`** — add/remove route tables, subnets, and policy on existing VPC endpoints
+- **EC2 `DescribePrefixLists`** — returns AWS service prefix lists (S3, DynamoDB) and user-managed prefix lists; required by Terraform for every VPC endpoint
+- **EC2 Managed Prefix Lists** — `CreateManagedPrefixList`, `DescribeManagedPrefixLists`, `GetManagedPrefixListEntries`, `ModifyManagedPrefixList`, `DeleteManagedPrefixList`; supports versioned CIDR entry management
+- **EC2 VPN Gateways** — `CreateVpnGateway`, `DescribeVpnGateways`, `AttachVpnGateway`, `DetachVpnGateway`, `DeleteVpnGateway`; includes attachment state tracking and `attachment.vpc-id` filter
+- **EC2 VPN Route Propagation** — `EnableVgwRoutePropagation`, `DisableVgwRoutePropagation`; tracks propagating VGWs on route tables
+- **EC2 Customer Gateways** — `CreateCustomerGateway`, `DescribeCustomerGateways`, `DeleteCustomerGateway`
+- **Lambda `provided` runtime support** — `provided.al2023`, `provided.al2` runtimes now execute via Docker using the AWS Lambda RIE; code is mounted to `/var/task` matching real AWS behavior; Go, Rust, and C++ Lambda functions work correctly with companion files accessible at `LAMBDA_TASK_ROOT`
+- **KMS Terraform support** — `EnableKeyRotation`, `DisableKeyRotation`, `GetKeyRotationStatus`, `GetKeyPolicy`, `PutKeyPolicy`, `ListKeyPolicies`, `EnableKey`, `DisableKey`, `ScheduleKeyDeletion`, `CancelKeyDeletion`, `TagResource`, `UntagResource`, `ListResourceTags`; KMS now has 27 actions (was 14). Fixes Terraform `aws_kms_key` with `enable_key_rotation = true`. Reported by @betorvs
+- **Docker image: `cryptography` package included** — KMS RSA Sign/Verify/GetPublicKey now work out of the box in the Docker image (+20MB image size, 211MB → 231MB)
+
+### Stats
+- EC2 now supports **127 actions** (was 109)
+- Full Terraform VPC module coverage: 98/98 actions for 20 resource types
+
+### Tests
+- 988 tests total, all passing
+
+---
+
 ## [1.1.35] — 2026-04-04
 
 ### Fixed

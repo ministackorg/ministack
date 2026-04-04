@@ -937,6 +937,9 @@ _RUNTIME_IMAGE_MAP: dict[str, str] = {
     "nodejs16.x": "node:16-slim",
     "nodejs18.x": "node:18-slim",
     "nodejs20.x": "node:20-slim",
+    "provided.al2023": "public.ecr.aws/lambda/provided:al2023",
+    "provided.al2": "public.ecr.aws/lambda/provided:al2",
+    "provided": "public.ecr.aws/lambda/provided:al2023",
 }
 
 
@@ -949,6 +952,8 @@ def _docker_image_for_runtime(runtime: str) -> str | None:
     if runtime.startswith("nodejs"):
         ver = runtime.replace("nodejs", "").rstrip(".x")
         return f"node:{ver}-slim"
+    if runtime.startswith("provided"):
+        return "public.ecr.aws/lambda/provided:al2023"
     return None
 
 
@@ -986,12 +991,13 @@ def _execute_function_docker(func: dict, event: dict) -> dict:
             },
         }
 
+    is_provided = runtime.startswith("provided")
     is_node = runtime.startswith("nodejs")
-    if not runtime.startswith("python") and not is_node:
+    if not runtime.startswith("python") and not is_node and not is_provided:
         return {
             "body": {
                 "statusCode": 200,
-                "body": f"Mock response - {runtime} docker wrapper only supports Python and Node.js runtimes",
+                "body": f"Mock response - {runtime} docker wrapper only supports Python, Node.js, and provided runtimes",
             },
         }
 
@@ -1028,9 +1034,10 @@ def _execute_function_docker(func: dict, event: dict) -> dict:
                         lzf.extractall(layer_dir)
                     layers_dirs.append(layer_dir)
 
-            if "." not in handler:
-                return {"body": {"errorMessage": f"Invalid handler format: {handler}", "errorType": "Runtime.InvalidEntrypoint"}, "error": True}
-            module_name, func_name = handler.rsplit(".", 1)
+            if not is_provided:
+                if "." not in handler:
+                    return {"body": {"errorMessage": f"Invalid handler format: {handler}", "errorType": "Runtime.InvalidEntrypoint"}, "error": True}
+                module_name, func_name = handler.rsplit(".", 1)
 
             # Build volume mounts
             volumes: dict = {}
@@ -1056,12 +1063,16 @@ def _execute_function_docker(func: dict, event: dict) -> dict:
                 "AWS_LAMBDA_FUNCTION_MEMORY_SIZE": str(config["MemorySize"]),
                 "AWS_LAMBDA_FUNCTION_VERSION": config.get("Version", "$LATEST"),
                 "AWS_LAMBDA_LOG_STREAM_NAME": new_uuid(),
-                "_LAMBDA_HANDLER_MODULE": module_name,
-                "_LAMBDA_HANDLER_FUNC": func_name,
                 "_LAMBDA_FUNCTION_ARN": config["FunctionArn"],
                 "_LAMBDA_TIMEOUT": str(timeout),
                 "_LAMBDA_LAYERS_DIRS": ":".join(container_layer_dirs),
             }
+            if not is_provided:
+                container_env["_LAMBDA_HANDLER_MODULE"] = module_name
+                container_env["_LAMBDA_HANDLER_FUNC"] = func_name
+            else:
+                container_env["LAMBDA_TASK_ROOT"] = "/var/task"
+                container_env["_HANDLER"] = handler
             endpoint = _normalize_endpoint_url(os.environ.get("AWS_ENDPOINT_URL", ""))
             if not endpoint:
                 endpoint = _normalize_endpoint_url(env_vars.get("AWS_ENDPOINT_URL", ""))
@@ -1075,7 +1086,63 @@ def _execute_function_docker(func: dict, event: dict) -> dict:
             with open(event_file, "w") as ef:
                 ef.write(json.dumps(event))
 
-            if is_node:
+            if is_provided:
+                # provided runtimes: use AWS Lambda RIE built into the provided image.
+                # Make bootstrap executable, start container with RIE, POST event via HTTP.
+                bootstrap_path = os.path.join(code_dir, "bootstrap")
+                if os.path.exists(bootstrap_path):
+                    os.chmod(bootstrap_path, 0o755)
+                # provided runtimes use the AWS Lambda RIE built into the base image.
+                # RIE listens on port 8080; we POST the event and read the response.
+                import urllib.request
+                bootstrap_path = os.path.join(code_dir, "bootstrap")
+                if os.path.exists(bootstrap_path):
+                    os.chmod(bootstrap_path, 0o755)
+                run_kwargs: dict = {
+                    "image": image, "command": ["/var/task/bootstrap"],
+                    "environment": container_env, "volumes": volumes,
+                    "ports": {"8080/tcp": None}, "detach": True, "stdin_open": False,
+                }
+                if LAMBDA_DOCKER_NETWORK:
+                    run_kwargs["network"] = LAMBDA_DOCKER_NETWORK
+                container = client.containers.run(**run_kwargs)
+                try:
+                    import time as _time
+                    for _attempt in range(30):
+                        _time.sleep(0.5)
+                        container.reload()
+                        if container.status != "running":
+                            break
+                        try:
+                            ports = container.ports.get("8080/tcp") or []
+                            if not ports:
+                                continue
+                            host_port = ports[0]["HostPort"]
+                            rie_url = f"http://127.0.0.1:{host_port}/2015-03-31/functions/function/invocations"
+                            req = urllib.request.Request(rie_url, data=json.dumps(event).encode(),
+                                                        headers={"Content-Type": "application/json"})
+                            resp = urllib.request.urlopen(req, timeout=timeout)
+                            body = resp.read().decode("utf-8", errors="replace")
+                            try:
+                                parsed = json.loads(body)
+                            except json.JSONDecodeError:
+                                parsed = body
+                            logs = container.logs(stdout=True, stderr=True).decode("utf-8", errors="replace").strip()
+                            return {"body": parsed, "log": logs}
+                        except (urllib.error.URLError, ConnectionRefusedError, OSError):
+                            continue
+                    stdout = container.logs(stdout=True, stderr=True).decode("utf-8", errors="replace").strip()
+                    return {"body": {"errorMessage": f"provided runtime failed: {stdout[:500]}", "errorType": "Runtime.ExitError"}, "error": True, "log": stdout}
+                finally:
+                    try:
+                        container.stop(timeout=2)
+                    except Exception:
+                        pass
+                    try:
+                        container.remove(force=True)
+                    except Exception:
+                        pass
+            elif is_node:
                 wrapper_path = os.path.join(code_dir, "_wrapper.js")
                 with open(wrapper_path, "w") as wf:
                     wf.write(_NODE_WRAPPER_SCRIPT)

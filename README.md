@@ -54,6 +54,34 @@ That's it. No account, no API key, no sign-up.
 
 ---
 
+## Internal API
+
+MiniStack exposes internal endpoints for test automation:
+
+```bash
+# Health check — returns service status
+curl http://localhost:4566/_ministack/health
+
+# Reset all state — wipe every service back to empty (useful between test runs)
+curl -X POST http://localhost:4566/_ministack/reset
+
+# Runtime config — change settings without restart
+curl -X POST http://localhost:4566/_ministack/config \
+  -H "Content-Type: application/json" \
+  -d '{"MINISTACK_ACCOUNT_ID": "123456789012"}'
+```
+
+The reset endpoint is especially useful in CI pipelines and test suites — call it in `setUp`/`beforeEach` to get a clean environment for every test without restarting the container.
+
+Also compatible with LocalStack's health endpoint:
+
+```bash
+curl http://localhost:4566/_localstack/health
+curl http://localhost:4566/health
+```
+
+---
+
 ## Using with AWS CLI
 
 ```bash
@@ -162,6 +190,33 @@ sfn.create_state_machine(
     roleArn="arn:aws:iam::000000000000:role/role",
 )
 
+# Step Functions — TestState API (test a single state in isolation)
+# Note: inject_host_prefix=False prevents boto3 from prepending "sync-" to the hostname
+from botocore.config import Config as BotoConfig
+sfn_test = client("stepfunctions", config=BotoConfig(inject_host_prefix=False))
+
+result = sfn_test.test_state(
+    definition='{"Type":"Pass","Result":{"greeting":"hello"},"End":true}',
+    input='{"name":"world"}',
+)
+print(result["status"])  # SUCCEEDED
+print(result["output"])  # {"greeting": "hello"}
+
+# TestState with mock — test error handling without calling real services
+result = sfn_test.test_state(
+    definition=json.dumps({
+        "Type": "Task",
+        "Resource": "arn:aws:lambda:us-east-1:000000000000:function:my-fn",
+        "Catch": [{"ErrorEquals": ["States.ALL"], "Next": "Fallback"}],
+        "End": True
+    }),
+    input='{}',
+    inspectionLevel="DEBUG",
+    mock={"errorOutput": {"error": "ServiceError", "cause": "Timeout"}},
+)
+print(result["status"])  # CAUGHT_ERROR
+print(result["nextState"])  # Fallback
+
 # EC2
 ec2 = client("ec2")
 reservation = ec2.run_instances(
@@ -202,7 +257,7 @@ subnet = ec2.create_subnet(
 | **SQS** | CreateQueue, DeleteQueue, ListQueues, GetQueueUrl, GetQueueAttributes, SetQueueAttributes, PurgeQueue, SendMessage, ReceiveMessage, DeleteMessage, ChangeMessageVisibility, ChangeMessageVisibilityBatch, SendMessageBatch, DeleteMessageBatch, TagQueue, UntagQueue, ListQueueTags | Both Query API and JSON protocol; FIFO queues with deduplication; DLQ support |
 | **SNS** | CreateTopic, DeleteTopic, ListTopics, GetTopicAttributes, SetTopicAttributes, Subscribe, Unsubscribe, ListSubscriptions, ListSubscriptionsByTopic, GetSubscriptionAttributes, SetSubscriptionAttributes, ConfirmSubscription, Publish, PublishBatch, TagResource, UntagResource, ListTagsForResource, CreatePlatformApplication, CreatePlatformEndpoint | SNS→SQS fanout delivery; SNS→Lambda fanout (synchronous invocation) |
 | **DynamoDB** | CreateTable, UpdateTable, DeleteTable, DescribeTable, ListTables, PutItem, GetItem, DeleteItem, UpdateItem, Query, Scan, BatchWriteItem, BatchGetItem, TransactWriteItems, TransactGetItems, DescribeTimeToLive, UpdateTimeToLive, DescribeContinuousBackups, UpdateContinuousBackups, DescribeEndpoints, TagResource, UntagResource, ListTagsOfResource | TTL enforced via thread-safe background reaper (60s cadence); DynamoDB Streams — `StreamSpecification` emits INSERT/MODIFY/REMOVE records on all write operations, respects `StreamViewType` |
-| **Lambda** | CreateFunction, DeleteFunction, GetFunction, GetFunctionConfiguration, ListFunctions, Invoke, UpdateFunctionCode, UpdateFunctionConfiguration, AddPermission, RemovePermission, GetPolicy, ListVersionsByFunction, PublishVersion, CreateAlias, GetAlias, UpdateAlias, DeleteAlias, ListAliases, TagResource, UntagResource, ListTags, CreateEventSourceMapping, DeleteEventSourceMapping, GetEventSourceMapping, ListEventSourceMappings, UpdateEventSourceMapping, CreateFunctionUrlConfig, GetFunctionUrlConfig, UpdateFunctionUrlConfig, DeleteFunctionUrlConfig, ListFunctionUrlConfigs, PutFunctionConcurrency, GetFunctionConcurrency, DeleteFunctionConcurrency, PutFunctionEventInvokeConfig, GetFunctionEventInvokeConfig, DeleteFunctionEventInvokeConfig, PublishLayerVersion, GetLayerVersion, GetLayerVersionByArn, ListLayerVersions, DeleteLayerVersion, ListLayers, AddLayerVersionPermission, RemoveLayerVersionPermission, GetLayerVersionPolicy | Python and Node.js runtimes execute with warm worker pool; `Publish=True` creates immutable numbered versions; Code via `ZipFile` or `S3Bucket`/`S3Key`; SQS, Kinesis, and DynamoDB Streams event source mappings; Function URL CRUD; Lambda Layers CRUD; Aliases; Concurrency; EventInvokeConfig |
+| **Lambda** | CreateFunction, DeleteFunction, GetFunction, GetFunctionConfiguration, ListFunctions, Invoke, UpdateFunctionCode, UpdateFunctionConfiguration, AddPermission, RemovePermission, GetPolicy, ListVersionsByFunction, PublishVersion, CreateAlias, GetAlias, UpdateAlias, DeleteAlias, ListAliases, TagResource, UntagResource, ListTags, CreateEventSourceMapping, DeleteEventSourceMapping, GetEventSourceMapping, ListEventSourceMappings, UpdateEventSourceMapping, CreateFunctionUrlConfig, GetFunctionUrlConfig, UpdateFunctionUrlConfig, DeleteFunctionUrlConfig, ListFunctionUrlConfigs, PutFunctionConcurrency, GetFunctionConcurrency, DeleteFunctionConcurrency, PutFunctionEventInvokeConfig, GetFunctionEventInvokeConfig, DeleteFunctionEventInvokeConfig, PublishLayerVersion, GetLayerVersion, GetLayerVersionByArn, ListLayerVersions, DeleteLayerVersion, ListLayers, AddLayerVersionPermission, RemoveLayerVersionPermission, GetLayerVersionPolicy | Python and Node.js runtimes execute with warm worker pool; `provided.al2023`/`provided.al2` runtimes execute via Docker RIE (Go, Rust, C++ support); `Publish=True` creates immutable numbered versions; Code via `ZipFile` or `S3Bucket`/`S3Key`; SQS, Kinesis, and DynamoDB Streams event source mappings; Function URL CRUD; Lambda Layers CRUD; Aliases; Concurrency; EventInvokeConfig |
 | **IAM** | CreateUser, GetUser, ListUsers, DeleteUser, CreateRole, GetRole, ListRoles, DeleteRole, CreatePolicy, GetPolicy, DeletePolicy, AttachRolePolicy, DetachRolePolicy, PutRolePolicy, GetRolePolicy, DeleteRolePolicy, ListRolePolicies, ListAttachedRolePolicies, CreateAccessKey, ListAccessKeys, DeleteAccessKey, CreateInstanceProfile, GetInstanceProfile, DeleteInstanceProfile, AddRoleToInstanceProfile, RemoveRoleFromInstanceProfile, ListInstanceProfiles, CreateGroup, GetGroup, AddUserToGroup, RemoveUserFromGroup, CreateServiceLinkedRole, DeleteServiceLinkedRole, GetServiceLinkedRoleDeletionStatus, CreateOpenIDConnectProvider, TagRole, UntagRole, TagUser, UntagUser, TagPolicy, UntagPolicy | |
 | **STS** | GetCallerIdentity, AssumeRole, GetSessionToken, AssumeRoleWithWebIdentity | |
 | **SecretsManager** | CreateSecret, GetSecretValue, ListSecrets, DeleteSecret, UpdateSecret, DescribeSecret, PutSecretValue, RestoreSecret, RotateSecret, GetRandomPassword, ListSecretVersionIds, ReplicateSecretToRegions, TagResource, UntagResource, PutResourcePolicy, GetResourcePolicy, DeleteResourcePolicy, ValidateResourcePolicy | |
@@ -272,7 +327,7 @@ Unsupported resource types fail with `CREATE_FAILED` (or `ROLLBACK_COMPLETE` if 
 | **Athena** | StartQueryExecution, GetQueryExecution, GetQueryResults, StopQueryExecution, ListQueryExecutions, BatchGetQueryExecution, CreateWorkGroup, DeleteWorkGroup, GetWorkGroup, ListWorkGroups, UpdateWorkGroup, CreateNamedQuery, DeleteNamedQuery, GetNamedQuery, ListNamedQueries, BatchGetNamedQuery, CreateDataCatalog, GetDataCatalog, ListDataCatalogs, DeleteDataCatalog, UpdateDataCatalog, CreatePreparedStatement, GetPreparedStatement, DeletePreparedStatement, ListPreparedStatements, GetTableMetadata, ListTableMetadata, TagResource, UntagResource, ListTagsForResource | Real SQL via **DuckDB** when installed (`pip install duckdb`), otherwise returns mock results; result pagination; column type metadata |
 | **Firehose** | CreateDeliveryStream, DeleteDeliveryStream, DescribeDeliveryStream, ListDeliveryStreams, PutRecord, PutRecordBatch, UpdateDestination, TagDeliveryStream, UntagDeliveryStream, ListTagsForDeliveryStream, StartDeliveryStreamEncryption, StopDeliveryStreamEncryption | S3 destinations write records to the local S3 emulator; all other destination types buffer in-memory; concurrency-safe `UpdateDestination` via `VersionId` |
 | **Route53** | CreateHostedZone, GetHostedZone, DeleteHostedZone, ListHostedZones, ListHostedZonesByName, UpdateHostedZoneComment, ChangeResourceRecordSets (CREATE/UPSERT/DELETE), ListResourceRecordSets, GetChange, CreateHealthCheck, GetHealthCheck, DeleteHealthCheck, ListHealthChecks, UpdateHealthCheck, ChangeTagsForResource, ListTagsForResource | REST/XML protocol; SOA + NS records auto-created; CallerReference idempotency; alias records, weighted/failover/latency routing; marker-based pagination |
-| **EC2** | RunInstances, DescribeInstances, DescribeInstanceAttribute, DescribeInstanceTypes, DescribeVpcAttribute, TerminateInstances, StopInstances, StartInstances, RebootInstances, DescribeImages, CreateSecurityGroup, DeleteSecurityGroup, DescribeSecurityGroups, AuthorizeSecurityGroupIngress, RevokeSecurityGroupIngress, AuthorizeSecurityGroupEgress, RevokeSecurityGroupEgress, CreateKeyPair, DeleteKeyPair, DescribeKeyPairs, ImportKeyPair, CreateVpc, DeleteVpc, DescribeVpcs, ModifyVpcAttribute, CreateSubnet, DeleteSubnet, DescribeSubnets, ModifySubnetAttribute, CreateInternetGateway, DeleteInternetGateway, DescribeInternetGateways, AttachInternetGateway, DetachInternetGateway, CreateRouteTable, DeleteRouteTable, DescribeRouteTables, AssociateRouteTable, DisassociateRouteTable, CreateRoute, ReplaceRoute, DeleteRoute, CreateNetworkInterface, DeleteNetworkInterface, DescribeNetworkInterfaces, AttachNetworkInterface, DetachNetworkInterface, CreateVpcEndpoint, DeleteVpcEndpoints, DescribeVpcEndpoints, DescribeAvailabilityZones, AllocateAddress, ReleaseAddress, AssociateAddress, DisassociateAddress, DescribeAddresses, CreateTags, DeleteTags, DescribeTags, CreateNatGateway, DescribeNatGateways, DeleteNatGateway, CreateNetworkAcl, DescribeNetworkAcls, DeleteNetworkAcl, CreateNetworkAclEntry, DeleteNetworkAclEntry, ReplaceNetworkAclEntry, ReplaceNetworkAclAssociation, CreateFlowLogs, DescribeFlowLogs, DeleteFlowLogs, CreateVpcPeeringConnection, AcceptVpcPeeringConnection, DescribeVpcPeeringConnections, DeleteVpcPeeringConnection, CreateDhcpOptions, AssociateDhcpOptions, DescribeDhcpOptions, DeleteDhcpOptions, CreateEgressOnlyInternetGateway, DescribeEgressOnlyInternetGateways, DeleteEgressOnlyInternetGateway, DescribeInstanceCreditSpecifications, DescribeInstanceMaintenanceOptions, DescribeInstanceAutoRecoveryAttribute, ModifyInstanceMaintenanceOptions, DescribeInstanceTopology, DescribeSpotInstanceRequests, DescribeCapacityReservations | In-memory state only — no real VMs; default VPC, subnet, security group, internet gateway, and route table always present; rules stored but not enforced (matches LocalStack); Terraform v6 compatible |
+| **EC2** | RunInstances, DescribeInstances, DescribeInstanceAttribute, DescribeInstanceTypes, DescribeVpcAttribute, TerminateInstances, StopInstances, StartInstances, RebootInstances, DescribeImages, CreateSecurityGroup, DeleteSecurityGroup, DescribeSecurityGroups, AuthorizeSecurityGroupIngress, RevokeSecurityGroupIngress, AuthorizeSecurityGroupEgress, RevokeSecurityGroupEgress, DescribeSecurityGroupRules, CreateKeyPair, DeleteKeyPair, DescribeKeyPairs, ImportKeyPair, CreateVpc, DeleteVpc, DescribeVpcs, ModifyVpcAttribute, CreateSubnet, DeleteSubnet, DescribeSubnets, ModifySubnetAttribute, CreateInternetGateway, DeleteInternetGateway, DescribeInternetGateways, AttachInternetGateway, DetachInternetGateway, CreateRouteTable, DeleteRouteTable, DescribeRouteTables, AssociateRouteTable, DisassociateRouteTable, ReplaceRouteTableAssociation, CreateRoute, ReplaceRoute, DeleteRoute, CreateNetworkInterface, DeleteNetworkInterface, DescribeNetworkInterfaces, AttachNetworkInterface, DetachNetworkInterface, CreateVpcEndpoint, DeleteVpcEndpoints, DescribeVpcEndpoints, ModifyVpcEndpoint, DescribePrefixLists, DescribeAvailabilityZones, AllocateAddress, ReleaseAddress, AssociateAddress, DisassociateAddress, DescribeAddresses, DescribeAddressesAttribute, CreateTags, DeleteTags, DescribeTags, CreateNatGateway, DescribeNatGateways, DeleteNatGateway, CreateNetworkAcl, DescribeNetworkAcls, DeleteNetworkAcl, CreateNetworkAclEntry, DeleteNetworkAclEntry, ReplaceNetworkAclEntry, ReplaceNetworkAclAssociation, CreateFlowLogs, DescribeFlowLogs, DeleteFlowLogs, CreateVpcPeeringConnection, AcceptVpcPeeringConnection, DescribeVpcPeeringConnections, DeleteVpcPeeringConnection, CreateDhcpOptions, AssociateDhcpOptions, DescribeDhcpOptions, DeleteDhcpOptions, CreateEgressOnlyInternetGateway, DescribeEgressOnlyInternetGateways, DeleteEgressOnlyInternetGateway, CreateManagedPrefixList, DescribeManagedPrefixLists, GetManagedPrefixListEntries, ModifyManagedPrefixList, DeleteManagedPrefixList, CreateVpnGateway, DescribeVpnGateways, AttachVpnGateway, DetachVpnGateway, DeleteVpnGateway, EnableVgwRoutePropagation, DisableVgwRoutePropagation, CreateCustomerGateway, DescribeCustomerGateways, DeleteCustomerGateway, DescribeInstanceCreditSpecifications, DescribeInstanceMaintenanceOptions, DescribeInstanceAutoRecoveryAttribute, ModifyInstanceMaintenanceOptions, DescribeInstanceTopology, DescribeSpotInstanceRequests, DescribeCapacityReservations | 127 actions; in-memory state only — no real VMs; CreateVpc provisions per-VPC default route table, network ACL, and security group; full Terraform VPC module v6.6.0 compatible; VPN/Customer gateways, managed prefix lists, VPC endpoints with modify support |
 | **EBS** | CreateVolume, DeleteVolume, DescribeVolumes, DescribeVolumeStatus, AttachVolume, DetachVolume, ModifyVolume, DescribeVolumesModifications, EnableVolumeIO, ModifyVolumeAttribute, DescribeVolumeAttribute, CreateSnapshot, DeleteSnapshot, DescribeSnapshots, CopySnapshot, ModifySnapshotAttribute, DescribeSnapshotAttribute | Part of EC2 Query/XML service; attach/detach updates volume state; snapshots stored as completed immediately; Pro-only on LocalStack — free here |
 | **EFS** | CreateFileSystem, DescribeFileSystems, DeleteFileSystem, UpdateFileSystem, CreateMountTarget, DescribeMountTargets, DeleteMountTarget, DescribeMountTargetSecurityGroups, ModifyMountTargetSecurityGroups, CreateAccessPoint, DescribeAccessPoints, DeleteAccessPoint, TagResource, UntagResource, ListTagsForResource, PutLifecycleConfiguration, DescribeLifecycleConfiguration, PutBackupPolicy, DescribeBackupPolicy, DescribeAccountPreferences, PutAccountPreferences | REST/JSON `/2015-02-01/*`; CreationToken idempotency; FileSystem deletion blocked when mount targets exist; Pro-only on LocalStack — free here |
 | **EMR** | RunJobFlow, DescribeCluster, ListClusters, TerminateJobFlows, ModifyCluster, SetTerminationProtection, SetVisibleToAllUsers, AddJobFlowSteps, DescribeStep, ListSteps, CancelSteps, AddInstanceFleet, ListInstanceFleets, ModifyInstanceFleet, AddInstanceGroups, ListInstanceGroups, ModifyInstanceGroups, ListBootstrapActions, AddTags, RemoveTags, GetBlockPublicAccessConfiguration, PutBlockPublicAccessConfiguration | Control plane only — no real Spark/Hadoop; clusters start in WAITING (KeepAlive=true) or TERMINATED (KeepAlive=false); steps stored as COMPLETED immediately; all three instance modes (simple, InstanceGroups, InstanceFleets); TerminationProtected enforced; Pro-only on LocalStack — free here |
@@ -618,6 +673,27 @@ provider "aws" {
   }
 }
 ```
+
+**Terraform VPC module** — fully supported (v6.6.0):
+
+```hcl
+module "vpc" {
+  source  = "terraform-aws-modules/vpc/aws"
+  version = "6.6.0"
+
+  name = "my-vpc"
+  cidr = "10.0.0.0/16"
+
+  azs             = ["us-east-1a", "us-east-1b", "us-east-1c"]
+  private_subnets = ["10.0.0.0/20", "10.0.16.0/20", "10.0.32.0/20"]
+  public_subnets  = ["10.0.64.0/20", "10.0.80.0/20", "10.0.96.0/20"]
+
+  enable_nat_gateway = true
+  single_nat_gateway = true
+}
+```
+
+Creates VPC with per-VPC default network ACL, security group, and main route table. All 23 resources (subnets, IGW, NAT, route tables, associations, routes, default resources) supported.
 
 ### AWS CDK
 

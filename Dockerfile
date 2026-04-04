@@ -15,7 +15,8 @@ RUN pip install --no-cache-dir --upgrade pip && \
         "cbor2>=5.4.0" \
         "defusedxml>=0.7" \
         "docker>=7.0.0" \
-        "pyyaml>=6.0"
+        "pyyaml>=6.0" \
+        "cryptography>=41.0"
 
 COPY ministack/ ministack/
 

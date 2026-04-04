@@ -19,11 +19,12 @@ Supports:
   Tags:            CreateTags, DeleteTags, DescribeTags
   VPC attributes:  ModifyVpcAttribute, ModifySubnetAttribute
   Route Tables:    CreateRouteTable, DeleteRouteTable, DescribeRouteTables,
-                   AssociateRouteTable, DisassociateRouteTable,
+                   AssociateRouteTable, DisassociateRouteTable, ReplaceRouteTableAssociation,
                    CreateRoute, ReplaceRoute, DeleteRoute
   ENI:             CreateNetworkInterface, DeleteNetworkInterface, DescribeNetworkInterfaces,
                    AttachNetworkInterface, DetachNetworkInterface
-  VPC Endpoints:   CreateVpcEndpoint, DeleteVpcEndpoints, DescribeVpcEndpoints
+  VPC Endpoints:   CreateVpcEndpoint, DeleteVpcEndpoints, DescribeVpcEndpoints,
+                   ModifyVpcEndpoint, DescribePrefixLists
   EBS Volumes:     CreateVolume, DeleteVolume, DescribeVolumes, DescribeVolumeStatus,
                    AttachVolume, DetachVolume, ModifyVolume, DescribeVolumesModifications,
                    EnableVolumeIO, ModifyVolumeAttribute, DescribeVolumeAttribute
@@ -40,6 +41,14 @@ Supports:
                    DeleteDhcpOptions
   Egress IGW:      CreateEgressOnlyInternetGateway, DescribeEgressOnlyInternetGateways,
                    DeleteEgressOnlyInternetGateway
+  Prefix Lists:    CreateManagedPrefixList, DescribeManagedPrefixLists,
+                   GetManagedPrefixListEntries, ModifyManagedPrefixList,
+                   DeleteManagedPrefixList
+  VPN Gateways:    CreateVpnGateway, DescribeVpnGateways, AttachVpnGateway,
+                   DetachVpnGateway, DeleteVpnGateway,
+                   EnableVgwRoutePropagation, DisableVgwRoutePropagation
+  Customer GW:     CreateCustomerGateway, DescribeCustomerGateways,
+                   DeleteCustomerGateway
 """
 
 import copy
@@ -82,6 +91,9 @@ _flow_logs: dict = {}       # flow_log_id -> flow log record
 _vpc_peering: dict = {}     # pcx_id -> peering connection record
 _dhcp_options: dict = {}    # dopt_id -> DHCP options record
 _egress_igws: dict = {}     # eigw_id -> egress-only internet gateway record
+_prefix_lists: dict = {}    # pl_id -> managed prefix list record
+_vpn_gateways: dict = {}    # vgw_id -> VPN gateway record
+_customer_gateways: dict = {}  # cgw_id -> customer gateway record
 
 
 # ── Persistence ────────────────────────────────────────────
@@ -107,6 +119,9 @@ def get_state():
         "vpc_peering": copy.deepcopy(_vpc_peering),
         "dhcp_options": copy.deepcopy(_dhcp_options),
         "egress_igws": copy.deepcopy(_egress_igws),
+        "prefix_lists": copy.deepcopy(_prefix_lists),
+        "vpn_gateways": copy.deepcopy(_vpn_gateways),
+        "customer_gateways": copy.deepcopy(_customer_gateways),
     }
 
 
@@ -131,6 +146,9 @@ def restore_state(data):
         _vpc_peering.update(data.get("vpc_peering", {}))
         _dhcp_options.update(data.get("dhcp_options", {}))
         _egress_igws.update(data.get("egress_igws", {}))
+        _prefix_lists.update(data.get("prefix_lists", {}))
+        _vpn_gateways.update(data.get("vpn_gateways", {}))
+        _customer_gateways.update(data.get("customer_gateways", {}))
 
 
 _restored = load_state("ec2")
@@ -2413,6 +2431,359 @@ def _delete_egress_only_igw(params):
 
 
 # ---------------------------------------------------------------------------
+# ReplaceRouteTableAssociation
+# ---------------------------------------------------------------------------
+
+def _replace_route_table_association(p):
+    assoc_id = _p(p, "AssociationId")
+    new_rtb_id = _p(p, "RouteTableId")
+    if new_rtb_id not in _route_tables:
+        return _error("InvalidRouteTableID.NotFound", f"The route table '{new_rtb_id}' does not exist", 400)
+    new_assoc_id = "rtbassoc-" + "".join(random.choices(string.hexdigits[:16], k=17))
+    for rtb in _route_tables.values():
+        for i, a in enumerate(rtb["Associations"]):
+            if a["RouteTableAssociationId"] == assoc_id:
+                subnet_id = a.get("SubnetId")
+                is_main = a.get("Main", False)
+                rtb["Associations"].pop(i)
+                _route_tables[new_rtb_id]["Associations"].append({
+                    "RouteTableAssociationId": new_assoc_id,
+                    "RouteTableId": new_rtb_id,
+                    "SubnetId": subnet_id,
+                    "Main": is_main,
+                    "AssociationState": {"State": "associated"},
+                })
+                return _xml(200, "ReplaceRouteTableAssociationResponse",
+                            f"<newAssociationId>{new_assoc_id}</newAssociationId>")
+    return _error("InvalidAssociationID.NotFound", f"Association '{assoc_id}' not found", 400)
+
+
+# ---------------------------------------------------------------------------
+# ModifyVpcEndpoint
+# ---------------------------------------------------------------------------
+
+def _modify_vpc_endpoint(p):
+    vpce_id = _p(p, "VpcEndpointId")
+    ep = _vpc_endpoints.get(vpce_id)
+    if not ep:
+        return _error("InvalidVpcEndpointId.NotFound", f"The VPC endpoint '{vpce_id}' does not exist", 400)
+    add_rtbs = _parse_member_list(p, "AddRouteTableId")
+    rm_rtbs = _parse_member_list(p, "RemoveRouteTableId")
+    add_subnets = _parse_member_list(p, "AddSubnetId")
+    rm_subnets = _parse_member_list(p, "RemoveSubnetId")
+    if add_rtbs:
+        ep["RouteTableIds"] = list(set(ep.get("RouteTableIds", []) + add_rtbs))
+    if rm_rtbs:
+        ep["RouteTableIds"] = [r for r in ep.get("RouteTableIds", []) if r not in rm_rtbs]
+    if add_subnets:
+        ep["SubnetIds"] = list(set(ep.get("SubnetIds", []) + add_subnets))
+    if rm_subnets:
+        ep["SubnetIds"] = [s for s in ep.get("SubnetIds", []) if s not in rm_subnets]
+    policy = _p(p, "PolicyDocument")
+    if policy:
+        ep["PolicyDocument"] = policy
+    return _xml(200, "ModifyVpcEndpointResponse", "<return>true</return>")
+
+
+# ---------------------------------------------------------------------------
+# DescribePrefixLists
+# ---------------------------------------------------------------------------
+
+_AWS_PREFIX_LISTS = {
+    "com.amazonaws.{region}.s3": ("pl-63a5400a", "com.amazonaws.{region}.s3"),
+    "com.amazonaws.{region}.dynamodb": ("pl-02cd2c6b", "com.amazonaws.{region}.dynamodb"),
+}
+
+def _describe_prefix_lists(p):
+    filter_ids = _parse_member_list(p, "PrefixListId")
+    filters = _parse_filters(p)
+    items = ""
+    # Built-in AWS service prefix lists
+    for tpl_svc, (pl_id, tpl_name) in _AWS_PREFIX_LISTS.items():
+        svc = tpl_svc.replace("{region}", REGION)
+        name = tpl_name.replace("{region}", REGION)
+        if filter_ids and pl_id not in filter_ids:
+            continue
+        if filters.get("prefix-list-name") and name not in filters["prefix-list-name"]:
+            continue
+        items += f"""<item>
+            <prefixListId>{pl_id}</prefixListId>
+            <prefixListName>{name}</prefixListName>
+            <cidrSet><item><cidr>0.0.0.0/0</cidr></item></cidrSet>
+        </item>"""
+    # User-created managed prefix lists
+    for pl in _prefix_lists.values():
+        if filter_ids and pl["PrefixListId"] not in filter_ids:
+            continue
+        if filters.get("prefix-list-name") and pl.get("PrefixListName", "") not in filters["prefix-list-name"]:
+            continue
+        entries = "".join(f"<item><cidr>{e['Cidr']}</cidr></item>" for e in pl.get("Entries", []))
+        items += f"""<item>
+            <prefixListId>{pl['PrefixListId']}</prefixListId>
+            <prefixListName>{pl.get('PrefixListName','')}</prefixListName>
+            <cidrSet>{entries}</cidrSet>
+        </item>"""
+    return _xml(200, "DescribePrefixListsResponse", f"<prefixListSet>{items}</prefixListSet>")
+
+
+# ---------------------------------------------------------------------------
+# Managed Prefix Lists
+# ---------------------------------------------------------------------------
+
+def _create_managed_prefix_list(p):
+    name = _p(p, "PrefixListName") or ""
+    max_entries = int(_p(p, "MaxEntries") or "10")
+    af = _p(p, "AddressFamily") or "IPv4"
+    pl_id = "pl-" + "".join(random.choices(string.hexdigits[:16], k=17))
+    entries = []
+    i = 1
+    while _p(p, f"Entry.{i}.Cidr"):
+        entries.append({"Cidr": _p(p, f"Entry.{i}.Cidr"), "Description": _p(p, f"Entry.{i}.Description")})
+        i += 1
+    tags = _parse_tags(p)
+    _prefix_lists[pl_id] = {
+        "PrefixListId": pl_id, "PrefixListName": name, "State": "create-complete",
+        "AddressFamily": af, "MaxEntries": max_entries, "Version": 1,
+        "Entries": entries, "Tags": tags, "OwnerId": ACCOUNT_ID,
+        "PrefixListArn": f"arn:aws:ec2:{REGION}:{ACCOUNT_ID}:prefix-list/{pl_id}",
+    }
+    if tags:
+        _tags[pl_id] = tags
+    return _xml(200, "CreateManagedPrefixListResponse", _prefix_list_xml(_prefix_lists[pl_id], tag="prefixList"))
+
+
+def _describe_managed_prefix_lists(p):
+    filter_ids = _parse_member_list(p, "PrefixListId")
+    filters = _parse_filters(p)
+    items = ""
+    for pl in _prefix_lists.values():
+        if filter_ids and pl["PrefixListId"] not in filter_ids:
+            continue
+        if filters.get("prefix-list-name") and pl.get("PrefixListName", "") not in filters["prefix-list-name"]:
+            continue
+        items += _prefix_list_xml(pl)
+    return _xml(200, "DescribeManagedPrefixListsResponse", f"<prefixListSet>{items}</prefixListSet>")
+
+
+def _get_managed_prefix_list_entries(p):
+    pl_id = _p(p, "PrefixListId")
+    pl = _prefix_lists.get(pl_id)
+    if not pl:
+        return _error("InvalidPrefixListID.NotFound", f"Prefix list '{pl_id}' not found", 400)
+    entries = "".join(f"""<item>
+        <cidr>{e['Cidr']}</cidr>
+        <description>{e.get('Description','')}</description>
+    </item>""" for e in pl.get("Entries", []))
+    return _xml(200, "GetManagedPrefixListEntriesResponse", f"<entrySet>{entries}</entrySet>")
+
+
+def _modify_managed_prefix_list(p):
+    pl_id = _p(p, "PrefixListId")
+    pl = _prefix_lists.get(pl_id)
+    if not pl:
+        return _error("InvalidPrefixListID.NotFound", f"Prefix list '{pl_id}' not found", 400)
+    name = _p(p, "PrefixListName")
+    if name:
+        pl["PrefixListName"] = name
+    max_e = _p(p, "MaxEntries")
+    if max_e:
+        pl["MaxEntries"] = int(max_e)
+    # Add entries
+    i = 1
+    while _p(p, f"AddEntry.{i}.Cidr"):
+        pl["Entries"].append({"Cidr": _p(p, f"AddEntry.{i}.Cidr"), "Description": _p(p, f"AddEntry.{i}.Description")})
+        i += 1
+    # Remove entries
+    i = 1
+    rm_cidrs = set()
+    while _p(p, f"RemoveEntry.{i}.Cidr"):
+        rm_cidrs.add(_p(p, f"RemoveEntry.{i}.Cidr"))
+        i += 1
+    if rm_cidrs:
+        pl["Entries"] = [e for e in pl["Entries"] if e["Cidr"] not in rm_cidrs]
+    pl["Version"] = pl.get("Version", 1) + 1
+    return _xml(200, "ModifyManagedPrefixListResponse", _prefix_list_xml(pl, tag="prefixList"))
+
+
+def _delete_managed_prefix_list(p):
+    pl_id = _p(p, "PrefixListId")
+    if pl_id not in _prefix_lists:
+        return _error("InvalidPrefixListID.NotFound", f"Prefix list '{pl_id}' not found", 400)
+    del _prefix_lists[pl_id]
+    return _xml(200, "DeleteManagedPrefixListResponse", "<return>true</return>")
+
+
+def _prefix_list_xml(pl, tag="item"):
+    return f"""<{tag}>
+        <prefixListId>{pl['PrefixListId']}</prefixListId>
+        <prefixListName>{pl.get('PrefixListName','')}</prefixListName>
+        <state>{pl.get('State','create-complete')}</state>
+        <addressFamily>{pl.get('AddressFamily','IPv4')}</addressFamily>
+        <maxEntries>{pl.get('MaxEntries',10)}</maxEntries>
+        <version>{pl.get('Version',1)}</version>
+        <prefixListArn>{pl.get('PrefixListArn','')}</prefixListArn>
+        <ownerId>{pl.get('OwnerId', ACCOUNT_ID)}</ownerId>
+        <tagSet/>
+    </{tag}>"""
+
+
+# ---------------------------------------------------------------------------
+# VPN Gateways
+# ---------------------------------------------------------------------------
+
+def _create_vpn_gateway(p):
+    gw_type = _p(p, "Type") or "ipsec.1"
+    az = _p(p, "AvailabilityZone") or ""
+    asn = _p(p, "AmazonSideAsn") or "64512"
+    vgw_id = "vgw-" + "".join(random.choices(string.hexdigits[:16], k=17))
+    tags = _parse_tags(p)
+    _vpn_gateways[vgw_id] = {
+        "VpnGatewayId": vgw_id, "Type": gw_type, "State": "available",
+        "AvailabilityZone": az, "AmazonSideAsn": asn,
+        "Attachments": [], "Tags": tags, "OwnerId": ACCOUNT_ID,
+    }
+    if tags:
+        _tags[vgw_id] = tags
+    return _xml(200, "CreateVpnGatewayResponse", _vgw_xml(_vpn_gateways[vgw_id], tag="vpnGateway"))
+
+
+def _describe_vpn_gateways(p):
+    filter_ids = _parse_member_list(p, "VpnGatewayId")
+    filters = _parse_filters(p)
+    items = ""
+    for vgw in _vpn_gateways.values():
+        if filter_ids and vgw["VpnGatewayId"] not in filter_ids:
+            continue
+        if filters.get("attachment.vpc-id"):
+            vpc_ids = [a["VpcId"] for a in vgw.get("Attachments", [])]
+            if not any(v in vpc_ids for v in filters["attachment.vpc-id"]):
+                continue
+        items += _vgw_xml(vgw)
+    return _xml(200, "DescribeVpnGatewaysResponse", f"<vpnGatewaySet>{items}</vpnGatewaySet>")
+
+
+def _attach_vpn_gateway(p):
+    vgw_id = _p(p, "VpnGatewayId")
+    vpc_id = _p(p, "VpcId")
+    vgw = _vpn_gateways.get(vgw_id)
+    if not vgw:
+        return _error("InvalidVpnGatewayID.NotFound", f"VPN gateway '{vgw_id}' not found", 400)
+    vgw["Attachments"] = [{"VpcId": vpc_id, "State": "attached"}]
+    return _xml(200, "AttachVpnGatewayResponse",
+                f"<attachment><vpcId>{vpc_id}</vpcId><state>attached</state></attachment>")
+
+
+def _detach_vpn_gateway(p):
+    vgw_id = _p(p, "VpnGatewayId")
+    vgw = _vpn_gateways.get(vgw_id)
+    if not vgw:
+        return _error("InvalidVpnGatewayID.NotFound", f"VPN gateway '{vgw_id}' not found", 400)
+    vgw["Attachments"] = []
+    vgw["State"] = "detached"
+    return _xml(200, "DetachVpnGatewayResponse", "<return>true</return>")
+
+
+def _delete_vpn_gateway(p):
+    vgw_id = _p(p, "VpnGatewayId")
+    if vgw_id not in _vpn_gateways:
+        return _error("InvalidVpnGatewayID.NotFound", f"VPN gateway '{vgw_id}' not found", 400)
+    del _vpn_gateways[vgw_id]
+    return _xml(200, "DeleteVpnGatewayResponse", "<return>true</return>")
+
+
+def _vgw_xml(vgw, tag="item"):
+    attachments = "".join(
+        f"<item><vpcId>{a['VpcId']}</vpcId><state>{a['State']}</state></item>"
+        for a in vgw.get("Attachments", [])
+    )
+    return f"""<{tag}>
+        <vpnGatewayId>{vgw['VpnGatewayId']}</vpnGatewayId>
+        <state>{vgw['State']}</state>
+        <type>{vgw['Type']}</type>
+        <availabilityZone>{vgw.get('AvailabilityZone','')}</availabilityZone>
+        <amazonSideAsn>{vgw.get('AmazonSideAsn','64512')}</amazonSideAsn>
+        <attachments>{attachments}</attachments>
+        <tagSet/>
+    </{tag}>"""
+
+
+# ---------------------------------------------------------------------------
+# VPN Gateway Route Propagation
+# ---------------------------------------------------------------------------
+
+def _enable_vgw_route_propagation(p):
+    rtb_id = _p(p, "RouteTableId")
+    vgw_id = _p(p, "GatewayId")
+    rtb = _route_tables.get(rtb_id)
+    if not rtb:
+        return _error("InvalidRouteTableID.NotFound", f"Route table '{rtb_id}' not found", 400)
+    propagating = rtb.setdefault("PropagatingVgws", [])
+    if vgw_id not in propagating:
+        propagating.append(vgw_id)
+    return _xml(200, "EnableVgwRoutePropagationResponse", "<return>true</return>")
+
+
+def _disable_vgw_route_propagation(p):
+    rtb_id = _p(p, "RouteTableId")
+    vgw_id = _p(p, "GatewayId")
+    rtb = _route_tables.get(rtb_id)
+    if not rtb:
+        return _error("InvalidRouteTableID.NotFound", f"Route table '{rtb_id}' not found", 400)
+    propagating = rtb.get("PropagatingVgws", [])
+    if vgw_id in propagating:
+        propagating.remove(vgw_id)
+    return _xml(200, "DisableVgwRoutePropagationResponse", "<return>true</return>")
+
+
+# ---------------------------------------------------------------------------
+# Customer Gateways
+# ---------------------------------------------------------------------------
+
+def _create_customer_gateway(p):
+    bgp_asn = _p(p, "BgpAsn") or "65000"
+    ip_address = _p(p, "IpAddress") or _p(p, "PublicIp") or ""
+    gw_type = _p(p, "Type") or "ipsec.1"
+    cgw_id = "cgw-" + "".join(random.choices(string.hexdigits[:16], k=17))
+    tags = _parse_tags(p)
+    _customer_gateways[cgw_id] = {
+        "CustomerGatewayId": cgw_id, "BgpAsn": bgp_asn, "IpAddress": ip_address,
+        "Type": gw_type, "State": "available", "Tags": tags, "OwnerId": ACCOUNT_ID,
+    }
+    if tags:
+        _tags[cgw_id] = tags
+    return _xml(200, "CreateCustomerGatewayResponse", _cgw_xml(_customer_gateways[cgw_id], tag="customerGateway"))
+
+
+def _describe_customer_gateways(p):
+    filter_ids = _parse_member_list(p, "CustomerGatewayId")
+    items = ""
+    for cgw in _customer_gateways.values():
+        if filter_ids and cgw["CustomerGatewayId"] not in filter_ids:
+            continue
+        items += _cgw_xml(cgw)
+    return _xml(200, "DescribeCustomerGatewaysResponse", f"<customerGatewaySet>{items}</customerGatewaySet>")
+
+
+def _delete_customer_gateway(p):
+    cgw_id = _p(p, "CustomerGatewayId")
+    if cgw_id not in _customer_gateways:
+        return _error("InvalidCustomerGatewayID.NotFound", f"Customer gateway '{cgw_id}' not found", 400)
+    del _customer_gateways[cgw_id]
+    return _xml(200, "DeleteCustomerGatewayResponse", "<return>true</return>")
+
+
+def _cgw_xml(cgw, tag="item"):
+    return f"""<{tag}>
+        <customerGatewayId>{cgw['CustomerGatewayId']}</customerGatewayId>
+        <bgpAsn>{cgw['BgpAsn']}</bgpAsn>
+        <ipAddress>{cgw['IpAddress']}</ipAddress>
+        <type>{cgw['Type']}</type>
+        <state>{cgw['State']}</state>
+        <tagSet/>
+    </{tag}>"""
+
+
+# ---------------------------------------------------------------------------
 # Reset
 # ---------------------------------------------------------------------------
 
@@ -2436,6 +2807,9 @@ def reset():
     _vpc_peering.clear()
     _dhcp_options.clear()
     _egress_igws.clear()
+    _prefix_lists.clear()
+    _vpn_gateways.clear()
+    _customer_gateways.clear()
     _init_defaults()
 
 
@@ -2731,6 +3105,24 @@ _ACTION_MAP = {
     "CreateVpcEndpoint": _create_vpc_endpoint,
     "DeleteVpcEndpoints": _delete_vpc_endpoints,
     "DescribeVpcEndpoints": _describe_vpc_endpoints,
+    "ReplaceRouteTableAssociation": _replace_route_table_association,
+    "ModifyVpcEndpoint": _modify_vpc_endpoint,
+    "DescribePrefixLists": _describe_prefix_lists,
+    "CreateManagedPrefixList": _create_managed_prefix_list,
+    "DescribeManagedPrefixLists": _describe_managed_prefix_lists,
+    "GetManagedPrefixListEntries": _get_managed_prefix_list_entries,
+    "ModifyManagedPrefixList": _modify_managed_prefix_list,
+    "DeleteManagedPrefixList": _delete_managed_prefix_list,
+    "CreateVpnGateway": _create_vpn_gateway,
+    "DescribeVpnGateways": _describe_vpn_gateways,
+    "AttachVpnGateway": _attach_vpn_gateway,
+    "DetachVpnGateway": _detach_vpn_gateway,
+    "DeleteVpnGateway": _delete_vpn_gateway,
+    "EnableVgwRoutePropagation": _enable_vgw_route_propagation,
+    "DisableVgwRoutePropagation": _disable_vgw_route_propagation,
+    "CreateCustomerGateway": _create_customer_gateway,
+    "DescribeCustomerGateways": _describe_customer_gateways,
+    "DeleteCustomerGateway": _delete_customer_gateway,
     # EBS Volumes
     "CreateVolume": _create_volume,
     "DeleteVolume": _delete_volume,

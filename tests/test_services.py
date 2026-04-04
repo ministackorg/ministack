@@ -18639,3 +18639,474 @@ def test_appsync_graphql_empty_query():
         assert False, "Should have failed"
     except urllib.error.HTTPError as e:
         assert e.code == 400
+
+
+# ---------------------------------------------------------------------------
+# EC2 v1.1.36 — new VPC/Terraform actions
+# ---------------------------------------------------------------------------
+
+def test_ec2_create_vpc_default_resources(ec2):
+    """CreateVpc must create per-VPC default ACL, SG, and main route table."""
+    vpc = ec2.create_vpc(CidrBlock="10.99.0.0/16")
+    vpc_id = vpc["Vpc"]["VpcId"]
+    try:
+        # DescribeNetworkAcls with vpc-id + default=true
+        acls = ec2.describe_network_acls(Filters=[
+            {"Name": "vpc-id", "Values": [vpc_id]},
+            {"Name": "default", "Values": ["true"]},
+        ])
+        assert len(acls["NetworkAcls"]) == 1
+        acl = acls["NetworkAcls"][0]
+        assert acl["IsDefault"] is True
+        assert acl["VpcId"] == vpc_id
+
+        # DescribeSecurityGroups with vpc-id + group-name=default
+        sgs = ec2.describe_security_groups(Filters=[
+            {"Name": "vpc-id", "Values": [vpc_id]},
+            {"Name": "group-name", "Values": ["default"]},
+        ])
+        assert len(sgs["SecurityGroups"]) == 1
+        assert sgs["SecurityGroups"][0]["VpcId"] == vpc_id
+
+        # DescribeRouteTables with vpc-id + association.main=true
+        rtbs = ec2.describe_route_tables(Filters=[
+            {"Name": "vpc-id", "Values": [vpc_id]},
+            {"Name": "association.main", "Values": ["true"]},
+        ])
+        assert len(rtbs["RouteTables"]) == 1
+        assert rtbs["RouteTables"][0]["VpcId"] == vpc_id
+    finally:
+        ec2.delete_vpc(VpcId=vpc_id)
+
+
+def test_ec2_route_table_association_filter(ec2):
+    """AssociateRouteTable + DescribeRouteTables filter by association ID."""
+    vpc = ec2.create_vpc(CidrBlock="10.98.0.0/16")
+    vpc_id = vpc["Vpc"]["VpcId"]
+    try:
+        subnet = ec2.create_subnet(VpcId=vpc_id, CidrBlock="10.98.1.0/24")
+        subnet_id = subnet["Subnet"]["SubnetId"]
+        rtb = ec2.create_route_table(VpcId=vpc_id)
+        rtb_id = rtb["RouteTable"]["RouteTableId"]
+        assoc = ec2.associate_route_table(RouteTableId=rtb_id, SubnetId=subnet_id)
+        assoc_id = assoc["AssociationId"]
+
+        # Filter by association ID
+        result = ec2.describe_route_tables(Filters=[
+            {"Name": "association.route-table-association-id", "Values": [assoc_id]},
+        ])
+        assert len(result["RouteTables"]) == 1
+        assert result["RouteTables"][0]["RouteTableId"] == rtb_id
+
+        # Filter by subnet ID
+        result2 = ec2.describe_route_tables(Filters=[
+            {"Name": "association.subnet-id", "Values": [subnet_id]},
+        ])
+        assert len(result2["RouteTables"]) == 1
+
+        ec2.disassociate_route_table(AssociationId=assoc_id)
+        ec2.delete_route_table(RouteTableId=rtb_id)
+        ec2.delete_subnet(SubnetId=subnet_id)
+    finally:
+        ec2.delete_vpc(VpcId=vpc_id)
+
+
+def test_ec2_replace_route_table_association(ec2):
+    """ReplaceRouteTableAssociation moves subnet to a different route table."""
+    vpc = ec2.create_vpc(CidrBlock="10.97.0.0/16")
+    vpc_id = vpc["Vpc"]["VpcId"]
+    try:
+        subnet = ec2.create_subnet(VpcId=vpc_id, CidrBlock="10.97.1.0/24")
+        subnet_id = subnet["Subnet"]["SubnetId"]
+        rtb1 = ec2.create_route_table(VpcId=vpc_id)
+        rtb1_id = rtb1["RouteTable"]["RouteTableId"]
+        rtb2 = ec2.create_route_table(VpcId=vpc_id)
+        rtb2_id = rtb2["RouteTable"]["RouteTableId"]
+
+        assoc = ec2.associate_route_table(RouteTableId=rtb1_id, SubnetId=subnet_id)
+        old_assoc_id = assoc["AssociationId"]
+
+        # Replace association to rtb2
+        new = ec2.replace_route_table_association(AssociationId=old_assoc_id, RouteTableId=rtb2_id)
+        new_assoc_id = new["NewAssociationId"]
+        assert new_assoc_id != old_assoc_id
+
+        # Verify subnet is now on rtb2
+        result = ec2.describe_route_tables(Filters=[
+            {"Name": "association.subnet-id", "Values": [subnet_id]},
+        ])
+        assert result["RouteTables"][0]["RouteTableId"] == rtb2_id
+
+        ec2.disassociate_route_table(AssociationId=new_assoc_id)
+        ec2.delete_route_table(RouteTableId=rtb1_id)
+        ec2.delete_route_table(RouteTableId=rtb2_id)
+        ec2.delete_subnet(SubnetId=subnet_id)
+    finally:
+        ec2.delete_vpc(VpcId=vpc_id)
+
+
+def test_ec2_modify_vpc_endpoint(ec2):
+    """ModifyVpcEndpoint adds/removes route tables."""
+    vpc = ec2.create_vpc(CidrBlock="10.96.0.0/16")
+    vpc_id = vpc["Vpc"]["VpcId"]
+    try:
+        rtb = ec2.create_route_table(VpcId=vpc_id)
+        rtb_id = rtb["RouteTable"]["RouteTableId"]
+        ep = ec2.create_vpc_endpoint(
+            VpcId=vpc_id, ServiceName="com.amazonaws.us-east-1.s3",
+            VpcEndpointType="Gateway",
+        )
+        vpce_id = ep["VpcEndpoint"]["VpcEndpointId"]
+
+        # Add route table
+        ec2.modify_vpc_endpoint(VpcEndpointId=vpce_id, AddRouteTableIds=[rtb_id])
+        desc = ec2.describe_vpc_endpoints(VpcEndpointIds=[vpce_id])
+        assert rtb_id in desc["VpcEndpoints"][0]["RouteTableIds"]
+
+        # Remove route table
+        ec2.modify_vpc_endpoint(VpcEndpointId=vpce_id, RemoveRouteTableIds=[rtb_id])
+        desc = ec2.describe_vpc_endpoints(VpcEndpointIds=[vpce_id])
+        assert rtb_id not in desc["VpcEndpoints"][0]["RouteTableIds"]
+
+        ec2.delete_vpc_endpoints(VpcEndpointIds=[vpce_id])
+        ec2.delete_route_table(RouteTableId=rtb_id)
+    finally:
+        ec2.delete_vpc(VpcId=vpc_id)
+
+
+def test_ec2_describe_prefix_lists(ec2):
+    """DescribePrefixLists returns built-in AWS service prefix lists."""
+    result = ec2.describe_prefix_lists()
+    pl_names = [pl["PrefixListName"] for pl in result["PrefixLists"]]
+    assert any("s3" in n for n in pl_names)
+    assert any("dynamodb" in n for n in pl_names)
+
+
+def test_ec2_managed_prefix_list_crud(ec2):
+    """Full lifecycle: create, describe, get entries, modify, delete."""
+    pl = ec2.create_managed_prefix_list(
+        PrefixListName="test-pl", MaxEntries=5, AddressFamily="IPv4",
+        Entries=[{"Cidr": "10.0.0.0/8", "Description": "RFC1918-10"}],
+    )
+    pl_id = pl["PrefixList"]["PrefixListId"]
+    assert pl["PrefixList"]["PrefixListName"] == "test-pl"
+
+    # Describe
+    desc = ec2.describe_managed_prefix_lists(PrefixListIds=[pl_id])
+    assert len(desc["PrefixLists"]) == 1
+    assert desc["PrefixLists"][0]["PrefixListName"] == "test-pl"
+
+    # Get entries
+    entries = ec2.get_managed_prefix_list_entries(PrefixListId=pl_id)
+    assert len(entries["Entries"]) == 1
+    assert entries["Entries"][0]["Cidr"] == "10.0.0.0/8"
+
+    # Modify — add entry
+    ec2.modify_managed_prefix_list(
+        PrefixListId=pl_id, CurrentVersion=1,
+        AddEntries=[{"Cidr": "172.16.0.0/12", "Description": "RFC1918-172"}],
+    )
+    entries = ec2.get_managed_prefix_list_entries(PrefixListId=pl_id)
+    cidrs = [e["Cidr"] for e in entries["Entries"]]
+    assert "10.0.0.0/8" in cidrs
+    assert "172.16.0.0/12" in cidrs
+
+    # Modify — remove entry
+    ec2.modify_managed_prefix_list(
+        PrefixListId=pl_id, CurrentVersion=2,
+        RemoveEntries=[{"Cidr": "10.0.0.0/8"}],
+    )
+    entries = ec2.get_managed_prefix_list_entries(PrefixListId=pl_id)
+    cidrs = [e["Cidr"] for e in entries["Entries"]]
+    assert "10.0.0.0/8" not in cidrs
+    assert "172.16.0.0/12" in cidrs
+
+    # Delete
+    ec2.delete_managed_prefix_list(PrefixListId=pl_id)
+    desc = ec2.describe_managed_prefix_lists(PrefixListIds=[pl_id])
+    assert len(desc["PrefixLists"]) == 0
+
+
+def test_ec2_vpn_gateway_crud(ec2):
+    """Full lifecycle: create, attach, describe, detach, delete."""
+    vpc = ec2.create_vpc(CidrBlock="10.95.0.0/16")
+    vpc_id = vpc["Vpc"]["VpcId"]
+    try:
+        vgw = ec2.create_vpn_gateway(Type="ipsec.1")
+        vgw_id = vgw["VpnGateway"]["VpnGatewayId"]
+        assert vgw["VpnGateway"]["State"] == "available"
+
+        # Attach
+        ec2.attach_vpn_gateway(VpnGatewayId=vgw_id, VpcId=vpc_id)
+        desc = ec2.describe_vpn_gateways(VpnGatewayIds=[vgw_id])
+        attachments = desc["VpnGateways"][0]["VpcAttachments"]
+        assert len(attachments) == 1
+        assert attachments[0]["VpcId"] == vpc_id
+        assert attachments[0]["State"] == "attached"
+
+        # Filter by attachment.vpc-id
+        filtered = ec2.describe_vpn_gateways(Filters=[
+            {"Name": "attachment.vpc-id", "Values": [vpc_id]},
+        ])
+        assert len(filtered["VpnGateways"]) == 1
+
+        # Detach
+        ec2.detach_vpn_gateway(VpnGatewayId=vgw_id, VpcId=vpc_id)
+        desc = ec2.describe_vpn_gateways(VpnGatewayIds=[vgw_id])
+        assert desc["VpnGateways"][0]["VpcAttachments"] == []
+
+        # Delete
+        ec2.delete_vpn_gateway(VpnGatewayId=vgw_id)
+        desc = ec2.describe_vpn_gateways(VpnGatewayIds=[vgw_id])
+        assert len(desc["VpnGateways"]) == 0
+    finally:
+        ec2.delete_vpc(VpcId=vpc_id)
+
+
+def test_ec2_vgw_route_propagation(ec2):
+    """EnableVgwRoutePropagation / DisableVgwRoutePropagation."""
+    vpc = ec2.create_vpc(CidrBlock="10.94.0.0/16")
+    vpc_id = vpc["Vpc"]["VpcId"]
+    try:
+        rtb = ec2.create_route_table(VpcId=vpc_id)
+        rtb_id = rtb["RouteTable"]["RouteTableId"]
+        vgw = ec2.create_vpn_gateway(Type="ipsec.1")
+        vgw_id = vgw["VpnGateway"]["VpnGatewayId"]
+
+        ec2.enable_vgw_route_propagation(RouteTableId=rtb_id, GatewayId=vgw_id)
+        # No error = success (propagation stored server-side)
+
+        ec2.disable_vgw_route_propagation(RouteTableId=rtb_id, GatewayId=vgw_id)
+        # No error = success
+
+        ec2.delete_vpn_gateway(VpnGatewayId=vgw_id)
+        ec2.delete_route_table(RouteTableId=rtb_id)
+    finally:
+        ec2.delete_vpc(VpcId=vpc_id)
+
+
+def test_ec2_customer_gateway_crud(ec2):
+    """Full lifecycle: create, describe, delete."""
+    cgw = ec2.create_customer_gateway(BgpAsn=65000, IpAddress="203.0.113.1", Type="ipsec.1")
+    cgw_id = cgw["CustomerGateway"]["CustomerGatewayId"]
+    assert cgw["CustomerGateway"]["State"] == "available"
+    assert cgw["CustomerGateway"]["IpAddress"] == "203.0.113.1"
+
+    # Describe
+    desc = ec2.describe_customer_gateways(CustomerGatewayIds=[cgw_id])
+    assert len(desc["CustomerGateways"]) == 1
+    assert desc["CustomerGateways"][0]["BgpAsn"] == "65000"
+
+    # Delete
+    ec2.delete_customer_gateway(CustomerGatewayId=cgw_id)
+    desc = ec2.describe_customer_gateways(CustomerGatewayIds=[cgw_id])
+    assert len(desc["CustomerGateways"]) == 0
+
+
+def test_ec2_create_route_nat_gateway(ec2):
+    """CreateRoute with NatGatewayId stores it separately from GatewayId."""
+    vpc = ec2.create_vpc(CidrBlock="10.93.0.0/16")
+    vpc_id = vpc["Vpc"]["VpcId"]
+    try:
+        subnet = ec2.create_subnet(VpcId=vpc_id, CidrBlock="10.93.1.0/24")
+        subnet_id = subnet["Subnet"]["SubnetId"]
+        eip = ec2.allocate_address(Domain="vpc")
+        nat = ec2.create_nat_gateway(SubnetId=subnet_id, AllocationId=eip["AllocationId"])
+        nat_id = nat["NatGateway"]["NatGatewayId"]
+        rtb = ec2.create_route_table(VpcId=vpc_id)
+        rtb_id = rtb["RouteTable"]["RouteTableId"]
+
+        ec2.create_route(RouteTableId=rtb_id, DestinationCidrBlock="0.0.0.0/0", NatGatewayId=nat_id)
+
+        desc = ec2.describe_route_tables(RouteTableIds=[rtb_id])
+        routes = desc["RouteTables"][0]["Routes"]
+        nat_route = [r for r in routes if r.get("DestinationCidrBlock") == "0.0.0.0/0"][0]
+        assert nat_route.get("NatGatewayId") == nat_id
+        assert nat_route.get("GatewayId", "") == ""
+
+        ec2.delete_route(RouteTableId=rtb_id, DestinationCidrBlock="0.0.0.0/0")
+        ec2.delete_route_table(RouteTableId=rtb_id)
+        ec2.delete_nat_gateway(NatGatewayId=nat_id)
+        ec2.release_address(AllocationId=eip["AllocationId"])
+        ec2.delete_subnet(SubnetId=subnet_id)
+    finally:
+        ec2.delete_vpc(VpcId=vpc_id)
+
+
+def test_ec2_full_terraform_vpc_flow(ec2):
+    """End-to-end Terraform VPC module flow: VPC → subnets → IGW → NAT → routes → associations."""
+    # 1. Create VPC
+    vpc = ec2.create_vpc(CidrBlock="10.50.0.0/16")
+    vpc_id = vpc["Vpc"]["VpcId"]
+    try:
+        # 2. Verify default resources
+        acls = ec2.describe_network_acls(Filters=[
+            {"Name": "vpc-id", "Values": [vpc_id]},
+            {"Name": "default", "Values": ["true"]},
+        ])
+        assert len(acls["NetworkAcls"]) == 1
+
+        sgs = ec2.describe_security_groups(Filters=[
+            {"Name": "vpc-id", "Values": [vpc_id]},
+            {"Name": "group-name", "Values": ["default"]},
+        ])
+        assert len(sgs["SecurityGroups"]) == 1
+
+        main_rtbs = ec2.describe_route_tables(Filters=[
+            {"Name": "vpc-id", "Values": [vpc_id]},
+            {"Name": "association.main", "Values": ["true"]},
+        ])
+        assert len(main_rtbs["RouteTables"]) == 1
+
+        # 3. Create 6 subnets
+        subnets = []
+        for cidr, az in [
+            ("10.50.0.0/20", "us-east-1a"), ("10.50.16.0/20", "us-east-1b"), ("10.50.32.0/20", "us-east-1c"),
+            ("10.50.64.0/20", "us-east-1a"), ("10.50.80.0/20", "us-east-1b"), ("10.50.96.0/20", "us-east-1c"),
+        ]:
+            s = ec2.create_subnet(VpcId=vpc_id, CidrBlock=cidr, AvailabilityZone=az)
+            subnets.append(s["Subnet"]["SubnetId"])
+
+        # 4. IGW
+        igw = ec2.create_internet_gateway()
+        igw_id = igw["InternetGateway"]["InternetGatewayId"]
+        ec2.attach_internet_gateway(InternetGatewayId=igw_id, VpcId=vpc_id)
+
+        # 5. EIP + NAT
+        eip = ec2.allocate_address(Domain="vpc")
+        nat = ec2.create_nat_gateway(SubnetId=subnets[3], AllocationId=eip["AllocationId"])
+        nat_id = nat["NatGateway"]["NatGatewayId"]
+
+        # 6. Public + private route tables
+        pub_rtb = ec2.create_route_table(VpcId=vpc_id)["RouteTable"]["RouteTableId"]
+        priv_rtb = ec2.create_route_table(VpcId=vpc_id)["RouteTable"]["RouteTableId"]
+
+        # 7. Associate subnets (3 public, 3 private)
+        assoc_ids = []
+        for i in range(3):
+            a = ec2.associate_route_table(RouteTableId=pub_rtb, SubnetId=subnets[i + 3])
+            assoc_ids.append(a["AssociationId"])
+            # Verify filter works
+            found = ec2.describe_route_tables(Filters=[
+                {"Name": "association.route-table-association-id", "Values": [a["AssociationId"]]},
+            ])
+            assert len(found["RouteTables"]) == 1
+        for i in range(3):
+            a = ec2.associate_route_table(RouteTableId=priv_rtb, SubnetId=subnets[i])
+            assoc_ids.append(a["AssociationId"])
+
+        # 8. Routes
+        ec2.create_route(RouteTableId=pub_rtb, DestinationCidrBlock="0.0.0.0/0", GatewayId=igw_id)
+        ec2.create_route(RouteTableId=priv_rtb, DestinationCidrBlock="0.0.0.0/0", NatGatewayId=nat_id)
+
+        # Verify NAT route
+        desc = ec2.describe_route_tables(RouteTableIds=[priv_rtb])
+        nat_route = [r for r in desc["RouteTables"][0]["Routes"] if r.get("DestinationCidrBlock") == "0.0.0.0/0"][0]
+        assert nat_route.get("NatGatewayId") == nat_id
+
+        # 9. Cleanup
+        ec2.delete_route(RouteTableId=pub_rtb, DestinationCidrBlock="0.0.0.0/0")
+        ec2.delete_route(RouteTableId=priv_rtb, DestinationCidrBlock="0.0.0.0/0")
+        for aid in assoc_ids:
+            ec2.disassociate_route_table(AssociationId=aid)
+        ec2.delete_route_table(RouteTableId=pub_rtb)
+        ec2.delete_route_table(RouteTableId=priv_rtb)
+        ec2.delete_nat_gateway(NatGatewayId=nat_id)
+        ec2.release_address(AllocationId=eip["AllocationId"])
+        ec2.detach_internet_gateway(InternetGatewayId=igw_id, VpcId=vpc_id)
+        ec2.delete_internet_gateway(InternetGatewayId=igw_id)
+        for sid in subnets:
+            ec2.delete_subnet(SubnetId=sid)
+    finally:
+        ec2.delete_vpc(VpcId=vpc_id)
+
+
+# ---------------------------------------------------------------------------
+# KMS v1.1.36 — Terraform key rotation, policy, tags, lifecycle
+# ---------------------------------------------------------------------------
+
+def test_kms_enable_disable_key_rotation(kms_client):
+    """EnableKeyRotation / DisableKeyRotation / GetKeyRotationStatus."""
+    key = kms_client.create_key(KeyUsage="ENCRYPT_DECRYPT")
+    key_id = key["KeyMetadata"]["KeyId"]
+    status = kms_client.get_key_rotation_status(KeyId=key_id)
+    assert status["KeyRotationEnabled"] is False
+    kms_client.enable_key_rotation(KeyId=key_id)
+    status = kms_client.get_key_rotation_status(KeyId=key_id)
+    assert status["KeyRotationEnabled"] is True
+    kms_client.disable_key_rotation(KeyId=key_id)
+    status = kms_client.get_key_rotation_status(KeyId=key_id)
+    assert status["KeyRotationEnabled"] is False
+    kms_client.schedule_key_deletion(KeyId=key_id, PendingWindowInDays=7)
+
+
+def test_kms_get_put_key_policy(kms_client):
+    """GetKeyPolicy / PutKeyPolicy."""
+    key = kms_client.create_key()
+    key_id = key["KeyMetadata"]["KeyId"]
+    policy = kms_client.get_key_policy(KeyId=key_id, PolicyName="default")
+    assert "Statement" in policy["Policy"]
+    custom = '{"Version":"2012-10-17","Statement":[]}'
+    kms_client.put_key_policy(KeyId=key_id, PolicyName="default", Policy=custom)
+    got = kms_client.get_key_policy(KeyId=key_id, PolicyName="default")
+    assert got["Policy"] == custom
+    kms_client.schedule_key_deletion(KeyId=key_id, PendingWindowInDays=7)
+
+
+def test_kms_tag_untag_list_v2(kms_client):
+    """TagResource / UntagResource / ListResourceTags."""
+    key = kms_client.create_key()
+    key_id = key["KeyMetadata"]["KeyId"]
+    kms_client.tag_resource(KeyId=key_id, Tags=[
+        {"TagKey": "env", "TagValue": "test"},
+        {"TagKey": "team", "TagValue": "platform"},
+    ])
+    tags = kms_client.list_resource_tags(KeyId=key_id)
+    tag_map = {t["TagKey"]: t["TagValue"] for t in tags["Tags"]}
+    assert tag_map["env"] == "test"
+    assert tag_map["team"] == "platform"
+    kms_client.untag_resource(KeyId=key_id, TagKeys=["team"])
+    tags = kms_client.list_resource_tags(KeyId=key_id)
+    assert len(tags["Tags"]) == 1
+    assert tags["Tags"][0]["TagKey"] == "env"
+    kms_client.schedule_key_deletion(KeyId=key_id, PendingWindowInDays=7)
+
+
+def test_kms_enable_disable_key(kms_client):
+    """EnableKey / DisableKey."""
+    key = kms_client.create_key()
+    key_id = key["KeyMetadata"]["KeyId"]
+    assert key["KeyMetadata"]["KeyState"] == "Enabled"
+    kms_client.disable_key(KeyId=key_id)
+    desc = kms_client.describe_key(KeyId=key_id)
+    assert desc["KeyMetadata"]["KeyState"] == "Disabled"
+    kms_client.enable_key(KeyId=key_id)
+    desc = kms_client.describe_key(KeyId=key_id)
+    assert desc["KeyMetadata"]["KeyState"] == "Enabled"
+    kms_client.schedule_key_deletion(KeyId=key_id, PendingWindowInDays=7)
+
+
+def test_kms_schedule_cancel_deletion(kms_client):
+    """ScheduleKeyDeletion / CancelKeyDeletion."""
+    key = kms_client.create_key()
+    key_id = key["KeyMetadata"]["KeyId"]
+    resp = kms_client.schedule_key_deletion(KeyId=key_id, PendingWindowInDays=7)
+    assert resp["KeyState"] == "PendingDeletion"
+    kms_client.cancel_key_deletion(KeyId=key_id)
+    desc = kms_client.describe_key(KeyId=key_id)
+    assert desc["KeyMetadata"]["KeyState"] == "Disabled"
+
+
+def test_kms_terraform_full_flow(kms_client):
+    """Full Terraform aws_kms_key lifecycle."""
+    key = kms_client.create_key(KeySpec="SYMMETRIC_DEFAULT", KeyUsage="ENCRYPT_DECRYPT", Description="RDS key")
+    key_id = key["KeyMetadata"]["KeyId"]
+    kms_client.enable_key_rotation(KeyId=key_id)
+    assert kms_client.get_key_rotation_status(KeyId=key_id)["KeyRotationEnabled"] is True
+    pol = kms_client.get_key_policy(KeyId=key_id, PolicyName="default")
+    assert len(pol["Policy"]) > 0
+    kms_client.tag_resource(KeyId=key_id, Tags=[{"TagKey": "Name", "TagValue": "rds-key"}])
+    assert kms_client.list_resource_tags(KeyId=key_id)["Tags"][0]["TagValue"] == "rds-key"
+    desc = kms_client.describe_key(KeyId=key_id)
+    assert desc["KeyMetadata"]["Description"] == "RDS key"
+    kms_client.schedule_key_deletion(KeyId=key_id, PendingWindowInDays=7)
