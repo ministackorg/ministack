@@ -16,9 +16,12 @@ export default function Layout({ children }: { children: ReactNode }) {
     <div className="flex h-screen bg-background text-foreground">
       {/* Sidebar */}
       <nav aria-label="Main navigation" className="w-56 bg-card border-r flex flex-col">
-        <div className="px-4 py-5">
-          <h1 className="text-lg font-bold tracking-tight">MiniStack</h1>
-          <p className="text-xs text-muted-foreground mt-0.5">Local AWS Emulator</p>
+        <div className="px-4 py-4 flex items-center gap-3">
+          <img src="/_ministack/ui/logo.png" alt="MiniStack" className="h-9 w-auto" />
+          <div>
+            <h1 className="text-lg font-bold tracking-tight leading-tight">MiniStack</h1>
+            <p className="text-xs text-muted-foreground">Local AWS Emulator</p>
+          </div>
         </div>
         <Separator />
         <ul className="flex-1 py-2">
