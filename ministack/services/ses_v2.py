@@ -14,6 +14,7 @@ import os
 import re
 
 from ministack.core.responses import json_response, new_uuid, now_iso
+from ministack.services.ses import _build_mime_message, _smtp_relay
 
 logger = logging.getLogger("ses-v2")
 
@@ -62,6 +63,33 @@ async def handle_request(method, path, headers, body, query_params):
     if sub == "/outbound-emails" and method == "POST":
         msg_id = f"ministack-{new_uuid()}"
         logger.info("SESv2 SendEmail: MessageId=%s", msg_id)
+        # SMTP relay
+        source = data.get("FromEmailAddress", "")
+        dest = data.get("Destination", {})
+        to_addrs = dest.get("ToAddresses", [])
+        cc_addrs = dest.get("CcAddresses", [])
+        bcc_addrs = dest.get("BccAddresses", [])
+        all_addrs = to_addrs + cc_addrs + bcc_addrs
+        if source and all_addrs:
+            content = data.get("Content", {})
+            simple = content.get("Simple", {})
+            raw = content.get("Raw", {})
+            if simple:
+                subj = simple.get("Subject", {}).get("Data", "")
+                body_text = simple.get("Body", {}).get("Text", {}).get("Data", "")
+                body_html = simple.get("Body", {}).get("Html", {}).get("Data", "")
+                mime_str = _build_mime_message(source, to_addrs, cc_addrs, bcc_addrs,
+                                               subj, body_text, body_html, msg_id)
+                _smtp_relay(source, all_addrs, mime_str)
+            elif raw:
+                import base64
+                raw_data = raw.get("Data", "")
+                try:
+                    decoded = base64.b64decode(raw_data).decode('utf-8', errors='replace')
+                except Exception:
+                    decoded = raw_data
+                raw_str = f'Message-ID: <{msg_id}>\r\n' + decoded
+                _smtp_relay(source, all_addrs, raw_str)
         return json_response({"MessageId": msg_id})
 
     # POST /v2/email/identities  (CreateEmailIdentity)

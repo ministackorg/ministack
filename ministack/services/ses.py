@@ -23,14 +23,17 @@ Send statistics aggregated into 15-minute buckets per AWS spec.
 """
 
 import base64
-import os
 import hashlib
 import json
 import logging
+import os
 import re
+import smtplib
 import time
 from datetime import datetime, timezone
 from email import message_from_bytes
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 from email.policy import default as default_policy
 from urllib.parse import parse_qs, unquote
 
@@ -133,6 +136,11 @@ def _send_email(params):
         record["ConfigurationSetName"] = config_set
     _sent_emails.append(record)
     logger.info("SES SendEmail: %s -> %s | %s", source, to_addrs, subject)
+    all_addrs = to_addrs + cc_addrs + bcc_addrs
+    if all_addrs:
+        mime_str = _build_mime_message(source, to_addrs, cc_addrs, bcc_addrs,
+                                       subject, body_text, body_html, msg_id)
+        _smtp_relay(source, all_addrs, mime_str)
     return _xml(200, "SendEmailResponse",
                 f"<SendEmailResult><MessageId>{msg_id}</MessageId></SendEmailResult>")
 
@@ -154,6 +162,22 @@ def _send_raw_email(params):
     }
     _sent_emails.append(record)
     logger.info("SES SendRawEmail: %s", msg_id)
+    # Relay raw message via SMTP
+    actual_source = source or parsed.get("From", "")
+    raw_destinations = _collect_list(params, "Destinations.member")
+    to_from_parsed = [a.strip() for a in parsed.get("To", "").split(",") if a.strip()]
+    relay_addrs = raw_destinations or to_from_parsed
+    if actual_source and relay_addrs:
+        try:
+            raw_bytes = raw_b64.encode('utf-8') if isinstance(raw_b64, str) else raw_b64
+            try:
+                decoded = base64.b64decode(raw_bytes)
+            except Exception:
+                decoded = raw_bytes
+            raw_str = f'Message-ID: <{msg_id}>\r\n' + decoded.decode('utf-8', errors='replace')
+            _smtp_relay(actual_source, relay_addrs, raw_str)
+        except Exception:
+            logger.warning('SMTP relay failed for SendRawEmail: %s', msg_id, exc_info=True)
     return _xml(200, "SendRawEmailResponse",
                 f"<SendRawEmailResult><MessageId>{msg_id}</MessageId></SendRawEmailResult>")
 
@@ -192,6 +216,13 @@ def _send_templated_email(params):
         record["ConfigurationSetName"] = config_set
     _sent_emails.append(record)
     logger.info("SES SendTemplatedEmail: %s -> %s | template=%s", source, to_addrs, template_name)
+    all_addrs = to_addrs + cc_addrs + bcc_addrs
+    if all_addrs:
+        mime_str = _build_mime_message(source, to_addrs, cc_addrs, bcc_addrs,
+                                       rendered.get("Subject", ""),
+                                       rendered.get("Text", ""),
+                                       rendered.get("Html", ""), msg_id)
+        _smtp_relay(source, all_addrs, mime_str)
     return _xml(200, "SendTemplatedEmailResponse",
                 f"<SendTemplatedEmailResult><MessageId>{msg_id}</MessageId></SendTemplatedEmailResult>")
 
@@ -234,6 +265,12 @@ def _send_bulk_templated_email(params):
         if config_set:
             record["ConfigurationSetName"] = config_set
         _sent_emails.append(record)
+        if dest["To"]:
+            mime_str = _build_mime_message(source, dest["To"], [], [],
+                                           rendered.get("Subject", ""),
+                                           rendered.get("Text", ""),
+                                           rendered.get("Html", ""), msg_id)
+            _smtp_relay(source, dest["To"], mime_str)
         statuses.append(
             f"<member><Status>Success</Status>"
             f"<MessageId>{msg_id}</MessageId></member>")
@@ -908,6 +945,56 @@ def _render_template(template, template_data_json):
             text = text.replace("{{" + key + "}}", str(val))
         result[out_key] = text
     return result
+
+
+def _parse_smtp_host():
+    """Parse SMTP_HOST env var. Returns (host, port) or None if not set."""
+    val = os.environ.get('SMTP_HOST')
+    if not val:
+        return None
+    if ':' in val:
+        host, port_str = val.rsplit(':', 1)
+        try:
+            return host, int(port_str)
+        except ValueError:
+            return val, 25
+    return val, 25
+
+
+def _build_mime_message(source, to_addrs, cc_addrs, bcc_addrs,
+                        subject, body_text, body_html, message_id):
+    """Build a MIME message string for SMTP relay."""
+    if body_text and body_html:
+        msg = MIMEMultipart('alternative')
+        msg.attach(MIMEText(body_text, 'plain', 'utf-8'))
+        msg.attach(MIMEText(body_html, 'html', 'utf-8'))
+    elif body_html:
+        msg = MIMEText(body_html, 'html', 'utf-8')
+    else:
+        msg = MIMEText(body_text or '', 'plain', 'utf-8')
+    msg['Message-ID'] = f'<{message_id}>'
+    msg['Subject'] = subject or ''
+    msg['From'] = source
+    if to_addrs:
+        msg['To'] = ', '.join(to_addrs)
+    if cc_addrs:
+        msg['Cc'] = ', '.join(cc_addrs)
+    return msg.as_string()
+
+
+def _smtp_relay(source, to_addrs, message_str):
+    """Relay email via external SMTP if SMTP_HOST is set. Best-effort."""
+    endpoint = _parse_smtp_host()
+    if not endpoint:
+        return
+    host, port = endpoint
+    try:
+        with smtplib.SMTP(host, port) as conn:
+            conn.sendmail(source, to_addrs, message_str)
+        logger.info('SMTP relay: %s -> %s via %s:%d', source, to_addrs, host, port)
+    except Exception:
+        logger.warning('SMTP relay failed: %s -> %s via %s:%d',
+                       source, to_addrs, host, port, exc_info=True)
 
 
 def _parse_raw_mime(raw_b64):
