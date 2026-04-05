@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react'
-import { fetchS3Buckets, fetchS3Objects, fetchS3Object } from '@/lib/api'
+import { fetchS3Buckets, fetchS3Objects, fetchS3Object, getS3DownloadUrl } from '@/lib/api'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -26,6 +26,7 @@ import {
   Lock,
   Tag,
   Shield,
+  Download,
 } from 'lucide-react'
 
 interface S3Bucket {
@@ -291,17 +292,18 @@ export function S3Browser() {
             <Table>
               <TableHeader>
                 <TableRow>
-                  <TableHead className="w-[50%]">Name</TableHead>
+                  <TableHead className="w-[45%]">Name</TableHead>
                   <TableHead>Type</TableHead>
                   <TableHead>Size</TableHead>
                   <TableHead>Last Modified</TableHead>
+                  <TableHead className="w-[50px]" />
                 </TableRow>
               </TableHeader>
               <TableBody>
                 {/* Back navigation */}
                 {prefix && (
                   <TableRow className="cursor-pointer hover:bg-accent/50" onClick={navigateUp}>
-                    <TableCell className="text-xs" colSpan={4}>
+                    <TableCell className="text-xs" colSpan={5}>
                       <div className="flex items-center gap-2 text-muted-foreground">
                         <ArrowLeft className="h-3.5 w-3.5" />
                         <span>..</span>
@@ -328,6 +330,7 @@ export function S3Browser() {
                       <TableCell className="text-xs text-muted-foreground">Folder</TableCell>
                       <TableCell className="text-xs text-muted-foreground">—</TableCell>
                       <TableCell className="text-xs text-muted-foreground">—</TableCell>
+                      <TableCell />
                     </TableRow>
                   )
                 })}
@@ -350,6 +353,22 @@ export function S3Browser() {
                       <TableCell className="text-xs text-muted-foreground">{file.content_type}</TableCell>
                       <TableCell className="text-xs text-muted-foreground">{formatBytes(file.size)}</TableCell>
                       <TableCell className="text-xs text-muted-foreground">{formatDate(file.last_modified)}</TableCell>
+                      <TableCell>
+                        <Tooltip>
+                          <TooltipTrigger asChild>
+                            <a
+                              href={getS3DownloadUrl(selectedBucket, file.key)}
+                              download
+                              onClick={(e) => e.stopPropagation()}
+                              className="inline-flex items-center justify-center h-7 w-7 rounded-md hover:bg-accent transition-colors"
+                              aria-label={`Download ${file.name}`}
+                            >
+                              <Download className="h-3.5 w-3.5 text-muted-foreground" />
+                            </a>
+                          </TooltipTrigger>
+                          <TooltipContent>Download</TooltipContent>
+                        </Tooltip>
+                      </TableCell>
                     </TableRow>
                   )
                 })}
@@ -374,6 +393,13 @@ export function S3Browser() {
                 <SheetTitle className="break-all text-base">{objectDetail.key.split('/').pop()}</SheetTitle>
                 <SheetDescription className="break-all">{objectDetail.key}</SheetDescription>
               </SheetHeader>
+
+              <Button variant="outline" size="sm" className="w-full mt-2" asChild>
+                <a href={getS3DownloadUrl(objectDetail.bucket, objectDetail.key)} download>
+                  <Download className="h-4 w-4 mr-2" />
+                  Download ({formatBytes(objectDetail.size)})
+                </a>
+              </Button>
 
               <div className="space-y-4 mt-4">
                 {/* Properties */}

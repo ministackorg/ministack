@@ -47,5 +47,9 @@ export async function fetchS3Object(bucket: string, key: string) {
   return res.json()
 }
 
+export function getS3DownloadUrl(bucket: string, key: string): string {
+  return `${API_BASE}/s3/buckets/${encodeURIComponent(bucket)}/objects/${key}?download=1`
+}
+
 export const SSE_REQUESTS_URL = `${API_BASE}/requests/stream`
 export const SSE_LOGS_URL = `${API_BASE}/logs/stream`
