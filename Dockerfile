@@ -1,13 +1,3 @@
-# Stage 1: Build UI dashboard
-# This stage runs but its output is only used if ministack/ui/dist/ wasn't pre-built.
-FROM node:20-alpine AS ui-build
-WORKDIR /app/ui
-COPY ui/package*.json ./
-RUN npm ci
-COPY ui/ ./
-RUN npm run build
-
-# Stage 2: Python application
 FROM python:3.12-alpine
 
 LABEL maintainer="MiniStack" \
@@ -28,11 +18,8 @@ RUN pip install --no-cache-dir --upgrade pip && \
     "pyyaml>=6.0" \
     "cryptography>=41.0"
 
-# Copy application code (includes pre-built ministack/ui/dist/ if committed)
+# Copy application code (includes pre-built ministack/ui/dist/)
 COPY ministack/ ministack/
-
-# If dist/ wasn't included (e.g. clean checkout without pre-built files), use the node build
-COPY --from=ui-build /app/ministack/ui/dist ministack/ui/dist/
 
 RUN addgroup -S ministack && adduser -S ministack -G ministack
 RUN mkdir -p /tmp/ministack-data/s3 && chown -R ministack:ministack /tmp/ministack-data
