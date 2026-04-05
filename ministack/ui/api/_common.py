@@ -82,6 +82,22 @@ def safe_serialize(obj):
     return str(obj)
 
 
+async def binary_response(send, body: bytes, content_type: str, filename: str):
+    """Send a binary file download response."""
+    disp = f'attachment; filename="{filename}"'.encode()
+    await send({
+        "type": "http.response.start",
+        "status": 200,
+        "headers": [
+            (b"content-type", content_type.encode()),
+            (b"content-length", str(len(body)).encode()),
+            (b"content-disposition", disp),
+            (b"access-control-allow-origin", b"*"),
+        ],
+    })
+    await send({"type": "http.response.body", "body": body})
+
+
 def get_query_param(query_params: dict, name: str, default: str = "") -> str:
     """Extract a single query parameter value, handling list/string formats."""
     val = query_params.get(name, default)

@@ -7,7 +7,7 @@ Routes:
   GET /s3/buckets/{name}/objects/{key}         — single object metadata (no body)
 """
 
-from ministack.ui.api._common import get_query_param, json_response
+from ministack.ui.api._common import binary_response, get_query_param, json_response
 
 
 async def handle(rel_path: str, query_params: dict, send):
@@ -52,13 +52,24 @@ async def handle(rel_path: str, query_params: dict, send):
     bkt = buckets[bucket_name]
     objects = bkt.get("objects", {})
 
-    # GET /s3/buckets/{name}/objects/{key...} — single object metadata
+    # GET /s3/buckets/{name}/objects/{key...} — single object metadata or download
     if len(parts) >= 3 and parts[2] == "objects" and len(parts) > 3:
         object_key = "/".join(parts[3:])
         if object_key not in objects:
             await json_response(send, {"error": f"Object not found: {object_key}"}, status=404)
             return
         obj = objects[object_key]
+
+        # ?download=1 — serve the raw object body as a file download
+        if get_query_param(query_params, "download") == "1":
+            body = obj.get("body", b"")
+            if isinstance(body, str):
+                body = body.encode("utf-8")
+            content_type = obj.get("content_type", "application/octet-stream")
+            filename = object_key.rsplit("/", 1)[-1] or object_key
+            await binary_response(send, body, content_type, filename)
+            return
+
         object_tags = getattr(s3, "_object_tags", {})
         await json_response(send, {
             "bucket": bucket_name,
