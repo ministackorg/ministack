@@ -11,6 +11,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 - **CFN `AWS::ECR::Repository`** — CDK bootstrap (`cdk bootstrap`) now works. Reported by @youngkwangk (#152)
+- **SecretsManager `UpdateSecretVersionStage`** — move staging labels between secret versions. Enables rotation flows with AWSCURRENT/AWSPREVIOUS rollover. Contributed by @jayjanssen (#155)
 
 ---
 
