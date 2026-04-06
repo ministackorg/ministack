@@ -19383,3 +19383,267 @@ def test_persist_stepfunctions_running_marked_failed():
     assert restored_done["output"] == '{"result": "ok"}'
     _sfn._executions.pop(run_arn)
     _sfn._executions.pop(done_arn)
+
+
+# ========== Cross-service integration tests (issue #130) ==========
+
+
+def test_s3_event_to_sqs(s3, sqs):
+    """S3 notification delivers event to SQS on object creation and deletion."""
+    bucket = "intg-s3evt-sqs"
+    queue_name = "intg-s3evt-sqs-q"
+
+    s3.create_bucket(Bucket=bucket)
+    queue_url = sqs.create_queue(QueueName=queue_name)["QueueUrl"]
+    queue_arn = sqs.get_queue_attributes(
+        QueueUrl=queue_url, AttributeNames=["QueueArn"]
+    )["Attributes"]["QueueArn"]
+
+    s3.put_bucket_notification_configuration(
+        Bucket=bucket,
+        NotificationConfiguration={
+            "QueueConfigurations": [
+                {
+                    "QueueArn": queue_arn,
+                    "Events": ["s3:ObjectCreated:*", "s3:ObjectRemoved:*"],
+                }
+            ],
+        },
+    )
+
+    # Put an object — should fire ObjectCreated event
+    s3.put_object(Bucket=bucket, Key="hello.txt", Body=b"world")
+    time.sleep(1)
+    msgs = sqs.receive_message(QueueUrl=queue_url, MaxNumberOfMessages=10, WaitTimeSeconds=2)
+    assert "Messages" in msgs and len(msgs["Messages"]) >= 1
+    body = json.loads(msgs["Messages"][0]["Body"])
+    assert body["Records"][0]["eventSource"] == "aws:s3"
+    assert body["Records"][0]["eventName"].startswith("ObjectCreated:")
+    assert body["Records"][0]["s3"]["bucket"]["name"] == bucket
+    assert body["Records"][0]["s3"]["object"]["key"] == "hello.txt"
+
+    # Delete receipts so queue is clean
+    for m in msgs["Messages"]:
+        sqs.delete_message(QueueUrl=queue_url, ReceiptHandle=m["ReceiptHandle"])
+
+    # Delete the object — should fire ObjectRemoved event
+    s3.delete_object(Bucket=bucket, Key="hello.txt")
+    time.sleep(1)
+    msgs = sqs.receive_message(QueueUrl=queue_url, MaxNumberOfMessages=10, WaitTimeSeconds=2)
+    assert "Messages" in msgs and len(msgs["Messages"]) >= 1
+    del_body = json.loads(msgs["Messages"][0]["Body"])
+    assert del_body["Records"][0]["eventName"].startswith("ObjectRemoved:")
+
+
+def test_sns_to_sqs_fanout(sns, sqs):
+    """SNS publish fans out to multiple SQS subscribers."""
+    topic_arn = sns.create_topic(Name="intg-fanout-topic")["TopicArn"]
+
+    q1_url = sqs.create_queue(QueueName="intg-fanout-q1")["QueueUrl"]
+    q2_url = sqs.create_queue(QueueName="intg-fanout-q2")["QueueUrl"]
+    q1_arn = sqs.get_queue_attributes(QueueUrl=q1_url, AttributeNames=["QueueArn"])["Attributes"]["QueueArn"]
+    q2_arn = sqs.get_queue_attributes(QueueUrl=q2_url, AttributeNames=["QueueArn"])["Attributes"]["QueueArn"]
+
+    sub1 = sns.subscribe(TopicArn=topic_arn, Protocol="sqs", Endpoint=q1_arn)
+    sub2 = sns.subscribe(TopicArn=topic_arn, Protocol="sqs", Endpoint=q2_arn)
+    assert sub1["SubscriptionArn"] != "PendingConfirmation"
+    assert sub2["SubscriptionArn"] != "PendingConfirmation"
+
+    sns.publish(TopicArn=topic_arn, Message="fanout-test-msg", Subject="IntgTest")
+
+    # Both queues should receive the message
+    for q_url, q_name in [(q1_url, "q1"), (q2_url, "q2")]:
+        msgs = sqs.receive_message(QueueUrl=q_url, MaxNumberOfMessages=1, WaitTimeSeconds=2)
+        assert len(msgs.get("Messages", [])) == 1, f"{q_name} should have received the message"
+        body = json.loads(msgs["Messages"][0]["Body"])
+        assert body["Message"] == "fanout-test-msg"
+        assert body["TopicArn"] == topic_arn
+        assert body["Subject"] == "IntgTest"
+        assert body["Type"] == "Notification"
+
+
+def test_dynamodb_stream_to_lambda(lam, ddb):
+    """DynamoDB stream records are delivered to Lambda via event source mapping."""
+    table_name = "intg-ddbstream-tbl"
+    fn_name = "intg-ddbstream-fn"
+
+    ddb.create_table(
+        TableName=table_name,
+        KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+        AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "S"}],
+        BillingMode="PAY_PER_REQUEST",
+        StreamSpecification={"StreamEnabled": True, "StreamViewType": "NEW_AND_OLD_IMAGES"},
+    )
+    stream_arn = ddb.describe_table(TableName=table_name)["Table"]["LatestStreamArn"]
+    assert stream_arn is not None
+
+    code = (
+        "import json\n"
+        "def handler(event, context):\n"
+        "    records = event.get('Records', [])\n"
+        "    return {'processed': len(records)}\n"
+    )
+    lam.create_function(
+        FunctionName=fn_name,
+        Runtime="python3.11",
+        Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _make_zip(code)},
+    )
+
+    esm = lam.create_event_source_mapping(
+        FunctionName=fn_name,
+        EventSourceArn=stream_arn,
+        StartingPosition="TRIM_HORIZON",
+        BatchSize=10,
+    )
+    assert esm["EventSourceArn"] == stream_arn
+    assert esm["FunctionArn"].endswith(fn_name)
+    assert esm["State"] in ("Creating", "Enabled")
+
+    # Write items to trigger stream records
+    ddb.put_item(TableName=table_name, Item={"pk": {"S": "a1"}, "data": {"S": "hello"}})
+    ddb.put_item(TableName=table_name, Item={"pk": {"S": "a2"}, "data": {"S": "world"}})
+    ddb.delete_item(TableName=table_name, Key={"pk": {"S": "a1"}})
+
+    # Allow background poller to process
+    time.sleep(3)
+
+    # Verify the ESM is still active
+    esm_resp = lam.get_event_source_mapping(UUID=esm["UUID"])
+    assert esm_resp["EventSourceArn"] == stream_arn
+
+    # Verify DynamoDB state is correct after stream operations
+    scan = ddb.scan(TableName=table_name)
+    pks = {item["pk"]["S"] for item in scan["Items"]}
+    assert "a2" in pks
+    assert "a1" not in pks
+
+    # Cleanup ESM
+    lam.delete_event_source_mapping(UUID=esm["UUID"])
+
+
+def test_sqs_event_source_mapping_to_lambda(lam, sqs):
+    """SQS messages trigger Lambda invocation via event source mapping."""
+    queue_name = "intg-sqsesm-q"
+    fn_name = "intg-sqsesm-fn"
+
+    queue_url = sqs.create_queue(QueueName=queue_name)["QueueUrl"]
+    queue_arn = sqs.get_queue_attributes(
+        QueueUrl=queue_url, AttributeNames=["QueueArn"]
+    )["Attributes"]["QueueArn"]
+
+    code = (
+        "import json\n"
+        "def handler(event, context):\n"
+        "    return {'received': len(event.get('Records', []))}\n"
+    )
+    lam.create_function(
+        FunctionName=fn_name,
+        Runtime="python3.11",
+        Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _make_zip(code)},
+    )
+
+    esm = lam.create_event_source_mapping(
+        FunctionName=fn_name,
+        EventSourceArn=queue_arn,
+        BatchSize=5,
+    )
+    assert esm["EventSourceArn"] == queue_arn
+    assert esm["FunctionArn"].endswith(fn_name)
+
+    # Send messages to SQS
+    for i in range(3):
+        sqs.send_message(QueueUrl=queue_url, MessageBody=json.dumps({"idx": i}))
+
+    # Allow the ESM poller to pick up and process
+    time.sleep(3)
+
+    # Messages should have been consumed by the ESM (queue should be empty or near-empty)
+    msgs = sqs.receive_message(QueueUrl=queue_url, MaxNumberOfMessages=10, WaitTimeSeconds=1)
+    remaining = len(msgs.get("Messages", []))
+    assert remaining == 0, f"ESM should have consumed all messages, but {remaining} remain"
+
+    # Cleanup
+    lam.delete_event_source_mapping(UUID=esm["UUID"])
+
+
+def test_cfn_stack_with_s3_lambda_dynamodb(cfn, s3, lam, ddb):
+    """CloudFormation stack provisions S3 bucket, Lambda function, and DynamoDB table together."""
+    stack_name = "intg-cfn-full-stack"
+    bucket_name = "intg-cfn-full-bkt"
+    fn_name = "intg-cfn-full-fn"
+    table_name = "intg-cfn-full-tbl"
+
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "MyBucket": {
+                "Type": "AWS::S3::Bucket",
+                "Properties": {"BucketName": bucket_name},
+            },
+            "MyTable": {
+                "Type": "AWS::DynamoDB::Table",
+                "Properties": {
+                    "TableName": table_name,
+                    "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+                    "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+                    "BillingMode": "PAY_PER_REQUEST",
+                },
+            },
+            "MyFunction": {
+                "Type": "AWS::Lambda::Function",
+                "Properties": {
+                    "FunctionName": fn_name,
+                    "Runtime": "python3.11",
+                    "Handler": "index.handler",
+                    "Role": "arn:aws:iam::000000000000:role/cfn-role",
+                    "Code": {
+                        "ZipFile": (
+                            "import json\n"
+                            "def handler(event, context):\n"
+                            "    return {'statusCode': 200, 'body': json.dumps(event)}\n"
+                        ),
+                    },
+                },
+            },
+        },
+    }
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(template))
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "CREATE_COMPLETE"
+
+    # Verify S3 bucket was created
+    buckets = [b["Name"] for b in s3.list_buckets()["Buckets"]]
+    assert bucket_name in buckets
+
+    # Verify DynamoDB table was created and is functional
+    tables = ddb.list_tables()["TableNames"]
+    assert table_name in tables
+    ddb.put_item(TableName=table_name, Item={"pk": {"S": "cfn-test"}, "val": {"S": "works"}})
+    item = ddb.get_item(TableName=table_name, Key={"pk": {"S": "cfn-test"}})
+    assert item["Item"]["val"]["S"] == "works"
+
+    # Verify Lambda function was created and is invocable
+    funcs = [f["FunctionName"] for f in lam.list_functions()["Functions"]]
+    assert fn_name in funcs
+    resp = lam.invoke(FunctionName=fn_name, Payload=json.dumps({"test": "cfn"}))
+    payload = json.loads(resp["Payload"].read())
+    assert payload["statusCode"] == 200
+
+    # Verify stack describes all 3 resources
+    resources = cfn.describe_stack_resources(StackName=stack_name)["StackResources"]
+    resource_types = {r["ResourceType"] for r in resources}
+    assert "AWS::S3::Bucket" in resource_types
+    assert "AWS::DynamoDB::Table" in resource_types
+    assert "AWS::Lambda::Function" in resource_types
+
+    # Delete stack and verify cleanup
+    cfn.delete_stack(StackName=stack_name)
+    time.sleep(2)
+    stacks = cfn.describe_stacks()["Stacks"]
+    active = [st for st in stacks if st["StackName"] == stack_name and "DELETE" not in st["StackStatus"]]
+    assert len(active) == 0
