@@ -8,11 +8,13 @@ Supports: SendEmail, CreateEmailIdentity, GetEmailIdentity, DeleteEmailIdentity,
           TagResource, UntagResource, ListTagsForResource.
 """
 
+import copy
 import json
 import logging
 import os
 import re
 
+from ministack.core.persistence import PERSIST_STATE, load_state
 from ministack.core.responses import json_response, new_uuid, now_iso
 from ministack.services.ses import _build_mime_message, _smtp_relay
 
@@ -24,6 +26,25 @@ REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 _identities: dict = {}        # identity -> dict
 _config_sets: dict = {}       # name -> dict
 _ses_tags: dict = {}          # resource_arn -> [tags]
+
+
+def get_state() -> dict:
+    return copy.deepcopy({
+        "_identities": _identities,
+        "_config_sets": _config_sets,
+        "_ses_tags": _ses_tags,
+    })
+
+
+def restore_state(data: dict):
+    _identities.update(data.get("_identities", {}))
+    _config_sets.update(data.get("_config_sets", {}))
+    _ses_tags.update(data.get("_ses_tags", {}))
+
+
+_restored = load_state("ses_v2")
+if _restored:
+    restore_state(_restored)
 
 
 def _json_err(code, message, status=400):

@@ -7,10 +7,13 @@ Supports: RequestCertificate, DescribeCertificate, ListCertificates,
           UpdateCertificateOptions, RenewCertificate, ResendValidationEmail.
 """
 
+import copy
 import json
 import os
 import logging
 import time
+
+from ministack.core.persistence import PERSIST_STATE, load_state
 
 from ministack.core.responses import error_response_json, json_response, new_uuid, now_iso
 
@@ -20,6 +23,19 @@ ACCOUNT_ID = os.environ.get("MINISTACK_ACCOUNT_ID", "000000000000")
 REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 
 _certificates: dict = {}  # arn -> certificate dict
+
+
+def get_state():
+    return copy.deepcopy({"_certificates": _certificates})
+
+
+def restore_state(data):
+    _certificates.update(data.get("_certificates", {}))
+
+
+_restored = load_state("acm")
+if _restored:
+    restore_state(_restored)
 
 
 def _future_iso(seconds):

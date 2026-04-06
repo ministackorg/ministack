@@ -8,6 +8,7 @@ Job execution runs Python scripts via subprocess in background threads.
 Crawlers transition through RUNNING state with a configurable timer.
 """
 
+import copy
 import fnmatch
 import json
 import logging
@@ -17,6 +18,7 @@ import tempfile
 import threading
 import time
 
+from ministack.core.persistence import PERSIST_STATE, load_state
 from ministack.core.responses import error_response_json, json_response, new_uuid
 
 logger = logging.getLogger("glue")
@@ -40,6 +42,38 @@ _classifiers: dict = {}
 _triggers: dict = {}     # trigger_name -> trigger dict
 _workflows: dict = {}    # workflow_name -> workflow dict
 _workflow_runs: dict = {} # workflow_name -> [run, ...]
+
+_ALL_STATE = {
+    "databases": _databases,
+    "tables": _tables,
+    "partitions": _partitions,
+    "partition_indexes": _partition_indexes,
+    "connections": _connections,
+    "crawlers": _crawlers,
+    "jobs": _jobs,
+    "job_runs": _job_runs,
+    "tags": _tags,
+    "security_configs": _security_configs,
+    "classifiers": _classifiers,
+    "triggers": _triggers,
+    "workflows": _workflows,
+    "workflow_runs": _workflow_runs,
+}
+
+
+def get_state():
+    return copy.deepcopy(_ALL_STATE)
+
+
+def restore_state(data):
+    for key, store in _ALL_STATE.items():
+        store.clear()
+        store.update(data.get(key, {}))
+
+
+_restored = load_state("glue")
+if _restored:
+    restore_state(_restored)
 
 
 def _arn(resource_type, name):

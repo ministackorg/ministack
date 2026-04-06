@@ -9,10 +9,12 @@ Supports: CreateWebACL, GetWebACL, UpdateWebACL, DeleteWebACL, ListWebACLs,
           CheckCapacity, DescribeManagedRuleGroup.
 """
 
+import copy
 import json
 import os
 import logging
 
+from ministack.core.persistence import PERSIST_STATE, load_state
 from ministack.core.responses import error_response_json, json_response, new_uuid, now_iso
 
 logger = logging.getLogger("wafv2")
@@ -25,6 +27,29 @@ _ip_sets: dict = {}        # id -> ipset
 _rule_groups: dict = {}    # id -> rulegroup
 _associations: dict = {}   # resource_arn -> webacl_arn
 _waf_tags: dict = {}       # resource_arn -> [tags]
+
+
+def get_state():
+    return copy.deepcopy({
+        "_web_acls": _web_acls,
+        "_ip_sets": _ip_sets,
+        "_rule_groups": _rule_groups,
+        "_associations": _associations,
+        "_waf_tags": _waf_tags,
+    })
+
+
+def restore_state(data):
+    _web_acls.update(data.get("_web_acls", {}))
+    _ip_sets.update(data.get("_ip_sets", {}))
+    _rule_groups.update(data.get("_rule_groups", {}))
+    _associations.update(data.get("_associations", {}))
+    _waf_tags.update(data.get("_waf_tags", {}))
+
+
+_restored = load_state("waf")
+if _restored:
+    restore_state(_restored)
 
 
 def _waf_err(code, message):

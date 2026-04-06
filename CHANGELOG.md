@@ -13,6 +13,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 - **AppSync persistence crash on restart** — `restore_state()` called before it was defined in the file, causing `NameError` when `PERSIST_STATE=1` and restarting. Reported by @samiuoi (#66)
 - **Cognito `AdminSetUserPassword` with `Permanent=false`** — now correctly sets `UserStatus` to `FORCE_CHANGE_PASSWORD`. Previously the password was updated but the status wasn't changed.
 
+### Community
+- **README: Community Integrations section** — [StackPort](https://github.com/DaviReisVieira/stackport) visual dashboard by @DaviReisVieira, [Aspire Hosting](https://github.com/McDoit/aspire-hosting-ministack) .NET integration by @McDoit
+
 ### Tests
 - 10 new tests: KMS (list policies, rotation period), ElastiCache (parameter groups, snapshots, tags), Lambda (Image CRUD, update ImageUri, provided runtime), SecretsManager (rotate secret), Firehose (S3 destination writes)
 - 1011 tests total

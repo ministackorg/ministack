@@ -23,6 +23,7 @@ Send statistics aggregated into 15-minute buckets per AWS spec.
 """
 
 import base64
+import copy
 import hashlib
 import json
 import logging
@@ -37,6 +38,7 @@ from email.mime.text import MIMEText
 from email.policy import default as default_policy
 from urllib.parse import parse_qs, unquote
 
+from ministack.core.persistence import PERSIST_STATE, load_state
 from ministack.core.responses import new_uuid
 
 logger = logging.getLogger("ses")
@@ -48,6 +50,29 @@ _identities: dict = {}
 _sent_emails: list = []
 _templates: dict = {}
 _configuration_sets: dict = {}
+
+
+# ---------------------------------------------------------------------------
+# Persistence helpers
+# ---------------------------------------------------------------------------
+
+def get_state() -> dict:
+    return copy.deepcopy({
+        "_identities": _identities,
+        "_templates": _templates,
+        "_configuration_sets": _configuration_sets,
+    })
+
+
+def restore_state(data: dict):
+    _identities.update(data.get("_identities", {}))
+    _templates.update(data.get("_templates", {}))
+    _configuration_sets.update(data.get("_configuration_sets", {}))
+
+
+_restored = load_state("ses")
+if _restored:
+    restore_state(_restored)
 
 
 # ---------------------------------------------------------------------------

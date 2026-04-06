@@ -591,6 +591,17 @@ async def _handle_lifespan(scope, receive, send):
                     "elasticache": elasticache.get_state,
                     "appsync": appsync.get_state,
                     "stepfunctions": stepfunctions.get_state,
+                    "alb": alb.get_state,
+                    "glue": glue.get_state,
+                    "efs": efs.get_state,
+                    "waf": waf.get_state,
+                    "athena": athena.get_state,
+                    "emr": emr.get_state,
+                    "cloudfront": cloudfront.get_state,
+                    "acm": acm.get_state,
+                    "firehose": firehose.get_state,
+                    "ses": ses.get_state,
+                    "ses_v2": ses_v2.get_state,
                 })
             await send({"type": "lifespan.shutdown.complete"})
             return

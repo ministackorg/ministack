@@ -15,6 +15,7 @@ in-memory (accessible for testing via PutRecord/PutRecordBatch round-trip).
 """
 
 import asyncio
+import copy
 import os
 import base64
 import json
@@ -22,6 +23,7 @@ import logging
 import threading
 import time
 
+from ministack.core.persistence import PERSIST_STATE, load_state
 from ministack.core.responses import (
     error_response_json,
     json_response,
@@ -46,6 +48,21 @@ def reset():
     with _lock:
         _streams = {}
         _dest_counter = 0
+
+
+def get_state() -> dict:
+    return copy.deepcopy({"_streams": _streams, "_dest_counter": _dest_counter})
+
+
+def restore_state(data: dict):
+    global _streams, _dest_counter
+    _streams.update(data.get("_streams", {}))
+    _dest_counter = data.get("_dest_counter", _dest_counter)
+
+
+_restored = load_state("firehose")
+if _restored:
+    restore_state(_restored)
 
 
 # ─── helpers ─────────────────────────────────────────────────────────────────

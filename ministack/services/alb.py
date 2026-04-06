@@ -16,6 +16,7 @@ Supports:
 """
 
 import base64
+import copy
 import fnmatch
 import json
 import logging
@@ -25,6 +26,7 @@ import string
 import time
 from urllib.parse import parse_qs
 
+from ministack.core.persistence import PERSIST_STATE, load_state
 from ministack.core.responses import new_uuid
 
 logger = logging.getLogger("alb")
@@ -44,6 +46,35 @@ _targets: dict = {}    # tg_arn   -> [target dict]
 _tags: dict = {}       # res_arn  -> [{Key, Value}]
 _lb_attrs: dict = {}   # lb_arn   -> [{Key, Value}]
 _tg_attrs: dict = {}   # tg_arn   -> [{Key, Value}]
+
+
+def get_state():
+    return copy.deepcopy({
+        "_lbs": _lbs,
+        "_tgs": _tgs,
+        "_listeners": _listeners,
+        "_rules": _rules,
+        "_targets": _targets,
+        "_tags": _tags,
+        "_lb_attrs": _lb_attrs,
+        "_tg_attrs": _tg_attrs,
+    })
+
+
+def restore_state(data):
+    _lbs.update(data.get("_lbs", {}))
+    _tgs.update(data.get("_tgs", {}))
+    _listeners.update(data.get("_listeners", {}))
+    _rules.update(data.get("_rules", {}))
+    _targets.update(data.get("_targets", {}))
+    _tags.update(data.get("_tags", {}))
+    _lb_attrs.update(data.get("_lb_attrs", {}))
+    _tg_attrs.update(data.get("_tg_attrs", {}))
+
+
+_restored = load_state("alb")
+if _restored:
+    restore_state(_restored)
 
 # ---------------------------------------------------------------------------
 # Small helpers

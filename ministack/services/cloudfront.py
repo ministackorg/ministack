@@ -9,6 +9,7 @@ Supports:
   Invalidations: CreateInvalidation, ListInvalidations, GetInvalidation
 """
 
+import copy
 import logging
 import os
 import random
@@ -18,6 +19,7 @@ from datetime import datetime, timezone
 from defusedxml.ElementTree import fromstring
 from xml.etree.ElementTree import Element, SubElement, tostring
 
+from ministack.core.persistence import PERSIST_STATE, load_state
 from ministack.core.responses import new_uuid
 
 logger = logging.getLogger("cloudfront")
@@ -44,6 +46,23 @@ _invalidations: dict = {}   # distribution_id -> [invalidation record, ...]
 def reset():
     _distributions.clear()
     _invalidations.clear()
+
+
+def get_state():
+    return copy.deepcopy({
+        "distributions": _distributions,
+        "invalidations": _invalidations,
+    })
+
+
+def restore_state(data):
+    _distributions.update(data.get("distributions", {}))
+    _invalidations.update(data.get("invalidations", {}))
+
+
+_restored = load_state("cloudfront")
+if _restored:
+    restore_state(_restored)
 
 
 # ---------------------------------------------------------------------------

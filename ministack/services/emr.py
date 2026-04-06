@@ -14,6 +14,7 @@ Supports:
   Block Public Access: GetBlockPublicAccessConfiguration, PutBlockPublicAccessConfiguration
 """
 
+import copy
 import json
 import logging
 import os
@@ -21,6 +22,7 @@ import random
 import string
 import time
 
+from ministack.core.persistence import PERSIST_STATE, load_state
 from ministack.core.responses import error_response_json, json_response, new_uuid
 
 logger = logging.getLogger("emr")
@@ -38,6 +40,25 @@ _block_public_access: dict = {
     "BlockPublicSecurityGroupRules": False,
     "PermittedPublicSecurityGroupRuleRanges": [],
 }
+
+
+def get_state():
+    return copy.deepcopy({
+        "_clusters": _clusters,
+        "_steps": _steps,
+        "_block_public_access": _block_public_access,
+    })
+
+
+def restore_state(data):
+    _clusters.update(data.get("_clusters", {}))
+    _steps.update(data.get("_steps", {}))
+    _block_public_access.update(data.get("_block_public_access", {}))
+
+
+_restored = load_state("emr")
+if _restored:
+    restore_state(_restored)
 
 # ---------------------------------------------------------------------------
 # ID generators

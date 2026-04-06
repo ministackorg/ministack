@@ -15,6 +15,7 @@ Supports:
   Account:        DescribeAccountPreferences, PutAccountPreferences
 """
 
+import copy
 import json
 import logging
 import os
@@ -22,6 +23,8 @@ import random
 import re
 import string
 import time
+
+from ministack.core.persistence import PERSIST_STATE, load_state
 
 logger = logging.getLogger("efs")
 
@@ -333,6 +336,35 @@ def _find_resource(resource_id):
 
 _lifecycle_configs: dict = {}
 _backup_policies: dict = {}
+
+
+def get_state():
+    return copy.deepcopy({
+        "file_systems": _file_systems,
+        "mount_targets": _mount_targets,
+        "access_points": _access_points,
+        "lifecycle_configs": _lifecycle_configs,
+        "backup_policies": _backup_policies,
+    })
+
+
+def restore_state(data):
+    _file_systems.clear()
+    _file_systems.update(data.get("file_systems", {}))
+    _mount_targets.clear()
+    _mount_targets.update(data.get("mount_targets", {}))
+    _access_points.clear()
+    _access_points.update(data.get("access_points", {}))
+    _lifecycle_configs.clear()
+    _lifecycle_configs.update(data.get("lifecycle_configs", {}))
+    _backup_policies.clear()
+    _backup_policies.update(data.get("backup_policies", {}))
+
+
+_restored = load_state("efs")
+if _restored:
+    restore_state(_restored)
+
 
 def _put_lifecycle_configuration(fs_id, body):
     fs = _file_systems.get(fs_id)

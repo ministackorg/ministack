@@ -13,6 +13,7 @@ Supports: StartQueryExecution, GetQueryExecution, GetQueryResults,
           TagResource, UntagResource, ListTagsForResource.
 """
 
+import copy
 import json
 import logging
 import os
@@ -20,6 +21,7 @@ import re
 import threading
 import time
 
+from ministack.core.persistence import PERSIST_STATE, load_state
 from ministack.core.responses import error_response_json, json_response, new_uuid
 
 logger = logging.getLogger("athena")
@@ -63,6 +65,38 @@ _data_catalogs: dict = {
 }
 _prepared_statements: dict = {}  # "workgroup/name" -> statement dict
 _tags: dict = {}  # arn -> {key: value, ...}
+
+
+def get_state():
+    return copy.deepcopy(
+        {
+            "_executions": _executions,
+            "_workgroups": _workgroups,
+            "_named_queries": _named_queries,
+            "_data_catalogs": _data_catalogs,
+            "_prepared_statements": _prepared_statements,
+            "_tags": _tags,
+        }
+    )
+
+
+def restore_state(data):
+    global _workgroups, _data_catalogs
+    _executions.clear()
+    _executions.update(data.get("_executions", {}))
+    _workgroups = data.get("_workgroups", _workgroups)
+    _named_queries.clear()
+    _named_queries.update(data.get("_named_queries", {}))
+    _data_catalogs = data.get("_data_catalogs", _data_catalogs)
+    _prepared_statements.clear()
+    _prepared_statements.update(data.get("_prepared_statements", {}))
+    _tags.clear()
+    _tags.update(data.get("_tags", {}))
+
+
+_restored = load_state("athena")
+if _restored:
+    restore_state(_restored)
 
 try:
     import duckdb
