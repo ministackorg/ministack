@@ -7,6 +7,21 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [1.1.44] — 2026-04-06
+
+### Added
+- **CFN `AWS::IAM::ManagedPolicy`, `AWS::KMS::Key`, `AWS::KMS::Alias`** — completes full CDK bootstrap support. All 9 resource types in the CDKToolkit stack now work.
+- **Step Functions nested `startExecution.sync`** — parent workflows can now invoke child state machines synchronously via `arn:aws:states:::states:startExecution.sync` and `.sync:2`. Output shape matches AWS (`.sync` = JSON string, `.sync:2` = parsed JSON). Contributed by @jayjanssen (#157)
+
+### Fixed
+- **API Gateway v2 `lastUpdatedDate` returned as ISO8601 string** — Stage and Deployment `lastUpdatedDate` was returning Unix timestamp (number), causing Terraform deserialization failure on `aws_apigatewayv2_stage`. Reported by @hmarcuzzo (#132)
+- **ECS timestamp wire format** — all ECS timestamp fields (`createdAt`, `startedAt`, `stoppedAt`, etc.) now return epoch numbers instead of ISO strings. Fixes SDK deserialization for Go, Java, and other typed SDKs
+
+### Tests
+- 4 new tests: EMR instance fleets, ECS timestamp format, API GW v2 stage timestamps, CDK bootstrap full stack
+
+---
+
 ## [1.1.43] — 2026-04-06
 
 ### Added

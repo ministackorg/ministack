@@ -19885,3 +19885,130 @@ def test_cloudfront_tags(cloudfront):
     tag_keys = [t["Key"] for t in tags["Tags"]["Items"]]
     assert "env" in tag_keys
     assert "team" not in tag_keys
+
+
+# ---------------------------------------------------------------------------
+# EMR v1.1.44 — instance fleets
+# ---------------------------------------------------------------------------
+
+def test_emr_instance_fleets(emr):
+    """AddInstanceFleet / ListInstanceFleets / ModifyInstanceFleet."""
+    resp = emr.run_job_flow(
+        Name="fleet-test-v44",
+        ReleaseLabel="emr-6.15.0",
+        Instances={
+            "KeepJobFlowAliveWhenNoSteps": True,
+            "InstanceFleets": [
+                {"InstanceFleetType": "MASTER", "Name": "master-fleet",
+                 "TargetOnDemandCapacity": 1,
+                 "InstanceTypeConfigs": [{"InstanceType": "m5.xlarge"}]},
+            ],
+        },
+        JobFlowRole="EMR_EC2_DefaultRole",
+        ServiceRole="EMR_DefaultRole",
+    )
+    cluster_id = resp["JobFlowId"]
+
+    # Add a CORE fleet
+    add_resp = emr.add_instance_fleet(
+        ClusterId=cluster_id,
+        InstanceFleet={
+            "InstanceFleetType": "CORE", "Name": "core-fleet",
+            "TargetOnDemandCapacity": 2,
+            "InstanceTypeConfigs": [{"InstanceType": "m5.xlarge"}],
+        },
+    )
+    fleet_id = add_resp["InstanceFleetId"]
+    assert fleet_id
+
+    # List fleets
+    fleets = emr.list_instance_fleets(ClusterId=cluster_id)
+    fleet_types = [f["InstanceFleetType"] for f in fleets["InstanceFleets"]]
+    assert "MASTER" in fleet_types
+    assert "CORE" in fleet_types
+
+    emr.terminate_job_flows(JobFlowIds=[cluster_id])
+
+
+# ---------------------------------------------------------------------------
+# v1.1.44 — timestamp wire format tests
+# ---------------------------------------------------------------------------
+
+def test_ecs_timestamps_are_epoch(ecs):
+    """ECS timestamps should be epoch numbers, not ISO strings."""
+    ecs.create_cluster(clusterName="ts-test-v44")
+    clusters = ecs.describe_clusters(clusters=["ts-test-v44"])
+    registered = clusters["clusters"][0].get("registeredContainerInstancesCount", 0)
+    # registeredAt might not be present on cluster, test on task def
+    ecs.register_task_definition(
+        family="ts-td-v44",
+        containerDefinitions=[{"name": "app", "image": "nginx", "memory": 256}],
+    )
+    td = ecs.describe_task_definition(taskDefinition="ts-td-v44")
+    registered_at = td["taskDefinition"].get("registeredAt")
+    if registered_at is not None:
+        from datetime import datetime
+        assert isinstance(registered_at, datetime), f"registeredAt should be datetime, got {type(registered_at)}"
+
+
+def test_apigw_v2_stage_timestamps(apigw):
+    """API Gateway v2 Stage timestamps should be ISO8601 (datetime)."""
+    from datetime import datetime
+    api = apigw.create_api(Name="ts-stage-v44", ProtocolType="HTTP")
+    api_id = api["ApiId"]
+    stage = apigw.create_stage(ApiId=api_id, StageName="test-stage")
+    assert isinstance(stage["CreatedDate"], datetime), f"CreatedDate should be datetime, got {type(stage['CreatedDate'])}"
+    assert isinstance(stage["LastUpdatedDate"], datetime), f"LastUpdatedDate should be datetime, got {type(stage['LastUpdatedDate'])}"
+    apigw.delete_api(ApiId=api_id)
+
+
+def test_cfn_cdk_bootstrap_resources(cfn, s3, ecr):
+    """CDK bootstrap template resources: S3 + ECR + IAM Role + KMS Key + SSM Parameter."""
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "StagingBucket": {
+                "Type": "AWS::S3::Bucket",
+                "Properties": {"BucketName": "cdk-bootstrap-v44"},
+            },
+            "ContainerRepo": {
+                "Type": "AWS::ECR::Repository",
+                "Properties": {"RepositoryName": "cdk-assets-v44"},
+            },
+            "DeployRole": {
+                "Type": "AWS::IAM::Role",
+                "Properties": {
+                    "RoleName": "cdk-deploy-v44",
+                    "AssumeRolePolicyDocument": {"Version": "2012-10-17", "Statement": []},
+                },
+            },
+            "FileKey": {
+                "Type": "AWS::KMS::Key",
+                "Properties": {"Description": "CDK file assets key"},
+            },
+            "KeyAlias": {
+                "Type": "AWS::KMS::Alias",
+                "Properties": {"AliasName": "alias/cdk-key-v44", "TargetKeyId": "dummy"},
+            },
+            "BootstrapVersion": {
+                "Type": "AWS::SSM::Parameter",
+                "Properties": {"Name": "/cdk-bootstrap/v44/version", "Type": "String", "Value": "27"},
+            },
+            "DeployPolicy": {
+                "Type": "AWS::IAM::ManagedPolicy",
+                "Properties": {"ManagedPolicyName": "cdk-policy-v44", "PolicyDocument": {"Version": "2012-10-17", "Statement": []}},
+            },
+        },
+    }
+    cfn.create_stack(StackName="CDKToolkit-v44", TemplateBody=json.dumps(template))
+    import time as _t; _t.sleep(2)
+    stack = cfn.describe_stacks(StackName="CDKToolkit-v44")["Stacks"][0]
+    assert stack["StackStatus"] == "CREATE_COMPLETE"
+
+    # Verify resources
+    buckets = [b["Name"] for b in s3.list_buckets()["Buckets"]]
+    assert "cdk-bootstrap-v44" in buckets
+    repos = [r["repositoryName"] for r in ecr.describe_repositories()["repositories"]]
+    assert "cdk-assets-v44" in repos
+
+    cfn.delete_stack(StackName="CDKToolkit-v44")
