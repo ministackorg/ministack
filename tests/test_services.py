@@ -19110,3 +19110,155 @@ def test_kms_terraform_full_flow(kms_client):
     desc = kms_client.describe_key(KeyId=key_id)
     assert desc["KeyMetadata"]["Description"] == "RDS key"
     kms_client.schedule_key_deletion(KeyId=key_id, PendingWindowInDays=7)
+
+
+def test_kms_list_key_policies(kms_client):
+    """ListKeyPolicies returns default policy name."""
+    key = kms_client.create_key()
+    key_id = key["KeyMetadata"]["KeyId"]
+    resp = kms_client.list_key_policies(KeyId=key_id)
+    assert "default" in resp["PolicyNames"]
+    kms_client.schedule_key_deletion(KeyId=key_id, PendingWindowInDays=7)
+
+
+def test_kms_key_rotation_with_period(kms_client):
+    """EnableKeyRotation with custom RotationPeriodInDays."""
+    key = kms_client.create_key()
+    key_id = key["KeyMetadata"]["KeyId"]
+    kms_client.enable_key_rotation(KeyId=key_id, RotationPeriodInDays=180)
+    status = kms_client.get_key_rotation_status(KeyId=key_id)
+    assert status["KeyRotationEnabled"] is True
+    assert status["RotationPeriodInDays"] == 180
+    kms_client.schedule_key_deletion(KeyId=key_id, PendingWindowInDays=7)
+
+
+# ---------------------------------------------------------------------------
+# ElastiCache v1.1.39 — parameter groups, snapshots, tags
+# ---------------------------------------------------------------------------
+
+def test_elasticache_parameter_group_crud(ec):
+    """CreateCacheParameterGroup / DescribeCacheParameterGroups / DeleteCacheParameterGroup."""
+    ec.create_cache_parameter_group(
+        CacheParameterGroupName="test-pg-v39",
+        CacheParameterGroupFamily="redis7",
+        Description="Test param group",
+    )
+    desc = ec.describe_cache_parameter_groups(CacheParameterGroupName="test-pg-v39")
+    groups = desc["CacheParameterGroups"]
+    assert len(groups) == 1
+    assert groups[0]["CacheParameterGroupName"] == "test-pg-v39"
+    assert groups[0]["CacheParameterGroupFamily"] == "redis7"
+    ec.delete_cache_parameter_group(CacheParameterGroupName="test-pg-v39")
+
+
+def test_elasticache_snapshot_crud(ec):
+    """CreateSnapshot / DescribeSnapshots / DeleteSnapshot."""
+    ec.create_cache_cluster(
+        CacheClusterId="snap-cluster-v39",
+        Engine="redis",
+        CacheNodeType="cache.t3.micro",
+        NumCacheNodes=1,
+    )
+    ec.create_snapshot(SnapshotName="test-snap-v39", CacheClusterId="snap-cluster-v39")
+    desc = ec.describe_snapshots(SnapshotName="test-snap-v39")
+    assert len(desc["Snapshots"]) == 1
+    assert desc["Snapshots"][0]["SnapshotName"] == "test-snap-v39"
+    ec.delete_snapshot(SnapshotName="test-snap-v39")
+
+
+def test_elasticache_tags(ec):
+    """AddTagsToResource / ListTagsForResource / RemoveTagsFromResource."""
+    ec.create_cache_cluster(
+        CacheClusterId="tag-cluster-v39",
+        Engine="redis",
+        CacheNodeType="cache.t3.micro",
+        NumCacheNodes=1,
+    )
+    arn = "arn:aws:elasticache:us-east-1:000000000000:cluster:tag-cluster-v39"
+    ec.add_tags_to_resource(
+        ResourceName=arn,
+        Tags=[{"Key": "env", "Value": "test"}, {"Key": "team", "Value": "platform"}],
+    )
+    tags = ec.list_tags_for_resource(ResourceName=arn)
+    tag_map = {t["Key"]: t["Value"] for t in tags["TagList"]}
+    assert tag_map["env"] == "test"
+    assert tag_map["team"] == "platform"
+    ec.remove_tags_from_resource(ResourceName=arn, TagKeys=["team"])
+    tags = ec.list_tags_for_resource(ResourceName=arn)
+    tag_keys = [t["Key"] for t in tags["TagList"]]
+    assert "env" in tag_keys
+    assert "team" not in tag_keys
+
+
+# ---------------------------------------------------------------------------
+# Lambda v1.1.39 — PackageType Image, provided runtime, UpdateFunctionCode
+# ---------------------------------------------------------------------------
+
+def test_lambda_image_create_invoke(lam):
+    """CreateFunction with PackageType Image + GetFunction returns ImageUri."""
+    lam.create_function(
+        FunctionName="img-test-v39",
+        PackageType="Image",
+        Code={"ImageUri": "my-repo/my-image:latest"},
+        Role="arn:aws:iam::000000000000:role/test",
+        Timeout=30,
+    )
+    desc = lam.get_function(FunctionName="img-test-v39")
+    assert desc["Configuration"]["PackageType"] == "Image"
+    assert desc["Code"]["RepositoryType"] == "ECR"
+    assert desc["Code"]["ImageUri"] == "my-repo/my-image:latest"
+    lam.delete_function(FunctionName="img-test-v39")
+
+
+def test_lambda_update_code_image_uri(lam):
+    """UpdateFunctionCode with ImageUri updates the image."""
+    lam.create_function(
+        FunctionName="img-update-v39",
+        PackageType="Image",
+        Code={"ImageUri": "my-repo/my-image:v1"},
+        Role="arn:aws:iam::000000000000:role/test",
+    )
+    lam.update_function_code(FunctionName="img-update-v39", ImageUri="my-repo/my-image:v2")
+    desc = lam.get_function(FunctionName="img-update-v39")
+    assert desc["Code"]["ImageUri"] == "my-repo/my-image:v2"
+    lam.delete_function(FunctionName="img-update-v39")
+
+
+def test_lambda_provided_runtime_create(lam):
+    """CreateFunction with provided.al2023 runtime accepts bootstrap handler."""
+    import zipfile, io
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("bootstrap", "#!/bin/sh\necho ok\n")
+    lam.create_function(
+        FunctionName="provided-test-v39",
+        Runtime="provided.al2023",
+        Handler="bootstrap",
+        Code={"ZipFile": buf.getvalue()},
+        Role="arn:aws:iam::000000000000:role/test",
+    )
+    desc = lam.get_function_configuration(FunctionName="provided-test-v39")
+    assert desc["Runtime"] == "provided.al2023"
+    assert desc["Handler"] == "bootstrap"
+    lam.delete_function(FunctionName="provided-test-v39")
+
+
+# ---------------------------------------------------------------------------
+# SecretsManager v1.1.39 — rotate secret
+# ---------------------------------------------------------------------------
+
+def test_secretsmanager_rotate_secret(sm):
+    """RotateSecret creates a new version and promotes it to AWSCURRENT."""
+    sm.create_secret(Name="rotate-test-v39", SecretString="original")
+    resp = sm.rotate_secret(
+        SecretId="rotate-test-v39",
+        RotationLambdaARN="arn:aws:lambda:us-east-1:000000000000:function:rotator",
+        RotationRules={"AutomaticallyAfterDays": 30},
+    )
+    assert "VersionId" in resp
+    desc = sm.describe_secret(SecretId="rotate-test-v39")
+    assert desc["RotationEnabled"] is True
+    assert desc["RotationLambdaARN"] == "arn:aws:lambda:us-east-1:000000000000:function:rotator"
+    current = sm.get_secret_value(SecretId="rotate-test-v39", VersionStage="AWSCURRENT")
+    assert current["SecretString"] == "original"
+    sm.delete_secret(SecretId="rotate-test-v39", ForceDeleteWithoutRecovery=True)
