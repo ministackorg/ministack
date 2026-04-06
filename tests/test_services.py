@@ -19647,3 +19647,48 @@ def test_cfn_stack_with_s3_lambda_dynamodb(cfn, s3, lam, ddb):
     stacks = cfn.describe_stacks()["Stacks"]
     active = [st for st in stacks if st["StackName"] == stack_name and "DELETE" not in st["StackStatus"]]
     assert len(active) == 0
+
+
+# ---------------------------------------------------------------------------
+# CloudFront v1.1.42 — tags
+# ---------------------------------------------------------------------------
+
+def test_cloudfront_tags(cloudfront):
+    """TagResource / ListTagsForResource / UntagResource for CloudFront distributions."""
+    resp = cloudfront.create_distribution(
+        DistributionConfig={
+            "CallerReference": "tag-test-v42",
+            "Origins": {"Items": [{"Id": "o1", "DomainName": "example.com",
+                                   "S3OriginConfig": {"OriginAccessIdentity": ""}}], "Quantity": 1},
+            "DefaultCacheBehavior": {
+                "TargetOriginId": "o1", "ViewerProtocolPolicy": "allow-all",
+                "ForwardedValues": {"QueryString": False, "Cookies": {"Forward": "none"}},
+                "MinTTL": 0,
+            },
+            "Comment": "tag test", "Enabled": True,
+        }
+    )
+    dist_arn = resp["Distribution"]["ARN"]
+
+    cloudfront.tag_resource(
+        Resource=dist_arn,
+        Tags={"Items": [
+            {"Key": "env", "Value": "test"},
+            {"Key": "team", "Value": "platform"},
+        ]},
+    )
+
+    tags = cloudfront.list_tags_for_resource(Resource=dist_arn)
+    tag_map = {t["Key"]: t["Value"] for t in tags["Tags"]["Items"]}
+    assert tag_map["env"] == "test"
+    assert tag_map["team"] == "platform"
+
+    cloudfront.untag_resource(
+        Resource=dist_arn,
+        TagKeys={"Items": ["team"]},
+    )
+
+    tags = cloudfront.list_tags_for_resource(Resource=dist_arn)
+    tag_keys = [t["Key"] for t in tags["Tags"]["Items"]]
+    assert "env" in tag_keys
+    assert "team" not in tag_keys

@@ -35,29 +35,34 @@ _DIST_CFG_RE = re.compile(r"^/2020-05-31/distribution/([^/]+)/config$")
 _DIST_ID_RE  = re.compile(r"^/2020-05-31/distribution/([^/]+)/?$")
 _INV_RE      = re.compile(r"^/2020-05-31/distribution/([^/]+)/invalidation/?$")
 _INV_ID_RE   = re.compile(r"^/2020-05-31/distribution/([^/]+)/invalidation/([^/]+)$")
+_TAG_RE      = re.compile(r"^/2020-05-31/tagging/?$")
 
 # ---------------------------------------------------------------------------
 # In-memory state
 # ---------------------------------------------------------------------------
 _distributions: dict = {}   # Id -> distribution record
 _invalidations: dict = {}   # distribution_id -> [invalidation record, ...]
+_tags: dict = {}            # arn -> [{"Key": ..., "Value": ...}]
 
 
 def reset():
     _distributions.clear()
     _invalidations.clear()
+    _tags.clear()
 
 
 def get_state():
     return copy.deepcopy({
         "distributions": _distributions,
         "invalidations": _invalidations,
+        "tags": _tags,
     })
 
 
 def restore_state(data):
     _distributions.update(data.get("distributions", {}))
     _invalidations.update(data.get("invalidations", {}))
+    _tags.update(data.get("tags", {}))
 
 
 _restored = load_state("cloudfront")
@@ -209,6 +214,17 @@ async def handle_request(method, path, headers, body, query_params):
         inv_id = m.group(2)
         if method == "GET":
             return _get_invalidation(dist_id, inv_id)
+
+    m = _TAG_RE.match(path)
+    if m:
+        resource = query_params.get("Resource", [""])[0] if isinstance(query_params.get("Resource"), list) else query_params.get("Resource", "")
+        operation = query_params.get("Operation", [""])[0] if isinstance(query_params.get("Operation"), list) else query_params.get("Operation", "")
+        if method == "GET":
+            return _list_tags(resource)
+        if method == "POST" and operation == "Tag":
+            return _tag_resource(resource, body)
+        if method == "POST" and operation == "Untag":
+            return _untag_resource(resource, body)
 
     return _error("NoSuchResource", f"No route for {method} {path}", 404)
 
@@ -434,3 +450,50 @@ def _get_invalidation(dist_id, inv_id):
         _build_invalidation_xml(root, inv)
 
     return _xml_response("Invalidation", build)
+
+
+# ---------------------------------------------------------------------------
+# Tagging
+# ---------------------------------------------------------------------------
+
+def _list_tags(resource_arn):
+    tags = _tags.get(resource_arn, [])
+    root = Element("Tags", xmlns=NS)
+    items = SubElement(root, "Items")
+    for t in tags:
+        tag_el = SubElement(items, "Tag")
+        SubElement(tag_el, "Key").text = t["Key"]
+        SubElement(tag_el, "Value").text = t["Value"]
+    body = tostring(root, encoding="unicode")
+    return 200, {"Content-Type": "application/xml"}, f'<?xml version="1.0" encoding="UTF-8"?>\n{body}'.encode()
+
+
+def _tag_resource(resource_arn, body):
+    el = _parse_body(body)
+    items_el = _find(el, "Items") or _find(el, "Tags")
+    if items_el is None:
+        items_el = el
+    existing = {t["Key"]: t for t in _tags.get(resource_arn, [])}
+    for tag_el in items_el:
+        local = tag_el.tag.split("}")[-1] if "}" in tag_el.tag else tag_el.tag
+        if local == "Tag":
+            key = _text(tag_el, "Key")
+            val = _text(tag_el, "Value")
+            if key:
+                existing[key] = {"Key": key, "Value": val}
+    _tags[resource_arn] = list(existing.values())
+    return 204, {}, b""
+
+
+def _untag_resource(resource_arn, body):
+    el = _parse_body(body)
+    items_el = _find(el, "Items") or _find(el, "Keys")
+    if items_el is None:
+        items_el = el
+    remove_keys = set()
+    for child in items_el:
+        local = child.tag.split("}")[-1] if "}" in child.tag else child.tag
+        if local == "Key":
+            remove_keys.add(child.text or "")
+    _tags[resource_arn] = [t for t in _tags.get(resource_arn, []) if t["Key"] not in remove_keys]
+    return 204, {}, b""

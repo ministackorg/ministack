@@ -7,10 +7,19 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [1.1.42] — 2026-04-06
+
+### Added
+- **RDS configurable tmpfs size** — `RDS_TMPFS_SIZE` env var (default `256m`). Set to `2g` or higher for large database testing
+- **CloudFront tagging** — `TagResource`, `UntagResource`, `ListTagsForResource` for distributions. Enables Terraform CloudFront with tags
+
+---
+
 ## [1.1.41] — 2026-04-06
 
 ### Fixed
 - **ElastiCache persistence crash on restart** — `restore_state()` called `_get_docker()` before it was defined, causing `NameError` when `PERSIST_STATE=1`. Reported by @adamkirk (#145)
+- **RDS persistence crash on restart** — same `_get_docker()` ordering issue in `restore_state()`
 
 ---
 

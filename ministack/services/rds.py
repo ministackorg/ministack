@@ -37,6 +37,7 @@ logger = logging.getLogger("rds")
 ACCOUNT_ID = os.environ.get("MINISTACK_ACCOUNT_ID", "000000000000")
 REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 BASE_PORT = int(os.environ.get("RDS_BASE_PORT", "15432"))
+RDS_TMPFS_SIZE = os.environ.get("RDS_TMPFS_SIZE", "256m")
 
 _instances: dict = {}
 _clusters: dict = {}
@@ -182,8 +183,8 @@ def _create_db_instance(p):
                     ports={f"{container_port}/tcp": host_port},
                     name=f"ministack-rds-{db_id}",
                     labels={"ministack": "rds", "db_id": db_id},
-                    tmpfs={"/var/lib/postgresql/data": "rw,noexec,nosuid,size=256m",
-                           "/var/lib/mysql": "rw,noexec,nosuid,size=256m"},
+                    tmpfs={"/var/lib/postgresql/data": f"rw,noexec,nosuid,size={RDS_TMPFS_SIZE}",
+                           "/var/lib/mysql": f"rw,noexec,nosuid,size={RDS_TMPFS_SIZE}"},
                 )
                 docker_container_id = container.id
                 logger.info("RDS: started %s container for %s on port %s", engine, db_id, host_port)

@@ -483,6 +483,7 @@ ecs.stop_task(cluster="dev", task=task_arn)
 | `REDIS_HOST` | `redis` | Redis host for ElastiCache fallback |
 | `REDIS_PORT` | `6379` | Redis port for ElastiCache fallback |
 | `RDS_BASE_PORT` | `15432` | Starting host port for RDS containers |
+| `RDS_TMPFS_SIZE` | `256m` | Tmpfs size for RDS database containers. Set to `2g` or higher for large databases |
 | `ELASTICACHE_BASE_PORT` | `16379` | Starting host port for ElastiCache containers |
 | `PERSIST_STATE` | `0` | Set `1` to persist service state across restarts |
 | `STATE_DIR` | `/tmp/ministack-state` | Directory for persisted state files |
