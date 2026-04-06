@@ -787,6 +787,14 @@ See [`Testcontainers/java-testcontainers`](Testcontainers/java-testcontainers), 
 
 ---
 
+## Community Integrations
+
+| Project | Description |
+|---------|-------------|
+| [**StackPort**](https://github.com/DaviReisVieira/stackport) | Visual dashboard to browse and inspect AWS resources in MiniStack. Available on [PyPI](https://pypi.org/project/stackport/) and [Docker Hub](https://hub.docker.com/r/davireis/stackport). |
+
+---
+
 ## Contributing
 
 PRs welcome. The codebase is intentionally simple — each service is a single self-contained Python file in `ministack/services/`. Adding a new service means:
