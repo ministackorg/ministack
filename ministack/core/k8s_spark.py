@@ -54,7 +54,14 @@ DEFAULT_SPARK_IMAGE = (
     "331455399823.dkr.ecr.us-west-2.amazonaws.com"
     "/sfci/a360/cdp-emr-eks/spark-emr-eks-7.9.0:emr-7.9-84c4181"
 )
-FALLBACK_SPARK_IMAGE = "apache/spark:3.5.0-java17"
+FALLBACK_SPARK_IMAGE = "apache/spark:3.5.3"
+
+# spark-submit path varies by image:
+#   Salesforce/EMR images: /usr/lib/spark/bin/spark-submit
+#   Apache Spark images:   /opt/spark/bin/spark-submit
+# Configurable via spark config "sparkSubmitPath" key, or auto-detected from image name.
+DEFAULT_SPARK_SUBMIT_PATH = "/usr/lib/spark/bin/spark-submit"
+APACHE_SPARK_SUBMIT_PATH = "/opt/spark/bin/spark-submit"
 
 # Track running jobs for status polling:
 #   job_name -> {"state": ..., "stateDetails": ..., "labels": {...}, "name": ...}
@@ -178,6 +185,11 @@ def create_spark_job(
     size = config.get("clusterSize", "small")
     resources = CLUSTER_SIZE_PROFILES.get(size, CLUSTER_SIZE_PROFILES["small"])
 
+    # Determine spark-submit path: explicit config > auto-detect from image name
+    spark_submit = config.get("sparkSubmitPath")
+    if not spark_submit:
+        spark_submit = APACHE_SPARK_SUBMIT_PATH if "apache/spark" in image else DEFAULT_SPARK_SUBMIT_PATH
+
     # Build spark-submit args
     submit_args = []
     if class_name:
@@ -216,7 +228,7 @@ def create_spark_job(
     container = client.V1Container(
         name="spark",
         image=image,
-        command=["/usr/lib/spark/bin/spark-submit"],
+        command=[spark_submit],
         args=submit_args,
         env=env_vars,
         resources=client.V1ResourceRequirements(
