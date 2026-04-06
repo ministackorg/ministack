@@ -219,3 +219,20 @@ def sfn_sync():
 @pytest.fixture(scope="session")
 def cloudfront():
     return make_client("cloudfront")
+
+@pytest.fixture(scope="session")
+def sd():
+    """SD client for DiscoverInstances — forces same endpoint (boto3 normally prefixes data-)."""
+    from botocore.config import Config as BotoConfig
+    return boto3.client(
+        "servicediscovery",
+        endpoint_url=ENDPOINT,
+        aws_access_key_id="test",
+        aws_secret_access_key="test",
+        region_name=REGION,
+        config=BotoConfig(
+            region_name=REGION,
+            retries={"max_attempts": 0},
+            inject_host_prefix=False,
+        ),
+    )

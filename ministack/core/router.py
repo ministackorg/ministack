@@ -167,6 +167,11 @@ SERVICE_PATTERNS = {
         "path_prefixes": ["/v1/apis", "/v1/tags"],
         "credential_scope": "appsync",
     },
+    "servicediscovery": {
+        "target_prefixes": ["Route53AutoNaming_v20170314"],
+        "host_patterns": [r"servicediscovery\."],
+        "credential_scope": "servicediscovery",
+    },
 }
 
 
@@ -219,6 +224,7 @@ def detect_service(method: str, path: str, headers: dict, query_params: dict) ->
                 "kms": "kms",
                 "cloudfront": "cloudfront",
                 "appsync": "appsync",
+                "servicediscovery": "servicediscovery",
             }
             if svc_name in scope_map:
                 return scope_map[svc_name]

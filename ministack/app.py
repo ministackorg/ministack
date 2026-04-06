@@ -75,6 +75,7 @@ from ministack.services import (
     stepfunctions,
     waf,
     cloudfront,
+    servicediscovery,
 )
 from ministack.services import iam_sts
 from ministack.services.iam_sts import handle_iam_request, handle_sts_request
@@ -124,6 +125,7 @@ SERVICE_HANDLERS = {
     "kms": kms.handle_request,
     "cloudfront": cloudfront.handle_request,
     "appsync": appsync.handle_request,
+    "servicediscovery": servicediscovery.handle_request,
 }
 
 SERVICE_NAME_ALIASES = {
@@ -178,7 +180,7 @@ BANNER = r"""
           SSM, EventBridge, Kinesis, CloudWatch, SES, SES v2, ACM, WAF v2, Step Functions,
           ECS, RDS, ElastiCache, Glue, Athena, API Gateway, Firehose, Route53,
           Cognito, EC2, EMR, EBS, EFS, ALB/ELBv2, CloudFormation, KMS, ECR, CloudFront,
-          AppSync
+          AppSync, Cloud Map
 """
 
 
@@ -602,6 +604,7 @@ async def _handle_lifespan(scope, receive, send):
                     "firehose": firehose.get_state,
                     "ses": ses.get_state,
                     "ses_v2": ses_v2.get_state,
+                    "servicediscovery": servicediscovery.get_state,
                 })
             await send({"type": "lifespan.shutdown.complete"})
             return
@@ -617,6 +620,10 @@ def _load_persisted_state():
     if data_v1:
         apigateway_v1.load_persisted_state(data_v1)
         logger.info("Loaded persisted state for apigateway_v1")
+    data_sd = load_state("servicediscovery")
+    if data_sd:
+        servicediscovery.load_persisted_state(data_sd)
+        logger.info("Loaded persisted state for servicediscovery")
 
 
 def _run_init_scripts():
@@ -682,6 +689,7 @@ def _reset_all_state():
         (cloudfront, cloudfront.reset),
         (ecr, ecr.reset),
         (appsync, appsync.reset),
+        (servicediscovery, servicediscovery.reset),
     ]:
         try:
             fn()
