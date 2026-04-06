@@ -12285,6 +12285,109 @@ def test_sfn_list_executions_filter(sfn):
     assert all(e["status"] == "SUCCEEDED" for e in succeeded)
 
 
+def test_sfn_timestamp_fields_are_sdk_compatible(sfn, sfn_sync):
+    """SFN timestamp fields must deserialize as datetimes, not fail as strings."""
+    import datetime
+
+    def assert_dt(value, field_name):
+        assert isinstance(value, datetime.datetime), (
+            f"{field_name} should be datetime, got {type(value)}"
+        )
+
+    unique = str(time.time_ns())
+    definition = json.dumps(
+        {
+            "StartAt": "Done",
+            "States": {"Done": {"Type": "Succeed"}},
+        }
+    )
+
+    create = sfn.create_state_machine(
+        name=f"qa-sfn-ts-{unique}",
+        definition=definition,
+        roleArn="arn:aws:iam::000000000000:role/r",
+    )
+    assert_dt(create["creationDate"], "CreateStateMachine.creationDate")
+
+    arn = create["stateMachineArn"]
+    desc = sfn.describe_state_machine(stateMachineArn=arn)
+    assert_dt(desc["creationDate"], "DescribeStateMachine.creationDate")
+
+    updated = sfn.update_state_machine(stateMachineArn=arn, definition=definition)
+    assert_dt(updated["updateDate"], "UpdateStateMachine.updateDate")
+
+    machines = sfn.list_state_machines()["stateMachines"]
+    listed_sm = next(sm for sm in machines if sm["stateMachineArn"] == arn)
+    assert_dt(listed_sm["creationDate"], "ListStateMachines.creationDate")
+
+    start = sfn.start_execution(stateMachineArn=arn, input="{}")
+    assert_dt(start["startDate"], "StartExecution.startDate")
+
+    exec_arn = start["executionArn"]
+    exec_desc = _wait_sfn(sfn, exec_arn)
+    assert_dt(exec_desc["startDate"], "DescribeExecution.startDate")
+    assert_dt(exec_desc["stopDate"], "DescribeExecution.stopDate")
+
+    sm_for_exec = sfn.describe_state_machine_for_execution(executionArn=exec_arn)
+    assert_dt(
+        sm_for_exec["updateDate"],
+        "DescribeStateMachineForExecution.updateDate",
+    )
+
+    executions = sfn.list_executions(stateMachineArn=arn)["executions"]
+    listed_exec = next(ex for ex in executions if ex["executionArn"] == exec_arn)
+    assert_dt(listed_exec["startDate"], "ListExecutions.startDate")
+    assert_dt(listed_exec["stopDate"], "ListExecutions.stopDate")
+
+    history = sfn.get_execution_history(executionArn=exec_arn)["events"]
+    assert history, "GetExecutionHistory should return at least one event"
+    assert_dt(history[0]["timestamp"], "GetExecutionHistory.events[].timestamp")
+
+    sync = sfn_sync.start_sync_execution(stateMachineArn=arn, input="{}")
+    assert_dt(sync["startDate"], "StartSyncExecution.startDate")
+    assert_dt(sync["stopDate"], "StartSyncExecution.stopDate")
+
+    wait_definition = json.dumps(
+        {
+            "StartAt": "Wait",
+            "States": {"Wait": {"Type": "Wait", "Seconds": 60, "End": True}},
+        }
+    )
+    wait_sm = sfn.create_state_machine(
+        name=f"qa-sfn-ts-stop-{unique}",
+        definition=wait_definition,
+        roleArn="arn:aws:iam::000000000000:role/r",
+    )
+    wait_exec = sfn.start_execution(
+        stateMachineArn=wait_sm["stateMachineArn"],
+        input="{}",
+    )
+    stopped = sfn.stop_execution(executionArn=wait_exec["executionArn"], cause="test stop")
+    assert_dt(stopped["stopDate"], "StopExecution.stopDate")
+
+
+def test_sfn_activity_timestamp_fields_are_sdk_compatible(sfn):
+    """SFN activity timestamp fields must deserialize as datetimes."""
+    import datetime
+
+    def assert_dt(value, field_name):
+        assert isinstance(value, datetime.datetime), (
+            f"{field_name} should be datetime, got {type(value)}"
+        )
+
+    unique = str(time.time_ns())
+    created = sfn.create_activity(name=f"qa-sfn-activity-ts-{unique}")
+    assert_dt(created["creationDate"], "CreateActivity.creationDate")
+
+    arn = created["activityArn"]
+    desc = sfn.describe_activity(activityArn=arn)
+    assert_dt(desc["creationDate"], "DescribeActivity.creationDate")
+
+    activities = sfn.list_activities()["activities"]
+    listed = next(act for act in activities if act["activityArn"] == arn)
+    assert_dt(listed["creationDate"], "ListActivities.creationDate")
+
+
 # ---------------------------------------------------------------------------
 # CLOUDWATCH — edge cases
 # ---------------------------------------------------------------------------

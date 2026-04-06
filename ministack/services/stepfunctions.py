@@ -131,6 +131,55 @@ if _restored:
     restore_state(_restored)
 
 
+_TIMESTAMP_RESPONSE_FIELDS = {
+    "creationDate",
+    "redriveDate",
+    "startDate",
+    "stopDate",
+    "timestamp",
+    "updateDate",
+}
+
+
+def _timestamp_response_value(value):
+    """Step Functions models timestamps as JSON numbers, not ISO strings."""
+    if not isinstance(value, str):
+        return value
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return value
+
+
+def _normalize_timestamp_response(payload, field_name=None):
+    if isinstance(payload, dict):
+        return {
+            key: _normalize_timestamp_response(value, key)
+            for key, value in payload.items()
+        }
+    if isinstance(payload, list):
+        return [_normalize_timestamp_response(item, field_name) for item in payload]
+    if field_name in _TIMESTAMP_RESPONSE_FIELDS:
+        return _timestamp_response_value(payload)
+    return payload
+
+
+def _finalize_response(response):
+    """Serialize Step Functions timestamps in the format AWS SDKs expect."""
+    status, headers, body = response
+    if not body:
+        return response
+    try:
+        payload = json.loads(body)
+    except (TypeError, ValueError):
+        return response
+
+    normalized = _normalize_timestamp_response(payload)
+    if normalized == payload:
+        return response
+    return json_response(normalized, status)
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
@@ -175,8 +224,8 @@ async def handle_request(method, path, headers, body, query_params):
     if not handler:
         return error_response_json("InvalidAction", f"Unknown action: {action}", 400)
     if action == "GetActivityTask":
-        return await _get_activity_task(data)
-    return handler(data)
+        return _finalize_response(await _get_activity_task(data))
+    return _finalize_response(handler(data))
 
 
 # ---------------------------------------------------------------------------
