@@ -10,8 +10,12 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 ## [1.1.40] — 2026-04-06
 
 ### Added
-- **State persistence for all services** — 11 remaining services now support `PERSIST_STATE=1`: ALB, Glue, EFS, WAF, Athena, EMR, CloudFront, ACM, Firehose, SES, SES v2. All 35+ services now persist state across restarts.
+- **State persistence for ALL services** — 11 remaining services now support `PERSIST_STATE=1`: ALB, Glue, EFS, WAF, Athena, EMR, CloudFront, ACM, Firehose, SES, SES v2. All 35+ services now persist state across restarts.
 - **Step Functions persistence** — state machines, executions, tags, and activities persist. RUNNING executions restored as FAILED with `States.ServiceRestart`. Contributed by @TheJokersThief (#141)
+- **IAM `ListEntitiesForPolicy`** — returns users, roles, and groups attached to a managed policy. Supports `EntityFilter` and `PathPrefix`. Contributed by @TheJokersThief (#143)
+
+### Tests
+- 5 cross-service integration tests: S3→SQS events, SNS→SQS fanout, DynamoDB streams→Lambda, SQS ESM→Lambda, CloudFormation full stack (S3+Lambda+DynamoDB). Contributed by @DaviReisVieira (#142)
 
 ---
 
