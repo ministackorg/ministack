@@ -88,19 +88,9 @@ def restore_state(data):
     _user_groups.update(data.get("user_groups", {}))
     if "port_counter" in data:
         _port_counter[0] = data["port_counter"]
-    docker_client = _get_docker()
     for name, cl in data.get("clusters", {}).items():
         cl["_docker_container_id"] = None
-        if docker_client:
-            try:
-                c = docker_client.containers.get(f"ministack-ec-{name}")
-                if c.status == "running":
-                    cl["_docker_container_id"] = c.id
-                    cl["CacheClusterStatus"] = "available"
-                else:
-                    cl["CacheClusterStatus"] = "stopped"
-            except Exception:
-                cl["CacheClusterStatus"] = "stopped"
+        cl["CacheClusterStatus"] = "available"
         _clusters[name] = cl
 
 
