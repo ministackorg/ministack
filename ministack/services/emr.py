@@ -22,6 +22,7 @@ import string
 import time
 
 from ministack.core.responses import error_response_json, json_response, new_uuid
+from ministack.core import k8s_spark
 
 logger = logging.getLogger("emr")
 
@@ -267,22 +268,68 @@ def _set_visible_to_all_users(data):
 # ---------------------------------------------------------------------------
 
 def _make_step(step_config):
+    """Build an EMR step record from a step config.
+
+    If spark config is present (k8s mode), creates a real K8s Job for the step.
+    Otherwise, the step is immediately marked COMPLETED (mock mode).
+    """
     now = _now_iso()
+    step_id = _step_id()
+    hadoop_jar = step_config.get("HadoopJarStep", {})
+    entry_point = hadoop_jar.get("Jar", "")
+    class_name = hadoop_jar.get("MainClass", "")
+    args = hadoop_jar.get("Args", [])
+    properties = hadoop_jar.get("Properties", [])
+
+    k8s_job_name = None
+    if k8s_spark.is_k8s_mode():
+        # Real execution: create K8s Job
+        # Parse --class from Args if MainClass not set (EMR CLI puts --class in Args)
+        effective_class = class_name
+        effective_args = list(args)
+        if not effective_class and "--class" in effective_args:
+            idx = effective_args.index("--class")
+            if idx + 1 < len(effective_args):
+                effective_class = effective_args[idx + 1]
+                effective_args = effective_args[:idx] + effective_args[idx + 2:]
+
+        # Convert Properties list to spark conf dict
+        spark_conf = {p["Key"]: p["Value"] for p in properties} if properties else {}
+
+        k8s_job_name = f"emr-step-{step_id.lower()}"
+        k8s_spark.create_spark_job(
+            job_name=k8s_job_name,
+            entry_point=entry_point,
+            class_name=effective_class,
+            spark_args=effective_args if effective_args else None,
+            spark_conf=spark_conf if spark_conf else None,
+            labels={
+                "ministack/service": "emr-ec2",
+                "ministack/step": step_id,
+            },
+        )
+        initial_state = "RUNNING"
+        end_time = None
+    else:
+        initial_state = "COMPLETED"
+        end_time = now
+
     return {
-        "Id": _step_id(),
+        "Id": step_id,
         "Name": step_config.get("Name", ""),
         "Config": {
-            "Jar": step_config.get("HadoopJarStep", {}).get("Jar", ""),
-            "Properties": {p["Key"]: p["Value"] for p in step_config.get("HadoopJarStep", {}).get("Properties", [])},
-            "MainClass": step_config.get("HadoopJarStep", {}).get("MainClass", ""),
-            "Args": step_config.get("HadoopJarStep", {}).get("Args", []),
+            "Jar": entry_point,
+            "Properties": {p["Key"]: p["Value"] for p in properties} if properties else {},
+            "MainClass": class_name,
+            "Args": args,
         },
         "ActionOnFailure": step_config.get("ActionOnFailure", "CONTINUE"),
         "Status": {
-            "State": "COMPLETED",
+            "State": initial_state,
             "StateChangeReason": {},
-            "Timeline": {"CreationDateTime": now, "StartDateTime": now, "EndDateTime": now},
+            "Timeline": {"CreationDateTime": now, "StartDateTime": now, "EndDateTime": end_time},
         },
+        "_k8s_job_name": k8s_job_name,
     }
 
 
@@ -304,6 +351,13 @@ def _describe_step(data):
     step_id = data.get("StepId")
     for step in _steps.get(cluster_id, []):
         if step["Id"] == step_id:
+            # In k8s mode, update state from K8s before returning
+            k8s_job_name = step.get("_k8s_job_name")
+            if k8s_job_name and step["Status"]["State"] not in ("COMPLETED", "FAILED", "CANCELLED"):
+                k8s_state = k8s_spark.get_job_state(k8s_job_name)
+                step["Status"]["State"] = k8s_state["state"]
+                if k8s_state["state"] in ("COMPLETED", "FAILED", "CANCELLED"):
+                    step["Status"]["Timeline"]["EndDateTime"] = _now_iso()
             return json_response({"Step": step})
     return error_response_json("InvalidRequestException",
                                f"Step id '{step_id}' is not valid.", 400)
@@ -324,6 +378,10 @@ def _cancel_steps(data):
     cancelled = []
     for step in _steps.get(cluster_id, []):
         if step["Id"] in step_ids and step["Status"]["State"] in ("PENDING", "RUNNING"):
+            # In k8s mode, delete the K8s Job
+            k8s_job_name = step.get("_k8s_job_name")
+            if k8s_job_name:
+                k8s_spark.delete_job(k8s_job_name)
             step["Status"]["State"] = "CANCELLED"
             cancelled.append({"StepId": step["Id"], "Status": "SUBMITTED"})
         elif step["Id"] in step_ids:

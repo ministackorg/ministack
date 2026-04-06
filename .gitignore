@@ -38,6 +38,7 @@ htmlcov/
 *.swp
 *.swo
 .DS_Store
+*.code-workspace
 
 # Docker
 data/
@@ -50,3 +51,8 @@ data/
 
 # Logs
 *.log
+
+# Project planning / reference docs (not part of the codebase)
+EMR_on_EKS_Support_MiniStack.md
+emr-on-eks-reference.md
+CLAUDE.md

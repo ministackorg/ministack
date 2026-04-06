@@ -34,6 +34,9 @@ full = [
     "docker>=7.0.0",
     "cryptography>=41.0",
 ]
+k8s = [
+    "kubernetes>=28.0",
+]
 dev = [
     "boto3>=1.34",
     "pytest>=8.0",

@@ -26,6 +26,7 @@ import os
 import re
 
 from ministack.core.responses import json_response, new_uuid, now_iso
+from ministack.core import k8s_spark
 
 logger = logging.getLogger("emr-containers")
 
@@ -173,7 +174,10 @@ def _list_virtual_clusters(query_params):
 # --- Job Run operations ---
 
 def _start_job_run(vc_id, data):
-    """Create a new job run. In mock mode, the job is immediately marked COMPLETED.
+    """Create a new job run.
+
+    If spark config is present (k8s mode), creates a real K8s Job via k8s_spark.
+    Otherwise, the job is immediately marked COMPLETED (mock mode).
     """
     jr_id = new_uuid()[:13]
     name = data.get("name", "")
@@ -184,23 +188,65 @@ def _start_job_run(vc_id, data):
     tags = data.get("tags", {})
     now = now_iso()
 
+    if k8s_spark.is_k8s_mode():
+        # Real execution: extract Spark params and create K8s Job
+        spark_submit = job_driver.get("sparkSubmitJobDriver", {})
+        entry_point = spark_submit.get("entryPoint", "")
+        submit_params = spark_submit.get("sparkSubmitParameters", "")
+
+        # Parse --class from sparkSubmitParameters
+        class_name = ""
+        if "--class " in submit_params:
+            parts = submit_params.split("--class ")
+            class_name = parts[1].split()[0] if len(parts) > 1 else ""
+
+        # Extract spark conf from configurationOverrides
+        spark_conf = {}
+        app_config = configuration_overrides.get("applicationConfiguration", {})
+        for cfg in app_config.get("configurations", []) if isinstance(app_config, dict) else []:
+            if cfg.get("classification") == "spark-defaults":
+                spark_conf.update(cfg.get("properties", {}))
+
+        k8s_job_name = f"emr-jr-{jr_id}"
+        k8s_spark.create_spark_job(
+            job_name=k8s_job_name,
+            entry_point=entry_point,
+            class_name=class_name,
+            spark_conf=spark_conf,
+            labels={
+                "ministack/service": "emr-containers",
+                "ministack/virtual-cluster": vc_id,
+                "ministack/job-run": jr_id,
+            },
+        )
+        initial_state = "PENDING"
+        state_details = "K8s Job created"
+        finished_at = None
+    else:
+        # Mock mode: immediately completed
+        initial_state = "COMPLETED"
+        state_details = "Job completed successfully (mock)"
+        finished_at = now
+
     jr = {
         "id": jr_id,
         "name": name,
         "arn": _jr_arn(vc_id, jr_id),
         "virtualClusterId": vc_id,
-        "state": "COMPLETED",  # Mock mode: immediately completed
-        "stateDetails": "Job completed successfully (mock)",
+        "state": initial_state,
+        "stateDetails": state_details,
         "releaseLabel": release_label,
         "executionRoleArn": execution_role_arn,
         "jobDriver": job_driver,
         "configurationOverrides": configuration_overrides,
         "tags": tags,
         "createdAt": now,
-        "finishedAt": now,
+        "finishedAt": finished_at,
+        "_k8s_job_name": f"emr-jr-{jr_id}" if k8s_spark.is_k8s_mode() else None,
     }
     _job_runs[(vc_id, jr_id)] = jr
-    logger.info("StartJobRun: vc=%s jr=%s name=%s (mock — COMPLETED)", vc_id, jr_id, name)
+    logger.info("StartJobRun: vc=%s jr=%s name=%s (mode=%s)",
+                vc_id, jr_id, name, "k8s" if k8s_spark.is_k8s_mode() else "mock")
     return json_response({
         "id": jr_id,
         "name": name,
@@ -214,6 +260,14 @@ def _describe_job_run(vc_id, jr_id):
     if not jr:
         return _json_err("ResourceNotFoundException",
                          f"Job run {jr_id} does not exist", 404)
+    # In k8s mode, update state from K8s before returning
+    k8s_job_name = jr.get("_k8s_job_name")
+    if k8s_job_name and jr["state"] not in ("COMPLETED", "FAILED", "CANCELLED"):
+        k8s_state = k8s_spark.get_job_state(k8s_job_name)
+        jr["state"] = k8s_state["state"]
+        jr["stateDetails"] = k8s_state["stateDetails"]
+        if jr["state"] in ("COMPLETED", "FAILED", "CANCELLED"):
+            jr["finishedAt"] = now_iso()
     return json_response({"jobRun": jr})
 
 
@@ -222,6 +276,10 @@ def _cancel_job_run(vc_id, jr_id):
     if not jr:
         return _json_err("ResourceNotFoundException",
                          f"Job run {jr_id} does not exist", 404)
+    # In k8s mode, delete the K8s Job
+    k8s_job_name = jr.get("_k8s_job_name")
+    if k8s_job_name:
+        k8s_spark.delete_job(k8s_job_name)
     jr["state"] = "CANCELLED"
     jr["stateDetails"] = "Job cancelled by user"
     jr["finishedAt"] = now_iso()

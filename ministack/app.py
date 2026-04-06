@@ -293,7 +293,16 @@ async def app(scope, receive, send):
         except json.JSONDecodeError:
             config = {}
         applied = {}
+
+        # Handle spark config: {"spark": {...}} or {"spark": null}
+        if "spark" in config:
+            from ministack.core import k8s_spark
+            k8s_spark.set_spark_config(config["spark"])
+            applied["spark"] = config["spark"]
+
         for key, value in config.items():
+            if key == "spark":
+                continue  # already handled above
             if key not in _ALLOWED_CONFIG_KEYS:
                 logger.warning("/_ministack/config: rejected key %s (not in whitelist)", key)
                 continue
@@ -689,6 +698,13 @@ def _reset_all_state():
         _iam_reset()
     except Exception as e:
         logger.warning("reset() failed for iam_sts: %s", e)
+
+    # Reset k8s_spark job tracking state
+    try:
+        from ministack.core import k8s_spark
+        k8s_spark.reset()
+    except Exception as e:
+        logger.warning("reset() failed for k8s_spark: %s", e)
 
     # Wipe persisted files so a subsequent restart doesn't reload old state
     if PERSIST_STATE and os.path.isdir(STATE_DIR):
