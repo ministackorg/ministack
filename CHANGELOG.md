@@ -13,6 +13,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 - **RDS configurable tmpfs size** — `RDS_TMPFS_SIZE` env var (default `256m`). Set to `2g` or higher for large database testing
 - **CloudFront tagging** — `TagResource`, `UntagResource`, `ListTagsForResource` for distributions. Enables Terraform CloudFront with tags
 
+### Fixed
+- **Step Functions timestamp wire format** — responses now return epoch numbers instead of ISO strings for timestamp fields (`creationDate`, `startDate`, `stopDate`, etc.). Fixes Go SDK v2 and botocore deserialization failures. Contributed by @jayjanssen (#151)
+
 ---
 
 ## [1.1.41] — 2026-04-06
