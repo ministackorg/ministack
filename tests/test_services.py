@@ -19262,3 +19262,31 @@ def test_secretsmanager_rotate_secret(sm):
     current = sm.get_secret_value(SecretId="rotate-test-v39", VersionStage="AWSCURRENT")
     assert current["SecretString"] == "original"
     sm.delete_secret(SecretId="rotate-test-v39", ForceDeleteWithoutRecovery=True)
+
+
+# ---------------------------------------------------------------------------
+# Firehose v1.1.39 — S3 destination writes
+# ---------------------------------------------------------------------------
+
+def test_firehose_s3_destination_writes(s3, fh):
+    """PutRecord with S3 destination actually writes data to the S3 bucket."""
+    import base64, time as _time
+    bucket = "fh-s3-dest-v39"
+    s3.create_bucket(Bucket=bucket)
+    fh.create_delivery_stream(
+        DeliveryStreamName="fh-s3-test-v39",
+        DeliveryStreamType="DirectPut",
+        ExtendedS3DestinationConfiguration={
+            "BucketARN": f"arn:aws:s3:::{bucket}",
+            "RoleARN": "arn:aws:iam::000000000000:role/firehose",
+            "Prefix": "data/",
+        },
+    )
+    fh.put_record(DeliveryStreamName="fh-s3-test-v39", Record={"Data": b"hello from firehose"})
+    _time.sleep(1)  # allow async delivery
+    objs = s3.list_objects_v2(Bucket=bucket, Prefix="data/")
+    assert objs.get("KeyCount", 0) > 0, "Firehose should have written to S3"
+    key = objs["Contents"][0]["Key"]
+    obj = s3.get_object(Bucket=bucket, Key=key)
+    body = obj["Body"].read()
+    assert b"hello from firehose" in body
