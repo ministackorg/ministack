@@ -29,6 +29,7 @@ import ministack.services.secretsmanager as _sm
 import ministack.services.cognito as _cognito
 import ministack.services.ecr as _ecr
 import ministack.services.kms as _kms
+import ministack.services.ec2 as _ec2
 
 
 logger = logging.getLogger("cloudformation")
@@ -1359,6 +1360,218 @@ def _kms_alias_delete(physical_id, props):
     _kms._aliases.pop(physical_id, None)
 
 
+# --- EC2 resource provisioners ---
+
+def _ec2_vpc_create(logical_id, props, stack_name):
+    import random, string
+    cidr = props.get("CidrBlock", "10.0.0.0/16")
+    vpc_id = _ec2._new_vpc_id()
+    # Create per-VPC default resources (same as _create_vpc)
+    acl_id = "acl-" + "".join(random.choices(string.hexdigits[:16], k=17))
+    _ec2._network_acls[acl_id] = {
+        "NetworkAclId": acl_id, "VpcId": vpc_id, "IsDefault": True,
+        "Entries": [
+            {"RuleNumber": 100, "Protocol": "-1", "RuleAction": "allow", "Egress": False, "CidrBlock": "0.0.0.0/0"},
+            {"RuleNumber": 32767, "Protocol": "-1", "RuleAction": "deny", "Egress": False, "CidrBlock": "0.0.0.0/0"},
+            {"RuleNumber": 100, "Protocol": "-1", "RuleAction": "allow", "Egress": True, "CidrBlock": "0.0.0.0/0"},
+            {"RuleNumber": 32767, "Protocol": "-1", "RuleAction": "deny", "Egress": True, "CidrBlock": "0.0.0.0/0"},
+        ],
+        "Associations": [], "Tags": [], "OwnerId": ACCOUNT_ID,
+    }
+    rtb_id = "rtb-" + "".join(random.choices(string.hexdigits[:16], k=17))
+    rtb_assoc_id = "rtbassoc-" + "".join(random.choices(string.hexdigits[:16], k=17))
+    _ec2._route_tables[rtb_id] = {
+        "RouteTableId": rtb_id, "VpcId": vpc_id, "OwnerId": ACCOUNT_ID,
+        "Routes": [{"DestinationCidrBlock": cidr, "GatewayId": "local", "State": "active", "Origin": "CreateRouteTable"}],
+        "Associations": [{"RouteTableAssociationId": rtb_assoc_id, "RouteTableId": rtb_id, "Main": True,
+                          "AssociationState": {"State": "associated"}}],
+    }
+    sg_id = _ec2._new_sg_id()
+    _ec2._security_groups[sg_id] = {
+        "GroupId": sg_id, "GroupName": "default", "Description": "default VPC security group",
+        "VpcId": vpc_id, "OwnerId": ACCOUNT_ID, "IpPermissions": [],
+        "IpPermissionsEgress": [{"IpProtocol": "-1", "IpRanges": [{"CidrIp": "0.0.0.0/0"}],
+             "Ipv6Ranges": [], "PrefixListIds": [], "UserIdGroupPairs": []}],
+    }
+    _ec2._vpcs[vpc_id] = {
+        "VpcId": vpc_id, "CidrBlock": cidr, "State": "available", "IsDefault": False,
+        "DhcpOptionsId": "dopt-00000001", "InstanceTenancy": props.get("InstanceTenancy", "default"),
+        "OwnerId": ACCOUNT_ID, "DefaultNetworkAclId": acl_id,
+        "DefaultSecurityGroupId": sg_id, "MainRouteTableId": rtb_id,
+    }
+    arn = f"arn:aws:ec2:{REGION}:{ACCOUNT_ID}:vpc/{vpc_id}"
+    return vpc_id, {"VpcId": vpc_id, "DefaultSecurityGroup": sg_id, "DefaultNetworkAcl": acl_id}
+
+
+def _ec2_vpc_delete(physical_id, props):
+    _ec2._vpcs.pop(physical_id, None)
+
+
+def _ec2_subnet_create(logical_id, props, stack_name):
+    import random, string
+    vpc_id = props.get("VpcId", "")
+    cidr = props.get("CidrBlock", "10.0.1.0/24")
+    az = props.get("AvailabilityZone", f"{REGION}a")
+    subnet_id = _ec2._new_subnet_id()
+    _ec2._subnets[subnet_id] = {
+        "SubnetId": subnet_id,
+        "VpcId": vpc_id,
+        "CidrBlock": cidr,
+        "AvailabilityZone": az,
+        "State": "available",
+        "AvailableIpAddressCount": 251,
+        "DefaultForAz": False,
+        "MapPublicIpOnLaunch": props.get("MapPublicIpOnLaunch", False),
+        "OwnerId": ACCOUNT_ID,
+    }
+    return subnet_id, {"SubnetId": subnet_id, "AvailabilityZone": az}
+
+
+def _ec2_subnet_delete(physical_id, props):
+    _ec2._subnets.pop(physical_id, None)
+
+
+def _ec2_sg_create(logical_id, props, stack_name):
+    name = props.get("GroupName", f"{stack_name}-{logical_id}")
+    desc = props.get("GroupDescription", name)
+    vpc_id = props.get("VpcId", _ec2._DEFAULT_VPC_ID)
+    sg_id = _ec2._new_sg_id()
+    _ec2._security_groups[sg_id] = {
+        "GroupId": sg_id,
+        "GroupName": name,
+        "Description": desc,
+        "VpcId": vpc_id,
+        "OwnerId": ACCOUNT_ID,
+        "IpPermissions": [],
+        "IpPermissionsEgress": [
+            {"IpProtocol": "-1", "IpRanges": [{"CidrIp": "0.0.0.0/0"}],
+             "Ipv6Ranges": [], "PrefixListIds": [], "UserIdGroupPairs": []},
+        ],
+    }
+    # Apply ingress rules from props
+    for rule in props.get("SecurityGroupIngress", []):
+        perm = {
+            "IpProtocol": rule.get("IpProtocol", "tcp"),
+            "IpRanges": [],
+            "Ipv6Ranges": [],
+            "PrefixListIds": [],
+            "UserIdGroupPairs": [],
+        }
+        if "FromPort" in rule:
+            perm["FromPort"] = int(rule["FromPort"])
+        if "ToPort" in rule:
+            perm["ToPort"] = int(rule["ToPort"])
+        if "CidrIp" in rule:
+            perm["IpRanges"].append({"CidrIp": rule["CidrIp"]})
+        _ec2._security_groups[sg_id]["IpPermissions"].append(perm)
+
+    arn = f"arn:aws:ec2:{REGION}:{ACCOUNT_ID}:security-group/{sg_id}"
+    return sg_id, {"GroupId": sg_id, "VpcId": vpc_id, "Arn": arn}
+
+
+def _ec2_sg_delete(physical_id, props):
+    _ec2._security_groups.pop(physical_id, None)
+
+
+def _ec2_igw_create(logical_id, props, stack_name):
+    import random, string
+    igw_id = "igw-" + "".join(random.choices(string.hexdigits[:16], k=17))
+    _ec2._internet_gateways[igw_id] = {
+        "InternetGatewayId": igw_id,
+        "OwnerId": ACCOUNT_ID,
+        "Attachments": [],
+    }
+    return igw_id, {"InternetGatewayId": igw_id}
+
+
+def _ec2_igw_delete(physical_id, props):
+    _ec2._internet_gateways.pop(physical_id, None)
+
+
+def _ec2_vpc_gw_attach_create(logical_id, props, stack_name):
+    vpc_id = props.get("VpcId", "")
+    igw_id = props.get("InternetGatewayId", "")
+    igw = _ec2._internet_gateways.get(igw_id)
+    if igw:
+        igw["Attachments"] = [{"VpcId": vpc_id, "State": "available"}]
+    physical_id = f"{igw_id}|{vpc_id}"
+    return physical_id, {}
+
+
+def _ec2_vpc_gw_attach_delete(physical_id, props):
+    parts = physical_id.split("|")
+    if len(parts) == 2:
+        igw = _ec2._internet_gateways.get(parts[0])
+        if igw:
+            igw["Attachments"] = []
+
+
+def _ec2_rtb_create(logical_id, props, stack_name):
+    import random, string
+    vpc_id = props.get("VpcId", _ec2._DEFAULT_VPC_ID)
+    rtb_id = "rtb-" + "".join(random.choices(string.hexdigits[:16], k=17))
+    _ec2._route_tables[rtb_id] = {
+        "RouteTableId": rtb_id,
+        "VpcId": vpc_id,
+        "OwnerId": ACCOUNT_ID,
+        "Routes": [
+            {"DestinationCidrBlock": _ec2._vpcs.get(vpc_id, {}).get("CidrBlock", "10.0.0.0/16"),
+             "GatewayId": "local", "State": "active", "Origin": "CreateRouteTable"},
+        ],
+        "Associations": [],
+    }
+    return rtb_id, {"RouteTableId": rtb_id}
+
+
+def _ec2_rtb_delete(physical_id, props):
+    _ec2._route_tables.pop(physical_id, None)
+
+
+def _ec2_route_create(logical_id, props, stack_name):
+    rtb_id = props.get("RouteTableId", "")
+    dest = props.get("DestinationCidrBlock", "0.0.0.0/0")
+    rtb = _ec2._route_tables.get(rtb_id)
+    if rtb:
+        route = {"DestinationCidrBlock": dest, "State": "active", "Origin": "CreateRoute"}
+        if props.get("GatewayId"):
+            route["GatewayId"] = props["GatewayId"]
+        elif props.get("NatGatewayId"):
+            route["NatGatewayId"] = props["NatGatewayId"]
+        rtb["Routes"].append(route)
+    physical_id = f"{rtb_id}|{dest}"
+    return physical_id, {}
+
+
+def _ec2_route_delete(physical_id, props):
+    parts = physical_id.split("|")
+    if len(parts) == 2:
+        rtb = _ec2._route_tables.get(parts[0])
+        if rtb:
+            rtb["Routes"] = [r for r in rtb["Routes"] if r.get("DestinationCidrBlock") != parts[1]]
+
+
+def _ec2_subnet_rtb_assoc_create(logical_id, props, stack_name):
+    import random, string
+    rtb_id = props.get("RouteTableId", "")
+    subnet_id = props.get("SubnetId", "")
+    assoc_id = "rtbassoc-" + "".join(random.choices(string.hexdigits[:16], k=17))
+    rtb = _ec2._route_tables.get(rtb_id)
+    if rtb:
+        rtb["Associations"].append({
+            "RouteTableAssociationId": assoc_id,
+            "RouteTableId": rtb_id,
+            "SubnetId": subnet_id,
+            "Main": False,
+            "AssociationState": {"State": "associated"},
+        })
+    return assoc_id, {}
+
+
+def _ec2_subnet_rtb_assoc_delete(physical_id, props):
+    for rtb in _ec2._route_tables.values():
+        rtb["Associations"] = [a for a in rtb["Associations"] if a["RouteTableAssociationId"] != physical_id]
+
+
 # Resource Handler Registry
 # ===========================================================================
 
@@ -1403,4 +1616,12 @@ _RESOURCE_HANDLERS = {
     "AWS::IAM::ManagedPolicy": {"create": _iam_managed_policy_create, "delete": _iam_managed_policy_delete},
     "AWS::KMS::Key": {"create": _kms_key_create, "delete": _kms_key_delete},
     "AWS::KMS::Alias": {"create": _kms_alias_create, "delete": _kms_alias_delete},
+    "AWS::EC2::VPC": {"create": _ec2_vpc_create, "delete": _ec2_vpc_delete},
+    "AWS::EC2::Subnet": {"create": _ec2_subnet_create, "delete": _ec2_subnet_delete},
+    "AWS::EC2::SecurityGroup": {"create": _ec2_sg_create, "delete": _ec2_sg_delete},
+    "AWS::EC2::InternetGateway": {"create": _ec2_igw_create, "delete": _ec2_igw_delete},
+    "AWS::EC2::VPCGatewayAttachment": {"create": _ec2_vpc_gw_attach_create, "delete": _ec2_vpc_gw_attach_delete},
+    "AWS::EC2::RouteTable": {"create": _ec2_rtb_create, "delete": _ec2_rtb_delete},
+    "AWS::EC2::Route": {"create": _ec2_route_create, "delete": _ec2_route_delete},
+    "AWS::EC2::SubnetRouteTableAssociation": {"create": _ec2_subnet_rtb_assoc_create, "delete": _ec2_subnet_rtb_assoc_delete},
 }
