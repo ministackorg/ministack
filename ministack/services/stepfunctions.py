@@ -2120,7 +2120,7 @@ _AWS_SDK_SERVICE_MAP = {
     "ecs": {"target_prefix": "AmazonEC2ContainerServiceV20141113", "protocol": "json"},
     "ecr": {"target_prefix": "AmazonEC2ContainerRegistry_V20150921", "protocol": "json"},
     "kms": {"target_prefix": "TrentService", "protocol": "json"},
-    # Query-protocol services (not yet supported via aws-sdk dispatcher)
+    # Query-protocol services
     "sqs": {"protocol": "query"},
     "sns": {"protocol": "query"},
     "rds": {"protocol": "query"},
@@ -2191,6 +2191,142 @@ def _dispatch_aws_sdk_json(service_info, service_name, action, input_data):
     return result
 
 
+def _flatten_query_params(data, prefix=""):
+    """Flatten a JSON dict into AWS query-protocol form params.
+
+    Handles nested dicts, lists (Member.N convention), and scalar values.
+    """
+    params = {}
+    if not isinstance(data, dict):
+        return params
+    for key, value in data.items():
+        full_key = f"{prefix}{key}" if not prefix else f"{prefix}.{key}"
+        if isinstance(value, dict):
+            params.update(_flatten_query_params(value, full_key))
+        elif isinstance(value, list):
+            for i, item in enumerate(value, 1):
+                member_key = f"{full_key}.member.{i}"
+                if isinstance(item, dict):
+                    params.update(_flatten_query_params(item, member_key))
+                else:
+                    params[member_key] = str(item)
+        elif isinstance(value, bool):
+            params[full_key] = "true" if value else "false"
+        else:
+            params[full_key] = str(value)
+    return params
+
+
+def _xml_element_to_dict(element):
+    """Convert an XML element tree to a JSON-friendly dict.
+
+    Strips namespace prefixes.  Repeated child tags become lists.
+    Leaf text nodes become strings.
+    """
+    # Strip namespace
+    tag = element.tag.split("}")[-1] if "}" in element.tag else element.tag
+
+    children = list(element)
+    if not children:
+        # Leaf node
+        return tag, (element.text or "")
+
+    result = {}
+    for child in children:
+        child_tag, child_val = _xml_element_to_dict(child)
+        if child_tag in result:
+            existing = result[child_tag]
+            if not isinstance(existing, list):
+                result[child_tag] = [existing]
+            result[child_tag].append(child_val)
+        else:
+            result[child_tag] = child_val
+    return tag, result
+
+
+def _dispatch_aws_sdk_query(service_info, service_name, action, input_data):
+    """Dispatch an aws-sdk integration call to a query-protocol MiniStack service."""
+    import xml.etree.ElementTree as ET
+    from urllib.parse import urlencode
+    from ministack import app
+
+    service_key = service_info.get("service_key", service_name)
+    handler = app.SERVICE_HANDLERS.get(service_key)
+    if not handler:
+        raise _ExecutionError(
+            "States.Runtime",
+            f"Service '{service_key}' is not available in MiniStack",
+        )
+
+    # Build form-encoded body with Action param
+    form_params = {"Action": action}
+    form_params.update(_flatten_query_params(input_data))
+    body = urlencode(form_params)
+
+    headers = {
+        "content-type": "application/x-www-form-urlencoded",
+        "host": f"{service_key}.{REGION}.amazonaws.com",
+        "authorization": (
+            f"AWS4-HMAC-SHA256 Credential=test/20260101/{REGION}/{service_key}/aws4_request"
+        ),
+    }
+
+    coro = handler("POST", "/", headers, body, {})
+    try:
+        coro.send(None)
+    except StopIteration as stop:
+        status, resp_headers, resp_body = stop.value
+    else:
+        coro.close()
+        loop = asyncio.new_event_loop()
+        try:
+            status, resp_headers, resp_body = loop.run_until_complete(
+                handler("POST", "/", headers, body, {})
+            )
+        finally:
+            loop.close()
+
+    decoded = resp_body.decode("utf-8") if isinstance(resp_body, bytes) else resp_body
+
+    # Parse XML response to JSON
+    if status >= 400:
+        # Try to extract error from XML
+        try:
+            root = ET.fromstring(decoded)
+            err_el = root.find(".//{http://rds.amazonaws.com/doc/2014-10-31/}Error")
+            if err_el is None:
+                # Try without namespace
+                err_el = root.find(".//Error")
+            if err_el is not None:
+                code = err_el.findtext("{http://rds.amazonaws.com/doc/2014-10-31/}Code")
+                if code is None:
+                    code = err_el.findtext("Code")
+                msg = err_el.findtext("{http://rds.amazonaws.com/doc/2014-10-31/}Message")
+                if msg is None:
+                    msg = err_el.findtext("Message")
+                raise _ExecutionError(code or f"{service_name}.ServiceException", msg or decoded)
+        except _ExecutionError:
+            raise
+        except Exception:
+            pass
+        raise _ExecutionError(f"{service_name}.ServiceException", decoded)
+
+    # Convert successful XML response to dict
+    try:
+        root = ET.fromstring(decoded)
+        _, result = _xml_element_to_dict(root)
+        if isinstance(result, dict):
+            # Unwrap the <ActionResult> wrapper if present
+            result_key = f"{action}Result"
+            if result_key in result:
+                result = result[result_key]
+            # Drop ResponseMetadata
+            result.pop("ResponseMetadata", None)
+        return result
+    except ET.ParseError:
+        raise _ExecutionError("States.Runtime", f"Failed to parse {service_name} XML response")
+
+
 def _invoke_aws_sdk_integration(resource, input_data):
     """Dispatch arn:aws:states:::aws-sdk:<service>:<action> to the target MiniStack service."""
     # Parse service and action from ARN
@@ -2210,14 +2346,16 @@ def _invoke_aws_sdk_integration(resource, input_data):
         )
 
     protocol = service_info["protocol"]
-    if protocol != "json":
+    if protocol == "json":
+        return _dispatch_aws_sdk_json(service_info, service_name, action, input_data)
+    elif protocol == "query":
+        return _dispatch_aws_sdk_query(service_info, service_name, action, input_data)
+    else:
         raise _ExecutionError(
             "States.Runtime",
             f"aws-sdk integration for {protocol}-protocol service '{service_name}' "
             "is not yet implemented; use native service integrations instead",
         )
-
-    return _dispatch_aws_sdk_json(service_info, service_name, action, input_data)
 
 
 _SERVICE_DISPATCH = {

@@ -9,11 +9,13 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **Step Functions query-protocol `aws-sdk:*` task dispatcher** — Task states can now call query-protocol AWS services (RDS, SQS, SNS, ElastiCache, EC2, IAM, STS, CloudWatch) via `arn:aws:states:::aws-sdk:<service>:<action>` resource ARNs. Converts JSON parameters to query-encoded form data and parses XML responses back to JSON. Contributed by @jayjanssen
+
 ### Tests
-- 5 new tests: comprehensive `aws-sdk:secretsmanager` Step Functions task dispatch coverage — PutSecretValue+GetSecretValue round-trip, GetRandomPassword, DeleteSecret, full create→put→get→describe→delete lifecycle, and error propagation for missing secrets. Contributed by @jayjanssen
+- 4 new tests: `aws-sdk:rds` Step Functions task dispatch — CreateDBCluster+DescribeDBClusters, CreateDBInstance+DescribeDBInstances, ModifyDBCluster, and error propagation for missing clusters. Contributed by @jayjanssen
 
 ---
-
 ## [1.1.47] — 2026-04-07
 
 ### Added
