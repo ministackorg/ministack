@@ -27,6 +27,8 @@ import ministack.services.apigateway_v1 as _apigw_v1
 import ministack.services.appsync as _appsync
 import ministack.services.secretsmanager as _sm
 import ministack.services.cognito as _cognito
+import ministack.services.ecr as _ecr
+import ministack.services.kms as _kms
 
 
 logger = logging.getLogger("cloudformation")
@@ -1271,6 +1273,92 @@ def _cognito_user_pool_domain_delete(physical_id, props):
 
 
 # ===========================================================================
+# --- ECR resource provisioners ---
+
+def _ecr_repo_create(logical_id, props, stack_name):
+    name = props.get("RepositoryName", f"{stack_name}-{logical_id}".lower())
+    arn = f"arn:aws:ecr:{REGION}:{ACCOUNT_ID}:repository/{name}"
+    _ecr._repositories[name] = {
+        "repositoryName": name,
+        "repositoryArn": arn,
+        "registryId": ACCOUNT_ID,
+        "repositoryUri": f"{ACCOUNT_ID}.dkr.ecr.{REGION}.amazonaws.com/{name}",
+        "createdAt": __import__("time").time(),
+        "imageTagMutability": props.get("ImageTagMutability", "MUTABLE"),
+        "imageScanningConfiguration": props.get("ImageScanningConfiguration", {"scanOnPush": False}),
+        "encryptionConfiguration": props.get("EncryptionConfiguration", {"encryptionType": "AES256"}),
+        "images": [],
+    }
+    return name, {"Arn": arn, "RepositoryUri": _ecr._repositories[name]["repositoryUri"]}
+
+
+def _ecr_repo_delete(physical_id, props):
+    _ecr._repositories.pop(physical_id, None)
+
+
+# --- IAM ManagedPolicy provisioner ---
+
+def _iam_managed_policy_create(logical_id, props, stack_name):
+    name = props.get("ManagedPolicyName", f"{stack_name}-{logical_id}")
+    arn = f"arn:aws:iam::{ACCOUNT_ID}:policy/{name}"
+    policy_doc = props.get("PolicyDocument", {})
+    _iam_sts._policies[arn] = {
+        "PolicyName": name,
+        "PolicyId": new_uuid().replace("-", "")[:21].upper(),
+        "Arn": arn,
+        "Path": props.get("Path", "/"),
+        "DefaultVersionId": "v1",
+        "AttachmentCount": 0,
+        "IsAttachable": True,
+        "Description": props.get("Description", ""),
+        "CreateDate": __import__("time").strftime("%Y-%m-%dT%H:%M:%SZ", __import__("time").gmtime()),
+        "UpdateDate": __import__("time").strftime("%Y-%m-%dT%H:%M:%SZ", __import__("time").gmtime()),
+        "PolicyVersions": [{"Document": json.dumps(policy_doc) if isinstance(policy_doc, dict) else policy_doc, "VersionId": "v1", "IsDefaultVersion": True}],
+    }
+    return arn, {"Arn": arn}
+
+
+def _iam_managed_policy_delete(physical_id, props):
+    _iam_sts._policies.pop(physical_id, None)
+
+
+# --- KMS resource provisioners ---
+
+def _kms_key_create(logical_id, props, stack_name):
+    key_id = new_uuid()
+    arn = f"arn:aws:kms:{REGION}:{ACCOUNT_ID}:key/{key_id}"
+    _kms._keys[key_id] = {
+        "KeyId": key_id,
+        "Arn": arn,
+        "KeyState": "Enabled",
+        "Enabled": True,
+        "KeySpec": "SYMMETRIC_DEFAULT",
+        "KeyUsage": props.get("KeyUsage", "ENCRYPT_DECRYPT"),
+        "Description": props.get("Description", ""),
+        "CreationDate": __import__("time").time(),
+        "Origin": "AWS_KMS",
+        "_symmetric_key": __import__("os").urandom(32),
+        "EncryptionAlgorithms": ["SYMMETRIC_DEFAULT"],
+        "SigningAlgorithms": [],
+    }
+    return key_id, {"Arn": arn, "KeyId": key_id}
+
+
+def _kms_key_delete(physical_id, props):
+    _kms._keys.pop(physical_id, None)
+
+
+def _kms_alias_create(logical_id, props, stack_name):
+    alias_name = props.get("AliasName", f"alias/{stack_name}-{logical_id}")
+    target_key = props.get("TargetKeyId", "")
+    _kms._aliases[alias_name] = target_key
+    return alias_name, {}
+
+
+def _kms_alias_delete(physical_id, props):
+    _kms._aliases.pop(physical_id, None)
+
+
 # Resource Handler Registry
 # ===========================================================================
 
@@ -1311,4 +1399,8 @@ _RESOURCE_HANDLERS = {
     "AWS::Cognito::UserPoolClient": {"create": _cognito_user_pool_client_create, "delete": _cognito_user_pool_client_delete},
     "AWS::Cognito::IdentityPool": {"create": _cognito_identity_pool_create, "delete": _cognito_identity_pool_delete},
     "AWS::Cognito::UserPoolDomain": {"create": _cognito_user_pool_domain_create, "delete": _cognito_user_pool_domain_delete},
+    "AWS::ECR::Repository": {"create": _ecr_repo_create, "delete": _ecr_repo_delete},
+    "AWS::IAM::ManagedPolicy": {"create": _iam_managed_policy_create, "delete": _iam_managed_policy_delete},
+    "AWS::KMS::Key": {"create": _kms_key_create, "delete": _kms_key_delete},
+    "AWS::KMS::Alias": {"create": _kms_alias_create, "delete": _kms_alias_delete},
 }

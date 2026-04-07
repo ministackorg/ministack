@@ -7,6 +7,48 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [1.1.44] — 2026-04-06
+
+### Added
+- **CFN `AWS::IAM::ManagedPolicy`, `AWS::KMS::Key`, `AWS::KMS::Alias`** — completes full CDK bootstrap support. All 9 resource types in the CDKToolkit stack now work.
+- **Step Functions nested `startExecution.sync`** — parent workflows can now invoke child state machines synchronously via `arn:aws:states:::states:startExecution.sync` and `.sync:2`. Output shape matches AWS (`.sync` = JSON string, `.sync:2` = parsed JSON). Contributed by @jayjanssen (#157)
+
+### Fixed
+- **API Gateway v2 `lastUpdatedDate` returned as ISO8601 string** — Stage and Deployment `lastUpdatedDate` was returning Unix timestamp (number), causing Terraform deserialization failure on `aws_apigatewayv2_stage`. Reported by @hmarcuzzo (#132)
+- **ECS timestamp wire format** — all ECS timestamp fields (`createdAt`, `startedAt`, `stoppedAt`, etc.) now return epoch numbers instead of ISO strings. Fixes SDK deserialization for Go, Java, and other typed SDKs
+
+### Tests
+- 4 new tests: EMR instance fleets, ECS timestamp format, API GW v2 stage timestamps, CDK bootstrap full stack
+
+---
+
+## [1.1.43] — 2026-04-06
+
+### Added
+- **CFN `AWS::ECR::Repository`** — CDK bootstrap (`cdk bootstrap`) now works. Reported by @youngkwangk (#152)
+- **SecretsManager `UpdateSecretVersionStage`** — move staging labels between secret versions. Enables rotation flows with AWSCURRENT/AWSPREVIOUS rollover. Contributed by @jayjanssen (#155)
+
+---
+
+## [1.1.42] — 2026-04-06
+
+### Added
+- **RDS configurable tmpfs size** — `RDS_TMPFS_SIZE` env var (default `256m`). Set to `2g` or higher for large database testing
+- **CloudFront tagging** — `TagResource`, `UntagResource`, `ListTagsForResource` for distributions. Enables Terraform CloudFront with tags
+
+### Fixed
+- **Step Functions timestamp wire format** — responses now return epoch numbers instead of ISO strings for timestamp fields (`creationDate`, `startDate`, `stopDate`, etc.). Fixes Go SDK v2 and botocore deserialization failures. Contributed by @jayjanssen (#151)
+
+---
+
+## [1.1.41] — 2026-04-06
+
+### Fixed
+- **ElastiCache persistence crash on restart** — `restore_state()` called `_get_docker()` before it was defined, causing `NameError` when `PERSIST_STATE=1`. Reported by @adamkirk (#145)
+- **RDS persistence crash on restart** — same `_get_docker()` ordering issue in `restore_state()`
+
+---
+
 ## [1.1.40] — 2026-04-06
 
 ### Added

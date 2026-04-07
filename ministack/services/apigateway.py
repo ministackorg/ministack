@@ -571,7 +571,7 @@ def _create_stage(api_id, data):
         "stageName": stage_name,
         "autoDeploy": data.get("autoDeploy", False),
         "createdDate": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "lastUpdatedDate": int(time.time()),
+        "lastUpdatedDate": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "stageVariables": data.get("stageVariables", {}),
         "description": data.get("description", ""),
         "defaultRouteSettings": data.get("defaultRouteSettings", {}),
@@ -601,7 +601,7 @@ def _update_stage(api_id, stage_name, data):
               "defaultRouteSettings", "routeSettings"):
         if k in data:
             stage[k] = data[k]
-    stage["lastUpdatedDate"] = int(time.time())
+    stage["lastUpdatedDate"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     return _apigw_response(stage)
 
 

@@ -120,6 +120,47 @@ def _iso():
 # Request routing
 # ---------------------------------------------------------------------------
 
+_ECS_TIMESTAMP_FIELDS = {
+    "createdAt", "startedAt", "stoppedAt", "registeredAt",
+    "deregisteredAt", "updatedAt", "lastModified", "runningAt",
+    "pullStartedAt", "pullStoppedAt", "executionStoppedAt",
+}
+
+
+def _ts_to_epoch(value):
+    if not isinstance(value, str):
+        return value
+    try:
+        from datetime import datetime, timezone
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+    except (ValueError, TypeError):
+        return value
+
+
+def _normalize_ecs_timestamps(payload, field_name=None):
+    if isinstance(payload, dict):
+        return {k: _normalize_ecs_timestamps(v, k) for k, v in payload.items()}
+    if isinstance(payload, list):
+        return [_normalize_ecs_timestamps(item, field_name) for item in payload]
+    if field_name in _ECS_TIMESTAMP_FIELDS:
+        return _ts_to_epoch(payload)
+    return payload
+
+
+def _finalize_ecs_response(response):
+    status, headers_resp, body = response
+    if not body:
+        return response
+    try:
+        payload = json.loads(body)
+    except (TypeError, ValueError):
+        return response
+    normalized = _normalize_ecs_timestamps(payload)
+    if normalized == payload:
+        return response
+    return json_response(normalized, status)
+
+
 async def handle_request(method, path, headers, body, query_params):
     try:
         data = json.loads(body) if body else {}
@@ -134,13 +175,13 @@ async def handle_request(method, path, headers, body, query_params):
     target = headers.get("x-amz-target", "") or headers.get("X-Amz-Target", "")
     if target:
         action = target.split(".")[-1]
-        return _dispatch_action(action, data)
+        return _finalize_ecs_response(_dispatch_action(action, data))
 
     parts = [p for p in path.strip("/").split("/") if p]
     if not parts:
         return error_response_json("InvalidRequest", "Missing path", 400)
 
-    return _dispatch_path(method, parts, data)
+    return _finalize_ecs_response(_dispatch_path(method, parts, data))
 
 
 def _dispatch_action(action, data):

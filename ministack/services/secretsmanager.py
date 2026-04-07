@@ -3,8 +3,9 @@ SecretsManager Service Emulator.
 JSON-based API via X-Amz-Target.
 Supports: CreateSecret, GetSecretValue, ListSecrets, DeleteSecret,
           RestoreSecret, UpdateSecret, DescribeSecret, PutSecretValue,
-          TagResource, UntagResource, ListSecretVersionIds, RotateSecret,
-          GetRandomPassword, ReplicateSecretToRegions,
+          UpdateSecretVersionStage, TagResource, UntagResource,
+          ListSecretVersionIds, RotateSecret, GetRandomPassword,
+          ReplicateSecretToRegions,
           PutResourcePolicy, GetResourcePolicy, DeleteResourcePolicy,
           ValidateResourcePolicy.
 """
@@ -121,6 +122,28 @@ def _vid_to_stages(secret):
     return {vid: list(ver["Stages"]) for vid, ver in secret["Versions"].items() if ver["Stages"]}
 
 
+def _remove_stage(secret, version_id, stage):
+    """Detach *stage* from *version_id*. Returns True when a label was removed."""
+    ver = secret["Versions"].get(version_id)
+    if not ver or stage not in ver["Stages"]:
+        return False
+    ver["Stages"] = [label for label in ver["Stages"] if label != stage]
+    return True
+
+
+def _remove_stage_everywhere(secret, stage, except_version_id=None):
+    for vid in list(secret["Versions"].keys()):
+        if vid == except_version_id:
+            continue
+        _remove_stage(secret, vid, stage)
+
+
+def _add_stage(secret, version_id, stage):
+    ver = secret["Versions"].get(version_id)
+    if ver and stage not in ver["Stages"]:
+        ver["Stages"].append(stage)
+
+
 # ---------------------------------------------------------------------------
 # Router
 # ---------------------------------------------------------------------------
@@ -144,6 +167,7 @@ async def handle_request(method, path, headers, body, query_params):
         "UpdateSecret": _update_secret,
         "DescribeSecret": _describe_secret,
         "PutSecretValue": _put_secret_value,
+        "UpdateSecretVersionStage": _update_secret_version_stage,
         "TagResource": _tag_resource,
         "UntagResource": _untag_resource,
         "ListSecretVersionIds": _list_secret_version_ids,
@@ -497,6 +521,90 @@ def _put_secret_value(data):
         "VersionId": vid,
         "VersionStages": list(secret["Versions"][vid]["Stages"]),
     })
+
+
+def _update_secret_version_stage(data):
+    secret_id = data.get("SecretId")
+    _, secret = _resolve(secret_id)
+    if not secret:
+        return error_response_json(
+            "ResourceNotFoundException",
+            "Secrets Manager can't find the specified secret.", 400,
+        )
+    if secret.get("DeletedDate"):
+        return error_response_json(
+            "InvalidRequestException",
+            "You can't perform this operation on the secret because it was marked for deletion.", 400,
+        )
+
+    version_stage = data.get("VersionStage")
+    move_to_vid = data.get("MoveToVersionId")
+    remove_from_vid = data.get("RemoveFromVersionId")
+
+    if not version_stage:
+        return error_response_json(
+            "InvalidParameterException",
+            "VersionStage is required.", 400,
+        )
+    if not move_to_vid and not remove_from_vid:
+        return error_response_json(
+            "InvalidParameterException",
+            "You must specify MoveToVersionId or RemoveFromVersionId.", 400,
+        )
+
+    for version_id in [move_to_vid, remove_from_vid]:
+        if version_id and version_id not in secret["Versions"]:
+            return error_response_json(
+                "ResourceNotFoundException",
+                f"Secrets Manager can't find the specified secret version: {version_id}.", 400,
+            )
+
+    current_vid, _ = _find_stage_version(secret, version_stage)
+    if move_to_vid:
+        if current_vid and current_vid != move_to_vid:
+            if not remove_from_vid:
+                return error_response_json(
+                    "InvalidParameterException",
+                    f"The staging label {version_stage} is currently attached to version {current_vid}. "
+                    "You must specify RemoveFromVersionId to move it.",
+                    400,
+                )
+            if remove_from_vid != current_vid:
+                return error_response_json(
+                    "InvalidParameterException",
+                    f"The staging label {version_stage} is currently attached to version {current_vid}, "
+                    f"not version {remove_from_vid}.",
+                    400,
+                )
+        elif remove_from_vid and remove_from_vid not in (current_vid, move_to_vid):
+            return error_response_json(
+                "InvalidParameterException",
+                f"The staging label {version_stage} is not attached to version {remove_from_vid}.",
+                400,
+            )
+
+    if remove_from_vid and not move_to_vid and current_vid != remove_from_vid:
+        return error_response_json(
+            "InvalidParameterException",
+            f"The staging label {version_stage} is not attached to version {remove_from_vid}.",
+            400,
+        )
+
+    old_current_vid = current_vid if version_stage == "AWSCURRENT" else None
+
+    if remove_from_vid and remove_from_vid != move_to_vid:
+        _remove_stage(secret, remove_from_vid, version_stage)
+
+    if move_to_vid:
+        _remove_stage_everywhere(secret, version_stage, except_version_id=move_to_vid)
+        _add_stage(secret, move_to_vid, version_stage)
+
+        if old_current_vid and old_current_vid != move_to_vid:
+            _remove_stage_everywhere(secret, "AWSPREVIOUS")
+            _add_stage(secret, old_current_vid, "AWSPREVIOUS")
+
+    secret["LastChangedDate"] = time.time()
+    return json_response({"ARN": secret["ARN"], "Name": secret["Name"]})
 
 
 def _tag_resource(data):

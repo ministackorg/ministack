@@ -37,6 +37,7 @@ logger = logging.getLogger("rds")
 ACCOUNT_ID = os.environ.get("MINISTACK_ACCOUNT_ID", "000000000000")
 REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 BASE_PORT = int(os.environ.get("RDS_BASE_PORT", "15432"))
+RDS_TMPFS_SIZE = os.environ.get("RDS_TMPFS_SIZE", "256m")
 
 _instances: dict = {}
 _clusters: dict = {}
@@ -87,20 +88,9 @@ def restore_state(data):
     _tags.update(data.get("tags", {}))
     if "port_counter" in data:
         _port_counter[0] = data["port_counter"]
-    # Restore instances and try to reconnect Docker containers
-    docker_client = _get_docker()
     for name, inst in data.get("instances", {}).items():
         inst["_docker_container_id"] = None
-        if docker_client:
-            try:
-                c = docker_client.containers.get(f"ministack-rds-{name}")
-                if c.status == "running":
-                    inst["_docker_container_id"] = c.id
-                    inst["DBInstanceStatus"] = "available"
-                else:
-                    inst["DBInstanceStatus"] = "stopped"
-            except Exception:
-                inst["DBInstanceStatus"] = "stopped"
+        inst["DBInstanceStatus"] = "available"
         _instances[name] = inst
 
 
@@ -193,8 +183,8 @@ def _create_db_instance(p):
                     ports={f"{container_port}/tcp": host_port},
                     name=f"ministack-rds-{db_id}",
                     labels={"ministack": "rds", "db_id": db_id},
-                    tmpfs={"/var/lib/postgresql/data": "rw,noexec,nosuid,size=256m",
-                           "/var/lib/mysql": "rw,noexec,nosuid,size=256m"},
+                    tmpfs={"/var/lib/postgresql/data": f"rw,noexec,nosuid,size={RDS_TMPFS_SIZE}",
+                           "/var/lib/mysql": f"rw,noexec,nosuid,size={RDS_TMPFS_SIZE}"},
                 )
                 docker_container_id = container.id
                 logger.info("RDS: started %s container for %s on port %s", engine, db_id, host_port)

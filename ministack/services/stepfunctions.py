@@ -131,6 +131,55 @@ if _restored:
     restore_state(_restored)
 
 
+_TIMESTAMP_RESPONSE_FIELDS = {
+    "creationDate",
+    "redriveDate",
+    "startDate",
+    "stopDate",
+    "timestamp",
+    "updateDate",
+}
+
+
+def _timestamp_response_value(value):
+    """Step Functions models timestamps as JSON numbers, not ISO strings."""
+    if not isinstance(value, str):
+        return value
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return value
+
+
+def _normalize_timestamp_response(payload, field_name=None):
+    if isinstance(payload, dict):
+        return {
+            key: _normalize_timestamp_response(value, key)
+            for key, value in payload.items()
+        }
+    if isinstance(payload, list):
+        return [_normalize_timestamp_response(item, field_name) for item in payload]
+    if field_name in _TIMESTAMP_RESPONSE_FIELDS:
+        return _timestamp_response_value(payload)
+    return payload
+
+
+def _finalize_response(response):
+    """Serialize Step Functions timestamps in the format AWS SDKs expect."""
+    status, headers, body = response
+    if not body:
+        return response
+    try:
+        payload = json.loads(body)
+    except (TypeError, ValueError):
+        return response
+
+    normalized = _normalize_timestamp_response(payload)
+    if normalized == payload:
+        return response
+    return json_response(normalized, status)
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
@@ -175,8 +224,8 @@ async def handle_request(method, path, headers, body, query_params):
     if not handler:
         return error_response_json("InvalidAction", f"Unknown action: {action}", 400)
     if action == "GetActivityTask":
-        return await _get_activity_task(data)
-    return handler(data)
+        return _finalize_response(await _get_activity_task(data))
+    return _finalize_response(handler(data))
 
 
 # ---------------------------------------------------------------------------
@@ -1151,6 +1200,9 @@ def _invoke_resource(resource, input_data):
     if ":activity:" in resource:
         return _invoke_activity(resource, input_data)
 
+    if resource.startswith("arn:aws:states:::states:startExecution.sync"):
+        return _invoke_nested_start_execution(resource, input_data)
+
     # Service integration dispatch
     clean = resource.replace(".sync", "").replace(".waitForTaskToken", "")
     for prefix, handler in _SERVICE_DISPATCH.items():
@@ -1719,6 +1771,79 @@ def _parse_ts(v):
 # ===================================================================
 # Service integrations (Task state dispatch)
 # ===================================================================
+
+
+def _invoke_nested_start_execution(resource, input_data):
+    """Run a nested Step Functions execution and wait for the child result."""
+    request = _nested_start_execution_request(input_data)
+    status, _, body = _start_sync_execution(request)
+    payload = json.loads(body) if body else {}
+
+    if status >= 400:
+        raise _ExecutionError(
+            payload.get("__type", "States.Runtime"),
+            payload.get("message", "Nested execution failed to start"),
+        )
+
+    if payload.get("status") != "SUCCEEDED":
+        error, cause = _nested_execution_failure(payload)
+        raise _ExecutionError(error, cause)
+
+    output_value = payload.get("output") or "{}"
+    if resource.endswith(".sync:2") and isinstance(output_value, str):
+        try:
+            output_value = json.loads(output_value)
+        except json.JSONDecodeError:
+            pass
+
+    return {
+        "ExecutionArn": payload.get("executionArn"),
+        "Input": payload.get("input", "{}"),
+        "InputDetails": payload.get("inputDetails", {"included": True}),
+        "Name": payload.get("name"),
+        "Output": output_value,
+        "OutputDetails": payload.get("outputDetails", {"included": True}),
+        "StartDate": payload.get("startDate"),
+        "StateMachineArn": payload.get("stateMachineArn"),
+        "Status": payload.get("status"),
+        "StopDate": payload.get("stopDate"),
+    }
+
+
+def _nested_start_execution_request(input_data):
+    state_machine_arn = input_data.get("StateMachineArn") or input_data.get("stateMachineArn")
+    if not state_machine_arn:
+        raise _ExecutionError("ValidationException", "StateMachineArn is required")
+
+    nested_input = input_data.get("Input", input_data.get("input", {}))
+    if isinstance(nested_input, str):
+        input_str = nested_input
+    else:
+        input_str = json.dumps(nested_input)
+
+    request = {
+        "stateMachineArn": state_machine_arn,
+        "input": input_str,
+    }
+    name = input_data.get("Name") or input_data.get("name")
+    if name:
+        request["name"] = name
+    return request
+
+
+def _nested_execution_failure(payload):
+    output = payload.get("output")
+    if isinstance(output, str):
+        try:
+            decoded = json.loads(output)
+        except json.JSONDecodeError:
+            decoded = None
+        if isinstance(decoded, dict) and decoded.get("Error"):
+            return decoded["Error"], decoded.get("Cause", "")
+
+    execution_arn = payload.get("executionArn", "")
+    status = payload.get("status", "FAILED")
+    return "States.TaskFailed", f"Nested execution {execution_arn} ended with status {status}"
 
 
 def _invoke_sqs_send_message(resource, input_data):

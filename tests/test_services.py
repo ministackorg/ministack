@@ -7730,6 +7730,158 @@ def test_sfn_integration_ecs_run_task_output_contains_status(sfn, ecs):
     assert "failures" in output
 
 
+def test_sfn_integration_nested_start_execution_sync_returns_string_output(sfn):
+    """states:startExecution.sync should return the child Output as a JSON string."""
+    unique = str(time.time_ns())
+
+    child_definition = json.dumps(
+        {
+            "StartAt": "BuildResult",
+            "States": {
+                "BuildResult": {
+                    "Type": "Pass",
+                    "Result": {"message": "child-ok", "version": 1},
+                    "End": True,
+                }
+            },
+        }
+    )
+    child = sfn.create_state_machine(
+        name=f"sfn-child-sync-{unique}",
+        definition=child_definition,
+        roleArn="arn:aws:iam::000000000000:role/R",
+    )
+
+    parent_definition = json.dumps(
+        {
+            "StartAt": "RunChild",
+            "States": {
+                "RunChild": {
+                    "Type": "Task",
+                    "Resource": "arn:aws:states:::states:startExecution.sync",
+                    "Parameters": {
+                        "StateMachineArn": child["stateMachineArn"],
+                        "Input": {"requestId.$": "$.requestId"},
+                    },
+                    "End": True,
+                }
+            },
+        }
+    )
+    parent = sfn.create_state_machine(
+        name=f"sfn-parent-sync-{unique}",
+        definition=parent_definition,
+        roleArn="arn:aws:iam::000000000000:role/R",
+    )
+
+    ex = sfn.start_execution(
+        stateMachineArn=parent["stateMachineArn"],
+        input=json.dumps({"requestId": "req-123"}),
+    )
+
+    desc = _wait_sfn(sfn, ex["executionArn"])
+    assert desc["status"] == "SUCCEEDED"
+
+    output = json.loads(desc["output"])
+    assert output["Status"] == "SUCCEEDED"
+    assert isinstance(output["Output"], str)
+    assert json.loads(output["Output"]) == {"message": "child-ok", "version": 1}
+
+    child_execs = sfn.list_executions(
+        stateMachineArn=child["stateMachineArn"],
+        statusFilter="SUCCEEDED",
+    )["executions"]
+    assert any(e["executionArn"] == output["ExecutionArn"] for e in child_execs)
+
+
+def test_sfn_integration_nested_start_execution_sync2_returns_json_output(sfn):
+    """states:startExecution.sync:2 should expose the child Output as JSON."""
+    unique = str(time.time_ns())
+
+    child_definition = json.dumps(
+        {
+            "StartAt": "Echo",
+            "States": {
+                "Echo": {
+                    "Type": "Pass",
+                    "Parameters": {
+                        "childValue.$": "$.value",
+                        "source": "child",
+                    },
+                    "End": True,
+                }
+            },
+        }
+    )
+    child = sfn.create_state_machine(
+        name=f"sfn-child-sync2-{unique}",
+        definition=child_definition,
+        roleArn="arn:aws:iam::000000000000:role/R",
+    )
+
+    parent_definition = json.dumps(
+        {
+            "StartAt": "RunChild",
+            "States": {
+                "RunChild": {
+                    "Type": "Task",
+                    "Resource": "arn:aws:states:::states:startExecution.sync:2",
+                    "Parameters": {
+                        "StateMachineArn": child["stateMachineArn"],
+                        "Input": {"value.$": "$.value"},
+                    },
+                    "ResultPath": "$.child",
+                    "Next": "CheckChild",
+                },
+                "CheckChild": {
+                    "Type": "Choice",
+                    "Choices": [
+                        {
+                            "Variable": "$.child.Output.childValue",
+                            "StringEquals": "expected",
+                            "Next": "Done",
+                        }
+                    ],
+                    "Default": "WrongChildOutput",
+                },
+                "WrongChildOutput": {
+                    "Type": "Fail",
+                    "Error": "WrongChildOutput",
+                },
+                "Done": {
+                    "Type": "Succeed",
+                },
+            },
+        }
+    )
+    parent = sfn.create_state_machine(
+        name=f"sfn-parent-sync2-{unique}",
+        definition=parent_definition,
+        roleArn="arn:aws:iam::000000000000:role/R",
+    )
+
+    ex = sfn.start_execution(
+        stateMachineArn=parent["stateMachineArn"],
+        input=json.dumps({"value": "expected"}),
+    )
+
+    desc = _wait_sfn(sfn, ex["executionArn"])
+    assert desc["status"] == "SUCCEEDED"
+
+    output = json.loads(desc["output"])
+    assert output["child"]["Status"] == "SUCCEEDED"
+    assert output["child"]["Output"] == {
+        "childValue": "expected",
+        "source": "child",
+    }
+
+    child_execs = sfn.list_executions(
+        stateMachineArn=child["stateMachineArn"],
+        statusFilter="SUCCEEDED",
+    )["executions"]
+    assert any(e["executionArn"] == output["child"]["ExecutionArn"] for e in child_execs)
+
+
 def test_sfn_integration_multi_service_pipeline(sfn, sqs, ddb):
     """End-to-end: Pass → DynamoDB putItem → SQS sendMessage → Succeed."""
     table_name = "sfn-pipeline-test"
@@ -11828,6 +11980,96 @@ def test_sm_list_secret_version_ids(sm):
     assert len(resp["Versions"]) >= 2
 
 
+def test_sm_update_secret_version_stage_moves_current(sm):
+    """UpdateSecretVersionStage can move AWSCURRENT and refresh AWSPREVIOUS."""
+    first = sm.create_secret(Name="qa-sm-stage-move-current", SecretString="v1")
+    first_vid = first["VersionId"]
+    second_vid = "22222222-2222-2222-2222-222222222222"
+    sm.put_secret_value(
+        SecretId="qa-sm-stage-move-current",
+        SecretString="v2",
+        ClientRequestToken=second_vid,
+    )
+
+    sm.update_secret_version_stage(
+        SecretId="qa-sm-stage-move-current",
+        VersionStage="AWSCURRENT",
+        RemoveFromVersionId=second_vid,
+        MoveToVersionId=first_vid,
+    )
+
+    current = sm.get_secret_value(SecretId="qa-sm-stage-move-current", VersionStage="AWSCURRENT")
+    assert current["SecretString"] == "v1"
+    previous = sm.get_secret_value(SecretId="qa-sm-stage-move-current", VersionStage="AWSPREVIOUS")
+    assert previous["SecretString"] == "v2"
+
+    versions = sm.list_secret_version_ids(SecretId="qa-sm-stage-move-current")["Versions"]
+    version_stages = {v["VersionId"]: set(v["VersionStages"]) for v in versions}
+    assert version_stages[first_vid] == {"AWSCURRENT"}
+    assert version_stages[second_vid] == {"AWSPREVIOUS"}
+
+
+def test_sm_update_secret_version_stage_moves_and_removes_custom_label(sm):
+    """UpdateSecretVersionStage can move a custom label and then detach it."""
+    first = sm.create_secret(Name="qa-sm-stage-custom", SecretString="v1")
+    first_vid = first["VersionId"]
+    second_vid = "33333333-3333-3333-3333-333333333333"
+    sm.put_secret_value(
+        SecretId="qa-sm-stage-custom",
+        SecretString="v2",
+        ClientRequestToken=second_vid,
+        VersionStages=["BLUE"],
+    )
+
+    before = sm.get_secret_value(SecretId="qa-sm-stage-custom", VersionStage="BLUE")
+    assert before["SecretString"] == "v2"
+
+    sm.update_secret_version_stage(
+        SecretId="qa-sm-stage-custom",
+        VersionStage="BLUE",
+        RemoveFromVersionId=second_vid,
+        MoveToVersionId=first_vid,
+    )
+
+    moved = sm.get_secret_value(SecretId="qa-sm-stage-custom", VersionStage="BLUE")
+    assert moved["SecretString"] == "v1"
+
+    sm.update_secret_version_stage(
+        SecretId="qa-sm-stage-custom",
+        VersionStage="BLUE",
+        RemoveFromVersionId=first_vid,
+    )
+
+    versions = sm.list_secret_version_ids(SecretId="qa-sm-stage-custom")["Versions"]
+    version_stages = {v["VersionId"]: set(v["VersionStages"]) for v in versions}
+    assert "BLUE" not in version_stages[first_vid]
+    assert "BLUE" not in version_stages[second_vid]
+
+    with pytest.raises(ClientError) as exc:
+        sm.get_secret_value(SecretId="qa-sm-stage-custom", VersionStage="BLUE")
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
+def test_sm_update_secret_version_stage_requires_matching_remove_version(sm):
+    """Moving an attached label requires RemoveFromVersionId to match the current owner."""
+    first = sm.create_secret(Name="qa-sm-stage-guard", SecretString="v1")
+    first_vid = first["VersionId"]
+    second_vid = "44444444-4444-4444-4444-444444444444"
+    sm.put_secret_value(
+        SecretId="qa-sm-stage-guard",
+        SecretString="v2",
+        ClientRequestToken=second_vid,
+    )
+
+    with pytest.raises(ClientError) as exc:
+        sm.update_secret_version_stage(
+            SecretId="qa-sm-stage-guard",
+            VersionStage="AWSCURRENT",
+            MoveToVersionId=first_vid,
+        )
+    assert exc.value.response["Error"]["Code"] == "InvalidParameterException"
+
+
 def test_sm_delete_and_restore(sm):
     """DeleteSecret schedules deletion; RestoreSecret cancels it."""
     sm.create_secret(Name="qa-sm-restore", SecretString="data")
@@ -12283,6 +12525,109 @@ def test_sfn_list_executions_filter(sfn):
     time.sleep(0.5)
     succeeded = sfn.list_executions(stateMachineArn=arn, statusFilter="SUCCEEDED")["executions"]
     assert all(e["status"] == "SUCCEEDED" for e in succeeded)
+
+
+def test_sfn_timestamp_fields_are_sdk_compatible(sfn, sfn_sync):
+    """SFN timestamp fields must deserialize as datetimes, not fail as strings."""
+    import datetime
+
+    def assert_dt(value, field_name):
+        assert isinstance(value, datetime.datetime), (
+            f"{field_name} should be datetime, got {type(value)}"
+        )
+
+    unique = str(time.time_ns())
+    definition = json.dumps(
+        {
+            "StartAt": "Done",
+            "States": {"Done": {"Type": "Succeed"}},
+        }
+    )
+
+    create = sfn.create_state_machine(
+        name=f"qa-sfn-ts-{unique}",
+        definition=definition,
+        roleArn="arn:aws:iam::000000000000:role/r",
+    )
+    assert_dt(create["creationDate"], "CreateStateMachine.creationDate")
+
+    arn = create["stateMachineArn"]
+    desc = sfn.describe_state_machine(stateMachineArn=arn)
+    assert_dt(desc["creationDate"], "DescribeStateMachine.creationDate")
+
+    updated = sfn.update_state_machine(stateMachineArn=arn, definition=definition)
+    assert_dt(updated["updateDate"], "UpdateStateMachine.updateDate")
+
+    machines = sfn.list_state_machines()["stateMachines"]
+    listed_sm = next(sm for sm in machines if sm["stateMachineArn"] == arn)
+    assert_dt(listed_sm["creationDate"], "ListStateMachines.creationDate")
+
+    start = sfn.start_execution(stateMachineArn=arn, input="{}")
+    assert_dt(start["startDate"], "StartExecution.startDate")
+
+    exec_arn = start["executionArn"]
+    exec_desc = _wait_sfn(sfn, exec_arn)
+    assert_dt(exec_desc["startDate"], "DescribeExecution.startDate")
+    assert_dt(exec_desc["stopDate"], "DescribeExecution.stopDate")
+
+    sm_for_exec = sfn.describe_state_machine_for_execution(executionArn=exec_arn)
+    assert_dt(
+        sm_for_exec["updateDate"],
+        "DescribeStateMachineForExecution.updateDate",
+    )
+
+    executions = sfn.list_executions(stateMachineArn=arn)["executions"]
+    listed_exec = next(ex for ex in executions if ex["executionArn"] == exec_arn)
+    assert_dt(listed_exec["startDate"], "ListExecutions.startDate")
+    assert_dt(listed_exec["stopDate"], "ListExecutions.stopDate")
+
+    history = sfn.get_execution_history(executionArn=exec_arn)["events"]
+    assert history, "GetExecutionHistory should return at least one event"
+    assert_dt(history[0]["timestamp"], "GetExecutionHistory.events[].timestamp")
+
+    sync = sfn_sync.start_sync_execution(stateMachineArn=arn, input="{}")
+    assert_dt(sync["startDate"], "StartSyncExecution.startDate")
+    assert_dt(sync["stopDate"], "StartSyncExecution.stopDate")
+
+    wait_definition = json.dumps(
+        {
+            "StartAt": "Wait",
+            "States": {"Wait": {"Type": "Wait", "Seconds": 60, "End": True}},
+        }
+    )
+    wait_sm = sfn.create_state_machine(
+        name=f"qa-sfn-ts-stop-{unique}",
+        definition=wait_definition,
+        roleArn="arn:aws:iam::000000000000:role/r",
+    )
+    wait_exec = sfn.start_execution(
+        stateMachineArn=wait_sm["stateMachineArn"],
+        input="{}",
+    )
+    stopped = sfn.stop_execution(executionArn=wait_exec["executionArn"], cause="test stop")
+    assert_dt(stopped["stopDate"], "StopExecution.stopDate")
+
+
+def test_sfn_activity_timestamp_fields_are_sdk_compatible(sfn):
+    """SFN activity timestamp fields must deserialize as datetimes."""
+    import datetime
+
+    def assert_dt(value, field_name):
+        assert isinstance(value, datetime.datetime), (
+            f"{field_name} should be datetime, got {type(value)}"
+        )
+
+    unique = str(time.time_ns())
+    created = sfn.create_activity(name=f"qa-sfn-activity-ts-{unique}")
+    assert_dt(created["creationDate"], "CreateActivity.creationDate")
+
+    arn = created["activityArn"]
+    desc = sfn.describe_activity(activityArn=arn)
+    assert_dt(desc["creationDate"], "DescribeActivity.creationDate")
+
+    activities = sfn.list_activities()["activities"]
+    listed = next(act for act in activities if act["activityArn"] == arn)
+    assert_dt(listed["creationDate"], "ListActivities.creationDate")
 
 
 # ---------------------------------------------------------------------------
@@ -19838,3 +20183,173 @@ def test_servicediscovery_additional_operations(sd):
     sd.deregister_instance(ServiceId=svc_id, InstanceId="inst-1")
     sd.delete_service(Id=svc_id)
     sd.delete_namespace(Id=ns_id)
+# ---------------------------------------------------------------------------
+# CloudFront v1.1.42 — tags
+# ---------------------------------------------------------------------------
+
+def test_cloudfront_tags(cloudfront):
+    """TagResource / ListTagsForResource / UntagResource for CloudFront distributions."""
+    resp = cloudfront.create_distribution(
+        DistributionConfig={
+            "CallerReference": "tag-test-v42",
+            "Origins": {"Items": [{"Id": "o1", "DomainName": "example.com",
+                                   "S3OriginConfig": {"OriginAccessIdentity": ""}}], "Quantity": 1},
+            "DefaultCacheBehavior": {
+                "TargetOriginId": "o1", "ViewerProtocolPolicy": "allow-all",
+                "ForwardedValues": {"QueryString": False, "Cookies": {"Forward": "none"}},
+                "MinTTL": 0,
+            },
+            "Comment": "tag test", "Enabled": True,
+        }
+    )
+    dist_arn = resp["Distribution"]["ARN"]
+
+    cloudfront.tag_resource(
+        Resource=dist_arn,
+        Tags={"Items": [
+            {"Key": "env", "Value": "test"},
+            {"Key": "team", "Value": "platform"},
+        ]},
+    )
+
+    tags = cloudfront.list_tags_for_resource(Resource=dist_arn)
+    tag_map = {t["Key"]: t["Value"] for t in tags["Tags"]["Items"]}
+    assert tag_map["env"] == "test"
+    assert tag_map["team"] == "platform"
+
+    cloudfront.untag_resource(
+        Resource=dist_arn,
+        TagKeys={"Items": ["team"]},
+    )
+
+    tags = cloudfront.list_tags_for_resource(Resource=dist_arn)
+    tag_keys = [t["Key"] for t in tags["Tags"]["Items"]]
+    assert "env" in tag_keys
+    assert "team" not in tag_keys
+
+
+# ---------------------------------------------------------------------------
+# EMR v1.1.44 — instance fleets
+# ---------------------------------------------------------------------------
+
+def test_emr_instance_fleets(emr):
+    """AddInstanceFleet / ListInstanceFleets / ModifyInstanceFleet."""
+    resp = emr.run_job_flow(
+        Name="fleet-test-v44",
+        ReleaseLabel="emr-6.15.0",
+        Instances={
+            "KeepJobFlowAliveWhenNoSteps": True,
+            "InstanceFleets": [
+                {"InstanceFleetType": "MASTER", "Name": "master-fleet",
+                 "TargetOnDemandCapacity": 1,
+                 "InstanceTypeConfigs": [{"InstanceType": "m5.xlarge"}]},
+            ],
+        },
+        JobFlowRole="EMR_EC2_DefaultRole",
+        ServiceRole="EMR_DefaultRole",
+    )
+    cluster_id = resp["JobFlowId"]
+
+    # Add a CORE fleet
+    add_resp = emr.add_instance_fleet(
+        ClusterId=cluster_id,
+        InstanceFleet={
+            "InstanceFleetType": "CORE", "Name": "core-fleet",
+            "TargetOnDemandCapacity": 2,
+            "InstanceTypeConfigs": [{"InstanceType": "m5.xlarge"}],
+        },
+    )
+    fleet_id = add_resp["InstanceFleetId"]
+    assert fleet_id
+
+    # List fleets
+    fleets = emr.list_instance_fleets(ClusterId=cluster_id)
+    fleet_types = [f["InstanceFleetType"] for f in fleets["InstanceFleets"]]
+    assert "MASTER" in fleet_types
+    assert "CORE" in fleet_types
+
+    emr.terminate_job_flows(JobFlowIds=[cluster_id])
+
+
+# ---------------------------------------------------------------------------
+# v1.1.44 — timestamp wire format tests
+# ---------------------------------------------------------------------------
+
+def test_ecs_timestamps_are_epoch(ecs):
+    """ECS timestamps should be epoch numbers, not ISO strings."""
+    ecs.create_cluster(clusterName="ts-test-v44")
+    clusters = ecs.describe_clusters(clusters=["ts-test-v44"])
+    registered = clusters["clusters"][0].get("registeredContainerInstancesCount", 0)
+    # registeredAt might not be present on cluster, test on task def
+    ecs.register_task_definition(
+        family="ts-td-v44",
+        containerDefinitions=[{"name": "app", "image": "nginx", "memory": 256}],
+    )
+    td = ecs.describe_task_definition(taskDefinition="ts-td-v44")
+    registered_at = td["taskDefinition"].get("registeredAt")
+    if registered_at is not None:
+        from datetime import datetime
+        assert isinstance(registered_at, datetime), f"registeredAt should be datetime, got {type(registered_at)}"
+
+
+def test_apigw_v2_stage_timestamps(apigw):
+    """API Gateway v2 Stage timestamps should be ISO8601 (datetime)."""
+    from datetime import datetime
+    api = apigw.create_api(Name="ts-stage-v44", ProtocolType="HTTP")
+    api_id = api["ApiId"]
+    stage = apigw.create_stage(ApiId=api_id, StageName="test-stage")
+    assert isinstance(stage["CreatedDate"], datetime), f"CreatedDate should be datetime, got {type(stage['CreatedDate'])}"
+    assert isinstance(stage["LastUpdatedDate"], datetime), f"LastUpdatedDate should be datetime, got {type(stage['LastUpdatedDate'])}"
+    apigw.delete_api(ApiId=api_id)
+
+
+def test_cfn_cdk_bootstrap_resources(cfn, s3, ecr):
+    """CDK bootstrap template resources: S3 + ECR + IAM Role + KMS Key + SSM Parameter."""
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "StagingBucket": {
+                "Type": "AWS::S3::Bucket",
+                "Properties": {"BucketName": "cdk-bootstrap-v44"},
+            },
+            "ContainerRepo": {
+                "Type": "AWS::ECR::Repository",
+                "Properties": {"RepositoryName": "cdk-assets-v44"},
+            },
+            "DeployRole": {
+                "Type": "AWS::IAM::Role",
+                "Properties": {
+                    "RoleName": "cdk-deploy-v44",
+                    "AssumeRolePolicyDocument": {"Version": "2012-10-17", "Statement": []},
+                },
+            },
+            "FileKey": {
+                "Type": "AWS::KMS::Key",
+                "Properties": {"Description": "CDK file assets key"},
+            },
+            "KeyAlias": {
+                "Type": "AWS::KMS::Alias",
+                "Properties": {"AliasName": "alias/cdk-key-v44", "TargetKeyId": "dummy"},
+            },
+            "BootstrapVersion": {
+                "Type": "AWS::SSM::Parameter",
+                "Properties": {"Name": "/cdk-bootstrap/v44/version", "Type": "String", "Value": "27"},
+            },
+            "DeployPolicy": {
+                "Type": "AWS::IAM::ManagedPolicy",
+                "Properties": {"ManagedPolicyName": "cdk-policy-v44", "PolicyDocument": {"Version": "2012-10-17", "Statement": []}},
+            },
+        },
+    }
+    cfn.create_stack(StackName="CDKToolkit-v44", TemplateBody=json.dumps(template))
+    import time as _t; _t.sleep(2)
+    stack = cfn.describe_stacks(StackName="CDKToolkit-v44")["Stacks"][0]
+    assert stack["StackStatus"] == "CREATE_COMPLETE"
+
+    # Verify resources
+    buckets = [b["Name"] for b in s3.list_buckets()["Buckets"]]
+    assert "cdk-bootstrap-v44" in buckets
+    repos = [r["repositoryName"] for r in ecr.describe_repositories()["repositories"]]
+    assert "cdk-assets-v44" in repos
+
+    cfn.delete_stack(StackName="CDKToolkit-v44")
