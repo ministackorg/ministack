@@ -513,7 +513,7 @@ def _start_sync_execution(data):
     _run_execution(exec_arn)
 
     execution = _executions[exec_arn]
-    return json_response({
+    resp = {
         "executionArn": exec_arn,
         "stateMachineArn": sm_arn,
         "name": name,
@@ -524,7 +524,18 @@ def _start_sync_execution(data):
         "inputDetails": {"included": True},
         "output": execution.get("output") or "{}",
         "outputDetails": {"included": True},
-    })
+    }
+    # Include error/cause for failed executions (matches AWS SFN behaviour)
+    if execution["status"] == "FAILED":
+        failed_events = [
+            e for e in execution.get("events", [])
+            if e.get("type") == "ExecutionFailed"
+        ]
+        if failed_events:
+            details = failed_events[-1].get("executionFailedEventDetails", {})
+            resp["error"] = details.get("error", "")
+            resp["cause"] = details.get("cause", "")
+    return json_response(resp)
 
 
 def _describe_state_machine_for_execution(data):
@@ -2124,7 +2135,7 @@ _AWS_SDK_SERVICE_MAP = {
 }
 
 
-async def _dispatch_aws_sdk_json(service_info, service_name, action, input_data):
+def _dispatch_aws_sdk_json(service_info, service_name, action, input_data):
     """Dispatch an aws-sdk integration call to a JSON-protocol MiniStack service."""
     from ministack import app
 
@@ -2149,7 +2160,26 @@ async def _dispatch_aws_sdk_json(service_info, service_name, action, input_data)
         ),
     }
 
-    status, resp_headers, resp_body = await handler("POST", "/", headers, body, {})
+    # Service handlers are async def but perform no real I/O, so we can
+    # drive the coroutine synchronously — this avoids conflicts with the
+    # already-running uvicorn event loop.
+    coro = handler("POST", "/", headers, body, {})
+    try:
+        coro.send(None)
+    except StopIteration as stop:
+        status, resp_headers, resp_body = stop.value
+    else:
+        # If the coroutine didn't finish in one step it truly needs async;
+        # fall back to the event loop (only reachable if a handler awaits).
+        coro.close()
+        loop = asyncio.new_event_loop()
+        try:
+            status, resp_headers, resp_body = loop.run_until_complete(
+                handler("POST", "/", headers, body, {})
+            )
+        finally:
+            loop.close()
+
     decoded = resp_body.decode("utf-8") if isinstance(resp_body, bytes) else resp_body
     result = json.loads(decoded) if decoded else {}
 
@@ -2187,13 +2217,7 @@ def _invoke_aws_sdk_integration(resource, input_data):
             "is not yet implemented; use native service integrations instead",
         )
 
-    loop = asyncio.new_event_loop()
-    try:
-        return loop.run_until_complete(
-            _dispatch_aws_sdk_json(service_info, service_name, action, input_data)
-        )
-    finally:
-        loop.close()
+    return _dispatch_aws_sdk_json(service_info, service_name, action, input_data)
 
 
 _SERVICE_DISPATCH = {
