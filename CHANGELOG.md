@@ -7,13 +7,17 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
-## [Unreleased]
+## [1.1.46] — 2026-04-07
 
 ### Added
-- **Step Functions intrinsic functions** — `States.StringToJson`, `States.JsonMerge`, `States.Format` now work in `Parameters` and `ResultSelector`. Supports nested intrinsic calls. Enables real-world ASL definitions that use string interpolation and JSON manipulation
+- **Cloud Map (Service Discovery)** — new service with namespace lifecycle (HTTP, private/public DNS), service/instance CRUD, operation tracking, tagging, Route53 hosted zone integration. Contributed by @jgrumboe (#147)
+- **Step Functions intrinsic functions** — `States.StringToJson`, `States.JsonMerge`, `States.Format` in `Parameters` and `ResultSelector`. Supports nested intrinsic calls. Contributed by @jayjanssen (#167)
+- **STS `GetAccessKeyInfo`** — returns account ID for a given access key
+- **`ready.d` scripts** — execute after server startup for resource seeding. Contributed by @kjdev (#159)
 
 ### Tests
-- 4 new tests: `States.StringToJson`, `States.JsonMerge`, `States.Format`, nested intrinsics
+- 3 WAF tests: check_capacity, describe_managed_rule_group, list_resources_for_web_acl. Contributed by @mvanhorn (#164)
+- 2 STS tests: assume_role_returns_credentials, get_access_key_info. Contributed by @mvanhorn (#162)
 
 ---
 

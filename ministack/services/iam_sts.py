@@ -25,7 +25,7 @@ IAM actions:
   SimulatePrincipalPolicy, SimulateCustomPolicy.
 
 STS actions:
-  GetCallerIdentity, AssumeRole, GetSessionToken.
+  GetCallerIdentity, AssumeRole, GetSessionToken, GetAccessKeyInfo.
 """
 
 import copy
@@ -1421,6 +1421,14 @@ async def handle_sts_request(method, path, headers, body, query_params):
                     f"<Expiration>{expiration}</Expiration>"
                     f"</Credentials>"
                     f"</GetSessionTokenResult>",
+                    ns="sts")
+
+    if action == "GetAccessKeyInfo":
+        access_key = _p(params, "AccessKeyId") or ""
+        return _xml(200, "GetAccessKeyInfoResponse",
+                    f"<GetAccessKeyInfoResult>"
+                    f"<Account>{ACCOUNT_ID}</Account>"
+                    f"</GetAccessKeyInfoResult>",
                     ns="sts")
 
     return _error(400, "InvalidAction", f"Unknown STS action: {action}", ns="sts")
