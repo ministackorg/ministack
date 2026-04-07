@@ -7,11 +7,18 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [1.1.45] — 2026-04-07
+
+### Added
+- **CFN 8 EC2 resource types** — `AWS::EC2::VPC`, `AWS::EC2::Subnet`, `AWS::EC2::SecurityGroup`, `AWS::EC2::InternetGateway`, `AWS::EC2::VPCGatewayAttachment`, `AWS::EC2::RouteTable`, `AWS::EC2::Route`, `AWS::EC2::SubnetRouteTableAssociation`. CDK/CFN VPC stacks now deploy end-to-end. 48 CFN resource types total.
+- **`ready.d` scripts** — shell scripts in `/docker-entrypoint-initaws.d/ready.d/` execute after the server is fully started and accepting connections. Enables seeding AWS resources (S3 buckets, SQS queues, etc.) on startup. Contributed by @kjdev (#159)
+
+---
+
 ## [1.1.44] — 2026-04-06
 
 ### Added
-- **CFN `AWS::IAM::ManagedPolicy`, `AWS::KMS::Key`, `AWS::KMS::Alias`** — completes full CDK bootstrap support. All 9 resource types in the CDKToolkit stack now work.
-- **CFN 8 EC2 resource types** — `AWS::EC2::VPC`, `AWS::EC2::Subnet`, `AWS::EC2::SecurityGroup`, `AWS::EC2::InternetGateway`, `AWS::EC2::VPCGatewayAttachment`, `AWS::EC2::RouteTable`, `AWS::EC2::Route`, `AWS::EC2::SubnetRouteTableAssociation`. CDK/CFN VPC stacks now deploy end-to-end. 48 CFN resource types total.
+- **CFN `AWS::IAM::ManagedPolicy`, `AWS::KMS::Key`, `AWS::KMS::Alias`** — completes full CDK bootstrap support. All 9 resource types in the CDKToolkit stack now work. Reported by @youngkwangk (#152)
 - **Step Functions nested `startExecution.sync`** — parent workflows can now invoke child state machines synchronously via `arn:aws:states:::states:startExecution.sync` and `.sync:2`. Output shape matches AWS (`.sync` = JSON string, `.sync:2` = parsed JSON). Contributed by @jayjanssen (#157)
 
 ### Fixed
