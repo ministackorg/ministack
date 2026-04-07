@@ -4425,6 +4425,155 @@ def test_sfn_intrinsic_nested(sfn, sfn_sync):
 
 
 # ===================================================================
+# Step Functions — aws-sdk:* generic dispatcher tests
+# ===================================================================
+
+
+def test_sfn_aws_sdk_secretsmanager_create_and_get(sfn, sfn_sync, sm):
+    """aws-sdk:secretsmanager integration creates and retrieves a secret."""
+    import uuid as _uuid
+
+    secret_name = f"sfn-sdk-test-{_uuid.uuid4().hex[:8]}"
+    sm_name = f"sdk-sm-{_uuid.uuid4().hex[:8]}"
+
+    definition = json.dumps({
+        "StartAt": "CreateSecret",
+        "States": {
+            "CreateSecret": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::aws-sdk:secretsmanager:CreateSecret",
+                "Parameters": {
+                    "Name": secret_name,
+                    "SecretString": "hunter2",
+                },
+                "ResultPath": "$.createResult",
+                "Next": "DescribeSecret",
+            },
+            "DescribeSecret": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::aws-sdk:secretsmanager:DescribeSecret",
+                "Parameters": {
+                    "SecretId": secret_name,
+                },
+                "ResultPath": "$.describeResult",
+                "Next": "Done",
+            },
+            "Done": {"Type": "Succeed"},
+        },
+    })
+
+    sm_arn = sfn_sync.create_state_machine(
+        name=sm_name,
+        definition=definition,
+        roleArn="arn:aws:iam::000000000000:role/sfn-role",
+    )["stateMachineArn"]
+
+    resp = sfn_sync.start_sync_execution(stateMachineArn=sm_arn, input=json.dumps({}))
+    assert resp["status"] == "SUCCEEDED", f"Execution failed: {resp.get('error')} — {resp.get('cause')}"
+    output = json.loads(resp["output"])
+    assert "createResult" in output
+    assert output["createResult"]["Name"] == secret_name
+    assert "describeResult" in output
+    assert output["describeResult"]["Name"] == secret_name
+
+    sfn_sync.delete_state_machine(stateMachineArn=sm_arn)
+
+
+def test_sfn_aws_sdk_dynamodb_put_and_get(sfn, sfn_sync, ddb):
+    """aws-sdk:dynamodb integration puts and gets an item."""
+    import uuid as _uuid
+
+    table_name = f"sfn-sdk-ddb-{_uuid.uuid4().hex[:8]}"
+    sm_name = f"sdk-ddb-{_uuid.uuid4().hex[:8]}"
+
+    ddb.create_table(
+        TableName=table_name,
+        KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+        AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "S"}],
+        BillingMode="PAY_PER_REQUEST",
+    )
+
+    definition = json.dumps({
+        "StartAt": "PutItem",
+        "States": {
+            "PutItem": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::aws-sdk:dynamodb:PutItem",
+                "Parameters": {
+                    "TableName": table_name,
+                    "Item": {
+                        "pk": {"S": "key1"},
+                        "data": {"S": "hello"},
+                    },
+                },
+                "ResultPath": "$.putResult",
+                "Next": "GetItem",
+            },
+            "GetItem": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::aws-sdk:dynamodb:GetItem",
+                "Parameters": {
+                    "TableName": table_name,
+                    "Key": {
+                        "pk": {"S": "key1"},
+                    },
+                },
+                "ResultPath": "$.getResult",
+                "Next": "Done",
+            },
+            "Done": {"Type": "Succeed"},
+        },
+    })
+
+    sm_arn = sfn_sync.create_state_machine(
+        name=sm_name,
+        definition=definition,
+        roleArn="arn:aws:iam::000000000000:role/sfn-role",
+    )["stateMachineArn"]
+
+    resp = sfn_sync.start_sync_execution(stateMachineArn=sm_arn, input=json.dumps({}))
+    assert resp["status"] == "SUCCEEDED", f"Execution failed: {resp.get('error')} — {resp.get('cause')}"
+    output = json.loads(resp["output"])
+    assert "getResult" in output
+    item = output["getResult"].get("Item", {})
+    assert item.get("pk", {}).get("S") == "key1"
+    assert item.get("data", {}).get("S") == "hello"
+
+    sfn_sync.delete_state_machine(stateMachineArn=sm_arn)
+
+
+def test_sfn_aws_sdk_unknown_service_fails(sfn, sfn_sync):
+    """aws-sdk integration with unsupported service returns clean error."""
+    import uuid as _uuid
+
+    sm_name = f"sdk-unknown-{_uuid.uuid4().hex[:8]}"
+
+    definition = json.dumps({
+        "StartAt": "BadCall",
+        "States": {
+            "BadCall": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::aws-sdk:neptune:DescribeDBClusters",
+                "Parameters": {},
+                "End": True,
+            },
+        },
+    })
+
+    sm_arn = sfn_sync.create_state_machine(
+        name=sm_name,
+        definition=definition,
+        roleArn="arn:aws:iam::000000000000:role/sfn-role",
+    )["stateMachineArn"]
+
+    resp = sfn_sync.start_sync_execution(stateMachineArn=sm_arn, input=json.dumps({}))
+    assert resp["status"] == "FAILED"
+    assert "neptune" in resp.get("cause", "").lower() or "neptune" in resp.get("error", "").lower()
+
+    sfn_sync.delete_state_machine(stateMachineArn=sm_arn)
+
+
+# ===================================================================
 # ECS — comprehensive tests
 # ===================================================================
 

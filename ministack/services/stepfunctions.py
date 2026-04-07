@@ -513,7 +513,7 @@ def _start_sync_execution(data):
     _run_execution(exec_arn)
 
     execution = _executions[exec_arn]
-    return json_response({
+    resp = {
         "executionArn": exec_arn,
         "stateMachineArn": sm_arn,
         "name": name,
@@ -524,7 +524,18 @@ def _start_sync_execution(data):
         "inputDetails": {"included": True},
         "output": execution.get("output") or "{}",
         "outputDetails": {"included": True},
-    })
+    }
+    # Include error/cause for failed executions (matches AWS SFN behaviour)
+    if execution["status"] == "FAILED":
+        failed_events = [
+            e for e in execution.get("events", [])
+            if e.get("type") == "ExecutionFailed"
+        ]
+        if failed_events:
+            details = failed_events[-1].get("executionFailedEventDetails", {})
+            resp["error"] = details.get("error", "")
+            resp["cause"] = details.get("cause", "")
+    return json_response(resp)
 
 
 def _describe_state_machine_for_execution(data):
@@ -1208,6 +1219,10 @@ def _invoke_resource(resource, input_data):
     for prefix, handler in _SERVICE_DISPATCH.items():
         if clean.startswith(prefix):
             return handler(resource, input_data)
+
+    # Generic aws-sdk:* service integration
+    if "aws-sdk:" in resource:
+        return _invoke_aws_sdk_integration(resource, input_data)
 
     return input_data
 
@@ -2082,6 +2097,127 @@ def _pascal_to_camel(d):
         new_key = k[0].lower() + k[1:] if k else k
         out[new_key] = v
     return out
+
+
+# ---------------------------------------------------------------------------
+# Generic aws-sdk:* task dispatcher
+# ---------------------------------------------------------------------------
+
+# Map aws-sdk service names to MiniStack internal routing info.
+# service_key overrides the key used in app.SERVICE_HANDLERS when it differs
+# from the sdk service name.
+_AWS_SDK_SERVICE_MAP = {
+    # JSON-protocol services: use X-Amz-Target header
+    "dynamodb": {"target_prefix": "DynamoDB_20120810", "protocol": "json"},
+    "secretsmanager": {"target_prefix": "secretsmanager", "protocol": "json"},
+    "sfn": {"target_prefix": "AWSStepFunctions", "protocol": "json", "service_key": "states"},
+    "logs": {"target_prefix": "Logs_20140328", "protocol": "json"},
+    "ssm": {"target_prefix": "AmazonSSM", "protocol": "json"},
+    "eventbridge": {"target_prefix": "AWSEvents", "protocol": "json", "service_key": "events"},
+    "kinesis": {"target_prefix": "Kinesis_20131202", "protocol": "json"},
+    "glue": {"target_prefix": "AWSGlue", "protocol": "json"},
+    "athena": {"target_prefix": "AmazonAthena", "protocol": "json"},
+    "ecs": {"target_prefix": "AmazonEC2ContainerServiceV20141113", "protocol": "json"},
+    "ecr": {"target_prefix": "AmazonEC2ContainerRegistry_V20150921", "protocol": "json"},
+    "kms": {"target_prefix": "TrentService", "protocol": "json"},
+    # Query-protocol services (not yet supported via aws-sdk dispatcher)
+    "sqs": {"protocol": "query"},
+    "sns": {"protocol": "query"},
+    "rds": {"protocol": "query"},
+    "elasticache": {"protocol": "query"},
+    "ec2": {"protocol": "query"},
+    "iam": {"protocol": "query"},
+    "sts": {"protocol": "query"},
+    "cloudwatch": {"protocol": "query", "service_key": "monitoring"},
+    # REST services (not yet supported via aws-sdk dispatcher)
+    "s3": {"protocol": "rest"},
+    "lambda": {"protocol": "rest"},
+}
+
+
+def _dispatch_aws_sdk_json(service_info, service_name, action, input_data):
+    """Dispatch an aws-sdk integration call to a JSON-protocol MiniStack service."""
+    from ministack import app
+
+    target_prefix = service_info["target_prefix"]
+    target = f"{target_prefix}.{action}"
+    service_key = service_info.get("service_key", service_name)
+
+    handler = app.SERVICE_HANDLERS.get(service_key)
+    if not handler:
+        raise _ExecutionError(
+            "States.Runtime",
+            f"Service '{service_key}' is not available in MiniStack",
+        )
+
+    body = json.dumps(input_data)
+    headers = {
+        "x-amz-target": target,
+        "content-type": "application/x-amz-json-1.0",
+        "host": f"{service_key}.{REGION}.amazonaws.com",
+        "authorization": (
+            f"AWS4-HMAC-SHA256 Credential=test/20260101/{REGION}/{service_key}/aws4_request"
+        ),
+    }
+
+    # Service handlers are async def but perform no real I/O, so we can
+    # drive the coroutine synchronously — this avoids conflicts with the
+    # already-running uvicorn event loop.
+    coro = handler("POST", "/", headers, body, {})
+    try:
+        coro.send(None)
+    except StopIteration as stop:
+        status, resp_headers, resp_body = stop.value
+    else:
+        # If the coroutine didn't finish in one step it truly needs async;
+        # fall back to the event loop (only reachable if a handler awaits).
+        coro.close()
+        loop = asyncio.new_event_loop()
+        try:
+            status, resp_headers, resp_body = loop.run_until_complete(
+                handler("POST", "/", headers, body, {})
+            )
+        finally:
+            loop.close()
+
+    decoded = resp_body.decode("utf-8") if isinstance(resp_body, bytes) else resp_body
+    result = json.loads(decoded) if decoded else {}
+
+    if status >= 400:
+        error_type = result.get("__type", result.get("Error", {}).get("Code", f"{service_name}.ServiceException"))
+        error_msg = result.get("message", result.get("Message", str(result)))
+        raise _ExecutionError(error_type, error_msg)
+
+    return result
+
+
+def _invoke_aws_sdk_integration(resource, input_data):
+    """Dispatch arn:aws:states:::aws-sdk:<service>:<action> to the target MiniStack service."""
+    # Parse service and action from ARN
+    parts = resource.replace(".sync", "").replace(".waitForTaskToken", "").split(":")
+    # arn:aws:states:::aws-sdk:<service>:<action>
+    # parts after split: ['arn', 'aws', 'states', '', '', 'aws-sdk', '<service>', '<action>']
+    if len(parts) < 8 or parts[5] != "aws-sdk":
+        raise _ExecutionError("States.Runtime", f"Invalid aws-sdk resource ARN: {resource}")
+    service_name = parts[6].lower()
+    action = parts[7]
+
+    service_info = _AWS_SDK_SERVICE_MAP.get(service_name)
+    if not service_info:
+        raise _ExecutionError(
+            "States.Runtime",
+            f"Service '{service_name}' is not supported in MiniStack aws-sdk integrations",
+        )
+
+    protocol = service_info["protocol"]
+    if protocol != "json":
+        raise _ExecutionError(
+            "States.Runtime",
+            f"aws-sdk integration for {protocol}-protocol service '{service_name}' "
+            "is not yet implemented; use native service integrations instead",
+        )
+
+    return _dispatch_aws_sdk_json(service_info, service_name, action, input_data)
 
 
 _SERVICE_DISPATCH = {
