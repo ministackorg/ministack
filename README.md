@@ -343,6 +343,7 @@ Unsupported resource types fail with `CREATE_FAILED` (or `ROLLBACK_COMPLETE` if 
 | **ECR** | CreateRepository, DescribeRepositories, DeleteRepository, ListImages, DescribeImages, PutImage, BatchGetImage, BatchDeleteImage, GetAuthorizationToken, GetRepositoryPolicy, SetRepositoryPolicy, DeleteRepositoryPolicy, PutLifecyclePolicy, GetLifecyclePolicy, DeleteLifecyclePolicy, ListTagsForResource, TagResource, UntagResource, PutImageTagMutability, PutImageScanningConfiguration, DescribeRegistry, GetDownloadUrlForLayer, BatchCheckLayerAvailability, InitiateLayerUpload, UploadLayerPart, CompleteLayerUpload | In-memory image registry; Docker V2 manifest support; authorization token generation; lifecycle policies; tag mutability; Pro-only on LocalStack — free here |
 | **AppSync** | CreateGraphQLApi, GetGraphQLApi, ListGraphQLApis, UpdateGraphQLApi, DeleteGraphQLApi, CreateApiKey, DeleteApiKey, ListApiKeys, CreateDataSource, GetDataSource, ListDataSources, DeleteDataSource, CreateResolver, GetResolver, ListResolvers, DeleteResolver, CreateType, ListTypes, GetType, TagResource, UntagResource, ListTagsForResource | Control plane + data plane; GraphQL queries/mutations execute against DynamoDB resolvers (create/get/list/update/delete); Lambda resolvers supported; designed for Amplify/CDK CRUD patterns — not a full GraphQL spec engine |
 | **Cloud Map** | CreateHttpNamespace, CreatePrivateDnsNamespace, CreatePublicDnsNamespace, GetNamespace, ListNamespaces, DeleteNamespace, UpdateHttpNamespace, UpdatePrivateDnsNamespace, UpdatePublicDnsNamespace, CreateService, GetService, ListServices, DeleteService, UpdateService, RegisterInstance, DeregisterInstance, DiscoverInstances, DiscoverInstancesRevision, ListInstances, GetInstancesHealthStatus, UpdateInstanceCustomHealthStatus, GetServiceAttributes, UpdateServiceAttributes, DeleteServiceAttributes, GetOperation, ListOperations, TagResource, UntagResource, ListTagsForResource | DNS namespaces create Route53 hosted zones; operation tracking; Terraform `aws_service_discovery_*` compatible |
+| **S3 Files** | CreateFileSystem, GetFileSystem, ListFileSystems, DeleteFileSystem, CreateMountTarget, GetMountTarget, ListMountTargets, UpdateMountTarget, DeleteMountTarget, CreateAccessPoint, GetAccessPoint, ListAccessPoints, DeleteAccessPoint, GetFileSystemPolicy, PutFileSystemPolicy, DeleteFileSystemPolicy, GetSynchronizationConfiguration, PutSynchronizationConfiguration, TagResource, UntagResource, ListTagsForResource | 21 operations; control plane for the new S3 Files service (launched April 2026); file systems, mount targets, access points, policies |
 
 ---
 
@@ -799,6 +800,7 @@ See [`Testcontainers/java-testcontainers`](Testcontainers/java-testcontainers), 
 | **CloudFront** | ✅ | Paid | ✅ |
 | **AppSync** | ✅ | NO | ✅ |
 | **Cloud Map** | ✅ | ❌ | ✅ |
+| **S3 Files** | ✅ | ❌ | ❌ |
 | Cost | **Free forever** | Was free, now paid | $35+/mo |
 | Docker image size | ~250MB | ~1GB | ~1GB |
 | Memory at idle | ~40MB | ~500MB | ~500MB |

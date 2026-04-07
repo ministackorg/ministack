@@ -7,6 +7,19 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [1.1.48] — 2026-04-07
+
+### Added
+- **S3 Files service (21 operations)** — CreateFileSystem, GetFileSystem, ListFileSystems, DeleteFileSystem, CreateMountTarget, GetMountTarget, ListMountTargets, UpdateMountTarget, DeleteMountTarget, CreateAccessPoint, GetAccessPoint, ListAccessPoints, DeleteAccessPoint, policies, synchronization config, tagging. First emulator to support AWS S3 Files (launched April 7 2026). 39 services total.
+- **Step Functions query-protocol aws-sdk:* dispatcher** — extends the generic aws-sdk dispatcher to support query-protocol services: RDS, SQS, SNS, ElastiCache, EC2, IAM, STS, CloudWatch. XML responses automatically converted to JSON. Contributed by @jayjanssen (#174)
+- **Cognito RSA JWT signing** — tokens now signed with the RSA private key matching the JWKS endpoint. Adds `username` claim to access tokens. Contributed by @MartinsMLX (#172)
+
+### Tests
+- Comprehensive aws-sdk:secretsmanager SFN task dispatch coverage. Contributed by @jayjanssen (#173)
+- 1054 tests total
+
+---
+
 ## [1.1.47] — 2026-04-07
 
 ### Added
