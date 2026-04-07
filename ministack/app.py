@@ -563,6 +563,7 @@ async def _handle_lifespan(scope, receive, send):
             if PERSIST_STATE:
                 _load_persisted_state()
             await send({"type": "lifespan.startup.complete"})
+            asyncio.create_task(_run_ready_scripts())
         elif message["type"] == "lifespan.shutdown":
             logger.info("MiniStack shutting down...")
             if PERSIST_STATE:
@@ -617,6 +618,57 @@ def _load_persisted_state():
     if data_v1:
         apigateway_v1.load_persisted_state(data_v1)
         logger.info("Loaded persisted state for apigateway_v1")
+
+
+async def _wait_for_port(port, timeout=30):
+    """Wait until the server is accepting TCP connections."""
+    import time
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            reader, writer = await asyncio.open_connection('127.0.0.1', port)
+            writer.close()
+            await writer.wait_closed()
+            return
+        except OSError:
+            await asyncio.sleep(0.1)
+    logger.warning('Server did not become ready within %ds — skipping ready.d scripts', timeout)
+
+
+async def _run_ready_scripts():
+    """Execute .sh scripts from /docker-entrypoint-initaws.d/ready.d/ after the server is ready."""
+    ready_dir = '/docker-entrypoint-initaws.d/ready.d'
+    if not os.path.isdir(ready_dir):
+        return
+    scripts = sorted(f for f in os.listdir(ready_dir) if f.endswith('.sh'))
+    if not scripts:
+        return
+    port = int(_resolve_port())
+    await _wait_for_port(port)
+    logger.info('Found %d ready script(s) in %s', len(scripts), ready_dir)
+    for script in scripts:
+        script_path = os.path.join(ready_dir, script)
+        logger.info('Running ready script: %s', script_path)
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                'sh', script_path,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=os.environ,
+            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=300)
+            if stdout:
+                logger.info('  stdout: %s', stdout.decode('utf-8', errors='replace').rstrip())
+            if proc.returncode != 0:
+                logger.error('Ready script %s failed (exit %d): %s', script_path, proc.returncode,
+                             stderr.decode('utf-8', errors='replace'))
+            else:
+                logger.info('Ready script %s completed successfully', script_path)
+        except asyncio.TimeoutError:
+            logger.error('Ready script %s timed out after 300s', script_path)
+            proc.kill()
+        except Exception as e:
+            logger.error('Failed to execute ready script %s: %s', script_path, e)
 
 
 def _run_init_scripts():
