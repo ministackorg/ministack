@@ -7,6 +7,13 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [Unreleased]
+
+### Tests
+- 5 new tests: comprehensive `aws-sdk:secretsmanager` Step Functions task dispatch coverage — PutSecretValue+GetSecretValue round-trip, GetRandomPassword, DeleteSecret, full create→put→get→describe→delete lifecycle, and error propagation for missing secrets. Contributed by @jayjanssen
+
+---
+
 ## [1.1.47] — 2026-04-07
 
 ### Added

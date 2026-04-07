@@ -4574,6 +4574,268 @@ def test_sfn_aws_sdk_unknown_service_fails(sfn, sfn_sync):
 
 
 # ===================================================================
+# Step Functions aws-sdk:secretsmanager — comprehensive dispatch tests
+# ===================================================================
+
+
+def test_sfn_aws_sdk_secretsmanager_put_and_get(sfn, sfn_sync, sm):
+    """aws-sdk:secretsmanager PutSecretValue then GetSecretValue round-trip."""
+    import uuid as _uuid
+
+    secret_name = f"sfn-sdk-put-get-{_uuid.uuid4().hex[:8]}"
+    sm_name = f"sdk-sm-put-{_uuid.uuid4().hex[:8]}"
+
+    # Pre-create the secret so we can PutSecretValue to it
+    sm.create_secret(Name=secret_name, SecretString="initial")
+
+    definition = json.dumps({
+        "StartAt": "PutValue",
+        "States": {
+            "PutValue": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::aws-sdk:secretsmanager:PutSecretValue",
+                "Parameters": {
+                    "SecretId": secret_name,
+                    "SecretString": "updated-via-sfn",
+                },
+                "ResultPath": "$.putResult",
+                "Next": "GetValue",
+            },
+            "GetValue": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::aws-sdk:secretsmanager:GetSecretValue",
+                "Parameters": {
+                    "SecretId": secret_name,
+                },
+                "ResultPath": "$.getResult",
+                "Next": "Done",
+            },
+            "Done": {"Type": "Succeed"},
+        },
+    })
+
+    sm_arn = sfn_sync.create_state_machine(
+        name=sm_name,
+        definition=definition,
+        roleArn="arn:aws:iam::000000000000:role/sfn-role",
+    )["stateMachineArn"]
+
+    resp = sfn_sync.start_sync_execution(stateMachineArn=sm_arn, input=json.dumps({}))
+    assert resp["status"] == "SUCCEEDED", f"Execution failed: {resp.get('error')} — {resp.get('cause')}"
+    output = json.loads(resp["output"])
+    assert output["getResult"]["SecretString"] == "updated-via-sfn"
+    assert output["putResult"]["Name"] == secret_name
+
+    sfn_sync.delete_state_machine(stateMachineArn=sm_arn)
+
+
+def test_sfn_aws_sdk_secretsmanager_get_random_password(sfn, sfn_sync):
+    """aws-sdk:secretsmanager GetRandomPassword returns a password string."""
+    import uuid as _uuid
+
+    sm_name = f"sdk-sm-rndpw-{_uuid.uuid4().hex[:8]}"
+
+    definition = json.dumps({
+        "StartAt": "GetPassword",
+        "States": {
+            "GetPassword": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::aws-sdk:secretsmanager:GetRandomPassword",
+                "Parameters": {
+                    "PasswordLength": 20,
+                    "ExcludePunctuation": True,
+                },
+                "ResultPath": "$.passwordResult",
+                "Next": "Done",
+            },
+            "Done": {"Type": "Succeed"},
+        },
+    })
+
+    sm_arn = sfn_sync.create_state_machine(
+        name=sm_name,
+        definition=definition,
+        roleArn="arn:aws:iam::000000000000:role/sfn-role",
+    )["stateMachineArn"]
+
+    resp = sfn_sync.start_sync_execution(stateMachineArn=sm_arn, input=json.dumps({}))
+    assert resp["status"] == "SUCCEEDED", f"Execution failed: {resp.get('error')} — {resp.get('cause')}"
+    output = json.loads(resp["output"])
+    pw = output["passwordResult"]["RandomPassword"]
+    assert isinstance(pw, str)
+    assert len(pw) == 20
+
+    sfn_sync.delete_state_machine(stateMachineArn=sm_arn)
+
+
+def test_sfn_aws_sdk_secretsmanager_delete(sfn, sfn_sync, sm):
+    """aws-sdk:secretsmanager DeleteSecret marks a secret for deletion."""
+    import uuid as _uuid
+
+    secret_name = f"sfn-sdk-del-{_uuid.uuid4().hex[:8]}"
+    sm_name = f"sdk-sm-del-{_uuid.uuid4().hex[:8]}"
+
+    sm.create_secret(Name=secret_name, SecretString="to-delete")
+
+    definition = json.dumps({
+        "StartAt": "DeleteSecret",
+        "States": {
+            "DeleteSecret": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::aws-sdk:secretsmanager:DeleteSecret",
+                "Parameters": {
+                    "SecretId": secret_name,
+                    "ForceDeleteWithoutRecovery": True,
+                },
+                "ResultPath": "$.deleteResult",
+                "Next": "Done",
+            },
+            "Done": {"Type": "Succeed"},
+        },
+    })
+
+    sm_arn = sfn_sync.create_state_machine(
+        name=sm_name,
+        definition=definition,
+        roleArn="arn:aws:iam::000000000000:role/sfn-role",
+    )["stateMachineArn"]
+
+    resp = sfn_sync.start_sync_execution(stateMachineArn=sm_arn, input=json.dumps({}))
+    assert resp["status"] == "SUCCEEDED", f"Execution failed: {resp.get('error')} — {resp.get('cause')}"
+    output = json.loads(resp["output"])
+    assert output["deleteResult"]["Name"] == secret_name
+
+    sfn_sync.delete_state_machine(stateMachineArn=sm_arn)
+
+
+def test_sfn_aws_sdk_secretsmanager_full_lifecycle(sfn, sfn_sync):
+    """Full lifecycle via aws-sdk: create → put → get → describe → delete."""
+    import uuid as _uuid
+
+    secret_name = f"sfn-sdk-lifecycle-{_uuid.uuid4().hex[:8]}"
+    sm_name = f"sdk-sm-lifecycle-{_uuid.uuid4().hex[:8]}"
+
+    definition = json.dumps({
+        "StartAt": "Create",
+        "States": {
+            "Create": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::aws-sdk:secretsmanager:CreateSecret",
+                "Parameters": {
+                    "Name": secret_name,
+                    "SecretString": "step1",
+                },
+                "ResultPath": "$.createResult",
+                "Next": "Put",
+            },
+            "Put": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::aws-sdk:secretsmanager:PutSecretValue",
+                "Parameters": {
+                    "SecretId": secret_name,
+                    "SecretString": "step2",
+                },
+                "ResultPath": "$.putResult",
+                "Next": "Get",
+            },
+            "Get": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::aws-sdk:secretsmanager:GetSecretValue",
+                "Parameters": {
+                    "SecretId": secret_name,
+                },
+                "ResultPath": "$.getResult",
+                "Next": "Describe",
+            },
+            "Describe": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::aws-sdk:secretsmanager:DescribeSecret",
+                "Parameters": {
+                    "SecretId": secret_name,
+                },
+                "ResultPath": "$.describeResult",
+                "Next": "Delete",
+            },
+            "Delete": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::aws-sdk:secretsmanager:DeleteSecret",
+                "Parameters": {
+                    "SecretId": secret_name,
+                    "ForceDeleteWithoutRecovery": True,
+                },
+                "ResultPath": "$.deleteResult",
+                "Next": "Done",
+            },
+            "Done": {"Type": "Succeed"},
+        },
+    })
+
+    sm_arn = sfn_sync.create_state_machine(
+        name=sm_name,
+        definition=definition,
+        roleArn="arn:aws:iam::000000000000:role/sfn-role",
+    )["stateMachineArn"]
+
+    resp = sfn_sync.start_sync_execution(stateMachineArn=sm_arn, input=json.dumps({}))
+    assert resp["status"] == "SUCCEEDED", f"Execution failed: {resp.get('error')} — {resp.get('cause')}"
+    output = json.loads(resp["output"])
+
+    # Verify create
+    assert output["createResult"]["Name"] == secret_name
+    assert "ARN" in output["createResult"]
+
+    # Verify put
+    assert output["putResult"]["Name"] == secret_name
+    assert "VersionId" in output["putResult"]
+
+    # Verify get — should have the updated value
+    assert output["getResult"]["SecretString"] == "step2"
+    assert output["getResult"]["Name"] == secret_name
+
+    # Verify describe
+    assert output["describeResult"]["Name"] == secret_name
+    assert "ARN" in output["describeResult"]
+
+    # Verify delete
+    assert output["deleteResult"]["Name"] == secret_name
+
+    sfn_sync.delete_state_machine(stateMachineArn=sm_arn)
+
+
+def test_sfn_aws_sdk_secretsmanager_not_found_error(sfn, sfn_sync):
+    """aws-sdk:secretsmanager GetSecretValue on missing secret propagates error."""
+    import uuid as _uuid
+
+    sm_name = f"sdk-sm-notfound-{_uuid.uuid4().hex[:8]}"
+
+    definition = json.dumps({
+        "StartAt": "GetMissing",
+        "States": {
+            "GetMissing": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::aws-sdk:secretsmanager:GetSecretValue",
+                "Parameters": {
+                    "SecretId": "this-secret-does-not-exist",
+                },
+                "End": True,
+            },
+        },
+    })
+
+    sm_arn = sfn_sync.create_state_machine(
+        name=sm_name,
+        definition=definition,
+        roleArn="arn:aws:iam::000000000000:role/sfn-role",
+    )["stateMachineArn"]
+
+    resp = sfn_sync.start_sync_execution(stateMachineArn=sm_arn, input=json.dumps({}))
+    assert resp["status"] == "FAILED"
+    assert "ResourceNotFoundException" in (resp.get("error", "") + resp.get("cause", ""))
+
+    sfn_sync.delete_state_machine(stateMachineArn=sm_arn)
+
+
+# ===================================================================
 # ECS — comprehensive tests
 # ===================================================================
 
