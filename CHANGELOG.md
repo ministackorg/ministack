@@ -7,6 +7,13 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [1.1.51] — 2026-04-08
+
+### Fixed
+- **SQS FIFO `ReceiveMessage` returns all messages in same group** — was incorrectly returning only 1 message per MessageGroupId per batch. AWS allows up to 10 messages from the same group in a single `ReceiveMessage` call; the per-group restriction only applies to subsequent calls while messages are in-flight. Reported by @mspiller (#179)
+
+---
+
 ## [1.1.50] — 2026-04-08
 
 ### Added

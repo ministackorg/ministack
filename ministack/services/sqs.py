@@ -655,7 +655,6 @@ def _collect_fifo(q: dict, max_n: int, vis_timeout: int,
         and m["receive_count"] > 0
         and m["group_id"]
     }
-    seen_groups: set = set()
     result: list = []
     for m in q["messages"]:
         if len(result) >= max_n:
@@ -663,7 +662,7 @@ def _collect_fifo(q: dict, max_n: int, vis_timeout: int,
         if m["visible_at"] > now:
             continue
         g = m["group_id"]
-        if g in inflight_groups or g in seen_groups:
+        if g in inflight_groups:
             continue
         m["receipt_handle"] = new_uuid()
         m["visible_at"] = now + vis_timeout
@@ -671,8 +670,6 @@ def _collect_fifo(q: dict, max_n: int, vis_timeout: int,
         if m.get("first_receive_at") is None:
             m["first_receive_at"] = now
         result.append(m)
-        if g is not None:
-            seen_groups.add(g)
     return result
 
 
