@@ -7,6 +7,13 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [1.1.50] — 2026-04-08
+
+### Added
+- **CFN `AWS::ECS::Cluster`, `AWS::ECS::TaskDefinition`, `AWS::ECS::Service`** — ECS resources now work in CloudFormation/CDK stacks. 51 CFN resource types total.
+
+---
+
 ## [1.1.49] — 2026-04-08
 
 ### Added

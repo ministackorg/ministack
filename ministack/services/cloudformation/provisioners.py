@@ -30,6 +30,7 @@ import ministack.services.cognito as _cognito
 import ministack.services.ecr as _ecr
 import ministack.services.kms as _kms
 import ministack.services.ec2 as _ec2
+import ministack.services.ecs as _ecs
 
 
 logger = logging.getLogger("cloudformation")
@@ -1572,6 +1573,94 @@ def _ec2_subnet_rtb_assoc_delete(physical_id, props):
         rtb["Associations"] = [a for a in rtb["Associations"] if a["RouteTableAssociationId"] != physical_id]
 
 
+# --- ECS resource provisioners ---
+
+def _ecs_cluster_create(logical_id, props, stack_name):
+    name = props.get("ClusterName", f"{stack_name}-{logical_id}")
+    arn = f"arn:aws:ecs:{REGION}:{ACCOUNT_ID}:cluster/{name}"
+    _ecs._clusters[name] = {
+        "clusterArn": arn,
+        "clusterName": name,
+        "status": "ACTIVE",
+        "registeredContainerInstancesCount": 0,
+        "runningTasksCount": 0,
+        "pendingTasksCount": 0,
+        "activeServicesCount": 0,
+        "settings": props.get("ClusterSettings", []),
+        "capacityProviders": props.get("CapacityProviders", []),
+        "defaultCapacityProviderStrategy": props.get("DefaultCapacityProviderStrategy", []),
+        "tags": [{"key": t["Key"], "value": t["Value"]} for t in props.get("Tags", [])],
+    }
+    return name, {"Arn": arn, "ClusterName": name}
+
+
+def _ecs_cluster_delete(physical_id, props):
+    _ecs._clusters.pop(physical_id, None)
+
+
+def _ecs_task_def_create(logical_id, props, stack_name):
+    family = props.get("Family", f"{stack_name}-{logical_id}")
+    revision = 1
+    td_key = f"{family}:{revision}"
+    arn = f"arn:aws:ecs:{REGION}:{ACCOUNT_ID}:task-definition/{td_key}"
+    td = {
+        "taskDefinitionArn": arn,
+        "family": family,
+        "revision": revision,
+        "status": "ACTIVE",
+        "containerDefinitions": props.get("ContainerDefinitions", []),
+        "requiresCompatibilities": props.get("RequiresCompatibilities", ["EC2"]),
+        "networkMode": props.get("NetworkMode", "bridge"),
+        "cpu": props.get("Cpu", "256"),
+        "memory": props.get("Memory", "512"),
+        "executionRoleArn": props.get("ExecutionRoleArn", ""),
+        "taskRoleArn": props.get("TaskRoleArn", ""),
+        "volumes": props.get("Volumes", []),
+        "placementConstraints": props.get("PlacementConstraints", []),
+    }
+    _ecs._task_defs[td_key] = td
+    _ecs._task_def_latest[family] = td_key
+    return arn, {"TaskDefinitionArn": arn}
+
+
+def _ecs_task_def_delete(physical_id, props):
+    _ecs._task_defs.pop(physical_id, None)
+
+
+def _ecs_service_create(logical_id, props, stack_name):
+    name = props.get("ServiceName", f"{stack_name}-{logical_id}")
+    cluster = props.get("Cluster", "default")
+    arn = f"arn:aws:ecs:{REGION}:{ACCOUNT_ID}:service/{cluster}/{name}"
+    svc = {
+        "serviceArn": arn,
+        "serviceName": name,
+        "clusterArn": f"arn:aws:ecs:{REGION}:{ACCOUNT_ID}:cluster/{cluster}",
+        "taskDefinition": props.get("TaskDefinition", ""),
+        "desiredCount": props.get("DesiredCount", 1),
+        "runningCount": 0,
+        "status": "ACTIVE",
+        "launchType": props.get("LaunchType", "EC2"),
+        "deployments": [{
+            "id": f"ecs-svc/{new_uuid().replace('-','')[:32]}",
+            "status": "PRIMARY",
+            "taskDefinition": props.get("TaskDefinition", ""),
+            "desiredCount": props.get("DesiredCount", 1),
+            "runningCount": 0,
+            "createdAt": __import__("time").time(),
+            "updatedAt": __import__("time").time(),
+        }],
+        "loadBalancers": props.get("LoadBalancers", []),
+        "networkConfiguration": props.get("NetworkConfiguration", {}),
+        "tags": [{"key": t["Key"], "value": t["Value"]} for t in props.get("Tags", [])],
+    }
+    _ecs._services[arn] = svc
+    return arn, {"ServiceArn": arn, "Name": name}
+
+
+def _ecs_service_delete(physical_id, props):
+    _ecs._services.pop(physical_id, None)
+
+
 # Resource Handler Registry
 # ===========================================================================
 
@@ -1624,4 +1713,7 @@ _RESOURCE_HANDLERS = {
     "AWS::EC2::RouteTable": {"create": _ec2_rtb_create, "delete": _ec2_rtb_delete},
     "AWS::EC2::Route": {"create": _ec2_route_create, "delete": _ec2_route_delete},
     "AWS::EC2::SubnetRouteTableAssociation": {"create": _ec2_subnet_rtb_assoc_create, "delete": _ec2_subnet_rtb_assoc_delete},
+    "AWS::ECS::Cluster": {"create": _ecs_cluster_create, "delete": _ecs_cluster_delete},
+    "AWS::ECS::TaskDefinition": {"create": _ecs_task_def_create, "delete": _ecs_task_def_delete},
+    "AWS::ECS::Service": {"create": _ecs_service_create, "delete": _ecs_service_delete},
 }
