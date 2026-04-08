@@ -21,7 +21,7 @@ import os
 import re
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime
 
 from ministack.core.responses import error_response_json, json_response, new_uuid
 
@@ -31,8 +31,22 @@ ACCOUNT_ID = os.environ.get("MINISTACK_ACCOUNT_ID", "000000000000")
 REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 
 
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+def _now_ts() -> float:
+    return time.time()
+
+
+def _coerce_timestamp(value):
+    if isinstance(value, (int, float)):
+        return value
+    if isinstance(value, str):
+        try:
+            return float(value)
+        except ValueError:
+            try:
+                return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+            except ValueError:
+                return value
+    return value
 
 
 from ministack.core.persistence import load_state, PERSIST_STATE
@@ -41,7 +55,8 @@ _event_buses: dict = {
     "default": {
         "Name": "default",
         "Arn": f"arn:aws:events:{REGION}:{ACCOUNT_ID}:event-bus/default",
-        "CreationTime": _now_iso(),
+        "CreationTime": _now_ts(),
+        "LastModifiedTime": _now_ts(),
     }
 }
 _rules: dict = {}
@@ -73,6 +88,16 @@ def restore_state(data):
         _targets.update(data.get("targets", {}))
         _tags.update(data.get("tags", {}))
 
+        for bus in _event_buses.values():
+            if "CreationTime" in bus:
+                bus["CreationTime"] = _coerce_timestamp(bus["CreationTime"])
+            if "LastModifiedTime" in bus:
+                bus["LastModifiedTime"] = _coerce_timestamp(bus["LastModifiedTime"])
+
+        for rule in _rules.values():
+            if "CreationTime" in rule:
+                rule["CreationTime"] = _coerce_timestamp(rule["CreationTime"])
+
 
 _restored = load_state("eventbridge")
 if _restored:
@@ -90,6 +115,7 @@ async def handle_request(method, path, headers, body, query_params):
 
     handlers = {
         "CreateEventBus": _create_event_bus,
+        "UpdateEventBus": _update_event_bus,
         "DeleteEventBus": _delete_event_bus,
         "ListEventBuses": _list_event_buses,
         "DescribeEventBus": _describe_event_bus,
@@ -141,10 +167,13 @@ def _create_event_bus(data):
     if name in _event_buses:
         return error_response_json("ResourceAlreadyExistsException", f"Event bus {name} already exists", 400)
     arn = f"arn:aws:events:{REGION}:{ACCOUNT_ID}:event-bus/{name}"
+    description = data.get("Description", "")
     _event_buses[name] = {
         "Name": name,
         "Arn": arn,
-        "CreationTime": _now_iso(),
+        "Description": description,
+        "CreationTime": _now_ts(),
+        "LastModifiedTime": _now_ts(),
     }
     tags = data.get("Tags", [])
     if tags:
@@ -171,9 +200,14 @@ def _list_event_buses(data):
     buses = []
     for n, b in _event_buses.items():
         if n.startswith(prefix):
+            policy = _event_bus_policies.get(n)
             buses.append({
                 "Name": b["Name"],
                 "Arn": b["Arn"],
+                "Description": b.get("Description", ""),
+                "CreationTime": b["CreationTime"],
+                "LastModifiedTime": b.get("LastModifiedTime", b.get("CreationTime")),
+                "Policy": json.dumps(policy) if policy else ""
             })
     return json_response({"EventBuses": buses})
 
@@ -183,10 +217,44 @@ def _describe_event_bus(data):
     bus = _event_buses.get(name)
     if not bus:
         return error_response_json("ResourceNotFoundException", f"Event bus {name} not found", 400)
+    policy = _event_bus_policies.get(name)
     return json_response({
         "Name": bus["Name"],
         "Arn": bus["Arn"],
+        "Description": bus.get("Description", ""),
         "CreationTime": bus["CreationTime"],
+        "LastModifiedTime": bus.get("LastModifiedTime", bus.get("CreationTime")),
+        "Policy": json.dumps(policy) if policy else "",
+    })
+
+
+def _update_event_bus(data):
+    name = data.get("Name")
+    if not name:
+        return error_response_json("ValidationException", "Name is required", 400)
+
+    if name not in _event_buses:
+        return error_response_json("ResourceNotFoundException", f"Event bus {name} not found", 400)
+
+    bus = _event_buses[name]
+    now = _now_ts()
+
+    # Allow updating a few mutable attributes (extendable).
+    if "EventSourceName" in data:
+        bus["EventSourceName"] = data.get("EventSourceName")
+    if "Description" in data:
+        bus["Description"] = data.get("Description")
+
+    # Update tags if provided
+    tags = data.get("Tags")
+    if tags:
+        _tags[bus["Arn"]] = {t["Key"]: t["Value"] for t in tags}
+
+    bus["LastModifiedTime"] = now
+
+    return json_response({
+        "EventBusArn": bus["Arn"],
+        "LastModifiedTime": bus["LastModifiedTime"],
     })
 
 
@@ -255,7 +323,7 @@ def _put_rule(data):
         "RoleArn": data.get("RoleArn", existing.get("RoleArn", "")),
         "ManagedBy": existing.get("ManagedBy", ""),
         "CreatedBy": ACCOUNT_ID,
-        "CreationTime": existing.get("CreationTime", _now_iso()),
+        "CreationTime": existing.get("CreationTime", _now_ts()),
     }
 
     tags = data.get("Tags", [])
@@ -386,7 +454,7 @@ def _put_events(data):
     for entry in entries:
         event_id = new_uuid()
         bus_name = entry.get("EventBusName", "default")
-        event_time = _now_iso()
+        event_time = _now_ts()
 
         event_record = {
             "EventId": event_id,
@@ -747,7 +815,7 @@ def _create_archive(data):
         "EventPattern": data.get("EventPattern", ""),
         "RetentionDays": data.get("RetentionDays", 0),
         "State": "ENABLED",
-        "CreationTime": _now_iso(),
+        "CreationTime": _now_ts(),
         "EventCount": 0,
         "SizeBytes": 0,
     }
@@ -792,9 +860,7 @@ def _list_archives(data):
 
 def _put_permission(data):
     bus_name = data.get("EventBusName", "default")
-    statement_id = data.get("StatementId")
-    if not statement_id:
-        return error_response_json("ValidationException", "StatementId is required", 400)
+    statement_id = data.get("StatementId") or new_uuid()
 
     if bus_name not in _event_bus_policies:
         _event_bus_policies[bus_name] = {"Version": "2012-10-17", "Statement": []}
@@ -848,7 +914,7 @@ def _create_connection(data):
                                    f"Connection {name} already exists", 400)
 
     arn = f"arn:aws:events:{REGION}:{ACCOUNT_ID}:connection/{name}"
-    now = _now_iso()
+    now = _now_ts()
     _connections[name] = {
         "Name": name,
         "ConnectionArn": arn,
@@ -885,7 +951,7 @@ def _delete_connection(data):
     return json_response({
         "ConnectionArn": conn["ConnectionArn"],
         "ConnectionState": "DELETING",
-        "LastModifiedTime": _now_iso(),
+        "LastModifiedTime": _now_ts(),
     })
 
 
@@ -917,7 +983,7 @@ def _update_connection(data):
         return error_response_json("ResourceNotFoundException",
                                    f"Connection {name} does not exist.", 400)
     conn = _connections[name]
-    now = _now_iso()
+    now = _now_ts()
     for key in ("AuthorizationType", "AuthParameters", "Description"):
         if key in data:
             conn[key] = data[key]
@@ -945,7 +1011,7 @@ def _create_api_destination(data):
                                    f"ApiDestination {name} already exists", 400)
 
     arn = f"arn:aws:events:{REGION}:{ACCOUNT_ID}:api-destination/{name}"
-    now = _now_iso()
+    now = _now_ts()
     _api_destinations[name] = {
         "Name": name,
         "ApiDestinationArn": arn,
@@ -1013,7 +1079,7 @@ def _update_api_destination(data):
         return error_response_json("ResourceNotFoundException",
                                    f"ApiDestination {name} does not exist.", 400)
     dest = _api_destinations[name]
-    now = _now_iso()
+    now = _now_ts()
     for key in ("ConnectionArn", "InvocationEndpoint", "HttpMethod",
                 "InvocationRateLimitPerSecond", "Description"):
         if key in data:
@@ -1041,6 +1107,7 @@ def reset():
         "default": {
             "Name": "default",
             "Arn": f"arn:aws:events:{REGION}:{ACCOUNT_ID}:event-bus/default",
-            "CreationTime": _now_iso(),
+            "CreationTime": _now_ts(),
+            "LastModifiedTime": _now_ts(),
         }
     }

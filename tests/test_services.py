@@ -3570,6 +3570,12 @@ def test_eb_create_event_bus_v2(eb):
     desc = eb.describe_event_bus(Name="eb-bus-v2")
     assert desc["Name"] == "eb-bus-v2"
 
+    resp = eb.update_event_bus(Name="eb-bus-v2", Description="updated description")
+    assert resp["ResponseMetadata"]["HTTPStatusCode"] == 200
+
+    updated = eb.describe_event_bus(Name="eb-bus-v2")
+    assert updated["Description"] == "updated description"
+
 
 def test_eb_put_rule_v2(eb):
     eb.create_event_bus(Name="eb-rule-bus")
