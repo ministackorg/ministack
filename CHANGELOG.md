@@ -9,7 +9,12 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [1.1.51] — 2026-04-08
 
+### Added
+- **EC2 Launch Templates (6 operations)** — `CreateLaunchTemplate`, `CreateLaunchTemplateVersion`, `DescribeLaunchTemplates`, `DescribeLaunchTemplateVersions`, `ModifyLaunchTemplate`, `DeleteLaunchTemplate`. Full versioning support with `$Latest` / `$Default` resolution, block device mappings, network interfaces, IAM instance profiles, and tag specifications.
+- **CFN `AWS::EC2::LaunchTemplate`** — Launch templates now work in CloudFormation/CDK stacks. 53 CFN resource types total.
+
 ### Fixed
+- **KMS tags and policy not saved on key creation** — `CreateKey` was ignoring `Tags` and `Policy` parameters, so they were lost until explicitly set via `TagResource` / `PutKeyPolicy`. Contributed by @jgrumboe (#183)
 - **SQS FIFO `ReceiveMessage` returns all messages in same group** — was incorrectly returning only 1 message per MessageGroupId per batch. AWS allows up to 10 messages from the same group in a single `ReceiveMessage` call; the per-group restriction only applies to subsequent calls while messages are in-flight. Reported by @mspiller (#179)
 
 ---
