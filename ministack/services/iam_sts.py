@@ -95,7 +95,21 @@ if _restored:
 
 async def handle_iam_request(method, path, headers, body, query_params):
     params = dict(query_params)
-    if method == "POST" and body:
+    content_type = headers.get("content-type", "")
+    target = headers.get("x-amz-target", "")
+
+    # JSON protocol (newer SDKs): X-Amz-Target: IAMService.ActionName
+    if "amz-json" in content_type and "." in target:
+        action_name = target.split(".")[-1]
+        params["Action"] = [action_name]
+        if body:
+            try:
+                json_body = json.loads(body)
+                for k, v in json_body.items():
+                    params[k] = [str(v)] if not isinstance(v, list) else v
+            except (json.JSONDecodeError, TypeError):
+                pass
+    elif method == "POST" and body:
         for k, v in parse_qs(body.decode("utf-8", errors="replace")).items():
             params[k] = v
 

@@ -9,6 +9,7 @@ Supports: CreateStack, UpdateStack, DeleteStack, DescribeStacks, ListStacks,
 Uses Query API (Action=...) with form-encoded body.
 """
 
+import json
 import logging
 import os
 from urllib.parse import parse_qs
@@ -40,7 +41,21 @@ from .helpers import _p  # noqa: E402
 async def handle_request(method: str, path: str, headers: dict,
                          body: bytes, query_params: dict) -> tuple:
     params = dict(query_params)
-    if method == "POST" and body:
+    content_type = headers.get("content-type", "")
+    target = headers.get("x-amz-target", "")
+
+    # JSON protocol (newer SDKs): X-Amz-Target: CloudFormation_20100515.ActionName
+    if "amz-json" in content_type and target.startswith("CloudFormation_20100515."):
+        action_name = target.split(".")[-1]
+        params["Action"] = [action_name]
+        if body:
+            try:
+                json_body = json.loads(body)
+                for k, v in json_body.items():
+                    params[k] = [str(v)] if not isinstance(v, list) else v
+            except (json.JSONDecodeError, TypeError):
+                pass
+    elif method == "POST" and body:
         form_params = parse_qs(body.decode("utf-8", errors="replace"))
         for k, v in form_params.items():
             params[k] = v

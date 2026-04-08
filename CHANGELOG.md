@@ -7,6 +7,15 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [1.1.55] — 2026-04-09
+
+### Fixed
+- **IAM/CloudFormation JSON protocol support** — IAM and CloudFormation now handle `AwsJson1_1` protocol requests (used by newer AWS SDK versions and CDK CLI). v1.1.54 added JSON protocol support for STS only, but some CDK/SDK versions also send IAM and CloudFormation requests via JSON protocol, causing "The security token included in the request is invalid" errors.
+- **CloudFormation AutoScaling stubs** — `AWS::AutoScaling::AutoScalingGroup`, `LaunchConfiguration`, `ScalingPolicy`, `LifecycleHook`, and `ScheduledAction` are now handled as no-ops, allowing CDK/CFN stacks with ASGs to deploy without failing. Reported by @titan1978
+- **README KMS table formatting** — KMS row was detached from the services table by a blank line, causing broken rendering.
+
+---
+
 ## [1.1.54] — 2026-04-08
 
 ### Added
