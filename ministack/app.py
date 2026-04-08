@@ -64,6 +64,7 @@ from ministack.services import (
     kms,
     lambda_svc,
     rds,
+    rds_data,
     route53,
     s3,
     secretsmanager,
@@ -145,6 +146,7 @@ SERVICE_NAME_ALIASES = {
     "elbv2": "elasticloadbalancing",
     "elb": "elasticloadbalancing",
     "ecr": "ecr",
+    "rds-data": "rds-data",
 }
 
 
@@ -182,7 +184,7 @@ BANNER = r"""
           SSM, EventBridge, Kinesis, CloudWatch, SES, SES v2, ACM, WAF v2, Step Functions,
           ECS, RDS, ElastiCache, Glue, Athena, API Gateway, Firehose, Route53,
           Cognito, EC2, EMR, EBS, EFS, ALB/ELBv2, CloudFormation, KMS, ECR, CloudFront,
-          AppSync, Cloud Map, S3 Files
+          AppSync, Cloud Map, S3 Files, RDS Data API
 """
 
 
@@ -372,6 +374,12 @@ async def app(scope, receive, send):
                 "Content-Type": "application/json",
                 "x-amzn-requestid": request_id,
             }, b"{}")
+        return
+
+    # RDS Data API — /Execute, /BeginTransaction, /CommitTransaction, /RollbackTransaction, /BatchExecute
+    if path in ("/Execute", "/BeginTransaction", "/CommitTransaction", "/RollbackTransaction", "/BatchExecute"):
+        status, resp_headers, resp_body = await rds_data.handle_request(method, path, headers, body, query_params)
+        await _send_response(send, status, resp_headers, resp_body)
         return
 
     # SES v2 REST API — /v2/email/...
@@ -745,6 +753,7 @@ def _reset_all_state():
         (ecr, ecr.reset),
         (appsync, appsync.reset),
         (servicediscovery, servicediscovery.reset),
+        (rds_data, rds_data.reset),
         (s3files, s3files.reset),
     ]:
         try:

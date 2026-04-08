@@ -11,6 +11,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 - **RDS Aurora Global Clusters (5 operations)** — `CreateGlobalCluster`, `DescribeGlobalClusters`, `DeleteGlobalCluster`, `RemoveFromGlobalCluster`, `ModifyGlobalCluster`. In-memory global cluster model with member cluster membership, source cluster auto-attach, deletion protection, and rename support.
+- **RDS Data API service** — `ExecuteStatement`, `BatchExecuteStatement`, `BeginTransaction`, `CommitTransaction`, `RollbackTransaction`. Routes SQL to the real database containers MiniStack spins up for RDS instances. Supports both MySQL and PostgreSQL engines.
 
 ---
 
