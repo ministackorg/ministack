@@ -67,6 +67,7 @@ Data plane:
   when api_id is found in _rest_apis.
 """
 
+import asyncio
 import datetime
 import json
 import logging
@@ -237,7 +238,7 @@ async def _call_lambda(func_name, event):
 
     if code_zip and func_data["config"]["Runtime"].startswith("python"):
         worker = get_or_create_worker(func_name, func_data["config"], code_zip)
-        result = worker.invoke(event, new_uuid())
+        result = await asyncio.to_thread(worker.invoke, event, new_uuid())
         if result.get("status") == "error":
             return None, result.get("error", "Lambda invocation error")
         return result.get("result", {}), None

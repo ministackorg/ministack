@@ -40,6 +40,7 @@ Data plane:
   Lambda (AWS_PROXY) or HTTP backends (HTTP_PROXY) via handle_execute().
 """
 
+import asyncio
 import json
 import logging
 import os
@@ -367,7 +368,7 @@ async def _invoke_lambda_proxy(integration, api_id, stage, path, method, headers
 
     if code_zip and func_data["config"]["Runtime"].startswith("python"):
         worker = get_or_create_worker(func_name, func_data["config"], code_zip)
-        result = worker.invoke(event, new_uuid())
+        result = await asyncio.to_thread(worker.invoke, event, new_uuid())
         if result.get("status") == "error":
             return 502, {"Content-Type": "application/json"}, json.dumps({"message": result.get("error")}).encode()
         lambda_response = result.get("result", {})
