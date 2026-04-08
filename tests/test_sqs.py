@@ -476,9 +476,18 @@ def test_sqs_event_source_mapping_to_lambda(lam, sqs):
     time.sleep(3)
 
     # Messages should have been consumed by the ESM (queue should be empty or near-empty)
-    msgs = sqs.receive_message(QueueUrl=queue_url, MaxNumberOfMessages=10, WaitTimeSeconds=1)
-    remaining = len(msgs.get("Messages", []))
-    assert remaining == 0, f"ESM should have consumed all messages, but {remaining} remain"
+    # Retry with backoff to account for variable Lambda invocation latency
+    max_retries = 5
+    retry_delay = 2
+    for attempt in range(max_retries):
+        msgs = sqs.receive_message(QueueUrl=queue_url, MaxNumberOfMessages=10, WaitTimeSeconds=1)
+        remaining = len(msgs.get("Messages", []))
+        if remaining == 0:
+            break
+        if attempt < max_retries - 1:
+            time.sleep(retry_delay)
+    
+    assert remaining == 0, f"ESM should have consumed all messages, but {remaining} remain after {max_retries} retries"
 
     # Cleanup
     lam.delete_event_source_mapping(UUID=esm["UUID"])
