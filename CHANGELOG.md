@@ -14,6 +14,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 - **CloudFormation `TemplateURL` support** — `CreateStack`, `UpdateStack`, `CreateChangeSet`, and `GetTemplateSummary` now fetch templates from S3 when `TemplateURL` is provided instead of `TemplateBody`. This unblocks `cdk deploy` which publishes templates to S3 and passes a URL.
 - **CloudFormation `AWS::CDK::Metadata` support** — CDK metadata resources are now handled as no-ops instead of failing with "Unsupported resource type".
 - **STS JSON protocol support** — STS now handles `AwsJson1_1` protocol requests (used by newer AWS SDK versions and CDK CLI). Previously, STS only accepted Query/form-encoded requests, causing CDK to fail with "The security token included in the request is invalid" when it tried to AssumeRole using the JSON protocol.
+- **CloudFormation AutoScaling stubs** — `AWS::AutoScaling::AutoScalingGroup`, `LaunchConfiguration`, `ScalingPolicy`, `LifecycleHook`, and `ScheduledAction` are now handled as no-ops, allowing CDK/CFN stacks with ASGs to deploy without failing. Reported by @titan1978
 
 ### Fixed
 - **Test coverage for v1.1.53 fixes** — added unit tests for `_convert_parameters` (RDS Data API parameter binding) and SSM epoch timestamp in CloudFormation provisioner.

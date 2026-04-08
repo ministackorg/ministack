@@ -1755,4 +1755,10 @@ _RESOURCE_HANDLERS = {
     "AWS::EC2::LaunchTemplate": {"create": _ec2_launch_template_create, "delete": _ec2_launch_template_delete},
     # CDK metadata — safe to ignore
     "AWS::CDK::Metadata": {"create": lambda lid, props, sn: (f"CDKMetadata-{lid}", {}), "delete": lambda pid, props: None},
+    # AutoScaling stubs — allow CDK/CFN stacks with ASGs to deploy
+    "AWS::AutoScaling::AutoScalingGroup": {"create": lambda lid, props, sn: (f"asg-{lid}", {}), "delete": lambda pid, props: None},
+    "AWS::AutoScaling::LaunchConfiguration": {"create": lambda lid, props, sn: (f"lc-{lid}", {}), "delete": lambda pid, props: None},
+    "AWS::AutoScaling::ScalingPolicy": {"create": lambda lid, props, sn: (f"sp-{lid}", {}), "delete": lambda pid, props: None},
+    "AWS::AutoScaling::LifecycleHook": {"create": lambda lid, props, sn: (f"lh-{lid}", {}), "delete": lambda pid, props: None},
+    "AWS::AutoScaling::ScheduledAction": {"create": lambda lid, props, sn: (f"sa-{lid}", {}), "delete": lambda pid, props: None},
 }
