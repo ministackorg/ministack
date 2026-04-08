@@ -14,7 +14,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 - **RDS Data API service** — `ExecuteStatement`, `BatchExecuteStatement`, `BeginTransaction`, `CommitTransaction`, `RollbackTransaction`. Routes SQL to the real database containers MiniStack spins up for RDS instances. Supports both MySQL and PostgreSQL engines. Contributed by @jayjanssen (#193)
 
 ### Fixed
-- **CDK deploy "implicit NaN" deserialization error** — the CloudFormation SSM provisioner stored `LastModifiedDate` as an ISO 8601 string instead of a Unix epoch float. The JS SDK v3 (bundled in CDK CLI) uses `AwsJson1_1Protocol` for SSM and calls `parseEpochTimestamp()` on the value, which expects a number. `cdk deploy` would fail immediately after bootstrap when checking the SSM bootstrap version parameter. Reported by @youngkwangk and @jolo-dev
+- **CDK deploy "implicit NaN" deserialization error** — the CloudFormation SSM provisioner stored `LastModifiedDate` as an ISO 8601 string instead of a Unix epoch float. The JS SDK v3 (bundled in CDK CLI) uses `AwsJson1_1Protocol` for SSM and calls `parseEpochTimestamp()` on the value, which expects a number. `cdk deploy` would fail immediately after bootstrap when checking the SSM bootstrap version parameter. Reported by @youngkwangk @jolo-dev and @ben-shearlaw 
 - **RDS Data API thread safety** — added `threading.Lock` to protect transaction state against concurrent access
 - **RDS Data API parameter binding** — `ExecuteStatement` and `BatchExecuteStatement` now convert RDS Data API `:name` parameters to DB-API parameterized queries instead of ignoring them
 - **RDS Data API connection leak** — connections are now properly closed on exceptions in non-transaction execute paths
