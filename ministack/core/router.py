@@ -177,6 +177,10 @@ SERVICE_PATTERNS = {
         "credential_scope": "s3files",
         "path_prefixes": ["/file-systems", "/mount-targets", "/access-points"],
     },
+    "rds-data": {
+        "host_patterns": [r"rds-data\."],
+        "credential_scope": "rds-data",
+    },
 }
 
 
@@ -231,6 +235,7 @@ def detect_service(method: str, path: str, headers: dict, query_params: dict) ->
                 "appsync": "appsync",
                 "servicediscovery": "servicediscovery",
                 "s3files": "s3files",
+                "rds-data": "rds-data",
             }
             if svc_name in scope_map:
                 return scope_map[svc_name]

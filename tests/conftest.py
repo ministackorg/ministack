@@ -221,6 +221,10 @@ def cloudfront():
     return make_client("cloudfront")
 
 @pytest.fixture(scope="session")
+def rds_data():
+    return make_client("rds-data")
+
+@pytest.fixture(scope="session")
 def sd():
     """SD client for DiscoverInstances — forces same endpoint (boto3 normally prefixes data-)."""
     from botocore.config import Config as BotoConfig

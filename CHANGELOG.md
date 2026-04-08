@@ -7,6 +7,13 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [Unreleased]
+
+### Added
+- **RDS Data API service** — `ExecuteStatement`, `BatchExecuteStatement`, `BeginTransaction`, `CommitTransaction`, `RollbackTransaction`. Routes SQL to the real database containers MiniStack spins up for RDS instances. Supports both MySQL and PostgreSQL engines.
+
+---
+
 ## [1.1.52] — 2026-04-08
 
 ### Fixed
