@@ -184,18 +184,24 @@ def _init_defaults():
             "DefaultSecurityGroupId": _DEFAULT_SG_ID,
             "MainRouteTableId": _DEFAULT_RTB_ID,
         }
-    if _DEFAULT_SUBNET_ID not in _subnets:
-        _subnets[_DEFAULT_SUBNET_ID] = {
-            "SubnetId": _DEFAULT_SUBNET_ID,
-            "VpcId": _DEFAULT_VPC_ID,
-            "CidrBlock": "172.31.0.0/20",
-            "AvailabilityZone": f"{REGION}a",
-            "AvailableIpAddressCount": 4091,
-            "State": "available",
-            "DefaultForAz": True,
-            "MapPublicIpOnLaunch": True,
-            "OwnerId": get_account_id(),
-        }
+    _default_subnets = [
+        (_DEFAULT_SUBNET_ID, "172.31.0.0/20", f"{REGION}a"),
+        ("subnet-00000002", "172.31.16.0/20", f"{REGION}b"),
+        ("subnet-00000003", "172.31.32.0/20", f"{REGION}c"),
+    ]
+    for subnet_id, cidr, az in _default_subnets:
+        if subnet_id not in _subnets:
+            _subnets[subnet_id] = {
+                "SubnetId": subnet_id,
+                "VpcId": _DEFAULT_VPC_ID,
+                "CidrBlock": cidr,
+                "AvailabilityZone": az,
+                "AvailableIpAddressCount": 4091,
+                "State": "available",
+                "DefaultForAz": True,
+                "MapPublicIpOnLaunch": True,
+                "OwnerId": get_account_id(),
+            }
     if _DEFAULT_SG_ID not in _security_groups:
         _security_groups[_DEFAULT_SG_ID] = {
             "GroupId": _DEFAULT_SG_ID,

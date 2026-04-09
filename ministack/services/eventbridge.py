@@ -1,16 +1,23 @@
 """
 EventBridge Service Emulator.
-JSON-based API via X-Amz-Target (AmazonEventBridge).
-Supports: CreateEventBus, DeleteEventBus, ListEventBuses, DescribeEventBus,
+JSON-based API via X-Amz-Target (AmazonEventBridge / AWSEvents).
+Supports: CreateEventBus, UpdateEventBus, DeleteEventBus, ListEventBuses, DescribeEventBus,
           PutRule, DeleteRule, ListRules, DescribeRule, EnableRule, DisableRule,
-          PutTargets, RemoveTargets, ListTargetsByRule,
-          PutEvents,
+          PutTargets, RemoveTargets, ListTargetsByRule, ListRuleNamesByTarget,
+          PutEvents, TestEventPattern,
           TagResource, UntagResource, ListTagsForResource,
-          CreateArchive, DeleteArchive, DescribeArchive, ListArchives,
+          CreateArchive, DeleteArchive, DescribeArchive, UpdateArchive, ListArchives,
           PutPermission, RemovePermission,
-          CreateConnection, DescribeConnection, DeleteConnection, ListConnections, UpdateConnection,
+          CreateConnection, DescribeConnection, DeleteConnection, ListConnections,
+          UpdateConnection, DeauthorizeConnection,
           CreateApiDestination, DescribeApiDestination, DeleteApiDestination,
-          ListApiDestinations, UpdateApiDestination.
+          ListApiDestinations, UpdateApiDestination,
+          StartReplay, DescribeReplay, ListReplays, CancelReplay,
+          CreateEndpoint, DeleteEndpoint, DescribeEndpoint, ListEndpoints, UpdateEndpoint,
+          ActivateEventSource, DeactivateEventSource, DescribeEventSource,
+          CreatePartnerEventSource, DeletePartnerEventSource, DescribePartnerEventSource,
+          ListPartnerEventSources, ListPartnerEventSourceAccounts,
+          ListEventSources, PutPartnerEvents.
 """
 
 import copy
@@ -67,6 +74,10 @@ _archives = AccountScopedDict()
 _event_bus_policies = AccountScopedDict()  # bus_name -> {Statement: [...]}
 _connections = AccountScopedDict()         # connection_name -> {...}
 _api_destinations = AccountScopedDict()    # destination_name -> {...}
+_replays = AccountScopedDict()              # replay_name -> replay record
+_endpoints = AccountScopedDict()            # endpoint name -> endpoint record
+# Partner event sources: key "account|name" -> metadata (cross-account style API)
+_partner_event_sources: dict = {}
 
 
 # ── Persistence ────────────────────────────────────────────
@@ -77,6 +88,9 @@ def get_state():
         "rules": copy.deepcopy(_rules),
         "targets": copy.deepcopy(_targets),
         "tags": copy.deepcopy(_tags),
+        "replays": copy.deepcopy(_replays),
+        "endpoints": copy.deepcopy(_endpoints),
+        "partner_event_sources": copy.deepcopy(_partner_event_sources),
     }
 
 
@@ -87,6 +101,12 @@ def restore_state(data):
         _rules.update(data.get("rules", {}))
         _targets.update(data.get("targets", {}))
         _tags.update(data.get("tags", {}))
+        _replays.update(data.get("replays", {}))
+        _endpoints.update(data.get("endpoints", {}))
+        pe = data.get("partner_event_sources")
+        if pe is not None:
+            _partner_event_sources.clear()
+            _partner_event_sources.update(pe)
 
         for bus in _event_buses.values():
             if "CreationTime" in bus:
@@ -97,6 +117,11 @@ def restore_state(data):
         for rule in _rules.values():
             if "CreationTime" in rule:
                 rule["CreationTime"] = _coerce_timestamp(rule["CreationTime"])
+
+        for rep in _replays.values():
+            for tk in ("ReplayStartTime", "ReplayEndTime", "EventStartTime", "EventEndTime"):
+                if tk in rep and rep[tk] is not None:
+                    rep[tk] = _coerce_timestamp(rep[tk])
 
 
 _restored = load_state("eventbridge")
@@ -128,6 +153,8 @@ async def handle_request(method, path, headers, body, query_params):
         "PutTargets": _put_targets,
         "RemoveTargets": _remove_targets,
         "ListTargetsByRule": _list_targets_by_rule,
+        "ListRuleNamesByTarget": _list_rule_names_by_target,
+        "TestEventPattern": _test_event_pattern,
         "PutEvents": _put_events,
         "TagResource": _tag_resource,
         "UntagResource": _untag_resource,
@@ -135,7 +162,27 @@ async def handle_request(method, path, headers, body, query_params):
         "CreateArchive": _create_archive,
         "DeleteArchive": _delete_archive,
         "DescribeArchive": _describe_archive,
+        "UpdateArchive": _update_archive,
         "ListArchives": _list_archives,
+        "StartReplay": _start_replay,
+        "DescribeReplay": _describe_replay,
+        "ListReplays": _list_replays,
+        "CancelReplay": _cancel_replay,
+        "CreateEndpoint": _create_endpoint,
+        "DeleteEndpoint": _delete_endpoint,
+        "DescribeEndpoint": _describe_endpoint,
+        "ListEndpoints": _list_endpoints,
+        "UpdateEndpoint": _update_endpoint,
+        "ActivateEventSource": _activate_event_source,
+        "DeactivateEventSource": _deactivate_event_source,
+        "DescribeEventSource": _describe_event_source,
+        "CreatePartnerEventSource": _create_partner_event_source,
+        "DeletePartnerEventSource": _delete_partner_event_source,
+        "DescribePartnerEventSource": _describe_partner_event_source,
+        "ListPartnerEventSources": _list_partner_event_sources,
+        "ListPartnerEventSourceAccounts": _list_partner_event_source_accounts,
+        "ListEventSources": _list_event_sources,
+        "PutPartnerEvents": _put_partner_events,
         "PutPermission": _put_permission,
         "RemovePermission": _remove_permission,
         "CreateConnection": _create_connection,
@@ -143,6 +190,7 @@ async def handle_request(method, path, headers, body, query_params):
         "DeleteConnection": _delete_connection,
         "ListConnections": _list_connections,
         "UpdateConnection": _update_connection,
+        "DeauthorizeConnection": _deauthorize_connection,
         "CreateApiDestination": _create_api_destination,
         "DescribeApiDestination": _describe_api_destination,
         "DeleteApiDestination": _delete_api_destination,
@@ -442,6 +490,80 @@ def _list_targets_by_rule(data):
     key = _rule_key(rule_name, bus)
     targets = _targets.get(key, [])
     return json_response({"Targets": targets})
+
+
+def _list_rule_names_by_target(data):
+    target_arn = data.get("TargetArn", "")
+    if not target_arn:
+        return error_response_json("ValidationException", "TargetArn is required", 400)
+    bus_filter = data.get("EventBusName", "")
+    limit = int(data.get("Limit", 100))
+    if limit < 1:
+        limit = 100
+    if limit > 100:
+        limit = 100
+    next_token = data.get("NextToken", "")
+
+    matched = []
+    for key, tlist in _targets.items():
+        bus_name, rule_name = key.split("|", 1) if "|" in key else ("default", key)
+        if bus_filter and bus_name != bus_filter:
+            continue
+        if not any(t.get("Arn") == target_arn for t in tlist):
+            continue
+        if key in _rules:
+            matched.append(_rules[key]["Name"])
+
+    matched = sorted(set(matched))
+    start = 0
+    if next_token:
+        try:
+            start = int(next_token)
+        except ValueError:
+            start = 0
+    page = matched[start:start + limit]
+    resp = {"RuleNames": page}
+    if start + limit < len(matched):
+        resp["NextToken"] = str(start + limit)
+    return json_response(resp)
+
+
+def _event_from_test_payload(event_obj: dict) -> dict:
+    """Map CloudWatch Events-shaped JSON to internal fields used by _matches_pattern."""
+    detail = event_obj.get("detail", event_obj.get("Detail", {}))
+    if isinstance(detail, dict):
+        detail = json.dumps(detail)
+    elif detail is None:
+        detail = "{}"
+    else:
+        detail = str(detail)
+    return {
+        "Source": event_obj.get("source", event_obj.get("Source", "")),
+        "DetailType": event_obj.get("detail-type", event_obj.get("DetailType", "")),
+        "Detail": detail,
+        "Account": event_obj.get("account", event_obj.get("Account", get_account_id())),
+        "Region": event_obj.get("region", event_obj.get("Region", REGION)),
+        "Resources": event_obj.get("resources", event_obj.get("Resources", [])),
+    }
+
+
+def _test_event_pattern(data):
+    event_str = data.get("Event", "")
+    pattern_str = data.get("EventPattern", "")
+    if not event_str:
+        return error_response_json("ValidationException", "Event is required", 400)
+    if not pattern_str:
+        return error_response_json("ValidationException", "EventPattern is required", 400)
+    try:
+        event_obj = json.loads(event_str) if isinstance(event_str, str) else event_str
+    except (json.JSONDecodeError, TypeError):
+        return error_response_json("InvalidEventPatternException", "Event is not valid JSON", 400)
+    if not isinstance(event_obj, dict):
+        return error_response_json("InvalidEventPatternException", "Event must be a JSON object", 400)
+
+    synthetic = _event_from_test_payload(event_obj)
+    matched = _matches_pattern(pattern_str, synthetic)
+    return json_response({"Result": bool(matched)})
 
 
 # ---------------------------------------------------------------------------
@@ -847,6 +969,39 @@ def _describe_archive(data):
     return json_response(archive)
 
 
+def _update_archive(data):
+    name = data.get("ArchiveName")
+    if not name:
+        return error_response_json("ValidationException", "ArchiveName is required", 400)
+    archive = _archives.get(name)
+    if not archive:
+        return error_response_json("ResourceNotFoundException", f"Archive {name} does not exist.", 400)
+
+    if "Description" in data:
+        archive["Description"] = data["Description"]
+    if "EventPattern" in data:
+        ep = data["EventPattern"]
+        if isinstance(ep, str) and ep:
+            try:
+                json.loads(ep)
+            except json.JSONDecodeError:
+                return error_response_json(
+                    "InvalidEventPatternException",
+                    "Event pattern is not valid JSON",
+                    400,
+                )
+        archive["EventPattern"] = ep
+    if "RetentionDays" in data:
+        archive["RetentionDays"] = int(data["RetentionDays"])
+
+    archive["LastUpdatedTime"] = _now_ts()
+    return json_response({
+        "ArchiveArn": archive["ArchiveArn"],
+        "State": archive.get("State", "ENABLED"),
+        "CreationTime": archive["CreationTime"],
+    })
+
+
 def _list_archives(data):
     prefix = data.get("NamePrefix", "")
     source_arn = data.get("EventSourceArn", "")
@@ -861,6 +1016,306 @@ def _list_archives(data):
             continue
         results.append(archive)
     return json_response({"Archives": results})
+
+
+# ---------------------------------------------------------------------------
+# Replays (minimal control plane — no archive replay engine)
+# ---------------------------------------------------------------------------
+
+def _start_replay(data):
+    name = data.get("ReplayName")
+    if not name:
+        return error_response_json("ValidationException", "ReplayName is required", 400)
+    if name in _replays:
+        return error_response_json(
+            "ResourceAlreadyExistsException",
+            f"Replay {name} already exists",
+            400,
+        )
+    dest = data.get("Destination") or {}
+    if not dest.get("Arn"):
+        return error_response_json(
+            "ValidationException",
+            "Destination.Arn is required",
+            400,
+        )
+    arn = f"arn:aws:events:{REGION}:{get_account_id()}:replay/{name}"
+    now = _now_ts()
+    _replays[name] = {
+        "ReplayName": name,
+        "ReplayArn": arn,
+        "Description": data.get("Description", ""),
+        "EventSourceArn": data.get("EventSourceArn", ""),
+        "EventStartTime": data.get("EventStartTime", now),
+        "EventEndTime": data.get("EventEndTime", now),
+        "Destination": dest,
+        "State": "RUNNING",
+        "ReplayStartTime": now,
+    }
+    return json_response({"ReplayArn": arn, "State": "RUNNING"})
+
+
+def _describe_replay(data):
+    name = data.get("ReplayName")
+    if not name:
+        return error_response_json("ValidationException", "ReplayName is required", 400)
+    rep = _replays.get(name)
+    if not rep:
+        return error_response_json("ResourceNotFoundException", f"Replay {name} does not exist.", 400)
+    return json_response(dict(rep))
+
+
+def _list_replays(data):
+    prefix = data.get("NamePrefix", "")
+    state_f = data.get("State", "")
+    source_f = data.get("EventSourceArn", "")
+    results = []
+    for n in sorted(_replays.keys()):
+        rep = _replays[n]
+        if prefix and not n.startswith(prefix):
+            continue
+        if state_f and rep.get("State") != state_f:
+            continue
+        if source_f and rep.get("EventSourceArn") != source_f:
+            continue
+        results.append({
+            "ReplayName": rep["ReplayName"],
+            "ReplayArn": rep["ReplayArn"],
+            "State": rep["State"],
+            "EventSourceArn": rep.get("EventSourceArn", ""),
+            "ReplayStartTime": rep.get("ReplayStartTime", ""),
+        })
+    return json_response({"Replays": results})
+
+
+def _cancel_replay(data):
+    name = data.get("ReplayName")
+    if not name:
+        return error_response_json("ValidationException", "ReplayName is required", 400)
+    rep = _replays.get(name)
+    if not rep:
+        return error_response_json("ResourceNotFoundException", f"Replay {name} does not exist.", 400)
+    if rep["State"] == "COMPLETED":
+        return error_response_json(
+            "ValidationException",
+            "Replay is already completed",
+            400,
+        )
+    if rep["State"] == "CANCELLED":
+        return json_response({"ReplayArn": rep["ReplayArn"], "State": "CANCELLED"})
+    rep["State"] = "CANCELLED"
+    rep["ReplayEndTime"] = _now_ts()
+    return json_response({"ReplayArn": rep["ReplayArn"], "State": "CANCELLED"})
+
+
+# ---------------------------------------------------------------------------
+# Global endpoints + SaaS partner event sources (minimal / stub)
+# ---------------------------------------------------------------------------
+
+def _create_endpoint(data):
+    name = data.get("Name")
+    if not name:
+        return error_response_json("ValidationException", "Name is required", 400)
+    if name in _endpoints:
+        return error_response_json("ResourceAlreadyExistsException",
+                                   f"Endpoint {name} already exists", 400)
+    arn = f"arn:aws:events:{REGION}:{get_account_id()}:endpoint/{name}"
+    now = _now_ts()
+    _endpoints[name] = {
+        "Name": name,
+        "Description": data.get("Description", ""),
+        "RoutingConfig": data.get("RoutingConfig", {}),
+        "ReplicationConfig": data.get("ReplicationConfig", {}),
+        "EventBuses": data.get("EventBuses", []),
+        "RoleArn": data.get("RoleArn", ""),
+        "Arn": arn,
+        "EndpointUrl": f"https://{name}.global-events.{REGION}.amazonaws.com",
+        "State": "ACTIVE",
+        "CreationTime": now,
+        "LastModifiedTime": now,
+    }
+    ep = _endpoints[name]
+    return json_response({
+        "Name": ep["Name"],
+        "Arn": ep["Arn"],
+        "RoutingConfig": ep["RoutingConfig"],
+        "ReplicationConfig": ep["ReplicationConfig"],
+        "EventBuses": ep["EventBuses"],
+        "RoleArn": ep["RoleArn"],
+        "State": ep["State"],
+    })
+
+
+def _delete_endpoint(data):
+    name = data.get("Name")
+    if name not in _endpoints:
+        return error_response_json("ResourceNotFoundException",
+                                   f"Endpoint {name} does not exist.", 400)
+    del _endpoints[name]
+    return json_response({})
+
+
+def _describe_endpoint(data):
+    name = data.get("Name")
+    ep = _endpoints.get(name)
+    if not ep:
+        return error_response_json("ResourceNotFoundException",
+                                   f"Endpoint {name} does not exist.", 400)
+    return json_response({
+        "Name": ep["Name"],
+        "Description": ep.get("Description", ""),
+        "Arn": ep["Arn"],
+        "RoutingConfig": ep.get("RoutingConfig", {}),
+        "ReplicationConfig": ep.get("ReplicationConfig", {}),
+        "EventBuses": ep.get("EventBuses", []),
+        "RoleArn": ep.get("RoleArn", ""),
+        "EndpointId": ep["Name"],
+        "EndpointUrl": ep["EndpointUrl"],
+        "State": ep["State"],
+        "StateReason": "",
+        "CreationTime": ep["CreationTime"],
+        "LastModifiedTime": ep.get("LastModifiedTime", ep["CreationTime"]),
+    })
+
+
+def _list_endpoints(data):
+    prefix = data.get("NamePrefix", "")
+    home = data.get("HomeRegion", "")
+    results = []
+    for n in sorted(_endpoints.keys()):
+        ep = _endpoints[n]
+        if prefix and not n.startswith(prefix):
+            continue
+        if home and REGION != home:
+            continue
+        results.append({
+            "Name": ep["Name"],
+            "Arn": ep["Arn"],
+            "EndpointUrl": ep["EndpointUrl"],
+            "State": ep["State"],
+            "CreationTime": ep["CreationTime"],
+        })
+    return json_response({"Endpoints": results})
+
+
+def _update_endpoint(data):
+    name = data.get("Name")
+    if name not in _endpoints:
+        return error_response_json("ResourceNotFoundException",
+                                   f"Endpoint {name} does not exist.", 400)
+    ep = _endpoints[name]
+    now = _now_ts()
+    for key in ("Description", "RoutingConfig", "ReplicationConfig", "EventBuses", "RoleArn"):
+        if key in data:
+            ep[key] = data[key]
+    ep["LastModifiedTime"] = now
+    return json_response({
+        "Name": ep["Name"],
+        "Arn": ep["Arn"],
+        "RoutingConfig": ep["RoutingConfig"],
+        "ReplicationConfig": ep["ReplicationConfig"],
+        "EventBuses": ep["EventBuses"],
+        "RoleArn": ep["RoleArn"],
+        "EndpointId": ep["Name"],
+        "EndpointUrl": ep["EndpointUrl"],
+        "State": ep["State"],
+    })
+
+
+def _activate_event_source(data):
+    _ = data.get("Name", "")
+    return json_response({})
+
+
+def _deactivate_event_source(data):
+    _ = data.get("Name", "")
+    return json_response({})
+
+
+def _describe_event_source(data):
+    name = data.get("Name", "")
+    return json_response({
+        "Name": name,
+        "State": "ENABLED",
+        "Arn": f"arn:aws:events:{REGION}::event-source/{name}" if name else "",
+    })
+
+
+def _partner_key(account: str, name: str) -> str:
+    return f"{account}|{name}"
+
+
+def _create_partner_event_source(data):
+    name = data.get("Name")
+    account = data.get("Account", "")
+    if not name or not account:
+        return error_response_json("ValidationException", "Name and Account are required", 400)
+    pk = _partner_key(account, name)
+    if pk in _partner_event_sources:
+        return error_response_json("ResourceAlreadyExistsException",
+                                   "Partner event source already exists", 400)
+    arn = f"arn:aws:events:{REGION}:{account}:event-source/{name}"
+    _partner_event_sources[pk] = {
+        "Name": name,
+        "Account": account,
+        "EventSourceArn": arn,
+    }
+    return json_response({"EventSourceArn": arn})
+
+
+def _delete_partner_event_source(data):
+    name = data.get("Name")
+    account = data.get("Account", "")
+    pk = _partner_key(account, name)
+    if pk not in _partner_event_sources:
+        return error_response_json("ResourceNotFoundException",
+                                   "Partner event source does not exist.", 400)
+    del _partner_event_sources[pk]
+    return json_response({})
+
+
+def _describe_partner_event_source(data):
+    name = data.get("Name")
+    for pk, rec in _partner_event_sources.items():
+        if rec["Name"] == name:
+            return json_response({
+                "Name": rec["Name"],
+                "Arn": rec["EventSourceArn"],
+                "State": "ACTIVE",
+            })
+    return error_response_json("ResourceNotFoundException",
+                               f"Partner event source {name} does not exist.", 400)
+
+
+def _list_partner_event_sources(data):
+    prefix = data.get("NamePrefix", "")
+    results = []
+    for rec in _partner_event_sources.values():
+        if prefix and not rec["Name"].startswith(prefix):
+            continue
+        results.append({
+            "Name": rec["Name"],
+            "Arn": rec["EventSourceArn"],
+            "State": "ACTIVE",
+        })
+    return json_response({"PartnerEventSources": results})
+
+
+def _list_partner_event_source_accounts(data):
+    _ = data.get("EventSourceName", "")
+    return json_response({"PartnerEventSourceAccounts": [], "NextToken": ""})
+
+
+def _list_event_sources(data):
+    prefix = data.get("NamePrefix", "")
+    _ = prefix
+    return json_response({"EventSources": []})
+
+
+def _put_partner_events(data):
+    entries = data.get("Entries", [])
+    results = [{"EventId": new_uuid()} for _ in entries]
+    return json_response({"FailedEntryCount": 0, "Entries": results})
 
 
 # ---------------------------------------------------------------------------
@@ -1007,6 +1462,25 @@ def _update_connection(data):
     })
 
 
+def _deauthorize_connection(data):
+    name = data.get("Name")
+    if not name:
+        return error_response_json("ValidationException", "Name is required", 400)
+    conn = _connections.get(name)
+    if not conn:
+        return error_response_json("ResourceNotFoundException",
+                                   f"Connection {name} does not exist.", 400)
+    now = _now_ts()
+    conn["ConnectionState"] = "DEAUTHORIZED"
+    conn["LastModifiedTime"] = now
+    conn.pop("LastAuthorizedTime", None)
+    return json_response({
+        "ConnectionArn": conn["ConnectionArn"],
+        "ConnectionState": conn["ConnectionState"],
+        "LastModifiedTime": now,
+    })
+
+
 # ---------------------------------------------------------------------------
 # API Destinations
 # ---------------------------------------------------------------------------
@@ -1112,6 +1586,9 @@ def reset():
     _event_bus_policies.clear()
     _connections.clear()
     _api_destinations.clear()
+    _replays.clear()
+    _endpoints.clear()
+    _partner_event_sources.clear()
     _event_buses = {
         "default": {
             "Name": "default",

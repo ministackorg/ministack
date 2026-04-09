@@ -321,3 +321,44 @@ def test_kinesis_esm_creates_and_lists(lam, kin):
 
     lam.delete_event_source_mapping(UUID=esm["UUID"])
     lam.delete_function(FunctionName="esm-kin-fn")
+
+
+def test_kinesis_cbor_put_record(kin):
+    """Java SDK sends CBOR-encoded PutRecord; ministack must decode it."""
+    import cbor2
+    import urllib.request
+
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+
+    kin.create_stream(StreamName="cbor-test-stream", ShardCount=1)
+
+    # Build a CBOR-encoded PutRecord payload (same as AWS Java SDK v2 sends)
+    cbor_body = cbor2.dumps({
+        "StreamName": "cbor-test-stream",
+        "Data": b'{ "test": "123"}',
+        "PartitionKey": "1",
+    })
+
+    req = urllib.request.Request(
+        endpoint,
+        data=cbor_body,
+        headers={
+            "Content-Type": "application/x-amz-cbor-1.1",
+            "X-Amz-Target": "Kinesis_20131202.PutRecord",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req) as resp:
+        assert resp.status == 200
+        resp_body = cbor2.loads(resp.read())
+        assert "ShardId" in resp_body
+        assert "SequenceNumber" in resp_body
+
+    # Verify the record is retrievable via normal JSON path
+    desc = kin.describe_stream(StreamName="cbor-test-stream")
+    shard_id = desc["StreamDescription"]["Shards"][0]["ShardId"]
+    it = kin.get_shard_iterator(
+        StreamName="cbor-test-stream", ShardId=shard_id, ShardIteratorType="TRIM_HORIZON"
+    )
+    records = kin.get_records(ShardIterator=it["ShardIterator"])
+    assert len(records["Records"]) == 1

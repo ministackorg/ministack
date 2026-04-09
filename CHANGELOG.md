@@ -14,6 +14,13 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [1.1.58] — 2026-04-09
+
+### Fixed
+- **Kinesis CBOR protocol support** — `PutRecord` and `PutRecords` from the AWS Java SDK v2 failed with `'utf-8' codec can't decode byte 0xbf`. The Java SDK sends Kinesis requests as CBOR (`application/x-amz-cbor-1.1`) by default, but the handler only accepted JSON. Kinesis now detects CBOR content-type, decodes with `cbor2`, and returns CBOR-encoded responses. Reported by community.
+
+---
+
 ## [1.1.57] — 2026-04-09
 
 ### Fixed

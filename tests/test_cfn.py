@@ -249,6 +249,42 @@ def test_cfn_outputs_exports(cfn):
     exports = cfn.list_exports()["Exports"]
     assert any(e["Name"] == "cfn-t05-bucket-export" for e in exports)
 
+
+def test_cfn_kinesis_stream(cfn, kin):
+    stream_name = "cfn-kinesis-cfn-test"
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "DataStream": {
+                "Type": "AWS::Kinesis::Stream",
+                "Properties": {
+                    "Name": stream_name,
+                    "ShardCount": 2,
+                },
+            },
+        },
+        "Outputs": {
+            "StreamArn": {"Value": {"Fn::GetAtt": ["DataStream", "Arn"]}},
+        },
+    }
+    cfn.create_stack(StackName="cfn-t-kinesis", TemplateBody=json.dumps(template))
+    stack = _wait_stack(cfn, "cfn-t-kinesis")
+    assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+
+    desc = kin.describe_stream(StreamName=stream_name)
+    assert desc["StreamDescription"]["StreamStatus"] == "ACTIVE"
+    assert len(desc["StreamDescription"]["Shards"]) == 2
+
+    outputs = {o["OutputKey"]: o["OutputValue"] for o in stack.get("Outputs", [])}
+    assert outputs["StreamArn"] == desc["StreamDescription"]["StreamARN"]
+
+    cfn.delete_stack(StackName="cfn-t-kinesis")
+    _wait_stack(cfn, "cfn-t-kinesis")
+
+    with pytest.raises(ClientError):
+        kin.describe_stream(StreamName=stream_name)
+
+
 def test_cfn_fn_sub(cfn, ssm):
     template = {
         "AWSTemplateFormatVersion": "2010-09-09",
@@ -1062,6 +1098,78 @@ def test_cfn_ec2_launch_template(cfn, ec2):
     desc2 = ec2.describe_launch_templates(LaunchTemplateIds=[lt_id])
     assert len(desc2["LaunchTemplates"]) == 0
 
+def test_cfn_elbv2_load_balancer_and_listener(cfn, elbv2):
+    """CloudFormation provisions ELBv2 LoadBalancer + Listener and cleans both on delete."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-elbv2-{uid}"
+    lb_name = f"cfn-alb-{uid}"
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "Alb": {
+                "Type": "AWS::ElasticLoadBalancingV2::LoadBalancer",
+                "Properties": {
+                    "Name": lb_name,
+                    "Type": "application",
+                    "Scheme": "internal",
+                    "SecurityGroups": ["sg-cfn12345"],
+                    "Subnets": ["subnet-cfn-a", "subnet-cfn-b"],
+                    "LoadBalancerAttributes": [
+                        {"Key": "idle_timeout.timeout_seconds", "Value": "45"},
+                    ],
+                },
+            },
+            "AlbListener": {
+                "Type": "AWS::ElasticLoadBalancingV2::Listener",
+                "Properties": {
+                    "LoadBalancerArn": {"Ref": "Alb"},
+                    "Port": 443,
+                    "Protocol": "HTTPS",
+                    "DefaultActions": [
+                        {
+                            "Type": "fixed-response",
+                            "FixedResponseConfig": {
+                                "StatusCode": "404",
+                                "ContentType": "application/json",
+                                "MessageBody": '{"status":404}',
+                            },
+                        }
+                    ],
+                },
+            },
+        },
+        "Outputs": {
+            "AlbDnsName": {"Value": {"Fn::GetAtt": ["Alb", "DNSName"]}},
+            "AlbFullName": {"Value": {"Fn::GetAtt": ["Alb", "LoadBalancerFullName"]}},
+            "AlbListenerArn": {"Value": {"Ref": "AlbListener"}},
+        },
+    }
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(template))
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "CREATE_COMPLETE"
+
+    outputs = {o["OutputKey"]: o["OutputValue"] for o in stack.get("Outputs", [])}
+    assert outputs["AlbDnsName"].endswith(".elb.amazonaws.com")
+    assert outputs["AlbFullName"].startswith(f"app/{lb_name}/")
+    assert ":listener/app/" in outputs["AlbListenerArn"]
+
+    lbs = elbv2.describe_load_balancers(Names=[lb_name])["LoadBalancers"]
+    assert len(lbs) == 1
+    lb_arn = lbs[0]["LoadBalancerArn"]
+    assert lbs[0]["Scheme"] == "internal"
+    assert lbs[0]["Type"] == "application"
+
+    listeners = elbv2.describe_listeners(LoadBalancerArn=lb_arn)["Listeners"]
+    assert len(listeners) == 1
+    listener = listeners[0]
+    assert listener["Port"] == 443
+    assert listener["Protocol"] == "HTTPS"
+    assert listener["DefaultActions"][0]["Type"] == "fixed-response"
+
+    cfn.delete_stack(StackName=stack_name)
+    _wait_stack(cfn, stack_name)
+    assert elbv2.describe_load_balancers(Names=[lb_name])["LoadBalancers"] == []
 
 def test_cfn_ssm_parameter_timestamp_is_epoch(cfn, ssm):
     """SSM parameters created via CloudFormation must store LastModifiedDate

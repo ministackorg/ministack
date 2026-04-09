@@ -130,6 +130,7 @@ SERVICE_HANDLERS = {
     "appsync": appsync.handle_request,
     "servicediscovery": servicediscovery.handle_request,
     "s3files": s3files.handle_request,
+    "rds-data": rds_data.handle_request,
 }
 
 SERVICE_NAME_ALIASES = {
@@ -488,7 +489,7 @@ async def app(scope, receive, send):
         bucket = _s3_vhost.group(1)
         _non_s3_hosts = {"s3", "s3-control", "sqs", "sns", "dynamodb", "lambda", "iam", "sts",
                          "secretsmanager", "logs", "ssm", "events", "kinesis",
-                         "monitoring", "ses", "states", "ecs", "rds", "elasticache",
+                         "monitoring", "ses", "states", "ecs", "rds", "rds-data", "elasticache",
                          "glue", "athena", "apigateway", "cloudformation"}
         if bucket not in _non_s3_hosts:
             vhost_path = "/" + bucket + path if path != "/" else "/" + bucket + "/"

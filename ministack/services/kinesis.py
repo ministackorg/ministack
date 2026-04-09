@@ -142,10 +142,26 @@ async def handle_request(method, path, headers, body, query_params):
     target = headers.get("x-amz-target", "")
     action = target.split(".")[-1] if "." in target else ""
 
+    content_type = headers.get("content-type", "")
+    is_cbor = "cbor" in content_type
+
     try:
-        data = json.loads(body) if body else {}
+        if is_cbor and body:
+            import cbor2
+            data = cbor2.loads(body)
+            # CBOR Data field arrives as raw bytes; base64-encode for uniform handling
+            if "Data" in data and isinstance(data["Data"], (bytes, bytearray)):
+                data["Data"] = base64.b64encode(data["Data"]).decode("ascii")
+            for rec in data.get("Records", []):
+                if "Data" in rec and isinstance(rec["Data"], (bytes, bytearray)):
+                    rec["Data"] = base64.b64encode(rec["Data"]).decode("ascii")
+        else:
+            data = json.loads(body) if body else {}
     except json.JSONDecodeError:
         return error_response_json("SerializationException", "Invalid JSON", 400)
+    except Exception as e:
+        logger.error("Failed to decode request body: %s", e)
+        return error_response_json("SerializationException", f"Could not decode request body: {e}", 400)
 
     _expire_iterators()
 
@@ -180,8 +196,22 @@ async def handle_request(method, path, headers, body, query_params):
 
     handler = handlers.get(action)
     if not handler:
+        if is_cbor:
+            return _cbor_response({"__type": "InvalidAction", "message": f"Unknown action: {action}"}, 400)
         return error_response_json("InvalidAction", f"Unknown action: {action}", 400)
-    return handler(data)
+
+    status, resp_headers, resp_body = handler(data)
+    if is_cbor:
+        import cbor2
+        # Re-encode JSON response body as CBOR
+        try:
+            json_data = json.loads(resp_body) if isinstance(resp_body, (str, bytes)) else resp_body
+        except (json.JSONDecodeError, TypeError):
+            json_data = {}
+        cbor_body = cbor2.dumps(json_data)
+        resp_headers["Content-Type"] = "application/x-amz-cbor-1.1"
+        return status, resp_headers, cbor_body
+    return status, resp_headers, resp_body
 
 
 # ---------------------------------------------------------------------------
@@ -915,6 +945,12 @@ def _stream_desc(stream, shard_ids=None):
         "EnhancedMonitoring": [{"ShardLevelMetrics": []}],
         "EncryptionType": stream.get("EncryptionType", "NONE"),
     }
+
+
+def _cbor_response(data: dict, status: int = 200):
+    import cbor2
+    body = cbor2.dumps(data)
+    return status, {"Content-Type": "application/x-amz-cbor-1.1"}, body
 
 
 def reset():

@@ -53,6 +53,77 @@ def test_eventbridge_targets(eb):
     resp = eb.list_targets_by_rule(Rule="target-rule")
     assert len(resp["Targets"]) == 1
 
+
+def test_eventbridge_list_rule_names_by_target(eb):
+    fn_arn = "arn:aws:lambda:us-east-1:000000000000:function:list-by-tgt-fn"
+    eb.create_event_bus(Name="lrt-bus")
+    eb.put_rule(
+        Name="rule-a",
+        EventBusName="lrt-bus",
+        EventPattern=json.dumps({"source": ["my.app"]}),
+        State="ENABLED",
+    )
+    eb.put_rule(
+        Name="rule-b",
+        EventBusName="lrt-bus",
+        EventPattern=json.dumps({"source": ["other.app"]}),
+        State="ENABLED",
+    )
+    eb.put_targets(
+        Rule="rule-a",
+        EventBusName="lrt-bus",
+        Targets=[{"Id": "t1", "Arn": fn_arn}],
+    )
+    eb.put_targets(
+        Rule="rule-b",
+        EventBusName="lrt-bus",
+        Targets=[{"Id": "t1", "Arn": fn_arn}],
+    )
+    out = eb.list_rule_names_by_target(TargetArn=fn_arn, EventBusName="lrt-bus")
+    assert sorted(out["RuleNames"]) == ["rule-a", "rule-b"]
+
+
+def test_eventbridge_test_event_pattern_match(eb):
+    event = json.dumps({
+        "source": "orders.service",
+        "detail-type": "Order Placed",
+        "detail": {"orderId": "42", "amount": 10},
+    })
+    pattern = json.dumps({
+        "source": ["orders.service"],
+        "detail-type": ["Order Placed"],
+    })
+    r = eb.test_event_pattern(Event=event, EventPattern=pattern)
+    assert r["Result"] is True
+
+
+def test_eventbridge_test_event_pattern_no_match(eb):
+    event = json.dumps({"source": "other", "detail-type": "X", "detail": {}})
+    pattern = json.dumps({"source": ["orders.service"]})
+    r = eb.test_event_pattern(Event=event, EventPattern=pattern)
+    assert r["Result"] is False
+
+
+def test_eventbridge_test_event_pattern_invalid_event(eb):
+    with pytest.raises(ClientError) as exc:
+        eb.test_event_pattern(Event="not-json", EventPattern="{}")
+    assert exc.value.response["Error"]["Code"] == "InvalidEventPatternException"
+
+
+def test_eventbridge_list_rule_names_by_target_pagination(eb):
+    fn_arn = "arn:aws:lambda:us-east-1:000000000000:function:page-fn"
+    eb.put_rule(Name="r1", ScheduleExpression="rate(1 hour)", State="ENABLED")
+    eb.put_rule(Name="r2", ScheduleExpression="rate(1 hour)", State="ENABLED")
+    eb.put_targets(Rule="r1", Targets=[{"Id": "1", "Arn": fn_arn}])
+    eb.put_targets(Rule="r2", Targets=[{"Id": "1", "Arn": fn_arn}])
+    p1 = eb.list_rule_names_by_target(TargetArn=fn_arn, Limit=1)
+    assert len(p1["RuleNames"]) == 1
+    assert "NextToken" in p1
+    p2 = eb.list_rule_names_by_target(TargetArn=fn_arn, Limit=1, NextToken=p1["NextToken"])
+    assert len(p2["RuleNames"]) == 1
+    assert p1["RuleNames"][0] != p2["RuleNames"][0]
+
+
 def test_eventbridge_permission(eb):
     eb.create_event_bus(Name="perm-bus")
     eb.put_permission(
@@ -73,6 +144,20 @@ def test_eventbridge_connection(eb):
     desc = eb.describe_connection(Name="test-conn")
     assert desc["Name"] == "test-conn"
     eb.delete_connection(Name="test-conn")
+
+
+def test_eventbridge_deauthorize_connection(eb):
+    eb.create_connection(
+        Name="deauth-conn",
+        AuthorizationType="API_KEY",
+        AuthParameters={"ApiKeyAuthParameters": {"ApiKeyName": "k", "ApiKeyValue": "v"}},
+    )
+    out = eb.deauthorize_connection(Name="deauth-conn")
+    assert out["ConnectionState"] == "DEAUTHORIZED"
+    desc = eb.describe_connection(Name="deauth-conn")
+    assert desc["ConnectionState"] == "DEAUTHORIZED"
+    eb.delete_connection(Name="deauth-conn")
+
 
 def test_eventbridge_api_destination(eb):
     eb.create_connection(
@@ -291,6 +376,107 @@ def test_eventbridge_archive(eb):
     eb.delete_archive(ArchiveName=archive_name)
     archives2 = eb.list_archives()
     assert not any(a["ArchiveName"] == archive_name for a in archives2["Archives"])
+
+
+def test_eventbridge_endpoints_and_partner_stubs(eb):
+    eb.create_endpoint(
+        Name="my-global-endpoint",
+        Description="stub",
+        RoleArn="arn:aws:iam::000000000000:role/r",
+        RoutingConfig={
+            "FailoverConfig": {
+                "Primary": {"HealthCheck": "arn:aws:route53:::healthcheck/primary"},
+                "Secondary": {"Route": "secondary-route"},
+            }
+        },
+        EventBuses=[
+            {"EventBusArn": "arn:aws:events:us-east-1:000000000000:event-bus/default"},
+            {"EventBusArn": "arn:aws:events:us-east-1:000000000000:event-bus/backup"},
+        ],
+    )
+    d = eb.describe_endpoint(Name="my-global-endpoint")
+    assert d["State"] == "ACTIVE"
+    assert "Arn" in d
+    lst = eb.list_endpoints()
+    assert any(e["Name"] == "my-global-endpoint" for e in lst["Endpoints"])
+    eb.update_endpoint(Name="my-global-endpoint", Description="updated")
+    eb.delete_endpoint(Name="my-global-endpoint")
+
+    eb.activate_event_source(Name="aws.partner/saas/foo")
+    eb.deactivate_event_source(Name="aws.partner/saas/foo")
+    src = eb.describe_event_source(Name="aws.partner/saas/foo")
+    assert src["State"] == "ENABLED"
+
+    r = eb.create_partner_event_source(Name="saas.src", Account="111111111111")
+    assert "EventSourceArn" in r
+    eb.describe_partner_event_source(Name="saas.src")
+    pl = eb.list_partner_event_sources(NamePrefix="saas")
+    assert len(pl["PartnerEventSources"]) >= 1
+    eb.delete_partner_event_source(Name="saas.src", Account="111111111111")
+
+    acc = eb.list_partner_event_source_accounts(EventSourceName="x")
+    assert acc["PartnerEventSourceAccounts"] == []
+
+    es = eb.list_event_sources()
+    assert es["EventSources"] == []
+
+    pe = eb.put_partner_events(Entries=[{"Source": "p", "DetailType": "t", "Detail": "{}"}])
+    assert pe["FailedEntryCount"] == 0
+
+
+def test_eventbridge_replay_lifecycle(eb):
+    arch = f"replay-arch-{_uuid_mod.uuid4().hex[:8]}"
+    eb.create_archive(
+        ArchiveName=arch,
+        EventSourceArn="arn:aws:events:us-east-1:000000000000:event-bus/default",
+    )
+    archive_arn = eb.describe_archive(ArchiveName=arch)["ArchiveArn"]
+    rep_name = f"replay-{_uuid_mod.uuid4().hex[:8]}"
+    src = "arn:aws:events:us-east-1:000000000000:event-bus/default"
+    from datetime import datetime, timezone
+
+    t0 = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    t1 = datetime(2024, 1, 2, tzinfo=timezone.utc)
+    start = eb.start_replay(
+        ReplayName=rep_name,
+        EventSourceArn=src,
+        EventStartTime=t0,
+        EventEndTime=t1,
+        Destination={"Arn": archive_arn},
+    )
+    assert start["State"] == "RUNNING"
+    desc = eb.describe_replay(ReplayName=rep_name)
+    assert desc["ReplayName"] == rep_name
+    assert desc["State"] == "RUNNING"
+    listed = eb.list_replays(NamePrefix=rep_name)
+    assert any(r["ReplayName"] == rep_name for r in listed["Replays"])
+    cancel = eb.cancel_replay(ReplayName=rep_name)
+    assert cancel["State"] == "CANCELLED"
+    desc2 = eb.describe_replay(ReplayName=rep_name)
+    assert desc2["State"] == "CANCELLED"
+    eb.delete_archive(ArchiveName=arch)
+
+
+def test_eventbridge_update_archive(eb):
+    name = f"upd-archive-{_uuid_mod.uuid4().hex[:8]}"
+    eb.create_archive(
+        ArchiveName=name,
+        EventSourceArn="arn:aws:events:us-east-1:000000000000:event-bus/default",
+        Description="old",
+        RetentionDays=1,
+    )
+    eb.update_archive(
+        ArchiveName=name,
+        Description="new desc",
+        RetentionDays=30,
+        EventPattern=json.dumps({"source": ["app"]}),
+    )
+    desc = eb.describe_archive(ArchiveName=name)
+    assert desc["Description"] == "new desc"
+    assert desc["RetentionDays"] == 30
+    assert "app" in desc["EventPattern"]
+    eb.delete_archive(ArchiveName=name)
+
 
 def test_eventbridge_put_remove_permission(eb):
     import uuid as _uuid
