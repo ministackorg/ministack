@@ -7,6 +7,13 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [Unreleased]
+
+### Added
+- **Native `provided` / `provided.al2023` Lambda runtime** — Lambda functions using custom runtimes (Go, Rust, C++ compiled binaries) now execute natively. MiniStack implements the Lambda Runtime API (`GET /invocation/next`, `POST /invocation/{id}/response`) as a minimal HTTP server, extracts the bootstrap binary from the deployment package, and manages the invocation lifecycle. Handles Go's default chunked `Transfer-Encoding` by parsing chunk framing rather than relying on `Content-Length`.
+
+---
+
 ## [1.1.58] — 2026-04-09
 
 ### Fixed
