@@ -1798,6 +1798,10 @@ def _exec_intrinsic(node, data, ctx):
                 val = args[i + 1]
                 result_parts.append(str(val) if not isinstance(val, str) else val)
         return "".join(result_parts)
+    elif name == "States.ArrayGetItem":
+        return args[0][int(args[1])]
+    elif name == "States.Array":
+        return list(args)
 
     raise ValueError(f"Unsupported intrinsic function: {name}")
 
