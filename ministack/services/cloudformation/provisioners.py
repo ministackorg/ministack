@@ -31,6 +31,7 @@ import ministack.services.ecr as _ecr
 import ministack.services.kms as _kms
 import ministack.services.ec2 as _ec2
 import ministack.services.ecs as _ecs
+import ministack.services.alb as _alb
 
 
 logger = logging.getLogger("cloudformation")
@@ -1697,6 +1698,174 @@ def _ec2_launch_template_delete(physical_id, props):
     _ec2._launch_templates.pop(physical_id, None)
 
 
+# --- ELBv2 (Load Balancer + Listener) provisioners ---
+
+def _elbv2_as_list(value):
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    if isinstance(value, str):
+        # CloudFormation parameters like CommaDelimitedList are often resolved as CSV strings.
+        return [v.strip() for v in value.split(",") if v.strip()]
+    return [value]
+
+
+def _elbv2_tags(tags):
+    out = []
+    for tag in (tags or []):
+        if isinstance(tag, dict) and "Key" in tag:
+            out.append({"Key": str(tag["Key"]), "Value": str(tag.get("Value", ""))})
+    return out
+
+
+def _elbv2_load_balancer_create(logical_id, props, stack_name):
+    name = props.get("Name") or _physical_name(
+        stack_name,
+        logical_id,
+        lowercase=True,
+        max_len=32,
+    )
+    lb_id = _alb._short_id()
+    arn = (
+        f"arn:aws:elasticloadbalancing:{REGION}:{get_account_id()}:"
+        f"loadbalancer/app/{name}/{lb_id}"
+    )
+    dns_name = f"{name}-{lb_id[:8]}.{REGION}.elb.amazonaws.com"
+    lb = {
+        "LoadBalancerArn": arn,
+        "LoadBalancerName": name,
+        "DNSName": dns_name,
+        "Scheme": props.get("Scheme", "internet-facing"),
+        "VpcId": props.get("VpcId", "vpc-00000001"),
+        "State": "active",
+        "Type": props.get("Type", "application"),
+        "Subnets": _elbv2_as_list(props.get("Subnets")),
+        "SecurityGroups": _elbv2_as_list(props.get("SecurityGroups")),
+        "IpAddressType": props.get("IpAddressType", "ipv4"),
+        "CreatedTime": _alb._now_iso(),
+    }
+    _alb._lbs[arn] = lb
+    _alb._tags[arn] = _elbv2_tags(props.get("Tags"))
+    _alb._lb_attrs[arn] = [
+        {"Key": a.get("Key", ""), "Value": str(a.get("Value", ""))}
+        for a in (props.get("LoadBalancerAttributes") or [])
+        if isinstance(a, dict) and a.get("Key")
+    ] or [
+        {"Key": "access_logs.s3.enabled", "Value": "false"},
+        {"Key": "deletion_protection.enabled", "Value": "false"},
+        {"Key": "idle_timeout.timeout_seconds", "Value": "60"},
+    ]
+
+    attrs = {
+        "Arn": arn,
+        "LoadBalancerArn": arn,
+        "LoadBalancerName": name,
+        "DNSName": dns_name,
+        "LoadBalancerFullName": f"app/{name}/{lb_id}",
+        "CanonicalHostedZoneID": "Z35SXDOTRQ7X7K",
+        "SecurityGroups": lb["SecurityGroups"],
+    }
+    return arn, attrs
+
+
+def _elbv2_load_balancer_delete(physical_id, props):
+    # Clean up listeners/rules linked to this load balancer.
+    listener_arns = [
+        l_arn
+        for l_arn, listener in list(_alb._listeners.items())
+        if listener.get("LoadBalancerArn") == physical_id
+    ]
+    for l_arn in listener_arns:
+        _alb._listeners.pop(l_arn, None)
+        _alb._tags.pop(l_arn, None)
+        for r_arn in [k for k, v in list(_alb._rules.items()) if v.get("ListenerArn") == l_arn]:
+            _alb._rules.pop(r_arn, None)
+            _alb._tags.pop(r_arn, None)
+
+    for tg in _alb._tgs.values():
+        if physical_id in tg.get("LoadBalancerArns", []):
+            tg["LoadBalancerArns"] = [a for a in tg.get("LoadBalancerArns", []) if a != physical_id]
+
+    _alb._lbs.pop(physical_id, None)
+    _alb._lb_attrs.pop(physical_id, None)
+    _alb._tags.pop(physical_id, None)
+
+
+def _elbv2_listener_create(logical_id, props, stack_name):
+    lb_arn = props.get("LoadBalancerArn", "")
+    lb = _alb._lbs.get(lb_arn)
+    if not lb:
+        raise ValueError(f"Load balancer not found for Listener: {lb_arn}")
+
+    listener_id = _alb._short_id()
+    lb_name = lb["LoadBalancerName"]
+    lb_id = lb_arn.split("/")[-1]
+    listener_arn = (
+        f"arn:aws:elasticloadbalancing:{REGION}:{get_account_id()}:"
+        f"listener/app/{lb_name}/{lb_id}/{listener_id}"
+    )
+
+    actions = []
+    for idx, action in enumerate(props.get("DefaultActions", []) or [], start=1):
+        if not isinstance(action, dict):
+            continue
+        entry = {
+            "Type": action.get("Type", "fixed-response"),
+            "Order": int(action.get("Order", idx)),
+        }
+        tg_arn = action.get("TargetGroupArn")
+        if not tg_arn:
+            forward_cfg = action.get("ForwardConfig", {})
+            tg_list = forward_cfg.get("TargetGroups", []) if isinstance(forward_cfg, dict) else []
+            if tg_list and isinstance(tg_list[0], dict):
+                tg_arn = tg_list[0].get("TargetGroupArn")
+        if tg_arn:
+            entry["TargetGroupArn"] = tg_arn
+            if tg_arn in _alb._tgs and lb_arn not in _alb._tgs[tg_arn].get("LoadBalancerArns", []):
+                _alb._tgs[tg_arn].setdefault("LoadBalancerArns", []).append(lb_arn)
+        if isinstance(action.get("FixedResponseConfig"), dict):
+            entry["FixedResponseConfig"] = action["FixedResponseConfig"]
+        if isinstance(action.get("RedirectConfig"), dict):
+            entry["RedirectConfig"] = action["RedirectConfig"]
+        actions.append(entry)
+
+    listener = {
+        "ListenerArn": listener_arn,
+        "LoadBalancerArn": lb_arn,
+        "Port": int(props.get("Port", 80) or 80),
+        "Protocol": props.get("Protocol", "HTTP"),
+        "DefaultActions": actions,
+    }
+    _alb._listeners[listener_arn] = listener
+    _alb._tags[listener_arn] = _elbv2_tags(props.get("Tags"))
+
+    # Match alb service semantics: create a default rule for every listener.
+    rule_id = _alb._short_id()
+    rule_arn = (
+        f"arn:aws:elasticloadbalancing:{REGION}:{get_account_id()}:"
+        f"listener-rule/app/{lb_name}/{lb_id}/{listener_id}/{rule_id}"
+    )
+    _alb._rules[rule_arn] = {
+        "RuleArn": rule_arn,
+        "ListenerArn": listener_arn,
+        "Priority": "default",
+        "Conditions": [],
+        "Actions": actions,
+        "IsDefault": True,
+    }
+
+    return listener_arn, {"ListenerArn": listener_arn, "Arn": listener_arn}
+
+
+def _elbv2_listener_delete(physical_id, props):
+    _alb._listeners.pop(physical_id, None)
+    _alb._tags.pop(physical_id, None)
+    for rule_arn in [k for k, v in list(_alb._rules.items()) if v.get("ListenerArn") == physical_id]:
+        _alb._rules.pop(rule_arn, None)
+        _alb._tags.pop(rule_arn, None)
+
+
 # Resource Handler Registry
 # ===========================================================================
 
@@ -1753,6 +1922,8 @@ _RESOURCE_HANDLERS = {
     "AWS::ECS::TaskDefinition": {"create": _ecs_task_def_create, "delete": _ecs_task_def_delete},
     "AWS::ECS::Service": {"create": _ecs_service_create, "delete": _ecs_service_delete},
     "AWS::EC2::LaunchTemplate": {"create": _ec2_launch_template_create, "delete": _ec2_launch_template_delete},
+    "AWS::ElasticLoadBalancingV2::LoadBalancer": {"create": _elbv2_load_balancer_create, "delete": _elbv2_load_balancer_delete,},
+    "AWS::ElasticLoadBalancingV2::Listener": {"create": _elbv2_listener_create, "delete": _elbv2_listener_delete,},
     # CDK metadata — safe to ignore
     "AWS::CDK::Metadata": {"create": lambda lid, props, sn: (f"CDKMetadata-{lid}", {}), "delete": lambda pid, props: None},
     # AutoScaling stubs — allow CDK/CFN stacks with ASGs to deploy
