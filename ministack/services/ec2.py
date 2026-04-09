@@ -687,10 +687,22 @@ def _delete_vpc(p):
 
 def _describe_subnets(p):
     filter_ids = _parse_member_list(p, "SubnetId")
+    filters = _parse_filters(p)
     items = ""
     for subnet in _subnets.values():
         if filter_ids and subnet["SubnetId"] not in filter_ids:
             continue
+        if filters:
+            if "vpc-id" in filters and subnet["VpcId"] not in filters["vpc-id"]:
+                continue
+            if "availability-zone" in filters and subnet["AvailabilityZone"] not in filters["availability-zone"]:
+                continue
+            if "subnet-id" in filters and subnet["SubnetId"] not in filters["subnet-id"]:
+                continue
+            if "default-for-az" in filters:
+                val = "true" if subnet.get("DefaultForAz") else "false"
+                if val not in filters["default-for-az"]:
+                    continue
         items += _subnet_xml(subnet)
     return _xml(200, "DescribeSubnetsResponse", f"<subnetSet>{items}</subnetSet>")
 
