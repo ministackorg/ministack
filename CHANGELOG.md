@@ -13,6 +13,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 - **States.ArrayGetItem, States.Array, States.ArrayLength intrinsics** — SFN state machines using `States.ArrayGetItem(array, index)`, `States.Array(val1, val2, ...)`, and `States.ArrayLength(array)` now execute correctly.
 - **Botocore response parser for query-protocol aws-sdk dispatch** — query-protocol responses are now deserialized through botocore's response parser, producing correctly typed values (int, bool) and proper SDK member names instead of raw XML element names.
 - **SFN key naming convention (`_convert_keys_to_sfn_convention`)** — API response keys like `DBClusters` are now converted to Java SDK V2 convention (`DbClusters`) matching real AWS SFN behavior. Applied to both query-protocol and JSON-protocol aws-sdk dispatchers.
+- **REST-JSON aws-sdk dispatcher** — SFN `aws-sdk` integrations for REST-JSON protocol services (e.g. RDS Data API) now dispatch correctly. The dispatcher constructs path-based requests with JSON bodies following botocore's `rest-json` serialization model.
+- **RDS Data API (`rds-data`) service handler** — `ExecuteStatement` and `BatchExecuteStatement` are handled with MySQL query execution against the Aurora container. Falls back to stub success on connection failure to avoid blocking SFN execution.
+- **`rdsdata` alias in `_AWS_SDK_SERVICE_MAP`** — SFN uses `rdsdata` (no hyphen) as the service name in aws-sdk Task ARNs per AWS docs. The alias maps to the `rds-data` botocore service key for model lookup.
 
 ### Fixed
 - **`States.TaskFailed` treated as catch-all** — `Retry` and `Catch` blocks matching `States.TaskFailed` now catch any Task error, matching AWS behavior where it acts as a wildcard error matcher.
