@@ -19,7 +19,7 @@ _kwargs = dict(
     # Hardcoded retry and pool settings to reduce transient connection flakes
     config=Config(
         region_name=REGION,
-        retries={"max_attempts": 3},
+        retries={"mode": "standard"},
         max_pool_connections=50,
     ),
 )
@@ -239,7 +239,7 @@ def sfn_sync():
         region_name=REGION,
         config=BotoConfig(
             region_name=REGION,
-            retries={"max_attempts": 3},
+            retries={"mode": "standard"},
             max_pool_connections=50,
             inject_host_prefix=False,
         ),
@@ -265,7 +265,7 @@ def sd():
         region_name=REGION,
         config=BotoConfig(
             region_name=REGION,
-            retries={"max_attempts": 3},
+            retries={"mode": "standard"},
             max_pool_connections=50,
             inject_host_prefix=False,
         ),
