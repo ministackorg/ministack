@@ -1,16 +1,23 @@
 """
 EventBridge Service Emulator.
-JSON-based API via X-Amz-Target (AmazonEventBridge).
-Supports: CreateEventBus, DeleteEventBus, ListEventBuses, DescribeEventBus,
+JSON-based API via X-Amz-Target (AmazonEventBridge / AWSEvents).
+Supports: CreateEventBus, UpdateEventBus, DeleteEventBus, ListEventBuses, DescribeEventBus,
           PutRule, DeleteRule, ListRules, DescribeRule, EnableRule, DisableRule,
-          PutTargets, RemoveTargets, ListTargetsByRule,
-          PutEvents,
+          PutTargets, RemoveTargets, ListTargetsByRule, ListRuleNamesByTarget,
+          PutEvents, TestEventPattern,
           TagResource, UntagResource, ListTagsForResource,
-          CreateArchive, DeleteArchive, DescribeArchive, ListArchives,
+          CreateArchive, DeleteArchive, DescribeArchive, UpdateArchive, ListArchives,
           PutPermission, RemovePermission,
-          CreateConnection, DescribeConnection, DeleteConnection, ListConnections, UpdateConnection,
+          CreateConnection, DescribeConnection, DeleteConnection, ListConnections,
+          UpdateConnection, DeauthorizeConnection,
           CreateApiDestination, DescribeApiDestination, DeleteApiDestination,
-          ListApiDestinations, UpdateApiDestination.
+          ListApiDestinations, UpdateApiDestination,
+          StartReplay, DescribeReplay, ListReplays, CancelReplay,
+          CreateEndpoint, DeleteEndpoint, DescribeEndpoint, ListEndpoints, UpdateEndpoint,
+          ActivateEventSource, DeactivateEventSource, DescribeEventSource,
+          CreatePartnerEventSource, DeletePartnerEventSource, DescribePartnerEventSource,
+          ListPartnerEventSources, ListPartnerEventSourceAccounts,
+          ListEventSources, PutPartnerEvents.
 """
 
 import copy
