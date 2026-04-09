@@ -2450,14 +2450,18 @@ def _dispatch_aws_sdk_rest_json(service_info, service_name, action, input_data):
 
     # Determine the REST path from botocore model
     pascal_action = action[0].upper() + action[1:] if action else action
+    operation_model = None
+    # Use service_key for botocore lookup (e.g., 'rds-data' instead of 'rdsdata')
+    botocore_name = service_info.get("botocore_name", service_key)
     try:
         import botocore.session
         session = botocore.session.get_session()
-        service_model = session.get_service_model(service_name)
+        service_model = session.get_service_model(botocore_name)
         operation_model = service_model.operation_model(pascal_action)
         http = operation_model.http
         path = http.get("requestUri", f"/{pascal_action}")
-    except Exception:
+    except Exception as exc:
+        logger.warning("botocore model lookup failed for %s/%s: %s", botocore_name, pascal_action, exc)
         path = f"/{pascal_action}"
 
     # Convert SDK-style param names to the model's expected names
