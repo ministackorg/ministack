@@ -249,6 +249,42 @@ def test_cfn_outputs_exports(cfn):
     exports = cfn.list_exports()["Exports"]
     assert any(e["Name"] == "cfn-t05-bucket-export" for e in exports)
 
+
+def test_cfn_kinesis_stream(cfn, kin):
+    stream_name = "cfn-kinesis-cfn-test"
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "DataStream": {
+                "Type": "AWS::Kinesis::Stream",
+                "Properties": {
+                    "Name": stream_name,
+                    "ShardCount": 2,
+                },
+            },
+        },
+        "Outputs": {
+            "StreamArn": {"Value": {"Fn::GetAtt": ["DataStream", "Arn"]}},
+        },
+    }
+    cfn.create_stack(StackName="cfn-t-kinesis", TemplateBody=json.dumps(template))
+    stack = _wait_stack(cfn, "cfn-t-kinesis")
+    assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+
+    desc = kin.describe_stream(StreamName=stream_name)
+    assert desc["StreamDescription"]["StreamStatus"] == "ACTIVE"
+    assert len(desc["StreamDescription"]["Shards"]) == 2
+
+    outputs = {o["OutputKey"]: o["OutputValue"] for o in stack.get("Outputs", [])}
+    assert outputs["StreamArn"] == desc["StreamDescription"]["StreamARN"]
+
+    cfn.delete_stack(StackName="cfn-t-kinesis")
+    _wait_stack(cfn, "cfn-t-kinesis")
+
+    with pytest.raises(ClientError):
+        kin.describe_stream(StreamName=stream_name)
+
+
 def test_cfn_fn_sub(cfn, ssm):
     template = {
         "AWSTemplateFormatVersion": "2010-09-09",

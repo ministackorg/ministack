@@ -368,6 +368,7 @@ subnet = ec2.create_subnet(
 | `AWS::SSM::Parameter` | Parameter name | Type, Value |
 | `AWS::Logs::LogGroup` | Log group name | Arn |
 | `AWS::Events::Rule` | Rule name | Arn |
+| `AWS::Kinesis::Stream` | Stream name | Arn, StreamId |
 | `AWS::Lambda::Permission` | Statement ID | — |
 | `AWS::Lambda::Version` | Version ARN | Version |
 | `AWS::Lambda::Alias` | Alias ARN | — |

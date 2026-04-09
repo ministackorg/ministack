@@ -31,6 +31,7 @@ import ministack.services.ecr as _ecr
 import ministack.services.kms as _kms
 import ministack.services.ec2 as _ec2
 import ministack.services.ecs as _ecs
+import ministack.services.kinesis as _kinesis
 
 
 logger = logging.getLogger("cloudformation")
@@ -643,6 +644,52 @@ def _eb_rule_delete(physical_id, props):
     key = f"{physical_id}|{bus}"
     _eb._rules.pop(key, None)
     _eb._targets.pop(key, None)
+
+
+# --- Kinesis Stream ---
+
+def _kinesis_stream_create(logical_id, props, stack_name):
+    name = props.get("Name") or _physical_name(stack_name, logical_id, lowercase=True, max_len=128)
+    smd = props.get("StreamModeDetails") or {}
+    stream_mode = smd.get("StreamMode", "PROVISIONED") if isinstance(smd, dict) else "PROVISIONED"
+    if stream_mode == "ON_DEMAND":
+        shard_count = 4
+    else:
+        shard_count = int(props.get("ShardCount", 1))
+    if shard_count < 1:
+        shard_count = 1
+
+    retention = int(props.get("RetentionPeriodHours", 24))
+    if retention < 24:
+        retention = 24
+    if retention > 8760:
+        retention = 8760
+
+    arn = f"arn:aws:kinesis:{REGION}:{get_account_id()}:stream/{name}"
+    stream_id = new_uuid()
+
+    _kinesis._streams[name] = {
+        "StreamName": name,
+        "StreamARN": arn,
+        "StreamStatus": "ACTIVE",
+        "StreamModeDetails": {"StreamMode": stream_mode},
+        "RetentionPeriodHours": retention,
+        "shards": _kinesis._build_shards(shard_count),
+        "tags": {},
+        "CreationTimestamp": time.time(),
+        "EncryptionType": "NONE",
+    }
+    return name, {"Arn": arn, "StreamId": stream_id}
+
+
+def _kinesis_stream_delete(physical_id, props):
+    stream = _kinesis._streams.pop(physical_id, None)
+    if not stream:
+        return
+    for tok in [t for t, s in _kinesis._shard_iterators.items() if s["stream"] == physical_id]:
+        del _kinesis._shard_iterators[tok]
+    for carn in [a for a, c in _kinesis._consumers.items() if c["StreamARN"] == stream["StreamARN"]]:
+        del _kinesis._consumers[carn]
 
 
 # --- Lambda Permission ---
@@ -1714,6 +1761,7 @@ _RESOURCE_HANDLERS = {
     "AWS::SSM::Parameter": {"create": _ssm_create, "delete": _ssm_delete},
     "AWS::Logs::LogGroup": {"create": _cwlogs_create, "delete": _cwlogs_delete},
     "AWS::Events::Rule": {"create": _eb_rule_create, "delete": _eb_rule_delete},
+    "AWS::Kinesis::Stream": {"create": _kinesis_stream_create, "delete": _kinesis_stream_delete},
     "AWS::Lambda::Permission": {"create": _lambda_permission_create, "delete": _lambda_permission_delete},
     "AWS::Lambda::Version": {"create": _lambda_version_create},
     "AWS::CloudFormation::WaitCondition": {"create": _cfn_wait_condition_create},
