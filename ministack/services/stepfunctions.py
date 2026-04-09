@@ -1804,6 +1804,8 @@ def _exec_intrinsic(node, data, ctx):
         return args[0][int(args[1])]
     elif name == "States.Array":
         return list(args)
+    elif name == "States.ArrayLength":
+        return len(args[0])
 
     raise ValueError(f"Unsupported intrinsic function: {name}")
 
