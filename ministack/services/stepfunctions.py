@@ -2250,6 +2250,77 @@ def _xml_element_to_dict(element):
     return tag, result
 
 
+
+
+def _parse_query_response_via_botocore(service_name, pascal_action, xml_body, status_code):
+    """Use botocore's response parser to deserialize a query-protocol XML response.
+
+    This correctly handles arrays, typed values (int, bool), and uses the proper
+    SDK member names from the service model rather than raw XML element names.
+    """
+    import botocore.session
+    from botocore.parsers import create_parser
+
+    session = botocore.session.get_session()
+    service_model = session.get_service_model(service_name)
+    operation_model = service_model.operation_model(pascal_action)
+    parser = create_parser(service_model.protocol)
+
+    http_response = {
+        "status_code": status_code,
+        "headers": {},
+        "body": xml_body.encode("utf-8") if isinstance(xml_body, str) else xml_body,
+    }
+    return parser.parse(http_response, operation_model.output_shape)
+
+
+def _api_name_to_sfn_key(name):
+    """Convert an AWS API/botocore member name to SFN SDK integration key name.
+
+    SFN uses the Java SDK V2 naming convention: consecutive uppercase characters
+    (acronyms) are lowered except the last one when followed by a lowercase char.
+    Examples: DBClusters -> DbClusters, DBClusterArn -> DbClusterArn,
+              IAMDatabaseAuthenticationEnabled -> IamDatabaseAuthenticationEnabled
+    """
+    if not name:
+        return name
+    result = []
+    i = 0
+    while i < len(name):
+        if i == 0:
+            result.append(name[i].upper())
+            i += 1
+            continue
+        if name[i].isupper():
+            j = i
+            while j < len(name) and name[j].isupper():
+                j += 1
+            run_len = j - i
+            if run_len == 1:
+                result.append(name[i])
+                i += 1
+            else:
+                if j < len(name) and name[j].islower():
+                    result.append(name[i:j - 1].lower())
+                    result.append(name[j - 1])
+                else:
+                    result.append(name[i:j].lower())
+                i = j
+        else:
+            result.append(name[i])
+            i += 1
+    return "".join(result)
+
+
+def _convert_keys_to_sfn_convention(obj):
+    """Recursively convert dict keys from botocore naming to SFN/Java SDK V2 naming."""
+    if isinstance(obj, dict):
+        return {_api_name_to_sfn_key(k): _convert_keys_to_sfn_convention(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_convert_keys_to_sfn_convention(item) for item in obj]
+    return obj
+
+
 def _dispatch_aws_sdk_query(service_info, service_name, action, input_data):
     """Dispatch an aws-sdk integration call to a query-protocol MiniStack service."""
     import xml.etree.ElementTree as ET
@@ -2320,20 +2391,28 @@ def _dispatch_aws_sdk_query(service_info, service_name, action, input_data):
             pass
         raise _ExecutionError(f"{service_name}.ServiceException", decoded)
 
-    # Convert successful XML response to dict
+    # Use botocore's response parser to properly deserialize the XML response.
+    # This correctly handles arrays, typed values, and SDK-style key names.
+    # Then convert keys to the SFN/Java SDK V2 naming convention.
     try:
-        root = ET.fromstring(decoded)
-        _, result = _xml_element_to_dict(root)
-        if isinstance(result, dict):
-            # Unwrap the <ActionResult> wrapper if present
-            result_key = f"{pascal_action}Result"
-            if result_key in result:
-                result = result[result_key]
-            # Drop ResponseMetadata
-            result.pop("ResponseMetadata", None)
-        return result
-    except ET.ParseError:
-        raise _ExecutionError("States.Runtime", f"Failed to parse {service_name} XML response")
+        result = _parse_query_response_via_botocore(service_name, pascal_action, decoded, status)
+        result.pop("ResponseMetadata", None)
+        return _convert_keys_to_sfn_convention(result)
+    except _ExecutionError:
+        raise
+    except Exception:
+        # Fall back to naive XML parsing if botocore parsing fails
+        try:
+            root = ET.fromstring(decoded)
+            _, result = _xml_element_to_dict(root)
+            if isinstance(result, dict):
+                result_key = f"{pascal_action}Result"
+                if result_key in result:
+                    result = result[result_key]
+                result.pop("ResponseMetadata", None)
+            return _convert_keys_to_sfn_convention(result)
+        except ET.ParseError:
+            raise _ExecutionError("States.Runtime", f"Failed to parse {service_name} XML response")
 
 
 def _invoke_aws_sdk_integration(resource, input_data):
