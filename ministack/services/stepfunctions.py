@@ -1781,6 +1781,8 @@ def _exec_intrinsic(node, data, ctx):
 
     if name == "States.StringToJson":
         return json.loads(args[0])
+    elif name == "States.JsonToString":
+        return json.dumps(args[0], separators=(",", ":"))
     elif name == "States.JsonMerge":
         merged = {}
         merged.update(args[0])
