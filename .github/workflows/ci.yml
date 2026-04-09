@@ -40,7 +40,7 @@ jobs:
           curl -sf http://localhost:4566/_ministack/health
 
       - name: Run tests (parallel safe set)
-        run: pytest tests/ -v --tb=short -n 3 --dist=loadfile -m "not serial"
+        run: pytest tests/ -v --tb=short -n 2 --dist=loadfile -m "not serial"
 
       - name: Run tests (serial global-state set)
         run: pytest tests/ -v --tb=short -m "serial"
