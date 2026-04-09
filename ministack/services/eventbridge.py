@@ -129,6 +129,7 @@ async def handle_request(method, path, headers, body, query_params):
         "RemoveTargets": _remove_targets,
         "ListTargetsByRule": _list_targets_by_rule,
         "ListRuleNamesByTarget": _list_rule_names_by_target,
+        "TestEventPattern": _test_event_pattern,
         "PutEvents": _put_events,
         "TagResource": _tag_resource,
         "UntagResource": _untag_resource,
@@ -479,6 +480,44 @@ def _list_rule_names_by_target(data):
     if start + limit < len(matched):
         resp["NextToken"] = str(start + limit)
     return json_response(resp)
+
+
+def _event_from_test_payload(event_obj: dict) -> dict:
+    """Map CloudWatch Events-shaped JSON to internal fields used by _matches_pattern."""
+    detail = event_obj.get("detail", event_obj.get("Detail", {}))
+    if isinstance(detail, dict):
+        detail = json.dumps(detail)
+    elif detail is None:
+        detail = "{}"
+    else:
+        detail = str(detail)
+    return {
+        "Source": event_obj.get("source", event_obj.get("Source", "")),
+        "DetailType": event_obj.get("detail-type", event_obj.get("DetailType", "")),
+        "Detail": detail,
+        "Account": event_obj.get("account", event_obj.get("Account", get_account_id())),
+        "Region": event_obj.get("region", event_obj.get("Region", REGION)),
+        "Resources": event_obj.get("resources", event_obj.get("Resources", [])),
+    }
+
+
+def _test_event_pattern(data):
+    event_str = data.get("Event", "")
+    pattern_str = data.get("EventPattern", "")
+    if not event_str:
+        return error_response_json("ValidationException", "Event is required", 400)
+    if not pattern_str:
+        return error_response_json("ValidationException", "EventPattern is required", 400)
+    try:
+        event_obj = json.loads(event_str) if isinstance(event_str, str) else event_str
+    except (json.JSONDecodeError, TypeError):
+        return error_response_json("InvalidEventPatternException", "Event is not valid JSON", 400)
+    if not isinstance(event_obj, dict):
+        return error_response_json("InvalidEventPatternException", "Event must be a JSON object", 400)
+
+    synthetic = _event_from_test_payload(event_obj)
+    matched = _matches_pattern(pattern_str, synthetic)
+    return json_response({"Result": bool(matched)})
 
 
 # ---------------------------------------------------------------------------

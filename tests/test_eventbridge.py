@@ -83,6 +83,33 @@ def test_eventbridge_list_rule_names_by_target(eb):
     assert sorted(out["RuleNames"]) == ["rule-a", "rule-b"]
 
 
+def test_eventbridge_test_event_pattern_match(eb):
+    event = json.dumps({
+        "source": "orders.service",
+        "detail-type": "Order Placed",
+        "detail": {"orderId": "42", "amount": 10},
+    })
+    pattern = json.dumps({
+        "source": ["orders.service"],
+        "detail-type": ["Order Placed"],
+    })
+    r = eb.test_event_pattern(Event=event, EventPattern=pattern)
+    assert r["Result"] is True
+
+
+def test_eventbridge_test_event_pattern_no_match(eb):
+    event = json.dumps({"source": "other", "detail-type": "X", "detail": {}})
+    pattern = json.dumps({"source": ["orders.service"]})
+    r = eb.test_event_pattern(Event=event, EventPattern=pattern)
+    assert r["Result"] is False
+
+
+def test_eventbridge_test_event_pattern_invalid_event(eb):
+    with pytest.raises(ClientError) as exc:
+        eb.test_event_pattern(Event="not-json", EventPattern="{}")
+    assert exc.value.response["Error"]["Code"] == "InvalidEventPatternException"
+
+
 def test_eventbridge_list_rule_names_by_target_pagination(eb):
     fn_arn = "arn:aws:lambda:us-east-1:000000000000:function:page-fn"
     eb.put_rule(Name="r1", ScheduleExpression="rate(1 hour)", State="ENABLED")
