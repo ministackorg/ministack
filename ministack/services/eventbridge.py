@@ -128,6 +128,7 @@ async def handle_request(method, path, headers, body, query_params):
         "PutTargets": _put_targets,
         "RemoveTargets": _remove_targets,
         "ListTargetsByRule": _list_targets_by_rule,
+        "ListRuleNamesByTarget": _list_rule_names_by_target,
         "PutEvents": _put_events,
         "TagResource": _tag_resource,
         "UntagResource": _untag_resource,
@@ -442,6 +443,42 @@ def _list_targets_by_rule(data):
     key = _rule_key(rule_name, bus)
     targets = _targets.get(key, [])
     return json_response({"Targets": targets})
+
+
+def _list_rule_names_by_target(data):
+    target_arn = data.get("TargetArn", "")
+    if not target_arn:
+        return error_response_json("ValidationException", "TargetArn is required", 400)
+    bus_filter = data.get("EventBusName", "")
+    limit = int(data.get("Limit", 100))
+    if limit < 1:
+        limit = 100
+    if limit > 100:
+        limit = 100
+    next_token = data.get("NextToken", "")
+
+    matched = []
+    for key, tlist in _targets.items():
+        bus_name, rule_name = key.split("|", 1) if "|" in key else ("default", key)
+        if bus_filter and bus_name != bus_filter:
+            continue
+        if not any(t.get("Arn") == target_arn for t in tlist):
+            continue
+        if key in _rules:
+            matched.append(_rules[key]["Name"])
+
+    matched = sorted(set(matched))
+    start = 0
+    if next_token:
+        try:
+            start = int(next_token)
+        except ValueError:
+            start = 0
+    page = matched[start:start + limit]
+    resp = {"RuleNames": page}
+    if start + limit < len(matched):
+        resp["NextToken"] = str(start + limit)
+    return json_response(resp)
 
 
 # ---------------------------------------------------------------------------

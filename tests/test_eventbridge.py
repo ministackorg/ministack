@@ -53,6 +53,50 @@ def test_eventbridge_targets(eb):
     resp = eb.list_targets_by_rule(Rule="target-rule")
     assert len(resp["Targets"]) == 1
 
+
+def test_eventbridge_list_rule_names_by_target(eb):
+    fn_arn = "arn:aws:lambda:us-east-1:000000000000:function:list-by-tgt-fn"
+    eb.create_event_bus(Name="lrt-bus")
+    eb.put_rule(
+        Name="rule-a",
+        EventBusName="lrt-bus",
+        EventPattern=json.dumps({"source": ["my.app"]}),
+        State="ENABLED",
+    )
+    eb.put_rule(
+        Name="rule-b",
+        EventBusName="lrt-bus",
+        EventPattern=json.dumps({"source": ["other.app"]}),
+        State="ENABLED",
+    )
+    eb.put_targets(
+        Rule="rule-a",
+        EventBusName="lrt-bus",
+        Targets=[{"Id": "t1", "Arn": fn_arn}],
+    )
+    eb.put_targets(
+        Rule="rule-b",
+        EventBusName="lrt-bus",
+        Targets=[{"Id": "t1", "Arn": fn_arn}],
+    )
+    out = eb.list_rule_names_by_target(TargetArn=fn_arn, EventBusName="lrt-bus")
+    assert sorted(out["RuleNames"]) == ["rule-a", "rule-b"]
+
+
+def test_eventbridge_list_rule_names_by_target_pagination(eb):
+    fn_arn = "arn:aws:lambda:us-east-1:000000000000:function:page-fn"
+    eb.put_rule(Name="r1", ScheduleExpression="rate(1 hour)", State="ENABLED")
+    eb.put_rule(Name="r2", ScheduleExpression="rate(1 hour)", State="ENABLED")
+    eb.put_targets(Rule="r1", Targets=[{"Id": "1", "Arn": fn_arn}])
+    eb.put_targets(Rule="r2", Targets=[{"Id": "1", "Arn": fn_arn}])
+    p1 = eb.list_rule_names_by_target(TargetArn=fn_arn, Limit=1)
+    assert len(p1["RuleNames"]) == 1
+    assert "NextToken" in p1
+    p2 = eb.list_rule_names_by_target(TargetArn=fn_arn, Limit=1, NextToken=p1["NextToken"])
+    assert len(p2["RuleNames"]) == 1
+    assert p1["RuleNames"][0] != p2["RuleNames"][0]
+
+
 def test_eventbridge_permission(eb):
     eb.create_event_bus(Name="perm-bus")
     eb.put_permission(
