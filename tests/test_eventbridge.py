@@ -703,3 +703,81 @@ def test_eventbridge_input_transformer(eb, sqs):
     body = json.loads(msgs["Messages"][0]["Body"])
     assert body.get("transformed") == "myapp"
 
+
+def test_eventbridge_put_events_with_arn_as_bus_name(eb, sqs):
+    """PutEvents with an ARN as EventBusName should dispatch to rules using the bus name."""
+    bus_name = "qa-eb-arn-bus"
+    eb.create_event_bus(Name=bus_name)
+    q_url = sqs.create_queue(QueueName="qa-eb-arn-q")["QueueUrl"]
+    q_arn = sqs.get_queue_attributes(QueueUrl=q_url, AttributeNames=["QueueArn"])["Attributes"]["QueueArn"]
+    eb.put_rule(
+        Name="qa-eb-arn-rule",
+        EventBusName=bus_name,
+        EventPattern=json.dumps({"source": ["myapp"]}),
+        State="ENABLED",
+    )
+    eb.put_targets(
+        Rule="qa-eb-arn-rule",
+        EventBusName=bus_name,
+        Targets=[{"Id": "t1", "Arn": q_arn}],
+    )
+    bus_arn = f"arn:aws:events:us-east-1:000000000000:event-bus/{bus_name}"
+    eb.put_events(
+        Entries=[
+            {
+                "Source": "myapp",
+                "DetailType": "test",
+                "Detail": json.dumps({"key": "value"}),
+                "EventBusName": bus_arn,
+            }
+        ]
+    )
+    msgs = sqs.receive_message(QueueUrl=q_url, MaxNumberOfMessages=1, WaitTimeSeconds=2)
+    assert len(msgs.get("Messages", [])) == 1
+
+
+def test_eventbridge_cfn_rule_accessible_via_api(eb, sqs, cfn):
+    """Rules created via CloudFormation should be accessible via the EventBridge API."""
+    bus_name = "qa-eb-cfn-bus"
+    eb.create_event_bus(Name=bus_name)
+    q_url = sqs.create_queue(QueueName="qa-eb-cfn-q")["QueueUrl"]
+    q_arn = sqs.get_queue_attributes(QueueUrl=q_url, AttributeNames=["QueueArn"])["Attributes"]["QueueArn"]
+
+    template = json.dumps({
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "TestRule": {
+                "Type": "AWS::Events::Rule",
+                "Properties": {
+                    "Name": "qa-eb-cfn-rule",
+                    "EventBusName": bus_name,
+                    "EventPattern": {"source": ["myapp.cfn"]},
+                    "State": "ENABLED",
+                    "Targets": [{"Id": "t1", "Arn": q_arn}],
+                },
+            },
+        },
+    })
+    cfn.create_stack(StackName="qa-eb-cfn-stack", TemplateBody=template)
+
+    rule = eb.describe_rule(Name="qa-eb-cfn-rule", EventBusName=bus_name)
+    assert rule["Name"] == "qa-eb-cfn-rule"
+
+    targets = eb.list_targets_by_rule(Rule="qa-eb-cfn-rule", EventBusName=bus_name)
+    assert len(targets["Targets"]) == 1
+
+    eb.put_events(
+        Entries=[
+            {
+                "Source": "myapp.cfn",
+                "DetailType": "test",
+                "Detail": json.dumps({"from": "cfn"}),
+                "EventBusName": bus_name,
+            }
+        ]
+    )
+    msgs = sqs.receive_message(QueueUrl=q_url, MaxNumberOfMessages=1, WaitTimeSeconds=2)
+    assert len(msgs.get("Messages", [])) == 1
+
+    cfn.delete_stack(StackName="qa-eb-cfn-stack")
+

@@ -2,7 +2,7 @@
 CloudFormation Service Emulator -- AWS-compatible.
 Supports: CreateStack, UpdateStack, DeleteStack, DescribeStacks, ListStacks,
           DescribeStackEvents, DescribeStackResource, DescribeStackResources,
-          GetTemplate, ValidateTemplate, ListExports,
+          ListStackResources, GetTemplate, ValidateTemplate, ListExports,
           CreateChangeSet, DescribeChangeSet, ExecuteChangeSet,
           DeleteChangeSet, ListChangeSets,
           GetTemplateSummary.

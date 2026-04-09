@@ -328,6 +328,43 @@ def _describe_stack_resources(params):
                 f"</DescribeStackResourcesResult>")
 
 
+# --- ListStackResources ---
+
+def _list_stack_resources(params):
+    from ministack.services.cloudformation import _stacks
+    stack_name = _p(params, "StackName")
+    if not stack_name:
+        return _error("ValidationError", "StackName is required")
+
+    stack = _stacks.get(stack_name)
+    if not stack:
+        for s in _stacks.values():
+            if s.get("StackId") == stack_name:
+                stack = s
+                break
+    if not stack:
+        return _error("ValidationError",
+                      f"Stack [{stack_name}] does not exist")
+
+    resources = stack.get("_resources", {})
+    members = ""
+    for logical_id, res in resources.items():
+        members += (
+            "<member>"
+            f"<LogicalResourceId>{_esc(logical_id)}</LogicalResourceId>"
+            f"<PhysicalResourceId>{_esc(res.get('PhysicalResourceId', ''))}</PhysicalResourceId>"
+            f"<ResourceType>{_esc(res.get('ResourceType', ''))}</ResourceType>"
+            f"<ResourceStatus>{res.get('ResourceStatus', '')}</ResourceStatus>"
+            f"<LastUpdatedTimestamp>{res.get('Timestamp', '')}</LastUpdatedTimestamp>"
+            "</member>"
+        )
+
+    return _xml(200, "ListStackResourcesResponse",
+                f"<ListStackResourcesResult>"
+                f"<StackResourceSummaries>{members}</StackResourceSummaries>"
+                f"</ListStackResourcesResult>")
+
+
 # --- GetTemplate ---
 
 def _get_template(params):
@@ -595,6 +632,7 @@ _ACTION_HANDLERS = {
     "DescribeStackEvents": _describe_stack_events,
     "DescribeStackResource": _describe_stack_resource,
     "DescribeStackResources": _describe_stack_resources,
+    "ListStackResources": _list_stack_resources,
     "GetTemplate": _get_template,
     "ValidateTemplate": _validate_template,
     "ListExports": _list_exports,

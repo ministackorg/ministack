@@ -570,12 +570,18 @@ def _test_event_pattern(data):
 # PutEvents + event pattern matching + target dispatch
 # ---------------------------------------------------------------------------
 
+def _normalize_bus_name(name):
+    if name and name.startswith("arn:"):
+        return name.split("/")[-1]
+    return name
+
+
 def _put_events(data):
     entries = data.get("Entries", [])
     results = []
     for entry in entries:
         event_id = new_uuid()
-        bus_name = entry.get("EventBusName", "default")
+        bus_name = _normalize_bus_name(entry.get("EventBusName", "default"))
         event_time = _now_ts()
 
         event_record = {
