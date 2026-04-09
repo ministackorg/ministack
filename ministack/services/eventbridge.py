@@ -14,6 +14,7 @@ Supports: CreateEventBus, DeleteEventBus, ListEventBuses, DescribeEventBus,
 """
 
 import copy
+import fnmatch
 import hashlib
 import json
 import logging
@@ -536,7 +537,14 @@ def _matches_pattern(pattern_str, event):
 
 def _matches_field(value, pattern_values):
     if isinstance(pattern_values, list):
-        return value in pattern_values
+        for item in pattern_values:
+            if isinstance(item, dict):
+                # Content-based filter (wildcard, prefix, suffix, etc.)
+                if _matches_content_filter(value, item):
+                    return True
+            elif value == item:
+                return True
+        return False
     return value == pattern_values
 
 
@@ -569,6 +577,8 @@ def _matches_detail(detail, pattern):
 
 
 def _matches_content_filter(value, filter_rule):
+    if "wildcard" in filter_rule:
+        return isinstance(value, str) and fnmatch.fnmatch(value, filter_rule["wildcard"])
     if "prefix" in filter_rule:
         return isinstance(value, str) and value.startswith(filter_rule["prefix"])
     if "suffix" in filter_rule:

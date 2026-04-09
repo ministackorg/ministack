@@ -10,6 +10,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 ## [1.1.57] — 2026-04-09
 
 ### Fixed
+- **EventBridge wildcard and content-filter patterns not matching** — event patterns using `{"wildcard": "*simple*"}`, `{"prefix": "..."}`, `{"suffix": "..."}`, etc. in top-level fields like `detail-type` and `source` were silently ignored. Content-based filters now work in all pattern fields, not just `detail`. Also added `wildcard` support to the content filter engine (uses `fnmatch` glob matching). Reported by @jfisbein
 - **IAM tags not saved on CreateRole/CreateUser** — tags passed at creation time via `Tags.member.N.Key/Value` were silently ignored. `GetRole` and `GetUser` now return tags set during creation. Same pattern as the KMS and SQS tag fixes in prior releases.
 - **Multi-tenant state persistence loses non-default accounts on restart** — when `PERSIST_STATE=1`, resources created under custom account IDs were restored under `000000000000` after container restart. Affected services: **S3**, **Lambda**, **ECS**, **KMS**. All four services' `get_state()` functions now iterate all accounts' data (via `_data`) instead of only the current request context. S3 file persistence (`S3_DATA_DIR`) layout changed to `DATA_DIR/<account_id>/<bucket>/<key>`; legacy flat layout auto-detected on load. The other 14 services (SQS, SNS, DynamoDB, IAM, EC2, SSM, etc.) were already safe — they use `copy.deepcopy()` which preserves all accounts.
 

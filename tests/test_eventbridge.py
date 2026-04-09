@@ -349,6 +349,86 @@ def test_eventbridge_content_filter_prefix(eb, sqs):
     msgs2 = sqs.receive_message(QueueUrl=q_url, MaxNumberOfMessages=1, WaitTimeSeconds=0)
     assert len(msgs2.get("Messages", [])) == 0
 
+def test_eventbridge_wildcard_detail_type(eb, sqs):
+    """EventBridge wildcard pattern matches detail-type field."""
+    bus_name = "qa-eb-wc-bus"
+    eb.create_event_bus(Name=bus_name)
+    q_url = sqs.create_queue(QueueName="qa-eb-wc-q")["QueueUrl"]
+    q_arn = sqs.get_queue_attributes(QueueUrl=q_url, AttributeNames=["QueueArn"])["Attributes"]["QueueArn"]
+    eb.put_rule(
+        Name="qa-eb-wc-rule",
+        EventBusName=bus_name,
+        EventPattern=json.dumps({"detail-type": [{"wildcard": "*simple*"}]}),
+        State="ENABLED",
+    )
+    eb.put_targets(
+        Rule="qa-eb-wc-rule",
+        EventBusName=bus_name,
+        Targets=[{"Id": "t1", "Arn": q_arn}],
+    )
+    # Should match: detail-type contains "simple"
+    eb.put_events(
+        Entries=[{
+            "Source": "test-source",
+            "DetailType": "simple-detail",
+            "Detail": json.dumps({"key1": "value1"}),
+            "EventBusName": bus_name,
+        }]
+    )
+    msgs = sqs.receive_message(QueueUrl=q_url, MaxNumberOfMessages=1, WaitTimeSeconds=1)
+    assert len(msgs.get("Messages", [])) == 1, "Wildcard *simple* should match 'simple-detail'"
+    # Should NOT match: detail-type does not contain "simple"
+    eb.put_events(
+        Entries=[{
+            "Source": "test-source",
+            "DetailType": "complex-detail",
+            "Detail": json.dumps({"key1": "value1"}),
+            "EventBusName": bus_name,
+        }]
+    )
+    msgs2 = sqs.receive_message(QueueUrl=q_url, MaxNumberOfMessages=1, WaitTimeSeconds=0)
+    assert len(msgs2.get("Messages", [])) == 0, "Wildcard *simple* should not match 'complex-detail'"
+
+
+def test_eventbridge_wildcard_in_detail(eb, sqs):
+    """EventBridge wildcard pattern works inside detail fields too."""
+    bus_name = "qa-eb-wcd-bus"
+    eb.create_event_bus(Name=bus_name)
+    q_url = sqs.create_queue(QueueName="qa-eb-wcd-q")["QueueUrl"]
+    q_arn = sqs.get_queue_attributes(QueueUrl=q_url, AttributeNames=["QueueArn"])["Attributes"]["QueueArn"]
+    eb.put_rule(
+        Name="qa-eb-wcd-rule",
+        EventBusName=bus_name,
+        EventPattern=json.dumps({"detail": {"env": [{"wildcard": "prod*"}]}}),
+        State="ENABLED",
+    )
+    eb.put_targets(
+        Rule="qa-eb-wcd-rule",
+        EventBusName=bus_name,
+        Targets=[{"Id": "t1", "Arn": q_arn}],
+    )
+    eb.put_events(
+        Entries=[{
+            "Source": "app",
+            "DetailType": "deploy",
+            "Detail": json.dumps({"env": "production"}),
+            "EventBusName": bus_name,
+        }]
+    )
+    msgs = sqs.receive_message(QueueUrl=q_url, MaxNumberOfMessages=1, WaitTimeSeconds=1)
+    assert len(msgs.get("Messages", [])) == 1
+    eb.put_events(
+        Entries=[{
+            "Source": "app",
+            "DetailType": "deploy",
+            "Detail": json.dumps({"env": "staging"}),
+            "EventBusName": bus_name,
+        }]
+    )
+    msgs2 = sqs.receive_message(QueueUrl=q_url, MaxNumberOfMessages=1, WaitTimeSeconds=0)
+    assert len(msgs2.get("Messages", [])) == 0
+
+
 def test_eventbridge_anything_but_filter(eb, sqs):
     """EventBridge anything-but filter excludes specified values."""
     bus_name = "qa-eb-anybut-bus"
