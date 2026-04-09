@@ -7,6 +7,23 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [1.1.60] — 2026-04-09
+
+### Added
+- **Native `provided` / `provided.al2023` Lambda runtime** — Lambda functions using custom runtimes (Go, Rust, C++ compiled binaries) now execute natively without Docker. MiniStack implements the Lambda Runtime API (`GET /invocation/next`, `POST /invocation/{id}/response`) as a minimal HTTP server, extracts the bootstrap binary from the deployment package, and manages the invocation lifecycle. Handles Go's default chunked `Transfer-Encoding`. Contributed by @jayjanssen (#220).
+- **States.ArrayGetItem, States.Array, States.ArrayLength intrinsics** — SFN state machines using `States.ArrayGetItem(array, index)`, `States.Array(val1, val2, ...)`, and `States.ArrayLength(array)` now execute correctly. Cherry-picked from @jayjanssen (#218).
+- **SFN key naming convention** — API response keys like `DBClusters` are now converted to Java SDK V2 convention (`DbClusters`) matching real AWS SFN behavior. Applied to both query-protocol and JSON-protocol aws-sdk dispatchers. Cherry-picked from @jayjanssen (#218).
+- **RDS `EnableHttpEndpoint` action** — stub that accepts and stores the flag on DB clusters. Cherry-picked from @jayjanssen (#218).
+
+### Fixed
+- **Lambda provided-runtime race conditions** — fixed port allocation race (socket bind-then-close replaced with `TCPServer` port 0 atomic bind) and server-ready race (bootstrap process now waits for Runtime API server to be accepting connections before starting).
+- **`States.TaskFailed` treated as catch-all** — `Retry` and `Catch` blocks matching `States.TaskFailed` now catch any Task error, matching AWS behavior. Cherry-picked from @jayjanssen (#218).
+- **Map state `ItemSelector` path resolution** — `$` paths in `ItemSelector` now resolve against the Map state's effective input instead of the individual item. The item is available via `$$.Map.Item.Value`. Cherry-picked from @jayjanssen (#218).
+- **CFN inline ZipFile uses correct extension for Node.js** — `_zip_inline` now writes `index.js` for Node.js runtimes instead of always writing `index.py`. Fixes CDK `Code.fromInline` with Node.js failing at invocation. Reported by @jolo-dev.
+- **EC2 `DescribeSubnets` filter support** — `DescribeSubnets` now respects `vpc-id`, `availability-zone`, `subnet-id`, and `default-for-az` filters. Previously all filters were silently ignored.
+
+---
+
 ## [1.1.59] — 2026-04-09
 
 ### Added

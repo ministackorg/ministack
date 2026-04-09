@@ -1527,7 +1527,9 @@ def _execute_map(state_def, raw_input, execution, ctx):
             item_ctx = copy.deepcopy(ctx)
             item_ctx["Map"] = {"Item": {"Index": idx, "Value": item}}
             item_params = state_def.get("ItemSelector") or state_def.get("Parameters")
-            item_input = (_resolve_params_obj(item_params, item, item_ctx)
+            # ItemSelector $ paths resolve against the Map state's effective input,
+            # not the individual item. $$.Map.Item.Value provides the item.
+            item_input = (_resolve_params_obj(item_params, effective, item_ctx)
                           if item_params else item)
             results[idx] = _run_sub_machine(
                 iter_states, iter_start, item_input, execution, item_ctx)
@@ -1798,6 +1800,12 @@ def _exec_intrinsic(node, data, ctx):
                 val = args[i + 1]
                 result_parts.append(str(val) if not isinstance(val, str) else val)
         return "".join(result_parts)
+    elif name == "States.ArrayGetItem":
+        return args[0][int(args[1])]
+    elif name == "States.Array":
+        return list(args)
+    elif name == "States.ArrayLength":
+        return len(args[0])
 
     raise ValueError(f"Unsupported intrinsic function: {name}")
 
@@ -1859,7 +1867,7 @@ def _find_matching_retrier(retriers, error, retry_counts):
         max_attempts = retrier.get("MaxAttempts", 3)
         if retry_counts.get(idx, 0) >= max_attempts:
             continue
-        if "States.ALL" in equals or error in equals:
+        if "States.ALL" in equals or "States.TaskFailed" in equals or error in equals:
             return retrier, idx
     return None, -1
 
@@ -1867,7 +1875,7 @@ def _find_matching_retrier(retriers, error, retry_counts):
 def _find_matching_catcher(catchers, error):
     for catcher in catchers:
         equals = catcher.get("ErrorEquals", [])
-        if "States.ALL" in equals or error in equals:
+        if "States.ALL" in equals or "States.TaskFailed" in equals or error in equals:
             return catcher
     return None
 
@@ -2194,6 +2202,10 @@ def _dispatch_aws_sdk_json(service_info, service_name, action, input_data):
         error_msg = result.get("message", result.get("Message", str(result)))
         raise _ExecutionError(error_type, error_msg)
 
+    # For JSON-protocol services, only convert top-level keys to avoid
+    # mangling user-defined data (e.g. DynamoDB attribute names).
+    if isinstance(result, dict):
+        return {_api_name_to_sfn_key(k): v for k, v in result.items()}
     return result
 
 
@@ -2248,6 +2260,59 @@ def _xml_element_to_dict(element):
         else:
             result[child_tag] = child_val
     return tag, result
+
+
+def _api_name_to_sfn_key(name):
+    """Convert an AWS API member name to SFN SDK integration key name.
+
+    SFN uses the Java SDK V2 naming convention: consecutive uppercase characters
+    (acronyms) are lowered except the last one when followed by a lowercase char.
+    Examples: DBClusters -> DbClusters, DBClusterArn -> DbClusterArn,
+              IAMDatabaseAuthenticationEnabled -> IamDatabaseAuthenticationEnabled
+    """
+    if not name:
+        return name
+    result = []
+    i = 0
+    while i < len(name):
+        if i == 0:
+            result.append(name[i].upper())
+            i += 1
+            continue
+        if name[i].isupper():
+            j = i
+            while j < len(name) and name[j].isupper():
+                j += 1
+            run_len = j - i
+            if run_len == 1:
+                result.append(name[i])
+                i += 1
+            else:
+                if j < len(name) and name[j].islower():
+                    result.append(name[i:j - 1].lower())
+                    result.append(name[j - 1])
+                else:
+                    result.append(name[i:j].lower())
+                i = j
+        else:
+            result.append(name[i])
+            i += 1
+    return "".join(result)
+
+
+def _convert_keys_to_sfn_convention(obj):
+    """Recursively convert dict keys from AWS API naming to SFN/Java SDK V2 naming.
+
+    Also converts datetime objects to epoch seconds (AWS SFN convention).
+    """
+    import datetime
+    if isinstance(obj, dict):
+        return {_api_name_to_sfn_key(k): _convert_keys_to_sfn_convention(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_convert_keys_to_sfn_convention(item) for item in obj]
+    if isinstance(obj, datetime.datetime):
+        return obj.timestamp()
+    return obj
 
 
 def _dispatch_aws_sdk_query(service_info, service_name, action, input_data):
@@ -2320,7 +2385,7 @@ def _dispatch_aws_sdk_query(service_info, service_name, action, input_data):
             pass
         raise _ExecutionError(f"{service_name}.ServiceException", decoded)
 
-    # Convert successful XML response to dict
+    # Convert successful XML response to dict, then apply SFN key naming convention
     try:
         root = ET.fromstring(decoded)
         _, result = _xml_element_to_dict(root)
@@ -2331,7 +2396,7 @@ def _dispatch_aws_sdk_query(service_info, service_name, action, input_data):
                 result = result[result_key]
             # Drop ResponseMetadata
             result.pop("ResponseMetadata", None)
-        return result
+        return _convert_keys_to_sfn_convention(result)
     except ET.ParseError:
         raise _ExecutionError("States.Runtime", f"Failed to parse {service_name} XML response")
 

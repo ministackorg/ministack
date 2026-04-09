@@ -1513,6 +1513,19 @@ def _modify_global_cluster(p):
         f"<ModifyGlobalClusterResult><GlobalCluster>{_global_cluster_xml(gc)}</GlobalCluster></ModifyGlobalClusterResult>")
 
 
+def _enable_http_endpoint(p):
+    arn = _p(p, "ResourceArn")
+    for cluster in _clusters.values():
+        if cluster.get("DBClusterArn") == arn:
+            cluster["HttpEndpointEnabled"] = True
+            return _xml(200, "EnableHttpEndpointResponse",
+                f"<EnableHttpEndpointResult>"
+                f"<ResourceArn>{arn}</ResourceArn>"
+                f"<HttpEndpointEnabled>true</HttpEndpointEnabled>"
+                f"</EnableHttpEndpointResult>")
+    return _error("DBClusterNotFoundFault", f"Cluster with ARN {arn} not found.", 404)
+
+
 def _global_cluster_xml(gc):
     member_xml = ""
     for m in gc.get("GlobalClusterMembers", []):
@@ -2210,6 +2223,7 @@ _ACTION_MAP = {
     "DeleteGlobalCluster": _delete_global_cluster,
     "RemoveFromGlobalCluster": _remove_from_global_cluster,
     "ModifyGlobalCluster": _modify_global_cluster,
+    "EnableHttpEndpoint": _enable_http_endpoint,
 }
 
 

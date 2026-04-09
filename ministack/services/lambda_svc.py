@@ -1432,19 +1432,13 @@ def _execute_function_provided(func: dict, event: dict) -> dict:
                 return {"body": {"statusCode": 200, "body": "Mock response - no bootstrap binary found"}}
             os.chmod(bootstrap_path, 0o755)
 
-            # Find a free port for the Runtime API
-            import socket
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.bind(('127.0.0.1', 0))
-            port = sock.getsockname()[1]
-            sock.close()
-
             # Shared state for the Runtime API
             result_holder = {"response": None, "error": None}
             event_json = json.dumps(event)
             request_id = new_uuid()
             event_served = threading.Event()
             response_received = threading.Event()
+            server_ready = threading.Event()
 
             class RuntimeAPIHandler(http.server.BaseHTTPRequestHandler):
                 def log_message(self, format, *args):
@@ -1512,9 +1506,17 @@ def _execute_function_provided(func: dict, event: dict) -> dict:
                         self.send_response(404)
                         self.end_headers()
 
-            server = socketserver.TCPServer(("127.0.0.1", port), RuntimeAPIHandler)
-            server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+            # Bind to port 0 — OS assigns a free port atomically, no race window
+            server = socketserver.TCPServer(("127.0.0.1", 0), RuntimeAPIHandler)
+            port = server.server_address[1]
+
+            def _serve():
+                server_ready.set()
+                server.serve_forever()
+
+            server_thread = threading.Thread(target=_serve, daemon=True)
             server_thread.start()
+            server_ready.wait(timeout=5)
 
             try:
                 # Build environment for the Lambda binary
