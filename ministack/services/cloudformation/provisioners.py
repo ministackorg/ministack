@@ -610,7 +610,7 @@ def _cwlogs_delete(physical_id, props):
 def _eb_rule_create(logical_id, props, stack_name):
     name = props.get("Name") or _physical_name(stack_name, logical_id, max_len=64)
     bus = props.get("EventBusName", "default")
-    key = f"{name}|{bus}"
+    key = _eb._rule_key(name, bus)
     arn = f"arn:aws:events:{REGION}:{get_account_id()}:rule/{bus}/{name}"
 
     _eb._rules[key] = {
@@ -627,20 +627,14 @@ def _eb_rule_create(logical_id, props, stack_name):
     targets = props.get("Targets", [])
     _eb._targets[key] = []
     for t in targets:
-        _eb._targets[key].append({
-            "Id": t.get("Id", ""),
-            "Arn": t.get("Arn", ""),
-            "RoleArn": t.get("RoleArn", ""),
-            "Input": t.get("Input", ""),
-            "InputPath": t.get("InputPath", ""),
-        })
+        _eb._targets[key].append(t)
 
     return name, {"Arn": arn}
 
 
 def _eb_rule_delete(physical_id, props):
     bus = props.get("EventBusName", "default")
-    key = f"{physical_id}|{bus}"
+    key = _eb._rule_key(physical_id, bus)
     _eb._rules.pop(key, None)
     _eb._targets.pop(key, None)
 
