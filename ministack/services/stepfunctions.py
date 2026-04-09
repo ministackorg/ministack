@@ -1527,7 +1527,9 @@ def _execute_map(state_def, raw_input, execution, ctx):
             item_ctx = copy.deepcopy(ctx)
             item_ctx["Map"] = {"Item": {"Index": idx, "Value": item}}
             item_params = state_def.get("ItemSelector") or state_def.get("Parameters")
-            item_input = (_resolve_params_obj(item_params, item, item_ctx)
+            # ItemSelector $ paths resolve against the Map state's effective input,
+            # not the individual item. $$.Map.Item.Value provides the item.
+            item_input = (_resolve_params_obj(item_params, effective, item_ctx)
                           if item_params else item)
             results[idx] = _run_sub_machine(
                 iter_states, iter_start, item_input, execution, item_ctx)
@@ -2198,7 +2200,11 @@ def _dispatch_aws_sdk_json(service_info, service_name, action, input_data):
         error_msg = result.get("message", result.get("Message", str(result)))
         raise _ExecutionError(error_type, error_msg)
 
-    return _convert_keys_to_sfn_convention(result)
+    # For JSON-protocol services, only convert top-level keys to avoid
+    # mangling user-defined data (e.g. DynamoDB attribute names).
+    if isinstance(result, dict):
+        return {_api_name_to_sfn_key(k): v for k, v in result.items()}
+    return result
 
 
 def _flatten_query_params(data, prefix=""):
