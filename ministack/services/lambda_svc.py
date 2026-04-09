@@ -1262,6 +1262,10 @@ def _execute_function(func: dict, event: dict) -> dict:
     if LAMBDA_EXECUTOR == "docker":
         return _execute_function_docker(func, event)
 
+    # provided runtimes (Go, Rust, etc.) — use native binary execution
+    if runtime.startswith("provided"):
+        return _execute_function_provided(func, event)
+
     if runtime.startswith("python") or runtime.startswith("nodejs"):
         return _execute_function_warm(func, event)
 
@@ -1398,6 +1402,176 @@ def _execute_function_image(func: dict, event: dict) -> dict:
             container.remove(force=True)
         except Exception:
             pass
+
+
+def _execute_function_provided(func: dict, event: dict) -> dict:
+    """Execute a provided-runtime Lambda (Go/Rust binary) via a minimal Lambda Runtime API."""
+    config = func.get("config") or func
+    code_zip = func.get("code_zip")
+    if not code_zip:
+        return {"body": {"statusCode": 200, "body": "Mock response - no code deployed"}}
+
+    timeout = config.get("Timeout", 30)
+    env_vars = config.get("Environment", {}).get("Variables", {})
+
+    try:
+        import http.server
+        import socketserver
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Extract bootstrap binary
+            zip_path = os.path.join(tmpdir, "code.zip")
+            with open(zip_path, "wb") as f:
+                f.write(code_zip)
+            code_dir = os.path.join(tmpdir, "code")
+            os.makedirs(code_dir)
+            with zipfile.ZipFile(zip_path) as zf:
+                zf.extractall(code_dir)
+
+            bootstrap_path = os.path.join(code_dir, "bootstrap")
+            if not os.path.exists(bootstrap_path):
+                return {"body": {"statusCode": 200, "body": "Mock response - no bootstrap binary found"}}
+            os.chmod(bootstrap_path, 0o755)
+
+            # Find a free port for the Runtime API
+            import socket
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.bind(('127.0.0.1', 0))
+            port = sock.getsockname()[1]
+            sock.close()
+
+            # Shared state for the Runtime API
+            result_holder = {"response": None, "error": None}
+            event_json = json.dumps(event)
+            request_id = new_uuid()
+            event_served = threading.Event()
+            response_received = threading.Event()
+
+            class RuntimeAPIHandler(http.server.BaseHTTPRequestHandler):
+                def log_message(self, format, *args):
+                    pass  # Suppress logs
+
+                def _read_body(self):
+                    """Read request body, handling both Content-Length and chunked transfer encoding."""
+                    transfer_encoding = self.headers.get("Transfer-Encoding", "")
+                    if "chunked" in transfer_encoding.lower():
+                        chunks = []
+                        while True:
+                            line = self.rfile.readline().strip()
+                            chunk_size = int(line, 16)
+                            if chunk_size == 0:
+                                self.rfile.readline()  # trailing CRLF
+                                break
+                            chunks.append(self.rfile.read(chunk_size))
+                            self.rfile.readline()  # trailing CRLF
+                        return b"".join(chunks)
+                    content_length = int(self.headers.get("Content-Length", 0))
+                    return self.rfile.read(content_length) if content_length else b""
+
+                def do_GET(self):
+                    # GET /2018-06-01/runtime/invocation/next
+                    if "/runtime/invocation/next" in self.path:
+                        self.send_response(200)
+                        self.send_header("Lambda-Runtime-Aws-Request-Id", request_id)
+                        self.send_header("Lambda-Runtime-Deadline-Ms",
+                                         str(int((time.time() + timeout) * 1000)))
+                        self.send_header("Content-Type", "application/json")
+                        self.end_headers()
+                        self.wfile.write(event_json.encode())
+                        event_served.set()
+                    else:
+                        self.send_response(404)
+                        self.end_headers()
+
+                def do_POST(self):
+                    body = self._read_body()
+                    if f"/runtime/invocation/{request_id}/response" in self.path:
+                        try:
+                            result_holder["response"] = json.loads(body)
+                        except json.JSONDecodeError:
+                            result_holder["response"] = body.decode("utf-8", errors="replace")
+                        self.send_response(202)
+                        self.end_headers()
+                        response_received.set()
+                    elif f"/runtime/invocation/{request_id}/error" in self.path:
+                        try:
+                            result_holder["error"] = json.loads(body)
+                        except json.JSONDecodeError:
+                            result_holder["error"] = body.decode("utf-8", errors="replace")
+                        self.send_response(202)
+                        self.end_headers()
+                        response_received.set()
+                    elif "/runtime/init/error" in self.path:
+                        try:
+                            result_holder["error"] = json.loads(body)
+                        except json.JSONDecodeError:
+                            result_holder["error"] = body.decode("utf-8", errors="replace")
+                        self.send_response(202)
+                        self.end_headers()
+                        response_received.set()
+                    else:
+                        self.send_response(404)
+                        self.end_headers()
+
+            server = socketserver.TCPServer(("127.0.0.1", port), RuntimeAPIHandler)
+            server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+            server_thread.start()
+
+            try:
+                # Build environment for the Lambda binary
+                proc_env = dict(os.environ)
+                proc_env.update({
+                    "AWS_LAMBDA_RUNTIME_API": f"127.0.0.1:{port}",
+                    "AWS_DEFAULT_REGION": REGION,
+                    "AWS_REGION": REGION,
+                    "AWS_ACCESS_KEY_ID": os.environ.get("AWS_ACCESS_KEY_ID", "test"),
+                    "AWS_SECRET_ACCESS_KEY": os.environ.get("AWS_SECRET_ACCESS_KEY", "test"),
+                    "AWS_LAMBDA_FUNCTION_NAME": config.get("FunctionName", "unknown"),
+                    "LAMBDA_TASK_ROOT": code_dir,
+                    "_HANDLER": config.get("Handler", "bootstrap"),
+                })
+                # Pass through AWS_ENDPOINT_URL for SDK calls
+                endpoint = os.environ.get("AWS_ENDPOINT_URL", "")
+                if not endpoint:
+                    hostname = os.environ.get("LOCALSTACK_HOSTNAME", "")
+                    if hostname:
+                        endpoint = _normalize_endpoint_url(hostname)
+                if endpoint:
+                    proc_env["AWS_ENDPOINT_URL"] = endpoint
+                proc_env.update(env_vars)
+
+                proc = subprocess.Popen(
+                    [bootstrap_path],
+                    cwd=code_dir,
+                    env=proc_env,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+
+                if response_received.wait(timeout=timeout):
+                    proc.terminate()
+                    try:
+                        _, stderr_out = proc.communicate(timeout=5)
+                        if stderr_out:
+                            logger.info("Lambda %s stderr: %s", config.get("FunctionName", "?"), stderr_out.decode("utf-8", errors="replace")[:500])
+                    except Exception:
+                        pass
+                    if result_holder["error"]:
+                        err = result_holder["error"]
+                        if isinstance(err, dict):
+                            return {"body": err, "error": True}
+                        return {"body": {"errorMessage": str(err), "errorType": "Runtime.HandlerError"}, "error": True}
+                    return {"body": result_holder["response"]}
+                else:
+                    proc.kill()
+                    stdout, stderr = proc.communicate(timeout=5)
+                    logs = (stdout.decode("utf-8", errors="replace") + stderr.decode("utf-8", errors="replace")).strip()
+                    return {"body": {"errorMessage": f"Lambda timed out after {timeout}s: {logs[:500]}", "errorType": "Runtime.ExitError"}, "error": True}
+            finally:
+                server.shutdown()
+
+    except Exception as e:
+        logger.error("provided runtime execution error: %s", e)
+        return {"body": {"errorMessage": str(e), "errorType": type(e).__name__}, "error": True}
 
 
 def _execute_function_local(func: dict, event: dict) -> dict:
