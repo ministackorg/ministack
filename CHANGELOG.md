@@ -7,6 +7,21 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [Unreleased]
+
+### Added
+- **States.ArrayGetItem, States.Array, States.ArrayLength intrinsics** — SFN state machines using `States.ArrayGetItem(array, index)`, `States.Array(val1, val2, ...)`, and `States.ArrayLength(array)` now execute correctly.
+- **Botocore response parser for query-protocol aws-sdk dispatch** — query-protocol responses are now deserialized through botocore's response parser, producing correctly typed values (int, bool) and proper SDK member names instead of raw XML element names.
+- **SFN key naming convention (`_convert_keys_to_sfn_convention`)** — API response keys like `DBClusters` are now converted to Java SDK V2 convention (`DbClusters`) matching real AWS SFN behavior. Applied to both query-protocol and JSON-protocol aws-sdk dispatchers.
+
+### Fixed
+- **`States.TaskFailed` treated as catch-all** — `Retry` and `Catch` blocks matching `States.TaskFailed` now catch any Task error, matching AWS behavior where it acts as a wildcard error matcher.
+- **`datetime` objects in botocore responses** — botocore response parser returns `datetime` objects for timestamp fields; these are now serialized to ISO-8601 strings before JSON encoding.
+- **Map state `ItemSelector` `$` paths resolve against effective input** — `ItemSelector` paths prefixed with `$` were incorrectly resolving against the individual item instead of the Map state's effective input.
+- **EnableHttpEndpoint stub** — RDS `ModifyDBCluster` no longer errors on `EnableHttpEndpoint` parameter; it is accepted and ignored (stub).
+
+---
+
 ## [1.1.58] — 2026-04-09
 
 ### Fixed
