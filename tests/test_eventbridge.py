@@ -363,6 +363,28 @@ def test_eventbridge_archive(eb):
     archives2 = eb.list_archives()
     assert not any(a["ArchiveName"] == archive_name for a in archives2["Archives"])
 
+
+def test_eventbridge_update_archive(eb):
+    name = f"upd-archive-{_uuid_mod.uuid4().hex[:8]}"
+    eb.create_archive(
+        ArchiveName=name,
+        EventSourceArn="arn:aws:events:us-east-1:000000000000:event-bus/default",
+        Description="old",
+        RetentionDays=1,
+    )
+    eb.update_archive(
+        ArchiveName=name,
+        Description="new desc",
+        RetentionDays=30,
+        EventPattern=json.dumps({"source": ["app"]}),
+    )
+    desc = eb.describe_archive(ArchiveName=name)
+    assert desc["Description"] == "new desc"
+    assert desc["RetentionDays"] == 30
+    assert "app" in desc["EventPattern"]
+    eb.delete_archive(ArchiveName=name)
+
+
 def test_eventbridge_put_remove_permission(eb):
     import uuid as _uuid
 

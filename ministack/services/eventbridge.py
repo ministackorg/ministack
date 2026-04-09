@@ -137,6 +137,7 @@ async def handle_request(method, path, headers, body, query_params):
         "CreateArchive": _create_archive,
         "DeleteArchive": _delete_archive,
         "DescribeArchive": _describe_archive,
+        "UpdateArchive": _update_archive,
         "ListArchives": _list_archives,
         "PutPermission": _put_permission,
         "RemovePermission": _remove_permission,
@@ -921,6 +922,39 @@ def _describe_archive(data):
     if not archive:
         return error_response_json("ResourceNotFoundException", f"Archive {name} does not exist.", 400)
     return json_response(archive)
+
+
+def _update_archive(data):
+    name = data.get("ArchiveName")
+    if not name:
+        return error_response_json("ValidationException", "ArchiveName is required", 400)
+    archive = _archives.get(name)
+    if not archive:
+        return error_response_json("ResourceNotFoundException", f"Archive {name} does not exist.", 400)
+
+    if "Description" in data:
+        archive["Description"] = data["Description"]
+    if "EventPattern" in data:
+        ep = data["EventPattern"]
+        if isinstance(ep, str) and ep:
+            try:
+                json.loads(ep)
+            except json.JSONDecodeError:
+                return error_response_json(
+                    "InvalidEventPatternException",
+                    "Event pattern is not valid JSON",
+                    400,
+                )
+        archive["EventPattern"] = ep
+    if "RetentionDays" in data:
+        archive["RetentionDays"] = int(data["RetentionDays"])
+
+    archive["LastUpdatedTime"] = _now_ts()
+    return json_response({
+        "ArchiveArn": archive["ArchiveArn"],
+        "State": archive.get("State", "ENABLED"),
+        "CreationTime": archive["CreationTime"],
+    })
 
 
 def _list_archives(data):
