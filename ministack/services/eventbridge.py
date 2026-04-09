@@ -67,6 +67,7 @@ _archives = AccountScopedDict()
 _event_bus_policies = AccountScopedDict()  # bus_name -> {Statement: [...]}
 _connections = AccountScopedDict()         # connection_name -> {...}
 _api_destinations = AccountScopedDict()    # destination_name -> {...}
+_replays = AccountScopedDict()              # replay_name -> replay record
 
 
 # ── Persistence ────────────────────────────────────────────
@@ -77,6 +78,7 @@ def get_state():
         "rules": copy.deepcopy(_rules),
         "targets": copy.deepcopy(_targets),
         "tags": copy.deepcopy(_tags),
+        "replays": copy.deepcopy(_replays),
     }
 
 
@@ -87,6 +89,7 @@ def restore_state(data):
         _rules.update(data.get("rules", {}))
         _targets.update(data.get("targets", {}))
         _tags.update(data.get("tags", {}))
+        _replays.update(data.get("replays", {}))
 
         for bus in _event_buses.values():
             if "CreationTime" in bus:
@@ -97,6 +100,11 @@ def restore_state(data):
         for rule in _rules.values():
             if "CreationTime" in rule:
                 rule["CreationTime"] = _coerce_timestamp(rule["CreationTime"])
+
+        for rep in _replays.values():
+            for tk in ("ReplayStartTime", "ReplayEndTime", "EventStartTime", "EventEndTime"):
+                if tk in rep and rep[tk] is not None:
+                    rep[tk] = _coerce_timestamp(rep[tk])
 
 
 _restored = load_state("eventbridge")
@@ -139,6 +147,10 @@ async def handle_request(method, path, headers, body, query_params):
         "DescribeArchive": _describe_archive,
         "UpdateArchive": _update_archive,
         "ListArchives": _list_archives,
+        "StartReplay": _start_replay,
+        "DescribeReplay": _describe_replay,
+        "ListReplays": _list_replays,
+        "CancelReplay": _cancel_replay,
         "PutPermission": _put_permission,
         "RemovePermission": _remove_permission,
         "CreateConnection": _create_connection,
@@ -975,6 +987,96 @@ def _list_archives(data):
 
 
 # ---------------------------------------------------------------------------
+# Replays (minimal control plane — no archive replay engine)
+# ---------------------------------------------------------------------------
+
+def _start_replay(data):
+    name = data.get("ReplayName")
+    if not name:
+        return error_response_json("ValidationException", "ReplayName is required", 400)
+    if name in _replays:
+        return error_response_json(
+            "ResourceAlreadyExistsException",
+            f"Replay {name} already exists",
+            400,
+        )
+    dest = data.get("Destination") or {}
+    if not dest.get("Arn"):
+        return error_response_json(
+            "ValidationException",
+            "Destination.Arn is required",
+            400,
+        )
+    arn = f"arn:aws:events:{REGION}:{get_account_id()}:replay/{name}"
+    now = _now_ts()
+    _replays[name] = {
+        "ReplayName": name,
+        "ReplayArn": arn,
+        "Description": data.get("Description", ""),
+        "EventSourceArn": data.get("EventSourceArn", ""),
+        "EventStartTime": data.get("EventStartTime", now),
+        "EventEndTime": data.get("EventEndTime", now),
+        "Destination": dest,
+        "State": "RUNNING",
+        "ReplayStartTime": now,
+    }
+    return json_response({"ReplayArn": arn, "State": "RUNNING"})
+
+
+def _describe_replay(data):
+    name = data.get("ReplayName")
+    if not name:
+        return error_response_json("ValidationException", "ReplayName is required", 400)
+    rep = _replays.get(name)
+    if not rep:
+        return error_response_json("ResourceNotFoundException", f"Replay {name} does not exist.", 400)
+    return json_response(dict(rep))
+
+
+def _list_replays(data):
+    prefix = data.get("NamePrefix", "")
+    state_f = data.get("State", "")
+    source_f = data.get("EventSourceArn", "")
+    results = []
+    for n in sorted(_replays.keys()):
+        rep = _replays[n]
+        if prefix and not n.startswith(prefix):
+            continue
+        if state_f and rep.get("State") != state_f:
+            continue
+        if source_f and rep.get("EventSourceArn") != source_f:
+            continue
+        results.append({
+            "ReplayName": rep["ReplayName"],
+            "ReplayArn": rep["ReplayArn"],
+            "State": rep["State"],
+            "EventSourceArn": rep.get("EventSourceArn", ""),
+            "ReplayStartTime": rep.get("ReplayStartTime", ""),
+        })
+    return json_response({"Replays": results})
+
+
+def _cancel_replay(data):
+    name = data.get("ReplayName")
+    if not name:
+        return error_response_json("ValidationException", "ReplayName is required", 400)
+    rep = _replays.get(name)
+    if not rep:
+        return error_response_json("ResourceNotFoundException", f"Replay {name} does not exist.", 400)
+    if rep["State"] == "COMPLETED":
+        return error_response_json(
+            "ValidationException",
+            "Replay is already completed",
+            400,
+        )
+    if rep["State"] == "CANCELLED":
+        return json_response({"ReplayArn": rep["ReplayArn"], "State": "CANCELLED"})
+    rep["State"] = "CANCELLED"
+    rep["ReplayEndTime"] = _now_ts()
+    return json_response({"ReplayArn": rep["ReplayArn"], "State": "CANCELLED"})
+
+
+# ---------------------------------------------------------------------------
 # Permissions (resource policies)
 # ---------------------------------------------------------------------------
 
@@ -1242,6 +1344,7 @@ def reset():
     _event_bus_policies.clear()
     _connections.clear()
     _api_destinations.clear()
+    _replays.clear()
     _event_buses = {
         "default": {
             "Name": "default",

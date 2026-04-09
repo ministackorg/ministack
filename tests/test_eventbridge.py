@@ -378,6 +378,39 @@ def test_eventbridge_archive(eb):
     assert not any(a["ArchiveName"] == archive_name for a in archives2["Archives"])
 
 
+def test_eventbridge_replay_lifecycle(eb):
+    arch = f"replay-arch-{_uuid_mod.uuid4().hex[:8]}"
+    eb.create_archive(
+        ArchiveName=arch,
+        EventSourceArn="arn:aws:events:us-east-1:000000000000:event-bus/default",
+    )
+    archive_arn = eb.describe_archive(ArchiveName=arch)["ArchiveArn"]
+    rep_name = f"replay-{_uuid_mod.uuid4().hex[:8]}"
+    src = "arn:aws:events:us-east-1:000000000000:event-bus/default"
+    from datetime import datetime, timezone
+
+    t0 = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    t1 = datetime(2024, 1, 2, tzinfo=timezone.utc)
+    start = eb.start_replay(
+        ReplayName=rep_name,
+        EventSourceArn=src,
+        EventStartTime=t0,
+        EventEndTime=t1,
+        Destination={"Arn": archive_arn},
+    )
+    assert start["State"] == "RUNNING"
+    desc = eb.describe_replay(ReplayName=rep_name)
+    assert desc["ReplayName"] == rep_name
+    assert desc["State"] == "RUNNING"
+    listed = eb.list_replays(NamePrefix=rep_name)
+    assert any(r["ReplayName"] == rep_name for r in listed["Replays"])
+    cancel = eb.cancel_replay(ReplayName=rep_name)
+    assert cancel["State"] == "CANCELLED"
+    desc2 = eb.describe_replay(ReplayName=rep_name)
+    assert desc2["State"] == "CANCELLED"
+    eb.delete_archive(ArchiveName=arch)
+
+
 def test_eventbridge_update_archive(eb):
     name = f"upd-archive-{_uuid_mod.uuid4().hex[:8]}"
     eb.create_archive(
