@@ -235,7 +235,8 @@ async def _call_lambda(func_name, event):
     func_data = lambda_svc._functions[func_name]
     code_zip = func_data.get("code_zip")
 
-    if code_zip and func_data["config"]["Runtime"].startswith("python"):
+    runtime = func_data["config"].get("Runtime", "")
+    if code_zip and runtime.startswith(("python", "nodejs")):
         worker = get_or_create_worker(func_name, func_data["config"], code_zip)
         result = await asyncio.to_thread(worker.invoke, event, new_uuid())
         if result.get("status") == "error":

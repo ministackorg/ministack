@@ -1399,3 +1399,57 @@ def test_lambda_provided_runtime_docker_invoke(lam):
         assert payload["body"] == "hello from provided"
     finally:
         lam.delete_function(FunctionName=func_name)
+
+
+def test_apigwv2_nodejs_lambda_proxy(lam, apigw):
+    """API Gateway v2 HTTP API should invoke Node.js Lambda via warm worker, not return mock."""
+    import urllib.request as _urlreq
+    import uuid as _uuid
+    from botocore.exceptions import ClientError
+
+    fname = f"apigwv2-node-{_uuid.uuid4().hex[:8]}"
+    api_id = None
+    code = (
+        "exports.handler = async (event) => ({"
+        " statusCode: 200,"
+        " body: JSON.stringify({ route: event.routeKey, method: event.requestContext.http.method })"
+        "});"
+    )
+    try:
+        lam.create_function(
+            FunctionName=fname,
+            Runtime="nodejs20.x",
+            Role="arn:aws:iam::000000000000:role/test-role",
+            Handler="index.handler",
+            Code={"ZipFile": _make_zip_js(code, "index.js")},
+        )
+        api_id = apigw.create_api(Name=f"v2-node-{fname}", ProtocolType="HTTP")["ApiId"]
+        int_id = apigw.create_integration(
+            ApiId=api_id,
+            IntegrationType="AWS_PROXY",
+            IntegrationUri=f"arn:aws:lambda:us-east-1:000000000000:function:{fname}",
+            PayloadFormatVersion="2.0",
+        )["IntegrationId"]
+        apigw.create_route(ApiId=api_id, RouteKey="GET /test", Target=f"integrations/{int_id}")
+        apigw.create_stage(ApiId=api_id, StageName="$default")
+
+        req = _urlreq.Request(
+            f"http://{api_id}.execute-api.localhost:{_EXECUTE_PORT}/$default/test",
+            method="GET",
+        )
+        req.add_header("Host", f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}")
+        resp = _urlreq.urlopen(req).read().decode()
+        body = json.loads(resp)
+
+        assert body.get("route") == "GET /test", f"Expected handler result, got: {resp}"
+        assert body.get("method") == "GET"
+    finally:
+        if api_id is not None:
+            try:
+                apigw.delete_api(ApiId=api_id)
+            except ClientError:
+                pass
+        try:
+            lam.delete_function(FunctionName=fname)
+        except ClientError:
+            pass
