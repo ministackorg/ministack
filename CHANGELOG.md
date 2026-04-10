@@ -11,6 +11,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 - **SFN query-protocol acronym mapper** — Step Functions `aws-sdk:*` integrations now correctly convert SDK-style parameter names (e.g. `DbSubnetGroupName`) to wire-format names (`DBSubnetGroupName`) for query-protocol services (RDS, EC2, IAM, STS, etc.). Uses a static acronym mapping — no botocore dependency. Contributed by @jayjanssen.
+- **Warm worker Lambda Layer support** — `Worker._spawn()` in `lambda_runtime.py` now extracts attached layers into temp directories and sets `_LAMBDA_LAYERS_DIRS` + `NODE_PATH` so both Python (`sys.path`) and Node.js (`module.paths` + ESM `import()`) can resolve layer packages. Previously only the subprocess executor supported layers.
 
 ### Fixed
 - **API Gateway v1/v2 returns mock response for Node.js Lambdas** — `_invoke_lambda_proxy` in both `apigateway.py` (v2) and `apigateway_v1.py` (v1) only dispatched to the warm worker pool for Python runtimes. Node.js Lambdas received a hardcoded `"Mock response"` instead of being executed, even though the warm worker pool in `lambda_runtime.py` already supports Node.js. Now checks for both `python` and `nodejs` runtimes.

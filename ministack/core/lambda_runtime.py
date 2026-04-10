@@ -37,6 +37,11 @@ def run():
     env = init.get("env", {})
     os.environ.update(env)
     sys.path.insert(0, code_dir)
+    for _ld in filter(None, os.environ.get("_LAMBDA_LAYERS_DIRS", "").split(os.pathsep)):
+        _py = os.path.join(_ld, "python")
+        if os.path.isdir(_py):
+            sys.path.insert(0, _py)
+        sys.path.insert(0, _ld)
     try:
         mod = importlib.import_module(module_name)
         handler_fn = getattr(mod, handler_name)
@@ -314,6 +319,42 @@ class Worker:
         with zipfile.ZipFile(os.path.join(self._tmpdir, "code.zip")) as zf:
             zf.extractall(code_dir)
 
+        # Extract Lambda Layers and build search paths for the worker process.
+        # This mirrors the layer handling in lambda_svc._execute_function_local().
+        layers_dirs: list[str] = []
+        layer_refs = self.config.get("Layers", [])
+        if layer_refs:
+            from ministack.services.lambda_svc import _resolve_layer_zip
+        for layer_ref in layer_refs:
+            layer_arn = layer_ref if isinstance(layer_ref, str) else layer_ref.get("Arn", "")
+            if not layer_arn:
+                continue
+            try:
+                layer_data = _resolve_layer_zip(layer_arn)
+                if layer_data:
+                    layer_dir = os.path.join(self._tmpdir, f"layer_{len(layers_dirs)}")
+                    os.makedirs(layer_dir)
+                    lzip = os.path.join(self._tmpdir, f"layer_{len(layers_dirs)}.zip")
+                    try:
+                        with open(lzip, "wb") as lf:
+                            lf.write(layer_data)
+                        with zipfile.ZipFile(lzip) as lzf:
+                            # Validate paths to prevent zip-slip attacks
+                            for member in lzf.namelist():
+                                resolved = os.path.realpath(os.path.join(layer_dir, member))
+                                if not resolved.startswith(os.path.realpath(layer_dir) + os.sep) and resolved != os.path.realpath(layer_dir):
+                                    raise RuntimeError(f"Zip entry escapes target dir: {member}")
+                            lzf.extractall(layer_dir)
+                    except (OSError, zipfile.BadZipFile, zipfile.LargeFileError) as e:
+                        logger.error("Failed to extract layer %s", layer_arn, exc_info=True)
+                        raise RuntimeError(f"Failed to extract layer {layer_arn}") from e
+                    layers_dirs.append(layer_dir)
+            except RuntimeError:
+                raise
+            except Exception as e:
+                logger.error("Unexpected error resolving layer %s: %s", layer_arn, e)
+                raise RuntimeError(f"Failed to resolve layer {layer_arn}") from e
+
         handler = self.config.get("Handler", "index.handler")
         module_name, handler_name = handler.rsplit(".", 1)
         env_vars = self.config.get("Environment", {}).get("Variables", {})
@@ -322,6 +363,28 @@ class Worker:
         spawn_env.setdefault("AWS_LAMBDA_FUNCTION_NAME", self.config.get("FunctionName", ""))
         spawn_env.setdefault("AWS_LAMBDA_FUNCTION_MEMORY_SIZE", str(self.config.get("MemorySize", 128)))
         spawn_env.setdefault("_LAMBDA_FUNCTION_ARN", self.config.get("FunctionArn", ""))
+
+        # Set layer paths so worker runtimes can find packages from extracted layers.
+        # _LAMBDA_LAYERS_DIRS is consumed by the Python worker; Node.js layer resolution
+        # is handled via NODE_PATH populated from each layer's nodejs paths below.
+        if layers_dirs:
+            spawn_env["_LAMBDA_LAYERS_DIRS"] = os.pathsep.join(layers_dirs)
+            # NODE_PATH is needed for Node.js workers, including ESM import() which
+            # ignores module.paths. Prepend to any existing NODE_PATH.
+            node_paths = []
+            for ld in layers_dirs:
+                nm = os.path.join(ld, "nodejs", "node_modules")
+                if os.path.isdir(nm):
+                    node_paths.append(nm)
+                nj = os.path.join(ld, "nodejs")
+                if os.path.isdir(nj):
+                    node_paths.append(nj)
+            if node_paths:
+                existing = spawn_env.get("NODE_PATH")
+                if existing:
+                    spawn_env["NODE_PATH"] = os.pathsep.join(node_paths + [existing])
+                else:
+                    spawn_env["NODE_PATH"] = os.pathsep.join(node_paths)
 
         self._proc = subprocess.Popen(
             [binary, worker_path],
