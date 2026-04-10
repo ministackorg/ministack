@@ -1350,3 +1350,52 @@ def test_lambda_provided_runtime_create(lam):
     assert desc["Runtime"] == "provided.al2023"
     assert desc["Handler"] == "bootstrap"
     lam.delete_function(FunctionName="provided-test-v39")
+
+
+@pytest.mark.skipif(
+    os.environ.get("LAMBDA_EXECUTOR", "").lower() != "docker",
+    reason="requires LAMBDA_EXECUTOR=docker and Docker daemon",
+)
+def test_lambda_provided_runtime_docker_invoke(lam):
+    """Invoke a provided.al2023 Lambda via the Docker executor.
+
+    Uses a shell-script bootstrap that implements the Lambda Runtime API
+    (GET /invocation/next, POST /invocation/{id}/response).
+    """
+    # Shell bootstrap implementing the Lambda Runtime API protocol.
+    # Must loop: the RIE expects the bootstrap to poll for invocations.
+    bootstrap_script = (
+        "#!/bin/sh\n"
+        'RUNTIME_API="${AWS_LAMBDA_RUNTIME_API}"\n'
+        "while true; do\n"
+        '  RESP=$(curl -s -D /tmp/headers '
+        '"http://${RUNTIME_API}/2018-06-01/runtime/invocation/next")\n'
+        '  REQUEST_ID=$(grep -i "Lambda-Runtime-Aws-Request-Id" /tmp/headers '
+        '| tr -d "\\r" | cut -d" " -f2)\n'
+        '  curl -s -X POST '
+        '"http://${RUNTIME_API}/2018-06-01/runtime/invocation/${REQUEST_ID}/response" '
+        "-d '{\"statusCode\":200,\"body\":\"hello from provided\"}'\n"
+        "done\n"
+    )
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        info = zipfile.ZipInfo("bootstrap")
+        info.external_attr = 0o755 << 16  # executable
+        zf.writestr(info, bootstrap_script)
+
+    func_name = f"provided-docker-test-{_uuid_mod.uuid4().hex[:8]}"
+    lam.create_function(
+        FunctionName=func_name,
+        Runtime="provided.al2023",
+        Handler="bootstrap",
+        Code={"ZipFile": buf.getvalue()},
+        Role="arn:aws:iam::000000000000:role/test",
+        Timeout=30,
+    )
+    try:
+        resp = lam.invoke(FunctionName=func_name, Payload=json.dumps({"key": "value"}))
+        payload = json.loads(resp["Payload"].read())
+        assert payload["statusCode"] == 200
+        assert payload["body"] == "hello from provided"
+    finally:
+        lam.delete_function(FunctionName=func_name)

@@ -1076,10 +1076,8 @@ def _execute_function_docker(func: dict, event: dict) -> dict:
 
             # Build volume mounts
             volumes: dict = {}
-            if LAMBDA_DOCKER_VOLUME_MOUNT:
-                volumes[LAMBDA_DOCKER_VOLUME_MOUNT] = {"bind": "/var/task", "mode": "ro"}
-            else:
-                volumes[code_dir] = {"bind": "/var/task", "mode": "ro"}
+            host_code_dir = LAMBDA_DOCKER_VOLUME_MOUNT or code_dir
+            volumes[host_code_dir] = {"bind": "/var/task", "mode": "ro"}
 
             container_layer_dirs: list[str] = []
             for idx, ld in enumerate(layers_dirs):
@@ -1123,19 +1121,23 @@ def _execute_function_docker(func: dict, event: dict) -> dict:
 
             if is_provided:
                 # provided runtimes: use AWS Lambda RIE built into the provided image.
-                # Make bootstrap executable, start container with RIE, POST event via HTTP.
-                bootstrap_path = os.path.join(code_dir, "bootstrap")
-                if os.path.exists(bootstrap_path):
-                    os.chmod(bootstrap_path, 0o755)
-                # provided runtimes use the AWS Lambda RIE built into the base image.
-                # RIE listens on port 8080; we POST the event and read the response.
+                # The RIE entrypoint runs /var/runtime/bootstrap, while user
+                # code is expected at /var/task.  Mount the code dir to both
+                # paths using docker.types.Mount (the volumes dict can't bind
+                # the same host path to two container paths).
                 import urllib.request
                 bootstrap_path = os.path.join(code_dir, "bootstrap")
                 if os.path.exists(bootstrap_path):
                     os.chmod(bootstrap_path, 0o755)
+                mounts = [
+                    docker_lib.types.Mount("/var/task", host_code_dir, type="bind", read_only=True),
+                    docker_lib.types.Mount("/var/runtime", host_code_dir, type="bind", read_only=True),
+                ]
+                for idx, ld in enumerate(layers_dirs):
+                    mounts.append(docker_lib.types.Mount(f"/opt/layer_{idx}", ld, type="bind", read_only=True))
                 run_kwargs: dict = {
-                    "image": image, "command": ["/var/task/bootstrap"],
-                    "environment": container_env, "volumes": volumes,
+                    "image": image, "command": ["bootstrap"],
+                    "environment": container_env, "mounts": mounts,
                     "ports": {"8080/tcp": None}, "detach": True, "stdin_open": False,
                 }
                 if LAMBDA_DOCKER_NETWORK:
