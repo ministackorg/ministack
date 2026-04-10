@@ -2262,6 +2262,40 @@ def _xml_element_to_dict(element):
     return tag, result
 
 
+# Known AWS acronyms that appear as uppercase runs in wire-format names.
+# Used by _sfn_key_to_api_name to reverse the Java SDK V2 naming convention.
+# Excludes Arn/Id (single uppercase in wire format) and Http/Https/Ec2
+# (contain digits or are mixed-case in wire format, not pure acronym runs).
+_AWS_ACRONYMS = frozenset({
+    "Db", "Iam", "Vpc", "Ssl", "Kms", "Ttl", "Io", "Az",
+    "Ebs", "Ssh", "Mfa", "Dns", "Acl",
+    "Tcp", "Udp", "Iops", "Ca", "Sg",
+})
+
+
+def _sfn_key_to_api_name(name):
+    """Convert SFN SDK key name to AWS wire-format name.
+
+    Reverses _api_name_to_sfn_key: expands known acronyms back to uppercase.
+    Examples: DbClusters -> DBClusters, KmsKeyId -> KMSKeyId,
+              VpcSecurityGroupIds -> VPCSecurityGroupIds
+    """
+    if not name:
+        return name
+    import re
+    tokens = re.findall(r"[A-Z][a-z]*|[a-z]+|[0-9]+", name)
+    return "".join(t.upper() if t in _AWS_ACRONYMS else t for t in tokens)
+
+
+def _convert_params_to_api_names(data):
+    """Recursively convert SFN SDK-style param names to AWS wire-format names."""
+    if isinstance(data, dict):
+        return {_sfn_key_to_api_name(k): _convert_params_to_api_names(v) for k, v in data.items()}
+    if isinstance(data, list):
+        return [_convert_params_to_api_names(item) for item in data]
+    return data
+
+
 def _api_name_to_sfn_key(name):
     """Convert an AWS API member name to SFN SDK integration key name.
 
@@ -2329,12 +2363,14 @@ def _dispatch_aws_sdk_query(service_info, service_name, action, input_data):
             f"Service '{service_key}' is not available in MiniStack",
         )
 
-    # Build form-encoded body with Action param.
     # SFN ARNs use camelCase (e.g. createDBSubnetGroup) but query-protocol
     # services expect PascalCase (CreateDBSubnetGroup).
     pascal_action = action[0].upper() + action[1:] if action else action
+    # Convert SFN SDK-style param names (DbSubnetGroupName) to wire-format
+    # names (DBSubnetGroupName) before flattening to query params.
+    wire_data = _convert_params_to_api_names(input_data)
     form_params = {"Action": pascal_action}
-    form_params.update(_flatten_query_params(input_data))
+    form_params.update(_flatten_query_params(wire_data))
     body = urlencode(form_params)
 
     headers = {

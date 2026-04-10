@@ -9,11 +9,13 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **SFN query-protocol acronym mapper** — Step Functions `aws-sdk:*` integrations now correctly convert SDK-style parameter names (e.g. `DbSubnetGroupName`) to wire-format names (`DBSubnetGroupName`) for query-protocol services (RDS, EC2, IAM, STS, etc.). Uses a static acronym mapping — no botocore dependency. Contributed by @jayjanssen.
+
 ### Fixed
 - **Lambda Docker executor fails for `provided` runtimes** — `_execute_function_docker()` mounted Lambda code only at `/var/task` and overrode CMD to `["/var/task/bootstrap"]`, but the AWS RIE entrypoint (`/lambda-entrypoint.sh`) in `public.ecr.aws/lambda/provided:al2023` expects the bootstrap binary at `/var/runtime/bootstrap`. Now mounts code at both `/var/task` and `/var/runtime` (matching real AWS layout) and passes `"bootstrap"` as CMD so the RIE finds the handler correctly. Contributed by @jayjanssen.
 
 ---
-
 ## [1.1.61] — 2026-04-10
 
 ### Fixed

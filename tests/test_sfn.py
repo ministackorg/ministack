@@ -2077,3 +2077,137 @@ def test_sfn_aws_sdk_json_pascal_case(sfn, sfn_sync, sm):
     assert output["SecretString"] == "my-secret-value"
     # Cleanup
     sm.delete_secret(SecretId="sfn-pascal-json-secret", ForceDeleteWithoutRecovery=True)
+
+
+def test_sfn_aws_sdk_query_acronym_param_mapping(sfn, sfn_sync, rds):
+    """SFN aws-sdk query dispatch maps SDK-style param names to wire-format names."""
+    import uuid as _uuid
+    cluster_id = f"acronym-test-{_uuid.uuid4().hex[:8]}"
+    sm_name = f"sdk-acronym-{_uuid.uuid4().hex[:8]}"
+
+    definition = json.dumps({
+        "StartAt": "CreateCluster",
+        "States": {
+            "CreateCluster": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::aws-sdk:rds:createDBCluster",
+                "Parameters": {
+                    "DbClusterIdentifier": cluster_id,
+                    "Engine": "aurora-postgresql",
+                    "MasterUsername": "admin",
+                    "MasterUserPassword": "testpass123",
+                },
+                "ResultPath": "$.createResult",
+                "Next": "DescribeClusters",
+            },
+            "DescribeClusters": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::aws-sdk:rds:describeDBClusters",
+                "Parameters": {
+                    "DbClusterIdentifier": cluster_id,
+                },
+                "ResultPath": "$.describeResult",
+                "End": True,
+            },
+        },
+    })
+
+    sm_arn = sfn_sync.create_state_machine(
+        name=sm_name,
+        definition=definition,
+        roleArn="arn:aws:iam::000000000000:role/sfn-role",
+    )["stateMachineArn"]
+
+    resp = sfn_sync.start_sync_execution(stateMachineArn=sm_arn, input=json.dumps({}))
+    assert resp["status"] == "SUCCEEDED", f"Execution failed: {resp.get('error')} — {resp.get('cause')}"
+    output = json.loads(resp["output"])
+
+    create_cluster = output["createResult"]["DbCluster"]
+    assert create_cluster["DbClusterIdentifier"] == cluster_id
+    assert create_cluster["Engine"] == "aurora-postgresql"
+
+    sfn_sync.delete_state_machine(stateMachineArn=sm_arn)
+
+
+def test_sfn_key_to_api_name_must_convert():
+    """Verify _sfn_key_to_api_name expands known acronyms to uppercase."""
+    from ministack.services.stepfunctions import _sfn_key_to_api_name
+
+    cases = [
+        ("DbSubnetGroupName", "DBSubnetGroupName"),
+        ("DbClusterIdentifier", "DBClusterIdentifier"),
+        ("DbClusterArn", "DBClusterArn"),
+        ("IamDatabaseAuthenticationEnabled", "IAMDatabaseAuthenticationEnabled"),
+        ("DomainIamRoleName", "DomainIAMRoleName"),
+        ("CaCertificateIdentifier", "CACertificateIdentifier"),
+        ("VpcSecurityGroupIds", "VPCSecurityGroupIds"),
+        ("KmsKeyId", "KMSKeyId"),
+        ("SslMode", "SSLMode"),
+        ("EbsOptimized", "EBSOptimized"),
+        ("IoOptimizedNextAllowedModificationTime", "IOOptimizedNextAllowedModificationTime"),
+        ("DnsName", "DNSName"),
+        ("AzMode", "AZMode"),
+        ("TtlSeconds", "TTLSeconds"),
+        ("SgId", "SGId"),
+        ("AclName", "ACLName"),
+    ]
+    for sfn, expected in cases:
+        assert _sfn_key_to_api_name(sfn) == expected, f"{sfn} → expected {expected}"
+
+
+def test_sfn_key_to_api_name_must_not_convert():
+    """Verify _sfn_key_to_api_name leaves non-acronym names unchanged."""
+    from ministack.services.stepfunctions import _sfn_key_to_api_name
+
+    cases = [
+        "Engine", "MasterUsername", "Port", "SubnetIds",
+        "HttpEndpointEnabled", "StorageEncrypted", "DeletionProtection",
+        "BackupRetentionPeriod", "PreferredBackupWindow",
+    ]
+    for name in cases:
+        assert _sfn_key_to_api_name(name) == name, f"{name} should be unchanged"
+
+
+def test_sfn_key_to_api_name_idempotent():
+    """Verify _sfn_key_to_api_name is idempotent on wire-format names."""
+    from ministack.services.stepfunctions import _sfn_key_to_api_name
+
+    wire_names = [
+        "DBSubnetGroupName", "IAMDatabaseAuthenticationEnabled",
+        "VPCSecurityGroupIds", "KMSKeyId", "CACertificateIdentifier",
+    ]
+    for name in wire_names:
+        assert _sfn_key_to_api_name(name) == name, f"{name} should be idempotent"
+
+
+def test_sfn_key_to_api_name_round_trip():
+    """Verify _sfn_key_to_api_name correctly reverses _api_name_to_sfn_key."""
+    from ministack.services.stepfunctions import _api_name_to_sfn_key, _sfn_key_to_api_name
+
+    wire_names = [
+        "DBSubnetGroupName", "DBClusterIdentifier", "DBClusterArn",
+        "IAMDatabaseAuthenticationEnabled", "VPCSecurityGroupIds",
+        "KMSKeyId", "SSLMode", "EBSOptimized", "IOOptimizedNextAllowedModificationTime",
+        "CACertificateIdentifier", "DNSName", "AZMode", "TTLSeconds",
+        "Engine", "MasterUsername", "Port", "SubnetIds", "HttpEndpointEnabled",
+    ]
+    for wire in wire_names:
+        sfn = _api_name_to_sfn_key(wire)
+        back = _sfn_key_to_api_name(sfn)
+        assert back == wire, f"Round-trip failed: {wire} → {sfn} → {back}"
+
+
+def test_convert_params_to_api_names_nested():
+    """Verify _convert_params_to_api_names handles nested dicts and lists."""
+    from ministack.services.stepfunctions import _convert_params_to_api_names
+
+    result = _convert_params_to_api_names({
+        "DbClusterIdentifier": "my-cluster",
+        "VpcSecurityGroupIds": [{"SgId": "sg-123"}],
+        "Tags": [{"Key": "env", "Value": "test"}],
+    })
+    assert result == {
+        "DBClusterIdentifier": "my-cluster",
+        "VPCSecurityGroupIds": [{"SGId": "sg-123"}],
+        "Tags": [{"Key": "env", "Value": "test"}],
+    }
