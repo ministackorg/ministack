@@ -14,6 +14,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 - **API Gateway v1/v2 returns mock response for Node.js Lambdas** — `_invoke_lambda_proxy` in both `apigateway.py` (v2) and `apigateway_v1.py` (v1) only dispatched to the warm worker pool for Python runtimes. Node.js Lambdas received a hardcoded `"Mock response"` instead of being executed, even though the warm worker pool in `lambda_runtime.py` already supports Node.js. Now checks for both `python` and `nodejs` runtimes.
+- **API Gateway v2 missing `pathParameters` in Lambda event** — Routes with path parameters (e.g. `GET /items/{itemId}`) did not extract parameter values into the Lambda proxy event's `pathParameters` field. Handlers received `undefined` instead of `{ "itemId": "..." }`. Now extracts parameters from both `{param}` and `{proxy+}` route templates.
+- **API Gateway v2 `queryStringParameters` incorrect for multi-value params** — Multi-value query parameters (e.g. `?tag=a&tag=b`) were passed as Python lists instead of comma-joined strings. Now joins values with commas (`"tag": "a,b"`) matching the AWS API Gateway v2 payload format 2.0 spec.
+- **API Gateway v2 `rawQueryString` stringified lists** — Multi-value query parameters were rendered as `tag=['a', 'b']` instead of `tag=a&tag=b`. Now expands repeated keys correctly.
 - **Lambda Docker executor fails for `provided` runtimes** — `_execute_function_docker()` mounted Lambda code only at `/var/task` and overrode CMD to `["/var/task/bootstrap"]`, but the AWS RIE entrypoint (`/lambda-entrypoint.sh`) in `public.ecr.aws/lambda/provided:al2023` expects the bootstrap binary at `/var/runtime/bootstrap`. Now mounts code at both `/var/task` and `/var/runtime` (matching real AWS layout) and passes `"bootstrap"` as CMD so the RIE finds the handler correctly. Contributed by @jayjanssen.
 
 ---
