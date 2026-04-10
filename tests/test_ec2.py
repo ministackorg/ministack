@@ -1130,3 +1130,46 @@ def test_ec2_default_subnets_three_azs(ec2):
     for s in subnets:
         assert s["DefaultForAz"] is True
         assert s["MapPublicIpOnLaunch"] is True
+
+
+def test_describe_tags_filters(ec2):
+    """DescribeTags respects resource-id and key filters."""
+    # Create two instances and tag them differently
+    r1 = ec2.run_instances(ImageId="ami-test1", InstanceType="t2.micro", MinCount=1, MaxCount=1)
+    r2 = ec2.run_instances(ImageId="ami-test2", InstanceType="t2.micro", MinCount=1, MaxCount=1)
+    id1 = r1["Instances"][0]["InstanceId"]
+    id2 = r2["Instances"][0]["InstanceId"]
+
+    ec2.create_tags(Resources=[id1], Tags=[{"Key": "Name", "Value": "first"}, {"Key": "Env", "Value": "prod"}])
+    ec2.create_tags(Resources=[id2], Tags=[{"Key": "Name", "Value": "second"}])
+
+    # Filter by resource-id — should only return tags for id1
+    resp = ec2.describe_tags(Filters=[{"Name": "resource-id", "Values": [id1]}])
+    tags = resp["Tags"]
+    assert all(t["ResourceId"] == id1 for t in tags)
+    assert len(tags) == 2
+
+    # Filter by key — should return "Env" tag only for id1
+    resp = ec2.describe_tags(Filters=[{"Name": "key", "Values": ["Env"]}])
+    tags = resp["Tags"]
+    assert all(t["Key"] == "Env" for t in tags)
+    assert any(t["ResourceId"] == id1 for t in tags)
+
+    # Filter by resource-id + key — should return exactly one tag
+    resp = ec2.describe_tags(Filters=[
+        {"Name": "resource-id", "Values": [id1]},
+        {"Name": "key", "Values": ["Name"]},
+    ])
+    tags = resp["Tags"]
+    assert len(tags) == 1
+    assert tags[0]["ResourceId"] == id1
+    assert tags[0]["Key"] == "Name"
+    assert tags[0]["Value"] == "first"
+
+    # Filter by resource-id that has no tags — should return empty
+    resp = ec2.describe_tags(Filters=[{"Name": "resource-id", "Values": ["i-doesnotexist"]}])
+    assert len(resp["Tags"]) == 0
+
+    # All tags have correct resource type
+    resp = ec2.describe_tags(Filters=[{"Name": "resource-id", "Values": [id1, id2]}])
+    assert all(t["ResourceType"] == "instance" for t in resp["Tags"])

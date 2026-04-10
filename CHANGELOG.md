@@ -7,6 +7,15 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [1.1.61] — 2026-04-10
+
+### Fixed
+- **EC2 `DescribeTags` ignores filters** — `DescribeTags` returned every tag for every resource regardless of `Filter` parameters. Terraform's `aws_instance` resource sends `resource-id` and `key` filters when reading launch template tags; receiving unrelated tags caused "too many results: wanted 1, got 3". Now respects `resource-id`, `resource-type`, `key`, and `value` filters. Reported by @m7w.
+- **EC2 `DescribeTags` returns wrong `resourceType`** — resources with prefixes `acl-`, `nat-`, `dopt-`, `eigw-`, `lt-`, `pl-`, `vgw-`, `cgw-`, `ami-`, `tgw-` were returned as generic `"resource"` instead of their correct types (`network-acl`, `natgateway`, `launch-template`, etc.). Reported by @m7w.
+- **Lambda container networking in DinD** — when MiniStack runs inside a Docker container (DinD via socket mount), `127.0.0.1` refers to the MiniStack container itself, not the Docker host where the Lambda container's port is mapped. When `LAMBDA_DOCKER_NETWORK` is set, Lambda invocations now resolve the container's IP on the shared network and connect directly on port 8080. Contributed by @DaviReisVieira. Fixes #228.
+
+---
+
 ## [1.1.60] — 2026-04-09
 
 ### Added

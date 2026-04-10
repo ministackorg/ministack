@@ -1237,10 +1237,24 @@ def _delete_tags(p):
 
 
 def _describe_tags(p):
+    filters = _parse_filters(p)
+    filter_resource_ids = set(filters.get("resource-id", []))
+    filter_resource_types = set(filters.get("resource-type", []))
+    filter_keys = set(filters.get("key", []))
+    filter_values = set(filters.get("value", []))
+
     items = ""
     for rid, tag_list in _tags.items():
+        if filter_resource_ids and rid not in filter_resource_ids:
+            continue
         resource_type = _guess_resource_type(rid)
+        if filter_resource_types and resource_type not in filter_resource_types:
+            continue
         for tag in tag_list:
+            if filter_keys and tag["Key"] not in filter_keys:
+                continue
+            if filter_values and tag.get("Value", "") not in filter_values:
+                continue
             items += f"""<item>
                 <resourceId>{rid}</resourceId>
                 <resourceType>{resource_type}</resourceType>
@@ -1918,28 +1932,32 @@ def _now_ts():
 
 
 def _guess_resource_type(resource_id):
-    if resource_id.startswith("i-"):
-        return "instance"
-    if resource_id.startswith("sg-"):
-        return "security-group"
-    if resource_id.startswith("vpc-"):
-        return "vpc"
-    if resource_id.startswith("subnet-"):
-        return "subnet"
-    if resource_id.startswith("igw-"):
-        return "internet-gateway"
-    if resource_id.startswith("eipalloc-"):
-        return "elastic-ip"
-    if resource_id.startswith("rtb-"):
-        return "route-table"
-    if resource_id.startswith("eni-"):
-        return "network-interface"
-    if resource_id.startswith("vpce-"):
-        return "vpc-endpoint"
-    if resource_id.startswith("vol-"):
-        return "volume"
-    if resource_id.startswith("snap-"):
-        return "snapshot"
+    _PREFIX_MAP = {
+        "i-": "instance",
+        "sg-": "security-group",
+        "vpc-": "vpc",
+        "subnet-": "subnet",
+        "igw-": "internet-gateway",
+        "eipalloc-": "elastic-ip",
+        "rtb-": "route-table",
+        "eni-": "network-interface",
+        "vpce-": "vpc-endpoint",
+        "vol-": "volume",
+        "snap-": "snapshot",
+        "acl-": "network-acl",
+        "nat-": "natgateway",
+        "dopt-": "dhcp-options",
+        "eigw-": "egress-only-internet-gateway",
+        "lt-": "launch-template",
+        "pl-": "managed-prefix-list",
+        "vgw-": "vpn-gateway",
+        "cgw-": "customer-gateway",
+        "ami-": "image",
+        "tgw-": "transit-gateway",
+    }
+    for prefix, rtype in _PREFIX_MAP.items():
+        if resource_id.startswith(prefix):
+            return rtype
     return "resource"
 
 
