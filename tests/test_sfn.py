@@ -2213,6 +2213,94 @@ def test_convert_params_to_api_names_nested():
     }
 
 
+def test_sfn_aws_sdk_rdsdata_execute_statement(sfn, sfn_sync, rds, sm):
+    """SFN aws-sdk:rdsdata:executeStatement dispatches via REST-JSON protocol."""
+    import uuid as _uuid
+    cluster_id = f"rdsdata-sfn-{_uuid.uuid4().hex[:8]}"
+    sm_name = f"sdk-rdsdata-{_uuid.uuid4().hex[:8]}"
+
+    rds.create_db_cluster(
+        DBClusterIdentifier=cluster_id,
+        Engine="aurora-mysql",
+        MasterUsername="admin",
+        MasterUserPassword="testpass123",
+    )
+    secret_arn = sm.create_secret(
+        Name=f"rdsdata-secret-{_uuid.uuid4().hex[:8]}",
+        SecretString='{"username":"admin","password":"testpass123"}',
+    )["ARN"]
+    cluster_arn = f"arn:aws:rds:us-east-1:000000000000:cluster:{cluster_id}"
+
+    definition = json.dumps({
+        "StartAt": "ExecuteSQL",
+        "States": {
+            "ExecuteSQL": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::aws-sdk:rdsdata:executeStatement",
+                "Parameters": {
+                    "resourceArn": cluster_arn,
+                    "secretArn": secret_arn,
+                    "sql": "SELECT 1",
+                    "database": "testdb",
+                },
+                "End": True,
+            },
+        },
+    })
+
+    sm_arn = sfn_sync.create_state_machine(
+        name=sm_name,
+        definition=definition,
+        roleArn="arn:aws:iam::000000000000:role/sfn-role",
+    )["stateMachineArn"]
+
+    resp = sfn_sync.start_sync_execution(stateMachineArn=sm_arn, input=json.dumps({}))
+    assert resp["status"] == "SUCCEEDED", f"Execution failed: {resp.get('error')} — {resp.get('cause')}"
+    output = json.loads(resp["output"])
+    assert "numberOfRecordsUpdated" in output or "records" in output
+
+    sfn_sync.delete_state_machine(stateMachineArn=sm_arn)
+
+
+def test_sfn_aws_sdk_rdsdata_unknown_action_fails(sfn, sfn_sync):
+    """SFN aws-sdk:rdsdata with unknown action fails with deterministic error."""
+    import uuid as _uuid
+    sm_name = f"sdk-rdsdata-bad-{_uuid.uuid4().hex[:8]}"
+
+    definition = json.dumps({
+        "StartAt": "BadAction",
+        "States": {
+            "BadAction": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::aws-sdk:rdsdata:notARealAction",
+                "Parameters": {"resourceArn": "arn:aws:rds:us-east-1:000000000000:cluster:fake"},
+                "End": True,
+            },
+        },
+    })
+
+    sm_arn = sfn_sync.create_state_machine(
+        name=sm_name,
+        definition=definition,
+        roleArn="arn:aws:iam::000000000000:role/sfn-role",
+    )["stateMachineArn"]
+
+    resp = sfn_sync.start_sync_execution(stateMachineArn=sm_arn, input=json.dumps({}))
+    assert resp["status"] == "FAILED"
+
+    sfn_sync.delete_state_machine(stateMachineArn=sm_arn)
+
+
+def test_sfn_aws_sdk_rdsdata_path_mapping():
+    """Verify REST-JSON action→path mappings are correct for rds-data."""
+    from ministack.services.stepfunctions import _REST_JSON_ACTION_PATHS
+
+    rds_data_paths = _REST_JSON_ACTION_PATHS["rds-data"]
+    assert rds_data_paths["ExecuteStatement"] == "/Execute"
+    assert rds_data_paths["BatchExecuteStatement"] == "/BatchExecute"
+    assert rds_data_paths["BeginTransaction"] == "/BeginTransaction"
+    assert rds_data_paths["CommitTransaction"] == "/CommitTransaction"
+    assert rds_data_paths["RollbackTransaction"] == "/RollbackTransaction"
 # ---------------------------------------------------------------------------
 # Terraform compatibility tests
 # ---------------------------------------------------------------------------

@@ -2149,9 +2149,23 @@ _AWS_SDK_SERVICE_MAP = {
     "iam": {"protocol": "query"},
     "sts": {"protocol": "query"},
     "cloudwatch": {"protocol": "query", "service_key": "monitoring"},
+    # REST-JSON services: path-based routing with JSON body
+    "rdsdata": {"protocol": "rest-json", "service_key": "rds-data"},
     # REST services (not yet supported via aws-sdk dispatcher)
     "s3": {"protocol": "rest"},
     "lambda": {"protocol": "rest"},
+}
+
+# Static action→path maps for REST-JSON services.
+# Avoids a botocore runtime dependency for path resolution.
+_REST_JSON_ACTION_PATHS = {
+    "rds-data": {
+        "ExecuteStatement": "/Execute",
+        "BatchExecuteStatement": "/BatchExecute",
+        "BeginTransaction": "/BeginTransaction",
+        "CommitTransaction": "/CommitTransaction",
+        "RollbackTransaction": "/RollbackTransaction",
+    },
 }
 
 
@@ -2446,6 +2460,67 @@ def _dispatch_aws_sdk_query(service_info, service_name, action, input_data):
         raise _ExecutionError("States.Runtime", f"Failed to parse {service_name} XML response")
 
 
+def _dispatch_aws_sdk_rest_json(service_info, service_name, action, input_data):
+    """Dispatch an aws-sdk integration call to a REST-JSON protocol MiniStack service."""
+    from ministack import app
+
+    service_key = service_info.get("service_key", service_name)
+    handler = app.SERVICE_HANDLERS.get(service_key)
+    if not handler:
+        raise _ExecutionError(
+            "States.Runtime",
+            f"Service '{service_key}' is not available in MiniStack",
+        )
+
+    pascal_action = action[0].upper() + action[1:] if action else action
+
+    # Look up the REST path from the static map; fall back to /<Action>
+    action_paths = _REST_JSON_ACTION_PATHS.get(service_key, {})
+    path = action_paths.get(pascal_action, f"/{pascal_action}")
+
+    body = json.dumps(input_data or {}).encode("utf-8")
+    headers = {
+        "content-type": "application/json",
+        "host": f"{service_key}.{REGION}.amazonaws.com",
+        "authorization": (
+            f"AWS4-HMAC-SHA256 Credential=test/20260101/{REGION}/{service_key}/aws4_request"
+        ),
+    }
+
+    coro = handler("POST", path, headers, body, {})
+    try:
+        coro.send(None)
+    except StopIteration as stop:
+        status, resp_headers, resp_body = stop.value
+    else:
+        coro.close()
+        loop = asyncio.new_event_loop()
+        try:
+            status, resp_headers, resp_body = loop.run_until_complete(
+                handler("POST", path, headers, body, {})
+            )
+        finally:
+            loop.close()
+
+    decoded = resp_body.decode("utf-8") if isinstance(resp_body, bytes) else resp_body
+
+    if status >= 400:
+        try:
+            err_data = json.loads(decoded)
+            code = err_data.get("code") or err_data.get("__type", "ServiceException")
+            msg = err_data.get("message") or err_data.get("Message") or decoded
+            raise _ExecutionError(code, msg)
+        except _ExecutionError:
+            raise
+        except Exception:
+            raise _ExecutionError(f"{service_name}.ServiceException", decoded)
+
+    try:
+        return json.loads(decoded) if decoded else {}
+    except (json.JSONDecodeError, TypeError):
+        return decoded
+
+
 def _invoke_aws_sdk_integration(resource, input_data):
     """Dispatch arn:aws:states:::aws-sdk:<service>:<action> to the target MiniStack service."""
     # Parse service and action from ARN
@@ -2469,6 +2544,8 @@ def _invoke_aws_sdk_integration(resource, input_data):
         return _dispatch_aws_sdk_json(service_info, service_name, action, input_data)
     elif protocol == "query":
         return _dispatch_aws_sdk_query(service_info, service_name, action, input_data)
+    elif protocol == "rest-json":
+        return _dispatch_aws_sdk_rest_json(service_info, service_name, action, input_data)
     else:
         raise _ExecutionError(
             "States.Runtime",

@@ -1518,6 +1518,45 @@ def test_lambda_nodejs_esm_mjs_handler(lam):
         assert body["message"] == "Hello, MiniStack from ESM!"
         assert body["version"] == "1.0.0"
         assert body["esm"] is True
+def test_lambda_warm_worker_uses_layer(lam):
+    """Warm worker should extract layers and make their code available to the handler."""
+    # Create a layer with a Python module
+    layer_buf = io.BytesIO()
+    with zipfile.ZipFile(layer_buf, "w") as z:
+        z.writestr("python/myhelper.py", "LAYER_VALUE = 'from-layer'\n")
+    layer_resp = lam.publish_layer_version(
+        LayerName="warm-layer-test",
+        Content={"ZipFile": layer_buf.getvalue()},
+        CompatibleRuntimes=["python3.12"],
+    )
+    layer_arn = layer_resp["LayerVersionArn"]
+
+    # Create a function that imports from the layer
+    func_code = (
+        "import myhelper\n"
+        "def handler(event, context):\n"
+        "    return {'value': myhelper.LAYER_VALUE}\n"
+    )
+    func_buf = io.BytesIO()
+    with zipfile.ZipFile(func_buf, "w") as z:
+        z.writestr("index.py", func_code)
+
+    fname = f"warm-layer-{_uuid_mod.uuid4().hex[:8]}"
+    lam.create_function(
+        FunctionName=fname,
+        Runtime="python3.12",
+        Role="arn:aws:iam::000000000000:role/test",
+        Handler="index.handler",
+        Code={"ZipFile": func_buf.getvalue()},
+        Layers=[layer_arn],
+    )
+
+    try:
+        resp = lam.invoke(FunctionName=fname, Payload=b"{}")
+        assert resp["StatusCode"] == 200
+        assert "FunctionError" not in resp, f"Lambda error: {resp.get('FunctionError')}"
+        payload = json.loads(resp["Payload"].read())
+        assert payload["value"] == "from-layer"
     finally:
         lam.delete_function(FunctionName=fname)
 
@@ -1538,6 +1577,34 @@ def test_lambda_nodejs_esm_type_module(lam):
         z.writestr("index.js", handler_code)
         z.writestr("package.json", '{"type": "module"}')
 
+def test_lambda_warm_worker_nodejs_uses_layer(lam):
+    """Warm worker should extract Node.js layers and make packages available via require()."""
+    # Create a layer with a Node.js module under nodejs/node_modules/
+    layer_buf = io.BytesIO()
+    with zipfile.ZipFile(layer_buf, "w") as z:
+        z.writestr(
+            "nodejs/node_modules/layerhelper/index.js",
+            "module.exports.LAYER_VALUE = 'from-node-layer';\n",
+        )
+    layer_resp = lam.publish_layer_version(
+        LayerName="warm-node-layer-test",
+        Content={"ZipFile": layer_buf.getvalue()},
+        CompatibleRuntimes=["nodejs20.x"],
+    )
+    layer_arn = layer_resp["LayerVersionArn"]
+
+    # Create a Node.js function that requires the layer package
+    handler_code = (
+        "const helper = require('layerhelper');\n"
+        "exports.handler = async (event) => {\n"
+        "  return { value: helper.LAYER_VALUE };\n"
+        "};\n"
+    )
+    func_buf = io.BytesIO()
+    with zipfile.ZipFile(func_buf, "w") as z:
+        z.writestr("index.js", handler_code)
+
+    fname = f"warm-node-layer-{_uuid_mod.uuid4().hex[:8]}"
     lam.create_function(
         FunctionName=fname,
         Runtime="nodejs20.x",
@@ -1545,6 +1612,10 @@ def test_lambda_nodejs_esm_type_module(lam):
         Handler="index.handler",
         Code={"ZipFile": buf.getvalue()},
     )
+        Code={"ZipFile": func_buf.getvalue()},
+        Layers=[layer_arn],
+    )
+
     try:
         resp = lam.invoke(FunctionName=fname, Payload=b"{}")
         assert resp["StatusCode"] == 200
@@ -1552,6 +1623,7 @@ def test_lambda_nodejs_esm_type_module(lam):
         payload = json.loads(resp["Payload"].read())
         assert payload["statusCode"] == 200
         assert payload["body"] == "type-module-works"
+        assert payload["value"] == "from-node-layer"
     finally:
         lam.delete_function(FunctionName=fname)
 # ---------------------------------------------------------------------------
