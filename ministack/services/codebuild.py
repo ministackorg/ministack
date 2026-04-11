@@ -16,18 +16,17 @@ import os
 import time
 
 from ministack.core.persistence import PERSIST_STATE, load_state
-from ministack.core.responses import error_response_json, json_response, new_uuid, now_iso
+from ministack.core.responses import AccountScopedDict, error_response_json, get_account_id, json_response, new_uuid, now_iso
 
 logger = logging.getLogger("codebuild")
 
-ACCOUNT_ID = os.environ.get("MINISTACK_ACCOUNT_ID", "000000000000")
 REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 
 # ---------------------------------------------------------------------------
 # In-memory state
 # ---------------------------------------------------------------------------
-_projects: dict = {}    # project_name -> project record
-_builds: dict = {}      # build_id -> build record
+_projects = AccountScopedDict()    # project_name -> project record
+_builds = AccountScopedDict()      # build_id -> build record
 
 
 def reset():
@@ -57,11 +56,11 @@ if _restored:
 # ---------------------------------------------------------------------------
 
 def _project_arn(name):
-    return f"arn:aws:codebuild:{REGION}:{ACCOUNT_ID}:project/{name}"
+    return f"arn:aws:codebuild:{REGION}:{get_account_id()}:project/{name}"
 
 
 def _build_arn(build_id):
-    return f"arn:aws:codebuild:{REGION}:{ACCOUNT_ID}:build/{build_id}"
+    return f"arn:aws:codebuild:{REGION}:{get_account_id()}:build/{build_id}"
 
 
 def _build_id(project_name):
@@ -102,8 +101,8 @@ def _make_build_record(project, build_id, source_version=None):
             "streamName": build_id.replace(":", "/"),
         },
         "timeoutInMinutes": project.get("timeoutInMinutes", 60),
-        "initiator": f"{ACCOUNT_ID}/user",
-        "encryptionKey": f"arn:aws:kms:{REGION}:{ACCOUNT_ID}:alias/aws/codebuild",
+        "initiator": f"{get_account_id()}/user",
+        "encryptionKey": f"arn:aws:kms:{REGION}:{get_account_id()}:alias/aws/codebuild",
     }
 
 
@@ -166,13 +165,13 @@ def _create_project(data):
             "computeType": "BUILD_GENERAL1_SMALL",
         }),
         "serviceRole": data.get("serviceRole",
-                                f"arn:aws:iam::{ACCOUNT_ID}:role/codebuild-role"),
+                                f"arn:aws:iam::{get_account_id()}:role/codebuild-role"),
         "timeoutInMinutes": data.get("timeoutInMinutes", 60),
         "tags": data.get("tags", []),
         "created": now,
         "lastModified": now,
         "encryptionKey": data.get("encryptionKey",
-                                  f"arn:aws:kms:{REGION}:{ACCOUNT_ID}:alias/aws/codebuild"),
+                                  f"arn:aws:kms:{REGION}:{get_account_id()}:alias/aws/codebuild"),
         "badge": {"badgeEnabled": False},
     }
     _projects[name] = project
@@ -265,7 +264,7 @@ def _start_build(data):
     build = _make_build_record(project, bid, data.get("sourceVersion"))
     _builds[bid] = build
     logger.info("StartBuild: %s -> %s", project_name, bid)
-    return json_response({"build": build})
+    return json_response({"build": copy.deepcopy(build)})
 
 
 def _batch_get_builds(data):
@@ -291,7 +290,7 @@ def _stop_build(data):
     build["endTime"] = now_iso()
     build["currentPhase"] = "COMPLETED"
     logger.info("StopBuild: %s", bid)
-    return json_response({"build": build})
+    return json_response({"build": copy.deepcopy(build)})
 
 
 def _list_builds(data):

@@ -2113,12 +2113,11 @@ def _r53_resolve_hosted_zone_id(props: dict) -> str:
 
 def _r53_record_set_create(logical_id, props, stack_name):
     zone_id = _r53_resolve_hosted_zone_id(props)
-    with _r53._lock:
-        if zone_id not in _r53._zones:
-            raise ValueError(f"No hosted zone with id '{zone_id}'")
     rs = _r53_record_set_build_rs(props)
     key = _r53._rs_key(rs)
     with _r53._lock:
+        if zone_id not in _r53._zones:
+            raise ValueError(f"No hosted zone with id '{zone_id}'")
         current = list(_r53._records.get(zone_id, []))
         if any(_r53._rs_key(r) == key for r in current):
             raise ValueError(

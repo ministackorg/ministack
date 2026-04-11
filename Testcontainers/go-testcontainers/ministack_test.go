@@ -22,7 +22,7 @@ func newMiniStackContainer(ctx context.Context, t *testing.T) (string, func()) {
 	t.Helper()
 
 	req := testcontainers.ContainerRequest{
-		Image:        "nahuelnucera/ministack:latest",
+		Image:        "ministackorg/ministack:latest",
 		ExposedPorts: []string{"4566/tcp"},
 		Env: map[string]string{
 			"GATEWAY_PORT": "4566",

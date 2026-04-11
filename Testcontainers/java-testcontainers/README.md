@@ -14,7 +14,7 @@ Integration tests for S3, SQS, and DynamoDB using [Testcontainers](https://testc
 mvn test
 ```
 
-Testcontainers will pull `nahuelnucera/ministack:latest`, start it, run the tests, and tear it down automatically.
+Testcontainers will pull `ministackorg/ministack:latest`, start it, run the tests, and tear it down automatically.
 
 ## What's tested
 

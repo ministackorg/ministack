@@ -1193,6 +1193,35 @@ def test_cfn_cloudwatch_alarm_lifecycle(cfn, cw):
                     "Threshold": 80.0,
                     "ComparisonOperator": "GreaterThanThreshold",
                     "TreatMissingData": "notBreaching",
+                },
+            },
+        },
+        "Outputs": {
+            "AlarmNameOut": {"Value": {"Ref": "CpuAlarm"}},
+            "AlarmArnOut": {"Value": {"Fn::GetAtt": ["CpuAlarm", "Arn"]}},
+        },
+    }
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(template))
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "CREATE_COMPLETE"
+
+    outputs = {o["OutputKey"]: o["OutputValue"] for o in stack.get("Outputs", [])}
+    assert outputs["AlarmNameOut"] == alarm_name
+    assert outputs["AlarmArnOut"].endswith(f":alarm:{alarm_name}")
+
+    resp = cw.describe_alarms(AlarmNames=[alarm_name])
+    assert len(resp["MetricAlarms"]) == 1
+    a = resp["MetricAlarms"][0]
+    assert a["MetricName"] == "CPUUtilization"
+    assert a["Namespace"] == f"CfnCwTest/{uid}"
+    assert float(a["Threshold"]) == 80.0
+
+    cfn.delete_stack(StackName=stack_name)
+    _wait_stack(cfn, stack_name)
+    resp2 = cw.describe_alarms(AlarmNames=[alarm_name])
+    assert resp2["MetricAlarms"] == []
+
+
 def test_cfn_route53_hosted_zone_and_record_set(cfn, r53):
     """CloudFormation provisions Route53 HostedZone + RecordSet and removes records on delete."""
     uid = _uuid_mod.uuid4().hex[:8]
@@ -1218,8 +1247,6 @@ def test_cfn_route53_hosted_zone_and_record_set(cfn, r53):
             },
         },
         "Outputs": {
-            "AlarmNameOut": {"Value": {"Ref": "CpuAlarm"}},
-            "AlarmArnOut": {"Value": {"Fn::GetAtt": ["CpuAlarm", "Arn"]}},
             "RecordFqdn": {"Value": {"Ref": "WebA"}},
         },
     }
@@ -1228,20 +1255,6 @@ def test_cfn_route53_hosted_zone_and_record_set(cfn, r53):
     assert stack["StackStatus"] == "CREATE_COMPLETE"
 
     outputs = {o["OutputKey"]: o["OutputValue"] for o in stack.get("Outputs", [])}
-    assert outputs["AlarmNameOut"] == alarm_name
-    assert outputs["AlarmArnOut"].endswith(f":alarm:{alarm_name}")
-
-    resp = cw.describe_alarms(AlarmNames=[alarm_name])
-    assert len(resp["MetricAlarms"]) == 1
-    a = resp["MetricAlarms"][0]
-    assert a["MetricName"] == "CPUUtilization"
-    assert a["Namespace"] == f"CfnCwTest/{uid}"
-    assert float(a["Threshold"]) == 80.0
-
-    cfn.delete_stack(StackName=stack_name)
-    _wait_stack(cfn, stack_name)
-    resp2 = cw.describe_alarms(AlarmNames=[alarm_name])
-    assert resp2["MetricAlarms"] == []
     assert outputs["RecordFqdn"].endswith(".")
 
     resources = {r["LogicalResourceId"]: r for r in cfn.describe_stack_resources(StackName=stack_name)["StackResources"]}

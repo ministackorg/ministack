@@ -7,11 +7,27 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [1.2.4] — 2026-04-11
+
+### Added
+- **CodeBuild service** — new service with 11 API operations: CreateProject, BatchGetProjects, ListProjects, UpdateProject, DeleteProject, StartBuild, BatchGetBuilds, StopBuild, ListBuilds, ListBuildsForProject, BatchDeleteBuilds. Contributed by @Nikhiladiga (#253)
+- **CloudFront Origin Access Control (OAC)** — CreateOriginAccessControl, GetOriginAccessControl, GetOriginAccessControlConfig, ListOriginAccessControls, UpdateOriginAccessControl, DeleteOriginAccessControl. Contributed by @yskarparis (#258)
+- **CloudFormation `AWS::Route53::RecordSet`** — provisions A, AAAA, CNAME, and alias records with weighted/failover/geo routing support. Contributed by @aldokimi (#263)
+- **CloudFormation `AWS::CloudWatch::Alarm`** — provisions metric alarms with full lifecycle (create/delete). Contributed by @aldokimi (#265)
+- **Lambda ESM layer symlink** — Node.js ESM `import()` now resolves packages from Lambda Layers via symlinked `node_modules`. Contributed by @bognari (#259)
+
+### Fixed
+- **CodeBuild multitenancy** — switched from plain `dict` to `AccountScopedDict` for proper account scoping
+- **CFN test merge conflict** — separated mangled CloudWatch Alarm and Route53 RecordSet tests into independent functions
+
+---
+
 ## [1.2.3] — 2026-04-11
 
 ### Fixed
 - **Go SDK v2 `failed to close HTTP response body` warning** — uvicorn's default keep-alive timeout (5s) was too short for Go/Java SDK connection pools (~90s idle). Increased to 75s to match AWS ALB defaults. Affected all services, most visible with DynamoDB health checks. Reported by @mspiller (#249)
-- **SSM inline tags regression test** — added test for `PutParameter` with inline `Tags` followed by `ListTagsForResource`. Contributed by @bognari 
+- **SSM inline tags regression test** — added test for `PutParameter` with inline `Tags` followed by `ListTagsForResource`. Contributed by @bognari (#254)
+
 ---
 
 ## [1.2.2] — 2026-04-11

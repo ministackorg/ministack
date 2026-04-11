@@ -14,7 +14,7 @@ go mod tidy
 go test ./... -v
 ```
 
-Testcontainers will pull `nahuelnucera/ministack:latest`, start it, run the tests, and tear it down automatically.
+Testcontainers will pull `ministackorg/ministack:latest`, start it, run the tests, and tear it down automatically.
 
 ## What's tested
 

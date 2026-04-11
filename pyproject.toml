@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ministack"
-version = "1.2.3"
+version = "1.2.4"
 description = "Free, open-source local AWS emulator — drop-in LocalStack replacement"
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -50,9 +50,9 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/Nahuel990/ministack"
-Repository = "https://github.com/Nahuel990/ministack"
-Issues = "https://github.com/Nahuel990/ministack/issues"
+Homepage = "https://github.com/ministackorg/ministack"
+Repository = "https://github.com/ministackorg/ministack"
+Issues = "https://github.com/ministackorg/ministack/issues"
 
 [project.scripts]
 ministack = "ministack.app:main"

@@ -32,7 +32,7 @@ class MiniStackTest {
 
     @Container
     static final GenericContainer<?> ministack = new GenericContainer<>(
-            DockerImageName.parse("nahuelnucera/ministack:latest"))
+            DockerImageName.parse("ministackorg/ministack:latest"))
             .withExposedPorts(4566)
             .withEnv("GATEWAY_PORT", "4566")
             .withEnv("LOG_LEVEL", "INFO")

@@ -4,20 +4,20 @@
 
 <h1 align="center">MiniStack</h1>
 <p align="center"><strong>Free, open-source local AWS emulator. Free forever.</strong></p>
-<p align="center">40 AWS services on a single port · Terraform compatible · Real databases · MIT licensed</p>
+<p align="center">41 AWS services on a single port · Terraform compatible · Real databases · MIT licensed</p>
 
 <p align="center">
-  <a href="https://github.com/Nahuel990/ministack/releases"><img src="https://img.shields.io/github/v/release/Nahuel990/ministack" alt="GitHub release"></a>
-  <a href="https://github.com/Nahuel990/ministack/actions"><img src="https://img.shields.io/github/actions/workflow/status/Nahuel990/ministack/ci.yml?branch=master" alt="Build"></a>
-  <a href="https://hub.docker.com/r/nahuelnucera/ministack"><img src="https://img.shields.io/docker/pulls/nahuelnucera/ministack" alt="Docker Pulls"></a>
-  <a href="https://hub.docker.com/r/nahuelnucera/ministack"><img src="https://img.shields.io/docker/image-size/nahuelnucera/ministack/latest" alt="Docker Image Size"></a>
-  <a href="https://github.com/Nahuel990/ministack/blob/master/LICENSE"><img src="https://img.shields.io/github/license/Nahuel990/ministack" alt="License"></a>
+  <a href="https://github.com/ministackorg/ministack/releases"><img src="https://img.shields.io/github/v/release/ministackorg/ministack" alt="GitHub release"></a>
+  <a href="https://github.com/ministackorg/ministack/actions"><img src="https://img.shields.io/github/actions/workflow/status/ministackorg/ministack/ci.yml?branch=master" alt="Build"></a>
+  <a href="https://hub.docker.com/r/ministackorg/ministack"><img src="https://img.shields.io/docker/pulls/ministackorg/ministack" alt="Docker Pulls"></a>
+  <a href="https://hub.docker.com/r/ministackorg/ministack"><img src="https://img.shields.io/docker/image-size/ministackorg/ministack/latest" alt="Docker Image Size"></a>
+  <a href="https://github.com/ministackorg/ministack/blob/master/LICENSE"><img src="https://img.shields.io/github/license/ministackorg/ministack" alt="License"></a>
   <img src="https://img.shields.io/badge/python-3.12-blue" alt="Python">
-  <a href="https://github.com/Nahuel990/ministack/stargazers"><img src="https://img.shields.io/github/stars/Nahuel990/ministack" alt="GitHub stars"></a>
+  <a href="https://github.com/ministackorg/ministack/stargazers"><img src="https://img.shields.io/github/stars/ministackorg/ministack" alt="GitHub stars"></a>
 </p>
 
 <p align="center">
-  <a href="https://ministack.org">Website</a> · <a href="https://hub.docker.com/r/nahuelnucera/ministack">Docker Hub</a> · <a href="https://www.linkedin.com/company/ministackorg/">LinkedIn</a> · <a href="https://www.producthunt.com/products/ministack">Product Hunt</a>
+  <a href="https://ministack.org">Website</a> · <a href="https://hub.docker.com/r/ministackorg/ministack">Docker Hub</a> · <a href="https://www.linkedin.com/company/ministackorg/">LinkedIn</a> · <a href="https://www.producthunt.com/products/ministack">Product Hunt</a>
 </p>
 
 ---
@@ -26,7 +26,7 @@
 
 LocalStack recently moved its core services behind a paid plan. If you relied on LocalStack Community for local development and CI/CD pipelines, MiniStack is your free alternative.
 
-- **40 AWS services** emulated on a single port (4566)
+- **41 AWS services** emulated on a single port (4566)
 - **Drop-in compatible** — works with `boto3`, AWS CLI, Terraform, CDK, Pulumi, any SDK
 - **Real infrastructure** — RDS spins up actual Postgres/MySQL containers, ElastiCache spins up real Redis, Athena runs real SQL via DuckDB, ECS runs real Docker containers
 - **Tiny footprint** — ~200MB image, ~30MB RAM at idle vs LocalStack's ~1GB image and ~500MB RAM
@@ -44,13 +44,13 @@ ministack
 # Runs on http://localhost:4566 — use GATEWAY_PORT=XXXX to change
 
 # Option 2: Docker Hub
-docker run -p 4566:4566 nahuelnucera/ministack
+docker run -p 4566:4566 ministackorg/ministack
 
 # Option 2b: Docker Hub with real infrastructure (RDS, ECS, Lambda containers)
-docker run -p 4566:4566 -v /var/run/docker.sock:/var/run/docker.sock nahuelnucera/ministack
+docker run -p 4566:4566 -v /var/run/docker.sock:/var/run/docker.sock ministackorg/ministack
 
 # Option 3: Clone and build
-git clone https://github.com/Nahuel990/ministack
+git clone https://github.com/ministackorg/ministack
 cd ministack
 docker compose up -d
 
@@ -453,6 +453,7 @@ Unsupported resource types fail with `CREATE_FAILED` (or `ROLLBACK_COMPLETE` if 
 | **RDS Data API** | ExecuteStatement, BatchExecuteStatement, BeginTransaction, CommitTransaction, RollbackTransaction | Routes SQL to real Docker-backed RDS database containers; supports MySQL (pymysql) and PostgreSQL (psycopg2); REST paths (`/Execute`, `/BeginTransaction`, etc.) |
 | **S3 Files** | CreateFileSystem, GetFileSystem, ListFileSystems, DeleteFileSystem, CreateMountTarget, GetMountTarget, ListMountTargets, UpdateMountTarget, DeleteMountTarget, CreateAccessPoint, GetAccessPoint, ListAccessPoints, DeleteAccessPoint, GetFileSystemPolicy, PutFileSystemPolicy, DeleteFileSystemPolicy, GetSynchronizationConfiguration, PutSynchronizationConfiguration, TagResource, UntagResource, ListTagsForResource | 21 operations; control plane for the new S3 Files service (launched April 2026); file systems, mount targets, access points, policies |
 | **AutoScaling** | CreateAutoScalingGroup, DescribeAutoScalingGroups, UpdateAutoScalingGroup, DeleteAutoScalingGroup, DescribeAutoScalingInstances, CreateLaunchConfiguration, DescribeLaunchConfigurations, DeleteLaunchConfiguration, PutScalingPolicy, DescribePolicies, DeletePolicy, PutLifecycleHook, DescribeLifecycleHooks, DeleteLifecycleHook, CompleteLifecycleAction, RecordLifecycleActionHeartbeat, PutScheduledUpdateGroupAction, DescribeScheduledActions, DeleteScheduledAction, CreateOrUpdateTags, DescribeTags, DeleteTags | 22 actions; in-memory state — no real instance scaling; full ASG lifecycle (launch configs, scaling policies, lifecycle hooks, scheduled actions, tags); CDK/Terraform compatible |
+| **CodeBuild** | CreateProject, BatchGetProjects, ListProjects, UpdateProject, DeleteProject, StartBuild, BatchGetBuilds, StopBuild, ListBuilds, ListBuildsForProject, BatchDeleteBuilds | 11 actions; builds complete immediately with SUCCEEDED status; project and build metadata stored in-memory |
 
 ---
 
@@ -638,14 +639,14 @@ Install DuckDB for full Athena SQL compatibility: `pip install ministack[full]`.
 
 When `PERSIST_STATE=1`, MiniStack saves service state to `STATE_DIR` on shutdown and reloads it on startup. Writes are atomic (write-to-tmp then rename) to prevent corruption on crash.
 
-Services currently supporting persistence: **All 40 services** — API Gateway v1/v2, ALB, ACM, AppSync, Athena, Cloud Map, CloudFront, CloudWatch, CloudWatch Logs, Cognito, DynamoDB, EC2, ECR, ECS, EFS, ElastiCache, EMR, EventBridge, Firehose, Glue, IAM/STS, Kinesis, KMS, Lambda, RDS, Route 53, S3, Secrets Manager, SES, SES v2, SNS, SQS, SSM, Step Functions, WAF v2
+Services currently supporting persistence: **All 41 services** — API Gateway v1/v2, ALB, ACM, AppSync, Athena, Cloud Map, CloudFront, CloudWatch, CloudWatch Logs, CodeBuild, Cognito, DynamoDB, EC2, ECR, ECS, EFS, ElastiCache, EMR, EventBridge, Firehose, Glue, IAM/STS, Kinesis, KMS, Lambda, RDS, Route 53, S3, Secrets Manager, SES, SES v2, SNS, SQS, SSM, Step Functions, WAF v2
 
 ```bash
 docker run -p 4566:4566 \
   -e PERSIST_STATE=1 \
   -e STATE_DIR=/data/ministack-state \
   -v /tmp/ministack-data:/data \
-  nahuelnucera/ministack
+  ministackorg/ministack
 ```
 
 ### Lambda Warm Starts
@@ -736,7 +737,7 @@ pip install boto3 pytest duckdb docker cbor2
 # Start MiniStack
 docker compose up -d
 
-# Run the full test suite (1,146 tests across all 40 services)
+# Run the full test suite (1,188 tests across all 41 services)
 pytest tests/ -v
 ```
 
@@ -776,7 +777,9 @@ provider "aws" {
     appsync         = "http://localhost:4566"
     athena          = "http://localhost:4566"
     cloudformation  = "http://localhost:4566"
+    cloudfront      = "http://localhost:4566"
     cloudwatch      = "http://localhost:4566"
+    codebuild       = "http://localhost:4566"
     cognitoidentity = "http://localhost:4566"
     cognitoidp      = "http://localhost:4566"
     dynamodb        = "http://localhost:4566"
@@ -808,7 +811,6 @@ provider "aws" {
     stepfunctions   = "http://localhost:4566"
     sts             = "http://localhost:4566"
     wafv2           = "http://localhost:4566"
-    cloudfront      = "http://localhost:4566"
   }
 }
 ```
@@ -930,6 +932,7 @@ See [`Testcontainers/java-testcontainers`](Testcontainers/java-testcontainers), 
 | **CloudFront** | ✅ | Paid | ✅ |
 | **AppSync** | ✅ | NO | ✅ |
 | **Cloud Map** | ✅ | ❌ | ✅ |
+| **CodeBuild** | ✅ | ✅ | ✅ |
 | **S3 Files** | ✅ | ❌ | ❌ |
 | Cost | **Free forever** | Was free, now paid | $35+/mo |
 | Docker image size | ~250MB | ~1GB | ~1GB |

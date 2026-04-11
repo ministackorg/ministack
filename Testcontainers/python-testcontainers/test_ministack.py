@@ -10,7 +10,7 @@ from testcontainers.core.waiting_utils import wait_for_logs
 @pytest.fixture(scope="module")
 def ministack():
     """Start a MiniStack container and wait for it to be healthy."""
-    container = DockerContainer("nahuelnucera/ministack:latest").with_exposed_ports(4566)
+    container = DockerContainer("ministackorg/ministack:latest").with_exposed_ports(4566)
     container.start()
 
     host = container.get_container_host_ip()
