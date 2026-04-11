@@ -39,6 +39,7 @@ logger = logging.getLogger("rds")
 REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 BASE_PORT = int(os.environ.get("RDS_BASE_PORT", "15432"))
 RDS_TMPFS_SIZE = os.environ.get("RDS_TMPFS_SIZE", "256m")
+RDS_PERSIST = os.environ.get("RDS_PERSIST", "0").lower() in ("1", "true", "yes")
 
 _instances = AccountScopedDict()
 _clusters = AccountScopedDict()
@@ -181,15 +182,24 @@ def _create_db_instance(p):
         )
         if image:
             try:
-                container = docker_client.containers.run(
-                    image, detach=True,
+                container_kwargs = dict(
+                    image=image, detach=True,
                     environment=env,
                     ports={f"{container_port}/tcp": host_port},
                     name=f"ministack-rds-{db_id}",
                     labels={"ministack": "rds", "db_id": db_id},
-                    tmpfs={"/var/lib/postgresql/data": f"rw,noexec,nosuid,size={RDS_TMPFS_SIZE}",
-                           "/var/lib/mysql": f"rw,noexec,nosuid,size={RDS_TMPFS_SIZE}"},
                 )
+                if RDS_PERSIST:
+                    container_kwargs["volumes"] = {
+                        f"ministack-rds-{db_id}-data": {"bind": "/var/lib/postgresql/data", "mode": "rw"},
+                        f"ministack-rds-{db_id}-mysql": {"bind": "/var/lib/mysql", "mode": "rw"},
+                    }
+                else:
+                    container_kwargs["tmpfs"] = {
+                        "/var/lib/postgresql/data": f"rw,noexec,nosuid,size={RDS_TMPFS_SIZE}",
+                        "/var/lib/mysql": f"rw,noexec,nosuid,size={RDS_TMPFS_SIZE}",
+                    }
+                container = docker_client.containers.run(**container_kwargs)
                 docker_container_id = container.id
                 logger.info("RDS: started %s container for %s on port %s", engine, db_id, host_port)
             except Exception as e:
