@@ -19,8 +19,10 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 - **5 AutoScaling CFN provisioners upgraded** — `AWS::AutoScaling::AutoScalingGroup`, `LaunchConfiguration`, `ScalingPolicy`, `LifecycleHook`, `ScheduledAction` now store real data (were stubs).
 - **EC2 `DescribeInstanceStatus`** — new operation with `IncludeAllInstances` support. Returns instance state, system status, and instance status.
 - **EC2 `DescribeVpcClassicLink` / `DescribeVpcClassicLinkDnsSupport`** — stubs returning empty sets. Unblocks all VPC-dependent Terraform resources (subnet, security group, instance, ALB, NLB, EFS).
+- **Test parallelization** — CI now runs tests in parallel with pytest-xdist. Adjusted worker count for CFN stack reliability, added retries for flaky tests, increased CFN stack wait timeout. Contributed by @jgrumboe (#199).
 
 ### Fixed
+- **Terraform AWS provider v5.x compatibility (Lambda, DynamoDB, SFN, ESM)** — Lambda no longer injects default runtime/handler for Image-based functions and preserves `ImageConfigResponse` in create/update responses. ESM omits `StartingPosition` for SQS event sources (only valid for Kinesis/DynamoDB Streams). DynamoDB returns `ProvisionedThroughput` with zero values for PAY_PER_REQUEST tables and GSIs. Step Functions implements `ValidateStateMachineDefinition` stub required by provider v5.42.0+. Contributed by @DaviReisVieira (#242).
 - **Kinesis `IncreaseStreamRetentionPeriod` rejects same value** — setting retention to 24h (the default) failed with "must be greater than current value". Now accepts same-value as no-op. Blocked `aws_kinesis_stream` in Terraform and Pulumi.
 - **ACM `DescribeCertificate` timestamps as ISO strings** — Terraform Go SDK expects epoch floats. `CreatedAt`, `IssuedAt`, `NotBefore`, `NotAfter` now return epoch numbers. Blocked `aws_acm_certificate` in Terraform.
 - **Lambda ESM `Enabled` field ignored** — creating an ESM with `Enabled: false` always returned `State: Enabled`. Now respects the request parameter.
