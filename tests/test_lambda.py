@@ -1518,6 +1518,10 @@ def test_lambda_nodejs_esm_mjs_handler(lam):
         assert body["message"] == "Hello, MiniStack from ESM!"
         assert body["version"] == "1.0.0"
         assert body["esm"] is True
+    finally:
+        lam.delete_function(FunctionName=fname)
+
+
 def test_lambda_warm_worker_uses_layer(lam):
     """Warm worker should extract layers and make their code available to the handler."""
     # Create a layer with a Python module
@@ -1577,6 +1581,24 @@ def test_lambda_nodejs_esm_type_module(lam):
         z.writestr("index.js", handler_code)
         z.writestr("package.json", '{"type": "module"}')
 
+    lam.create_function(
+        FunctionName=fname,
+        Runtime="nodejs20.x",
+        Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": buf.getvalue()},
+    )
+    try:
+        resp = lam.invoke(FunctionName=fname, Payload=b"{}")
+        assert resp["StatusCode"] == 200
+        assert "FunctionError" not in resp, f"Lambda error: {resp['Payload'].read().decode()}"
+        payload = json.loads(resp["Payload"].read())
+        assert payload["statusCode"] == 200
+        assert payload["body"] == "type-module-works"
+    finally:
+        lam.delete_function(FunctionName=fname)
+
+
 def test_lambda_warm_worker_nodejs_uses_layer(lam):
     """Warm worker should extract Node.js layers and make packages available via require()."""
     # Create a layer with a Node.js module under nodejs/node_modules/
@@ -1610,8 +1632,6 @@ def test_lambda_warm_worker_nodejs_uses_layer(lam):
         Runtime="nodejs20.x",
         Role=_LAMBDA_ROLE,
         Handler="index.handler",
-        Code={"ZipFile": buf.getvalue()},
-    )
         Code={"ZipFile": func_buf.getvalue()},
         Layers=[layer_arn],
     )
@@ -1621,8 +1641,6 @@ def test_lambda_warm_worker_nodejs_uses_layer(lam):
         assert resp["StatusCode"] == 200
         assert "FunctionError" not in resp, f"Lambda error: {resp['Payload'].read().decode()}"
         payload = json.loads(resp["Payload"].read())
-        assert payload["statusCode"] == 200
-        assert payload["body"] == "type-module-works"
         assert payload["value"] == "from-node-layer"
     finally:
         lam.delete_function(FunctionName=fname)
