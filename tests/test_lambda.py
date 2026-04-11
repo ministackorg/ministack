@@ -1543,3 +1543,200 @@ def test_lambda_warm_worker_nodejs_uses_layer(lam):
         assert payload["value"] == "from-node-layer"
     finally:
         lam.delete_function(FunctionName=fname)
+# ---------------------------------------------------------------------------
+# Terraform compatibility tests
+# ---------------------------------------------------------------------------
+
+
+def test_lambda_image_no_default_runtime_handler(lam):
+    """Image-based functions must not get default runtime/handler values."""
+    fname = "tf-compat-image-no-defaults"
+    try:
+        lam.delete_function(FunctionName=fname)
+    except ClientError:
+        pass
+    resp = lam.create_function(
+        FunctionName=fname,
+        PackageType="Image",
+        Code={"ImageUri": "my-repo/my-image:latest"},
+        Role=_LAMBDA_ROLE,
+        Timeout=30,
+    )
+    try:
+        assert resp["PackageType"] == "Image"
+        assert resp["Runtime"] == "", f"Expected empty Runtime for Image, got {resp['Runtime']!r}"
+        assert resp["Handler"] == "", f"Expected empty Handler for Image, got {resp['Handler']!r}"
+    finally:
+        lam.delete_function(FunctionName=fname)
+
+
+def test_lambda_image_preserves_image_config(lam):
+    """ImageConfig provided at creation must be preserved in the GetFunction response."""
+    fname = "tf-compat-image-config"
+    try:
+        lam.delete_function(FunctionName=fname)
+    except ClientError:
+        pass
+    lam.create_function(
+        FunctionName=fname,
+        PackageType="Image",
+        Code={"ImageUri": "my-repo/my-image:latest"},
+        Role=_LAMBDA_ROLE,
+        ImageConfig={"Command": ["main.lambda_handler"]},
+    )
+    try:
+        get_resp = lam.get_function(FunctionName=fname)
+        cfg = get_resp["Configuration"]
+        assert "ImageConfigResponse" in cfg, "ImageConfigResponse missing from get_function response"
+        assert cfg["ImageConfigResponse"]["ImageConfig"]["Command"] == ["main.lambda_handler"]
+    finally:
+        lam.delete_function(FunctionName=fname)
+
+
+def test_lambda_empty_dead_letter_config(lam):
+    """Functions without DeadLetterConfig must return empty dict, not {TargetArn: ''}."""
+    fname = "tf-compat-no-dlc"
+    try:
+        lam.delete_function(FunctionName=fname)
+    except ClientError:
+        pass
+    resp = lam.create_function(
+        FunctionName=fname,
+        Runtime="python3.9",
+        Handler="index.handler",
+        Role=_LAMBDA_ROLE,
+        Code={"ZipFile": _make_zip(_LAMBDA_CODE)},
+    )
+    try:
+        dlc = resp.get("DeadLetterConfig", {})
+        assert dlc == {} or "TargetArn" not in dlc or dlc.get("TargetArn") == "", \
+            f"Expected empty DeadLetterConfig, got {dlc!r}"
+        assert dlc.get("TargetArn") is None or dlc == {}, \
+            f"DeadLetterConfig should not have TargetArn when unconfigured, got {dlc!r}"
+    finally:
+        lam.delete_function(FunctionName=fname)
+
+
+def test_esm_sqs_no_starting_position(lam, sqs):
+    """SQS event source mappings must not include StartingPosition."""
+    fname = "tf-compat-esm-sqs"
+    try:
+        lam.delete_function(FunctionName=fname)
+    except ClientError:
+        pass
+    lam.create_function(
+        FunctionName=fname,
+        Runtime="python3.9",
+        Handler="index.handler",
+        Role=_LAMBDA_ROLE,
+        Code={"ZipFile": _make_zip(_LAMBDA_CODE)},
+    )
+    q_url = sqs.create_queue(QueueName="tf-compat-esm-queue")["QueueUrl"]
+    q_arn = sqs.get_queue_attributes(
+        QueueUrl=q_url, AttributeNames=["QueueArn"]
+    )["Attributes"]["QueueArn"]
+
+    esm_uuid = None
+    try:
+        resp = lam.create_event_source_mapping(
+            EventSourceArn=q_arn,
+            FunctionName=fname,
+            BatchSize=5,
+            Enabled=True,
+        )
+        esm_uuid = resp["UUID"]
+        assert "StartingPosition" not in resp, \
+            f"SQS ESM should not have StartingPosition, got {resp.get('StartingPosition')!r}"
+
+        get_resp = lam.get_event_source_mapping(UUID=esm_uuid)
+        assert "StartingPosition" not in get_resp, \
+            "StartingPosition should not appear in get_event_source_mapping for SQS"
+    finally:
+        if esm_uuid:
+            lam.delete_event_source_mapping(UUID=esm_uuid)
+        lam.delete_function(FunctionName=fname)
+        sqs.delete_queue(QueueUrl=q_url)
+
+
+def test_esm_kinesis_has_starting_position(lam, kin):
+    """Kinesis event source mappings must include StartingPosition."""
+    fname = "tf-compat-esm-kinesis"
+    stream_name = "tf-compat-esm-stream"
+    try:
+        lam.delete_function(FunctionName=fname)
+    except ClientError:
+        pass
+    try:
+        kin.delete_stream(StreamName=stream_name, EnforceConsumerDeletion=True)
+    except ClientError:
+        pass
+
+    lam.create_function(
+        FunctionName=fname,
+        Runtime="python3.9",
+        Handler="index.handler",
+        Role=_LAMBDA_ROLE,
+        Code={"ZipFile": _make_zip(_LAMBDA_CODE)},
+    )
+    kin.create_stream(StreamName=stream_name, ShardCount=1)
+    stream_arn = kin.describe_stream(
+        StreamName=stream_name
+    )["StreamDescription"]["StreamARN"]
+
+    esm_uuid = None
+    try:
+        resp = lam.create_event_source_mapping(
+            EventSourceArn=stream_arn,
+            FunctionName=fname,
+            StartingPosition="TRIM_HORIZON",
+            BatchSize=100,
+            Enabled=True,
+        )
+        esm_uuid = resp["UUID"]
+        assert "StartingPosition" in resp, "Kinesis ESM must include StartingPosition"
+        assert resp["StartingPosition"] == "TRIM_HORIZON"
+    finally:
+        if esm_uuid:
+            lam.delete_event_source_mapping(UUID=esm_uuid)
+        lam.delete_function(FunctionName=fname)
+        try:
+            kin.delete_stream(StreamName=stream_name, EnforceConsumerDeletion=True)
+        except ClientError:
+            pass
+
+
+def test_esm_response_no_function_name_field(lam, sqs):
+    """ESM API responses should contain FunctionArn but not FunctionName (matching AWS)."""
+    fname = "tf-compat-esm-no-fname"
+    try:
+        lam.delete_function(FunctionName=fname)
+    except ClientError:
+        pass
+    lam.create_function(
+        FunctionName=fname,
+        Runtime="python3.9",
+        Handler="index.handler",
+        Role=_LAMBDA_ROLE,
+        Code={"ZipFile": _make_zip(_LAMBDA_CODE)},
+    )
+    q_url = sqs.create_queue(QueueName="tf-compat-esm-fname-queue")["QueueUrl"]
+    q_arn = sqs.get_queue_attributes(
+        QueueUrl=q_url, AttributeNames=["QueueArn"]
+    )["Attributes"]["QueueArn"]
+
+    esm_uuid = None
+    try:
+        resp = lam.create_event_source_mapping(
+            EventSourceArn=q_arn,
+            FunctionName=fname,
+            BatchSize=5,
+            Enabled=True,
+        )
+        esm_uuid = resp["UUID"]
+        assert "FunctionArn" in resp, "ESM response must include FunctionArn"
+        assert fname in resp["FunctionArn"], "FunctionArn must contain the function name"
+    finally:
+        if esm_uuid:
+            lam.delete_event_source_mapping(UUID=esm_uuid)
+        lam.delete_function(FunctionName=fname)
+        sqs.delete_queue(QueueUrl=q_url)

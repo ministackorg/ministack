@@ -9,13 +9,20 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+---
+
+## [1.1.62] — 2026-04-10
+
 ### Added
-- **SFN query-protocol acronym mapper** — Step Functions `aws-sdk:*` integrations now correctly convert SDK-style parameter names (e.g. `DbSubnetGroupName`) to wire-format names (`DBSubnetGroupName`) for query-protocol services (RDS, EC2, IAM, STS, etc.). Uses a static acronym mapping — no botocore dependency. Contributed by @jayjanssen.
-- **Warm worker Lambda Layer support** — `Worker._spawn()` in `lambda_runtime.py` now extracts attached layers into temp directories and sets `_LAMBDA_LAYERS_DIRS` + `NODE_PATH` so both Python (`sys.path`) and Node.js (`module.paths` + ESM `import()`) can resolve layer packages. Previously only the subprocess executor supported layers.
+- **SFN query-protocol acronym mapper** — Step Functions `aws-sdk:*` integrations now correctly convert SDK-style parameter names (e.g. `DbSubnetGroupName`) to wire-format names (`DBSubnetGroupName`) for query-protocol services (RDS, EC2, IAM, STS, etc.). Uses a static acronym mapping — no botocore dependency. Contributed by @jayjanssen (#235).
 
 ### Fixed
-- **API Gateway v1/v2 returns mock response for Node.js Lambdas** — `_invoke_lambda_proxy` in both `apigateway.py` (v2) and `apigateway_v1.py` (v1) only dispatched to the warm worker pool for Python runtimes. Node.js Lambdas received a hardcoded `"Mock response"` instead of being executed, even though the warm worker pool in `lambda_runtime.py` already supports Node.js. Now checks for both `python` and `nodejs` runtimes.
-- **Lambda Docker executor fails for `provided` runtimes** — `_execute_function_docker()` mounted Lambda code only at `/var/task` and overrode CMD to `["/var/task/bootstrap"]`, but the AWS RIE entrypoint (`/lambda-entrypoint.sh`) in `public.ecr.aws/lambda/provided:al2023` expects the bootstrap binary at `/var/runtime/bootstrap`. Now mounts code at both `/var/task` and `/var/runtime` (matching real AWS layout) and passes `"bootstrap"` as CMD so the RIE finds the handler correctly. Contributed by @jayjanssen.
+- **API Gateway v1/v2 returns mock response for Node.js Lambdas** — `_invoke_lambda_proxy` in both `apigateway.py` (v2) and `apigateway_v1.py` (v1) only dispatched to the warm worker pool for Python runtimes. Node.js Lambdas received a hardcoded `"Mock response"` instead of being executed. Now checks for both `python` and `nodejs` runtimes. Contributed by @bognari (#234).
+- **API Gateway v2 missing `pathParameters` in Lambda event** — Routes with path parameters (e.g. `GET /items/{itemId}`) did not extract parameter values into the Lambda proxy event's `pathParameters` field. Now extracts parameters from both `{param}` and `{proxy+}` route templates. Contributed by @bognari (#239).
+- **API Gateway v2 `queryStringParameters` incorrect for multi-value params** — Multi-value query parameters (e.g. `?tag=a&tag=b`) were passed as Python lists instead of comma-joined strings. Now joins values with commas (`"tag": "a,b"`) matching the AWS API Gateway v2 payload format 2.0 spec. Contributed by @bognari (#239).
+- **API Gateway v2 `rawQueryString` stringified lists** — Multi-value query parameters were rendered as `tag=['a', 'b']` instead of `tag=a&tag=b`. Now expands repeated keys correctly. Contributed by @bognari (#239).
+- **Lambda Docker executor fails for `provided` runtimes** — `_execute_function_docker()` mounted Lambda code only at `/var/task` and overrode CMD to `["/var/task/bootstrap"]`, but the AWS RIE entrypoint expects the bootstrap binary at `/var/runtime/bootstrap`. Now mounts code at both `/var/task` and `/var/runtime` and passes `"bootstrap"` as CMD. Contributed by @jayjanssen (#232).
+- **Lambda `print()` / `console.log()` output lost in warm worker pool** — Python handler `print()` wrote to stdout, colliding with the JSON-line protocol between worker and host. Now redirects Python stdout to stderr (matching the existing Node.js worker behavior). Worker `invoke()` drains stderr after each invocation and returns it as `log`. ESM success paths (SQS, Kinesis, DynamoDB Streams) now emit handler output to the MiniStack log. Direct `Invoke` with `LogType=Tail` returns the output in `X-Amz-Log-Result`. Reported by @PerhapsJack.
 
 ---
 ## [1.1.61] — 2026-04-10

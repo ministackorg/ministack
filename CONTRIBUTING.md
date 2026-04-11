@@ -139,10 +139,13 @@ def test_myservice_operation_one(mysvc):
 docker compose up -d
 
 # Install test dependencies
-pip install boto3 pytest duckdb docker cbor2
+pip install boto3 pytest pytest-xdist duckdb docker cbor2 
 
-# Run all tests
-pytest tests/ -v
+# Parallel-safe phase: run tests that are safe to run concurrently
+pytest tests/ -v -n 4 --dist=loadfile -m "not serial"
+
+# Serial/global-state phase: run tests that mutate runtime state or require isolation
+pytest tests/ -v -m serial
 
 # Run a specific service
 pytest tests/ -v -k "cognito"

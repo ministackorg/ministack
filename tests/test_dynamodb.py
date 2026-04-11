@@ -1164,3 +1164,117 @@ def test_dynamodb_query_filter_legacy(ddb):
     for item in resp["Items"]:
         assert item["status"]["S"] == "active"
 
+
+# ---------------------------------------------------------------------------
+# Terraform compatibility tests
+# ---------------------------------------------------------------------------
+
+
+def test_dynamodb_pay_per_request_provisioned_throughput(ddb):
+    """PAY_PER_REQUEST tables must return ProvisionedThroughput with zero values."""
+    tname = "tf-compat-ondemand"
+    try:
+        ddb.delete_table(TableName=tname)
+    except ClientError:
+        pass
+    ddb.create_table(
+        TableName=tname,
+        KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+        AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "S"}],
+        BillingMode="PAY_PER_REQUEST",
+    )
+    try:
+        desc = ddb.describe_table(TableName=tname)["Table"]
+        pt = desc["ProvisionedThroughput"]
+        assert pt["ReadCapacityUnits"] == 0, \
+            f"Expected ReadCapacityUnits=0 for PAY_PER_REQUEST, got {pt['ReadCapacityUnits']}"
+        assert pt["WriteCapacityUnits"] == 0, \
+            f"Expected WriteCapacityUnits=0 for PAY_PER_REQUEST, got {pt['WriteCapacityUnits']}"
+    finally:
+        ddb.delete_table(TableName=tname)
+
+
+def test_dynamodb_provisioned_keeps_capacity(ddb):
+    """PROVISIONED tables must keep their configured throughput values."""
+    tname = "tf-compat-provisioned"
+    try:
+        ddb.delete_table(TableName=tname)
+    except ClientError:
+        pass
+    ddb.create_table(
+        TableName=tname,
+        KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+        AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "S"}],
+        BillingMode="PROVISIONED",
+        ProvisionedThroughput={"ReadCapacityUnits": 10, "WriteCapacityUnits": 5},
+    )
+    try:
+        desc = ddb.describe_table(TableName=tname)["Table"]
+        pt = desc["ProvisionedThroughput"]
+        assert pt["ReadCapacityUnits"] == 10
+        assert pt["WriteCapacityUnits"] == 5
+    finally:
+        ddb.delete_table(TableName=tname)
+
+
+def test_dynamodb_pay_per_request_gsi_zero_throughput(ddb):
+    """GSIs on PAY_PER_REQUEST tables must have zero ProvisionedThroughput."""
+    tname = "tf-compat-ondemand-gsi"
+    try:
+        ddb.delete_table(TableName=tname)
+    except ClientError:
+        pass
+    ddb.create_table(
+        TableName=tname,
+        KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+        AttributeDefinitions=[
+            {"AttributeName": "pk", "AttributeType": "S"},
+            {"AttributeName": "gsi_key", "AttributeType": "S"},
+        ],
+        BillingMode="PAY_PER_REQUEST",
+        GlobalSecondaryIndexes=[
+            {
+                "IndexName": "gsi-test",
+                "KeySchema": [{"AttributeName": "gsi_key", "KeyType": "HASH"}],
+                "Projection": {"ProjectionType": "ALL"},
+            }
+        ],
+    )
+    try:
+        desc = ddb.describe_table(TableName=tname)["Table"]
+        gsis = desc.get("GlobalSecondaryIndexes", [])
+        assert len(gsis) == 1, f"Expected 1 GSI, got {len(gsis)}"
+        gsi_pt = gsis[0]["ProvisionedThroughput"]
+        assert gsi_pt["ReadCapacityUnits"] == 0, \
+            f"Expected GSI ReadCapacityUnits=0 for PAY_PER_REQUEST, got {gsi_pt['ReadCapacityUnits']}"
+        assert gsi_pt["WriteCapacityUnits"] == 0, \
+            f"Expected GSI WriteCapacityUnits=0 for PAY_PER_REQUEST, got {gsi_pt['WriteCapacityUnits']}"
+    finally:
+        ddb.delete_table(TableName=tname)
+
+
+def test_dynamodb_update_to_pay_per_request_zeroes_throughput(ddb):
+    """Updating billing mode to PAY_PER_REQUEST should zero out throughput."""
+    tname = "tf-compat-update-billing"
+    try:
+        ddb.delete_table(TableName=tname)
+    except ClientError:
+        pass
+    ddb.create_table(
+        TableName=tname,
+        KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+        AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "S"}],
+        BillingMode="PROVISIONED",
+        ProvisionedThroughput={"ReadCapacityUnits": 10, "WriteCapacityUnits": 5},
+    )
+    try:
+        ddb.update_table(TableName=tname, BillingMode="PAY_PER_REQUEST")
+        desc = ddb.describe_table(TableName=tname)["Table"]
+        pt = desc["ProvisionedThroughput"]
+        assert pt["ReadCapacityUnits"] == 0, \
+            f"Expected ReadCapacityUnits=0 after switching to PAY_PER_REQUEST, got {pt['ReadCapacityUnits']}"
+        assert pt["WriteCapacityUnits"] == 0, \
+            f"Expected WriteCapacityUnits=0 after switching to PAY_PER_REQUEST, got {pt['WriteCapacityUnits']}"
+    finally:
+        ddb.delete_table(TableName=tname)
+

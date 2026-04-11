@@ -219,6 +219,7 @@ async def handle_request(method, path, headers, body, query_params):
         "ListActivities": _list_activities,
         "GetActivityTask": _get_activity_task,
         "TestState": _test_state,
+        "ValidateStateMachineDefinition": _validate_state_machine_definition,
     }
 
     handler = handlers.get(action)
@@ -933,6 +934,14 @@ def _test_state(data):
         result["inspectionData"] = inspection_data
 
     return json_response(result)
+
+
+# ---------------------------------------------------------------------------
+# ValidateStateMachineDefinition API
+# ---------------------------------------------------------------------------
+
+def _validate_state_machine_definition(data):
+    return json_response({"result": "OK", "diagnostics": []})
 
 
 # ===================================================================
