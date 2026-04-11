@@ -1171,6 +1171,58 @@ def test_cfn_elbv2_load_balancer_and_listener(cfn, elbv2):
     _wait_stack(cfn, stack_name)
     assert elbv2.describe_load_balancers(Names=[lb_name])["LoadBalancers"] == []
 
+
+def test_cfn_route53_hosted_zone_and_record_set(cfn, r53):
+    """CloudFormation provisions Route53 HostedZone + RecordSet and removes records on delete."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-r53rs-{uid}"
+    zone_name = f"cfnrs{uid}.com."
+    record_name = f"www.cfnrs{uid}.com"
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "Zone": {
+                "Type": "AWS::Route53::HostedZone",
+                "Properties": {"Name": zone_name},
+            },
+            "WebA": {
+                "Type": "AWS::Route53::RecordSet",
+                "Properties": {
+                    "HostedZoneId": {"Ref": "Zone"},
+                    "Name": record_name,
+                    "Type": "A",
+                    "TTL": 300,
+                    "ResourceRecords": [{"Value": "198.51.100.10"}],
+                },
+            },
+        },
+        "Outputs": {
+            "RecordFqdn": {"Value": {"Ref": "WebA"}},
+        },
+    }
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(template))
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "CREATE_COMPLETE"
+
+    outputs = {o["OutputKey"]: o["OutputValue"] for o in stack.get("Outputs", [])}
+    assert outputs["RecordFqdn"].endswith(".")
+
+    resources = {r["LogicalResourceId"]: r for r in cfn.describe_stack_resources(StackName=stack_name)["StackResources"]}
+    zone_id = resources["Zone"]["PhysicalResourceId"]
+
+    rrs = r53.list_resource_record_sets(HostedZoneId=zone_id)["ResourceRecordSets"]
+    a_rrs = [r for r in rrs if r["Type"] == "A" and "cfnrs" in r["Name"]]
+    assert len(a_rrs) == 1
+    assert a_rrs[0]["ResourceRecords"][0]["Value"] == "198.51.100.10"
+
+    cfn.delete_stack(StackName=stack_name)
+    _wait_stack(cfn, stack_name)
+
+    with pytest.raises(ClientError) as exc:
+        r53.get_hosted_zone(Id=zone_id)
+    assert exc.value.response["Error"]["Code"] == "NoSuchHostedZone"
+
+
 def test_cfn_ssm_parameter_timestamp_is_epoch(cfn, ssm):
     """SSM parameters created via CloudFormation must store LastModifiedDate
     as an epoch float, not an ISO string.  The JS SDK v3 deserializes SSM
