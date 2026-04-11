@@ -562,6 +562,9 @@ async def _send_response(send, status, headers, body):
         except UnicodeEncodeError:
             return v.encode("utf-8")
 
+    body_bytes = body if isinstance(body, bytes) else body.encode("utf-8")
+    if "content-length" not in {k.lower() for k in headers}:
+        headers["Content-Length"] = str(len(body_bytes))
     header_list = [(k.encode("latin-1"), _encode_header_value(str(v))) for k, v in headers.items()]
     await send({
         "type": "http.response.start",
@@ -570,7 +573,7 @@ async def _send_response(send, status, headers, body):
     })
     await send({
         "type": "http.response.body",
-        "body": body if isinstance(body, bytes) else body.encode("utf-8"),
+        "body": body_bytes,
     })
 
 
