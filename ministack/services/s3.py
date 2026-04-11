@@ -71,6 +71,7 @@ _bucket_accelerate_config = AccountScopedDict()
 _bucket_request_payment_config = AccountScopedDict()
 
 _object_tags = AccountScopedDict()
+_object_versions = AccountScopedDict()  # (bucket, key) -> [{version_id, obj_record}, ...]
 
 _bucket_object_lock = AccountScopedDict()
 _bucket_replication = AccountScopedDict()
@@ -1038,22 +1039,52 @@ def _list_object_versions(bucket_name: str, query_params: dict):
     keys = sorted(
         k for k in bucket["objects"] if k.startswith(prefix) and k > key_marker
     )
-    is_truncated = len(keys) > max_keys
-    SubElement(root, "IsTruncated").text = "true" if is_truncated else "false"
+    is_truncated = False
+    SubElement(root, "IsTruncated").text = "false"
 
-    for k in keys[:max_keys]:
-        obj = bucket["objects"][k]
-        ver = SubElement(root, "Version")
-        SubElement(ver, "Key").text = k
-        SubElement(ver, "VersionId").text = "1"
-        SubElement(ver, "IsLatest").text = "true"
-        SubElement(ver, "LastModified").text = obj["last_modified"]
-        SubElement(ver, "ETag").text = obj["etag"]
-        SubElement(ver, "Size").text = str(obj["size"])
-        SubElement(ver, "StorageClass").text = "STANDARD"
-        owner = SubElement(ver, "Owner")
-        SubElement(owner, "ID").text = "owner-id"
-        SubElement(owner, "DisplayName").text = "ministack"
+    count = 0
+    for k in keys:
+        if count >= max_keys:
+            is_truncated = True
+            break
+        vkey = (bucket_name, k)
+        versions = _object_versions.get(vkey)
+        if versions:
+            # Return all stored versions (newest first)
+            for v in reversed(versions):
+                if count >= max_keys:
+                    is_truncated = True
+                    break
+                ver = SubElement(root, "Version")
+                SubElement(ver, "Key").text = k
+                SubElement(ver, "VersionId").text = v["version_id"]
+                SubElement(ver, "IsLatest").text = "true" if v["is_latest"] else "false"
+                SubElement(ver, "LastModified").text = v["last_modified"]
+                SubElement(ver, "ETag").text = v["etag"]
+                SubElement(ver, "Size").text = str(v["size"])
+                SubElement(ver, "StorageClass").text = "STANDARD"
+                owner = SubElement(ver, "Owner")
+                SubElement(owner, "ID").text = "owner-id"
+                SubElement(owner, "DisplayName").text = "ministack"
+                count += 1
+        else:
+            # No version history — return current object with null version
+            obj = bucket["objects"][k]
+            ver = SubElement(root, "Version")
+            SubElement(ver, "Key").text = k
+            SubElement(ver, "VersionId").text = obj.get("version_id", "null")
+            SubElement(ver, "IsLatest").text = "true"
+            SubElement(ver, "LastModified").text = obj["last_modified"]
+            SubElement(ver, "ETag").text = obj["etag"]
+            SubElement(ver, "Size").text = str(obj["size"])
+            SubElement(ver, "StorageClass").text = "STANDARD"
+            owner = SubElement(ver, "Owner")
+            SubElement(owner, "ID").text = "owner-id"
+            SubElement(owner, "DisplayName").text = "ministack"
+            count += 1
+
+    # Update IsTruncated after actual count
+    root.find("IsTruncated").text = "true" if is_truncated else "false"
 
     return 200, {"Content-Type": "application/xml"}, _xml_body(root)
 
@@ -1381,6 +1412,20 @@ def _put_object(bucket_name: str, key: str, body: bytes, headers: dict):
         version_id = new_uuid()
         obj["version_id"] = version_id
         resp_headers["x-amz-version-id"] = version_id
+        vkey = (bucket_name, key)
+        if vkey not in _object_versions:
+            _object_versions[vkey] = []
+        _object_versions[vkey].append({
+            "version_id": version_id,
+            "last_modified": obj["last_modified"],
+            "etag": obj["etag"],
+            "size": obj["size"],
+            "is_latest": True,
+            "data": obj.get("data", body if len(body) < 10_000_000 else None),
+        })
+        # Mark all previous versions as not latest
+        for v in _object_versions[vkey][:-1]:
+            v["is_latest"] = False
     return 200, resp_headers, b""
 
 
@@ -1494,6 +1539,7 @@ def _delete_object(bucket_name: str, key: str, headers: dict | None = None):
     _object_tags.pop((bucket_name, key), None)
     _object_retention.pop((bucket_name, key), None)
     _object_legal_hold.pop((bucket_name, key), None)
+    _object_versions.pop((bucket_name, key), None)
 
     if existed:
         _fire_s3_event_async(bucket_name, key, "s3:ObjectRemoved:Delete")

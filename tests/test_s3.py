@@ -876,6 +876,33 @@ def test_s3_list_object_versions(s3):
     keys = [v["Key"] for v in versions]
     assert "v1.txt" in keys and "v2.txt" in keys
 
+def test_s3_list_object_versions_multiple_puts_same_key(s3):
+    """Multiple PUTs to the same key with versioning enabled should return all versions."""
+    bkt = "s3-ver-multi"
+    s3.create_bucket(Bucket=bkt)
+    s3.put_bucket_versioning(Bucket=bkt, VersioningConfiguration={"Status": "Enabled"})
+
+    r1 = s3.put_object(Bucket=bkt, Key="doc.txt", Body=b"v1")
+    r2 = s3.put_object(Bucket=bkt, Key="doc.txt", Body=b"v2")
+    r3 = s3.put_object(Bucket=bkt, Key="doc.txt", Body=b"v3")
+
+    assert r1["VersionId"] != r2["VersionId"]
+    assert r2["VersionId"] != r3["VersionId"]
+
+    resp = s3.list_object_versions(Bucket=bkt)
+    versions = resp.get("Versions", [])
+    assert len(versions) == 3
+
+    version_ids = [v["VersionId"] for v in versions]
+    assert r1["VersionId"] in version_ids
+    assert r2["VersionId"] in version_ids
+    assert r3["VersionId"] in version_ids
+
+    latest = [v for v in versions if v["IsLatest"]]
+    assert len(latest) == 1
+    assert latest[0]["VersionId"] == r3["VersionId"]
+
+
 def test_s3_bucket_website(s3):
     s3.create_bucket(Bucket="s3-web-bkt")
     s3.put_bucket_website(

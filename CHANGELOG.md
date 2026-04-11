@@ -44,7 +44,8 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 - **Cognito UserPool extra empty blocks** — `DeviceConfiguration`, `UserPoolAddOns`, `UsernameConfiguration`, `VerificationMessageTemplate` returned when not set. Now only included when explicitly provided. Added missing `DeletionProtection` field.
 - **SNS `GetTopicAttributes` 404 with empty account ARN** — SDKs that skip `GetCallerIdentity` (Pulumi with `skipRequestingAccountId`) construct ARNs with empty account ID (`arn:aws:sns:us-east-1::name`). All SNS operations now normalize these to the default account.
 - **SES `DeleteIdentity` malformed XML response** — response lacked `<DeleteIdentityResult/>` element. Go SDK deserialization failed. Also fixed `SetIdentityNotificationTopic` and `SetIdentityFeedbackForwardingEnabled`.
-- **Go SDK v2 "failed to close HTTP response body" warning** — all responses lacked `Content-Length` header, causing Uvicorn to use `Transfer-Encoding: chunked`. The Go AWS SDK v2 warns on every chunked response close. Now sets `Content-Length` on all responses. Affects all services.
+- **Go SDK v2 "failed to close HTTP response body" warning** — all responses lacked `Content-Length` header, causing Uvicorn to use `Transfer-Encoding: chunked`. The Go AWS SDK v2 warns on every chunked response close. Now sets `Content-Length` on all responses. Affects all services. Reported by @mspiller.
+- **S3 `ListObjectVersions` returns only one version** — when versioning is enabled, multiple PUTs to the same key only stored the latest object. `ListObjectVersions` returned a single version with hardcoded `VersionId: "1"`. Now maintains full version history with unique VersionIds per PUT. Reported by @aldex32.
 
 ---
 
