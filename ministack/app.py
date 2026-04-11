@@ -870,7 +870,8 @@ def main():
         proc = subprocess.Popen(
             [sys.executable, "-m", "uvicorn", "ministack.app:app",
              "--host", "0.0.0.0", "--port", str(port),
-             "--log-level", LOG_LEVEL.lower()],
+             "--log-level", LOG_LEVEL.lower(),
+             "--timeout-keep-alive", "75"],
             stdout=log_fh,
             stderr=subprocess.STDOUT,
             start_new_session=True,
@@ -896,7 +897,7 @@ def main():
 
     signal.signal(signal.SIGTERM, lambda *_: (_cleanup(), sys.exit(0)))
     try:
-        uvicorn.run("ministack.app:app", host="0.0.0.0", port=port, log_level=LOG_LEVEL.lower())
+        uvicorn.run("ministack.app:app", host="0.0.0.0", port=port, log_level=LOG_LEVEL.lower(), timeout_keep_alive=75)
     finally:
         _cleanup()
 
