@@ -30,6 +30,10 @@ _PYTHON_WORKER_SCRIPT = '''
 import sys, json, importlib, traceback, os
 
 def run():
+    # Redirect print() to stderr so stdout stays clean for JSON-line protocol
+    _real_stdout = sys.stdout
+    sys.stdout = sys.stderr
+
     init = json.loads(sys.stdin.readline())
     code_dir = init["code_dir"]
     module_name = init["module"]
@@ -40,11 +44,11 @@ def run():
     try:
         mod = importlib.import_module(module_name)
         handler_fn = getattr(mod, handler_name)
-        sys.stdout.write(json.dumps({"status": "ready", "cold": True}) + "\\n")
-        sys.stdout.flush()
+        _real_stdout.write(json.dumps({"status": "ready", "cold": True}) + "\\n")
+        _real_stdout.flush()
     except Exception as e:
-        sys.stdout.write(json.dumps({"status": "error", "error": str(e)}) + "\\n")
-        sys.stdout.flush()
+        _real_stdout.write(json.dumps({"status": "error", "error": str(e)}) + "\\n")
+        _real_stdout.flush()
         return
 
     while True:
@@ -60,10 +64,10 @@ def run():
         })()
         try:
             result = handler_fn(event, context)
-            sys.stdout.write(json.dumps({"status": "ok", "result": result}) + "\\n")
+            _real_stdout.write(json.dumps({"status": "ok", "result": result}) + "\\n")
         except Exception as e:
-            sys.stdout.write(json.dumps({"status": "error", "error": str(e), "trace": traceback.format_exc()}) + "\\n")
-        sys.stdout.flush()
+            _real_stdout.write(json.dumps({"status": "error", "error": str(e), "trace": traceback.format_exc()}) + "\\n")
+        _real_stdout.flush()
 
 run()
 '''
@@ -398,6 +402,18 @@ class Worker:
         self._start_time = time.time()
         logger.info("Lambda worker spawned for %s (%s, cold start)", self.func_name, runtime)
 
+    def _drain_stderr(self) -> str:
+        """Read any available stderr output without blocking."""
+        import select
+        lines = []
+        if self._proc and self._proc.stderr:
+            while select.select([self._proc.stderr], [], [], 0)[0]:
+                line = self._proc.stderr.readline()
+                if not line:
+                    break
+                lines.append(line.rstrip("\n"))
+        return "\n".join(lines)
+
     def invoke(self, event: dict, request_id: str) -> dict:
         with self._lock:
             cold = self._cold
@@ -426,6 +442,7 @@ class Worker:
                         try:
                             response = json.loads(response_line)
                             response["cold_start"] = cold
+                            response["log"] = self._drain_stderr()
                             return response
                         except json.JSONDecodeError:
                             continue

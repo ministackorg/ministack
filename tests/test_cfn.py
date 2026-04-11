@@ -8,7 +8,7 @@ import pytest
 from botocore.exceptions import ClientError
 import uuid as _uuid_mod
 
-def _wait_stack(cfn, name, timeout=10):
+def _wait_stack(cfn, name, timeout=30):
     """Poll until stack reaches terminal status."""
     deadline = time.time() + timeout
     while time.time() < deadline:

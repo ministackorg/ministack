@@ -385,6 +385,269 @@ def test_apigw_path_param_route(apigw, lam):
     apigw.delete_api(ApiId=api_id)
     lam.delete_function(FunctionName=fname)
 
+def test_apigw_path_parameters_in_event(apigw, lam):
+    """API Gateway v2 should populate pathParameters in the Lambda event."""
+    import urllib.request as _urlreq
+    import uuid as _uuid
+
+    fname = f"intg-pathparam-{_uuid.uuid4().hex[:8]}"
+    code = (
+        "import json\n"
+        "def handler(event, context):\n"
+        "    return {'statusCode': 200, 'body': json.dumps(event.get('pathParameters'))}\n"
+    )
+    lam.create_function(
+        FunctionName=fname,
+        Runtime="python3.9",
+        Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _make_zip(code)},
+    )
+    api_id = apigw.create_api(Name=f"pp-api-{fname}", ProtocolType="HTTP")["ApiId"]
+    int_id = apigw.create_integration(
+        ApiId=api_id,
+        IntegrationType="AWS_PROXY",
+        IntegrationUri=f"arn:aws:lambda:us-east-1:000000000000:function:{fname}",
+        PayloadFormatVersion="2.0",
+    )["IntegrationId"]
+    apigw.create_route(ApiId=api_id, RouteKey="GET /items/{itemId}", Target=f"integrations/{int_id}")
+    apigw.create_stage(ApiId=api_id, StageName="$default")
+
+    try:
+        url = f"http://{api_id}.execute-api.localhost:{_EXECUTE_PORT}/$default/items/my-item-42"
+        req = _urlreq.Request(url, method="GET")
+        req.add_header("Host", f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}")
+        resp = _urlreq.urlopen(req)
+        assert resp.status == 200
+        body = json.loads(resp.read())
+        assert body == {"itemId": "my-item-42"}
+    finally:
+        apigw.delete_api(ApiId=api_id)
+        lam.delete_function(FunctionName=fname)
+
+
+def test_apigw_greedy_path_parameters_in_event(apigw, lam):
+    """{proxy+} greedy path parameter should be extracted into pathParameters."""
+    import urllib.request as _urlreq
+    import uuid as _uuid
+
+    fname = f"intg-greedy-pp-{_uuid.uuid4().hex[:8]}"
+    code = (
+        "import json\n"
+        "def handler(event, context):\n"
+        "    return {'statusCode': 200, 'body': json.dumps(event.get('pathParameters'))}\n"
+    )
+    lam.create_function(
+        FunctionName=fname,
+        Runtime="python3.9",
+        Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _make_zip(code)},
+    )
+    api_id = apigw.create_api(Name=f"greedy-pp-{fname}", ProtocolType="HTTP")["ApiId"]
+    int_id = apigw.create_integration(
+        ApiId=api_id,
+        IntegrationType="AWS_PROXY",
+        IntegrationUri=f"arn:aws:lambda:us-east-1:000000000000:function:{fname}",
+        PayloadFormatVersion="2.0",
+    )["IntegrationId"]
+    apigw.create_route(ApiId=api_id, RouteKey="GET /files/{proxy+}", Target=f"integrations/{int_id}")
+    apigw.create_stage(ApiId=api_id, StageName="$default")
+
+    try:
+        url = f"http://{api_id}.execute-api.localhost:{_EXECUTE_PORT}/$default/files/a/b/c.txt"
+        req = _urlreq.Request(url, method="GET")
+        req.add_header("Host", f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}")
+        resp = _urlreq.urlopen(req)
+        assert resp.status == 200
+        body = json.loads(resp.read())
+        assert body == {"proxy": "a/b/c.txt"}
+    finally:
+        apigw.delete_api(ApiId=api_id)
+        lam.delete_function(FunctionName=fname)
+
+
+def test_apigw_query_params_and_headers_in_event(apigw, lam):
+    """API Gateway v2 should pass queryStringParameters, rawQueryString, and headers to Lambda."""
+    import urllib.request as _urlreq
+    import uuid as _uuid
+
+    fname = f"intg-qp-{_uuid.uuid4().hex[:8]}"
+    code = (
+        "import json\n"
+        "def handler(event, context):\n"
+        "    return {'statusCode': 200, 'body': json.dumps({\n"
+        "        'qs': event.get('queryStringParameters'),\n"
+        "        'rawQs': event.get('rawQueryString'),\n"
+        "        'customHeader': event.get('headers', {}).get('x-custom-header'),\n"
+        "    })}\n"
+    )
+    lam.create_function(
+        FunctionName=fname,
+        Runtime="python3.9",
+        Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _make_zip(code)},
+    )
+    api_id = apigw.create_api(Name=f"qp-api-{fname}", ProtocolType="HTTP")["ApiId"]
+    int_id = apigw.create_integration(
+        ApiId=api_id,
+        IntegrationType="AWS_PROXY",
+        IntegrationUri=f"arn:aws:lambda:us-east-1:000000000000:function:{fname}",
+        PayloadFormatVersion="2.0",
+    )["IntegrationId"]
+    apigw.create_route(ApiId=api_id, RouteKey="GET /search", Target=f"integrations/{int_id}")
+    apigw.create_stage(ApiId=api_id, StageName="$default")
+
+    try:
+        url = f"http://{api_id}.execute-api.localhost:{_EXECUTE_PORT}/$default/search?q=hello&tag=a&tag=b"
+        req = _urlreq.Request(url, method="GET")
+        req.add_header("Host", f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}")
+        req.add_header("X-Custom-Header", "test-value")
+        resp = _urlreq.urlopen(req)
+        assert resp.status == 200
+        body = json.loads(resp.read())
+        assert body["qs"]["q"] == "hello"
+        # Multi-value params should be comma-joined per AWS API Gateway v2 spec
+        assert body["qs"]["tag"] == "a,b"
+        assert "q=hello" in body["rawQs"]
+        assert "tag=a" in body["rawQs"]
+        assert "tag=b" in body["rawQs"]
+        assert body["customHeader"] == "test-value"
+    finally:
+        apigw.delete_api(ApiId=api_id)
+        lam.delete_function(FunctionName=fname)
+
+
+def test_apigw_multiple_path_parameters(apigw, lam):
+    """Multiple path parameters in one route should all be extracted."""
+    import urllib.request as _urlreq
+    import uuid as _uuid
+
+    fname = f"intg-multi-pp-{_uuid.uuid4().hex[:8]}"
+    code = (
+        "import json\n"
+        "def handler(event, context):\n"
+        "    return {'statusCode': 200, 'body': json.dumps(event.get('pathParameters'))}\n"
+    )
+    lam.create_function(
+        FunctionName=fname,
+        Runtime="python3.9",
+        Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _make_zip(code)},
+    )
+    api_id = apigw.create_api(Name=f"multi-pp-{fname}", ProtocolType="HTTP")["ApiId"]
+    int_id = apigw.create_integration(
+        ApiId=api_id,
+        IntegrationType="AWS_PROXY",
+        IntegrationUri=f"arn:aws:lambda:us-east-1:000000000000:function:{fname}",
+        PayloadFormatVersion="2.0",
+    )["IntegrationId"]
+    apigw.create_route(
+        ApiId=api_id,
+        RouteKey="GET /projects/{projectKey}/items/{itemId}",
+        Target=f"integrations/{int_id}",
+    )
+    apigw.create_stage(ApiId=api_id, StageName="$default")
+
+    try:
+        url = f"http://{api_id}.execute-api.localhost:{_EXECUTE_PORT}/$default/projects/bunya/items/prod-42"
+        req = _urlreq.Request(url, method="GET")
+        req.add_header("Host", f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}")
+        resp = _urlreq.urlopen(req)
+        assert resp.status == 200
+        body = json.loads(resp.read())
+        assert body == {"projectKey": "bunya", "itemId": "prod-42"}
+    finally:
+        apigw.delete_api(ApiId=api_id)
+        lam.delete_function(FunctionName=fname)
+
+
+def test_apigw_no_path_parameters_returns_null(apigw, lam):
+    """Routes without path parameters should have pathParameters as null."""
+    import urllib.request as _urlreq
+    import uuid as _uuid
+
+    fname = f"intg-no-pp-{_uuid.uuid4().hex[:8]}"
+    code = (
+        "import json\n"
+        "def handler(event, context):\n"
+        "    return {'statusCode': 200, 'body': json.dumps({'pp': event.get('pathParameters')})}\n"
+    )
+    lam.create_function(
+        FunctionName=fname,
+        Runtime="python3.9",
+        Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _make_zip(code)},
+    )
+    api_id = apigw.create_api(Name=f"no-pp-{fname}", ProtocolType="HTTP")["ApiId"]
+    int_id = apigw.create_integration(
+        ApiId=api_id,
+        IntegrationType="AWS_PROXY",
+        IntegrationUri=f"arn:aws:lambda:us-east-1:000000000000:function:{fname}",
+        PayloadFormatVersion="2.0",
+    )["IntegrationId"]
+    apigw.create_route(ApiId=api_id, RouteKey="GET /products", Target=f"integrations/{int_id}")
+    apigw.create_stage(ApiId=api_id, StageName="$default")
+
+    try:
+        url = f"http://{api_id}.execute-api.localhost:{_EXECUTE_PORT}/$default/products"
+        req = _urlreq.Request(url, method="GET")
+        req.add_header("Host", f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}")
+        resp = _urlreq.urlopen(req)
+        assert resp.status == 200
+        body = json.loads(resp.read())
+        assert body["pp"] is None
+    finally:
+        apigw.delete_api(ApiId=api_id)
+        lam.delete_function(FunctionName=fname)
+
+
+def test_apigw_url_encoded_path_parameter(apigw, lam):
+    """URL-encoded characters in path parameters are decoded by the ASGI layer."""
+    import urllib.request as _urlreq
+    import uuid as _uuid
+
+    fname = f"intg-enc-pp-{_uuid.uuid4().hex[:8]}"
+    code = (
+        "import json\n"
+        "def handler(event, context):\n"
+        "    return {'statusCode': 200, 'body': json.dumps(event.get('pathParameters'))}\n"
+    )
+    lam.create_function(
+        FunctionName=fname,
+        Runtime="python3.9",
+        Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _make_zip(code)},
+    )
+    api_id = apigw.create_api(Name=f"enc-pp-{fname}", ProtocolType="HTTP")["ApiId"]
+    int_id = apigw.create_integration(
+        ApiId=api_id,
+        IntegrationType="AWS_PROXY",
+        IntegrationUri=f"arn:aws:lambda:us-east-1:000000000000:function:{fname}",
+        PayloadFormatVersion="2.0",
+    )["IntegrationId"]
+    apigw.create_route(ApiId=api_id, RouteKey="GET /items/{itemId}", Target=f"integrations/{int_id}")
+    apigw.create_stage(ApiId=api_id, StageName="$default")
+
+    try:
+        # URL-encode a value with special characters
+        url = f"http://{api_id}.execute-api.localhost:{_EXECUTE_PORT}/$default/items/hello%20world"
+        req = _urlreq.Request(url, method="GET")
+        req.add_header("Host", f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}")
+        resp = _urlreq.urlopen(req)
+        assert resp.status == 200
+        body = json.loads(resp.read())
+        # AWS passes the decoded value in pathParameters
+        assert body["itemId"] == "hello world"
+    finally:
+        apigw.delete_api(ApiId=api_id)
+        lam.delete_function(FunctionName=fname)
+
+
 def test_apigw_greedy_path_param(apigw, lam):
     """{proxy+} greedy path parameter matches paths with multiple segments."""
     import urllib.request as _urlreq

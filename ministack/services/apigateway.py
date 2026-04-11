@@ -266,7 +266,12 @@ async def handle_execute(api_id, stage, path, method, headers, body, query_param
     integration_type = integration.get("integrationType", "")
 
     if integration_type == "AWS_PROXY":
-        return await _invoke_lambda_proxy(integration, api_id, stage, path, method, headers, body, query_params, route.get("routeKey", "$default"))
+        route_key = route.get("routeKey", "$default")
+        path_params = None
+        rk_parts = route_key.split(" ", 1)
+        if len(rk_parts) == 2:
+            path_params = _extract_path_params(rk_parts[1], path) or None
+        return await _invoke_lambda_proxy(integration, api_id, stage, path, method, headers, body, query_params, route_key, path_params)
     elif integration_type == "HTTP_PROXY":
         return await _invoke_http_proxy(integration, path, method, headers, body, query_params)
     else:
@@ -293,32 +298,41 @@ def _match_route(api_id, method, path):
     return None
 
 
-def _path_matches(route_path: str, request_path: str) -> bool:
+def _extract_path_params(route_path: str, request_path: str) -> dict | None:
     """
-    Match a route path against a request path.
+    Extract path parameter values from a request path using the route template.
 
+    Returns a dict of {paramName: value} on match, or None if no match.
     Supports:
       {param}   — single path segment (no slashes)
       {proxy+}  — greedy match (one or more path segments, may include slashes)
     """
-    # Build regex by splitting on placeholders
     parts = re.split(r"(\{[^}]+\})", route_path)
     pattern_parts = []
+    param_names = []
     for part in parts:
         if part.startswith("{") and part.endswith("}"):
             inner = part[1:-1]
             if inner.endswith("+"):
-                # greedy — matches one or more characters including slashes
-                pattern_parts.append(".+")
+                param_names.append(inner[:-1])
+                pattern_parts.append("(.+)")
             else:
-                # single segment — no slashes
-                pattern_parts.append("[^/]+")
+                param_names.append(inner)
+                pattern_parts.append("([^/]+)")
         else:
             pattern_parts.append(re.escape(part))
-    return bool(re.fullmatch("".join(pattern_parts), request_path))
+    m = re.fullmatch("".join(pattern_parts), request_path)
+    if not m:
+        return None
+    return dict(zip(param_names, m.groups())) if param_names else {}
 
 
-async def _invoke_lambda_proxy(integration, api_id, stage, path, method, headers, body, query_params, route_key="$default"):
+def _path_matches(route_path: str, request_path: str) -> bool:
+    """Match a route path against a request path."""
+    return _extract_path_params(route_path, request_path) is not None
+
+
+async def _invoke_lambda_proxy(integration, api_id, stage, path, method, headers, body, query_params, route_key="$default", path_params=None):
     """Invoke a Lambda function using the API Gateway v2 proxy event format."""
     from ministack.core.lambda_runtime import get_or_create_worker
     from ministack.services import lambda_svc
@@ -333,12 +347,14 @@ async def _invoke_lambda_proxy(integration, api_id, stage, path, method, headers
         return 502, {"Content-Type": "application/json"}, json.dumps({"message": f"Lambda function '{func_name}' not found"}).encode()
 
     # Build API Gateway v2 proxy event (payload format 2.0)
-    qs = {k: v[0] if len(v) == 1 else v for k, v in query_params.items()}
+    # AWS API Gateway v2 joins multi-value query params with commas
+    qs = {k: ",".join(v) for k, v in query_params.items()} if query_params else None
+    raw_qs = "&".join(f"{k}={val}" for k, vals in query_params.items() for val in vals)
     event = {
         "version": "2.0",
         "routeKey": route_key,
         "rawPath": path,
-        "rawQueryString": "&".join(f"{k}={v}" for k, v in query_params.items()),
+        "rawQueryString": raw_qs,
         "headers": dict(headers),
         "queryStringParameters": qs,
         "requestContext": {
@@ -358,6 +374,7 @@ async def _invoke_lambda_proxy(integration, api_id, stage, path, method, headers
             "time": time.strftime("%d/%b/%Y:%H:%M:%S +0000"),
             "timeEpoch": int(time.time() * 1000),
         },
+        "pathParameters": path_params,
         "body": body.decode("utf-8", errors="replace") if body else None,
         "isBase64Encoded": False,
     }

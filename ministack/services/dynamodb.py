@@ -225,9 +225,15 @@ def _create_table(data):
 
     gsis = copy.deepcopy(data.get("GlobalSecondaryIndexes", []))
     lsis = copy.deepcopy(data.get("LocalSecondaryIndexes", []))
+    billing_mode = data.get("BillingMode", "PROVISIONED")
+    gsi_default_throughput = (
+        {"ReadCapacityUnits": 0, "WriteCapacityUnits": 0}
+        if billing_mode == "PAY_PER_REQUEST"
+        else {"ReadCapacityUnits": 5, "WriteCapacityUnits": 5}
+    )
     for gsi in gsis:
         gsi.setdefault("IndexStatus", "ACTIVE")
-        gsi.setdefault("ProvisionedThroughput", {"ReadCapacityUnits": 5, "WriteCapacityUnits": 5})
+        gsi.setdefault("ProvisionedThroughput", gsi_default_throughput)
         gsi["IndexArn"] = f"arn:aws:dynamodb:{REGION}:{get_account_id()}:table/{name}/index/{gsi['IndexName']}"
         gsi["IndexSizeBytes"] = 0
         gsi["ItemCount"] = 0
@@ -251,7 +257,9 @@ def _create_table(data):
         "TableId": new_uuid(),
         "GlobalSecondaryIndexes": gsis,
         "LocalSecondaryIndexes": lsis,
-        "ProvisionedThroughput": data.get("ProvisionedThroughput", {"ReadCapacityUnits": 5, "WriteCapacityUnits": 5}),
+        "ProvisionedThroughput": {"ReadCapacityUnits": 0, "WriteCapacityUnits": 0}
+            if data.get("BillingMode") == "PAY_PER_REQUEST"
+            else data.get("ProvisionedThroughput", {"ReadCapacityUnits": 5, "WriteCapacityUnits": 5}),
         "BillingModeSummary": {"BillingMode": data.get("BillingMode", "PROVISIONED")},
         "StreamSpecification": data.get("StreamSpecification"),
         "SSEDescription": data.get("SSESpecification"),
@@ -302,6 +310,8 @@ def _update_table(data):
         table["ProvisionedThroughput"] = data["ProvisionedThroughput"]
     if "BillingMode" in data:
         table["BillingModeSummary"] = {"BillingMode": data["BillingMode"]}
+        if data["BillingMode"] == "PAY_PER_REQUEST":
+            table["ProvisionedThroughput"] = {"ReadCapacityUnits": 0, "WriteCapacityUnits": 0}
     if "AttributeDefinitions" in data:
         table["AttributeDefinitions"] = data["AttributeDefinitions"]
     if "StreamSpecification" in data:
@@ -311,7 +321,13 @@ def _update_table(data):
         if "Create" in update:
             gsi_def = copy.deepcopy(update["Create"])
             gsi_def.setdefault("IndexStatus", "ACTIVE")
-            gsi_def.setdefault("ProvisionedThroughput", {"ReadCapacityUnits": 5, "WriteCapacityUnits": 5})
+            current_billing = table.get("BillingModeSummary", {}).get("BillingMode", "PROVISIONED")
+            gsi_def.setdefault(
+                "ProvisionedThroughput",
+                {"ReadCapacityUnits": 0, "WriteCapacityUnits": 0}
+                if current_billing == "PAY_PER_REQUEST"
+                else {"ReadCapacityUnits": 5, "WriteCapacityUnits": 5},
+            )
             gsi_def["IndexArn"] = f"arn:aws:dynamodb:{REGION}:{get_account_id()}:table/{name}/index/{gsi_def['IndexName']}"
             gsi_def["IndexSizeBytes"] = 0
             gsi_def["ItemCount"] = 0

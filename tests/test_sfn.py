@@ -2211,3 +2211,35 @@ def test_convert_params_to_api_names_nested():
         "VPCSecurityGroupIds": [{"SGId": "sg-123"}],
         "Tags": [{"Key": "env", "Value": "test"}],
     }
+
+
+# ---------------------------------------------------------------------------
+# Terraform compatibility tests
+# ---------------------------------------------------------------------------
+
+
+def test_sfn_validate_state_machine_definition(sfn):
+    """ValidateStateMachineDefinition must return OK (required by Terraform v5.42.0+)."""
+    definition = json.dumps({
+        "StartAt": "Pass",
+        "States": {"Pass": {"Type": "Succeed"}},
+    })
+    resp = sfn.validate_state_machine_definition(definition=definition)
+    assert resp["result"] == "OK"
+    assert resp["diagnostics"] == []
+
+
+def test_sfn_validate_state_machine_definition_with_type(sfn):
+    """ValidateStateMachineDefinition should accept optional type parameter."""
+    definition = json.dumps({
+        "StartAt": "Hello",
+        "States": {
+            "Hello": {"Type": "Pass", "Result": "world", "End": True},
+        },
+    })
+    resp = sfn.validate_state_machine_definition(
+        definition=definition,
+        type="STANDARD",
+    )
+    assert resp["result"] == "OK"
+    assert isinstance(resp["diagnostics"], list)

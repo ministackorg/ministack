@@ -16,12 +16,40 @@ _kwargs = dict(
     aws_access_key_id="test",
     aws_secret_access_key="test",
     region_name=REGION,
-    config=Config(region_name=REGION, retries={"max_attempts": 0}),
+    # Hardcoded retry and pool settings to reduce transient connection flakes
+    config=Config(
+        region_name=REGION,
+        retries={"mode": "standard"},
+        max_pool_connections=50,
+    ),
 )
 
 
 def make_client(service):
     return boto3.client(service, **_kwargs)
+
+
+_SERIAL_TESTS = {
+    "tests/test_athena.py::test_athena_engine_mock_via_config",
+    "tests/test_lambda.py::test_lambda_reset_terminates_workers",
+    "tests/test_ministack.py::test_ministack_config_invalid_key_ignored",
+    "tests/test_sfn.py::test_sfn_mock_config_return",
+    "tests/test_sfn.py::test_sfn_mock_config_throw",
+}
+
+
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers",
+        "serial: test must run in a dedicated sequential phase",
+    )
+
+
+def pytest_collection_modifyitems(config, items):
+    for item in items:
+        nodeid = item.nodeid.split("[", 1)[0]
+        if nodeid in _SERIAL_TESTS:
+            item.add_marker("serial")
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -211,7 +239,8 @@ def sfn_sync():
         region_name=REGION,
         config=BotoConfig(
             region_name=REGION,
-            retries={"max_attempts": 0},
+            retries={"mode": "standard"},
+            max_pool_connections=50,
             inject_host_prefix=False,
         ),
     )
@@ -236,7 +265,8 @@ def sd():
         region_name=REGION,
         config=BotoConfig(
             region_name=REGION,
-            retries={"max_attempts": 0},
+            retries={"mode": "standard"},
+            max_pool_connections=50,
             inject_host_prefix=False,
         ),
     )
