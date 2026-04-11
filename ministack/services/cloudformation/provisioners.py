@@ -33,6 +33,14 @@ import ministack.services.ec2 as _ec2
 import ministack.services.ecs as _ecs
 import ministack.services.alb as _alb
 import ministack.services.kinesis as _kinesis
+import ministack.services.stepfunctions as _sfn
+import ministack.services.route53 as _r53
+import ministack.services.apigateway as _apigw_v2
+import ministack.services.ses as _ses
+import ministack.services.waf as _waf
+import ministack.services.cloudfront as _cf
+import ministack.services.rds as _rds
+import ministack.services.autoscaling as _asg
 
 
 logger = logging.getLogger("cloudformation")
@@ -1908,6 +1916,456 @@ def _elbv2_listener_delete(physical_id, props):
         _alb._tags.pop(rule_arn, None)
 
 
+# ---------------------------------------------------------------------------
+# Lambda LayerVersion
+# ---------------------------------------------------------------------------
+
+def _lambda_layer_create(logical_id, props, stack_name):
+    layer_name = props.get("LayerName") or _physical_name(stack_name, logical_id, max_len=64)
+    runtimes = props.get("CompatibleRuntimes", [])
+    architectures = props.get("CompatibleArchitectures", [])
+
+    content = props.get("Content", {})
+    s3_bucket = content.get("S3Bucket", "")
+    s3_key = content.get("S3Key", "")
+
+    if layer_name not in _lambda_svc._layers:
+        _lambda_svc._layers[layer_name] = {"versions": [], "next_version": 1}
+    layer = _lambda_svc._layers[layer_name]
+    ver = layer["next_version"]
+    layer["next_version"] = ver + 1
+
+    import base64, hashlib
+    zip_data = None
+    if s3_bucket and s3_key:
+        zip_data = _s3._get_object_data(s3_bucket, s3_key)
+
+    layer_arn = f"arn:aws:lambda:{REGION}:{get_account_id()}:layer:{layer_name}"
+    version_arn = f"{layer_arn}:{ver}"
+
+    ver_config = {
+        "LayerArn": layer_arn,
+        "LayerVersionArn": version_arn,
+        "Version": ver,
+        "Description": props.get("Description", ""),
+        "CompatibleRuntimes": runtimes,
+        "CompatibleArchitectures": architectures,
+        "LicenseInfo": props.get("LicenseInfo", ""),
+        "CreatedDate": now_iso(),
+        "Content": {
+            "CodeSha256": (base64.b64encode(hashlib.sha256(zip_data).digest()).decode() if zip_data else ""),
+            "CodeSize": len(zip_data) if zip_data else 0,
+        },
+    }
+    layer["versions"].append(ver_config)
+    return version_arn, {"LayerVersionArn": version_arn, "Arn": version_arn}
+
+
+def _lambda_layer_delete(physical_id, props):
+    # physical_id is the version ARN like arn:aws:lambda:...:layer:name:1
+    parts = physical_id.split(":")
+    if len(parts) >= 2:
+        layer_name = parts[-2].split("layer:")[-1] if "layer:" in physical_id else ""
+        layer = _lambda_svc._layers.get(layer_name)
+        if layer:
+            layer["versions"] = [v for v in layer["versions"] if v["LayerVersionArn"] != physical_id]
+
+
+# ---------------------------------------------------------------------------
+# StepFunctions StateMachine
+# ---------------------------------------------------------------------------
+
+def _sfn_state_machine_create(logical_id, props, stack_name):
+    name = props.get("StateMachineName") or _physical_name(stack_name, logical_id, max_len=80)
+    role_arn = props.get("RoleArn", f"arn:aws:iam::{get_account_id()}:role/StepFunctionsRole")
+    definition = props.get("DefinitionString", "{}")
+    if isinstance(definition, dict):
+        import json as _json
+        definition = _json.dumps(definition)
+    sm_type = props.get("StateMachineType", "STANDARD")
+
+    arn = f"arn:aws:states:{REGION}:{get_account_id()}:stateMachine:{name}"
+    ts = now_iso()
+    _sfn._state_machines[arn] = {
+        "stateMachineArn": arn,
+        "name": name,
+        "definition": definition,
+        "roleArn": role_arn,
+        "type": sm_type,
+        "creationDate": ts,
+        "status": "ACTIVE",
+        "loggingConfiguration": props.get("LoggingConfiguration", {"level": "OFF", "includeExecutionData": False}),
+    }
+    return arn, {"Arn": arn, "Name": name}
+
+
+def _sfn_state_machine_delete(physical_id, props):
+    _sfn._state_machines.pop(physical_id, None)
+
+
+# ---------------------------------------------------------------------------
+# Route53 HostedZone
+# ---------------------------------------------------------------------------
+
+def _r53_hosted_zone_create(logical_id, props, stack_name):
+    zone_name = props.get("Name", "")
+    if not zone_name.endswith("."):
+        zone_name += "."
+
+    zone_id = _r53._zone_id()
+    caller_ref = new_uuid()
+
+    _r53._zones[zone_id] = {
+        "id": zone_id,
+        "name": zone_name,
+        "caller_reference": caller_ref,
+        "comment": (props.get("HostedZoneConfig", {}) or {}).get("Comment", ""),
+        "private": False,
+    }
+    _r53._records[zone_id] = _r53._default_records(zone_name)
+    _r53._caller_refs[caller_ref] = zone_id
+    return zone_id, {"Id": zone_id, "NameServers": ["ns-1.awsdns-01.org", "ns-2.awsdns-02.co.uk"]}
+
+
+def _r53_hosted_zone_delete(physical_id, props):
+    _r53._zones.pop(physical_id, None)
+    _r53._records.pop(physical_id, None)
+
+
+# ---------------------------------------------------------------------------
+# ApiGatewayV2 Api
+# ---------------------------------------------------------------------------
+
+def _apigw_v2_api_create(logical_id, props, stack_name):
+    api_id = new_uuid()[:8]
+    name = props.get("Name") or _physical_name(stack_name, logical_id, max_len=128)
+    protocol = props.get("ProtocolType", "HTTP")
+    api = {
+        "apiId": api_id,
+        "name": name,
+        "protocolType": protocol,
+        "apiEndpoint": f"http://{api_id}.execute-api.localhost:4566",
+        "createdDate": now_iso(),
+        "routeSelectionExpression": props.get("RouteSelectionExpression", "$request.method $request.path"),
+        "apiKeySelectionExpression": props.get("ApiKeySelectionExpression", "$request.header.x-api-key"),
+        "tags": props.get("Tags", {}),
+        "disableSchemaValidation": props.get("DisableSchemaValidation", False),
+        "disableExecuteApiEndpoint": props.get("DisableExecuteApiEndpoint", False),
+        "version": props.get("Version", ""),
+    }
+    if props.get("CorsConfiguration"):
+        api["corsConfiguration"] = props["CorsConfiguration"]
+    _apigw_v2._apis[api_id] = api
+    _apigw_v2._routes[api_id] = {}
+    _apigw_v2._integrations[api_id] = {}
+    _apigw_v2._stages[api_id] = {}
+    _apigw_v2._deployments[api_id] = {}
+    return api_id, {"ApiId": api_id, "ApiEndpoint": api["apiEndpoint"]}
+
+
+def _apigw_v2_api_delete(physical_id, props):
+    _apigw_v2._apis.pop(physical_id, None)
+    _apigw_v2._routes.pop(physical_id, None)
+    _apigw_v2._integrations.pop(physical_id, None)
+    _apigw_v2._stages.pop(physical_id, None)
+    _apigw_v2._deployments.pop(physical_id, None)
+
+
+# ---------------------------------------------------------------------------
+# ApiGatewayV2 Stage
+# ---------------------------------------------------------------------------
+
+def _apigw_v2_stage_create(logical_id, props, stack_name):
+    api_id = props.get("ApiId", "")
+    stage_name = props.get("StageName", "$default")
+    stage = {
+        "stageName": stage_name,
+        "autoDeploy": props.get("AutoDeploy", False),
+        "createdDate": now_iso(),
+        "lastUpdatedDate": now_iso(),
+        "stageVariables": props.get("StageVariables", {}),
+        "description": props.get("Description", ""),
+        "defaultRouteSettings": props.get("DefaultRouteSettings", {}),
+        "routeSettings": props.get("RouteSettings", {}),
+        "tags": props.get("Tags", {}),
+    }
+    _apigw_v2._stages.setdefault(api_id, {})[stage_name] = stage
+    physical_id = f"{api_id}/{stage_name}"
+    return physical_id, {"StageName": stage_name}
+
+
+def _apigw_v2_stage_delete(physical_id, props):
+    parts = physical_id.split("/", 1)
+    if len(parts) == 2:
+        api_id, stage_name = parts
+        stages = _apigw_v2._stages.get(api_id, {})
+        stages.pop(stage_name, None)
+
+
+# ---------------------------------------------------------------------------
+# SES EmailIdentity
+# ---------------------------------------------------------------------------
+
+def _ses_email_identity_create(logical_id, props, stack_name):
+    identity = props.get("EmailIdentity", "")
+    _ses._identities[identity] = _ses._make_identity(identity,
+        "Domain" if "@" not in identity else "EmailAddress")
+    return identity, {"EmailIdentity": identity}
+
+
+def _ses_email_identity_delete(physical_id, props):
+    _ses._identities.pop(physical_id, None)
+
+
+# ---------------------------------------------------------------------------
+# WAFv2 WebACL
+# ---------------------------------------------------------------------------
+
+def _waf_web_acl_create(logical_id, props, stack_name):
+    name = props.get("Name") or _physical_name(stack_name, logical_id, max_len=128)
+    uid = new_uuid()
+    lock_token = new_uuid()
+    scope = props.get("Scope", "REGIONAL")
+    arn = f"arn:aws:wafv2:{REGION}:{get_account_id()}:{scope.lower()}/webacl/{name}/{uid}"
+    _waf._web_acls[uid] = {
+        "ARN": arn, "Id": uid, "Name": name,
+        "Description": props.get("Description", ""),
+        "DefaultAction": props.get("DefaultAction", {"Allow": {}}),
+        "Rules": props.get("Rules", []),
+        "VisibilityConfig": props.get("VisibilityConfig", {}),
+        "Capacity": 0,
+        "LockToken": lock_token,
+        "Scope": scope,
+    }
+    return uid, {"Arn": arn, "Id": uid}
+
+
+def _waf_web_acl_delete(physical_id, props):
+    _waf._web_acls.pop(physical_id, None)
+
+
+# ---------------------------------------------------------------------------
+# CloudFront Distribution
+# ---------------------------------------------------------------------------
+
+def _cf_distribution_create(logical_id, props, stack_name):
+    dist_config = props.get("DistributionConfig", props)
+    dist_id = _cf._dist_id()
+    arn = f"arn:aws:cloudfront::{get_account_id()}:distribution/{dist_id}"
+
+    origins = dist_config.get("Origins", [])
+    default_cache = dist_config.get("DefaultCacheBehavior", {})
+
+    _cf._distributions[dist_id] = {
+        "Id": dist_id,
+        "ARN": arn,
+        "Status": "Deployed",
+        "DomainName": f"{dist_id}.cloudfront.net",
+        "LastModifiedTime": now_iso(),
+        "ETag": new_uuid(),
+        "config_xml": "",
+        "enabled": dist_config.get("Enabled", True),
+    }
+    return dist_id, {"Arn": arn, "DomainName": f"{dist_id}.cloudfront.net", "Id": dist_id}
+
+
+def _cf_distribution_delete(physical_id, props):
+    _cf._distributions.pop(physical_id, None)
+
+
+# ---------------------------------------------------------------------------
+# RDS DBCluster
+# ---------------------------------------------------------------------------
+
+def _rds_db_cluster_create(logical_id, props, stack_name):
+    cluster_id = props.get("DBClusterIdentifier") or _physical_name(stack_name, logical_id, lowercase=True, max_len=63)
+    engine = props.get("Engine", "aurora-postgresql")
+    engine_version = props.get("EngineVersion", "15.4")
+    master_user = props.get("MasterUsername", "admin")
+    arn = f"arn:aws:rds:{REGION}:{get_account_id()}:cluster:{cluster_id}"
+    suffix = new_uuid()[:8]
+
+    _rds._clusters[cluster_id] = {
+        "DBClusterIdentifier": cluster_id,
+        "DBClusterArn": arn,
+        "Engine": engine,
+        "EngineVersion": engine_version,
+        "EngineMode": props.get("EngineMode", "provisioned"),
+        "Status": "available",
+        "MasterUsername": master_user,
+        "DatabaseName": props.get("DatabaseName", ""),
+        "Endpoint": f"{cluster_id}.cluster-{suffix}.{REGION}.rds.amazonaws.com",
+        "ReaderEndpoint": f"{cluster_id}.cluster-ro-{suffix}.{REGION}.rds.amazonaws.com",
+        "Port": int(props.get("Port", 5432)),
+        "MultiAZ": props.get("MultiAZ", False),
+        "AvailabilityZones": [f"{REGION}a", f"{REGION}b", f"{REGION}c"],
+        "DBClusterMembers": [],
+        "VpcSecurityGroups": [],
+        "DBSubnetGroup": props.get("DBSubnetGroupName", "default"),
+        "StorageEncrypted": props.get("StorageEncrypted", False),
+        "DeletionProtection": props.get("DeletionProtection", False),
+        "CopyTagsToSnapshot": props.get("CopyTagsToSnapshot", False),
+        "AllocatedStorage": 1,
+        "ClusterCreateTime": now_iso(),
+        "BackupRetentionPeriod": int(props.get("BackupRetentionPeriod", 1)),
+    }
+    return cluster_id, {
+        "Arn": arn,
+        "ClusterResourceId": f"cluster-{new_uuid()[:20]}",
+        "Endpoint.Address": f"{cluster_id}.cluster-{suffix}.{REGION}.rds.amazonaws.com",
+        "Endpoint.Port": str(int(props.get("Port", 5432))),
+        "ReadEndpoint.Address": f"{cluster_id}.cluster-ro-{suffix}.{REGION}.rds.amazonaws.com",
+    }
+
+
+def _rds_db_cluster_delete(physical_id, props):
+    _rds._clusters.pop(physical_id, None)
+
+
+# ---------------------------------------------------------------------------
+# AutoScaling Group
+# ---------------------------------------------------------------------------
+
+def _asg_create(logical_id, props, stack_name):
+    name = props.get("AutoScalingGroupName") or _physical_name(stack_name, logical_id, max_len=255)
+    arn = f"arn:aws:autoscaling:{REGION}:{get_account_id()}:autoScalingGroup:{new_uuid()}:autoScalingGroupName/{name}"
+    asg = {
+        "AutoScalingGroupName": name,
+        "AutoScalingGroupARN": arn,
+        "LaunchConfigurationName": props.get("LaunchConfigurationName", ""),
+        "LaunchTemplate": {},
+        "MinSize": int(props.get("MinSize", 0)),
+        "MaxSize": int(props.get("MaxSize", 0)),
+        "DesiredCapacity": int(props.get("DesiredCapacity", props.get("MinSize", 0))),
+        "DefaultCooldown": int(props.get("Cooldown", 300)),
+        "AvailabilityZones": props.get("AvailabilityZones", [f"{REGION}a"]),
+        "HealthCheckType": props.get("HealthCheckType", "EC2"),
+        "HealthCheckGracePeriod": int(props.get("HealthCheckGracePeriod", 300)),
+        "Instances": [],
+        "CreatedTime": now_iso(),
+        "VPCZoneIdentifier": ",".join(props.get("VPCZoneIdentifier", [])) if isinstance(props.get("VPCZoneIdentifier"), list) else props.get("VPCZoneIdentifier", ""),
+        "TerminationPolicies": props.get("TerminationPolicies", ["Default"]),
+        "NewInstancesProtectedFromScaleIn": props.get("NewInstancesProtectedFromScaleIn", False),
+        "Tags": [],
+        "Status": "",
+    }
+    lt = props.get("LaunchTemplate", {})
+    if lt:
+        asg["LaunchTemplate"] = {
+            "LaunchTemplateId": lt.get("LaunchTemplateId", lt.get("LaunchTemplateName", "")),
+            "LaunchTemplateName": lt.get("LaunchTemplateName", ""),
+            "Version": lt.get("Version", "$Default"),
+        }
+    tags = []
+    for t in props.get("Tags", []):
+        tags.append({
+            "Key": t.get("Key", ""),
+            "Value": t.get("Value", ""),
+            "ResourceId": name,
+            "ResourceType": "auto-scaling-group",
+            "PropagateAtLaunch": t.get("PropagateAtLaunch", False),
+        })
+    asg["Tags"] = tags
+    _asg._asgs[name] = asg
+    _asg._tags[name] = tags
+    return name, {"Arn": arn}
+
+
+def _asg_delete(physical_id, props):
+    _asg._asgs.pop(physical_id, None)
+    _asg._tags.pop(physical_id, None)
+
+
+def _asg_lc_create(logical_id, props, stack_name):
+    name = props.get("LaunchConfigurationName") or _physical_name(stack_name, logical_id, max_len=255)
+    arn = f"arn:aws:autoscaling:{REGION}:{get_account_id()}:launchConfiguration:{new_uuid()}:launchConfigurationName/{name}"
+    _asg._launch_configs[name] = {
+        "LaunchConfigurationName": name,
+        "LaunchConfigurationARN": arn,
+        "ImageId": props.get("ImageId", "ami-00000000"),
+        "InstanceType": props.get("InstanceType", "t2.micro"),
+        "KeyName": props.get("KeyName", ""),
+        "SecurityGroups": props.get("SecurityGroups", []),
+        "UserData": props.get("UserData", ""),
+        "CreatedTime": now_iso(),
+    }
+    return name, {"Arn": arn}
+
+
+def _asg_lc_delete(physical_id, props):
+    _asg._launch_configs.pop(physical_id, None)
+
+
+def _asg_policy_create(logical_id, props, stack_name):
+    asg_name = props.get("AutoScalingGroupName", "")
+    policy_name = props.get("PolicyName") or _physical_name(stack_name, logical_id, max_len=255)
+    arn = f"arn:aws:autoscaling:{REGION}:{get_account_id()}:scalingPolicy:{new_uuid()}:autoScalingGroupName/{asg_name}:policyName/{policy_name}"
+    key = f"{asg_name}/{policy_name}"
+    _asg._policies[key] = {
+        "PolicyARN": arn,
+        "PolicyName": policy_name,
+        "AutoScalingGroupName": asg_name,
+        "PolicyType": props.get("PolicyType", "SimpleScaling"),
+        "AdjustmentType": props.get("AdjustmentType", "ChangeInCapacity"),
+        "ScalingAdjustment": int(props.get("ScalingAdjustment", 0)),
+        "Cooldown": int(props.get("Cooldown", 300)),
+    }
+    return arn, {"Arn": arn, "PolicyName": policy_name}
+
+
+def _asg_policy_delete(physical_id, props):
+    # physical_id is the ARN, find matching key
+    for k, v in list(_asg._policies.items()):
+        if v.get("PolicyARN") == physical_id:
+            _asg._policies.pop(k, None)
+            break
+
+
+def _asg_hook_create(logical_id, props, stack_name):
+    asg_name = props.get("AutoScalingGroupName", "")
+    hook_name = props.get("LifecycleHookName") or _physical_name(stack_name, logical_id, max_len=255)
+    key = f"{asg_name}/{hook_name}"
+    _asg._hooks[key] = {
+        "LifecycleHookName": hook_name,
+        "AutoScalingGroupName": asg_name,
+        "LifecycleTransition": props.get("LifecycleTransition", "autoscaling:EC2_INSTANCE_LAUNCHING"),
+        "HeartbeatTimeout": int(props.get("HeartbeatTimeout", 3600)),
+        "DefaultResult": props.get("DefaultResult", "ABANDON"),
+        "NotificationTargetARN": props.get("NotificationTargetARN", ""),
+        "RoleARN": props.get("RoleARN", ""),
+    }
+    return hook_name, {"LifecycleHookName": hook_name}
+
+
+def _asg_hook_delete(physical_id, props):
+    asg_name = props.get("AutoScalingGroupName", "")
+    _asg._hooks.pop(f"{asg_name}/{physical_id}", None)
+
+
+def _asg_scheduled_create(logical_id, props, stack_name):
+    asg_name = props.get("AutoScalingGroupName", "")
+    action_name = props.get("ScheduledActionName") or _physical_name(stack_name, logical_id, max_len=255)
+    arn = f"arn:aws:autoscaling:{REGION}:{get_account_id()}:scheduledUpdateGroupAction:{new_uuid()}:autoScalingGroupName/{asg_name}:scheduledActionName/{action_name}"
+    key = f"{asg_name}/{action_name}"
+    _asg._scheduled_actions[key] = {
+        "ScheduledActionARN": arn,
+        "ScheduledActionName": action_name,
+        "AutoScalingGroupName": asg_name,
+        "Recurrence": props.get("Recurrence", ""),
+        "MinSize": int(props.get("MinSize", -1)),
+        "MaxSize": int(props.get("MaxSize", -1)),
+        "DesiredCapacity": int(props.get("DesiredCapacity", -1)),
+    }
+    return arn, {"Arn": arn, "ScheduledActionName": action_name}
+
+
+def _asg_scheduled_delete(physical_id, props):
+    for k, v in list(_asg._scheduled_actions.items()):
+        if v.get("ScheduledActionARN") == physical_id:
+            _asg._scheduled_actions.pop(k, None)
+            break
+
+
 # Resource Handler Registry
 # ===========================================================================
 
@@ -1967,12 +2425,21 @@ _RESOURCE_HANDLERS = {
     "AWS::EC2::LaunchTemplate": {"create": _ec2_launch_template_create, "delete": _ec2_launch_template_delete},
     "AWS::ElasticLoadBalancingV2::LoadBalancer": {"create": _elbv2_load_balancer_create, "delete": _elbv2_load_balancer_delete,},
     "AWS::ElasticLoadBalancingV2::Listener": {"create": _elbv2_listener_create, "delete": _elbv2_listener_delete,},
+    "AWS::Lambda::LayerVersion": {"create": _lambda_layer_create, "delete": _lambda_layer_delete},
+    "AWS::StepFunctions::StateMachine": {"create": _sfn_state_machine_create, "delete": _sfn_state_machine_delete},
+    "AWS::Route53::HostedZone": {"create": _r53_hosted_zone_create, "delete": _r53_hosted_zone_delete},
+    "AWS::ApiGatewayV2::Api": {"create": _apigw_v2_api_create, "delete": _apigw_v2_api_delete},
+    "AWS::ApiGatewayV2::Stage": {"create": _apigw_v2_stage_create, "delete": _apigw_v2_stage_delete},
+    "AWS::SES::EmailIdentity": {"create": _ses_email_identity_create, "delete": _ses_email_identity_delete},
+    "AWS::WAFv2::WebACL": {"create": _waf_web_acl_create, "delete": _waf_web_acl_delete},
+    "AWS::CloudFront::Distribution": {"create": _cf_distribution_create, "delete": _cf_distribution_delete},
+    "AWS::RDS::DBCluster": {"create": _rds_db_cluster_create, "delete": _rds_db_cluster_delete},
     # CDK metadata — safe to ignore
     "AWS::CDK::Metadata": {"create": lambda lid, props, sn: (f"CDKMetadata-{lid}", {}), "delete": lambda pid, props: None},
-    # AutoScaling stubs — allow CDK/CFN stacks with ASGs to deploy
-    "AWS::AutoScaling::AutoScalingGroup": {"create": lambda lid, props, sn: (f"asg-{lid}", {}), "delete": lambda pid, props: None},
-    "AWS::AutoScaling::LaunchConfiguration": {"create": lambda lid, props, sn: (f"lc-{lid}", {}), "delete": lambda pid, props: None},
-    "AWS::AutoScaling::ScalingPolicy": {"create": lambda lid, props, sn: (f"sp-{lid}", {}), "delete": lambda pid, props: None},
-    "AWS::AutoScaling::LifecycleHook": {"create": lambda lid, props, sn: (f"lh-{lid}", {}), "delete": lambda pid, props: None},
-    "AWS::AutoScaling::ScheduledAction": {"create": lambda lid, props, sn: (f"sa-{lid}", {}), "delete": lambda pid, props: None},
+    # AutoScaling
+    "AWS::AutoScaling::AutoScalingGroup": {"create": _asg_create, "delete": _asg_delete},
+    "AWS::AutoScaling::LaunchConfiguration": {"create": _asg_lc_create, "delete": _asg_lc_delete},
+    "AWS::AutoScaling::ScalingPolicy": {"create": _asg_policy_create, "delete": _asg_policy_delete},
+    "AWS::AutoScaling::LifecycleHook": {"create": _asg_hook_create, "delete": _asg_hook_delete},
+    "AWS::AutoScaling::ScheduledAction": {"create": _asg_scheduled_create, "delete": _asg_scheduled_delete},
 }

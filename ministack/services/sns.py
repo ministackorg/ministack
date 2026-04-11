@@ -31,6 +31,18 @@ logger = logging.getLogger("sns")
 
 REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 
+import re as _re
+
+def _normalize_arn(arn: str) -> str:
+    """Normalize an SNS ARN that has an empty account ID.
+    Some SDKs (Go v2 with skipRequestingAccountId) construct ARNs with empty
+    account like arn:aws:sns:us-east-1::topic-name. Replace the empty account
+    with the current request's account ID so the lookup succeeds.
+    """
+    if arn and _re.match(r"arn:aws:sns:[^:]+::[^:]+", arn):
+        return _re.sub(r"(arn:aws:sns:[^:]+)::", rf"\1:{get_account_id()}:", arn)
+    return arn
+
 from ministack.core.persistence import load_state, PERSIST_STATE
 
 _topics = AccountScopedDict()
@@ -120,7 +132,7 @@ def _create_topic(params):
             "arn": arn,
             "attributes": {
                 "TopicArn": arn,
-                "DisplayName": name,
+                "DisplayName": "",
                 "Owner": get_account_id(),
                 "Policy": default_policy,
                 "SubscriptionsConfirmed": "0",
@@ -148,12 +160,20 @@ def _create_topic(params):
             _topics[arn]["attributes"][key] = val
             i += 1
 
+        # Store tags from CreateTopic
+        i = 1
+        while _p(params, f"Tag.member.{i}.Key"):
+            key = _p(params, f"Tag.member.{i}.Key")
+            val = _p(params, f"Tag.member.{i}.Value")
+            _topics[arn]["tags"][key] = val
+            i += 1
+
     return _xml(200, "CreateTopicResponse",
                 f"<CreateTopicResult><TopicArn>{arn}</TopicArn></CreateTopicResult>")
 
 
 def _delete_topic(params):
-    arn = _p(params, "TopicArn")
+    arn = _normalize_arn(_p(params, "TopicArn"))
     topic = _topics.pop(arn, None)
     if topic:
         for sub in topic.get("subscriptions", []):
@@ -182,7 +202,7 @@ def _list_topics(params):
 
 
 def _get_topic_attributes(params):
-    arn = _p(params, "TopicArn")
+    arn = _normalize_arn(_p(params, "TopicArn"))
     topic = _topics.get(arn)
     if not topic:
         return _error("NotFoundException", f"Topic does not exist: {arn}", 404)
@@ -196,7 +216,7 @@ def _get_topic_attributes(params):
 
 
 def _set_topic_attributes(params):
-    arn = _p(params, "TopicArn")
+    arn = _normalize_arn(_p(params, "TopicArn"))
     topic = _topics.get(arn)
     if not topic:
         return _error("NotFoundException", f"Topic does not exist: {arn}", 404)
@@ -212,7 +232,7 @@ def _set_topic_attributes(params):
 # ---------------------------------------------------------------------------
 
 def _subscribe(params):
-    topic_arn = _p(params, "TopicArn")
+    topic_arn = _normalize_arn(_p(params, "TopicArn"))
     protocol = _p(params, "Protocol")
     endpoint = _p(params, "Endpoint")
 
@@ -274,7 +294,7 @@ def _subscribe(params):
 
 
 def _confirm_subscription(params):
-    topic_arn = _p(params, "TopicArn")
+    topic_arn = _normalize_arn(_p(params, "TopicArn"))
     token = _p(params, "Token")
 
     topic = _topics.get(topic_arn)
@@ -340,7 +360,7 @@ def _list_subscriptions(params):
 
 
 def _list_subscriptions_by_topic(params):
-    topic_arn = _p(params, "TopicArn")
+    topic_arn = _normalize_arn(_p(params, "TopicArn"))
     topic = _topics.get(topic_arn)
     if not topic:
         return _error("NotFoundException", f"Topic does not exist: {topic_arn}", 404)
@@ -411,7 +431,7 @@ def _set_subscription_attributes(params):
 # ---------------------------------------------------------------------------
 
 def _publish(params):
-    topic_arn = _p(params, "TopicArn") or _p(params, "TargetArn")
+    topic_arn = _normalize_arn(_p(params, "TopicArn") or _p(params, "TargetArn"))
     phone_number = _p(params, "PhoneNumber")
     message = _p(params, "Message")
     subject = _p(params, "Subject")
@@ -453,7 +473,7 @@ def _publish(params):
 
 
 def _publish_batch(params):
-    topic_arn = _p(params, "TopicArn")
+    topic_arn = _normalize_arn(_p(params, "TopicArn"))
     if not topic_arn:
         return _error("InvalidParameterException", "TopicArn is required", 400)
     if topic_arn not in _topics:
@@ -674,7 +694,7 @@ async def _send_subscription_confirmation(topic_arn: str, sub: dict):
 # ---------------------------------------------------------------------------
 
 def _list_tags_for_resource(params):
-    arn = _p(params, "ResourceArn")
+    arn = _normalize_arn(_p(params, "ResourceArn"))
     topic = _topics.get(arn)
     tags_xml = ""
     if topic:
@@ -685,7 +705,7 @@ def _list_tags_for_resource(params):
 
 
 def _tag_resource(params):
-    arn = _p(params, "ResourceArn")
+    arn = _normalize_arn(_p(params, "ResourceArn"))
     topic = _topics.get(arn)
     if not topic:
         return _error("ResourceNotFoundException", "Resource not found", 404)
@@ -699,7 +719,7 @@ def _tag_resource(params):
 
 
 def _untag_resource(params):
-    arn = _p(params, "ResourceArn")
+    arn = _normalize_arn(_p(params, "ResourceArn"))
     topic = _topics.get(arn)
     if topic:
         i = 1

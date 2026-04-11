@@ -39,7 +39,7 @@ def test_sns_get_topic_attributes(sns):
     arn = sns.create_topic(Name="intg-sns-getattr")["TopicArn"]
     resp = sns.get_topic_attributes(TopicArn=arn)
     assert resp["Attributes"]["TopicArn"] == arn
-    assert resp["Attributes"]["DisplayName"] == "intg-sns-getattr"
+    assert resp["Attributes"]["DisplayName"] == ""  # AWS default is empty, not topic name
 
 def test_sns_set_topic_attributes(sns):
     arn = sns.create_topic(Name="intg-sns-setattr")["TopicArn"]

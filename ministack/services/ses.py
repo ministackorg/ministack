@@ -378,7 +378,7 @@ def _get_identity_verification_attributes(params):
 def _delete_identity(params):
     identity = _p(params, "Identity")
     _identities.pop(identity, None)
-    return _xml(200, "DeleteIdentityResponse", "")
+    return _xml(200, "DeleteIdentityResponse", "<DeleteIdentityResult/>")
 
 
 def _list_verified_emails(params):
@@ -419,7 +419,7 @@ def _set_identity_notification_topic(params):
     sns_topic = _p(params, "SnsTopic")
     if identity in _identities:
         _identities[identity]["NotificationTopics"][notification_type] = sns_topic
-    return _xml(200, "SetIdentityNotificationTopicResponse", "")
+    return _xml(200, "SetIdentityNotificationTopicResponse", "<SetIdentityNotificationTopicResult/>")
 
 
 def _set_identity_feedback_forwarding(params):
@@ -427,7 +427,7 @@ def _set_identity_feedback_forwarding(params):
     enabled = _p(params, "ForwardingEnabled").lower() == "true"
     if identity in _identities:
         _identities[identity]["FeedbackForwardingEnabled"] = enabled
-    return _xml(200, "SetIdentityFeedbackForwardingEnabledResponse", "")
+    return _xml(200, "SetIdentityFeedbackForwardingEnabledResponse", "<SetIdentityFeedbackForwardingEnabledResult/>")
 
 
 # ---------------------------------------------------------------------------

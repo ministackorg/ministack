@@ -44,6 +44,7 @@ from ministack.services import (
     acm,
     alb,
     apigateway,
+    autoscaling,
     apigateway_v1,
     appsync,
     athena,
@@ -131,6 +132,7 @@ SERVICE_HANDLERS = {
     "servicediscovery": servicediscovery.handle_request,
     "s3files": s3files.handle_request,
     "rds-data": rds_data.handle_request,
+    "autoscaling": autoscaling.handle_request,
 }
 
 SERVICE_NAME_ALIASES = {
@@ -490,7 +492,7 @@ async def app(scope, receive, send):
         _non_s3_hosts = {"s3", "s3-control", "sqs", "sns", "dynamodb", "lambda", "iam", "sts",
                          "secretsmanager", "logs", "ssm", "events", "kinesis",
                          "monitoring", "ses", "states", "ecs", "rds", "rds-data", "elasticache",
-                         "glue", "athena", "apigateway", "cloudformation"}
+                         "glue", "athena", "apigateway", "cloudformation", "autoscaling"}
         if bucket not in _non_s3_hosts:
             vhost_path = "/" + bucket + path if path != "/" else "/" + bucket + "/"
             try:

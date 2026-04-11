@@ -36,6 +36,32 @@ def test_ec2_run_describe_terminate_instances(ec2):
     term = ec2.terminate_instances(InstanceIds=[instance_id])
     assert term["TerminatingInstances"][0]["CurrentState"]["Name"] == "terminated"
 
+def test_ec2_describe_instance_status(ec2):
+    resp = ec2.run_instances(ImageId="ami-00000000", MinCount=1, MaxCount=1, InstanceType="t2.micro")
+    iid = resp["Instances"][0]["InstanceId"]
+
+    # Running instance should appear by default
+    status = ec2.describe_instance_status(InstanceIds=[iid])
+    assert len(status["InstanceStatuses"]) == 1
+    s = status["InstanceStatuses"][0]
+    assert s["InstanceId"] == iid
+    assert s["InstanceState"]["Name"] == "running"
+    assert s["SystemStatus"]["Status"] == "ok"
+    assert s["InstanceStatus"]["Status"] == "ok"
+
+    # Stopped instance should NOT appear without IncludeAllInstances
+    ec2.stop_instances(InstanceIds=[iid])
+    status2 = ec2.describe_instance_status(InstanceIds=[iid])
+    assert len(status2["InstanceStatuses"]) == 0
+
+    # With IncludeAllInstances=True it should appear
+    status3 = ec2.describe_instance_status(InstanceIds=[iid], IncludeAllInstances=True)
+    assert len(status3["InstanceStatuses"]) == 1
+    assert status3["InstanceStatuses"][0]["InstanceState"]["Name"] == "stopped"
+
+    ec2.terminate_instances(InstanceIds=[iid])
+
+
 def test_ec2_stop_start_instances(ec2):
     resp = ec2.run_instances(ImageId="ami-00000000", MinCount=1, MaxCount=1)
     iid = resp["Instances"][0]["InstanceId"]

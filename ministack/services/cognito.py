@@ -485,7 +485,6 @@ def _create_user_pool(data):
         "EmailVerificationSubject": data.get("EmailVerificationSubject", ""),
         "SmsAuthenticationMessage": data.get("SmsAuthenticationMessage", ""),
         "MfaConfiguration": data.get("MfaConfiguration", "OFF"),
-        "DeviceConfiguration": data.get("DeviceConfiguration", {}),
         "EstimatedNumberOfUsers": 0,
         "EmailConfiguration": data.get("EmailConfiguration", {}),
         "SmsConfiguration": data.get("SmsConfiguration", {}),
@@ -494,15 +493,21 @@ def _create_user_pool(data):
             "AllowAdminCreateUserOnly": False,
             "UnusedAccountValidityDays": 7,
         }),
-        "UsernameConfiguration": data.get("UsernameConfiguration", {"CaseSensitive": False}),
         "AccountRecoverySetting": data.get("AccountRecoverySetting", {}),
-        "UserPoolAddOns": data.get("UserPoolAddOns", {}),
-        "VerificationMessageTemplate": data.get("VerificationMessageTemplate", {}),
+        "DeletionProtection": data.get("DeletionProtection", "INACTIVE"),
         "Domain": None,
         "_clients": {},
         "_users": {},
         "_groups": {},
     }
+    if data.get("DeviceConfiguration"):
+        pool["DeviceConfiguration"] = data["DeviceConfiguration"]
+    if data.get("UsernameConfiguration"):
+        pool["UsernameConfiguration"] = data["UsernameConfiguration"]
+    if data.get("UserPoolAddOns"):
+        pool["UserPoolAddOns"] = data["UserPoolAddOns"]
+    if data.get("VerificationMessageTemplate"):
+        pool["VerificationMessageTemplate"] = data["VerificationMessageTemplate"]
     _user_pools[pid] = pool
     logger.info("Cognito: CreateUserPool %s (%s)", name, pid)
     return json_response({"UserPool": _pool_out(pool)})

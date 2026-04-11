@@ -381,14 +381,7 @@ def _register_task_definition(data):
             return error_response_json("ClientException",
                 f"Container definition {idx} ({cdef['name']}): image is required.", 400)
         cdef.setdefault("cpu", 0)
-        cdef.setdefault("memory", 0)
-        cdef.setdefault("memoryReservation", 0)
         cdef.setdefault("essential", True)
-        cdef.setdefault("portMappings", [])
-        cdef.setdefault("environment", [])
-        cdef.setdefault("mountPoints", [])
-        cdef.setdefault("volumesFrom", [])
-        cdef.setdefault("logConfiguration", None)
 
     rev = _task_def_latest.get(family, 0) + 1
     _task_def_latest[family] = rev

@@ -577,7 +577,9 @@ def _increase_retention(data):
     if hours is None:
         return error_response_json("ValidationException", "RetentionPeriodHours is required", 400)
     hours = int(hours)
-    if hours <= stream["RetentionPeriodHours"]:
+    if hours == stream["RetentionPeriodHours"]:
+        return json_response({})  # no-op: same value is fine
+    if hours < stream["RetentionPeriodHours"]:
         return error_response_json("ValidationException",
                                    "RetentionPeriodHours must be greater than current value", 400)
     if hours > 8760:

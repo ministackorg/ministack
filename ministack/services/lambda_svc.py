@@ -344,12 +344,10 @@ def _build_config(name: str, data: dict, code_zip: bytes | None = None) -> dict:
             layers_cfg.append(layer)
 
     env = data.get("Environment")
-    if env is None:
-        env = {"Variables": {}}
-    elif "Variables" not in env:
+    if env is not None and "Variables" not in env:
         env["Variables"] = {}
 
-    return {
+    config = {
         "FunctionName": name,
         "FunctionArn": _func_arn(name),
         "Runtime": data.get("Runtime", "" if is_image else "python3.9"),
@@ -370,7 +368,6 @@ def _build_config(name: str, data: dict, code_zip: bytes | None = None) -> dict:
         "LastUpdateStatusReasonCode": "",
         "PackageType": data.get("PackageType", "Zip"),
         "Architectures": data.get("Architectures", ["x86_64"]),
-        "Environment": env,
         "Layers": layers_cfg,
         "TracingConfig": data.get("TracingConfig", {"Mode": "PassThrough"}),
         "VpcConfig": data.get(
@@ -381,7 +378,6 @@ def _build_config(name: str, data: dict, code_zip: bytes | None = None) -> dict:
                 "VpcId": "",
             },
         ),
-        "DeadLetterConfig": data.get("DeadLetterConfig", {}),
         "KMSKeyArn": data.get("KMSKeyArn", ""),
         "RevisionId": new_uuid(),
         "EphemeralStorage": data.get("EphemeralStorage", {"Size": 512}),
@@ -397,6 +393,14 @@ def _build_config(name: str, data: dict, code_zip: bytes | None = None) -> dict:
             "RuntimeVersionArn": "",
         },
     }
+    if env is not None:
+        config["Environment"] = env
+    dlc = data.get("DeadLetterConfig")
+    if dlc and dlc.get("TargetArn"):
+        config["DeadLetterConfig"] = dlc
+    return config
+
+
 
 
 def _qp_first(query_params: dict, key: str, default: str = "") -> str:
@@ -2556,7 +2560,7 @@ def _delete_provisioned_concurrency(func_name: str, qualifier: str):
 
 def _esm_response(esm: dict) -> dict:
     """Return ESM dict without internal-only fields."""
-    return {k: v for k, v in esm.items() if k != "FunctionName"}
+    return {k: v for k, v in esm.items() if k not in ("FunctionName", "Enabled")}
 
 
 def _create_esm(data: dict):
@@ -2564,18 +2568,21 @@ def _create_esm(data: dict):
     func_name = _resolve_name(data.get("FunctionName", ""))
     event_source_arn = data.get("EventSourceArn", "")
 
+    enabled = data.get("Enabled", True)
+    if isinstance(enabled, str):
+        enabled = enabled.lower() != "false"
     esm = {
         "UUID": esm_id,
         "EventSourceArn": event_source_arn,
         "FunctionArn": _func_arn(func_name),
         "FunctionName": func_name,
-        "State": "Enabled",
+        "State": "Enabled" if enabled else "Disabled",
         "StateTransitionReason": "USER_INITIATED",
         "BatchSize": data.get("BatchSize", 10),
         "MaximumBatchingWindowInSeconds": data.get("MaximumBatchingWindowInSeconds", 0),
         "LastModified": time.time(),
         "LastProcessingResult": "No records processed",
-        "Enabled": True,
+        "Enabled": enabled,
         "FunctionResponseTypes": data.get("FunctionResponseTypes", []),
     }
     if ":sqs:" not in event_source_arn:
@@ -2955,10 +2962,12 @@ def _create_function_url_config(func_name: str, data: dict, qualifier: str | Non
         "FunctionUrl": f"https://{new_uuid()}.lambda-url.{REGION}.on.aws/",
         "FunctionArn": _func_arn(func_name),
         "AuthType": data.get("AuthType", "NONE"),
-        "Cors": data.get("Cors", {}),
+        "InvokeMode": data.get("InvokeMode", "BUFFERED"),
         "CreationTime": _now_iso(),
         "LastModifiedTime": _now_iso(),
     }
+    if data.get("Cors"):
+        cfg["Cors"] = data["Cors"]
     _function_urls[key] = cfg
     return json_response(cfg, status=201)
 

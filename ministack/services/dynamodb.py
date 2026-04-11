@@ -264,6 +264,8 @@ def _create_table(data):
         "StreamSpecification": data.get("StreamSpecification"),
         "SSEDescription": data.get("SSESpecification"),
     }
+    if data.get("Tags"):
+        _tags[_tables[name]["TableArn"]] = data["Tags"]
     return json_response({"TableDescription": _table_description(name)})
 
 

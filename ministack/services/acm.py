@@ -41,6 +41,16 @@ def _future_iso(seconds):
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + seconds))
 
 
+def _epoch(iso_or_epoch):
+    """Convert ISO timestamp to epoch float if needed. ACM API returns epoch floats."""
+    if isinstance(iso_or_epoch, (int, float)):
+        return float(iso_or_epoch)
+    try:
+        return time.mktime(time.strptime(iso_or_epoch, "%Y-%m-%dT%H:%M:%SZ")) - time.timezone
+    except (ValueError, TypeError):
+        return time.time()
+
+
 def _cert_arn():
     return f"arn:aws:acm:{REGION}:{get_account_id()}:certificate/{new_uuid()}"
 
@@ -68,10 +78,10 @@ def _cert_shape(cert):
         "KeyAlgorithm": "RSA_2048",
         "SignatureAlgorithm": "SHA256WITHRSA",
         "InUseBy": cert.get("InUseBy", []),
-        "CreatedAt": cert["CreatedAt"],
-        "IssuedAt": cert.get("IssuedAt", cert["CreatedAt"]),
-        "NotBefore": cert.get("NotBefore", cert["CreatedAt"]),
-        "NotAfter": cert.get("NotAfter", _future_iso(365 * 24 * 3600)),
+        "CreatedAt": _epoch(cert["CreatedAt"]),
+        "IssuedAt": _epoch(cert.get("IssuedAt", cert["CreatedAt"])),
+        "NotBefore": _epoch(cert.get("NotBefore", cert["CreatedAt"])),
+        "NotAfter": _epoch(cert.get("NotAfter", _future_iso(365 * 24 * 3600))),
         "DomainValidationOptions": cert.get("DomainValidationOptions", []),
         "Options": cert.get("Options", {}),
         "Tags": cert.get("Tags", []),

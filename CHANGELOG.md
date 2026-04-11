@@ -11,6 +11,37 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [1.2.0] — 2026-04-11
+
+### Added
+- **AutoScaling service** — new full service with 22 API operations: CreateAutoScalingGroup, DescribeAutoScalingGroups, UpdateAutoScalingGroup, DeleteAutoScalingGroup, CreateLaunchConfiguration, DescribeLaunchConfigurations, DeleteLaunchConfiguration, PutScalingPolicy, DescribePolicies, DeletePolicy, PutLifecycleHook, DescribeLifecycleHooks, DeleteLifecycleHook, CompleteLifecycleAction, RecordLifecycleActionHeartbeat, PutScheduledUpdateGroupAction, DescribeScheduledActions, DeleteScheduledAction, CreateOrUpdateTags, DescribeTags, DeleteTags, DescribeAutoScalingInstances.
+- **9 new CloudFormation provisioners** — `AWS::Lambda::LayerVersion`, `AWS::StepFunctions::StateMachine`, `AWS::Route53::HostedZone`, `AWS::ApiGatewayV2::Api`, `AWS::ApiGatewayV2::Stage`, `AWS::SES::EmailIdentity`, `AWS::WAFv2::WebACL`, `AWS::CloudFront::Distribution`, `AWS::RDS::DBCluster`. All 9 support create, delete, and Fn::GetAtt. Total provisioners: 66 (was 57).
+- **5 AutoScaling CFN provisioners upgraded** — `AWS::AutoScaling::AutoScalingGroup`, `LaunchConfiguration`, `ScalingPolicy`, `LifecycleHook`, `ScheduledAction` now store real data (were stubs).
+- **EC2 `DescribeInstanceStatus`** — new operation with `IncludeAllInstances` support. Returns instance state, system status, and instance status.
+- **EC2 `DescribeVpcClassicLink` / `DescribeVpcClassicLinkDnsSupport`** — stubs returning empty sets. Unblocks all VPC-dependent Terraform resources (subnet, security group, instance, ALB, NLB, EFS).
+
+### Fixed
+- **Kinesis `IncreaseStreamRetentionPeriod` rejects same value** — setting retention to 24h (the default) failed with "must be greater than current value". Now accepts same-value as no-op. Blocked `aws_kinesis_stream` in Terraform and Pulumi.
+- **ACM `DescribeCertificate` timestamps as ISO strings** — Terraform Go SDK expects epoch floats. `CreatedAt`, `IssuedAt`, `NotBefore`, `NotAfter` now return epoch numbers. Blocked `aws_acm_certificate` in Terraform.
+- **Lambda ESM `Enabled` field ignored** — creating an ESM with `Enabled: false` always returned `State: Enabled`. Now respects the request parameter.
+- **Lambda ESM `Enabled` field in response** — real AWS does not include `Enabled` in ESM responses, only `State`. Extra field caused Terraform drift.
+- **ECS TaskDefinition extra container fields** — `container_definitions` included `environment=[], mountPoints=[], volumesFrom=[], memoryReservation=0` when not specified. Caused Terraform replacement on every apply.
+- **DynamoDB `CreateTable` ignores `Tags`** — tags passed in `CreateTable` were not stored. `ListTagsOfResource` returned empty. Terraform re-applied tags every plan.
+- **SNS `CreateTopic` ignores `Tags`** — same as DynamoDB. Tags now stored on create.
+- **SNS `DisplayName` defaults to topic name** — real AWS defaults to empty string. Caused Terraform drift.
+- **SSM `PutParameter` ignores `Tags`** — tags now stored on create.
+- **Lambda empty `Environment` block returned** — when no env vars set, response included `Environment: {Variables: {}}`. Terraform tried to remove it every plan. Now omitted when not set.
+- **Lambda `DeadLetterConfig` empty object returned** — when not configured, response included `DeadLetterConfig: {}`. Now omitted when not set.
+- **Lambda Function URL missing `InvokeMode`** — response lacked `InvokeMode` field. Terraform wanted to set "BUFFERED" every plan. Now defaults to "BUFFERED".
+- **Lambda Function URL empty `Cors` block** — `cors: {}` returned when not configured. Now omitted.
+- **API Gateway v2 empty `corsConfiguration`** — returned `{}` when not set. Caused Terraform/Pulumi drift.
+- **API Gateway v2 missing `apiKeySelectionExpression`** — now defaults to `$request.header.x-api-key`.
+- **Cognito UserPool extra empty blocks** — `DeviceConfiguration`, `UserPoolAddOns`, `UsernameConfiguration`, `VerificationMessageTemplate` returned when not set. Now only included when explicitly provided. Added missing `DeletionProtection` field.
+- **SNS `GetTopicAttributes` 404 with empty account ARN** — SDKs that skip `GetCallerIdentity` (Pulumi with `skipRequestingAccountId`) construct ARNs with empty account ID (`arn:aws:sns:us-east-1::name`). All SNS operations now normalize these to the default account.
+- **SES `DeleteIdentity` malformed XML response** — response lacked `<DeleteIdentityResult/>` element. Go SDK deserialization failed. Also fixed `SetIdentityNotificationTopic` and `SetIdentityFeedbackForwardingEnabled`.
+
+---
+
 ## [1.1.62] — 2026-04-10
 
 ### Added

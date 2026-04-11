@@ -181,6 +181,10 @@ SERVICE_PATTERNS = {
         "host_patterns": [r"rds-data\."],
         "credential_scope": "rds-data",
     },
+    "autoscaling": {
+        "host_patterns": [r"autoscaling\."],
+        "credential_scope": "autoscaling",
+    },
 }
 
 
@@ -236,6 +240,7 @@ def detect_service(method: str, path: str, headers: dict, query_params: dict) ->
                 "servicediscovery": "servicediscovery",
                 "s3files": "s3files",
                 "rds-data": "rds-data",
+                "autoscaling": "autoscaling",
             }
             if svc_name in scope_map:
                 return scope_map[svc_name]
@@ -429,6 +434,18 @@ def detect_service(method: str, path: str, headers: dict, query_params: dict) ->
             # name. These are routed via credential scope or host header instead.
             "CopySnapshot": "ec2", "ModifySnapshotAttribute": "ec2",
             "DescribeSnapshotAttribute": "ec2",
+            # AutoScaling actions
+            "CreateAutoScalingGroup": "autoscaling", "DescribeAutoScalingGroups": "autoscaling",
+            "UpdateAutoScalingGroup": "autoscaling", "DeleteAutoScalingGroup": "autoscaling",
+            "CreateLaunchConfiguration": "autoscaling", "DescribeLaunchConfigurations": "autoscaling",
+            "DeleteLaunchConfiguration": "autoscaling",
+            "PutScalingPolicy": "autoscaling", "DescribePolicies": "autoscaling",
+            "DeletePolicy": "autoscaling",
+            "PutLifecycleHook": "autoscaling", "DescribeLifecycleHooks": "autoscaling",
+            "DeleteLifecycleHook": "autoscaling",
+            "PutScheduledUpdateGroupAction": "autoscaling", "DescribeScheduledActions": "autoscaling",
+            "DeleteScheduledAction": "autoscaling",
+            "DescribeAutoScalingInstances": "autoscaling",
         }
         if action in action_service_map:
             return action_service_map[action]

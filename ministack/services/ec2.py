@@ -4,7 +4,7 @@ Query API (Action=...) — instances exist in memory only, no real VMs launched.
 
 Supports:
   Instances:       RunInstances, TerminateInstances, DescribeInstances,
-                   StartInstances, StopInstances, RebootInstances
+                   DescribeInstanceStatus, StartInstances, StopInstances, RebootInstances
   Images:          DescribeImages (stub — returns common AMI IDs)
   Security Groups: CreateSecurityGroup, DeleteSecurityGroup, DescribeSecurityGroups,
                    AuthorizeSecurityGroupIngress, RevokeSecurityGroupIngress,
@@ -353,6 +353,43 @@ def _describe_instances(p):
         for inst in results
     )
     return _xml(200, "DescribeInstancesResponse", f"<reservationSet>{items}</reservationSet>")
+
+
+def _describe_instance_status(p):
+    filter_ids = _parse_member_list(p, "InstanceId")
+    raw = p.get("IncludeAllInstances", "false")
+    if isinstance(raw, list):
+        raw = raw[0] if raw else "false"
+    include_all = raw.lower() == "true"
+
+    results = []
+    for iid, inst in _instances.items():
+        if filter_ids and iid not in filter_ids:
+            continue
+        state = inst["State"]["Name"]
+        if not include_all and state != "running":
+            continue
+        az = inst.get("Placement", {}).get("AvailabilityZone", "us-east-1a")
+        results.append(f"""<item>
+            <instanceId>{iid}</instanceId>
+            <availabilityZone>{az}</availabilityZone>
+            <instanceState>
+                <code>{inst['State']['Code']}</code>
+                <name>{state}</name>
+            </instanceState>
+            <systemStatus>
+                <status>ok</status>
+                <details><item><name>reachability</name><status>passed</status></item></details>
+            </systemStatus>
+            <instanceStatus>
+                <status>ok</status>
+                <details><item><name>reachability</name><status>passed</status></item></details>
+            </instanceStatus>
+        </item>""")
+
+    items = "".join(results)
+    return _xml(200, "DescribeInstanceStatusResponse",
+                f"<instanceStatusSet>{items}</instanceStatusSet>")
 
 
 def _terminate_instances(p):
@@ -823,6 +860,16 @@ def _describe_vpc_attribute(p):
         return _xml(200, "DescribeVpcAttributeResponse",
                     f"<vpcId>{vpc_id}</vpcId><enableNetworkAddressUsageMetrics><value>false</value></enableNetworkAddressUsageMetrics>")
     return _xml(200, "DescribeVpcAttributeResponse", f"<vpcId>{vpc_id}</vpcId>")
+
+
+def _describe_vpc_classic_link(p):
+    """Stub — ClassicLink is deprecated, return empty set."""
+    return _xml(200, "DescribeVpcClassicLinkResponse", "<vpcSet/>")
+
+
+def _describe_vpc_classic_link_dns_support(p):
+    """Stub — ClassicLink DNS support, return empty set."""
+    return _xml(200, "DescribeVpcClassicLinkDnsSupportResponse", "<vpcs/>")
 
 
 def _modify_subnet_attribute(p):
@@ -3596,6 +3643,7 @@ def _delete_launch_template(p):
 _ACTION_MAP = {
     "RunInstances": _run_instances,
     "DescribeInstances": _describe_instances,
+    "DescribeInstanceStatus": _describe_instance_status,
     "DescribeInstanceAttribute": _describe_instance_attribute,
     "DescribeInstanceCreditSpecifications": _describe_instance_credit_specifications,
     "DescribeInstanceMaintenanceOptions": _describe_instance_maintenance_options,
@@ -3643,6 +3691,8 @@ _ACTION_MAP = {
     "DescribeTags": _describe_tags,
     "ModifyVpcAttribute": _modify_vpc_attribute,
     "DescribeVpcAttribute": _describe_vpc_attribute,
+    "DescribeVpcClassicLink": _describe_vpc_classic_link,
+    "DescribeVpcClassicLinkDnsSupport": _describe_vpc_classic_link_dns_support,
     "DescribeAddressesAttribute": _describe_addresses_attribute,
     "DescribeSecurityGroupRules": _describe_security_group_rules,
     "ModifySubnetAttribute": _modify_subnet_attribute,

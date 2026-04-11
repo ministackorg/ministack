@@ -435,12 +435,14 @@ def _create_api(data):
         "apiEndpoint": f"http://{api_id}.execute-api.{_HOST}:{_PORT}",
         "createdDate": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "routeSelectionExpression": data.get("routeSelectionExpression", "$request.method $request.path"),
+        "apiKeySelectionExpression": data.get("apiKeySelectionExpression", "$request.header.x-api-key"),
         "tags": data.get("tags", {}),
-        "corsConfiguration": data.get("corsConfiguration", {}),
         "disableSchemaValidation": data.get("disableSchemaValidation", False),
         "disableExecuteApiEndpoint": data.get("disableExecuteApiEndpoint", False),
         "version": data.get("version", ""),
     }
+    if data.get("corsConfiguration"):
+        api["corsConfiguration"] = data["corsConfiguration"]
     _apis[api_id] = api
     _routes[api_id] = {}
     _integrations[api_id] = {}
