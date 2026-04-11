@@ -166,7 +166,7 @@ def _put_parameter(data):
     _parameter_history[name].append(history_entry)
 
     if data.get("Tags"):
-        _tags[arn] = data["Tags"]
+        _tags[arn] = {t["Key"]: t["Value"] for t in data["Tags"]}
 
     logger.info("SSM PutParameter: %s v%s type=%s", name, version, param_type)
     return json_response({"Version": version, "Tier": record["Tier"]})
