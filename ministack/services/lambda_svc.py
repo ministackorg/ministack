@@ -1674,6 +1674,20 @@ def _execute_function_local(func: dict, event: dict) -> dict:
                         lzf.extractall(layer_dir)
                     layers_dirs.append(layer_dir)
 
+            # Symlink layer node_modules packages into the code directory so that
+            # Node.js ESM import() can resolve them via ancestor-tree lookup.
+            if layers_dirs and is_node:
+                code_nm = os.path.join(code_dir, "node_modules")
+                os.makedirs(code_nm, exist_ok=True)
+                for ld in layers_dirs:
+                    layer_nm = os.path.join(ld, "nodejs", "node_modules")
+                    if os.path.isdir(layer_nm):
+                        for pkg in os.listdir(layer_nm):
+                            src = os.path.join(layer_nm, pkg)
+                            dst = os.path.join(code_nm, pkg)
+                            if not os.path.exists(dst):
+                                os.symlink(src, dst)
+
             if "." not in handler:
                 return {"body": {"errorMessage": f"Invalid handler format: {handler}", "errorType": "Runtime.InvalidEntrypoint"}, "error": True}
             module_name, func_name = handler.rsplit(".", 1)

@@ -385,6 +385,22 @@ class Worker:
                 logger.error("Unexpected error resolving layer %s: %s", layer_arn, e)
                 raise RuntimeError(f"Failed to resolve layer {layer_arn}") from e
 
+        # Symlink layer node_modules packages into the code directory so that
+        # Node.js ESM import() can resolve them via ancestor-tree lookup.
+        # ESM does not use NODE_PATH, so packages must be physically reachable
+        # from the handler file's directory tree.
+        if layers_dirs and runtime.startswith("nodejs"):
+            code_nm = os.path.join(code_dir, "node_modules")
+            os.makedirs(code_nm, exist_ok=True)
+            for ld in layers_dirs:
+                layer_nm = os.path.join(ld, "nodejs", "node_modules")
+                if os.path.isdir(layer_nm):
+                    for pkg in os.listdir(layer_nm):
+                        src = os.path.join(layer_nm, pkg)
+                        dst = os.path.join(code_nm, pkg)
+                        if not os.path.exists(dst):
+                            os.symlink(src, dst)
+
         handler = self.config.get("Handler", "index.handler")
         module_name, handler_name = handler.rsplit(".", 1)
         env_vars = self.config.get("Environment", {}).get("Variables", {})
@@ -399,8 +415,9 @@ class Worker:
         # is handled via NODE_PATH populated from each layer's nodejs paths below.
         if layers_dirs:
             spawn_env["_LAMBDA_LAYERS_DIRS"] = os.pathsep.join(layers_dirs)
-            # NODE_PATH is needed for Node.js workers, including ESM import() which
-            # ignores module.paths. Prepend to any existing NODE_PATH.
+            # NODE_PATH is used by the CJS require() resolver in Node.js workers.
+            # ESM import() does not use NODE_PATH — layer packages are instead
+            # symlinked into code/node_modules/ above for ancestor-tree resolution.
             node_paths = []
             for ld in layers_dirs:
                 nm = os.path.join(ld, "nodejs", "node_modules")
