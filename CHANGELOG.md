@@ -7,15 +7,18 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [1.2.2] — 2026-04-11
+
+### Fixed
+- **SSM `ListTagsForResource` crash** — `PutParameter` stored tags as a list but `ListTagsForResource` expected a dict, causing `AttributeError: 'list' object has no attribute 'items'`. Blocked all Terraform/OpenTofu deployments creating SSM parameters. Reported by @bognari (#248)
+
+---
+
 ## [1.2.1] — 2026-04-11
 
 ### Added
 - **Dynamic RDS storage** — new `RDS_PERSIST=1` env var switches database containers from fixed-size tmpfs to Docker named volumes for auto-growing persistent storage. Default (`RDS_PERSIST=0`) remains ephemeral tmpfs for CI/CD. Reported by @macario1983 (#248).
 - **Dual Docker Hub publishing** — Docker images now publish to both `nahuelnucera/ministack` and `ministackorg/ministack` on tag push.
-
----
-
-## [Unreleased]
 
 ---
 
