@@ -131,6 +131,21 @@ def test_ssm_tags_v2(ssm):
     assert "team" not in tag_map2
     assert tag_map2["env"] == "staging"
 
+
+def test_ssm_list_tags_handles_put_parameter_tag_format(ssm):
+    ssm.put_parameter(
+        Name="/ssm2/tag/from-put",
+        Value="v",
+        Type="String",
+        Tags=[{"Key": "env", "Value": "test"}, {"Key": "service", "Value": "api"}],
+    )
+
+    resp = ssm.list_tags_for_resource(
+        ResourceType="Parameter", ResourceId="/ssm2/tag/from-put"
+    )
+    tag_map = {t["Key"]: t["Value"] for t in resp["TagList"]}
+    assert tag_map == {"env": "test", "service": "api"}
+
 def test_ssm_label_parameter_version(ssm):
     import uuid as _uuid
 

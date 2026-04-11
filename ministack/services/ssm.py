@@ -483,8 +483,16 @@ def _list_tags_for_resource(data):
     else:
         arn = resource_id
 
-    tag_dict = _tags.get(arn, {})
-    tag_list = [{"Key": k, "Value": v} for k, v in tag_dict.items()]
+    tags = _tags.get(arn, {})
+
+    if isinstance(tags, list):
+        tag_list = [
+            {"Key": t.get("Key"), "Value": t.get("Value")}
+            for t in tags
+            if isinstance(t, dict) and "Key" in t and "Value" in t
+        ]
+    else:
+        tag_list = [{"Key": k, "Value": v} for k, v in tags.items()]
 
     return json_response({"TagList": tag_list})
 
