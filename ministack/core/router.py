@@ -162,6 +162,11 @@ SERVICE_PATTERNS = {
         "host_patterns": [r"cloudfront\."],
         "credential_scope": "cloudfront",
     },
+    "codebuild": {
+        "target_prefixes": ["CodeBuild_20161006"],
+        "host_patterns": [r"codebuild\."],
+        "credential_scope": "codebuild",
+    },
     "appsync": {
         "host_patterns": [r"appsync\."],
         "path_prefixes": ["/v1/apis", "/v1/tags"],
@@ -236,6 +241,7 @@ def detect_service(method: str, path: str, headers: dict, query_params: dict) ->
                 "cloudformation": "cloudformation",
                 "kms": "kms",
                 "cloudfront": "cloudfront",
+                "codebuild": "codebuild",
                 "appsync": "appsync",
                 "servicediscovery": "servicediscovery",
                 "s3files": "s3files",

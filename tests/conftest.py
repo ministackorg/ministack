@@ -270,3 +270,7 @@ def sd():
             inject_host_prefix=False,
         ),
     )
+
+@pytest.fixture(scope="session")
+def codebuild():
+    return make_client("codebuild")

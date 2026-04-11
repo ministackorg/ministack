@@ -1193,12 +1193,34 @@ def test_cfn_cloudwatch_alarm_lifecycle(cfn, cw):
                     "Threshold": 80.0,
                     "ComparisonOperator": "GreaterThanThreshold",
                     "TreatMissingData": "notBreaching",
+def test_cfn_route53_hosted_zone_and_record_set(cfn, r53):
+    """CloudFormation provisions Route53 HostedZone + RecordSet and removes records on delete."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-r53rs-{uid}"
+    zone_name = f"cfnrs{uid}.com."
+    record_name = f"www.cfnrs{uid}.com"
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "Zone": {
+                "Type": "AWS::Route53::HostedZone",
+                "Properties": {"Name": zone_name},
+            },
+            "WebA": {
+                "Type": "AWS::Route53::RecordSet",
+                "Properties": {
+                    "HostedZoneId": {"Ref": "Zone"},
+                    "Name": record_name,
+                    "Type": "A",
+                    "TTL": 300,
+                    "ResourceRecords": [{"Value": "198.51.100.10"}],
                 },
             },
         },
         "Outputs": {
             "AlarmNameOut": {"Value": {"Ref": "CpuAlarm"}},
             "AlarmArnOut": {"Value": {"Fn::GetAtt": ["CpuAlarm", "Arn"]}},
+            "RecordFqdn": {"Value": {"Ref": "WebA"}},
         },
     }
     cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(template))
@@ -1220,6 +1242,22 @@ def test_cfn_cloudwatch_alarm_lifecycle(cfn, cw):
     _wait_stack(cfn, stack_name)
     resp2 = cw.describe_alarms(AlarmNames=[alarm_name])
     assert resp2["MetricAlarms"] == []
+    assert outputs["RecordFqdn"].endswith(".")
+
+    resources = {r["LogicalResourceId"]: r for r in cfn.describe_stack_resources(StackName=stack_name)["StackResources"]}
+    zone_id = resources["Zone"]["PhysicalResourceId"]
+
+    rrs = r53.list_resource_record_sets(HostedZoneId=zone_id)["ResourceRecordSets"]
+    a_rrs = [r for r in rrs if r["Type"] == "A" and "cfnrs" in r["Name"]]
+    assert len(a_rrs) == 1
+    assert a_rrs[0]["ResourceRecords"][0]["Value"] == "198.51.100.10"
+
+    cfn.delete_stack(StackName=stack_name)
+    _wait_stack(cfn, stack_name)
+
+    with pytest.raises(ClientError) as exc:
+        r53.get_hosted_zone(Id=zone_id)
+    assert exc.value.response["Error"]["Code"] == "NoSuchHostedZone"
 
 
 def test_cfn_ssm_parameter_timestamp_is_epoch(cfn, ssm):

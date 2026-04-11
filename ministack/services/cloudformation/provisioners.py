@@ -2033,6 +2033,116 @@ def _r53_hosted_zone_delete(physical_id, props):
     _r53._records.pop(physical_id, None)
 
 
+def _r53_normalize_hosted_zone_id(zone_ref: str) -> str:
+    if not zone_ref:
+        return ""
+    z = str(zone_ref).strip()
+    if z.startswith("/hostedzone/"):
+        z = z[len("/hostedzone/"):]
+    return z
+
+
+def _r53_record_set_build_rs(props: dict) -> dict:
+    name = _r53._normalise_name(str(props.get("Name", "") or ""))
+    rtype = str(props.get("Type", "") or "").upper()
+    if not name or not rtype:
+        raise ValueError("CloudFormation properties 'Name' and 'Type' are required for AWS::Route53::RecordSet")
+    rs: dict = {"Name": name, "Type": rtype}
+    if props.get("SetIdentifier") not in (None, ""):
+        rs["SetIdentifier"] = str(props["SetIdentifier"])
+    if props.get("Weight") not in (None, ""):
+        rs["Weight"] = int(props["Weight"])
+    if props.get("Region"):
+        rs["Region"] = str(props["Region"])
+    if props.get("Failover"):
+        rs["Failover"] = str(props["Failover"])
+    if props.get("HealthCheckId"):
+        rs["HealthCheckId"] = str(props["HealthCheckId"])
+    if props.get("MultiValueAnswer") is not None:
+        mv = props["MultiValueAnswer"]
+        if isinstance(mv, str):
+            rs["MultiValueAnswer"] = mv.lower() == "true"
+        else:
+            rs["MultiValueAnswer"] = bool(mv)
+    geo = props.get("GeoLocation")
+    if isinstance(geo, dict) and geo:
+        rs["GeoLocation"] = {k: v for k, v in geo.items() if v not in (None, "", False)}
+    crc = props.get("CidrRoutingConfig")
+    if isinstance(crc, dict) and crc:
+        rs["CidrRoutingConfig"] = crc
+    ttl = props.get("TTL")
+    if ttl not in (None, ""):
+        rs["TTL"] = str(ttl)
+    if props.get("ResourceRecords"):
+        vals = []
+        for rr in props["ResourceRecords"]:
+            if isinstance(rr, dict):
+                vals.append(str(rr.get("Value", "")))
+            else:
+                vals.append(str(rr))
+        rs["ResourceRecords"] = vals
+    at = props.get("AliasTarget")
+    if isinstance(at, dict) and at:
+        dns_name = str(at.get("DNSName", "") or "")
+        if dns_name and not dns_name.endswith("."):
+            dns_name += "."
+        ev = at.get("EvaluateTargetHealth", False)
+        if isinstance(ev, str):
+            ev = ev.lower() == "true"
+        rs["AliasTarget"] = {
+            "HostedZoneId": str(at.get("HostedZoneId", "") or ""),
+            "DNSName": dns_name,
+            "EvaluateTargetHealth": bool(ev),
+        }
+    return rs
+
+
+def _r53_resolve_hosted_zone_id(props: dict) -> str:
+    hz_id = props.get("HostedZoneId")
+    if hz_id not in (None, ""):
+        return _r53_normalize_hosted_zone_id(str(hz_id))
+    hz_name = props.get("HostedZoneName")
+    if hz_name not in (None, ""):
+        want = _r53._normalise_name(str(hz_name))
+        with _r53._lock:
+            for z in _r53._zones.values():
+                if z["name"] == want:
+                    return z["id"]
+    raise ValueError("HostedZoneId or HostedZoneName is required for AWS::Route53::RecordSet")
+
+
+def _r53_record_set_create(logical_id, props, stack_name):
+    zone_id = _r53_resolve_hosted_zone_id(props)
+    with _r53._lock:
+        if zone_id not in _r53._zones:
+            raise ValueError(f"No hosted zone with id '{zone_id}'")
+    rs = _r53_record_set_build_rs(props)
+    key = _r53._rs_key(rs)
+    with _r53._lock:
+        current = list(_r53._records.get(zone_id, []))
+        if any(_r53._rs_key(r) == key for r in current):
+            raise ValueError(
+                f"Route 53 record already exists: {rs['Name']} type {rs['Type']} "
+                f"set={rs.get('SetIdentifier', '')!r}"
+            )
+        current.append(rs)
+        _r53._records[zone_id] = current
+    fqdn = rs["Name"]
+    return fqdn, {"Name": fqdn}
+
+
+def _r53_record_set_delete(physical_id, props):
+    zone_id = _r53_resolve_hosted_zone_id(props)
+    rs = _r53_record_set_build_rs(props)
+    key = _r53._rs_key(rs)
+    with _r53._lock:
+        if zone_id not in _r53._records:
+            return
+        _r53._records[zone_id] = [
+            r for r in _r53._records[zone_id] if _r53._rs_key(r) != key
+        ]
+
+
 # ---------------------------------------------------------------------------
 # CloudWatch Alarm (standard metric alarms)
 # ---------------------------------------------------------------------------
@@ -2519,6 +2629,7 @@ _RESOURCE_HANDLERS = {
     "AWS::Lambda::LayerVersion": {"create": _lambda_layer_create, "delete": _lambda_layer_delete},
     "AWS::StepFunctions::StateMachine": {"create": _sfn_state_machine_create, "delete": _sfn_state_machine_delete},
     "AWS::Route53::HostedZone": {"create": _r53_hosted_zone_create, "delete": _r53_hosted_zone_delete},
+    "AWS::Route53::RecordSet": {"create": _r53_record_set_create, "delete": _r53_record_set_delete},
     "AWS::ApiGatewayV2::Api": {"create": _apigw_v2_api_create, "delete": _apigw_v2_api_delete},
     "AWS::ApiGatewayV2::Stage": {"create": _apigw_v2_stage_create, "delete": _apigw_v2_stage_delete},
     "AWS::SES::EmailIdentity": {"create": _ses_email_identity_create, "delete": _ses_email_identity_delete},

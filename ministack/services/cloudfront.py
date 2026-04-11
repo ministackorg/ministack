@@ -7,6 +7,10 @@ Supports:
   Distributions: CreateDistribution, GetDistribution, GetDistributionConfig,
                  ListDistributions, UpdateDistribution, DeleteDistribution
   Invalidations: CreateInvalidation, ListInvalidations, GetInvalidation
+  Origin Access Control (OAC): CreateOriginAccessControl, GetOriginAccessControl,
+                 GetOriginAccessControlConfig, ListOriginAccessControls,
+                 UpdateOriginAccessControl, DeleteOriginAccessControl
+  Tags: TagResource, UntagResource, ListTagsForResource
 """
 
 import copy
@@ -16,8 +20,9 @@ import random
 import re
 import string
 from datetime import datetime, timezone
-from defusedxml.ElementTree import fromstring
 from xml.etree.ElementTree import Element, SubElement, tostring
+
+from defusedxml.ElementTree import fromstring
 
 from ministack.core.persistence import PERSIST_STATE, load_state
 from ministack.core.responses import AccountScopedDict, get_account_id, new_uuid
@@ -36,18 +41,25 @@ _INV_RE      = re.compile(r"^/2020-05-31/distribution/([^/]+)/invalidation/?$")
 _INV_ID_RE   = re.compile(r"^/2020-05-31/distribution/([^/]+)/invalidation/([^/]+)$")
 _TAG_RE      = re.compile(r"^/2020-05-31/tagging/?$")
 
+# OAC path regexes — note: _OAC_CFG_RE must be matched before _OAC_ID_RE
+_OAC_RE      = re.compile(r"^/2020-05-31/origin-access-control/?$")
+_OAC_CFG_RE  = re.compile(r"^/2020-05-31/origin-access-control/([^/]+)/config$")
+_OAC_ID_RE   = re.compile(r"^/2020-05-31/origin-access-control/([^/]+)/?$")
+
 # ---------------------------------------------------------------------------
 # In-memory state
 # ---------------------------------------------------------------------------
 _distributions = AccountScopedDict()   # Id -> distribution record
 _invalidations = AccountScopedDict()   # distribution_id -> [invalidation record, ...]
 _tags = AccountScopedDict()            # arn -> [{"Key": ..., "Value": ...}]
+_oacs = AccountScopedDict()            # Id -> OAC record
 
 
 def reset():
     _distributions.clear()
     _invalidations.clear()
     _tags.clear()
+    _oacs.clear()
 
 
 def get_state():
@@ -55,6 +67,7 @@ def get_state():
         "distributions": _distributions,
         "invalidations": _invalidations,
         "tags": _tags,
+        "oacs": _oacs,
     })
 
 
@@ -62,6 +75,7 @@ def restore_state(data):
     _distributions.update(data.get("distributions", {}))
     _invalidations.update(data.get("invalidations", {}))
     _tags.update(data.get("tags", {}))
+    _oacs.update(data.get("oacs", {}))
 
 
 _restored = load_state("cloudfront")
@@ -154,6 +168,55 @@ def _build_distribution_xml(parent, dist):
     parent.append(config_el)
 
 
+_VALID_ORIGIN_TYPES = {"s3", "mediastore", "mediapackagev2", "lambda"}
+_VALID_SIGNING_BEHAVIORS = {"always", "never", "no-override"}
+_VALID_SIGNING_PROTOCOLS = {"sigv4"}
+
+
+def _validate_oac_config(el):
+    """Validate OAC config fields from a parsed XML element.
+
+    Returns an error tuple (via _error()) on validation failure, or None on success.
+    """
+    name = _text(el, "Name")
+    if not name:
+        return _error("InvalidArgument", "Name is required.", 400)
+
+    origin_type = _text(el, "OriginAccessControlOriginType")
+    if origin_type not in _VALID_ORIGIN_TYPES:
+        return _error("InvalidArgument", "Invalid OriginAccessControlOriginType value.", 400)
+
+    signing_behavior = _text(el, "SigningBehavior")
+    if signing_behavior not in _VALID_SIGNING_BEHAVIORS:
+        return _error("InvalidArgument", "Invalid SigningBehavior value.", 400)
+
+    signing_protocol = _text(el, "SigningProtocol")
+    if signing_protocol not in _VALID_SIGNING_PROTOCOLS:
+        return _error("InvalidArgument", "Invalid SigningProtocol value.", 400)
+
+    return None
+
+
+def _build_oac_xml(parent, oac):
+    """Append OriginAccessControl child elements (Id + config) to parent."""
+    SubElement(parent, "Id").text = oac["Id"]
+    config_el = SubElement(parent, "OriginAccessControlConfig")
+    SubElement(config_el, "Name").text = oac["Name"]
+    SubElement(config_el, "Description").text = oac.get("Description", "")
+    SubElement(config_el, "OriginAccessControlOriginType").text = oac["OriginAccessControlOriginType"]
+    SubElement(config_el, "SigningBehavior").text = oac["SigningBehavior"]
+    SubElement(config_el, "SigningProtocol").text = oac["SigningProtocol"]
+
+
+def _build_oac_config_xml(parent, oac):
+    """Append only OAC config fields directly to parent element."""
+    SubElement(parent, "Name").text = oac["Name"]
+    SubElement(parent, "Description").text = oac.get("Description", "")
+    SubElement(parent, "OriginAccessControlOriginType").text = oac["OriginAccessControlOriginType"]
+    SubElement(parent, "SigningBehavior").text = oac["SigningBehavior"]
+    SubElement(parent, "SigningProtocol").text = oac["SigningProtocol"]
+
+
 def _build_invalidation_xml(parent, inv):
     """Append Invalidation child elements to parent."""
     SubElement(parent, "Id").text = inv["Id"]
@@ -224,6 +287,30 @@ async def handle_request(method, path, headers, body, query_params):
             return _tag_resource(resource, body)
         if method == "POST" and operation == "Untag":
             return _untag_resource(resource, body)
+
+    # OAC routes
+    m = _OAC_RE.match(path)
+    if m:
+        if method == "POST":
+            return _create_oac(headers, body)
+        if method == "GET":
+            return _list_oacs()
+
+    m = _OAC_CFG_RE.match(path)
+    if m:
+        oac_id = m.group(1)
+        if method == "GET":
+            return _get_oac_config(oac_id)
+        if method == "PUT":
+            return _update_oac(oac_id, headers, body)
+
+    m = _OAC_ID_RE.match(path)
+    if m:
+        oac_id = m.group(1)
+        if method == "GET":
+            return _get_oac(oac_id)
+        if method == "DELETE":
+            return _delete_oac(oac_id, headers)
 
     return _error("NoSuchResource", f"No route for {method} {path}", 404)
 
@@ -495,4 +582,160 @@ def _untag_resource(resource_arn, body):
         if local == "Key":
             remove_keys.add(child.text or "")
     _tags[resource_arn] = [t for t in _tags.get(resource_arn, []) if t["Key"] not in remove_keys]
+    return 204, {}, b""
+
+
+# ---------------------------------------------------------------------------
+# OAC handlers
+# ---------------------------------------------------------------------------
+
+def _create_oac(headers, body):
+    el = _parse_body(body)
+    if el is None:
+        return _error("MalformedXML", "The XML document is malformed.", 400)
+
+    validation_err = _validate_oac_config(el)
+    if validation_err is not None:
+        return validation_err
+
+    name = _text(el, "Name")
+
+    # Check name uniqueness across existing OACs in the account
+    for existing in _oacs.values():
+        if existing["Name"] == name:
+            return _error(
+                "OriginAccessControlAlreadyExists",
+                "An origin access control with this name already exists.",
+                409,
+            )
+
+    oac_id = _dist_id()
+    etag = new_uuid()
+
+    oac = {
+        "Id": oac_id,
+        "Name": name,
+        "Description": _text(el, "Description"),
+        "OriginAccessControlOriginType": _text(el, "OriginAccessControlOriginType"),
+        "SigningBehavior": _text(el, "SigningBehavior"),
+        "SigningProtocol": _text(el, "SigningProtocol"),
+        "ETag": etag,
+    }
+    _oacs[oac_id] = oac
+
+    logger.info("CreateOriginAccessControl id=%s name=%s", oac_id, name)
+
+    def build(root):
+        _build_oac_xml(root, oac)
+
+    return _xml_response("OriginAccessControl", build, status=201, extra_headers={
+        "ETag": etag,
+        "Location": f"/2020-05-31/origin-access-control/{oac_id}",
+    })
+
+
+def _get_oac(oac_id):
+    oac = _oacs.get(oac_id)
+    if not oac:
+        return _error("NoSuchOriginAccessControl", "The specified origin access control does not exist.", 404)
+
+    def build(root):
+        _build_oac_xml(root, oac)
+
+    return _xml_response("OriginAccessControl", build, extra_headers={"ETag": oac["ETag"]})
+
+
+def _get_oac_config(oac_id):
+    oac = _oacs.get(oac_id)
+    if not oac:
+        return _error("NoSuchOriginAccessControl", "The specified origin access control does not exist.", 404)
+
+    def build(root):
+        _build_oac_config_xml(root, oac)
+
+    return _xml_response("OriginAccessControlConfig", build, extra_headers={"ETag": oac["ETag"]})
+
+
+def _list_oacs():
+    items = list(_oacs.values())
+
+    def build(root):
+        SubElement(root, "Marker").text = ""
+        SubElement(root, "MaxItems").text = "100"
+        SubElement(root, "IsTruncated").text = "false"
+        SubElement(root, "Quantity").text = str(len(items))
+        if items:
+            items_el = SubElement(root, "Items")
+            for oac in items:
+                summary = SubElement(items_el, "OriginAccessControlSummary")
+                SubElement(summary, "Id").text = oac["Id"]
+                SubElement(summary, "Name").text = oac["Name"]
+                SubElement(summary, "Description").text = oac.get("Description", "")
+                SubElement(summary, "OriginAccessControlOriginType").text = oac["OriginAccessControlOriginType"]
+                SubElement(summary, "SigningBehavior").text = oac["SigningBehavior"]
+                SubElement(summary, "SigningProtocol").text = oac["SigningProtocol"]
+
+    return _xml_response("OriginAccessControlList", build)
+
+
+def _update_oac(oac_id, headers, body):
+    oac = _oacs.get(oac_id)
+    if not oac:
+        return _error("NoSuchOriginAccessControl", "The specified origin access control does not exist.", 404)
+
+    if_match = headers.get("if-match")
+    if not if_match:
+        return _error("InvalidIfMatchVersion", "The If-Match version is missing or not valid for the resource.", 400)
+    if if_match != oac["ETag"]:
+        return _error("PreconditionFailed", "The precondition given in one or more of the request-header fields evaluated to false.", 412)
+
+    el = _parse_body(body)
+    if el is None:
+        return _error("MalformedXML", "The XML document is malformed.", 400)
+
+    validation_err = _validate_oac_config(el)
+    if validation_err is not None:
+        return validation_err
+
+    name = _text(el, "Name")
+
+    # Check name uniqueness, excluding the OAC being updated
+    for existing in _oacs.values():
+        if existing["Id"] != oac_id and existing["Name"] == name:
+            return _error(
+                "OriginAccessControlAlreadyExists",
+                "An origin access control with this name already exists.",
+                409,
+            )
+
+    new_etag = new_uuid()
+    oac["Name"] = name
+    oac["Description"] = _text(el, "Description")
+    oac["OriginAccessControlOriginType"] = _text(el, "OriginAccessControlOriginType")
+    oac["SigningBehavior"] = _text(el, "SigningBehavior")
+    oac["SigningProtocol"] = _text(el, "SigningProtocol")
+    oac["ETag"] = new_etag
+
+    logger.info("UpdateOriginAccessControl id=%s name=%s", oac_id, name)
+
+    def build(root):
+        _build_oac_xml(root, oac)
+
+    return _xml_response("OriginAccessControl", build, extra_headers={"ETag": new_etag})
+
+
+def _delete_oac(oac_id, headers):
+    oac = _oacs.get(oac_id)
+    if not oac:
+        return _error("NoSuchOriginAccessControl", "The specified origin access control does not exist.", 404)
+
+    if_match = headers.get("if-match")
+    if not if_match:
+        return _error("InvalidIfMatchVersion", "The If-Match version is missing or not valid for the resource.", 400)
+    if if_match != oac["ETag"]:
+        return _error("PreconditionFailed", "The precondition given in one or more of the request-header fields evaluated to false.", 412)
+
+    del _oacs[oac_id]
+
+    logger.info("DeleteOriginAccessControl id=%s", oac_id)
     return 204, {}, b""

@@ -1644,6 +1644,61 @@ def test_lambda_warm_worker_nodejs_uses_layer(lam):
         assert payload["value"] == "from-node-layer"
     finally:
         lam.delete_function(FunctionName=fname)
+
+def test_lambda_warm_worker_nodejs_esm_uses_layer(lam):
+    """ESM .mjs handler must be able to import packages from a Lambda Layer.
+
+    This is the combined case of ESM support (PR #238) and Layer extraction
+    (PR #236). Node.js ESM import() does not use NODE_PATH, so the runtime
+    symlinks layer packages into code/node_modules/ for ancestor-tree resolution.
+    """
+    # Create a layer with a Node.js package under nodejs/node_modules/
+    layer_buf = io.BytesIO()
+    with zipfile.ZipFile(layer_buf, "w") as z:
+        z.writestr(
+            "nodejs/node_modules/esmhelper/index.js",
+            "module.exports.LAYER_VALUE = 'from-esm-layer';\n",
+        )
+    layer_resp = lam.publish_layer_version(
+        LayerName="warm-esm-layer-test",
+        Content={"ZipFile": layer_buf.getvalue()},
+        CompatibleRuntimes=["nodejs20.x"],
+    )
+    layer_arn = layer_resp["LayerVersionArn"]
+
+    # Create an ESM handler that uses native import to load the layer package.
+    # The layer package exports via CJS but Node.js ESM can import CJS modules.
+    # Native import does NOT use NODE_PATH — this is the bug we are testing.
+    handler_code = (
+        "import helper from 'esmhelper';\n"
+        "export const handler = async (event) => {\n"
+        "  return { value: helper.LAYER_VALUE, esm: true };\n"
+        "};\n"
+    )
+    func_buf = io.BytesIO()
+    with zipfile.ZipFile(func_buf, "w") as z:
+        z.writestr("index.mjs", handler_code)
+
+    fname = f"warm-esm-layer-{_uuid_mod.uuid4().hex[:8]}"
+    lam.create_function(
+        FunctionName=fname,
+        Runtime="nodejs20.x",
+        Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": func_buf.getvalue()},
+        Layers=[layer_arn],
+    )
+
+    try:
+        resp = lam.invoke(FunctionName=fname, Payload=b"{}")
+        assert resp["StatusCode"] == 200
+        assert "FunctionError" not in resp, f"Lambda error: {resp['Payload'].read().decode()}"
+        payload = json.loads(resp["Payload"].read())
+        assert payload["value"] == "from-esm-layer"
+        assert payload["esm"] is True
+    finally:
+        lam.delete_function(FunctionName=fname)
+
 # ---------------------------------------------------------------------------
 # Terraform compatibility tests
 # ---------------------------------------------------------------------------
