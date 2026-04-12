@@ -45,8 +45,9 @@ def test_ebs_delete_volume(ebs):
     vol = ebs.create_volume(AvailabilityZone="us-east-1a", Size=5, VolumeType="gp2")
     vol_id = vol["VolumeId"]
     ebs.delete_volume(VolumeId=vol_id)
-    desc = ebs.describe_volumes(VolumeIds=[vol_id])
-    assert len(desc["Volumes"]) == 0
+    with pytest.raises(ClientError) as exc:
+        ebs.describe_volumes(VolumeIds=[vol_id])
+    assert exc.value.response["Error"]["Code"] == "InvalidVolume.NotFound"
 
 def test_ebs_modify_volume(ebs):
     vol = ebs.create_volume(AvailabilityZone="us-east-1a", Size=10, VolumeType="gp2")
@@ -80,8 +81,9 @@ def test_ebs_delete_snapshot(ebs):
     snap = ebs.create_snapshot(VolumeId=vol["VolumeId"])
     snap_id = snap["SnapshotId"]
     ebs.delete_snapshot(SnapshotId=snap_id)
-    desc = ebs.describe_snapshots(SnapshotIds=[snap_id])
-    assert len(desc["Snapshots"]) == 0
+    with pytest.raises(ClientError) as exc:
+        ebs.describe_snapshots(SnapshotIds=[snap_id])
+    assert exc.value.response["Error"]["Code"] == "InvalidSnapshot.NotFound"
 
 def test_ebs_copy_snapshot(ebs):
     vol = ebs.create_volume(AvailabilityZone="us-east-1a", Size=10, VolumeType="gp2")

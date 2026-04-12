@@ -117,6 +117,10 @@ def _create_web_acl(data):
     name = data.get("Name", "")
     if not name:
         return _waf_err("WAFInvalidParameterException", "Name is required")
+    scope = data.get("Scope", "REGIONAL")
+    for existing in _web_acls.values():
+        if existing["Name"] == name and existing.get("Scope") == scope:
+            return _waf_err("WAFDuplicateItemException", f"A WebACL with name '{name}' already exists.")
     uid = new_uuid()
     lock_token = new_uuid()
     arn = _acl_arn(name, uid)
@@ -153,6 +157,9 @@ def _update_web_acl(data):
     acl = _web_acls.get(uid)
     if not acl:
         return _waf_err("WAFNonexistentItemException", f"WebACL {uid} not found")
+    lock_token = data.get("LockToken", "")
+    if lock_token != acl.get("LockToken", ""):
+        return _waf_err("WAFOptimisticLockException", "The resource you are trying to update has been modified by another request.")
     acl["Rules"] = data.get("Rules", acl["Rules"])
     acl["DefaultAction"] = data.get("DefaultAction", acl["DefaultAction"])
     acl["VisibilityConfig"] = data.get("VisibilityConfig", acl["VisibilityConfig"])

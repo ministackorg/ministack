@@ -578,6 +578,7 @@ async def _send_response(send, status, headers, body):
     await send({
         "type": "http.response.body",
         "body": body_bytes,
+        "more_body": False,
     })
 
 

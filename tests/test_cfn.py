@@ -1169,7 +1169,9 @@ def test_cfn_elbv2_load_balancer_and_listener(cfn, elbv2):
 
     cfn.delete_stack(StackName=stack_name)
     _wait_stack(cfn, stack_name)
-    assert elbv2.describe_load_balancers(Names=[lb_name])["LoadBalancers"] == []
+    with pytest.raises(ClientError) as exc:
+        elbv2.describe_load_balancers(Names=[lb_name])
+    assert exc.value.response["Error"]["Code"] == "LoadBalancerNotFound"
 
 
 def test_cfn_cloudwatch_alarm_lifecycle(cfn, cw):

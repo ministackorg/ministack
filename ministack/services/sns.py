@@ -205,7 +205,7 @@ def _get_topic_attributes(params):
     arn = _normalize_arn(_p(params, "TopicArn"))
     topic = _topics.get(arn)
     if not topic:
-        return _error("NotFoundException", f"Topic does not exist: {arn}", 404)
+        return _error("NotFound", f"Topic does not exist: {arn}", 404)
     _refresh_subscription_counts(topic)
     attrs = "".join(
         f"<entry><key>{k}</key><value>{_xml_escape(v)}</value></entry>"
@@ -219,7 +219,7 @@ def _set_topic_attributes(params):
     arn = _normalize_arn(_p(params, "TopicArn"))
     topic = _topics.get(arn)
     if not topic:
-        return _error("NotFoundException", f"Topic does not exist: {arn}", 404)
+        return _error("NotFound", f"Topic does not exist: {arn}", 404)
     attr_name = _p(params, "AttributeName")
     attr_val = _p(params, "AttributeValue")
     if attr_name:
@@ -238,7 +238,7 @@ def _subscribe(params):
 
     topic = _topics.get(topic_arn)
     if not topic:
-        return _error("NotFoundException", f"Topic does not exist: {topic_arn}", 404)
+        return _error("NotFound", f"Topic does not exist: {topic_arn}", 404)
 
     if not protocol:
         return _error("InvalidParameterException", "Protocol is required", 400)
@@ -299,7 +299,7 @@ def _confirm_subscription(params):
 
     topic = _topics.get(topic_arn)
     if not topic:
-        return _error("NotFoundException", f"Topic does not exist: {topic_arn}", 404)
+        return _error("NotFound", f"Topic does not exist: {topic_arn}", 404)
 
     if not token:
         return _error("InvalidParameterException", "Token is required", 400)
@@ -363,7 +363,7 @@ def _list_subscriptions_by_topic(params):
     topic_arn = _normalize_arn(_p(params, "TopicArn"))
     topic = _topics.get(topic_arn)
     if not topic:
-        return _error("NotFoundException", f"Topic does not exist: {topic_arn}", 404)
+        return _error("NotFound", f"Topic does not exist: {topic_arn}", 404)
     members = ""
     for sub in topic["subscriptions"]:
         members += (
@@ -383,11 +383,11 @@ def _get_subscription_attributes(params):
     sub_arn = _p(params, "SubscriptionArn")
     topic_arn = _sub_arn_to_topic.get(sub_arn)
     if not topic_arn or topic_arn not in _topics:
-        return _error("NotFoundException", f"Subscription does not exist: {sub_arn}", 404)
+        return _error("NotFound", f"Subscription does not exist: {sub_arn}", 404)
 
     sub = _find_subscription(topic_arn, sub_arn)
     if not sub:
-        return _error("NotFoundException", f"Subscription does not exist: {sub_arn}", 404)
+        return _error("NotFound", f"Subscription does not exist: {sub_arn}", 404)
 
     attrs = "".join(
         f"<entry><key>{k}</key><value>{_xml_escape(v)}</value></entry>"
@@ -401,11 +401,11 @@ def _set_subscription_attributes(params):
     sub_arn = _p(params, "SubscriptionArn")
     topic_arn = _sub_arn_to_topic.get(sub_arn)
     if not topic_arn or topic_arn not in _topics:
-        return _error("NotFoundException", f"Subscription does not exist: {sub_arn}", 404)
+        return _error("NotFound", f"Subscription does not exist: {sub_arn}", 404)
 
     sub = _find_subscription(topic_arn, sub_arn)
     if not sub:
-        return _error("NotFoundException", f"Subscription does not exist: {sub_arn}", 404)
+        return _error("NotFound", f"Subscription does not exist: {sub_arn}", 404)
 
     attr_name = _p(params, "AttributeName")
     attr_val = _p(params, "AttributeValue")
@@ -448,7 +448,7 @@ def _publish(params):
                       "TopicArn, TargetArn, or PhoneNumber is required", 400)
 
     if topic_arn not in _topics:
-        return _error("NotFoundException", f"Topic does not exist: {topic_arn}", 404)
+        return _error("NotFound", f"Topic does not exist: {topic_arn}", 404)
 
     msg_attrs = _parse_message_attributes(params)
     msg_id = new_uuid()
@@ -477,7 +477,7 @@ def _publish_batch(params):
     if not topic_arn:
         return _error("InvalidParameterException", "TopicArn is required", 400)
     if topic_arn not in _topics:
-        return _error("NotFoundException", f"Topic does not exist: {topic_arn}", 404)
+        return _error("NotFound", f"Topic does not exist: {topic_arn}", 404)
 
     entries = _parse_batch_entries(params)
     if not entries:
@@ -765,7 +765,7 @@ def _create_platform_endpoint(params):
     token = _p(params, "Token")
 
     if app_arn not in _platform_applications:
-        return _error("NotFoundException", f"PlatformApplication does not exist: {app_arn}", 404)
+        return _error("NotFound", f"PlatformApplication does not exist: {app_arn}", 404)
     if not token:
         return _error("InvalidParameterException", "Token is required", 400)
 

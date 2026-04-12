@@ -235,6 +235,8 @@ def _update_database(data):
 
 def _create_table(data):
     db_name = data.get("DatabaseName")
+    if db_name not in _databases:
+        return error_response_json("EntityNotFoundException", f"Database {db_name} not found.", 400)
     table_input = data.get("TableInput", {})
     name = table_input.get("Name")
     key = f"{db_name}/{name}"
@@ -262,6 +264,8 @@ def _delete_table(data):
     db_name = data.get("DatabaseName")
     name = data.get("Name")
     key = f"{db_name}/{name}"
+    if key not in _tables:
+        return error_response_json("EntityNotFoundException", f"Table {name} not found.", 400)
     _tables.pop(key, None)
     _partitions.pop(key, None)
     _partition_indexes.pop(key, None)
@@ -455,7 +459,10 @@ def _create_connection(data):
 
 
 def _delete_connection(data):
-    _connections.pop(data.get("ConnectionName"), None)
+    name = data.get("ConnectionName")
+    if name not in _connections:
+        return error_response_json("EntityNotFoundException", f"Connection {name} not found.", 400)
+    _connections.pop(name, None)
     return json_response({})
 
 
@@ -475,6 +482,8 @@ def _get_connections(data):
 
 def _create_crawler(data):
     name = data.get("Name")
+    if name in _crawlers:
+        return error_response_json("AlreadyExistsException", f"Crawler {name} already exists", 400)
     schedule = data.get("Schedule", "")
     schedule_struct = {"ScheduleExpression": schedule} if schedule else {}
     _crawlers[name] = {

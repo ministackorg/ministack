@@ -374,8 +374,12 @@ def _describe_lbs(params):
     results = list(_lbs.values())
     if arn_filter:
         results = [lb for lb in results if lb["LoadBalancerArn"] in arn_filter]
+        if not results:
+            return _error("LoadBalancerNotFound", "One or more load balancers not found", 400)
     if name_filter:
         results = [lb for lb in results if lb["LoadBalancerName"] in name_filter]
+        if not results:
+            return _error("LoadBalancerNotFound", "One or more load balancers not found", 400)
     return _xml(200, "DescribeLoadBalancers",
                 f"<LoadBalancers>{''.join(_lb_xml(lb) for lb in results)}</LoadBalancers>")
 
@@ -469,6 +473,8 @@ def _describe_tgs(params):
     results = list(_tgs.values())
     if arn_filter:
         results = [tg for tg in results if tg["TargetGroupArn"] in arn_filter]
+        if not results:
+            return _error("TargetGroupNotFound", "One or more target groups not found", 400)
     if name_filter:
         results = [tg for tg in results if tg["TargetGroupName"] in name_filter]
     if lb_arn:
@@ -506,6 +512,8 @@ def _modify_tg(params):
 
 def _delete_tg(params):
     arn = _p(params, "TargetGroupArn")
+    if arn not in _tgs:
+        return _error("TargetGroupNotFound", f"Target group '{arn}' not found", 400)
     _tgs.pop(arn, None)
     _targets.pop(arn, None)
     _tg_attrs.pop(arn, None)
@@ -614,6 +622,8 @@ def _modify_listener(params):
 
 def _delete_listener(params):
     arn = _p(params, "ListenerArn")
+    if arn not in _listeners:
+        return _error("ListenerNotFound", f"Listener '{arn}' not found", 400)
     _listeners.pop(arn, None)
     _tags.pop(arn, None)
     for rarn in [k for k, v in list(_rules.items()) if v.get("ListenerArn") == arn]:

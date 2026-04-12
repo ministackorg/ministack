@@ -7,6 +7,38 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [1.2.6] — 2026-04-12
+
+### Fixed
+- **EFS timestamp format** — `CreationTime` now returns integer epoch seconds instead of ISO string, fixing Java SDK v2 unmarshalling errors.
+- **ECS timestamps** — `createdAt` and other timestamp fields now return integer epoch seconds instead of floats with sub-second precision.
+- **DynamoDB `X-Amz-Crc32` header** — all DynamoDB responses now include the CRC32 checksum header, fixing Go SDK v2 `failed to close HTTP response body` warnings.
+- **EC2 DescribeInternetGateways not-found** — returns `InvalidInternetGatewayID.NotFound` for nonexistent IDs.
+- **EC2 CreateVpc CIDR validation** — rejects invalid CIDR blocks with `InvalidParameterValue`.
+- **EC2 duplicate security group rule** — `AuthorizeSecurityGroupIngress` returns `InvalidPermission.Duplicate` for existing rules.
+- **EC2 CreateVolume/CreateSnapshot TagSpecifications** — tags specified in `TagSpecifications` are now persisted.
+- **ElastiCache CreateCacheSubnetGroup** — `DescribeCacheSubnetGroups` now returns the `Subnets` list with subnet identifiers and availability zones.
+- **SNS error code** — `GetTopicAttributes`, `Publish`, and other operations on nonexistent topics now return `NotFound` instead of `NotFoundException`, matching real AWS.
+- **LocalStack init script path compatibility** — now supports `/etc/localstack/init/ready.d/` in addition to `/docker-entrypoint-initaws.d/ready.d/` for drop-in LocalStack replacement. Contributed by @AdigaAkhil (#271)
+- **CloudWatch error response protocol mismatch** — error responses now match the request protocol (JSON errors for JSON requests, CBOR errors for CBOR requests). Previously, JSON-protocol requests received CBOR-encoded errors causing boto3 `UnicodeDecodeError`.
+- **AppSync apiId length** — `CreateGraphQLApi` now generates 26-character alphanumeric IDs matching real AWS format. Previously 8 characters, which broke boto3 ARN validation for tag operations.
+- **EC2 CreateTags persistence** — tags applied via `CreateTags` now appear in `DescribeVpcs`, `DescribeSubnets`, `DescribeSecurityGroups`, and `DescribeInternetGateways`. Previously returned empty `<tagSet/>`.
+- **EC2 RunInstances TagSpecifications** — tags specified in `TagSpecifications` with `ResourceType=instance` are now persisted and returned in `DescribeInstances`.
+- **EC2 Describe not-found errors** — `DescribeVpcs`, `DescribeSubnets`, `DescribeSecurityGroups`, `DescribeKeyPairs`, `DescribeInstances`, `DescribeVolumes`, `DescribeSnapshots` now return proper AWS error codes (`InvalidVpcID.NotFound`, etc.) when specific IDs are requested but don't exist.
+- **EFS not-found errors** — `DescribeFileSystems` and `DescribeMountTargets` now return `FileSystemNotFound` / `MountTargetNotFound` for nonexistent IDs.
+- **ELBv2 not-found errors** — `DescribeLoadBalancers`, `DescribeTargetGroups` return proper errors for nonexistent ARNs/names. `DeleteListener`, `DeleteTargetGroup` return errors for nonexistent ARNs.
+- **ElastiCache not-found errors** — `DescribeCacheSubnetGroups`, `DeleteCacheSubnetGroup`, `DescribeCacheParameterGroups`, `DeleteCacheParameterGroup` now return proper `CacheSubnetGroupNotFoundFault` / `CacheParameterGroupNotFound` errors.
+- **Glue validation** — `CreateTable` rejects nonexistent database, `CreateCrawler` rejects duplicate names, `DeleteTable` / `DeleteConnection` return `EntityNotFoundException` for nonexistent resources.
+- **CloudFront CallerReference idempotency** — `CreateDistribution` with a duplicate `CallerReference` returns the existing distribution instead of creating a duplicate.
+- **WAFv2 LockToken enforcement** — `UpdateWebACL` validates `LockToken` and returns `WAFOptimisticLockException` for stale tokens.
+- **WAFv2 duplicate name** — `CreateWebACL` rejects duplicate names within the same scope with `WAFDuplicateItemException`.
+- **ServiceDiscovery duplicate namespace** — `CreateHttpNamespace` rejects duplicate names with `NamespaceAlreadyExists`.
+- **AutoScaling DescribePolicies** — response now includes `AdjustmentType`, `ScalingAdjustment`, and `Cooldown` fields.
+- **ECS TagResource validation** — rejects nonexistent resource ARNs with `InvalidParameterException`.
+- **EC2 DescribeVpcs filters** — filters parameter (`owner-id`, `vpc-id`, `cidr`, `state`, `is-default`, `tag:*`) now applied correctly. Previously silently ignored.
+
+---
+
 ## [1.2.5] — 2026-04-12
 
 ### Fixed

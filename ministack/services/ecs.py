@@ -143,7 +143,7 @@ def _ts_to_epoch(value):
         return value
     try:
         from datetime import datetime, timezone
-        return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+        return int(datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp())
     except (ValueError, TypeError):
         return value
 
@@ -1002,6 +1002,16 @@ def _tag_resource(data):
     new_tags = data.get("tags", [])
     if not arn:
         return error_response_json("InvalidParameterException", "resourceArn is required", 400)
+    # Validate the resource exists by checking all known ARN stores
+    found = (
+        any(c.get("clusterArn") == arn for c in _clusters.values())
+        or any(td.get("taskDefinitionArn") == arn for td in _task_defs.values())
+        or any(svc.get("serviceArn") == arn for svc in _services.values())
+        or any(t.get("taskArn") == arn for t in _tasks.values())
+        or arn in _tags
+    )
+    if not found:
+        return error_response_json("InvalidParameterException", f"The specified resource is not valid.", 400)
     existing = _tags.get(arn, [])
     existing_keys = {t["key"]: i for i, t in enumerate(existing)}
     for tag in new_tags:

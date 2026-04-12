@@ -70,7 +70,7 @@ def _build_id(project_name):
 
 def _make_build_record(project, build_id, source_version=None):
     """Create a build record that immediately shows SUCCEEDED."""
-    now = time.time()
+    now = int(time.time())
     return {
         "id": build_id,
         "arn": _build_arn(build_id),
@@ -151,7 +151,7 @@ def _create_project(data):
         return error_response_json("ResourceAlreadyExistsException",
                                    f"Project already exists: {name}", 400)
 
-    now = time.time()
+    now = int(time.time())
     project = {
         "name": name,
         "arn": _project_arn(name),

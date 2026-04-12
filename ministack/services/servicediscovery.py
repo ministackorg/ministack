@@ -155,6 +155,9 @@ async def _create_namespace(data):
     ns_name = data.get("Name")
     if not ns_name:
         return error_response_json("InvalidInput", "Name is required", 400)
+    for existing in _namespaces.values():
+        if existing["Name"] == ns_name:
+            return error_response_json("NamespaceAlreadyExists", f"Namespace {ns_name} already exists", 409)
 
     ns_id = f"ns-{new_uuid()[:8]}"
     action = data.get("_action", "")
