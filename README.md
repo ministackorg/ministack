@@ -73,13 +73,33 @@ curl http://localhost:4566/_ministack/health
 # Reset all state — wipe every service back to empty (useful between test runs)
 curl -X POST http://localhost:4566/_ministack/reset
 
-# Runtime config — change settings without restart
+# Runtime config — change service-level settings without restart
 curl -X POST http://localhost:4566/_ministack/config \
   -H "Content-Type: application/json" \
-  -d '{"MINISTACK_ACCOUNT_ID": "123456789012"}'
+  -d '{"lambda_svc.LAMBDA_EXECUTOR": "docker"}'
 ```
 
 The reset endpoint is especially useful in CI pipelines and test suites — call it in `setUp`/`beforeEach` to get a clean environment for every test without restarting the container.
+
+The config endpoint supports these keys:
+
+| Key | Description |
+|-----|-------------|
+| `lambda_svc.LAMBDA_EXECUTOR` | Lambda execution mode (`local` or `docker`) |
+| `athena.ATHENA_ENGINE` | Athena query engine (`duckdb` or `mock`) |
+| `athena.ATHENA_DATA_DIR` | Directory for Athena DuckDB data files |
+| `stepfunctions._sfn_mock_config` | SFN mock config (AWS SFN Local compatible) |
+
+To set region or account ID, use environment variables at startup:
+
+```bash
+docker run -p 4566:4566 \
+  -e MINISTACK_REGION=eu-west-1 \
+  -e MINISTACK_ACCOUNT_ID=123456789012 \
+  ministackorg/ministack
+```
+
+Or use the multi-tenancy feature — a 12-digit access key automatically becomes the account ID (see [Multi-Tenancy](#multi-tenancy) below).
 
 Also compatible with LocalStack's health endpoint:
 
