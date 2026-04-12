@@ -11,6 +11,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 - **Secrets Manager partial ARN lookup** — `GetSecretValue` and all other operations now resolve secrets by partial ARN (without the random 6-character suffix), matching real AWS behaviour. Previously returned `ResourceNotFoundException`.
+- **Java SDK v2 timestamp compatibility** — all JSON-protocol services now return integer epoch seconds instead of high-precision floats. Fixes `Unable to parse date` and `Input timestamp string must be no longer than 20 characters` errors across DynamoDB, Lambda, Kinesis, CodeBuild, CloudWatch, Glue, Athena, ECR, Secrets Manager, EventBridge, KMS, SNS, Service Discovery, and CloudFormation provisioners. Python and Node.js SDKs are unaffected.
 
 ---
 

@@ -250,7 +250,7 @@ def _create_table(data):
         "sk_name": sk_name,
         "items": defaultdict(dict),
         "TableStatus": "ACTIVE",
-        "CreationDateTime": time.time(),
+        "CreationDateTime": int(time.time()),
         "ItemCount": 0,
         "TableSizeBytes": 0,
         "TableArn": f"arn:aws:dynamodb:{REGION}:{get_account_id()}:table/{name}",

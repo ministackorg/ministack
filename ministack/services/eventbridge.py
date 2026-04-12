@@ -895,7 +895,7 @@ def _dispatch_to_sns(arn, payload):
         "id": msg_id,
         "message": payload,
         "subject": "EventBridge Notification",
-        "timestamp": time.time(),
+        "timestamp": int(time.time()),
     })
     _sns._fanout(arn, msg_id, payload, "EventBridge Notification")
     logger.info("EventBridge → SNS %s", arn)

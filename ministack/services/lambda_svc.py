@@ -2476,7 +2476,7 @@ def _put_event_invoke_config(func_name: str, data: dict):
         "FunctionArn": _func_arn(func_name),
         "MaximumRetryAttempts": data.get("MaximumRetryAttempts", 2),
         "MaximumEventAgeInSeconds": data.get("MaximumEventAgeInSeconds", 21600),
-        "LastModified": time.time(),
+        "LastModified": int(time.time()),
         "DestinationConfig": data.get(
             "DestinationConfig",
             {
@@ -2623,7 +2623,7 @@ def _create_esm(data: dict):
         "StateTransitionReason": "USER_INITIATED",
         "BatchSize": data.get("BatchSize", 10),
         "MaximumBatchingWindowInSeconds": data.get("MaximumBatchingWindowInSeconds", 0),
-        "LastModified": time.time(),
+        "LastModified": int(time.time()),
         "LastProcessingResult": "No records processed",
         "Enabled": enabled,
         "FunctionResponseTypes": data.get("FunctionResponseTypes", []),
@@ -2700,7 +2700,7 @@ def _update_esm(esm_id: str, data: dict):
         new_name = _resolve_name(data["FunctionName"])
         esm["FunctionName"] = new_name
         esm["FunctionArn"] = _func_arn(new_name)
-    esm["LastModified"] = time.time()
+    esm["LastModified"] = int(time.time())
     return json_response(_esm_response(esm))
 
 

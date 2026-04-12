@@ -459,7 +459,7 @@ def _publish(params):
         "subject": subject,
         "message_structure": message_structure,
         "message_attributes": msg_attrs,
-        "timestamp": time.time(),
+        "timestamp": int(time.time()),
     })
 
     group_id = _p(params, "MessageGroupId") or ""
@@ -511,7 +511,7 @@ def _publish_batch(params):
             "subject": subject,
             "message_structure": message_structure,
             "message_attributes": msg_attrs,
-            "timestamp": time.time(),
+            "timestamp": int(time.time()),
         })
         _fanout(topic_arn, msg_id, message, subject, message_structure, msg_attrs)
 

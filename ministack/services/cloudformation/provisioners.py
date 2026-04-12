@@ -324,7 +324,7 @@ def _ddb_create(logical_id, props, stack_name):
         "TableArn": arn,
         "TableId": new_uuid(),
         "TableStatus": "ACTIVE",
-        "CreationDateTime": time.time(),
+        "CreationDateTime": int(time.time()),
         "KeySchema": key_schema,
         "AttributeDefinitions": attr_defs,
         "ProvisionedThroughput": props.get("ProvisionedThroughput", {
@@ -681,7 +681,7 @@ def _kinesis_stream_create(logical_id, props, stack_name):
         "RetentionPeriodHours": retention,
         "shards": _kinesis._build_shards(shard_count),
         "tags": {},
-        "CreationTimestamp": time.time(),
+        "CreationTimestamp": int(time.time()),
         "EncryptionType": "NONE",
     }
     return name, {"Arn": arn, "StreamId": stream_id}
@@ -930,7 +930,7 @@ def _lambda_esm_create(logical_id, props, stack_name):
         "StateTransitionReason": "USER_INITIATED",
         "BatchSize": int(props.get("BatchSize", 10)),
         "MaximumBatchingWindowInSeconds": int(props.get("MaximumBatchingWindowInSeconds", 0)),
-        "LastModified": time.time(),
+        "LastModified": int(time.time()),
         "LastProcessingResult": "No records processed",
         "StartingPosition": props.get("StartingPosition", "LATEST"),
         "Enabled": props.get("Enabled", True),
@@ -1167,7 +1167,7 @@ def _sm_secret_create(logical_id, props, stack_name):
     _sm._secrets[name] = {
         "ARN": arn, "Name": name, "Description": props.get("Description", ""),
         "Tags": props.get("Tags", []),
-        "CreatedDate": _time.time(), "LastChangedDate": _time.time(),
+        "CreatedDate": int(_time.time()), "LastChangedDate": int(_time.time()),
         "LastAccessedDate": None, "DeletedDate": None,
         "RotationEnabled": False, "RotationLambdaARN": None,
         "RotationRules": None, "ReplicationStatus": [],
@@ -1176,7 +1176,7 @@ def _sm_secret_create(logical_id, props, stack_name):
             new_uuid(): {
                 "SecretString": secret_string,
                 "SecretBinary": None,
-                "CreatedDate": _time.time(),
+                "CreatedDate": int(_time.time()),
                 "Stages": ["AWSCURRENT"],
             }
         },
@@ -2214,14 +2214,14 @@ def _cw_metric_alarm_create(logical_id, props, stack_name):
         "StateReason": _cw._alarms[name]["StateReason"]
         if name in _cw._alarms
         else "Unchecked: Initial alarm creation",
-        "StateUpdatedTimestamp": time.time(),
+        "StateUpdatedTimestamp": int(time.time()),
         "ActionsEnabled": ae,
         "AlarmActions": alarm_actions,
         "OKActions": ok_actions,
         "InsufficientDataActions": insuff_actions,
         "Dimensions": dims,
         "Unit": props.get("Unit"),
-        "AlarmConfigurationUpdatedTimestamp": time.time(),
+        "AlarmConfigurationUpdatedTimestamp": int(time.time()),
     }
     _cw.cloudformation_put_metric_alarm(alarm)
     arn = alarm["AlarmArn"]

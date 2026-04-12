@@ -187,7 +187,7 @@ def _create_key(data):
         "KeySpec": key_spec,
         "KeyUsage": key_usage,
         "Description": description,
-        "CreationDate": time.time(),
+        "CreationDate": int(time.time()),
         "Origin": "AWS_KMS",
         "Tags": tags,
         "Policy": policy,
@@ -764,7 +764,7 @@ def _schedule_key_deletion(data):
     days = data.get("PendingWindowInDays", 30)
     rec["KeyState"] = "PendingDeletion"
     rec["Enabled"] = False
-    rec["DeletionDate"] = time.time() + (days * 86400)
+    rec["DeletionDate"] = int(time.time() + (days * 86400))
     return json_response({
         "KeyId": rec["KeyId"],
         "KeyState": "PendingDeletion",

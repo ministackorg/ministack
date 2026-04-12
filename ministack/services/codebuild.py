@@ -16,7 +16,7 @@ import os
 import time
 
 from ministack.core.persistence import PERSIST_STATE, load_state
-from ministack.core.responses import AccountScopedDict, error_response_json, get_account_id, json_response, new_uuid, now_iso
+from ministack.core.responses import AccountScopedDict, error_response_json, get_account_id, json_response, new_uuid
 
 logger = logging.getLogger("codebuild")
 
@@ -70,7 +70,7 @@ def _build_id(project_name):
 
 def _make_build_record(project, build_id, source_version=None):
     """Create a build record that immediately shows SUCCEEDED."""
-    now = now_iso()
+    now = time.time()
     return {
         "id": build_id,
         "arn": _build_arn(build_id),
@@ -151,7 +151,7 @@ def _create_project(data):
         return error_response_json("ResourceAlreadyExistsException",
                                    f"Project already exists: {name}", 400)
 
-    now = now_iso()
+    now = time.time()
     project = {
         "name": name,
         "arn": _project_arn(name),
@@ -235,7 +235,7 @@ def _update_project(data):
                 "encryptionKey"):
         if key in data:
             project[key] = data[key]
-    project["lastModified"] = now_iso()
+    project["lastModified"] = int(time.time())
     logger.info("UpdateProject: %s", name)
     return json_response({"project": _project_shape(project)})
 
@@ -287,7 +287,7 @@ def _stop_build(data):
         return error_response_json("ResourceNotFoundException",
                                    f"Build not found: {bid}", 400)
     build["buildStatus"] = "STOPPED"
-    build["endTime"] = now_iso()
+    build["endTime"] = int(time.time())
     build["currentPhase"] = "COMPLETED"
     logger.info("StopBuild: %s", bid)
     return json_response({"build": copy.deepcopy(build)})

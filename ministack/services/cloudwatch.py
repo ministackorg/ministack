@@ -191,7 +191,7 @@ def _evaluate_alarm(alarm):
         reason = f"Threshold Crossed: {alarm.get('Statistic','Average')} {val} {op} {threshold}"
         alarm["StateValue"] = new_state
         alarm["StateReason"] = reason
-        alarm["StateUpdatedTimestamp"] = time.time()
+        alarm["StateUpdatedTimestamp"] = int(time.time())
         _record_history(alarm["AlarmName"], old_state, new_state, reason)
 
 
@@ -697,14 +697,14 @@ def _put_metric_alarm(params, cbor_data, is_cbor, is_json=False):
             "StateReason": _alarms[name]["StateReason"]
             if name in _alarms
             else "Unchecked: Initial alarm creation",
-            "StateUpdatedTimestamp": time.time(),
+            "StateUpdatedTimestamp": int(time.time()),
             "ActionsEnabled": cbor_data.get("ActionsEnabled", True),
             "AlarmActions": cbor_data.get("AlarmActions", []),
             "OKActions": cbor_data.get("OKActions", []),
             "InsufficientDataActions": cbor_data.get("InsufficientDataActions", []),
             "Dimensions": cbor_data.get("Dimensions", []),
             "Unit": cbor_data.get("Unit"),
-            "AlarmConfigurationUpdatedTimestamp": time.time(),
+            "AlarmConfigurationUpdatedTimestamp": int(time.time()),
         }
     else:
         name = _p(params, "AlarmName")
@@ -752,14 +752,14 @@ def _put_metric_alarm(params, cbor_data, is_cbor, is_json=False):
             "StateReason": _alarms[name]["StateReason"]
             if name in _alarms
             else "Unchecked: Initial alarm creation",
-            "StateUpdatedTimestamp": time.time(),
+            "StateUpdatedTimestamp": int(time.time()),
             "ActionsEnabled": _p(params, "ActionsEnabled") != "false",
             "AlarmActions": alarm_actions,
             "OKActions": ok_actions,
             "InsufficientDataActions": [],
             "Dimensions": dims,
             "Unit": _p(params, "Unit") or None,
-            "AlarmConfigurationUpdatedTimestamp": time.time(),
+            "AlarmConfigurationUpdatedTimestamp": int(time.time()),
         }
 
     is_new = name not in _alarms
@@ -819,12 +819,12 @@ def _put_composite_alarm(params, cbor_data, is_cbor, is_json=False):
         "AlarmRule": alarm_rule,
         "StateValue": "INSUFFICIENT_DATA",
         "StateReason": "Unchecked: Initial alarm creation",
-        "StateUpdatedTimestamp": time.time(),
+        "StateUpdatedTimestamp": int(time.time()),
         "ActionsEnabled": actions_enabled,
         "AlarmActions": alarm_actions,
         "OKActions": ok_actions,
         "InsufficientDataActions": insuff_actions,
-        "AlarmConfigurationUpdatedTimestamp": time.time(),
+        "AlarmConfigurationUpdatedTimestamp": int(time.time()),
     }
     if is_cbor:
         return _cbor_ok({})
@@ -1106,7 +1106,7 @@ def _set_alarm_state(params, cbor_data, is_cbor, is_json=False):
     alarm["StateReason"] = reason
     if reason_data:
         alarm["StateReasonData"] = reason_data
-    alarm["StateUpdatedTimestamp"] = time.time()
+    alarm["StateUpdatedTimestamp"] = int(time.time())
 
     if old_state != new_state:
         _record_history(name, old_state, new_state, reason)
@@ -1224,7 +1224,7 @@ def _put_dashboard(params, cbor_data, is_cbor, is_json=False):
         "DashboardName": name,
         "DashboardBody": body,
         "DashboardArn": f"arn:aws:cloudwatch::{get_account_id()}:dashboard/{name}",
-        "LastModified": time.time(),
+        "LastModified": int(time.time()),
         "Size": len(body),
     }
 

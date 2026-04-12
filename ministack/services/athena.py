@@ -47,7 +47,7 @@ _workgroups: dict = {
         "Name": "primary",
         "State": "ENABLED",
         "Description": "Primary workgroup",
-        "CreationTime": time.time(),
+        "CreationTime": int(time.time()),
         "Configuration": {
             "ResultConfiguration": {"OutputLocation": "s3://athena-results/"}
         },
@@ -216,7 +216,7 @@ def _start_query_execution(data):
         "QueryExecutionContext": {"Database": db, "Catalog": catalog},
         "Status": {
             "State": "QUEUED",
-            "SubmissionDateTime": time.time(),
+            "SubmissionDateTime": int(time.time()),
             "CompletionDateTime": None,
             "StateChangeReason": "",
         },
@@ -283,7 +283,7 @@ def _execute_query(query_id, query, database):
         execution["Status"]["StateChangeReason"] = str(e)[:2000]
         execution["_error"] = str(e)
 
-    execution["Status"]["CompletionDateTime"] = time.time()
+    execution["Status"]["CompletionDateTime"] = int(time.time())
 
 
 def _run_duckdb(query, database):
@@ -502,7 +502,7 @@ def _stop_query_execution(data):
     if execution and execution["Status"]["State"] in ("QUEUED", "RUNNING"):
         execution["Status"]["State"] = "CANCELLED"
         execution["Status"]["StateChangeReason"] = "Query was cancelled by user"
-        execution["Status"]["CompletionDateTime"] = time.time()
+        execution["Status"]["CompletionDateTime"] = int(time.time())
     return json_response({})
 
 
@@ -525,7 +525,7 @@ def _create_workgroup(data):
         "Name": name,
         "State": "ENABLED",
         "Description": data.get("Description", ""),
-        "CreationTime": time.time(),
+        "CreationTime": int(time.time()),
         "Configuration": data.get("Configuration", {}),
     }
     tags = data.get("Tags", [])
@@ -784,7 +784,7 @@ def _create_prepared_statement(data):
         "WorkGroupName": workgroup,
         "QueryStatement": query,
         "Description": data.get("Description", ""),
-        "LastModifiedTime": time.time(),
+        "LastModifiedTime": int(time.time()),
     }
     return json_response({})
 
@@ -836,8 +836,8 @@ def _get_table_metadata(data):
         {
             "TableMetadata": {
                 "Name": table,
-                "CreateTime": time.time(),
-                "LastAccessTime": time.time(),
+                "CreateTime": int(time.time()),
+                "LastAccessTime": int(time.time()),
                 "TableType": "EXTERNAL_TABLE",
                 "Columns": [],
                 "PartitionKeys": [],
@@ -896,7 +896,7 @@ def reset():
             "Name": "primary",
             "State": "ENABLED",
             "Description": "Primary workgroup",
-            "CreationTime": time.time(),
+            "CreationTime": int(time.time()),
             "Configuration": {
                 "ResultConfiguration": {"OutputLocation": "s3://athena-results/"}
             },

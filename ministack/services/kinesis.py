@@ -238,7 +238,7 @@ def _create_stream(data):
         "RetentionPeriodHours": 24,
         "shards": _build_shards(shard_count),
         "tags": {},
-        "CreationTimestamp": time.time(),
+        "CreationTimestamp": int(time.time()),
         "EncryptionType": "NONE",
     }
     return json_response({})
@@ -383,7 +383,7 @@ def _put_record(data):
 
     stream["shards"][shard_id]["records"].append({
         "SequenceNumber": seq,
-        "ApproximateArrivalTimestamp": time.time(),
+        "ApproximateArrivalTimestamp": int(time.time()),
         "Data": record_data,
         "PartitionKey": partition_key,
     })
@@ -440,7 +440,7 @@ def _put_records(data):
         seq = _next_sequence_number()
         stream["shards"][sid]["records"].append({
             "SequenceNumber": seq,
-            "ApproximateArrivalTimestamp": time.time(),
+            "ApproximateArrivalTimestamp": int(time.time()),
             "Data": rd,
             "PartitionKey": pk,
         })
@@ -760,7 +760,7 @@ def _register_consumer(data):
                                        f"Consumer {consumer_name} already exists", 400)
 
     consumer_arn = f"{stream_arn}/consumer/{consumer_name}:{int(time.time())}"
-    now = time.time()
+    now = int(time.time())
     _consumers[consumer_arn] = {
         "ConsumerName": consumer_name,
         "ConsumerARN": consumer_arn,

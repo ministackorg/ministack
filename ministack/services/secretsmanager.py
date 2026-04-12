@@ -212,7 +212,7 @@ def _create_secret(data):
 
     arn = f"arn:aws:secretsmanager:{REGION}:{get_account_id()}:secret:{name}-{new_uuid()[:6]}"
     vid = new_uuid()
-    now = time.time()
+    now = int(time.time())
 
     _secrets[name] = {
         "ARN": arn,
@@ -254,7 +254,7 @@ def _get_secret_value(data):
             "You can't perform this operation on the secret because it was marked for deletion.", 400,
         )
 
-    secret["LastAccessedDate"] = time.time()
+    secret["LastAccessedDate"] = int(time.time())
 
     req_vid = data.get("VersionId")
     req_stage = data.get("VersionStage", "AWSCURRENT")
@@ -395,7 +395,7 @@ def _delete_secret(data):
             "RecoveryWindowInDays value must be between 7 and 30 days (inclusive).", 400,
         )
 
-    now = time.time()
+    now = int(time.time())
     deletion_date = now if force else now + window * 86400
 
     if force:
@@ -445,11 +445,11 @@ def _update_secret(data):
 
     has_new_value = "SecretString" in data or "SecretBinary" in data
     if not has_new_value:
-        secret["LastChangedDate"] = time.time()
+        secret["LastChangedDate"] = int(time.time())
         return json_response({"ARN": secret["ARN"], "Name": secret["Name"]})
 
     vid = new_uuid()
-    now = time.time()
+    now = int(time.time())
     secret["Versions"][vid] = {
         "SecretString": data.get("SecretString"),
         "SecretBinary": data.get("SecretBinary"),
@@ -510,7 +510,7 @@ def _put_secret_value(data):
 
     vid = data.get("ClientRequestToken", new_uuid())
     stages = data.get("VersionStages", ["AWSCURRENT"])
-    now = time.time()
+    now = int(time.time())
 
     secret["Versions"][vid] = {
         "SecretString": data.get("SecretString"),
@@ -613,7 +613,7 @@ def _update_secret_version_stage(data):
             _remove_stage_everywhere(secret, "AWSPREVIOUS")
             _add_stage(secret, old_current_vid, "AWSPREVIOUS")
 
-    secret["LastChangedDate"] = time.time()
+    secret["LastChangedDate"] = int(time.time())
     return json_response({"ARN": secret["ARN"], "Name": secret["Name"]})
 
 
@@ -710,7 +710,7 @@ def _rotate_secret(data):
     secret["RotationEnabled"] = True
 
     vid = data.get("ClientRequestToken", new_uuid())
-    now = time.time()
+    now = int(time.time())
 
     curr_vid, curr_ver = _find_stage_version(secret, "AWSCURRENT")
     secret["Versions"][vid] = {

@@ -123,7 +123,7 @@ def _create_repository(data):
         "registryId": _registry_id(),
         "repositoryName": name,
         "repositoryUri": _repo_uri(name),
-        "createdAt": time.time(),
+        "createdAt": int(time.time()),
         "imageTagMutability": data.get("imageTagMutability", "MUTABLE"),
         "imageScanningConfiguration": data.get("imageScanningConfiguration", {"scanOnPush": False}),
         "encryptionConfiguration": data.get("encryptionConfiguration", {"encryptionType": "AES256"}),
@@ -202,7 +202,7 @@ def _put_image(data):
         "imageManifest": manifest,
         "imageManifestMediaType": manifest_type,
         "imageTags": [tag] if tag else [],
-        "imagePushedAt": time.time(),
+        "imagePushedAt": int(time.time()),
         "imageDigest": digest,
     }
     if tag:
@@ -329,7 +329,7 @@ def _describe_images(data):
             "imageDigest": img["imageDigest"],
             "imageTags": img.get("imageTags", []),
             "imageSizeInBytes": len(manifest),
-            "imagePushedAt": img.get("imagePushedAt", time.time()),
+            "imagePushedAt": img.get("imagePushedAt", int(time.time())),
             "imageManifestMediaType": img.get("imageManifestMediaType",
                 "application/vnd.docker.distribution.manifest.v2+json"),
             "artifactMediaType": img.get("imageManifestMediaType",
@@ -344,7 +344,7 @@ def _get_authorization_token(data):
     return json_response({
         "authorizationData": [{
             "authorizationToken": token,
-            "expiresAt": time.time() + 43200,
+            "expiresAt": int(time.time()) + 43200,
             "proxyEndpoint": f"https://{get_account_id()}.dkr.ecr.{REGION}.amazonaws.com",
         }]
     })
@@ -421,7 +421,7 @@ def _get_lifecycle_policy(data):
         "registryId": _registry_id(),
         "repositoryName": name,
         "lifecyclePolicyText": _lifecycle_policies[name],
-        "lastEvaluatedAt": time.time(),
+        "lastEvaluatedAt": int(time.time()),
     })
 
 
@@ -438,7 +438,7 @@ def _delete_lifecycle_policy(data):
         "registryId": _registry_id(),
         "repositoryName": name,
         "lifecyclePolicyText": policy,
-        "lastEvaluatedAt": time.time(),
+        "lastEvaluatedAt": int(time.time()),
     })
 
 

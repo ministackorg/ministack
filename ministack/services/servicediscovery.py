@@ -134,7 +134,7 @@ def _create_operation(op_type: str, targets=None):
     op_id = new_uuid()
     targets = targets or {}
 
-    now = time.time()
+    now = int(time.time())
     op = {
         "Id": op_id,
         "Status": "SUCCESS",
@@ -189,7 +189,7 @@ async def _create_namespace(data):
         "Name": ns_name,
         "Type": ns_type,
         "Description": data.get("Description"),
-        "CreateDate": time.time(),
+        "CreateDate": int(time.time()),
     }
 
     if ns_type != "HTTP":
@@ -287,7 +287,7 @@ def _create_service(data):
         "DnsConfig": data.get("DnsConfig"),
         "HealthCheckConfig": data.get("HealthCheckConfig"),
         "HealthCheckCustomConfig": data.get("HealthCheckCustomConfig"),
-        "CreateDate": time.time(),
+        "CreateDate": int(time.time()),
     }
     _services[svc_id] = service
     _service_attributes.setdefault(svc_id, {})

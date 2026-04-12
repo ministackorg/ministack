@@ -188,7 +188,7 @@ def _create_database(data):
         "Description": db_input.get("Description", ""),
         "LocationUri": db_input.get("LocationUri", ""),
         "Parameters": db_input.get("Parameters", {}),
-        "CreateTime": time.time(),
+        "CreateTime": int(time.time()),
         "CatalogId": get_account_id(),
     }
     return json_response({})
@@ -245,9 +245,9 @@ def _create_table(data):
         "DatabaseName": db_name,
         "Description": table_input.get("Description", ""),
         "Owner": table_input.get("Owner", ""),
-        "CreateTime": time.time(),
-        "UpdateTime": time.time(),
-        "LastAccessTime": time.time(),
+        "CreateTime": int(time.time()),
+        "UpdateTime": int(time.time()),
+        "LastAccessTime": int(time.time()),
         "StorageDescriptor": table_input.get("StorageDescriptor", {}),
         "PartitionKeys": table_input.get("PartitionKeys", []),
         "TableType": table_input.get("TableType", "EXTERNAL_TABLE"),
@@ -299,7 +299,7 @@ def _update_table(data):
     for k in safe_keys:
         if k in table_input:
             _tables[key][k] = table_input[k]
-    _tables[key]["UpdateTime"] = time.time()
+    _tables[key]["UpdateTime"] = int(time.time())
     return json_response({})
 
 
@@ -339,8 +339,8 @@ def _create_partition(data):
         **partition_input,
         "DatabaseName": db_name,
         "TableName": table_name,
-        "CreationTime": time.time(),
-        "LastAccessTime": time.time(),
+        "CreationTime": int(time.time()),
+        "LastAccessTime": int(time.time()),
         "CatalogId": get_account_id(),
     })
     return json_response({})
@@ -393,7 +393,7 @@ def _batch_create_partition(data):
                 **pi,
                 "DatabaseName": db_name,
                 "TableName": table_name,
-                "CreationTime": time.time(),
+                "CreationTime": int(time.time()),
                 "CatalogId": get_account_id(),
             })
     return json_response({"Errors": errors})
@@ -450,7 +450,7 @@ def _get_partition_indexes(data):
 def _create_connection(data):
     conn_input = data.get("ConnectionInput", {})
     name = conn_input.get("Name")
-    _connections[name] = {**conn_input, "CreationTime": time.time(), "LastUpdatedTime": time.time()}
+    _connections[name] = {**conn_input, "CreationTime": int(time.time()), "LastUpdatedTime": int(time.time())}
     return json_response({})
 
 
@@ -491,8 +491,8 @@ def _create_crawler(data):
         "LineageConfiguration": data.get("LineageConfiguration", {}),
         "State": "READY",
         "CrawlElapsedTime": 0,
-        "CreationTime": time.time(),
-        "LastUpdated": time.time(),
+        "CreationTime": int(time.time()),
+        "LastUpdated": int(time.time()),
         "LastCrawl": None,
         "Version": 1,
         "Configuration": data.get("Configuration", ""),
@@ -536,7 +536,7 @@ def _update_crawler(data):
                 crawler["Schedule"] = {"ScheduleExpression": sched} if isinstance(sched, str) else sched
             else:
                 crawler[k] = data[k]
-    crawler["LastUpdated"] = time.time()
+    crawler["LastUpdated"] = int(time.time())
     crawler["Version"] = crawler.get("Version", 1) + 1
     return json_response({})
 
@@ -564,7 +564,7 @@ def _start_crawler(data):
                 "LogStream": new_uuid(),
                 "MessagePrefix": "",
                 "StartTime": start_time,
-                "EndTime": time.time(),
+                "EndTime": int(time.time()),
             }
             logger.info("Glue: Crawler %s finished after %ss", name, CRAWLER_RUN_SECONDS)
 
@@ -631,8 +631,8 @@ def _create_job(data):
         "MaxCapacity": data.get("MaxCapacity"),
         "SecurityConfiguration": data.get("SecurityConfiguration", ""),
         "Tags": data.get("Tags", {}),
-        "CreatedOn": time.time(),
-        "LastModifiedOn": time.time(),
+        "CreatedOn": int(time.time()),
+        "LastModifiedOn": int(time.time()),
     }
     _job_runs[name] = []
     return json_response({"Name": name})
@@ -669,7 +669,7 @@ def _update_job(data):
     for k in updatable:
         if k in job_update:
             _jobs[name][k] = job_update[k]
-    _jobs[name]["LastModifiedOn"] = time.time()
+    _jobs[name]["LastModifiedOn"] = int(time.time())
     return json_response({"JobName": name})
 
 
@@ -702,8 +702,8 @@ def _start_job_run(data):
     run = {
         "Id": run_id,
         "JobName": job_name,
-        "StartedOn": time.time(),
-        "LastModifiedOn": time.time(),
+        "StartedOn": int(time.time()),
+        "LastModifiedOn": int(time.time()),
         "CompletedOn": None,
         "JobRunState": "STARTING",
         "Arguments": args,
@@ -726,7 +726,7 @@ def _start_job_run(data):
 
     def _execute():
         run["JobRunState"] = "RUNNING"
-        run["LastModifiedOn"] = time.time()
+        run["LastModifiedOn"] = int(time.time())
 
         script_location = job.get("Command", {}).get("ScriptLocation", "")
         resolved = _resolve_script(script_location)
@@ -757,9 +757,9 @@ def _start_job_run(data):
         else:
             run["JobRunState"] = "SUCCEEDED"
 
-        run["CompletedOn"] = time.time()
+        run["CompletedOn"] = int(time.time())
         run["ExecutionTime"] = int(run["CompletedOn"] - run["StartedOn"])
-        run["LastModifiedOn"] = time.time()
+        run["LastModifiedOn"] = int(time.time())
 
     thread = threading.Thread(target=_execute, daemon=True)
     thread.start()
@@ -792,8 +792,8 @@ def _batch_stop_job_run(data):
             if run["Id"] == run_id:
                 if run["JobRunState"] in ("STARTING", "RUNNING"):
                     run["JobRunState"] = "STOPPED"
-                    run["CompletedOn"] = time.time()
-                    run["LastModifiedOn"] = time.time()
+                    run["CompletedOn"] = int(time.time())
+                    run["LastModifiedOn"] = int(time.time())
                     successful.append({"JobName": job_name, "JobRunId": run_id})
                 else:
                     errors.append({"JobName": job_name, "JobRunId": run_id,
@@ -819,7 +819,7 @@ def _create_security_configuration(data):
             f"Security configuration {name} already exists", 400)
     _security_configs[name] = {
         "Name": name,
-        "CreatedTimeStamp": time.time(),
+        "CreatedTimeStamp": int(time.time()),
         "EncryptionConfiguration": data.get("EncryptionConfiguration", {}),
     }
     return json_response({"Name": name, "CreatedTimestamp": _security_configs[name]["CreatedTimeStamp"]})
@@ -869,7 +869,7 @@ def _create_classifier(data):
 
     cls_type = "GrokClassifier" if grok else "XMLClassifier" if xml_cls else "JsonClassifier" if json_cls else "CsvClassifier"
     _classifiers[name] = {
-        cls_type: {**classifier, "CreationTime": time.time(), "LastUpdated": time.time(), "Version": 1},
+        cls_type: {**classifier, "CreationTime": int(time.time()), "LastUpdated": int(time.time()), "Version": 1},
     }
     return json_response({})
 
@@ -914,8 +914,8 @@ def _create_trigger(data):
         "Description": data.get("Description", ""),
         "WorkflowName": data.get("WorkflowName", ""),
         "Tags": data.get("Tags", {}),
-        "CreatedOn": time.time(),
-        "LastModifiedOn": time.time(),
+        "CreatedOn": int(time.time()),
+        "LastModifiedOn": int(time.time()),
     }
     if data.get("StartOnCreation", False):
         _triggers[name]["State"] = "ACTIVATED"
@@ -951,7 +951,7 @@ def _update_trigger(data):
     for k in updatable:
         if k in trigger_update:
             _triggers[name][k] = trigger_update[k]
-    _triggers[name]["LastModifiedOn"] = time.time()
+    _triggers[name]["LastModifiedOn"] = int(time.time())
     return json_response({"Trigger": _triggers[name]})
 
 
@@ -960,7 +960,7 @@ def _start_trigger(data):
     if name not in _triggers:
         return error_response_json("EntityNotFoundException", f"Trigger {name} not found", 400)
     _triggers[name]["State"] = "ACTIVATED"
-    _triggers[name]["LastModifiedOn"] = time.time()
+    _triggers[name]["LastModifiedOn"] = int(time.time())
     return json_response({"Name": name})
 
 
@@ -969,7 +969,7 @@ def _stop_trigger(data):
     if name not in _triggers:
         return error_response_json("EntityNotFoundException", f"Trigger {name} not found", 400)
     _triggers[name]["State"] = "DEACTIVATED"
-    _triggers[name]["LastModifiedOn"] = time.time()
+    _triggers[name]["LastModifiedOn"] = int(time.time())
     return json_response({"Name": name})
 
 
@@ -1016,8 +1016,8 @@ def _create_workflow(data):
         "Name": name,
         "Description": data.get("Description", ""),
         "DefaultRunProperties": data.get("DefaultRunProperties", {}),
-        "CreatedOn": time.time(),
-        "LastModifiedOn": time.time(),
+        "CreatedOn": int(time.time()),
+        "LastModifiedOn": int(time.time()),
         "MaxConcurrentRuns": data.get("MaxConcurrentRuns", 0),
     }
     if data.get("Tags"):
@@ -1055,7 +1055,7 @@ def _update_workflow(data):
     for k in ("Description", "DefaultRunProperties", "MaxConcurrentRuns"):
         if k in data:
             _workflows[name][k] = data[k]
-    _workflows[name]["LastModifiedOn"] = time.time()
+    _workflows[name]["LastModifiedOn"] = int(time.time())
     return json_response({"Name": name})
 
 
@@ -1068,7 +1068,7 @@ def _start_workflow_run(data):
         "WorkflowRunId": run_id,
         "Name": name,
         "Status": "RUNNING",
-        "StartedOn": time.time(),
+        "StartedOn": int(time.time()),
         "CompletedOn": None,
         "Statistics": {
             "TotalActions": 0, "RunningActions": 0, "StoppedActions": 0,
