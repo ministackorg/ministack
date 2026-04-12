@@ -292,6 +292,9 @@ def _describe_policies(p):
                     f"<PolicyName>{pol['PolicyName']}</PolicyName>"
                     f"<AutoScalingGroupName>{pol['AutoScalingGroupName']}</AutoScalingGroupName>"
                     f"<PolicyType>{pol['PolicyType']}</PolicyType>"
+                    f"<AdjustmentType>{pol.get('AdjustmentType', '')}</AdjustmentType>"
+                    f"<ScalingAdjustment>{pol.get('ScalingAdjustment', 0)}</ScalingAdjustment>"
+                    f"<Cooldown>{pol.get('Cooldown', 300)}</Cooldown>"
                     f"</member>")
     return _xml(200, "DescribePoliciesResponse",
                 f"<DescribePoliciesResult><ScalingPolicies>{members}</ScalingPolicies></DescribePoliciesResult>")

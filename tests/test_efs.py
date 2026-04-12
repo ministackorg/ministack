@@ -6,6 +6,7 @@ import zipfile
 from urllib.parse import urlparse
 import pytest
 from botocore.exceptions import ClientError
+from botocore.exceptions import ClientError
 import uuid as _uuid_mod
 
 def test_efs_create_and_describe_filesystem(efs):
@@ -35,8 +36,9 @@ def test_efs_delete_filesystem(efs):
     resp = efs.create_file_system()
     fs_id = resp["FileSystemId"]
     efs.delete_file_system(FileSystemId=fs_id)
-    desc = efs.describe_file_systems(FileSystemId=fs_id)
-    assert len(desc["FileSystems"]) == 0
+    with pytest.raises(ClientError) as exc:
+        efs.describe_file_systems(FileSystemId=fs_id)
+    assert exc.value.response["Error"]["Code"] == "FileSystemNotFound"
 
 def test_efs_mount_target(efs):
     fs = efs.create_file_system()

@@ -293,7 +293,7 @@ async def handle_request(method, path, headers, body, query_params):
     handler = handlers.get(action)
     if not handler:
         return _error(
-            "InvalidAction", f"Unknown action: {action}", 400, is_cbor or is_json
+            "InvalidAction", f"Unknown action: {action}", 400, use_json=is_json, use_cbor=is_cbor
         )
     return handler(params, cbor_data, is_cbor, is_json)
 
@@ -1098,7 +1098,7 @@ def _set_alarm_state(params, cbor_data, is_cbor, is_json=False):
     alarm = _alarms.get(name) or _composite_alarms.get(name)
     if not alarm:
         return _error(
-            "ResourceNotFound", f"Alarm {name} not found", 404, is_cbor or is_json
+            "ResourceNotFound", f"Alarm {name} not found", 404, use_json=is_json, use_cbor=is_cbor
         )
 
     old_state = alarm["StateValue"]
@@ -1217,7 +1217,7 @@ def _put_dashboard(params, cbor_data, is_cbor, is_json=False):
             "InvalidParameterValue",
             "DashboardName is required",
             400,
-            is_cbor or is_json,
+            use_json=is_json, use_cbor=is_cbor,
         )
 
     _dashboards[name] = {
@@ -1251,7 +1251,7 @@ def _get_dashboard(params, cbor_data, is_cbor, is_json=False):
             "ResourceNotFound",
             f"Dashboard {name} does not exist",
             404,
-            is_cbor or is_json,
+            use_json=is_json, use_cbor=is_cbor,
         )
 
     if is_cbor:
@@ -1386,18 +1386,18 @@ def _xml(status, root_tag, inner):
     return status, {"Content-Type": "application/xml"}, body
 
 
-def _error(code, message, status, use_json=False):
-    if use_json:
+def _error(code, message, status, use_json=False, use_cbor=False):
+    if use_cbor:
         try:
             import cbor2
-
             body = cbor2.dumps({"__type": code, "message": message})
-            return status, {"Content-Type": "application/cbor"}, body
-        except Exception:
+            return status, {"Content-Type": "application/cbor", "smithy-protocol": "rpc-v2-cbor"}, body
+        except ImportError:
             pass
+    if use_json or use_cbor:
         return (
             status,
-            {"Content-Type": "application/json"},
+            {"Content-Type": "application/x-amz-json-1.0"},
             json.dumps({"__type": code, "message": message}).encode(),
         )
     body = (

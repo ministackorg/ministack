@@ -76,7 +76,7 @@ def _json(status, body):
 # ---------------------------------------------------------------------------
 
 def _create_graphql_api(body):
-    api_id = new_uuid()[:8]
+    api_id = new_uuid().replace("-", "")[:26]
     name = body.get("name", "")
     auth_type = body.get("authenticationType", "API_KEY")
     additional_auth = body.get("additionalAuthenticationProviders", [])

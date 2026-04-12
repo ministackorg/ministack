@@ -105,6 +105,9 @@ def _describe_file_systems(query):
     creation_token = query.get("CreationToken")
     max_items = int(query.get("MaxItems", 100))
 
+    if fs_id and fs_id not in _file_systems:
+        return _error(404, "FileSystemNotFound", f"File system '{fs_id}' does not exist.")
+
     results = []
     for fs in _file_systems.values():
         if fs_id and fs["FileSystemId"] != fs_id:
@@ -185,6 +188,9 @@ def _describe_mount_targets(query):
     fs_id = query.get("FileSystemId")
     mt_id = query.get("MountTargetId")
     max_items = int(query.get("MaxItems", 100))
+
+    if mt_id and mt_id not in _mount_targets:
+        return _error(404, "MountTargetNotFound", f"Mount target '{mt_id}' does not exist.")
 
     results = []
     for mt in _mount_targets.values():

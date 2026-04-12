@@ -324,8 +324,15 @@ def _create_distribution(headers, body):
     if config_el is None:
         return _error("MalformedXML", "The XML document is malformed.", 400)
 
-    if not _text(config_el, "CallerReference"):
+    caller_ref = _text(config_el, "CallerReference")
+    if not caller_ref:
         return _error("InvalidArgument", "CallerReference is required.", 400)
+    # CallerReference idempotency — return existing distribution if CallerReference matches
+    for existing in _distributions.values():
+        if existing.get("CallerReference") == caller_ref:
+            def build(root, _dist=existing):
+                _build_distribution_xml(root, _dist)
+            return _xml_response("Distribution", build, status=200, extra_headers={"ETag": existing["ETag"]})
     if _find(config_el, "Origins") is None:
         return _error("InvalidArgument", "Origins is required.", 400)
     if _find(config_el, "DefaultCacheBehavior") is None:
@@ -342,6 +349,7 @@ def _create_distribution(headers, body):
         "DomainName": f"{dist_id}.cloudfront.net",
         "LastModifiedTime": now,
         "ETag": etag,
+        "CallerReference": caller_ref,
         "config_xml": tostring(config_el, encoding="unicode"),
         "enabled": _get_enabled(config_el),
     }

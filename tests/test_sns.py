@@ -104,7 +104,7 @@ def test_sns_publish_nonexistent_topic(sns):
     fake_arn = "arn:aws:sns:us-east-1:000000000000:intg-sns-nonexist"
     with pytest.raises(ClientError) as exc:
         sns.publish(TopicArn=fake_arn, Message="fail")
-    assert exc.value.response["Error"]["Code"] == "NotFoundException"
+    assert exc.value.response["Error"]["Code"] == "NotFound"
 
 def test_sns_sqs_fanout(sns, sqs):
     topic_arn = sns.create_topic(Name="intg-sns-fanout")["TopicArn"]

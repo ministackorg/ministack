@@ -580,6 +580,8 @@ def _create_subnet_group(p):
 
 def _describe_subnet_groups(p):
     name = _p(p, "CacheSubnetGroupName")
+    if name and name not in _subnet_groups:
+        return _error("CacheSubnetGroupNotFoundFault", f"Cache subnet group {name} not found.", 404)
     groups = [_subnet_groups[name]] if name and name in _subnet_groups else list(_subnet_groups.values())
     members = "".join(
         f"<member><CacheSubnetGroupName>{g['CacheSubnetGroupName']}</CacheSubnetGroupName>"
@@ -593,6 +595,8 @@ def _describe_subnet_groups(p):
 
 def _delete_subnet_group(p):
     name = _p(p, "CacheSubnetGroupName")
+    if name not in _subnet_groups:
+        return _error("CacheSubnetGroupNotFoundFault", f"Cache subnet group {name} not found.", 404)
     sg = _subnet_groups.pop(name, None)
     if sg:
         _tags.pop(sg.get("ARN", ""), None)
@@ -654,6 +658,8 @@ def _create_param_group(p):
 
 def _describe_param_groups(p):
     name = _p(p, "CacheParameterGroupName")
+    if name and name not in _param_groups:
+        return _error("CacheParameterGroupNotFound", f"Cache parameter group {name} not found.", 404)
     groups = [_param_groups[name]] if name and name in _param_groups else list(_param_groups.values())
     members = "".join(
         f"<member><CacheParameterGroupName>{g['CacheParameterGroupName']}</CacheParameterGroupName>"
@@ -668,6 +674,8 @@ def _describe_param_groups(p):
 
 def _delete_param_group(p):
     name = _p(p, "CacheParameterGroupName")
+    if name not in _param_groups:
+        return _error("CacheParameterGroupNotFound", f"Cache parameter group {name} not found.", 404)
     pg = _param_groups.pop(name, None)
     _param_group_params.pop(name, None)
     if pg:

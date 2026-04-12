@@ -316,6 +316,23 @@ def _run_instances(p):
         }
         created.append(_instances[instance_id])
 
+    # Process TagSpecifications
+    i = 1
+    while _p(p, f"TagSpecification.{i}.ResourceType"):
+        rtype = _p(p, f"TagSpecification.{i}.ResourceType")
+        spec_tags = []
+        j = 1
+        while _p(p, f"TagSpecification.{i}.Tag.{j}.Key"):
+            spec_tags.append({
+                "Key": _p(p, f"TagSpecification.{i}.Tag.{j}.Key"),
+                "Value": _p(p, f"TagSpecification.{i}.Tag.{j}.Value", ""),
+            })
+            j += 1
+        if rtype == "instance" and spec_tags:
+            for inst in created:
+                _tags[inst["InstanceId"]] = spec_tags[:]
+        i += 1
+
     items = "".join(_instance_xml(i) for i in created)
     inner = f"""<instancesSet>{items}</instancesSet>
     <reservationId>r-{new_uuid().replace('-','')[:17]}</reservationId>
@@ -334,6 +351,11 @@ def _describe_instances(p):
              and time.time() - v.get("_terminated_at", 0) > 60]
     for k in stale:
         _instances.pop(k, None)
+
+    if filter_ids:
+        for iid in filter_ids:
+            if iid not in _instances:
+                return _error("InvalidInstanceID.NotFound", f"The instance ID '{iid}' does not exist", 400)
 
     results = []
     for inst in _instances.values():
@@ -525,6 +547,10 @@ def _delete_security_group(p):
 def _describe_security_groups(p):
     filter_ids = _parse_member_list(p, "GroupId")
     filters = _parse_filters(p)
+    if filter_ids:
+        for gid in filter_ids:
+            if gid not in _security_groups:
+                return _error("InvalidGroup.NotFound", f"The security group '{gid}' does not exist", 400)
     items = ""
     for sg in _security_groups.values():
         if filter_ids and sg["GroupId"] not in filter_ids:
@@ -625,6 +651,10 @@ def _delete_key_pair(p):
 
 def _describe_key_pairs(p):
     filter_names = _parse_member_list(p, "KeyName")
+    if filter_names:
+        for kn in filter_names:
+            if kn not in _key_pairs:
+                return _error("InvalidKeyPair.NotFound", f"The key pair '{kn}' does not exist", 400)
     items = ""
     for kp in _key_pairs.values():
         if filter_names and kp["KeyName"] not in filter_names:
@@ -659,12 +689,46 @@ def _import_key_pair(p):
 
 def _describe_vpcs(p):
     filter_ids = _parse_member_list(p, "VpcId")
+    if filter_ids:
+        for vid in filter_ids:
+            if vid not in _vpcs:
+                return _error("InvalidVpcID.NotFound", f"The vpc ID '{vid}' does not exist", 400)
+    filters = _parse_filters(p)
     items = ""
     for vpc in _vpcs.values():
         if filter_ids and vpc["VpcId"] not in filter_ids:
             continue
+        if not _matches_vpc_filters(vpc, filters):
+            continue
         items += _vpc_xml(vpc)
     return _xml(200, "DescribeVpcsResponse", f"<vpcSet>{items}</vpcSet>")
+
+
+def _matches_vpc_filters(vpc, filters):
+    for name, vals in filters.items():
+        if name == "vpc-id":
+            if vpc["VpcId"] not in vals:
+                return False
+        elif name == "cidr" or name == "cidr-block-association.cidr-block":
+            if vpc["CidrBlock"] not in vals:
+                return False
+        elif name == "state":
+            if vpc["State"] not in vals:
+                return False
+        elif name == "owner-id":
+            if vpc["OwnerId"] not in vals:
+                return False
+        elif name == "is-default":
+            is_def = "true" if vpc["IsDefault"] else "false"
+            if is_def not in vals:
+                return False
+        elif name.startswith("tag:"):
+            tag_key = name[4:]
+            tag_list = _tags.get(vpc["VpcId"], [])
+            tag_val = next((t["Value"] for t in tag_list if t["Key"] == tag_key), None)
+            if tag_val not in vals:
+                return False
+    return True
 
 
 def _create_vpc(p):
@@ -725,6 +789,10 @@ def _delete_vpc(p):
 def _describe_subnets(p):
     filter_ids = _parse_member_list(p, "SubnetId")
     filters = _parse_filters(p)
+    if filter_ids:
+        for sid in filter_ids:
+            if sid not in _subnets:
+                return _error("InvalidSubnetID.NotFound", f"The subnet ID '{sid}' does not exist", 400)
     items = ""
     for subnet in _subnets.values():
         if filter_ids and subnet["SubnetId"] not in filter_ids:
@@ -1257,6 +1325,19 @@ def _describe_addresses(p):
 # Tags
 # ---------------------------------------------------------------------------
 
+
+def _tag_set_xml(resource_id):
+    """Build <tagSet> XML from _tags for a resource. Returns <tagSet/> if no tags."""
+    tag_list = _tags.get(resource_id, [])
+    if not tag_list:
+        return "<tagSet/>"
+    items = "".join(
+        f"<item><key>{_esc(t['Key'])}</key><value>{_esc(t.get('Value', ''))}</value></item>"
+        for t in tag_list
+    )
+    return f"<tagSet>{items}</tagSet>"
+
+
 def _create_tags(p):
     resource_ids = _parse_member_list(p, "ResourceId")
     tags = _parse_tags(p)
@@ -1361,6 +1442,10 @@ def _delete_volume(p):
 
 def _describe_volumes(p):
     filter_ids = _parse_member_list(p, "VolumeId")
+    if filter_ids:
+        for vid in filter_ids:
+            if vid not in _volumes:
+                return _error("InvalidVolume.NotFound", f"The volume '{vid}' does not exist", 400)
     items = ""
     for vol in _volumes.values():
         if filter_ids and vol["VolumeId"] not in filter_ids:
@@ -1554,6 +1639,10 @@ def _delete_snapshot(p):
 def _describe_snapshots(p):
     filter_ids = _parse_member_list(p, "SnapshotId")
     owner_ids = _parse_member_list(p, "Owner")
+    if filter_ids:
+        for sid in filter_ids:
+            if sid not in _snapshots:
+                return _error("InvalidSnapshot.NotFound", f"The snapshot '{sid}' does not exist", 400)
     items = ""
     for snap in _snapshots.values():
         if filter_ids and snap["SnapshotId"] not in filter_ids:
@@ -1681,7 +1770,7 @@ def _sg_xml(sg):
         <vpcId>{sg['VpcId']}</vpcId>
         <ipPermissions>{ingress}</ipPermissions>
         <ipPermissionsEgress>{egress}</ipPermissionsEgress>
-        <tagSet/>
+        {_tag_set_xml(sg['GroupId'])}
     </item>"""
 
 
@@ -1712,7 +1801,7 @@ def _vpc_fields_xml(vpc, tag="item"):
         {'<defaultNetworkAclId>' + vpc.get('DefaultNetworkAclId', '') + '</defaultNetworkAclId>' if vpc.get('DefaultNetworkAclId') else ''}
         {'<defaultSecurityGroupId>' + vpc.get('DefaultSecurityGroupId', '') + '</defaultSecurityGroupId>' if vpc.get('DefaultSecurityGroupId') else ''}
         {'<mainRouteTableId>' + vpc.get('MainRouteTableId', '') + '</mainRouteTableId>' if vpc.get('MainRouteTableId') else ''}
-        <tagSet/>
+        {_tag_set_xml(vpc['VpcId'])}
     </{tag}>"""
 
 
@@ -1732,7 +1821,7 @@ def _subnet_fields_xml(subnet, tag="item"):
         <defaultForAz>{'true' if subnet['DefaultForAz'] else 'false'}</defaultForAz>
         <mapPublicIpOnLaunch>{'true' if subnet['MapPublicIpOnLaunch'] else 'false'}</mapPublicIpOnLaunch>
         <ownerId>{subnet['OwnerId']}</ownerId>
-        <tagSet/>
+        {_tag_set_xml(subnet['SubnetId'])}
     </{tag}>"""
 
 
@@ -1749,7 +1838,7 @@ def _igw_fields_xml(igw, tag="item"):
         <internetGatewayId>{igw['InternetGatewayId']}</internetGatewayId>
         <ownerId>{igw['OwnerId']}</ownerId>
         <attachmentSet>{attachments}</attachmentSet>
-        <tagSet/>
+        {_tag_set_xml(igw['InternetGatewayId'])}
     </{tag}>"""
 
 
