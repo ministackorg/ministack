@@ -143,7 +143,7 @@ def _ts_to_epoch(value):
         return value
     try:
         from datetime import datetime, timezone
-        return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+        return int(datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp())
     except (ValueError, TypeError):
         return value
 

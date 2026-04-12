@@ -53,7 +53,7 @@ def _ap_id():
     return "fsap-" + "".join(random.choices(string.hexdigits[:16], k=17))
 
 def _now_iso():
-    return time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime())
+    return int(time.time())
 
 # ---------------------------------------------------------------------------
 # File Systems

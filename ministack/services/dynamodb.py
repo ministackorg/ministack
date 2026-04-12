@@ -200,7 +200,12 @@ async def handle_request(method: str, path: str, headers: dict, body: bytes, que
     handler = handlers.get(action)
     if not handler:
         return error_response_json("UnknownOperationException", f"Unknown operation: {action}", 400)
-    return handler(data)
+    status, resp_headers, resp_body = handler(data)
+    # Add CRC32 checksum — Go SDK v2 DynamoDB client validates this on Close()
+    import zlib
+    body_bytes = resp_body if isinstance(resp_body, bytes) else resp_body.encode("utf-8")
+    resp_headers["x-amz-crc32"] = str(zlib.crc32(body_bytes) & 0xFFFFFFFF)
+    return status, resp_headers, resp_body
 
 
 # ---------------------------------------------------------------------------

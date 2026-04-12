@@ -573,8 +573,9 @@ def _authorize_sg_ingress(p):
         return _error("InvalidGroup.NotFound", f"Security group {sg_id} not found", 400)
     rules = _parse_ip_permissions(p, "IpPermissions")
     for r in rules:
-        if r not in sg["IpPermissions"]:
-            sg["IpPermissions"].append(r)
+        if r in sg["IpPermissions"]:
+            return _error("InvalidPermission.Duplicate", "The specified rule already exists", 400)
+        sg["IpPermissions"].append(r)
     return _xml(200, "AuthorizeSecurityGroupIngressResponse", "<return>true</return>")
 
 
@@ -733,6 +734,11 @@ def _matches_vpc_filters(vpc, filters):
 
 def _create_vpc(p):
     cidr = _p(p, "CidrBlock") or "10.0.0.0/16"
+    try:
+        import ipaddress
+        ipaddress.ip_network(cidr, strict=False)
+    except ValueError:
+        return _error("InvalidParameterValue", f"Value ({cidr}) for parameter cidrBlock is invalid.", 400)
     vpc_id = _new_vpc_id()
     # Per-VPC default network ACL
     acl_id = "acl-" + "".join(random.choices(string.hexdigits[:16], k=17))
@@ -866,6 +872,10 @@ def _delete_internet_gateway(p):
 
 def _describe_internet_gateways(p):
     filter_ids = _parse_member_list(p, "InternetGatewayId")
+    if filter_ids:
+        for gid in filter_ids:
+            if gid not in _internet_gateways:
+                return _error("InvalidInternetGatewayID.NotFound", f"The internet gateway ID '{gid}' does not exist", 400)
     items = ""
     for igw in _internet_gateways.values():
         if filter_ids and igw["InternetGatewayId"] not in filter_ids:
@@ -1426,6 +1436,19 @@ def _create_volume(p):
         "MultiAttachEnabled": False,
         "Throughput": 125 if vol_type == "gp3" else 0,
     }
+    # Process TagSpecifications
+    i = 1
+    while _p(p, f"TagSpecification.{i}.ResourceType"):
+        if _p(p, f"TagSpecification.{i}.ResourceType") == "volume":
+            vol_tags = []
+            j = 1
+            while _p(p, f"TagSpecification.{i}.Tag.{j}.Key"):
+                vol_tags.append({"Key": _p(p, f"TagSpecification.{i}.Tag.{j}.Key"),
+                                 "Value": _p(p, f"TagSpecification.{i}.Tag.{j}.Value", "")})
+                j += 1
+            if vol_tags:
+                _tags[vol_id] = vol_tags
+        i += 1
     return _xml(200, "CreateVolumeResponse", _volume_inner_xml(_volumes[vol_id]))
 
 
@@ -1625,6 +1648,19 @@ def _create_snapshot(p):
         "Encrypted": vol["Encrypted"],
         "StorageTier": "standard",
     }
+    # Process TagSpecifications
+    i = 1
+    while _p(p, f"TagSpecification.{i}.ResourceType"):
+        if _p(p, f"TagSpecification.{i}.ResourceType") == "snapshot":
+            snap_tags = []
+            j = 1
+            while _p(p, f"TagSpecification.{i}.Tag.{j}.Key"):
+                snap_tags.append({"Key": _p(p, f"TagSpecification.{i}.Tag.{j}.Key"),
+                                  "Value": _p(p, f"TagSpecification.{i}.Tag.{j}.Value", "")})
+                j += 1
+            if snap_tags:
+                _tags[snap_id] = snap_tags
+        i += 1
     return _xml(200, "CreateSnapshotResponse", _snapshot_inner_xml(_snapshots[snap_id]))
 
 

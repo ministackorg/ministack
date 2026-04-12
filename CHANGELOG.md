@@ -10,6 +10,14 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 ## [1.2.6] — 2026-04-12
 
 ### Fixed
+- **EFS timestamp format** — `CreationTime` now returns integer epoch seconds instead of ISO string, fixing Java SDK v2 unmarshalling errors.
+- **ECS timestamps** — `createdAt` and other timestamp fields now return integer epoch seconds instead of floats with sub-second precision.
+- **DynamoDB `X-Amz-Crc32` header** — all DynamoDB responses now include the CRC32 checksum header, fixing Go SDK v2 `failed to close HTTP response body` warnings.
+- **EC2 DescribeInternetGateways not-found** — returns `InvalidInternetGatewayID.NotFound` for nonexistent IDs.
+- **EC2 CreateVpc CIDR validation** — rejects invalid CIDR blocks with `InvalidParameterValue`.
+- **EC2 duplicate security group rule** — `AuthorizeSecurityGroupIngress` returns `InvalidPermission.Duplicate` for existing rules.
+- **EC2 CreateVolume/CreateSnapshot TagSpecifications** — tags specified in `TagSpecifications` are now persisted.
+- **ElastiCache CreateCacheSubnetGroup** — `DescribeCacheSubnetGroups` now returns the `Subnets` list with subnet identifiers and availability zones.
 - **SNS error code** — `GetTopicAttributes`, `Publish`, and other operations on nonexistent topics now return `NotFound` instead of `NotFoundException`, matching real AWS.
 - **LocalStack init script path compatibility** — now supports `/etc/localstack/init/ready.d/` in addition to `/docker-entrypoint-initaws.d/ready.d/` for drop-in LocalStack replacement.
 - **CloudWatch error response protocol mismatch** — error responses now match the request protocol (JSON errors for JSON requests, CBOR errors for CBOR requests). Previously, JSON-protocol requests received CBOR-encoded errors causing boto3 `UnicodeDecodeError`.

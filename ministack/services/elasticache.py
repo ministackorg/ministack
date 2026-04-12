@@ -583,12 +583,20 @@ def _describe_subnet_groups(p):
     if name and name not in _subnet_groups:
         return _error("CacheSubnetGroupNotFoundFault", f"Cache subnet group {name} not found.", 404)
     groups = [_subnet_groups[name]] if name and name in _subnet_groups else list(_subnet_groups.values())
-    members = "".join(
-        f"<member><CacheSubnetGroupName>{g['CacheSubnetGroupName']}</CacheSubnetGroupName>"
-        f"<CacheSubnetGroupDescription>{g.get('CacheSubnetGroupDescription', '')}</CacheSubnetGroupDescription>"
-        f"<ARN>{g.get('ARN', '')}</ARN></member>"
-        for g in groups
-    )
+    members = ""
+    for g in groups:
+        subnets_xml = "".join(
+            f"<member><SubnetIdentifier>{s['SubnetIdentifier']}</SubnetIdentifier>"
+            f"<SubnetAvailabilityZone><Name>{s['SubnetAvailabilityZone']['Name']}</Name></SubnetAvailabilityZone></member>"
+            for s in g.get("Subnets", [])
+        )
+        members += (
+            f"<member><CacheSubnetGroupName>{g['CacheSubnetGroupName']}</CacheSubnetGroupName>"
+            f"<CacheSubnetGroupDescription>{g.get('CacheSubnetGroupDescription', '')}</CacheSubnetGroupDescription>"
+            f"<VpcId>{g.get('VpcId', '')}</VpcId>"
+            f"<Subnets>{subnets_xml}</Subnets>"
+            f"<ARN>{g.get('ARN', '')}</ARN></member>"
+        )
     return _xml(200, "DescribeCacheSubnetGroupsResponse",
         f"<DescribeCacheSubnetGroupsResult><CacheSubnetGroups>{members}</CacheSubnetGroups></DescribeCacheSubnetGroupsResult>")
 
