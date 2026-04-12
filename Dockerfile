@@ -22,8 +22,12 @@ COPY ministack/ ministack/
 
 RUN addgroup -S ministack && adduser -S ministack -G ministack
 RUN mkdir -p /tmp/ministack-data/s3 && chown -R ministack:ministack /tmp/ministack-data
-RUN mkdir -p /docker-entrypoint-initaws.d && chown ministack:ministack /docker-entrypoint-initaws.d
+RUN mkdir -p /docker-entrypoint-initaws.d/ready.d \
+             /etc/localstack/init/boot.d \
+             /etc/localstack/init/ready.d && \
+    chown -R ministack:ministack /docker-entrypoint-initaws.d /etc/localstack
 VOLUME /docker-entrypoint-initaws.d
+VOLUME /etc/localstack/init
 
 ENV GATEWAY_PORT=4566 \
     LOG_LEVEL=INFO \

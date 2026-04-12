@@ -609,15 +609,28 @@ ecs.stop_task(cluster="dev", task=task_arn)
 
 ### Startup Scripts
 
-MiniStack supports two types of init scripts:
+MiniStack supports two types of init scripts, with LocalStack-compatible paths:
 
-- **`/docker-entrypoint-initaws.d/*.sh`** — run before the server starts (for installing tools)
-- **`/docker-entrypoint-initaws.d/ready.d/*.sh`** — run after the server is ready and accepting connections (for seeding AWS resources)
+| Phase | MiniStack path | LocalStack-compatible path |
+|-------|----------------|---------------------------|
+| Pre-start | `/docker-entrypoint-initaws.d/*.sh` | `/etc/localstack/init/boot.d/*.sh` |
+| Post-ready | `/docker-entrypoint-initaws.d/ready.d/*.sh` | `/etc/localstack/init/ready.d/*.sh` |
+
+Scripts from both paths are merged, deduplicated by filename, and run in alphabetical order.
+If the same filename exists in both paths, the MiniStack-native path takes priority.
 
 ```bash
 # ready.d/01-create-resources.sh
 aws --endpoint-url=http://localhost:4566 s3 mb s3://my-bucket
 aws --endpoint-url=http://localhost:4566 sqs create-queue --queue-name my-queue
+```
+
+**Docker Compose** — mount scripts at either path:
+```yaml
+volumes:
+  - ./init-scripts:/docker-entrypoint-initaws.d           # ministack-native
+  # OR
+  - ./init-scripts:/etc/localstack/init                    # localstack-compatible
 ```
 
 ### Athena SQL Engines

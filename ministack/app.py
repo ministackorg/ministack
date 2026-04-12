@@ -693,18 +693,14 @@ async def _wait_for_port(port, timeout=30):
 
 
 async def _run_ready_scripts():
-    """Execute .sh scripts from /docker-entrypoint-initaws.d/ready.d/ after the server is ready."""
-    ready_dir = '/docker-entrypoint-initaws.d/ready.d'
-    if not os.path.isdir(ready_dir):
-        return
-    scripts = sorted(f for f in os.listdir(ready_dir) if f.endswith('.sh'))
+    """Execute .sh scripts from ready.d directories after the server is ready."""
+    scripts = _collect_scripts('/docker-entrypoint-initaws.d/ready.d', '/etc/localstack/init/ready.d')
     if not scripts:
         return
     port = int(_resolve_port())
     await _wait_for_port(port)
-    logger.info('Found %d ready script(s) in %s', len(scripts), ready_dir)
-    for script in scripts:
-        script_path = os.path.join(ready_dir, script)
+    logger.info('Found %d ready script(s)', len(scripts))
+    for script_path in scripts:
         logger.info('Running ready script: %s', script_path)
         try:
             proc = await asyncio.create_subprocess_exec(
@@ -728,17 +724,25 @@ async def _run_ready_scripts():
             logger.error('Failed to execute ready script %s: %s', script_path, e)
 
 
+def _collect_scripts(*dirs):
+    """Collect .sh scripts from multiple directories, deduped by filename."""
+    seen = {}
+    for d in dirs:
+        if not os.path.isdir(d):
+            continue
+        for f in sorted(os.listdir(d)):
+            if f.endswith('.sh') and f not in seen:
+                seen[f] = os.path.join(d, f)
+    return [seen[f] for f in sorted(seen)]
+
+
 def _run_init_scripts():
-    """Execute .sh scripts from /docker-entrypoint-initaws.d/ in alphabetical order."""
-    init_dir = "/docker-entrypoint-initaws.d"
-    if not os.path.isdir(init_dir):
-        return
-    scripts = sorted(f for f in os.listdir(init_dir) if f.endswith(".sh"))
+    """Execute .sh scripts from init directories in alphabetical order."""
+    scripts = _collect_scripts('/docker-entrypoint-initaws.d', '/etc/localstack/init/boot.d')
     if not scripts:
         return
-    logger.info("Found %d init script(s) in %s", len(scripts), init_dir)
-    for script in scripts:
-        script_path = os.path.join(init_dir, script)
+    logger.info("Found %d init script(s)", len(scripts))
+    for script_path in scripts:
         logger.info("Running init script: %s", script_path)
         try:
             result = subprocess.run(
