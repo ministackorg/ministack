@@ -7,10 +7,14 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
-## [Unreleased]
+## [1.2.10] — 2026-04-13
+
+### Added
+- **AppConfig service emulator** — 33 operations across control plane (`appconfig`) and data plane (`appconfigdata`). Applications, environments, configuration profiles, hosted configuration versions, deployment strategies, deployments, tags, and session-based configuration retrieval with token rotation. Contributed by @alexanderkrum-next (#284)
+- **Startup `Ready.` log message** — MiniStack now outputs `Ready.` and per-service `<Service> init completed.` messages when the server is ready. Compatible with Testcontainers `LogMessageWaitStrategy` and LocalStack-style readiness detection.
 
 ### Fixed
-- **SFN aws-sdk error code prefixing** — SDK errors from `aws-sdk:*` task integrations are now prefixed with the service name (e.g., `SecretsManager.ResourceExistsException` instead of bare `ResourceExistsException`), matching real AWS Step Functions behavior. This allows ASL `Catch` blocks that match on service-specific error codes (e.g., `SecretsManager.ResourceExistsException`) to work correctly. Contributed by @jayjanssen
+- **SFN aws-sdk error code prefixing** — SDK errors from `aws-sdk:*` task integrations are now prefixed with the service name (e.g. `SecretsManager.ResourceExistsException` instead of bare `ResourceExistsException`), matching real AWS Step Functions behavior. Fixes `Catch` blocks that match on service-specific error codes. Contributed by @jayjanssen (#296)
 
 ---
 
@@ -20,12 +24,6 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 - **AWS CLI bundled in Docker image** — `aws` command now available inside the container for init scripts. Uses AWS CLI v1 via pip (Apache 2.0). Image size increases from 242MB to 269MB. Contributed by @AdigaAkhil (#272)
 - **`.py` init scripts** — ready.d and boot.d directories now support Python scripts in addition to shell scripts. Files ending in `.py` are executed with the container's Python interpreter. Contributed by @AdigaAkhil (#272)
 - **Init script environment defaults** — init scripts automatically receive `AWS_ACCESS_KEY_ID=test`, `AWS_SECRET_ACCESS_KEY=test`, `AWS_DEFAULT_REGION`, and `AWS_ENDPOINT_URL` so `aws` CLI and boto3 work out of the box without manual configuration.
-
-### Added
-- **AppConfig service emulator** — full control plane (applications, environments, configuration profiles, hosted configuration versions, deployment strategies, deployments, tags) and data plane (`StartConfigurationSession`, `GetLatestConfiguration`). 33 operations across both `appconfig` and `appconfigdata` API surfaces. Deployments complete immediately; session-based configuration retrieval with token rotation matches real AWS behavior.
-
-### Fixed
-- **Health check log noise** — health endpoint access logs (`/_ministack/health`, `/_localstack/health`, `/health`) are now suppressed at `LOG_LEVEL=INFO`. Visible at `LOG_LEVEL=DEBUG`. Reported by @McDoit
 
 ---
 

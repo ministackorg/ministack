@@ -596,6 +596,9 @@ async def _handle_lifespan(scope, receive, send):
             if PERSIST_STATE:
                 _load_persisted_state()
             await send({"type": "lifespan.startup.complete"})
+            logger.info("Ready.")
+            for svc in SERVICE_HANDLERS:
+                logger.info("%s init completed.", svc.capitalize())
             asyncio.create_task(_run_ready_scripts())
         elif message["type"] == "lifespan.shutdown":
             logger.info("MiniStack shutting down...")
