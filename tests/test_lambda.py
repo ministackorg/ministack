@@ -371,6 +371,85 @@ def test_lambda_esm_sqs_failure_respects_visibility_timeout(lam, sqs):
 
     lam.delete_event_source_mapping(UUID=esm_uuid)
 
+
+def test_lambda_esm_sqs_report_batch_item_failures(lam, sqs):
+    """ReportBatchItemFailures: failed messages stay on queue and reach DLQ."""
+    for fn in ("esm-partial-func",):
+        try:
+            lam.delete_function(FunctionName=fn)
+        except Exception:
+            pass
+
+    # Handler reports ALL messages as failed
+    code = (
+        "import json\n"
+        "def handler(event, context):\n"
+        "    failures = []\n"
+        "    for r in event.get('Records', []):\n"
+        "        failures.append({'itemIdentifier': r['messageId']})\n"
+        "    return {'batchItemFailures': failures}\n"
+    )
+    lam.create_function(
+        FunctionName="esm-partial-func",
+        Runtime="python3.9",
+        Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _make_zip(code)},
+    )
+
+    # DLQ + main queue with maxReceiveCount=1
+    dlq_url = sqs.create_queue(QueueName="esm-partial-dlq")["QueueUrl"]
+    dlq_arn = sqs.get_queue_attributes(
+        QueueUrl=dlq_url, AttributeNames=["QueueArn"]
+    )["Attributes"]["QueueArn"]
+
+    q_url = sqs.create_queue(
+        QueueName="esm-partial-queue",
+        Attributes={
+            "VisibilityTimeout": "1",
+            "RedrivePolicy": json.dumps({
+                "deadLetterTargetArn": dlq_arn,
+                "maxReceiveCount": "1",
+            }),
+        },
+    )["QueueUrl"]
+    q_arn = sqs.get_queue_attributes(
+        QueueUrl=q_url, AttributeNames=["QueueArn"]
+    )["Attributes"]["QueueArn"]
+
+    esm = lam.create_event_source_mapping(
+        EventSourceArn=q_arn,
+        FunctionName="esm-partial-func",
+        FunctionResponseTypes=["ReportBatchItemFailures"],
+        BatchSize=1,
+        Enabled=True,
+    )
+    esm_uuid = esm["UUID"]
+    assert "ReportBatchItemFailures" in esm["FunctionResponseTypes"]
+
+    sqs.send_message(QueueUrl=q_url, MessageBody="partial-fail-test")
+
+    # Wait for ESM to process and message to land in DLQ
+    dlq_count = 0
+    for _ in range(30):
+        time.sleep(1)
+        attrs = sqs.get_queue_attributes(
+            QueueUrl=dlq_url,
+            AttributeNames=["ApproximateNumberOfMessages"],
+        )
+        dlq_count = int(attrs["Attributes"]["ApproximateNumberOfMessages"])
+        if dlq_count >= 1:
+            break
+
+    lam.update_event_source_mapping(UUID=esm_uuid, Enabled=False)
+    lam.delete_event_source_mapping(UUID=esm_uuid)
+
+    assert dlq_count >= 1, (
+        f"Message should have reached DLQ after partial failure, "
+        f"but DLQ has {dlq_count} messages"
+    )
+
+
 def test_lambda_warm_start(lam, apigw):
     """Warm worker via API Gateway execute-api: module-level state persists across invocations."""
     import urllib.request as _urlreq
