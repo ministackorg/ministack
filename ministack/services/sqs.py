@@ -598,13 +598,13 @@ def _get_q(url: str) -> dict:
     if q is None:
         # Fallback: extract queue name from URL and look up by name.
         # This handles cases where the hostname differs (e.g. docker-compose
-        # service name "ministack" vs "localhost").
+        # service name "ministack" vs "localhost"), or when a bare queue name
+        # is passed instead of a full URL (supported by AWS and some SDKs).
         parts = url.rstrip("/").split("/")
-        if len(parts) >= 2:
-            name = parts[-1]
-            canonical_url = _queue_name_to_url.get(name)
-            if canonical_url:
-                q = _queues.get(canonical_url)
+        name = parts[-1] if len(parts) >= 2 else url
+        canonical_url = _queue_name_to_url.get(name)
+        if canonical_url:
+            q = _queues.get(canonical_url)
     if q is None:
         raise _Err("QueueDoesNotExist",
                     "The specified queue does not exist for this wsdl version.")

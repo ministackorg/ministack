@@ -7,24 +7,23 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
-## [Unreleased]
+## [1.2.8] — 2026-04-13
+
+### Added
+- **SFN intrinsic functions batch 2** — `States.ArrayContains`, `States.ArrayUnique`, `States.ArrayPartition`, `States.ArrayRange`, `States.MathRandom`, `States.MathAdd`, `States.UUID`. Contributed by @jayjanssen (#289)
+- **RDS Data API SQL-aware stubs** — when no real database endpoint is available, `ExecuteStatement` now tracks `CREATE/DROP DATABASE`, `CREATE/DROP USER`, and `GRANT/REVOKE` statements in memory per cluster. Verification queries return tracked state. Enables acceptance testing of database provisioning workflows without Docker-in-Docker. Contributed by @jayjanssen (#293)
+- **RDS parameter group persistence** — `ModifyDBParameterGroup` and `ModifyDBClusterParameterGroup` now store `ApplyMethod` alongside parameter values. `DescribeDBParameters` and `DescribeDBClusterParameters` return stored parameters with `Source` filter support. Contributed by @jayjanssen (#292)
+- **ELBv2 listener attributes** — `DescribeListenerAttributes` and `ModifyListenerAttributes` for ALB listeners. Contributed by @jgrumboe (#286)
+- **EC2 subnet tag filtering** — `DescribeSubnets` now supports `tag:*` and `tag-key` filters. Contributed by @jgrumboe (#285)
 
 ### Fixed
-- **SFN query-protocol XML response fidelity** — `_xml_element_to_dict` now coerces known numeric fields to integers, boolean fields to booleans, and detects list-wrapper elements to produce JSON arrays even with a single child. Empty self-closing list wrappers return `[]` instead of `""`. Contributed by @jayjanssen.
-### Added
-- **RDS Data API SQL-aware stubs** — when no real database endpoint is available, `ExecuteStatement` now tracks `CREATE/DROP DATABASE`, `CREATE/DROP USER`, and `GRANT/REVOKE` statements in memory per cluster. Verification queries (`SELECT schema_name FROM information_schema.schemata`, `SELECT FROM mysql.user`, `SHOW GRANTS FOR`) return tracked state. Enables acceptance testing of database provisioning workflows without Docker-in-Docker. Connection errors also fall back to stubs instead of returning 400. Contributed by @jayjanssen.
-### Added
-- **RDS parameter group persistence** — `ModifyDBParameterGroup` and `ModifyDBClusterParameterGroup` now store `ApplyMethod` alongside parameter values. `DescribeDBParameters` and `DescribeDBClusterParameters` return stored parameters with `Source` filter support (`user`, `engine-default`). Custom parameters beyond engine defaults are included.
-
-### Fixed
-- **RDS `DescribeDBEngineVersions` family prefix** — `DBParameterGroupFamily` no longer double-prefixes the engine name (e.g. `aurora-mysqlaurora-mysql8.0` → `aurora-mysql8.0`). Contributed by @jayjanssen.
+- **SQS bare queue name as QueueUrl** — passing a bare queue name (e.g. `my-queue`) instead of a full URL now resolves correctly, matching AWS and LocalStack behavior. Previously returned `QueueDoesNotExist`. Reported by @RSzynal-albot
+- **Lambda ESM ReportBatchItemFailures** — SQS event source mappings with `FunctionResponseTypes=["ReportBatchItemFailures"]` now parse the handler's `batchItemFailures` response. Failed messages are left on the queue for redelivery/DLQ instead of being silently deleted. Reported by @okinaka
+- **SFN REST-JSON PascalCase to camelCase conversion** — `_dispatch_aws_sdk_rest_json` now converts PascalCase parameter names to camelCase before dispatching. Fixes `BadRequestException: resourceArn is required` when Step Functions dispatches to RDS Data API. Contributed by @jayjanssen (#291)
+- **SFN query-protocol XML response fidelity** — `_xml_element_to_dict` now coerces known numeric fields to integers, boolean fields to booleans, and detects list-wrapper elements to produce JSON arrays even with a single child. Contributed by @jayjanssen (#290)
+- **RDS DescribeDBEngineVersions family prefix** — `DBParameterGroupFamily` no longer double-prefixes the engine name. Contributed by @jayjanssen (#292)
 
 ---
-### Fixed
-- **SFN REST-JSON PascalCase\u2192camelCase conversion** \u2014 `_dispatch_aws_sdk_rest_json` now converts PascalCase parameter names to camelCase before dispatching. Fixes `BadRequestException: resourceArn is required` when Step Functions dispatches to RDS Data API. Contributed by @jayjanssen.
-### Added
-- **SFN intrinsic functions batch 2** — `States.ArrayContains`, `States.ArrayUnique`, `States.ArrayPartition`, `States.ArrayRange`, `States.MathRandom`, `States.MathAdd`, `States.UUID`. Contributed by @jayjanssen.
-
 
 ## [1.2.7] — 2026-04-12
 

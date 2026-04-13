@@ -491,3 +491,25 @@ def test_sqs_event_source_mapping_to_lambda(lam, sqs):
 
     # Cleanup
     lam.delete_event_source_mapping(UUID=esm["UUID"])
+
+
+def test_sqs_bare_queue_name_as_url(sqs):
+    """Passing a bare queue name instead of a full URL should work (AWS compatibility)."""
+    queue_name = "intg-sqs-bare-name"
+    sqs.create_queue(QueueName=queue_name)
+
+    # Send using full URL (normal)
+    url = sqs.get_queue_url(QueueName=queue_name)["QueueUrl"]
+    sqs.send_message(QueueUrl=url, MessageBody="via-url")
+
+    # Send using bare queue name instead of full URL
+    sqs.send_message(QueueUrl=queue_name, MessageBody="via-name")
+
+    # Both messages should be receivable
+    msgs = []
+    for _ in range(2):
+        resp = sqs.receive_message(QueueUrl=queue_name, MaxNumberOfMessages=10)
+        msgs.extend(resp.get("Messages", []))
+    assert len(msgs) == 2
+    bodies = sorted(m["Body"] for m in msgs)
+    assert bodies == ["via-name", "via-url"]
