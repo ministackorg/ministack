@@ -639,10 +639,19 @@ MiniStack supports two types of init scripts, with LocalStack-compatible paths:
 Scripts from both paths are merged, deduplicated by filename, and run in alphabetical order.
 If the same filename exists in both paths, the MiniStack-native path takes priority.
 
+Init scripts automatically receive `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_DEFAULT_REGION`, and `AWS_ENDPOINT_URL` — no manual configuration needed. The `aws` CLI is bundled in the image.
+
 ```bash
 # ready.d/01-create-resources.sh
-aws --endpoint-url=http://localhost:4566 s3 mb s3://my-bucket
-aws --endpoint-url=http://localhost:4566 sqs create-queue --queue-name my-queue
+aws s3 mb s3://my-bucket
+aws sqs create-queue --queue-name my-queue
+```
+
+```python
+# ready.d/02-seed-data.py
+import boto3, os
+s3 = boto3.client("s3", endpoint_url=os.environ["AWS_ENDPOINT_URL"])
+s3.put_object(Bucket="my-bucket", Key="config.json", Body=b'{"env": "local"}')
 ```
 
 **Docker Compose** — mount scripts at either path:

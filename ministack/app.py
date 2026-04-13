@@ -701,6 +701,13 @@ async def _run_ready_scripts():
     port = int(_resolve_port())
     await _wait_for_port(port)
     logger.info('Found %d ready script(s)', len(scripts))
+    # Provide sensible defaults so init scripts can use aws cli / boto3
+    # without requiring manual credential configuration.
+    script_env = {**os.environ}
+    script_env.setdefault("AWS_ACCESS_KEY_ID", "test")
+    script_env.setdefault("AWS_SECRET_ACCESS_KEY", "test")
+    script_env.setdefault("AWS_DEFAULT_REGION", os.environ.get("MINISTACK_REGION", "us-east-1"))
+    script_env.setdefault("AWS_ENDPOINT_URL", f"http://localhost:{port}")
     for script_path in scripts:
         logger.info('Running ready script: %s', script_path)
         try:
@@ -709,7 +716,7 @@ async def _run_ready_scripts():
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                env=os.environ,
+                env=script_env,
             )
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=300)
             if stdout:

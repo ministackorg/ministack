@@ -7,6 +7,18 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [1.2.9] — 2026-04-13
+
+### Added
+- **AWS CLI bundled in Docker image** — `aws` command now available inside the container for init scripts. Uses AWS CLI v1 via pip (Apache 2.0). Image size increases from 242MB to 269MB. Contributed by @AdigaAkhil (#272)
+- **`.py` init scripts** — ready.d and boot.d directories now support Python scripts in addition to shell scripts. Files ending in `.py` are executed with the container's Python interpreter. Contributed by @AdigaAkhil (#272)
+- **Init script environment defaults** — init scripts automatically receive `AWS_ACCESS_KEY_ID=test`, `AWS_SECRET_ACCESS_KEY=test`, `AWS_DEFAULT_REGION`, and `AWS_ENDPOINT_URL` so `aws` CLI and boto3 work out of the box without manual configuration.
+
+### Fixed
+- **Health check log noise** — health endpoint access logs (`/_ministack/health`, `/_localstack/health`, `/health`) are now suppressed at `LOG_LEVEL=INFO`. Visible at `LOG_LEVEL=DEBUG`. Reported by @McDoit
+
+---
+
 ## [1.2.8] — 2026-04-13
 
 ### Added
