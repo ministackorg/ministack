@@ -31,6 +31,9 @@ COPY --from=builder /usr/local/bin/aws /usr/local/bin/aws
 COPY --from=builder /usr/local/bin/aws_completer /usr/local/bin/aws_completer
 COPY --from=builder /usr/local/bin/uvicorn /usr/local/bin/uvicorn
 
+COPY bin/awslocal /usr/local/bin/awslocal
+RUN chmod +x /usr/local/bin/awslocal
+
 COPY ministack/ ministack/
 
 RUN addgroup -S ministack && adduser -S ministack -G ministack
