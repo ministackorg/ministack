@@ -957,15 +957,26 @@ def _describe_db_parameters(p):
     if not pg:
         return _error("DBParameterGroupNotFoundFault", f"Parameter group {name} not found.", 404)
 
+    source_filter = _p(p, "Source")  # "user", "engine-default", or None (all)
+
     family = pg.get("DBParameterGroupFamily", "")
     default_params = _default_parameters_for_family(family)
 
     custom = pg.get("Parameters", {})
+    default_names = {p["name"] for p in default_params}
     params_xml = ""
     for param in default_params:
         pname = param["name"]
-        value = custom.get(pname, param.get("default", ""))
+        cval = custom.get(pname)
+        if isinstance(cval, dict):
+            value = cval.get("ParameterValue", param.get("default", ""))
+            apply_method = cval.get("ApplyMethod", "pending-reboot")
+        else:
+            value = cval if cval is not None else param.get("default", "")
+            apply_method = "pending-reboot"
         source = "user" if pname in custom else "engine-default"
+        if source_filter and source != source_filter:
+            continue
         params_xml += f"""<Parameter>
             <ParameterName>{pname}</ParameterName>
             <ParameterValue>{value}</ParameterValue>
@@ -974,7 +985,29 @@ def _describe_db_parameters(p):
             <ApplyType>{param.get('apply_type', 'dynamic')}</ApplyType>
             <DataType>{param.get('data_type', 'string')}</DataType>
             <IsModifiable>{str(param.get('modifiable', True)).lower()}</IsModifiable>
-            <ApplyMethod>pending-reboot</ApplyMethod>
+            <ApplyMethod>{apply_method}</ApplyMethod>
+        </Parameter>"""
+    # Include custom parameters not in the defaults
+    for pname, cval in custom.items():
+        if pname in default_names:
+            continue
+        if source_filter and source_filter != "user":
+            continue
+        if isinstance(cval, dict):
+            value = cval.get("ParameterValue", "")
+            apply_method = cval.get("ApplyMethod", "immediate")
+        else:
+            value = cval if cval is not None else ""
+            apply_method = "immediate"
+        params_xml += f"""<Parameter>
+            <ParameterName>{pname}</ParameterName>
+            <ParameterValue>{value}</ParameterValue>
+            <Description></Description>
+            <Source>user</Source>
+            <ApplyType>dynamic</ApplyType>
+            <DataType>string</DataType>
+            <IsModifiable>true</IsModifiable>
+            <ApplyMethod>{apply_method}</ApplyMethod>
         </Parameter>"""
 
     return _xml(200, "DescribeDBParametersResponse",
@@ -992,11 +1025,15 @@ def _modify_param_group(p):
         return _error("DBParameterGroupNotFoundFault", f"Parameter group {name} not found.", 404)
 
     params = pg.setdefault("Parameters", {})
+    prefix = "Parameters.member"
+    if not _p(p, "Parameters.member.1.ParameterName"):
+        prefix = "Parameters.Parameter"
     idx = 1
-    while _p(p, f"Parameters.member.{idx}.ParameterName"):
-        pname = _p(p, f"Parameters.member.{idx}.ParameterName")
-        pvalue = _p(p, f"Parameters.member.{idx}.ParameterValue")
-        params[pname] = pvalue
+    while _p(p, f"{prefix}.{idx}.ParameterName"):
+        pname = _p(p, f"{prefix}.{idx}.ParameterName")
+        pvalue = _p(p, f"{prefix}.{idx}.ParameterValue")
+        apply_method = _p(p, f"{prefix}.{idx}.ApplyMethod") or "immediate"
+        params[pname] = {"ParameterValue": pvalue, "ApplyMethod": apply_method}
         idx += 1
 
     return _xml(200, "ModifyDBParameterGroupResponse",
@@ -1069,12 +1106,34 @@ def _delete_db_cluster_param_group(p):
 
 def _describe_db_cluster_parameters(p):
     name = _p(p, "DBClusterParameterGroupName")
+    source_filter = _p(p, "Source")
     pg = _db_cluster_param_groups.get(name)
     if not pg:
         return _error("DBParameterGroupNotFoundFault",
             f"DB cluster parameter group {name} not found.", 404)
+    params = pg.get("Parameters", {})
+    # When filtering by source, treat all stored params as "user" source.
+    # If filter is "engine-default" and we have no defaults list, return empty.
+    if source_filter and source_filter != "user":
+        params = {}
+    if not params:
+        return _xml(200, "DescribeDBClusterParametersResponse",
+            "<DescribeDBClusterParametersResult><Parameters/></DescribeDBClusterParametersResult>")
+    members = []
+    for pname, pinfo in params.items():
+        pvalue = pinfo.get("ParameterValue", "")
+        apply_method = pinfo.get("ApplyMethod", "immediate")
+        members.append(
+            f"<Parameter>"
+            f"<ParameterName>{pname}</ParameterName>"
+            f"<ParameterValue>{pvalue}</ParameterValue>"
+            f"<ApplyMethod>{apply_method}</ApplyMethod>"
+            f"<IsModifiable>true</IsModifiable>"
+            f"<ApplyType>dynamic</ApplyType>"
+            f"</Parameter>"
+        )
     return _xml(200, "DescribeDBClusterParametersResponse",
-        "<DescribeDBClusterParametersResult><Parameters/></DescribeDBClusterParametersResult>")
+        f"<DescribeDBClusterParametersResult><Parameters>{''.join(members)}</Parameters></DescribeDBClusterParametersResult>")
 
 
 def _modify_db_cluster_param_group(p):
@@ -1085,11 +1144,15 @@ def _modify_db_cluster_param_group(p):
             f"DB cluster parameter group {name} not found.", 404)
 
     params = pg.setdefault("Parameters", {})
+    prefix = "Parameters.member"
+    if not _p(p, "Parameters.member.1.ParameterName"):
+        prefix = "Parameters.Parameter"
     idx = 1
-    while _p(p, f"Parameters.member.{idx}.ParameterName"):
-        pname = _p(p, f"Parameters.member.{idx}.ParameterName")
-        pvalue = _p(p, f"Parameters.member.{idx}.ParameterValue")
-        params[pname] = pvalue
+    while _p(p, f"{prefix}.{idx}.ParameterName"):
+        pname = _p(p, f"{prefix}.{idx}.ParameterName")
+        pvalue = _p(p, f"{prefix}.{idx}.ParameterValue")
+        apply_method = _p(p, f"{prefix}.{idx}.ApplyMethod") or "immediate"
+        params[pname] = {"ParameterValue": pvalue, "ApplyMethod": apply_method}
         idx += 1
 
     return _xml(200, "ModifyDBClusterParameterGroupResponse",
@@ -1588,7 +1651,7 @@ def _describe_engine_versions(p):
         members += f"""<DBEngineVersion>
             <Engine>{engine}</Engine>
             <EngineVersion>{ver}</EngineVersion>
-            <DBParameterGroupFamily>{engine}{family}</DBParameterGroupFamily>
+            <DBParameterGroupFamily>{family}</DBParameterGroupFamily>
             <DBEngineDescription>{engine.replace('-', ' ').title()}</DBEngineDescription>
             <DBEngineVersionDescription>{engine} {ver}</DBEngineVersionDescription>
             <ValidUpgradeTarget/>

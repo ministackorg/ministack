@@ -446,6 +446,88 @@ def test_rds_global_cluster_modify(rds):
             pass
 
 
+
+def test_rds_modify_and_describe_db_parameters(rds):
+    """ModifyDBParameterGroup stores ApplyMethod; DescribeDBParameters returns it with Source filter."""
+    rds.create_db_parameter_group(
+        DBParameterGroupName="test-param-persist",
+        DBParameterGroupFamily="mysql8.0",
+        Description="param persistence test",
+    )
+    rds.modify_db_parameter_group(
+        DBParameterGroupName="test-param-persist",
+        Parameters=[
+            {
+                "ParameterName": "max_connections",
+                "ParameterValue": "200",
+                "ApplyMethod": "immediate",
+            },
+            {
+                "ParameterName": "custom_param_xyz",
+                "ParameterValue": "hello",
+                "ApplyMethod": "pending-reboot",
+            },
+        ],
+    )
+    # Describe with Source=user - should only return modified params
+    resp = rds.describe_db_parameters(
+        DBParameterGroupName="test-param-persist", Source="user"
+    )
+    params = resp["Parameters"]
+    names = [p["ParameterName"] for p in params]
+    assert "max_connections" in names
+    assert "custom_param_xyz" in names
+    mc = next(p for p in params if p["ParameterName"] == "max_connections")
+    assert mc["ParameterValue"] == "200"
+    assert mc["ApplyMethod"] == "immediate"
+    cp = next(p for p in params if p["ParameterName"] == "custom_param_xyz")
+    assert cp["ParameterValue"] == "hello"
+    assert cp["ApplyMethod"] == "pending-reboot"
+
+
+def test_rds_modify_and_describe_cluster_parameters(rds):
+    """ModifyDBClusterParameterGroup stores ApplyMethod; DescribeDBClusterParameters returns it."""
+    rds.create_db_cluster_parameter_group(
+        DBClusterParameterGroupName="test-cparam-persist",
+        DBParameterGroupFamily="aurora-mysql8.0",
+        Description="cluster param persistence test",
+    )
+    rds.modify_db_cluster_parameter_group(
+        DBClusterParameterGroupName="test-cparam-persist",
+        Parameters=[
+            {
+                "ParameterName": "innodb_lock_wait_timeout",
+                "ParameterValue": "60",
+                "ApplyMethod": "immediate",
+            },
+        ],
+    )
+    resp = rds.describe_db_cluster_parameters(
+        DBClusterParameterGroupName="test-cparam-persist", Source="user"
+    )
+    params = resp["Parameters"]
+    assert len(params) >= 1
+    p = next(p for p in params if p["ParameterName"] == "innodb_lock_wait_timeout")
+    assert p["ParameterValue"] == "60"
+    assert p["ApplyMethod"] == "immediate"
+    # engine-default filter should return empty when no defaults are tracked
+    resp2 = rds.describe_db_cluster_parameters(
+        DBClusterParameterGroupName="test-cparam-persist", Source="engine-default"
+    )
+    assert len(resp2["Parameters"]) == 0
+
+
+def test_rds_describe_engine_versions_family(rds):
+    """DBParameterGroupFamily should not double-prefix the engine name."""
+    resp = rds.describe_db_engine_versions(Engine="aurora-mysql")
+    versions = resp["DBEngineVersions"]
+    assert len(versions) >= 1
+    for v in versions:
+        family = v["DBParameterGroupFamily"]
+        # Should be e.g. "aurora-mysql8.0", not "aurora-mysqlaurora-mysql8.0"
+        assert not family.startswith("aurora-mysqlaurora-"), f"Double-prefixed family: {family}"
+
+
 def test_rds_parse_member_list_both_formats():
     """_parse_member_list handles both Prefix.member.N and Prefix.MemberName.N formats."""
     from ministack.services.rds import _parse_member_list

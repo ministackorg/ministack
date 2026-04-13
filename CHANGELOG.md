@@ -7,6 +7,16 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [Unreleased]
+
+### Added
+- **RDS parameter group persistence** — `ModifyDBParameterGroup` and `ModifyDBClusterParameterGroup` now store `ApplyMethod` alongside parameter values. `DescribeDBParameters` and `DescribeDBClusterParameters` return stored parameters with `Source` filter support (`user`, `engine-default`). Custom parameters beyond engine defaults are included.
+
+### Fixed
+- **RDS `DescribeDBEngineVersions` family prefix** — `DBParameterGroupFamily` no longer double-prefixes the engine name (e.g. `aurora-mysqlaurora-mysql8.0` → `aurora-mysql8.0`). Contributed by @jayjanssen.
+
+---
+
 ## [1.2.7] — 2026-04-12
 
 ### Added
