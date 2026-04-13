@@ -8,15 +8,18 @@ Supports: CreateTopic, DeleteTopic, ListTopics, GetTopicAttributes, SetTopicAttr
           ListTagsForResource, TagResource, UntagResource,
           CreatePlatformApplication, CreatePlatformEndpoint.
 SNS → Lambda fanout dispatches via _execute_function (synchronous).
+FIFO topics: .fifo naming validation, MessageGroupId/MessageDeduplicationId enforcement,
+             5-minute deduplication window, sequence numbers, content-based deduplication,
+             FIFO SQS subscription validation, PublishBatch FIFO support.
 """
 
 import asyncio
-import threading as _threading
 import copy
 import hashlib
 import json
 import logging
 import os
+import threading as _threading
 import time
 from urllib.parse import parse_qs
 
@@ -33,6 +36,7 @@ REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 
 import re as _re
 
+
 def _normalize_arn(arn: str) -> str:
     """Normalize an SNS ARN that has an empty account ID.
     Some SDKs (Go v2 with skipRequestingAccountId) construct ARNs with empty
@@ -43,7 +47,7 @@ def _normalize_arn(arn: str) -> str:
         return _re.sub(r"(arn:aws:sns:[^:]+)::", rf"\1:{get_account_id()}:", arn)
     return arn
 
-from ministack.core.persistence import load_state, PERSIST_STATE
+from ministack.core.persistence import PERSIST_STATE, load_state
 
 _topics = AccountScopedDict()
 _sub_arn_to_topic = AccountScopedDict()
@@ -113,6 +117,36 @@ def _create_topic(params):
     if not name:
         return _error("InvalidParameterException", "Name is required", 400)
 
+    # ── Collect explicit attributes from the request ──
+    explicit_attrs = {}
+    i = 1
+    while _p(params, f"Attributes.entry.{i}.key"):
+        key = _p(params, f"Attributes.entry.{i}.key")
+        val = _p(params, f"Attributes.entry.{i}.value")
+        explicit_attrs[key] = val
+        i += 1
+
+    fifo_attr = explicit_attrs.get("FifoTopic", "")
+    is_fifo_name = name.endswith(".fifo")
+
+    # FIFO naming validation: FifoTopic=true requires .fifo suffix
+    if fifo_attr == "true" and not is_fifo_name:
+        return _error(
+            "InvalidParameterException",
+            "Invalid parameter: Topic names with FIFO attribute must end with .fifo suffix",
+            400,
+        )
+
+    # Auto-detect FIFO when name ends with .fifo but attribute not explicitly set
+    if is_fifo_name and fifo_attr != "true":
+        explicit_attrs["FifoTopic"] = "true"
+
+    is_fifo = explicit_attrs.get("FifoTopic") == "true"
+
+    # Default ContentBasedDeduplication to "false" for FIFO topics
+    if is_fifo and "ContentBasedDeduplication" not in explicit_attrs:
+        explicit_attrs["ContentBasedDeduplication"] = "false"
+
     arn = f"arn:aws:sns:{REGION}:{get_account_id()}:{name}"
     if arn not in _topics:
         default_policy = json.dumps({
@@ -127,7 +161,7 @@ def _create_topic(params):
                 "Condition": {"StringEquals": {"AWS:SourceOwner": get_account_id()}},
             }],
         })
-        _topics[arn] = {
+        topic = {
             "name": name,
             "arn": arn,
             "attributes": {
@@ -153,20 +187,23 @@ def _create_topic(params):
             "tags": {},
         }
 
-        i = 1
-        while _p(params, f"Attributes.entry.{i}.key"):
-            key = _p(params, f"Attributes.entry.{i}.key")
-            val = _p(params, f"Attributes.entry.{i}.value")
-            _topics[arn]["attributes"][key] = val
-            i += 1
+        # Apply explicit attributes (including auto-set FIFO attrs)
+        topic["attributes"].update(explicit_attrs)
+
+        # Initialize FIFO-specific state
+        if is_fifo:
+            topic["dedup_cache"] = {}
+            topic["fifo_seq"] = 0
 
         # Store tags from CreateTopic
         i = 1
         while _p(params, f"Tag.member.{i}.Key"):
             key = _p(params, f"Tag.member.{i}.Key")
             val = _p(params, f"Tag.member.{i}.Value")
-            _topics[arn]["tags"][key] = val
+            topic["tags"][key] = val
             i += 1
+
+        _topics[arn] = topic
 
     return _xml(200, "CreateTopicResponse",
                 f"<CreateTopicResult><TopicArn>{arn}</TopicArn></CreateTopicResult>")
@@ -242,6 +279,16 @@ def _subscribe(params):
 
     if not protocol:
         return _error("InvalidParameterException", "Protocol is required", 400)
+
+    # FIFO subscription validation: SQS endpoints must be FIFO queues
+    if _is_fifo_topic(topic) and protocol == "sqs":
+        queue_name = (endpoint or "").split(":")[-1]
+        if not queue_name.endswith(".fifo"):
+            return _error(
+                "InvalidParameterException",
+                "Invalid parameter: Invalid parameter: Topic with FIFO requires a subscription to a FIFO SQS Queue",
+                400,
+            )
 
     for existing in topic["subscriptions"]:
         if existing["protocol"] == protocol and existing["endpoint"] == endpoint:
@@ -427,6 +474,53 @@ def _set_subscription_attributes(params):
 
 
 # ---------------------------------------------------------------------------
+# FIFO helpers
+# ---------------------------------------------------------------------------
+
+# AWS SNS FIFO topics deduplicate messages for exactly 5 minutes (300 s).
+# Publishing the same MessageDeduplicationId within this window returns the
+# original MessageId/SequenceNumber without re-delivering to subscribers.
+# Reference: https://docs.aws.amazon.com/sns/latest/dg/fifo-message-dedup.html
+_DEDUP_WINDOW_S = 300
+
+
+def _is_fifo_topic(topic: dict) -> bool:
+    """Return True if the topic is a FIFO topic."""
+    return topic.get("attributes", {}).get("FifoTopic") == "true"
+
+
+def _prune_sns_dedup(topic: dict) -> None:
+    """Remove expired entries (older than 300s) from the topic's dedup_cache."""
+    now = time.time()
+    topic["dedup_cache"] = {
+        k: v for k, v in topic.get("dedup_cache", {}).items()
+        if v["expire"] > now
+    }
+
+
+def _resolve_dedup_id(topic: dict, params: dict, message: str) -> str:
+    """Resolve the effective MessageDeduplicationId.
+
+    Priority:
+      1. Explicit param value
+      2. SHA-256 of body when ContentBasedDeduplication is enabled
+      3. Raise ValueError when neither is available
+    """
+    explicit = _p(params, "MessageDeduplicationId") or ""
+    if explicit:
+        return explicit
+
+    cbd = topic.get("attributes", {}).get("ContentBasedDeduplication", "false")
+    if cbd == "true":
+        return hashlib.sha256(message.encode()).hexdigest()
+
+    raise ValueError(
+        "Invalid parameter: The MessageDeduplicationId parameter is required "
+        "for FIFO topics when ContentBasedDeduplication is not enabled"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Publish
 # ---------------------------------------------------------------------------
 
@@ -450,10 +544,77 @@ def _publish(params):
     if topic_arn not in _topics:
         return _error("NotFound", f"Topic does not exist: {topic_arn}", 404)
 
+    topic = _topics[topic_arn]
     msg_attrs = _parse_message_attributes(params)
-    msg_id = new_uuid()
+    fifo = _is_fifo_topic(topic)
 
-    _topics[topic_arn]["messages"].append({
+    # ── FIFO validation, deduplication, and sequencing ──
+    if fifo:
+        group_id = _p(params, "MessageGroupId") or ""
+        if not group_id:
+            return _error(
+                "InvalidParameterException",
+                "Invalid parameter: The MessageGroupId parameter is required for FIFO topics",
+                400,
+            )
+
+        # Resolve dedup ID: explicit > CBD SHA-256 > error
+        try:
+            dedup_id = _resolve_dedup_id(topic, params, message)
+        except ValueError as exc:
+            return _error("InvalidParameterException", str(exc), 400)
+
+        # Prune expired cache entries, then check for duplicate
+        _prune_sns_dedup(topic)
+        cached = topic.get("dedup_cache", {}).get(dedup_id)
+        if cached:
+            # Duplicate within the 5-minute window — return cached result
+            return _xml(
+                200,
+                "PublishResponse",
+                f"<PublishResult>"
+                f"<MessageId>{cached['message_id']}</MessageId>"
+                f"<SequenceNumber>{cached['sequence_number']}</SequenceNumber>"
+                f"</PublishResult>",
+            )
+
+        # New message: increment sequence counter
+        topic["fifo_seq"] = topic.get("fifo_seq", 0) + 1
+        seq_number = str(topic["fifo_seq"]).zfill(20)
+
+        msg_id = new_uuid()
+        topic["messages"].append({
+            "id": msg_id,
+            "message": message,
+            "subject": subject,
+            "message_structure": message_structure,
+            "message_attributes": msg_attrs,
+            "timestamp": int(time.time()),
+        })
+
+        _fanout(topic_arn, msg_id, message, subject, message_structure, msg_attrs,
+                message_group_id=group_id, message_dedup_id=dedup_id)
+
+        # Cache the entry for deduplication (300s window)
+        topic.setdefault("dedup_cache", {})[dedup_id] = {
+            "expire": time.time() + _DEDUP_WINDOW_S,
+            "message_id": msg_id,
+            "sequence_number": seq_number,
+        }
+
+        logger.info("SNS FIFO publish to %s: %s", topic_arn, message[:100])
+        return _xml(
+            200,
+            "PublishResponse",
+            f"<PublishResult>"
+            f"<MessageId>{msg_id}</MessageId>"
+            f"<SequenceNumber>{seq_number}</SequenceNumber>"
+            f"</PublishResult>",
+        )
+
+    # ── Standard (non-FIFO) publish path ──
+    msg_id = new_uuid()
+    topic["messages"].append({
         "id": msg_id,
         "message": message,
         "subject": subject,
@@ -495,6 +656,9 @@ def _publish_batch(params):
                           "Batch entry ids must be distinct", 400)
         ids_seen.add(eid)
 
+    topic = _topics[topic_arn]
+    fifo = _is_fifo_topic(topic)
+
     successful = ""
     failed = ""
     for entry in entries:
@@ -503,24 +667,102 @@ def _publish_batch(params):
         subject = entry.get("subject", "")
         message_structure = entry.get("message_structure", "")
         msg_attrs = entry.get("message_attributes", {})
+        group_id = entry.get("message_group_id", "")
+        entry_dedup_id = entry.get("message_dedup_id", "")
 
-        msg_id = new_uuid()
-        _topics[topic_arn]["messages"].append({
-            "id": msg_id,
-            "message": message,
-            "subject": subject,
-            "message_structure": message_structure,
-            "message_attributes": msg_attrs,
-            "timestamp": int(time.time()),
-        })
-        _fanout(topic_arn, msg_id, message, subject, message_structure, msg_attrs)
+        # ── FIFO per-entry validation ──
+        if fifo:
+            if not group_id:
+                failed += (
+                    "<member>"
+                    f"<Id>{_xml_escape(eid)}</Id>"
+                    f"<Code>InvalidParameterException</Code>"
+                    f"<Message>Invalid parameter: The MessageGroupId parameter is required for FIFO topics</Message>"
+                    f"<SenderFault>true</SenderFault>"
+                    "</member>"
+                )
+                continue
 
-        successful += (
-            "<member>"
-            f"<Id>{_xml_escape(eid)}</Id>"
-            f"<MessageId>{msg_id}</MessageId>"
-            "</member>"
-        )
+            # Build a mini params dict so _resolve_dedup_id can read the explicit value
+            entry_params = {}
+            if entry_dedup_id:
+                entry_params["MessageDeduplicationId"] = [entry_dedup_id]
+            try:
+                dedup_id = _resolve_dedup_id(topic, entry_params, message)
+            except ValueError as exc:
+                failed += (
+                    "<member>"
+                    f"<Id>{_xml_escape(eid)}</Id>"
+                    f"<Code>InvalidParameterException</Code>"
+                    f"<Message>{_xml_escape(str(exc))}</Message>"
+                    f"<SenderFault>true</SenderFault>"
+                    "</member>"
+                )
+                continue
+
+            # Dedup check
+            _prune_sns_dedup(topic)
+            cached = topic.get("dedup_cache", {}).get(dedup_id)
+            if cached:
+                successful += (
+                    "<member>"
+                    f"<Id>{_xml_escape(eid)}</Id>"
+                    f"<MessageId>{cached['message_id']}</MessageId>"
+                    f"<SequenceNumber>{cached['sequence_number']}</SequenceNumber>"
+                    "</member>"
+                )
+                continue
+
+            # New FIFO message: increment sequence counter
+            topic["fifo_seq"] = topic.get("fifo_seq", 0) + 1
+            seq_number = str(topic["fifo_seq"]).zfill(20)
+
+            msg_id = new_uuid()
+            topic["messages"].append({
+                "id": msg_id,
+                "message": message,
+                "subject": subject,
+                "message_structure": message_structure,
+                "message_attributes": msg_attrs,
+                "timestamp": int(time.time()),
+            })
+
+            _fanout(topic_arn, msg_id, message, subject, message_structure, msg_attrs,
+                    message_group_id=group_id, message_dedup_id=dedup_id)
+
+            # Cache for deduplication
+            topic.setdefault("dedup_cache", {})[dedup_id] = {
+                "expire": time.time() + _DEDUP_WINDOW_S,
+                "message_id": msg_id,
+                "sequence_number": seq_number,
+            }
+
+            successful += (
+                "<member>"
+                f"<Id>{_xml_escape(eid)}</Id>"
+                f"<MessageId>{msg_id}</MessageId>"
+                f"<SequenceNumber>{seq_number}</SequenceNumber>"
+                "</member>"
+            )
+        else:
+            # ── Standard (non-FIFO) batch entry ──
+            msg_id = new_uuid()
+            topic["messages"].append({
+                "id": msg_id,
+                "message": message,
+                "subject": subject,
+                "message_structure": message_structure,
+                "message_attributes": msg_attrs,
+                "timestamp": int(time.time()),
+            })
+            _fanout(topic_arn, msg_id, message, subject, message_structure, msg_attrs)
+
+            successful += (
+                "<member>"
+                f"<Id>{_xml_escape(eid)}</Id>"
+                f"<MessageId>{msg_id}</MessageId>"
+                "</member>"
+            )
 
     return _xml(200, "PublishBatchResponse",
                 f"<PublishBatchResult>"
@@ -885,6 +1127,8 @@ def _parse_batch_entries(params) -> list[dict]:
             "subject": _p(params, f"PublishBatchRequestEntries.member.{i}.Subject"),
             "message_structure": _p(params, f"PublishBatchRequestEntries.member.{i}.MessageStructure"),
             "message_attributes": {},
+            "message_group_id": _p(params, f"PublishBatchRequestEntries.member.{i}.MessageGroupId"),
+            "message_dedup_id": _p(params, f"PublishBatchRequestEntries.member.{i}.MessageDeduplicationId"),
         }
         j = 1
         while True:
