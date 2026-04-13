@@ -784,13 +784,15 @@ async def handle_request(method, path, headers, body_bytes, query_params):
             return await _a(_delete_configuration_profile(app_id, profile_id))
 
     # --- Deployment Strategies ---
-    if path == "/deploymentstrategies":
+    # botocore's model uses the misspelled path "/deployementstrategies" for
+    # DeleteDeploymentStrategy (and possibly others), so accept both spellings.
+    if path in ("/deploymentstrategies", "/deployementstrategies"):
         if method == "POST":
             return await _a(_create_deployment_strategy(body))
         if method == "GET":
             return await _a(_list_deployment_strategies(query))
 
-    m = re.fullmatch(r"/deploymentstrategies/([^/]+)", path)
+    m = re.fullmatch(r"/deploy(?:e?)mentstrategies/([^/]+)", path)
     if m:
         strategy_id = m.group(1)
         if method == "GET":

@@ -192,7 +192,7 @@ SERVICE_PATTERNS = {
     },
     "appconfig": {
         "host_patterns": [r"appconfig\."],
-        "path_prefixes": ["/applications", "/deploymentstrategies"],
+        "path_prefixes": ["/applications", "/deploymentstrategies", "/deployementstrategies"],
         "credential_scope": "appconfig",
     },
     "appconfigdata": {
