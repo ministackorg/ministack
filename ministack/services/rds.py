@@ -7,9 +7,10 @@ Supports: CreateDBInstance, DeleteDBInstance, DescribeDBInstances, ModifyDBInsta
           StartDBCluster, StopDBCluster,
           CreateDBSubnetGroup, DeleteDBSubnetGroup, DescribeDBSubnetGroups, ModifyDBSubnetGroup,
           CreateDBParameterGroup, DeleteDBParameterGroup, DescribeDBParameterGroups,
-          DescribeDBParameters, ModifyDBParameterGroup,
+          DescribeDBParameters, ModifyDBParameterGroup, ResetDBParameterGroup,
           CreateDBClusterParameterGroup, DescribeDBClusterParameterGroups,
-          DeleteDBClusterParameterGroup, DescribeDBClusterParameters, ModifyDBClusterParameterGroup,
+          DeleteDBClusterParameterGroup, DescribeDBClusterParameters,
+          ModifyDBClusterParameterGroup, ResetDBClusterParameterGroup,
           CreateDBSnapshot, DeleteDBSnapshot, DescribeDBSnapshots,
           CreateDBClusterSnapshot, DescribeDBClusterSnapshots, DeleteDBClusterSnapshot,
           CreateOptionGroup, DeleteOptionGroup, DescribeOptionGroups, DescribeOptionGroupOptions,
@@ -1025,9 +1026,7 @@ def _modify_param_group(p):
         return _error("DBParameterGroupNotFoundFault", f"Parameter group {name} not found.", 404)
 
     params = pg.setdefault("Parameters", {})
-    prefix = "Parameters.member"
-    if not _p(p, "Parameters.member.1.ParameterName"):
-        prefix = "Parameters.Parameter"
+    prefix = _parameter_member_prefix(p)
     idx = 1
     while _p(p, f"{prefix}.{idx}.ParameterName"):
         pname = _p(p, f"{prefix}.{idx}.ParameterName")
@@ -1038,6 +1037,35 @@ def _modify_param_group(p):
 
     return _xml(200, "ModifyDBParameterGroupResponse",
         f"<ModifyDBParameterGroupResult><DBParameterGroupName>{name}</DBParameterGroupName></ModifyDBParameterGroupResult>")
+
+
+def _reset_param_group(p):
+    name = _p(p, "DBParameterGroupName")
+    pg = _param_groups.get(name)
+    if not pg:
+        return _error("DBParameterGroupNotFoundFault", f"Parameter group {name} not found.", 404)
+
+    params = pg.setdefault("Parameters", {})
+    prefix = _parameter_member_prefix(p)
+    has_explicit_parameters = bool(_p(p, f"{prefix}.1.ParameterName"))
+    reset_all = _p(p, "ResetAllParameters", "").lower() == "true"
+    if reset_all and has_explicit_parameters:
+        return _error(
+            "InvalidParameterCombination",
+            "You can't specify both ResetAllParameters and Parameters.",
+            400,
+        )
+
+    if reset_all or not has_explicit_parameters:
+        params.clear()
+    else:
+        idx = 1
+        while _p(p, f"{prefix}.{idx}.ParameterName"):
+            params.pop(_p(p, f"{prefix}.{idx}.ParameterName"), None)
+            idx += 1
+
+    return _xml(200, "ResetDBParameterGroupResponse",
+        f"<ResetDBParameterGroupResult><DBParameterGroupName>{name}</DBParameterGroupName></ResetDBParameterGroupResult>")
 
 
 # ---------------------------------------------------------------------------
@@ -1144,9 +1172,7 @@ def _modify_db_cluster_param_group(p):
             f"DB cluster parameter group {name} not found.", 404)
 
     params = pg.setdefault("Parameters", {})
-    prefix = "Parameters.member"
-    if not _p(p, "Parameters.member.1.ParameterName"):
-        prefix = "Parameters.Parameter"
+    prefix = _parameter_member_prefix(p)
     idx = 1
     while _p(p, f"{prefix}.{idx}.ParameterName"):
         pname = _p(p, f"{prefix}.{idx}.ParameterName")
@@ -1157,6 +1183,36 @@ def _modify_db_cluster_param_group(p):
 
     return _xml(200, "ModifyDBClusterParameterGroupResponse",
         f"<ModifyDBClusterParameterGroupResult><DBClusterParameterGroupName>{name}</DBClusterParameterGroupName></ModifyDBClusterParameterGroupResult>")
+
+
+def _reset_db_cluster_param_group(p):
+    name = _p(p, "DBClusterParameterGroupName")
+    pg = _db_cluster_param_groups.get(name)
+    if not pg:
+        return _error("DBParameterGroupNotFoundFault",
+            f"DB cluster parameter group {name} not found.", 404)
+
+    params = pg.setdefault("Parameters", {})
+    prefix = _parameter_member_prefix(p)
+    has_explicit_parameters = bool(_p(p, f"{prefix}.1.ParameterName"))
+    reset_all = _p(p, "ResetAllParameters", "").lower() == "true"
+    if reset_all and has_explicit_parameters:
+        return _error(
+            "InvalidParameterCombination",
+            "You can't specify both ResetAllParameters and Parameters.",
+            400,
+        )
+
+    if reset_all or not has_explicit_parameters:
+        params.clear()
+    else:
+        idx = 1
+        while _p(p, f"{prefix}.{idx}.ParameterName"):
+            params.pop(_p(p, f"{prefix}.{idx}.ParameterName"), None)
+            idx += 1
+
+    return _xml(200, "ResetDBClusterParameterGroupResponse",
+        f"<ResetDBClusterParameterGroupResult><DBClusterParameterGroupName>{name}</DBClusterParameterGroupName></ResetDBClusterParameterGroupResult>")
 
 
 # ---------------------------------------------------------------------------
@@ -2083,6 +2139,14 @@ def _parse_member_list(params, prefix):
     return [numbered[k] for k in sorted(numbered)] if numbered else []
 
 
+def _parameter_member_prefix(params, prefix="Parameters"):
+    """Handle both Query API and botocore/SFN parameter list serialization."""
+    query_prefix = f"{prefix}.member"
+    if _p(params, f"{query_prefix}.1.ParameterName"):
+        return query_prefix
+    return f"{prefix}.Parameter"
+
+
 def _parse_filters(params):
     """Parse Filters.member.N.Name / Filters.member.N.Values.member.M."""
     filters = {}
@@ -2277,11 +2341,13 @@ _ACTION_MAP = {
     "DescribeDBParameterGroups": _describe_param_groups,
     "DescribeDBParameters": _describe_db_parameters,
     "ModifyDBParameterGroup": _modify_param_group,
+    "ResetDBParameterGroup": _reset_param_group,
     "CreateDBClusterParameterGroup": _create_db_cluster_param_group,
     "DescribeDBClusterParameterGroups": _describe_db_cluster_param_groups,
     "DeleteDBClusterParameterGroup": _delete_db_cluster_param_group,
     "DescribeDBClusterParameters": _describe_db_cluster_parameters,
     "ModifyDBClusterParameterGroup": _modify_db_cluster_param_group,
+    "ResetDBClusterParameterGroup": _reset_db_cluster_param_group,
     "CreateOptionGroup": _create_option_group,
     "DeleteOptionGroup": _delete_option_group,
     "DescribeOptionGroups": _describe_option_groups,

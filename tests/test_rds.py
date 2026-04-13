@@ -2,11 +2,13 @@ import io
 import json
 import os
 import time
+import uuid as _uuid_mod
 import zipfile
 from urllib.parse import urlparse
+
 import pytest
 from botocore.exceptions import ClientError
-import uuid as _uuid_mod
+
 
 def test_rds_create(rds):
     rds.create_db_instance(
@@ -485,6 +487,63 @@ def test_rds_modify_and_describe_db_parameters(rds):
     assert cp["ApplyMethod"] == "pending-reboot"
 
 
+def test_rds_reset_db_parameters(rds):
+    """ResetDBParameterGroup supports targeted and full reset of user overrides."""
+    rds.create_db_parameter_group(
+        DBParameterGroupName="test-param-reset",
+        DBParameterGroupFamily="mysql8.0",
+        Description="param reset test",
+    )
+    rds.modify_db_parameter_group(
+        DBParameterGroupName="test-param-reset",
+        Parameters=[
+            {
+                "ParameterName": "max_connections",
+                "ParameterValue": "200",
+                "ApplyMethod": "immediate",
+            },
+            {
+                "ParameterName": "custom_param_xyz",
+                "ParameterValue": "hello",
+                "ApplyMethod": "pending-reboot",
+            },
+        ],
+    )
+
+    rds.reset_db_parameter_group(
+        DBParameterGroupName="test-param-reset",
+        Parameters=[
+            {
+                "ParameterName": "custom_param_xyz",
+                "ApplyMethod": "pending-reboot",
+            },
+        ],
+    )
+    resp = rds.describe_db_parameters(
+        DBParameterGroupName="test-param-reset", Source="user"
+    )
+    names = [p["ParameterName"] for p in resp["Parameters"]]
+    assert "max_connections" in names
+    assert "custom_param_xyz" not in names
+
+    rds.reset_db_parameter_group(
+        DBParameterGroupName="test-param-reset",
+        ResetAllParameters=True,
+    )
+    resp2 = rds.describe_db_parameters(
+        DBParameterGroupName="test-param-reset", Source="user"
+    )
+    assert len(resp2["Parameters"]) == 0
+
+    defaults = rds.describe_db_parameters(
+        DBParameterGroupName="test-param-reset", Source="engine-default"
+    )["Parameters"]
+    max_connections = next(
+        p for p in defaults if p["ParameterName"] == "max_connections"
+    )
+    assert max_connections["ParameterValue"] == "151"
+
+
 def test_rds_modify_and_describe_cluster_parameters(rds):
     """ModifyDBClusterParameterGroup stores ApplyMethod; DescribeDBClusterParameters returns it."""
     rds.create_db_cluster_parameter_group(
@@ -513,6 +572,55 @@ def test_rds_modify_and_describe_cluster_parameters(rds):
     # engine-default filter should return empty when no defaults are tracked
     resp2 = rds.describe_db_cluster_parameters(
         DBClusterParameterGroupName="test-cparam-persist", Source="engine-default"
+    )
+    assert len(resp2["Parameters"]) == 0
+
+
+def test_rds_reset_cluster_parameters(rds):
+    """ResetDBClusterParameterGroup clears targeted overrides and full group state."""
+    rds.create_db_cluster_parameter_group(
+        DBClusterParameterGroupName="test-cparam-reset",
+        DBParameterGroupFamily="aurora-mysql8.0",
+        Description="cluster param reset test",
+    )
+    rds.modify_db_cluster_parameter_group(
+        DBClusterParameterGroupName="test-cparam-reset",
+        Parameters=[
+            {
+                "ParameterName": "innodb_lock_wait_timeout",
+                "ParameterValue": "60",
+                "ApplyMethod": "immediate",
+            },
+            {
+                "ParameterName": "time_zone",
+                "ParameterValue": "UTC",
+                "ApplyMethod": "pending-reboot",
+            },
+        ],
+    )
+
+    rds.reset_db_cluster_parameter_group(
+        DBClusterParameterGroupName="test-cparam-reset",
+        Parameters=[
+            {
+                "ParameterName": "time_zone",
+                "ApplyMethod": "pending-reboot",
+            },
+        ],
+    )
+    resp = rds.describe_db_cluster_parameters(
+        DBClusterParameterGroupName="test-cparam-reset", Source="user"
+    )
+    names = [p["ParameterName"] for p in resp["Parameters"]]
+    assert "innodb_lock_wait_timeout" in names
+    assert "time_zone" not in names
+
+    rds.reset_db_cluster_parameter_group(
+        DBClusterParameterGroupName="test-cparam-reset",
+        ResetAllParameters=True,
+    )
+    resp2 = rds.describe_db_cluster_parameters(
+        DBClusterParameterGroupName="test-cparam-reset", Source="user"
     )
     assert len(resp2["Parameters"]) == 0
 
