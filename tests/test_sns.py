@@ -2,11 +2,15 @@ import io
 import json
 import os
 import time
+import urllib.request
+import uuid as _uuid_mod
 import zipfile
-from urllib.parse import urlparse
+from urllib.parse import urlencode, urlparse
+
 import pytest
 from botocore.exceptions import ClientError
-import uuid as _uuid_mod
+
+ENDPOINT = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
 
 def _make_zip(code: str) -> bytes:
     buf = io.BytesIO()
@@ -407,3 +411,689 @@ def test_sns_to_sqs_fanout(sns, sqs):
         assert body["TopicArn"] == topic_arn
         assert body["Subject"] == "IntgTest"
         assert body["Type"] == "Notification"
+
+
+# ---------------------------------------------------------------------------
+# FIFO Topic Creation Tests 
+# ---------------------------------------------------------------------------
+
+
+def test_sns_fifo_create_topic_with_fifo_suffix_and_attribute(sns):
+    """Creating a FIFO topic with .fifo suffix and FifoTopic=true succeeds."""
+    resp = sns.create_topic(
+        Name="intg-fifo-create.fifo",
+        Attributes={"FifoTopic": "true"},
+    )
+    arn = resp["TopicArn"]
+    assert arn.endswith("intg-fifo-create.fifo")
+
+    attrs = sns.get_topic_attributes(TopicArn=arn)["Attributes"]
+    assert attrs["FifoTopic"] == "true"
+
+
+def test_sns_fifo_create_topic_without_fifo_suffix_returns_error(sns):
+    """Creating a topic with FifoTopic=true but no .fifo suffix returns InvalidParameterException."""
+    with pytest.raises(ClientError) as exc:
+        sns.create_topic(
+            Name="intg-fifo-no-suffix",
+            Attributes={"FifoTopic": "true"},
+        )
+    assert exc.value.response["Error"]["Code"] == "InvalidParameterException"
+
+
+def test_sns_fifo_auto_detect_from_suffix(sns):
+    """Creating a topic with .fifo suffix auto-detects as FIFO even without explicit FifoTopic attribute."""
+    resp = sns.create_topic(Name="intg-fifo-autodetect.fifo")
+    arn = resp["TopicArn"]
+
+    attrs = sns.get_topic_attributes(TopicArn=arn)["Attributes"]
+    assert attrs["FifoTopic"] == "true"
+
+
+def test_sns_fifo_content_based_dedup_defaults_to_false(sns):
+    """ContentBasedDeduplication defaults to 'false' for FIFO topics when not explicitly provided."""
+    resp = sns.create_topic(
+        Name="intg-fifo-cbd-default.fifo",
+        Attributes={"FifoTopic": "true"},
+    )
+    arn = resp["TopicArn"]
+
+    attrs = sns.get_topic_attributes(TopicArn=arn)["Attributes"]
+    assert attrs["ContentBasedDeduplication"] == "false"
+
+
+def test_sns_fifo_content_based_dedup_set_to_true(sns):
+    """ContentBasedDeduplication can be set to 'true' at creation time."""
+    resp = sns.create_topic(
+        Name="intg-fifo-cbd-true.fifo",
+        Attributes={"FifoTopic": "true", "ContentBasedDeduplication": "true"},
+    )
+    arn = resp["TopicArn"]
+
+    attrs = sns.get_topic_attributes(TopicArn=arn)["Attributes"]
+    assert attrs["ContentBasedDeduplication"] == "true"
+
+
+def test_sns_fifo_get_topic_attributes_returns_fifo_attrs(sns):
+    """GetTopicAttributes returns all FIFO-related attributes correctly."""
+    resp = sns.create_topic(
+        Name="intg-fifo-getattrs.fifo",
+        Attributes={"FifoTopic": "true", "ContentBasedDeduplication": "true"},
+    )
+    arn = resp["TopicArn"]
+
+    attrs = sns.get_topic_attributes(TopicArn=arn)["Attributes"]
+    assert attrs["TopicArn"] == arn
+    assert attrs["FifoTopic"] == "true"
+    assert attrs["ContentBasedDeduplication"] == "true"
+    # Standard attributes should still be present
+    assert "Owner" in attrs
+    assert "Policy" in attrs
+
+
+# ---------------------------------------------------------------------------
+# FIFO Publish Validation Tests
+# ---------------------------------------------------------------------------
+
+
+def test_sns_fifo_publish_without_message_group_id_returns_error(sns):
+    """Publishing to a FIFO topic without MessageGroupId returns InvalidParameterException."""
+    arn = sns.create_topic(
+        Name="intg-fifo-pub-no-grp.fifo",
+        Attributes={"FifoTopic": "true", "ContentBasedDeduplication": "true"},
+    )["TopicArn"]
+
+    with pytest.raises(ClientError) as exc:
+        sns.publish(TopicArn=arn, Message="missing group id")
+    assert exc.value.response["Error"]["Code"] == "InvalidParameterException"
+
+
+def test_sns_fifo_publish_without_dedup_id_cbd_false_returns_error(sns):
+    """Publishing to a FIFO topic (CBD=false) without MessageDeduplicationId returns error."""
+    arn = sns.create_topic(
+        Name="intg-fifo-pub-no-dedup.fifo",
+        Attributes={"FifoTopic": "true", "ContentBasedDeduplication": "false"},
+    )["TopicArn"]
+
+    with pytest.raises(ClientError) as exc:
+        sns.publish(
+            TopicArn=arn,
+            Message="missing dedup id",
+            MessageGroupId="grp-1",
+        )
+    assert exc.value.response["Error"]["Code"] == "InvalidParameterException"
+
+
+def test_sns_standard_topic_publish_without_message_group_id_succeeds(sns):
+    """Publishing to a standard topic without MessageGroupId succeeds normally."""
+    arn = sns.create_topic(Name="intg-std-pub-no-grp")["TopicArn"]
+
+    resp = sns.publish(TopicArn=arn, Message="standard topic message")
+    assert "MessageId" in resp
+
+
+def test_sns_fifo_publish_with_valid_params_returns_sequence_number(sns):
+    """Publishing to a FIFO topic with valid params succeeds and returns SequenceNumber."""
+    arn = sns.create_topic(
+        Name="intg-fifo-pub-seq.fifo",
+        Attributes={"FifoTopic": "true", "ContentBasedDeduplication": "false"},
+    )["TopicArn"]
+
+    resp = sns.publish(
+        TopicArn=arn,
+        Message="fifo message with seq",
+        MessageGroupId="grp-1",
+        MessageDeduplicationId="dedup-seq-001",
+    )
+    assert "MessageId" in resp
+    assert "SequenceNumber" in resp
+    # Sequence number should be a zero-padded numeric string
+    assert resp["SequenceNumber"].isdigit()
+    assert len(resp["SequenceNumber"]) == 20
+
+
+def test_sns_standard_topic_publish_response_omits_sequence_number(sns):
+    """Standard topic publish response does not include SequenceNumber."""
+    arn = sns.create_topic(Name="intg-std-pub-no-seq")["TopicArn"]
+
+    resp = sns.publish(TopicArn=arn, Message="standard topic no seq")
+    assert "MessageId" in resp
+    assert "SequenceNumber" not in resp
+
+
+# ---------------------------------------------------------------------------
+# FIFO Deduplication and Sequence Number Tests 
+# ---------------------------------------------------------------------------
+
+
+def test_sns_fifo_explicit_dedup_id_returns_same_result_on_duplicate(sns):
+    """Publishing the same MessageDeduplicationId twice returns the same MessageId and SequenceNumber."""
+    arn = sns.create_topic(
+        Name="intg-fifo-dedup-same.fifo",
+        Attributes={"FifoTopic": "true", "ContentBasedDeduplication": "false"},
+    )["TopicArn"]
+
+    resp1 = sns.publish(
+        TopicArn=arn,
+        Message="first publish",
+        MessageGroupId="grp-1",
+        MessageDeduplicationId="dedup-same-001",
+    )
+    resp2 = sns.publish(
+        TopicArn=arn,
+        Message="second publish different body",
+        MessageGroupId="grp-1",
+        MessageDeduplicationId="dedup-same-001",
+    )
+
+    assert resp1["MessageId"] == resp2["MessageId"]
+    assert resp1["SequenceNumber"] == resp2["SequenceNumber"]
+
+
+def test_sns_fifo_cbd_dedup_subscriber_gets_one_message(sns, sqs):
+    """CBD=true with same body twice deduplicates — subscriber receives only one message."""
+    topic_arn = sns.create_topic(
+        Name="intg-fifo-cbd-dedup.fifo",
+        Attributes={"FifoTopic": "true", "ContentBasedDeduplication": "true"},
+    )["TopicArn"]
+
+    q_url = sqs.create_queue(
+        QueueName="intg-fifo-cbd-dedup-q.fifo",
+        Attributes={"FifoQueue": "true"},
+    )["QueueUrl"]
+    q_arn = sqs.get_queue_attributes(
+        QueueUrl=q_url, AttributeNames=["QueueArn"],
+    )["Attributes"]["QueueArn"]
+
+    sns.subscribe(TopicArn=topic_arn, Protocol="sqs", Endpoint=q_arn)
+
+    # Publish the same body twice — CBD will generate the same dedup ID
+    resp1 = sns.publish(
+        TopicArn=topic_arn,
+        Message="identical body for cbd",
+        MessageGroupId="grp-cbd",
+    )
+    resp2 = sns.publish(
+        TopicArn=topic_arn,
+        Message="identical body for cbd",
+        MessageGroupId="grp-cbd",
+    )
+
+    # Both responses should return the same MessageId (dedup hit)
+    assert resp1["MessageId"] == resp2["MessageId"]
+
+    # Subscriber should only receive one message
+    msgs = sqs.receive_message(
+        QueueUrl=q_url,
+        MaxNumberOfMessages=10,
+        WaitTimeSeconds=2,
+    )
+    assert len(msgs.get("Messages", [])) == 1
+    body = json.loads(msgs["Messages"][0]["Body"])
+    assert body["Message"] == "identical body for cbd"
+
+
+def test_sns_fifo_explicit_dedup_id_overrides_cbd(sns):
+    """Explicit MessageDeduplicationId is used regardless of CBD setting."""
+    arn = sns.create_topic(
+        Name="intg-fifo-dedup-override.fifo",
+        Attributes={"FifoTopic": "true", "ContentBasedDeduplication": "true"},
+    )["TopicArn"]
+
+    # Publish two messages with the same body but different explicit dedup IDs
+    resp1 = sns.publish(
+        TopicArn=arn,
+        Message="same body",
+        MessageGroupId="grp-1",
+        MessageDeduplicationId="explicit-dedup-A",
+    )
+    resp2 = sns.publish(
+        TopicArn=arn,
+        Message="same body",
+        MessageGroupId="grp-1",
+        MessageDeduplicationId="explicit-dedup-B",
+    )
+
+    # Different explicit dedup IDs → different messages (not deduplicated)
+    assert resp1["MessageId"] != resp2["MessageId"]
+    assert resp1["SequenceNumber"] != resp2["SequenceNumber"]
+
+    # Now publish again with the same explicit dedup ID as the first → deduplicated
+    resp3 = sns.publish(
+        TopicArn=arn,
+        Message="different body this time",
+        MessageGroupId="grp-1",
+        MessageDeduplicationId="explicit-dedup-A",
+    )
+    assert resp3["MessageId"] == resp1["MessageId"]
+    assert resp3["SequenceNumber"] == resp1["SequenceNumber"]
+
+
+def test_sns_fifo_sequence_numbers_monotonically_increasing(sns):
+    """Multiple non-duplicate publishes produce monotonically increasing sequence numbers."""
+    arn = sns.create_topic(
+        Name="intg-fifo-seq-incr.fifo",
+        Attributes={"FifoTopic": "true", "ContentBasedDeduplication": "false"},
+    )["TopicArn"]
+
+    seq_numbers = []
+    for i in range(5):
+        resp = sns.publish(
+            TopicArn=arn,
+            Message=f"message-{i}",
+            MessageGroupId="grp-seq",
+            MessageDeduplicationId=f"dedup-seq-{i}",
+        )
+        assert "SequenceNumber" in resp
+        seq_numbers.append(resp["SequenceNumber"])
+
+    # All sequence numbers should be numeric and zero-padded to 20 digits
+    for seq in seq_numbers:
+        assert seq.isdigit()
+        assert len(seq) == 20
+
+    # Sequence numbers should be strictly increasing
+    for j in range(1, len(seq_numbers)):
+        assert int(seq_numbers[j]) > int(seq_numbers[j - 1])
+
+
+# ---------------------------------------------------------------------------
+# FIFO Subscription Validation Tests
+# ---------------------------------------------------------------------------
+
+
+def test_sns_fifo_subscribe_non_fifo_sqs_queue_returns_error(sns, sqs):
+    """Subscribing a non-FIFO SQS queue to a FIFO topic returns InvalidParameterException."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    topic_arn = sns.create_topic(
+        Name=f"intg-fifo-sub-nonfifo-{uid}.fifo",
+        Attributes={"FifoTopic": "true"},
+    )["TopicArn"]
+
+    q_url = sqs.create_queue(QueueName=f"intg-fifo-sub-nonfifo-q-{uid}")["QueueUrl"]
+    q_arn = sqs.get_queue_attributes(
+        QueueUrl=q_url, AttributeNames=["QueueArn"],
+    )["Attributes"]["QueueArn"]
+
+    with pytest.raises(ClientError) as exc:
+        sns.subscribe(TopicArn=topic_arn, Protocol="sqs", Endpoint=q_arn)
+    assert exc.value.response["Error"]["Code"] == "InvalidParameterException"
+
+
+def test_sns_fifo_subscribe_fifo_sqs_queue_succeeds(sns, sqs):
+    """Subscribing a FIFO SQS queue to a FIFO topic succeeds."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    topic_arn = sns.create_topic(
+        Name=f"intg-fifo-sub-fifo-{uid}.fifo",
+        Attributes={"FifoTopic": "true"},
+    )["TopicArn"]
+
+    q_url = sqs.create_queue(
+        QueueName=f"intg-fifo-sub-fifo-q-{uid}.fifo",
+        Attributes={"FifoQueue": "true"},
+    )["QueueUrl"]
+    q_arn = sqs.get_queue_attributes(
+        QueueUrl=q_url, AttributeNames=["QueueArn"],
+    )["Attributes"]["QueueArn"]
+
+    resp = sns.subscribe(TopicArn=topic_arn, Protocol="sqs", Endpoint=q_arn)
+    assert "SubscriptionArn" in resp
+    assert resp["SubscriptionArn"] != "PendingConfirmation"
+
+
+def test_sns_fifo_subscribe_non_sqs_protocols_succeed(sns):
+    """Subscribing email/lambda/http to a FIFO topic succeeds without FIFO queue validation."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    topic_arn = sns.create_topic(
+        Name=f"intg-fifo-sub-nonsqs-{uid}.fifo",
+        Attributes={"FifoTopic": "true"},
+    )["TopicArn"]
+
+    # email protocol
+    resp_email = sns.subscribe(
+        TopicArn=topic_arn, Protocol="email", Endpoint=f"user-{uid}@example.com",
+    )
+    assert "SubscriptionArn" in resp_email
+
+    # lambda protocol
+    lambda_arn = f"arn:aws:lambda:us-east-1:000000000000:function:my-func-{uid}"
+    resp_lambda = sns.subscribe(
+        TopicArn=topic_arn, Protocol="lambda", Endpoint=lambda_arn,
+    )
+    assert "SubscriptionArn" in resp_lambda
+
+    # http protocol
+    resp_http = sns.subscribe(
+        TopicArn=topic_arn, Protocol="http", Endpoint=f"http://example.com/hook-{uid}",
+    )
+    assert "SubscriptionArn" in resp_http
+
+
+# ---------------------------------------------------------------------------
+# PublishBatch FIFO Support Tests
+# ---------------------------------------------------------------------------
+
+
+def _raw_publish_batch(topic_arn, entries):
+    """Send a PublishBatch request via raw HTTP to bypass boto3 client-side validation.
+
+    This is needed because boto3 may raise ParamValidationError for entries
+    missing MessageGroupId on FIFO topics before the request reaches the server.
+
+    Each entry is a dict with keys: Id, Message, and optionally MessageGroupId,
+    MessageDeduplicationId.
+    """
+    form = {"Action": "PublishBatch", "TopicArn": topic_arn}
+    for i, entry in enumerate(entries, start=1):
+        prefix = f"PublishBatchRequestEntries.member.{i}"
+        form[f"{prefix}.Id"] = entry["Id"]
+        form[f"{prefix}.Message"] = entry["Message"]
+        if "MessageGroupId" in entry:
+            form[f"{prefix}.MessageGroupId"] = entry["MessageGroupId"]
+        if "MessageDeduplicationId" in entry:
+            form[f"{prefix}.MessageDeduplicationId"] = entry["MessageDeduplicationId"]
+
+    data = urlencode(form).encode()
+    req = urllib.request.Request(ENDPOINT, data=data, method="POST")
+    req.add_header("Content-Type", "application/x-www-form-urlencoded")
+    resp = urllib.request.urlopen(req, timeout=10)
+    body = resp.read().decode()
+    return resp.status, body
+
+
+def test_sns_fifo_publish_batch_missing_group_id_fails_entries(sns):
+    """PublishBatch to FIFO topic: entries missing MessageGroupId go to Failed list.
+    """
+    uid = _uuid_mod.uuid4().hex[:8]
+    topic_arn = sns.create_topic(
+        Name=f"intg-fifo-batch-nogrp-{uid}.fifo",
+        Attributes={"FifoTopic": "true", "ContentBasedDeduplication": "true"},
+    )["TopicArn"]
+
+    # Use raw HTTP to bypass boto3 client-side validation
+    entries = [
+        {"Id": "e1", "Message": "msg without group id"},
+        {"Id": "e2", "Message": "msg without group id 2"},
+    ]
+    status, body = _raw_publish_batch(topic_arn, entries)
+    assert status == 200
+
+    # Both entries should be in the Failed list
+    assert "<Failed>" in body
+    assert body.count("<Id>e1</Id>") == 1
+    assert body.count("<Id>e2</Id>") == 1
+    assert "InvalidParameterException" in body
+
+
+def test_sns_fifo_publish_batch_all_valid_returns_successful_with_sequence(sns):
+    """PublishBatch to FIFO topic: all valid entries return in Successful with SequenceNumber.
+    """
+    uid = _uuid_mod.uuid4().hex[:8]
+    topic_arn = sns.create_topic(
+        Name=f"intg-fifo-batch-valid-{uid}.fifo",
+        Attributes={"FifoTopic": "true", "ContentBasedDeduplication": "false"},
+    )["TopicArn"]
+
+    resp = sns.publish_batch(
+        TopicArn=topic_arn,
+        PublishBatchRequestEntries=[
+            {
+                "Id": "e1",
+                "Message": "batch fifo msg 1",
+                "MessageGroupId": "grp-1",
+                "MessageDeduplicationId": f"dedup-batch-1-{uid}",
+            },
+            {
+                "Id": "e2",
+                "Message": "batch fifo msg 2",
+                "MessageGroupId": "grp-1",
+                "MessageDeduplicationId": f"dedup-batch-2-{uid}",
+            },
+            {
+                "Id": "e3",
+                "Message": "batch fifo msg 3",
+                "MessageGroupId": "grp-2",
+                "MessageDeduplicationId": f"dedup-batch-3-{uid}",
+            },
+        ],
+    )
+
+    assert len(resp["Successful"]) == 3
+    assert len(resp.get("Failed", [])) == 0
+
+    # Each successful entry should have a SequenceNumber
+    seq_numbers = []
+    for entry in resp["Successful"]:
+        assert "MessageId" in entry
+        assert "SequenceNumber" in entry
+        seq = entry["SequenceNumber"]
+        assert seq.isdigit()
+        assert len(seq) == 20
+        seq_numbers.append(int(seq))
+
+    # Sequence numbers should be monotonically increasing
+    for i in range(1, len(seq_numbers)):
+        assert seq_numbers[i] > seq_numbers[i - 1]
+
+
+def test_sns_fifo_publish_batch_mixed_valid_invalid_entries(sns):
+    """PublishBatch to FIFO topic: mixed entries correctly separate Successful and Failed.
+    """
+    uid = _uuid_mod.uuid4().hex[:8]
+    topic_arn = sns.create_topic(
+        Name=f"intg-fifo-batch-mixed-{uid}.fifo",
+        Attributes={"FifoTopic": "true", "ContentBasedDeduplication": "false"},
+    )["TopicArn"]
+
+    # Use raw HTTP: e1 is valid, e2 is missing MessageGroupId, e3 is valid
+    entries = [
+        {
+            "Id": "e1",
+            "Message": "valid msg 1",
+            "MessageGroupId": "grp-1",
+            "MessageDeduplicationId": f"dedup-mixed-1-{uid}",
+        },
+        {
+            "Id": "e2",
+            "Message": "invalid msg missing group id",
+            # No MessageGroupId — should fail
+        },
+        {
+            "Id": "e3",
+            "Message": "valid msg 3",
+            "MessageGroupId": "grp-2",
+            "MessageDeduplicationId": f"dedup-mixed-3-{uid}",
+        },
+    ]
+    status, body = _raw_publish_batch(topic_arn, entries)
+    assert status == 200
+
+    # e1 and e3 should be in Successful
+    # e2 should be in Failed
+    # Parse the XML to verify
+    assert "<Successful>" in body
+    assert "<Failed>" in body
+
+    # Count successful entries (e1 and e3)
+    successful_section = body.split("<Successful>")[1].split("</Successful>")[0]
+    assert "<Id>e1</Id>" in successful_section
+    assert "<Id>e3</Id>" in successful_section
+    # Successful entries should have SequenceNumber
+    assert "<SequenceNumber>" in successful_section
+
+    # Count failed entries (e2)
+    failed_section = body.split("<Failed>")[1].split("</Failed>")[0]
+    assert "<Id>e2</Id>" in failed_section
+    assert "InvalidParameterException" in failed_section
+
+
+# ---------------------------------------------------------------------------
+# ContentBasedDeduplication Attribute Management Tests
+# ---------------------------------------------------------------------------
+
+
+def test_sns_fifo_set_topic_attributes_toggle_cbd(sns):
+    """SetTopicAttributes can toggle ContentBasedDeduplication on a FIFO topic.
+    """
+    uid = _uuid_mod.uuid4().hex[:8]
+    arn = sns.create_topic(
+        Name=f"intg-fifo-cbd-toggle-{uid}.fifo",
+        Attributes={"FifoTopic": "true"},
+    )["TopicArn"]
+
+    # CBD defaults to "false"
+    attrs = sns.get_topic_attributes(TopicArn=arn)["Attributes"]
+    assert attrs["ContentBasedDeduplication"] == "false"
+
+    # Enable CBD via SetTopicAttributes
+    sns.set_topic_attributes(
+        TopicArn=arn,
+        AttributeName="ContentBasedDeduplication",
+        AttributeValue="true",
+    )
+    attrs = sns.get_topic_attributes(TopicArn=arn)["Attributes"]
+    assert attrs["ContentBasedDeduplication"] == "true"
+
+    # Disable CBD via SetTopicAttributes
+    sns.set_topic_attributes(
+        TopicArn=arn,
+        AttributeName="ContentBasedDeduplication",
+        AttributeValue="false",
+    )
+    attrs = sns.get_topic_attributes(TopicArn=arn)["Attributes"]
+    assert attrs["ContentBasedDeduplication"] == "false"
+
+
+def test_sns_fifo_publish_succeeds_without_dedup_id_after_enabling_cbd(sns):
+    """After enabling CBD, publishing without an explicit dedup ID succeeds.
+    """
+    uid = _uuid_mod.uuid4().hex[:8]
+    arn = sns.create_topic(
+        Name=f"intg-fifo-cbd-enable-pub-{uid}.fifo",
+        Attributes={"FifoTopic": "true"},  # CBD defaults to "false"
+    )["TopicArn"]
+
+    # Enable CBD
+    sns.set_topic_attributes(
+        TopicArn=arn,
+        AttributeName="ContentBasedDeduplication",
+        AttributeValue="true",
+    )
+
+    # Publish without explicit MessageDeduplicationId — should succeed
+    resp = sns.publish(
+        TopicArn=arn,
+        Message="cbd enabled message",
+        MessageGroupId="grp-1",
+    )
+    assert "MessageId" in resp
+    assert "SequenceNumber" in resp
+
+
+def test_sns_fifo_publish_fails_without_dedup_id_after_disabling_cbd(sns):
+    """After disabling CBD, publishing without an explicit dedup ID fails.
+    """
+    uid = _uuid_mod.uuid4().hex[:8]
+    arn = sns.create_topic(
+        Name=f"intg-fifo-cbd-disable-pub-{uid}.fifo",
+        Attributes={"FifoTopic": "true", "ContentBasedDeduplication": "true"},
+    )["TopicArn"]
+
+    # Verify publishing without dedup ID works while CBD is enabled
+    resp = sns.publish(
+        TopicArn=arn,
+        Message="should succeed with cbd on",
+        MessageGroupId="grp-1",
+    )
+    assert "MessageId" in resp
+
+    # Disable CBD
+    sns.set_topic_attributes(
+        TopicArn=arn,
+        AttributeName="ContentBasedDeduplication",
+        AttributeValue="false",
+    )
+
+    # Now publishing without explicit MessageDeduplicationId should fail
+    with pytest.raises(ClientError) as exc:
+        sns.publish(
+            TopicArn=arn,
+            Message="should fail with cbd off",
+            MessageGroupId="grp-1",
+        )
+    assert exc.value.response["Error"]["Code"] == "InvalidParameterException"
+
+
+# ---------------------------------------------------------------------------
+# End-to-End FIFO SNS → SQS Fanout Integration Test
+# ---------------------------------------------------------------------------
+
+
+def test_sns_fifo_e2e_fanout_with_dedup(sns, sqs):
+    """End-to-end: FIFO SNS → SQS fanout passes MessageGroupId and deduplicates.
+    """
+    uid = _uuid_mod.uuid4().hex[:8]
+
+    # 1. Create a FIFO topic and FIFO SQS queue, subscribe the queue to the topic
+    topic_arn = sns.create_topic(
+        Name=f"intg-fifo-e2e-{uid}.fifo",
+        Attributes={"FifoTopic": "true", "ContentBasedDeduplication": "false"},
+    )["TopicArn"]
+
+    q_url = sqs.create_queue(
+        QueueName=f"intg-fifo-e2e-q-{uid}.fifo",
+        Attributes={"FifoQueue": "true"},
+    )["QueueUrl"]
+    q_arn = sqs.get_queue_attributes(
+        QueueUrl=q_url, AttributeNames=["QueueArn"],
+    )["Attributes"]["QueueArn"]
+
+    sns.subscribe(TopicArn=topic_arn, Protocol="sqs", Endpoint=q_arn)
+
+    # 2. Publish a message with MessageGroupId and MessageDeduplicationId
+    dedup_id = f"dedup-e2e-{uid}"
+    group_id = f"grp-e2e-{uid}"
+    resp1 = sns.publish(
+        TopicArn=topic_arn,
+        Message="e2e fifo fanout message",
+        MessageGroupId=group_id,
+        MessageDeduplicationId=dedup_id,
+    )
+    assert "MessageId" in resp1
+    assert "SequenceNumber" in resp1
+
+    # 3. Receive the message from SQS and verify MessageGroupId is passed through
+    msgs = sqs.receive_message(
+        QueueUrl=q_url,
+        MaxNumberOfMessages=10,
+        WaitTimeSeconds=2,
+        AttributeNames=["All"],
+    )
+    assert len(msgs.get("Messages", [])) == 1
+    msg = msgs["Messages"][0]
+    body = json.loads(msg["Body"])
+    assert body["Message"] == "e2e fifo fanout message"
+    attrs = msg.get("Attributes", {})
+    assert attrs.get("MessageGroupId") == group_id
+
+    # Delete the received message so the queue is clean for the next check
+    sqs.delete_message(QueueUrl=q_url, ReceiptHandle=msg["ReceiptHandle"])
+
+    # 4. Publish the same dedup ID again — should be deduplicated
+    resp2 = sns.publish(
+        TopicArn=topic_arn,
+        Message="duplicate attempt",
+        MessageGroupId=group_id,
+        MessageDeduplicationId=dedup_id,
+    )
+    # Dedup hit: same MessageId and SequenceNumber as the first publish
+    assert resp2["MessageId"] == resp1["MessageId"]
+    assert resp2["SequenceNumber"] == resp1["SequenceNumber"]
+
+    # Verify the subscriber does NOT receive a duplicate message
+    dup_msgs = sqs.receive_message(
+        QueueUrl=q_url,
+        MaxNumberOfMessages=10,
+        WaitTimeSeconds=1,
+    )
+    assert len(dup_msgs.get("Messages", [])) == 0, "Duplicate message should not be delivered"
