@@ -1230,6 +1230,12 @@ def test_ec2_create_default_vpc(ec2):
         # Delete subnets
         for s in ec2.describe_subnets(Filters=[{"Name": "vpc-id", "Values": [default_vpc_id]}])["Subnets"]:
             ec2.delete_subnet(SubnetId=s["SubnetId"])
+        # Delete non-default security groups (other tests may have created them)
+        for sg in ec2.describe_security_groups(
+            Filters=[{"Name": "vpc-id", "Values": [default_vpc_id]}]
+        )["SecurityGroups"]:
+            if sg["GroupName"] != "default":
+                ec2.delete_security_group(GroupId=sg["GroupId"])
         # Detach and delete IGWs
         for igw in ec2.describe_internet_gateways(
             Filters=[{"Name": "attachment.vpc-id", "Values": [default_vpc_id]}]

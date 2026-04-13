@@ -35,6 +35,7 @@ _SERIAL_TESTS = {
     "tests/test_ministack.py::test_ministack_config_invalid_key_ignored",
     "tests/test_sfn.py::test_sfn_mock_config_return",
     "tests/test_sfn.py::test_sfn_mock_config_throw",
+    "tests/test_ec2.py::test_ec2_create_default_vpc",
 }
 
 
