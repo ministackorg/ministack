@@ -552,9 +552,10 @@ def test_sfn_aws_sdk_rds_create_and_describe_cluster(sfn, sfn_sync):
     assert create_cluster["DbClusterIdentifier"] == cluster_id
     assert create_cluster["Engine"] == "aurora-postgresql"
 
-    # Verify describe result contains cluster data
+    # Verify describe result contains cluster data (list-wrapper fidelity)
     describe_clusters = output["describeResult"]["DbClusters"]
-    assert "DbCluster" in describe_clusters
+    assert isinstance(describe_clusters, list)
+    assert len(describe_clusters) >= 1
 
     sfn_sync.delete_state_machine(stateMachineArn=sm_arn)
 
@@ -649,7 +650,60 @@ def test_sfn_aws_sdk_rds_modify_cluster(sfn, sfn_sync, rds):
     resp = sfn_sync.start_sync_execution(stateMachineArn=sm_arn, input=json.dumps({}))
     assert resp["status"] == "SUCCEEDED", f"Execution failed: {resp.get('error')} — {resp.get('cause')}"
     output = json.loads(resp["output"])
-    assert output["modifyResult"]["DbCluster"]["BackupRetentionPeriod"] == "7"
+    assert output["modifyResult"]["DbCluster"]["BackupRetentionPeriod"] == 7
+
+    sfn_sync.delete_state_machine(stateMachineArn=sm_arn)
+
+def test_sfn_xml_list_wrapper_single_element(sfn, sfn_sync):
+    """DescribeDBClusters returns a JSON list even when only one cluster exists."""
+    import uuid as _uuid
+
+    cluster_id = f"sfn-wrap-{_uuid.uuid4().hex[:8]}"
+    sm_name = f"sdk-rds-wrap-{_uuid.uuid4().hex[:8]}"
+
+    definition = json.dumps({
+        "StartAt": "CreateCluster",
+        "States": {
+            "CreateCluster": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::aws-sdk:rds:CreateDBCluster",
+                "Parameters": {
+                    "DBClusterIdentifier": cluster_id,
+                    "Engine": "aurora-postgresql",
+                    "MasterUsername": "admin",
+                    "MasterUserPassword": "testpass123",
+                },
+                "ResultPath": "$.createResult",
+                "Next": "DescribeClusters",
+            },
+            "DescribeClusters": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::aws-sdk:rds:DescribeDBClusters",
+                "Parameters": {
+                    "DBClusterIdentifier": cluster_id,
+                },
+                "ResultPath": "$.describeResult",
+                "Next": "Done",
+            },
+            "Done": {"Type": "Succeed"},
+        },
+    })
+
+    sm_arn = sfn_sync.create_state_machine(
+        name=sm_name,
+        definition=definition,
+        roleArn="arn:aws:iam::000000000000:role/sfn-role",
+    )["stateMachineArn"]
+
+    resp = sfn_sync.start_sync_execution(stateMachineArn=sm_arn, input=json.dumps({}))
+    assert resp["status"] == "SUCCEEDED", f"Execution failed: {resp.get('error')} — {resp.get('cause')}"
+    output = json.loads(resp["output"])
+
+    # Even with a single cluster, DbClusters must be a list (not a dict).
+    db_clusters = output["describeResult"]["DbClusters"]
+    assert isinstance(db_clusters, list), f"Expected list, got {type(db_clusters)}: {db_clusters}"
+    assert len(db_clusters) == 1
+    assert db_clusters[0]["DbClusterIdentifier"] == cluster_id
 
     sfn_sync.delete_state_machine(stateMachineArn=sm_arn)
 

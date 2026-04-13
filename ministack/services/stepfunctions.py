@@ -2270,19 +2270,98 @@ def _flatten_query_params(data, prefix=""):
     return params
 
 
+# Fields in AWS XML responses that should be coerced to native types in JSON.
+# Only fields that Step Functions consumers rely on being non-string.
+_XML_NUMERIC_FIELDS = frozenset({
+    "Port", "BackupRetentionPeriod", "AllocatedStorage", "Iops",
+    "MonitoringInterval", "PromotionTier", "DbInstancePort",
+    "MaxAllocatedStorage", "StorageThroughput",
+})
+# Empty self-closing XML elements that should become [] not "".
+_XML_LIST_WRAPPER_TAGS = frozenset({
+    "Parameters", "DBClusterMembers", "VpcSecurityGroups",
+    "AvailabilityZones", "Subnets", "ReadReplicaDBInstanceIdentifiers",
+    "ReadReplicaDBClusterIdentifiers", "DBSecurityGroups",
+    "OptionGroupMemberships", "StatusInfos", "DomainMemberships",
+    "AssociatedRoles", "TagList", "ProcessorFeatures",
+    "EnabledCloudwatchLogsExports", "GlobalClusterMembers",
+    "DBParameterGroups", "DBInstances", "DBClusters",
+    "SupportedNetworkTypes",
+})
+_XML_BOOLEAN_FIELDS = frozenset({
+    "MultiAZ", "Multiaz", "StorageEncrypted", "DeletionProtection",
+    "PubliclyAccessible", "AutoMinorVersionUpgrade",
+    "CopyTagsToSnapshot", "IamDatabaseAuthenticationEnabled",
+    "PerformanceInsightsEnabled", "HttpEndpointEnabled",
+    "CrossAccountClone", "CustomerOwnedIpEnabled",
+    "IsStorageConfigUpgradeAvailable", "IsWriter",
+})
+
+
 def _xml_element_to_dict(element):
     """Convert an XML element tree to a JSON-friendly dict.
 
     Strips namespace prefixes.  Repeated child tags become lists.
     Leaf text nodes become strings.
+
+    AWS query-protocol list convention: when a parent element contains only
+    children that all share the same tag (e.g. ``<DBClusters><DBCluster>...
+    </DBCluster></DBClusters>`` or ``<member>...</member>``), the parent is
+    treated as a **list wrapper** and its value becomes a JSON array — even
+    when there is only a single child.  This matches the real AWS SDK
+    behaviour that Step Functions consumers rely on (``DbClusters[0]``).
     """
     # Strip namespace
     tag = element.tag.split("}")[-1] if "}" in element.tag else element.tag
 
     children = list(element)
     if not children:
-        # Leaf node
-        return tag, (element.text or "")
+        text = element.text or ""
+        # Empty self-closing tags that are known list wrappers should become
+        # empty arrays, not empty strings (e.g. <Parameters/> → []).
+        if not text and tag in _XML_LIST_WRAPPER_TAGS:
+            return tag, []
+        # Leaf node — keep as string by default.  Only coerce specific known
+        # numeric/boolean fields that Step Functions consumers rely on (e.g.
+        # Port must be an integer for JSON unmarshal into int64).
+        if text and tag in _XML_NUMERIC_FIELDS:
+            try:
+                return tag, int(text)
+            except ValueError:
+                try:
+                    return tag, float(text)
+                except ValueError:
+                    pass
+        if text and tag in _XML_BOOLEAN_FIELDS:
+            if text == "true":
+                return tag, True
+            if text == "false":
+                return tag, False
+        return tag, text
+
+    # Detect list-wrapper elements: all children share the same tag name AND
+    # the parent looks like a plural wrapper (e.g. DBClusters→DBCluster,
+    # AvailabilityZones→AvailabilityZone) or children use the generic
+    # "member" tag.  We require either multiple children OR a plural naming
+    # pattern to avoid false positives on single-child result wrappers like
+    # <CreateDBClusterParameterGroupResult><DBClusterParameterGroup>...</>
+    child_tags = {(c.tag.split("}")[-1] if "}" in c.tag else c.tag) for c in children}
+    if len(child_tags) == 1:
+        child_tag_name = next(iter(child_tags))
+        is_member = child_tag_name == "member"
+        is_plural = (
+            tag.endswith(child_tag_name + "s")
+            or tag == child_tag_name + "s"
+            or tag.endswith("Ids") and child_tag_name == "Id"
+        )
+        has_multiple = len(children) > 1
+        if is_member or is_plural or has_multiple:
+            # Treat as a list.
+            items = []
+            for child in children:
+                _, child_val = _xml_element_to_dict(child)
+                items.append(child_val)
+            return tag, items
 
     result = {}
     for child in children:

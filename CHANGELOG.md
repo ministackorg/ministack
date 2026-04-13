@@ -7,6 +7,11 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [Unreleased]
+
+### Fixed
+- **SFN query-protocol XML response fidelity** — `_xml_element_to_dict` now coerces known numeric fields to integers, boolean fields to booleans, and detects list-wrapper elements to produce JSON arrays even with a single child. Empty self-closing list wrappers return `[]` instead of `""`. Contributed by @jayjanssen.
+
 ## [1.2.7] — 2026-04-12
 
 ### Added
