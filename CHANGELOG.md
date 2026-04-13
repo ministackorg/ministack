@@ -9,6 +9,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+<<<<<<< jayj/rds-parameter-persistence
 ### Added
 - **RDS parameter group persistence** — `ModifyDBParameterGroup` and `ModifyDBClusterParameterGroup` now store `ApplyMethod` alongside parameter values. `DescribeDBParameters` and `DescribeDBClusterParameters` return stored parameters with `Source` filter support (`user`, `engine-default`). Custom parameters beyond engine defaults are included.
 
@@ -16,6 +17,12 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 - **RDS `DescribeDBEngineVersions` family prefix** — `DBParameterGroupFamily` no longer double-prefixes the engine name (e.g. `aurora-mysqlaurora-mysql8.0` → `aurora-mysql8.0`). Contributed by @jayjanssen.
 
 ---
+=======
+### Fixed
+- **SFN REST-JSON PascalCase\u2192camelCase conversion** \u2014 `_dispatch_aws_sdk_rest_json` now converts PascalCase parameter names to camelCase before dispatching. Fixes `BadRequestException: resourceArn is required` when Step Functions dispatches to RDS Data API. Contributed by @jayjanssen.
+### Added
+- **SFN intrinsic functions batch 2** — `States.ArrayContains`, `States.ArrayUnique`, `States.ArrayPartition`, `States.ArrayRange`, `States.MathRandom`, `States.MathAdd`, `States.UUID`. Contributed by @jayjanssen.
+>>>>>>> main
 
 ## [1.2.7] — 2026-04-12
 

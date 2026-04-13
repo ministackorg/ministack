@@ -1827,6 +1827,27 @@ def _exec_intrinsic(node, data, ctx):
         return list(args)
     elif name == "States.ArrayLength":
         return len(args[0])
+    elif name == "States.ArrayContains":
+        return args[1] in args[0]
+    elif name == "States.ArrayUnique":
+        seen = []
+        for item in args[0]:
+            if item not in seen:
+                seen.append(item)
+        return seen
+    elif name == "States.ArrayPartition":
+        arr, chunk = args[0], int(args[1])
+        return [arr[i:i + chunk] for i in range(0, len(arr), chunk)]
+    elif name == "States.ArrayRange":
+        start, end, step = int(args[0]), int(args[1]), int(args[2])
+        return list(range(start, end + 1, step))
+    elif name == "States.MathRandom":
+        import random
+        return random.randint(int(args[0]), int(args[1]))
+    elif name == "States.MathAdd":
+        return int(args[0]) + int(args[1])
+    elif name == "States.UUID":
+        return new_uuid()
 
     raise ValueError(f"Unsupported intrinsic function: {name}")
 
@@ -2472,6 +2493,22 @@ def _dispatch_aws_sdk_query(service_info, service_name, action, input_data):
         raise _ExecutionError("States.Runtime", f"Failed to parse {service_name} XML response")
 
 
+def _pascal_key_to_camel(key):
+    """Convert a single PascalCase key to camelCase: 'ResourceArn' -> 'resourceArn'."""
+    if not key:
+        return key
+    return key[0].lower() + key[1:]
+
+
+def _convert_keys_to_camel(data):
+    """Recursively convert dict keys from PascalCase to camelCase."""
+    if isinstance(data, dict):
+        return {_pascal_key_to_camel(k): _convert_keys_to_camel(v) for k, v in data.items()}
+    if isinstance(data, list):
+        return [_convert_keys_to_camel(v) for v in data]
+    return data
+
+
 def _dispatch_aws_sdk_rest_json(service_info, service_name, action, input_data):
     """Dispatch an aws-sdk integration call to a REST-JSON protocol MiniStack service."""
     from ministack import app
@@ -2490,7 +2527,10 @@ def _dispatch_aws_sdk_rest_json(service_info, service_name, action, input_data):
     action_paths = _REST_JSON_ACTION_PATHS.get(service_key, {})
     path = action_paths.get(pascal_action, f"/{pascal_action}")
 
-    body = json.dumps(input_data or {}).encode("utf-8")
+    # REST-JSON services use camelCase on the wire, but SFN Parameters use
+    # PascalCase.  AWS SFN converts automatically; we must do the same.
+    wire_data = _convert_keys_to_camel(input_data or {})
+    body = json.dumps(wire_data).encode("utf-8")
     headers = {
         "content-type": "application/json",
         "host": f"{service_key}.{REGION}.amazonaws.com",
