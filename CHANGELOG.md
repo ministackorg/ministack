@@ -7,6 +7,11 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [Unreleased]
+
+### Added
+- **SFN intrinsic functions batch 2** — `States.ArrayContains`, `States.ArrayUnique`, `States.ArrayPartition`, `States.ArrayRange`, `States.MathRandom`, `States.MathAdd`, `States.UUID`. Contributed by @jayjanssen.
+
 ## [1.2.7] — 2026-04-12
 
 ### Added

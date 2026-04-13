@@ -1827,6 +1827,27 @@ def _exec_intrinsic(node, data, ctx):
         return list(args)
     elif name == "States.ArrayLength":
         return len(args[0])
+    elif name == "States.ArrayContains":
+        return args[1] in args[0]
+    elif name == "States.ArrayUnique":
+        seen = []
+        for item in args[0]:
+            if item not in seen:
+                seen.append(item)
+        return seen
+    elif name == "States.ArrayPartition":
+        arr, chunk = args[0], int(args[1])
+        return [arr[i:i + chunk] for i in range(0, len(arr), chunk)]
+    elif name == "States.ArrayRange":
+        start, end, step = int(args[0]), int(args[1]), int(args[2])
+        return list(range(start, end + 1, step))
+    elif name == "States.MathRandom":
+        import random
+        return random.randint(int(args[0]), int(args[1]))
+    elif name == "States.MathAdd":
+        return int(args[0]) + int(args[1])
+    elif name == "States.UUID":
+        return new_uuid()
 
     raise ValueError(f"Unsupported intrinsic function: {name}")
 
