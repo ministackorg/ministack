@@ -1158,7 +1158,31 @@ def test_ec2_default_subnets_three_azs(ec2):
         assert s["MapPublicIpOnLaunch"] is True
 
 
-def test_describe_tags_filters(ec2):
+def test_ec2_describe_subnets_tags_filters(ec2):
+    vpc_id = ec2.create_vpc(CidrBlock="10.77.0.0/16")["Vpc"]["VpcId"]
+    subnet_id = ec2.create_subnet(VpcId=vpc_id, CidrBlock="10.77.1.0/24")["Subnet"]["SubnetId"]
+    ec2.create_tags(Resources=[subnet_id], Tags=[{"Key": "Tier", "Value": "private"}, {"Key": "Env", "Value": "dev"}])
+
+    resp = ec2.describe_subnets(Filters=[
+        {"Name": "vpc-id", "Values": [vpc_id]},
+        {"Name": "tag:Tier", "Values": ["private"]},
+    ])
+    assert any(s["SubnetId"] == subnet_id for s in resp["Subnets"])
+
+    resp = ec2.describe_subnets(Filters=[{"Name": "tag-key", "Values": ["Tier"]}])
+    assert any(s["SubnetId"] == subnet_id for s in resp["Subnets"])
+
+    resp = ec2.describe_subnets(Filters=[
+        {"Name": "vpc-id", "Values": [vpc_id]},
+        {"Name": "tag:Tier", "Values": ["public"]},
+    ])
+    assert all(s["SubnetId"] != subnet_id for s in resp["Subnets"])
+
+    ec2.delete_subnet(SubnetId=subnet_id)
+    ec2.delete_vpc(VpcId=vpc_id)
+
+
+def test_ec2_describe_tags_filters(ec2):
     """DescribeTags respects resource-id and key filters."""
     # Create two instances and tag them differently
     r1 = ec2.run_instances(ImageId="ami-test1", InstanceType="t2.micro", MinCount=1, MaxCount=1)

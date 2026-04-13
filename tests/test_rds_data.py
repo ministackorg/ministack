@@ -245,3 +245,115 @@ def test_convert_parameters_empty_value():
 
     result = _convert_parameters([{"name": "x", "value": {}}])
     assert result["x"] is None
+
+
+# ── Stub mode tests ────────────────────────────────────────
+
+def _setup_stub_cluster(rds, sm):
+    """Create an RDS cluster (no real DB container) and a secret for stub testing."""
+    import uuid as _uuid
+    cluster_id = f"stub-test-{_uuid.uuid4().hex[:8]}"
+    rds.create_db_cluster(
+        DBClusterIdentifier=cluster_id,
+        Engine="aurora-mysql",
+        MasterUsername="admin",
+        MasterUserPassword="testpass123",
+    )
+    secret_arn = sm.create_secret(
+        Name=f"stub-secret-{_uuid.uuid4().hex[:8]}",
+        SecretString='{"username":"admin","password":"testpass123"}',
+    )["ARN"]
+    cluster_arn = f"arn:aws:rds:{REGION}:{ACCOUNT_ID}:cluster:{cluster_id}"
+    return cluster_arn, secret_arn
+
+
+def _exec(cluster_arn, secret_arn, sql):
+    """Execute a SQL statement via the stub and return (status, body)."""
+    return _raw_post("/Execute", {
+        "resourceArn": cluster_arn,
+        "secretArn": secret_arn,
+        "sql": sql,
+    })
+
+
+def test_rds_data_stub_create_and_query_databases(rds, sm):
+    """CREATE DATABASE via stub, then query information_schema.schemata."""
+    cluster_arn, secret_arn = _setup_stub_cluster(rds, sm)
+
+    status, _ = _exec(cluster_arn, secret_arn, "CREATE DATABASE myappdb")
+    assert status == 200
+
+    status, body = _exec(
+        cluster_arn, secret_arn,
+        "SELECT schema_name FROM information_schema.schemata WHERE schema_name IN ('myappdb')",
+    )
+    assert status == 200
+    names = [r[0]["stringValue"] for r in body.get("records", [])]
+    assert "myappdb" in names
+
+
+def test_rds_data_stub_create_and_query_users(rds, sm):
+    """CREATE USER via stub, then query mysql.user."""
+    cluster_arn, secret_arn = _setup_stub_cluster(rds, sm)
+
+    status, _ = _exec(cluster_arn, secret_arn, "CREATE USER 'appuser'@'%' IDENTIFIED BY 'pass'")
+    assert status == 200
+
+    status, body = _exec(
+        cluster_arn, secret_arn,
+        "SELECT User FROM mysql.user WHERE User='appuser'",
+    )
+    assert status == 200
+    names = [r[0]["stringValue"] for r in body.get("records", [])]
+    assert "appuser" in names
+
+
+def test_rds_data_stub_grant_and_show_grants(rds, sm):
+    """GRANT privileges, then SHOW GRANTS FOR."""
+    cluster_arn, secret_arn = _setup_stub_cluster(rds, sm)
+
+    _exec(cluster_arn, secret_arn, "CREATE USER 'grantee'@'%' IDENTIFIED BY 'pass'")
+    status, _ = _exec(
+        cluster_arn, secret_arn,
+        "GRANT ALL PRIVILEGES ON mydb.* TO 'grantee'@'%'",
+    )
+    assert status == 200
+
+    status, body = _exec(cluster_arn, secret_arn, "SHOW GRANTS FOR 'grantee'")
+    assert status == 200
+    grants = [r[0]["stringValue"] for r in body.get("records", [])]
+    assert any("GRANT" in g and "grantee" in g for g in grants)
+
+
+def test_rds_data_stub_drop_database(rds, sm):
+    """CREATE then DROP DATABASE, verify gone from queries."""
+    cluster_arn, secret_arn = _setup_stub_cluster(rds, sm)
+
+    _exec(cluster_arn, secret_arn, "CREATE DATABASE dropme")
+    _exec(cluster_arn, secret_arn, "DROP DATABASE dropme")
+
+    status, body = _exec(
+        cluster_arn, secret_arn,
+        "SELECT schema_name FROM information_schema.schemata WHERE schema_name = 'dropme'",
+    )
+    assert status == 200
+    names = [r[0]["stringValue"] for r in body.get("records", [])]
+    assert "dropme" not in names
+
+
+def test_rds_data_stub_drop_user(rds, sm):
+    """CREATE then DROP USER, verify gone from queries."""
+    cluster_arn, secret_arn = _setup_stub_cluster(rds, sm)
+
+    _exec(cluster_arn, secret_arn, "CREATE USER 'tempuser'@'%' IDENTIFIED BY 'pass'")
+    _exec(cluster_arn, secret_arn, "DROP USER 'tempuser'@'%'")
+
+    status, body = _exec(
+        cluster_arn, secret_arn,
+        "SELECT User FROM mysql.user WHERE User='tempuser'",
+    )
+    assert status == 200
+    # Should return no records (empty records list from _stub_success)
+    records = body.get("records", [])
+    names = [r[0]["stringValue"] for r in records] if records else []
+    assert "tempuser" not in names

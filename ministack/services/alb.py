@@ -8,7 +8,8 @@ Supports:
   Target Groups:        CreateTargetGroup, DescribeTargetGroups, ModifyTargetGroup,
                         DeleteTargetGroup, DescribeTargetGroupAttributes,
                         ModifyTargetGroupAttributes
-  Listeners:            CreateListener, DescribeListeners, ModifyListener, DeleteListener
+  Listeners:            CreateListener, DescribeListeners, ModifyListener, DeleteListener,
+                        DescribeListenerAttributes, ModifyListenerAttributes
   Rules:                CreateRule, DescribeRules, ModifyRule, DeleteRule,
                         SetRulePriorities
   Target Registration:  RegisterTargets, DeregisterTargets, DescribeTargetHealth
@@ -45,6 +46,7 @@ _targets = AccountScopedDict()    # tg_arn   -> [target dict]
 _tags = AccountScopedDict()       # res_arn  -> [{Key, Value}]
 _lb_attrs = AccountScopedDict()   # lb_arn   -> [{Key, Value}]
 _tg_attrs = AccountScopedDict()   # tg_arn   -> [{Key, Value}]
+_listener_attrs = AccountScopedDict()  # l_arn -> [{Key, Value}]
 
 
 def get_state():
@@ -57,6 +59,7 @@ def get_state():
         "_tags": _tags,
         "_lb_attrs": _lb_attrs,
         "_tg_attrs": _tg_attrs,
+        "_listener_attrs": _listener_attrs,
     })
 
 
@@ -69,6 +72,7 @@ def restore_state(data):
     _tags.update(data.get("_tags", {}))
     _lb_attrs.update(data.get("_lb_attrs", {}))
     _tg_attrs.update(data.get("_tg_attrs", {}))
+    _listener_attrs.update(data.get("_listener_attrs", {}))
 
 
 _restored = load_state("alb")
@@ -578,6 +582,9 @@ def _create_listener(params):
         "DefaultActions": actions,
     }
     _listeners[l_arn] = listener
+    _listener_attrs[l_arn] = [
+        {"Key": "routing.http.response.server.enabled", "Value": "true"},
+    ]
     _tags[l_arn] = _parse_tags(params)
     # auto-create default rule
     rule_id = _short_id()
@@ -625,10 +632,42 @@ def _delete_listener(params):
     if arn not in _listeners:
         return _error("ListenerNotFound", f"Listener '{arn}' not found", 400)
     _listeners.pop(arn, None)
+    _listener_attrs.pop(arn, None)
     _tags.pop(arn, None)
     for rarn in [k for k, v in list(_rules.items()) if v.get("ListenerArn") == arn]:
         _rules.pop(rarn, None)
     return _empty("DeleteListener")
+
+
+def _describe_listener_attrs(params):
+    arn = _p(params, "ListenerArn")
+    if arn not in _listeners:
+        return _error("ListenerNotFound", f"Listener '{arn}' not found.")
+    attrs = _listener_attrs.get(arn, [])
+    return _xml(200, "DescribeListenerAttributes",
+                f"<Attributes>{_attrs_xml(attrs)}</Attributes>")
+
+
+def _modify_listener_attrs(params):
+    arn = _p(params, "ListenerArn")
+    if arn not in _listeners:
+        return _error("ListenerNotFound", f"Listener '{arn}' not found.")
+    attrs = _listener_attrs.setdefault(arn, [])
+    idx = {a["Key"]: i for i, a in enumerate(attrs)}
+    i = 1
+    while True:
+        key = _p(params, f"Attributes.member.{i}.Key")
+        if not key:
+            break
+        val = _p(params, f"Attributes.member.{i}.Value")
+        if key in idx:
+            attrs[idx[key]]["Value"] = val
+        else:
+            attrs.append({"Key": key, "Value": val})
+            idx[key] = len(attrs) - 1
+        i += 1
+    return _xml(200, "ModifyListenerAttributes",
+                f"<Attributes>{_attrs_xml(attrs)}</Attributes>")
 
 
 # ---------------------------------------------------------------------------
@@ -814,6 +853,8 @@ _ACTION_MAP = {
     "ModifyTargetGroupAttributes": _modify_tg_attrs,
     "CreateListener": _create_listener,
     "DescribeListeners": _describe_listeners,
+    "DescribeListenerAttributes": _describe_listener_attrs,
+    "ModifyListenerAttributes": _modify_listener_attrs,
     "ModifyListener": _modify_listener,
     "DeleteListener": _delete_listener,
     "CreateRule": _create_rule,
@@ -1093,3 +1134,4 @@ def reset():
     _tags.clear()
     _lb_attrs.clear()
     _tg_attrs.clear()
+    _listener_attrs.clear()

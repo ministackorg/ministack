@@ -7,6 +7,7 @@ Routes SQL to real database containers managed by the RDS service emulator.
 import json
 import logging
 import os
+import re
 import threading
 import uuid
 
@@ -20,6 +21,12 @@ REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 _transactions: dict = {}
 _lock = threading.Lock()
 
+# In-memory tracking for stub mode: remember databases/users created via SQL.
+# Keyed by cluster identifier.
+_stub_databases: dict = {}   # cluster_id -> set of database names
+_stub_users: dict = {}       # cluster_id -> set of usernames
+_stub_grants: dict = {}      # cluster_id -> {username -> list of grant strings}
+
 
 def _error(code, message, status=400):
     return error_response_json(code, message, status)
@@ -32,6 +39,157 @@ def _stub_success():
         "generatedFields": [],
         "records": [],
     })
+
+
+def _cluster_id_from_arn(resource_arn):
+    """Extract cluster identifier from an ARN."""
+    parts = resource_arn.split(":")
+    if len(parts) >= 7:
+        return parts[6]
+    return resource_arn
+
+
+_CREATE_DB_RE = re.compile(
+    r"CREATE\s+DATABASE\s+(?:IF\s+NOT\s+EXISTS\s+)?`?(\w+)`?", re.IGNORECASE)
+_CREATE_USER_RE = re.compile(
+    r"CREATE\s+USER\s+(?:IF\s+NOT\s+EXISTS\s+)?'([^']+)'", re.IGNORECASE)
+_DROP_USER_RE = re.compile(
+    r"DROP\s+USER\s+(?:IF\s+EXISTS\s+)?'([^']+)'", re.IGNORECASE)
+_DROP_DB_RE = re.compile(
+    r"DROP\s+DATABASE\s+(?:IF\s+EXISTS\s+)?`?(\w+)`?", re.IGNORECASE)
+_GRANT_RE = re.compile(
+    r"(GRANT\s+.+?\s+TO\s+'([^']+)'.*)", re.IGNORECASE | re.DOTALL)
+_REVOKE_RE = re.compile(
+    r"REVOKE\s+.+?\s+FROM\s+'([^']+)'", re.IGNORECASE | re.DOTALL)
+_SHOW_DATABASES_RE = re.compile(
+    r"SHOW\s+DATABASES", re.IGNORECASE)
+_SELECT_SCHEMATA_RE = re.compile(
+    r"SELECT\s+schema_name\s+FROM\s+information_schema\.schemata", re.IGNORECASE)
+_SELECT_USER_RE = re.compile(
+    r"SELECT\s+.*FROM\s+mysql\.user\s+WHERE\s+User\s*=\s*'([^']+)'", re.IGNORECASE)
+_SHOW_GRANTS_RE = re.compile(
+    r"SHOW\s+GRANTS\s+FOR\s+'([^']+)'", re.IGNORECASE)
+
+
+def _stub_execute(resource_arn, sql):
+    """Handle SQL in stub mode: track creates, respond to queries."""
+    cid = _cluster_id_from_arn(resource_arn)
+
+    # Track CREATE DATABASE
+    m = _CREATE_DB_RE.search(sql)
+    if m:
+        _stub_databases.setdefault(cid, set()).add(m.group(1))
+        logger.info("Stub: tracked CREATE DATABASE %s on %s", m.group(1), cid)
+        return _stub_success()
+
+    # Track CREATE USER
+    m = _CREATE_USER_RE.search(sql)
+    if m:
+        _stub_users.setdefault(cid, set()).add(m.group(1))
+        logger.info("Stub: tracked CREATE USER %s on %s", m.group(1), cid)
+        return _stub_success()
+
+    # Track DROP USER
+    m = _DROP_USER_RE.search(sql)
+    if m:
+        _stub_users.get(cid, set()).discard(m.group(1))
+        _stub_grants.get(cid, {}).pop(m.group(1), None)
+        logger.info("Stub: tracked DROP USER %s on %s", m.group(1), cid)
+        return _stub_success()
+
+    # Track DROP DATABASE
+    m = _DROP_DB_RE.search(sql)
+    if m:
+        _stub_databases.get(cid, set()).discard(m.group(1))
+        logger.info("Stub: tracked DROP DATABASE %s on %s", m.group(1), cid)
+        return _stub_success()
+
+    # Track GRANT
+    m = _GRANT_RE.search(sql)
+    if m:
+        grant_str, username = m.group(1).strip(), m.group(2)
+        _stub_grants.setdefault(cid, {}).setdefault(username, []).append(grant_str)
+        logger.info("Stub: tracked GRANT for %s on %s", username, cid)
+        return _stub_success()
+
+    # Track REVOKE
+    m = _REVOKE_RE.search(sql)
+    if m:
+        username = m.group(1)
+        _stub_grants.get(cid, {}).pop(username, None)
+        logger.info("Stub: tracked REVOKE for %s on %s", username, cid)
+        return _stub_success()
+
+    # Respond to SHOW DATABASES
+    if _SHOW_DATABASES_RE.search(sql):
+        dbs = _stub_databases.get(cid, set())
+        # Always include system databases
+        all_dbs = {"information_schema", "mysql", "performance_schema", "sys"} | dbs
+        records = [[{"stringValue": db}] for db in sorted(all_dbs)]
+        return json_response({
+            "numberOfRecordsUpdated": 0,
+            "generatedFields": [],
+            "records": records,
+        })
+
+    # Respond to SELECT schema_name FROM information_schema.schemata ...
+    if _SELECT_SCHEMATA_RE.search(sql):
+        dbs = _stub_databases.get(cid, set())
+        all_dbs = {"information_schema", "mysql", "performance_schema", "sys"} | dbs
+        # Filter by WHERE clause if present
+        in_match = re.search(r"WHERE\s+schema_name\s+IN\s*\(([^)]+)\)", sql, re.IGNORECASE)
+        eq_match = re.search(r"WHERE\s+schema_name\s*=\s*'([^']+)'", sql, re.IGNORECASE)
+        if in_match:
+            requested = {s.strip().strip("'\"") for s in in_match.group(1).split(",")}
+            matching = all_dbs & requested
+        elif eq_match:
+            name = eq_match.group(1)
+            matching = {name} if name in all_dbs else set()
+        else:
+            matching = all_dbs
+        records = [[{"stringValue": db}] for db in sorted(matching)]
+        return json_response({
+            "numberOfRecordsUpdated": 0,
+            "generatedFields": [],
+            "records": records,
+        })
+
+    # Respond to SELECT ... FROM mysql.user WHERE User = '...'
+    m = _SELECT_USER_RE.search(sql)
+    if m:
+        username = m.group(1)
+        users = _stub_users.get(cid, set())
+        if username in users:
+            # Check if it's asking for a specific column (privilege check)
+            col_match = re.match(r"SELECT\s+(\w+)\s+FROM", sql, re.IGNORECASE)
+            if col_match and col_match.group(1).lower() != "user":
+                # Privilege column query — return "Y" for any privilege
+                return json_response({
+                    "numberOfRecordsUpdated": 0,
+                    "generatedFields": [],
+                    "records": [[{"stringValue": "Y"}]],
+                })
+            return json_response({
+                "numberOfRecordsUpdated": 0,
+                "generatedFields": [],
+                "records": [[{"stringValue": username}]],
+            })
+        return _stub_success()
+
+    # Respond to SHOW GRANTS FOR '...'
+    m = _SHOW_GRANTS_RE.search(sql)
+    if m:
+        username = m.group(1)
+        grants = _stub_grants.get(cid, {}).get(username, [])
+        records = [[{"stringValue": g}] for g in grants]
+        return json_response({
+            "numberOfRecordsUpdated": 0,
+            "generatedFields": [],
+            "records": records,
+        })
+
+    # Default stub
+    return _stub_success()
 
 
 def _resolve_cluster(resource_arn):
@@ -246,8 +404,8 @@ def _execute_statement(data):
     # Clusters have Endpoint as a string (hostname); instances have it as a dict.
     endpoint = instance.get("Endpoint", {})
     if isinstance(endpoint, str) or not endpoint.get("Port"):
-        logger.info("No endpoint for %s, returning stub success", resource_arn)
-        return _stub_success()
+        logger.info("No endpoint for %s, using stub mode", resource_arn)
+        return _stub_execute(resource_arn, sql)
 
     password = _get_secret_password(secret_arn)
 
@@ -299,11 +457,19 @@ def _execute_statement(data):
     except ImportError as e:
         if own_conn and conn:
             conn.close()
-        logger.warning("DB driver not available, returning stub: %s", e)
-        return _stub_success()
+        logger.warning("DB driver not available, using stub: %s", e)
+        return _stub_execute(resource_arn, sql)
     except Exception as e:
         if own_conn and conn:
             conn.close()
+        # Connection errors (e.g. when RDS containers are not reachable from
+        # within the MiniStack container) should fall back to stubs rather than
+        # failing the caller.  This covers LAMBDA_EXECUTOR=local where the
+        # MySQL sidecar container is not network-accessible.
+        err_str = str(e)
+        if "Can't connect" in err_str or "Connection refused" in err_str:
+            logger.warning("DB connection failed, using stub: %s", e)
+            return _stub_execute(resource_arn, sql)
         return _error("BadRequestException", f"Database error: {e}")
 
 
@@ -462,3 +628,6 @@ def reset():
             except Exception:
                 pass
         _transactions.clear()
+    _stub_databases.clear()
+    _stub_users.clear()
+    _stub_grants.clear()

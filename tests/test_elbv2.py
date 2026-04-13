@@ -145,6 +145,81 @@ def test_elbv2_listener_crud(elbv2):
     elbv2.delete_target_group(TargetGroupArn=tg_arn)
     elbv2.delete_load_balancer(LoadBalancerArn=lb_arn)
 
+
+def test_elbv2_describe_listener_attributes(elbv2):
+    lb_arn = elbv2.create_load_balancer(Name="qa-alb-listener-attrs")["LoadBalancers"][0]["LoadBalancerArn"]
+    tg_arn = elbv2.create_target_group(
+        Name="qa-tg-la",
+        Protocol="HTTP",
+        Port=80,
+        VpcId="vpc-00000001",
+    )["TargetGroups"][0]["TargetGroupArn"]
+    l_arn = elbv2.create_listener(
+        LoadBalancerArn=lb_arn,
+        Protocol="HTTP",
+        Port=80,
+        DefaultActions=[{"Type": "forward", "TargetGroupArn": tg_arn}],
+    )["Listeners"][0]["ListenerArn"]
+
+    resp = elbv2.describe_listener_attributes(ListenerArn=l_arn)
+    attrs = {a["Key"]: a["Value"] for a in resp["Attributes"]}
+    assert attrs.get("routing.http.response.server.enabled") == "true"
+
+    elbv2.delete_listener(ListenerArn=l_arn)
+    elbv2.delete_target_group(TargetGroupArn=tg_arn)
+    elbv2.delete_load_balancer(LoadBalancerArn=lb_arn)
+
+
+def test_elbv2_describe_listener_attributes_not_found(elbv2):
+    with pytest.raises(ClientError) as exc:
+        elbv2.describe_listener_attributes(ListenerArn="arn:aws:elasticloadbalancing:us-east-1:000000000000:listener/app/missing/abc/def")
+    assert exc.value.response["Error"]["Code"] == "ListenerNotFound"
+
+
+def test_elbv2_modify_listener_attributes(elbv2):
+    lb_arn = elbv2.create_load_balancer(Name="qa-alb-mod-listener-attrs")["LoadBalancers"][0]["LoadBalancerArn"]
+    tg_arn = elbv2.create_target_group(
+        Name="qa-tg-mla",
+        Protocol="HTTP",
+        Port=80,
+        VpcId="vpc-00000001",
+    )["TargetGroups"][0]["TargetGroupArn"]
+    l_arn = elbv2.create_listener(
+        LoadBalancerArn=lb_arn,
+        Protocol="HTTP",
+        Port=80,
+        DefaultActions=[{"Type": "forward", "TargetGroupArn": tg_arn}],
+    )["Listeners"][0]["ListenerArn"]
+
+    resp = elbv2.modify_listener_attributes(
+        ListenerArn=l_arn,
+        Attributes=[
+            {"Key": "routing.http.response.server.enabled", "Value": "false"},
+            {"Key": "routing.http.response.strict_transport_security.header_value", "Value": "max-age=31536000"},
+        ],
+    )
+    attrs = {a["Key"]: a["Value"] for a in resp["Attributes"]}
+    assert attrs["routing.http.response.server.enabled"] == "false"
+    assert attrs["routing.http.response.strict_transport_security.header_value"] == "max-age=31536000"
+
+    desc = elbv2.describe_listener_attributes(ListenerArn=l_arn)
+    desc_attrs = {a["Key"]: a["Value"] for a in desc["Attributes"]}
+    assert desc_attrs["routing.http.response.server.enabled"] == "false"
+    assert desc_attrs["routing.http.response.strict_transport_security.header_value"] == "max-age=31536000"
+
+    elbv2.delete_listener(ListenerArn=l_arn)
+    elbv2.delete_target_group(TargetGroupArn=tg_arn)
+    elbv2.delete_load_balancer(LoadBalancerArn=lb_arn)
+
+
+def test_elbv2_modify_listener_attributes_not_found(elbv2):
+    with pytest.raises(ClientError) as exc:
+        elbv2.modify_listener_attributes(
+            ListenerArn="arn:aws:elasticloadbalancing:us-east-1:000000000000:listener/app/missing/abc/def",
+            Attributes=[{"Key": "routing.http.response.server.enabled", "Value": "false"}],
+        )
+    assert exc.value.response["Error"]["Code"] == "ListenerNotFound"
+
 def test_elbv2_rule_crud(elbv2):
     lb_arn = elbv2.create_load_balancer(Name="qa-alb-rules")["LoadBalancers"][0]["LoadBalancerArn"]
     tg_arn = elbv2.create_target_group(

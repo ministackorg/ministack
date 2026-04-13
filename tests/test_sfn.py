@@ -552,9 +552,10 @@ def test_sfn_aws_sdk_rds_create_and_describe_cluster(sfn, sfn_sync):
     assert create_cluster["DbClusterIdentifier"] == cluster_id
     assert create_cluster["Engine"] == "aurora-postgresql"
 
-    # Verify describe result contains cluster data
+    # Verify describe result contains cluster data (list-wrapper fidelity)
     describe_clusters = output["describeResult"]["DbClusters"]
-    assert "DbCluster" in describe_clusters
+    assert isinstance(describe_clusters, list)
+    assert len(describe_clusters) >= 1
 
     sfn_sync.delete_state_machine(stateMachineArn=sm_arn)
 
@@ -649,7 +650,60 @@ def test_sfn_aws_sdk_rds_modify_cluster(sfn, sfn_sync, rds):
     resp = sfn_sync.start_sync_execution(stateMachineArn=sm_arn, input=json.dumps({}))
     assert resp["status"] == "SUCCEEDED", f"Execution failed: {resp.get('error')} — {resp.get('cause')}"
     output = json.loads(resp["output"])
-    assert output["modifyResult"]["DbCluster"]["BackupRetentionPeriod"] == "7"
+    assert output["modifyResult"]["DbCluster"]["BackupRetentionPeriod"] == 7
+
+    sfn_sync.delete_state_machine(stateMachineArn=sm_arn)
+
+def test_sfn_xml_list_wrapper_single_element(sfn, sfn_sync):
+    """DescribeDBClusters returns a JSON list even when only one cluster exists."""
+    import uuid as _uuid
+
+    cluster_id = f"sfn-wrap-{_uuid.uuid4().hex[:8]}"
+    sm_name = f"sdk-rds-wrap-{_uuid.uuid4().hex[:8]}"
+
+    definition = json.dumps({
+        "StartAt": "CreateCluster",
+        "States": {
+            "CreateCluster": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::aws-sdk:rds:CreateDBCluster",
+                "Parameters": {
+                    "DBClusterIdentifier": cluster_id,
+                    "Engine": "aurora-postgresql",
+                    "MasterUsername": "admin",
+                    "MasterUserPassword": "testpass123",
+                },
+                "ResultPath": "$.createResult",
+                "Next": "DescribeClusters",
+            },
+            "DescribeClusters": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::aws-sdk:rds:DescribeDBClusters",
+                "Parameters": {
+                    "DBClusterIdentifier": cluster_id,
+                },
+                "ResultPath": "$.describeResult",
+                "Next": "Done",
+            },
+            "Done": {"Type": "Succeed"},
+        },
+    })
+
+    sm_arn = sfn_sync.create_state_machine(
+        name=sm_name,
+        definition=definition,
+        roleArn="arn:aws:iam::000000000000:role/sfn-role",
+    )["stateMachineArn"]
+
+    resp = sfn_sync.start_sync_execution(stateMachineArn=sm_arn, input=json.dumps({}))
+    assert resp["status"] == "SUCCEEDED", f"Execution failed: {resp.get('error')} — {resp.get('cause')}"
+    output = json.loads(resp["output"])
+
+    # Even with a single cluster, DbClusters must be a list (not a dict).
+    db_clusters = output["describeResult"]["DbClusters"]
+    assert isinstance(db_clusters, list), f"Expected list, got {type(db_clusters)}: {db_clusters}"
+    assert len(db_clusters) == 1
+    assert db_clusters[0]["DbClusterIdentifier"] == cluster_id
 
     sfn_sync.delete_state_machine(stateMachineArn=sm_arn)
 
@@ -2317,6 +2371,57 @@ def test_sfn_validate_state_machine_definition(sfn):
     assert resp["diagnostics"] == []
 
 
+def test_sfn_rest_json_pascal_to_camel_conversion(sfn, sfn_sync, rds, sm):
+    """PascalCase params in SFN are converted to camelCase for REST-JSON dispatch."""
+    import uuid as _uuid
+
+    cluster_id = f"rdsdata-camel-{_uuid.uuid4().hex[:8]}"
+    sm_name = f"sdk-rdsdata-camel-{_uuid.uuid4().hex[:8]}"
+
+    rds.create_db_cluster(
+        DBClusterIdentifier=cluster_id,
+        Engine="aurora-mysql",
+        MasterUsername="admin",
+        MasterUserPassword="testpass123",
+    )
+    secret_arn = sm.create_secret(
+        Name=f"rdsdata-camel-secret-{_uuid.uuid4().hex[:8]}",
+        SecretString='{"username":"admin","password":"testpass123"}',
+    )["ARN"]
+    cluster_arn = f"arn:aws:rds:us-east-1:000000000000:cluster:{cluster_id}"
+
+    # Use PascalCase keys — the dispatcher must convert them to camelCase
+    definition = json.dumps({
+        "StartAt": "ExecuteSQL",
+        "States": {
+            "ExecuteSQL": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::aws-sdk:rdsdata:executeStatement",
+                "Parameters": {
+                    "ResourceArn": cluster_arn,
+                    "SecretArn": secret_arn,
+                    "Sql": "SELECT 1",
+                    "Database": "testdb",
+                },
+                "End": True,
+            },
+        },
+    })
+
+    sm_arn = sfn_sync.create_state_machine(
+        name=sm_name,
+        definition=definition,
+        roleArn="arn:aws:iam::000000000000:role/sfn-role",
+    )["stateMachineArn"]
+
+    resp = sfn_sync.start_sync_execution(stateMachineArn=sm_arn, input=json.dumps({}))
+    assert resp["status"] == "SUCCEEDED", f"Execution failed: {resp.get('error')} \u2014 {resp.get('cause')}"
+    output = json.loads(resp["output"])
+    assert "numberOfRecordsUpdated" in output or "records" in output
+
+    sfn_sync.delete_state_machine(stateMachineArn=sm_arn)
+
+
 def test_sfn_validate_state_machine_definition_with_type(sfn):
     """ValidateStateMachineDefinition should accept optional type parameter."""
     definition = json.dumps({
@@ -2331,3 +2436,40 @@ def test_sfn_validate_state_machine_definition_with_type(sfn):
     )
     assert resp["result"] == "OK"
     assert isinstance(resp["diagnostics"], list)
+
+
+
+def test_sfn_intrinsic_functions_batch_2(sfn, sfn_sync):
+    """Test batch 2 intrinsic functions."""
+    import uuid as _uuid
+    sm_name = f"intrinsics-b2-{_uuid.uuid4().hex[:8]}"
+    definition = json.dumps({
+        "StartAt": "Test",
+        "States": {
+            "Test": {
+                "Type": "Pass",
+                "Parameters": {
+                    "contains.$": "States.ArrayContains(States.Array(1, 2, 3), 2)",
+                    "containsMiss.$": "States.ArrayContains(States.Array(1, 2, 3), 5)",
+                    "unique.$": "States.ArrayUnique(States.Array(1, 2, 2, 3, 3))",
+                    "partition.$": "States.ArrayPartition(States.Array(1, 2, 3, 4, 5), 2)",
+                    "range.$": "States.ArrayRange(1, 9, 2)",
+                    "add.$": "States.MathAdd(5, 3)",
+                    "uuid.$": "States.UUID()",
+                },
+                "End": True,
+            },
+        },
+    })
+    sm_arn = sfn_sync.create_state_machine(name=sm_name, definition=definition, roleArn="arn:aws:iam::000000000000:role/sfn-role")["stateMachineArn"]
+    resp = sfn_sync.start_sync_execution(stateMachineArn=sm_arn, input="{}")
+    assert resp["status"] == "SUCCEEDED"
+    output = json.loads(resp["output"])
+    assert output["contains"] is True
+    assert output["containsMiss"] is False
+    assert output["unique"] == [1, 2, 3]
+    assert output["partition"] == [[1, 2], [3, 4], [5]]
+    assert output["range"] == [1, 3, 5, 7, 9]
+    assert output["add"] == 8
+    assert len(output["uuid"]) == 36  # UUID format
+    sfn_sync.delete_state_machine(stateMachineArn=sm_arn)

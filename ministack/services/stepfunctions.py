@@ -1827,6 +1827,27 @@ def _exec_intrinsic(node, data, ctx):
         return list(args)
     elif name == "States.ArrayLength":
         return len(args[0])
+    elif name == "States.ArrayContains":
+        return args[1] in args[0]
+    elif name == "States.ArrayUnique":
+        seen = []
+        for item in args[0]:
+            if item not in seen:
+                seen.append(item)
+        return seen
+    elif name == "States.ArrayPartition":
+        arr, chunk = args[0], int(args[1])
+        return [arr[i:i + chunk] for i in range(0, len(arr), chunk)]
+    elif name == "States.ArrayRange":
+        start, end, step = int(args[0]), int(args[1]), int(args[2])
+        return list(range(start, end + 1, step))
+    elif name == "States.MathRandom":
+        import random
+        return random.randint(int(args[0]), int(args[1]))
+    elif name == "States.MathAdd":
+        return int(args[0]) + int(args[1])
+    elif name == "States.UUID":
+        return new_uuid()
 
     raise ValueError(f"Unsupported intrinsic function: {name}")
 
@@ -2270,19 +2291,98 @@ def _flatten_query_params(data, prefix=""):
     return params
 
 
+# Fields in AWS XML responses that should be coerced to native types in JSON.
+# Only fields that Step Functions consumers rely on being non-string.
+_XML_NUMERIC_FIELDS = frozenset({
+    "Port", "BackupRetentionPeriod", "AllocatedStorage", "Iops",
+    "MonitoringInterval", "PromotionTier", "DbInstancePort",
+    "MaxAllocatedStorage", "StorageThroughput",
+})
+# Empty self-closing XML elements that should become [] not "".
+_XML_LIST_WRAPPER_TAGS = frozenset({
+    "Parameters", "DBClusterMembers", "VpcSecurityGroups",
+    "AvailabilityZones", "Subnets", "ReadReplicaDBInstanceIdentifiers",
+    "ReadReplicaDBClusterIdentifiers", "DBSecurityGroups",
+    "OptionGroupMemberships", "StatusInfos", "DomainMemberships",
+    "AssociatedRoles", "TagList", "ProcessorFeatures",
+    "EnabledCloudwatchLogsExports", "GlobalClusterMembers",
+    "DBParameterGroups", "DBInstances", "DBClusters",
+    "SupportedNetworkTypes",
+})
+_XML_BOOLEAN_FIELDS = frozenset({
+    "MultiAZ", "Multiaz", "StorageEncrypted", "DeletionProtection",
+    "PubliclyAccessible", "AutoMinorVersionUpgrade",
+    "CopyTagsToSnapshot", "IamDatabaseAuthenticationEnabled",
+    "PerformanceInsightsEnabled", "HttpEndpointEnabled",
+    "CrossAccountClone", "CustomerOwnedIpEnabled",
+    "IsStorageConfigUpgradeAvailable", "IsWriter",
+})
+
+
 def _xml_element_to_dict(element):
     """Convert an XML element tree to a JSON-friendly dict.
 
     Strips namespace prefixes.  Repeated child tags become lists.
     Leaf text nodes become strings.
+
+    AWS query-protocol list convention: when a parent element contains only
+    children that all share the same tag (e.g. ``<DBClusters><DBCluster>...
+    </DBCluster></DBClusters>`` or ``<member>...</member>``), the parent is
+    treated as a **list wrapper** and its value becomes a JSON array — even
+    when there is only a single child.  This matches the real AWS SDK
+    behaviour that Step Functions consumers rely on (``DbClusters[0]``).
     """
     # Strip namespace
     tag = element.tag.split("}")[-1] if "}" in element.tag else element.tag
 
     children = list(element)
     if not children:
-        # Leaf node
-        return tag, (element.text or "")
+        text = element.text or ""
+        # Empty self-closing tags that are known list wrappers should become
+        # empty arrays, not empty strings (e.g. <Parameters/> → []).
+        if not text and tag in _XML_LIST_WRAPPER_TAGS:
+            return tag, []
+        # Leaf node — keep as string by default.  Only coerce specific known
+        # numeric/boolean fields that Step Functions consumers rely on (e.g.
+        # Port must be an integer for JSON unmarshal into int64).
+        if text and tag in _XML_NUMERIC_FIELDS:
+            try:
+                return tag, int(text)
+            except ValueError:
+                try:
+                    return tag, float(text)
+                except ValueError:
+                    pass
+        if text and tag in _XML_BOOLEAN_FIELDS:
+            if text == "true":
+                return tag, True
+            if text == "false":
+                return tag, False
+        return tag, text
+
+    # Detect list-wrapper elements: all children share the same tag name AND
+    # the parent looks like a plural wrapper (e.g. DBClusters→DBCluster,
+    # AvailabilityZones→AvailabilityZone) or children use the generic
+    # "member" tag.  We require either multiple children OR a plural naming
+    # pattern to avoid false positives on single-child result wrappers like
+    # <CreateDBClusterParameterGroupResult><DBClusterParameterGroup>...</>
+    child_tags = {(c.tag.split("}")[-1] if "}" in c.tag else c.tag) for c in children}
+    if len(child_tags) == 1:
+        child_tag_name = next(iter(child_tags))
+        is_member = child_tag_name == "member"
+        is_plural = (
+            tag.endswith(child_tag_name + "s")
+            or tag == child_tag_name + "s"
+            or tag.endswith("Ids") and child_tag_name == "Id"
+        )
+        has_multiple = len(children) > 1
+        if is_member or is_plural or has_multiple:
+            # Treat as a list.
+            items = []
+            for child in children:
+                _, child_val = _xml_element_to_dict(child)
+                items.append(child_val)
+            return tag, items
 
     result = {}
     for child in children:
@@ -2472,6 +2572,22 @@ def _dispatch_aws_sdk_query(service_info, service_name, action, input_data):
         raise _ExecutionError("States.Runtime", f"Failed to parse {service_name} XML response")
 
 
+def _pascal_key_to_camel(key):
+    """Convert a single PascalCase key to camelCase: 'ResourceArn' -> 'resourceArn'."""
+    if not key:
+        return key
+    return key[0].lower() + key[1:]
+
+
+def _convert_keys_to_camel(data):
+    """Recursively convert dict keys from PascalCase to camelCase."""
+    if isinstance(data, dict):
+        return {_pascal_key_to_camel(k): _convert_keys_to_camel(v) for k, v in data.items()}
+    if isinstance(data, list):
+        return [_convert_keys_to_camel(v) for v in data]
+    return data
+
+
 def _dispatch_aws_sdk_rest_json(service_info, service_name, action, input_data):
     """Dispatch an aws-sdk integration call to a REST-JSON protocol MiniStack service."""
     from ministack import app
@@ -2490,7 +2606,10 @@ def _dispatch_aws_sdk_rest_json(service_info, service_name, action, input_data):
     action_paths = _REST_JSON_ACTION_PATHS.get(service_key, {})
     path = action_paths.get(pascal_action, f"/{pascal_action}")
 
-    body = json.dumps(input_data or {}).encode("utf-8")
+    # REST-JSON services use camelCase on the wire, but SFN Parameters use
+    # PascalCase.  AWS SFN converts automatically; we must do the same.
+    wire_data = _convert_keys_to_camel(input_data or {})
+    body = json.dumps(wire_data).encode("utf-8")
     headers = {
         "content-type": "application/json",
         "host": f"{service_key}.{REGION}.amazonaws.com",

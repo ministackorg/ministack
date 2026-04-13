@@ -750,6 +750,10 @@ def _matches_vpc_filters(vpc, filters):
             tag_val = next((t["Value"] for t in tag_list if t["Key"] == tag_key), None)
             if tag_val not in vals:
                 return False
+        elif name == "tag-key":
+            tag_list = _tags.get(vpc["VpcId"], [])
+            if not any(t["Key"] in vals for t in tag_list):
+                return False
     return True
 
 
@@ -917,19 +921,38 @@ def _describe_subnets(p):
     for subnet in _subnets.values():
         if filter_ids and subnet["SubnetId"] not in filter_ids:
             continue
-        if filters:
-            if "vpc-id" in filters and subnet["VpcId"] not in filters["vpc-id"]:
-                continue
-            if "availability-zone" in filters and subnet["AvailabilityZone"] not in filters["availability-zone"]:
-                continue
-            if "subnet-id" in filters and subnet["SubnetId"] not in filters["subnet-id"]:
-                continue
-            if "default-for-az" in filters:
-                val = "true" if subnet.get("DefaultForAz") else "false"
-                if val not in filters["default-for-az"]:
-                    continue
+        if not _matches_subnet_filters(subnet, filters):
+            continue
         items += _subnet_xml(subnet)
     return _xml(200, "DescribeSubnetsResponse", f"<subnetSet>{items}</subnetSet>")
+
+
+def _matches_subnet_filters(subnet, filters):
+    for name, vals in filters.items():
+        if name == "vpc-id":
+            if subnet["VpcId"] not in vals:
+                return False
+        elif name == "availability-zone":
+            if subnet["AvailabilityZone"] not in vals:
+                return False
+        elif name == "subnet-id":
+            if subnet["SubnetId"] not in vals:
+                return False
+        elif name == "default-for-az":
+            val = "true" if subnet.get("DefaultForAz") else "false"
+            if val not in vals:
+                return False
+        elif name.startswith("tag:"):
+            tag_key = name[4:]
+            tag_list = _tags.get(subnet["SubnetId"], [])
+            tag_val = next((t["Value"] for t in tag_list if t["Key"] == tag_key), None)
+            if tag_val not in vals:
+                return False
+        elif name == "tag-key":
+            tag_list = _tags.get(subnet["SubnetId"], [])
+            if not any(t["Key"] in vals for t in tag_list):
+                return False
+    return True
 
 
 def _create_subnet(p):
