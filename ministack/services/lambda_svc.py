@@ -2823,13 +2823,42 @@ def _poll_sqs():
                 func_name, queue_name, err_type, err_msg, result.get("log", ""),
             )
         else:
-            receipt_handles = {msg["receipt_handle"] for msg in batch if msg.get("receipt_handle")}
-            _sqs._delete_messages_for_esm(queue_url, receipt_handles)
-            esm["LastProcessingResult"] = f"OK - {len(batch)} records"
+            # Check for ReportBatchItemFailures — partial batch response
+            failed_ids = set()
+            if "ReportBatchItemFailures" in esm.get("FunctionResponseTypes", []):
+                body = result.get("body")
+                if isinstance(body, dict):
+                    for failure in body.get("batchItemFailures", []):
+                        fid = failure.get("itemIdentifier", "")
+                        if fid:
+                            failed_ids.add(fid)
+                elif isinstance(body, str):
+                    try:
+                        parsed = json.loads(body)
+                        for failure in parsed.get("batchItemFailures", []):
+                            fid = failure.get("itemIdentifier", "")
+                            if fid:
+                                failed_ids.add(fid)
+                    except (json.JSONDecodeError, AttributeError):
+                        pass
+
+            # Delete only the messages that succeeded (not in failed_ids)
+            succeeded = [msg for msg in batch if msg["id"] not in failed_ids]
+            receipt_handles = {msg["receipt_handle"] for msg in succeeded if msg.get("receipt_handle")}
+            if receipt_handles:
+                _sqs._delete_messages_for_esm(queue_url, receipt_handles)
+
+            n_failed = len(batch) - len(succeeded)
+            if n_failed:
+                esm["LastProcessingResult"] = f"OK - {len(succeeded)} records, {n_failed} partial failures"
+                logger.info("ESM: Lambda %s processed %d SQS messages from %s (%d partial failures)",
+                            func_name, len(succeeded), queue_name, n_failed)
+            else:
+                esm["LastProcessingResult"] = f"OK - {len(batch)} records"
+                logger.info("ESM: Lambda %s processed %d SQS messages from %s", func_name, len(batch), queue_name)
             log_output = result.get("log", "")
             if log_output:
                 logger.info("ESM: Lambda %s output:\n%s", func_name, log_output)
-            logger.info("ESM: Lambda %s processed %d SQS messages from %s", func_name, len(batch), queue_name)
 
 
 def _poll_kinesis():

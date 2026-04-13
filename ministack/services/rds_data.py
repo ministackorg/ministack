@@ -23,9 +23,9 @@ _lock = threading.Lock()
 
 # In-memory tracking for stub mode: remember databases/users created via SQL.
 # Keyed by cluster identifier.
-_stub_databases: dict = {}   # cluster_id -> set of database names
-_stub_users: dict = {}       # cluster_id -> set of usernames
-_stub_grants: dict = {}      # cluster_id -> {username -> list of grant strings}
+_stub_databases = AccountScopedDict()   # cluster_id -> set of database names
+_stub_users = AccountScopedDict()       # cluster_id -> set of usernames
+_stub_grants = AccountScopedDict()      # cluster_id -> {username -> list of grant strings}
 
 
 def _error(code, message, status=400):

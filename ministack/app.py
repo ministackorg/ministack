@@ -910,7 +910,26 @@ def main():
 
     signal.signal(signal.SIGTERM, lambda *_: (_cleanup(), sys.exit(0)))
     try:
-        uvicorn.run("ministack.app:app", host="0.0.0.0", port=port, log_level=LOG_LEVEL.lower(), timeout_keep_alive=75)
+        # Suppress health-check access logs at INFO level (reported by @McDoit).
+        # Visible when LOG_LEVEL=DEBUG.
+        _HEALTH_PATHS = ("/_ministack/health", "/_localstack/health", "/health")
+
+        class _HealthLogFilter(logging.Filter):
+            def filter(self, record):
+                if LOG_LEVEL == "DEBUG":
+                    return True
+                msg = record.getMessage()
+                return not any(p in msg for p in _HEALTH_PATHS)
+
+        log_config = uvicorn.config.LOGGING_CONFIG.copy()
+        log_config["loggers"] = log_config.get("loggers", {}).copy()
+        log_config["filters"] = {"health_filter": {"()": lambda: _HealthLogFilter()}}
+        access_logger = log_config["loggers"].get("uvicorn.access", {}).copy()
+        access_logger["filters"] = ["health_filter"]
+        log_config["loggers"]["uvicorn.access"] = access_logger
+
+        uvicorn.run("ministack.app:app", host="0.0.0.0", port=port, log_level=LOG_LEVEL.lower(),
+                    timeout_keep_alive=75, log_config=log_config)
     finally:
         _cleanup()
 

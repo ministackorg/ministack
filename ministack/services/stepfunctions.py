@@ -2373,7 +2373,7 @@ def _xml_element_to_dict(element):
         is_plural = (
             tag.endswith(child_tag_name + "s")
             or tag == child_tag_name + "s"
-            or tag.endswith("Ids") and child_tag_name == "Id"
+            or (tag.endswith("Ids") and child_tag_name == "Id")
         )
         has_multiple = len(children) > 1
         if is_member or is_plural or has_multiple:
