@@ -2317,6 +2317,57 @@ def test_sfn_validate_state_machine_definition(sfn):
     assert resp["diagnostics"] == []
 
 
+def test_sfn_rest_json_pascal_to_camel_conversion(sfn, sfn_sync, rds, sm):
+    """PascalCase params in SFN are converted to camelCase for REST-JSON dispatch."""
+    import uuid as _uuid
+
+    cluster_id = f"rdsdata-camel-{_uuid.uuid4().hex[:8]}"
+    sm_name = f"sdk-rdsdata-camel-{_uuid.uuid4().hex[:8]}"
+
+    rds.create_db_cluster(
+        DBClusterIdentifier=cluster_id,
+        Engine="aurora-mysql",
+        MasterUsername="admin",
+        MasterUserPassword="testpass123",
+    )
+    secret_arn = sm.create_secret(
+        Name=f"rdsdata-camel-secret-{_uuid.uuid4().hex[:8]}",
+        SecretString='{"username":"admin","password":"testpass123"}',
+    )["ARN"]
+    cluster_arn = f"arn:aws:rds:us-east-1:000000000000:cluster:{cluster_id}"
+
+    # Use PascalCase keys — the dispatcher must convert them to camelCase
+    definition = json.dumps({
+        "StartAt": "ExecuteSQL",
+        "States": {
+            "ExecuteSQL": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::aws-sdk:rdsdata:executeStatement",
+                "Parameters": {
+                    "ResourceArn": cluster_arn,
+                    "SecretArn": secret_arn,
+                    "Sql": "SELECT 1",
+                    "Database": "testdb",
+                },
+                "End": True,
+            },
+        },
+    })
+
+    sm_arn = sfn_sync.create_state_machine(
+        name=sm_name,
+        definition=definition,
+        roleArn="arn:aws:iam::000000000000:role/sfn-role",
+    )["stateMachineArn"]
+
+    resp = sfn_sync.start_sync_execution(stateMachineArn=sm_arn, input=json.dumps({}))
+    assert resp["status"] == "SUCCEEDED", f"Execution failed: {resp.get('error')} \u2014 {resp.get('cause')}"
+    output = json.loads(resp["output"])
+    assert "numberOfRecordsUpdated" in output or "records" in output
+
+    sfn_sync.delete_state_machine(stateMachineArn=sm_arn)
+
+
 def test_sfn_validate_state_machine_definition_with_type(sfn):
     """ValidateStateMachineDefinition should accept optional type parameter."""
     definition = json.dumps({

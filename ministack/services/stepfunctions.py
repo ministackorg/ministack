@@ -2472,6 +2472,22 @@ def _dispatch_aws_sdk_query(service_info, service_name, action, input_data):
         raise _ExecutionError("States.Runtime", f"Failed to parse {service_name} XML response")
 
 
+def _pascal_key_to_camel(key):
+    """Convert a single PascalCase key to camelCase: 'ResourceArn' -> 'resourceArn'."""
+    if not key:
+        return key
+    return key[0].lower() + key[1:]
+
+
+def _convert_keys_to_camel(data):
+    """Recursively convert dict keys from PascalCase to camelCase."""
+    if isinstance(data, dict):
+        return {_pascal_key_to_camel(k): _convert_keys_to_camel(v) for k, v in data.items()}
+    if isinstance(data, list):
+        return [_convert_keys_to_camel(v) for v in data]
+    return data
+
+
 def _dispatch_aws_sdk_rest_json(service_info, service_name, action, input_data):
     """Dispatch an aws-sdk integration call to a REST-JSON protocol MiniStack service."""
     from ministack import app
@@ -2490,7 +2506,10 @@ def _dispatch_aws_sdk_rest_json(service_info, service_name, action, input_data):
     action_paths = _REST_JSON_ACTION_PATHS.get(service_key, {})
     path = action_paths.get(pascal_action, f"/{pascal_action}")
 
-    body = json.dumps(input_data or {}).encode("utf-8")
+    # REST-JSON services use camelCase on the wire, but SFN Parameters use
+    # PascalCase.  AWS SFN converts automatically; we must do the same.
+    wire_data = _convert_keys_to_camel(input_data or {})
+    body = json.dumps(wire_data).encode("utf-8")
     headers = {
         "content-type": "application/json",
         "host": f"{service_key}.{REGION}.amazonaws.com",

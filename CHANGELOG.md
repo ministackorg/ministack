@@ -7,6 +7,11 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [Unreleased]
+
+### Fixed
+- **SFN REST-JSON PascalCase\u2192camelCase conversion** \u2014 `_dispatch_aws_sdk_rest_json` now converts PascalCase parameter names to camelCase before dispatching. Fixes `BadRequestException: resourceArn is required` when Step Functions dispatches to RDS Data API. Contributed by @jayjanssen.
+
 ## [1.2.7] — 2026-04-12
 
 ### Added
