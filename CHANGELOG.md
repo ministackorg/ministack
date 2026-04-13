@@ -14,6 +14,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 - **`.py` init scripts** — ready.d and boot.d directories now support Python scripts in addition to shell scripts. Files ending in `.py` are executed with the container's Python interpreter. Contributed by @AdigaAkhil (#272)
 - **Init script environment defaults** — init scripts automatically receive `AWS_ACCESS_KEY_ID=test`, `AWS_SECRET_ACCESS_KEY=test`, `AWS_DEFAULT_REGION`, and `AWS_ENDPOINT_URL` so `aws` CLI and boto3 work out of the box without manual configuration.
 
+### Added
+- **AppConfig service emulator** — full control plane (applications, environments, configuration profiles, hosted configuration versions, deployment strategies, deployments, tags) and data plane (`StartConfigurationSession`, `GetLatestConfiguration`). 33 operations across both `appconfig` and `appconfigdata` API surfaces. Deployments complete immediately; session-based configuration retrieval with token rotation matches real AWS behavior.
+
 ### Fixed
 - **Health check log noise** — health endpoint access logs (`/_ministack/health`, `/_localstack/health`, `/health`) are now suppressed at `LOG_LEVEL=INFO`. Visible at `LOG_LEVEL=DEBUG`. Reported by @McDoit
 

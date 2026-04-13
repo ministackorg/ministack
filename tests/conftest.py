@@ -255,6 +255,14 @@ def rds_data():
     return make_client("rds-data")
 
 @pytest.fixture(scope="session")
+def appconfig_client():
+    return make_client("appconfig")
+
+@pytest.fixture(scope="session")
+def appconfigdata_client():
+    return make_client("appconfigdata")
+
+@pytest.fixture(scope="session")
 def sd():
     """SD client for DiscoverInstances — forces same endpoint (boto3 normally prefixes data-)."""
     from botocore.config import Config as BotoConfig

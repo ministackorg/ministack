@@ -190,6 +190,16 @@ SERVICE_PATTERNS = {
         "host_patterns": [r"autoscaling\."],
         "credential_scope": "autoscaling",
     },
+    "appconfig": {
+        "host_patterns": [r"appconfig\."],
+        "path_prefixes": ["/applications", "/deploymentstrategies"],
+        "credential_scope": "appconfig",
+    },
+    "appconfigdata": {
+        "host_patterns": [r"appconfigdata\."],
+        "path_prefixes": ["/configurationsessions", "/configuration"],
+        "credential_scope": "appconfigdata",
+    },
 }
 
 
@@ -247,6 +257,8 @@ def detect_service(method: str, path: str, headers: dict, query_params: dict) ->
                 "s3files": "s3files",
                 "rds-data": "rds-data",
                 "autoscaling": "autoscaling",
+                "appconfig": "appconfig",
+                "appconfigdata": "appconfigdata",
             }
             if svc_name in scope_map:
                 return scope_map[svc_name]
