@@ -11,6 +11,8 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 - **SFN REST-JSON PascalCase\u2192camelCase conversion** \u2014 `_dispatch_aws_sdk_rest_json` now converts PascalCase parameter names to camelCase before dispatching. Fixes `BadRequestException: resourceArn is required` when Step Functions dispatches to RDS Data API. Contributed by @jayjanssen.
+### Added
+- **SFN intrinsic functions batch 2** — `States.ArrayContains`, `States.ArrayUnique`, `States.ArrayPartition`, `States.ArrayRange`, `States.MathRandom`, `States.MathAdd`, `States.UUID`. Contributed by @jayjanssen.
 
 ## [1.2.7] — 2026-04-12
 
