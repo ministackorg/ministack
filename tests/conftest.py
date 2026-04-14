@@ -283,3 +283,7 @@ def sd():
 @pytest.fixture(scope="session")
 def codebuild():
     return make_client("codebuild")
+
+@pytest.fixture(scope="session")
+def autoscaling():
+    return make_client("autoscaling")
