@@ -334,6 +334,39 @@ def test_sfn_intrinsic_format(sfn, sfn_sync):
     output = json.loads(resp["output"])
     assert output["greeting"] == "Hello Jay from SF"
 
+def test_sfn_intrinsic_format_escapes(sfn, sfn_sync):
+    """States.Format handles \\' \\{ \\} \\\\ escapes in template only."""
+    definition = json.dumps({
+        "StartAt": "Fmt",
+        "States": {
+            "Fmt": {
+                "Type": "Pass",
+                "Parameters": {
+                    "quoted.$": "States.Format('it\\'s {}', $.x)",
+                    "braces.$": "States.Format('\\{literal\\}')",
+                    "backslash.$": "States.Format('C:\\\\tmp')",
+                    "preserved.$": "States.Format('path: {}', $.path)",
+                },
+                "End": True,
+            }
+        },
+    })
+    sm = sfn.create_state_machine(
+        name="sfn-intrinsic-fmt-esc",
+        definition=definition,
+        roleArn="arn:aws:iam::000000000000:role/R",
+    )
+    resp = sfn_sync.start_sync_execution(
+        stateMachineArn=sm["stateMachineArn"],
+        input=json.dumps({"x": "fine", "path": "C:\\tmp\\file"}),
+    )
+    assert resp["status"] == "SUCCEEDED"
+    output = json.loads(resp["output"])
+    assert output["quoted"] == "it's fine"
+    assert output["braces"] == "{literal}"
+    assert output["backslash"] == "C:\\tmp"
+    assert output["preserved"] == "path: C:\\tmp\\file"
+
 def test_sfn_intrinsic_nested(sfn, sfn_sync):
     """Nested intrinsic: States.StringToJson(States.Format(...))"""
     definition = json.dumps({

@@ -1758,7 +1758,15 @@ def _parse_intrinsic_args(s, pos):
             arg, pos = _parse_intrinsic_call(s, pos)
             args.append(arg)
         elif ch == "'":
-            end = s.index("'", pos + 1)
+            # Scan for closing quote, handling \' escapes.
+            end = pos + 1
+            while end < len(s):
+                if s[end] == '\\' and end + 1 < len(s):
+                    end += 2
+                elif s[end] == "'":
+                    break
+                else:
+                    end += 1
             args.append(("str", s[pos + 1 : end]))
             pos = end + 1
         elif ch == "$":
@@ -1845,15 +1853,27 @@ def _exec_intrinsic(node, data, ctx):
         merged.update(args[1])
         return merged
     elif name == "States.Format":
+        # AWS States.Format: \' → ', \{ → {, \} → }, \\ → \ in
+        # template segments only.  Interpolated values are verbatim.
         template = args[0]
-        parts = template.split("{}")
-        result_parts = []
-        for i, part in enumerate(parts):
-            result_parts.append(part)
-            if i < len(parts) - 1 and i < len(args) - 1:
-                val = args[i + 1]
-                result_parts.append(str(val) if not isinstance(val, str) else val)
-        return "".join(result_parts)
+        arg_idx = 1
+        out: list[str] = []
+        i = 0
+        while i < len(template):
+            ch = template[i]
+            if ch == '\\' and i + 1 < len(template):
+                out.append(template[i + 1])
+                i += 2
+            elif ch == '{' and i + 1 < len(template) and template[i + 1] == '}':
+                if arg_idx < len(args):
+                    val = args[arg_idx]
+                    out.append(str(val) if not isinstance(val, str) else val)
+                    arg_idx += 1
+                i += 2
+            else:
+                out.append(ch)
+                i += 1
+        return "".join(out)
     elif name == "States.ArrayGetItem":
         return args[0][int(args[1])]
     elif name == "States.Array":

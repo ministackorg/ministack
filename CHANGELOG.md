@@ -7,6 +7,13 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [Unreleased]
+
+### Fixed
+- **SFN States.Format escape handling** — `States.Format` now correctly processes `\'`, `\{`, `\}`, and `\` escape sequences in template strings, matching AWS behavior. Escaped quotes no longer truncate the template during intrinsic argument parsing. Interpolated values are preserved verbatim (backslashes in arguments are not interpreted as escapes).
+
+---
+
 ## [1.2.12] — 2026-04-14
 
 ### Added
