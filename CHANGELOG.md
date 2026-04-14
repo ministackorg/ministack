@@ -7,6 +7,14 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [1.2.11] — 2026-04-14
+
+### Fixed
+- **RDS parameter group reset actions** — `ResetDBParameterGroup` and `ResetDBClusterParameterGroup` now clear either selected overrides or the full user-parameter state, matching AWS semantics. Parameter list parsing now accepts both `Parameters.member.N` and `Parameters.Parameter.N` serialization styles. Contributed by @jayjanssen (#298)
+- **RDS DbiResourceId lookup** — `DescribeDBInstances` and other instance actions now accept `DbiResourceId` (e.g. `db-1AD581BD3647411AACBF`) in addition to the friendly `DBInstanceIdentifier`. Fixes Terraform/OpenTofu state refresh failures. Contributed by @alexanderkrum-next (#305)
+
+---
+
 ## [1.2.10] — 2026-04-13
 
 ### Added
@@ -15,7 +23,6 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 - **SFN aws-sdk error code prefixing** — SDK errors from `aws-sdk:*` task integrations are now prefixed with the service name (e.g. `SecretsManager.ResourceExistsException` instead of bare `ResourceExistsException`), matching real AWS Step Functions behavior. Fixes `Catch` blocks that match on service-specific error codes. Contributed by @jayjanssen (#296)
-- **RDS parameter group reset actions** — `ResetDBParameterGroup` and `ResetDBClusterParameterGroup` now clear either selected overrides or the full user-parameter state, matching AWS semantics. Parameter list parsing now accepts both `Parameters.member.N` and `Parameters.Parameter.N` serialization styles used by different clients.
 
 ---
 
