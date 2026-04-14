@@ -678,3 +678,40 @@ def test_rds_describe_by_dbi_resource_id(rds):
     assert len(desc["DBInstances"]) == 1
     assert desc["DBInstances"][0]["DBInstanceIdentifier"] == "resid-lookup-test"
     assert desc["DBInstances"][0]["DbiResourceId"] == resource_id
+
+
+def test_rds_instance_inherits_cluster_username(rds):
+    """CreateDBInstance inherits MasterUsername from parent cluster."""
+    rds.create_db_cluster(
+        DBClusterIdentifier="inherit-cluster",
+        Engine="aurora-mysql",
+        MasterUsername="myadmin",
+        MasterUserPassword="s3cret!",
+    )
+    rds.create_db_instance(
+        DBInstanceIdentifier="inherit-cluster-1",
+        DBClusterIdentifier="inherit-cluster",
+        DBInstanceClass="db.r6g.large",
+        Engine="aurora-mysql",
+    )
+    resp = rds.describe_db_instances(DBInstanceIdentifier="inherit-cluster-1")
+    inst = resp["DBInstances"][0]
+    assert inst["MasterUsername"] == "myadmin"
+    assert inst["DBClusterIdentifier"] == "inherit-cluster"
+
+
+def test_rds_modify_cluster_password(rds):
+    """ModifyDBCluster with MasterUserPassword succeeds."""
+    rds.create_db_cluster(
+        DBClusterIdentifier="pw-mod-cluster",
+        Engine="aurora-mysql",
+        MasterUsername="admin",
+        MasterUserPassword="old_pass",
+    )
+    rds.modify_db_cluster(
+        DBClusterIdentifier="pw-mod-cluster",
+        MasterUserPassword="new_pass",
+    )
+    resp = rds.describe_db_clusters(DBClusterIdentifier="pw-mod-cluster")
+    cluster = resp["DBClusters"][0]
+    assert cluster["DBClusterIdentifier"] == "pw-mod-cluster"

@@ -28,6 +28,7 @@ import copy
 import datetime
 import logging
 import os
+import socket
 import time
 from urllib.parse import parse_qs
 from xml.sax.saxutils import escape as _esc
@@ -55,6 +56,7 @@ _tags = AccountScopedDict()
 _port_counter = [BASE_PORT]
 
 _docker = None
+_ministack_network = None
 
 
 # ── Persistence ────────────────────────────────────────────
@@ -114,6 +116,40 @@ def _get_docker():
         except Exception:
             pass
     return _docker
+
+
+def _get_ministack_network(docker_client):
+    """Detect the Docker network MiniStack is running on (if containerised)."""
+    global _ministack_network
+    if _ministack_network is not None:
+        return _ministack_network or None
+    try:
+        self_container = docker_client.containers.get(
+            os.environ.get("HOSTNAME", ""))
+        nets = list(
+            self_container.attrs["NetworkSettings"]["Networks"].keys())
+        if nets:
+            _ministack_network = nets[0]
+            logger.debug("RDS: detected MiniStack network: %s",
+                         _ministack_network)
+            return _ministack_network
+    except Exception:
+        logger.debug("RDS: could not detect MiniStack network, "
+                     "using localhost")
+    _ministack_network = ""
+    return None
+
+
+def _wait_for_port(host, port, timeout=60):
+    """Block until a TCP connection to host:port succeeds."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            with socket.create_connection((host, port), timeout=2):
+                return True
+        except OSError:
+            time.sleep(0.5)
+    return False
 
 
 def _next_port():
@@ -182,8 +218,21 @@ def _create_db_instance(p):
     db_class = _p(p, "DBInstanceClass") or "db.t3.micro"
     master_user = _p(p, "MasterUsername") or "admin"
     master_pass = _p(p, "MasterUserPassword") or "password"
-    db_name = _p(p, "DBName") or "mydb"
+    db_name = _p(p, "DBName") or ""
     port = int(_p(p, "Port") or _default_port(engine))
+
+    # Inherit credentials from cluster when instance is a cluster member.
+    cluster_id_param = _p(p, "DBClusterIdentifier")
+    if cluster_id_param and cluster_id_param in _clusters:
+        parent = _clusters[cluster_id_param]
+        if not _p(p, "MasterUsername"):
+            master_user = parent.get("MasterUsername", master_user)
+        if not _p(p, "MasterUserPassword"):
+            master_pass = parent.get("_MasterUserPassword", master_pass)
+        if not db_name:
+            db_name = parent.get("DatabaseName", "")
+    if not db_name:
+        db_name = "mydb"
     allocated_storage = int(_p(p, "AllocatedStorage") or "20")
     storage_type = _p(p, "StorageType") or "gp2"
     subnet_group_name = _p(p, "DBSubnetGroupName") or "default"
@@ -193,11 +242,14 @@ def _create_db_instance(p):
     endpoint_host = "localhost"
     endpoint_port = port
     docker_container_id = None
+    internal_host = None
+    internal_port = None
 
     docker_client = _get_docker()
     if docker_client:
         host_port = _next_port()
         endpoint_port = host_port
+        ms_network = _get_ministack_network(docker_client)
         image, env, container_port = _docker_image_for_engine(
             engine, engine_version, master_user, master_pass, db_name
         )
@@ -210,6 +262,8 @@ def _create_db_instance(p):
                     name=f"ministack-rds-{db_id}",
                     labels={"ministack": "rds", "db_id": db_id},
                 )
+                if ms_network:
+                    container_kwargs["network"] = ms_network
                 if RDS_PERSIST:
                     container_kwargs["volumes"] = {
                         f"ministack-rds-{db_id}-data": {"bind": "/var/lib/postgresql/data", "mode": "rw"},
@@ -222,7 +276,33 @@ def _create_db_instance(p):
                     }
                 container = docker_client.containers.run(**container_kwargs)
                 docker_container_id = container.id
-                logger.info("RDS: started %s container for %s on port %s", engine, db_id, host_port)
+                if ms_network:
+                    container.reload()
+                    networks = container.attrs.get(
+                        "NetworkSettings", {}).get("Networks", {})
+                    container_ip = networks.get(
+                        ms_network, {}).get("IPAddress", "")
+                    if container_ip:
+                        internal_host = container_ip
+                        internal_port = container_port
+                        if _wait_for_port(container_ip, container_port):
+                            logger.info(
+                                "RDS: %s container for %s ready at "
+                                "%s:%s (network %s)", engine, db_id,
+                                container_ip, container_port, ms_network)
+                        else:
+                            logger.warning(
+                                "RDS: %s container for %s at %s:%s "
+                                "not ready after timeout", engine,
+                                db_id, container_ip, container_port)
+                    else:
+                        logger.info(
+                            "RDS: started %s container for %s on port %s",
+                            engine, db_id, host_port)
+                else:
+                    logger.info(
+                        "RDS: started %s container for %s on port %s",
+                        engine, db_id, host_port)
             except Exception as e:
                 logger.warning("RDS: Docker failed for %s: %s", db_id, e)
 
@@ -325,6 +405,8 @@ def _create_db_instance(p):
         "IsStorageConfigUpgradeAvailable": False,
         "MultiTenant": False,
         "_docker_container_id": docker_container_id,
+        "_internal_address": internal_host,
+        "_internal_port": internal_port,
     }
     _instances[db_id] = instance
 
@@ -621,6 +703,8 @@ def _create_db_cluster(p):
     if not az_list:
         az_list = [f"{REGION}a", f"{REGION}b", f"{REGION}c"]
 
+    master_pass = _p(p, "MasterUserPassword") or "password"
+
     cluster = {
         "DBClusterIdentifier": cluster_id,
         "DBClusterArn": arn,
@@ -629,6 +713,7 @@ def _create_db_cluster(p):
         "EngineMode": _p(p, "EngineMode") or "provisioned",
         "Status": "available",
         "MasterUsername": master_user,
+        "_MasterUserPassword": master_pass,
         "DatabaseName": _p(p, "DatabaseName") or "",
         "Endpoint": f"{cluster_id}.cluster-{unique_suffix}.{REGION}.rds.amazonaws.com",
         "ReaderEndpoint": f"{cluster_id}.cluster-ro-{unique_suffix}.{REGION}.rds.amazonaws.com",
@@ -713,6 +798,40 @@ def _describe_db_clusters(p):
         f"<DescribeDBClustersResult><DBClusters>{members}</DBClusters></DescribeDBClustersResult>")
 
 
+def _rotate_real_password(cluster, old_pass, new_pass):
+    """Alter the root password on the real MySQL/MariaDB container."""
+    cluster_id = cluster.get("DBClusterIdentifier", "")
+    for inst in _instances.values():
+        if inst.get("DBClusterIdentifier") != cluster_id:
+            continue
+        engine = inst.get("Engine", "")
+        if not any(e in engine for e in ("mysql", "aurora-mysql", "mariadb")):
+            continue
+        host = inst.get("_internal_address")
+        port = inst.get("_internal_port")
+        if not host or not port:
+            endpoint = inst.get("Endpoint", {})
+            if not isinstance(endpoint, dict) or not endpoint.get("Port"):
+                continue
+            host = endpoint.get("Address", "localhost")
+            port = int(endpoint.get("Port", 3306))
+        try:
+            import pymysql
+            conn = pymysql.connect(
+                host=host, port=port, user="root",
+                password=old_pass, autocommit=True)
+            cur = conn.cursor()
+            cur.execute(
+                "ALTER USER 'root'@'%%' IDENTIFIED BY %s", (new_pass,))
+            cur.close()
+            conn.close()
+            logger.info("RDS: rotated root password on %s", cluster_id)
+        except Exception as e:
+            logger.warning("RDS: password rotation failed on %s: %s",
+                           cluster_id, e)
+        break
+
+
 def _modify_db_cluster(p):
     cluster_id = _p(p, "DBClusterIdentifier")
     cluster = _clusters.get(cluster_id)
@@ -722,7 +841,10 @@ def _modify_db_cluster(p):
     if _p(p, "EngineVersion"):
         cluster["EngineVersion"] = _p(p, "EngineVersion")
     if _p(p, "MasterUserPassword"):
-        pass
+        new_pass = _p(p, "MasterUserPassword")
+        old_pass = cluster.get("_MasterUserPassword", "password")
+        cluster["_MasterUserPassword"] = new_pass
+        _rotate_real_password(cluster, old_pass, new_pass)
     if _p(p, "Port"):
         cluster["Port"] = int(_p(p, "Port"))
     if _p(p, "BackupRetentionPeriod"):
@@ -2260,14 +2382,16 @@ def _docker_image_for_engine(engine, engine_version, user, password, db_name):
     if "mysql" in engine or "aurora-mysql" in engine:
         return (
             "mysql:8",
-            {"MYSQL_ROOT_PASSWORD": password, "MYSQL_DATABASE": db_name,
+            {"MYSQL_ROOT_PASSWORD": password, "MYSQL_ROOT_HOST": "%",
+             "MYSQL_DATABASE": db_name,
              "MYSQL_USER": user, "MYSQL_PASSWORD": password},
             3306,
         )
     if "mariadb" in engine:
         return (
             "mariadb:latest",
-            {"MYSQL_ROOT_PASSWORD": password, "MYSQL_DATABASE": db_name,
+            {"MYSQL_ROOT_PASSWORD": password, "MYSQL_ROOT_HOST": "%",
+             "MYSQL_DATABASE": db_name,
              "MYSQL_USER": user, "MYSQL_PASSWORD": password},
             3306,
         )

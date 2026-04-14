@@ -357,3 +357,49 @@ def test_rds_data_stub_drop_user(rds, sm):
     records = body.get("records", [])
     names = [r[0]["stringValue"] for r in records] if records else []
     assert "tempuser" not in names
+
+
+def test_rds_data_secret_credentials_parsing():
+    """_get_secret_credentials extracts username and password from secret."""
+    from ministack.services import secretsmanager, rds_data
+    from ministack.core.responses import set_request_account_id
+    set_request_account_id("test")
+    # Create a secret with JSON credentials
+    secretsmanager._secrets["test-cred-secret"] = {
+        "ARN": "arn:aws:secretsmanager:us-east-1:000000000000:secret:test-cred",
+        "Name": "test-cred-secret",
+        "Versions": {
+            "v1": {
+                "Stages": ["AWSCURRENT"],
+                "SecretString": '{"username":"app_rw","password":"p@ss123"}',
+            }
+        },
+    }
+    user, pw = rds_data._get_secret_credentials(
+        "arn:aws:secretsmanager:us-east-1:000000000000:secret:test-cred")
+    assert user == "app_rw"
+    assert pw == "p@ss123"
+    # Clean up
+    del secretsmanager._secrets["test-cred-secret"]
+
+
+def test_rds_data_secret_credentials_no_username():
+    """_get_secret_credentials returns None username for password-only secret."""
+    from ministack.services import secretsmanager, rds_data
+    from ministack.core.responses import set_request_account_id
+    set_request_account_id("test")
+    secretsmanager._secrets["pw-only-secret"] = {
+        "ARN": "arn:aws:secretsmanager:us-east-1:000000000000:secret:pw-only",
+        "Name": "pw-only-secret",
+        "Versions": {
+            "v1": {
+                "Stages": ["AWSCURRENT"],
+                "SecretString": '{"password":"just-a-password"}',
+            }
+        },
+    }
+    user, pw = rds_data._get_secret_credentials(
+        "arn:aws:secretsmanager:us-east-1:000000000000:secret:pw-only")
+    assert user is None
+    assert pw == "just-a-password"
+    del secretsmanager._secrets["pw-only-secret"]
