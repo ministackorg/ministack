@@ -7,6 +7,13 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [Unreleased]
+
+### Added
+- **pymysql bundled in Docker image** — `pymysql` (44 KB, pure Python) is now installed in the official image, enabling the RDS Data API to connect to MySQL/Aurora MySQL containers that MiniStack already spawns for RDS instances. Previously required a custom image or fell back to in-memory stubs. Contributed by @jayjanssen
+
+---
+
 ## [1.2.11] — 2026-04-14
 
 ### Fixed
