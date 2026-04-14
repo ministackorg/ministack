@@ -7,13 +7,18 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
-## [Unreleased]
+## [1.2.12] — 2026-04-14
+
+### Added
+- **SFN Wait state scaling** — new `SFN_WAIT_SCALE` environment variable (default `1.0`) scales Wait state durations and retry interval sleeps. Set to `0` to skip all waits for fast-forward execution in test scenarios where emulated resources are immediately available. Contributed by @jayjanssen (#310)
+- **AutoScaling `DescribeScalingActivities`** — returns empty activities list. Terraform polls this after ASG creation; without it Terraform fails. Contributed by @alexanderkrum-next (#317)
+- **Reset with init scripts** — `POST /_ministack/reset?init=1` re-runs boot.d and ready.d init scripts after clearing state. Without this, resources created by init scripts were lost after reset with no way to restore them. Reported by @staranto
 
 ### Fixed
-- **Lambda Runtime API noise** — suppressed `BrokenPipeError` tracebacks from Lambda binaries disconnecting after reading the event. This is benign and expected behavior during native `provided` runtime execution.
-- **RDS Data API warning spam** — the `pymysql` import warning is now logged once per process instead of on every `ExecuteStatement` call.
-### Added
-- **SFN Wait state scaling** — new `SFN_WAIT_SCALE` environment variable (default `1.0`) scales Wait state durations and retry interval sleeps. Set to `0` to skip all waits for fast-forward execution in test scenarios where emulated resources are immediately available. Contributed by @jayjanssen
+- **S3 lifecycle configuration hangs Terraform** — `PutBucketLifecycleConfiguration` and `GetBucketLifecycleConfiguration` now return the `x-amz-transition-default-minimum-object-size` header. The Terraform AWS provider waits for this header and hangs indefinitely without it. Reported by @mspiller (#306)
+- **Lambda Runtime API noise** — suppressed `BrokenPipeError` tracebacks from Lambda binaries disconnecting after reading the event. This is benign and expected behavior during native `provided` runtime execution. Contributed by @jayjanssen (#311)
+- **RDS Data API warning spam** — the `pymysql` import warning is now logged once per process instead of on every `ExecuteStatement` call. Contributed by @jayjanssen (#311)
+- **SFN Wait scaling coverage** — `SFN_WAIT_SCALE` now also applies to Activity task timeouts, waitForTaskToken timeouts, and ECS task polling intervals. Runtime config endpoint validates the value (rejects non-numeric, negative, NaN, Inf).
 
 ---
 
@@ -24,6 +29,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 - **RDS DbiResourceId lookup** — `DescribeDBInstances` and other instance actions now accept `DbiResourceId` (e.g. `db-1AD581BD3647411AACBF`) in addition to the friendly `DBInstanceIdentifier`. Fixes Terraform/OpenTofu state refresh failures. Contributed by @alexanderkrum-next (#305)
 
 ---
+
 ## [1.2.10] — 2026-04-13
 
 ### Added
@@ -32,7 +38,6 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 - **SFN aws-sdk error code prefixing** — SDK errors from `aws-sdk:*` task integrations are now prefixed with the service name (e.g. `SecretsManager.ResourceExistsException` instead of bare `ResourceExistsException`), matching real AWS Step Functions behavior. Fixes `Catch` blocks that match on service-specific error codes. Contributed by @jayjanssen (#296)
-- **RDS parameter group reset actions** — `ResetDBParameterGroup` and `ResetDBClusterParameterGroup` now clear either selected overrides or the full user-parameter state, matching AWS semantics. Parameter list parsing now accepts both `Parameters.member.N` and `Parameters.Parameter.N` serialization styles used by different clients.
 
 ---
 

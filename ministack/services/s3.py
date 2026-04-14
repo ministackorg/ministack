@@ -754,7 +754,10 @@ def _get_bucket_lifecycle(name: str):
         return _no_such_bucket(name)
     config = _bucket_lifecycle.get(name)
     if config:
-        return 200, {"Content-Type": "application/xml"}, config
+        return 200, {
+            "Content-Type": "application/xml",
+            "x-amz-transition-default-minimum-object-size": "all_storage_classes_128K",
+        }, config
     return _error(
         "NoSuchLifecycleConfiguration",
         "The lifecycle configuration does not exist",
@@ -767,7 +770,7 @@ def _put_bucket_lifecycle(name: str, body: bytes):
     if name not in _buckets:
         return _no_such_bucket(name)
     _bucket_lifecycle[name] = body
-    return 200, {}, b""
+    return 200, {"x-amz-transition-default-minimum-object-size": "all_storage_classes_128K"}, b""
 
 
 def _delete_bucket_lifecycle(name: str):

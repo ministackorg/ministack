@@ -298,8 +298,13 @@ async def app(scope, receive, send):
     # Admin endpoints — no wildcard CORS headers (return early, before CORS block)
     if path == "/_ministack/reset" and method == "POST":
         _reset_all_state()
+        run_init = query_params.get("init", [""])[0] == "1"
+        if run_init:
+            _run_init_scripts()
         await _send_response(send, 200, {"Content-Type": "application/json"},
                              json.dumps({"reset": "ok"}).encode())
+        if run_init:
+            asyncio.create_task(_run_ready_scripts())
         return
 
     if path == "/_ministack/config" and method == "POST":
@@ -322,6 +327,17 @@ async def app(scope, receive, send):
                 mod_name, var_name = key.rsplit(".", 1)
                 try:
                     mod = __import__(f"ministack.services.{mod_name}", fromlist=[var_name])
+                    # Validate SFN_WAIT_SCALE before applying
+                    if key == "stepfunctions._SFN_WAIT_SCALE":
+                        try:
+                            fv = float(value)
+                        except (ValueError, TypeError):
+                            logger.warning("/_ministack/config: invalid SFN_WAIT_SCALE=%r", value)
+                            continue
+                        if not __import__("math").isfinite(fv) or fv < 0:
+                            logger.warning("/_ministack/config: invalid SFN_WAIT_SCALE=%r", value)
+                            continue
+                        value = fv
                     setattr(mod, var_name, value)
                     applied[key] = value
                 except (ImportError, AttributeError) as e:
