@@ -7,6 +7,14 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [Unreleased]
+
+### Fixed
+- **Lambda Runtime API noise** — suppressed `BrokenPipeError` tracebacks from Lambda binaries disconnecting after reading the event. This is benign and expected behavior during native `provided` runtime execution.
+- **RDS Data API warning spam** — the `pymysql` import warning is now logged once per process instead of on every `ExecuteStatement` call.
+
+---
+
 ## [1.2.11] — 2026-04-14
 
 ### Fixed
@@ -14,7 +22,6 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 - **RDS DbiResourceId lookup** — `DescribeDBInstances` and other instance actions now accept `DbiResourceId` (e.g. `db-1AD581BD3647411AACBF`) in addition to the friendly `DBInstanceIdentifier`. Fixes Terraform/OpenTofu state refresh failures. Contributed by @alexanderkrum-next (#305)
 
 ---
-
 ## [1.2.10] — 2026-04-13
 
 ### Added

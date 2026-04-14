@@ -457,7 +457,9 @@ def _execute_statement(data):
     except ImportError as e:
         if own_conn and conn:
             conn.close()
-        logger.warning("DB driver not available, using stub: %s", e)
+        if not getattr(_execute_statement, "_import_warned", False):
+            logger.warning("DB driver not available, using stub: %s", e)
+            _execute_statement._import_warned = True
         return _stub_execute(resource_arn, sql)
     except Exception as e:
         if own_conn and conn:

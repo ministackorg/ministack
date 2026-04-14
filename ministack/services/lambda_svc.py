@@ -1569,7 +1569,15 @@ def _execute_function_provided(func: dict, event: dict) -> dict:
                         self.end_headers()
 
             # Bind to port 0 — OS assigns a free port atomically, no race window
-            server = socketserver.TCPServer(("127.0.0.1", 0), RuntimeAPIHandler)
+            class _QuietTCPServer(socketserver.TCPServer):
+                def handle_error(self, request, client_address):
+                    import sys
+                    _, exc, _ = sys.exc_info()
+                    if isinstance(exc, (BrokenPipeError, ConnectionResetError, ConnectionAbortedError)):
+                        return
+                    super().handle_error(request, client_address)
+
+            server = _QuietTCPServer(("127.0.0.1", 0), RuntimeAPIHandler)
             port = server.server_address[1]
 
             def _serve():
