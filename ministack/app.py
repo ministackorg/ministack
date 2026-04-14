@@ -306,6 +306,7 @@ async def app(scope, receive, send):
         _ALLOWED_CONFIG_KEYS = {
             "athena.ATHENA_ENGINE", "athena.ATHENA_DATA_DIR",
             "stepfunctions._sfn_mock_config",
+            "stepfunctions._SFN_WAIT_SCALE",
             "lambda_svc.LAMBDA_EXECUTOR",
         }
         try:

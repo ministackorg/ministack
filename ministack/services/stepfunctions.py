@@ -22,6 +22,7 @@ import asyncio
 import copy
 import json
 import logging
+import math
 import os
 import re
 import threading
@@ -41,6 +42,24 @@ from ministack.core.responses import (
 )
 
 logger = logging.getLogger("states")
+
+# Scale factor for Wait state durations and retry intervals.
+# 0 = skip all waits, 0.01 = 1% of normal, 1 = normal (default).
+# Set via SFN_WAIT_SCALE environment variable.
+
+def _parse_wait_scale():
+    raw = os.environ.get("SFN_WAIT_SCALE", "1")
+    try:
+        val = float(raw)
+    except (ValueError, TypeError):
+        logger.warning("Invalid SFN_WAIT_SCALE=%r, using default 1.0", raw)
+        return 1.0
+    if not math.isfinite(val):
+        logger.warning("Invalid SFN_WAIT_SCALE=%r, using default 1.0", raw)
+        return 1.0
+    return max(val, 0)
+
+_SFN_WAIT_SCALE = _parse_wait_scale()
 
 REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 
@@ -1198,7 +1217,7 @@ def _execute_task(state_def, raw_input, execution, ctx):
                 interval = retrier.get("IntervalSeconds", 1)
                 backoff = retrier.get("BackoffRate", 2.0)
                 sleep_sec = interval * (backoff ** count)
-                time.sleep(min(sleep_sec, 60))
+                _scaled_sleep(min(sleep_sec, 60))
                 retry_counts[retrier_idx] = count + 1
                 continue
             break
@@ -1457,13 +1476,13 @@ def _execute_wait(state_def, raw_input):
     effective = _apply_input_path(state_def, raw_input)
 
     if "Seconds" in state_def:
-        time.sleep(state_def["Seconds"])
+        _scaled_sleep(state_def["Seconds"])
     elif "Timestamp" in state_def:
         _sleep_until(state_def["Timestamp"])
     elif "SecondsPath" in state_def:
         secs = _resolve_path(state_def["SecondsPath"], effective)
         if isinstance(secs, (int, float)) and secs > 0:
-            time.sleep(secs)
+            _scaled_sleep(secs)
     elif "TimestampPath" in state_def:
         ts_str = _resolve_path(state_def["TimestampPath"], effective)
         if isinstance(ts_str, str):
@@ -1473,12 +1492,18 @@ def _execute_wait(state_def, raw_input):
     return output, _next_or_end(state_def)
 
 
+def _scaled_sleep(seconds):
+    scaled = seconds * _SFN_WAIT_SCALE
+    if scaled > 0:
+        time.sleep(scaled)
+
+
 def _sleep_until(iso_ts):
     try:
         target = datetime.fromisoformat(iso_ts.replace("Z", "+00:00"))
         delta = (target - datetime.now(timezone.utc)).total_seconds()
         if delta > 0:
-            time.sleep(delta)
+            _scaled_sleep(delta)
     except (ValueError, TypeError):
         pass
 
