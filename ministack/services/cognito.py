@@ -37,6 +37,11 @@ Identity Pools operations:
   UnlinkDeveloperIdentity, UnlinkIdentity,
   TagResource, UntagResource, ListTagsForResource.
 
+Data-plane endpoints (path-based, form-encoded):
+  GET  /oauth2/authorize   — redirect to external SAML/OIDC IdP
+  POST /saml2/idpresponse  — receive SAML assertion, create user, issue auth code
+  POST /oauth2/token       — exchange authorization_code or client_credentials for tokens
+
 Wire protocol:
   Both services use JSON with X-Amz-Target header.
   cognito-idp  credential scope: cognito-idp
@@ -46,15 +51,19 @@ Wire protocol:
 
 import base64
 import copy
-import os
 import json
 import logging
+import os
 import re
 import secrets
 import string
 import time
+import zlib
 from datetime import datetime, timezone
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, urlencode
+from xml.etree.ElementTree import Element, SubElement, tostring as xml_tostring
+
+from defusedxml.ElementTree import fromstring as safe_xml_parse
 
 from ministack.core.persistence import load_state, PERSIST_STATE
 from ministack.core.responses import AccountScopedDict, get_account_id, error_response_json, json_response, new_uuid
@@ -128,6 +137,14 @@ def well_known_openid_configuration(pool_id: str, region: str | None = None):
     return 200, {"Content-Type": "application/json"}, json.dumps(doc).encode()
 
 REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
+_MINISTACK_HOST = os.environ.get("MINISTACK_HOST", "localhost")
+_MINISTACK_PORT = os.environ.get("GATEWAY_PORT", os.environ.get("EDGE_PORT", "4566"))
+
+# SAML XML namespaces
+_SAML_NS = {
+    "samlp": "urn:oasis:names:tc:SAML:2.0:protocol",
+    "saml": "urn:oasis:names:tc:SAML:2.0:assertion",
+}
 
 # ---------------------------------------------------------------------------
 # In-memory state — User Pools (cognito-idp)
@@ -163,6 +180,13 @@ _identity_pools = AccountScopedDict()
 # }
 
 _identity_tags = AccountScopedDict()   # identity_pool_id -> {key: value}
+
+# ---------------------------------------------------------------------------
+# In-memory state — OAuth2 authorization codes (ephemeral, not persisted)
+# ---------------------------------------------------------------------------
+
+_auth_codes = {}   # code -> {pool_id, client_id, username, redirect_uri, scopes, state, created_at}
+_AUTH_CODE_TTL = 300  # 5 minutes
 
 
 # ── Persistence ────────────────────────────────────────────
@@ -316,12 +340,86 @@ def _merge_attributes(existing: list, updates: list) -> list:
 
 
 # ---------------------------------------------------------------------------
+# SAML / OAuth2 helpers
+# ---------------------------------------------------------------------------
+
+def _acs_url() -> str:
+    """Assertion Consumer Service URL for SAML responses."""
+    return f"http://{_MINISTACK_HOST}:{_MINISTACK_PORT}/saml2/idpresponse"
+
+
+def _build_saml_authn_request(pool_id: str, destination: str) -> str:
+    """Build a minimal SAML AuthnRequest, deflate + base64-encode for HTTP-Redirect binding."""
+    req = Element("{urn:oasis:names:tc:SAML:2.0:protocol}AuthnRequest")
+    req.set("ID", "_" + new_uuid())
+    req.set("Version", "2.0")
+    req.set("IssueInstant", datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
+    req.set("AssertionConsumerServiceURL", _acs_url())
+    req.set("Destination", destination)
+    req.set("ProtocolBinding", "urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST")
+    issuer = SubElement(req, "{urn:oasis:names:tc:SAML:2.0:assertion}Issuer")
+    issuer.text = f"urn:amazon:cognito:sp:{pool_id}"
+    xml_bytes = xml_tostring(req, encoding="unicode").encode("utf-8")
+    # Raw deflate (strip zlib header/checksum) per SAML HTTP-Redirect binding
+    deflated = zlib.compress(xml_bytes)[2:-4]
+    return base64.b64encode(deflated).decode()
+
+
+def _parse_saml_response(saml_response_b64: str) -> dict:
+    """Decode and parse a SAML Response, extract NameID and attributes."""
+    xml_bytes = base64.b64decode(saml_response_b64)
+    root = safe_xml_parse(xml_bytes)
+    name_id_el = root.find(".//{urn:oasis:names:tc:SAML:2.0:assertion}Subject/"
+                           "{urn:oasis:names:tc:SAML:2.0:assertion}NameID")
+    name_id = name_id_el.text if name_id_el is not None else None
+    attrs = {}
+    for attr_el in root.findall(".//{urn:oasis:names:tc:SAML:2.0:assertion}AttributeStatement/"
+                                "{urn:oasis:names:tc:SAML:2.0:assertion}Attribute"):
+        attr_name = attr_el.get("Name", "")
+        val_el = attr_el.find("{urn:oasis:names:tc:SAML:2.0:assertion}AttributeValue")
+        if val_el is not None and val_el.text:
+            attrs[attr_name] = val_el.text
+    return {"name_id": name_id, "attributes": attrs}
+
+
+def _find_pool_and_client(client_id: str):
+    """Find the pool and client dict by client_id. Returns (pool_id, pool, client) or Nones."""
+    for pid, pool in _user_pools.items():
+        client = pool["_clients"].get(client_id)
+        if client:
+            return pid, pool, client
+    return None, None, None
+
+
+def _cleanup_expired_codes():
+    """Remove auth codes older than _AUTH_CODE_TTL."""
+    now = time.time()
+    expired = [k for k, v in _auth_codes.items() if now - v.get("created_at", 0) > _AUTH_CODE_TTL]
+    for k in expired:
+        del _auth_codes[k]
+
+
+def _get_qp(query_params: dict, key: str, default: str = "") -> str:
+    """Extract a single value from query_params (which may have list values)."""
+    v = query_params.get(key, default)
+    return v[0] if isinstance(v, list) else v
+
+
+# ---------------------------------------------------------------------------
 # Entry points — two separate handle_request functions
 # ---------------------------------------------------------------------------
 
 async def handle_request(method, path, headers, body, query_params):
     """Unified entry point — dispatches to IDP or Identity based on target prefix."""
     target = headers.get("x-amz-target", "")
+
+    # Path-based endpoints (form-encoded or no body — must run before JSON parse)
+    if path.startswith("/oauth2/authorize"):
+        return _oauth2_authorize(query_params)
+    if path.startswith("/saml2/idpresponse"):
+        return _saml2_idp_response(body, query_params)
+    if path.startswith("/oauth2/token"):
+        return _oauth2_token({}, query_params, body)
 
     try:
         data = json.loads(body) if body else {}
@@ -335,10 +433,6 @@ async def handle_request(method, path, headers, body, query_params):
     if target.startswith("AWSCognitoIdentityProviderService."):
         action = target.split(".")[-1]
         return _dispatch_idp(action, data)
-
-    # Path-based fallback for REST-style calls (e.g. /oauth2/token)
-    if path.startswith("/oauth2/token"):
-        return _oauth2_token(data, query_params, body)
 
     return error_response_json("InvalidAction", f"Unknown Cognito target: {target}", 400)
 
@@ -1884,11 +1978,203 @@ def _idp_list_tags_for_resource(data):
 
 
 # ===========================================================================
-# OAUTH2 TOKEN ENDPOINT (data plane)
+# OAUTH2 / SAML DATA-PLANE ENDPOINTS
 # ===========================================================================
 
+def _oauth2_authorize(query_params):
+    """GET /oauth2/authorize — redirect to external IdP (SAML or OIDC)."""
+    response_type = _get_qp(query_params, "response_type")
+    client_id = _get_qp(query_params, "client_id")
+    redirect_uri = _get_qp(query_params, "redirect_uri")
+    identity_provider = _get_qp(query_params, "identity_provider")
+    state = _get_qp(query_params, "state")
+    scope = _get_qp(query_params, "scope", "openid")
+
+    if not client_id:
+        return error_response_json("InvalidParameterException", "client_id is required.", 400)
+
+    pool_id, pool, client = _find_pool_and_client(client_id)
+    if not pool:
+        return error_response_json("ResourceNotFoundException", f"Client {client_id} not found.", 400)
+
+    # Validate redirect_uri against CallbackURLs (skip if empty for dev convenience)
+    callback_urls = client.get("CallbackURLs", [])
+    if callback_urls and redirect_uri not in callback_urls:
+        return error_response_json("InvalidParameterException",
+                                   f"redirect_uri {redirect_uri} is not in CallbackURLs.", 400)
+
+    if not identity_provider:
+        return error_response_json("InvalidParameterException", "identity_provider is required.", 400)
+
+    provider = pool.get("_identity_providers", {}).get(identity_provider)
+    if not provider:
+        return error_response_json("ResourceNotFoundException",
+                                   f"Identity provider {identity_provider} not found.", 400)
+
+    # Store relay context for the callback
+    _cleanup_expired_codes()
+    relay_key = secrets.token_urlsafe(24)
+    _auth_codes[relay_key] = {
+        "type": "relay",
+        "pool_id": pool_id,
+        "client_id": client_id,
+        "redirect_uri": redirect_uri,
+        "state": state,
+        "scope": scope,
+        "provider_name": identity_provider,
+        "created_at": time.time(),
+    }
+
+    provider_type = provider.get("ProviderType", "")
+    details = provider.get("ProviderDetails", {})
+
+    if provider_type == "SAML":
+        # Resolve IdP SSO URL: IDPSSOEndpoint > MetadataURL
+        sso_url = details.get("IDPSSOEndpoint") or details.get("MetadataURL", "")
+        if not sso_url:
+            return error_response_json("InvalidParameterException",
+                                       "SAML provider has no IDPSSOEndpoint or MetadataURL.", 400)
+        saml_request = _build_saml_authn_request(pool_id, sso_url)
+        redirect_url = sso_url + ("&" if "?" in sso_url else "?") + urlencode({
+            "SAMLRequest": saml_request,
+            "RelayState": relay_key,
+        })
+    elif provider_type == "OIDC":
+        # OIDC authorize redirect
+        oidc_issuer = details.get("oidc_issuer", "")
+        authorize_url = details.get("authorize_url", f"{oidc_issuer}/authorize" if oidc_issuer else "")
+        if not authorize_url:
+            return error_response_json("InvalidParameterException",
+                                       "OIDC provider has no oidc_issuer or authorize_url.", 400)
+        oidc_client_id = details.get("client_id", "")
+        redirect_url = authorize_url + ("&" if "?" in authorize_url else "?") + urlencode({
+            "response_type": response_type or "code",
+            "client_id": oidc_client_id,
+            "redirect_uri": _acs_url(),
+            "scope": details.get("authorize_scopes", scope),
+            "state": relay_key,
+        })
+    else:
+        return error_response_json("InvalidParameterException",
+                                   f"Federated sign-in not supported for {provider_type}.", 400)
+
+    logger.info("Cognito: OAuth2 authorize redirect to %s for provider %s", provider_type, identity_provider)
+    return 302, {"Location": redirect_url, "Content-Type": "text/html"}, b""
+
+
+def _saml2_idp_response(body: bytes, query_params):
+    """POST /saml2/idpresponse — receive SAML assertion, create user, redirect with auth code."""
+    # Parse form-encoded body
+    form = {}
+    if body:
+        try:
+            parsed = parse_qs(body.decode("utf-8", errors="replace"), keep_blank_values=True)
+            form = {k: v[0] for k, v in parsed.items()}
+        except Exception:
+            pass
+
+    saml_response_b64 = form.get("SAMLResponse", "")
+    relay_state = form.get("RelayState", "")
+
+    if not saml_response_b64:
+        return error_response_json("InvalidParameterException", "SAMLResponse is required.", 400)
+
+    # Look up relay context
+    relay = _auth_codes.pop(relay_state, None)
+    if not relay or relay.get("type") != "relay":
+        return error_response_json("InvalidParameterException", "Invalid or expired RelayState.", 400)
+
+    pool_id = relay["pool_id"]
+    client_id = relay["client_id"]
+    redirect_uri = relay["redirect_uri"]
+    state = relay.get("state", "")
+    provider_name = relay["provider_name"]
+
+    pool = _user_pools.get(pool_id)
+    if not pool:
+        return error_response_json("ResourceNotFoundException", f"User pool {pool_id} not found.", 400)
+
+    provider = pool.get("_identity_providers", {}).get(provider_name)
+    if not provider:
+        return error_response_json("ResourceNotFoundException",
+                                   f"Identity provider {provider_name} not found.", 400)
+
+    # Parse SAML assertion
+    try:
+        saml_data = _parse_saml_response(saml_response_b64)
+    except Exception as e:
+        logger.warning("Cognito: failed to parse SAML response: %s", e)
+        return error_response_json("InvalidParameterException", f"Failed to parse SAML response: {e}", 400)
+
+    name_id = saml_data.get("name_id")
+    if not name_id:
+        return error_response_json("InvalidParameterException", "SAML assertion missing NameID.", 400)
+
+    # Apply attribute mapping: IdP claim name → Cognito attribute name
+    attr_mapping = provider.get("AttributeMapping", {})
+    reverse_mapping = {v: k for k, v in attr_mapping.items()}  # IdP claim → Cognito attr
+    user_attrs = {}
+    for idp_claim, value in saml_data.get("attributes", {}).items():
+        cognito_attr = reverse_mapping.get(idp_claim, idp_claim)
+        user_attrs[cognito_attr] = value
+
+    # Create or update federated user
+    username = f"{provider_name}_{name_id}"
+    existing_user = pool["_users"].get(username)
+    now = _now_epoch()
+
+    if existing_user:
+        # Update attributes
+        existing_dict = _attr_list_to_dict(existing_user.get("Attributes", []))
+        existing_dict.update(user_attrs)
+        existing_user["Attributes"] = _dict_to_attr_list(existing_dict)
+        existing_user["UserLastModifiedDate"] = now
+        sub = existing_dict.get("sub", new_uuid())
+    else:
+        sub = new_uuid()
+        user_attrs["sub"] = sub
+        if "email" not in user_attrs:
+            user_attrs["email"] = name_id if "@" in name_id else ""
+        user = {
+            "Username": username,
+            "Attributes": _dict_to_attr_list(user_attrs),
+            "UserCreateDate": now,
+            "UserLastModifiedDate": now,
+            "Enabled": True,
+            "UserStatus": "EXTERNAL_PROVIDER",
+            "MFAOptions": [],
+            "_password": "",
+            "_groups": [],
+            "_tokens": [],
+        }
+        pool["_users"][username] = user
+        pool["EstimatedNumberOfUsers"] = len(pool["_users"])
+
+    # Generate authorization code
+    _cleanup_expired_codes()
+    code = secrets.token_urlsafe(32)
+    _auth_codes[code] = {
+        "type": "code",
+        "pool_id": pool_id,
+        "client_id": client_id,
+        "username": username,
+        "sub": sub,
+        "redirect_uri": redirect_uri,
+        "scopes": relay.get("scope", "openid"),
+        "created_at": time.time(),
+    }
+
+    # Redirect to app callback
+    params = {"code": code}
+    if state:
+        params["state"] = state
+    location = redirect_uri + ("&" if "?" in redirect_uri else "?") + urlencode(params)
+    logger.info("Cognito: SAML IdP response — user %s created/updated, redirecting to app", username)
+    return 302, {"Location": location, "Content-Type": "text/html"}, b""
+
+
 def _oauth2_token(data, query_params, raw_body: bytes = b""):
-    """Stub /oauth2/token endpoint — returns fake tokens for client_credentials flow.
+    """/oauth2/token — supports authorization_code and client_credentials grants.
     Body is application/x-www-form-urlencoded, not JSON.
     """
     # Parse form-encoded body first, fall back to query_params
@@ -1906,14 +2192,44 @@ def _oauth2_token(data, query_params, raw_body: bytes = b""):
         v = query_params.get(key, "")
         return v[0] if isinstance(v, list) else v
 
+    grant_type = _get("grant_type")
     client_id = _get("client_id")
-    now = int(time.time())
-    pool_id = ""
-    for pid, pool in _user_pools.items():
-        if client_id in pool["_clients"]:
-            pool_id = pid
-            break
-    access_token = _fake_token(client_id or new_uuid(), pool_id, client_id or "", "access")
+
+    # --- authorization_code grant ---
+    if grant_type == "authorization_code":
+        code = _get("code")
+        redirect_uri = _get("redirect_uri")
+
+        code_data = _auth_codes.pop(code, None)
+        if not code_data or code_data.get("type") != "code":
+            return error_response_json("InvalidGrantException", "Invalid or expired authorization code.", 400)
+
+        # Validate client and redirect_uri
+        if client_id and code_data["client_id"] != client_id:
+            return error_response_json("InvalidGrantException", "client_id mismatch.", 400)
+        if redirect_uri and code_data["redirect_uri"] != redirect_uri:
+            return error_response_json("InvalidGrantException", "redirect_uri mismatch.", 400)
+
+        pool_id = code_data["pool_id"]
+        username = code_data["username"]
+        sub = code_data["sub"]
+        effective_client_id = code_data["client_id"]
+
+        access_token = _fake_token(sub, pool_id, effective_client_id, "access", username)
+        id_token = _fake_token(sub, pool_id, effective_client_id, "id", username)
+        refresh_token = secrets.token_urlsafe(48)
+
+        return json_response({
+            "id_token": id_token,
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+            "token_type": "Bearer",
+            "expires_in": 3600,
+        })
+
+    # --- client_credentials grant (existing behavior / default) ---
+    pool_id, pool, _ = _find_pool_and_client(client_id)
+    access_token = _fake_token(client_id or new_uuid(), pool_id or "", client_id or "", "access")
     return json_response({
         "access_token": access_token,
         "token_type": "Bearer",
@@ -2181,3 +2497,4 @@ def reset():
     _pool_domain_map.clear()
     _identity_pools.clear()
     _identity_tags.clear()
+    _auth_codes.clear()

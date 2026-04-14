@@ -489,6 +489,10 @@ def detect_service(method: str, path: str, headers: dict, query_params: dict) ->
         return "lambda"
     if path_lower.startswith("/oauth2/token"):
         return "cognito-idp"
+    if path_lower.startswith("/oauth2/authorize"):
+        return "cognito-idp"
+    if path_lower.startswith("/saml2/idpresponse"):
+        return "cognito-idp"
     if path_lower.startswith(("/clusters", "/taskdefinitions", "/tasks", "/services", "/stoptask")):
         return "ecs"
     # smithy-rpc-v2-cbor path: /service/ServiceName/operation/ActionName
