@@ -1667,3 +1667,45 @@ def test_cfn_codebuild_project_idempotent_delete(cfn, codebuild):
     cfn.delete_stack(StackName="cfn-cb-t07")
     stack = _wait_stack(cfn, "cfn-cb-t07")
     assert stack["StackStatus"] in ("DELETE_COMPLETE", "DOES_NOT_EXIST")
+
+
+def test_cfn_scheduler_schedule(cfn):
+    """AWS::Scheduler::Schedule and ScheduleGroup should provision and delete cleanly."""
+    template = json.dumps({
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "Group": {
+                "Type": "AWS::Scheduler::ScheduleGroup",
+                "Properties": {"Name": "cfn-test-group"},
+            },
+            "Schedule": {
+                "Type": "AWS::Scheduler::Schedule",
+                "Properties": {
+                    "Name": "cfn-test-schedule",
+                    "GroupName": "cfn-test-group",
+                    "ScheduleExpression": "rate(5 minutes)",
+                    "FlexibleTimeWindow": {"Mode": "OFF"},
+                    "Target": {
+                        "Arn": "arn:aws:lambda:us-east-1:000000000000:function:noop",
+                        "RoleArn": "arn:aws:iam::000000000000:role/test",
+                    },
+                },
+            },
+        },
+    })
+    cfn.create_stack(StackName="cfn-scheduler-test", TemplateBody=template)
+    stack = _wait_stack(cfn, "cfn-scheduler-test")
+    assert stack["StackStatus"] == "CREATE_COMPLETE"
+
+    resources = {
+        r["ResourceType"]: r
+        for r in cfn.list_stack_resources(StackName="cfn-scheduler-test")["StackResourceSummaries"]
+    }
+    assert "AWS::Scheduler::Schedule" in resources
+    assert resources["AWS::Scheduler::Schedule"]["PhysicalResourceId"] == "cfn-test-schedule"
+    assert "AWS::Scheduler::ScheduleGroup" in resources
+    assert resources["AWS::Scheduler::ScheduleGroup"]["PhysicalResourceId"] == "cfn-test-group"
+
+    cfn.delete_stack(StackName="cfn-scheduler-test")
+    stack = _wait_stack(cfn, "cfn-scheduler-test")
+    assert stack["StackStatus"] == "DELETE_COMPLETE"

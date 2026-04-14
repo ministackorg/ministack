@@ -7,6 +7,18 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [Unreleased]
+
+### Added
+- **EventBridge Scheduler service** — full `scheduler` API: CreateSchedule, GetSchedule, UpdateSchedule, DeleteSchedule, ListSchedules, CreateScheduleGroup, GetScheduleGroup, DeleteScheduleGroup, ListScheduleGroups, TagResource, UntagResource, ListTagsForResource. Supports schedule groups, cascading deletes, name prefix/state filters, and `at()`/`cron()`/`rate()` expressions. 21 tests.
+- **CloudFormation `AWS::Scheduler::Schedule` and `AWS::Scheduler::ScheduleGroup`** — CFN/CDK stacks using EventBridge Scheduler resources now provision correctly and are queryable via the Scheduler API.
+
+### Improved
+- **Lazy service imports** — service modules are now loaded on first request instead of at startup. Idle RAM drops from ~59 MB to ~21 MB (64% reduction). Startup time drops from ~1.2s to ~0.5s (2.5x faster). Services that are never called consume zero memory.
+- **Removed pip from Docker image** — pip is no longer present in the final image (security hardening, reduced attack surface).
+
+---
+
 ## [1.2.18] — 2026-04-15
 
 ### Fixed

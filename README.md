@@ -4,7 +4,7 @@
 
 <h1 align="center">MiniStack</h1>
 <p align="center"><strong>Free, open-source local AWS emulator. Free forever.</strong></p>
-<p align="center">43 AWS services on a single port · Terraform compatible · Real databases · MIT licensed</p>
+<p align="center">40+ AWS services on a single port · Terraform compatible · Real databases · MIT licensed</p>
 
 <p align="center">
   <a href="https://github.com/ministackorg/ministack/releases"><img src="https://img.shields.io/github/v/release/ministackorg/ministack" alt="GitHub release"></a>
@@ -26,10 +26,10 @@
 
 LocalStack recently moved its core services behind a paid plan. If you relied on LocalStack Community for local development and CI/CD pipelines, MiniStack is your free alternative.
 
-- **43 AWS services** emulated on a single port (4566)
+- **40+ AWS services** emulated on a single port (4566)
 - **Drop-in compatible** — works with `boto3`, AWS CLI, Terraform, CDK, Pulumi, any SDK
 - **Real infrastructure** — RDS spins up actual Postgres/MySQL containers, ElastiCache spins up real Redis, Athena runs real SQL via DuckDB, ECS runs real Docker containers
-- **Tiny footprint** — ~270MB image, ~45MB RAM at idle vs LocalStack's ~1GB image and ~500MB RAM
+- **Tiny footprint** — ~270MB image, ~21MB RAM at idle vs LocalStack's ~1GB image and ~500MB RAM
 - **Fast startup** — under 2 seconds
 - **MIT licensed** — use it, fork it, contribute to it
 
@@ -450,6 +450,8 @@ subnet = ec2.create_subnet(
 | `AWS::AutoScaling::ScalingPolicy` | Policy ARN | Arn, PolicyName |
 | `AWS::AutoScaling::LifecycleHook` | Hook name | LifecycleHookName |
 | `AWS::AutoScaling::ScheduledAction` | Action ARN | Arn, ScheduledActionName |
+| `AWS::Scheduler::Schedule` | Schedule name | Arn |
+| `AWS::Scheduler::ScheduleGroup` | Group name | Arn |
 | `AWS::CloudFormation::WaitCondition` | Condition ID | — |
 | `AWS::CloudFormation::WaitConditionHandle` | Handle URL | — |
 
@@ -480,6 +482,7 @@ Unsupported resource types fail with `CREATE_FAILED` (or `ROLLBACK_COMPLETE` if 
 | **CodeBuild** | CreateProject, BatchGetProjects, ListProjects, UpdateProject, DeleteProject, StartBuild, BatchGetBuilds, StopBuild, ListBuilds, ListBuildsForProject, BatchDeleteBuilds | 11 actions; builds complete immediately with SUCCEEDED status; project and build metadata stored in-memory |
 | **AppConfig** | CreateApplication, GetApplication, ListApplications, UpdateApplication, DeleteApplication, CreateEnvironment, GetEnvironment, ListEnvironments, UpdateEnvironment, DeleteEnvironment, CreateConfigurationProfile, GetConfigurationProfile, ListConfigurationProfiles, UpdateConfigurationProfile, DeleteConfigurationProfile, CreateHostedConfigurationVersion, GetHostedConfigurationVersion, ListHostedConfigurationVersions, DeleteHostedConfigurationVersion, CreateDeploymentStrategy, GetDeploymentStrategy, ListDeploymentStrategies, UpdateDeploymentStrategy, DeleteDeploymentStrategy, StartDeployment, GetDeployment, ListDeployments, StopDeployment, TagResource, UntagResource, ListTagsForResource, StartConfigurationSession, GetLatestConfiguration | 33 operations; control plane + data plane; hosted configuration versions; deployments complete immediately; session-based configuration retrieval with token rotation |
 | **Transfer Family** | CreateServer, DescribeServer, DeleteServer, ListServers, CreateUser, DescribeUser, DeleteUser, ListUsers, ImportSshPublicKey, DeleteSshPublicKey | 10 operations; SFTP server and user management; SSH key rotation; LOGICAL home directory mappings to S3; in-memory state |
+| **EventBridge Scheduler** | CreateSchedule, GetSchedule, UpdateSchedule, DeleteSchedule, ListSchedules, CreateScheduleGroup, GetScheduleGroup, DeleteScheduleGroup, ListScheduleGroups, TagResource, UntagResource, ListTagsForResource | 12 actions; schedule groups with cascading deletes; `rate()`, `cron()`, `at()` expressions; group/prefix/state filters on list; default group auto-created; CFN `AWS::Scheduler::Schedule` and `AWS::Scheduler::ScheduleGroup` supported |
 
 ---
 
@@ -687,7 +690,7 @@ Install DuckDB for full Athena SQL compatibility: `pip install ministack[full]`.
 
 When `PERSIST_STATE=1`, MiniStack saves service state to `STATE_DIR` on shutdown and reloads it on startup. Writes are atomic (write-to-tmp then rename) to prevent corruption on crash.
 
-Services currently supporting persistence: **All 43 services** — API Gateway v1/v2, ALB, ACM, AppConfig, AppSync, Athena, Cloud Map, CloudFront, CloudWatch, CloudWatch Logs, CodeBuild, Cognito, DynamoDB, EC2, ECR, ECS, EFS, ElastiCache, EMR, EventBridge, Firehose, Glue, IAM/STS, Kinesis, KMS, Lambda, RDS, Route 53, S3, Secrets Manager, SES, SES v2, SNS, SQS, SSM, Step Functions, Transfer Family, WAF v2
+Services currently supporting persistence: **All services** — API Gateway v1/v2, ALB, ACM, AppConfig, AppSync, Athena, Cloud Map, CloudFront, CloudWatch, CloudWatch Logs, CodeBuild, Cognito, DynamoDB, EC2, ECR, ECS, EFS, ElastiCache, EMR, EventBridge, EventBridge Scheduler, Firehose, Glue, IAM/STS, Kinesis, KMS, Lambda, RDS, Route 53, S3, Secrets Manager, SES, SES v2, SNS, SQS, SSM, Step Functions, Transfer Family, WAF v2
 
 ```bash
 docker run -p 4566:4566 \
@@ -750,19 +753,21 @@ MiniStack also sets the standard Lambda runtime environment before the handler m
                     │  └────────────────┬───────────────────┘  │
                     │                 │                        │
                     │  ┌────────────────────────────────────┐  │
-                    │  │         Service Handlers           │  │
+                    │  │   Service Handlers (lazy-loaded)   │  │
                     │  │                                    │  │
-                    │  │  S3      SQS    SNS    DynamoDB    │  │
-                    │  │  Lambda  IAM    STS    Secrets     │  │
-                    │  │  SSM     EventBridge   Kinesis     │  │
-                    │  │  CW Logs   CW Metrics  SES  SESv2  │  │
-                    │  │  Step Functions  API GW v1/v2      │  │
-                    │  │  ECS   RDS   ElastiCache   Glue    │  │
-                    │  │  Athena   Firehose   Route53       │  │
-                    │  │  Cognito  EC2   EMR   EBS   EFS    │  │
-                    │  │  ALB/ELBv2   ACM   WAF v2          │  │
-                    │  │  CloudFormation  KMS  ECR          │  │
-                    │  │  CloudFront   AppSync              │  │
+                    │  │  S3      SQS     SNS    DynamoDB   │  │
+                    │  │  Lambda  IAM     STS    Secrets    │  │
+                    │  │  SSM     Events  Kinesis    CW     │  │
+                    │  │  CW Logs  SES    SESv2     ACM     │  │
+                    │  │  Step Functions   API GW  v1/v2    │  │
+                    │  │  ECS    RDS   ElastiCache  Glue    │  │
+                    │  │  Athena   Firehose    Route53      │  │
+                    │  │  Cognito  EC2    EMR   EBS  EFS    │  │
+                    │  │  ALB/ELBv2   WAF v2   KMS  ECR     │  │
+                    │  │  CloudFormation    CloudFront      │  │
+                    │  │  AppSync  Cloud Map   CodeBuild    │  │
+                    │  │  AutoScaling    AppConfig          │  │
+                    │  │  RDS Data   S3 Files  Scheduler    │  │
                     │  └────────────────────────────────────┘  │
                     │                                          │
                     │  In-Memory Storage + Optional Docker     │
@@ -785,7 +790,7 @@ pip install boto3 pytest duckdb docker cbor2
 # Start MiniStack
 docker compose up -d
 
-# Run the full test suite (1,207 tests across all 43 services)
+# Run the full test suite (1,300+ tests across all services)
 pytest tests/ -v
 ```
 

@@ -137,6 +137,7 @@ SERVICE_HANDLERS = {
     "autoscaling": _lazy_handler("autoscaling"),
     "appconfig": _lazy_handler("appconfig"),
     "appconfigdata": _lazy_handler("appconfig"),
+    "scheduler": _lazy_handler("scheduler"),
 }
 
 SERVICE_NAME_ALIASES = {

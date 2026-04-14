@@ -654,6 +654,47 @@ def _eb_rule_delete(physical_id, props):
     _eb._targets.pop(key, None)
 
 
+# --- EventBridge Scheduler (AWS::Scheduler::Schedule) ---
+
+
+def _scheduler_schedule_create(logical_id, props, stack_name):
+    import ministack.services.scheduler as _sched
+    name = props.get("Name") or _physical_name(stack_name, logical_id, max_len=64)
+    group = props.get("GroupName", "default")
+    _sched._ensure_default_group()
+    body = {
+        "ScheduleExpression": props.get("ScheduleExpression", "rate(1 hour)"),
+        "FlexibleTimeWindow": props.get("FlexibleTimeWindow", {"Mode": "OFF"}),
+        "Target": props.get("Target", {"Arn": "arn:aws:lambda:us-east-1:000000000000:function:noop", "RoleArn": "arn:aws:iam::000000000000:role/noop"}),
+        "GroupName": group,
+        "State": props.get("State", "ENABLED"),
+        "Description": props.get("Description", ""),
+    }
+    _sched._create_schedule(name, body)
+    arn = _sched._schedule_arn(group, name)
+    return name, {"Arn": arn}
+
+
+def _scheduler_schedule_delete(physical_id, props):
+    import ministack.services.scheduler as _sched
+    group = props.get("GroupName", "default")
+    key = f"{group}/{physical_id}"
+    _sched._schedules.pop(key, None)
+
+
+def _scheduler_group_create(logical_id, props, stack_name):
+    import ministack.services.scheduler as _sched
+    name = props.get("Name") or _physical_name(stack_name, logical_id, max_len=64)
+    _sched._create_schedule_group(name, {"Tags": props.get("Tags", [])})
+    arn = _sched._group_arn(name)
+    return name, {"Arn": arn}
+
+
+def _scheduler_group_delete(physical_id, props):
+    import ministack.services.scheduler as _sched
+    _sched._schedule_groups.pop(physical_id, None)
+
+
 # --- Kinesis Stream ---
 
 def _kinesis_stream_create(logical_id, props, stack_name):
@@ -2696,6 +2737,9 @@ _RESOURCE_HANDLERS = {
     "AWS::CloudFront::Distribution": {"create": _cf_distribution_create, "delete": _cf_distribution_delete},
     "AWS::CloudWatch::Alarm": {"create": _cw_metric_alarm_create, "delete": _cw_metric_alarm_delete},
     "AWS::RDS::DBCluster": {"create": _rds_db_cluster_create, "delete": _rds_db_cluster_delete},
+    # EventBridge Scheduler
+    "AWS::Scheduler::Schedule": {"create": _scheduler_schedule_create, "delete": _scheduler_schedule_delete},
+    "AWS::Scheduler::ScheduleGroup": {"create": _scheduler_group_create, "delete": _scheduler_group_delete},
     # CDK metadata — safe to ignore
     "AWS::CDK::Metadata": {"create": lambda lid, props, sn: (f"CDKMetadata-{lid}", {}), "delete": lambda pid, props: None},
     # AutoScaling
