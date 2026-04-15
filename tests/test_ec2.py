@@ -1296,3 +1296,47 @@ def test_ec2_create_default_vpc(ec2):
     with pytest.raises(ClientError) as exc:
         ec2.create_default_vpc()
     assert exc.value.response["Error"]["Code"] == "DefaultVpcAlreadyExists"
+
+
+def test_ec2_authorize_sg_ingress_returns_rules(ec2):
+    """AuthorizeSecurityGroupIngress returns SecurityGroupRules in response (provider v6)."""
+    vpc = ec2.create_vpc(CidrBlock="10.99.0.0/16")["Vpc"]
+    sg = ec2.create_security_group(
+        GroupName="sgr-test", Description="test", VpcId=vpc["VpcId"])
+    resp = ec2.authorize_security_group_ingress(
+        GroupId=sg["GroupId"],
+        IpPermissions=[{
+            "IpProtocol": "tcp", "FromPort": 443, "ToPort": 443,
+            "IpRanges": [{"CidrIp": "10.0.0.0/16"}],
+        }],
+    )
+    assert resp.get("Return") is True
+    rules = resp.get("SecurityGroupRules", [])
+    assert len(rules) >= 1
+    rule = rules[0]
+    assert rule["SecurityGroupRuleId"].startswith("sgr-")
+    assert rule["GroupId"] == sg["GroupId"]
+    assert rule["IsEgress"] is False
+    assert rule["IpProtocol"] == "tcp"
+    assert rule["FromPort"] == 443
+    assert rule["ToPort"] == 443
+    assert rule["CidrIpv4"] == "10.0.0.0/16"
+
+
+def test_ec2_authorize_sg_egress_returns_rules(ec2):
+    """AuthorizeSecurityGroupEgress returns SecurityGroupRules in response (provider v6)."""
+    vpc = ec2.create_vpc(CidrBlock="10.98.0.0/16")["Vpc"]
+    sg = ec2.create_security_group(
+        GroupName="sgr-egress-test", Description="test", VpcId=vpc["VpcId"])
+    resp = ec2.authorize_security_group_egress(
+        GroupId=sg["GroupId"],
+        IpPermissions=[{
+            "IpProtocol": "tcp", "FromPort": 80, "ToPort": 80,
+            "IpRanges": [{"CidrIp": "0.0.0.0/0"}],
+        }],
+    )
+    assert resp.get("Return") is True
+    rules = resp.get("SecurityGroupRules", [])
+    assert len(rules) >= 1
+    assert rules[0]["IsEgress"] is True
+    assert rules[0]["CidrIpv4"] == "0.0.0.0/0"

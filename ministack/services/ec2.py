@@ -586,17 +586,62 @@ def _describe_security_groups(p):
                 f"<securityGroupInfo>{items}</securityGroupInfo>")
 
 
+def _sg_rule_xml(sg_id, rule, idx, is_egress=False):
+    """Build <securityGroupRuleSet> items for Authorize responses (provider v6)."""
+    direction = "egress" if is_egress else "ingress"
+    rule_id = f"sgr-{sg_id[3:]}-{direction}-{idx}"
+    items = ""
+    for cidr in rule.get("IpRanges", []):
+        items += (f"<item>"
+                  f"<securityGroupRuleId>{rule_id}</securityGroupRuleId>"
+                  f"<groupId>{sg_id}</groupId>"
+                  f"<groupOwnerId>{get_account_id()}</groupOwnerId>"
+                  f"<isEgress>{'true' if is_egress else 'false'}</isEgress>"
+                  f"<ipProtocol>{rule.get('IpProtocol', '-1')}</ipProtocol>"
+                  f"<fromPort>{rule.get('FromPort', -1)}</fromPort>"
+                  f"<toPort>{rule.get('ToPort', -1)}</toPort>"
+                  f"<cidrIpv4>{cidr.get('CidrIp', '')}</cidrIpv4>"
+                  f"</item>")
+    for cidr6 in rule.get("Ipv6Ranges", []):
+        items += (f"<item>"
+                  f"<securityGroupRuleId>{rule_id}</securityGroupRuleId>"
+                  f"<groupId>{sg_id}</groupId>"
+                  f"<groupOwnerId>{get_account_id()}</groupOwnerId>"
+                  f"<isEgress>{'true' if is_egress else 'false'}</isEgress>"
+                  f"<ipProtocol>{rule.get('IpProtocol', '-1')}</ipProtocol>"
+                  f"<fromPort>{rule.get('FromPort', -1)}</fromPort>"
+                  f"<toPort>{rule.get('ToPort', -1)}</toPort>"
+                  f"<cidrIpv6>{cidr6.get('CidrIpv6', '')}</cidrIpv6>"
+                  f"</item>")
+    if not items:
+        # No CIDR ranges — still return the rule (e.g. referenced group)
+        items = (f"<item>"
+                 f"<securityGroupRuleId>{rule_id}</securityGroupRuleId>"
+                 f"<groupId>{sg_id}</groupId>"
+                 f"<groupOwnerId>{get_account_id()}</groupOwnerId>"
+                 f"<isEgress>{'true' if is_egress else 'false'}</isEgress>"
+                 f"<ipProtocol>{rule.get('IpProtocol', '-1')}</ipProtocol>"
+                 f"<fromPort>{rule.get('FromPort', -1)}</fromPort>"
+                 f"<toPort>{rule.get('ToPort', -1)}</toPort>"
+                 f"</item>")
+    return items
+
+
 def _authorize_sg_ingress(p):
     sg_id = _p(p, "GroupId")
     sg = _security_groups.get(sg_id)
     if not sg:
         return _error("InvalidGroup.NotFound", f"Security group {sg_id} not found", 400)
     rules = _parse_ip_permissions(p, "IpPermissions")
+    rule_items = ""
     for r in rules:
         if r in sg["IpPermissions"]:
             return _error("InvalidPermission.Duplicate", "The specified rule already exists", 400)
         sg["IpPermissions"].append(r)
-    return _xml(200, "AuthorizeSecurityGroupIngressResponse", "<return>true</return>")
+        idx = len(sg["IpPermissions"]) - 1
+        rule_items += _sg_rule_xml(sg_id, r, idx, is_egress=False)
+    return _xml(200, "AuthorizeSecurityGroupIngressResponse",
+                f"<return>true</return><securityGroupRuleSet>{rule_items}</securityGroupRuleSet>")
 
 
 def _revoke_sg_ingress(p):
@@ -619,10 +664,14 @@ def _authorize_sg_egress(p):
     if not sg:
         return _error("InvalidGroup.NotFound", f"Security group {sg_id} not found", 400)
     rules = _parse_ip_permissions(p, "IpPermissions")
+    rule_items = ""
     for r in rules:
         if r not in sg["IpPermissionsEgress"]:
             sg["IpPermissionsEgress"].append(r)
-    return _xml(200, "AuthorizeSecurityGroupEgressResponse", "<return>true</return>")
+            idx = len(sg["IpPermissionsEgress"]) - 1
+            rule_items += _sg_rule_xml(sg_id, r, idx, is_egress=True)
+    return _xml(200, "AuthorizeSecurityGroupEgressResponse",
+                f"<return>true</return><securityGroupRuleSet>{rule_items}</securityGroupRuleSet>")
 
 
 def _revoke_sg_egress(p):

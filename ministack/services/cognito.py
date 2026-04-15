@@ -226,6 +226,7 @@ def _fake_token(sub: str, pool_id: str, client_id: str, token_type: str = "acces
         json.dumps({"alg": "RS256", "kid": "ministack-key-1"}).encode()
     ).rstrip(b"=").decode()
     now = int(time.time())
+    origin_jti = new_uuid()
     claims = {
         "sub": sub,
         "iss": f"https://cognito-idp.{REGION}.amazonaws.com/{pool_id}",
@@ -233,12 +234,12 @@ def _fake_token(sub: str, pool_id: str, client_id: str, token_type: str = "acces
         "iat": now,
         "exp": now + 3600,
         "jti": new_uuid(),
-        "auth_time": now,
-        "origin_jti": new_uuid(),
     }
     if token_type == "id":
         # IdToken uses 'aud' (not 'client_id') per OIDC spec
         claims["aud"] = client_id
+        claims["auth_time"] = now
+        claims["origin_jti"] = origin_jti
         if username:
             claims["cognito:username"] = username
         # Include user attributes in IdToken
@@ -249,11 +250,15 @@ def _fake_token(sub: str, pool_id: str, client_id: str, token_type: str = "acces
                 claims[k] = v
             if "email" in user_attrs:
                 claims.setdefault("email_verified", True)
-    else:
-        # AccessToken uses 'client_id'
+    elif token_type == "access":
         claims["client_id"] = client_id
+        claims["auth_time"] = now
+        claims["origin_jti"] = origin_jti
         if username:
             claims["username"] = username
+    else:
+        # RefreshToken — opaque in real AWS, but we use a JWT stub for simplicity
+        claims["client_id"] = client_id
     payload = base64.urlsafe_b64encode(
         json.dumps(claims).encode()
     ).rstrip(b"=").decode()
