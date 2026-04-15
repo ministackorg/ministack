@@ -1,9 +1,12 @@
+import base64
 import io
 import json
 import os
 import time
+import urllib.request
+import urllib.error
 import zipfile
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs as _parse_qs, urlencode as _urlencode
 import pytest
 from botocore.exceptions import ClientError
 import uuid as _uuid_mod
@@ -1100,3 +1103,379 @@ def test_cognito_openid_configuration():
     assert pool_id in data["issuer"]
     assert "jwks_uri" in data
     assert "token_endpoint" in data
+
+
+# ===========================================================================
+# Identity Provider CRUD
+# ===========================================================================
+
+def test_cognito_create_and_describe_identity_provider(cognito_idp):
+    pid = cognito_idp.create_user_pool(PoolName="IdpCrudPool")["UserPool"]["Id"]
+    resp = cognito_idp.create_identity_provider(
+        UserPoolId=pid,
+        ProviderName="MySAML",
+        ProviderType="SAML",
+        ProviderDetails={"MetadataURL": "https://idp.example.com/metadata"},
+        AttributeMapping={"email": "http://schemas.xmlsoap.org/ws/2005/05/identity/claims/emailaddress"},
+        IdpIdentifiers=["my-saml"],
+    )
+    provider = resp["IdentityProvider"]
+    assert provider["ProviderName"] == "MySAML"
+    assert provider["ProviderType"] == "SAML"
+    assert provider["ProviderDetails"]["MetadataURL"] == "https://idp.example.com/metadata"
+    assert provider["IdpIdentifiers"] == ["my-saml"]
+    assert "CreationDate" in provider
+    assert "LastModifiedDate" in provider
+
+    desc = cognito_idp.describe_identity_provider(UserPoolId=pid, ProviderName="MySAML")
+    assert desc["IdentityProvider"]["ProviderName"] == "MySAML"
+    assert desc["IdentityProvider"]["UserPoolId"] == pid
+
+
+def test_cognito_create_identity_provider_duplicate(cognito_idp):
+    pid = cognito_idp.create_user_pool(PoolName="IdpDupPool")["UserPool"]["Id"]
+    cognito_idp.create_identity_provider(
+        UserPoolId=pid, ProviderName="Dup", ProviderType="OIDC",
+        ProviderDetails={"client_id": "abc", "authorize_scopes": "openid"},
+    )
+    with pytest.raises(ClientError) as exc:
+        cognito_idp.create_identity_provider(
+            UserPoolId=pid, ProviderName="Dup", ProviderType="OIDC",
+            ProviderDetails={"client_id": "abc", "authorize_scopes": "openid"},
+        )
+    assert "DuplicateProviderException" in str(exc.value)
+
+
+def test_cognito_update_identity_provider(cognito_idp):
+    pid = cognito_idp.create_user_pool(PoolName="IdpUpdatePool")["UserPool"]["Id"]
+    cognito_idp.create_identity_provider(
+        UserPoolId=pid, ProviderName="UpdateMe", ProviderType="SAML",
+        ProviderDetails={"MetadataURL": "https://old.example.com/metadata"},
+        AttributeMapping={"email": "old-claim"},
+    )
+    resp = cognito_idp.update_identity_provider(
+        UserPoolId=pid, ProviderName="UpdateMe",
+        ProviderDetails={"MetadataURL": "https://new.example.com/metadata"},
+        AttributeMapping={"email": "new-claim", "name": "name-claim"},
+        IdpIdentifiers=["updated-id"],
+    )
+    updated = resp["IdentityProvider"]
+    assert updated["ProviderDetails"]["MetadataURL"] == "https://new.example.com/metadata"
+    assert updated["AttributeMapping"]["email"] == "new-claim"
+    assert updated["AttributeMapping"]["name"] == "name-claim"
+    assert updated["IdpIdentifiers"] == ["updated-id"]
+
+
+def test_cognito_delete_identity_provider(cognito_idp):
+    pid = cognito_idp.create_user_pool(PoolName="IdpDeletePool")["UserPool"]["Id"]
+    cognito_idp.create_identity_provider(
+        UserPoolId=pid, ProviderName="DeleteMe", ProviderType="OIDC",
+        ProviderDetails={"client_id": "x", "authorize_scopes": "openid"},
+    )
+    cognito_idp.delete_identity_provider(UserPoolId=pid, ProviderName="DeleteMe")
+
+    with pytest.raises(ClientError) as exc:
+        cognito_idp.describe_identity_provider(UserPoolId=pid, ProviderName="DeleteMe")
+    assert "ResourceNotFoundException" in str(exc.value)
+
+
+def test_cognito_list_identity_providers(cognito_idp):
+    pid = cognito_idp.create_user_pool(PoolName="IdpListPool")["UserPool"]["Id"]
+    for i in range(3):
+        cognito_idp.create_identity_provider(
+            UserPoolId=pid, ProviderName=f"Idp{i}", ProviderType="SAML",
+            ProviderDetails={"MetadataURL": f"https://idp{i}.example.com/metadata"},
+        )
+    resp = cognito_idp.list_identity_providers(UserPoolId=pid, MaxResults=60)
+    names = [p["ProviderName"] for p in resp["Providers"]]
+    assert "Idp0" in names
+    assert "Idp1" in names
+    assert "Idp2" in names
+    # Each entry should have the summary fields
+    for p in resp["Providers"]:
+        assert "ProviderType" in p
+        assert "CreationDate" in p
+        assert "LastModifiedDate" in p
+
+
+def test_cognito_list_identity_providers_pagination(cognito_idp):
+    pid = cognito_idp.create_user_pool(PoolName="IdpPagePool")["UserPool"]["Id"]
+    for i in range(5):
+        cognito_idp.create_identity_provider(
+            UserPoolId=pid, ProviderName=f"Page{i}", ProviderType="SAML",
+            ProviderDetails={"MetadataURL": f"https://page{i}.example.com/metadata"},
+        )
+    resp = cognito_idp.list_identity_providers(UserPoolId=pid, MaxResults=2)
+    assert len(resp["Providers"]) == 2
+    assert "NextToken" in resp
+    resp2 = cognito_idp.list_identity_providers(UserPoolId=pid, MaxResults=2, NextToken=resp["NextToken"])
+    assert len(resp2["Providers"]) == 2
+    all_names = [p["ProviderName"] for p in resp["Providers"] + resp2["Providers"]]
+    assert len(set(all_names)) == 4  # no duplicates across pages
+
+
+def test_cognito_get_identity_provider_by_identifier(cognito_idp):
+    pid = cognito_idp.create_user_pool(PoolName="IdpByIdPool")["UserPool"]["Id"]
+    cognito_idp.create_identity_provider(
+        UserPoolId=pid, ProviderName="ByIdProvider", ProviderType="SAML",
+        ProviderDetails={"MetadataURL": "https://byid.example.com/metadata"},
+        IdpIdentifiers=["find-me"],
+    )
+    resp = cognito_idp.get_identity_provider_by_identifier(UserPoolId=pid, IdpIdentifier="find-me")
+    assert resp["IdentityProvider"]["ProviderName"] == "ByIdProvider"
+
+    with pytest.raises(ClientError) as exc:
+        cognito_idp.get_identity_provider_by_identifier(UserPoolId=pid, IdpIdentifier="not-exist")
+    assert "ResourceNotFoundException" in str(exc.value)
+
+
+def test_cognito_describe_nonexistent_identity_provider(cognito_idp):
+    pid = cognito_idp.create_user_pool(PoolName="IdpNotFoundPool")["UserPool"]["Id"]
+    with pytest.raises(ClientError) as exc:
+        cognito_idp.describe_identity_provider(UserPoolId=pid, ProviderName="Ghost")
+    assert "ResourceNotFoundException" in str(exc.value)
+
+
+# ===========================================================================
+# Federated SAML / OAuth2 flow
+# ===========================================================================
+
+ENDPOINT = "http://localhost:4566"
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Capture 302 redirects without following them."""
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise urllib.error.HTTPError(req.full_url, code, msg, headers, fp)
+
+
+_no_redirect_opener = urllib.request.build_opener(_NoRedirectHandler)
+
+
+def _setup_saml_pool(cognito_idp):
+    """Helper: create a pool + client + SAML provider for federated tests."""
+    pid = cognito_idp.create_user_pool(PoolName="FedPool")["UserPool"]["Id"]
+    client = cognito_idp.create_user_pool_client(
+        UserPoolId=pid,
+        ClientName="FedApp",
+        CallbackURLs=["http://localhost:3000/callback"],
+        AllowedOAuthFlows=["code"],
+        AllowedOAuthScopes=["openid", "email"],
+        SupportedIdentityProviders=["TestSAML"],
+    )["UserPoolClient"]
+    cognito_idp.create_identity_provider(
+        UserPoolId=pid,
+        ProviderName="TestSAML",
+        ProviderType="SAML",
+        ProviderDetails={"IDPSSOEndpoint": "https://idp.example.com/saml/sso"},
+        AttributeMapping={
+            "email": "http://schemas.xmlsoap.org/ws/2005/05/identity/claims/emailaddress",
+            "name": "http://schemas.xmlsoap.org/ws/2005/05/identity/claims/name",
+        },
+    )
+    return pid, client["ClientId"]
+
+
+def _build_mock_saml_response(name_id, attributes=None):
+    """Build a minimal SAML Response XML for testing, return base64-encoded."""
+    attrs_xml = ""
+    if attributes:
+        attr_statements = []
+        for name, value in attributes.items():
+            attr_statements.append(
+                f'<saml:Attribute Name="{name}">'
+                f'<saml:AttributeValue>{value}</saml:AttributeValue>'
+                f'</saml:Attribute>'
+            )
+        attrs_xml = '<saml:AttributeStatement>' + ''.join(attr_statements) + '</saml:AttributeStatement>'
+
+    xml = (
+        '<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol"'
+        ' xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion">'
+        '<saml:Assertion>'
+        '<saml:Subject>'
+        f'<saml:NameID>{name_id}</saml:NameID>'
+        '</saml:Subject>'
+        f'{attrs_xml}'
+        '</saml:Assertion>'
+        '</samlp:Response>'
+    )
+    return base64.b64encode(xml.encode("utf-8")).decode()
+
+
+def test_cognito_oauth2_authorize_saml_redirect(cognito_idp):
+    """GET /oauth2/authorize should 302 to the SAML IdP with SAMLRequest."""
+    pid, cid = _setup_saml_pool(cognito_idp)
+    url = (
+        f"{ENDPOINT}/oauth2/authorize?"
+        f"response_type=code&client_id={cid}"
+        f"&redirect_uri=http://localhost:3000/callback"
+        f"&identity_provider=TestSAML&state=xyz123&scope=openid"
+    )
+    try:
+        _no_redirect_opener.open(url)
+        assert False, "Expected redirect, got 200"
+    except urllib.error.HTTPError as e:
+        assert e.code == 302, f"Expected 302, got {e.code}"
+        location = e.headers.get("Location", "")
+        assert "idp.example.com" in location
+        assert "SAMLRequest=" in location
+        assert "RelayState=" in location
+
+
+def test_cognito_oauth2_authorize_invalid_client(cognito_idp):
+    """GET /oauth2/authorize with unknown client_id returns 400."""
+    url = f"{ENDPOINT}/oauth2/authorize?response_type=code&client_id=nonexistent&redirect_uri=http://x&identity_provider=X"
+    try:
+        _no_redirect_opener.open(url)
+        assert False, "Expected error"
+    except urllib.error.HTTPError as e:
+        assert e.code == 400
+        body = json.loads(e.read())
+        assert "ResourceNotFoundException" in body.get("__type", "")
+
+
+def test_cognito_saml_full_flow(cognito_idp):
+    """Full SAML flow: authorize → SAML response → token exchange → user created."""
+    pid, cid = _setup_saml_pool(cognito_idp)
+
+    # Step 1: GET /oauth2/authorize → extract RelayState from redirect Location
+    url = (
+        f"{ENDPOINT}/oauth2/authorize?"
+        f"response_type=code&client_id={cid}"
+        f"&redirect_uri=http://localhost:3000/callback"
+        f"&identity_provider=TestSAML&state=mystate&scope=openid"
+    )
+    try:
+        _no_redirect_opener.open(url)
+        assert False, "Expected redirect"
+    except urllib.error.HTTPError as e:
+        location = e.headers.get("Location", "")
+    parsed_loc = urlparse(location)
+    relay_state = _parse_qs(parsed_loc.query).get("RelayState", [""])[0]
+    assert relay_state, "RelayState should be in redirect URL"
+
+    # Step 2: POST /saml2/idpresponse with mock SAML assertion
+    saml_resp = _build_mock_saml_response(
+        name_id="john@example.com",
+        attributes={
+            "http://schemas.xmlsoap.org/ws/2005/05/identity/claims/emailaddress": "john@example.com",
+            "http://schemas.xmlsoap.org/ws/2005/05/identity/claims/name": "John Doe",
+        },
+    )
+    form_data = _urlencode({"SAMLResponse": saml_resp, "RelayState": relay_state}).encode()
+    req2 = urllib.request.Request(
+        f"{ENDPOINT}/saml2/idpresponse",
+        data=form_data,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+    try:
+        _no_redirect_opener.open(req2)
+        assert False, "Expected redirect"
+    except urllib.error.HTTPError as e2:
+        callback_location = e2.headers.get("Location", "")
+    assert "localhost:3000/callback" in callback_location
+    assert "code=" in callback_location
+    assert "state=mystate" in callback_location
+
+    # Extract authorization code
+    parsed_cb = urlparse(callback_location)
+    auth_code = _parse_qs(parsed_cb.query).get("code", [""])[0]
+    assert auth_code, "Authorization code should be in callback URL"
+
+    # Step 3: POST /oauth2/token with authorization_code grant
+    token_data = (
+        f"grant_type=authorization_code&code={auth_code}"
+        f"&client_id={cid}&redirect_uri=http://localhost:3000/callback"
+    ).encode()
+    req3 = urllib.request.Request(
+        f"{ENDPOINT}/oauth2/token",
+        data=token_data,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+    with urllib.request.urlopen(req3) as resp:
+        tokens = json.loads(resp.read())
+    assert "access_token" in tokens
+    assert "id_token" in tokens
+    assert "refresh_token" in tokens
+    assert tokens["token_type"] == "Bearer"
+
+    # Step 3b: Verify id_token contains email claim
+    id_payload_b64 = tokens["id_token"].split(".")[1]
+    id_payload_b64 += "=" * (4 - len(id_payload_b64) % 4)
+    id_claims = json.loads(base64.urlsafe_b64decode(id_payload_b64))
+    assert id_claims.get("email") == "john@example.com", f"Missing email in id_token: {id_claims}"
+    assert id_claims.get("token_use") == "id"
+    assert "cognito:username" in id_claims
+
+    # Step 4: Verify user was created via AdminGetUser
+    user = cognito_idp.admin_get_user(UserPoolId=pid, Username="TestSAML_john@example.com")
+    assert user["Username"] == "TestSAML_john@example.com"
+    assert user["UserStatus"] == "EXTERNAL_PROVIDER"
+    attrs = {a["Name"]: a["Value"] for a in user["UserAttributes"]}
+    assert attrs.get("email") == "john@example.com"
+    assert attrs.get("name") == "John Doe"
+
+
+def test_cognito_oauth2_token_invalid_code():
+    """POST /oauth2/token with invalid code returns 400."""
+    data = b"grant_type=authorization_code&code=invalid_code&client_id=x"
+    req = urllib.request.Request(
+        f"{ENDPOINT}/oauth2/token",
+        data=data,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+    try:
+        urllib.request.urlopen(req)
+        assert False, "Expected error"
+    except urllib.error.HTTPError as e:
+        assert e.code == 400
+        body = json.loads(e.read())
+        assert "InvalidGrantException" in body.get("__type", "")
+
+
+def test_cognito_federated_user_idempotent(cognito_idp):
+    """Running SAML flow twice with same NameID updates user, doesn't duplicate."""
+    pid, cid = _setup_saml_pool(cognito_idp)
+
+    def _do_saml_flow(name_value):
+        # Authorize
+        url = (
+            f"{ENDPOINT}/oauth2/authorize?response_type=code&client_id={cid}"
+            f"&redirect_uri=http://localhost:3000/callback"
+            f"&identity_provider=TestSAML&state=s&scope=openid"
+        )
+        try:
+            _no_redirect_opener.open(url)
+        except urllib.error.HTTPError as e:
+            location = e.headers.get("Location", "")
+        relay = _parse_qs(urlparse(location).query).get("RelayState", [""])[0]
+
+        # SAML response
+        saml = _build_mock_saml_response(
+            name_id="repeat@example.com",
+            attributes={
+                "http://schemas.xmlsoap.org/ws/2005/05/identity/claims/name": name_value,
+            },
+        )
+        form = _urlencode({"SAMLResponse": saml, "RelayState": relay}).encode()
+        try:
+            _no_redirect_opener.open(urllib.request.Request(
+                f"{ENDPOINT}/saml2/idpresponse", data=form,
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+            ))
+        except urllib.error.HTTPError:
+            pass
+
+    _do_saml_flow("First Name")
+    _do_saml_flow("Updated Name")
+
+    # Should be one user, not two
+    user = cognito_idp.admin_get_user(UserPoolId=pid, Username="TestSAML_repeat@example.com")
+    attrs = {a["Name"]: a["Value"] for a in user["UserAttributes"]}
+    assert attrs.get("name") == "Updated Name"
+
+    # Count users with this username pattern
+    all_users = cognito_idp.list_users(UserPoolId=pid)["Users"]
+    repeat_users = [u for u in all_users if u["Username"] == "TestSAML_repeat@example.com"]
+    assert len(repeat_users) == 1

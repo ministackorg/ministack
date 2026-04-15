@@ -7,6 +7,13 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [Unreleased]
+
+### Added
+- **Cognito federated SAML/OIDC auth flow** — `GET /oauth2/authorize` (redirects to external SAML/OIDC IdP), `POST /saml2/idpresponse` (parses SAML assertion, creates federated user, issues authorization code), and `POST /oauth2/token` now supports `grant_type=authorization_code` for full SSO flow. Also adds `GetIdentityProviderByIdentifier`. Closes #325.
+
+---
+
 ## [1.2.13] — 2026-04-14
 
 ### Added
