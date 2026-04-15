@@ -1295,3 +1295,99 @@ def test_s3_event_to_sqs(s3, sqs):
     assert "Messages" in msgs and len(msgs["Messages"]) >= 1
     del_body = json.loads(msgs["Messages"][0]["Body"])
     assert del_body["Records"][0]["eventName"].startswith("ObjectRemoved:")
+
+
+def test_s3_lifecycle_transition_round_trip(s3):
+    """PUT lifecycle with Transition, verify GET returns canonical XML with correct fields."""
+    bucket = "intg-s3-lc-transition"
+    s3.create_bucket(Bucket=bucket)
+    s3.put_bucket_lifecycle_configuration(
+        Bucket=bucket,
+        LifecycleConfiguration={
+            "Rules": [{
+                "ID": "archive-rule",
+                "Status": "Enabled",
+                "Filter": {"Prefix": "data/"},
+                "Transitions": [
+                    {"Days": 30, "StorageClass": "STANDARD_IA"},
+                    {"Days": 90, "StorageClass": "GLACIER"},
+                ],
+                "Expiration": {"Days": 365},
+            }]
+        },
+    )
+    resp = s3.get_bucket_lifecycle_configuration(Bucket=bucket)
+    rule = resp["Rules"][0]
+    assert rule["ID"] == "archive-rule"
+    assert rule["Status"] == "Enabled"
+    assert rule["Filter"]["Prefix"] == "data/"
+    transitions = rule["Transitions"]
+    assert len(transitions) == 2
+    assert transitions[0]["Days"] == 30
+    assert transitions[0]["StorageClass"] == "STANDARD_IA"
+    assert transitions[1]["Days"] == 90
+    assert transitions[1]["StorageClass"] == "GLACIER"
+    assert rule["Expiration"]["Days"] == 365
+
+
+def test_s3_lifecycle_noncurrent_version(s3):
+    """PUT lifecycle with NoncurrentVersionExpiration, verify round-trip."""
+    bucket = "intg-s3-lc-noncurrent"
+    s3.create_bucket(Bucket=bucket)
+    s3.put_bucket_lifecycle_configuration(
+        Bucket=bucket,
+        LifecycleConfiguration={
+            "Rules": [{
+                "ID": "noncurrent-cleanup",
+                "Status": "Enabled",
+                "Filter": {"Prefix": ""},
+                "NoncurrentVersionExpiration": {"NoncurrentDays": 30},
+            }]
+        },
+    )
+    resp = s3.get_bucket_lifecycle_configuration(Bucket=bucket)
+    rule = resp["Rules"][0]
+    assert rule["NoncurrentVersionExpiration"]["NoncurrentDays"] == 30
+
+
+def test_s3_lifecycle_multiple_rules(s3):
+    """Multiple lifecycle rules survive PUT/GET round-trip."""
+    bucket = "intg-s3-lc-multi"
+    s3.create_bucket(Bucket=bucket)
+    s3.put_bucket_lifecycle_configuration(
+        Bucket=bucket,
+        LifecycleConfiguration={
+            "Rules": [
+                {"ID": "rule-1", "Status": "Enabled", "Filter": {"Prefix": "a/"}, "Expiration": {"Days": 10}},
+                {"ID": "rule-2", "Status": "Disabled", "Filter": {"Prefix": "b/"}, "Expiration": {"Days": 20}},
+                {"ID": "rule-3", "Status": "Enabled", "Filter": {"Prefix": "c/"}, "Expiration": {"Days": 30}},
+            ]
+        },
+    )
+    resp = s3.get_bucket_lifecycle_configuration(Bucket=bucket)
+    assert len(resp["Rules"]) == 3
+    ids = [r["ID"] for r in resp["Rules"]]
+    assert "rule-1" in ids
+    assert "rule-2" in ids
+    assert "rule-3" in ids
+    disabled = [r for r in resp["Rules"] if r["ID"] == "rule-2"][0]
+    assert disabled["Status"] == "Disabled"
+
+
+def test_s3_lifecycle_abort_multipart(s3):
+    """AbortIncompleteMultipartUpload round-trip."""
+    bucket = "intg-s3-lc-abort"
+    s3.create_bucket(Bucket=bucket)
+    s3.put_bucket_lifecycle_configuration(
+        Bucket=bucket,
+        LifecycleConfiguration={
+            "Rules": [{
+                "ID": "abort-uploads",
+                "Status": "Enabled",
+                "Filter": {"Prefix": ""},
+                "AbortIncompleteMultipartUpload": {"DaysAfterInitiation": 7},
+            }]
+        },
+    )
+    resp = s3.get_bucket_lifecycle_configuration(Bucket=bucket)
+    assert resp["Rules"][0]["AbortIncompleteMultipartUpload"]["DaysAfterInitiation"] == 7

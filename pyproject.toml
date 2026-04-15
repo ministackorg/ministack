@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ministack"
-version = "1.2.16"
+version = "1.2.17"
 description = "Free, open-source local AWS emulator — drop-in LocalStack replacement"
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -67,7 +67,7 @@ python_functions = ["test_*"]
 
 [tool.ruff]
 line-length = 120
-target-version = "py312"
+target-version = "py310"
 
 [tool.ruff.lint]
 select = ["E", "F", "I"]

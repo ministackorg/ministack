@@ -7,12 +7,18 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
-## [Unreleased]
+## [1.2.17] — 2026-04-15
 
 ### Added
-- **Transfer Family** — new service: CreateServer, DescribeServer, DeleteServer, ListServers, CreateUser, DescribeUser, DeleteUser, ListUsers, ImportSshPublicKey, DeleteSshPublicKey. 10 operations covering SFTP server/user management with SSH key rotation and LOGICAL home directory mappings to S3. 19 integration tests.
+- **Transfer Family service** — new service with 10 operations: CreateServer, DescribeServer, DeleteServer, ListServers, CreateUser, DescribeUser, DeleteUser, ListUsers, ImportSshPublicKey, DeleteSshPublicKey. SFTP server/user management with SSH key rotation and LOGICAL home directory mappings to S3. Contributed by @mjdavidson (#330)
+
 ### Fixed
-- **Cognito `cognito:groups` missing from tokens** — `initiate_auth` and `admin_initiate_auth` now include the `cognito:groups` claim in both access and ID tokens when the user belongs to one or more groups. Real AWS Cognito includes this claim automatically; MiniStack was not threading the already-populated `_groups` list through to the JWT builder.
+- **Cognito `cognito:groups` missing from tokens** — `initiate_auth` and `admin_initiate_auth` now include the `cognito:groups` claim in both access and ID tokens when the user belongs to one or more groups. Contributed by @subrotosanyal (#342)
+- **Cognito AccessToken missing `scope` claim** — AccessToken now includes `scope: "aws.cognito.signin.user.admin"`, matching real AWS Cognito. Libraries validating OAuth2 scopes no longer fail.
+- **Lambda default runtime updated to python3.12** — AWS blocked new `python3.9` function creation since Dec 15 2025. All defaults and tests updated. Zip deployments without `Runtime` now return `InvalidParameterValueException`. Contributed by @AdigaAkhil (#339)
+- **Ready.d scripts use `MINISTACK_HOST`** — `AWS_ENDPOINT_URL` in init scripts now uses `MINISTACK_HOST` instead of hardcoded `localhost`. Contributed by @AdigaAkhil (#339)
+- **Docker Compose version field removed** — silences Compose v2 deprecation warning. Contributed by @AdigaAkhil (#339)
+- **Ruff target-version corrected** — reverted to `py310` to match `requires-python = ">=3.10"`.
 
 ---
 

@@ -284,6 +284,7 @@ def _fake_token(sub: str, pool_id: str, client_id: str, token_type: str = "acces
         claims["client_id"] = client_id
         claims["auth_time"] = now
         claims["origin_jti"] = origin_jti
+        claims["scope"] = "aws.cognito.signin.user.admin"
         if username:
             claims["username"] = username
         if groups:
