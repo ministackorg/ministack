@@ -2603,6 +2603,76 @@ def test_sfn_aws_sdk_error_prefix_in_failed_execution(sfn, sfn_sync):
 
     sfn_sync.delete_state_machine(stateMachineArn=sm_arn)
 
+def test_sfn_wait_scale_zero_does_not_timeout_lambda_tasks(sfn, lam):
+    """SFN_WAIT_SCALE=0 must not cause Lambda Task states to timeout.
+
+    _scaled_timeout was previously applied to activity and callback waits,
+    causing 0.01s timeouts that raced against Lambda execution.  Task
+    states that invoke Lambda synchronously should be unaffected by the
+    wait scale factor.
+    """
+    import urllib.request
+
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+
+    def _set_wait_scale(val):
+        req = urllib.request.Request(
+            f"{endpoint}/_ministack/config",
+            data=json.dumps({"stepfunctions._SFN_WAIT_SCALE": val}).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        urllib.request.urlopen(req, timeout=5)
+
+    # Create a Lambda that sleeps briefly to simulate real work.
+    code = (
+        "import time\n"
+        "def handler(event, context):\n"
+        "    time.sleep(0.5)\n"
+        "    return {'done': True}\n"
+    )
+    lam.create_function(
+        FunctionName="sfn-timeout-test-fn",
+        Runtime="python3.11",
+        Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _make_zip(code)},
+    )
+    fn_arn = f"arn:aws:lambda:us-east-1:000000000000:function:sfn-timeout-test-fn"
+
+    _set_wait_scale(0)
+    try:
+        definition = json.dumps({
+            "StartAt": "CallLambda",
+            "States": {
+                "CallLambda": {
+                    "Type": "Task",
+                    "Resource": fn_arn,
+                    "End": True,
+                },
+            },
+        })
+        sm = sfn.create_state_machine(
+            name="qa-sfn-timeout-test",
+            definition=definition,
+            roleArn="arn:aws:iam::000000000000:role/R",
+        )
+        sm_arn = sm["stateMachineArn"]
+
+        exec_resp = sfn.start_execution(stateMachineArn=sm_arn, input="{}")
+        desc = _wait_sfn(sfn, exec_resp["executionArn"], timeout=10)
+
+        assert desc["status"] == "SUCCEEDED", (
+            f"Lambda Task should succeed with SFN_WAIT_SCALE=0, "
+            f"got {desc['status']}"
+        )
+        assert json.loads(desc["output"]) == {"done": True}
+
+        sfn.delete_state_machine(stateMachineArn=sm_arn)
+    finally:
+        _set_wait_scale(1.0)
+
+
 def test_sfn_wait_scale_zero_skips_wait(sfn):
     """SFN_WAIT_SCALE=0 skips Wait state sleeps entirely.
 

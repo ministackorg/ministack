@@ -7,6 +7,13 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [Unreleased]
+
+### Fixed
+- **SFN callback/activity timeout not scaled** — `SFN_WAIT_SCALE=0` no longer causes `States.Timeout` on activity tasks and `waitForTaskToken` callbacks. The scale factor was incorrectly applied to functional timeouts (which must wait for real work to complete), not just Wait state sleeps and retry intervals. Contributed by @jayjanssen
+
+---
+
 ## [1.2.15] — 2026-04-15
 
 ### Fixed
