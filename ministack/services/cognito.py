@@ -2674,20 +2674,37 @@ def handle_oauth2_userinfo(method, path, headers, body, query_params):
     sub = payload.get("sub", "")
     username = payload.get("username", "") or payload.get("cognito:username", "")
 
-    # Find user in pools (search all accounts — no AWS auth in browser)
+    # Extract pool_id from the issuer claim to scope the lookup
+    iss = payload.get("iss", "")
+    token_pool_id = iss.rsplit("/", 1)[-1] if "/" in iss else ""
+
+    # Find user — prefer the specific pool from the token
     user = None
-    for _, pool in _all_pools():
-        if username and username in pool["_users"]:
-            user = pool["_users"][username]
-            break
-        # Fallback: search by sub
-        for u in pool["_users"].values():
-            attrs = _attr_list_to_dict(u.get("Attributes", []))
-            if attrs.get("sub") == sub:
-                user = u
+    if token_pool_id:
+        pool = _get_pool_unscoped(token_pool_id)
+        if pool:
+            if username and username in pool["_users"]:
+                user = pool["_users"][username]
+            else:
+                for u in pool["_users"].values():
+                    attrs = _attr_list_to_dict(u.get("Attributes", []))
+                    if attrs.get("sub") == sub:
+                        user = u
+                        break
+
+    # Fallback: search all pools (no AWS auth in browser)
+    if not user:
+        for _, pool in _all_pools():
+            if username and username in pool["_users"]:
+                user = pool["_users"][username]
                 break
-        if user:
-            break
+            for u in pool["_users"].values():
+                attrs = _attr_list_to_dict(u.get("Attributes", []))
+                if attrs.get("sub") == sub:
+                    user = u
+                    break
+            if user:
+                break
 
     if not user:
         return 401, {"Content-Type": "application/json", "WWW-Authenticate": "Bearer"}, \
