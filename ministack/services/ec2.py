@@ -2271,7 +2271,22 @@ def _parse_ip_permissions(params, prefix):
             cidr = _p(params, f"{prefix}.{i}.IpRanges.{j}.CidrIp")
             if not cidr:
                 break
-            rule["IpRanges"].append({"CidrIp": cidr})
+            entry = {"CidrIp": cidr}
+            desc = _p(params, f"{prefix}.{i}.IpRanges.{j}.Description")
+            if desc:
+                entry["Description"] = desc
+            rule["IpRanges"].append(entry)
+            j += 1
+        j = 1
+        while True:
+            cidr6 = _p(params, f"{prefix}.{i}.Ipv6Ranges.{j}.CidrIpv6")
+            if not cidr6:
+                break
+            entry = {"CidrIpv6": cidr6}
+            desc = _p(params, f"{prefix}.{i}.Ipv6Ranges.{j}.Description")
+            if desc:
+                entry["Description"] = desc
+            rule["Ipv6Ranges"].append(entry)
             j += 1
         rules.append(rule)
         i += 1
