@@ -1284,7 +1284,7 @@ def _invoke_activity(resource, input_data):
         "input": json.dumps(input_data),
     })
 
-    timeout = _scaled_timeout(99999)
+    timeout = 99999
     if not evt.wait(timeout=timeout):
         _task_tokens.pop(token, None)
         raise _ExecutionError("States.Timeout", "Activity task timed out waiting for worker")
@@ -1319,7 +1319,7 @@ def _invoke_with_callback(resource, input_data, token, state_def):
         except _ExecutionError:
             pass
 
-    timeout = _scaled_timeout(state_def.get("TimeoutSeconds", 99999))
+    timeout = state_def.get("TimeoutSeconds", 99999)
     if not evt.wait(timeout=timeout):
         _task_tokens.pop(token, None)
         raise _ExecutionError("States.Timeout",
@@ -1496,14 +1496,6 @@ def _scaled_sleep(seconds):
     scaled = seconds * _SFN_WAIT_SCALE
     if scaled > 0:
         time.sleep(scaled)
-
-
-def _scaled_timeout(seconds):
-    """Scale a blocking-wait timeout.  Returns at least 0.01 so Event.wait()
-    never blocks forever when scale is 0."""
-    if _SFN_WAIT_SCALE == 0:
-        return 0.01
-    return max(seconds * _SFN_WAIT_SCALE, 0.01)
 
 
 def _sleep_until(iso_ts):
