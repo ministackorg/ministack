@@ -726,10 +726,18 @@ async def _run_ready_scripts():
     await _wait_for_port(port)
     logger.info('Found %d ready script(s)', len(scripts))
     # Provide sensible defaults so init scripts can use aws cli / boto3
-    # without requiring manual credential configuration.
+    # without requiring manual credential configuration.  Skip credential
+    # defaults when the user has mounted ~/.aws/credentials so the CLI
+    # respects their configured profile.
     script_env = {**os.environ}
-    script_env.setdefault("AWS_ACCESS_KEY_ID", "test")
-    script_env.setdefault("AWS_SECRET_ACCESS_KEY", "test")
+    _creds_paths = [os.path.expanduser("~/.aws"), "/root/.aws"]
+    _custom_creds = os.environ.get("AWS_SHARED_CREDENTIALS_FILE")
+    _has_creds_file = (_custom_creds and os.path.isfile(_custom_creds)) or any(
+        os.path.isfile(os.path.join(d, "credentials")) for d in _creds_paths
+    )
+    if not _has_creds_file:
+        script_env.setdefault("AWS_ACCESS_KEY_ID", "test")
+        script_env.setdefault("AWS_SECRET_ACCESS_KEY", "test")
     script_env.setdefault("AWS_DEFAULT_REGION", os.environ.get("MINISTACK_REGION", "us-east-1"))
     script_env.setdefault("AWS_ENDPOINT_URL", f"http://localhost:{port}")
     for script_path in scripts:
