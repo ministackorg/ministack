@@ -7,6 +7,13 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [Unreleased]
+
+### Fixed
+- **Cognito `cognito:groups` missing from tokens** — `initiate_auth` and `admin_initiate_auth` now include the `cognito:groups` claim in both access and ID tokens when the user belongs to one or more groups. Real AWS Cognito includes this claim automatically; MiniStack was not threading the already-populated `_groups` list through to the JWT builder.
+
+---
+
 ## [1.2.16] — 2026-04-15
 
 ### Added

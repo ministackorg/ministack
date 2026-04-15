@@ -1479,3 +1479,45 @@ def test_cognito_federated_user_idempotent(cognito_idp):
     all_users = cognito_idp.list_users(UserPoolId=pid)["Users"]
     repeat_users = [u for u in all_users if u["Username"] == "TestSAML_repeat@example.com"]
     assert len(repeat_users) == 1
+
+
+def test_cognito_groups_in_auth_tokens(cognito_idp):
+    """cognito:groups claim must appear in both access and ID tokens."""
+    pid = cognito_idp.create_user_pool(PoolName="GroupTokenPool")["UserPool"]["Id"]
+    cid = cognito_idp.create_user_pool_client(
+        UserPoolId=pid,
+        ClientName="GroupTokenApp",
+        ExplicitAuthFlows=["ALLOW_USER_PASSWORD_AUTH", "ALLOW_REFRESH_TOKEN_AUTH"],
+    )["UserPoolClient"]["ClientId"]
+
+    cognito_idp.create_group(UserPoolId=pid, GroupName="admin")
+    cognito_idp.create_group(UserPoolId=pid, GroupName="readers")
+    cognito_idp.admin_create_user(
+        UserPoolId=pid, Username="groupuser",
+        TemporaryPassword="Temp1234!", MessageAction="SUPPRESS",
+    )
+    cognito_idp.admin_set_user_password(
+        UserPoolId=pid, Username="groupuser", Password="Group1234!", Permanent=True,
+    )
+    cognito_idp.admin_add_user_to_group(UserPoolId=pid, Username="groupuser", GroupName="admin")
+    cognito_idp.admin_add_user_to_group(UserPoolId=pid, Username="groupuser", GroupName="readers")
+
+    auth = cognito_idp.initiate_auth(
+        ClientId=cid,
+        AuthFlow="USER_PASSWORD_AUTH",
+        AuthParameters={"USERNAME": "groupuser", "PASSWORD": "Group1234!"},
+    )
+    result = auth["AuthenticationResult"]
+
+    def _decode_jwt_payload(token):
+        payload = token.split(".")[1]
+        payload += "=" * (4 - len(payload) % 4)
+        return json.loads(base64.urlsafe_b64decode(payload))
+
+    access_claims = _decode_jwt_payload(result["AccessToken"])
+    assert "cognito:groups" in access_claims, "cognito:groups missing from access token"
+    assert sorted(access_claims["cognito:groups"]) == ["admin", "readers"]
+
+    id_claims = _decode_jwt_payload(result["IdToken"])
+    assert "cognito:groups" in id_claims, "cognito:groups missing from id token"
+    assert sorted(id_claims["cognito:groups"]) == ["admin", "readers"]

@@ -247,7 +247,8 @@ def _identity_id(pool_id: str) -> str:
 
 
 def _fake_token(sub: str, pool_id: str, client_id: str, token_type: str = "access",
-                 username: str = "", user_attrs: dict | None = None) -> str:
+                 username: str = "", user_attrs: dict | None = None,
+                 groups: list[str] | None = None) -> str:
     """Return a JWT signed with the RSA key when cryptography is available."""
     header = base64.urlsafe_b64encode(
         json.dumps({"alg": "RS256", "kid": "ministack-key-1"}).encode()
@@ -269,6 +270,8 @@ def _fake_token(sub: str, pool_id: str, client_id: str, token_type: str = "acces
         claims["origin_jti"] = origin_jti
         if username:
             claims["cognito:username"] = username
+        if groups:
+            claims["cognito:groups"] = groups
         # Include user attributes in IdToken
         if user_attrs:
             for k, v in user_attrs.items():
@@ -283,6 +286,8 @@ def _fake_token(sub: str, pool_id: str, client_id: str, token_type: str = "acces
         claims["origin_jti"] = origin_jti
         if username:
             claims["username"] = username
+        if groups:
+            claims["cognito:groups"] = groups
     else:
         # RefreshToken — opaque in real AWS, but we use a JWT stub for simplicity
         claims["client_id"] = client_id
@@ -1129,10 +1134,11 @@ def _build_auth_result(pool_id: str, client_id: str, user: dict) -> dict:
     attrs = _attr_list_to_dict(user.get("Attributes", []))
     sub = attrs.get("sub", user["Username"])
     username = user.get("Username", "")
+    groups = user.get("_groups", [])
     return {
-        "AccessToken": _fake_token(sub, pool_id, client_id, "access", username=username),
+        "AccessToken": _fake_token(sub, pool_id, client_id, "access", username=username, groups=groups),
         "IdToken": _fake_token(sub, pool_id, client_id, "id", username=username,
-                               user_attrs=attrs),
+                               user_attrs=attrs, groups=groups),
         "RefreshToken": _fake_token(sub, pool_id, client_id, "refresh"),
         "TokenType": "Bearer",
         "ExpiresIn": 3600,
