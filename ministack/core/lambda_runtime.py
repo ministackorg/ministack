@@ -405,6 +405,12 @@ class Worker:
         module_name, handler_name = handler.rsplit(".", 1)
         env_vars = self.config.get("Environment", {}).get("Variables", {})
         spawn_env = {**os.environ, **env_vars}
+        # Restore the internal endpoint URL so Lambda SDK calls reach
+        # this MiniStack instance, not a host-mapped port that may be
+        # unreachable from inside the container.
+        for key in ("AWS_ENDPOINT_URL", "LOCALSTACK_HOSTNAME"):
+            if key in os.environ:
+                spawn_env[key] = os.environ[key]
         spawn_env.setdefault("LAMBDA_TASK_ROOT", code_dir)
         spawn_env.setdefault("AWS_LAMBDA_FUNCTION_NAME", self.config.get("FunctionName", ""))
         spawn_env.setdefault("AWS_LAMBDA_FUNCTION_MEMORY_SIZE", str(self.config.get("MemorySize", 128)))

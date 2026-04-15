@@ -1152,6 +1152,10 @@ def _execute_function_docker(func: dict, event: dict) -> dict:
             else:
                 container_env["LAMBDA_TASK_ROOT"] = "/var/task"
                 container_env["_HANDLER"] = handler
+            container_env.update(env_vars)
+            # Override AWS_ENDPOINT_URL *after* function env vars so the
+            # Lambda container always calls back to this MiniStack
+            # instance, not a host-mapped port.
             endpoint = _normalize_endpoint_url(os.environ.get("AWS_ENDPOINT_URL", ""))
             if not endpoint:
                 endpoint = _normalize_endpoint_url(env_vars.get("AWS_ENDPOINT_URL", ""))
@@ -1159,7 +1163,6 @@ def _execute_function_docker(func: dict, event: dict) -> dict:
                 endpoint = _normalize_endpoint_url(env_vars.get("LOCALSTACK_HOSTNAME", ""))
             if endpoint:
                 container_env["AWS_ENDPOINT_URL"] = endpoint
-            container_env.update(env_vars)
 
             event_file = os.path.join(code_dir, "_event.json")
             with open(event_file, "w") as ef:
@@ -1403,12 +1406,14 @@ def _execute_function_image(func: dict, event: dict) -> dict:
         "AWS_LAMBDA_FUNCTION_VERSION": config.get("Version", "$LATEST"),
         "AWS_LAMBDA_LOG_STREAM_NAME": new_uuid(),
     }
+    container_env.update(env_vars)
+    # Override AWS_ENDPOINT_URL *after* function env vars so the
+    # Lambda container always calls back to this MiniStack instance.
     endpoint = _normalize_endpoint_url(os.environ.get("AWS_ENDPOINT_URL", ""))
     if not endpoint:
         endpoint = _normalize_endpoint_url(env_vars.get("AWS_ENDPOINT_URL", ""))
     if endpoint:
         container_env["AWS_ENDPOINT_URL"] = endpoint
-    container_env.update(env_vars)
 
     run_kwargs = {
         "image": image_uri,
@@ -1601,7 +1606,12 @@ def _execute_function_provided(func: dict, event: dict) -> dict:
                     "LAMBDA_TASK_ROOT": code_dir,
                     "_HANDLER": config.get("Handler", "bootstrap"),
                 })
-                # Pass through AWS_ENDPOINT_URL for SDK calls
+                proc_env.update(env_vars)
+                # Override AWS_ENDPOINT_URL *after* function env vars so
+                # Lambda binaries always call back to this MiniStack
+                # instance.  Function-level env vars may carry the
+                # host-mapped URL which is unreachable from inside the
+                # container.
                 endpoint = os.environ.get("AWS_ENDPOINT_URL", "")
                 if not endpoint:
                     hostname = os.environ.get("LOCALSTACK_HOSTNAME", "")
@@ -1609,7 +1619,6 @@ def _execute_function_provided(func: dict, event: dict) -> dict:
                         endpoint = _normalize_endpoint_url(hostname)
                 if endpoint:
                     proc_env["AWS_ENDPOINT_URL"] = endpoint
-                proc_env.update(env_vars)
 
                 proc = subprocess.Popen(
                     [bootstrap_path],
