@@ -325,7 +325,7 @@ def _alb_setup(elbv2, lam, lb_name, fn_name, fn_code, listener_port=80, extra_ru
     # Lambda
     lam.create_function(
         FunctionName=fn_name,
-        Runtime="python3.9",
+        Runtime="python3.12",
         Role="arn:aws:iam::000000000000:role/test-role",
         Handler="index.handler",
         Code={"ZipFile": _alb_zip(fn_code)},
@@ -532,7 +532,7 @@ def test_elbv2_dataplane_path_pattern_rule(elbv2, lam):
     for fn_name, fn_code in [("dp-alb-api-fn", api_code), ("dp-alb-def-fn", default_code)]:
         lam.create_function(
             FunctionName=fn_name,
-            Runtime="python3.9",
+            Runtime="python3.12",
             Role="arn:aws:iam::000000000000:role/test-role",
             Handler="index.handler",
             Code={"ZipFile": _alb_zip(fn_code)},

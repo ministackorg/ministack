@@ -351,7 +351,7 @@ def test_apigwv1_execute_lambda_proxy(apigw_v1, lam):
         zf.writestr("index.py", code)
     lam.create_function(
         FunctionName=fname,
-        Runtime="python3.9",
+        Runtime="python3.12",
         Role="arn:aws:iam::000000000000:role/test-role",
         Handler="index.handler",
         Code={"ZipFile": buf.getvalue()},
@@ -409,7 +409,7 @@ def test_apigwv1_execute_path_params(apigw_v1, lam):
         zf.writestr("index.py", code)
     lam.create_function(
         FunctionName=fname,
-        Runtime="python3.9",
+        Runtime="python3.12",
         Role="arn:aws:iam::000000000000:role/test-role",
         Handler="index.handler",
         Code={"ZipFile": buf.getvalue()},
@@ -540,7 +540,7 @@ def test_apigwv1_no_conflict_with_v2(apigw_v1, apigw, lam):
         zf.writestr("index.py", code_v1)
     lam.create_function(
         FunctionName=fname_v1,
-        Runtime="python3.9",
+        Runtime="python3.12",
         Role="arn:aws:iam::000000000000:role/test-role",
         Handler="index.handler",
         Code={"ZipFile": buf_v1.getvalue()},
@@ -554,7 +554,7 @@ def test_apigwv1_no_conflict_with_v2(apigw_v1, apigw, lam):
         zf.writestr("index.py", code_v2)
     lam.create_function(
         FunctionName=fname_v2,
-        Runtime="python3.9",
+        Runtime="python3.12",
         Role="arn:aws:iam::000000000000:role/test-role",
         Handler="index.handler",
         Code={"ZipFile": buf_v2.getvalue()},
@@ -845,7 +845,7 @@ def test_apigwv1_execute_lambda_arn_uri(apigw_v1, lam):
         zf.writestr("index.py", code)
     lam.create_function(
         FunctionName=fname,
-        Runtime="python3.9",
+        Runtime="python3.12",
         Role="arn:aws:iam::000000000000:role/test-role",
         Handler="index.handler",
         Code={"ZipFile": buf.getvalue()},
@@ -909,7 +909,7 @@ def test_apigwv1_execute_lambda_requestcontext(apigw_v1, lam):
         zf.writestr("index.py", code)
     lam.create_function(
         FunctionName=fname,
-        Runtime="python3.9",
+        Runtime="python3.12",
         Role="arn:aws:iam::000000000000:role/test-role",
         Handler="index.handler",
         Code={"ZipFile": buf.getvalue()},

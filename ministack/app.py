@@ -742,7 +742,7 @@ async def _run_ready_scripts():
         script_env.setdefault("AWS_ACCESS_KEY_ID", "test")
         script_env.setdefault("AWS_SECRET_ACCESS_KEY", "test")
     script_env.setdefault("AWS_DEFAULT_REGION", os.environ.get("MINISTACK_REGION", "us-east-1"))
-    script_env.setdefault("AWS_ENDPOINT_URL", f"http://localhost:{port}")
+    script_env.setdefault("AWS_ENDPOINT_URL", f"http://{_MINISTACK_HOST}:{port}")
     for script_path in scripts:
         logger.info('Running ready script: %s', script_path)
         try:

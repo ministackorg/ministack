@@ -94,7 +94,7 @@ z.writestr('index.py', 'import json\ndef handler(event, context):\n    return {\
 z.close(); \
 print('Lambda zip created')"
 	aws --endpoint-url=http://localhost:$(PORT) lambda create-function \
-		--function-name alb-test-fn --runtime python3.9 \
+		--function-name alb-test-fn --runtime python3.12 \
 		--handler index.handler \
 		--role arn:aws:iam::000000000000:role/role \
 		--zip-file fileb:///tmp/ms-alb-test.zip

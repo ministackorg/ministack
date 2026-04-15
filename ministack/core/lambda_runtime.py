@@ -332,7 +332,7 @@ class Worker:
     def _spawn(self):
         """Extract zip and start worker process."""
         self._tmpdir = tempfile.mkdtemp(prefix=f"ministack-lambda-{self.func_name}-")
-        runtime = self.config.get("Runtime", "python3.9")
+        runtime = self.config.get("Runtime", "python3.12")
         binary, worker_script = _detect_runtime_binary(runtime)
         if not binary:
             raise RuntimeError(f"Unsupported runtime: {runtime}")

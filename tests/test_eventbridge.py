@@ -190,7 +190,7 @@ def test_eventbridge_lambda_target(eb, lam):
         zf.writestr("index.py", code)
     lam.create_function(
         FunctionName=fname,
-        Runtime="python3.9",
+        Runtime="python3.12",
         Role="arn:aws:iam::000000000000:role/test-role",
         Handler="index.handler",
         Code={"ZipFile": buf.getvalue()},

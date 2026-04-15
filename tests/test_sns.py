@@ -243,7 +243,7 @@ def test_sns_to_lambda_fanout(lam, sns):
     code = "received = []\ndef handler(event, context):\n    received.append(event)\n    return {'ok': True}\n"
     lam.create_function(
         FunctionName=fn,
-        Runtime="python3.9",
+        Runtime="python3.12",
         Role=_LAMBDA_ROLE,
         Handler="index.handler",
         Code={"ZipFile": _make_zip(code)},
@@ -269,7 +269,7 @@ def test_sns_to_lambda_event_subscription_arn(lam, sns):
     )
     lam.create_function(
         FunctionName=fn,
-        Runtime="python3.9",
+        Runtime="python3.12",
         Role=_LAMBDA_ROLE,
         Handler="index.handler",
         Code={"ZipFile": _make_zip(code)},

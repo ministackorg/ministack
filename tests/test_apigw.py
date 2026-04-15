@@ -256,7 +256,7 @@ def test_apigw_execute_lambda_proxy(apigw, lam):
         zf.writestr("index.py", code)
     lam.create_function(
         FunctionName=fname,
-        Runtime="python3.9",
+        Runtime="python3.12",
         Role="arn:aws:iam::000000000000:role/test-role",
         Handler="index.handler",
         Code={"ZipFile": buf.getvalue()},
@@ -319,7 +319,7 @@ def test_apigw_execute_default_route(apigw, lam):
         zf.writestr("index.py", code)
     lam.create_function(
         FunctionName=fname,
-        Runtime="python3.9",
+        Runtime="python3.12",
         Role="arn:aws:iam::000000000000:role/test-role",
         Handler="index.handler",
         Code={"ZipFile": buf.getvalue()},
@@ -359,7 +359,7 @@ def test_apigw_path_param_route(apigw, lam):
         zf.writestr("index.py", code)
     lam.create_function(
         FunctionName=fname,
-        Runtime="python3.9",
+        Runtime="python3.12",
         Role="arn:aws:iam::000000000000:role/test-role",
         Handler="index.handler",
         Code={"ZipFile": buf.getvalue()},
@@ -398,7 +398,7 @@ def test_apigw_path_parameters_in_event(apigw, lam):
     )
     lam.create_function(
         FunctionName=fname,
-        Runtime="python3.9",
+        Runtime="python3.12",
         Role=_LAMBDA_ROLE,
         Handler="index.handler",
         Code={"ZipFile": _make_zip(code)},
@@ -439,7 +439,7 @@ def test_apigw_greedy_path_parameters_in_event(apigw, lam):
     )
     lam.create_function(
         FunctionName=fname,
-        Runtime="python3.9",
+        Runtime="python3.12",
         Role=_LAMBDA_ROLE,
         Handler="index.handler",
         Code={"ZipFile": _make_zip(code)},
@@ -484,7 +484,7 @@ def test_apigw_query_params_and_headers_in_event(apigw, lam):
     )
     lam.create_function(
         FunctionName=fname,
-        Runtime="python3.9",
+        Runtime="python3.12",
         Role=_LAMBDA_ROLE,
         Handler="index.handler",
         Code={"ZipFile": _make_zip(code)},
@@ -532,7 +532,7 @@ def test_apigw_multiple_path_parameters(apigw, lam):
     )
     lam.create_function(
         FunctionName=fname,
-        Runtime="python3.9",
+        Runtime="python3.12",
         Role=_LAMBDA_ROLE,
         Handler="index.handler",
         Code={"ZipFile": _make_zip(code)},
@@ -577,7 +577,7 @@ def test_apigw_no_path_parameters_returns_null(apigw, lam):
     )
     lam.create_function(
         FunctionName=fname,
-        Runtime="python3.9",
+        Runtime="python3.12",
         Role=_LAMBDA_ROLE,
         Handler="index.handler",
         Code={"ZipFile": _make_zip(code)},
@@ -618,7 +618,7 @@ def test_apigw_url_encoded_path_parameter(apigw, lam):
     )
     lam.create_function(
         FunctionName=fname,
-        Runtime="python3.9",
+        Runtime="python3.12",
         Role=_LAMBDA_ROLE,
         Handler="index.handler",
         Code={"ZipFile": _make_zip(code)},
@@ -657,7 +657,7 @@ def test_apigw_greedy_path_param(apigw, lam):
     code = 'def handler(event, context):\n    return {"statusCode": 200, "body": event["rawPath"]}\n'
     lam.create_function(
         FunctionName=fname,
-        Runtime="python3.9",
+        Runtime="python3.12",
         Role=_LAMBDA_ROLE,
         Handler="index.handler",
         Code={"ZipFile": _make_zip(code)},
@@ -735,7 +735,7 @@ def test_apigw_routekey_in_lambda_event(apigw, lam):
     code = 'def handler(event, context):\n    return {"statusCode": 200, "body": event["routeKey"]}\n'
     lam.create_function(
         FunctionName=fname,
-        Runtime="python3.9",
+        Runtime="python3.12",
         Role=_LAMBDA_ROLE,
         Handler="index.handler",
         Code={"ZipFile": _make_zip(code)},

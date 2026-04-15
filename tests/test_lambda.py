@@ -48,7 +48,7 @@ def test_lambda_create_invoke(lam):
         zf.writestr("index.py", code)
     lam.create_function(
         FunctionName="test-func-1",
-        Runtime="python3.9",
+        Runtime="python3.12",
         Role="arn:aws:iam::000000000000:role/test-role",
         Handler="index.handler",
         Code={"ZipFile": buf.getvalue()},
@@ -58,6 +58,21 @@ def test_lambda_create_invoke(lam):
     resp = lam.invoke(FunctionName="test-func-1", Payload=json.dumps({"key": "value"}))
     payload = json.loads(resp["Payload"].read())
     assert payload["statusCode"] == 200
+
+def test_create_function_missing_runtime_raises(lam):
+    """Zip deployment without a Runtime should return InvalidParameterValueException."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("index.py", "def handler(e, c): return {}")
+    with pytest.raises(ClientError) as exc:
+        lam.create_function(
+            FunctionName="no-runtime-fn",
+            Role="arn:aws:iam::000000000000:role/role",
+            Handler="index.handler",
+            Code={"ZipFile": buf.getvalue()},
+        )
+    assert exc.value.response["Error"]["Code"] == "InvalidParameterValueException"
+
 
 def test_lambda_esm_sqs(lam, sqs):
     """SQS → Lambda event source mapping: messages sent to SQS trigger Lambda."""
@@ -84,7 +99,7 @@ def test_lambda_esm_sqs(lam, sqs):
 
     lam.create_function(
         FunctionName="esm-test-func",
-        Runtime="python3.9",
+        Runtime="python3.12",
         Role="arn:aws:iam::000000000000:role/test-role",
         Handler="index.handler",
         Code={"ZipFile": buf.getvalue()},
@@ -125,13 +140,13 @@ def test_lambda_esm_sqs(lam, sqs):
 def test_lambda_create_function(lam):
     resp = lam.create_function(
         FunctionName="lam-create-test",
-        Runtime="python3.9",
+        Runtime="python3.12",
         Role=_LAMBDA_ROLE,
         Handler="index.handler",
         Code={"ZipFile": _make_zip(_LAMBDA_CODE)},
     )
     assert resp["FunctionName"] == "lam-create-test"
-    assert resp["Runtime"] == "python3.9"
+    assert resp["Runtime"] == "python3.12"
     assert resp["Handler"] == "index.handler"
     assert resp["State"] == "Active"
     assert "FunctionArn" in resp
@@ -140,7 +155,7 @@ def test_lambda_create_duplicate(lam):
     with pytest.raises(ClientError) as exc:
         lam.create_function(
             FunctionName="lam-create-test",
-            Runtime="python3.9",
+            Runtime="python3.12",
             Role=_LAMBDA_ROLE,
             Handler="index.handler",
             Code={"ZipFile": _make_zip(_LAMBDA_CODE)},
@@ -166,7 +181,7 @@ def test_lambda_list_functions(lam):
 def test_lambda_delete_function(lam):
     lam.create_function(
         FunctionName="lam-to-delete",
-        Runtime="python3.9",
+        Runtime="python3.12",
         Role=_LAMBDA_ROLE,
         Handler="index.handler",
         Code={"ZipFile": _make_zip(_LAMBDA_CODE)},
@@ -179,7 +194,7 @@ def test_lambda_delete_function(lam):
 def test_lambda_invoke(lam):
     lam.create_function(
         FunctionName="lam-invoke-test",
-        Runtime="python3.9",
+        Runtime="python3.12",
         Role=_LAMBDA_ROLE,
         Handler="index.handler",
         Code={"ZipFile": _make_zip(_LAMBDA_CODE)},
@@ -282,7 +297,7 @@ def test_lambda_esm_sqs_comprehensive(lam, sqs):
     code = 'def handler(event, context):\n    return {"processed": len(event.get("Records", []))}\n'
     lam.create_function(
         FunctionName="esm-comp-func",
-        Runtime="python3.9",
+        Runtime="python3.12",
         Role=_LAMBDA_ROLE,
         Handler="index.handler",
         Code={"ZipFile": _make_zip(code)},
@@ -330,7 +345,7 @@ def test_lambda_esm_sqs_failure_respects_visibility_timeout(lam, sqs):
 
     lam.create_function(
         FunctionName="esm-fail-func",
-        Runtime="python3.9",
+        Runtime="python3.12",
         Role="arn:aws:iam::000000000000:role/test-role",
         Handler="index.handler",
         Code={"ZipFile": buf.getvalue()},
@@ -391,7 +406,7 @@ def test_lambda_esm_sqs_report_batch_item_failures(lam, sqs):
     )
     lam.create_function(
         FunctionName="esm-partial-func",
-        Runtime="python3.9",
+        Runtime="python3.12",
         Role=_LAMBDA_ROLE,
         Handler="index.handler",
         Code={"ZipFile": _make_zip(code)},
@@ -467,7 +482,7 @@ def test_lambda_warm_start(lam, apigw):
         zf.writestr("index.py", code)
     lam.create_function(
         FunctionName=fname,
-        Runtime="python3.9",
+        Runtime="python3.12",
         Role="arn:aws:iam::000000000000:role/test-role",
         Handler="index.handler",
         Code={"ZipFile": buf.getvalue()},
@@ -808,7 +823,7 @@ def test_lambda_function_url_config(lam):
     fn = f"intg-url-cfg-{_uuid_mod.uuid4().hex[:8]}"
     lam.create_function(
         FunctionName=fn,
-        Runtime="python3.9",
+        Runtime="python3.12",
         Role=_LAMBDA_ROLE,
         Handler="index.handler",
         Code={"ZipFile": _make_zip(_LAMBDA_CODE)},
@@ -868,7 +883,7 @@ def test_lambda_reset_terminates_workers(lam):
     code = "import time\n_boot = time.time()\ndef handler(event, context):\n    return {'boot': _boot}\n"
     lam.create_function(
         FunctionName=fn,
-        Runtime="python3.9",
+        Runtime="python3.12",
         Role=_LAMBDA_ROLE,
         Handler="index.handler",
         Code={"ZipFile": _make_zip(code)},
@@ -891,7 +906,7 @@ def test_lambda_reset_terminates_workers(lam):
     # Re-create and invoke — new worker means new boot time
     lam.create_function(
         FunctionName=fn,
-        Runtime="python3.9",
+        Runtime="python3.12",
         Role=_LAMBDA_ROLE,
         Handler="index.handler",
         Code={"ZipFile": _make_zip(code)},
@@ -905,7 +920,7 @@ def test_lambda_alias_crud(lam):
     code = _zip_lambda("def handler(e,c): return {'v': 1}")
     lam.create_function(
         FunctionName="qa-lam-alias",
-        Runtime="python3.9",
+        Runtime="python3.12",
         Role="arn:aws:iam::000000000000:role/r",
         Handler="index.handler",
         Code={"ZipFile": code},
@@ -934,7 +949,7 @@ def test_lambda_publish_version_snapshot(lam):
     code = _zip_lambda("def handler(e,c): return 'v1'")
     lam.create_function(
         FunctionName="qa-lam-version",
-        Runtime="python3.9",
+        Runtime="python3.12",
         Role="arn:aws:iam::000000000000:role/r",
         Handler="index.handler",
         Code={"ZipFile": code},
@@ -951,7 +966,7 @@ def test_lambda_function_concurrency(lam):
     code = _zip_lambda("def handler(e,c): return {}")
     lam.create_function(
         FunctionName="qa-lam-concurrency",
-        Runtime="python3.9",
+        Runtime="python3.12",
         Role="arn:aws:iam::000000000000:role/r",
         Handler="index.handler",
         Code={"ZipFile": code},
@@ -971,7 +986,7 @@ def test_lambda_add_remove_permission(lam):
     code = _zip_lambda("def handler(e,c): return {}")
     lam.create_function(
         FunctionName="qa-lam-policy",
-        Runtime="python3.9",
+        Runtime="python3.12",
         Role="arn:aws:iam::000000000000:role/r",
         Handler="index.handler",
         Code={"ZipFile": code},
@@ -995,7 +1010,7 @@ def test_lambda_list_functions_pagination(lam):
         try:
             lam.create_function(
                 FunctionName=f"qa-lam-page-{i}",
-                Runtime="python3.9",
+                Runtime="python3.12",
                 Role="arn:aws:iam::000000000000:role/r",
                 Handler="index.handler",
                 Code={"ZipFile": code},
@@ -1016,7 +1031,7 @@ def test_lambda_invoke_event_type_returns_202(lam):
     try:
         lam.create_function(
             FunctionName="qa-lam-event-invoke",
-            Runtime="python3.9",
+            Runtime="python3.12",
             Role="arn:aws:iam::000000000000:role/r",
             Handler="index.handler",
             Code={"ZipFile": code},
@@ -1036,7 +1051,7 @@ def test_lambda_invoke_dry_run_returns_204(lam):
     try:
         lam.create_function(
             FunctionName="qa-lam-dryrun",
-            Runtime="python3.9",
+            Runtime="python3.12",
             Role="arn:aws:iam::000000000000:role/r",
             Handler="index.handler",
             Code={"ZipFile": code},
@@ -1357,7 +1372,7 @@ def test_lambda_warm_worker_invalidation(lam):
         z.writestr("index.py", code_v1)
     lam.create_function(
         FunctionName=fname,
-        Runtime="python3.9",
+        Runtime="python3.12",
         Role="arn:aws:iam::000000000000:role/test-role",
         Handler="index.handler",
         Code={"ZipFile": buf1.getvalue()},
@@ -1895,7 +1910,7 @@ def test_lambda_empty_dead_letter_config(lam):
         pass
     resp = lam.create_function(
         FunctionName=fname,
-        Runtime="python3.9",
+        Runtime="python3.12",
         Handler="index.handler",
         Role=_LAMBDA_ROLE,
         Code={"ZipFile": _make_zip(_LAMBDA_CODE)},
@@ -1919,7 +1934,7 @@ def test_esm_sqs_no_starting_position(lam, sqs):
         pass
     lam.create_function(
         FunctionName=fname,
-        Runtime="python3.9",
+        Runtime="python3.12",
         Handler="index.handler",
         Role=_LAMBDA_ROLE,
         Code={"ZipFile": _make_zip(_LAMBDA_CODE)},
@@ -1966,7 +1981,7 @@ def test_esm_kinesis_has_starting_position(lam, kin):
 
     lam.create_function(
         FunctionName=fname,
-        Runtime="python3.9",
+        Runtime="python3.12",
         Handler="index.handler",
         Role=_LAMBDA_ROLE,
         Code={"ZipFile": _make_zip(_LAMBDA_CODE)},
@@ -2007,7 +2022,7 @@ def test_esm_response_no_function_name_field(lam, sqs):
         pass
     lam.create_function(
         FunctionName=fname,
-        Runtime="python3.9",
+        Runtime="python3.12",
         Handler="index.handler",
         Role=_LAMBDA_ROLE,
         Code={"ZipFile": _make_zip(_LAMBDA_CODE)},

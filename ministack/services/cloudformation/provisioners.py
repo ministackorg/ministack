@@ -360,7 +360,7 @@ def _ddb_delete(physical_id, props):
 
 # --- Lambda Function ---
 
-def _zip_inline(source: str | None, handler: str, runtime: str = "python3.9") -> bytes | None:
+def _zip_inline(source: str | None, handler: str, runtime: str = "python3.12") -> bytes | None:
     """Wrap inline ZipFile source code into a real zip archive."""
     if not source:
         return None
@@ -375,7 +375,7 @@ def _zip_inline(source: str | None, handler: str, runtime: str = "python3.9") ->
 def _lambda_create(logical_id, props, stack_name):
     name = props.get("FunctionName") or _physical_name(stack_name, logical_id, max_len=64)
     arn = f"arn:aws:lambda:{REGION}:{get_account_id()}:function:{name}"
-    runtime = props.get("Runtime", "python3.9")
+    runtime = props.get("Runtime", "python3.12")
     handler = props.get("Handler", "index.handler")
     role = props.get("Role", f"arn:aws:iam::{get_account_id()}:role/dummy-role")
     timeout = int(props.get("Timeout", 3))
@@ -2244,7 +2244,7 @@ def _apigw_v2_api_create(logical_id, props, stack_name):
         "apiId": api_id,
         "name": name,
         "protocolType": protocol,
-        "apiEndpoint": f"http://{api_id}.execute-api.localhost:4566",
+        "apiEndpoint": f"http://{api_id}.execute-api.{os.environ.get('MINISTACK_HOST', 'localhost')}:{os.environ.get('GATEWAY_PORT', '4566')}",
         "createdDate": now_iso(),
         "routeSelectionExpression": props.get("RouteSelectionExpression", "$request.method $request.path"),
         "apiKeySelectionExpression": props.get("ApiKeySelectionExpression", "$request.header.x-api-key"),

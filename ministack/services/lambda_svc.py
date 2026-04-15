@@ -379,7 +379,7 @@ def _build_config(name: str, data: dict, code_zip: bytes | None = None) -> dict:
     config = {
         "FunctionName": name,
         "FunctionArn": _func_arn(name),
-        "Runtime": data.get("Runtime", "" if is_image else "python3.9"),
+        "Runtime": data.get("Runtime", "" if is_image else "python3.12"),
         "Role": data.get("Role", f"arn:aws:iam::{get_account_id()}:role/lambda-role"),
         "Handler": data.get("Handler", "" if is_image else "index.handler"),
         "CodeSize": code_size,
@@ -709,6 +709,14 @@ def _create_function(data: dict):
 
     if image_uri:
         data.setdefault("PackageType", "Image")
+
+    is_image = data.get("PackageType", "Zip") == "Image"
+    if not is_image and not data.get("Runtime"):
+        return error_response_json(
+            "InvalidParameterValueException",
+            "Runtime is required for .zip deployment packages.",
+            400,
+        )
 
     config = _build_config(name, data, code_zip)
     if image_uri:
@@ -1044,7 +1052,7 @@ def _execute_function_docker(func: dict, event: dict) -> dict:
     ``{"body": ..., "log": ..., "error": ...}``.
     """
     config = func.get("config") or func
-    runtime = config.get("Runtime", "python3.9")
+    runtime = config.get("Runtime", "python3.12")
 
     if not _docker_available:
         
@@ -1315,7 +1323,7 @@ def _execute_function(func: dict, event: dict) -> dict:
     if config.get("PackageType") == "Image" and config.get("ImageUri"):
         return _execute_function_image(func, event)
 
-    runtime = config.get("Runtime", "python3.9")
+    runtime = config.get("Runtime", "python3.12")
 
     if LAMBDA_EXECUTOR == "docker":
         return _execute_function_docker(func, event)

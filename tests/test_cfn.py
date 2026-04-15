@@ -333,7 +333,7 @@ def test_cfn_multi_resource_dependencies(cfn, iam, lam):
                 "Type": "AWS::Lambda::Function",
                 "Properties": {
                     "FunctionName": "cfn-t07-func",
-                    "Runtime": "python3.9",
+                    "Runtime": "python3.12",
                     "Handler": "index.handler",
                     "Role": {"Fn::GetAtt": ["Role", "Arn"]},
                     "Code": {"ZipFile": "def handler(e,c): return {}"},

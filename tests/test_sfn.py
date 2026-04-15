@@ -1387,7 +1387,7 @@ def test_sfn_integration_lambda_invoke(sfn, lam):
     code = "def handler(event, context):\n    return {'doubled': event.get('value', 0) * 2}\n"
     lam.create_function(
         FunctionName=fn,
-        Runtime="python3.9",
+        Runtime="python3.12",
         Role=_LAMBDA_ROLE,
         Handler="index.handler",
         Code={"ZipFile": _make_zip(code)},
