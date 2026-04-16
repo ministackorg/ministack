@@ -238,3 +238,14 @@ def test_ssm_secure_string_not_decrypted_by_default(ssm):
     assert resp["Parameter"]["Value"] != "mysecret"
     resp2 = ssm.get_parameter(Name="/qa/ssm/secure", WithDecryption=True)
     assert resp2["Parameter"]["Value"] == "mysecret"
+
+
+def test_ssm_get_parameters_by_path_root_non_recursive(ssm):
+    """GetParametersByPath with Path=/ and Recursive=False should only return top-level params."""
+    ssm.put_parameter(Name="/toplevel", Value="top", Type="String", Overwrite=True)
+    ssm.put_parameter(Name="/nested/deep", Value="deep", Type="String", Overwrite=True)
+
+    resp = ssm.get_parameters_by_path(Path="/", Recursive=False)
+    names = [p["Name"] for p in resp["Parameters"]]
+    assert "/toplevel" in names
+    assert "/nested/deep" not in names

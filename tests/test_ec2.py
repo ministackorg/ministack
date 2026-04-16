@@ -1358,3 +1358,31 @@ def test_ec2_authorize_sg_ingress_ipv6(ec2):
     rules = resp.get("SecurityGroupRules", [])
     assert len(rules) >= 1
     assert rules[0]["CidrIpv6"] == "::/0"
+
+
+def test_ec2_terminate_unknown_instance(ec2):
+    """TerminateInstances with a non-existent ID should return InvalidInstanceID.NotFound."""
+    with pytest.raises(ClientError) as exc:
+        ec2.terminate_instances(InstanceIds=["i-nonexistent0000000"])
+    assert exc.value.response["Error"]["Code"] == "InvalidInstanceID.NotFound"
+
+
+def test_ec2_stop_unknown_instance(ec2):
+    """StopInstances with a non-existent ID should return InvalidInstanceID.NotFound."""
+    with pytest.raises(ClientError) as exc:
+        ec2.stop_instances(InstanceIds=["i-nonexistent0000000"])
+    assert exc.value.response["Error"]["Code"] == "InvalidInstanceID.NotFound"
+
+
+def test_ec2_vpc_cidr_block_association_set(ec2):
+    """CreateVpc and DescribeVpcs should include cidrBlockAssociationSet."""
+    vpc = ec2.create_vpc(CidrBlock="10.99.0.0/16")["Vpc"]
+    assocs = vpc.get("CidrBlockAssociationSet", [])
+    assert len(assocs) >= 1
+    assert assocs[0]["CidrBlock"] == "10.99.0.0/16"
+    assert assocs[0]["CidrBlockState"]["State"] == "associated"
+
+    # DescribeVpcs should also include it
+    desc = ec2.describe_vpcs(VpcIds=[vpc["VpcId"]])["Vpcs"][0]
+    assert len(desc.get("CidrBlockAssociationSet", [])) >= 1
+    ec2.delete_vpc(VpcId=vpc["VpcId"])

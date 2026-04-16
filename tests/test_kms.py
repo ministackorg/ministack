@@ -613,3 +613,23 @@ def test_kms_key_rotation_with_period(kms_client):
     assert status["KeyRotationEnabled"] is True
     assert status["RotationPeriodInDays"] == 180
     kms_client.schedule_key_deletion(KeyId=key_id, PendingWindowInDays=7)
+
+
+def test_kms_pending_deletion_blocks_encrypt(kms_client):
+    """Encrypt on a PendingDeletion key should raise KMSInvalidStateException."""
+    import pytest
+    key = kms_client.create_key()
+    key_id = key["KeyMetadata"]["KeyId"]
+    kms_client.schedule_key_deletion(KeyId=key_id, PendingWindowInDays=7)
+    with pytest.raises(kms_client.exceptions.KMSInvalidStateException):
+        kms_client.encrypt(KeyId=key_id, Plaintext=b"test")
+
+
+def test_kms_disabled_key_blocks_encrypt(kms_client):
+    """Encrypt on a disabled key should raise DisabledException."""
+    import pytest
+    key = kms_client.create_key()
+    key_id = key["KeyMetadata"]["KeyId"]
+    kms_client.disable_key(KeyId=key_id)
+    with pytest.raises(kms_client.exceptions.DisabledException):
+        kms_client.encrypt(KeyId=key_id, Plaintext=b"test")
