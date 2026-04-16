@@ -1431,7 +1431,7 @@ def test_cognito_oauth2_token_invalid_code():
     except urllib.error.HTTPError as e:
         assert e.code == 400
         body = json.loads(e.read())
-        assert "InvalidGrantException" in body.get("__type", "")
+        assert body.get("error") == "invalid_grant"
 
 
 def test_cognito_federated_user_idempotent(cognito_idp):

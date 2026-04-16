@@ -297,6 +297,28 @@ async def app(scope, receive, send):
                 await _send_response(send, status, resp_headers, resp_body)
                 return
 
+    # Cognito OAuth2 / Managed Login UI endpoints
+    if path == "/oauth2/authorize" and method == "GET":
+        status, resp_headers, resp_body = cognito.handle_oauth2_authorize(method, path, headers, query_params)
+        await _send_response(send, status, resp_headers, resp_body)
+        return
+    if path == "/login" and method == "POST":
+        status, resp_headers, resp_body = cognito.handle_login_submit(method, path, headers, body, query_params)
+        await _send_response(send, status, resp_headers, resp_body)
+        return
+    if path == "/oauth2/token" and method == "POST":
+        status, resp_headers, resp_body = cognito.handle_oauth2_token(method, path, headers, body, query_params)
+        await _send_response(send, status, resp_headers, resp_body)
+        return
+    if path in ("/oauth2/userInfo", "/oauth2/userinfo") and method in ("GET", "POST"):
+        status, resp_headers, resp_body = cognito.handle_oauth2_userinfo(method, path, headers, body, query_params)
+        await _send_response(send, status, resp_headers, resp_body)
+        return
+    if path == "/logout" and method == "GET":
+        status, resp_headers, resp_body = cognito.handle_logout(method, path, headers, query_params)
+        await _send_response(send, status, resp_headers, resp_body)
+        return
+
     # Admin endpoints — no wildcard CORS headers (return early, before CORS block)
     if path == "/_ministack/reset" and method == "POST":
         _reset_all_state()

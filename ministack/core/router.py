@@ -493,7 +493,7 @@ def detect_service(method: str, path: str, headers: dict, query_params: dict) ->
         return "apigateway"
     if path_lower.startswith("/2015-03-31/functions"):
         return "lambda"
-    if path_lower.startswith("/oauth2/token"):
+    if path_lower.startswith(("/oauth2/", "/login", "/logout")):
         return "cognito-idp"
     if path_lower.startswith("/oauth2/authorize"):
         return "cognito-idp"
