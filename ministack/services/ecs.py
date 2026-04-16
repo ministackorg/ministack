@@ -479,7 +479,7 @@ def _make_deployment(task_definition, desired_count, status="PRIMARY"):
         "status": status,
         "taskDefinition": task_definition,
         "desiredCount": desired_count,
-        "runningCount": desired_count if status == "PRIMARY" else 0,
+        "runningCount": 0,
         "pendingCount": 0,
         "failedTasks": 0,
         "launchType": "EC2",
@@ -488,6 +488,80 @@ def _make_deployment(task_definition, desired_count, status="PRIMARY"):
         "rolloutState": "COMPLETED" if status == "PRIMARY" else "IN_PROGRESS",
         "rolloutStateReason": "ECS deployment completed." if status == "PRIMARY" else "",
     }
+
+
+def _reconcile_service_tasks(cluster_name, svc_key):
+    """Spawn or stop tasks so running tasks match desiredCount and task definition."""
+    svc = _services.get(svc_key)
+    if not svc or svc["status"] != "ACTIVE":
+        return
+
+    svc_name = svc["serviceName"]
+    desired = svc.get("desiredCount", 0)
+    td_arn = svc.get("taskDefinition", "")
+    cluster_arn = svc.get("clusterArn", "")
+    launch_type = svc.get("launchType", "EC2")
+    network_cfg = svc.get("networkConfiguration", {})
+
+    # Resolve the target task definition ARN for comparison
+    td_key = _resolve_td_key(td_arn)
+    td = _task_defs.get(td_key)
+    target_td_arn = td["taskDefinitionArn"] if td else td_arn
+
+    # Partition running service tasks into current-TD and stale-TD
+    current_tasks = []
+    stale_tasks = []
+    for arn, t in _tasks.items():
+        if (t.get("group") == f"service:{svc_name}"
+                and t.get("clusterArn") == cluster_arn
+                and t.get("lastStatus") == "RUNNING"):
+            if t.get("taskDefinitionArn") == target_td_arn:
+                current_tasks.append((arn, t))
+            else:
+                stale_tasks.append((arn, t))
+
+    # Stop tasks running on a stale task definition
+    for task_arn, _ in stale_tasks:
+        _stop_task({"task": task_arn, "cluster": cluster_name,
+                     "reason": "Task definition updated"})
+
+    # Scale up: spawn tasks to reach desiredCount
+    to_spawn = desired - len(current_tasks)
+    if to_spawn > 0:
+        if not td:
+            svc["runningCount"] = desired
+            if svc["deployments"]:
+                svc["deployments"][0]["runningCount"] = desired
+            return
+        _run_task({
+            "cluster": cluster_name,
+            "taskDefinition": td_arn,
+            "count": to_spawn,
+            "group": f"service:{svc_name}",
+            "startedBy": svc_name,
+            "launchType": launch_type,
+            "networkConfiguration": network_cfg,
+            "enableExecuteCommand": svc.get("enableExecuteCommand", False),
+        })
+    elif to_spawn < 0:
+        # Scale down: stop newest tasks first
+        excess = -to_spawn
+        current_tasks.sort(key=lambda x: x[1].get("createdAt", ""), reverse=True)
+        for task_arn, _ in current_tasks[:excess]:
+            _stop_task({"task": task_arn, "cluster": cluster_name,
+                         "reason": "Service scaling down"})
+
+    # Recount actual running tasks
+    running = sum(
+        1 for t in _tasks.values()
+        if t.get("group") == f"service:{svc_name}"
+        and t.get("clusterArn") == cluster_arn
+        and t.get("lastStatus") == "RUNNING"
+    )
+    svc["runningCount"] = running
+    if svc["deployments"]:
+        svc["deployments"][0]["runningCount"] = running
+    _recount_cluster(cluster_name)
 
 
 def _create_service(data):
@@ -522,7 +596,7 @@ def _create_service(data):
         "clusterArn": _clusters[cluster_name]["clusterArn"],
         "taskDefinition": td_arn,
         "desiredCount": desired,
-        "runningCount": desired,
+        "runningCount": 0,
         "pendingCount": 0,
         "status": "ACTIVE",
         "launchType": launch_type,
@@ -540,11 +614,7 @@ def _create_service(data):
             "deploymentCircuitBreaker": {"enable": False, "rollback": False},
         }),
         "deployments": [deployment],
-        "events": [{
-            "id": new_uuid(),
-            "createdAt": now,
-            "message": f"(service {name}) has started 1 tasks: (task placeholder).",
-        }],
+        "events": [],
         "roleArn": data.get("role", ""),
         "createdAt": now,
         "createdBy": f"arn:aws:iam::{get_account_id()}:root",
@@ -558,7 +628,7 @@ def _create_service(data):
     if svc["tags"]:
         _tags[arn] = list(svc["tags"])
 
-    _recount_cluster(cluster_name)
+    _reconcile_service_tasks(cluster_name, svc_key)
     return json_response({"service": _sanitize(svc)})
 
 
@@ -578,8 +648,19 @@ def _delete_service(data):
             "The service cannot be stopped while it is scaled above 0.", 400)
 
     svc["status"] = "DRAINING"
-    svc["runningCount"] = 0
     svc["desiredCount"] = 0
+
+    # Stop all tasks belonging to this service
+    cluster_arn = svc.get("clusterArn", "")
+    for task_arn in [
+        a for a, t in _tasks.items()
+        if t.get("group") == f"service:{svc_name}"
+        and t.get("clusterArn") == cluster_arn
+        and t.get("lastStatus") == "RUNNING"
+    ]:
+        _stop_task({"task": task_arn, "cluster": cluster_name, "reason": "Service deleted"})
+
+    svc["runningCount"] = 0
     _tags.pop(svc["serviceArn"], None)
     del _services[svc_key]
 
@@ -635,10 +716,8 @@ def _update_service(data):
 
     if new_desired is not None:
         svc["desiredCount"] = new_desired
-        svc["runningCount"] = new_desired
         if svc["deployments"]:
             svc["deployments"][0]["desiredCount"] = new_desired
-            svc["deployments"][0]["runningCount"] = new_desired
             svc["deployments"][0]["updatedAt"] = _iso()
         changed = True
 
@@ -664,7 +743,7 @@ def _update_service(data):
             "message": f"(service {svc['serviceName']}) has begun draining connections on 1 tasks.",
         })
 
-    _recount_cluster(cluster_name)
+    _reconcile_service_tasks(cluster_name, svc_key)
     return json_response({"service": _sanitize(svc)})
 
 

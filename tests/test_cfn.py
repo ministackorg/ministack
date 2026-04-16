@@ -1342,3 +1342,328 @@ def test_cfn_lambda_nodejs_inline_zip(cfn, lam):
 
     cfn.delete_stack(StackName="cfn-nodejs-inline")
     _wait_stack(cfn, "cfn-nodejs-inline")
+
+def test_cfn_dynamodb_stream_spec(cfn, ddb):
+    """CloudFormation DynamoDB table with StreamViewType (no StreamEnabled) must
+    have streams enabled: LatestStreamArn and StreamSpecification present on
+    describe_table, and StreamArn Fn::GetAtt output must be a valid stream ARN."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-ddb-stream-{uid}"
+    table_name = f"cfn-stream-tbl-{uid}"
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "StreamTable": {
+                "Type": "AWS::DynamoDB::Table",
+                "Properties": {
+                    "TableName": table_name,
+                    "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+                    "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+                    "BillingMode": "PAY_PER_REQUEST",
+                    # CFN standard form: StreamViewType only, no StreamEnabled
+                    "StreamSpecification": {"StreamViewType": "NEW_AND_OLD_IMAGES"},
+                },
+            },
+        },
+        "Outputs": {
+            "StreamArn": {"Value": {"Fn::GetAtt": ["StreamTable", "StreamArn"]}},
+        },
+    }
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(template))
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+
+    # StreamArn output must look like a real DynamoDB stream ARN, not the table name
+    outputs = {o["OutputKey"]: o["OutputValue"] for o in stack.get("Outputs", [])}
+    stream_arn = outputs.get("StreamArn", "")
+    assert ":dynamodb:" in stream_arn and "/stream/" in stream_arn, (
+        f"Expected a DynamoDB stream ARN, got: {stream_arn!r}"
+    )
+
+    # describe_table must expose stream info
+    desc = ddb.describe_table(TableName=table_name)["Table"]
+    assert desc.get("LatestStreamArn"), "LatestStreamArn missing from describe_table"
+    spec = desc.get("StreamSpecification", {})
+    assert spec.get("StreamViewType") == "NEW_AND_OLD_IMAGES", (
+        f"StreamViewType mismatch: {spec}"
+    )
+
+    cfn.delete_stack(StackName=stack_name)
+    _wait_stack(cfn, stack_name)
+
+
+# ===========================================================================
+# CodeBuild Project Tests
+# ===========================================================================
+
+def test_cfn_codebuild_project_basic(cfn, codebuild):
+    """CFN stack with a minimal CodeBuild project deploys successfully."""
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "Project": {
+                "Type": "AWS::CodeBuild::Project",
+                "Properties": {
+                    "Name": "cfn-cb-t01",
+                    "Source": {"Type": "NO_SOURCE"},
+                    "Artifacts": {"Type": "NO_ARTIFACTS"},
+                    "Environment": {
+                        "Type": "LINUX_CONTAINER",
+                        "Image": "aws/codebuild/standard:7.0",
+                        "ComputeType": "BUILD_GENERAL1_SMALL",
+                    },
+                    "ServiceRole": "arn:aws:iam::000000000000:role/codebuild-role",
+                },
+            }
+        },
+    }
+    cfn.create_stack(StackName="cfn-cb-t01", TemplateBody=json.dumps(template))
+    stack = _wait_stack(cfn, "cfn-cb-t01")
+    assert stack["StackStatus"] == "CREATE_COMPLETE"
+
+    # Verify project exists via CodeBuild API
+    result = codebuild.batch_get_projects(names=["cfn-cb-t01"])
+    assert len(result["projects"]) == 1
+    assert result["projects"][0]["name"] == "cfn-cb-t01"
+
+    # Delete stack and verify cleanup
+    cfn.delete_stack(StackName="cfn-cb-t01")
+    _wait_stack(cfn, "cfn-cb-t01")
+    result = codebuild.batch_get_projects(names=["cfn-cb-t01"])
+    assert len(result["projects"]) == 0
+
+
+def test_cfn_codebuild_project_auto_name(cfn, codebuild):
+    """When Name is omitted, _physical_name() generates one."""
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "Project": {
+                "Type": "AWS::CodeBuild::Project",
+                "Properties": {
+                    "Source": {"Type": "NO_SOURCE"},
+                    "Artifacts": {"Type": "NO_ARTIFACTS"},
+                    "Environment": {
+                        "Type": "LINUX_CONTAINER",
+                        "Image": "aws/codebuild/standard:7.0",
+                        "ComputeType": "BUILD_GENERAL1_SMALL",
+                    },
+                    "ServiceRole": "arn:aws:iam::000000000000:role/codebuild-role",
+                },
+            }
+        },
+    }
+    cfn.create_stack(StackName="cfn-cb-t02", TemplateBody=json.dumps(template))
+    stack = _wait_stack(cfn, "cfn-cb-t02")
+    assert stack["StackStatus"] == "CREATE_COMPLETE"
+
+    # Find the auto-generated project name via stack resources
+    resources = cfn.describe_stack_resources(StackName="cfn-cb-t02")["StackResources"]
+    project_name = next(r["PhysicalResourceId"] for r in resources if r["ResourceType"] == "AWS::CodeBuild::Project")
+    assert project_name.startswith("cfn-cb-t02-Project-")
+
+    # Verify it exists
+    result = codebuild.batch_get_projects(names=[project_name])
+    assert len(result["projects"]) == 1
+
+    cfn.delete_stack(StackName="cfn-cb-t02")
+    _wait_stack(cfn, "cfn-cb-t02")
+
+
+def test_cfn_codebuild_project_getatt_arn(cfn, codebuild):
+    """Fn::GetAtt on Arn attribute resolves correctly."""
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "Project": {
+                "Type": "AWS::CodeBuild::Project",
+                "Properties": {
+                    "Name": "cfn-cb-t03",
+                    "Source": {"Type": "NO_SOURCE"},
+                    "Artifacts": {"Type": "NO_ARTIFACTS"},
+                    "Environment": {
+                        "Type": "LINUX_CONTAINER",
+                        "Image": "aws/codebuild/standard:7.0",
+                        "ComputeType": "BUILD_GENERAL1_SMALL",
+                    },
+                    "ServiceRole": "arn:aws:iam::000000000000:role/codebuild-role",
+                },
+            }
+        },
+        "Outputs": {
+            "ProjectArn": {"Value": {"Fn::GetAtt": ["Project", "Arn"]}},
+        },
+    }
+    cfn.create_stack(StackName="cfn-cb-t03", TemplateBody=json.dumps(template))
+    stack = _wait_stack(cfn, "cfn-cb-t03")
+    assert stack["StackStatus"] == "CREATE_COMPLETE"
+
+    outputs = {o["OutputKey"]: o["OutputValue"] for o in stack.get("Outputs", [])}
+    assert outputs["ProjectArn"].startswith("arn:aws:codebuild:")
+    assert outputs["ProjectArn"].endswith(":project/cfn-cb-t03")
+
+    cfn.delete_stack(StackName="cfn-cb-t03")
+    _wait_stack(cfn, "cfn-cb-t03")
+
+
+def test_cfn_codebuild_project_tags(cfn, codebuild):
+    """CFN Tags (capitalised Key/Value) are translated correctly."""
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "Project": {
+                "Type": "AWS::CodeBuild::Project",
+                "Properties": {
+                    "Name": "cfn-cb-t04",
+                    "Source": {"Type": "NO_SOURCE"},
+                    "Artifacts": {"Type": "NO_ARTIFACTS"},
+                    "Environment": {
+                        "Type": "LINUX_CONTAINER",
+                        "Image": "aws/codebuild/standard:7.0",
+                        "ComputeType": "BUILD_GENERAL1_SMALL",
+                    },
+                    "ServiceRole": "arn:aws:iam::000000000000:role/codebuild-role",
+                    "Tags": [
+                        {"Key": "env", "Value": "test"},
+                        {"Key": "team", "Value": "platform"},
+                    ],
+                },
+            }
+        },
+    }
+    cfn.create_stack(StackName="cfn-cb-t04", TemplateBody=json.dumps(template))
+    stack = _wait_stack(cfn, "cfn-cb-t04")
+    assert stack["StackStatus"] == "CREATE_COMPLETE"
+
+    result = codebuild.batch_get_projects(names=["cfn-cb-t04"])
+    tags = {t["key"]: t["value"] for t in result["projects"][0]["tags"]}
+    assert tags["env"] == "test"
+    assert tags["team"] == "platform"
+
+    cfn.delete_stack(StackName="cfn-cb-t04")
+    _wait_stack(cfn, "cfn-cb-t04")
+
+
+def test_cfn_codebuild_project_with_iam_role(cfn, codebuild, iam):
+    """Project references IAM role via Fn::GetAtt."""
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "Role": {
+                "Type": "AWS::IAM::Role",
+                "Properties": {
+                    "RoleName": "cfn-cb-t05-role",
+                    "AssumeRolePolicyDocument": {
+                        "Version": "2012-10-17",
+                        "Statement": [{
+                            "Effect": "Allow",
+                            "Principal": {"Service": "codebuild.amazonaws.com"},
+                            "Action": "sts:AssumeRole",
+                        }],
+                    },
+                },
+            },
+            "Project": {
+                "Type": "AWS::CodeBuild::Project",
+                "Properties": {
+                    "Name": "cfn-cb-t05",
+                    "Source": {"Type": "NO_SOURCE"},
+                    "Artifacts": {"Type": "NO_ARTIFACTS"},
+                    "Environment": {
+                        "Type": "LINUX_CONTAINER",
+                        "Image": "aws/codebuild/standard:7.0",
+                        "ComputeType": "BUILD_GENERAL1_SMALL",
+                    },
+                    "ServiceRole": {"Fn::GetAtt": ["Role", "Arn"]},
+                },
+            },
+        },
+    }
+    cfn.create_stack(StackName="cfn-cb-t05", TemplateBody=json.dumps(template))
+    stack = _wait_stack(cfn, "cfn-cb-t05")
+    assert stack["StackStatus"] == "CREATE_COMPLETE"
+
+    role_arn = iam.get_role(RoleName="cfn-cb-t05-role")["Role"]["Arn"]
+    result = codebuild.batch_get_projects(names=["cfn-cb-t05"])
+    assert result["projects"][0]["serviceRole"] == role_arn
+
+    cfn.delete_stack(StackName="cfn-cb-t05")
+    _wait_stack(cfn, "cfn-cb-t05")
+
+
+def test_cfn_codebuild_project_duplicate_name_fails(cfn, codebuild):
+    """Duplicate project name causes CREATE_FAILED."""
+    # Pre-create the project directly via CodeBuild API
+    codebuild.create_project(
+        name="cfn-cb-t06-dup",
+        source={"type": "NO_SOURCE"},
+        artifacts={"type": "NO_ARTIFACTS"},
+        environment={
+            "type": "LINUX_CONTAINER",
+            "image": "aws/codebuild/standard:7.0",
+            "computeType": "BUILD_GENERAL1_SMALL",
+        },
+        serviceRole="arn:aws:iam::000000000000:role/codebuild-role",
+    )
+
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "Project": {
+                "Type": "AWS::CodeBuild::Project",
+                "Properties": {
+                    "Name": "cfn-cb-t06-dup",  # Same name — should fail
+                    "Source": {"Type": "NO_SOURCE"},
+                    "Artifacts": {"Type": "NO_ARTIFACTS"},
+                    "Environment": {
+                        "Type": "LINUX_CONTAINER",
+                        "Image": "aws/codebuild/standard:7.0",
+                        "ComputeType": "BUILD_GENERAL1_SMALL",
+                    },
+                    "ServiceRole": "arn:aws:iam::000000000000:role/codebuild-role",
+                },
+            }
+        },
+    }
+    cfn.create_stack(StackName="cfn-cb-t06", TemplateBody=json.dumps(template))
+    stack = _wait_stack(cfn, "cfn-cb-t06")
+    assert stack["StackStatus"] == "ROLLBACK_COMPLETE"
+
+    # Cleanup
+    cfn.delete_stack(StackName="cfn-cb-t06")
+    _wait_stack(cfn, "cfn-cb-t06")
+    codebuild.delete_project(name="cfn-cb-t06-dup")
+
+
+def test_cfn_codebuild_project_idempotent_delete(cfn, codebuild):
+    """Delete is idempotent — double delete does not crash."""
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "Project": {
+                "Type": "AWS::CodeBuild::Project",
+                "Properties": {
+                    "Name": "cfn-cb-t07",
+                    "Source": {"Type": "NO_SOURCE"},
+                    "Artifacts": {"Type": "NO_ARTIFACTS"},
+                    "Environment": {
+                        "Type": "LINUX_CONTAINER",
+                        "Image": "aws/codebuild/standard:7.0",
+                        "ComputeType": "BUILD_GENERAL1_SMALL",
+                    },
+                    "ServiceRole": "arn:aws:iam::000000000000:role/codebuild-role",
+                },
+            }
+        },
+    }
+    cfn.create_stack(StackName="cfn-cb-t07", TemplateBody=json.dumps(template))
+    _wait_stack(cfn, "cfn-cb-t07")
+
+    # First delete
+    cfn.delete_stack(StackName="cfn-cb-t07")
+    _wait_stack(cfn, "cfn-cb-t07")
+
+    # Second delete — must not raise
+    cfn.delete_stack(StackName="cfn-cb-t07")
+    stack = _wait_stack(cfn, "cfn-cb-t07")
+    assert stack["StackStatus"] in ("DELETE_COMPLETE", "DOES_NOT_EXIST")

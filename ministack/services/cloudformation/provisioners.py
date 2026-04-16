@@ -42,6 +42,7 @@ import ministack.services.waf as _waf
 import ministack.services.cloudfront as _cf
 import ministack.services.rds as _rds
 import ministack.services.autoscaling as _asg
+import ministack.services.codebuild as _codebuild
 
 
 logger = logging.getLogger("cloudformation")
@@ -314,6 +315,8 @@ def _ddb_create(logical_id, props, stack_name):
     lsis = props.get("LocalSecondaryIndexes", [])
 
     stream_spec = props.get("StreamSpecification", {})
+    if stream_spec.get("StreamViewType") and "StreamEnabled" not in stream_spec:
+        stream_spec = {**stream_spec, "StreamEnabled": True}
     stream_enabled = stream_spec.get("StreamEnabled", False)
     stream_arn = f"{arn}/stream/{now_iso()}" if stream_enabled else None
 
@@ -1348,6 +1351,40 @@ def _ecr_repo_delete(physical_id, props):
     _ecr._repositories.pop(physical_id, None)
 
 
+# --- CodeBuild Project provisioner ---
+
+def _codebuild_project_create(logical_id, props, stack_name):
+    name = props.get("Name") or _physical_name(stack_name, logical_id, max_len=255)
+    
+    # Pre-check for duplicates to raise exception (not just return error response)
+    if name in _codebuild._projects:
+        raise ValueError(f"CodeBuild project already exists: {name}")
+    
+    data = {
+        "name": name,
+        "description": props.get("Description", ""),
+        "source": props.get("Source", {"type": "NO_SOURCE"}),
+        "sourceVersion": props.get("SourceVersion", ""),
+        "artifacts": props.get("Artifacts", {"type": "NO_ARTIFACTS"}),
+        "environment": props.get("Environment", {
+            "type": "LINUX_CONTAINER",
+            "image": "aws/codebuild/standard:7.0",
+            "computeType": "BUILD_GENERAL1_SMALL",
+        }),
+        "serviceRole": props.get("ServiceRole", f"arn:aws:iam::{get_account_id()}:role/codebuild-role"),
+        "timeoutInMinutes": int(props.get("TimeoutInMinutes", 60)),
+        "tags": [{"key": t["Key"], "value": t["Value"]} for t in props.get("Tags", [])],
+        "encryptionKey": props.get("EncryptionKey", f"arn:aws:kms:{REGION}:{get_account_id()}:alias/aws/codebuild"),
+    }
+    _codebuild._create_project(data)
+    arn = _codebuild._project_arn(name)
+    return name, {"Arn": arn}
+
+
+def _codebuild_project_delete(physical_id, props):
+    _codebuild._projects.pop(physical_id, None)
+
+
 # --- IAM ManagedPolicy provisioner ---
 
 def _iam_managed_policy_create(logical_id, props, stack_name):
@@ -1648,6 +1685,35 @@ def _ecs_cluster_delete(physical_id, props):
     _ecs._clusters.pop(physical_id, None)
 
 
+def _cfn_to_camel(key):
+    """Convert a PascalCase CloudFormation key to camelCase."""
+    if not key:
+        return key
+    return key[0].lower() + key[1:]
+
+
+def _normalize_container_defs(cdefs):
+    """Convert CF PascalCase container definitions to camelCase for ECS API."""
+    result = []
+    for cdef in cdefs:
+        normalized = {}
+        for k, v in cdef.items():
+            camel = _cfn_to_camel(k)
+            if camel == "portMappings" and isinstance(v, list):
+                v = [{_cfn_to_camel(pk): pv for pk, pv in pm.items()} for pm in v]
+            elif camel == "environment" and isinstance(v, list):
+                v = [{_cfn_to_camel(ek): ev for ek, ev in e.items()} for e in v]
+            elif camel == "mountPoints" and isinstance(v, list):
+                v = [{_cfn_to_camel(mk): mv for mk, mv in m.items()} for m in v]
+            elif camel == "volumesFrom" and isinstance(v, list):
+                v = [{_cfn_to_camel(vk): vv for vk, vv in vf.items()} for vf in v]
+            elif camel == "logConfiguration" and isinstance(v, dict):
+                v = {_cfn_to_camel(lk): lv for lk, lv in v.items()}
+            normalized[camel] = v
+        result.append(normalized)
+    return result
+
+
 def _ecs_task_def_create(logical_id, props, stack_name):
     family = props.get("Family", f"{stack_name}-{logical_id}")
     revision = 1
@@ -1658,7 +1724,7 @@ def _ecs_task_def_create(logical_id, props, stack_name):
         "family": family,
         "revision": revision,
         "status": "ACTIVE",
-        "containerDefinitions": props.get("ContainerDefinitions", []),
+        "containerDefinitions": _normalize_container_defs(props.get("ContainerDefinitions", [])),
         "requiresCompatibilities": props.get("RequiresCompatibilities", ["EC2"]),
         "networkMode": props.get("NetworkMode", "bridge"),
         "cpu": props.get("Cpu", "256"),
@@ -1669,46 +1735,39 @@ def _ecs_task_def_create(logical_id, props, stack_name):
         "placementConstraints": props.get("PlacementConstraints", []),
     }
     _ecs._task_defs[td_key] = td
-    _ecs._task_def_latest[family] = td_key
+    _ecs._task_def_latest[family] = revision
     return arn, {"TaskDefinitionArn": arn}
 
 
 def _ecs_task_def_delete(physical_id, props):
-    _ecs._task_defs.pop(physical_id, None)
+    # physical_id is the ARN; _task_defs is keyed by "family:revision"
+    td_key = physical_id.split("/")[-1] if "/" in physical_id else physical_id
+    _ecs._task_defs.pop(td_key, None)
 
 
 def _ecs_service_create(logical_id, props, stack_name):
     name = props.get("ServiceName", f"{stack_name}-{logical_id}")
     cluster = props.get("Cluster", "default")
-    arn = f"arn:aws:ecs:{REGION}:{get_account_id()}:service/{cluster}/{name}"
-    svc = {
-        "serviceArn": arn,
+    _ecs._create_service({
         "serviceName": name,
-        "clusterArn": f"arn:aws:ecs:{REGION}:{get_account_id()}:cluster/{cluster}",
+        "cluster": cluster,
         "taskDefinition": props.get("TaskDefinition", ""),
         "desiredCount": props.get("DesiredCount", 1),
-        "runningCount": 0,
-        "status": "ACTIVE",
         "launchType": props.get("LaunchType", "EC2"),
-        "deployments": [{
-            "id": f"ecs-svc/{new_uuid().replace('-','')[:32]}",
-            "status": "PRIMARY",
-            "taskDefinition": props.get("TaskDefinition", ""),
-            "desiredCount": props.get("DesiredCount", 1),
-            "runningCount": 0,
-            "createdAt": __import__("time").time(),
-            "updatedAt": __import__("time").time(),
-        }],
         "loadBalancers": props.get("LoadBalancers", []),
         "networkConfiguration": props.get("NetworkConfiguration", {}),
         "tags": [{"key": t["Key"], "value": t["Value"]} for t in props.get("Tags", [])],
-    }
-    _ecs._services[arn] = svc
+    })
+    arn = f"arn:aws:ecs:{REGION}:{get_account_id()}:service/{cluster}/{name}"
     return arn, {"ServiceArn": arn, "Name": name}
 
 
 def _ecs_service_delete(physical_id, props):
-    _ecs._services.pop(physical_id, None)
+    cluster = props.get("Cluster", "default")
+    name = props.get("ServiceName", "")
+    if not name and "/" in physical_id:
+        name = physical_id.split("/")[-1]
+    _ecs._delete_service({"cluster": cluster, "service": name, "force": True})
 
 
 # --- EC2 Launch Template provisioners ---
@@ -2608,6 +2667,7 @@ _RESOURCE_HANDLERS = {
     "AWS::Cognito::IdentityPool": {"create": _cognito_identity_pool_create, "delete": _cognito_identity_pool_delete},
     "AWS::Cognito::UserPoolDomain": {"create": _cognito_user_pool_domain_create, "delete": _cognito_user_pool_domain_delete},
     "AWS::ECR::Repository": {"create": _ecr_repo_create, "delete": _ecr_repo_delete},
+    "AWS::CodeBuild::Project": {"create": _codebuild_project_create, "delete": _codebuild_project_delete},
     "AWS::IAM::ManagedPolicy": {"create": _iam_managed_policy_create, "delete": _iam_managed_policy_delete},
     "AWS::KMS::Key": {"create": _kms_key_create, "delete": _kms_key_delete},
     "AWS::KMS::Alias": {"create": _kms_alias_create, "delete": _kms_alias_delete},

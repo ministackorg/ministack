@@ -287,3 +287,268 @@ def test_ecs_timestamps_are_epoch(ecs):
     if registered_at is not None:
         from datetime import datetime
         assert isinstance(registered_at, datetime), f"registeredAt should be datetime, got {type(registered_at)}"
+
+
+# ---------------------------------------------------------------------------
+# Service task spawning tests
+# ---------------------------------------------------------------------------
+
+def test_ecs_service_spawns_tasks(ecs):
+    """Creating a service should spawn tasks matching desiredCount."""
+    cluster = "svc-spawn-c"
+    ecs.create_cluster(clusterName=cluster)
+    ecs.register_task_definition(
+        family="svc-spawn-td",
+        containerDefinitions=[{"name": "app", "image": "nginx", "cpu": 64, "memory": 128}],
+    )
+    ecs.create_service(
+        cluster=cluster,
+        serviceName="svc-spawn",
+        taskDefinition="svc-spawn-td",
+        desiredCount=2,
+    )
+    tasks = ecs.list_tasks(cluster=cluster, serviceName="svc-spawn")
+    assert len(tasks["taskArns"]) == 2
+
+    # Verify describe_tasks returns correct metadata
+    desc = ecs.describe_tasks(cluster=cluster, tasks=tasks["taskArns"])
+    for t in desc["tasks"]:
+        assert t["lastStatus"] == "RUNNING"
+        assert t["group"] == "service:svc-spawn"
+        assert t["startedBy"] == "svc-spawn"
+
+
+def test_ecs_list_services(ecs):
+    """list_services should return ARNs of services in the cluster."""
+    cluster = "ls-svc-c"
+    ecs.create_cluster(clusterName=cluster)
+    ecs.register_task_definition(
+        family="ls-svc-td",
+        containerDefinitions=[{"name": "app", "image": "nginx", "cpu": 64, "memory": 128}],
+    )
+    ecs.create_service(
+        cluster=cluster, serviceName="ls-svc-a", taskDefinition="ls-svc-td", desiredCount=1,
+    )
+    ecs.create_service(
+        cluster=cluster, serviceName="ls-svc-b", taskDefinition="ls-svc-td", desiredCount=1,
+    )
+    resp = ecs.list_services(cluster=cluster)
+    arns = resp["serviceArns"]
+    assert len(arns) == 2
+    assert any("ls-svc-a" in a for a in arns)
+    assert any("ls-svc-b" in a for a in arns)
+
+
+def test_ecs_service_running_count(ecs):
+    """Service runningCount should match the number of actual running tasks."""
+    cluster = "rc-c"
+    ecs.create_cluster(clusterName=cluster)
+    ecs.register_task_definition(
+        family="rc-td",
+        containerDefinitions=[{"name": "app", "image": "nginx", "cpu": 64, "memory": 128}],
+    )
+    ecs.create_service(
+        cluster=cluster, serviceName="rc-svc", taskDefinition="rc-td", desiredCount=3,
+    )
+    resp = ecs.describe_services(cluster=cluster, services=["rc-svc"])
+    svc = resp["services"][0]
+    assert svc["runningCount"] == 3
+    assert svc["desiredCount"] == 3
+
+
+def test_ecs_service_scale_up(ecs):
+    """Updating desiredCount should spawn additional tasks."""
+    cluster = "su-c"
+    ecs.create_cluster(clusterName=cluster)
+    ecs.register_task_definition(
+        family="su-td",
+        containerDefinitions=[{"name": "app", "image": "nginx", "cpu": 64, "memory": 128}],
+    )
+    ecs.create_service(
+        cluster=cluster, serviceName="su-svc", taskDefinition="su-td", desiredCount=1,
+    )
+    tasks_before = ecs.list_tasks(cluster=cluster, serviceName="su-svc")
+    assert len(tasks_before["taskArns"]) == 1
+
+    ecs.update_service(cluster=cluster, service="su-svc", desiredCount=3)
+    tasks_after = ecs.list_tasks(cluster=cluster, serviceName="su-svc")
+    assert len(tasks_after["taskArns"]) == 3
+
+    resp = ecs.describe_services(cluster=cluster, services=["su-svc"])
+    assert resp["services"][0]["runningCount"] == 3
+
+
+def test_ecs_service_scale_down(ecs):
+    """Scaling down desiredCount should stop excess tasks."""
+    cluster = "sd-c"
+    ecs.create_cluster(clusterName=cluster)
+    ecs.register_task_definition(
+        family="sd-td",
+        containerDefinitions=[{"name": "app", "image": "nginx", "cpu": 64, "memory": 128}],
+    )
+    ecs.create_service(
+        cluster=cluster, serviceName="sd-svc", taskDefinition="sd-td", desiredCount=3,
+    )
+    tasks_before = ecs.list_tasks(cluster=cluster, serviceName="sd-svc")
+    assert len(tasks_before["taskArns"]) == 3
+
+    ecs.update_service(cluster=cluster, service="sd-svc", desiredCount=1)
+    tasks_after = ecs.list_tasks(cluster=cluster, serviceName="sd-svc")
+    assert len(tasks_after["taskArns"]) == 1
+
+    resp = ecs.describe_services(cluster=cluster, services=["sd-svc"])
+    assert resp["services"][0]["runningCount"] == 1
+
+
+def test_ecs_service_td_update_replaces_tasks(ecs):
+    """Updating task definition should replace old tasks with new ones."""
+    cluster = "tdu-c"
+    ecs.create_cluster(clusterName=cluster)
+    ecs.register_task_definition(
+        family="tdu-td",
+        containerDefinitions=[{"name": "app", "image": "nginx:1.0", "cpu": 64, "memory": 128}],
+    )
+    ecs.create_service(
+        cluster=cluster, serviceName="tdu-svc", taskDefinition="tdu-td:1", desiredCount=2,
+    )
+    old_tasks = ecs.list_tasks(cluster=cluster, serviceName="tdu-svc")
+    assert len(old_tasks["taskArns"]) == 2
+
+    # Register new revision and update service
+    resp2 = ecs.register_task_definition(
+        family="tdu-td",
+        containerDefinitions=[{"name": "app", "image": "nginx:2.0", "cpu": 64, "memory": 128}],
+    )
+    new_td_arn = resp2["taskDefinition"]["taskDefinitionArn"]
+    ecs.update_service(cluster=cluster, service="tdu-svc", taskDefinition="tdu-td:2")
+
+    # New tasks should be on the new TD
+    new_tasks = ecs.list_tasks(cluster=cluster, serviceName="tdu-svc")
+    assert len(new_tasks["taskArns"]) == 2
+
+    # Verify all running tasks use the new task definition
+    desc = ecs.describe_tasks(cluster=cluster, tasks=new_tasks["taskArns"])
+    for t in desc["tasks"]:
+        assert t["taskDefinitionArn"] == new_td_arn, \
+            f"Task still on old TD: {t['taskDefinitionArn']}"
+        assert t["lastStatus"] == "RUNNING"
+
+    # Old tasks should be stopped
+    old_desc = ecs.describe_tasks(cluster=cluster, tasks=old_tasks["taskArns"])
+    for t in old_desc["tasks"]:
+        assert t["lastStatus"] == "STOPPED"
+
+    # Service should reflect correct counts
+    svc = ecs.describe_services(cluster=cluster, services=["tdu-svc"])
+    assert svc["services"][0]["runningCount"] == 2
+
+
+def test_ecs_service_delete_stops_tasks(ecs):
+    """Deleting a service should stop all its tasks."""
+    cluster = "del-c"
+    ecs.create_cluster(clusterName=cluster)
+    ecs.register_task_definition(
+        family="del-td",
+        containerDefinitions=[{"name": "app", "image": "nginx", "cpu": 64, "memory": 128}],
+    )
+    ecs.create_service(
+        cluster=cluster, serviceName="del-svc", taskDefinition="del-td", desiredCount=2,
+    )
+    tasks = ecs.list_tasks(cluster=cluster, serviceName="del-svc")
+    assert len(tasks["taskArns"]) == 2
+
+    ecs.delete_service(cluster=cluster, service="del-svc", force=True)
+    tasks_after = ecs.list_tasks(cluster=cluster, serviceName="del-svc")
+    assert len(tasks_after["taskArns"]) == 0
+
+    # Verify tasks are STOPPED, not deleted
+    desc = ecs.describe_tasks(cluster=cluster, tasks=tasks["taskArns"])
+    for t in desc["tasks"]:
+        assert t["lastStatus"] == "STOPPED"
+
+
+def test_ecs_service_scale_to_zero(ecs):
+    """Scaling to zero should stop all tasks without deleting the service."""
+    cluster = "z-c"
+    ecs.create_cluster(clusterName=cluster)
+    ecs.register_task_definition(
+        family="z-td",
+        containerDefinitions=[{"name": "app", "image": "nginx", "cpu": 64, "memory": 128}],
+    )
+    ecs.create_service(
+        cluster=cluster, serviceName="z-svc", taskDefinition="z-td", desiredCount=2,
+    )
+    ecs.update_service(cluster=cluster, service="z-svc", desiredCount=0)
+
+    tasks = ecs.list_tasks(cluster=cluster, serviceName="z-svc")
+    assert len(tasks["taskArns"]) == 0
+
+    resp = ecs.describe_services(cluster=cluster, services=["z-svc"])
+    svc = resp["services"][0]
+    assert svc["status"] == "ACTIVE"
+    assert svc["desiredCount"] == 0
+    assert svc["runningCount"] == 0
+
+
+def test_ecs_cluster_task_counts(ecs):
+    """Cluster runningTasksCount should reflect service-spawned tasks."""
+    cluster = "ct-c"
+    ecs.create_cluster(clusterName=cluster)
+    ecs.register_task_definition(
+        family="ct-td",
+        containerDefinitions=[{"name": "app", "image": "nginx", "cpu": 64, "memory": 128}],
+    )
+    ecs.create_service(
+        cluster=cluster, serviceName="ct-svc", taskDefinition="ct-td", desiredCount=3,
+    )
+    resp = ecs.describe_clusters(clusters=[cluster])
+    cl = resp["clusters"][0]
+    assert cl["runningTasksCount"] == 3
+    assert cl["activeServicesCount"] == 1
+
+
+def test_ecs_cfn_service_visible(ecs, cfn):
+    """Services created via CloudFormation should be visible in list-services and list-tasks."""
+    stack_name = "ecs-cfn-test"
+    template = json.dumps({
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "Cluster": {
+                "Type": "AWS::ECS::Cluster",
+                "Properties": {"ClusterName": "cfn-ecs-c"},
+            },
+            "TaskDef": {
+                "Type": "AWS::ECS::TaskDefinition",
+                "Properties": {
+                    "Family": "cfn-ecs-td",
+                    "ContainerDefinitions": [
+                        {"Name": "app", "Image": "nginx", "Cpu": 64, "Memory": 128},
+                    ],
+                },
+            },
+            "Service": {
+                "Type": "AWS::ECS::Service",
+                "DependsOn": ["Cluster", "TaskDef"],
+                "Properties": {
+                    "Cluster": {"Ref": "Cluster"},
+                    "ServiceName": "cfn-ecs-svc",
+                    "TaskDefinition": {"Ref": "TaskDef"},
+                    "DesiredCount": 1,
+                    "LaunchType": "EC2",
+                },
+            },
+        },
+    })
+    cfn.create_stack(StackName=stack_name, TemplateBody=template)
+
+    # Verify service is visible
+    svcs = ecs.list_services(cluster="cfn-ecs-c")
+    assert any("cfn-ecs-svc" in a for a in svcs["serviceArns"]), \
+        f"Service not found in list_services: {svcs['serviceArns']}"
+
+    # Verify tasks were spawned
+    tasks = ecs.list_tasks(cluster="cfn-ecs-c")
+    assert len(tasks["taskArns"]) >= 1, "No tasks spawned for CF-created service"
+
+    # Cleanup
+    cfn.delete_stack(StackName=stack_name)

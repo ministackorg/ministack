@@ -1517,7 +1517,67 @@ def test_cognito_groups_in_auth_tokens(cognito_idp):
     access_claims = _decode_jwt_payload(result["AccessToken"])
     assert "cognito:groups" in access_claims, "cognito:groups missing from access token"
     assert sorted(access_claims["cognito:groups"]) == ["admin", "readers"]
+    assert "scope" in access_claims, "scope missing from access token"
+    assert access_claims["scope"] == "aws.cognito.signin.user.admin"
 
     id_claims = _decode_jwt_payload(result["IdToken"])
     assert "cognito:groups" in id_claims, "cognito:groups missing from id token"
     assert sorted(id_claims["cognito:groups"]) == ["admin", "readers"]
+
+
+def test_cognito_access_token_scope_no_groups(cognito_idp):
+    """AccessToken includes scope claim even when user has no groups."""
+    import base64
+    pid = cognito_idp.create_user_pool(PoolName="ScopePool")["UserPool"]["Id"]
+    cid = cognito_idp.create_user_pool_client(
+        UserPoolId=pid, ClientName="scope-app",
+        ExplicitAuthFlows=["ALLOW_USER_PASSWORD_AUTH", "ALLOW_REFRESH_TOKEN_AUTH"],
+    )["UserPoolClient"]["ClientId"]
+    cognito_idp.admin_create_user(
+        UserPoolId=pid, Username="scopeuser",
+        TemporaryPassword="Temp1234!", MessageAction="SUPPRESS",
+    )
+    cognito_idp.admin_set_user_password(
+        UserPoolId=pid, Username="scopeuser", Password="Scope1234!", Permanent=True,
+    )
+    auth = cognito_idp.initiate_auth(
+        ClientId=cid, AuthFlow="USER_PASSWORD_AUTH",
+        AuthParameters={"USERNAME": "scopeuser", "PASSWORD": "Scope1234!"},
+    )
+    payload = auth["AuthenticationResult"]["AccessToken"].split(".")[1]
+    payload += "=" * (4 - len(payload) % 4)
+    claims = json.loads(base64.urlsafe_b64decode(payload))
+    assert claims["scope"] == "aws.cognito.signin.user.admin"
+    assert "cognito:groups" not in claims  # no groups = no claim
+
+
+def test_cognito_admin_set_password_by_sub(cognito_idp):
+    """AdminSetUserPassword works with sub UUID, not just username."""
+    pid = cognito_idp.create_user_pool(PoolName="SubPassPool")["UserPool"]["Id"]
+    cognito_idp.admin_create_user(
+        UserPoolId=pid, Username="subpassuser",
+        UserAttributes=[{"Name": "email", "Value": "subpass@test.com"}],
+    )
+    user = cognito_idp.admin_get_user(UserPoolId=pid, Username="subpassuser")
+    sub = next(a["Value"] for a in user["UserAttributes"] if a["Name"] == "sub")
+    # Set password using sub UUID
+    cognito_idp.admin_set_user_password(
+        UserPoolId=pid, Username=sub, Password="NewPass1234!", Permanent=True,
+    )
+    # Verify user still accessible
+    user2 = cognito_idp.admin_get_user(UserPoolId=pid, Username=sub)
+    assert user2["Username"] == "subpassuser"
+
+
+def test_cognito_admin_disable_by_sub(cognito_idp):
+    """AdminDisableUser works with sub UUID."""
+    pid = cognito_idp.create_user_pool(PoolName="SubDisPool")["UserPool"]["Id"]
+    cognito_idp.admin_create_user(
+        UserPoolId=pid, Username="subdisuser",
+        UserAttributes=[{"Name": "email", "Value": "subdis@test.com"}],
+    )
+    user = cognito_idp.admin_get_user(UserPoolId=pid, Username="subdisuser")
+    sub = next(a["Value"] for a in user["UserAttributes"] if a["Name"] == "sub")
+    cognito_idp.admin_disable_user(UserPoolId=pid, Username=sub)
+    user2 = cognito_idp.admin_get_user(UserPoolId=pid, Username=sub)
+    assert user2["Enabled"] is False
