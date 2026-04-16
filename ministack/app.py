@@ -695,7 +695,7 @@ def _stop_docker_containers():
         client = docker.from_env()
     except Exception:
         return
-    for label in ("ministack=rds", "ministack=ecs", "ministack=elasticache", "ministack=eks"):
+    for label in ("ministack=rds", "ministack=ecs", "ministack=elasticache", "ministack=eks", "ministack=lambda"):
         try:
             for c in client.containers.list(filters={"label": label}):
                 try:

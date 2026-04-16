@@ -29,34 +29,22 @@ import base64
 import copy
 import hashlib
 import importlib
-import io
 import json
 import logging
 import os
-import pathlib
-import random
 import re
 import subprocess
 import tempfile
 import threading
 import time
-import typing
 import zipfile
 from datetime import datetime, timezone
+from typing import Any
 from urllib.parse import unquote
 
 from ministack.core.persistence import load_state, PERSIST_STATE
 from ministack.core.responses import AccountScopedDict, get_account_id, _request_account_id, error_response_json, json_response, new_uuid
 from ministack.core.lambda_runtime import get_or_create_worker, invalidate_worker
-
-if typing.TYPE_CHECKING:
-    from mypy_boto3_lambda.type_defs import FunctionConfigurationResponseTypeDef, FunctionConfigurationTypeDef
-    from mypy_boto3_lambda.literals import RuntimeType
-    from docker.models.containers import Container
-
-    class LambdaConfigType(FunctionConfigurationResponseTypeDef):
-        ImageUri: typing.Optional[str]
-
 
 logger = logging.getLogger("lambda")
 
@@ -65,11 +53,8 @@ LAMBDA_EXECUTOR = os.environ.get("LAMBDA_EXECUTOR", "local").lower()
 LAMBDA_DOCKER_VOLUME_MOUNT = os.environ.get("LAMBDA_REMOTE_DOCKER_VOLUME_MOUNT", "")
 LAMBDA_DOCKER_NETWORK = os.environ.get("LAMBDA_DOCKER_NETWORK", "")
 
-if typing.TYPE_CHECKING:
-    from docker import DockerClient
-
 try:
-    docker_lib: "DockerClient" = importlib.import_module("docker")
+    docker_lib: Any = importlib.import_module("docker")
     _docker_available = True
 except ImportError:
     docker_lib = None
@@ -82,32 +67,12 @@ _function_urls = AccountScopedDict()  # function_name -> FunctionUrlConfig dict
 _poller_started = False
 _poller_lock = threading.Lock()
 
-_containers_lock = threading.Lock()
-
-
-class ContainerScopedDict(AccountScopedDict):
-    def clear(self):
-        """Stop running ccontainers when clear"""
-        with _containers_lock:
-            for containers in self._data.values():
-                for container in containers:
-                    try:
-                        container.stop()
-                        container.remove()
-                    except Exception:
-                        pass
-        super().clear()
-
-
-_containers = ContainerScopedDict()
 
 # ── Persistence ────────────────────────────────────────────
-
 
 def get_state():
     """Return JSON-serializable state. code_zip bytes are base64-encoded."""
     from ministack.core.responses import AccountScopedDict
-
     funcs = AccountScopedDict()
     # Iterate _data directly to capture ALL accounts, not just current request context
     for scoped_key, func in _functions._data.items():
@@ -129,7 +94,6 @@ def get_state():
 def restore_state(data):
     if data:
         from ministack.core.responses import AccountScopedDict
-
         funcs = data.get("functions", {})
         if isinstance(funcs, AccountScopedDict):
             for scoped_key, func in funcs._data.items():
@@ -163,12 +127,163 @@ if _restored:
 # Wrapper script executed inside the subprocess.
 # All configuration is passed through env vars; event data arrives on stdin.
 # ---------------------------------------------------------------------------
-import ministack.core
-_WRAPPER_SCRIPT = (pathlib.Path(ministack.core.__file__).parent / "lambda_wrapper.py").read_text()
+_WRAPPER_SCRIPT = """\
+import sys, os, json
+
+sys.path.insert(0, os.environ["_LAMBDA_CODE_DIR"])
+
+_REAL_STDOUT = sys.__stdout__
+# Match AWS Lambda semantics: logs go to CloudWatch (stderr here),
+# while the Invoke response payload must be clean JSON on stdout.
+sys.stdout = sys.stderr
+
+for _ld in filter(None, os.environ.get("_LAMBDA_LAYERS_DIRS", "").split(os.pathsep)):
+    _py = os.path.join(_ld, "python")
+    if os.path.isdir(_py):
+        sys.path.insert(0, _py)
+    sys.path.insert(0, _ld)
+
+_mod_path = os.environ["_LAMBDA_HANDLER_MODULE"]
+_fn_name  = os.environ["_LAMBDA_HANDLER_FUNC"]
+
+event = json.loads(sys.stdin.read())
+
+class LambdaContext:
+    function_name        = os.environ.get("AWS_LAMBDA_FUNCTION_NAME", "")
+    memory_limit_in_mb   = int(os.environ.get("AWS_LAMBDA_FUNCTION_MEMORY_SIZE", "128"))
+    invoked_function_arn = os.environ.get("_LAMBDA_FUNCTION_ARN", "")
+    aws_request_id       = os.environ.get("AWS_LAMBDA_LOG_STREAM_NAME", "")
+    log_group_name       = "/aws/lambda/" + function_name
+    log_stream_name      = aws_request_id
+
+    @staticmethod
+    def get_remaining_time_in_millis():
+        return int(float(os.environ.get("_LAMBDA_TIMEOUT", "3")) * 1000)
+
+_mod = __import__(_mod_path)
+for _part in _mod_path.split(".")[1:]:
+    _mod = getattr(_mod, _part)
+_result = getattr(_mod, _fn_name)(event, LambdaContext())
+if _result is not None:
+    _REAL_STDOUT.write(json.dumps(_result))
+    _REAL_STDOUT.flush()
+"""
+
+# Docker variant: paths fixed to /var/task (code) and /opt (layers).
+_DOCKER_WRAPPER_SCRIPT = """\
+import sys, os, json
+
+sys.path.insert(0, "/var/task")
+
+_REAL_STDOUT = sys.__stdout__
+# Match AWS Lambda semantics: logs go to CloudWatch (stderr here),
+# while the Invoke response payload must be clean JSON on stdout.
+sys.stdout = sys.stderr
+
+for _ld in filter(None, os.environ.get("_LAMBDA_LAYERS_DIRS", "").split(":")):
+    _py = os.path.join(_ld, "python")
+    if os.path.isdir(_py):
+        sys.path.insert(0, _py)
+    sys.path.insert(0, _ld)
+
+_mod_path = os.environ["_LAMBDA_HANDLER_MODULE"]
+_fn_name  = os.environ["_LAMBDA_HANDLER_FUNC"]
+
+event = json.loads(sys.stdin.read())
+
+class LambdaContext:
+    function_name        = os.environ.get("AWS_LAMBDA_FUNCTION_NAME", "")
+    memory_limit_in_mb   = int(os.environ.get("AWS_LAMBDA_FUNCTION_MEMORY_SIZE", "128"))
+    invoked_function_arn = os.environ.get("_LAMBDA_FUNCTION_ARN", "")
+    aws_request_id       = os.environ.get("AWS_LAMBDA_LOG_STREAM_NAME", "")
+    log_group_name       = "/aws/lambda/" + function_name
+    log_stream_name      = aws_request_id
+
+    @staticmethod
+    def get_remaining_time_in_millis():
+        return int(float(os.environ.get("_LAMBDA_TIMEOUT", "3")) * 1000)
+
+_mod = __import__(_mod_path)
+for _part in _mod_path.split(".")[1:]:
+    _mod = getattr(_mod, _part)
+_result = getattr(_mod, _fn_name)(event, LambdaContext())
+if _result is not None:
+    _REAL_STDOUT.write(json.dumps(_result))
+    _REAL_STDOUT.flush()
+"""
+
 
 # Node.js wrapper — written to the code dir and executed with `node`.
 # Reads event from stdin, calls handler, writes JSON result to stdout.
-_NODE_WRAPPER_SCRIPT = (pathlib.Path(ministack.core.__file__).parent / "lambda_wrapper_node.js").read_text()
+_NODE_WRAPPER_SCRIPT = """\
+const fs = require('fs');
+const path = require('path');
+const { pathToFileURL } = require('url');
+
+const codeDir = process.env._LAMBDA_CODE_DIR || '/var/task';
+const modPath  = process.env._LAMBDA_HANDLER_MODULE;
+const fnName   = process.env._LAMBDA_HANDLER_FUNC;
+
+// Prepend layer dirs to NODE_PATH
+const layerDirs = (process.env._LAMBDA_LAYERS_DIRS || '').split(path.delimiter).filter(Boolean);
+const nodePaths = layerDirs.map(d => path.join(d, 'nodejs', 'node_modules'))
+                           .concat(layerDirs)
+                           .concat([path.join(codeDir, 'node_modules'), codeDir]);
+module.paths.unshift(...nodePaths);
+
+const context = {
+  functionName:       process.env.AWS_LAMBDA_FUNCTION_NAME || '',
+  memoryLimitInMB:    process.env.AWS_LAMBDA_FUNCTION_MEMORY_SIZE || '128',
+  invokedFunctionArn: process.env._LAMBDA_FUNCTION_ARN || '',
+  awsRequestId:       process.env.AWS_LAMBDA_LOG_STREAM_NAME || '',
+  logGroupName:       '/aws/lambda/' + (process.env.AWS_LAMBDA_FUNCTION_NAME || ''),
+  logStreamName:      process.env.AWS_LAMBDA_LOG_STREAM_NAME || '',
+  getRemainingTimeInMillis: () => parseFloat(process.env._LAMBDA_TIMEOUT || '3') * 1000,
+};
+
+let input = '';
+process.stdin.on('data', d => input += d);
+process.stdin.on('end', async () => {
+  const event = JSON.parse(input);
+  const fullPath = path.resolve(codeDir, modPath);
+  let mod;
+  let resolvedPath;
+  try {
+    resolvedPath = require.resolve(fullPath);
+    mod = require(resolvedPath);
+  } catch (reqErr) {
+    if (reqErr.code === 'ERR_REQUIRE_ESM' && resolvedPath) {
+      mod = await import(pathToFileURL(resolvedPath).href);
+    } else if (reqErr.code === 'MODULE_NOT_FOUND') {
+      const mjsPath = fullPath + '.mjs';
+      const missingHandlerEntry =
+        (reqErr.message && reqErr.message.includes("'" + fullPath + "'")) ||
+        (resolvedPath && reqErr.message && reqErr.message.includes("'" + resolvedPath + "'"));
+      if (missingHandlerEntry && fs.existsSync(mjsPath)) {
+        mod = await import(pathToFileURL(mjsPath).href);
+      } else {
+        throw reqErr;
+      }
+    } else {
+      throw reqErr;
+    }
+  }
+  const handler = mod[fnName] || (mod.default && mod.default[fnName]) || mod.default;
+  if (typeof handler !== 'function') {
+    process.stderr.write(
+      "Handler '" + fnName + "' in module '" + modPath + "' is undefined or not a function"
+    );
+    process.exit(1);
+  }
+  Promise.resolve(handler(event, context)).then(result => {
+    if (result !== undefined) process.stdout.write(JSON.stringify(result));
+  }).catch(err => {
+    process.stderr.write(String(err.stack || err));
+    process.exit(1);
+  });
+});
+"""
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -239,7 +354,6 @@ def _fetch_code_from_s3(bucket: str, key: str) -> bytes | None:
     """Fetch Lambda code zip from the in-memory S3 service."""
     try:
         from ministack.services import s3 as s3_svc
-
         obj = s3_svc._get_object_data(bucket, key)
         if obj is not None:
             return obj
@@ -248,7 +362,7 @@ def _fetch_code_from_s3(bucket: str, key: str) -> bytes | None:
     return None
 
 
-def _build_config(name: str, data: dict, code_zip: bytes | None = None) -> "LambdaConfigType":
+def _build_config(name: str, data: dict, code_zip: bytes | None = None) -> dict:
     code_size = len(code_zip) if code_zip else 0
     code_sha = base64.b64encode(hashlib.sha256(code_zip).digest()).decode() if code_zip else ""
     is_image = data.get("PackageType", "Zip") == "Image"
@@ -260,58 +374,33 @@ def _build_config(name: str, data: dict, code_zip: bytes | None = None) -> "Lamb
         elif isinstance(layer, dict):
             layers_cfg.append(layer)
 
-    env = data.get("Environment", {"Variables": {}})
+    env = data.get("Environment")
+    if env is not None and "Variables" not in env:
+        env["Variables"] = {}
 
-    config: "LambdaConfigType" = {
-        "Architectures": data.get("Architectures", ["x86_64"]),
-        "CapacityProviderConfig": {
-            "LambdaManagedInstancesCapacityProviderConfig": {"CapacityProviderArn": "lambda-default"}
-        },
-        "ConfigSha256": data.get("LambdaConfigSha256", ""),
-        "CodeSha256": code_sha,
-        "CodeSize": code_size,
-        "DeadLetterConfig": data.get("DeadLetterConfig", {}),
-        "Description": data.get("Description", ""),
-        "DurableConfig": data.get("DurableConfig", {}),
-        "Environment": env,
-        "EphemeralStorage": data.get("EphemeralStorage", {"Size": 512}),
-        "FileSystemConfigs": data.get("FileSystemConfigs", []),
-        "FunctionArn": _func_arn(name),
+    config = {
         "FunctionName": name,
-        "Handler": data.get("Handler", "" if is_image else "index.handler"),
-        "ImageConfigResponse": {},
-        "ImageUri": data.get("ImageUri", ""),
-        "KMSKeyArn": data.get("KMSKeyArn", ""),
-        "LastModified": _now_iso(),
-        "LastUpdateStatus": "Successful",
-        "LastUpdateStatusReason": "",
-        "LastUpdateStatusReasonCode": data.get("LastUpdateStatusReasonCode", ""),
-        "Layers": layers_cfg,
-        "LoggingConfig": data.get(
-            "LoggingConfig",
-            {
-                "LogFormat": "Text",
-                "LogGroup": f"/aws/lambda/{name}",
-            },
-        ),
-        "MasterArn": data.get("MasterArn", ""),
-        "MemorySize": data.get("MemorySize", 128),
-        "PackageType": data.get("PackageType", "Zip"),
+        "FunctionArn": _func_arn(name),
+        "Runtime": data.get("Runtime", "" if is_image else "python3.12"),
         "Role": data.get("Role", f"arn:aws:iam::{get_account_id()}:role/lambda-role"),
-        "Runtime": data.get("Runtime", "" if is_image else "python3.9"),
-        "SigningJobArn": data.get("SigningJobArn", ""),
-        "SigningProfileVersionArn": data.get("SigningProfileVersionArn", ""),
+        "Handler": data.get("Handler", "" if is_image else "index.handler"),
+        "CodeSize": code_size,
+        "CodeSha256": code_sha,
+        "Description": data.get("Description", ""),
+        "Timeout": data.get("Timeout", 3),
+        "MemorySize": data.get("MemorySize", 128),
+        "LastModified": _now_iso(),
+        "Version": "$LATEST",
         "State": "Active",
         "StateReason": "",
-        "StateReasonCode": data.get("StateReasonCode", "Idle"),
-        "ResponseMetadata": data.get("ResponseMetadata", {}),
-        "RevisionId": new_uuid(),
-        "RuntimeVersionConfig": data.get("RuntimeVersionConfig", {}),
-        "SnapStart": {"ApplyOn": "None", "OptimizationStatus": "Off"},
-        "TenancyConfig": data.get("TenancyConfig", {}),
-        "Timeout": data.get("Timeout", 3),
+        "StateReasonCode": "",
+        "LastUpdateStatus": "Successful",
+        "LastUpdateStatusReason": "",
+        "LastUpdateStatusReasonCode": "",
+        "PackageType": data.get("PackageType", "Zip"),
+        "Architectures": data.get("Architectures", ["x86_64"]),
+        "Layers": layers_cfg,
         "TracingConfig": data.get("TracingConfig", {"Mode": "PassThrough"}),
-        "Version": "$LATEST",
         "VpcConfig": data.get(
             "VpcConfig",
             {
@@ -320,8 +409,29 @@ def _build_config(name: str, data: dict, code_zip: bytes | None = None) -> "Lamb
                 "VpcId": "",
             },
         ),
+        "KMSKeyArn": data.get("KMSKeyArn", ""),
+        "RevisionId": new_uuid(),
+        "EphemeralStorage": data.get("EphemeralStorage", {"Size": 512}),
+        "SnapStart": {"ApplyOn": "None", "OptimizationStatus": "Off"},
+        "LoggingConfig": data.get(
+            "LoggingConfig",
+            {
+                "LogFormat": "Text",
+                "LogGroup": f"/aws/lambda/{name}",
+            },
+        ),
+        "RuntimeVersionConfig": {
+            "RuntimeVersionArn": "",
+        },
     }
+    if env is not None:
+        config["Environment"] = env
+    dlc = data.get("DeadLetterConfig")
+    if dlc and dlc.get("TargetArn"):
+        config["DeadLetterConfig"] = dlc
     return config
+
+
 
 
 def _qp_first(query_params: dict, key: str, default: str = "") -> str:
@@ -872,7 +982,7 @@ async def _invoke(name: str, event: dict, headers: dict, path_qualifier: str | N
 
     # RequestResponse — execute in worker thread so nested SDK calls
     # from the Lambda process can still reach this ASGI server.
-    result = await asyncio.to_thread(_execute_function, exec_record, event, async_mode=False)
+    result = await asyncio.to_thread(_execute_function, exec_record, event)
 
     resp_headers: dict = {
         "Content-Type": "application/json",
@@ -936,290 +1046,285 @@ def _docker_image_for_runtime(runtime: str) -> str | None:
 
 
 # ---------------------------------------------------------------------------
-# Function execution – Docker mode
+# Function execution – Docker mode (RIE with warm containers)
 # ---------------------------------------------------------------------------
 
-
-def _get_function_code(config: "LambdaConfigType") -> str:
-    "Get a unique path for lambda with package type zip"
-    func_name = config["FunctionName"]
-    sha256 = config["CodeSha256"]
-    return f"/var/task/{func_name}/{sha256}-code"
+# Warm container cache: {cache_key: {"container": Container, "last_used": float}}
+_warm_containers: dict[str, dict] = {}
+_warm_containers_lock = threading.Lock()
+_WARM_CONTAINER_TTL = 300  # 5 minutes, matching AWS warm container behaviour
 
 
-def _get_image_key(config: "LambdaConfigType") -> str:
-    "Get a unique path for a lambda with package type image"
-    if (image_uri := config.get("ImageUri")) is None:
-        raise ValueError("ImageUri is required for Image package type")
-    version = config["Version"]
-    return f"/var/task/{image_uri}/{version}"
+def _warm_container_key(func_name: str, code_sha: str) -> str:
+    return f"{func_name}:{code_sha}"
 
 
-def _execute_function_docker_rie(func: LambdaFunc, event: dict, async_mode: bool = True) -> dict:
-    """
-    Execute docker using AWS Runtime Interface Emulator (RIE). This allows us to
-    run the Lambda function in an environment very close to the actual Lambda
-    runtime, using the same base images and emulation layer as AWS.
-    If there is a running one, which is not doing something, we will
-    reuse it.
-    """
-    if not _docker_available:
-        return {
-            "body": {
-                "errorMessage": "Docker is required for Image-based Lambda functions",
-                "errorType": "Runtime.DockerUnavailable",
-            },
-            "error": True,
-        }
-    config = func["config"]
-    func_name = config["FunctionName"]
-    version = config["Version"]
-    # Need to modify key for package type image.
-    container_key = _get_function_code(config) if config["PackageType"] == "Zip" else _get_image_key(config)
-    with _containers_lock:
-        _containers.setdefault(container_key, [])
-        # Gert a local copy
-        containers = _containers[container_key].copy()
-
-    # Shuffle order to divide the load
-    random.shuffle(containers)
-
-    for container in containers:
-        container.reload()
-        if container.status == "running":
-            try:
-                ret = _invoke_function_in_running_container(container, event, async_mode=async_mode, tries=1)
-                logger.info("Successfully reused container for function %s (version: %s)", func_name, version)
-                return ret
-            except Exception as e:
-                logger.info(
-                    "Could not reuse container (most likely busy) for function %s (version: %s): %s",
-                    func_name,
-                    version,
-                    e,
-                )
-    container, ret = _invoke_function_in_container(func, event, async_mode=async_mode)
-    if container:
-        with _containers_lock:
-            _containers[container_key].append(container)
-    logger.info("Started container for function %s (version: %s)", func_name, version)
-    return ret
-
-
-def _get_aws_endpoint_url() -> str | None:
-    return _normalize_endpoint_url(
-        os.environ.get(
-            "AWS_ENDPOINT_URL",
-            _normalize_endpoint_url(
-                os.environ.get("AWS_ENDPOINT_URL", _normalize_endpoint_url(os.environ.get("LOCALSTACK_HOSTNAME", "")))
-            ),
-        )
-    )
-
-
-def _invoke_function_in_container(
-    func: LambdaFunc, event: dict, async_mode: bool = True, tries=5
-) -> "tuple[Container | None, dict]":
-    config = func["config"]
-    func_name = config["FunctionName"]
-    runtime = config["Runtime"]
-    sha256 = config["CodeSha256"]
-    code_zip = func["code_zip"]
-
-    running_ministack_in_container = os.path.exists("/run/.containerenv") or os.path.exists("/.dockerenv")
-
-    mounts = []
-    env_vars = config["Environment"].get("Variables") or {}
-    match config["PackageType"]:
-        case "Zip":
-            image = _RUNTIME_IMAGE_MAP[runtime]
-            if code_zip is None:
-                return None, {
-                    "body": {
-                        "errorMessage": "No code found for Zip package type",
-                        "errorType": "Runtime.NoCode",
-                    },
-                    "error": True,
-                }
-            function_code = _get_function_code(config)
-            # We need volume mount for the code.
-            if not LAMBDA_DOCKER_VOLUME_MOUNT:
-                return None, {
-                    "body": {
-                        "errorMessage": "LAMBDA_DOCKER_VOLUME_MOUNT must be set to use lambda Docker execution",
-                        "errorType": "Runtime.MissingConfiguration",
-                    },
-                    "error": True,
-                }
-
-            if running_ministack_in_container and not LAMBDA_DOCKER_NETWORK:
-                raise RuntimeError(
-                    "LAMBDA_DOCKER_NETWORK must be set when running inside a container to use lambda Docker execution"
-                )
-            if not os.path.exists(function_code):
-                os.makedirs(function_code)
-                with zipfile.ZipFile(io.BytesIO(code_zip)) as zf:
-                    zf.extractall(function_code)
-            # Need the mount to be read-write for RIE to work, but we can set the
-            # container side to read-only
-            mounts.append(
-                dict(
-                    type="volume",
-                    source=LAMBDA_DOCKER_VOLUME_MOUNT,
-                    target="/var/task",
-                    volume_subpath=function_code[1:],
-                    read_only=True,
-                )
-            )
-            function_code_abs = os.path.abspath(function_code)
-            env_vars.update(
-                {
-                    "LAMBDA_TASK_ROOT": function_code_abs,
-                    "AWS_LAMBDA_FUNCTION_NAME": config["FunctionName"],
-                    "AWS_LAMBDA_FUNCTION_MEMORY_SIZE": str(config.get("MemorySize", 128)),
-                    "AWS_LAMBDA_FUNCTION_VERSION": config.get("Version", "$LATEST"),
-                }
-            )
-        case "Image":
-            image_uri = config.get("ImageUri")
-            # We need volume mount for the layers.
-            if config["Layers"] and not LAMBDA_DOCKER_VOLUME_MOUNT:
-                return None, {
-                    "body": {
-                        "errorMessage": "LAMBDA_DOCKER_VOLUME_MOUNT must be set to use lambda Docker execution",
-                        "errorType": "Runtime.MissingConfiguration",
-                    },
-                    "error": True,
-                }
-            if not image_uri:
-                return None, {
-                    "body": {
-                        "errorMessage": "ImageUri is required for Image package type",
-                        "errorType": "InvalidConfiguration",
-                    },
-                    "error": True,
-                }
-            image = image_uri
-            env_vars = {}
-
-    def _wait_for_container_running(container: "Container", timeout: int = 30, interval: float = 0.2):
-        start = time.time()
-        while time.time() - start < timeout:
+def _get_warm_container(key: str):
+    """Return a running warm container for the key, or None."""
+    with _warm_containers_lock:
+        entry = _warm_containers.get(key)
+        if not entry:
+            return None
+        container = entry["container"]
+        try:
             container.reload()
             if container.status == "running":
-                break
-            time.sleep(interval)
-        else:
-            raise TimeoutError("Container did not reach running state")
+                entry["last_used"] = time.time()
+                return container
+        except Exception:
+            pass
+        # Container dead — remove from cache
+        _warm_containers.pop(key, None)
+        return None
 
-    # If we have layers, we need to extract them and mount them under /opt
-    if config.get("Layers"):
-        function_layers = f"/var/task/{func_name}/{sha256}-layers"
-        if not os.path.exists(function_layers):
-            os.mkdir(function_layers)
-            for layer_ref in config["Layers"]:
-                layer_arn_str = layer_ref.get("Arn", "")
-                layer_zip = _resolve_layer_zip(layer_arn_str)
-                if layer_zip:
-                    layer_name = function_layers + "/" + layer_arn_str.split(":")[-1]
-                    with zipfile.ZipFile(io.BytesIO(layer_zip)) as zf:
-                        zf.extractall(layer_name)
 
-        mounts.append(
-            dict(
-                type="volume",
-                source=LAMBDA_DOCKER_VOLUME_MOUNT,
-                target="/opt",
-                volume_subpath=function_layers[1:],
-                read_only=True,
+def _cache_warm_container(key: str, container):
+    """Store a running container in the warm cache."""
+    with _warm_containers_lock:
+        # Evict old entry if exists
+        old = _warm_containers.pop(key, None)
+        if old:
+            try:
+                old["container"].stop(timeout=2)
+                old["container"].remove(force=True)
+            except Exception:
+                pass
+        _warm_containers[key] = {"container": container, "last_used": time.time()}
+
+
+def _cleanup_warm_containers():
+    """Remove all warm containers. Called on reset() and shutdown."""
+    with _warm_containers_lock:
+        for key, entry in list(_warm_containers.items()):
+            try:
+                entry["container"].stop(timeout=2)
+            except Exception:
+                pass
+            try:
+                entry["container"].remove(force=True)
+            except Exception:
+                pass
+        _warm_containers.clear()
+
+
+def _invoke_rie(container, event: dict, timeout: int) -> dict:
+    """POST event to a running RIE container's HTTP endpoint."""
+    import urllib.request
+    max_attempts = int(timeout * 2) + 10
+    for _attempt in range(max_attempts):
+        time.sleep(0.5)
+        container.reload()
+        if container.status != "running":
+            break
+        try:
+            networks = container.attrs.get("NetworkSettings", {}).get("Networks", {})
+            # Try Docker network first (container-to-container)
+            container_ip = None
+            if LAMBDA_DOCKER_NETWORK:
+                container_ip = networks.get(LAMBDA_DOCKER_NETWORK, {}).get("IPAddress", "")
+            if container_ip:
+                rie_url = f"http://{container_ip}:8080/2015-03-31/functions/function/invocations"
+            else:
+                ports = container.ports.get("8080/tcp") or []
+                if not ports:
+                    continue
+                rie_url = f"http://127.0.0.1:{ports[0]['HostPort']}/2015-03-31/functions/function/invocations"
+            req = urllib.request.Request(
+                rie_url, data=json.dumps(event).encode(),
+                headers={"Content-Type": "application/json"},
             )
-        )
-    # Set the task root
-    env_vars.update(
-        {
+            resp = urllib.request.urlopen(req, timeout=timeout)
+            body = resp.read().decode("utf-8", errors="replace")
+            try:
+                parsed = json.loads(body)
+            except json.JSONDecodeError:
+                parsed = body
+            logs = container.logs(stdout=True, stderr=True).decode("utf-8", errors="replace").strip()
+            return {"body": parsed, "log": logs}
+        except (urllib.error.URLError, ConnectionRefusedError, OSError):
+            continue
+    # Timed out
+    stdout = container.logs(stdout=True, stderr=True).decode("utf-8", errors="replace").strip()
+    return {
+        "body": {"errorMessage": f"Lambda RIE failed: {stdout[:500]}", "errorType": "Runtime.ExitError"},
+        "error": True, "log": stdout,
+    }
+
+
+def _execute_function_docker(func: dict, event: dict) -> dict:
+    """Execute a Lambda function inside a Docker container using AWS RIE.
+
+    All runtimes (Python, Node.js, provided) use the official AWS Lambda
+    Runtime Interface Emulator images. The handler is passed as CMD, and
+    the event is POSTed to the RIE HTTP endpoint on port 8080 — matching
+    exact AWS Lambda execution semantics.
+
+    Containers are kept warm between invocations (like real AWS) and reused
+    when the same function+code is invoked again. Warm containers are cleaned
+    up on reset() and shutdown.
+    """
+    config = func.get("config") or func
+    runtime = config.get("Runtime", "python3.12")
+
+    if not _docker_available:
+        if runtime.startswith("python") or runtime.startswith("nodejs"):
+            logger.warning("docker SDK unavailable - falling back to warm executor (node/py detected)")
+            return _execute_function_warm(func, event)
+        logger.warning("docker SDK unavailable - falling back to local subprocess executor")
+        return _execute_function_local(func, event)
+
+    code_zip = func.get("code_zip")
+    if not code_zip:
+        return {"body": {"statusCode": 200, "body": "Mock response - no code deployed"}}
+
+    handler = config["Handler"]
+    timeout = config.get("Timeout", 3)
+    env_vars = config.get("Environment", {}).get("Variables", {})
+    code_sha = config.get("CodeSha256", "")
+
+    image = _docker_image_for_runtime(runtime)
+    if image is None:
+        return {"body": {"statusCode": 200, "body": f"Mock response - {runtime} not supported for docker execution"}}
+
+    # Try reusing a warm container
+    cache_key = _warm_container_key(config["FunctionName"], code_sha)
+    warm = _get_warm_container(cache_key)
+    if warm:
+        try:
+            result = _invoke_rie(warm, event, timeout)
+            if not result.get("error"):
+                logger.debug("Lambda %s: warm RIE container reused", config["FunctionName"])
+                return result
+        except Exception:
+            pass
+        # Warm container failed — kill it, start fresh
+        with _warm_containers_lock:
+            _warm_containers.pop(cache_key, None)
+        try:
+            warm.stop(timeout=2)
+            warm.remove(force=True)
+        except Exception:
+            pass
+
+    # Cold start — create new container
+    try:
+        client = docker_lib.from_env()
+    except Exception as exc:
+        logger.warning("Cannot connect to Docker daemon (%s) – falling back to local subprocess", exc)
+        return _execute_function_local(func, event)
+
+    # Code and layers are extracted to a persistent temp dir (not cleaned up
+    # immediately) so the warm container can keep using the bind mounts.
+    tmpdir = tempfile.mkdtemp(prefix="ministack-lambda-docker-")
+    container = None
+    try:
+        code_dir = os.path.join(tmpdir, "code")
+        os.makedirs(code_dir)
+        with open(os.path.join(tmpdir, "code.zip"), "wb") as f:
+            f.write(code_zip)
+        with zipfile.ZipFile(os.path.join(tmpdir, "code.zip")) as zf:
+            zf.extractall(code_dir)
+
+        # For provided runtimes, ensure bootstrap is executable
+        is_provided = runtime.startswith("provided")
+        if is_provided:
+            bootstrap_path = os.path.join(code_dir, "bootstrap")
+            if os.path.exists(bootstrap_path):
+                os.chmod(bootstrap_path, 0o755)
+
+        # Extract layers
+        layers_dirs: list[str] = []
+        for layer_ref in config.get("Layers", []):
+            layer_arn_str = layer_ref if isinstance(layer_ref, str) else layer_ref.get("Arn", "")
+            layer_zip = _resolve_layer_zip(layer_arn_str)
+            if layer_zip:
+                layer_dir = os.path.join(tmpdir, f"layer_{len(layers_dirs)}")
+                os.makedirs(layer_dir)
+                with open(os.path.join(tmpdir, f"layer_{len(layers_dirs)}.zip"), "wb") as lf:
+                    lf.write(layer_zip)
+                with zipfile.ZipFile(os.path.join(tmpdir, f"layer_{len(layers_dirs)}.zip")) as lzf:
+                    lzf.extractall(layer_dir)
+                layers_dirs.append(layer_dir)
+
+        # Build mounts — RIE expects code at /var/task, layers at /opt
+        host_code_dir = LAMBDA_DOCKER_VOLUME_MOUNT or code_dir
+        mounts = [
+            docker_lib.types.Mount("/var/task", host_code_dir, type="bind", read_only=True),
+        ]
+        if is_provided:
+            mounts.append(docker_lib.types.Mount("/var/runtime", host_code_dir, type="bind", read_only=True))
+        for idx, ld in enumerate(layers_dirs):
+            mounts.append(docker_lib.types.Mount(f"/opt/layer_{idx}", ld, type="bind", read_only=True))
+
+        # Build environment
+        container_env: dict[str, str] = {
             "AWS_DEFAULT_REGION": REGION,
             "AWS_REGION": REGION,
             "AWS_ACCESS_KEY_ID": os.environ.get("AWS_ACCESS_KEY_ID", "test"),
             "AWS_SECRET_ACCESS_KEY": os.environ.get("AWS_SECRET_ACCESS_KEY", "test"),
+            "AWS_SESSION_TOKEN": os.environ.get("AWS_SESSION_TOKEN", ""),
+            "AWS_LAMBDA_FUNCTION_NAME": config["FunctionName"],
+            "AWS_LAMBDA_FUNCTION_MEMORY_SIZE": str(config["MemorySize"]),
+            "AWS_LAMBDA_FUNCTION_VERSION": config.get("Version", "$LATEST"),
             "AWS_LAMBDA_LOG_STREAM_NAME": new_uuid(),
         }
-    )
-    if endpoint := _get_aws_endpoint_url():
-        env_vars["AWS_ENDPOINT_URL"] = endpoint
-    container_port = "8080"
-    # mounts is not documented, therefore use kwargs.
-    run_kwargs: dict = {
-        "image": image,
-        "environment": env_vars,
-        "mounts": mounts,
-        "mem_limit": f"{config['MemorySize']}m",
-        "detach": True,
-        "stdin_open": False,
-    }
-    if running_ministack_in_container:
-        run_kwargs["network"] = LAMBDA_DOCKER_NETWORK
-    else:
-        run_kwargs["network_mode"] = "host"
-        run_kwargs["ports"] = {f"{container_port}/tcp": None}
+        if layers_dirs:
+            container_env["_LAMBDA_LAYERS_DIRS"] = ":".join(
+                f"/opt/layer_{i}" for i in range(len(layers_dirs))
+            )
+        container_env.update(env_vars)
+        endpoint = _normalize_endpoint_url(os.environ.get("AWS_ENDPOINT_URL", ""))
+        if not endpoint:
+            endpoint = _normalize_endpoint_url(env_vars.get("AWS_ENDPOINT_URL", ""))
+        if not endpoint:
+            endpoint = _normalize_endpoint_url(env_vars.get("LOCALSTACK_HOSTNAME", ""))
+        if endpoint:
+            container_env["AWS_ENDPOINT_URL"] = endpoint
 
-    client = docker_lib.from_env()
-    container: "Container" = client.containers.run(
-        command=[config["Handler"]], name=f"lambda_{random.randbytes(8).hex()}", **run_kwargs
-    )
-    _wait_for_container_running(container)
-    return container, _invoke_function_in_running_container(container, event, async_mode=async_mode, tries=tries)
-
-
-def _invoke_function_in_running_container(
-    container: "Container", event: dict, async_mode: bool = True, tries=5
-) -> dict:
-    import urllib.request
-    import urllib.error
-
-    container_port = "8080"
-    running_ministack_in_container = os.path.exists("/run/.containerenv") or os.path.exists("/.dockerenv")
-    localstack_hostname = os.getenv("LOCALSTACK_HOSTNAME") or "localhost"
-    if running_ministack_in_container:
-        host_name = container.name
-        host_port = container_port
-    else:
-        ports = container.ports[container_port]
-        host_port = ports[0]["HostPort"]
-        host_name = localstack_hostname
-    headers = {
-        "Content-Type": "application/json",
-    }
-    if async_mode:
-        headers["X-Amz-Invocation-Type"] = "Event"
-    try:
-        for retry in range(tries):
-            time.sleep(0.1 * (2**retry))
-            try:
-                rie_url = f"http://{host_name}:{host_port}/2015-03-31/functions/function/invocations"
-                req = urllib.request.Request(rie_url, data=json.dumps(event).encode(), headers=headers)
-                resp = urllib.request.urlopen(req)
-                body = resp.read().decode("utf-8", errors="replace")
-                try:
-                    ret = {"body": json.loads(body)}
-                except json.JSONDecodeError:
-                    ret = {"body": body}
-
-                if async_mode:
-                    logs = container.logs(stdout=True, stderr=True).decode("utf-8", errors="replace").strip()
-                    ret["log"] = logs
-                logger.debug("Invocation successful for container %s: %s", container.name, ret)
-                return ret
-            except (urllib.error.URLError, ConnectionRefusedError, OSError):
-                logger.debug("Failed to connect to RIE endpoint, retrying... (%d)", retry + 1)
-        else:
-            raise Exception("Failed to connect to RIE endpoint after multiple retries")
-    except (urllib.error.URLError, ConnectionRefusedError, OSError):
-        stdout = container.logs(stdout=True, stderr=True).decode("utf-8", errors="replace").strip()
-        return {
-            "body": {"errorMessage": f"provided runtime failed: {stdout[:500]}", "errorType": "Runtime.ExitError"},
-            "error": True,
-            "log": stdout,
+        # RIE: pass handler as CMD, invoke via HTTP on port 8080
+        cmd = ["bootstrap"] if is_provided else [handler]
+        run_kwargs: dict = {
+            "image": image,
+            "command": cmd,
+            "environment": container_env,
+            "mounts": mounts,
+            "ports": {"8080/tcp": None},
+            "detach": True,
+            "stdin_open": False,
+            "labels": {"ministack": "lambda"},
         }
+        if LAMBDA_DOCKER_NETWORK:
+            run_kwargs["network"] = LAMBDA_DOCKER_NETWORK
+
+        container = client.containers.run(**run_kwargs)
+        result = _invoke_rie(container, event, timeout)
+
+        if not result.get("error"):
+            # Success — cache the warm container for reuse
+            _cache_warm_container(cache_key, container)
+            container = None  # prevent finally from killing it
+            logger.info("Lambda %s: cold start RIE container cached for reuse", config["FunctionName"])
+        return result
+
+    except Exception as exc:
+        if "timed out" in str(exc).lower() or "read timed out" in str(exc).lower():
+            return {
+                "body": {"errorMessage": f"Task timed out after {timeout}.00 seconds", "errorType": "Runtime.ExitError"},
+                "error": True, "log": "",
+            }
+        logger.error("Lambda docker execution error: %s", exc)
+        return {"body": {"errorMessage": str(exc), "errorType": type(exc).__name__}, "error": True, "log": ""}
+    finally:
+        # Only clean up if we're NOT caching this container
+        if container is not None:
+            try:
+                container.stop(timeout=2)
+            except Exception:
+                pass
+            try:
+                container.remove(force=True)
+            except Exception:
+                pass
 
 
 # ---------------------------------------------------------------------------
@@ -1227,14 +1332,19 @@ def _invoke_function_in_running_container(
 # ---------------------------------------------------------------------------
 
 
-def _execute_function(func: dict, event: dict, async_mode: bool = True) -> dict:
+def _execute_function(func: dict, event: dict) -> dict:
     """Dispatch to warm worker pool (Python + Node.js) or Docker executor."""
+    config = func.get("config") or func
+
+    # Image-based Lambda — always Docker
+    if config.get("PackageType") == "Image" and config.get("ImageUri"):
+        return _execute_function_image(func, event)
+
+    runtime = config.get("Runtime", "python3.12")
 
     if LAMBDA_EXECUTOR == "docker":
-        return _execute_function_docker_rie(func, event, async_mode=async_mode)  # type: ignore
+        return _execute_function_docker(func, event)
 
-    config: LambdaConfigType = func["config"]
-    runtime = config.get("Runtime", "python3.9")
     # provided runtimes (Go, Rust, etc.) — use native binary execution
     if runtime.startswith("provided"):
         return _execute_function_provided(func, event)
@@ -1277,6 +1387,116 @@ def _execute_function_warm(func: dict, event: dict) -> dict:
         }
 
 
+# ---------------------------------------------------------------------------
+# Function execution – Docker Image mode (PackageType: Image)
+# ---------------------------------------------------------------------------
+
+
+def _execute_function_image(func: dict, event: dict) -> dict:
+    """Execute a Lambda function from a user-provided Docker image.
+
+    The image must contain the Lambda Runtime Interface Client (RIC) or
+    Runtime Interface Emulator (RIE) listening on port 8080.
+    """
+    if not _docker_available:
+        return {"body": {"errorMessage": "Docker is required for Image-based Lambda functions", "errorType": "Runtime.DockerUnavailable"}, "error": True}
+
+    config = func.get("config") or func
+    image_uri = config.get("ImageUri", "")
+    timeout = config.get("Timeout", 30)
+    env_vars = config.get("Environment", {}).get("Variables", {})
+
+    try:
+        client = docker_lib.from_env()
+    except Exception as exc:
+        return {"body": {"errorMessage": f"Cannot connect to Docker: {exc}", "errorType": "Runtime.DockerError"}, "error": True}
+
+    # Use image locally if available, otherwise pull
+    try:
+        client.images.get(image_uri)
+        logger.info("Using local Lambda image: %s", image_uri)
+    except docker_lib.errors.ImageNotFound:
+        try:
+            logger.info("Pulling Lambda image: %s", image_uri)
+            client.images.pull(image_uri)
+        except Exception as exc:
+            return {"body": {"errorMessage": f"Failed to pull image {image_uri}: {exc}", "errorType": "Runtime.ImagePullError"}, "error": True}
+
+    container_env = {
+        "AWS_DEFAULT_REGION": REGION,
+        "AWS_REGION": REGION,
+        "AWS_ACCESS_KEY_ID": os.environ.get("AWS_ACCESS_KEY_ID", "test"),
+        "AWS_SECRET_ACCESS_KEY": os.environ.get("AWS_SECRET_ACCESS_KEY", "test"),
+        "AWS_LAMBDA_FUNCTION_NAME": config["FunctionName"],
+        "AWS_LAMBDA_FUNCTION_MEMORY_SIZE": str(config.get("MemorySize", 128)),
+        "AWS_LAMBDA_FUNCTION_VERSION": config.get("Version", "$LATEST"),
+        "AWS_LAMBDA_LOG_STREAM_NAME": new_uuid(),
+    }
+    container_env.update(env_vars)
+    # Override AWS_ENDPOINT_URL *after* function env vars so the
+    # Lambda container always calls back to this MiniStack instance.
+    endpoint = _normalize_endpoint_url(os.environ.get("AWS_ENDPOINT_URL", ""))
+    if not endpoint:
+        endpoint = _normalize_endpoint_url(env_vars.get("AWS_ENDPOINT_URL", ""))
+    if endpoint:
+        container_env["AWS_ENDPOINT_URL"] = endpoint
+
+    run_kwargs = {
+        "image": image_uri,
+        "environment": container_env,
+        "ports": {"8080/tcp": None},
+        "detach": True,
+    }
+    if LAMBDA_DOCKER_NETWORK:
+        run_kwargs["network"] = LAMBDA_DOCKER_NETWORK
+
+    container = client.containers.run(**run_kwargs)
+    try:
+        import time as _time
+        import urllib.request
+        for _attempt in range(int(timeout * 2) + 10):
+            _time.sleep(0.5)
+            container.reload()
+            if container.status != "running":
+                break
+            try:
+                if LAMBDA_DOCKER_NETWORK:
+                    networks = container.attrs.get("NetworkSettings", {}).get("Networks", {})
+                    container_ip = networks.get(LAMBDA_DOCKER_NETWORK, {}).get("IPAddress", "")
+                    if container_ip:
+                        rie_url = f"http://{container_ip}:8080/2015-03-31/functions/function/invocations"
+                    else:
+                        continue
+                else:
+                    ports = container.ports.get("8080/tcp") or []
+                    if not ports:
+                        continue
+                    rie_url = f"http://127.0.0.1:{ports[0]['HostPort']}/2015-03-31/functions/function/invocations"
+                req = urllib.request.Request(rie_url, data=json.dumps(event).encode(),
+                                            headers={"Content-Type": "application/json"})
+                resp = urllib.request.urlopen(req, timeout=timeout)
+                body = resp.read().decode("utf-8", errors="replace")
+                try:
+                    parsed = json.loads(body)
+                except json.JSONDecodeError:
+                    parsed = body
+                logs = container.logs(stdout=True, stderr=True).decode("utf-8", errors="replace").strip()
+                return {"body": parsed, "log": logs}
+            except (urllib.error.URLError, ConnectionRefusedError, OSError):
+                continue
+        stdout = container.logs(stdout=True, stderr=True).decode("utf-8", errors="replace").strip()
+        return {"body": {"errorMessage": f"Image Lambda failed: {stdout[:500]}", "errorType": "Runtime.ExitError"}, "error": True, "log": stdout}
+    finally:
+        try:
+            container.stop(timeout=2)
+        except Exception:
+            pass
+        try:
+            container.remove(force=True)
+        except Exception:
+            pass
+
+
 def _execute_function_provided(func: dict, event: dict) -> dict:
     """Execute a provided-runtime Lambda (Go/Rust binary) via a minimal Lambda Runtime API."""
     config = func.get("config") or func
@@ -1290,7 +1510,6 @@ def _execute_function_provided(func: dict, event: dict) -> dict:
     try:
         import http.server
         import socketserver
-
         with tempfile.TemporaryDirectory() as tmpdir:
             # Extract bootstrap binary
             zip_path = os.path.join(tmpdir, "code.zip")
@@ -1340,7 +1559,8 @@ def _execute_function_provided(func: dict, event: dict) -> dict:
                     if "/runtime/invocation/next" in self.path:
                         self.send_response(200)
                         self.send_header("Lambda-Runtime-Aws-Request-Id", request_id)
-                        self.send_header("Lambda-Runtime-Deadline-Ms", str(int((time.time() + timeout) * 1000)))
+                        self.send_header("Lambda-Runtime-Deadline-Ms",
+                                         str(int((time.time() + timeout) * 1000)))
                         self.send_header("Content-Type", "application/json")
                         self.end_headers()
                         self.wfile.write(event_json.encode())
@@ -1439,11 +1659,7 @@ def _execute_function_provided(func: dict, event: dict) -> dict:
                     try:
                         _, stderr_out = proc.communicate(timeout=5)
                         if stderr_out:
-                            logger.info(
-                                "Lambda %s stderr: %s",
-                                config.get("FunctionName", "?"),
-                                stderr_out.decode("utf-8", errors="replace")[:500],
-                            )
+                            logger.info("Lambda %s stderr: %s", config.get("FunctionName", "?"), stderr_out.decode("utf-8", errors="replace")[:500])
                     except Exception:
                         pass
                     if result_holder["error"]:
@@ -1456,13 +1672,7 @@ def _execute_function_provided(func: dict, event: dict) -> dict:
                     proc.kill()
                     stdout, stderr = proc.communicate(timeout=5)
                     logs = (stdout.decode("utf-8", errors="replace") + stderr.decode("utf-8", errors="replace")).strip()
-                    return {
-                        "body": {
-                            "errorMessage": f"Lambda timed out after {timeout}s: {logs[:500]}",
-                            "errorType": "Runtime.ExitError",
-                        },
-                        "error": True,
-                    }
+                    return {"body": {"errorMessage": f"Lambda timed out after {timeout}s: {logs[:500]}", "errorType": "Runtime.ExitError"}, "error": True}
             finally:
                 server.shutdown()
 
@@ -1531,13 +1741,7 @@ def _execute_function_local(func: dict, event: dict) -> dict:
                                 os.symlink(src, dst)
 
             if "." not in handler:
-                return {
-                    "body": {
-                        "errorMessage": f"Invalid handler format: {handler}",
-                        "errorType": "Runtime.InvalidEntrypoint",
-                    },
-                    "error": True,
-                }
+                return {"body": {"errorMessage": f"Invalid handler format: {handler}", "errorType": "Runtime.InvalidEntrypoint"}, "error": True}
             module_name, func_name = handler.rsplit(".", 1)
 
             if is_node:
@@ -2635,24 +2839,22 @@ def _poll_sqs():
         records = []
         for msg in batch:
             first_recv = msg.get("first_receive_at") or now
-            records.append(
-                {
-                    "messageId": msg["id"],
-                    "receiptHandle": msg["receipt_handle"],
-                    "body": msg["body"],
-                    "attributes": {
-                        "ApproximateReceiveCount": str(msg.get("receive_count", 1)),
-                        "SentTimestamp": str(int(msg["sent_at"] * 1000)),
-                        "SenderId": get_account_id(),
-                        "ApproximateFirstReceiveTimestamp": str(int(first_recv * 1000)),
-                    },
-                    "messageAttributes": msg.get("message_attributes", {}),
-                    "md5OfBody": msg.get("md5_body") or msg.get("md5") or "",
-                    "eventSource": "aws:sqs",
-                    "eventSourceARN": source_arn,
-                    "awsRegion": REGION,
-                }
-            )
+            records.append({
+                "messageId": msg["id"],
+                "receiptHandle": msg["receipt_handle"],
+                "body": msg["body"],
+                "attributes": {
+                    "ApproximateReceiveCount": str(msg.get("receive_count", 1)),
+                    "SentTimestamp": str(int(msg["sent_at"] * 1000)),
+                    "SenderId": get_account_id(),
+                    "ApproximateFirstReceiveTimestamp": str(int(first_recv * 1000)),
+                },
+                "messageAttributes": msg.get("message_attributes", {}),
+                "md5OfBody": msg.get("md5_body") or msg.get("md5") or "",
+                "eventSource": "aws:sqs",
+                "eventSourceARN": source_arn,
+                "awsRegion": REGION,
+            })
 
         event = {"Records": records}
         result = _execute_function(_functions[func_name], event)
@@ -2664,11 +2866,7 @@ def _poll_sqs():
             esm["LastProcessingResult"] = "FAILED"
             logger.warning(
                 "ESM: Lambda %s failed processing SQS batch from %s (errorType=%s errorMessage=%s)\n%s",
-                func_name,
-                queue_name,
-                err_type,
-                err_msg,
-                result.get("log", ""),
+                func_name, queue_name, err_type, err_msg, result.get("log", ""),
             )
         else:
             # Check for ReportBatchItemFailures — partial batch response
@@ -2699,13 +2897,8 @@ def _poll_sqs():
             n_failed = len(batch) - len(succeeded)
             if n_failed:
                 esm["LastProcessingResult"] = f"OK - {len(succeeded)} records, {n_failed} partial failures"
-                logger.info(
-                    "ESM: Lambda %s processed %d SQS messages from %s (%d partial failures)",
-                    func_name,
-                    len(succeeded),
-                    queue_name,
-                    n_failed,
-                )
+                logger.info("ESM: Lambda %s processed %d SQS messages from %s (%d partial failures)",
+                            func_name, len(succeeded), queue_name, n_failed)
             else:
                 esm["LastProcessingResult"] = f"OK - {len(batch)} records"
                 logger.info("ESM: Lambda %s processed %d SQS messages from %s", func_name, len(batch), queue_name)
@@ -2753,7 +2946,7 @@ def _poll_kinesis():
                 continue
 
             pos = positions[shard_id]
-            raw_records = shard["records"][pos : pos + batch_size]
+            raw_records = shard["records"][pos:pos + batch_size]
             if not raw_records:
                 continue
 
@@ -2771,24 +2964,22 @@ def _poll_kinesis():
                 else:
                     data_b64 = base64.b64encode(str(data_val).encode("utf-8")).decode("ascii")
 
-                records.append(
-                    {
-                        "kinesis": {
-                            "kinesisSchemaVersion": "1.0",
-                            "partitionKey": r["PartitionKey"],
-                            "sequenceNumber": r["SequenceNumber"],
-                            "data": data_b64,
-                            "approximateArrivalTimestamp": r["ApproximateArrivalTimestamp"],
-                        },
-                        "eventSource": "aws:kinesis",
-                        "eventVersion": "1.0",
-                        "eventID": f"{shard_id}:{r['SequenceNumber']}",
-                        "eventName": "aws:kinesis:record",
-                        "invokeIdentityArn": f"arn:aws:iam::{get_account_id()}:role/lambda-role",
-                        "awsRegion": REGION,
-                        "eventSourceARN": source_arn,
-                    }
-                )
+                records.append({
+                    "kinesis": {
+                        "kinesisSchemaVersion": "1.0",
+                        "partitionKey": r["PartitionKey"],
+                        "sequenceNumber": r["SequenceNumber"],
+                        "data": data_b64,
+                        "approximateArrivalTimestamp": r["ApproximateArrivalTimestamp"],
+                    },
+                    "eventSource": "aws:kinesis",
+                    "eventVersion": "1.0",
+                    "eventID": f"{shard_id}:{r['SequenceNumber']}",
+                    "eventName": "aws:kinesis:record",
+                    "invokeIdentityArn": f"arn:aws:iam::{get_account_id()}:role/lambda-role",
+                    "awsRegion": REGION,
+                    "eventSourceARN": source_arn,
+                })
 
             event = {"Records": records}
             result = _execute_function(_functions[func_name], event)
@@ -2800,12 +2991,7 @@ def _poll_kinesis():
                 esm["LastProcessingResult"] = "FAILED"
                 logger.warning(
                     "ESM: Lambda %s failed processing Kinesis batch from %s/%s (errorType=%s errorMessage=%s)\n%s",
-                    func_name,
-                    stream_name,
-                    shard_id,
-                    err_type,
-                    err_msg,
-                    result.get("log", ""),
+                    func_name, stream_name, shard_id, err_type, err_msg, result.get("log", ""),
                 )
             else:
                 positions[shard_id] = pos + len(raw_records)
@@ -2815,10 +3001,7 @@ def _poll_kinesis():
                     logger.info("ESM: Lambda %s output:\n%s", func_name, log_output)
                 logger.info(
                     "ESM: Lambda %s processed %d Kinesis records from %s/%s",
-                    func_name,
-                    len(raw_records),
-                    stream_name,
-                    shard_id,
+                    func_name, len(raw_records), stream_name, shard_id,
                 )
 
 
@@ -2858,7 +3041,7 @@ def _poll_dynamodb_streams():
             pos = _dynamodb_stream_positions[esm_id]
 
         batch_size = esm.get("BatchSize", 100)
-        batch = table_records[pos : pos + batch_size]
+        batch = table_records[pos:pos + batch_size]
         if not batch:
             continue
 
@@ -2872,11 +3055,7 @@ def _poll_dynamodb_streams():
             esm["LastProcessingResult"] = "FAILED"
             logger.warning(
                 "ESM: Lambda %s failed processing DynamoDB stream batch from %s (errorType=%s errorMessage=%s)\n%s",
-                func_name,
-                table_name,
-                err_type,
-                err_msg,
-                result.get("log", ""),
+                func_name, table_name, err_type, err_msg, result.get("log", ""),
             )
         else:
             with _dynamodb_stream_positions_lock:
@@ -2887,9 +3066,7 @@ def _poll_dynamodb_streams():
                 logger.info("ESM: Lambda %s output:\n%s", func_name, log_output)
             logger.info(
                 "ESM: Lambda %s processed %d DynamoDB stream records from %s",
-                func_name,
-                len(batch),
-                table_name,
+                func_name, len(batch), table_name,
             )
 
 
@@ -2967,5 +3144,5 @@ def reset():
     _function_urls.clear()
     _kinesis_positions.clear()
     _dynamodb_stream_positions.clear()
-    _containers.clear()
+    _cleanup_warm_containers()
     lambda_runtime.reset()
