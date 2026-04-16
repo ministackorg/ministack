@@ -1355,6 +1355,11 @@ def _ecr_repo_delete(physical_id, props):
 
 def _codebuild_project_create(logical_id, props, stack_name):
     name = props.get("Name") or _physical_name(stack_name, logical_id, max_len=255)
+    
+    # Pre-check for duplicates to raise exception (not just return error response)
+    if name in _codebuild._projects:
+        raise ValueError(f"CodeBuild project already exists: {name}")
+    
     data = {
         "name": name,
         "description": props.get("Description", ""),
