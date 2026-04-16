@@ -2012,6 +2012,8 @@ def _publish_layer_version(layer_name: str, data: dict):
     content = data.get("Content", {})
     if "ZipFile" in content:
         zip_data = base64.b64decode(content["ZipFile"])
+    elif "S3Bucket" in content and "S3Key" in content:
+        zip_data = _fetch_code_from_s3(content["S3Bucket"], content["S3Key"])
 
     ver_config: dict = {
         "LayerArn": _layer_arn(layer_name),
