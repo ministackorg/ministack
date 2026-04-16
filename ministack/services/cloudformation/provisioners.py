@@ -1351,6 +1351,35 @@ def _ecr_repo_delete(physical_id, props):
     _ecr._repositories.pop(physical_id, None)
 
 
+# --- CodeBuild Project provisioner ---
+
+def _codebuild_project_create(logical_id, props, stack_name):
+    name = props.get("Name") or _physical_name(stack_name, logical_id, max_len=255)
+    data = {
+        "name": name,
+        "description": props.get("Description", ""),
+        "source": props.get("Source", {"type": "NO_SOURCE"}),
+        "sourceVersion": props.get("SourceVersion", ""),
+        "artifacts": props.get("Artifacts", {"type": "NO_ARTIFACTS"}),
+        "environment": props.get("Environment", {
+            "type": "LINUX_CONTAINER",
+            "image": "aws/codebuild/standard:7.0",
+            "computeType": "BUILD_GENERAL1_SMALL",
+        }),
+        "serviceRole": props.get("ServiceRole", f"arn:aws:iam::{get_account_id()}:role/codebuild-role"),
+        "timeoutInMinutes": int(props.get("TimeoutInMinutes", 60)),
+        "tags": [{"key": t["Key"], "value": t["Value"]} for t in props.get("Tags", [])],
+        "encryptionKey": props.get("EncryptionKey", f"arn:aws:kms:{REGION}:{get_account_id()}:alias/aws/codebuild"),
+    }
+    _codebuild._create_project(data)
+    arn = _codebuild._project_arn(name)
+    return name, {"Arn": arn}
+
+
+def _codebuild_project_delete(physical_id, props):
+    _codebuild._projects.pop(physical_id, None)
+
+
 # --- IAM ManagedPolicy provisioner ---
 
 def _iam_managed_policy_create(logical_id, props, stack_name):
