@@ -907,6 +907,7 @@ def _run_task(data):
                         name=f"ministack-ecs-{task_id[:8]}-{cdef['name']}",
                         labels={"ministack": "ecs", "task_arn": task_arn},
                         network=ecs_network,
+                        command=cdef["command"]
                     )
                     task["_docker_ids"].append(container.id)
                     if i < len(task["containers"]):
