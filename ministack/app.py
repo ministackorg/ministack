@@ -24,6 +24,12 @@ from urllib.parse import parse_qs, urlparse
 _MINISTACK_HOST = os.environ.get("MINISTACK_HOST", "localhost")
 _MINISTACK_PORT = os.environ.get("GATEWAY_PORT", "4566")
 
+try:
+    from importlib.metadata import version as _pkg_version
+    _VERSION = _pkg_version("ministack")
+except Exception:
+    _VERSION = "dev"
+
 # Matches host headers like "{apiId}.execute-api.<host>" or "{apiId}.execute-api.<host>:4566"
 _EXECUTE_API_RE = re.compile(
     r"^([a-f0-9]{8})\.execute-api\." + re.escape(_MINISTACK_HOST) + r"(?::\d+)?$"
@@ -458,7 +464,7 @@ async def app(scope, receive, send):
         }, json.dumps({
             "services": {s: "available" for s in SERVICE_HANDLERS},
             "edition": "light",
-            "version": "3.0.0.dev",
+            "version": _VERSION,
         }).encode())
         return
 

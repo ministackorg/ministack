@@ -1539,6 +1539,19 @@ def _get_task_protection(data):
 
 
 # ---------------------------------------------------------------------------
+# Container instances (stub — MiniStack runs tasks as Docker containers
+# directly, there are no EC2 container instances to register)
+# ---------------------------------------------------------------------------
+
+def _list_container_instances(data):
+    return json_response({"containerInstanceArns": []})
+
+
+def _describe_container_instances(data):
+    return json_response({"containerInstances": [], "failures": []})
+
+
+# ---------------------------------------------------------------------------
 # Action map (X-Amz-Target dispatch)
 # ---------------------------------------------------------------------------
 
@@ -1588,6 +1601,8 @@ _ACTION_MAP = {
     "SubmitContainerStateChange": _submit_container_state_change,
     "SubmitAttachmentStateChanges": _submit_attachment_state_changes,
     "DiscoverPollEndpoint": _discover_poll_endpoint,
+    "ListContainerInstances": _list_container_instances,
+    "DescribeContainerInstances": _describe_container_instances,
     "UpdateTaskProtection": _update_task_protection,
     "GetTaskProtection": _get_task_protection,
 }
