@@ -1342,3 +1342,51 @@ def test_cfn_lambda_nodejs_inline_zip(cfn, lam):
 
     cfn.delete_stack(StackName="cfn-nodejs-inline")
     _wait_stack(cfn, "cfn-nodejs-inline")
+
+def test_cfn_dynamodb_stream_spec(cfn, ddb):
+    """CloudFormation DynamoDB table with StreamViewType (no StreamEnabled) must
+    have streams enabled: LatestStreamArn and StreamSpecification present on
+    describe_table, and StreamArn Fn::GetAtt output must be a valid stream ARN."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-ddb-stream-{uid}"
+    table_name = f"cfn-stream-tbl-{uid}"
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "StreamTable": {
+                "Type": "AWS::DynamoDB::Table",
+                "Properties": {
+                    "TableName": table_name,
+                    "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+                    "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+                    "BillingMode": "PAY_PER_REQUEST",
+                    # CFN standard form: StreamViewType only, no StreamEnabled
+                    "StreamSpecification": {"StreamViewType": "NEW_AND_OLD_IMAGES"},
+                },
+            },
+        },
+        "Outputs": {
+            "StreamArn": {"Value": {"Fn::GetAtt": ["StreamTable", "StreamArn"]}},
+        },
+    }
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(template))
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+
+    # StreamArn output must look like a real DynamoDB stream ARN, not the table name
+    outputs = {o["OutputKey"]: o["OutputValue"] for o in stack.get("Outputs", [])}
+    stream_arn = outputs.get("StreamArn", "")
+    assert ":dynamodb:" in stream_arn and "/stream/" in stream_arn, (
+        f"Expected a DynamoDB stream ARN, got: {stream_arn!r}"
+    )
+
+    # describe_table must expose stream info
+    desc = ddb.describe_table(TableName=table_name)["Table"]
+    assert desc.get("LatestStreamArn"), "LatestStreamArn missing from describe_table"
+    spec = desc.get("StreamSpecification", {})
+    assert spec.get("StreamViewType") == "NEW_AND_OLD_IMAGES", (
+        f"StreamViewType mismatch: {spec}"
+    )
+
+    cfn.delete_stack(StackName=stack_name)
+    _wait_stack(cfn, stack_name)
