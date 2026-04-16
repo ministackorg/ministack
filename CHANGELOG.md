@@ -12,6 +12,16 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 ### Added
 - **EventBridge Scheduler service** — full `scheduler` API: CreateSchedule, GetSchedule, UpdateSchedule, DeleteSchedule, ListSchedules, CreateScheduleGroup, GetScheduleGroup, DeleteScheduleGroup, ListScheduleGroups, TagResource, UntagResource, ListTagsForResource. Supports schedule groups, cascading deletes, name prefix/state filters, and `at()`/`cron()`/`rate()` expressions. 21 tests.
 - **CloudFormation `AWS::Scheduler::Schedule` and `AWS::Scheduler::ScheduleGroup`** — CFN/CDK stacks using EventBridge Scheduler resources now provision correctly and are queryable via the Scheduler API.
+- **CloudFormation `AWS::CodeBuild::Project`** — CDK/Terraform stacks declaring CodeBuild projects now provision correctly. Supports Name, Source, Artifacts, Environment, ServiceRole, Tags, and Fn::GetAtt Arn. Contributed by @AdigaAkhil (#352)
+- **Cognito OAuth2/OIDC managed login UI** — `/oauth2/authorize` serves a browser-based login form, `/oauth2/token` supports authorization_code (with PKCE S256/plain), refresh_token, and client_credentials grants, `/oauth2/userInfo` returns OIDC claims, `/logout` redirects to logout URI. Full hosted UI flow for local development. Contributed by @kjdev (#344)
+- **ECS `ListContainerInstances` and `DescribeContainerInstances`** — stub endpoints return empty results (MiniStack runs tasks directly as Docker containers, no EC2 container instance layer).
+
+### Fixed
+- **DynamoDB CFN StreamSpecification** — CloudFormation DynamoDB tables with `StreamViewType` but no explicit `StreamEnabled` now correctly enable streams. `Fn::GetAtt StreamArn` returns a valid stream ARN. Contributed by @davidtme (#349)
+- **IAM/STS split** — IAM and STS are now separate modules (`iam.py` and `sts.py`), each with standard `handle_request`. Eliminates the `func_name` parameter hack in the lazy loader.
+- **IAM user inline policy persistence** — `PutUserPolicy` data was not included in `get_state()`/`restore_state()`, causing inline policies to be lost on restart with `PERSIST_STATE=1`.
+- **AutoScaling state persistence** — added `get_state()`, `restore_state()`, and `reset()` to autoscaling service. ASG, launch config, policy, hook, scheduled action, and tag state is now persisted and reset correctly.
+- **Health endpoint version** — `/_ministack/health` now returns the real package version instead of hardcoded `3.0.0.dev`.
 
 ### Improved
 - **Lazy service imports** — service modules are now loaded on first request instead of at startup. Idle RAM drops from ~59 MB to ~21 MB (64% reduction). Startup time drops from ~1.2s to ~0.5s (2.5x faster). Services that are never called consume zero memory.

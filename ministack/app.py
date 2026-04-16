@@ -310,23 +310,23 @@ async def app(scope, receive, send):
 
     # Cognito OAuth2 / Managed Login UI endpoints
     if path == "/oauth2/authorize" and method == "GET":
-        status, resp_headers, resp_body = cognito.handle_oauth2_authorize(method, path, headers, query_params)
+        status, resp_headers, resp_body = _get_module("cognito").handle_oauth2_authorize(method, path, headers, query_params)
         await _send_response(send, status, resp_headers, resp_body)
         return
-    if path == "/login" and method == "POST":
-        status, resp_headers, resp_body = cognito.handle_login_submit(method, path, headers, body, query_params)
+    if path in ("/oauth2/login", "/login") and method == "POST":
+        status, resp_headers, resp_body = _get_module("cognito").handle_login_submit(method, path, headers, body, query_params)
         await _send_response(send, status, resp_headers, resp_body)
         return
     if path == "/oauth2/token" and method == "POST":
-        status, resp_headers, resp_body = cognito.handle_oauth2_token(method, path, headers, body, query_params)
+        status, resp_headers, resp_body = _get_module("cognito").handle_oauth2_token(method, path, headers, body, query_params)
         await _send_response(send, status, resp_headers, resp_body)
         return
     if path in ("/oauth2/userInfo", "/oauth2/userinfo") and method in ("GET", "POST"):
-        status, resp_headers, resp_body = cognito.handle_oauth2_userinfo(method, path, headers, body, query_params)
+        status, resp_headers, resp_body = _get_module("cognito").handle_oauth2_userinfo(method, path, headers, body, query_params)
         await _send_response(send, status, resp_headers, resp_body)
         return
     if path == "/logout" and method == "GET":
-        status, resp_headers, resp_body = cognito.handle_logout(method, path, headers, query_params)
+        status, resp_headers, resp_body = _get_module("cognito").handle_logout(method, path, headers, query_params)
         await _send_response(send, status, resp_headers, resp_body)
         return
 

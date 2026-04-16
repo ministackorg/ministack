@@ -215,6 +215,8 @@ def get_state():
         "pool_domain_map": copy.deepcopy(_pool_domain_map),
         "identity_pools": copy.deepcopy(_identity_pools),
         "identity_tags": copy.deepcopy(_identity_tags),
+        "authorization_codes": copy.deepcopy(_authorization_codes),
+        "refresh_tokens": copy.deepcopy(_refresh_tokens),
     }
 
 
@@ -224,6 +226,8 @@ def restore_state(data):
         _pool_domain_map.update(data.get("pool_domain_map", {}))
         _identity_pools.update(data.get("identity_pools", {}))
         _identity_tags.update(data.get("identity_tags", {}))
+        _authorization_codes.update(data.get("authorization_codes", {}))
+        _refresh_tokens.update(data.get("refresh_tokens", {}))
 
 
 _restored = load_state("cognito")
