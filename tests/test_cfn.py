@@ -1343,7 +1343,6 @@ def test_cfn_lambda_nodejs_inline_zip(cfn, lam):
     cfn.delete_stack(StackName="cfn-nodejs-inline")
     _wait_stack(cfn, "cfn-nodejs-inline")
 
-<<<<<<< HEAD
 def test_cfn_dynamodb_stream_spec(cfn, ddb):
     """CloudFormation DynamoDB table with StreamViewType (no StreamEnabled) must
     have streams enabled: LatestStreamArn and StreamSpecification present on
