@@ -627,6 +627,19 @@ def _sg_rule_xml(sg_id, rule, idx, is_egress=False):
     return items
 
 
+def _strip_descriptions(rule):
+    """Return a copy of rule with Description stripped from all range entries for comparison."""
+    r = dict(rule)
+    for key in ("IpRanges", "Ipv6Ranges"):
+        r[key] = [{k: v for k, v in entry.items() if k != "Description"} for entry in r.get(key, [])]
+    return r
+
+
+def _rules_match(a, b):
+    """Compare two SG rules ignoring Description fields (matches AWS behavior)."""
+    return _strip_descriptions(a) == _strip_descriptions(b)
+
+
 def _authorize_sg_ingress(p):
     sg_id = _p(p, "GroupId")
     sg = _security_groups.get(sg_id)
@@ -635,7 +648,7 @@ def _authorize_sg_ingress(p):
     rules = _parse_ip_permissions(p, "IpPermissions")
     rule_items = ""
     for r in rules:
-        if r in sg["IpPermissions"]:
+        if any(_rules_match(r, existing) for existing in sg["IpPermissions"]):
             return _error("InvalidPermission.Duplicate", "The specified rule already exists", 400)
         sg["IpPermissions"].append(r)
         idx = len(sg["IpPermissions"]) - 1
@@ -651,10 +664,7 @@ def _revoke_sg_ingress(p):
         return _error("InvalidGroup.NotFound", f"Security group {sg_id} not found", 400)
     rules = _parse_ip_permissions(p, "IpPermissions")
     for r in rules:
-        try:
-            sg["IpPermissions"].remove(r)
-        except ValueError:
-            pass
+        sg["IpPermissions"] = [e for e in sg["IpPermissions"] if not _rules_match(r, e)]
     return _xml(200, "RevokeSecurityGroupIngressResponse", "<return>true</return>")
 
 
@@ -666,7 +676,7 @@ def _authorize_sg_egress(p):
     rules = _parse_ip_permissions(p, "IpPermissions")
     rule_items = ""
     for r in rules:
-        if r not in sg["IpPermissionsEgress"]:
+        if not any(_rules_match(r, existing) for existing in sg["IpPermissionsEgress"]):
             sg["IpPermissionsEgress"].append(r)
             idx = len(sg["IpPermissionsEgress"]) - 1
             rule_items += _sg_rule_xml(sg_id, r, idx, is_egress=True)
@@ -681,10 +691,7 @@ def _revoke_sg_egress(p):
         return _error("InvalidGroup.NotFound", f"Security group {sg_id} not found", 400)
     rules = _parse_ip_permissions(p, "IpPermissions")
     for r in rules:
-        try:
-            sg["IpPermissionsEgress"].remove(r)
-        except ValueError:
-            pass
+        sg["IpPermissionsEgress"] = [e for e in sg["IpPermissionsEgress"] if not _rules_match(r, e)]
     return _xml(200, "RevokeSecurityGroupEgressResponse", "<return>true</return>")
 
 

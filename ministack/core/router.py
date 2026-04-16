@@ -210,6 +210,10 @@ SERVICE_PATTERNS = {
         "path_prefixes": ["/schedules", "/schedule-groups"],
         "credential_scope": "scheduler",
     },
+    "eks": {
+        "host_patterns": [r"eks\."],
+        "credential_scope": "eks",
+    },
 }
 
 
@@ -271,6 +275,7 @@ def detect_service(method: str, path: str, headers: dict, query_params: dict) ->
                 "appconfig": "appconfig",
                 "appconfigdata": "appconfigdata",
                 "scheduler": "scheduler",
+                "eks": "eks",
             }
             if svc_name in scope_map:
                 return scope_map[svc_name]

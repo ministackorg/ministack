@@ -292,3 +292,7 @@ def autoscaling():
 @pytest.fixture(scope="session")
 def transfer():
     return make_client("transfer")
+
+@pytest.fixture(scope="session")
+def eks():
+    return make_client("eks")

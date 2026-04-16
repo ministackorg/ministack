@@ -570,10 +570,16 @@ def _create_subnet_group(p):
         "Subnets": subnets,
         "ARN": arn,
     }
+    subnets_xml = "".join(
+        f"<Subnet><SubnetIdentifier>{s['SubnetIdentifier']}</SubnetIdentifier>"
+        f"<SubnetAvailabilityZone><Name>{s['SubnetAvailabilityZone']['Name']}</Name></SubnetAvailabilityZone>"
+        f"</Subnet>" for s in subnets
+    )
     return _xml(200, "CreateCacheSubnetGroupResponse",
         f"<CreateCacheSubnetGroupResult><CacheSubnetGroup>"
         f"<CacheSubnetGroupName>{name}</CacheSubnetGroupName>"
         f"<CacheSubnetGroupDescription>{desc}</CacheSubnetGroupDescription>"
+        f"<Subnets>{subnets_xml}</Subnets>"
         f"<ARN>{arn}</ARN>"
         f"</CacheSubnetGroup></CreateCacheSubnetGroupResult>")
 
