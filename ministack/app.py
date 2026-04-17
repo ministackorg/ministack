@@ -24,12 +24,6 @@ from urllib.parse import parse_qs, urlparse
 _MINISTACK_HOST = os.environ.get("MINISTACK_HOST", "localhost")
 _MINISTACK_PORT = os.environ.get("GATEWAY_PORT", "4566")
 
-try:
-    from importlib.metadata import version as _pkg_version
-    _VERSION = _pkg_version("ministack")
-except Exception:
-    _VERSION = "dev"
-
 # Matches host headers like "{apiId}.execute-api.<host>" or "{apiId}.execute-api.<host>:4566"
 _EXECUTE_API_RE = re.compile(
     r"^([a-f0-9]{8})\.execute-api\." + re.escape(_MINISTACK_HOST) + r"(?::\d+)?$"
@@ -46,7 +40,6 @@ _S3_VHOST_EXCLUDE_RE = re.compile(r"\.(execute-api|alb|emr|efs|elasticache|s3-co
 from ministack.core.persistence import PERSIST_STATE, load_state, save_all
 from ministack.core.responses import set_request_account_id
 from ministack.core.router import detect_service, extract_access_key_id, extract_account_id, extract_region
-<<<<<<< cf-pipes
 from ministack.services import (
     acm,
     alb,
@@ -54,7 +47,6 @@ from ministack.services import (
     autoscaling,
     apigateway_v1,
     appconfig,
-    pipes,
     appsync,
     athena,
     cloudformation,
@@ -94,59 +86,6 @@ from ministack.services import (
 )
 from ministack.services import iam_sts
 from ministack.services.iam_sts import handle_iam_request, handle_sts_request
-=======
-
-# ---------------------------------------------------------------------------
-# Lazy service loader — modules are imported on first request, not at startup.
-# This saves ~20 MB of idle RAM and speeds up boot.
-# ---------------------------------------------------------------------------
-_loaded_modules: dict = {}
-
-
-class _ErrorModule:
-    """Stub returned when a service module fails to import."""
-    def __init__(self, name: str, error: str):
-        self._name = name
-        self._error = error
-
-    async def handle_request(self, method, path, headers, body, query_params):
-        return 500, {"Content-Type": "application/json"}, \
-            json.dumps({"__type": "ServiceUnavailable",
-                        "message": f"Service module '{self._name}' failed to load: {self._error}"}).encode()
-
-    def get_state(self):
-        return {}
-
-    def restore_state(self, data):
-        pass
-
-    def load_persisted_state(self, data):
-        pass
-
-    def reset(self):
-        pass
-
-
-def _get_module(name: str):
-    """Import and cache a service module by short name (e.g. 's3', 'lambda_svc')."""
-    mod = _loaded_modules.get(name)
-    if mod is None:
-        try:
-            mod = __import__(f"ministack.services.{name}", fromlist=["handle_request"])
-        except (ModuleNotFoundError, ImportError) as e:
-            logger.warning("Service module failed to load: %s - %s", name, e)
-            mod = _ErrorModule(name, str(e))
-        _loaded_modules[name] = mod
-    return mod
-
-
-def _lazy_handler(module_name: str):
-    """Return a callable that lazily imports module_name and delegates to handle_request."""
-    async def _handler(method, path, headers, body, query_params):
-        mod = _get_module(module_name)
-        return await mod.handle_request(method, path, headers, body, query_params)
-    return _handler
->>>>>>> main
 
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
@@ -157,52 +96,50 @@ logging.basicConfig(
 logger = logging.getLogger("ministack")
 
 SERVICE_HANDLERS = {
-    "s3": _lazy_handler("s3"),
-    "sqs": _lazy_handler("sqs"),
-    "cloudformation": _lazy_handler("cloudformation"),
-    "sns": _lazy_handler("sns"),
-    "dynamodb": _lazy_handler("dynamodb"),
-    "lambda": _lazy_handler("lambda_svc"),
-    "iam": _lazy_handler("iam"),
-    "sts": _lazy_handler("sts"),
-    "secretsmanager": _lazy_handler("secretsmanager"),
-    "logs": _lazy_handler("cloudwatch_logs"),
-    "ssm": _lazy_handler("ssm"),
-    "events": _lazy_handler("eventbridge"),
-    "kinesis": _lazy_handler("kinesis"),
-    "monitoring": _lazy_handler("cloudwatch"),
-    "ses": _lazy_handler("ses"),
-    "acm": _lazy_handler("acm"),
-    "wafv2": _lazy_handler("waf"),
-    "states": _lazy_handler("stepfunctions"),
-    "ecr": _lazy_handler("ecr"),
-    "ecs": _lazy_handler("ecs"),
-    "rds": _lazy_handler("rds"),
-    "elasticache": _lazy_handler("elasticache"),
-    "glue": _lazy_handler("glue"),
-    "athena": _lazy_handler("athena"),
-    "apigateway": _lazy_handler("apigateway"),
-    "firehose": _lazy_handler("firehose"),
-    "route53": _lazy_handler("route53"),
-    "cognito-idp": _lazy_handler("cognito"),
-    "cognito-identity": _lazy_handler("cognito"),
-    "ec2": _lazy_handler("ec2"),
-    "elasticmapreduce": _lazy_handler("emr"),
-    "elasticloadbalancing": _lazy_handler("alb"),
-    "elasticfilesystem": _lazy_handler("efs"),
-    "kms": _lazy_handler("kms"),
-    "cloudfront": _lazy_handler("cloudfront"),
-    "codebuild": _lazy_handler("codebuild"),
-    "transfer": _lazy_handler("transfer"),
-    "appsync": _lazy_handler("appsync"),
-    "servicediscovery": _lazy_handler("servicediscovery"),
-    "s3files": _lazy_handler("s3files"),
-    "rds-data": _lazy_handler("rds_data"),
-    "autoscaling": _lazy_handler("autoscaling"),
-    "appconfig": _lazy_handler("appconfig"),
-    "appconfigdata": _lazy_handler("appconfig"),
-    "scheduler": _lazy_handler("scheduler"),
-    "eks": _lazy_handler("eks"),
+    "s3": s3.handle_request,
+    "sqs": sqs.handle_request,
+    "cloudformation": cloudformation.handle_request,
+    "sns": sns.handle_request,
+    "dynamodb": dynamodb.handle_request,
+    "lambda": lambda_svc.handle_request,
+    "iam": handle_iam_request,
+    "sts": handle_sts_request,
+    "secretsmanager": secretsmanager.handle_request,
+    "logs": cloudwatch_logs.handle_request,
+    "ssm": ssm.handle_request,
+    "events": eventbridge.handle_request,
+    "kinesis": kinesis.handle_request,
+    "monitoring": cloudwatch.handle_request,
+    "ses": ses.handle_request,
+    "acm": acm.handle_request,
+    "wafv2": waf.handle_request,
+    "states": stepfunctions.handle_request,
+    "ecr": ecr.handle_request,
+    "ecs": ecs.handle_request,
+    "rds": rds.handle_request,
+    "elasticache": elasticache.handle_request,
+    "glue": glue.handle_request,
+    "athena": athena.handle_request,
+    "apigateway": apigateway.handle_request,
+    "firehose": firehose.handle_request,
+    "route53": route53.handle_request,
+    "cognito-idp": cognito.handle_request,
+    "cognito-identity": cognito.handle_request,
+    "ec2": ec2.handle_request,
+    "elasticmapreduce": emr.handle_request,
+    "elasticloadbalancing": alb.handle_request,
+    "elasticfilesystem": efs.handle_request,
+    "kms": kms.handle_request,
+    "cloudfront": cloudfront.handle_request,
+    "codebuild": codebuild.handle_request,
+    "transfer": transfer.handle_request,
+    "appsync": appsync.handle_request,
+    "servicediscovery": servicediscovery.handle_request,
+    "s3files": s3files.handle_request,
+    "rds-data": rds_data.handle_request,
+    "autoscaling": autoscaling.handle_request,
+    "appconfig": appconfig.handle_request,
+    "appconfigdata": appconfig.handle_request,
 }
 
 SERVICE_NAME_ALIASES = {
@@ -258,7 +195,7 @@ BANNER = r"""
           SSM, EventBridge, Kinesis, CloudWatch, SES, SES v2, ACM, WAF v2, Step Functions,
           ECS, RDS, ElastiCache, Glue, Athena, API Gateway, Firehose, Route53,
           Cognito, EC2, EMR, EBS, EFS, ALB/ELBv2, CloudFormation, KMS, ECR, CloudFront,
-          AppSync, Cloud Map, S3 Files, RDS Data API, CodeBuild, AppConfig, Transfer, EKS
+          AppSync, Cloud Map, S3 Files, RDS Data API, CodeBuild, AppConfig, Transfer
 """
 
 
@@ -337,7 +274,8 @@ async def app(scope, receive, send):
     if path.startswith("/_ministack/lambda-layers/") and method == "GET":
         lp = path.split("/")  # ['', '_ministack', 'lambda-layers', name, ver, 'content']
         if len(lp) >= 6 and lp[5] == "content" and lp[4].isdigit():
-            status, resp_headers, resp_body = _get_module("lambda_svc").serve_layer_content(lp[3], int(lp[4]))
+            from ministack.services import lambda_svc
+            status, resp_headers, resp_body = lambda_svc.serve_layer_content(lp[3], int(lp[4]))
             await _send_response(send, status, resp_headers, resp_body)
             return
 
@@ -348,38 +286,16 @@ async def app(scope, receive, send):
             _pool_id = path.rsplit("/.well-known/jwks.json", 1)[0].lstrip("/")
             if _pool_id:
                 _region = extract_region(headers) or "us-east-1"
-                status, resp_headers, resp_body = _get_module("cognito").well_known_jwks(_pool_id)
+                status, resp_headers, resp_body = cognito.well_known_jwks(_pool_id)
                 await _send_response(send, status, resp_headers, resp_body)
                 return
         elif path.endswith("/.well-known/openid-configuration"):
             _pool_id = path.rsplit("/.well-known/openid-configuration", 1)[0].lstrip("/")
             if _pool_id:
                 _region = extract_region(headers) or "us-east-1"
-                status, resp_headers, resp_body = _get_module("cognito").well_known_openid_configuration(_pool_id, _region)
+                status, resp_headers, resp_body = cognito.well_known_openid_configuration(_pool_id, _region)
                 await _send_response(send, status, resp_headers, resp_body)
                 return
-
-    # Cognito OAuth2 / Managed Login UI endpoints
-    if path == "/oauth2/authorize" and method == "GET":
-        status, resp_headers, resp_body = _get_module("cognito").handle_oauth2_authorize(method, path, headers, query_params)
-        await _send_response(send, status, resp_headers, resp_body)
-        return
-    if path in ("/oauth2/login", "/login") and method == "POST":
-        status, resp_headers, resp_body = _get_module("cognito").handle_login_submit(method, path, headers, body, query_params)
-        await _send_response(send, status, resp_headers, resp_body)
-        return
-    if path == "/oauth2/token" and method == "POST":
-        status, resp_headers, resp_body = _get_module("cognito").handle_oauth2_token(method, path, headers, body, query_params)
-        await _send_response(send, status, resp_headers, resp_body)
-        return
-    if path in ("/oauth2/userInfo", "/oauth2/userinfo") and method in ("GET", "POST"):
-        status, resp_headers, resp_body = _get_module("cognito").handle_oauth2_userinfo(method, path, headers, body, query_params)
-        await _send_response(send, status, resp_headers, resp_body)
-        return
-    if path == "/logout" and method == "GET":
-        status, resp_headers, resp_body = _get_module("cognito").handle_logout(method, path, headers, query_params)
-        await _send_response(send, status, resp_headers, resp_body)
-        return
 
     # Admin endpoints — no wildcard CORS headers (return early, before CORS block)
     if path == "/_ministack/reset" and method == "POST":
@@ -442,8 +358,8 @@ async def app(scope, receive, send):
             bucket_name = arn.split(":::")[-1].split("/")[0] if ":::" in arn else arn.split("/")[0]
 
             if method == "GET":
-                # ListTagsForResource — return real tags from _get_module("s3")._bucket_tags
-                tags = _get_module("s3")._bucket_tags.get(bucket_name, {})
+                # ListTagsForResource — return real tags from s3._bucket_tags
+                tags = s3._bucket_tags.get(bucket_name, {})
                 tag_members = "".join(
                     f"<member><Key>{k}</Key><Value>{v}</Value></member>"
                     for k, v in tags.items()
@@ -459,13 +375,13 @@ async def app(scope, receive, send):
                     "x-amzn-requestid": request_id,
                 }, xml_body)
             elif method == "PUT":
-                # TagResource — merge tags into _get_module("s3")._bucket_tags
+                # TagResource — merge tags into s3._bucket_tags
                 try:
                     payload = json.loads(body) if body else {}
                     new_tags = {t["Key"]: t["Value"] for t in payload.get("Tags", [])}
-                    existing = _get_module("s3")._bucket_tags.get(bucket_name, {})
+                    existing = s3._bucket_tags.get(bucket_name, {})
                     existing.update(new_tags)
-                    _get_module("s3")._bucket_tags[bucket_name] = existing
+                    s3._bucket_tags[bucket_name] = existing
                 except Exception as e:
                     logger.warning("S3 Control TagResource parse error: %s", e)
                 await _send_response(send, 204, {
@@ -476,10 +392,10 @@ async def app(scope, receive, send):
                 keys_to_remove = query_params.get("tagKeys", [])
                 if isinstance(keys_to_remove, str):
                     keys_to_remove = [keys_to_remove]
-                tags = _get_module("s3")._bucket_tags.get(bucket_name, {})
+                tags = s3._bucket_tags.get(bucket_name, {})
                 for k in keys_to_remove:
                     tags.pop(k, None)
-                _get_module("s3")._bucket_tags[bucket_name] = tags
+                s3._bucket_tags[bucket_name] = tags
                 await _send_response(send, 204, {
                     "x-amzn-requestid": request_id,
                 }, b"")
@@ -498,13 +414,13 @@ async def app(scope, receive, send):
 
     # RDS Data API — /Execute, /BeginTransaction, /CommitTransaction, /RollbackTransaction, /BatchExecute
     if path in ("/Execute", "/BeginTransaction", "/CommitTransaction", "/RollbackTransaction", "/BatchExecute"):
-        status, resp_headers, resp_body = await _get_module("rds_data").handle_request(method, path, headers, body, query_params)
+        status, resp_headers, resp_body = await rds_data.handle_request(method, path, headers, body, query_params)
         await _send_response(send, status, resp_headers, resp_body)
         return
 
     # SES v2 REST API — /v2/email/...
     if path.startswith("/v2/email"):
-        status, resp_headers, resp_body = await _get_module("ses_v2").handle_request(method, path, headers, body, query_params)
+        status, resp_headers, resp_body = await ses_v2.handle_request(method, path, headers, body, query_params)
         await _send_response(send, status, resp_headers, resp_body)
         return
 
@@ -515,7 +431,7 @@ async def app(scope, receive, send):
         }, json.dumps({
             "services": {s: "available" for s in SERVICE_HANDLERS},
             "edition": "light",
-            "version": _VERSION,
+            "version": "3.0.0.dev",
         }).encode())
         return
 
@@ -541,12 +457,12 @@ async def app(scope, receive, send):
         stage = path_parts[0] if path_parts else "$default"
         execute_path = "/" + path_parts[1] if len(path_parts) > 1 else "/"
         try:
-            if api_id in _get_module("apigateway_v1")._rest_apis:
-                status, resp_headers, resp_body = await _get_module("apigateway_v1").handle_execute(
+            if api_id in apigateway_v1._rest_apis:
+                status, resp_headers, resp_body = await apigateway_v1.handle_execute(
                     api_id, stage, method, execute_path, headers, body, query_params
                 )
             else:
-                status, resp_headers, resp_body = await _get_module("apigateway").handle_execute(
+                status, resp_headers, resp_body = await apigateway.handle_execute(
                     api_id, stage, execute_path, method, headers, body, query_params
                 )
         except Exception as e:
@@ -563,10 +479,10 @@ async def app(scope, receive, send):
     # ALB data-plane — two addressing modes:
     #   1. Host header matches a configured ALB DNS name or {lb-name}.alb.localhost
     #   2. Path prefix /_alb/{lb-name}/...  (no DNS config needed for local testing)
-    _alb_lb = _get_module("alb").find_lb_for_host(host)
+    _alb_lb = alb.find_lb_for_host(host)
     if _alb_lb is None and path.startswith("/_alb/"):
         _alb_path_parts = path[6:].split("/", 1)
-        _alb_lb = _get_module("alb")._find_lb_by_name(_alb_path_parts[0])
+        _alb_lb = alb._find_lb_by_name(_alb_path_parts[0])
         if _alb_lb:
             path = "/" + _alb_path_parts[1] if len(_alb_path_parts) > 1 else "/"
 
@@ -578,7 +494,7 @@ async def app(scope, receive, send):
             except ValueError:
                 pass
         try:
-            status, resp_headers, resp_body = await _get_module("alb").dispatch_request(
+            status, resp_headers, resp_body = await alb.dispatch_request(
                 _alb_lb, method, path, headers, body, query_params, _alb_port
             )
         except Exception as e:
@@ -606,7 +522,7 @@ async def app(scope, receive, send):
         if bucket not in _non_s3_hosts:
             vhost_path = "/" + bucket + path if path != "/" else "/" + bucket + "/"
             try:
-                status, resp_headers, resp_body = await _get_module("s3").handle_request(
+                status, resp_headers, resp_body = await s3.handle_request(
                     method, vhost_path, headers, body, query_params
                 )
             except Exception as e:
@@ -706,32 +622,48 @@ async def _handle_lifespan(scope, receive, send):
         elif message["type"] == "lifespan.shutdown":
             logger.info("MiniStack shutting down...")
             if PERSIST_STATE:
-                # Only save state for modules that were actually loaded
-                _state_map = {
-                    "apigateway": "apigateway", "apigateway_v1": "apigateway_v1",
-                    "sqs": "sqs", "sns": "sns", "ssm": "ssm",
-                    "secretsmanager": "secretsmanager", "iam": "iam",
-                    "dynamodb": "dynamodb", "kms": "kms", "eventbridge": "eventbridge",
-                    "cloudwatch_logs": "cloudwatch_logs", "kinesis": "kinesis",
-                    "ec2": "ec2", "route53": "route53", "cognito": "cognito",
-                    "ecr": "ecr", "cloudwatch": "cloudwatch", "s3": "s3",
-                    "lambda": "lambda_svc", "rds": "rds", "ecs": "ecs",
-                    "elasticache": "elasticache", "appsync": "appsync",
-                    "stepfunctions": "stepfunctions", "alb": "alb",
-                    "glue": "glue", "efs": "efs", "waf": "waf",
-                    "athena": "athena", "emr": "emr", "cloudfront": "cloudfront",
-                    "codebuild": "codebuild", "acm": "acm", "firehose": "firehose",
-                    "ses": "ses", "ses_v2": "ses_v2",
-                    "servicediscovery": "servicediscovery", "s3files": "s3files",
-                    "appconfig": "appconfig", "transfer": "transfer",
-                    "scheduler": "scheduler", "autoscaling": "autoscaling",
-                    "eks": "eks",
-                }
-                save_dict = {}
-                for key, mod_name in _state_map.items():
-                    if mod_name in _loaded_modules:
-                        save_dict[key] = _loaded_modules[mod_name].get_state
-                save_all(save_dict)
+                save_all({
+                    "apigateway": apigateway.get_state,
+                    "apigateway_v1": apigateway_v1.get_state,
+                    "sqs": sqs.get_state,
+                    "sns": sns.get_state,
+                    "ssm": ssm.get_state,
+                    "secretsmanager": secretsmanager.get_state,
+                    "iam": iam_sts.get_state,
+                    "dynamodb": dynamodb.get_state,
+                    "kms": kms.get_state,
+                    "eventbridge": eventbridge.get_state,
+                    "cloudwatch_logs": cloudwatch_logs.get_state,
+                    "kinesis": kinesis.get_state,
+                    "ec2": ec2.get_state,
+                    "route53": route53.get_state,
+                    "cognito": cognito.get_state,
+                    "ecr": ecr.get_state,
+                    "cloudwatch": cloudwatch.get_state,
+                    "s3": s3.get_state,
+                    "lambda": lambda_svc.get_state,
+                    "rds": rds.get_state,
+                    "ecs": ecs.get_state,
+                    "elasticache": elasticache.get_state,
+                    "appsync": appsync.get_state,
+                    "stepfunctions": stepfunctions.get_state,
+                    "alb": alb.get_state,
+                    "glue": glue.get_state,
+                    "efs": efs.get_state,
+                    "waf": waf.get_state,
+                    "athena": athena.get_state,
+                    "emr": emr.get_state,
+                    "cloudfront": cloudfront.get_state,
+                    "codebuild": codebuild.get_state,
+                    "transfer": transfer.get_state,
+                    "acm": acm.get_state,
+                    "firehose": firehose.get_state,
+                    "ses": ses.get_state,
+                    "ses_v2": ses_v2.get_state,
+                    "servicediscovery": servicediscovery.get_state,
+                    "s3files": s3files.get_state,
+                    "appconfig": appconfig.get_state,
+                })
             _stop_docker_containers()
             await send({"type": "lifespan.shutdown.complete"})
             return
@@ -745,7 +677,7 @@ def _stop_docker_containers():
         client = docker.from_env()
     except Exception:
         return
-    for label in ("ministack=rds", "ministack=ecs", "ministack=elasticache", "ministack=eks", "ministack=lambda"):
+    for label in ("ministack=rds", "ministack=ecs", "ministack=elasticache"):
         try:
             for c in client.containers.list(filters={"label": label}):
                 try:
@@ -759,11 +691,18 @@ def _stop_docker_containers():
 
 def _load_persisted_state():
     """Load persisted state for services that support it."""
-    for svc_key in ("apigateway", "apigateway_v1", "servicediscovery"):
-        data = load_state(svc_key)
-        if data:
-            _get_module(svc_key).load_persisted_state(data)
-            logger.info("Loaded persisted state for %s", svc_key)
+    data = load_state("apigateway")
+    if data:
+        apigateway.load_persisted_state(data)
+        logger.info("Loaded persisted state for apigateway")
+    data_v1 = load_state("apigateway_v1")
+    if data_v1:
+        apigateway_v1.load_persisted_state(data_v1)
+        logger.info("Loaded persisted state for apigateway_v1")
+    data_sd = load_state("servicediscovery")
+    if data_sd:
+        servicediscovery.load_persisted_state(data_sd)
+        logger.info("Loaded persisted state for servicediscovery")
 
 
 async def _wait_for_port(port, timeout=30):
@@ -871,7 +810,6 @@ def _reset_all_state():
     """Wipe all in-memory state across every service module, and persisted files if enabled."""
 
     from ministack.core.persistence import PERSIST_STATE, STATE_DIR
-<<<<<<< cf-pipes
     from ministack.services.iam_sts import reset as _iam_reset
     from ministack.services.s3 import DATA_DIR as S3_DATA_DIR
     from ministack.services.s3 import PERSIST as S3_PERSIST
@@ -908,7 +846,6 @@ def _reset_all_state():
         (rds_data, rds_data.reset),
         (s3files, s3files.reset),
         (appconfig, appconfig.reset),
-        (pipes, pipes.reset),
     ]:
         try:
             fn()
@@ -918,28 +855,6 @@ def _reset_all_state():
         _iam_reset()
     except Exception as e:
         logger.warning("reset() failed for iam_sts: %s", e)
-=======
-
-    _ALL_SERVICE_MODULES = [
-        "s3", "sqs", "sns", "dynamodb", "lambda_svc", "secretsmanager",
-        "cloudwatch_logs", "ssm", "eventbridge", "kinesis", "cloudwatch",
-        "ses", "stepfunctions", "ecs", "rds", "elasticache", "glue", "athena",
-        "apigateway", "apigateway_v1", "firehose", "route53", "cognito", "ec2",
-        "emr", "alb", "acm", "ses_v2", "waf", "efs", "cloudformation", "kms",
-        "cloudfront", "codebuild", "ecr", "appsync", "servicediscovery",
-        "rds_data", "s3files", "appconfig", "transfer", "scheduler", "autoscaling", "eks", "iam",
-    ]
-    for mod_name in _ALL_SERVICE_MODULES:
-        if mod_name in _loaded_modules:
-            mod = _loaded_modules[mod_name]
-            try:
-                mod.reset()
-            except Exception as e:
-                logger.warning("reset() failed for %s: %s", mod_name, e)
-
-    S3_DATA_DIR = os.environ.get("S3_DATA_DIR", "/tmp/ministack-data/s3")
-    S3_PERSIST = os.environ.get("S3_PERSIST", "0") == "1"
->>>>>>> main
 
     # Wipe persisted files so a subsequent restart doesn't reload old state
     if PERSIST_STATE and os.path.isdir(STATE_DIR):
