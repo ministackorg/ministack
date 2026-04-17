@@ -1709,3 +1709,192 @@ def test_cfn_scheduler_schedule(cfn):
     cfn.delete_stack(StackName="cfn-scheduler-test")
     stack = _wait_stack(cfn, "cfn-scheduler-test")
     assert stack["StackStatus"] == "DELETE_COMPLETE"
+
+
+def test_cfn_eventbus_basic(cfn, eb):
+    """Test basic EventBus create and delete."""
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "Bus": {
+                "Type": "AWS::Events::EventBus",
+                "Properties": {"Name": "cfn-eb-t01"},
+            }
+        },
+    }
+    cfn.create_stack(StackName="cfn-eb-t01", TemplateBody=json.dumps(template))
+    stack = _wait_stack(cfn, "cfn-eb-t01")
+    assert stack["StackStatus"] == "CREATE_COMPLETE"
+
+    bus = eb.describe_event_bus(Name="cfn-eb-t01")
+    assert bus["Name"] == "cfn-eb-t01"
+    assert "arn:aws:events:" in bus["Arn"]
+
+    cfn.delete_stack(StackName="cfn-eb-t01")
+    _wait_stack(cfn, "cfn-eb-t01")
+    with pytest.raises(ClientError):
+        eb.describe_event_bus(Name="cfn-eb-t01")
+
+
+def test_cfn_eventbus_auto_name(cfn, eb):
+    """Test EventBus with auto-generated name."""
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "Bus": {
+                "Type": "AWS::Events::EventBus",
+                "Properties": {},
+            }
+        },
+    }
+    cfn.create_stack(StackName="cfn-eb-t02", TemplateBody=json.dumps(template))
+    stack = _wait_stack(cfn, "cfn-eb-t02")
+    assert stack["StackStatus"] == "CREATE_COMPLETE"
+
+    resources = cfn.describe_stack_resources(StackName="cfn-eb-t02")["StackResources"]
+    bus_name = next(r["PhysicalResourceId"] for r in resources if r["ResourceType"] == "AWS::Events::EventBus")
+    assert bus_name.startswith("cfn-eb-t02-Bus-")
+
+    bus = eb.describe_event_bus(Name=bus_name)
+    assert bus["Name"] == bus_name
+
+    cfn.delete_stack(StackName="cfn-eb-t02")
+    _wait_stack(cfn, "cfn-eb-t02")
+
+
+def test_cfn_eventbus_getatt_arn(cfn, eb):
+    """Test Fn::GetAtt for Arn and Name attributes."""
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "Bus": {
+                "Type": "AWS::Events::EventBus",
+                "Properties": {"Name": "cfn-eb-t03"},
+            }
+        },
+        "Outputs": {
+            "BusArn": {"Value": {"Fn::GetAtt": ["Bus", "Arn"]}},
+            "BusName": {"Value": {"Fn::GetAtt": ["Bus", "Name"]}},
+        },
+    }
+    cfn.create_stack(StackName="cfn-eb-t03", TemplateBody=json.dumps(template))
+    stack = _wait_stack(cfn, "cfn-eb-t03")
+    assert stack["StackStatus"] == "CREATE_COMPLETE"
+
+    outputs = {o["OutputKey"]: o["OutputValue"] for o in stack.get("Outputs", [])}
+    assert outputs["BusArn"].startswith("arn:aws:events:")
+    assert outputs["BusArn"].endswith(":event-bus/cfn-eb-t03")
+    assert outputs["BusName"] == "cfn-eb-t03"
+
+    cfn.delete_stack(StackName="cfn-eb-t03")
+    _wait_stack(cfn, "cfn-eb-t03")
+
+
+def test_cfn_eventbus_tags(cfn, eb):
+    """Test EventBus tags are propagated."""
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "Bus": {
+                "Type": "AWS::Events::EventBus",
+                "Properties": {
+                    "Name": "cfn-eb-t04",
+                    "Tags": [
+                        {"Key": "env", "Value": "test"},
+                        {"Key": "team", "Value": "platform"},
+                    ],
+                },
+            }
+        },
+    }
+    cfn.create_stack(StackName="cfn-eb-t04", TemplateBody=json.dumps(template))
+    stack = _wait_stack(cfn, "cfn-eb-t04")
+    assert stack["StackStatus"] == "CREATE_COMPLETE"
+
+    bus = eb.describe_event_bus(Name="cfn-eb-t04")
+    tags = eb.list_tags_for_resource(ResourceARN=bus["Arn"])["Tags"]
+    tag_map = {t["Key"]: t["Value"] for t in tags}
+    assert tag_map["env"] == "test"
+    assert tag_map["team"] == "platform"
+
+    cfn.delete_stack(StackName="cfn-eb-t04")
+    _wait_stack(cfn, "cfn-eb-t04")
+
+
+def test_cfn_eventbus_with_rule(cfn, eb):
+    """Test EventBus with EventBridge Rule on custom bus."""
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "Bus": {
+                "Type": "AWS::Events::EventBus",
+                "Properties": {"Name": "cfn-eb-t05"},
+            },
+            "Rule": {
+                "Type": "AWS::Events::Rule",
+                "Properties": {
+                    "Name": "cfn-eb-t05-rule",
+                    "EventBusName": {"Ref": "Bus"},
+                    "EventPattern": {"source": ["my.app"]},
+                    "State": "ENABLED",
+                },
+            },
+        },
+    }
+    cfn.create_stack(StackName="cfn-eb-t05", TemplateBody=json.dumps(template))
+    stack = _wait_stack(cfn, "cfn-eb-t05")
+    assert stack["StackStatus"] == "CREATE_COMPLETE"
+
+    bus = eb.describe_event_bus(Name="cfn-eb-t05")
+    assert bus["Name"] == "cfn-eb-t05"
+
+    rules = eb.list_rules(EventBusName="cfn-eb-t05")["Rules"]
+    assert any(r["Name"] == "cfn-eb-t05-rule" for r in rules)
+
+    cfn.delete_stack(StackName="cfn-eb-t05")
+    _wait_stack(cfn, "cfn-eb-t05")
+
+
+def test_cfn_eventbus_duplicate_name_fails(cfn, eb):
+    """Test that duplicate EventBus name causes ROLLBACK_COMPLETE."""
+    eb.create_event_bus(Name="cfn-eb-t06-dup")
+
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "Bus": {
+                "Type": "AWS::Events::EventBus",
+                "Properties": {"Name": "cfn-eb-t06-dup"},
+            }
+        },
+    }
+    cfn.create_stack(StackName="cfn-eb-t06", TemplateBody=json.dumps(template))
+    stack = _wait_stack(cfn, "cfn-eb-t06")
+    assert stack["StackStatus"] == "ROLLBACK_COMPLETE"
+
+    cfn.delete_stack(StackName="cfn-eb-t06")
+    _wait_stack(cfn, "cfn-eb-t06")
+    eb.delete_event_bus(Name="cfn-eb-t06-dup")
+
+
+def test_cfn_eventbus_default_name_fails(cfn, eb):
+    """Test that 'default' bus name causes ROLLBACK_COMPLETE."""
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "Bus": {
+                "Type": "AWS::Events::EventBus",
+                "Properties": {"Name": "default"},
+            }
+        },
+    }
+    cfn.create_stack(StackName="cfn-eb-t07", TemplateBody=json.dumps(template))
+    stack = _wait_stack(cfn, "cfn-eb-t07")
+    assert stack["StackStatus"] == "ROLLBACK_COMPLETE"
+
+    cfn.delete_stack(StackName="cfn-eb-t07")
+    _wait_stack(cfn, "cfn-eb-t07")
+
+    # Default bus must still exist and be unaffected
+    bus = eb.describe_event_bus(Name="default")
+    assert bus["Name"] == "default"
