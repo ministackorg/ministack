@@ -762,6 +762,29 @@ def _eks_nodegroup_delete(physical_id, props):
     _eks._delete_nodegroup(cluster_name, physical_id)
 
 
+# --- EventBridge EventBus ---
+
+def _eb_event_bus_create(logical_id, props, stack_name):
+    name = props.get("Name") or _physical_name(stack_name, logical_id, max_len=256)
+    if name in _eb._event_buses:
+        raise ValueError(f"EventBus already exists: {name}")
+    data = {
+        "Name": name,
+        "Description": props.get("Description", ""),
+        "Tags": props.get("Tags", []),
+    }
+    _eb._create_event_bus(data)
+    arn = f"arn:aws:events:{REGION}:{get_account_id()}:event-bus/{name}"
+    return name, {"Arn": arn, "Name": name}
+
+
+def _eb_event_bus_delete(physical_id, props):
+    if physical_id == "default" or physical_id not in _eb._event_buses:
+        return
+    _eb._delete_event_bus({"Name": physical_id})
+
+
+
 # --- Kinesis Stream ---
 
 def _kinesis_stream_create(logical_id, props, stack_name):
@@ -2751,6 +2774,7 @@ _RESOURCE_HANDLERS = {
     "AWS::SSM::Parameter": {"create": _ssm_create, "delete": _ssm_delete},
     "AWS::Logs::LogGroup": {"create": _cwlogs_create, "delete": _cwlogs_delete},
     "AWS::Events::Rule": {"create": _eb_rule_create, "delete": _eb_rule_delete},
+    "AWS::Events::EventBus": {"create": _eb_event_bus_create, "delete": _eb_event_bus_delete},
     "AWS::Kinesis::Stream": {"create": _kinesis_stream_create, "delete": _kinesis_stream_delete},
     "AWS::Lambda::Permission": {"create": _lambda_permission_create, "delete": _lambda_permission_delete},
     "AWS::Lambda::Version": {"create": _lambda_version_create},
