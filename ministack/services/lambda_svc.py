@@ -611,7 +611,7 @@ async def handle_request(method: str, path: str, headers: dict, body: bytes, que
 
         # Invoke
         if method == "POST" and sub == "invocations":
-            return await _invoke(func_name, data, headers, path_qualifier)
+            return await _invoke(func_name, data, headers, path_qualifier, query_params)
 
         # PublishVersion
         if method == "POST" and sub == "versions":
@@ -872,8 +872,8 @@ def _update_code(name: str, data: dict):
     func["config"]["LastUpdateStatus"] = "Successful"
     func["config"]["RevisionId"] = new_uuid()
 
-    # Invalidate warm worker so next invocation picks up the new code
-    invalidate_worker(name)
+    # Invalidate only the old $LATEST worker �� published version workers stay alive
+    invalidate_worker(name, qualifier="$LATEST")
 
     if data.get("Publish"):
         ver_num = func["next_version"]
@@ -939,7 +939,8 @@ def _update_config(name: str, data: dict):
 # ---------------------------------------------------------------------------
 
 
-async def _invoke(name: str, event: dict, headers: dict, path_qualifier: str | None = None):
+async def _invoke(name: str, event: dict, headers: dict, path_qualifier: str | None = None,
+                  query_params: dict | None = None):
     if name not in _functions:
         return error_response_json(
             "ResourceNotFoundException",
@@ -949,7 +950,7 @@ async def _invoke(name: str, event: dict, headers: dict, path_qualifier: str | N
 
     func = _functions[name]
     invocation_type = headers.get("x-amz-invocation-type") or headers.get("X-Amz-Invocation-Type") or "RequestResponse"
-    qualifier = path_qualifier or _qp_first(headers, "x-amz-qualifier") or None
+    qualifier = path_qualifier or _qp_first(query_params or {}, "Qualifier") or _qp_first(headers, "x-amz-qualifier") or None
     executed_version = "$LATEST"
 
     exec_record = func
@@ -1025,6 +1026,15 @@ _RUNTIME_IMAGE_MAP: dict[str, str] = {
     "nodejs20.x": "public.ecr.aws/lambda/nodejs:20",
     "nodejs22.x": "public.ecr.aws/lambda/nodejs:22",
     "nodejs24.x": "public.ecr.aws/lambda/nodejs:24",
+    "java21": "public.ecr.aws/lambda/java:21",
+    "java17": "public.ecr.aws/lambda/java:17",
+    "java11": "public.ecr.aws/lambda/java:11",
+    "java8.al2": "public.ecr.aws/lambda/java:8.al2",
+    "dotnet8": "public.ecr.aws/lambda/dotnet:8",
+    "dotnet6": "public.ecr.aws/lambda/dotnet:6",
+    "ruby3.4": "public.ecr.aws/lambda/ruby:3.4",
+    "ruby3.3": "public.ecr.aws/lambda/ruby:3.3",
+    "ruby3.2": "public.ecr.aws/lambda/ruby:3.2",
     "provided.al2023": "public.ecr.aws/lambda/provided:al2023",
     "provided.al2": "public.ecr.aws/lambda/provided:al2",
     "provided": "public.ecr.aws/lambda/provided:latest",
@@ -1040,6 +1050,15 @@ def _docker_image_for_runtime(runtime: str) -> str | None:
     if runtime.startswith("nodejs"):
         ver = runtime.replace("nodejs", "").rstrip(".x")
         return f"public.ecr.aws/lambda/nodejs:{ver}"
+    if runtime.startswith("java"):
+        ver = runtime.replace("java", "")
+        return f"public.ecr.aws/lambda/java:{ver}"
+    if runtime.startswith("dotnet"):
+        ver = runtime.replace("dotnet", "")
+        return f"public.ecr.aws/lambda/dotnet:{ver}"
+    if runtime.startswith("ruby"):
+        ver = runtime.replace("ruby", "")
+        return f"public.ecr.aws/lambda/ruby:{ver}"
     if runtime.startswith("provided"):
         return "public.ecr.aws/lambda/provided:al2023"
     return None
@@ -1079,7 +1098,7 @@ def _get_warm_container(key: str):
         return None
 
 
-def _cache_warm_container(key: str, container):
+def _cache_warm_container(key: str, container, tmpdir: str = None):
     """Store a running container in the warm cache."""
     with _warm_containers_lock:
         # Evict old entry if exists
@@ -1090,11 +1109,16 @@ def _cache_warm_container(key: str, container):
                 old["container"].remove(force=True)
             except Exception:
                 pass
-        _warm_containers[key] = {"container": container, "last_used": time.time()}
+            old_tmpdir = old.get("tmpdir")
+            if old_tmpdir and os.path.exists(old_tmpdir):
+                import shutil
+                shutil.rmtree(old_tmpdir, ignore_errors=True)
+        _warm_containers[key] = {"container": container, "last_used": time.time(), "tmpdir": tmpdir}
 
 
 def _cleanup_warm_containers():
-    """Remove all warm containers. Called on reset() and shutdown."""
+    """Remove all warm containers and their tmpdirs. Called on reset() and shutdown."""
+    import shutil
     with _warm_containers_lock:
         for key, entry in list(_warm_containers.items()):
             try:
@@ -1105,6 +1129,9 @@ def _cleanup_warm_containers():
                 entry["container"].remove(force=True)
             except Exception:
                 pass
+            tmpdir = entry.get("tmpdir")
+            if tmpdir and os.path.exists(tmpdir):
+                shutil.rmtree(tmpdir, ignore_errors=True)
         _warm_containers.clear()
 
 
@@ -1307,8 +1334,9 @@ def _execute_function_docker(func: dict, event: dict) -> dict:
 
         if not result.get("error"):
             # Success — cache the warm container for reuse
-            _cache_warm_container(cache_key, container)
+            _cache_warm_container(cache_key, container, tmpdir=tmpdir)
             container = None  # prevent finally from killing it
+            tmpdir = None  # prevent finally from cleaning it
             logger.info("Lambda %s: cold start RIE container cached for reuse", config["FunctionName"])
         return result
 
@@ -1331,6 +1359,9 @@ def _execute_function_docker(func: dict, event: dict) -> dict:
                 container.remove(force=True)
             except Exception:
                 pass
+        if tmpdir is not None and os.path.exists(tmpdir):
+            import shutil
+            shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------
@@ -1369,16 +1400,21 @@ def _execute_function_warm(func: dict, event: dict) -> dict:
         return {"body": {"statusCode": 200, "body": "Mock response - no code deployed"}}
 
     func_name = config.get("FunctionName", "unknown")
+    qualifier = config.get("Version", "$LATEST")
     try:
-        worker = get_or_create_worker(func_name, config, code_zip)
+        worker = get_or_create_worker(func_name, config, code_zip, qualifier=qualifier)
         result = worker.invoke(event, new_uuid())
         if result.get("status") == "ok":
             return {"body": result.get("result"), "log": result.get("log", "")}
         else:
+            error_msg = result.get("error", "Unknown error")
+            error_type = "Runtime.HandlerError"
+            if "timed out" in error_msg.lower():
+                error_type = "Runtime.ExitError"
             return {
                 "body": {
-                    "errorMessage": result.get("error", "Unknown error"),
-                    "errorType": "Runtime.HandlerError",
+                    "errorMessage": error_msg,
+                    "errorType": error_type,
                 },
                 "error": True,
                 "log": result.get("trace", result.get("error", "")),
@@ -1458,40 +1494,8 @@ def _execute_function_image(func: dict, event: dict) -> dict:
 
     container = client.containers.run(**run_kwargs)
     try:
-        import time as _time
-        import urllib.request
-        for _attempt in range(int(timeout * 2) + 10):
-            _time.sleep(0.5)
-            container.reload()
-            if container.status != "running":
-                break
-            try:
-                if LAMBDA_DOCKER_NETWORK:
-                    networks = container.attrs.get("NetworkSettings", {}).get("Networks", {})
-                    container_ip = networks.get(LAMBDA_DOCKER_NETWORK, {}).get("IPAddress", "")
-                    if container_ip:
-                        rie_url = f"http://{container_ip}:8080/2015-03-31/functions/function/invocations"
-                    else:
-                        continue
-                else:
-                    ports = container.ports.get("8080/tcp") or []
-                    if not ports:
-                        continue
-                    rie_url = f"http://127.0.0.1:{ports[0]['HostPort']}/2015-03-31/functions/function/invocations"
-                req = urllib.request.Request(rie_url, data=json.dumps(event).encode(),
-                                            headers={"Content-Type": "application/json"})
-                resp = urllib.request.urlopen(req, timeout=timeout)
-                body = resp.read().decode("utf-8", errors="replace")
-                try:
-                    parsed = json.loads(body)
-                except json.JSONDecodeError:
-                    parsed = body
-                logs = container.logs(stdout=True, stderr=True).decode("utf-8", errors="replace").strip()
-                return {"body": parsed, "log": logs}
-            except (urllib.error.URLError, ConnectionRefusedError, OSError):
-                continue
-        stdout = container.logs(stdout=True, stderr=True).decode("utf-8", errors="replace").strip()
-        return {"body": {"errorMessage": f"Image Lambda failed: {stdout[:500]}", "errorType": "Runtime.ExitError"}, "error": True, "log": stdout}
+        result = _invoke_rie(container, event, timeout)
+        return result
     finally:
         try:
             container.stop(timeout=2)

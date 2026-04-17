@@ -527,32 +527,60 @@ class Worker:
             else:
                 cold = False
 
+            timeout = self.config.get("Timeout", 30)
             event["_request_id"] = request_id
-            try:
-                self._proc.stdin.write(json.dumps(event) + "\n")
-                self._proc.stdin.flush()
-                # Read lines until we get a valid JSON protocol message.
-                # Non-JSON lines (e.g. stray console.log to stdout) are treated as log noise.
-                for _ in range(200):
-                    response_line = self._proc.stdout.readline()
-                    if not response_line:
-                        raise RuntimeError("Worker process died")
-                    response_line = response_line.strip()
-                    if not response_line:
-                        continue
-                    if response_line.startswith("{"):
-                        try:
-                            response = json.loads(response_line)
-                            response["cold_start"] = cold
-                            response["log"] = self._drain_stderr()
-                            return response
-                        except json.JSONDecodeError:
+            result_box: list = []
+
+            def _read_response():
+                try:
+                    self._proc.stdin.write(json.dumps(event) + "\n")
+                    self._proc.stdin.flush()
+                    for _ in range(200):
+                        response_line = self._proc.stdout.readline()
+                        if not response_line:
+                            result_box.append({"status": "error", "error": "Worker process died"})
+                            return
+                        response_line = response_line.strip()
+                        if not response_line:
                             continue
-                    # Non-JSON line -- skip it
-                raise RuntimeError("No JSON response from worker after 200 lines")
-            except Exception as e:
+                        if response_line.startswith("{"):
+                            try:
+                                response = json.loads(response_line)
+                                result_box.append(response)
+                                return
+                            except json.JSONDecodeError:
+                                continue
+                    result_box.append({"status": "error", "error": "No JSON response from worker after 200 lines"})
+                except Exception as e:
+                    result_box.append({"status": "error", "error": str(e)})
+
+            reader = threading.Thread(target=_read_response, daemon=True)
+            reader.start()
+            reader.join(timeout=timeout)
+
+            if reader.is_alive():
+                # Timeout — kill the worker process
+                logger.warning("Lambda %s timed out after %ds — killing worker", self.func_name, timeout)
+                if self._proc:
+                    self._proc.kill()
                 self._proc = None
-                return {"status": "error", "error": str(e), "cold_start": cold}
+                return {
+                    "status": "error",
+                    "error": f"Task timed out after {timeout}.00 seconds",
+                    "cold_start": cold,
+                    "log": self._drain_stderr(),
+                }
+
+            if not result_box:
+                self._proc = None
+                return {"status": "error", "error": "Worker returned no response", "cold_start": cold}
+
+            response = result_box[0]
+            if response.get("status") == "error":
+                self._proc = None
+            response["cold_start"] = cold
+            response["log"] = self._drain_stderr()
+            return response
 
     def kill(self):
         if self._proc and self._proc.poll() is None:
@@ -562,21 +590,36 @@ class Worker:
             shutil.rmtree(self._tmpdir, ignore_errors=True)
 
 
-def get_or_create_worker(func_name: str, config: dict, code_zip: bytes) -> Worker:
+def get_or_create_worker(func_name: str, config: dict, code_zip: bytes,
+                         qualifier: str = "$LATEST") -> Worker:
+    key = f"{func_name}:{qualifier}"
     with _lock:
-        worker = _workers.get(func_name)
-        if worker is None:
-            worker = Worker(func_name, config, code_zip)
-            _workers[func_name] = worker
+        worker = _workers.get(key)
+        if worker is not None:
+            return worker
+        worker = Worker(func_name, config, code_zip)
+        _workers[key] = worker
         return worker
 
 
-def invalidate_worker(func_name: str):
-    """Kill and remove worker when function is updated or deleted."""
+def invalidate_worker(func_name: str, qualifier: str = None):
+    """Kill and remove workers for a function.
+
+    If qualifier is provided, only kill that specific version/alias worker.
+    Otherwise kill all workers for the function (used on delete).
+    """
     with _lock:
-        worker = _workers.pop(func_name, None)
-        if worker:
-            worker.kill()
+        if qualifier is not None:
+            key = f"{func_name}:{qualifier}"
+            worker = _workers.pop(key, None)
+            if worker:
+                worker.kill()
+        else:
+            to_remove = [k for k in _workers if k.startswith(f"{func_name}:")]
+            for k in to_remove:
+                worker = _workers.pop(k, None)
+                if worker:
+                    worker.kill()
 
 
 def reset():

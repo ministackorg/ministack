@@ -908,6 +908,30 @@ def _update_user_pool_client(data):
     return json_response({"UserPoolClient": {k: v for k, v in client.items() if v is not None}})
 
 
+def _validate_password(pool, password):
+    """Validate password against the pool's PasswordPolicy. Returns error response or None."""
+    policy = pool.get("Policies", {}).get("PasswordPolicy", {})
+    min_len = policy.get("MinimumLength", 8)
+    errors = []
+    if len(password) < min_len:
+        errors.append(f"Password must have length greater than or equal to {min_len}")
+    if policy.get("RequireUppercase", True) and not any(c.isupper() for c in password):
+        errors.append("Password must have uppercase characters")
+    if policy.get("RequireLowercase", True) and not any(c.islower() for c in password):
+        errors.append("Password must have lowercase characters")
+    if policy.get("RequireNumbers", True) and not any(c.isdigit() for c in password):
+        errors.append("Password must have numeric characters")
+    if policy.get("RequireSymbols", True) and not any(c in "^$*.[]{}()?-\"!@#%&/\\,><':;|_~`+=" for c in password):
+        errors.append("Password must have symbol characters")
+    if errors:
+        return error_response_json(
+            "InvalidPasswordException",
+            "Password did not conform with policy: " + "; ".join(errors),
+            400,
+        )
+    return None
+
+
 # ===========================================================================
 # USER MANAGEMENT
 # ===========================================================================
@@ -929,6 +953,9 @@ def _admin_create_user(data):
 
     now = _now_epoch()
     temp_password = data.get("TemporaryPassword") or _generate_temp_password()
+    pw_err = _validate_password(pool, temp_password)
+    if pw_err:
+        return pw_err
     attrs = data.get("UserAttributes", [])
     # Ensure sub attribute
     attr_dict = _attr_list_to_dict(attrs)
@@ -1022,7 +1049,11 @@ def _admin_set_user_password(data):
     user, err = _resolve_user(pool, username)
     if err:
         return err
-    user["_password"] = data.get("Password", "")
+    new_pw = data.get("Password", "")
+    pw_err = _validate_password(pool, new_pw)
+    if pw_err:
+        return pw_err
+    user["_password"] = new_pw
     permanent = data.get("Permanent", False)
     if permanent:
         user["UserStatus"] = "CONFIRMED"
@@ -1474,6 +1505,10 @@ def _sign_up(data):
     if username in pool["_users"]:
         return error_response_json("UsernameExistsException", "User already exists.", 400)
 
+    pw_err = _validate_password(pool, password)
+    if pw_err:
+        return pw_err
+
     now = _now_epoch()
     attrs = data.get("UserAttributes", [])
     attr_dict = _attr_list_to_dict(attrs)
@@ -1583,6 +1618,9 @@ def _confirm_forgot_password(data):
         return error_response_json("UserNotFoundException", "User does not exist.", 400)
 
     # Accept any confirmation code in emulation (real AWS validates against issued code)
+    pw_err = _validate_password(pool, new_password)
+    if pw_err:
+        return pw_err
     user["_password"] = new_password
     user["UserStatus"] = "CONFIRMED"
     user["UserLastModifiedDate"] = _now_epoch()
@@ -1598,6 +1636,9 @@ def _change_password(data):
     for pool in _user_pools.values():
         user = _user_from_token(access_token, pool)
         if user:
+            pw_err = _validate_password(pool, proposed)
+            if pw_err:
+                return pw_err
             user["_password"] = proposed
             user["UserLastModifiedDate"] = _now_epoch()
             return json_response({})
@@ -2971,8 +3012,18 @@ def _identity_pool_out(pool: dict) -> dict:
 # ===========================================================================
 
 def _generate_temp_password() -> str:
-    chars = string.ascii_uppercase + string.ascii_lowercase + string.digits + "!@#$%"
-    return "".join(secrets.choice(chars) for _ in range(12))
+    # Ensure at least one char from each required class to satisfy default policy
+    required = [
+        secrets.choice(string.ascii_uppercase),
+        secrets.choice(string.ascii_lowercase),
+        secrets.choice(string.digits),
+        secrets.choice("!@#$%^&*"),
+    ]
+    chars = string.ascii_uppercase + string.ascii_lowercase + string.digits + "!@#$%^&*"
+    remaining = [secrets.choice(chars) for _ in range(8)]
+    password = required + remaining
+    secrets.SystemRandom().shuffle(password)
+    return "".join(password)
 
 
 def _apply_user_filter(users: list, filter_str: str) -> list:
