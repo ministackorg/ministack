@@ -53,6 +53,15 @@ from ministack.core.router import detect_service, extract_access_key_id, extract
 # ---------------------------------------------------------------------------
 _loaded_modules: dict = {}
 
+# Execution state of ready.d scripts — surfaced via /_ministack/health and /_ministack/ready.
+# status: "pending" (not started) | "running" | "completed" (all scripts finished, errors included)
+_ready_scripts_state: dict = {
+    "status": "pending",
+    "total": 0,
+    "completed": 0,
+    "failed": 0,
+}
+
 
 class _ErrorModule:
     """Stub returned when a service module fails to import."""
@@ -340,6 +349,7 @@ async def app(scope, receive, send):
         await _send_response(send, 200, {"Content-Type": "application/json"},
                              json.dumps({"reset": "ok"}).encode())
         if run_init:
+            _ready_scripts_state.update({"status": "pending", "total": 0, "completed": 0, "failed": 0})
             asyncio.create_task(_run_ready_scripts())
         return
 
@@ -466,7 +476,19 @@ async def app(scope, receive, send):
             "services": {s: "available" for s in SERVICE_HANDLERS},
             "edition": "light",
             "version": _VERSION,
+            "ready_scripts": dict(_ready_scripts_state),
         }).encode())
+        return
+
+    # Readiness endpoint — returns 503 until all ready.d scripts finish, then 200.
+    # Point a compose healthcheck here to gate depends_on: service_healthy on script completion.
+    if path == "/_ministack/ready":
+        ready = _ready_scripts_state["status"] == "completed"
+        status = 200 if ready else 503
+        await _send_response(send, status, {
+            "Content-Type": "application/json",
+            "x-amzn-requestid": request_id,
+        }, json.dumps(dict(_ready_scripts_state)).encode())
         return
 
     if method == "OPTIONS":
@@ -735,7 +757,9 @@ async def _run_ready_scripts():
     """Execute .sh/.py scripts from ready.d directories after the server is ready."""
     scripts = _collect_scripts('/docker-entrypoint-initaws.d/ready.d', '/etc/localstack/init/ready.d')
     if not scripts:
+        _ready_scripts_state.update({"status": "completed", "total": 0, "completed": 0, "failed": 0})
         return
+    _ready_scripts_state.update({"status": "running", "total": len(scripts), "completed": 0, "failed": 0})
     port = int(_resolve_port())
     await _wait_for_port(port)
     logger.info('Found %d ready script(s)', len(scripts))
@@ -756,6 +780,7 @@ async def _run_ready_scripts():
     script_env.setdefault("AWS_ENDPOINT_URL", f"http://{_MINISTACK_HOST}:{port}")
     for script_path in scripts:
         logger.info('Running ready script: %s', script_path)
+        script_failed = False
         try:
             cmd = [sys.executable, script_path] if script_path.endswith('.py') else ['sh', script_path]
             proc = await asyncio.create_subprocess_exec(
@@ -768,15 +793,22 @@ async def _run_ready_scripts():
             if stdout:
                 logger.info('  stdout: %s', stdout.decode('utf-8', errors='replace').rstrip())
             if proc.returncode != 0:
+                script_failed = True
                 logger.error('Ready script %s failed (exit %d): %s', script_path, proc.returncode,
                              stderr.decode('utf-8', errors='replace'))
             else:
                 logger.info('Ready script %s completed successfully', script_path)
         except asyncio.TimeoutError:
+            script_failed = True
             logger.error('Ready script %s timed out after 300s', script_path)
             proc.kill()
         except Exception as e:
+            script_failed = True
             logger.error('Failed to execute ready script %s: %s', script_path, e)
+        _ready_scripts_state["completed"] += 1
+        if script_failed:
+            _ready_scripts_state["failed"] += 1
+    _ready_scripts_state["status"] = "completed"
 
 
 def _collect_scripts(*dirs):
