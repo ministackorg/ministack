@@ -11,6 +11,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 - **`/_ministack/ready` endpoint** — exposes ready.d script completion status, enabling Docker healthchecks and orchestrators to gate on init script completion. Contributed by @kjdev (#360)
+- **ECS `command` passed to Docker containers** — task definition `containerDefinitions[].command` is now forwarded to `docker run`, overriding the image's default CMD. Previously the command field was ignored. Contributed by @s0rbus (#366)
 - **CloudFormation `AWS::Events::EventBus` provisioner** — CDK/Terraform stacks declaring EventBridge custom event buses now provision correctly. Supports Name, Tags, and Fn::GetAtt Arn/Name. Contributed by @AdigaAkhil (#365)
 - **Lambda Java, .NET, and Ruby runtime support** — `LAMBDA_EXECUTOR=docker` now supports `java21`, `java17`, `java11`, `java8.al2`, `dotnet8`, `dotnet6`, `ruby3.4`, `ruby3.3`, `ruby3.2` using official AWS Lambda RIE images. Fallback resolvers added for future versions.
 
