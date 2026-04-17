@@ -213,9 +213,7 @@ def _get_parameters_by_path(data):
             continue
         if not name.startswith(path_prefix) and not (name.startswith(path) and path == "/"):
             continue
-        if path == "/":
-            matches = True
-        elif recursive:
+        if recursive:
             matches = True
         else:
             suffix = name[len(path_prefix):]

@@ -1085,7 +1085,11 @@ def _put_user_policy(p):
     if user_name not in _users:
         return _error(404, "NoSuchEntity",
                       f"The user with name {user_name} cannot be found.", ns="iam")
-    _user_inline_policies[(user_name, policy_name)] = policy_doc
+    user_policies = _user_inline_policies.get(user_name)
+    if user_policies is None:
+        user_policies = {}
+        _user_inline_policies[user_name] = user_policies
+    user_policies[policy_name] = policy_doc
     return _xml(200, "PutUserPolicyResponse", "", ns="iam")
 
 
@@ -1095,7 +1099,7 @@ def _get_user_policy(p):
     if user_name not in _users:
         return _error(404, "NoSuchEntity",
                       f"The user with name {user_name} cannot be found.", ns="iam")
-    doc = _user_inline_policies.get((user_name, policy_name))
+    doc = (_user_inline_policies.get(user_name) or {}).get(policy_name)
     if doc is None:
         return _error(404, "NoSuchEntity",
                       f"The user policy with name {policy_name} cannot be found.", ns="iam")
@@ -1121,10 +1125,11 @@ def _delete_user_policy(p):
     if user_name not in _users:
         return _error(404, "NoSuchEntity",
                       f"The user with name {user_name} cannot be found.", ns="iam")
-    if (user_name, policy_name) not in _user_inline_policies:
+    user_policies = _user_inline_policies.get(user_name) or {}
+    if policy_name not in user_policies:
         return _error(404, "NoSuchEntity",
                       f"The user policy with name {policy_name} cannot be found.", ns="iam")
-    del _user_inline_policies[(user_name, policy_name)]
+    del user_policies[policy_name]
     return _xml(200, "DeleteUserPolicyResponse", "", ns="iam")
 
 
@@ -1135,8 +1140,7 @@ def _list_user_policies(p):
                       f"The user with name {user_name} cannot be found.", ns="iam")
     members = "".join(
         f"<member>{pname}</member>"
-        for (uname, pname) in _user_inline_policies
-        if uname == user_name
+        for pname in (_user_inline_policies.get(user_name) or {})
     )
     return _xml(200, "ListUserPoliciesResponse",
                 f"<ListUserPoliciesResult><PolicyNames>{members}</PolicyNames>"

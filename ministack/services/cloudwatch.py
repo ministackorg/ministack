@@ -1295,7 +1295,7 @@ def _delete_dashboards(params, cbor_data, is_cbor, is_json=False):
     if missing:
         return _error("DashboardNotFoundError",
                        f"Dashboard {', '.join(missing)} does not exist",
-                       use_json=is_json, use_cbor=is_cbor)
+                       404, use_json=is_json, use_cbor=is_cbor)
 
     for n in names:
         _dashboards.pop(n, None)

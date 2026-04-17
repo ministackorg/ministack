@@ -643,10 +643,11 @@ def _get_named_query(data):
 
 
 def _list_named_queries(data):
-    workgroup = data.get("WorkGroup", "primary")
-    ids = [
-        qid for qid, nq in _named_queries.items() if nq.get("WorkGroup") == workgroup
-    ]
+    workgroup = data.get("WorkGroup")
+    if workgroup:
+        ids = [qid for qid, nq in _named_queries.items() if nq.get("WorkGroup") == workgroup]
+    else:
+        ids = list(_named_queries.keys())
     return json_response({"NamedQueryIds": ids})
 
 

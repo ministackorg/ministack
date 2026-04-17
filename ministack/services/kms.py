@@ -147,6 +147,23 @@ def _resolve_key(key_id_or_arn):
     return None
 
 
+def _check_key_state(rec):
+    """Return an error response if the key is in an unusable state, else None."""
+    if rec["KeyState"] == "PendingDeletion":
+        return error_response_json(
+            "KMSInvalidStateException",
+            f"{rec['Arn']} is pending deletion.",
+            400,
+        )
+    if rec["KeyState"] == "Disabled":
+        return error_response_json(
+            "DisabledException",
+            f"{rec['Arn']} is disabled.",
+            400,
+        )
+    return None
+
+
 def _require_crypto(operation):
     if not HAS_CRYPTO:
         return error_response_json(
@@ -291,7 +308,7 @@ def _get_public_key(data):
             400,
         )
     return json_response({
-        "KeyId": rec["KeyId"],
+        "KeyId": rec["Arn"],
         "KeyUsage": rec["KeyUsage"],
         "KeySpec": rec["KeySpec"],
         "PublicKey": base64.b64encode(rec["_public_key_der"]).decode(),
@@ -309,6 +326,9 @@ def _sign(data):
     rec = _resolve_key(key_id)
     if not rec:
         return error_response_json("NotFoundException", f"Key {key_id} not found", 400)
+    err = _check_key_state(rec)
+    if err:
+        return err
     if "_private_key" not in rec:
         return error_response_json(
             "UnsupportedOperationException",
@@ -352,7 +372,7 @@ def _sign(data):
 
     logger.debug("Signed %d bytes with key %s (%s)", len(message), key_id, algorithm)
     return json_response({
-        "KeyId": rec["KeyId"],
+        "KeyId": rec["Arn"],
         "Signature": base64.b64encode(signature).decode(),
         "SigningAlgorithm": algorithm,
     })
@@ -367,6 +387,9 @@ def _verify(data):
     rec = _resolve_key(key_id)
     if not rec:
         return error_response_json("NotFoundException", f"Key {key_id} not found", 400)
+    err = _check_key_state(rec)
+    if err:
+        return err
     if "_private_key" not in rec:
         return error_response_json(
             "UnsupportedOperationException",
@@ -406,11 +429,15 @@ def _verify(data):
                 public_key.verify(signature, message, pad, hash_algo)
         valid = True
     except InvalidSignature:
-        valid = False
+        return error_response_json(
+            "KMSInvalidSignatureException",
+            "Signature verification failed",
+            400,
+        )
 
     return json_response({
-        "KeyId": rec["KeyId"],
-        "SignatureValid": valid,
+        "KeyId": rec["Arn"],
+        "SignatureValid": True,
         "SigningAlgorithm": algorithm,
     })
 
@@ -466,6 +493,9 @@ def _encrypt(data):
     rec = _resolve_key(key_id)
     if not rec:
         return error_response_json("NotFoundException", f"Key {key_id} not found", 400)
+    err = _check_key_state(rec)
+    if err:
+        return err
 
     plaintext_b64 = data.get("Plaintext", "")
     plaintext = base64.b64decode(plaintext_b64) if isinstance(plaintext_b64, str) else plaintext_b64
@@ -511,7 +541,7 @@ def _encrypt(data):
         )
 
     return json_response({
-        "KeyId": rec["KeyId"],
+        "KeyId": rec["Arn"],
         "CiphertextBlob": base64.b64encode(ciphertext).decode(),
         "EncryptionAlgorithm": data.get(
             "EncryptionAlgorithm", "SYMMETRIC_DEFAULT"
@@ -542,6 +572,9 @@ def _decrypt(data):
             "Unable to find the key for decryption",
             400,
         )
+    err = _check_key_state(rec)
+    if err:
+        return err
 
     if "_symmetric_key" in rec:
         stored_ctx_hash = ciphertext[36:68]
@@ -591,7 +624,7 @@ def _decrypt(data):
         )
 
     return json_response({
-        "KeyId": rec["KeyId"],
+        "KeyId": rec["Arn"],
         "Plaintext": base64.b64encode(plaintext).decode(),
         "EncryptionAlgorithm": data.get(
             "EncryptionAlgorithm", "SYMMETRIC_DEFAULT"
@@ -607,6 +640,9 @@ def _generate_data_key_common(data):
         return None, None, error_response_json(
             "NotFoundException", f"Key {key_id} not found", 400
         )
+    err = _check_key_state(rec)
+    if err:
+        return None, None, err
     if "_symmetric_key" not in rec:
         return None, None, error_response_json(
             "UnsupportedOperationException",
@@ -643,7 +679,7 @@ def _generate_data_key(data):
         # result is an error response tuple
         return result
     return json_response({
-        "KeyId": rec["KeyId"],
+        "KeyId": rec["Arn"],
         "Plaintext": base64.b64encode(data_key).decode(),
         "CiphertextBlob": base64.b64encode(result).decode(),
     })
@@ -654,7 +690,7 @@ def _generate_data_key_without_plaintext(data):
     if rec is None:
         return result
     return json_response({
-        "KeyId": rec["KeyId"],
+        "KeyId": rec["Arn"],
         "CiphertextBlob": base64.b64encode(result).decode(),
     })
 
@@ -817,7 +853,7 @@ def _schedule_key_deletion(data):
     rec["Enabled"] = False
     rec["DeletionDate"] = int(time.time() + (days * 86400))
     return json_response({
-        "KeyId": rec["KeyId"],
+        "KeyId": rec["Arn"],
         "KeyState": "PendingDeletion",
         "DeletionDate": rec["DeletionDate"],
     })
@@ -829,7 +865,7 @@ def _cancel_key_deletion(data):
         return error_response_json("NotFoundException", f"Key {data.get('KeyId', '')} not found", 400)
     rec["KeyState"] = "Disabled"
     rec.pop("DeletionDate", None)
-    return json_response({"KeyId": rec["KeyId"]})
+    return json_response({"KeyId": rec["Arn"]})
 
 
 # ---- Tags ----

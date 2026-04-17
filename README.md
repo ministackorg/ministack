@@ -483,6 +483,7 @@ Unsupported resource types fail with `CREATE_FAILED` (or `ROLLBACK_COMPLETE` if 
 | **AppConfig** | CreateApplication, GetApplication, ListApplications, UpdateApplication, DeleteApplication, CreateEnvironment, GetEnvironment, ListEnvironments, UpdateEnvironment, DeleteEnvironment, CreateConfigurationProfile, GetConfigurationProfile, ListConfigurationProfiles, UpdateConfigurationProfile, DeleteConfigurationProfile, CreateHostedConfigurationVersion, GetHostedConfigurationVersion, ListHostedConfigurationVersions, DeleteHostedConfigurationVersion, CreateDeploymentStrategy, GetDeploymentStrategy, ListDeploymentStrategies, UpdateDeploymentStrategy, DeleteDeploymentStrategy, StartDeployment, GetDeployment, ListDeployments, StopDeployment, TagResource, UntagResource, ListTagsForResource, StartConfigurationSession, GetLatestConfiguration | 33 operations; control plane + data plane; hosted configuration versions; deployments complete immediately; session-based configuration retrieval with token rotation |
 | **Transfer Family** | CreateServer, DescribeServer, DeleteServer, ListServers, CreateUser, DescribeUser, DeleteUser, ListUsers, ImportSshPublicKey, DeleteSshPublicKey | 10 operations; SFTP server and user management; SSH key rotation; LOGICAL home directory mappings to S3; in-memory state |
 | **EventBridge Scheduler** | CreateSchedule, GetSchedule, UpdateSchedule, DeleteSchedule, ListSchedules, CreateScheduleGroup, GetScheduleGroup, DeleteScheduleGroup, ListScheduleGroups, TagResource, UntagResource, ListTagsForResource | 12 actions; schedule groups with cascading deletes; `rate()`, `cron()`, `at()` expressions; group/prefix/state filters on list; default group auto-created; CFN `AWS::Scheduler::Schedule` and `AWS::Scheduler::ScheduleGroup` supported |
+| **EKS** | CreateCluster, DescribeCluster, ListClusters, DeleteCluster, CreateNodegroup, DescribeNodegroup, ListNodegroups, DeleteNodegroup, TagResource, UntagResource, ListTagsForResource | 11 operations; `CreateCluster` spawns a real **k3s** container (75 MB) with a full Kubernetes API server; `kubectl`, Helm, and any K8s tooling work out of the box; cascading delete removes nodegroups and k3s container; CFN `AWS::EKS::Cluster` and `AWS::EKS::Nodegroup` supported |
 
 ---
 
@@ -690,7 +691,7 @@ Install DuckDB for full Athena SQL compatibility: `pip install ministack[full]`.
 
 When `PERSIST_STATE=1`, MiniStack saves service state to `STATE_DIR` on shutdown and reloads it on startup. Writes are atomic (write-to-tmp then rename) to prevent corruption on crash.
 
-Services currently supporting persistence: **All services** — API Gateway v1/v2, ALB, ACM, AppConfig, AppSync, Athena, Cloud Map, CloudFront, CloudWatch, CloudWatch Logs, CodeBuild, Cognito, DynamoDB, EC2, ECR, ECS, EFS, ElastiCache, EMR, EventBridge, EventBridge Scheduler, Firehose, Glue, IAM/STS, Kinesis, KMS, Lambda, RDS, Route 53, S3, Secrets Manager, SES, SES v2, SNS, SQS, SSM, Step Functions, Transfer Family, WAF v2
+Services currently supporting persistence: **All services** — API Gateway v1/v2, ALB, ACM, AppConfig, AppSync, Athena, Cloud Map, CloudFront, CloudWatch, CloudWatch Logs, CodeBuild, Cognito, DynamoDB, EC2, ECR, ECS, EFS, EKS, ElastiCache, EMR, EventBridge, EventBridge Scheduler, Firehose, Glue, IAM/STS, Kinesis, KMS, Lambda, RDS, Route 53, S3, Secrets Manager, SES, SES v2, SNS, SQS, SSM, Step Functions, Transfer Family, WAF v2
 
 ```bash
 docker run -p 4566:4566 \
@@ -742,7 +743,7 @@ services:
     networks:
       infra-network:
     healthcheck:
-      test: "python -c "import urllib.request; urllib.request.urlopen('http://localhost:4566/_ministack/health')" || exit 1"
+      test: "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:4566/_ministack/health')\" || exit 1"
       interval: 10s
       timeout: 2s
       start_period: 5s
@@ -769,7 +770,38 @@ networks:
   infra-network:
 ```
 
-Option prvivileged set to "true" is needed if /var/run/docker.sock is root owned.
+Option privileged set to "true" is needed if /var/run/docker.sock is root owned.
+
+### EKS with Real Kubernetes (k3s)
+
+MiniStack's EKS spawns a real [k3s](https://k3s.io) cluster (75 MB image) when you create a cluster. `kubectl`, Helm, and any Kubernetes tooling work out of the box.
+
+```bash
+# Create an EKS cluster — k3s starts automatically
+aws --endpoint-url=http://localhost:4566 eks create-cluster \
+  --name my-cluster --role-arn arn:aws:iam::000000000000:role/eks \
+  --resources-vpc-config subnetIds=subnet-1
+
+# Get the k3s kubeconfig (container name follows ministack-eks-{name} pattern)
+docker exec ministack-eks-my-cluster cat /etc/rancher/k3s/k3s.yaml \
+  | sed "s/127.0.0.1:6443/localhost:$(docker port ministack-eks-my-cluster 6443/tcp | cut -d: -f2)/" \
+  > /tmp/ministack-kubeconfig.yaml
+
+# Use kubectl against real Kubernetes
+export KUBECONFIG=/tmp/ministack-kubeconfig.yaml
+kubectl get nodes          # Real k3s node, Ready status
+kubectl create deployment nginx --image=nginx:alpine
+kubectl get pods           # Real pod running
+
+# Helm works too
+helm repo add bitnami https://charts.bitnami.com/bitnami
+helm install my-redis bitnami/redis --set auth.enabled=false
+
+# Clean up — k3s container is removed automatically
+aws --endpoint-url=http://localhost:4566 eks delete-cluster --name my-cluster
+```
+
+> **Note:** EKS requires Docker socket access (`-v /var/run/docker.sock:/var/run/docker.sock`) to spawn k3s containers. The k3s image is pulled on first `CreateCluster` call.
 
 ### Lambda Warm Starts
 

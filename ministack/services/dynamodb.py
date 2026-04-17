@@ -271,6 +271,10 @@ def _create_table(data):
         "StreamSpecification": data.get("StreamSpecification"),
         "SSEDescription": data.get("SSESpecification"),
     }
+    if data.get("StreamSpecification"):
+        stream_label = now_iso()
+        _tables[name]["LatestStreamLabel"] = stream_label
+        _tables[name]["LatestStreamArn"] = f"{_tables[name]['TableArn']}/stream/{stream_label}"
     if data.get("Tags"):
         _tags[_tables[name]["TableArn"]] = data["Tags"]
     return json_response({"TableDescription": _table_description(name)})
@@ -376,8 +380,8 @@ def _table_description(name):
         desc["LocalSecondaryIndexes"] = t["LocalSecondaryIndexes"]
     if t.get("StreamSpecification"):
         desc["StreamSpecification"] = t["StreamSpecification"]
-        desc["LatestStreamLabel"] = now_iso()
-        desc["LatestStreamArn"] = f"{t['TableArn']}/stream/{now_iso()}"
+        desc["LatestStreamLabel"] = t.get("LatestStreamLabel", "")
+        desc["LatestStreamArn"] = t.get("LatestStreamArn", "")
     if t.get("SSEDescription"):
         desc["SSEDescription"] = t["SSEDescription"]
     desc["WarmThroughput"] = t.get("WarmThroughput", {

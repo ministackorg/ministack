@@ -89,7 +89,7 @@ def test_kms_sign_and_verify_pkcs1(kms_client):
         MessageType="RAW",
         SigningAlgorithm="RSASSA_PKCS1_V1_5_SHA_256",
     )
-    assert sign_resp["KeyId"] == key_id
+    assert key_id in sign_resp["KeyId"]  # KeyId in response is the full ARN
     assert sign_resp["SigningAlgorithm"] == "RSASSA_PKCS1_V1_5_SHA_256"
     assert len(sign_resp["Signature"]) > 0
 
@@ -132,14 +132,16 @@ def test_kms_verify_wrong_message(kms_client):
         MessageType="RAW",
         SigningAlgorithm="RSASSA_PKCS1_V1_5_SHA_256",
     )
-    verify_resp = kms_client.verify(
-        KeyId=key_id,
-        Message=b"tampered",
-        MessageType="RAW",
-        Signature=sign_resp["Signature"],
-        SigningAlgorithm="RSASSA_PKCS1_V1_5_SHA_256",
-    )
-    assert verify_resp["SignatureValid"] is False
+    # Real AWS raises KMSInvalidSignatureException on invalid signature
+    import pytest
+    with pytest.raises(kms_client.exceptions.KMSInvalidSignatureException):
+        kms_client.verify(
+            KeyId=key_id,
+            Message=b"tampered",
+            MessageType="RAW",
+            Signature=sign_resp["Signature"],
+            SigningAlgorithm="RSASSA_PKCS1_V1_5_SHA_256",
+        )
 
 def test_kms_jwt_signing_flow(kms_client):
     """Sign a JWT-style header.payload string and verify the signature."""
@@ -180,7 +182,7 @@ def test_kms_encrypt_decrypt_roundtrip(kms_client):
     plaintext = b"sensitive document content"
 
     enc_resp = kms_client.encrypt(KeyId=key_id, Plaintext=plaintext)
-    assert enc_resp["KeyId"] == key_id
+    assert key_id in enc_resp["KeyId"]
 
     dec_resp = kms_client.decrypt(CiphertextBlob=enc_resp["CiphertextBlob"])
     assert dec_resp["Plaintext"] == plaintext
@@ -205,7 +207,7 @@ def test_kms_generate_data_key_aes_256(kms_client):
     key_id = key["KeyMetadata"]["KeyId"]
 
     resp = kms_client.generate_data_key(KeyId=key_id, KeySpec="AES_256")
-    assert resp["KeyId"] == key_id
+    assert key_id in resp["KeyId"]
     assert len(resp["Plaintext"]) == 32
     assert resp["CiphertextBlob"]
 
@@ -238,7 +240,7 @@ def test_kms_generate_data_key_without_plaintext(kms_client):
     resp = kms_client.generate_data_key_without_plaintext(
         KeyId=key_id, KeySpec="AES_256"
     )
-    assert resp["KeyId"] == key_id
+    assert key_id in resp["KeyId"]
     assert resp["CiphertextBlob"]
     assert "Plaintext" not in resp
 
@@ -247,7 +249,7 @@ def test_kms_get_public_key(kms_client):
     key_id = key["KeyMetadata"]["KeyId"]
 
     resp = kms_client.get_public_key(KeyId=key_id)
-    assert resp["KeyId"] == key_id
+    assert key_id in resp["KeyId"]
     assert resp["KeySpec"] == "RSA_2048"
     assert resp["PublicKey"]
 
@@ -442,7 +444,7 @@ def test_kms_ecc_sign_and_verify(kms_client):
         MessageType="RAW",
         SigningAlgorithm="ECDSA_SHA_256",
     )
-    assert sign_resp["KeyId"] == key_id
+    assert key_id in sign_resp["KeyId"]  # KeyId in response is the full ARN
     assert sign_resp["SigningAlgorithm"] == "ECDSA_SHA_256"
     assert len(sign_resp["Signature"]) > 0
 
@@ -465,21 +467,22 @@ def test_kms_ecc_verify_wrong_message(kms_client):
         MessageType="RAW",
         SigningAlgorithm="ECDSA_SHA_256",
     )
-    verify_resp = kms_client.verify(
-        KeyId=key_id,
-        Message=b"tampered",
-        MessageType="RAW",
-        Signature=sign_resp["Signature"],
-        SigningAlgorithm="ECDSA_SHA_256",
-    )
-    assert verify_resp["SignatureValid"] is False
+    import pytest
+    with pytest.raises(kms_client.exceptions.KMSInvalidSignatureException):
+        kms_client.verify(
+            KeyId=key_id,
+            Message=b"tampered",
+            MessageType="RAW",
+            Signature=sign_resp["Signature"],
+            SigningAlgorithm="ECDSA_SHA_256",
+        )
 
 def test_kms_ecc_get_public_key(kms_client):
     key = kms_client.create_key(KeySpec="ECC_SECG_P256K1", KeyUsage="SIGN_VERIFY")
     key_id = key["KeyMetadata"]["KeyId"]
 
     resp = kms_client.get_public_key(KeyId=key_id)
-    assert resp["KeyId"] == key_id
+    assert key_id in resp["KeyId"]
     assert resp["KeySpec"] == "ECC_SECG_P256K1"
     assert resp["PublicKey"]
     assert "ECDSA_SHA_256" in resp["SigningAlgorithms"]
@@ -568,16 +571,17 @@ def test_kms_ecc_sign_verify_digest_mode(kms_client):
     )
     assert verify_resp["SignatureValid"] is True
 
-    # Wrong digest should fail
+    # Wrong digest should fail with KMSInvalidSignatureException
+    import pytest
     wrong_digest = hashlib.sha256(b"different message").digest()
-    verify_resp = kms_client.verify(
-        KeyId=key_id,
-        Message=wrong_digest,
-        MessageType="DIGEST",
-        Signature=sign_resp["Signature"],
-        SigningAlgorithm="ECDSA_SHA_256",
-    )
-    assert verify_resp["SignatureValid"] is False
+    with pytest.raises(kms_client.exceptions.KMSInvalidSignatureException):
+        kms_client.verify(
+            KeyId=key_id,
+            Message=wrong_digest,
+            MessageType="DIGEST",
+            Signature=sign_resp["Signature"],
+            SigningAlgorithm="ECDSA_SHA_256",
+        )
 
 def test_kms_ecc_sign_via_alias(kms_client):
     """Sign and verify using an alias instead of key ID."""
@@ -609,3 +613,23 @@ def test_kms_key_rotation_with_period(kms_client):
     assert status["KeyRotationEnabled"] is True
     assert status["RotationPeriodInDays"] == 180
     kms_client.schedule_key_deletion(KeyId=key_id, PendingWindowInDays=7)
+
+
+def test_kms_pending_deletion_blocks_encrypt(kms_client):
+    """Encrypt on a PendingDeletion key should raise KMSInvalidStateException."""
+    import pytest
+    key = kms_client.create_key()
+    key_id = key["KeyMetadata"]["KeyId"]
+    kms_client.schedule_key_deletion(KeyId=key_id, PendingWindowInDays=7)
+    with pytest.raises(kms_client.exceptions.KMSInvalidStateException):
+        kms_client.encrypt(KeyId=key_id, Plaintext=b"test")
+
+
+def test_kms_disabled_key_blocks_encrypt(kms_client):
+    """Encrypt on a disabled key should raise DisabledException."""
+    import pytest
+    key = kms_client.create_key()
+    key_id = key["KeyMetadata"]["KeyId"]
+    kms_client.disable_key(KeyId=key_id)
+    with pytest.raises(kms_client.exceptions.DisabledException):
+        kms_client.encrypt(KeyId=key_id, Plaintext=b"test")

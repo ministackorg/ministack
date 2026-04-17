@@ -1427,8 +1427,13 @@ def _list_services_by_namespace(data):
 def _put_account_setting_default(data):
     name = data.get("name", "")
     value = data.get("value", "")
-    _account_settings[name] = {"name": name, "value": value, "principalArn": f"arn:aws:iam::{os.environ.get('MINISTACK_ACCOUNT_ID', '000000000000')}:root"}
-    return json_response({"setting": _account_settings[name]})
+    _account_settings[name] = value
+    return json_response({"setting": {
+        "name": name,
+        "value": value,
+        "principalArn": f"arn:aws:iam::{get_account_id()}:root",
+        "type": "account",
+    }})
 
 
 def _delete_account_setting(data):

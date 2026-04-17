@@ -29,6 +29,7 @@ import datetime
 import logging
 import os
 import socket
+import threading
 import time
 from urllib.parse import parse_qs
 from xml.sax.saxutils import escape as _esc
@@ -62,8 +63,12 @@ _ministack_network = None
 # ── Persistence ────────────────────────────────────────────
 
 def get_state():
+    instances = copy.deepcopy(_instances)
+    # Strip Docker container IDs (not restorable across restarts)
+    for key in list(instances._data):
+        instances._data[key].pop("_docker_container_id", None)
     state = {
-        "instances": {},
+        "instances": instances,
         "clusters": copy.deepcopy(_clusters),
         "subnet_groups": copy.deepcopy(_subnet_groups),
         "param_groups": copy.deepcopy(_param_groups),
@@ -75,10 +80,6 @@ def get_state():
         "tags": copy.deepcopy(_tags),
         "port_counter": _port_counter[0],
     }
-    for name, inst in _instances.items():
-        i = copy.deepcopy(inst)
-        i.pop("_docker_container_id", None)
-        state["instances"][name] = i
     return state
 
 
@@ -96,10 +97,19 @@ def restore_state(data):
     _tags.update(data.get("tags", {}))
     if "port_counter" in data:
         _port_counter[0] = data["port_counter"]
-    for name, inst in data.get("instances", {}).items():
-        inst["_docker_container_id"] = None
-        inst["DBInstanceStatus"] = "available"
-        _instances[name] = inst
+    instances_data = data.get("instances", {})
+    if isinstance(instances_data, AccountScopedDict):
+        # New format: AccountScopedDict with full multi-account data
+        for key, inst in list(instances_data._data.items()):
+            inst["_docker_container_id"] = None
+            inst["DBInstanceStatus"] = "available"
+            _instances._data[key] = inst
+    else:
+        # Legacy format: plain dict keyed by instance name
+        for name, inst in instances_data.items():
+            inst["_docker_container_id"] = None
+            inst["DBInstanceStatus"] = "available"
+            _instances[name] = inst
 
 
 _restored = load_state("rds")
@@ -152,10 +162,14 @@ def _wait_for_port(host, port, timeout=60):
     return False
 
 
+_port_lock = threading.Lock()
+
+
 def _next_port():
-    port = _port_counter[0]
-    _port_counter[0] += 1
-    return port
+    with _port_lock:
+        port = _port_counter[0]
+        _port_counter[0] += 1
+        return port
 
 
 # ---------------------------------------------------------------------------
@@ -285,24 +299,30 @@ def _create_db_instance(p):
                     if container_ip:
                         internal_host = container_ip
                         internal_port = container_port
-                        if _wait_for_port(container_ip, container_port):
-                            logger.info(
-                                "RDS: %s container for %s ready at "
-                                "%s:%s (network %s)", engine, db_id,
-                                container_ip, container_port, ms_network)
-                        else:
-                            logger.warning(
-                                "RDS: %s container for %s at %s:%s "
-                                "not ready after timeout", engine,
-                                db_id, container_ip, container_port)
+                        def _bg_wait(cip=container_ip, cport=container_port,
+                                     eng=engine, did=db_id, net=ms_network):
+                            if _wait_for_port(cip, cport):
+                                logger.info(
+                                    "RDS: %s container for %s ready at "
+                                    "%s:%s (network %s)", eng, did,
+                                    cip, cport, net)
+                            else:
+                                logger.warning(
+                                    "RDS: %s container for %s at %s:%s "
+                                    "not ready after timeout", eng,
+                                    did, cip, cport)
+                        threading.Thread(target=_bg_wait, daemon=True).start()
                     else:
                         logger.info(
                             "RDS: started %s container for %s on port %s",
                             engine, db_id, host_port)
                 else:
-                    logger.info(
-                        "RDS: started %s container for %s on port %s",
-                        engine, db_id, host_port)
+                    def _bg_wait_port(hp=host_port, eng=engine, did=db_id):
+                        if _wait_for_port("127.0.0.1", hp):
+                            logger.info("RDS: %s container for %s ready on port %s", eng, did, hp)
+                        else:
+                            logger.warning("RDS: %s container for %s on port %s not ready after timeout", eng, did, hp)
+                    threading.Thread(target=_bg_wait_port, daemon=True).start()
             except Exception as e:
                 logger.warning("RDS: Docker failed for %s: %s", db_id, e)
 
