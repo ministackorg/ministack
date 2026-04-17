@@ -35,7 +35,7 @@ jobs:
 
       - name: Start MiniStack
         run: |
-          REDIS_HOST=localhost python -m uvicorn ministack.app:app --host 0.0.0.0 --port 4566 &
+          REDIS_HOST=localhost python -m hypercorn ministack.app:app --bind 0.0.0.0:4566 --keep-alive 75 &
           sleep 3
           curl -sf http://localhost:4566/_ministack/health
 

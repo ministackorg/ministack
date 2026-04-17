@@ -2318,7 +2318,7 @@ def _dispatch_aws_sdk_json(service_info, service_name, action, input_data):
 
     # Service handlers are async def but perform no real I/O, so we can
     # drive the coroutine synchronously — this avoids conflicts with the
-    # already-running uvicorn event loop.
+    # already-running asyncio event loop.
     coro = handler("POST", "/", headers, body, {})
     try:
         coro.send(None)

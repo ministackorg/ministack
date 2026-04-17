@@ -905,7 +905,8 @@ def _pid_file(port: int) -> str:
 
 
 def main():
-    import uvicorn
+    from hypercorn.config import Config as HypercornConfig
+    from hypercorn.asyncio import serve as hypercorn_serve
 
     parser = argparse.ArgumentParser(description="MiniStack — Local AWS Service Emulator")
     parser.add_argument("-d", "--detach", action="store_true", help="Run in the background (detached mode)")
@@ -944,10 +945,10 @@ def main():
         # process; the OS reclaims it when the parent exits.
         log_fh = open(log_file, "w")
         proc = subprocess.Popen(
-            [sys.executable, "-m", "uvicorn", "ministack.app:app",
-             "--host", "0.0.0.0", "--port", str(port),
-             "--log-level", LOG_LEVEL.lower(),
-             "--timeout-keep-alive", "75"],
+            [sys.executable, "-m", "hypercorn", "ministack.app:app",
+             "--bind", f"0.0.0.0:{port}",
+             "--log-level", LOG_LEVEL.upper(),
+             "--keep-alive", "75"],
             stdout=log_fh,
             stderr=subprocess.STDOUT,
             start_new_session=True,
@@ -981,18 +982,16 @@ def main():
             def filter(self, record):
                 if LOG_LEVEL == "DEBUG":
                     return True
-                msg = record.getMessage()
-                return not any(p in msg for p in _HEALTH_PATHS)
+                return not any(p in record.getMessage() for p in _HEALTH_PATHS)
 
-        log_config = uvicorn.config.LOGGING_CONFIG.copy()
-        log_config["loggers"] = log_config.get("loggers", {}).copy()
-        log_config["filters"] = {"health_filter": {"()": lambda: _HealthLogFilter()}}
-        access_logger = log_config["loggers"].get("uvicorn.access", {}).copy()
-        access_logger["filters"] = ["health_filter"]
-        log_config["loggers"]["uvicorn.access"] = access_logger
+        logging.getLogger("hypercorn.access").addFilter(_HealthLogFilter())
 
-        uvicorn.run("ministack.app:app", host="0.0.0.0", port=port, log_level=LOG_LEVEL.lower(),
-                    timeout_keep_alive=75, log_config=log_config)
+        config = HypercornConfig()
+        config.bind = [f"0.0.0.0:{port}"]
+        config.keep_alive_timeout = 75
+        config.loglevel = LOG_LEVEL.upper()
+
+        asyncio.run(hypercorn_serve(app, config))
     finally:
         _cleanup()
 

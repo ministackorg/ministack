@@ -22,8 +22,7 @@ classifiers = [
     "Topic :: Internet",
 ]
 dependencies = [
-    "uvicorn[standard]>=0.30.6",
-    "httptools>=0.6.1",
+    "hypercorn>=0.18.0",
     "pyyaml>=6.0",
     "defusedxml>=0.7",
 ]

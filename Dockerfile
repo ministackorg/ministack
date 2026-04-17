@@ -1,7 +1,7 @@
 FROM python:3.12-alpine AS builder
 
 RUN pip install --no-cache-dir --no-compile \
-        uvicorn==0.30.6 \
+        hypercorn==0.18.0 \
         "cbor2>=5.4.0" \
         "defusedxml>=0.7" \
         "docker>=7.0.0" \
@@ -33,7 +33,7 @@ WORKDIR /opt/ministack
 COPY --from=builder /usr/local/lib/python3.12/site-packages /usr/local/lib/python3.12/site-packages
 COPY --from=builder /usr/local/bin/aws /usr/local/bin/aws
 COPY --from=builder /usr/local/bin/aws_completer /usr/local/bin/aws_completer
-COPY --from=builder /usr/local/bin/uvicorn /usr/local/bin/uvicorn
+COPY --from=builder /usr/local/bin/hypercorn /usr/local/bin/hypercorn
 
 COPY bin/awslocal /usr/local/bin/awslocal
 RUN chmod +x /usr/local/bin/awslocal
@@ -67,4 +67,4 @@ EXPOSE 4566
 HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=3 \
     CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:4566/_ministack/health')" || exit 1
 
-ENTRYPOINT ["python", "-m", "uvicorn", "ministack.app:app", "--host", "0.0.0.0", "--port", "4566"]
+ENTRYPOINT ["python", "-m", "hypercorn", "ministack.app:app", "--bind", "0.0.0.0:4566", "--keep-alive", "75"]
