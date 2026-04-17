@@ -12,6 +12,7 @@ import os
 import shutil
 import subprocess
 import sys
+import queue
 import tempfile
 import threading
 import time
@@ -464,7 +465,7 @@ class Worker:
         self._stderr_thread = threading.Thread(
             target=self._read_stderr, daemon=True, name=f"stderr-{self.func_name}"
         )
-        self._stderr_thread.start()        
+        self._stderr_thread.start()
 
         init = {
             "code_dir": code_dir,

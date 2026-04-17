@@ -96,13 +96,14 @@ async def handle_request(method, path, headers, body, query_params):
         if not assumed_arn.endswith(f"/{session}"):
             assumed_arn = f"{assumed_arn}/{session}"
         role_id = "AROA" + new_uuid().replace("-", "")[:17].upper()
+        provider = _p(params, "ProviderId") or "sts.amazonaws.com"
         if use_json:
             return json_response({
                 "Credentials": {"AccessKeyId": access_key, "SecretAccessKey": secret_key, "SessionToken": session_token, "Expiration": time.time() + duration},
                 "AssumedRoleUser": {"AssumedRoleId": f"{role_id}:{session}", "Arn": assumed_arn},
                 "SubjectFromWebIdentityToken": "test-subject",
                 "Audience": "sts.amazonaws.com",
-                "Provider": "accounts.google.com",
+                "Provider": provider,
             })
         return _xml(200, "AssumeRoleWithWebIdentityResponse",
                     f"<AssumeRoleWithWebIdentityResult>"
@@ -118,7 +119,7 @@ async def handle_request(method, path, headers, body, query_params):
                     f"</AssumedRoleUser>"
                     f"<SubjectFromWebIdentityToken>test-subject</SubjectFromWebIdentityToken>"
                     f"<Audience>sts.amazonaws.com</Audience>"
-                    f"<Provider>accounts.google.com</Provider>"
+                    f"<Provider>{provider}</Provider>"
                     f"</AssumeRoleWithWebIdentityResult>",
                     ns="sts")
 

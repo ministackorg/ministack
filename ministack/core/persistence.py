@@ -4,6 +4,7 @@ When PERSIST_STATE=1, service state is saved to STATE_DIR on shutdown
 and reloaded on startup.
 """
 
+import ast
 import json
 import logging
 import os
@@ -37,8 +38,8 @@ def _json_object_hook(obj):
             account_id, key_repr = k.split("\x00", 1)
             # Restore the original key (was serialized with repr())
             try:
-                original_key = eval(key_repr)  # noqa: S307
-            except Exception:
+                original_key = ast.literal_eval(key_repr)
+            except (ValueError, SyntaxError):
                 original_key = key_repr
             asd._data[(account_id, original_key)] = v
         return asd

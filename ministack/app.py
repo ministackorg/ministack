@@ -152,6 +152,7 @@ SERVICE_HANDLERS = {
     "appconfig": _lazy_handler("appconfig"),
     "appconfigdata": _lazy_handler("appconfig"),
     "scheduler": _lazy_handler("scheduler"),
+    "eks": _lazy_handler("eks"),
 }
 
 SERVICE_NAME_ALIASES = {
@@ -207,7 +208,7 @@ BANNER = r"""
           SSM, EventBridge, Kinesis, CloudWatch, SES, SES v2, ACM, WAF v2, Step Functions,
           ECS, RDS, ElastiCache, Glue, Athena, API Gateway, Firehose, Route53,
           Cognito, EC2, EMR, EBS, EFS, ALB/ELBv2, CloudFormation, KMS, ECR, CloudFront,
-          AppSync, Cloud Map, S3 Files, RDS Data API, CodeBuild, AppConfig, Transfer
+          AppSync, Cloud Map, S3 Files, RDS Data API, CodeBuild, AppConfig, Transfer, EKS
 """
 
 
@@ -674,6 +675,7 @@ async def _handle_lifespan(scope, receive, send):
                     "servicediscovery": "servicediscovery", "s3files": "s3files",
                     "appconfig": "appconfig", "transfer": "transfer",
                     "scheduler": "scheduler", "autoscaling": "autoscaling",
+                    "eks": "eks",
                 }
                 save_dict = {}
                 for key, mod_name in _state_map.items():
@@ -693,7 +695,7 @@ def _stop_docker_containers():
         client = docker.from_env()
     except Exception:
         return
-    for label in ("ministack=rds", "ministack=ecs", "ministack=elasticache"):
+    for label in ("ministack=rds", "ministack=ecs", "ministack=elasticache", "ministack=eks", "ministack=lambda"):
         try:
             for c in client.containers.list(filters={"label": label}):
                 try:
@@ -827,7 +829,7 @@ def _reset_all_state():
         "apigateway", "apigateway_v1", "firehose", "route53", "cognito", "ec2",
         "emr", "alb", "acm", "ses_v2", "waf", "efs", "cloudformation", "kms",
         "cloudfront", "codebuild", "ecr", "appsync", "servicediscovery",
-        "rds_data", "s3files", "appconfig", "transfer", "scheduler", "autoscaling", "iam",
+        "rds_data", "s3files", "appconfig", "transfer", "scheduler", "autoscaling", "eks", "iam",
     ]
     for mod_name in _ALL_SERVICE_MODULES:
         if mod_name in _loaded_modules:

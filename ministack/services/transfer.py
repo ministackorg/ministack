@@ -201,7 +201,7 @@ def _list_servers(data):
     if next_token:
         for i, s in enumerate(all_servers):
             if s["ServerId"] == next_token:
-                start = i
+                start = i + 1
                 break
 
     page = all_servers[start:start + max_results]
@@ -332,7 +332,7 @@ def _list_users(data):
     if next_token:
         for i, u in enumerate(server_users):
             if u["UserName"] == next_token:
-                start = i
+                start = i + 1
                 break
 
     page = server_users[start:start + max_results]

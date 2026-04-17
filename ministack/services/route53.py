@@ -85,15 +85,14 @@ if _restored:
 
 
 def reset():
-    global _zones, _records, _changes, _health_checks, _tags, _caller_refs, _hc_caller_refs
     with _lock:
-        _zones = {}
-        _records = {}
-        _changes = {}
-        _health_checks = {}
-        _tags = {}
-        _caller_refs = {}
-        _hc_caller_refs = {}
+        _zones.clear()
+        _records.clear()
+        _changes.clear()
+        _health_checks.clear()
+        _tags.clear()
+        _caller_refs.clear()
+        _hc_caller_refs.clear()
 
 
 # ─── ID generators ────────────────────────────────────────────────────────────

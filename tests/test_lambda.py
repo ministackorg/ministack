@@ -1110,6 +1110,31 @@ def test_lambda_layer_publish(lam):
     assert resp["Version"] == 1
     assert "my-test-layer" in resp["LayerVersionArn"]
 
+def test_lambda_layer_publish_from_s3(lam, s3):
+    """PublishLayerVersion with S3Bucket/S3Key. Contributed by @Baptiste-Garcin (#356)."""
+    import zipfile, io
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        z.writestr("s3layer.py", "# layer from s3")
+    zip_bytes = buf.getvalue()
+
+    bucket = "layer-bucket"
+    key = "layers/my-layer.zip"
+    s3.create_bucket(Bucket=bucket)
+    s3.put_object(Bucket=bucket, Key=key, Body=zip_bytes)
+
+    resp = lam.publish_layer_version(
+        LayerName="s3-layer",
+        Description="Layer from S3",
+        Content={"S3Bucket": bucket, "S3Key": key},
+        CompatibleRuntimes=["python3.12"],
+    )
+    assert resp["Version"] == 1
+    assert "s3-layer" in resp["LayerVersionArn"]
+    assert resp["Content"]["CodeSize"] == len(zip_bytes)
+    assert resp["Content"]["CodeSha256"]
+
 def test_lambda_layer_get_version(lam):
     resp = lam.get_layer_version(LayerName="my-test-layer", VersionNumber=1)
     assert resp["Version"] == 1

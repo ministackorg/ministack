@@ -705,6 +705,63 @@ def _scheduler_group_delete(physical_id, props):
         _sched._tags.pop(group.get("Arn", ""), None)
 
 
+# --- EKS Cluster ---
+
+def _eks_cluster_create(logical_id, props, stack_name):
+    import ministack.services.eks as _eks
+    name = props.get("Name") or _physical_name(stack_name, logical_id, max_len=100)
+    body = {
+        "name": name,
+        "version": props.get("Version", "1.30"),
+        "roleArn": props.get("RoleArn", f"arn:aws:iam::{get_account_id()}:role/eks-role"),
+        "resourcesVpcConfig": props.get("ResourcesVpcConfig", {}),
+        "tags": {t["Key"]: t["Value"] for t in props.get("Tags", [])},
+    }
+    _eks._create_cluster(body)
+    arn = _eks._cluster_arn(name)
+    cluster = _eks._clusters.get(name, {})
+    return name, {
+        "Arn": arn,
+        "Endpoint": cluster.get("endpoint", ""),
+        "CertificateAuthorityData": cluster.get("certificateAuthority", {}).get("data", ""),
+        "ClusterSecurityGroupId": cluster.get("resourcesVpcConfig", {}).get("clusterSecurityGroupId", ""),
+        "OpenIdConnectIssuerUrl": cluster.get("identity", {}).get("oidc", {}).get("issuer", ""),
+    }
+
+
+def _eks_cluster_delete(physical_id, props):
+    import ministack.services.eks as _eks
+    _eks._delete_cluster(physical_id)
+
+
+def _eks_nodegroup_create(logical_id, props, stack_name):
+    import ministack.services.eks as _eks
+    cluster_name = props.get("ClusterName", "")
+    ng_name = props.get("NodegroupName") or _physical_name(stack_name, logical_id, max_len=63)
+    body = {
+        "nodegroupName": ng_name,
+        "scalingConfig": props.get("ScalingConfig", {"minSize": 1, "maxSize": 2, "desiredSize": 1}),
+        "instanceTypes": props.get("InstanceTypes", ["t3.medium"]),
+        "subnets": props.get("Subnets", []),
+        "nodeRole": props.get("NodeRole", f"arn:aws:iam::{get_account_id()}:role/eks-node-role"),
+        "amiType": props.get("AmiType", "AL2_x86_64"),
+        "diskSize": props.get("DiskSize", 20),
+        "labels": props.get("Labels", {}),
+        "tags": {t["Key"]: t["Value"] for t in props.get("Tags", [])},
+    }
+    _eks._create_nodegroup(cluster_name, body)
+    key = f"{cluster_name}/{ng_name}"
+    ng = _eks._nodegroups.get(key, {})
+    arn = ng.get("nodegroupArn", "")
+    return ng_name, {"Arn": arn}
+
+
+def _eks_nodegroup_delete(physical_id, props):
+    import ministack.services.eks as _eks
+    cluster_name = props.get("ClusterName", "")
+    _eks._delete_nodegroup(cluster_name, physical_id)
+
+
 # --- Kinesis Stream ---
 
 def _kinesis_stream_create(logical_id, props, stack_name):
@@ -2751,6 +2808,9 @@ _RESOURCE_HANDLERS = {
     # EventBridge Scheduler
     "AWS::Scheduler::Schedule": {"create": _scheduler_schedule_create, "delete": _scheduler_schedule_delete},
     "AWS::Scheduler::ScheduleGroup": {"create": _scheduler_group_create, "delete": _scheduler_group_delete},
+    # EKS
+    "AWS::EKS::Cluster": {"create": _eks_cluster_create, "delete": _eks_cluster_delete},
+    "AWS::EKS::Nodegroup": {"create": _eks_nodegroup_create, "delete": _eks_nodegroup_delete},
     # CDK metadata — safe to ignore
     "AWS::CDK::Metadata": {"create": lambda lid, props, sn: (f"CDKMetadata-{lid}", {}), "delete": lambda pid, props: None},
     # AutoScaling

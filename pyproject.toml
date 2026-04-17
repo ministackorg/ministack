@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ministack"
-version = "1.2.19"
+version = "1.2.20"
 description = "Free, open-source local AWS emulator — drop-in LocalStack replacement"
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -47,6 +47,7 @@ dev = [
     "psycopg2-binary>=2.9",
     "pymysql>=1.1",
     "ruff>=0.4",
+    "mypy-boto3-lambda (>=1.42.85,<2.0.0)",
 ]
 
 [project.urls]
@@ -87,3 +88,4 @@ ignore = [
 [tool.coverage.run]
 source = ["ministack"]
 omit = ["tests/*"]
+
