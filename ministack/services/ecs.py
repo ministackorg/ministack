@@ -907,6 +907,7 @@ def _run_task(data):
                         name=f"ministack-ecs-{task_id[:8]}-{cdef['name']}",
                         labels={"ministack": "ecs", "task_arn": task_arn},
                         network=ecs_network,
+                        command=cdef["command"]
                     )
                     task["_docker_ids"].append(container.id)
                     if i < len(task["containers"]):
@@ -1616,14 +1617,17 @@ _ACTION_MAP = {
 def reset():
     docker_client = _get_docker()
     if docker_client:
-        for task in _tasks.values():
-            for cid in task.get("_docker_ids", []):
+        # Stop containers by label instead of chasing individual IDs —
+        # avoids slow 404s for containers that were already removed.
+        try:
+            for c in docker_client.containers.list(filters={"label": "ministack=ecs"}):
                 try:
-                    c = docker_client.containers.get(cid)
                     c.stop(timeout=2)
                     c.remove(v=True)
-                except Exception as e:
-                    logger.warning("reset: failed to stop/remove container %s: %s", cid, e)
+                except Exception:
+                    pass
+        except Exception:
+            pass
     _clusters.clear()
     _task_defs.clear()
     _task_def_latest.clear()

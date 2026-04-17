@@ -548,7 +548,7 @@ def test_cognito_refresh_token_auth_correct_user(cognito_idp):
         ExplicitAuthFlows=["ALLOW_USER_PASSWORD_AUTH", "ALLOW_REFRESH_TOKEN_AUTH"],
     )["UserPoolClient"]["ClientId"]
 
-    for name, pw in [("first", "First1!"), ("second", "Second1!")]:
+    for name, pw in [("first", "FirstPass1!"), ("second", "SecondPass1!")]:
         cognito_idp.admin_create_user(UserPoolId=pid, Username=name)
         cognito_idp.admin_set_user_password(UserPoolId=pid, Username=name, Password=pw, Permanent=True)
 
@@ -557,7 +557,7 @@ def test_cognito_refresh_token_auth_correct_user(cognito_idp):
         UserPoolId=pid,
         ClientId=cid,
         AuthFlow="ADMIN_USER_PASSWORD_AUTH",
-        AuthParameters={"USERNAME": "second", "PASSWORD": "Second1!"},
+        AuthParameters={"USERNAME": "second", "PASSWORD": "SecondPass1!"},
     )
     refresh_token = auth["AuthenticationResult"]["RefreshToken"]
 
@@ -700,7 +700,7 @@ def test_cognito_update_user_pool_client(cognito_idp):
 def test_cognito_admin_reset_user_password(cognito_idp):
     pid = cognito_idp.create_user_pool(PoolName="ResetPwdPool")["UserPool"]["Id"]
     cognito_idp.admin_create_user(UserPoolId=pid, Username="resetuser")
-    cognito_idp.admin_set_user_password(UserPoolId=pid, Username="resetuser", Password="Pass1!", Permanent=True)
+    cognito_idp.admin_set_user_password(UserPoolId=pid, Username="resetuser", Password="PassWord1!", Permanent=True)
     cognito_idp.admin_reset_user_password(UserPoolId=pid, Username="resetuser")
     user = cognito_idp.admin_get_user(UserPoolId=pid, Username="resetuser")
     assert user["UserStatus"] == "RESET_REQUIRED"
@@ -808,14 +808,14 @@ def test_cognito_refresh_token_returns_correct_user(cognito_idp):
         ClientName="qa-refresh-app",
         ExplicitAuthFlows=["ALLOW_USER_PASSWORD_AUTH", "ALLOW_REFRESH_TOKEN_AUTH"],
     )["UserPoolClient"]["ClientId"]
-    for name, pw in [("qa-first", "First1!"), ("qa-second", "Second1!")]:
+    for name, pw in [("qa-first", "FirstPass1!"), ("qa-second", "SecondPass1!")]:
         cognito_idp.admin_create_user(UserPoolId=pid, Username=name)
         cognito_idp.admin_set_user_password(UserPoolId=pid, Username=name, Password=pw, Permanent=True)
     auth = cognito_idp.admin_initiate_auth(
         UserPoolId=pid,
         ClientId=cid,
         AuthFlow="ADMIN_USER_PASSWORD_AUTH",
-        AuthParameters={"USERNAME": "qa-second", "PASSWORD": "Second1!"},
+        AuthParameters={"USERNAME": "qa-second", "PASSWORD": "SecondPass1!"},
     )
     refresh_token = auth["AuthenticationResult"]["RefreshToken"]
     refresh = cognito_idp.admin_initiate_auth(
@@ -853,14 +853,14 @@ def test_cognito_disabled_user_auth_fails(cognito_idp):
         ExplicitAuthFlows=["ALLOW_USER_PASSWORD_AUTH", "ALLOW_REFRESH_TOKEN_AUTH"],
     )["UserPoolClient"]["ClientId"]
     cognito_idp.admin_create_user(UserPoolId=pid, Username="qa-disabled")
-    cognito_idp.admin_set_user_password(UserPoolId=pid, Username="qa-disabled", Password="Dis1!", Permanent=True)
+    cognito_idp.admin_set_user_password(UserPoolId=pid, Username="qa-disabled", Password="DisableP1!", Permanent=True)
     cognito_idp.admin_disable_user(UserPoolId=pid, Username="qa-disabled")
     with pytest.raises(ClientError) as exc:
         cognito_idp.admin_initiate_auth(
             UserPoolId=pid,
             ClientId=cid,
             AuthFlow="ADMIN_USER_PASSWORD_AUTH",
-            AuthParameters={"USERNAME": "qa-disabled", "PASSWORD": "Dis1!"},
+            AuthParameters={"USERNAME": "qa-disabled", "PASSWORD": "DisableP1!"},
         )
     assert exc.value.response["Error"]["Code"] == "NotAuthorizedException"
 
@@ -936,8 +936,8 @@ def test_cognito_totp_full_flow(cognito_idp):
     assert cfg["SoftwareTokenMfaConfiguration"]["Enabled"] is True
 
     # Create and confirm user
-    cognito_idp.admin_create_user(UserPoolId=pid, Username="totp-user", TemporaryPassword="Tmp1!")
-    cognito_idp.admin_set_user_password(UserPoolId=pid, Username="totp-user", Password="Perm1!", Permanent=True)
+    cognito_idp.admin_create_user(UserPoolId=pid, Username="totp-user", TemporaryPassword="TmpPass1!")
+    cognito_idp.admin_set_user_password(UserPoolId=pid, Username="totp-user", Password="PermPass1!", Permanent=True)
 
     # Enroll TOTP: associate → get tokens first (MFA not yet enrolled, pool is ON but no enrollment)
     # Pool ON with no enrollment → auth succeeds so user can enroll
@@ -945,7 +945,7 @@ def test_cognito_totp_full_flow(cognito_idp):
         UserPoolId=pid,
         ClientId=cid,
         AuthFlow="ADMIN_USER_PASSWORD_AUTH",
-        AuthParameters={"USERNAME": "totp-user", "PASSWORD": "Perm1!"},
+        AuthParameters={"USERNAME": "totp-user", "PASSWORD": "PermPass1!"},
     )
     access_token = auth["AuthenticationResult"]["AccessToken"]
 
@@ -963,7 +963,7 @@ def test_cognito_totp_full_flow(cognito_idp):
         UserPoolId=pid,
         ClientId=cid,
         AuthFlow="ADMIN_USER_PASSWORD_AUTH",
-        AuthParameters={"USERNAME": "totp-user", "PASSWORD": "Perm1!"},
+        AuthParameters={"USERNAME": "totp-user", "PASSWORD": "PermPass1!"},
     )
     assert auth2.get("ChallengeName") == "SOFTWARE_TOKEN_MFA"
     assert "Session" in auth2
@@ -995,19 +995,19 @@ def test_cognito_totp_optional_mfa(cognito_idp):
     )
 
     # User without MFA enrolled
-    cognito_idp.admin_create_user(UserPoolId=pid, Username="no-mfa-user", TemporaryPassword="Tmp1!")
-    cognito_idp.admin_set_user_password(UserPoolId=pid, Username="no-mfa-user", Password="Perm1!", Permanent=True)
+    cognito_idp.admin_create_user(UserPoolId=pid, Username="no-mfa-user", TemporaryPassword="TmpPass1!")
+    cognito_idp.admin_set_user_password(UserPoolId=pid, Username="no-mfa-user", Password="PermPass1!", Permanent=True)
     auth = cognito_idp.admin_initiate_auth(
         UserPoolId=pid,
         ClientId=cid,
         AuthFlow="ADMIN_USER_PASSWORD_AUTH",
-        AuthParameters={"USERNAME": "no-mfa-user", "PASSWORD": "Perm1!"},
+        AuthParameters={"USERNAME": "no-mfa-user", "PASSWORD": "PermPass1!"},
     )
     assert "AuthenticationResult" in auth  # no challenge — not enrolled
 
     # User with MFA enrolled via AdminSetUserMFAPreference
-    cognito_idp.admin_create_user(UserPoolId=pid, Username="mfa-user", TemporaryPassword="Tmp1!")
-    cognito_idp.admin_set_user_password(UserPoolId=pid, Username="mfa-user", Password="Perm1!", Permanent=True)
+    cognito_idp.admin_create_user(UserPoolId=pid, Username="mfa-user", TemporaryPassword="TmpPass1!")
+    cognito_idp.admin_set_user_password(UserPoolId=pid, Username="mfa-user", Password="PermPass1!", Permanent=True)
     cognito_idp.admin_set_user_mfa_preference(
         UserPoolId=pid,
         Username="mfa-user",
@@ -1017,15 +1017,15 @@ def test_cognito_totp_optional_mfa(cognito_idp):
         UserPoolId=pid,
         ClientId=cid,
         AuthFlow="ADMIN_USER_PASSWORD_AUTH",
-        AuthParameters={"USERNAME": "mfa-user", "PASSWORD": "Perm1!"},
+        AuthParameters={"USERNAME": "mfa-user", "PASSWORD": "PermPass1!"},
     )
     assert auth2.get("ChallengeName") == "SOFTWARE_TOKEN_MFA"
 
 def test_cognito_admin_get_user_mfa_fields(cognito_idp):
     """AdminGetUser returns correct UserMFASettingList and PreferredMfaSetting."""
     pid = cognito_idp.create_user_pool(PoolName="qa-totp-getuser")["UserPool"]["Id"]
-    cognito_idp.admin_create_user(UserPoolId=pid, Username="mfa-check-user", TemporaryPassword="Tmp1!")
-    cognito_idp.admin_set_user_password(UserPoolId=pid, Username="mfa-check-user", Password="Perm1!", Permanent=True)
+    cognito_idp.admin_create_user(UserPoolId=pid, Username="mfa-check-user", TemporaryPassword="TmpPass1!")
+    cognito_idp.admin_set_user_password(UserPoolId=pid, Username="mfa-check-user", Password="PermPass1!", Permanent=True)
 
     # Before enrollment
     u = cognito_idp.admin_get_user(UserPoolId=pid, Username="mfa-check-user")
@@ -1050,14 +1050,14 @@ def test_cognito_set_user_mfa_preference_via_token(cognito_idp):
         ClientName="qa-totp-self-app",
         ExplicitAuthFlows=["ALLOW_USER_PASSWORD_AUTH", "ALLOW_REFRESH_TOKEN_AUTH"],
     )["UserPoolClient"]["ClientId"]
-    cognito_idp.admin_create_user(UserPoolId=pid, Username="self-enroll", TemporaryPassword="Tmp1!")
-    cognito_idp.admin_set_user_password(UserPoolId=pid, Username="self-enroll", Password="Perm1!", Permanent=True)
+    cognito_idp.admin_create_user(UserPoolId=pid, Username="self-enroll", TemporaryPassword="TmpPass1!")
+    cognito_idp.admin_set_user_password(UserPoolId=pid, Username="self-enroll", Password="PermPass1!", Permanent=True)
 
     auth = cognito_idp.admin_initiate_auth(
         UserPoolId=pid,
         ClientId=cid,
         AuthFlow="ADMIN_USER_PASSWORD_AUTH",
-        AuthParameters={"USERNAME": "self-enroll", "PASSWORD": "Perm1!"},
+        AuthParameters={"USERNAME": "self-enroll", "PASSWORD": "PermPass1!"},
     )
     access_token = auth["AuthenticationResult"]["AccessToken"]
 

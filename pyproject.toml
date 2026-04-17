@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ministack"
-version = "1.2.20"
+version = "1.2.21"
 description = "Free, open-source local AWS emulator — drop-in LocalStack replacement"
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -64,6 +64,9 @@ include = ["ministack*"]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
 python_functions = ["test_*"]
+markers = [
+    "serial: tests that mutate global server state and must run alone",
+]
 
 [tool.ruff]
 line-length = 120

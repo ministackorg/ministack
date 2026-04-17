@@ -342,7 +342,7 @@ async def app(scope, receive, send):
 
     # Admin endpoints — no wildcard CORS headers (return early, before CORS block)
     if path == "/_ministack/reset" and method == "POST":
-        _reset_all_state()
+        await asyncio.to_thread(_reset_all_state)
         run_init = query_params.get("init", [""])[0] == "1"
         if run_init:
             _run_init_scripts()

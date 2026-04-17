@@ -29,6 +29,7 @@ import base64
 import copy
 import hashlib
 import importlib
+import io
 import json
 import logging
 import os
@@ -59,6 +60,45 @@ try:
 except ImportError:
     docker_lib = None
     _docker_available = False
+
+_cached_docker_client = None
+_is_in_container: bool | None = None
+
+
+def _running_in_container() -> bool:
+    """Detect if we're running inside a Docker/Podman container."""
+    global _is_in_container
+    if _is_in_container is not None:
+        return _is_in_container
+    # /.dockerenv is created by Docker; /run/.containerenv by Podman
+    if os.path.exists("/.dockerenv") or os.path.exists("/run/.containerenv"):
+        _is_in_container = True
+        return True
+    # Fall back to checking cgroup (works on most Linux container runtimes)
+    try:
+        with open("/proc/1/cgroup", "r") as f:
+            content = f.read()
+            if "docker" in content or "containerd" in content or "lxc" in content:
+                _is_in_container = True
+                return True
+    except (OSError, IOError):
+        pass
+    _is_in_container = False
+    return False
+
+
+def _get_docker_client():
+    """Return a cached Docker client, or create one on first call."""
+    global _cached_docker_client
+    if _cached_docker_client is not None:
+        return _cached_docker_client
+    if not _docker_available:
+        return None
+    try:
+        _cached_docker_client = docker_lib.from_env()
+        return _cached_docker_client
+    except Exception:
+        return None
 
 _functions = AccountScopedDict()  # function_name -> FunctionRecord
 _layers = AccountScopedDict()  # layer_name -> {"versions": [...], "next_version": int}
@@ -611,7 +651,7 @@ async def handle_request(method: str, path: str, headers: dict, body: bytes, que
 
         # Invoke
         if method == "POST" and sub == "invocations":
-            return await _invoke(func_name, data, headers, path_qualifier)
+            return await _invoke(func_name, data, headers, path_qualifier, query_params)
 
         # PublishVersion
         if method == "POST" and sub == "versions":
@@ -872,8 +912,8 @@ def _update_code(name: str, data: dict):
     func["config"]["LastUpdateStatus"] = "Successful"
     func["config"]["RevisionId"] = new_uuid()
 
-    # Invalidate warm worker so next invocation picks up the new code
-    invalidate_worker(name)
+    # Invalidate only the old $LATEST worker �� published version workers stay alive
+    invalidate_worker(name, qualifier="$LATEST")
 
     if data.get("Publish"):
         ver_num = func["next_version"]
@@ -939,7 +979,8 @@ def _update_config(name: str, data: dict):
 # ---------------------------------------------------------------------------
 
 
-async def _invoke(name: str, event: dict, headers: dict, path_qualifier: str | None = None):
+async def _invoke(name: str, event: dict, headers: dict, path_qualifier: str | None = None,
+                  query_params: dict | None = None):
     if name not in _functions:
         return error_response_json(
             "ResourceNotFoundException",
@@ -949,7 +990,7 @@ async def _invoke(name: str, event: dict, headers: dict, path_qualifier: str | N
 
     func = _functions[name]
     invocation_type = headers.get("x-amz-invocation-type") or headers.get("X-Amz-Invocation-Type") or "RequestResponse"
-    qualifier = path_qualifier or _qp_first(headers, "x-amz-qualifier") or None
+    qualifier = path_qualifier or _qp_first(query_params or {}, "Qualifier") or _qp_first(headers, "x-amz-qualifier") or None
     executed_version = "$LATEST"
 
     exec_record = func
@@ -1025,6 +1066,15 @@ _RUNTIME_IMAGE_MAP: dict[str, str] = {
     "nodejs20.x": "public.ecr.aws/lambda/nodejs:20",
     "nodejs22.x": "public.ecr.aws/lambda/nodejs:22",
     "nodejs24.x": "public.ecr.aws/lambda/nodejs:24",
+    "java21": "public.ecr.aws/lambda/java:21",
+    "java17": "public.ecr.aws/lambda/java:17",
+    "java11": "public.ecr.aws/lambda/java:11",
+    "java8.al2": "public.ecr.aws/lambda/java:8.al2",
+    "dotnet8": "public.ecr.aws/lambda/dotnet:8",
+    "dotnet6": "public.ecr.aws/lambda/dotnet:6",
+    "ruby3.4": "public.ecr.aws/lambda/ruby:3.4",
+    "ruby3.3": "public.ecr.aws/lambda/ruby:3.3",
+    "ruby3.2": "public.ecr.aws/lambda/ruby:3.2",
     "provided.al2023": "public.ecr.aws/lambda/provided:al2023",
     "provided.al2": "public.ecr.aws/lambda/provided:al2",
     "provided": "public.ecr.aws/lambda/provided:latest",
@@ -1040,6 +1090,15 @@ def _docker_image_for_runtime(runtime: str) -> str | None:
     if runtime.startswith("nodejs"):
         ver = runtime.replace("nodejs", "").rstrip(".x")
         return f"public.ecr.aws/lambda/nodejs:{ver}"
+    if runtime.startswith("java"):
+        ver = runtime.replace("java", "")
+        return f"public.ecr.aws/lambda/java:{ver}"
+    if runtime.startswith("dotnet"):
+        ver = runtime.replace("dotnet", "")
+        return f"public.ecr.aws/lambda/dotnet:{ver}"
+    if runtime.startswith("ruby"):
+        ver = runtime.replace("ruby", "")
+        return f"public.ecr.aws/lambda/ruby:{ver}"
     if runtime.startswith("provided"):
         return "public.ecr.aws/lambda/provided:al2023"
     return None
@@ -1079,7 +1138,7 @@ def _get_warm_container(key: str):
         return None
 
 
-def _cache_warm_container(key: str, container):
+def _cache_warm_container(key: str, container, tmpdir: str = None):
     """Store a running container in the warm cache."""
     with _warm_containers_lock:
         # Evict old entry if exists
@@ -1090,11 +1149,16 @@ def _cache_warm_container(key: str, container):
                 old["container"].remove(force=True)
             except Exception:
                 pass
-        _warm_containers[key] = {"container": container, "last_used": time.time()}
+            old_tmpdir = old.get("tmpdir")
+            if old_tmpdir and os.path.exists(old_tmpdir):
+                import shutil
+                shutil.rmtree(old_tmpdir, ignore_errors=True)
+        _warm_containers[key] = {"container": container, "last_used": time.time(), "tmpdir": tmpdir}
 
 
 def _cleanup_warm_containers():
-    """Remove all warm containers. Called on reset() and shutdown."""
+    """Remove all warm containers and their tmpdirs. Called on reset() and shutdown."""
+    import shutil
     with _warm_containers_lock:
         for key, entry in list(_warm_containers.items()):
             try:
@@ -1105,15 +1169,28 @@ def _cleanup_warm_containers():
                 entry["container"].remove(force=True)
             except Exception:
                 pass
+            tmpdir = entry.get("tmpdir")
+            if tmpdir and os.path.exists(tmpdir):
+                shutil.rmtree(tmpdir, ignore_errors=True)
         _warm_containers.clear()
+
+
+def _docker_cp_dir(container, src_dir: str, dest_dir: str):
+    """Copy a local directory into a Docker container using a tar archive."""
+    import tarfile
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tar:
+        tar.add(src_dir, arcname=".")
+    buf.seek(0)
+    container.put_archive(dest_dir, buf)
 
 
 def _invoke_rie(container, event: dict, timeout: int) -> dict:
     """POST event to a running RIE container's HTTP endpoint."""
     import urllib.request
-    max_attempts = int(timeout * 2) + 10
+    max_attempts = int(timeout * 10) + 20
     for _attempt in range(max_attempts):
-        time.sleep(0.5)
+        time.sleep(0.1)
         container.reload()
         if container.status != "running":
             break
@@ -1123,6 +1200,14 @@ def _invoke_rie(container, event: dict, timeout: int) -> dict:
             container_ip = None
             if LAMBDA_DOCKER_NETWORK:
                 container_ip = networks.get(LAMBDA_DOCKER_NETWORK, {}).get("IPAddress", "")
+            if not container_ip and _running_in_container():
+                # DinD: host-mapped ports aren't reachable from inside this container.
+                # Use the Lambda container's IP on any available Docker network.
+                for net_info in networks.values():
+                    ip = net_info.get("IPAddress", "")
+                    if ip:
+                        container_ip = ip
+                        break
             if container_ip:
                 rie_url = f"http://{container_ip}:8080/2015-03-31/functions/function/invocations"
             else:
@@ -1208,10 +1293,9 @@ def _execute_function_docker(func: dict, event: dict) -> dict:
             pass
 
     # Cold start — create new container
-    try:
-        client = docker_lib.from_env()
-    except Exception as exc:
-        logger.warning("Cannot connect to Docker daemon (%s) – falling back to local subprocess", exc)
+    client = _get_docker_client()
+    if not client:
+        logger.warning("Cannot connect to Docker daemon – falling back to local subprocess")
         return _execute_function_local(func, event)
 
     # Code and layers are extracted to a persistent temp dir (not cleaned up
@@ -1248,14 +1332,29 @@ def _execute_function_docker(func: dict, event: dict) -> dict:
                 layers_dirs.append(layer_dir)
 
         # Build mounts — RIE expects code at /var/task, layers at /opt
+        # Detect Docker-in-Docker: if running inside a container, bind mount
+        # paths from /tmp won't exist on the host. Use LAMBDA_REMOTE_DOCKER_VOLUME_MOUNT
+        # if set, otherwise fall back to docker cp after container creation.
+        _use_docker_cp = False
         host_code_dir = LAMBDA_DOCKER_VOLUME_MOUNT or code_dir
-        mounts = [
-            docker_lib.types.Mount("/var/task", host_code_dir, type="bind", read_only=True),
-        ]
-        if is_provided:
-            mounts.append(docker_lib.types.Mount("/var/runtime", host_code_dir, type="bind", read_only=True))
-        for idx, ld in enumerate(layers_dirs):
-            mounts.append(docker_lib.types.Mount(f"/opt/layer_{idx}", ld, type="bind", read_only=True))
+        mounts = []
+        if LAMBDA_DOCKER_VOLUME_MOUNT:
+            mounts.append(docker_lib.types.Mount("/var/task", host_code_dir, type="bind", read_only=True))
+            if is_provided:
+                mounts.append(docker_lib.types.Mount("/var/runtime", host_code_dir, type="bind", read_only=True))
+            for idx, ld in enumerate(layers_dirs):
+                mounts.append(docker_lib.types.Mount(f"/opt/layer_{idx}", ld, type="bind", read_only=True))
+        elif _running_in_container():
+            # Running inside Docker — bind mounts from tmpdir won't work
+            # because the host Docker daemon can't see our container's filesystem.
+            # We'll use docker cp after container creation instead.
+            _use_docker_cp = True
+        else:
+            mounts.append(docker_lib.types.Mount("/var/task", host_code_dir, type="bind", read_only=True))
+            if is_provided:
+                mounts.append(docker_lib.types.Mount("/var/runtime", host_code_dir, type="bind", read_only=True))
+            for idx, ld in enumerate(layers_dirs):
+                mounts.append(docker_lib.types.Mount(f"/opt/layer_{idx}", ld, type="bind", read_only=True))
 
         # Build environment
         container_env: dict[str, str] = {
@@ -1293,22 +1392,35 @@ def _execute_function_docker(func: dict, event: dict) -> dict:
             "image": image,
             "command": cmd,
             "environment": container_env,
-            "mounts": mounts,
             "ports": {"8080/tcp": None},
             "detach": True,
             "stdin_open": False,
             "labels": {"ministack": "lambda"},
         }
+        if mounts:
+            run_kwargs["mounts"] = mounts
         if LAMBDA_DOCKER_NETWORK:
             run_kwargs["network"] = LAMBDA_DOCKER_NETWORK
 
-        container = client.containers.run(**run_kwargs)
+        if _use_docker_cp:
+            # Docker-in-Docker: create container first, copy code in, then start
+            create_kwargs = {k: v for k, v in run_kwargs.items() if k not in ("detach", "stdin_open")}
+            container = client.containers.create(**create_kwargs)
+            _docker_cp_dir(container, code_dir, "/var/task")
+            if is_provided:
+                _docker_cp_dir(container, code_dir, "/var/runtime")
+            for idx, ld in enumerate(layers_dirs):
+                _docker_cp_dir(container, ld, f"/opt/layer_{idx}")
+            container.start()
+        else:
+            container = client.containers.run(**run_kwargs)
         result = _invoke_rie(container, event, timeout)
 
         if not result.get("error"):
             # Success — cache the warm container for reuse
-            _cache_warm_container(cache_key, container)
+            _cache_warm_container(cache_key, container, tmpdir=tmpdir)
             container = None  # prevent finally from killing it
+            tmpdir = None  # prevent finally from cleaning it
             logger.info("Lambda %s: cold start RIE container cached for reuse", config["FunctionName"])
         return result
 
@@ -1331,6 +1443,9 @@ def _execute_function_docker(func: dict, event: dict) -> dict:
                 container.remove(force=True)
             except Exception:
                 pass
+        if tmpdir is not None and os.path.exists(tmpdir):
+            import shutil
+            shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------
@@ -1369,23 +1484,28 @@ def _execute_function_warm(func: dict, event: dict) -> dict:
         return {"body": {"statusCode": 200, "body": "Mock response - no code deployed"}}
 
     func_name = config.get("FunctionName", "unknown")
+    qualifier = config.get("Version", "$LATEST")
     try:
-        worker = get_or_create_worker(func_name, config, code_zip)
+        worker = get_or_create_worker(func_name, config, code_zip, qualifier=qualifier)
         result = worker.invoke(event, new_uuid())
         if result.get("status") == "ok":
             return {"body": result.get("result"), "log": result.get("log", "")}
         else:
+            error_msg = result.get("error", "Unknown error")
+            error_type = "Runtime.HandlerError"
+            if "timed out" in error_msg.lower():
+                error_type = "Runtime.ExitError"
             return {
                 "body": {
-                    "errorMessage": result.get("error", "Unknown error"),
-                    "errorType": "Runtime.HandlerError",
+                    "errorMessage": error_msg,
+                    "errorType": error_type,
                 },
                 "error": True,
                 "log": result.get("trace", result.get("error", "")),
             }
     except Exception as e:
         logger.error("Warm worker execution error for %s: %s", func_name, e)
-        invalidate_worker(func_name)
+        invalidate_worker(func_name, qualifier=qualifier)
         return {
             "body": {"errorMessage": str(e), "errorType": type(e).__name__},
             "error": True,
@@ -1412,10 +1532,9 @@ def _execute_function_image(func: dict, event: dict) -> dict:
     timeout = config.get("Timeout", 30)
     env_vars = config.get("Environment", {}).get("Variables", {})
 
-    try:
-        client = docker_lib.from_env()
-    except Exception as exc:
-        return {"body": {"errorMessage": f"Cannot connect to Docker: {exc}", "errorType": "Runtime.DockerError"}, "error": True}
+    client = _get_docker_client()
+    if not client:
+        return {"body": {"errorMessage": "Cannot connect to Docker", "errorType": "Runtime.DockerError"}, "error": True}
 
     # Use image locally if available, otherwise pull
     try:
@@ -1458,40 +1577,8 @@ def _execute_function_image(func: dict, event: dict) -> dict:
 
     container = client.containers.run(**run_kwargs)
     try:
-        import time as _time
-        import urllib.request
-        for _attempt in range(int(timeout * 2) + 10):
-            _time.sleep(0.5)
-            container.reload()
-            if container.status != "running":
-                break
-            try:
-                if LAMBDA_DOCKER_NETWORK:
-                    networks = container.attrs.get("NetworkSettings", {}).get("Networks", {})
-                    container_ip = networks.get(LAMBDA_DOCKER_NETWORK, {}).get("IPAddress", "")
-                    if container_ip:
-                        rie_url = f"http://{container_ip}:8080/2015-03-31/functions/function/invocations"
-                    else:
-                        continue
-                else:
-                    ports = container.ports.get("8080/tcp") or []
-                    if not ports:
-                        continue
-                    rie_url = f"http://127.0.0.1:{ports[0]['HostPort']}/2015-03-31/functions/function/invocations"
-                req = urllib.request.Request(rie_url, data=json.dumps(event).encode(),
-                                            headers={"Content-Type": "application/json"})
-                resp = urllib.request.urlopen(req, timeout=timeout)
-                body = resp.read().decode("utf-8", errors="replace")
-                try:
-                    parsed = json.loads(body)
-                except json.JSONDecodeError:
-                    parsed = body
-                logs = container.logs(stdout=True, stderr=True).decode("utf-8", errors="replace").strip()
-                return {"body": parsed, "log": logs}
-            except (urllib.error.URLError, ConnectionRefusedError, OSError):
-                continue
-        stdout = container.logs(stdout=True, stderr=True).decode("utf-8", errors="replace").strip()
-        return {"body": {"errorMessage": f"Image Lambda failed: {stdout[:500]}", "errorType": "Runtime.ExitError"}, "error": True, "log": stdout}
+        result = _invoke_rie(container, event, timeout)
+        return result
     finally:
         try:
             container.stop(timeout=2)

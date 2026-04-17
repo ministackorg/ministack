@@ -72,9 +72,17 @@ def test_ecs_run_task_stops_after_exit(ecs):
 def test_ecs_run_task_network_connectivity(ecs):
     """ECS container can reach Ministack (proves network detection works)."""
     endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
-    # When Ministack runs on the host (CI), containers need host.docker.internal.
-    # When Ministack runs in Docker (compose), network detection handles it.
-    host = os.environ.get("MINISTACK_HOST_FROM_CONTAINER", "host.docker.internal")
+    # Determine how a container can reach the host where Ministack runs.
+    # Docker Desktop (macOS/Windows): host.docker.internal works.
+    # Linux: use the Docker bridge gateway IP (typically 172.17.0.1).
+    host = os.environ.get("MINISTACK_HOST_FROM_CONTAINER", "")
+    if not host:
+        import platform
+        if platform.system() == "Linux":
+            # Docker bridge gateway — how containers reach the host on Linux
+            host = "172.17.0.1"
+        else:
+            host = "host.docker.internal"
     parsed = urlparse(endpoint)
     container_endpoint = f"{parsed.scheme}://{host}:{parsed.port}"
 

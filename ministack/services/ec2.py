@@ -356,16 +356,26 @@ def _run_instances(p):
     return _xml(200, "RunInstancesResponse", inner)
 
 
+_last_cleanup = [0.0]
+
+def _cleanup_terminated():
+    """Remove instances terminated >60s ago. Called at most once per 10 seconds."""
+    now = time.time()
+    if now - _last_cleanup[0] < 10:
+        return
+    _last_cleanup[0] = now
+    stale = [k for k, v in _instances.items()
+             if v["State"]["Name"] == "terminated"
+             and now - v.get("_terminated_at", 0) > 60]
+    for k in stale:
+        _instances.pop(k, None)
+
+
 def _describe_instances(p):
     filter_ids = _parse_member_list(p, "InstanceId")
     filters = _parse_filters(p)
 
-    # Clean up instances terminated more than 60s ago (AWS removes after ~1 hour)
-    stale = [k for k, v in _instances.items()
-             if v["State"]["Name"] == "terminated"
-             and time.time() - v.get("_terminated_at", 0) > 60]
-    for k in stale:
-        _instances.pop(k, None)
+    _cleanup_terminated()
 
     if filter_ids:
         for iid in filter_ids:

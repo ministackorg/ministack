@@ -26,7 +26,7 @@ from ministack.core.responses import AccountScopedDict, get_account_id, json_res
 logger = logging.getLogger("eks")
 
 REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
-EKS_K3S_IMAGE = os.environ.get("EKS_K3S_IMAGE", "rancher/k3s:latest")
+EKS_K3S_IMAGE = os.environ.get("EKS_K3S_IMAGE", "rancher/k3s:v1.31.4-k3s1")
 EKS_BASE_PORT = int(os.environ.get("EKS_BASE_PORT", "16443"))
 
 try:
@@ -211,57 +211,9 @@ def _create_cluster(body):
     container_id = None
     port = _next_port()
 
-    client = _get_docker()
-    if client:
-        try:
-            ms_network = _get_ministack_network(client)
-            run_kwargs = dict(
-                image=EKS_K3S_IMAGE,
-                command=["server",
-                         "--disable=traefik,metrics-server,servicelb",
-                         "--tls-san=0.0.0.0",
-                         f"--https-listen-port=6443"],
-                detach=True,
-                privileged=True,
-                ports={"6443/tcp": port},
-                name=f"ministack-eks-{name}",
-                labels={"ministack": "eks", "cluster_name": name},
-                environment={
-                    "K3S_KUBECONFIG_MODE": "644",
-                },
-                tmpfs={"/run": "", "/var/run": ""},
-            )
-            if ms_network:
-                run_kwargs["network"] = ms_network
-
-            container = client.containers.run(**run_kwargs)
-            container_id = container.id
-
-            # Wait for API server
-            if ms_network:
-                container.reload()
-                networks = container.attrs.get("NetworkSettings", {}).get("Networks", {})
-                container_ip = networks.get(ms_network, {}).get("IPAddress", "")
-                if container_ip and _wait_for_port(container_ip, 6443):
-                    endpoint = f"https://{container_ip}:6443"
-                    logger.info("EKS: k3s for %s ready at %s (network %s)", name, endpoint, ms_network)
-            if not endpoint:
-                if _wait_for_port("127.0.0.1", port):
-                    endpoint = f"https://localhost:{port}"
-                    logger.info("EKS: k3s for %s ready at %s", name, endpoint)
-                else:
-                    logger.warning("EKS: k3s for %s did not become ready on port %d", name, port)
-                    endpoint = f"https://localhost:{port}"
-
-            ca_data = _extract_ca_cert(container)
-
-        except Exception as e:
-            logger.warning("EKS: failed to start k3s for %s: %s", name, e)
-            endpoint = f"https://localhost:{port}"
-    else:
-        endpoint = f"https://localhost:{port}"
-        logger.info("EKS: Docker unavailable — cluster %s created without k3s backend", name)
-
+    # Build cluster record immediately (status CREATING) and return fast.
+    # k3s startup happens in background thread to avoid blocking the event loop.
+    endpoint = f"https://localhost:{port}"
     cluster = {
         "name": name,
         "arn": arn,
@@ -286,13 +238,13 @@ def _create_cluster(body):
         "identity": {
             "oidc": {"issuer": f"https://oidc.eks.{REGION}.amazonaws.com/id/{new_uuid()[:32].replace('-', '').upper()}"}
         },
-        "status": "ACTIVE",
-        "certificateAuthority": {"data": ca_data},
+        "status": "CREATING",
+        "certificateAuthority": {"data": ""},
         "platformVersion": f"eks.{int(time.time()) % 100}",
         "tags": body.get("tags", {}),
         "encryptionConfig": body.get("encryptionConfig", []),
         "accessConfig": body.get("accessConfig", {}),
-        "_docker_id": container_id,
+        "_docker_id": None,
         "_port": port,
     }
 
@@ -300,6 +252,58 @@ def _create_cluster(body):
     if cluster["tags"]:
         _tags[arn] = dict(cluster["tags"])
 
+    def _bg_start():
+        client = _get_docker()
+        if not client:
+            cluster["status"] = "ACTIVE"
+            logger.info("EKS: Docker unavailable — cluster %s created without k3s backend", name)
+            return
+        try:
+            ms_network = _get_ministack_network(client)
+            run_kwargs = dict(
+                image=EKS_K3S_IMAGE,
+                command=["server",
+                         "--disable=traefik,metrics-server,servicelb",
+                         "--tls-san=0.0.0.0",
+                         f"--https-listen-port=6443"],
+                detach=True,
+                privileged=True,
+                ports={"6443/tcp": port},
+                name=f"ministack-eks-{name}",
+                labels={"ministack": "eks", "cluster_name": name},
+                environment={"K3S_KUBECONFIG_MODE": "644"},
+                tmpfs={"/run": "", "/var/run": ""},
+            )
+            if ms_network:
+                run_kwargs["network"] = ms_network
+
+            container = client.containers.run(**run_kwargs)
+            cluster["_docker_id"] = container.id
+
+            ep = ""
+            if ms_network:
+                container.reload()
+                networks = container.attrs.get("NetworkSettings", {}).get("Networks", {})
+                container_ip = networks.get(ms_network, {}).get("IPAddress", "")
+                if container_ip and _wait_for_port(container_ip, 6443):
+                    ep = f"https://{container_ip}:6443"
+                    logger.info("EKS: k3s for %s ready at %s (network %s)", name, ep, ms_network)
+            if not ep:
+                if _wait_for_port("127.0.0.1", port):
+                    ep = f"https://localhost:{port}"
+                    logger.info("EKS: k3s for %s ready at %s", name, ep)
+                else:
+                    logger.warning("EKS: k3s for %s did not become ready on port %d", name, port)
+                    ep = f"https://localhost:{port}"
+
+            cluster["endpoint"] = ep
+            cluster["certificateAuthority"]["data"] = _extract_ca_cert(container)
+            cluster["status"] = "ACTIVE"
+        except Exception as e:
+            logger.warning("EKS: failed to start k3s for %s: %s", name, e)
+            cluster["status"] = "FAILED"
+
+    threading.Thread(target=_bg_start, daemon=True, name=f"eks-{name}").start()
     return _json_resp(200, {"cluster": _sanitize(cluster)})
 
 

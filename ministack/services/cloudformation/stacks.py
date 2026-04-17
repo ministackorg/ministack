@@ -151,8 +151,7 @@ async def _deploy_stack_async(stack_name: str, stack_id: str, template: dict,
                                logical_id, exc)
             provisioned_resources.pop(logical_id, None)
 
-    # Delay for realistic async behavior
-    await asyncio.sleep(1.5)
+    await asyncio.sleep(0)
 
     if failed:
         if disable_rollback:
@@ -290,7 +289,7 @@ async def _delete_stack_async(stack_name: str, stack_id: str):
         if export_name:
             _exports.pop(export_name, None)
 
-    await asyncio.sleep(1.5)
+    await asyncio.sleep(0)
 
     stack["StackStatus"] = "DELETE_COMPLETE"
     _add_event(stack_id, stack_name, stack_name,

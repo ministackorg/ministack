@@ -46,7 +46,7 @@ def test_eks_create_describe_delete_cluster(eks):
     )
     cluster = resp["cluster"]
     assert cluster["name"] == name
-    assert cluster["status"] == "ACTIVE"
+    assert cluster["status"] in ("CREATING", "ACTIVE")
     assert cluster["version"] == "1.30"
     assert "arn" in cluster
     assert f"cluster/{name}" in cluster["arn"]
@@ -55,11 +55,14 @@ def test_eks_create_describe_delete_cluster(eks):
     assert "identity" in cluster
     assert "oidc" in cluster["identity"]
 
-    # Describe
-    resp = eks.describe_cluster(name=name)
+    # Describe — poll until background k3s startup completes
+    for _ in range(30):
+        resp = eks.describe_cluster(name=name)
+        if resp["cluster"]["status"] == "ACTIVE":
+            break
+        time.sleep(1)
     assert resp["cluster"]["name"] == name
     assert resp["cluster"]["status"] == "ACTIVE"
-    assert resp["cluster"]["endpoint"] == cluster["endpoint"]
 
     # Delete
     resp = eks.delete_cluster(name=name)
