@@ -297,3 +297,7 @@ def transfer():
 @pytest.fixture(scope="session")
 def eks():
     return make_client("eks")
+
+@pytest.fixture(scope="session")
+def tagging():
+    return make_client("resourcegroupstaggingapi")
