@@ -332,6 +332,19 @@ class Worker:
         self._lock = threading.Lock()
         self._cold = True
         self._start_time = None
+        self._log_lines: list[str] = []
+        self._log_lock = threading.Lock()
+
+    def _read_stderr(self):
+        for line in self._proc.stderr:
+            with self._log_lock:
+                self._log_lines.append(line.rstrip("\n"))
+
+    def _flush_logs(self) -> str:
+        with self._log_lock:
+            logs = "\n".join(self._log_lines)
+            self._log_lines.clear()
+        return logs
 
     def _spawn(self):
         """Extract zip and start worker process."""
@@ -490,19 +503,10 @@ class Worker:
             raise RuntimeError(f"Worker init failed: {response.get('error')}")
 
         self._start_time = time.time()
+        self._stderr_thread = threading.Thread(target=self._read_stderr, daemon=True)
+        self._stderr_thread.start()
         logger.info("Lambda worker spawned for %s (%s, cold start)", self.func_name, runtime)
 
-    def _drain_stderr(self) -> str:
-        """Read any available stderr output without blocking."""
-        import select
-        lines = []
-        if self._proc and self._proc.stderr:
-            while select.select([self._proc.stderr], [], [], 0)[0]:
-                line = self._proc.stderr.readline()
-                if not line:
-                    break
-                lines.append(line.rstrip("\n"))
-        return "\n".join(lines)
 
     def invoke(self, event: dict, request_id: str) -> dict:
         with self._lock:
@@ -532,7 +536,7 @@ class Worker:
                         try:
                             response = json.loads(response_line)
                             response["cold_start"] = cold
-                            response["log"] = self._drain_stderr()
+                            response["log"] = self._flush_logs()
                             return response
                         except json.JSONDecodeError:
                             continue
