@@ -739,7 +739,7 @@ services:
   ministack:
     image: ministackorg/ministack:latest
     container_name: infra_ministack
-    entrypoint: ["python", "-m", "uvicorn", "ministack.app:app", "--host", "0.0.0.0", "--port", "4566"]
+    entrypoint: ["python", "-m", "hypercorn", "ministack.app:app", "--bind", "0.0.0.0:4566", "--keep-alive", "75"]
     networks:
       infra-network:
     healthcheck:
