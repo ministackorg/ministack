@@ -29,6 +29,7 @@ import base64
 import copy
 import hashlib
 import importlib
+import io
 import json
 import logging
 import os
@@ -59,6 +60,21 @@ try:
 except ImportError:
     docker_lib = None
     _docker_available = False
+
+_cached_docker_client = None
+
+def _get_docker_client():
+    """Return a cached Docker client, or create one on first call."""
+    global _cached_docker_client
+    if _cached_docker_client is not None:
+        return _cached_docker_client
+    if not _docker_available:
+        return None
+    try:
+        _cached_docker_client = docker_lib.from_env()
+        return _cached_docker_client
+    except Exception:
+        return None
 
 _functions = AccountScopedDict()  # function_name -> FunctionRecord
 _layers = AccountScopedDict()  # layer_name -> {"versions": [...], "next_version": int}
@@ -1135,12 +1151,22 @@ def _cleanup_warm_containers():
         _warm_containers.clear()
 
 
+def _docker_cp_dir(container, src_dir: str, dest_dir: str):
+    """Copy a local directory into a Docker container using a tar archive."""
+    import tarfile
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tar:
+        tar.add(src_dir, arcname=".")
+    buf.seek(0)
+    container.put_archive(dest_dir, buf)
+
+
 def _invoke_rie(container, event: dict, timeout: int) -> dict:
     """POST event to a running RIE container's HTTP endpoint."""
     import urllib.request
-    max_attempts = int(timeout * 2) + 10
+    max_attempts = int(timeout * 10) + 20
     for _attempt in range(max_attempts):
-        time.sleep(0.5)
+        time.sleep(0.1)
         container.reload()
         if container.status != "running":
             break
@@ -1235,10 +1261,9 @@ def _execute_function_docker(func: dict, event: dict) -> dict:
             pass
 
     # Cold start — create new container
-    try:
-        client = docker_lib.from_env()
-    except Exception as exc:
-        logger.warning("Cannot connect to Docker daemon (%s) – falling back to local subprocess", exc)
+    client = _get_docker_client()
+    if not client:
+        logger.warning("Cannot connect to Docker daemon – falling back to local subprocess")
         return _execute_function_local(func, event)
 
     # Code and layers are extracted to a persistent temp dir (not cleaned up
@@ -1275,14 +1300,28 @@ def _execute_function_docker(func: dict, event: dict) -> dict:
                 layers_dirs.append(layer_dir)
 
         # Build mounts — RIE expects code at /var/task, layers at /opt
+        # Detect Docker-in-Docker: if running inside a container, bind mount
+        # paths from /tmp won't exist on the host. Use LAMBDA_REMOTE_DOCKER_VOLUME_MOUNT
+        # if set, otherwise fall back to docker cp after container creation.
+        _use_docker_cp = False
         host_code_dir = LAMBDA_DOCKER_VOLUME_MOUNT or code_dir
-        mounts = [
-            docker_lib.types.Mount("/var/task", host_code_dir, type="bind", read_only=True),
-        ]
-        if is_provided:
-            mounts.append(docker_lib.types.Mount("/var/runtime", host_code_dir, type="bind", read_only=True))
-        for idx, ld in enumerate(layers_dirs):
-            mounts.append(docker_lib.types.Mount(f"/opt/layer_{idx}", ld, type="bind", read_only=True))
+        mounts = []
+        if LAMBDA_DOCKER_VOLUME_MOUNT:
+            mounts.append(docker_lib.types.Mount("/var/task", host_code_dir, type="bind", read_only=True))
+            if is_provided:
+                mounts.append(docker_lib.types.Mount("/var/runtime", host_code_dir, type="bind", read_only=True))
+            for idx, ld in enumerate(layers_dirs):
+                mounts.append(docker_lib.types.Mount(f"/opt/layer_{idx}", ld, type="bind", read_only=True))
+        elif os.path.exists("/.dockerenv") or os.environ.get("HOSTNAME"):
+            # Running inside Docker — bind mounts from tmpdir won't work.
+            # We'll use docker cp after container creation instead.
+            _use_docker_cp = True
+        else:
+            mounts.append(docker_lib.types.Mount("/var/task", host_code_dir, type="bind", read_only=True))
+            if is_provided:
+                mounts.append(docker_lib.types.Mount("/var/runtime", host_code_dir, type="bind", read_only=True))
+            for idx, ld in enumerate(layers_dirs):
+                mounts.append(docker_lib.types.Mount(f"/opt/layer_{idx}", ld, type="bind", read_only=True))
 
         # Build environment
         container_env: dict[str, str] = {
@@ -1320,16 +1359,28 @@ def _execute_function_docker(func: dict, event: dict) -> dict:
             "image": image,
             "command": cmd,
             "environment": container_env,
-            "mounts": mounts,
             "ports": {"8080/tcp": None},
             "detach": True,
             "stdin_open": False,
             "labels": {"ministack": "lambda"},
         }
+        if mounts:
+            run_kwargs["mounts"] = mounts
         if LAMBDA_DOCKER_NETWORK:
             run_kwargs["network"] = LAMBDA_DOCKER_NETWORK
 
-        container = client.containers.run(**run_kwargs)
+        if _use_docker_cp:
+            # Docker-in-Docker: create container first, copy code in, then start
+            create_kwargs = {k: v for k, v in run_kwargs.items() if k not in ("detach", "stdin_open")}
+            container = client.containers.create(**create_kwargs)
+            _docker_cp_dir(container, code_dir, "/var/task")
+            if is_provided:
+                _docker_cp_dir(container, code_dir, "/var/runtime")
+            for idx, ld in enumerate(layers_dirs):
+                _docker_cp_dir(container, ld, f"/opt/layer_{idx}")
+            container.start()
+        else:
+            container = client.containers.run(**run_kwargs)
         result = _invoke_rie(container, event, timeout)
 
         if not result.get("error"):
@@ -1448,10 +1499,9 @@ def _execute_function_image(func: dict, event: dict) -> dict:
     timeout = config.get("Timeout", 30)
     env_vars = config.get("Environment", {}).get("Variables", {})
 
-    try:
-        client = docker_lib.from_env()
-    except Exception as exc:
-        return {"body": {"errorMessage": f"Cannot connect to Docker: {exc}", "errorType": "Runtime.DockerError"}, "error": True}
+    client = _get_docker_client()
+    if not client:
+        return {"body": {"errorMessage": "Cannot connect to Docker", "errorType": "Runtime.DockerError"}, "error": True}
 
     # Use image locally if available, otherwise pull
     try:

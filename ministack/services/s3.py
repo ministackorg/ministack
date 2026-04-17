@@ -304,7 +304,7 @@ def _extract_user_metadata(headers: dict) -> dict:
     return meta
 
 
-def _build_object_record(body: bytes, headers: dict) -> dict:
+def _build_object_record(body: bytes, headers: dict, etag: str = None) -> dict:
     content_type = headers.get("content-type", "application/octet-stream")
     content_encoding = headers.get("content-encoding")
     preserved = {}
@@ -317,7 +317,7 @@ def _build_object_record(body: bytes, headers: dict) -> dict:
         "body": body,
         "content_type": content_type,
         "content_encoding": content_encoding,
-        "etag": f'"{md5_hash(body)}"',
+        "etag": etag or f'"{md5_hash(body)}"',
         "last_modified": now_iso(),
         "size": len(body),
         "metadata": _extract_user_metadata(headers),
@@ -1562,7 +1562,8 @@ def _put_object(bucket_name: str, key: str, body: bytes, headers: dict):
     if md5_err:
         return md5_err
 
-    obj = _build_object_record(body, headers)
+    etag = f'"{md5_hash(body)}"'
+    obj = _build_object_record(body, headers, etag=etag)
     bucket["objects"][key] = obj
 
     # --- Object Lock headers on PutObject ---
