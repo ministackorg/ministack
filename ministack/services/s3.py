@@ -2844,7 +2844,8 @@ def _complete_multipart_upload(
     )
 
     root = Element("CompleteMultipartUploadResult", xmlns=S3_NS)
-    SubElement(root, "Location").text = f"http://s3.amazonaws.com/{bucket_name}/{key}"
+    s3_host = os.environ.get("MINISTACK_HOST", os.environ.get("AWS_ENDPOINT_URL", "http://localhost:4566"))
+    SubElement(root, "Location").text = f"{s3_host}/{bucket_name}/{key}"
     SubElement(root, "Bucket").text = bucket_name
     SubElement(root, "Key").text = key
     SubElement(root, "ETag").text = final_etag

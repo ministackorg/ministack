@@ -1,5 +1,7 @@
 """
-IAM & STS Service Emulators (AWS-compatible).
+IAM Service Emulator (AWS-compatible).
+
+STS actions are in sts.py.
 
 IAM actions:
   CreateUser, GetUser, ListUsers, DeleteUser,
@@ -17,15 +19,12 @@ IAM actions:
   UpdateAssumeRolePolicy,
   CreateGroup, GetGroup, DeleteGroup, ListGroups,
   AddUserToGroup, RemoveUserFromGroup, ListGroupsForUser,
-    CreateServiceLinkedRole, DeleteServiceLinkedRole, GetServiceLinkedRoleDeletionStatus,
+  CreateServiceLinkedRole, DeleteServiceLinkedRole, GetServiceLinkedRoleDeletionStatus,
   CreateOpenIDConnectProvider, GetOpenIDConnectProvider, DeleteOpenIDConnectProvider,
   TagRole, UntagRole, ListRoleTags,
   TagUser, UntagUser, ListUserTags,
   TagPolicy, UntagPolicy, ListPolicyTags,
   SimulatePrincipalPolicy, SimulateCustomPolicy.
-
-STS actions:
-  GetCallerIdentity, AssumeRole, GetSessionToken, GetAccessKeyInfo.
 """
 
 import copy
@@ -70,6 +69,7 @@ def get_state():
         "access_keys": copy.deepcopy(_access_keys),
         "oidc_providers": copy.deepcopy(_oidc_providers),
         "service_linked_role_deletion_tasks": copy.deepcopy(_service_linked_role_deletion_tasks),
+        "user_inline_policies": copy.deepcopy(_user_inline_policies),
     }
 
 
@@ -83,6 +83,7 @@ def restore_state(data):
         _access_keys.update(data.get("access_keys", {}))
         _oidc_providers.update(data.get("oidc_providers", {}))
         _service_linked_role_deletion_tasks.update(data.get("service_linked_role_deletion_tasks", {}))
+        _user_inline_policies.update(data.get("user_inline_policies", {}))
 
 
 _restored = load_state("iam")
@@ -93,7 +94,7 @@ if _restored:
 # ===================================================================== IAM
 # =====================================================================
 
-async def handle_iam_request(method, path, headers, body, query_params):
+async def handle_request(method, path, headers, body, query_params):
     params = dict(query_params)
     content_type = headers.get("content-type", "")
     target = headers.get("x-amz-target", "")
@@ -1084,7 +1085,11 @@ def _put_user_policy(p):
     if user_name not in _users:
         return _error(404, "NoSuchEntity",
                       f"The user with name {user_name} cannot be found.", ns="iam")
-    _user_inline_policies[(user_name, policy_name)] = policy_doc
+    user_policies = _user_inline_policies.get(user_name)
+    if user_policies is None:
+        user_policies = {}
+        _user_inline_policies[user_name] = user_policies
+    user_policies[policy_name] = policy_doc
     return _xml(200, "PutUserPolicyResponse", "", ns="iam")
 
 
@@ -1094,7 +1099,7 @@ def _get_user_policy(p):
     if user_name not in _users:
         return _error(404, "NoSuchEntity",
                       f"The user with name {user_name} cannot be found.", ns="iam")
-    doc = _user_inline_policies.get((user_name, policy_name))
+    doc = (_user_inline_policies.get(user_name) or {}).get(policy_name)
     if doc is None:
         return _error(404, "NoSuchEntity",
                       f"The user policy with name {policy_name} cannot be found.", ns="iam")
@@ -1120,10 +1125,11 @@ def _delete_user_policy(p):
     if user_name not in _users:
         return _error(404, "NoSuchEntity",
                       f"The user with name {user_name} cannot be found.", ns="iam")
-    if (user_name, policy_name) not in _user_inline_policies:
+    user_policies = _user_inline_policies.get(user_name) or {}
+    if policy_name not in user_policies:
         return _error(404, "NoSuchEntity",
                       f"The user policy with name {policy_name} cannot be found.", ns="iam")
-    del _user_inline_policies[(user_name, policy_name)]
+    del user_policies[policy_name]
     return _xml(200, "DeleteUserPolicyResponse", "", ns="iam")
 
 
@@ -1134,8 +1140,7 @@ def _list_user_policies(p):
                       f"The user with name {user_name} cannot be found.", ns="iam")
     members = "".join(
         f"<member>{pname}</member>"
-        for (uname, pname) in _user_inline_policies
-        if uname == user_name
+        for pname in (_user_inline_policies.get(user_name) or {})
     )
     return _xml(200, "ListUserPoliciesResponse",
                 f"<ListUserPoliciesResult><PolicyNames>{members}</PolicyNames>"
@@ -1342,145 +1347,6 @@ def _list_policy_tags(p):
                 ns="iam")
 
 
-# ===================================================================== STS
-# =====================================================================
-
-async def handle_sts_request(method, path, headers, body, query_params):
-    params = dict(query_params)
-    content_type = headers.get("content-type", "")
-    target = headers.get("x-amz-target", "")
-
-    # JSON protocol (newer SDKs): X-Amz-Target: AWSSecurityTokenServiceV20110615.ActionName
-    if "amz-json" in content_type and target.startswith("AWSSecurityTokenServiceV20110615."):
-        action_name = target.split(".")[-1]
-        params["Action"] = [action_name]
-        if body:
-            try:
-                json_body = json.loads(body)
-                for k, v in json_body.items():
-                    params[k] = [str(v)] if not isinstance(v, list) else v
-            except (json.JSONDecodeError, TypeError):
-                pass
-    elif method == "POST" and body:
-        for k, v in parse_qs(body.decode("utf-8", errors="replace")).items():
-            params[k] = v
-
-    action = _p(params, "Action")
-    use_json = "amz-json" in content_type
-
-    if action == "GetCallerIdentity":
-        if use_json:
-            return json_response({"Account": get_account_id(), "Arn": f"arn:aws:iam::{get_account_id()}:root", "UserId": get_account_id()})
-        return _xml(200, "GetCallerIdentityResponse",
-                    f"<GetCallerIdentityResult>"
-                    f"<Arn>arn:aws:iam::{get_account_id()}:root</Arn>"
-                    f"<UserId>{get_account_id()}</UserId>"
-                    f"<Account>{get_account_id()}</Account>"
-                    f"</GetCallerIdentityResult>",
-                    ns="sts")
-
-    if action == "AssumeRole":
-        role_arn = _p(params, "RoleArn")
-        session_name = _p(params, "RoleSessionName")
-        duration = int(_p(params, "DurationSeconds") or 3600)
-        expiration = _future(duration)
-        access_key = _gen_session_access_key()
-        secret_key = _gen_secret()
-        session_token = _gen_session_token()
-        role_id = "AROA" + new_uuid().replace("-", "")[:17].upper()
-        assumed_arn = role_arn.replace(":role/", ":assumed-role/", 1)
-        if not assumed_arn.endswith(f"/{session_name}"):
-            assumed_arn = f"{assumed_arn}/{session_name}"
-        if use_json:
-            return json_response({
-                "Credentials": {"AccessKeyId": access_key, "SecretAccessKey": secret_key, "SessionToken": session_token, "Expiration": time.time() + duration},
-                "AssumedRoleUser": {"AssumedRoleId": f"{role_id}:{session_name}", "Arn": assumed_arn},
-                "PackedPolicySize": 0,
-            })
-        return _xml(200, "AssumeRoleResponse",
-                    f"<AssumeRoleResult>"
-                    f"<Credentials>"
-                    f"<AccessKeyId>{access_key}</AccessKeyId>"
-                    f"<SecretAccessKey>{secret_key}</SecretAccessKey>"
-                    f"<SessionToken>{session_token}</SessionToken>"
-                    f"<Expiration>{expiration}</Expiration>"
-                    f"</Credentials>"
-                    f"<AssumedRoleUser>"
-                    f"<AssumedRoleId>{role_id}:{session_name}</AssumedRoleId>"
-                    f"<Arn>{assumed_arn}</Arn>"
-                    f"</AssumedRoleUser>"
-                    f"<PackedPolicySize>0</PackedPolicySize>"
-                    f"</AssumeRoleResult>",
-                    ns="sts")
-
-    if action == "AssumeRoleWithWebIdentity":
-        role_arn = _p(params, "RoleArn")
-        session = _p(params, "RoleSessionName", "session")
-        duration = int(_p(params, "DurationSeconds") or 3600)
-        access_key = _gen_session_access_key()
-        secret_key = _gen_secret()
-        session_token = _gen_session_token()
-        assumed_arn = role_arn.replace(":role/", ":assumed-role/", 1)
-        if not assumed_arn.endswith(f"/{session}"):
-            assumed_arn = f"{assumed_arn}/{session}"
-        role_id = "AROA" + new_uuid().replace("-", "")[:17].upper()
-        if use_json:
-            return json_response({
-                "Credentials": {"AccessKeyId": access_key, "SecretAccessKey": secret_key, "SessionToken": session_token, "Expiration": time.time() + duration},
-                "AssumedRoleUser": {"AssumedRoleId": f"{role_id}:{session}", "Arn": assumed_arn},
-                "SubjectFromWebIdentityToken": "test-subject",
-                "Audience": "sts.amazonaws.com",
-                "Provider": "accounts.google.com",
-            })
-        return _xml(200, "AssumeRoleWithWebIdentityResponse",
-                    f"<AssumeRoleWithWebIdentityResult>"
-                    f"<Credentials>"
-                    f"<AccessKeyId>{access_key}</AccessKeyId>"
-                    f"<SecretAccessKey>{secret_key}</SecretAccessKey>"
-                    f"<SessionToken>{session_token}</SessionToken>"
-                    f"<Expiration>{_future(duration)}</Expiration>"
-                    f"</Credentials>"
-                    f"<AssumedRoleUser>"
-                    f"<AssumedRoleId>{role_id}:{session}</AssumedRoleId>"
-                    f"<Arn>{assumed_arn}</Arn>"
-                    f"</AssumedRoleUser>"
-                    f"<SubjectFromWebIdentityToken>test-subject</SubjectFromWebIdentityToken>"
-                    f"<Audience>sts.amazonaws.com</Audience>"
-                    f"<Provider>accounts.google.com</Provider>"
-                    f"</AssumeRoleWithWebIdentityResult>",
-                    ns="sts")
-
-    if action == "GetSessionToken":
-        duration = int(_p(params, "DurationSeconds") or 43200)
-        expiration = _future(duration)
-        access_key = _gen_session_access_key()
-        secret_key = _gen_secret()
-        session_token = _gen_session_token()
-        if use_json:
-            return json_response({
-                "Credentials": {"AccessKeyId": access_key, "SecretAccessKey": secret_key, "SessionToken": session_token, "Expiration": time.time() + duration},
-            })
-        return _xml(200, "GetSessionTokenResponse",
-                    f"<GetSessionTokenResult>"
-                    f"<Credentials>"
-                    f"<AccessKeyId>{access_key}</AccessKeyId>"
-                    f"<SecretAccessKey>{secret_key}</SecretAccessKey>"
-                    f"<SessionToken>{session_token}</SessionToken>"
-                    f"<Expiration>{expiration}</Expiration>"
-                    f"</Credentials>"
-                    f"</GetSessionTokenResult>",
-                    ns="sts")
-
-    if action == "GetAccessKeyInfo":
-        if use_json:
-            return json_response({"Account": get_account_id()})
-        return _xml(200, "GetAccessKeyInfoResponse",
-                    f"<GetAccessKeyInfoResult>"
-                    f"<Account>{get_account_id()}</Account>"
-                    f"</GetAccessKeyInfoResult>",
-                    ns="sts")
-
-    return _error(400, "InvalidAction", f"Unknown STS action: {action}", ns="sts")
 
 
 # ===================================================================== Shared helpers

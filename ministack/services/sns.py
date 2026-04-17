@@ -396,7 +396,7 @@ def _list_subscriptions(params):
             f"<Owner>{sub.get('owner', get_account_id())}</Owner>"
             f"<TopicArn>{sub['topic_arn']}</TopicArn>"
             f"<Protocol>{sub['protocol']}</Protocol>"
-            f"<Endpoint>{sub['endpoint']}</Endpoint>"
+            f"<Endpoint>{_xml_escape(sub['endpoint'])}</Endpoint>"
             "</member>"
         )
     next_token_xml = ""
@@ -419,7 +419,7 @@ def _list_subscriptions_by_topic(params):
             f"<Owner>{sub.get('owner', get_account_id())}</Owner>"
             f"<TopicArn>{topic_arn}</TopicArn>"
             f"<Protocol>{sub['protocol']}</Protocol>"
-            f"<Endpoint>{sub['endpoint']}</Endpoint>"
+            f"<Endpoint>{_xml_escape(sub['endpoint'])}</Endpoint>"
             "</member>"
         )
     return _xml(200, "ListSubscriptionsByTopicResponse",

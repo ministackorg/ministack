@@ -220,6 +220,42 @@ def test_sqs_fifo_deduplication(sqs):
     )
     assert r1["MessageId"] == r2["MessageId"]
 
+def test_sqs_fifo_dedup_scope_message_group(sqs):
+    """DeduplicationScope=messageGroup: same body in different groups must both enqueue."""
+    url = sqs.create_queue(
+        QueueName="intg-sqs-dedup-scope-mg.fifo",
+        Attributes={
+            "FifoQueue": "true",
+            "ContentBasedDeduplication": "true",
+            "DeduplicationScope": "messageGroup",
+            "FifoThroughputLimit": "perMessageGroupId",
+        },
+    )["QueueUrl"]
+
+    r1 = sqs.send_message(
+        QueueUrl=url,
+        MessageBody="same-body",
+        MessageGroupId="G1",
+    )
+    r2 = sqs.send_message(
+        QueueUrl=url,
+        MessageBody="same-body",
+        MessageGroupId="G2",
+    )
+    # Different groups → different MessageIds
+    assert r1["MessageId"] != r2["MessageId"]
+
+    # Duplicate within the same group → same MessageId
+    r3 = sqs.send_message(
+        QueueUrl=url,
+        MessageBody="same-body",
+        MessageGroupId="G1",
+    )
+    assert r1["MessageId"] == r3["MessageId"]
+
+    msgs = sqs.receive_message(QueueUrl=url, MaxNumberOfMessages=10)
+    assert len(msgs.get("Messages", [])) == 2
+
 def test_sqs_dlq(sqs):
     dlq_url = sqs.create_queue(QueueName="intg-sqs-dlq-target")["QueueUrl"]
     dlq_arn = sqs.get_queue_attributes(

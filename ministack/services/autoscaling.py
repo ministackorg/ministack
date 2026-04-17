@@ -32,6 +32,39 @@ _scheduled_actions = AccountScopedDict()
 _tags = AccountScopedDict()  # asg_name -> [{"Key":..., "Value":...}, ...]
 
 
+import copy
+
+
+def get_state():
+    return {
+        "asgs": copy.deepcopy(_asgs),
+        "launch_configs": copy.deepcopy(_launch_configs),
+        "policies": copy.deepcopy(_policies),
+        "hooks": copy.deepcopy(_hooks),
+        "scheduled_actions": copy.deepcopy(_scheduled_actions),
+        "tags": copy.deepcopy(_tags),
+    }
+
+
+def restore_state(data):
+    if data:
+        _asgs.update(data.get("asgs", {}))
+        _launch_configs.update(data.get("launch_configs", {}))
+        _policies.update(data.get("policies", {}))
+        _hooks.update(data.get("hooks", {}))
+        _scheduled_actions.update(data.get("scheduled_actions", {}))
+        _tags.update(data.get("tags", {}))
+
+
+def reset():
+    _asgs.clear()
+    _launch_configs.clear()
+    _policies.clear()
+    _hooks.clear()
+    _scheduled_actions.clear()
+    _tags.clear()
+
+
 def _p(params, key):
     v = params.get(key, "")
     return v[0] if isinstance(v, list) else v

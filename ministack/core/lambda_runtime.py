@@ -12,10 +12,12 @@ import os
 import shutil
 import subprocess
 import sys
+import queue
 import tempfile
 import threading
 import time
 import zipfile
+import queue
 
 logger = logging.getLogger("lambda_runtime")
 
@@ -328,6 +330,16 @@ class Worker:
         self._lock = threading.Lock()
         self._cold = True
         self._start_time = None
+        self._stderr_queue: queue.Queue = queue.Queue()
+        self._stderr_thread: threading.Thread | None = None
+
+    def _read_stderr(self):
+        """Background daemon thread: continuously drain stderr into queue."""
+        try:
+            for line in self._proc.stderr:
+                self._stderr_queue.put(line.rstrip("\n"))
+        except Exception:
+            pass
 
     def _spawn(self):
         """Extract zip and start worker process."""
@@ -449,6 +461,12 @@ class Worker:
             env=spawn_env,
         )
 
+        self._stderr_queue = queue.Queue()
+        self._stderr_thread = threading.Thread(
+            target=self._read_stderr, daemon=True, name=f"stderr-{self.func_name}"
+        )
+        self._stderr_thread.start()
+
         init = {
             "code_dir": code_dir,
             "module": module_name,
@@ -489,15 +507,13 @@ class Worker:
         logger.info("Lambda worker spawned for %s (%s, cold start)", self.func_name, runtime)
 
     def _drain_stderr(self) -> str:
-        """Read any available stderr output without blocking."""
-        import select
+        """Collect all currently available stderr lines (non-blocking)."""
         lines = []
-        if self._proc and self._proc.stderr:
-            while select.select([self._proc.stderr], [], [], 0)[0]:
-                line = self._proc.stderr.readline()
-                if not line:
-                    break
-                lines.append(line.rstrip("\n"))
+        try:
+            while True:
+                lines.append(self._stderr_queue.get_nowait())
+        except queue.Empty:
+            pass
         return "\n".join(lines)
 
     def invoke(self, event: dict, request_id: str) -> dict:

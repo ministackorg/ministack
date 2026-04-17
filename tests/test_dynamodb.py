@@ -1473,3 +1473,20 @@ def test_partiql_select_where_number(ddb):
     assert len(resp["Items"]) == 1
     assert resp["Items"][0]["pk"]["S"] == "n2"
 
+
+def test_dynamodb_stream_arn_stable(ddb):
+    """LatestStreamArn should be stable across DescribeTable calls."""
+    tname = f"stream-stable-{_uuid_mod.uuid4().hex[:8]}"
+    ddb.create_table(
+        TableName=tname,
+        KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+        AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "S"}],
+        BillingMode="PAY_PER_REQUEST",
+        StreamSpecification={"StreamEnabled": True, "StreamViewType": "NEW_AND_OLD_IMAGES"},
+    )
+    desc1 = ddb.describe_table(TableName=tname)["Table"]
+    desc2 = ddb.describe_table(TableName=tname)["Table"]
+    assert desc1["LatestStreamArn"] == desc2["LatestStreamArn"]
+    assert desc1["LatestStreamLabel"] == desc2["LatestStreamLabel"]
+    ddb.delete_table(TableName=tname)
+

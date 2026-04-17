@@ -1427,8 +1427,13 @@ def _list_services_by_namespace(data):
 def _put_account_setting_default(data):
     name = data.get("name", "")
     value = data.get("value", "")
-    _account_settings[name] = {"name": name, "value": value, "principalArn": f"arn:aws:iam::{os.environ.get('MINISTACK_ACCOUNT_ID', '000000000000')}:root"}
-    return json_response({"setting": _account_settings[name]})
+    _account_settings[name] = value
+    return json_response({"setting": {
+        "name": name,
+        "value": value,
+        "principalArn": f"arn:aws:iam::{get_account_id()}:root",
+        "type": "account",
+    }})
 
 
 def _delete_account_setting(data):
@@ -1539,6 +1544,19 @@ def _get_task_protection(data):
 
 
 # ---------------------------------------------------------------------------
+# Container instances (stub — MiniStack runs tasks as Docker containers
+# directly, there are no EC2 container instances to register)
+# ---------------------------------------------------------------------------
+
+def _list_container_instances(data):
+    return json_response({"containerInstanceArns": []})
+
+
+def _describe_container_instances(data):
+    return json_response({"containerInstances": [], "failures": []})
+
+
+# ---------------------------------------------------------------------------
 # Action map (X-Amz-Target dispatch)
 # ---------------------------------------------------------------------------
 
@@ -1588,6 +1606,8 @@ _ACTION_MAP = {
     "SubmitContainerStateChange": _submit_container_state_change,
     "SubmitAttachmentStateChanges": _submit_attachment_state_changes,
     "DiscoverPollEndpoint": _discover_poll_endpoint,
+    "ListContainerInstances": _list_container_instances,
+    "DescribeContainerInstances": _describe_container_instances,
     "UpdateTaskProtection": _update_task_protection,
     "GetTaskProtection": _get_task_protection,
 }

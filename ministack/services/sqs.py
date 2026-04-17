@@ -262,6 +262,7 @@ def _act_send_message(data: dict, qurl: str) -> dict:
     sys_attrs = data.get("MessageSystemAttributes") or {}
     group_id = data.get("MessageGroupId")
     dedup_id = data.get("MessageDeduplicationId")
+    dedup_cache_key = None
     seq = None
 
     # FIFO-specific validation & dedup
@@ -276,8 +277,15 @@ def _act_send_message(data: dict, qurl: str) -> dict:
                 raise _Err("InvalidParameterValue",
                             "The queue should either have ContentBasedDeduplication "
                             "enabled or MessageDeduplicationId provided explicitly.")
+        # When DeduplicationScope=messageGroup the dedup window is per message
+        # group; two messages with the same body but different group IDs are
+        # distinct and must both be enqueued.  Scope the cache key accordingly.
+        dedup_scope = q["attributes"].get("DeduplicationScope", "queue")
+        dedup_cache_key = (
+            f"{group_id}:{dedup_id}" if dedup_scope == "messageGroup" else dedup_id
+        )
         _prune_dedup(q)
-        cached = q["dedup_cache"].get(dedup_id)
+        cached = q["dedup_cache"].get(dedup_cache_key)
         if cached:
             r: dict = {"MessageId": cached["id"],
                        "MD5OfMessageBody": cached["md5"]}
@@ -312,12 +320,13 @@ def _act_send_message(data: dict, qurl: str) -> dict:
         },
         "group_id": group_id,
         "dedup_id": dedup_id,
+        "dedup_cache_key": dedup_cache_key if q["is_fifo"] else None,
         "seq": seq,
     }
     q["messages"].append(msg)
 
     if q["is_fifo"] and dedup_id:
-        q["dedup_cache"][dedup_id] = {
+        q["dedup_cache"][dedup_cache_key] = {
             "expire": now + _DEDUP_WINDOW_S,
             "id": mid, "md5": md5b, "md5a": md5a, "seq": seq,
         }
@@ -397,7 +406,10 @@ def _act_delete_message(data: dict, qurl: str) -> dict:
             # 5-minute window, but clearing on delete is more practical for
             # local development where tests re-run with fixed dedup IDs.
             if q["is_fifo"] and m.get("dedup_id"):
-                q["dedup_cache"].pop(m["dedup_id"], None)
+                # Use the stored cache key (which may be group-scoped) to
+                # clear the correct dedup entry.
+                cache_key = m.get("dedup_cache_key") or m["dedup_id"]
+                q["dedup_cache"].pop(cache_key, None)
         else:
             kept.append(m)
     q["messages"] = kept

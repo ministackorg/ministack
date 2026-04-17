@@ -424,8 +424,8 @@ def _create_replication_group(p):
         "AuthTokenEnabled": _p(p, "AuthToken") != "",
         "TransitEncryptionEnabled": _p(p, "TransitEncryptionEnabled", "false").lower() == "true",
         "AtRestEncryptionEnabled": _p(p, "AtRestEncryptionEnabled", "false").lower() == "true",
-        "AutomaticFailover": _p(p, "AutomaticFailoverEnabled", "false"),
-        "MultiAZ": _p(p, "MultiAZEnabled", "false"),
+        "AutomaticFailover": "enabled" if _p(p, "AutomaticFailoverEnabled", "false").lower() == "true" else "disabled",
+        "MultiAZ": "enabled" if _p(p, "MultiAZEnabled", "false").lower() == "true" else "disabled",
         "ConfigurationEndpoint": {"Address": endpoint_host, "Port": endpoint_port} if num_node_groups > 1 else None,
         "ARN": arn,
         "_num_node_groups": num_node_groups,
@@ -481,9 +481,9 @@ def _modify_replication_group(p):
     if _p(p, "SnapshotWindow"):
         rg["SnapshotWindow"] = _p(p, "SnapshotWindow")
     if _p(p, "AutomaticFailoverEnabled"):
-        rg["AutomaticFailover"] = _p(p, "AutomaticFailoverEnabled")
+        rg["AutomaticFailover"] = "enabled" if _p(p, "AutomaticFailoverEnabled").lower() == "true" else "disabled"
     if _p(p, "MultiAZEnabled"):
-        rg["MultiAZ"] = _p(p, "MultiAZEnabled")
+        rg["MultiAZ"] = "enabled" if _p(p, "MultiAZEnabled").lower() == "true" else "disabled"
     if _p(p, "EngineVersion"):
         rg["EngineVersion"] = _p(p, "EngineVersion")
     if _p(p, "CacheParameterGroupName"):
@@ -570,10 +570,16 @@ def _create_subnet_group(p):
         "Subnets": subnets,
         "ARN": arn,
     }
+    subnets_xml = "".join(
+        f"<Subnet><SubnetIdentifier>{s['SubnetIdentifier']}</SubnetIdentifier>"
+        f"<SubnetAvailabilityZone><Name>{s['SubnetAvailabilityZone']['Name']}</Name></SubnetAvailabilityZone>"
+        f"</Subnet>" for s in subnets
+    )
     return _xml(200, "CreateCacheSubnetGroupResponse",
         f"<CreateCacheSubnetGroupResult><CacheSubnetGroup>"
         f"<CacheSubnetGroupName>{name}</CacheSubnetGroupName>"
         f"<CacheSubnetGroupDescription>{desc}</CacheSubnetGroupDescription>"
+        f"<Subnets>{subnets_xml}</Subnets>"
         f"<ARN>{arn}</ARN>"
         f"</CacheSubnetGroup></CreateCacheSubnetGroupResult>")
 

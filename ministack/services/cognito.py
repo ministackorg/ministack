@@ -60,7 +60,9 @@ import string
 import time
 import zlib
 from datetime import datetime, timezone
-from urllib.parse import parse_qs, urlencode
+import hashlib
+import html as html_mod
+from urllib.parse import parse_qs, urlencode, quote
 from xml.etree.ElementTree import Element, SubElement, tostring as xml_tostring
 
 from defusedxml.ElementTree import fromstring as safe_xml_parse
@@ -130,9 +132,18 @@ def well_known_openid_configuration(pool_id: str, region: str | None = None):
         "jwks_uri": f"{issuer}/.well-known/jwks.json",
         "authorization_endpoint": f"{issuer}/oauth2/authorize",
         "token_endpoint": f"{issuer}/oauth2/token",
-        "response_types_supported": ["code", "token"],
+        "userinfo_endpoint": f"{issuer}/oauth2/userInfo",
+        "end_session_endpoint": f"{issuer}/logout",
+        "response_types_supported": ["code"],
         "subject_types_supported": ["public"],
         "id_token_signing_alg_values_supported": ["RS256"],
+        "scopes_supported": ["openid", "email", "phone", "profile"],
+        "token_endpoint_auth_methods_supported": ["client_secret_basic", "client_secret_post"],
+        "claims_supported": [
+            "sub", "iss", "aud", "exp", "iat", "auth_time",
+            "email", "email_verified", "name", "phone_number",
+            "phone_number_verified", "cognito:username", "cognito:groups",
+        ],
     }
     return 200, {"Content-Type": "application/json"}, json.dumps(doc).encode()
 
@@ -166,6 +177,13 @@ _user_pools = AccountScopedDict()
 _pool_domain_map = AccountScopedDict()   # domain -> pool_id
 
 # ---------------------------------------------------------------------------
+# In-memory state — OAuth2 Authorization Codes & Refresh Tokens
+# ---------------------------------------------------------------------------
+
+_authorization_codes: dict[str, dict] = {}   # code -> {client_id, pool_id, redirect_uri, scope, username, nonce, expires_at, code_challenge, code_challenge_method}
+_refresh_tokens: dict[str, dict] = {}        # refresh_token_value -> {pool_id, client_id, username, scope}
+
+# ---------------------------------------------------------------------------
 # In-memory state — Identity Pools (cognito-identity)
 # ---------------------------------------------------------------------------
 
@@ -197,6 +215,8 @@ def get_state():
         "pool_domain_map": copy.deepcopy(_pool_domain_map),
         "identity_pools": copy.deepcopy(_identity_pools),
         "identity_tags": copy.deepcopy(_identity_tags),
+        "authorization_codes": copy.deepcopy(_authorization_codes),
+        "refresh_tokens": copy.deepcopy(_refresh_tokens),
     }
 
 
@@ -206,6 +226,8 @@ def restore_state(data):
         _pool_domain_map.update(data.get("pool_domain_map", {}))
         _identity_pools.update(data.get("identity_pools", {}))
         _identity_tags.update(data.get("identity_tags", {}))
+        _authorization_codes.update(data.get("authorization_codes", {}))
+        _refresh_tokens.update(data.get("refresh_tokens", {}))
 
 
 _restored = load_state("cognito")
@@ -417,24 +439,82 @@ def _parse_saml_response(saml_response_b64: str) -> dict:
     return {"name_id": name_id, "attributes": attrs}
 
 
-def _find_pool_and_client(client_id: str):
-    """Find the pool and client dict by client_id. Returns (pool_id, pool, client) or Nones."""
-    for pid, pool in _user_pools.items():
+def _all_pools():
+    """Iterate ALL user pools across ALL accounts.
+
+    OAuth2 endpoints are accessed by browsers without AWS credentials, so the
+    normal account-scoped iteration would miss pools created under a specific
+    account.  Yields (pool_id, pool_dict) pairs.
+    """
+    # _user_pools._data stores {(account_id, pool_id): pool_dict}
+    for (_, pid), pool in _user_pools._data.items():
+        yield pid, pool
+
+
+def _get_pool_unscoped(pool_id: str):
+    """Look up a pool by ID across ALL accounts."""
+    for pid, pool in _all_pools():
+        if pid == pool_id:
+            return pool
+    return None
+
+
+def _find_pool_by_client_id(client_id: str):
+    """Return (pool_id, pool, client) or (None, None, None).
+
+    Searches across ALL accounts because OAuth2 endpoints are accessed by
+    browsers without AWS credentials, so the normal account-scoped lookup
+    would miss pools created under a specific account.
+    """
+    for pid, pool in _all_pools():
         client = pool["_clients"].get(client_id)
-        if client:
+        if client is not None:
             return pid, pool, client
     return None, None, None
 
 
-def _cleanup_expired_codes():
-    """Remove auth codes older than _AUTH_CODE_TTL."""
+def _cleanup_expired_relay_codes():
+    """Remove SAML/OIDC relay auth codes older than _AUTH_CODE_TTL."""
     now = time.time()
     expired = [k for k, v in _auth_codes.items() if now - v.get("created_at", 0) > _AUTH_CODE_TTL]
     for k in expired:
         del _auth_codes[k]
 
 
-def _get_qp(query_params: dict, key: str, default: str = "") -> str:
+def _authenticate_client(headers: dict, form: dict):
+    """Extract client_id / client_secret from Basic auth header or form body."""
+    auth = headers.get("authorization", "") if headers else ""
+    if auth.lower().startswith("basic "):
+        try:
+            decoded = base64.b64decode(auth.split(" ", 1)[1]).decode("utf-8")
+            cid, csec = decoded.split(":", 1)
+            return cid, csec
+        except Exception:
+            pass
+    return form.get("client_id", ""), form.get("client_secret", "")
+
+
+def _generate_auth_code() -> str:
+    return secrets.token_urlsafe(32)
+
+
+def _cleanup_expired_codes():
+    now = time.time()
+    expired = [code for code, entry in _authorization_codes.items() if entry["expires_at"] < now]
+    for code in expired:
+        del _authorization_codes[code]
+
+
+def _verify_pkce(code_verifier: str, code_challenge: str, method: str) -> bool:
+    if method == "S256":
+        digest = hashlib.sha256(code_verifier.encode("ascii")).digest()
+        computed = base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+        return computed == code_challenge
+    # plain
+    return code_verifier == code_challenge
+
+
+def _qp(query_params: dict, key: str, default: str = "") -> str:
     """Extract a single value from query_params (which may have list values)."""
     v = query_params.get(key, default)
     return v[0] if isinstance(v, list) else v
@@ -450,11 +530,11 @@ async def handle_request(method, path, headers, body, query_params):
 
     # Path-based endpoints (form-encoded or no body — must run before JSON parse)
     if path.startswith("/oauth2/authorize"):
-        return _oauth2_authorize(query_params)
+        return handle_oauth2_authorize(method, path, headers, query_params)
     if path.startswith("/saml2/idpresponse"):
         return _saml2_idp_response(body, query_params)
     if path.startswith("/oauth2/token"):
-        return _oauth2_token({}, query_params, body)
+        return _oauth2_token({}, query_params, body, headers)
 
     try:
         data = json.loads(body) if body else {}
@@ -2020,22 +2100,86 @@ def _idp_list_tags_for_resource(data):
 
 
 # ===========================================================================
-# OAUTH2 / SAML DATA-PLANE ENDPOINTS
+# OAUTH2 / OIDC / SAML ENDPOINTS (data plane)
 # ===========================================================================
 
-def _oauth2_authorize(query_params):
-    """GET /oauth2/authorize — redirect to external IdP (SAML or OIDC)."""
-    response_type = _get_qp(query_params, "response_type")
-    client_id = _get_qp(query_params, "client_id")
-    redirect_uri = _get_qp(query_params, "redirect_uri")
-    identity_provider = _get_qp(query_params, "identity_provider")
-    state = _get_qp(query_params, "state")
-    scope = _get_qp(query_params, "scope", "openid")
+def _oauth2_error(error: str, description: str, status: int = 400):
+    body = json.dumps({"error": error, "error_description": description}).encode()
+    return status, {"Content-Type": "application/json"}, body
+
+
+def _login_page_html(client_id, redirect_uri, scope, state, response_type,
+                     code_challenge="", code_challenge_method="", nonce="",
+                     error_message=""):
+    esc = html_mod.escape
+    err_block = ""
+    if error_message:
+        err_block = f'<div class="error">{esc(error_message)}</div>'
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Sign in</title>
+<style>
+*{{margin:0;padding:0;box-sizing:border-box}}
+body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  background:#f0f2f5;display:flex;justify-content:center;align-items:center;min-height:100vh}}
+.card{{background:#fff;border-radius:8px;box-shadow:0 2px 8px rgba(0,0,0,.1);
+  padding:40px;width:400px;max-width:90vw}}
+h1{{font-size:24px;font-weight:600;color:#232f3e;margin-bottom:24px;text-align:center}}
+label{{display:block;font-size:14px;font-weight:500;color:#545b64;margin-bottom:4px}}
+input[type=text],input[type=password]{{width:100%;padding:10px 12px;border:1px solid #aab7b8;
+  border-radius:4px;font-size:14px;margin-bottom:16px;outline:none;transition:border-color .15s}}
+input[type=text]:focus,input[type=password]:focus{{border-color:#0073bb;box-shadow:0 0 0 2px rgba(0,115,187,.2)}}
+button{{width:100%;padding:10px;background:#0073bb;color:#fff;border:none;border-radius:4px;
+  font-size:16px;font-weight:500;cursor:pointer;transition:background .15s}}
+button:hover{{background:#005a94}}
+.error{{background:#fce8e6;color:#d13212;border:1px solid #d13212;border-radius:4px;
+  padding:10px;margin-bottom:16px;font-size:13px;text-align:center}}
+.footer{{text-align:center;margin-top:20px;font-size:12px;color:#879596}}
+</style>
+</head>
+<body>
+<div class="card">
+<h1>Sign in</h1>
+{err_block}
+<form method="POST" action="/login">
+<input type="hidden" name="client_id" value="{esc(client_id)}">
+<input type="hidden" name="redirect_uri" value="{esc(redirect_uri)}">
+<input type="hidden" name="scope" value="{esc(scope)}">
+<input type="hidden" name="state" value="{esc(state)}">
+<input type="hidden" name="response_type" value="{esc(response_type)}">
+<input type="hidden" name="code_challenge" value="{esc(code_challenge)}">
+<input type="hidden" name="code_challenge_method" value="{esc(code_challenge_method)}">
+<input type="hidden" name="nonce" value="{esc(nonce)}">
+<label for="username">Username</label>
+<input type="text" id="username" name="username" autocomplete="username" required autofocus>
+<label for="password">Password</label>
+<input type="password" id="password" name="password" autocomplete="current-password" required>
+<button type="submit">Sign in</button>
+</form>
+<div class="footer">Powered by ministack</div>
+</div>
+</body>
+</html>"""
+
+
+# -- /oauth2/authorize (GET) ------------------------------------------------
+
+def _oauth2_authorize_federation(query_params):
+    """Redirect to external IdP (SAML or OIDC) when identity_provider is specified."""
+    response_type = _qp(query_params, "response_type")
+    client_id = _qp(query_params, "client_id")
+    redirect_uri = _qp(query_params, "redirect_uri")
+    identity_provider = _qp(query_params, "identity_provider")
+    state = _qp(query_params, "state")
+    scope = _qp(query_params, "scope", "openid")
 
     if not client_id:
         return error_response_json("InvalidParameterException", "client_id is required.", 400)
 
-    pool_id, pool, client = _find_pool_and_client(client_id)
+    pool_id, pool, client = _find_pool_by_client_id(client_id)
     if not pool:
         return error_response_json("ResourceNotFoundException", f"Client {client_id} not found.", 400)
 
@@ -2054,7 +2198,7 @@ def _oauth2_authorize(query_params):
                                    f"Identity provider {identity_provider} not found.", 400)
 
     # Store relay context for the callback
-    _cleanup_expired_codes()
+    _cleanup_expired_relay_codes()
     relay_key = secrets.token_urlsafe(24)
     _auth_codes[relay_key] = {
         "type": "relay",
@@ -2104,6 +2248,55 @@ def _oauth2_authorize(query_params):
     return 302, {"Location": redirect_url, "Content-Type": "text/html"}, b""
 
 
+def handle_oauth2_authorize(method, path, headers, query_params):
+    """GET /oauth2/authorize — if identity_provider is given, redirect to external IdP;
+    otherwise show managed login form."""
+    # Federation redirect (SAML / OIDC external IdP)
+    identity_provider = _qp(query_params, "identity_provider")
+    if identity_provider:
+        return _oauth2_authorize_federation(query_params)
+
+    # Managed login UI
+    client_id = _qp(query_params, "client_id")
+    redirect_uri = _qp(query_params, "redirect_uri")
+    response_type = _qp(query_params, "response_type")
+    scope = _qp(query_params, "scope")
+    state = _qp(query_params, "state")
+    code_challenge = _qp(query_params, "code_challenge")
+    code_challenge_method = _qp(query_params, "code_challenge_method")
+    nonce = _qp(query_params, "nonce")
+
+    if response_type != "code":
+        return _oauth2_error("unsupported_response_type", "Only response_type=code is supported.")
+
+    if not client_id:
+        return _oauth2_error("invalid_request", "client_id is required.")
+
+    pool_id, pool, client = _find_pool_by_client_id(client_id)
+    if not pool:
+        return _oauth2_error("invalid_client", f"Client {client_id} not found.")
+
+    if "code" not in client.get("AllowedOAuthFlows", []):
+        return _oauth2_error("unauthorized_client", "Client is not allowed to use the code flow.")
+
+    # Validate redirect_uri
+    callback_urls = client.get("CallbackURLs", [])
+    if not redirect_uri:
+        redirect_uri = client.get("DefaultRedirectURI", "")
+    if not redirect_uri:
+        return _oauth2_error("invalid_request", "redirect_uri is required.")
+    if callback_urls and redirect_uri not in callback_urls:
+        return _oauth2_error("invalid_request", f"redirect_uri is not allowed: {redirect_uri}")
+
+    html_body = _login_page_html(
+        client_id, redirect_uri, scope, state, response_type,
+        code_challenge, code_challenge_method, nonce,
+    )
+    return 200, {"Content-Type": "text/html; charset=utf-8"}, html_body.encode("utf-8")
+
+
+# -- /saml2/idpresponse (POST) ---------------------------------------------
+
 def _saml2_idp_response(body: bytes, query_params):
     """POST /saml2/idpresponse — receive SAML assertion, create user, redirect with auth code."""
     # Parse form-encoded body
@@ -2132,7 +2325,7 @@ def _saml2_idp_response(body: bytes, query_params):
     state = relay.get("state", "")
     provider_name = relay["provider_name"]
 
-    pool = _user_pools.get(pool_id)
+    pool = _get_pool_unscoped(pool_id)
     if not pool:
         return error_response_json("ResourceNotFoundException", f"User pool {pool_id} not found.", 400)
 
@@ -2193,7 +2386,7 @@ def _saml2_idp_response(body: bytes, query_params):
         pool["EstimatedNumberOfUsers"] = len(pool["_users"])
 
     # Generate authorization code
-    _cleanup_expired_codes()
+    _cleanup_expired_relay_codes()
     code = secrets.token_urlsafe(32)
     _auth_codes[code] = {
         "type": "code",
@@ -2215,11 +2408,81 @@ def _saml2_idp_response(body: bytes, query_params):
     return 302, {"Location": location, "Content-Type": "text/html"}, b""
 
 
-def _oauth2_token(data, query_params, raw_body: bytes = b""):
-    """/oauth2/token — supports authorization_code and client_credentials grants.
-    Body is application/x-www-form-urlencoded, not JSON.
-    """
-    # Parse form-encoded body first, fall back to query_params
+# -- /login (POST) ----------------------------------------------------------
+
+def handle_login_submit(method, path, headers, body, query_params):
+    """POST /login — process the login form and redirect with auth code."""
+    form: dict = {}
+    if body:
+        try:
+            parsed = parse_qs(body.decode("utf-8", errors="replace"), keep_blank_values=True)
+            form = {k: v[0] for k, v in parsed.items()}
+        except Exception:
+            pass
+
+    username = form.get("username", "")
+    password = form.get("password", "")
+    client_id = form.get("client_id", "")
+    redirect_uri = form.get("redirect_uri", "")
+    scope = form.get("scope", "")
+    state = form.get("state", "")
+    response_type = form.get("response_type", "code")
+    code_challenge = form.get("code_challenge", "")
+    code_challenge_method = form.get("code_challenge_method", "")
+    nonce = form.get("nonce", "")
+
+    pool_id, pool, client = _find_pool_by_client_id(client_id)
+    if not pool:
+        return _oauth2_error("invalid_client", f"Client {client_id} not found.")
+
+    # Authenticate user
+    error_msg = ""
+    user = pool["_users"].get(username)
+    if not user:
+        error_msg = "Incorrect username or password."
+    elif not user.get("Enabled", True):
+        error_msg = "User is disabled."
+    elif user.get("UserStatus") not in ("CONFIRMED", "FORCE_CHANGE_PASSWORD"):
+        error_msg = "User is not confirmed."
+    elif user.get("_password") != password:
+        error_msg = "Incorrect username or password."
+
+    if error_msg:
+        html_body = _login_page_html(
+            client_id, redirect_uri, scope, state, response_type,
+            code_challenge, code_challenge_method, nonce,
+            error_message=error_msg,
+        )
+        return 200, {"Content-Type": "text/html; charset=utf-8"}, html_body.encode("utf-8")
+
+    # Generate authorization code
+    code = _generate_auth_code()
+    _authorization_codes[code] = {
+        "client_id": client_id,
+        "pool_id": pool_id,
+        "redirect_uri": redirect_uri,
+        "scope": scope,
+        "username": username,
+        "nonce": nonce,
+        "code_challenge": code_challenge,
+        "code_challenge_method": code_challenge_method,
+        "expires_at": time.time() + 300,
+    }
+
+    # Redirect with code
+    sep = "&" if "?" in redirect_uri else "?"
+    location = f"{redirect_uri}{sep}code={quote(code)}"
+    if state:
+        location += f"&state={quote(state)}"
+
+    return 302, {"Location": location, "Cache-Control": "no-store"}, b""
+
+
+# -- /oauth2/token (POST) ---------------------------------------------------
+
+def _oauth2_token(data, query_params, raw_body: bytes = b"", headers: dict | None = None):
+    """/oauth2/token endpoint — supports authorization_code, refresh_token, client_credentials."""
+    # Parse form-encoded body
     form: dict = {}
     if raw_body:
         try:
@@ -2228,63 +2491,268 @@ def _oauth2_token(data, query_params, raw_body: bytes = b""):
         except Exception:
             pass
 
-    def _get(key):
-        if key in form:
-            return form[key]
-        v = query_params.get(key, "")
-        return v[0] if isinstance(v, list) else v
+    grant_type = form.get("grant_type", "")
 
-    grant_type = _get("grant_type")
-    client_id = _get("client_id")
+    # Client authentication
+    cid, csec = _authenticate_client(headers or {}, form)
 
-    # --- authorization_code grant ---
+    # ── authorization_code ──
     if grant_type == "authorization_code":
-        code = _get("code")
-        redirect_uri = _get("redirect_uri")
+        code = form.get("code", "")
+        redirect_uri = form.get("redirect_uri", "")
+        code_verifier = form.get("code_verifier", "")
 
+        # Try managed-login authorization codes first
+        _cleanup_expired_codes()
+        entry = _authorization_codes.get(code)
+        if entry:
+            # Validate
+            if entry["client_id"] != cid:
+                return _oauth2_error("invalid_grant", "client_id mismatch.")
+            if entry["redirect_uri"] and entry["redirect_uri"] != redirect_uri:
+                return _oauth2_error("invalid_grant", "redirect_uri mismatch.")
+
+            # PKCE verification
+            if entry.get("code_challenge"):
+                if not code_verifier:
+                    return _oauth2_error("invalid_grant", "code_verifier is required.")
+                method = entry.get("code_challenge_method", "plain")
+                if not _verify_pkce(code_verifier, entry["code_challenge"], method):
+                    return _oauth2_error("invalid_grant", "PKCE verification failed.")
+
+            # Consume code (one-time use)
+            del _authorization_codes[code]
+
+            pool_id = entry["pool_id"]
+            pool = _get_pool_unscoped(pool_id)
+            if not pool:
+                return _oauth2_error("server_error", "User pool not found.")
+
+            user = pool["_users"].get(entry["username"])
+            if not user:
+                return _oauth2_error("server_error", "User not found.")
+
+            # Validate client secret if client has one
+            _, _, client = _find_pool_by_client_id(cid)
+            if client and client.get("ClientSecret") and csec != client["ClientSecret"]:
+                return _oauth2_error("invalid_client", "Invalid client credentials.")
+
+            result = _build_auth_result(pool_id, cid, user)
+            refresh_val = result["RefreshToken"]
+            _refresh_tokens[refresh_val] = {
+                "pool_id": pool_id,
+                "client_id": cid,
+                "username": entry["username"],
+                "scope": entry.get("scope", ""),
+            }
+
+            resp = {
+                "access_token": result["AccessToken"],
+                "id_token": result["IdToken"],
+                "refresh_token": refresh_val,
+                "token_type": "Bearer",
+                "expires_in": 3600,
+            }
+            return 200, {"Content-Type": "application/json"}, json.dumps(resp).encode()
+
+        # Try SAML/OIDC federation auth codes
+        _cleanup_expired_relay_codes()
         code_data = _auth_codes.pop(code, None)
-        if not code_data or code_data.get("type") != "code":
-            return error_response_json("InvalidGrantException", "Invalid or expired authorization code.", 400)
+        if code_data and code_data.get("type") == "code":
+            if cid and code_data["client_id"] != cid:
+                return _oauth2_error("invalid_grant", "client_id mismatch.")
+            if redirect_uri and code_data["redirect_uri"] != redirect_uri:
+                return _oauth2_error("invalid_grant", "redirect_uri mismatch.")
 
-        # Validate client and redirect_uri
-        if client_id and code_data["client_id"] != client_id:
-            return error_response_json("InvalidGrantException", "client_id mismatch.", 400)
-        if redirect_uri and code_data["redirect_uri"] != redirect_uri:
-            return error_response_json("InvalidGrantException", "redirect_uri mismatch.", 400)
+            pool_id = code_data["pool_id"]
+            username = code_data["username"]
+            sub = code_data["sub"]
+            effective_client_id = code_data["client_id"]
 
-        pool_id = code_data["pool_id"]
-        username = code_data["username"]
-        sub = code_data["sub"]
-        effective_client_id = code_data["client_id"]
+            user_attrs = {}
+            pool = _get_pool_unscoped(pool_id)
+            if pool:
+                user = pool["_users"].get(username)
+                if user:
+                    user_attrs = _attr_list_to_dict(user.get("Attributes", []))
 
-        # Fetch user attributes for id_token claims (email, etc.)
-        user_attrs = {}
-        pool = _user_pools.get(pool_id)
-        if pool:
-            user = pool["_users"].get(username)
-            if user:
-                user_attrs = _attr_list_to_dict(user.get("Attributes", []))
+            access_token = _fake_token(sub, pool_id, effective_client_id, "access", username)
+            id_token = _fake_token(sub, pool_id, effective_client_id, "id", username, user_attrs=user_attrs)
+            refresh_token = secrets.token_urlsafe(48)
 
-        access_token = _fake_token(sub, pool_id, effective_client_id, "access", username)
-        id_token = _fake_token(sub, pool_id, effective_client_id, "id", username, user_attrs=user_attrs)
-        refresh_token = secrets.token_urlsafe(48)
+            return json_response({
+                "id_token": id_token,
+                "access_token": access_token,
+                "refresh_token": refresh_token,
+                "token_type": "Bearer",
+                "expires_in": 3600,
+            })
 
-        return json_response({
-            "id_token": id_token,
-            "access_token": access_token,
-            "refresh_token": refresh_token,
+        return _oauth2_error("invalid_grant", "Invalid or expired authorization code.")
+
+    # ── refresh_token ──
+    if grant_type == "refresh_token":
+        refresh_val = form.get("refresh_token", "")
+        entry = _refresh_tokens.get(refresh_val)
+        if not entry:
+            return _oauth2_error("invalid_grant", "Invalid refresh token.")
+
+        pool_id = entry["pool_id"]
+        pool = _get_pool_unscoped(pool_id)
+        if not pool:
+            return _oauth2_error("server_error", "User pool not found.")
+        user = pool["_users"].get(entry["username"])
+        if not user:
+            return _oauth2_error("server_error", "User not found.")
+
+        # Validate client secret if client has one
+        _, _, client = _find_pool_by_client_id(cid or entry["client_id"])
+        if client and client.get("ClientSecret") and csec and csec != client["ClientSecret"]:
+            return _oauth2_error("invalid_client", "Invalid client credentials.")
+
+        client_id = cid or entry["client_id"]
+        attrs = _attr_list_to_dict(user.get("Attributes", []))
+        sub = attrs.get("sub", user["Username"])
+        username = user.get("Username", "")
+        resp = {
+            "access_token": _fake_token(sub, pool_id, client_id, "access", username=username),
+            "id_token": _fake_token(sub, pool_id, client_id, "id", username=username, user_attrs=attrs),
             "token_type": "Bearer",
             "expires_in": 3600,
-        })
+        }
+        return 200, {"Content-Type": "application/json"}, json.dumps(resp).encode()
 
-    # --- client_credentials grant (existing behavior / default) ---
-    pool_id, pool, _ = _find_pool_and_client(client_id)
-    access_token = _fake_token(client_id or new_uuid(), pool_id or "", client_id or "", "access")
+    # ── client_credentials ──
+    if grant_type == "client_credentials":
+        pool_id, pool, client = _find_pool_by_client_id(cid)
+        if not pool or not client:
+            return _oauth2_error("invalid_client", "Client not found.")
+        if not client.get("ClientSecret"):
+            return _oauth2_error("invalid_client", "client_credentials requires a confidential client.")
+        if csec != client["ClientSecret"]:
+            return _oauth2_error("invalid_client", "Invalid client credentials.")
+
+        access_token = _fake_token(cid, pool_id, cid, "access")
+        resp = {
+            "access_token": access_token,
+            "token_type": "Bearer",
+            "expires_in": 3600,
+        }
+        return 200, {"Content-Type": "application/json"}, json.dumps(resp).encode()
+
+    # ── fallback (legacy behaviour for unrecognised grant_type) ──
+    pool_id, pool, client = _find_pool_by_client_id(cid)
+    access_token = _fake_token(cid or new_uuid(), pool_id or "", cid or "", "access")
     return json_response({
         "access_token": access_token,
         "token_type": "Bearer",
         "expires_in": 3600,
     })
+
+
+def handle_oauth2_token(method, path, headers, body, query_params):
+    """Public entry point called from app.py for POST /oauth2/token."""
+    return _oauth2_token({}, query_params, body, headers)
+
+
+# -- /oauth2/userInfo (GET/POST) ---------------------------------------------
+
+def handle_oauth2_userinfo(method, path, headers, body, query_params):
+    """GET or POST /oauth2/userInfo — return user claims from the access token."""
+    auth = headers.get("authorization", "")
+    if not auth.lower().startswith("bearer "):
+        return 401, {"Content-Type": "application/json", "WWW-Authenticate": "Bearer"}, \
+            json.dumps({"error": "invalid_token", "error_description": "Missing Bearer token."}).encode()
+
+    token = auth.split(" ", 1)[1].strip()
+    # Decode JWT payload
+    try:
+        parts = token.split(".")
+        payload_b64 = parts[1]
+        # Add padding
+        payload_b64 += "=" * (4 - len(payload_b64) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(payload_b64))
+    except Exception:
+        return 401, {"Content-Type": "application/json", "WWW-Authenticate": "Bearer"}, \
+            json.dumps({"error": "invalid_token", "error_description": "Invalid token."}).encode()
+
+    sub = payload.get("sub", "")
+    username = payload.get("username", "") or payload.get("cognito:username", "")
+
+    # Extract pool_id from the issuer claim to scope the lookup
+    iss = payload.get("iss", "")
+    token_pool_id = iss.rsplit("/", 1)[-1] if "/" in iss else ""
+
+    # Find user — prefer the specific pool from the token
+    user = None
+    if token_pool_id:
+        pool = _get_pool_unscoped(token_pool_id)
+        if pool:
+            if username and username in pool["_users"]:
+                user = pool["_users"][username]
+            else:
+                for u in pool["_users"].values():
+                    attrs = _attr_list_to_dict(u.get("Attributes", []))
+                    if attrs.get("sub") == sub:
+                        user = u
+                        break
+
+    # Fallback: search all pools (no AWS auth in browser)
+    if not user:
+        for _, pool in _all_pools():
+            if username and username in pool["_users"]:
+                user = pool["_users"][username]
+                break
+            for u in pool["_users"].values():
+                attrs = _attr_list_to_dict(u.get("Attributes", []))
+                if attrs.get("sub") == sub:
+                    user = u
+                    break
+            if user:
+                break
+
+    if not user:
+        return 401, {"Content-Type": "application/json", "WWW-Authenticate": "Bearer"}, \
+            json.dumps({"error": "invalid_token", "error_description": "User not found."}).encode()
+
+    attrs = _attr_list_to_dict(user.get("Attributes", []))
+    claims = {"sub": attrs.get("sub", user["Username"])}
+    # Standard OIDC claims
+    for key in ("email", "email_verified", "name", "family_name", "given_name",
+                "phone_number", "phone_number_verified", "preferred_username",
+                "nickname", "picture", "profile", "website", "gender",
+                "birthdate", "zoneinfo", "locale", "address", "updated_at"):
+        if key in attrs:
+            claims[key] = attrs[key]
+    claims["cognito:username"] = user.get("Username", "")
+    groups = user.get("_groups", [])
+    if groups:
+        claims["cognito:groups"] = groups
+
+    return 200, {"Content-Type": "application/json"}, json.dumps(claims).encode()
+
+
+# -- /logout (GET) -----------------------------------------------------------
+
+def handle_logout(method, path, headers, query_params):
+    """GET /logout — redirect to the logout URI."""
+    client_id = _qp(query_params, "client_id")
+    logout_uri = _qp(query_params, "logout_uri")
+
+    if not client_id:
+        return _oauth2_error("invalid_request", "client_id is required.")
+    if not logout_uri:
+        return _oauth2_error("invalid_request", "logout_uri is required.")
+
+    _, _, client = _find_pool_by_client_id(client_id)
+    if not client:
+        return _oauth2_error("invalid_client", f"Client {client_id} not found.")
+
+    allowed = client.get("LogoutURLs", [])
+    if allowed and logout_uri not in allowed:
+        return _oauth2_error("invalid_request", f"logout_uri is not allowed: {logout_uri}")
+
+    return 302, {"Location": logout_uri, "Cache-Control": "no-store"}, b""
 
 
 # ===========================================================================
@@ -2548,3 +3016,5 @@ def reset():
     _identity_pools.clear()
     _identity_tags.clear()
     _auth_codes.clear()
+    _authorization_codes.clear()
+    _refresh_tokens.clear()

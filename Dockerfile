@@ -8,6 +8,7 @@ RUN pip install --no-cache-dir --no-compile \
         "pyyaml>=6.0" \
         "cryptography>=41.0" \
         "pymysql>=1.1" \
+        "boto3>=1.34" \
         "awscli"
 
 # Strip awscli help examples (~25 MB) and Python cache files (~15 MB).
@@ -22,7 +23,9 @@ LABEL maintainer="MiniStack" \
       description="Local AWS Service Emulator — drop-in LocalStack replacement"
 
 # Upgrade base packages to pick up latest security patches.
-RUN apk upgrade --no-cache && apk add --no-cache nodejs bash && rm -f /usr/bin/wget /bin/wget
+RUN apk upgrade --no-cache && apk add --no-cache nodejs bash && rm -f /usr/bin/wget /bin/wget \
+    && rm -rf /usr/local/lib/python3.12/site-packages/pip* \
+              /usr/local/bin/pip*
 
 WORKDIR /opt/ministack
 

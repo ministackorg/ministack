@@ -57,7 +57,7 @@ def test_package_services_importable():
         ssm,
         stepfunctions,
     )
-    from ministack.services.iam_sts import handle_iam_request, handle_sts_request
+    from ministack.services import iam, sts
 
     for mod in [
         s3,
@@ -82,7 +82,7 @@ def test_package_services_importable():
         firehose,
         route53,
         cognito,
+        iam,
+        sts,
     ]:
         assert callable(getattr(mod, "handle_request", None)), f"{mod.__name__} missing handle_request"
-    assert callable(handle_iam_request)
-    assert callable(handle_sts_request)
