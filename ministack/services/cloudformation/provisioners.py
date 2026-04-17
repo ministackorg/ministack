@@ -245,14 +245,7 @@ def _sns_create(logical_id, props, stack_name):
             "endpoint": endpoint,
             "confirmed": protocol not in ("http", "https"),
             "owner": get_account_id(),
-            "attributes": {
-                "FilterPolicyScope": sub_def.get("FilterPolicyScope", "MessageAttributes"),
-                "FilterPolicy": (
-                    json.dumps(sub_def.get("FilterPolicy"))
-                    if isinstance(sub_def.get("FilterPolicy"), (dict, list))
-                    else (sub_def.get("FilterPolicy", "") or "")
-                )
-            }
+            "attributes": {}
         }
         _sns._topics[arn]["subscriptions"].append(sub)
         _sns._sub_arn_to_topic[sub_arn] = arn
