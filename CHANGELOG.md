@@ -41,7 +41,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 - **EC2 terminated instance cleanup throttled** — `DescribeInstances` no longer scans and cleans up terminated instances on every call; cleanup runs at most once per 10 seconds.
 - **S3 ETag single-compute** — `PutObject` now computes the MD5 hash once instead of twice, reducing CPU per write.
 - **CloudFormation deploy/delete speed** — removed artificial 1.5s async delays from stack deploy and delete operations.
-- **`/_ministack/reset` no longer blocks event loop** — `_reset_all_state()` now runs in a background thread via `asyncio.to_thread()`. Previously, ECS container cleanup during reset could block the ASGI event loop for 6+ seconds, causing subsequent requests to time out.
+- **`/_ministack/reset` no longer blocks event loop** — `_reset_all_state()` now runs via `asyncio.to_thread()` so Docker container cleanup (ECS, EKS, Lambda) doesn't starve the ASGI event loop. ECS `reset()` also fixed to stop containers by label filter (`ministack=ecs`) instead of individually fetching stale container IDs.
 
 ---
 
