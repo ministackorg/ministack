@@ -10,6 +10,7 @@ import pytest
 import boto3
 from botocore.exceptions import ClientError
 
+
 ENDPOINT = "http://localhost:4566"
 REGION = "us-east-1"
 
@@ -37,6 +38,7 @@ def _uid():
 # ---------------------------------------------------------------------------
 
 def test_eks_create_describe_delete_cluster(eks):
+    """Test EKS API contract: create → describe → delete → gone."""
     name = f"test-cluster-{_uid()}"
     resp = eks.create_cluster(
         name=name,
@@ -55,12 +57,12 @@ def test_eks_create_describe_delete_cluster(eks):
     assert "identity" in cluster
     assert "oidc" in cluster["identity"]
 
-    # Describe — poll until background k3s startup completes
-    for _ in range(30):
+    # Describe — wait for background thread to finish
+    for _ in range(60):
         resp = eks.describe_cluster(name=name)
         if resp["cluster"]["status"] == "ACTIVE":
             break
-        time.sleep(1)
+        time.sleep(0.5)
     assert resp["cluster"]["name"] == name
     assert resp["cluster"]["status"] == "ACTIVE"
 
@@ -224,9 +226,7 @@ def test_eks_cfn_cluster(cfn, eks):
     stack_name = f"eks-stack-{uid}"
     cfn.create_stack(StackName=stack_name, TemplateBody=template)
 
-    # Poll for stack creation — stack is stored synchronously but deploy
-    # runs as an async task, so describe_stacks may briefly not find it
-    # if the event loop hasn't yielded yet.
+    # Poll for stack — deploy runs as an async task
     stack = None
     for _ in range(30):
         try:
