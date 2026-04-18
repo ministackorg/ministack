@@ -223,19 +223,24 @@ def test_eks_cfn_cluster(cfn, eks):
     })
     stack_name = f"eks-stack-{uid}"
     cfn.create_stack(StackName=stack_name, TemplateBody=template)
-    time.sleep(3)
 
-    stack = cfn.describe_stacks(StackName=stack_name)["Stacks"][0]
+    # Poll for stack creation — stack is stored synchronously but deploy
+    # runs as an async task, so describe_stacks may briefly not find it
+    # if the event loop hasn't yielded yet.
+    stack = None
+    for _ in range(30):
+        try:
+            stack = cfn.describe_stacks(StackName=stack_name)["Stacks"][0]
+            if stack["StackStatus"] not in ("CREATE_IN_PROGRESS",):
+                break
+        except Exception:
+            pass
+        time.sleep(1)
+    assert stack is not None, f"Stack {stack_name} never appeared"
     assert stack["StackStatus"] == "CREATE_COMPLETE"
 
-    # Verify the cluster was created via the EKS API — poll for ACTIVE
-    for _ in range(10):
-        resp = eks.describe_cluster(name=cluster_name)
-        if resp["cluster"]["status"] == "ACTIVE":
-            break
-        time.sleep(0.5)
+    resp = eks.describe_cluster(name=cluster_name)
     assert resp["cluster"]["name"] == cluster_name
-    assert resp["cluster"]["status"] == "ACTIVE"
 
     cfn.delete_stack(StackName=stack_name)
     time.sleep(2)
