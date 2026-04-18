@@ -221,6 +221,16 @@ BANNER = r"""
 """
 
 
+_reset_lock: "asyncio.Lock | None" = None
+
+
+def _get_reset_lock() -> asyncio.Lock:
+    global _reset_lock
+    if _reset_lock is None:
+        _reset_lock = asyncio.Lock()
+    return _reset_lock
+
+
 async def app(scope, receive, send):
     """ASGI application entry point."""
     if scope["type"] == "lifespan":
@@ -286,6 +296,14 @@ async def app(scope, receive, send):
 
     request_id = str(uuid.uuid4())
 
+    # If a /_ministack/reset is in flight, wait for it to finish before
+    # serving this request. The lock is uncontended in steady state
+    # (acquire/release is near-free); during a reset, new requests block
+    # until state-wipe completes so no test can observe a half-reset server.
+    if path != "/_ministack/reset":
+        async with _get_reset_lock():
+            pass
+
     # Set per-request account ID from credentials (multi-tenancy support).
     # If the access key is a 12-digit number, it becomes the account ID.
     _access_key = extract_access_key_id(headers)
@@ -342,7 +360,10 @@ async def app(scope, receive, send):
 
     # Admin endpoints — no wildcard CORS headers (return early, before CORS block)
     if path == "/_ministack/reset" and method == "POST":
-        await asyncio.to_thread(_reset_all_state)
+        # Hold the reset lock exclusively so in-flight requests drain first
+        # and no new requests can interleave with service state wipes.
+        async with _get_reset_lock():
+            await asyncio.to_thread(_reset_all_state)
         run_init = query_params.get("init", [""])[0] == "1"
         if run_init:
             _run_init_scripts()
