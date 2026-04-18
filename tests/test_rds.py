@@ -715,3 +715,254 @@ def test_rds_modify_cluster_password(rds):
     resp = rds.describe_db_clusters(DBClusterIdentifier="pw-mod-cluster")
     cluster = resp["DBClusters"][0]
     assert cluster["DBClusterIdentifier"] == "pw-mod-cluster"
+
+
+# ---------------------------------------------------------------------------
+# Tests for the 8 previously-untested operations
+# ---------------------------------------------------------------------------
+
+
+def test_rds_create_read_replica(rds):
+    """CreateDBInstanceReadReplica creates a replica linked to the source."""
+    rds.create_db_instance(
+        DBInstanceIdentifier="rr-source",
+        DBInstanceClass="db.t3.micro",
+        Engine="postgres",
+        MasterUsername="admin",
+        MasterUserPassword="pass123",
+        AllocatedStorage=20,
+    )
+    try:
+        resp = rds.create_db_instance_read_replica(
+            DBInstanceIdentifier="rr-replica",
+            SourceDBInstanceIdentifier="rr-source",
+        )
+        replica = resp["DBInstance"]
+        assert replica["DBInstanceIdentifier"] == "rr-replica"
+        assert replica["ReadReplicaSourceDBInstanceIdentifier"] == "rr-source"
+        assert replica["DBInstanceStatus"] == "available"
+        assert replica["Engine"] == "postgres"
+        assert "Address" in replica["Endpoint"]
+
+        # Source should list the replica
+        source = rds.describe_db_instances(DBInstanceIdentifier="rr-source")["DBInstances"][0]
+        assert "rr-replica" in source["ReadReplicaDBInstanceIdentifiers"]
+
+        # Duplicate replica id should fail
+        with pytest.raises(ClientError) as exc:
+            rds.create_db_instance_read_replica(
+                DBInstanceIdentifier="rr-replica",
+                SourceDBInstanceIdentifier="rr-source",
+            )
+        assert exc.value.response["Error"]["Code"] == "DBInstanceAlreadyExistsFault"
+    finally:
+        rds.delete_db_instance(DBInstanceIdentifier="rr-replica", SkipFinalSnapshot=True)
+        rds.delete_db_instance(DBInstanceIdentifier="rr-source", SkipFinalSnapshot=True)
+
+
+def test_rds_create_read_replica_source_not_found(rds):
+    """CreateDBInstanceReadReplica fails when the source instance does not exist."""
+    with pytest.raises(ClientError) as exc:
+        rds.create_db_instance_read_replica(
+            DBInstanceIdentifier="rr-orphan",
+            SourceDBInstanceIdentifier="rr-nonexistent",
+        )
+    assert exc.value.response["Error"]["Code"] == "DBInstanceNotFoundFault"
+
+
+def test_rds_reboot_db_instance(rds):
+    """RebootDBInstance sets the instance status back to available."""
+    rds.create_db_instance(
+        DBInstanceIdentifier="reboot-test",
+        DBInstanceClass="db.t3.micro",
+        Engine="postgres",
+        MasterUsername="admin",
+        MasterUserPassword="pass",
+        AllocatedStorage=10,
+    )
+    try:
+        resp = rds.reboot_db_instance(DBInstanceIdentifier="reboot-test")
+        assert resp["DBInstance"]["DBInstanceStatus"] == "available"
+
+        desc = rds.describe_db_instances(DBInstanceIdentifier="reboot-test")
+        assert desc["DBInstances"][0]["DBInstanceStatus"] == "available"
+    finally:
+        rds.delete_db_instance(DBInstanceIdentifier="reboot-test", SkipFinalSnapshot=True)
+
+
+def test_rds_reboot_db_instance_not_found(rds):
+    """RebootDBInstance fails for a non-existent instance."""
+    with pytest.raises(ClientError) as exc:
+        rds.reboot_db_instance(DBInstanceIdentifier="no-such-instance")
+    assert exc.value.response["Error"]["Code"] == "DBInstanceNotFoundFault"
+
+
+def test_rds_restore_from_snapshot(rds):
+    """RestoreDBInstanceFromDBSnapshot creates a new instance from a snapshot."""
+    rds.create_db_instance(
+        DBInstanceIdentifier="restore-src",
+        DBInstanceClass="db.t3.micro",
+        Engine="postgres",
+        MasterUsername="admin",
+        MasterUserPassword="pass",
+        AllocatedStorage=20,
+        DBName="srcdb",
+    )
+    rds.create_db_snapshot(
+        DBSnapshotIdentifier="restore-snap",
+        DBInstanceIdentifier="restore-src",
+    )
+    try:
+        resp = rds.restore_db_instance_from_db_snapshot(
+            DBInstanceIdentifier="restored-db",
+            DBSnapshotIdentifier="restore-snap",
+            DBInstanceClass="db.t3.small",
+        )
+        inst = resp["DBInstance"]
+        assert inst["DBInstanceIdentifier"] == "restored-db"
+        assert inst["DBInstanceStatus"] == "available"
+        assert inst["Engine"] == "postgres"
+        assert inst["DBInstanceClass"] == "db.t3.small"
+
+        desc = rds.describe_db_instances(DBInstanceIdentifier="restored-db")
+        assert len(desc["DBInstances"]) == 1
+
+        # Duplicate target id should fail
+        with pytest.raises(ClientError) as exc:
+            rds.restore_db_instance_from_db_snapshot(
+                DBInstanceIdentifier="restored-db",
+                DBSnapshotIdentifier="restore-snap",
+            )
+        assert exc.value.response["Error"]["Code"] == "DBInstanceAlreadyExistsFault"
+    finally:
+        rds.delete_db_instance(DBInstanceIdentifier="restored-db", SkipFinalSnapshot=True)
+        rds.delete_db_snapshot(DBSnapshotIdentifier="restore-snap")
+        rds.delete_db_instance(DBInstanceIdentifier="restore-src", SkipFinalSnapshot=True)
+
+
+def test_rds_restore_from_snapshot_not_found(rds):
+    """RestoreDBInstanceFromDBSnapshot fails when the snapshot does not exist."""
+    with pytest.raises(ClientError) as exc:
+        rds.restore_db_instance_from_db_snapshot(
+            DBInstanceIdentifier="will-not-exist",
+            DBSnapshotIdentifier="no-such-snap",
+        )
+    assert exc.value.response["Error"]["Code"] == "DBSnapshotNotFound"
+
+
+def test_rds_start_db_instance(rds):
+    """StartDBInstance transitions a stopped instance to available."""
+    rds.create_db_instance(
+        DBInstanceIdentifier="start-test",
+        DBInstanceClass="db.t3.micro",
+        Engine="mysql",
+        MasterUsername="admin",
+        MasterUserPassword="pass",
+        AllocatedStorage=10,
+    )
+    try:
+        rds.stop_db_instance(DBInstanceIdentifier="start-test")
+        stopped = rds.describe_db_instances(DBInstanceIdentifier="start-test")["DBInstances"][0]
+        assert stopped["DBInstanceStatus"] == "stopped"
+
+        resp = rds.start_db_instance(DBInstanceIdentifier="start-test")
+        assert resp["DBInstance"]["DBInstanceStatus"] == "available"
+
+        started = rds.describe_db_instances(DBInstanceIdentifier="start-test")["DBInstances"][0]
+        assert started["DBInstanceStatus"] == "available"
+    finally:
+        rds.delete_db_instance(DBInstanceIdentifier="start-test", SkipFinalSnapshot=True)
+
+
+def test_rds_start_db_instance_not_found(rds):
+    """StartDBInstance fails for a non-existent instance."""
+    with pytest.raises(ClientError) as exc:
+        rds.start_db_instance(DBInstanceIdentifier="ghost-instance")
+    assert exc.value.response["Error"]["Code"] == "DBInstanceNotFoundFault"
+
+
+def test_rds_stop_db_instance(rds):
+    """StopDBInstance transitions an available instance to stopped."""
+    rds.create_db_instance(
+        DBInstanceIdentifier="stop-test",
+        DBInstanceClass="db.t3.micro",
+        Engine="mysql",
+        MasterUsername="admin",
+        MasterUserPassword="pass",
+        AllocatedStorage=10,
+    )
+    try:
+        resp = rds.stop_db_instance(DBInstanceIdentifier="stop-test")
+        assert resp["DBInstance"]["DBInstanceStatus"] == "stopped"
+
+        desc = rds.describe_db_instances(DBInstanceIdentifier="stop-test")["DBInstances"][0]
+        assert desc["DBInstanceStatus"] == "stopped"
+    finally:
+        rds.delete_db_instance(DBInstanceIdentifier="stop-test", SkipFinalSnapshot=True)
+
+
+def test_rds_stop_db_instance_not_found(rds):
+    """StopDBInstance fails for a non-existent instance."""
+    with pytest.raises(ClientError) as exc:
+        rds.stop_db_instance(DBInstanceIdentifier="ghost-instance-2")
+    assert exc.value.response["Error"]["Code"] == "DBInstanceNotFoundFault"
+
+
+def test_rds_describe_option_group_options(rds):
+    """DescribeOptionGroupOptions returns an empty list (stub)."""
+    resp = rds.describe_option_group_options(EngineName="mysql")
+    assert "OptionGroupOptions" in resp
+    assert resp["OptionGroupOptions"] == []
+
+
+def test_rds_describe_orderable_db_instance_options(rds):
+    """DescribeOrderableDBInstanceOptions returns instance classes for an engine."""
+    resp = rds.describe_orderable_db_instance_options(Engine="postgres")
+    options = resp["OrderableDBInstanceOptions"]
+    assert len(options) > 0
+    engines = {o["Engine"] for o in options}
+    assert engines == {"postgres"}
+    classes = {o["DBInstanceClass"] for o in options}
+    assert "db.t3.micro" in classes
+    assert "db.r5.large" in classes
+
+    # Filter by DBInstanceClass
+    resp2 = rds.describe_orderable_db_instance_options(
+        Engine="mysql", DBInstanceClass="db.t3.micro",
+    )
+    options2 = resp2["OrderableDBInstanceOptions"]
+    assert len(options2) == 1
+    assert options2[0]["DBInstanceClass"] == "db.t3.micro"
+    assert options2[0]["Engine"] == "mysql"
+
+
+def test_rds_enable_http_endpoint(rds):
+    """EnableHttpEndpoint enables Data API on an Aurora cluster."""
+    rds.create_db_cluster(
+        DBClusterIdentifier="http-ep-cluster",
+        Engine="aurora-mysql",
+        MasterUsername="admin",
+        MasterUserPassword="password123",
+    )
+    try:
+        cluster_arn = rds.describe_db_clusters(
+            DBClusterIdentifier="http-ep-cluster"
+        )["DBClusters"][0]["DBClusterArn"]
+
+        resp = rds.enable_http_endpoint(ResourceArn=cluster_arn)
+        assert resp["ResourceArn"] == cluster_arn
+        assert resp["HttpEndpointEnabled"] is True
+
+        desc = rds.describe_db_clusters(DBClusterIdentifier="http-ep-cluster")
+        assert desc["DBClusters"][0]["HttpEndpointEnabled"] is True
+    finally:
+        rds.delete_db_cluster(DBClusterIdentifier="http-ep-cluster", SkipFinalSnapshot=True)
+
+
+def test_rds_enable_http_endpoint_not_found(rds):
+    """EnableHttpEndpoint fails when the cluster ARN does not exist."""
+    with pytest.raises(ClientError) as exc:
+        rds.enable_http_endpoint(
+            ResourceArn="arn:aws:rds:us-east-1:123456789012:cluster:no-such-cluster"
+        )
+    assert exc.value.response["Error"]["Code"] == "DBClusterNotFoundFault"

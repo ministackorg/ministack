@@ -118,3 +118,80 @@ def test_efs_backup_policy(efs):
     )
     resp = efs.describe_backup_policy(FileSystemId=fs_id)
     assert resp["BackupPolicy"]["Status"] == "ENABLED"
+
+def _uid():
+    return _uuid_mod.uuid4().hex[:8]
+
+def test_efs_update_file_system(efs):
+    fs = efs.create_file_system(
+        CreationToken=f"update-fs-{_uid()}",
+        ThroughputMode="bursting",
+    )
+    fs_id = fs["FileSystemId"]
+    assert fs["ThroughputMode"] == "bursting"
+
+    resp = efs.update_file_system(
+        FileSystemId=fs_id,
+        ThroughputMode="provisioned",
+        ProvisionedThroughputInMibps=256.0,
+    )
+    assert resp["ThroughputMode"] == "provisioned"
+    assert resp["ProvisionedThroughputInMibps"] == 256.0
+
+    desc = efs.describe_file_systems(FileSystemId=fs_id)
+    updated = desc["FileSystems"][0]
+    assert updated["ThroughputMode"] == "provisioned"
+    assert updated["ProvisionedThroughputInMibps"] == 256.0
+
+    efs.delete_file_system(FileSystemId=fs_id)
+
+def test_efs_describe_mount_target_security_groups(efs):
+    fs = efs.create_file_system(CreationToken=f"sg-desc-{_uid()}")
+    fs_id = fs["FileSystemId"]
+    mt = efs.create_mount_target(
+        FileSystemId=fs_id,
+        SubnetId="subnet-00000001",
+        SecurityGroups=["sg-aaa111aaa", "sg-bbb222bbb"],
+    )
+    mt_id = mt["MountTargetId"]
+
+    resp = efs.describe_mount_target_security_groups(MountTargetId=mt_id)
+    assert set(resp["SecurityGroups"]) == {"sg-aaa111aaa", "sg-bbb222bbb"}
+
+    efs.delete_mount_target(MountTargetId=mt_id)
+    efs.delete_file_system(FileSystemId=fs_id)
+
+def test_efs_modify_mount_target_security_groups(efs):
+    fs = efs.create_file_system(CreationToken=f"sg-mod-{_uid()}")
+    fs_id = fs["FileSystemId"]
+    mt = efs.create_mount_target(
+        FileSystemId=fs_id,
+        SubnetId="subnet-00000001",
+        SecurityGroups=["sg-old111old"],
+    )
+    mt_id = mt["MountTargetId"]
+
+    efs.modify_mount_target_security_groups(
+        MountTargetId=mt_id,
+        SecurityGroups=["sg-new111new", "sg-new222new"],
+    )
+
+    resp = efs.describe_mount_target_security_groups(MountTargetId=mt_id)
+    assert set(resp["SecurityGroups"]) == {"sg-new111new", "sg-new222new"}
+
+    efs.delete_mount_target(MountTargetId=mt_id)
+    efs.delete_file_system(FileSystemId=fs_id)
+
+def test_efs_describe_account_preferences(efs):
+    resp = efs.describe_account_preferences()
+    pref = resp["ResourceIdPreference"]
+    assert "ResourceIdType" in pref
+    assert "Resources" in pref
+    assert isinstance(pref["Resources"], list)
+
+def test_efs_put_account_preferences(efs):
+    resp = efs.put_account_preferences(ResourceIdType="LONG_ID")
+    pref = resp["ResourceIdPreference"]
+    assert pref["ResourceIdType"] == "LONG_ID"
+    assert "FILE_SYSTEM" in pref["Resources"]
+    assert "MOUNT_TARGET" in pref["Resources"]

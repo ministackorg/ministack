@@ -434,9 +434,11 @@ def _create_partition_index(data):
     key = f"{db_name}/{table_name}"
     if key not in _partition_indexes:
         _partition_indexes[key] = []
+    raw_keys = index_input.get("Keys", [])
+    key_schema = [{"Name": k} if isinstance(k, str) else k for k in raw_keys]
     _partition_indexes[key].append({
         "IndexName": index_input.get("IndexName", ""),
-        "Keys": index_input.get("Keys", []),
+        "Keys": key_schema,
         "IndexStatus": "ACTIVE",
     })
     return json_response({})

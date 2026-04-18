@@ -387,3 +387,45 @@ def test_cloudwatch_put_metric_data_statistics_values(cw):
     resp = cw.list_metrics(Namespace="qa/cw-multi")
     assert any(m["MetricName"] == "Latency" for m in resp["Metrics"])
 
+
+def test_cloudwatch_enable_alarm_actions(cw):
+    cw.put_metric_alarm(
+        AlarmName="heimdall-enable-actions",
+        MetricName="M",
+        Namespace="N",
+        Statistic="Sum",
+        Period=60,
+        EvaluationPeriods=1,
+        Threshold=1.0,
+        ComparisonOperator="GreaterThanThreshold",
+        ActionsEnabled=False,
+    )
+    alarm = cw.describe_alarms(AlarmNames=["heimdall-enable-actions"])["MetricAlarms"][0]
+    assert alarm["ActionsEnabled"] is False
+
+    cw.enable_alarm_actions(AlarmNames=["heimdall-enable-actions"])
+    alarm = cw.describe_alarms(AlarmNames=["heimdall-enable-actions"])["MetricAlarms"][0]
+    assert alarm["ActionsEnabled"] is True
+    cw.delete_alarms(AlarmNames=["heimdall-enable-actions"])
+
+
+def test_cloudwatch_disable_alarm_actions(cw):
+    cw.put_metric_alarm(
+        AlarmName="heimdall-disable-actions",
+        MetricName="M",
+        Namespace="N",
+        Statistic="Sum",
+        Period=60,
+        EvaluationPeriods=1,
+        Threshold=1.0,
+        ComparisonOperator="GreaterThanThreshold",
+        ActionsEnabled=True,
+    )
+    alarm = cw.describe_alarms(AlarmNames=["heimdall-disable-actions"])["MetricAlarms"][0]
+    assert alarm["ActionsEnabled"] is True
+
+    cw.disable_alarm_actions(AlarmNames=["heimdall-disable-actions"])
+    alarm = cw.describe_alarms(AlarmNames=["heimdall-disable-actions"])["MetricAlarms"][0]
+    assert alarm["ActionsEnabled"] is False
+    cw.delete_alarms(AlarmNames=["heimdall-disable-actions"])
+

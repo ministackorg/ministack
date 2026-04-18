@@ -384,3 +384,517 @@ def test_glue_duplicate_partition_error(glue):
             PartitionInput=part_input,
         )
     assert exc.value.response["Error"]["Code"] == "AlreadyExistsException"
+
+
+# ---------------------------------------------------------------------------
+# BatchDeleteTable
+# ---------------------------------------------------------------------------
+
+def test_glue_batch_delete_table(glue):
+    db = "qa-bdt-db"
+    glue.create_database(DatabaseInput={"Name": db})
+    for t in ("tbl_a", "tbl_b", "tbl_c"):
+        glue.create_table(
+            DatabaseName=db,
+            TableInput={
+                "Name": t,
+                "StorageDescriptor": {
+                    "Columns": [{"Name": "c", "Type": "string"}],
+                    "Location": f"s3://b/{t}/",
+                    "InputFormat": "TIF",
+                    "OutputFormat": "TOF",
+                    "SerdeInfo": {"SerializationLibrary": "SL"},
+                },
+            },
+        )
+    resp = glue.batch_delete_table(DatabaseName=db, TablesToDelete=["tbl_a", "tbl_b", "no_such"])
+    errors = resp.get("Errors", [])
+    assert len(errors) == 1
+    assert errors[0]["TableName"] == "no_such"
+    tables = glue.get_tables(DatabaseName=db)
+    names = [t["Name"] for t in tables["TableList"]]
+    assert "tbl_a" not in names
+    assert "tbl_b" not in names
+    assert "tbl_c" in names
+    # cleanup
+    glue.delete_table(DatabaseName=db, Name="tbl_c")
+    glue.delete_database(Name=db)
+
+
+# ---------------------------------------------------------------------------
+# BatchGetPartition
+# ---------------------------------------------------------------------------
+
+def test_glue_batch_get_partition(glue):
+    db = "qa-bgp-db"
+    tbl = "qa-bgp-tbl"
+    glue.create_database(DatabaseInput={"Name": db})
+    glue.create_table(
+        DatabaseName=db,
+        TableInput={
+            "Name": tbl,
+            "StorageDescriptor": {
+                "Columns": [],
+                "Location": "s3://b/k",
+                "InputFormat": "",
+                "OutputFormat": "",
+                "SerdeInfo": {},
+            },
+            "PartitionKeys": [{"Name": "dt", "Type": "string"}],
+        },
+    )
+    for val in ("2024-01", "2024-02"):
+        glue.create_partition(
+            DatabaseName=db,
+            TableName=tbl,
+            PartitionInput={
+                "Values": [val],
+                "StorageDescriptor": {
+                    "Columns": [],
+                    "Location": f"s3://b/k/dt={val}",
+                    "InputFormat": "",
+                    "OutputFormat": "",
+                    "SerdeInfo": {},
+                },
+            },
+        )
+    resp = glue.batch_get_partition(
+        DatabaseName=db,
+        TableName=tbl,
+        PartitionsToGet=[
+            {"Values": ["2024-01"]},
+            {"Values": ["2024-02"]},
+            {"Values": ["no-such"]},
+        ],
+    )
+    assert len(resp["Partitions"]) == 2
+    assert len(resp["UnprocessedKeys"]) == 1
+    assert resp["UnprocessedKeys"][0]["Values"] == ["no-such"]
+    # cleanup
+    glue.delete_table(DatabaseName=db, Name=tbl)
+    glue.delete_database(Name=db)
+
+
+# ---------------------------------------------------------------------------
+# BatchCreatePartition
+# ---------------------------------------------------------------------------
+
+def test_glue_batch_create_partition(glue):
+    db = "qa-bcp-db"
+    tbl = "qa-bcp-tbl"
+    glue.create_database(DatabaseInput={"Name": db})
+    glue.create_table(
+        DatabaseName=db,
+        TableInput={
+            "Name": tbl,
+            "StorageDescriptor": {
+                "Columns": [],
+                "Location": "s3://b/k",
+                "InputFormat": "",
+                "OutputFormat": "",
+                "SerdeInfo": {},
+            },
+            "PartitionKeys": [{"Name": "dt", "Type": "string"}],
+        },
+    )
+    resp = glue.batch_create_partition(
+        DatabaseName=db,
+        TableName=tbl,
+        PartitionInputList=[
+            {
+                "Values": ["2024-03"],
+                "StorageDescriptor": {
+                    "Columns": [],
+                    "Location": "s3://b/k/dt=2024-03",
+                    "InputFormat": "",
+                    "OutputFormat": "",
+                    "SerdeInfo": {},
+                },
+            },
+            {
+                "Values": ["2024-04"],
+                "StorageDescriptor": {
+                    "Columns": [],
+                    "Location": "s3://b/k/dt=2024-04",
+                    "InputFormat": "",
+                    "OutputFormat": "",
+                    "SerdeInfo": {},
+                },
+            },
+        ],
+    )
+    assert resp.get("Errors", []) == []
+    parts = glue.get_partitions(DatabaseName=db, TableName=tbl)["Partitions"]
+    assert len(parts) == 2
+    # duplicate insert returns error
+    resp2 = glue.batch_create_partition(
+        DatabaseName=db,
+        TableName=tbl,
+        PartitionInputList=[
+            {
+                "Values": ["2024-03"],
+                "StorageDescriptor": {
+                    "Columns": [],
+                    "Location": "s3://b/k/dt=2024-03",
+                    "InputFormat": "",
+                    "OutputFormat": "",
+                    "SerdeInfo": {},
+                },
+            },
+        ],
+    )
+    assert len(resp2["Errors"]) == 1
+    assert resp2["Errors"][0]["ErrorDetail"]["ErrorCode"] == "AlreadyExistsException"
+    # cleanup
+    glue.delete_table(DatabaseName=db, Name=tbl)
+    glue.delete_database(Name=db)
+
+
+# ---------------------------------------------------------------------------
+# GetCrawlerMetrics
+# ---------------------------------------------------------------------------
+
+def test_glue_get_crawler_metrics(glue):
+    name = "qa-metrics-cr"
+    glue.create_crawler(
+        Name=name,
+        Role="arn:aws:iam::000000000000:role/R",
+        DatabaseName="test_db",
+        Targets={"S3Targets": [{"Path": "s3://b/d/"}]},
+    )
+    resp = glue.get_crawler_metrics(CrawlerNameList=[name])
+    assert len(resp["CrawlerMetricsList"]) == 1
+    m = resp["CrawlerMetricsList"][0]
+    assert m["CrawlerName"] == name
+    assert "TablesCreated" in m
+    # cleanup
+    glue.delete_crawler(Name=name)
+
+
+# ---------------------------------------------------------------------------
+# UpdateCrawler
+# ---------------------------------------------------------------------------
+
+def test_glue_update_crawler(glue):
+    name = "qa-upd-cr"
+    glue.create_crawler(
+        Name=name,
+        Role="arn:aws:iam::000000000000:role/R",
+        DatabaseName="test_db",
+        Targets={"S3Targets": [{"Path": "s3://b/d/"}]},
+    )
+    glue.update_crawler(Name=name, Description="updated desc", Role="arn:aws:iam::000000000000:role/New")
+    cr = glue.get_crawler(Name=name)["Crawler"]
+    assert cr["Description"] == "updated desc"
+    assert cr["Role"] == "arn:aws:iam::000000000000:role/New"
+    assert cr["Version"] == 2
+    # cleanup
+    glue.delete_crawler(Name=name)
+
+
+# ---------------------------------------------------------------------------
+# StopCrawler
+# ---------------------------------------------------------------------------
+
+def test_glue_stop_crawler(glue):
+    name = "qa-stop-cr"
+    glue.create_crawler(
+        Name=name,
+        Role="arn:aws:iam::000000000000:role/R",
+        DatabaseName="test_db",
+        Targets={"S3Targets": [{"Path": "s3://b/d/"}]},
+    )
+    glue.start_crawler(Name=name)
+    cr = glue.get_crawler(Name=name)["Crawler"]
+    assert cr["State"] == "RUNNING"
+    glue.stop_crawler(Name=name)
+    cr2 = glue.get_crawler(Name=name)["Crawler"]
+    assert cr2["State"] == "READY"
+    # stopping a non-running crawler raises
+    with pytest.raises(ClientError) as exc:
+        glue.stop_crawler(Name=name)
+    assert exc.value.response["Error"]["Code"] == "CrawlerNotRunningException"
+    # cleanup
+    glue.delete_crawler(Name=name)
+
+
+# ---------------------------------------------------------------------------
+# CreateJob / DeleteJob / GetJobs / UpdateJob
+# ---------------------------------------------------------------------------
+
+def test_glue_create_delete_job(glue):
+    name = "qa-cd-job"
+    resp = glue.create_job(
+        Name=name,
+        Role="arn:aws:iam::000000000000:role/R",
+        Command={"Name": "glueetl", "ScriptLocation": "s3://b/s.py"},
+        GlueVersion="3.0",
+    )
+    assert resp["Name"] == name
+    job = glue.get_job(JobName=name)["Job"]
+    assert job["Name"] == name
+    # delete returns JobName
+    resp2 = glue.delete_job(JobName=name)
+    assert resp2["JobName"] == name
+    with pytest.raises(ClientError) as exc:
+        glue.get_job(JobName=name)
+    assert exc.value.response["Error"]["Code"] == "EntityNotFoundException"
+
+
+def test_glue_get_jobs(glue):
+    names = ["qa-gj-a", "qa-gj-b"]
+    for n in names:
+        glue.create_job(
+            Name=n,
+            Role="arn:aws:iam::000000000000:role/R",
+            Command={"Name": "glueetl", "ScriptLocation": "s3://b/s.py"},
+        )
+    resp = glue.get_jobs()
+    found = [j["Name"] for j in resp["Jobs"]]
+    for n in names:
+        assert n in found
+    # cleanup
+    for n in names:
+        glue.delete_job(JobName=n)
+
+
+def test_glue_update_job(glue):
+    name = "qa-uj-job"
+    glue.create_job(
+        Name=name,
+        Role="arn:aws:iam::000000000000:role/R",
+        Command={"Name": "glueetl", "ScriptLocation": "s3://b/s.py"},
+        Description="orig",
+    )
+    resp = glue.update_job(
+        JobName=name,
+        JobUpdate={"Description": "updated", "MaxRetries": 3},
+    )
+    assert resp["JobName"] == name
+    job = glue.get_job(JobName=name)["Job"]
+    assert job["Description"] == "updated"
+    assert job["MaxRetries"] == 3
+    # cleanup
+    glue.delete_job(JobName=name)
+
+
+# ---------------------------------------------------------------------------
+# BatchStopJobRun
+# ---------------------------------------------------------------------------
+
+def test_glue_batch_stop_job_run(glue):
+    name = "qa-bsjr-job"
+    glue.create_job(
+        Name=name,
+        Role="arn:aws:iam::000000000000:role/R",
+        Command={"Name": "glueetl", "ScriptLocation": "s3://b/s.py"},
+    )
+    run1 = glue.start_job_run(JobName=name)["JobRunId"]
+    run2 = glue.start_job_run(JobName=name)["JobRunId"]
+    # Ministack auto-completes runs (SUCCEEDED), so batch stop returns errors
+    # for completed runs + not-found run
+    resp = glue.batch_stop_job_run(JobName=name, JobRunIds=[run1, run2, "no-such-run"])
+    assert "SuccessfulSubmissions" in resp
+    assert "Errors" in resp
+    # All 3 should be errors: 2 already completed + 1 not found
+    assert len(resp["Errors"]) == 3
+    # cleanup
+    glue.delete_job(JobName=name)
+
+
+# ---------------------------------------------------------------------------
+# SecurityConfigurations (Create / Delete / Get / GetAll)
+# ---------------------------------------------------------------------------
+
+def test_glue_security_configuration_crud(glue):
+    name = "qa-sec-cfg"
+    resp = glue.create_security_configuration(
+        Name=name,
+        EncryptionConfiguration={
+            "S3Encryption": [{"S3EncryptionMode": "SSE-S3"}],
+        },
+    )
+    assert resp["Name"] == name
+    assert "CreatedTimestamp" in resp
+
+    cfg = glue.get_security_configuration(Name=name)["SecurityConfiguration"]
+    assert cfg["Name"] == name
+    assert cfg["EncryptionConfiguration"]["S3Encryption"] == [{"S3EncryptionMode": "SSE-S3"}]
+
+    all_cfgs = glue.get_security_configurations()["SecurityConfigurations"]
+    assert any(c["Name"] == name for c in all_cfgs)
+
+    glue.delete_security_configuration(Name=name)
+    with pytest.raises(ClientError) as exc:
+        glue.get_security_configuration(Name=name)
+    assert exc.value.response["Error"]["Code"] == "EntityNotFoundException"
+
+
+def test_glue_security_configuration_duplicate(glue):
+    name = "qa-sec-dup"
+    glue.create_security_configuration(Name=name, EncryptionConfiguration={})
+    with pytest.raises(ClientError) as exc:
+        glue.create_security_configuration(Name=name, EncryptionConfiguration={})
+    assert exc.value.response["Error"]["Code"] == "AlreadyExistsException"
+    # cleanup
+    glue.delete_security_configuration(Name=name)
+
+
+# ---------------------------------------------------------------------------
+# Classifiers (Create / Get / GetAll / Delete)
+# ---------------------------------------------------------------------------
+
+def test_glue_classifier_crud(glue):
+    name = "qa-cls-grok"
+    glue.create_classifier(
+        GrokClassifier={
+            "Name": name,
+            "Classification": "test",
+            "GrokPattern": "%{WORD:field}",
+        },
+    )
+    cls = glue.get_classifier(Name=name)["Classifier"]
+    assert "GrokClassifier" in cls
+    assert cls["GrokClassifier"]["Name"] == name
+    assert cls["GrokClassifier"]["GrokPattern"] == "%{WORD:field}"
+
+    all_cls = glue.get_classifiers()["Classifiers"]
+    assert any("GrokClassifier" in c and c["GrokClassifier"]["Name"] == name for c in all_cls)
+
+    glue.delete_classifier(Name=name)
+    with pytest.raises(ClientError) as exc:
+        glue.get_classifier(Name=name)
+    assert exc.value.response["Error"]["Code"] == "EntityNotFoundException"
+
+
+def test_glue_classifier_json(glue):
+    name = "qa-cls-json"
+    glue.create_classifier(
+        JsonClassifier={"Name": name, "JsonPath": "$.records[*]"},
+    )
+    cls = glue.get_classifier(Name=name)["Classifier"]
+    assert "JsonClassifier" in cls
+    assert cls["JsonClassifier"]["JsonPath"] == "$.records[*]"
+    # cleanup
+    glue.delete_classifier(Name=name)
+
+
+def test_glue_classifier_duplicate(glue):
+    name = "qa-cls-dup"
+    glue.create_classifier(
+        GrokClassifier={"Name": name, "Classification": "t", "GrokPattern": "%{WORD:f}"},
+    )
+    with pytest.raises(ClientError) as exc:
+        glue.create_classifier(
+            GrokClassifier={"Name": name, "Classification": "t", "GrokPattern": "%{WORD:f}"},
+        )
+    assert exc.value.response["Error"]["Code"] == "AlreadyExistsException"
+    # cleanup
+    glue.delete_classifier(Name=name)
+
+
+# ---------------------------------------------------------------------------
+# BatchGetTriggers
+# ---------------------------------------------------------------------------
+
+def test_glue_batch_get_triggers(glue):
+    names = ["qa-bgt-a", "qa-bgt-b"]
+    for n in names:
+        glue.create_trigger(Name=n, Type="ON_DEMAND", Actions=[{"JobName": "dummy"}])
+    resp = glue.batch_get_triggers(TriggerNames=["qa-bgt-a", "qa-bgt-b", "no-such-trig"])
+    found = [t["Name"] for t in resp["Triggers"]]
+    assert "qa-bgt-a" in found
+    assert "qa-bgt-b" in found
+    assert "no-such-trig" in resp["TriggersNotFound"]
+    # cleanup
+    for n in names:
+        glue.delete_trigger(Name=n)
+
+
+# ---------------------------------------------------------------------------
+# GetTriggers
+# ---------------------------------------------------------------------------
+
+def test_glue_get_triggers(glue):
+    names = ["qa-gt-x", "qa-gt-y"]
+    for n in names:
+        glue.create_trigger(Name=n, Type="ON_DEMAND", Actions=[{"JobName": "target-job"}])
+    resp = glue.get_triggers(DependentJobName="target-job")
+    found = [t["Name"] for t in resp["Triggers"]]
+    for n in names:
+        assert n in found
+    # without filter, should also include them
+    resp2 = glue.get_triggers()
+    found2 = [t["Name"] for t in resp2["Triggers"]]
+    for n in names:
+        assert n in found2
+    # cleanup
+    for n in names:
+        glue.delete_trigger(Name=n)
+
+
+# ---------------------------------------------------------------------------
+# UpdateWorkflow
+# ---------------------------------------------------------------------------
+
+def test_glue_update_workflow(glue):
+    name = "qa-upd-wf"
+    glue.create_workflow(Name=name, Description="orig")
+    resp = glue.update_workflow(Name=name, Description="updated", MaxConcurrentRuns=5)
+    assert resp["Name"] == name
+    wf = glue.get_workflow(Name=name)["Workflow"]
+    assert wf["Description"] == "updated"
+    assert wf["MaxConcurrentRuns"] == 5
+    # not found
+    with pytest.raises(ClientError) as exc:
+        glue.update_workflow(Name="no-such-wf", Description="x")
+    assert exc.value.response["Error"]["Code"] == "EntityNotFoundException"
+    # cleanup
+    glue.delete_workflow(Name=name)
+
+
+# ---------------------------------------------------------------------------
+# CreatePartitionIndex / GetPartitionIndexes
+# ---------------------------------------------------------------------------
+
+def test_glue_partition_indexes(glue):
+    db = "qa-pidx-db"
+    tbl = "qa-pidx-tbl"
+    glue.create_database(DatabaseInput={"Name": db})
+    glue.create_table(
+        DatabaseName=db,
+        TableInput={
+            "Name": tbl,
+            "StorageDescriptor": {
+                "Columns": [{"Name": "data", "Type": "string"}],
+                "Location": "s3://b/pidx/",
+                "InputFormat": "TIF",
+                "OutputFormat": "TOF",
+                "SerdeInfo": {"SerializationLibrary": "SL"},
+            },
+            "PartitionKeys": [
+                {"Name": "year", "Type": "string"},
+                {"Name": "month", "Type": "string"},
+            ],
+        },
+    )
+    glue.create_partition_index(
+        DatabaseName=db,
+        TableName=tbl,
+        PartitionIndex={"IndexName": "idx_year", "Keys": ["year"]},
+    )
+    glue.create_partition_index(
+        DatabaseName=db,
+        TableName=tbl,
+        PartitionIndex={"IndexName": "idx_month", "Keys": ["month"]},
+    )
+    resp = glue.get_partition_indexes(DatabaseName=db, TableName=tbl)
+    indexes = resp["PartitionIndexDescriptorList"]
+    assert len(indexes) == 2
+    idx_names = [i["IndexName"] for i in indexes]
+    assert "idx_year" in idx_names
+    assert "idx_month" in idx_names
+    assert all(i["IndexStatus"] == "ACTIVE" for i in indexes)
+    # cleanup
+    glue.delete_table(DatabaseName=db, Name=tbl)
+    glue.delete_database(Name=db)

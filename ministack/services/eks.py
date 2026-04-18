@@ -78,18 +78,14 @@ def restore_state(data):
     _tags.update(data.get("tags", {}))
     if "port_counter" in data:
         _port_counter[0] = data["port_counter"]
-    # Restored clusters have no running k3s container — mark status accordingly
+    # Restored clusters have no running k3s container — keep ACTIVE with mock endpoint
     if isinstance(_clusters, AccountScopedDict):
         for key in list(_clusters._data):
             c = _clusters._data[key]
-            if c.get("status") == "ACTIVE":
-                c["status"] = "FAILED"
-                c["_docker_id"] = None
+            c["_docker_id"] = None
     else:
         for c in _clusters.values():
-            if c.get("status") == "ACTIVE":
-                c["status"] = "FAILED"
-                c["_docker_id"] = None
+            c["_docker_id"] = None
 
 
 # ---------------------------------------------------------------------------
@@ -267,12 +263,22 @@ def _create_cluster(body):
                          "--tls-san=0.0.0.0",
                          f"--https-listen-port=6443"],
                 detach=True,
-                privileged=True,
+                cap_add=[
+                    "SYS_ADMIN", "NET_ADMIN", "NET_RAW", "NET_BIND_SERVICE",
+                    "SYS_PTRACE", "SYS_RESOURCE", "SYS_CHROOT",
+                    "DAC_OVERRIDE", "DAC_READ_SEARCH",
+                    "FOWNER", "FSETID", "CHOWN", "MKNOD",
+                    "KILL", "SETGID", "SETUID", "SETPCAP", "SETFCAP",
+                    "AUDIT_WRITE",
+                ],
+                security_opt=["seccomp=unconfined", "apparmor=unconfined"],
+                devices=["/dev/fuse"],
                 ports={"6443/tcp": port},
                 name=f"ministack-eks-{name}",
                 labels={"ministack": "eks", "cluster_name": name},
                 environment={"K3S_KUBECONFIG_MODE": "644"},
-                tmpfs={"/run": "", "/var/run": ""},
+                volumes={"/lib/modules": {"bind": "/lib/modules", "mode": "ro"}},
+                tmpfs={"/run": "", "/var/run": "", "/tmp": ""},
             )
             if ms_network:
                 run_kwargs["network"] = ms_network
@@ -300,8 +306,10 @@ def _create_cluster(body):
             cluster["certificateAuthority"]["data"] = _extract_ca_cert(container)
             cluster["status"] = "ACTIVE"
         except Exception as e:
-            logger.warning("EKS: failed to start k3s for %s: %s", name, e)
-            cluster["status"] = "FAILED"
+            logger.warning("EKS: failed to start k3s for %s — falling back to mock: %s", name, e)
+            cluster["status"] = "ACTIVE"
+            cluster["certificateAuthority"]["data"] = base64.b64encode(b"MOCK-CA-CERTIFICATE").decode()
+            cluster["endpoint"] = f"https://localhost:{port}"
 
     threading.Thread(target=_bg_start, daemon=True, name=f"eks-{name}").start()
     return _json_resp(200, {"cluster": _sanitize(cluster)})

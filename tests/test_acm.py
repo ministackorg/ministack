@@ -66,3 +66,43 @@ def test_acm_delete_certificate(acm_client):
     resp = acm_client.list_certificates()
     arns = [c["CertificateArn"] for c in resp["CertificateSummaryList"]]
     assert arn not in arns
+
+def test_acm_update_certificate_options(acm_client):
+    arn = acm_client.request_certificate(DomainName="options.example.com")["CertificateArn"]
+    acm_client.update_certificate_options(
+        CertificateArn=arn,
+        Options={"CertificateTransparencyLoggingPreference": "DISABLED"},
+    )
+    desc = acm_client.describe_certificate(CertificateArn=arn)
+    pref = desc["Certificate"]["Options"]["CertificateTransparencyLoggingPreference"]
+    assert pref == "DISABLED"
+    acm_client.update_certificate_options(
+        CertificateArn=arn,
+        Options={"CertificateTransparencyLoggingPreference": "ENABLED"},
+    )
+    desc2 = acm_client.describe_certificate(CertificateArn=arn)
+    pref2 = desc2["Certificate"]["Options"]["CertificateTransparencyLoggingPreference"]
+    assert pref2 == "ENABLED"
+    acm_client.delete_certificate(CertificateArn=arn)
+
+def test_acm_renew_certificate(acm_client):
+    arn = acm_client.request_certificate(DomainName="renew.example.com")["CertificateArn"]
+    # RenewCertificate is a no-op in ministack — just verify it doesn't error
+    acm_client.renew_certificate(CertificateArn=arn)
+    desc = acm_client.describe_certificate(CertificateArn=arn)
+    assert desc["Certificate"]["Status"] in ("ISSUED", "PENDING_VALIDATION")
+    acm_client.delete_certificate(CertificateArn=arn)
+
+def test_acm_resend_validation_email(acm_client):
+    arn = acm_client.request_certificate(
+        DomainName="resend.example.com",
+        ValidationMethod="EMAIL",
+    )["CertificateArn"]
+    acm_client.resend_validation_email(
+        CertificateArn=arn,
+        Domain="resend.example.com",
+        ValidationDomain="example.com",
+    )
+    desc = acm_client.describe_certificate(CertificateArn=arn)
+    assert desc["Certificate"]["DomainName"] == "resend.example.com"
+    acm_client.delete_certificate(CertificateArn=arn)

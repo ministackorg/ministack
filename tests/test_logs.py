@@ -285,3 +285,163 @@ def test_logs_get_log_events_pagination_stops(logs):
     resp2 = logs.get_log_events(logGroupName=group, logStreamName=stream, nextToken=fwd_token)
     assert len(resp2["events"]) == 0
     assert resp2["nextForwardToken"] == fwd_token  # same token = stop paginating
+
+
+# ---------------------------------------------------------------------------
+# Destination operations
+# ---------------------------------------------------------------------------
+
+def test_logs_put_destination(logs):
+    """PutDestination creates a destination and returns its metadata."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    dest_name = f"test-dest-{uid}"
+    target_arn = f"arn:aws:kinesis:us-east-1:000000000000:stream/dest-stream-{uid}"
+    role_arn = f"arn:aws:iam::000000000000:role/dest-role-{uid}"
+
+    resp = logs.put_destination(
+        destinationName=dest_name,
+        targetArn=target_arn,
+        roleArn=role_arn,
+    )
+    dest = resp["destination"]
+    assert dest["destinationName"] == dest_name
+    assert dest["targetArn"] == target_arn
+    assert dest["roleArn"] == role_arn
+    assert "arn" in dest
+    assert "creationTime" in dest
+
+    # cleanup
+    logs.delete_destination(destinationName=dest_name)
+
+
+def test_logs_delete_destination(logs):
+    """DeleteDestination removes a destination; deleting again raises ResourceNotFoundException."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    dest_name = f"test-dest-del-{uid}"
+    logs.put_destination(
+        destinationName=dest_name,
+        targetArn="arn:aws:kinesis:us-east-1:000000000000:stream/s1",
+        roleArn="arn:aws:iam::000000000000:role/r1",
+    )
+
+    logs.delete_destination(destinationName=dest_name)
+
+    with pytest.raises(ClientError) as exc:
+        logs.delete_destination(destinationName=dest_name)
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
+def test_logs_describe_destinations(logs):
+    """DescribeDestinations lists destinations filtered by prefix."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    name_a = f"desc-dest-{uid}-alpha"
+    name_b = f"desc-dest-{uid}-beta"
+    name_c = f"other-dest-{uid}"
+
+    for n in (name_a, name_b, name_c):
+        logs.put_destination(
+            destinationName=n,
+            targetArn="arn:aws:kinesis:us-east-1:000000000000:stream/s1",
+            roleArn="arn:aws:iam::000000000000:role/r1",
+        )
+
+    resp = logs.describe_destinations(DestinationNamePrefix=f"desc-dest-{uid}")
+    names = [d["destinationName"] for d in resp["destinations"]]
+    assert name_a in names
+    assert name_b in names
+    assert name_c not in names
+
+    # cleanup
+    for n in (name_a, name_b, name_c):
+        logs.delete_destination(destinationName=n)
+
+
+def test_logs_put_destination_policy(logs):
+    """PutDestinationPolicy updates the accessPolicy on an existing destination."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    dest_name = f"test-dest-pol-{uid}"
+    logs.put_destination(
+        destinationName=dest_name,
+        targetArn="arn:aws:kinesis:us-east-1:000000000000:stream/s1",
+        roleArn="arn:aws:iam::000000000000:role/r1",
+    )
+
+    policy = json.dumps({"Statement": [{"Effect": "Allow", "Principal": "*", "Action": "logs:PutSubscriptionFilter"}]})
+    logs.put_destination_policy(destinationName=dest_name, accessPolicy=policy)
+
+    resp = logs.describe_destinations(DestinationNamePrefix=dest_name)
+    dest = next(d for d in resp["destinations"] if d["destinationName"] == dest_name)
+    assert dest["accessPolicy"] == policy
+
+    # cleanup
+    logs.delete_destination(destinationName=dest_name)
+
+
+# ---------------------------------------------------------------------------
+# ARN-based tagging operations (TagResource / UntagResource)
+# ---------------------------------------------------------------------------
+
+def test_logs_tag_resource(logs):
+    """TagResource adds tags to a log group resolved by ARN."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    group = f"/intg/tag-resource/{uid}"
+    logs.create_log_group(logGroupName=group)
+
+    groups = logs.describe_log_groups(logGroupNamePrefix=group)["logGroups"]
+    arn = groups[0]["arn"]
+
+    logs.tag_resource(resourceArn=arn, tags={"team": "platform", "env": "staging"})
+
+    resp = logs.list_tags_for_resource(resourceArn=arn)
+    assert resp["tags"]["team"] == "platform"
+    assert resp["tags"]["env"] == "staging"
+
+    # cleanup
+    logs.delete_log_group(logGroupName=group)
+
+
+def test_logs_untag_resource(logs):
+    """UntagResource removes tags from a log group resolved by ARN."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    group = f"/intg/untag-resource/{uid}"
+    logs.create_log_group(logGroupName=group, tags={"keep": "yes", "remove": "me"})
+
+    groups = logs.describe_log_groups(logGroupNamePrefix=group)["logGroups"]
+    arn = groups[0]["arn"]
+
+    logs.untag_resource(resourceArn=arn, tagKeys=["remove"])
+
+    resp = logs.list_tags_for_resource(resourceArn=arn)
+    assert resp["tags"]["keep"] == "yes"
+    assert "remove" not in resp["tags"]
+
+    # cleanup
+    logs.delete_log_group(logGroupName=group)
+
+
+# ---------------------------------------------------------------------------
+# StopQuery
+# ---------------------------------------------------------------------------
+
+def test_logs_stop_query(logs):
+    """StopQuery cancels a running query and sets its status to Cancelled."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    group = f"/intg/stop-query/{uid}"
+    logs.create_log_group(logGroupName=group)
+
+    start_resp = logs.start_query(
+        logGroupName=group,
+        startTime=int(time.time()) - 3600,
+        endTime=int(time.time()),
+        queryString="fields @timestamp | limit 5",
+    )
+    query_id = start_resp["queryId"]
+
+    stop_resp = logs.stop_query(queryId=query_id)
+    assert stop_resp["success"] is True
+
+    results = logs.get_query_results(queryId=query_id)
+    assert results["status"] == "Cancelled"
+
+    # cleanup
+    logs.delete_log_group(logGroupName=group)

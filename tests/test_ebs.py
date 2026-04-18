@@ -131,3 +131,21 @@ def test_ebs_describe_volumes_modifications(ebs):
     assert mods[0]["VolumeId"] == vol_id
     assert mods[0]["TargetSize"] == 50
     assert mods[0]["TargetVolumeType"] == "gp3"
+
+
+def test_ebs_enable_volume_io(ebs):
+    vol = ebs.create_volume(AvailabilityZone="us-east-1a", Size=10, VolumeType="gp2")
+    vol_id = vol["VolumeId"]
+    ebs.enable_volume_io(VolumeId=vol_id)
+    # Stub — just verify it doesn't error
+    resp = ebs.describe_volume_attribute(VolumeId=vol_id, Attribute="autoEnableIO")
+    assert resp["VolumeId"] == vol_id
+
+
+def test_ebs_modify_volume_attribute(ebs):
+    vol = ebs.create_volume(AvailabilityZone="us-east-1a", Size=10, VolumeType="gp2")
+    vol_id = vol["VolumeId"]
+    ebs.modify_volume_attribute(VolumeId=vol_id, AutoEnableIO={"Value": True})
+    # Stub — just verify it doesn't error
+    resp = ebs.describe_volume_attribute(VolumeId=vol_id, Attribute="autoEnableIO")
+    assert resp["VolumeId"] == vol_id

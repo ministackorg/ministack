@@ -265,3 +265,380 @@ def test_elasticache_modify_cache_parameter_group(ec):
     assert maxmem is not None
     assert maxmem["ParameterValue"] == "allkeys-lru"
 
+
+def _uid():
+    return _uuid_mod.uuid4().hex[:8]
+
+
+# ---------------------------------------------------------------------------
+# 1. ModifyCacheCluster
+# ---------------------------------------------------------------------------
+
+def test_modify_cache_cluster_num_nodes(ec):
+    """ModifyCacheCluster: scale NumCacheNodes up and down."""
+    cid = f"mod-cc-{_uid()}"
+    ec.create_cache_cluster(
+        CacheClusterId=cid,
+        Engine="redis",
+        CacheNodeType="cache.t3.micro",
+        NumCacheNodes=1,
+    )
+    # scale up
+    resp = ec.modify_cache_cluster(CacheClusterId=cid, NumCacheNodes=3)
+    cluster = resp["CacheCluster"]
+    assert cluster["NumCacheNodes"] == 3
+    assert len(cluster["CacheNodes"]) == 3
+
+    # scale down
+    resp = ec.modify_cache_cluster(CacheClusterId=cid, NumCacheNodes=2)
+    cluster = resp["CacheCluster"]
+    assert cluster["NumCacheNodes"] == 2
+    assert len(cluster["CacheNodes"]) == 2
+
+    ec.delete_cache_cluster(CacheClusterId=cid)
+
+
+def test_modify_cache_cluster_node_type_and_engine(ec):
+    """ModifyCacheCluster: update CacheNodeType and EngineVersion."""
+    cid = f"mod-nt-{_uid()}"
+    ec.create_cache_cluster(
+        CacheClusterId=cid,
+        Engine="redis",
+        CacheNodeType="cache.t3.micro",
+        NumCacheNodes=1,
+    )
+    resp = ec.modify_cache_cluster(
+        CacheClusterId=cid,
+        CacheNodeType="cache.m5.large",
+        EngineVersion="7.1.0",
+    )
+    cluster = resp["CacheCluster"]
+    assert cluster["CacheNodeType"] == "cache.m5.large"
+    assert cluster["EngineVersion"] == "7.1.0"
+
+    ec.delete_cache_cluster(CacheClusterId=cid)
+
+
+# ---------------------------------------------------------------------------
+# 2. RebootCacheCluster
+# ---------------------------------------------------------------------------
+
+def test_reboot_cache_cluster(ec):
+    """RebootCacheCluster: reboot and verify cluster stays available."""
+    cid = f"reboot-{_uid()}"
+    ec.create_cache_cluster(
+        CacheClusterId=cid,
+        Engine="redis",
+        CacheNodeType="cache.t3.micro",
+        NumCacheNodes=1,
+    )
+    resp = ec.reboot_cache_cluster(
+        CacheClusterId=cid,
+        CacheNodeIdsToReboot=["0001"],
+    )
+    cluster = resp["CacheCluster"]
+    assert cluster["CacheClusterId"] == cid
+    assert cluster["CacheClusterStatus"] == "available"
+
+    ec.delete_cache_cluster(CacheClusterId=cid)
+
+
+# ---------------------------------------------------------------------------
+# 3. DeleteReplicationGroup
+# ---------------------------------------------------------------------------
+
+def test_delete_replication_group(ec):
+    """DeleteReplicationGroup: create then delete, verify gone."""
+    rg_id = f"del-rg-{_uid()}"
+    ec.create_replication_group(
+        ReplicationGroupId=rg_id,
+        ReplicationGroupDescription="To be deleted",
+        CacheNodeType="cache.t3.micro",
+    )
+    # verify exists
+    resp = ec.describe_replication_groups(ReplicationGroupId=rg_id)
+    assert len(resp["ReplicationGroups"]) == 1
+
+    # delete
+    ec.delete_replication_group(ReplicationGroupId=rg_id)
+
+    # verify gone
+    with pytest.raises(ClientError) as exc:
+        ec.describe_replication_groups(ReplicationGroupId=rg_id)
+    assert "ReplicationGroupNotFoundFault" in str(exc.value)
+
+
+# ---------------------------------------------------------------------------
+# 4. ModifyReplicationGroup
+# ---------------------------------------------------------------------------
+
+def test_modify_replication_group(ec):
+    """ModifyReplicationGroup: update description and CacheNodeType."""
+    rg_id = f"mod-rg-{_uid()}"
+    ec.create_replication_group(
+        ReplicationGroupId=rg_id,
+        ReplicationGroupDescription="Original desc",
+        CacheNodeType="cache.t3.micro",
+    )
+    resp = ec.modify_replication_group(
+        ReplicationGroupId=rg_id,
+        ReplicationGroupDescription="Updated desc",
+        CacheNodeType="cache.m5.large",
+    )
+    rg = resp["ReplicationGroup"]
+    assert rg["Description"] == "Updated desc"
+    assert rg["CacheNodeType"] == "cache.m5.large"
+
+    ec.delete_replication_group(ReplicationGroupId=rg_id)
+
+
+# ---------------------------------------------------------------------------
+# 5. IncreaseReplicaCount
+# ---------------------------------------------------------------------------
+
+def test_increase_replica_count(ec):
+    """IncreaseReplicaCount: scale replicas up from 1 to 3."""
+    rg_id = f"inc-rep-{_uid()}"
+    ec.create_replication_group(
+        ReplicationGroupId=rg_id,
+        ReplicationGroupDescription="Scale up test",
+        CacheNodeType="cache.t3.micro",
+        NumNodeGroups=1,
+        ReplicasPerNodeGroup=1,
+    )
+    # verify initial: 1 primary + 1 replica = 2 members
+    desc = ec.describe_replication_groups(ReplicationGroupId=rg_id)
+    initial_members = len(desc["ReplicationGroups"][0]["NodeGroups"][0]["NodeGroupMembers"])
+    assert initial_members == 2
+
+    resp = ec.increase_replica_count(
+        ReplicationGroupId=rg_id,
+        NewReplicaCount=3,
+        ApplyImmediately=True,
+    )
+    rg = resp["ReplicationGroup"]
+    # 1 primary + 3 replicas = 4 members
+    assert len(rg["NodeGroups"][0]["NodeGroupMembers"]) == 4
+
+    ec.delete_replication_group(ReplicationGroupId=rg_id)
+
+
+# ---------------------------------------------------------------------------
+# 6. DecreaseReplicaCount
+# ---------------------------------------------------------------------------
+
+def test_decrease_replica_count(ec):
+    """DecreaseReplicaCount: scale replicas down from 3 to 1."""
+    rg_id = f"dec-rep-{_uid()}"
+    ec.create_replication_group(
+        ReplicationGroupId=rg_id,
+        ReplicationGroupDescription="Scale down test",
+        CacheNodeType="cache.t3.micro",
+        NumNodeGroups=1,
+        ReplicasPerNodeGroup=3,
+    )
+    # verify initial: 1 primary + 3 replicas = 4 members
+    desc = ec.describe_replication_groups(ReplicationGroupId=rg_id)
+    assert len(desc["ReplicationGroups"][0]["NodeGroups"][0]["NodeGroupMembers"]) == 4
+
+    resp = ec.decrease_replica_count(
+        ReplicationGroupId=rg_id,
+        NewReplicaCount=1,
+        ApplyImmediately=True,
+    )
+    rg = resp["ReplicationGroup"]
+    # 1 primary + 1 replica = 2 members
+    assert len(rg["NodeGroups"][0]["NodeGroupMembers"]) == 2
+
+    ec.delete_replication_group(ReplicationGroupId=rg_id)
+
+
+# ---------------------------------------------------------------------------
+# 7. DeleteCacheSubnetGroup
+# ---------------------------------------------------------------------------
+
+def test_delete_cache_subnet_group(ec):
+    """DeleteCacheSubnetGroup: create then delete, verify gone."""
+    name = f"del-sg-{_uid()}"
+    ec.create_cache_subnet_group(
+        CacheSubnetGroupName=name,
+        CacheSubnetGroupDescription="To be deleted",
+        SubnetIds=["subnet-aaa"],
+    )
+    # verify exists
+    resp = ec.describe_cache_subnet_groups(CacheSubnetGroupName=name)
+    assert len(resp["CacheSubnetGroups"]) == 1
+
+    # delete
+    ec.delete_cache_subnet_group(CacheSubnetGroupName=name)
+
+    # verify gone
+    with pytest.raises(ClientError) as exc:
+        ec.describe_cache_subnet_groups(CacheSubnetGroupName=name)
+    assert "CacheSubnetGroupNotFoundFault" in str(exc.value)
+
+
+# ---------------------------------------------------------------------------
+# 8. ResetCacheParameterGroup
+# ---------------------------------------------------------------------------
+
+def test_reset_cache_parameter_group_full(ec):
+    """ResetCacheParameterGroup: full reset restores defaults."""
+    pg = f"reset-full-{_uid()}"
+    ec.create_cache_parameter_group(
+        CacheParameterGroupName=pg,
+        CacheParameterGroupFamily="redis7.0",
+        Description="Full reset test",
+    )
+    # modify a parameter away from default
+    ec.modify_cache_parameter_group(
+        CacheParameterGroupName=pg,
+        ParameterNameValues=[{"ParameterName": "maxmemory-policy", "ParameterValue": "allkeys-lru"}],
+    )
+    params = ec.describe_cache_parameters(CacheParameterGroupName=pg)["Parameters"]
+    maxmem = next(p for p in params if p["ParameterName"] == "maxmemory-policy")
+    assert maxmem["ParameterValue"] == "allkeys-lru"
+
+    # full reset
+    ec.reset_cache_parameter_group(
+        CacheParameterGroupName=pg,
+        ResetAllParameters=True,
+    )
+    params = ec.describe_cache_parameters(CacheParameterGroupName=pg)["Parameters"]
+    maxmem = next(p for p in params if p["ParameterName"] == "maxmemory-policy")
+    assert maxmem["ParameterValue"] == "volatile-lru"
+
+    ec.delete_cache_parameter_group(CacheParameterGroupName=pg)
+
+
+def test_reset_cache_parameter_group_selective(ec):
+    """ResetCacheParameterGroup: selective reset of specific parameter."""
+    pg = f"reset-sel-{_uid()}"
+    ec.create_cache_parameter_group(
+        CacheParameterGroupName=pg,
+        CacheParameterGroupFamily="redis7.0",
+        Description="Selective reset test",
+    )
+    # modify two parameters
+    ec.modify_cache_parameter_group(
+        CacheParameterGroupName=pg,
+        ParameterNameValues=[
+            {"ParameterName": "maxmemory-policy", "ParameterValue": "allkeys-lru"},
+            {"ParameterName": "timeout", "ParameterValue": "300"},
+        ],
+    )
+    # selective reset only maxmemory-policy
+    ec.reset_cache_parameter_group(
+        CacheParameterGroupName=pg,
+        ResetAllParameters=False,
+        ParameterNameValues=[{"ParameterName": "maxmemory-policy", "ParameterValue": ""}],
+    )
+    params = ec.describe_cache_parameters(CacheParameterGroupName=pg)["Parameters"]
+    maxmem = next(p for p in params if p["ParameterName"] == "maxmemory-policy")
+    timeout_p = next(p for p in params if p["ParameterName"] == "timeout")
+    # maxmemory-policy should be back to default
+    assert maxmem["ParameterValue"] == "volatile-lru"
+    # timeout should still have the modified value
+    assert timeout_p["ParameterValue"] == "300"
+
+    ec.delete_cache_parameter_group(CacheParameterGroupName=pg)
+
+
+# ---------------------------------------------------------------------------
+# 9. DeleteSnapshot (explicit)
+# ---------------------------------------------------------------------------
+
+def test_delete_snapshot_explicit(ec):
+    """DeleteSnapshot: create snapshot, delete it, verify gone."""
+    cid = f"snap-del-{_uid()}"
+    snap_name = f"snap-{_uid()}"
+    ec.create_cache_cluster(
+        CacheClusterId=cid,
+        Engine="redis",
+        CacheNodeType="cache.t3.micro",
+        NumCacheNodes=1,
+    )
+    ec.create_snapshot(SnapshotName=snap_name, CacheClusterId=cid)
+
+    # verify exists
+    resp = ec.describe_snapshots(SnapshotName=snap_name)
+    assert len(resp["Snapshots"]) == 1
+
+    # delete
+    del_resp = ec.delete_snapshot(SnapshotName=snap_name)
+    assert del_resp["Snapshot"]["SnapshotStatus"] == "deleting"
+
+    # verify gone
+    resp = ec.describe_snapshots(SnapshotName=snap_name)
+    assert len(resp["Snapshots"]) == 0
+
+    ec.delete_cache_cluster(CacheClusterId=cid)
+
+
+# ---------------------------------------------------------------------------
+# 10. DescribeEvents
+# ---------------------------------------------------------------------------
+
+def test_describe_events_all(ec):
+    """DescribeEvents: listing all events returns results."""
+    # create a cluster to generate at least one event
+    cid = f"evt-all-{_uid()}"
+    ec.create_cache_cluster(
+        CacheClusterId=cid,
+        Engine="redis",
+        CacheNodeType="cache.t3.micro",
+        NumCacheNodes=1,
+    )
+    resp = ec.describe_events()
+    assert "Events" in resp
+    assert len(resp["Events"]) > 0
+
+    ec.delete_cache_cluster(CacheClusterId=cid)
+
+
+def test_describe_events_filter_source_type(ec):
+    """DescribeEvents: filter by SourceType."""
+    rg_id = f"evt-rg-{_uid()}"
+    ec.create_replication_group(
+        ReplicationGroupId=rg_id,
+        ReplicationGroupDescription="Event filter test",
+        CacheNodeType="cache.t3.micro",
+    )
+    resp = ec.describe_events(SourceType="replication-group")
+    assert "Events" in resp
+    # all returned events should be replication-group type
+    for evt in resp["Events"]:
+        assert evt["SourceType"] == "replication-group"
+
+    ec.delete_replication_group(ReplicationGroupId=rg_id)
+
+
+def test_describe_events_filter_source_id(ec):
+    """DescribeEvents: filter by SourceIdentifier."""
+    cid = f"evt-src-{_uid()}"
+    ec.create_cache_cluster(
+        CacheClusterId=cid,
+        Engine="redis",
+        CacheNodeType="cache.t3.micro",
+        NumCacheNodes=1,
+    )
+    resp = ec.describe_events(SourceIdentifier=cid)
+    assert "Events" in resp
+    for evt in resp["Events"]:
+        assert evt["SourceIdentifier"] == cid
+
+    ec.delete_cache_cluster(CacheClusterId=cid)
+
+
+# ---------------------------------------------------------------------------
+# 11. Serverless cache operations — not implemented in MiniStack
+# ---------------------------------------------------------------------------
+
+def test_serverless_cache_not_implemented(ec):
+    """Serverless cache operations are not yet implemented; verify graceful error."""
+    with pytest.raises(ClientError):
+        ec.create_serverless_cache(
+            ServerlessCacheName="test-serverless",
+            Engine="redis",
+        )
+

@@ -2036,7 +2036,7 @@ def _instance_xml(i):
         </DBSubnetGroup>
         <PreferredMaintenanceWindow>{i.get('PreferredMaintenanceWindow','sun:05:00-sun:06:00')}</PreferredMaintenanceWindow>
         <PendingModifiedValues>{pending_xml}</PendingModifiedValues>
-        <LatestRestorableTime>{i.get('LatestRestorableTime','')}</LatestRestorableTime>
+        <LatestRestorableTime>{i.get('LatestRestorableTime') or _format_time(time.time())}</LatestRestorableTime>
         <MultiAZ>{str(i.get('MultiAZ',False)).lower()}</MultiAZ>
         <AutoMinorVersionUpgrade>{str(i.get('AutoMinorVersionUpgrade',True)).lower()}</AutoMinorVersionUpgrade>
         <ReadReplicaDBInstanceIdentifiers>{read_replica_xml}</ReadReplicaDBInstanceIdentifiers>

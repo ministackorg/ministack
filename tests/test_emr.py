@@ -320,3 +320,228 @@ def test_emr_instance_fleets(emr):
     assert "CORE" in fleet_types
 
     emr.terminate_job_flows(JobFlowIds=[cluster_id])
+
+
+def test_emr_set_visible_to_all_users(emr):
+    """SetVisibleToAllUsers toggles visibility on and off."""
+    jf = emr.run_job_flow(
+        Name="visible-test",
+        ReleaseLabel="emr-6.10.0",
+        Instances={
+            "MasterInstanceType": "m5.xlarge",
+            "InstanceCount": 1,
+            "KeepJobFlowAliveWhenNoSteps": True,
+        },
+        JobFlowRole="EMR_EC2_DefaultRole",
+        ServiceRole="EMR_DefaultRole",
+    )
+    cluster_id = jf["JobFlowId"]
+
+    # Default is visible
+    desc = emr.describe_cluster(ClusterId=cluster_id)
+    assert desc["Cluster"]["VisibleToAllUsers"] is True
+
+    # Set to False
+    emr.set_visible_to_all_users(JobFlowIds=[cluster_id], VisibleToAllUsers=False)
+    desc = emr.describe_cluster(ClusterId=cluster_id)
+    assert desc["Cluster"]["VisibleToAllUsers"] is False
+
+    # Set back to True
+    emr.set_visible_to_all_users(JobFlowIds=[cluster_id], VisibleToAllUsers=True)
+    desc = emr.describe_cluster(ClusterId=cluster_id)
+    assert desc["Cluster"]["VisibleToAllUsers"] is True
+
+    emr.terminate_job_flows(JobFlowIds=[cluster_id])
+
+
+def test_emr_cancel_steps(emr):
+    """CancelSteps returns info list for each requested step."""
+    jf = emr.run_job_flow(
+        Name="cancel-steps-test",
+        ReleaseLabel="emr-6.10.0",
+        Instances={
+            "MasterInstanceType": "m5.xlarge",
+            "InstanceCount": 1,
+            "KeepJobFlowAliveWhenNoSteps": True,
+        },
+        JobFlowRole="EMR_EC2_DefaultRole",
+        ServiceRole="EMR_DefaultRole",
+    )
+    cluster_id = jf["JobFlowId"]
+
+    step_resp = emr.add_job_flow_steps(
+        JobFlowId=cluster_id,
+        Steps=[
+            {
+                "Name": "cancel-me",
+                "ActionOnFailure": "CONTINUE",
+                "HadoopJarStep": {"Jar": "command-runner.jar", "Args": ["echo", "hi"]},
+            },
+            {
+                "Name": "cancel-me-too",
+                "ActionOnFailure": "CONTINUE",
+                "HadoopJarStep": {"Jar": "command-runner.jar", "Args": ["echo", "bye"]},
+            },
+        ],
+    )
+    step_ids = step_resp["StepIds"]
+    assert len(step_ids) == 2
+
+    # Steps are already COMPLETED in ministack, so cancel returns FAILED_TO_CANCEL
+    cancel_resp = emr.cancel_steps(ClusterId=cluster_id, StepIds=step_ids)
+    info_list = cancel_resp["CancelStepsInfoList"]
+    assert len(info_list) == 2
+    for info in info_list:
+        assert info["StepId"] in step_ids
+        assert info["Status"] == "FAILED_TO_CANCEL"
+        assert "Reason" in info
+
+    emr.terminate_job_flows(JobFlowIds=[cluster_id])
+
+
+def test_emr_modify_instance_fleet(emr):
+    """ModifyInstanceFleet updates on-demand/spot capacity."""
+    jf = emr.run_job_flow(
+        Name="modify-fleet-test",
+        ReleaseLabel="emr-6.15.0",
+        Instances={
+            "KeepJobFlowAliveWhenNoSteps": True,
+            "InstanceFleets": [
+                {
+                    "InstanceFleetType": "MASTER",
+                    "Name": "master-fleet",
+                    "TargetOnDemandCapacity": 1,
+                    "InstanceTypeConfigs": [{"InstanceType": "m5.xlarge"}],
+                },
+            ],
+        },
+        JobFlowRole="EMR_EC2_DefaultRole",
+        ServiceRole="EMR_DefaultRole",
+    )
+    cluster_id = jf["JobFlowId"]
+
+    # Add a CORE fleet to modify
+    add_resp = emr.add_instance_fleet(
+        ClusterId=cluster_id,
+        InstanceFleet={
+            "InstanceFleetType": "CORE",
+            "Name": "core-fleet",
+            "TargetOnDemandCapacity": 2,
+            "InstanceTypeConfigs": [{"InstanceType": "m5.xlarge"}],
+        },
+    )
+    fleet_id = add_resp["InstanceFleetId"]
+
+    # Modify capacity
+    emr.modify_instance_fleet(
+        ClusterId=cluster_id,
+        InstanceFleet={
+            "InstanceFleetId": fleet_id,
+            "TargetOnDemandCapacity": 5,
+            "TargetSpotCapacity": 3,
+        },
+    )
+
+    # Verify the modification
+    fleets = emr.list_instance_fleets(ClusterId=cluster_id)
+    core_fleet = [f for f in fleets["InstanceFleets"] if f["Id"] == fleet_id][0]
+    assert core_fleet["TargetOnDemandCapacity"] == 5
+    assert core_fleet["TargetSpotCapacity"] == 3
+    assert core_fleet["ProvisionedOnDemandCapacity"] == 5
+    assert core_fleet["ProvisionedSpotCapacity"] == 3
+
+    emr.terminate_job_flows(JobFlowIds=[cluster_id])
+
+
+def test_emr_modify_instance_groups(emr):
+    """ModifyInstanceGroups updates instance counts."""
+    jf = emr.run_job_flow(
+        Name="modify-groups-test",
+        ReleaseLabel="emr-6.10.0",
+        Instances={
+            "InstanceGroups": [
+                {
+                    "Name": "Master",
+                    "InstanceRole": "MASTER",
+                    "InstanceType": "m5.xlarge",
+                    "InstanceCount": 1,
+                },
+                {
+                    "Name": "Core",
+                    "InstanceRole": "CORE",
+                    "InstanceType": "m5.xlarge",
+                    "InstanceCount": 2,
+                },
+            ],
+            "KeepJobFlowAliveWhenNoSteps": True,
+        },
+        JobFlowRole="EMR_EC2_DefaultRole",
+        ServiceRole="EMR_DefaultRole",
+    )
+    cluster_id = jf["JobFlowId"]
+
+    # Find the CORE group id
+    groups = emr.list_instance_groups(ClusterId=cluster_id)
+    core_group = [g for g in groups["InstanceGroups"] if g["InstanceGroupType"] == "CORE"][0]
+    group_id = core_group["Id"]
+    assert core_group["RequestedInstanceCount"] == 2
+
+    # Modify the group count
+    emr.modify_instance_groups(
+        ClusterId=cluster_id,
+        InstanceGroups=[{"InstanceGroupId": group_id, "InstanceCount": 6}],
+    )
+
+    # Verify the modification
+    groups2 = emr.list_instance_groups(ClusterId=cluster_id)
+    core_group2 = [g for g in groups2["InstanceGroups"] if g["Id"] == group_id][0]
+    assert core_group2["RequestedInstanceCount"] == 6
+    assert core_group2["RunningInstanceCount"] == 6
+
+    emr.terminate_job_flows(JobFlowIds=[cluster_id])
+
+
+def test_emr_list_bootstrap_actions(emr):
+    """ListBootstrapActions returns actions created with the cluster."""
+    jf = emr.run_job_flow(
+        Name="bootstrap-test",
+        ReleaseLabel="emr-6.10.0",
+        Instances={
+            "MasterInstanceType": "m5.xlarge",
+            "InstanceCount": 1,
+            "KeepJobFlowAliveWhenNoSteps": True,
+        },
+        JobFlowRole="EMR_EC2_DefaultRole",
+        ServiceRole="EMR_DefaultRole",
+        BootstrapActions=[
+            {
+                "Name": "install-deps",
+                "ScriptBootstrapAction": {
+                    "Path": "s3://my-bucket/bootstrap/install.sh",
+                    "Args": ["--env", "prod"],
+                },
+            },
+            {
+                "Name": "setup-monitoring",
+                "ScriptBootstrapAction": {
+                    "Path": "s3://my-bucket/bootstrap/monitor.sh",
+                    "Args": [],
+                },
+            },
+        ],
+    )
+    cluster_id = jf["JobFlowId"]
+
+    actions = emr.list_bootstrap_actions(ClusterId=cluster_id)
+    ba_list = actions["BootstrapActions"]
+    assert len(ba_list) == 2
+
+    assert ba_list[0]["Name"] == "install-deps"
+    assert ba_list[0]["ScriptPath"] == "s3://my-bucket/bootstrap/install.sh"
+    assert ba_list[0]["Args"] == ["--env", "prod"]
+
+    assert ba_list[1]["Name"] == "setup-monitoring"
+    assert ba_list[1]["ScriptPath"] == "s3://my-bucket/bootstrap/monitor.sh"
+    assert ba_list[1]["Args"] == []
+
+    emr.terminate_job_flows(JobFlowIds=[cluster_id])

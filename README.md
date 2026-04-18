@@ -30,7 +30,7 @@ LocalStack recently moved its core services behind a paid plan. If you relied on
 - **Drop-in compatible** — works with `boto3`, AWS CLI, Terraform, CDK, Pulumi, any SDK
 - **Real infrastructure** — RDS spins up actual Postgres/MySQL containers, ElastiCache spins up real Redis, Athena runs real SQL via DuckDB, ECS runs real Docker containers
 - **Tiny footprint** — ~270MB image, ~21MB RAM at idle vs LocalStack's ~1GB image and ~500MB RAM
-- **Fast startup** — under 2 seconds
+- **Fast startup** — under 2 seconds, HTTP/2 (h2c) supported
 - **MIT licensed** — use it, fork it, contribute to it
 
 ---
@@ -392,6 +392,7 @@ subnet = ec2.create_subnet(
 | `AWS::IAM::InstanceProfile` | Profile name | Arn |
 | `AWS::SSM::Parameter` | Parameter name | Type, Value |
 | `AWS::Logs::LogGroup` | Log group name | Arn |
+| `AWS::Events::EventBus` | EventBus name | Arn, Name |
 | `AWS::Events::Rule` | Rule name | Arn |
 | `AWS::Kinesis::Stream` | Stream name | Arn, StreamId |
 | `AWS::Lambda::Permission` | Statement ID | — |
@@ -478,7 +479,7 @@ Unsupported resource types fail with `CREATE_FAILED` (or `ROLLBACK_COMPLETE` if 
 | **Cloud Map** | CreateHttpNamespace, CreatePrivateDnsNamespace, CreatePublicDnsNamespace, GetNamespace, ListNamespaces, DeleteNamespace, UpdateHttpNamespace, UpdatePrivateDnsNamespace, UpdatePublicDnsNamespace, CreateService, GetService, ListServices, DeleteService, UpdateService, RegisterInstance, DeregisterInstance, DiscoverInstances, DiscoverInstancesRevision, ListInstances, GetInstancesHealthStatus, UpdateInstanceCustomHealthStatus, GetServiceAttributes, UpdateServiceAttributes, DeleteServiceAttributes, GetOperation, ListOperations, TagResource, UntagResource, ListTagsForResource | DNS namespaces create Route53 hosted zones; operation tracking; Terraform `aws_service_discovery_*` compatible |
 | **RDS Data API** | ExecuteStatement, BatchExecuteStatement, BeginTransaction, CommitTransaction, RollbackTransaction | Routes SQL to real Docker-backed RDS database containers; supports MySQL (pymysql) and PostgreSQL (psycopg2); REST paths (`/Execute`, `/BeginTransaction`, etc.) |
 | **S3 Files** | CreateFileSystem, GetFileSystem, ListFileSystems, DeleteFileSystem, CreateMountTarget, GetMountTarget, ListMountTargets, UpdateMountTarget, DeleteMountTarget, CreateAccessPoint, GetAccessPoint, ListAccessPoints, DeleteAccessPoint, GetFileSystemPolicy, PutFileSystemPolicy, DeleteFileSystemPolicy, GetSynchronizationConfiguration, PutSynchronizationConfiguration, TagResource, UntagResource, ListTagsForResource | 21 operations; control plane for the new S3 Files service (launched April 2026); file systems, mount targets, access points, policies |
-| **AutoScaling** | CreateAutoScalingGroup, DescribeAutoScalingGroups, UpdateAutoScalingGroup, DeleteAutoScalingGroup, DescribeAutoScalingInstances, CreateLaunchConfiguration, DescribeLaunchConfigurations, DeleteLaunchConfiguration, PutScalingPolicy, DescribePolicies, DeletePolicy, PutLifecycleHook, DescribeLifecycleHooks, DeleteLifecycleHook, CompleteLifecycleAction, RecordLifecycleActionHeartbeat, PutScheduledUpdateGroupAction, DescribeScheduledActions, DeleteScheduledAction, CreateOrUpdateTags, DescribeTags, DeleteTags | 22 actions; in-memory state — no real instance scaling; full ASG lifecycle (launch configs, scaling policies, lifecycle hooks, scheduled actions, tags); CDK/Terraform compatible |
+| **AutoScaling** | CreateAutoScalingGroup, DescribeAutoScalingGroups, UpdateAutoScalingGroup, DeleteAutoScalingGroup, DescribeAutoScalingInstances, CreateLaunchConfiguration, DescribeLaunchConfigurations, DeleteLaunchConfiguration, PutScalingPolicy, DescribePolicies, DeletePolicy, PutLifecycleHook, DescribeLifecycleHooks, DeleteLifecycleHook, CompleteLifecycleAction, RecordLifecycleActionHeartbeat, PutScheduledUpdateGroupAction, DescribeScheduledActions, DeleteScheduledAction, CreateOrUpdateTags, DescribeTags, DeleteTags | 23 actions; in-memory state — no real instance scaling; full ASG lifecycle (launch configs, scaling policies, lifecycle hooks, scheduled actions, tags); CDK/Terraform compatible |
 | **CodeBuild** | CreateProject, BatchGetProjects, ListProjects, UpdateProject, DeleteProject, StartBuild, BatchGetBuilds, StopBuild, ListBuilds, ListBuildsForProject, BatchDeleteBuilds | 11 actions; builds complete immediately with SUCCEEDED status; project and build metadata stored in-memory |
 | **AppConfig** | CreateApplication, GetApplication, ListApplications, UpdateApplication, DeleteApplication, CreateEnvironment, GetEnvironment, ListEnvironments, UpdateEnvironment, DeleteEnvironment, CreateConfigurationProfile, GetConfigurationProfile, ListConfigurationProfiles, UpdateConfigurationProfile, DeleteConfigurationProfile, CreateHostedConfigurationVersion, GetHostedConfigurationVersion, ListHostedConfigurationVersions, DeleteHostedConfigurationVersion, CreateDeploymentStrategy, GetDeploymentStrategy, ListDeploymentStrategies, UpdateDeploymentStrategy, DeleteDeploymentStrategy, StartDeployment, GetDeployment, ListDeployments, StopDeployment, TagResource, UntagResource, ListTagsForResource, StartConfigurationSession, GetLatestConfiguration | 33 operations; control plane + data plane; hosted configuration versions; deployments complete immediately; session-based configuration retrieval with token rotation |
 | **Transfer Family** | CreateServer, DescribeServer, DeleteServer, ListServers, CreateUser, DescribeUser, DeleteUser, ListUsers, ImportSshPublicKey, DeleteSshPublicKey | 10 operations; SFTP server and user management; SSH key rotation; LOGICAL home directory mappings to S3; in-memory state |
@@ -869,8 +870,9 @@ MiniStack also sets the standard Lambda runtime environment before the handler m
                     │  │  ALB/ELBv2   WAF v2   KMS  ECR     │  │
                     │  │  CloudFormation    CloudFront      │  │
                     │  │  AppSync  Cloud Map   CodeBuild    │  │
-                    │  │  AutoScaling    AppConfig          │  │
-                    │  │  RDS Data   S3 Files  Scheduler    │  │
+                    │  │  AutoScaling  AppConfig     EKS    │  │
+                    │  │  RDS Data  S3 Files  Scheduler     │  │
+                    │  │  Transfer Family                   │  │
                     │  └────────────────────────────────────┘  │
                     │                                          │
                     │  In-Memory Storage + Optional Docker     │

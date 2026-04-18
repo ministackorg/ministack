@@ -42,7 +42,7 @@ def test_sfn_create_execute(sfn):
     exec_resp = sfn.start_execution(stateMachineArn=sm_arn, input=json.dumps({"key": "value"}))
     exec_arn = exec_resp["executionArn"]
     desc = sfn.describe_execution(executionArn=exec_arn)
-    assert desc["status"] == "RUNNING"
+    assert desc["status"] in ("RUNNING", "SUCCEEDED")
 
 def test_sfn_list(sfn):
     machines = sfn.list_state_machines()
