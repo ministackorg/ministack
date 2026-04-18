@@ -717,6 +717,31 @@ def test_rds_modify_cluster_password(rds):
     assert cluster["DBClusterIdentifier"] == "pw-mod-cluster"
 
 
+def test_rds_modify_instance_password(rds):
+    """ModifyDBInstance with MasterUserPassword updates the stored password."""
+    rds.create_db_instance(
+        DBInstanceIdentifier="pw-mod-inst",
+        DBInstanceClass="db.t3.micro",
+        Engine="postgres",
+        MasterUsername="admin",
+        MasterUserPassword="old_pass",
+        AllocatedStorage=20,
+    )
+    # Password change should succeed without error
+    rds.modify_db_instance(
+        DBInstanceIdentifier="pw-mod-inst",
+        MasterUserPassword="new_pass",
+        ApplyImmediately=True,
+    )
+    resp = rds.describe_db_instances(DBInstanceIdentifier="pw-mod-inst")
+    inst = resp["DBInstances"][0]
+    assert inst["DBInstanceIdentifier"] == "pw-mod-inst"
+    # Other fields should remain unchanged
+    assert inst["MasterUsername"] == "admin"
+    assert inst["Engine"] == "postgres"
+    assert inst["DBInstanceStatus"] == "available"
+
+
 # ---------------------------------------------------------------------------
 # Tests for the 8 previously-untested operations
 # ---------------------------------------------------------------------------
