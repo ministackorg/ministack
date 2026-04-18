@@ -169,3 +169,308 @@ def test_tagging_get_resources_no_match(tagging):
 def test_tagging_get_resources_pagination_token_empty(tagging):
     resp = tagging.get_resources()
     assert resp.get("PaginationToken", "") == ""
+
+
+# ========== Phase 2: New service collectors ==========
+
+def test_tagging_get_resources_kms(tagging, kms_client):
+    key_id = kms_client.create_key(Description="tg-kms-basic")["KeyMetadata"]["KeyId"]
+    kms_client.tag_resource(KeyId=key_id, Tags=[{"TagKey": _TAG_KEY, "TagValue": "kms-basic"}])
+
+    resp = tagging.get_resources(TagFilters=[{"Key": _TAG_KEY, "Values": ["kms-basic"]}])
+    arns = [r["ResourceARN"] for r in resp["ResourceTagMappingList"]]
+    assert any(key_id in a for a in arns)
+
+
+def test_tagging_get_resources_kms_tags_returned(tagging, kms_client):
+    """KMS stores tags as TagKey/TagValue — verify normalised to Key/Value in response."""
+    key_id = kms_client.create_key(Description="tg-kms-tags")["KeyMetadata"]["KeyId"]
+    kms_client.tag_resource(KeyId=key_id, Tags=[
+        {"TagKey": _TAG_KEY, "TagValue": "kms-tags"},
+        {"TagKey": "team", "TagValue": "platform"},
+    ])
+
+    resp = tagging.get_resources(TagFilters=[{"Key": _TAG_KEY, "Values": ["kms-tags"]}])
+    matched = [r for r in resp["ResourceTagMappingList"] if key_id in r["ResourceARN"]]
+    assert len(matched) == 1
+    tag_map = {t["Key"]: t["Value"] for t in matched[0]["Tags"]}
+    assert tag_map[_TAG_KEY] == "kms-tags"
+    assert tag_map["team"] == "platform"
+
+
+def test_tagging_get_resources_ecr(tagging, ecr):
+    ecr.create_repository(
+        repositoryName="tg-ecr-basic",
+        tags=[{"Key": _TAG_KEY, "Value": "ecr-basic"}],
+    )
+
+    resp = tagging.get_resources(TagFilters=[{"Key": _TAG_KEY, "Values": ["ecr-basic"]}])
+    arns = [r["ResourceARN"] for r in resp["ResourceTagMappingList"]]
+    assert any("tg-ecr-basic" in a for a in arns)
+
+
+def test_tagging_get_resources_ecs(tagging, ecs):
+    ecs.create_cluster(
+        clusterName="tg-ecs-basic",
+        tags=[{"key": _TAG_KEY, "value": "ecs-basic"}],
+    )
+
+    resp = tagging.get_resources(TagFilters=[{"Key": _TAG_KEY, "Values": ["ecs-basic"]}])
+    arns = [r["ResourceARN"] for r in resp["ResourceTagMappingList"]]
+    assert any("tg-ecs-basic" in a for a in arns)
+
+
+def test_tagging_get_resources_ecs_tags_returned(tagging, ecs):
+    """ECS stores tags as lowercase key/value — verify normalised to Key/Value in response."""
+    ecs.create_cluster(clusterName="tg-ecs-tags", tags=[
+        {"key": _TAG_KEY, "value": "ecs-tags"},
+        {"key": "team", "value": "infra"},
+    ])
+
+    resp = tagging.get_resources(TagFilters=[{"Key": _TAG_KEY, "Values": ["ecs-tags"]}])
+    matched = [r for r in resp["ResourceTagMappingList"] if "tg-ecs-tags" in r["ResourceARN"]]
+    assert len(matched) == 1
+    tag_map = {t["Key"]: t["Value"] for t in matched[0]["Tags"]}
+    assert tag_map[_TAG_KEY] == "ecs-tags"
+    assert tag_map["team"] == "infra"
+
+
+def test_tagging_get_resources_glue(tagging, glue):
+    glue.create_database(DatabaseInput={"Name": "tg-glue-db"})
+    db_arn = glue.get_database(Name="tg-glue-db")["Database"].get(
+        "DatabaseArn",
+        f"arn:aws:glue:us-east-1:000000000000:database/tg-glue-db",
+    )
+    glue.tag_resource(ResourceArn=db_arn, TagsToAdd={_TAG_KEY: "glue-basic"})
+
+    resp = tagging.get_resources(TagFilters=[{"Key": _TAG_KEY, "Values": ["glue-basic"]}])
+    arns = [r["ResourceARN"] for r in resp["ResourceTagMappingList"]]
+    assert db_arn in arns
+
+
+def test_tagging_get_resources_cognito_idp(tagging, cognito_idp):
+    pool_id = cognito_idp.create_user_pool(PoolName="tg-cognito-pool")["UserPool"]["Id"]
+    pool_arn = cognito_idp.describe_user_pool(UserPoolId=pool_id)["UserPool"]["Arn"]
+    cognito_idp.tag_resource(ResourceArn=pool_arn, Tags={_TAG_KEY: "cognito-idp-basic"})
+
+    resp = tagging.get_resources(TagFilters=[{"Key": _TAG_KEY, "Values": ["cognito-idp-basic"]}])
+    arns = [r["ResourceARN"] for r in resp["ResourceTagMappingList"]]
+    assert any(pool_id in a for a in arns)
+
+
+def test_tagging_get_resources_cognito_identity(tagging, cognito_identity):
+    pool_id = cognito_identity.create_identity_pool(
+        IdentityPoolName="tg-cognito-identity",
+        AllowUnauthenticatedIdentities=False,
+    )["IdentityPoolId"]
+    cognito_identity.tag_resource(
+        ResourceArn=f"arn:aws:cognito-identity:us-east-1:000000000000:identitypool/{pool_id}",
+        Tags={_TAG_KEY: "cognito-identity-basic"},
+    )
+
+    resp = tagging.get_resources(TagFilters=[{"Key": _TAG_KEY, "Values": ["cognito-identity-basic"]}])
+    arns = [r["ResourceARN"] for r in resp["ResourceTagMappingList"]]
+    assert any(pool_id in a for a in arns)
+
+
+def test_tagging_get_resources_appsync(tagging, appsync):
+    api_id = appsync.create_graphql_api(
+        name="tg-appsync-api",
+        authenticationType="API_KEY",
+        tags={_TAG_KEY: "appsync-basic"},
+    )["graphqlApi"]["apiId"]
+    api_arn = appsync.get_graphql_api(apiId=api_id)["graphqlApi"]["arn"]
+
+    resp = tagging.get_resources(TagFilters=[{"Key": _TAG_KEY, "Values": ["appsync-basic"]}])
+    arns = [r["ResourceARN"] for r in resp["ResourceTagMappingList"]]
+    assert api_arn in arns
+
+
+def test_tagging_get_resources_scheduler(tagging, scheduler):
+    scheduler.create_schedule(
+        Name="tg-scheduler-sched",
+        GroupName="default",
+        ScheduleExpression="rate(1 hour)",
+        Target={
+            "Arn": "arn:aws:sqs:us-east-1:000000000000:dummy",
+            "RoleArn": "arn:aws:iam::000000000000:role/dummy",
+        },
+        FlexibleTimeWindow={"Mode": "OFF"},
+    )
+    sched_arn = f"arn:aws:scheduler:us-east-1:000000000000:schedule/default/tg-scheduler-sched"
+    scheduler.tag_resource(ResourceArn=sched_arn, Tags=[{"Key": _TAG_KEY, "Value": "scheduler-basic"}])
+
+    resp = tagging.get_resources(TagFilters=[{"Key": _TAG_KEY, "Values": ["scheduler-basic"]}])
+    arns = [r["ResourceARN"] for r in resp["ResourceTagMappingList"]]
+    assert any("tg-scheduler-sched" in a for a in arns)
+
+
+def test_tagging_get_resources_cloudfront(tagging, cloudfront):
+    dist_id = cloudfront.create_distribution(DistributionConfig={
+        "CallerReference": "tg-cf-dist",
+        "Origins": {"Quantity": 1, "Items": [{
+            "Id": "o1",
+            "DomainName": "example.com",
+            "S3OriginConfig": {"OriginAccessIdentity": ""},
+        }]},
+        "DefaultCacheBehavior": {
+            "TargetOriginId": "o1",
+            "ViewerProtocolPolicy": "allow-all",
+            "ForwardedValues": {"QueryString": False, "Cookies": {"Forward": "none"}},
+            "MinTTL": 0,
+        },
+        "Comment": "",
+        "Enabled": True,
+    })["Distribution"]["Id"]
+    dist_arn = cloudfront.get_distribution(Id=dist_id)["Distribution"]["ARN"]
+    cloudfront.tag_resource(
+        Resource=dist_arn,
+        Tags={"Items": [{"Key": _TAG_KEY, "Value": "cf-basic"}]},
+    )
+
+    resp = tagging.get_resources(TagFilters=[{"Key": _TAG_KEY, "Values": ["cf-basic"]}])
+    arns = [r["ResourceARN"] for r in resp["ResourceTagMappingList"]]
+    assert dist_arn in arns
+
+
+def test_tagging_get_resources_efs(tagging, efs):
+    fs_id = efs.create_file_system(
+        Tags=[{"Key": _TAG_KEY, "Value": "efs-basic"}],
+    )["FileSystemId"]
+
+    resp = tagging.get_resources(TagFilters=[{"Key": _TAG_KEY, "Values": ["efs-basic"]}])
+    arns = [r["ResourceARN"] for r in resp["ResourceTagMappingList"]]
+    assert any(fs_id in a for a in arns)
+
+
+def test_tagging_get_resources_efs_access_point(tagging, efs):
+    fs_id = efs.create_file_system()["FileSystemId"]
+    ap_id = efs.create_access_point(
+        FileSystemId=fs_id,
+        Tags=[{"Key": _TAG_KEY, "Value": "efs-ap"}],
+    )["AccessPointId"]
+
+    resp = tagging.get_resources(TagFilters=[{"Key": _TAG_KEY, "Values": ["efs-ap"]}])
+    arns = [r["ResourceARN"] for r in resp["ResourceTagMappingList"]]
+    assert any(ap_id in a for a in arns)
+
+
+def test_tagging_get_resources_resource_type_filter_kms(tagging, kms_client, s3):
+    """ResourceTypeFilters=["kms"] returns KMS resources and excludes S3."""
+    key_id = kms_client.create_key(Description="tg-type-kms")["KeyMetadata"]["KeyId"]
+    kms_client.tag_resource(KeyId=key_id, Tags=[{"TagKey": _TAG_KEY, "TagValue": "type-kms"}])
+    s3.create_bucket(Bucket="tg-type-kms-s3")
+    s3.put_bucket_tagging(Bucket="tg-type-kms-s3", Tagging={
+        "TagSet": [{"Key": _TAG_KEY, "Value": "type-kms"}]
+    })
+
+    resp = tagging.get_resources(
+        TagFilters=[{"Key": _TAG_KEY, "Values": ["type-kms"]}],
+        ResourceTypeFilters=["kms"],
+    )
+    arns = [r["ResourceARN"] for r in resp["ResourceTagMappingList"]]
+    assert any(key_id in a for a in arns)
+    assert not any("tg-type-kms-s3" in a for a in arns)
+
+
+def test_tagging_get_resources_cross_service_phase2(tagging, kms_client, ecr):
+    """GetResources fan-out includes Phase 2 collectors (KMS + ECR)."""
+    key_id = kms_client.create_key(Description="tg-cross2-kms")["KeyMetadata"]["KeyId"]
+    kms_client.tag_resource(KeyId=key_id, Tags=[{"TagKey": _TAG_KEY, "TagValue": "cross-phase2"}])
+    ecr.create_repository(
+        repositoryName="tg-cross2-ecr",
+        tags=[{"Key": _TAG_KEY, "Value": "cross-phase2"}],
+    )
+
+    resp = tagging.get_resources(TagFilters=[{"Key": _TAG_KEY, "Values": ["cross-phase2"]}])
+    arns = [r["ResourceARN"] for r in resp["ResourceTagMappingList"]]
+    assert any(key_id in a for a in arns)
+    assert any("tg-cross2-ecr" in a for a in arns)
+
+
+# ========== GetTagKeys ==========
+
+def test_tagging_get_tag_keys_returns_known_key(tagging, s3):
+    s3.create_bucket(Bucket="tg-keys-s3")
+    s3.put_bucket_tagging(Bucket="tg-keys-s3", Tagging={
+        "TagSet": [{"Key": _TAG_KEY, "Value": "keys-test"}]
+    })
+    resp = tagging.get_tag_keys()
+    assert _TAG_KEY in resp["TagKeys"]
+
+
+def test_tagging_get_tag_keys_no_duplicates(tagging, s3):
+    """Same key on multiple resources appears once."""
+    s3.create_bucket(Bucket="tg-keys-dup-a")
+    s3.put_bucket_tagging(Bucket="tg-keys-dup-a", Tagging={
+        "TagSet": [{"Key": _TAG_KEY, "Value": "v1"}]
+    })
+    s3.create_bucket(Bucket="tg-keys-dup-b")
+    s3.put_bucket_tagging(Bucket="tg-keys-dup-b", Tagging={
+        "TagSet": [{"Key": _TAG_KEY, "Value": "v2"}]
+    })
+    resp = tagging.get_tag_keys()
+    assert resp["TagKeys"].count(_TAG_KEY) == 1
+
+
+def test_tagging_get_tag_keys_cross_service_phase2(tagging, kms_client):
+    """GetTagKeys aggregates keys from Phase 2 collectors, not just Phase 1."""
+    key_id = kms_client.create_key(Description="tg-keys-kms")["KeyMetadata"]["KeyId"]
+    kms_client.tag_resource(KeyId=key_id, Tags=[{"TagKey": _TAG_KEY, "TagValue": "keys-kms"}])
+
+    resp = tagging.get_tag_keys()
+    assert _TAG_KEY in resp["TagKeys"]
+
+
+def test_tagging_get_tag_keys_pagination_token_empty(tagging):
+    resp = tagging.get_tag_keys()
+    assert resp.get("PaginationToken", "") == ""
+
+
+# ========== GetTagValues ==========
+
+def test_tagging_get_tag_values_returns_values(tagging, s3):
+    s3.create_bucket(Bucket="tg-vals-a")
+    s3.put_bucket_tagging(Bucket="tg-vals-a", Tagging={
+        "TagSet": [{"Key": _TAG_KEY, "Value": "vals-v1"}]
+    })
+    s3.create_bucket(Bucket="tg-vals-b")
+    s3.put_bucket_tagging(Bucket="tg-vals-b", Tagging={
+        "TagSet": [{"Key": _TAG_KEY, "Value": "vals-v2"}]
+    })
+    resp = tagging.get_tag_values(Key=_TAG_KEY)
+    assert "vals-v1" in resp["TagValues"]
+    assert "vals-v2" in resp["TagValues"]
+
+
+def test_tagging_get_tag_values_excludes_other_keys(tagging, s3):
+    s3.create_bucket(Bucket="tg-vals-other")
+    s3.put_bucket_tagging(Bucket="tg-vals-other", Tagging={
+        "TagSet": [{"Key": "other-key", "Value": "should-not-appear"}]
+    })
+    resp = tagging.get_tag_values(Key=_TAG_KEY)
+    assert "should-not-appear" not in resp["TagValues"]
+
+
+def test_tagging_get_tag_values_cross_service_phase2(tagging, s3, kms_client):
+    """GetTagValues returns values sourced from both Phase 1 and Phase 2 collectors."""
+    s3.create_bucket(Bucket="tg-vals-phase2-s3")
+    s3.put_bucket_tagging(Bucket="tg-vals-phase2-s3", Tagging={
+        "TagSet": [{"Key": _TAG_KEY, "Value": "vals-from-s3"}]
+    })
+    key_id = kms_client.create_key(Description="tg-vals-kms")["KeyMetadata"]["KeyId"]
+    kms_client.tag_resource(KeyId=key_id, Tags=[{"TagKey": _TAG_KEY, "TagValue": "vals-from-kms"}])
+
+    resp = tagging.get_tag_values(Key=_TAG_KEY)
+    assert "vals-from-s3" in resp["TagValues"]
+    assert "vals-from-kms" in resp["TagValues"]
+
+
+def test_tagging_get_tag_values_empty_for_unknown_key(tagging):
+    resp = tagging.get_tag_values(Key="__nonexistent_key__")
+    assert resp["TagValues"] == []
+
+
+def test_tagging_get_tag_values_pagination_token_empty(tagging):
+    resp = tagging.get_tag_values(Key=_TAG_KEY)
+    assert resp.get("PaginationToken", "") == ""

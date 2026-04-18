@@ -301,5 +301,13 @@ def eks():
     return make_client("eks")
 
 @pytest.fixture(scope="session")
+def appsync():
+    return make_client("appsync")
+
+@pytest.fixture(scope="session")
+def scheduler():
+    return make_client("scheduler")
+
+@pytest.fixture(scope="session")
 def tagging():
     return make_client("resourcegroupstaggingapi")
