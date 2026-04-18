@@ -1,6 +1,6 @@
 """
 Resource Groups Tagging API emulator.
-Phase 1: GetResources across S3, Lambda, SQS, SNS, DynamoDB, EventBridge.
+Phase 2: extends GetResources to 15 services and adds GetTagKeys, GetTagValues.
 """
 
 import json
@@ -21,6 +21,16 @@ def _normalise_flat(tag_dict):
 def _normalise_list(tag_list):
     """Pass-through [{"Key": k, "Value": v}] list (DynamoDB format)."""
     return tag_list or []
+
+
+def _normalise_kms(tag_list):
+    """Convert KMS [{"TagKey": k, "TagValue": v}] to standard format."""
+    return [{"Key": t["TagKey"], "Value": t["TagValue"]} for t in (tag_list or [])]
+
+
+def _normalise_ecs(tag_list):
+    """Convert ECS [{"key": k, "value": v}] (lowercase) to standard format."""
+    return [{"Key": t["key"], "Value": t["value"]} for t in (tag_list or [])]
 
 
 # ── Per-service tag collectors ────────────────────────────────────────────────
@@ -64,14 +74,90 @@ def _collect_eventbridge():
         yield arn, _normalise_flat(tags)
 
 
+def _collect_kms():
+    import ministack.services.kms as svc
+    for key_id, rec in svc._keys.items():
+        arn = f"arn:aws:kms:{REGION}:{_account()}:key/{key_id}"
+        yield arn, _normalise_kms(rec.get("Tags", []))
+
+
+def _collect_ecr():
+    import ministack.services.ecr as svc
+    for name, repo in svc._repositories.items():
+        arn = f"arn:aws:ecr:{REGION}:{_account()}:repository/{name}"
+        yield arn, _normalise_list(repo.get("tags", []))
+
+
+def _collect_ecs():
+    import ministack.services.ecs as svc
+    for arn, tags in svc._tags.items():
+        yield arn, _normalise_ecs(tags)
+
+
+def _collect_glue():
+    import ministack.services.glue as svc
+    for arn, tags in svc._tags.items():
+        yield arn, _normalise_flat(tags)
+
+
+def _collect_cognito():
+    import ministack.services.cognito as svc
+    for pool_id, pool in svc._user_pools.items():
+        arn = f"arn:aws:cognito-idp:{REGION}:{_account()}:userpool/{pool_id}"
+        yield arn, _normalise_flat(pool.get("UserPoolTags", {}))
+    for pool_id, tags in svc._identity_tags.items():
+        arn = f"arn:aws:cognito-identity:{REGION}:{_account()}:identitypool/{pool_id}"
+        yield arn, _normalise_flat(tags)
+
+
+def _collect_appsync():
+    import ministack.services.appsync as svc
+    for arn, tags in svc._tags.items():
+        yield arn, _normalise_flat(tags)
+
+
+def _collect_scheduler():
+    import ministack.services.scheduler as svc
+    for arn, tags in svc._tags.items():
+        yield arn, _normalise_flat(tags)
+
+
+def _collect_cloudfront():
+    import ministack.services.cloudfront as svc
+    for arn, tags in svc._tags.items():
+        yield arn, _normalise_list(tags)
+
+
+def _collect_efs():
+    import ministack.services.efs as svc
+    for fs_id, fs in svc._file_systems.items():
+        arn = f"arn:aws:elasticfilesystem:{REGION}:{_account()}:file-system/{fs_id}"
+        yield arn, _normalise_list(fs.get("Tags", []))
+    for ap_id, ap in svc._access_points.items():
+        arn = f"arn:aws:elasticfilesystem:{REGION}:{_account()}:access-point/{ap_id}"
+        yield arn, _normalise_list(ap.get("Tags", []))
+
+
 # ResourceTypeFilter prefix -> collector
 _COLLECTORS = {
-    "s3":       _collect_s3,
-    "lambda":   _collect_lambda,
-    "sqs":      _collect_sqs,
-    "sns":      _collect_sns,
-    "dynamodb": _collect_dynamodb,
-    "events":   _collect_eventbridge,
+    # Phase 1
+    "s3":                _collect_s3,
+    "lambda":            _collect_lambda,
+    "sqs":               _collect_sqs,
+    "sns":               _collect_sns,
+    "dynamodb":          _collect_dynamodb,
+    "events":            _collect_eventbridge,
+    # Phase 2
+    "kms":               _collect_kms,
+    "ecr":               _collect_ecr,
+    "ecs":               _collect_ecs,
+    "glue":              _collect_glue,
+    "cognito-idp":       _collect_cognito,
+    "cognito-identity":  _collect_cognito,
+    "appsync":           _collect_appsync,
+    "scheduler":         _collect_scheduler,
+    "cloudfront":        _collect_cloudfront,
+    "elasticfilesystem": _collect_efs,
 }
 
 
