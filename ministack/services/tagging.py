@@ -225,10 +225,44 @@ def _get_resources(data):
     }).encode()
 
 
+def _get_tag_keys(data):
+    keys = set()
+    for collector in _COLLECTORS.values():
+        try:
+            for _arn, tags in collector():
+                for t in tags:
+                    keys.add(t["Key"])
+        except Exception:
+            pass
+    return 200, {"Content-Type": "application/x-amz-json-1.1"}, json.dumps({
+        "TagKeys": sorted(keys),
+        "PaginationToken": "",
+    }).encode()
+
+
+def _get_tag_values(data):
+    target_key = data.get("Key", "")
+    values = set()
+    for collector in _COLLECTORS.values():
+        try:
+            for _arn, tags in collector():
+                for t in tags:
+                    if t["Key"] == target_key:
+                        values.add(t["Value"])
+        except Exception:
+            pass
+    return 200, {"Content-Type": "application/x-amz-json-1.1"}, json.dumps({
+        "TagValues": sorted(values),
+        "PaginationToken": "",
+    }).encode()
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 _HANDLERS = {
     "GetResources": _get_resources,
+    "GetTagKeys":   _get_tag_keys,
+    "GetTagValues": _get_tag_values,
 }
 
 
