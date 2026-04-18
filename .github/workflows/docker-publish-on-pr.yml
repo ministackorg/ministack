@@ -17,13 +17,6 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - name: Get latest git tag
-        id: git_tag
-        run: |
-          git fetch --tags --force
-          latest_tag=$(git describe --tags --abbrev=0)
-          echo "latest_tag=$latest_tag" >> "$GITHUB_OUTPUT"
-
       - name: Get short SHA
         id: short_sha
         run: |
@@ -49,7 +42,7 @@ jobs:
           images: |
             ${{ env.DOCKERHUB_IMAGE_ORG }}
           tags: |
-            type=ref,event=pr,suffix=-${{ steps.git_tag.outputs.latest_tag }}-${{ steps.short_sha.outputs.short_sha }}
+            type=ref,event=pr,suffix=-${{ steps.short_sha.outputs.short_sha }}
 
       - name: Build and push
         uses: docker/build-push-action@v7
