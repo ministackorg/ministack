@@ -1,0 +1,64 @@
+name: Docker Publish on PR
+
+on:
+  pull_request:
+
+env:
+  DOCKERHUB_IMAGE_ORG: ministackorg/ministack-preview-build
+
+jobs:
+  publish-pr:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      pull-requests: write
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Get short SHA
+        id: short_sha
+        run: |
+          short_sha=$(echo "$GITHUB_SHA" | cut -c1-8)
+          echo "short_sha=$short_sha" >> "$GITHUB_OUTPUT"
+
+      - name: Set up QEMU (multi-arch)
+        uses: docker/setup-qemu-action@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: |
+            ${{ env.DOCKERHUB_IMAGE_ORG }}
+          tags: |
+            type=ref,event=pr,suffix=-${{ steps.short_sha.outputs.short_sha }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Comment on PR with Docker image info
+        uses: peter-evans/create-or-update-comment@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          issue-number: ${{ github.event.pull_request.number }}
+          body: |
+            Docker image for this PR has been published: `${{ steps.meta.outputs.tags }}`
