@@ -1,7 +1,7 @@
 name: Docker Publish on PR
 
 on:
-  pull_request:
+  pull_request_target:
 
 env:
   DOCKERHUB_IMAGE_ORG: ministackorg/ministack-preview-build
@@ -16,11 +16,13 @@ jobs:
 
     steps:
       - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
 
       - name: Get short SHA
         id: short_sha
         run: |
-          short_sha=$(echo "$GITHUB_SHA" | cut -c1-8)
+          short_sha=$(echo "${{ github.event.pull_request.head.sha }}" | cut -c1-8)
           echo "short_sha=$short_sha" >> "$GITHUB_OUTPUT"
 
       - name: Set up QEMU (multi-arch)
