@@ -205,6 +205,136 @@ def _matches_tag_filters(tags, tag_filters):
     return True
 
 
+def _service_key_from_arn(arn):
+    """Extract service segment from ARN (e.g. 'arn:aws:s3:::...' → 's3')."""
+    parts = arn.split(":")
+    return parts[2] if len(parts) >= 3 else ""
+
+
+# ── Per-service tag writers ───────────────────────────────────────────────────
+
+def _write_s3(arn, tags):
+    import ministack.services.s3 as svc
+    name = arn.split(":::")[-1]
+    svc._bucket_tags.setdefault(name, {}).update(tags)
+
+
+def _write_lambda(arn, tags):
+    import ministack.services.lambda_svc as svc
+    name = arn.split("function:")[-1]
+    if name in svc._functions:
+        svc._functions[name].setdefault("tags", {}).update(tags)
+
+
+def _write_sqs(arn, tags):
+    import ministack.services.sqs as svc
+    for q in svc._queues.values():
+        if q.get("attributes", {}).get("QueueArn") == arn:
+            q.setdefault("tags", {}).update(tags)
+            break
+
+
+def _write_sns(arn, tags):
+    import ministack.services.sns as svc
+    if arn in svc._topics:
+        svc._topics[arn].setdefault("tags", {}).update(tags)
+
+
+def _write_dynamodb(arn, tags):
+    import ministack.services.dynamodb as svc
+    existing = {t["Key"]: t["Value"] for t in svc._tags.get(arn, [])}
+    existing.update(tags)
+    svc._tags[arn] = [{"Key": k, "Value": v} for k, v in existing.items()]
+
+
+def _write_eventbridge(arn, tags):
+    import ministack.services.eventbridge as svc
+    svc._tags.setdefault(arn, {}).update(tags)
+
+
+def _write_kms(arn, tags):
+    import ministack.services.kms as svc
+    key_id = arn.split("/")[-1]
+    if key_id in svc._keys:
+        existing = {t["TagKey"]: t["TagValue"] for t in svc._keys[key_id].get("Tags", [])}
+        existing.update(tags)
+        svc._keys[key_id]["Tags"] = [{"TagKey": k, "TagValue": v} for k, v in existing.items()]
+
+
+def _write_ecr(arn, tags):
+    import ministack.services.ecr as svc
+    name = arn.split("repository/")[-1]
+    if name in svc._repositories:
+        existing = {t["Key"]: t["Value"] for t in svc._repositories[name].get("tags", [])}
+        existing.update(tags)
+        svc._repositories[name]["tags"] = [{"Key": k, "Value": v} for k, v in existing.items()]
+
+
+def _write_ecs(arn, tags):
+    import ministack.services.ecs as svc
+    existing = {t["key"]: t["value"] for t in svc._tags.get(arn, [])}
+    existing.update(tags)
+    svc._tags[arn] = [{"key": k, "value": v} for k, v in existing.items()]
+
+
+def _write_glue(arn, tags):
+    import ministack.services.glue as svc
+    svc._tags.setdefault(arn, {}).update(tags)
+
+
+def _write_cognito_idp(arn, tags):
+    import ministack.services.cognito as svc
+    pool_id = arn.split("userpool/")[-1]
+    if pool_id in svc._user_pools:
+        svc._user_pools[pool_id].setdefault("UserPoolTags", {}).update(tags)
+
+
+def _write_cognito_identity(arn, tags):
+    import ministack.services.cognito as svc
+    pool_id = arn.split("identitypool/")[-1]
+    svc._identity_tags.setdefault(pool_id, {}).update(tags)
+
+
+def _write_appsync(arn, tags):
+    import ministack.services.appsync as svc
+    svc._tags.setdefault(arn, {}).update(tags)
+
+
+def _write_scheduler(arn, tags):
+    import ministack.services.scheduler as svc
+    svc._tags.setdefault(arn, {}).update(tags)
+
+
+def _write_cloudfront(arn, tags):
+    import ministack.services.cloudfront as svc
+    existing = {t["Key"]: t["Value"] for t in svc._tags.get(arn, [])}
+    existing.update(tags)
+    svc._tags[arn] = [{"Key": k, "Value": v} for k, v in existing.items()]
+
+
+def _write_efs(arn, tags):
+    import ministack.services.efs as svc
+    if ":file-system/" in arn:
+        resource = svc._file_systems.get(arn.split("file-system/")[-1])
+    else:
+        resource = svc._access_points.get(arn.split("access-point/")[-1])
+    if resource is not None:
+        existing = {t["Key"]: t["Value"] for t in resource.get("Tags", [])}
+        existing.update(tags)
+        resource["Tags"] = [{"Key": k, "Value": v} for k, v in existing.items()]
+
+
+_WRITERS = {
+    "s3": _write_s3, "lambda": _write_lambda, "sqs": _write_sqs,
+    "sns": _write_sns, "dynamodb": _write_dynamodb, "events": _write_eventbridge,
+    "kms": _write_kms, "ecr": _write_ecr, "ecs": _write_ecs,
+    "glue": _write_glue, "cognito-idp": _write_cognito_idp,
+    "cognito-identity": _write_cognito_identity, "appsync": _write_appsync,
+    "scheduler": _write_scheduler, "cloudfront": _write_cloudfront,
+    "elasticfilesystem": _write_efs,
+}
+
+
 # ── Operation handlers ────────────────────────────────────────────────────────
 
 def _get_resources(data):
