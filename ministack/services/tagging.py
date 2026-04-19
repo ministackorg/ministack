@@ -537,10 +537,70 @@ def _get_tag_values(data):
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
+def _tag_resources(data):
+    arn_list = data.get("ResourceARNList", [])
+    tags = data.get("Tags", {})
+    failed = {}
+
+    for arn in arn_list:
+        svc_key = _service_key_from_arn(arn)
+        writer = _WRITERS.get(svc_key)
+        if writer is None:
+            failed[arn] = {
+                "ErrorCode": "InternalServiceException",
+                "ErrorMessage": f"Unsupported resource type: {svc_key}",
+                "StatusCode": 501,
+            }
+            continue
+        try:
+            writer(arn, tags)
+        except Exception as exc:
+            failed[arn] = {
+                "ErrorCode": "InternalServiceException",
+                "ErrorMessage": str(exc),
+                "StatusCode": 500,
+            }
+
+    return 200, {"Content-Type": "application/x-amz-json-1.1"}, json.dumps({
+        "FailedResourcesMap": failed,
+    }).encode()
+
+
+def _untag_resources(data):
+    arn_list = data.get("ResourceARNList", [])
+    tag_keys = data.get("TagKeys", [])
+    failed = {}
+
+    for arn in arn_list:
+        svc_key = _service_key_from_arn(arn)
+        remover = _REMOVERS.get(svc_key)
+        if remover is None:
+            failed[arn] = {
+                "ErrorCode": "InternalServiceException",
+                "ErrorMessage": f"Unsupported resource type: {svc_key}",
+                "StatusCode": 501,
+            }
+            continue
+        try:
+            remover(arn, tag_keys)
+        except Exception as exc:
+            failed[arn] = {
+                "ErrorCode": "InternalServiceException",
+                "ErrorMessage": str(exc),
+                "StatusCode": 500,
+            }
+
+    return 200, {"Content-Type": "application/x-amz-json-1.1"}, json.dumps({
+        "FailedResourcesMap": failed,
+    }).encode()
+
+
 _HANDLERS = {
-    "GetResources": _get_resources,
-    "GetTagKeys":   _get_tag_keys,
-    "GetTagValues": _get_tag_values,
+    "GetResources":   _get_resources,
+    "GetTagKeys":     _get_tag_keys,
+    "GetTagValues":   _get_tag_values,
+    "TagResources":   _tag_resources,
+    "UntagResources": _untag_resources,
 }
 
 
