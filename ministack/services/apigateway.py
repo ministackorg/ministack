@@ -1074,7 +1074,7 @@ async def _invoke_ws_lambda(api_id: str, account_id: str, route: dict, stage: st
     return {"statusCode": 200, "body": ""}
 
 
-async def handle_websocket(scope, receive, send, api_id: str):
+async def handle_websocket(scope, receive, send, api_id: str, path_override: str | None = None):
     """Drive a WebSocket session for a $WEBSOCKET API.
 
     Flow:
@@ -1086,6 +1086,10 @@ async def handle_websocket(scope, receive, send, api_id: str):
       4. Concurrently drain the per-connection outbox (fed by @connections
          PostToConnection) and forward messages to the socket.
       5. On client disconnect, invoke `$disconnect` route Lambda (fire-and-forget).
+
+    ``path_override`` is used when the caller addressed us via the LocalStack-
+    compat path form (``/_aws/execute-api/{apiId}/{stage}``) so we read the
+    stage from the rewritten path instead of the raw URL.
     """
     owner = _api_owner(api_id)
     if not owner or owner[0] != "WEBSOCKET":
@@ -1096,9 +1100,9 @@ async def handle_websocket(scope, receive, send, api_id: str):
 
     protocol, account_id = owner
 
-    # Stage parsing: path is /{stage} or /{stage}/... — execute-api WS URLs are
-    # wss://{apiId}.execute-api.../stage
-    path = scope.get("path", "")
+    # Stage parsing: Host-based URLs look like wss://{apiId}.execute-api.../stage;
+    # path-based compat URLs (#401) use path_override with the rewritten path.
+    path = path_override if path_override is not None else scope.get("path", "")
     path_parts = path.lstrip("/").split("/", 1)
     stage = path_parts[0] if path_parts and path_parts[0] else "$default"
 

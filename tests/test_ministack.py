@@ -1,12 +1,17 @@
+"""Ministack admin/core tests — health, config, persistence, hypercorn compat."""
+
 import io
 import json
 import os
-import time
-import zipfile
-from urllib.parse import urlparse
 import pytest
-from botocore.exceptions import ClientError
+import time
 import uuid as _uuid_mod
+import zipfile
+from botocore.exceptions import ClientError
+from urllib.parse import urlparse
+
+
+# ========== from test_ministack.py ==========
 
 _ministack_installed = True
 
@@ -137,3 +142,365 @@ def test_ministack_package_services_importable():
         sts,
     ]:
         assert callable(getattr(mod, "handle_request", None)), f"{mod.__name__} missing handle_request"
+
+# ========== from test_ministack_persist.py ==========
+
+def test_ministack_persist_sqs_roundtrip():
+    from ministack.services import sqs as _sqs
+    _sqs._queues["http://localhost:4566/000000000000/persist-q"] = {"name": "persist-q", "messages": [], "attributes": {}}
+    _sqs._queue_name_to_url["persist-q"] = "http://localhost:4566/000000000000/persist-q"
+    state = _sqs.get_state()
+    assert "queues" in state
+    saved_queues = dict(_sqs._queues)
+    _sqs._queues.clear()
+    _sqs._queue_name_to_url.clear()
+    _sqs.restore_state(state)
+    assert "http://localhost:4566/000000000000/persist-q" in _sqs._queues
+    _sqs._queues.update(saved_queues)
+
+def test_ministack_persist_sns_roundtrip():
+    from ministack.services import sns as _sns
+    _sns._topics["arn:aws:sns:us-east-1:000000000000:persist-topic"] = {"TopicArn": "arn:aws:sns:us-east-1:000000000000:persist-topic", "subscriptions": []}
+    state = _sns.get_state()
+    assert "topics" in state
+    _sns._topics.pop("arn:aws:sns:us-east-1:000000000000:persist-topic", None)
+    _sns.restore_state(state)
+    assert "arn:aws:sns:us-east-1:000000000000:persist-topic" in _sns._topics
+    _sns._topics.pop("arn:aws:sns:us-east-1:000000000000:persist-topic", None)
+
+def test_ministack_persist_ssm_roundtrip():
+    from ministack.services import ssm as _ssm
+    _ssm._parameters["/persist/key"] = {"Name": "/persist/key", "Value": "val", "Type": "String"}
+    state = _ssm.get_state()
+    assert "parameters" in state
+    _ssm._parameters.pop("/persist/key")
+    _ssm.restore_state(state)
+    assert "/persist/key" in _ssm._parameters
+    _ssm._parameters.pop("/persist/key")
+
+def test_ministack_persist_secretsmanager_roundtrip():
+    from ministack.services import secretsmanager as _sm
+    _sm._secrets["persist-secret"] = {"Name": "persist-secret", "ARN": "arn:test", "Versions": {}}
+    state = _sm.get_state()
+    assert "secrets" in state
+    _sm._secrets.pop("persist-secret")
+    _sm.restore_state(state)
+    assert "persist-secret" in _sm._secrets
+    _sm._secrets.pop("persist-secret")
+
+def test_ministack_persist_dynamodb_roundtrip():
+    from ministack.services import dynamodb as _ddb
+    _ddb._tables["persist-tbl"] = {"TableName": "persist-tbl", "pk_name": "pk", "sk_name": None, "items": {}}
+    state = _ddb.get_state()
+    assert "tables" in state
+    _ddb._tables.pop("persist-tbl")
+    _ddb.restore_state(state)
+    assert "persist-tbl" in _ddb._tables
+    _ddb._tables.pop("persist-tbl")
+
+def test_ministack_persist_eventbridge_roundtrip():
+    from ministack.services import eventbridge as _eb
+    _eb._rules["default|persist-rule"] = {"Name": "persist-rule", "State": "ENABLED", "EventPattern": "{}"}
+    state = _eb.get_state()
+    assert "rules" in state
+    _eb._rules.pop("default|persist-rule")
+    _eb.restore_state(state)
+    assert "default|persist-rule" in _eb._rules
+    _eb._rules.pop("default|persist-rule")
+
+def test_ministack_persist_kinesis_roundtrip():
+    from ministack.services import kinesis as _kin
+    _kin._streams["persist-stream"] = {"StreamName": "persist-stream", "StreamStatus": "ACTIVE", "shards": {}}
+    state = _kin.get_state()
+    assert "streams" in state
+    _kin._streams.pop("persist-stream")
+    _kin.restore_state(state)
+    assert "persist-stream" in _kin._streams
+    _kin._streams.pop("persist-stream")
+
+def test_ministack_persist_kms_roundtrip():
+    from ministack.services import kms as _kms
+    key_id = "test-persist-key-id"
+    _kms._keys[key_id] = {"KeyId": key_id, "Description": "persist-key", "KeySpec": "SYMMETRIC_DEFAULT", "_symmetric_key": b"\x00" * 32}
+    state = _kms.get_state()
+    assert "keys" in state
+    _kms._keys.pop(key_id)
+    _kms.restore_state(state)
+    assert key_id in _kms._keys
+    assert _kms._keys[key_id]["Description"] == "persist-key"
+    _kms._keys.pop(key_id)
+
+def test_ministack_persist_ec2_roundtrip():
+    from ministack.services import ec2 as _ec2
+    _ec2._instances["i-persist01"] = {"InstanceId": "i-persist01", "State": {"Name": "running"}}
+    state = _ec2.get_state()
+    assert "instances" in state
+    _ec2._instances.pop("i-persist01")
+    _ec2.restore_state(state)
+    assert "i-persist01" in _ec2._instances
+    _ec2._instances.pop("i-persist01")
+
+def test_ministack_persist_route53_roundtrip():
+    from ministack.services import route53 as _r53
+    _r53._zones["Z00PERSIST"] = {"Id": "Z00PERSIST", "Name": "persist.test."}
+    state = _r53.get_state()
+    assert "zones" in state
+    _r53._zones.pop("Z00PERSIST")
+    _r53.restore_state(state)
+    assert "Z00PERSIST" in _r53._zones
+    _r53._zones.pop("Z00PERSIST")
+
+def test_ministack_persist_cognito_roundtrip():
+    from ministack.services import cognito as _cog
+    _cog._user_pools["us-east-1_PERSIST"] = {"Id": "us-east-1_PERSIST", "Name": "persist-pool"}
+    state = _cog.get_state()
+    assert "user_pools" in state
+    _cog._user_pools.pop("us-east-1_PERSIST")
+    _cog.restore_state(state)
+    assert "us-east-1_PERSIST" in _cog._user_pools
+    _cog._user_pools.pop("us-east-1_PERSIST")
+
+def test_ministack_persist_ecr_roundtrip():
+    from ministack.services import ecr as _ecr
+    _ecr._repositories["persist-repo"] = {"repositoryName": "persist-repo", "repositoryArn": "arn:test"}
+    state = _ecr.get_state()
+    assert "repositories" in state
+    _ecr._repositories.pop("persist-repo")
+    _ecr.restore_state(state)
+    assert "persist-repo" in _ecr._repositories
+    _ecr._repositories.pop("persist-repo")
+
+def test_ministack_persist_cloudwatch_roundtrip():
+    from ministack.services import cloudwatch as _cw
+    _cw._alarms["persist-alarm"] = {"AlarmName": "persist-alarm", "StateValue": "OK"}
+    state = _cw.get_state()
+    assert "alarms" in state
+    _cw._alarms.pop("persist-alarm")
+    _cw.restore_state(state)
+    assert "persist-alarm" in _cw._alarms
+    _cw._alarms.pop("persist-alarm")
+
+def test_ministack_persist_s3_metadata_roundtrip():
+    from ministack.services import s3 as _s3
+    _s3._buckets["persist-bkt"] = {"created": "2025-01-01T00:00:00Z", "objects": {"k": {"body": b"v"}}, "region": "us-east-1"}
+    _s3._bucket_versioning["persist-bkt"] = "Enabled"
+    state = _s3.get_state()
+    assert "buckets_meta" in state
+    # Object bodies must NOT be in the persisted metadata
+    assert "objects" not in state["buckets_meta"].get("persist-bkt", {})
+    assert "bucket_versioning" in state
+    _s3._buckets.pop("persist-bkt")
+    _s3._bucket_versioning.pop("persist-bkt")
+    _s3.restore_state(state)
+    assert "persist-bkt" in _s3._buckets
+    assert _s3._buckets["persist-bkt"]["objects"] == {}  # objects not restored
+    assert _s3._bucket_versioning["persist-bkt"] == "Enabled"
+    _s3._buckets.pop("persist-bkt")
+    _s3._bucket_versioning.pop("persist-bkt")
+
+def test_ministack_persist_lambda_roundtrip():
+    from ministack.services import lambda_svc as _lam
+    _lam._functions["persist-fn"] = {
+        "config": {"FunctionName": "persist-fn", "Runtime": "python3.11"},
+        "code_zip": b"fake-zip-bytes",
+        "versions": {},
+        "next_version": 1,
+    }
+    state = _lam.get_state()
+    assert "functions" in state
+    # code_zip should be base64-encoded in state
+    assert isinstance(state["functions"]["persist-fn"]["code_zip"], str)
+    _lam._functions.pop("persist-fn")
+    _lam.restore_state(state)
+    assert "persist-fn" in _lam._functions
+    # code_zip should be decoded back to bytes
+    assert _lam._functions["persist-fn"]["code_zip"] == b"fake-zip-bytes"
+    _lam._functions.pop("persist-fn")
+
+def test_ministack_persist_rds_roundtrip():
+    from ministack.services import rds as _rds
+    _rds._instances["persist-db"] = {
+        "DBInstanceIdentifier": "persist-db",
+        "Engine": "postgres",
+        "DBInstanceStatus": "available",
+        "_docker_container_id": "fake-container-id",
+    }
+    state = _rds.get_state()
+    assert "instances" in state
+    assert "_docker_container_id" not in state["instances"]["persist-db"]
+    _rds._instances.pop("persist-db")
+    _rds.restore_state(state)
+    assert "persist-db" in _rds._instances
+    assert _rds._instances["persist-db"]["Engine"] == "postgres"
+    _rds._instances.pop("persist-db")
+
+def test_ministack_persist_ecs_roundtrip():
+    from ministack.services import ecs as _ecs
+    _ecs._clusters["persist-cluster"] = {"clusterName": "persist-cluster", "status": "ACTIVE"}
+    _ecs._tasks["arn:persist-task"] = {
+        "taskArn": "arn:persist-task",
+        "lastStatus": "RUNNING",
+        "_docker_ids": ["fake-id"],
+    }
+    state = _ecs.get_state()
+    assert "clusters" in state
+    assert "tasks" in state
+    assert "_docker_ids" not in state["tasks"]["arn:persist-task"]
+    _ecs._clusters.pop("persist-cluster")
+    _ecs._tasks.pop("arn:persist-task")
+    _ecs.restore_state(state)
+    assert "persist-cluster" in _ecs._clusters
+    assert "arn:persist-task" in _ecs._tasks
+    assert _ecs._tasks["arn:persist-task"]["lastStatus"] == "STOPPED"
+    _ecs._clusters.pop("persist-cluster")
+    _ecs._tasks.pop("arn:persist-task")
+
+def test_ministack_persist_elasticache_roundtrip():
+    from ministack.services import elasticache as _ec
+    _ec._clusters["persist-cache"] = {
+        "CacheClusterId": "persist-cache",
+        "Engine": "redis",
+        "CacheClusterStatus": "available",
+        "_docker_container_id": "fake-id",
+    }
+    state = _ec.get_state()
+    assert "clusters" in state
+    assert "_docker_container_id" not in state["clusters"]["persist-cache"]
+    _ec._clusters.pop("persist-cache")
+    _ec.restore_state(state)
+    assert "persist-cache" in _ec._clusters
+    assert _ec._clusters["persist-cache"]["Engine"] == "redis"
+    _ec._clusters.pop("persist-cache")
+
+def test_ministack_persist_stepfunctions_roundtrip():
+    from ministack.services import stepfunctions as _sfn
+    sm_arn = "arn:aws:states:us-east-1:000000000000:stateMachine:persist-sm"
+    _sfn._state_machines[sm_arn] = {
+        "stateMachineArn": sm_arn,
+        "name": "persist-sm",
+        "definition": '{"StartAt":"Pass","States":{"Pass":{"Type":"Pass","End":true}}}',
+        "roleArn": "arn:aws:iam::000000000000:role/sfn",
+        "type": "STANDARD",
+        "status": "ACTIVE",
+    }
+    state = _sfn.get_state()
+    assert "state_machines" in state
+    assert sm_arn in state["state_machines"]
+    _sfn._state_machines.pop(sm_arn)
+    _sfn.restore_state(state)
+    assert sm_arn in _sfn._state_machines
+    assert _sfn._state_machines[sm_arn]["name"] == "persist-sm"
+    _sfn._state_machines.pop(sm_arn)
+
+def test_ministack_persist_stepfunctions_running_marked_failed():
+    from ministack.services import stepfunctions as _sfn
+    run_arn = "arn:aws:states:us-east-1:000000000000:execution:persist-sm:run-1"
+    done_arn = "arn:aws:states:us-east-1:000000000000:execution:persist-sm:done-1"
+    _sfn._executions[run_arn] = {
+        "executionArn": run_arn,
+        "stateMachineArn": "arn:aws:states:us-east-1:000000000000:stateMachine:persist-sm",
+        "status": "RUNNING",
+        "startDate": "2026-01-01T00:00:00.000Z",
+    }
+    _sfn._executions[done_arn] = {
+        "executionArn": done_arn,
+        "stateMachineArn": "arn:aws:states:us-east-1:000000000000:stateMachine:persist-sm",
+        "status": "SUCCEEDED",
+        "startDate": "2026-01-01T00:00:00.000Z",
+        "stopDate": "2026-01-01T00:01:00.000Z",
+        "output": '{"result": "ok"}',
+    }
+    state = _sfn.get_state()
+    _sfn._executions.pop(run_arn)
+    _sfn._executions.pop(done_arn)
+    _sfn.restore_state(state)
+    # RUNNING execution should be marked FAILED
+    restored_run = _sfn._executions[run_arn]
+    assert restored_run["status"] == "FAILED"
+    assert restored_run["error"] == "States.ServiceRestart"
+    assert restored_run["cause"] == "Execution was running when service restarted"
+    assert "stopDate" in restored_run
+    assert restored_run["startDate"] == "2026-01-01T00:00:00.000Z"
+    # SUCCEEDED execution should pass through unchanged
+    restored_done = _sfn._executions[done_arn]
+    assert restored_done["status"] == "SUCCEEDED"
+    assert restored_done["output"] == '{"result": "ok"}'
+    _sfn._executions.pop(run_arn)
+    _sfn._executions.pop(done_arn)
+
+# ========== from test_expect_100_continue.py ==========
+
+"""Regression test for issue #389.
+
+boto3 < 1.40's bundled urllib3 aborts with ``BadStatusLine`` when the server
+replies to ``Expect: 100-continue`` with ``HTTP/1.1 100 \\r\\n`` (empty reason
+phrase). h11's default behaviour is to emit an empty reason; the compat shim in
+``ministack/core/hypercorn_compat.py`` injects the canonical reason phrase so
+the wire output is ``HTTP/1.1 100 Continue\\r\\n``, matching real AWS and every
+SDK we test.
+"""
+
+import os
+import socket
+from urllib.parse import urlparse
+
+
+def test_unit_h11_informational_has_reason_phrase():
+    """h11.InformationalResponse(100, ...) serialises as 'HTTP/1.1 100 Continue' once the patch is installed."""
+    # Import ministack.app triggers the patch; tests usually hit a live server
+    # already, but import it here defensively for isolated runs.
+    import ministack.app  # noqa: F401
+
+    import h11
+
+    conn = h11.Connection(our_role=h11.SERVER)
+    conn.receive_data(
+        b"PUT /foo HTTP/1.1\r\n"
+        b"Host: x\r\n"
+        b"Expect: 100-continue\r\n"
+        b"Content-Length: 4\r\n\r\n"
+    )
+    conn.next_event()
+    out = conn.send(h11.InformationalResponse(status_code=100, headers=[]))
+    assert out is not None
+    assert out.startswith(b"HTTP/1.1 100 Continue\r\n"), \
+        f"expected canonical reason phrase, got: {out!r}"
+
+
+def test_wire_expect_100_continue_returns_canonical_status_line():
+    """End-to-end: a raw PUT with Expect: 100-continue against ministack must
+    receive a 100 Continue with the reason phrase intact (issue #389)."""
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+    parsed = urlparse(endpoint)
+    host = parsed.hostname or "localhost"
+    port = parsed.port or 4566
+
+    # Use a bucket path that exists without having to PUT a real object: any
+    # path that accepts a body will do, because the server must emit the 100
+    # response before the body arrives. We target S3 because that's the SDK
+    # path in the bug report, but any 100-capable endpoint would work.
+    body = b"ministack-issue-389-probe"
+
+    sock = socket.create_connection((host, port), timeout=5)
+    try:
+        request = (
+            f"PUT /ministack-probe-389/key HTTP/1.1\r\n"
+            f"Host: {host}:{port}\r\n"
+            f"Expect: 100-continue\r\n"
+            f"Content-Length: {len(body)}\r\n"
+            f"Content-Type: application/octet-stream\r\n"
+            f"\r\n"
+        ).encode("ascii")
+        sock.sendall(request)
+        # Server must send 100 Continue before we write the body.
+        sock.settimeout(3.0)
+        first_line = b""
+        while b"\r\n" not in first_line:
+            chunk = sock.recv(1)
+            if not chunk:
+                break
+            first_line += chunk
+        assert first_line.startswith(b"HTTP/1.1 100 Continue\r\n"), \
+            f"expected '100 Continue' status line, got: {first_line!r}"
+    finally:
+        sock.close()

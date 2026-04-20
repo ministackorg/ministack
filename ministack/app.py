@@ -592,23 +592,59 @@ async def _handle_ses_v2_request(method: str, path: str, headers: dict, body: by
     return await _get_module("ses_v2").handle_request(method, path, headers, body, query_params)
 
 
-async def _handle_execute_api_request(host: str, path: str, method: str, headers: dict, body: bytes, query_params: dict):
-    """Handle API Gateway execute-api data plane requests."""
-    execute_match = _EXECUTE_API_RE.match(host)
-    if not execute_match:
-        return None
+def _parse_execute_api_url(host: str, path: str) -> tuple[str, str, str] | None:
+    """Resolve an execute-api request into (api_id, stage, execute_path).
 
-    api_id = execute_match.group(1)
-    path_parts = path.lstrip("/").split("/", 1)
-    stage = path_parts[0] if path_parts else "$default"
-    execute_path = "/" + path_parts[1] if len(path_parts) > 1 else "/"
+    Supports three addressing modes, in priority order:
+      1. Host-based (AWS-native):   {apiId}.execute-api.<host>[:port]/{stage}/{path}
+      2. LocalStack-compat (new):   <host>[:port]/_aws/execute-api/{apiId}/{stage}/{path}
+      3. LocalStack-compat (v1):    <host>[:port]/restapis/{apiId}/{stage}/_user_request_/{path}
+
+    The path-based forms exist because (a) browsers on macOS don't resolve
+    `*.localhost` and (b) many HTTP clients can't override the `Host` header
+    (issue #401). Returns ``None`` if none of the three patterns match."""
+    m = _EXECUTE_API_RE.match(host)
+    if m:
+        api_id = m.group(1)
+        parts = path.lstrip("/").split("/", 1)
+        stage = parts[0] if parts and parts[0] else "$default"
+        execute_path = "/" + parts[1] if len(parts) > 1 else "/"
+        return api_id, stage, execute_path
+
+    # LocalStack-compat: /_aws/execute-api/{apiId}/{stage}/{path...}
+    if path.startswith("/_aws/execute-api/"):
+        rest = path[len("/_aws/execute-api/"):]
+        parts = rest.split("/", 2)
+        if len(parts) >= 2 and parts[0]:
+            api_id = parts[0]
+            stage = parts[1] if parts[1] else "$default"
+            execute_path = "/" + parts[2] if len(parts) > 2 else "/"
+            return api_id, stage, execute_path
+
+    # LocalStack v1 legacy: /restapis/{apiId}/{stage}/_user_request_/{path...}
+    if path.startswith("/restapis/"):
+        rest = path[len("/restapis/"):]
+        parts = rest.split("/", 3)
+        if len(parts) >= 3 and parts[2] == "_user_request_":
+            api_id = parts[0]
+            stage = parts[1] if parts[1] else "$default"
+            execute_path = "/" + parts[3] if len(parts) > 3 else "/"
+            return api_id, stage, execute_path
+
+    return None
+
+
+async def _handle_execute_api_request(host: str, path: str, method: str, headers: dict, body: bytes, query_params: dict):
+    """Handle API Gateway execute-api data plane requests (Host-based + path-based)."""
+    parsed = _parse_execute_api_url(host, path)
+    if parsed is None:
+        return None
+    api_id, stage, execute_path = parsed
     try:
-        # WebSocket @connections management API — lives on the execute-api host
-        # at /{stage}/@connections/{connectionId}. Detect and dispatch before
-        # normal REST/HTTP routing.
-        conn_prefix = f"/{stage}/@connections/"
-        if path.startswith(conn_prefix):
-            connection_id = path[len(conn_prefix):].split("/", 1)[0]
+        # WebSocket @connections management API — /{stage}/@connections/{id} in
+        # the Host-based form resolves to execute_path == "/@connections/{id}".
+        if execute_path.startswith("/@connections/"):
+            connection_id = execute_path[len("/@connections/"):].split("/", 1)[0]
             return await _get_module("apigateway").handle_connections_api(
                 method, api_id, stage, connection_id, body, headers
             )
@@ -782,8 +818,9 @@ async def app(scope, receive, send):
         return
 
     if scope["type"] == "websocket":
-        # WebSocket APIs only reach us via the execute-api host pattern:
-        #   ws://{apiId}.execute-api.{host}[:port]/{stage}[/...]
+        # WebSocket APIs are reachable two ways:
+        #   ws://{apiId}.execute-api.{host}[:port]/{stage}[/...]           (Host-based)
+        #   ws://<host>[:port]/_aws/execute-api/{apiId}/{stage}[/...]      (LocalStack-compat path)
         ws_headers = {}
         for name, value in scope.get("headers", []):
             try:
@@ -791,15 +828,18 @@ async def app(scope, receive, send):
             except UnicodeDecodeError:
                 ws_headers[name.decode("latin-1").lower()] = value.decode("latin-1")
         ws_host = ws_headers.get("host", "")
-        m = _EXECUTE_API_RE.match(ws_host)
-        if not m:
+        ws_path = scope.get("path", "")
+        parsed = _parse_execute_api_url(ws_host, ws_path)
+        if not parsed:
             msg = await receive()
             if msg.get("type") == "websocket.connect":
                 await send({"type": "websocket.close", "code": 1008})
             return
-        ws_api_id = m.group(1)
+        ws_api_id, _stage, _execute_path = parsed
         try:
-            await _get_module("apigateway").handle_websocket(scope, receive, send, ws_api_id)
+            await _get_module("apigateway").handle_websocket(
+                scope, receive, send, ws_api_id, path_override=_execute_path,
+            )
         except Exception:
             logger.exception("Error in WebSocket dispatch")
             try:
