@@ -398,9 +398,11 @@ def _act_delete_message(data: dict, qurl: str) -> dict:
     # Only remove messages whose receipt_handle is set and matches.
     # Messages that have never been received (receipt_handle is None) are never
     # accidentally removed by an empty or unrelated receipt handle.
+    found = False
     kept = []
     for m in q["messages"]:
         if m["receipt_handle"] is not None and m["receipt_handle"] == rh:
+            found = True
             # Clear the FIFO dedup cache entry so the same dedup ID can be
             # reused immediately after deletion.  Real AWS keeps a strict
             # 5-minute window, but clearing on delete is more practical for
@@ -412,6 +414,8 @@ def _act_delete_message(data: dict, qurl: str) -> dict:
                 q["dedup_cache"].pop(cache_key, None)
         else:
             kept.append(m)
+    if not found:
+        raise _Err("ReceiptHandleIsInvalid", "The input receipt handle is invalid.")
     q["messages"] = kept
     return {}
 
@@ -423,10 +427,14 @@ def _act_change_visibility(data: dict, qurl: str) -> dict:
     q = _get_q(url)
     rh = data.get("ReceiptHandle", "")
     vt = int(data.get("VisibilityTimeout", 30))
+    found = False
     for m in q["messages"]:
         if m["receipt_handle"] is not None and m["receipt_handle"] == rh:
             m["visible_at"] = time.time() + vt
+            found = True
             break
+    if not found:
+        raise _Err("ReceiptHandleIsInvalid", "The input receipt handle is invalid.")
     return {}
 
 

@@ -376,6 +376,24 @@ def test_sqs_batch_delete_invalid_receipt_handle(sqs):
     assert "bad" in failed_ids
     assert resp["Failed"][0]["Code"] == "ReceiptHandleIsInvalid"
 
+def test_sqs_delete_message_invalid_receipt_handle(sqs):
+    """DeleteMessage with an invalid ReceiptHandle must raise ReceiptHandleIsInvalid."""
+    url = sqs.create_queue(QueueName="intg-sqs-del-invalid")["QueueUrl"]
+    with pytest.raises(ClientError) as exc_info:
+        sqs.delete_message(QueueUrl=url, ReceiptHandle="INVALID-HANDLE-XYZ")
+    assert exc_info.value.response["Error"]["Code"] == "ReceiptHandleIsInvalid"
+    assert exc_info.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+
+
+def test_sqs_change_message_visibility_invalid_receipt_handle(sqs):
+    """ChangeMessageVisibility with an invalid ReceiptHandle must raise ReceiptHandleIsInvalid."""
+    url = sqs.create_queue(QueueName="intg-sqs-vis-invalid")["QueueUrl"]
+    with pytest.raises(ClientError) as exc_info:
+        sqs.change_message_visibility(QueueUrl=url, ReceiptHandle="INVALID-HANDLE-XYZ", VisibilityTimeout=60)
+    assert exc_info.value.response["Error"]["Code"] == "ReceiptHandleIsInvalid"
+    assert exc_info.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+
+
 def test_sqs_receive_max_10(sqs):
     """ReceiveMessage with MaxNumberOfMessages > 10 is capped at 10."""
     url = sqs.create_queue(QueueName="qa-sqs-max10")["QueueUrl"]
