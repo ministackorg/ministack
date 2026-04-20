@@ -92,6 +92,7 @@ def test_ec2_security_group_crud(ec2):
 
     desc = ec2.describe_security_groups(GroupIds=[sg_id])
     assert desc["SecurityGroups"][0]["GroupName"] == "qa-ec2-sg"
+    assert desc["SecurityGroups"][0]["Description"] == "test sg"
 
     ec2.delete_security_group(GroupId=sg_id)
     desc2 = ec2.describe_security_groups()

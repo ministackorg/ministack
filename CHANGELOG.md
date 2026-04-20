@@ -7,6 +7,13 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [1.3.4] — 2026-04-20
+
+### Fixed
+- **`Expect: 100-continue` regression on boto3 < 1.40 (S3 `upload_file`)** — after the uvicorn → hypercorn migration in 1.3.0 (#369), boto3 `< 1.40` S3 uploads that used the `Expect: 100-continue` handshake aborted with `urllib3 BadStatusLine('date: ...')`. Root cause: h11 serialises `InformationalResponse` with an empty reason phrase by default, producing `HTTP/1.1 100 \r\n` on the wire, which older urllib3 parses strictly. ministack now installs a surgical compatibility shim at app import (`ministack.core.hypercorn_compat`) that injects the canonical reason phrase (`Continue`, `Switching Protocols`, etc.) when h11 emits an empty one, restoring the pre-1.3.0 behaviour for every SDK version. Reported by @AlbertodelaCruz. Fixes #389
+
+---
+
 ## [1.3.3] — 2026-04-19
 
 ### Added

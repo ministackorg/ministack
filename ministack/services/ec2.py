@@ -541,7 +541,7 @@ def _describe_images(p):
 
 def _create_security_group(p):
     name = _p(p, "GroupName")
-    desc = _p(p, "Description") or name
+    desc = _p(p, "GroupDescription") or name
     vpc_id = _p(p, "VpcId") or _DEFAULT_VPC_ID
     if not name:
         return _error("MissingParameter", "GroupName is required", 400)
