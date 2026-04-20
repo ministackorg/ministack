@@ -237,6 +237,34 @@ async def app(scope, receive, send):
         await _handle_lifespan(scope, receive, send)
         return
 
+    if scope["type"] == "websocket":
+        # WebSocket APIs only reach us via the execute-api host pattern:
+        #   ws://{apiId}.execute-api.{host}[:port]/{stage}[/...]
+        ws_headers = {}
+        for name, value in scope.get("headers", []):
+            try:
+                ws_headers[name.decode("latin-1").lower()] = value.decode("utf-8")
+            except UnicodeDecodeError:
+                ws_headers[name.decode("latin-1").lower()] = value.decode("latin-1")
+        ws_host = ws_headers.get("host", "")
+        m = _EXECUTE_API_RE.match(ws_host)
+        if not m:
+            # Not an execute-api host — reject the upgrade.
+            msg = await receive()
+            if msg.get("type") == "websocket.connect":
+                await send({"type": "websocket.close", "code": 1008})
+            return
+        ws_api_id = m.group(1)
+        try:
+            await _get_module("apigateway").handle_websocket(scope, receive, send, ws_api_id)
+        except Exception:
+            logger.exception("Error in WebSocket dispatch")
+            try:
+                await send({"type": "websocket.close", "code": 1011})
+            except Exception:
+                pass
+        return
+
     if scope["type"] != "http":
         return
 
@@ -543,7 +571,16 @@ async def app(scope, receive, send):
         stage = path_parts[0] if path_parts else "$default"
         execute_path = "/" + path_parts[1] if len(path_parts) > 1 else "/"
         try:
-            if api_id in _get_module("apigateway_v1")._rest_apis:
+            # WebSocket @connections management API — lives on the execute-api host
+            # at /{stage}/@connections/{connectionId}. Detect and dispatch before
+            # normal REST/HTTP routing.
+            conn_prefix = f"/{stage}/@connections/"
+            if path.startswith(conn_prefix):
+                connection_id = path[len(conn_prefix):].split("/", 1)[0]
+                status, resp_headers, resp_body = await _get_module("apigateway").handle_connections_api(
+                    method, api_id, stage, connection_id, body, headers
+                )
+            elif api_id in _get_module("apigateway_v1")._rest_apis:
                 status, resp_headers, resp_body = await _get_module("apigateway_v1").handle_execute(
                     api_id, stage, method, execute_path, headers, body, query_params
                 )

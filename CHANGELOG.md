@@ -7,6 +7,10 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [Unreleased] — 2026-04-20
+
+### Added
+- **API Gateway v2 WebSocket APIs** — full WebSocket data plane and control plane on the execute-api host (`ws://{apiId}.execute-api.{host}:{port}/{stage}`). `CreateApi(ProtocolType=WEBSOCKET)` defaults `RouteSelectionExpression` to `$request.body.action`; adds full `RouteResponse` and `IntegrationResponse` CRUD (`Create/Get/Update/Delete` under `/v2/apis/{apiId}/routes/{routeId}/routeresponses` and `/integrations/{integrationId}/integrationresponses`). ASGI `websocket` scope is handled end-to-end: on connect, the `$connect` Lambda runs with the handshake's `queryStringParameters` / `multiValueQueryStringParameters` on the event so token-gated connect hooks work like AWS — 2xx accepts, non-2xx rejects. Incoming frames evaluate the API's `RouteSelectionExpression` and dispatch to `$connect` / `$disconnect` / `$default` / custom-action routes; Lambda event matches AWS WebSocket v2 proxy (`requestContext.connectionId` / `routeKey` / `eventType` / `messageId` / `identity.sourceIp`, real `disconnectStatusCode` + `disconnectReason` from the close frame). `AWS`, `AWS_PROXY`, and `MOCK` integration types supported (MOCK returns the first matching `IntegrationResponse.responseTemplates` entry). `@connections` management API served on the execute-api host: `PostToConnection` pushes to a per-connection outbox that the WS session drains (enables server-side push), `GetConnection`, `DeleteConnection`; unknown or closed connections return `410 GoneException`. Connections carry their owning account; cross-API `@connections` lookups are rejected and Lambda invocations run in the owner's context. No new dependencies — upgrade is served by hypercorn; tests use a stdlib-only WS client. Reported by @whittin3
 ## [1.3.4] — 2026-04-20
 
 ### Fixed

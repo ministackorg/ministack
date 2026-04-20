@@ -66,6 +66,15 @@ _stages = AccountScopedDict()        # api_id -> {stage_name -> stage object}
 _deployments = AccountScopedDict()   # api_id -> {deployment_id -> deployment object}
 _authorizers = AccountScopedDict()   # api_id -> {authorizer_id -> authorizer object}
 _api_tags = AccountScopedDict()      # resource_arn -> {key -> value}
+_route_responses = AccountScopedDict()         # api_id -> {route_id -> {rr_id -> route_response}}
+_integration_responses = AccountScopedDict()   # api_id -> {integration_id -> {ir_id -> int_response}}
+
+# WebSocket connection registry — connections are not per-account-scoped at the store level
+# because the @connections management API may arrive on any host/account; instead we store
+# the owning account id inside each connection record and check on access.
+# { connectionId -> {apiId, accountId, stage, connectedAt, sourceIp, outbox (asyncio.Queue),
+#                    close_event (asyncio.Event), lastActiveAt, identity} }
+_ws_connections: dict = {}
 
 
 # ---- Response helpers ----
@@ -95,6 +104,8 @@ def get_state() -> dict:
         "deployments": _deployments,
         "authorizers": _authorizers,
         "api_tags": _api_tags,
+        "route_responses": _route_responses,
+        "integration_responses": _integration_responses,
     }
 
 
@@ -107,6 +118,8 @@ def load_persisted_state(data: dict) -> None:
     _deployments.update(data.get("deployments", {}))
     _authorizers.update(data.get("authorizers", {}))
     _api_tags.update(data.get("api_tags", {}))
+    _route_responses.update(data.get("route_responses", {}))
+    _integration_responses.update(data.get("integration_responses", {}))
 
 
 # ---- Control plane router ----
@@ -166,13 +179,28 @@ async def handle_request(method, path, headers, body, query_params):
             if method == "PATCH":
                 return _update_api(api_id, data)
 
-        # /v2/apis/{apiId}/routes[/{routeId}]
+        # /v2/apis/{apiId}/routes[/{routeId}[/routeresponses[/{routeResponseId}]]]
         if api_id and sub == "routes":
+            rr_segment = parts[5] if len(parts) > 5 else None
+            rr_id = parts[6] if len(parts) > 6 else None
             if not sub_id:
                 if method == "POST":
                     return _create_route(api_id, data)
                 if method == "GET":
                     return _get_routes(api_id)
+            elif rr_segment == "routeresponses":
+                if not rr_id:
+                    if method == "POST":
+                        return _create_route_response(api_id, sub_id, data)
+                    if method == "GET":
+                        return _get_route_responses(api_id, sub_id)
+                else:
+                    if method == "GET":
+                        return _get_route_response(api_id, sub_id, rr_id)
+                    if method == "PATCH":
+                        return _update_route_response(api_id, sub_id, rr_id, data)
+                    if method == "DELETE":
+                        return _delete_route_response(api_id, sub_id, rr_id)
             else:
                 if method == "GET":
                     return _get_route(api_id, sub_id)
@@ -181,13 +209,28 @@ async def handle_request(method, path, headers, body, query_params):
                 if method == "DELETE":
                     return _delete_route(api_id, sub_id)
 
-        # /v2/apis/{apiId}/integrations[/{integrationId}]
+        # /v2/apis/{apiId}/integrations[/{integrationId}[/integrationresponses[/{irId}]]]
         if api_id and sub == "integrations":
+            ir_segment = parts[5] if len(parts) > 5 else None
+            ir_id = parts[6] if len(parts) > 6 else None
             if not sub_id:
                 if method == "POST":
                     return _create_integration(api_id, data)
                 if method == "GET":
                     return _get_integrations(api_id)
+            elif ir_segment == "integrationresponses":
+                if not ir_id:
+                    if method == "POST":
+                        return _create_integration_response(api_id, sub_id, data)
+                    if method == "GET":
+                        return _get_integration_responses(api_id, sub_id)
+                else:
+                    if method == "GET":
+                        return _get_integration_response(api_id, sub_id, ir_id)
+                    if method == "PATCH":
+                        return _update_integration_response(api_id, sub_id, ir_id, data)
+                    if method == "DELETE":
+                        return _delete_integration_response(api_id, sub_id, ir_id)
             else:
                 if method == "GET":
                     return _get_integration(api_id, sub_id)
@@ -428,13 +471,16 @@ async def _invoke_http_proxy(integration, path, method, headers, body, query_par
 
 def _create_api(data):
     api_id = new_uuid()[:8]
+    protocol = data.get("protocolType", "HTTP")
+    # AWS defaults: HTTP → "$request.method $request.path"; WEBSOCKET → "$request.body.action".
+    default_rse = "$request.body.action" if protocol == "WEBSOCKET" else "$request.method $request.path"
     api = {
         "apiId": api_id,
         "name": data.get("name", "unnamed"),
-        "protocolType": data.get("protocolType", "HTTP"),
+        "protocolType": protocol,
         "apiEndpoint": f"http://{api_id}.execute-api.{_HOST}:{_PORT}",
         "createdDate": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "routeSelectionExpression": data.get("routeSelectionExpression", "$request.method $request.path"),
+        "routeSelectionExpression": data.get("routeSelectionExpression", default_rse),
         "apiKeySelectionExpression": data.get("apiKeySelectionExpression", "$request.header.x-api-key"),
         "tags": data.get("tags", {}),
         "disableSchemaValidation": data.get("disableSchemaValidation", False),
@@ -741,3 +787,526 @@ def reset():
     _deployments.clear()
     _authorizers.clear()
     _api_tags.clear()
+    _route_responses.clear()
+    _integration_responses.clear()
+    # Signal any live WS connections to shut down, then drop registry.
+    for conn in list(_ws_connections.values()):
+        ev = conn.get("close_event")
+        if ev is not None:
+            try:
+                ev.set()
+            except Exception:
+                pass
+    _ws_connections.clear()
+
+
+# ==========================================================================
+# Route responses (WebSocket)
+# ==========================================================================
+
+def _create_route_response(api_id, route_id, data):
+    routes = _routes.get(api_id, {})
+    if route_id not in routes:
+        return _apigw_error("NotFoundException", f"Route {route_id} not found", 404)
+    rr_id = new_uuid()[:8]
+    rr = {
+        "routeResponseId": rr_id,
+        "routeResponseKey": data.get("routeResponseKey", "$default"),
+        "modelSelectionExpression": data.get("modelSelectionExpression"),
+        "responseModels": data.get("responseModels", {}),
+        "responseParameters": data.get("responseParameters", {}),
+    }
+    by_route = _route_responses.setdefault(api_id, {}).setdefault(route_id, {})
+    by_route[rr_id] = rr
+    return _apigw_response(rr, 201)
+
+
+def _get_route_responses(api_id, route_id):
+    items = list(_route_responses.get(api_id, {}).get(route_id, {}).values())
+    return _apigw_response({"items": items})
+
+
+def _get_route_response(api_id, route_id, rr_id):
+    rr = _route_responses.get(api_id, {}).get(route_id, {}).get(rr_id)
+    if not rr:
+        return _apigw_error("NotFoundException", f"RouteResponse {rr_id} not found", 404)
+    return _apigw_response(rr)
+
+
+def _update_route_response(api_id, route_id, rr_id, data):
+    rr = _route_responses.get(api_id, {}).get(route_id, {}).get(rr_id)
+    if not rr:
+        return _apigw_error("NotFoundException", f"RouteResponse {rr_id} not found", 404)
+    for k in ("routeResponseKey", "modelSelectionExpression", "responseModels", "responseParameters"):
+        if k in data:
+            rr[k] = data[k]
+    return _apigw_response(rr)
+
+
+def _delete_route_response(api_id, route_id, rr_id):
+    _route_responses.get(api_id, {}).get(route_id, {}).pop(rr_id, None)
+    return 204, {}, b""
+
+
+# ==========================================================================
+# Integration responses (WebSocket)
+# ==========================================================================
+
+def _create_integration_response(api_id, integration_id, data):
+    integs = _integrations.get(api_id, {})
+    if integration_id not in integs:
+        return _apigw_error("NotFoundException", f"Integration {integration_id} not found", 404)
+    ir_id = new_uuid()[:8]
+    ir = {
+        "integrationResponseId": ir_id,
+        "integrationResponseKey": data.get("integrationResponseKey", "$default"),
+        "contentHandlingStrategy": data.get("contentHandlingStrategy"),
+        "templateSelectionExpression": data.get("templateSelectionExpression"),
+        "responseParameters": data.get("responseParameters", {}),
+        "responseTemplates": data.get("responseTemplates", {}),
+    }
+    by_int = _integration_responses.setdefault(api_id, {}).setdefault(integration_id, {})
+    by_int[ir_id] = ir
+    return _apigw_response(ir, 201)
+
+
+def _get_integration_responses(api_id, integration_id):
+    items = list(_integration_responses.get(api_id, {}).get(integration_id, {}).values())
+    return _apigw_response({"items": items})
+
+
+def _get_integration_response(api_id, integration_id, ir_id):
+    ir = _integration_responses.get(api_id, {}).get(integration_id, {}).get(ir_id)
+    if not ir:
+        return _apigw_error("NotFoundException", f"IntegrationResponse {ir_id} not found", 404)
+    return _apigw_response(ir)
+
+
+def _update_integration_response(api_id, integration_id, ir_id, data):
+    ir = _integration_responses.get(api_id, {}).get(integration_id, {}).get(ir_id)
+    if not ir:
+        return _apigw_error("NotFoundException", f"IntegrationResponse {ir_id} not found", 404)
+    for k in ("integrationResponseKey", "contentHandlingStrategy", "templateSelectionExpression",
+              "responseParameters", "responseTemplates"):
+        if k in data:
+            ir[k] = data[k]
+    return _apigw_response(ir)
+
+
+def _delete_integration_response(api_id, integration_id, ir_id):
+    _integration_responses.get(api_id, {}).get(integration_id, {}).pop(ir_id, None)
+    return 204, {}, b""
+
+
+# ==========================================================================
+# WebSocket data plane
+# ==========================================================================
+
+def _api_protocol(api_id: str) -> str | None:
+    """Return the protocolType for an API id, checking all accounts.
+
+    WebSocket connections arrive on the execute-api host before we've resolved
+    which account owns the api. We scan every AccountScopedDict bucket to find
+    the owning account, then return (protocol, account_id).
+    """
+    info = _api_owner(api_id)
+    return info[0] if info else None
+
+
+def _api_owner(api_id: str):
+    """Return (protocolType, owner_account_id) for an API or None if unknown."""
+    # AccountScopedDict stores keys as (account_id, original_key). Walk internals
+    # so we can find the owning account without knowing it up front.
+    for (acct, key), api in _apis._data.items():
+        if key == api_id:
+            return (api.get("protocolType", "HTTP"), acct)
+    return None
+
+
+def _match_ws_route(api_id: str, route_key: str):
+    """Find the route for a WS route key (e.g. '$connect', '$disconnect', '$default',
+    or a custom action like 'sendMessage'). Fallback to $default."""
+    routes = _routes.get(api_id, {})
+    for r in routes.values():
+        if r.get("routeKey") == route_key:
+            return r
+    for r in routes.values():
+        if r.get("routeKey") == "$default":
+            return r
+    return None
+
+
+def _evaluate_route_selection(expr: str, payload_text: str) -> str:
+    """Evaluate a WebSocket RouteSelectionExpression against an incoming frame.
+
+    AWS supports '$request.body.<dotted.path>' (the common case) and any plain
+    literal that the client includes. Anything we can't parse falls back to
+    '$default'.
+    """
+    if not expr:
+        return "$default"
+    if expr.startswith("$request.body."):
+        path = expr[len("$request.body."):]
+        try:
+            obj = json.loads(payload_text) if payload_text else {}
+        except (ValueError, TypeError):
+            return "$default"
+        cur = obj
+        for segment in path.split("."):
+            if isinstance(cur, dict) and segment in cur:
+                cur = cur[segment]
+            else:
+                return "$default"
+        return str(cur) if cur is not None else "$default"
+    return "$default"
+
+
+async def _invoke_ws_lambda(api_id: str, account_id: str, route: dict, stage: str,
+                            connection_id: str, event_type: str, message_id: str,
+                            body_text: str, source_ip: str, headers: dict,
+                            query_params: dict | None = None, **kwargs) -> dict | None:
+    """Invoke a WS route's integration. Returns the integration's response dict or None.
+
+    The event shape matches AWS WebSocket v2 proxy (see docs: "Set up integration
+    request in API Gateway" under WebSocket). Headers include the incoming
+    handshake headers for $connect (along with query string params); for
+    MESSAGE/DISCONNECT the body is the frame payload.
+
+    Integration type handling:
+      - AWS / AWS_PROXY → dispatch to Lambda via the warm worker pool.
+      - MOCK            → synthesise a 200 response (no Lambda). Any
+                          `responseTemplates.$default` on a matching
+                          integration response is returned as the body.
+      - anything else   → returns None (caller treats as "no reply").
+                          AWS itself only supports AWS/AWS_PROXY/MOCK for
+                          WebSocket routes, so this also covers the
+                          never-valid HTTP_PROXY case.
+    """
+    from ministack.core.lambda_runtime import get_or_create_worker
+    from ministack.services import lambda_svc
+
+    integration_id = route.get("target", "").replace("integrations/", "")
+    integration = _integrations.get(api_id, {}).get(integration_id)
+    if not integration:
+        return None
+
+    int_type = integration.get("integrationType", "")
+    if int_type == "MOCK":
+        ir_map = _integration_responses.get(api_id, {}).get(integration_id, {})
+        body = ""
+        for ir in ir_map.values():
+            templates = ir.get("responseTemplates", {}) or {}
+            if "$default" in templates:
+                body = templates["$default"]
+                break
+            if templates:
+                body = next(iter(templates.values()))
+                break
+        return {"statusCode": 200, "body": body}
+
+    if int_type not in ("AWS_PROXY", "AWS"):
+        logger.warning(
+            "WebSocket route %s has unsupported integrationType %r; "
+            "AWS only supports AWS / AWS_PROXY / MOCK for WebSocket APIs",
+            route.get("routeKey"), int_type,
+        )
+        return None
+
+    uri = integration.get("integrationUri", "")
+    func_name = uri.split(":")[-1] if ":" in uri else uri
+    func_name = func_name.replace("/invocations", "")
+    if func_name not in lambda_svc._functions:
+        return None
+
+    request_context = {
+        "routeKey": route.get("routeKey", "$default"),
+        "eventType": event_type,
+        "extendedRequestId": new_uuid(),
+        "requestTime": time.strftime("%d/%b/%Y:%H:%M:%S +0000"),
+        "stage": stage,
+        "connectedAt": int(time.time() * 1000),
+        "requestTimeEpoch": int(time.time() * 1000),
+        "identity": {"sourceIp": source_ip, "userAgent": headers.get("user-agent", "")},
+        "requestId": message_id,
+        "domainName": f"{api_id}.execute-api.{_HOST}",
+        "connectionId": connection_id,
+        "apiId": api_id,
+    }
+    if event_type == "DISCONNECT":
+        # Populated by handle_websocket from the ASGI disconnect message.
+        request_context["disconnectReason"] = kwargs.get("disconnect_reason", "")
+        request_context["disconnectStatusCode"] = int(kwargs.get("disconnect_code", 1005))
+    if event_type == "MESSAGE":
+        request_context["messageId"] = message_id
+
+    event = {
+        "requestContext": request_context,
+        "body": body_text if body_text is not None else "",
+        "isBase64Encoded": False,
+    }
+    if event_type == "CONNECT":
+        event["headers"] = dict(headers)
+        event["multiValueHeaders"] = {k: [v] for k, v in headers.items()}
+        if query_params:
+            # AWS flattens single-valued QS params to string, keeps multi-valued as lists.
+            event["queryStringParameters"] = {
+                k: (v[-1] if isinstance(v, list) else v)
+                for k, v in query_params.items()
+            }
+            event["multiValueQueryStringParameters"] = {
+                k: (v if isinstance(v, list) else [v])
+                for k, v in query_params.items()
+            }
+        else:
+            event["queryStringParameters"] = None
+            event["multiValueQueryStringParameters"] = None
+
+    func_data = lambda_svc._functions[func_name]
+    runtime = func_data["config"].get("Runtime", "")
+    code_zip = func_data.get("code_zip")
+    if code_zip and runtime.startswith(("python", "nodejs")):
+        worker = get_or_create_worker(func_name, func_data["config"], code_zip)
+        result = await asyncio.to_thread(worker.invoke, event, message_id)
+        if result.get("status") == "error":
+            return {"statusCode": 500, "body": result.get("error", "")}
+        return result.get("result", {})
+    # Image/unsupported runtime stub — success without body.
+    return {"statusCode": 200, "body": ""}
+
+
+async def handle_websocket(scope, receive, send, api_id: str):
+    """Drive a WebSocket session for a $WEBSOCKET API.
+
+    Flow:
+      1. Receive `websocket.connect` from ASGI.
+      2. Invoke `$connect` route Lambda (if any). 2xx → accept; else close.
+      3. Loop on `websocket.receive`: evaluate routeSelectionExpression, dispatch
+         to the matching route's Lambda. If the Lambda returns a body, forward it
+         back on the same socket.
+      4. Concurrently drain the per-connection outbox (fed by @connections
+         PostToConnection) and forward messages to the socket.
+      5. On client disconnect, invoke `$disconnect` route Lambda (fire-and-forget).
+    """
+    owner = _api_owner(api_id)
+    if not owner or owner[0] != "WEBSOCKET":
+        # Not a WS API — refuse the upgrade.
+        await receive()  # consume websocket.connect
+        await send({"type": "websocket.close", "code": 1008})
+        return
+
+    protocol, account_id = owner
+
+    # Stage parsing: path is /{stage} or /{stage}/... — execute-api WS URLs are
+    # wss://{apiId}.execute-api.../stage
+    path = scope.get("path", "")
+    path_parts = path.lstrip("/").split("/", 1)
+    stage = path_parts[0] if path_parts and path_parts[0] else "$default"
+
+    headers = {}
+    for name, value in scope.get("headers", []):
+        try:
+            headers[name.decode("latin-1").lower()] = value.decode("utf-8")
+        except UnicodeDecodeError:
+            headers[name.decode("latin-1").lower()] = value.decode("latin-1")
+
+    qs = scope.get("query_string", b"").decode("utf-8")
+    from urllib.parse import parse_qs as _pq
+    query_params = {k: v for k, v in _pq(qs, keep_blank_values=True).items()}
+
+    client = scope.get("client") or ("127.0.0.1", 0)
+    source_ip = client[0] if isinstance(client, (tuple, list)) else "127.0.0.1"
+
+    # Wait for websocket.connect.
+    msg = await receive()
+    if msg.get("type") != "websocket.connect":
+        return
+
+    connection_id = new_uuid().replace("-", "")[:16]
+
+    # Set account context so downstream Lambda invocations see the right tenant.
+    from ministack.core.responses import _request_account_id
+    token = _request_account_id.set(account_id)
+    try:
+        # $connect hook
+        connect_route = _match_ws_route(api_id, "$connect")
+        if connect_route is not None:
+            resp = await _invoke_ws_lambda(
+                api_id, account_id, connect_route, stage, connection_id,
+                "CONNECT", new_uuid(), "", source_ip, headers,
+                query_params=query_params,
+            )
+            status = int((resp or {}).get("statusCode", 200))
+            if status < 200 or status >= 300:
+                await send({"type": "websocket.close", "code": 1008})
+                return
+
+        await send({"type": "websocket.accept"})
+
+        outbox: asyncio.Queue = asyncio.Queue()
+        close_event = asyncio.Event()
+        now_epoch = int(time.time())
+        conn_record = {
+            "apiId": api_id,
+            "accountId": account_id,
+            "stage": stage,
+            # Int epoch seconds — matches ministack JSON timestamp convention.
+            "connectedAt": now_epoch,
+            "lastActiveAt": now_epoch,
+            "sourceIp": source_ip,
+            "identity": {"sourceIp": source_ip, "userAgent": headers.get("user-agent", "")},
+            "outbox": outbox,
+            "close_event": close_event,
+        }
+        _ws_connections[connection_id] = conn_record
+
+        selection_expr = None
+        api_obj = _apis.get(api_id)
+        if api_obj:
+            selection_expr = api_obj.get("routeSelectionExpression", "$request.body.action")
+
+        async def _drain_outbox():
+            while not close_event.is_set():
+                try:
+                    item = await asyncio.wait_for(outbox.get(), timeout=0.5)
+                except asyncio.TimeoutError:
+                    continue
+                if item is None:
+                    return
+                if isinstance(item, bytes):
+                    await send({"type": "websocket.send", "bytes": item})
+                else:
+                    await send({"type": "websocket.send", "text": str(item)})
+
+        drain_task = asyncio.create_task(_drain_outbox())
+
+        disconnect_code = 1005  # 1005 = "no status rcvd" per RFC 6455, matches AWS default
+        disconnect_reason = ""
+        try:
+            while True:
+                message = await receive()
+                mtype = message.get("type")
+                if mtype == "websocket.disconnect":
+                    disconnect_code = int(message.get("code", 1005) or 1005)
+                    # ASGI extension: some servers (incl. modern hypercorn) pass the
+                    # close-frame reason; fall back to empty string if not present.
+                    disconnect_reason = message.get("reason") or ""
+                    break
+                if mtype != "websocket.receive":
+                    continue
+                frame_text = message.get("text")
+                frame_bytes = message.get("bytes")
+                payload = frame_text if frame_text is not None else (
+                    frame_bytes.decode("utf-8", errors="replace") if frame_bytes else ""
+                )
+                conn_record["lastActiveAt"] = int(time.time())
+
+                route_key = _evaluate_route_selection(selection_expr or "", payload)
+                route = _match_ws_route(api_id, route_key)
+                if route is None:
+                    # No $default — AWS sends GoneException to the client; we log and continue.
+                    continue
+                msg_id = new_uuid()
+                resp = await _invoke_ws_lambda(
+                    api_id, account_id, route, stage, connection_id, "MESSAGE",
+                    msg_id, payload, source_ip, headers,
+                )
+                if resp is None:
+                    continue
+                body = resp.get("body")
+                if body:
+                    if isinstance(body, (dict, list)):
+                        body = json.dumps(body)
+                    if isinstance(body, bytes):
+                        await send({"type": "websocket.send", "bytes": body})
+                    else:
+                        await send({"type": "websocket.send", "text": str(body)})
+        finally:
+            close_event.set()
+            try:
+                await drain_task
+            except Exception:
+                pass
+            _ws_connections.pop(connection_id, None)
+            # Fire $disconnect route best-effort.
+            disconnect_route = _match_ws_route(api_id, "$disconnect")
+            if disconnect_route is not None:
+                try:
+                    await _invoke_ws_lambda(
+                        api_id, account_id, disconnect_route, stage, connection_id,
+                        "DISCONNECT", new_uuid(), "", source_ip, headers,
+                        disconnect_code=disconnect_code,
+                        disconnect_reason=disconnect_reason,
+                    )
+                except Exception:
+                    logger.exception("error firing $disconnect")
+            try:
+                await send({"type": "websocket.close", "code": 1000})
+            except Exception:
+                pass
+    finally:
+        try:
+            _request_account_id.reset(token)
+        except Exception:
+            pass
+
+
+# ==========================================================================
+# @connections management API
+# ==========================================================================
+
+async def handle_connections_api(method: str, api_id: str, stage: str,
+                                  connection_id: str, body: bytes, headers: dict):
+    """Serve the @connections runtime API.
+
+    Paths (on execute-api host):
+      POST   /{stage}/@connections/{connectionId}  → PostToConnection
+      GET    /{stage}/@connections/{connectionId}  → GetConnection
+      DELETE /{stage}/@connections/{connectionId}  → DeleteConnection
+
+    AWS behaviour:
+      - 410 Gone      if the connection is unknown or already closed.
+      - 403 Forbidden if the caller does not own the API (not enforced locally).
+      - 200           on success; POST returns empty body, GET returns JSON.
+    """
+    conn = _ws_connections.get(connection_id)
+    if not conn or conn.get("apiId") != api_id:
+        return 410, {"Content-Type": "application/json"}, json.dumps(
+            {"message": "GoneException"}
+        ).encode()
+
+    if method == "POST":
+        # Push the message into the connection outbox; drain_task will forward it.
+        try:
+            if body:
+                await conn["outbox"].put(body)
+        except Exception as exc:
+            return 500, {"Content-Type": "application/json"}, json.dumps(
+                {"message": str(exc)}
+            ).encode()
+        return 200, {"Content-Type": "application/json"}, b""
+
+    if method == "GET":
+        payload = {
+            "ConnectedAt": conn.get("connectedAt"),
+            "Identity": conn.get("identity", {}),
+            "LastActiveAt": conn.get("lastActiveAt"),
+        }
+        return 200, {"Content-Type": "application/json"}, json.dumps(payload).encode()
+
+    if method == "DELETE":
+        ev = conn.get("close_event")
+        if ev is not None:
+            try:
+                ev.set()
+            except Exception:
+                pass
+        # Flush the outbox with a sentinel so drain_task exits promptly.
+        try:
+            await conn["outbox"].put(None)
+        except Exception:
+            pass
+        return 204, {}, b""
+
+    return 405, {"Content-Type": "application/json"}, json.dumps(
+        {"message": f"Method {method} not allowed on @connections"}
+    ).encode()
