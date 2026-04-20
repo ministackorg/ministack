@@ -12,13 +12,14 @@ from collections import defaultdict
 
 import yaml
 
-from ministack.core.responses import get_account_id, new_uuid
+from ministack.core.responses import get_account_id, get_region, new_uuid
 
 # Sentinel for AWS::NoValue
 _NO_VALUE = object()
 
+# REGION kept for backwards compat with old imports; new code must prefer
+# get_region() so AWS::Region reflects the caller's request region (#398).
 REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
-# Note: get_account_id()/REGION duplicated here to keep engine.py free of __init__ imports (avoids circular deps)
 
 
 # ===========================================================================
@@ -252,7 +253,7 @@ def _resolve_refs(value, resources, params, conditions, mappings,
         pseudo = {
             "AWS::StackName": stack_name,
             "AWS::StackId": stack_id,
-            "AWS::Region": REGION,
+            "AWS::Region": get_region(),
             "AWS::AccountId": get_account_id(),
             "AWS::NoValue": _NO_VALUE,
             "AWS::URLSuffix": "amazonaws.com",
@@ -318,7 +319,7 @@ def _resolve_refs(value, resources, params, conditions, mappings,
             pseudo = {
                 "AWS::StackName": stack_name,
                 "AWS::StackId": stack_id,
-                "AWS::Region": REGION,
+                "AWS::Region": get_region(),
                 "AWS::AccountId": get_account_id(),
                 "AWS::URLSuffix": "amazonaws.com",
                 "AWS::Partition": "aws",
@@ -407,7 +408,7 @@ def _resolve_refs(value, resources, params, conditions, mappings,
         region = _resolve_refs(value["Fn::GetAZs"], resources, params,
                                conditions, mappings, stack_name, stack_id)
         if not region:
-            region = REGION
+            region = get_region()
         return [f"{region}a", f"{region}b", f"{region}c"]
 
     # --- Fn::Cidr ---

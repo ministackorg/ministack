@@ -12,7 +12,7 @@ import time
 import zipfile
 from collections import defaultdict
 
-from ministack.core.responses import get_account_id, new_uuid, now_iso
+from ministack.core.responses import get_account_id, get_region, new_uuid, now_iso
 
 import ministack.services.s3 as _s3
 import ministack.services.sqs as _sqs
@@ -48,6 +48,8 @@ import ministack.services.codebuild as _codebuild
 
 logger = logging.getLogger("cloudformation")
 
+# Module-level REGION kept for legacy imports; new code must use get_region()
+# so AWS::Region / ARNs reflect the caller's request region (#398).
 REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 
 
@@ -105,7 +107,7 @@ def _s3_create(logical_id, props, stack_name):
     _s3._buckets[name] = {
         "created": now_iso(),
         "objects": {},
-        "region": REGION,
+        "region": get_region(),
     }
     versioning = props.get("VersioningConfiguration", {})
     if versioning.get("Status") == "Enabled":
@@ -113,8 +115,8 @@ def _s3_create(logical_id, props, stack_name):
     attrs = {
         "Arn": f"arn:aws:s3:::{name}",
         "DomainName": f"{name}.s3.amazonaws.com",
-        "RegionalDomainName": f"{name}.s3.{REGION}.amazonaws.com",
-        "WebsiteURL": f"http://{name}.s3-website-{REGION}.amazonaws.com",
+        "RegionalDomainName": f"{name}.s3.{get_region()}.amazonaws.com",
+        "WebsiteURL": f"http://{name}.s3-website-{get_region()}.amazonaws.com",
     }
     return name, attrs
 
@@ -151,7 +153,7 @@ def _sqs_create(logical_id, props, stack_name):
     name = props.get("QueueName") or _physical_name(stack_name, logical_id, max_len=80)
     is_fifo = name.endswith(".fifo")
     url = f"http://{_sqs.DEFAULT_HOST}:{_sqs.DEFAULT_PORT}/{get_account_id()}/{name}"
-    arn = f"arn:aws:sqs:{REGION}:{get_account_id()}:{name}"
+    arn = f"arn:aws:sqs:{get_region()}:{get_account_id()}:{name}"
     now_ts = str(int(time.time()))
 
     attributes = {
@@ -194,7 +196,7 @@ def _sqs_delete(physical_id, props):
 
 def _sns_create(logical_id, props, stack_name):
     name = props.get("TopicName") or _physical_name(stack_name, logical_id, max_len=256)
-    arn = f"arn:aws:sns:{REGION}:{get_account_id()}:{name}"
+    arn = f"arn:aws:sns:{get_region()}:{get_account_id()}:{name}"
     default_policy = json.dumps({
         "Version": "2008-10-17",
         "Id": "__default_policy_ID",
@@ -307,7 +309,7 @@ def _sns_sub_delete(physical_id, props):
 
 def _ddb_create(logical_id, props, stack_name):
     name = props.get("TableName") or _physical_name(stack_name, logical_id, max_len=255)
-    arn = f"arn:aws:dynamodb:{REGION}:{get_account_id()}:table/{name}"
+    arn = f"arn:aws:dynamodb:{get_region()}:{get_account_id()}:table/{name}"
 
     key_schema = props.get("KeySchema", [])
     pk_name = None
@@ -385,7 +387,7 @@ def _zip_inline(source: str | None, handler: str, runtime: str = "python3.12") -
 
 def _lambda_create(logical_id, props, stack_name):
     name = props.get("FunctionName") or _physical_name(stack_name, logical_id, max_len=64)
-    arn = f"arn:aws:lambda:{REGION}:{get_account_id()}:function:{name}"
+    arn = f"arn:aws:lambda:{get_region()}:{get_account_id()}:function:{name}"
     runtime = props.get("Runtime", "python3.12")
     handler = props.get("Handler", "index.handler")
     role = props.get("Role", f"arn:aws:iam::{get_account_id()}:role/dummy-role")
@@ -584,7 +586,7 @@ def _ssm_create(logical_id, props, stack_name):
     value = props.get("Value", "")
     description = props.get("Description", "")
     # ARN: no extra slash if name starts with /
-    param_arn = f"arn:aws:ssm:{REGION}:{get_account_id()}:parameter{name}"
+    param_arn = f"arn:aws:ssm:{get_region()}:{get_account_id()}:parameter{name}"
 
     _ssm._parameters[name] = {
         "Name": name,
@@ -610,7 +612,7 @@ def _ssm_delete(physical_id, props):
 
 def _cwlogs_create(logical_id, props, stack_name):
     name = props.get("LogGroupName") or f"/aws/cloudformation/{stack_name}/{logical_id}"
-    arn = f"arn:aws:logs:{REGION}:{get_account_id()}:log-group:{name}:*"
+    arn = f"arn:aws:logs:{get_region()}:{get_account_id()}:log-group:{name}:*"
     retention = props.get("RetentionInDays")
 
     _cw_logs._log_groups[name] = {
@@ -634,7 +636,7 @@ def _eb_rule_create(logical_id, props, stack_name):
     name = props.get("Name") or _physical_name(stack_name, logical_id, max_len=64)
     bus = props.get("EventBusName", "default")
     key = _eb._rule_key(name, bus)
-    arn = f"arn:aws:events:{REGION}:{get_account_id()}:rule/{bus}/{name}"
+    arn = f"arn:aws:events:{get_region()}:{get_account_id()}:rule/{bus}/{name}"
 
     _eb._rules[key] = {
         "Name": name,
@@ -782,7 +784,7 @@ def _eb_event_bus_create(logical_id, props, stack_name):
         "Tags": props.get("Tags", []),
     }
     _eb._create_event_bus(data)
-    arn = f"arn:aws:events:{REGION}:{get_account_id()}:event-bus/{name}"
+    arn = f"arn:aws:events:{get_region()}:{get_account_id()}:event-bus/{name}"
     return name, {"Arn": arn, "Name": name}
 
 
@@ -812,7 +814,7 @@ def _kinesis_stream_create(logical_id, props, stack_name):
     if retention > 8760:
         retention = 8760
 
-    arn = f"arn:aws:kinesis:{REGION}:{get_account_id()}:stream/{name}"
+    arn = f"arn:aws:kinesis:{get_region()}:{get_account_id()}:stream/{name}"
     stream_id = new_uuid()
 
     _kinesis._streams[name] = {
@@ -895,7 +897,7 @@ def _lambda_version_create(logical_id, props, stack_name):
             "code_zip": func.get("code_zip"),
         }
         return ver_arn, {"Version": ver_str}
-    ver_arn = f"arn:aws:lambda:{REGION}:{get_account_id()}:function:{func_name}:1"
+    ver_arn = f"arn:aws:lambda:{get_region()}:{get_account_id()}:function:{func_name}:1"
     return ver_arn, {"Version": "1"}
 
 
@@ -910,7 +912,7 @@ def _cfn_wait_condition_create(logical_id, props, stack_name):
 def _cfn_wait_condition_handle_create(logical_id, props, stack_name):
     """WaitConditionHandle — no-op, return a presigned-style URL."""
     pid = f"{stack_name}-{logical_id}-{new_uuid()[:8]}"
-    url = f"https://cloudformation-waitcondition-{REGION}.s3.amazonaws.com/{pid}"
+    url = f"https://cloudformation-waitcondition-{get_region()}.s3.amazonaws.com/{pid}"
     return pid, {"Ref": url}
 
 
@@ -938,7 +940,7 @@ def _apigw_rest_api_create(logical_id, props, stack_name):
             break
     return api_id, {
         "RootResourceId": root_id,
-        "Arn": f"arn:aws:apigateway:{REGION}::/restapis/{api_id}",
+        "Arn": f"arn:aws:apigateway:{get_region()}::/restapis/{api_id}",
     }
 
 
@@ -1061,7 +1063,7 @@ def _lambda_esm_create(logical_id, props, stack_name):
         func_name = func_name.rsplit(":", 1)[-1]
     esm_id = new_uuid()
     func = _lambda_svc._functions.get(func_name)
-    func_arn = func["config"]["FunctionArn"] if func else f"arn:aws:lambda:{REGION}:{get_account_id()}:function:{func_name}"
+    func_arn = func["config"]["FunctionArn"] if func else f"arn:aws:lambda:{get_region()}:{get_account_id()}:function:{func_name}"
 
     esm = {
         "UUID": esm_id,
@@ -1127,7 +1129,7 @@ def _lambda_alias_create(logical_id, props, stack_name):
     func = _lambda_svc._functions.get(func_name)
     if func:
         alias = {
-            "AliasArn": f"arn:aws:lambda:{REGION}:{get_account_id()}:function:{func_name}:{alias_name}",
+            "AliasArn": f"arn:aws:lambda:{get_region()}:{get_account_id()}:function:{func_name}:{alias_name}",
             "Name": alias_name,
             "FunctionVersion": func_version,
             "Description": props.get("Description", ""),
@@ -1139,7 +1141,7 @@ def _lambda_alias_create(logical_id, props, stack_name):
         func["aliases"][alias_name] = alias
         return alias["AliasArn"], {"AliasArn": alias["AliasArn"]}
 
-    alias_arn = f"arn:aws:lambda:{REGION}:{get_account_id()}:function:{func_name}:{alias_name}"
+    alias_arn = f"arn:aws:lambda:{get_region()}:{get_account_id()}:function:{func_name}:{alias_name}"
     return alias_arn, {"AliasArn": alias_arn}
 
 
@@ -1207,12 +1209,12 @@ def _appsync_api_create(logical_id, props, stack_name):
     name = props.get("Name") or _physical_name(stack_name, logical_id)
     auth_type = props.get("AuthenticationType", "API_KEY")
     api_id = new_uuid()[:8]
-    arn = f"arn:aws:appsync:{REGION}:{get_account_id()}:apis/{api_id}"
+    arn = f"arn:aws:appsync:{get_region()}:{get_account_id()}:apis/{api_id}"
     now = _time.time()
     _appsync._apis[api_id] = {
         "apiId": api_id, "name": name, "authenticationType": auth_type,
         "arn": arn,
-        "uris": {"GRAPHQL": f"https://{api_id}.appsync-api.{REGION}.amazonaws.com/graphql"},
+        "uris": {"GRAPHQL": f"https://{api_id}.appsync-api.{get_region()}.amazonaws.com/graphql"},
         "createdAt": now, "lastUpdatedAt": now,
         "additionalAuthenticationProviders": props.get("AdditionalAuthenticationProviders", []),
         "xrayEnabled": False,
@@ -1221,7 +1223,7 @@ def _appsync_api_create(logical_id, props, stack_name):
     _appsync._data_sources[api_id] = {}
     _appsync._resolvers[api_id] = {}
     _appsync._types[api_id] = {}
-    return api_id, {"ApiId": api_id, "Arn": arn, "GraphQLUrl": f"https://{api_id}.appsync-api.{REGION}.amazonaws.com/graphql"}
+    return api_id, {"ApiId": api_id, "Arn": arn, "GraphQLUrl": f"https://{api_id}.appsync-api.{get_region()}.amazonaws.com/graphql"}
 
 
 def _appsync_api_delete(physical_id, props):
@@ -1245,9 +1247,9 @@ def _appsync_ds_create(logical_id, props, stack_name):
         body["serviceRoleArn"] = props["ServiceRoleArn"]
     _appsync._data_sources.setdefault(api_id, {})[name] = {
         "name": name, "type": ds_type, **body,
-        "dataSourceArn": f"arn:aws:appsync:{REGION}:{get_account_id()}:apis/{api_id}/datasources/{name}",
+        "dataSourceArn": f"arn:aws:appsync:{get_region()}:{get_account_id()}:apis/{api_id}/datasources/{name}",
     }
-    return f"{api_id}/{name}", {"Name": name, "DataSourceArn": f"arn:aws:appsync:{REGION}:{get_account_id()}:apis/{api_id}/datasources/{name}"}
+    return f"{api_id}/{name}", {"Name": name, "DataSourceArn": f"arn:aws:appsync:{get_region()}:{get_account_id()}:apis/{api_id}/datasources/{name}"}
 
 
 def _appsync_ds_delete(physical_id, props):
@@ -1264,7 +1266,7 @@ def _appsync_resolver_create(logical_id, props, stack_name):
     resolver = {
         "typeName": type_name, "fieldName": field_name,
         "dataSourceName": ds_name,
-        "resolverArn": f"arn:aws:appsync:{REGION}:{get_account_id()}:apis/{api_id}/types/{type_name}/resolvers/{field_name}",
+        "resolverArn": f"arn:aws:appsync:{get_region()}:{get_account_id()}:apis/{api_id}/types/{type_name}/resolvers/{field_name}",
     }
     if props.get("RequestMappingTemplate"):
         resolver["requestMappingTemplate"] = props["RequestMappingTemplate"]
@@ -1298,7 +1300,7 @@ def _appsync_apikey_create(logical_id, props, stack_name):
         "expires": props.get("Expires", int(time.time()) + 604800),
     }
     _appsync._api_keys.setdefault(api_id, {})[key_id] = key
-    return key_id, {"ApiKey": key_id, "Arn": f"arn:aws:appsync:{REGION}:{get_account_id()}:apis/{api_id}/apikeys/{key_id}"}
+    return key_id, {"ApiKey": key_id, "Arn": f"arn:aws:appsync:{get_region()}:{get_account_id()}:apis/{api_id}/apikeys/{key_id}"}
 
 
 def _appsync_apikey_delete(physical_id, props):
@@ -1333,7 +1335,7 @@ def _sm_secret_create(logical_id, props, stack_name):
         else:
             secret_string = generated
 
-    arn = f"arn:aws:secretsmanager:{REGION}:{get_account_id()}:secret:{name}-{new_uuid()[:6]}"
+    arn = f"arn:aws:secretsmanager:{get_region()}:{get_account_id()}:secret:{name}-{new_uuid()[:6]}"
     import time as _time
     _sm._secrets[name] = {
         "ARN": arn, "Name": name, "Description": props.get("Description", ""),
@@ -1399,7 +1401,7 @@ def _cognito_user_pool_create(logical_id, props, stack_name):
     }
     _cognito._user_pools[pid] = pool
     arn = _cognito._pool_arn(pid)
-    provider_name = f"cognito-idp.{REGION}.amazonaws.com/{pid}"
+    provider_name = f"cognito-idp.{get_region()}.amazonaws.com/{pid}"
     return pid, {"Arn": arn, "ProviderName": provider_name}
 
 
@@ -1500,12 +1502,12 @@ def _cognito_user_pool_domain_delete(physical_id, props):
 
 def _ecr_repo_create(logical_id, props, stack_name):
     name = props.get("RepositoryName", f"{stack_name}-{logical_id}".lower())
-    arn = f"arn:aws:ecr:{REGION}:{get_account_id()}:repository/{name}"
+    arn = f"arn:aws:ecr:{get_region()}:{get_account_id()}:repository/{name}"
     _ecr._repositories[name] = {
         "repositoryName": name,
         "repositoryArn": arn,
         "registryId": get_account_id(),
-        "repositoryUri": f"{get_account_id()}.dkr.ecr.{REGION}.amazonaws.com/{name}",
+        "repositoryUri": f"{get_account_id()}.dkr.ecr.{get_region()}.amazonaws.com/{name}",
         "createdAt": __import__("time").time(),
         "imageTagMutability": props.get("ImageTagMutability", "MUTABLE"),
         "imageScanningConfiguration": props.get("ImageScanningConfiguration", {"scanOnPush": False}),
@@ -1542,7 +1544,7 @@ def _codebuild_project_create(logical_id, props, stack_name):
         "serviceRole": props.get("ServiceRole", f"arn:aws:iam::{get_account_id()}:role/codebuild-role"),
         "timeoutInMinutes": int(props.get("TimeoutInMinutes", 60)),
         "tags": [{"key": t["Key"], "value": t["Value"]} for t in props.get("Tags", [])],
-        "encryptionKey": props.get("EncryptionKey", f"arn:aws:kms:{REGION}:{get_account_id()}:alias/aws/codebuild"),
+        "encryptionKey": props.get("EncryptionKey", f"arn:aws:kms:{get_region()}:{get_account_id()}:alias/aws/codebuild"),
     }
     _codebuild._create_project(data)
     arn = _codebuild._project_arn(name)
@@ -1583,7 +1585,7 @@ def _iam_managed_policy_delete(physical_id, props):
 
 def _kms_key_create(logical_id, props, stack_name):
     key_id = new_uuid()
-    arn = f"arn:aws:kms:{REGION}:{get_account_id()}:key/{key_id}"
+    arn = f"arn:aws:kms:{get_region()}:{get_account_id()}:key/{key_id}"
     _kms._keys[key_id] = {
         "KeyId": key_id,
         "Arn": arn,
@@ -1655,7 +1657,7 @@ def _ec2_vpc_create(logical_id, props, stack_name):
         "OwnerId": get_account_id(), "DefaultNetworkAclId": acl_id,
         "DefaultSecurityGroupId": sg_id, "MainRouteTableId": rtb_id,
     }
-    arn = f"arn:aws:ec2:{REGION}:{get_account_id()}:vpc/{vpc_id}"
+    arn = f"arn:aws:ec2:{get_region()}:{get_account_id()}:vpc/{vpc_id}"
     return vpc_id, {"VpcId": vpc_id, "DefaultSecurityGroup": sg_id, "DefaultNetworkAcl": acl_id}
 
 
@@ -1667,7 +1669,7 @@ def _ec2_subnet_create(logical_id, props, stack_name):
     import random, string
     vpc_id = props.get("VpcId", "")
     cidr = props.get("CidrBlock", "10.0.1.0/24")
-    az = props.get("AvailabilityZone", f"{REGION}a")
+    az = props.get("AvailabilityZone", f"{get_region()}a")
     subnet_id = _ec2._new_subnet_id()
     _ec2._subnets[subnet_id] = {
         "SubnetId": subnet_id,
@@ -1721,7 +1723,7 @@ def _ec2_sg_create(logical_id, props, stack_name):
             perm["IpRanges"].append({"CidrIp": rule["CidrIp"]})
         _ec2._security_groups[sg_id]["IpPermissions"].append(perm)
 
-    arn = f"arn:aws:ec2:{REGION}:{get_account_id()}:security-group/{sg_id}"
+    arn = f"arn:aws:ec2:{get_region()}:{get_account_id()}:security-group/{sg_id}"
     return sg_id, {"GroupId": sg_id, "VpcId": vpc_id, "Arn": arn}
 
 
@@ -1832,7 +1834,7 @@ def _ec2_subnet_rtb_assoc_delete(physical_id, props):
 
 def _ecs_cluster_create(logical_id, props, stack_name):
     name = props.get("ClusterName", f"{stack_name}-{logical_id}")
-    arn = f"arn:aws:ecs:{REGION}:{get_account_id()}:cluster/{name}"
+    arn = f"arn:aws:ecs:{get_region()}:{get_account_id()}:cluster/{name}"
     _ecs._clusters[name] = {
         "clusterArn": arn,
         "clusterName": name,
@@ -1886,7 +1888,7 @@ def _ecs_task_def_create(logical_id, props, stack_name):
     family = props.get("Family", f"{stack_name}-{logical_id}")
     revision = 1
     td_key = f"{family}:{revision}"
-    arn = f"arn:aws:ecs:{REGION}:{get_account_id()}:task-definition/{td_key}"
+    arn = f"arn:aws:ecs:{get_region()}:{get_account_id()}:task-definition/{td_key}"
     td = {
         "taskDefinitionArn": arn,
         "family": family,
@@ -1926,7 +1928,7 @@ def _ecs_service_create(logical_id, props, stack_name):
         "networkConfiguration": props.get("NetworkConfiguration", {}),
         "tags": [{"key": t["Key"], "value": t["Value"]} for t in props.get("Tags", [])],
     })
-    arn = f"arn:aws:ecs:{REGION}:{get_account_id()}:service/{cluster}/{name}"
+    arn = f"arn:aws:ecs:{get_region()}:{get_account_id()}:service/{cluster}/{name}"
     return arn, {"ServiceArn": arn, "Name": name}
 
 
@@ -2006,10 +2008,10 @@ def _elbv2_load_balancer_create(logical_id, props, stack_name):
     )
     lb_id = _alb._short_id()
     arn = (
-        f"arn:aws:elasticloadbalancing:{REGION}:{get_account_id()}:"
+        f"arn:aws:elasticloadbalancing:{get_region()}:{get_account_id()}:"
         f"loadbalancer/app/{name}/{lb_id}"
     )
-    dns_name = f"{name}-{lb_id[:8]}.{REGION}.elb.amazonaws.com"
+    dns_name = f"{name}-{lb_id[:8]}.{get_region()}.elb.amazonaws.com"
     lb = {
         "LoadBalancerArn": arn,
         "LoadBalancerName": name,
@@ -2080,7 +2082,7 @@ def _elbv2_listener_create(logical_id, props, stack_name):
     lb_name = lb["LoadBalancerName"]
     lb_id = lb_arn.split("/")[-1]
     listener_arn = (
-        f"arn:aws:elasticloadbalancing:{REGION}:{get_account_id()}:"
+        f"arn:aws:elasticloadbalancing:{get_region()}:{get_account_id()}:"
         f"listener/app/{lb_name}/{lb_id}/{listener_id}"
     )
 
@@ -2121,7 +2123,7 @@ def _elbv2_listener_create(logical_id, props, stack_name):
     # Match alb service semantics: create a default rule for every listener.
     rule_id = _alb._short_id()
     rule_arn = (
-        f"arn:aws:elasticloadbalancing:{REGION}:{get_account_id()}:"
+        f"arn:aws:elasticloadbalancing:{get_region()}:{get_account_id()}:"
         f"listener-rule/app/{lb_name}/{lb_id}/{listener_id}/{rule_id}"
     )
     _alb._rules[rule_arn] = {
@@ -2168,7 +2170,7 @@ def _lambda_layer_create(logical_id, props, stack_name):
     if s3_bucket and s3_key:
         zip_data = _s3._get_object_data(s3_bucket, s3_key)
 
-    layer_arn = f"arn:aws:lambda:{REGION}:{get_account_id()}:layer:{layer_name}"
+    layer_arn = f"arn:aws:lambda:{get_region()}:{get_account_id()}:layer:{layer_name}"
     version_arn = f"{layer_arn}:{ver}"
 
     ver_config = {
@@ -2212,7 +2214,7 @@ def _sfn_state_machine_create(logical_id, props, stack_name):
         definition = _json.dumps(definition)
     sm_type = props.get("StateMachineType", "STANDARD")
 
-    arn = f"arn:aws:states:{REGION}:{get_account_id()}:stateMachine:{name}"
+    arn = f"arn:aws:states:{get_region()}:{get_account_id()}:stateMachine:{name}"
     ts = now_iso()
     _sfn._state_machines[arn] = {
         "stateMachineArn": arn,
@@ -2423,7 +2425,7 @@ def _cw_metric_alarm_create(logical_id, props, stack_name):
 
     alarm = {
         "AlarmName": name,
-        "AlarmArn": f"arn:aws:cloudwatch:{REGION}:{get_account_id()}:alarm:{name}",
+        "AlarmArn": f"arn:aws:cloudwatch:{get_region()}:{get_account_id()}:alarm:{name}",
         "AlarmDescription": props.get("AlarmDescription", "") or "",
         "MetricName": metric_name,
         "Namespace": namespace,
@@ -2553,7 +2555,7 @@ def _waf_web_acl_create(logical_id, props, stack_name):
     uid = new_uuid()
     lock_token = new_uuid()
     scope = props.get("Scope", "REGIONAL")
-    arn = f"arn:aws:wafv2:{REGION}:{get_account_id()}:{scope.lower()}/webacl/{name}/{uid}"
+    arn = f"arn:aws:wafv2:{get_region()}:{get_account_id()}:{scope.lower()}/webacl/{name}/{uid}"
     _waf._web_acls[uid] = {
         "ARN": arn, "Id": uid, "Name": name,
         "Description": props.get("Description", ""),
@@ -2609,7 +2611,7 @@ def _rds_db_cluster_create(logical_id, props, stack_name):
     engine = props.get("Engine", "aurora-postgresql")
     engine_version = props.get("EngineVersion", "15.4")
     master_user = props.get("MasterUsername", "admin")
-    arn = f"arn:aws:rds:{REGION}:{get_account_id()}:cluster:{cluster_id}"
+    arn = f"arn:aws:rds:{get_region()}:{get_account_id()}:cluster:{cluster_id}"
     suffix = new_uuid()[:8]
 
     _rds._clusters[cluster_id] = {
@@ -2621,11 +2623,11 @@ def _rds_db_cluster_create(logical_id, props, stack_name):
         "Status": "available",
         "MasterUsername": master_user,
         "DatabaseName": props.get("DatabaseName", ""),
-        "Endpoint": f"{cluster_id}.cluster-{suffix}.{REGION}.rds.amazonaws.com",
-        "ReaderEndpoint": f"{cluster_id}.cluster-ro-{suffix}.{REGION}.rds.amazonaws.com",
+        "Endpoint": f"{cluster_id}.cluster-{suffix}.{get_region()}.rds.amazonaws.com",
+        "ReaderEndpoint": f"{cluster_id}.cluster-ro-{suffix}.{get_region()}.rds.amazonaws.com",
         "Port": int(props.get("Port", 5432)),
         "MultiAZ": props.get("MultiAZ", False),
-        "AvailabilityZones": [f"{REGION}a", f"{REGION}b", f"{REGION}c"],
+        "AvailabilityZones": [f"{get_region()}a", f"{get_region()}b", f"{get_region()}c"],
         "DBClusterMembers": [],
         "VpcSecurityGroups": [],
         "DBSubnetGroup": props.get("DBSubnetGroupName", "default"),
@@ -2639,9 +2641,9 @@ def _rds_db_cluster_create(logical_id, props, stack_name):
     return cluster_id, {
         "Arn": arn,
         "ClusterResourceId": f"cluster-{new_uuid()[:20]}",
-        "Endpoint.Address": f"{cluster_id}.cluster-{suffix}.{REGION}.rds.amazonaws.com",
+        "Endpoint.Address": f"{cluster_id}.cluster-{suffix}.{get_region()}.rds.amazonaws.com",
         "Endpoint.Port": str(int(props.get("Port", 5432))),
-        "ReadEndpoint.Address": f"{cluster_id}.cluster-ro-{suffix}.{REGION}.rds.amazonaws.com",
+        "ReadEndpoint.Address": f"{cluster_id}.cluster-ro-{suffix}.{get_region()}.rds.amazonaws.com",
     }
 
 
@@ -2655,7 +2657,7 @@ def _rds_db_cluster_delete(physical_id, props):
 
 def _asg_create(logical_id, props, stack_name):
     name = props.get("AutoScalingGroupName") or _physical_name(stack_name, logical_id, max_len=255)
-    arn = f"arn:aws:autoscaling:{REGION}:{get_account_id()}:autoScalingGroup:{new_uuid()}:autoScalingGroupName/{name}"
+    arn = f"arn:aws:autoscaling:{get_region()}:{get_account_id()}:autoScalingGroup:{new_uuid()}:autoScalingGroupName/{name}"
     asg = {
         "AutoScalingGroupName": name,
         "AutoScalingGroupARN": arn,
@@ -2665,7 +2667,7 @@ def _asg_create(logical_id, props, stack_name):
         "MaxSize": int(props.get("MaxSize", 0)),
         "DesiredCapacity": int(props.get("DesiredCapacity", props.get("MinSize", 0))),
         "DefaultCooldown": int(props.get("Cooldown", 300)),
-        "AvailabilityZones": props.get("AvailabilityZones", [f"{REGION}a"]),
+        "AvailabilityZones": props.get("AvailabilityZones", [f"{get_region()}a"]),
         "HealthCheckType": props.get("HealthCheckType", "EC2"),
         "HealthCheckGracePeriod": int(props.get("HealthCheckGracePeriod", 300)),
         "Instances": [],
@@ -2705,7 +2707,7 @@ def _asg_delete(physical_id, props):
 
 def _asg_lc_create(logical_id, props, stack_name):
     name = props.get("LaunchConfigurationName") or _physical_name(stack_name, logical_id, max_len=255)
-    arn = f"arn:aws:autoscaling:{REGION}:{get_account_id()}:launchConfiguration:{new_uuid()}:launchConfigurationName/{name}"
+    arn = f"arn:aws:autoscaling:{get_region()}:{get_account_id()}:launchConfiguration:{new_uuid()}:launchConfigurationName/{name}"
     _asg._launch_configs[name] = {
         "LaunchConfigurationName": name,
         "LaunchConfigurationARN": arn,
@@ -2726,7 +2728,7 @@ def _asg_lc_delete(physical_id, props):
 def _asg_policy_create(logical_id, props, stack_name):
     asg_name = props.get("AutoScalingGroupName", "")
     policy_name = props.get("PolicyName") or _physical_name(stack_name, logical_id, max_len=255)
-    arn = f"arn:aws:autoscaling:{REGION}:{get_account_id()}:scalingPolicy:{new_uuid()}:autoScalingGroupName/{asg_name}:policyName/{policy_name}"
+    arn = f"arn:aws:autoscaling:{get_region()}:{get_account_id()}:scalingPolicy:{new_uuid()}:autoScalingGroupName/{asg_name}:policyName/{policy_name}"
     key = f"{asg_name}/{policy_name}"
     _asg._policies[key] = {
         "PolicyARN": arn,
@@ -2772,7 +2774,7 @@ def _asg_hook_delete(physical_id, props):
 def _asg_scheduled_create(logical_id, props, stack_name):
     asg_name = props.get("AutoScalingGroupName", "")
     action_name = props.get("ScheduledActionName") or _physical_name(stack_name, logical_id, max_len=255)
-    arn = f"arn:aws:autoscaling:{REGION}:{get_account_id()}:scheduledUpdateGroupAction:{new_uuid()}:autoScalingGroupName/{asg_name}:scheduledActionName/{action_name}"
+    arn = f"arn:aws:autoscaling:{get_region()}:{get_account_id()}:scheduledUpdateGroupAction:{new_uuid()}:autoScalingGroupName/{asg_name}:scheduledActionName/{action_name}"
     key = f"{asg_name}/{action_name}"
     _asg._scheduled_actions[key] = {
         "ScheduledActionARN": arn,

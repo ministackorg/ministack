@@ -40,6 +40,29 @@ def get_account_id() -> str:
     return _request_account_id.get()
 
 
+# Request-scoped region. Set per-request in app.py from the SigV4 Authorization
+# header's Credential scope. Fixes #398 (CDK bootstrap resources inheriting the
+# wrong region when MINISTACK_REGION differs from the caller's AWS_REGION).
+_request_region: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "_request_region",
+    default=os.environ.get("MINISTACK_REGION", "us-east-1"),
+)
+
+
+def set_request_region(region: str | None) -> None:
+    """Set the region for the current request. Falls back to MINISTACK_REGION /
+    ``us-east-1`` when the caller supplies nothing."""
+    if region:
+        _request_region.set(region)
+    else:
+        _request_region.set(os.environ.get("MINISTACK_REGION", "us-east-1"))
+
+
+def get_region() -> str:
+    """Return the region for the current request."""
+    return _request_region.get()
+
+
 class AccountScopedDict:
     """A dict-like container that namespaces keys by the current request's account ID.
 

@@ -629,3 +629,71 @@ def test_tagging_tag_resources_visible_in_get_tag_keys(tagging, s3):
     tagging.tag_resources(ResourceARNList=[arn], Tags={"phase3-key": "phase3-val"})
     resp = tagging.get_tag_keys()
     assert "phase3-key" in resp["TagKeys"]
+
+
+# ========== Error shape (1.3.5) ==========
+
+def test_tagging_tag_resources_unknown_service_returns_invalid_parameter(tagging):
+    """Unknown ARN service segment returns InvalidParameterException/400, not
+    InternalServiceException/501 — matches real AWS."""
+    resp = tagging.tag_resources(
+        ResourceARNList=["arn:aws:unknownsvc:::no-such"],
+        Tags={"k": "v"},
+    )
+    entry = resp["FailedResourcesMap"]["arn:aws:unknownsvc:::no-such"]
+    assert entry["ErrorCode"] == "InvalidParameterException"
+    assert entry["StatusCode"] == 400
+
+
+def test_tagging_tag_resources_missing_lambda_surfaces_in_failed_map(tagging):
+    """Tagging a Lambda that does not exist in the caller's account surfaces
+    InvalidParameterException in FailedResourcesMap instead of silently no-op'ing."""
+    arn = "arn:aws:lambda:us-east-1:000000000000:function:no-such-fn-tag-missing"
+    resp = tagging.tag_resources(ResourceARNList=[arn], Tags={"k": "v"})
+    assert arn in resp["FailedResourcesMap"]
+    entry = resp["FailedResourcesMap"][arn]
+    assert entry["ErrorCode"] == "InvalidParameterException"
+    assert entry["StatusCode"] == 400
+
+
+def test_tagging_untag_missing_sns_surfaces_in_failed_map(tagging):
+    arn = "arn:aws:sns:us-east-1:000000000000:no-such-topic-untag-missing"
+    resp = tagging.untag_resources(ResourceARNList=[arn], TagKeys=["k"])
+    assert arn in resp["FailedResourcesMap"]
+    entry = resp["FailedResourcesMap"][arn]
+    assert entry["ErrorCode"] == "InvalidParameterException"
+
+
+def test_tagging_tag_resources_cross_account_isolation(s3):
+    """Tags applied in account A must not be visible in account B. Guard for
+    the multi-tenant property guaranteed by AccountScopedDict under the hood."""
+    import boto3
+    from botocore.config import Config
+
+    def _client(svc: str, account: str):
+        return boto3.client(
+            svc, endpoint_url=os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566"),
+            region_name="us-east-1",
+            aws_access_key_id=account, aws_secret_access_key="test",
+            config=Config(retries={"mode": "standard"}),
+        )
+
+    s3_a = _client("s3", "111111111111")
+    s3_b = _client("s3", "222222222222")
+    tag_a = _client("resourcegroupstaggingapi", "111111111111")
+    tag_b = _client("resourcegroupstaggingapi", "222222222222")
+
+    s3_a.create_bucket(Bucket="tg-iso-acct-a")
+    s3_b.create_bucket(Bucket="tg-iso-acct-b")
+    arn_a = "arn:aws:s3:::tg-iso-acct-a"
+    tag_a.tag_resources(ResourceARNList=[arn_a], Tags={"tenant": "A"})
+
+    # Account B must not see A's tag.
+    resp_b = tag_b.get_resources(TagFilters=[{"Key": "tenant", "Values": ["A"]}])
+    arns_b = [r["ResourceARN"] for r in resp_b["ResourceTagMappingList"]]
+    assert arn_a not in arns_b
+
+    # Account A still sees its own tag.
+    resp_a = tag_a.get_resources(TagFilters=[{"Key": "tenant", "Values": ["A"]}])
+    arns_a = [r["ResourceARN"] for r in resp_a["ResourceTagMappingList"]]
+    assert arn_a in arns_a

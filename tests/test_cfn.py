@@ -2050,3 +2050,59 @@ def test_cfn_eventbus_default_name_fails(cfn, eb):
     # Default bus must still exist and be unaffected
     bus = eb.describe_event_bus(Name="default")
     assert bus["Name"] == "default"
+
+
+def test_cfn_aws_region_pseudo_param_uses_caller_region():
+    """CFN's AWS::Region pseudo-param must resolve to the caller's request region,
+    not MINISTACK_REGION (issue #398 — CDK bootstrap resources inheriting wrong region)."""
+    import boto3
+    from botocore.config import Config
+
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+
+    # Caller explicitly uses us-east-2 via SigV4 Credential scope.
+    def _client(svc: str):
+        return boto3.client(
+            svc, endpoint_url=endpoint, region_name="us-east-2",
+            aws_access_key_id="test", aws_secret_access_key="test",
+            config=Config(retries={"mode": "standard"}),
+        )
+
+    cfn_us2 = _client("cloudformation")
+    s3_us2 = _client("s3")
+
+    template = """
+AWSTemplateFormatVersion: '2010-09-09'
+Resources:
+  RegionalBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "rgn-test-${AWS::Region}"
+Outputs:
+  Region:
+    Value: !Ref AWS::Region
+  BucketName:
+    Value: !Ref RegionalBucket
+"""
+
+    stack_name = "cfn-region-398"
+    try:
+        cfn_us2.delete_stack(StackName=stack_name)
+    except Exception:
+        pass
+
+    cfn_us2.create_stack(StackName=stack_name, TemplateBody=template)
+    _wait_stack(cfn_us2, stack_name)
+
+    stack = cfn_us2.describe_stacks(StackName=stack_name)["Stacks"][0]
+    outputs = {o["OutputKey"]: o["OutputValue"] for o in stack.get("Outputs", [])}
+    assert outputs["Region"] == "us-east-2", \
+        f"AWS::Region should resolve to caller's region, got {outputs['Region']!r}"
+    assert outputs["BucketName"] == "rgn-test-us-east-2"
+
+    # Stack ARN itself must carry the caller's region, not us-east-1.
+    assert ":us-east-2:" in stack["StackId"], f"StackId missing caller region: {stack['StackId']!r}"
+
+    # And the bucket was actually created with that name.
+    buckets = [b["Name"] for b in s3_us2.list_buckets()["Buckets"]]
+    assert "rgn-test-us-east-2" in buckets

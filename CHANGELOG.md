@@ -7,10 +7,24 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
-## [Unreleased] — 2026-04-20
+## [1.3.5] — 2026-04-20
 
 ### Added
-- **API Gateway v2 WebSocket APIs** — full WebSocket data plane and control plane on the execute-api host (`ws://{apiId}.execute-api.{host}:{port}/{stage}`). `CreateApi(ProtocolType=WEBSOCKET)` defaults `RouteSelectionExpression` to `$request.body.action`; adds full `RouteResponse` and `IntegrationResponse` CRUD (`Create/Get/Update/Delete` under `/v2/apis/{apiId}/routes/{routeId}/routeresponses` and `/integrations/{integrationId}/integrationresponses`). ASGI `websocket` scope is handled end-to-end: on connect, the `$connect` Lambda runs with the handshake's `queryStringParameters` / `multiValueQueryStringParameters` on the event so token-gated connect hooks work like AWS — 2xx accepts, non-2xx rejects. Incoming frames evaluate the API's `RouteSelectionExpression` and dispatch to `$connect` / `$disconnect` / `$default` / custom-action routes; Lambda event matches AWS WebSocket v2 proxy (`requestContext.connectionId` / `routeKey` / `eventType` / `messageId` / `identity.sourceIp`, real `disconnectStatusCode` + `disconnectReason` from the close frame). `AWS`, `AWS_PROXY`, and `MOCK` integration types supported (MOCK returns the first matching `IntegrationResponse.responseTemplates` entry). `@connections` management API served on the execute-api host: `PostToConnection` pushes to a per-connection outbox that the WS session drains (enables server-side push), `GetConnection`, `DeleteConnection`; unknown or closed connections return `410 GoneException`. Connections carry their owning account; cross-API `@connections` lookups are rejected and Lambda invocations run in the owner's context. No new dependencies — upgrade is served by hypercorn; tests use a stdlib-only WS client. Reported by @whittin3
+- **API Gateway v2 WebSocket APIs** — full WebSocket support on the execute-api host: `CreateApi(ProtocolType=WEBSOCKET)`, `RouteResponse` + `IntegrationResponse` CRUD, `$connect`/`$disconnect`/`$default`/custom-action route dispatch via `$request.body.*`, `AWS_PROXY`/`AWS`/`MOCK` integrations, and the `@connections` management API (`PostToConnection`/`GetConnection`/`DeleteConnection`) with per-connection outbox for server-side push. `$connect` receives `queryStringParameters`/`multiValueQueryStringParameters` so token-gated hooks work like AWS. Multi-tenant: connections carry their owning account. Reported by @whittin3. Fixes #383
+- **Resource Groups Tagging API — Phase 3** — `TagResources` and `UntagResources` across S3, Lambda, SQS, SNS, DynamoDB, EventBridge, KMS, ECR, ECS, Glue, Cognito (IdP + Identity), AppSync, Scheduler, CloudFront, EFS. Contributed by @AdigaAkhil (#384). Fixes #382
+
+### Changed
+- **Centralised service registry** — `SERVICE_HANDLERS`, `SERVICE_NAME_ALIASES`, and `_reset_all_state`'s module list are now derived from one `SERVICE_REGISTRY` in `app.py`. Adding a service is one dict entry. Contributed by @jgrumboe (#391)
+- **ASGI dispatcher refactor** — the monolithic `app()` is split into tiered helpers (pre-body / post-body / special data-plane / generic). Adds an `_is_potential_alb_request()` gate that skips the ALB module load for non-ALB traffic. Contributed by @jgrumboe (#394)
+
+### Fixed
+- **CloudFormation `AWS::Region` and provisioner ARNs ignored the caller's region** — CFN used a module-level `REGION` everywhere, so CDK bootstrap with `AWS_REGION=us-east-2` got `us-east-1` baked into every `${AWS::Region}` substitution and ~15 provisioner ARNs. Region is now a per-request contextvar (`get_region()`); CFN engine, handlers, and every provisioner use it. Reported by @youngkwangk. Fixes #398
+- **S3 `CompleteMultipartUpload` did not version the final object** — when versioning was enabled, the response lacked `x-amz-version-id` and the object never appeared in `list_object_versions`. Multipart now follows the same versioning path as `PutObject`. Reported by @adzcodemi. (#397) Fixes #392
+- **EC2 `CreateSecurityGroup` description parameter** — contributed by @AdigaAkhil (#396)
+- **Tagging `TagResources`/`UntagResources` error shape** — unsupported resource types and missing resources now return `InvalidParameterException` (400) in `FailedResourcesMap`, matching AWS. Previously returned `InternalServiceException` (501/500) or silently no-op'd on Lambda/SNS/SQS/Cognito-IDP. Writers/removers now raise a typed `_ResourceNotFound` that the entry point surfaces per-ARN. Docstrings added across every writer/remover.
+
+---
+
 ## [1.3.4] — 2026-04-20
 
 ### Fixed

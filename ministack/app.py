@@ -59,7 +59,7 @@ _NON_S3_VHOST_NAMES = frozenset({
 
 from ministack.core.hypercorn_compat import install as _install_hypercorn_compat
 from ministack.core.persistence import PERSIST_STATE, load_state, save_all
-from ministack.core.responses import set_request_account_id
+from ministack.core.responses import set_request_account_id, set_request_region
 from ministack.core.router import detect_service, extract_access_key_id, extract_region
 
 # Must run before hypercorn emits its first Expect: 100-continue reply.
@@ -603,6 +603,15 @@ async def _handle_execute_api_request(host: str, path: str, method: str, headers
     stage = path_parts[0] if path_parts else "$default"
     execute_path = "/" + path_parts[1] if len(path_parts) > 1 else "/"
     try:
+        # WebSocket @connections management API — lives on the execute-api host
+        # at /{stage}/@connections/{connectionId}. Detect and dispatch before
+        # normal REST/HTTP routing.
+        conn_prefix = f"/{stage}/@connections/"
+        if path.startswith(conn_prefix):
+            connection_id = path[len(conn_prefix):].split("/", 1)[0]
+            return await _get_module("apigateway").handle_connections_api(
+                method, api_id, stage, connection_id, body, headers
+            )
         if api_id in _get_module("apigateway_v1")._rest_apis:
             return await _get_module("apigateway_v1").handle_execute(
                 api_id, stage, method, execute_path, headers, body, query_params
@@ -772,6 +781,33 @@ async def app(scope, receive, send):
         await _handle_lifespan(scope, receive, send)
         return
 
+    if scope["type"] == "websocket":
+        # WebSocket APIs only reach us via the execute-api host pattern:
+        #   ws://{apiId}.execute-api.{host}[:port]/{stage}[/...]
+        ws_headers = {}
+        for name, value in scope.get("headers", []):
+            try:
+                ws_headers[name.decode("latin-1").lower()] = value.decode("utf-8")
+            except UnicodeDecodeError:
+                ws_headers[name.decode("latin-1").lower()] = value.decode("latin-1")
+        ws_host = ws_headers.get("host", "")
+        m = _EXECUTE_API_RE.match(ws_host)
+        if not m:
+            msg = await receive()
+            if msg.get("type") == "websocket.connect":
+                await send({"type": "websocket.close", "code": 1008})
+            return
+        ws_api_id = m.group(1)
+        try:
+            await _get_module("apigateway").handle_websocket(scope, receive, send, ws_api_id)
+        except Exception:
+            logger.exception("Error in WebSocket dispatch")
+            try:
+                await send({"type": "websocket.close", "code": 1011})
+            except Exception:
+                pass
+        return
+
     if scope["type"] != "http":
         return
 
@@ -802,6 +838,11 @@ async def app(scope, receive, send):
     _access_key = extract_access_key_id(headers)
     if _access_key:
         set_request_account_id(_access_key)
+
+    # Set per-request region from SigV4 Credential scope so CFN's AWS::Region
+    # pseudo-param and ARN-building use the caller's region, not MINISTACK_REGION
+    # (issue #398). Falls back to MINISTACK_REGION env.
+    set_request_region(extract_region(headers))
 
     if await _send_if_handled(send, await _handle_pre_body_request(method, path, headers, query_params, request_id)):
         return

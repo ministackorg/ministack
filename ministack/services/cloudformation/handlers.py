@@ -14,7 +14,8 @@ from .engine import (
     _resolve_refs, _NO_VALUE,
 )
 from .stacks import _add_event, _deploy_stack_async, _delete_stack_async, _diff_resources
-from .provisioners import _provision_resource, REGION
+from .provisioners import _provision_resource
+from ministack.core.responses import get_region
 from .helpers import _xml, _error, _p, _esc, _extract_members, _extract_stack_status_filters, _resolve_template, CFN_NS
 from .changesets import (
     _create_change_set, _describe_change_set, _execute_change_set,
@@ -61,7 +62,7 @@ def _create_stack(params):
         return _error("ValidationError", str(exc))
 
     stack_id = (
-        f"arn:aws:cloudformation:{REGION}:{get_account_id()}:"
+        f"arn:aws:cloudformation:{get_region()}:{get_account_id()}:"
         f"stack/{stack_name}/{new_uuid()}"
     )
 
