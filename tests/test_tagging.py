@@ -474,3 +474,158 @@ def test_tagging_get_tag_values_empty_for_unknown_key(tagging):
 def test_tagging_get_tag_values_pagination_token_empty(tagging):
     resp = tagging.get_tag_values(Key=_TAG_KEY)
     assert resp.get("PaginationToken", "") == ""
+
+
+# ========== TagResources ==========
+
+def test_tagging_tag_resources_s3(tagging, s3):
+    s3.create_bucket(Bucket="tg-tr-s3")
+    arn = "arn:aws:s3:::tg-tr-s3"
+    resp = tagging.tag_resources(ResourceARNList=[arn], Tags={_TAG_KEY: "tr-s3"})
+    assert resp["FailedResourcesMap"] == {}
+    check = tagging.get_resources(TagFilters=[{"Key": _TAG_KEY, "Values": ["tr-s3"]}])
+    assert any(r["ResourceARN"] == arn for r in check["ResourceTagMappingList"])
+
+
+def test_tagging_tag_resources_kms(tagging, kms_client):
+    key_id = kms_client.create_key(Description="tg-tr-kms")["KeyMetadata"]["KeyId"]
+    arn = f"arn:aws:kms:us-east-1:000000000000:key/{key_id}"
+    resp = tagging.tag_resources(ResourceARNList=[arn], Tags={_TAG_KEY: "tr-kms"})
+    assert resp["FailedResourcesMap"] == {}
+    check = tagging.get_resources(TagFilters=[{"Key": _TAG_KEY, "Values": ["tr-kms"]}])
+    assert any(r["ResourceARN"] == arn for r in check["ResourceTagMappingList"])
+
+
+def test_tagging_tag_resources_merges_existing(tagging, s3):
+    """TagResources merges new tags, preserving keys not in the request."""
+    s3.create_bucket(Bucket="tg-tr-merge")
+    s3.put_bucket_tagging(Bucket="tg-tr-merge", Tagging={
+        "TagSet": [{"Key": "existing", "Value": "keep-me"}]
+    })
+    arn = "arn:aws:s3:::tg-tr-merge"
+    tagging.tag_resources(ResourceARNList=[arn], Tags={_TAG_KEY: "tr-merge"})
+    check = tagging.get_resources(TagFilters=[{"Key": _TAG_KEY, "Values": ["tr-merge"]}])
+    matched = next(r for r in check["ResourceTagMappingList"] if r["ResourceARN"] == arn)
+    tag_map = {t["Key"]: t["Value"] for t in matched["Tags"]}
+    assert tag_map["existing"] == "keep-me"
+    assert tag_map[_TAG_KEY] == "tr-merge"
+
+
+def test_tagging_tag_resources_overwrites_existing_key(tagging, s3):
+    """TagResources overwrites the value when the same key already exists."""
+    s3.create_bucket(Bucket="tg-tr-overwrite")
+    s3.put_bucket_tagging(Bucket="tg-tr-overwrite", Tagging={
+        "TagSet": [{"Key": _TAG_KEY, "Value": "old-value"}]
+    })
+    arn = "arn:aws:s3:::tg-tr-overwrite"
+    tagging.tag_resources(ResourceARNList=[arn], Tags={_TAG_KEY: "new-value"})
+    check = tagging.get_resources(TagFilters=[{"Key": _TAG_KEY, "Values": ["new-value"]}])
+    assert any(r["ResourceARN"] == arn for r in check["ResourceTagMappingList"])
+
+
+def test_tagging_tag_resources_multiple_arns(tagging, s3):
+    """TagResources applies the same tags to multiple ARNs in one call."""
+    s3.create_bucket(Bucket="tg-tr-multi-a")
+    s3.create_bucket(Bucket="tg-tr-multi-b")
+    arns = ["arn:aws:s3:::tg-tr-multi-a", "arn:aws:s3:::tg-tr-multi-b"]
+    resp = tagging.tag_resources(ResourceARNList=arns, Tags={_TAG_KEY: "tr-multi"})
+    assert resp["FailedResourcesMap"] == {}
+    check = tagging.get_resources(TagFilters=[{"Key": _TAG_KEY, "Values": ["tr-multi"]}])
+    result_arns = [r["ResourceARN"] for r in check["ResourceTagMappingList"]]
+    assert "arn:aws:s3:::tg-tr-multi-a" in result_arns
+    assert "arn:aws:s3:::tg-tr-multi-b" in result_arns
+
+
+def test_tagging_tag_resources_unknown_service(tagging):
+    """Unknown service segment appears in FailedResourcesMap, not an exception."""
+    resp = tagging.tag_resources(
+        ResourceARNList=["arn:aws:unknownsvc:::no-such-resource"],
+        Tags={_TAG_KEY: "fail"},
+    )
+    assert "arn:aws:unknownsvc:::no-such-resource" in resp["FailedResourcesMap"]
+
+
+# ========== UntagResources ==========
+
+def test_tagging_untag_resources_s3(tagging, s3):
+    s3.create_bucket(Bucket="tg-utr-s3")
+    s3.put_bucket_tagging(Bucket="tg-utr-s3", Tagging={
+        "TagSet": [{"Key": _TAG_KEY, "Value": "utr-s3"}]
+    })
+    arn = "arn:aws:s3:::tg-utr-s3"
+    resp = tagging.untag_resources(ResourceARNList=[arn], TagKeys=[_TAG_KEY])
+    assert resp["FailedResourcesMap"] == {}
+    check = tagging.get_resources(TagFilters=[{"Key": _TAG_KEY, "Values": ["utr-s3"]}])
+    assert not any(r["ResourceARN"] == arn for r in check["ResourceTagMappingList"])
+
+
+def test_tagging_untag_resources_kms(tagging, kms_client):
+    key_id = kms_client.create_key(Description="tg-utr-kms")["KeyMetadata"]["KeyId"]
+    kms_client.tag_resource(KeyId=key_id, Tags=[{"TagKey": _TAG_KEY, "TagValue": "utr-kms"}])
+    arn = f"arn:aws:kms:us-east-1:000000000000:key/{key_id}"
+    resp = tagging.untag_resources(ResourceARNList=[arn], TagKeys=[_TAG_KEY])
+    assert resp["FailedResourcesMap"] == {}
+    check = tagging.get_resources(TagFilters=[{"Key": _TAG_KEY, "Values": ["utr-kms"]}])
+    assert not any(r["ResourceARN"] == arn for r in check["ResourceTagMappingList"])
+
+
+def test_tagging_untag_resources_preserves_other_keys(tagging, s3):
+    """UntagResources removes only the specified keys, leaving others intact."""
+    s3.create_bucket(Bucket="tg-utr-preserve")
+    s3.put_bucket_tagging(Bucket="tg-utr-preserve", Tagging={
+        "TagSet": [
+            {"Key": _TAG_KEY, "Value": "remove-me"},
+            {"Key": "stay", "Value": "here"},
+        ]
+    })
+    arn = "arn:aws:s3:::tg-utr-preserve"
+    tagging.untag_resources(ResourceARNList=[arn], TagKeys=[_TAG_KEY])
+    check = tagging.get_resources(TagFilters=[{"Key": "stay", "Values": ["here"]}])
+    assert any(r["ResourceARN"] == arn for r in check["ResourceTagMappingList"])
+
+
+def test_tagging_untag_resources_nonexistent_key_is_noop(tagging, s3):
+    """Removing a key that does not exist is a no-op, not an error."""
+    s3.create_bucket(Bucket="tg-utr-noop")
+    arn = "arn:aws:s3:::tg-utr-noop"
+    resp = tagging.untag_resources(ResourceARNList=[arn], TagKeys=["__nonexistent__"])
+    assert resp["FailedResourcesMap"] == {}
+
+
+def test_tagging_untag_resources_unknown_service(tagging):
+    """Unknown service segment appears in FailedResourcesMap."""
+    resp = tagging.untag_resources(
+        ResourceARNList=["arn:aws:unknownsvc:::no-such-resource"],
+        TagKeys=[_TAG_KEY],
+    )
+    assert "arn:aws:unknownsvc:::no-such-resource" in resp["FailedResourcesMap"]
+
+
+# ========== Cross-operation roundtrips ==========
+
+def test_tagging_tag_then_get_roundtrip(tagging, s3):
+    """Tags applied via TagResources are visible in GetResources."""
+    s3.create_bucket(Bucket="tg-roundtrip")
+    arn = "arn:aws:s3:::tg-roundtrip"
+    tagging.tag_resources(ResourceARNList=[arn], Tags={_TAG_KEY: "roundtrip"})
+    resp = tagging.get_resources(TagFilters=[{"Key": _TAG_KEY, "Values": ["roundtrip"]}])
+    assert any(r["ResourceARN"] == arn for r in resp["ResourceTagMappingList"])
+
+
+def test_tagging_tag_untag_get_roundtrip(tagging, s3):
+    """Tags removed via UntagResources no longer appear in GetResources."""
+    s3.create_bucket(Bucket="tg-full-roundtrip")
+    arn = "arn:aws:s3:::tg-full-roundtrip"
+    tagging.tag_resources(ResourceARNList=[arn], Tags={_TAG_KEY: "full-roundtrip"})
+    tagging.untag_resources(ResourceARNList=[arn], TagKeys=[_TAG_KEY])
+    resp = tagging.get_resources(TagFilters=[{"Key": _TAG_KEY, "Values": ["full-roundtrip"]}])
+    assert not any(r["ResourceARN"] == arn for r in resp["ResourceTagMappingList"])
+
+
+def test_tagging_tag_resources_visible_in_get_tag_keys(tagging, s3):
+    """Tags applied via TagResources appear in GetTagKeys."""
+    s3.create_bucket(Bucket="tg-tr-keys")
+    arn = "arn:aws:s3:::tg-tr-keys"
+    tagging.tag_resources(ResourceARNList=[arn], Tags={"phase3-key": "phase3-val"})
+    resp = tagging.get_tag_keys()
+    assert "phase3-key" in resp["TagKeys"]

@@ -205,6 +205,271 @@ def _matches_tag_filters(tags, tag_filters):
     return True
 
 
+def _service_key_from_arn(arn):
+    """Extract service segment from ARN (e.g. 'arn:aws:s3:::...' → 's3')."""
+    parts = arn.split(":")
+    return parts[2] if len(parts) >= 3 else ""
+
+
+# ── Per-service tag writers ───────────────────────────────────────────────────
+
+def _write_s3(arn, tags):
+    import ministack.services.s3 as svc
+    name = arn.split(":::")[-1]
+    svc._bucket_tags.setdefault(name, {}).update(tags)
+
+
+def _write_lambda(arn, tags):
+    import ministack.services.lambda_svc as svc
+    name = arn.split("function:")[-1]
+    if name in svc._functions:
+        svc._functions[name].setdefault("tags", {}).update(tags)
+
+
+def _write_sqs(arn, tags):
+    import ministack.services.sqs as svc
+    for q in svc._queues.values():
+        if q.get("attributes", {}).get("QueueArn") == arn:
+            q.setdefault("tags", {}).update(tags)
+            break
+
+
+def _write_sns(arn, tags):
+    import ministack.services.sns as svc
+    if arn in svc._topics:
+        svc._topics[arn].setdefault("tags", {}).update(tags)
+
+
+def _write_dynamodb(arn, tags):
+    import ministack.services.dynamodb as svc
+    existing = {t["Key"]: t["Value"] for t in svc._tags.get(arn, [])}
+    existing.update(tags)
+    svc._tags[arn] = [{"Key": k, "Value": v} for k, v in existing.items()]
+
+
+def _write_eventbridge(arn, tags):
+    import ministack.services.eventbridge as svc
+    svc._tags.setdefault(arn, {}).update(tags)
+
+
+def _write_kms(arn, tags):
+    import ministack.services.kms as svc
+    key_id = arn.split("/")[-1]
+    if key_id in svc._keys:
+        existing = {t["TagKey"]: t["TagValue"] for t in svc._keys[key_id].get("Tags", [])}
+        existing.update(tags)
+        svc._keys[key_id]["Tags"] = [{"TagKey": k, "TagValue": v} for k, v in existing.items()]
+
+
+def _write_ecr(arn, tags):
+    import ministack.services.ecr as svc
+    name = arn.split("repository/")[-1]
+    if name in svc._repositories:
+        existing = {t["Key"]: t["Value"] for t in svc._repositories[name].get("tags", [])}
+        existing.update(tags)
+        svc._repositories[name]["tags"] = [{"Key": k, "Value": v} for k, v in existing.items()]
+
+
+def _write_ecs(arn, tags):
+    import ministack.services.ecs as svc
+    existing = {t["key"]: t["value"] for t in svc._tags.get(arn, [])}
+    existing.update(tags)
+    svc._tags[arn] = [{"key": k, "value": v} for k, v in existing.items()]
+
+
+def _write_glue(arn, tags):
+    import ministack.services.glue as svc
+    svc._tags.setdefault(arn, {}).update(tags)
+
+
+def _write_cognito_idp(arn, tags):
+    import ministack.services.cognito as svc
+    pool_id = arn.split("userpool/")[-1]
+    if pool_id in svc._user_pools:
+        svc._user_pools[pool_id].setdefault("UserPoolTags", {}).update(tags)
+
+
+def _write_cognito_identity(arn, tags):
+    import ministack.services.cognito as svc
+    pool_id = arn.split("identitypool/")[-1]
+    svc._identity_tags.setdefault(pool_id, {}).update(tags)
+
+
+def _write_appsync(arn, tags):
+    import ministack.services.appsync as svc
+    svc._tags.setdefault(arn, {}).update(tags)
+
+
+def _write_scheduler(arn, tags):
+    import ministack.services.scheduler as svc
+    svc._tags.setdefault(arn, {}).update(tags)
+
+
+def _write_cloudfront(arn, tags):
+    import ministack.services.cloudfront as svc
+    existing = {t["Key"]: t["Value"] for t in svc._tags.get(arn, [])}
+    existing.update(tags)
+    svc._tags[arn] = [{"Key": k, "Value": v} for k, v in existing.items()]
+
+
+def _write_efs(arn, tags):
+    import ministack.services.efs as svc
+    if ":file-system/" in arn:
+        resource = svc._file_systems.get(arn.split("file-system/")[-1])
+    else:
+        resource = svc._access_points.get(arn.split("access-point/")[-1])
+    if resource is not None:
+        existing = {t["Key"]: t["Value"] for t in resource.get("Tags", [])}
+        existing.update(tags)
+        resource["Tags"] = [{"Key": k, "Value": v} for k, v in existing.items()]
+
+
+_WRITERS = {
+    "s3": _write_s3, "lambda": _write_lambda, "sqs": _write_sqs,
+    "sns": _write_sns, "dynamodb": _write_dynamodb, "events": _write_eventbridge,
+    "kms": _write_kms, "ecr": _write_ecr, "ecs": _write_ecs,
+    "glue": _write_glue, "cognito-idp": _write_cognito_idp,
+    "cognito-identity": _write_cognito_identity, "appsync": _write_appsync,
+    "scheduler": _write_scheduler, "cloudfront": _write_cloudfront,
+    "elasticfilesystem": _write_efs,
+}
+
+
+# ── Per-service tag removers ──────────────────────────────────────────────────
+
+def _remove_s3(arn, keys):
+    import ministack.services.s3 as svc
+    tags = svc._bucket_tags.get(arn.split(":::")[-1], {})
+    for k in keys:
+        tags.pop(k, None)
+
+
+def _remove_lambda(arn, keys):
+    import ministack.services.lambda_svc as svc
+    name = arn.split("function:")[-1]
+    if name in svc._functions:
+        tags = svc._functions[name].get("tags", {})
+        for k in keys:
+            tags.pop(k, None)
+
+
+def _remove_sqs(arn, keys):
+    import ministack.services.sqs as svc
+    for q in svc._queues.values():
+        if q.get("attributes", {}).get("QueueArn") == arn:
+            tags = q.get("tags", {})
+            for k in keys:
+                tags.pop(k, None)
+            break
+
+
+def _remove_sns(arn, keys):
+    import ministack.services.sns as svc
+    if arn in svc._topics:
+        tags = svc._topics[arn].get("tags", {})
+        for k in keys:
+            tags.pop(k, None)
+
+
+def _remove_dynamodb(arn, keys):
+    import ministack.services.dynamodb as svc
+    svc._tags[arn] = [t for t in svc._tags.get(arn, []) if t["Key"] not in keys]
+
+
+def _remove_eventbridge(arn, keys):
+    import ministack.services.eventbridge as svc
+    tags = svc._tags.get(arn, {})
+    for k in keys:
+        tags.pop(k, None)
+
+
+def _remove_kms(arn, keys):
+    import ministack.services.kms as svc
+    key_id = arn.split("/")[-1]
+    if key_id in svc._keys:
+        svc._keys[key_id]["Tags"] = [
+            t for t in svc._keys[key_id].get("Tags", []) if t["TagKey"] not in keys
+        ]
+
+
+def _remove_ecr(arn, keys):
+    import ministack.services.ecr as svc
+    name = arn.split("repository/")[-1]
+    if name in svc._repositories:
+        svc._repositories[name]["tags"] = [
+            t for t in svc._repositories[name].get("tags", []) if t["Key"] not in keys
+        ]
+
+
+def _remove_ecs(arn, keys):
+    import ministack.services.ecs as svc
+    svc._tags[arn] = [t for t in svc._tags.get(arn, []) if t["key"] not in keys]
+
+
+def _remove_glue(arn, keys):
+    import ministack.services.glue as svc
+    tags = svc._tags.get(arn, {})
+    for k in keys:
+        tags.pop(k, None)
+
+
+def _remove_cognito_idp(arn, keys):
+    import ministack.services.cognito as svc
+    pool_id = arn.split("userpool/")[-1]
+    if pool_id in svc._user_pools:
+        tags = svc._user_pools[pool_id].get("UserPoolTags", {})
+        for k in keys:
+            tags.pop(k, None)
+
+
+def _remove_cognito_identity(arn, keys):
+    import ministack.services.cognito as svc
+    pool_id = arn.split("identitypool/")[-1]
+    tags = svc._identity_tags.get(pool_id, {})
+    for k in keys:
+        tags.pop(k, None)
+
+
+def _remove_appsync(arn, keys):
+    import ministack.services.appsync as svc
+    tags = svc._tags.get(arn, {})
+    for k in keys:
+        tags.pop(k, None)
+
+
+def _remove_scheduler(arn, keys):
+    import ministack.services.scheduler as svc
+    tags = svc._tags.get(arn, {})
+    for k in keys:
+        tags.pop(k, None)
+
+
+def _remove_cloudfront(arn, keys):
+    import ministack.services.cloudfront as svc
+    svc._tags[arn] = [t for t in svc._tags.get(arn, []) if t["Key"] not in keys]
+
+
+def _remove_efs(arn, keys):
+    import ministack.services.efs as svc
+    if ":file-system/" in arn:
+        resource = svc._file_systems.get(arn.split("file-system/")[-1])
+    else:
+        resource = svc._access_points.get(arn.split("access-point/")[-1])
+    if resource is not None:
+        resource["Tags"] = [t for t in resource.get("Tags", []) if t["Key"] not in keys]
+
+
+_REMOVERS = {
+    "s3": _remove_s3, "lambda": _remove_lambda, "sqs": _remove_sqs,
+    "sns": _remove_sns, "dynamodb": _remove_dynamodb, "events": _remove_eventbridge,
+    "kms": _remove_kms, "ecr": _remove_ecr, "ecs": _remove_ecs,
+    "glue": _remove_glue, "cognito-idp": _remove_cognito_idp,
+    "cognito-identity": _remove_cognito_identity, "appsync": _remove_appsync,
+    "scheduler": _remove_scheduler, "cloudfront": _remove_cloudfront,
+    "elasticfilesystem": _remove_efs,
+}
+
+
 # ── Operation handlers ────────────────────────────────────────────────────────
 
 def _get_resources(data):
@@ -221,7 +486,7 @@ def _get_resources(data):
         active = _COLLECTORS
 
     results = []
-    for collector in active.values():
+    for collector in dict.fromkeys(active.values()):
         try:
             for arn, tags in collector():
                 if not _matches_type_filters(arn, type_filters):
@@ -272,10 +537,70 @@ def _get_tag_values(data):
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
+def _tag_resources(data):
+    arn_list = data.get("ResourceARNList", [])
+    tags = data.get("Tags", {})
+    failed = {}
+
+    for arn in arn_list:
+        svc_key = _service_key_from_arn(arn)
+        writer = _WRITERS.get(svc_key)
+        if writer is None:
+            failed[arn] = {
+                "ErrorCode": "InternalServiceException",
+                "ErrorMessage": f"Unsupported resource type: {svc_key}",
+                "StatusCode": 501,
+            }
+            continue
+        try:
+            writer(arn, tags)
+        except Exception as exc:
+            failed[arn] = {
+                "ErrorCode": "InternalServiceException",
+                "ErrorMessage": str(exc),
+                "StatusCode": 500,
+            }
+
+    return 200, {"Content-Type": "application/x-amz-json-1.1"}, json.dumps({
+        "FailedResourcesMap": failed,
+    }).encode()
+
+
+def _untag_resources(data):
+    arn_list = data.get("ResourceARNList", [])
+    tag_keys = data.get("TagKeys", [])
+    failed = {}
+
+    for arn in arn_list:
+        svc_key = _service_key_from_arn(arn)
+        remover = _REMOVERS.get(svc_key)
+        if remover is None:
+            failed[arn] = {
+                "ErrorCode": "InternalServiceException",
+                "ErrorMessage": f"Unsupported resource type: {svc_key}",
+                "StatusCode": 501,
+            }
+            continue
+        try:
+            remover(arn, tag_keys)
+        except Exception as exc:
+            failed[arn] = {
+                "ErrorCode": "InternalServiceException",
+                "ErrorMessage": str(exc),
+                "StatusCode": 500,
+            }
+
+    return 200, {"Content-Type": "application/x-amz-json-1.1"}, json.dumps({
+        "FailedResourcesMap": failed,
+    }).encode()
+
+
 _HANDLERS = {
-    "GetResources": _get_resources,
-    "GetTagKeys":   _get_tag_keys,
-    "GetTagValues": _get_tag_values,
+    "GetResources":   _get_resources,
+    "GetTagKeys":     _get_tag_keys,
+    "GetTagValues":   _get_tag_values,
+    "TagResources":   _tag_resources,
+    "UntagResources": _untag_resources,
 }
 
 
