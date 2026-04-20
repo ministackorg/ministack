@@ -43,9 +43,14 @@ _S3_VHOST_RE = re.compile(
 )
 _S3_VHOST_EXCLUDE_RE = re.compile(r"\.(execute-api|alb|emr|efs|elasticache|s3-control)\.")
 
+from ministack.core.hypercorn_compat import install as _install_hypercorn_compat
 from ministack.core.persistence import PERSIST_STATE, load_state, save_all
 from ministack.core.responses import set_request_account_id
 from ministack.core.router import detect_service, extract_access_key_id, extract_account_id, extract_region
+
+# Must run before hypercorn emits its first Expect: 100-continue reply.
+# See ministack/core/hypercorn_compat.py for the rationale (issue #389).
+_install_hypercorn_compat()
 
 # ---------------------------------------------------------------------------
 # Lazy service loader — modules are imported on first request, not at startup.
