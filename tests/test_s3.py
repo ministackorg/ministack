@@ -903,6 +903,75 @@ def test_s3_list_object_versions_multiple_puts_same_key(s3):
     assert latest[0]["VersionId"] == r3["VersionId"]
 
 
+def test_s3_multipart_upload_returns_version_id(s3):
+    """CompleteMultipartUpload should return VersionId when versioning is enabled."""
+    bkt = "s3-ver-mpu"
+    s3.create_bucket(Bucket=bkt)
+    s3.put_bucket_versioning(Bucket=bkt, VersioningConfiguration={"Status": "Enabled"})
+
+    mpu = s3.create_multipart_upload(Bucket=bkt, Key="big.bin")
+    upload_id = mpu["UploadId"]
+    part = s3.upload_part(Bucket=bkt, Key="big.bin", UploadId=upload_id, PartNumber=1, Body=b"x" * 1000)
+    resp = s3.complete_multipart_upload(
+        Bucket=bkt, Key="big.bin", UploadId=upload_id,
+        MultipartUpload={"Parts": [{"PartNumber": 1, "ETag": part["ETag"]}]},
+    )
+    assert "VersionId" in resp, "CompleteMultipartUpload must return VersionId"
+    first_vid = resp["VersionId"]
+
+    # Second multipart to same key — different version
+    mpu2 = s3.create_multipart_upload(Bucket=bkt, Key="big.bin")
+    part2 = s3.upload_part(Bucket=bkt, Key="big.bin", UploadId=mpu2["UploadId"], PartNumber=1, Body=b"y" * 1000)
+    resp2 = s3.complete_multipart_upload(
+        Bucket=bkt, Key="big.bin", UploadId=mpu2["UploadId"],
+        MultipartUpload={"Parts": [{"PartNumber": 1, "ETag": part2["ETag"]}]},
+    )
+    assert resp2["VersionId"] != first_vid
+
+    # Both versions should appear in list_object_versions
+    versions = s3.list_object_versions(Bucket=bkt).get("Versions", [])
+    vids = [v["VersionId"] for v in versions]
+    assert first_vid in vids
+    assert resp2["VersionId"] in vids
+    latest = [v for v in versions if v["IsLatest"]]
+    assert len(latest) == 1
+    assert latest[0]["VersionId"] == resp2["VersionId"]
+
+
+def test_s3_copy_object_returns_version_id(s3):
+    """CopyObject should return VersionId and track versions when versioning is enabled."""
+    bkt = "s3-ver-copy"
+    s3.create_bucket(Bucket=bkt)
+    s3.put_bucket_versioning(Bucket=bkt, VersioningConfiguration={"Status": "Enabled"})
+
+    s3.put_object(Bucket=bkt, Key="src.txt", Body=b"original")
+    resp = s3.copy_object(Bucket=bkt, Key="dst.txt", CopySource=f"{bkt}/src.txt")
+    assert "VersionId" in resp, "CopyObject must return VersionId"
+    first_vid = resp["VersionId"]
+
+    # Copy again — different version
+    resp2 = s3.copy_object(Bucket=bkt, Key="dst.txt", CopySource=f"{bkt}/src.txt")
+    assert resp2["VersionId"] != first_vid
+
+    versions = s3.list_object_versions(Bucket=bkt, Prefix="dst.txt").get("Versions", [])
+    assert len(versions) == 2, f"Expected 2 versions for dst.txt, got {len(versions)}"
+    latest = [v for v in versions if v["IsLatest"]]
+    assert len(latest) == 1
+
+
+def test_s3_multipart_no_version_without_versioning(s3):
+    """CompleteMultipartUpload should NOT return VersionId when versioning is disabled."""
+    bkt = "s3-nover-mpu"
+    s3.create_bucket(Bucket=bkt)
+    mpu = s3.create_multipart_upload(Bucket=bkt, Key="file.bin")
+    part = s3.upload_part(Bucket=bkt, Key="file.bin", UploadId=mpu["UploadId"], PartNumber=1, Body=b"data")
+    resp = s3.complete_multipart_upload(
+        Bucket=bkt, Key="file.bin", UploadId=mpu["UploadId"],
+        MultipartUpload={"Parts": [{"PartNumber": 1, "ETag": part["ETag"]}]},
+    )
+    assert "VersionId" not in resp, "Should not return VersionId without versioning"
+
+
 def test_s3_bucket_website(s3):
     s3.create_bucket(Bucket="s3-web-bkt")
     s3.put_bucket_website(
