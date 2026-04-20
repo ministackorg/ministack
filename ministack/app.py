@@ -120,72 +120,66 @@ logging.basicConfig(
 )
 logger = logging.getLogger("ministack")
 
+# Single source of truth for routable services, their backing modules, and aliases.
+SERVICE_REGISTRY = {
+    "acm": {"module": "acm"},
+    "apigateway": {"module": "apigateway", "aliases": ("execute-api", "apigatewayv2")},
+    "appconfig": {"module": "appconfig"},
+    "appconfigdata": {"module": "appconfig"},
+    "appsync": {"module": "appsync"},
+    "athena": {"module": "athena"},
+    "autoscaling": {"module": "autoscaling"},
+    "cloudformation": {"module": "cloudformation"},
+    "cloudfront": {"module": "cloudfront"},
+    "codebuild": {"module": "codebuild"},
+    "cognito-identity": {"module": "cognito"},
+    "cognito-idp": {"module": "cognito"},
+    "dynamodb": {"module": "dynamodb"},
+    "ec2": {"module": "ec2"},
+    "ecr": {"module": "ecr"},
+    "ecs": {"module": "ecs"},
+    "eks": {"module": "eks"},
+    "elasticache": {"module": "elasticache"},
+    "elasticfilesystem": {"module": "efs"},
+    "elasticloadbalancing": {"module": "alb", "aliases": ("elbv2", "elb")},
+    "elasticmapreduce": {"module": "emr"},
+    "events": {"module": "eventbridge", "aliases": ("eventbridge",)},
+    "firehose": {"module": "firehose", "aliases": ("kinesis-firehose",)},
+    "glue": {"module": "glue"},
+    "iam": {"module": "iam"},
+    "kinesis": {"module": "kinesis"},
+    "kms": {"module": "kms"},
+    "lambda": {"module": "lambda_svc"},
+    "logs": {"module": "cloudwatch_logs", "aliases": ("cloudwatch-logs",)},
+    "monitoring": {"module": "cloudwatch", "aliases": ("cloudwatch",)},
+    "rds-data": {"module": "rds_data"},
+    "rds": {"module": "rds"},
+    "route53": {"module": "route53"},
+    "s3": {"module": "s3"},
+    "s3files": {"module": "s3files"},
+    "scheduler": {"module": "scheduler"},
+    "secretsmanager": {"module": "secretsmanager"},
+    "servicediscovery": {"module": "servicediscovery"},
+    "ses": {"module": "ses"},
+    "sns": {"module": "sns"},
+    "sqs": {"module": "sqs"},
+    "ssm": {"module": "ssm"},
+    "states": {"module": "stepfunctions", "aliases": ("step-functions", "stepfunctions")},
+    "sts": {"module": "sts"},
+    "tagging": {"module": "tagging"},
+    "transfer": {"module": "transfer"},
+    "wafv2": {"module": "waf"},
+}
+
 SERVICE_HANDLERS = {
-    "s3": _lazy_handler("s3"),
-    "sqs": _lazy_handler("sqs"),
-    "cloudformation": _lazy_handler("cloudformation"),
-    "sns": _lazy_handler("sns"),
-    "dynamodb": _lazy_handler("dynamodb"),
-    "lambda": _lazy_handler("lambda_svc"),
-    "iam": _lazy_handler("iam"),
-    "sts": _lazy_handler("sts"),
-    "secretsmanager": _lazy_handler("secretsmanager"),
-    "logs": _lazy_handler("cloudwatch_logs"),
-    "ssm": _lazy_handler("ssm"),
-    "events": _lazy_handler("eventbridge"),
-    "kinesis": _lazy_handler("kinesis"),
-    "monitoring": _lazy_handler("cloudwatch"),
-    "ses": _lazy_handler("ses"),
-    "acm": _lazy_handler("acm"),
-    "wafv2": _lazy_handler("waf"),
-    "states": _lazy_handler("stepfunctions"),
-    "ecr": _lazy_handler("ecr"),
-    "ecs": _lazy_handler("ecs"),
-    "rds": _lazy_handler("rds"),
-    "elasticache": _lazy_handler("elasticache"),
-    "glue": _lazy_handler("glue"),
-    "athena": _lazy_handler("athena"),
-    "apigateway": _lazy_handler("apigateway"),
-    "firehose": _lazy_handler("firehose"),
-    "route53": _lazy_handler("route53"),
-    "cognito-idp": _lazy_handler("cognito"),
-    "cognito-identity": _lazy_handler("cognito"),
-    "ec2": _lazy_handler("ec2"),
-    "elasticmapreduce": _lazy_handler("emr"),
-    "elasticloadbalancing": _lazy_handler("alb"),
-    "elasticfilesystem": _lazy_handler("efs"),
-    "kms": _lazy_handler("kms"),
-    "cloudfront": _lazy_handler("cloudfront"),
-    "codebuild": _lazy_handler("codebuild"),
-    "transfer": _lazy_handler("transfer"),
-    "appsync": _lazy_handler("appsync"),
-    "servicediscovery": _lazy_handler("servicediscovery"),
-    "s3files": _lazy_handler("s3files"),
-    "rds-data": _lazy_handler("rds_data"),
-    "autoscaling": _lazy_handler("autoscaling"),
-    "appconfig": _lazy_handler("appconfig"),
-    "appconfigdata": _lazy_handler("appconfig"),
-    "scheduler": _lazy_handler("scheduler"),
-    "eks": _lazy_handler("eks"),
-    "tagging": _lazy_handler("tagging"),
+    service_name: _lazy_handler(service_config["module"])
+    for service_name, service_config in SERVICE_REGISTRY.items()
 }
 
 SERVICE_NAME_ALIASES = {
-    "cloudwatch-logs": "logs",
-    "cloudwatch": "monitoring",
-    "eventbridge": "events",
-    "step-functions": "states",
-    "stepfunctions": "states",
-    "execute-api": "apigateway",
-    "apigatewayv2": "apigateway",
-    "kinesis-firehose": "firehose",
-    "route53": "route53",
-    "cognito-idp": "cognito-idp",
-    "cognito-identity": "cognito-identity",
-    "elbv2": "elasticloadbalancing",
-    "elb": "elasticloadbalancing",
-    "ecr": "ecr",
-    "rds-data": "rds-data",
+    alias: service_name
+    for service_name, service_config in SERVICE_REGISTRY.items()
+    for alias in service_config.get("aliases", ())
 }
 
 
@@ -890,17 +884,8 @@ def _reset_all_state():
 
     from ministack.core.persistence import PERSIST_STATE, STATE_DIR
 
-    _ALL_SERVICE_MODULES = [
-        "s3", "sqs", "sns", "dynamodb", "lambda_svc", "secretsmanager",
-        "cloudwatch_logs", "ssm", "eventbridge", "kinesis", "cloudwatch",
-        "ses", "stepfunctions", "ecs", "rds", "elasticache", "glue", "athena",
-        "apigateway", "apigateway_v1", "firehose", "route53", "cognito", "ec2",
-        "emr", "alb", "acm", "ses_v2", "waf", "efs", "cloudformation", "kms",
-        "cloudfront", "codebuild", "ecr", "appsync", "servicediscovery",
-        "rds_data", "s3files", "appconfig", "transfer", "scheduler", "autoscaling", "eks", "iam",
-        "pipes"
-    ]
-    for mod_name in _ALL_SERVICE_MODULES:
+    for service_config in SERVICE_REGISTRY.values():
+        mod_name = service_config["module"]
         if mod_name in _loaded_modules:
             mod = _loaded_modules[mod_name]
             try:

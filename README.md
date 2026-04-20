@@ -1118,7 +1118,7 @@ See [`Testcontainers/java-testcontainers`](Testcontainers/java-testcontainers), 
 PRs welcome. The codebase is intentionally simple — each service is a single self-contained Python file in `ministack/services/`. Adding a new service means:
 
 1. Create `ministack/services/myservice.py` with an `async def handle_request(...)` function and a `reset()` function
-2. Add it to `SERVICE_HANDLERS` in `ministack/app.py`
+2. Add it to `SERVICE_REGISTRY` in `ministack/app.py` so the handler, aliases, and service filter are generated automatically
 3. Add detection patterns to `ministack/core/router.py`
 4. Add a fixture to `tests/conftest.py` and tests to `tests/test_services.py`
 

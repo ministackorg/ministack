@@ -92,13 +92,13 @@ def reset():
 ```python
 from ministack.services import myservice
 
-SERVICE_HANDLERS = {
+SERVICE_REGISTRY = {
     # ... existing ...
-    "myservice": myservice.handle_request,
+    "myservice": {"module": "myservice"},
 }
 ```
 
-Also add `(myservice, myservice.reset)` to the list in `_reset_all_state()`.
+If the service needs aliases, add them in the registry entry.
 
 ### 3. Add detection to `ministack/core/router.py`
 
@@ -169,7 +169,7 @@ pytest tests/ -v -k "cognito"
 ## Pull Request Checklist
 
 - [ ] New service file in `ministack/services/`
-- [ ] Registered in `ministack/app.py` SERVICE_HANDLERS and `_reset_all_state()`
+- [ ] Registered in `ministack/app.py` SERVICE_REGISTRY
 - [ ] Detection patterns added to `ministack/core/router.py`
 - [ ] Fixture added to `tests/conftest.py`
 - [ ] Tests added and passing (`pytest tests/ -v`)
