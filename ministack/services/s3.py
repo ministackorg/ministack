@@ -1921,6 +1921,19 @@ def _copy_object(bucket_name: str, dest_key: str, headers: dict):
         version_id = new_uuid()
         dest_obj["version_id"] = version_id
         resp_headers["x-amz-version-id"] = version_id
+        vkey = (bucket_name, dest_key)
+        if vkey not in _object_versions:
+            _object_versions[vkey] = []
+        _object_versions[vkey].append({
+            "version_id": version_id,
+            "last_modified": dest_obj["last_modified"],
+            "etag": dest_obj["etag"],
+            "size": dest_obj["size"],
+            "is_latest": True,
+            "data": dest_obj.get("data", src_obj["body"] if src_obj["size"] < 10_000_000 else None),
+        })
+        for v in _object_versions[vkey][:-1]:
+            v["is_latest"] = False
 
     root = Element("CopyObjectResult", xmlns=S3_NS)
     SubElement(root, "LastModified").text = last_modified
@@ -2846,13 +2859,32 @@ def _complete_multipart_upload(
         etag=final_etag,
     )
 
+    resp_headers = {"Content-Type": "application/xml"}
+    if _bucket_versioning.get(bucket_name) in ("Enabled", "Suspended"):
+        version_id = new_uuid()
+        obj["version_id"] = version_id
+        resp_headers["x-amz-version-id"] = version_id
+        vkey = (bucket_name, key)
+        if vkey not in _object_versions:
+            _object_versions[vkey] = []
+        _object_versions[vkey].append({
+            "version_id": version_id,
+            "last_modified": obj["last_modified"],
+            "etag": obj["etag"],
+            "size": obj["size"],
+            "is_latest": True,
+            "data": obj.get("data", combined if len(combined) < 10_000_000 else None),
+        })
+        for v in _object_versions[vkey][:-1]:
+            v["is_latest"] = False
+
     root = Element("CompleteMultipartUploadResult", xmlns=S3_NS)
     s3_host = os.environ.get("MINISTACK_HOST", os.environ.get("AWS_ENDPOINT_URL", "http://localhost:4566"))
     SubElement(root, "Location").text = f"{s3_host}/{bucket_name}/{key}"
     SubElement(root, "Bucket").text = bucket_name
     SubElement(root, "Key").text = key
     SubElement(root, "ETag").text = final_etag
-    return 200, {"Content-Type": "application/xml"}, _xml_body(root)
+    return 200, resp_headers, _xml_body(root)
 
 
 def _abort_multipart_upload(bucket_name: str, key: str, query_params: dict):
