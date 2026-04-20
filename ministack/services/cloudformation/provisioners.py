@@ -1425,7 +1425,7 @@ def _cognito_user_pool_client_create(logical_id, props, stack_name):
         "UserPoolId": pid,
         "ClientName": props.get("ClientName", ""),
         "ClientId": cid,
-        "ClientSecret": None,
+        "ClientSecret": props.get("GenerateSecret", False) and _cognito._client_secret() or None,
         "CreationDate": now,
         "LastModifiedDate": now,
         "ExplicitAuthFlows": props.get("ExplicitAuthFlows", []),
