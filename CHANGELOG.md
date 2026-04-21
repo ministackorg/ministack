@@ -7,6 +7,14 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [1.3.7] — 2026-04-21
+
+### Fixed
+- **API Gateway v2 Lambda integrations 502'd on the Terraform-produced wrapper URI** — 1.3.6's #407 fix passed the full APIGW wrapper `arn:aws:apigateway:<region>:lambda:path/2015-03-31/functions/<lambda-arn>/invocations` to the name/qualifier parser, which split on `:` and mis-read `("aws", "lambda")` as function + qualifier (error text: `Lambda function 'aws' (qualifier 'lambda') not found`). Broke every v2 HTTP + WebSocket integration using `aws_lambda_function.*.invoke_arn` / `aws_lambda_alias.*.invoke_arn`, with no Terraform-layer workaround. New `_extract_lambda_ref_from_integration_uri` helper unwraps the nested Lambda ARN before parsing, covering all 12 observed URI shapes (wrapped ± alias/version/$LATEST, bare ARN, plain name, cross-account, malformed trailing `/invocations`). Reported by @whittin3. Fixes #409
+- **Unknown `/_localstack/*` paths returned S3 `NoSuchBucket` XML** — probes from LocalStack-migrated tooling (e.g. `/_localstack/info`, `/_localstack/plugins`, `/_localstack/init`) fell through to the S3 handler. ministack now returns a clear 404 JSON pointing callers at the `/_ministack/*` endpoints. `/_localstack/health` is unaffected (matched earlier in the dispatch chain). Contributed by @AdigaAkhil (#413). Fixes #386
+
+---
+
 ## [1.3.6] — 2026-04-20
 
 ### Added
