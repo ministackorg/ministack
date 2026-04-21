@@ -92,6 +92,30 @@ def _api_arn(api_id: str) -> str:
     return f"arn:aws:apigateway:{get_region()}::/apis/{api_id}"
 
 
+def _extract_lambda_ref_from_integration_uri(uri: str) -> str:
+    """Return the inner Lambda ARN / name from an APIGW integrationUri.
+
+    Terraform and real AWS store Lambda proxy URIs as the wrapper form
+    ``arn:aws:apigateway:<region>:lambda:path/2015-03-31/functions/<lambda-arn>/invocations``.
+    Splitting the whole wrapper on ``:`` would mis-parse the nested ARN
+    (taking the wrapper's ``aws``/``lambda`` segments as function name +
+    qualifier, issue #409).
+
+    Also accepts already-unwrapped Lambda ARNs and plain function names so
+    fixtures that pass the bare ARN continue to work.
+    """
+    if not uri:
+        return ""
+    if "/functions/" in uri:
+        inner = uri.split("/functions/", 1)[1]
+        if "/invocations" in inner:
+            inner = inner.split("/invocations", 1)[0]
+        return inner
+    if uri.endswith("/invocations"):
+        return uri[: -len("/invocations")]
+    return uri
+
+
 # ---- Persistence hooks ----
 
 def get_state() -> dict:
@@ -451,12 +475,12 @@ async def _invoke_lambda_proxy(integration, api_id, stage, path, method, headers
     from ministack.core.lambda_runtime import get_or_create_worker
     from ministack.services import lambda_svc
 
-    # integrationUri is typically a Lambda ARN; strip the trailing /invocations
-    # that the apigateway:lambda:path form appends, then parse name + qualifier.
-    # Qualified aliases (arn:...:function:<name>:<alias>) must resolve to the
-    # alias's target version, not be treated as the function name itself (#407).
-    uri = integration.get("integrationUri", "").replace("/invocations", "")
-    func_name, qualifier = lambda_svc._resolve_name_and_qualifier(uri)
+    # integrationUri from Terraform / real AWS is wrapped:
+    #   arn:aws:apigateway:<region>:lambda:path/2015-03-31/functions/<lambda-arn>/invocations
+    # Unwrap to the inner Lambda ARN before parsing name + qualifier (#409).
+    # Bare Lambda ARNs and plain function names keep working via the fallback.
+    lambda_ref = _extract_lambda_ref_from_integration_uri(integration.get("integrationUri", ""))
+    func_name, qualifier = lambda_svc._resolve_name_and_qualifier(lambda_ref)
     func_data, func_config = lambda_svc._get_func_record_for_qualifier(func_name, qualifier)
     if func_data is None:
         return 502, {"Content-Type": "application/json"}, json.dumps({
@@ -1123,9 +1147,10 @@ async def _invoke_ws_lambda(api_id: str, account_id: str, route: dict, stage: st
         )
         return None
 
-    # Parse name + qualifier so alias ARNs resolve to their target version (#407).
-    uri = integration.get("integrationUri", "").replace("/invocations", "")
-    func_name, qualifier = lambda_svc._resolve_name_and_qualifier(uri)
+    # Same unwrap path as HTTP (#409): APIGW integrationUri is the wrapper form
+    # that nests the Lambda ARN between /functions/ and /invocations.
+    lambda_ref = _extract_lambda_ref_from_integration_uri(integration.get("integrationUri", ""))
+    func_name, qualifier = lambda_svc._resolve_name_and_qualifier(lambda_ref)
     func_data, func_config = lambda_svc._get_func_record_for_qualifier(func_name, qualifier)
     if func_data is None:
         return None
