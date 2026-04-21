@@ -186,11 +186,29 @@ def _send_raw_email(params):
 
     parsed = _parse_raw_mime(raw_b64)
 
+    # Extract from body parts if available
+    subject = ""
+    body_text = ""
+    body_html = None
+    for part_info in parsed.get("BodyParts", []):
+        if isinstance(part_info, dict):
+            ct = part_info.get("ContentType", "")
+            data = part_info.get("Data", "")
+            if "text/plain" in ct:
+                body_text = data
+            elif "text/html" in ct:
+                body_html = data
+        elif isinstance(part_info, str):
+            # Already parsed as string (edge case)
+            pass
+    
     record = {
         "MessageId": msg_id,
         "Source": source or parsed.get("From", ""),
-        "RawMessage": raw_b64,
-        "Parsed": parsed,
+        "To": [e.strip() for e in parsed.get("To", "").split(",") if e.strip()] or [],
+        "Subject": subject or parsed.get("Subject", ""),
+        "BodyText": body_text,
+        "BodyHtml": body_html,
         "Timestamp": time.time(),
         "Type": "SendRawEmail",
     }
