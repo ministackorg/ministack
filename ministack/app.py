@@ -379,6 +379,27 @@ def _handle_ready_request(path: str, request_id: str):
     }, json.dumps(dict(_ready_scripts_state)).encode()
 
 
+def _handle_unknown_localstack_request(path: str, request_id: str):
+    """Return a clear 404 JSON for unrecognised /_localstack/* paths.
+
+    /_localstack/health is already matched by _handle_health_request (included in
+    _HEALTH_PATHS), so only unknown paths reach here. This prevents them from
+    falling through to the S3 handler and returning confusing NoSuchBucket XML.
+    """
+    if not path.startswith("/_localstack/"):
+        return None
+    return 404, {
+        "Content-Type": "application/json",
+        "x-amzn-requestid": request_id,
+    }, json.dumps({
+        "error": (
+            f"Unknown LocalStack endpoint: {path}. "
+            "Ministack exposes /_ministack/health, /_ministack/ready, and /_ministack/reset. "
+            "See https://github.com/ministackorg/ministack for the full API."
+        )
+    }).encode()
+
+
 def _handle_lambda_download_request(path: str, method: str):
     """Serve MiniStack's Lambda layer and function-code download endpoints."""
     if path.startswith("/_ministack/lambda-layers/") and method == "GET":
@@ -442,6 +463,7 @@ async def _handle_pre_body_request(method: str, path: str, headers: dict, query_
         None if is_execute_api else _handle_options_request(method, request_id),
         _handle_health_request(path, request_id),
         _handle_ready_request(path, request_id),
+        _handle_unknown_localstack_request(path, request_id),
         _handle_lambda_download_request(path, method),
     ):
         if response is not None:
