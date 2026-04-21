@@ -1659,3 +1659,110 @@ def test_apigwv2_named_stage_still_requires_prefix(apigw, lam):
     req.add_header("Host", f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}")
     r = urllib.request.urlopen(req, timeout=5)
     assert r.status == 200
+
+
+# ========== APIGW wrapper URI unwrap (issue #409) ==========
+
+def _wrapped_uri(fn_arn: str) -> str:
+    """Build the APIGW integration URI Terraform/AWS actually send."""
+    return f"arn:aws:apigateway:us-east-1:lambda:path/2015-03-31/functions/{fn_arn}/invocations"
+
+
+def test_apigwv2_integration_wrapped_function_arn(apigw, lam):
+    """Wrapped integrationUri pointing at an unqualified Lambda ARN must invoke
+    the function — regression test for 1.3.6's wrapper mis-parse (#409)."""
+    import urllib.request
+
+    code = "def handler(e,c): return {'statusCode': 200, 'body': 'wrapped-plain'}\n"
+    fn_name = f"wrapped-plain-{uuid.uuid4().hex[:6]}"
+    arn = _make_fn(lam, fn_name, code)
+
+    api_id = apigw.create_api(Name="wrapped-plain-api", ProtocolType="HTTP")["ApiId"]
+    integ = apigw.create_integration(
+        ApiId=api_id, IntegrationType="AWS_PROXY",
+        IntegrationUri=_wrapped_uri(arn), IntegrationMethod="POST",
+    )
+    apigw.create_route(ApiId=api_id, RouteKey="GET /hello",
+                       Target=f"integrations/{integ['IntegrationId']}")
+    apigw.create_stage(ApiId=api_id, StageName="$default", AutoDeploy=True)
+
+    req = urllib.request.Request(f"http://{api_id}.execute-api.localhost:{_EXECUTE_PORT}/hello")
+    req.add_header("Host", f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}")
+    r = urllib.request.urlopen(req, timeout=5)
+    assert r.status == 200
+    assert r.read() == b"wrapped-plain"
+
+
+def test_apigwv2_integration_wrapped_alias_arn(apigw, lam):
+    """Wrapped integrationUri pointing at an alias ARN must resolve to the
+    alias target (combines #407 + #409)."""
+    import urllib.request
+
+    code = "def handler(e,c): return {'statusCode': 200, 'body': 'wrapped-alias'}\n"
+    fn_name = f"wrapped-alias-{uuid.uuid4().hex[:6]}"
+    lam.create_function(
+        FunctionName=fn_name, Runtime="python3.12", Role=_LAMBDA_ROLE,
+        Handler="index.handler", Code={"ZipFile": _make_zip(code)}, Publish=True,
+    )
+    lam.create_alias(FunctionName=fn_name, Name="live", FunctionVersion="1")
+    alias_arn = f"arn:aws:lambda:us-east-1:000000000000:function:{fn_name}:live"
+
+    api_id = apigw.create_api(Name="wrapped-alias-api", ProtocolType="HTTP")["ApiId"]
+    integ = apigw.create_integration(
+        ApiId=api_id, IntegrationType="AWS_PROXY",
+        IntegrationUri=_wrapped_uri(alias_arn), IntegrationMethod="POST",
+    )
+    apigw.create_route(ApiId=api_id, RouteKey="GET /hello",
+                       Target=f"integrations/{integ['IntegrationId']}")
+    apigw.create_stage(ApiId=api_id, StageName="$default", AutoDeploy=True)
+
+    req = urllib.request.Request(f"http://{api_id}.execute-api.localhost:{_EXECUTE_PORT}/hello")
+    req.add_header("Host", f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}")
+    r = urllib.request.urlopen(req, timeout=5)
+    assert r.status == 200
+    assert r.read() == b"wrapped-alias"
+
+
+def test_apigwv2_extract_lambda_ref_matrix():
+    """Unit-level table test for every integrationUri shape we've seen in the
+    wild. Lock the parser so #409-class bugs can't recur silently (#407, #409)."""
+    from ministack.services.apigateway import _extract_lambda_ref_from_integration_uri as unwrap
+    from ministack.services.lambda_svc import _resolve_name_and_qualifier as parse
+
+    cases = [
+        # wrapped (Terraform invoke_arn)
+        ("arn:aws:apigateway:us-east-1:lambda:path/2015-03-31/functions/arn:aws:lambda:us-east-1:000000000000:function:my-function/invocations",
+         "my-function", None),
+        # wrapped + alias
+        ("arn:aws:apigateway:us-east-1:lambda:path/2015-03-31/functions/arn:aws:lambda:us-east-1:000000000000:function:my-function:live/invocations",
+         "my-function", "live"),
+        # wrapped + version number
+        ("arn:aws:apigateway:us-east-1:lambda:path/2015-03-31/functions/arn:aws:lambda:us-east-1:000000000000:function:my-function:3/invocations",
+         "my-function", "3"),
+        # wrapped + $LATEST explicit
+        ("arn:aws:apigateway:us-east-1:lambda:path/2015-03-31/functions/arn:aws:lambda:us-east-1:000000000000:function:my-function:$LATEST/invocations",
+         "my-function", "$LATEST"),
+        # bare lambda ARN (direct CreateIntegration without wrapper)
+        ("arn:aws:lambda:us-east-1:000000000000:function:my-function", "my-function", None),
+        # bare alias ARN
+        ("arn:aws:lambda:us-east-1:000000000000:function:my-function:live", "my-function", "live"),
+        # plain function name
+        ("my-function", "my-function", None),
+        # plain name + qualifier
+        ("my-function:live", "my-function", "live"),
+        # empty string (degenerate — should not crash)
+        ("", "", None),
+        # future API version path — unwrap still works
+        ("arn:aws:apigateway:us-east-1:lambda:path/2020-04-16/functions/arn:aws:lambda:us-east-1:000000000000:function:my-function/invocations",
+         "my-function", None),
+        # cross-account wrapper (parse OK; downstream per-account lookup handles existence)
+        ("arn:aws:apigateway:us-east-1:lambda:path/2015-03-31/functions/arn:aws:lambda:us-east-1:999999999999:function:cross-acct/invocations",
+         "cross-acct", None),
+        # malformed: /invocations suffix without a wrapper
+        ("my-function/invocations", "my-function", None),
+    ]
+    for uri, expected_name, expected_q in cases:
+        ref = unwrap(uri)
+        name, qualifier = parse(ref)
+        assert name == expected_name, f"{uri!r} → name={name!r}, expected {expected_name!r}"
+        assert qualifier == expected_q, f"{uri!r} → qualifier={qualifier!r}, expected {expected_q!r}"
