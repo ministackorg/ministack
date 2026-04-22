@@ -83,6 +83,31 @@ _multipart_uploads = AccountScopedDict()
 
 # ── Persistence (metadata only — object bodies are NOT persisted here) ────
 
+# Module-level registry of per-bucket dicts that round-trip through s3.json.
+# One entry per module global: adding a new _bucket_* dict means one line here,
+# not two separate edits in get_state/restore_state. Must sit below every
+# _bucket_* declaration above — the dict literal holds live references.
+# Excludes _buckets (has bespoke objects-stripping + legacy fallback) and
+# per-bucket keys like _ownership_controls / _public_access_block that live
+# on _buckets[name] and travel with buckets_meta.
+_PERSISTED_BUCKET_DICTS = {
+    "bucket_versioning": _bucket_versioning,
+    "bucket_notifications": _bucket_notifications,
+    "bucket_tags": _bucket_tags,
+    "bucket_policies": _bucket_policies,
+    "bucket_encryption": _bucket_encryption,
+    "bucket_lifecycle": _bucket_lifecycle,
+    "bucket_cors": _bucket_cors,
+    "bucket_acl": _bucket_acl,
+    "bucket_websites": _bucket_websites,
+    "bucket_logging_config": _bucket_logging_config,
+    "bucket_accelerate_config": _bucket_accelerate_config,
+    "bucket_request_payment_config": _bucket_request_payment_config,
+    "bucket_object_lock": _bucket_object_lock,
+    "bucket_replication": _bucket_replication,
+}
+
+
 def get_state():
     # Persist bucket metadata without object bodies.
     # Use _data directly to capture ALL accounts, not just the current one.
@@ -90,46 +115,28 @@ def get_state():
     for scoped_key, bkt in _buckets._data.items():
         meta = {k: v for k, v in bkt.items() if k != "objects"}
         buckets_meta._data[scoped_key] = meta
-    return {
-        "buckets_meta": copy.deepcopy(buckets_meta),
-        "bucket_versioning": copy.deepcopy(_bucket_versioning),
-        "bucket_notifications": copy.deepcopy(_bucket_notifications),
-        "bucket_tags": copy.deepcopy(_bucket_tags),
-        "bucket_policies": copy.deepcopy(_bucket_policies),
-        "bucket_encryption": copy.deepcopy(_bucket_encryption),
-        "bucket_lifecycle": copy.deepcopy(_bucket_lifecycle),
-        "bucket_cors": copy.deepcopy(_bucket_cors),
-        "bucket_acl": copy.deepcopy(_bucket_acl),
-        "bucket_websites": copy.deepcopy(_bucket_websites),
-        "bucket_object_lock": copy.deepcopy(_bucket_object_lock),
-        "bucket_replication": copy.deepcopy(_bucket_replication),
-    }
+    state = {"buckets_meta": copy.deepcopy(buckets_meta)}
+    for key, d in _PERSISTED_BUCKET_DICTS.items():
+        state[key] = copy.deepcopy(d)
+    return state
 
 
 def restore_state(data):
-    if data:
-        bm = data.get("buckets_meta", {})
-        if isinstance(bm, AccountScopedDict):
-            # Restore all accounts' buckets directly via _data
-            for scoped_key, meta in bm._data.items():
-                if scoped_key not in _buckets._data:
-                    _buckets._data[scoped_key] = {**meta, "objects": {}}
-        else:
-            # Legacy plain-dict format (pre-multi-tenancy)
-            for name, meta in bm.items():
-                if name not in _buckets:
-                    _buckets[name] = {**meta, "objects": {}}
-        _bucket_versioning.update(data.get("bucket_versioning", {}))
-        _bucket_notifications.update(data.get("bucket_notifications", {}))
-        _bucket_tags.update(data.get("bucket_tags", {}))
-        _bucket_policies.update(data.get("bucket_policies", {}))
-        _bucket_encryption.update(data.get("bucket_encryption", {}))
-        _bucket_lifecycle.update(data.get("bucket_lifecycle", {}))
-        _bucket_cors.update(data.get("bucket_cors", {}))
-        _bucket_acl.update(data.get("bucket_acl", {}))
-        _bucket_websites.update(data.get("bucket_websites", {}))
-        _bucket_object_lock.update(data.get("bucket_object_lock", {}))
-        _bucket_replication.update(data.get("bucket_replication", {}))
+    if not data:
+        return
+    bm = data.get("buckets_meta", {})
+    if isinstance(bm, AccountScopedDict):
+        # Restore all accounts' buckets directly via _data
+        for scoped_key, meta in bm._data.items():
+            if scoped_key not in _buckets._data:
+                _buckets._data[scoped_key] = {**meta, "objects": {}}
+    else:
+        # Legacy plain-dict format (pre-multi-tenancy)
+        for name, meta in bm.items():
+            if name not in _buckets:
+                _buckets[name] = {**meta, "objects": {}}
+    for key, d in _PERSISTED_BUCKET_DICTS.items():
+        d.update(data.get(key, {}))
 
 
 try:

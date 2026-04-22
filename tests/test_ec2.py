@@ -258,6 +258,101 @@ def test_ec2_describe_instances_tag_filter_excludes_untagged(ec2):
     ec2.terminate_instances(InstanceIds=[untagged_id, tagged_id])
 
 
+def test_ec2_describe_instances_tag_filter_wildcard(ec2):
+    suffix = _uuid_mod.uuid4().hex[:8]
+    tagged = ec2.run_instances(
+        ImageId="ami-wild",
+        MinCount=1,
+        MaxCount=1,
+        TagSpecifications=[{
+            "ResourceType": "instance",
+            "Tags": [{"Key": "Env", "Value": f"prod-{suffix}"}],
+        }],
+    )["Instances"][0]["InstanceId"]
+    other = ec2.run_instances(
+        ImageId="ami-wild",
+        MinCount=1,
+        MaxCount=1,
+        TagSpecifications=[{
+            "ResourceType": "instance",
+            "Tags": [{"Key": "Env", "Value": f"dev-{suffix}"}],
+        }],
+    )["Instances"][0]["InstanceId"]
+
+    resp = ec2.describe_instances(Filters=[{"Name": "tag:Env", "Values": [f"prod-{suffix[:4]}*"]}])
+    ids = [i["InstanceId"] for r in resp["Reservations"] for i in r["Instances"]]
+    assert tagged in ids
+    assert other not in ids
+    ec2.terminate_instances(InstanceIds=[tagged, other])
+
+
+def test_ec2_describe_instances_tag_value_and_tag_key_filters(ec2):
+    suffix = _uuid_mod.uuid4().hex[:8]
+    match_v = ec2.run_instances(
+        ImageId="ami-tv",
+        MinCount=1, MaxCount=1,
+        TagSpecifications=[{"ResourceType": "instance",
+                            "Tags": [{"Key": f"anykey-{suffix}", "Value": f"payload-{suffix}"}]}],
+    )["Instances"][0]["InstanceId"]
+    other_v = ec2.run_instances(
+        ImageId="ami-tv",
+        MinCount=1, MaxCount=1,
+        TagSpecifications=[{"ResourceType": "instance",
+                            "Tags": [{"Key": f"anykey-{suffix}", "Value": f"nope-{suffix}"}]}],
+    )["Instances"][0]["InstanceId"]
+
+    resp = ec2.describe_instances(Filters=[{"Name": "tag-value", "Values": [f"payload-{suffix}"]}])
+    ids = [i["InstanceId"] for r in resp["Reservations"] for i in r["Instances"]]
+    assert match_v in ids
+    assert other_v not in ids
+
+    resp = ec2.describe_instances(Filters=[{"Name": "tag-key", "Values": [f"anykey-{suffix}"]}])
+    ids = [i["InstanceId"] for r in resp["Reservations"] for i in r["Instances"]]
+    assert match_v in ids and other_v in ids
+
+    ec2.terminate_instances(InstanceIds=[match_v, other_v])
+
+
+def test_ec2_describe_vpcs_tag_filter(ec2):
+    suffix = _uuid_mod.uuid4().hex[:8]
+    tagged_vpc = ec2.create_vpc(
+        CidrBlock="10.99.0.0/16",
+        TagSpecifications=[{"ResourceType": "vpc",
+                            "Tags": [{"Key": "Team", "Value": f"core-{suffix}"}]}],
+    )["Vpc"]["VpcId"]
+    untagged_vpc = ec2.create_vpc(CidrBlock="10.98.0.0/16")["Vpc"]["VpcId"]
+    try:
+        resp = ec2.describe_vpcs(Filters=[{"Name": "tag:Team", "Values": [f"core-{suffix}"]}])
+        ids = [v["VpcId"] for v in resp["Vpcs"]]
+        assert tagged_vpc in ids
+        assert untagged_vpc not in ids
+    finally:
+        ec2.delete_vpc(VpcId=tagged_vpc)
+        ec2.delete_vpc(VpcId=untagged_vpc)
+
+
+def test_ec2_describe_security_groups_tag_filter(ec2):
+    suffix = _uuid_mod.uuid4().hex[:8]
+    vpc = ec2.create_vpc(CidrBlock="10.97.0.0/16")["Vpc"]["VpcId"]
+    try:
+        tagged_sg = ec2.create_security_group(
+            GroupName=f"tagged-{suffix}", Description="x", VpcId=vpc,
+            TagSpecifications=[{"ResourceType": "security-group",
+                                "Tags": [{"Key": "Scope", "Value": f"svc-{suffix}"}]}],
+        )["GroupId"]
+        untagged_sg = ec2.create_security_group(
+            GroupName=f"untagged-{suffix}", Description="y", VpcId=vpc,
+        )["GroupId"]
+        resp = ec2.describe_security_groups(Filters=[{"Name": "tag:Scope", "Values": [f"svc-{suffix}"]}])
+        ids = [s["GroupId"] for s in resp["SecurityGroups"]]
+        assert tagged_sg in ids
+        assert untagged_sg not in ids
+    finally:
+        ec2.delete_security_group(GroupId=tagged_sg)
+        ec2.delete_security_group(GroupId=untagged_sg)
+        ec2.delete_vpc(VpcId=vpc)
+
+
 def test_ec2_modify_vpc_attribute(ec2):
     vpc_id = ec2.create_vpc(CidrBlock="10.10.0.0/16")["Vpc"]["VpcId"]
     ec2.modify_vpc_attribute(VpcId=vpc_id, EnableDnsSupport={"Value": True})

@@ -332,6 +332,34 @@ def test_ministack_persist_s3_metadata_roundtrip():
     _s3._buckets.pop("persist-bkt")
     _s3._bucket_versioning.pop("persist-bkt")
 
+def test_ministack_persist_s3_logging_accelerate_request_payment_roundtrip():
+    # Regression for #424 + the two adjacent landmines: logging, accelerate,
+    # and request-payment configs must all survive save/restore. Previously
+    # _bucket_logging_config / _bucket_accelerate_config / _bucket_request_payment_config
+    # were never enumerated in get_state/restore_state, so they silently
+    # evaporated on warm boot. Now driven by _PERSISTED_BUCKET_DICTS.
+    from ministack.services import s3 as _s3
+    _s3._buckets["persist-log-bkt"] = {"created": "2025-01-01T00:00:00Z", "objects": {}, "region": "us-east-1"}
+    _s3._bucket_logging_config["persist-log-bkt"] = "<BucketLoggingStatus><LoggingEnabled><TargetBucket>tgt</TargetBucket></LoggingEnabled></BucketLoggingStatus>"
+    _s3._bucket_accelerate_config["persist-log-bkt"] = "<AccelerateConfiguration><Status>Enabled</Status></AccelerateConfiguration>"
+    _s3._bucket_request_payment_config["persist-log-bkt"] = "<RequestPaymentConfiguration><Payer>Requester</Payer></RequestPaymentConfiguration>"
+    state = _s3.get_state()
+    assert "bucket_logging_config" in state
+    assert "bucket_accelerate_config" in state
+    assert "bucket_request_payment_config" in state
+    _s3._buckets.pop("persist-log-bkt")
+    _s3._bucket_logging_config.pop("persist-log-bkt")
+    _s3._bucket_accelerate_config.pop("persist-log-bkt")
+    _s3._bucket_request_payment_config.pop("persist-log-bkt")
+    _s3.restore_state(state)
+    assert "TargetBucket>tgt" in _s3._bucket_logging_config["persist-log-bkt"]
+    assert "Enabled" in _s3._bucket_accelerate_config["persist-log-bkt"]
+    assert "Requester" in _s3._bucket_request_payment_config["persist-log-bkt"]
+    _s3._buckets.pop("persist-log-bkt")
+    _s3._bucket_logging_config.pop("persist-log-bkt")
+    _s3._bucket_accelerate_config.pop("persist-log-bkt")
+    _s3._bucket_request_payment_config.pop("persist-log-bkt")
+
 def test_ministack_persist_lambda_roundtrip():
     from ministack.services import lambda_svc as _lam
     _lam._functions["persist-fn"] = {

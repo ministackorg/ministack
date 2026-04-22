@@ -600,6 +600,8 @@ def _describe_security_groups(p):
     for sg in _security_groups.values():
         if filter_ids and sg["GroupId"] not in filter_ids:
             continue
+        if not _resource_matches_tag_filters(sg["GroupId"], filters):
+            continue
         vpc_filter = filters.get("vpc-id", [])
         if vpc_filter and sg.get("VpcId", "") not in vpc_filter:
             continue
@@ -808,6 +810,8 @@ def _describe_vpcs(p):
 
 
 def _matches_vpc_filters(vpc, filters):
+    if not _resource_matches_tag_filters(vpc["VpcId"], filters):
+        return False
     for name, vals in filters.items():
         if name == "vpc-id":
             if vpc["VpcId"] not in vals:
@@ -824,16 +828,6 @@ def _matches_vpc_filters(vpc, filters):
         elif name == "is-default":
             is_def = "true" if vpc["IsDefault"] else "false"
             if is_def not in vals:
-                return False
-        elif name.startswith("tag:"):
-            tag_key = name[4:]
-            tag_list = _tags.get(vpc["VpcId"], [])
-            tag_val = next((t["Value"] for t in tag_list if t["Key"] == tag_key), None)
-            if tag_val not in vals:
-                return False
-        elif name == "tag-key":
-            tag_list = _tags.get(vpc["VpcId"], [])
-            if not any(t["Key"] in vals for t in tag_list):
                 return False
     return True
 
@@ -1009,6 +1003,8 @@ def _describe_subnets(p):
 
 
 def _matches_subnet_filters(subnet, filters):
+    if not _resource_matches_tag_filters(subnet["SubnetId"], filters):
+        return False
     for name, vals in filters.items():
         if name == "vpc-id":
             if subnet["VpcId"] not in vals:
@@ -1022,16 +1018,6 @@ def _matches_subnet_filters(subnet, filters):
         elif name == "default-for-az":
             val = "true" if subnet.get("DefaultForAz") else "false"
             if val not in vals:
-                return False
-        elif name.startswith("tag:"):
-            tag_key = name[4:]
-            tag_list = _tags.get(subnet["SubnetId"], [])
-            tag_val = next((t["Value"] for t in tag_list if t["Key"] == tag_key), None)
-            if tag_val not in vals:
-                return False
-        elif name == "tag-key":
-            tag_list = _tags.get(subnet["SubnetId"], [])
-            if not any(t["Key"] in vals for t in tag_list):
                 return False
     return True
 
@@ -1218,6 +1204,8 @@ def _describe_route_tables(p):
     results = []
     for rtb in _route_tables.values():
         if filter_ids and rtb["RouteTableId"] not in filter_ids:
+            continue
+        if not _resource_matches_tag_filters(rtb["RouteTableId"], filters):
             continue
         # Filter by association.route-table-association-id
         assoc_filter = filters.get("association.route-table-association-id", [])
@@ -2278,8 +2266,52 @@ def _parse_filters(params):
     return filters
 
 
+def _glob_match(pattern: str, value: str) -> bool:
+    """AWS filter value match: exact when no wildcards, fnmatch glob otherwise.
+    AWS supports `*` (zero or more) and `?` (exactly one) in tag filter values.
+    """
+    if "*" in pattern or "?" in pattern:
+        import fnmatch
+        return fnmatch.fnmatchcase(value, pattern)
+    return pattern == value
+
+
+def _resource_matches_tag_filters(resource_id: str, filters: dict) -> bool:
+    """Apply AWS EC2 tag-related filters to any resource by id.
+
+    Supports:
+      tag:<key>  — instance has a tag with this Key whose Value matches any
+                   entry in `vals` (wildcards permitted per entry).
+      tag-key    — instance has any tag whose Key matches any entry in `vals`.
+      tag-value  — instance has any tag whose Value matches any entry in `vals`.
+
+    Returns True when no tag-related filter is present or every tag-related
+    filter passes. Non-tag filter names are ignored here (callers handle them).
+    Safe to call unconditionally — short-circuits on the first failing filter.
+    """
+    tag_list = None
+    for name, vals in filters.items():
+        if not (name.startswith("tag:") or name in ("tag-key", "tag-value")):
+            continue
+        if tag_list is None:
+            tag_list = _tags.get(resource_id, [])
+        if name.startswith("tag:"):
+            tag_key = name[4:]
+            actual = next((t["Value"] for t in tag_list if t["Key"] == tag_key), None)
+            if actual is None or not any(_glob_match(pat, actual) for pat in vals):
+                return False
+        elif name == "tag-key":
+            if not any(_glob_match(pat, t["Key"]) for t in tag_list for pat in vals):
+                return False
+        elif name == "tag-value":
+            if not any(_glob_match(pat, t.get("Value", "")) for t in tag_list for pat in vals):
+                return False
+    return True
+
+
 def _matches_filters(inst, filters):
-    tag_list = _tags.get(inst["InstanceId"], [])
+    if not _resource_matches_tag_filters(inst["InstanceId"], filters):
+        return False
     for name, vals in filters.items():
         if name == "instance-state-name":
             if inst["State"]["Name"] not in vals:
@@ -2289,14 +2321,6 @@ def _matches_filters(inst, filters):
                 return False
         elif name == "image-id":
             if inst["ImageId"] not in vals:
-                return False
-        elif name.startswith("tag:"):
-            tag_key = name[4:]
-            tag_val = next((t["Value"] for t in tag_list if t["Key"] == tag_key), None)
-            if tag_val not in vals:
-                return False
-        elif name == "tag-key":
-            if not any(t["Key"] in vals for t in tag_list):
                 return False
     return True
 
@@ -2480,6 +2504,8 @@ def _describe_nat_gateways(params):
     for nat in _nat_gateways.values():
         if ids and nat["NatGatewayId"] not in ids:
             continue
+        if not _resource_matches_tag_filters(nat["NatGatewayId"], filters):
+            continue
         if filters.get("state") and nat["State"] not in filters["state"]:
             continue
         if filters.get("vpc-id") and nat["VpcId"] not in filters["vpc-id"]:
@@ -2550,6 +2576,8 @@ def _describe_network_acls(params):
     items = ""
     for acl in _network_acls.values():
         if ids and acl["NetworkAclId"] not in ids:
+            continue
+        if not _resource_matches_tag_filters(acl["NetworkAclId"], filters):
             continue
         if filters.get("vpc-id") and acl["VpcId"] not in filters["vpc-id"]:
             continue
@@ -2691,6 +2719,8 @@ def _describe_flow_logs(params):
     for fl in _flow_logs.values():
         if ids and fl["FlowLogId"] not in ids:
             continue
+        if not _resource_matches_tag_filters(fl["FlowLogId"], filters):
+            continue
         if filters.get("resource-id") and fl["ResourceId"] not in filters["resource-id"]:
             continue
         items += f"""<item>
@@ -2766,6 +2796,8 @@ def _describe_vpc_peering_connections(params):
     items = ""
     for pcx in _vpc_peering.values():
         if ids and pcx["VpcPeeringConnectionId"] not in ids:
+            continue
+        if not _resource_matches_tag_filters(pcx["VpcPeeringConnectionId"], filters):
             continue
         if filters.get("status-code") and pcx["Status"]["Code"] not in filters["status-code"]:
             continue
@@ -3022,6 +3054,8 @@ def _describe_prefix_lists(p):
     for pl in _prefix_lists.values():
         if filter_ids and pl["PrefixListId"] not in filter_ids:
             continue
+        if not _resource_matches_tag_filters(pl["PrefixListId"], filters):
+            continue
         if filters.get("prefix-list-name") and pl.get("PrefixListName", "") not in filters["prefix-list-name"]:
             continue
         entries = "".join(f"<item><cidr>{e['Cidr']}</cidr></item>" for e in pl.get("Entries", []))
@@ -3065,6 +3099,8 @@ def _describe_managed_prefix_lists(p):
     items = ""
     for pl in _prefix_lists.values():
         if filter_ids and pl["PrefixListId"] not in filter_ids:
+            continue
+        if not _resource_matches_tag_filters(pl["PrefixListId"], filters):
             continue
         if filters.get("prefix-list-name") and pl.get("PrefixListName", "") not in filters["prefix-list-name"]:
             continue
@@ -3160,6 +3196,8 @@ def _describe_vpn_gateways(p):
     items = ""
     for vgw in _vpn_gateways.values():
         if filter_ids and vgw["VpnGatewayId"] not in filter_ids:
+            continue
+        if not _resource_matches_tag_filters(vgw["VpnGatewayId"], filters):
             continue
         if filters.get("attachment.vpc-id"):
             vpc_ids = [a["VpcId"] for a in vgw.get("Attachments", [])]
@@ -3920,6 +3958,8 @@ def _describe_launch_templates(p):
         if lt_ids and lt["LaunchTemplateId"] not in lt_ids:
             continue
         if lt_names and lt["LaunchTemplateName"] not in lt_names:
+            continue
+        if not _resource_matches_tag_filters(lt["LaunchTemplateId"], filters):
             continue
         if filters:
             if "launch-template-name" in filters:
