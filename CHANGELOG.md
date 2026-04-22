@@ -15,6 +15,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Changed
 - **`_parse_filters` consumers share a single tag-matching helper** — the three `_matches_*_filters` functions (instances, VPCs, subnets) and 9 inline filter sites now all call `_resource_matches_tag_filters(resource_id, filters)` instead of re-implementing `tag:` handling per resource. New EC2 resource types need zero tag-filter code — the helper walks the resource's entry in `_tags` and short-circuits on the first failing tag predicate.
+- **ECS exited-container reaper** — `RunTask` spawned containers via `docker run -d` without `auto_remove`, so every short-lived task command (e.g. `echo`, `wget` probes) exited but left an `Exited (0)` container on the Docker daemon indefinitely. `StopTask` and `/_ministack/reset` only ever listed running containers, so the exited ones accumulated across sessions. A background daemon thread now sweeps exited `ministack=ecs` containers every `ECS_REAP_INTERVAL_SECONDS` (default 60), `reset()` now reaps exited containers alongside running ones, and the reaper starts lazily on first `RunTask` so no-docker install paths are unaffected.
 
 ---
 

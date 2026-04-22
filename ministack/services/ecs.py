@@ -27,6 +27,7 @@ import copy
 import json
 import logging
 import os
+import threading
 import time
 
 from ministack.core.persistence import load_state
@@ -54,6 +55,46 @@ _account_settings = AccountScopedDict()
 _capacity_providers = AccountScopedDict()
 
 _docker = None
+
+# ECS exited-container reaper. Every ministack=ecs container we start via
+# RunTask lingers after its command exits (docker-py detach=True without
+# auto_remove leaves Exited containers on the daemon). StopTask and reset
+# clean what they know about, but short-lived commands (echo, wget probes)
+# exit on their own and accumulate indefinitely. A background daemon thread
+# sweeps them every ECS_REAP_INTERVAL_SECONDS (default 60).
+_ECS_REAP_INTERVAL = int(os.environ.get("ECS_REAP_INTERVAL_SECONDS", "60"))
+_ecs_reaper_started = False
+_ecs_reaper_lock = threading.Lock()
+
+
+def _reap_exited_containers():
+    docker_client = _get_docker()
+    if not docker_client:
+        return
+    # all=True includes exited containers; reset() uses list() (running only),
+    # so this complements — and overlaps harmlessly — with the reset path.
+    for c in docker_client.containers.list(all=True, filters={"label": "ministack=ecs"}):
+        if c.status in ("exited", "dead", "created"):
+            try:
+                c.remove(v=True, force=True)
+            except Exception:
+                pass
+
+
+def _ensure_ecs_reaper_thread():
+    global _ecs_reaper_started
+    with _ecs_reaper_lock:
+        if _ecs_reaper_started:
+            return
+        def _loop():
+            while True:
+                time.sleep(_ECS_REAP_INTERVAL)
+                try:
+                    _reap_exited_containers()
+                except Exception as exc:
+                    logger.debug("ECS reaper iteration error: %s", exc)
+        threading.Thread(target=_loop, daemon=True, name="ministack-ecs-reaper").start()
+        _ecs_reaper_started = True
 
 
 # ── Persistence ────────────────────────────────────────────
@@ -879,6 +920,7 @@ def _run_task(data):
 
         docker_client = _get_docker()
         if docker_client and td:
+            _ensure_ecs_reaper_thread()
             # Detect the Docker network Ministack is running on,
             # so ECS containers can reach sibling services (S3, etc.)
             ecs_network = None
@@ -1624,13 +1666,16 @@ _ACTION_MAP = {
 def reset():
     docker_client = _get_docker()
     if docker_client:
-        # Stop containers by label instead of chasing individual IDs —
-        # avoids slow 404s for containers that were already removed.
+        # Stop + remove every ministack=ecs container (running OR exited).
+        # Including exited ones matters because short-lived commands
+        # (echo, wget probes) leave Exited containers behind that otherwise
+        # only the background reaper would remove.
         try:
-            for c in docker_client.containers.list(filters={"label": "ministack=ecs"}):
+            for c in docker_client.containers.list(all=True, filters={"label": "ministack=ecs"}):
                 try:
-                    c.stop(timeout=2)
-                    c.remove(v=True)
+                    if c.status == "running":
+                        c.stop(timeout=2)
+                    c.remove(v=True, force=True)
                 except Exception:
                     pass
         except Exception:
