@@ -559,3 +559,20 @@ def test_ses_messages_endpoint_v2(sesv2):
     assert len(v2_emails) >= 1, f"Expected v2.SendEmail, got {[m['Type'] for m in data['messages']]}"
     assert v2_emails[0]["Subject"] == "Test v2 subject"
 
+def test_ses_messages_endpoint_reset(ses):
+    """ Calling POST /_ministack/reset clears stored SES messages. """
+    ses.verify_email_identity(EmailAddress="from@example.com")
+    ses.send_email(                                                                                                                                                 
+        Source="from@example.com",
+        Destination={"ToAddresses": ["to@example.com"]},                                                                                                            
+        Message={"Subject": {"Data": "Hi"}, "Body": {"Text": {"Data": "body"}}},                                                           
+    )                                                                                                                                                               
+    import urllib.request
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+
+    urllib.request.urlopen(                                                                                                                                         
+        urllib.request.Request(f"{endpoint}/_ministack/reset", method="POST")                                                                                       
+    )                                  
+    with urllib.request.urlopen(f"{endpoint}/_ministack/ses/messages") as r:                                                                                        
+        data = json.loads(r.read())                                                                                                                                 
+    assert data == {"messages": []}    
