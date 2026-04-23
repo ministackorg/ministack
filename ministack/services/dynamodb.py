@@ -313,6 +313,7 @@ def _create_table(data):
         "BillingModeSummary": {"BillingMode": data.get("BillingMode", "PROVISIONED")},
         "StreamSpecification": data.get("StreamSpecification"),
         "SSEDescription": _sse_description_from_spec(data.get("SSESpecification")),
+        "DeletionProtectionEnabled": data.get("DeletionProtectionEnabled", False),
     }
     if data.get("StreamSpecification"):
         stream_label = now_iso()
@@ -327,6 +328,9 @@ def _delete_table(data):
     name = data.get("TableName")
     if name not in _tables:
         return error_response_json("ResourceNotFoundException", f"Requested resource not found: Table: {name} not found", 400)
+    if _tables[name].get("DeletionProtectionEnabled"):
+        return error_response_json("ValidationException",
+            "Table can't be deleted as deletion protection is enabled", 400)
     desc = _table_description(name)
     desc["TableStatus"] = "DELETING"
     del _tables[name]
@@ -378,6 +382,8 @@ def _update_table(data):
         # response-shape SSEDescription with a proper Status field so the
         # Terraform waiter can observe ENABLED/DISABLED and return.
         table["SSEDescription"] = _sse_description_from_spec(data["SSESpecification"])
+    if "DeletionProtectionEnabled" in data:
+        table["DeletionProtectionEnabled"] = data["DeletionProtectionEnabled"]
 
     for update in data.get("GlobalSecondaryIndexUpdates", []):
         if "Create" in update:
@@ -433,6 +439,7 @@ def _table_description(name):
         desc["LatestStreamArn"] = t.get("LatestStreamArn", "")
     if t.get("SSEDescription"):
         desc["SSEDescription"] = t["SSEDescription"]
+    desc["DeletionProtectionEnabled"] = t.get("DeletionProtectionEnabled", False)
     desc["WarmThroughput"] = t.get("WarmThroughput", {
         "ReadUnitsPerSecond": 0,
         "WriteUnitsPerSecond": 0,
