@@ -105,6 +105,7 @@ _usage_plan_keys = AccountScopedDict()     # plan_id -> {key_id -> UsagePlanKey}
 _domain_names = AccountScopedDict()        # domain_name -> DomainName
 _base_path_mappings = AccountScopedDict()  # domain_name -> {base_path -> BasePathMapping}
 _v1_tags = AccountScopedDict()             # resource_arn -> {key -> value}
+_account_settings = AccountScopedDict()    # singleton per account: stores fields set via UpdateAccount
 
 
 # ---- Helpers ----
@@ -306,6 +307,7 @@ def get_state():
         "domain_names": _domain_names,
         "base_path_mappings": _base_path_mappings,
         "v1_tags": _v1_tags,
+        "account_settings": _account_settings,
     }
 
 
@@ -323,6 +325,7 @@ def load_persisted_state(data):
     _domain_names.update(data.get("domain_names", {}))
     _base_path_mappings.update(data.get("base_path_mappings", {}))
     _v1_tags.update(data.get("v1_tags", {}))
+    _account_settings.update(data.get("account_settings", {}))
 
 
 def reset():
@@ -339,6 +342,7 @@ def reset():
     _domain_names.clear()
     _base_path_mappings.clear()
     _v1_tags.clear()
+    _account_settings.clear()
 
 
 # ---- Control plane router ----
@@ -356,6 +360,13 @@ async def handle_request(method, path, headers, body, query_params):
         return _v1_error("NotFoundException", f"Unknown path: {path}", 404)
 
     top = parts[0]
+
+    if top == "account":
+        if method == "GET":
+            return _get_account()
+        if method == "PATCH":
+            return _update_account(data)
+        return _v1_error("MethodNotAllowedException", f"Method not allowed: {method} /account", 405)
 
     if top == "tags":
         # /tags/{resourceArn} — ARN may contain slashes
@@ -1602,3 +1613,32 @@ def _untag_v1_resource(resource_arn, tag_keys):
     for key in tag_keys:
         existing.pop(key, None)
     return 204, {}, b""
+
+
+# ---- Control plane: Account ----
+# GetAccount / UpdateAccount — singleton per AWS account. Terraform's
+# aws_api_gateway_account resource reads and writes /account with a single
+# patch op for cloudwatchRoleArn.
+
+_ACCOUNT_DEFAULTS = {
+    "cloudwatchRoleArn": None,
+    "throttleSettings": {"burstLimit": 5000, "rateLimit": 10000},
+    "features": ["UsagePlans"],
+    "apiKeyVersion": "4",
+}
+
+
+def _get_account():
+    overrides = _account_settings.get("settings") or {}
+    merged = {**_ACCOUNT_DEFAULTS, **overrides}
+    # throttleSettings is a dict — merge nested so a partial override keeps the other limit
+    if "throttleSettings" in overrides:
+        merged["throttleSettings"] = {**_ACCOUNT_DEFAULTS["throttleSettings"], **overrides["throttleSettings"]}
+    return _v1_response(merged)
+
+
+def _update_account(data):
+    current = dict(_account_settings.get("settings") or {})
+    _apply_patch(current, data.get("patchOperations", []))
+    _account_settings["settings"] = current
+    return _get_account()

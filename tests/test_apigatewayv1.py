@@ -42,6 +42,31 @@ def test_apigwv1_get_rest_apis(apigw_v1):
     apigw_v1.delete_rest_api(restApiId=id1)
     apigw_v1.delete_rest_api(restApiId=id2)
 
+def test_apigwv1_get_account_defaults_and_update_roundtrip(apigw_v1):
+    """GetAccount returns AWS-shaped defaults; UpdateAccount with /cloudwatchRoleArn
+    patch op round-trips. Single test to avoid cross-test state bleed on the
+    singleton per-account /account settings."""
+    # Clear any prior state on the singleton (singleton per account, shared across tests)
+    apigw_v1.update_account(patchOperations=[
+        {"op": "replace", "path": "/cloudwatchRoleArn", "value": ""}
+    ])
+
+    resp = apigw_v1.get_account()
+    assert resp["throttleSettings"] == {"burstLimit": 5000, "rateLimit": 10000}
+    assert resp["features"] == ["UsagePlans"]
+    assert resp["apiKeyVersion"] == "4"
+
+    # Mirrors Terraform aws_api_gateway_account: single cloudwatchRoleArn replace.
+    role_arn = "arn:aws:iam::000000000000:role/apigw-cloudwatch-test"
+    apigw_v1.update_account(patchOperations=[
+        {"op": "replace", "path": "/cloudwatchRoleArn", "value": role_arn}
+    ])
+    resp = apigw_v1.get_account()
+    assert resp["cloudwatchRoleArn"] == role_arn
+    # Defaults still present after the patch
+    assert resp["throttleSettings"] == {"burstLimit": 5000, "rateLimit": 10000}
+
+
 def test_apigwv1_rest_api_policy_terraform_roundtrip(apigw_v1):
     """GetRestApi must return `policy` JSON-string-escape-encoded, matching
     real AWS. Terraform-provider-aws's flattenAPIPolicy wraps the SDK-decoded
