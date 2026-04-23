@@ -192,11 +192,31 @@ def _send_raw_email(params):
 
     parsed = _parse_raw_mime(raw_b64)
 
+    # Extract from body parts if available
+    subject = ""
+    body_text = ""
+    body_html = None
+    for part_info in parsed.get("BodyParts", []):
+        if isinstance(part_info, dict):
+            ct = part_info.get("ContentType", "")
+            data = part_info.get("Data", "")
+            if "text/plain" in ct:
+                body_text = data
+            elif "text/html" in ct:
+                body_html = data
+        elif isinstance(part_info, str):
+            # Already parsed as string (edge case)
+            pass
+    
     record = {
         "MessageId": msg_id,
         "Source": source or parsed.get("From", ""),
-        "RawMessage": raw_b64,
-        "Parsed": parsed,
+        "To": [e.strip() for e in parsed.get("To", "").split(",") if e.strip()] or [],
+        "CC": [e.strip() for e in parsed.get("Cc", "").split(",") if e.strip()] or [],
+        "BCC": [e.strip() for e in parsed.get("Bcc", "").split(",") if e.strip()] or [],
+        "Subject": subject or parsed.get("Subject", ""),
+        "BodyText": body_text,
+        "BodyHtml": body_html,
         "Timestamp": time.time(),
         "Type": "SendRawEmail",
     }
@@ -206,7 +226,9 @@ def _send_raw_email(params):
     actual_source = source or parsed.get("From", "")
     raw_destinations = _collect_list(params, "Destinations.member")
     to_from_parsed = [a.strip() for a in parsed.get("To", "").split(",") if a.strip()]
-    relay_addrs = raw_destinations or to_from_parsed
+    cc_from_parsed = [a.strip() for a in parsed.get("Cc", "").split(",") if a.strip()]
+    bcc_from_parsed = [a.strip() for a in parsed.get("Bcc", "").split(",") if a.strip()]
+    relay_addrs = raw_destinations or (to_from_parsed + cc_from_parsed + bcc_from_parsed)
     if actual_source and relay_addrs:
         try:
             raw_bytes = raw_b64.encode('utf-8') if isinstance(raw_b64, str) else raw_b64

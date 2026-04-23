@@ -59,7 +59,7 @@ _NON_S3_VHOST_NAMES = frozenset({
 
 from ministack.core.hypercorn_compat import install as _install_hypercorn_compat
 from ministack.core.persistence import PERSIST_STATE, load_state, save_all
-from ministack.core.responses import set_request_account_id, set_request_region
+from ministack.core.responses import _12_DIGIT_RE, set_request_account_id, set_request_region
 from ministack.core.router import detect_service, extract_access_key_id, extract_region
 
 # Must run before hypercorn emits its first Expect: 100-continue reply.
@@ -452,6 +452,66 @@ async def _handle_admin_reset(path: str, method: str, query_params: dict):
     return 200, {"Content-Type": "application/json"}, json.dumps({"reset": "ok"}).encode()
 
 
+async def _handle_ses_messages_request(method: str, path: str, headers: dict, query_params: dict):
+    """Handle SES messages inspection endpoint.
+
+    Supports filtering by account via the 'account' query parameter. When provided,
+    sets the request context to that account so emails are retrieved from the correct
+    AccountScopedDict._sent_emails_list.
+    """
+    if path != "/_ministack/ses/messages" or method != "GET":
+        return None
+
+    account_id = None
+    if "account" in query_params:
+        raw_account = query_params["account"]
+        account_id = raw_account[0] if isinstance(raw_account, (list, tuple)) else raw_account
+        if not _12_DIGIT_RE.match(account_id):
+            return 400, {"Content-Type": "application/json"}, json.dumps({
+                "__type": "InvalidAccountID",
+                "message": f"Account ID must be 12 digits, got: {account_id}",
+            }).encode()
+
+    try:
+        mod = _get_module("ses")
+        sent_emails_dict = {}
+        try:
+            all_data = mod._sent_emails.to_dict()
+            for (acct, key), val in all_data.items():
+                if key == "entries" and isinstance(val, list):
+                    sent_emails_dict[acct] = val
+        except Exception:
+            # Fallback: empty dict on any unexpected shape
+            sent_emails_dict = {}
+
+        response = {
+            "messages": {
+                acct: [
+                    {
+                        "MessageId": rec["MessageId"],
+                        "Source": rec["Source"],
+                        "To": rec.get("To", []),
+                        "CC": rec.get("CC", []),
+                        "BCC": rec.get("BCC", []),
+                        "Subject": rec.get("RenderedSubject") or rec.get("Subject", ""),
+                        "BodyText": rec.get("RenderedBodyText") or rec.get("BodyText", ""),
+                        "BodyHtml": rec.get("RenderedBodyHtml") or rec.get("BodyHtml"),
+                        "Timestamp": rec["Timestamp"],
+                        "Type": rec["Type"],
+                    }
+                    for rec in (recs if isinstance(recs, list) else [])
+                ]
+                for acct, recs in sent_emails_dict.items()
+                if account_id is None or acct == account_id
+            }
+        }
+    except Exception as e:
+        logger.exception("Error retrieving SES messages: %s", e)
+        return 500, {"Content-Type": "application/json"}, json.dumps({"message": str(e)}).encode()
+
+    return 200, {"Content-Type": "application/json"}, json.dumps(response).encode()
+
+
 async def _handle_pre_body_request(method: str, path: str, headers: dict, query_params: dict, request_id: str):
     """Handle fast-path routes that do not require request body parsing."""
     # OPTIONS on an execute-api host / path MUST flow through apigateway.handle_execute
@@ -472,6 +532,11 @@ async def _handle_pre_body_request(method: str, path: str, headers: dict, query_
     response = await _handle_cognito_get_request(method, path, headers, query_params)
     if response is not None:
         return response
+    
+    response = await _handle_ses_messages_request(method, path, headers, query_params)
+    if response is not None:
+        return response
+
     return await _handle_admin_reset(path, method, query_params)
 
 

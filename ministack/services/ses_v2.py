@@ -13,10 +13,11 @@ import json
 import logging
 import os
 import re
+import time
 
 from ministack.core.persistence import PERSIST_STATE, load_state
 from ministack.core.responses import AccountScopedDict, get_account_id, json_response, new_uuid, now_iso, get_region
-from ministack.services.ses import _build_mime_message, _smtp_relay
+from ministack.services.ses import _build_mime_message, _smtp_relay, _sent_emails_list, _parse_raw_mime
 
 logger = logging.getLogger("ses-v2")
 
@@ -68,11 +69,14 @@ async def handle_request(method, path, headers, body, query_params):
 
     # GET /v2/email/account
     if sub == "/account" and method == "GET":
+        cutoff = time.time() - 86400
+        sent_list = _sent_emails_list()
+        sent_24h = sum(1 for e in sent_list if e["Timestamp"] >= cutoff)
         return json_response({
             "DedicatedIpAutoWarmupEnabled": False,
             "EnforcementStatus": "HEALTHY",
             "ProductionAccessEnabled": True,
-            "SendQuota": {"Max24HourSend": 50000.0, "MaxSendRate": 14.0, "SentLast24Hours": 0.0},
+            "SendQuota": {"Max24HourSend": 50000.0, "MaxSendRate": 14.0, "SentLast24Hours": float(sent_24h)},
             "SendingEnabled": True,
             "SuppressionAttributes": {"SuppressedReasons": []},
         })
@@ -88,34 +92,61 @@ async def handle_request(method, path, headers, body, query_params):
     # POST /v2/email/outbound-emails  (SendEmail)
     if sub == "/outbound-emails" and method == "POST":
         msg_id = f"ministack-{new_uuid()}"
-        logger.info("SESv2 SendEmail: MessageId=%s", msg_id)
-        # SMTP relay
         source = data.get("FromEmailAddress", "")
         dest = data.get("Destination", {})
         to_addrs = dest.get("ToAddresses", [])
         cc_addrs = dest.get("CcAddresses", [])
         bcc_addrs = dest.get("BccAddresses", [])
+        content = data.get("Content", {})
+        simple = content.get("Simple", {})
+        raw = content.get("Raw", {})
+        subj = ""
+        body_text = ""
+        body_html = None
+        if simple:
+            subj = simple.get("Subject", {}).get("Data", "")
+            body_text = simple.get("Body", {}).get("Text", {}).get("Data", "")
+            body_html = simple.get("Body", {}).get("Html", {}).get("Data", "")
+        elif raw:
+            raw_data = raw.get("Data", "")
+            parsed = _parse_raw_mime(raw_data)
+            subj = parsed.get("Subject", "") or ""
+            for part_info in parsed.get("BodyParts", []):
+                if isinstance(part_info, dict):
+                    ct = part_info.get("ContentType", "")
+                    data = part_info.get("Data", "")
+                    if "text/plain" in ct:
+                        body_text = data
+                    elif "text/html" in ct:
+                        body_html = data
+            # Extract Cc/Bcc from raw MIME headers when not provided via Destination
+            if not cc_addrs:
+                cc_addrs = [e.strip() for e in parsed.get("Cc", "").split(",") if e.strip()]
+            if not bcc_addrs:
+                bcc_addrs = [e.strip() for e in parsed.get("Bcc", "").split(",") if e.strip()]
+
         all_addrs = to_addrs + cc_addrs + bcc_addrs
         if source and all_addrs:
-            content = data.get("Content", {})
-            simple = content.get("Simple", {})
-            raw = content.get("Raw", {})
-            if simple:
-                subj = simple.get("Subject", {}).get("Data", "")
-                body_text = simple.get("Body", {}).get("Text", {}).get("Data", "")
-                body_html = simple.get("Body", {}).get("Html", {}).get("Data", "")
-                mime_str = _build_mime_message(source, to_addrs, cc_addrs, bcc_addrs,
-                                               subj, body_text, body_html, msg_id)
-                _smtp_relay(source, all_addrs, mime_str)
-            elif raw:
-                import base64
-                raw_data = raw.get("Data", "")
-                try:
-                    decoded = base64.b64decode(raw_data).decode('utf-8', errors='replace')
-                except Exception:
-                    decoded = raw_data
-                raw_str = f'Message-ID: <{msg_id}>\r\n' + decoded
-                _smtp_relay(source, all_addrs, raw_str)
+            mime_str = _build_mime_message(source, to_addrs, cc_addrs, bcc_addrs,
+                                           subj, body_text, body_html, msg_id)
+            _smtp_relay(source, all_addrs, mime_str)
+
+        # Append to shared sent_emails list for inspection endpoint visibility
+        record = {
+            "MessageId": msg_id,
+            "Source": source,
+            "To": to_addrs,
+            "CC": cc_addrs,
+            "BCC": bcc_addrs,
+            "Subject": subj,
+            "BodyText": body_text,
+            "BodyHtml": body_html,
+            "Timestamp": time.time(),
+            "Type": "v2.SendEmail",
+        }
+        _sent_emails_list().append(record)
+
+        logger.info("SESv2 SendEmail: MessageId=%s | %s -> %s", msg_id, source, to_addrs)
         return json_response({"MessageId": msg_id})
 
     # POST /v2/email/identities  (CreateEmailIdentity)

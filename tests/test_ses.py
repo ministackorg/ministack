@@ -1,6 +1,7 @@
 """SES tests — API operations + SMTP relay integration."""
 
 import io
+import base64
 import json
 import os
 import pytest
@@ -9,9 +10,9 @@ import uuid as _uuid_mod
 import zipfile
 from botocore.exceptions import ClientError
 from urllib.parse import urlparse
+from unittest.mock import MagicMock, patch
 
 
-# ========== from test_ses.py ==========
 
 def test_ses_parse_smtp_host_not_set():
     from ministack.services.ses import _parse_smtp_host
@@ -243,15 +244,6 @@ def test_ses_v2_get_account(sesv2):
     assert resp["SendingEnabled"] is True
     assert resp["ProductionAccessEnabled"] is True
 
-# ========== from test_ses_smtp_relay.py ==========
-
-"""Unit tests for SES SMTP relay functionality."""
-import os
-from unittest.mock import MagicMock, patch
-
-import pytest
-
-
 @pytest.fixture(autouse=True)
 def _clear_smtp_host():
     """Ensure SMTP_HOST is clean before/after each test."""
@@ -448,3 +440,248 @@ def test_ses_smtp_relay_send_templated_email(monkeypatch):
         mock_smtp.sendmail.assert_called_once()
         msg = _parse_mime(mock_smtp.sendmail.call_args[0][2])
         assert 'Hello World' in msg['Subject']
+
+# ---------------------------------------------------------------------------
+# Endpoint tests for the new /_ministack/ses/messages endpoint
+# Verifies acceptance criteria from issue #415:
+# - v1 SES: SendEmail, SendRawEmail, SendTemplatedEmail, SendBulkTemplatedEmail
+# - v2 SES: SendEmail via sesv2 client
+# ---------------------------------------------------------------------------
+
+def test_ses_messages_endpoint_all_v1_send_types(ses):
+    """GET /_ministack/ses/messages shows all v1 send operations."""
+    import urllib.request
+    
+    # Prepare template for SendTemplatedEmail and SendBulkTemplatedEmail
+    ses.create_template(Template={
+        "TemplateName": "test-template",
+        "SubjectPart": "Hello {{name}}",
+        "TextPart": "Hi {{name}}!",
+    })
+    
+    # Test 1: Verify SendEmail appears
+    ses.verify_email_identity(EmailAddress="v1-sender@example.com")
+    ses.send_email(
+        Source="v1-sender@example.com",
+        Destination={"ToAddresses": ["recipient@example.com"]},
+        Message={
+            "Subject": {"Data": "Test v1 subject"},
+            "Body": {"Text": {"Data": "Hello from MiniStack SES v1"}},
+        },
+    )
+    
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+    url = f"{endpoint}/_ministack/ses/messages"
+    req = urllib.request.Request(url, method="GET")
+    with urllib.request.urlopen(req, timeout=5) as r:
+        data = json.loads(r.read().decode())
+    
+    assert "messages" in data
+    send_emails = [m for m in data["messages"]["000000000000"] if m["Type"] == "SendEmail" and m["Source"] == "v1-sender@example.com"]
+    assert len(send_emails) >= 1, f"Expected SendEmail, got {[m['Type'] for m in data['messages']['000000000000']]}"
+    
+    # Test 2: Verify SendRawEmail appears
+    ses.verify_email_identity(EmailAddress="raw-sender@example.com")
+    raw = (
+        "From: raw-sender@example.com\r\nTo: dest@example.com\r\nSubject: Raw Test\r\n\r\nRaw body"
+    )
+    ses.send_raw_email(RawMessage={"Data": raw})
+    
+    req = urllib.request.Request(url, method="GET")
+    with urllib.request.urlopen(req, timeout=5) as r:
+        data = json.loads(r.read().decode())
+    
+    raw_emails = [m for m in data["messages"]["000000000000"] if m["Type"] == "SendRawEmail" and m["Source"] == "raw-sender@example.com"]
+    assert len(raw_emails) >= 1, f"Expected SendRawEmail, got {[m['Type'] for m in data['messages']['000000000000']]}"
+    
+    # Test 3: Verify SendTemplatedEmail appears
+    resp = ses.send_templated_email(
+        Source="template-sender@example.com",
+        Destination={"ToAddresses": ["user@example.com"]},
+        Template="test-template",
+        TemplateData=json.dumps({"name": "Alice"}),
+    )
+    
+    req = urllib.request.Request(url, method="GET")
+    with urllib.request.urlopen(req, timeout=5) as r:
+        data = json.loads(r.read().decode())
+    
+    templated_emails = [m for m in data["messages"]["000000000000"] if m["Type"] == "SendTemplatedEmail" and m["Source"] == "template-sender@example.com"]
+    assert len(templated_emails) >= 1, f"Expected SendTemplatedEmail, got {[m['Type'] for m in data['messages']['000000000000']]}"
+    
+    # Test 4: Verify SendBulkTemplatedEmail appears
+    resp = ses.send_bulk_templated_email(
+        Source="bulk-sender@example.com",
+        Template="test-template",
+        DefaultTemplateData=json.dumps({"name": "Bob"}),
+        Destinations=[
+            {
+                "Destination": {"ToAddresses": ["user1@example.com"]},
+                "ReplacementTemplateData": json.dumps({"name": "Bob"}),
+            },
+            {
+                "Destination": {"ToAddresses": ["user2@example.com"]},
+                "ReplacementTemplateData": json.dumps({"name": "Carol"}),
+            },
+        ],
+    )
+    
+    req = urllib.request.Request(url, method="GET")
+    with urllib.request.urlopen(req, timeout=5) as r:
+        data = json.loads(r.read().decode())
+    
+    bulk_emails = [m for m in data["messages"]["000000000000"] if m["Type"] == "SendBulkTemplatedEmail" and m["Source"] == "bulk-sender@example.com"]
+    assert len(bulk_emails) >= 2, f"Expected SendBulkTemplatedEmail (>=2), got {[m['Type'] for m in data['messages']['000000000000']]}"
+
+def test_ses_messages_endpoint_v2(sesv2):
+    """GET /_ministack/ses/messages shows v2 SendEmail via sesv2 client."""
+    import urllib.request
+    
+    sesv2.send_email(
+        FromEmailAddress="v2-sender@example.com",
+        Destination={"ToAddresses": ["recipient@example.com"]},
+        Content={
+            "Simple": {
+                "Subject": {"Data": "Test v2 subject"},
+                "Body": {"Text": {"Data": "Hello from MiniStack SES v2"}},
+            }
+        },
+    )
+    
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+    url = f"{endpoint}/_ministack/ses/messages"
+    req = urllib.request.Request(url, method="GET")
+    with urllib.request.urlopen(req, timeout=5) as r:
+        data = json.loads(r.read().decode())
+    
+    assert "messages" in data
+    v2_emails = [m for m in data["messages"]["000000000000"] if m["Type"] == "v2.SendEmail" and m["Source"] == "v2-sender@example.com"]
+    assert len(v2_emails) >= 1, f"Expected v2.SendEmail, got {[m['Type'] for m in data['messages']]}"
+    assert v2_emails[0]["Subject"] == "Test v2 subject"
+
+def test_ses_messages_endpoint_reset(ses):
+    """ Calling POST /_ministack/reset clears stored SES messages. """
+    ses.verify_email_identity(EmailAddress="from@example.com")
+    ses.send_email(                                                                                                                                                 
+        Source="from@example.com",
+        Destination={"ToAddresses": ["to@example.com"]},                                                                                                            
+        Message={"Subject": {"Data": "Hi"}, "Body": {"Text": {"Data": "body"}}},                                                           
+    )                                                                                                                                                               
+    import urllib.request
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+
+    urllib.request.urlopen(                                                                                                                                         
+        urllib.request.Request(f"{endpoint}/_ministack/reset", method="POST")                                                                                       
+    )                                  
+    with urllib.request.urlopen(f"{endpoint}/_ministack/ses/messages") as r:                                                                                        
+        data = json.loads(r.read())                                                                                                                                 
+    assert data == {"messages": {}}
+
+# ---------------------------------------------------------------------------
+# Account filtering test for /_ministack/ses/messages endpoint
+#
+# Verifies that the ?account query parameter properly validates and filters emails.
+# Invalid non-12-digit accounts now return a 400 InvalidAccountID error.
+# ---------------------------------------------------------------------------
+def _client(service, access_key="test"):
+    """Create a boto3 client with a specific access key."""
+    import boto3
+    from botocore.config import Config
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+    region = "us-east-1"
+    return boto3.client(
+        service,
+        endpoint_url=endpoint,
+        aws_access_key_id=access_key,
+        aws_secret_access_key="test",
+        region_name=region,
+        config=Config(region_name=region, retries={"max_attempts": 0}),
+    )
+
+def test_ses_messages_endpoint_account_filter():
+    """GET /_ministack/ses/messages?account=X filters by account ID."""
+    import urllib.request
+
+    # Clear any existing messages on the running server
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+    urllib.request.urlopen(urllib.request.Request(f"{endpoint}/_ministack/reset", method="POST"))
+
+    # Account 1 and Account 2
+    ACCOUNT_1 = "011111111111"
+    ACCOUNT_2 = "987654321098"
+    ses_account_1 = _client("ses", access_key=ACCOUNT_1)
+    ses_account_2 = _client("ses", access_key=ACCOUNT_2)
+
+    # Send 2 emails to ACCOUNT_1
+    ses_account_1.verify_email_identity(EmailAddress=f"sender-{ACCOUNT_1}@example.com")
+    ses_account_1.send_email(
+        Source=f"sender-{ACCOUNT_1}@example.com",
+        Destination={"ToAddresses": [f"recipient-{ACCOUNT_1}@example.com"]},
+        Message={"Subject": {"Data": "Test email 1"}, "Body": {"Text": {"Data": "Body of test email 1"}}},
+    )
+    ses_account_1.send_email(
+        Source=f"sender-{ACCOUNT_1}@example.com",
+        Destination={"ToAddresses": [f"recipient-{ACCOUNT_1}@example.com"]},
+        Message={"Subject": {"Data": "Test email 2"}, "Body": {"Text": {"Data": "Body of test email 2"}}},
+    )
+
+    # Send 1 email to ACCOUNT_2
+    ses_account_2.verify_email_identity(EmailAddress=f"sender-{ACCOUNT_2}@example.com")
+    ses_account_2.send_email(
+        Source=f"sender-{ACCOUNT_2}@example.com",
+        Destination={"ToAddresses": [f"recipient-{ACCOUNT_2}@example.com"]},
+        Message={"Subject": {"Data": "Test email 3"}, "Body": {"Text": {"Data": "Body of test email 3"}}},
+    )
+
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+
+    # Test 1: Without ?account: returns all emails
+    url = f"{endpoint}/_ministack/ses/messages"
+    req = urllib.request.Request(url, method="GET")
+    with urllib.request.urlopen(req, timeout=5) as r:
+        data = json.loads(r.read().decode())
+
+    assert "messages" in data
+    total = sum(len(messages) for messages in data["messages"].values())
+    assert total == 3, f"Expected 3 messages across all accounts, got {total}"
+
+    # Test 2: With invalid non-12-digit account should return error
+    url = f"{endpoint}/_ministack/ses/messages?account=notvalid"
+    req = urllib.request.Request(url, method="GET")
+    with pytest.raises(urllib.error.HTTPError) as exc_info:
+        urllib.request.urlopen(req, timeout=5)
+    assert exc_info.value.code == 400
+    import io
+    error_data = json.loads(io.BytesIO(exc_info.value.read()).read())
+    assert error_data["__type"] == "InvalidAccountID"
+    assert "got: notvalid" in error_data["message"]
+
+    # Test 3: With correct valid custom account (ACCOUNT_1)
+    url = f"{endpoint}/_ministack/ses/messages?account={ACCOUNT_1}"
+    req = urllib.request.Request(url, method="GET")
+    with urllib.request.urlopen(req, timeout=5) as r:
+        data = json.loads(r.read().decode())
+
+    assert "messages" in data
+    messages_for_a1 = data["messages"].get(ACCOUNT_1, [])
+    assert len(messages_for_a1) == 2, f"Expected 2 messages from ACCOUNT_1, got {len(messages_for_a1)}"
+
+    # Test 4: With correct valid custom account (ACCOUNT_2)
+    url = f"{endpoint}/_ministack/ses/messages?account={ACCOUNT_2}"
+    req = urllib.request.Request(url, method="GET")
+    with urllib.request.urlopen(req, timeout=5) as r:
+        data = json.loads(r.read().decode())
+
+    assert "messages" in data
+    messages_for_a2 = data["messages"].get(ACCOUNT_2, [])
+    assert len(messages_for_a2) == 1, f"Expected 1 message from ACCOUNT_2, got {len(messages_for_a2)}"
+
+    # Test 5: Empty messages for correct account with no emails sent
+    url = f"{endpoint}/_ministack/ses/messages?account=123456789012"
+    req = urllib.request.Request(url, method="GET")
+    with urllib.request.urlopen(req, timeout=5) as r:
+        data = json.loads(r.read().decode())
+    # Should return empty list (no emails for this account)
+    assert "messages" in data
+    assert data["messages"].get("123456789012", []) == [], "Expected 0 messages for account with no emails"
+  

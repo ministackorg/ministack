@@ -130,6 +130,8 @@ def test_myservice_operation_one(mysvc):
     assert resp["result"] == "ok"
 ```
 
+**Note:** If your service has operations that mutate global state or require isolation (like calling the reset endpoint), add them to the `_SERIAL_TESTS` set in `conftest.py`. This ensures they run sequentially after the parallel-safe tests.
+
 ---
 
 ## Running Tests Locally
