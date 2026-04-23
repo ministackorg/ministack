@@ -7,6 +7,17 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [1.3.11] — 2026-04-24
+
+### Added
+- **`GET /_ministack/ses/messages` email inspection endpoint** — returns every SES message sent across v1 and v2 APIs (`SendEmail`, `SendRawEmail`, `SendTemplatedEmail`, `SendBulkTemplatedEmail`, v2 `SendEmail`), grouped by account ID. Accepts an optional `?account=<12-digit-id>` query parameter to filter. Invalid account IDs return a 400 `InvalidAccountID` error. Unlocks end-to-end testing for flows that send password-reset / verification / transactional emails without a real SMTP sink. Contributed by @jgrumboe.
+- **API Gateway v1 `GetAccount` / `UpdateAccount`** — `/account` now responds with the AWS-shaped defaults (`throttleSettings`, `features`, `apiKeyVersion`) and honours `UpdateAccount` patches (typically `/cloudwatchRoleArn`). Unblocks `terraform apply` on `aws_api_gateway_account`, which previously failed with `NotFoundException: Unknown path: /account`. Reported by @david-hay.
+
+### Fixed
+- **API Gateway v1 `policy` field broke `terraform plan` refresh** — ministack returned the REST API policy as a plain JSON string; terraform-provider-aws's `flattenAPIPolicy` wraps the SDK-decoded value in outer quotes and re-parses as JSON (`NormalizeJsonString("\"" + policy + "\"")` then `strconv.Unquote`), so the unescaped inner quotes made Go's decoder error with `invalid character 'S' after top-level value` as soon as the policy contained `"Statement"`. The wire now matches real AWS, which returns the `policy` already JSON-string escape-encoded — Terraform's wrap-and-reparse recovers the original policy JSON unchanged. Fix applied at emit time across `CreateRestApi`, `GetRestApi`, `GetRestApis`, and `UpdateRestApi`; internal reads (CFN, other services) keep seeing the raw policy. Reported by @david-hay.
+
+---
+
 ## [1.3.10] — 2026-04-23
 
 ### Fixed

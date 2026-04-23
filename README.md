@@ -80,6 +80,12 @@ curl -X POST http://localhost:4566/_ministack/reset?init=1
 curl -X POST http://localhost:4566/_ministack/config \
   -H "Content-Type: application/json" \
   -d '{"lambda_svc.LAMBDA_EXECUTOR": "docker"}'
+
+# Inspect emails sent via SES — returns every message grouped by account
+curl http://localhost:4566/_ministack/ses/messages
+
+# Filter by account (12-digit access-key ID used as the account ID)
+curl "http://localhost:4566/_ministack/ses/messages?account=000000000000"
 ```
 
 The reset endpoint is especially useful in CI pipelines and test suites — call it in `setUp`/`beforeEach` to get a clean environment for every test without restarting the container. Add `?init=1` to re-run your init scripts after the reset, restoring any resources they create (VPCs, queues, seed data, etc.).
