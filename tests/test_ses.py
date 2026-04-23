@@ -609,7 +609,7 @@ def test_ses_messages_endpoint_rejects_invalid_account_query_param():
         urllib.request.urlopen(f"{endpoint}/_ministack/ses/messages?account=invalid")
     assert exc.value.code == 400
     payload = json.loads(exc.value.read().decode())
-    assert payload["messages"] == ["Invalid 'account' query parameter. Expected a 12 digit number."]
+    assert payload["errors"] == ["Invalid 'account' query parameter. Expected a 12-digit number."]
 
 
 def test_ses_messages_endpoint_reset(ses):

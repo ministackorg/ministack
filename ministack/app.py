@@ -457,10 +457,11 @@ async def _handle_ses_messages_request(method: str, path: str, headers: dict, qu
     if path != "/_ministack/ses/messages" or method != "GET":
         return None
 
-    account = query_params.get("account", [""])[0] if isinstance(query_params.get("account"), list) else query_params.get("account", "")
+    account_param = query_params.get("account", "")
+    account = account_param[0] if isinstance(account_param, list) else account_param
     if account and not re.fullmatch(r"\d{12}", account):
         return 400, {"Content-Type": "application/json"}, json.dumps({
-            "messages": ["Invalid 'account' query parameter. Expected a 12 digit number."],
+            "errors": ["Invalid 'account' query parameter. Expected a 12-digit number."],
         }).encode()
 
     try:
