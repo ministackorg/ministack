@@ -559,6 +559,59 @@ def test_ses_messages_endpoint_v2(sesv2):
     assert len(v2_emails) >= 1, f"Expected v2.SendEmail, got {[m['Type'] for m in data['messages']]}"
     assert v2_emails[0]["Subject"] == "Test v2 subject"
 
+def test_ses_messages_endpoint_includes_account_field(ses):
+    """GET /_ministack/ses/messages returns Account for each message."""
+    import urllib.request
+
+    ses.verify_email_identity(EmailAddress="account-source@example.com")
+    ses.send_email(
+        Source="account-source@example.com",
+        Destination={"ToAddresses": ["to@example.com"]},
+        Message={"Subject": {"Data": "Account test"}, "Body": {"Text": {"Data": "body"}}},
+    )
+
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+    with urllib.request.urlopen(f"{endpoint}/_ministack/ses/messages") as r:
+        data = json.loads(r.read().decode())
+
+    msg = next(m for m in data["messages"] if m["Source"] == "account-source@example.com")
+    assert msg["Account"] == "000000000000"
+
+
+def test_ses_messages_endpoint_filters_by_account_query_param(ses):
+    """GET /_ministack/ses/messages?account=... filters messages by account."""
+    import urllib.request
+
+    ses.verify_email_identity(EmailAddress="filter-source@example.com")
+    ses.send_email(
+        Source="filter-source@example.com",
+        Destination={"ToAddresses": ["to@example.com"]},
+        Message={"Subject": {"Data": "Filter test"}, "Body": {"Text": {"Data": "body"}}},
+    )
+
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+    with urllib.request.urlopen(f"{endpoint}/_ministack/ses/messages?account=000000000000") as r:
+        matching = json.loads(r.read().decode())
+    assert any(m["Source"] == "filter-source@example.com" for m in matching["messages"])
+
+    with urllib.request.urlopen(f"{endpoint}/_ministack/ses/messages?account=123456789012") as r:
+        non_matching = json.loads(r.read().decode())
+    assert all(m["Source"] != "filter-source@example.com" for m in non_matching["messages"])
+
+
+def test_ses_messages_endpoint_rejects_invalid_account_query_param():
+    """GET /_ministack/ses/messages rejects invalid account query values."""
+    import urllib.error
+    import urllib.request
+
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        urllib.request.urlopen(f"{endpoint}/_ministack/ses/messages?account=invalid")
+    assert exc.value.code == 400
+    payload = json.loads(exc.value.read().decode())
+    assert payload["messages"] == ["Invalid 'account' query parameter. Expected a 12 digit number."]
+
+
 def test_ses_messages_endpoint_reset(ses):
     """ Calling POST /_ministack/reset clears stored SES messages. """
     ses.verify_email_identity(EmailAddress="from@example.com")

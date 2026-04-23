@@ -134,6 +134,7 @@ async def handle_request(method, path, headers, body, query_params):
         # Append to shared sent_emails list for inspection endpoint visibility
         record = {
             "MessageId": msg_id,
+            "Account": get_account_id(),
             "Source": source,
             "To": to_addrs,
             "CC": cc_addrs,

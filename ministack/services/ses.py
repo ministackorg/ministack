@@ -162,6 +162,7 @@ def _send_email(params):
     msg_id = f"{new_uuid()}@email.amazonses.com"
     record = {
         "MessageId": msg_id,
+        "Account": get_account_id(),
         "Source": source,
         "To": to_addrs,
         "CC": cc_addrs,
@@ -210,6 +211,7 @@ def _send_raw_email(params):
     
     record = {
         "MessageId": msg_id,
+        "Account": get_account_id(),
         "Source": source or parsed.get("From", ""),
         "To": [e.strip() for e in parsed.get("To", "").split(",") if e.strip()] or [],
         "CC": [e.strip() for e in parsed.get("Cc", "").split(",") if e.strip()] or [],
@@ -262,6 +264,7 @@ def _send_templated_email(params):
     msg_id = f"{new_uuid()}@email.amazonses.com"
     record = {
         "MessageId": msg_id,
+        "Account": get_account_id(),
         "Source": source,
         "To": to_addrs,
         "CC": cc_addrs,
@@ -316,6 +319,7 @@ def _send_bulk_templated_email(params):
         rendered = _render_template(template, dest["TemplateData"])
         record = {
             "MessageId": msg_id,
+            "Account": get_account_id(),
             "Source": source,
             "To": dest["To"],
             "Template": template_name,
@@ -725,6 +729,7 @@ def _v2_send_email(data):
     msg_id = f"{new_uuid()}@email.amazonses.com"
     record = {
         "MessageId": msg_id,
+        "Account": get_account_id(),
         "Source": from_addr,
         "To": to_addrs,
         "CC": cc_addrs,
@@ -768,6 +773,7 @@ def _v2_send_bulk_email(data):
         msg_id = f"{new_uuid()}@email.amazonses.com"
         record = {
             "MessageId": msg_id,
+            "Account": get_account_id(),
             "Source": from_addr,
             "To": to_addrs,
             "Template": template_name,

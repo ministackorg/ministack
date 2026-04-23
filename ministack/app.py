@@ -452,19 +452,28 @@ async def _handle_admin_reset(path: str, method: str, query_params: dict):
     return 200, {"Content-Type": "application/json"}, json.dumps({"reset": "ok"}).encode()
 
 
-async def _handle_ses_messages_request(method: str, path: str, headers: dict):
+async def _handle_ses_messages_request(method: str, path: str, headers: dict, query_params: dict):
     """Handle SES messages inspection endpoint."""
     if path != "/_ministack/ses/messages" or method != "GET":
         return None
+
+    account = query_params.get("account", [""])[0] if isinstance(query_params.get("account"), list) else query_params.get("account", "")
+    if account and not re.fullmatch(r"\d{12}", account):
+        return 400, {"Content-Type": "application/json"}, json.dumps({
+            "messages": ["Invalid 'account' query parameter. Expected a 12 digit number."],
+        }).encode()
 
     try:
         # Use ses module for all SES message retrieval (v1 + v2 emails stored together)
         mod = _get_module("ses")
         sent_emails_list = mod._sent_emails_list()
+        if account:
+            sent_emails_list = [rec for rec in sent_emails_list if rec.get("Account") == account]
         response = {
             "messages": [
                 {
                     "MessageId": rec["MessageId"],
+                    "Account": rec.get("Account", ""),
                     "Source": rec["Source"],
                     "To": rec.get("To", []),
                     "CC": rec.get("CC", []),
@@ -506,7 +515,7 @@ async def _handle_pre_body_request(method: str, path: str, headers: dict, query_
     if response is not None:
         return response
     
-    response = await _handle_ses_messages_request(method, path, headers)
+    response = await _handle_ses_messages_request(method, path, headers, query_params)
     if response is not None:
         return response
 
