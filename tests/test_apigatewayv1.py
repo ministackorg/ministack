@@ -42,6 +42,33 @@ def test_apigwv1_get_rest_apis(apigw_v1):
     apigw_v1.delete_rest_api(restApiId=id1)
     apigw_v1.delete_rest_api(restApiId=id2)
 
+def test_apigwv1_rest_api_policy_terraform_roundtrip(apigw_v1):
+    """GetRestApi must return `policy` JSON-string-escape-encoded, matching
+    real AWS. Terraform-provider-aws's flattenAPIPolicy wraps the SDK-decoded
+    policy in outer quotes and re-parses as JSON; if ministack returns the
+    raw policy (unescaped) the provider fails with
+    ``invalid character 'S' after top-level value``. Regression for #430."""
+    import urllib.request
+    raw_policy = '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"execute-api:Invoke","Resource":"*"}]}'
+    api_id = apigw_v1.create_rest_api(name="v1-policy-roundtrip", policy=raw_policy)["id"]
+    try:
+        # What the AWS SDK v2 deserializer hands to the Terraform provider
+        # is the outer-JSON-decoded string. Fetch it raw (bypass botocore
+        # which may further manipulate the field).
+        endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+        with urllib.request.urlopen(f"{endpoint}/restapis/{api_id}") as r:
+            body = json.loads(r.read().decode())
+        sdk_decoded_policy = body["policy"]
+
+        # The Terraform provider does:
+        #   NormalizeJsonString(`"` + *out.Policy + `"`) -> strconv.Unquote
+        # which is equivalent to: json.loads('"' + policy + '"')
+        recovered = json.loads('"' + sdk_decoded_policy + '"')
+        assert recovered == raw_policy, f"provider roundtrip lost fidelity: {recovered!r} vs {raw_policy!r}"
+    finally:
+        apigw_v1.delete_rest_api(restApiId=api_id)
+
+
 def test_apigwv1_update_rest_api(apigw_v1):
     """UpdateRestApi (PATCH) modifies the API name."""
     api_id = apigw_v1.create_rest_api(name="v1-update-before")["id"]

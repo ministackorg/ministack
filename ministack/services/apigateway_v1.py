@@ -119,6 +119,38 @@ def _v1_response(data, status=200):
     return status, {"Content-Type": "application/json"}, json.dumps(data, ensure_ascii=False).encode("utf-8")
 
 
+def _encode_rest_api_policy(policy):
+    """Match AWS's wire shape for the RestApi.policy field.
+
+    terraform-provider-aws's ``flattenAPIPolicy`` wraps the SDK-decoded policy
+    string in outer quotes and re-parses it as JSON
+    (``NormalizeJsonString(`"` + policy + `"`)`` then ``strconv.Unquote``).
+    For that roundtrip to work, AWS returns the policy already JSON-string
+    escape-encoded — e.g. ``{\\"Statement\\":[...]}`` — so the provider's
+    wrap-and-reparse recovers the original policy JSON. Emitting the raw
+    policy string (what ministack used to do) makes the provider's decoder
+    error with ``invalid character 'S' after top-level value`` as soon as the
+    policy contains an inner quote.
+    """
+    if policy is None or policy == "":
+        return policy
+    if not isinstance(policy, str):
+        policy = json.dumps(policy, ensure_ascii=False)
+    # json.dumps("abc") -> '"abc"'; strip the outer quotes to get the
+    # escape-sequence form the provider expects to see in *Policy.
+    return json.dumps(policy, ensure_ascii=False)[1:-1]
+
+
+def _rest_api_view(api):
+    """Return a response-shaped copy with the policy field properly encoded."""
+    if api is None:
+        return api
+    view = dict(api)
+    if "policy" in view:
+        view["policy"] = _encode_rest_api_policy(view["policy"])
+    return view
+
+
 def _v1_error(code, message, status):
     # AWS API Gateway errors use __type (double underscore), matching every
     # other JSON-protocol AWS service. boto3 reads this to populate
@@ -825,18 +857,18 @@ def _create_rest_api(data):
     _resources[api_id][root_id] = root_resource
 
     _v1_tags[_rest_api_arn(api_id)] = dict(data.get("tags", {}))
-    return _v1_response(api, 201)
+    return _v1_response(_rest_api_view(api), 201)
 
 
 def _get_rest_api(api_id):
     api = _rest_apis.get(api_id)
     if not api:
         return _v1_error("NotFoundException", "Invalid API identifier specified", 404)
-    return _v1_response(api)
+    return _v1_response(_rest_api_view(api))
 
 
 def _get_rest_apis():
-    return _v1_response({"item": list(_rest_apis.values()), "nextToken": None})
+    return _v1_response({"item": [_rest_api_view(a) for a in _rest_apis.values()], "nextToken": None})
 
 
 def _update_rest_api(api_id, data):
@@ -845,7 +877,7 @@ def _update_rest_api(api_id, data):
         return _v1_error("NotFoundException", "Invalid API identifier specified", 404)
     patch_ops = data.get("patchOperations", [])
     _apply_patch(api, patch_ops)
-    return _v1_response(api)
+    return _v1_response(_rest_api_view(api))
 
 
 def _delete_rest_api(api_id):
