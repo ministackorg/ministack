@@ -462,57 +462,48 @@ async def _handle_ses_messages_request(method: str, path: str, headers: dict, qu
     if path != "/_ministack/ses/messages" or method != "GET":
         return None
 
-    # Support account filtering via query parameter. If provided, set the
-    # request-scoped account so AccountScopedDict lookups are scoped to it.
+    account_id = None
     if "account" in query_params:
         raw_account = query_params["account"]
-        # Some query parsing returns a list of values; accept either list or single string
         account_id = raw_account[0] if isinstance(raw_account, (list, tuple)) else raw_account
-        account_id = "" if account_id is None else str(account_id)
         if not _12_DIGIT_RE.match(account_id):
             return 400, {"Content-Type": "application/json"}, json.dumps({
                 "__type": "InvalidAccountID",
                 "message": f"Account ID must be 12 digits, got: {account_id}",
             }).encode()
-        # Set the request account context so subsequent lookups use this account
-        set_request_account_id(account_id)
 
     try:
-        # Use ses module for all SES message retrieval (v1 + v2 emails stored together)
         mod = _get_module("ses")
+        sent_emails_dict = {}
+        try:
+            all_data = mod._sent_emails.to_dict()
+            for (acct, key), val in all_data.items():
+                if key == "entries" and isinstance(val, list):
+                    sent_emails_dict[acct] = val
+        except Exception:
+            # Fallback: empty dict on any unexpected shape
+            sent_emails_dict = {}
 
-        # If an `account` query param was provided we already set the request
-        # account above and can use the regular per-account helper. When no
-        # account is requested, aggregate `entries` from all accounts by using
-        # the AccountScopedDict's `to_dict()` internal representation.
-        if "account" in query_params:
-            sent_emails_list = mod._sent_emails_list()
-        else:
-            sent_emails_list = []
-            try:
-                all_data = mod._sent_emails.to_dict()
-                for (acct, key), val in all_data.items():
-                    if key == "entries" and isinstance(val, list):
-                        sent_emails_list.extend(val)
-            except Exception:
-                # Fallback: empty list on any unexpected shape
-                sent_emails_list = []
         response = {
-            "messages": [
-                {
-                    "MessageId": rec["MessageId"],
-                    "Source": rec["Source"],
-                    "To": rec.get("To", []),
-                    "CC": rec.get("CC", []),
-                    "BCC": rec.get("BCC", []),
-                    "Subject": rec.get("RenderedSubject") or rec.get("Subject", ""),
-                    "BodyText": rec.get("RenderedBodyText") or rec.get("BodyText", ""),
-                    "BodyHtml": rec.get("RenderedBodyHtml") or rec.get("BodyHtml"),
-                    "Timestamp": rec["Timestamp"],
-                    "Type": rec["Type"],
-                }
-                for rec in sent_emails_list
-            ]
+            "messages": {
+                acct: [
+                    {
+                        "MessageId": rec["MessageId"],
+                        "Source": rec["Source"],
+                        "To": rec.get("To", []),
+                        "CC": rec.get("CC", []),
+                        "BCC": rec.get("BCC", []),
+                        "Subject": rec.get("RenderedSubject") or rec.get("Subject", ""),
+                        "BodyText": rec.get("RenderedBodyText") or rec.get("BodyText", ""),
+                        "BodyHtml": rec.get("RenderedBodyHtml") or rec.get("BodyHtml"),
+                        "Timestamp": rec["Timestamp"],
+                        "Type": rec["Type"],
+                    }
+                    for rec in (recs if isinstance(recs, list) else [])
+                ]
+                for acct, recs in sent_emails_dict.items()
+                if account_id is None or acct == account_id
+            }
         }
     except Exception as e:
         logger.exception("Error retrieving SES messages: %s", e)

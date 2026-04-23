@@ -477,8 +477,8 @@ def test_ses_messages_endpoint_all_v1_send_types(ses):
         data = json.loads(r.read().decode())
     
     assert "messages" in data
-    send_emails = [m for m in data["messages"] if m["Type"] == "SendEmail" and m["Source"] == "v1-sender@example.com"]
-    assert len(send_emails) >= 1, f"Expected SendEmail, got {[m['Type'] for m in data['messages']]}"
+    send_emails = [m for m in data["messages"]["000000000000"] if m["Type"] == "SendEmail" and m["Source"] == "v1-sender@example.com"]
+    assert len(send_emails) >= 1, f"Expected SendEmail, got {[m['Type'] for m in data['messages']['000000000000']]}"
     
     # Test 2: Verify SendRawEmail appears
     ses.verify_email_identity(EmailAddress="raw-sender@example.com")
@@ -491,8 +491,8 @@ def test_ses_messages_endpoint_all_v1_send_types(ses):
     with urllib.request.urlopen(req, timeout=5) as r:
         data = json.loads(r.read().decode())
     
-    raw_emails = [m for m in data["messages"] if m["Type"] == "SendRawEmail" and m["Source"] == "raw-sender@example.com"]
-    assert len(raw_emails) >= 1, f"Expected SendRawEmail, got {[m['Type'] for m in data['messages']]}"
+    raw_emails = [m for m in data["messages"]["000000000000"] if m["Type"] == "SendRawEmail" and m["Source"] == "raw-sender@example.com"]
+    assert len(raw_emails) >= 1, f"Expected SendRawEmail, got {[m['Type'] for m in data['messages']['000000000000']]}"
     
     # Test 3: Verify SendTemplatedEmail appears
     resp = ses.send_templated_email(
@@ -506,8 +506,8 @@ def test_ses_messages_endpoint_all_v1_send_types(ses):
     with urllib.request.urlopen(req, timeout=5) as r:
         data = json.loads(r.read().decode())
     
-    templated_emails = [m for m in data["messages"] if m["Type"] == "SendTemplatedEmail" and m["Source"] == "template-sender@example.com"]
-    assert len(templated_emails) >= 1, f"Expected SendTemplatedEmail, got {[m['Type'] for m in data['messages']]}"
+    templated_emails = [m for m in data["messages"]["000000000000"] if m["Type"] == "SendTemplatedEmail" and m["Source"] == "template-sender@example.com"]
+    assert len(templated_emails) >= 1, f"Expected SendTemplatedEmail, got {[m['Type'] for m in data['messages']['000000000000']]}"
     
     # Test 4: Verify SendBulkTemplatedEmail appears
     resp = ses.send_bulk_templated_email(
@@ -530,8 +530,8 @@ def test_ses_messages_endpoint_all_v1_send_types(ses):
     with urllib.request.urlopen(req, timeout=5) as r:
         data = json.loads(r.read().decode())
     
-    bulk_emails = [m for m in data["messages"] if m["Type"] == "SendBulkTemplatedEmail" and m["Source"] == "bulk-sender@example.com"]
-    assert len(bulk_emails) >= 2, f"Expected SendBulkTemplatedEmail (>=2), got {[m['Type'] for m in data['messages']]}"
+    bulk_emails = [m for m in data["messages"]["000000000000"] if m["Type"] == "SendBulkTemplatedEmail" and m["Source"] == "bulk-sender@example.com"]
+    assert len(bulk_emails) >= 2, f"Expected SendBulkTemplatedEmail (>=2), got {[m['Type'] for m in data['messages']['000000000000']]}"
 
 def test_ses_messages_endpoint_v2(sesv2):
     """GET /_ministack/ses/messages shows v2 SendEmail via sesv2 client."""
@@ -555,7 +555,7 @@ def test_ses_messages_endpoint_v2(sesv2):
         data = json.loads(r.read().decode())
     
     assert "messages" in data
-    v2_emails = [m for m in data["messages"] if m["Type"] == "v2.SendEmail" and m["Source"] == "v2-sender@example.com"]
+    v2_emails = [m for m in data["messages"]["000000000000"] if m["Type"] == "v2.SendEmail" and m["Source"] == "v2-sender@example.com"]
     assert len(v2_emails) >= 1, f"Expected v2.SendEmail, got {[m['Type'] for m in data['messages']]}"
     assert v2_emails[0]["Subject"] == "Test v2 subject"
 
@@ -575,7 +575,7 @@ def test_ses_messages_endpoint_reset(ses):
     )                                  
     with urllib.request.urlopen(f"{endpoint}/_ministack/ses/messages") as r:                                                                                        
         data = json.loads(r.read())                                                                                                                                 
-    assert data == {"messages": []}    
+    assert data == {"messages": {}}
 
 # ---------------------------------------------------------------------------
 # Account filtering test for /_ministack/ses/messages endpoint
@@ -599,14 +599,7 @@ def _client(service, access_key="test"):
     )
 
 def test_ses_messages_endpoint_account_filter():
-    """GET /_ministack/ses/messages?account=X filters by account ID.
-
-    Test cases:
-    - Without ?account: returns all emails (from default account)
-    - With invalid non-12-digit account: returns 400 InvalidAccountID error
-    - With invalid non-matching 12-digit account: returns 400 InvalidAccountID error
-    - With correct valid account and emails sent to it: filtered results only
-    """
+    """GET /_ministack/ses/messages?account=X filters by account ID."""
     import urllib.request
 
     # Clear any existing messages on the running server
@@ -642,15 +635,15 @@ def test_ses_messages_endpoint_account_filter():
 
     endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
 
-    # Test 1: Without ?account: returns all emails (from default account)
+    # Test 1: Without ?account: returns all emails
     url = f"{endpoint}/_ministack/ses/messages"
     req = urllib.request.Request(url, method="GET")
     with urllib.request.urlopen(req, timeout=5) as r:
         data = json.loads(r.read().decode())
 
     assert "messages" in data
-    total = len(data["messages"])
-    assert total == 3, f"Expected 3 messages (default account), got {total}"
+    total = sum(len(messages) for messages in data["messages"].values())
+    assert total == 3, f"Expected 3 messages across all accounts, got {total}"
 
     # Test 2: With invalid non-12-digit account should return error
     url = f"{endpoint}/_ministack/ses/messages?account=notvalid"
@@ -663,34 +656,32 @@ def test_ses_messages_endpoint_account_filter():
     assert error_data["__type"] == "InvalidAccountID"
     assert "got: notvalid" in error_data["message"]
 
-    # Test 5: With correct valid custom account (ACCOUNT_1)
+    # Test 3: With correct valid custom account (ACCOUNT_1)
     url = f"{endpoint}/_ministack/ses/messages?account={ACCOUNT_1}"
     req = urllib.request.Request(url, method="GET")
     with urllib.request.urlopen(req, timeout=5) as r:
         data = json.loads(r.read().decode())
 
     assert "messages" in data
-    total = len(data["messages"])
-    messages_for_a1 = [m for m in data["messages"] if ACCOUNT_1 in m["Source"]]
+    messages_for_a1 = data["messages"].get(ACCOUNT_1, [])
     assert len(messages_for_a1) == 2, f"Expected 2 messages from ACCOUNT_1, got {len(messages_for_a1)}"
 
-    # Test 6: With correct valid custom account (ACCOUNT_2)
+    # Test 4: With correct valid custom account (ACCOUNT_2)
     url = f"{endpoint}/_ministack/ses/messages?account={ACCOUNT_2}"
     req = urllib.request.Request(url, method="GET")
     with urllib.request.urlopen(req, timeout=5) as r:
         data = json.loads(r.read().decode())
 
     assert "messages" in data
-    total = len(data["messages"])
-    messages_for_a2 = [m for m in data["messages"] if ACCOUNT_2 in m["Source"]]
+    messages_for_a2 = data["messages"].get(ACCOUNT_2, [])
     assert len(messages_for_a2) == 1, f"Expected 1 message from ACCOUNT_2, got {len(messages_for_a2)}"
 
-    # Test 7: Empty messages for correct valid account with no emails sent
+    # Test 5: Empty messages for correct account with no emails sent
     url = f"{endpoint}/_ministack/ses/messages?account=123456789012"
     req = urllib.request.Request(url, method="GET")
     with urllib.request.urlopen(req, timeout=5) as r:
         data = json.loads(r.read().decode())
     # Should return empty list (no emails for this account)
     assert "messages" in data
-    assert len(data["messages"]) == 0, f"Expected 0 messages for account with no emails, got {len(data['messages'])}"
+    assert data["messages"].get("123456789012", []) == [], "Expected 0 messages for account with no emails"
   
