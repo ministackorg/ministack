@@ -511,19 +511,26 @@ def _reboot_instances(p):
 # Images (AMIs) — stub
 # ---------------------------------------------------------------------------
 
+# (ami_id, name, description, platform, root_device_name)
+# platform: "windows" or "" (Linux/Unix — matches AWS's empty-field behaviour)
+# root_device_name: Windows AMIs use /dev/sda1, Linux HVM uses /dev/xvda.
 _STUB_AMIS = [
-    ("ami-0abcdef1234567890", "amzn2-ami-hvm-2.0.20231116.0-x86_64-gp2", "Amazon Linux 2"),
-    ("ami-0123456789abcdef0", "ubuntu/images/hvm-ssd/ubuntu-22.04-amd64-server", "Ubuntu 22.04"),
-    ("ami-0fedcba9876543210", "Windows_Server-2022-English-Full-Base", "Windows Server 2022"),
+    ("ami-0abcdef1234567890", "amzn2-ami-hvm-2.0.20231116.0-x86_64-gp2", "Amazon Linux 2", "", "/dev/xvda"),
+    ("ami-0123456789abcdef0", "ubuntu/images/hvm-ssd/ubuntu-22.04-amd64-server", "Ubuntu 22.04", "", "/dev/xvda"),
+    ("ami-0fedcba9876543210", "Windows_Server-2022-English-Full-Base", "Windows Server 2022", "windows", "/dev/sda1"),
 ]
 
 
 def _describe_images(p):
     filter_ids = _parse_member_list(p, "ImageId")
     items = ""
-    for ami_id, name, desc in _STUB_AMIS:
+    for ami_id, name, desc, platform, root_device in _STUB_AMIS:
         if filter_ids and ami_id not in filter_ids:
             continue
+        # RootDeviceName + BlockDeviceMappings are required by Terraform's AWS
+        # provider on aws_instance — it resolves them from DescribeImages before
+        # RunInstances and fails with "finding Root Device Name for AMI" if absent.
+        platform_xml = f"<platform>{platform}</platform>" if platform else ""
         items += f"""<item>
             <imageId>{ami_id}</imageId>
             <imageLocation>{name}</imageLocation>
@@ -534,7 +541,19 @@ def _describe_images(p):
             <imageType>machine</imageType>
             <name>{name}</name>
             <description>{desc}</description>
+            {platform_xml}
             <rootDeviceType>ebs</rootDeviceType>
+            <rootDeviceName>{root_device}</rootDeviceName>
+            <blockDeviceMapping>
+                <item>
+                    <deviceName>{root_device}</deviceName>
+                    <ebs>
+                        <volumeSize>8</volumeSize>
+                        <volumeType>gp2</volumeType>
+                        <deleteOnTermination>true</deleteOnTermination>
+                    </ebs>
+                </item>
+            </blockDeviceMapping>
             <virtualizationType>hvm</virtualizationType>
             <hypervisor>xen</hypervisor>
         </item>"""

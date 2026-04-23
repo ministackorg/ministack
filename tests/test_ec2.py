@@ -88,6 +88,26 @@ def test_ec2_describe_images(ec2):
     assert len(resp["Images"]) >= 1
     assert all("ImageId" in img for img in resp["Images"])
 
+
+def test_ec2_describe_images_has_root_device_and_block_mappings(ec2):
+    # Terraform's AWS provider resolves these before aws_instance creation;
+    # absence produced "finding Root Device Name for AMI" and blocked apply.
+    resp = ec2.describe_images(ImageIds=["ami-0abcdef1234567890"])
+    img = resp["Images"][0]
+    assert img["RootDeviceType"] == "ebs"
+    assert img["RootDeviceName"] == "/dev/xvda"
+    bdms = img["BlockDeviceMappings"]
+    assert bdms and bdms[0]["DeviceName"] == "/dev/xvda"
+    assert bdms[0]["Ebs"]["VolumeSize"] == 8
+    assert bdms[0]["Ebs"]["VolumeType"] == "gp2"
+
+    # Windows AMI uses /dev/sda1 and exposes Platform=windows.
+    resp = ec2.describe_images(ImageIds=["ami-0fedcba9876543210"])
+    win = resp["Images"][0]
+    assert win["RootDeviceName"] == "/dev/sda1"
+    assert win.get("Platform") == "windows"
+    assert win["BlockDeviceMappings"][0]["DeviceName"] == "/dev/sda1"
+
 def test_ec2_security_group_crud(ec2):
     sg_id = ec2.create_security_group(GroupName="qa-ec2-sg", Description="test sg")["GroupId"]
     assert sg_id.startswith("sg-")
