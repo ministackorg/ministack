@@ -258,6 +258,29 @@ def md5_hash(data: bytes) -> str:
     return hashlib.md5(data).hexdigest()
 
 
+def apply_image_prefix(image: str) -> str:
+    """Prepend ``MINISTACK_IMAGE_PREFIX`` (trailing slash optional) to a Docker
+    image reference so real-infra services route through a private registry.
+
+    Mirrors Testcontainers' ``hub.image.name.prefix`` semantics: when the
+    prefix is set, every nested container image (RDS postgres/mysql/mariadb,
+    ElastiCache redis/memcached, EKS k3s) is rewritten to
+    ``{prefix}/{image}``. Images already prefixed are left alone so repeated
+    application is idempotent.
+
+    Examples (``MINISTACK_IMAGE_PREFIX=proxy.corp.net``):
+        ``postgres:15-alpine`` → ``proxy.corp.net/postgres:15-alpine``
+        ``rancher/k3s:v1.31.4-k3s1`` → ``proxy.corp.net/rancher/k3s:v1.31.4-k3s1``
+        ``proxy.corp.net/postgres:15-alpine`` → unchanged
+    """
+    prefix = os.environ.get("MINISTACK_IMAGE_PREFIX", "").strip().rstrip("/")
+    if not prefix:
+        return image
+    if image.startswith(prefix + "/"):
+        return image
+    return f"{prefix}/{image}"
+
+
 def sha256_hash(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 

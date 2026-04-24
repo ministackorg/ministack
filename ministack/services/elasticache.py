@@ -27,7 +27,7 @@ import time
 from urllib.parse import parse_qs
 
 from ministack.core.persistence import load_state
-from ministack.core.responses import AccountScopedDict, get_account_id, new_uuid, get_region
+from ministack.core.responses import AccountScopedDict, apply_image_prefix, get_account_id, new_uuid, get_region
 
 logger = logging.getLogger("elasticache")
 
@@ -240,10 +240,10 @@ def _create_cache_cluster(p):
         endpoint_port = host_port
 
         if engine == "redis":
-            image = f"redis:{engine_version.split('.')[0]}-alpine"
+            image = apply_image_prefix(f"redis:{engine_version.split('.')[0]}-alpine")
             container_port = 6379
         else:
-            image = f"memcached:{engine_version}-alpine"
+            image = apply_image_prefix(f"memcached:{engine_version}-alpine")
             container_port = 11211
 
         try:

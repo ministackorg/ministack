@@ -44,7 +44,7 @@ from typing import Any
 from urllib.parse import unquote
 
 from ministack.core.persistence import load_state, PERSIST_STATE
-from ministack.core.responses import AccountScopedDict, get_account_id, _request_account_id, error_response_json, json_response, new_uuid, get_region
+from ministack.core.responses import AccountScopedDict, apply_image_prefix, get_account_id, _request_account_id, error_response_json, json_response, new_uuid, get_region
 from ministack.core.lambda_runtime import get_or_create_worker, invalidate_worker
 
 logger = logging.getLogger("lambda")
@@ -1378,24 +1378,24 @@ _RUNTIME_IMAGE_MAP: dict[str, str] = {
 
 def _docker_image_for_runtime(runtime: str) -> str | None:
     if runtime in _RUNTIME_IMAGE_MAP:
-        return _RUNTIME_IMAGE_MAP[runtime]
+        return apply_image_prefix(_RUNTIME_IMAGE_MAP[runtime])
     if runtime.startswith("python"):
         ver = runtime.replace("python", "")
-        return f"public.ecr.aws/lambda/python:{ver}"
+        return apply_image_prefix(f"public.ecr.aws/lambda/python:{ver}")
     if runtime.startswith("nodejs"):
         ver = runtime.replace("nodejs", "").rstrip(".x")
-        return f"public.ecr.aws/lambda/nodejs:{ver}"
+        return apply_image_prefix(f"public.ecr.aws/lambda/nodejs:{ver}")
     if runtime.startswith("java"):
         ver = runtime.replace("java", "")
-        return f"public.ecr.aws/lambda/java:{ver}"
+        return apply_image_prefix(f"public.ecr.aws/lambda/java:{ver}")
     if runtime.startswith("dotnet"):
         ver = runtime.replace("dotnet", "")
-        return f"public.ecr.aws/lambda/dotnet:{ver}"
+        return apply_image_prefix(f"public.ecr.aws/lambda/dotnet:{ver}")
     if runtime.startswith("ruby"):
         ver = runtime.replace("ruby", "")
-        return f"public.ecr.aws/lambda/ruby:{ver}"
+        return apply_image_prefix(f"public.ecr.aws/lambda/ruby:{ver}")
     if runtime.startswith("provided"):
-        return "public.ecr.aws/lambda/provided:al2023"
+        return apply_image_prefix("public.ecr.aws/lambda/provided:al2023")
     return None
 
 

@@ -21,7 +21,7 @@ import re
 import threading
 import time
 
-from ministack.core.responses import AccountScopedDict, get_account_id, json_response, error_response_json, new_uuid, get_region
+from ministack.core.responses import AccountScopedDict, apply_image_prefix, get_account_id, json_response, error_response_json, new_uuid, get_region
 
 logger = logging.getLogger("eks")
 
@@ -260,7 +260,7 @@ def _create_cluster(body):
         try:
             ms_network = _get_ministack_network(client)
             run_kwargs = dict(
-                image=EKS_K3S_IMAGE,
+                image=apply_image_prefix(EKS_K3S_IMAGE),
                 command=["server",
                          "--disable=traefik,metrics-server,servicelb",
                          "--tls-san=0.0.0.0",

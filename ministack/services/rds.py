@@ -41,7 +41,7 @@ from urllib.parse import parse_qs
 from xml.sax.saxutils import escape as _esc
 
 from ministack.core.persistence import load_state
-from ministack.core.responses import AccountScopedDict, get_account_id, new_uuid, get_region
+from ministack.core.responses import AccountScopedDict, apply_image_prefix, get_account_id, new_uuid, get_region
 
 logger = logging.getLogger("rds")
 
@@ -2559,13 +2559,13 @@ def _docker_image_for_engine(engine, engine_version, user, password, db_name):
     if "postgres" in engine or "aurora-postgresql" in engine:
         major = engine_version.split(".")[0]
         return (
-            f"postgres:{major}-alpine",
+            apply_image_prefix(f"postgres:{major}-alpine"),
             {"POSTGRES_USER": user, "POSTGRES_PASSWORD": password, "POSTGRES_DB": db_name},
             5432,
         )
     if "mysql" in engine or "aurora-mysql" in engine:
         return (
-            "mysql:8",
+            apply_image_prefix("mysql:8"),
             {"MYSQL_ROOT_PASSWORD": password, "MYSQL_ROOT_HOST": "%",
              "MYSQL_DATABASE": db_name,
              "MYSQL_USER": user, "MYSQL_PASSWORD": password},
@@ -2573,7 +2573,7 @@ def _docker_image_for_engine(engine, engine_version, user, password, db_name):
         )
     if "mariadb" in engine:
         return (
-            "mariadb:latest",
+            apply_image_prefix("mariadb:latest"),
             {"MYSQL_ROOT_PASSWORD": password, "MYSQL_ROOT_HOST": "%",
              "MYSQL_DATABASE": db_name,
              "MYSQL_USER": user, "MYSQL_PASSWORD": password},
