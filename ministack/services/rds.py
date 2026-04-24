@@ -188,6 +188,16 @@ def _next_port():
 # Request routing
 # ---------------------------------------------------------------------------
 
+def _json_key_to_query_param_name(key: str) -> str:
+    """Map JSON / Smithy body keys to Query-API parameter names."""
+    lk = key.lower()
+    if lk == "dbinstanceidentifier":
+        return "DBInstanceIdentifier"
+    if lk == "filters":
+        return "Filters"
+    return key
+
+
 def _flatten_json_request_params(params, data):
     """Merge SigV4 JSON (``application/x-amz-json-1.*``) bodies into query-style params.
 
@@ -199,35 +209,43 @@ def _flatten_json_request_params(params, data):
     for key, val in data.items():
         if val is None:
             continue
+        qkey = _json_key_to_query_param_name(key)
         if isinstance(val, bool):
-            params[key] = ["true" if val else "false"]
+            params[qkey] = ["true" if val else "false"]
         elif isinstance(val, (int, float)):
-            params[key] = [str(val)]
+            params[qkey] = [str(val)]
         elif isinstance(val, str):
-            params[key] = [val]
-        elif isinstance(val, list) and key == "Filters":
+            params[qkey] = [val]
+        elif isinstance(val, list) and qkey == "Filters":
             for i, f in enumerate(val, 1):
                 if not isinstance(f, dict):
                     continue
-                name = f.get("Name")
+                name = f.get("Name") or f.get("name")
                 if not name:
                     continue
                 params[f"Filters.member.{i}.Name"] = [name]
-                for j, v in enumerate(f.get("Values") or [], 1):
+                values = f.get("Values") or f.get("values") or []
+                for j, v in enumerate(values, 1):
                     params[f"Filters.member.{i}.Values.member.{j}"] = [str(v)]
 
 
 async def handle_request(method, path, headers, body, query_params):
     params = dict(query_params)
     if method == "POST" and body:
-        raw = body if isinstance(body, str) else body.decode("utf-8", errors="replace")
+        raw = body if isinstance(body, str) else body.decode("utf-8-sig", errors="replace")
         stripped = raw.lstrip()
-        if stripped.startswith("{"):
+        ct = (headers.get("content-type") or headers.get("Content-Type") or "").lower()
+        merged_json = False
+        # Prefer JSON when it looks like JSON, or when the client declares AWS/JSON.
+        if stripped.startswith("{") or ("json" in ct and stripped):
             try:
-                _flatten_json_request_params(params, json.loads(raw))
+                payload = json.loads(stripped)
+                if isinstance(payload, dict):
+                    _flatten_json_request_params(params, payload)
+                    merged_json = True
             except json.JSONDecodeError:
                 pass
-        else:
+        if not merged_json:
             form_params = parse_qs(raw)
             for k, v in form_params.items():
                 params[k] = v

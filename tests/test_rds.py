@@ -753,6 +753,13 @@ def test_rds_flatten_json_request_params():
     assert params["Filters.member.1.Values.member.1"] == ["a"]
     assert params["Filters.member.1.Values.member.2"] == ["b"]
 
+    params2 = {}
+    m._flatten_json_request_params(
+        params2,
+        {"dbInstanceIdentifier": "smithy-style-id", "filters": []},
+    )
+    assert params2["DBInstanceIdentifier"] == ["smithy-style-id"]
+
 
 def test_rds_aurora_cluster_lists_instance_member(rds):
     """CreateDBInstance for a cluster updates DescribeDBClusters DBClusterMembers."""
