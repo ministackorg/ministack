@@ -578,6 +578,9 @@ class Worker:
             if response.get("status") == "error":
                 self._proc = None
             response["cold_start"] = cold
+            # Brief pause so in-flight stderr lines from the OS pipe buffer
+            # reach the queue before we drain it.
+            time.sleep(0.05)
             response["log"] = self._drain_stderr()
             return response
 

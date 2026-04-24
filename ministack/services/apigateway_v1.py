@@ -269,7 +269,6 @@ async def _call_lambda(func_name, event, qualifier=None):
     ``qualifier`` may be a version number or alias name; aliases resolve to
     their target version via ``_get_func_record_for_qualifier`` so aliased
     integration URIs (arn:...:function:<name>:<alias>) invoke correctly (#407)."""
-    from ministack.core.lambda_runtime import get_or_create_worker
     from ministack.services import lambda_svc
 
     func_data, func_config = lambda_svc._get_func_record_for_qualifier(func_name, qualifier)
@@ -277,17 +276,16 @@ async def _call_lambda(func_name, event, qualifier=None):
         label = f"{func_name}:{qualifier}" if qualifier else func_name
         return None, f"Lambda function '{label}' not found"
 
-    code_zip = func_data.get("code_zip")
-    runtime = func_config.get("Runtime", "")
-    if code_zip and runtime.startswith(("python", "nodejs")):
-        worker_key = f"{func_name}:{qualifier}" if qualifier else func_name
-        worker = get_or_create_worker(worker_key, func_config, code_zip)
-        result = await asyncio.to_thread(worker.invoke, event, new_uuid())
-        if result.get("status") == "error":
-            return None, result.get("error", "Lambda invocation error")
-        return result.get("result", {}), None
-    else:
-        return {"statusCode": 200, "body": "Mock response"}, None
+    # Route through the central _execute_function dispatcher so CloudWatch
+    # Logs emission and Docker log output work for API Gateway invocations.
+    exec_record = {"config": func_config, "code_zip": func_data.get("code_zip")}
+    result = await asyncio.to_thread(lambda_svc._execute_function, exec_record, event)
+    if result.get("error"):
+        error_msg = result.get("body", {})
+        if isinstance(error_msg, dict):
+            error_msg = error_msg.get("errorMessage", "Lambda invocation error")
+        return None, error_msg
+    return result.get("body", {}), None
 
 
 # ---- Persistence hooks ----
