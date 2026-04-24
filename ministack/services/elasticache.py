@@ -35,6 +35,7 @@ REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 REDIS_DEFAULT_HOST = os.environ.get("REDIS_HOST", "redis")
 REDIS_DEFAULT_PORT = int(os.environ.get("REDIS_PORT", "6379"))
 BASE_PORT = int(os.environ.get("ELASTICACHE_BASE_PORT", "16379"))
+DOCKER_NETWORK = os.environ.get("DOCKER_NETWORK", "")
 
 _clusters = AccountScopedDict()
 _replication_groups = AccountScopedDict()
@@ -246,15 +247,30 @@ def _create_cache_cluster(p):
             container_port = 11211
 
         try:
-            container = docker_client.containers.run(
-                image, detach=True,
+            run_kwargs = dict(
+                image=image, detach=True,
                 ports={f"{container_port}/tcp": host_port},
                 name=f"ministack-elasticache-{cluster_id}",
                 labels={"ministack": "elasticache", "cluster_id": cluster_id},
                 volumes={},
             )
+            if DOCKER_NETWORK:
+                run_kwargs["network"] = DOCKER_NETWORK
+            container = docker_client.containers.run(**run_kwargs)
             docker_container_id = container.id
-            logger.info("ElastiCache: started %s container for %s on port %s", engine, cluster_id, host_port)
+            if DOCKER_NETWORK:
+                container.reload()
+                networks = container.attrs.get("NetworkSettings", {}).get("Networks", {})
+                container_ip = networks.get(DOCKER_NETWORK, {}).get("IPAddress", "")
+                if container_ip:
+                    endpoint_host = container_ip
+                    endpoint_port = container_port
+                    logger.info("ElastiCache: started %s container for %s at %s:%s (network %s)",
+                                engine, cluster_id, container_ip, container_port, DOCKER_NETWORK)
+                else:
+                    logger.info("ElastiCache: started %s container for %s on port %s", engine, cluster_id, host_port)
+            else:
+                logger.info("ElastiCache: started %s container for %s on port %s", engine, cluster_id, host_port)
         except Exception as e:
             logger.warning("ElastiCache: Docker failed for %s: %s", cluster_id, e)
             endpoint_host = REDIS_DEFAULT_HOST

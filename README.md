@@ -635,7 +635,7 @@ ecs.stop_task(cluster="dev", task=task_arn)
 | `RDS_BASE_PORT` | `15432` | Starting host port for RDS containers |
 | `RDS_TMPFS_SIZE` | `256m` | Tmpfs size for RDS database containers (when `RDS_PERSIST=0`). Set to `2g` or higher for large databases |
 | `RDS_PERSIST` | `0` | Set `1` to use Docker named volumes for RDS containers instead of tmpfs. Storage grows dynamically with no fixed cap |
-| `DOCKER_NETWORK` | _(unset)_ | Docker network for RDS and EKS containers. Set to your Docker Compose network name so RDS/EKS endpoints are reachable from other containers (e.g. Lambda) |
+| `DOCKER_NETWORK` | _(unset)_ | Docker network for RDS, EKS, and ElastiCache containers. Set to your Docker Compose network name so container endpoints are reachable from other containers (e.g. Lambda) |
 | `ELASTICACHE_BASE_PORT` | `16379` | Starting host port for ElastiCache containers |
 | `PERSIST_STATE` | `0` | Set `1` to persist service state across restarts |
 | `STATE_DIR` | `/tmp/ministack-state` | Directory for persisted state files |
