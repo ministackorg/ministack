@@ -1871,7 +1871,6 @@ def _invoke_rie(container, event: dict, timeout: int) -> dict:
     import urllib.request
     max_attempts = int(timeout * 10) + 20
     for _attempt in range(max_attempts):
-        time.sleep(0.1)
         container.reload()
         if container.status != "running":
             break
@@ -1896,6 +1895,7 @@ def _invoke_rie(container, event: dict, timeout: int) -> dict:
                 if not ports:
                     continue
                 rie_url = f"http://127.0.0.1:{ports[0]['HostPort']}/2015-03-31/functions/function/invocations"
+            invoke_time = time.time()
             req = urllib.request.Request(
                 rie_url, data=json.dumps(event).encode(),
                 headers={"Content-Type": "application/json"},
@@ -1906,7 +1906,7 @@ def _invoke_rie(container, event: dict, timeout: int) -> dict:
                 parsed = json.loads(body)
             except json.JSONDecodeError:
                 parsed = body
-            logs = container.logs(stdout=True, stderr=True).decode("utf-8", errors="replace").strip()
+            logs = container.logs(stdout=True, stderr=True, since=invoke_time).decode("utf-8", errors="replace").strip()
             # RIE sets 'Lambda-Runtime-Function-Error-Type' (or bare
             # 'X-Amz-Function-Error') when the handler raised an unhandled
             # exception. If it's set we surface the error flag + propagate the
@@ -1921,6 +1921,7 @@ def _invoke_rie(container, event: dict, timeout: int) -> dict:
                 result["function_error"] = "Unhandled" if err_header else "Handled"
             return result
         except (urllib.error.URLError, ConnectionRefusedError, OSError):
+            time.sleep(0.1)
             continue
     # Timed out
     stdout = container.logs(stdout=True, stderr=True).decode("utf-8", errors="replace").strip()
