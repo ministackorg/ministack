@@ -472,7 +472,6 @@ def _path_matches(route_path: str, request_path: str) -> bool:
 
 async def _invoke_lambda_proxy(integration, api_id, stage, path, method, headers, body, query_params, route_key="$default", path_params=None):
     """Invoke a Lambda function using the API Gateway v2 proxy event format."""
-    from ministack.core.lambda_runtime import get_or_create_worker
     from ministack.services import lambda_svc
 
     # integrationUri from Terraform / real AWS is wrapped:
@@ -522,19 +521,16 @@ async def _invoke_lambda_proxy(integration, api_id, stage, path, method, headers
         "isBase64Encoded": False,
     }
 
-    code_zip = func_data.get("code_zip")
-    runtime = func_config.get("Runtime", "")
-    if code_zip and runtime.startswith(("python", "nodejs")):
-        # Key the worker by name+qualifier so versioned / aliased invocations
-        # use their own cached process, matching Lambda.Invoke semantics.
-        worker_key = f"{func_name}:{qualifier}" if qualifier else func_name
-        worker = get_or_create_worker(worker_key, func_config, code_zip)
-        result = await asyncio.to_thread(worker.invoke, event, new_uuid())
-        if result.get("status") == "error":
-            return 502, {"Content-Type": "application/json"}, json.dumps({"message": result.get("error")}).encode()
-        lambda_response = result.get("result", {})
-    else:
-        lambda_response = {"statusCode": 200, "body": "Mock response"}
+    # Route through the central _execute_function dispatcher so CloudWatch
+    # Logs emission and Docker log output work for API Gateway invocations.
+    exec_record = {"config": func_config, "code_zip": func_data.get("code_zip")}
+    result = await asyncio.to_thread(lambda_svc._execute_function, exec_record, event)
+    if result.get("error"):
+        error_msg = result.get("body", {})
+        if isinstance(error_msg, dict):
+            error_msg = error_msg.get("errorMessage", "Lambda invocation error")
+        return 502, {"Content-Type": "application/json"}, json.dumps({"message": error_msg}).encode()
+    lambda_response = result.get("body", {})
 
     status = lambda_response.get("statusCode", 200)
     resp_headers = {"Content-Type": "application/json"}

@@ -277,6 +277,28 @@ def test_apigwv1_update_stage(apigw_v1):
     assert resp["variables"]["myVar"] == "myVal"
     apigw_v1.delete_rest_api(restApiId=api_id)
 
+
+def test_apigwv1_update_stage_method_settings_wildcard(apigw_v1):
+    """UpdateStage paths like ``/*/*/metrics/enabled`` map to ``methodSettings['*/*']`` (Terraform)."""
+    api_id = apigw_v1.create_rest_api(name="v1-method-settings")["id"]
+    dep_id = apigw_v1.create_deployment(restApiId=api_id)["id"]
+    apigw_v1.create_stage(restApiId=api_id, stageName="local", deploymentId=dep_id)
+    apigw_v1.update_stage(
+        restApiId=api_id,
+        stageName="local",
+        patchOperations=[
+            {"op": "replace", "path": "/*/*/metrics/enabled", "value": "true"},
+            {"op": "replace", "path": "/*/*/logging/loglevel", "value": "INFO"},
+        ],
+    )
+    stage = apigw_v1.get_stage(restApiId=api_id, stageName="local")
+    assert "*/*" in stage.get("methodSettings", {})
+    ms = stage["methodSettings"]["*/*"]
+    assert ms["metricsEnabled"] is True
+    assert ms["loggingLevel"] == "INFO"
+    apigw_v1.delete_rest_api(restApiId=api_id)
+
+
 def test_apigwv1_authorizer_crud(apigw_v1):
     """Authorizer full lifecycle: create, get, update (patch), delete."""
     api_id = apigw_v1.create_rest_api(name="v1-auth-crud")["id"]
@@ -1113,3 +1135,157 @@ def test_apigwv1_custom_id_absent_uses_random(apigw_v1):
     resp = apigw_v1.create_rest_api(name="v1-random")
     # _new_id() returns up to 10 hex chars; trimmed to [:8] in _create_rest_api.
     assert 8 <= len(resp["id"]) <= 10
+
+
+def test_apigwv1_lambda_proxy_emits_cloudwatch_logs(apigw_v1, lam, logs):
+    """Lambda invoked via API Gateway v1 REST proxy must emit CloudWatch Logs."""
+    import urllib.request as _urlreq
+
+    fname = f"intg-v1-cwl-{_uuid_mod.uuid4().hex[:8]}"
+    marker = f"MARKER-{_uuid_mod.uuid4().hex[:8]}"
+    code = (
+        f"import sys\n"
+        f"def handler(event, context):\n"
+        f"    print('{marker}')\n"
+        f"    return {{'statusCode': 200, 'body': 'ok'}}\n"
+    ).encode()
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("index.py", code)
+    lam.create_function(
+        FunctionName=fname,
+        Runtime="python3.12",
+        Role="arn:aws:iam::000000000000:role/test-role",
+        Handler="index.handler",
+        Code={"ZipFile": buf.getvalue()},
+    )
+
+    api_id = apigw_v1.create_rest_api(name=f"v1-cwl-{fname}")["id"]
+    root = next(r for r in apigw_v1.get_resources(restApiId=api_id)["items"] if r["path"] == "/")
+    resource_id = apigw_v1.create_resource(
+        restApiId=api_id,
+        parentId=root["id"],
+        pathPart="cwltest",
+    )["id"]
+    apigw_v1.put_method(
+        restApiId=api_id,
+        resourceId=resource_id,
+        httpMethod="GET",
+        authorizationType="NONE",
+    )
+    apigw_v1.put_integration(
+        restApiId=api_id,
+        resourceId=resource_id,
+        httpMethod="GET",
+        type="AWS_PROXY",
+        integrationHttpMethod="POST",
+        uri=f"arn:aws:apigateway:us-east-1:lambda:path/2015-03-31/functions/arn:aws:lambda:us-east-1:000000000000:function:{fname}/invocations",
+    )
+    dep_id = apigw_v1.create_deployment(restApiId=api_id)["id"]
+    apigw_v1.create_stage(restApiId=api_id, stageName="test", deploymentId=dep_id)
+
+    url = f"http://{api_id}.execute-api.localhost:{_EXECUTE_PORT}/test/cwltest"
+    req = _urlreq.Request(url, method="GET")
+    req.add_header("Host", f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}")
+    resp = _urlreq.urlopen(req)
+    assert resp.status == 200
+
+    # Verify CloudWatch Logs contain the marker text
+    log_group = f"/aws/lambda/{fname}"
+    streams = logs.describe_log_streams(logGroupName=log_group)["logStreams"]
+    assert len(streams) >= 1, f"Expected at least one log stream in {log_group}"
+
+    all_messages = []
+    for stream in streams:
+        events = logs.get_log_events(
+            logGroupName=log_group,
+            logStreamName=stream["logStreamName"],
+        )["events"]
+        all_messages.extend(e["message"] for e in events)
+
+    assert any(marker in msg for msg in all_messages), (
+        f"Marker '{marker}' not found in CloudWatch Logs. Messages: {all_messages}"
+    )
+    assert any(msg.startswith("START RequestId:") for msg in all_messages)
+    assert any(msg.startswith("END RequestId:") for msg in all_messages)
+    assert any(msg.startswith("REPORT RequestId:") for msg in all_messages)
+
+    # Cleanup
+    apigw_v1.delete_rest_api(restApiId=api_id)
+    lam.delete_function(FunctionName=fname)
+
+
+def test_apigwv1_lambda_proxy_emits_cloudwatch_logs_nodejs(apigw_v1, lam, logs):
+    """Node.js Lambda invoked via API Gateway v1 REST proxy must emit CloudWatch Logs."""
+    import urllib.request as _urlreq
+
+    fname = f"intg-v1-cwl-js-{_uuid_mod.uuid4().hex[:8]}"
+    marker = f"JSMARKER-{_uuid_mod.uuid4().hex[:8]}"
+    code = (
+        "exports.handler = async (event) => {\n"
+        f"  console.log('{marker}');\n"
+        "  return { statusCode: 200, body: 'ok' };\n"
+        "};\n"
+    )
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("index.js", code)
+    lam.create_function(
+        FunctionName=fname,
+        Runtime="nodejs20.x",
+        Role="arn:aws:iam::000000000000:role/test-role",
+        Handler="index.handler",
+        Code={"ZipFile": buf.getvalue()},
+    )
+
+    api_id = apigw_v1.create_rest_api(name=f"v1-cwl-js-{fname}")["id"]
+    root = next(r for r in apigw_v1.get_resources(restApiId=api_id)["items"] if r["path"] == "/")
+    resource_id = apigw_v1.create_resource(
+        restApiId=api_id,
+        parentId=root["id"],
+        pathPart="cwljs",
+    )["id"]
+    apigw_v1.put_method(
+        restApiId=api_id,
+        resourceId=resource_id,
+        httpMethod="GET",
+        authorizationType="NONE",
+    )
+    apigw_v1.put_integration(
+        restApiId=api_id,
+        resourceId=resource_id,
+        httpMethod="GET",
+        type="AWS_PROXY",
+        integrationHttpMethod="POST",
+        uri=f"arn:aws:apigateway:us-east-1:lambda:path/2015-03-31/functions/arn:aws:lambda:us-east-1:000000000000:function:{fname}/invocations",
+    )
+    dep_id = apigw_v1.create_deployment(restApiId=api_id)["id"]
+    apigw_v1.create_stage(restApiId=api_id, stageName="test", deploymentId=dep_id)
+
+    url = f"http://{api_id}.execute-api.localhost:{_EXECUTE_PORT}/test/cwljs"
+    req = _urlreq.Request(url, method="GET")
+    req.add_header("Host", f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}")
+    resp = _urlreq.urlopen(req)
+    assert resp.status == 200
+
+    log_group = f"/aws/lambda/{fname}"
+    streams = logs.describe_log_streams(logGroupName=log_group)["logStreams"]
+    assert len(streams) >= 1
+
+    all_messages = []
+    for stream in streams:
+        events = logs.get_log_events(
+            logGroupName=log_group,
+            logStreamName=stream["logStreamName"],
+        )["events"]
+        all_messages.extend(e["message"] for e in events)
+
+    assert any(marker in msg for msg in all_messages), (
+        f"Marker '{marker}' not found in CloudWatch Logs. Messages: {all_messages}"
+    )
+    assert any(msg.startswith("START RequestId:") for msg in all_messages)
+    assert any(msg.startswith("END RequestId:") for msg in all_messages)
+    assert any(msg.startswith("REPORT RequestId:") for msg in all_messages)
+
+    apigw_v1.delete_rest_api(restApiId=api_id)
+    lam.delete_function(FunctionName=fname)

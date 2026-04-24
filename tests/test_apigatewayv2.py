@@ -21,6 +21,12 @@ def _make_zip(code: str) -> bytes:
         zf.writestr("index.py", code)
     return buf.getvalue()
 
+def _make_zip_js(code: str, filename: str = "index.js") -> bytes:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr(filename, code)
+    return buf.getvalue()
+
 _LAMBDA_ROLE = "arn:aws:iam::000000000000:role/lambda-role"
 
 def test_apigw_create_api(apigw):
@@ -1789,3 +1795,138 @@ def test_apigwv2_extract_lambda_ref_matrix():
         name, qualifier = parse(ref)
         assert name == expected_name, f"{uri!r} → name={name!r}, expected {expected_name!r}"
         assert qualifier == expected_q, f"{uri!r} → qualifier={qualifier!r}, expected {expected_q!r}"
+
+
+def test_apigw_lambda_proxy_emits_cloudwatch_logs(apigw, lam, logs):
+    """Lambda invoked via API Gateway v2 proxy must emit CloudWatch Logs."""
+    import urllib.request as _urlreq
+
+    fname = f"intg-apigw-cwl-{_uuid_mod.uuid4().hex[:8]}"
+    marker = f"MARKER-{_uuid_mod.uuid4().hex[:8]}"
+    code = (
+        "import sys\n"
+        "def handler(event, context):\n"
+        f"    print('{marker}')\n"
+        "    return {'statusCode': 200, 'body': 'ok'}\n"
+    )
+
+    lam.create_function(
+        FunctionName=fname,
+        Runtime="python3.12",
+        Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _make_zip(code)},
+    )
+
+    api_id = apigw.create_api(Name=f"cwl-test-{fname}", ProtocolType="HTTP")["ApiId"]
+    int_id = apigw.create_integration(
+        ApiId=api_id,
+        IntegrationType="AWS_PROXY",
+        IntegrationUri=f"arn:aws:lambda:us-east-1:000000000000:function:{fname}",
+        PayloadFormatVersion="2.0",
+    )["IntegrationId"]
+    route_id = apigw.create_route(
+        ApiId=api_id,
+        RouteKey="GET /cwltest",
+        Target=f"integrations/{int_id}",
+    )["RouteId"]
+    apigw.create_stage(ApiId=api_id, StageName="$default")
+
+    url = f"http://{api_id}.execute-api.localhost:{_EXECUTE_PORT}/$default/cwltest"
+    req = _urlreq.Request(url, method="GET")
+    req.add_header("Host", f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}")
+    resp = _urlreq.urlopen(req)
+    assert resp.status == 200
+
+    # Verify CloudWatch Logs contain the marker text
+    log_group = f"/aws/lambda/{fname}"
+    streams = logs.describe_log_streams(logGroupName=log_group)["logStreams"]
+    assert len(streams) >= 1, f"Expected at least one log stream in {log_group}"
+
+    all_messages = []
+    for stream in streams:
+        events = logs.get_log_events(
+            logGroupName=log_group,
+            logStreamName=stream["logStreamName"],
+        )["events"]
+        all_messages.extend(e["message"] for e in events)
+
+    assert any(marker in msg for msg in all_messages), (
+        f"Marker '{marker}' not found in CloudWatch Logs. Messages: {all_messages}"
+    )
+    # Verify START/END/REPORT structure
+    assert any(msg.startswith("START RequestId:") for msg in all_messages)
+    assert any(msg.startswith("END RequestId:") for msg in all_messages)
+    assert any(msg.startswith("REPORT RequestId:") for msg in all_messages)
+
+    # Cleanup
+    apigw.delete_route(ApiId=api_id, RouteId=route_id)
+    apigw.delete_integration(ApiId=api_id, IntegrationId=int_id)
+    apigw.delete_api(ApiId=api_id)
+    lam.delete_function(FunctionName=fname)
+
+
+def test_apigw_lambda_proxy_emits_cloudwatch_logs_nodejs(apigw, lam, logs):
+    """Node.js Lambda invoked via API Gateway v2 proxy must emit CloudWatch Logs."""
+    import urllib.request as _urlreq
+
+    fname = f"intg-apigw-cwl-js-{_uuid_mod.uuid4().hex[:8]}"
+    marker = f"JSMARKER-{_uuid_mod.uuid4().hex[:8]}"
+    code = (
+        "exports.handler = async (event) => {\n"
+        f"  console.log('{marker}');\n"
+        "  return { statusCode: 200, body: 'ok' };\n"
+        "};\n"
+    )
+
+    lam.create_function(
+        FunctionName=fname,
+        Runtime="nodejs20.x",
+        Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _make_zip_js(code)},
+    )
+
+    api_id = apigw.create_api(Name=f"cwl-js-{fname}", ProtocolType="HTTP")["ApiId"]
+    int_id = apigw.create_integration(
+        ApiId=api_id,
+        IntegrationType="AWS_PROXY",
+        IntegrationUri=f"arn:aws:lambda:us-east-1:000000000000:function:{fname}",
+        PayloadFormatVersion="2.0",
+    )["IntegrationId"]
+    route_id = apigw.create_route(
+        ApiId=api_id,
+        RouteKey="GET /cwljs",
+        Target=f"integrations/{int_id}",
+    )["RouteId"]
+    apigw.create_stage(ApiId=api_id, StageName="$default")
+
+    url = f"http://{api_id}.execute-api.localhost:{_EXECUTE_PORT}/$default/cwljs"
+    req = _urlreq.Request(url, method="GET")
+    req.add_header("Host", f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}")
+    resp = _urlreq.urlopen(req)
+    assert resp.status == 200
+
+    log_group = f"/aws/lambda/{fname}"
+    streams = logs.describe_log_streams(logGroupName=log_group)["logStreams"]
+    assert len(streams) >= 1
+
+    all_messages = []
+    for stream in streams:
+        events = logs.get_log_events(
+            logGroupName=log_group,
+            logStreamName=stream["logStreamName"],
+        )["events"]
+        all_messages.extend(e["message"] for e in events)
+
+    assert any(marker in msg for msg in all_messages), (
+        f"Marker '{marker}' not found in CloudWatch Logs. Messages: {all_messages}"
+    )
+    assert any(msg.startswith("START RequestId:") for msg in all_messages)
+    assert any(msg.startswith("END RequestId:") for msg in all_messages)
+    assert any(msg.startswith("REPORT RequestId:") for msg in all_messages)
+
+    apigw.delete_route(ApiId=api_id, RouteId=route_id)
+    apigw.delete_integration(ApiId=api_id, IntegrationId=int_id)
+    apigw.delete_api(ApiId=api_id)
+    lam.delete_function(FunctionName=fname)

@@ -220,6 +220,172 @@ def _apply_patch(obj, patch_ops):
     return obj
 
 
+# UpdateStage patch paths for per-method settings use
+# ``/{resourcePath}/{httpMethod}/metrics/enabled`` (JSON Pointer ``~1`` for ``/``
+# in ``resourcePath``), not ``/methodSettings/...``. ``_apply_patch`` would split
+# ``/*/*/metrics/enabled`` into nested keys under the stage root; we map these
+# into ``stage["methodSettings"]["*/*"]`` etc. instead (Terraform
+# ``aws_api_gateway_method_settings``).
+
+_STAGE_ROOT_PATH_PREFIXES = frozenset(
+    {
+        "variables",
+        "deploymentId",
+        "description",
+        "cacheClusterEnabled",
+        "cacheClusterSize",
+        "tracingEnabled",
+        "documentationVersion",
+        "accessLogSettings",
+        "clientCertificateId",
+        "methodSettings",
+        "canarySettings",
+    }
+)
+
+_HTTP_METHOD_TOKENS = frozenset(
+    {"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "ANY", "*"}
+)
+
+_METHOD_SETTING_CATEGORIES = frozenset({"metrics", "logging", "throttling", "caching"})
+
+
+def _decode_json_pointer_token(segment):
+    """RFC 6901 token decode (~1 -> /, ~0 -> ~)."""
+    return segment.replace("~1", "/").replace("~0", "~")
+
+
+def _default_method_setting_entry():
+    """Wire-shaped defaults similar to AWS GetStage for a method setting block."""
+    return {
+        "metricsEnabled": False,
+        "loggingLevel": "OFF",
+        "dataTraceEnabled": False,
+        "throttlingBurstLimit": 5000,
+        "throttlingRateLimit": 10000.0,
+        "cachingEnabled": False,
+        "cacheTtlInSeconds": 300,
+        "cacheDataEncrypted": False,
+        "requireAuthorizationForCacheControl": True,
+        "unauthorizedCacheControlHeaderStrategy": "SUCCEED_WITH_RESPONSE_HEADER",
+    }
+
+
+def _parse_stage_method_setting_value(field, value_str):
+    if value_str is None:
+        return None
+    if field in (
+        "metricsEnabled",
+        "dataTraceEnabled",
+        "cachingEnabled",
+        "cacheDataEncrypted",
+        "requireAuthorizationForCacheControl",
+    ):
+        return str(value_str).lower() == "true"
+    if field in ("throttlingBurstLimit", "cacheTtlInSeconds"):
+        return int(value_str)
+    if field == "throttlingRateLimit":
+        return float(value_str)
+    return str(value_str)
+
+
+def _method_setting_field_from_patch(rel_tokens):
+    """Map tokens after ``{resourcePath}/{httpMethod}/`` to the methodSettings field name."""
+    if len(rel_tokens) < 2:
+        return None
+    cat, rest0 = rel_tokens[0], rel_tokens[1]
+    if cat == "metrics" and rest0 == "enabled":
+        return "metricsEnabled"
+    if cat == "logging" and rest0 == "loglevel":
+        return "loggingLevel"
+    if cat == "logging" and rest0 == "dataTrace":
+        return "dataTraceEnabled"
+    if cat == "throttling" and rest0 == "burstLimit":
+        return "throttlingBurstLimit"
+    if cat == "throttling" and rest0 == "rateLimit":
+        return "throttlingRateLimit"
+    if cat == "caching" and rest0 == "enabled":
+        return "cachingEnabled"
+    if cat == "caching" and rest0 == "ttlInSeconds":
+        return "cacheTtlInSeconds"
+    if cat == "caching" and rest0 == "dataEncrypted":
+        return "cacheDataEncrypted"
+    if cat == "caching" and rest0 == "requireAuthorizationForCacheControl":
+        return "requireAuthorizationForCacheControl"
+    if cat == "caching" and rest0 == "unauthorizedCacheControlHeaderStrategy":
+        return "unauthorizedCacheControlHeaderStrategy"
+    return None
+
+
+def _try_apply_method_settings_patch(stage, op):
+    """Handle UpdateStage patches documented under ``/{resourcePath}/{httpMethod}/...``."""
+    path = (op.get("path") or "").strip()
+    if not path.startswith("/"):
+        return False
+    raw = path[1:]
+    if not raw:
+        return False
+
+    tokens = [_decode_json_pointer_token(p) for p in raw.split("/")]
+    operation = (op.get("op") or "replace").lower()
+    value = op.get("value")
+
+    # Remove entire method setting: ``/{resourcePath}/{httpMethod}`` (Terraform delete).
+    if operation == "remove" and len(tokens) == 2:
+        if tokens[0] in _STAGE_ROOT_PATH_PREFIXES:
+            return False
+        if tokens[1] not in _HTTP_METHOD_TOKENS:
+            return False
+        key = f"{tokens[0]}/{tokens[1]}"
+        stage.setdefault("methodSettings", {}).pop(key, None)
+        return True
+
+    cat_idx = None
+    for idx, tok in enumerate(tokens):
+        if tok in _METHOD_SETTING_CATEGORIES:
+            cat_idx = idx
+            break
+
+    if cat_idx is None or cat_idx < 1:
+        return False
+    if tokens[0] in _STAGE_ROOT_PATH_PREFIXES:
+        return False
+
+    http_method = tokens[cat_idx - 1]
+    resource_path = "/".join(tokens[: cat_idx - 1])
+    setting_key = f"{resource_path}/{http_method}"
+    rel = tokens[cat_idx:]
+
+    field_name = _method_setting_field_from_patch(rel)
+    if field_name is None:
+        return False
+    ms = stage.setdefault("methodSettings", {})
+    if operation == "remove":
+        entry = ms.get(setting_key)
+        if isinstance(entry, dict):
+            entry.pop(field_name, None)
+        return True
+
+    if operation not in ("replace", "add"):
+        return False
+
+    entry = ms.setdefault(setting_key, {})
+    if len(entry) == 0:
+        entry.update(_default_method_setting_entry())
+    entry[field_name] = _parse_stage_method_setting_value(field_name, value)
+    return True
+
+
+def _apply_stage_patch(stage, patch_ops):
+    """Apply UpdateStage patch operations (method settings + generic JSON patch)."""
+    leftover = []
+    for op in patch_ops:
+        if not _try_apply_method_settings_patch(stage, op):
+            leftover.append(op)
+    if leftover:
+        _apply_patch(stage, leftover)
+
+
 def _match_resource_tree(api_id, segments):
     """Match path segments against the resource tree. Returns (resource, path_params) or (None, {})."""
     resources = _resources.get(api_id, {})
@@ -269,7 +435,6 @@ async def _call_lambda(func_name, event, qualifier=None):
     ``qualifier`` may be a version number or alias name; aliases resolve to
     their target version via ``_get_func_record_for_qualifier`` so aliased
     integration URIs (arn:...:function:<name>:<alias>) invoke correctly (#407)."""
-    from ministack.core.lambda_runtime import get_or_create_worker
     from ministack.services import lambda_svc
 
     func_data, func_config = lambda_svc._get_func_record_for_qualifier(func_name, qualifier)
@@ -277,17 +442,16 @@ async def _call_lambda(func_name, event, qualifier=None):
         label = f"{func_name}:{qualifier}" if qualifier else func_name
         return None, f"Lambda function '{label}' not found"
 
-    code_zip = func_data.get("code_zip")
-    runtime = func_config.get("Runtime", "")
-    if code_zip and runtime.startswith(("python", "nodejs")):
-        worker_key = f"{func_name}:{qualifier}" if qualifier else func_name
-        worker = get_or_create_worker(worker_key, func_config, code_zip)
-        result = await asyncio.to_thread(worker.invoke, event, new_uuid())
-        if result.get("status") == "error":
-            return None, result.get("error", "Lambda invocation error")
-        return result.get("result", {}), None
-    else:
-        return {"statusCode": 200, "body": "Mock response"}, None
+    # Route through the central _execute_function dispatcher so CloudWatch
+    # Logs emission and Docker log output work for API Gateway invocations.
+    exec_record = {"config": func_config, "code_zip": func_data.get("code_zip")}
+    result = await asyncio.to_thread(lambda_svc._execute_function, exec_record, event)
+    if result.get("error"):
+        error_msg = result.get("body", {})
+        if isinstance(error_msg, dict):
+            error_msg = error_msg.get("errorMessage", "Lambda invocation error")
+        return None, error_msg
+    return result.get("body", {}), None
 
 
 # ---- Persistence hooks ----
@@ -1301,7 +1465,7 @@ def _update_stage(api_id, stage_name, data):
     if not stage:
         return _v1_error("NotFoundException", "Invalid Stage identifier specified", 404)
     patch_ops = data.get("patchOperations", [])
-    _apply_patch(stage, patch_ops)
+    _apply_stage_patch(stage, patch_ops)
     stage["lastUpdatedDate"] = _now_unix()
     return _v1_response(stage)
 

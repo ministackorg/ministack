@@ -4,7 +4,8 @@ REST/XML API — service credential scope: cloudfront.
 Paths are under /2020-05-31/
 
 Supports:
-  Distributions: CreateDistribution, GetDistribution, GetDistributionConfig,
+  Distributions: CreateDistribution, CreateDistributionWithTags (DistributionConfigWithTags),
+                 GetDistribution, GetDistributionConfig,
                  ListDistributions, UpdateDistribution, DeleteDistribution
   Invalidations: CreateInvalidation, ListInvalidations, GetInvalidation
   Origin Access Control (OAC): CreateOriginAccessControl, GetOriginAccessControl,
@@ -166,10 +167,61 @@ def _parse_body(body: bytes):
         return None
 
 
+def _local_tag_name(el) -> str:
+    t = el.tag
+    return t.split("}")[-1] if "}" in t else t
+
+
+def _unwrap_distribution_create_xml(root_el):
+    """Return ``(DistributionConfig element, Tags element or None)``.
+
+    Terraform / boto3 ``CreateDistributionWithTags`` posts a
+    ``DistributionConfigWithTags`` root; ``CreateDistribution`` uses
+    ``DistributionConfig`` directly.
+    """
+    if root_el is None:
+        return None, None
+    if _local_tag_name(root_el) == "DistributionConfigWithTags":
+        cfg = _find(root_el, "DistributionConfig")
+        tags_el = _find(root_el, "Tags")
+        return cfg, tags_el
+    return root_el, None
+
+
+def _ingest_distribution_tags_from_xml(dist_arn: str, tags_el):
+    """Apply tag Items from CreateDistributionWithTags onto ``_tags``."""
+    if tags_el is None:
+        return
+    items_el = _find(tags_el, "Items") or tags_el
+    existing = {t["Key"]: t for t in _tags.get(dist_arn, [])}
+    for tag_el in items_el:
+        local = _local_tag_name(tag_el)
+        if local == "Tag":
+            key = _text(tag_el, "Key")
+            val = _text(tag_el, "Value")
+            if key:
+                existing[key] = {"Key": key, "Value": val}
+    _tags[dist_arn] = list(existing.values())
+
+
 def _get_enabled(config_el) -> bool:
     """Extract Enabled boolean from a DistributionConfig XML element."""
     val = _text(config_el, "Enabled", "true")
     return val.strip().lower() != "false"
+
+
+def _ensure_distribution_config_sdk_compat(config_el):
+    """Patch DistributionConfig XML so hashicorp/aws CloudFront flatten does not nil-deref.
+
+    terraform-provider-aws (e.g. v6.42) does ``OriginGroups.Quantity`` without checking
+    ``OriginGroups``; real AWS returns ``<OriginGroups><Quantity>0</Quantity></OriginGroups>``
+    even when empty. Requests often omit that block.
+    """
+    if config_el is None:
+        return
+    if _find(config_el, "OriginGroups") is None:
+        og = SubElement(config_el, "OriginGroups")
+        SubElement(og, "Quantity").text = "0"
 
 
 def _build_distribution_xml(parent, dist):
@@ -182,6 +234,7 @@ def _build_distribution_xml(parent, dist):
     SubElement(parent, "DomainName").text = dist["DomainName"]
     # Re-parse and embed the stored config XML
     config_el = fromstring(dist["config_xml"])
+    _ensure_distribution_config_sdk_compat(config_el)
     config_el.tag = "DistributionConfig"
     parent.append(config_el)
 
@@ -617,7 +670,8 @@ async def handle_request(method, path, headers, body, query_params):
 # ---------------------------------------------------------------------------
 
 def _create_distribution(headers, body):
-    config_el = _parse_body(body)
+    root_el = _parse_body(body)
+    config_el, tags_el = _unwrap_distribution_create_xml(root_el)
     if config_el is None:
         return _error("MalformedXML", "The XML document is malformed.", 400)
 
@@ -653,6 +707,8 @@ def _create_distribution(headers, body):
     _distributions[dist_id] = dist
     _invalidations[dist_id] = []
 
+    _ingest_distribution_tags_from_xml(dist["ARN"], tags_el)
+
     logger.info("CreateDistribution id=%s", dist_id)
 
     def build(root):
@@ -681,6 +737,7 @@ def _get_distribution_config(dist_id):
         return _error("NoSuchDistribution", "The specified distribution does not exist.", 404)
 
     config_el = fromstring(dist["config_xml"])
+    _ensure_distribution_config_sdk_compat(config_el)
     config_el.tag = "DistributionConfig"
     config_el.set("xmlns", NS)
     body = b'<?xml version="1.0" encoding="UTF-8"?>\n' + tostring(config_el, encoding="unicode").encode("utf-8")

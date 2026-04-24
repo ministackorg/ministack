@@ -44,6 +44,30 @@ def test_cloudfront_create_distribution(cloudfront):
     assert dist["Status"] == "Deployed"
     assert resp["ResponseMetadata"]["HTTPStatusCode"] == 201
 
+
+def test_cloudfront_create_distribution_with_tags(cloudfront):
+    """CreateDistributionWithTags (Terraform aws_cloudfront_distribution tags) unwraps inner config."""
+    if not hasattr(cloudfront, "create_distribution_with_tags"):
+        pytest.skip("boto3 has no create_distribution_with_tags")
+    ref = f"cf-with-tags-{_uuid_mod.uuid4().hex[:12]}"
+    cfg = {**_CF_DIST_CONFIG, "CallerReference": ref}
+    resp = cloudfront.create_distribution_with_tags(
+        DistributionConfigWithTags={
+            "DistributionConfig": cfg,
+            "Tags": {"Items": [{"Key": "env", "Value": "test"}]},
+        }
+    )
+    dist = resp["Distribution"]
+    dist_id = dist["Id"]
+    dist_arn = dist["ARN"]
+    assert dist["DomainName"].endswith(".cloudfront.net")
+    tags = cloudfront.list_tags_for_resource(Resource=dist_arn)["Tags"]["Items"]
+    assert any(t["Key"] == "env" and t["Value"] == "test" for t in tags)
+    etag = resp["ETag"]
+    disabled_cfg = {**cfg, "Enabled": False}
+    upd = cloudfront.update_distribution(DistributionConfig=disabled_cfg, Id=dist_id, IfMatch=etag)
+    cloudfront.delete_distribution(Id=dist_id, IfMatch=upd["ETag"])
+
 def test_cloudfront_list_distributions(cloudfront):
     cfg_a = {**_CF_DIST_CONFIG, "CallerReference": "cf-list-a", "Comment": "list-a"}
     cfg_b = {**_CF_DIST_CONFIG, "CallerReference": "cf-list-b", "Comment": "list-b"}
@@ -64,6 +88,8 @@ def test_cloudfront_get_distribution(cloudfront):
     assert dist["Id"] == dist_id
     assert dist["DomainName"] == f"{dist_id}.cloudfront.net"
     assert dist["Status"] == "Deployed"
+    # terraform-provider-aws v6+ dereferences OriginGroups without a nil check
+    assert dist["DistributionConfig"]["OriginGroups"]["Quantity"] == 0
 
 def test_cloudfront_get_distribution_config(cloudfront):
     cfg = {**_CF_DIST_CONFIG, "CallerReference": "cf-getcfg-1", "Comment": "getcfg-test"}
@@ -74,6 +100,7 @@ def test_cloudfront_get_distribution_config(cloudfront):
     resp = cloudfront.get_distribution_config(Id=dist_id)
     assert resp["ETag"] == etag
     assert resp["DistributionConfig"]["Comment"] == "getcfg-test"
+    assert resp["DistributionConfig"]["OriginGroups"]["Quantity"] == 0
 
 def test_cloudfront_update_distribution(cloudfront):
     cfg = {**_CF_DIST_CONFIG, "CallerReference": "cf-upd-1", "Comment": "before-update"}
@@ -618,3 +645,18 @@ def test_cloudfront_function_describe_requires_stage(cloudfront):
         cloudfront.describe_function(Name=name)
     assert exc.value.response["Error"]["Code"] == "InvalidArgument"
     assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+
+
+def test_cloudfront_sdk_compat_injects_origin_groups():
+    """terraform-provider-aws dereferences OriginGroups.Quantity without a nil check."""
+    from xml.etree.ElementTree import Element, SubElement
+
+    import ministack.services.cloudfront as cf
+
+    el = Element("DistributionConfig")
+    SubElement(el, "CallerReference").text = "unit-ref"
+    assert cf._find(el, "OriginGroups") is None
+    cf._ensure_distribution_config_sdk_compat(el)
+    og = cf._find(el, "OriginGroups")
+    assert og is not None
+    assert cf._text(og, "Quantity") == "0"
