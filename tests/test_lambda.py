@@ -2927,3 +2927,59 @@ def test_lambda_invoke_emits_cloudwatch_logs_nodejs(lam, logs):
         assert any(msg.startswith("REPORT RequestId:") for msg in all_messages)
     finally:
         lam.delete_function(FunctionName=fname)
+
+
+# ──────────────────── LAMBDA_DOCKER_FLAGS ────────────────────
+
+def test_lambda_docker_flags_applied_to_run_kwargs(monkeypatch):
+    """LAMBDA_DOCKER_FLAGS env/volume/dns/network/cap/memory flags end up in containers.run() kwargs."""
+    monkeypatch.setattr(lsvc, "LAMBDA_DOCKER_FLAGS", (
+        '-v /host/ca:/opt/ca:ro -e SSL_CERT_FILE=/opt/ca/ca.crt -e NODE_EXTRA_CA_CERTS=/opt/ca/ca.crt '
+        '--dns 172.30.0.2 --network=my-net --memory 512m --shm-size=256m '
+        '--cap-add SYS_PTRACE --add-host myhost:10.0.0.1 --tmpfs /run:size=100m '
+        '--privileged --read-only --unknown-flag ignored'
+    ))
+    monkeypatch.setattr(lsvc, "_docker_available", True)
+
+    captured = {}
+    fake_container = _mk_container()
+    fake_container.ports = {"8080/tcp": [{"HostPort": "9999"}]}
+
+    def _fake_run(**kwargs):
+        captured.update(kwargs)
+        return fake_container
+
+    fake_client = MagicMock()
+    fake_client.containers.run = _fake_run
+    fake_client.images.get = MagicMock()
+    monkeypatch.setattr(lsvc, "_get_docker_client", lambda: fake_client)
+
+    code = b""
+    import io, zipfile
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("index.py", "def handler(e,c): pass")
+    code = buf.getvalue()
+
+    lsvc._spawn_lambda_container(
+        {"FunctionName": "test-fn", "Runtime": "python3.12", "Handler": "index.handler",
+         "PackageType": "Zip", "Timeout": 3, "MemorySize": 128},
+        code,
+    )
+
+    assert captured["environment"]["SSL_CERT_FILE"] == "/opt/ca/ca.crt"
+    assert captured["environment"]["NODE_EXTRA_CA_CERTS"] == "/opt/ca/ca.crt"
+    ca_mount = [m for m in captured["mounts"] if m["Target"] == "/opt/ca"]
+    assert len(ca_mount) == 1
+    assert ca_mount[0]["Source"] == "/host/ca"
+    assert ca_mount[0]["ReadOnly"] is True
+    assert captured["dns"] == ["172.30.0.2"]
+    assert captured["network"] == "my-net"
+    assert captured["mem_limit"] == "512m"
+    assert captured["shm_size"] == "256m"
+    assert captured["cap_add"] == ["SYS_PTRACE"]
+    assert captured["extra_hosts"] == {"myhost": "10.0.0.1"}
+    assert captured["tmpfs"] == {"/run": "size=100m"}
+    assert captured["privileged"] is True
+    assert captured["read_only"] is True
+    assert "unknown_flag" not in captured

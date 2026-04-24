@@ -53,6 +53,7 @@ REGION = os.environ.get("MINISTACK_REGION", os.environ.get("AWS_DEFAULT_REGION",
 LAMBDA_EXECUTOR = os.environ.get("LAMBDA_EXECUTOR", "local").lower()
 LAMBDA_DOCKER_VOLUME_MOUNT = os.environ.get("LAMBDA_REMOTE_DOCKER_VOLUME_MOUNT", "")
 LAMBDA_DOCKER_NETWORK = os.environ.get("LAMBDA_DOCKER_NETWORK", "")
+LAMBDA_DOCKER_FLAGS = os.environ.get("LAMBDA_DOCKER_FLAGS", "")
 # LAMBDA_STRICT=1 → AWS-fidelity mode: every invocation must run in Docker via
 # the AWS RIE image (matching fzonneveld's "docker = docker, no fallbacks"
 # rule). When set, the warm-worker / local-subprocess fallbacks are disabled
@@ -1931,6 +1932,81 @@ def _invoke_rie(container, event: dict, timeout: int) -> dict:
     }
 
 
+def _parse_docker_flags(flags: str) -> dict:
+    """Parse a LAMBDA_DOCKER_FLAGS string into docker-py ``containers.run()`` kwargs.
+
+    Supports the same flags as ``docker run`` by mapping CLI flags to their
+    docker-py keyword equivalents.  Uses argparse so both ``--flag value`` and
+    ``--flag=value`` work.  Unknown flags are silently ignored.
+    """
+    import argparse
+    import shlex
+
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("-e", "--env", action="append", default=[])
+    parser.add_argument("-v", "--volume", action="append", default=[])
+    parser.add_argument("--dns", action="append", default=[])
+    parser.add_argument("--network")
+    parser.add_argument("--cap-add", action="append", default=[])
+    parser.add_argument("-m", "--memory")
+    parser.add_argument("--shm-size")
+    parser.add_argument("--tmpfs", action="append", default=[])
+    parser.add_argument("--add-host", action="append", default=[])
+    parser.add_argument("--privileged", action="store_true")
+    parser.add_argument("--read-only", action="store_true")
+    args, _ = parser.parse_known_args(shlex.split(flags))
+
+    kwargs: dict = {}
+
+    if args.env:
+        env = {}
+        for entry in args.env:
+            k, _, v = entry.partition("=")
+            env[k] = v
+        kwargs["environment"] = env
+
+    if args.volume:
+        mounts = []
+        for vol in args.volume:
+            parts = vol.split(":")
+            host = parts[0]
+            container = parts[1] if len(parts) > 1 else parts[0]
+            ro = len(parts) > 2 and parts[2] == "ro"
+            mounts.append(docker_lib.types.Mount(container, host, type="bind", read_only=ro))
+        kwargs["mounts"] = mounts
+
+    if args.dns:
+        kwargs["dns"] = args.dns
+    if args.network:
+        kwargs["network"] = args.network
+    if args.cap_add:
+        kwargs["cap_add"] = args.cap_add
+    if args.memory:
+        kwargs["mem_limit"] = args.memory
+    if args.shm_size:
+        kwargs["shm_size"] = args.shm_size
+    if args.privileged:
+        kwargs["privileged"] = True
+    if args.read_only:
+        kwargs["read_only"] = True
+
+    if args.tmpfs:
+        tmpfs = {}
+        for entry in args.tmpfs:
+            path, _, opts = entry.partition(":")
+            tmpfs[path] = opts
+        kwargs["tmpfs"] = tmpfs
+
+    if args.add_host:
+        extra_hosts = {}
+        for entry in args.add_host:
+            name, _, ip = entry.partition(":")
+            extra_hosts[name] = ip
+        kwargs["extra_hosts"] = extra_hosts
+
+    return kwargs
+
+
 def _spawn_lambda_container(config: dict, code_zip: bytes | None):
     """Create and start a Lambda container for the given config.
 
@@ -2077,6 +2153,17 @@ def _spawn_lambda_container(config: dict, code_zip: bytes | None):
         run_kwargs["mounts"] = mounts
     if LAMBDA_DOCKER_NETWORK:
         run_kwargs["network"] = LAMBDA_DOCKER_NETWORK
+
+    # Apply LAMBDA_DOCKER_FLAGS — merge parsed kwargs into run_kwargs
+    if LAMBDA_DOCKER_FLAGS:
+        df_kwargs = _parse_docker_flags(LAMBDA_DOCKER_FLAGS)
+        df_env = df_kwargs.pop("environment", {})
+        if df_env:
+            container_env.update(df_env)
+        df_mounts = df_kwargs.pop("mounts", [])
+        if df_mounts:
+            run_kwargs.setdefault("mounts", []).extend(df_mounts)
+        run_kwargs.update(df_kwargs)
 
     # Pull the image on first use (both Zip RIE images and user Image types)
     try:
