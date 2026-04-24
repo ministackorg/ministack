@@ -1895,6 +1895,7 @@ def _invoke_rie(container, event: dict, timeout: int) -> dict:
                 if not ports:
                     continue
                 rie_url = f"http://127.0.0.1:{ports[0]['HostPort']}/2015-03-31/functions/function/invocations"
+            invoke_time = time.time()
             req = urllib.request.Request(
                 rie_url, data=json.dumps(event).encode(),
                 headers={"Content-Type": "application/json"},
@@ -1905,7 +1906,7 @@ def _invoke_rie(container, event: dict, timeout: int) -> dict:
                 parsed = json.loads(body)
             except json.JSONDecodeError:
                 parsed = body
-            logs = container.logs(stdout=True, stderr=True).decode("utf-8", errors="replace").strip()
+            logs = container.logs(stdout=True, stderr=True, since=invoke_time).decode("utf-8", errors="replace").strip()
             # RIE sets 'Lambda-Runtime-Function-Error-Type' (or bare
             # 'X-Amz-Function-Error') when the handler raised an unhandled
             # exception. If it's set we surface the error flag + propagate the
