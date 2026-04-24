@@ -885,22 +885,47 @@ def _deliver_to_lambda(endpoint: str, envelope: str, topic_arn: str, sub_arn: st
         logger.error("SNS fanout → Lambda %s failed: %s", func_name, exc)
 
 
+def _http_post_sync(endpoint: str, payload: str, sns_message_type: str) -> int:
+    """Blocking HTTP POST for SNS delivery. Runs on a worker thread so the
+    event loop stays unblocked. Uses stdlib only — aiohttp was dropped because
+    it isn't a declared dependency and wasn't shipped in the Docker image,
+    which silently skipped every HTTP subscription confirmation (#460).
+
+    Handles `http://user:pass@host/path` userinfo by stripping it from the URL
+    and promoting to an Authorization: Basic header, matching real AWS SNS
+    behaviour for HTTP(S) endpoints with embedded credentials. urllib leaves
+    userinfo in the URL by default, which would break the Host header."""
+    import base64 as _b64
+    import urllib.parse
+    import urllib.request
+    parsed = urllib.parse.urlsplit(endpoint)
+    headers = {
+        "Content-Type": "text/plain; charset=UTF-8",
+        "x-amz-sns-message-type": sns_message_type,
+    }
+    if parsed.username is not None:
+        user = urllib.parse.unquote(parsed.username)
+        pwd = urllib.parse.unquote(parsed.password or "")
+        token = _b64.b64encode(f"{user}:{pwd}".encode("utf-8")).decode("ascii")
+        headers["Authorization"] = f"Basic {token}"
+        netloc = parsed.hostname or ""
+        if parsed.port is not None:
+            netloc = f"{netloc}:{parsed.port}"
+        endpoint = urllib.parse.urlunsplit((parsed.scheme, netloc, parsed.path, parsed.query, parsed.fragment))
+    req = urllib.request.Request(
+        endpoint,
+        data=payload.encode("utf-8"),
+        headers=headers,
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=5) as resp:
+        return resp.status
+
+
 async def _deliver_to_http(endpoint: str, payload: str):
     try:
-        import aiohttp
-        timeout = aiohttp.ClientTimeout(total=5)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.post(
-                endpoint,
-                data=payload,
-                headers={
-                    "Content-Type": "text/plain; charset=UTF-8",
-                    "x-amz-sns-message-type": "Notification",
-                },
-            ) as resp:
-                logger.info("SNS HTTP delivery to %s: %s", endpoint, resp.status)
-    except ImportError:
-        logger.warning("aiohttp not installed — HTTP delivery skipped")
+        status = await asyncio.to_thread(_http_post_sync, endpoint, payload, "Notification")
+        logger.info("SNS HTTP delivery to %s: %s", endpoint, status)
     except Exception as exc:
         logger.warning("SNS HTTP delivery to %s failed: %s", endpoint, exc)
 
@@ -922,20 +947,8 @@ async def _send_subscription_confirmation(topic_arn: str, sub: dict):
         "SigningCertURL": "https://sns.us-east-1.amazonaws.com/SimpleNotificationService-fake.pem",
     })
     try:
-        import aiohttp
-        timeout = aiohttp.ClientTimeout(total=5)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.post(
-                endpoint,
-                data=payload,
-                headers={
-                    "Content-Type": "text/plain; charset=UTF-8",
-                    "x-amz-sns-message-type": "SubscriptionConfirmation",
-                },
-            ) as resp:
-                logger.info("SNS SubscriptionConfirmation sent to %s: %s", endpoint, resp.status)
-    except ImportError:
-        logger.info("aiohttp not installed — subscription confirmation for %s skipped", endpoint)
+        status = await asyncio.to_thread(_http_post_sync, endpoint, payload, "SubscriptionConfirmation")
+        logger.info("SNS SubscriptionConfirmation sent to %s: %s", endpoint, status)
     except Exception as exc:
         logger.warning("SNS SubscriptionConfirmation to %s failed: %s", endpoint, exc)
 

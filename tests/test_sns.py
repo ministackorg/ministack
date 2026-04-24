@@ -1097,3 +1097,120 @@ def test_sns_fifo_e2e_fanout_with_dedup(sns, sqs):
         WaitTimeSeconds=1,
     )
     assert len(dup_msgs.get("Messages", [])) == 0, "Duplicate message should not be delivered"
+
+
+def test_sns_http_subscription_confirmation_delivered(sns):
+    """HTTP subscribe() must POST a SubscriptionConfirmation to the endpoint (#460).
+
+    Regression for the aiohttp-not-installed silent skip: the Docker image
+    never shipped aiohttp, so every HTTP subscription's confirmation was
+    logged-and-dropped. stdlib urllib must deliver.
+    """
+    import http.server
+    import socketserver
+    import threading as _threading
+
+    received = []
+
+    class _Handler(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length", "0"))
+            body = self.rfile.read(length).decode("utf-8", errors="replace")
+            received.append({
+                "headers": dict(self.headers),
+                "body": body,
+            })
+            self.send_response(200)
+            self.end_headers()
+
+        def log_message(self, *_args, **_kwargs):
+            pass
+
+    httpd = socketserver.TCPServer(("127.0.0.1", 0), _Handler)
+    port = httpd.server_address[1]
+    server_thread = _threading.Thread(target=httpd.serve_forever, daemon=True)
+    server_thread.start()
+
+    try:
+        uid = _uuid_mod.uuid4().hex[:8]
+        topic_arn = sns.create_topic(Name=f"intg-sns-http-conf-{uid}")["TopicArn"]
+        sns.subscribe(
+            TopicArn=topic_arn,
+            Protocol="http",
+            Endpoint=f"http://127.0.0.1:{port}/hook",
+        )
+
+        deadline = time.time() + 5
+        while time.time() < deadline and not received:
+            time.sleep(0.05)
+
+        assert received, "SubscriptionConfirmation POST never arrived"
+        first = received[0]
+        header_lookup = {k.lower(): v for k, v in first["headers"].items()}
+        assert header_lookup.get("x-amz-sns-message-type") == "SubscriptionConfirmation"
+        parsed = json.loads(first["body"])
+        assert parsed["Type"] == "SubscriptionConfirmation"
+        assert parsed["TopicArn"] == topic_arn
+        assert "Token" in parsed and parsed["Token"]
+        assert "SubscribeURL" in parsed
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def test_sns_http_subscription_basic_auth_userinfo(sns):
+    """`http://user:pass@host/path` endpoints must deliver Authorization: Basic (#460).
+
+    Real AWS SNS promotes URL userinfo to a Basic auth header. urllib leaves
+    userinfo in the URL by default, which also corrupts the Host header, so
+    the SNS HTTP helper must parse-and-inject explicitly.
+    """
+    import base64 as _b64
+    import http.server
+    import socketserver
+    import threading as _threading
+
+    received = []
+
+    class _Handler(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length", "0"))
+            self.rfile.read(length)
+            received.append({"headers": dict(self.headers)})
+            self.send_response(200)
+            self.end_headers()
+
+        def log_message(self, *_args, **_kwargs):
+            pass
+
+    httpd = socketserver.TCPServer(("127.0.0.1", 0), _Handler)
+    port = httpd.server_address[1]
+    _threading.Thread(target=httpd.serve_forever, daemon=True).start()
+
+    try:
+        uid = _uuid_mod.uuid4().hex[:8]
+        topic_arn = sns.create_topic(Name=f"intg-sns-http-basic-{uid}")["TopicArn"]
+        sns.subscribe(
+            TopicArn=topic_arn,
+            Protocol="http",
+            Endpoint=f"http://alice:s3cret@127.0.0.1:{port}/hook",
+        )
+
+        deadline = time.time() + 5
+        while time.time() < deadline and not received:
+            time.sleep(0.05)
+
+        assert received, "SubscriptionConfirmation POST never arrived"
+        header_lookup = {k.lower(): v for k, v in received[0]["headers"].items()}
+
+        auth = header_lookup.get("authorization", "")
+        assert auth.startswith("Basic "), f"Expected Basic auth header, got {auth!r}"
+        decoded = _b64.b64decode(auth[len("Basic "):]).decode("utf-8")
+        assert decoded == "alice:s3cret"
+
+        host = header_lookup.get("host", "")
+        assert "@" not in host, f"Host header must not contain userinfo, got {host!r}"
+        assert host == f"127.0.0.1:{port}"
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
