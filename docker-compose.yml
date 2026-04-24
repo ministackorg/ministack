@@ -12,6 +12,7 @@ services:
       - REDIS_HOST=redis
       - REDIS_PORT=6379
       - RDS_BASE_PORT=15432
+      # - DOCKER_NETWORK=ministack_default  # Docker network for RDS/EKS/ElastiCache/Lambda containers
       - ELASTICACHE_BASE_PORT=16379
     volumes:
       - ./data/s3:/tmp/ministack-data/s3

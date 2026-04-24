@@ -98,6 +98,28 @@ def test_s3_put_get_json_chunked(s3):
     body = resp["Body"].read().decode()
     assert _json.loads(body) == {"hello": "world", "number": 42}
 
+def test_s3_put_zero_byte_chunked(s3):
+    """Zero-byte PutObject via AWS chunked encoding must store empty body and return correct ETag."""
+    import urllib.request, hashlib
+    bucket = "intg-s3-zero-byte"
+    s3.create_bucket(Bucket=bucket)
+
+    fake_sig = b"abc123"
+    chunked = b"0;chunk-signature=" + fake_sig + b"\r\n\r\n"
+    endpoint = "http://localhost:4566/" + bucket + "/empty.bin"
+    req = urllib.request.Request(endpoint, data=chunked, method="PUT", headers={
+        "x-amz-content-sha256": "STREAMING-AWS4-HMAC-SHA256-PAYLOAD",
+        "Authorization": "AWS4-HMAC-SHA256 Credential=test/20240101/us-east-1/s3/aws4_request, SignedHeaders=host, Signature=fake",
+    })
+    with urllib.request.urlopen(req) as r:
+        assert r.status == 200
+        etag = r.headers.get("ETag", "").strip('"')
+    assert etag == hashlib.md5(b"").hexdigest()
+
+    resp = s3.get_object(Bucket=bucket, Key="empty.bin")
+    assert resp["Body"].read() == b""
+    assert resp["ContentLength"] == 0
+
 def test_s3_head_object(s3):
     s3.create_bucket(Bucket="intg-s3-headobj")
     s3.put_object(

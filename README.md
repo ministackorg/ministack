@@ -635,12 +635,13 @@ ecs.stop_task(cluster="dev", task=task_arn)
 | `RDS_BASE_PORT` | `15432` | Starting host port for RDS containers |
 | `RDS_TMPFS_SIZE` | `256m` | Tmpfs size for RDS database containers (when `RDS_PERSIST=0`). Set to `2g` or higher for large databases |
 | `RDS_PERSIST` | `0` | Set `1` to use Docker named volumes for RDS containers instead of tmpfs. Storage grows dynamically with no fixed cap |
+| `DOCKER_NETWORK` | _(unset)_ | Docker network for all container-backed services (RDS, EKS, ElastiCache, Lambda). Set to your Docker Compose network name so containers can reach each other. Replaces `LAMBDA_DOCKER_NETWORK` |
 | `ELASTICACHE_BASE_PORT` | `16379` | Starting host port for ElastiCache containers |
 | `PERSIST_STATE` | `0` | Set `1` to persist service state across restarts |
 | `STATE_DIR` | `/tmp/ministack-state` | Directory for persisted state files |
 | `LAMBDA_EXECUTOR` | `local` | Lambda execution mode: `local` (subprocess) or `docker` (container). `provided` runtimes and `PackageType: Image` always use Docker |
 | `LAMBDA_STRICT` | `0` | Set `1` for AWS-fidelity mode: every Lambda invocation runs in a Docker container via the AWS RIE image; in-process fallbacks are disabled. Missing Docker surfaces as `Runtime.DockerUnavailable` instead of degrading to a subprocess. Opt-in because the default install doesn't require Docker |
-| `LAMBDA_DOCKER_NETWORK` | _(unset)_ | Docker network for Lambda containers. Set to your Docker Compose network name so Lambda can reach MiniStack |
+| `LAMBDA_DOCKER_NETWORK` | _(unset)_ | Legacy alias for `DOCKER_NETWORK` (Lambda only). Prefer `DOCKER_NETWORK` which covers all services |
 | `LAMBDA_WARM_TTL_SECONDS` | `300` | How long an idle warm Lambda container stays in the pool before the reaper evicts it |
 | `LAMBDA_ACCOUNT_CONCURRENCY` | `0` | Account-level concurrent-invocation cap (0 = unbounded). Match real AWS by setting to `1000`. Used to simulate `ConcurrentInvocationLimitExceeded` throttles |
 | `SFN_MOCK_CONFIG` | _(unset)_ | Path to JSON file for Step Functions mock testing; compatible with AWS SFN Local format. Also accepts `LOCALSTACK_SFN_MOCK_CONFIG` |
@@ -740,8 +741,9 @@ created for lambdas need to be killed manually.
 Additionally a volume is needed to mount the code (and extra layers). This must be set with
 the LAMBDA_REMOTE_DOCKER_VOLUME_MOUNT environment variable. This must be a named volume (managed by docker).
 
-If a ministack is not running on the default network, LAMBDA_DOCKER_NETWORK needs to be set, which will attach
-the lambda to this network, making it posssible to access ministack (AWS) resources from the lambda.
+If a ministack is not running on the default network, DOCKER_NETWORK needs to be set, which will attach
+all container-backed services (Lambda, RDS, EKS, ElastiCache) to this network, making it possible to access
+ministack (AWS) resources from the lambda. The legacy `LAMBDA_DOCKER_NETWORK` is still accepted as a fallback.
 
 Example docker compose file:
 ```
@@ -763,7 +765,7 @@ services:
     environment:
       DOCKER_SOCK: ${DOCKER_SOCK:-/var/run/docker.sock}
       LAMBDA_EXECUTOR: docker
-      LAMBDA_DOCKER_NETWORK: ${COMPOSE_PROJECT_NAME}_infra-network
+      DOCKER_NETWORK: ${COMPOSE_PROJECT_NAME}_infra-network
       LAMBDA_REMOTE_DOCKER_VOLUME_MOUNT: "{COMPOSE_PROJECT_NAME}_lambda-docker-volume"
       AWS_DEFAULT_REGION: ${AWS_REGION:-eu-central-1}
       AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-my_secret}

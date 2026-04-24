@@ -52,7 +52,7 @@ logger = logging.getLogger("lambda")
 REGION = os.environ.get("MINISTACK_REGION", os.environ.get("AWS_DEFAULT_REGION", "us-east-1"))
 LAMBDA_EXECUTOR = os.environ.get("LAMBDA_EXECUTOR", "local").lower()
 LAMBDA_DOCKER_VOLUME_MOUNT = os.environ.get("LAMBDA_REMOTE_DOCKER_VOLUME_MOUNT", "")
-LAMBDA_DOCKER_NETWORK = os.environ.get("LAMBDA_DOCKER_NETWORK", "")
+LAMBDA_DOCKER_NETWORK = os.environ.get("DOCKER_NETWORK", "") or os.environ.get("LAMBDA_DOCKER_NETWORK", "")
 # LAMBDA_STRICT=1 → AWS-fidelity mode: every invocation must run in Docker via
 # the AWS RIE image (matching fzonneveld's "docker = docker, no fallbacks"
 # rule). When set, the warm-worker / local-subprocess fallbacks are disabled

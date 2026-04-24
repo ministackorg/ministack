@@ -28,6 +28,7 @@ logger = logging.getLogger("eks")
 REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 EKS_K3S_IMAGE = os.environ.get("EKS_K3S_IMAGE", "rancher/k3s:v1.31.4-k3s1")
 EKS_BASE_PORT = int(os.environ.get("EKS_BASE_PORT", "16443"))
+DOCKER_NETWORK = os.environ.get("DOCKER_NETWORK", "")
 
 try:
     docker_lib = importlib.import_module("docker")
@@ -130,6 +131,8 @@ def _get_docker():
 
 def _get_ministack_network(client):
     """Detect the Docker network MiniStack is running on."""
+    if DOCKER_NETWORK:
+        return DOCKER_NETWORK
     try:
         hostname = os.environ.get("HOSTNAME", "")
         if not hostname:

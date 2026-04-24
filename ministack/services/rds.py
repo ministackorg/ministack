@@ -49,6 +49,7 @@ REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 BASE_PORT = int(os.environ.get("RDS_BASE_PORT", "15432"))
 RDS_TMPFS_SIZE = os.environ.get("RDS_TMPFS_SIZE", "256m")
 RDS_PERSIST = os.environ.get("RDS_PERSIST", "0").lower() in ("1", "true", "yes")
+DOCKER_NETWORK = os.environ.get("DOCKER_NETWORK", "")
 
 _instances = AccountScopedDict()
 _clusters = AccountScopedDict()
@@ -145,6 +146,10 @@ def _get_ministack_network(docker_client):
     global _ministack_network
     if _ministack_network is not None:
         return _ministack_network or None
+    if DOCKER_NETWORK:
+        _ministack_network = DOCKER_NETWORK
+        logger.debug("RDS: using DOCKER_NETWORK=%s", DOCKER_NETWORK)
+        return DOCKER_NETWORK
     try:
         self_container = docker_client.containers.get(
             os.environ.get("HOSTNAME", ""))
@@ -392,6 +397,8 @@ def _create_db_instance(p):
                     if container_ip:
                         internal_host = container_ip
                         internal_port = container_port
+                        endpoint_host = container_ip
+                        endpoint_port = container_port
                         def _bg_wait(cip=container_ip, cport=container_port,
                                      eng=engine, did=db_id, net=ms_network):
                             if _wait_for_port(cip, cport):

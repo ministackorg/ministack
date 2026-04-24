@@ -278,8 +278,7 @@ def _decode_aws_chunked_body(body: bytes, headers: dict) -> bytes:
         decoded += remaining[data_start:data_start + chunk_size]
         remaining = remaining[data_start + chunk_size + 2:]  # skip trailing \r\n
 
-    if decoded or not body:
-        body = decoded
+    body = decoded
     if "aws-chunked" in content_encoding:
         encodings = [p.strip() for p in content_encoding.split(",") if p.strip() != "aws-chunked"]
         if encodings:
