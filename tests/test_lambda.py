@@ -59,6 +59,34 @@ def test_lambda_create_invoke(lam):
     payload = json.loads(resp["Payload"].read())
     assert payload["statusCode"] == 200
 
+
+def test_lambda_python_nested_handler_slash_form(lam):
+    """AWS Python Lambda accepts both dot and slash separators in nested
+    handler paths (``pkg/sub/mod.fn`` equivalent to ``pkg.sub.mod.fn``);
+    real AWS resolves either form via the underlying file path. MiniStack
+    previously imported the pre-rsplit string literally, so slash form
+    failed with ``ModuleNotFoundError: No module named 'pkg/sub/mod'``.
+    """
+    code = b"def hello(event, context):\n    return {\"ok\": True, \"event\": event}\n"
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("pkg/sub/mod.py", code)
+    lam.create_function(
+        FunctionName="slash-handler-fn",
+        Runtime="python3.12",
+        Role="arn:aws:iam::000000000000:role/test-role",
+        Handler="pkg/sub/mod.hello",
+        Code={"ZipFile": buf.getvalue()},
+    )
+    resp = lam.invoke(
+        FunctionName="slash-handler-fn",
+        Payload=json.dumps({"k": "v"}),
+    )
+    assert "FunctionError" not in resp, resp
+    payload = json.loads(resp["Payload"].read())
+    assert payload.get("ok") is True
+
+
 def test_create_function_missing_runtime_raises(lam):
     """Zip deployment without a Runtime should return InvalidParameterValueException."""
     buf = io.BytesIO()

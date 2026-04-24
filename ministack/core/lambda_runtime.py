@@ -414,6 +414,12 @@ class Worker:
 
         handler = self.config.get("Handler", "index.handler")
         module_name, handler_name = handler.rsplit(".", 1)
+        # AWS Python Lambda accepts both dot (``pkg.mod.fn``) and slash
+        # (``pkg/mod.fn``) in nested handler paths; ``__import__`` only
+        # takes dot. Other runtimes (Node.js, etc.) keep the raw string
+        # because they don't use Python module resolution.
+        if runtime.startswith("python"):
+            module_name = module_name.replace("/", ".")
         env_vars = self.config.get("Environment", {}).get("Variables", {})
         spawn_env = {**os.environ, **env_vars}
         # Restore the internal endpoint URL so Lambda SDK calls reach

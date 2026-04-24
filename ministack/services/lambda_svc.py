@@ -2711,6 +2711,12 @@ def _execute_function_local(func: dict, event: dict) -> dict:
             if "." not in handler:
                 return {"body": {"errorMessage": f"Invalid handler format: {handler}", "errorType": "Runtime.InvalidEntrypoint"}, "error": True}
             module_name, func_name = handler.rsplit(".", 1)
+            # AWS Python Lambda accepts both dot (``pkg.mod.fn``) and slash
+            # (``pkg/mod.fn``) in nested handler paths; ``__import__`` only
+            # takes dot. Other runtimes (Node.js, etc.) keep the raw string
+            # because they don't use Python module resolution.
+            if runtime.startswith("python"):
+                module_name = module_name.replace("/", ".")
 
             if is_node:
                 wrapper_path = os.path.join(tmpdir, "_wrapper.js")
