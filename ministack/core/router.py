@@ -221,7 +221,7 @@ SERVICE_PATTERNS = {
     },
     "backup": {
         "host_patterns": [r"backup\."],
-        "path_prefixes": ["/backup-vaults", "/backup/plans", "/backup-jobs", "/tags"],
+        "path_prefixes": ["/backup-vaults", "/backup/plans", "/backup-jobs", "/untag"],
         "credential_scope": "backup",
     },
 }

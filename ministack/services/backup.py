@@ -577,14 +577,18 @@ async def handle_request(method, path, headers, body_bytes, query_params):
             if method == "GET":
                 return _describe_job(job_id)
 
-    # /tags/{resourceArn}
+    # /tags/{resourceArn} — TagResource (POST) and ListTags (GET)
     if parts and parts[0] == "tags":
         arn = "/".join(parts[1:])
         if method == "GET":
             return _list_tags(arn)
         if method == "POST":
             return _tag_resource(arn, body)
-        if method == "DELETE":
+
+    # /untag/{resourceArn} — UntagResource (POST)
+    if parts and parts[0] == "untag":
+        arn = "/".join(parts[1:])
+        if method == "POST":
             return _untag_resource(arn, body)
 
     return _err("ValidationException", f"No route for {method} {path}", 400)
