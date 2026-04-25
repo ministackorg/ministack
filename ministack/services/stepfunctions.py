@@ -12,7 +12,10 @@ Supports: CreateStateMachine, DeleteStateMachine, DescribeStateMachine,
           GetActivityTask,
           TagResource, UntagResource, ListTagsForResource,
           PublishStateMachineVersion, DeleteStateMachineVersion,
-          ListStateMachineVersions.
+          ListStateMachineVersions,
+          CreateStateMachineAlias, UpdateStateMachineAlias,
+          DeleteStateMachineAlias, DescribeStateMachineAlias,
+          ListStateMachineAliases.
 
 ASL state types: Pass, Task, Choice, Wait, Succeed, Fail, Parallel, Map.
 Task states invoke Lambda functions via services.lambda_svc when available.
@@ -127,6 +130,12 @@ _activity_tasks = AccountScopedDict()
 # Version ARN shape: arn:aws:states:<region>:<acct>:stateMachine:<name>:<N>
 _state_machine_versions = AccountScopedDict()
 
+# alias_arn -> {stateMachineAliasArn, name, description,
+#               routingConfiguration: [{stateMachineVersionArn, weight}],
+#               creationDate, updateDate}
+# Alias ARN shape: arn:aws:states:<region>:<acct>:stateMachine:<name>:<aliasName>
+_state_machine_aliases = AccountScopedDict()
+
 # ── Persistence ────────────────────────────────────────────
 
 def get_state():
@@ -136,6 +145,7 @@ def get_state():
         "tags": copy.deepcopy(_tags),
         "activities": copy.deepcopy(_activities),
         "state_machine_versions": copy.deepcopy(_state_machine_versions),
+        "state_machine_aliases": copy.deepcopy(_state_machine_aliases),
     }
 
 
@@ -147,6 +157,7 @@ def restore_state(data):
     _tags.update(data.get("tags", {}))
     _activities.update(data.get("activities", {}))
     _state_machine_versions.update(data.get("state_machine_versions", {}))
+    _state_machine_aliases.update(data.get("state_machine_aliases", {}))
     # Executions that were RUNNING when the process died cannot resume —
     # mark them FAILED, following the ECS precedent (tasks → STOPPED).
     for exc in _executions.values():
@@ -259,6 +270,11 @@ async def handle_request(method, path, headers, body, query_params):
         "PublishStateMachineVersion": _publish_state_machine_version,
         "DeleteStateMachineVersion": _delete_state_machine_version,
         "ListStateMachineVersions": _list_state_machine_versions,
+        "CreateStateMachineAlias": _create_state_machine_alias,
+        "UpdateStateMachineAlias": _update_state_machine_alias,
+        "DeleteStateMachineAlias": _delete_state_machine_alias,
+        "DescribeStateMachineAlias": _describe_state_machine_alias,
+        "ListStateMachineAliases": _list_state_machine_aliases,
     }
 
     handler = handlers.get(action)
@@ -375,6 +391,26 @@ def _describe_state_machine(data):
             "loggingConfiguration": version.get("loggingConfiguration")
                 or base_sm.get("loggingConfiguration", {"level": "OFF"}),
             "revisionId": version.get("stateMachineRevisionId", ""),
+        })
+    # DescribeStateMachine on an alias ARN: AWS accepts it and returns
+    # state-machine-shaped fields (definition/roleArn/...) resolved from
+    # the base state machine; per AWS's response shape for this API,
+    # routingConfiguration is NOT one of the returned fields (callers
+    # who want routing should use DescribeStateMachineAlias).
+    alias = _state_machine_aliases.get(arn) if arn else None
+    if alias:
+        base_sm = _state_machines.get(_state_machine_arn_from_alias_arn(arn)) or {}
+        return json_response({
+            "stateMachineArn": alias["stateMachineAliasArn"],
+            "name": base_sm.get("name", ""),
+            "definition": base_sm.get("definition", "{}"),
+            "roleArn": base_sm.get("roleArn", ""),
+            "type": base_sm.get("type", "STANDARD"),
+            "creationDate": alias.get("creationDate"),
+            "status": "ACTIVE",
+            "description": alias.get("description", ""),
+            "loggingConfiguration": base_sm.get("loggingConfiguration", {"level": "OFF"}),
+            "revisionId": base_sm.get("revisionId", ""),
         })
     return error_response_json(
         "StateMachineDoesNotExist",
@@ -2890,6 +2926,7 @@ def reset():
     _activities.clear()
     _activity_tasks.clear()
     _state_machine_versions.clear()
+    _state_machine_aliases.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -2963,6 +3000,19 @@ def _delete_state_machine_version(data):
         # AWS semantics: DeleteStateMachineVersion on a nonexistent version
         # is a no-op (200 OK), matching other idempotent delete APIs.
         return json_response({})
+    # AWS rejects DeleteStateMachineVersion while any alias still routes
+    # to the version (ConflictException). Iterate aliases defensively —
+    # _state_machine_aliases is declared by the alias module, so if
+    # aliases haven't been imported/used, nothing to check.
+    for alias_arn, alias in _state_machine_aliases.items():
+        for entry in alias.get("routingConfiguration", []):
+            if entry.get("stateMachineVersionArn") == version_arn:
+                return error_response_json(
+                    "ConflictException",
+                    f"Version {version_arn} cannot be deleted while referenced "
+                    f"by alias {alias_arn} (routingConfiguration).",
+                    400,
+                )
     del _state_machine_versions[version_arn]
     return json_response({})
 
@@ -2988,4 +3038,203 @@ def _list_state_machine_versions(data):
     max_results = data.get("maxResults") or len(matching)
     return json_response({
         "stateMachineVersions": matching[:max_results],
+    })
+
+
+# ---------------------------------------------------------------------------
+# State machine alias CRUD (routes traffic across multiple versions)
+# ---------------------------------------------------------------------------
+
+def _validate_routing_config(routing, state_machine_arn):
+    """AWS routing rules: 1-2 entries, weights in [0,100] summing to 100,
+    no duplicate version entries, and every referenced version ARN must
+    belong to the same state machine and exist."""
+    if not isinstance(routing, list) or not (1 <= len(routing) <= 2):
+        return error_response_json(
+            "ValidationException",
+            "routingConfiguration must have 1 or 2 entries.", 400)
+    total = 0
+    seen_version_arns = set()
+    for entry in routing:
+        weight = entry.get("weight")
+        version_arn = entry.get("stateMachineVersionArn")
+        if weight is None or not isinstance(weight, int) or not (0 <= weight <= 100):
+            return error_response_json(
+                "ValidationException",
+                "routingConfiguration.weight must be an integer in [0, 100].", 400)
+        if not version_arn:
+            return error_response_json(
+                "ValidationException",
+                "routingConfiguration.stateMachineVersionArn is required.", 400)
+        if not version_arn.startswith(f"{state_machine_arn}:"):
+            return error_response_json(
+                "ValidationException",
+                "routingConfiguration version ARN must belong to the same state machine.", 400)
+        if version_arn not in _state_machine_versions:
+            return error_response_json(
+                "ResourceNotFound",
+                f"Version not found: {version_arn}", 400)
+        if version_arn in seen_version_arns:
+            return error_response_json(
+                "ValidationException",
+                "routingConfiguration cannot contain duplicate version entries.", 400)
+        seen_version_arns.add(version_arn)
+        total += weight
+    if total != 100:
+        return error_response_json(
+            "ValidationException",
+            f"routingConfiguration weights must sum to 100 (got {total}).", 400)
+    return None
+
+
+# Alias names must match AWS's documented regex: alphanumerics,
+# underscore, and hyphen only; 1-80 characters.
+_ALIAS_NAME_RE = re.compile(r"^[0-9A-Za-z_\-]+$")
+
+
+def _validate_alias_name(name):
+    """Return an error response if the alias name is malformed per AWS rules,
+    else None."""
+    if not isinstance(name, str) or not (1 <= len(name) <= 80):
+        return error_response_json(
+            "ValidationException",
+            "Alias name must be 1-80 characters.", 400)
+    if not _ALIAS_NAME_RE.match(name):
+        return error_response_json(
+            "ValidationException",
+            "Alias name must match pattern ^[0-9A-Za-z_-]+$.", 400)
+    return None
+
+
+def _state_machine_arn_from_alias_arn(alias_arn):
+    return alias_arn.rsplit(":", 1)[0]
+
+
+def _create_state_machine_alias(data):
+    name = data.get("name")
+    if not name:
+        return error_response_json("ValidationException", "name is required.", 400)
+    name_err = _validate_alias_name(name)
+    if name_err:
+        return name_err
+    routing = data.get("routingConfiguration")
+    if not routing:
+        return error_response_json(
+            "ValidationException",
+            "routingConfiguration is required.", 400)
+    # Reject malformed shapes (dict, scalar, etc.) before any indexing.
+    # AWS rejects these with ValidationException; without this, a caller
+    # who sends a dict (e.g. accidentally unwrapped) would hit a Python
+    # TypeError on routing[0] and surface a 500 instead.
+    if not isinstance(routing, list):
+        return error_response_json(
+            "ValidationException",
+            "routingConfiguration must be a list.", 400)
+    if not routing or not isinstance(routing[0], dict):
+        return error_response_json(
+            "ValidationException",
+            "routingConfiguration must contain at least one entry shaped "
+            "{stateMachineVersionArn, weight}.", 400)
+    # All routing entries must reference the same state machine. Derive
+    # the state-machine ARN from the first entry and validate.
+    first_version_arn = routing[0].get("stateMachineVersionArn")
+    if not first_version_arn:
+        return error_response_json(
+            "ValidationException",
+            "routingConfiguration.stateMachineVersionArn is required.", 400)
+    state_machine_arn = first_version_arn.rsplit(":", 1)[0]
+    if state_machine_arn not in _state_machines:
+        return error_response_json(
+            "StateMachineDoesNotExist",
+            f"State machine {state_machine_arn} not found", 400)
+
+    err = _validate_routing_config(routing, state_machine_arn)
+    if err:
+        return err
+
+    alias_arn = f"{state_machine_arn}:{name}"
+    if alias_arn in _state_machine_aliases:
+        return error_response_json(
+            "ConflictException",
+            f"Alias {name} already exists.", 400)
+
+    ts = now_iso()
+    _state_machine_aliases[alias_arn] = {
+        "stateMachineAliasArn": alias_arn,
+        "name": name,
+        "description": data.get("description", ""),
+        "routingConfiguration": [dict(r) for r in routing],
+        "creationDate": ts,
+        "updateDate": ts,
+    }
+    return json_response({
+        "stateMachineAliasArn": alias_arn,
+        "creationDate": ts,
+    })
+
+
+def _update_state_machine_alias(data):
+    alias_arn = data.get("stateMachineAliasArn")
+    alias = _state_machine_aliases.get(alias_arn)
+    if not alias:
+        return error_response_json(
+            "ResourceNotFound",
+            f"Alias {alias_arn} not found", 400)
+    if "description" in data:
+        alias["description"] = data["description"]
+    if "routingConfiguration" in data:
+        state_machine_arn = _state_machine_arn_from_alias_arn(alias_arn)
+        err = _validate_routing_config(data["routingConfiguration"], state_machine_arn)
+        if err:
+            return err
+        alias["routingConfiguration"] = [dict(r) for r in data["routingConfiguration"]]
+    ts = now_iso()
+    alias["updateDate"] = ts
+    return json_response({"updateDate": ts})
+
+
+def _delete_state_machine_alias(data):
+    alias_arn = data.get("stateMachineAliasArn")
+    # Match AWS semantics: delete is idempotent (no 404 on missing alias).
+    _state_machine_aliases.pop(alias_arn, None)
+    return json_response({})
+
+
+def _describe_state_machine_alias(data):
+    alias_arn = data.get("stateMachineAliasArn")
+    alias = _state_machine_aliases.get(alias_arn)
+    if not alias:
+        return error_response_json(
+            "ResourceNotFound",
+            f"Alias {alias_arn} not found", 400)
+    return json_response({
+        "stateMachineAliasArn": alias["stateMachineAliasArn"],
+        "name": alias["name"],
+        "description": alias.get("description", ""),
+        "routingConfiguration": [dict(r) for r in alias.get("routingConfiguration", [])],
+        "creationDate": alias["creationDate"],
+        "updateDate": alias.get("updateDate", alias["creationDate"]),
+    })
+
+
+def _list_state_machine_aliases(data):
+    state_machine_arn = data.get("stateMachineArn")
+    if state_machine_arn not in _state_machines:
+        return error_response_json(
+            "StateMachineDoesNotExist",
+            f"State machine {state_machine_arn} not found", 400)
+
+    matching = []
+    for alias_arn, alias in _state_machine_aliases.items():
+        if _state_machine_arn_from_alias_arn(alias_arn) != state_machine_arn:
+            continue
+        matching.append({
+            "stateMachineAliasArn": alias_arn,
+            "creationDate": alias["creationDate"],
+        })
+    matching.sort(key=lambda a: a["creationDate"], reverse=True)
+
+    max_results = data.get("maxResults") or len(matching)
+    return json_response({
+        "stateMachineAliases": matching[:max_results],
     })
