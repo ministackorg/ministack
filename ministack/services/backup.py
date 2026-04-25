@@ -529,7 +529,7 @@ async def handle_request(method, path, headers, body_bytes, query_params):
     if len(parts) >= 2 and parts[0] == "backup" and parts[1] == "plans":
         # /backup/plans
         if len(parts) == 2:
-            if method == "POST":
+            if method == "PUT":
                 return _create_plan(body)
             if method == "GET":
                 return _list_plans(query)
