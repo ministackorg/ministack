@@ -138,6 +138,33 @@ def test_backup_list_plan_versions(backup):
     assert len(resp["BackupPlanVersionsList"]) == 2
 
 
+def test_backup_list_plan_versions_single_version(backup):
+    plan_id = backup.create_backup_plan(BackupPlan=_plan_body(f"ver-single-{_uid()}"))["BackupPlanId"]
+    resp = backup.list_backup_plan_versions(BackupPlanId=plan_id)
+    assert len(resp["BackupPlanVersionsList"]) == 1
+
+
+def test_backup_list_plan_versions_not_found(backup):
+    with pytest.raises(ClientError) as exc:
+        backup.list_backup_plan_versions(BackupPlanId="no-such-plan-id")
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
+def test_backup_delete_plan_not_found(backup):
+    with pytest.raises(ClientError) as exc:
+        backup.delete_backup_plan(BackupPlanId="no-such-plan-id")
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
+def test_backup_update_plan_not_found(backup):
+    with pytest.raises(ClientError) as exc:
+        backup.update_backup_plan(
+            BackupPlanId="no-such-plan-id",
+            BackupPlan=_plan_body(f"upd-missing-{_uid()}"),
+        )
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
 def test_backup_list_plans(backup):
     plan_id = backup.create_backup_plan(BackupPlan=_plan_body(f"listed-{_uid()}"))["BackupPlanId"]
     resp = backup.list_backup_plans()
@@ -159,6 +186,18 @@ def test_backup_delete_plan(backup):
 
 def _make_plan(backup):
     return backup.create_backup_plan(BackupPlan=_plan_body(f"sel-plan-{_uid()}"))["BackupPlanId"]
+
+
+def test_backup_create_selection_plan_not_found(backup):
+    with pytest.raises(ClientError) as exc:
+        backup.create_backup_selection(
+            BackupPlanId="no-such-plan-id",
+            BackupSelection={
+                "SelectionName": "sel-x",
+                "IamRoleArn": "arn:aws:iam::000000000000:role/BackupRole",
+            },
+        )
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
 
 
 def test_backup_create_selection(backup):
@@ -201,6 +240,19 @@ def test_backup_list_selections(backup):
     resp = backup.list_backup_selections(BackupPlanId=plan_id)
     ids = [s["SelectionId"] for s in resp["BackupSelectionsList"]]
     assert sel_id in ids
+
+
+def test_backup_list_selections_plan_not_found(backup):
+    with pytest.raises(ClientError) as exc:
+        backup.list_backup_selections(BackupPlanId="no-such-plan-id")
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
+def test_backup_get_selection_not_found(backup):
+    plan_id = _make_plan(backup)
+    with pytest.raises(ClientError) as exc:
+        backup.get_backup_selection(BackupPlanId=plan_id, SelectionId="no-such-sel-id")
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
 
 
 def test_backup_delete_selection(backup):
@@ -267,6 +319,80 @@ def test_backup_list_jobs(backup):
     assert job_id in ids
 
 
+def test_backup_start_job_vault_not_found(backup):
+    with pytest.raises(ClientError) as exc:
+        backup.start_backup_job(
+            BackupVaultName="no-such-vault-xyz",
+            ResourceArn="arn:aws:s3:::my-bucket",
+            IamRoleArn="arn:aws:iam::000000000000:role/BackupRole",
+        )
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
+def test_backup_start_job_increments_recovery_point_count(backup):
+    vault_name = f"rp-count-vault-{_uid()}"
+    backup.create_backup_vault(BackupVaultName=vault_name)
+    before = backup.describe_backup_vault(BackupVaultName=vault_name)["NumberOfRecoveryPoints"]
+    backup.start_backup_job(
+        BackupVaultName=vault_name,
+        ResourceArn="arn:aws:dynamodb:us-east-1:000000000000:table/MyTable",
+        IamRoleArn="arn:aws:iam::000000000000:role/BackupRole",
+    )
+    after = backup.describe_backup_vault(BackupVaultName=vault_name)["NumberOfRecoveryPoints"]
+    assert after == before + 1
+
+
+def test_backup_stop_job_not_found(backup):
+    with pytest.raises(ClientError) as exc:
+        backup.stop_backup_job(BackupJobId="no-such-job-id")
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
+def test_backup_stop_job_aborts_running_job(backup):
+    import ministack.services.backup as svc
+    vault_name = f"abort-vault-{_uid()}"
+    backup.create_backup_vault(BackupVaultName=vault_name)
+    job_id = backup.start_backup_job(
+        BackupVaultName=vault_name,
+        ResourceArn="arn:aws:s3:::my-bucket",
+        IamRoleArn="arn:aws:iam::000000000000:role/BackupRole",
+    )["JobId"]
+    # force the job back to a non-terminal state so stop_job can act on it
+    svc._jobs[job_id]["State"] = "RUNNING"
+    backup.stop_backup_job(BackupJobId=job_id)
+    assert backup.describe_backup_job(BackupJobId=job_id)["State"] == "ABORTED"
+
+
+def test_backup_list_jobs_by_state(backup):
+    vault_name = f"state-filter-vault-{_uid()}"
+    backup.create_backup_vault(BackupVaultName=vault_name)
+    job_id = backup.start_backup_job(
+        BackupVaultName=vault_name,
+        ResourceArn="arn:aws:s3:::my-bucket",
+        IamRoleArn="arn:aws:iam::000000000000:role/BackupRole",
+    )["JobId"]
+    resp = backup.list_backup_jobs(ByState="COMPLETED")
+    ids = [j["JobId"] for j in resp["BackupJobs"]]
+    assert job_id in ids
+    resp_fail = backup.list_backup_jobs(ByState="FAILED")
+    ids_fail = [j["JobId"] for j in resp_fail["BackupJobs"]]
+    assert job_id not in ids_fail
+
+
+def test_backup_list_jobs_by_resource_arn(backup):
+    vault_name = f"res-filter-vault-{_uid()}"
+    resource = f"arn:aws:dynamodb:us-east-1:000000000000:table/table-{_uid()}"
+    backup.create_backup_vault(BackupVaultName=vault_name)
+    job_id = backup.start_backup_job(
+        BackupVaultName=vault_name,
+        ResourceArn=resource,
+        IamRoleArn="arn:aws:iam::000000000000:role/BackupRole",
+    )["JobId"]
+    resp = backup.list_backup_jobs(ByResourceArn=resource)
+    ids = [j["JobId"] for j in resp["BackupJobs"]]
+    assert job_id in ids
+
+
 def test_backup_stop_job_already_completed(backup):
     vault_name = f"stop-vault-{_uid()}"
     backup.create_backup_vault(BackupVaultName=vault_name)
@@ -318,3 +444,25 @@ def test_backup_tag_not_found(backup):
     with pytest.raises(ClientError) as exc:
         backup.tag_resource(ResourceArn=arn, Tags={"k": "v"})
     assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
+def test_backup_untag_resource_not_found(backup):
+    arn = "arn:aws:backup:us-east-1:000000000000:backup-vault:no-such-vault"
+    with pytest.raises(ClientError) as exc:
+        backup.untag_resource(ResourceArn=arn, TagKeyList=["k"])
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
+def test_backup_list_tags_not_found(backup):
+    arn = "arn:aws:backup:us-east-1:000000000000:backup-vault:no-such-vault"
+    with pytest.raises(ClientError) as exc:
+        backup.list_tags(ResourceArn=arn)
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
+def test_backup_list_tags_empty(backup):
+    name = f"empty-tag-vault-{_uid()}"
+    backup.create_backup_vault(BackupVaultName=name)
+    arn = f"arn:aws:backup:{REGION}:000000000000:backup-vault:{name}"
+    resp = backup.list_tags(ResourceArn=arn)
+    assert resp["Tags"] == {}

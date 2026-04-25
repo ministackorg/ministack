@@ -444,8 +444,8 @@ def _describe_job(job_id):
 
 def _list_jobs(query):
     vault_filter = query.get("backupVaultName", "")
-    state_filter = query.get("byState", "")
-    resource_filter = query.get("byResourceArn", "")
+    state_filter = query.get("state", "")
+    resource_filter = query.get("resourceArn", "")
     items = list(_jobs.values())
     if vault_filter:
         items = [j for j in items if j["BackupVaultName"] == vault_filter]
