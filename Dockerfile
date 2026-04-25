@@ -8,6 +8,7 @@ RUN pip install --no-cache-dir --no-compile \
         "pyyaml>=6.0" \
         "cryptography>=41.0" \
         "pymysql>=1.1" \
+        "asyncssh>=2.14" \
         "boto3>=1.34" \
         "awscli"
 
@@ -61,7 +62,7 @@ ENV GATEWAY_PORT=4566 \
     LAMBDA_EXECUTOR=local \
     PYTHONUNBUFFERED=1
 
-EXPOSE 4566
+EXPOSE 4566 2222
 
 # Pure Python healthcheck — no curl dependency
 HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=3 \

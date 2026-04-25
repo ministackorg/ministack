@@ -3,11 +3,17 @@ AWS Transfer Family Service Emulator.
 JSON-based API via X-Amz-Target: TransferService.<Operation>.
 
 Supports:
-  Servers:  CreateServer, DescribeServer, DeleteServer, ListServers
+  Servers:  CreateServer, DescribeServer, DeleteServer, ListServers,
+            StartServer, StopServer
   Users:    CreateUser, DescribeUser, DeleteUser, ListUsers
   SSH Keys: ImportSshPublicKey, DeleteSshPublicKey
+
+Real SFTP transport is provided by ``transfer_sftp``: a single shared
+listener on :2222 by default, with `SFTP_PORT_PER_SERVER=1` opting into
+per-server endpoints (matching AWS's per-server hostname model).
 """
 
+import asyncio
 import copy
 import json
 import logging
@@ -123,6 +129,8 @@ async def handle_request(method, path, headers, body, query_params):
         "DescribeServer": _describe_server,
         "DeleteServer": _delete_server,
         "ListServers": _list_servers,
+        "StartServer": _start_server,
+        "StopServer": _stop_server,
         "CreateUser": _create_user,
         "DescribeUser": _describe_user,
         "DeleteUser": _delete_user,
@@ -134,14 +142,20 @@ async def handle_request(method, path, headers, body, query_params):
     handler = handlers.get(action)
     if not handler:
         return error_response_json("InvalidAction", f"Unknown action: {action}", 400)
-    return handler(data)
+    result = handler(data)
+    # Some handlers need to await SFTP listener setup; the dispatcher
+    # transparently handles both sync and async return shapes so the
+    # per-handler signature stays minimal.
+    if asyncio.iscoroutine(result):
+        result = await result
+    return result
 
 
 # ---------------------------------------------------------------------------
 # Server handlers
 # ---------------------------------------------------------------------------
 
-def _create_server(data):
+async def _create_server(data):
     sid = _server_id()
     now = now_iso()
 
@@ -159,6 +173,18 @@ def _create_server(data):
     }
 
     _servers[sid] = server
+
+    # If SFTP_PORT_PER_SERVER=1, allocate a dedicated SFTP listener for
+    # this server (matches AWS's per-server endpoint model). Otherwise
+    # the shared :2222 listener handles every server, disambiguating by
+    # the user's SSH public key. Discovery of the port is via the admin
+    # endpoint /_ministack/transfer/sftp-ports.
+    try:
+        from ministack.services import transfer_sftp
+        await transfer_sftp.start_server_listener(sid)
+    except Exception as e:
+        logger.warning("SFTP per-server listener failed for %s: %s", sid, e)
+
     return json_response({"ServerId": sid})
 
 
@@ -180,10 +206,29 @@ def _describe_server(data):
         "Tags": server.get("Tags", []),
         "UserCount": server.get("UserCount", 0),
     }
+    # SFTP port discovery is via GET /_ministack/transfer/sftp-ports —
+    # boto3's model-driven deserializer drops fields not in the AWS spec
+    # (so DescribeServer can't carry an SftpPort field meaningfully).
     return json_response({"Server": described})
 
 
-def _delete_server(data):
+def _start_server(data):
+    sid = data.get("ServerId", "")
+    if sid not in _servers:
+        return _error("ResourceNotFoundException", f"Unknown server: {sid}", 404)
+    _servers[sid]["State"] = "ONLINE"
+    return json_response({})
+
+
+def _stop_server(data):
+    sid = data.get("ServerId", "")
+    if sid not in _servers:
+        return _error("ResourceNotFoundException", f"Unknown server: {sid}", 404)
+    _servers[sid]["State"] = "OFFLINE"
+    return json_response({})
+
+
+async def _delete_server(data):
     sid = data.get("ServerId", "")
     if sid not in _servers:
         return _error("ResourceNotFoundException",
@@ -195,6 +240,15 @@ def _delete_server(data):
         del _users[k]
 
     del _servers[sid]
+
+    # Tear down any per-server SFTP listener bound for this server (no-op
+    # in shared-port mode).
+    try:
+        from ministack.services import transfer_sftp
+        await transfer_sftp.stop_server_listener(sid)
+    except Exception as e:
+        logger.debug("SFTP per-server stop error for %s: %s", sid, e)
+
     return json_response({})
 
 
