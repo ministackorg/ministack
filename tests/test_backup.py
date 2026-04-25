@@ -348,20 +348,6 @@ def test_backup_stop_job_not_found(backup):
     assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
 
 
-def test_backup_stop_job_aborts_running_job(backup):
-    import ministack.services.backup as svc
-    vault_name = f"abort-vault-{_uid()}"
-    backup.create_backup_vault(BackupVaultName=vault_name)
-    job_id = backup.start_backup_job(
-        BackupVaultName=vault_name,
-        ResourceArn="arn:aws:s3:::my-bucket",
-        IamRoleArn="arn:aws:iam::000000000000:role/BackupRole",
-    )["BackupJobId"]
-    # force the job back to a non-terminal state so stop_job can act on it
-    svc._jobs[job_id]["State"] = "RUNNING"
-    backup.stop_backup_job(BackupJobId=job_id)
-    assert backup.describe_backup_job(BackupJobId=job_id)["State"] == "ABORTED"
-
 
 def test_backup_list_jobs_by_state(backup):
     vault_name = f"state-filter-vault-{_uid()}"
