@@ -445,3 +445,233 @@ def test_logs_stop_query(logs):
 
     # cleanup
     logs.delete_log_group(logGroupName=group)
+
+
+# ---------------------------------------------------------------------------
+# Log Delivery API (PutDeliverySource / DeliveryDestination / Create+Describe)
+# ---------------------------------------------------------------------------
+
+def test_logs_delivery_source_crud(logs):
+    """Put/Get/Describe/Delete round-trip for a delivery source.
+
+    Per AWS's contract ``PutDeliverySource`` is idempotent (upsert)
+    and ``DescribeDeliverySources`` must include the record after
+    creation.
+    """
+    uid = _uuid_mod.uuid4().hex[:8]
+    src_name = f"intg-src-{uid}"
+    resource_arn = f"arn:aws:bedrock:us-east-1:000000000000:model/anthropic.x-{uid}"
+
+    put_resp = logs.put_delivery_source(
+        name=src_name,
+        resourceArn=resource_arn,
+        logType="APPLICATION_LOGS",
+    )
+    assert put_resp["deliverySource"]["name"] == src_name
+    assert put_resp["deliverySource"]["resourceArns"] == [resource_arn]
+    assert put_resp["deliverySource"]["logType"] == "APPLICATION_LOGS"
+    assert put_resp["deliverySource"]["arn"].endswith(f":delivery-source:{src_name}")
+
+    get_resp = logs.get_delivery_source(name=src_name)
+    assert get_resp["deliverySource"]["logType"] == "APPLICATION_LOGS"
+
+    describe_resp = logs.describe_delivery_sources()
+    assert any(s["name"] == src_name for s in describe_resp["deliverySources"])
+
+    logs.delete_delivery_source(name=src_name)
+    with pytest.raises(ClientError) as exc:
+        logs.get_delivery_source(name=src_name)
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
+def test_logs_delivery_destination_crud(logs):
+    """Put/Get/Describe/Delete round-trip for a delivery destination."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    dest_name = f"intg-dest-{uid}"
+    dest_resource_arn = f"arn:aws:logs:us-east-1:000000000000:log-group:/intg/delivery-{uid}:*"
+
+    put_resp = logs.put_delivery_destination(
+        name=dest_name,
+        deliveryDestinationConfiguration={
+            "destinationResourceArn": dest_resource_arn,
+        },
+    )
+    assert put_resp["deliveryDestination"]["name"] == dest_name
+    assert (
+        put_resp["deliveryDestination"]["deliveryDestinationConfiguration"]["destinationResourceArn"]
+        == dest_resource_arn
+    )
+    assert put_resp["deliveryDestination"]["arn"].endswith(f":delivery-destination:{dest_name}")
+
+    get_resp = logs.get_delivery_destination(name=dest_name)
+    assert (
+        get_resp["deliveryDestination"]["deliveryDestinationConfiguration"]["destinationResourceArn"]
+        == dest_resource_arn
+    )
+
+    describe_resp = logs.describe_delivery_destinations()
+    assert any(d["name"] == dest_name for d in describe_resp["deliveryDestinations"])
+
+    logs.delete_delivery_destination(name=dest_name)
+
+
+def test_logs_delivery_create_binds_source_and_destination(logs):
+    """CreateDelivery wires a source to a destination and returns a delivery id/ARN."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    src_name = f"intg-src-{uid}"
+    dest_name = f"intg-dest-{uid}"
+
+    logs.put_delivery_source(
+        name=src_name,
+        resourceArn=f"arn:aws:bedrock:us-east-1:000000000000:model/test-{uid}",
+        logType="APPLICATION_LOGS",
+    )
+    dest_resp = logs.put_delivery_destination(
+        name=dest_name,
+        deliveryDestinationConfiguration={
+            "destinationResourceArn": f"arn:aws:logs:us-east-1:000000000000:log-group:/intg/d-{uid}:*",
+        },
+    )
+    dest_arn = dest_resp["deliveryDestination"]["arn"]
+
+    create_resp = logs.create_delivery(
+        deliverySourceName=src_name,
+        deliveryDestinationArn=dest_arn,
+    )
+    delivery = create_resp["delivery"]
+    assert delivery["deliverySourceName"] == src_name
+    assert delivery["deliveryDestinationArn"] == dest_arn
+    assert delivery["arn"].startswith("arn:aws:logs:")
+
+    describe_resp = logs.describe_deliveries()
+    assert any(d["id"] == delivery["id"] for d in describe_resp["deliveries"])
+
+    logs.delete_delivery(id=delivery["id"])
+    logs.delete_delivery_destination(name=dest_name)
+    logs.delete_delivery_source(name=src_name)
+
+
+# ---------------------------------------------------------------------------
+# Log Delivery — validation & AWS-derived fields (hardening)
+# ---------------------------------------------------------------------------
+
+def test_logs_delivery_source_service_derived_from_resource_arn(logs):
+    """PutDeliverySource must set ``service`` from the resource ARN, ignoring
+    any value the caller sends. AWS treats this as a server-computed
+    field — callers cannot override it."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    src_name = f"intg-svc-{uid}"
+    resp = logs.put_delivery_source(
+        name=src_name,
+        resourceArn=f"arn:aws:bedrock:us-east-1:000000000000:model/anthropic.claude-{uid}",
+        logType="APPLICATION_LOGS",
+    )
+    assert resp["deliverySource"]["service"] == "bedrock"
+    logs.delete_delivery_source(name=src_name)
+
+
+def test_logs_delivery_destination_type_derived_from_arn(logs):
+    """PutDeliveryDestination must compute ``deliveryDestinationType`` from
+    the destinationResourceArn (S3 / CWL / FH)."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    cases = [
+        (f"arn:aws:s3:::bucket-{uid}", "S3"),
+        (f"arn:aws:logs:us-east-1:000000000000:log-group:/intg/{uid}:*", "CWL"),
+        (f"arn:aws:firehose:us-east-1:000000000000:deliverystream/{uid}", "FH"),
+    ]
+    for i, (arn, expected_type) in enumerate(cases):
+        dest_name = f"intg-type-{uid}-{i}"
+        resp = logs.put_delivery_destination(
+            name=dest_name,
+            deliveryDestinationConfiguration={"destinationResourceArn": arn},
+        )
+        assert resp["deliveryDestination"]["deliveryDestinationType"] == expected_type
+        logs.delete_delivery_destination(name=dest_name)
+
+
+def test_logs_delivery_destination_rejects_unknown_output_format(logs):
+    """outputFormat outside the AWS-allowed set is rejected."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    with pytest.raises(ClientError) as exc:
+        logs.put_delivery_destination(
+            name=f"intg-bad-{uid}",
+            outputFormat="yaml",
+            deliveryDestinationConfiguration={
+                "destinationResourceArn": f"arn:aws:logs:us-east-1:000000000000:log-group:/x/{uid}:*",
+            },
+        )
+    assert exc.value.response["Error"]["Code"] == "ValidationException"
+
+
+def test_logs_delivery_destination_rejects_unsupported_target(logs):
+    """destinationResourceArn that isn't S3/CWL/FH is rejected upfront."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    with pytest.raises(ClientError) as exc:
+        logs.put_delivery_destination(
+            name=f"intg-bad-target-{uid}",
+            deliveryDestinationConfiguration={
+                "destinationResourceArn": f"arn:aws:lambda:us-east-1:000000000000:function:anything-{uid}",
+            },
+        )
+    assert exc.value.response["Error"]["Code"] == "ValidationException"
+
+
+def test_logs_create_delivery_requires_destination_to_exist(logs):
+    """CreateDelivery pointed at a non-existent destination must raise
+    ResourceNotFoundException (real AWS cannot ship to an unknown sink)."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    src_name = f"intg-src-{uid}"
+    logs.put_delivery_source(
+        name=src_name,
+        resourceArn=f"arn:aws:bedrock:us-east-1:000000000000:model/claude-{uid}",
+        logType="APPLICATION_LOGS",
+    )
+    try:
+        with pytest.raises(ClientError) as exc:
+            logs.create_delivery(
+                deliverySourceName=src_name,
+                deliveryDestinationArn=f"arn:aws:logs:us-east-1:000000000000:delivery-destination:never-created-{uid}",
+            )
+        assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+    finally:
+        logs.delete_delivery_source(name=src_name)
+
+
+def test_logs_create_delivery_rejects_duplicate_pair(logs):
+    """AWS allows at most one Delivery per (source, destination) pair;
+    a second CreateDelivery against the same pair raises
+    ConflictException."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    src_name = f"intg-dup-src-{uid}"
+    dest_name = f"intg-dup-dest-{uid}"
+
+    logs.put_delivery_source(
+        name=src_name,
+        resourceArn=f"arn:aws:bedrock:us-east-1:000000000000:model/x-{uid}",
+        logType="APPLICATION_LOGS",
+    )
+    dest_resp = logs.put_delivery_destination(
+        name=dest_name,
+        deliveryDestinationConfiguration={
+            "destinationResourceArn": f"arn:aws:logs:us-east-1:000000000000:log-group:/intg/d-{uid}:*",
+        },
+    )
+    dest_arn = dest_resp["deliveryDestination"]["arn"]
+
+    try:
+        first = logs.create_delivery(
+            deliverySourceName=src_name,
+            deliveryDestinationArn=dest_arn,
+        )
+
+        with pytest.raises(ClientError) as exc:
+            logs.create_delivery(
+                deliverySourceName=src_name,
+                deliveryDestinationArn=dest_arn,
+            )
+        assert exc.value.response["Error"]["Code"] == "ConflictException"
+
+        logs.delete_delivery(id=first["delivery"]["id"])
+    finally:
+        logs.delete_delivery_destination(name=dest_name)
+        logs.delete_delivery_source(name=src_name)

@@ -11,7 +11,10 @@ Supports: CreateLogGroup, DeleteLogGroup, DescribeLogGroups,
           PutDestination, DeleteDestination, DescribeDestinations,
           PutDestinationPolicy,
           PutMetricFilter, DeleteMetricFilter, DescribeMetricFilters,
-          StartQuery, GetQueryResults, StopQuery.
+          StartQuery, GetQueryResults, StopQuery,
+          PutDeliverySource, GetDeliverySource, DeleteDeliverySource, DescribeDeliverySources,
+          PutDeliveryDestination, GetDeliveryDestination, DeleteDeliveryDestination, DescribeDeliveryDestinations,
+          CreateDelivery, GetDelivery, DeleteDelivery, DescribeDeliveries.
 """
 
 import base64
@@ -49,16 +52,36 @@ _metric_filters = AccountScopedDict()
 _queries = AccountScopedDict()
 # query_id -> {queryId, logGroupName, startTime, endTime, queryString, status}
 
+_delivery_sources = AccountScopedDict()
+# source_name -> {name, arn, resourceArns: [str], logType, service, tags}
+
+_delivery_destinations = AccountScopedDict()
+# dest_name -> {name, arn, deliveryDestinationType, outputFormat,
+#               deliveryDestinationConfiguration: {destinationResourceArn}, tags}
+
+_deliveries = AccountScopedDict()
+# delivery_id -> {id, arn, deliverySourceName, deliveryDestinationArn,
+#                 deliveryDestinationType, recordFields, fieldDelimiter,
+#                 s3DeliveryConfiguration, tags}
+
 
 # ── Persistence ────────────────────────────────────────────
 
 def get_state():
-    return {"log_groups": copy.deepcopy(_log_groups)}
+    return {
+        "log_groups": copy.deepcopy(_log_groups),
+        "delivery_sources": copy.deepcopy(_delivery_sources),
+        "delivery_destinations": copy.deepcopy(_delivery_destinations),
+        "deliveries": copy.deepcopy(_deliveries),
+    }
 
 
 def restore_state(data):
     if data:
         _log_groups.update(data.get("log_groups", {}))
+        _delivery_sources.update(data.get("delivery_sources", {}))
+        _delivery_destinations.update(data.get("delivery_destinations", {}))
+        _deliveries.update(data.get("deliveries", {}))
 
 
 try:
@@ -149,6 +172,18 @@ async def handle_request(method, path, headers, body, query_params):
         "StartQuery": _start_query,
         "GetQueryResults": _get_query_results,
         "StopQuery": _stop_query,
+        "PutDeliverySource": _put_delivery_source,
+        "GetDeliverySource": _get_delivery_source,
+        "DeleteDeliverySource": _delete_delivery_source,
+        "DescribeDeliverySources": _describe_delivery_sources,
+        "PutDeliveryDestination": _put_delivery_destination,
+        "GetDeliveryDestination": _get_delivery_destination,
+        "DeleteDeliveryDestination": _delete_delivery_destination,
+        "DescribeDeliveryDestinations": _describe_delivery_destinations,
+        "CreateDelivery": _create_delivery,
+        "GetDelivery": _get_delivery,
+        "DeleteDelivery": _delete_delivery,
+        "DescribeDeliveries": _describe_deliveries,
     }
 
     handler = handlers.get(action)
@@ -877,3 +912,321 @@ def reset():
     _destinations.clear()
     _metric_filters.clear()
     _queries.clear()
+    _delivery_sources.clear()
+    _delivery_destinations.clear()
+    _deliveries.clear()
+
+
+# ---------------------------------------------------------------------------
+# Log Delivery API — Sources, Destinations, Deliveries
+# AWS's 2023-era replacement for subscription filters; lets services like
+# Bedrock, AppSync, and CodeWhisperer ship vended logs to S3 / CloudWatch
+# Logs / Firehose.
+# ---------------------------------------------------------------------------
+
+def _make_delivery_source_arn(name):
+    return f"arn:aws:logs:{get_region()}:{get_account_id()}:delivery-source:{name}"
+
+
+def _make_delivery_destination_arn(name):
+    return f"arn:aws:logs:{get_region()}:{get_account_id()}:delivery-destination:{name}"
+
+
+def _make_delivery_arn(delivery_id):
+    return f"arn:aws:logs:{get_region()}:{get_account_id()}:delivery:{delivery_id}"
+
+
+# AWS derives the "service" label of a delivery source from the ARN's
+# service component (e.g. arn:aws:bedrock:... -> "bedrock"). Callers do
+# not supply it; any value in the request is ignored. The field is
+# always server-computed so it stays stable across describe calls.
+def _derive_service_from_arn(arn):
+    parts = arn.split(":", 5)
+    return parts[2] if len(parts) >= 3 else ""
+
+
+# AWS derives deliveryDestinationType from the destination resource ARN
+# (S3 / CWL / FH); callers cannot override it.
+def _derive_destination_type_from_arn(arn):
+    """Parse arn:aws:<svc>:region:acct:<resource>/... and map to the
+    deliveryDestinationType label AWS returns. Returns None if the ARN
+    doesn't match a supported target service."""
+    parts = arn.split(":", 5)
+    if len(parts) < 3:
+        return None
+    svc = parts[2]
+    if svc == "s3":
+        return "S3"
+    if svc == "logs":
+        return "CWL"
+    if svc == "firehose":
+        return "FH"
+    return None
+
+
+_VALID_OUTPUT_FORMATS = {"json", "plain", "w3c", "raw", "parquet"}
+
+
+def _put_delivery_source(data):
+    name = data.get("name")
+    if not name:
+        return error_response_json("ValidationException", "name is required.", 400)
+    resource_arn = data.get("resourceArn")
+    if not resource_arn:
+        return error_response_json("ValidationException", "resourceArn is required.", 400)
+    log_type = data.get("logType")
+    if not log_type:
+        return error_response_json("ValidationException", "logType is required.", 400)
+
+    # AWS derives the service label from the resource ARN; ignore any
+    # caller-supplied value.
+    derived_service = _derive_service_from_arn(resource_arn)
+
+    existing = _delivery_sources.get(name)
+    if existing:
+        existing["resourceArns"] = [resource_arn]
+        existing["logType"] = log_type
+        existing["service"] = derived_service
+        if "tags" in data:
+            existing["tags"] = dict(data["tags"])
+        source = existing
+    else:
+        source = {
+            "name": name,
+            "arn": _make_delivery_source_arn(name),
+            "resourceArns": [resource_arn],
+            "logType": log_type,
+            "service": derived_service,
+            "tags": dict(data.get("tags", {})),
+        }
+        _delivery_sources[name] = source
+    return json_response({"deliverySource": _format_delivery_source(source)})
+
+
+def _format_delivery_source(source):
+    return {
+        "name": source["name"],
+        "arn": source["arn"],
+        "resourceArns": list(source.get("resourceArns", [])),
+        "service": source.get("service", ""),
+        "logType": source.get("logType", ""),
+        "tags": dict(source.get("tags", {})),
+    }
+
+
+def _get_delivery_source(data):
+    name = data.get("name")
+    source = _delivery_sources.get(name)
+    if not source:
+        return error_response_json(
+            "ResourceNotFoundException",
+            f"Delivery source does not exist: {name}", 400,
+        )
+    return json_response({"deliverySource": _format_delivery_source(source)})
+
+
+def _delete_delivery_source(data):
+    name = data.get("name")
+    if name not in _delivery_sources:
+        return error_response_json(
+            "ResourceNotFoundException",
+            f"Delivery source does not exist: {name}", 400,
+        )
+    del _delivery_sources[name]
+    return json_response({})
+
+
+def _describe_delivery_sources(data):
+    sources = [_format_delivery_source(s) for s in _delivery_sources.values()]
+    return json_response({"deliverySources": sources})
+
+
+def _put_delivery_destination(data):
+    name = data.get("name")
+    if not name:
+        return error_response_json("ValidationException", "name is required.", 400)
+    config = data.get("deliveryDestinationConfiguration", {}) or {}
+    destination_resource_arn = config.get("destinationResourceArn")
+    if not destination_resource_arn:
+        return error_response_json(
+            "ValidationException",
+            "deliveryDestinationConfiguration.destinationResourceArn is required.", 400,
+        )
+
+    # AWS derives deliveryDestinationType from the destination resource
+    # ARN (s3 -> S3, logs -> CWL, firehose -> FH); callers cannot
+    # override it.
+    derived_type = _derive_destination_type_from_arn(destination_resource_arn)
+    if derived_type is None:
+        return error_response_json(
+            "ValidationException",
+            "deliveryDestinationConfiguration.destinationResourceArn must target "
+            "S3 (arn:aws:s3:::...), CloudWatch Logs (arn:aws:logs:...:log-group:...), "
+            "or Firehose (arn:aws:firehose:...:deliverystream/...).", 400,
+        )
+
+    output_format = data.get("outputFormat", "json")
+    # AWS enforces the enum; reject unknown values so callers fail early.
+    if output_format not in _VALID_OUTPUT_FORMATS:
+        return error_response_json(
+            "ValidationException",
+            f"outputFormat must be one of {sorted(_VALID_OUTPUT_FORMATS)}; got {output_format!r}.",
+            400,
+        )
+
+    existing = _delivery_destinations.get(name)
+    if existing:
+        existing["deliveryDestinationConfiguration"] = {"destinationResourceArn": destination_resource_arn}
+        existing["outputFormat"] = output_format
+        existing["deliveryDestinationType"] = derived_type
+        if "tags" in data:
+            existing["tags"] = dict(data["tags"])
+        dest = existing
+    else:
+        dest = {
+            "name": name,
+            "arn": _make_delivery_destination_arn(name),
+            "deliveryDestinationType": derived_type,
+            "outputFormat": output_format,
+            "deliveryDestinationConfiguration": {
+                "destinationResourceArn": destination_resource_arn,
+            },
+            "tags": dict(data.get("tags", {})),
+        }
+        _delivery_destinations[name] = dest
+    return json_response({"deliveryDestination": _format_delivery_destination(dest)})
+
+
+def _format_delivery_destination(dest):
+    return {
+        "name": dest["name"],
+        "arn": dest["arn"],
+        "deliveryDestinationType": dest.get("deliveryDestinationType", "CWL"),
+        "outputFormat": dest.get("outputFormat", "json"),
+        "deliveryDestinationConfiguration": dict(dest.get("deliveryDestinationConfiguration", {})),
+        "tags": dict(dest.get("tags", {})),
+    }
+
+
+def _get_delivery_destination(data):
+    name = data.get("name")
+    dest = _delivery_destinations.get(name)
+    if not dest:
+        return error_response_json(
+            "ResourceNotFoundException",
+            f"Delivery destination does not exist: {name}", 400,
+        )
+    return json_response({"deliveryDestination": _format_delivery_destination(dest)})
+
+
+def _delete_delivery_destination(data):
+    name = data.get("name")
+    if name not in _delivery_destinations:
+        return error_response_json(
+            "ResourceNotFoundException",
+            f"Delivery destination does not exist: {name}", 400,
+        )
+    del _delivery_destinations[name]
+    return json_response({})
+
+
+def _describe_delivery_destinations(data):
+    dests = [_format_delivery_destination(d) for d in _delivery_destinations.values()]
+    return json_response({"deliveryDestinations": dests})
+
+
+def _create_delivery(data):
+    source_name = data.get("deliverySourceName")
+    dest_arn = data.get("deliveryDestinationArn")
+    if not source_name:
+        return error_response_json("ValidationException", "deliverySourceName is required.", 400)
+    if not dest_arn:
+        return error_response_json("ValidationException", "deliveryDestinationArn is required.", 400)
+    if source_name not in _delivery_sources:
+        return error_response_json(
+            "ResourceNotFoundException",
+            f"Delivery source does not exist: {source_name}", 400,
+        )
+
+    # AWS rejects CreateDelivery unless the destination ARN resolves to a
+    # destination we've previously recorded via PutDeliveryDestination —
+    # the API cannot ship logs to an unknown sink.
+    dest_type = None
+    for d in _delivery_destinations.values():
+        if d["arn"] == dest_arn:
+            dest_type = d.get("deliveryDestinationType")
+            break
+    if dest_type is None:
+        return error_response_json(
+            "ResourceNotFoundException",
+            f"Delivery destination does not exist: {dest_arn}", 400,
+        )
+
+    # AWS allows at most one Delivery per (deliverySourceName,
+    # deliveryDestinationArn) pair; CreateDelivery on an existing pair
+    # raises ConflictException.
+    for existing in _deliveries.values():
+        if (existing["deliverySourceName"] == source_name
+                and existing["deliveryDestinationArn"] == dest_arn):
+            return error_response_json(
+                "ConflictException",
+                f"A delivery already exists for source {source_name!r} → "
+                f"destination {dest_arn!r}.",
+                400,
+            )
+
+    delivery_id = new_uuid()
+    delivery = {
+        "id": delivery_id,
+        "arn": _make_delivery_arn(delivery_id),
+        "deliverySourceName": source_name,
+        "deliveryDestinationArn": dest_arn,
+        "deliveryDestinationType": dest_type,
+        "recordFields": list(data.get("recordFields", [])),
+        "fieldDelimiter": data.get("fieldDelimiter", ""),
+        "s3DeliveryConfiguration": dict(data.get("s3DeliveryConfiguration", {})),
+        "tags": dict(data.get("tags", {})),
+    }
+    _deliveries[delivery_id] = delivery
+    return json_response({"delivery": _format_delivery(delivery)})
+
+
+def _format_delivery(delivery):
+    return {
+        "id": delivery["id"],
+        "arn": delivery["arn"],
+        "deliverySourceName": delivery["deliverySourceName"],
+        "deliveryDestinationArn": delivery["deliveryDestinationArn"],
+        "deliveryDestinationType": delivery.get("deliveryDestinationType", "CWL"),
+        "recordFields": list(delivery.get("recordFields", [])),
+        "fieldDelimiter": delivery.get("fieldDelimiter", ""),
+        "s3DeliveryConfiguration": dict(delivery.get("s3DeliveryConfiguration", {})),
+        "tags": dict(delivery.get("tags", {})),
+    }
+
+
+def _get_delivery(data):
+    delivery_id = data.get("id")
+    delivery = _deliveries.get(delivery_id)
+    if not delivery:
+        return error_response_json(
+            "ResourceNotFoundException",
+            f"Delivery does not exist: {delivery_id}", 400,
+        )
+    return json_response({"delivery": _format_delivery(delivery)})
+
+
+def _delete_delivery(data):
+    delivery_id = data.get("id")
+    if delivery_id not in _deliveries:
+        return error_response_json(
+            "ResourceNotFoundException",
+            f"Delivery does not exist: {delivery_id}", 400,
+        )
+    del _deliveries[delivery_id]
+    return json_response({})
+
+
+def _describe_deliveries(data):
+    deliveries = [_format_delivery(d) for d in _deliveries.values()]
+    return json_response({"deliveries": deliveries})
