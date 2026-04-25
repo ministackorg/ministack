@@ -35,6 +35,12 @@ from cryptography.hazmat.primitives.asymmetric import ed25519
 ENDPOINT_HOST = os.environ.get("MINISTACK_HOST", "127.0.0.1")
 SFTP_PORT = int(os.environ.get("SFTP_PORT", "2222"))
 
+# Honour MINISTACK_ENDPOINT (e.g. http://localhost:14566) so the same test
+# file works against a locally-built MiniStack on port 4566 *and* against a
+# preview Docker image bound to a different host port.
+_endpoint = os.environ.get("MINISTACK_ENDPOINT", f"http://{ENDPOINT_HOST}:4566")
+ADMIN_BASE = _endpoint.rstrip("/")
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -399,7 +405,7 @@ def _sftp_port_state():
     import json as _json
     try:
         with urllib.request.urlopen(
-            f"http://{ENDPOINT_HOST}:4566/_ministack/transfer/sftp-ports", timeout=2
+            f"{ADMIN_BASE}/_ministack/transfer/sftp-ports", timeout=2
         ) as resp:
             return _json.loads(resp.read())
     except Exception:

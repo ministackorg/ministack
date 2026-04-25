@@ -555,12 +555,12 @@ def _handle_transfer_sftp_ports_request(method: str, path: str):
     if path != "/_ministack/transfer/sftp-ports" or method != "GET":
         return None
     try:
-        from ministack.services import transfer_sftp
+        from ministack.services import transfer
         body = {
-            "enabled": transfer_sftp._sftp_enabled(),
-            "port_per_server": transfer_sftp._port_per_server(),
-            "shared_port": transfer_sftp._shared_port() if transfer_sftp._sftp_enabled() else None,
-            "per_server": dict(transfer_sftp._per_server_ports),
+            "enabled": transfer._sftp_enabled(),
+            "port_per_server": transfer._port_per_server(),
+            "shared_port": transfer._shared_port() if transfer._sftp_enabled() else None,
+            "per_server": dict(transfer._sftp_per_server_ports),
         }
     except Exception as e:
         return 500, {"Content-Type": "application/json"}, json.dumps({"message": str(e)}).encode()
@@ -1117,8 +1117,8 @@ async def _handle_lifespan(scope, receive, send):
             # the SSH auth callback). Cheap no-op if asyncssh isn't
             # installed or SFTP_ENABLED=0.
             try:
-                from ministack.services import transfer_sftp
-                await transfer_sftp.start()
+                from ministack.services import transfer
+                await transfer.sftp_start()
             except Exception as e:
                 logger.warning("Transfer SFTP startup failed: %s", e)
             await send({"type": "lifespan.startup.complete"})
@@ -1156,8 +1156,8 @@ async def _handle_lifespan(scope, receive, send):
                         save_dict[key] = _loaded_modules[mod_name].get_state
                 save_all(save_dict)
             try:
-                from ministack.services import transfer_sftp
-                await transfer_sftp.stop()
+                from ministack.services import transfer
+                await transfer.sftp_stop()
             except Exception as e:
                 logger.debug("Transfer SFTP shutdown error: %s", e)
             _stop_docker_containers()
