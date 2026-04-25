@@ -726,6 +726,10 @@ def _repo_shape(repo):
 
 
 def reset():
+    docker_client = _get_docker()
+    if docker_client:
+        for name in list(_repositories.keys()):
+            _remove_docker_images_for_repo(name)
     _repositories.clear()
     _images.clear()
     _lifecycle_policies.clear()
