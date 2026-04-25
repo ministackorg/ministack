@@ -23,6 +23,8 @@ _images = AccountScopedDict()
 _lifecycle_policies = AccountScopedDict()
 _repo_policies = AccountScopedDict()
 
+_docker = None
+
 
 # ── Persistence ────────────────────────────────────────────
 
@@ -165,9 +167,13 @@ def _delete_repository(data):
         return error_response_json("RepositoryNotFoundException",
                                    f"The repository with name '{name}' does not exist", 400)
 
-    if not force and _images.get(name):
+    if not force and _all_images(name):
         return error_response_json("RepositoryNotEmptyException",
                                    f"The repository with name '{name}' is not empty", 400)
+
+    # Remove matching Docker images when force-deleting
+    if force:
+        _remove_docker_images_for_repo(name)
 
     repo = _repositories.pop(name)
     _images.pop(name, None)
@@ -278,7 +284,11 @@ def _batch_delete_image(data):
     for iid in image_ids:
         match = _find_image(name, iid)
         if match:
-            _images[name].remove(match)
+            try:
+                _images[name].remove(match)
+            except ValueError:
+                pass  # image came from Docker daemon, not in-memory store
+            _remove_docker_image(name, match)
             deleted.append(match["imageId"])
         else:
             failures.append({
@@ -298,7 +308,7 @@ def _list_images(data):
 
     tag_status = data.get("filter", {}).get("tagStatus")
     result = []
-    for img in _images.get(name, []):
+    for img in _all_images(name):
         tags = img.get("imageTags", [])
         if tag_status == "TAGGED" and not tags:
             continue
@@ -316,7 +326,7 @@ def _describe_images(data):
                                    f"The repository with name '{name}' does not exist", 400)
 
     image_ids = data.get("imageIds")
-    images = _images.get(name, [])
+    images = _all_images(name)
 
     if image_ids:
         filtered = []
@@ -570,10 +580,124 @@ def _complete_layer_upload(data):
     })
 
 
+def _get_docker():
+    global _docker
+    if _docker is None:
+        try:
+            import docker
+            _docker = docker.from_env()
+        except Exception:
+            pass
+    return _docker
+
+
+def _remove_docker_image(repo_name, image):
+    """Remove/untag a single image from the local Docker daemon."""
+    docker_client = _get_docker()
+    if not docker_client:
+        return
+    repo_uri = _repositories.get(repo_name, {}).get("repositoryUri", "")
+    if not repo_uri:
+        return
+    for tag in image.get("imageTags", []):
+        full_tag = f"{repo_uri}:{tag}"
+        try:
+            docker_client.images.remove(full_tag, force=False, noprune=True)
+            logger.info("ECR: untagged Docker image %s", full_tag)
+        except Exception as e:
+            logger.debug("ECR: failed to untag Docker image %s: %s", full_tag, e)
+
+
+def _remove_docker_images_for_repo(repo_name):
+    """Remove all Docker images tagged with this repo's URI."""
+    docker_client = _get_docker()
+    if not docker_client:
+        return
+    repo_uri = _repositories.get(repo_name, {}).get("repositoryUri", "")
+    if not repo_uri:
+        return
+    try:
+        all_images = docker_client.images.list()
+    except Exception:
+        return
+    for di in all_images:
+        for full_tag in (di.tags or []):
+            if full_tag.startswith(repo_uri + ":") or full_tag == repo_uri:
+                try:
+                    docker_client.images.remove(full_tag, force=True)
+                    logger.info("ECR: removed Docker image %s", full_tag)
+                except Exception as e:
+                    logger.debug("ECR: failed to remove Docker image %s: %s", full_tag, e)
+
+
+def _get_docker_images(repo_name):
+    """Query the local Docker daemon for images tagged with this repo's URI."""
+    if repo_name not in _repositories:
+        return []
+    repo_uri = _repositories[repo_name]["repositoryUri"]
+    docker_client = _get_docker()
+    if not docker_client:
+        return []
+    try:
+        all_images = docker_client.images.list()
+    except Exception:
+        return []
+
+    results = []
+    seen_tags = set()
+    # Collect tags already known in-memory so we can skip duplicates
+    for img in _images.get(repo_name, []):
+        for t in img.get("imageTags", []):
+            seen_tags.add(t)
+
+    for di in all_images:
+        for full_tag in (di.tags or []):
+            # full_tag looks like "000000000000.dkr.ecr.us-east-1.amazonaws.com/my-repo:v1"
+            if not full_tag.startswith(repo_uri):
+                continue
+            suffix = full_tag[len(repo_uri):]
+            if suffix.startswith(":"):
+                tag = suffix[1:]
+            elif suffix == "":
+                tag = None
+            else:
+                continue
+
+            if tag and tag in seen_tags:
+                continue
+
+            # Build a digest from the Docker image id
+            docker_id = di.id  # e.g. "sha256:abcdef..."
+            digest = docker_id if docker_id.startswith("sha256:") else "sha256:" + docker_id
+
+            image_entry = {
+                "registryId": _registry_id(),
+                "repositoryName": repo_name,
+                "imageId": {"imageDigest": digest},
+                "imageManifest": "{}",
+                "imageManifestMediaType": "application/vnd.docker.distribution.manifest.v2+json",
+                "imageTags": [tag] if tag else [],
+                "imagePushedAt": int(time.time()),
+                "imageDigest": digest,
+            }
+            if tag:
+                image_entry["imageId"]["imageTag"] = tag
+                seen_tags.add(tag)
+            results.append(image_entry)
+    return results
+
+
+def _all_images(repo_name):
+    """Return in-memory images merged with Docker-daemon images."""
+    mem = list(_images.get(repo_name, []))
+    mem.extend(_get_docker_images(repo_name))
+    return mem
+
+
 def _find_image(repo_name, image_id):
     digest = image_id.get("imageDigest")
     tag = image_id.get("imageTag")
-    for img in _images.get(repo_name, []):
+    for img in _all_images(repo_name):
         if digest and img["imageDigest"] == digest:
             return img
         if tag and tag in img.get("imageTags", []):
