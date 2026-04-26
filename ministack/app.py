@@ -537,7 +537,35 @@ async def _handle_pre_body_request(method: str, path: str, headers: dict, query_
     if response is not None:
         return response
 
+    response = _handle_transfer_sftp_ports_request(method, path)
+    if response is not None:
+        return response
+
     return await _handle_admin_reset(path, method, query_params)
+
+
+def _handle_transfer_sftp_ports_request(method: str, path: str):
+    """`GET /_ministack/transfer/sftp-ports` returns ``{shared, per_server}``.
+
+    boto3's DescribeServer drops fields not in the AWS spec, so this
+    admin endpoint is how tests (and humans) discover which ports
+    MiniStack's SFTP listeners ended up on — particularly relevant
+    when ``SFTP_PORT_PER_SERVER=1`` allocates ports dynamically from
+    ``SFTP_BASE_PORT``.
+    """
+    if path != "/_ministack/transfer/sftp-ports" or method != "GET":
+        return None
+    try:
+        from ministack.services import transfer
+        body = {
+            "enabled": transfer._sftp_enabled(),
+            "port_per_server": transfer._port_per_server(),
+            "shared_port": transfer._shared_port() if transfer._sftp_enabled() else None,
+            "per_server": dict(transfer._sftp_per_server_ports),
+        }
+    except Exception as e:
+        return 500, {"Content-Type": "application/json"}, json.dumps({"message": str(e)}).encode()
+    return 200, {"Content-Type": "application/json"}, json.dumps(body).encode()
 
 
 # ---------------------------------------------------------------------------
@@ -1085,6 +1113,15 @@ async def _handle_lifespan(scope, receive, send):
             _run_init_scripts()
             if PERSIST_STATE:
                 _load_persisted_state()
+            # Start the Transfer Family SFTP listener after persistence is
+            # loaded (so any restored Transfer servers/users are visible to
+            # the SSH auth callback). Cheap no-op if asyncssh isn't
+            # installed or SFTP_ENABLED=0.
+            try:
+                from ministack.services import transfer
+                await transfer.sftp_start()
+            except Exception as e:
+                logger.warning("Transfer SFTP startup failed: %s", e)
             await send({"type": "lifespan.startup.complete"})
             logger.info("Ready.")
             for svc in SERVICE_HANDLERS:
@@ -1119,6 +1156,11 @@ async def _handle_lifespan(scope, receive, send):
                     if mod_name in _loaded_modules:
                         save_dict[key] = _loaded_modules[mod_name].get_state
                 save_all(save_dict)
+            try:
+                from ministack.services import transfer
+                await transfer.sftp_stop()
+            except Exception as e:
+                logger.debug("Transfer SFTP shutdown error: %s", e)
             _stop_docker_containers()
             await send({"type": "lifespan.shutdown.complete"})
             return

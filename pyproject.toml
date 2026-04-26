@@ -34,6 +34,7 @@ full = [
     "cryptography>=41.0",
     "psycopg2-binary>=2.9",
     "pymysql>=1.1",
+    "asyncssh>=2.14",
 ]
 dev = [
     "boto3>=1.34",
@@ -47,6 +48,7 @@ dev = [
     "pymysql>=1.1",
     "ruff>=0.4",
     "mypy-boto3-lambda (>=1.42.85,<2.0.0)",
+    "asyncssh>=2.14",
 ]
 
 [project.urls]

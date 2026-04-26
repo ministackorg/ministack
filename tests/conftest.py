@@ -44,6 +44,18 @@ _SERIAL_TESTS = {
     "tests/test_sfn.py::test_sfn_wait_scale_zero_skips_wait",
     "tests/test_rds_lambda_network.py::test_rds_lambda_network_connectivity",
     "tests/test_elasticache_lambda_network.py::test_elasticache_lambda_network_connectivity",
+    # API Gateway execute-api → Lambda invoke under tight urlopen / WS recv
+    # timeouts. These pass cleanly when run serially but are sensitive to
+    # xdist parallel load on shared CI runners (cold-start time bursts past
+    # the client timeout). Pre-warming + the WS warm-pool key fix covered
+    # the deterministic cases; these remaining ones tip over only under
+    # sustained parallel pressure. Run them in the dedicated serial phase.
+    "tests/test_apigatewayv2.py::test_apigwv2_path_based_execute_api_http",
+    "tests/test_apigatewayv2.py::test_apigwv2_path_based_websocket",
+    "tests/test_apigatewayv2.py::test_apigwv2_default_stage_serves_from_root",
+    "tests/test_apigatewayv2.py::test_apigwv1_path_based_restapi_legacy_user_request",
+    "tests/test_apigatewayv2.py::test_apigwv2_named_stage_still_requires_prefix",
+    "tests/test_apigatewayv2.py::test_apigwv2_integration_wrapped_function_arn",
 }
 
 

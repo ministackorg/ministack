@@ -1200,8 +1200,17 @@ async def _invoke_ws_lambda(api_id: str, account_id: str, route: dict, stage: st
     runtime = func_config.get("Runtime", "")
     code_zip = func_data.get("code_zip")
     if code_zip and runtime.startswith(("python", "nodejs")):
-        worker_key = f"{func_name}:{qualifier}" if qualifier else func_name
-        worker = get_or_create_worker(worker_key, func_config, code_zip)
+        # get_or_create_worker keys internally as f"{func_name}:{qualifier}",
+        # so we must pass name + qualifier separately. Building a synthetic
+        # `f"{func_name}:{qualifier}"` and passing it as func_name double-
+        # suffixes the key (`fn:qual:$LATEST`), missing the warm pool the
+        # SDK invoke path populates and forcing a cold start on every WS
+        # message. That's why pre-warming the function via the SDK didn't
+        # help WebSocket dispatch — keys didn't match.
+        worker = get_or_create_worker(
+            func_name, func_config, code_zip,
+            qualifier=qualifier or "$LATEST",
+        )
         result = await asyncio.to_thread(worker.invoke, event, message_id)
         if result.get("status") == "error":
             return {"statusCode": 500, "body": result.get("error", "")}

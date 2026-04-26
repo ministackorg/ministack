@@ -1039,6 +1039,22 @@ def _make_fn(lam, name: str, code: str) -> str:
         Handler="index.handler",
         Code={"ZipFile": _make_zip(code)},
     )
+    # Pre-warm the warm-pool subprocess so subsequent execute-api invocations
+    # don't pay the zip-extract + interpreter-boot cost on the first request.
+    # boto3's invoke has a generous read timeout (60s) and tolerates spawn
+    # latency that the apigwv2 tests' 5-second urlopen does not — under xdist
+    # parallel load on shared CI runners the cold start can exceed 5s and
+    # cause opaque socket timeouts (#404-class flakes).
+    # Handler errors on the warmup payload are non-fatal: the subprocess is
+    # warm regardless, which is the only thing we need.
+    try:
+        lam.invoke(
+            FunctionName=name,
+            InvocationType="RequestResponse",
+            Payload=b'{"_ministack_warmup": true}',
+        )
+    except Exception:
+        pass
     return f"arn:aws:lambda:us-east-1:000000000000:function:{name}"
 
 
