@@ -25,11 +25,13 @@ from urllib.parse import parse_qs, unquote
 _MINISTACK_HOST = os.environ.get("MINISTACK_HOST", "localhost")
 _MINISTACK_PORT = os.environ.get("GATEWAY_PORT", "4566")
 
-try:
-    from importlib.metadata import version as _pkg_version
-    _VERSION = _pkg_version("ministack")
-except Exception:
-    _VERSION = "dev"
+_VERSION = os.environ.get("MINISTACK_VERSION") or "dev"
+if _VERSION == "dev":
+    try:
+        from importlib.metadata import version as _pkg_version
+        _VERSION = _pkg_version("ministack")
+    except Exception:
+        pass
 
 # Matches host headers like "{apiId}.execute-api.<host>" or "{apiId}.execute-api.<host>:4566"
 _EXECUTE_API_RE = re.compile(

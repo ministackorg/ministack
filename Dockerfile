@@ -50,7 +50,9 @@ RUN mkdir -p /docker-entrypoint-initaws.d/ready.d \
 VOLUME /docker-entrypoint-initaws.d
 VOLUME /etc/localstack/init
 
-ENV GATEWAY_PORT=4566 \
+ARG MINISTACK_VERSION=dev
+ENV MINISTACK_VERSION=${MINISTACK_VERSION} \
+    GATEWAY_PORT=4566 \
     LOG_LEVEL=INFO \
     S3_PERSIST=0 \
     S3_DATA_DIR=/tmp/ministack-data/s3 \
