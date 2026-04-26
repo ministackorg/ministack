@@ -432,28 +432,34 @@ def test_eventbridge_replay_lifecycle(eb):
     )
     archive_arn = eb.describe_archive(ArchiveName=arch)["ArchiveArn"]
     rep_name = f"replay-{_uuid_mod.uuid4().hex[:8]}"
-    src = "arn:aws:events:us-east-1:000000000000:event-bus/default"
+    bus_arn = "arn:aws:events:us-east-1:000000000000:event-bus/default"
     from datetime import datetime, timezone
 
     t0 = datetime(2024, 1, 1, tzinfo=timezone.utc)
     t1 = datetime(2024, 1, 2, tzinfo=timezone.utc)
     start = eb.start_replay(
         ReplayName=rep_name,
-        EventSourceArn=src,
+        EventSourceArn=archive_arn,
         EventStartTime=t0,
         EventEndTime=t1,
-        Destination={"Arn": archive_arn},
+        Destination={"Arn": bus_arn},
     )
     assert start["State"] == "RUNNING"
     desc = eb.describe_replay(ReplayName=rep_name)
     assert desc["ReplayName"] == rep_name
-    assert desc["State"] == "RUNNING"
+    assert desc["State"] in ("RUNNING", "COMPLETED")
     listed = eb.list_replays(NamePrefix=rep_name)
     assert any(r["ReplayName"] == rep_name for r in listed["Replays"])
-    cancel = eb.cancel_replay(ReplayName=rep_name)
-    assert cancel["State"] == "CANCELLED"
-    desc2 = eb.describe_replay(ReplayName=rep_name)
-    assert desc2["State"] == "CANCELLED"
+    from botocore.exceptions import ClientError as _CE
+    try:
+        cancel = eb.cancel_replay(ReplayName=rep_name)
+        assert cancel["State"] == "CANCELLED"
+        desc2 = eb.describe_replay(ReplayName=rep_name)
+        assert desc2["State"] == "CANCELLED"
+    except _CE as e:
+        # Replay may have already completed before the cancel call
+        assert e.response["Error"]["Code"] == "ValidationException"
+        assert "completed" in e.response["Error"]["Message"].lower()
     eb.delete_archive(ArchiveName=arch)
 
 
@@ -781,3 +787,355 @@ def test_eventbridge_cfn_rule_accessible_via_api(eb, sqs, cfn):
 
     cfn.delete_stack(StackName="qa-eb-cfn-stack")
 
+
+def test_eventbridge_archive_stores_events(eb):
+    """PutEvents writes to a matching archive and increments EventCount."""
+    arch_name = f"store-arch-{_uuid_mod.uuid4().hex[:8]}"
+    bus_arn = "arn:aws:events:us-east-1:000000000000:event-bus/default"
+    eb.create_archive(ArchiveName=arch_name, EventSourceArn=bus_arn)
+    eb.put_events(
+        Entries=[
+            {
+                "Source": "archiver.test",
+                "DetailType": "Stored",
+                "Detail": json.dumps({"x": 1}),
+                "EventBusName": "default",
+            }
+        ]
+    )
+    desc = eb.describe_archive(ArchiveName=arch_name)
+    assert desc["EventCount"] == 1
+    eb.delete_archive(ArchiveName=arch_name)
+
+
+def test_eventbridge_archive_filters_by_pattern(eb):
+    """Events that do not match the archive EventPattern are not stored."""
+    arch_name = f"filter-arch-{_uuid_mod.uuid4().hex[:8]}"
+    bus_arn = "arn:aws:events:us-east-1:000000000000:event-bus/default"
+    eb.create_archive(
+        ArchiveName=arch_name,
+        EventSourceArn=bus_arn,
+        EventPattern=json.dumps({"source": ["only.this"]}),
+    )
+    eb.put_events(
+        Entries=[
+            {
+                "Source": "not.this",
+                "DetailType": "NoMatch",
+                "Detail": json.dumps({}),
+                "EventBusName": "default",
+            }
+        ]
+    )
+    desc = eb.describe_archive(ArchiveName=arch_name)
+    assert desc["EventCount"] == 0
+    eb.delete_archive(ArchiveName=arch_name)
+
+
+def test_eventbridge_replay_completes(eb):
+    """StartReplay dispatches archived events and reaches COMPLETED state."""
+    arch_name = f"replay-cmp-{_uuid_mod.uuid4().hex[:8]}"
+    bus_arn = "arn:aws:events:us-east-1:000000000000:event-bus/default"
+    eb.create_archive(ArchiveName=arch_name, EventSourceArn=bus_arn)
+    eb.put_events(
+        Entries=[
+            {
+                "Source": "replay.src",
+                "DetailType": "ReplayMe",
+                "Detail": json.dumps({"seq": 1}),
+                "EventBusName": "default",
+            }
+        ]
+    )
+    archive_arn = eb.describe_archive(ArchiveName=arch_name)["ArchiveArn"]
+    rep_name = f"rep-cmp-{_uuid_mod.uuid4().hex[:8]}"
+    eb.start_replay(
+        ReplayName=rep_name,
+        EventSourceArn=archive_arn,
+        EventStartTime=0,
+        EventEndTime=time.time() + 3600,
+        Destination={"Arn": bus_arn},
+    )
+    time.sleep(0.3)
+    desc = eb.describe_replay(ReplayName=rep_name)
+    assert desc["State"] == "COMPLETED"
+    eb.delete_archive(ArchiveName=arch_name)
+
+
+def test_eventbridge_replay_not_found(eb):
+    """StartReplay with a nonexistent archive returns ResourceNotFoundException."""
+    from botocore.exceptions import ClientError
+    nonexistent_arn = "arn:aws:events:us-east-1:000000000000:archive/does-not-exist"
+    rep_name = f"rep-nf-{_uuid_mod.uuid4().hex[:8]}"
+    with pytest.raises(ClientError) as exc:
+        eb.start_replay(
+            ReplayName=rep_name,
+            EventSourceArn=nonexistent_arn,
+            EventStartTime=0,
+            EventEndTime=time.time() + 3600,
+            Destination={"Arn": "arn:aws:events:us-east-1:000000000000:event-bus/default"},
+        )
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
+def test_eventbridge_archive_event_count_accumulation(eb):
+    """EventCount increments once per matching PutEvents call."""
+    arch_name = f"accum-arch-{_uuid_mod.uuid4().hex[:8]}"
+    bus_arn = "arn:aws:events:us-east-1:000000000000:event-bus/default"
+    eb.create_archive(ArchiveName=arch_name, EventSourceArn=bus_arn)
+    for i in range(5):
+        eb.put_events(
+            Entries=[
+                {
+                    "Source": "accum.test",
+                    "DetailType": "Tick",
+                    "Detail": json.dumps({"seq": i}),
+                    "EventBusName": "default",
+                }
+            ]
+        )
+    desc = eb.describe_archive(ArchiveName=arch_name)
+    assert desc["EventCount"] == 5
+    eb.delete_archive(ArchiveName=arch_name)
+
+
+def test_eventbridge_archive_empty_pattern_stores_all_events(eb):
+    """An archive with no EventPattern captures every event on the source bus."""
+    arch_name = f"nopat-arch-{_uuid_mod.uuid4().hex[:8]}"
+    bus_arn = "arn:aws:events:us-east-1:000000000000:event-bus/default"
+    eb.create_archive(ArchiveName=arch_name, EventSourceArn=bus_arn)
+    eb.put_events(
+        Entries=[
+            {
+                "Source": "source.a",
+                "DetailType": "EventA",
+                "Detail": json.dumps({}),
+                "EventBusName": "default",
+            },
+            {
+                "Source": "source.b",
+                "DetailType": "EventB",
+                "Detail": json.dumps({}),
+                "EventBusName": "default",
+            },
+        ]
+    )
+    desc = eb.describe_archive(ArchiveName=arch_name)
+    assert desc["EventCount"] == 2
+    eb.delete_archive(ArchiveName=arch_name)
+
+
+def test_eventbridge_multiple_archives_same_bus(eb):
+    """One PutEvents call stores the event in every matching archive on that bus."""
+    bus_arn = "arn:aws:events:us-east-1:000000000000:event-bus/default"
+    arch_a = f"multi-a-{_uuid_mod.uuid4().hex[:8]}"
+    arch_b = f"multi-b-{_uuid_mod.uuid4().hex[:8]}"
+    eb.create_archive(
+        ArchiveName=arch_a,
+        EventSourceArn=bus_arn,
+        EventPattern=json.dumps({"source": ["multi.src"]}),
+    )
+    eb.create_archive(
+        ArchiveName=arch_b,
+        EventSourceArn=bus_arn,
+        EventPattern=json.dumps({"source": ["multi.src"]}),
+    )
+    eb.put_events(
+        Entries=[
+            {
+                "Source": "multi.src",
+                "DetailType": "Both",
+                "Detail": json.dumps({}),
+                "EventBusName": "default",
+            }
+        ]
+    )
+    assert eb.describe_archive(ArchiveName=arch_a)["EventCount"] == 1
+    assert eb.describe_archive(ArchiveName=arch_b)["EventCount"] == 1
+    eb.delete_archive(ArchiveName=arch_a)
+    eb.delete_archive(ArchiveName=arch_b)
+
+
+def test_eventbridge_replay_time_range_filtering(eb, sqs):
+    """Events outside the replay time window are not dispatched to the destination."""
+    bus_name = "rp-trange-bus"
+    bus_arn = f"arn:aws:events:us-east-1:000000000000:event-bus/{bus_name}"
+    eb.create_event_bus(Name=bus_name)
+
+    q_url = sqs.create_queue(QueueName="rp-trange-q")["QueueUrl"]
+    q_arn = sqs.get_queue_attributes(QueueUrl=q_url, AttributeNames=["QueueArn"])["Attributes"]["QueueArn"]
+    eb.put_rule(
+        Name="rp-trange-rule",
+        EventBusName=bus_name,
+        EventPattern=json.dumps({"source": ["trange.src"]}),
+        State="ENABLED",
+    )
+    eb.put_targets(
+        Rule="rp-trange-rule",
+        EventBusName=bus_name,
+        Targets=[{"Id": "t1", "Arn": q_arn}],
+    )
+
+    src_bus_arn = "arn:aws:events:us-east-1:000000000000:event-bus/default"
+    arch_name = f"trange-arch-{_uuid_mod.uuid4().hex[:8]}"
+    eb.create_archive(ArchiveName=arch_name, EventSourceArn=src_bus_arn)
+
+    # Put one event now — its Time will be approximately now (float)
+    eb.put_events(
+        Entries=[
+            {
+                "Source": "trange.src",
+                "DetailType": "InRange",
+                "Detail": json.dumps({"marker": "in"}),
+                "EventBusName": "default",
+            }
+        ]
+    )
+    now = time.time()
+
+    archive_arn = eb.describe_archive(ArchiveName=arch_name)["ArchiveArn"]
+    rep_name = f"rep-trange-{_uuid_mod.uuid4().hex[:8]}"
+    # Replay window ends BEFORE the event was stored — nothing should be dispatched.
+    eb.start_replay(
+        ReplayName=rep_name,
+        EventSourceArn=archive_arn,
+        EventStartTime=0,
+        EventEndTime=now - 3600,
+        Destination={"Arn": bus_arn},
+    )
+    time.sleep(0.3)
+    msgs = sqs.receive_message(QueueUrl=q_url, MaxNumberOfMessages=10, WaitTimeSeconds=1)
+    assert len(msgs.get("Messages", [])) == 0, (
+        "Events outside the replay time window should not be dispatched"
+    )
+    eb.delete_archive(ArchiveName=arch_name)
+
+
+def test_eventbridge_replay_empty_archive_completes(eb):
+    """A replay on an archive with zero events still reaches COMPLETED state."""
+    arch_name = f"empty-arch-{_uuid_mod.uuid4().hex[:8]}"
+    bus_arn = "arn:aws:events:us-east-1:000000000000:event-bus/default"
+    eb.create_archive(ArchiveName=arch_name, EventSourceArn=bus_arn)
+    archive_arn = eb.describe_archive(ArchiveName=arch_name)["ArchiveArn"]
+    rep_name = f"rep-empty-{_uuid_mod.uuid4().hex[:8]}"
+    eb.start_replay(
+        ReplayName=rep_name,
+        EventSourceArn=archive_arn,
+        EventStartTime=0,
+        EventEndTime=time.time() + 3600,
+        Destination={"Arn": bus_arn},
+    )
+    time.sleep(0.3)
+    desc = eb.describe_replay(ReplayName=rep_name)
+    assert desc["State"] == "COMPLETED"
+    eb.delete_archive(ArchiveName=arch_name)
+
+
+def test_eventbridge_replay_destination_receives_events(eb, sqs):
+    """Archived events are actually delivered to the destination bus during replay."""
+    bus_name = "rp-dest-bus"
+    bus_arn = f"arn:aws:events:us-east-1:000000000000:event-bus/{bus_name}"
+    eb.create_event_bus(Name=bus_name)
+
+    q_url = sqs.create_queue(QueueName="rp-dest-q")["QueueUrl"]
+    q_arn = sqs.get_queue_attributes(QueueUrl=q_url, AttributeNames=["QueueArn"])["Attributes"]["QueueArn"]
+    eb.put_rule(
+        Name="rp-dest-rule",
+        EventBusName=bus_name,
+        EventPattern=json.dumps({"source": ["dest.replay"]}),
+        State="ENABLED",
+    )
+    eb.put_targets(
+        Rule="rp-dest-rule",
+        EventBusName=bus_name,
+        Targets=[{"Id": "t1", "Arn": q_arn}],
+    )
+
+    src_bus_arn = "arn:aws:events:us-east-1:000000000000:event-bus/default"
+    arch_name = f"dest-arch-{_uuid_mod.uuid4().hex[:8]}"
+    eb.create_archive(ArchiveName=arch_name, EventSourceArn=src_bus_arn)
+    eb.put_events(
+        Entries=[
+            {
+                "Source": "dest.replay",
+                "DetailType": "ReplayDelivery",
+                "Detail": json.dumps({"check": "delivered"}),
+                "EventBusName": "default",
+            }
+        ]
+    )
+    archive_arn = eb.describe_archive(ArchiveName=arch_name)["ArchiveArn"]
+    rep_name = f"rep-dest-{_uuid_mod.uuid4().hex[:8]}"
+    eb.start_replay(
+        ReplayName=rep_name,
+        EventSourceArn=archive_arn,
+        EventStartTime=0,
+        EventEndTime=time.time() + 3600,
+        Destination={"Arn": bus_arn},
+    )
+    time.sleep(0.5)
+    msgs = sqs.receive_message(QueueUrl=q_url, MaxNumberOfMessages=10, WaitTimeSeconds=2)
+    assert len(msgs.get("Messages", [])) >= 1, (
+        "Replayed events should be dispatched to the destination bus and arrive in SQS"
+    )
+    eb.delete_archive(ArchiveName=arch_name)
+
+
+def test_eventbridge_archive_event_count_unchanged_after_replay(eb):
+    """Replay reads archived events non-destructively; EventCount stays the same."""
+    arch_name = f"postcnt-arch-{_uuid_mod.uuid4().hex[:8]}"
+    bus_arn = "arn:aws:events:us-east-1:000000000000:event-bus/default"
+    eb.create_archive(ArchiveName=arch_name, EventSourceArn=bus_arn)
+    eb.put_events(
+        Entries=[
+            {
+                "Source": "postcnt.src",
+                "DetailType": "CountCheck",
+                "Detail": json.dumps({}),
+                "EventBusName": "default",
+            }
+        ]
+    )
+    count_before = eb.describe_archive(ArchiveName=arch_name)["EventCount"]
+    archive_arn = eb.describe_archive(ArchiveName=arch_name)["ArchiveArn"]
+    rep_name = f"rep-postcnt-{_uuid_mod.uuid4().hex[:8]}"
+    eb.start_replay(
+        ReplayName=rep_name,
+        EventSourceArn=archive_arn,
+        EventStartTime=0,
+        EventEndTime=time.time() + 3600,
+        Destination={"Arn": bus_arn},
+    )
+    time.sleep(0.3)
+    count_after = eb.describe_archive(ArchiveName=arch_name)["EventCount"]
+    assert count_after == count_before, (
+        "Replay must not consume or modify archived events"
+    )
+    eb.delete_archive(ArchiveName=arch_name)
+
+
+def test_eventbridge_duplicate_replay_name_fails(eb):
+    """Starting a replay with the same name twice returns ResourceAlreadyExistsException."""
+    from botocore.exceptions import ClientError
+    arch_name = f"dup-rep-arch-{_uuid_mod.uuid4().hex[:8]}"
+    bus_arn = "arn:aws:events:us-east-1:000000000000:event-bus/default"
+    eb.create_archive(ArchiveName=arch_name, EventSourceArn=bus_arn)
+    archive_arn = eb.describe_archive(ArchiveName=arch_name)["ArchiveArn"]
+    rep_name = f"rep-dup-{_uuid_mod.uuid4().hex[:8]}"
+    eb.start_replay(
+        ReplayName=rep_name,
+        EventSourceArn=archive_arn,
+        EventStartTime=0,
+        EventEndTime=time.time() + 3600,
+        Destination={"Arn": bus_arn},
+    )
+    with pytest.raises(ClientError) as exc:
+        eb.start_replay(
+            ReplayName=rep_name,
+            EventSourceArn=archive_arn,
+            EventStartTime=0,
+            EventEndTime=time.time() + 3600,
+            Destination={"Arn": bus_arn},
+        )
+    assert exc.value.response["Error"]["Code"] == "ResourceAlreadyExistsException"
+    eb.delete_archive(ArchiveName=arch_name)
