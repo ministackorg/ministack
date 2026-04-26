@@ -137,6 +137,7 @@ logger = logging.getLogger("ministack")
 # Single source of truth for routable services, their backing modules, and aliases.
 SERVICE_REGISTRY = {
     "acm": {"module": "acm"},
+    "backup": {"module": "backup"},
     "apigateway": {"module": "apigateway", "aliases": ("execute-api", "apigatewayv2")},
     "appconfig": {"module": "appconfig"},
     "appconfigdata": {"module": "appconfig"},
@@ -1111,7 +1112,7 @@ async def _handle_lifespan(scope, receive, send):
                     "servicediscovery": "servicediscovery", "s3files": "s3files",
                     "appconfig": "appconfig", "transfer": "transfer",
                     "scheduler": "scheduler", "autoscaling": "autoscaling",
-                    "eks": "eks",
+                    "eks": "eks", "backup": "backup",
                 }
                 save_dict = {}
                 for key, mod_name in _state_map.items():

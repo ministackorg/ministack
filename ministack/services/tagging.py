@@ -176,6 +176,16 @@ def _collect_efs():
         yield arn, _normalise_list(ap.get("Tags", []))
 
 
+def _collect_backup():
+    import ministack.services.backup as svc
+    for name, v in svc._vaults.items():
+        arn = f"arn:aws:backup:{get_region()}:{_account()}:backup-vault:{name}"
+        yield arn, _normalise_flat(v.get("BackupVaultTags", {}))
+    for pid, p in svc._plans.items():
+        arn = f"arn:aws:backup:{get_region()}:{_account()}:backup-plan:{pid}"
+        yield arn, _normalise_flat(p.get("Tags", {}))
+
+
 # ResourceTypeFilter prefix -> collector
 _COLLECTORS = {
     # Phase 1
@@ -196,6 +206,7 @@ _COLLECTORS = {
     "scheduler":         _collect_scheduler,
     "cloudfront":        _collect_cloudfront,
     "elasticfilesystem": _collect_efs,
+    "backup":            _collect_backup,
 }
 
 
@@ -369,6 +380,24 @@ def _write_efs(arn, tags):
         resource["Tags"] = [{"Key": k, "Value": v} for k, v in existing.items()]
 
 
+def _write_backup(arn, tags):
+    import ministack.services.backup as svc
+    if ":backup-vault:" in arn:
+        name = arn.split(":")[-1]
+        v = svc._vaults.get(name)
+        if v is None:
+            raise _ResourceNotFound(arn)
+        v.setdefault("BackupVaultTags", {}).update(tags)
+    elif ":backup-plan:" in arn:
+        pid = arn.split(":")[-1]
+        p = svc._plans.get(pid)
+        if p is None:
+            raise _ResourceNotFound(arn)
+        p.setdefault("Tags", {}).update(tags)
+    else:
+        raise _ResourceNotFound(arn)
+
+
 _WRITERS = {
     "s3": _write_s3, "lambda": _write_lambda, "sqs": _write_sqs,
     "sns": _write_sns, "dynamodb": _write_dynamodb, "events": _write_eventbridge,
@@ -376,7 +405,7 @@ _WRITERS = {
     "glue": _write_glue, "cognito-idp": _write_cognito_idp,
     "cognito-identity": _write_cognito_identity, "appsync": _write_appsync,
     "scheduler": _write_scheduler, "cloudfront": _write_cloudfront,
-    "elasticfilesystem": _write_efs,
+    "elasticfilesystem": _write_efs, "backup": _write_backup,
 }
 
 
@@ -514,6 +543,18 @@ def _remove_efs(arn, keys):
         resource["Tags"] = [t for t in resource.get("Tags", []) if t["Key"] not in keys]
 
 
+def _remove_backup(arn, keys):
+    import ministack.services.backup as svc
+    if ":backup-vault:" in arn:
+        tags = svc._vaults.get(arn.split(":")[-1], {}).get("BackupVaultTags", {})
+    elif ":backup-plan:" in arn:
+        tags = svc._plans.get(arn.split(":")[-1], {}).get("Tags", {})
+    else:
+        return
+    for k in keys:
+        tags.pop(k, None)
+
+
 _REMOVERS = {
     "s3": _remove_s3, "lambda": _remove_lambda, "sqs": _remove_sqs,
     "sns": _remove_sns, "dynamodb": _remove_dynamodb, "events": _remove_eventbridge,
@@ -521,7 +562,7 @@ _REMOVERS = {
     "glue": _remove_glue, "cognito-idp": _remove_cognito_idp,
     "cognito-identity": _remove_cognito_identity, "appsync": _remove_appsync,
     "scheduler": _remove_scheduler, "cloudfront": _remove_cloudfront,
-    "elasticfilesystem": _remove_efs,
+    "elasticfilesystem": _remove_efs, "backup": _remove_backup,
 }
 
 

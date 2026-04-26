@@ -44,6 +44,7 @@ import ministack.services.cloudfront as _cf
 import ministack.services.rds as _rds
 import ministack.services.autoscaling as _asg
 import ministack.services.codebuild as _codebuild
+import ministack.services.backup as _backup
 
 
 logger = logging.getLogger("cloudformation")
@@ -2798,6 +2799,40 @@ def _asg_scheduled_delete(physical_id, props):
 # Resource Handler Registry
 # ===========================================================================
 
+# --- AWS Backup ---
+
+
+def _backup_vault_create(logical_id, props, stack_name):
+    name = props.get("BackupVaultName") or _physical_name(stack_name, logical_id, max_len=50)
+    tags = {t["Key"]: t["Value"] for t in props.get("BackupVaultTags", [])} if isinstance(props.get("BackupVaultTags"), list) else props.get("BackupVaultTags", {})
+    body = {
+        "EncryptionKeyArn": props.get("EncryptionKeyArn", ""),
+        "BackupVaultTags": tags,
+    }
+    _backup._create_vault(name, body)
+    arn = _backup._vault_arn(name)
+    return name, {"BackupVaultArn": arn, "BackupVaultName": name}
+
+
+def _backup_vault_delete(physical_id, props):
+    _backup._vaults.pop(physical_id, None)
+
+
+def _backup_plan_create(logical_id, props, stack_name):
+    plan_cfg = props.get("BackupPlan", {})
+    tags = {t["Key"]: t["Value"] for t in props.get("BackupPlanTags", [])} if isinstance(props.get("BackupPlanTags"), list) else props.get("BackupPlanTags", {})
+    body = {"BackupPlan": plan_cfg, "BackupPlanTags": tags}
+    _, _, resp_bytes = _backup._create_plan(body)
+    import json as _json
+    resp = _json.loads(resp_bytes)
+    plan_id = resp["BackupPlanId"]
+    return plan_id, {"BackupPlanArn": resp["BackupPlanArn"], "BackupPlanId": plan_id, "VersionId": resp["VersionId"]}
+
+
+def _backup_plan_delete(physical_id, props):
+    _backup._plans.pop(physical_id, None)
+
+
 _RESOURCE_HANDLERS = {
     "AWS::S3::Bucket": {"create": _s3_create, "delete": _s3_delete},
     "AWS::S3::BucketPolicy": {"create": _s3_bucket_policy_create, "delete": _s3_bucket_policy_delete},
@@ -2874,6 +2909,9 @@ _RESOURCE_HANDLERS = {
     # EKS
     "AWS::EKS::Cluster": {"create": _eks_cluster_create, "delete": _eks_cluster_delete},
     "AWS::EKS::Nodegroup": {"create": _eks_nodegroup_create, "delete": _eks_nodegroup_delete},
+    # AWS Backup
+    "AWS::Backup::BackupVault": {"create": _backup_vault_create, "delete": _backup_vault_delete},
+    "AWS::Backup::BackupPlan": {"create": _backup_plan_create, "delete": _backup_plan_delete},
     # CDK metadata — safe to ignore
     "AWS::CDK::Metadata": {"create": lambda lid, props, sn: (f"CDKMetadata-{lid}", {}), "delete": lambda pid, props: None},
     # AutoScaling
