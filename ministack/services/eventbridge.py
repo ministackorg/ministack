@@ -106,6 +106,7 @@ def get_state():
         "rules": copy.deepcopy(_rules),
         "targets": copy.deepcopy(_targets),
         "tags": copy.deepcopy(_tags),
+        "archives": copy.deepcopy(_archives),
         "replays": copy.deepcopy(_replays),
         "endpoints": copy.deepcopy(_endpoints),
         "partner_event_sources": copy.deepcopy(_partner_event_sources),
@@ -118,6 +119,7 @@ def restore_state(data):
         _rules.update(data.get("rules", {}))
         _targets.update(data.get("targets", {}))
         _tags.update(data.get("tags", {}))
+        _archives.update(data.get("archives", {}))
         _replays.update(data.get("replays", {}))
         _endpoints.update(data.get("endpoints", {}))
         pe = data.get("partner_event_sources")
@@ -627,8 +629,22 @@ def _put_events(data):
         logger.debug("EventBridge event: %s / %s", entry.get('Source'), entry.get('DetailType'))
 
         _dispatch_event(event_record)
+        _archive_event(event_record)
 
     return json_response({"FailedEntryCount": 0, "Entries": results})
+
+
+def _archive_event(event):
+    bus_name = event.get("EventBusName", "default")
+    bus_arn = f"arn:aws:events:{get_region()}:{get_account_id()}:event-bus/{bus_name}"
+    for archive in _archives.values():
+        if archive.get("EventSourceArn") != bus_arn:
+            continue
+        pattern = archive.get("EventPattern", "")
+        if pattern and not _matches_pattern(pattern, event):
+            continue
+        archive.setdefault("Events", []).append(event)
+        archive["EventCount"] = archive.get("EventCount", 0) + 1
 
 
 def _dispatch_event(event):
@@ -1052,7 +1068,7 @@ def _list_archives(data):
 
 
 # ---------------------------------------------------------------------------
-# Replays (minimal control plane — no archive replay engine)
+# Replays
 # ---------------------------------------------------------------------------
 
 def _start_replay(data):
@@ -1072,19 +1088,52 @@ def _start_replay(data):
             "Destination.Arn is required",
             400,
         )
+
+    source_arn = data.get("EventSourceArn", "")
+    # source_arn format: arn:aws:events:{region}:{account}:archive/{name}
+    archive_name = source_arn.split("/")[-1] if "/" in source_arn else ""
+    archive = _archives.get(archive_name)
+    if not archive:
+        return error_response_json(
+            "ResourceNotFoundException",
+            f"Archive {archive_name} does not exist.",
+            400,
+        )
+
     arn = f"arn:aws:events:{get_region()}:{get_account_id()}:replay/{name}"
     now = _now_ts()
-    _replays[name] = {
+    event_start = _coerce_timestamp(data.get("EventStartTime", now))
+    event_end = _coerce_timestamp(data.get("EventEndTime", now))
+    replay = {
         "ReplayName": name,
         "ReplayArn": arn,
         "Description": data.get("Description", ""),
-        "EventSourceArn": data.get("EventSourceArn", ""),
-        "EventStartTime": data.get("EventStartTime", now),
-        "EventEndTime": data.get("EventEndTime", now),
+        "EventSourceArn": source_arn,
+        "EventStartTime": event_start,
+        "EventEndTime": event_end,
         "Destination": dest,
-        "State": "RUNNING",
+        "State": "STARTING",
         "ReplayStartTime": now,
     }
+    _replays[name] = replay
+
+    dest_bus_name = _normalize_bus_name(dest.get("Arn", ""))
+
+    def _run():
+        replay["State"] = "RUNNING"
+        for event in list(archive.get("Events", [])):
+            ts = event.get("Time", 0)
+            if not (event_start <= ts <= event_end):
+                continue
+            replayed = dict(event)
+            replayed["EventBusName"] = dest_bus_name
+            _dispatch_event(replayed)
+        replay["State"] = "COMPLETED"
+        replay["ReplayEndTime"] = _now_ts()
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+
     return json_response({"ReplayArn": arn, "State": "RUNNING"})
 
 
