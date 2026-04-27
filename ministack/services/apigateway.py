@@ -119,17 +119,24 @@ def _extract_lambda_ref_from_integration_uri(uri: str) -> str:
 # ---- Persistence hooks ----
 
 def get_state() -> dict:
-    """Return full module state for persistence."""
+    """Return full module state for persistence.
+
+    Deep-copies each dict so a concurrent write during shutdown
+    serialisation can't corrupt the persisted JSON. Every other
+    persisted service in this codebase already does the same; the
+    apigateway pair was an outlier.
+    """
+    import copy
     return {
-        "apis": _apis,
-        "routes": _routes,
-        "integrations": _integrations,
-        "stages": _stages,
-        "deployments": _deployments,
-        "authorizers": _authorizers,
-        "api_tags": _api_tags,
-        "route_responses": _route_responses,
-        "integration_responses": _integration_responses,
+        "apis": copy.deepcopy(_apis),
+        "routes": copy.deepcopy(_routes),
+        "integrations": copy.deepcopy(_integrations),
+        "stages": copy.deepcopy(_stages),
+        "deployments": copy.deepcopy(_deployments),
+        "authorizers": copy.deepcopy(_authorizers),
+        "api_tags": copy.deepcopy(_api_tags),
+        "route_responses": copy.deepcopy(_route_responses),
+        "integration_responses": copy.deepcopy(_integration_responses),
     }
 
 

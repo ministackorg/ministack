@@ -172,7 +172,13 @@ def _list_certificates(data):
             "DomainName": cert["DomainName"],
             "Status": cert["Status"],
         })
-    return json_response({"CertificateSummaryList": summaries, "NextToken": None})
+    # Real AWS omits NextToken when there's no next page. boto3 strips
+    # null fields client-side so it tolerates `"NextToken": null`, but
+    # other SDKs (Java, Go, raw HTTP) and pagination loops checking
+    # `if "NextToken" in response` see the literal null and loop
+    # forever. ACM emulator currently emits a single page, so always
+    # omit the key.
+    return json_response({"CertificateSummaryList": summaries})
 
 
 def _delete_certificate(data):

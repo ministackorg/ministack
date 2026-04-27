@@ -460,21 +460,28 @@ async def _call_lambda(func_name, event, qualifier=None):
 # ---- Persistence hooks ----
 
 def get_state():
-    """Return full module state for persistence."""
+    """Return full module state for persistence.
+
+    Deep-copies each dict so a concurrent write during shutdown
+    serialisation can't corrupt the persisted JSON. Every other
+    persisted service in this codebase already does the same; the
+    apigateway pair was an outlier.
+    """
+    import copy
     return {
-        "rest_apis": _rest_apis,
-        "resources": _resources,
-        "stages_v1": _stages_v1,
-        "deployments_v1": _deployments_v1,
-        "authorizers_v1": _authorizers_v1,
-        "models": _models,
-        "api_keys": _api_keys,
-        "usage_plans": _usage_plans,
-        "usage_plan_keys": _usage_plan_keys,
-        "domain_names": _domain_names,
-        "base_path_mappings": _base_path_mappings,
-        "v1_tags": _v1_tags,
-        "account_settings": _account_settings,
+        "rest_apis": copy.deepcopy(_rest_apis),
+        "resources": copy.deepcopy(_resources),
+        "stages_v1": copy.deepcopy(_stages_v1),
+        "deployments_v1": copy.deepcopy(_deployments_v1),
+        "authorizers_v1": copy.deepcopy(_authorizers_v1),
+        "models": copy.deepcopy(_models),
+        "api_keys": copy.deepcopy(_api_keys),
+        "usage_plans": copy.deepcopy(_usage_plans),
+        "usage_plan_keys": copy.deepcopy(_usage_plan_keys),
+        "domain_names": copy.deepcopy(_domain_names),
+        "base_path_mappings": copy.deepcopy(_base_path_mappings),
+        "v1_tags": copy.deepcopy(_v1_tags),
+        "account_settings": copy.deepcopy(_account_settings),
     }
 
 
