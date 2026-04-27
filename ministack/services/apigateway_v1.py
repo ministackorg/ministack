@@ -1242,6 +1242,11 @@ def _put_integration(api_id, resource_id, http_method, data):
         "timeoutInMillis": data.get("timeoutInMillis", 29000),
         "cacheNamespace": resource_id,
         "cacheKeyParameters": data.get("cacheKeyParameters", []),
+        # contentHandling (CONVERT_TO_TEXT | CONVERT_TO_BINARY) is the v1
+        # equivalent of v2's contentHandlingStrategy (#439). Without
+        # storing it Terraform's aws_api_gateway_integration plans a
+        # perpetual replace on every apply.
+        "contentHandling": data.get("contentHandling"),
         "integrationResponses": {},
     }
     method_obj["methodIntegration"] = integration
