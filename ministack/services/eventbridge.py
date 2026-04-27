@@ -110,6 +110,9 @@ def get_state():
         "replays": copy.deepcopy(_replays),
         "endpoints": copy.deepcopy(_endpoints),
         "partner_event_sources": copy.deepcopy(_partner_event_sources),
+        "event_bus_policies": copy.deepcopy(_event_bus_policies),
+        "connections": copy.deepcopy(_connections),
+        "api_destinations": copy.deepcopy(_api_destinations),
     }
 
 
@@ -122,6 +125,9 @@ def restore_state(data):
         _archives.update(data.get("archives", {}))
         _replays.update(data.get("replays", {}))
         _endpoints.update(data.get("endpoints", {}))
+        _event_bus_policies.update(data.get("event_bus_policies", {}))
+        _connections.update(data.get("connections", {}))
+        _api_destinations.update(data.get("api_destinations", {}))
         pe = data.get("partner_event_sources")
         if pe is not None:
             _partner_event_sources.clear()

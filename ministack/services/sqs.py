@@ -49,7 +49,14 @@ _queues_lock = threading.Lock()
 # ── Persistence ────────────────────────────────────────────
 
 def get_state():
-    return {"queues": copy.deepcopy(_queues), "queue_name_to_url": dict(_queue_name_to_url)}
+    # Both must be deepcopy(asd): dict(asd) iterates only the current
+    # request's tenant via AccountScopedDict.__iter__, so other tenants'
+    # name→url mappings would silently disappear at shutdown
+    # serialisation. Same bug family as #492.
+    return {
+        "queues": copy.deepcopy(_queues),
+        "queue_name_to_url": copy.deepcopy(_queue_name_to_url),
+    }
 
 
 def restore_state(data):

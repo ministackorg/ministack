@@ -4,17 +4,17 @@ Regression tests for the CloudWatch Logs persistence drops.
 Three module-level AccountScopedDicts are mutated by public APIs but
 were missing from `get_state()` / `restore_state()`:
 
-  H-2  cloudwatch_logs._destinations      (PutDestination)
-  H-2  cloudwatch_logs._metric_filters    (PutMetricFilter)
-  H-2  cloudwatch_logs._queries           (StartQuery)
+  - cloudwatch_logs._destinations      (PutDestination)
+  - cloudwatch_logs._metric_filters    (PutMetricFilter)
+  - cloudwatch_logs._queries           (StartQuery)
 
 Plus a follow-on consistency bug:
 
-  M-9  Subscription filters live inside _log_groups (persisted) but
-       reference destination ARNs in _destinations (not persisted).
-       After warm-boot you get split-brain: the filter on the log group
-       still references a destination that no longer exists in
-       _destinations.
+  - Subscription filters live inside _log_groups (persisted) but
+    reference destination ARNs in _destinations (not persisted).
+    After warm-boot you get split-brain: the filter on the log group
+    still references a destination that no longer exists in
+    _destinations.
 
 Each test exercises the FULL warm-boot path:
   1. populate the in-memory dict
@@ -64,7 +64,7 @@ def _round_trip(mod, svc_key="cloudwatch_logs"):
     mod.restore_state(loaded)
 
 
-# ── H-2: _destinations ─────────────────────────────────────────────────
+# ── _destinations ──────────────────────────────────────────────────────
 
 def test_destinations_survive_warm_boot():
     mod = _module()
@@ -88,7 +88,7 @@ def test_destinations_survive_warm_boot():
     mod.reset()
 
 
-# ── H-2: _metric_filters ──────────────────────────────────────────────
+# ── _metric_filters ────────────────────────────────────────────────────
 
 def test_metric_filters_survive_warm_boot():
     mod = _module()
@@ -125,7 +125,7 @@ def test_metric_filters_survive_warm_boot():
     mod.reset()
 
 
-# ── H-2: _queries ─────────────────────────────────────────────────────
+# ── _queries ───────────────────────────────────────────────────────────
 
 def test_queries_survive_warm_boot():
     mod = _module()
@@ -148,7 +148,7 @@ def test_queries_survive_warm_boot():
     mod.reset()
 
 
-# ── M-9: subscription-filter ↔ destination consistency ────────────────
+# ── subscription-filter ↔ destination consistency ──────────────────────
 
 def test_subscription_filter_destination_resolvable_after_warm_boot():
     """A subscription filter on a log group references a destination ARN.

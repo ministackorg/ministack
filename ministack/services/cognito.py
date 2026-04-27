@@ -200,15 +200,19 @@ _identity_pools = AccountScopedDict()
 _identity_tags = AccountScopedDict()   # identity_pool_id -> {key: value}
 
 # ---------------------------------------------------------------------------
-# In-memory state — OAuth2 hosted-UI / federation codes
+# In-memory state — OAuth2 authorization codes
 # ---------------------------------------------------------------------------
-# `_auth_codes` and `_authorization_codes` are intentionally plain dicts
-# (NOT AccountScopedDict). The OAuth2 token endpoint is a public callback
-# with no AWS authentication context — it identifies the caller via the
-# random code + client_id + client_secret, not via a SigV4 access key.
-# Wrapping these in AccountScopedDict would make the callback lookup
-# happen under a default account, invisible to codes issued under any
-# other tenant. Effective tenant isolation is provided by the random
+# Both `_auth_codes` (SAML / OIDC federation codes minted by
+# `_oauth2_authorize_federation` and `_saml2_idp_response`) and
+# `_authorization_codes` (managed-login PKCE flow) are intentionally
+# plain dicts — NOT AccountScopedDict.
+#
+# The mint paths and the redeem path (`_oauth2_token`) are all public
+# OAuth2 endpoints invoked without SigV4. With no AWS access key on the
+# request, every operation runs under the default account, so
+# AccountScopedDict would scope mint AND lookup to the same default
+# account — functionally equivalent to a plain dict, no isolation
+# gained or lost. Effective tenant isolation is provided by the random
 # unguessable token namespace. See
 # tests/test_cognito_auth_codes_persistence.py for a regression pin.
 

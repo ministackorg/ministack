@@ -6,14 +6,13 @@ but the dict is missing from `get_state()` and/or `restore_state()`. With
 PERSIST_STATE=1, every record stored via that API silently disappears on
 the next restart.
 
-This file covers five distinct state-dict persistence drops surfaced by
-the persistence-symmetry audit:
+This file covers five distinct state-dict persistence drops:
 
-  H-1  secretsmanager._resource_policies
-  H-3  kinesis._consumers             (enhanced fan-out)
-  H-4  ecs._attributes                (PutAttributes / ListAttributes)
-  H-5  sns._platform_applications
-  H-5  sns._platform_endpoints
+  - secretsmanager._resource_policies
+  - kinesis._consumers             (enhanced fan-out)
+  - ecs._attributes                (PutAttributes / ListAttributes)
+  - sns._platform_applications
+  - sns._platform_endpoints
 
 Each test populates the dict, snapshots state via the public
 `get_state()` / `restore_state()` contract, simulates a restart, and
@@ -58,7 +57,7 @@ def _round_trip(mod, svc_key):
     mod.restore_state(loaded)
 
 
-# ── H-1: secretsmanager._resource_policies ─────────────────────────────
+# ── secretsmanager._resource_policies ──────────────────────────────────
 
 def test_secretsmanager_resource_policies_survive_warm_boot():
     """`PutResourcePolicy` writes to `_resource_policies`, but if that
@@ -78,7 +77,7 @@ def test_secretsmanager_resource_policies_survive_warm_boot():
     mod.reset()
 
 
-# ── H-3: kinesis._consumers ────────────────────────────────────────────
+# ── kinesis._consumers ─────────────────────────────────────────────────
 
 def test_kinesis_consumers_survive_warm_boot():
     """`RegisterStreamConsumer` writes to `_consumers`. Without
@@ -106,7 +105,7 @@ def test_kinesis_consumers_survive_warm_boot():
     mod.reset()
 
 
-# ── H-4: ecs._attributes ───────────────────────────────────────────────
+# ── ecs._attributes ────────────────────────────────────────────────────
 
 def test_ecs_attributes_survive_warm_boot():
     """`PutAttributes` writes to `_attributes`. Lost on restart without
@@ -129,7 +128,7 @@ def test_ecs_attributes_survive_warm_boot():
     mod.reset()
 
 
-# ── H-5: sns._platform_applications + sns._platform_endpoints ─────────
+# ── sns._platform_applications + sns._platform_endpoints ──────────────
 
 def test_sns_platform_applications_survive_warm_boot():
     """`CreatePlatformApplication` writes to `_platform_applications`.
@@ -233,7 +232,7 @@ def test_module_cold_import_with_typical_snapshot_does_not_log_restore_failure(
     svc_key, mod_name, caplog,
 ):
     """Generic regression for the NameError-at-import pattern that hit
-    `ecs._attributes` (this PR) and `acm._synthetic_pem` (#494).
+    `ecs._attributes` (#492) and `acm._synthetic_pem` (#494).
 
     The bug shape: `restore_state(data)` references a module-level
     symbol declared further down the file. The import-time `try:

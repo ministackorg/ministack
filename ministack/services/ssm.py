@@ -32,12 +32,18 @@ _tags = AccountScopedDict()
 # ── Persistence ────────────────────────────────────────────
 
 def get_state():
-    return {"parameters": copy.deepcopy(_parameters)}
+    return {
+        "parameters": copy.deepcopy(_parameters),
+        "parameter_history": copy.deepcopy(_parameter_history),
+        "tags": copy.deepcopy(_tags),
+    }
 
 
 def restore_state(data):
     if data:
         _parameters.update(data.get("parameters", {}))
+        _parameter_history.update(data.get("parameter_history", {}))
+        _tags.update(data.get("tags", {}))
 
 
 try:

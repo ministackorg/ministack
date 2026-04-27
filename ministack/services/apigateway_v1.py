@@ -1053,7 +1053,7 @@ def _get_rest_api(api_id):
 
 
 def _get_rest_apis():
-    return _v1_response({"item": [_rest_api_view(a) for a in _rest_apis.values()], "nextToken": None})
+    return _v1_response({"item": [_rest_api_view(a) for a in _rest_apis.values()]})
 
 
 def _update_rest_api(api_id, data):

@@ -1,24 +1,24 @@
 """
-Regression tests for the §7.4 / §7.5 omnibus (MINISTACK_GAP_PLAN.md):
+Regression tests for three medium/low correctness bugs:
 
-  M-1  apigateway + apigateway_v1 get_state() returned live
-       AccountScopedDict references rather than deep copies. A
-       concurrent write during shutdown serialisation could corrupt
-       the persisted snapshot.
+  - apigateway + apigateway_v1 get_state() returned live
+    AccountScopedDict references rather than deep copies. A
+    concurrent write during shutdown serialisation could corrupt
+    the persisted snapshot.
 
-  M-2  secretsmanager._delete_secret(force=True) deleted the secret
-       record but left orphan entries in `_resource_policies` (keyed
-       by ARN) — invisible to the API but accumulating in memory and
-       surviving warm-boot via the persistence path.
+  - secretsmanager._delete_secret(force=True) deleted the secret
+    record but left orphan entries in `_resource_policies` (keyed
+    by ARN) — invisible to the API but accumulating in memory and
+    surviving warm-boot via the persistence path.
 
-  L-2  acm._list_certificates returned `{"NextToken": null}`
-       unconditionally. Real AWS omits the key when there is no next
-       page; SDK consumers that paginate via
-       `if "NextToken" in response` will loop forever.
+  - acm._list_certificates returned `{"NextToken": null}`
+    unconditionally. Real AWS omits the key when there is no next
+    page; SDK consumers that paginate via
+    `if "NextToken" in response` will loop forever.
 
 Each test bypasses boto3 to inspect a layer it would otherwise hide:
-in-process module state (M-1, M-2) or the wire-level JSON before
-client-side null-stripping (L-2).
+in-process module state for the first two, or the wire-level JSON
+before client-side null-stripping for the NextToken case.
 """
 import importlib
 import json
@@ -37,7 +37,7 @@ def _module(name):
     return importlib.import_module(f"ministack.services.{name}")
 
 
-# ── M-1: apigateway / apigateway_v1 get_state must deep-copy ──────────
+# ── apigateway / apigateway_v1 get_state must deep-copy ───────────────
 
 @pytest.mark.parametrize("mod_name", ["apigateway", "apigateway_v1"])
 def test_apigateway_get_state_returns_independent_copy(mod_name):
@@ -75,7 +75,7 @@ def test_apigateway_get_state_returns_independent_copy(mod_name):
         mod.reset()
 
 
-# ── M-2: secretsmanager force-delete must clean up orphan policies ────
+# ── secretsmanager force-delete must clean up orphan policies ─────────
 
 def test_secretsmanager_force_delete_removes_resource_policy():
     """ForceDeleteWithoutRecovery must remove not just the secret but
@@ -133,7 +133,7 @@ def _invoke_action(mod, action, params):
     return resp_body.decode() if isinstance(resp_body, bytes) else resp_body
 
 
-# ── L-2: ACM ListCertificates must omit NextToken when no more pages ──
+# ── ACM ListCertificates must omit NextToken when no more pages ───────
 
 def test_acm_list_certificates_omits_nexttoken_when_no_more_pages():
     """Returning `{"NextToken": null}` is non-standard AWS — real AWS

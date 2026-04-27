@@ -136,6 +136,12 @@ def get_state():
         "layers": copy.deepcopy(_layers),
         "esms": copy.deepcopy(_esms),
         "function_urls": copy.deepcopy(_function_urls),
+        # Stream-poll offsets must persist with the ESM record they
+        # belong to — without this, every warm-boot replays from the
+        # configured StartingPosition (TRIM_HORIZON ⇒ full backlog),
+        # violating at-least-once delivery semantics.
+        "kinesis_positions": copy.deepcopy(_kinesis_positions),
+        "dynamodb_stream_positions": copy.deepcopy(_dynamodb_stream_positions),
     }
 
 
@@ -162,6 +168,8 @@ def restore_state(data):
         _layers.update(data.get("layers", {}))
         _esms.update(data.get("esms", {}))
         _function_urls.update(data.get("function_urls", {}))
+        _kinesis_positions.update(data.get("kinesis_positions", {}))
+        _dynamodb_stream_positions.update(data.get("dynamodb_stream_positions", {}))
         if _esms:
             _ensure_poller()
 
@@ -401,15 +409,21 @@ def _normalize_endpoint_url(value: str) -> str:
     return f"http://{host}"
 
 
-def _fetch_code_from_s3(bucket: str, key: str) -> bytes | None:
-    """Fetch Lambda code zip from the in-memory S3 service."""
+def _fetch_code_from_s3(bucket: str, key: str, version_id: str | None = None) -> bytes | None:
+    """Fetch Lambda code zip from the in-memory S3 service.
+
+    `version_id` matches AWS Lambda's `Code.S3ObjectVersion` — when set,
+    fetches that specific S3 object version instead of the latest."""
     try:
         from ministack.services import s3 as s3_svc
-        obj = s3_svc._get_object_data(bucket, key)
+        obj = s3_svc._get_object_data(bucket, key, version_id=version_id)
         if obj is not None:
             return obj
     except Exception as e:
-        logger.warning("Failed to fetch Lambda code from s3://%s/%s: %s", bucket, key, e)
+        logger.warning(
+            "Failed to fetch Lambda code from s3://%s/%s%s: %s",
+            bucket, key, f"?versionId={version_id}" if version_id else "", e,
+        )
     return None
 
 
@@ -822,7 +836,11 @@ def _create_function(data: dict):
     elif "ZipFile" in code_data:
         code_zip = base64.b64decode(code_data["ZipFile"])
     elif "S3Bucket" in code_data and "S3Key" in code_data:
-        code_zip = _fetch_code_from_s3(code_data["S3Bucket"], code_data["S3Key"])
+        code_zip = _fetch_code_from_s3(
+            code_data["S3Bucket"],
+            code_data["S3Key"],
+            version_id=code_data.get("S3ObjectVersion"),
+        )
 
     err = _validate_unzipped_size(code_zip)
     if err is not None:
@@ -1180,7 +1198,11 @@ def _update_code(name: str, data: dict):
     elif "ZipFile" in data:
         code_zip = base64.b64decode(data["ZipFile"])
     elif "S3Bucket" in data and "S3Key" in data:
-        code_zip = _fetch_code_from_s3(data["S3Bucket"], data["S3Key"])
+        code_zip = _fetch_code_from_s3(
+            data["S3Bucket"],
+            data["S3Key"],
+            version_id=data.get("S3ObjectVersion"),
+        )
         if code_zip is None:
             return error_response_json(
                 "InvalidParameterValueException",
@@ -3373,7 +3395,11 @@ def _publish_layer_version(layer_name: str, data: dict):
     if "ZipFile" in content:
         zip_data = base64.b64decode(content["ZipFile"])
     elif "S3Bucket" in content and "S3Key" in content:
-        zip_data = _fetch_code_from_s3(content["S3Bucket"], content["S3Key"])
+        zip_data = _fetch_code_from_s3(
+            content["S3Bucket"],
+            content["S3Key"],
+            version_id=content.get("S3ObjectVersion"),
+        )
 
     err = _validate_unzipped_size(zip_data)
     if err is not None:

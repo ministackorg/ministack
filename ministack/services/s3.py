@@ -189,10 +189,18 @@ def _error(code: str, message: str, status: int, resource: str = "") -> tuple:
     return status, {"Content-Type": "application/xml"}, _xml_body(root)
 
 
-def _get_object_data(bucket_name: str, key: str) -> bytes | None:
-    """Return raw object bytes, or None if not found. Used by Lambda S3 code fetch."""
+def _get_object_data(bucket_name: str, key: str, version_id: str | None = None) -> bytes | None:
+    """Return raw object bytes, or None if not found. Used by Lambda S3 code fetch.
+
+    When `version_id` is provided, returns the bytes for that specific
+    version from `_object_versions` — matches AWS GetObject(VersionId)."""
     bucket = _buckets.get(bucket_name)
     if bucket is None:
+        return None
+    if version_id:
+        for v in _object_versions.get((bucket_name, key), []):
+            if v["version_id"] == version_id:
+                return v.get("data")
         return None
     obj = bucket["objects"].get(key)
     if obj is None:

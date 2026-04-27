@@ -856,6 +856,11 @@ def _deliver_to_sqs(endpoint: str, envelope: str, raw: bool, raw_message: str,
         "body": body,
         "md5": hashlib.md5(body.encode()).hexdigest(),
         "message_attributes": sqs_attrs,
+        # Real SQS emits MD5OfMessageAttributes alongside MD5OfBody on
+        # ReceiveMessage; the field reads from msg["md5_attrs"]. Without
+        # this, raw SNS→SQS deliveries diverge from real AWS for
+        # consumers that verify the attribute MD5 (Java/Go SDKs do).
+        "md5_attrs": _sqs._md5_msg_attrs(sqs_attrs),
         "receipt_handle": None,
         "sent_at": now,
         "visible_at": now,
