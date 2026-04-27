@@ -401,11 +401,15 @@ def _normalize_endpoint_url(value: str) -> str:
     return f"http://{host}"
 
 
-def _fetch_code_from_s3(bucket: str, key: str) -> bytes | None:
-    """Fetch Lambda code zip from the in-memory S3 service."""
+def _fetch_code_from_s3(bucket: str, key: str, version_id: str | None = None) -> bytes | None:
+    """Fetch Lambda code zip from the in-memory S3 service.
+
+    When ``version_id`` is provided, fetch that specific object version (so
+    pinned ``Code.S3ObjectVersion`` deployments behave like real AWS).
+    """
     try:
         from ministack.services import s3 as s3_svc
-        obj = s3_svc._get_object_data(bucket, key)
+        obj = s3_svc._get_object_data(bucket, key, version_id=version_id)
         if obj is not None:
             return obj
     except Exception as e:

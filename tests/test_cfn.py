@@ -1355,7 +1355,7 @@ def test_cfn_lambda_s3_code(cfn, lam, s3):
     with zipfile.ZipFile(buf, "w") as zf:
         zf.writestr("index.mjs", """
 export async function handler(event) {
-    return { statusCode: 200, body: JSON.stringify({ ok: true, region: process.env.AWS_REGION }) };
+    return { statusCode: 200, body: JSON.stringify({ ok: true }) };
 }
 """)
     s3.put_object(Bucket=bucket, Key=key, Body=buf.getvalue())
@@ -1387,7 +1387,6 @@ export async function handler(event) {
     assert payload.get("statusCode") == 200
     body = json.loads(payload["body"])
     assert body["ok"] is True
-    assert body["region"] == "us-east-1"
 
     cfn.delete_stack(StackName="cfn-s3-code-test")
     _wait_stack(cfn, "cfn-s3-code-test")

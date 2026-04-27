@@ -399,6 +399,14 @@ def _lambda_create(logical_id, props, stack_name):
     layers = props.get("Layers", [])
     code = props.get("Code", {})
 
+    code_zip = _zip_inline(code.get("ZipFile"), handler, runtime)
+    if code_zip is None and code.get("S3Bucket") and code.get("S3Key"):
+        code_zip = _lambda_svc._fetch_code_from_s3(
+            code["S3Bucket"],
+            code["S3Key"],
+            version_id=code.get("S3ObjectVersion"),
+        )
+
     func = {
         "config": {
             "FunctionName": name,
@@ -422,8 +430,7 @@ def _lambda_create(logical_id, props, stack_name):
             "TracingConfig": props.get("TracingConfig", {"Mode": "PassThrough"}),
             "RevisionId": new_uuid(),
         },
-        "code_zip": _zip_inline(code.get("ZipFile"), handler, runtime)
-            or _lambda_svc._fetch_code_from_s3(code.get("S3Bucket", ""), code.get("S3Key", "")),
+        "code_zip": code_zip,
         "code_s3_bucket": code.get("S3Bucket"),
         "code_s3_key": code.get("S3Key"),
         "versions": {},
