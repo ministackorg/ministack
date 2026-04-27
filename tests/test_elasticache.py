@@ -642,3 +642,85 @@ def test_serverless_cache_not_implemented(ec):
             Engine="redis",
         )
 
+
+# ---------------------------------------------------------------------------
+# 12. Cluster-mode (real sharded redis) — opt-in, requires Docker + network
+# ---------------------------------------------------------------------------
+
+def _cluster_mode_env_ready():
+    """True only if the host can actually exercise the cluster-mode path:
+    the flag is set, DOCKER_NETWORK is set, and `docker` is importable+usable.
+    """
+    if os.environ.get("ELASTICACHE_CLUSTER_MODE_REAL") != "1":
+        return False
+    if not os.environ.get("DOCKER_NETWORK"):
+        return False
+    try:
+        import docker
+        client = docker.from_env()
+        client.ping()
+        return True
+    except Exception:
+        return False
+
+
+@pytest.mark.skipif(
+    not _cluster_mode_env_ready(),
+    reason="cluster-mode requires ELASTICACHE_CLUSTER_MODE_REAL=1 + DOCKER_NETWORK + docker",
+)
+def test_elasticache_real_cluster_mode(ec):
+    """Bootstraps a real 3-shard redis cluster via redis-cli and verifies
+    CLUSTER SLOTS topology + cluster-aware SET/GET via an ephemeral client
+    container on the same network."""
+    import subprocess
+    rg_id = "pytest-cluster"
+    network = os.environ["DOCKER_NETWORK"]
+
+    # Cleanup any leftover from a prior aborted run.
+    try:
+        ec.delete_replication_group(ReplicationGroupId=rg_id)
+        time.sleep(2)
+    except ClientError:
+        pass
+
+    resp = ec.create_replication_group(
+        ReplicationGroupId=rg_id,
+        ReplicationGroupDescription="pytest cluster mode",
+        CacheNodeType="cache.t3.micro",
+        Engine="redis",
+        EngineVersion="7.0.12",
+        NumNodeGroups=3,
+        ReplicasPerNodeGroup=1,
+    )
+    rg = resp["ReplicationGroup"]
+    assert rg["ClusterEnabled"] is True
+    assert len(rg["NodeGroups"]) == 3
+    config_ep = rg["ConfigurationEndpoint"]
+    assert config_ep and config_ep["Port"] == 6379
+
+    def cli(args):
+        cmd = (
+            ["docker", "run", "--rm", "--network", network, "redis:7-alpine", "redis-cli"]
+            + args
+        )
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+
+    info = cli(["-h", config_ep["Address"], "-p", "6379", "CLUSTER", "INFO"]).stdout
+    assert "cluster_state:ok" in info, info
+    assert "cluster_known_nodes:6" in info, info
+    assert "cluster_size:3" in info, info
+
+    for k, v in [("alpha", "1"), ("beta", "2"), ("gamma", "3"), ("delta", "4")]:
+        r = cli(["-c", "-h", config_ep["Address"], "-p", "6379", "SET", k, v])
+        assert r.returncode == 0 and r.stdout.strip() == "OK", r.stdout + r.stderr
+        r = cli(["-c", "-h", config_ep["Address"], "-p", "6379", "GET", k])
+        assert r.stdout.strip() == v, r.stdout
+
+    ec.delete_replication_group(ReplicationGroupId=rg_id)
+    time.sleep(1)
+    leftover = subprocess.run(
+        ["docker", "ps", "-a", "--filter", f"label=rg_id={rg_id}", "--format", "{{.Names}}"],
+        capture_output=True, text=True,
+    ).stdout.strip()
+    assert leftover == "", f"leftover containers after delete: {leftover}"
+

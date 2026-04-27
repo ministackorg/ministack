@@ -1140,6 +1140,11 @@ async def _handle_lifespan(scope, receive, send):
             )
             logger.info("Worker thread pool: %d threads", _max_workers)
             _run_init_scripts()
+            # Reap any container that survived a hard kill of the previous
+            # process. Persistence strips container ids from snapshots, so any
+            # ministack-labelled container alive at boot is by definition an
+            # orphan whose name will collide on next create.
+            _stop_docker_containers()
             if PERSIST_STATE:
                 _load_persisted_state()
             # Start the Transfer Family SFTP listener after persistence is
@@ -1185,7 +1190,8 @@ def _stop_docker_containers():
         return
     for label in ("ministack=rds", "ministack=ecs", "ministack=elasticache", "ministack=eks", "ministack=lambda"):
         try:
-            for c in client.containers.list(filters={"label": label}):
+            # all=True so exited-but-not-removed orphans get cleaned at boot.
+            for c in client.containers.list(all=True, filters={"label": label}):
                 try:
                     c.stop(timeout=5)
                     c.remove(v=True)
