@@ -1379,6 +1379,10 @@ def main():
     args = parser.parse_args()
 
     port = int(_resolve_port())
+    # BIND_HOST controls the bind interface; defaults to 0.0.0.0 (existing
+    # behaviour). Distinct from MINISTACK_HOST, which is the virtual hostname
+    # used for S3 virtual-host / execute-api URL matching.
+    bind_host = os.environ.get("BIND_HOST", "0.0.0.0")
 
     if args.stop:
         pf = _pid_file(port)
@@ -1395,9 +1399,12 @@ def main():
         os.remove(pf)
         return
 
+    # 0.0.0.0 binds every interface so 127.0.0.1 always works as a probe;
+    # for an explicit BIND_HOST, probe that host directly.
+    probe_host = "127.0.0.1" if bind_host == "0.0.0.0" else bind_host
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        if s.connect_ex(("127.0.0.1", port)) == 0:
-            print(f"ERROR: Port {port} is already in use. Is MiniStack already running?\n"
+        if s.connect_ex((probe_host, port)) == 0:
+            print(f"ERROR: {probe_host}:{port} is already in use. Is MiniStack already running?\n"
                   f"  Stop it with: ministack --stop\n"
                   f"  Or use a different port: GATEWAY_PORT=4567 ministack")
             raise SystemExit(1)
@@ -1411,7 +1418,7 @@ def main():
         log_fh = open(log_file, "w")
         proc = subprocess.Popen(
             [sys.executable, "-m", "hypercorn", "ministack.app:app",
-             "--bind", f"0.0.0.0:{port}",
+             "--bind", f"{bind_host}:{port}",
              "--log-level", LOG_LEVEL.upper(),
              "--keep-alive", "75"],
             stdout=log_fh,
@@ -1450,7 +1457,7 @@ def main():
         logging.getLogger("hypercorn.access").addFilter(_HealthLogFilter())
 
         config = HypercornConfig()
-        config.bind = [f"0.0.0.0:{port}"]
+        config.bind = [f"{bind_host}:{port}"]
         config.keep_alive_timeout = 75
         config.loglevel = LOG_LEVEL.upper()
 

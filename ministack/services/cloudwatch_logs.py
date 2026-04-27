@@ -70,6 +70,9 @@ _deliveries = AccountScopedDict()
 def get_state():
     return {
         "log_groups": copy.deepcopy(_log_groups),
+        "destinations": copy.deepcopy(_destinations),
+        "metric_filters": copy.deepcopy(_metric_filters),
+        "queries": copy.deepcopy(_queries),
         "delivery_sources": copy.deepcopy(_delivery_sources),
         "delivery_destinations": copy.deepcopy(_delivery_destinations),
         "deliveries": copy.deepcopy(_deliveries),
@@ -79,6 +82,9 @@ def get_state():
 def restore_state(data):
     if data:
         _log_groups.update(data.get("log_groups", {}))
+        _destinations.update(data.get("destinations", {}))
+        _metric_filters.update(data.get("metric_filters", {}))
+        _queries.update(data.get("queries", {}))
         _delivery_sources.update(data.get("delivery_sources", {}))
         _delivery_destinations.update(data.get("delivery_destinations", {}))
         _deliveries.update(data.get("deliveries", {}))

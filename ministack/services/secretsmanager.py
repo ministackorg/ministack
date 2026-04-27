@@ -42,12 +42,16 @@ _resource_policies = AccountScopedDict()
 # ── Persistence ────────────────────────────────────────────
 
 def get_state():
-    return {"secrets": copy.deepcopy(_secrets)}
+    return {
+        "secrets": copy.deepcopy(_secrets),
+        "resource_policies": copy.deepcopy(_resource_policies),
+    }
 
 
 def restore_state(data):
     if data:
         _secrets.update(data.get("secrets", {}))
+        _resource_policies.update(data.get("resource_policies", {}))
 
 
 try:

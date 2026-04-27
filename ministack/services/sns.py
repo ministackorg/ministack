@@ -58,13 +58,20 @@ _platform_endpoints = AccountScopedDict()
 # ── Persistence ────────────────────────────────────────────
 
 def get_state():
-    return {"topics": copy.deepcopy(_topics), "sub_arn_to_topic": copy.deepcopy(_sub_arn_to_topic)}
+    return {
+        "topics": copy.deepcopy(_topics),
+        "sub_arn_to_topic": copy.deepcopy(_sub_arn_to_topic),
+        "platform_applications": copy.deepcopy(_platform_applications),
+        "platform_endpoints": copy.deepcopy(_platform_endpoints),
+    }
 
 
 def restore_state(data):
     if data:
         _topics.update(data.get("topics", {}))
         _sub_arn_to_topic.update(data.get("sub_arn_to_topic", {}))
+        _platform_applications.update(data.get("platform_applications", {}))
+        _platform_endpoints.update(data.get("platform_endpoints", {}))
 
 
 try:
