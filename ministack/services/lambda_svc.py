@@ -413,6 +413,26 @@ def _fetch_code_from_s3(bucket: str, key: str) -> bytes | None:
     return None
 
 
+_UNZIPPED_LIMIT_BYTES = 262144000  # 250 MiB — AWS hard limit
+
+
+def _validate_unzipped_size(zip_data: bytes | None):
+    if not zip_data:
+        return None
+    try:
+        with zipfile.ZipFile(io.BytesIO(zip_data)) as zf:
+            unzipped_size = sum(info.file_size for info in zf.infolist())
+    except zipfile.BadZipFile:
+        return None
+    if unzipped_size > _UNZIPPED_LIMIT_BYTES:
+        return error_response_json(
+            "InvalidParameterValueException",
+            f"Unzipped size must be smaller than {_UNZIPPED_LIMIT_BYTES} bytes",
+            400,
+        )
+    return None
+
+
 def _build_config(name: str, data: dict, code_zip: bytes | None = None) -> dict:
     code_size = len(code_zip) if code_zip else 0
     code_sha = base64.b64encode(hashlib.sha256(code_zip).digest()).decode() if code_zip else ""
@@ -804,6 +824,10 @@ def _create_function(data: dict):
     elif "S3Bucket" in code_data and "S3Key" in code_data:
         code_zip = _fetch_code_from_s3(code_data["S3Bucket"], code_data["S3Key"])
 
+    err = _validate_unzipped_size(code_zip)
+    if err is not None:
+        return err
+
     if image_uri:
         data.setdefault("PackageType", "Image")
 
@@ -1163,6 +1187,9 @@ def _update_code(name: str, data: dict):
                 f"Failed to fetch code from s3://{data['S3Bucket']}/{data['S3Key']}",
                 400,
             )
+    err = _validate_unzipped_size(code_zip)
+    if err is not None:
+        return err
     if code_zip:
         func["code_zip"] = code_zip
         func["config"]["CodeSize"] = len(code_zip)
@@ -3348,18 +3375,9 @@ def _publish_layer_version(layer_name: str, data: dict):
     elif "S3Bucket" in content and "S3Key" in content:
         zip_data = _fetch_code_from_s3(content["S3Bucket"], content["S3Key"])
 
-    if zip_data:
-        try:
-            with zipfile.ZipFile(io.BytesIO(zip_data)) as zf:
-                unzipped_size = sum(info.file_size for info in zf.infolist())
-            if unzipped_size > 262144000:
-                return error_response_json(
-                    "InvalidParameterValueException",
-                    "Unzipped size must be smaller than 262144000 bytes",
-                    400,
-                )
-        except zipfile.BadZipFile:
-            pass
+    err = _validate_unzipped_size(zip_data)
+    if err is not None:
+        return err
 
     ver_config: dict = {
         "LayerArn": _layer_arn(layer_name),

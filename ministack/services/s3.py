@@ -3102,21 +3102,52 @@ def _list_parts(bucket_name: str, key: str, query_params: dict):
 # ---------------------------------------------------------------------------
 
 
+def _object_disk_path(bucket: str, key: str, account_id: str = None) -> str | None:
+    """Resolve the on-disk path for an object and verify it lives under DATA_DIR.
+
+    Returns None if the resolved path escapes DATA_DIR (e.g. key contains `..`
+    or absolute path). Callers must treat None as "skip operation".
+    """
+    if account_id is None:
+        account_id = get_account_id()
+    root = os.path.realpath(DATA_DIR)
+    candidate = os.path.realpath(os.path.join(DATA_DIR, account_id, bucket, key))
+    try:
+        if os.path.commonpath([root, candidate]) != root:
+            logger.warning("S3 persist: path traversal blocked for %s/%s", bucket, key)
+            return None
+    except ValueError:
+        # commonpath raises on mixed drives / unrelated paths — treat as escape.
+        logger.warning("S3 persist: path traversal blocked for %s/%s", bucket, key)
+        return None
+    return candidate
+
+
+def _atomic_write(fpath: str, data: bytes, *, text: bool = False):
+    """Write `data` to `fpath` atomically with mode 0o600."""
+    tmp = fpath + ".tmp"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    fd = os.open(tmp, flags, 0o600)
+    try:
+        with os.fdopen(fd, "w" if text else "wb") as f:
+            f.write(data)
+    except Exception:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+    os.replace(tmp, fpath)
+
+
 def _persist_object(bucket: str, key: str, obj):
     try:
-        account_id = get_account_id()
-        fpath = os.path.realpath(os.path.join(DATA_DIR, account_id, bucket, key))
-        if not fpath.startswith(os.path.realpath(DATA_DIR)):
-            logger.warning("S3 persist: path traversal blocked for %s/%s", bucket, key)
+        fpath = _object_disk_path(bucket, key)
+        if fpath is None:
             return
-        os.makedirs(os.path.dirname(fpath), exist_ok=True)
+        os.makedirs(os.path.dirname(fpath), mode=0o700, exist_ok=True)
         data = obj["body"] if isinstance(obj, dict) else obj
-        # Atomic write: write to temp file then rename to avoid
-        # concurrent readers seeing partial content.
-        tmp = fpath + ".tmp"
-        with open(tmp, "wb") as f:
-            f.write(data)
-        os.replace(tmp, fpath)
+        _atomic_write(fpath, data)
         if isinstance(obj, dict):
             meta = {
                 "content_type": obj.get("content_type", "application/octet-stream"),
@@ -3127,22 +3158,12 @@ def _persist_object(bucket: str, key: str, obj):
                 "metadata": obj.get("metadata", {}),
                 "preserved_headers": obj.get("preserved_headers", {}),
             }
-            tmp_meta = fpath + ".meta.json.tmp"
-            with open(tmp_meta, "w") as mf:
-                json.dump(meta, mf)
-            os.replace(tmp_meta, fpath + ".meta.json")
+            _atomic_write(fpath + ".meta.json", json.dumps(meta), text=True)
         # Drop body from in-memory record to save RAM
         if isinstance(obj, dict):
             obj["body"] = None
     except Exception as e:
         logger.warning("Failed to persist S3 object %s/%s: %s", bucket, key, e)
-
-
-def _object_disk_path(bucket: str, key: str, account_id: str = None):
-    """Return the resolved filesystem path for a persisted object."""
-    if account_id is None:
-        account_id = get_account_id()
-    return os.path.realpath(os.path.join(DATA_DIR, account_id, bucket, key))
 
 
 def _read_body(bucket_name: str, key: str, obj: dict) -> bytes:
@@ -3154,6 +3175,8 @@ def _read_body(bucket_name: str, key: str, obj: dict) -> bytes:
         return b""
     try:
         fpath = _object_disk_path(bucket_name, key)
+        if fpath is None:
+            return b""
         with open(fpath, "rb") as f:
             return f.read()
     except Exception as e:
@@ -3167,6 +3190,8 @@ def _delete_persisted_object(bucket_name: str, key: str):
         return
     try:
         fpath = _object_disk_path(bucket_name, key)
+        if fpath is None:
+            return
         if os.path.exists(fpath):
             os.remove(fpath)
         meta_path = fpath + ".meta.json"
