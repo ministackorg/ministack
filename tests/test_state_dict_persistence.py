@@ -217,8 +217,13 @@ def test_ecs_module_reload_with_persisted_attributes_does_not_namerror():
 # ── Generic NameError-at-import regression for ALL persisted services ─
 
 def _persisted_services():
-    """Yield (svc_key, mod_name) pairs for everything in _state_map.
-    Lazy-loaded so the test pulls fresh state on every run."""
+    """Return a sorted list of ``(svc_key, mod_name)`` pairs from
+    ``ministack.app._state_map``.
+
+    Evaluated by ``@pytest.mark.parametrize(...)`` at test collection
+    time — `_state_map` is therefore imported when pytest collects this
+    module, NOT lazily per test case. (Calling it inside the parametrize
+    decorator means it runs once, at collection.)"""
     from ministack.app import _state_map
     return sorted(_state_map.items())
 
@@ -257,41 +262,38 @@ def test_module_cold_import_with_typical_snapshot_does_not_log_restore_failure(
     populated state — see the per-service tests above).
     """
     import sys
-    import tempfile
-    monkeypatch_persistence = pytest.MonkeyPatch()
-    monkeypatch_persistence.setattr(persistence, "PERSIST_STATE", True)
-    with tempfile.TemporaryDirectory() as td:
-        monkeypatch_persistence.setattr(persistence, "STATE_DIR", td)
 
-        # Step 1+2: produce + persist a snapshot using the already-loaded
-        # module (so we get a valid get_state() shape).
-        mod = _module(mod_name)
-        if hasattr(mod, "reset"):
-            mod.reset()
-        persistence.save_state(svc_key, mod.get_state())
+    # Persistence is already enabled and STATE_DIR is already pointed at
+    # a per-test tmp by the autouse `_enable_persistence` fixture.
 
-        # Step 3: cold-import — wipe sys.modules and re-import.
-        # importlib.reload() won't work because it merges into the
-        # existing namespace; the late-declared symbol stays bound from
-        # the prior import.
-        full_name = f"ministack.services.{mod_name}"
-        sys.modules.pop(full_name, None)
+    # Step 1+2: produce + persist a snapshot using the already-loaded
+    # module (so we get a valid get_state() shape).
+    mod = _module(mod_name)
+    if hasattr(mod, "reset"):
+        mod.reset()
+    persistence.save_state(svc_key, mod.get_state())
 
-        caplog.clear()
-        with caplog.at_level("WARNING"):
-            mod = importlib.import_module(full_name)
+    # Step 3: cold-import — wipe sys.modules and re-import.
+    # importlib.reload() won't work because it merges into the
+    # existing namespace; the late-declared symbol stays bound from
+    # the prior import.
+    full_name = f"ministack.services.{mod_name}"
+    sys.modules.pop(full_name, None)
 
-        bad = [
-            r for r in caplog.records
-            if r.levelno >= 30  # WARNING+
-            and any(needle in r.getMessage().lower()
-                    for needle in ("failed to restore", "restore failed",
-                                   "continuing fresh", "continuing with fresh"))
-        ]
-        if hasattr(mod, "reset"):
-            mod.reset()
+    caplog.clear()
+    with caplog.at_level("WARNING"):
+        mod = importlib.import_module(full_name)
 
-    monkeypatch_persistence.undo()
+    bad = [
+        r for r in caplog.records
+        if r.levelno >= 30  # WARNING+
+        and any(needle in r.getMessage().lower()
+                for needle in ("failed to restore", "restore failed",
+                               "continuing fresh", "continuing with fresh"))
+    ]
+    if hasattr(mod, "reset"):
+        mod.reset()
+
     assert not bad, (
         f"Cold import of `{mod_name}` (state-key `{svc_key}`) emitted "
         f"a restore-failure log:\n  "
