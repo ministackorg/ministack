@@ -6,13 +6,14 @@ but the dict is missing from `get_state()` and/or `restore_state()`. With
 PERSIST_STATE=1, every record stored via that API silently disappears on
 the next restart.
 
-This file covers four such drops surfaced by the persistence-symmetry
-audit:
+This file covers five distinct state-dict persistence drops surfaced by
+the persistence-symmetry audit:
 
   H-1  secretsmanager._resource_policies
-  H-3  kinesis._consumers          (enhanced fan-out)
-  H-4  ecs._attributes             (PutAttributes / ListAttributes)
-  H-5  sns._platform_applications + sns._platform_endpoints
+  H-3  kinesis._consumers             (enhanced fan-out)
+  H-4  ecs._attributes                (PutAttributes / ListAttributes)
+  H-5  sns._platform_applications
+  H-5  sns._platform_endpoints
 
 Each test populates the dict, snapshots state via the public
 `get_state()` / `restore_state()` contract, simulates a restart, and
