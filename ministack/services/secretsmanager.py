@@ -42,12 +42,16 @@ _resource_policies = AccountScopedDict()
 # ── Persistence ────────────────────────────────────────────
 
 def get_state():
-    return {"secrets": copy.deepcopy(_secrets)}
+    return {
+        "secrets": copy.deepcopy(_secrets),
+        "resource_policies": copy.deepcopy(_resource_policies),
+    }
 
 
 def restore_state(data):
     if data:
         _secrets.update(data.get("secrets", {}))
+        _resource_policies.update(data.get("resource_policies", {}))
 
 
 try:
@@ -414,6 +418,11 @@ def _delete_secret(data):
     if force:
         arn, sname = secret["ARN"], secret["Name"]
         del _secrets[key]
+        # Clean up any associated resource policy too — otherwise it
+        # lingers as an orphan keyed by the now-deleted ARN, invisible
+        # to the API but still consuming memory and surviving warm
+        # boot via the persistence path.
+        _resource_policies.pop(arn, None)
         return json_response({"ARN": arn, "Name": sname, "DeletionDate": deletion_date})
 
     secret["DeletedDate"] = deletion_date

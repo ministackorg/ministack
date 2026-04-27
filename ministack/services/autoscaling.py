@@ -14,12 +14,14 @@ Supports:
   Tags:      CreateOrUpdateTags, DescribeTags, DeleteTags
 """
 
+import copy
 import logging
 import os
 import time
 from collections import defaultdict
 
 from ministack.core.responses import AccountScopedDict, get_account_id, new_uuid, now_iso, get_region
+from ministack.core.persistence import load_state
 
 logger = logging.getLogger("autoscaling")
 REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
@@ -30,9 +32,6 @@ _policies = AccountScopedDict()
 _hooks = AccountScopedDict()
 _scheduled_actions = AccountScopedDict()
 _tags = AccountScopedDict()  # asg_name -> [{"Key":..., "Value":...}, ...]
-
-
-import copy
 
 
 def get_state():
@@ -54,6 +53,14 @@ def restore_state(data):
         _hooks.update(data.get("hooks", {}))
         _scheduled_actions.update(data.get("scheduled_actions", {}))
         _tags.update(data.get("tags", {}))
+
+
+try:
+    _restored = load_state("autoscaling")
+    if _restored:
+        restore_state(_restored)
+except Exception:
+    logger.exception("Failed to restore persisted autoscaling state; continuing fresh")
 
 
 def reset():

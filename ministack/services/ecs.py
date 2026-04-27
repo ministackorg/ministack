@@ -53,6 +53,12 @@ _tasks = AccountScopedDict()
 _tags = AccountScopedDict()
 _account_settings = AccountScopedDict()
 _capacity_providers = AccountScopedDict()
+# `_attributes` was originally declared next to its handler block much
+# further down the file. Moved up here so the import-time `load_state`
+# block (which calls `restore_state` and references `_attributes`) sees
+# it defined; otherwise warm-boot fires NameError, the surrounding
+# try/except swallows it, and ALL ECS state silently fails to restore.
+_attributes = AccountScopedDict()
 
 _docker = None
 
@@ -108,6 +114,7 @@ def get_state():
         "tags": copy.deepcopy(_tags),
         "account_settings": copy.deepcopy(_account_settings),
         "capacity_providers": copy.deepcopy(_capacity_providers),
+        "attributes": copy.deepcopy(_attributes),
     }
     # Save tasks but strip Docker container IDs.
     # Iterate _data directly to capture ALL accounts.
@@ -131,6 +138,7 @@ def restore_state(data):
     _tags.update(data.get("tags", {}))
     _account_settings.update(data.get("account_settings", {}))
     _capacity_providers.update(data.get("capacity_providers", {}))
+    _attributes.update(data.get("attributes", {}))
     from ministack.core.responses import AccountScopedDict
     tasks_data = data.get("tasks", {})
     if isinstance(tasks_data, AccountScopedDict):
@@ -1494,9 +1502,9 @@ def _delete_account_setting(data):
 
 # ---------------------------------------------------------------------------
 # Attributes (PutAttributes / DeleteAttributes / ListAttributes)
+# (state dict `_attributes` is declared at module top with the other
+# state — see the comment there for why.)
 # ---------------------------------------------------------------------------
-
-_attributes = AccountScopedDict()
 
 def _put_attributes(data):
     attrs = data.get("attributes", [])

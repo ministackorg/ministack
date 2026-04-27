@@ -141,6 +141,13 @@ def restore_state(data):
             for tk in ("ReplayStartTime", "ReplayEndTime", "EventStartTime", "EventEndTime"):
                 if tk in rep and rep[tk] is not None:
                     rep[tk] = _coerce_timestamp(rep[tk])
+            # Replays whose dispatch thread was running at shutdown can't
+            # resume — the thread is gone. Flip them to FAILED so persisted
+            # state never carries zombie RUNNING replays across restarts.
+            # Same precedent as Step Functions executions (stepfunctions.py).
+            if rep.get("State") in ("STARTING", "RUNNING"):
+                rep["State"] = "FAILED"
+                rep["ReplayEndTime"] = _now_ts()
 
 
 try:

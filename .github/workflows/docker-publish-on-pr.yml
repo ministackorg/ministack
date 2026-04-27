@@ -54,6 +54,8 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            MINISTACK_VERSION=pr-${{ github.event.pull_request.number }}-${{ steps.short_sha.outputs.short_sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
