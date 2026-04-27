@@ -844,45 +844,23 @@ def test_lambda_standard_runtime_env_vars_injected(lam):
     # VERSION defaults to $LATEST for unpublished functions.
     assert payload["AWS_LAMBDA_FUNCTION_VERSION"] == "$LATEST"
 
-def test_lambda_endpoint_url_not_overridden_by_function_env(lam):
-    """AWS_ENDPOINT_URL from function env vars must not override the
-    process-level value.  When MiniStack runs in Docker, the host-mapped
-    port (e.g. 4568) is unreachable from inside the container — the
-    Lambda binary must always use MiniStack's internal endpoint.
+def test_lambda_function_env_overrides_endpoint_url(lam):
+    """Function ``Environment.Variables.AWS_ENDPOINT_URL`` wins over the
+    host process value, matching real AWS Lambda behavior.
 
-    This test verifies that the MiniStack server's AWS_ENDPOINT_URL takes
-    precedence over function-level env vars.  It requires the server to
-    have AWS_ENDPOINT_URL set (as it does when running via docker-compose).
+    Real AWS does not inject ``AWS_ENDPOINT_URL`` — it is an SDK/testing
+    convention — so a function-level value is the user's authoritative
+    configuration and must not be silently overridden by MiniStack.
+    Precedence is: function Environment.Variables → host AWS_ENDPOINT_URL
+    → MiniStack's internal default.
     """
-    # Verify the MiniStack server has AWS_ENDPOINT_URL set by checking
-    # a baseline Lambda.  If the server doesn't have it, the override
-    # logic has nothing to restore and this test is not meaningful.
-    probe_code = (
-        "import os\n"
-        "def handler(event, context):\n"
-        "    return {'endpoint': os.environ.get('AWS_ENDPOINT_URL', '')}\n"
-    )
-    probe_name = f"lam-endpoint-probe-{_uuid_mod.uuid4().hex[:8]}"
-    lam.create_function(
-        FunctionName=probe_name,
-        Runtime="python3.11",
-        Role=_LAMBDA_ROLE,
-        Handler="index.handler",
-        Code={"ZipFile": _make_zip(probe_code)},
-    )
-    resp = lam.invoke(FunctionName=probe_name, Payload=b"{}")
-    server_endpoint = json.loads(resp["Payload"].read()).get("endpoint", "")
-    if not server_endpoint:
-        pytest.skip("MiniStack server does not have AWS_ENDPOINT_URL set "
-                     "(run with docker-compose to test endpoint override)")
-
-    # Now test with a function that sets a conflicting AWS_ENDPOINT_URL.
     code = (
         "import os\n"
         "def handler(event, context):\n"
         "    return {'endpoint': os.environ.get('AWS_ENDPOINT_URL', 'unset')}\n"
     )
     fname = f"lam-endpoint-override-{_uuid_mod.uuid4().hex[:8]}"
+    function_endpoint = "http://function-scoped-endpoint:9999"
     lam.create_function(
         FunctionName=fname,
         Runtime="python3.11",
@@ -890,16 +868,14 @@ def test_lambda_endpoint_url_not_overridden_by_function_env(lam):
         Handler="index.handler",
         Code={"ZipFile": _make_zip(code)},
         Environment={"Variables": {
-            "AWS_ENDPOINT_URL": "http://should-be-overridden:9999",
+            "AWS_ENDPOINT_URL": function_endpoint,
         }},
     )
     resp = lam.invoke(FunctionName=fname, Payload=b"{}")
     payload = json.loads(resp["Payload"].read())
-    # The Lambda must see the server's endpoint, not the function env var.
-    assert payload["endpoint"] != "http://should-be-overridden:9999", (
-        "Function-level AWS_ENDPOINT_URL must not override internal endpoint"
+    assert payload["endpoint"] == function_endpoint, (
+        "Function-level AWS_ENDPOINT_URL must win over host/internal default"
     )
-    assert payload["endpoint"] == server_endpoint
 
 
 def test_lambda_dynamodb_stream_esm(lam, ddb):

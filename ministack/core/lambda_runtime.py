@@ -433,15 +433,16 @@ class Worker:
         spawn_env.setdefault("AWS_ACCESS_KEY_ID", os.environ.get("AWS_ACCESS_KEY_ID", "test"))
         spawn_env.setdefault("AWS_SECRET_ACCESS_KEY", os.environ.get("AWS_SECRET_ACCESS_KEY", "test"))
         spawn_env.setdefault("AWS_SESSION_TOKEN", os.environ.get("AWS_SESSION_TOKEN", ""))
-        # AWS_ENDPOINT_URL must always point at the internal MiniStack endpoint
-        # so SDK calls from the Lambda reach this instance.  This UNCONDITIONALLY
-        # overrides any function-level AWS_ENDPOINT_URL — function env vars must
-        # not redirect SDK traffic to an unreachable host-mapped port.
-        # Precedence: host process value (if set) > internal default.
+        # AWS_ENDPOINT_URL precedence matches real AWS: function
+        # Environment.Variables wins, then host env, then the internal
+        # default that points at this MiniStack instance.  Real AWS Lambda
+        # does not inject AWS_ENDPOINT_URL — it is an SDK/testing convention
+        # — so function-level values must be respected.  spawn_env was built
+        # as {**os.environ, **env_vars}, so any function-level value is
+        # already present; setdefault only fills in the default when neither
+        # the function nor the host set one.
         port = os.environ.get("GATEWAY_PORT", os.environ.get("EDGE_PORT", "4566"))
-        spawn_env["AWS_ENDPOINT_URL"] = os.environ.get(
-            "AWS_ENDPOINT_URL", f"http://127.0.0.1:{port}"
-        )
+        spawn_env.setdefault("AWS_ENDPOINT_URL", f"http://127.0.0.1:{port}")
         if "LOCALSTACK_HOSTNAME" in os.environ:
             spawn_env["LOCALSTACK_HOSTNAME"] = os.environ["LOCALSTACK_HOSTNAME"]
         spawn_env.setdefault("LAMBDA_TASK_ROOT", code_dir)
@@ -491,19 +492,11 @@ class Worker:
         )
         self._stderr_thread.start()
 
-        # Strip protected vars from the init payload so the worker's
-        # os.environ.update(env) call cannot override our spawn_env values
-        # post-startup.  AWS_ENDPOINT_URL must always point at MiniStack —
-        # function-level overrides would redirect SDK calls to unreachable
-        # host-mapped ports.
-        _PROTECTED = {"AWS_ENDPOINT_URL"}
-        init_env = {k: v for k, v in env_vars.items() if k not in _PROTECTED}
-
         init = {
             "code_dir": code_dir,
             "module": module_name,
             "handler": handler_name,
-            "env": init_env,
+            "env": env_vars,
             "function_name": self.config.get("FunctionName", ""),
             "memory": self.config.get("MemorySize", 128),
             "arn": self.config.get("FunctionArn", ""),
