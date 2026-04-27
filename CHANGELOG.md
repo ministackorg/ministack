@@ -6,6 +6,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
+
+## [Unreleased]
+
+### Added
+- **`BIND_HOST` env var to configure the listen interface** — the bind interface was previously hard-coded to `0.0.0.0` (no env var, no CLI flag). Setting `BIND_HOST=127.0.0.1 ministack` now restricts MiniStack to loopback (useful on shared dev machines or when a `pip install` user wants tighter network exposure). Defaults to `0.0.0.0`, so existing setups behave identically. Distinct from `MINISTACK_HOST` (the *virtual* hostname used for S3 virtual-host / execute-api URL matching) — `BIND_HOST` is the TCP listen interface only. Docker users can keep using `docker run -p 127.0.0.1:4566:4566 …` as before; this is for the `pip install ministack` path.
+
+---
 ## [1.3.15] — 2026-04-26
 
 ### Added
