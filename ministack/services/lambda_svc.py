@@ -3348,6 +3348,19 @@ def _publish_layer_version(layer_name: str, data: dict):
     elif "S3Bucket" in content and "S3Key" in content:
         zip_data = _fetch_code_from_s3(content["S3Bucket"], content["S3Key"])
 
+    if zip_data:
+        try:
+            with zipfile.ZipFile(io.BytesIO(zip_data)) as zf:
+                unzipped_size = sum(info.file_size for info in zf.infolist())
+            if unzipped_size > 262144000:
+                return error_response_json(
+                    "InvalidParameterValueException",
+                    "Unzipped size must be smaller than 262144000 bytes",
+                    400,
+                )
+        except zipfile.BadZipFile:
+            pass
+
     ver_config: dict = {
         "LayerArn": _layer_arn(layer_name),
         "LayerVersionArn": f"{_layer_arn(layer_name)}:{ver}",
