@@ -22,9 +22,15 @@ client-side null-stripping (L-2).
 """
 import importlib
 import json
+import os
 import urllib.request
 
 import pytest
+
+# Match the project convention from tests/conftest.py — honours
+# `MINISTACK_ENDPOINT` so tests run unchanged against a non-default
+# host / port (Docker networking, alternate CI bind, etc.).
+ENDPOINT = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
 
 
 def _module(name):
@@ -139,7 +145,7 @@ def test_acm_list_certificates_omits_nexttoken_when_no_more_pages():
     Asserted at the wire level via raw HTTP to bypass boto3's null
     stripping."""
     req = urllib.request.Request(
-        "http://127.0.0.1:4566/",
+        ENDPOINT.rstrip("/") + "/",
         method="POST",
         headers={
             "x-amz-target": "CertificateManager.ListCertificates",
