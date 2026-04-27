@@ -62,15 +62,20 @@ def test_auth_codes_survive_warm_boot():
     mod = _module()
     mod.reset()
 
+    # Match the actual production payload shape written by the SAML/OIDC
+    # callback handler in `cognito.py` — `type: "code"` entries store
+    # `scopes` as a space-separated string (copied from `relay["scope"]`)
+    # and have no `state` field (state lives on the sibling `type: "relay"`
+    # entry that this code-type one is created from).
     relay_state = "test-relay-12345"
     mod._auth_codes[relay_state] = {
         "type": "code",
         "pool_id": "us-east-1_TestPool",
         "client_id": "client-id-abc",
         "username": "user@example.com",
+        "sub": "user-sub-12345",
         "redirect_uri": "https://app.example.com/callback",
-        "scopes": ["openid", "email"],
-        "state": "client-state-xyz",
+        "scopes": "openid email",
         "created_at": 1700000000.0,
     }
 
@@ -85,22 +90,28 @@ def test_auth_codes_survive_warm_boot():
     mod.reset()
 
 
-def test_auth_codes_dict_types_not_account_scoped():
+def test_auth_codes_dict_types_are_plain_builtin_dict():
     """Belt-and-braces: assert that `_auth_codes` and
-    `_authorization_codes` remain plain dicts (NOT AccountScopedDict).
+    `_authorization_codes` remain plain built-in `dict` instances —
+    not AccountScopedDict, not any other dict-like wrapper.
 
     These dicts are looked up by random unguessable token from a public
     OAuth2 callback with no AWS auth context. Wrapping them in
-    AccountScopedDict would make the callback lookup happen under a
-    default account, invisible to codes issued under any other tenant —
+    AccountScopedDict (or anything else with request-scoped lookup
+    semantics) would make the callback lookup happen under a default
+    account, invisible to codes issued under any other tenant —
     breaking the entire OAuth2 flow. This test pins the type so a
-    well-meaning future refactor doesn't silently break OAuth2."""
-    mod = _module()
-    from ministack.core.responses import AccountScopedDict
+    well-meaning future refactor doesn't silently break OAuth2.
 
-    assert not isinstance(mod._auth_codes, AccountScopedDict), (
-        "_auth_codes must remain a plain dict — see the docstring for why."
+    `type(x) is dict` (strict identity) catches not just AccountScopedDict
+    but also any other Mapping subclass that might quietly slip in."""
+    mod = _module()
+
+    assert type(mod._auth_codes) is dict, (
+        "_auth_codes must remain a plain built-in dict — see the "
+        "docstring for why."
     )
-    assert not isinstance(mod._authorization_codes, AccountScopedDict), (
-        "_authorization_codes must remain a plain dict — same reason."
+    assert type(mod._authorization_codes) is dict, (
+        "_authorization_codes must remain a plain built-in dict — same "
+        "reason."
     )
