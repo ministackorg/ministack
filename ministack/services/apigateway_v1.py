@@ -1257,7 +1257,8 @@ def _put_integration(api_id, resource_id, http_method, data):
         "integrationResponses": {},
     }
     method_obj["methodIntegration"] = integration
-    return _v1_response(integration)
+    # Real AWS returns HTTP 201 Created for PutIntegration.
+    return _v1_response(integration, 201)
 
 
 def _get_integration(api_id, resource_id, http_method):

@@ -1147,7 +1147,9 @@ def _start_replay(data):
     t = threading.Thread(target=_run, daemon=True)
     t.start()
 
-    return json_response({"ReplayArn": arn, "State": "RUNNING"})
+    # Real AWS StartReplay returns the initial state STARTING; the
+    # replay flips to RUNNING in the background dispatch thread above.
+    return json_response({"ReplayArn": arn, "State": "STARTING"})
 
 
 def _describe_replay(data):

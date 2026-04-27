@@ -444,10 +444,12 @@ def test_eventbridge_replay_lifecycle(eb):
         EventEndTime=t1,
         Destination={"Arn": bus_arn},
     )
-    assert start["State"] == "RUNNING"
+    # Real AWS returns STARTING as the immediate state; the background
+    # dispatch flips through RUNNING to COMPLETED.
+    assert start["State"] == "STARTING"
     desc = eb.describe_replay(ReplayName=rep_name)
     assert desc["ReplayName"] == rep_name
-    assert desc["State"] in ("RUNNING", "COMPLETED")
+    assert desc["State"] in ("STARTING", "RUNNING", "COMPLETED")
     listed = eb.list_replays(NamePrefix=rep_name)
     assert any(r["ReplayName"] == rep_name for r in listed["Replays"])
     from botocore.exceptions import ClientError as _CE
@@ -829,6 +831,27 @@ def test_eventbridge_archive_filters_by_pattern(eb):
     )
     desc = eb.describe_archive(ArchiveName=arch_name)
     assert desc["EventCount"] == 0
+    eb.delete_archive(ArchiveName=arch_name)
+
+
+def test_eventbridge_start_replay_initial_state_is_starting(eb):
+    """StartReplay's immediate response must return State=STARTING per the
+    AWS Replay state machine (STARTING → RUNNING → COMPLETED). The
+    background dispatch thread flips it to RUNNING then COMPLETED — but
+    callers reading the start_replay() return value must see STARTING."""
+    arch_name = f"replay-init-{_uuid_mod.uuid4().hex[:8]}"
+    bus_arn = "arn:aws:events:us-east-1:000000000000:event-bus/default"
+    eb.create_archive(ArchiveName=arch_name, EventSourceArn=bus_arn)
+    archive_arn = eb.describe_archive(ArchiveName=arch_name)["ArchiveArn"]
+    rep_name = f"rep-init-{_uuid_mod.uuid4().hex[:8]}"
+    resp = eb.start_replay(
+        ReplayName=rep_name,
+        EventSourceArn=archive_arn,
+        EventStartTime=0,
+        EventEndTime=time.time() + 3600,
+        Destination={"Arn": bus_arn},
+    )
+    assert resp["State"] == "STARTING", resp
     eb.delete_archive(ArchiveName=arch_name)
 
 

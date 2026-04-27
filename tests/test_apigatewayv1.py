@@ -184,6 +184,8 @@ def test_apigwv1_put_integration(apigw_v1):
         uri="arn:aws:apigateway:us-east-1:lambda:path/2015-03-31/functions/arn:aws:lambda:us-east-1:000000000000:function:myFunc/invocations",
     )
     assert resp["type"] == "AWS_PROXY"
+    # Real AWS returns HTTP 201 Created for PutIntegration.
+    assert resp["ResponseMetadata"]["HTTPStatusCode"] == 201
     apigw_v1.delete_rest_api(restApiId=api_id)
 
 def test_apigwv1_put_method_response(apigw_v1):

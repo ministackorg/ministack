@@ -51,6 +51,26 @@ def test_sts_assume_role(sts):
     assert "test-session" in assumed["Arn"]
     assert "AssumedRoleId" in assumed
 
+
+def test_sts_assumed_role_arn_uses_sts_service(sts):
+    """Real AWS returns AssumeRole's AssumedRoleUser.Arn under the sts
+    service, not iam — e.g. arn:aws:sts::123456789012:assumed-role/demo/Sess.
+    Pinning this against future regressions."""
+    resp = sts.assume_role(
+        RoleArn="arn:aws:iam::000000000000:role/demo",
+        RoleSessionName="TestAR",
+    )
+    arn = resp["AssumedRoleUser"]["Arn"]
+    assert arn == "arn:aws:sts::000000000000:assumed-role/demo/TestAR", arn
+
+    resp_wi = sts.assume_role_with_web_identity(
+        RoleArn="arn:aws:iam::000000000000:role/demo",
+        RoleSessionName="WebSess",
+        WebIdentityToken="dummy.jwt.token",
+    )
+    arn_wi = resp_wi["AssumedRoleUser"]["Arn"]
+    assert arn_wi == "arn:aws:sts::000000000000:assumed-role/demo/WebSess", arn_wi
+
 def test_sts_get_session_token(sts):
     resp = sts.get_session_token(DurationSeconds=900)
     creds = resp["Credentials"]
