@@ -2432,3 +2432,176 @@ def test_cfn_apigwv2_full_http_api_stack(cfn, apigw):
 
     assert apigw.get_integrations(ApiId=api_id)["Items"] == []
     assert apigw.get_routes(ApiId=api_id)["Items"] == []
+
+
+def test_cfn_apigwv2_integration_ref_returns_integration_id_alone(cfn, apigw):
+    """Regression: Ref on AWS::ApiGatewayV2::Integration must return the bare
+    integration ID (e.g. "abcd123"), NOT "{apiId}/{integrationId}".
+
+    Per AWS CloudFormation Template Reference:
+      "Ref returns the Integration resource ID, such as abcd123."
+      https://docs.aws.amazon.com/AWSCloudFormation/latest/TemplateReference/aws-resource-apigatewayv2-integration.html#aws-resource-apigatewayv2-integration-return-values
+
+    A Route's Target is built by substituting the Integration's Ref into
+    "integrations/${Integration}". If Ref returns "{apiId}/{integrationId}",
+    the route target becomes "integrations/{apiId}/{integrationId}", which
+    cannot be matched against the integration store at request time.
+    """
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "HttpApi": {
+                "Type": "AWS::ApiGatewayV2::Api",
+                "Properties": {"Name": "cfn-apigwv2-ref-t01", "ProtocolType": "HTTP"},
+            },
+            "Integration": {
+                "Type": "AWS::ApiGatewayV2::Integration",
+                "Properties": {
+                    "ApiId": {"Ref": "HttpApi"},
+                    "IntegrationType": "AWS_PROXY",
+                    "IntegrationUri": "arn:aws:lambda:us-east-1:000000000000:function:dummy",
+                    "PayloadFormatVersion": "2.0",
+                },
+            },
+            "Route": {
+                "Type": "AWS::ApiGatewayV2::Route",
+                "Properties": {
+                    "ApiId": {"Ref": "HttpApi"},
+                    "RouteKey": "GET /hello",
+                    "Target": {"Fn::Sub": "integrations/${Integration}"},
+                },
+            },
+        },
+        "Outputs": {
+            "IntegrationRef": {"Value": {"Ref": "Integration"}},
+            "ApiId": {"Value": {"Ref": "HttpApi"}},
+        },
+    }
+    stack_name = "cfn-apigwv2-ref-t01"
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(template))
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "CREATE_COMPLETE"
+
+    outputs = {o["OutputKey"]: o["OutputValue"] for o in stack.get("Outputs", [])}
+    api_id = outputs["ApiId"]
+    integration_ref = outputs["IntegrationRef"]
+
+    # The Integration Ref must be the bare integration ID (no slash).
+    integrations = apigw.get_integrations(ApiId=api_id)["Items"]
+    assert len(integrations) == 1
+    actual_int_id = integrations[0]["IntegrationId"]
+    assert integration_ref == actual_int_id, (
+        f"Ref returned {integration_ref!r}, expected bare integration ID "
+        f"{actual_int_id!r}. AWS spec requires Ref to return the integration "
+        f"ID alone, not '{{apiId}}/{{integrationId}}'."
+    )
+    assert "/" not in integration_ref, (
+        f"Ref returned {integration_ref!r} containing '/'. AWS returns just "
+        f"the integration ID, never a composite identifier."
+    )
+
+    # The route target should resolve to integrations/<int_id>, not
+    # integrations/<api_id>/<int_id>.
+    routes = apigw.get_routes(ApiId=api_id)["Items"]
+    assert len(routes) == 1
+    target = routes[0].get("Target", "")
+    assert target == f"integrations/{actual_int_id}", (
+        f"Route target is {target!r}, expected 'integrations/{actual_int_id}'. "
+        f"A malformed target prevents handle_execute() from matching the route "
+        f"to its integration at request time."
+    )
+
+    cfn.delete_stack(StackName=stack_name)
+    _wait_stack(cfn, stack_name)
+
+
+def test_cfn_apigwv2_full_http_api_stack_invokes_lambda(cfn, apigw, lam):
+    """Regression: an HTTP API deployed via CFN must actually route requests
+    through to the Lambda integration. PR #480's tests validated resource
+    creation and Fn::GetAtt but never sent a request through the deployed API,
+    so a broken physical_id (used by Ref) went undetected — every CFN-deployed
+    HTTP API returned 500 'No integration configured' at request time.
+    """
+    import urllib.request as _urlreq
+
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+    execute_port = urlparse(endpoint).port or 4566
+
+    fname = f"cfn-e2e-fn-{_uuid_mod.uuid4().hex[:8]}"
+    code = (
+        b"import json\n"
+        b"def handler(event, context):\n"
+        b"    return {\n"
+        b"        'statusCode': 200,\n"
+        b"        'headers': {'Content-Type': 'application/json'},\n"
+        b"        'body': json.dumps({'path': event.get('rawPath', '/'), 'ok': True}),\n"
+        b"    }\n"
+    )
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("index.py", code)
+    lam.create_function(
+        FunctionName=fname,
+        Runtime="python3.12",
+        Role="arn:aws:iam::000000000000:role/test-role",
+        Handler="index.handler",
+        Code={"ZipFile": buf.getvalue()},
+    )
+
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "HttpApi": {
+                "Type": "AWS::ApiGatewayV2::Api",
+                "Properties": {"Name": f"cfn-e2e-{fname}", "ProtocolType": "HTTP"},
+            },
+            "Stage": {
+                "Type": "AWS::ApiGatewayV2::Stage",
+                "Properties": {
+                    "ApiId": {"Ref": "HttpApi"},
+                    "StageName": "$default",
+                    "AutoDeploy": True,
+                },
+            },
+            "Integration": {
+                "Type": "AWS::ApiGatewayV2::Integration",
+                "Properties": {
+                    "ApiId": {"Ref": "HttpApi"},
+                    "IntegrationType": "AWS_PROXY",
+                    "IntegrationUri": f"arn:aws:lambda:us-east-1:000000000000:function:{fname}",
+                    "PayloadFormatVersion": "2.0",
+                },
+            },
+            "ProxyRoute": {
+                "Type": "AWS::ApiGatewayV2::Route",
+                "Properties": {
+                    "ApiId": {"Ref": "HttpApi"},
+                    "RouteKey": "ANY /{proxy+}",
+                    "Target": {"Fn::Sub": "integrations/${Integration}"},
+                },
+            },
+        },
+        "Outputs": {"ApiId": {"Value": {"Ref": "HttpApi"}}},
+    }
+    stack_name = f"cfn-e2e-{fname}"
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(template))
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "CREATE_COMPLETE"
+
+    outputs = {o["OutputKey"]: o["OutputValue"] for o in stack.get("Outputs", [])}
+    api_id = outputs["ApiId"]
+
+    # Send a real HTTP request through the deployed API.
+    url = f"http://{api_id}.execute-api.localhost:{execute_port}/$default/hello"
+    req = _urlreq.Request(url, method="GET")
+    req.add_header("Host", f"{api_id}.execute-api.localhost:{execute_port}")
+    resp = _urlreq.urlopen(req)
+    assert resp.status == 200, f"Expected 200, got {resp.status}"
+    body = json.loads(resp.read())
+    assert body["ok"] is True
+    assert body["path"] == "/hello"
+
+    # Cleanup
+    cfn.delete_stack(StackName=stack_name)
+    _wait_stack(cfn, stack_name)
+    lam.delete_function(FunctionName=fname)

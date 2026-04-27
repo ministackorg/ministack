@@ -2555,14 +2555,19 @@ def _apigw_v2_integration_create(logical_id, props, stack_name):
         "contentHandlingStrategy": props.get("ContentHandlingStrategy"),
     }
     _apigw_v2._integrations.setdefault(api_id, {})[int_id] = integration
-    physical_id = f"{api_id}/{int_id}"
-    return physical_id, {"IntegrationId": int_id}
+    # AWS returns just the integration ID as the physical ID (Ref).
+    # Store apiId in outputs so delete can find the right API.
+    return int_id, {"IntegrationId": int_id, "ApiId": api_id}
 
 
 def _apigw_v2_integration_delete(physical_id, props):
-    parts = physical_id.split("/", 1)
-    if len(parts) == 2:
-        api_id, int_id = parts
+    api_id = props.get("ApiId", "")
+    int_id = physical_id
+    # Backwards compat: old physical IDs were "{apiId}/{integrationId}"
+    if "/" in physical_id:
+        parts = physical_id.split("/", 1)
+        api_id, int_id = parts[0], parts[1]
+    if api_id:
         integrations = _apigw_v2._integrations.get(api_id, {})
         integrations.pop(int_id, None)
 

@@ -395,7 +395,9 @@ async def handle_execute(api_id, stage, path, method, headers, body, query_param
     if not route:
         return 404, {"Content-Type": "application/json"}, json.dumps({"message": "No route found"}).encode()
 
-    integration_id = route.get("target", "").replace("integrations/", "")
+    raw_target = route.get("target", "").replace("integrations/", "")
+    # Target may be "{integrationId}" or "{apiId}/{integrationId}" (CFN physical ID)
+    integration_id = raw_target.split("/")[-1] if "/" in raw_target else raw_target
     integration = _integrations.get(api_id, {}).get(integration_id)
     if not integration:
         return 500, {"Content-Type": "application/json"}, json.dumps({"message": "No integration configured"}).encode()
@@ -1126,7 +1128,9 @@ async def _invoke_ws_lambda(api_id: str, account_id: str, route: dict, stage: st
     from ministack.core.lambda_runtime import get_or_create_worker
     from ministack.services import lambda_svc
 
-    integration_id = route.get("target", "").replace("integrations/", "")
+    raw_target = route.get("target", "").replace("integrations/", "")
+    # Target may be "{integrationId}" or "{apiId}/{integrationId}" (CFN physical ID)
+    integration_id = raw_target.split("/")[-1] if "/" in raw_target else raw_target
     integration = _integrations.get(api_id, {}).get(integration_id)
     if not integration:
         return None
