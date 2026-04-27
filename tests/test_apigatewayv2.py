@@ -895,7 +895,14 @@ class _WSClient:
     """Blocking WebSocket client — just enough to drive tests."""
 
     def __init__(self, host: str, port: int, path: str, headers: dict | None = None):
-        self._sock = socket.create_connection((host, port), timeout=5)
+        # 30s instead of 5s: socket.create_connection sets both connect and
+        # recv timeout. The `$connect` Lambda invocation (cold-start +
+        # subprocess spawn under CI xdist contention on a 2-core Linux
+        # runner) can exceed 5s on the second WS attempt of tests that
+        # first reject without QS, then succeed with QS. The handshake
+        # itself is sub-ms once Lambda returns; 30s is well over worst
+        # observed cold-start latency without slowing real failures.
+        self._sock = socket.create_connection((host, port), timeout=30)
         key = base64.b64encode(os.urandom(16)).decode()
         request_headers = {
             "Host": f"{host}:{port}",

@@ -32,8 +32,13 @@ def _raw_post(path, body):
         headers={"Content-Type": "application/json"},
         method="POST",
     )
+    # 30s instead of 10s: under CI xdist contention the server's first
+    # call into _resolve_cluster triggers a lazy `from ministack.services
+    # import rds` whose import-time block can exceed 10s on the shared
+    # 2-core Linux runner. Handler itself is sub-ms once rds is loaded,
+    # so 30s leaves a wide margin without making real failures slow.
     try:
-        resp = urllib.request.urlopen(req, timeout=10)
+        resp = urllib.request.urlopen(req, timeout=30)
         return resp.status, json.loads(resp.read())
     except urllib.error.HTTPError as e:
         return e.code, json.loads(e.read())

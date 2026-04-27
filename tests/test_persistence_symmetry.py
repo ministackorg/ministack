@@ -82,6 +82,45 @@ def test_pipes_is_in_state_map():
     )
 
 
+def test_state_map_services_without_endpoint_are_eagerly_imported():
+    """Services in `_state_map` but NOT in `SERVICE_REGISTRY` have no
+    AWS endpoint, so the lazy router never imports them. Their
+    import-time `load_state()` block therefore never fires unless
+    `_load_persisted_state()` eagerly imports them at startup.
+
+    Without this, persisted RUNNING pipes don't resume their poller
+    after warm-boot until something else happens to import the
+    module (e.g. a new CFN pipe registration) — silently breaking
+    event forwarding for the entire window between restart and the
+    next pipe-related API call."""
+    from ministack.app import SERVICE_REGISTRY, _load_persisted_state
+    import inspect
+
+    # Find services that need eager import.
+    routable_modules = {cfg["module"] for cfg in SERVICE_REGISTRY.values()}
+    needs_eager_import = [
+        mod_name for _, mod_name in _state_map.items()
+        if mod_name not in routable_modules
+    ]
+    assert needs_eager_import, (
+        "Test premise broken: every persisted module is now also routable, "
+        "so this test would never catch the bug it's guarding against. "
+        "Update it or delete it."
+    )
+
+    # The eager-import section in _load_persisted_state must reference each
+    # such module by name, otherwise it stays unimported and its restore
+    # never runs.
+    src = inspect.getsource(_load_persisted_state)
+    for mod_name in needs_eager_import:
+        assert f'"{mod_name}"' in src or f"'{mod_name}'" in src, (
+            f"Service `{mod_name}` is in `_state_map` but not in "
+            f"`SERVICE_REGISTRY`, and `_load_persisted_state()` doesn't "
+            f"eagerly import it. With PERSIST_STATE=1, its persisted "
+            f"state will be silently ignored on warm-boot."
+        )
+
+
 # ── Functional round-trip tests ────────────────────────────────────────
 
 def _round_trip(mod_name, svc_key, populate_fn, observe_fn):

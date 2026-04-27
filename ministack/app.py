@@ -1203,6 +1203,22 @@ def _load_persisted_state():
             _get_module(svc_key).load_persisted_state(data)
             logger.info("Loaded persisted state for %s", svc_key)
 
+    # Eagerly import persisted services whose restore path depends on
+    # a module-level `load_state()` side-effect, but which would not
+    # otherwise be imported during startup. These are NOT covered by
+    # the explicit central-restore loop above (no
+    # `load_persisted_state` method), and the lazy router will not
+    # pull them in early enough — for example, `ses_v2` is reached
+    # via the `/v2/email/*` path-prefix shortcut and `pipes` via
+    # CloudFormation, neither of which fires at lifespan startup.
+    # Importing here triggers the restore (and, for `pipes`, also
+    # restarts the background poller for any RUNNING pipe). Keep this
+    # list narrow — every entry costs a cold-start import. Enforced
+    # by `tests/test_persistence_symmetry.py::test_state_map_
+    # services_without_endpoint_are_eagerly_imported`.
+    for svc_key in ("pipes", "ses_v2"):
+        _get_module(svc_key)
+
 
 async def _wait_for_port(port, timeout=30):
     """Wait until the server is accepting TCP connections."""

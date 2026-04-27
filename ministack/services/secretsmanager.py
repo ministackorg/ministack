@@ -418,6 +418,11 @@ def _delete_secret(data):
     if force:
         arn, sname = secret["ARN"], secret["Name"]
         del _secrets[key]
+        # Clean up any associated resource policy too — otherwise it
+        # lingers as an orphan keyed by the now-deleted ARN, invisible
+        # to the API but still consuming memory and surviving warm
+        # boot via the persistence path.
+        _resource_policies.pop(arn, None)
         return json_response({"ARN": arn, "Name": sname, "DeletionDate": deletion_date})
 
     secret["DeletedDate"] = deletion_date
