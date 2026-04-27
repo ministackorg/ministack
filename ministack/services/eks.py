@@ -22,6 +22,7 @@ import threading
 import time
 
 from ministack.core.responses import AccountScopedDict, apply_image_prefix, get_account_id, json_response, error_response_json, new_uuid, get_region
+from ministack.core.persistence import load_state
 
 logger = logging.getLogger("eks")
 
@@ -87,6 +88,14 @@ def restore_state(data):
     else:
         for c in _clusters.values():
             c["_docker_id"] = None
+
+
+try:
+    _restored = load_state("eks")
+    if _restored:
+        restore_state(_restored)
+except Exception:
+    logger.exception("Failed to restore persisted eks state; continuing fresh")
 
 
 # ---------------------------------------------------------------------------

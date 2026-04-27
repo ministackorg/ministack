@@ -193,6 +193,33 @@ SERVICE_HANDLERS = {
     for service_name, service_config in SERVICE_REGISTRY.items()
 }
 
+# Maps the on-disk persistence key to the service module name. `save_all`
+# (lifespan.shutdown) consumes this. Restore happens at module import time
+# in each service via its own `load_state()` call (see e.g. services/sqs.py);
+# a small allow-list is also restored centrally by `_load_persisted_state`
+# below. Symmetry between save and restore is enforced by
+# tests/test_persistence_symmetry.py.
+_state_map = {
+    "apigateway": "apigateway", "apigateway_v1": "apigateway_v1",
+    "sqs": "sqs", "sns": "sns", "ssm": "ssm",
+    "secretsmanager": "secretsmanager", "iam": "iam",
+    "dynamodb": "dynamodb", "kms": "kms", "eventbridge": "eventbridge",
+    "cloudwatch_logs": "cloudwatch_logs", "kinesis": "kinesis",
+    "ec2": "ec2", "route53": "route53", "cognito": "cognito",
+    "ecr": "ecr", "cloudwatch": "cloudwatch", "s3": "s3",
+    "lambda": "lambda_svc", "rds": "rds", "ecs": "ecs",
+    "elasticache": "elasticache", "appsync": "appsync",
+    "stepfunctions": "stepfunctions", "alb": "alb",
+    "glue": "glue", "efs": "efs", "waf": "waf",
+    "athena": "athena", "emr": "emr", "cloudfront": "cloudfront",
+    "codebuild": "codebuild", "acm": "acm", "firehose": "firehose",
+    "ses": "ses", "ses_v2": "ses_v2",
+    "servicediscovery": "servicediscovery", "s3files": "s3files",
+    "appconfig": "appconfig", "transfer": "transfer",
+    "scheduler": "scheduler", "autoscaling": "autoscaling",
+    "eks": "eks", "backup": "backup", "pipes": "pipes",
+}
+
 SERVICE_NAME_ALIASES = {
     alias: service_name
     for service_name, service_config in SERVICE_REGISTRY.items()
@@ -1133,26 +1160,6 @@ async def _handle_lifespan(scope, receive, send):
             logger.info("MiniStack shutting down...")
             if PERSIST_STATE:
                 # Only save state for modules that were actually loaded
-                _state_map = {
-                    "apigateway": "apigateway", "apigateway_v1": "apigateway_v1",
-                    "sqs": "sqs", "sns": "sns", "ssm": "ssm",
-                    "secretsmanager": "secretsmanager", "iam": "iam",
-                    "dynamodb": "dynamodb", "kms": "kms", "eventbridge": "eventbridge",
-                    "cloudwatch_logs": "cloudwatch_logs", "kinesis": "kinesis",
-                    "ec2": "ec2", "route53": "route53", "cognito": "cognito",
-                    "ecr": "ecr", "cloudwatch": "cloudwatch", "s3": "s3",
-                    "lambda": "lambda_svc", "rds": "rds", "ecs": "ecs",
-                    "elasticache": "elasticache", "appsync": "appsync",
-                    "stepfunctions": "stepfunctions", "alb": "alb",
-                    "glue": "glue", "efs": "efs", "waf": "waf",
-                    "athena": "athena", "emr": "emr", "cloudfront": "cloudfront",
-                    "codebuild": "codebuild", "acm": "acm", "firehose": "firehose",
-                    "ses": "ses", "ses_v2": "ses_v2",
-                    "servicediscovery": "servicediscovery", "s3files": "s3files",
-                    "appconfig": "appconfig", "transfer": "transfer",
-                    "scheduler": "scheduler", "autoscaling": "autoscaling",
-                    "eks": "eks", "backup": "backup",
-                }
                 save_dict = {}
                 for key, mod_name in _state_map.items():
                     if mod_name in _loaded_modules:
