@@ -15,6 +15,7 @@ import threading
 import time
 
 from ministack.core.responses import AccountScopedDict, get_account_id, new_uuid, get_region
+from ministack.core.persistence import load_state
 
 logger = logging.getLogger("pipes")
 
@@ -31,6 +32,20 @@ def get_state():
         "pipes": copy.deepcopy(_pipes),
         "positions": copy.deepcopy(_positions),
     }
+
+
+def restore_state(data):
+    if data:
+        _pipes.update(data.get("pipes", {}))
+        _positions.update(data.get("positions", {}))
+
+
+try:
+    _restored = load_state("pipes")
+    if _restored:
+        restore_state(_restored)
+except Exception:
+    logger.exception("Failed to restore persisted pipes state; continuing fresh")
 
 
 def reset():

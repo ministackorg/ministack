@@ -18,6 +18,7 @@ import re
 import time
 
 from ministack.core.responses import AccountScopedDict, get_account_id, get_region
+from ministack.core.persistence import load_state
 
 logger = logging.getLogger("scheduler")
 
@@ -39,17 +40,29 @@ def reset():
 
 
 def get_state():
-    return copy.deepcopy({
-        "schedules": dict(_schedules),
-        "schedule_groups": dict(_schedule_groups),
-        "tags": dict(_tags),
-    })
+    # Preserve AccountScopedDict wrappers; casting to a plain dict drops the
+    # per-account scoping and would persist only the current request's
+    # tenants. AccountScopedDict has a JSON encoder hook in core/persistence
+    # that round-trips the (account, key) tuple correctly.
+    return {
+        "schedules": copy.deepcopy(_schedules),
+        "schedule_groups": copy.deepcopy(_schedule_groups),
+        "tags": copy.deepcopy(_tags),
+    }
 
 
 def restore_state(data):
     _schedules.update(data.get("schedules", {}))
     _schedule_groups.update(data.get("schedule_groups", {}))
     _tags.update(data.get("tags", {}))
+
+
+try:
+    _restored = load_state("scheduler")
+    if _restored:
+        restore_state(_restored)
+except Exception:
+    logger.exception("Failed to restore persisted scheduler state; continuing fresh")
 
 
 # ---------------------------------------------------------------------------
