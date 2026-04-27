@@ -104,6 +104,10 @@ def ddb():
     return make_client("dynamodb")
 
 @pytest.fixture(scope="session")
+def ddb_streams():
+    return make_client("dynamodbstreams")
+
+@pytest.fixture(scope="session")
 def sts():
     return make_client("sts")
 

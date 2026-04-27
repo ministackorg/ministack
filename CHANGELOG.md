@@ -9,6 +9,10 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **DynamoDB Streams read API** — new `ministack/services/dynamodb_streams.py` exposes `ListStreams`, `DescribeStream`, `GetShardIterator`, and `GetRecords` via `boto3.client("dynamodbstreams")` and the `streams.dynamodb.*` host. Reads the records already captured by the main DynamoDB service (emitted from `PutItem`, `UpdateItem`, `DeleteItem`, `TransactWriteItems`, and `BatchWriteItem`) so the public Streams API and the internal Lambda ESM path share one source of truth. Supports all four iterator types (`TRIM_HORIZON`, `LATEST`, `AT_SEQUENCE_NUMBER`, `AFTER_SEQUENCE_NUMBER`) and all four stream view types (`NEW_AND_OLD_IMAGES`, `NEW_IMAGE`, `OLD_IMAGE`, `KEYS_ONLY`). Single synthetic shard per stream; opaque base64 iterator tokens. Unblocks `DynamoDbOutboxWorker`-style consumers.
+- **DynamoDB → Kinesis streaming destination** — `EnableKinesisStreamingDestination`, `DisableKinesisStreamingDestination`, `DescribeKinesisStreamingDestination`, and `UpdateKinesisStreamingDestination` on `boto3.client("dynamodb")`. Item mutations from `PutItem` / `UpdateItem` / `DeleteItem` / `TransactWriteItems` / `BatchWriteItem` fan out to every ACTIVE destination as JSON-encoded records (via `kinesis.put_record_internal`) for Kinesis / Lambda ESM / Firehose-style consumers. DISABLED destinations remain on `Describe` for the ~24h AWS window; `DeleteTable` drops destinations. Coverage: `tests/test_dynamodb_kinesis_destination.py`.
+
 ---
 
 ## [1.3.18] — 2026-04-28
@@ -55,7 +59,6 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 - **SNS → SQS raw delivery did not forward message attributes** — raw subscriptions delivered the message body but stripped `MessageAttributes`, so SQS receivers never saw them. Forwarded now, plus the follow-up that adds the matching `MD5OfMessageAttributes` header so Java / Go SDK receivers (which verify the digest) match real AWS. Contributed by @arischow.
 - **Three medium / low correctness bugs.** `apigateway` and `apigateway_v1` `get_state()` returned live `AccountScopedDict` references instead of deep copies, so a concurrent write during shutdown serialisation could corrupt the persisted snapshot. `secretsmanager._delete_secret(force=True)` deleted the secret but left orphan entries in `_resource_policies` keyed by ARN — invisible to the API but accumulating in memory and surviving warm-boot. `acm._list_certificates` returned `{"NextToken": null}` unconditionally — boto3 strips it client-side, but Java / Go / raw-HTTP pagination clients that loop on `if NextToken in response` looped forever. Contributed by @bognari. Pattern extended in this release with a sweep across `ses_v2`, `apigateway` v2, and `apigateway` v1 (ten more endpoints) so every list response now omits `NextToken` when there is no next page; AppSync's GraphQL `{items, nextToken}` shape is intentionally unchanged.
 - **`/health` reported `version: dev` in the published Docker image** — `pip` is stripped from the runtime image, so the `importlib.metadata` lookup that worked under `pip install ministack` returned the fallback. Now reads from a `MINISTACK_VERSION` env var injected at image build time.
-
 
 ---
 ## [1.3.15] — 2026-04-26

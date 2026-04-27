@@ -174,6 +174,7 @@ SERVICE_REGISTRY = {
     "cognito-identity": {"module": "cognito"},
     "cognito-idp": {"module": "cognito"},
     "dynamodb": {"module": "dynamodb"},
+    "dynamodbstreams": {"module": "dynamodb_streams"},
     "ec2": {"module": "ec2"},
     "ecr": {"module": "ecr"},
     "ecs": {"module": "ecs"},

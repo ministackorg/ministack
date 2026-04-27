@@ -38,6 +38,16 @@ SERVICE_PATTERNS = {
         "host_patterns": [r"sns\."],
         "target_prefixes": ["AmazonSNS"],
     },
+    # NOTE: dynamodbstreams must be listed BEFORE dynamodb because the target
+    # prefix "DynamoDBStreams_20120810" also starts with "DynamoDB_20120810",
+    # and detect_service() checks target_prefixes in iteration order with
+    # str.startswith(). Without this order, Streams traffic would be misrouted
+    # to the main DynamoDB service.
+    "dynamodbstreams": {
+        "target_prefixes": ["DynamoDBStreams_20120810"],
+        "host_patterns": [r"streams\.dynamodb\."],
+        "credential_scope": "dynamodb",
+    },
     "dynamodb": {
         "target_prefixes": ["DynamoDB_20120810"],
         "host_patterns": [r"dynamodb\."],

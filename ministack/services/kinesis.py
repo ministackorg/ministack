@@ -144,6 +144,29 @@ def _max_shard_index(stream):
     return max((int(sid.split("-")[1]) for sid in stream["shards"]), default=-1)
 
 
+def put_record_internal(stream_arn: str, partition_key: str, data: bytes) -> bool:
+    """Append a record to a stream looked up by ARN — used by cross-service
+    emitters such as DynamoDB's Kinesis streaming destination fan-out.
+
+    Returns ``True`` on success, ``False`` silently when the stream is gone
+    or not ACTIVE (matches AWS behaviour where delivery to a disabled
+    destination is dropped without surfacing an error on the writer).
+    """
+    stream = next((s for s in _streams.values() if s.get("StreamARN") == stream_arn), None)
+    if not stream or stream.get("StreamStatus") != "ACTIVE":
+        return False
+    _expire_records(stream)
+    hash_int = _partition_key_to_hash(partition_key)
+    shard_id = _route_to_shard(hash_int, stream)
+    stream["shards"][shard_id]["records"].append({
+        "SequenceNumber": _next_sequence_number(),
+        "ApproximateArrivalTimestamp": int(time.time()),
+        "Data": base64.b64encode(data).decode("ascii"),
+        "PartitionKey": partition_key,
+    })
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Request dispatcher
 # ---------------------------------------------------------------------------
