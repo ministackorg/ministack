@@ -58,13 +58,20 @@ _platform_endpoints = AccountScopedDict()
 # ── Persistence ────────────────────────────────────────────
 
 def get_state():
-    return {"topics": copy.deepcopy(_topics), "sub_arn_to_topic": copy.deepcopy(_sub_arn_to_topic)}
+    return {
+        "topics": copy.deepcopy(_topics),
+        "sub_arn_to_topic": copy.deepcopy(_sub_arn_to_topic),
+        "platform_applications": copy.deepcopy(_platform_applications),
+        "platform_endpoints": copy.deepcopy(_platform_endpoints),
+    }
 
 
 def restore_state(data):
     if data:
         _topics.update(data.get("topics", {}))
         _sub_arn_to_topic.update(data.get("sub_arn_to_topic", {}))
+        _platform_applications.update(data.get("platform_applications", {}))
+        _platform_endpoints.update(data.get("platform_endpoints", {}))
 
 
 try:
@@ -813,7 +820,8 @@ def _fanout(topic_arn: str, msg_id: str, message: str, subject: str,
 
         if protocol == "sqs":
             _deliver_to_sqs(endpoint, envelope, raw, effective_message,
-                           message_group_id=message_group_id, message_dedup_id=message_dedup_id)
+                           message_group_id=message_group_id, message_dedup_id=message_dedup_id,
+                           message_attributes=message_attributes or {})
         elif protocol in ("http", "https"):
             _threading.Thread(
                 target=asyncio.run,
@@ -831,7 +839,8 @@ def _fanout(topic_arn: str, msg_id: str, message: str, subject: str,
 
 
 def _deliver_to_sqs(endpoint: str, envelope: str, raw: bool, raw_message: str,
-                    message_group_id: str = "", message_dedup_id: str = ""):
+                    message_group_id: str = "", message_dedup_id: str = "",
+                    message_attributes: dict | None = None):
     queue_name = endpoint.split(":")[-1]
     queue_url = _sqs._queue_url(queue_name)
     queue = _sqs._queues.get(queue_url)
@@ -840,11 +849,13 @@ def _deliver_to_sqs(endpoint: str, envelope: str, raw: bool, raw_message: str,
         return
 
     body = raw_message if raw else envelope
+    sqs_attrs = dict(message_attributes) if raw and message_attributes else {}
     now = time.time()
     msg = {
         "id": new_uuid(),
         "body": body,
         "md5": hashlib.md5(body.encode()).hexdigest(),
+        "message_attributes": sqs_attrs,
         "receipt_handle": None,
         "sent_at": now,
         "visible_at": now,

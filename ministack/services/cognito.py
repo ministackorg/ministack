@@ -200,8 +200,17 @@ _identity_pools = AccountScopedDict()
 _identity_tags = AccountScopedDict()   # identity_pool_id -> {key: value}
 
 # ---------------------------------------------------------------------------
-# In-memory state — OAuth2 authorization codes (ephemeral, not persisted)
+# In-memory state — OAuth2 hosted-UI / federation codes
 # ---------------------------------------------------------------------------
+# `_auth_codes` and `_authorization_codes` are intentionally plain dicts
+# (NOT AccountScopedDict). The OAuth2 token endpoint is a public callback
+# with no AWS authentication context — it identifies the caller via the
+# random code + client_id + client_secret, not via a SigV4 access key.
+# Wrapping these in AccountScopedDict would make the callback lookup
+# happen under a default account, invisible to codes issued under any
+# other tenant. Effective tenant isolation is provided by the random
+# unguessable token namespace. See
+# tests/test_cognito_auth_codes_persistence.py for a regression pin.
 
 _auth_codes = {}   # code -> {pool_id, client_id, username, redirect_uri, scopes, state, created_at}
 _AUTH_CODE_TTL = 300  # 5 minutes
@@ -217,6 +226,7 @@ def get_state():
         "identity_tags": copy.deepcopy(_identity_tags),
         "authorization_codes": copy.deepcopy(_authorization_codes),
         "refresh_tokens": copy.deepcopy(_refresh_tokens),
+        "auth_codes": copy.deepcopy(_auth_codes),
     }
 
 
@@ -228,6 +238,7 @@ def restore_state(data):
         _identity_tags.update(data.get("identity_tags", {}))
         _authorization_codes.update(data.get("authorization_codes", {}))
         _refresh_tokens.update(data.get("refresh_tokens", {}))
+        _auth_codes.update(data.get("auth_codes", {}))
 
 
 try:

@@ -41,12 +41,16 @@ _sequence_lock = threading.Lock()
 # ── Persistence ────────────────────────────────────────────
 
 def get_state():
-    return {"streams": copy.deepcopy(_streams)}
+    return {
+        "streams": copy.deepcopy(_streams),
+        "consumers": copy.deepcopy(_consumers),
+    }
 
 
 def restore_state(data):
     if data:
         _streams.update(data.get("streams", {}))
+        _consumers.update(data.get("consumers", {}))
 
 
 try:

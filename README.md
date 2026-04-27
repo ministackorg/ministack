@@ -354,7 +354,7 @@ subnet = ec2.create_subnet(
 | Service | Operations | Notes |
 |---------|-----------|-------|
 | **SSM Parameter Store** | PutParameter, GetParameter, GetParameters, GetParametersByPath, DeleteParameter, DeleteParameters, DescribeParameters, GetParameterHistory, LabelParameterVersion, AddTagsToResource, RemoveTagsFromResource, ListTagsForResource | Supports String, SecureString, StringList |
-| **EventBridge** | CreateEventBus, UpdateEventBus, DeleteEventBus, ListEventBuses, DescribeEventBus, PutRule, DeleteRule, ListRules, DescribeRule, EnableRule, DisableRule, PutTargets, RemoveTargets, ListTargetsByRule, ListRuleNamesByTarget, PutEvents, TestEventPattern, TagResource, UntagResource, ListTagsForResource, CreateArchive, DeleteArchive, DescribeArchive, UpdateArchive, ListArchives, PutPermission, RemovePermission, CreateConnection, DescribeConnection, DeleteConnection, UpdateConnection, DeauthorizeConnection, ListConnections, CreateApiDestination, DescribeApiDestination, DeleteApiDestination, UpdateApiDestination, ListApiDestinations, StartReplay, DescribeReplay, ListReplays, CancelReplay, CreateEndpoint, DeleteEndpoint, DescribeEndpoint, ListEndpoints, UpdateEndpoint, ActivateEventSource, DeactivateEventSource, DescribeEventSource, CreatePartnerEventSource, DeletePartnerEventSource, DescribePartnerEventSource, ListPartnerEventSources, ListPartnerEventSourceAccounts, ListEventSources, PutPartnerEvents | Lambda target dispatch on PutEvents; S3 EventBridge notifications; replays and SaaS/partner APIs are control-plane stubs |
+| **EventBridge** | CreateEventBus, UpdateEventBus, DeleteEventBus, ListEventBuses, DescribeEventBus, PutRule, DeleteRule, ListRules, DescribeRule, EnableRule, DisableRule, PutTargets, RemoveTargets, ListTargetsByRule, ListRuleNamesByTarget, PutEvents, TestEventPattern, TagResource, UntagResource, ListTagsForResource, CreateArchive, DeleteArchive, DescribeArchive, UpdateArchive, ListArchives, PutPermission, RemovePermission, CreateConnection, DescribeConnection, DeleteConnection, UpdateConnection, DeauthorizeConnection, ListConnections, CreateApiDestination, DescribeApiDestination, DeleteApiDestination, UpdateApiDestination, ListApiDestinations, StartReplay, DescribeReplay, ListReplays, CancelReplay, CreateEndpoint, DeleteEndpoint, DescribeEndpoint, ListEndpoints, UpdateEndpoint, ActivateEventSource, DeactivateEventSource, DescribeEventSource, CreatePartnerEventSource, DeletePartnerEventSource, DescribePartnerEventSource, ListPartnerEventSources, ListPartnerEventSourceAccounts, ListEventSources, PutPartnerEvents | Lambda target dispatch on PutEvents; S3 EventBridge notifications; archives capture matching events and `StartReplay` re-dispatches them to the destination bus in a background thread; SaaS/partner APIs are control-plane stubs |
 | **Kinesis** | CreateStream, DeleteStream, DescribeStream, DescribeStreamSummary, ListStreams, ListShards, PutRecord, PutRecords, GetShardIterator, GetRecords, IncreaseStreamRetentionPeriod, DecreaseStreamRetentionPeriod, MergeShards, SplitShard, UpdateShardCount, StartStreamEncryption, StopStreamEncryption, EnableEnhancedMonitoring, DisableEnhancedMonitoring, RegisterStreamConsumer, DeregisterStreamConsumer, ListStreamConsumers, DescribeStreamConsumer, AddTagsToStream, RemoveTagsFromStream, ListTagsForStream | Partition key → shard routing; AWS limits enforced (1 MB/record, 500 records/batch, 5 MB payload, 256-char partition key) |
 | **CloudWatch Metrics** | PutMetricData, GetMetricStatistics, GetMetricData, ListMetrics, PutMetricAlarm, PutCompositeAlarm, DescribeAlarms, DescribeAlarmsForMetric, DescribeAlarmHistory, DeleteAlarms, SetAlarmState, EnableAlarmActions, DisableAlarmActions, TagResource, UntagResource, ListTagsForResource, PutDashboard, GetDashboard, DeleteDashboards, ListDashboards | CBOR and JSON protocol |
 | **SES** | SendEmail, SendRawEmail, SendTemplatedEmail, SendBulkTemplatedEmail, VerifyEmailIdentity, VerifyEmailAddress, VerifyDomainIdentity, VerifyDomainDkim, ListIdentities, ListVerifiedEmailAddresses, GetIdentityVerificationAttributes, GetIdentityDkimAttributes, DeleteIdentity, GetSendQuota, GetSendStatistics, SetIdentityNotificationTopic, SetIdentityFeedbackForwardingEnabled, CreateConfigurationSet, DeleteConfigurationSet, DescribeConfigurationSet, ListConfigurationSets, CreateTemplate, GetTemplate, UpdateTemplate, DeleteTemplate, ListTemplates | Emails stored in-memory, not sent |
@@ -448,6 +448,8 @@ subnet = ec2.create_subnet(
 | `AWS::Route53::RecordSet` | Record FQDN (trailing dot) | Name |
 | `AWS::ApiGatewayV2::Api` | API ID | ApiId, ApiEndpoint |
 | `AWS::ApiGatewayV2::Stage` | Stage ID | StageName |
+| `AWS::ApiGatewayV2::Integration` | Integration ID | IntegrationId |
+| `AWS::ApiGatewayV2::Route` | Route ID | RouteId |
 | `AWS::SES::EmailIdentity` | Identity | EmailIdentity |
 | `AWS::WAFv2::WebACL` | WebACL ID | Arn, Id |
 | `AWS::CloudFront::Distribution` | Distribution ID | Arn, DomainName, Id |
@@ -489,7 +491,7 @@ Unsupported resource types fail with `CREATE_FAILED` (or `ROLLBACK_COMPLETE` if 
 | **AutoScaling** | CreateAutoScalingGroup, DescribeAutoScalingGroups, UpdateAutoScalingGroup, DeleteAutoScalingGroup, DescribeAutoScalingInstances, CreateLaunchConfiguration, DescribeLaunchConfigurations, DeleteLaunchConfiguration, PutScalingPolicy, DescribePolicies, DeletePolicy, PutLifecycleHook, DescribeLifecycleHooks, DeleteLifecycleHook, CompleteLifecycleAction, RecordLifecycleActionHeartbeat, PutScheduledUpdateGroupAction, DescribeScheduledActions, DeleteScheduledAction, CreateOrUpdateTags, DescribeTags, DeleteTags | 23 actions; in-memory state — no real instance scaling; full ASG lifecycle (launch configs, scaling policies, lifecycle hooks, scheduled actions, tags); CDK/Terraform compatible |
 | **CodeBuild** | CreateProject, BatchGetProjects, ListProjects, UpdateProject, DeleteProject, StartBuild, BatchGetBuilds, StopBuild, ListBuilds, ListBuildsForProject, BatchDeleteBuilds | 11 actions; builds complete immediately with SUCCEEDED status; project and build metadata stored in-memory |
 | **AppConfig** | CreateApplication, GetApplication, ListApplications, UpdateApplication, DeleteApplication, CreateEnvironment, GetEnvironment, ListEnvironments, UpdateEnvironment, DeleteEnvironment, CreateConfigurationProfile, GetConfigurationProfile, ListConfigurationProfiles, UpdateConfigurationProfile, DeleteConfigurationProfile, CreateHostedConfigurationVersion, GetHostedConfigurationVersion, ListHostedConfigurationVersions, DeleteHostedConfigurationVersion, CreateDeploymentStrategy, GetDeploymentStrategy, ListDeploymentStrategies, UpdateDeploymentStrategy, DeleteDeploymentStrategy, StartDeployment, GetDeployment, ListDeployments, StopDeployment, TagResource, UntagResource, ListTagsForResource, StartConfigurationSession, GetLatestConfiguration | 33 operations; control plane + data plane; hosted configuration versions; deployments complete immediately; session-based configuration retrieval with token rotation |
-| **Transfer Family** | CreateServer, DescribeServer, DeleteServer, ListServers, CreateUser, DescribeUser, DeleteUser, ListUsers, ImportSshPublicKey, DeleteSshPublicKey | 10 operations; SFTP server and user management; SSH key rotation; LOGICAL home directory mappings to S3; in-memory state |
+| **Transfer Family** | CreateServer, DescribeServer, DeleteServer, ListServers, StartServer, StopServer, CreateUser, DescribeUser, DeleteUser, ListUsers, ImportSshPublicKey, DeleteSshPublicKey | 12 operations; **real SFTP listener** on `:2222` (override with `SFTP_PORT`) backed by S3 — `ls`, `put`, `get`, `mkdir`, `rename` work end-to-end against the local S3 emulator; `SFTP_PORT_PER_SERVER=1` allocates one port per `CreateServer` from `SFTP_BASE_PORT` (default 2300); SSH key auth scans every user across every server and account; `LOGICAL` and `PATH` home-directory mappings; host key persists across restarts when `PERSIST_STATE=1` |
 | **EventBridge Scheduler** | CreateSchedule, GetSchedule, UpdateSchedule, DeleteSchedule, ListSchedules, CreateScheduleGroup, GetScheduleGroup, DeleteScheduleGroup, ListScheduleGroups, TagResource, UntagResource, ListTagsForResource | 12 actions; schedule groups with cascading deletes; `rate()`, `cron()`, `at()` expressions; group/prefix/state filters on list; default group auto-created; CFN `AWS::Scheduler::Schedule` and `AWS::Scheduler::ScheduleGroup` supported |
 | **EKS** | CreateCluster, DescribeCluster, ListClusters, DeleteCluster, CreateNodegroup, DescribeNodegroup, ListNodegroups, DeleteNodegroup, TagResource, UntagResource, ListTagsForResource | 11 operations; `CreateCluster` spawns a real **k3s** container (75 MB) with a full Kubernetes API server; `kubectl`, Helm, and any K8s tooling work out of the box; cascading delete removes nodegroups and k3s container; CFN `AWS::EKS::Cluster` and `AWS::EKS::Nodegroup` supported |
 
@@ -715,68 +717,45 @@ docker run -p 4566:4566 \
   ministackorg/ministack
 ```
 
-### Lambdas in docker
+### Lambda in Docker
 
-To run lambda in docker, the LAMBDA_EXECUTOR needs to be set to "docker". All lambdas will be run in an
-AWS supplied docker image, following docker images are supported:
-   *  "python3.8": "public.ecr.aws/lambda/python:3.8"
-   *  "python3.9": "public.ecr.aws/lambda/python:3.9"
-   *  "python3.10": "public.ecr.aws/lambda/python:3.10"
-   *  "python3.11": "public.ecr.aws/lambda/python:3.11"
-   *  "python3.12": "public.ecr.aws/lambda/python:3.12"
-   *  "python3.13": "public.ecr.aws/lambda/python:3.13"
-   *  "python3.14": "public.ecr.aws/lambda/python:3.14"
-   *  "nodejs14.x": "public.ecr.aws/lambda/nodejs:14"
-   *  "nodejs16.x": "public.ecr.aws/lambda/nodejs:16"
-   *  "nodejs18.x": "public.ecr.aws/lambda/nodejs:18"
-   *  "nodejs20.x": "public.ecr.aws/lambda/nodejs:20"
-   *  "nodejs22.x": "public.ecr.aws/lambda/nodejs:22"
-   *  "nodejs24.x": "public.ecr.aws/lambda/nodejs:24"
-   *  "provided.al2023": "public.ecr.aws/lambda/provided:al2023"
-   *  "provided.al2": "public.ecr.aws/lambda/provided:al2"
-   *  "provided": "public.ecr.aws/lambda/provided:latest"
+Set `LAMBDA_EXECUTOR=docker` to run every Lambda invocation inside an AWS-supplied runtime container instead of a local subprocess. `provided.*` runtimes and `PackageType: Image` always use Docker regardless of this setting.
 
-Docker containers for lambda are name lambda-<random-hex-16>.
+Supported runtimes and the AWS public ECR images MiniStack pulls for them:
 
-Docker containers are always kept "warm", and reused when possible. This means that containers
-created for lambdas need to be killed manually.
+| Runtime | Image |
+|---------|-------|
+| `python3.8` – `python3.14` | `public.ecr.aws/lambda/python:<version>` |
+| `nodejs14.x` – `nodejs24.x` | `public.ecr.aws/lambda/nodejs:<version>` |
+| `provided.al2023` | `public.ecr.aws/lambda/provided:al2023` |
+| `provided.al2` | `public.ecr.aws/lambda/provided:al2` |
+| `provided` | `public.ecr.aws/lambda/provided:latest` |
 
-Additionally a volume is needed to mount the code (and extra layers). This must be set with
-the LAMBDA_REMOTE_DOCKER_VOLUME_MOUNT environment variable. This must be a named volume (managed by docker).
+Containers are named `lambda-<random-hex-16>` and pooled across invocations. Idle containers are reaped after `LAMBDA_WARM_TTL_SECONDS` (default 300s) — no manual cleanup needed. The pool is also drained on `/_ministack/reset`.
 
-If a ministack is not running on the default network, DOCKER_NETWORK needs to be set, which will attach
-all container-backed services (Lambda, RDS, EKS, ElastiCache) to this network, making it possible to access
-ministack (AWS) resources from the lambda. The legacy `LAMBDA_DOCKER_NETWORK` is still accepted as a fallback.
+**Docker-in-Docker:** when MiniStack itself runs inside a container, set `LAMBDA_REMOTE_DOCKER_VOLUME_MOUNT` to a Docker named volume that is also mounted at `/var/task` inside the MiniStack container. MiniStack writes the Lambda code into the volume so the sibling Lambda container (started via the host Docker socket) can read it. Not needed when MiniStack runs directly on the host.
 
-Example docker compose file:
-```
+**Networking:** when MiniStack runs in Docker Compose, set `DOCKER_NETWORK` to the Compose network name. All container-backed services (Lambda, RDS, EKS, ElastiCache) then attach to that network so Lambda code can reach MiniStack at `http://<ministack-service-name>:4566`. The legacy `LAMBDA_DOCKER_NETWORK` is still accepted (Lambda only) as a fallback.
+
+Example `docker-compose.yml`:
+
+```yaml
 services:
   ministack:
     image: ministackorg/ministack:latest
     container_name: infra_ministack
-    entrypoint: ["python", "-m", "hypercorn", "ministack.app:app", "--bind", "0.0.0.0:4566", "--keep-alive", "75"]
-    networks:
-      infra-network:
-    healthcheck:
-      test: "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:4566/_ministack/health')\" || exit 1"
-      interval: 10s
-      timeout: 2s
-      start_period: 5s
-      retries: 3
     ports:
       - "4566:4566"
     environment:
-      DOCKER_SOCK: ${DOCKER_SOCK:-/var/run/docker.sock}
       LAMBDA_EXECUTOR: docker
       DOCKER_NETWORK: ${COMPOSE_PROJECT_NAME}_infra-network
-      LAMBDA_REMOTE_DOCKER_VOLUME_MOUNT: "{COMPOSE_PROJECT_NAME}_lambda-docker-volume"
+      LAMBDA_REMOTE_DOCKER_VOLUME_MOUNT: ${COMPOSE_PROJECT_NAME}_lambda-docker-volume
       AWS_DEFAULT_REGION: ${AWS_REGION:-eu-central-1}
-      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-my_secret}
-      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-my_key}
-      AWS_ENDPOINT_URL: http://localstack:4566
     volumes:
-      - "/var/run/docker.sock:/var/run/docker.sock"
-      - "lambda-docker-volume:/var/task"
+      - /var/run/docker.sock:/var/run/docker.sock
+      - lambda-docker-volume:/var/task
+    networks:
+      - infra-network
 
 volumes:
   lambda-docker-volume:
@@ -785,7 +764,13 @@ networks:
   infra-network:
 ```
 
-Option privileged set to "true" is needed if /var/run/docker.sock is root owned.
+Lambda code in this setup should point at the MiniStack service name, not `localhost`:
+
+```python
+boto3.client("s3", endpoint_url="http://infra_ministack:4566", ...)
+```
+
+If `/var/run/docker.sock` is root-owned on the host, add `privileged: true` to the `ministack` service so it can talk to the daemon.
 
 ### EKS with Real Kubernetes (k3s)
 
@@ -909,20 +894,18 @@ pip install boto3 pytest duckdb docker cbor2
 # Start MiniStack
 docker compose up -d
 
-# Run the full test suite (1,300+ tests across all services)
+# Run the full test suite (1,800+ tests across all services)
 pytest tests/ -v
 ```
 
 Expected output:
 
 ```
-collected 955 items
-
-tests/test_services.py::test_s3_create_bucket PASSED
+tests/test_s3.py::test_s3_create_bucket PASSED
 ...
-tests/test_services.py::test_app_asgi_callable PASSED
+tests/test_lambda.py::test_lambda_invoke PASSED
 
-955 passed in ~100s
+1800+ passed in ~120s
 ```
 
 ---
