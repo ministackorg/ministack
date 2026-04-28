@@ -39,12 +39,12 @@ from datetime import datetime, timezone
 from ministack.core.persistence import PERSIST_STATE, load_state
 from ministack.core.responses import (
     AccountScopedDict,
-    get_account_id,
     error_response_json,
+    get_account_id,
+    get_region,
     json_response,
     new_uuid,
     now_iso,
-    get_region,
 )
 
 logger = logging.getLogger("states")
@@ -1385,6 +1385,8 @@ def _invoke_resource(resource, input_data):
         return _invoke_activity(resource, input_data)
 
     if resource.startswith("arn:aws:states:::states:startExecution.sync"):
+        return _invoke_nested_start_execution_sync(resource, input_data)
+    if resource.startswith("arn:aws:states:::states:startExecution"):
         return _invoke_nested_start_execution(resource, input_data)
 
     # Service integration dispatch
@@ -2146,6 +2148,24 @@ def _parse_ts(v):
 
 
 def _invoke_nested_start_execution(resource, input_data):
+    """Start a nested Step Functions execution without waiting for completion."""
+    request = _nested_start_execution_request(input_data)
+    status, _, body = _start_execution(request)
+    payload = json.loads(body) if body else {}
+
+    if status >= 400:
+        raise _ExecutionError(
+            payload.get("__type", "States.Runtime"),
+            payload.get("message", "Nested execution failed to start"),
+        )
+
+    return {
+        "ExecutionArn": payload.get("executionArn"),
+        "StartDate": payload.get("startDate"),
+    }
+
+
+def _invoke_nested_start_execution_sync(resource, input_data):
     """Run a nested Step Functions execution and wait for the child result."""
     request = _nested_start_execution_request(input_data)
     status, _, body = _start_sync_execution(request)
@@ -2340,7 +2360,12 @@ _AWS_SDK_SERVICE_MAP = {
     # JSON-protocol services: use X-Amz-Target header
     "dynamodb": {"target_prefix": "DynamoDB_20120810", "protocol": "json"},
     "secretsmanager": {"target_prefix": "secretsmanager", "protocol": "json"},
-    "sfn": {"target_prefix": "AWSStepFunctions", "protocol": "json", "service_key": "states"},
+    "sfn": {
+        "target_prefix": "AWSStepFunctions",
+        "protocol": "json",
+        "service_key": "states",
+        "param_case": "lower-camel",
+    },
     "logs": {"target_prefix": "Logs_20140328", "protocol": "json"},
     "ssm": {"target_prefix": "AmazonSSM", "protocol": "json"},
     "eventbridge": {"target_prefix": "AWSEvents", "protocol": "json", "service_key": "events"},
@@ -2438,7 +2463,11 @@ def _dispatch_aws_sdk_json(service_info, service_name, action, input_data):
             f"Service '{service_key}' is not available in MiniStack",
         )
 
-    body = json.dumps(input_data)
+    if service_info.get("param_case") == "lower-camel":
+        wire_data = _convert_keys_to_camel(input_data or {})
+    else:
+        wire_data = input_data
+    body = json.dumps(wire_data)
     headers = {
         "x-amz-target": target,
         "content-type": "application/x-amz-json-1.0",
@@ -2706,6 +2735,7 @@ def _dispatch_aws_sdk_query(service_info, service_name, action, input_data):
     """Dispatch an aws-sdk integration call to a query-protocol MiniStack service."""
     import xml.etree.ElementTree as ET
     from urllib.parse import urlencode
+
     from ministack import app
 
     service_key = service_info.get("service_key", service_name)
