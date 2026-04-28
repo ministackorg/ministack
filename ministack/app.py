@@ -41,9 +41,8 @@ _EXECUTE_API_RE = re.compile(
 #   "{bucket}.<host>" or "{bucket}.<host>:4566"          (boto3/SDK default)
 #   "{bucket}.s3.<host>" or "{bucket}.s3.<host>:4566"    (Terraform AWS provider v4+)
 # Does NOT match execute-api, alb, or other sub-service hostnames.
-_S3_VHOST_RE = re.compile(
-    r"^([^.]+)(?:\.s3)?\." + re.escape(_MINISTACK_HOST) + r"(?::\d+)?$"
-)
+_S3_VHOST_RE = re.compile(r"^([a-z0-9][a-z0-9-]{1,61}[a-z0-9])..+$")
+
 _S3_VHOST_EXCLUDE_RE = re.compile(r"\.(execute-api|alb|emr|efs|elasticache|s3-control)\.")
 _HEALTH_PATHS = ("/_ministack/health", "/_localstack/health", "/health")
 _BODY_METHODS = ("POST", "PUT", "PATCH")
