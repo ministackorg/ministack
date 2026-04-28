@@ -235,12 +235,9 @@ def _url_encode(value: str) -> str:
 
 
 def _parse_bucket_key(path: str, headers: dict):
-    host = headers.get("host", "")
-    vhost_match = re.match(r"^([a-zA-Z0-9.\-_]+)\.s3[\.\-]", host)
-    if vhost_match:
-        bucket = vhost_match.group(1)
-        key = path.lstrip("/")
-        return bucket, key
+    # Vhost extraction lives in app.py:_extract_s3_vhost_bucket, which
+    # rewrites the path to /{bucket}{key} before this handler runs. By the
+    # time we get here, every request is path-style.
     parts = path.lstrip("/").split("/", 1)
     bucket = parts[0] if parts else ""
     key = parts[1] if len(parts) > 1 else ""

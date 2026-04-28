@@ -13,6 +13,16 @@ import re
 
 logger = logging.getLogger("ministack")
 
+# Lambda API paths are versioned by date prefix. Resources enumerated per
+# AWS Lambda API Reference (functions, layers, event-source-mappings,
+# account-settings, runtime, tags, code-signing-configs). Matches any
+# date-prefixed path so routing works for unsigned clients (boto3 signs
+# and routes via credential scope, but raw HTTP/curl/runtime API don't).
+_LAMBDA_PATH_RE = re.compile(
+    r"^/\d{4}-\d{2}-\d{2}/(?:functions|layers|event-source-mappings|"
+    r"account-settings|runtime|tags|code-signing-configs)(?:/|$)"
+)
+
 # Service detection patterns
 SERVICE_PATTERNS = {
     "s3": {
@@ -513,7 +523,7 @@ def detect_service(method: str, path: str, headers: dict, query_params: dict) ->
     if (path_lower.startswith("/restapis") or path_lower.startswith("/apikeys")
             or path_lower.startswith("/usageplans") or path_lower.startswith("/domainnames")):
         return "apigateway"
-    if path_lower.startswith("/2015-03-31/functions"):
+    if _LAMBDA_PATH_RE.match(path_lower):
         return "lambda"
     if path_lower.startswith(("/oauth2/", "/login", "/logout")):
         return "cognito-idp"
