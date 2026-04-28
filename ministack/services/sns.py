@@ -348,7 +348,9 @@ def _subscribe(params):
     if needs_confirmation:
         asyncio.ensure_future(_send_subscription_confirmation(topic_arn, sub))
 
-    result_arn = "PendingConfirmation" if needs_confirmation else sub_arn
+    # Real AWS returns the literal lowercase string "pending confirmation"
+    # (with a space) as the SubscriptionArn until the subscriber confirms.
+    result_arn = "pending confirmation" if needs_confirmation else sub_arn
     return _xml(200, "SubscribeResponse",
                 f"<SubscribeResult><SubscriptionArn>{result_arn}</SubscriptionArn></SubscribeResult>")
 

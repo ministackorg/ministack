@@ -60,7 +60,9 @@ async def handle_request(method, path, headers, body, query_params):
         secret_key = _gen_secret()
         session_token = _gen_session_token()
         role_id = "AROA" + new_uuid().replace("-", "")[:17].upper()
-        assumed_arn = role_arn.replace(":role/", ":assumed-role/", 1)
+        # Real AWS returns the assumed-role ARN under the `sts` service,
+        # not `iam` — e.g. arn:aws:sts::123456789012:assumed-role/demo/TestAR.
+        assumed_arn = role_arn.replace(":iam:", ":sts:", 1).replace(":role/", ":assumed-role/", 1)
         if not assumed_arn.endswith(f"/{session_name}"):
             assumed_arn = f"{assumed_arn}/{session_name}"
         if use_json:
@@ -92,7 +94,7 @@ async def handle_request(method, path, headers, body, query_params):
         access_key = _gen_session_access_key()
         secret_key = _gen_secret()
         session_token = _gen_session_token()
-        assumed_arn = role_arn.replace(":role/", ":assumed-role/", 1)
+        assumed_arn = role_arn.replace(":iam:", ":sts:", 1).replace(":role/", ":assumed-role/", 1)
         if not assumed_arn.endswith(f"/{session}"):
             assumed_arn = f"{assumed_arn}/{session}"
         role_id = "AROA" + new_uuid().replace("-", "")[:17].upper()
