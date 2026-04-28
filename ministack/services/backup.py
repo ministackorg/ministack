@@ -17,8 +17,8 @@ import json
 import logging
 import time
 
-from ministack.core.responses import AccountScopedDict, get_account_id, get_region, new_uuid
 from ministack.core.persistence import load_state
+from ministack.core.responses import AccountScopedDict, get_account_id, get_region, new_uuid
 
 logger = logging.getLogger("backup")
 

@@ -2,11 +2,13 @@ import io
 import json
 import os
 import time
+import uuid as _uuid_mod
 import zipfile
 from urllib.parse import urlparse
+
 import pytest
 from botocore.exceptions import ClientError
-import uuid as _uuid_mod
+
 
 def test_route53_create_and_get_hosted_zone(r53):
     resp = r53.create_hosted_zone(

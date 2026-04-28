@@ -4,9 +4,9 @@ condition evaluation, intrinsic function resolution, and topological sorting.
 """
 
 import base64
-import os
 import heapq
 import json
+import os
 import re
 from collections import defaultdict
 

@@ -8,7 +8,6 @@ import pytest
 
 from ministack.core.router import detect_service
 
-
 _HEADERS = {"host": "localhost:4566"}
 
 

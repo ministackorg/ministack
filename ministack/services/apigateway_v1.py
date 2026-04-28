@@ -77,7 +77,7 @@ import time
 import urllib.error
 import urllib.request
 
-from ministack.core.responses import AccountScopedDict, get_account_id, new_uuid, get_region
+from ministack.core.responses import AccountScopedDict, get_account_id, get_region, new_uuid
 
 
 def _now_unix():

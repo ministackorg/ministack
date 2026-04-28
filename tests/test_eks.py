@@ -6,10 +6,10 @@ k3s Docker container tests require Docker socket access.
 import json
 import time
 import uuid
-import pytest
-import boto3
-from botocore.exceptions import ClientError
 
+import boto3
+import pytest
+from botocore.exceptions import ClientError
 
 ENDPOINT = "http://localhost:4566"
 REGION = "us-east-1"

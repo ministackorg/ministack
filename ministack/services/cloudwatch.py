@@ -12,16 +12,16 @@ Operations: PutMetricData, GetMetricStatistics, GetMetricData, ListMetrics,
 
 import copy
 import json
-import os
 import logging
+import os
 import re
 import time
 from collections import defaultdict
 from datetime import datetime, timezone
 from urllib.parse import parse_qs
 
-from ministack.core.persistence import load_state, PERSIST_STATE
-from ministack.core.responses import AccountScopedDict, get_account_id, new_uuid, get_region
+from ministack.core.persistence import PERSIST_STATE, load_state
+from ministack.core.responses import AccountScopedDict, get_account_id, get_region, new_uuid
 
 logger = logging.getLogger("cloudwatch")
 

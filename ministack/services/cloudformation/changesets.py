@@ -10,12 +10,15 @@ import logging
 from ministack.core.responses import get_account_id, new_uuid, now_iso
 
 from .engine import (
-    _evaluate_conditions, _parse_template, _resolve_parameters,
-    _resolve_refs, _NO_VALUE,
+    _NO_VALUE,
+    _evaluate_conditions,
+    _parse_template,
+    _resolve_parameters,
+    _resolve_refs,
 )
-from .stacks import _add_event, _deploy_stack_async, _diff_resources
+from .helpers import CFN_NS, _error, _esc, _extract_members, _p, _resolve_template, _xml
 from .provisioners import REGION
-from .helpers import _xml, _error, _p, _esc, _extract_members, _resolve_template, CFN_NS
+from .stacks import _add_event, _deploy_stack_async, _diff_resources
 
 logger = logging.getLogger("cloudformation")
 
@@ -35,7 +38,7 @@ def _find_change_set(cs_name, stack_name=""):
 # --- CreateChangeSet ---
 
 def _create_change_set(params):
-    from ministack.services.cloudformation import _stacks, _stack_events, _change_sets
+    from ministack.services.cloudformation import _change_sets, _stack_events, _stacks
     stack_name = _p(params, "StackName")
     cs_name = _p(params, "ChangeSetName")
     cs_type = _p(params, "ChangeSetType", "UPDATE")
@@ -291,7 +294,7 @@ def _delete_change_set(params):
 # --- ListChangeSets ---
 
 def _list_change_sets(params):
-    from ministack.services.cloudformation import _stacks, _change_sets
+    from ministack.services.cloudformation import _change_sets, _stacks
     stack_name = _p(params, "StackName")
     if not stack_name:
         return _error("ValidationError", "StackName is required")

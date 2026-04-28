@@ -1404,8 +1404,8 @@ def _pid_file(port: int) -> str:
 
 
 def main():
-    from hypercorn.config import Config as HypercornConfig
     from hypercorn.asyncio import serve as hypercorn_serve
+    from hypercorn.config import Config as HypercornConfig
 
     parser = argparse.ArgumentParser(description="MiniStack — Local AWS Service Emulator")
     parser.add_argument("-d", "--detach", action="store_true", help="Run in the background (detached mode)")
@@ -1464,7 +1464,7 @@ def main():
             f.write(str(proc.pid))
         print(f"MiniStack started in background (PID {proc.pid}) on port {port}.")
         print(f"  Logs: {log_file}")
-        print(f"  Stop: ministack --stop")
+        print("  Stop: ministack --stop")
         return
 
     # Foreground — write PID file and clean up on exit

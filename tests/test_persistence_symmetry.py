@@ -24,7 +24,6 @@ import pytest
 from ministack.app import _state_map  # noqa: E402  (intentional internal import)
 from ministack.core import persistence
 
-
 # Services that MUST be persistence-round-trippable. Every entry of
 # `_state_map` qualifies. The set is materialised here so an addition to
 # `_state_map` automatically gets coverage.
@@ -93,8 +92,9 @@ def test_state_map_services_without_endpoint_are_eagerly_imported():
     module (e.g. a new CFN pipe registration) — silently breaking
     event forwarding for the entire window between restart and the
     next pipe-related API call."""
-    from ministack.app import SERVICE_REGISTRY, _load_persisted_state
     import inspect
+
+    from ministack.app import SERVICE_REGISTRY, _load_persisted_state
 
     # Find services that need eager import.
     routable_modules = {cfg["module"] for cfg in SERVICE_REGISTRY.values()}

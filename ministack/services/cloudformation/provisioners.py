@@ -3,49 +3,47 @@ CloudFormation provisioners — resource create/delete handlers for each AWS res
 """
 
 import io
-import os
 import json
 import logging
+import os
 import random
 import string
 import time
 import zipfile
 from collections import defaultdict
 
-from ministack.core.responses import get_account_id, get_region, new_uuid, now_iso
-
-import ministack.services.s3 as _s3
-import ministack.services.sqs as _sqs
-import ministack.services.sns as _sns
-import ministack.services.dynamodb as _dynamodb
-import ministack.services.lambda_svc as _lambda_svc
-import ministack.services.ssm as _ssm
-import ministack.services.cloudwatch as _cw
-import ministack.services.cloudwatch_logs as _cw_logs
-import ministack.services.eventbridge as _eb
-import ministack.services.iam as _iam
+import ministack.services.alb as _alb
+import ministack.services.apigateway as _apigw_v2
 import ministack.services.apigateway_v1 as _apigw_v1
 import ministack.services.appsync as _appsync
-import ministack.services.secretsmanager as _sm
-import ministack.services.cognito as _cognito
-import ministack.services.ecr as _ecr
-import ministack.services.kms as _kms
-import ministack.services.ec2 as _ec2
-import ministack.services.ecs as _ecs
-import ministack.services.alb as _alb
-import ministack.services.kinesis as _kinesis
-import ministack.services.pipes as _pipes
-import ministack.services.stepfunctions as _sfn
-import ministack.services.route53 as _r53
-import ministack.services.apigateway as _apigw_v2
-import ministack.services.ses as _ses
-import ministack.services.waf as _waf
-import ministack.services.cloudfront as _cf
-import ministack.services.rds as _rds
 import ministack.services.autoscaling as _asg
-import ministack.services.codebuild as _codebuild
 import ministack.services.backup as _backup
-
+import ministack.services.cloudfront as _cf
+import ministack.services.cloudwatch as _cw
+import ministack.services.cloudwatch_logs as _cw_logs
+import ministack.services.codebuild as _codebuild
+import ministack.services.cognito as _cognito
+import ministack.services.dynamodb as _dynamodb
+import ministack.services.ec2 as _ec2
+import ministack.services.ecr as _ecr
+import ministack.services.ecs as _ecs
+import ministack.services.eventbridge as _eb
+import ministack.services.iam as _iam
+import ministack.services.kinesis as _kinesis
+import ministack.services.kms as _kms
+import ministack.services.lambda_svc as _lambda_svc
+import ministack.services.pipes as _pipes
+import ministack.services.rds as _rds
+import ministack.services.route53 as _r53
+import ministack.services.s3 as _s3
+import ministack.services.secretsmanager as _sm
+import ministack.services.ses as _ses
+import ministack.services.sns as _sns
+import ministack.services.sqs as _sqs
+import ministack.services.ssm as _ssm
+import ministack.services.stepfunctions as _sfn
+import ministack.services.waf as _waf
+from ministack.core.responses import get_account_id, get_region, new_uuid, now_iso
 
 logger = logging.getLogger("cloudformation")
 
@@ -1637,7 +1635,8 @@ def _kms_alias_delete(physical_id, props):
 # --- EC2 resource provisioners ---
 
 def _ec2_vpc_create(logical_id, props, stack_name):
-    import random, string
+    import random
+    import string
     cidr = props.get("CidrBlock", "10.0.0.0/16")
     vpc_id = _ec2._new_vpc_id()
     # Create per-VPC default resources (same as _create_vpc)
@@ -1682,7 +1681,8 @@ def _ec2_vpc_delete(physical_id, props):
 
 
 def _ec2_subnet_create(logical_id, props, stack_name):
-    import random, string
+    import random
+    import string
     vpc_id = props.get("VpcId", "")
     cidr = props.get("CidrBlock", "10.0.1.0/24")
     az = props.get("AvailabilityZone", f"{get_region()}a")
@@ -1748,7 +1748,8 @@ def _ec2_sg_delete(physical_id, props):
 
 
 def _ec2_igw_create(logical_id, props, stack_name):
-    import random, string
+    import random
+    import string
     igw_id = "igw-" + "".join(random.choices(string.hexdigits[:16], k=17))
     _ec2._internet_gateways[igw_id] = {
         "InternetGatewayId": igw_id,
@@ -1781,7 +1782,8 @@ def _ec2_vpc_gw_attach_delete(physical_id, props):
 
 
 def _ec2_rtb_create(logical_id, props, stack_name):
-    import random, string
+    import random
+    import string
     vpc_id = props.get("VpcId", _ec2._DEFAULT_VPC_ID)
     rtb_id = "rtb-" + "".join(random.choices(string.hexdigits[:16], k=17))
     _ec2._route_tables[rtb_id] = {
@@ -1825,7 +1827,8 @@ def _ec2_route_delete(physical_id, props):
 
 
 def _ec2_subnet_rtb_assoc_create(logical_id, props, stack_name):
-    import random, string
+    import random
+    import string
     rtb_id = props.get("RouteTableId", "")
     subnet_id = props.get("SubnetId", "")
     assoc_id = "rtbassoc-" + "".join(random.choices(string.hexdigits[:16], k=17))
@@ -2181,7 +2184,8 @@ def _lambda_layer_create(logical_id, props, stack_name):
     ver = layer["next_version"]
     layer["next_version"] = ver + 1
 
-    import base64, hashlib
+    import base64
+    import hashlib
     zip_data = None
     if s3_bucket and s3_key:
         zip_data = _s3._get_object_data(s3_bucket, s3_key)

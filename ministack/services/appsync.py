@@ -25,7 +25,14 @@ import re
 import time
 
 from ministack.core.persistence import PERSIST_STATE, load_state
-from ministack.core.responses import AccountScopedDict, get_account_id, error_response_json, json_response, new_uuid, get_region
+from ministack.core.responses import (
+    AccountScopedDict,
+    error_response_json,
+    get_account_id,
+    get_region,
+    json_response,
+    new_uuid,
+)
 
 logger = logging.getLogger("appsync")
 
@@ -864,8 +871,9 @@ def _ddb_scan(table, table_name, args, sub_fields):
 
 def _ddb_put_item(table, table_name, args):
     """Create/put an item."""
-    import ministack.services.dynamodb as _ddb
     from collections import defaultdict
+
+    import ministack.services.dynamodb as _ddb
 
     input_data = args.get("input", args)
     pk_name = table["pk_name"]

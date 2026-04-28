@@ -39,7 +39,7 @@ from email.policy import default as default_policy
 from urllib.parse import parse_qs, unquote
 
 from ministack.core.persistence import PERSIST_STATE, load_state
-from ministack.core.responses import AccountScopedDict, get_account_id, new_uuid, get_region
+from ministack.core.responses import AccountScopedDict, get_account_id, get_region, new_uuid
 
 logger = logging.getLogger("ses")
 

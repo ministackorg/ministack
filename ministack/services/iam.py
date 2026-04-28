@@ -29,13 +29,13 @@ IAM actions:
 
 import copy
 import json
-import os
 import logging
+import os
 import time
 from urllib.parse import parse_qs
 from urllib.parse import quote as _url_quote
 
-from ministack.core.responses import AccountScopedDict, get_account_id, json_response, new_uuid, get_region
+from ministack.core.responses import AccountScopedDict, get_account_id, get_region, json_response, new_uuid
 
 logger = logging.getLogger("iam")
 
@@ -44,7 +44,7 @@ REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 # ---------------------------------------------------------------------------
 # Module-level state
 # ---------------------------------------------------------------------------
-from ministack.core.persistence import load_state, PERSIST_STATE
+from ministack.core.persistence import PERSIST_STATE, load_state
 
 _users = AccountScopedDict()
 _roles = AccountScopedDict()

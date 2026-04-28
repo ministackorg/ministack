@@ -3,13 +3,13 @@
 import io
 import json
 import os
-import pytest
 import time
 import uuid as _uuid_mod
 import zipfile
-from botocore.exceptions import ClientError
 from urllib.parse import urlparse
 
+import pytest
+from botocore.exceptions import ClientError
 
 _endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
 
@@ -884,7 +884,6 @@ from urllib.parse import urlparse
 
 import pytest
 
-
 _WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
 
@@ -1279,8 +1278,8 @@ def test_ws_delete_connection_closes_socket(apigw, lam):
 
 def test_ws_post_to_unknown_connection_returns_410(apigw, lam):
     """@connections PostToConnection on an unknown id returns 410 GoneException."""
-    import urllib.request
     import urllib.error
+    import urllib.request
 
     api_id, _ = _wire_ws_api(apigw, lam, name_suffix="gone")
     url = f"http://{api_id}.execute-api.localhost:{_EXECUTE_PORT}/prod/@connections/{uuid.uuid4().hex}"
@@ -1629,7 +1628,8 @@ def test_apigwv2_cors_preflight_echoes_configured_origin(apigw):
 
 def test_apigwv2_cors_preflight_denies_non_allowlisted_origin(apigw):
     """OPTIONS from an origin not in allow_origins returns 403 with no CORS headers."""
-    import urllib.request, urllib.error
+    import urllib.error
+    import urllib.request
     api_id = _create_cors_api(apigw, name="cors-deny", cors={
         "AllowOrigins": ["http://localhost:3000"],
         "AllowMethods": ["GET"],
@@ -1647,7 +1647,8 @@ def test_apigwv2_cors_preflight_denies_non_allowlisted_origin(apigw):
 
 def test_apigwv2_cors_preflight_403_when_no_configuration(apigw):
     """API without CorsConfiguration returns 403 on OPTIONS (AWS default)."""
-    import urllib.request, urllib.error
+    import urllib.error
+    import urllib.request
     api_id = _create_cors_api(apigw, name="no-cors", cors=None)
     req = urllib.request.Request(
         f"http://{api_id}.execute-api.localhost:{_EXECUTE_PORT}/",

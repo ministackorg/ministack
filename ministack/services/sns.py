@@ -27,7 +27,7 @@ _HOST = os.environ.get("MINISTACK_HOST", "localhost")
 _PORT = os.environ.get("GATEWAY_PORT", "4566")
 
 import ministack.services.lambda_svc as _lambda_svc
-from ministack.core.responses import AccountScopedDict, get_account_id, new_uuid, get_region
+from ministack.core.responses import AccountScopedDict, get_account_id, get_region, new_uuid
 from ministack.services import sqs as _sqs
 
 logger = logging.getLogger("sns")

@@ -2,11 +2,13 @@ import io
 import json
 import os
 import time
+import uuid as _uuid_mod
 import zipfile
 from urllib.parse import urlparse
+
 import pytest
 from botocore.exceptions import ClientError
-import uuid as _uuid_mod
+
 
 def test_firehose_create_and_describe(fh):
     name = "intg-fh-basic"
@@ -300,7 +302,8 @@ def test_firehose_update_destination_version_mismatch(fh):
 
 def test_firehose_s3_destination_writes(s3, fh):
     """PutRecord with S3 destination actually writes data to the S3 bucket."""
-    import base64, time as _time
+    import base64
+    import time as _time
     bucket = "fh-s3-dest-v39"
     s3.create_bucket(Bucket=bucket)
     fh.create_delivery_stream(

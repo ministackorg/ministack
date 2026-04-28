@@ -3,13 +3,13 @@
 import io
 import json
 import os
-import pytest
 import time
 import uuid as _uuid_mod
 import zipfile
-from botocore.exceptions import ClientError
 from urllib.parse import urlparse
 
+import pytest
+from botocore.exceptions import ClientError
 
 # ========== from test_ministack.py ==========
 
@@ -135,6 +135,7 @@ def test_ministack_package_services_importable():
         eventbridge,
         firehose,
         glue,
+        iam,
         kinesis,
         lambda_svc,
         rds,
@@ -146,8 +147,8 @@ def test_ministack_package_services_importable():
         sqs,
         ssm,
         stepfunctions,
+        sts,
     )
-    from ministack.services import iam, sts
 
     for mod in [
         s3,
@@ -511,9 +512,9 @@ def test_unit_h11_informational_has_reason_phrase():
     """h11.InformationalResponse(100, ...) serialises as 'HTTP/1.1 100 Continue' once the patch is installed."""
     # Import ministack.app triggers the patch; tests usually hit a live server
     # already, but import it here defensively for isolated runs.
-    import ministack.app  # noqa: F401
-
     import h11
+
+    import ministack.app  # noqa: F401
 
     conn = h11.Connection(our_role=h11.SERVER)
     conn.receive_data(
@@ -599,7 +600,9 @@ def test_persistence_s3_writes_state_after_ownership_and_public_access_block(tmp
     bucket has OwnershipControls / PublicAccessBlock configured (Terraform v6
     sends both by default). Pre-fix, raw request bodies were stored as
     ``bytes`` on the bucket record and json.dump silently failed."""
-    import importlib, json
+    import importlib
+    import json
+
     import ministack.core.persistence as pers
 
     monkeypatch.setattr(pers, "PERSIST_STATE", True)

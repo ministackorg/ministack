@@ -4,15 +4,17 @@ import base64
 import io
 import json
 import os
-import pytest
 import time
 import urllib.error
 import urllib.request
 import uuid as _uuid_mod
 import zipfile
-from botocore.exceptions import ClientError
-from urllib.parse import urlparse, parse_qs as _parse_qs, urlencode as _urlencode
+from urllib.parse import parse_qs as _parse_qs
+from urllib.parse import urlencode as _urlencode
+from urllib.parse import urlparse
 
+import pytest
+from botocore.exceptions import ClientError
 
 # ========== from test_cognito.py ==========
 
@@ -1077,7 +1079,9 @@ def test_cognito_set_user_mfa_preference_via_token(cognito_idp):
 
 def test_cognito_jwks_endpoint():
     """/.well-known/jwks.json returns valid JWK set."""
-    import urllib.request, json as _json
+    import json as _json
+    import urllib.request
+
     from conftest import make_client
     cognito = make_client("cognito-idp")
     pool = cognito.create_user_pool(PoolName="jwks-pool")["UserPool"]
@@ -1094,7 +1098,9 @@ def test_cognito_jwks_endpoint():
 
 def test_cognito_openid_configuration():
     """/.well-known/openid-configuration returns valid discovery document."""
-    import urllib.request, json as _json
+    import json as _json
+    import urllib.request
+
     from conftest import make_client
     cognito = make_client("cognito-idp")
     pool = cognito.create_user_pool(PoolName="oidc-pool")["UserPool"]
@@ -1605,7 +1611,6 @@ import urllib.parse
 import urllib.request
 
 from conftest import ENDPOINT, make_client
-
 
 # ---------------------------------------------------------------------------
 # Helpers

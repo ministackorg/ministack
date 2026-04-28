@@ -2,12 +2,13 @@ import io
 import json
 import os
 import time
+import uuid as _uuid_mod
 import zipfile
 from urllib.parse import urlparse
+
 import pytest
 from botocore.exceptions import ClientError
-from botocore.exceptions import ClientError
-import uuid as _uuid_mod
+
 
 def test_efs_create_and_describe_filesystem(efs):
     resp = efs.create_file_system(
