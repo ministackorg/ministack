@@ -64,6 +64,20 @@ def test_sns_subscribe_email(sns):
     )
     assert "SubscriptionArn" in resp
 
+
+def test_sns_subscribe_pending_arn_is_lowercase_with_space(sns):
+    """For protocols that require confirmation, AWS returns the literal
+    lowercase string 'pending confirmation' (with a space) as the
+    SubscriptionArn until the subscriber confirms — NOT PascalCase
+    'PendingConfirmation'."""
+    arn = sns.create_topic(Name="intg-sns-pending-arn")["TopicArn"]
+    resp = sns.subscribe(
+        TopicArn=arn,
+        Protocol="http",
+        Endpoint="http://example.com/sns-callback",
+    )
+    assert resp["SubscriptionArn"] == "pending confirmation", resp["SubscriptionArn"]
+
 def test_sns_unsubscribe(sns):
     arn = sns.create_topic(Name="intg-sns-unsub")["TopicArn"]
     sub = sns.subscribe(
