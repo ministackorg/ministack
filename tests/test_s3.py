@@ -1,12 +1,10 @@
-import io
 import json
-import os
 import time
-import zipfile
 from urllib.parse import urlparse
 import pytest
 from botocore.exceptions import ClientError
-import uuid as _uuid_mod
+
+from conftest import make_client, patch_endpoint_dns, ENDPOINT_HOST
 
 def test_s3_create_bucket(s3):
     s3.create_bucket(Bucket="intg-s3-create")
@@ -446,6 +444,27 @@ def test_s3_control_list_tags_via_s3_control_host(s3):
         body = r.read().decode()
     assert "env" in body
     assert "test" in body
+
+def test_s3_vhost_get_put_object(s3):
+    """Virtual-hosted (subdomain) style access: bucket.<host>/key must resolve correctly.
+
+    Tests both ``{bucket}.localhost:4566`` and ``{bucket}.s3.localhost:4566`` Host patterns.
+    """
+    bkt = "intg-s3-vhost"
+    s3.create_bucket(Bucket=bkt)
+    s3.put_object(Bucket=bkt, Key="vhost-test.txt", Body=b"vhost content")
+
+    # test get with path style
+    s3_path = make_client("s3", additional_config_kwargs=dict(s3={"addressing_style": "path"}))
+    resp = s3_path.get_object(Bucket=bkt, Key="vhost-test.txt")
+    assert resp["Body"].read() == b"vhost content"
+
+    # test get with vhost style
+    with patch_endpoint_dns():
+        s3_virtual = make_client("s3", additional_config_kwargs=dict(s3={"addressing_style": "virtual"}))
+        resp = s3_virtual.get_object(Bucket=bkt, Key="vhost-test.txt")
+        assert resp["Body"].read() == b"vhost content"
+
 
 def test_s3_bucket_policy(s3):
     bkt = "intg-s3-policy"
@@ -1589,3 +1608,79 @@ def test_s3_lifecycle_abort_multipart(s3):
     )
     resp = s3.get_bucket_lifecycle_configuration(Bucket=bucket)
     assert resp["Rules"][0]["AbortIncompleteMultipartUpload"]["DaysAfterInitiation"] == 7
+
+
+# ---------------------------------------------------------------------------
+# Unit tests for _parse_bucket_key
+# ---------------------------------------------------------------------------
+
+from ministack.services.s3 import _parse_bucket_key
+
+
+def test_parse_bucket_key_vhost_s3_dot():
+    """bucket.s3.domain style extracts bucket from host."""
+    bucket, key = _parse_bucket_key("/my-key.txt", {"host": f"myBucket.s3.{ENDPOINT_HOST}"})
+    assert bucket == "myBucket"
+    assert key == "my-key.txt"
+
+
+def test_parse_bucket_key_vhost_s3_dot_region():
+    """bucket.s3.region.domain style extracts bucket from host."""
+    bucket, key = _parse_bucket_key("/my-key.txt", {"host": f"myBucket.s3.us-east-1.{ENDPOINT_HOST}"})
+    assert bucket == "myBucket"
+    assert key == "my-key.txt"
+
+
+def test_parse_bucket_key_vhost_plain():
+    """bucket.domain style (no s3 segment) extracts bucket from host."""
+    bucket, key = _parse_bucket_key("/my-key.txt", {"host": f"myBucket.{ENDPOINT_HOST}"})
+    assert bucket == "myBucket"
+    assert key == "my-key.txt"
+
+
+def test_parse_bucket_key_vhost_root_path():
+    """Vhost with root path yields an empty key."""
+    bucket, key = _parse_bucket_key("/", {"host": f"myBucket.s3.{ENDPOINT_HOST}"})
+    assert bucket == "myBucket"
+    assert key == ""
+
+def test_parse_bucket_key_bare_s3_with_region():
+    """ bare s3 with region extracts bucket and key from path."""
+    bucket, key = _parse_bucket_key("/myBucket/my-key.txt", {"host": f"s3.us-east-1.{ENDPOINT_HOST}"})
+    assert bucket == "myBucket"
+    assert key == "my-key.txt"
+
+def test_parse_bucket_key_vhost_s3_with_non_endpint_host():
+    """ path style with non-endpoint host extracts bucket and key from path."""
+    bucket, key = _parse_bucket_key("/myBucket/my-key.txt", {"host": "notMyBucket.s3.us-east-1.not-endpoint"})
+    assert bucket == "myBucket"
+    assert key == "my-key.txt"
+
+def test_parse_bucket_key_vhost_nested_key():
+    """Vhost request preserves the full nested key path."""
+    bucket, key = _parse_bucket_key(
+        "/prefix/nested/object.txt", {"host": f"myBucket.s3.{ENDPOINT_HOST}"}
+    )
+    assert bucket == "myBucket"
+    assert key == "prefix/nested/object.txt"
+
+
+def test_parse_bucket_key_path_style():
+    """Path-style URL (no vhost match) extracts bucket and key from path."""
+    bucket, key = _parse_bucket_key("/myBucket/my-key.txt", {"host": "localhost"})
+    assert bucket == "myBucket"
+    assert key == "my-key.txt"
+
+
+def test_parse_bucket_key_no_host_header():
+    """Missing host header falls back to path-style parsing."""
+    bucket, key = _parse_bucket_key("/myBucket/my-key.txt", {})
+    assert bucket == "myBucket"
+    assert key == "my-key.txt"
+
+
+def test_parse_bucket_key_ipv4_host_uses_path_style():
+    """IPv4 host addresses are not treated as vhost and fall back to path parsing."""
+    bucket, key = _parse_bucket_key("/myBucket/my-key.txt", {"host": "192.168.1.1"})
+    assert bucket == "myBucket"
+    assert key == "my-key.txt"

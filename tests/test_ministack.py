@@ -633,3 +633,111 @@ def test_persistence_s3_writes_state_after_ownership_and_public_access_block(tmp
     pers.save_state("roundtrip-bytes", state_with_bytes)
     loaded = pers.load_state("roundtrip-bytes")
     assert loaded["blob"] == b"\x00\x01\xff\xfe"
+
+
+# ---------------------------------------------------------------------------
+# Unit tests for _S3_VHOST_RE / _S3_VHOST_EXCLUDE_RE / _NON_S3_VHOST_NAMES
+# ---------------------------------------------------------------------------
+
+from ministack.app import _S3_VHOST_RE, _S3_VHOST_EXCLUDE_RE, _NON_S3_VHOST_NAMES
+
+
+class TestS3VhostRe:
+    """_S3_VHOST_RE extracts the bucket name from virtual-hosted S3 host headers."""
+
+    # --- should match ---
+
+    def test_plain_vhost(self):
+        """bucket.localhost — boto3/SDK default style."""
+        m = _S3_VHOST_RE.match("mybucket.localhost")
+        assert m is not None
+        assert m.group(1) == "mybucket"
+
+    def test_plain_vhost_with_port(self):
+        """bucket.localhost:4566 — includes port number."""
+        m = _S3_VHOST_RE.match("mybucket.localhost:4566")
+        assert m is not None
+        assert m.group(1) == "mybucket"
+
+    def test_s3_segment_vhost(self):
+        """bucket.s3.localhost — Terraform AWS provider v4+ style."""
+        m = _S3_VHOST_RE.match("mybucket.s3.localhost")
+        assert m is not None
+        assert m.group(1) == "mybucket"
+
+    def test_s3_segment_vhost_with_port(self):
+        """bucket.s3.localhost:4566 — Terraform style with port."""
+        m = _S3_VHOST_RE.match("mybucket.s3.localhost:4566")
+        assert m is not None
+        assert m.group(1) == "mybucket"
+
+    def test_bucket_with_hyphens(self):
+        """Bucket names containing hyphens are matched correctly."""
+        m = _S3_VHOST_RE.match("my-bucket-name.localhost")
+        assert m is not None
+        assert m.group(1) == "my-bucket-name"
+
+    # --- should NOT match ---
+
+    def test_bare_host_no_bucket(self):
+        """localhost alone has no bucket prefix — must not match."""
+        assert _S3_VHOST_RE.match("localhost") is None
+
+    def test_bare_host_with_port(self):
+        """localhost:4566 alone — must not match."""
+        assert _S3_VHOST_RE.match("localhost:4566") is None
+
+    def test_wrong_host(self):
+        """Requests to an unrelated domain must not match."""
+        assert _S3_VHOST_RE.match("mybucket.example.com") is None
+
+    def test_execute_api_host(self):
+        """execute-api sub-service hostname must not be claimed as an S3 bucket."""
+        assert _S3_VHOST_RE.match("abc12345.execute-api.localhost") is None
+
+    def test_ip_address_host(self):
+        """IPv4 address host headers must not match."""
+        assert _S3_VHOST_RE.match("192.168.1.1") is None
+
+
+class TestS3VhostExcludeRe:
+    """_S3_VHOST_EXCLUDE_RE gates out sub-service hostnames that look like vhosts."""
+
+    def test_excludes_execute_api(self):
+        assert _S3_VHOST_EXCLUDE_RE.search("abc12345.execute-api.localhost")
+
+    def test_excludes_alb(self):
+        assert _S3_VHOST_EXCLUDE_RE.search("mybucket.alb.localhost")
+
+    def test_excludes_emr(self):
+        assert _S3_VHOST_EXCLUDE_RE.search("mybucket.emr.localhost")
+
+    def test_excludes_efs(self):
+        assert _S3_VHOST_EXCLUDE_RE.search("mybucket.efs.localhost")
+
+    def test_excludes_elasticache(self):
+        assert _S3_VHOST_EXCLUDE_RE.search("mybucket.elasticache.localhost")
+
+    def test_excludes_s3_control(self):
+        assert _S3_VHOST_EXCLUDE_RE.search("mybucket.s3-control.localhost")
+
+    def test_does_not_exclude_plain_vhost(self):
+        assert not _S3_VHOST_EXCLUDE_RE.search("mybucket.localhost")
+
+    def test_does_not_exclude_s3_segment_vhost(self):
+        assert not _S3_VHOST_EXCLUDE_RE.search("mybucket.s3.localhost")
+
+
+class TestNonS3VhostNames:
+    """_NON_S3_VHOST_NAMES prevents service endpoint names from being treated as bucket names."""
+
+    def test_s3_is_excluded(self):
+        assert "s3" in _NON_S3_VHOST_NAMES
+
+    def test_common_services_excluded(self):
+        for svc in ("sqs", "sns", "dynamodb", "lambda", "iam", "sts", "secretsmanager"):
+            assert svc in _NON_S3_VHOST_NAMES, f"{svc!r} should be in _NON_S3_VHOST_NAMES"
+
+    def test_normal_bucket_name_not_excluded(self):
+        assert "mybucket" not in _NON_S3_VHOST_NAMES
+        assert "my-data" not in _NON_S3_VHOST_NAMES
