@@ -159,16 +159,64 @@ async def handle_request(method, path, headers, body, query_params):
                     ns="sts")
 
     if action == "GetWebIdentityToken":
-        audiences = [v for k, v in params.items() for v in (v if isinstance(v, list) else [v]) if k.startswith("Audience")]
+        # --- AWS-spec validation ---
+        # SigningAlgorithm: REQUIRED, must be RS256 or ES384.
+        signing_alg = _p(params, "SigningAlgorithm")
+        if not signing_alg:
+            return _error(400, "MissingParameter",
+                          "The request must contain the parameter SigningAlgorithm.",
+                          ns="sts")
+        if signing_alg not in ("RS256", "ES384"):
+            return _error(400, "ValidationError",
+                          f"Value '{signing_alg}' at 'signingAlgorithm' failed to satisfy constraint: "
+                          f"Member must satisfy enum value set: [RS256, ES384]",
+                          ns="sts")
+
+        # Audience: REQUIRED, 1-10 items, each 1-1000 chars.
+        audiences = []
+        for k, v in params.items():
+            if k == "Audience" or k.startswith("Audience.member."):
+                vals = v if isinstance(v, list) else [v]
+                audiences.extend(vals)
         if not audiences:
-            audiences = [_p(params, "Audience", "sts.amazonaws.com")]
-        duration = int(_p(params, "DurationSeconds") or 300)
+            return _error(400, "MissingParameter",
+                          "The request must contain the parameter Audience.",
+                          ns="sts")
+        if len(audiences) > 10:
+            return _error(400, "ValidationError",
+                          "1 validation error detected: Value at 'audience' failed to satisfy constraint: "
+                          "Member must have length less than or equal to 10",
+                          ns="sts")
+        for a in audiences:
+            if not (1 <= len(a) <= 1000):
+                return _error(400, "ValidationError",
+                              "1 validation error detected: Value at 'audience' failed to satisfy constraint: "
+                              "Member must have length between 1 and 1000",
+                              ns="sts")
+
+        # DurationSeconds: optional, 60-3600, default 300.
+        try:
+            duration = int(_p(params, "DurationSeconds") or 300)
+        except (TypeError, ValueError):
+            return _error(400, "ValidationError",
+                          "Value for DurationSeconds must be an integer.",
+                          ns="sts")
+        if not (60 <= duration <= 3600):
+            return _error(400, "ValidationError",
+                          f"1 validation error detected: Value '{duration}' at 'durationSeconds' "
+                          f"failed to satisfy constraint: Member must have value between 60 and 3600",
+                          ns="sts")
+
         now = int(time.time())
         exp = now + duration
         expiration = _future(duration)
 
-        # Build a minimal JWT (header.payload.signature)
-        header = {"alg": _p(params, "SigningAlgorithm", "RS256"), "typ": "JWT"}
+        # Emulator stub: real STS signs RS256/ES384 via JWKS-published keys; we
+        # HMAC-sign so the token is self-contained and parseable but not
+        # publicly verifiable. Header reports HS256 to stay honest about the
+        # signature. Workloads that only inspect claims work; workloads that
+        # verify against AWS JWKS are not in scope for the emulator.
+        header = {"alg": "HS256", "typ": "JWT"}
         payload = {
             "sub": f"arn:aws:iam::{get_account_id()}:root",
             "aud": audiences if len(audiences) > 1 else audiences[0],
@@ -176,10 +224,6 @@ async def handle_request(method, path, headers, body, query_params):
             "iat": now,
             "exp": exp,
         }
-        # Include tags as custom claims if provided
-        for k, v in params.items():
-            if k.startswith("Tags.member."):
-                pass  # simplified — tags ignored in emulator
 
         def _b64url(data: bytes) -> str:
             return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
