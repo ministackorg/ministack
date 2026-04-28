@@ -22,15 +22,14 @@ import asyncio
 import os
 import socket
 import time
+import urllib.request
 import uuid
 
 import pytest
-import urllib.request
 
 asyncssh = pytest.importorskip("asyncssh")
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ed25519
-
 
 ENDPOINT_HOST = os.environ.get("MINISTACK_HOST", "127.0.0.1")
 SFTP_PORT = int(os.environ.get("SFTP_PORT", "2222"))

@@ -2,11 +2,12 @@ import io
 import json
 import os
 import time
+import uuid as _uuid_mod
 import zipfile
 from urllib.parse import urlparse
+
 import pytest
 from botocore.exceptions import ClientError
-import uuid as _uuid_mod
 
 _LAMBDA_ROLE = "arn:aws:iam::000000000000:role/lambda-role"
 
@@ -351,8 +352,9 @@ def test_kinesis_iterator_reuse_on_retry(kin):
 
 def test_kinesis_cbor_put_record(kin):
     """Java SDK sends CBOR-encoded PutRecord; ministack must decode it."""
-    import cbor2
     import urllib.request
+
+    import cbor2
 
     endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
 

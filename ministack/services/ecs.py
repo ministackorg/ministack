@@ -33,12 +33,12 @@ import time
 from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountScopedDict,
-    get_account_id,
     error_response_json,
+    get_account_id,
+    get_region,
     json_response,
     new_uuid,
     now_iso,
-    get_region,
 )
 
 logger = logging.getLogger("ecs")
@@ -1144,7 +1144,7 @@ def _tag_resource(data):
         or arn in _tags
     )
     if not found:
-        return error_response_json("InvalidParameterException", f"The specified resource is not valid.", 400)
+        return error_response_json("InvalidParameterException", "The specified resource is not valid.", 400)
     existing = _tags.get(arn, [])
     existing_keys = {t["key"]: i for i, t in enumerate(existing)}
     for tag in new_tags:

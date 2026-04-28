@@ -9,15 +9,14 @@ import base64
 import json
 import logging
 import os
+import queue
 import shutil
 import subprocess
 import sys
-import queue
 import tempfile
 import threading
 import time
 import zipfile
-import queue
 
 logger = logging.getLogger("lambda_runtime")
 

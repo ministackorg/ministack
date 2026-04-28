@@ -51,6 +51,8 @@ Wire protocol:
 
 import base64
 import copy
+import hashlib
+import html as html_mod
 import json
 import logging
 import os
@@ -60,15 +62,21 @@ import string
 import time
 import zlib
 from datetime import datetime, timezone
-import hashlib
-import html as html_mod
-from urllib.parse import parse_qs, urlencode, quote
-from xml.etree.ElementTree import Element, SubElement, tostring as xml_tostring
+from urllib.parse import parse_qs, quote, urlencode
+from xml.etree.ElementTree import Element, SubElement
+from xml.etree.ElementTree import tostring as xml_tostring
 
 from defusedxml.ElementTree import fromstring as safe_xml_parse
 
-from ministack.core.persistence import load_state, PERSIST_STATE
-from ministack.core.responses import AccountScopedDict, get_account_id, error_response_json, json_response, new_uuid, get_region
+from ministack.core.persistence import PERSIST_STATE, load_state
+from ministack.core.responses import (
+    AccountScopedDict,
+    error_response_json,
+    get_account_id,
+    get_region,
+    json_response,
+    new_uuid,
+)
 
 logger = logging.getLogger("cognito")
 
@@ -80,8 +88,8 @@ _RSA_PRIVATE_KEY = None
 _JWKS_KEY: dict = {}
 
 try:
-    from cryptography.hazmat.primitives.asymmetric import rsa
     from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
 
     _rsa_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     _RSA_PRIVATE_KEY = _rsa_key
@@ -340,8 +348,8 @@ def _fake_token(sub: str, pool_id: str, client_id: str, token_type: str = "acces
     ).rstrip(b"=").decode()
     signing_input = f"{header}.{payload}".encode()
     if _RSA_PRIVATE_KEY is not None:
-        from cryptography.hazmat.primitives.asymmetric import padding
         from cryptography.hazmat.primitives import hashes
+        from cryptography.hazmat.primitives.asymmetric import padding
         sig_bytes = _RSA_PRIVATE_KEY.sign(signing_input, padding.PKCS1v15(), hashes.SHA256())
         sig = base64.urlsafe_b64encode(sig_bytes).rstrip(b"=").decode()
     else:

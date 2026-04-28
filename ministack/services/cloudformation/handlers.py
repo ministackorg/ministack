@@ -7,20 +7,25 @@ import copy
 import json
 import logging
 
-from ministack.core.responses import get_account_id, new_uuid, now_iso
+from ministack.core.responses import get_account_id, get_region, new_uuid, now_iso
 
-from .engine import (
-    _evaluate_conditions, _parse_template, _resolve_parameters,
-    _resolve_refs, _NO_VALUE,
-)
-from .stacks import _add_event, _deploy_stack_async, _delete_stack_async, _diff_resources
-from .provisioners import _provision_resource
-from ministack.core.responses import get_region
-from .helpers import _xml, _error, _p, _esc, _extract_members, _extract_stack_status_filters, _resolve_template, CFN_NS
 from .changesets import (
-    _create_change_set, _describe_change_set, _execute_change_set,
-    _delete_change_set, _list_change_sets,
+    _create_change_set,
+    _delete_change_set,
+    _describe_change_set,
+    _execute_change_set,
+    _list_change_sets,
 )
+from .engine import (
+    _NO_VALUE,
+    _evaluate_conditions,
+    _parse_template,
+    _resolve_parameters,
+    _resolve_refs,
+)
+from .helpers import CFN_NS, _error, _esc, _extract_members, _extract_stack_status_filters, _p, _resolve_template, _xml
+from .provisioners import _provision_resource
+from .stacks import _add_event, _delete_stack_async, _deploy_stack_async, _diff_resources
 
 logger = logging.getLogger("cloudformation")
 
@@ -28,7 +33,7 @@ logger = logging.getLogger("cloudformation")
 # --- CreateStack ---
 
 def _create_stack(params):
-    from ministack.services.cloudformation import _stacks, _stack_events, _exports, _change_sets
+    from ministack.services.cloudformation import _change_sets, _exports, _stack_events, _stacks
     stack_name = _p(params, "StackName")
     if not stack_name:
         return _error("ValidationError", "StackName is required")
@@ -221,7 +226,7 @@ def _list_stacks(params):
 # --- DescribeStackEvents ---
 
 def _describe_stack_events(params):
-    from ministack.services.cloudformation import _stacks, _stack_events
+    from ministack.services.cloudformation import _stack_events, _stacks
     stack_name = _p(params, "StackName")
     if not stack_name:
         return _error("ValidationError", "StackName is required")

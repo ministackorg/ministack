@@ -24,6 +24,7 @@ denormalise on write.
 import json
 import logging
 import os
+
 from ministack.core.responses import get_region
 
 logger = logging.getLogger("tagging")

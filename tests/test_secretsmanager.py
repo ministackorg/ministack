@@ -2,11 +2,13 @@ import io
 import json
 import os
 import time
+import uuid as _uuid_mod
 import zipfile
 from urllib.parse import urlparse
+
 import pytest
 from botocore.exceptions import ClientError
-import uuid as _uuid_mod
+
 
 def test_secretsmanager_resource_policy(sm):
     sm.create_secret(Name="sm-pol-sec", SecretString="secret-val")

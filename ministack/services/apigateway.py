@@ -49,7 +49,7 @@ import time
 import urllib.error
 import urllib.request
 
-from ministack.core.responses import AccountScopedDict, get_account_id, error_response_json, new_uuid, get_region
+from ministack.core.responses import AccountScopedDict, error_response_json, get_account_id, get_region, new_uuid
 
 _HOST = os.environ.get("MINISTACK_HOST", "localhost")
 _PORT = os.environ.get("GATEWAY_PORT", "4566")

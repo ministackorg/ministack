@@ -2,11 +2,13 @@ import io
 import json
 import os
 import time
+import uuid as _uuid_mod
 import zipfile
 from urllib.parse import urlparse
+
 import pytest
 from botocore.exceptions import ClientError
-import uuid as _uuid_mod
+
 
 def test_s3_create_bucket(s3):
     s3.create_bucket(Bucket="intg-s3-create")
@@ -71,7 +73,9 @@ def test_s3_put_object_no_bucket(s3):
 
 def test_s3_put_get_json_chunked(s3):
     """AWS SDK v2 sends PutObject with chunked Transfer-Encoding — body must be decoded cleanly."""
-    import urllib.request, urllib.parse, json as _json
+    import json as _json
+    import urllib.parse
+    import urllib.request
     bucket = "intg-s3-chunked"
     s3.create_bucket(Bucket=bucket)
 
@@ -100,7 +104,8 @@ def test_s3_put_get_json_chunked(s3):
 
 def test_s3_put_zero_byte_chunked(s3):
     """Zero-byte PutObject via AWS chunked encoding must store empty body and return correct ETag."""
-    import urllib.request, hashlib
+    import hashlib
+    import urllib.request
     bucket = "intg-s3-zero-byte"
     s3.create_bucket(Bucket=bucket)
 
@@ -381,7 +386,8 @@ def test_s3_control_tag_resource_post_xml_stores_tags(s3):
     send) and persist the tags. Previously the handler only had GET/PUT/DELETE
     and parsed bodies as JSON, silently dropping all tags.
     """
-    import urllib.request, urllib.parse
+    import urllib.parse
+    import urllib.request
     bkt = "intg-s3control-tag-post"
     s3.create_bucket(Bucket=bkt)
     arn = urllib.parse.quote(f"arn:aws:s3:::{bkt}", safe="")
@@ -425,7 +431,8 @@ def test_s3_control_tag_resource_post_xml_stores_tags(s3):
 
 def test_s3_control_list_tags_via_s3_control_host(s3):
     """S3 Control requests via s3-control.localhost host must not be intercepted by S3 vhost."""
-    import urllib.request, urllib.parse
+    import urllib.parse
+    import urllib.request
     bkt = "intg-s3control-host"
     s3.create_bucket(Bucket=bkt)
     s3.put_bucket_tagging(
@@ -560,7 +567,7 @@ def test_s3_object_retention(s3):
     s3.create_bucket(Bucket=bkt, ObjectLockEnabledForBucket=True)
     s3.put_object(Bucket=bkt, Key="doc.txt", Body=b"hello")
 
-    from datetime import datetime, timezone, timedelta
+    from datetime import datetime, timedelta, timezone
 
     retain_until = datetime.now(timezone.utc) + timedelta(days=1)
     s3.put_object_retention(
@@ -613,7 +620,7 @@ def test_s3_object_lock_prevents_delete(s3):
         Key="locked.txt",
         LegalHold={"Status": "OFF"},
     )
-    from datetime import datetime, timezone, timedelta
+    from datetime import datetime, timedelta, timezone
 
     retain_until = datetime.now(timezone.utc) + timedelta(days=1)
     s3.put_object_retention(
@@ -680,7 +687,7 @@ def test_s3_replication_requires_versioning(s3):
 def test_s3_put_object_with_lock_headers(s3):
     bkt = "intg-s3-put-lock-hdr"
     s3.create_bucket(Bucket=bkt, ObjectLockEnabledForBucket=True)
-    from datetime import datetime, timezone, timedelta
+    from datetime import datetime, timedelta, timezone
 
     retain_until = datetime.now(timezone.utc) + timedelta(days=5)
     s3.put_object(
@@ -824,7 +831,7 @@ def test_s3_replication_validates_dest_versioning(s3):
 def test_s3_head_object_returns_lock_headers(s3):
     bkt = "intg-s3-head-lock-hdr"
     s3.create_bucket(Bucket=bkt, ObjectLockEnabledForBucket=True)
-    from datetime import datetime, timezone, timedelta
+    from datetime import datetime, timedelta, timezone
 
     retain_until = datetime.now(timezone.utc) + timedelta(days=3)
     s3.put_object(

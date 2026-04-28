@@ -47,10 +47,10 @@ from ministack.core.responses import (
     AccountScopedDict,
     error_response_json,
     get_account_id,
+    get_region,
     json_response,
     new_uuid,
     now_iso,
-    get_region,
 )
 
 logger = logging.getLogger("transfer")

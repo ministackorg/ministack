@@ -241,7 +241,7 @@ def test_tagging_get_resources_glue(tagging, glue):
     glue.create_database(DatabaseInput={"Name": "tg-glue-db"})
     db_arn = glue.get_database(Name="tg-glue-db")["Database"].get(
         "DatabaseArn",
-        f"arn:aws:glue:us-east-1:000000000000:database/tg-glue-db",
+        "arn:aws:glue:us-east-1:000000000000:database/tg-glue-db",
     )
     glue.tag_resource(ResourceArn=db_arn, TagsToAdd={_TAG_KEY: "glue-basic"})
 
@@ -299,7 +299,7 @@ def test_tagging_get_resources_scheduler(tagging, scheduler):
         },
         FlexibleTimeWindow={"Mode": "OFF"},
     )
-    sched_arn = f"arn:aws:scheduler:us-east-1:000000000000:schedule/default/tg-scheduler-sched"
+    sched_arn = "arn:aws:scheduler:us-east-1:000000000000:schedule/default/tg-scheduler-sched"
     scheduler.tag_resource(ResourceArn=sched_arn, Tags=[{"Key": _TAG_KEY, "Value": "scheduler-basic"}])
 
     resp = tagging.get_resources(TagFilters=[{"Key": _TAG_KEY, "Values": ["scheduler-basic"]}])

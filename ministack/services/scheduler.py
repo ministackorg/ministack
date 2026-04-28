@@ -17,8 +17,8 @@ import os
 import re
 import time
 
-from ministack.core.responses import AccountScopedDict, get_account_id, get_region
 from ministack.core.persistence import load_state
+from ministack.core.responses import AccountScopedDict, get_account_id, get_region
 
 logger = logging.getLogger("scheduler")
 

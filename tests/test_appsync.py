@@ -2,11 +2,13 @@ import io
 import json
 import os
 import time
+import uuid as _uuid_mod
 import zipfile
 from urllib.parse import urlparse
+
 import pytest
 from botocore.exceptions import ClientError
-import uuid as _uuid_mod
+
 
 def test_appsync_create_and_list_api():
     """Create a GraphQL API and list it."""
@@ -97,7 +99,8 @@ def test_appsync_graphql_create_and_query(ddb):
     )
 
     # Execute mutation via HTTP
-    import urllib.request, json as _json
+    import json as _json
+    import urllib.request
     mutation = _json.dumps({
         "query": 'mutation CreateUser { createUser(input: {id: "u1", name: "Alice", email: "alice@example.com"}) { id name email } }',
     }).encode()
@@ -142,7 +145,9 @@ def test_appsync_graphql_create_and_query(ddb):
 
 def test_appsync_graphql_update_mutation(ddb):
     """Update an existing item via GraphQL mutation."""
-    import urllib.request, json as _json
+    import json as _json
+    import urllib.request
+
     from conftest import make_client
     appsync = make_client("appsync")
 
@@ -177,7 +182,9 @@ def test_appsync_graphql_update_mutation(ddb):
 
 def test_appsync_graphql_delete_mutation(ddb):
     """Delete an item via GraphQL mutation."""
-    import urllib.request, json as _json
+    import json as _json
+    import urllib.request
+
     from conftest import make_client
     appsync = make_client("appsync")
 
@@ -209,7 +216,9 @@ def test_appsync_graphql_delete_mutation(ddb):
 
 def test_appsync_graphql_with_variables():
     """GraphQL query using $variables."""
-    import urllib.request, json as _json
+    import json as _json
+    import urllib.request
+
     from conftest import make_client
     appsync = make_client("appsync")
     ddb_client = make_client("dynamodb")
@@ -241,7 +250,9 @@ def test_appsync_graphql_with_variables():
 
 def test_appsync_graphql_nonexistent_item():
     """Query for a non-existent item returns null."""
-    import urllib.request, json as _json
+    import json as _json
+    import urllib.request
+
     from conftest import make_client
     appsync = make_client("appsync")
     ddb_client = make_client("dynamodb")
@@ -266,7 +277,8 @@ def test_appsync_graphql_nonexistent_item():
 
 def test_appsync_graphql_nonexistent_api():
     """Query against a non-existent API returns 404."""
-    import urllib.request, json as _json
+    import json as _json
+    import urllib.request
     req = urllib.request.Request("http://localhost:4566/v1/apis/fake-api-id/graphql",
         data=_json.dumps({"query": "{ getItem(id: \"1\") { id } }"}).encode(),
         headers={"Content-Type": "application/json"})
@@ -278,7 +290,9 @@ def test_appsync_graphql_nonexistent_api():
 
 def test_appsync_graphql_empty_query():
     """Empty query returns 400."""
-    import urllib.request, json as _json
+    import json as _json
+    import urllib.request
+
     from conftest import make_client
     appsync = make_client("appsync")
     api = appsync.create_graphql_api(name="gql-empty", authenticationType="API_KEY")["graphqlApi"]

@@ -12,20 +12,27 @@ Supports: CreateSecret, GetSecretValue, ListSecrets, DeleteSecret,
 
 import base64
 import copy
-import os
 import json
 import logging
+import os
 import secrets as stdlib_secrets
 import string
 import time
 
-from ministack.core.responses import AccountScopedDict, get_account_id, error_response_json, json_response, new_uuid, get_region
+from ministack.core.responses import (
+    AccountScopedDict,
+    error_response_json,
+    get_account_id,
+    get_region,
+    json_response,
+    new_uuid,
+)
 
 logger = logging.getLogger("secretsmanager")
 
 REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 
-from ministack.core.persistence import load_state, PERSIST_STATE
+from ministack.core.persistence import PERSIST_STATE, load_state
 
 _secrets = AccountScopedDict()
 _resource_policies = AccountScopedDict()

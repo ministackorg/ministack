@@ -175,6 +175,7 @@ def test_get_state_strips_private_key_from_persisted_snapshot():
     disk, so anything in there ends up readable on the filesystem."""
     import importlib
     import json
+
     from ministack.core.persistence import _json_default
     from ministack.core.responses import _request_account_id
     mod = importlib.import_module("ministack.services.acm")
@@ -253,6 +254,7 @@ def test_get_state_preserves_certs_across_all_tenants():
     is request-scoped via AccountScopedDict's contextvar; iterating
     `_certificates._data` captures all (account_id, key) pairs."""
     import importlib
+
     from ministack.core.responses import _request_account_id
     mod = importlib.import_module("ministack.services.acm")
     mod.reset() if hasattr(mod, "reset") else None

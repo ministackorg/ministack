@@ -11,10 +11,14 @@ import time
 from ministack.core.responses import get_account_id, new_uuid, now_iso
 
 from .engine import (
-    _evaluate_conditions, _parse_template, _resolve_parameters,
-    _resolve_refs, _topological_sort, _NO_VALUE,
+    _NO_VALUE,
+    _evaluate_conditions,
+    _parse_template,
+    _resolve_parameters,
+    _resolve_refs,
+    _topological_sort,
 )
-from .provisioners import _provision_resource, _delete_resource, REGION
+from .provisioners import REGION, _delete_resource, _provision_resource
 
 logger = logging.getLogger("cloudformation")
 
@@ -52,7 +56,7 @@ async def _deploy_stack_async(stack_name: str, stack_id: str, template: dict,
                               tags: list, is_update: bool = False,
                               previous_stack: dict | None = None):
     """Background task: provision resources and set final stack status."""
-    from ministack.services.cloudformation import _stacks, _exports
+    from ministack.services.cloudformation import _exports, _stacks
     status_prefix = "UPDATE" if is_update else "CREATE"
     stack = _stacks[stack_name]
 
@@ -241,7 +245,7 @@ async def _deploy_stack_async(stack_name: str, stack_id: str, template: dict,
 
 async def _delete_stack_async(stack_name: str, stack_id: str):
     """Background task: delete all resources and mark stack DELETE_COMPLETE."""
-    from ministack.services.cloudformation import _stacks, _exports
+    from ministack.services.cloudformation import _exports, _stacks
     stack = _stacks.get(stack_name)
     if not stack:
         return
