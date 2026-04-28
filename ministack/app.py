@@ -37,13 +37,35 @@ if _VERSION == "dev":
 _EXECUTE_API_RE = re.compile(
     r"^([a-f0-9]{8})\.execute-api\." + re.escape(_MINISTACK_HOST) + r"(?::\d+)?$"
 )
-# Matches virtual-hosted S3:
-#   "{bucket}.<host>" or "{bucket}.<host>:4566"          (boto3/SDK default)
-#   "{bucket}.s3.<host>" or "{bucket}.s3.<host>:4566"    (Terraform AWS provider v4+)
-# Does NOT match execute-api, alb, or other sub-service hostnames.
-_S3_VHOST_RE = re.compile(
-    r"^([^.]+)(?:\.s3)?\." + re.escape(_MINISTACK_HOST) + r"(?::\d+)?$"
-)
+# Virtual-hosted S3 bucket extraction. AWS-aligned per
+# docs.aws.amazon.com/AmazonS3/latest/userguide/VirtualHosting.html and
+# bucketnamingrules.html (HTTP vhost — ministack is HTTP). Works for any
+# endpoint hostname (localhost, ministack, custom Docker DNS, real AWS
+# domains) without hardcoding _MINISTACK_HOST.
+_IPV4_RE = re.compile(r"^(?:\d{1,3}\.){3}\d{1,3}$")
+_BUCKET_LABEL_RE = re.compile(r"^[a-z0-9](?:[a-z0-9.\-]{1,61}[a-z0-9])$")
+
+
+def _extract_s3_vhost_bucket(host: str):
+    """Return the bucket if Host is virtual-hosted-style S3, else None."""
+    if not host:
+        return None
+    host = host.strip()
+    if not host or host.startswith("["):
+        return None
+    host = host.lower()
+    if ":" in host:
+        host = host.rsplit(":", 1)[0]
+    if not host or _IPV4_RE.match(host) or "." not in host:
+        return None
+    candidate, tail = host.split(".", 1)
+    if not tail or tail.startswith("."):
+        return None
+    if not _BUCKET_LABEL_RE.match(candidate):
+        return None
+    if ".." in candidate or _IPV4_RE.match(candidate):
+        return None
+    return candidate
 _S3_VHOST_EXCLUDE_RE = re.compile(r"\.(execute-api|alb|emr|efs|elasticache|s3-control)\.")
 _HEALTH_PATHS = ("/_ministack/health", "/_localstack/health", "/health")
 _BODY_METHODS = ("POST", "PUT", "PATCH")
@@ -909,12 +931,8 @@ async def _handle_alb_request(host: str, path: str, method: str, headers: dict, 
 
 async def _handle_s3_vhost_request(host: str, path: str, method: str, headers: dict, body: bytes, query_params: dict):
     """Handle virtual-hosted S3 requests before generic routing."""
-    s3_vhost = _S3_VHOST_RE.match(host)
-    if not s3_vhost or _S3_VHOST_EXCLUDE_RE.search(host):
-        return None
-
-    bucket = s3_vhost.group(1)
-    if bucket in _NON_S3_VHOST_NAMES:
+    bucket = _extract_s3_vhost_bucket(host)
+    if not bucket or _S3_VHOST_EXCLUDE_RE.search(host) or bucket in _NON_S3_VHOST_NAMES:
         return None
 
     vhost_path = "/" + bucket + path if path != "/" else "/" + bucket + "/"
