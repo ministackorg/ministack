@@ -1,12 +1,10 @@
-import io
 import json
-import os
 import time
-import zipfile
 from urllib.parse import urlparse
 import pytest
 from botocore.exceptions import ClientError
-import uuid as _uuid_mod
+
+from conftest import make_client, patch_endpoint_dns, ENDPOINT_HOST
 
 def test_s3_create_bucket(s3):
     s3.create_bucket(Bucket="intg-s3-create")
@@ -446,6 +444,52 @@ def test_s3_control_list_tags_via_s3_control_host(s3):
         body = r.read().decode()
     assert "env" in body
     assert "test" in body
+
+class TestS3VhostGetPutObject:
+    """
+    Ensure vhost style and path style requests work correctly.
+
+    Test with both a simple bucket name and a max length one with dot and hyphen
+    """
+
+    BKT = "intg-s3-vhost"
+    # max length and dotted with hyphen
+    BKT_DOTTED_BASE = "intg-s3.vhost-nested.bucket"
+    BKT_DOTTED = BKT_DOTTED_BASE + "x" * (63 - len(BKT_DOTTED_BASE))
+
+    @pytest.fixture(autouse=True)
+    def _init_buckets(self, s3):
+        self.s3 = s3
+        print(s3)
+        assert len(self.BKT_DOTTED) == 63
+        self.s3_path = make_client("s3", additional_config_kwargs=dict(s3={"addressing_style": "path"}))
+        self.s3_virtual = make_client("s3", additional_config_kwargs=dict(s3={"addressing_style": "virtual"}))
+
+        s3.create_bucket(Bucket=self.BKT)
+        s3.put_object(Bucket=self.BKT, Key="vhost-test.txt", Body=b"vhost content")
+
+        s3.create_bucket(Bucket=self.BKT_DOTTED)
+        s3.put_object(Bucket=self.BKT_DOTTED, Key="vhost-test.txt", Body=b"vhost content")
+
+    def test_path_style_get(self):
+        resp = self.s3_path.get_object(Bucket=self.BKT, Key="vhost-test.txt")
+        assert resp["Body"].read() == b"vhost content"
+
+    def test_virtual_hosted_style_get(self):
+        with patch_endpoint_dns():
+            resp = self.s3_virtual.get_object(Bucket=self.BKT, Key="vhost-test.txt")
+        assert resp["Body"].read() == b"vhost content"
+
+    @pytest.mark.skip(reason="Dotted Nested Bucket is not supported yet")
+    def test_dotted_bucket_virtual_hosted_style_get(self):
+        with patch_endpoint_dns():
+            resp = self.s3_virtual.get_object(Bucket=self.BKT_DOTTED, Key="vhost-test.txt")
+        assert resp["Body"].read() == b"vhost content"
+
+    def test_dotted_bucket_path_style_get(self):
+        resp = self.s3_path.get_object(Bucket=self.BKT_DOTTED, Key="vhost-test.txt")
+        assert resp["Body"].read() == b"vhost content"
+
 
 def test_s3_bucket_policy(s3):
     bkt = "intg-s3-policy"

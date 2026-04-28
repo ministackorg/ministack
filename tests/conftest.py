@@ -1,7 +1,10 @@
 """
 Pytest fixtures for MiniStack integration tests.
 """
+import contextlib
 import os
+import socket
+from urllib.parse import urlparse
 import urllib.request
 
 import boto3
@@ -9,24 +12,42 @@ import pytest
 from botocore.config import Config
 
 ENDPOINT = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+ENDPOINT_HOST = urlparse(ENDPOINT).hostname
 REGION = "us-east-1"
 
-_kwargs = dict(
+_default_kwargs = dict(
     endpoint_url=ENDPOINT,
     aws_access_key_id="test",
     aws_secret_access_key="test",
     region_name=REGION,
-    # Hardcoded retry and pool settings to reduce transient connection flakes
-    config=Config(
+)
+  # Hardcoded retry and pool settings to reduce transient connection flakes
+_default_config_kwargs = dict(
         region_name=REGION,
         retries={"mode": "standard"},
         max_pool_connections=50,
-    ),
 )
 
 
-def make_client(service):
-    return boto3.client(service, **_kwargs)
+@contextlib.contextmanager
+def patch_endpoint_dns():
+    """Make *.MINISTACK_ENDPOINT subdomains resolve to 127.0.0.1 for virtual-hosted S3 testing."""
+    _real_getaddrinfo = socket.getaddrinfo
+
+    def _patched(host, port, *args, **kwargs):
+        if isinstance(host, str) and host.endswith(f".{ENDPOINT_HOST}"):
+            host = ENDPOINT_HOST
+        return _real_getaddrinfo(host, port, *args, **kwargs)
+
+    socket.getaddrinfo = _patched
+    yield
+    socket.getaddrinfo = _real_getaddrinfo
+
+
+def make_client(service, additional_config_kwargs=None):
+    if additional_config_kwargs is None:
+        additional_config_kwargs = {}
+    return boto3.client(service, **_default_kwargs, config=Config(**_default_config_kwargs, **additional_config_kwargs))
 
 
 _SERIAL_TESTS = {
