@@ -107,6 +107,21 @@ def ddb():
 def sts():
     return make_client("sts")
 
+@pytest.fixture
+def sts_as_role(sts):
+    def _make(role_arn, session_name="test-session"):
+        creds = sts.assume_role(RoleArn=role_arn, RoleSessionName=session_name)["Credentials"]
+        return boto3.client(
+            "sts",
+            endpoint_url=ENDPOINT,
+            aws_access_key_id=creds["AccessKeyId"],
+            aws_secret_access_key=creds["SecretAccessKey"],
+            aws_session_token=creds["SessionToken"],
+            region_name=REGION,
+            config=Config(retries={"mode": "standard"}),
+        )
+    return _make
+
 @pytest.fixture(scope="session")
 def sm():
     return make_client("secretsmanager")

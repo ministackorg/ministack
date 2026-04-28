@@ -229,3 +229,27 @@ def test_sts_get_web_identity_token_duration_too_long():
     )
     assert status == 400
     assert "ValidationError" in body
+def test_get_caller_identity_reflects_assumed_role(sts_as_role):
+    """GetCallerIdentity called with assumed-role creds must return the role ARN, not root."""
+    identity = sts_as_role("arn:aws:iam::000000000000:role/MyTestRole", "caller-identity-session").get_caller_identity()
+
+    assert identity["Account"] == "000000000000"
+    assert "MyTestRole" in identity["Arn"]
+    assert "caller-identity-session" in identity["Arn"]
+    assert ":assumed-role/" in identity["Arn"]
+
+
+def test_get_caller_identity_without_assume_role_returns_root(sts):
+    """GetCallerIdentity with root/plain creds must still return root ARN."""
+    identity = sts.get_caller_identity()
+    assert identity["Arn"] == "arn:aws:iam::000000000000:root"
+
+
+def test_get_caller_identity_different_roles_return_different_arns(sts_as_role):
+    """Two distinct assumed roles must produce distinct caller identities."""
+    arn_a = sts_as_role("arn:aws:iam::000000000000:role/RoleA", "session-a").get_caller_identity()["Arn"]
+    arn_b = sts_as_role("arn:aws:iam::000000000000:role/RoleB", "session-b").get_caller_identity()["Arn"]
+
+    assert "RoleA" in arn_a
+    assert "RoleB" in arn_b
+    assert arn_a != arn_b

@@ -20,6 +20,13 @@ from ministack.services.iam import _p, _xml, _error, _future, \
     _gen_session_access_key, _gen_secret, _gen_session_token
 
 
+_sessions: dict[str, dict] = {}
+
+
+def reset():
+    _sessions.clear()
+
+
 async def handle_request(method, path, headers, body, query_params):
     params = dict(query_params)
     content_type = headers.get("content-type", "")
@@ -44,12 +51,23 @@ async def handle_request(method, path, headers, body, query_params):
     use_json = "amz-json" in content_type
 
     if action == "GetCallerIdentity":
+        auth = headers.get("authorization", "")
+        caller_arn = f"arn:aws:iam::{get_account_id()}:root"
+        caller_user_id = get_account_id()
+        if "Credential=" in auth:
+            try:
+                access_key = auth.split("Credential=")[1].split("/")[0]
+                if access_key in _sessions:
+                    caller_arn = _sessions[access_key]["Arn"]
+                    caller_user_id = _sessions[access_key]["UserId"]
+            except Exception:
+                pass
         if use_json:
-            return json_response({"Account": get_account_id(), "Arn": f"arn:aws:iam::{get_account_id()}:root", "UserId": get_account_id()})
+            return json_response({"Account": get_account_id(), "Arn": caller_arn, "UserId": caller_user_id})
         return _xml(200, "GetCallerIdentityResponse",
                     f"<GetCallerIdentityResult>"
-                    f"<Arn>arn:aws:iam::{get_account_id()}:root</Arn>"
-                    f"<UserId>{get_account_id()}</UserId>"
+                    f"<Arn>{caller_arn}</Arn>"
+                    f"<UserId>{caller_user_id}</UserId>"
                     f"<Account>{get_account_id()}</Account>"
                     f"</GetCallerIdentityResult>",
                     ns="sts")
@@ -68,6 +86,7 @@ async def handle_request(method, path, headers, body, query_params):
         assumed_arn = role_arn.replace(":iam:", ":sts:", 1).replace(":role/", ":assumed-role/", 1)
         if not assumed_arn.endswith(f"/{session_name}"):
             assumed_arn = f"{assumed_arn}/{session_name}"
+        _sessions[access_key] = {"Arn": assumed_arn, "UserId": f"{role_id}:{session_name}"}
         if use_json:
             return json_response({
                 "Credentials": {"AccessKeyId": access_key, "SecretAccessKey": secret_key, "SessionToken": session_token, "Expiration": time.time() + duration},
@@ -101,6 +120,7 @@ async def handle_request(method, path, headers, body, query_params):
         if not assumed_arn.endswith(f"/{session}"):
             assumed_arn = f"{assumed_arn}/{session}"
         role_id = "AROA" + new_uuid().replace("-", "")[:17].upper()
+        _sessions[access_key] = {"Arn": assumed_arn, "UserId": f"{role_id}:{session}"}
         provider = _p(params, "ProviderId") or "sts.amazonaws.com"
         if use_json:
             return json_response({
