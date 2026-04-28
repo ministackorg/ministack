@@ -5,6 +5,12 @@ All notable changes to MiniStack will be documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning follows [Semantic Versioning](https://semver.org/).
 
+---
+
+## [Unreleased]
+
+### Added
+- **`ministackorg/ministack:full` Docker variant** — Debian/glibc-based superset of the regular Alpine image, adding `duckdb` (Athena engine), `psycopg2-binary` (PostgreSQL driver), and `pymysql` (MySQL driver). DuckDB and psycopg2 ship `manylinux` wheels but no `musllinux` wheels, so on Alpine they either fall back to source-builds or silently disable themselves; the `:full` tag installs them cleanly. Published in lockstep with the regular image on every release: `:full` always points at the latest Debian build, alongside `:{version}-full` and `:{major}.{minor}-full`. The regular `:latest` / `:{version}` tags are unchanged. Full image reports `edition: full` on `/_ministack/health`; regular reports `edition: light`. Closes the long-standing Athena-on-Alpine gap raised by @arischow.
 
 ---
 ## [1.3.16] — 2026-04-27

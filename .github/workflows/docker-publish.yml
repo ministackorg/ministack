@@ -28,7 +28,8 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Extract metadata
+      # ── Regular (Alpine) image — :latest, :{version}, :{major}.{minor} ──
+      - name: Extract metadata (regular)
         id: meta
         uses: docker/metadata-action@v5
         with:
@@ -40,15 +41,47 @@ jobs:
             type=semver,pattern={{major}}.{{minor}}
             type=raw,value=latest
 
-      - name: Build and push
+      - name: Build and push (regular)
         uses: docker/build-push-action@v5
         with:
           context: .
+          file: Dockerfile
           platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
             MINISTACK_VERSION=${{ steps.meta.outputs.version }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=regular
+          cache-to: type=gha,mode=max,scope=regular
+
+      # ── Full (Debian/glibc) image — :full, :{version}-full, :{major}.{minor}-full ──
+      # Adds DuckDB (Athena engine), psycopg2-binary, pymysql. Larger
+      # image (~360 MB vs ~110 MB) but all manylinux wheels install
+      # cleanly. Tracks the same release cadence as regular until
+      # issue #411 has a longer-term answer.
+      - name: Extract metadata (full)
+        id: meta_full
+        uses: docker/metadata-action@v5
+        with:
+          images: |
+            ${{ env.DOCKERHUB_IMAGE }}
+            ${{ env.DOCKERHUB_IMAGE_ORG }}
+          tags: |
+            type=semver,pattern={{version}},suffix=-full
+            type=semver,pattern={{major}}.{{minor}},suffix=-full
+            type=raw,value=full
+
+      - name: Build and push (full)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Dockerfile.full
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta_full.outputs.tags }}
+          labels: ${{ steps.meta_full.outputs.labels }}
+          build-args: |
+            MINISTACK_VERSION=${{ steps.meta_full.outputs.version }}
+          cache-from: type=gha,scope=full
+          cache-to: type=gha,mode=max,scope=full
