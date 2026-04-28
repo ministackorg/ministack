@@ -2,6 +2,7 @@ name: Docker Publish on PR
 
 on:
   pull_request_target:
+    types: [opened, synchronize, reopened, labeled]
 
 env:
   DOCKERHUB_IMAGE_ORG: ministackorg/ministack-preview-build
@@ -37,7 +38,8 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Extract metadata
+      # ── Regular (Alpine) image ──
+      - name: Extract metadata (regular)
         id: meta
         uses: docker/metadata-action@v6
         with:
@@ -46,18 +48,48 @@ jobs:
           tags: |
             type=ref,event=pr,suffix=-${{ steps.short_sha.outputs.short_sha }}
 
-      - name: Build and push
+      - name: Build and push (regular)
         uses: docker/build-push-action@v7
         with:
           context: .
+          file: Dockerfile
           platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
             MINISTACK_VERSION=pr-${{ github.event.pull_request.number }}-${{ steps.short_sha.outputs.short_sha }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=regular-pr
+          cache-to: type=gha,mode=max,scope=regular-pr
+
+      # ── Full (Debian/glibc) image — DuckDB-backed Athena, psycopg2, pymysql.
+      # Only built when the PR carries the `full-preview` label (opt-in to keep
+      # default PR cost down). Add the label to any PR that touches the full
+      # variant or needs DuckDB/Postgres/MySQL paths verified end-to-end.
+      - name: Extract metadata (full)
+        id: meta_full
+        if: contains(github.event.pull_request.labels.*.name, 'full-preview')
+        uses: docker/metadata-action@v6
+        with:
+          images: |
+            ${{ env.DOCKERHUB_IMAGE_ORG }}
+          tags: |
+            type=ref,event=pr,suffix=-${{ steps.short_sha.outputs.short_sha }}-full
+
+      - name: Build and push (full)
+        if: contains(github.event.pull_request.labels.*.name, 'full-preview')
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: Dockerfile.full
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta_full.outputs.tags }}
+          labels: ${{ steps.meta_full.outputs.labels }}
+          build-args: |
+            MINISTACK_VERSION=pr-${{ github.event.pull_request.number }}-${{ steps.short_sha.outputs.short_sha }}
+          cache-from: type=gha,scope=full-pr
+          cache-to: type=gha,mode=max,scope=full-pr
 
       - name: Comment on PR with Docker image info
         uses: peter-evans/create-or-update-comment@v4
@@ -66,3 +98,4 @@ jobs:
           issue-number: ${{ github.event.pull_request.number }}
           body: |
             Docker image for this PR has been published: `${{ steps.meta.outputs.tags }}`
+            ${{ steps.meta_full.outputs.tags && format('Full variant: `{0}`', steps.meta_full.outputs.tags) || '' }}
