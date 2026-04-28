@@ -1343,6 +1343,55 @@ def test_cfn_lambda_nodejs_inline_zip(cfn, lam):
     cfn.delete_stack(StackName="cfn-nodejs-inline")
     _wait_stack(cfn, "cfn-nodejs-inline")
 
+def test_cfn_lambda_s3_code(cfn, lam, s3):
+    """CFN Lambda with Code.S3Bucket/S3Key should fetch the zip from S3
+    and execute the deployed handler (not return a mock response)."""
+    bucket = "cfn-lambda-code-test"
+    key = "handler.zip"
+    s3.create_bucket(Bucket=bucket)
+
+    # Build a zip with a Node.js handler
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("index.mjs", """
+export async function handler(event) {
+    return { statusCode: 200, body: JSON.stringify({ ok: true }) };
+}
+""")
+    s3.put_object(Bucket=bucket, Key=key, Body=buf.getvalue())
+
+    template = json.dumps({
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "Fn": {
+                "Type": "AWS::Lambda::Function",
+                "Properties": {
+                    "FunctionName": "cfn-s3-code-test",
+                    "Runtime": "nodejs20.x",
+                    "Handler": "index.handler",
+                    "Role": "arn:aws:iam::000000000000:role/r",
+                    "Environment": {"Variables": {"MY_VAR": "hello"}},
+                    "Code": {"S3Bucket": bucket, "S3Key": key},
+                },
+            },
+        },
+    })
+    cfn.create_stack(StackName="cfn-s3-code-test", TemplateBody=template)
+    stack = _wait_stack(cfn, "cfn-s3-code-test")
+    assert stack["StackStatus"] == "CREATE_COMPLETE"
+
+    resp = lam.invoke(FunctionName="cfn-s3-code-test", Payload=b'{}')
+    assert resp["StatusCode"] == 200
+    payload = json.loads(resp["Payload"].read().decode())
+    # Should execute real code, not return "Mock response"
+    assert payload.get("statusCode") == 200
+    body = json.loads(payload["body"])
+    assert body["ok"] is True
+
+    cfn.delete_stack(StackName="cfn-s3-code-test")
+    _wait_stack(cfn, "cfn-s3-code-test")
+
+
 def test_cfn_dynamodb_stream_spec(cfn, ddb):
     """CloudFormation DynamoDB table with StreamViewType (no StreamEnabled) must
     have streams enabled: LatestStreamArn and StreamSpecification present on

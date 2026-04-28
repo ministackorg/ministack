@@ -422,16 +422,36 @@ class Worker:
             module_name = module_name.replace("/", ".")
         env_vars = self.config.get("Environment", {}).get("Variables", {})
         spawn_env = {**os.environ, **env_vars}
-        # Restore the internal endpoint URL so Lambda SDK calls reach
-        # this MiniStack instance, not a host-mapped port that may be
-        # unreachable from inside the container.
-        for key in ("AWS_ENDPOINT_URL", "LOCALSTACK_HOSTNAME"):
-            if key in os.environ:
-                spawn_env[key] = os.environ[key]
+        # Inject standard Lambda runtime env vars to match the Docker and
+        # provided-runtime execution paths in lambda_svc.py.  Real AWS
+        # Lambda always injects these; the warm-worker path was missing them.
+        # Per AWS docs:
+        #   https://docs.aws.amazon.com/lambda/latest/dg/configuration-envvars.html
+        from ministack.core.responses import get_region, new_uuid
+        spawn_env.setdefault("AWS_REGION", get_region())
+        spawn_env.setdefault("AWS_DEFAULT_REGION", get_region())
+        spawn_env.setdefault("AWS_ACCESS_KEY_ID", os.environ.get("AWS_ACCESS_KEY_ID", "test"))
+        spawn_env.setdefault("AWS_SECRET_ACCESS_KEY", os.environ.get("AWS_SECRET_ACCESS_KEY", "test"))
+        spawn_env.setdefault("AWS_SESSION_TOKEN", os.environ.get("AWS_SESSION_TOKEN", ""))
+        # AWS_ENDPOINT_URL precedence matches real AWS: function
+        # Environment.Variables wins, then host env, then the internal
+        # default that points at this MiniStack instance.  Real AWS Lambda
+        # does not inject AWS_ENDPOINT_URL — it is an SDK/testing convention
+        # — so function-level values must be respected.  spawn_env was built
+        # as {**os.environ, **env_vars}, so any function-level value is
+        # already present; setdefault only fills in the default when neither
+        # the function nor the host set one.
+        port = os.environ.get("GATEWAY_PORT", os.environ.get("EDGE_PORT", "4566"))
+        spawn_env.setdefault("AWS_ENDPOINT_URL", f"http://127.0.0.1:{port}")
+        if "LOCALSTACK_HOSTNAME" in os.environ:
+            spawn_env["LOCALSTACK_HOSTNAME"] = os.environ["LOCALSTACK_HOSTNAME"]
         spawn_env.setdefault("LAMBDA_TASK_ROOT", code_dir)
         spawn_env.setdefault("AWS_LAMBDA_FUNCTION_NAME", self.config.get("FunctionName", ""))
         spawn_env.setdefault("AWS_LAMBDA_FUNCTION_MEMORY_SIZE", str(self.config.get("MemorySize", 128)))
+        spawn_env.setdefault("AWS_LAMBDA_FUNCTION_VERSION", self.config.get("Version", "$LATEST"))
+        spawn_env.setdefault("AWS_LAMBDA_LOG_STREAM_NAME", new_uuid())
         spawn_env.setdefault("_LAMBDA_FUNCTION_ARN", self.config.get("FunctionArn", ""))
+        spawn_env.setdefault("_LAMBDA_TIMEOUT", str(self.config.get("Timeout", 30)))
 
         # Set layer paths so worker runtimes can find packages from extracted layers.
         # _LAMBDA_LAYERS_DIRS is consumed by the Python worker; Node.js layer resolution
