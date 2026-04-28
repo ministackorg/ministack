@@ -49,6 +49,11 @@ docker run -p 4566:4566 ministackorg/ministack
 # Option 2b: Docker Hub with real infrastructure (RDS, ECS, Lambda containers)
 docker run -p 4566:4566 -v /var/run/docker.sock:/var/run/docker.sock ministackorg/ministack
 
+# Option 2c: Full image — Debian/glibc base with DuckDB (Athena), psycopg2, pymysql.
+# Larger (~360 MB vs ~110 MB) but enables Athena and native PostgreSQL/MySQL drivers
+# that don't ship musllinux wheels. Reports `edition: full` on /_ministack/health.
+docker run -p 4566:4566 ministackorg/ministack:full
+
 # Option 3: Clone and build
 git clone https://github.com/ministackorg/ministack
 cd ministack
