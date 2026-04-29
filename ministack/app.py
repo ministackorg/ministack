@@ -47,7 +47,17 @@ _BUCKET_LABEL_RE = re.compile(r"^[a-z0-9](?:[a-z0-9.\-]{1,61}[a-z0-9])$")
 
 
 def _extract_s3_vhost_bucket(host: str):
-    """Return the bucket if Host is virtual-hosted-style S3, else None."""
+    """Return the bucket if Host is virtual-hosted-style S3, else None.
+
+    AWS virtual-hosted patterns (all must resolve to a bucket):
+      <bucket>.<base-host>                          — SDK default
+      <bucket>.s3.<base-host>                       — explicit S3 endpoint
+      <bucket>.s3.<region>.<base-host>              — region-qualified
+      <bucket>.s3-website.<region>.<base-host>      — static website
+      <bucket>.s3-accelerate.<base-host>            — transfer acceleration
+
+    A bare ``<base-host>`` (no leading bucket label) is path-style → None.
+    """
     if not host:
         return None
     host = host.strip()
@@ -65,7 +75,12 @@ def _extract_s3_vhost_bucket(host: str):
         return None
     if ".." in candidate or _IPV4_RE.match(candidate):
         return None
-    return candidate
+    if tail == _MINISTACK_HOST or tail.endswith("." + _MINISTACK_HOST):
+        return candidate
+    first_tail_segment = tail.split(".", 1)[0]
+    if first_tail_segment == "s3" or first_tail_segment.startswith(("s3-", "s3express-")):
+        return candidate
+    return None
 _S3_VHOST_EXCLUDE_RE = re.compile(r"\.(execute-api|alb|emr|efs|elasticache|s3-control)\.")
 _HEALTH_PATHS = ("/_ministack/health", "/_localstack/health", "/health")
 _BODY_METHODS = ("POST", "PUT", "PATCH")
