@@ -20,8 +20,8 @@ import os
 import time
 from collections import defaultdict
 
-from ministack.core.responses import AccountScopedDict, get_account_id, new_uuid, now_iso, get_region
 from ministack.core.persistence import load_state
+from ministack.core.responses import AccountScopedDict, get_account_id, get_region, new_uuid, now_iso
 
 logger = logging.getLogger("autoscaling")
 REGION = os.environ.get("MINISTACK_REGION", "us-east-1")

@@ -21,8 +21,16 @@ import re
 import threading
 import time
 
-from ministack.core.responses import AccountScopedDict, apply_image_prefix, get_account_id, json_response, error_response_json, new_uuid, get_region
 from ministack.core.persistence import load_state
+from ministack.core.responses import (
+    AccountScopedDict,
+    apply_image_prefix,
+    error_response_json,
+    get_account_id,
+    get_region,
+    json_response,
+    new_uuid,
+)
 
 logger = logging.getLogger("eks")
 
@@ -273,7 +281,7 @@ def _create_cluster(body):
                 command=["server",
                          "--disable=traefik,metrics-server,servicelb",
                          "--tls-san=0.0.0.0",
-                         f"--https-listen-port=6443"],
+                         "--https-listen-port=6443"],
                 detach=True,
                 cap_add=[
                     "SYS_ADMIN", "NET_ADMIN", "NET_RAW", "NET_BIND_SERVICE",

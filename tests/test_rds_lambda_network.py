@@ -68,7 +68,7 @@ def test_rds_lambda_network_connectivity(rds, lam):
 
         # 2. Endpoint.Address must NOT be localhost when DOCKER_NETWORK is set
         assert host != "localhost", (
-            f"Expected container IP, got 'localhost' — DOCKER_NETWORK not working"
+            "Expected container IP, got 'localhost' — DOCKER_NETWORK not working"
         )
 
         # 3. Wait for the Postgres container to accept connections

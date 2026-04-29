@@ -8,8 +8,8 @@ Since no real DB containers are available in CI, these tests focus on:
 """
 
 import json
-import urllib.request
 import os
+import urllib.request
 
 import pytest
 from botocore.exceptions import ClientError
@@ -366,8 +366,8 @@ def test_rds_data_stub_drop_user(rds, sm):
 
 def test_rds_data_secret_credentials_parsing():
     """_get_secret_credentials extracts username and password from secret."""
-    from ministack.services import secretsmanager, rds_data
     from ministack.core.responses import set_request_account_id
+    from ministack.services import rds_data, secretsmanager
     set_request_account_id("test")
     # Create a secret with JSON credentials
     secretsmanager._secrets["test-cred-secret"] = {
@@ -390,8 +390,8 @@ def test_rds_data_secret_credentials_parsing():
 
 def test_rds_data_secret_credentials_no_username():
     """_get_secret_credentials returns None username for password-only secret."""
-    from ministack.services import secretsmanager, rds_data
     from ministack.core.responses import set_request_account_id
+    from ministack.services import rds_data, secretsmanager
     set_request_account_id("test")
     secretsmanager._secrets["pw-only-secret"] = {
         "ARN": "arn:aws:secretsmanager:us-east-1:000000000000:secret:pw-only",

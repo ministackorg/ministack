@@ -14,11 +14,10 @@ import time
 from urllib.parse import parse_qs
 
 from ministack.core.responses import get_account_id, json_response, new_uuid
+
 # Shared helpers — IAM and STS are a natural pair; STS is stateless
 # and reuses IAM's XML builders and credential generators.
-from ministack.services.iam import _p, _xml, _error, _future, \
-    _gen_session_access_key, _gen_secret, _gen_session_token
-
+from ministack.services.iam import _error, _future, _gen_secret, _gen_session_access_key, _gen_session_token, _p, _xml
 
 _sessions: dict[str, dict] = {}
 

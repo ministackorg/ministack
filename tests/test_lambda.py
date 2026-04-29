@@ -2,11 +2,12 @@ import io
 import json
 import os
 import time
+import uuid as _uuid_mod
 import zipfile
 from urllib.parse import urlparse
+
 import pytest
 from botocore.exceptions import ClientError
-import uuid as _uuid_mod
 
 _endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
 
@@ -1263,7 +1264,9 @@ def test_lambda_invoke_dry_run_returns_204(lam):
     assert resp["StatusCode"] == 204
 
 def test_lambda_layer_publish(lam):
-    import base64, zipfile, io
+    import base64
+    import io
+    import zipfile
 
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w") as z:
@@ -1280,7 +1283,8 @@ def test_lambda_layer_publish(lam):
 
 def test_lambda_layer_publish_from_s3(lam, s3):
     """PublishLayerVersion with S3Bucket/S3Key. Contributed by @Baptiste-Garcin (#356)."""
-    import zipfile, io
+    import io
+    import zipfile
 
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w") as z:
@@ -1319,7 +1323,9 @@ def test_lambda_layer_list_layers(lam):
     assert "my-test-layer" in names
 
 def test_lambda_layer_delete_version(lam):
-    import base64, zipfile, io
+    import base64
+    import io
+    import zipfile
 
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w") as z:
@@ -1709,7 +1715,8 @@ def test_lambda_update_code_image_uri(lam):
 
 def test_lambda_provided_runtime_create(lam):
     """CreateFunction with provided.al2023 runtime accepts bootstrap handler."""
-    import zipfile, io
+    import io
+    import zipfile
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w") as zf:
         zf.writestr("bootstrap", "#!/bin/sh\necho ok\n")
@@ -1779,6 +1786,7 @@ def test_apigwv2_nodejs_lambda_proxy(lam, apigw):
     """API Gateway v2 HTTP API should invoke Node.js Lambda via warm worker, not return mock."""
     import urllib.request as _urlreq
     import uuid as _uuid
+
     from botocore.exceptions import ClientError
 
     fname = f"apigwv2-node-{_uuid.uuid4().hex[:8]}"
@@ -3003,7 +3011,8 @@ def test_lambda_docker_flags_applied_to_run_kwargs(monkeypatch):
     monkeypatch.setattr(lsvc, "_get_docker_client", lambda: fake_client)
 
     code = b""
-    import io, zipfile
+    import io
+    import zipfile
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w") as zf:
         zf.writestr("index.py", "def handler(e,c): pass")

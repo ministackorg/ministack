@@ -2,11 +2,12 @@ import io
 import json
 import os
 import time
+import uuid as _uuid_mod
 import zipfile
 from urllib.parse import urlparse
+
 import pytest
 from botocore.exceptions import ClientError
-import uuid as _uuid_mod
 
 _endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
 _EXECUTE_PORT = urlparse(_endpoint).port or 4566

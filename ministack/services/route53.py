@@ -25,10 +25,11 @@ import re
 import string
 import threading
 from datetime import datetime, timezone
-from defusedxml.ElementTree import fromstring
 from xml.etree.ElementTree import Element, SubElement, tostring
 
-from ministack.core.persistence import load_state, PERSIST_STATE
+from defusedxml.ElementTree import fromstring
+
+from ministack.core.persistence import PERSIST_STATE, load_state
 from ministack.core.responses import AccountScopedDict, new_uuid
 
 logger = logging.getLogger("route53")

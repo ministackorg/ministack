@@ -1,17 +1,17 @@
 """SES tests — API operations + SMTP relay integration."""
 
-import io
 import base64
+import io
 import json
 import os
-import pytest
 import time
 import uuid as _uuid_mod
 import zipfile
-from botocore.exceptions import ClientError
-from urllib.parse import urlparse
 from unittest.mock import MagicMock, patch
+from urllib.parse import urlparse
 
+import pytest
+from botocore.exceptions import ClientError
 
 
 def test_ses_parse_smtp_host_not_set():

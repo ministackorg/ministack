@@ -2,11 +2,12 @@ import io
 import json
 import os
 import time
+import uuid as _uuid_mod
 import zipfile
 from urllib.parse import urlparse
+
 import pytest
 from botocore.exceptions import ClientError
-import uuid as _uuid_mod
 
 _ministack_installed = True
 
@@ -45,6 +46,7 @@ def test_package_services_importable():
         eventbridge,
         firehose,
         glue,
+        iam,
         kinesis,
         lambda_svc,
         rds,
@@ -56,8 +58,8 @@ def test_package_services_importable():
         sqs,
         ssm,
         stepfunctions,
+        sts,
     )
-    from ministack.services import iam, sts
 
     for mod in [
         s3,

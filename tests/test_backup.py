@@ -1,5 +1,5 @@
-import pytest
 import boto3
+import pytest
 from botocore.exceptions import ClientError
 
 ENDPOINT = "http://localhost:4566"

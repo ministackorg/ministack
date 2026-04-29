@@ -2,11 +2,13 @@ import io
 import json
 import os
 import time
+import uuid as _uuid_mod
 import zipfile
 from urllib.parse import urlparse
+
 import pytest
 from botocore.exceptions import ClientError
-import uuid as _uuid_mod
+
 
 def test_sts_get_caller_identity(sts):
     resp = sts.get_caller_identity()
@@ -84,7 +86,7 @@ def test_sts_assume_role_with_web_identity(sts, iam):
         RoleName="test-oidc-role",
         AssumeRolePolicyDocument='{"Version":"2012-10-17","Statement":[]}',
     )
-    role_arn = f"arn:aws:iam::000000000000:role/test-oidc-role"
+    role_arn = "arn:aws:iam::000000000000:role/test-oidc-role"
     resp = sts.assume_role_with_web_identity(
         RoleArn=role_arn,
         RoleSessionName="ci-session",
@@ -99,7 +101,8 @@ def test_sts_assume_role_with_web_identity(sts, iam):
 
 def _gwit_post(data: bytes):
     """POST raw form-encoded body to STS GetWebIdentityToken (boto3 has no client method)."""
-    import urllib.request, urllib.error
+    import urllib.error
+    import urllib.request
     endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
     req = urllib.request.Request(
         endpoint,
@@ -123,7 +126,8 @@ def _b64url_pad(s):
 
 def test_sts_get_web_identity_token():
     """GetWebIdentityToken returns a JWT with AWS-spec claims (XML protocol)."""
-    import re, base64
+    import base64
+    import re
     status, body = _gwit_post(
         b"Action=GetWebIdentityToken&Audience=my-service&SigningAlgorithm=RS256&DurationSeconds=300"
     )
@@ -149,7 +153,8 @@ def test_sts_get_web_identity_token():
 
 def test_sts_get_web_identity_token_json_protocol():
     """JSON protocol returns int-epoch Expiration per ministack convention."""
-    import urllib.request, urllib.error
+    import urllib.error
+    import urllib.request
     endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
     req = urllib.request.Request(
         endpoint,
@@ -176,7 +181,8 @@ def test_sts_get_web_identity_token_es384():
 
 def test_sts_get_web_identity_token_multiple_audiences():
     """Audience.member.N produces aud as a list when multiple."""
-    import re, base64
+    import base64
+    import re
     status, body = _gwit_post(
         b"Action=GetWebIdentityToken&SigningAlgorithm=RS256"
         b"&Audience.member.1=alpha&Audience.member.2=beta"

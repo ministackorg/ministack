@@ -43,9 +43,18 @@ from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import unquote
 
-from ministack.core.persistence import load_state, PERSIST_STATE
-from ministack.core.responses import AccountScopedDict, apply_image_prefix, get_account_id, _request_account_id, error_response_json, json_response, new_uuid, get_region
 from ministack.core.lambda_runtime import get_or_create_worker, invalidate_worker
+from ministack.core.persistence import PERSIST_STATE, load_state
+from ministack.core.responses import (
+    AccountScopedDict,
+    _request_account_id,
+    apply_image_prefix,
+    error_response_json,
+    get_account_id,
+    get_region,
+    json_response,
+    new_uuid,
+)
 
 logger = logging.getLogger("lambda")
 
@@ -3284,7 +3293,7 @@ def _list_tags(resource_arn: str):
         if not esm:
             return error_response_json(
                 "ResourceNotFoundException",
-                f"The resource you requested does not exist.",
+                "The resource you requested does not exist.",
                 404,
             )
         return json_response({"Tags": esm.get("Tags", {})})
@@ -3305,7 +3314,7 @@ def _tag_resource(resource_arn: str, data: dict):
         if not esm:
             return error_response_json(
                 "ResourceNotFoundException",
-                f"The resource you requested does not exist.",
+                "The resource you requested does not exist.",
                 404,
             )
         esm.setdefault("Tags", {}).update(data.get("Tags", {}))
@@ -3336,7 +3345,7 @@ def _untag_resource(resource_arn: str, query_params: dict):
         if not esm:
             return error_response_json(
                 "ResourceNotFoundException",
-                f"The resource you requested does not exist.",
+                "The resource you requested does not exist.",
                 404,
             )
         tags = esm.setdefault("Tags", {})

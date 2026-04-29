@@ -28,15 +28,14 @@ _change_sets = AccountScopedDict()     # cs_id -> change set dict
 
 # Re-exports for compatibility
 from .engine import (  # noqa: E402
+    _NO_VALUE,
+    _evaluate_conditions,
+    _extract_deps,
     _parse_template,
     _resolve_parameters,
-    _evaluate_conditions,
     _resolve_refs,
-    _extract_deps,
     _topological_sort,
-    _NO_VALUE,
 )
-
 from .helpers import _p  # noqa: E402
 
 
@@ -78,5 +77,6 @@ def reset():
 
 
 # Must be last — handlers imports from this module
-from .handlers import _ACTION_HANDLERS, _validate_template  # noqa: E402
 from ministack.core.responses import AccountScopedDict, get_account_id
+
+from .handlers import _ACTION_HANDLERS, _validate_template  # noqa: E402

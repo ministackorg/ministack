@@ -34,8 +34,8 @@ import time
 from urllib.parse import parse_qs
 from xml.sax.saxutils import escape as _esc
 
-from ministack.core.persistence import load_state, PERSIST_STATE
-from ministack.core.responses import AccountScopedDict, get_account_id, md5_hash, new_uuid, now_iso, get_region
+from ministack.core.persistence import PERSIST_STATE, load_state
+from ministack.core.responses import AccountScopedDict, get_account_id, get_region, md5_hash, new_uuid, now_iso
 
 logger = logging.getLogger("sqs")
 

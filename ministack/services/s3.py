@@ -32,20 +32,23 @@ import os
 import re
 import threading
 import time
-from urllib.parse import quote as url_quote, unquote as url_unquote, parse_qs as _parse_qs
-from defusedxml.ElementTree import fromstring
+from urllib.parse import parse_qs as _parse_qs
+from urllib.parse import quote as url_quote
+from urllib.parse import unquote as url_unquote
 from xml.etree.ElementTree import Element, SubElement, tostring
 from xml.sax.saxutils import escape as _esc
 
-from ministack.core.persistence import load_state, PERSIST_STATE
+from defusedxml.ElementTree import fromstring
+
+from ministack.core.persistence import PERSIST_STATE, load_state
 from ministack.core.responses import (
     AccountScopedDict,
     get_account_id,
-    md5_hash,
-    sha256_hash,
-    now_iso,
-    new_uuid,
     iso_to_rfc7231,
+    md5_hash,
+    new_uuid,
+    now_iso,
+    sha256_hash,
 )
 
 logger = logging.getLogger("s3")
