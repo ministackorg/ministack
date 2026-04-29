@@ -636,3 +636,80 @@ def test_persistence_s3_writes_state_after_ownership_and_public_access_block(tmp
     pers.save_state("roundtrip-bytes", state_with_bytes)
     loaded = pers.load_state("roundtrip-bytes")
     assert loaded["blob"] == b"\x00\x01\xff\xfe"
+
+
+# ---------------------------------------------------------------------------
+# Unit tests for _S3_VHOST_RE / _S3_VHOST_EXCLUDE_RE / _NON_S3_VHOST_NAMES
+# ---------------------------------------------------------------------------
+
+from ministack.app import _S3_VHOST_EXCLUDE_RE, _NON_S3_VHOST_NAMES
+
+class TestS3VhostExcludeRe:
+    """_S3_VHOST_EXCLUDE_RE gates out sub-service hostnames that look like vhosts."""
+
+    def test_excludes_execute_api(self):
+        assert _S3_VHOST_EXCLUDE_RE.search("abc12345.execute-api.localhost")
+
+    def test_excludes_alb(self):
+        assert _S3_VHOST_EXCLUDE_RE.search("mybucket.alb.localhost")
+
+    def test_excludes_emr(self):
+        assert _S3_VHOST_EXCLUDE_RE.search("mybucket.emr.localhost")
+
+    def test_excludes_efs(self):
+        assert _S3_VHOST_EXCLUDE_RE.search("mybucket.efs.localhost")
+
+    def test_excludes_elasticache(self):
+        assert _S3_VHOST_EXCLUDE_RE.search("mybucket.elasticache.localhost")
+
+    def test_excludes_s3_control(self):
+        assert _S3_VHOST_EXCLUDE_RE.search("mybucket.s3-control.localhost")
+
+    def test_does_not_exclude_plain_vhost(self):
+        assert not _S3_VHOST_EXCLUDE_RE.search("mybucket.localhost")
+
+    def test_does_not_exclude_s3_segment_vhost(self):
+        assert not _S3_VHOST_EXCLUDE_RE.search("mybucket.s3.localhost")
+
+
+class TestNonS3VhostNames:
+    """_NON_S3_VHOST_NAMES prevents service endpoint names from being treated as bucket names."""
+
+    def test_s3_is_excluded(self):
+        assert "s3" in _NON_S3_VHOST_NAMES
+
+    def test_common_services_excluded(self):
+        for svc in ("sqs", "sns", "dynamodb", "lambda", "iam", "sts", "secretsmanager"):
+            assert svc in _NON_S3_VHOST_NAMES, f"{svc!r} should be in _NON_S3_VHOST_NAMES"
+
+    def test_normal_bucket_name_not_excluded(self):
+        assert "mybucket" not in _NON_S3_VHOST_NAMES
+        assert "my-data" not in _NON_S3_VHOST_NAMES
+
+
+from ministack.app import _extract_s3_vhost_bucket
+
+
+class TestExtractS3VhostBucket:
+    """_extract_s3_vhost_bucket extracts the bucket name from virtual-hosted S3 host headers."""
+    def test_bare_bucket(self):
+        assert _extract_s3_vhost_bucket("mybucket.localhost") == "mybucket"
+
+    def test_single_segment_s3_nested_bucket(self):
+        assert _extract_s3_vhost_bucket("mybucket.s3.localhost") == "mybucket"
+
+    def test_single_segment_region_nested_bucket(self):
+        assert _extract_s3_vhost_bucket("mybucket.s3.us-east-1.localhost") == "mybucket"
+
+    def test_single_segment_region_nested_bucket_with_port(self):
+        assert _extract_s3_vhost_bucket("mybucket.s3.us-east-1.localhost:4566") == "mybucket"
+
+    @pytest.mark.skip(reason="Dotted Nested Bucket is not supported yet")
+    def test_double_segment_s3_nested_bucket(self):
+        assert _extract_s3_vhost_bucket("dotted.mybucket.s3.localhost") == "dotted.mybucket"
+
+    def test_bare_s3_with_region(self):
+        assert _extract_s3_vhost_bucket("s3.us-east-1.localhost") is None
+
+    def test_bare_s3_without_region(self):
+        assert _extract_s3_vhost_bucket("s3.localhost") is None
