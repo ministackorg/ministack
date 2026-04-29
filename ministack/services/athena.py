@@ -12,14 +12,19 @@ Supports: StartQueryExecution, GetQueryExecution, GetQueryResults,
           GetTableMetadata, ListTableMetadata,
           TagResource, UntagResource, ListTagsForResource.
 """
-
+import asyncio
 import copy
+import csv
+import io
 import json
 import logging
 import os
 import re
 import threading
 import time
+import xml.etree.ElementTree as ET
+from datetime import date
+from urllib.parse import urlparse
 
 from ministack.core.persistence import PERSIST_STATE, load_state
 from ministack.core.responses import (
@@ -270,15 +275,12 @@ def _start_query_execution(data):
     }
     _executions[query_id] = execution
 
-    thread = threading.Thread(
-        target=_execute_query, args=(query_id, query, db), daemon=True
-    )
-    thread.start()
+    asyncio.create_task(_execute_query(query_id, query, db))
 
     return json_response({"QueryExecutionId": query_id})
 
 
-def _execute_query(query_id, query, database):
+async def _execute_query(query_id, query, database):
     execution = _executions.get(query_id)
     if not execution:
         return
@@ -290,7 +292,7 @@ def _execute_query(query_id, query, database):
         engine = get_athena_engine()
 
         if engine == "duckdb":
-            results = _run_duckdb(query, database)
+            results = await _run_duckdb(query, database)
         else:
             results = _mock_query_results(query)
 
@@ -307,6 +309,8 @@ def _execute_query(query_id, query, database):
         execution["Statistics"]["DataScannedInBytes"] = sum(
             len(str(row)) for row in results.get("rows", [])
         )
+
+        await _save_query_results(query_id)
     except Exception as e:
         logger.error("Athena query %s failed: %s", query_id, e)
         execution["Status"]["State"] = "FAILED"
@@ -316,11 +320,11 @@ def _execute_query(query_id, query, database):
     execution["Status"]["CompletionDateTime"] = int(time.time())
 
 
-def _run_duckdb(query, database):
+async def _run_duckdb(query, database):
     import duckdb
-
     conn = duckdb.connect(":memory:")
-    rewritten = _rewrite_s3_paths(query)
+
+    rewritten = await _rewrite_data_paths(query, database)
 
     try:
         result = conn.execute(rewritten)
@@ -348,6 +352,43 @@ def _run_duckdb(query, database):
         raise e
 
 
+async def _rewrite_data_paths(query, database):
+    from ministack.services import glue as glue_svc
+
+    pattern = r'(?:FROM|JOIN)\s+([a-zA-Z0-9_".\-/]+(?:\(.*?\))?)'
+    tables_to_resolve = re.findall(pattern, query, re.IGNORECASE)
+
+    for full_name in tables_to_resolve:
+        if "/" in full_name or "(" in full_name:
+            continue
+
+        parts = full_name.split(".")
+        db_name, table_name = (parts[0], parts[1]) if len(parts) > 1 else (database or "default", parts[0])
+
+        body = json.dumps({"DatabaseName": db_name, "Name": table_name}).encode("utf-8")
+        headers = {"x-amz-target": "AWSGlue.GetTable"}
+        status, _, response_body = await glue_svc.handle_request("POST", "/", headers, body, {})
+
+        if status == 200:
+            table_data = json.loads(response_body).get("Table", {})
+            sd = table_data.get('StorageDescriptor', {})
+            s3_location = sd.get("Location")
+
+            if s3_location:
+                account_id = get_account_id()
+                p = urlparse(s3_location)
+                stripped = f"{p.netloc}{p.path}".rstrip("/")
+                classification = table_data.get("Parameters", {}).get("classification", "csv")
+
+                local_path = f"{S3_DATA_DIR}/{account_id}/{stripped}"
+                duck_path = f"{local_path}/**/*.{classification}"
+
+                query = re.sub(rf"{re.escape(full_name)}", f"'{duck_path}'", query)
+
+    query = _rewrite_s3_paths(query)
+    return query
+
+
 def _rewrite_s3_paths(query):
     """Replace s3://bucket/key references with local file paths.
     Handles: quoted strings, read_csv/read_parquet/read_json function args,
@@ -364,9 +405,10 @@ def _rewrite_s3_paths(query):
         elif stripped.startswith("s3a://"):
             stripped = stripped[6:]
         parts = stripped.split("/", 1)
+        account_id = get_account_id()
         bucket = parts[0]
         key = parts[1] if len(parts) > 1 else ""
-        local_path = os.path.join(S3_DATA_DIR, bucket, key)
+        local_path = os.path.join(S3_DATA_DIR, account_id, bucket, key)
         return f"{prefix}{local_path}{suffix}"
 
     result = re.sub(
@@ -381,6 +423,54 @@ def _rewrite_s3_paths(query):
         flags=re.IGNORECASE,
     )
     return result
+
+
+async def _save_query_results(query_id):
+    from ministack.services import s3 as s3_svc
+    execution = _executions.get(query_id)
+    results = execution.get('_results', [])
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerows(results['rows'])
+    csv_content = output.getvalue().encode("utf-8")
+
+    col_types = execution.get('_column_types', [])
+    metadata_text = ",".join(results['columns']) + "\n" + ",".join(col_types)
+    metadata_content = metadata_text.encode("utf-8")
+
+    output_location = execution["ResultConfiguration"]["OutputLocation"]
+    p = urlparse(output_location)
+    local_path = f"{p.netloc}{p.path}".rstrip("/")
+
+    async def upload(path, data):
+        account_id = get_account_id()
+        aws_region = get_region()
+        dt = date.today().strftime("%Y%m%d")
+
+        credential = f"{account_id}/{dt}/{aws_region}/s3/aws4_request"
+
+        headers = {
+            "content-type": "application/octet-stream",
+            "content-length": str(len(data)),
+            "x-amz-account-id": account_id,
+            "Authorization": f"AWS4-HMAC-SHA256 Credential={credential}"
+        }
+        status, _, body = await s3_svc.handle_request("PUT", path, headers, data, {})
+        if status != 200:
+            try:
+                root = ET.fromstring(body)
+                code = root.findtext("Code", "UnknownError")
+                message = root.findtext("Message", "An unexpected S3 error occurred")
+            except Exception:
+                code, message = "InternalError", "Failed to parse S3 error response"
+            execution["Status"]["State"] = "FAILED"
+            execution["Status"]["StateChangeReason"] = f"An error occurred while writing to S3. {code}: {message}"
+            return False
+        return True
+
+    if await upload(local_path, csv_content):
+        await upload(f"{local_path}.metadata", metadata_content)
 
 
 def _mock_query_results(query):
