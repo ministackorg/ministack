@@ -73,6 +73,8 @@ jobs:
         with:
           images: |
             ${{ env.DOCKERHUB_IMAGE_ORG }}
+          flavor: |
+            latest=false
           tags: |
             type=ref,event=pr,suffix=-${{ steps.short_sha.outputs.short_sha }}-full
 

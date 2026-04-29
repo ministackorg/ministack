@@ -67,6 +67,8 @@ jobs:
           images: |
             ${{ env.DOCKERHUB_IMAGE }}
             ${{ env.DOCKERHUB_IMAGE_ORG }}
+          flavor: |
+            latest=false
           tags: |
             type=semver,pattern={{version}},suffix=-full
             type=semver,pattern={{major}}.{{minor}},suffix=-full
@@ -82,6 +84,6 @@ jobs:
           tags: ${{ steps.meta_full.outputs.tags }}
           labels: ${{ steps.meta_full.outputs.labels }}
           build-args: |
-            MINISTACK_VERSION=${{ steps.meta_full.outputs.version }}
+            MINISTACK_VERSION=${{ steps.meta.outputs.version }}
           cache-from: type=gha,scope=full
           cache-to: type=gha,mode=max,scope=full

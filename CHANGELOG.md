@@ -11,6 +11,14 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [1.3.18] — 2026-04-28
+
+### Fixed
+- **`:latest` Docker tag pointed at the `:full` image instead of the regular Alpine image** — `docker/metadata-action`'s default `flavor: latest=auto` auto-added `:latest` to both the regular and the full meta blocks; the full build ran second and overwrote `:latest` on Docker Hub. Anyone running `docker pull ministackorg/ministack` silently got the 360 MB Debian image instead of the 110 MB Alpine one. Fixed by adding `flavor: latest=false` to the full meta block in both `docker-publish.yml` and `docker-publish-on-pr.yml` so only the regular build claims `:latest`.
+- **Full image reported `version: 1.3.17-full` on `/_ministack/health`** — the `MINISTACK_VERSION` build-arg for the full image was sourced from the full meta's `outputs.version`, which includes the `-full` suffix used for tagging. Tools parsing the `version` field for semver checks saw `1.3.17-full` and rejected it. Now sourced from the regular meta's `outputs.version` so both editions report a clean `1.3.18`; the edition is already separately exposed as `edition: full`.
+
+---
+
 ## [1.3.17] — 2026-04-28
 
 ### Added
