@@ -782,6 +782,76 @@ def test_sfn_aws_sdk_rds_modify_cluster(sfn, sfn_sync, rds):
 
     sfn_sync.delete_state_machine(stateMachineArn=sm_arn)
 
+def test_sfn_aws_sdk_rds_remove_from_global_cluster(sfn, sfn_sync, rds):
+    """aws-sdk:rds RemoveFromGlobalCluster preserves RDS' DbClusterIdentifier shape."""
+    cluster_id = f"sfn-global-{_uuid_mod.uuid4().hex[:8]}"
+    global_id = f"sfn-global-{_uuid_mod.uuid4().hex[:8]}"
+    sm_name = f"sdk-rds-global-{_uuid_mod.uuid4().hex[:8]}"
+    sm_arn = None
+
+    rds.create_db_cluster(
+        DBClusterIdentifier=cluster_id,
+        Engine="aurora-postgresql",
+        MasterUsername="admin",
+        MasterUserPassword="testpass123",
+    )
+    rds.create_global_cluster(
+        GlobalClusterIdentifier=global_id,
+        SourceDBClusterIdentifier=cluster_id,
+    )
+
+    definition = json.dumps({
+        "StartAt": "RemovePrimary",
+        "States": {
+            "RemovePrimary": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::aws-sdk:rds:removeFromGlobalCluster",
+                "Parameters": {
+                    "GlobalClusterIdentifier": global_id,
+                    "DbClusterIdentifier": cluster_id,
+                },
+                "ResultPath": "$.removeResult",
+                "Next": "DeleteGlobal",
+            },
+            "DeleteGlobal": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::aws-sdk:rds:deleteGlobalCluster",
+                "Parameters": {
+                    "GlobalClusterIdentifier": global_id,
+                },
+                "ResultPath": "$.deleteResult",
+                "End": True,
+            },
+        },
+    })
+
+    try:
+        sm_arn = sfn_sync.create_state_machine(
+            name=sm_name,
+            definition=definition,
+            roleArn="arn:aws:iam::000000000000:role/sfn-role",
+        )["stateMachineArn"]
+
+        resp = sfn_sync.start_sync_execution(stateMachineArn=sm_arn, input=json.dumps({}))
+        assert resp["status"] == "SUCCEEDED", f"Execution failed: {resp.get('error')} — {resp.get('cause')}"
+        output = json.loads(resp["output"])
+        assert output["removeResult"]["GlobalCluster"]["GlobalClusterMembers"] == []
+    finally:
+        if sm_arn:
+            sfn_sync.delete_state_machine(stateMachineArn=sm_arn)
+        try:
+            rds.remove_from_global_cluster(
+                GlobalClusterIdentifier=global_id,
+                DbClusterIdentifier=cluster_id,
+            )
+        except ClientError:
+            pass
+        try:
+            rds.delete_global_cluster(GlobalClusterIdentifier=global_id)
+        except ClientError:
+            pass
+        rds.delete_db_cluster(DBClusterIdentifier=cluster_id, SkipFinalSnapshot=True)
+
 def test_sfn_xml_list_wrapper_single_element(sfn, sfn_sync):
     """DescribeDBClusters returns a JSON list even when only one cluster exists."""
     import uuid as _uuid

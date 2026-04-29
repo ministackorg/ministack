@@ -2654,6 +2654,15 @@ _AWS_ACRONYMS = frozenset({
     "Tcp", "Udp", "Iops", "Ca", "Sg",
 })
 
+# Most query-protocol RDS params expand SDK-style "Db" to wire-format "DB".
+# RemoveFromGlobalCluster is the AWS-shape exception: its member is
+# "DbClusterIdentifier", and sending "DBClusterIdentifier" is ignored.
+_QUERY_PARAM_NAME_OVERRIDES = {
+    ("rds", "RemoveFromGlobalCluster"): {
+        "DbClusterIdentifier": "DbClusterIdentifier",
+    },
+}
+
 
 def _sfn_key_to_api_name(name):
     """Convert SFN SDK key name to AWS wire-format name.
@@ -2669,12 +2678,19 @@ def _sfn_key_to_api_name(name):
     return "".join(t.upper() if t in _AWS_ACRONYMS else t for t in tokens)
 
 
-def _convert_params_to_api_names(data):
+def _convert_params_to_api_names(data, name_overrides=None):
     """Recursively convert SFN SDK-style param names to AWS wire-format names."""
     if isinstance(data, dict):
-        return {_sfn_key_to_api_name(k): _convert_params_to_api_names(v) for k, v in data.items()}
+        converted = {}
+        for key, value in data.items():
+            if name_overrides and key in name_overrides:
+                wire_key = name_overrides[key]
+            else:
+                wire_key = _sfn_key_to_api_name(key)
+            converted[wire_key] = _convert_params_to_api_names(value, name_overrides)
+        return converted
     if isinstance(data, list):
-        return [_convert_params_to_api_names(item) for item in data]
+        return [_convert_params_to_api_names(item, name_overrides) for item in data]
     return data
 
 
@@ -2751,7 +2767,8 @@ def _dispatch_aws_sdk_query(service_info, service_name, action, input_data):
     pascal_action = action[0].upper() + action[1:] if action else action
     # Convert SFN SDK-style param names (DbSubnetGroupName) to wire-format
     # names (DBSubnetGroupName) before flattening to query params.
-    wire_data = _convert_params_to_api_names(input_data)
+    name_overrides = _QUERY_PARAM_NAME_OVERRIDES.get((service_key, pascal_action))
+    wire_data = _convert_params_to_api_names(input_data, name_overrides)
     form_params = {"Action": pascal_action}
     form_params.update(_flatten_query_params(wire_data))
     body = urlencode(form_params)
