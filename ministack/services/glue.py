@@ -192,7 +192,7 @@ def _create_database(data):
     _databases[name] = {
         "Name": name,
         "Description": db_input.get("Description", ""),
-        "LocationUri": db_input.get("LocationUri", ""),
+        "LocationUri": db_input.get("LocationUri"),
         "Parameters": db_input.get("Parameters", {}),
         "CreateTime": int(time.time()),
         "CatalogId": get_account_id(),

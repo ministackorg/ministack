@@ -59,6 +59,15 @@ def test_glue_crawler(glue):
     assert resp["Crawler"]["Name"] == "test-crawler"
     glue.start_crawler(Name="test-crawler")
 
+def test_glue_database_location_uri(glue):
+    glue.create_database(DatabaseInput={"Name": "db_no_location"})
+    resp = glue.get_database(Name="db_no_location")
+    assert resp["Database"].get("LocationUri") is None
+
+    glue.create_database(DatabaseInput={"Name": "db_with_location", "LocationUri": "s3://my-bucket/warehouse/"})
+    resp = glue.get_database(Name="db_with_location")
+    assert resp["Database"]["LocationUri"] == "s3://my-bucket/warehouse/"
+
 def test_glue_database_v2(glue):
     glue.create_database(DatabaseInput={"Name": "glue_db_v2", "Description": "v2 DB"})
     resp = glue.get_database(Name="glue_db_v2")
