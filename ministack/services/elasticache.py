@@ -853,7 +853,9 @@ def _describe_replication_groups(p):
         groups = [rg]
     else:
         groups = list(_replication_groups.values())
-    members = "".join(f"<member>{_rg_xml(g)}</member>" for g in groups)
+    # AWS shape: ReplicationGroupList.member.locationName = "ReplicationGroup".
+    # Strict SDKs (aws-sdk-go-v2, Java/Rust v2) parse a <member>-wrapped list as empty.
+    members = "".join(f"<ReplicationGroup>{_rg_xml(g)}</ReplicationGroup>" for g in groups)
     return _xml(200, "DescribeReplicationGroupsResponse",
         f"<DescribeReplicationGroupsResult><ReplicationGroups>{members}</ReplicationGroups></DescribeReplicationGroupsResult>")
 
@@ -983,17 +985,19 @@ def _describe_subnet_groups(p):
     groups = [_subnet_groups[name]] if name and name in _subnet_groups else list(_subnet_groups.values())
     members = ""
     for g in groups:
+        # SubnetList.member.locationName = "Subnet"
         subnets_xml = "".join(
-            f"<member><SubnetIdentifier>{s['SubnetIdentifier']}</SubnetIdentifier>"
-            f"<SubnetAvailabilityZone><Name>{s['SubnetAvailabilityZone']['Name']}</Name></SubnetAvailabilityZone></member>"
+            f"<Subnet><SubnetIdentifier>{s['SubnetIdentifier']}</SubnetIdentifier>"
+            f"<SubnetAvailabilityZone><Name>{s['SubnetAvailabilityZone']['Name']}</Name></SubnetAvailabilityZone></Subnet>"
             for s in g.get("Subnets", [])
         )
+        # CacheSubnetGroups.member.locationName = "CacheSubnetGroup"
         members += (
-            f"<member><CacheSubnetGroupName>{g['CacheSubnetGroupName']}</CacheSubnetGroupName>"
+            f"<CacheSubnetGroup><CacheSubnetGroupName>{g['CacheSubnetGroupName']}</CacheSubnetGroupName>"
             f"<CacheSubnetGroupDescription>{g.get('CacheSubnetGroupDescription', '')}</CacheSubnetGroupDescription>"
             f"<VpcId>{g.get('VpcId', '')}</VpcId>"
             f"<Subnets>{subnets_xml}</Subnets>"
-            f"<ARN>{g.get('ARN', '')}</ARN></member>"
+            f"<ARN>{g.get('ARN', '')}</ARN></CacheSubnetGroup>"
         )
     return _xml(200, "DescribeCacheSubnetGroupsResponse",
         f"<DescribeCacheSubnetGroupsResult><CacheSubnetGroups>{members}</CacheSubnetGroups></DescribeCacheSubnetGroupsResult>")
@@ -1067,11 +1071,12 @@ def _describe_param_groups(p):
     if name and name not in _param_groups:
         return _error("CacheParameterGroupNotFound", f"Cache parameter group {name} not found.", 404)
     groups = [_param_groups[name]] if name and name in _param_groups else list(_param_groups.values())
+    # CacheParameterGroupList.member.locationName = "CacheParameterGroup"
     members = "".join(
-        f"<member><CacheParameterGroupName>{g['CacheParameterGroupName']}</CacheParameterGroupName>"
+        f"<CacheParameterGroup><CacheParameterGroupName>{g['CacheParameterGroupName']}</CacheParameterGroupName>"
         f"<CacheParameterGroupFamily>{g.get('CacheParameterGroupFamily', '')}</CacheParameterGroupFamily>"
         f"<Description>{g.get('Description', '')}</Description>"
-        f"<ARN>{g.get('ARN', '')}</ARN></member>"
+        f"<ARN>{g.get('ARN', '')}</ARN></CacheParameterGroup>"
         for g in groups
     )
     return _xml(200, "DescribeCacheParameterGroupsResponse",
@@ -1096,9 +1101,10 @@ def _describe_cache_parameters(p):
                        f"Parameter group {name} not found", 404)
     params = _param_group_params.get(name, {})
     members = ""
+    # ParametersList.member.locationName = "Parameter"
     for pname, pval in params.items():
         members += (
-            f"<member>"
+            f"<Parameter>"
             f"<ParameterName>{pname}</ParameterName>"
             f"<ParameterValue>{pval.get('Value', '')}</ParameterValue>"
             f"<Description>{pval.get('Description', '')}</Description>"
@@ -1107,7 +1113,7 @@ def _describe_cache_parameters(p):
             f"<AllowedValues>{pval.get('AllowedValues', '')}</AllowedValues>"
             f"<IsModifiable>{str(pval.get('IsModifiable', True)).lower()}</IsModifiable>"
             f"<MinimumEngineVersion>{pval.get('MinimumEngineVersion', '5.0.0')}</MinimumEngineVersion>"
-            f"</member>"
+            f"</Parameter>"
         )
     return _xml(200, "DescribeCacheParametersResponse",
         f"<DescribeCacheParametersResult><Parameters>{members}</Parameters></DescribeCacheParametersResult>")
@@ -1197,9 +1203,10 @@ def _default_params_for_family(family):
 def _describe_engine_versions(p):
     engine = _p(p, "Engine") or "redis"
     versions = {"redis": ["7.1.0", "7.0.12", "6.2.14", "5.0.6"], "memcached": ["1.6.22", "1.6.17", "1.6.12"]}
+    # CacheEngineVersionList.member.locationName = "CacheEngineVersion"
     members = "".join(
-        f"<member><Engine>{engine}</Engine><EngineVersion>{v}</EngineVersion>"
-        f"<CacheParameterGroupFamily>{engine}{v[:3]}</CacheParameterGroupFamily></member>"
+        f"<CacheEngineVersion><Engine>{engine}</Engine><EngineVersion>{v}</EngineVersion>"
+        f"<CacheParameterGroupFamily>{engine}{v[:3]}</CacheParameterGroupFamily></CacheEngineVersion>"
         for v in versions.get(engine, ["7.0.12"])
     )
     return _xml(200, "DescribeCacheEngineVersionsResponse",
@@ -1227,7 +1234,8 @@ def _extract_tags(p):
 def _list_tags(p):
     arn = _p(p, "ResourceName")
     tags = _tags.get(arn, [])
-    tag_xml = "".join(f"<member><Key>{t['Key']}</Key><Value>{t['Value']}</Value></member>" for t in tags)
+    # TagList.member.locationName = "Tag"
+    tag_xml = "".join(f"<Tag><Key>{t['Key']}</Key><Value>{t['Value']}</Value></Tag>" for t in tags)
     return _xml(200, "ListTagsForResourceResponse",
         f"<ListTagsForResourceResult><TagList>{tag_xml}</TagList></ListTagsForResourceResult>")
 
@@ -1247,7 +1255,7 @@ def _add_tags(p):
             existing.append(t)
             existing_keys.add(t["Key"])
 
-    tag_xml = "".join(f"<member><Key>{t['Key']}</Key><Value>{t['Value']}</Value></member>" for t in existing)
+    tag_xml = "".join(f"<Tag><Key>{t['Key']}</Key><Value>{t['Value']}</Value></Tag>" for t in existing)
     return _xml(200, "AddTagsToResourceResponse",
         f"<AddTagsToResourceResult><TagList>{tag_xml}</TagList></AddTagsToResourceResult>")
 
@@ -1263,7 +1271,7 @@ def _remove_tags(p):
         _tags[arn] = [t for t in _tags[arn] if t["Key"] not in keys_to_remove]
 
     tags = _tags.get(arn, [])
-    tag_xml = "".join(f"<member><Key>{t['Key']}</Key><Value>{t['Value']}</Value></member>" for t in tags)
+    tag_xml = "".join(f"<Tag><Key>{t['Key']}</Key><Value>{t['Value']}</Value></Tag>" for t in tags)
     return _xml(200, "RemoveTagsFromResourceResponse",
         f"<RemoveTagsFromResourceResult><TagList>{tag_xml}</TagList></RemoveTagsFromResourceResult>")
 
@@ -1336,7 +1344,8 @@ def _describe_snapshots(p):
     if rg_id:
         snaps = [s for s in snaps if s.get("ReplicationGroupId") == rg_id]
 
-    members = "".join(f"<member>{_snapshot_xml(s)}</member>" for s in snaps)
+    # SnapshotList.member.locationName = "Snapshot"
+    members = "".join(f"<Snapshot>{_snapshot_xml(s)}</Snapshot>" for s in snaps)
     return _xml(200, "DescribeSnapshotsResponse",
         f"<DescribeSnapshotsResult><Snapshots>{members}</Snapshots></DescribeSnapshotsResult>")
 
@@ -1355,13 +1364,14 @@ def _describe_events(p):
         filtered = [e for e in filtered if e["SourceType"] == source_type]
 
     filtered = filtered[-max_records:]
+    # EventList.member.locationName = "Event"
     members = "".join(
-        f"<member>"
+        f"<Event>"
         f"<SourceIdentifier>{e['SourceIdentifier']}</SourceIdentifier>"
         f"<SourceType>{e['SourceType']}</SourceType>"
         f"<Message>{e['Message']}</Message>"
         f"<Date>{e['Date']}</Date>"
-        f"</member>"
+        f"</Event>"
         for e in filtered
     )
     return _xml(200, "DescribeEventsResponse",
@@ -1587,15 +1597,16 @@ def _cluster_xml_inner(c):
     """Render cluster fields — no wrapping element."""
     ep = c.get("_endpoint", {})
     nodes_xml = ""
+    # CacheNodeList.member.locationName = "CacheNode"
     for node in c.get("CacheNodes", []):
         nep = node.get("Endpoint", {})
         nodes_xml += (
-            f"<member>"
+            f"<CacheNode>"
             f"<CacheNodeId>{node['CacheNodeId']}</CacheNodeId>"
             f"<CacheNodeStatus>{node['CacheNodeStatus']}</CacheNodeStatus>"
             f"<Endpoint><Address>{nep.get('Address', 'localhost')}</Address>"
             f"<Port>{nep.get('Port', 6379)}</Port></Endpoint>"
-            f"</member>"
+            f"</CacheNode>"
         )
     return (
         f"<CacheClusterId>{c['CacheClusterId']}</CacheClusterId>"
@@ -1616,30 +1627,35 @@ def _cluster_xml_inner(c):
 
 
 def _cluster_xml(c):
-    """For list contexts (DescribeCacheClusters), wrap in <member>."""
-    return f"<member>{_cluster_xml_inner(c)}</member>"
+    """For list contexts (DescribeCacheClusters), wrap each item in
+    <CacheCluster> — that's the AWS-spec locationName for
+    `CacheClusterList.member`. Strict SDKs (aws-sdk-go-v2 / Java v2 /
+    Rust v2) parse a <member>-wrapped list as empty (issue #530)."""
+    return f"<CacheCluster>{_cluster_xml_inner(c)}</CacheCluster>"
 
 
 def _rg_xml(rg):
     node_groups_xml = ""
+    # NodeGroupList.member.locationName = "NodeGroup",
+    # NodeGroupMemberList.member.locationName = "NodeGroupMember".
     for ng in rg.get("NodeGroups", []):
         members_xml = ""
         for m in ng.get("NodeGroupMembers", []):
             rep = m.get("ReadEndpoint", {})
             members_xml += (
-                f"<member>"
+                f"<NodeGroupMember>"
                 f"<CacheClusterId>{m.get('CacheClusterId', '')}</CacheClusterId>"
                 f"<CacheNodeId>{m.get('CacheNodeId', '0001')}</CacheNodeId>"
                 f"<CurrentRole>{m.get('CurrentRole', 'primary')}</CurrentRole>"
                 f"<PreferredAvailabilityZone>{m.get('PreferredAvailabilityZone', '')}</PreferredAvailabilityZone>"
                 f"<ReadEndpoint><Address>{rep.get('Address', 'localhost')}</Address>"
                 f"<Port>{rep.get('Port', 6379)}</Port></ReadEndpoint>"
-                f"</member>"
+                f"</NodeGroupMember>"
             )
         pep = ng.get("PrimaryEndpoint", {})
         rdr = ng.get("ReaderEndpoint", {})
         node_groups_xml += (
-            f"<member>"
+            f"<NodeGroup>"
             f"<NodeGroupId>{ng['NodeGroupId']}</NodeGroupId>"
             f"<Status>{ng['Status']}</Status>"
             f"<PrimaryEndpoint><Address>{pep.get('Address', 'localhost')}</Address>"
@@ -1647,7 +1663,7 @@ def _rg_xml(rg):
             f"<ReaderEndpoint><Address>{rdr.get('Address', 'localhost')}</Address>"
             f"<Port>{rdr.get('Port', 6379)}</Port></ReaderEndpoint>"
             f"<NodeGroupMembers>{members_xml}</NodeGroupMembers>"
-            f"</member>"
+            f"</NodeGroup>"
         )
 
     config_ep_xml = ""
@@ -1679,13 +1695,14 @@ def _rg_xml(rg):
 
 def _snapshot_xml(snap):
     nodes_xml = ""
+    # NodeSnapshotList.member.locationName = "NodeSnapshot"
     for ns in snap.get("NodeSnapshots", []):
         nodes_xml += (
-            f"<member>"
+            f"<NodeSnapshot>"
             f"<CacheNodeId>{ns.get('CacheNodeId', '0001')}</CacheNodeId>"
             f"<SnapshotCreateTime>{ns.get('SnapshotCreateTime', 0)}</SnapshotCreateTime>"
             f"<CacheSize>{ns.get('CacheSize', '0 MB')}</CacheSize>"
-            f"</member>"
+            f"</NodeSnapshot>"
         )
     return (
         f"<SnapshotName>{snap['SnapshotName']}</SnapshotName>"

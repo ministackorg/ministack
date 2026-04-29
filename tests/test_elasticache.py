@@ -9,6 +9,8 @@ from urllib.parse import urlparse
 import pytest
 from botocore.exceptions import ClientError
 
+ENDPOINT = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+
 
 def test_elasticache_create(ec):
     ec.create_cache_cluster(
@@ -726,3 +728,59 @@ def test_elasticache_real_cluster_mode(ec):
     ).stdout.strip()
     assert leftover == "", f"leftover containers after delete: {leftover}"
 
+
+
+# ========== Regression: AWS XML list wrappers (issue #530) ==========
+# ElastiCache list responses must use the AWS-spec locationName for each
+# list (e.g. <CacheCluster> for CacheClusterList.member) — NOT <member>.
+# Strict generated SDKs (aws-sdk-go-v2, Java/Rust v2) parse a <member>-
+# wrapped list as empty when the model declares a custom locationName.
+# botocore is permissive and accepts both, so a boto3-only test cannot
+# catch this — these tests assert on the wire shape via raw HTTP.
+
+
+def test_describe_cache_clusters_wraps_in_cachecluster_not_member():
+    """Real AWS uses <CacheCluster>...</CacheCluster> for each list item;
+    aws-sdk-go-v2 sees an empty CacheClusters slice if we emit <member>."""
+    import urllib.request
+    cluster_id = f"shape-test-{_uuid_mod.uuid4().hex[:8]}"
+    create = urllib.request.urlopen(urllib.request.Request(
+        f"{ENDPOINT}/",
+        data=(
+            f"Action=CreateCacheCluster&Version=2015-02-02"
+            f"&CacheClusterId={cluster_id}&CacheNodeType=cache.t3.micro"
+            f"&Engine=redis&NumCacheNodes=1"
+        ).encode(),
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        method="POST",
+    ))
+    create.read()
+    try:
+        resp = urllib.request.urlopen(urllib.request.Request(
+            f"{ENDPOINT}/",
+            data=(
+                f"Action=DescribeCacheClusters&Version=2015-02-02"
+                f"&CacheClusterId={cluster_id}"
+            ).encode(),
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            method="POST",
+        ))
+        body = resp.read().decode()
+        assert "<CacheCluster>" in body, (
+            "DescribeCacheClusters list items must be wrapped in "
+            "<CacheCluster> per AWS shape — strict SDKs (aws-sdk-go-v2, "
+            "Java/Rust v2) parse a <member>-wrapped list as empty (#530)."
+        )
+        assert "<member><CacheClusterId>" not in body, (
+            "Found legacy <member> wrapper for cluster — regression of #530"
+        )
+    finally:
+        urllib.request.urlopen(urllib.request.Request(
+            f"{ENDPOINT}/",
+            data=(
+                f"Action=DeleteCacheCluster&Version=2015-02-02"
+                f"&CacheClusterId={cluster_id}"
+            ).encode(),
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            method="POST",
+        )).read()

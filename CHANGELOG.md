@@ -7,6 +7,16 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [Unreleased]
+
+### Added
+- **ElastiCache: real Redis replication groups + opt-in real Redis Cluster mode** — `CreateReplicationGroup` now spawns live Redis containers per shard (was a metadata-only stub). Behind `ELASTICACHE_CLUSTER_MODE_REAL=1` + `DOCKER_NETWORK`, `NumNodeGroups=N`/`ReplicasPerNodeGroup=R` provisions `N × (1+R)` cluster-enabled nodes, runs `redis-cli --cluster create`, and serves real `CLUSTER SLOTS` / `MOVED` redirects. `NumNodeGroups=2` rejected with `InvalidParameterValue` (matches AWS: only 1 or ≥3 shards). Account-scoped container names + `account_id` label so accounts can share `rg_id`; orphan-container reaper at startup. Reported by @akursar.
+
+### Fixed
+- **ElastiCache list responses wrapped items in `<member>` instead of the AWS-spec element name** — `DescribeCacheClusters` and 10 other list-emitting ops emitted `<member>` where AWS uses the model-declared `locationName` (e.g. `<CacheCluster>`, `<Tag>`, `<Snapshot>`). Strict generated SDKs (`aws-sdk-go-v2`, Java/Rust v2) parse a `<member>`-wrapped list as empty; botocore is permissive, so boto3 / CLI users never saw it. 16 sites fixed; the 5 remaining `<member>` sites (`UserList`, `UserGroupList`, `UserIdList`, etc.) match AWS. Verified against botocore service-2.json. Reported by @jmickey (#530).
+
+---
+
 ## [1.3.20] — 2026-04-29
 
 ### Added
