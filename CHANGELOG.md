@@ -5,6 +5,12 @@ All notable changes to MiniStack will be documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning follows [Semantic Versioning](https://semver.org/).
 
+---
+
+## [Unreleased]
+
+### Added
+- **Native HTTPS via `USE_SSL=1`** — the gateway listener now speaks TLS when `USE_SSL=1` (also accepts `true` / `yes`). Drop-in compatible with LocalStack's `USE_SSL=true`, so a `compose.yml` switching from LocalStack to MiniStack doesn't need TLS-specific changes. By default, MiniStack auto-generates a self-signed RSA cert (CN: `ministack-local`, SAN: `localhost`, `ministack`, `127.0.0.1`, `::1`) cached under `${TMPDIR}/ministack-tls/` so the cert survives restarts. To pin a specific cert (e.g. an `mkcert`-issued one for browser trust), set `MINISTACK_SSL_CERT` and `MINISTACK_SSL_KEY` to PEM paths. Auto-generation uses the `cryptography` package (already shipped in both the regular and `:full` images). Unblocks AWS SDKs that hardcode `https://` against Cognito Hosted UI endpoints (e.g. Amplify v6) without needing a separate TLS-terminating proxy. Closes #526.
 
 ---
 
