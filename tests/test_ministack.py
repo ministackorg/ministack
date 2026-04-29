@@ -633,3 +633,86 @@ def test_persistence_s3_writes_state_after_ownership_and_public_access_block(tmp
     pers.save_state("roundtrip-bytes", state_with_bytes)
     loaded = pers.load_state("roundtrip-bytes")
     assert loaded["blob"] == b"\x00\x01\xff\xfe"
+
+
+# ---------------------------------------------------------------------------
+# Unit tests for _extract_s3_vhost_bucket
+#
+# Regression coverage for the bug introduced in #508 where the function would
+# return the first dotted-host segment as a "bucket" for ANY hostname with a
+# dot. That caused sibling-container DNS names (host.docker.internal) and
+# private-net domains (foo.local, bar.example.com) to be hijacked by the S3
+# vhost handler, returning 405 MethodNotAllowed for legitimate non-S3 requests
+# (terraform-apply → STS:GetCallerIdentity is the canonical reproduction).
+# ---------------------------------------------------------------------------
+
+from ministack.app import _extract_s3_vhost_bucket
+
+
+class TestExtractS3VhostBucket:
+    """_extract_s3_vhost_bucket must accept real S3 vhost shapes only."""
+
+    # --- positives: real S3 vhost patterns ---
+
+    def test_bare_bucket_localhost(self):
+        assert _extract_s3_vhost_bucket("mybucket.localhost") == "mybucket"
+
+    def test_bare_bucket_localhost_with_port(self):
+        assert _extract_s3_vhost_bucket("mybucket.localhost:4566") == "mybucket"
+
+    def test_s3_segment_localhost(self):
+        assert _extract_s3_vhost_bucket("mybucket.s3.localhost") == "mybucket"
+
+    def test_s3_region_localhost(self):
+        assert _extract_s3_vhost_bucket("mybucket.s3.us-east-1.localhost") == "mybucket"
+
+    def test_s3_region_localhost_with_port(self):
+        assert _extract_s3_vhost_bucket("mybucket.s3.us-east-1.localhost:4566") == "mybucket"
+
+    def test_s3_aws_standard(self):
+        assert _extract_s3_vhost_bucket("mybucket.s3.amazonaws.com") == "mybucket"
+
+    def test_s3_aws_regional(self):
+        assert _extract_s3_vhost_bucket("mybucket.s3.us-west-2.amazonaws.com") == "mybucket"
+
+    def test_s3_aws_legacy_dash_region(self):
+        assert _extract_s3_vhost_bucket("mybucket.s3-us-east-1.amazonaws.com") == "mybucket"
+
+    def test_s3_dotted_bucket_name(self):
+        # Dotted bucket names: only the first label is captured (consistent
+        # with the existing behaviour codified in PR #504 tests).
+        assert _extract_s3_vhost_bucket("my-bucket.s3.amazonaws.com") == "my-bucket"
+
+    # --- negatives: not S3 vhosts, must NOT be claimed by the S3 handler ---
+
+    def test_host_docker_internal_not_vhost(self):
+        # Regression for the Aspire/Docker-Desktop case: terraform-apply
+        # container reaches the gateway via host.docker.internal:4566 and
+        # was getting 405 MethodNotAllowed because "host" was returned as
+        # bucket and S3 then refused POST / on a non-existent bucket.
+        assert _extract_s3_vhost_bucket("host.docker.internal") is None
+        assert _extract_s3_vhost_bucket("host.docker.internal:4566") is None
+
+    def test_service_local_not_vhost(self):
+        # mDNS / Bonjour-style hostnames common in dev environments.
+        assert _extract_s3_vhost_bucket("printer.local") is None
+        assert _extract_s3_vhost_bucket("api.local:4566") is None
+
+    def test_random_external_domain_not_vhost(self):
+        assert _extract_s3_vhost_bucket("api.example.com") is None
+        assert _extract_s3_vhost_bucket("internal.corp.example") is None
+
+    def test_bare_s3_host_not_vhost(self):
+        # Path-style S3 endpoints (no bucket label) must return None.
+        assert _extract_s3_vhost_bucket("s3.amazonaws.com") is None
+        assert _extract_s3_vhost_bucket("s3.us-east-1.amazonaws.com") is None
+        assert _extract_s3_vhost_bucket("s3.localhost") is None
+        assert _extract_s3_vhost_bucket("s3.us-east-1.localhost") is None
+
+    def test_empty_or_invalid_host(self):
+        assert _extract_s3_vhost_bucket("") is None
+        assert _extract_s3_vhost_bucket(None) is None
+        assert _extract_s3_vhost_bucket("localhost") is None  # no dot
+        assert _extract_s3_vhost_bucket("[::1]") is None  # IPv6 literal
+        assert _extract_s3_vhost_bucket("127.0.0.1") is None
+        assert _extract_s3_vhost_bucket("127.0.0.1:4566") is None

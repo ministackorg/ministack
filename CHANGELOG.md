@@ -9,6 +9,10 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`_extract_s3_vhost_bucket` mis-classified non-S3 hostnames as S3 vhosts (regression from #508)** — the v1.3.18 rewrite accepted any `<word>.<rest>` host as a virtual-hosted bucket, which broke multi-service gateway setups: requests through sibling-Docker DNS names (`host.docker.internal`), mDNS (`service.local`), or any private CNAME got hijacked by the S3 handler and answered with 405 MethodNotAllowed. The canonical reproducer was an Aspire/Docker `terraform-apply` container hitting `STS:GetCallerIdentity` via `http://host.docker.internal:4566` (request fell into the S3 vhost path, S3 returned 405 for POST `/`). The function now requires the tail to look like an S3 endpoint: ends with `MINISTACK_HOST`, or first tail segment is `s3` / `s3-...` (covers AWS dot-region, dash-region, dualstack, FIPS, accelerate, website endpoints, plus the LocalStack-compat `bucket.localhost`). CNAME alias mode (AWS docs rule 3) and S3 Express One Zone remain unsupported — deliberate, the gateway shares port 4566 with all other services and the bug from #508 was that "any tail" hijacked them. 14 unit tests added covering both regression hosts and all positive S3 vhost shapes.
+
 ---
 
 ## [1.3.18] — 2026-04-28

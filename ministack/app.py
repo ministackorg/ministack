@@ -39,15 +39,27 @@ _EXECUTE_API_RE = re.compile(
 )
 # Virtual-hosted S3 bucket extraction. AWS-aligned per
 # docs.aws.amazon.com/AmazonS3/latest/userguide/VirtualHosting.html and
-# bucketnamingrules.html (HTTP vhost — ministack is HTTP). Works for any
-# endpoint hostname (localhost, ministack, custom Docker DNS, real AWS
-# domains) without hardcoding _MINISTACK_HOST.
+# bucketnamingrules.html (HTTP vhost — ministack is HTTP). The tail must
+# look like an S3 endpoint (s3 / s3-region segment) or end with the
+# configured _MINISTACK_HOST (LocalStack-compat: bucket.localhost). A bare
+# "<word>.<anything>" host is NOT treated as an S3 vhost — otherwise sibling
+# Docker DNS names like "host.docker.internal" or service names like
+# "service.local" would be mis-parsed as bucket="host" / "service" and
+# every non-S3 request reaching the gateway through such a hostname would
+# get hijacked by the S3 handler.
 _IPV4_RE = re.compile(r"^(?:\d{1,3}\.){3}\d{1,3}$")
 _BUCKET_LABEL_RE = re.compile(r"^[a-z0-9](?:[a-z0-9.\-]{1,61}[a-z0-9])$")
 
 
 def _extract_s3_vhost_bucket(host: str):
-    """Return the bucket if Host is virtual-hosted-style S3, else None."""
+    """Return the bucket if Host is virtual-hosted-style S3, else None.
+
+    Recognises:
+      - <bucket>.<MINISTACK_HOST>[:port]            (MiniStack-compat)
+      - <bucket>.s3.<anything>[:port]               (AWS standard vhost)
+      - <bucket>.s3-<region>.<anything>[:port]      (legacy AWS pattern)
+    Anything else falls through to generic routing.
+    """
     if not host:
         return None
     host = host.strip()
@@ -65,7 +77,12 @@ def _extract_s3_vhost_bucket(host: str):
         return None
     if ".." in candidate or _IPV4_RE.match(candidate):
         return None
-    return candidate
+    if tail == _MINISTACK_HOST or tail.endswith("." + _MINISTACK_HOST):
+        return candidate
+    first_tail_segment = tail.split(".", 1)[0]
+    if first_tail_segment == "s3" or first_tail_segment.startswith("s3-"):
+        return candidate
+    return None
 _S3_VHOST_EXCLUDE_RE = re.compile(r"\.(execute-api|alb|emr|efs|elasticache|s3-control)\.")
 _HEALTH_PATHS = ("/_ministack/health", "/_localstack/health", "/health")
 _BODY_METHODS = ("POST", "PUT", "PATCH")
