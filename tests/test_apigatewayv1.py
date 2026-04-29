@@ -682,7 +682,8 @@ def test_apigwv1_execute_missing_resource_404(apigw_v1):
 
 def test_apigwv1_http_proxy_does_not_block_parallel_ddb(monkeypatch):
     import asyncio
-    from ministack.core import nonblocking_http
+
+    from ministack.services import apigateway as apigw_mod
     from ministack.services import apigateway_v1 as apigw_v1_mod
     from ministack.services import dynamodb as ddb_mod
 
@@ -690,7 +691,9 @@ def test_apigwv1_http_proxy_does_not_block_parallel_ddb(monkeypatch):
         time.sleep(0.4)
         return 200, {"Content-Type": "application/json"}, b"{}"
 
-    monkeypatch.setattr(nonblocking_http, "_urlopen_sync", _slow_urlopen)
+    # _urlopen_async lives on apigateway and is reused by v1; patch the sync
+    # helper there so both v1 and v2 tests target the same offload point.
+    monkeypatch.setattr(apigw_mod, "_urlopen_sync", _slow_urlopen)
 
     async def _run():
         slow_call = asyncio.create_task(
@@ -722,16 +725,17 @@ def test_apigwv1_http_proxy_does_not_block_parallel_ddb(monkeypatch):
 
 
 def test_apigwv1_http_proxy_timeout_is_configurable(monkeypatch):
-    import importlib
-    from ministack.services import apigateway_v1 as apigateway_v1_module
+    """`_timeout_from_env` honours the env var and falls back on bad input.
+    Tested directly instead of via importlib.reload so the suite-wide
+    apigateway_v1 module state is not rebuilt mid-run."""
+    from ministack.services.apigateway import _timeout_from_env
 
     monkeypatch.setenv("MINISTACK_APIGW_PROXY_TIMEOUT_SECONDS", "55")
-    reloaded = importlib.reload(apigateway_v1_module)
-    try:
-        assert reloaded._PROXY_TIMEOUT_SECONDS == 55.0
-    finally:
-        monkeypatch.delenv("MINISTACK_APIGW_PROXY_TIMEOUT_SECONDS", raising=False)
-        importlib.reload(reloaded)
+    assert _timeout_from_env("MINISTACK_APIGW_PROXY_TIMEOUT_SECONDS", 30.0) == 55.0
+    monkeypatch.setenv("MINISTACK_APIGW_PROXY_TIMEOUT_SECONDS", "not-a-number")
+    assert _timeout_from_env("MINISTACK_APIGW_PROXY_TIMEOUT_SECONDS", 30.0) == 30.0
+    monkeypatch.setenv("MINISTACK_APIGW_PROXY_TIMEOUT_SECONDS", "0")
+    assert _timeout_from_env("MINISTACK_APIGW_PROXY_TIMEOUT_SECONDS", 30.0) == 30.0
 
 
 def test_apigwv1_no_conflict_with_v2(apigw_v1, apigw, lam):

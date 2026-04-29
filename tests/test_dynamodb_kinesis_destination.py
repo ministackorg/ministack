@@ -72,7 +72,9 @@ def test_enable_returns_active_and_describe_lists_it(ddb, kin):
     resp = ddb.enable_kinesis_streaming_destination(
         TableName="KdsLifecycle", StreamArn=arn,
     )
-    assert resp["DestinationStatus"] == "ACTIVE"
+    # AWS returns ENABLING immediately; the destination flips to ACTIVE
+    # by the time Describe is called.
+    assert resp["DestinationStatus"] == "ENABLING"
     assert resp["StreamArn"] == arn
     assert resp["TableName"] == "KdsLifecycle"
 
@@ -145,7 +147,9 @@ def test_disable_stops_delivery(ddb, kin):
     ddb.put_item(TableName="KdsDisable", Item={"pk": {"S": "before"}})
 
     resp = ddb.disable_kinesis_streaming_destination(TableName="KdsDisable", StreamArn=arn)
-    assert resp["DestinationStatus"] == "DISABLED"
+    # AWS returns DISABLING immediately; storage is DISABLED so Describe
+    # below shows the steady-state.
+    assert resp["DestinationStatus"] == "DISABLING"
 
     # Describe still lists the now-DISABLED entry (matches AWS ~24h retention).
     dests = ddb.describe_kinesis_streaming_destination(TableName="KdsDisable")[
@@ -184,7 +188,8 @@ def test_update_precision(ddb, kin):
             "ApproximateCreationDateTimePrecision": "MICROSECOND",
         },
     )
-    assert resp["DestinationStatus"] == "ACTIVE"
+    # AWS returns UPDATING immediately; Describe below shows steady-state ACTIVE.
+    assert resp["DestinationStatus"] == "UPDATING"
     assert (
         resp["UpdateKinesisStreamingConfiguration"]["ApproximateCreationDateTimePrecision"]
         == "MICROSECOND"
@@ -197,24 +202,37 @@ def test_update_precision(ddb, kin):
 
 
 def test_update_rejects_invalid_precision(ddb, kin):
+    """boto3 catches `NANOSECOND` client-side via enum validation, so we hit
+    the server with a raw HTTP POST to verify the server-side ValidationException
+    actually fires (not just the SDK)."""
+    import urllib.error
+    import urllib.request
+
     _make_table(ddb, "KdsUpdateInvalid")
     arn = _make_stream(kin, "ministack-kds-update-invalid")
     ddb.enable_kinesis_streaming_destination(TableName="KdsUpdateInvalid", StreamArn=arn)
 
-    with pytest.raises(ClientError) as ei:
-        ddb.update_kinesis_streaming_destination(
-            TableName="KdsUpdateInvalid",
-            StreamArn=arn,
-            UpdateKinesisStreamingConfiguration={
-                "ApproximateCreationDateTimePrecision": "NANOSECOND",
-            },
-        )
-    # boto3 performs client-side enum validation and raises ParamValidationError
-    # BEFORE the request is sent; fall back to a server-side check with a raw
-    # call if that's what happened.
-    err = ei.value
-    code = getattr(err, "response", {}).get("Error", {}).get("Code", "")
-    assert code in ("ValidationException", "")
+    body = json.dumps({
+        "TableName": "KdsUpdateInvalid",
+        "StreamArn": arn,
+        "UpdateKinesisStreamingConfiguration": {"ApproximateCreationDateTimePrecision": "NANOSECOND"},
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        "http://localhost:4566/",
+        data=body,
+        headers={
+            "Content-Type": "application/x-amz-json-1.0",
+            "X-Amz-Target": "DynamoDB_20120810.UpdateKinesisStreamingDestination",
+        },
+        method="POST",
+    )
+    try:
+        urllib.request.urlopen(req)
+        pytest.fail("Expected server to reject NANOSECOND precision")
+    except urllib.error.HTTPError as e:
+        assert e.code == 400
+        err_body = json.loads(e.read().decode("utf-8"))
+        assert err_body.get("__type", "").endswith("ValidationException")
 
 
 # ---------------------------------------------------------------------------
