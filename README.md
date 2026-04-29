@@ -660,6 +660,9 @@ ecs.stop_task(cluster="dev", task=task_arn)
 | `SMTP_HOST` | _(unset)_ | SMTP server for SES email relay (e.g. `mailhog:1025`). When set, SES SendEmail/SendRawEmail actually deliver mail. When unset, emails are stored in-memory only |
 | `MINISTACK_APIGW_PROXY_TIMEOUT_SECONDS` | `30` | API Gateway v1/v2 HTTP `HTTP_PROXY` / `HTTP` integration: upstream request timeout (seconds) |
 | `MINISTACK_APIGW_JWKS_TIMEOUT_SECONDS` | `5` | API Gateway v2 JWT authorizer: JWKS document fetch timeout (seconds) |
+| `USE_SSL` | `0` | Enable HTTPS on the gateway listener. Accepts `1`, `true`, `yes`. LocalStack-compatible flag name |
+| `MINISTACK_SSL_CERT` | _(unset)_ | Optional PEM-encoded server certificate path; required together with `MINISTACK_SSL_KEY`. When unset, MiniStack auto-generates a self-signed cert under `${TMPDIR}/ministack-tls/` (cached across restarts) |
+| `MINISTACK_SSL_KEY` | _(unset)_ | Optional PEM-encoded private key path; required together with `MINISTACK_SSL_CERT` |
 
 ### API Gateway HTTP proxy execution model
 

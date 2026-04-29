@@ -51,17 +51,42 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-from ministack.core.nonblocking_http import timeout_from_env, urlopen as nb_urlopen
-from ministack.core.responses import AccountScopedDict, get_account_id, error_response_json, new_uuid, get_region
+from ministack.core.responses import AccountScopedDict, error_response_json, get_account_id, get_region, new_uuid
 
 _HOST = os.environ.get("MINISTACK_HOST", "localhost")
 _PORT = os.environ.get("GATEWAY_PORT", "4566")
 
 logger = logging.getLogger("apigateway")
 
+
+def _timeout_from_env(env_name: str, default_seconds: float) -> float:
+    """Read a positive float timeout from an env var; fall back on missing /
+    non-numeric / non-positive values."""
+    raw = os.environ.get(env_name)
+    if raw is None:
+        return float(default_seconds)
+    try:
+        parsed = float(raw)
+    except ValueError:
+        return float(default_seconds)
+    return parsed if parsed > 0 else float(default_seconds)
+
+
+def _urlopen_sync(request_or_url, timeout_seconds: float):
+    with urllib.request.urlopen(request_or_url, timeout=timeout_seconds) as resp:
+        return resp.status, dict(resp.headers.items()), resp.read()
+
+
+async def _urlopen_async(request_or_url, timeout_seconds: float):
+    """Run a blocking ``urllib`` call on the default thread executor so the
+    ASGI event loop stays responsive while upstream / JWKS sockets are in
+    flight. Used by the JWKS fetcher and the HTTP_PROXY integration."""
+    return await asyncio.to_thread(_urlopen_sync, request_or_url, timeout_seconds)
+
+
 REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
-_PROXY_TIMEOUT_SECONDS = timeout_from_env("MINISTACK_APIGW_PROXY_TIMEOUT_SECONDS", 30.0)
-_JWKS_TIMEOUT_SECONDS = timeout_from_env("MINISTACK_APIGW_JWKS_TIMEOUT_SECONDS", 5.0)
+_PROXY_TIMEOUT_SECONDS = _timeout_from_env("MINISTACK_APIGW_PROXY_TIMEOUT_SECONDS", 30.0)
+_JWKS_TIMEOUT_SECONDS = _timeout_from_env("MINISTACK_APIGW_JWKS_TIMEOUT_SECONDS", 5.0)
 
 # ---- Module-level state ----
 _apis = AccountScopedDict()          # api_id -> api object
@@ -73,7 +98,10 @@ _authorizers = AccountScopedDict()   # api_id -> {authorizer_id -> authorizer ob
 _api_tags = AccountScopedDict()      # resource_arn -> {key -> value}
 _route_responses = AccountScopedDict()         # api_id -> {route_id -> {rr_id -> route_response}}
 _integration_responses = AccountScopedDict()   # api_id -> {integration_id -> {ir_id -> int_response}}
-_jwks_cache: dict = {}
+# JWKS cache is account-scoped because issuer URLs in MiniStack can resolve
+# to per-account local Cognito user pools — the same URL string may legitimately
+# serve different keys in different accounts.
+_jwks_cache = AccountScopedDict()
 
 # WebSocket connection registry — connections are not per-account-scoped at the store level
 # because the @connections management API may arrive on any host/account; instead we store
@@ -82,6 +110,10 @@ _jwks_cache: dict = {}
 #                    close_event (asyncio.Event), lastActiveAt, identity} }
 _ws_connections: dict = {}
 
+# HTTP API parameter-mapping reserved headers — sourced from
+# https://docs.aws.amazon.com/apigateway/latest/developerguide/http-api-parameter-mapping.html
+# (verified 2026-04-29). Any change to this list must be cross-checked
+# against that AWS doc page; do not extend by guesswork.
 _RESERVED_HEADER_EXACT = {
     "authorization",
     "connection",
@@ -478,7 +510,7 @@ async def _fetch_jwks(url: str) -> dict:
     now = time.time()
     if cached and cached.get("expiresAt", 0) > now:
         return cached["jwks"]
-    _, _, body = await nb_urlopen(url, _JWKS_TIMEOUT_SECONDS)
+    _, _, body = await _urlopen_async(url, _JWKS_TIMEOUT_SECONDS)
     payload = json.loads(body or b"{}")
     _jwks_cache[url] = {
         "jwks": payload,
@@ -1003,7 +1035,7 @@ async def _invoke_http_proxy(integration, path, method, headers, body, query_par
         if k.lower() not in ("host", "content-length"):
             req.add_header(k, v)
     try:
-        status, resp_headers_raw, resp_body = await nb_urlopen(req, _PROXY_TIMEOUT_SECONDS)
+        status, resp_headers_raw, resp_body = await _urlopen_async(req, _PROXY_TIMEOUT_SECONDS)
         resp_headers = {"Content-Type": resp_headers_raw.get("Content-Type", "application/json")}
         return status, resp_headers, resp_body
     except urllib.error.HTTPError as e:

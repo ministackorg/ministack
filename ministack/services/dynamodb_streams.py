@@ -188,6 +188,18 @@ def _describe_stream(data):
     table = _ddb._tables.get(table_name, {})
     key_schema = table.get("KeySchema", [])
 
+    # AWS shard pagination: Limit caps the number of Shards returned (max 100),
+    # ExclusiveStartShardId skips past a previously-returned shard. We expose
+    # one synthetic shard so this is degenerate, but the fields must be honored
+    # for SDK consumers that pass them.
+    all_shards = [shard]
+    start_shard = data.get("ExclusiveStartShardId")
+    if start_shard:
+        idx = next((i for i, s in enumerate(all_shards) if s["ShardId"] == start_shard), -1)
+        all_shards = all_shards[idx + 1:] if idx >= 0 else []
+    limit = min(int(data.get("Limit", 100) or 100), 100)
+    page = all_shards[:limit]
+
     description = {
         "StreamArn": stream_arn,
         "StreamLabel": info["StreamLabel"],
@@ -196,8 +208,10 @@ def _describe_stream(data):
         "CreationRequestDateTime": table.get("CreationDateTime", 0),
         "TableName": table_name,
         "KeySchema": key_schema,
-        "Shards": [shard],
+        "Shards": page,
     }
+    if len(page) == limit and len(all_shards) > limit:
+        description["LastEvaluatedShardId"] = page[-1]["ShardId"]
     return json_response({"StreamDescription": description})
 
 

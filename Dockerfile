@@ -67,8 +67,8 @@ ENV MINISTACK_VERSION=${MINISTACK_VERSION} \
 
 EXPOSE 4566 2222
 
-# Pure Python healthcheck — honours USE_SSL so it works for both HTTP and HTTPS.
+# Pure Python healthcheck — no curl dependency; USE_SSL for HTTP/HTTPS.
 HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=3 \
-    CMD python -c "import os,ssl,urllib.request as r; t=os.environ.get('USE_SSL','').strip().lower() in ('1','true','yes'); r.urlopen(('https' if t else 'http')+'://localhost:'+os.environ.get('GATEWAY_PORT','4566')+'/_ministack/health',context=ssl._create_unverified_context() if t else None)" || exit 1
+    CMD python -c "import os,ssl,urllib.request as r; t=os.environ.get('USE_SSL','').strip().lower() in ('1','true','yes'); r.urlopen(('https' if t else 'http')+'://localhost:4566/_ministack/health',context=ssl._create_unverified_context() if t else None)" || exit 1
 
 ENTRYPOINT ["python", "-m", "hypercorn", "ministack.app:app", "-c", "file:ministack/core/hypercorn_conf.py", "--bind", "0.0.0.0:4566", "--keep-alive", "75"]

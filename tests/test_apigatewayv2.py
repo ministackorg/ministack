@@ -4,16 +4,11 @@ import base64
 import io
 import json
 import os
-import pytest
 import threading
 import time
 import uuid as _uuid_mod
 import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from botocore.exceptions import ClientError
-import time
-import uuid as _uuid_mod
-import zipfile
 from urllib.parse import urlparse
 
 import pytest
@@ -846,6 +841,7 @@ def test_apigw_integration_without_request_parameters_optional_map(apigw):
 def test_apigw_jwt_authorizer_enforced_in_data_plane(apigw):
     import urllib.error as _urlerr
     import urllib.request as _urlreq
+
     from ministack.services import cognito as _cognito
 
     api_id = apigw.create_api(Name=f"jwt-enforce-{_uuid_mod.uuid4().hex[:8]}", ProtocolType="HTTP")["ApiId"]
@@ -959,7 +955,7 @@ def test_apigw_request_mapping_claims_to_headers(apigw):
 
 def test_apigw_http_proxy_does_not_block_parallel_ddb(monkeypatch):
     import asyncio
-    from ministack.core import nonblocking_http
+
     from ministack.services import apigateway as apigw_mod
     from ministack.services import dynamodb as ddb_mod
 
@@ -967,7 +963,7 @@ def test_apigw_http_proxy_does_not_block_parallel_ddb(monkeypatch):
         time.sleep(0.4)
         return 200, {"Content-Type": "application/json"}, b"{}"
 
-    monkeypatch.setattr(nonblocking_http, "_urlopen_sync", _slow_urlopen)
+    monkeypatch.setattr(apigw_mod, "_urlopen_sync", _slow_urlopen)
 
     async def _run():
         slow_call = asyncio.create_task(
@@ -999,19 +995,14 @@ def test_apigw_http_proxy_does_not_block_parallel_ddb(monkeypatch):
 
 
 def test_apigw_http_proxy_timeout_is_configurable(monkeypatch):
-    import importlib
-    from ministack.services import apigateway as apigateway_module
+    """`_timeout_from_env` honours both apigateway timeout env vars.
+    Tested directly to avoid importlib.reload churn on session-scoped module state."""
+    from ministack.services.apigateway import _timeout_from_env
 
     monkeypatch.setenv("MINISTACK_APIGW_PROXY_TIMEOUT_SECONDS", "41")
     monkeypatch.setenv("MINISTACK_APIGW_JWKS_TIMEOUT_SECONDS", "9")
-    reloaded = importlib.reload(apigateway_module)
-    try:
-        assert reloaded._PROXY_TIMEOUT_SECONDS == 41.0
-        assert reloaded._JWKS_TIMEOUT_SECONDS == 9.0
-    finally:
-        monkeypatch.delenv("MINISTACK_APIGW_PROXY_TIMEOUT_SECONDS", raising=False)
-        monkeypatch.delenv("MINISTACK_APIGW_JWKS_TIMEOUT_SECONDS", raising=False)
-        importlib.reload(reloaded)
+    assert _timeout_from_env("MINISTACK_APIGW_PROXY_TIMEOUT_SECONDS", 30.0) == 41.0
+    assert _timeout_from_env("MINISTACK_APIGW_JWKS_TIMEOUT_SECONDS", 5.0) == 9.0
 
 
 def test_apigw_routekey_in_lambda_event(apigw, lam):
