@@ -121,10 +121,11 @@ def test_ministack_package_core_importable():
 
 @_requires_package
 def test_ministack_package_services_importable():
-    """All 25 ministack.services modules must be importable and expose handle_request."""
+    """All core ministack.services modules must be importable and expose handle_request."""
     from ministack.services import (
         apigateway,
         apigateway_v1,
+        appsync_events,
         athena,
         cloudwatch,
         cloudwatch_logs,
@@ -170,6 +171,7 @@ def test_ministack_package_services_importable():
         glue,
         athena,
         apigateway,
+        appsync_events,
         firehose,
         route53,
         cognito,
