@@ -1449,6 +1449,32 @@ def test_s3_post_object_storage_class(s3):
     assert s3.get_object(Bucket="qa-s3-post-sc", Key="cold")["StorageClass"] == "GLACIER"
 
 
+def test_s3_post_object_unquoted_field_names(s3):
+    """`Content-Disposition: form-data; name=key` (token form) is accepted —
+    .NET's MultipartFormDataContent emits this rather than the quoted form,
+    and real S3 accepts both per RFC 2183."""
+    import requests
+    s3.create_bucket(Bucket="qa-s3-post-tok")
+    boundary = "----testboundary"
+    body = (
+        f"--{boundary}\r\n"
+        f"Content-Disposition: form-data; name=key\r\n\r\n"
+        f"hello.txt\r\n"
+        f"--{boundary}\r\n"
+        f"Content-Disposition: form-data; name=file; filename=hello.txt\r\n"
+        f"Content-Type: application/octet-stream\r\n\r\n"
+        f"hello world\r\n"
+        f"--{boundary}--\r\n"
+    ).encode()
+    r = requests.post(
+        f"http://localhost:4566/qa-s3-post-tok",
+        data=body,
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+    )
+    assert r.status_code == 204, r.text
+    assert s3.get_object(Bucket="qa-s3-post-tok", Key="hello.txt")["Body"].read() == b"hello world"
+
+
 def test_s3_post_object_content_length_range_enforced(s3):
     """`content-length-range` condition rejects oversize uploads with EntityTooLarge."""
     import requests

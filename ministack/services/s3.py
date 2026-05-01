@@ -1737,11 +1737,14 @@ def _parse_multipart_form(content_type: str, body: bytes) -> list[tuple]:
                 k, _, v = line.partition(b":")
                 part_headers[k.strip().decode("latin-1").lower()] = v.strip().decode("latin-1")
         cd = part_headers.get("content-disposition", "")
-        name_m = _re.search(r'name="([^"]*)"', cd)
-        fn_m = _re.search(r'filename="([^"]*)"', cd)
+        # RFC 2183 allows both quoted-string ('name="x"') and token ('name=x')
+        # forms. .NET's MultipartFormDataContent emits the token form for
+        # ASCII-clean values; real S3 accepts both, so we do too.
+        name_m = _re.search(r'name=(?:"([^"]*)"|([^;\s]+))', cd)
+        fn_m = _re.search(r'filename=(?:"([^"]*)"|([^;\s]+))', cd)
         out.append((
-            name_m.group(1) if name_m else "",
-            fn_m.group(1) if fn_m else None,
+            (name_m.group(1) or name_m.group(2)) if name_m else "",
+            (fn_m.group(1) or fn_m.group(2)) if fn_m else None,
             part_headers,
             value,
         ))
