@@ -265,17 +265,26 @@ def _create_event_bus(data):
         return error_response_json("ResourceAlreadyExistsException", f"Event bus {name} already exists", 400)
     arn = f"arn:aws:events:{get_region()}:{get_account_id()}:event-bus/{name}"
     description = data.get("Description", "")
-    _event_buses[name] = {
+    bus_record = {
         "Name": name,
         "Arn": arn,
         "Description": description,
         "CreationTime": _now_ts(),
         "LastModifiedTime": _now_ts(),
     }
+    # Optional 2026-03 additive fields — accept-and-echo so SDK callers
+    # configuring rule-match logging round-trip cleanly.
+    for k in ("LogConfig", "DeadLetterConfig", "KmsKeyIdentifier"):
+        if k in data:
+            bus_record[k] = data[k]
+    _event_buses[name] = bus_record
     tags = data.get("Tags", [])
     if tags:
         _tags[arn] = {t["Key"]: t["Value"] for t in tags}
-    return json_response({"EventBusArn": arn})
+    out = {"EventBusArn": arn}
+    if "LogConfig" in bus_record:
+        out["LogConfig"] = bus_record["LogConfig"]
+    return json_response(out)
 
 
 def _delete_event_bus(data):
@@ -315,14 +324,18 @@ def _describe_event_bus(data):
     if not bus:
         return error_response_json("ResourceNotFoundException", f"Event bus {name} not found", 400)
     policy = _event_bus_policies.get(name)
-    return json_response({
+    out = {
         "Name": bus["Name"],
         "Arn": bus["Arn"],
         "Description": bus.get("Description", ""),
         "CreationTime": bus["CreationTime"],
         "LastModifiedTime": bus.get("LastModifiedTime", bus.get("CreationTime")),
         "Policy": json.dumps(policy) if policy else "",
-    })
+    }
+    for k in ("LogConfig", "DeadLetterConfig", "KmsKeyIdentifier"):
+        if k in bus:
+            out[k] = bus[k]
+    return json_response(out)
 
 
 def _update_event_bus(data):
@@ -341,6 +354,9 @@ def _update_event_bus(data):
         bus["EventSourceName"] = data.get("EventSourceName")
     if "Description" in data:
         bus["Description"] = data.get("Description")
+    for k in ("LogConfig", "DeadLetterConfig", "KmsKeyIdentifier"):
+        if k in data:
+            bus[k] = data[k]
 
     # Update tags if provided
     tags = data.get("Tags")

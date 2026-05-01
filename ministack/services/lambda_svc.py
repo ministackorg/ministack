@@ -534,6 +534,12 @@ def _build_config(name: str, data: dict, code_zip: bytes | None = None) -> dict:
         config["TenancyConfig"] = data["TenancyConfig"]
     if "CapacityProviderConfig" in data:
         config["CapacityProviderConfig"] = data["CapacityProviderConfig"]
+    # FileSystemConfigs is opaque at the wire level — historically EFS access
+    # points (fsap-*), and as of 2026-04 also S3 bucket ARNs for the S3 mount
+    # feature. The emulator doesn't actually mount; it just round-trips the
+    # config so SDK/CFN/Terraform reads see what was set.
+    if "FileSystemConfigs" in data:
+        config["FileSystemConfigs"] = data["FileSystemConfigs"]
     return config
 
 

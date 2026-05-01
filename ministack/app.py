@@ -175,8 +175,10 @@ logger = logging.getLogger("ministack")
 
 # Single source of truth for routable services, their backing modules, and aliases.
 SERVICE_REGISTRY = {
+    "account": {"module": "account"},
     "acm": {"module": "acm"},
     "backup": {"module": "backup"},
+    "batch": {"module": "batch"},
     "apigateway": {"module": "apigateway", "aliases": ("execute-api", "apigatewayv2")},
     "appconfig": {"module": "appconfig"},
     "appconfigdata": {"module": "appconfig"},
@@ -207,6 +209,8 @@ SERVICE_REGISTRY = {
     "kms": {"module": "kms"},
     "lambda": {"module": "lambda_svc"},
     "logs": {"module": "cloudwatch_logs", "aliases": ("cloudwatch-logs",)},
+    "opensearch": {"module": "opensearch", "aliases": ("es", "elasticsearch")},
+    "organizations": {"module": "organizations"},
     "monitoring": {"module": "cloudwatch", "aliases": ("cloudwatch",)},
     "rds-data": {"module": "rds_data"},
     "rds": {"module": "rds"},
@@ -224,6 +228,8 @@ SERVICE_REGISTRY = {
     "sts": {"module": "sts"},
     "tagging": {"module": "tagging"},
     "transfer": {"module": "transfer"},
+    "waf": {"module": "waf_v1"},
+    "waf-regional": {"module": "waf_v1"},
     "wafv2": {"module": "waf"},
 }
 

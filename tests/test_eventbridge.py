@@ -1164,3 +1164,36 @@ def test_eventbridge_duplicate_replay_name_fails(eb):
         )
     assert exc.value.response["Error"]["Code"] == "ResourceAlreadyExistsException"
     eb.delete_archive(ArchiveName=arch_name)
+
+
+def test_eventbridge_log_config_round_trip(eb):
+    """LogConfig accept-and-echo (2026-03 AWS additive change) — must
+    persist on Create, echo on Describe, update via UpdateEventBus.
+    Older botocore strict-validates this new field, so call via raw HTTP."""
+    import urllib.request as _r
+    name = f"log-bus-{int(time.time()*1000)}"
+    log_cfg = {"IncludeDetail": "FULL", "Level": "INFO"}
+
+    def _post(target, payload):
+        req = _r.Request(
+            "http://localhost:4566/",
+            data=json.dumps(payload).encode(),
+            headers={
+                "X-Amz-Target": f"AWSEvents.{target}",
+                "Content-Type": "application/x-amz-json-1.1",
+                "Authorization": ("AWS4-HMAC-SHA256 Credential=test/20260101/"
+                                  "us-east-1/events/aws4_request, SignedHeaders=, Signature=x"),
+            },
+        )
+        return json.loads(_r.urlopen(req).read())
+
+    _post("CreateEventBus", {"Name": name, "LogConfig": log_cfg})
+    desc = _post("DescribeEventBus", {"Name": name})
+    assert desc.get("LogConfig") == log_cfg
+
+    new_cfg = {"IncludeDetail": "NONE", "Level": "ERROR"}
+    _post("UpdateEventBus", {"Name": name, "LogConfig": new_cfg})
+    desc2 = _post("DescribeEventBus", {"Name": name})
+    assert desc2.get("LogConfig") == new_cfg
+
+    eb.delete_event_bus(Name=name)

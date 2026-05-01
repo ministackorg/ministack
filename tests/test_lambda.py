@@ -3040,3 +3040,26 @@ def test_lambda_docker_flags_applied_to_run_kwargs(monkeypatch):
     assert captured["privileged"] is True
     assert captured["read_only"] is True
     assert "unknown_flag" not in captured
+
+
+def test_lambda_filesystem_configs_s3_mount_round_trip(lam):
+    """FileSystemConfigs accept-and-echo: AWS added S3-bucket ARN support
+    in 2026-04 alongside the original EFS access-point ARNs. The emulator
+    doesn't mount anything; it just round-trips the config so SDK/CFN reads
+    see what was set."""
+    fn = f"fs-mount-{int(time.time()*1000)}"
+    lam.create_function(
+        FunctionName=fn,
+        Runtime="python3.12",
+        Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _make_zip(_LAMBDA_CODE)},
+        FileSystemConfigs=[{
+            "Arn": "arn:aws:s3:::my-bucket",
+            "LocalMountPath": "/mnt/data",
+        }],
+    )
+    cfg = lam.get_function_configuration(FunctionName=fn)
+    assert cfg["FileSystemConfigs"] == [{"Arn": "arn:aws:s3:::my-bucket",
+                                          "LocalMountPath": "/mnt/data"}]
+    lam.delete_function(FunctionName=fn)

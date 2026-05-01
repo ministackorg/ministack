@@ -1486,6 +1486,64 @@ def _describe_availability_zones(p):
                 f"<availabilityZoneInfo>{items}</availabilityZoneInfo>")
 
 
+# Standard commercial AWS regions (us-gov-* / cn-* served by separate partitions
+# in real AWS, so excluded). opt-in-not-required matches AWS for legacy regions
+# enabled by default; newer regions surface as opted-in for the stub.
+_AWS_REGIONS = [
+    ("us-east-1", "opt-in-not-required"),
+    ("us-east-2", "opt-in-not-required"),
+    ("us-west-1", "opt-in-not-required"),
+    ("us-west-2", "opt-in-not-required"),
+    ("af-south-1", "opted-in"),
+    ("ap-east-1", "opted-in"),
+    ("ap-south-1", "opt-in-not-required"),
+    ("ap-south-2", "opted-in"),
+    ("ap-northeast-1", "opt-in-not-required"),
+    ("ap-northeast-2", "opt-in-not-required"),
+    ("ap-northeast-3", "opt-in-not-required"),
+    ("ap-southeast-1", "opt-in-not-required"),
+    ("ap-southeast-2", "opt-in-not-required"),
+    ("ap-southeast-3", "opted-in"),
+    ("ap-southeast-4", "opted-in"),
+    ("ap-southeast-5", "opted-in"),
+    ("ca-central-1", "opt-in-not-required"),
+    ("ca-west-1", "opted-in"),
+    ("eu-central-1", "opt-in-not-required"),
+    ("eu-central-2", "opted-in"),
+    ("eu-west-1", "opt-in-not-required"),
+    ("eu-west-2", "opt-in-not-required"),
+    ("eu-west-3", "opt-in-not-required"),
+    ("eu-north-1", "opt-in-not-required"),
+    ("eu-south-1", "opted-in"),
+    ("eu-south-2", "opted-in"),
+    ("il-central-1", "opted-in"),
+    ("me-south-1", "opted-in"),
+    ("me-central-1", "opted-in"),
+    ("sa-east-1", "opt-in-not-required"),
+    ("mx-central-1", "opted-in"),
+]
+
+
+def _describe_regions(p):
+    requested = _parse_member_list(p, "RegionName")
+    all_regions = _p(p, "AllRegions", "").lower() == "true"
+    items_xml = []
+    for name, opt_in in _AWS_REGIONS:
+        if requested and name not in requested:
+            continue
+        # Without AllRegions, AWS omits regions that are disabled (not-opted-in).
+        # The stub treats every listed region as enabled, so AllRegions has no
+        # filtering effect here — it's accepted for SDK compatibility.
+        items_xml.append(
+            f"<item><regionName>{name}</regionName>"
+            f"<regionEndpoint>ec2.{name}.amazonaws.com</regionEndpoint>"
+            f"<optInStatus>{opt_in}</optInStatus></item>"
+        )
+    _ = all_regions
+    return _xml(200, "DescribeRegionsResponse",
+                f"<regionInfo>{''.join(items_xml)}</regionInfo>")
+
+
 # ---------------------------------------------------------------------------
 # Elastic IPs
 # ---------------------------------------------------------------------------
@@ -4145,6 +4203,7 @@ _ACTION_MAP = {
     "AttachInternetGateway": _attach_internet_gateway,
     "DetachInternetGateway": _detach_internet_gateway,
     "DescribeAvailabilityZones": _describe_availability_zones,
+    "DescribeRegions": _describe_regions,
     "AllocateAddress": _allocate_address,
     "ReleaseAddress": _release_address,
     "AssociateAddress": _associate_address,

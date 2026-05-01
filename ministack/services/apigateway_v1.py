@@ -1783,6 +1783,10 @@ def _create_domain_name(data):
         "regionalDomainName": f"{domain_name}.execute-api.{get_region()}.amazonaws.com",
         "regionalHostedZoneId": "Z1UJRXOUMOOFQ8",
         "endpointConfiguration": data.get("endpointConfiguration", {"types": ["REGIONAL"]}),
+        # securityPolicy is an opaque enum at the wire level; AWS keeps adding
+        # new values (e.g. SecurityPolicy-TLS13-1-2-FIPS-PFS-PQ-2025-09 in
+        # 2026-03). Accept whatever the caller sends; default mirrors AWS.
+        "securityPolicy": data.get("securityPolicy", "TLS_1_2"),
         "tags": data.get("tags", {}),
     }
     _domain_names[domain_name] = dn

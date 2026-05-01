@@ -24,6 +24,31 @@ def test_ec2_describe_availability_zones(ec2):
     azs = [az["ZoneName"] for az in resp["AvailabilityZones"]]
     assert any("us-east-1" in az for az in azs)
 
+
+def test_ec2_describe_regions_returns_commercial_regions(ec2):
+    """DescribeRegions must list at least the four legacy us-* regions
+    with opt-in-not-required, and emit the shape AWS returns."""
+    resp = ec2.describe_regions()
+    regions = {r["RegionName"]: r for r in resp["Regions"]}
+    for name in ("us-east-1", "us-east-2", "us-west-1", "us-west-2"):
+        assert name in regions
+        assert regions[name]["OptInStatus"] == "opt-in-not-required"
+        assert regions[name]["Endpoint"] == f"ec2.{name}.amazonaws.com"
+
+
+def test_ec2_describe_regions_with_filter(ec2):
+    resp = ec2.describe_regions(RegionNames=["us-east-1", "eu-west-1"])
+    names = {r["RegionName"] for r in resp["Regions"]}
+    assert names == {"us-east-1", "eu-west-1"}
+
+
+def test_ec2_describe_regions_all_regions_includes_opt_in(ec2):
+    base = len(ec2.describe_regions()["Regions"])
+    full = len(ec2.describe_regions(AllRegions=True)["Regions"])
+    assert full == base
+    assert base >= 30
+
+
 def test_ec2_run_describe_terminate_instances(ec2):
     resp = ec2.run_instances(ImageId="ami-00000000", MinCount=1, MaxCount=1, InstanceType="t2.micro")
     assert len(resp["Instances"]) == 1

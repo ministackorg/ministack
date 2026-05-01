@@ -1585,3 +1585,29 @@ def test_put_integration_response_persists_content_handling(apigw_v1, method_set
         statusCode="200",
     )
     assert got.get("contentHandling") == ch_value
+
+
+def test_apigateway_v1_create_domain_name_accepts_new_tls_policy(apigw_v1):
+    """securityPolicy must accept the 2026-03 added enum value
+    SecurityPolicy-TLS13-1-2-FIPS-PFS-PQ-2025-09 and any future opaque values."""
+    domain = f"api-tls-{_uuid_mod.uuid4().hex[:8]}.example.com"
+    new_policy = "SecurityPolicy-TLS13-1-2-FIPS-PFS-PQ-2025-09"
+    r = apigw_v1.create_domain_name(
+        domainName=domain,
+        certificateName="c1",
+        certificateArn=f"arn:aws:acm:us-east-1:000000000000:certificate/{_uuid_mod.uuid4().hex[:8]}",
+        securityPolicy=new_policy,
+    )
+    assert r["securityPolicy"] == new_policy
+    got = apigw_v1.get_domain_name(domainName=domain)
+    assert got["securityPolicy"] == new_policy
+
+
+def test_apigateway_v1_create_domain_name_default_tls_policy(apigw_v1):
+    """When securityPolicy is omitted, AWS defaults to TLS_1_2."""
+    domain = f"api-tls-default-{_uuid_mod.uuid4().hex[:8]}.example.com"
+    r = apigw_v1.create_domain_name(
+        domainName=domain,
+        certificateName="c2",
+    )
+    assert r["securityPolicy"] == "TLS_1_2"
