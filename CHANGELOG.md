@@ -7,6 +7,13 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [Unreleased]
+
+### Added
+- **EventBridge scheduled rule auto-fire** — `rate(N minute|hour|day)` rules now fire automatically in Ministack. A background daemon thread (`eb-scheduler`) ticks every 10 seconds and dispatches enabled rules whose interval has elapsed. Follows the AWS-documented behaviour: the countdown starts at rule creation time so the first fire is one full interval after the rule is enabled, not immediately. The scheduled event payload matches the AWS wire format exactly: `"source": "aws.events"`, `"detail-type": "Scheduled Event"`, `"detail": {}`, `"version": "0"`, `"resources": [rule_arn]`, and `"time"` as an ISO 8601 UTC string. Iterates `_rules._data` directly so multi-tenant (multi-account) setups work correctly. `cron()` expressions are accepted and stored but not yet auto-fired. `reset()` clears the scheduler state. 12 unit tests cover rate-expression parsing and all tick-decision branches; one slow end-to-end integration test (gated by `MINISTACK_SLOW_TESTS=1`) exercises the full path from `PutRule`/`PutTargets` through Lambda invocation.
+
+---
+
 ## [1.3.22] — 2026-04-30
 
 ### Added
