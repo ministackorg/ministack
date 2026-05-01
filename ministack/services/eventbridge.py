@@ -29,7 +29,7 @@ import os
 import re
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 
 from ministack.core.responses import (
     AccountScopedDict,
@@ -38,6 +38,7 @@ from ministack.core.responses import (
     get_region,
     json_response,
     new_uuid,
+    set_request_account_id,
 )
 
 logger = logging.getLogger("events")
@@ -83,6 +84,10 @@ _replays = AccountScopedDict()              # replay_name -> replay record
 _endpoints = AccountScopedDict()            # endpoint name -> endpoint record
 # Partner event sources, per-account (key: "account|name" pattern inside each tenant).
 _partner_event_sources = AccountScopedDict()
+
+# Tracks when each scheduled rule last fired: {(account_id, rule_key): timestamp}.
+# Plain dict (not AccountScopedDict) because the scheduler thread owns it globally.
+_rule_last_fired: dict = {}
 
 
 def _ensure_default_bus():
@@ -808,12 +813,18 @@ def _matches_content_filter(value, filter_rule):
 def _invoke_target(target, event, rule):
     arn = target.get("Arn", "")
 
+    raw_time = event["Time"]
+    if isinstance(raw_time, (int, float)):
+        iso_time = datetime.fromtimestamp(raw_time, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    else:
+        iso_time = raw_time
+
     event_payload = json.dumps({
         "version": "0",
         "id": event["EventId"],
         "source": event["Source"],
         "account": get_account_id(),
-        "time": event["Time"],
+        "time": iso_time,
         "region": get_region(),
         "resources": event.get("Resources", []),
         "detail-type": event["DetailType"],
@@ -1680,6 +1691,89 @@ def _update_api_destination(data):
     })
 
 
+# ---------------------------------------------------------------------------
+# Scheduled rule background ticker
+# ---------------------------------------------------------------------------
+
+_SCHEDULER_TICK_INTERVAL = 10  # seconds between sweeps
+
+
+def _parse_rate_seconds(expr: str) -> int | None:
+    """Return the interval in seconds for a rate() expression, or None."""
+    m = re.match(r"^rate\((\d+)\s+(minute|minutes|hour|hours|day|days)\)$", expr)
+    if not m:
+        return None
+    n, unit = int(m.group(1)), m.group(2)
+    if unit in ("minute", "minutes"):
+        return n * 60
+    if unit in ("hour", "hours"):
+        return n * 3600
+    return n * 86400
+
+
+def _tick_scheduled_rules():
+    """Fire any enabled scheduled rule whose interval has elapsed."""
+    now = _now_ts()
+    # Iterate _rules._data directly so we see every account, not just the
+    # ContextVar default.  Keys are (account_id, rule_key) tuples.
+    for (account_id, rule_key), rule in list(_rules._data.items()):
+        if rule.get("State") != "ENABLED":
+            continue
+        interval = _parse_rate_seconds(rule.get("ScheduleExpression", ""))
+        if interval is None:
+            continue  # cron() expressions not yet supported by the scheduler
+        state_key = (account_id, rule_key)
+        if state_key not in _rule_last_fired:
+            # First time the scheduler sees this rule: start the countdown but
+            # don't fire yet.  AWS fires rate() rules ~interval seconds after
+            # creation, not immediately.
+            _rule_last_fired[state_key] = now
+            continue
+        if now - _rule_last_fired[state_key] < interval:
+            continue
+        _rule_last_fired[state_key] = now
+        targets = _targets._data.get((account_id, rule_key), [])
+        if not targets:
+            continue
+        # Set the account context so ARN-building and Lambda dispatch use the
+        # correct account for this rule's tenant.
+        set_request_account_id(account_id)
+        event = {
+            "EventId": new_uuid(),
+            "Source": "aws.events",
+            "DetailType": "Scheduled Event",
+            "Detail": "{}",
+            "EventBusName": rule.get("EventBusName", "default"),
+            "Time": now,
+            "Resources": [rule.get("Arn", "")],
+            "Account": account_id,
+            "Region": get_region(),
+        }
+        for target in targets:
+            try:
+                _invoke_target(target, event, rule)
+            except Exception:
+                logger.exception(
+                    "EventBridge scheduler: dispatch error for rule %s account %s",
+                    rule_key, account_id,
+                )
+
+
+def _scheduler_loop():
+    while True:
+        time.sleep(_SCHEDULER_TICK_INTERVAL)
+        try:
+            _tick_scheduled_rules()
+        except Exception:
+            logger.exception("EventBridge scheduler tick error")
+
+
+_scheduler_thread = threading.Thread(
+    target=_scheduler_loop, daemon=True, name="eb-scheduler"
+)
+_scheduler_thread.start()
+
+
 def reset():
     _rules.clear()
     _targets.clear()
@@ -1693,5 +1787,6 @@ def reset():
     _endpoints.clear()
     _partner_event_sources.clear()
     _event_buses.clear()
+    _rule_last_fired.clear()
     # The "default" bus is lazily recreated per-account on next access via
     # _ensure_default_bus(), so nothing to re-seed here.
