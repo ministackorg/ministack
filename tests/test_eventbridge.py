@@ -1197,3 +1197,170 @@ def test_eventbridge_log_config_round_trip(eb):
     assert desc2.get("LogConfig") == new_cfg
 
     eb.delete_event_bus(Name=name)
+# ---------------------------------------------------------------------------
+# Unit tests: _parse_rate_seconds
+# ---------------------------------------------------------------------------
+
+import pytest as _pytest
+from ministack.services import eventbridge as _eb
+
+
+@_pytest.mark.parametrize("expr,expected", [
+    ("rate(1 minute)",   60),
+    ("rate(5 minutes)",  300),
+    ("rate(1 hour)",     3600),
+    ("rate(2 hours)",    7200),
+    ("rate(1 day)",      86400),
+    ("rate(3 days)",     259200),
+    # invalid — should return None
+    ("cron(0 12 * * ? *)", None),
+    ("rate(1 second)",    None),
+    ("rate(1 seconds)",   None),
+    ("",                  None),
+    ("rate(1 week)",      None),
+    ("not-a-rate",        None),
+])
+def test_scheduler_parse_rate_seconds(expr, expected):
+    assert _eb._parse_rate_seconds(expr) == expected
+
+
+# ---------------------------------------------------------------------------
+# Unit tests: _tick_scheduled_rules
+# ---------------------------------------------------------------------------
+
+@_pytest.fixture()
+def isolated_scheduler():
+    """Save and restore scheduler module state so unit tests don't bleed."""
+    saved_rules = dict(_eb._rules._data)
+    saved_targets = dict(_eb._targets._data)
+    saved_fired = dict(_eb._rule_last_fired)
+    _eb._rules._data.clear()
+    _eb._targets._data.clear()
+    _eb._rule_last_fired.clear()
+    yield
+    _eb._rules._data.clear()
+    _eb._rules._data.update(saved_rules)
+    _eb._targets._data.clear()
+    _eb._targets._data.update(saved_targets)
+    _eb._rule_last_fired.clear()
+    _eb._rule_last_fired.update(saved_fired)
+
+
+_ACCOUNT = "000000000000"
+_RULE_KEY = "default|unit-test-rule"
+_STATE_KEY = (_ACCOUNT, _RULE_KEY)
+_DUMMY_TARGET = [{"Id": "t1", "Arn": "arn:aws:lambda:us-east-1:000000000000:function:dummy"}]
+
+def _seed_rule(schedule="rate(1 minute)", state="ENABLED"):
+    _eb._rules._data[_STATE_KEY] = {
+        "Name": "unit-test-rule",
+        "ScheduleExpression": schedule,
+        "State": state,
+        "EventBusName": "default",
+        "Arn": "arn:aws:events:us-east-1:000000000000:rule/unit-test-rule",
+    }
+    _eb._targets._data[_STATE_KEY] = list(_DUMMY_TARGET)
+
+
+from unittest.mock import patch as _patch
+
+
+def test_scheduler_first_sight_initializes_countdown(isolated_scheduler):
+    """First tick records the timestamp but must NOT dispatch."""
+    _seed_rule()
+    with _patch("ministack.services.eventbridge._invoke_target") as mock_invoke:
+        _eb._tick_scheduled_rules()
+    assert _STATE_KEY in _eb._rule_last_fired
+    mock_invoke.assert_not_called()
+
+
+def test_scheduler_fires_after_interval(isolated_scheduler):
+    """Tick dispatches when last-fired is older than the rule interval."""
+    _seed_rule()
+    _eb._rule_last_fired[_STATE_KEY] = _eb._now_ts() - 65  # 65 s ago > 60 s interval
+    with _patch("ministack.services.eventbridge._invoke_target") as mock_invoke:
+        _eb._tick_scheduled_rules()
+    mock_invoke.assert_called_once()
+    _, kwargs = mock_invoke.call_args
+    target_arg = mock_invoke.call_args[0][0]
+    assert target_arg["Id"] == "t1"
+
+
+def test_scheduler_skips_rule_before_interval(isolated_scheduler):
+    """Tick must NOT dispatch when interval hasn't elapsed."""
+    _seed_rule()
+    _eb._rule_last_fired[_STATE_KEY] = _eb._now_ts() - 10  # only 10 s ago
+    with _patch("ministack.services.eventbridge._invoke_target") as mock_invoke:
+        _eb._tick_scheduled_rules()
+    mock_invoke.assert_not_called()
+
+
+def test_scheduler_skips_disabled_rule(isolated_scheduler):
+    """Disabled rules must never be dispatched even if past interval."""
+    _seed_rule(state="DISABLED")
+    _eb._rule_last_fired[_STATE_KEY] = _eb._now_ts() - 120
+    with _patch("ministack.services.eventbridge._invoke_target") as mock_invoke:
+        _eb._tick_scheduled_rules()
+    mock_invoke.assert_not_called()
+
+
+def test_scheduler_skips_cron_expression(isolated_scheduler):
+    """cron() rules are not yet supported — must be skipped silently."""
+    _seed_rule(schedule="cron(0 12 * * ? *)")
+    with _patch("ministack.services.eventbridge._invoke_target") as mock_invoke:
+        _eb._tick_scheduled_rules()
+    # No countdown entry, no dispatch
+    assert _STATE_KEY not in _eb._rule_last_fired
+    mock_invoke.assert_not_called()
+
+
+def test_scheduler_no_error_without_targets(isolated_scheduler):
+    """A rule with no targets must not raise; just skip dispatch."""
+    _seed_rule()
+    _eb._targets._data[_STATE_KEY] = []  # empty targets list
+    _eb._rule_last_fired[_STATE_KEY] = _eb._now_ts() - 120
+    with _patch("ministack.services.eventbridge._invoke_target") as mock_invoke:
+        _eb._tick_scheduled_rules()
+    mock_invoke.assert_not_called()
+
+
+def test_scheduler_reset_clears_last_fired(isolated_scheduler):
+    """reset() must empty _rule_last_fired."""
+    _eb._rule_last_fired[_STATE_KEY] = _eb._now_ts()
+    _eb.reset()
+    assert _eb._rule_last_fired == {}
+
+
+def test_scheduler_first_sight_with_old_creation_time_fires_immediately(isolated_scheduler):
+    """AWS doc: 'the countdown begins when you create the rule'. A rule whose
+    CreationTime is already older than the interval must fire on the first
+    scheduler tick that observes it, not wait another full interval."""
+    _eb._rules._data[_STATE_KEY] = {
+        "Name": "old-rule",
+        "ScheduleExpression": "rate(1 minute)",
+        "State": "ENABLED",
+        "EventBusName": "default",
+        "Arn": "arn:aws:events:us-east-1:000000000000:rule/old-rule",
+        "CreationTime": _eb._now_ts() - 120,  # created 2 min ago, interval = 1 min
+    }
+    _eb._targets._data[_STATE_KEY] = list(_DUMMY_TARGET)
+    with _patch("ministack.services.eventbridge._invoke_target") as mock_invoke:
+        _eb._tick_scheduled_rules()
+    mock_invoke.assert_called_once()
+
+
+def test_scheduler_first_sight_with_recent_creation_time_waits(isolated_scheduler):
+    """A rule created within the last interval must NOT fire on first sight —
+    AWS countdown begins at PutRule, so the first fire is one full interval later."""
+    _eb._rules._data[_STATE_KEY] = {
+        "Name": "fresh-rule",
+        "ScheduleExpression": "rate(1 minute)",
+        "State": "ENABLED",
+        "EventBusName": "default",
+        "Arn": "arn:aws:events:us-east-1:000000000000:rule/fresh-rule",
+        "CreationTime": _eb._now_ts() - 5,  # created 5s ago, interval = 60s
+    }
+    _eb._targets._data[_STATE_KEY] = list(_DUMMY_TARGET)
+    with _patch("ministack.services.eventbridge._invoke_target") as mock_invoke:
+        _eb._tick_scheduled_rules()
+    mock_invoke.assert_not_called()
