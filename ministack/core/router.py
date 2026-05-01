@@ -186,7 +186,11 @@ SERVICE_PATTERNS = {
     },
     "opensearch": {
         "host_patterns": [r"^es\.", r"^aos\.", r"^opensearch\."],
-        "path_prefixes": ["/2021-01-01/domain", "/2021-01-01/opensearch"],
+        "path_prefixes": [
+            "/2021-01-01/domain", "/2021-01-01/opensearch",
+            "/2021-01-01/versions", "/2021-01-01/compatibleVersions",
+            "/2021-01-01/tags", "/2021-01-01/tags-removal",
+        ],
         "credential_scope": "es",
     },
     "organizations": {
