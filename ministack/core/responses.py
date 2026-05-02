@@ -223,12 +223,21 @@ def error_response_xml(code: str, message: str, status: int, namespace: str = "h
 
 
 def error_response_json(code: str, message: str, status: int = 400) -> tuple:
-    """AWS-style JSON error response."""
+    """AWS-style JSON error response.
+
+    Real AWS emits the error type in BOTH the body (`__type`) and the
+    `x-amzn-errortype` response header. Java/Go SDK v2 prefer the header;
+    boto3 reads the body. Send both.
+    """
     data = {
         "__type": code,
         "message": message,
     }
-    return json_response(data, status)
+    body = json.dumps(data, ensure_ascii=False).encode("utf-8")
+    return status, {
+        "Content-Type": "application/x-amz-json-1.0",
+        "x-amzn-errortype": code,
+    }, body
 
 
 def now_iso() -> str:

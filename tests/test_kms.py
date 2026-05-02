@@ -79,6 +79,9 @@ def test_kms_describe_nonexistent_key(kms_client):
     with pytest.raises(ClientError) as exc_info:
         kms_client.describe_key(KeyId="nonexistent-key-id")
     assert "NotFoundException" in str(exc_info.value)
+    # Real AWS sends `x-amzn-errortype` on JSON-protocol errors. Java/Go SDK v2
+    # read it; without it they raise SdkClientException(unknown error type).
+    assert exc_info.value.response["ResponseMetadata"]["HTTPHeaders"].get("x-amzn-errortype") == "NotFoundException"
 
 def test_kms_sign_and_verify_pkcs1(kms_client):
     key = kms_client.create_key(KeySpec="RSA_2048", KeyUsage="SIGN_VERIFY")

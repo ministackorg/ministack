@@ -731,16 +731,20 @@ async def handle_request(method, path, headers, body, query_params):
     try:
         data = json.loads(body) if body else {}
     except json.JSONDecodeError:
-        return 400, {"Content-Type": "application/x-amz-json-1.1"}, json.dumps({
+        return 400, {"Content-Type": "application/x-amz-json-1.1", "x-amzn-errortype": "SerializationException"}, json.dumps({
             "__type": "SerializationException",
             "message": "Invalid JSON",
         }).encode()
 
     handler = _HANDLERS.get(action)
     if not handler:
-        return 400, {"Content-Type": "application/x-amz-json-1.1"}, json.dumps({
+        return 400, {"Content-Type": "application/x-amz-json-1.1", "x-amzn-errortype": "InvalidRequestException"}, json.dumps({
             "__type": "InvalidRequestException",
             "message": f"Unknown action: {action}",
         }).encode()
 
     return handler(data)
+
+
+def reset():
+    pass

@@ -28,7 +28,7 @@ LocalStack recently moved its core services behind a paid plan. If you relied on
 
 - **40+ AWS services** emulated on a single port (4566)
 - **Drop-in compatible** — works with `boto3`, AWS CLI, Terraform, CDK, Pulumi, any SDK
-- **Real infrastructure** — RDS spins up actual Postgres/MySQL containers, ElastiCache spins up real Redis, Athena runs real SQL via DuckDB, ECS runs real Docker containers
+- **Real infrastructure** — RDS spins up actual Postgres/MySQL containers, ElastiCache spins up real Redis, Athena runs real SQL via DuckDB (full image only), ECS runs real Docker containers
 - **Tiny footprint** — ~270MB image, ~21MB RAM at idle vs LocalStack's ~1GB image and ~500MB RAM
 - **Fast startup** — under 2 seconds, HTTP/2 (h2c) supported
 - **MIT licensed** — use it, fork it, contribute to it
@@ -573,6 +573,8 @@ A Redis sidecar is also always available at `localhost:6379` when using Docker C
 
 ## Athena with Real SQL
 
+> **Requires the full image** (`ministackorg/ministack:full`). The default light image ships without DuckDB and returns mocked results — `SELECT 1+1` will return `1`, not `2`.
+
 Athena queries run via DuckDB and can query files in your local S3 data directory:
 
 ```python
@@ -936,7 +938,7 @@ pip install boto3 pytest duckdb docker cbor2
 # Start MiniStack
 docker compose up -d
 
-# Run the full test suite (2,100+ tests across all services)
+# Run the full test suite (2,200+ tests across all services)
 pytest tests/ -v
 ```
 

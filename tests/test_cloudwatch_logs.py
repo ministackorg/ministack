@@ -853,3 +853,12 @@ def test_subscription_filter_destination_resolvable_after_warm_boot():
         "state. _destinations must be persisted alongside _log_groups."
     )
     mod.reset()
+
+
+def test_logs_describe_streams_on_nonexistent_group_carries_errortype(logs):
+    """Real AWS sends `x-amzn-errortype` on JSON-protocol errors. Java/Go SDK
+    v2 read it; without it they raise SdkClientException(unknown error type)."""
+    with pytest.raises(ClientError) as exc:
+        logs.describe_log_streams(logGroupName="missing-lg")
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+    assert exc.value.response["ResponseMetadata"]["HTTPHeaders"].get("x-amzn-errortype") == "ResourceNotFoundException"

@@ -83,6 +83,8 @@ def test_ssm_delete_v2(ssm):
     with pytest.raises(ClientError) as exc:
         ssm.get_parameter(Name="/ssm2/del/tmp")
     assert exc.value.response["Error"]["Code"] == "ParameterNotFound"
+    # Real AWS sends `x-amzn-errortype` on JSON-protocol errors; Java/Go SDK v2 read it.
+    assert exc.value.response["ResponseMetadata"]["HTTPHeaders"].get("x-amzn-errortype") == "ParameterNotFound"
 
     ssm.put_parameter(Name="/ssm2/del/b1", Value="v1", Type="String")
     ssm.put_parameter(Name="/ssm2/del/b2", Value="v2", Type="String")

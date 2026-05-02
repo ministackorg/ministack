@@ -2207,6 +2207,8 @@ def test_sfn_describe_not_found(sfn):
         sfn.describe_state_machine(stateMachineArn="arn:aws:states:us-east-1:000000000000:stateMachine:nonexistent-99")
     err = exc.value.response["Error"]["Code"]
     assert "StateMachineDoesNotExist" in err or "NotFound" in err or "ResourceNotFound" in err
+    # Real AWS sends `x-amzn-errortype` on JSON-protocol errors; Java/Go SDK v2 read it.
+    assert exc.value.response["ResponseMetadata"]["HTTPHeaders"].get("x-amzn-errortype") == "StateMachineDoesNotExist"
 
 def test_sfn_start_execution_not_found(sfn):
     """StartExecution on non-existent SM should fail."""

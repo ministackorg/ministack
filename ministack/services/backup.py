@@ -117,7 +117,7 @@ def _no_content():
 def _err(code, msg, status=400):
     return (
         status,
-        {"Content-Type": "application/json"},
+        {"Content-Type": "application/json", "x-amzn-errortype": code},
         json.dumps({"__type": code, "Message": msg}).encode(),
     )
 

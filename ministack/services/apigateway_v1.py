@@ -160,7 +160,7 @@ def _v1_error(code, message, status):
     # other JSON-protocol AWS service. boto3 reads this to populate
     # ``ClientError.response["Error"]["Code"]``; with plain "type" it falls
     # back to the numeric HTTP status as the code.
-    return status, {"Content-Type": "application/json"}, json.dumps({"message": message, "__type": code}, ensure_ascii=False).encode("utf-8")
+    return status, {"Content-Type": "application/json", "x-amzn-errortype": code}, json.dumps({"message": message, "__type": code}, ensure_ascii=False).encode("utf-8")
 
 
 def _qp(query_params, key, default=None):

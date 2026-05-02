@@ -101,6 +101,8 @@ def test_secretsmanager_delete_v2(sm):
     with pytest.raises(ClientError) as exc:
         sm.get_secret_value(SecretId="sm-del-v2")
     assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+    # Real AWS sends `x-amzn-errortype` on JSON-protocol errors; Java/Go SDK v2 read it.
+    assert exc.value.response["ResponseMetadata"]["HTTPHeaders"].get("x-amzn-errortype") == "ResourceNotFoundException"
 
 def test_secretsmanager_delete_with_recovery(sm):
     sm.create_secret(Name="sm-del-rec", SecretString="recoverable")

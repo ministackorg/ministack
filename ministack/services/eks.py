@@ -134,7 +134,7 @@ def _json_resp(status, body):
 
 
 def _error(status, code, message):
-    return _json_resp(status, {"__type": code, "message": message})
+    return status, {"Content-Type": "application/json", "x-amzn-errortype": code}, json.dumps({"__type": code, "message": message}).encode()
 
 
 def _get_docker():

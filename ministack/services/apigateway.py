@@ -159,7 +159,7 @@ def _apigw_response(data: dict, status: int = 200) -> tuple:
 
 
 def _apigw_error(code: str, message: str, status: int) -> tuple:
-    return status, {"Content-Type": "application/json"}, json.dumps({"message": message, "__type": code}, ensure_ascii=False).encode("utf-8")
+    return status, {"Content-Type": "application/json", "x-amzn-errortype": code}, json.dumps({"message": message, "__type": code}, ensure_ascii=False).encode("utf-8")
 
 
 def _api_arn(api_id: str) -> str:

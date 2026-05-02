@@ -1148,7 +1148,7 @@ def _json_response(status, data):
 
 
 def _json_error(code, message, status):
-    return _json_response(status, {"__type": code, "message": message})
+    return status, {"Content-Type": "application/json", "x-amzn-errortype": code}, json.dumps({"__type": code, "message": message}).encode("utf-8")
 
 
 def reset():

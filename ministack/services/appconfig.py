@@ -828,7 +828,7 @@ def _json(status, data):
 
 
 def _error(status, code, message):
-    body = json.dumps({"Message": message, "Code": code}).encode("utf-8")
+    body = json.dumps({"__type": code, "Message": message, "Code": code, "message": message}).encode("utf-8")
     return status, {"Content-Type": "application/json", "x-amzn-errortype": code}, body
 
 

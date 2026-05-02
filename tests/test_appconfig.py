@@ -537,6 +537,22 @@ def test_appconfig_get_nonexistent_application(appconfig_client):
     with pytest.raises(ClientError) as exc:
         appconfig_client.get_application(ApplicationId="nonexistent")
     assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+    # Real AWS sends `x-amzn-errortype` on REST-JSON errors; Java/Go SDK v2 read it.
+    assert exc.value.response["ResponseMetadata"]["HTTPHeaders"].get("x-amzn-errortype") == "ResourceNotFoundException"
+    # Body must also include `__type` (was previously only `Code`/`Message`,
+    # which generic JSON-error parsers miss). Verify via raw HTTP since boto3
+    # surfaces only Error.Code/Message.
+    import json, urllib.request, urllib.error
+    req = urllib.request.Request(
+        "http://localhost:4566/applications/nonexistent",
+        headers={"Authorization": "AWS4-HMAC-SHA256 Credential=test/20260501/us-east-1/appconfig/aws4_request"},
+    )
+    try:
+        urllib.request.urlopen(req, timeout=5)
+        assert False, "expected 404"
+    except urllib.error.HTTPError as e:
+        body = json.loads(e.read())
+        assert body.get("__type") == "ResourceNotFoundException"
 
 
 def test_appconfig_get_nonexistent_environment(appconfig_client):

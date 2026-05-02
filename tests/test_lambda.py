@@ -204,6 +204,8 @@ def test_lambda_get_function_not_found(lam):
     with pytest.raises(ClientError) as exc:
         lam.get_function(FunctionName="nonexistent-func-xyz")
     assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+    # Real AWS sends `x-amzn-errortype` on REST-JSON errors; Java/Go SDK v2 read it.
+    assert exc.value.response["ResponseMetadata"]["HTTPHeaders"].get("x-amzn-errortype") == "ResourceNotFoundException"
 
 def test_lambda_list_functions(lam):
     resp = lam.list_functions()

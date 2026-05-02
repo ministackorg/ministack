@@ -323,3 +323,12 @@ def test_firehose_s3_destination_writes(s3, fh):
     obj = s3.get_object(Bucket=bucket, Key=key)
     body = obj["Body"].read()
     assert b"hello from firehose" in body
+
+
+def test_firehose_describe_nonexistent_carries_errortype(fh):
+    """Real AWS sends `x-amzn-errortype` on JSON-protocol errors. Java/Go SDK
+    v2 read it; without it they raise SdkClientException(unknown error type)."""
+    with pytest.raises(ClientError) as exc:
+        fh.describe_delivery_stream(DeliveryStreamName="missing-fh")
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+    assert exc.value.response["ResponseMetadata"]["HTTPHeaders"].get("x-amzn-errortype") == "ResourceNotFoundException"

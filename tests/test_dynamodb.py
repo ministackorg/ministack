@@ -356,6 +356,9 @@ def test_dynamodb_delete_table_not_found(ddb):
     with pytest.raises(ClientError) as exc:
         ddb.delete_table(TableName="t_nonexistent_xyz")
     assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+    # Real AWS sends `x-amzn-errortype` on JSON-protocol errors. Java/Go SDK v2
+    # read it; without it they raise SdkClientException(unknown error type).
+    assert exc.value.response["ResponseMetadata"]["HTTPHeaders"].get("x-amzn-errortype") == "ResourceNotFoundException"
 
 
 def test_dynamodb_deletion_protection(ddb):

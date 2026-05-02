@@ -699,3 +699,12 @@ def test_tagging_tag_resources_cross_account_isolation(s3):
     resp_a = tag_a.get_resources(TagFilters=[{"Key": "tenant", "Values": ["A"]}])
     arns_a = [r["ResourceARN"] for r in resp_a["ResourceTagMappingList"]]
     assert arn_a in arns_a
+
+
+def test_tagging_module_exposes_no_op_reset():
+    """Tag dispatcher is stateless (delegates to per-service tag stores), but
+    must expose `reset()` so the central `/_ministack/reset` doesn't log a
+    warning."""
+    from ministack.services import tagging
+    assert callable(getattr(tagging, "reset", None))
+    tagging.reset()

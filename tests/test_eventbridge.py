@@ -338,6 +338,8 @@ def test_eventbridge_delete_rule_v2(eb):
     with pytest.raises(ClientError) as exc:
         eb.describe_rule(Name="eb-del-v2")
     assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+    # Real AWS sends `x-amzn-errortype` on JSON-protocol errors; Java/Go SDK v2 read it.
+    assert exc.value.response["ResponseMetadata"]["HTTPHeaders"].get("x-amzn-errortype") == "ResourceNotFoundException"
 
 def test_eventbridge_tags_v2(eb):
     resp = eb.put_rule(Name="eb-tag-v2", ScheduleExpression="rate(1 hour)", State="ENABLED")

@@ -119,3 +119,7 @@ async def handle_request(method, path, headers, body, query_params):
     except json.JSONDecodeError:
         return error_response_json("SerializationException", "invalid JSON body", 400)
     return fn(payload)
+
+
+def reset():
+    pass

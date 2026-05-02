@@ -1433,7 +1433,7 @@ def _error(code, message, status, use_json=False, use_cbor=False):
     if use_json or use_cbor:
         return (
             status,
-            {"Content-Type": "application/x-amz-json-1.0"},
+            {"Content-Type": "application/x-amz-json-1.0", "x-amzn-errortype": code},
             json.dumps({"__type": code, "message": message}).encode(),
         )
     body = (

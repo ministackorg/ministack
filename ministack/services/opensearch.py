@@ -129,12 +129,15 @@ def restore_state(data):
 # Wire helpers
 # ---------------------------------------------------------------------------
 
-def _json(status, body):
-    return status, {"Content-Type": "application/json"}, json.dumps(body).encode()
+def _json(status, body, extra_headers=None):
+    headers = {"Content-Type": "application/json"}
+    if extra_headers:
+        headers.update(extra_headers)
+    return status, headers, json.dumps(body).encode()
 
 
 def _error(status, code, message):
-    return _json(status, {"__type": code, "Message": message})
+    return _json(status, {"__type": code, "Message": message}, {"x-amzn-errortype": code})
 
 
 def _arn(name):

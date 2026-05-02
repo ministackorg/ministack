@@ -79,3 +79,9 @@ def test_waf_v1_does_not_collide_with_wafv2():
     # An empty wafv2 list still works alongside the v1 stub
     assert isinstance(v1.list_web_acls(Limit=5)["WebACLs"], list)
     assert isinstance(v2.list_web_acls(Scope="REGIONAL", Limit=5)["WebACLs"], list)
+
+
+def test_waf_v1_module_exposes_no_op_reset():
+    from ministack.services import waf_v1
+    assert callable(getattr(waf_v1, "reset", None))
+    waf_v1.reset()

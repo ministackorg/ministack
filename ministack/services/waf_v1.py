@@ -108,3 +108,7 @@ async def handle_request(method, path, headers, body, query_params):
     return error_response_json("WAFInvalidOperationException",
                                f"Operation '{op}' is not implemented in this stub.",
                                400)
+
+
+def reset():
+    pass

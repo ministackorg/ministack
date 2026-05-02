@@ -86,7 +86,7 @@ def _json_resp(status, body):
 
 
 def _error(status, code, message):
-    return _json_resp(status, {"__type": code, "Message": message})
+    return status, {"Content-Type": "application/json", "x-amzn-errortype": code}, json.dumps({"__type": code, "Message": message}).encode()
 
 
 def _ensure_default_group():

@@ -1325,7 +1325,8 @@ def _transact_cancel_response(total, failed_idx, reason):
         "message": f"Transaction cancelled, please refer cancellation reasons for specific reasons [{', '.join(r['Code'] for r in reasons)}]",
         "CancellationReasons": reasons,
     }
-    return json_response(data, 400)
+    body = json.dumps(data, ensure_ascii=False).encode("utf-8")
+    return 400, {"Content-Type": "application/x-amz-json-1.0", "x-amzn-errortype": "TransactionCanceledException"}, body
 
 
 # ---------------------------------------------------------------------------

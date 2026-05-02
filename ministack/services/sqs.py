@@ -913,6 +913,7 @@ def _json_err_resp(code: str, msg: str, status: int = 400) -> tuple:
     headers = {
         "Content-Type": "application/x-amz-json-1.0",
         "x-amzn-query-error": f"{legacy};{fault}",
+        "x-amzn-errortype": code,
     }
     return (status, headers, json.dumps({"__type": code, "message": msg}).encode("utf-8"))
 

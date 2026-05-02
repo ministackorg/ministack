@@ -277,6 +277,8 @@ def test_apigw_api_not_found(apigw):
     with pytest.raises(ClientError) as exc:
         apigw.get_api(ApiId="00000000")
     assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 404
+    # Real AWS sends `x-amzn-errortype` on REST-JSON errors; Java/Go SDK v2 read it.
+    assert exc.value.response["ResponseMetadata"]["HTTPHeaders"].get("x-amzn-errortype")
 
 def test_apigw_route_on_deleted_api(apigw):
     from botocore.exceptions import ClientError

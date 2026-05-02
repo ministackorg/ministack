@@ -118,6 +118,8 @@ def test_kinesis_delete_stream_v2(kin):
     with pytest.raises(ClientError) as exc:
         kin.describe_stream(StreamName="kin-del-v2")
     assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+    # Real AWS sends `x-amzn-errortype` on JSON-protocol errors; Java/Go SDK v2 read it.
+    assert exc.value.response["ResponseMetadata"]["HTTPHeaders"].get("x-amzn-errortype") == "ResourceNotFoundException"
 
 def test_kinesis_stream_encryption(kin):
     import uuid as _uuid
