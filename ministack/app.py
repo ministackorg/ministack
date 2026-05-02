@@ -96,6 +96,7 @@ _NON_S3_VHOST_NAMES = frozenset({
     "secretsmanager", "logs", "ssm", "events", "kinesis", "monitoring", "ses",
     "states", "ecs", "rds", "rds-data", "elasticache", "glue", "athena",
     "apigateway", "cloudformation", "autoscaling", "codebuild", "transfer",
+    "appsync-api", "appsync-realtime-api",
 })
 
 from ministack.core.hypercorn_compat import install as _install_hypercorn_compat

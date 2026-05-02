@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 from ministack.core.responses import set_request_region
 
 
@@ -36,3 +38,23 @@ def test_dns_templates_override_when_both_set(monkeypatch):
     d = _default_dns_for_api("x")
     assert d["HTTP"] == "x.appsync-api.custom:8080"
     assert d["REALTIME"] == "x.appsync-realtime-api.custom:8080"
+
+
+def test_appsync_events_service_hosts_are_not_s3_virtual_hosts():
+    from ministack.app import _handle_s3_vhost_request
+
+    for host in (
+        "appsync-api.eu-west-2.localhost:4566",
+        "appsync-realtime-api.eu-west-2.localhost:4566",
+    ):
+        result = asyncio.run(
+            _handle_s3_vhost_request(
+                host,
+                "/v2/apis",
+                "GET",
+                {"host": host},
+                b"",
+                {},
+            )
+        )
+        assert result is None
