@@ -1306,13 +1306,72 @@ def test_scheduler_skips_disabled_rule(isolated_scheduler):
     mock_invoke.assert_not_called()
 
 
-def test_scheduler_skips_cron_expression(isolated_scheduler):
-    """cron() rules are not yet supported — must be skipped silently."""
+@_pytest.mark.parametrize("expr,valid", [
+    ("cron(0 12 * * ? *)",       True),   # noon every day
+    ("cron(0/5 * * * ? *)",      True),   # every 5 minutes
+    ("cron(0 0 ? * MON-FRI *)",  True),   # midnight Mon–Fri
+    ("cron(30 6 1 * ? *)",       True),   # 06:30 on 1st of each month
+    ("cron(0 0 1 1 ? 2030)",     True),   # specific year
+    ("rate(1 minute)",            False),  # not a cron expression
+    ("",                          False),
+    ("cron(0 12 * * *)",          False),  # 5 fields — missing Year
+    ("cron()",                    False),
+])
+def test_scheduler_parse_cron_fields_validity(expr, valid):
+    result = _eb._parse_cron_fields(expr)
+    assert (result is not None) == valid
+
+
+def test_scheduler_cron_next_fire_same_day():
+    """cron(0 12 * * ? *): next noon after 11:00 is 12:00 same day."""
+    from datetime import datetime as _dt, timezone as _tz
+    fields = _eb._parse_cron_fields("cron(0 12 * * ? *)")
+    after = _dt(2024, 1, 1, 11, 0, tzinfo=_tz.utc)
+    assert _eb._cron_next_fire(fields, after) == _dt(2024, 1, 1, 12, 0, tzinfo=_tz.utc)
+
+
+def test_scheduler_cron_next_fire_wraps_to_next_day():
+    """cron(0 12 * * ? *): after noon, next occurrence is noon tomorrow."""
+    from datetime import datetime as _dt, timezone as _tz
+    fields = _eb._parse_cron_fields("cron(0 12 * * ? *)")
+    after = _dt(2024, 1, 1, 12, 0, tzinfo=_tz.utc)
+    assert _eb._cron_next_fire(fields, after) == _dt(2024, 1, 2, 12, 0, tzinfo=_tz.utc)
+
+
+def test_scheduler_cron_next_fire_weekday():
+    """cron(0 0 ? * MON-FRI *): after Friday 23:00, next is Monday 00:00."""
+    from datetime import datetime as _dt, timezone as _tz
+    fields = _eb._parse_cron_fields("cron(0 0 ? * MON-FRI *)")
+    after = _dt(2024, 1, 5, 23, 0, tzinfo=_tz.utc)   # Friday
+    assert _eb._cron_next_fire(fields, after) == _dt(2024, 1, 8, 0, 0, tzinfo=_tz.utc)  # Monday
+
+
+def test_scheduler_cron_first_sight_initializes_countdown(isolated_scheduler):
+    """First tick of a cron() rule records the timestamp but must NOT dispatch."""
     _seed_rule(schedule="cron(0 12 * * ? *)")
     with _patch("ministack.services.eventbridge._invoke_target") as mock_invoke:
         _eb._tick_scheduled_rules()
-    # No countdown entry, no dispatch
-    assert _STATE_KEY not in _eb._rule_last_fired
+    assert _STATE_KEY in _eb._rule_last_fired
+    mock_invoke.assert_not_called()
+
+
+def test_scheduler_cron_fires_after_scheduled_time(isolated_scheduler):
+    """cron() rule dispatches when the next scheduled occurrence has passed."""
+    _seed_rule(schedule="cron(0 * * * ? *)")  # every hour on the hour
+    # last_fired 2 hours ago → next occurrence is ~1 hour ago → should fire now
+    _eb._rule_last_fired[_STATE_KEY] = _eb._now_ts() - 7200
+    with _patch("ministack.services.eventbridge._invoke_target") as mock_invoke:
+        _eb._tick_scheduled_rules()
+    mock_invoke.assert_called_once()
+
+
+def test_scheduler_cron_skips_before_scheduled_time(isolated_scheduler):
+    """cron() rule does NOT dispatch before the next scheduled occurrence arrives."""
+    _seed_rule(schedule="cron(0 * * * ? *)")  # every hour on the hour
+    # last_fired 10 s ago → next occurrence is ~59m50s from now → must not fire
+    _eb._rule_last_fired[_STATE_KEY] = _eb._now_ts() - 10
+    with _patch("ministack.services.eventbridge._invoke_target") as mock_invoke:
+        _eb._tick_scheduled_rules()
     mock_invoke.assert_not_called()
 
 

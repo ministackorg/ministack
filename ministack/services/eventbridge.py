@@ -29,7 +29,7 @@ import os
 import re
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from ministack.core.responses import (
     AccountScopedDict,
@@ -1727,47 +1727,168 @@ def _parse_rate_seconds(expr: str) -> int | None:
     return n * 86400
 
 
-_cron_skip_warned: set = set()
+_MONTH_NAMES = {
+    "JAN": 1, "FEB": 2, "MAR": 3, "APR": 4,  "MAY": 5,  "JUN": 6,
+    "JUL": 7, "AUG": 8, "SEP": 9, "OCT": 10, "NOV": 11, "DEC": 12,
+}
+# AWS DoW: 1=SUN, 2=MON, 3=TUE, 4=WED, 5=THU, 6=FRI, 7=SAT
+_DOW_NAMES = {"SUN": 1, "MON": 2, "TUE": 3, "WED": 4, "THU": 5, "FRI": 6, "SAT": 7}
+
+
+def _cron_field(field: str, lo: int, hi: int, names: dict | None = None) -> frozenset:
+    """Expand a single AWS cron field token into a frozenset of matching integers."""
+    if field in ("*", "?"):
+        return frozenset(range(lo, hi + 1))
+
+    def resolve(tok: str) -> int:
+        upper = tok.upper()
+        if names and upper in names:
+            return names[upper]
+        return int(upper)
+
+    result: set = set()
+    for part in field.upper().split(","):
+        if "/" in part:
+            base, step_s = part.rsplit("/", 1)
+            step = int(step_s)
+            if base in ("*", "?"):
+                start, end = lo, hi
+            elif "-" in base:
+                a, b = base.split("-", 1)
+                start, end = resolve(a), resolve(b)
+            else:
+                start, end = resolve(base), hi
+            result.update(range(start, end + 1, step))
+        elif "-" in part:
+            a, b = part.split("-", 1)
+            result.update(range(resolve(a), resolve(b) + 1))
+        else:
+            result.add(resolve(part))
+    return frozenset(result)
+
+
+def _parse_cron_fields(expr: str):
+    """Parse AWS cron(Min Hr DoM Mon DoW Year) into expanded field sets, or return None.
+
+    Returns an 8-tuple:
+      (min_set, hr_set, dom_set, mon_set, dow_set, yr_set_or_none, dom_raw, dow_raw)
+    dom_raw / dow_raw preserve the original token so '?' semantics can be applied.
+    """
+    m = re.match(r"^cron\((.+)\)$", expr.strip())
+    if not m:
+        return None
+    parts = m.group(1).split()
+    if len(parts) != 6:
+        return None
+    min_f, hr_f, dom_f, mon_f, dow_f, yr_f = parts
+    try:
+        return (
+            _cron_field(min_f, 0, 59),
+            _cron_field(hr_f, 0, 23),
+            _cron_field(dom_f, 1, 31),
+            _cron_field(mon_f, 1, 12, _MONTH_NAMES),
+            _cron_field(dow_f, 1, 7, _DOW_NAMES),
+            _cron_field(yr_f, 1970, 2199) if yr_f not in ("*", "?") else None,
+            dom_f,   # raw token — preserved for '?' mutual-exclusion logic
+            dow_f,
+        )
+    except (ValueError, KeyError):
+        return None
+
+
+def _cron_next_fire(fields, after_dt: datetime) -> datetime | None:
+    """Return the first datetime >= (after_dt + 1 min) that satisfies the cron fields.
+
+    Uses forward-walking with jumps so sparse schedules (monthly, yearly) don't
+    iterate every minute.  Returns None if no match is found within 4 years.
+    """
+    min_s, hr_s, dom_s, mon_s, dow_s, yr_s, dom_raw, dow_raw = fields
+    dt = after_dt.replace(second=0, microsecond=0) + timedelta(minutes=1)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    limit = dt + timedelta(days=4 * 366)
+    while dt <= limit:
+        if yr_s is not None and dt.year not in yr_s:
+            later = sorted(y for y in yr_s if y > dt.year)
+            if not later:
+                return None
+            dt = dt.replace(year=later[0], month=1, day=1, hour=0, minute=0)
+            continue
+        if dt.month not in mon_s:
+            later = sorted(v for v in mon_s if v > dt.month)
+            if later:
+                dt = dt.replace(month=later[0], day=1, hour=0, minute=0)
+            else:
+                dt = dt.replace(year=dt.year + 1, month=min(mon_s), day=1, hour=0, minute=0)
+            continue
+        # DoM / DoW: '?' means "don't use this field" (AWS mutual-exclusion rule).
+        # Convert Python isoweekday (1=MON…7=SUN) → AWS dow (1=SUN…7=SAT):
+        #   aws_dow = (isoweekday % 7) + 1
+        aws_dow = (dt.isoweekday() % 7) + 1
+        if dom_raw == "?":
+            day_ok = aws_dow in dow_s
+        elif dow_raw == "?":
+            day_ok = dt.day in dom_s
+        else:
+            day_ok = (dt.day in dom_s) or (aws_dow in dow_s)
+        if not day_ok:
+            dt = dt.replace(hour=0, minute=0) + timedelta(days=1)
+            continue
+        if dt.hour not in hr_s:
+            later = sorted(v for v in hr_s if v > dt.hour)
+            if later:
+                dt = dt.replace(hour=later[0], minute=0)
+            else:
+                dt = dt.replace(hour=0, minute=0) + timedelta(days=1)
+            continue
+        if dt.minute not in min_s:
+            later = sorted(v for v in min_s if v > dt.minute)
+            if later:
+                dt = dt.replace(minute=later[0])
+            else:
+                dt = dt.replace(minute=0) + timedelta(hours=1)
+            continue
+        return dt
+    return None
 
 
 def _tick_scheduled_rules():
     """Fire any enabled scheduled rule whose interval has elapsed."""
     now = _now_ts()
+    now_dt = datetime.fromtimestamp(now, tz=timezone.utc)
     # Iterate _rules._data directly so we see every account, not just the
     # ContextVar default.  Keys are (account_id, rule_key) tuples.
     for (account_id, rule_key), rule in list(_rules._data.items()):
         if rule.get("State") != "ENABLED":
             continue
-        expr = rule.get("ScheduleExpression", "")
-        interval = _parse_rate_seconds(expr)
-        if interval is None:
-            # cron() and unsupported expressions are stored but not fired.
-            # Surface it once per (account, rule) so users can debug a rule
-            # they expected to see invoke. Real AWS fires cron() schedules;
-            # this is a tracked parity gap.
-            if expr.startswith("cron(") and (account_id, rule_key) not in _cron_skip_warned:
-                logger.info(
-                    "EventBridge: cron() schedule on rule '%s' (account %s) is "
-                    "stored but not auto-fired — ministack only auto-fires rate() "
-                    "rules at present.",
-                    rule.get("Name", rule_key), account_id,
-                )
-                _cron_skip_warned.add((account_id, rule_key))
-            continue
+        schedule = rule.get("ScheduleExpression", "")
         state_key = (account_id, rule_key)
-        if state_key not in _rule_last_fired:
-            # AWS doc: "the countdown begins when you create the rule" — anchor
-            # to the rule's CreationTime so the first fire lands one full
-            # interval after PutRule, not one full interval after the first
-            # scheduler tick (which can lag up to _SCHEDULER_TICK_INTERVAL).
-            _rule_last_fired[state_key] = rule.get("CreationTime", now)
-            # Fall through so a rule whose CreationTime is already > interval
-            # ago (e.g. restored from persistence) fires on this same tick
-            # rather than waiting another full interval.
+
+        interval = _parse_rate_seconds(schedule)
+        if interval is not None:
+            # rate() — fire every `interval` seconds.
+            if state_key not in _rule_last_fired:
+                # AWS doc: "the countdown begins when you create the rule" — anchor
+                # to CreationTime so a rule restored from persistence fires on the
+                # first tick if its interval has already elapsed.
+                _rule_last_fired[state_key] = rule.get("CreationTime", now)
+                if now - _rule_last_fired[state_key] < interval:
+                    continue
             if now - _rule_last_fired[state_key] < interval:
                 continue
-        if now - _rule_last_fired[state_key] < interval:
-            continue
+        else:
+            fields = _parse_cron_fields(schedule)
+            if fields is None:
+                continue  # unknown / unsupported expression type
+            # cron() — fire once per scheduled occurrence.
+            if state_key not in _rule_last_fired:
+                _rule_last_fired[state_key] = now
+                continue
+            last_dt = datetime.fromtimestamp(_rule_last_fired[state_key], tz=timezone.utc)
+            next_fire = _cron_next_fire(fields, last_dt)
+            if next_fire is None or now_dt < next_fire:
+                continue
+
         _rule_last_fired[state_key] = now
         targets = _targets._data.get((account_id, rule_key), [])
         if not targets:
@@ -1825,6 +1946,5 @@ def reset():
     _partner_event_sources.clear()
     _event_buses.clear()
     _rule_last_fired.clear()
-    _cron_skip_warned.clear()
     # The "default" bus is lazily recreated per-account on next access via
     # _ensure_default_bus(), so nothing to re-seed here.
