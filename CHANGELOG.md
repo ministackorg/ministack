@@ -7,6 +7,10 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [Unreleased]
+
+### Added
+- **AppSync Events API emulator** — Event APIs are now available under the AppSync service: `CreateApi`/`GetApi`/`ListApis`/`UpdateApi`/`DeleteApi`, channel namespace CRUD, API-key management through the AWS SDK's `/v1/apis/{apiId}/apikeys` path, HTTP `POST /event` publishing on `*.appsync-api.*`, and realtime `*.appsync-realtime-api.*` WebSocket subscribe/publish flows. Channel validation follows the AppSync Events grammar, publish fan-out returns AWS-shaped identifiers, and API-key / Lambda-authorizer checks are enforced consistently across HTTP and WebSocket publish paths.
 ## [1.3.24] — 2026-05-02
 
 ### Fixed

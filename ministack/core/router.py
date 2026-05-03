@@ -236,6 +236,13 @@ SERVICE_PATTERNS = {
         "path_prefixes": ["/v1/apis", "/v1/tags"],
         "credential_scope": "appsync",
     },
+    # AppSync Events data plane: HTTP publish lives on
+    # {apiId}.appsync-api.{region}.{host}; realtime WebSocket lives on
+    # {apiId}.appsync-realtime-api.{region}.{host}. Management shares the
+    # "appsync" credential scope and is delegated from services/appsync.py.
+    "appsync-events": {
+        "host_patterns": [r"appsync-api\.", r"appsync-realtime-api\."],
+    },
     "servicediscovery": {
         "target_prefixes": ["Route53AutoNaming_v20170314"],
         "host_patterns": [r"servicediscovery\."],
@@ -299,6 +306,13 @@ def detect_service(method: str, path: str, headers: dict, query_params: dict) ->
             for prefix in patterns.get("target_prefixes", []):
                 if target.startswith(prefix):
                     return svc
+
+    # AppSync Events HTTP publish: POST /event on
+    # {apiId}.appsync-api.{region}.{host}. AWS SDKs sign these requests with
+    # the legacy "appsync" credential scope, so the data-plane host/path must
+    # win before credential-scope routing.
+    if method == "POST" and path == "/event" and re.search(r"\.appsync-api\.", host):
+        return "appsync-events"
 
     # 2. Check Authorization header for service name in credential scope
     if auth:
@@ -576,6 +590,10 @@ def detect_service(method: str, path: str, headers: dict, query_params: dict) ->
         return "cloudfront"
     if path_lower.startswith("/2013-04-01/"):
         return "route53"
+    if (path_lower.startswith("/v2/apis") or path_lower.startswith("/v2/tags")) and (
+        re.search(r"appsync-api\.", host) or re.search(r"appsync-realtime-api\.", host)
+    ):
+        return "appsync-events"
     if path_lower.startswith("/v2/apis"):
         return "apigateway"
     if (path_lower.startswith("/restapis") or path_lower.startswith("/apikeys")
