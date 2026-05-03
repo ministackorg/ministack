@@ -36,6 +36,7 @@ _CF_DIST_CONFIG = {
     "Enabled": True,
 }
 
+
 def test_cloudfront_create_distribution(cloudfront):
     resp = cloudfront.create_distribution(DistributionConfig=_CF_DIST_CONFIG)
     dist = resp["Distribution"]
@@ -68,6 +69,7 @@ def test_cloudfront_create_distribution_with_tags(cloudfront):
     upd = cloudfront.update_distribution(DistributionConfig=disabled_cfg, Id=dist_id, IfMatch=etag)
     cloudfront.delete_distribution(Id=dist_id, IfMatch=upd["ETag"])
 
+
 def test_cloudfront_list_distributions(cloudfront):
     cfg_a = {**_CF_DIST_CONFIG, "CallerReference": "cf-list-a", "Comment": "list-a"}
     cfg_b = {**_CF_DIST_CONFIG, "CallerReference": "cf-list-b", "Comment": "list-b"}
@@ -77,6 +79,7 @@ def test_cloudfront_list_distributions(cloudfront):
     dist_list = resp["DistributionList"]
     ids = [d["Id"] for d in dist_list.get("Items", [])]
     assert len(ids) >= 2
+
 
 def test_cloudfront_get_distribution(cloudfront):
     cfg = {**_CF_DIST_CONFIG, "CallerReference": "cf-get-1", "Comment": "get-test"}
@@ -91,6 +94,7 @@ def test_cloudfront_get_distribution(cloudfront):
     # terraform-provider-aws v6+ dereferences OriginGroups without a nil check
     assert dist["DistributionConfig"]["OriginGroups"]["Quantity"] == 0
 
+
 def test_cloudfront_get_distribution_config(cloudfront):
     cfg = {**_CF_DIST_CONFIG, "CallerReference": "cf-getcfg-1", "Comment": "getcfg-test"}
     create_resp = cloudfront.create_distribution(DistributionConfig=cfg)
@@ -101,6 +105,7 @@ def test_cloudfront_get_distribution_config(cloudfront):
     assert resp["ETag"] == etag
     assert resp["DistributionConfig"]["Comment"] == "getcfg-test"
     assert resp["DistributionConfig"]["OriginGroups"]["Quantity"] == 0
+
 
 def test_cloudfront_update_distribution(cloudfront):
     cfg = {**_CF_DIST_CONFIG, "CallerReference": "cf-upd-1", "Comment": "before-update"}
@@ -116,16 +121,16 @@ def test_cloudfront_update_distribution(cloudfront):
     get_resp = cloudfront.get_distribution_config(Id=dist_id)
     assert get_resp["DistributionConfig"]["Comment"] == "after-update"
 
+
 def test_cloudfront_update_distribution_etag_mismatch(cloudfront):
     cfg = {**_CF_DIST_CONFIG, "CallerReference": "cf-etag-mismatch", "Comment": "mismatch-test"}
     create_resp = cloudfront.create_distribution(DistributionConfig=cfg)
     dist_id = create_resp["Distribution"]["Id"]
 
     with pytest.raises(ClientError) as exc:
-        cloudfront.update_distribution(
-            DistributionConfig=cfg, Id=dist_id, IfMatch="wrong-etag-value"
-        )
+        cloudfront.update_distribution(DistributionConfig=cfg, Id=dist_id, IfMatch="wrong-etag-value")
     assert exc.value.response["Error"]["Code"] == "PreconditionFailed"
+
 
 def test_cloudfront_delete_distribution(cloudfront):
     cfg = {**_CF_DIST_CONFIG, "CallerReference": "cf-del-1", "Comment": "delete-test", "Enabled": True}
@@ -144,6 +149,7 @@ def test_cloudfront_delete_distribution(cloudfront):
         cloudfront.get_distribution(Id=dist_id)
     assert exc.value.response["Error"]["Code"] == "NoSuchDistribution"
 
+
 def test_cloudfront_delete_enabled_distribution(cloudfront):
     cfg = {**_CF_DIST_CONFIG, "CallerReference": "cf-del-enabled", "Comment": "del-enabled-test", "Enabled": True}
     create_resp = cloudfront.create_distribution(DistributionConfig=cfg)
@@ -154,10 +160,12 @@ def test_cloudfront_delete_enabled_distribution(cloudfront):
         cloudfront.delete_distribution(Id=dist_id, IfMatch=etag)
     assert exc.value.response["Error"]["Code"] == "DistributionNotDisabled"
 
+
 def test_cloudfront_get_nonexistent(cloudfront):
     with pytest.raises(ClientError) as exc:
         cloudfront.get_distribution(Id="ENONEXISTENT1234")
     assert exc.value.response["Error"]["Code"] == "NoSuchDistribution"
+
 
 def test_cloudfront_create_invalidation(cloudfront):
     cfg = {**_CF_DIST_CONFIG, "CallerReference": "cf-inv-1", "Comment": "inv-test"}
@@ -175,6 +183,7 @@ def test_cloudfront_create_invalidation(cloudfront):
     assert inv["Id"]
     assert inv["Status"] == "Completed"
     assert inv_resp["ResponseMetadata"]["HTTPStatusCode"] == 201
+
 
 def test_cloudfront_list_invalidations(cloudfront):
     cfg = {**_CF_DIST_CONFIG, "CallerReference": "cf-listinv-1", "Comment": "listinv-test"}
@@ -194,6 +203,7 @@ def test_cloudfront_list_invalidations(cloudfront):
     inv_list = resp["InvalidationList"]
     assert inv_list["Quantity"] == 2
     assert len(inv_list["Items"]) == 2
+
 
 def test_cloudfront_get_invalidation(cloudfront):
     cfg = {**_CF_DIST_CONFIG, "CallerReference": "cf-getinv-1", "Comment": "getinv-test"}
@@ -215,29 +225,36 @@ def test_cloudfront_get_invalidation(cloudfront):
     assert inv["Status"] == "Completed"
     assert "/getinv-path" in inv["InvalidationBatch"]["Paths"]["Items"]
 
+
 def test_cloudfront_tags(cloudfront):
     """TagResource / ListTagsForResource / UntagResource for CloudFront distributions."""
     resp = cloudfront.create_distribution(
         DistributionConfig={
             "CallerReference": "tag-test-v42",
-            "Origins": {"Items": [{"Id": "o1", "DomainName": "example.com",
-                                   "S3OriginConfig": {"OriginAccessIdentity": ""}}], "Quantity": 1},
+            "Origins": {
+                "Items": [{"Id": "o1", "DomainName": "example.com", "S3OriginConfig": {"OriginAccessIdentity": ""}}],
+                "Quantity": 1,
+            },
             "DefaultCacheBehavior": {
-                "TargetOriginId": "o1", "ViewerProtocolPolicy": "allow-all",
+                "TargetOriginId": "o1",
+                "ViewerProtocolPolicy": "allow-all",
                 "ForwardedValues": {"QueryString": False, "Cookies": {"Forward": "none"}},
                 "MinTTL": 0,
             },
-            "Comment": "tag test", "Enabled": True,
+            "Comment": "tag test",
+            "Enabled": True,
         }
     )
     dist_arn = resp["Distribution"]["ARN"]
 
     cloudfront.tag_resource(
         Resource=dist_arn,
-        Tags={"Items": [
-            {"Key": "env", "Value": "test"},
-            {"Key": "team", "Value": "platform"},
-        ]},
+        Tags={
+            "Items": [
+                {"Key": "env", "Value": "test"},
+                {"Key": "team", "Value": "platform"},
+            ]
+        },
     )
 
     tags = cloudfront.list_tags_for_resource(Resource=dist_arn)
@@ -259,6 +276,7 @@ def test_cloudfront_tags(cloudfront):
 # ---------------------------------------------------------------------------
 # OAC happy-path integration tests
 # ---------------------------------------------------------------------------
+
 
 def _oac_config(name, description="", origin_type="s3", signing_behavior="always", signing_protocol="sigv4"):
     """Helper to build an OAC config dict for boto3."""
@@ -660,3 +678,154 @@ def test_cloudfront_sdk_compat_injects_origin_groups():
     og = cf._find(el, "OriginGroups")
     assert og is not None
     assert cf._text(og, "Quantity") == "0"
+
+
+# ---------------------------------------------------------------------------
+# KeyValueStore tests
+# ---------------------------------------------------------------------------
+
+
+def test_kvs_create_and_describe(cloudfront):
+    resp = cloudfront.create_key_value_store(Name="test-kvs-1", Comment="test comment")
+    kvs = resp["KeyValueStore"]
+    assert kvs["Name"] == "test-kvs-1"
+    assert kvs["Comment"] == "test comment"
+    assert kvs["Status"] == "READY"
+    assert "Id" in kvs
+    assert kvs["ARN"].endswith(":key-value-store/test-kvs-1")
+    assert "LastModifiedTime" in kvs
+    etag = resp["ETag"]
+    assert etag
+
+    desc = cloudfront.describe_key_value_store(Name="test-kvs-1")
+    assert desc["KeyValueStore"]["Name"] == "test-kvs-1"
+    assert desc["KeyValueStore"]["Id"] == kvs["Id"]
+    assert desc["ETag"] == etag
+
+
+def test_kvs_list(cloudfront):
+    name_a = f"kvs-list-a-{_uuid_mod.uuid4().hex[:8]}"
+    name_b = f"kvs-list-b-{_uuid_mod.uuid4().hex[:8]}"
+    cloudfront.create_key_value_store(Name=name_a, Comment="a")
+    cloudfront.create_key_value_store(Name=name_b, Comment="b")
+
+    resp = cloudfront.list_key_value_stores()
+    names = [item["Name"] for item in resp["KeyValueStoreList"]["Items"]]
+    assert name_a in names
+    assert name_b in names
+    assert resp["KeyValueStoreList"]["Quantity"] >= 2
+
+
+def test_kvs_update_comment(cloudfront):
+    name = f"kvs-update-{_uuid_mod.uuid4().hex[:8]}"
+    create_resp = cloudfront.create_key_value_store(Name=name, Comment="old")
+    etag = create_resp["ETag"]
+
+    update_resp = cloudfront.update_key_value_store(Name=name, Comment="new comment", IfMatch=etag)
+    assert update_resp["KeyValueStore"]["Comment"] == "new comment"
+    new_etag = update_resp["ETag"]
+    assert new_etag != etag
+
+    desc = cloudfront.describe_key_value_store(Name=name)
+    assert desc["KeyValueStore"]["Comment"] == "new comment"
+    assert desc["ETag"] == new_etag
+
+
+def test_kvs_delete(cloudfront):
+    name = f"kvs-delete-{_uuid_mod.uuid4().hex[:8]}"
+    create_resp = cloudfront.create_key_value_store(Name=name, Comment="to delete")
+    etag = create_resp["ETag"]
+
+    cloudfront.delete_key_value_store(Name=name, IfMatch=etag)
+
+    with pytest.raises(ClientError) as exc:
+        cloudfront.describe_key_value_store(Name=name)
+    assert exc.value.response["Error"]["Code"] == "EntityNotFound"
+
+
+def test_kvs_duplicate_name(cloudfront):
+    name = f"kvs-dup-{_uuid_mod.uuid4().hex[:8]}"
+    cloudfront.create_key_value_store(Name=name, Comment="first")
+
+    with pytest.raises(ClientError) as exc:
+        cloudfront.create_key_value_store(Name=name, Comment="second")
+    assert exc.value.response["Error"]["Code"] == "EntityAlreadyExists"
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 409
+
+
+def test_kvs_describe_nonexistent(cloudfront):
+    with pytest.raises(ClientError) as exc:
+        cloudfront.describe_key_value_store(Name="nonexistent-kvs")
+    assert exc.value.response["Error"]["Code"] == "EntityNotFound"
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 404
+
+
+def test_kvs_delete_etag_mismatch(cloudfront):
+    name = f"kvs-del-etag-{_uuid_mod.uuid4().hex[:8]}"
+    cloudfront.create_key_value_store(Name=name, Comment="test")
+
+    with pytest.raises(ClientError) as exc:
+        cloudfront.delete_key_value_store(Name=name, IfMatch="wrong-etag")
+    assert exc.value.response["Error"]["Code"] == "PreconditionFailed"
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 412
+
+
+def test_kvs_update_etag_mismatch(cloudfront):
+    name = f"kvs-upd-etag-{_uuid_mod.uuid4().hex[:8]}"
+    cloudfront.create_key_value_store(Name=name, Comment="test")
+
+    with pytest.raises(ClientError) as exc:
+        cloudfront.update_key_value_store(Name=name, Comment="new", IfMatch="wrong-etag")
+    assert exc.value.response["Error"]["Code"] == "PreconditionFailed"
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 412
+
+
+def test_kvs_function_association(cloudfront):
+    kvs_name = f"kvs-assoc-{_uuid_mod.uuid4().hex[:8]}"
+    kvs_resp = cloudfront.create_key_value_store(Name=kvs_name, Comment="for function")
+    kvs_arn = kvs_resp["KeyValueStore"]["ARN"]
+
+    func_name = f"fn-kvs-{_uuid_mod.uuid4().hex[:8]}"
+    cloudfront.create_function(
+        Name=func_name,
+        FunctionConfig={
+            "Comment": "with kvs",
+            "Runtime": "cloudfront-js-2.0",
+            "KeyValueStoreAssociations": {
+                "Quantity": 1,
+                "Items": [{"KeyValueStoreARN": kvs_arn}],
+            },
+        },
+        FunctionCode=b"function handler(event) { return event.response; }",
+    )
+
+    desc = cloudfront.describe_function(Name=func_name, Stage="DEVELOPMENT")
+    kvs_assocs = desc["FunctionSummary"]["FunctionConfig"]["KeyValueStoreAssociations"]
+    assert kvs_assocs["Quantity"] == 1
+    assert kvs_assocs["Items"][0]["KeyValueStoreARN"] == kvs_arn
+
+
+def test_kvs_delete_in_use(cloudfront):
+    kvs_name = f"kvs-inuse-{_uuid_mod.uuid4().hex[:8]}"
+    kvs_resp = cloudfront.create_key_value_store(Name=kvs_name, Comment="in use")
+    kvs_arn = kvs_resp["KeyValueStore"]["ARN"]
+    kvs_etag = kvs_resp["ETag"]
+
+    func_name = f"fn-inuse-{_uuid_mod.uuid4().hex[:8]}"
+    cloudfront.create_function(
+        Name=func_name,
+        FunctionConfig={
+            "Comment": "uses kvs",
+            "Runtime": "cloudfront-js-2.0",
+            "KeyValueStoreAssociations": {
+                "Quantity": 1,
+                "Items": [{"KeyValueStoreARN": kvs_arn}],
+            },
+        },
+        FunctionCode=b"function handler(event) { return event.response; }",
+    )
+
+    with pytest.raises(ClientError) as exc:
+        cloudfront.delete_key_value_store(Name=kvs_name, IfMatch=kvs_etag)
+    assert exc.value.response["Error"]["Code"] == "CannotDeleteEntityWhileInUse"
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 409

@@ -13,6 +13,8 @@ Supports:
                  UpdateOriginAccessControl, DeleteOriginAccessControl
   Functions (stub): CreateFunction, DeleteFunction, DescribeFunction, GetFunction,
                  ListFunctions, PublishFunction, UpdateFunction
+  KeyValueStore: CreateKeyValueStore, DescribeKeyValueStore, ListKeyValueStores,
+                 UpdateKeyValueStore, DeleteKeyValueStore
   Tags: TagResource, UntagResource, ListTagsForResource
 """
 
@@ -38,31 +40,35 @@ NS = "http://cloudfront.amazonaws.com/doc/2020-05-31/"
 # ---------------------------------------------------------------------------
 # Path regexes — note: _DIST_CFG_RE must be matched before _DIST_ID_RE
 # ---------------------------------------------------------------------------
-_DIST_RE     = re.compile(r"^/2020-05-31/distribution/?$")
+_DIST_RE = re.compile(r"^/2020-05-31/distribution/?$")
 _DIST_CFG_RE = re.compile(r"^/2020-05-31/distribution/([^/]+)/config$")
-_DIST_ID_RE  = re.compile(r"^/2020-05-31/distribution/([^/]+)/?$")
-_INV_RE      = re.compile(r"^/2020-05-31/distribution/([^/]+)/invalidation/?$")
-_INV_ID_RE   = re.compile(r"^/2020-05-31/distribution/([^/]+)/invalidation/([^/]+)$")
-_TAG_RE      = re.compile(r"^/2020-05-31/tagging/?$")
+_DIST_ID_RE = re.compile(r"^/2020-05-31/distribution/([^/]+)/?$")
+_INV_RE = re.compile(r"^/2020-05-31/distribution/([^/]+)/invalidation/?$")
+_INV_ID_RE = re.compile(r"^/2020-05-31/distribution/([^/]+)/invalidation/([^/]+)$")
+_TAG_RE = re.compile(r"^/2020-05-31/tagging/?$")
 
 # OAC path regexes — note: _OAC_CFG_RE must be matched before _OAC_ID_RE
-_OAC_RE      = re.compile(r"^/2020-05-31/origin-access-control/?$")
-_OAC_CFG_RE  = re.compile(r"^/2020-05-31/origin-access-control/([^/]+)/config$")
-_OAC_ID_RE   = re.compile(r"^/2020-05-31/origin-access-control/([^/]+)/?$")
+_OAC_RE = re.compile(r"^/2020-05-31/origin-access-control/?$")
+_OAC_CFG_RE = re.compile(r"^/2020-05-31/origin-access-control/([^/]+)/config$")
+_OAC_ID_RE = re.compile(r"^/2020-05-31/origin-access-control/([^/]+)/?$")
 
-_FUN_LIST_RE     = re.compile(r"^/2020-05-31/function/?$")
+_FUN_LIST_RE = re.compile(r"^/2020-05-31/function/?$")
 _FUN_DESCRIBE_RE = re.compile(r"^/2020-05-31/function/([^/]+)/describe/?$")
-_FUN_PUBLISH_RE  = re.compile(r"^/2020-05-31/function/([^/]+)/publish/?$")
-_FUN_NAME_RE     = re.compile(r"^/2020-05-31/function/([^/]+)/?$")
+_FUN_PUBLISH_RE = re.compile(r"^/2020-05-31/function/([^/]+)/publish/?$")
+_FUN_NAME_RE = re.compile(r"^/2020-05-31/function/([^/]+)/?$")
+
+_KVS_LIST_RE = re.compile(r"^/2020-05-31/key-value-store/?$")
+_KVS_NAME_RE = re.compile(r"^/2020-05-31/key-value-store/([^/]+)/?$")
 
 # ---------------------------------------------------------------------------
 # In-memory state
 # ---------------------------------------------------------------------------
-_distributions = AccountScopedDict()   # Id -> distribution record
-_invalidations = AccountScopedDict()   # distribution_id -> [invalidation record, ...]
-_tags = AccountScopedDict()            # arn -> [{"Key": ..., "Value": ...}]
-_oacs = AccountScopedDict()            # Id -> OAC record
-_functions = AccountScopedDict()     # Name -> function record (CloudFront Functions API)
+_distributions = AccountScopedDict()  # Id -> distribution record
+_invalidations = AccountScopedDict()  # distribution_id -> [invalidation record, ...]
+_tags = AccountScopedDict()  # arn -> [{"Key": ..., "Value": ...}]
+_oacs = AccountScopedDict()  # Id -> OAC record
+_functions = AccountScopedDict()  # Name -> function record (CloudFront Functions API)
+_kvstores = AccountScopedDict()  # Name -> KVS record
 
 
 def reset():
@@ -71,16 +77,20 @@ def reset():
     _tags.clear()
     _oacs.clear()
     _functions.clear()
+    _kvstores.clear()
 
 
 def get_state():
-    return copy.deepcopy({
-        "distributions": _distributions,
-        "invalidations": _invalidations,
-        "tags": _tags,
-        "oacs": _oacs,
-        "functions": _functions,
-    })
+    return copy.deepcopy(
+        {
+            "distributions": _distributions,
+            "invalidations": _invalidations,
+            "tags": _tags,
+            "oacs": _oacs,
+            "functions": _functions,
+            "kvstores": _kvstores,
+        }
+    )
 
 
 def restore_state(data):
@@ -89,6 +99,7 @@ def restore_state(data):
     _tags.update(data.get("tags", {}))
     _oacs.update(data.get("oacs", {}))
     _functions.update(data.get("functions", {}))
+    _kvstores.update(data.get("kvstores", {}))
 
 
 try:
@@ -97,9 +108,8 @@ try:
         restore_state(_restored)
 except Exception:
     import logging
-    logging.getLogger(__name__).exception(
-        "Failed to restore persisted state; continuing with fresh store"
-    )
+
+    logging.getLogger(__name__).exception("Failed to restore persisted state; continuing with fresh store")
 
 
 # ---------------------------------------------------------------------------
@@ -123,6 +133,7 @@ def _now_iso() -> str:
 # ---------------------------------------------------------------------------
 # XML helpers
 # ---------------------------------------------------------------------------
+
 
 def _xml_response(root_tag: str, builder_fn, status: int = 200, extra_headers: dict = None) -> tuple:
     root = Element(root_tag, xmlns=NS)
@@ -319,13 +330,21 @@ def _func_arn(name: str) -> str:
     return f"arn:aws:cloudfront::{get_account_id()}:function/{name}"
 
 
+def _kvs_arn(name: str) -> str:
+    return f"arn:aws:cloudfront::{get_account_id()}:key-value-store/{name}"
+
+
 def _function_summary_builder(fn: dict, stage: str, status: str, last_modified: str):
     def build(root):
         fc = SubElement(root, "FunctionConfig")
         SubElement(fc, "Comment").text = fn.get("comment", "")
+        kvs_arns = fn.get("kvs_arns", [])
         kvs = SubElement(fc, "KeyValueStoreAssociations")
-        SubElement(kvs, "Quantity").text = "0"
-        SubElement(kvs, "Items")
+        SubElement(kvs, "Quantity").text = str(len(kvs_arns))
+        items_el = SubElement(kvs, "Items")
+        for arn in kvs_arns:
+            assoc = SubElement(items_el, "KeyValueStoreAssociation")
+            SubElement(assoc, "KeyValueStoreARN").text = arn
         SubElement(fc, "Runtime").text = fn["runtime"]
         md = SubElement(root, "FunctionMetadata")
         SubElement(md, "CreatedTime").text = fn["created"]
@@ -345,7 +364,17 @@ def _cf_parse_function_config(cfg_el):
     runtime = _text(cfg_el, "Runtime")
     if not runtime:
         return None, _error("InvalidArgument", "Runtime is required.", 400)
-    return {"comment": comment, "runtime": runtime}, None
+    kvs_arns = []
+    kvs_el = _find(cfg_el, "KeyValueStoreAssociations")
+    if kvs_el is not None:
+        items_el = _find(kvs_el, "Items")
+        if items_el is not None:
+            for child in items_el:
+                if _local_tag_name(child) == "KeyValueStoreAssociation":
+                    arn = _text(child, "KeyValueStoreARN")
+                    if arn:
+                        kvs_arns.append(arn)
+    return {"comment": comment, "runtime": runtime, "kvs_arns": kvs_arns}, None
 
 
 def _cf_decode_function_code(code_b64: str):
@@ -382,6 +411,7 @@ def _cf_create_function(headers, body):
         "arn": _func_arn(name),
         "comment": cfg["comment"],
         "runtime": cfg["runtime"],
+        "kvs_arns": cfg["kvs_arns"],
         "code": code,
         "created": now,
         "last_modified_dev": now,
@@ -410,9 +440,7 @@ def _cf_list_functions(query_params):
         if stage_filter in ("", "DEVELOPMENT"):
             summaries.append((fn, "DEVELOPMENT", "UNPUBLISHED", fn["last_modified_dev"]))
         if stage_filter in ("", "LIVE") and fn["live_etag"]:
-            summaries.append(
-                (fn, "LIVE", "DEPLOYED", fn["last_modified_live"] or fn["last_modified_dev"])
-            )
+            summaries.append((fn, "LIVE", "DEPLOYED", fn["last_modified_live"] or fn["last_modified_dev"]))
 
     def build(root):
         SubElement(root, "MaxItems").text = "100"
@@ -478,7 +506,11 @@ def _cf_publish_function(name: str, headers):
     if not if_match:
         return _error("InvalidIfMatchVersion", "The If-Match version is missing or not valid for the resource.", 400)
     if if_match != fn["dev_etag"]:
-        return _error("PreconditionFailed", "The precondition given in one or more of the request-header fields evaluated to false.", 412)
+        return _error(
+            "PreconditionFailed",
+            "The precondition given in one or more of the request-header fields evaluated to false.",
+            412,
+        )
 
     now = _now_iso()
     fn["live_etag"] = new_uuid()
@@ -501,7 +533,11 @@ def _cf_update_function(name: str, headers, body):
     if not if_match:
         return _error("InvalidIfMatchVersion", "The If-Match version is missing or not valid for the resource.", 400)
     if if_match != fn["dev_etag"]:
-        return _error("PreconditionFailed", "The precondition given in one or more of the request-header fields evaluated to false.", 412)
+        return _error(
+            "PreconditionFailed",
+            "The precondition given in one or more of the request-header fields evaluated to false.",
+            412,
+        )
 
     el = _parse_body(body)
     if el is None:
@@ -517,6 +553,7 @@ def _cf_update_function(name: str, headers, body):
     now = _now_iso()
     fn["comment"] = cfg["comment"]
     fn["runtime"] = cfg["runtime"]
+    fn["kvs_arns"] = cfg["kvs_arns"]
     fn["code"] = code
     fn["last_modified_dev"] = now
     fn["dev_etag"] = new_uuid()
@@ -539,7 +576,11 @@ def _cf_delete_function(name: str, headers):
     if not if_match:
         return _error("InvalidIfMatchVersion", "The If-Match version is missing or not valid for the resource.", 400)
     if if_match != fn["dev_etag"]:
-        return _error("PreconditionFailed", "The precondition given in one or more of the request-header fields evaluated to false.", 412)
+        return _error(
+            "PreconditionFailed",
+            "The precondition given in one or more of the request-header fields evaluated to false.",
+            412,
+        )
 
     del _functions[name]
     logger.info("DeleteFunction name=%s", name)
@@ -549,6 +590,7 @@ def _cf_delete_function(name: str, headers):
 # ---------------------------------------------------------------------------
 # Request dispatcher
 # ---------------------------------------------------------------------------
+
 
 async def handle_request(method, path, headers, body, query_params):
     logger.debug("%s %s", method, path)
@@ -593,8 +635,16 @@ async def handle_request(method, path, headers, body, query_params):
 
     m = _TAG_RE.match(path)
     if m:
-        resource = query_params.get("Resource", [""])[0] if isinstance(query_params.get("Resource"), list) else query_params.get("Resource", "")
-        operation = query_params.get("Operation", [""])[0] if isinstance(query_params.get("Operation"), list) else query_params.get("Operation", "")
+        resource = (
+            query_params.get("Resource", [""])[0]
+            if isinstance(query_params.get("Resource"), list)
+            else query_params.get("Resource", "")
+        )
+        operation = (
+            query_params.get("Operation", [""])[0]
+            if isinstance(query_params.get("Operation"), list)
+            else query_params.get("Operation", "")
+        )
         if method == "GET":
             return _list_tags(resource)
         if method == "POST" and operation == "Tag":
@@ -662,12 +712,31 @@ async def handle_request(method, path, headers, body, query_params):
         if method == "GET":
             return _cf_list_functions(query_params)
 
+    # KeyValueStore routes
+    m = _KVS_NAME_RE.match(path)
+    if m:
+        kvs_name = m.group(1)
+        if method == "GET":
+            return _describe_kvs(kvs_name)
+        if method == "PUT":
+            return _update_kvs(kvs_name, headers, body)
+        if method == "DELETE":
+            return _delete_kvs(kvs_name, headers)
+
+    m = _KVS_LIST_RE.match(path)
+    if m:
+        if method == "POST":
+            return _create_kvs(headers, body)
+        if method == "GET":
+            return _list_kvstores(query_params)
+
     return _error("NoSuchResource", f"No route for {method} {path}", 404)
 
 
 # ---------------------------------------------------------------------------
 # Distribution handlers
 # ---------------------------------------------------------------------------
+
 
 def _create_distribution(headers, body):
     root_el = _parse_body(body)
@@ -681,8 +750,10 @@ def _create_distribution(headers, body):
     # CallerReference idempotency — return existing distribution if CallerReference matches
     for existing in _distributions.values():
         if existing.get("CallerReference") == caller_ref:
+
             def build(root, _dist=existing):
                 _build_distribution_xml(root, _dist)
+
             return _xml_response("Distribution", build, status=200, extra_headers={"ETag": existing["ETag"]})
     if _find(config_el, "Origins") is None:
         return _error("InvalidArgument", "Origins is required.", 400)
@@ -714,10 +785,15 @@ def _create_distribution(headers, body):
     def build(root):
         _build_distribution_xml(root, dist)
 
-    return _xml_response("Distribution", build, status=201, extra_headers={
-        "ETag": etag,
-        "Location": f"/2020-05-31/distribution/{dist_id}",
-    })
+    return _xml_response(
+        "Distribution",
+        build,
+        status=201,
+        extra_headers={
+            "ETag": etag,
+            "Location": f"/2020-05-31/distribution/{dist_id}",
+        },
+    )
 
 
 def _get_distribution(dist_id):
@@ -776,7 +852,11 @@ def _update_distribution(dist_id, headers, body):
     if not if_match:
         return _error("InvalidIfMatchVersion", "The If-Match version is missing or not valid for the resource.", 400)
     if if_match != dist["ETag"]:
-        return _error("PreconditionFailed", "The precondition given in one or more of the request-header fields evaluated to false.", 412)
+        return _error(
+            "PreconditionFailed",
+            "The precondition given in one or more of the request-header fields evaluated to false.",
+            412,
+        )
 
     config_el = _parse_body(body)
     if config_el is None:
@@ -805,10 +885,16 @@ def _delete_distribution(dist_id, headers):
     if not if_match:
         return _error("InvalidIfMatchVersion", "The If-Match version is missing or not valid for the resource.", 400)
     if if_match != dist["ETag"]:
-        return _error("PreconditionFailed", "The precondition given in one or more of the request-header fields evaluated to false.", 412)
+        return _error(
+            "PreconditionFailed",
+            "The precondition given in one or more of the request-header fields evaluated to false.",
+            412,
+        )
 
     if dist["enabled"]:
-        return _error("DistributionNotDisabled", "The distribution you are trying to delete has not been disabled.", 409)
+        return _error(
+            "DistributionNotDisabled", "The distribution you are trying to delete has not been disabled.", 409
+        )
 
     del _distributions[dist_id]
     _invalidations.pop(dist_id, None)
@@ -820,6 +906,7 @@ def _delete_distribution(dist_id, headers):
 # ---------------------------------------------------------------------------
 # Invalidation handlers
 # ---------------------------------------------------------------------------
+
 
 def _create_invalidation(dist_id, body):
     if dist_id not in _distributions:
@@ -858,9 +945,14 @@ def _create_invalidation(dist_id, body):
     def build(root):
         _build_invalidation_xml(root, inv)
 
-    return _xml_response("Invalidation", build, status=201, extra_headers={
-        "Location": f"/2020-05-31/distribution/{dist_id}/invalidation/{inv_id}",
-    })
+    return _xml_response(
+        "Invalidation",
+        build,
+        status=201,
+        extra_headers={
+            "Location": f"/2020-05-31/distribution/{dist_id}/invalidation/{inv_id}",
+        },
+    )
 
 
 def _list_invalidations(dist_id):
@@ -903,6 +995,7 @@ def _get_invalidation(dist_id, inv_id):
 # ---------------------------------------------------------------------------
 # Tagging
 # ---------------------------------------------------------------------------
+
 
 def _list_tags(resource_arn):
     tags = _tags.get(resource_arn, [])
@@ -951,6 +1044,7 @@ def _untag_resource(resource_arn, body):
 # OAC handlers
 # ---------------------------------------------------------------------------
 
+
 def _create_oac(headers, body):
     el = _parse_body(body)
     if el is None:
@@ -990,10 +1084,15 @@ def _create_oac(headers, body):
     def build(root):
         _build_oac_xml(root, oac)
 
-    return _xml_response("OriginAccessControl", build, status=201, extra_headers={
-        "ETag": etag,
-        "Location": f"/2020-05-31/origin-access-control/{oac_id}",
-    })
+    return _xml_response(
+        "OriginAccessControl",
+        build,
+        status=201,
+        extra_headers={
+            "ETag": etag,
+            "Location": f"/2020-05-31/origin-access-control/{oac_id}",
+        },
+    )
 
 
 def _get_oac(oac_id):
@@ -1049,7 +1148,11 @@ def _update_oac(oac_id, headers, body):
     if not if_match:
         return _error("InvalidIfMatchVersion", "The If-Match version is missing or not valid for the resource.", 400)
     if if_match != oac["ETag"]:
-        return _error("PreconditionFailed", "The precondition given in one or more of the request-header fields evaluated to false.", 412)
+        return _error(
+            "PreconditionFailed",
+            "The precondition given in one or more of the request-header fields evaluated to false.",
+            412,
+        )
 
     el = _parse_body(body)
     if el is None:
@@ -1095,9 +1198,168 @@ def _delete_oac(oac_id, headers):
     if not if_match:
         return _error("InvalidIfMatchVersion", "The If-Match version is missing or not valid for the resource.", 400)
     if if_match != oac["ETag"]:
-        return _error("PreconditionFailed", "The precondition given in one or more of the request-header fields evaluated to false.", 412)
+        return _error(
+            "PreconditionFailed",
+            "The precondition given in one or more of the request-header fields evaluated to false.",
+            412,
+        )
 
     del _oacs[oac_id]
 
     logger.info("DeleteOriginAccessControl id=%s", oac_id)
+    return 204, {}, b""
+
+
+# ---------------------------------------------------------------------------
+# KeyValueStore handlers
+# ---------------------------------------------------------------------------
+
+_KVS_NAME_RE_VALIDATE = re.compile(r"^[a-zA-Z0-9\-_]{1,64}$")
+
+
+def _build_kvs_xml(parent, kvs):
+    SubElement(parent, "ARN").text = kvs["ARN"]
+    SubElement(parent, "Comment").text = kvs.get("Comment", "")
+    SubElement(parent, "Id").text = kvs["Id"]
+    SubElement(parent, "LastModifiedTime").text = kvs["LastModifiedTime"]
+    SubElement(parent, "Name").text = kvs["Name"]
+    SubElement(parent, "Status").text = kvs.get("Status", "READY")
+
+
+def _create_kvs(headers, body):
+    el = _parse_body(body)
+    if el is None:
+        return _error("MalformedXML", "The XML document is malformed.", 400)
+
+    name = _text(el, "Name")
+    if not name:
+        return _error("InvalidArgument", "Name is required.", 400)
+    if not _KVS_NAME_RE_VALIDATE.match(name):
+        return _error("InvalidArgument", "Name must match pattern [a-zA-Z0-9-_]{1,64}.", 400)
+    if name in _kvstores:
+        return _error("EntityAlreadyExists", f"A key value store with name {name} already exists.", 409)
+
+    comment = _text(el, "Comment")
+    kvs_id = new_uuid()
+    etag = new_uuid()
+    now = _now_iso()
+    arn = _kvs_arn(name)
+
+    kvs = {
+        "Id": kvs_id,
+        "Name": name,
+        "Comment": comment,
+        "ARN": arn,
+        "Status": "READY",
+        "LastModifiedTime": now,
+        "ETag": etag,
+    }
+    _kvstores[name] = kvs
+
+    tags_el = _find(el, "Tags")
+    if tags_el is not None:
+        _ingest_distribution_tags_from_xml(arn, tags_el)
+
+    logger.info("CreateKeyValueStore name=%s id=%s", name, kvs_id)
+
+    def build(root):
+        _build_kvs_xml(root, kvs)
+
+    return _xml_response(
+        "KeyValueStore",
+        build,
+        status=201,
+        extra_headers={
+            "ETag": etag,
+            "Location": f"/2020-05-31/key-value-store/{name}",
+        },
+    )
+
+
+def _describe_kvs(name):
+    kvs = _kvstores.get(name)
+    if not kvs:
+        return _error("EntityNotFound", f"The key value store {name} was not found.", 404)
+
+    def build(root):
+        _build_kvs_xml(root, kvs)
+
+    return _xml_response("KeyValueStore", build, extra_headers={"ETag": kvs["ETag"]})
+
+
+def _list_kvstores(query_params):
+    max_items = int(_qval(query_params, "MaxItems", "100") or "100")
+    items = list(_kvstores.values())[:max_items]
+
+    def build(root):
+        items_el = SubElement(root, "Items")
+        for kvs in items:
+            kvs_el = SubElement(items_el, "KeyValueStore")
+            _build_kvs_xml(kvs_el, kvs)
+        SubElement(root, "MaxItems").text = str(max_items)
+        SubElement(root, "Quantity").text = str(len(items))
+
+    return _xml_response("KeyValueStoreList", build)
+
+
+def _update_kvs(name, headers, body):
+    kvs = _kvstores.get(name)
+    if not kvs:
+        return _error("EntityNotFound", f"The key value store {name} was not found.", 404)
+
+    if_match = headers.get("if-match")
+    if not if_match:
+        return _error("InvalidIfMatchVersion", "The If-Match version is missing or not valid for the resource.", 400)
+    if if_match != kvs["ETag"]:
+        return _error(
+            "PreconditionFailed",
+            "The precondition given in one or more of the request-header fields evaluated to false.",
+            412,
+        )
+
+    el = _parse_body(body)
+    if el is None:
+        return _error("MalformedXML", "The XML document is malformed.", 400)
+
+    comment = _text(el, "Comment")
+    new_etag = new_uuid()
+    kvs["Comment"] = comment
+    kvs["ETag"] = new_etag
+    kvs["LastModifiedTime"] = _now_iso()
+
+    logger.info("UpdateKeyValueStore name=%s", name)
+
+    def build(root):
+        _build_kvs_xml(root, kvs)
+
+    return _xml_response("KeyValueStore", build, extra_headers={"ETag": new_etag})
+
+
+def _delete_kvs(name, headers):
+    kvs = _kvstores.get(name)
+    if not kvs:
+        return _error("EntityNotFound", f"The key value store {name} was not found.", 404)
+
+    if_match = headers.get("if-match")
+    if not if_match:
+        return _error("InvalidIfMatchVersion", "The If-Match version is missing or not valid for the resource.", 400)
+    if if_match != kvs["ETag"]:
+        return _error(
+            "PreconditionFailed",
+            "The precondition given in one or more of the request-header fields evaluated to false.",
+            412,
+        )
+
+    arn = kvs["ARN"]
+    for fn in _functions.values():
+        if arn in fn.get("kvs_arns", []):
+            return _error(
+                "CannotDeleteEntityWhileInUse",
+                "The key value store is associated with a function and cannot be deleted.",
+                409,
+            )
+
+    del _kvstores[name]
+
+    logger.info("DeleteKeyValueStore name=%s", name)
     return 204, {}, b""
