@@ -249,6 +249,7 @@ SERVICE_REGISTRY = {
     "waf": {"module": "waf_v1"},
     "waf-regional": {"module": "waf_v1"},
     "wafv2": {"module": "waf"},
+    "cloudtrail": {"module": "cloudtrail"},
 }
 
 SERVICE_HANDLERS = {
@@ -282,6 +283,7 @@ _state_map = {
     "scheduler": "scheduler", "autoscaling": "autoscaling",
     "eks": "eks", "backup": "backup", "pipes": "pipes",
     "cloudfront_keyvaluestore": "cloudfront_keyvaluestore",
+    "cloudtrail": "cloudtrail",
 }
 
 SERVICE_NAME_ALIASES = {
@@ -722,6 +724,7 @@ async def _handle_admin_config_request(path: str, method: str, body: bytes):
         "stepfunctions._sfn_mock_config",
         "stepfunctions._SFN_WAIT_SCALE",
         "lambda_svc.LAMBDA_EXECUTOR",
+        "cloudtrail._recording_enabled",
     }
     try:
         config = json.loads(body) if body else {}
@@ -749,6 +752,8 @@ async def _handle_admin_config_request(path: str, method: str, body: bytes):
                     logger.warning("/_ministack/config: invalid SFN_WAIT_SCALE=%r", value)
                     continue
                 value = float_value
+            elif key == "cloudtrail._recording_enabled":
+                value = str(value).lower() in ("1", "true", "yes")
             setattr(mod, var_name, value)
             applied[key] = value
         except (ImportError, AttributeError) as e:
@@ -1099,6 +1104,186 @@ async def _handle_special_data_plane_request(
 
 
 # ---------------------------------------------------------------------------
+# CloudTrail event recording helpers
+# ---------------------------------------------------------------------------
+
+_S3_PATH_EVENTS = {
+    ("GET", 0): "ListBuckets",
+    ("PUT", 1): "CreateBucket",
+    ("DELETE", 1): "DeleteBucket",
+    ("HEAD", 1): "HeadBucket",
+    ("GET", 1): "ListObjects",
+    ("PUT", 2): "PutObject",
+    ("GET", 2): "GetObject",
+    ("DELETE", 2): "DeleteObject",
+    ("HEAD", 2): "HeadObject",
+    ("POST", 2): "CreateMultipartUpload",
+}
+
+
+def _ct_event_name(service: str, method: str, path: str, headers: dict, query_params: dict) -> str:
+    target = headers.get("x-amz-target", "")
+    if target and "." in target:
+        return target.rsplit(".", 1)[-1]
+
+    action = query_params.get("Action", "")
+    if isinstance(action, list):
+        action = action[0] if action else ""
+    if action:
+        return action
+
+    if service == "s3":
+        parts = [p for p in path.split("/") if p]
+        depth = min(len(parts), 2)
+        return _S3_PATH_EVENTS.get((method, depth), f"{method}.s3")
+
+    if service == "lambda":
+        parts = [p for p in path.split("/") if p]
+        if "functions" in parts:
+            fi = parts.index("functions")
+            rest = parts[fi + 1 :]
+            if not rest:
+                return "CreateFunction" if method == "POST" else "ListFunctions"
+            sub = rest[1] if len(rest) > 1 else None
+            _sub_map = {
+                "invocations": "Invoke",
+                "code": "UpdateFunctionCode",
+                "configuration": "UpdateFunctionConfiguration",
+                "aliases": "CreateAlias" if method == "POST" else "ListAliases",
+                "versions": "PublishVersion" if method == "POST" else "ListVersionsByFunction",
+            }
+            if sub in _sub_map:
+                return _sub_map[sub]
+            return {"GET": "GetFunction", "DELETE": "DeleteFunction", "PUT": "UpdateFunctionCode"}.get(
+                method, f"{method}.lambda"
+            )
+
+    return f"{method}.{service}"
+
+
+def _ct_resources(service: str, method: str, path: str, body: bytes) -> list:
+    if service == "s3":
+        parts = [p for p in path.split("/") if p]
+        if not parts:
+            return []
+        resources = [{"ResourceName": parts[0], "ResourceType": "AWS::S3::Bucket"}]
+        if len(parts) >= 2:
+            resources.append(
+                {"ResourceName": "/".join(parts[1:]), "ResourceType": "AWS::S3::Object"}
+            )
+        return resources
+
+    if service in ("dynamodb", "lambda", "sqs", "sns", "kinesis"):
+        try:
+            parsed = json.loads(body) if body else {}
+        except Exception:
+            parsed = {}
+
+        if service == "dynamodb":
+            table = parsed.get("TableName", "")
+            if table:
+                return [{"ResourceName": table, "ResourceType": "AWS::DynamoDB::Table"}]
+
+        if service == "lambda":
+            fn = parsed.get("FunctionName", "")
+            if not fn:
+                parts = [p for p in path.split("/") if p]
+                if "functions" in parts:
+                    fi = parts.index("functions")
+                    rest = parts[fi + 1 :]
+                    fn = rest[0] if rest else ""
+            if fn:
+                return [{"ResourceName": fn, "ResourceType": "AWS::Lambda::Function"}]
+
+        if service == "sqs":
+            parts = [p for p in path.split("/") if p]
+            if len(parts) >= 2:
+                return [{"ResourceName": parts[-1], "ResourceType": "AWS::SQS::Queue"}]
+
+        if service == "sns":
+            topic = parsed.get("TopicArn", "")
+            if topic:
+                return [{"ResourceName": topic, "ResourceType": "AWS::SNS::Topic"}]
+
+        if service == "kinesis":
+            stream = parsed.get("StreamName", "")
+            if stream:
+                return [{"ResourceName": stream, "ResourceType": "AWS::Kinesis::Stream"}]
+
+    return []
+
+
+def _ct_request_params(headers: dict, body: bytes, query_params: dict) -> dict:
+    ct = headers.get("content-type", "")
+    if "json" in ct:
+        try:
+            return json.loads(body) if body else {}
+        except Exception:
+            return {}
+    if "form" in ct:
+        try:
+            from urllib.parse import parse_qs as _pqs
+            raw = {k: v[0] if len(v) == 1 else v for k, v in _pqs(body.decode("utf-8", errors="replace")).items()}
+            return raw
+        except Exception:
+            return {}
+    return {}
+
+
+def _maybe_record_cloudtrail(
+    service: str,
+    method: str,
+    path: str,
+    headers: dict,
+    body: bytes,
+    query_params: dict,
+    request_id: str,
+    region: str,
+):
+    """Best-effort CloudTrail event recording.
+
+    Zero hot-path cost when CLOUDTRAIL_RECORDING is not set: the cloudtrail
+    module is never loaded and the dict lookup short-circuits immediately.
+    When CLOUDTRAIL_RECORDING=1 is set, the module is loaded on the first
+    request so recording begins from the very first API call, not just after
+    someone has explicitly called a CloudTrail endpoint.
+    """
+    if service == "cloudtrail" or path.startswith("/_"):
+        return
+    ct_mod = _loaded_modules.get("cloudtrail")
+    if ct_mod is None:
+        # Only pay the import cost if CLOUDTRAIL_RECORDING is explicitly on.
+        # This keeps the default-off hot path to a single O(1) dict lookup.
+        if os.environ.get("CLOUDTRAIL_RECORDING", "0") != "1":
+            return
+        ct_mod = _get_module("cloudtrail")
+    if isinstance(ct_mod, _ErrorModule):
+        return
+    if not getattr(ct_mod, "_recording_enabled", False):
+        return
+    try:
+        event_name = _ct_event_name(service, method, path, headers, query_params)
+        resources = _ct_resources(service, method, path, body)
+        access_key_id = extract_access_key_id(headers) or "test"
+        user_agent = headers.get("user-agent", "")
+        request_params = _ct_request_params(headers, body, query_params)
+        ct_mod.record_event(
+            service=service,
+            event_name=event_name,
+            username=access_key_id,
+            access_key_id=access_key_id,
+            resources=resources,
+            region=region,
+            request_id=request_id,
+            user_agent=user_agent,
+            request_params=request_params,
+            method=method,
+        )
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
 # Tier 4 — Generic service dispatch
 # ---------------------------------------------------------------------------
 
@@ -1142,6 +1327,8 @@ async def _dispatch_service_request(
             {"Content-Type": "application/json"},
             json.dumps({"__type": "InternalError", "message": str(e)}).encode(),
         )
+
+    _maybe_record_cloudtrail(service, method, path, headers, body, query_params, request_id, region)
 
     resp_headers.update(
         {
