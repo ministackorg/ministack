@@ -12,7 +12,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 ### Added
 - **AppSync Events API** — Event API management under `/v2/apis`, channel namespaces, API keys via `/v1/apis/{apiId}/apikeys`, HTTP publish on `{apiId}.appsync-api.*`, and realtime WebSocket on `{apiId}.appsync-realtime-api.*` (`aws-appsync-event-ws` subprotocol). Strict auth via `APPSYNC_EVENTS_ENFORCE_AUTH=1`. Contributed by @marcin-nowak-scl.
 - **CloudFront KeyValueStore — management plane** — Create/Describe/List/Update/Delete with ETag concurrency; `KeyValueStoreAssociations` round-tripped through CloudFront Functions. Contributed by @DaviReisVieira.
-- **CloudFront KeyValueStore — data plane** — separate `cloudfront-keyvaluestore` service covering Describe, ListKeys, GetKey, PutKey, DeleteKey, UpdateKeys with ETag concurrency. Contributed by @DaviReisVieira.
+- **CloudFront KeyValueStore — data plane** — separate `cloudfront-keyvaluestore` service covering Describe, ListKeys, GetKey, PutKey, DeleteKey, UpdateKeys with ETag concurrency. Requested by @shellscape. Contributed by @DaviReisVieira.
 - **EventBridge `cron()` schedule auto-fire** — full AWS-spec parity. Zero-dep parser for the 6-field syntax: `*`, `?`, ranges, steps, lists, named month/weekday tokens, and the `L` (last day / `<n>L` last weekday-of-month), `LW` (last weekday), `<n>W` (nearest weekday), and `<n>#<k>` (kth weekday-of-month) operators. DoM/DoW mutual-exclusion enforced at `PutRule`. Contributed by @hiddengearz.
 
 ### Fixed
