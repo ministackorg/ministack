@@ -392,6 +392,7 @@ def _create_table(data):
         _tables[name]["LatestStreamArn"] = f"{_tables[name]['TableArn']}/stream/{stream_label}"
     if data.get("Tags"):
         _tags[_tables[name]["TableArn"]] = data["Tags"]
+    logger.info("DynamoDB table created: %s", name)
     return json_response({"TableDescription": _table_description(name)})
 
 

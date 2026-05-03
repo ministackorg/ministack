@@ -22,6 +22,7 @@ Supports: CreateEventBus, UpdateEventBus, DeleteEventBus, ListEventBuses, Descri
 
 import copy
 import fnmatch
+import calendar
 import hashlib
 import json
 import logging
@@ -311,15 +312,19 @@ def _list_event_buses(data):
     buses = []
     for n, b in _event_buses.items():
         if n.startswith(prefix):
-            policy = _event_bus_policies.get(n)
-            buses.append({
+            entry = {
                 "Name": b["Name"],
                 "Arn": b["Arn"],
                 "Description": b.get("Description", ""),
                 "CreationTime": b["CreationTime"],
                 "LastModifiedTime": b.get("LastModifiedTime", b.get("CreationTime")),
-                "Policy": json.dumps(policy) if policy else ""
-            })
+            }
+            # AWS spec: Policy is optional; omit when no policy is set rather
+            # than returning an empty string (Java SDK v2 sees a stray empty).
+            policy = _event_bus_policies.get(n)
+            if policy:
+                entry["Policy"] = json.dumps(policy)
+            buses.append(entry)
     return json_response({"EventBuses": buses})
 
 
@@ -328,15 +333,17 @@ def _describe_event_bus(data):
     bus = _event_buses.get(name)
     if not bus:
         return error_response_json("ResourceNotFoundException", f"Event bus {name} not found", 400)
-    policy = _event_bus_policies.get(name)
     out = {
         "Name": bus["Name"],
         "Arn": bus["Arn"],
         "Description": bus.get("Description", ""),
         "CreationTime": bus["CreationTime"],
         "LastModifiedTime": bus.get("LastModifiedTime", bus.get("CreationTime")),
-        "Policy": json.dumps(policy) if policy else "",
     }
+    # AWS spec: Policy is optional; omit when no policy is set.
+    policy = _event_bus_policies.get(name)
+    if policy:
+        out["Policy"] = json.dumps(policy)
     for k in ("LogConfig", "DeadLetterConfig", "KmsKeyIdentifier"):
         if k in bus:
             out[k] = bus[k]
@@ -390,12 +397,19 @@ def _rule_key(rule_name: str, bus_name: str) -> str:
     return f"{bus_name}|{rule_name}"
 
 
+_RATE_RE = re.compile(r"^rate\(\d+\s+(minute|minutes|hour|hours|day|days)\)$")
+
+
 def _validate_schedule_expression(expr: str) -> bool:
     if not expr:
         return True
-    rate_pattern = re.compile(r"^rate\(\d+\s+(minute|minutes|hour|hours|day|days)\)$")
-    cron_pattern = re.compile(r"^cron\(.+\)$")
-    return bool(rate_pattern.match(expr) or cron_pattern.match(expr))
+    if _RATE_RE.match(expr):
+        return True
+    if expr.startswith("cron("):
+        # Reuses the structural parser so PutRule rejects bad cron syntax (DoM/DoW
+        # both non-'?', unknown tokens, malformed L/W/#) the same way real AWS does.
+        return _parse_cron_fields(expr) is not None
+    return False
 
 
 def _put_rule(data):
@@ -462,9 +476,32 @@ def _delete_rule(data):
     return json_response({})
 
 
+def _opaque_offset_encode(offset: int) -> str:
+    """AWS NextToken values are opaque (base64-style) per the EventBridge spec —
+    not a raw integer offset. Encode the cursor so SDKs that round-trip and
+    inspect the value see something opaque rather than a leakable index."""
+    import base64 as _b64
+    return _b64.urlsafe_b64encode(str(offset).encode("ascii")).decode("ascii").rstrip("=")
+
+
+def _opaque_offset_decode(token: str) -> int:
+    import base64 as _b64
+    if not token:
+        return 0
+    try:
+        padded = token + "=" * (-len(token) % 4)
+        return int(_b64.urlsafe_b64decode(padded.encode("ascii")).decode("ascii"))
+    except (ValueError, UnicodeDecodeError):
+        return 0
+
+
 def _list_rules(data):
     prefix = data.get("NamePrefix", "")
     bus = data.get("EventBusName", "default")
+    # AWS spec: ListRules supports NextToken + Limit (1..100, default 100).
+    limit = int(data.get("Limit", 100))
+    if limit < 1 or limit > 100:
+        limit = 100
     rules = []
     for key, r in _rules.items():
         if r.get("EventBusName", "default") != bus:
@@ -472,7 +509,13 @@ def _list_rules(data):
         if prefix and not r["Name"].startswith(prefix):
             continue
         rules.append(_rule_out(r))
-    return json_response({"Rules": rules})
+    rules.sort(key=lambda x: x["Name"])
+    start = _opaque_offset_decode(data.get("NextToken", ""))
+    page = rules[start:start + limit]
+    resp = {"Rules": page}
+    if start + limit < len(rules):
+        resp["NextToken"] = _opaque_offset_encode(start + limit)
+    return json_response(resp)
 
 
 def _describe_rule(data):
@@ -518,6 +561,11 @@ def _rule_out(rule):
         out["Description"] = rule["Description"]
     if rule.get("RoleArn"):
         out["RoleArn"] = rule["RoleArn"]
+    # AWS spec members on DescribeRule/RuleResponse — emit when populated.
+    if rule.get("ManagedBy"):
+        out["ManagedBy"] = rule["ManagedBy"]
+    if rule.get("CreatedBy"):
+        out["CreatedBy"] = rule["CreatedBy"]
     return out
 
 
@@ -585,16 +633,11 @@ def _list_rule_names_by_target(data):
             matched.append(_rules[key]["Name"])
 
     matched = sorted(set(matched))
-    start = 0
-    if next_token:
-        try:
-            start = int(next_token)
-        except ValueError:
-            start = 0
+    start = _opaque_offset_decode(next_token)
     page = matched[start:start + limit]
     resp = {"RuleNames": page}
     if start + limit < len(matched):
-        resp["NextToken"] = str(start + limit)
+        resp["NextToken"] = _opaque_offset_encode(start + limit)
     return json_response(resp)
 
 
@@ -648,11 +691,23 @@ def _normalize_bus_name(name):
 
 def _put_events(data):
     entries = data.get("Entries", [])
+    # AWS spec: PutEvents.Entries list min=1 max=10. Real AWS rejects with
+    # ValidationException; matching that here so SDKs see the same constraint.
+    if len(entries) > 10:
+        return error_response_json(
+            "ValidationException",
+            "1 validation error detected: Value '%d' at 'entries' failed to satisfy constraint: "
+            "Member must have length less than or equal to 10" % len(entries),
+            400,
+        )
     results = []
     for entry in entries:
         event_id = new_uuid()
         bus_name = _normalize_bus_name(entry.get("EventBusName", "default"))
-        event_time = _now_ts()
+        # AWS Time is a timestamp shape; ministack convention is int epoch seconds
+        # (Java SDK v2 chokes on floats). Persisted in the event_record so
+        # archive replay also dispatches the int form.
+        event_time = int(_now_ts())
 
         event_record = {
             "EventId": event_id,
@@ -764,13 +819,32 @@ def _matches_detail(detail, pattern):
     if not isinstance(pattern, dict):
         return True
     for key, expected in pattern.items():
-        actual = detail.get(key)
+        present = isinstance(detail, dict) and key in detail
+        actual = detail.get(key) if isinstance(detail, dict) else None
         if isinstance(expected, list):
-            if actual is None:
+            # AWS content-filter: ``[{"exists": true|false}]`` is evaluated
+            # against key presence/absence, NOT against the value, so an
+            # absent key must NOT short-circuit to False before that check.
+            exists_filters = [
+                item for item in expected
+                if isinstance(item, dict) and "exists" in item
+            ]
+            if exists_filters:
+                if any(item.get("exists") is True for item in exists_filters) and present:
+                    continue
+                if any(item.get("exists") is False for item in exists_filters) and not present:
+                    continue
+                # No exists branch matched and there are no value-level filters
+                # left to try — treat as no match.
+                if all(isinstance(item, dict) and "exists" in item for item in expected):
+                    return False
+            if not present:
                 return False
             if isinstance(actual, (str, int, float, bool)):
                 matched = False
                 for item in expected:
+                    if isinstance(item, dict) and "exists" in item:
+                        continue  # already handled above
                     if isinstance(item, dict):
                         matched = matched or _matches_content_filter(actual, item)
                     elif actual == item or str(actual) == str(item):
@@ -1365,9 +1439,11 @@ def _deactivate_event_source(data):
 
 def _describe_event_source(data):
     name = data.get("Name", "")
+    # AWS EventSourceState enum: PENDING | ACTIVE | DELETED. "ENABLED" is not
+    # a valid value (Java/Go SDK v2 strict enum parsers reject it).
     return json_response({
         "Name": name,
-        "State": "ENABLED",
+        "State": "ACTIVE",
         "Arn": f"arn:aws:events:{get_region()}::event-source/{name}" if name else "",
     })
 
@@ -1767,12 +1843,117 @@ def _cron_field(field: str, lo: int, hi: int, names: dict | None = None) -> froz
     return frozenset(result)
 
 
+def _last_day_of_month(year: int, month: int) -> int:
+    return calendar.monthrange(year, month)[1]
+
+
+def _last_weekday_of_month(year: int, month: int) -> int:
+    """Day-of-month of the last Mon-Fri (used by AWS cron LW)."""
+    last = _last_day_of_month(year, month)
+    for d in range(last, 0, -1):
+        if datetime(year, month, d).isoweekday() <= 5:
+            return d
+    return 1  # unreachable for any real month
+
+
+def _nearest_weekday(year: int, month: int, target_day: int) -> int:
+    """AWS ``<n>W``: weekday nearest to ``target_day``, never crossing month boundary."""
+    last = _last_day_of_month(year, month)
+    target_day = min(max(target_day, 1), last)
+    iso = datetime(year, month, target_day).isoweekday()
+    if iso <= 5:
+        return target_day
+    if iso == 6:  # Saturday → Friday (back 1) unless that crosses month start
+        return target_day - 1 if target_day - 1 >= 1 else target_day + 2
+    return target_day + 1 if target_day + 1 <= last else target_day - 2  # Sunday → Monday
+
+
+def _parse_dom_field(field: str) -> dict | None:
+    """Parse AWS cron DoM field. Returns dict with ``days`` set + ``last`` / ``last_weekday`` /
+    ``weekday_of`` markers for L, LW, and ``<n>W`` operators. ``None`` on invalid input."""
+    if field in ("*", "?"):
+        return {"days": frozenset(range(1, 32)), "last": False, "last_weekday": False, "weekday_of": []}
+    days: set[int] = set()
+    last = False
+    last_weekday = False
+    weekday_of: list[int] = []
+    for part in field.upper().split(","):
+        if part == "L":
+            last = True
+        elif part == "LW":
+            last_weekday = True
+        elif part.endswith("W"):
+            try:
+                n = int(part[:-1])
+            except ValueError:
+                return None
+            if not 1 <= n <= 31:
+                return None
+            weekday_of.append(n)
+        else:
+            try:
+                days.update(_cron_field(part, 1, 31))
+            except (ValueError, KeyError):
+                return None
+    return {"days": frozenset(days), "last": last, "last_weekday": last_weekday, "weekday_of": weekday_of}
+
+
+def _parse_dow_field(field: str) -> dict | None:
+    """Parse AWS cron DoW field. Returns dict with ``days`` set + ``last_of`` (``<n>L`` = last
+    <n> of month) and ``nth`` (``<n>#<k>`` = kth <n> of month). ``None`` on invalid input.
+    AWS DoW: 1=SUN..7=SAT."""
+    if field in ("*", "?"):
+        return {"days": frozenset(range(1, 8)), "last_of": [], "nth": []}
+    days: set[int] = set()
+    last_of: list[int] = []
+    nth: list[tuple[int, int]] = []
+
+    def _resolve_dow(tok: str) -> int | None:
+        u = tok.upper()
+        if u in _DOW_NAMES:
+            return _DOW_NAMES[u]
+        try:
+            v = int(u)
+        except ValueError:
+            return None
+        return v if 1 <= v <= 7 else None
+
+    for part in field.upper().split(","):
+        if "#" in part:
+            day_tok, sep, k_tok = part.partition("#")
+            try:
+                k = int(k_tok)
+            except ValueError:
+                return None
+            n = _resolve_dow(day_tok)
+            if n is None or not 1 <= k <= 5:
+                return None
+            nth.append((n, k))
+        elif part.endswith("L") and part != "L":
+            n = _resolve_dow(part[:-1])
+            if n is None:
+                return None
+            last_of.append(n)
+        elif part == "L":
+            # Bare ``L`` in DoW is "Saturday" per AWS (== 7). Real AWS accepts it.
+            last_of.append(7)
+        else:
+            try:
+                days.update(_cron_field(part, 1, 7, _DOW_NAMES))
+            except (ValueError, KeyError):
+                return None
+    return {"days": frozenset(days), "last_of": last_of, "nth": nth}
+
+
 def _parse_cron_fields(expr: str):
     """Parse AWS cron(Min Hr DoM Mon DoW Year) into expanded field sets, or return None.
 
     Returns an 8-tuple:
-      (min_set, hr_set, dom_set, mon_set, dow_set, yr_set_or_none, dom_raw, dow_raw)
-    dom_raw / dow_raw preserve the original token so '?' semantics can be applied.
+      (min_set, hr_set, dom_struct, mon_set, dow_struct, yr_set_or_none, dom_raw, dow_raw)
+    ``dom_struct`` / ``dow_struct`` are dicts (see ``_parse_dom_field`` / ``_parse_dow_field``)
+    so ``L`` / ``W`` / ``#`` operators that depend on the actual date can be evaluated at
+    match time. ``dom_raw`` / ``dow_raw`` preserve the original token for the AWS ``?``
+    mutual-exclusion rule.
     """
     m = re.match(r"^cron\((.+)\)$", expr.strip())
     if not m:
@@ -1781,19 +1962,53 @@ def _parse_cron_fields(expr: str):
     if len(parts) != 6:
         return None
     min_f, hr_f, dom_f, mon_f, dow_f, yr_f = parts
+    # AWS rule: exactly one of DoM and DoW must be '?'. Both non-'?' is invalid.
+    if dom_f != "?" and dow_f != "?":
+        return None
     try:
+        dom_struct = _parse_dom_field(dom_f)
+        dow_struct = _parse_dow_field(dow_f)
+        if dom_struct is None or dow_struct is None:
+            return None
         return (
             _cron_field(min_f, 0, 59),
             _cron_field(hr_f, 0, 23),
-            _cron_field(dom_f, 1, 31),
+            dom_struct,
             _cron_field(mon_f, 1, 12, _MONTH_NAMES),
-            _cron_field(dow_f, 1, 7, _DOW_NAMES),
+            dow_struct,
             _cron_field(yr_f, 1970, 2199) if yr_f not in ("*", "?") else None,
-            dom_f,   # raw token — preserved for '?' mutual-exclusion logic
+            dom_f,
             dow_f,
         )
     except (ValueError, KeyError):
         return None
+
+
+def _dom_matches(dom_struct: dict, dt: datetime) -> bool:
+    if dt.day in dom_struct["days"]:
+        return True
+    if dom_struct["last"] and dt.day == _last_day_of_month(dt.year, dt.month):
+        return True
+    if dom_struct["last_weekday"] and dt.day == _last_weekday_of_month(dt.year, dt.month):
+        return True
+    for n in dom_struct["weekday_of"]:
+        if dt.day == _nearest_weekday(dt.year, dt.month, n):
+            return True
+    return False
+
+
+def _dow_matches(dow_struct: dict, dt: datetime) -> bool:
+    aws_dow = (dt.isoweekday() % 7) + 1
+    if aws_dow in dow_struct["days"]:
+        return True
+    last = _last_day_of_month(dt.year, dt.month)
+    for n in dow_struct["last_of"]:
+        if aws_dow == n and dt.day + 7 > last:
+            return True
+    for n, k in dow_struct["nth"]:
+        if aws_dow == n and (dt.day - 1) // 7 + 1 == k:
+            return True
+    return False
 
 
 def _cron_next_fire(fields, after_dt: datetime) -> datetime | None:
@@ -1802,7 +2017,7 @@ def _cron_next_fire(fields, after_dt: datetime) -> datetime | None:
     Uses forward-walking with jumps so sparse schedules (monthly, yearly) don't
     iterate every minute.  Returns None if no match is found within 4 years.
     """
-    min_s, hr_s, dom_s, mon_s, dow_s, yr_s, dom_raw, dow_raw = fields
+    min_s, hr_s, dom_struct, mon_s, dow_struct, yr_s, dom_raw, dow_raw = fields
     dt = after_dt.replace(second=0, microsecond=0) + timedelta(minutes=1)
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
@@ -1821,16 +2036,13 @@ def _cron_next_fire(fields, after_dt: datetime) -> datetime | None:
             else:
                 dt = dt.replace(year=dt.year + 1, month=min(mon_s), day=1, hour=0, minute=0)
             continue
-        # DoM / DoW: '?' means "don't use this field" (AWS mutual-exclusion rule).
-        # Convert Python isoweekday (1=MON…7=SUN) → AWS dow (1=SUN…7=SAT):
-        #   aws_dow = (isoweekday % 7) + 1
-        aws_dow = (dt.isoweekday() % 7) + 1
+        # AWS '?' rule: exactly one of DoM/DoW is '?'. The non-'?' field gates the day,
+        # supporting L (last day), <n>W (nearest weekday), <n>L (last <n> of month),
+        # and <n>#<k> (kth <n> of month).
         if dom_raw == "?":
-            day_ok = aws_dow in dow_s
-        elif dow_raw == "?":
-            day_ok = dt.day in dom_s
+            day_ok = _dow_matches(dow_struct, dt)
         else:
-            day_ok = (dt.day in dom_s) or (aws_dow in dow_s)
+            day_ok = _dom_matches(dom_struct, dt)
         if not day_ok:
             dt = dt.replace(hour=0, minute=0) + timedelta(days=1)
             continue
@@ -1926,10 +2138,20 @@ def _scheduler_loop():
             logger.exception("EventBridge scheduler tick error")
 
 
-_scheduler_thread = threading.Thread(
-    target=_scheduler_loop, daemon=True, name="eb-scheduler"
-)
-_scheduler_thread.start()
+_scheduler_thread: "threading.Thread | None" = None
+
+
+def start_scheduler() -> None:
+    """Start the eb-scheduler daemon thread (idempotent). Called from the
+    gateway lifespan.startup. Kept out of module-import scope so unit tests
+    that patch ``_invoke_target`` don't race against a background tick."""
+    global _scheduler_thread
+    if _scheduler_thread is not None and _scheduler_thread.is_alive():
+        return
+    _scheduler_thread = threading.Thread(
+        target=_scheduler_loop, daemon=True, name="eb-scheduler"
+    )
+    _scheduler_thread.start()
 
 
 def reset():

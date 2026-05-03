@@ -7,10 +7,29 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
-## [Unreleased]
+## [1.3.25] — 2026-05-03
 
 ### Added
-- **AppSync Events API emulator** — Event APIs are now available under the AppSync service: `CreateApi`/`GetApi`/`ListApis`/`UpdateApi`/`DeleteApi`, channel namespace CRUD, API-key management through the AWS SDK's `/v1/apis/{apiId}/apikeys` path, HTTP `POST /event` publishing on `*.appsync-api.*`, and realtime `*.appsync-realtime-api.*` WebSocket subscribe/publish flows. Channel validation follows the AppSync Events grammar, publish fan-out returns AWS-shaped identifiers, and API-key / Lambda-authorizer checks are enforced consistently across HTTP and WebSocket publish paths.
+- **AppSync Events API** — Event API management under `/v2/apis`, channel namespaces, API keys via `/v1/apis/{apiId}/apikeys`, HTTP publish on `{apiId}.appsync-api.*`, and realtime WebSocket on `{apiId}.appsync-realtime-api.*` (`aws-appsync-event-ws` subprotocol). Strict auth via `APPSYNC_EVENTS_ENFORCE_AUTH=1`. Contributed by @marcin-nowak-scl.
+- **CloudFront KeyValueStore — management plane** — Create/Describe/List/Update/Delete with ETag concurrency; `KeyValueStoreAssociations` round-tripped through CloudFront Functions. Contributed by @DaviReisVieira.
+- **CloudFront KeyValueStore — data plane** — separate `cloudfront-keyvaluestore` service covering Describe, ListKeys, GetKey, PutKey, DeleteKey, UpdateKeys with ETag concurrency. Contributed by @DaviReisVieira.
+- **EventBridge `cron()` schedule auto-fire** — full AWS-spec parity. Zero-dep parser for the 6-field syntax: `*`, `?`, ranges, steps, lists, named month/weekday tokens, and the `L` (last day / `<n>L` last weekday-of-month), `LW` (last weekday), `<n>W` (nearest weekday), and `<n>#<k>` (kth weekday-of-month) operators. DoM/DoW mutual-exclusion enforced at `PutRule`. Contributed by @hiddengearz.
+
+### Fixed
+- **AppSync Events `ChannelNamespace` response now includes `channelNamespaceArn`** — spec member was omitted; Terraform / Java SDK v2 saw `null` where AWS returns the ARN.
+- **CloudFront KVS data-plane `DescribeKeyValueStore` `Created` / `LastModified`** — were hardcoded to `0`; now parsed from the management-plane timestamp into int epoch seconds.
+- **S3 vhost routing excludes `cloudfront-kvs.*`** — moved the bypass from a `/key-value-stores/` path check up to the `_NON_S3_VHOST_NAMES` host-name layer.
+- **EventBridge `DescribeRule` / `ListRules` now emit `CreatedBy` and `ManagedBy`** — spec members were silently dropped from `_rule_out`.
+- **EventBridge `PutEvents` rejects more than 10 entries** — AWS spec caps `Entries` at 10; ministack accepted any size.
+- **EventBridge event `Time` is int epoch seconds, not float** — Java/Go SDK v2 timestamp parsers reject high-precision floats; archive replays now also dispatch the int form.
+- **EventBridge content-filter `[{"exists": false}]` matches absent keys** — short-circuited to no-match before the `exists` branch was evaluated, so patterns that should fire on missing fields silently dropped.
+- **EventBridge `ListRules` paginates** — added `Limit` (1-100) and opaque `NextToken`; previously returned the full list and SDK paginators looped on the first page.
+- **EventBridge `ListRuleNamesByTarget` `NextToken` is opaque** — was a raw integer offset string.
+- **EventBridge `DescribeEventBus` / `ListEventBuses` omit `Policy` when no policy set** — was emitting `""`, divergent from AWS shape.
+- **EventBridge `DescribeEventSource` State** — was hardcoded `ENABLED`; AWS enum is `PENDING` / `ACTIVE` / `DELETED`. Now returns `ACTIVE`.
+
+---
+
 ## [1.3.24] — 2026-05-02
 
 ### Fixed
@@ -26,7 +45,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 ### Added
 
 - **Amazon OpenSearch Service** — management plane on `/2021-01-01/*`: CreateDomain, DescribeDomain(s), DeleteDomain, ListDomainNames (with `EngineType` filter), UpdateDomainConfig, DescribeDomainConfig (`Options`/`Status` wrapping), DescribeDomainChangeProgress, ListVersions, GetCompatibleVersions, AddTags/ListTags/RemoveTags. Account-scoped state. Default data plane is a stub endpoint; set `OPENSEARCH_DATAPLANE=1` to spawn one real `opensearchproject/opensearch` container per `CreateDomain` (same pattern as ElastiCache/RDS). Add `OPENSEARCH_DASHBOARDS=1` for an optional per-domain `opensearch-dashboards` sidecar — `DescribeDomain.DashboardEndpoint` is populated. `DeleteDomain` tears down spawned containers. Terraform `aws_opensearch_domain` compatible. Requested by @marcin-nowak-scl.
-- **EventBridge scheduled rule auto-fire — `rate()` and `cron()`** — both schedule expression types now fire automatically. A daemon thread (`eb-scheduler`) ticks every 10 s; the per-rule countdown anchors to `CreationTime` so the first fire lands one full interval after `PutRule`. `rate(N minute|hour|day)` rules use interval arithmetic; `cron(Min Hr DoM Mon DoW Year)` rules use a zero-dependency hand-rolled parser that handles `*`, `?`, ranges (`MON-FRI`), steps (`*/5`), lists, and named month/weekday tokens. The `?` mutual-exclusion between DoM and DoW is enforced per AWS spec. No new runtime dependencies. Scheduled event payload matches AWS exactly (`source: aws.events`, `detail-type: Scheduled Event`, `detail: {}`, ISO 8601 `time`). Multi-tenant — iterates the rules store directly. Contributed by @hiddengearz.
+- **EventBridge scheduled rule auto-fire** — `rate(N minute|hour|day)` rules now fire automatically. A daemon thread (`eb-scheduler`) ticks every 10 s; the per-rule countdown anchors to `CreationTime` so the first fire lands one full interval after `PutRule`. Scheduled event payload matches AWS exactly (`source: aws.events`, `detail-type: Scheduled Event`, `detail: {}`, ISO 8601 `time`). Multi-tenant — iterates the rules store directly. `cron()` expressions are stored but not yet auto-fired (one-time `INFO` log surfaces the gap). Contributed by @hiddengearz.
 - **AWS Organizations** — DescribeOrganization, ListRoots, ListAccounts, DescribeAccount, ListOrganizationalUnitsForParent / ListAccountsForParent, CreateOrganizationalUnit / DescribeOrganizationalUnit / DeleteOrganizationalUnit. Single-master-account org auto-initialised on first call; nested OUs carry the new `Path` field (2026-03 AWS additive change).
 - **AWS Account service** — GetAccountInformation, GetContactInformation, ListRegions, GetRegionOptStatus. Returns the new `AccountState: ACTIVE` field (2026-04 AWS additive change). Older boto3 SDKs strip the field; newer ones see it.
 - **AWS Batch** — control-plane stub: ComputeEnvironments, JobQueues, JobDefinitions (auto-revisioning), SubmitJob (auto-`SUCCEEDED`), DescribeJobs, ListJobs. Account-scoped.

@@ -558,7 +558,7 @@ async def handle_request(method, path, headers, body, query_params):
                     if method == "POST":
                         return appsync_events._create_api_key(api_id, body or b"{}")
                     elif method == "GET":
-                        return appsync_events._list_api_keys(api_id)
+                        return appsync_events._list_api_keys(api_id, query_params)
                 elif method == "DELETE":
                     return appsync_events._delete_api_key(api_id, sub2)
         if sub2 is None:

@@ -1,32 +1,19 @@
 """
-AppSync Events Service Emulator — AWS-compatible.
-Supports: CreateApi, GetApi, ListApis, UpdateApi, DeleteApi,
-          CreateChannelNamespace, GetChannelNamespace, ListChannelNamespaces,
-          UpdateChannelNamespace, DeleteChannelNamespace,
-          CreateApiKey, ListApiKeys, DeleteApiKey,
-          Publish (HTTP POST /event on {apiId}.appsync-api.{region}.{host}),
-          WebSocket subscribe (wss://{apiId}.appsync-realtime-api.{region}.{host}/event/realtime,
-          aws-appsync-event-ws subprotocol: connection_init, subscribe,
-          unsubscribe, publish, server-pushed data + ka keep-alives).
-Event API management is REST/JSON under /v2/apis (shares the ``appsync``
-credential scope); API key operations use the AWS SDK's /v1/apis/{apiId}/apikeys
-path and are delegated from ``services/appsync.py``. Channel paths validated
-against the 1..5-segment spec regex; subscribe patterns accept a trailing
-``*`` single-level wildcard. Connection-scoped
-authorization is sent via a second ``header-<base64url(json)>`` subprotocol
-entry and cached for later subscribe/publish frames. Set
-``APPSYNC_EVENTS_ENFORCE_AUTH=1`` for strict mode: without an ``AWS_LAMBDA``
-``authProvider``, only registered **x-api-key** values are accepted; when
-``authType: AWS_LAMBDA`` and ``lambdaAuthorizerConfig.authorizerUri`` are present
-in the API ``eventConfig``, the named Lambda is invoked (connect + subscribe +
-publish) with the same ``AuthorizationToken`` / ``Channel`` / ``Operation``
-shape as on AWS. By default ``CreateApi`` / ``GetApi`` return ``dns`` hostnames of
-the form ``{apiId}.appsync-api.{region}.{MINISTACK_HOST}:{port}`` and
-``{apiId}.appsync-realtime-api.{region}.{MINISTACK_HOST}:{port}`` (AWS-style
-service labels with a local base host and explicit ``GATEWAY_PORT``).
-Optional: ``APPSYNC_EVENTS_HTTP_HOST_TEMPLATE`` and
-``APPSYNC_EVENTS_REALTIME_HOST_TEMPLATE`` (``{api_id}``, ``{region}``, ``{port}``)
-override those defaults when **both** are set.
+AWS AppSync Events emulator.
+
+Event API management lives under /v2/apis and shares the ``appsync``
+credential scope, so ``services/appsync.py`` delegates here. API key
+operations land on /v1/apis/{apiId}/apikeys (same delegation path).
+Data plane: HTTP publish at POST /event on {apiId}.appsync-api.* and a
+realtime WebSocket on {apiId}.appsync-realtime-api.* using the
+``aws-appsync-event-ws`` subprotocol.
+
+Channel paths follow the 1..5-segment grammar; subscribe patterns accept a
+trailing ``*`` single-level wildcard. Connection-scoped authorization is
+declared via a second ``header-<base64url(json)>`` Sec-WebSocket-Protocol
+entry. Set ``APPSYNC_EVENTS_ENFORCE_AUTH=1`` for strict mode (registered
+x-api-key required, or AWS_LAMBDA authorizer Lambda invoked when configured
+in the API ``eventConfig``).
 """
 
 import asyncio
@@ -175,13 +162,15 @@ def _default_event_config(requested: dict | None) -> dict:
     """
     requested = requested or {}
     default_auth = [{"authType": "API_KEY"}]
-    return {
+    out = {
         "authProviders": requested.get("authProviders") or default_auth,
         "connectionAuthModes": requested.get("connectionAuthModes") or default_auth,
         "defaultPublishAuthModes": requested.get("defaultPublishAuthModes") or default_auth,
         "defaultSubscribeAuthModes": requested.get("defaultSubscribeAuthModes") or default_auth,
-        "logConfig": requested.get("logConfig"),
     }
+    if requested.get("logConfig") is not None:
+        out["logConfig"] = requested["logConfig"]
+    return out
 
 
 def _api_response(api_id: str) -> dict:
@@ -202,6 +191,10 @@ def _api_response(api_id: str) -> dict:
     }
 
 
+def _channel_namespace_arn(api_id: str, name: str) -> str:
+    return f"arn:aws:appsync:{get_region()}:{get_account_id()}:apis/{api_id}/channelNamespace/{name}"
+
+
 def _channel_response(api_id: str, name: str) -> dict:
     ns = _channel_namespaces.get(api_id, {}).get(name, {})
     if not ns:
@@ -214,6 +207,7 @@ def _channel_response(api_id: str, name: str) -> dict:
         "codeHandlers": ns.get("codeHandlers"),
         "handlerConfigs": ns.get("handlerConfigs"),
         "tags": ns.get("tags", {}),
+        "channelNamespaceArn": _channel_namespace_arn(api_id, name),
         "created": ns["created"],
         "lastModified": ns["lastModified"],
     }
@@ -262,7 +256,12 @@ _CHANNEL_SEGMENT_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,48}[A-Za-z0-9])
 
 
 def _split_channel(channel: str) -> list[str] | None:
-    if not channel or not channel.startswith("/"):
+    """Split an AWS AppSync Events channel path into segments.
+
+    Per AWS spec the leading and trailing ``/`` are optional, so ``foo/bar``
+    and ``/foo/bar/`` both yield ``["foo", "bar"]``. 1..5 segments required.
+    """
+    if not channel:
         return None
     parts = [p for p in channel.split("/") if p != ""]
     if not 1 <= len(parts) <= 5:
@@ -397,6 +396,13 @@ def _bearer_from_auth_dict(auth: dict | None) -> str:
 
 
 def _parse_lambda_authorizer_body(body: object) -> tuple[bool, dict | None]:
+    """Parse the AppSync Events Lambda authorizer response.
+
+    Per AWS spec the response carries ``isAuthorized`` (required boolean) and
+    optionally ``handlerContext`` (key/value strings, exposed to handlers as
+    ``$ctx.identity.handlerContext``). ``ttlOverride`` is parsed/ignored —
+    ministack doesn't cache authorizer decisions.
+    """
     if isinstance(body, str):
         try:
             body = json.loads(body)
@@ -404,28 +410,41 @@ def _parse_lambda_authorizer_body(body: object) -> tuple[bool, dict | None]:
             return False, None
     if not isinstance(body, dict):
         return False, None
-    ok = bool(
-        body.get("isAuthorized")
-        or body.get("IsAuthorized")
-    )
-    ctx = body.get("resolverContext")
-    if ctx is None:
-        ctx = body.get("ResolverContext")
-    if not ok:
+    if not bool(body.get("isAuthorized")):
         return False, None
-    if isinstance(ctx, dict):
-        return True, ctx
-    return True, None
+    ctx = body.get("handlerContext")
+    return True, ctx if isinstance(ctx, dict) else None
 
 
-def _events_authorizer_invoke(arn: str, operation: str, channel: str | None, authorization_token: str) -> tuple[bool, dict | None]:
-    """Invoke the configured authorizer Lambda with AppSync-style request/response payloads."""
+def _events_authorizer_invoke(
+    arn: str,
+    api_id: str,
+    operation: str,
+    channel: str | None,
+    namespace: str | None,
+    authorization_token: str,
+    request_headers: dict,
+) -> tuple[bool, dict | None]:
+    """Invoke the configured authorizer Lambda with the AWS-spec event payload.
+
+    Real AWS sends ``{authorizationToken, requestContext{apiId,accountId,
+    requestId,operation,channelNamespaceName,channel}, requestHeaders}`` with
+    operations ``EVENT_CONNECT`` / ``EVENT_SUBSCRIBE`` / ``EVENT_PUBLISH``;
+    for ``EVENT_CONNECT`` the channelNamespaceName and channel are null.
+    """
     if not authorization_token.strip() or not arn:
         return False, None
     payload: dict = {
-        "AuthorizationToken": authorization_token,
-        "Channel": channel,
-        "Operation": operation,
+        "authorizationToken": authorization_token,
+        "requestContext": {
+            "apiId": api_id,
+            "accountId": get_account_id(),
+            "requestId": new_uuid(),
+            "operation": operation,
+            "channelNamespaceName": namespace,
+            "channel": channel,
+        },
+        "requestHeaders": request_headers or {},
     }
     try:
         from ministack.services import lambda_svc
@@ -447,24 +466,38 @@ def _events_authorizer_invoke(arn: str, operation: str, channel: str | None, aut
     return _parse_lambda_authorizer_body(res.get("body"))
 
 
+# AWS operation enum — sent verbatim in the Lambda authorizer ``operation`` field.
+EVENT_CONNECT = "EVENT_CONNECT"
+EVENT_SUBSCRIBE = "EVENT_SUBSCRIBE"
+EVENT_PUBLISH = "EVENT_PUBLISH"
+
+# AWS limit: at most 5 events per publish (HTTP body or WebSocket frame).
+_MAX_EVENTS_PER_BATCH = 5
+
+
 async def _authorize_event_op(
     api_id: str,
     channel: str | None,
     operation: str,
     auth: dict | None,
+    request_headers: dict | None = None,
 ) -> tuple[bool, str | None]:
-    """Authorize an AppSync Events subscribe/publish operation."""
+    """Authorize an AppSync Events subscribe/publish/connect operation."""
     lambda_arn = _find_lambda_authorizer_arn(api_id)
     if lambda_arn:
         token = _bearer_from_auth_dict(auth)
         if not token:
             return False, f"{operation} rejected: no Authorization token"
-        ok, _resolver_context = await asyncio.to_thread(
+        namespace = _channel_namespace_for(channel) if channel else None
+        ok, _ctx = await asyncio.to_thread(
             _events_authorizer_invoke,
             lambda_arn,
+            api_id,
             operation,
             channel,
+            namespace,
             token,
+            request_headers or {},
         )
         if not ok:
             return False, f"{operation} rejected: AppSync authorizer denied"
@@ -588,10 +621,49 @@ def _get_api(api_id):
     return json_response({"api": _api_response(api_id)})
 
 
+def _qp_str(query_params: dict, key: str) -> str | None:
+    v = query_params.get(key)
+    if isinstance(v, list):
+        return v[0] if v else None
+    return v
+
+
+def _qp_int(query_params: dict, key: str, default: int) -> int:
+    v = _qp_str(query_params, key)
+    if v is None or v == "":
+        return default
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return default
+
+
+def _paginate(items: list, query_params: dict) -> tuple[list, str | None]:
+    """Apply AppSync ``maxResults`` + ``nextToken`` pagination over a sorted list.
+
+    Token is the index of the first item to return — opaque to clients but
+    survives a restart since item order is stable (lexical on identifier).
+    """
+    max_results = max(1, min(_qp_int(query_params, "maxResults", 100), 1000))
+    next_token = _qp_str(query_params, "nextToken")
+    start = 0
+    if next_token:
+        try:
+            start = max(0, int(next_token))
+        except ValueError:
+            start = 0
+    page = items[start : start + max_results]
+    new_token = str(start + max_results) if start + max_results < len(items) else None
+    return page, new_token
+
+
 def _list_apis(query_params):
-    max_results = int((query_params.get("maxResults", [100])[0]) if isinstance(query_params.get("maxResults"), list) else query_params.get("maxResults", 100) or 100)
-    page = [_api_response(aid) for aid in sorted(_apis.keys())]
-    return json_response({"apis": page[:max_results]})
+    items = [_api_response(aid) for aid in sorted(_apis.keys())]
+    page, token = _paginate(items, query_params)
+    resp: dict = {"apis": page}
+    if token is not None:
+        resp["nextToken"] = token
+    return json_response(resp)
 
 
 def _update_api(api_id, body):
@@ -666,7 +738,11 @@ def _list_channel_namespaces(api_id, query_params):
         return _not_found(f"Api {api_id} not found")
     namespaces = _channel_namespaces.get(api_id, {})
     items = [_channel_response(api_id, n) for n in sorted(namespaces.keys())]
-    return json_response({"channelNamespaces": items})
+    page, token = _paginate(items, query_params)
+    resp: dict = {"channelNamespaces": page}
+    if token is not None:
+        resp["nextToken"] = token
+    return json_response(resp)
 
 
 def _update_channel_namespace(api_id, name, body):
@@ -710,13 +786,16 @@ def _create_api_key(api_id, body):
     return json_response({"apiKey": _api_key_response(api_id, key_id)})
 
 
-def _list_api_keys(api_id):
+def _list_api_keys(api_id, query_params: dict | None = None):
     if api_id not in _apis:
         return _not_found(f"Api {api_id} not found")
     keys = _api_keys.get(api_id, {})
-    return json_response({
-        "apiKeys": [_api_key_response(api_id, kid) for kid in sorted(keys.keys())],
-    })
+    items = [_api_key_response(api_id, kid) for kid in sorted(keys.keys())]
+    page, token = _paginate(items, query_params or {})
+    resp: dict = {"apiKeys": page}
+    if token is not None:
+        resp["nextToken"] = token
+    return json_response(resp)
 
 
 def _delete_api_key(api_id, key_id):
@@ -746,6 +825,13 @@ async def _publish(api_id: str, headers: dict, body: bytes):
             "Request body must include 'channel' and 'events' (array)",
             400,
         )
+    # AWS spec: max 5 events per publish.
+    if len(events) > _MAX_EVENTS_PER_BATCH:
+        return error_response_json(
+            "BadRequestException",
+            f"events array may contain at most {_MAX_EVENTS_PER_BATCH} entries",
+            400,
+        )
 
     channel_err = _validate_channel(channel, allow_wildcard=False)
     if channel_err:
@@ -759,7 +845,9 @@ async def _publish(api_id: str, headers: dict, body: bytes):
             401,
         )
 
-    ok, message = await _authorize_event_op(api_id, str(channel), "publish", _auth_from_headers(headers))
+    ok, message = await _authorize_event_op(
+        api_id, str(channel), EVENT_PUBLISH, _auth_from_headers(headers), headers
+    )
     if not ok:
         return error_response_json("UnauthorizedException", message or "Unauthorized", 401)
 
@@ -908,9 +996,12 @@ async def handle_websocket(scope, receive, send, api_id: str):
             ok, connect_rctx = await asyncio.to_thread(
                 _events_authorizer_invoke,
                 lambda_auth_arn,
-                "connect",
+                api_id,
+                EVENT_CONNECT,
+                None,
                 None,
                 tok,
+                conn_auth or {},
             )
             if not ok and await _deny_websocket(
                 "connect rejected: AppSync authorizer returned deny or error",
@@ -1051,7 +1142,7 @@ async def _handle_client_frame(api_id: str, connection_id: str, frame: dict, out
             })
             return
         ok, message = await _authorize_event_op(
-            api_id, str(channel), "subscribe", _effective_auth(frame, connection_id),
+            api_id, str(channel), EVENT_SUBSCRIBE, _effective_auth(frame, connection_id),
         )
         if not ok:
             await outbox.put({
@@ -1061,10 +1152,20 @@ async def _handle_client_frame(api_id: str, connection_id: str, frame: dict, out
                             "message": message or "subscribe rejected"}],
             })
             return
+        # AWS spec: subscription IDs must be unique per connection. Duplicate → subscribe_error.
         async with _get_connections_lock():
             conn = _connections.get(connection_id)
-            if conn is not None:
-                conn["subscriptions"][sub_id] = channel
+            if conn is None:
+                return
+            if sub_id in conn["subscriptions"]:
+                await outbox.put({
+                    "type": "subscribe_error",
+                    "id": sub_id,
+                    "errors": [{"errorType": "BadRequestException",
+                                "message": f"Subscription id '{sub_id}' is already in use on this connection"}],
+                })
+                return
+            conn["subscriptions"][sub_id] = channel
         await outbox.put({"type": "subscribe_success", "id": sub_id})
         return
 
@@ -1078,6 +1179,14 @@ async def _handle_client_frame(api_id: str, connection_id: str, frame: dict, out
                 "id": pub_id,
                 "errors": [{"errorType": "BadRequestException",
                             "message": "'id', 'channel' and 'events' (array) are required"}],
+            })
+            return
+        if len(events) > _MAX_EVENTS_PER_BATCH:
+            await outbox.put({
+                "type": "publish_error",
+                "id": pub_id,
+                "errors": [{"errorType": "BadRequestException",
+                            "message": f"events array may contain at most {_MAX_EVENTS_PER_BATCH} entries"}],
             })
             return
         channel_err = _validate_channel(channel, allow_wildcard=False)
@@ -1098,7 +1207,7 @@ async def _handle_client_frame(api_id: str, connection_id: str, frame: dict, out
             })
             return
         ok, message = await _authorize_event_op(
-            api_id, str(channel), "publish", _effective_auth(frame, connection_id),
+            api_id, str(channel), EVENT_PUBLISH, _effective_auth(frame, connection_id),
         )
         if not ok:
             await outbox.put({
@@ -1119,11 +1228,22 @@ async def _handle_client_frame(api_id: str, connection_id: str, frame: dict, out
 
     if ftype == "unsubscribe":
         sub_id = frame.get("id")
+        removed = False
         async with _get_connections_lock():
             conn = _connections.get(connection_id)
-            if conn is not None:
+            if conn is not None and sub_id in conn["subscriptions"]:
                 conn["subscriptions"].pop(sub_id, None)
-        await outbox.put({"type": "unsubscribe_success", "id": sub_id})
+                removed = True
+        if removed:
+            await outbox.put({"type": "unsubscribe_success", "id": sub_id})
+        else:
+            # AWS spec: unknown sub_id → unsubscribe_error with UnknownOperationError.
+            await outbox.put({
+                "type": "unsubscribe_error",
+                "id": sub_id,
+                "errors": [{"errorType": "UnknownOperationError",
+                            "message": f"Unknown operation id {sub_id}"}],
+            })
         return
 
     await outbox.put({

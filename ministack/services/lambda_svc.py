@@ -904,6 +904,8 @@ def _create_function(data: dict):
         config["Version"] = str(ver_num)
 
     _schedule_state_transition(name, _LAMBDA_STATE_TRANSITION_DELAY)
+    runtime_or_image = config.get("Runtime") or ("image=" + image_uri if image_uri else "?")
+    logger.info("Lambda function created: %s (%s)", name, runtime_or_image)
     return json_response(config, 201)
 
 

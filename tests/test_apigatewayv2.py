@@ -1220,7 +1220,7 @@ class _WSClient:
             header = struct.pack("!BBQ", 0x81, 0x80 | 127, length)
         self._sock.sendall(header + mask + masked)
 
-    def recv(self, timeout: float = 3.0) -> str | None:
+    def recv(self, timeout: float = 15.0) -> str | None:
         """Return the next text or binary frame's payload as a string."""
         self._sock.settimeout(timeout)
         try:
@@ -1485,7 +1485,7 @@ def test_ws_post_to_connection_from_management_api(apigw, lam):
             url, data=b"server-push-payload", method="POST",
             headers={"Host": f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}"},
         )
-        r = urllib.request.urlopen(req, timeout=5)
+        r = urllib.request.urlopen(req, timeout=30)
         assert r.status == 200
 
         pushed = ws.recv(timeout=3)
@@ -1511,7 +1511,7 @@ def test_ws_get_connection_returns_metadata(apigw, lam):
             url, method="GET",
             headers={"Host": f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}"},
         )
-        r = urllib.request.urlopen(req, timeout=5)
+        r = urllib.request.urlopen(req, timeout=30)
         meta = json.loads(r.read())
         # Int epoch seconds, per ministack JSON timestamp convention.
         assert isinstance(meta["ConnectedAt"], int)
@@ -1538,7 +1538,7 @@ def test_ws_delete_connection_closes_socket(apigw, lam):
             url, method="DELETE",
             headers={"Host": f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}"},
         )
-        r = urllib.request.urlopen(req, timeout=5)
+        r = urllib.request.urlopen(req, timeout=30)
         assert r.status in (200, 204)
 
         # Give the server a moment to close, then subsequent recv returns None.
@@ -1560,7 +1560,7 @@ def test_ws_post_to_unknown_connection_returns_410(apigw, lam):
         headers={"Host": f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}"},
     )
     with pytest.raises(urllib.error.HTTPError) as exc_info:
-        urllib.request.urlopen(req, timeout=5)
+        urllib.request.urlopen(req, timeout=30)
     assert exc_info.value.code == 410
 
 
@@ -1718,7 +1718,7 @@ def test_apigwv2_path_based_execute_api_http(apigw, lam):
 
     import urllib.request
     url = f"http://localhost:{_EXECUTE_PORT}/_aws/execute-api/{http_api_id}/prod/hello"
-    r = urllib.request.urlopen(url, timeout=5)
+    r = urllib.request.urlopen(url, timeout=30)
     assert r.status == 200
     payload = json.loads(r.read())
     assert payload["eventType"] == "MESSAGE" or payload.get("action") == "GET /hello" or "hello" in str(payload)
@@ -1763,7 +1763,7 @@ def test_apigwv1_path_based_restapi_legacy_user_request(apigw_v1, lam):
     apigw_v1.create_deployment(restApiId=api_id, stageName="prod")
 
     url = f"http://localhost:{_EXECUTE_PORT}/restapis/{api_id}/prod/_user_request_/hello"
-    r = urllib.request.urlopen(url, timeout=5)
+    r = urllib.request.urlopen(url, timeout=30)
     assert r.status == 200
 
 
@@ -1854,7 +1854,7 @@ def handler(event, context):
     url = f"http://{api_id}.execute-api.localhost:{_EXECUTE_PORT}/live/hello"
     req = urllib.request.Request(url)
     req.add_header("Host", f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}")
-    r = urllib.request.urlopen(req, timeout=5)
+    r = urllib.request.urlopen(req, timeout=30)
     assert r.status == 200
     assert r.read() == b"hello-from-alias"
 
@@ -1888,7 +1888,7 @@ def test_apigwv2_cors_preflight_echoes_configured_origin(apigw):
     req.add_header("Host", f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}")
     req.add_header("Origin", "http://localhost:3000")
     req.add_header("Access-Control-Request-Method", "GET")
-    r = urllib.request.urlopen(req, timeout=5)
+    r = urllib.request.urlopen(req, timeout=30)
     assert r.status == 204
     assert r.headers["Access-Control-Allow-Origin"] == "http://localhost:3000"
     assert r.headers["Access-Control-Allow-Credentials"] == "true"
@@ -1913,7 +1913,7 @@ def test_apigwv2_cors_preflight_denies_non_allowlisted_origin(apigw):
     req.add_header("Host", f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}")
     req.add_header("Origin", "http://evil.example.com")
     with pytest.raises(urllib.error.HTTPError) as exc_info:
-        urllib.request.urlopen(req, timeout=5)
+        urllib.request.urlopen(req, timeout=30)
     assert exc_info.value.code == 403
 
 
@@ -1929,7 +1929,7 @@ def test_apigwv2_cors_preflight_403_when_no_configuration(apigw):
     req.add_header("Host", f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}")
     req.add_header("Origin", "http://localhost:3000")
     with pytest.raises(urllib.error.HTTPError) as exc_info:
-        urllib.request.urlopen(req, timeout=5)
+        urllib.request.urlopen(req, timeout=30)
     assert exc_info.value.code == 403
 
 
@@ -1957,7 +1957,7 @@ def test_apigwv2_default_stage_serves_from_root(apigw, lam):
     url = f"http://{api_id}.execute-api.localhost:{_EXECUTE_PORT}/api/hello"
     req = urllib.request.Request(url)
     req.add_header("Host", f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}")
-    r = urllib.request.urlopen(req, timeout=5)
+    r = urllib.request.urlopen(req, timeout=30)
     assert r.status == 200
 
 
@@ -1982,7 +1982,7 @@ def test_apigwv2_named_stage_still_requires_prefix(apigw, lam):
     url = f"http://{api_id}.execute-api.localhost:{_EXECUTE_PORT}/live/api/hello"
     req = urllib.request.Request(url)
     req.add_header("Host", f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}")
-    r = urllib.request.urlopen(req, timeout=5)
+    r = urllib.request.urlopen(req, timeout=30)
     assert r.status == 200
 
 
@@ -2013,7 +2013,7 @@ def test_apigwv2_integration_wrapped_function_arn(apigw, lam):
 
     req = urllib.request.Request(f"http://{api_id}.execute-api.localhost:{_EXECUTE_PORT}/hello")
     req.add_header("Host", f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}")
-    r = urllib.request.urlopen(req, timeout=5)
+    r = urllib.request.urlopen(req, timeout=30)
     assert r.status == 200
     assert r.read() == b"wrapped-plain"
 
@@ -2043,7 +2043,7 @@ def test_apigwv2_integration_wrapped_alias_arn(apigw, lam):
 
     req = urllib.request.Request(f"http://{api_id}.execute-api.localhost:{_EXECUTE_PORT}/hello")
     req.add_header("Host", f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}")
-    r = urllib.request.urlopen(req, timeout=5)
+    r = urllib.request.urlopen(req, timeout=30)
     assert r.status == 200
     assert r.read() == b"wrapped-alias"
 

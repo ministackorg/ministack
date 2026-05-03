@@ -230,6 +230,7 @@ def _act_create_queue(data: dict, _u: str) -> dict:
 
     _queues[url] = q
     _queue_name_to_url[name] = url
+    logger.info("SQS queue created: %s%s", name, " (FIFO)" if is_fifo else "")
     return {"QueueUrl": url}
 
 

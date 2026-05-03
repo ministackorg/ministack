@@ -658,6 +658,7 @@ def _create_bucket(name: str, body: bytes, headers: dict = None):
 
     if S3_PERSIST:
         os.makedirs(os.path.join(DATA_DIR, name), exist_ok=True)
+    logger.info("S3 bucket created: %s%s", name, f" (region={region})" if region else "")
     return 200, {"Location": f"/{name}"}, b""
 
 

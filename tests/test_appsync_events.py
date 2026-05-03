@@ -10,6 +10,7 @@ Covers:
   - WebSocket publish frame (``publish_success`` + fan-out to peers).
   - Server-pushed ``ka`` keep-alive frames.
   - Channel path regex validation (1..5 segments, alphanumeric + dash).
+  - DNS defaults for {apiId}.appsync-(api|realtime-api) hosts.
 
 Uses a stdlib WebSocket client (no new runtime deps).
 """
@@ -786,9 +787,12 @@ def test_publish_rejects_segment_with_bad_chars(api):
 
 
 def test_subscribe_rejects_invalid_channel_path(api):
+    # Underscores are rejected by the AWS channel-segment grammar
+    # (alphanumerics + dash only). Leading slash is OPTIONAL per AWS spec,
+    # so "default/foo" without one is valid; pick an actually-bad channel.
     ws = _open_subscriber(api)
     try:
-        ws.send_json({"type": "subscribe", "id": "sub-bad", "channel": "default/no-leading-slash"})
+        ws.send_json({"type": "subscribe", "id": "sub-bad", "channel": "/default/bad_seg"})
         err = _drain_until(ws, lambda f: f.get("type") == "subscribe_error", timeout=2.0)
         assert err is not None
         assert err["id"] == "sub-bad"
@@ -883,8 +887,8 @@ def test_http_publish_invokes_lambda_authorizer(monkeypatch):
 
     calls = []
 
-    def _fake_invoke(arn, operation, channel, authorization_token):
-        calls.append((arn, operation, channel, authorization_token))
+    def _fake_invoke(arn, api_id_arg, operation, channel, namespace, authorization_token, request_headers):
+        calls.append((arn, api_id_arg, operation, channel, namespace, authorization_token))
         return authorization_token == "allow", {"tenant": "local"}
 
     monkeypatch.setattr(ae, "_events_authorizer_invoke", _fake_invoke)
@@ -895,9 +899,72 @@ def test_http_publish_invokes_lambda_authorizer(monkeypatch):
 
     allowed = asyncio.run(ae._publish(api_id, {"authorization": "allow"}, publish_body))
     assert allowed[0] == 200
+    # AWS Lambda authorizer payload uses EVENT_PUBLISH (per the AppSync Events spec).
     assert calls[-1] == (
         "arn:aws:lambda:us-east-1:000000000000:function:authz",
-        "publish",
+        api_id,
+        ae.EVENT_PUBLISH,
         "/default/room",
+        "default",
         "allow",
     )
+
+
+
+# ---------------------------------------------------------------------------
+# DNS defaults — unit tests for the {api_id}.appsync-(api|realtime-api) hosts
+# ---------------------------------------------------------------------------
+from ministack.core.responses import set_request_region
+
+
+def test_default_dns_localhost_with_region(monkeypatch):
+    monkeypatch.delenv("APPSYNC_EVENTS_HTTP_HOST_TEMPLATE", raising=False)
+    monkeypatch.delenv("APPSYNC_EVENTS_REALTIME_HOST_TEMPLATE", raising=False)
+    monkeypatch.setenv("MINISTACK_HOST", "localhost")
+    monkeypatch.setenv("GATEWAY_PORT", "4566")
+    set_request_region("us-east-1")
+
+    from ministack.services.appsync_events import _default_dns_for_api
+
+    d = _default_dns_for_api("abc123")
+    assert d["HTTP"] == "abc123.appsync-api.us-east-1.localhost:4566"
+    assert d["REALTIME"] == "abc123.appsync-realtime-api.us-east-1.localhost:4566"
+
+
+def test_dns_templates_override_when_both_set(monkeypatch):
+    monkeypatch.setenv(
+        "APPSYNC_EVENTS_HTTP_HOST_TEMPLATE",
+        "{api_id}.appsync-api.custom:{port}",
+    )
+    monkeypatch.setenv(
+        "APPSYNC_EVENTS_REALTIME_HOST_TEMPLATE",
+        "{api_id}.appsync-realtime-api.custom:{port}",
+    )
+    monkeypatch.setenv("GATEWAY_PORT", "8080")
+    set_request_region("eu-west-2")
+
+    from ministack.services.appsync_events import _default_dns_for_api
+
+    d = _default_dns_for_api("x")
+    assert d["HTTP"] == "x.appsync-api.custom:8080"
+    assert d["REALTIME"] == "x.appsync-realtime-api.custom:8080"
+
+
+def test_appsync_events_service_hosts_are_not_s3_virtual_hosts():
+    from ministack.app import _handle_s3_vhost_request
+
+    for host in (
+        "appsync-api.eu-west-2.localhost:4566",
+        "appsync-realtime-api.eu-west-2.localhost:4566",
+    ):
+        result = asyncio.run(
+            _handle_s3_vhost_request(
+                host,
+                "/v2/apis",
+                "GET",
+                {"host": host},
+                b"",
+                {},
+            )
+        )
+        assert result is None

@@ -217,6 +217,7 @@ def _create_topic(params):
             i += 1
 
         _topics[arn] = topic
+        logger.info("SNS topic created: %s%s", name, " (FIFO)" if is_fifo else "")
 
     return _xml(200, "CreateTopicResponse",
                 f"<CreateTopicResult><TopicArn>{arn}</TopicArn></CreateTopicResult>")

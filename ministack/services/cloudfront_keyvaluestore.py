@@ -8,10 +8,12 @@ Supports:
   DescribeKeyValueStore, ListKeys, GetKey, PutKey, DeleteKey, UpdateKeys
 """
 
+import base64
 import copy
 import json
 import logging
 import re
+from datetime import datetime
 from urllib.parse import unquote
 
 from ministack.core.persistence import load_state
@@ -20,9 +22,9 @@ from ministack.core.responses import AccountScopedDict, json_response, new_uuid
 logger = logging.getLogger("cloudfront-keyvaluestore")
 
 # ---------------------------------------------------------------------------
-# Path regexes — ARN contains a slash (e.g. arn:aws:cloudfront::123:key-value-store/name)
-# The store name portion ([a-zA-Z0-9-_]+) never contains a slash, so we anchor
-# the /keys boundary against the name segment to avoid ambiguity.
+# Path regexes — ARN contains a slash (e.g. arn:aws:cloudfront::123:key-value-store/name).
+# The store-name segment ([a-zA-Z0-9_-]+) never contains a slash, so the
+# /keys boundary anchors unambiguously against the trailing name segment.
 # ---------------------------------------------------------------------------
 _KEY_RE = re.compile(r"^/key-value-stores/(arn:.+?/[a-zA-Z0-9_-]+)/keys/(.+)$")
 _KEYS_RE = re.compile(r"^/key-value-stores/(arn:.+?/[a-zA-Z0-9_-]+)/keys/?$")
@@ -147,19 +149,31 @@ def _describe_store(arn: str):
             break
 
     items = store["items"]
+    epoch = 0
+    if kvs_meta and kvs_meta.get("LastModifiedTime"):
+        try:
+            epoch = int(datetime.fromisoformat(kvs_meta["LastModifiedTime"].replace("Z", "+00:00")).timestamp())
+        except (ValueError, AttributeError):
+            epoch = 0
     resp = {
         "KvsARN": arn,
         "ItemCount": len(items),
         "TotalSizeInBytes": _compute_size(items),
         "Status": "READY",
-        "Created": 0,
-        "LastModified": 0,
+        "Created": epoch,
+        "LastModified": epoch,
     }
-    if kvs_meta and kvs_meta.get("LastModifiedTime"):
-        resp["Created"] = 0
-        resp["LastModified"] = 0
-
     return 200, {"Content-Type": "application/json", "ETag": store["etag"]}, json.dumps(resp).encode()
+
+
+_LIST_KEYS_MAX = 50  # AWS spec cap.
+
+
+def _qp_first(query_params, key):
+    v = query_params.get(key)
+    if isinstance(v, list):
+        return v[0] if v else None
+    return v
 
 
 def _list_keys(arn: str, query_params):
@@ -167,28 +181,37 @@ def _list_keys(arn: str, query_params):
     if store is None:
         return _error("ResourceNotFoundException", f"Key value store {arn} was not found.", 404)
 
-    max_results = (
-        int((query_params.get("MaxResults") or [None])[0] or "10")
-        if isinstance(query_params.get("MaxResults"), list)
-        else int(query_params.get("MaxResults", "10") or "10")
-    )
-    next_token = None
-    if isinstance(query_params.get("NextToken"), list):
-        next_token = query_params["NextToken"][0] if query_params["NextToken"] else None
-    elif isinstance(query_params.get("NextToken"), str):
-        next_token = query_params["NextToken"] or None
+    raw_max = _qp_first(query_params, "MaxResults")
+    try:
+        max_results = int(raw_max) if raw_max not in (None, "") else 10
+    except (TypeError, ValueError):
+        max_results = 10
+    max_results = max(1, min(max_results, _LIST_KEYS_MAX))  # AWS spec: cap at 50.
 
+    next_token = _qp_first(query_params, "NextToken") or None
     all_keys = sorted(store["items"].keys())
     start_idx = 0
-    if next_token and next_token in all_keys:
-        start_idx = all_keys.index(next_token)
+    if next_token:
+        try:
+            cursor = base64.urlsafe_b64decode(next_token + "=" * (-len(next_token) % 4)).decode("utf-8")
+        except (ValueError, UnicodeDecodeError):
+            return _error("ValidationException", "NextToken is not valid.", 400)
+        # Resume after the cursor key (exclusive) so successive pages don't
+        # re-emit the boundary key.
+        for i, k in enumerate(all_keys):
+            if k > cursor:
+                start_idx = i
+                break
+        else:
+            start_idx = len(all_keys)
 
     page = all_keys[start_idx : start_idx + max_results]
     items = [{"Key": k, "Value": store["items"][k]} for k in page]
 
     resp = {"Items": items}
     if start_idx + max_results < len(all_keys):
-        resp["NextToken"] = all_keys[start_idx + max_results]
+        last = page[-1]
+        resp["NextToken"] = base64.urlsafe_b64encode(last.encode("utf-8")).decode("ascii").rstrip("=")
 
     return json_response(resp)
 
@@ -252,7 +275,11 @@ def _delete_key(arn: str, key: str, headers):
     if if_match != store["etag"]:
         return _error("ConflictException", "The provided If-Match value does not match the current ETag.", 409)
 
-    store["items"].pop(key, None)
+    # AWS spec: deleting a non-existent key returns ResourceNotFoundException, not 200.
+    if key not in store["items"]:
+        return _error("ResourceNotFoundException", f"Key {key} was not found.", 404)
+
+    del store["items"][key]
     store["etag"] = new_uuid()
 
     resp = {
@@ -278,20 +305,38 @@ def _update_keys(arn: str, headers, body):
     except (json.JSONDecodeError, TypeError):
         return _error("ValidationException", "Invalid JSON body.", 400)
 
-    puts = data.get("Puts", [])
-    deletes = data.get("Deletes", [])
+    puts = data.get("Puts", []) or []
+    deletes = data.get("Deletes", []) or []
+    if not isinstance(puts, list) or not isinstance(deletes, list):
+        return _error("ValidationException", "Puts and Deletes must be arrays.", 400)
 
-    for item in puts:
+    # AWS UpdateKeys is atomic: validate every entry first, then commit. A
+    # single bad item rejects the whole batch so the store never sees a
+    # partial write.
+    validated_puts: list[tuple[str, str]] = []
+    for i, item in enumerate(puts):
+        if not isinstance(item, dict):
+            return _error("ValidationException", f"Puts[{i}] must be an object.", 400)
         k = item.get("Key")
         v = item.get("Value")
-        if k is not None and v is not None:
-            store["items"][k] = v
-
-    for item in deletes:
+        if not isinstance(k, str) or not k:
+            return _error("ValidationException", f"Puts[{i}].Key must be a non-empty string.", 400)
+        if not isinstance(v, str):
+            return _error("ValidationException", f"Puts[{i}].Value must be a string.", 400)
+        validated_puts.append((k, v))
+    validated_deletes: list[str] = []
+    for i, item in enumerate(deletes):
+        if not isinstance(item, dict):
+            return _error("ValidationException", f"Deletes[{i}] must be an object.", 400)
         k = item.get("Key")
-        if k is not None:
-            store["items"].pop(k, None)
+        if not isinstance(k, str) or not k:
+            return _error("ValidationException", f"Deletes[{i}].Key must be a non-empty string.", 400)
+        validated_deletes.append(k)
 
+    for k, v in validated_puts:
+        store["items"][k] = v
+    for k in validated_deletes:
+        store["items"].pop(k, None)
     store["etag"] = new_uuid()
 
     resp = {

@@ -97,6 +97,7 @@ _NON_S3_VHOST_NAMES = frozenset({
     "secretsmanager", "logs", "ssm", "events", "kinesis", "monitoring", "ses",
     "states", "ecs", "rds", "rds-data", "elasticache", "glue", "athena",
     "apigateway", "cloudformation", "autoscaling", "codebuild", "transfer",
+    "cloudfront-kvs",
     "appsync-api", "appsync-realtime-api",
 })
 
@@ -280,6 +281,7 @@ _state_map = {
     "appconfig": "appconfig", "transfer": "transfer",
     "scheduler": "scheduler", "autoscaling": "autoscaling",
     "eks": "eks", "backup": "backup", "pipes": "pipes",
+    "cloudfront_keyvaluestore": "cloudfront_keyvaluestore",
 }
 
 SERVICE_NAME_ALIASES = {
@@ -1029,6 +1031,10 @@ async def _handle_s3_vhost_request(host: str, path: str, method: str, headers: d
     bucket = _extract_s3_vhost_bucket(host)
     if not bucket or _S3_VHOST_EXCLUDE_RE.search(host) or bucket in _NON_S3_VHOST_NAMES:
         return None
+    # CloudFront KVS data-plane clients (boto3 cloudfront-keyvaluestore with
+    # inject_host_prefix=False) hit ministack with host=localhost and path
+    # prefixed by /key-value-stores/. Host-name exclusion above doesn't fire,
+    # so guard explicitly here too.
     if path.startswith("/key-value-stores/"):
         return None
 
@@ -1298,10 +1304,21 @@ async def _handle_lifespan(scope, receive, send):
                 await transfer.sftp_start()
             except Exception as e:
                 logger.warning("Transfer SFTP startup failed: %s", e)
+            # Start the EventBridge scheduler daemon explicitly. Module-import
+            # autostart is gated by MINISTACK_TEST_NO_AUTOSTART so unit tests
+            # don't race; lifespan.startup is the canonical place to spin it up.
+            try:
+                from ministack.services import eventbridge as _eb_mod
+                _eb_mod.start_scheduler()
+            except Exception as e:
+                logger.warning("EventBridge scheduler startup failed: %s", e)
             await send({"type": "lifespan.startup.complete"})
-            logger.info("Ready.")
+            logger.info("Ready — %d services available on port %s.", len(SERVICE_HANDLERS), port)
+            # Per-service "init completed" lines are logged at DEBUG only — at
+            # INFO they bury the operational signal (CreateBucket, etc.) under
+            # a wall of one line per service.
             for svc in SERVICE_HANDLERS:
-                logger.info("%s init completed.", svc.capitalize())
+                logger.debug("%s init completed.", svc.capitalize())
             asyncio.create_task(_run_ready_scripts())
         elif message["type"] == "lifespan.shutdown":
             logger.info("MiniStack shutting down...")
