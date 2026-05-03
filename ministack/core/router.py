@@ -308,6 +308,11 @@ SERVICE_PATTERNS = {
         "path_prefixes": ["/backup-vaults", "/backup/plans", "/backup-jobs", "/untag"],
         "credential_scope": "backup",
     },
+    "cloudtrail": {
+        "target_prefixes": ["com.amazonaws.cloudtrail.v20131101.AmazonCloudTrailService"],
+        "host_patterns": [r"cloudtrail\."],
+        "credential_scope": "cloudtrail",
+    },
 }
 
 
@@ -385,6 +390,7 @@ def detect_service(method: str, path: str, headers: dict, query_params: dict) ->
                 "scheduler": "scheduler",
                 "eks": "eks",
                 "tagging": "tagging",
+                "cloudtrail": "cloudtrail",
             }
             if svc_name in scope_map:
                 return scope_map[svc_name]
