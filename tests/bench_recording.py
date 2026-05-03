@@ -149,7 +149,7 @@ def _run_all(label, n, endpoint):
 def _delta_row(scenario, off, on):
     delta = (on - off) / off * 100
     sign = "+" if delta > 0 else ""
-    flag = "  ⚠️  >2%" if abs(delta) > 2 else ""
+    flag = "  ⚠️  overhead >2%" if delta < -2 else ""
     print(f"  {scenario:<12}  off={off:>7.0f}  on={on:>7.0f}  delta={sign}{delta:.1f}%{flag}")
 
 
