@@ -1,9 +1,15 @@
 """
 Amazon S3 Files Service Emulator (s3files-2025-05-05).
+REST/JSON API. Routes, payloads, and response shapes match the AWS spec.
 
-REST/JSON API. Routes, payloads, and response shapes match the AWS API
-Reference: file systems, mount targets, access points, file-system policy,
-synchronization configuration, and resource tagging.
+Supports:
+  File Systems:    CreateFileSystem, GetFileSystem, ListFileSystems, DeleteFileSystem
+  Mount Targets:   CreateMountTarget, GetMountTarget, ListMountTargets,
+                   DeleteMountTarget, UpdateMountTarget
+  Access Points:   CreateAccessPoint, GetAccessPoint, ListAccessPoints, DeleteAccessPoint
+  Policies:        GetFileSystemPolicy, PutFileSystemPolicy, DeleteFileSystemPolicy
+  Sync:            GetSynchronizationConfiguration, PutSynchronizationConfiguration
+  Tags:            TagResource, UntagResource, ListTagsForResource
 """
 
 import base64
