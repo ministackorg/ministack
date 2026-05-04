@@ -120,6 +120,54 @@ def test_ecs_run_task_network_connectivity(ecs):
             break
     assert success, "Task should transition to STOPPED"
 
+def test_ecs_run_task_metadata_v4(ecs):
+    """Container can resolve and read its V4 task-metadata URI end-to-end.
+
+    Proves the full wiring: env-var injection in _run_task, the
+    host.docker.internal/host-gateway extra_hosts mapping, the gateway
+    routing /v4/<token>/task to ecs_metadata.handle_request, and the task
+    payload containing the Containers array.
+    """
+    ecs.create_cluster(clusterName="metadata-test")
+    ecs.register_task_definition(
+        family="metadata-probe",
+        containerDefinitions=[
+            {
+                "name": "probe",
+                "image": "alpine:latest",
+                # wget -O /tmp/r exits 0 only if the URI is reachable and
+                # returns 200; grep then proves the body is the V4 task
+                # shape (with a Containers array) rather than something
+                # else returning 200.
+                "command": [
+                    "sh", "-c",
+                    'wget -q -O /tmp/r "$ECS_CONTAINER_METADATA_URI_V4/task" '
+                    '&& grep -q \'"Containers"\' /tmp/r',
+                ],
+                "essential": True,
+            }
+        ],
+    )
+    resp = ecs.run_task(cluster="metadata-test", taskDefinition="metadata-probe")
+    task_arn = resp["tasks"][0]["taskArn"]
+    assert resp["tasks"][0]["lastStatus"] == "RUNNING"
+
+    success = False
+    for _ in range(30):
+        time.sleep(2)
+        desc = ecs.describe_tasks(cluster="metadata-test", tasks=[task_arn])
+        task = desc["tasks"][0]
+        if task["lastStatus"] == "STOPPED":
+            exit_code = task["containers"][0].get("exitCode")
+            assert exit_code == 0, (
+                f"Container could not read ECS_CONTAINER_METADATA_URI_V4/task "
+                f"(exit code {exit_code}) — env-var injection, host-gateway "
+                "mapping, or the /v4/<token> route may be broken"
+            )
+            success = True
+            break
+    assert success, "Task should transition to STOPPED"
+
 def test_ecs_service(ecs):
     ecs.create_service(
         cluster="test-cluster",

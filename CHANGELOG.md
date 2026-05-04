@@ -7,15 +7,19 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [Unreleased]
+
+### Added
+
+- **ECS Task Metadata V4 emulator** — every container started by `RunTask` now receives `ECS_CONTAINER_METADATA_URI_V4=http://<ministack>:<gateway>/v4/<token>`, and the gateway responds on `/v4/<token>` (current container), `/v4/<token>/task` (task with sibling `Containers` array), and `/v4/<token>/stats` / `/task/stats` (empty stub). Tokens are per-container `secrets.token_urlsafe(32)` values; the registry is volatile by design (stripped on persistence, cleared by `/_ministack/reset`). The metadata host is Ministack's own IP on the shared user-defined Docker network (the only address that's reliably reachable on Linux Docker — `host-gateway` resolves to `docker0` which sibling bridges typically can't route to); when Ministack runs outside Docker the URI falls back to `host.docker.internal` mapped through `extra_hosts: host-gateway` for Docker-Desktop compatibility, and `networkMode: host` containers use loopback. Container labels follow the standard `com.amazonaws.ecs.*` keys (`task-arn`, `container-name`, `task-definition-family`, `task-definition-version`, `cluster`). `RunTask` also now translates more of the task-def: `privileged`, `linuxParameters.capabilities.add`, `pidMode: host`, and `volumes` + `mountPoints` (list-of-binds so two ECS volumes sharing a host path don't collide).
+
+---
+
 ## [1.3.27] — 2026-05-04
 
 ### Added
 - **AWS CloudTrail** — in-memory audit log + control plane. Recording opt-in via `CLOUDTRAIL_RECORDING=1`; per-account ring buffer (`CLOUDTRAIL_MAX_EVENTS=10000`). `LookupEvents` supports all 8 AWS `LookupAttributes`. Control plane: `CreateTrail`, `DeleteTrail`, `GetTrail`, `DescribeTrails`, `ListTrails`, `UpdateTrail`, `GetTrailStatus`, `StartLogging` / `StopLogging` with real `IsLogging` state, `Put`/`GetEventSelectors`, `AddTags` / `ListTags` / `RemoveTags`. Contributed by @AdigaAkhil.
 - **AWS Resource Groups (`resource-groups`, 2017-11-27)** — 19 of 23 spec operations: group CRUD, resource queries, configuration, membership, tagging, account settings. Tag-sync ops omitted (not exposed by AWS CLI / Terraform). Requested by @staranto.
-
-### Added
-
-- **ECS Task Metadata V4 emulator** — every container started by `RunTask` now receives `ECS_CONTAINER_METADATA_URI_V4=http://host.docker.internal:<gateway>/v4/<token>`, and the gateway responds on `/v4/<token>` (current container), `/v4/<token>/task` (task with sibling `Containers` array), and `/v4/<token>/stats` / `/task/stats` (empty stub). Tokens are per-container `secrets.token_urlsafe(32)` values; the registry is volatile by design (stripped on persistence, cleared by `/_ministack/reset`). Containers are reached via `host.docker.internal` mapped through `extra_hosts: host-gateway`, so the URI works from user-defined Docker networks (not just the default bridge); `networkMode: host` containers reach the gateway via loopback. Container labels follow the standard `com.amazonaws.ecs.*` keys (`task-arn`, `container-name`, `task-definition-family`, `task-definition-version`, `cluster`). `RunTask` also now translates more of the task-def: `privileged`, `linuxParameters.capabilities.add`, `pidMode: host`, and `volumes` + `mountPoints` (list-of-binds so two ECS volumes sharing a host path don't collide).
 
 ### Fixed
 - **API Gateway v1 `GetUsagePlanKey`** — `GET /usageplans/{planId}/keys/{keyId}` handler was missing; per-key path fell through to 404. Terraform's `GetUsagePlanKey` refresh after `CreateUsagePlanKey` aborted every `aws_api_gateway_usage_plan_key` apply. Contributed by @marcin-nowak-scl.
