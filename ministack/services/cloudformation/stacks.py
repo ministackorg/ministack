@@ -18,7 +18,7 @@ from .engine import (
     _resolve_refs,
     _topological_sort,
 )
-from .provisioners import REGION, _delete_resource, _provision_resource
+from .provisioners import REGION, _delete_resource, _provision_resource, _update_resource
 
 logger = logging.getLogger("cloudformation")
 
@@ -114,9 +114,23 @@ async def _deploy_stack_async(stack_name: str, stack_id: str, template: dict,
             _add_event(stack_id, stack_name, logical_id, resource_type,
                        f"{status_prefix}_IN_PROGRESS")
 
-            physical_id, attrs = _provision_resource(
-                resource_type, logical_id, resolved_props, stack_name
+            # On stack update, route previously-provisioned resources through
+            # the type's update handler when one exists; otherwise fall back
+            # to (idempotent) create. New resources go straight to create.
+            prev_resource = (
+                previous_stack.get("_resources", {}).get(logical_id)
+                if is_update and previous_stack else None
             )
+            if prev_resource:
+                old_pid = prev_resource.get("PhysicalResourceId", logical_id)
+                old_props = prev_resource.get("Properties", {})
+                physical_id, attrs = _update_resource(
+                    resource_type, old_pid, old_props, resolved_props, stack_name
+                )
+            else:
+                physical_id, attrs = _provision_resource(
+                    resource_type, logical_id, resolved_props, stack_name
+                )
         except Exception as exc:
             logger.error("Failed to provision %s (%s): %s",
                          logical_id, resource_type, exc)

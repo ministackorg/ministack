@@ -829,3 +829,31 @@ def test_kvs_delete_in_use(cloudfront):
         cloudfront.delete_key_value_store(Name=kvs_name, IfMatch=kvs_etag)
     assert exc.value.response["Error"]["Code"] == "CannotDeleteEntityWhileInUse"
     assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 409
+
+
+def test_kvs_create_with_import_source(cloudfront):
+    """ImportSource (create-only optional input, AWS spec requires SourceType +
+    SourceARN) is accepted and round-tripped. Ministack records it but does not
+    actually fetch from S3 — same stance as other side-effect creates."""
+    name = f"kvs-imp-{_uuid_mod.uuid4().hex[:8]}"
+    bucket_arn = "arn:aws:s3:::seed-bucket/initial.json"
+    resp = cloudfront.create_key_value_store(
+        Name=name,
+        Comment="seeded from S3",
+        ImportSource={"SourceType": "S3", "SourceARN": bucket_arn},
+    )
+    assert resp["KeyValueStore"]["Name"] == name
+    assert resp["KeyValueStore"]["Status"] == "READY"
+
+
+def test_kvs_create_with_import_source_missing_field_rejected(cloudfront):
+    """ImportSource requires both SourceType and SourceARN per AWS spec; either
+    missing is InvalidArgument."""
+    name = f"kvs-impbad-{_uuid_mod.uuid4().hex[:8]}"
+    with pytest.raises(ClientError) as exc:
+        cloudfront.create_key_value_store(
+            Name=name,
+            Comment="bad import",
+            ImportSource={"SourceType": "S3", "SourceARN": ""},
+        )
+    assert exc.value.response["Error"]["Code"] == "InvalidArgument"

@@ -1245,6 +1245,19 @@ def _create_kvs(headers, body):
     now = _now_iso()
     arn = _kvs_arn(name)
 
+    # Optional ImportSource (create-only) — AWS spec: structure with required
+    # SourceType + SourceARN. We accept and round-trip the values; data import
+    # itself is not performed (no S3 fetch). Recorded so callers that
+    # describe the store can see what was requested.
+    import_source = None
+    imp_el = _find(el, "ImportSource")
+    if imp_el is not None:
+        src_type = _text(imp_el, "SourceType") or ""
+        src_arn = _text(imp_el, "SourceARN") or ""
+        if not src_type or not src_arn:
+            return _error("InvalidArgument", "ImportSource requires SourceType and SourceARN.", 400)
+        import_source = {"SourceType": src_type, "SourceARN": src_arn}
+
     kvs = {
         "Id": kvs_id,
         "Name": name,
@@ -1253,6 +1266,7 @@ def _create_kvs(headers, body):
         "Status": "READY",
         "LastModifiedTime": now,
         "ETag": etag,
+        "ImportSource": import_source,
     }
     _kvstores[name] = kvs
 
