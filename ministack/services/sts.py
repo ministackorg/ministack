@@ -88,7 +88,7 @@ async def handle_request(method, path, headers, body, query_params):
         _sessions[access_key] = {"Arn": assumed_arn, "UserId": f"{role_id}:{session_name}"}
         if use_json:
             return json_response({
-                "Credentials": {"AccessKeyId": access_key, "SecretAccessKey": secret_key, "SessionToken": session_token, "Expiration": time.time() + duration},
+                "Credentials": {"AccessKeyId": access_key, "SecretAccessKey": secret_key, "SessionToken": session_token, "Expiration": int(time.time() + duration)},
                 "AssumedRoleUser": {"AssumedRoleId": f"{role_id}:{session_name}", "Arn": assumed_arn},
                 "PackedPolicySize": 0,
             })
@@ -123,7 +123,7 @@ async def handle_request(method, path, headers, body, query_params):
         provider = _p(params, "ProviderId") or "sts.amazonaws.com"
         if use_json:
             return json_response({
-                "Credentials": {"AccessKeyId": access_key, "SecretAccessKey": secret_key, "SessionToken": session_token, "Expiration": time.time() + duration},
+                "Credentials": {"AccessKeyId": access_key, "SecretAccessKey": secret_key, "SessionToken": session_token, "Expiration": int(time.time() + duration)},
                 "AssumedRoleUser": {"AssumedRoleId": f"{role_id}:{session}", "Arn": assumed_arn},
                 "SubjectFromWebIdentityToken": "test-subject",
                 "Audience": "sts.amazonaws.com",
@@ -155,7 +155,7 @@ async def handle_request(method, path, headers, body, query_params):
         session_token = _gen_session_token()
         if use_json:
             return json_response({
-                "Credentials": {"AccessKeyId": access_key, "SecretAccessKey": secret_key, "SessionToken": session_token, "Expiration": time.time() + duration},
+                "Credentials": {"AccessKeyId": access_key, "SecretAccessKey": secret_key, "SessionToken": session_token, "Expiration": int(time.time() + duration)},
             })
         return _xml(200, "GetSessionTokenResponse",
                     f"<GetSessionTokenResult>"

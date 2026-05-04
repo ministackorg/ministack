@@ -126,7 +126,7 @@ def _nodegroup_arn(cluster_name, ng_name):
 
 
 def _now():
-    return time.time()
+    return int(time.time())
 
 
 def _json_resp(status, body):

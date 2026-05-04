@@ -569,6 +569,86 @@ def test_dynamodb_update_item_condition_on_missing_item_fails(ddb):
         )
     assert exc.value.response["Error"]["Code"] == "ConditionalCheckFailedException"
 
+
+def test_dynamodb_conditional_check_failed_returns_item_when_all_old(ddb):
+    """ReturnValuesOnConditionCheckFailure='ALL_OLD' must populate the
+    `Item` member on ConditionalCheckFailedException for PutItem,
+    UpdateItem, DeleteItem, and TransactWriteItems. Verified against
+    botocore: ConditionalCheckFailedException shape includes `Item`,
+    and Put/Update/Delete sub-ops accept ReturnValuesOnConditionCheckFailure.
+    """
+    table = "t_ccf_all_old"
+    try:
+        ddb.delete_table(TableName=table)
+    except Exception:
+        pass
+    ddb.create_table(
+        TableName=table,
+        KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+        AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "S"}],
+        BillingMode="PAY_PER_REQUEST",
+    )
+    seed = {"pk": {"S": "k1"}, "v": {"S": "original"}}
+    ddb.put_item(TableName=table, Item=seed)
+
+    # PutItem: condition fails because the row already exists.
+    with pytest.raises(ClientError) as exc:
+        ddb.put_item(
+            TableName=table,
+            Item={"pk": {"S": "k1"}, "v": {"S": "new"}},
+            ConditionExpression="attribute_not_exists(pk)",
+            ReturnValuesOnConditionCheckFailure="ALL_OLD",
+        )
+    assert exc.value.response["Error"]["Code"] == "ConditionalCheckFailedException"
+    assert exc.value.response.get("Item") == seed
+
+    # UpdateItem: condition fails because the existing value is "original".
+    with pytest.raises(ClientError) as exc:
+        ddb.update_item(
+            TableName=table,
+            Key={"pk": {"S": "k1"}},
+            UpdateExpression="SET v = :v",
+            ConditionExpression="v = :expected",
+            ExpressionAttributeValues={":v": {"S": "new"}, ":expected": {"S": "wrong"}},
+            ReturnValuesOnConditionCheckFailure="ALL_OLD",
+        )
+    assert exc.value.response.get("Item") == seed
+
+    # DeleteItem: same setup.
+    with pytest.raises(ClientError) as exc:
+        ddb.delete_item(
+            TableName=table,
+            Key={"pk": {"S": "k1"}},
+            ConditionExpression="v = :expected",
+            ExpressionAttributeValues={":expected": {"S": "wrong"}},
+            ReturnValuesOnConditionCheckFailure="ALL_OLD",
+        )
+    assert exc.value.response.get("Item") == seed
+
+    # TransactWriteItems: failing CancellationReason carries Item.
+    with pytest.raises(ClientError) as exc:
+        ddb.transact_write_items(TransactItems=[{
+            "Put": {
+                "TableName": table,
+                "Item": {"pk": {"S": "k1"}, "v": {"S": "new"}},
+                "ConditionExpression": "attribute_not_exists(pk)",
+                "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+            },
+        }])
+    reasons = exc.value.response["CancellationReasons"]
+    assert reasons[0]["Code"] == "ConditionalCheckFailed"
+    assert reasons[0].get("Item") == seed
+
+    # And without ALL_OLD, the Item field must NOT be present.
+    with pytest.raises(ClientError) as exc:
+        ddb.put_item(
+            TableName=table,
+            Item={"pk": {"S": "k1"}, "v": {"S": "new"}},
+            ConditionExpression="attribute_not_exists(pk)",
+        )
+    assert "Item" not in exc.value.response
+
+
 def test_dynamodb_get_item_missing_sort_key_fails_validation(ddb):
     try:
         ddb.delete_table(TableName="t_get_missing_sk")

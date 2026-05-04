@@ -158,6 +158,49 @@ def test_start_stop_logging(ct):
     ct.stop_logging(Name=name)
 
 
+def test_start_stop_logging_flips_is_logging_state(ct):
+    """StopLogging / StartLogging actually transition IsLogging on the trail
+    record so subsequent GetTrailStatus reflects the change. Terraform's
+    aws_cloudtrail data source asserts on this."""
+    name = f"trail-state-{_uid()}"
+    ct.create_trail(Name=name, S3BucketName="bucket")
+    assert ct.get_trail_status(Name=name)["IsLogging"] is True
+
+    ct.stop_logging(Name=name)
+    after_stop = ct.get_trail_status(Name=name)
+    assert after_stop["IsLogging"] is False
+    assert after_stop.get("StopLoggingTime") is not None
+
+    ct.start_logging(Name=name)
+    assert ct.get_trail_status(Name=name)["IsLogging"] is True
+
+
+def test_list_trails_returns_summaries(ct):
+    name = f"trail-list-{_uid()}"
+    ct.create_trail(Name=name, S3BucketName="bucket")
+    out = ct.list_trails()
+    arns = [t["TrailARN"] for t in out["Trails"]]
+    assert any(arn.endswith(f":trail/{name}") for arn in arns)
+
+
+def test_update_trail_persists_fields(ct):
+    name = f"trail-update-{_uid()}"
+    ct.create_trail(Name=name, S3BucketName="orig")
+    out = ct.update_trail(
+        Name=name,
+        S3BucketName="updated",
+        IsMultiRegionTrail=True,
+        EnableLogFileValidation=True,
+    )
+    assert out["S3BucketName"] == "updated"
+    assert out["IsMultiRegionTrail"] is True
+    assert out["LogFileValidationEnabled"] is True
+
+    desc = ct.get_trail(Name=name)["Trail"]
+    assert desc["S3BucketName"] == "updated"
+    assert desc["IsMultiRegionTrail"] is True
+
+
 def test_start_logging_not_found(ct):
     with pytest.raises(ClientError) as exc:
         ct.start_logging(Name=f"nonexistent-{_uid()}")

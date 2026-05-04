@@ -322,7 +322,7 @@ SERVICE_PATTERNS = {
         "credential_scope": "backup",
     },
     "cloudtrail": {
-        "target_prefixes": ["com.amazonaws.cloudtrail.v20131101.AmazonCloudTrailService"],
+        "target_prefixes": ["com.amazonaws.cloudtrail.v20131101.CloudTrail_20131101"],
         "host_patterns": [r"cloudtrail\."],
         "credential_scope": "cloudtrail",
     },

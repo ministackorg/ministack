@@ -361,6 +361,29 @@ def test_apigwv1_model_crud(apigw_v1):
 
     apigw_v1.delete_rest_api(restApiId=api_id)
 
+
+def test_apigwv1_update_model(apigw_v1):
+    """UpdateModel applies patchOperations. Terraform aws_api_gateway_model
+    issues PATCH on description / schema changes; the dispatcher previously
+    fell through to 404."""
+    api_id = apigw_v1.create_rest_api(name="v1-update-model")["id"]
+    apigw_v1.create_model(
+        restApiId=api_id,
+        name="PatchMe",
+        description="initial",
+        contentType="application/json",
+        schema='{"type": "object"}',
+    )
+    apigw_v1.update_model(
+        restApiId=api_id,
+        modelName="PatchMe",
+        patchOperations=[{"op": "replace", "path": "/description", "value": "updated"}],
+    )
+    got = apigw_v1.get_model(restApiId=api_id, modelName="PatchMe")
+    assert got["description"] == "updated"
+    apigw_v1.delete_rest_api(restApiId=api_id)
+
+
 def test_apigwv1_tags(apigw_v1):
     """TagResource, GetTags, UntagResource."""
     api_id = apigw_v1.create_rest_api(name="v1-tags-test")["id"]

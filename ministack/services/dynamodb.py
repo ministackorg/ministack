@@ -34,6 +34,21 @@ from ministack.core.responses import (
 
 logger = logging.getLogger("dynamodb")
 
+
+def _conditional_check_failed(data, old_item, message="The conditional request failed"):
+    """Standard ConditionalCheckFailedException response, with `Item` populated
+    when the caller passed `ReturnValuesOnConditionCheckFailure="ALL_OLD"` and
+    we have the prior item. AWS returns the existing item in the error body
+    so callers don't have to re-fetch (see CancellationReason / Put / Update /
+    Delete shapes in service-2.json)."""
+    body = {"__type": "ConditionalCheckFailedException", "message": message}
+    if data.get("ReturnValuesOnConditionCheckFailure") == "ALL_OLD" and old_item:
+        body["Item"] = old_item
+    return 400, {
+        "Content-Type": "application/x-amz-json-1.0",
+        "x-amzn-errortype": "ConditionalCheckFailedException",
+    }, json.dumps(body, ensure_ascii=False).encode("utf-8")
+
 REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 
 from ministack.core.persistence import PERSIST_STATE, load_state
@@ -539,7 +554,7 @@ def _put_item(data):
     cond_expr = data.get("ConditionExpression")
     if cond_expr:
         if not _evaluate_condition(cond_expr, old_item or {}, data.get("ExpressionAttributeValues", {}), data.get("ExpressionAttributeNames", {})):
-            return error_response_json("ConditionalCheckFailedException", "The conditional request failed", 400)
+            return _conditional_check_failed(data, old_item)
 
     table["items"][pk_val][sk_val] = item
     _update_counts(table)
@@ -588,7 +603,7 @@ def _delete_item(data):
     cond_expr = data.get("ConditionExpression")
     if cond_expr:
         if not _evaluate_condition(cond_expr, old_item or {}, data.get("ExpressionAttributeValues", {}), data.get("ExpressionAttributeNames", {})):
-            return error_response_json("ConditionalCheckFailedException", "The conditional request failed", 400)
+            return _conditional_check_failed(data, old_item)
 
     if old_item is not None:
         table["items"].get(pk_val, {}).pop(sk_val, None)
@@ -621,7 +636,7 @@ def _update_item(data):
     if cond_expr:
         cond_target = existing or {}
         if not _evaluate_condition(cond_expr, cond_target, data.get("ExpressionAttributeValues", {}), data.get("ExpressionAttributeNames", {})):
-            return error_response_json("ConditionalCheckFailedException", "The conditional request failed", 400)
+            return _conditional_check_failed(data, existing)
 
     update_expr = data.get("UpdateExpression", "")
     eav = data.get("ExpressionAttributeValues", {})
@@ -1245,7 +1260,10 @@ def _transact_write_items(data):
             else:
                 existing = _get_item_by_key(tbl, op.get("Key", {}))
             if not _evaluate_condition(cond, existing or {}, op.get("ExpressionAttributeValues", {}), op.get("ExpressionAttributeNames", {})):
-                return _transact_cancel_response(len(items_list), idx, "ConditionalCheckFailed")
+                # AWS populates `Item` on the failing CancellationReason when
+                # the per-op `ReturnValuesOnConditionCheckFailure` is "ALL_OLD".
+                fail_item = existing if op.get("ReturnValuesOnConditionCheckFailure") == "ALL_OLD" else None
+                return _transact_cancel_response(len(items_list), idx, "ConditionalCheckFailed", fail_item)
 
     for transact in items_list:
         op_type, op = _extract_transact_op(transact)
@@ -1314,11 +1332,14 @@ def _extract_transact_op(transact):
     return None, None
 
 
-def _transact_cancel_response(total, failed_idx, reason):
+def _transact_cancel_response(total, failed_idx, reason, fail_item=None):
     reasons = []
     for i in range(total):
         if i == failed_idx:
-            reasons.append({"Code": reason, "Message": "The conditional request failed"})
+            entry = {"Code": reason, "Message": "The conditional request failed"}
+            if fail_item is not None:
+                entry["Item"] = fail_item
+            reasons.append(entry)
         else:
             reasons.append({"Code": "None"})
     data = {

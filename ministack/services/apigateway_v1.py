@@ -849,6 +849,8 @@ async def handle_request(method, path, headers, body, query_params):
             else:
                 if method == "GET":
                     return _get_model(api_id, model_name)
+                if method == "PATCH":
+                    return _update_model(api_id, model_name, data)
                 if method == "DELETE":
                     return _delete_model(api_id, model_name)
 
@@ -1671,6 +1673,15 @@ def _get_model(api_id, model_name):
     model = _models.get(api_id, {}).get(model_name)
     if not model:
         return _v1_error("NotFoundException", "Invalid Model identifier specified", 404)
+    return _v1_response(model)
+
+
+def _update_model(api_id, model_name, data):
+    model = _models.get(api_id, {}).get(model_name)
+    if not model:
+        return _v1_error("NotFoundException", "Invalid Model identifier specified", 404)
+    patch_ops = data.get("patchOperations", [])
+    _apply_patch(model, patch_ops)
     return _v1_response(model)
 
 

@@ -80,7 +80,7 @@ def _ts():
 
 
 def _epoch():
-    return time.time()
+    return int(time.time())
 
 
 def _vault_arn(name):

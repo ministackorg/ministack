@@ -5,21 +5,25 @@ All notable changes to MiniStack will be documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning follows [Semantic Versioning](https://semver.org/).
 
-- **Transfer Family `LOGICAL` root home directory mappings** — `HomeDirectoryMappings` with `Entry="/"` now match SFTP paths like `/users.csv` and resolve them under the configured target bucket instead of falling through because the resolver checked for a `"//"` prefix.
-
 ---
 
 ## [Unreleased]
 
-### Fixed
-- **API Gateway v1 `GetUsagePlanKey` per-key read handler** — `GET /usageplans/{planId}/keys/{keyId}` was missing from the route dispatcher; only list/create/delete were registered, so the per-key path fell through to a 404. Terraform's AWS provider invokes `GetUsagePlanKey` immediately after `CreateUsagePlanKey` to confirm the resource exists, and the missing handler caused `aws_api_gateway_usage_plan_key` applies to abort with `reading API Gateway Usage Plan Key (...): couldn't find resource`. Added `_get_usage_plan_key(plan_id, key_id)` returning the stored entry on hit and `NotFoundException` on miss for either the plan id or the key id. Contributed by @marcin-nowak-scl.
-
----
-
-## [Unreleased]
+### Added
+- **AWS CloudTrail** — in-memory audit log + control plane. Recording opt-in via `CLOUDTRAIL_RECORDING=1`; per-account ring buffer (`CLOUDTRAIL_MAX_EVENTS=10000`). `LookupEvents` supports all 8 AWS `LookupAttributes`. Control plane: `CreateTrail`, `DeleteTrail`, `GetTrail`, `DescribeTrails`, `ListTrails`, `UpdateTrail`, `GetTrailStatus`, `StartLogging` / `StopLogging` with real `IsLogging` state, `Put`/`GetEventSelectors`, `AddTags` / `ListTags` / `RemoveTags`. Contributed by @AdigaAkhil.
+- **AWS Resource Groups (`resource-groups`, 2017-11-27)** — 19 of 23 spec operations: group CRUD, resource queries, configuration, membership, tagging, account settings. Tag-sync ops omitted (not exposed by AWS CLI / Terraform). Requested by @staranto.
 
 ### Fixed
-- **API Gateway v1 HTTP_PROXY path-parameter substitution and query-string forwarding** — `_invoke_http_proxy_v1` ignored `integration.requestParameters` mappings (so `{paramName}` placeholders in the integration `uri` were forwarded literally), appended the inbound execute path to the integration URI, and dropped the request query string. Real AWS HTTP_PROXY substitutes `{paramName}` from `integration.request.path.X = method.request.path.X` mappings (and `{proxy}` for greedy `{proxy+}` resources), uses the substituted URI as the complete upstream URL, and forwards the query string. Terraform `aws_api_gateway_integration` configurations of the form `uri = ".../resource/{id}"` + `integration.request.path.id = method.request.path.id` now reach the upstream with the correct URL.
+- **API Gateway v1 `GetUsagePlanKey`** — `GET /usageplans/{planId}/keys/{keyId}` handler was missing; per-key path fell through to 404. Terraform's `GetUsagePlanKey` refresh after `CreateUsagePlanKey` aborted every `aws_api_gateway_usage_plan_key` apply. Contributed by @marcin-nowak-scl.
+- **API Gateway v1 HTTP_PROXY path-param substitution + query-string forwarding** — `{paramName}` placeholders in integration `uri` were forwarded literally; the inbound execute path was appended to the integration URI; query string was dropped. Now substitutes from `integration.request.path.X = method.request.path.X` mappings (plus `{proxy}` for `{proxy+}`), uses the substituted URI as the upstream URL, and forwards the query string. Contributed by @marcin-nowak-scl.
+- **API Gateway v1 `UpdateModel`** — `PATCH /restapis/{id}/models/{name}` was missing; Terraform `aws_api_gateway_model` updates 404
+- **Transfer Family `LOGICAL` root home directory mappings** — `Entry="/"` failed to match because the resolver built `"//"` as the prefix. Contributed by @stefanmb.
+- **CloudTrail router target prefix** — was `AmazonCloudTrailService`; AWS uses `CloudTrail_20131101`. Routing still worked via credential scope, but the prefix entry was dead code.
+- **CloudTrail `IsLogging` state on `Stop`/`StartLogging`** — both were no-ops; `GetTrailStatus` always returned `IsLogging: True`. Now flips the trail record's state and stamps `_StartedAt` / `_StoppedAt` (int epoch).
+- **`tests/test_cloudtrail.py` runs serially** — autouse fixture flips a process-wide recording flag, racing under xdist. New `_SERIAL_FILES` set in `tests/conftest.py`.
+- **STS `Credentials.Expiration` is int epoch in the JSON path** — `AssumeRole` / `AssumeRoleWithWebIdentity` / `GetSessionToken` returned a float; Java/Go SDK v2 reject it.
+- **`backup` / `eks` `_epoch()` / `_now()` return int** — were `time.time()` (float); consumed by record fields like `createdAt`.
+- **DynamoDB `ConditionalCheckFailedException` populates `Item` on `ReturnValuesOnConditionCheckFailure="ALL_OLD"`** — `PutItem` / `UpdateItem` / `DeleteItem` / `TransactWriteItems` now return the prior item alongside the error code (and on the failing `CancellationReason` for transactions). Verified against botocore: `CancellationReason` and `ConditionalCheckFailedException` shapes both include `Item`. Reported by @darkamgine.
 
 ---
 

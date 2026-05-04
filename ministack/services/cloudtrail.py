@@ -307,15 +307,17 @@ def _get_trail_status(body: dict):
     if not raw:
         return _err("InvalidTrailNameException", "Trail name is required.")
     name = _resolve_trail_name(raw)
-    if _trails.get(name) is None:
+    trail = _trails.get(name)
+    if trail is None:
         return _err("TrailNotFoundException", f"Unknown trail: {name!r}", 404)
-    now = time.time()
+    now = int(time.time())
+    is_logging = bool(trail.get("IsLogging", True))
     return _ok(
         {
-            "IsLogging": True,
-            "LatestDeliveryTime": now,
-            "StartLoggingTime": now - 3600,
-            "StopLoggingTime": None,
+            "IsLogging": is_logging,
+            "LatestDeliveryTime": now if is_logging else trail.get("_StoppedAt", now),
+            "StartLoggingTime": trail.get("_StartedAt", now - 3600),
+            "StopLoggingTime": trail.get("_StoppedAt") if not is_logging else None,
             "LatestDeliveryError": "",
             "LatestNotificationError": "",
         }
@@ -327,8 +329,12 @@ def _start_logging(body: dict):
     if not raw:
         return _err("InvalidTrailNameException", "Trail name is required.")
     name = _resolve_trail_name(raw)
-    if _trails.get(name) is None:
+    trail = _trails.get(name)
+    if trail is None:
         return _err("TrailNotFoundException", f"Unknown trail: {name!r}", 404)
+    trail["IsLogging"] = True
+    trail["_StartedAt"] = int(time.time())
+    trail.pop("_StoppedAt", None)
     return _ok({})
 
 
@@ -337,9 +343,67 @@ def _stop_logging(body: dict):
     if not raw:
         return _err("InvalidTrailNameException", "Trail name is required.")
     name = _resolve_trail_name(raw)
-    if _trails.get(name) is None:
+    trail = _trails.get(name)
+    if trail is None:
         return _err("TrailNotFoundException", f"Unknown trail: {name!r}", 404)
+    trail["IsLogging"] = False
+    trail["_StoppedAt"] = int(time.time())
     return _ok({})
+
+
+def _list_trails(body: dict):
+    """ListTrails: paginated summary list with TrailARN, Name, HomeRegion."""
+    summaries = [
+        {
+            "TrailARN": t["TrailARN"],
+            "Name": t["Name"],
+            "HomeRegion": t.get("HomeRegion", get_region()),
+        }
+        for t in _trails.values()
+    ]
+    out = {"Trails": summaries}
+    return _ok(out)
+
+
+def _update_trail(body: dict):
+    raw = body.get("Name", "").strip()
+    if not raw:
+        return _err("InvalidTrailNameException", "Trail name is required.")
+    name = _resolve_trail_name(raw)
+    trail = _trails.get(name)
+    if trail is None:
+        return _err("TrailNotFoundException", f"Unknown trail: {name!r}", 404)
+    for src, dst in (
+        ("S3BucketName", "S3BucketName"),
+        ("S3KeyPrefix", "S3KeyPrefix"),
+        ("SnsTopicName", "SnsTopicName"),
+        ("IncludeGlobalServiceEvents", "IncludeGlobalServiceEvents"),
+        ("IsMultiRegionTrail", "IsMultiRegionTrail"),
+        ("EnableLogFileValidation", "LogFileValidationEnabled"),
+        ("CloudWatchLogsLogGroupArn", "CloudWatchLogsLogGroupArn"),
+        ("CloudWatchLogsRoleArn", "CloudWatchLogsRoleArn"),
+        ("KmsKeyId", "KmsKeyId"),
+        ("IsOrganizationTrail", "IsOrganizationTrail"),
+    ):
+        if src in body:
+            trail[dst] = body[src]
+    return _ok(
+        {
+            "Name": name,
+            "S3BucketName": trail.get("S3BucketName", ""),
+            "S3KeyPrefix": trail.get("S3KeyPrefix", ""),
+            "SnsTopicName": trail.get("SnsTopicName", ""),
+            "SnsTopicARN": trail.get("SnsTopicARN", ""),
+            "IncludeGlobalServiceEvents": trail.get("IncludeGlobalServiceEvents", True),
+            "IsMultiRegionTrail": trail.get("IsMultiRegionTrail", False),
+            "TrailARN": trail["TrailARN"],
+            "LogFileValidationEnabled": trail.get("LogFileValidationEnabled", False),
+            "CloudWatchLogsLogGroupArn": trail.get("CloudWatchLogsLogGroupArn", ""),
+            "CloudWatchLogsRoleArn": trail.get("CloudWatchLogsRoleArn", ""),
+            "KmsKeyId": trail.get("KmsKeyId", ""),
+            "IsOrganizationTrail": trail.get("IsOrganizationTrail", False),
+        }
+    )
 
 
 def _put_event_selectors(body: dict):
@@ -408,6 +472,8 @@ _DISPATCH = {
     "GetTrail": _get_trail,
     "DescribeTrails": _describe_trails,
     "GetTrailStatus": _get_trail_status,
+    "ListTrails": _list_trails,
+    "UpdateTrail": _update_trail,
     "StartLogging": _start_logging,
     "StopLogging": _stop_logging,
     "PutEventSelectors": _put_event_selectors,

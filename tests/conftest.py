@@ -80,6 +80,15 @@ _SERIAL_TESTS = {
     "tests/test_apigatewayv2.py::test_apigwv2_integration_wrapped_function_arn",
 }
 
+# Files where every test must run serially. CloudTrail's module-autouse fixture
+# flips a process-wide recording flag via /_ministack/config; under xdist
+# parallel workers, other test files' API calls would be silently recorded into
+# (or excluded from) the cloudtrail event ring buffer, causing flakes both
+# inside and outside this file.
+_SERIAL_FILES = {
+    "tests/test_cloudtrail.py",
+}
+
 
 def pytest_configure(config):
     config.addinivalue_line(
@@ -91,7 +100,8 @@ def pytest_configure(config):
 def pytest_collection_modifyitems(config, items):
     for item in items:
         nodeid = item.nodeid.split("[", 1)[0]
-        if nodeid in _SERIAL_TESTS:
+        file_path = nodeid.split("::", 1)[0]
+        if nodeid in _SERIAL_TESTS or file_path in _SERIAL_FILES:
             item.add_marker("serial")
 
 
