@@ -9,6 +9,13 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [Unreleased]
+
+### Fixed
+- **API Gateway v1 `GetUsagePlanKey` per-key read handler** — `GET /usageplans/{planId}/keys/{keyId}` was missing from the route dispatcher; only list/create/delete were registered, so the per-key path fell through to a 404. Terraform's AWS provider invokes `GetUsagePlanKey` immediately after `CreateUsagePlanKey` to confirm the resource exists, and the missing handler caused `aws_api_gateway_usage_plan_key` applies to abort with `reading API Gateway Usage Plan Key (...): couldn't find resource`. Added `_get_usage_plan_key(plan_id, key_id)` returning the stored entry on hit and `NotFoundException` on miss for either the plan id or the key id. Contributed by @marcin-nowak-scl.
+
+---
+
 ## [1.3.26] — 2026-05-04
 
 ### Added

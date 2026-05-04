@@ -1225,6 +1225,34 @@ def test_apigwv1_usage_plan_key_crud(apigw_v1):
     keys2 = apigw_v1.get_usage_plan_keys(usagePlanId=plan_id)["items"]
     assert not any(k["id"] == key_id for k in keys2)
 
+def test_apigwv1_get_usage_plan_key(apigw_v1):
+    """GetUsagePlanKey returns the per-key entry. The Terraform AWS provider
+    issues this call immediately after CreateUsagePlanKey to verify the
+    resource exists; before the handler was added the request fell through
+    to a 404 and aws_api_gateway_usage_plan_key applies aborted with
+    'couldn't find resource'."""
+    api_key = apigw_v1.create_api_key(name="qa-v1-gupk-key", enabled=True)
+    key_id = api_key["id"]
+    plan_id = apigw_v1.create_usage_plan(
+        name="qa-v1-gupk-plan",
+        throttle={"rateLimit": 100, "burstLimit": 200},
+    )["id"]
+    apigw_v1.create_usage_plan_key(usagePlanId=plan_id, keyId=key_id, keyType="API_KEY")
+
+    got = apigw_v1.get_usage_plan_key(usagePlanId=plan_id, keyId=key_id)
+    assert got["id"] == key_id
+    assert got["type"] == "API_KEY"
+
+    with pytest.raises(ClientError) as exc:
+        apigw_v1.get_usage_plan_key(usagePlanId=plan_id, keyId="missing-key-id")
+    assert exc.value.response["Error"]["Code"] == "NotFoundException"
+
+    with pytest.raises(ClientError) as exc:
+        apigw_v1.get_usage_plan_key(usagePlanId="missing-plan-id", keyId=key_id)
+    assert exc.value.response["Error"]["Code"] == "NotFoundException"
+
+    apigw_v1.delete_usage_plan_key(usagePlanId=plan_id, keyId=key_id)
+
 def test_apigwv1_created_date_is_unix_timestamp(apigw_v1):
     resp = apigw_v1.create_rest_api(name="tf-date-test")
     created = resp["createdDate"]

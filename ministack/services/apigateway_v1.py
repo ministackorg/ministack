@@ -652,6 +652,8 @@ async def handle_request(method, path, headers, body, query_params):
                 if method == "POST":
                     return _create_usage_plan_key(plan_id, data)
             else:
+                if method == "GET":
+                    return _get_usage_plan_key(plan_id, sub_id)
                 if method == "DELETE":
                     return _delete_usage_plan_key(plan_id, sub_id)
         else:
@@ -1760,6 +1762,15 @@ def _get_usage_plan_keys(plan_id, query_params):
     if plan_id not in _usage_plans:
         return _v1_error("NotFoundException", "Invalid Usage Plan identifier specified", 404)
     return _v1_paginated_response(list(_usage_plan_keys.get(plan_id, {}).values()), query_params)
+
+
+def _get_usage_plan_key(plan_id, key_id):
+    if plan_id not in _usage_plans:
+        return _v1_error("NotFoundException", "Invalid Usage Plan identifier specified", 404)
+    plan_key = _usage_plan_keys.get(plan_id, {}).get(key_id)
+    if not plan_key:
+        return _v1_error("NotFoundException", "Invalid Usage Plan Key identifier specified", 404)
+    return _v1_response(plan_key, 200)
 
 
 def _delete_usage_plan_key(plan_id, key_id):
