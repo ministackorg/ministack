@@ -724,6 +724,92 @@ def test_apigwv1_http_proxy_does_not_block_parallel_ddb(monkeypatch):
     assert elapsed < 0.2, f"Parallel DDB request was delayed for {elapsed:.2f}s"
 
 
+def test_apigwv1_http_proxy_substitutes_path_params_and_forwards_query(monkeypatch):
+    """HTTP_PROXY uses the substituted integration URI as the upstream URL."""
+    import asyncio
+
+    from ministack.services import apigateway as apigw_mod
+    from ministack.services import apigateway_v1 as apigw_v1_mod
+
+    captured = {}
+
+    def _capture(req, _timeout_seconds):
+        captured["url"] = req.full_url
+        return 200, {"Content-Type": "application/json"}, b'{"ok": true}'
+
+    monkeypatch.setattr(apigw_mod, "_urlopen_sync", _capture)
+
+    status, _headers, body = apigw_v1_mod._create_rest_api({"name": "qa-v1-httpproxy-subst"})
+    assert status == 201
+    api_id = json.loads(body)["id"]
+
+    try:
+        status, _headers, body = apigw_v1_mod._get_resources(api_id, {})
+        assert status == 200
+        root = next(r for r in json.loads(body)["item"] if r["path"] == "/")
+
+        status, _headers, body = apigw_v1_mod._create_resource(
+            api_id,
+            root["id"],
+            {"pathPart": "things"},
+        )
+        assert status == 201
+        things = json.loads(body)
+
+        status, _headers, body = apigw_v1_mod._create_resource(
+            api_id,
+            things["id"],
+            {"pathPart": "{thingId}"},
+        )
+        assert status == 201
+        thing = json.loads(body)
+
+        status, _headers, _body = apigw_v1_mod._put_method(
+            api_id,
+            thing["id"],
+            "GET",
+            {
+                "authorizationType": "NONE",
+                "requestParameters": {"method.request.path.thingId": True},
+            },
+        )
+        assert status == 201
+
+        status, _headers, _body = apigw_v1_mod._put_integration(
+            api_id,
+            thing["id"],
+            "GET",
+            {
+                "type": "HTTP_PROXY",
+                "httpMethod": "GET",
+                "uri": "http://upstream.test/items/{thingId}",
+                "requestParameters": {"integration.request.path.thingId": "method.request.path.thingId"},
+            },
+        )
+        assert status == 201
+
+        status, _headers, _body = apigw_v1_mod._create_deployment(api_id, {"stageName": "test"})
+        assert status == 201
+
+        status, _headers, _body = asyncio.run(
+            apigw_v1_mod.handle_execute(
+                api_id,
+                "test",
+                "GET",
+                "/things/abc-123",
+                {"host": "test"},
+                b"",
+                {"limit": ["10"]},
+            )
+        )
+
+        assert status == 200
+        assert captured["url"] == "http://upstream.test/items/abc-123?limit=10"
+
+    finally:
+        apigw_v1_mod._delete_rest_api(api_id)
+
+
 def test_apigwv1_http_proxy_timeout_is_configurable(monkeypatch):
     """`_timeout_from_env` honours the env var and falls back on bad input.
     Tested directly instead of via importlib.reload so the suite-wide
