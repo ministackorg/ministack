@@ -591,6 +591,35 @@ def test_sftp_mkdir_listdir_rmdir(transfer, s3):
     transfer.delete_server(ServerId=ctx["server_id"])
 
 
+def test_sftp_logical_root_entry_mapping(transfer, s3):
+    """LOGICAL home dir with Entry='/' maps all paths to the target bucket.
+    Regression test for a bug where entry + '/' produced '//' and never
+    matched any path."""
+    suffix = uuid.uuid4().hex[:8]
+    bucket = f"sftp-root-{suffix}"
+    s3.create_bucket(Bucket=bucket)
+    ctx = _provision(
+        transfer,
+        s3,
+        bucket=bucket,
+        logical_mappings=[{"Entry": "/", "Target": f"/{bucket}"}],
+    )
+
+    async def _run():
+        async with await _connect(ctx["user_name"], ctx["priv_pem"]) as conn:
+            async with conn.start_sftp_client() as sftp:
+                async with sftp.open("/users.csv", "wb") as f:
+                    await f.write(b"id,name\n1,Alice\n")
+                async with sftp.open("/users.csv", "rb") as f:
+                    assert await f.read() == b"id,name\n1,Alice\n"
+
+    asyncio.run(_run())
+
+    obj = s3.get_object(Bucket=bucket, Key="users.csv")
+    assert obj["Body"].read() == b"id,name\n1,Alice\n"
+    transfer.delete_server(ServerId=ctx["server_id"])
+
+
 def test_sftp_logical_home_directory_mappings(transfer, s3):
     """LOGICAL home dir maps virtual `/inbox` → bucket prefix; an upload
     to /inbox/foo lands at the mapped S3 key."""
