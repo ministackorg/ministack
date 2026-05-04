@@ -9,6 +9,20 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [Unreleased]
+
+### Fixed
+- **API Gateway v1 `GetUsagePlanKey` per-key read handler** — `GET /usageplans/{planId}/keys/{keyId}` was missing from the route dispatcher; only list/create/delete were registered, so the per-key path fell through to a 404. Terraform's AWS provider invokes `GetUsagePlanKey` immediately after `CreateUsagePlanKey` to confirm the resource exists, and the missing handler caused `aws_api_gateway_usage_plan_key` applies to abort with `reading API Gateway Usage Plan Key (...): couldn't find resource`. Added `_get_usage_plan_key(plan_id, key_id)` returning the stored entry on hit and `NotFoundException` on miss for either the plan id or the key id. Contributed by @marcin-nowak-scl.
+
+---
+
+## [Unreleased]
+
+### Fixed
+- **API Gateway v1 HTTP_PROXY path-parameter substitution and query-string forwarding** — `_invoke_http_proxy_v1` ignored `integration.requestParameters` mappings (so `{paramName}` placeholders in the integration `uri` were forwarded literally), appended the inbound execute path to the integration URI, and dropped the request query string. Real AWS HTTP_PROXY substitutes `{paramName}` from `integration.request.path.X = method.request.path.X` mappings (and `{proxy}` for greedy `{proxy+}` resources), uses the substituted URI as the complete upstream URL, and forwards the query string. Terraform `aws_api_gateway_integration` configurations of the form `uri = ".../resource/{id}"` + `integration.request.path.id = method.request.path.id` now reach the upstream with the correct URL.
+
+---
+
 ## [1.3.26] — 2026-05-04
 
 ### Added

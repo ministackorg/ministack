@@ -724,6 +724,92 @@ def test_apigwv1_http_proxy_does_not_block_parallel_ddb(monkeypatch):
     assert elapsed < 0.2, f"Parallel DDB request was delayed for {elapsed:.2f}s"
 
 
+def test_apigwv1_http_proxy_substitutes_path_params_and_forwards_query(monkeypatch):
+    """HTTP_PROXY uses the substituted integration URI as the upstream URL."""
+    import asyncio
+
+    from ministack.services import apigateway as apigw_mod
+    from ministack.services import apigateway_v1 as apigw_v1_mod
+
+    captured = {}
+
+    def _capture(req, _timeout_seconds):
+        captured["url"] = req.full_url
+        return 200, {"Content-Type": "application/json"}, b'{"ok": true}'
+
+    monkeypatch.setattr(apigw_mod, "_urlopen_sync", _capture)
+
+    status, _headers, body = apigw_v1_mod._create_rest_api({"name": "qa-v1-httpproxy-subst"})
+    assert status == 201
+    api_id = json.loads(body)["id"]
+
+    try:
+        status, _headers, body = apigw_v1_mod._get_resources(api_id, {})
+        assert status == 200
+        root = next(r for r in json.loads(body)["item"] if r["path"] == "/")
+
+        status, _headers, body = apigw_v1_mod._create_resource(
+            api_id,
+            root["id"],
+            {"pathPart": "things"},
+        )
+        assert status == 201
+        things = json.loads(body)
+
+        status, _headers, body = apigw_v1_mod._create_resource(
+            api_id,
+            things["id"],
+            {"pathPart": "{thingId}"},
+        )
+        assert status == 201
+        thing = json.loads(body)
+
+        status, _headers, _body = apigw_v1_mod._put_method(
+            api_id,
+            thing["id"],
+            "GET",
+            {
+                "authorizationType": "NONE",
+                "requestParameters": {"method.request.path.thingId": True},
+            },
+        )
+        assert status == 201
+
+        status, _headers, _body = apigw_v1_mod._put_integration(
+            api_id,
+            thing["id"],
+            "GET",
+            {
+                "type": "HTTP_PROXY",
+                "httpMethod": "GET",
+                "uri": "http://upstream.test/items/{thingId}",
+                "requestParameters": {"integration.request.path.thingId": "method.request.path.thingId"},
+            },
+        )
+        assert status == 201
+
+        status, _headers, _body = apigw_v1_mod._create_deployment(api_id, {"stageName": "test"})
+        assert status == 201
+
+        status, _headers, _body = asyncio.run(
+            apigw_v1_mod.handle_execute(
+                api_id,
+                "test",
+                "GET",
+                "/things/abc-123",
+                {"host": "test"},
+                b"",
+                {"limit": ["10"]},
+            )
+        )
+
+        assert status == 200
+        assert captured["url"] == "http://upstream.test/items/abc-123?limit=10"
+
+    finally:
+        apigw_v1_mod._delete_rest_api(api_id)
+
+
 def test_apigwv1_http_proxy_timeout_is_configurable(monkeypatch):
     """`_timeout_from_env` honours the env var and falls back on bad input.
     Tested directly instead of via importlib.reload so the suite-wide
@@ -1224,6 +1310,34 @@ def test_apigwv1_usage_plan_key_crud(apigw_v1):
     apigw_v1.delete_usage_plan_key(usagePlanId=plan_id, keyId=key_id)
     keys2 = apigw_v1.get_usage_plan_keys(usagePlanId=plan_id)["items"]
     assert not any(k["id"] == key_id for k in keys2)
+
+def test_apigwv1_get_usage_plan_key(apigw_v1):
+    """GetUsagePlanKey returns the per-key entry. The Terraform AWS provider
+    issues this call immediately after CreateUsagePlanKey to verify the
+    resource exists; before the handler was added the request fell through
+    to a 404 and aws_api_gateway_usage_plan_key applies aborted with
+    'couldn't find resource'."""
+    api_key = apigw_v1.create_api_key(name="qa-v1-gupk-key", enabled=True)
+    key_id = api_key["id"]
+    plan_id = apigw_v1.create_usage_plan(
+        name="qa-v1-gupk-plan",
+        throttle={"rateLimit": 100, "burstLimit": 200},
+    )["id"]
+    apigw_v1.create_usage_plan_key(usagePlanId=plan_id, keyId=key_id, keyType="API_KEY")
+
+    got = apigw_v1.get_usage_plan_key(usagePlanId=plan_id, keyId=key_id)
+    assert got["id"] == key_id
+    assert got["type"] == "API_KEY"
+
+    with pytest.raises(ClientError) as exc:
+        apigw_v1.get_usage_plan_key(usagePlanId=plan_id, keyId="missing-key-id")
+    assert exc.value.response["Error"]["Code"] == "NotFoundException"
+
+    with pytest.raises(ClientError) as exc:
+        apigw_v1.get_usage_plan_key(usagePlanId="missing-plan-id", keyId=key_id)
+    assert exc.value.response["Error"]["Code"] == "NotFoundException"
+
+    apigw_v1.delete_usage_plan_key(usagePlanId=plan_id, keyId=key_id)
 
 def test_apigwv1_created_date_is_unix_timestamp(apigw_v1):
     resp = apigw_v1.create_rest_api(name="tf-date-test")
