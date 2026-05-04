@@ -150,7 +150,10 @@ def _engine_type(version: str) -> str:
 
 def _public(d: dict) -> dict:
     """Strip internal _-prefixed bookkeeping fields before serialising."""
-    return {k: v for k, v in d.items() if not k.startswith("_")}
+    out = {k: v for k, v in d.items() if not k.startswith("_")}
+    if not out.get("VPCOptions"):
+        out.pop("VPCOptions", None)
+    return out
 
 
 def _now() -> int:
@@ -324,6 +327,47 @@ def _default_ebs_options(override=None):
     return base
 
 
+def _normalise_vpc_options(options):
+    if not isinstance(options, dict):
+        return None
+
+    subnet_ids = list(options.get("SubnetIds") or [])
+    security_group_ids = list(options.get("SecurityGroupIds") or [])
+    if not subnet_ids and not security_group_ids:
+        return None
+
+    out = dict(options)
+    out["SubnetIds"] = subnet_ids
+    out["SecurityGroupIds"] = security_group_ids
+    out.setdefault("VPCId", "vpc-ministack")
+    out.setdefault(
+        "AvailabilityZones",
+        [f"{get_region()}{chr(ord('a') + idx)}" for idx, _ in enumerate(subnet_ids or ["default"])],
+    )
+    return out
+
+
+def _set_vpc_options(rec: dict, options) -> None:
+    vpc_options = _normalise_vpc_options(options)
+    endpoint = rec.get("_Endpoint") or rec.get("Endpoint")
+    endpoints = rec.get("Endpoints") or {}
+    endpoint = endpoint or endpoints.get("vpc")
+
+    if vpc_options:
+        rec["VPCOptions"] = vpc_options
+        if endpoint:
+            rec["_Endpoint"] = endpoint
+            rec["Endpoints"] = {"vpc": endpoint}
+        rec.pop("Endpoint", None)
+        return
+
+    rec.pop("VPCOptions", None)
+    rec.pop("Endpoints", None)
+    if endpoint:
+        rec["_Endpoint"] = endpoint
+        rec["Endpoint"] = endpoint
+
+
 def _new_domain_record(name, payload):
     engine_version = payload.get("EngineVersion", _DEFAULT_VERSION)
     cluster_cfg = _default_cluster_config(payload.get("ClusterConfig"))
@@ -347,7 +391,6 @@ def _new_domain_record(name, payload):
         "EBSOptions": ebs_opts,
         "AccessPolicies": access_policies,
         "SnapshotOptions": {"AutomatedSnapshotStartHour": 0},
-        "VPCOptions": payload.get("VPCOptions", {}),
         "CognitoOptions": payload.get("CognitoOptions", {"Enabled": False}),
         "EncryptionAtRestOptions": payload.get(
             "EncryptionAtRestOptions", {"Enabled": False}
@@ -378,11 +421,13 @@ def _new_domain_record(name, payload):
         "ChangeProgressDetails": {},
         "OffPeakWindowOptions": {"Enabled": False},
         "SoftwareUpdateOptions": {"AutoSoftwareUpdateEnabled": False},
+        "_Endpoint": endpoint,
         "_CreatedTime": _now(),
         "_UpdatedTime": _now(),
         "_ContainerId": cid,
         "_DashboardsContainerId": dash_cid,
     }
+    _set_vpc_options(rec, payload.get("VPCOptions"))
     if dash_endpoint:
         rec["DashboardEndpoint"] = dash_endpoint
     return rec
@@ -407,13 +452,12 @@ def _domain_config(rec: dict) -> dict:
     def wrap(value):
         return {"Options": value, "Status": dict(status)}
 
-    return {
+    config = {
         "EngineVersion": wrap(rec["EngineVersion"]),
         "ClusterConfig": wrap(rec["ClusterConfig"]),
         "EBSOptions": wrap(rec["EBSOptions"]),
         "AccessPolicies": wrap(rec["AccessPolicies"]),
         "SnapshotOptions": wrap(rec["SnapshotOptions"]),
-        "VPCOptions": wrap(rec["VPCOptions"]),
         "CognitoOptions": wrap(rec["CognitoOptions"]),
         "EncryptionAtRestOptions": wrap(rec["EncryptionAtRestOptions"]),
         "NodeToNodeEncryptionOptions": wrap(rec["NodeToNodeEncryptionOptions"]),
@@ -425,6 +469,9 @@ def _domain_config(rec: dict) -> dict:
         "OffPeakWindowOptions": wrap(rec["OffPeakWindowOptions"]),
         "SoftwareUpdateOptions": wrap(rec["SoftwareUpdateOptions"]),
     }
+    if rec.get("VPCOptions"):
+        config["VPCOptions"] = wrap(rec["VPCOptions"])
+    return config
 
 
 # ---------------------------------------------------------------------------
@@ -526,7 +573,10 @@ def _update_domain_config(name, payload):
     }
     for k, v in payload.items():
         if k in updatable:
-            rec[k] = v
+            if k == "VPCOptions":
+                _set_vpc_options(rec, v)
+            else:
+                rec[k] = v
     rec["_UpdatedTime"] = _now()
 
     # Real AWS marks the domain Processing while config rollout happens; we

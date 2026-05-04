@@ -133,6 +133,75 @@ def test_opensearch_describe_domain_config_wraps_options_status(os_client):
         os_client.delete_domain(DomainName=name)
 
 
+def test_opensearch_describe_omits_empty_vpc_options(os_client):
+    name = f"novpc-{_uid()}"
+    os_client.create_domain(DomainName=name)
+    try:
+        desc = os_client.describe_domain(DomainName=name)["DomainStatus"]
+        assert "VPCOptions" not in desc
+        assert desc["Endpoint"]
+        assert "Endpoints" not in desc
+
+        cfg = os_client.describe_domain_config(DomainName=name)["DomainConfig"]
+        assert "VPCOptions" not in cfg
+    finally:
+        os_client.delete_domain(DomainName=name)
+
+
+def test_opensearch_describe_domain_config_skips_unset_vpc_options(os_client):
+    name = f"dcfg-{_uid()}"
+    os_client.create_domain(DomainName=name)
+    try:
+        cfg = os_client.describe_domain_config(DomainName=name)["DomainConfig"]
+        assert "VPCOptions" not in cfg
+    finally:
+        os_client.delete_domain(DomainName=name)
+
+
+def test_opensearch_describe_with_vpc_returns_endpoints_map(os_client):
+    name = f"vpc-{_uid()}"
+    vpc_options = {
+        "SubnetIds": ["subnet-aaa", "subnet-bbb"],
+        "SecurityGroupIds": ["sg-1"],
+    }
+    rec = os_client.create_domain(DomainName=name, VPCOptions=vpc_options)["DomainStatus"]
+    try:
+        assert "Endpoint" not in rec
+        assert rec["Endpoints"]["vpc"]
+        assert rec["VPCOptions"]["SubnetIds"] == vpc_options["SubnetIds"]
+        assert rec["VPCOptions"]["SecurityGroupIds"] == vpc_options["SecurityGroupIds"]
+        assert rec["VPCOptions"]["VPCId"].startswith("vpc-")
+        assert rec["VPCOptions"]["AvailabilityZones"]
+
+        desc = os_client.describe_domain(DomainName=name)["DomainStatus"]
+        assert "Endpoint" not in desc
+        assert desc["Endpoints"]["vpc"] == rec["Endpoints"]["vpc"]
+    finally:
+        os_client.delete_domain(DomainName=name)
+
+
+def test_opensearch_update_domain_to_vpc_swaps_endpoint_shape(os_client):
+    name = f"uvpc-{_uid()}"
+    os_client.create_domain(DomainName=name)
+    try:
+        before = os_client.describe_domain(DomainName=name)["DomainStatus"]
+        assert before["Endpoint"]
+        assert "Endpoints" not in before
+
+        vpc_options = {
+            "SubnetIds": ["subnet-upd"],
+            "SecurityGroupIds": ["sg-upd"],
+        }
+        os_client.update_domain_config(DomainName=name, VPCOptions=vpc_options)
+
+        after = os_client.describe_domain(DomainName=name)["DomainStatus"]
+        assert "Endpoint" not in after
+        assert after["Endpoints"]["vpc"] == before["Endpoint"]
+        assert after["VPCOptions"]["SubnetIds"] == vpc_options["SubnetIds"]
+    finally:
+        os_client.delete_domain(DomainName=name)
+
+
 def test_opensearch_update_domain_config_persists(os_client):
     name = f"upd-{_uid()}"
     os_client.create_domain(DomainName=name)

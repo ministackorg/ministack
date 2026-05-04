@@ -7,6 +7,13 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [Unreleased]
+
+### Fixed
+- **OpenSearch non-VPC domains omit empty `VPCOptions`** — `CreateDomain` / `DescribeDomain` previously returned `VPCOptions: {}` alongside `Endpoint`, causing Terraform AWS provider reads to classify the domain as VPC-backed and fail with `OpenSearch Domain in VPC expected to have null Endpoint value`. Non-VPC domains now omit `VPCOptions`; VPC-shaped domains return `Endpoints["vpc"]` instead of `Endpoint`.
+
+---
+
 ## [1.3.25] — 2026-05-03
 
 ### Added
