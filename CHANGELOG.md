@@ -7,6 +7,13 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [Unreleased]
+
+### Fixed
+- **API Gateway v1 HTTP_PROXY path-parameter substitution and query-string forwarding** — `_invoke_http_proxy_v1` ignored `integration.requestParameters` mappings (so `{paramName}` placeholders in the integration `uri` were forwarded literally), appended the inbound execute path to the integration URI, and dropped the request query string. Real AWS HTTP_PROXY substitutes `{paramName}` from `integration.request.path.X = method.request.path.X` mappings (and `{proxy}` for greedy `{proxy+}` resources), uses the substituted URI as the complete upstream URL, and forwards the query string. Terraform `aws_api_gateway_integration` configurations of the form `uri = ".../resource/{id}"` + `integration.request.path.id = method.request.path.id` now reach the upstream with the correct URL.
+
+---
+
 ## [1.3.26] — 2026-05-04
 
 ### Added

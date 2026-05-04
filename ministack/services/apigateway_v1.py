@@ -76,6 +76,7 @@ import os
 import re
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 from ministack.core.responses import AccountScopedDict, get_account_id, get_region, new_uuid
@@ -889,7 +890,9 @@ async def handle_execute(api_id, stage_name, method, path, headers, body, query_
             headers, body, query_params, path_params
         )
     elif int_type in ("HTTP_PROXY", "HTTP"):
-        return await _invoke_http_proxy_v1(integration, path, method, headers, body, query_params)
+        return await _invoke_http_proxy_v1(
+            integration, path, method, headers, body, query_params, path_params
+        )
     elif int_type == "MOCK":
         return _invoke_mock_v1(integration)
     else:
@@ -974,12 +977,41 @@ async def _invoke_lambda_proxy_v1(integration, api_id, stage_name, stage, resour
     return status, resp_headers, resp_body
 
 
-async def _invoke_http_proxy_v1(integration, path, method, headers, body, query_params):
+async def _invoke_http_proxy_v1(integration, path, method, headers, body, query_params, path_params=None):
     """Forward a request to an HTTP backend."""
     uri = integration.get("uri", "")
-    url = uri.rstrip("/") + path
+    req_params = integration.get("requestParameters", {})
+    path_params = path_params or {}
 
-    req = urllib.request.Request(url, data=body or None, method=method)
+    for dest, src in req_params.items():
+        if not dest.startswith("integration.request.path."):
+            continue
+
+        placeholder = "{" + dest[len("integration.request.path."):] + "}"
+        value = ""
+        if isinstance(src, str):
+            if src.startswith("'") and src.endswith("'"):
+                value = src[1:-1]
+            elif src.startswith("method.request.path."):
+                value = path_params.get(src[len("method.request.path."):], "")
+
+        uri = uri.replace(placeholder, value)
+
+    if "{proxy}" in uri:
+        uri = uri.replace("{proxy}", path_params.get("proxy", ""))
+
+    if query_params:
+        flat_query = []
+        for key, value in query_params.items():
+            values = value if isinstance(value, list) else [value]
+            for item in values:
+                flat_query.append((key, item))
+
+        query_string = urllib.parse.urlencode(flat_query)
+        if query_string:
+            uri = uri + ("&" if "?" in uri else "?") + query_string
+
+    req = urllib.request.Request(uri, data=body or None, method=method)
     for k, v in headers.items():
         if k.lower() not in ("host", "content-length"):
             req.add_header(k, v)
