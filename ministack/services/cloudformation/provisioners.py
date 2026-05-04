@@ -2,6 +2,8 @@
 CloudFormation provisioners — resource create/delete handlers for each AWS resource type.
 """
 
+import base64
+import hashlib
 import io
 import json
 import logging
@@ -452,6 +454,12 @@ def _lambda_create(logical_id, props, stack_name):
             version_id=code.get("S3ObjectVersion"),
         )
 
+    code_size = len(code_zip) if code_zip else 0
+    code_sha = (
+        base64.b64encode(hashlib.sha256(code_zip).digest()).decode()
+        if code_zip else "cfn-deployed"
+    )
+
     func = {
         "config": {
             "FunctionName": name,
@@ -459,11 +467,12 @@ def _lambda_create(logical_id, props, stack_name):
             "Runtime": runtime,
             "Role": role,
             "Handler": handler,
+            "CodeSize": code_size,
             "Description": description,
             "Timeout": timeout,
             "MemorySize": memory,
             "LastModified": now_iso(),
-            "CodeSha256": "cfn-deployed",
+            "CodeSha256": code_sha,
             "Version": "$LATEST",
             "Environment": {"Variables": env_vars},
             "Layers": [{"Arn": l} if isinstance(l, str) else l for l in layers],
