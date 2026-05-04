@@ -7,7 +7,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
-## [Unreleased]
+## [1.3.27] — 2026-05-04
 
 ### Added
 - **AWS CloudTrail** — in-memory audit log + control plane. Recording opt-in via `CLOUDTRAIL_RECORDING=1`; per-account ring buffer (`CLOUDTRAIL_MAX_EVENTS=10000`). `LookupEvents` supports all 8 AWS `LookupAttributes`. Control plane: `CreateTrail`, `DeleteTrail`, `GetTrail`, `DescribeTrails`, `ListTrails`, `UpdateTrail`, `GetTrailStatus`, `StartLogging` / `StopLogging` with real `IsLogging` state, `Put`/`GetEventSelectors`, `AddTags` / `ListTags` / `RemoveTags`. Contributed by @AdigaAkhil.
