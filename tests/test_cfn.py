@@ -7,7 +7,10 @@ import zipfile
 from urllib.parse import urlparse
 
 import pytest
+import urllib.request
 from botocore.exceptions import ClientError
+
+from conftest import ENDPOINT
 
 
 def _wait_stack(cfn, name, timeout=30):
@@ -2727,3 +2730,131 @@ def test_cfn_cloudfront_keyvaluestore_create_update_delete(cfn, cloudfront):
     with pytest.raises(ClientError) as exc:
         cloudfront.describe_key_value_store(Name=kvs_name)
     assert exc.value.response["Error"]["Code"] == "EntityNotFound"
+
+
+def test_cfn_auto_named_s3_bucket_stable_across_updates(cfn, s3):
+    """Regression: auto-named S3 buckets (no explicit BucketName) must keep
+    the same physical resource ID across stack updates.  Before the fix,
+    _update_resource fell through to _s3_create which generated a new random
+    name on every update, orphaning the original bucket and all its objects."""
+    stack_name = f"cfn-s3-stable-{_uuid_mod.uuid4().hex[:8]}"
+    template_v1 = json.dumps({
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "DeployBucket": {
+                "Type": "AWS::S3::Bucket",
+            },
+        },
+        "Outputs": {
+            "BucketName": {"Value": {"Ref": "DeployBucket"}},
+        },
+    })
+    cfn.create_stack(StackName=stack_name, TemplateBody=template_v1)
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "CREATE_COMPLETE"
+    bucket_v1 = {o["OutputKey"]: o["OutputValue"] for o in stack["Outputs"]}["BucketName"]
+
+    s3.put_object(Bucket=bucket_v1, Key="artifact.zip", Body=b"zipdata")
+
+    template_v2 = json.dumps({
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "DeployBucket": {
+                "Type": "AWS::S3::Bucket",
+            },
+            "LogGroup": {
+                "Type": "AWS::Logs::LogGroup",
+                "Properties": {"LogGroupName": f"/test/{stack_name}"},
+            },
+        },
+        "Outputs": {
+            "BucketName": {"Value": {"Ref": "DeployBucket"}},
+        },
+    })
+    cfn.update_stack(StackName=stack_name, TemplateBody=template_v2)
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "UPDATE_COMPLETE"
+    bucket_v2 = {o["OutputKey"]: o["OutputValue"] for o in stack["Outputs"]}["BucketName"]
+
+    assert bucket_v1 == bucket_v2, (
+        f"Auto-named bucket changed from {bucket_v1!r} to {bucket_v2!r} on update"
+    )
+
+    obj = s3.get_object(Bucket=bucket_v2, Key="artifact.zip")
+    assert obj["Body"].read() == b"zipdata"
+
+    cfn.delete_stack(StackName=stack_name)
+    _wait_stack(cfn, stack_name)
+
+
+def test_cfn_lambda_s3_ref_bucket_has_code_size(cfn, lam, s3):
+    """Regression: Lambda deployed via CFN with Code.S3Bucket using
+    {Ref: DeployBucket} must report correct CodeSize and CodeSha256
+    (not NaN / 'cfn-deployed'), and the code must be downloadable."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-lam-s3ref-{uid}"
+    fn_name = f"cfn-lam-s3ref-fn-{uid}"
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("index.mjs",
+            'export async function handler(event) '
+            '{ return { statusCode: 200, body: "ok" }; }')
+    zip_bytes = buf.getvalue()
+
+    template_create = json.dumps({
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "DeployBucket": {"Type": "AWS::S3::Bucket"},
+        },
+        "Outputs": {
+            "BucketName": {"Value": {"Ref": "DeployBucket"}},
+        },
+    })
+    cfn.create_stack(StackName=stack_name, TemplateBody=template_create)
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "CREATE_COMPLETE"
+    bucket = {o["OutputKey"]: o["OutputValue"] for o in stack["Outputs"]}["BucketName"]
+
+    s3_key = f"deploy/{uid}/code.zip"
+    s3.put_object(Bucket=bucket, Key=s3_key, Body=zip_bytes)
+
+    template_update = json.dumps({
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "DeployBucket": {"Type": "AWS::S3::Bucket"},
+            "Fn": {
+                "Type": "AWS::Lambda::Function",
+                "Properties": {
+                    "FunctionName": fn_name,
+                    "Runtime": "nodejs20.x",
+                    "Handler": "index.handler",
+                    "Role": "arn:aws:iam::000000000000:role/r",
+                    "Code": {"S3Bucket": {"Ref": "DeployBucket"}, "S3Key": s3_key},
+                },
+            },
+        },
+        "Outputs": {
+            "BucketName": {"Value": {"Ref": "DeployBucket"}},
+        },
+    })
+    cfn.update_stack(StackName=stack_name, TemplateBody=template_update)
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "UPDATE_COMPLETE"
+
+    fn = lam.get_function(FunctionName=fn_name)
+    config = fn["Configuration"]
+    assert config["CodeSize"] == len(zip_bytes), (
+        f"CodeSize mismatch: expected {len(zip_bytes)}, got {config.get('CodeSize')}"
+    )
+    assert config["CodeSha256"] != "cfn-deployed", "CodeSha256 still hardcoded"
+
+    code_url = fn["Code"]["Location"]
+    local_url = code_url.replace("localhost", "127.0.0.1")
+    resp = urllib.request.urlopen(local_url, timeout=5)
+    downloaded = resp.read()
+    assert len(downloaded) == len(zip_bytes)
+    assert downloaded == zip_bytes
+
+    cfn.delete_stack(StackName=stack_name)
+    _wait_stack(cfn, stack_name)
