@@ -675,7 +675,8 @@ def _sftp_resolve_s3_target(user: dict, virtual_path: str):
         for mapping in sorted_maps:
             entry = _sftp_normalize_virtual_path(mapping.get("Entry", "/"))
             target = mapping.get("Target", "")
-            if virtual_path == entry or virtual_path.startswith(entry + "/"):
+            prefix = entry if entry == "/" else entry + "/"
+            if virtual_path == entry or virtual_path.startswith(prefix):
                 rest = virtual_path[len(entry):].lstrip("/")
                 full = target.rstrip("/") + ("/" + rest if rest else "")
                 return _sftp_split_bucket_key(full)

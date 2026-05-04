@@ -232,6 +232,7 @@ SERVICE_REGISTRY = {
     "monitoring": {"module": "cloudwatch", "aliases": ("cloudwatch",)},
     "rds-data": {"module": "rds_data"},
     "rds": {"module": "rds"},
+    "resource-groups": {"module": "resource_groups"},
     "route53": {"module": "route53"},
     "s3": {"module": "s3"},
     "s3files": {"module": "s3files"},
@@ -283,6 +284,7 @@ _state_map = {
     "scheduler": "scheduler", "autoscaling": "autoscaling",
     "eks": "eks", "backup": "backup", "pipes": "pipes",
     "cloudfront_keyvaluestore": "cloudfront_keyvaluestore",
+    "resource_groups": "resource_groups",
     "cloudtrail": "cloudtrail",
 }
 
