@@ -2656,3 +2656,74 @@ def test_cfn_apigwv2_full_http_api_stack_invokes_lambda(cfn, apigw, lam):
     cfn.delete_stack(StackName=stack_name)
     _wait_stack(cfn, stack_name)
     lam.delete_function(FunctionName=fname)
+
+
+# ---------------------------------------------------------------------------
+# AWS::CloudFront::KeyValueStore — covers create, in-place update via
+# UpdateStack (Comment change), and stack-delete teardown.
+# ---------------------------------------------------------------------------
+
+_KVS_TEMPLATE_V1 = """
+AWSTemplateFormatVersion: '2010-09-09'
+Resources:
+  EdgeRoutes:
+    Type: AWS::CloudFront::KeyValueStore
+    Properties:
+      Name: %(name)s
+      Comment: initial
+Outputs:
+  KvsArn:
+    Value: !GetAtt EdgeRoutes.Arn
+  KvsId:
+    Value: !GetAtt EdgeRoutes.Id
+"""
+
+_KVS_TEMPLATE_V2 = """
+AWSTemplateFormatVersion: '2010-09-09'
+Resources:
+  EdgeRoutes:
+    Type: AWS::CloudFront::KeyValueStore
+    Properties:
+      Name: %(name)s
+      Comment: updated by UpdateStack
+Outputs:
+  KvsArn:
+    Value: !GetAtt EdgeRoutes.Arn
+"""
+
+
+def test_cfn_cloudfront_keyvaluestore_create_update_delete(cfn, cloudfront):
+    """AWS::CloudFront::KeyValueStore: create via CFN, update Comment via
+    UpdateStack (in-place; AWS spec only allows Comment to change), describe
+    through the native CloudFront API to confirm the new Comment, then
+    delete via the stack."""
+    stack_name = f"e2e-kvs-{_uuid_mod.uuid4().hex[:8]}"
+    kvs_name = f"cfnkvs-{_uuid_mod.uuid4().hex[:8]}"
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=_KVS_TEMPLATE_V1 % {"name": kvs_name})
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "CREATE_COMPLETE"
+
+    # Outputs carry the ARN + Id from the provisioner.
+    outputs = {o["OutputKey"]: o["OutputValue"] for o in stack["Outputs"]}
+    assert outputs["KvsArn"].endswith(f":key-value-store/{kvs_name}")
+    assert outputs["KvsId"]
+
+    # Native describe sees the create-time Comment.
+    desc = cloudfront.describe_key_value_store(Name=kvs_name)
+    assert desc["KeyValueStore"]["Comment"] == "initial"
+
+    # UpdateStack changes the Comment in place — same physical name, no replacement.
+    cfn.update_stack(StackName=stack_name, TemplateBody=_KVS_TEMPLATE_V2 % {"name": kvs_name})
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "UPDATE_COMPLETE"
+
+    desc = cloudfront.describe_key_value_store(Name=kvs_name)
+    assert desc["KeyValueStore"]["Comment"] == "updated by UpdateStack"
+
+    # Stack delete cleans up the KVS.
+    cfn.delete_stack(StackName=stack_name)
+    _wait_stack(cfn, stack_name)
+    with pytest.raises(ClientError) as exc:
+        cloudfront.describe_key_value_store(Name=kvs_name)
+    assert exc.value.response["Error"]["Code"] == "EntityNotFound"

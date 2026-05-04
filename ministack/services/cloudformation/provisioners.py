@@ -95,6 +95,21 @@ def _delete_resource(resource_type: str, physical_id: str, props: dict):
                    resource_type, physical_id)
 
 
+def _update_resource(resource_type: str, physical_id: str, old_props: dict,
+                     new_props: dict, stack_name: str) -> tuple:
+    """Update a provisioned resource in place when the type provides an ``update``
+    handler. Falls back to ``create`` (which provisioners are expected to
+    implement idempotently) when no explicit update handler is registered.
+    Returns (physical_id, attributes).
+    """
+    handler = _RESOURCE_HANDLERS.get(resource_type)
+    if handler and "update" in handler:
+        return handler["update"](physical_id, old_props, new_props, stack_name)
+    # No update handler — fall through to create. Most resource types make
+    # their create idempotent; CFN never sees a fresh physical id this way.
+    return _provision_resource(resource_type, physical_id, new_props, stack_name)
+
+
 # ===========================================================================
 # Resource Provisioners
 # ===========================================================================
@@ -2693,6 +2708,49 @@ def _cf_distribution_delete(physical_id, props):
 
 
 # ---------------------------------------------------------------------------
+# CloudFront KeyValueStore (management plane)
+# ---------------------------------------------------------------------------
+
+def _cf_kvs_create(logical_id, props, stack_name):
+    name = props.get("Name") or _physical_name(stack_name, logical_id, max_len=64)
+    arn = _cf._kvs_arn(name)
+    if name not in _cf._kvstores:
+        _cf._kvstores[name] = {
+            "Id": new_uuid(),
+            "Name": name,
+            "Comment": props.get("Comment", ""),
+            "ARN": arn,
+            "Status": "READY",
+            "LastModifiedTime": now_iso(),
+            "ETag": new_uuid(),
+        }
+    record = _cf._kvstores[name]
+    # Return refs the spec exposes via Fn::GetAtt: Arn, Id, Status.
+    return name, {"Arn": arn, "Id": record["Id"], "Status": record["Status"]}
+
+
+def _cf_kvs_update(physical_id, old_props, new_props, stack_name):
+    """Update the KVS record (Comment is the only mutable field per AWS spec).
+
+    Name and ImportSource are create-only — a name change requires replacement,
+    handled at the CFN engine level by destroy+create.
+    """
+    record = _cf._kvstores.get(physical_id)
+    if not record:
+        # KVS was deleted out-of-band — recreate to converge to the new state.
+        return _cf_kvs_create(physical_id, new_props, stack_name)
+    if "Comment" in new_props:
+        record["Comment"] = new_props["Comment"] or ""
+    record["ETag"] = new_uuid()
+    record["LastModifiedTime"] = now_iso()
+    return physical_id, {"Arn": record["ARN"], "Id": record["Id"], "Status": record["Status"]}
+
+
+def _cf_kvs_delete(physical_id, props):
+    _cf._kvstores.pop(physical_id, None)
+
+
+# ---------------------------------------------------------------------------
 # RDS DBCluster
 # ---------------------------------------------------------------------------
 
@@ -2992,6 +3050,7 @@ _RESOURCE_HANDLERS = {
     "AWS::SES::EmailIdentity": {"create": _ses_email_identity_create, "delete": _ses_email_identity_delete},
     "AWS::WAFv2::WebACL": {"create": _waf_web_acl_create, "delete": _waf_web_acl_delete},
     "AWS::CloudFront::Distribution": {"create": _cf_distribution_create, "delete": _cf_distribution_delete},
+    "AWS::CloudFront::KeyValueStore": {"create": _cf_kvs_create, "update": _cf_kvs_update, "delete": _cf_kvs_delete},
     "AWS::CloudWatch::Alarm": {"create": _cw_metric_alarm_create, "delete": _cw_metric_alarm_delete},
     "AWS::RDS::DBCluster": {"create": _rds_db_cluster_create, "delete": _rds_db_cluster_delete},
     # EventBridge Scheduler
