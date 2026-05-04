@@ -303,6 +303,19 @@ SERVICE_PATTERNS = {
         "host_patterns": [r"tagging\."],
         "credential_scope": "tagging",
     },
+    "resource-groups": {
+        "host_patterns": [r"resource-groups\."],
+        "credential_scope": "resource-groups",
+        "path_prefixes": [
+            "/groups", "/groups-list", "/get-group", "/delete-group",
+            "/update-group", "/group-resources", "/ungroup-resources",
+            "/list-group-resources", "/list-grouping-statuses",
+            "/get-group-query", "/update-group-query",
+            "/get-group-configuration", "/put-group-configuration",
+            "/get-account-settings", "/update-account-settings",
+            "/resources/search",
+        ],
+    },
     "backup": {
         "host_patterns": [r"backup\."],
         "path_prefixes": ["/backup-vaults", "/backup/plans", "/backup-jobs", "/untag"],
@@ -390,6 +403,7 @@ def detect_service(method: str, path: str, headers: dict, query_params: dict) ->
                 "scheduler": "scheduler",
                 "eks": "eks",
                 "tagging": "tagging",
+                "resource-groups": "resource-groups",
                 "cloudtrail": "cloudtrail",
             }
             if svc_name in scope_map:
