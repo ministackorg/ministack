@@ -9,6 +9,8 @@ Supports: CreateTable, DeleteTable, DescribeTable, ListTables, UpdateTable,
           EnableKinesisStreamingDestination, DisableKinesisStreamingDestination,
           DescribeKinesisStreamingDestination, UpdateKinesisStreamingDestination,
           ExecuteStatement (PartiQL: SELECT, INSERT, UPDATE, DELETE).
+Legacy conditional parameters: Expected (PutItem/UpdateItem/DeleteItem),
+          KeyConditions (Query), ScanFilter/QueryFilter (Scan/Query).
 Uses X-Amz-Target header for action routing (JSON API).
 """
 
@@ -552,8 +554,14 @@ def _put_item(data):
     old_item = table["items"].get(pk_val, {}).get(sk_val)
 
     cond_expr = data.get("ConditionExpression")
+    expected = data.get("Expected")
+    if cond_expr and expected:
+        return error_response_json("ValidationException", "Can not use both expression and non-expression parameters in the same request: Non-expression parameters: {Expected} Expression parameters: {ConditionExpression}", 400)
     if cond_expr:
         if not _evaluate_condition(cond_expr, old_item or {}, data.get("ExpressionAttributeValues", {}), data.get("ExpressionAttributeNames", {})):
+            return _conditional_check_failed(data, old_item)
+    elif expected:
+        if not _evaluate_expected(old_item or {}, expected, data.get("ConditionalOperator", "AND")):
             return _conditional_check_failed(data, old_item)
 
     table["items"][pk_val][sk_val] = item
@@ -601,8 +609,14 @@ def _delete_item(data):
     old_item = table["items"].get(pk_val, {}).get(sk_val)
 
     cond_expr = data.get("ConditionExpression")
+    expected = data.get("Expected")
+    if cond_expr and expected:
+        return error_response_json("ValidationException", "Can not use both expression and non-expression parameters in the same request: Non-expression parameters: {Expected} Expression parameters: {ConditionExpression}", 400)
     if cond_expr:
         if not _evaluate_condition(cond_expr, old_item or {}, data.get("ExpressionAttributeValues", {}), data.get("ExpressionAttributeNames", {})):
+            return _conditional_check_failed(data, old_item)
+    elif expected:
+        if not _evaluate_expected(old_item or {}, expected, data.get("ConditionalOperator", "AND")):
             return _conditional_check_failed(data, old_item)
 
     if old_item is not None:
@@ -633,9 +647,15 @@ def _update_item(data):
     item = copy.deepcopy(existing) if existing else dict(key)
 
     cond_expr = data.get("ConditionExpression")
+    expected = data.get("Expected")
+    if cond_expr and expected:
+        return error_response_json("ValidationException", "Can not use both expression and non-expression parameters in the same request: Non-expression parameters: {Expected} Expression parameters: {ConditionExpression}", 400)
     if cond_expr:
         cond_target = existing or {}
         if not _evaluate_condition(cond_expr, cond_target, data.get("ExpressionAttributeValues", {}), data.get("ExpressionAttributeNames", {})):
+            return _conditional_check_failed(data, existing)
+    elif expected:
+        if not _evaluate_expected(existing or {}, expected, data.get("ConditionalOperator", "AND")):
             return _conditional_check_failed(data, existing)
 
     update_expr = data.get("UpdateExpression", "")
@@ -678,6 +698,7 @@ def _query(data):
     eav = data.get("ExpressionAttributeValues", {})
     ean = data.get("ExpressionAttributeNames", {})
     key_cond = data.get("KeyConditionExpression", "")
+    key_conditions = data.get("KeyConditions")
     filter_expr = data.get("FilterExpression", "")
     limit = data.get("Limit")
     scan_forward = data.get("ScanIndexForward", True)
@@ -685,8 +706,15 @@ def _query(data):
     index_name = data.get("IndexName")
     select = data.get("Select", "ALL_ATTRIBUTES")
 
+    if key_cond and key_conditions:
+        return error_response_json("ValidationException", "Can not use both expression and non-expression parameters in the same request: Non-expression parameters: {KeyConditions} Expression parameters: {KeyConditionExpression}", 400)
+
     pk_name, sk_name, is_gsi = _resolve_index_keys(table, index_name)
-    pk_val = _extract_pk_from_condition(key_cond, eav, ean, pk_name)
+
+    if key_conditions:
+        pk_val = _extract_pk_from_key_conditions(key_conditions, pk_name)
+    else:
+        pk_val = _extract_pk_from_condition(key_cond, eav, ean, pk_name)
     if pk_val is None:
         return error_response_json("ValidationException", "Query condition missed key schema element", 400)
 
@@ -703,7 +731,9 @@ def _query(data):
         sk_type = _get_attr_type(table, sk_name)
         candidates.sort(key=lambda it: _sort_key_value(it.get(sk_name), sk_type), reverse=not scan_forward)
 
-    if key_cond:
+    if key_conditions:
+        candidates = [it for it in candidates if _evaluate_key_conditions_item(it, key_conditions, pk_name)]
+    elif key_cond:
         candidates = [it for it in candidates if _evaluate_condition(key_cond, it, eav, ean)]
 
     if esk:
@@ -1246,6 +1276,9 @@ def _batch_get_item(data):
 def _transact_write_items(data):
     items_list = data.get("TransactItems", [])
 
+    # Phase 1: evaluate ALL conditions and collect failures (AWS returns all,
+    # not just the first).
+    failures = {}  # idx -> existing_item_or_None
     for idx, transact in enumerate(items_list):
         op_type, op = _extract_transact_op(transact)
         if op is None:
@@ -1260,10 +1293,11 @@ def _transact_write_items(data):
             else:
                 existing = _get_item_by_key(tbl, op.get("Key", {}))
             if not _evaluate_condition(cond, existing or {}, op.get("ExpressionAttributeValues", {}), op.get("ExpressionAttributeNames", {})):
-                # AWS populates `Item` on the failing CancellationReason when
-                # the per-op `ReturnValuesOnConditionCheckFailure` is "ALL_OLD".
                 fail_item = existing if op.get("ReturnValuesOnConditionCheckFailure") == "ALL_OLD" else None
-                return _transact_cancel_response(len(items_list), idx, "ConditionalCheckFailed", fail_item)
+                failures[idx] = fail_item
+
+    if failures:
+        return _transact_cancel_response(len(items_list), failures)
 
     for transact in items_list:
         op_type, op = _extract_transact_op(transact)
@@ -1332,13 +1366,20 @@ def _extract_transact_op(transact):
     return None, None
 
 
-def _transact_cancel_response(total, failed_idx, reason, fail_item=None):
+def _transact_cancel_response(total, failures):
+    """Build a TransactionCanceledException response.
+
+    *failures* is a dict mapping failed item indices to the existing item
+    (or ``None`` if ``ReturnValuesOnConditionCheckFailure`` was not ``ALL_OLD``).
+    All entries in the dict are marked ``ConditionalCheckFailed``; the rest are
+    ``None``.  AWS returns a reason entry for every item in the transaction.
+    """
     reasons = []
     for i in range(total):
-        if i == failed_idx:
-            entry = {"Code": reason, "Message": "The conditional request failed"}
-            if fail_item is not None:
-                entry["Item"] = fail_item
+        if i in failures:
+            entry = {"Code": "ConditionalCheckFailed", "Message": "The conditional request failed"}
+            if failures[i] is not None:
+                entry["Item"] = failures[i]
             reasons.append(entry)
         else:
             reasons.append({"Code": "None"})
@@ -2541,34 +2582,148 @@ def _update_counts(table):
     table["TableSizeBytes"] = count * 200
 
 
+def _check_legacy_comparison(item_val, op, attr_vals):
+    """Evaluate a single legacy ComparisonOperator against an item attribute.
+
+    Supports all DynamoDB legacy comparison operators:
+    EQ, NE, LE, LT, GE, GT, NOT_NULL, NULL, CONTAINS, NOT_CONTAINS,
+    BEGINS_WITH, IN, BETWEEN.
+
+    Uses the type-aware _compare_ddb / _ddb_comparable helpers so that numeric
+    comparisons work correctly (e.g. ``{"N":"10"} > {"N":"2"}``).
+    """
+    if op == "NOT_NULL":
+        return item_val is not None
+    if op == "NULL":
+        return item_val is None
+    if op == "EQ":
+        return item_val is not None and _ddb_equals(item_val, attr_vals[0])
+    if op == "NE":
+        return item_val is None or not _ddb_equals(item_val, attr_vals[0])
+    if op in ("LE", "LT", "GE", "GT"):
+        sym = {"LE": "<=", "LT": "<", "GE": ">=", "GT": ">"}[op]
+        return item_val is not None and _compare_ddb(item_val, sym, attr_vals[0])
+    if op == "BETWEEN":
+        return (item_val is not None
+                and _compare_ddb(item_val, ">=", attr_vals[0])
+                and _compare_ddb(item_val, "<=", attr_vals[1]))
+    if op == "IN":
+        return item_val is not None and any(_ddb_equals(item_val, v) for v in attr_vals)
+    if op == "BEGINS_WITH":
+        if item_val is None:
+            return False
+        val = _extract_key_val(item_val)
+        target = _extract_key_val(attr_vals[0]) if attr_vals else ""
+        return str(val).startswith(str(target))
+    if op == "CONTAINS":
+        if item_val is None:
+            return False
+        # For sets (SS/NS/BS), check membership; for S/B, check substring.
+        item_type = _ddb_type(item_val)
+        if item_type in ("SS", "NS", "BS"):
+            target_val = _extract_key_val(attr_vals[0]) if attr_vals else ""
+            return target_val in item_val[item_type]
+        if item_type == "L":
+            return any(_ddb_equals(el, attr_vals[0]) for el in item_val["L"])
+        val = _extract_key_val(item_val)
+        target = _extract_key_val(attr_vals[0]) if attr_vals else ""
+        return str(target) in str(val)
+    if op == "NOT_CONTAINS":
+        if item_val is None:
+            return True
+        item_type = _ddb_type(item_val)
+        if item_type in ("SS", "NS", "BS"):
+            target_val = _extract_key_val(attr_vals[0]) if attr_vals else ""
+            return target_val not in item_val[item_type]
+        if item_type == "L":
+            return not any(_ddb_equals(el, attr_vals[0]) for el in item_val["L"])
+        val = _extract_key_val(item_val)
+        target = _extract_key_val(attr_vals[0]) if attr_vals else ""
+        return str(target) not in str(val)
+    return True
+
+
 def _evaluate_legacy_filter(item, scan_filter):
-    """Evaluate legacy ScanFilter/QueryFilter conditions."""
+    """Evaluate legacy ScanFilter/QueryFilter conditions (implicit AND)."""
     for attr_name, condition in scan_filter.items():
         op = condition.get("ComparisonOperator", "")
         attr_vals = condition.get("AttributeValueList", [])
+        if not _check_legacy_comparison(item.get(attr_name), op, attr_vals):
+            return False
+    return True
+
+
+def _evaluate_expected(item, expected, conditional_operator="AND"):
+    """Evaluate legacy ``Expected`` conditions on an item.
+
+    Each key in *expected* is an attribute name.  The value is one of:
+
+    1. ``{"ComparisonOperator": "...", "AttributeValueList": [...]}``
+       – full comparison form.
+    2. ``{"Exists": true/false}``
+       – shorthand for NOT_NULL / NULL.
+    3. ``{"Value": <attr>}``
+       – shorthand for ``{"ComparisonOperator": "EQ", "AttributeValueList": [<attr>]}``.
+    4. ``{"Exists": false}``
+       – attribute must *not* exist.
+
+    *conditional_operator* is ``"AND"`` (default) or ``"OR"``.
+    """
+    results = []
+    for attr_name, cond in expected.items():
         item_val = item.get(attr_name)
-        if op == "EQ":
-            if item_val is None or item_val != attr_vals[0]:
-                return False
-        elif op == "NE":
-            if item_val is not None and item_val == attr_vals[0]:
-                return False
-        elif op == "NOT_NULL":
-            if item_val is None:
-                return False
-        elif op == "NULL":
-            if item_val is not None:
-                return False
-        elif op == "CONTAINS":
-            val = _extract_key_val(item_val) if item_val else ""
-            target = _extract_key_val(attr_vals[0]) if attr_vals else ""
-            if target not in str(val):
-                return False
-        elif op == "BEGINS_WITH":
-            val = _extract_key_val(item_val) if item_val else ""
-            target = _extract_key_val(attr_vals[0]) if attr_vals else ""
-            if not str(val).startswith(str(target)):
-                return False
+
+        # Shorthand: Exists / Value (cannot coexist with ComparisonOperator)
+        if "ComparisonOperator" not in cond:
+            if "Exists" in cond:
+                if cond["Exists"]:
+                    results.append(item_val is not None)
+                else:
+                    results.append(item_val is None)
+                continue
+            if "Value" in cond:
+                results.append(item_val is not None and _ddb_equals(item_val, cond["Value"]))
+                continue
+            # If neither — treat as attribute must exist (AWS default)
+            results.append(item_val is not None)
+            continue
+
+        op = cond["ComparisonOperator"]
+        attr_vals = cond.get("AttributeValueList", [])
+        results.append(_check_legacy_comparison(item_val, op, attr_vals))
+
+    if conditional_operator == "OR":
+        return any(results) if results else True
+    return all(results)
+
+
+def _extract_pk_from_key_conditions(key_conditions, pk_name):
+    """Extract the partition key value from a legacy ``KeyConditions`` map.
+
+    The partition key entry must use ``EQ`` with exactly one value.
+    Returns the extracted string/number value, or ``None`` if not found.
+    """
+    pk_cond = key_conditions.get(pk_name)
+    if not pk_cond:
+        return None
+    op = pk_cond.get("ComparisonOperator", "")
+    attr_vals = pk_cond.get("AttributeValueList", [])
+    if op != "EQ" or len(attr_vals) != 1:
+        return None
+    return _extract_key_val(attr_vals[0])
+
+
+def _evaluate_key_conditions_item(item, key_conditions, pk_name):
+    """Check whether *item* satisfies all ``KeyConditions`` entries.
+
+    The partition key is always checked via EQ.  The sort key (if present)
+    supports: EQ, LE, LT, GE, GT, BEGINS_WITH, BETWEEN.
+    """
+    for attr_name, cond in key_conditions.items():
+        op = cond.get("ComparisonOperator", "")
+        attr_vals = cond.get("AttributeValueList", [])
+        if not _check_legacy_comparison(item.get(attr_name), op, attr_vals):
+            return False
     return True
 
 
