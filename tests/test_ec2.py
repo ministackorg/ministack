@@ -546,6 +546,38 @@ def test_ec2_vpc_endpoint_crud(ec2):
 
     ec2.delete_vpc(VpcId=vpc_id)
 
+def test_ec2_describe_vpc_endpoint_services(ec2):
+    resp = ec2.describe_vpc_endpoint_services()
+    names = resp["ServiceNames"]
+    assert "com.amazonaws.us-east-1.s3" in names
+    assert "com.amazonaws.us-east-1.dynamodb" in names
+    assert "com.amazonaws.us-east-1.sts" in names
+
+    by_name = {d["ServiceName"]: d for d in resp["ServiceDetails"]}
+    s3 = by_name["com.amazonaws.us-east-1.s3"]
+    assert s3["ServiceType"][0]["ServiceType"] == "Gateway"
+    assert s3["Owner"] == "amazon"
+    assert "us-east-1a" in s3["AvailabilityZones"]
+    assert s3["BaseEndpointDnsNames"] == ["s3.us-east-1.amazonaws.com"]
+    assert "PrivateDnsName" not in s3
+
+    sts = by_name["com.amazonaws.us-east-1.sts"]
+    assert sts["ServiceType"][0]["ServiceType"] == "Interface"
+    assert sts["PrivateDnsName"] == "sts.us-east-1.amazonaws.com"
+
+    filtered = ec2.describe_vpc_endpoint_services(
+        ServiceNames=["com.amazonaws.us-east-1.s3"],
+    )
+    assert filtered["ServiceNames"] == ["com.amazonaws.us-east-1.s3"]
+
+    gw_only = ec2.describe_vpc_endpoint_services(
+        Filters=[{"Name": "service-type", "Values": ["Gateway"]}],
+    )
+    assert all(
+        d["ServiceType"][0]["ServiceType"] == "Gateway"
+        for d in gw_only["ServiceDetails"]
+    )
+
 def test_ec2_describe_route_tables_default(ec2):
     desc = ec2.describe_route_tables()
     assert any(rt["VpcId"] == "vpc-00000001" for rt in desc["RouteTables"])
