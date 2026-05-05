@@ -40,6 +40,52 @@ _EXECUTE_API_RE = re.compile(
 )
 # AppSync Events realtime WebSocket: {apiId}.appsync-realtime-api.<anything>[:port].
 _APPSYNC_REALTIME_RE = re.compile(r"^([a-z0-9]+)\.appsync-realtime-api\.")
+# IoT data plane WebSocket: anything containing ".iot." in the host header.
+# Match all four AWS-shaped variants (data-ats.iot, data.iot, plain iot, plus
+# an account-prefixed iot endpoint as returned by DescribeEndpoint).
+_IOT_DATA_WS_RE = re.compile(r"\.iot\.")
+
+
+def _ws_has_mqtt_subprotocol(ws_headers: dict) -> bool:
+    """Check whether the upgrade request advertises an ``mqtt`` subprotocol."""
+    raw = ws_headers.get("sec-websocket-protocol", "")
+    for proto in (p.strip().lower() for p in raw.split(",") if p.strip()):
+        if proto in ("mqtt", "mqttv3.1", "mqttv5"):
+            return True
+    return False
+
+
+def _ws_resolve_iot_account_id(scope: dict, ws_headers: dict) -> str:
+    """Pick the account ID for an inbound IoT WebSocket upgrade.
+
+    Resolution order:
+
+    1. ``X-Amz-Credential`` query parameter (SigV4-signed WS) — extract the
+       access key portion. If it's a 12-digit number, use it as the account.
+    2. ``Authorization: AWS4-HMAC-SHA256`` header — same extraction.
+    3. Fall back to ``MINISTACK_ACCOUNT_ID`` / ``000000000000``.
+
+    SigV4 signature *verification* is intentionally lax in Phase 1 (any
+    well-formed credential is accepted); IoT policy enforcement is a Phase 2+
+    feature. The point here is multi-tenancy isolation, not auth.
+    """
+    qs = scope.get("query_string", b"").decode("utf-8", errors="replace")
+    qp = parse_qs(qs, keep_blank_values=True) if qs else {}
+
+    cred = ""
+    raw = qp.get("X-Amz-Credential") or qp.get("x-amz-credential")
+    if raw:
+        cred = raw[0] if isinstance(raw, list) else raw
+    if not cred:
+        auth = ws_headers.get("authorization", "")
+        m = re.search(r"Credential=([^,/]+)/", auth)
+        if m:
+            cred = m.group(1)
+
+    access_key = cred.split("/", 1)[0] if cred else ""
+    if access_key and re.match(r"^\d{12}$", access_key):
+        return access_key
+    return os.environ.get("MINISTACK_ACCOUNT_ID", "000000000000")
 # Virtual-hosted S3 bucket extraction. AWS-aligned per
 # docs.aws.amazon.com/AmazonS3/latest/userguide/VirtualHosting.html and
 # bucketnamingrules.html (HTTP vhost — ministack is HTTP). Works for any
@@ -84,7 +130,7 @@ def _extract_s3_vhost_bucket(host: str):
     if first_tail_segment == "s3" or first_tail_segment.startswith(("s3-", "s3express-")):
         return candidate
     return None
-_S3_VHOST_EXCLUDE_RE = re.compile(r"\.(execute-api|alb|emr|efs|elasticache|s3-control|appsync-api|appsync-realtime-api)\.")
+_S3_VHOST_EXCLUDE_RE = re.compile(r"\.(execute-api|alb|emr|efs|elasticache|s3-control|appsync-api|appsync-realtime-api|iot)\.")
 _HEALTH_PATHS = ("/_ministack/health", "/_localstack/health", "/health")
 _BODY_METHODS = ("POST", "PUT", "PATCH")
 _COGNITO_USERINFO_PATHS = ("/oauth2/userInfo", "/oauth2/userinfo")
@@ -224,6 +270,8 @@ SERVICE_REGISTRY = {
     "glue": {"module": "glue"},
     "iam": {"module": "iam"},
     "imds": {"module": "imds"},
+    "iot": {"module": "iot"},
+    "iot-data": {"module": "iot_data"},
     "kinesis": {"module": "kinesis"},
     "kms": {"module": "kms"},
     "lambda": {"module": "lambda_svc"},
@@ -330,7 +378,8 @@ BANNER = r"""
           SSM, EventBridge, Kinesis, CloudWatch, SES, SES v2, ACM, WAF v2, Step Functions,
           ECS, RDS, ElastiCache, Glue, Athena, API Gateway, Firehose, Route53,
           Cognito, EC2, EMR, EBS, EFS, ALB/ELBv2, CloudFormation, KMS, ECR, CloudFront,
-          AppSync, Cloud Map, S3 Files, RDS Data API, CodeBuild, AppConfig, Transfer, EKS
+          AppSync, Cloud Map, S3 Files, RDS Data API, CodeBuild, AppConfig, Transfer, EKS,
+          IoT Core
 """
 
 
@@ -672,7 +721,45 @@ async def _handle_pre_body_request(method: str, path: str, headers: dict, query_
     if response is not None:
         return response
 
+    response = _handle_iot_ca_request(method, path)
+    if response is not None:
+        return response
+
     return await _handle_admin_reset(path, method, query_params)
+
+
+def _handle_iot_ca_request(method: str, path: str):
+    """`GET /_ministack/iot/ca.pem` returns the Local CA root certificate.
+
+    Test code and IoT SDKs use this to configure trust for mTLS connections
+    to the local broker (Phase 2). The CA is generated lazily on first call.
+    """
+    if path != "/_ministack/iot/ca.pem" or method != "GET":
+        return None
+    try:
+        from ministack.core import local_ca
+
+        cert_pem = local_ca.get_ca_cert_pem()
+    except RuntimeError as e:
+        return (
+            503,
+            {"Content-Type": "application/json"},
+            json.dumps({"message": str(e)}).encode(),
+        )
+    except Exception as e:
+        return (
+            500,
+            {"Content-Type": "application/json"},
+            json.dumps({"message": str(e)}).encode(),
+        )
+    return (
+        200,
+        {
+            "Content-Type": "application/x-pem-file",
+            "Content-Disposition": "attachment; filename=\"ministack-iot-ca.pem\"",
+        },
+        cert_pem.encode("utf-8"),
+    )
 
 
 def _handle_transfer_sftp_ports_request(method: str, path: str):
@@ -1372,7 +1459,8 @@ async def app(scope, receive, send):
         ws_path = scope.get("path", "")
         parsed = _parse_execute_api_url(ws_host, ws_path)
         appsync_rt_m = _APPSYNC_REALTIME_RE.match(ws_host)
-        if not parsed and not appsync_rt_m:
+        iot_ws_m = _IOT_DATA_WS_RE.search(ws_host) and _ws_has_mqtt_subprotocol(ws_headers)
+        if not parsed and not appsync_rt_m and not iot_ws_m:
             msg = await receive()
             if msg.get("type") == "websocket.connect":
                 await send({"type": "websocket.close", "code": 1008})
@@ -1383,9 +1471,16 @@ async def app(scope, receive, send):
                 await _get_module("apigateway").handle_websocket(
                     scope, receive, send, ws_api_id, path_override=_execute_path,
                 )
-            else:
+            elif appsync_rt_m:
                 await _get_module("appsync_events").handle_websocket(
                     scope, receive, send, appsync_rt_m.group(1)
+                )
+            else:
+                # IoT MQTT-over-WS — resolve account_id from SigV4 query
+                # params or Authorization header, fall back to default.
+                account_id = _ws_resolve_iot_account_id(scope, ws_headers)
+                await _get_module("iot_broker").handle_websocket(
+                    scope, receive, send, account_id
                 )
         except Exception:
             logger.exception("Error in WebSocket dispatch")

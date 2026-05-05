@@ -7,6 +7,15 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [Unreleased]
+
+### Added
+- **IoT Core (Phase 1)** — initial AWS IoT Core support split into control plane and data plane.
+  - Control plane (Phase 1a): Things / ThingTypes / ThingGroups CRUD, IoT Policies (CRUD + versioning + attach/detach), Certificates issued by a new in-process Local CA (`ministack/core/local_ca.py`), `CreateKeysAndCertificate`, `RegisterCertificate`, `AttachThingPrincipal`/`DetachThingPrincipal`, `DescribeEndpoint` returning a per-account hostname.
+  - Data plane (Phase 1b): `iot-data Publish` HTTP API (`POST /topics/{topic}` with QoS 0/1 and retain) plus MQTT 3.1.1 over WebSocket on the gateway port using the `mqtt` Sec-WebSocket-Protocol value. Multi-tenancy is enforced by transparent topic prefixing in the bridge layer (same architectural pattern as Transfer Family's shared SFTP listener resolving users at the session level).
+  - Local CA root certificate is exposed at `GET /_ministack/iot/ca.pem` so test code can configure SDK trust. Both the CA and issued client certificates persist across restarts when `PERSIST_STATE=1`.
+  - Deferred to Phase 2: Device Shadows, mTLS on port 8883, retained-message queries. Phase 3: Rules Engine, Jobs, Fleet Provisioning. Plain unencrypted MQTT on TCP 1883 is intentionally NOT exposed (real AWS IoT requires TLS or SigV4 on every connection). IoT policy documents are stored but not enforced on the data plane.
+
 ## [1.3.28] — 2026-05-05
 
 ### Added

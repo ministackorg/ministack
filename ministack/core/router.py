@@ -253,6 +253,30 @@ SERVICE_PATTERNS = {
         "host_patterns": [r"transfer\."],
         "credential_scope": "transfer",
     },
+    # IoT data plane (iot-data API) MUST come before "iot" because the host
+    # `data-ats.iot.{region}.{host}` matches both `iot\.` and the more
+    # specific `data-ats\.iot\.` regexes — first-match-wins routing in
+    # detect_service() means we want iot-data to win for data plane traffic.
+    "iot-data": {
+        "host_patterns": [r"data-ats\.iot\.", r"data\.iot\."],
+        "credential_scope": "iotdata",
+        "path_prefixes": ["/topics/", "/retainedMessage"],
+    },
+    "iot": {
+        "host_patterns": [r"iot\."],
+        "credential_scope": "iot",
+        "path_prefixes": [
+            "/things",
+            "/thing-types",
+            "/thing-groups",
+            "/policies",
+            "/certificates",
+            "/keys-and-certificate",
+            "/principals",
+            "/endpoint",
+            "/target-policies",
+        ],
+    },
     "appsync": {
         "host_patterns": [r"appsync\."],
         "path_prefixes": ["/v1/apis", "/v1/tags"],
@@ -397,6 +421,9 @@ def detect_service(method: str, path: str, headers: dict, query_params: dict) ->
                 "cloudfront": "cloudfront",
                 "codebuild": "codebuild",
                 "transfer": "transfer",
+                "iot": "iot",
+                "iotdata": "iot-data",
+                "iotdevicegateway": "iot-data",
                 "appsync": "appsync",
                 "servicediscovery": "servicediscovery",
                 "s3files": "s3files",

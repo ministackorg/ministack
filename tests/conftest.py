@@ -305,6 +305,16 @@ def acm_client():
 
 
 @pytest.fixture(scope="session")
+def iot_client():
+    return make_client("iot")
+
+
+@pytest.fixture(scope="session")
+def iot_data_client():
+    return make_client("iot-data")
+
+
+@pytest.fixture(scope="session")
 def wafv2():
     return make_client("wafv2")
 
