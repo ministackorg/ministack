@@ -1218,6 +1218,55 @@ def test_dynamodb_transact_write_condition_cancel(ddb):
     resp = ddb.get_item(TableName="qa-ddb-transact", Key={"pk": {"S": "new-item"}})
     assert "Item" not in resp
 
+def test_dynamodb_transact_write_multiple_failures_all_returned(ddb):
+    """TransactWriteItems returns CancellationReasons for ALL failed conditions, not just the first."""
+    table = "qa-ddb-transact"
+    # Ensure two items exist to trigger two condition failures
+    ddb.put_item(TableName=table, Item={"pk": {"S": "multi_fail_1"}, "val": {"S": "a"}})
+    ddb.put_item(TableName=table, Item={"pk": {"S": "multi_fail_2"}, "val": {"S": "b"}})
+    with pytest.raises(ClientError) as exc:
+        ddb.transact_write_items(
+            TransactItems=[
+                {
+                    "Put": {
+                        "TableName": table,
+                        "Item": {"pk": {"S": "multi_fail_1"}, "val": {"S": "x"}},
+                        "ConditionExpression": "attribute_not_exists(pk)",
+                        "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+                    }
+                },
+                {
+                    "Put": {
+                        "TableName": table,
+                        "Item": {"pk": {"S": "brand_new"}},
+                    }
+                },
+                {
+                    "Put": {
+                        "TableName": table,
+                        "Item": {"pk": {"S": "multi_fail_2"}, "val": {"S": "y"}},
+                        "ConditionExpression": "attribute_not_exists(pk)",
+                        "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+                    }
+                },
+            ]
+        )
+    err = exc.value.response
+    assert err["Error"]["Code"] == "TransactionCanceledException"
+    reasons = err["CancellationReasons"]
+    assert len(reasons) == 3
+    # First and third items should have ConditionalCheckFailed with Item populated
+    assert reasons[0]["Code"] == "ConditionalCheckFailed"
+    assert reasons[0]["Item"]["pk"]["S"] == "multi_fail_1"
+    assert reasons[0]["Item"]["val"]["S"] == "a"
+    # Second item had no condition — should be "None"
+    assert reasons[1]["Code"] == "None"
+    # Third item should also be failed with its old item
+    assert reasons[2]["Code"] == "ConditionalCheckFailed"
+    assert reasons[2]["Item"]["pk"]["S"] == "multi_fail_2"
+    assert reasons[2]["Item"]["val"]["S"] == "b"
+
+
 def test_dynamodb_batch_get_missing_table(ddb):
     """BatchGetItem with non-existent table returns it in UnprocessedKeys."""
     resp = ddb.batch_get_item(RequestItems={"qa-ddb-nonexistent-xyz": {"Keys": [{"pk": {"S": "k1"}}]}})
@@ -1925,5 +1974,372 @@ def test_multiple_puts_land_in_order(ddb, kin):
     ]
     keys = [d["dynamodb"]["Keys"]["pk"]["S"] for d in decoded]
     assert keys == [f"k{i}" for i in range(5)]
+
+
+# ---------------------------------------------------------------------------
+# Legacy Expected API tests (issue #563)
+# ---------------------------------------------------------------------------
+
+
+def test_dynamodb_put_item_expected_exists_false(ddb):
+    """PutItem with Expected {Exists: false} blocks overwrites."""
+    table = "intg-ddb-expected"
+    try:
+        ddb.delete_table(TableName=table)
+    except ClientError:
+        pass
+    ddb.create_table(
+        TableName=table,
+        KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+        AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "S"}],
+        BillingMode="PAY_PER_REQUEST",
+    )
+    # First put succeeds — item does not exist
+    ddb.put_item(
+        TableName=table,
+        Item={"pk": {"S": "exp1"}, "val": {"S": "first"}},
+        Expected={"pk": {"Exists": False}},
+    )
+    resp = ddb.get_item(TableName=table, Key={"pk": {"S": "exp1"}})
+    assert resp["Item"]["val"]["S"] == "first"
+
+    # Second put fails — item already exists
+    with pytest.raises(ClientError) as exc:
+        ddb.put_item(
+            TableName=table,
+            Item={"pk": {"S": "exp1"}, "val": {"S": "second"}},
+            Expected={"pk": {"Exists": False}},
+        )
+    assert exc.value.response["Error"]["Code"] == "ConditionalCheckFailedException"
+
+
+def test_dynamodb_put_item_expected_value_eq(ddb):
+    """PutItem with Expected {Value: ...} shorthand (EQ check)."""
+    table = "intg-ddb-expected"
+    ddb.put_item(TableName=table, Item={"pk": {"S": "exp_val"}, "status": {"S": "draft"}})
+    # Should succeed — status matches
+    ddb.put_item(
+        TableName=table,
+        Item={"pk": {"S": "exp_val"}, "status": {"S": "published"}},
+        Expected={"status": {"Value": {"S": "draft"}}},
+    )
+    resp = ddb.get_item(TableName=table, Key={"pk": {"S": "exp_val"}})
+    assert resp["Item"]["status"]["S"] == "published"
+
+    # Should fail — status is now "published", not "draft"
+    with pytest.raises(ClientError) as exc:
+        ddb.put_item(
+            TableName=table,
+            Item={"pk": {"S": "exp_val"}, "status": {"S": "archived"}},
+            Expected={"status": {"Value": {"S": "draft"}}},
+        )
+    assert exc.value.response["Error"]["Code"] == "ConditionalCheckFailedException"
+
+
+def test_dynamodb_put_item_expected_comparison_operator(ddb):
+    """PutItem with Expected using full ComparisonOperator form."""
+    table = "intg-ddb-expected"
+    ddb.put_item(TableName=table, Item={"pk": {"S": "exp_comp"}, "count": {"N": "5"}})
+    # LE: count <= 10 → should succeed
+    ddb.put_item(
+        TableName=table,
+        Item={"pk": {"S": "exp_comp"}, "count": {"N": "10"}},
+        Expected={"count": {"ComparisonOperator": "LE", "AttributeValueList": [{"N": "10"}]}},
+    )
+    # GT: count > 100 → should fail (count is 10)
+    with pytest.raises(ClientError) as exc:
+        ddb.put_item(
+            TableName=table,
+            Item={"pk": {"S": "exp_comp"}, "count": {"N": "20"}},
+            Expected={"count": {"ComparisonOperator": "GT", "AttributeValueList": [{"N": "100"}]}},
+        )
+    assert exc.value.response["Error"]["Code"] == "ConditionalCheckFailedException"
+
+
+def test_dynamodb_delete_item_expected(ddb):
+    """DeleteItem with Expected condition."""
+    table = "intg-ddb-expected"
+    ddb.put_item(TableName=table, Item={"pk": {"S": "exp_del"}, "status": {"S": "inactive"}})
+    # Should fail — status is not "active"
+    with pytest.raises(ClientError) as exc:
+        ddb.delete_item(
+            TableName=table,
+            Key={"pk": {"S": "exp_del"}},
+            Expected={"status": {"Value": {"S": "active"}}},
+        )
+    assert exc.value.response["Error"]["Code"] == "ConditionalCheckFailedException"
+    # Item should still exist
+    resp = ddb.get_item(TableName=table, Key={"pk": {"S": "exp_del"}})
+    assert "Item" in resp
+
+    # Should succeed — status matches
+    ddb.delete_item(
+        TableName=table,
+        Key={"pk": {"S": "exp_del"}},
+        Expected={"status": {"Value": {"S": "inactive"}}},
+    )
+    resp = ddb.get_item(TableName=table, Key={"pk": {"S": "exp_del"}})
+    assert "Item" not in resp
+
+
+def test_dynamodb_update_item_expected(ddb):
+    """UpdateItem with Expected condition."""
+    table = "intg-ddb-expected"
+    ddb.put_item(TableName=table, Item={"pk": {"S": "exp_upd"}, "ver": {"N": "1"}})
+    # Optimistic locking — update only if ver == 1
+    ddb.update_item(
+        TableName=table,
+        Key={"pk": {"S": "exp_upd"}},
+        UpdateExpression="SET ver = :newver",
+        ExpressionAttributeValues={":newver": {"N": "2"}},
+        Expected={"ver": {"Value": {"N": "1"}}},
+    )
+    resp = ddb.get_item(TableName=table, Key={"pk": {"S": "exp_upd"}})
+    assert resp["Item"]["ver"]["N"] == "2"
+
+    # Should fail — ver is now 2, not 1
+    with pytest.raises(ClientError) as exc:
+        ddb.update_item(
+            TableName=table,
+            Key={"pk": {"S": "exp_upd"}},
+            UpdateExpression="SET ver = :newver",
+            ExpressionAttributeValues={":newver": {"N": "3"}},
+            Expected={"ver": {"Value": {"N": "1"}}},
+        )
+    assert exc.value.response["Error"]["Code"] == "ConditionalCheckFailedException"
+
+
+def test_dynamodb_expected_conditional_operator_or(ddb):
+    """Expected with ConditionalOperator=OR — passes if any condition is true."""
+    table = "intg-ddb-expected"
+    ddb.put_item(TableName=table, Item={"pk": {"S": "exp_or"}, "a": {"S": "x"}, "b": {"S": "y"}})
+    # a == "x" OR b == "z" → should pass (a matches)
+    ddb.put_item(
+        TableName=table,
+        Item={"pk": {"S": "exp_or"}, "a": {"S": "x"}, "b": {"S": "y"}},
+        Expected={
+            "a": {"ComparisonOperator": "EQ", "AttributeValueList": [{"S": "x"}]},
+            "b": {"ComparisonOperator": "EQ", "AttributeValueList": [{"S": "z"}]},
+        },
+        ConditionalOperator="OR",
+    )
+
+
+def test_dynamodb_expected_between(ddb):
+    """Expected with BETWEEN operator."""
+    table = "intg-ddb-expected"
+    ddb.put_item(TableName=table, Item={"pk": {"S": "exp_btwn"}, "score": {"N": "75"}})
+    # score BETWEEN 50 AND 100 → should pass
+    ddb.put_item(
+        TableName=table,
+        Item={"pk": {"S": "exp_btwn"}, "score": {"N": "80"}},
+        Expected={
+            "score": {
+                "ComparisonOperator": "BETWEEN",
+                "AttributeValueList": [{"N": "50"}, {"N": "100"}],
+            }
+        },
+    )
+    # score BETWEEN 90 AND 100 → should fail (score is 80)
+    with pytest.raises(ClientError) as exc:
+        ddb.put_item(
+            TableName=table,
+            Item={"pk": {"S": "exp_btwn"}, "score": {"N": "85"}},
+            Expected={
+                "score": {
+                    "ComparisonOperator": "BETWEEN",
+                    "AttributeValueList": [{"N": "90"}, {"N": "100"}],
+                }
+            },
+        )
+    assert exc.value.response["Error"]["Code"] == "ConditionalCheckFailedException"
+
+
+def test_dynamodb_expected_in(ddb):
+    """Expected with IN operator."""
+    table = "intg-ddb-expected"
+    ddb.put_item(TableName=table, Item={"pk": {"S": "exp_in"}, "status": {"S": "active"}})
+    # status IN ("active", "pending") → should pass
+    ddb.put_item(
+        TableName=table,
+        Item={"pk": {"S": "exp_in"}, "status": {"S": "active"}},
+        Expected={
+            "status": {
+                "ComparisonOperator": "IN",
+                "AttributeValueList": [{"S": "active"}, {"S": "pending"}],
+            }
+        },
+    )
+
+
+def test_dynamodb_expected_mutually_exclusive_with_condition_expression(ddb):
+    """Expected and ConditionExpression cannot be used together."""
+    table = "intg-ddb-expected"
+    with pytest.raises(ClientError) as exc:
+        ddb.put_item(
+            TableName=table,
+            Item={"pk": {"S": "exp_excl"}},
+            Expected={"pk": {"Exists": False}},
+            ConditionExpression="attribute_not_exists(pk)",
+        )
+    assert exc.value.response["Error"]["Code"] == "ValidationException"
+
+
+# ---------------------------------------------------------------------------
+# Legacy KeyConditions API tests (issue #563)
+# ---------------------------------------------------------------------------
+
+
+def test_dynamodb_query_key_conditions_basic(ddb):
+    """Query with legacy KeyConditions on partition key only."""
+    table = "intg-ddb-keycond"
+    try:
+        ddb.delete_table(TableName=table)
+    except ClientError:
+        pass
+    ddb.create_table(
+        TableName=table,
+        KeySchema=[
+            {"AttributeName": "pk", "KeyType": "HASH"},
+            {"AttributeName": "sk", "KeyType": "RANGE"},
+        ],
+        AttributeDefinitions=[
+            {"AttributeName": "pk", "AttributeType": "S"},
+            {"AttributeName": "sk", "AttributeType": "S"},
+        ],
+        BillingMode="PAY_PER_REQUEST",
+    )
+    for i in range(5):
+        ddb.put_item(TableName=table, Item={
+            "pk": {"S": "kc_pk"},
+            "sk": {"S": f"sk_{i:03d}"},
+            "data": {"S": f"val_{i}"},
+        })
+    # Add items with different PK to ensure filtering works
+    ddb.put_item(TableName=table, Item={"pk": {"S": "other_pk"}, "sk": {"S": "sk_000"}, "data": {"S": "other"}})
+
+    resp = ddb.query(
+        TableName=table,
+        KeyConditions={
+            "pk": {
+                "AttributeValueList": [{"S": "kc_pk"}],
+                "ComparisonOperator": "EQ",
+            },
+        },
+    )
+    assert resp["Count"] == 5
+    assert all(item["pk"]["S"] == "kc_pk" for item in resp["Items"])
+
+
+def test_dynamodb_query_key_conditions_sort_key_begins_with(ddb):
+    """Query with KeyConditions using BEGINS_WITH on sort key."""
+    table = "intg-ddb-keycond"
+    resp = ddb.query(
+        TableName=table,
+        KeyConditions={
+            "pk": {
+                "AttributeValueList": [{"S": "kc_pk"}],
+                "ComparisonOperator": "EQ",
+            },
+            "sk": {
+                "AttributeValueList": [{"S": "sk_00"}],
+                "ComparisonOperator": "BEGINS_WITH",
+            },
+        },
+    )
+    # sk_000, sk_001, sk_002, sk_003, sk_004 all start with "sk_00"
+    assert resp["Count"] == 5
+
+
+def test_dynamodb_query_key_conditions_sort_key_between(ddb):
+    """Query with KeyConditions using BETWEEN on sort key."""
+    table = "intg-ddb-keycond"
+    resp = ddb.query(
+        TableName=table,
+        KeyConditions={
+            "pk": {
+                "AttributeValueList": [{"S": "kc_pk"}],
+                "ComparisonOperator": "EQ",
+            },
+            "sk": {
+                "AttributeValueList": [{"S": "sk_001"}, {"S": "sk_003"}],
+                "ComparisonOperator": "BETWEEN",
+            },
+        },
+    )
+    assert resp["Count"] == 3
+    sks = [item["sk"]["S"] for item in resp["Items"]]
+    assert sks == ["sk_001", "sk_002", "sk_003"]
+
+
+def test_dynamodb_query_key_conditions_sort_key_lt(ddb):
+    """Query with KeyConditions using LT on sort key."""
+    table = "intg-ddb-keycond"
+    resp = ddb.query(
+        TableName=table,
+        KeyConditions={
+            "pk": {
+                "AttributeValueList": [{"S": "kc_pk"}],
+                "ComparisonOperator": "EQ",
+            },
+            "sk": {
+                "AttributeValueList": [{"S": "sk_002"}],
+                "ComparisonOperator": "LT",
+            },
+        },
+    )
+    assert resp["Count"] == 2
+    sks = [item["sk"]["S"] for item in resp["Items"]]
+    assert sks == ["sk_000", "sk_001"]
+
+
+def test_dynamodb_query_key_conditions_mutually_exclusive(ddb):
+    """KeyConditions and KeyConditionExpression cannot be used together."""
+    table = "intg-ddb-keycond"
+    with pytest.raises(ClientError) as exc:
+        ddb.query(
+            TableName=table,
+            KeyConditionExpression="pk = :pk",
+            ExpressionAttributeValues={":pk": {"S": "kc_pk"}},
+            KeyConditions={
+                "pk": {
+                    "AttributeValueList": [{"S": "kc_pk"}],
+                    "ComparisonOperator": "EQ",
+                },
+            },
+        )
+    assert exc.value.response["Error"]["Code"] == "ValidationException"
+
+
+def test_dynamodb_query_key_conditions_with_query_filter(ddb):
+    """KeyConditions can be used together with legacy QueryFilter."""
+    table = "intg-ddb-keycond"
+    # Add items with a "status" attribute for filtering
+    for i in range(4):
+        ddb.put_item(TableName=table, Item={
+            "pk": {"S": "kc_filt"},
+            "sk": {"S": f"f_{i:03d}"},
+            "status": {"S": "active" if i < 2 else "inactive"},
+        })
+
+    resp = ddb.query(
+        TableName=table,
+        KeyConditions={
+            "pk": {
+                "AttributeValueList": [{"S": "kc_filt"}],
+                "ComparisonOperator": "EQ",
+            },
+        },
+        QueryFilter={
+            "status": {
+                "AttributeValueList": [{"S": "active"}],
+                "ComparisonOperator": "EQ",
+            },
+        },
+    )
+    assert resp["Count"] == 2
+    assert resp["ScannedCount"] == 4
+    for item in resp["Items"]:
+        assert item["status"]["S"] == "active"
 
 
