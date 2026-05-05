@@ -24,7 +24,7 @@ Supports:
   ENI:             CreateNetworkInterface, DeleteNetworkInterface, DescribeNetworkInterfaces,
                    AttachNetworkInterface, DetachNetworkInterface
   VPC Endpoints:   CreateVpcEndpoint, DeleteVpcEndpoints, DescribeVpcEndpoints,
-                   ModifyVpcEndpoint, DescribePrefixLists
+                   DescribeVpcEndpointServices, ModifyVpcEndpoint, DescribePrefixLists
   EBS Volumes:     CreateVolume, DeleteVolume, DescribeVolumes, DescribeVolumeStatus,
                    AttachVolume, DetachVolume, ModifyVolume, DescribeVolumesModifications,
                    EnableVolumeIO, ModifyVolumeAttribute, DescribeVolumeAttribute
@@ -1468,6 +1468,72 @@ def _describe_vpc_endpoints(p):
     )
     return _xml(200, "DescribeVpcEndpointsResponse",
                 f"<vpcEndpointSet>{items}</vpcEndpointSet>")
+
+
+# Services available as VPC endpoints. s3 and dynamodb are Gateway endpoints
+# (free, route-table-based); the rest are Interface (PrivateLink).
+_VPCE_GATEWAY_SERVICES = ("s3", "dynamodb")
+_VPCE_INTERFACE_SERVICES = (
+    "ec2", "sts", "logs", "sqs", "sns", "kinesis", "lambda",
+    "ssm", "ssmmessages", "ec2messages", "secretsmanager", "kms",
+    "monitoring", "events", "ecr.api", "ecr.dkr", "execute-api",
+)
+
+
+def _describe_vpc_endpoint_services(p):
+    region = get_region()
+    azs = [f"{region}a", f"{region}b", f"{region}c"]
+    requested = _parse_member_list(p, "ServiceName")
+    filters = _parse_filters(p)
+    name_filters = filters.get("service-name", [])
+    type_filters = filters.get("service-type", [])
+
+    catalog = []
+    for svc in _VPCE_GATEWAY_SERVICES:
+        catalog.append((f"com.amazonaws.{region}.{svc}", "Gateway"))
+    for svc in _VPCE_INTERFACE_SERVICES:
+        catalog.append((f"com.amazonaws.{region}.{svc}", "Interface"))
+
+    selected = []
+    for name, stype in catalog:
+        if requested and name not in requested:
+            continue
+        if name_filters and name not in name_filters:
+            continue
+        if type_filters and stype not in type_filters:
+            continue
+        selected.append((name, stype))
+
+    name_items = "".join(f"<item>{n}</item>" for n, _ in selected)
+    az_items = "".join(f"<item>{az}</item>" for az in azs)
+
+    detail_items = []
+    for name, stype in selected:
+        short = name.rsplit(".", 1)[-1]
+        if stype == "Gateway":
+            base_dns = f"<item>{short}.{region}.amazonaws.com</item>"
+            private_dns = ""
+        else:
+            base_dns = f"<item>{short}.{region}.vpce.amazonaws.com</item>"
+            private_dns = f"<privateDnsName>{short}.{region}.amazonaws.com</privateDnsName>"
+        detail_items.append(f"""<item>
+            <serviceName>{name}</serviceName>
+            <serviceId>vpce-svc-{abs(hash(name)) & 0xffffffffffff:012x}</serviceId>
+            <serviceType><item><serviceType>{stype}</serviceType></item></serviceType>
+            <availabilityZoneSet>{az_items}</availabilityZoneSet>
+            <owner>amazon</owner>
+            <baseEndpointDnsNameSet>{base_dns}</baseEndpointDnsNameSet>
+            {private_dns}
+            <vpcEndpointPolicySupported>{'false' if stype == 'Gateway' else 'true'}</vpcEndpointPolicySupported>
+            <acceptanceRequired>false</acceptanceRequired>
+            <managesVpcEndpoints>false</managesVpcEndpoints>
+            <supportedIpAddressTypeSet><item>ipv4</item></supportedIpAddressTypeSet>
+        </item>""")
+
+    return _xml(200, "DescribeVpcEndpointServicesResponse", f"""
+        <serviceNameSet>{name_items}</serviceNameSet>
+        <serviceDetailSet>{''.join(detail_items)}</serviceDetailSet>
+    """)
 
 
 # ---------------------------------------------------------------------------
@@ -4235,6 +4301,7 @@ _ACTION_MAP = {
     "CreateVpcEndpoint": _create_vpc_endpoint,
     "DeleteVpcEndpoints": _delete_vpc_endpoints,
     "DescribeVpcEndpoints": _describe_vpc_endpoints,
+    "DescribeVpcEndpointServices": _describe_vpc_endpoint_services,
     "ReplaceRouteTableAssociation": _replace_route_table_association,
     "ModifyVpcEndpoint": _modify_vpc_endpoint,
     "DescribePrefixLists": _describe_prefix_lists,
