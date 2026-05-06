@@ -5,6 +5,8 @@ All notable changes to MiniStack will be documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning follows [Semantic Versioning](https://semver.org/).
 
+
+- **Step Functions `aws-sdk:ec2` security group compatibility** — `CreateSecurityGroup` now maps the SDK `Description` parameter to EC2's query-wire `GroupDescription` while preserving `VpcId`, and `DescribeSecurityGroups` now sends EC2-shaped filters (`Filter.1.Value.1`) instead of the generic `member.N` form. The Step Functions XML adapter also returns `SecurityGroups` instead of raw `SecurityGroupInfo`, matching AWS SDK output.
 ---
 
 ## [1.3.28] — 2026-05-05
@@ -15,6 +17,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 ### Fixed
 - **DynamoDB legacy `Expected` (PutItem / UpdateItem / DeleteItem) and `KeyConditions` (Query)** — previously ignored; SDKs and code paths that still use the pre-expression API now work. `ScanFilter` / `QueryFilter` comparison support extended to all 13 legacy operators (`EQ`, `NE`, `LE`, `LT`, `GE`, `GT`, `NOT_NULL`, `NULL`, `CONTAINS`, `NOT_CONTAINS`, `BEGINS_WITH`, `IN`, `BETWEEN`) with type-aware numeric comparison. Reported by @darkamgine
 - **DynamoDB `TransactWriteItems` multi-failure reporting** — only the first failing item was marked in `CancellationReasons`; AWS returns a `ConditionalCheckFailed` entry for every failing item in the transaction. Now evaluates all conditions in a first pass and reports each failure. Reported by @anghel93 and @gnjack
+
 
 ---
 

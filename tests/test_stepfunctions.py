@@ -687,6 +687,143 @@ def test_sfn_aws_sdk_rds_create_and_describe_cluster(sfn, sfn_sync):
 
     sfn_sync.delete_state_machine(stateMachineArn=sm_arn)
 
+
+def test_sfn_aws_sdk_ec2_security_group_create_and_describe(sfn_sync, ec2):
+    """aws-sdk:ec2 CreateSecurityGroup + DescribeSecurityGroups use EC2 query shapes."""
+    import uuid as _uuid
+
+    vpc_id = ec2.create_vpc(CidrBlock="10.91.0.0/16")["Vpc"]["VpcId"]
+    group_name = f"sfn-ec2-sg-{_uuid.uuid4().hex[:8]}"
+    description = "created through sfn aws-sdk ec2"
+    sm_name = f"sdk-ec2-sg-{_uuid.uuid4().hex[:8]}"
+    sm_arn = None
+    sg_id = None
+
+    definition = json.dumps({
+        "StartAt": "CreateSecurityGroup",
+        "States": {
+            "CreateSecurityGroup": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::aws-sdk:ec2:createSecurityGroup",
+                "Parameters": {
+                    "GroupName": group_name,
+                    "Description": description,
+                    "VpcId": vpc_id,
+                    "TagSpecifications": [
+                        {
+                            "ResourceType": "security-group",
+                            "Tags": [{"Key": "Name", "Value": group_name}],
+                        }
+                    ],
+                },
+                "ResultPath": "$.createResult",
+                "Next": "DescribeSecurityGroups",
+            },
+            "DescribeSecurityGroups": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::aws-sdk:ec2:describeSecurityGroups",
+                "Parameters": {
+                    "Filters": [
+                        {"Name": "vpc-id", "Values": [vpc_id]},
+                        {"Name": "group-name", "Values": [group_name]},
+                    ],
+                },
+                "ResultPath": "$.describeResult",
+                "Next": "Done",
+            },
+            "Done": {"Type": "Succeed"},
+        },
+    })
+
+    try:
+        sm_arn = sfn_sync.create_state_machine(
+            name=sm_name,
+            definition=definition,
+            roleArn="arn:aws:iam::000000000000:role/sfn-role",
+        )["stateMachineArn"]
+
+        resp = sfn_sync.start_sync_execution(stateMachineArn=sm_arn, input=json.dumps({}))
+        assert resp["status"] == "SUCCEEDED", f"Execution failed: {resp.get('error')} — {resp.get('cause')}"
+        output = json.loads(resp["output"])
+
+        sg_id = output["createResult"]["GroupId"]
+        assert sg_id.startswith("sg-")
+
+        describe_result = output["describeResult"]
+        assert "SecurityGroups" in describe_result
+        assert "SecurityGroupInfo" not in describe_result
+        groups = describe_result["SecurityGroups"]
+        assert isinstance(groups, list)
+        assert len(groups) == 1
+        assert groups[0]["GroupId"] == sg_id
+        assert groups[0]["GroupName"] == group_name
+        assert groups[0]["Description"] == description
+        assert groups[0]["VpcId"] == vpc_id
+        assert groups[0]["Tags"] == [{"Key": "Name", "Value": group_name}]
+    finally:
+        if sg_id:
+            ec2.delete_security_group(GroupId=sg_id)
+        ec2.delete_vpc(VpcId=vpc_id)
+        if sm_arn:
+            sfn_sync.delete_state_machine(stateMachineArn=sm_arn)
+
+
+def test_sfn_aws_sdk_ec2_security_group_duplicate_error(sfn_sync, ec2):
+    """aws-sdk:ec2 CreateSecurityGroup preserves AWS duplicate-name errors."""
+    import uuid as _uuid
+
+    group_name = f"sfn-ec2-sg-dup-{_uuid.uuid4().hex[:8]}"
+    sm_name = f"sdk-ec2-sg-dup-{_uuid.uuid4().hex[:8]}"
+    sm_arn = None
+
+    definition = json.dumps({
+        "StartAt": "CreateFirst",
+        "States": {
+            "CreateFirst": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::aws-sdk:ec2:createSecurityGroup",
+                "Parameters": {
+                    "GroupName": group_name,
+                    "Description": "first",
+                    "VpcId": "vpc-00000001",
+                },
+                "Next": "CreateDuplicate",
+            },
+            "CreateDuplicate": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::aws-sdk:ec2:createSecurityGroup",
+                "Parameters": {
+                    "GroupName": group_name,
+                    "Description": "second",
+                    "VpcId": "vpc-00000001",
+                },
+                "End": True,
+            },
+        },
+    })
+
+    try:
+        sm_arn = sfn_sync.create_state_machine(
+            name=sm_name,
+            definition=definition,
+            roleArn="arn:aws:iam::000000000000:role/sfn-role",
+        )["stateMachineArn"]
+
+        resp = sfn_sync.start_sync_execution(stateMachineArn=sm_arn, input=json.dumps({}))
+        assert resp["status"] == "FAILED"
+        assert resp["error"] == "Ec2.InvalidGroup.Duplicate"
+        assert "already exists" in resp["cause"]
+    finally:
+        groups = ec2.describe_security_groups(Filters=[
+            {"Name": "vpc-id", "Values": ["vpc-00000001"]},
+            {"Name": "group-name", "Values": [group_name]},
+        ])["SecurityGroups"]
+        for group in groups:
+            ec2.delete_security_group(GroupId=group["GroupId"])
+        if sm_arn:
+            sfn_sync.delete_state_machine(stateMachineArn=sm_arn)
+
+
 def test_sfn_aws_sdk_rds_create_and_describe_instance(sfn, sfn_sync):
     """aws-sdk:rds CreateDBInstance + DescribeDBInstances via query-protocol dispatch."""
     import uuid as _uuid
