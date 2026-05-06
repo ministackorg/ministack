@@ -47,6 +47,7 @@ from ministack.core.lambda_runtime import get_or_create_worker, invalidate_worke
 from ministack.core.persistence import PERSIST_STATE, load_state
 from ministack.core.responses import (
     AccountScopedDict,
+    _12_DIGIT_RE,
     _request_account_id,
     apply_image_prefix,
     error_response_json,
@@ -57,6 +58,20 @@ from ministack.core.responses import (
 )
 
 logger = logging.getLogger("lambda")
+
+
+def _account_from_arn(arn: str) -> str:
+    """Extract the 12-digit account ID from a Lambda function ARN.
+
+    Falls back to the host's AWS_ACCESS_KEY_ID if the ARN is malformed."""
+    try:
+        parts = arn.split(":")
+        if len(parts) >= 5 and _12_DIGIT_RE.match(parts[4]):
+            return parts[4]
+    except (AttributeError, TypeError):
+        pass
+    return os.environ.get("AWS_ACCESS_KEY_ID", "test")
+
 
 REGION = os.environ.get("MINISTACK_REGION", os.environ.get("AWS_DEFAULT_REGION", "us-east-1"))
 LAMBDA_EXECUTOR = os.environ.get("LAMBDA_EXECUTOR", "local").lower()
@@ -2146,7 +2161,7 @@ def _spawn_lambda_container(config: dict, code_zip: bytes | None):
     container_env: dict[str, str] = {
         "AWS_DEFAULT_REGION": get_region(),
         "AWS_REGION": get_region(),
-        "AWS_ACCESS_KEY_ID": os.environ.get("AWS_ACCESS_KEY_ID", "test"),
+        "AWS_ACCESS_KEY_ID": _account_from_arn(config.get("FunctionArn", "")),
         "AWS_SECRET_ACCESS_KEY": os.environ.get("AWS_SECRET_ACCESS_KEY", "test"),
         "AWS_SESSION_TOKEN": os.environ.get("AWS_SESSION_TOKEN", ""),
         "AWS_LAMBDA_FUNCTION_NAME": config["FunctionName"],
@@ -2158,20 +2173,30 @@ def _spawn_lambda_container(config: dict, code_zip: bytes | None):
     }
     if is_provided:
         container_env["LAMBDA_TASK_ROOT"] = "/var/task"
-        container_env["_HANDLER"] = handler
+    container_env["_HANDLER"] = handler
     if layers_dirs:
         container_env["_LAMBDA_LAYERS_DIRS"] = ":".join(
             f"/opt/layer_{i}" for i in range(len(layers_dirs))
         )
     container_env.update(env_vars)
-    # AWS_ENDPOINT_URL set *after* function env so it always points at ministack
+    # AWS_ENDPOINT_URL set *after* function env so it always points at ministack.
+    # Replace localhost/127.0.0.1 with host.docker.internal so the container
+    # can reach the host where ministack is running.
     endpoint = _normalize_endpoint_url(os.environ.get("AWS_ENDPOINT_URL", ""))
     if not endpoint:
         endpoint = _normalize_endpoint_url(env_vars.get("AWS_ENDPOINT_URL", ""))
     if not endpoint:
         endpoint = _normalize_endpoint_url(env_vars.get("LOCALSTACK_HOSTNAME", ""))
-    if endpoint:
-        container_env["AWS_ENDPOINT_URL"] = endpoint
+    if not endpoint:
+        port = os.environ.get("GATEWAY_PORT", os.environ.get("EDGE_PORT", "4566"))
+        endpoint = f"http://host.docker.internal:{port}"
+    else:
+        # Rewrite localhost/127.0.0.1 → host.docker.internal for container access
+        endpoint = endpoint.replace("://localhost:", "://host.docker.internal:")
+        endpoint = endpoint.replace("://localhost/", "://host.docker.internal/")
+        endpoint = endpoint.replace("://127.0.0.1:", "://host.docker.internal:")
+        endpoint = endpoint.replace("://127.0.0.1/", "://host.docker.internal/")
+    container_env["AWS_ENDPOINT_URL"] = endpoint
 
     # Mounts (Zip only — Image bakes code in)
     _use_docker_cp = False
@@ -2748,7 +2773,7 @@ def _execute_function_provided(func: dict, event: dict) -> dict:
                     "AWS_LAMBDA_RUNTIME_API": f"127.0.0.1:{port}",
                     "AWS_DEFAULT_REGION": get_region(),
                     "AWS_REGION": get_region(),
-                    "AWS_ACCESS_KEY_ID": os.environ.get("AWS_ACCESS_KEY_ID", "test"),
+                    "AWS_ACCESS_KEY_ID": _account_from_arn(config.get("FunctionArn", "")),
                     "AWS_SECRET_ACCESS_KEY": os.environ.get("AWS_SECRET_ACCESS_KEY", "test"),
                     "AWS_LAMBDA_FUNCTION_NAME": config.get("FunctionName", "unknown"),
                     "LAMBDA_TASK_ROOT": code_dir,
@@ -2886,7 +2911,7 @@ def _execute_function_local(func: dict, event: dict) -> dict:
                 {
                     "AWS_DEFAULT_REGION": get_region(),
                     "AWS_REGION": get_region(),
-                    "AWS_ACCESS_KEY_ID": os.environ.get("AWS_ACCESS_KEY_ID", "test"),
+                    "AWS_ACCESS_KEY_ID": _account_from_arn(config.get("FunctionArn", "")),
                     "AWS_SECRET_ACCESS_KEY": os.environ.get("AWS_SECRET_ACCESS_KEY", "test"),
                     "AWS_SESSION_TOKEN": os.environ.get("AWS_SESSION_TOKEN", ""),
                     "AWS_LAMBDA_FUNCTION_NAME": config["FunctionName"],

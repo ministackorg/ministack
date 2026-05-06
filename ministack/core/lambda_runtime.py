@@ -17,8 +17,26 @@ import tempfile
 import threading
 import time
 import zipfile
+import re
 
 logger = logging.getLogger("lambda_runtime")
+
+_12_DIGIT_RE = re.compile(r"^\d{12}$")
+
+
+def _account_from_arn(arn: str) -> str:
+    """Extract the 12-digit account ID from a Lambda function ARN.
+
+    Falls back to the host's AWS_ACCESS_KEY_ID if the ARN is malformed.
+    Defined locally to avoid circular imports with lambda_svc."""
+    try:
+        parts = arn.split(":")
+        if len(parts) >= 5 and _12_DIGIT_RE.match(parts[4]):
+            return parts[4]
+    except (AttributeError, TypeError):
+        pass
+    return os.environ.get("AWS_ACCESS_KEY_ID", "test")
+
 
 _workers: dict = {}
 _lock = threading.Lock()
@@ -429,7 +447,7 @@ class Worker:
         from ministack.core.responses import get_region, new_uuid
         spawn_env.setdefault("AWS_REGION", get_region())
         spawn_env.setdefault("AWS_DEFAULT_REGION", get_region())
-        spawn_env.setdefault("AWS_ACCESS_KEY_ID", os.environ.get("AWS_ACCESS_KEY_ID", "test"))
+        spawn_env.setdefault("AWS_ACCESS_KEY_ID", _account_from_arn(self.config.get("FunctionArn", "")))
         spawn_env.setdefault("AWS_SECRET_ACCESS_KEY", os.environ.get("AWS_SECRET_ACCESS_KEY", "test"))
         spawn_env.setdefault("AWS_SESSION_TOKEN", os.environ.get("AWS_SESSION_TOKEN", ""))
         # AWS_ENDPOINT_URL precedence matches real AWS: function
@@ -658,7 +676,10 @@ class Worker:
 
 def get_or_create_worker(func_name: str, config: dict, code_zip: bytes,
                          qualifier: str = "$LATEST") -> Worker:
-    key = f"{func_name}:{qualifier}"
+    # Include account ID in the key to isolate workers across accounts.
+    # Two accounts deploying the same function name must not share a worker.
+    account = _account_from_arn(config.get("FunctionArn", ""))
+    key = f"{account}:{func_name}:{qualifier}"
     with _lock:
         worker = _workers.get(key)
         if worker is not None:
@@ -668,20 +689,36 @@ def get_or_create_worker(func_name: str, config: dict, code_zip: bytes,
         return worker
 
 
-def invalidate_worker(func_name: str, qualifier: str = None):
+def invalidate_worker(func_name: str, qualifier: str = None, account: str = None):
     """Kill and remove workers for a function.
 
     If qualifier is provided, only kill that specific version/alias worker.
     Otherwise kill all workers for the function (used on delete).
+    If account is provided, scope the invalidation to that account.
     """
     with _lock:
         if qualifier is not None:
-            key = f"{func_name}:{qualifier}"
+            if account:
+                key = f"{account}:{func_name}:{qualifier}"
+            else:
+                key = f"{func_name}:{qualifier}"
+            # Try exact match first (new key format with account)
             worker = _workers.pop(key, None)
             if worker:
                 worker.kill()
+            else:
+                # Fallback: search for any key ending with func_name:qualifier
+                to_remove = [k for k in _workers if k.endswith(f":{func_name}:{qualifier}") or k == f"{func_name}:{qualifier}"]
+                for k in to_remove:
+                    w = _workers.pop(k, None)
+                    if w:
+                        w.kill()
         else:
-            to_remove = [k for k in _workers if k.startswith(f"{func_name}:")]
+            # Kill all workers for this function (any account, any qualifier)
+            prefix = f"{account}:{func_name}:" if account else f"{func_name}:"
+            to_remove = [k for k in _workers if k.startswith(prefix) or k.endswith(f":{func_name}:") or (f":{func_name}:" in k)]
+            # Simpler: match any key containing the function name
+            to_remove = [k for k in _workers if f"{func_name}:" in k]
             for k in to_remove:
                 worker = _workers.pop(k, None)
                 if worker:
