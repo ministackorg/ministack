@@ -659,11 +659,17 @@ def _update_item(data):
             return _conditional_check_failed(data, existing)
 
     update_expr = data.get("UpdateExpression", "")
+    attribute_updates = data.get("AttributeUpdates")
     eav = data.get("ExpressionAttributeValues", {})
     ean = data.get("ExpressionAttributeNames", {})
 
+    if update_expr and attribute_updates:
+        return error_response_json("ValidationException", "Can not use both expression and non-expression parameters in the same request: Non-expression parameters: {AttributeUpdates} Expression parameters: {UpdateExpression}", 400)
+
     if update_expr:
         item = _apply_update_expression(item, update_expr, eav, ean)
+    elif attribute_updates:
+        item = _apply_attribute_updates(item, attribute_updates)
 
     table["items"][pk_val][sk_val] = item
     _update_counts(table)
@@ -2695,6 +2701,57 @@ def _evaluate_expected(item, expected, conditional_operator="AND"):
     if conditional_operator == "OR":
         return any(results) if results else True
     return all(results)
+
+
+def _apply_attribute_updates(item, attribute_updates):
+    """Apply legacy ``AttributeUpdates`` to an item.
+
+    Each key is an attribute name.  The value has ``Action`` (``PUT``,
+    ``DELETE``, or ``ADD``; default ``PUT``) and optionally ``Value``
+    (a DynamoDB-typed attribute value).
+    """
+    item = copy.deepcopy(item)
+    for attr_name, update in attribute_updates.items():
+        action = update.get("Action", "PUT")
+        value = update.get("Value")
+
+        if action == "PUT":
+            if value is not None:
+                item[attr_name] = value
+        elif action == "DELETE":
+            if value is None:
+                # No value → remove the attribute entirely
+                item.pop(attr_name, None)
+            else:
+                # Value provided → subtract from a set
+                existing = item.get(attr_name)
+                if existing:
+                    for set_type in ("SS", "NS", "BS"):
+                        if set_type in value and set_type in existing:
+                            remaining = [v for v in existing[set_type] if v not in set(value[set_type])]
+                            if remaining:
+                                item[attr_name] = {set_type: remaining}
+                            else:
+                                item.pop(attr_name, None)
+                            break
+        elif action == "ADD":
+            if value is None:
+                continue
+            existing = item.get(attr_name)
+            if "N" in value:
+                inc = Decimal(value["N"])
+                cur = Decimal(existing["N"]) if existing and "N" in existing else Decimal(0)
+                item[attr_name] = {"N": str(cur + inc)}
+            elif "SS" in value:
+                cur = set(existing["SS"]) if existing and "SS" in existing else set()
+                item[attr_name] = {"SS": sorted(cur | set(value["SS"]))}
+            elif "NS" in value:
+                cur = set(existing["NS"]) if existing and "NS" in existing else set()
+                item[attr_name] = {"NS": sorted(cur | set(value["NS"]))}
+            elif "BS" in value:
+                cur = set(existing["BS"]) if existing and "BS" in existing else set()
+                item[attr_name] = {"BS": sorted(cur | set(value["BS"]))}
+    return item
 
 
 def _extract_pk_from_key_conditions(key_conditions, pk_name):

@@ -2343,3 +2343,153 @@ def test_dynamodb_query_key_conditions_with_query_filter(ddb):
         assert item["status"]["S"] == "active"
 
 
+# ---------------------------------------------------------------------------
+# Legacy AttributeUpdates (UpdateItem)
+# ---------------------------------------------------------------------------
+
+def test_dynamodb_attribute_updates_put(ddb):
+    """PUT action sets attributes on a new and existing item."""
+    table = f"t_attr_upd_put_{_uuid_mod.uuid4().hex[:8]}"
+    ddb.create_table(
+        TableName=table,
+        KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+        AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "S"}],
+        BillingMode="PAY_PER_REQUEST",
+    )
+
+    # Create item via AttributeUpdates (upsert)
+    ddb.update_item(
+        TableName=table,
+        Key={"pk": {"S": "k1"}},
+        AttributeUpdates={
+            "name": {"Action": "PUT", "Value": {"S": "alice"}},
+            "age": {"Action": "PUT", "Value": {"N": "30"}},
+        },
+    )
+    item = ddb.get_item(TableName=table, Key={"pk": {"S": "k1"}})["Item"]
+    assert item["name"] == {"S": "alice"}
+    assert item["age"] == {"N": "30"}
+
+    # Update existing item
+    ddb.update_item(
+        TableName=table,
+        Key={"pk": {"S": "k1"}},
+        AttributeUpdates={
+            "name": {"Action": "PUT", "Value": {"S": "bob"}},
+        },
+    )
+    item = ddb.get_item(TableName=table, Key={"pk": {"S": "k1"}})["Item"]
+    assert item["name"] == {"S": "bob"}
+    assert item["age"] == {"N": "30"}  # unchanged
+
+
+def test_dynamodb_attribute_updates_delete(ddb):
+    """DELETE action removes an attribute or subtracts from a set."""
+    table = f"t_attr_upd_del_{_uuid_mod.uuid4().hex[:8]}"
+    ddb.create_table(
+        TableName=table,
+        KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+        AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "S"}],
+        BillingMode="PAY_PER_REQUEST",
+    )
+    ddb.put_item(TableName=table, Item={
+        "pk": {"S": "k1"},
+        "color": {"S": "red"},
+        "tags": {"SS": ["a", "b", "c"]},
+    })
+
+    # DELETE without Value → remove attribute
+    ddb.update_item(
+        TableName=table,
+        Key={"pk": {"S": "k1"}},
+        AttributeUpdates={"color": {"Action": "DELETE"}},
+    )
+    item = ddb.get_item(TableName=table, Key={"pk": {"S": "k1"}})["Item"]
+    assert "color" not in item
+
+    # DELETE with Value → subtract from set
+    ddb.update_item(
+        TableName=table,
+        Key={"pk": {"S": "k1"}},
+        AttributeUpdates={"tags": {"Action": "DELETE", "Value": {"SS": ["b"]}}},
+    )
+    item = ddb.get_item(TableName=table, Key={"pk": {"S": "k1"}})["Item"]
+    assert sorted(item["tags"]["SS"]) == ["a", "c"]
+
+
+def test_dynamodb_attribute_updates_add(ddb):
+    """ADD action increments a number or adds to a set."""
+    table = f"t_attr_upd_add_{_uuid_mod.uuid4().hex[:8]}"
+    ddb.create_table(
+        TableName=table,
+        KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+        AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "S"}],
+        BillingMode="PAY_PER_REQUEST",
+    )
+    ddb.put_item(TableName=table, Item={
+        "pk": {"S": "k1"},
+        "counter": {"N": "10"},
+        "tags": {"SS": ["a"]},
+    })
+
+    ddb.update_item(
+        TableName=table,
+        Key={"pk": {"S": "k1"}},
+        AttributeUpdates={
+            "counter": {"Action": "ADD", "Value": {"N": "5"}},
+            "tags": {"Action": "ADD", "Value": {"SS": ["b", "c"]}},
+        },
+    )
+    item = ddb.get_item(TableName=table, Key={"pk": {"S": "k1"}})["Item"]
+    assert item["counter"] == {"N": "15"}
+    assert sorted(item["tags"]["SS"]) == ["a", "b", "c"]
+
+    # ADD on non-existent numeric attribute → starts from 0
+    ddb.update_item(
+        TableName=table,
+        Key={"pk": {"S": "k1"}},
+        AttributeUpdates={"new_num": {"Action": "ADD", "Value": {"N": "7"}}},
+    )
+    item = ddb.get_item(TableName=table, Key={"pk": {"S": "k1"}})["Item"]
+    assert item["new_num"] == {"N": "7"}
+
+
+def test_dynamodb_attribute_updates_mutually_exclusive_with_update_expression(ddb):
+    """AttributeUpdates and UpdateExpression cannot be used together."""
+    table = f"t_attr_upd_excl_{_uuid_mod.uuid4().hex[:8]}"
+    ddb.create_table(
+        TableName=table,
+        KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+        AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "S"}],
+        BillingMode="PAY_PER_REQUEST",
+    )
+    with pytest.raises(ClientError) as exc_info:
+        ddb.update_item(
+            TableName=table,
+            Key={"pk": {"S": "k1"}},
+            UpdateExpression="SET #n = :v",
+            ExpressionAttributeNames={"#n": "name"},
+            ExpressionAttributeValues={":v": {"S": "x"}},
+            AttributeUpdates={"name": {"Action": "PUT", "Value": {"S": "y"}}},
+        )
+    assert exc_info.value.response["Error"]["Code"] == "ValidationException"
+
+
+def test_dynamodb_attribute_updates_default_action_is_put(ddb):
+    """When Action is omitted it defaults to PUT."""
+    table = f"t_attr_upd_dflt_{_uuid_mod.uuid4().hex[:8]}"
+    ddb.create_table(
+        TableName=table,
+        KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+        AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "S"}],
+        BillingMode="PAY_PER_REQUEST",
+    )
+    ddb.update_item(
+        TableName=table,
+        Key={"pk": {"S": "k1"}},
+        AttributeUpdates={"name": {"Value": {"S": "alice"}}},
+    )
+    item = ddb.get_item(TableName=table, Key={"pk": {"S": "k1"}})["Item"]
+    assert item["name"] == {"S": "alice"}
+
+
