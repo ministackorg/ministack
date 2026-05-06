@@ -48,7 +48,7 @@ def test_athena_query_execution_v2(athena):
     resp = athena.start_query_execution(
         QueryString="SELECT 42 AS answer, 'world' AS hello",
         QueryExecutionContext={"Database": "default"},
-        ResultConfiguration={"OutputLocation": "s3://athena-out/"},
+        ResultConfiguration={"OutputLocation": "s3://athena-results/"},
     )
     qid = resp["QueryExecutionId"]
     state = None
@@ -228,7 +228,7 @@ def test_athena_stop_query(athena):
     """StopQueryExecution cancels a running query."""
     resp = athena.start_query_execution(
         QueryString="SELECT 1",
-        ResultConfiguration={"OutputLocation": "s3://qa-athena-results/"},
+        ResultConfiguration={"OutputLocation": "s3://athena-results/"},
     )
     qid = resp["QueryExecutionId"]
     athena.stop_query_execution(QueryExecutionId=qid)
@@ -301,3 +301,80 @@ def test_athena_engine_mock_via_config(athena):
         method="POST",
     )
     urllib.request.urlopen(req2, timeout=5)
+
+
+def test_athena_mixed_glue_and_s3_uri(athena, s3, glue, monkeypatch):
+    bucket_name = "athena-results"
+    suffix = _uuid_mod.uuid4().hex[:6]
+    db_name = f"test_db_{suffix}"
+
+    monkeypatch.setenv("S3_PERSIST", "1")
+
+    s3.put_object(
+        Bucket=bucket_name,
+        Key="tables/users/data.csv",
+        Body=b"id,name\n1,alice\n2,bob"
+    )
+
+    s3.put_object(
+        Bucket=bucket_name,
+        Key="raw/age_info.csv",
+        Body=b"id,age\n1,25\n2,30"
+    )
+
+    s3.put_object(
+        Bucket=bucket_name,
+        Key="raw/height_info.csv",
+        Body=b"id,height\n1,170\n2,180"
+    )
+
+    glue.create_database(DatabaseInput={'Name': db_name})
+    glue.create_table(
+        DatabaseName=db_name,
+        TableInput={
+            'Name': 'users_table',
+            'StorageDescriptor': {
+                'Location': f's3://{bucket_name}/tables/users/',
+                'InputFormat': 'org.apache.hadoop.mapred.TextInputFormat',
+            },
+            'Parameters': {'classification': 'csv'}
+        }
+    )
+
+    query = f"""
+        SELECT u.name, a.age, h.height
+        FROM {db_name}.users_table u
+        JOIN read_csv('s3://{bucket_name}/raw/age_info.csv') a ON u.id = a.id
+        JOIN 's3://{bucket_name}/raw/height_info.csv' h ON u.id = h.id
+        ORDER BY u.id
+    """
+
+    output_loc = f"s3://{bucket_name}/results/"
+
+    resp = athena.start_query_execution(
+        QueryString=query,
+        QueryExecutionContext={'Database': db_name},
+        ResultConfiguration={'OutputLocation': output_loc}
+    )
+    query_id = resp['QueryExecutionId']
+
+    for _ in range(10):
+        status = athena.get_query_execution(QueryExecutionId=query_id)
+        state = status['QueryExecution']['Status']['State']
+        if state in ['SUCCEEDED', 'FAILED', 'CANCELLED']:
+            break
+        time.sleep(0.2)
+
+    assert state == "SUCCEEDED", f"Query ended in state: {state}"
+    results = athena.get_query_results(QueryExecutionId=query_id)
+
+    rows = results["ResultSet"]["Rows"]
+    assert len(rows) >= 2
+    assert rows[1]["Data"][0]["VarCharValue"] == "alice"
+    assert rows[1]["Data"][1]["VarCharValue"] == "25"
+    assert rows[1]["Data"][2]["VarCharValue"] == "170"
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _create_s3_results_bucket(s3):
+    s3.create_bucket(Bucket="athena-results")
