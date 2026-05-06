@@ -2425,11 +2425,16 @@ def _prefix_sdk_error(service_name: str, error_code: str) -> str:
     """Prefix an SDK error code with the service name, matching real AWS SFN behavior.
 
     E.g., ("secretsmanager", "ResourceExistsException") -> "SecretsManager.ResourceExistsException"
-    If the error already has a dot prefix or is a States.* error, return as-is.
+    States.* errors and already service-prefixed errors are returned as-is.
+    Non-EC2 dotted legacy codes are preserved for backwards compatibility.
     """
-    if "." in error_code:
+    if error_code.startswith("States."):
         return error_code
     prefix = _AWS_SDK_ERROR_PREFIX.get(service_name, service_name.capitalize())
+    if error_code.startswith(f"{prefix}."):
+        return error_code
+    if "." in error_code and service_name != "ec2":
+        return error_code
     return f"{prefix}.{error_code}"
 
 # Static action→path maps for REST-JSON services.
@@ -2531,6 +2536,46 @@ def _flatten_query_params(data, prefix=""):
                     params.update(_flatten_query_params(item, member_key))
                 else:
                     params[member_key] = str(item)
+        elif isinstance(value, bool):
+            params[full_key] = "true" if value else "false"
+        else:
+            params[full_key] = str(value)
+    return params
+
+
+_EC2_QUERY_LIST_NAME_OVERRIDES = {
+    "Filters": "Filter",
+    "Values": "Value",
+    "GroupIds": "GroupId",
+    "GroupNames": "GroupName",
+    "TagSpecifications": "TagSpecification",
+    "Tags": "Tag",
+}
+
+
+def _flatten_ec2_query_params(data, prefix=""):
+    """Flatten EC2 query params using EC2's numbered-list convention.
+
+    Most query services in MiniStack use ``member.N`` in the Step Functions
+    adapter. EC2's Query API expects bare numbered lists for the shapes used
+    here (e.g. ``Filter.1.Value.1`` and ``GroupId.1``).
+    """
+    params = {}
+    if not isinstance(data, dict):
+        return params
+    for key, value in data.items():
+        full_key = f"{prefix}{key}" if not prefix else f"{prefix}.{key}"
+        if isinstance(value, dict):
+            params.update(_flatten_ec2_query_params(value, full_key))
+        elif isinstance(value, list):
+            list_key = _EC2_QUERY_LIST_NAME_OVERRIDES.get(key, key)
+            full_list_key = f"{prefix}{list_key}" if not prefix else f"{prefix}.{list_key}"
+            for i, item in enumerate(value, 1):
+                item_key = f"{full_list_key}.{i}"
+                if isinstance(item, dict):
+                    params.update(_flatten_ec2_query_params(item, item_key))
+                else:
+                    params[item_key] = str(item)
         elif isinstance(value, bool):
             params[full_key] = "true" if value else "false"
         else:
@@ -2661,6 +2706,10 @@ _QUERY_PARAM_NAME_OVERRIDES = {
     ("rds", "RemoveFromGlobalCluster"): {
         "DbClusterIdentifier": "DbClusterIdentifier",
     },
+    ("ec2", "CreateSecurityGroup"): {
+        "Description": "GroupDescription",
+        "VpcId": "VpcId",
+    },
 }
 
 
@@ -2747,6 +2796,57 @@ def _convert_keys_to_sfn_convention(obj):
     return obj
 
 
+def _query_item_list(value):
+    if value in (None, ""):
+        return []
+    if isinstance(value, dict) and "item" in value:
+        item = value["item"]
+        return item if isinstance(item, list) else [item]
+    return value if isinstance(value, list) else [value]
+
+
+def _normalize_ec2_security_group(group):
+    if not isinstance(group, dict):
+        return group
+    if "groupDescription" in group:
+        group["Description"] = group.pop("groupDescription")
+    if "tagSet" in group:
+        group["Tags"] = _query_item_list(group.pop("tagSet"))
+
+    for permission_key in ("ipPermissions", "ipPermissionsEgress"):
+        if permission_key not in group:
+            continue
+        permissions = _query_item_list(group[permission_key])
+        for permission in permissions:
+            if not isinstance(permission, dict):
+                continue
+            for list_key in ("ipRanges", "ipv6Ranges", "prefixListIds"):
+                if list_key in permission:
+                    permission[list_key] = _query_item_list(permission[list_key])
+            if "groups" in permission:
+                permission["UserIdGroupPairs"] = _query_item_list(permission.pop("groups"))
+        group[permission_key] = permissions
+    return group
+
+
+def _normalize_query_response(service_key, action, result):
+    if not isinstance(result, dict):
+        return result
+    if service_key == "ec2" and action == "DescribeSecurityGroups":
+        raw_groups = result.pop("securityGroupInfo", None)
+        if raw_groups is not None:
+            if isinstance(raw_groups, dict) and "item" in raw_groups:
+                raw_groups = raw_groups["item"]
+            if raw_groups == "":
+                groups = []
+            elif isinstance(raw_groups, list):
+                groups = raw_groups
+            else:
+                groups = [raw_groups]
+            result["SecurityGroups"] = [_normalize_ec2_security_group(group) for group in groups]
+    return result
+
+
 def _dispatch_aws_sdk_query(service_info, service_name, action, input_data):
     """Dispatch an aws-sdk integration call to a query-protocol MiniStack service."""
     import xml.etree.ElementTree as ET
@@ -2770,7 +2870,10 @@ def _dispatch_aws_sdk_query(service_info, service_name, action, input_data):
     name_overrides = _QUERY_PARAM_NAME_OVERRIDES.get((service_key, pascal_action))
     wire_data = _convert_params_to_api_names(input_data, name_overrides)
     form_params = {"Action": pascal_action}
-    form_params.update(_flatten_query_params(wire_data))
+    if service_key == "ec2":
+        form_params.update(_flatten_ec2_query_params(wire_data))
+    else:
+        form_params.update(_flatten_query_params(wire_data))
     body = urlencode(form_params)
 
     headers = {
@@ -2832,6 +2935,7 @@ def _dispatch_aws_sdk_query(service_info, service_name, action, input_data):
                 result = result[result_key]
             # Drop ResponseMetadata
             result.pop("ResponseMetadata", None)
+            result = _normalize_query_response(service_key, pascal_action, result)
         return _convert_keys_to_sfn_convention(result)
     except ET.ParseError:
         raise _ExecutionError("States.Runtime", f"Failed to parse {service_name} XML response")
