@@ -827,6 +827,9 @@ These services stored per-tenant data in plain `dict` / `list`, so `List*` / `De
 - **Dynamic RDS storage** — new `RDS_PERSIST=1` env var switches database containers from fixed-size tmpfs to Docker named volumes for auto-growing persistent storage. Default (`RDS_PERSIST=0`) remains ephemeral tmpfs for CI/CD. Reported by @macario1983 (#248).
 - **Dual Docker Hub publishing** — Docker images now publish to both `nahuelnucera/ministack` and `ministackorg/ministack` on tag push.
 
+### Fixed
+- **Step Functions `aws-sdk:s3` integration** — `arn:aws:states:::aws-sdk:s3:listObjectsV2`, `:copyObject`, and other S3 control-plane operations now dispatch correctly. Previously, S3 was tagged as `rest`-protocol with no dispatcher and every call failed with `States.Runtime`: "aws-sdk integration for rest-protocol service 's3' is not yet implemented". A REST-XML dispatcher now drives a hand-tabled spec for list/head/copy/delete/tagging operations, mapping each `Parameters` field to its botocore-modelled URI/querystring/header location and returning XML responses normalised to the SFN PascalCase convention. Reported by @LeTrungNguyen1703 (#573). Phase 1 covers `ListBuckets`, `CreateBucket`, `DeleteBucket`, `HeadBucket`, `GetBucketVersioning`, `ListObjectsV2`, `ListObjects`, `HeadObject`, `CopyObject`, `DeleteObject`, `GetObjectTagging`, `PutObjectTagging`. `GetObject`/`PutObject` (Body-bearing operations) deferred to Phase 2.
+
 ---
 
 ## [1.2.0] — 2026-04-11
