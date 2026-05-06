@@ -316,6 +316,8 @@ def _sns_sub_create(logical_id, props, stack_name):
         return sub_arn, {"SubscriptionArn": sub_arn}
 
     sub_arn = f"{topic_arn}:{new_uuid()}"
+    raw = props.get("RawMessageDelivery", False)
+    raw_str = "true" if (raw is True or str(raw).lower() == "true") else "false"
     sub = {
         "arn": sub_arn,
         "topic_arn": topic_arn,
@@ -330,6 +332,7 @@ def _sns_sub_create(logical_id, props, stack_name):
                 if isinstance(props.get("FilterPolicy"), (dict, list))
                 else (props.get("FilterPolicy", "") or "")
             ),
+            "RawMessageDelivery": raw_str,
         },
     }
     topic["subscriptions"].append(sub)
