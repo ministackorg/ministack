@@ -344,6 +344,21 @@ def test_sqs_message_system_attributes(sqs):
     )
     assert msgs2["Messages"][0]["Attributes"]["ApproximateReceiveCount"] == "2"
 
+def test_sqs_message_system_attribute_names_modern_field(sqs):
+    """Regression: AWS SDK v2 / Java sends MessageSystemAttributeNames, not the
+    deprecated AttributeNames. Ministack must honor the modern field name."""
+    url = sqs.create_queue(QueueName="intg-sqs-msa-modern")["QueueUrl"]
+    sqs.send_message(QueueUrl=url, MessageBody="msa-modern")
+
+    msgs = sqs.receive_message(
+        QueueUrl=url,
+        MaxNumberOfMessages=1,
+        MessageSystemAttributeNames=["All"],
+    )
+    attrs = msgs["Messages"][0].get("Attributes", {})
+    assert attrs.get("ApproximateReceiveCount") == "1"
+    assert "SentTimestamp" in attrs
+
 def test_sqs_nonexistent_queue(sqs):
     with pytest.raises(ClientError) as exc:
         sqs.get_queue_url(QueueName="intg-sqs-does-not-exist")

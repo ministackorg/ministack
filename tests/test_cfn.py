@@ -1595,7 +1595,77 @@ def test_cfn_sns_topic_subscription_filter_policy_scope(cfn, sns, sqs):
 
     cfn.delete_stack(StackName=stack_name)
     _wait_stack(cfn, stack_name)
-    
+
+
+def test_cfn_sns_subscription_raw_message_delivery(cfn, sns, sqs):
+    """Regression: AWS::SNS::Subscription must honor RawMessageDelivery=true.
+    Without it, MessageAttributes are wrapped inside the SNS envelope JSON
+    instead of being delivered as SQS-level MessageAttributes — breaking
+    consumers that rely on attribute-based routing or read attrs directly."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-sns-raw-{uid}"
+    queue_name = f"cfn-sns-raw-q-{uid}"
+    topic_name = f"cfn-sns-raw-topic-{uid}"
+
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "RawQueue": {
+                "Type": "AWS::SQS::Queue",
+                "Properties": {"QueueName": queue_name},
+            },
+            "RawTopic": {
+                "Type": "AWS::SNS::Topic",
+                "Properties": {"TopicName": topic_name},
+            },
+            "RawSubscription": {
+                "Type": "AWS::SNS::Subscription",
+                "Properties": {
+                    "Protocol": "sqs",
+                    "TopicArn": {"Ref": "RawTopic"},
+                    "Endpoint": {"Fn::GetAtt": ["RawQueue", "Arn"]},
+                    "RawMessageDelivery": True,
+                },
+            },
+        },
+        "Outputs": {
+            "TopicArn": {"Value": {"Ref": "RawTopic"}},
+            "SubscriptionArn": {"Value": {"Ref": "RawSubscription"}},
+        },
+    }
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(template))
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+
+    outputs = {o["OutputKey"]: o["OutputValue"] for o in stack.get("Outputs", [])}
+    topic_arn = outputs["TopicArn"]
+    sub_arn = outputs["SubscriptionArn"]
+    queue_url = sqs.get_queue_url(QueueName=queue_name)["QueueUrl"]
+
+    sub_attrs = sns.get_subscription_attributes(SubscriptionArn=sub_arn)["Attributes"]
+    assert sub_attrs.get("RawMessageDelivery") == "true"
+
+    sns.publish(
+        TopicArn=topic_arn,
+        Message="raw-payload",
+        MessageAttributes={"ext_props": {"DataType": "String", "StringValue": "k=v"}},
+    )
+    msgs = sqs.receive_message(
+        QueueUrl=queue_url,
+        MaxNumberOfMessages=1,
+        WaitTimeSeconds=2,
+        MessageAttributeNames=["All"],
+    )
+    assert len(msgs.get("Messages", [])) == 1
+    m = msgs["Messages"][0]
+    assert m["Body"] == "raw-payload"
+    assert m.get("MessageAttributes", {}).get("ext_props", {}).get("StringValue") == "k=v"
+
+    cfn.delete_stack(StackName=stack_name)
+    _wait_stack(cfn, stack_name)
+
+
 # ===========================================================================
 # CodeBuild Project Tests
 # ===========================================================================

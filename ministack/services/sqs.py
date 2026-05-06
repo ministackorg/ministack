@@ -366,6 +366,7 @@ async def _act_receive_message(data: dict, qurl: str) -> dict:
                or q["attributes"].get("ReceiveMessageWaitTimeSeconds", "0"))
 
     attr_names = (data.get("AttributeNames")
+                  or data.get("MessageSystemAttributeNames")
                   or data.get("SystemAttributeNames") or [])
     msg_attr_names = data.get("MessageAttributeNames") or []
 
