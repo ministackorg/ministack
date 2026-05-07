@@ -1019,6 +1019,90 @@ def test_ec2_managed_prefix_list_crud(ec2):
     desc = ec2.describe_managed_prefix_lists(PrefixListIds=[pl_id])
     assert len(desc["PrefixLists"]) == 0
 
+
+def test_ec2_aws_managed_prefix_lists_in_describe_managed(ec2):
+    """DescribeManagedPrefixLists includes AWS-managed prefix lists with OwnerId=AWS."""
+    result = ec2.describe_managed_prefix_lists()
+    aws_pls = [pl for pl in result["PrefixLists"] if pl.get("OwnerId") == "AWS"]
+    assert len(aws_pls) > 0
+    names = [pl["PrefixListName"] for pl in aws_pls]
+    assert any("s3" in n for n in names)
+    assert any("dynamodb" in n for n in names)
+
+
+def test_ec2_aws_managed_prefix_list_filter_by_owner(ec2):
+    """Filtering DescribeManagedPrefixLists by owner-id=AWS returns only AWS-managed lists."""
+    result = ec2.describe_managed_prefix_lists(
+        Filters=[{"Name": "owner-id", "Values": ["AWS"]}]
+    )
+    assert all(pl.get("OwnerId") == "AWS" for pl in result["PrefixLists"])
+    assert len(result["PrefixLists"]) > 0
+
+
+def test_ec2_aws_managed_prefix_list_get_entries(ec2):
+    """GetManagedPrefixListEntries works for AWS-managed prefix lists."""
+    # Get an AWS-managed prefix list ID
+    result = ec2.describe_managed_prefix_lists(
+        Filters=[{"Name": "owner-id", "Values": ["AWS"]}]
+    )
+    aws_pl = next(pl for pl in result["PrefixLists"] if "s3" in pl["PrefixListName"])
+    entries = ec2.get_managed_prefix_list_entries(PrefixListId=aws_pl["PrefixListId"])
+    assert len(entries["Entries"]) >= 1
+    # CIDR should be in CGNAT space (100.64.0.0/10)
+    cidr = entries["Entries"][0]["Cidr"]
+    assert cidr.startswith("100.")
+
+
+def test_ec2_aws_managed_prefix_list_deterministic_cidr(ec2):
+    """AWS-managed prefix list CIDRs are deterministic across calls."""
+    result1 = ec2.describe_prefix_lists()
+    result2 = ec2.describe_prefix_lists()
+    for pl1, pl2 in zip(result1["PrefixLists"], result2["PrefixLists"]):
+        assert pl1["Cidrs"] == pl2["Cidrs"]
+
+
+def test_ec2_aws_managed_prefix_list_cannot_modify(ec2):
+    """Modifying an AWS-managed prefix list returns UnsupportedOperation."""
+    result = ec2.describe_managed_prefix_lists(
+        Filters=[{"Name": "owner-id", "Values": ["AWS"]}]
+    )
+    aws_pl_id = result["PrefixLists"][0]["PrefixListId"]
+    with pytest.raises(ClientError) as exc_info:
+        ec2.modify_managed_prefix_list(
+            PrefixListId=aws_pl_id, CurrentVersion=1,
+            AddEntries=[{"Cidr": "10.0.0.0/8", "Description": "should fail"}],
+        )
+    assert exc_info.value.response["Error"]["Code"] == "UnsupportedOperation"
+
+
+def test_ec2_aws_managed_prefix_list_cannot_delete(ec2):
+    """Deleting an AWS-managed prefix list returns UnsupportedOperation."""
+    result = ec2.describe_managed_prefix_lists(
+        Filters=[{"Name": "owner-id", "Values": ["AWS"]}]
+    )
+    aws_pl_id = result["PrefixLists"][0]["PrefixListId"]
+    with pytest.raises(ClientError) as exc_info:
+        ec2.delete_managed_prefix_list(PrefixListId=aws_pl_id)
+    assert exc_info.value.response["Error"]["Code"] == "UnsupportedOperation"
+
+
+def test_ec2_describe_prefix_lists_cidr_not_placeholder(ec2):
+    """DescribePrefixLists returns real CIDRs, not 0.0.0.0/0 placeholders."""
+    result = ec2.describe_prefix_lists()
+    for pl in result["PrefixLists"]:
+        for cidr in pl["Cidrs"]:
+            assert cidr != "0.0.0.0/0"
+
+
+def test_ec2_aws_managed_prefix_list_cannot_create(ec2):
+    """Creating a prefix list with an AWS-managed name returns UnsupportedOperation."""
+    with pytest.raises(ClientError) as exc_info:
+        ec2.create_managed_prefix_list(
+            PrefixListName="com.amazonaws.us-east-1.s3",
+            MaxEntries=5, AddressFamily="IPv4",
+        )
+    assert exc_info.value.response["Error"]["Code"] == "UnsupportedOperation"
+
 def test_ec2_vpn_gateway_crud(ec2):
     """Full lifecycle: create, attach, describe, detach, delete."""
     vpc = ec2.create_vpc(CidrBlock="10.95.0.0/16")

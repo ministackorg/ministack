@@ -1978,7 +1978,7 @@ def _get_object(bucket_name: str, key: str, headers: dict, query_params: dict = 
                     "Content-Type": "application/octet-stream",
                     "ETag": v["etag"],
                     "Content-Length": str(v["size"]),
-                    "Last-Modified": v["last_modified"],
+                    "Last-Modified": iso_to_rfc7231(v["last_modified"]),
                     "x-amz-version-id": v["version_id"],
                 }
                 return 200, resp_headers, v["data"]

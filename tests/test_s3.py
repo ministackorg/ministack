@@ -1,12 +1,18 @@
 import json
 import os
+import re
 import time
+from datetime import datetime
 from urllib.parse import urlparse
 
 import pytest
 from botocore.exceptions import ClientError
 from conftest import ENDPOINT_HOST, make_client, patch_endpoint_dns
 
+# Last-Modified on S3 HTTP responses must be RFC 7231 HTTP-date (AWS / Smithy).
+_RFC7231_LAST_MODIFIED_RE = re.compile(
+    r"^[A-Za-z]{3}, \d{2} [A-Za-z]{3} \d{4} \d{2}:\d{2}:\d{2} GMT$"
+)
 
 def test_s3_create_bucket(s3):
     s3.create_bucket(Bucket="intg-s3-create")
@@ -1644,6 +1650,54 @@ def test_s3_get_object_with_version_id(s3):
     get_resp = s3.get_object(Bucket=bucket, Key="file.txt")
     assert get_resp["Body"].read() == b"version-2"
     assert get_resp.get("VersionId") == vid2
+
+
+def test_s3_get_object_non_latest_version_last_modified_is_rfc7231_http_date(s3):
+    """GetObject with explicit VersionId must emit RFC 7231 Last-Modified.
+
+    Non-latest versions are only reachable via ``VersionId``. That code path must
+    not put ISO-8601 timestamps (with ``T`` / ``Z``) into the HTTP ``Last-Modified``
+    header: AWS SDK for JavaScript v3 deserializes that header as RFC7231 and throws
+    after HTTP 200 if the value is wrong.
+    """
+    import urllib.request
+
+    bucket = "s3-ver-lastmod-http-date"
+    key = "file.txt"
+    s3.create_bucket(Bucket=bucket)
+    s3.put_bucket_versioning(
+        Bucket=bucket,
+        VersioningConfiguration={"Status": "Enabled"},
+    )
+
+    r1 = s3.put_object(Bucket=bucket, Key=key, Body=b"first-version-body")
+    vid1 = r1["VersionId"]
+    assert vid1
+
+    # Second object version — vid1 is no longer the latest; GET by VersionId hits
+    # the versioned GetObject branch (not the generic object headers helper).
+    s3.put_object(Bucket=bucket, Key=key, Body=b"second-version-body")
+
+    got = s3.get_object(Bucket=bucket, Key=key, VersionId=vid1)
+    assert got["Body"].read() == b"first-version-body"
+    assert got["VersionId"] == vid1
+    assert isinstance(got["LastModified"], datetime)
+
+    url = s3.generate_presigned_url(
+        "get_object",
+        Params={"Bucket": bucket, "Key": key, "VersionId": vid1},
+        ExpiresIn=120,
+    )
+    req = urllib.request.Request(url, method="GET")
+    with urllib.request.urlopen(req) as resp:
+        assert resp.status == 200
+        last_modified_hdr = resp.headers.get("Last-Modified", "")
+
+    assert last_modified_hdr, "Last-Modified header must be present on GetObject response"
+    assert _RFC7231_LAST_MODIFIED_RE.match(last_modified_hdr), (
+        f"Last-Modified must be RFC 7231 HTTP-date like real S3; got {last_modified_hdr!r}"
+    )
+
 
 def test_s3_eventbridge_notification_on_delete(s3, sqs, eb):
     """S3 delete_object should send EventBridge event when EventBridgeConfiguration is enabled."""
