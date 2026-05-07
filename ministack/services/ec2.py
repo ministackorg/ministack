@@ -59,6 +59,7 @@ import hashlib
 import logging
 import os
 import random
+import re
 import string
 import time
 from urllib.parse import parse_qs
@@ -3177,27 +3178,151 @@ def _modify_vpc_endpoint(p):
 # DescribePrefixLists
 # ---------------------------------------------------------------------------
 
-_AWS_PREFIX_LISTS = {
-    "com.amazonaws.{region}.s3": ("pl-63a5400a", "com.amazonaws.{region}.s3"),
-    "com.amazonaws.{region}.dynamodb": ("pl-02cd2c6b", "com.amazonaws.{region}.dynamodb"),
-}
+# Regex to detect AWS managed prefix list names.
+# Matches: com.amazonaws.<region>.<service> or com.amazonaws.global.<service>
+# Optional ipv6 segment: com.amazonaws.<region>.ipv6.<service>
+_AWS_PREFIX_NAME_RE = re.compile(r"^com\.amazonaws\.([\w-]+)\.(ipv6\.)?([\w.-]+)$")
+
+# Fixed CIDR prefix lengths for AWS managed prefix lists.
+_AWS_PL_IPV4_PREFIX_LEN = 24
+_AWS_PL_IPV6_PREFIX_LEN = 56
+
+# Well-known AWS managed prefix list suffixes (single source of truth).
+# Used for enumeration in DescribeManagedPrefixLists and reverse ID lookup.
+_AWS_PL_REGIONAL_SUFFIXES = [
+    "s3", "dynamodb", "s3express", "vpc-lattice",
+    "route53-healthchecks", "ec2-instance-connect",
+    "ipv6.s3", "ipv6.dynamodb", "ipv6.s3express",
+    "ipv6.vpc-lattice", "ipv6.route53-healthchecks",
+    "ipv6.ec2-instance-connect",
+]
+
+_AWS_PL_GLOBAL_SUFFIXES = [
+    "cloudfront.origin-facing", "groundstation",
+    "ipv6.cloudfront.origin-facing",
+]
+
+
+def _aws_pl_id_from_name(prefix_name: str) -> str:
+    """Deterministic prefix-list ID derived from the name hash."""
+    h = hashlib.sha256(prefix_name.encode()).hexdigest()
+    return f"pl-{h[:17]}"
+
+
+def _aws_prefix_list_to_cidr(prefix_name: str, ipv6: bool = False) -> str:
+    """Deterministic mock: hash AWS managed prefix list name into a single CIDR.
+
+    IPv4: Forces result into 100.64.0.0/10 (CGNAT space) to avoid collision with real private ranges.
+    IPv6: Generates a deterministic /56 in the 64:ff9b:1::/48 space.
+    """
+    h = hashlib.sha256(prefix_name.encode()).digest()
+
+    if ipv6:
+        prefix_len = _AWS_PL_IPV6_PREFIX_LEN
+        # 64:ff9b:1::/48 space
+        base_bytes = bytes([0x00, 0x64, 0xff, 0x9b, 0x00, 0x01]) + b"\x00" * 10
+        base_int = int.from_bytes(base_bytes, "big")
+        usable_bits = prefix_len - 48
+        hash_int = int.from_bytes(h[:8], "big")
+        subnet_id = (hash_int >> (64 - usable_bits)) & ((1 << usable_bits) - 1)
+        network = base_int | (subnet_id << (128 - prefix_len))
+        groups = [format((network >> (112 - 16 * i)) & 0xFFFF, "x") for i in range(8)]
+        return f"{':'.join(groups)}/{prefix_len}"
+
+    # IPv4 — 100.64.0.0/10 = 0x64400000
+    prefix_len = _AWS_PL_IPV4_PREFIX_LEN
+    base = 0x64400000
+    usable_bits = prefix_len - 10
+    hash_int = int.from_bytes(h[:4], "big")
+    subnet_id = (hash_int >> (32 - usable_bits)) & ((1 << usable_bits) - 1)
+    network = base | (subnet_id << (32 - prefix_len))
+    octets = [(network >> (8 * i)) & 0xFF for i in range(3, -1, -1)]
+    return f"{'.'.join(map(str, octets))}/{prefix_len}"
+
+
+def _is_aws_managed_prefix_name(name: str) -> bool:
+    """Return True if the name matches the AWS managed prefix list pattern."""
+    return bool(_AWS_PREFIX_NAME_RE.match(name))
+
+
+def _is_aws_managed_prefix_id(pl_id: str) -> bool:
+    """Return True if the prefix-list ID belongs to an AWS managed prefix list."""
+    # AWS managed IDs are generated deterministically; check against known names
+    # by looking up in the resolve cache or checking the ID format.
+    # We use a fast path: if it's not in user-created lists, try to resolve it.
+    return pl_id not in _prefix_lists and _resolve_aws_pl_by_id(pl_id) is not None
+
+
+def _resolve_aws_pl(name: str) -> dict | None:
+    """Build an AWS managed prefix list record from a name if it matches the pattern."""
+    m = _AWS_PREFIX_NAME_RE.match(name)
+    if not m:
+        return None
+    is_ipv6 = m.group(2) is not None
+    return {
+        "PrefixListId": _aws_pl_id_from_name(name),
+        "PrefixListName": name,
+        "Cidr": _aws_prefix_list_to_cidr(name, ipv6=is_ipv6),
+        "AddressFamily": "IPv6" if is_ipv6 else "IPv4",
+        "MaxEntries": 20,
+        "OwnerId": "AWS",
+    }
+
+
+def _resolve_aws_pl_by_id(pl_id: str) -> dict | None:
+    """Reverse-lookup: given a prefix-list ID, find the matching AWS managed PL.
+
+    Since IDs are derived from names, we check against the well-known service names
+    for the current region and global scope.
+    """
+    region = get_region()
+    for suffix in _AWS_PL_REGIONAL_SUFFIXES:
+        name = f"com.amazonaws.{region}.{suffix}"
+        if _aws_pl_id_from_name(name) == pl_id:
+            return _resolve_aws_pl(name)
+    for suffix in _AWS_PL_GLOBAL_SUFFIXES:
+        name = f"com.amazonaws.global.{suffix}"
+        if _aws_pl_id_from_name(name) == pl_id:
+            return _resolve_aws_pl(name)
+    return None
+
+
+def _get_aws_managed_prefix_lists() -> list[dict]:
+    """Return the set of well-known AWS managed prefix lists for the current region."""
+    region = get_region()
+    result = []
+    for suffix in _AWS_PL_REGIONAL_SUFFIXES:
+        name = f"com.amazonaws.{region}.{suffix}"
+        pl = _resolve_aws_pl(name)
+        if pl:
+            result.append(pl)
+    for suffix in _AWS_PL_GLOBAL_SUFFIXES:
+        name = f"com.amazonaws.global.{suffix}"
+        pl = _resolve_aws_pl(name)
+        if pl:
+            result.append(pl)
+    return result
+
 
 def _describe_prefix_lists(p):
     filter_ids = _parse_member_list(p, "PrefixListId")
     filters = _parse_filters(p)
     items = ""
     # Built-in AWS service prefix lists
-    for tpl_svc, (pl_id, tpl_name) in _AWS_PREFIX_LISTS.items():
-        svc = tpl_svc.replace("{region}", get_region())
-        name = tpl_name.replace("{region}", get_region())
+    for aws_pl in _get_aws_managed_prefix_lists():
+        pl_id = aws_pl["PrefixListId"]
+        name = aws_pl["PrefixListName"]
+        cidr = aws_pl["Cidr"]
         if filter_ids and pl_id not in filter_ids:
             continue
         if filters.get("prefix-list-name") and name not in filters["prefix-list-name"]:
             continue
+        if filters.get("prefix-list-id") and pl_id not in filters["prefix-list-id"]:
+            continue
         items += f"""<item>
             <prefixListId>{pl_id}</prefixListId>
             <prefixListName>{name}</prefixListName>
-            <cidrSet><item><cidr>0.0.0.0/0</cidr></item></cidrSet>
+            <cidrSet><item>{cidr}</item></cidrSet>
         </item>"""
     # User-created managed prefix lists
     for pl in _prefix_lists.values():
@@ -3207,7 +3332,7 @@ def _describe_prefix_lists(p):
             continue
         if filters.get("prefix-list-name") and pl.get("PrefixListName", "") not in filters["prefix-list-name"]:
             continue
-        entries = "".join(f"<item><cidr>{e['Cidr']}</cidr></item>" for e in pl.get("Entries", []))
+        entries = "".join(f"<item>{e['Cidr']}</item>" for e in pl.get("Entries", []))
         items += f"""<item>
             <prefixListId>{pl['PrefixListId']}</prefixListId>
             <prefixListName>{pl.get('PrefixListName','')}</prefixListName>
@@ -3222,6 +3347,9 @@ def _describe_prefix_lists(p):
 
 def _create_managed_prefix_list(p):
     name = _p(p, "PrefixListName") or ""
+    # Reject creation of prefix lists that collide with AWS managed names
+    if _is_aws_managed_prefix_name(name):
+        return _error("UnsupportedOperation", "The action is not supported for an AWS-managed prefix list.", 400)
     max_entries = int(_p(p, "MaxEntries") or "10")
     af = _p(p, "AddressFamily") or "IPv4"
     pl_id = "pl-" + "".join(random.choices(string.hexdigits[:16], k=17))
@@ -3246,6 +3374,30 @@ def _describe_managed_prefix_lists(p):
     filter_ids = _parse_member_list(p, "PrefixListId")
     filters = _parse_filters(p)
     items = ""
+    # AWS managed prefix lists
+    for aws_pl in _get_aws_managed_prefix_lists():
+        pl_id = aws_pl["PrefixListId"]
+        name = aws_pl["PrefixListName"]
+        if filter_ids and pl_id not in filter_ids:
+            continue
+        if filters.get("prefix-list-name") and name not in filters["prefix-list-name"]:
+            continue
+        if filters.get("prefix-list-id") and pl_id not in filters["prefix-list-id"]:
+            continue
+        if filters.get("owner-id") and "AWS" not in filters["owner-id"]:
+            continue
+        items += f"""<item>
+        <prefixListId>{pl_id}</prefixListId>
+        <prefixListName>{name}</prefixListName>
+        <state>create-complete</state>
+        <addressFamily>{aws_pl['AddressFamily']}</addressFamily>
+        <maxEntries>{aws_pl['MaxEntries']}</maxEntries>
+        <version>1</version>
+        <prefixListArn>arn:aws:ec2:{get_region()}:aws:prefix-list/{pl_id}</prefixListArn>
+        <ownerId>AWS</ownerId>
+        <tagSet/>
+    </item>"""
+    # User-created managed prefix lists
     for pl in _prefix_lists.values():
         if filter_ids and pl["PrefixListId"] not in filter_ids:
             continue
@@ -3253,12 +3405,25 @@ def _describe_managed_prefix_lists(p):
             continue
         if filters.get("prefix-list-name") and pl.get("PrefixListName", "") not in filters["prefix-list-name"]:
             continue
+        if filters.get("owner-id") and pl.get("OwnerId", get_account_id()) not in filters["owner-id"]:
+            continue
         items += _prefix_list_xml(pl)
     return _xml(200, "DescribeManagedPrefixListsResponse", f"<prefixListSet>{items}</prefixListSet>")
 
 
 def _get_managed_prefix_list_entries(p):
     pl_id = _p(p, "PrefixListId")
+    # Check AWS managed prefix lists first
+    aws_pl = _resolve_aws_pl_by_id(pl_id)
+    if aws_pl:
+        cidr = aws_pl["Cidr"]
+        name = aws_pl["PrefixListName"]
+        entries = f"""<item>
+        <cidr>{cidr}</cidr>
+        <description>{name}</description>
+    </item>"""
+        return _xml(200, "GetManagedPrefixListEntriesResponse", f"<entrySet>{entries}</entrySet>")
+    # User-created managed prefix lists
     pl = _prefix_lists.get(pl_id)
     if not pl:
         return _error("InvalidPrefixListID.NotFound", f"Prefix list '{pl_id}' not found", 400)
@@ -3271,6 +3436,9 @@ def _get_managed_prefix_list_entries(p):
 
 def _modify_managed_prefix_list(p):
     pl_id = _p(p, "PrefixListId")
+    # Reject modifications to AWS managed prefix lists
+    if _is_aws_managed_prefix_id(pl_id):
+        return _error("UnsupportedOperation", "The action is not supported for an AWS-managed prefix list.", 400)
     pl = _prefix_lists.get(pl_id)
     if not pl:
         return _error("InvalidPrefixListID.NotFound", f"Prefix list '{pl_id}' not found", 400)
@@ -3294,15 +3462,20 @@ def _modify_managed_prefix_list(p):
     if rm_cidrs:
         pl["Entries"] = [e for e in pl["Entries"] if e["Cidr"] not in rm_cidrs]
     pl["Version"] = pl.get("Version", 1) + 1
+    pl["State"] = "modify-complete"
     return _xml(200, "ModifyManagedPrefixListResponse", _prefix_list_xml(pl, tag="prefixList"))
 
 
 def _delete_managed_prefix_list(p):
     pl_id = _p(p, "PrefixListId")
+    # Reject deletion of AWS managed prefix lists
+    if _is_aws_managed_prefix_id(pl_id):
+        return _error("UnsupportedOperation", "The action is not supported for an AWS-managed prefix list.", 400)
     if pl_id not in _prefix_lists:
         return _error("InvalidPrefixListID.NotFound", f"Prefix list '{pl_id}' not found", 400)
-    del _prefix_lists[pl_id]
-    return _xml(200, "DeleteManagedPrefixListResponse", "<return>true</return>")
+    pl = _prefix_lists.pop(pl_id)
+    pl["State"] = "delete-complete"
+    return _xml(200, "DeleteManagedPrefixListResponse", _prefix_list_xml(pl, tag="prefixList"))
 
 
 def _prefix_list_xml(pl, tag="item"):
