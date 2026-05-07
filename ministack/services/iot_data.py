@@ -1,8 +1,8 @@
 """IoT Data Plane HTTP API (``iot-data`` AWS service).
 
 Implements the HTTP-side of the AWS IoT Data Plane. The data plane mirrors
-the broker over a small REST surface (``Publish`` is the only Phase 1b
-operation; ``GetRetainedMessage`` / ``ListRetainedMessages`` are Phase 2).
+the broker over a small REST surface (``Publish`` is the primary
+operation; ``GetRetainedMessage`` / ``ListRetainedMessages`` are not yet implemented).
 
 Routing reaches us either through credential-scope detection (the SDK signs
 requests with the ``iotdata`` scope) or via the host pattern
@@ -83,18 +83,18 @@ async def handle_request(
     if method == "POST" and path.startswith("/topics/"):
         return await _publish(path[len("/topics/"):], body, qp)
 
-    # Phase 2 — placeholders return 501 so SDKs that probe these endpoints
+    # Placeholders — return 501 so SDKs that probe these endpoints
     # get a clear "not implemented" rather than a generic 404.
     if path == "/retainedMessage":
         return error_response_json(
             "InvalidRequestException",
-            "ListRetainedMessages is a Phase 2 feature",
+            "ListRetainedMessages is not yet implemented",
             501,
         )
     if path.startswith("/retainedMessage/"):
         return error_response_json(
             "InvalidRequestException",
-            "GetRetainedMessage is a Phase 2 feature",
+            "GetRetainedMessage is not yet implemented",
             501,
         )
 

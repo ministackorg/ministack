@@ -13,10 +13,10 @@ Implements the JSON/REST APIs under ``iot.{region}.amazonaws.com``:
     ``DetachPolicy``, etc.
   - ``DescribeEndpoint`` returning a per-account hostname
 
-This is the Phase 1a control plane — pure HTTP/JSON, no MQTT broker
+This is the control plane — pure HTTP/JSON, no MQTT broker
 dependency. The data plane (``iot_data.py``, ``iot_broker.py``) is
 implemented separately and only depends on this module for certificate
-lookups (Phase 2).
+lookups (mTLS).
 
 State is fully isolated per account via ``AccountScopedDict`` and persisted
 through ``get_state``/``restore_state``. The Local CA (used to sign

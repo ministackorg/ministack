@@ -65,8 +65,8 @@ def _ws_resolve_iot_account_id(scope: dict, ws_headers: dict) -> str:
     2. ``Authorization: AWS4-HMAC-SHA256`` header — same extraction.
     3. Fall back to ``MINISTACK_ACCOUNT_ID`` / ``000000000000``.
 
-    SigV4 signature *verification* is intentionally lax in Phase 1 (any
-    well-formed credential is accepted); IoT policy enforcement is a Phase 2+
+    SigV4 signature *verification* is intentionally lax (any
+    well-formed credential is accepted); IoT policy enforcement is not yet
     feature. The point here is multi-tenancy isolation, not auth.
     """
     qs = scope.get("query_string", b"").decode("utf-8", errors="replace")
@@ -739,7 +739,7 @@ def _handle_iot_ca_request(method: str, path: str):
     """`GET /_ministack/iot/ca.pem` returns the Local CA root certificate.
 
     Test code and IoT SDKs use this to configure trust for mTLS connections
-    to the local broker (Phase 2). The CA is generated lazily on first call.
+    to the local broker. The CA is generated lazily on first call.
     """
     if path != "/_ministack/iot/ca.pem" or method != "GET":
         return None

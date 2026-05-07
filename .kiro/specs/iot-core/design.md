@@ -20,8 +20,7 @@ graph TB
         IoTCP["services/iot.py<br/>IoT Control Plane"]
         IoTData["services/iot_data.py<br/>IoT Data HTTP API"]
         LocalCA["core/local_ca.py<br/>Local CA Module"]
-        Bridge["services/iot_broker.py<br/>Broker Bridge"]
-        Broker["amqtt (embedded)<br/>MQTT Broker"]
+        Bridge["services/iot_broker.py<br/>Broker Bridge + In-Memory MQTT"]
         WSHandler["ASGI WS Handler<br/>MQTT-over-WS"]
     end
 
@@ -37,7 +36,6 @@ graph TB
     Router -->|"credential scope: iotdata"| IoTData
     Lambda -->|"POST /topics/{topic}"| IoTData
     IoTData -->|"publish()"| Bridge
-    Bridge -->|"in-process"| Broker
     Browser -->|"WS upgrade + SigV4"| WSHandler
     WSHandler -->|"mqtt subprotocol"| Bridge
     Device -.->|"TLS 8883 (P2)"| Bridge
@@ -49,7 +47,7 @@ graph TB
 
 | Decision | Choice | Rationale |
 |----------|--------|-----------|
-| Broker strategy | Embedded Python library (`amqtt`) | In-process = zero IPC, simplest Broker Bridge (direct async calls). `amqtt` is a pure-Python MQTT 3.1.1 broker with QoS 0/1, retained messages, wildcards. No binary dependency, no Docker sidecar, no image-size concern. Falls within the `full` optional dependency group alongside `cryptography` and `docker`. |
+| Broker strategy | Custom in-memory Python broker | In-process pure-Python MQTT 3.1.1 pub/sub registry with its own frame codec. Zero external dependencies, zero IPC, direct async calls. No binary dependency, no Docker sidecar, no image-size concern. |
 | MQTT-over-WS port | Multiplexed on gateway port (4566) | Matches AppSync Events pattern. The ASGI app already dispatches WebSocket upgrades by host header. IoT WS uses `Sec-WebSocket-Protocol: mqtt` on the IoT data hostname. |
 | DescribeEndpoint hostname | `<prefix>-ats.iot.<region>.<MINISTACK_HOST>` | Follows AWS format. Router matches via `host_patterns: [r"\.iot\."]` and credential scope `iot`/`iotdata`. The prefix is a deterministic hash of the account ID. |
 | Local CA placement | `ministack/core/local_ca.py` | Reusable by ACM and API Gateway. Wraps `cryptography` library for CA generation and leaf signing. |
@@ -70,7 +68,7 @@ ministack/
 ├── services/
 │   ├── iot.py               # NEW — IoT control plane (Things, Certs, Policies, Endpoint)
 │   ├── iot_data.py          # NEW — iot-data HTTP API (Publish)
-│   └── iot_broker.py        # NEW — Broker Bridge + embedded amqtt lifecycle
+│   └── iot_broker.py        # NEW — Broker Bridge + in-memory MQTT broker
 └── app.py                   # MODIFIED — register iot/iot-data services, add IoT WS dispatch
 ```
 
@@ -114,17 +112,17 @@ if iot_ws_m:
 ### Broker Bridge Interface (`iot_broker.py`)
 
 ```python
-"""Broker Bridge — manages a single embedded amqtt broker with session-level account scoping.
+"""Broker Bridge — custom in-memory MQTT 3.1.1 broker with session-level account scoping.
 
-Follows the Transfer Family SFTP pattern: client-facing listeners are managed by
-Ministack (not by the broker). The bridge terminates connections, resolves the
-account (via SigV4 on WS, or client cert on mTLS in P2), and relays MQTT frames
-to/from the internal broker with transparent topic prefixing.
+Implements a pure-Python pub/sub registry with its own MQTT frame codec. Handles
+WebSocket connections directly through the ASGI layer. The bridge terminates
+connections, resolves the account (via SigV4 on WS, or client cert on mTLS in P2),
+and manages subscriptions with transparent topic prefixing.
 
 Architecture:
-  Client → [WS on gateway (P1b) / TLS 8883 (P2b)] → Bridge → amqtt (internal)
+  Client → [WS on gateway (P1b) / TLS 8883 (P2b)] → Bridge (in-memory broker)
   
-The broker itself has no external listeners. All multi-tenancy logic lives in the bridge.
+No external broker process. All multi-tenancy logic lives in the bridge.
 No plain TCP 1883 — matches real AWS IoT Core which requires TLS or SigV4 on all connections.
 """
 
@@ -151,7 +149,7 @@ async def handle_websocket(scope: dict, receive, send, account_id: str) -> None:
     """Handle an MQTT-over-WebSocket connection. Account already resolved from SigV4."""
 
 def is_available() -> bool:
-    """Return True if amqtt is importable."""
+    """Return True if the broker module is operational."""
 ```
 
 **Topic prefixing (transparent to clients):**
@@ -353,51 +351,31 @@ The router matches this via `host_patterns: [r"\.iot\."]` in the `iot-data` serv
 
 For the WebSocket upgrade path, the same hostname is used. The ASGI WebSocket dispatcher checks for `.iot.` in the host and the `mqtt` subprotocol to route to `iot_broker.handle_websocket`.
 
-## Broker Integration: Embedded `amqtt`
+## Broker Integration: Custom In-Memory Broker
 
-### Why `amqtt`
+### Why Custom
 
 | Option | Pros | Cons |
 |--------|------|------|
-| `amqtt` (embedded Python) | Pure Python, async, in-process, zero IPC, direct Bridge calls, no image size impact | Python-only, no MQTT 5.0, moderate throughput |
+| Custom in-memory (chosen) | Pure Python, async, in-process, zero deps, full control over AWS-specific semantics | Must implement MQTT frame codec, more code to maintain |
+| `amqtt` (embedded Python) | Existing library, less code | Standard MQTT semantics differ from AWS IoT Core (e.g., retained+wildcard), hard to customize |
 | Mosquitto sidecar | Battle-tested, high throughput | Requires Docker, IPC over TCP, complex Bridge, breaks single-binary story |
 | `mochi-mqtt` (Go binary) | Fast, small binary | Cross-compile needed, IPC over TCP, startup coordination |
 
-`amqtt` wins because:
-1. **In-process** — the Broker Bridge is just async function calls, no serialization or network hops.
-2. **Pure Python** — no binary compilation, works on all platforms Ministack supports.
-3. **Async-native** — integrates naturally with Hypercorn's event loop.
-4. **Sufficient for local testing** — throughput is irrelevant for dev/test workloads.
-5. **Optional dependency** — added to `[full]` extras alongside `cryptography` and `docker`.
+Custom in-memory wins because:
+1. **Full control** — AWS IoT Core deviates from standard MQTT in several ways (retained messages not delivered on wildcard subscribe, specific QoS 2 handling). A custom broker lets us match AWS behavior exactly.
+2. **In-process** — the Broker Bridge is just async function calls, no serialization or network hops.
+3. **Pure Python, zero deps** — no external library needed, works on all platforms.
+4. **Async-native** — integrates naturally with Hypercorn's event loop.
+5. **Sufficient for local testing** — throughput is irrelevant for dev/test workloads.
 
 ### Broker Lifecycle
 
 ```python
 # iot_broker.py internals
-_broker: "amqtt.broker.Broker | None" = None
-_broker_lock = asyncio.Lock()
-
-async def _ensure_broker() -> "Broker":
-    """Start the single broker if not running. Thread-safe via lock."""
-    global _broker
-    if _broker is not None:
-        return _broker
-    async with _broker_lock:
-        if _broker is not None:
-            return _broker
-        config = {
-            "listeners": {
-                # Internal only — no external TCP listener.
-                # All client connections go through the bridge layer.
-                "default": {"type": "tcp", "bind": "127.0.0.1:0"},  # ephemeral port, loopback only
-            },
-            "auth": {"allow-anonymous": True},
-            "topic-check": {"enabled": False},
-        }
-        _broker = Broker(config)
-        await _broker.start()
-        logger.info("IoT MQTT: internal broker started")
-        return _broker
+_subscriptions: dict[str, set[_Subscription]] = {}
+_retained: dict[str, _RetainedMessage] = {}
+_lock = asyncio.Lock()
 
 def _scoped_topic(account_id: str, topic: str) -> str:
     """Prefix topic with account ID for isolation."""
@@ -411,7 +389,7 @@ def _unscope_topic(account_id: str, scoped_topic: str) -> str:
     return scoped_topic
 ```
 
-One internal broker instance — no external TCP listener exposed by `amqtt` itself. All client-facing listeners (TCP 1883, TLS 8883, WS on gateway) are managed by Ministack's bridge layer, which terminates the connection, resolves the account, and relays MQTT frames to/from the broker with topic prefixing. This mirrors how Transfer Family's shared SFTP listener resolves users by SSH key at the session level.
+The broker is a module-level pub/sub registry — no separate process, no startup coordination. It's always available when the module is imported. All client-facing connections (WS on gateway, TLS 8883 in P2) are managed by the bridge layer, which terminates the connection, resolves the account, and manages subscriptions with topic prefixing. This mirrors how Transfer Family's shared SFTP listener resolves users by SSH key at the session level.
 
 ### MQTT-over-WebSocket Flow
 
@@ -419,8 +397,7 @@ One internal broker instance — no external TCP listener exposed by `amqtt` its
 sequenceDiagram
     participant Browser as Browser (IoT SDK)
     participant ASGI as Ministack ASGI
-    participant Bridge as iot_broker.py (Bridge)
-    participant Broker as amqtt (internal)
+    participant Bridge as iot_broker.py (In-Memory Broker)
 
     Browser->>ASGI: WS Upgrade (Sec-WebSocket-Protocol: mqtt)
     Note over ASGI: Validate SigV4 → extract account_id
@@ -430,15 +407,15 @@ sequenceDiagram
         Browser->>ASGI: WS binary frame (MQTT packet)
         ASGI->>Bridge: Forward bytes
         Note over Bridge: Parse MQTT, prefix topics with account_id
-        Bridge->>Broker: Internal publish/subscribe (prefixed topic)
-        Broker->>Bridge: Outbound message (prefixed topic)
+        Bridge->>Bridge: Internal publish/subscribe (prefixed topic)
+        Bridge->>Bridge: Match subscribers, deliver outbound
         Note over Bridge: Strip account_id prefix from topic
         Bridge->>ASGI: WS binary frame
         ASGI->>Browser: Deliver
     end
 ```
 
-The broker never sees the raw WebSocket connection. The bridge layer parses MQTT frames, applies topic prefixing, and relays to/from the internal broker. This same pattern applies to mTLS (P2) and anonymous TCP connections — only the account resolution method differs.
+The broker never sees the raw WebSocket connection. The bridge layer parses MQTT frames, applies topic prefixing, and manages the in-memory pub/sub registry directly. This same pattern applies to mTLS (P2) — only the account resolution method differs.
 
 ### SigV4 WebSocket Upgrade Flow
 
@@ -472,15 +449,14 @@ sequenceDiagram
     participant Router as router.py
     participant IoTData as iot_data.py
     participant Bridge as iot_broker.py
-    participant Broker as amqtt
     participant Sub as MQTT Subscriber
 
     Lambda->>Router: POST /topics/my/topic (credential scope: iotdata)
     Router->>IoTData: handle_request()
     IoTData->>IoTData: Validate topic (non-empty, no wildcards, ≤256 bytes)
     IoTData->>Bridge: publish("my/topic", payload, qos=0)
-    Bridge->>Broker: Internal publish
-    Broker->>Sub: Deliver to matching subscribers
+    Bridge->>Bridge: Match subscribers in registry
+    Bridge->>Sub: Deliver to matching subscribers
     IoTData-->>Lambda: HTTP 200 {}
 ```
 
@@ -518,7 +494,7 @@ All control-plane errors follow the standard AWS JSON error format:
 
 ### Graceful Degradation
 
-The control plane (`iot.py`) never calls the broker. It operates independently. Only `iot_data.py` and `iot_broker.py` depend on the broker being available. If `amqtt` is not installed (base install without `[full]`), the control plane still works; data-plane operations return 503 with a clear error message.
+The control plane (`iot.py`) never calls the broker. It operates independently. Only `iot_data.py` and `iot_broker.py` depend on the broker being available. If `IOT_BROKER_ENABLED=0`, the control plane still works; data-plane operations return 503 with a clear error message.
 
 ### Multi-Tenancy and Account Isolation
 
@@ -526,7 +502,7 @@ The control plane (`iot.py`) never calls the broker. It operates independently. 
 
 **Data plane (MQTT broker) — single broker, session-level scoping:**
 
-Following the Transfer Family SFTP pattern (one listener, multi-tenancy resolved at the session level), we run a single `amqtt` broker instance. Account isolation is enforced by the bridge layer through transparent topic prefixing:
+Following the Transfer Family SFTP pattern (one listener, multi-tenancy resolved at the session level), we run a single in-memory broker instance. Account isolation is enforced by the bridge layer through transparent topic prefixing:
 
 - **SigV4-over-WS (P1b):** Account ID extracted from `X-Amz-Credential` on the WS upgrade. The bridge prefixes all topics for that session with the account ID.
 - **mTLS on 8883 (P2):** Client certificate is looked up in the Certificate registry to find the owning account — same pattern as Transfer Family resolving SFTP users by SSH public key.
@@ -700,19 +676,636 @@ hypothesis>=6.100
 paho-mqtt>=2.0       # MQTT client for integration tests
 ```
 
-## Appendix: Dependency Addition
+---
 
-`amqtt` is added to `[full]` optional dependencies in `pyproject.toml`:
+# Phase 1c: MQTT Fidelity Improvements
+
+## Overview
+
+Phase 1c closes behavioral gaps between the Phase 1b custom broker and AWS IoT Core's MQTT semantics. The existing broker in `ministack/services/iot_broker.py` is a pure-Python in-memory pub/sub registry with its own MQTT 3.1.1 frame codec, handling WebSocket connections through the ASGI layer. Phase 1c extends this broker with six capabilities:
+
+1. **Retained message wildcard exclusion** — AWS IoT Core does not replay stored retained messages to wildcard subscribers.
+2. **Last Will and Testament (LWT)** — Publish a client's Will message on ungraceful disconnect.
+3. **Persistent sessions** — `cleanSession=0` preserves subscriptions and queues QoS 1 messages across reconnections.
+4. **QoS 1 end-to-end delivery** — Track granted QoS per subscription, assign packet IDs, retransmit on timeout, handle PUBACK.
+5. **Client ID duplicate detection** — Force-disconnect the old connection when a new client connects with the same Client ID.
+6. **Topic validation on MQTT PUBLISH** — Reject invalid topics (empty, wildcards, >256 bytes) on the WebSocket path, matching the HTTP Publish validation.
+
+All changes are confined to `iot_broker.py`. No new modules are introduced.
+
+## Architecture
+
+The Phase 1c changes extend the existing `_WSSession` class and the module-level pub/sub registry. The architecture remains the same — a single in-process broker with transparent topic prefixing for multi-tenancy:
+
+```mermaid
+graph TB
+    subgraph "iot_broker.py (Phase 1c additions)"
+        direction TB
+        WSSession["_WSSession<br/>(extended)"]
+        PubSub["In-memory pub/sub<br/>_subscriptions / _retained"]
+        PersistStore["_persistent_sessions<br/>dict[(account_id, client_id)]"]
+        ConnectedClients["_connected_clients<br/>dict[(account_id, client_id)]"]
+        InFlight["Per-session in-flight<br/>QoS 1 tracking"]
+    end
+
+    WSSession -->|"Will fields stored"| WSSession
+    WSSession -->|"cleanSession=0"| PersistStore
+    WSSession -->|"register on CONNECT"| ConnectedClients
+    WSSession -->|"QoS 1 PUBLISH"| InFlight
+    PubSub -->|"retained delivery<br/>(skip wildcards)"| WSSession
+```
+
+## Components and Interfaces
+
+### 1. Retained Message Wildcard Exclusion
+
+**Current behavior:** The `subscribe()` function replays all retained messages matching the subscription filter, including wildcard filters.
+
+**Change:** Modify the retained-message replay logic in `subscribe()` to skip delivery when the subscription filter contains `+` or `#`.
+
+```python
+async def subscribe(
+    account_id: str,
+    topic_filter: str,
+    callback: Callable[[str, bytes, int], Awaitable[None]],
+    *,
+    _deliver_retained: bool = True,
+) -> str:
+    filter_prefixed = _scoped_topic(account_id, topic_filter)
+    sub = _Subscription(filter_prefixed, account_id, callback)
+    async with _lock:
+        _subscriptions.setdefault(filter_prefixed, set()).add(sub)
+        # AWS IoT Core: retained messages are NOT replayed for wildcard subscriptions.
+        has_wildcard = "+" in topic_filter or "#" in topic_filter
+        if _deliver_retained and not has_wildcard:
+            retained_to_send = [
+                r for k, r in _retained.items() if _topic_matches(filter_prefixed, k)
+            ]
+        else:
+            retained_to_send = []
+
+    for r in retained_to_send:
+        try:
+            await sub.deliver(_unscope_topic(account_id, r.topic), r.payload, r.qos)
+        except Exception:
+            logger.exception("IoT broker: retained-message delivery failed")
+
+    return sub.subscription_id
+```
+
+Real-time delivery of messages published with `retain=1` is unaffected — the restriction applies only to replaying *stored* retained messages on new subscriptions.
+
+### 2. Last Will and Testament (LWT)
+
+**CONNECT packet parsing extension:** The `handle_packet` method for `PKT_CONNECT` currently ignores the variable header beyond accepting the connection. Phase 1c parses the Connect Flags byte and, when the Will Flag is set, extracts:
+
+- Will Topic (UTF-8 string)
+- Will Message (binary payload, length-prefixed)
+- Will QoS (bits 4–3 of Connect Flags)
+- Will Retain (bit 5 of Connect Flags)
+
+**Session fields added to `_WSSession`:**
+
+```python
+class _WSSession:
+    def __init__(self, send_coro, account_id: str):
+        # ... existing fields ...
+        self._will_topic: str | None = None
+        self._will_message: bytes | None = None
+        self._will_qos: int = 0
+        self._will_retain: bool = False
+        self._graceful_disconnect: bool = False
+        self._client_id: str = ""
+        self._clean_session: bool = True
+```
+
+**CONNECT handler changes:**
+
+```python
+async def _handle_connect(self, body: bytes) -> bool:
+    """Parse CONNECT variable header and payload."""
+    # Protocol Name (skip)
+    _, off = _read_string(body, 0)
+    # Protocol Level
+    off += 1  # skip protocol level byte
+    # Connect Flags
+    connect_flags = body[off]
+    off += 1
+    # Keep Alive
+    off += 2  # skip keep-alive (not enforced in local emulator)
+
+    has_username = bool(connect_flags & 0x80)
+    has_password = bool(connect_flags & 0x40)
+    will_retain = bool(connect_flags & 0x20)
+    will_qos = (connect_flags >> 3) & 0x03
+    has_will = bool(connect_flags & 0x04)
+    clean_session = bool(connect_flags & 0x02)
+
+    # Client ID
+    client_id, off = _read_string(body, off)
+    if not client_id:
+        client_id = uuid.uuid4().hex  # Auto-generate for empty Client ID
+
+    self._client_id = client_id
+    self._clean_session = clean_session
+
+    # Will fields
+    if has_will:
+        self._will_topic, off = _read_string(body, off)
+        will_msg_len = struct.unpack_from("!H", body, off)[0]
+        off += 2
+        self._will_message = body[off:off + will_msg_len]
+        off += will_msg_len
+        self._will_qos = will_qos
+        self._will_retain = will_retain
+    else:
+        self._will_topic = None
+        self._will_message = None
+        self._will_qos = 0
+        self._will_retain = False
+
+    # Username / Password (skip, not used in Phase 1)
+    # ... parsing skipped for brevity ...
+
+    return True
+```
+
+**Disconnect handling:**
+
+- **Graceful disconnect** (DISCONNECT packet received): Set `self._graceful_disconnect = True`. The `cleanup()` method checks this flag and does NOT publish the Will message.
+- **Ungraceful disconnect** (WebSocket closed without DISCONNECT, exception, buffer overflow): `cleanup()` publishes the Will message.
+
+```python
+async def cleanup(self) -> None:
+    # Publish Will message on ungraceful disconnect
+    if not self._graceful_disconnect and self._will_topic and self._will_message is not None:
+        await publish(
+            self.account_id,
+            self._will_topic,
+            self._will_message,
+            qos=self._will_qos,
+            retain=self._will_retain,
+        )
+    # Unsubscribe all session subscriptions
+    for sid in self._sub_ids:
+        await unsubscribe(sid)
+    self._sub_ids.clear()
+    # Deregister from connected clients
+    _deregister_client(self.account_id, self._client_id)
+    # Handle persistent session preservation (see section 3)
+    if not self._clean_session:
+        _preserve_session(self)
+```
+
+### 3. Persistent Sessions
+
+**New module-level state:**
+
+```python
+# Persistent session store: (account_id, client_id) → _PersistentSessionState
+_persistent_sessions: dict[tuple[str, str], "_PersistentSessionState"] = {}
+
+_SESSION_EXPIRY_SECONDS: int = int(os.environ.get("IOT_SESSION_EXPIRY_SECONDS", "3600"))
+
+
+class _PersistentSessionState:
+    """Stored state for a disconnected persistent session."""
+    __slots__ = ("subscriptions", "queued_messages", "created_at")
+
+    def __init__(self, subscriptions: list[str], created_at: float):
+        self.subscriptions = subscriptions  # list of topic filters (unprefixed)
+        self.queued_messages: list[tuple[str, bytes, int]] = []  # (topic, payload, qos)
+        self.created_at = created_at
+```
+
+**CONNECT flow with persistent sessions:**
+
+```python
+async def _handle_connect(self, body: bytes) -> bool:
+    # ... (parse client_id, clean_session, will fields as above) ...
+
+    # Duplicate Client ID detection (see section 5)
+    await _force_disconnect_duplicate(self.account_id, self._client_id)
+    _register_client(self.account_id, self._client_id, self)
+
+    session_key = (self.account_id, self._client_id)
+
+    if self._clean_session:
+        # Discard any prior session state
+        _persistent_sessions.pop(session_key, None)
+        await self.send_bytes(_make_connack(return_code=0, session_present=False))
+    else:
+        # Persistent session
+        existing = _persistent_sessions.pop(session_key, None)
+        if existing and not _is_session_expired(existing):
+            # Restore subscriptions
+            for topic_filter in existing.subscriptions:
+                sid = await subscribe(
+                    self.account_id, topic_filter, self.deliver_to_client,
+                    _deliver_retained=False,
+                )
+                self._sub_ids.append(sid)
+            await self.send_bytes(_make_connack(return_code=0, session_present=True))
+            # Deliver queued messages
+            for topic, payload, qos in existing.queued_messages:
+                await self.deliver_to_client(topic, payload, qos)
+        else:
+            await self.send_bytes(_make_connack(return_code=0, session_present=False))
+
+    return True
+
+
+def _is_session_expired(state: _PersistentSessionState) -> bool:
+    return (asyncio.get_event_loop().time() - state.created_at) > _SESSION_EXPIRY_SECONDS
+
+
+def _preserve_session(session: "_WSSession") -> None:
+    """Store session state for later resumption."""
+    if session._clean_session:
+        return
+    key = (session.account_id, session._client_id)
+    # Extract topic filters from current subscriptions
+    topic_filters = [
+        _unscope_topic(session.account_id, sid_filter)
+        for sid_filter in session._get_subscription_filters()
+    ]
+    _persistent_sessions[key] = _PersistentSessionState(
+        subscriptions=topic_filters,
+        created_at=asyncio.get_event_loop().time(),
+    )
+```
+
+**Offline message queuing:** When a message is published and matches a persistent session's stored subscriptions (but the client is disconnected), the message is appended to `queued_messages`:
+
+```python
+async def publish(account_id: str, topic: str, payload: bytes, qos: int = 0, retain: bool = False) -> None:
+    # ... existing publish logic ...
+
+    # Queue for disconnected persistent sessions (QoS 1 only)
+    if qos >= 1:
+        scoped = _scoped_topic(account_id, topic)
+        for key, state in _persistent_sessions.items():
+            if key[0] != account_id:
+                continue
+            for sub_filter in state.subscriptions:
+                if _topic_matches(_scoped_topic(account_id, sub_filter), scoped):
+                    state.queued_messages.append((topic, payload, qos))
+                    break
+```
+
+### 4. QoS 1 End-to-End Delivery
+
+**Current behavior:** `deliver_to_client()` downgrades all messages to QoS 0. Phase 1c adds proper QoS 1 delivery with packet ID tracking and retransmission.
+
+**Subscription-level QoS tracking:** The `_Subscription` class gains a `granted_qos` field:
+
+```python
+class _Subscription:
+    __slots__ = ("subscription_id", "filter_prefixed", "account_id", "deliver", "granted_qos")
+
+    def __init__(self, filter_prefixed, account_id, deliver, granted_qos: int = 0):
+        # ... existing ...
+        self.granted_qos = granted_qos
+```
+
+**Per-session in-flight tracking in `_WSSession`:**
+
+```python
+class _WSSession:
+    def __init__(self, send_coro, account_id: str):
+        # ... existing fields ...
+        self._next_pid: int = 1  # already exists
+        self._in_flight: dict[int, _InFlightMessage] = {}
+        self._retransmit_task: asyncio.Task | None = None
+
+    def _alloc_packet_id(self) -> int:
+        pid = self._next_pid
+        self._next_pid = (self._next_pid % 65535) + 1
+        return pid
+
+
+class _InFlightMessage:
+    __slots__ = ("packet_id", "topic", "payload", "sent_at", "retransmit_count")
+
+    def __init__(self, packet_id: int, topic: str, payload: bytes):
+        self.packet_id = packet_id
+        self.topic = topic
+        self.payload = payload
+        self.sent_at = asyncio.get_event_loop().time()
+        self.retransmit_count = 0
+```
+
+**Delivery logic:**
+
+```python
+async def deliver_to_client(self, topic: str, payload: bytes, qos: int) -> None:
+    effective_qos = min(qos, self._granted_qos_for(topic))
+    if effective_qos == 0:
+        await self.send_bytes(_make_publish(topic, payload, qos=0))
+    else:
+        # QoS 1: assign packet ID, track in-flight
+        pid = self._alloc_packet_id()
+        self._in_flight[pid] = _InFlightMessage(pid, topic, payload)
+        await self.send_bytes(_make_publish(topic, payload, qos=1, packet_id=pid))
+        self._ensure_retransmit_timer()
+```
+
+**PUBACK handling:** Added to `handle_packet`:
+
+```python
+if pkt_type == PKT_PUBACK:
+    packet_id = struct.unpack_from("!H", body, 0)[0]
+    self._in_flight.pop(packet_id, None)
+    return True
+```
+
+**Retransmission:** A background task checks `_in_flight` every N seconds (configurable, default 10s) and retransmits unacknowledged messages with `DUP=1`:
+
+```python
+_RETRANSMIT_INTERVAL_SECONDS = int(os.environ.get("IOT_RETRANSMIT_SECONDS", "10"))
+
+async def _retransmit_loop(self) -> None:
+    while self._in_flight:
+        await asyncio.sleep(_RETRANSMIT_INTERVAL_SECONDS)
+        now = asyncio.get_event_loop().time()
+        for pid, msg in list(self._in_flight.items()):
+            if now - msg.sent_at > _RETRANSMIT_INTERVAL_SECONDS:
+                msg.retransmit_count += 1
+                msg.sent_at = now
+                await self.send_bytes(
+                    _make_publish(msg.topic, msg.payload, qos=1, packet_id=pid, dup=True)
+                )
+```
+
+### 5. Client ID Duplicate Detection
+
+**New module-level state:**
+
+```python
+# Connected clients: (account_id, client_id) → _WSSession
+_connected_clients: dict[tuple[str, str], "_WSSession"] = {}
+
+
+def _register_client(account_id: str, client_id: str, session: "_WSSession") -> None:
+    _connected_clients[(account_id, client_id)] = session
+
+
+def _deregister_client(account_id: str, client_id: str) -> None:
+    _connected_clients.pop((account_id, client_id), None)
+
+
+async def _force_disconnect_duplicate(account_id: str, client_id: str) -> None:
+    """If a client with the same (account_id, client_id) is already connected,
+    force-close its WebSocket."""
+    key = (account_id, client_id)
+    existing = _connected_clients.get(key)
+    if existing is not None:
+        logger.info("IoT broker: duplicate client_id=%s, forcing old connection closed", client_id)
+        try:
+            await existing.send_bytes(b"")  # trigger close
+            await existing._send({"type": "websocket.close", "code": 1000})
+        except Exception:
+            pass
+        await existing.cleanup()
+        _connected_clients.pop(key, None)
+```
+
+**Scoping:** The `_connected_clients` dict is keyed by `(account_id, client_id)`, so different accounts can use the same Client ID without conflict.
+
+**Empty Client ID:** When a client connects with an empty Client ID string, the broker generates a unique ID using `uuid.uuid4().hex`. This is more lenient than AWS IoT Core (which rejects empty Client IDs) but avoids breaking simple test clients.
+
+### 6. Topic Validation on MQTT PUBLISH
+
+**New validation function:**
+
+```python
+def _validate_publish_topic(topic: str) -> bool:
+    """Validate a topic for PUBLISH. Returns True if valid.
+
+    Rules (matching HTTP Publish validation in iot_data.py):
+    - Must not be empty
+    - Must not contain '+' or '#' wildcard characters
+    - Must not exceed 256 bytes in UTF-8 encoding
+    """
+    if not topic:
+        return False
+    if "+" in topic or "#" in topic:
+        return False
+    if len(topic.encode("utf-8")) > 256:
+        return False
+    return True
+```
+
+**Integration into PUBLISH handler:**
+
+```python
+if pkt_type == PKT_PUBLISH:
+    qos = (flags >> 1) & 0x03
+    retain = bool(flags & 0x01)
+    topic, off = _read_string(body, 0)
+
+    # Phase 1c: validate topic
+    if not _validate_publish_topic(topic):
+        logger.warning("IoT broker: invalid publish topic %r, closing connection", topic[:64])
+        return False  # signals session termination → WebSocket close
+
+    # ... rest of existing PUBLISH handling ...
+```
+
+Returning `False` from `handle_packet` terminates the session loop, which triggers WebSocket close in the outer `handle_websocket` function. This matches the behavior described in Requirement 23.
+
+### Additional Behavioral Notes (Requirement 24)
+
+- **QoS 2 ignored:** The existing `handle_packet` already falls through to `return True` for unrecognized packet types (PUBREC=5, PUBREL=6, PUBCOMP=7). No change needed.
+- **DUP flag informational:** The existing PUBLISH handler does not check the DUP flag. No change needed.
+- **`#` wildcard does not match parent:** The existing `_topic_matches()` function already implements this correctly — `sensor/#` splits into `["sensor", "#"]` and requires at least one level after `sensor/`. The `#` at position `fi` returns `True` only when `ti < len(t_parts)`, meaning there must be remaining topic levels. No change needed.
+
+## Data Models
+
+### _PersistentSessionState (new)
+
+```python
+{
+    "subscriptions": list[str],          # topic filters (unprefixed)
+    "queued_messages": list[tuple[str, bytes, int]],  # (topic, payload, qos)
+    "created_at": float,                 # event loop time
+}
+```
+
+### _InFlightMessage (new)
+
+```python
+{
+    "packet_id": int,        # 1–65535
+    "topic": str,            # unprefixed topic
+    "payload": bytes,
+    "sent_at": float,        # event loop time of last send
+    "retransmit_count": int,
+}
+```
+
+### _WSSession (extended fields)
+
+```python
+{
+    # Existing:
+    "_send": Callable,
+    "account_id": str,
+    "_sub_ids": list[str],
+    "_buffer": bytearray,
+    "_next_pid": int,
+    "_send_lock": asyncio.Lock,
+
+    # Phase 1c additions:
+    "_client_id": str,
+    "_clean_session": bool,
+    "_will_topic": str | None,
+    "_will_message": bytes | None,
+    "_will_qos": int,
+    "_will_retain": bool,
+    "_graceful_disconnect": bool,
+    "_in_flight": dict[int, _InFlightMessage],
+    "_retransmit_task": asyncio.Task | None,
+}
+```
+
+## Configuration (Phase 1c additions)
+
+| Environment Variable | Default | Description |
+|---------------------|---------|-------------|
+| `IOT_SESSION_EXPIRY_SECONDS` | `3600` | Persistent session expiry timeout (seconds) |
+| `IOT_RETRANSMIT_SECONDS` | `10` | QoS 1 retransmission interval (seconds) |
+
+## Correctness Properties (Phase 1c)
+
+*A property is a characteristic or behavior that should hold true across all valid executions of a system — essentially, a formal statement about what the system should do. Properties serve as the bridge between human-readable specifications and machine-verifiable correctness guarantees.*
+
+### Property 15: Retained message wildcard exclusion
+
+*For any* topic with a stored retained message and *for any* subscription filter containing `+` or `#`, subscribing with that wildcard filter SHALL NOT deliver the stored retained message. Conversely, *for any* exact-match subscription filter (no wildcards) that matches a topic with a stored retained message, subscribing SHALL deliver the retained message.
+
+**Validates: Requirements 18.1, 18.2**
+
+### Property 16: Real-time delivery ignores retain storage semantics
+
+*For any* message published with `retain=1` to a topic, *for any* currently-connected subscriber whose topic filter matches (including wildcard filters), the message SHALL be delivered in real-time regardless of whether the filter contains wildcards.
+
+**Validates: Requirements 18.3**
+
+### Property 17: Will message published if and only if disconnect is ungraceful
+
+*For any* client that connects with a Will Topic and Will Message, if the client disconnects without sending DISCONNECT (ungraceful), the Will Message SHALL be published to the Will Topic at the specified QoS with the specified retain flag. If the client sends DISCONNECT before closing (graceful), the Will Message SHALL NOT be published.
+
+**Validates: Requirements 19.1, 19.2, 19.3, 19.4**
+
+### Property 18: Persistent session subscription round-trip
+
+*For any* client connecting with `cleanSession=0` that subscribes to a set of topic filters, disconnects, and reconnects with the same Client ID and `cleanSession=0`: the CONNACK SHALL have `sessionPresent=1`, and all previously registered subscriptions SHALL be active (messages published to matching topics are delivered). If the client reconnects with `cleanSession=1`, the CONNACK SHALL have `sessionPresent=0` and no prior subscriptions SHALL be active.
+
+**Validates: Requirements 20.1, 20.2, 20.5**
+
+### Property 19: Offline QoS 1 message queuing and delivery
+
+*For any* persistent session with active subscriptions, *for any* QoS 1 messages published to matching topics while the client is disconnected, all such messages SHALL be delivered to the client upon reconnection (with `cleanSession=0`).
+
+**Validates: Requirements 20.3, 20.4**
+
+### Property 20: Effective QoS is minimum of publish and subscription QoS
+
+*For any* message published at QoS level P and *for any* subscriber that subscribed at QoS level S, the message SHALL be delivered to the subscriber at QoS level `min(P, S)`.
+
+**Validates: Requirements 21.1, 21.2**
+
+### Property 21: PUBACK stops retransmission
+
+*For any* QoS 1 message delivered to a subscriber with a packet ID, if the subscriber sends PUBACK with that packet ID, the broker SHALL NOT retransmit that message. The packet IDs assigned to a session SHALL be monotonically increasing (modulo 65535 wrap).
+
+**Validates: Requirements 21.4, 21.5**
+
+### Property 22: Duplicate Client ID forces old connection closed
+
+*For any* two clients connecting with the same Client ID within the same account, the second CONNECT SHALL succeed and the first client's connection SHALL be forcibly closed. *For any* two clients with the same Client ID in different accounts, both connections SHALL remain active.
+
+**Validates: Requirements 22.1, 22.2, 22.3**
+
+### Property 23: MQTT PUBLISH topic validation consistency
+
+*For any* topic string, the MQTT PUBLISH handler (WebSocket path) and the HTTP Publish handler (`POST /topics/{topic}`) SHALL make identical accept/reject decisions. A topic is rejected if and only if it is empty, contains `+` or `#`, or exceeds 256 bytes UTF-8.
+
+**Validates: Requirements 23.1, 23.2, 23.3, 23.4**
+
+### Property 24: Multi-level wildcard `#` does not match parent topic
+
+*For any* topic `T` and subscription filter `T/#`, publishing to topic `T` (with no trailing level) SHALL NOT be delivered to the subscriber. Publishing to `T/child` (any child level) SHALL be delivered.
+
+**Validates: Requirements 24.3**
+
+## Error Handling (Phase 1c)
+
+| Condition | Response |
+|-----------|----------|
+| Invalid topic on MQTT PUBLISH (WS) | WebSocket closed (session terminated) |
+| Duplicate Client ID (same account) | Old connection force-closed (code 1000) |
+| Empty Client ID on CONNECT | Auto-generate UUID, accept connection |
+| QoS 2 packets (PUBREC/PUBREL/PUBCOMP) | Silently ignored, connection stays open |
+| Persistent session expired | Treated as new session (sessionPresent=0) |
+| Offline message queue overflow | Oldest messages dropped (bounded to 1000 per session) |
+
+## Testing Strategy (Phase 1c)
+
+### Unit Tests (example-based)
+
+Added to `tests/test_iot_broker.py`:
+
+- Retained message NOT delivered on wildcard subscribe (`sensor/+`, `sensor/#`)
+- Retained message IS delivered on exact-match subscribe
+- Will message published on ungraceful disconnect
+- Will message NOT published on graceful DISCONNECT
+- Will with retain flag stores retained message
+- Persistent session: connect → subscribe → disconnect → reconnect → sessionPresent=1
+- Clean session: connect with cleanSession=1 discards prior state
+- QoS 1 delivery with packet ID
+- PUBACK removes in-flight message
+- Duplicate Client ID disconnects old client
+- Topic validation rejects empty, wildcard, and oversized topics
+- `#` wildcard does not match parent topic
+
+### Property-Based Tests (hypothesis)
+
+Properties 15–24 are tested with **hypothesis**, minimum **100 iterations** each.
+
+Tag format: `# Feature: iot-core, Property {N}: {title}`
+
+Key generators:
+- `st_mqtt_topic()` — valid MQTT topic strings (1–256 bytes, no wildcards, printable UTF-8)
+- `st_wildcard_filter()` — topic filters with `+` and/or `#` in valid positions
+- `st_will_config()` — (topic, message, qos, retain) tuples
+- `st_client_id()` — 1–23 character alphanumeric strings (MQTT 3.1.1 spec)
+- `st_qos()` — integers in {0, 1}
+
+### Integration Tests
+
+- End-to-end LWT: client connects with Will, force-close WebSocket, verify Will message received by subscriber
+- Persistent session: subscribe, disconnect, publish messages, reconnect, verify delivery
+- QoS 1 retransmission: subscribe at QoS 1, receive message, delay PUBACK, verify DUP retransmit
+- Duplicate Client ID: two WebSocket connections with same Client ID, verify first is closed
+
+---
+
+## Appendix: Test Dependencies
+
+The following test dependencies are used for IoT data-plane testing:
 
 ```toml
 [project.optional-dependencies]
-full = [
+dev = [
     # ... existing ...
-    "amqtt>=0.11",
+    "hypothesis>=6.100",
+    "paho-mqtt>=2.0",
 ]
 ```
 
-When `amqtt` is not installed, `iot_broker.py` catches the `ImportError` and `is_available()` returns `False`. All data-plane operations return 503. Control-plane operations are unaffected.
+The in-memory broker has no external runtime dependencies — it is pure Python with no optional library requirements. The `is_available()` function returns `True` when `IOT_BROKER_ENABLED` is not set to `0`. Control-plane operations are always unaffected by broker state.
 
 ## Appendix: Local CA Endpoint
 
@@ -723,3 +1316,99 @@ GET /_ministack/iot/ca.pem
 ```
 
 This allows test code to configure MQTT clients and SDKs to trust the local CA for mTLS (Phase 2). The endpoint is handled directly in `app.py` as a pre-body handler (similar to `/_ministack/health`).
+
+## Appendix: Reserved Topics — Notes for Future Phases
+
+Reference: https://docs.aws.amazon.com/iot/latest/developerguide/reserved-topics.html
+
+All `$aws/` topics are reserved. Clients can subscribe/publish per the allowed operations but cannot create new `$`-prefixed topics.
+
+### Phase 2 — Shadows
+
+Shadow topics use two prefix patterns:
+
+| Shadow type | Prefix |
+|-------------|--------|
+| Classic (unnamed) | `$aws/things/{thingName}/shadow` |
+| Named | `$aws/things/{thingName}/shadow/name/{shadowName}` |
+
+Operations on each prefix:
+
+| Suffix | Direction | Notes |
+|--------|-----------|-------|
+| `/get` | Device publishes | Empty payload triggers shadow fetch |
+| `/get/accepted` | Direct to client | Full shadow document returned |
+| `/get/rejected` | Direct to client | Error response |
+| `/update` | Device publishes | Merge `state.desired`/`state.reported` |
+| `/update/accepted` | Direct to client | Updated document |
+| `/update/rejected` | Direct to client | Error response |
+| `/update/delta` | Brokered (subscribable) | Published when desired ≠ reported |
+| `/update/documents` | Brokered (subscribable) | Full doc on every successful update |
+| `/delete` | Device publishes | Remove shadow |
+| `/delete/accepted` | Direct to client | Confirmation |
+| `/delete/rejected` | Direct to client | Error response |
+
+**Key implementation note:** "Direct to client" responses are published only to the requesting client's session — they do NOT pass through the message broker and cannot be subscribed to by other clients or rules. The shadow service needs a mechanism to send a response directly to a specific `_WSSession` rather than via the general `publish()` path.
+
+### Phase 3 — Jobs
+
+| Topic pattern | Direction | Notes |
+|---------------|-----------|-------|
+| `$aws/things/{name}/jobs/get` | Device publishes | GetPendingJobExecutions |
+| `$aws/things/{name}/jobs/get/accepted\|rejected` | Direct to client | |
+| `$aws/things/{name}/jobs/start-next` | Device publishes | StartNextPendingJobExecution |
+| `$aws/things/{name}/jobs/start-next/accepted\|rejected` | Direct to client | |
+| `$aws/things/{name}/jobs/{jobId}/get` | Device publishes | DescribeJobExecution |
+| `$aws/things/{name}/jobs/{jobId}/get/accepted\|rejected` | Direct to client | |
+| `$aws/things/{name}/jobs/{jobId}/update` | Device publishes | UpdateJobExecution |
+| `$aws/things/{name}/jobs/{jobId}/update/accepted\|rejected` | Direct to client | Only requesting device receives |
+| `$aws/things/{name}/jobs/notify` | Subscribe only | Brokered — pending list changed |
+| `$aws/things/{name}/jobs/notify-next` | Subscribe only | Brokered — next pending changed |
+
+Job event topics (`$aws/events/job/{jobId}/...`) are subscribe-only and brokered normally.
+
+### Phase 3 — Fleet Provisioning
+
+| Topic pattern | Direction |
+|---------------|-----------|
+| `$aws/certificates/create/{format}` | Device publishes |
+| `$aws/certificates/create/{format}/accepted\|rejected` | Direct to client |
+| `$aws/certificates/create-from-csr/{format}` | Device publishes |
+| `$aws/certificates/create-from-csr/{format}/accepted\|rejected` | Direct to client |
+| `$aws/provisioning-templates/{name}/provision/{format}` | Device publishes |
+| `$aws/provisioning-templates/{name}/provision/{format}/accepted\|rejected` | Direct to client |
+
+Supports both `json` and `cbor` payload formats.
+
+### Phase 3 — Rules Engine (Basic Ingest)
+
+`$aws/rules/{ruleName}` — publish-only shortcut. Messages go directly to the rules engine without passing through the message broker. No subscriber delivery, no retained messages. Reduces messaging costs.
+
+### Future Enhancements (Easy Wins)
+
+These lifecycle events can be emitted with minimal effort since we already track the relevant state:
+
+| Event topic | Trigger | Current state available |
+|-------------|---------|------------------------|
+| `$aws/events/presence/connected/{clientId}` | CONNECT accepted | `_register_client()` |
+| `$aws/events/presence/disconnected/{clientId}` | Session cleanup | `_deregister_client()` |
+| `$aws/events/subscriptions/subscribed/{clientId}` | SUBSCRIBE processed | `handle_packet(PKT_SUBSCRIBE)` |
+| `$aws/events/subscriptions/unsubscribed/{clientId}` | UNSUBSCRIBE processed | `handle_packet(PKT_UNSUBSCRIBE)` |
+| `$aws/events/thing/{name}/created\|updated\|deleted` | Control plane CRUD | `iot.py` handlers |
+| `$aws/events/thingGroup/{name}/created\|updated\|deleted` | Control plane CRUD | `iot.py` handlers |
+
+### Design Pattern: Direct-to-Client Responses
+
+Multiple future features (Shadows, Jobs, Fleet Provisioning) require "direct to client" message delivery — responses sent only to the requesting session, not brokered to other subscribers.
+
+Proposed approach: add a `send_direct(topic, payload)` method to `_WSSession` that bypasses `publish()` entirely and sends a PUBLISH frame directly on the session's WebSocket. The shadow/jobs service would need a reference to the requesting session (passed via the MQTT message handler when it intercepts `$aws/` topic publishes).
+
+```python
+# In _WSSession:
+async def send_direct(self, topic: str, payload: bytes, qos: int = 0) -> None:
+    """Send a message directly to this client without going through the broker."""
+    pid = self._alloc_packet_id() if qos > 0 else None
+    await self.send_bytes(_make_publish(topic, payload, qos=qos, packet_id=pid))
+```
+
+The `handle_packet` for `PKT_PUBLISH` would check if the topic starts with `$aws/` and route to the appropriate service handler (shadow, jobs, provisioning) instead of calling `publish()`. The service handler would then call `send_direct()` on the session for accepted/rejected responses.

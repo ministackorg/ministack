@@ -11,6 +11,7 @@ The unblocking use case from issue #564 is end-to-end test of "Lambda publishes 
 
 - **Phase 1a** (P1a): Control-plane CRUD — Things, ThingTypes, ThingGroups, Certificates (with Local_CA), Policies, `DescribeEndpoint`, persistence, configuration. No broker dependency; pure HTTP/JSON service module.
 - **Phase 1b** (P1b): Data-plane integration — broker bridge, MQTT broker (TCP 1883 + MQTT-over-WS), SigV4-signed WS upgrades, `iot-data Publish` HTTP API. Completes the original use case end-to-end.
+- **Phase 1c** (P1c): MQTT fidelity improvements — fixes behavioral gaps between the Phase 1b broker and AWS IoT Core semantics. Covers retained-message wildcard exclusion, Last Will and Testament, persistent sessions, QoS 1 end-to-end delivery, Client ID duplicate detection, and MQTT PUBLISH topic validation.
 - **Phase 2a** (P2a): Shadows control plane — `GetThingShadow`, `UpdateThingShadow`, `DeleteThingShadow`, `ListNamedShadowsForThing` REST APIs with merge/version/delta semantics. No broker dependency for the REST path.
 - **Phase 2b** (P2b): Shadows data plane + mTLS — Shadow MQTT topic wiring (`$aws/things/+/shadow/#`), mTLS on port 8883 with Local_CA validation, `GetRetainedMessage` / `ListRetainedMessages`.
 - **Phase 3a** (P3a): Rules Engine + Jobs + Fleet Provisioning control plane — `CreateTopicRule` (with SQL parser), `CreateJob`, `CreateProvisioningTemplate` and their CRUD siblings. No broker dependency for the CRUD path.
@@ -35,6 +36,9 @@ Sub-phase tags (P1a, P1b, P2a, P2b, P3a, P3b) are used on each acceptance criter
 - **Rule**: A named record containing an SQL-like expression (`SELECT ... FROM '<topic-pattern>' WHERE ...`) and one or more action descriptors (Lambda, SQS, SNS, DynamoDB, Kinesis, Firehose, republish).
 - **Rules_SQL**: The IoT SQL dialect parsed by the Rules Engine. Covers `SELECT <projection>`, `FROM '<topic-filter>'`, optional `WHERE <expr>`, and a documented subset of built-in functions.
 - **MQTT_WS_Subprotocol**: The `mqtt` / `mqttv3.1` / `mqttv5` Sec-WebSocket-Protocol value used by IoT clients connecting over WebSockets.
+- **Last_Will_And_Testament**: An MQTT feature where a client specifies a Will Topic and Will Message during CONNECT. If the client disconnects unexpectedly (without sending DISCONNECT), the broker publishes the Will Message to the Will Topic on behalf of the disconnected client.
+- **Persistent_Session**: An MQTT session created with `cleanSession=0` that survives client disconnection. The broker stores subscriptions and queues QoS 1 messages for offline clients, delivering them upon reconnection.
+- **Client_ID**: A unique identifier provided by the MQTT client in the CONNECT packet. AWS IoT Core enforces uniqueness per account — a new connection with a duplicate Client ID forces the old connection closed.
 
 ## Requirements
 
@@ -259,6 +263,86 @@ Sub-phase tags (P1a, P1b, P2a, P2b, P3a, P3b) are used on each acceptance criter
 4. THE test suite SHALL include a Device_Shadow test that asserts the `delta` field is recomputed correctly across a sequence of `desired` / `reported` updates. (P2a)
 5. THE test suite SHALL include a Rules_SQL round-trip property test that, for a generator of valid Rules_SQL strings, asserts `parse(prettyPrint(parse(s))) == parse(s)`. (P3a)
 
+### Requirement 18: Retained messages must not match wildcard subscriptions
+
+**User Story:** As a developer testing retained-message semantics, I want Ministack to match AWS IoT Core's behavior where wildcard subscriptions do NOT receive retained messages, so that my application logic that depends on this distinction works correctly locally.
+
+#### Acceptance Criteria
+
+1. WHEN a new subscription is registered with a topic filter containing a `+` or `#` wildcard character, THE IoT_Data_Plane SHALL NOT deliver stored retained messages for topics matching that filter. (P1c)
+2. WHEN a new subscription is registered with a topic filter that contains no wildcard characters and exactly matches a topic with a stored retained message, THE IoT_Data_Plane SHALL deliver the retained message to the subscriber. (P1c)
+3. WHEN a message is published with `retain=1` to a topic, THE IoT_Data_Plane SHALL still deliver that message in real-time to all currently-connected subscribers whose topic filters match (including wildcard filters); the restriction applies only to replaying stored retained messages on new subscriptions. (P1c)
+
+### Requirement 19: Last Will and Testament (LWT) support
+
+**User Story:** As a developer testing device presence detection, I want the broker to publish a Will message when a client disconnects unexpectedly, so that my application's online/offline tracking logic works locally.
+
+#### Acceptance Criteria
+
+1. WHEN an MQTT CONNECT packet includes a Will Flag set to 1, THE IoT_Data_Plane SHALL store the Will Topic, Will Message, Will QoS, and Will Retain fields from the CONNECT payload. (P1c)
+2. WHEN a client that registered a Will message disconnects without sending a DISCONNECT packet (unexpected disconnection), THE IoT_Data_Plane SHALL publish the stored Will Message to the Will Topic at the specified Will QoS level. (P1c)
+3. WHEN a client that registered a Will message sends a DISCONNECT packet before closing the connection (graceful disconnection), THE IoT_Data_Plane SHALL NOT publish the Will Message. (P1c)
+4. WHEN the Will Retain flag is set to 1 in the CONNECT packet, THE IoT_Data_Plane SHALL set the retain flag on the Will message when publishing it. (P1c)
+5. WHEN a client reconnects (new CONNECT on the same session), THE IoT_Data_Plane SHALL replace any previously stored Will message with the new CONNECT's Will fields. (P1c)
+
+### Requirement 20: Persistent sessions (cleanSession flag)
+
+**User Story:** As a developer testing durable MQTT subscriptions, I want the broker to support `cleanSession=0` so that subscriptions survive reconnection and queued QoS 1 messages are delivered on resume, matching AWS IoT Core behavior.
+
+#### Acceptance Criteria
+
+1. WHEN an MQTT CONNECT packet is received with `cleanSession=0` and no prior session exists for the given Client ID, THE IoT_Data_Plane SHALL create a new persistent session, store all subscriptions for that session, and return CONNACK with `sessionPresent=0`. (P1c)
+2. WHEN an MQTT CONNECT packet is received with `cleanSession=0` and a prior session exists for the given Client ID, THE IoT_Data_Plane SHALL reinstate the stored subscriptions and return CONNACK with `sessionPresent=1`. (P1c)
+3. WHILE a persistent session's client is disconnected, THE IoT_Data_Plane SHALL queue QoS 1 messages that match the session's stored subscriptions. (P1c)
+4. WHEN a client with a persistent session reconnects, THE IoT_Data_Plane SHALL deliver all queued QoS 1 messages to the client. (P1c)
+5. WHEN an MQTT CONNECT packet is received with `cleanSession=1`, THE IoT_Data_Plane SHALL discard any prior session state for that Client ID and return CONNACK with `sessionPresent=0`. (P1c)
+6. THE IoT_Data_Plane SHALL expire persistent sessions after a configurable timeout (default: 1 hour, configurable via `IOT_SESSION_EXPIRY_SECONDS`), matching AWS IoT Core's session expiry behavior. (P1c)
+
+### Requirement 21: QoS 1 end-to-end delivery to subscribers
+
+**User Story:** As a developer testing reliable message delivery, I want subscribers who subscribed at QoS 1 to receive messages with packet IDs and PUBACK flow, so that my application's at-least-once delivery guarantees work locally.
+
+#### Acceptance Criteria
+
+1. WHEN a subscriber has subscribed at QoS 1 and a matching message is published at QoS 1, THE IoT_Data_Plane SHALL deliver the message to the subscriber at QoS 1 with a unique packet ID. (P1c)
+2. WHEN a subscriber has subscribed at QoS 1 and a matching message is published at QoS 0, THE IoT_Data_Plane SHALL deliver the message to the subscriber at QoS 0 (the effective QoS is the minimum of the publish QoS and the subscription QoS). (P1c)
+3. WHEN a QoS 1 message is delivered to a subscriber and the subscriber does not acknowledge it with PUBACK within a reasonable timeout, THE IoT_Data_Plane SHALL retransmit the message with the DUP flag set. (P1c)
+4. WHEN a subscriber sends a PUBACK for a delivered QoS 1 message, THE IoT_Data_Plane SHALL mark that message as acknowledged and SHALL NOT retransmit it. (P1c)
+5. THE IoT_Data_Plane SHALL maintain a per-session monotonically increasing packet ID counter (1–65535, wrapping) for outbound QoS 1 messages. (P1c)
+
+### Requirement 22: Client ID duplicate detection and forced disconnection
+
+**User Story:** As a developer testing device reconnection scenarios, I want the broker to disconnect an existing client when a new client connects with the same Client ID, matching AWS IoT Core's behavior.
+
+#### Acceptance Criteria
+
+1. WHEN an MQTT CONNECT packet is received with a Client ID that matches an already-connected client within the same account, THE IoT_Data_Plane SHALL accept the new connection and SHALL forcibly disconnect the previously connected client. (P1c)
+2. WHEN the previously connected client is forcibly disconnected due to duplicate Client ID, THE IoT_Data_Plane SHALL close the old client's WebSocket connection. (P1c)
+3. THE IoT_Data_Plane SHALL track connected Client IDs per account scope (different accounts MAY use the same Client ID without conflict). (P1c)
+4. WHEN a client connects with an empty Client ID, THE IoT_Data_Plane SHALL generate a unique Client ID for that session (AWS IoT Core requires non-empty Client IDs, but Ministack SHALL be lenient and auto-generate). (P1c)
+
+### Requirement 23: Topic validation on MQTT PUBLISH packets
+
+**User Story:** As a developer testing topic validation, I want the broker to validate topics on all publish paths (HTTP and MQTT), so that invalid topics are rejected consistently regardless of how the message enters the system.
+
+#### Acceptance Criteria
+
+1. WHEN an MQTT PUBLISH packet is received over WebSocket with a topic that exceeds 256 bytes in UTF-8 encoding, THE IoT_Data_Plane SHALL NOT forward the message and SHALL close the connection with an appropriate error. (P1c)
+2. WHEN an MQTT PUBLISH packet is received over WebSocket with a topic containing a `+` or `#` wildcard character, THE IoT_Data_Plane SHALL NOT forward the message and SHALL close the connection with an appropriate error. (P1c)
+3. WHEN an MQTT PUBLISH packet is received over WebSocket with a valid topic (non-empty, no wildcards, at most 256 bytes UTF-8), THE IoT_Data_Plane SHALL forward the message normally. (P1c)
+4. THE IoT_Data_Plane SHALL apply the same topic validation rules on MQTT PUBLISH packets as the IoT_Data_HTTP_API applies on `POST /topics/{topic}` requests. (P1c)
+
+### Requirement 24: AWS IoT Core MQTT behavioral notes
+
+**User Story:** As a Ministack maintainer, I want documented behavioral differences between AWS IoT Core and standard MQTT 3.1.1 brokers, so that the implementation correctly emulates AWS-specific semantics.
+
+#### Acceptance Criteria
+
+1. THE IoT_Data_Plane SHALL NOT support QoS 2 (PUBREC, PUBREL, PUBCOMP packets SHALL be ignored without error). (P1c)
+2. THE IoT_Data_Plane SHALL treat the DUP flag on inbound PUBLISH packets as informational only and SHALL NOT alter processing based on its value. (P1c)
+3. WHEN a subscription uses the multi-level wildcard `#`, THE IoT_Data_Plane SHALL NOT match the parent topic itself (e.g., a subscription to `sensor/#` SHALL match `sensor/temperature` but SHALL NOT match `sensor`). (P1c)
+4. THE IoT_Data_Plane SHALL NOT guarantee message ordering across different publishers on the same topic. (P1c)
+
 ## Out of Scope
 
 The following IoT Core surfaces are explicitly out of scope for this feature and may be addressed in follow-up work:
@@ -275,7 +359,7 @@ The following IoT Core surfaces are explicitly out of scope for this feature and
 
 The requirements above are deliberately silent on the following choices, which the design phase will resolve:
 
-1. **Broker integration strategy** — embedded Python broker library (e.g. `amqtt`), bundled binary (Mosquitto, mochi-mqtt-server, rumqttd), or external sidecar via `docker-compose.yml`. Affects image size, startup time, and how the Broker_Bridge is implemented.
+1. **Broker integration strategy** — custom in-memory Python broker (implemented), embedded library (e.g. `amqtt`), bundled binary (Mosquitto, mochi-mqtt-server, rumqttd), or external sidecar via `docker-compose.yml`. Decision: custom in-memory broker was chosen for full control over AWS-specific MQTT semantics.
 2. **`DescribeEndpoint` hostname scheme** — must align with existing Ministack subdomain routing in `ministack/core/router.py`.
 3. **Local CA module placement** — confirmation that the new `ministack/core/local_ca.py` (or equivalent) is the right home, and the migration plan for ACM and API Gateway custom domains to consume it.
 4. **MQTT-over-WebSocket path** — whether MQTT-over-WS is served on the main Ministack gateway port multiplexed with HTTP (preferred, matches AppSync Events) or on a dedicated port.
