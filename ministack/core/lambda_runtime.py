@@ -693,33 +693,27 @@ def invalidate_worker(func_name: str, qualifier: str = None, account: str = None
     Otherwise kill all workers for the function (used on delete).
     If account is provided, scope the invalidation to that account.
     """
+    # Worker keys are "{account}:{func_name}:{qualifier}". Lambda function names
+    # cannot contain ':' (AWS naming rule), so splitting on ':' is unambiguous.
+    def _matches(k: str) -> bool:
+        parts = k.split(":")
+        if len(parts) != 3:
+            return False
+        k_account, k_func, k_qualifier = parts
+        if k_func != func_name:
+            return False
+        if account is not None and k_account != account:
+            return False
+        if qualifier is not None and k_qualifier != qualifier:
+            return False
+        return True
+
     with _lock:
-        if qualifier is not None:
-            if account:
-                key = f"{account}:{func_name}:{qualifier}"
-            else:
-                key = f"{func_name}:{qualifier}"
-            # Try exact match first (new key format with account)
-            worker = _workers.pop(key, None)
+        to_remove = [k for k in _workers if _matches(k)]
+        for k in to_remove:
+            worker = _workers.pop(k, None)
             if worker:
                 worker.kill()
-            else:
-                # Fallback: search for any key ending with func_name:qualifier
-                to_remove = [k for k in _workers if k.endswith(f":{func_name}:{qualifier}") or k == f"{func_name}:{qualifier}"]
-                for k in to_remove:
-                    w = _workers.pop(k, None)
-                    if w:
-                        w.kill()
-        else:
-            # Kill all workers for this function (any account, any qualifier)
-            prefix = f"{account}:{func_name}:" if account else f"{func_name}:"
-            to_remove = [k for k in _workers if k.startswith(prefix) or k.endswith(f":{func_name}:") or (f":{func_name}:" in k)]
-            # Simpler: match any key containing the function name
-            to_remove = [k for k in _workers if f"{func_name}:" in k]
-            for k in to_remove:
-                worker = _workers.pop(k, None)
-                if worker:
-                    worker.kill()
 
 
 def reset():

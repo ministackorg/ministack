@@ -7,6 +7,18 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [1.3.31] — 2026-05-07
+
+### Added
+- **EC2 AWS-managed prefix lists** — `DescribePrefixLists`, `DescribeManagedPrefixLists`, and `GetManagedPrefixListEntries` now return deterministic CIDRs (instead of `0.0.0.0/0`) for the standard AWS-managed prefix list names: `s3`, `dynamodb`, `s3express`, `vpc-lattice`, `route53-healthchecks`, `ec2-instance-connect`, `cloudfront`, `groundstation`. IPv4 entries use the CGNAT range (`100.64.0.0/10`), IPv6 uses `64:ff9b:1::/48`. IDs and entries are stable across calls so VPC endpoint provisioning of type `Gateway` resolves consistently. Contributed by @jgrumboe.
+
+### Fixed
+- **Lambda multi-account isolation** — function workers spawned under non-default accounts now receive `AWS_ACCESS_KEY_ID` derived from the function ARN instead of the host process env var, so `STS GetCallerIdentity` and internal SDK calls inside the handler resolve to the correct account. The warm-worker pool key is now `{account}:{function}:{qualifier}`, preventing two accounts that deploy the same function name from sharing a worker. Fixes all four execution paths (warm worker, provided runtime, local subprocess, Docker container). Contributed by @jgrumboe.
+- **S3 `GetObject` by `VersionId` `Last-Modified` header** — the versioned `GetObject` path emitted the internal ISO-8601 timestamp directly into the HTTP `Last-Modified` header, where AWS returns RFC 7231 HTTP-date. AWS SDK for JavaScript v3 strictly parses the header and threw after the 200 response. Now wrapped through `iso_to_rfc7231`, matching the non-versioned path. Contributed by @mgius-ae.
+- **EC2 `RunInstances` and `DescribeInstances` emit `BlockDeviceMappings`** — every launched instance now auto-attaches a root EBS volume (`/dev/xvda`, gp3, 8 GiB, `DeleteOnTermination: true`) registered with `_volumes` and surfaced through both `DescribeInstances` (with `<volumeId>`, `<status>`, `<attachTime>`, `<deleteOnTermination>`) and `DescribeVolumes` (with the matching `Attachments` link), matching real AWS where every EBS-backed AMI auto-attaches a root volume regardless of whether the launch request specified `BlockDeviceMappings`. Cloud Custodian, AWS Config rules, and any policy tool that classifies instances by BDM presence now work. Reported by @Aeres-u99.
+
+---
+
 ## [1.3.30] — 2026-05-06
 
 ### Fixed
