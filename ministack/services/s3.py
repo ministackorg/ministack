@@ -35,6 +35,7 @@ import time
 from urllib.parse import parse_qs as _parse_qs
 from urllib.parse import quote as url_quote
 from urllib.parse import unquote as url_unquote
+from urllib.parse import urlparse as _urlparse
 from xml.etree.ElementTree import Element, SubElement, tostring
 from xml.sax.saxutils import escape as _esc
 
@@ -262,6 +263,8 @@ def _parse_bucket_key(path: str, headers: dict):
     # Vhost extraction lives in app.py:_extract_s3_vhost_bucket, which
     # rewrites the path to /{bucket}{key} before this handler runs. By the
     # time we get here, every request is path-style.
+    if path.startswith(("http://", "https://")):
+        path = _urlparse(path).path
     parts = path.lstrip("/").split("/", 1)
     bucket = parts[0] if parts else ""
     key = parts[1] if len(parts) > 1 else ""
