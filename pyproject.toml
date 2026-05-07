@@ -89,6 +89,7 @@ ignore = [
 
 [tool.ruff.lint.per-file-ignores]
 "ministack/services/dynamodb.py" = ["E701", "E702"]  # compact tokenizer style is intentional
+"ministack/services/lambda_svc.py" = ["E701", "E702"]  # compact tokenizer style is intentional
 
 [tool.coverage.run]
 source = ["ministack"]

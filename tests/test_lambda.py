@@ -4,9 +4,12 @@ import os
 import time
 import uuid as _uuid_mod
 import zipfile
+from unittest.mock import patch
 from urllib.parse import urlparse
 
+import boto3
 import pytest
+from botocore.config import Config
 from botocore.exceptions import ClientError
 
 _endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
@@ -3065,3 +3068,297 @@ def test_lambda_filesystem_configs_s3_mount_round_trip(lam):
     assert cfg["FileSystemConfigs"] == [{"Arn": "arn:aws:s3:::my-bucket",
                                           "LocalMountPath": "/mnt/data"}]
     lam.delete_function(FunctionName=fn)
+
+
+# ============================================================================
+# Lambda Account Context tests — Non-Default Account AWS_ACCESS_KEY_ID.
+# Originally in tests/test_lambda_account_context.py — merged here for
+# one-file-per-service.
+#
+# Validates that Lambda functions deployed under non-default accounts receive
+# AWS_ACCESS_KEY_ID set to the owning account's 12-digit ID (derived from
+# the function ARN), NOT the host process's AWS_ACCESS_KEY_ID.
+# ============================================================================
+
+_ACCOUNT_CONTEXT_ENDPOINT = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+_ACCOUNT_CONTEXT_REGION = "us-east-1"
+
+
+def _account_context_client(service, access_key="test"):
+    """Create a boto3 client with a specific access key for account context tests."""
+    return boto3.client(
+        service,
+        endpoint_url=_ACCOUNT_CONTEXT_ENDPOINT,
+        aws_access_key_id=access_key,
+        aws_secret_access_key="test",
+        region_name=_ACCOUNT_CONTEXT_REGION,
+        config=Config(region_name=_ACCOUNT_CONTEXT_REGION, retries={"max_attempts": 0}),
+    )
+
+
+# Lambda code that returns env vars for account context verification
+_STS_CALLER_CODE = """\
+import json
+import os
+import urllib.request
+
+def handler(event, context):
+    # Call STS GetCallerIdentity via the ministack endpoint
+    endpoint = os.environ.get("AWS_ENDPOINT_URL", "http://127.0.0.1:4566")
+    access_key = os.environ.get("AWS_ACCESS_KEY_ID", "unknown")
+    secret_key = os.environ.get("AWS_SECRET_ACCESS_KEY", "test")
+    region = os.environ.get("AWS_REGION", "us-east-1")
+
+    # Return the raw env vars so the test can verify them
+    return {
+        "aws_access_key_id": access_key,
+        "aws_region": region,
+        "function_arn": os.environ.get("_LAMBDA_FUNCTION_ARN", ""),
+    }
+"""
+
+
+# ---------------------------------------------------------------------------
+# Bug Condition Tests: Non-default account should get ARN-derived account ID
+# ---------------------------------------------------------------------------
+
+
+def test_account_context_non_default_gets_arn_account_id():
+    """Deploy a function under account 000000000001, invoke it, and verify
+    AWS_ACCESS_KEY_ID is set to '000000000001' (not the host's key)."""
+    lam = _account_context_client("lambda", access_key="000000000001")
+
+    func_name = "account-context-test-nondefault"
+    try:
+        lam.create_function(
+            FunctionName=func_name,
+            Runtime="python3.12",
+            Role="arn:aws:iam::000000000001:role/lambda-role",
+            Handler="index.handler",
+            Code={"ZipFile": _make_zip(_STS_CALLER_CODE)},
+        )
+
+        resp = lam.invoke(FunctionName=func_name, Payload=json.dumps({}))
+        payload = json.loads(resp["Payload"].read())
+
+        assert payload["aws_access_key_id"] == "000000000001", (
+            f"Expected AWS_ACCESS_KEY_ID='000000000001' (from ARN), "
+            f"got '{payload['aws_access_key_id']}'"
+        )
+    finally:
+        try:
+            lam.delete_function(FunctionName=func_name)
+        except Exception:
+            pass
+
+
+def test_account_context_another_non_default_account():
+    """Deploy under a different non-default account (123456789012) to confirm
+    the fix works for arbitrary 12-digit account IDs."""
+    lam = _account_context_client("lambda", access_key="123456789012")
+
+    func_name = "account-context-test-123"
+    try:
+        lam.create_function(
+            FunctionName=func_name,
+            Runtime="python3.12",
+            Role="arn:aws:iam::123456789012:role/lambda-role",
+            Handler="index.handler",
+            Code={"ZipFile": _make_zip(_STS_CALLER_CODE)},
+        )
+
+        resp = lam.invoke(FunctionName=func_name, Payload=json.dumps({}))
+        payload = json.loads(resp["Payload"].read())
+
+        assert payload["aws_access_key_id"] == "123456789012", (
+            f"Expected AWS_ACCESS_KEY_ID='123456789012' (from ARN), "
+            f"got '{payload['aws_access_key_id']}'"
+        )
+    finally:
+        try:
+            lam.delete_function(FunctionName=func_name)
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# Preservation Tests: Default account and explicit overrides unchanged
+# ---------------------------------------------------------------------------
+
+
+def test_account_context_default_account_still_works():
+    """Deploy a function under the default account (000000000000) and verify
+    AWS_ACCESS_KEY_ID is '000000000000' (derived from the ARN)."""
+    lam = _account_context_client("lambda", access_key="000000000000")
+
+    func_name = "account-context-test-default"
+    try:
+        lam.create_function(
+            FunctionName=func_name,
+            Runtime="python3.12",
+            Role="arn:aws:iam::000000000000:role/lambda-role",
+            Handler="index.handler",
+            Code={"ZipFile": _make_zip(_STS_CALLER_CODE)},
+        )
+
+        resp = lam.invoke(FunctionName=func_name, Payload=json.dumps({}))
+        payload = json.loads(resp["Payload"].read())
+
+        assert payload["aws_access_key_id"] == "000000000000", (
+            f"Expected AWS_ACCESS_KEY_ID='000000000000' for default account, "
+            f"got '{payload['aws_access_key_id']}'"
+        )
+    finally:
+        try:
+            lam.delete_function(FunctionName=func_name)
+        except Exception:
+            pass
+
+
+def test_account_context_explicit_env_override_takes_precedence():
+    """Deploy a function with an explicit AWS_ACCESS_KEY_ID in Environment.Variables.
+    The explicit value should take precedence over the ARN-derived account."""
+    lam = _account_context_client("lambda", access_key="000000000001")
+
+    func_name = "account-context-test-override"
+    try:
+        lam.create_function(
+            FunctionName=func_name,
+            Runtime="python3.12",
+            Role="arn:aws:iam::000000000001:role/lambda-role",
+            Handler="index.handler",
+            Code={"ZipFile": _make_zip(_STS_CALLER_CODE)},
+            Environment={
+                "Variables": {
+                    "AWS_ACCESS_KEY_ID": "999999999999",
+                }
+            },
+        )
+
+        resp = lam.invoke(FunctionName=func_name, Payload=json.dumps({}))
+        payload = json.loads(resp["Payload"].read())
+
+        assert payload["aws_access_key_id"] == "999999999999", (
+            f"Expected AWS_ACCESS_KEY_ID='999999999999' (explicit override), "
+            f"got '{payload['aws_access_key_id']}'"
+        )
+    finally:
+        try:
+            lam.delete_function(FunctionName=func_name)
+        except Exception:
+            pass
+
+
+def test_account_context_other_env_vars_unchanged():
+    """Verify that AWS_REGION and _LAMBDA_FUNCTION_ARN are still set correctly
+    regardless of the account context fix."""
+    lam = _account_context_client("lambda", access_key="000000000001")
+
+    func_name = "account-context-test-other-env"
+    try:
+        lam.create_function(
+            FunctionName=func_name,
+            Runtime="python3.12",
+            Role="arn:aws:iam::000000000001:role/lambda-role",
+            Handler="index.handler",
+            Code={"ZipFile": _make_zip(_STS_CALLER_CODE)},
+        )
+
+        resp = lam.invoke(FunctionName=func_name, Payload=json.dumps({}))
+        payload = json.loads(resp["Payload"].read())
+
+        assert payload["aws_region"] == _ACCOUNT_CONTEXT_REGION, (
+            f"Expected AWS_REGION='{_ACCOUNT_CONTEXT_REGION}', got '{payload['aws_region']}'"
+        )
+        assert "000000000001" in payload["function_arn"], (
+            f"Expected account '000000000001' in function ARN, "
+            f"got '{payload['function_arn']}'"
+        )
+        assert func_name in payload["function_arn"], (
+            f"Expected function name in ARN, got '{payload['function_arn']}'"
+        )
+    finally:
+        try:
+            lam.delete_function(FunctionName=func_name)
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# Unit Tests: _account_from_arn helper
+# ---------------------------------------------------------------------------
+
+
+def test_account_from_arn_valid_arn_extracts_account():
+    """Valid ARN returns the 12-digit account ID."""
+    from ministack.services.lambda_svc import _account_from_arn
+
+    result = _account_from_arn("arn:aws:lambda:us-east-1:123456789012:function:myFunc")
+    assert result == "123456789012"
+
+
+def test_account_from_arn_various_valid_accounts():
+    """Various valid 12-digit account IDs are extracted correctly."""
+    from ministack.services.lambda_svc import _account_from_arn
+
+    assert _account_from_arn("arn:aws:lambda:us-east-1:000000000000:function:f") == "000000000000"
+    assert _account_from_arn("arn:aws:lambda:eu-west-1:000000000001:function:f") == "000000000001"
+    assert _account_from_arn("arn:aws:lambda:ap-southeast-1:999999999999:function:f") == "999999999999"
+
+
+def test_account_from_arn_empty_string_falls_back():
+    """Empty string falls back to host env var."""
+    from ministack.services.lambda_svc import _account_from_arn
+
+    with patch.dict(os.environ, {"AWS_ACCESS_KEY_ID": "fallback_key"}):
+        result = _account_from_arn("")
+        assert result == "fallback_key"
+
+
+def test_account_from_arn_too_few_segments_falls_back():
+    """ARN with too few segments falls back to host env var."""
+    from ministack.services.lambda_svc import _account_from_arn
+
+    with patch.dict(os.environ, {"AWS_ACCESS_KEY_ID": "fallback_key"}):
+        result = _account_from_arn("arn:aws:lambda")
+        assert result == "fallback_key"
+
+
+def test_account_from_arn_non_numeric_falls_back():
+    """ARN with non-numeric account segment falls back to host env var."""
+    from ministack.services.lambda_svc import _account_from_arn
+
+    with patch.dict(os.environ, {"AWS_ACCESS_KEY_ID": "fallback_key"}):
+        result = _account_from_arn("arn:aws:lambda:us-east-1:not-a-number:function:f")
+        assert result == "fallback_key"
+
+
+def test_account_from_arn_none_input_falls_back():
+    """None input falls back to host env var without crashing."""
+    from ministack.services.lambda_svc import _account_from_arn
+
+    with patch.dict(os.environ, {"AWS_ACCESS_KEY_ID": "fallback_key"}):
+        result = _account_from_arn(None)
+        assert result == "fallback_key"
+
+
+def test_account_from_arn_no_env_var_falls_back_to_test():
+    """When AWS_ACCESS_KEY_ID is not set, falls back to 'test'."""
+    from ministack.services.lambda_svc import _account_from_arn
+
+    with patch.dict(os.environ, {}, clear=True):
+        result = _account_from_arn("")
+        assert result == "test"
+
+
+def test_account_from_arn_lambda_runtime_helper_matches():
+    """The lambda_runtime.py local helper produces the same results."""
+    from ministack.core.lambda_runtime import _account_from_arn as runtime_helper
+
+    assert runtime_helper("arn:aws:lambda:us-east-1:123456789012:function:f") == "123456789012"
+    assert runtime_helper("arn:aws:lambda:us-east-1:000000000001:function:f") == "000000000001"
+
+    with patch.dict(os.environ, {"AWS_ACCESS_KEY_ID": "fallback_key"}):
+        assert runtime_helper("") == "fallback_key"
+        assert runtime_helper(None) == "fallback_key"
+        assert runtime_helper("arn:aws:lambda") == "fallback_key"
