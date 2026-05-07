@@ -307,6 +307,43 @@ def _run_instances(p):
     for _ in range(max(1, min(min_count, max_count))):
         instance_id = _new_instance_id()
         private_ip = _random_ip("10.0")
+        # Synthesize a real root EBS volume so DescribeVolumes / DescribeInstances
+        # surface the same volume id, matching real AWS where every EBS-backed AMI
+        # auto-attaches a root volume regardless of whether the launch request
+        # specified BlockDeviceMappings. Cloud Custodian, AWS Config, and policy
+        # tools rely on the BDM presence to classify instance storage.
+        root_device = "/dev/xvda"
+        vol_id = _new_volume_id()
+        _volumes[vol_id] = {
+            "VolumeId": vol_id,
+            "Size": 8,
+            "AvailabilityZone": f"{get_region()}a",
+            "State": "in-use",
+            "VolumeType": "gp3",
+            "SnapshotId": "",
+            "Iops": 3000,
+            "Encrypted": False,
+            "CreateTime": now,
+            "Attachments": [{
+                "VolumeId": vol_id,
+                "InstanceId": instance_id,
+                "Device": root_device,
+                "State": "attached",
+                "AttachTime": now,
+                "DeleteOnTermination": True,
+            }],
+            "MultiAttachEnabled": False,
+            "Throughput": 125,
+        }
+        block_device_mappings = [{
+            "DeviceName": root_device,
+            "Ebs": {
+                "VolumeId": vol_id,
+                "Status": "attached",
+                "AttachTime": now,
+                "DeleteOnTermination": True,
+            },
+        }]
         _instances[instance_id] = {
             "InstanceId": instance_id,
             "ImageId": image_id,
@@ -328,7 +365,7 @@ def _run_instances(p):
             ],
             "Architecture": "x86_64",
             "RootDeviceType": "ebs",
-            "RootDeviceName": "/dev/xvda",
+            "RootDeviceName": root_device,
             "Hypervisor": "xen",
             "Virtualization": "hvm",
             "Placement": {"AvailabilityZone": f"{get_region()}a", "Tenancy": "default"},
@@ -336,6 +373,7 @@ def _run_instances(p):
             "AmiLaunchIndex": 0,
             "UserData": user_data,
             "LaunchTime": now,
+            "BlockDeviceMappings": block_device_mappings,
         }
         created.append(_instances[instance_id])
 
@@ -2141,6 +2179,7 @@ def _instance_xml(inst):
         <architecture>{inst['Architecture']}</architecture>
         <rootDeviceType>{inst['RootDeviceType']}</rootDeviceType>
         <rootDeviceName>{inst['RootDeviceName']}</rootDeviceName>
+        <blockDeviceMapping>{_inst_bdm_xml(inst)}</blockDeviceMapping>
         <virtualizationType>{inst['Virtualization']}</virtualizationType>
         <hypervisor>{inst['Hypervisor']}</hypervisor>
         <monitoring><state>{inst['Monitoring']['State']}</state></monitoring>
@@ -2148,6 +2187,27 @@ def _instance_xml(inst):
         <tagSet>{tags}</tagSet>
         <amiLaunchIndex>{inst['AmiLaunchIndex']}</amiLaunchIndex>
     </item>"""
+
+
+def _inst_bdm_xml(inst):
+    """Emit the running-instance BlockDeviceMapping shape. Distinct from the
+    launch-spec shape which carries VolumeSize/VolumeType/Encrypted; the
+    instance-runtime shape carries VolumeId/Status/AttachTime/DeleteOnTermination."""
+    out = ""
+    for bdm in inst.get("BlockDeviceMappings", []):
+        ebs = bdm.get("Ebs", {})
+        out += "<item>"
+        out += f"<deviceName>{_esc(bdm.get('DeviceName', ''))}</deviceName>"
+        out += "<ebs>"
+        if "VolumeId" in ebs:
+            out += f"<volumeId>{_esc(ebs['VolumeId'])}</volumeId>"
+        out += f"<status>{_esc(ebs.get('Status', 'attached'))}</status>"
+        if "AttachTime" in ebs:
+            out += f"<attachTime>{ebs['AttachTime']}</attachTime>"
+        out += f"<deleteOnTermination>{str(ebs.get('DeleteOnTermination', True)).lower()}</deleteOnTermination>"
+        out += "</ebs>"
+        out += "</item>"
+    return out
 
 
 def _sg_xml(sg):

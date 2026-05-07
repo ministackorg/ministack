@@ -63,6 +63,41 @@ def test_ec2_run_describe_terminate_instances(ec2):
     term = ec2.terminate_instances(InstanceIds=[instance_id])
     assert term["TerminatingInstances"][0]["CurrentState"]["Name"] == "terminated"
 
+
+def test_ec2_run_instances_emits_default_root_block_device_mapping(ec2):
+    """RunInstances without an explicit BDM must auto-attach a root EBS volume,
+    matching real AWS. Cloud Custodian / AWS Config use BlockDeviceMappings to
+    classify EBS-backed vs ephemeral instances; a missing BDM breaks them."""
+    resp = ec2.run_instances(
+        ImageId="ami-12345678", MinCount=1, MaxCount=1, InstanceType="t2.micro"
+    )
+    iid = resp["Instances"][0]["InstanceId"]
+
+    bdms = resp["Instances"][0].get("BlockDeviceMappings")
+    assert bdms, "RunInstances response must include BlockDeviceMappings"
+    assert len(bdms) == 1
+    root = bdms[0]
+    assert root["DeviceName"] == "/dev/xvda"
+    ebs = root["Ebs"]
+    assert ebs["VolumeId"].startswith("vol-")
+    assert ebs["Status"] == "attached"
+    assert ebs["DeleteOnTermination"] is True
+    assert "AttachTime" in ebs
+
+    desc = ec2.describe_instances(InstanceIds=[iid])
+    inst = desc["Reservations"][0]["Instances"][0]
+    desc_bdms = inst.get("BlockDeviceMappings", [])
+    assert len(desc_bdms) == 1
+    assert desc_bdms[0]["DeviceName"] == "/dev/xvda"
+    assert desc_bdms[0]["Ebs"]["VolumeId"] == ebs["VolumeId"]
+    assert desc_bdms[0]["Ebs"]["Status"] == "attached"
+
+    vols = ec2.describe_volumes(VolumeIds=[ebs["VolumeId"]])["Volumes"]
+    assert len(vols) == 1
+    atts = vols[0]["Attachments"]
+    assert atts and atts[0]["InstanceId"] == iid
+    assert atts[0]["Device"] == "/dev/xvda"
+
 def test_ec2_describe_instance_status(ec2):
     resp = ec2.run_instances(ImageId="ami-00000000", MinCount=1, MaxCount=1, InstanceType="t2.micro")
     iid = resp["Instances"][0]["InstanceId"]
