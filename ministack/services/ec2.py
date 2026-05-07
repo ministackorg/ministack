@@ -3322,7 +3322,7 @@ def _describe_prefix_lists(p):
         items += f"""<item>
             <prefixListId>{pl_id}</prefixListId>
             <prefixListName>{name}</prefixListName>
-            <cidrSet><item><cidr>{cidr}</cidr></item></cidrSet>
+            <cidrSet><item>{cidr}</item></cidrSet>
         </item>"""
     # User-created managed prefix lists
     for pl in _prefix_lists.values():
@@ -3332,7 +3332,7 @@ def _describe_prefix_lists(p):
             continue
         if filters.get("prefix-list-name") and pl.get("PrefixListName", "") not in filters["prefix-list-name"]:
             continue
-        entries = "".join(f"<item><cidr>{e['Cidr']}</cidr></item>" for e in pl.get("Entries", []))
+        entries = "".join(f"<item>{e['Cidr']}</item>" for e in pl.get("Entries", []))
         items += f"""<item>
             <prefixListId>{pl['PrefixListId']}</prefixListId>
             <prefixListName>{pl.get('PrefixListName','')}</prefixListName>
@@ -3462,6 +3462,7 @@ def _modify_managed_prefix_list(p):
     if rm_cidrs:
         pl["Entries"] = [e for e in pl["Entries"] if e["Cidr"] not in rm_cidrs]
     pl["Version"] = pl.get("Version", 1) + 1
+    pl["State"] = "modify-complete"
     return _xml(200, "ModifyManagedPrefixListResponse", _prefix_list_xml(pl, tag="prefixList"))
 
 
@@ -3472,8 +3473,9 @@ def _delete_managed_prefix_list(p):
         return _error("UnsupportedOperation", "The action is not supported for an AWS-managed prefix list.", 400)
     if pl_id not in _prefix_lists:
         return _error("InvalidPrefixListID.NotFound", f"Prefix list '{pl_id}' not found", 400)
-    del _prefix_lists[pl_id]
-    return _xml(200, "DeleteManagedPrefixListResponse", "<return>true</return>")
+    pl = _prefix_lists.pop(pl_id)
+    pl["State"] = "delete-complete"
+    return _xml(200, "DeleteManagedPrefixListResponse", _prefix_list_xml(pl, tag="prefixList"))
 
 
 def _prefix_list_xml(pl, tag="item"):
