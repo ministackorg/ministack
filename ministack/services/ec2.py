@@ -98,6 +98,7 @@ _egress_igws = AccountScopedDict()     # eigw_id -> egress-only internet gateway
 _prefix_lists = AccountScopedDict()    # pl_id -> managed prefix list record
 _vpn_gateways = AccountScopedDict()    # vgw_id -> VPN gateway record
 _customer_gateways = AccountScopedDict()  # cgw_id -> customer gateway record
+_vpn_connections = AccountScopedDict()    # vpn_id -> VPN connection record
 _launch_templates = AccountScopedDict()   # lt_id -> launch template record (includes versions list)
 
 
@@ -127,6 +128,7 @@ def get_state():
         "prefix_lists": copy.deepcopy(_prefix_lists),
         "vpn_gateways": copy.deepcopy(_vpn_gateways),
         "customer_gateways": copy.deepcopy(_customer_gateways),
+        "vpn_connections": copy.deepcopy(_vpn_connections),
         "launch_templates": copy.deepcopy(_launch_templates),
     }
 
@@ -155,6 +157,7 @@ def restore_state(data):
         _prefix_lists.update(data.get("prefix_lists", {}))
         _vpn_gateways.update(data.get("vpn_gateways", {}))
         _customer_gateways.update(data.get("customer_gateways", {}))
+        _vpn_connections.update(data.get("vpn_connections", {}))
         _launch_templates.update(data.get("launch_templates", {}))
 
 
@@ -2339,7 +2342,7 @@ def _rtb_fields_xml(rtb, tag="item"):
         <ownerId>{rtb['OwnerId']}</ownerId>
         <routeSet>{routes}</routeSet>
         <associationSet>{assocs}</associationSet>
-        <propagatingVgwSet/>
+        <propagatingVgwSet>{"".join(f"<item><gatewayId>{g}</gatewayId></item>" for g in rtb.get("PropagatingVgws", []))}</propagatingVgwSet>
         {_tag_set_xml(rtb['RouteTableId'])}
     </{tag}>"""
 
@@ -3711,6 +3714,88 @@ def _cgw_xml(cgw, tag="item"):
 
 
 # ---------------------------------------------------------------------------
+# VPN Connections
+# ---------------------------------------------------------------------------
+
+def _create_vpn_connection(p):
+    conn_type = _p(p, "Type") or "ipsec.1"
+    cgw_id = _p(p, "CustomerGatewayId")
+    vgw_id = _p(p, "VpnGatewayId") or ""
+    tgw_id = _p(p, "TransitGatewayId") or ""
+    static_only = _p(p, "Options.StaticRoutesOnly") or "false"
+    tags = _parse_tags(p)
+    vpn_id = "vpn-" + "".join(random.choices(string.hexdigits[:16], k=17))
+    _vpn_connections[vpn_id] = {
+        "VpnConnectionId": vpn_id, "State": "available", "Type": conn_type,
+        "CustomerGatewayId": cgw_id, "VpnGatewayId": vgw_id,
+        "TransitGatewayId": tgw_id, "Category": "VPN",
+        "Options": {"StaticRoutesOnly": static_only.lower() == "true"},
+        "Routes": [], "Tags": tags, "OwnerId": get_account_id(),
+    }
+    if tags:
+        _tags[vpn_id] = tags
+    return _xml(200, "CreateVpnConnectionResponse", _vpn_conn_xml(_vpn_connections[vpn_id], tag="vpnConnection"))
+
+
+def _vpn_conn_xml(vpn, tag="item"):
+    routes = "".join(
+        f"<item><destinationCidrBlock>{r['DestinationCidrBlock']}</destinationCidrBlock><state>{r['State']}</state></item>"
+        for r in vpn.get("Routes", [])
+    )
+    return f"""<{tag}>
+        <vpnConnectionId>{vpn['VpnConnectionId']}</vpnConnectionId>
+        <state>{vpn['State']}</state>
+        <type>{vpn['Type']}</type>
+        <customerGatewayId>{vpn['CustomerGatewayId']}</customerGatewayId>
+        <vpnGatewayId>{vpn['VpnGatewayId']}</vpnGatewayId>
+        <transitGatewayId>{vpn['TransitGatewayId']}</transitGatewayId>
+        <category>{vpn['Category']}</category>
+        <options><staticRoutesOnly>{'true' if vpn['Options']['StaticRoutesOnly'] else 'false'}</staticRoutesOnly></options>
+        <routes>{routes}</routes>
+        {_tag_set_xml(vpn['VpnConnectionId'])}
+    </{tag}>"""
+
+
+def _describe_vpn_connections(p):
+    filter_ids = _parse_member_list(p, "VpnConnectionId")
+    items = ""
+    for vpn in _vpn_connections.values():
+        if filter_ids and vpn["VpnConnectionId"] not in filter_ids:
+            continue
+        items += _vpn_conn_xml(vpn)
+    return _xml(200, "DescribeVpnConnectionsResponse", f"<vpnConnectionSet>{items}</vpnConnectionSet>")
+
+
+def _delete_vpn_connection(p):
+    vpn_id = _p(p, "VpnConnectionId")
+    if vpn_id not in _vpn_connections:
+        return _error("InvalidVpnConnectionID.NotFound", f"VPN connection '{vpn_id}' not found", 400)
+    _vpn_connections[vpn_id]["State"] = "deleted"
+    del _vpn_connections[vpn_id]
+    return _xml(200, "DeleteVpnConnectionResponse", "<return>true</return>")
+
+
+def _create_vpn_connection_route(p):
+    vpn_id = _p(p, "VpnConnectionId")
+    cidr = _p(p, "DestinationCidrBlock")
+    if vpn_id not in _vpn_connections:
+        return _error("InvalidVpnConnectionID.NotFound", f"VPN connection '{vpn_id}' not found", 400)
+    routes = _vpn_connections[vpn_id]["Routes"]
+    if not any(r["DestinationCidrBlock"] == cidr for r in routes):
+        routes.append({"DestinationCidrBlock": cidr, "State": "available"})
+    return _xml(200, "CreateVpnConnectionRouteResponse", "<return>true</return>")
+
+
+def _delete_vpn_connection_route(p):
+    vpn_id = _p(p, "VpnConnectionId")
+    cidr = _p(p, "DestinationCidrBlock")
+    if vpn_id not in _vpn_connections:
+        return _error("InvalidVpnConnectionID.NotFound", f"VPN connection '{vpn_id}' not found", 400)
+    _vpn_connections[vpn_id]["Routes"] = [r for r in _vpn_connections[vpn_id]["Routes"] if r["DestinationCidrBlock"] != cidr]
+    return _xml(200, "DeleteVpnConnectionRouteResponse", "<return>true</return>")
+
+
+# ---------------------------------------------------------------------------
 # Reset
 # ---------------------------------------------------------------------------
 
@@ -3737,6 +3822,7 @@ def reset():
     _prefix_lists.clear()
     _vpn_gateways.clear()
     _customer_gateways.clear()
+    _vpn_connections.clear()
     _launch_templates.clear()
     _init_defaults()
 
@@ -4554,6 +4640,12 @@ _ACTION_MAP = {
     "CreateCustomerGateway": _create_customer_gateway,
     "DescribeCustomerGateways": _describe_customer_gateways,
     "DeleteCustomerGateway": _delete_customer_gateway,
+    # VPN Connections
+    "CreateVpnConnection": _create_vpn_connection,
+    "DescribeVpnConnections": _describe_vpn_connections,
+    "DeleteVpnConnection": _delete_vpn_connection,
+    "CreateVpnConnectionRoute": _create_vpn_connection_route,
+    "DeleteVpnConnectionRoute": _delete_vpn_connection_route,
     # EBS Volumes
     "CreateVolume": _create_volume,
     "DeleteVolume": _delete_volume,
