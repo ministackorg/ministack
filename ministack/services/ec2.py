@@ -46,7 +46,10 @@ Supports:
                    DeleteManagedPrefixList
   VPN Gateways:    CreateVpnGateway, DescribeVpnGateways, AttachVpnGateway,
                    DetachVpnGateway, DeleteVpnGateway,
-                   EnableVgwRoutePropagation, DisableVgwRoutePropagation
+                   EnableVgwRoutePropagation, DisableVgwRoutePropagation,
+                   CreateVpnConnection, DescribeVpnConnections,
+                   DeleteVpnConnection, CreateVpnConnectionRoute,
+                   DeleteVpnConnectionRoute
   Customer GW:     CreateCustomerGateway, DescribeCustomerGateways,
                    DeleteCustomerGateway
   Launch Tmpl:     CreateLaunchTemplate, CreateLaunchTemplateVersion,
