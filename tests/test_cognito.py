@@ -1117,6 +1117,9 @@ def test_cognito_openid_configuration():
     assert pool_id in data["issuer"]
     assert "jwks_uri" in data
     assert "token_endpoint" in data
+    # AWS Cognito advertises both code and token grants
+    assert "code" in data["response_types_supported"]
+    assert "token" in data["response_types_supported"]
 
 
 # ===========================================================================

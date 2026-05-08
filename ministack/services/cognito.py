@@ -159,18 +159,27 @@ def well_known_jwks(pool_id: str):
     return 200, {"Content-Type": "application/json"}, json.dumps({"keys": [_JWKS_KEY]}).encode()
 
 
-def well_known_openid_configuration(pool_id: str, region: str | None = None):
-    """Return OpenID Connect discovery document."""
+def well_known_openid_configuration(pool_id: str, region: str | None = None, host: str | None = None):
+    """Return OpenID Connect discovery document.
+
+    `issuer` matches the JWT `iss` claim (real AWS URL) so OIDC clients that
+    verify `iss == discovery.issuer` keep working. Endpoint URLs point at the
+    MiniStack gateway where /oauth2/authorize, /oauth2/token, /oauth2/userInfo
+    and /logout are actually served (added by PR #344). Real AWS serves these
+    on the pool-domain host; MiniStack serves them on the gateway.
+    """
     r = region or get_region()
     issuer = f"https://cognito-idp.{r}.amazonaws.com/{pool_id}"
+    base = f"http://{host}" if host else f"http://{_MINISTACK_HOST}:{_MINISTACK_PORT}"
+    pool_base = f"{base}/{pool_id}"
     doc = {
         "issuer": issuer,
-        "jwks_uri": f"{issuer}/.well-known/jwks.json",
-        "authorization_endpoint": f"{issuer}/oauth2/authorize",
-        "token_endpoint": f"{issuer}/oauth2/token",
-        "userinfo_endpoint": f"{issuer}/oauth2/userInfo",
-        "end_session_endpoint": f"{issuer}/logout",
-        "response_types_supported": ["code"],
+        "jwks_uri": f"{pool_base}/.well-known/jwks.json",
+        "authorization_endpoint": f"{base}/oauth2/authorize",
+        "token_endpoint": f"{base}/oauth2/token",
+        "userinfo_endpoint": f"{base}/oauth2/userInfo",
+        "end_session_endpoint": f"{base}/logout",
+        "response_types_supported": ["code", "token"],
         "subject_types_supported": ["public"],
         "id_token_signing_alg_values_supported": ["RS256"],
         "scopes_supported": ["openid", "email", "phone", "profile"],

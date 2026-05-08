@@ -550,7 +550,8 @@ async def _handle_cognito_get_request(method: str, path: str, headers: dict, que
             pool_id = path.rsplit("/.well-known/openid-configuration", 1)[0].lstrip("/")
             if pool_id:
                 region = extract_region(headers) or "us-east-1"
-                return _get_module("cognito").well_known_openid_configuration(pool_id, region)
+                host = headers.get("host") or headers.get("Host")
+                return _get_module("cognito").well_known_openid_configuration(pool_id, region, host)
 
     if path == "/oauth2/authorize" and method == "GET":
         return _get_module("cognito").handle_oauth2_authorize(method, path, headers, query_params)
