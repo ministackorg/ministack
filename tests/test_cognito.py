@@ -1119,6 +1119,47 @@ def test_cognito_openid_configuration():
     assert "token_endpoint" in data
 
 
+def test_cognito_browser_endpoints_send_cors_headers():
+    """Cognito's OAuth2/OIDC endpoints must send `Access-Control-Allow-Origin`
+    so browser-based OIDC clients can fetch them. Regression for the bug
+    where the dispatcher in app.py returned raw response tuples for
+    /.well-known/*, /oauth2/*, /login and /logout, bypassing the
+    `_with_data_plane_headers` wrapper that every other data-plane response
+    goes through."""
+    import urllib.request
+
+    from conftest import make_client
+    cognito = make_client("cognito-idp")
+    pool_id = cognito.create_user_pool(PoolName="cors-pool")["UserPool"]["Id"]
+
+    # Public well-known endpoints — fetched cross-origin during OIDC discovery.
+    for path in (
+        f"/{pool_id}/.well-known/openid-configuration",
+        f"/{pool_id}/.well-known/jwks.json",
+    ):
+        with urllib.request.urlopen(f"http://localhost:4566{path}") as r:
+            assert r.headers.get("Access-Control-Allow-Origin") == "*", (
+                f"missing CORS header on {path}"
+            )
+
+    # Token endpoint — POSTed cross-origin by the OIDC client. We don't care
+    # about the body (an empty form yields a 4xx) — only that the CORS header
+    # is present on the response.
+    req = urllib.request.Request(
+        "http://localhost:4566/oauth2/token",
+        data=b"grant_type=authorization_code",
+        method="POST",
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+    try:
+        resp = urllib.request.urlopen(req)
+    except urllib.error.HTTPError as e:
+        resp = e
+    assert resp.headers.get("Access-Control-Allow-Origin") == "*", (
+        "missing CORS header on /oauth2/token"
+    )
+
+
 # ===========================================================================
 # Identity Provider CRUD
 # ===========================================================================
