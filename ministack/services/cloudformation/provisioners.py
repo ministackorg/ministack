@@ -3103,8 +3103,10 @@ _RESOURCE_HANDLERS = {
     "AWS::Lambda::Version": {"create": _lambda_version_create},
     "AWS::CloudFormation::WaitCondition": {"create": _cfn_wait_condition_create},
     "AWS::CloudFormation::WaitConditionHandle": {"create": _cfn_wait_condition_handle_create},
-    # update/delete are handled by explicit routing in _update_resource/_delete_resource
-    # so they can receive stack_name and logical_id from the caller.
+    # The "create" entry is load-bearing: without it, _provision_resource would
+    # hit the generic "AWS::CloudFormation::*" no-op branch. Update and delete
+    # are intentionally absent — they route through the explicit if-branches in
+    # _update_resource/_delete_resource so stack_name and logical_id reach the handler.
     "AWS::CloudFormation::CustomResource": {"create": _custom_resource_create},
     "AWS::ApiGateway::RestApi": {"create": _apigw_rest_api_create, "delete": _apigw_rest_api_delete},
     "AWS::ApiGateway::Resource": {"create": _apigw_resource_create, "delete": _apigw_resource_delete},
