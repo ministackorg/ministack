@@ -329,3 +329,195 @@ def handler(event, context):
         except Exception:
             pass
         lam.delete_function(FunctionName="cr-test-delete")
+
+
+# ── Data accessible via Fn::GetAtt ────────────────────────────────────────
+
+def test_custom_resource_data_via_getatt(cfn, lam, ssm):
+    """Data keys returned by the Lambda are accessible via Fn::GetAtt in outputs."""
+    lam.create_function(
+        FunctionName="cr-test-getatt",
+        Runtime="python3.12",
+        Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _make_zip(_CR_HANDLER_SUCCESS)},
+    )
+    tpl = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "CR": {
+                "Type": "Custom::GetAttTest",
+                "Properties": {
+                    "ServiceToken": "arn:aws:lambda:us-east-1:000000000000:function:cr-test-getatt",
+                },
+            },
+            "Param": {
+                "Type": "AWS::SSM::Parameter",
+                "Properties": {
+                    "Name": "cr-t06-endpoint",
+                    "Type": "String",
+                    "Value": {"Fn::GetAtt": ["CR", "Endpoint"]},
+                },
+            },
+        },
+    }
+    try:
+        cfn.create_stack(StackName="cr-t06", TemplateBody=json.dumps(tpl))
+        stack = _wait_stack(cfn, "cr-t06")
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+
+        val = ssm.get_parameter(Name="cr-t06-endpoint")["Parameter"]["Value"]
+        assert val == "https://example.com"
+    finally:
+        cfn.delete_stack(StackName="cr-t06")
+        _wait_stack(cfn, "cr-t06")
+        lam.delete_function(FunctionName="cr-test-getatt")
+
+
+# ── PhysicalResourceId fallback ───────────────────────────────────────────
+
+_CR_HANDLER_NO_PID = """\
+import json, urllib.request
+
+def handler(event, context):
+    # Deliberately omit PhysicalResourceId — Ministack should use RequestId
+    payload = json.dumps({
+        "Status": "SUCCESS",
+        "RequestId": event["RequestId"],
+        "StackId": event["StackId"],
+        "LogicalResourceId": event["LogicalResourceId"],
+    }).encode()
+    req = urllib.request.Request(
+        event["ResponseURL"],
+        data=payload,
+        method="PUT",
+        headers={"content-type": "", "content-length": str(len(payload))},
+    )
+    urllib.request.urlopen(req, timeout=10)
+"""
+
+
+def test_custom_resource_physical_id_fallback(cfn, lam):
+    """When Lambda omits PhysicalResourceId on Create, Ministack falls back to RequestId."""
+    lam.create_function(
+        FunctionName="cr-test-nopid",
+        Runtime="python3.12",
+        Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _make_zip(_CR_HANDLER_NO_PID)},
+    )
+    try:
+        cfn.create_stack(StackName="cr-t07", TemplateBody=_cfn_template("cr-test-nopid"))
+        stack = _wait_stack(cfn, "cr-t07")
+        assert stack["StackStatus"] == "CREATE_COMPLETE"
+
+        res = cfn.describe_stack_resource(StackName="cr-t07", LogicalResourceId="CR")
+        pid = res["StackResourceDetail"]["PhysicalResourceId"]
+        # Must be a non-empty UUID (the RequestId fallback)
+        assert pid and len(pid) > 8
+    finally:
+        cfn.delete_stack(StackName="cr-t07")
+        _wait_stack(cfn, "cr-t07")
+        lam.delete_function(FunctionName="cr-test-nopid")
+
+
+# ── Async response (Lambda returns before PUTting ResponseURL) ─────────────
+
+_CR_HANDLER_ASYNC = """\
+import json, threading, time, urllib.request
+
+def handler(event, context):
+    # Return immediately; a background thread delivers the response after a delay.
+    captured = dict(event)
+
+    def respond():
+        time.sleep(0.5)
+        payload = json.dumps({
+            "Status": "SUCCESS",
+            "RequestId": captured["RequestId"],
+            "StackId": captured["StackId"],
+            "LogicalResourceId": captured["LogicalResourceId"],
+            "PhysicalResourceId": "async-resource-id",
+            "Data": {"AsyncResult": "done"},
+        }).encode()
+        req = urllib.request.Request(
+            captured["ResponseURL"],
+            data=payload,
+            method="PUT",
+            headers={"content-type": "", "content-length": str(len(payload))},
+        )
+        urllib.request.urlopen(req, timeout=10)
+
+    threading.Thread(target=respond, daemon=True).start()
+"""
+
+
+def test_custom_resource_async_response(cfn, lam):
+    """Lambda returns without responding; background thread PUTs to ResponseURL later."""
+    lam.create_function(
+        FunctionName="cr-test-async",
+        Runtime="python3.12",
+        Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _make_zip(_CR_HANDLER_ASYNC)},
+    )
+    try:
+        cfn.create_stack(StackName="cr-t08", TemplateBody=_cfn_template("cr-test-async"))
+        stack = _wait_stack(cfn, "cr-t08", timeout=30)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+
+        res = cfn.describe_stack_resource(StackName="cr-t08", LogicalResourceId="CR")
+        assert res["StackResourceDetail"]["PhysicalResourceId"] == "async-resource-id"
+    finally:
+        cfn.delete_stack(StackName="cr-t08")
+        _wait_stack(cfn, "cr-t08")
+        lam.delete_function(FunctionName="cr-test-async")
+
+
+# ── Timeout ───────────────────────────────────────────────────────────────
+
+_CR_HANDLER_SILENT = """\
+def handler(event, context):
+    # Never PUTs to ResponseURL — triggers timeout
+    pass
+"""
+
+
+def test_custom_resource_timeout_fails_stack(cfn, lam):
+    """ServiceTimeout=2 with a silent Lambda causes the stack to fail."""
+    lam.create_function(
+        FunctionName="cr-test-timeout",
+        Runtime="python3.12",
+        Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _make_zip(_CR_HANDLER_SILENT)},
+    )
+    tpl = _cfn_template("cr-test-timeout", extra_props={"ServiceTimeout": "2"})
+    try:
+        cfn.create_stack(StackName="cr-t09", TemplateBody=tpl)
+        stack = _wait_stack(cfn, "cr-t09", timeout=30)
+        assert stack["StackStatus"] in ("ROLLBACK_COMPLETE", "CREATE_FAILED"), stack
+    finally:
+        try:
+            cfn.delete_stack(StackName="cr-t09")
+            _wait_stack(cfn, "cr-t09")
+        except Exception:
+            pass
+        lam.delete_function(FunctionName="cr-test-timeout")
+
+
+# ── Lambda not found ──────────────────────────────────────────────────────
+
+def test_custom_resource_lambda_not_found(cfn):
+    """ServiceToken pointing to a nonexistent Lambda fails the stack immediately."""
+    tpl = _cfn_template("cr-does-not-exist-function")
+    cfn.create_stack(StackName="cr-t10", TemplateBody=tpl)
+    stack = _wait_stack(cfn, "cr-t10")
+    try:
+        assert stack["StackStatus"] in ("ROLLBACK_COMPLETE", "CREATE_FAILED"), stack
+    finally:
+        try:
+            cfn.delete_stack(StackName="cr-t10")
+            _wait_stack(cfn, "cr-t10")
+        except Exception:
+            pass
