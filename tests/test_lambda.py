@@ -3480,6 +3480,43 @@ exports.handler = async (_event, _ctx) => ({
     assert r["hasGetParameterCommand"] is True
 
 
+def test_nodejs_worker_json_rpc_error_has_name():
+    """Service errors from the JSON-RPC stub expose err.name (not just err.code).
+
+    AWS SDK v3 handlers typically catch errors by name, e.g.:
+      if (e.name !== 'ParameterNotFound') throw e;
+    The stub must set both .name and .code so that pattern works.
+    """
+    handler_js = """\
+const http = require("http");
+// Spin up a tiny server that returns a ParameterNotFound error body.
+const srv = http.createServer((req, res) => {
+  res.writeHead(400, { "Content-Type": "application/x-amz-json-1.1" });
+  res.end(JSON.stringify({ __type: "ParameterNotFound", Message: "param not found" }));
+});
+srv.listen(0, "127.0.0.1", () => {
+  const port = srv.address().port;
+  process.env.AWS_ENDPOINT_URL = "http://127.0.0.1:" + port;
+  const { SSMClient, GetParameterCommand } = require("@aws-sdk/client-ssm");
+  const client = new SSMClient({});
+  client.send(new GetParameterCommand({ Name: "/does/not/exist" }))
+    .catch((e) => {
+      srv.close();
+      exports._result = { name: e.name, code: e.code };
+    });
+});
+exports.handler = () => new Promise((res) => {
+  const wait = () => exports._result ? res(exports._result) : setTimeout(wait, 10);
+  wait();
+});
+"""
+    result = _run_nodejs_worker(handler_js)
+    assert result.get("status") == "ok", f"Invocation failed: {result}"
+    r = result["result"]
+    assert r["name"] == "ParameterNotFound", f"err.name was {r['name']!r}, expected 'ParameterNotFound'"
+    assert r["code"] == "ParameterNotFound", f"err.code was {r['code']!r}"
+
+
 def test_nodejs_worker_aws_sdk_v3_stub_resolves_extended():
     """All newly added JSON-RPC service stubs resolve (SQS, SNS, KMS, Cognito, etc.)."""
     handler_js = """\

@@ -242,6 +242,7 @@ process.stdout.write = function(chunk, encoding, callback) {
               );
               err.statusCode = res.statusCode;
               err.code = parsed.__type || parsed.Code || "ServiceError";
+              err.name = err.code;
               reject(err);
             } else {
               resolve(parsed);
