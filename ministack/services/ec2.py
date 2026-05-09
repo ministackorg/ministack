@@ -309,10 +309,22 @@ def _run_instances(p):
         sg_ids = [_DEFAULT_SG_ID]
 
     now = _now_ts()
+    # Optional caller-provided values: respect them if set; fall back to defaults otherwise.
+    requested_private_ip = _p(p, "PrivateIpAddress")
+    iam_arn = _p(p, "IamInstanceProfile.Arn")
+    iam_name = _p(p, "IamInstanceProfile.Name")
+    iam_profile = None
+    if iam_arn or iam_name:
+        # Real AWS returns both Arn and Id. We synthesize a stable Id from the
+        # name/arn so DescribeInstances reads back as it does on AWS.
+        if not iam_arn and iam_name:
+            iam_arn = f"arn:aws:iam::{get_account_id()}:instance-profile/{iam_name}"
+        iam_id = "AIPA" + new_uuid().replace("-", "").upper()[:17]
+        iam_profile = {"Arn": iam_arn, "Id": iam_id}
     created = []
     for _ in range(max(1, min(min_count, max_count))):
         instance_id = _new_instance_id()
-        private_ip = _random_ip("10.0")
+        private_ip = requested_private_ip or _random_ip("10.0.")
         # Synthesize a real root EBS volume so DescribeVolumes / DescribeInstances
         # surface the same volume id, matching real AWS where every EBS-backed AMI
         # auto-attaches a root volume regardless of whether the launch request
@@ -380,6 +392,7 @@ def _run_instances(p):
             "UserData": user_data,
             "LaunchTime": now,
             "BlockDeviceMappings": block_device_mappings,
+            "IamInstanceProfile": iam_profile,
         }
         created.append(_instances[instance_id])
 
@@ -2186,13 +2199,26 @@ def _instance_xml(inst):
         <rootDeviceType>{inst['RootDeviceType']}</rootDeviceType>
         <rootDeviceName>{inst['RootDeviceName']}</rootDeviceName>
         <blockDeviceMapping>{_inst_bdm_xml(inst)}</blockDeviceMapping>
-        <virtualizationType>{inst['Virtualization']}</virtualizationType>
+        {_inst_iam_xml(inst)}<virtualizationType>{inst['Virtualization']}</virtualizationType>
         <hypervisor>{inst['Hypervisor']}</hypervisor>
         <monitoring><state>{inst['Monitoring']['State']}</state></monitoring>
         <groupSet>{sgs}</groupSet>
         <tagSet>{tags}</tagSet>
         <amiLaunchIndex>{inst['AmiLaunchIndex']}</amiLaunchIndex>
     </item>"""
+
+
+def _inst_iam_xml(inst):
+    """Emit <iamInstanceProfile> block when an IAM profile is attached."""
+    iip = inst.get("IamInstanceProfile")
+    if not iip or not (iip.get("Arn") or iip.get("Id")):
+        return ""
+    return (
+        "<iamInstanceProfile>"
+        f"<arn>{_esc(iip.get('Arn', ''))}</arn>"
+        f"<id>{_esc(iip.get('Id', ''))}</id>"
+        "</iamInstanceProfile>"
+    )
 
 
 def _inst_bdm_xml(inst):
@@ -2604,7 +2630,8 @@ def _new_igw_id():
 
 
 def _random_ip(prefix):
-    return f"{prefix}{random.randint(1,254)}.{random.randint(1,254)}"
+    sep = "" if prefix.endswith(".") else "."
+    return f"{prefix}{sep}{random.randint(1,254)}.{random.randint(1,254)}"
 
 
 def _now_ts():
