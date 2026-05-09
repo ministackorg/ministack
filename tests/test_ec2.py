@@ -64,6 +64,54 @@ def test_ec2_run_describe_terminate_instances(ec2):
     assert term["TerminatingInstances"][0]["CurrentState"]["Name"] == "terminated"
 
 
+def test_ec2_run_instances_honors_private_ip_and_iam_profile(ec2):
+    """RunInstances must reflect --private-ip-address and --iam-instance-profile
+    on the created instance and in DescribeInstances. Regression for issue #594."""
+    profile_arn = "arn:aws:iam::000000000000:instance-profile/ec2-test-profile"
+    resp = ec2.run_instances(
+        ImageId="ami-12345678",
+        MinCount=1,
+        MaxCount=1,
+        InstanceType="t3.micro",
+        PrivateIpAddress="172.31.0.42",
+        IamInstanceProfile={"Arn": profile_arn},
+    )
+    inst = resp["Instances"][0]
+    iid = inst["InstanceId"]
+    try:
+        # PrivateIpAddress is the value the caller passed, not a random one,
+        # and is well-formed (4 octets ≤ 255).
+        assert inst["PrivateIpAddress"] == "172.31.0.42"
+        assert all(0 <= int(o) <= 255 for o in inst["PrivateIpAddress"].split("."))
+        # PrivateDnsName is derived from the assigned IP, not malformed.
+        assert inst["PrivateDnsName"] == "ip-172-31-0-42.ec2.internal"
+        # IamInstanceProfile is attached and surfaced.
+        assert inst["IamInstanceProfile"]["Arn"] == profile_arn
+        assert inst["IamInstanceProfile"]["Id"]
+
+        # DescribeInstances surfaces the same.
+        desc = ec2.describe_instances(InstanceIds=[iid])
+        d_inst = desc["Reservations"][0]["Instances"][0]
+        assert d_inst["PrivateIpAddress"] == "172.31.0.42"
+        assert d_inst["IamInstanceProfile"]["Arn"] == profile_arn
+    finally:
+        ec2.terminate_instances(InstanceIds=[iid])
+
+
+def test_ec2_run_instances_default_private_ip_is_well_formed(ec2):
+    """When the caller does not pass --private-ip-address, the auto-generated
+    address must still be a valid IPv4. Regression for the 10.0193.216 bug
+    in #594 (missing dot separator in _random_ip prefix)."""
+    resp = ec2.run_instances(ImageId="ami-1", MinCount=1, MaxCount=1)
+    inst = resp["Instances"][0]
+    try:
+        octets = inst["PrivateIpAddress"].split(".")
+        assert len(octets) == 4, f"malformed IP: {inst['PrivateIpAddress']}"
+        assert all(0 <= int(o) <= 255 for o in octets)
+    finally:
+        ec2.terminate_instances(InstanceIds=[inst["InstanceId"]])
+
+
 def test_ec2_run_instances_emits_default_root_block_device_mapping(ec2):
     """RunInstances without an explicit BDM must auto-attach a root EBS volume,
     matching real AWS. Cloud Custodian / AWS Config use BlockDeviceMappings to
