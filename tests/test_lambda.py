@@ -3480,6 +3480,47 @@ exports.handler = async (_event, _ctx) => ({
     assert r["hasGetParameterCommand"] is True
 
 
+def test_nodejs_worker_aws_sdk_v3_stub_resolves_extended():
+    """All newly added JSON-RPC service stubs resolve (SQS, SNS, KMS, Cognito, etc.)."""
+    handler_js = """\
+const { SQSClient, SendMessageCommand } = require("@aws-sdk/client-sqs");
+const { SNSClient, PublishCommand } = require("@aws-sdk/client-sns");
+const { KMSClient, EncryptCommand } = require("@aws-sdk/client-kms");
+const { CognitoIdentityProviderClient, AdminGetUserCommand } = require("@aws-sdk/client-cognito-identity-provider");
+const { CognitoIdentityClient } = require("@aws-sdk/client-cognito-identity");
+const { ECRClient, DescribeRepositoriesCommand } = require("@aws-sdk/client-ecr");
+const { GlueClient, GetDatabaseCommand } = require("@aws-sdk/client-glue");
+const { AthenaClient, StartQueryExecutionCommand } = require("@aws-sdk/client-athena");
+const { FirehoseClient, PutRecordCommand } = require("@aws-sdk/client-firehose");
+const { ACMClient, ListCertificatesCommand } = require("@aws-sdk/client-acm");
+const { OrganizationsClient, ListAccountsCommand } = require("@aws-sdk/client-organizations");
+const { CodeBuildClient, ListProjectsCommand } = require("@aws-sdk/client-codebuild");
+const { CloudTrailClient, LookupEventsCommand } = require("@aws-sdk/client-cloudtrail");
+const { ServiceDiscoveryClient, ListServicesCommand } = require("@aws-sdk/client-servicediscovery");
+exports.handler = async () => ({
+  sqs:   typeof SQSClient === "function" && typeof SendMessageCommand === "function",
+  sns:   typeof SNSClient === "function" && typeof PublishCommand === "function",
+  kms:   typeof KMSClient === "function" && typeof EncryptCommand === "function",
+  cidp:  typeof CognitoIdentityProviderClient === "function" && typeof AdminGetUserCommand === "function",
+  ci:    typeof CognitoIdentityClient === "function",
+  ecr:   typeof ECRClient === "function" && typeof DescribeRepositoriesCommand === "function",
+  glue:  typeof GlueClient === "function" && typeof GetDatabaseCommand === "function",
+  ath:   typeof AthenaClient === "function" && typeof StartQueryExecutionCommand === "function",
+  fh:    typeof FirehoseClient === "function" && typeof PutRecordCommand === "function",
+  acm:   typeof ACMClient === "function" && typeof ListCertificatesCommand === "function",
+  org:   typeof OrganizationsClient === "function" && typeof ListAccountsCommand === "function",
+  cb:    typeof CodeBuildClient === "function" && typeof ListProjectsCommand === "function",
+  ct:    typeof CloudTrailClient === "function" && typeof LookupEventsCommand === "function",
+  sd:    typeof ServiceDiscoveryClient === "function" && typeof ListServicesCommand === "function",
+});
+"""
+    result = _run_nodejs_worker(handler_js)
+    assert result.get("status") == "ok", f"Invocation failed: {result}"
+    r = result["result"]
+    for svc, ok in r.items():
+        assert ok is True, f"Stub not resolved for service key: {svc!r}"
+
+
 def test_nodejs_worker_https_localhost_downgraded_to_http():
     """https.request to localhost is downgraded to HTTP so cfn-response.js works.
 
