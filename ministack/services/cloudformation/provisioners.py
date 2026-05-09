@@ -416,6 +416,51 @@ def _ddb_delete(physical_id, props):
     _dynamodb._tables.pop(physical_id, None)
 
 
+def _ddb_global_table_create(logical_id, props, stack_name):
+    """Provision an AWS::DynamoDB::GlobalTable.
+
+    GlobalTable's CFN schema diverges from Table's in three places that affect
+    a single-process emulator:
+      * No `ProvisionedThroughput` — capacity comes from
+        `WriteProvisionedThroughputSettings` and `ReadProvisionedThroughputSettings`,
+        each wrapping a `<Read|Write>CapacityAutoScalingSettings.MinCapacity`.
+      * `Replicas` is required (one entry per region). Cross-region replication
+        has no meaning here, so we accept the field and ignore its contents.
+      * Multi-region settings (`MultiRegionConsistency`, `GlobalTableWitnesses`,
+        `GlobalTableSourceArn`, `WarmThroughput`) are accepted and ignored.
+
+    Everything else (`KeySchema`, `AttributeDefinitions`, `BillingMode`, GSIs,
+    LSIs, `StreamSpecification`, `SSESpecification`, `TimeToLiveSpecification`,
+    `TableName`) routes through the regular Table provisioner.
+    """
+    translated = dict(props)
+    translated.pop("Replicas", None)
+    translated.pop("MultiRegionConsistency", None)
+    translated.pop("GlobalTableWitnesses", None)
+    translated.pop("GlobalTableSourceArn", None)
+    translated.pop("WarmThroughput", None)
+    translated.pop("WriteOnDemandThroughputSettings", None)
+    translated.pop("ReadOnDemandThroughputSettings", None)
+
+    write = (props.get("WriteProvisionedThroughputSettings") or {})
+    read = (props.get("ReadProvisionedThroughputSettings") or {})
+    write_cap = (write.get("WriteCapacityAutoScalingSettings") or {}).get("MinCapacity")
+    read_cap = (read.get("ReadCapacityAutoScalingSettings") or {}).get("MinCapacity")
+    if write_cap is not None or read_cap is not None:
+        translated["ProvisionedThroughput"] = {
+            "WriteCapacityUnits": int(write_cap) if write_cap is not None else 5,
+            "ReadCapacityUnits": int(read_cap) if read_cap is not None else 5,
+        }
+    translated.pop("WriteProvisionedThroughputSettings", None)
+    translated.pop("ReadProvisionedThroughputSettings", None)
+
+    return _ddb_create(logical_id, translated, stack_name)
+
+
+def _ddb_global_table_delete(physical_id, props):
+    _ddb_delete(physical_id, props)
+
+
 # --- Lambda Function ---
 
 def _zip_inline(source: str | None, handler: str, runtime: str = "python3.12") -> bytes | None:
@@ -3027,10 +3072,12 @@ _RESOURCE_HANDLERS = {
     "AWS::SNS::Topic": {"create": _sns_create, "delete": _sns_delete},
     "AWS::SNS::Subscription": {"create": _sns_sub_create, "delete": _sns_sub_delete},
     "AWS::DynamoDB::Table": {"create": _ddb_create, "delete": _ddb_delete},
-    # Global Tables: same shape and engine as a regular table; the only
-    # GlobalTable-specific property (Replicas) has no meaning in a
-    # single-process emulator, so we map it through the Table provisioner.
-    "AWS::DynamoDB::GlobalTable": {"create": _ddb_create, "delete": _ddb_delete},
+    # CDK TableV2 emits AWS::DynamoDB::GlobalTable, even for single-region
+    # tables. The schema differs from Table (no ProvisionedThroughput; capacity
+    # comes from WriteProvisionedThroughputSettings; Replicas is required and
+    # ignored locally), so it gets a dedicated provisioner that translates
+    # before delegating to the Table engine.
+    "AWS::DynamoDB::GlobalTable": {"create": _ddb_global_table_create, "delete": _ddb_global_table_delete},
     "AWS::Lambda::Function": {"create": _lambda_create, "delete": _lambda_delete},
     "AWS::IAM::Role": {"create": _iam_role_create, "delete": _iam_role_delete},
     "AWS::IAM::Policy": {"create": _iam_policy_create, "delete": _iam_policy_delete},
