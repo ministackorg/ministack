@@ -1912,6 +1912,35 @@ def test_oauth2_token_authorization_code():
     assert resp['expires_in'] == 3600
 
 
+def test_oauth2_id_token_echoes_nonce():
+    """OIDC requires the id_token to echo the nonce from the authorize request
+    so clients can mitigate replay. Strict OIDC clients (oidc-client-ts,
+    Auth0/MS libs) silently discard tokens that omit an expected nonce.
+    Regression for the bug where the nonce was stored on the auth code but
+    never propagated into the id_token."""
+    cognito_idp = make_client('cognito-idp')
+    pool_id, client = _setup_pool_with_user(cognito_idp)
+    client_id = client['ClientId']
+    client_secret = client.get('ClientSecret', '')
+
+    expected_nonce = 'a-nonce-the-client-sent-' + secrets.token_hex(8)
+    code = _do_login_and_get_code(cognito_idp, client_id, {'nonce': expected_nonce})
+
+    status, _, body = _post_form(f'{ENDPOINT}/oauth2/token', {
+        'grant_type': 'authorization_code',
+        'code': code,
+        'redirect_uri': 'http://localhost:3000/callback',
+        'client_id': client_id,
+        'client_secret': client_secret,
+    })
+    assert status == 200
+    id_token = json.loads(body)['id_token']
+    payload_b64 = id_token.split('.')[1]
+    payload_b64 += '=' * (-len(payload_b64) % 4)
+    claims = json.loads(base64.urlsafe_b64decode(payload_b64))
+    assert claims.get('nonce') == expected_nonce
+
+
 def test_oauth2_token_authorization_code_with_pkce():
     cognito_idp = make_client('cognito-idp')
     pool_id, client = _setup_pool_with_user(cognito_idp, generate_secret=False)
