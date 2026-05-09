@@ -1037,11 +1037,11 @@ def _custom_resource_delete(physical_id, props, stack_name=None, logical_id=None
     # CDK uses a marker physical ID when Create failed — treat as no-op
     if not physical_id or physical_id == "FAILED_CREATE_MARKER":
         return
-    effective_stack_name = stack_name or ""
+    sname = stack_name or ""
     from ministack.services.cloudformation import custom_resource as _cr
     _cr.invoke_custom_resource(
-        "Delete", logical_id or physical_id, props, effective_stack_name,
-        _cr_stack_id(effective_stack_name), resource_type,
+        "Delete", logical_id or physical_id, props, sname,
+        _cr_stack_id(sname), resource_type,
         physical_id=physical_id,
     )
 
