@@ -195,3 +195,118 @@ def test_custom_resource_create_failed_triggers_rollback(cfn, lam):
         except Exception:
             pass
         lam.delete_function(FunctionName="cr-test-fail")
+
+
+# ── Update lifecycle ───────────────────────────────────────────────────────
+
+_CR_HANDLER_RECORD = """\
+import json, urllib.request
+
+def handler(event, context):
+    # Echo what was received so tests can inspect it
+    data = {
+        "RequestType": event["RequestType"],
+        "PhysicalResourceId": event.get("PhysicalResourceId", ""),
+        "HasOldProps": str("OldResourceProperties" in event),
+        "OldFoo": str(event.get("OldResourceProperties", {}).get("Foo", "")),
+        "NewFoo": str(event.get("ResourceProperties", {}).get("Foo", "")),
+    }
+    pid = event.get("PhysicalResourceId") or "recorded-resource-id"
+    payload = json.dumps({
+        "Status": "SUCCESS",
+        "RequestId": event["RequestId"],
+        "StackId": event["StackId"],
+        "LogicalResourceId": event["LogicalResourceId"],
+        "PhysicalResourceId": pid,
+        "Data": data,
+    }).encode()
+    req = urllib.request.Request(
+        event["ResponseURL"],
+        data=payload,
+        method="PUT",
+        headers={"content-type": "", "content-length": str(len(payload))},
+    )
+    urllib.request.urlopen(req, timeout=10)
+"""
+
+
+def test_custom_resource_update_sends_old_properties(cfn, lam):
+    lam.create_function(
+        FunctionName="cr-test-record",
+        Runtime="python3.12",
+        Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _make_zip(_CR_HANDLER_RECORD)},
+    )
+    try:
+        tpl_v1 = _cfn_template("cr-test-record", extra_props={"Foo": "bar-v1"})
+        cfn.create_stack(StackName="cr-t04", TemplateBody=tpl_v1)
+        _wait_stack(cfn, "cr-t04")
+
+        tpl_v2 = _cfn_template("cr-test-record", extra_props={"Foo": "bar-v2"})
+        cfn.update_stack(StackName="cr-t04", TemplateBody=tpl_v2)
+        stack = _wait_stack(cfn, "cr-t04")
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+
+        res = cfn.describe_stack_resource(StackName="cr-t04", LogicalResourceId="CR")
+        detail = res["StackResourceDetail"]
+        assert detail["ResourceStatus"] == "UPDATE_COMPLETE"
+    finally:
+        cfn.delete_stack(StackName="cr-t04")
+        _wait_stack(cfn, "cr-t04")
+        lam.delete_function(FunctionName="cr-test-record")
+
+
+def test_custom_resource_delete_sends_physical_id(cfn, lam):
+    """Stack delete must send the PhysicalResourceId from Create to the Lambda."""
+    _CR_DELETE_CHECK = """\
+import json, urllib.request
+
+def handler(event, context):
+    data = {
+        "RequestType": event["RequestType"],
+        "ReceivedPhysicalId": event.get("PhysicalResourceId", "MISSING"),
+    }
+    pid = event.get("PhysicalResourceId") or "delete-test-id"
+    payload = json.dumps({
+        "Status": "SUCCESS",
+        "RequestId": event["RequestId"],
+        "StackId": event["StackId"],
+        "LogicalResourceId": event["LogicalResourceId"],
+        "PhysicalResourceId": pid,
+        "Data": data,
+    }).encode()
+    req = urllib.request.Request(
+        event["ResponseURL"],
+        data=payload,
+        method="PUT",
+        headers={"content-type": "", "content-length": str(len(payload))},
+    )
+    urllib.request.urlopen(req, timeout=10)
+"""
+
+    lam.create_function(
+        FunctionName="cr-test-delete",
+        Runtime="python3.12",
+        Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _make_zip(_CR_DELETE_CHECK)},
+    )
+    try:
+        cfn.create_stack(StackName="cr-t05", TemplateBody=_cfn_template("cr-test-delete"))
+        _wait_stack(cfn, "cr-t05")
+
+        res = cfn.describe_stack_resource(StackName="cr-t05", LogicalResourceId="CR")
+        create_pid = res["StackResourceDetail"]["PhysicalResourceId"]
+        assert create_pid  # must be non-empty
+
+        cfn.delete_stack(StackName="cr-t05")
+        stack = _wait_stack(cfn, "cr-t05")
+        assert stack["StackStatus"] == "DELETE_COMPLETE", stack
+    finally:
+        try:
+            cfn.delete_stack(StackName="cr-t05")
+            _wait_stack(cfn, "cr-t05")
+        except Exception:
+            pass
+        lam.delete_function(FunctionName="cr-test-delete")
