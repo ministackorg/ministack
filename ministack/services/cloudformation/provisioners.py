@@ -3027,6 +3027,10 @@ _RESOURCE_HANDLERS = {
     "AWS::SNS::Topic": {"create": _sns_create, "delete": _sns_delete},
     "AWS::SNS::Subscription": {"create": _sns_sub_create, "delete": _sns_sub_delete},
     "AWS::DynamoDB::Table": {"create": _ddb_create, "delete": _ddb_delete},
+    # Global Tables: same shape and engine as a regular table; the only
+    # GlobalTable-specific property (Replicas) has no meaning in a
+    # single-process emulator, so we map it through the Table provisioner.
+    "AWS::DynamoDB::GlobalTable": {"create": _ddb_create, "delete": _ddb_delete},
     "AWS::Lambda::Function": {"create": _lambda_create, "delete": _lambda_delete},
     "AWS::IAM::Role": {"create": _iam_role_create, "delete": _iam_role_delete},
     "AWS::IAM::Policy": {"create": _iam_policy_create, "delete": _iam_policy_delete},

@@ -7,6 +7,13 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [1.3.33] — 2026-05-09
+
+### Added
+- **CloudFormation `AWS::DynamoDB::GlobalTable`** — provisions through the existing DynamoDB Table engine. Honors `KeySchema`, `AttributeDefinitions`, `BillingMode`, `StreamSpecification`, `GlobalSecondaryIndexes`, `LocalSecondaryIndexes`, and `TableName`. The `Replicas` property is accepted but ignored: cross-region replication has no meaning in a single-process emulator. Reported by @youngkwangk.
+
+---
+
 ## [1.3.32] — 2026-05-09
 
 ### Added
