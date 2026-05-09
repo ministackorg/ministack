@@ -3442,16 +3442,16 @@ def _run_nodejs_worker(handler_js, event_payload=None, env_extra=None):
 
 
 def test_nodejs_worker_aws_sdk_v3_stub_resolves():
-    """@aws-sdk/client-lambda and @aws-sdk/client-sfn resolve to built-in stubs.
+    """@aws-sdk/client-lambda, @aws-sdk/client-sfn, @aws-sdk/client-ssm resolve.
 
-    The CDK Provider Framework's outbound.js requires both packages at module
-    load time; on real AWS (Node.js 18+) they're built-in. Ministack injects
-    stubs so framework.js initialises without errors even when the packages
-    aren't on disk. The framework uses Lambda (not LambdaClient) and SFN.
+    Real AWS Lambda (Node.js 18+) ships these built-in. Ministack injects
+    stubs: Lambda uses a dedicated REST stub; sfn/ssm use the generic JSON-RPC
+    stub backed by Ministack's own service implementations.
     """
     handler_js = """\
 const { Lambda, LambdaClient, InvokeCommand, waitUntilFunctionActiveV2 } = require("@aws-sdk/client-lambda");
 const { SFN, SFNClient } = require("@aws-sdk/client-sfn");
+const { SSM, SSMClient, PutParameterCommand, GetParameterCommand } = require("@aws-sdk/client-ssm");
 exports.handler = async (_event, _ctx) => ({
   hasLambda: typeof Lambda === "function",
   hasLambdaClient: typeof LambdaClient === "function",
@@ -3459,17 +3459,25 @@ exports.handler = async (_event, _ctx) => ({
   hasWaiter: typeof waitUntilFunctionActiveV2 === "function",
   hasSFN: typeof SFN === "function",
   hasSFNClient: typeof SFNClient === "function",
+  hasSSM: typeof SSM === "function",
+  hasSSMClient: typeof SSMClient === "function",
+  hasPutParameterCommand: typeof PutParameterCommand === "function",
+  hasGetParameterCommand: typeof GetParameterCommand === "function",
 });
 """
     result = _run_nodejs_worker(handler_js)
     assert result.get("status") == "ok", f"Invocation failed: {result}"
     r = result["result"]
-    assert r["hasLambda"] is True, "Lambda class not exported"
-    assert r["hasLambdaClient"] is True, "LambdaClient not exported"
-    assert r["hasInvokeCommand"] is True, "InvokeCommand not exported"
-    assert r["hasWaiter"] is True, "waitUntilFunctionActiveV2 not exported"
-    assert r["hasSFN"] is True, "SFN class not exported"
-    assert r["hasSFNClient"] is True, "SFNClient not exported"
+    assert r["hasLambda"] is True
+    assert r["hasLambdaClient"] is True
+    assert r["hasInvokeCommand"] is True
+    assert r["hasWaiter"] is True
+    assert r["hasSFN"] is True
+    assert r["hasSFNClient"] is True
+    assert r["hasSSM"] is True
+    assert r["hasSSMClient"] is True
+    assert r["hasPutParameterCommand"] is True
+    assert r["hasGetParameterCommand"] is True
 
 
 def test_nodejs_worker_https_localhost_downgraded_to_http():

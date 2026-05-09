@@ -117,7 +117,7 @@ process.stdout.write = function(chunk, encoding, callback) {
 // a Lambda Layer with the actual SDK takes precedence; fall back to a stub
 // that routes through AWS_ENDPOINT_URL (Ministack).
 (function _installAwsSdkV3Stubs() {
-  // Shared helper: invoke a Lambda function via the Ministack HTTP endpoint.
+  // ── Lambda stub (REST-based, not JSON-RPC) ─────────────────────────────
   function _lambdaInvoke(params) {
     const ep = new URL(process.env.AWS_ENDPOINT_URL || "http://127.0.0.1:4566");
     const fn = encodeURIComponent(params.FunctionName || "");
@@ -153,9 +153,6 @@ process.stdout.write = function(chunk, encoding, callback) {
     });
   }
 
-  // @aws-sdk/client-lambda stub.
-  // CDK Provider Framework uses the "bare" Lambda class (lambda.invoke(params))
-  // rather than LambdaClient + InvokeCommand — export both forms for safety.
   function _makeLambdaClientModule() {
     class Lambda {
       constructor(_cfg) {}
@@ -163,53 +160,146 @@ process.stdout.write = function(chunk, encoding, callback) {
     }
     class LambdaClient {
       constructor(_cfg) {}
-      async send(cmd) { return cmd._run(); }
+      send(cmd) { return cmd._run(); }
     }
     class InvokeCommand {
       constructor(params) { this._p = params; }
       _run() { return _lambdaInvoke(this._p); }
     }
-    // Ministack functions are always "active"; no-op waiter.
     async function waitUntilFunctionActiveV2(_params, _input) {
       return { state: "SUCCESS" };
     }
     return { Lambda, LambdaClient, InvokeCommand, waitUntilFunctionActiveV2 };
   }
 
-  // @aws-sdk/client-sfn stub.
-  // CDK Provider Framework requires this at module load time (outbound.js top-level).
-  // Only used for async custom resources with isComplete; stub startExecution so
-  // synchronous resources work without the full SFN service.
-  function _makeSfnClientModule() {
-    class SFN {
-      constructor(_cfg) {}
-      async startExecution(_req) {
-        throw new Error("SFN.startExecution: Step Functions not implemented in Ministack");
-      }
-    }
-    class SFNClient {
-      constructor(_cfg) {}
-      async send(_cmd) {
-        throw new Error("SFNClient.send: Step Functions not implemented in Ministack");
-      }
-    }
-    return { SFN, SFNClient };
+  // ── Generic JSON-RPC stub (covers SSM, SFN, STS, CloudWatch, Logs, etc.) ─
+  // Most AWS SDK v3 packages use awsJson1.x: POST / with X-Amz-Target header.
+  // Ministack's router maps target prefixes to service modules.
+  const _JSON_RPC_TARGETS = {
+    "ssm":             "AmazonSSM",
+    "sfn":             "AWSStepFunctions",
+    "sts":             "AWSSecurityTokenService",
+    "cloudwatch":      "GraniteServiceVersion20100801",
+    "cloudwatch-logs": "Logs_20140328",
+    "logs":            "Logs_20140328",
+    "secretsmanager":  "secretsmanager",
+    "events":          "AmazonEventBridge",
+    "eventbridge":     "AmazonEventBridge",
+    "kinesis":         "Kinesis_20131202",
+    "ecs":             "AmazonEC2ContainerServiceV20141113",
+    "dynamodb":        "DynamoDB_20120810",
+  };
+
+  function _jsonRpcRequest(targetPrefix, opName, params) {
+    const ep = new URL(process.env.AWS_ENDPOINT_URL || "http://127.0.0.1:4566");
+    const body = JSON.stringify(params || {});
+    return new Promise((resolve, reject) => {
+      const req = http.request(
+        {
+          hostname: ep.hostname,
+          port: parseInt(ep.port || "4566", 10),
+          method: "POST",
+          path: "/",
+          headers: {
+            "Content-Type": "application/x-amz-json-1.1",
+            "X-Amz-Target": targetPrefix + "." + opName,
+            "Content-Length": Buffer.byteLength(body),
+          },
+        },
+        (res) => {
+          const chunks = [];
+          res.on("data", (c) => chunks.push(c));
+          res.on("end", () => {
+            const text = Buffer.concat(chunks).toString();
+            let parsed;
+            try { parsed = JSON.parse(text); } catch (_) { parsed = {}; }
+            if (res.statusCode >= 400) {
+              const err = new Error(
+                parsed.Message || parsed.message || text || "Service error"
+              );
+              err.statusCode = res.statusCode;
+              err.code = parsed.__type || parsed.Code || "ServiceError";
+              reject(err);
+            } else {
+              resolve(parsed);
+            }
+          });
+        }
+      );
+      req.on("error", reject);
+      req.write(body);
+      req.end();
+    });
   }
 
-  const _sdkFactories = {
+  function _makeGenericJsonServiceModule(targetPrefix) {
+    // Command class factory: new PutParameterCommand(params) → has _run()
+    function _cmdClass(opName) {
+      return class {
+        constructor(params) { this._params = params; }
+        _run() { return _jsonRpcRequest(targetPrefix, opName, this._params); }
+      };
+    }
+
+    // v3-style client: new SSMClient({}).send(new PutParameterCommand({}))
+    class GenericClient {
+      constructor(_cfg) {}
+      send(cmd) { return cmd._run(); }
+    }
+
+    // Bare client: new SSM({}).putParameter(params)  (any method → operation)
+    const BareClient = new Proxy(function() {}, {
+      construct(_target, _args) {
+        return new Proxy({}, {
+          get(_, prop) {
+            if (typeof prop !== "string") return undefined;
+            const opName = prop[0].toUpperCase() + prop.slice(1);
+            return (params) => _jsonRpcRequest(targetPrefix, opName, params);
+          },
+        });
+      },
+    });
+
+    // Module proxy: any named export resolves on demand.
+    //   *Client  → GenericClient (v3 style)
+    //   *Command → command class  (strip "Command" suffix → op name)
+    //   other uppercase name → BareClient (bare/convenience style)
+    return new Proxy(
+      {},
+      {
+        get(_, prop) {
+          if (typeof prop !== "string") return undefined;
+          if (prop.endsWith("Client")) return GenericClient;
+          if (prop.endsWith("Command")) {
+            return _cmdClass(prop.slice(0, -7));
+          }
+          if (/^[A-Z]/.test(prop)) return BareClient;
+          return undefined;
+        },
+      }
+    );
+  }
+
+  // ── require() intercept ────────────────────────────────────────────────
+  const _SPECIFIC_STUBS = {
     "@aws-sdk/client-lambda": _makeLambdaClientModule,
-    "@aws-sdk/client-sfn": _makeSfnClientModule,
   };
+  const _SDK_CLIENT_RE = /^@aws-sdk\/client-(.+)$/;
 
   const _origRequire = Module.prototype.require;
   Module.prototype.require = function (id) {
-    const factory = _sdkFactories[id];
-    if (factory) {
-      try {
-        return _origRequire.apply(this, arguments);
-      } catch (_) {
-        return factory();
-      }
+    // 1. Specific stubs (Lambda uses REST, not JSON-RPC)
+    const specific = _SPECIFIC_STUBS[id];
+    if (specific) {
+      try { return _origRequire.apply(this, arguments); } catch (_) {}
+      return specific();
+    }
+    // 2. Generic JSON-RPC stubs for known @aws-sdk/client-* packages
+    const m = id.match(_SDK_CLIENT_RE);
+    if (m) {
+      try { return _origRequire.apply(this, arguments); } catch (_) {}
+      const prefix = _JSON_RPC_TARGETS[m[1]];
+      if (prefix) return _makeGenericJsonServiceModule(prefix);
     }
     return _origRequire.apply(this, arguments);
   };
