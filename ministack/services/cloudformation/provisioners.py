@@ -79,6 +79,9 @@ def _provision_resource(resource_type: str, logical_id: str, props: dict,
     handler = _RESOURCE_HANDLERS.get(resource_type)
     if handler and "create" in handler:
         return handler["create"](logical_id, props, stack_name)
+    # Custom resource types (Custom::* handled here; AWS::CloudFormation::CustomResource goes through handler)
+    if resource_type.startswith("Custom::"):
+        return _custom_resource_create(logical_id, props, stack_name, resource_type)
     # CloudFormation internal types are no-ops
     if resource_type.startswith("AWS::CloudFormation::"):
         logger.info("CloudFormation internal type %s for %s -- noop", resource_type, logical_id)
@@ -87,18 +90,28 @@ def _provision_resource(resource_type: str, logical_id: str, props: dict,
     raise ValueError(f"Unsupported resource type: {resource_type}")
 
 
-def _delete_resource(resource_type: str, physical_id: str, props: dict):
+def _delete_resource(resource_type: str, physical_id: str, props: dict,
+                     stack_name: str | None = None, logical_id: str | None = None):
     """Delete a provisioned resource."""
     handler = _RESOURCE_HANDLERS.get(resource_type)
     if handler and "delete" in handler:
         handler["delete"](physical_id, props)
+        return
+    # Custom resource types
+    if resource_type.startswith("Custom::") or resource_type == "AWS::CloudFormation::CustomResource":
+        _custom_resource_delete(
+            physical_id, props,
+            stack_name=stack_name, logical_id=logical_id,
+            resource_type=resource_type,
+        )
         return
     logger.warning("No delete handler for resource type %s (id=%s)",
                    resource_type, physical_id)
 
 
 def _update_resource(resource_type: str, physical_id: str, old_props: dict,
-                     new_props: dict, stack_name: str) -> tuple:
+                     new_props: dict, stack_name: str,
+                     logical_id: str | None = None) -> tuple:
     """Update a provisioned resource in place when the type provides an ``update``
     handler. Falls back to ``create`` (which provisioners are expected to
     implement idempotently) when no explicit update handler is registered.
@@ -107,6 +120,13 @@ def _update_resource(resource_type: str, physical_id: str, old_props: dict,
     handler = _RESOURCE_HANDLERS.get(resource_type)
     if handler and "update" in handler:
         return handler["update"](physical_id, old_props, new_props, stack_name)
+    # Custom resource types
+    if resource_type.startswith("Custom::") or resource_type == "AWS::CloudFormation::CustomResource":
+        return _custom_resource_update(
+            physical_id, old_props, new_props, stack_name,
+            logical_id=logical_id,
+            resource_type=resource_type,
+        )
     # No update handler — fall through to create. Most resource types make
     # their create idempotent; CFN never sees a fresh physical id this way.
     return _provision_resource(resource_type, physical_id, new_props, stack_name)
@@ -981,6 +1001,52 @@ def _cfn_wait_condition_handle_create(logical_id, props, stack_name):
     pid = f"{stack_name}-{logical_id}-{new_uuid()[:8]}"
     url = f"https://cloudformation-waitcondition-{get_region()}.s3.amazonaws.com/{pid}"
     return pid, {"Ref": url}
+
+
+# --- CloudFormation Custom Resource ---
+
+def _custom_resource_create(logical_id, props, stack_name, resource_type="AWS::CloudFormation::CustomResource"):
+    from ministack.services.cloudformation import _stacks
+    stack = _stacks.get(stack_name) or {}
+    stack_id = stack.get("StackId", f"arn:aws:cloudformation:us-east-1:000000000000:stack/{stack_name}/unknown")
+    from ministack.services.cloudformation import custom_resource as _cr
+    return _cr.invoke_custom_resource(
+        "Create", logical_id, props, stack_name, stack_id, resource_type,
+    )
+
+
+def _custom_resource_update(physical_id, old_props, new_props, stack_name,
+                             logical_id=None, resource_type="AWS::CloudFormation::CustomResource"):
+    from ministack.services.cloudformation import _stacks
+    stack = _stacks.get(stack_name) or {}
+    stack_id = stack.get("StackId", f"arn:aws:cloudformation:us-east-1:000000000000:stack/{stack_name}/unknown")
+    effective_logical_id = logical_id or physical_id
+    from ministack.services.cloudformation import custom_resource as _cr
+    return _cr.invoke_custom_resource(
+        "Update", effective_logical_id, new_props, stack_name, stack_id, resource_type,
+        physical_id=physical_id, old_props=old_props,
+    )
+
+
+def _custom_resource_delete(physical_id, props, stack_name=None, logical_id=None,
+                             resource_type="AWS::CloudFormation::CustomResource"):
+    from ministack.services.cloudformation import _stacks
+    # CDK uses a marker physical ID when Create failed — treat as no-op
+    if not physical_id or physical_id == "FAILED_CREATE_MARKER":
+        return
+    effective_stack_name = stack_name or ""
+    stack = _stacks.get(effective_stack_name) or {}
+    stack_id = stack.get("StackId", f"arn:aws:cloudformation:us-east-1:000000000000:stack/{effective_stack_name}/unknown")
+    effective_logical_id = logical_id or physical_id
+    from ministack.services.cloudformation import custom_resource as _cr
+    try:
+        _cr.invoke_custom_resource(
+            "Delete", effective_logical_id, props, effective_stack_name, stack_id, resource_type,
+            physical_id=physical_id,
+        )
+    except Exception as exc:
+        logger.warning("Custom resource Delete failed for %s: %s", physical_id, exc)
+        raise
 
 
 # --- API Gateway REST API ---
@@ -3040,6 +3106,16 @@ _RESOURCE_HANDLERS = {
     "AWS::Lambda::Version": {"create": _lambda_version_create},
     "AWS::CloudFormation::WaitCondition": {"create": _cfn_wait_condition_create},
     "AWS::CloudFormation::WaitConditionHandle": {"create": _cfn_wait_condition_handle_create},
+    "AWS::CloudFormation::CustomResource": {
+        "create": _custom_resource_create,
+        "update": lambda pid, old_props, new_props, sn: _custom_resource_update(
+            pid, old_props, new_props, sn,
+            resource_type="AWS::CloudFormation::CustomResource",
+        ),
+        "delete": lambda pid, props: _custom_resource_delete(
+            pid, props, resource_type="AWS::CloudFormation::CustomResource",
+        ),
+    },
     "AWS::ApiGateway::RestApi": {"create": _apigw_rest_api_create, "delete": _apigw_rest_api_delete},
     "AWS::ApiGateway::Resource": {"create": _apigw_resource_create, "delete": _apigw_resource_delete},
     "AWS::ApiGateway::Method": {"create": _apigw_method_create, "delete": _apigw_method_delete},

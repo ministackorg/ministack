@@ -69,3 +69,84 @@ def test_cfn_response_endpoint_accepts_put(cfn):
     )
     with urllib.request.urlopen(req, timeout=5) as resp:
         assert resp.status == 200
+
+
+# ── Create lifecycle ───────────────────────────────────────────────────────
+
+_CR_HANDLER_SUCCESS = """\
+import json, urllib.request
+
+def handler(event, context):
+    payload = json.dumps({
+        "Status": "SUCCESS",
+        "RequestId": event["RequestId"],
+        "StackId": event["StackId"],
+        "LogicalResourceId": event["LogicalResourceId"],
+        "PhysicalResourceId": "my-custom-resource-123",
+        "Data": {"Endpoint": "https://example.com", "Region": "us-east-1"},
+    }).encode()
+    req = urllib.request.Request(
+        event["ResponseURL"],
+        data=payload,
+        method="PUT",
+        headers={"content-type": "", "content-length": str(len(payload))},
+    )
+    urllib.request.urlopen(req, timeout=10)
+"""
+
+
+def test_custom_resource_create_success(cfn, lam):
+    lam.create_function(
+        FunctionName="cr-test-success",
+        Runtime="python3.12",
+        Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _make_zip(_CR_HANDLER_SUCCESS)},
+    )
+    try:
+        cfn.create_stack(
+            StackName="cr-t01",
+            TemplateBody=_cfn_template("cr-test-success"),
+        )
+        stack = _wait_stack(cfn, "cr-t01")
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+
+        res = cfn.describe_stack_resource(StackName="cr-t01", LogicalResourceId="CR")
+        assert res["StackResourceDetail"]["PhysicalResourceId"] == "my-custom-resource-123"
+    finally:
+        cfn.delete_stack(StackName="cr-t01")
+        _wait_stack(cfn, "cr-t01")
+        lam.delete_function(FunctionName="cr-test-success")
+
+
+def test_custom_resource_type_prefix(cfn, lam):
+    """Custom::Tester and AWS::CloudFormation::CustomResource both work."""
+    lam.create_function(
+        FunctionName="cr-test-prefix",
+        Runtime="python3.12",
+        Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _make_zip(_CR_HANDLER_SUCCESS)},
+    )
+    try:
+        cfn.create_stack(
+            StackName="cr-t02a",
+            TemplateBody=_cfn_template("cr-test-prefix", resource_type="Custom::MyTester"),
+        )
+        stack = _wait_stack(cfn, "cr-t02a")
+        assert stack["StackStatus"] == "CREATE_COMPLETE"
+
+        cfn.create_stack(
+            StackName="cr-t02b",
+            TemplateBody=_cfn_template("cr-test-prefix", resource_type="AWS::CloudFormation::CustomResource"),
+        )
+        stack = _wait_stack(cfn, "cr-t02b")
+        assert stack["StackStatus"] == "CREATE_COMPLETE"
+    finally:
+        for name in ("cr-t02a", "cr-t02b"):
+            try:
+                cfn.delete_stack(StackName=name)
+                _wait_stack(cfn, name)
+            except Exception:
+                pass
+        lam.delete_function(FunctionName="cr-test-prefix")
