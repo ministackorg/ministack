@@ -3106,16 +3106,9 @@ _RESOURCE_HANDLERS = {
     "AWS::Lambda::Version": {"create": _lambda_version_create},
     "AWS::CloudFormation::WaitCondition": {"create": _cfn_wait_condition_create},
     "AWS::CloudFormation::WaitConditionHandle": {"create": _cfn_wait_condition_handle_create},
-    "AWS::CloudFormation::CustomResource": {
-        "create": _custom_resource_create,
-        "update": lambda pid, old_props, new_props, sn: _custom_resource_update(
-            pid, old_props, new_props, sn,
-            resource_type="AWS::CloudFormation::CustomResource",
-        ),
-        "delete": lambda pid, props: _custom_resource_delete(
-            pid, props, resource_type="AWS::CloudFormation::CustomResource",
-        ),
-    },
+    # update/delete are handled by explicit routing in _update_resource/_delete_resource
+    # so they can receive stack_name and logical_id from the caller.
+    "AWS::CloudFormation::CustomResource": {"create": _custom_resource_create},
     "AWS::ApiGateway::RestApi": {"create": _apigw_rest_api_create, "delete": _apigw_rest_api_delete},
     "AWS::ApiGateway::Resource": {"create": _apigw_resource_create, "delete": _apigw_resource_delete},
     "AWS::ApiGateway::Method": {"create": _apigw_method_create, "delete": _apigw_method_delete},
