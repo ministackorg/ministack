@@ -774,7 +774,10 @@ async def _handle_post_body_shortcuts(method: str, path: str, headers: dict, bod
         except (json.JSONDecodeError, ValueError):
             payload = {}
         from ministack.services.cloudformation import custom_resource as _cfn_cr
-        _cfn_cr.deliver_response(token, payload)
+        if not _cfn_cr.deliver_response(token, payload):
+            logging.getLogger("cloudformation").warning(
+                "CFN ResponseURL PUT for unknown token %r — ignoring", token
+            )
         return 200, {}, b""
 
     response = await _handle_cognito_body_request(method, path, headers, body, query_params)
