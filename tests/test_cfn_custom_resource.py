@@ -511,9 +511,9 @@ def test_custom_resource_timeout_fails_stack(cfn, lam):
 def test_custom_resource_lambda_not_found(cfn):
     """ServiceToken pointing to a nonexistent Lambda fails the stack immediately."""
     tpl = _cfn_template("cr-does-not-exist-function")
-    cfn.create_stack(StackName="cr-t10", TemplateBody=tpl)
-    stack = _wait_stack(cfn, "cr-t10")
     try:
+        cfn.create_stack(StackName="cr-t10", TemplateBody=tpl)
+        stack = _wait_stack(cfn, "cr-t10")
         assert stack["StackStatus"] in ("ROLLBACK_COMPLETE", "CREATE_FAILED"), stack
     finally:
         try:
