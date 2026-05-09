@@ -93,7 +93,7 @@ def invoke_custom_resource(
     token = new_uuid()
     request_id = new_uuid()
 
-    cfn_event: dict = {
+    cfn_event = {
         "RequestType": request_type,
         "RequestId": request_id,
         "StackId": stack_id,

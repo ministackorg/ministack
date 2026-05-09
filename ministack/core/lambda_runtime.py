@@ -124,8 +124,9 @@ process.stdout.write = function(chunk, encoding, callback) {
     const qs = params.Qualifier
       ? "?Qualifier=" + encodeURIComponent(params.Qualifier)
       : "";
-    let body = params.Payload || "";
-    if (body instanceof Uint8Array) body = Buffer.from(body);
+    const body = params.Payload instanceof Uint8Array
+      ? Buffer.from(params.Payload)
+      : (params.Payload || "");
     return new Promise((resolve, reject) => {
       const req = http.request(
         {
@@ -166,9 +167,7 @@ process.stdout.write = function(chunk, encoding, callback) {
       constructor(params) { this._p = params; }
       _run() { return _lambdaInvoke(this._p); }
     }
-    async function waitUntilFunctionActiveV2(_params, _input) {
-      return { state: "SUCCESS" };
-    }
+    async function waitUntilFunctionActiveV2() { return { state: "SUCCESS" }; }
     return { Lambda, LambdaClient, InvokeCommand, waitUntilFunctionActiveV2 };
   }
 
@@ -306,7 +305,7 @@ process.stdout.write = function(chunk, encoding, callback) {
 
   // ── require() intercept ────────────────────────────────────────────────
   const _SPECIFIC_STUBS = {
-    "@aws-sdk/client-lambda": _makeLambdaClientModule,
+    "@aws-sdk/client-lambda": _makeLambdaClientModule(),
   };
   const _SDK_CLIENT_RE = /^@aws-sdk\/client-(.+)$/;
 
@@ -316,7 +315,7 @@ process.stdout.write = function(chunk, encoding, callback) {
     const specific = _SPECIFIC_STUBS[id];
     if (specific) {
       try { return _origRequire.apply(this, arguments); } catch (_) {}
-      return specific();
+      return specific;
     }
     // 2. Generic JSON-RPC stubs for known @aws-sdk/client-* packages
     const m = id.match(_SDK_CLIENT_RE);
@@ -391,11 +390,7 @@ function patchAwsSdk() {
       options.protocol = "http:";
       options.port = options.port || msPort;
       options.host = host + ":" + options.port;
-      if (options.agent instanceof https.Agent) {
-        options.agent = new http.Agent({ keepAlive: true });
-      } else if (options.agent === undefined) {
-        options.agent = new http.Agent({ keepAlive: true });
-      }
+      options.agent = new http.Agent({ keepAlive: true });
       delete options._defaultAgent;
       return http.request(options, callback);
     }
@@ -409,11 +404,7 @@ function patchAwsSdk() {
       options.host = esHost + ":" + esPort;
       options.port = esPort;
       options.rejectUnauthorized = false;
-      if (options.agent instanceof https.Agent) {
-        options.agent = new http.Agent({ keepAlive: true });
-      } else if (options.agent === undefined) {
-        options.agent = new http.Agent({ keepAlive: true });
-      }
+      options.agent = new http.Agent({ keepAlive: true });
       delete options._defaultAgent;
       return http.request(options, callback);
     }
