@@ -150,3 +150,48 @@ def test_custom_resource_type_prefix(cfn, lam):
             except Exception:
                 pass
         lam.delete_function(FunctionName="cr-test-prefix")
+
+
+# ── FAILED status → rollback ───────────────────────────────────────────────
+
+_CR_HANDLER_FAILED = """\
+import json, urllib.request
+
+def handler(event, context):
+    payload = json.dumps({
+        "Status": "FAILED",
+        "Reason": "Intentional test failure",
+        "RequestId": event["RequestId"],
+        "StackId": event["StackId"],
+        "LogicalResourceId": event["LogicalResourceId"],
+        "PhysicalResourceId": "failed-resource",
+    }).encode()
+    req = urllib.request.Request(
+        event["ResponseURL"],
+        data=payload,
+        method="PUT",
+        headers={"content-type": "", "content-length": str(len(payload))},
+    )
+    urllib.request.urlopen(req, timeout=10)
+"""
+
+
+def test_custom_resource_create_failed_triggers_rollback(cfn, lam):
+    lam.create_function(
+        FunctionName="cr-test-fail",
+        Runtime="python3.12",
+        Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _make_zip(_CR_HANDLER_FAILED)},
+    )
+    try:
+        cfn.create_stack(StackName="cr-t03", TemplateBody=_cfn_template("cr-test-fail"))
+        stack = _wait_stack(cfn, "cr-t03")
+        assert stack["StackStatus"] in ("ROLLBACK_COMPLETE", "CREATE_FAILED"), stack
+    finally:
+        try:
+            cfn.delete_stack(StackName="cr-t03")
+            _wait_stack(cfn, "cr-t03")
+        except Exception:
+            pass
+        lam.delete_function(FunctionName="cr-test-fail")
