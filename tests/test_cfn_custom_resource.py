@@ -26,8 +26,14 @@ def _make_zip(code: str) -> bytes:
 
 def _wait_stack(cfn, name, timeout=30):
     deadline = time.time() + timeout
+    status = "UNKNOWN"
     while time.time() < deadline:
-        stacks = cfn.describe_stacks(StackName=name)["Stacks"]
+        try:
+            stacks = cfn.describe_stacks(StackName=name)["Stacks"]
+        except ClientError as exc:
+            if "does not exist" in str(exc):
+                return {"StackStatus": "DELETE_COMPLETE", "StackName": name}
+            raise
         status = stacks[0]["StackStatus"]
         if not status.endswith("_IN_PROGRESS"):
             return stacks[0]
@@ -243,14 +249,27 @@ def test_custom_resource_update_sends_old_properties(cfn, lam):
         cfn.create_stack(StackName="cr-t04", TemplateBody=tpl_v1)
         _wait_stack(cfn, "cr-t04")
 
-        tpl_v2 = _cfn_template("cr-test-record", extra_props={"Foo": "bar-v2"})
+        tpl_v2 = _cfn_template(
+            "cr-test-record",
+            extra_props={"Foo": "bar-v2"},
+            outputs={
+                "HasOldPropsOut": {"Value": {"Fn::GetAtt": ["CR", "HasOldProps"]}},
+                "OldFooOut":      {"Value": {"Fn::GetAtt": ["CR", "OldFoo"]}},
+                "NewFooOut":      {"Value": {"Fn::GetAtt": ["CR", "NewFoo"]}},
+            },
+        )
         cfn.update_stack(StackName="cr-t04", TemplateBody=tpl_v2)
         stack = _wait_stack(cfn, "cr-t04")
         assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
 
         res = cfn.describe_stack_resource(StackName="cr-t04", LogicalResourceId="CR")
-        detail = res["StackResourceDetail"]
-        assert detail["ResourceStatus"] == "UPDATE_COMPLETE"
+        assert res["StackResourceDetail"]["ResourceStatus"] == "UPDATE_COMPLETE"
+
+        # Verify OldResourceProperties were forwarded to the Lambda on Update
+        outputs = {o["OutputKey"]: o["OutputValue"] for o in stack.get("Outputs", [])}
+        assert outputs.get("HasOldPropsOut") == "True", f"OldResourceProperties missing: {outputs}"
+        assert outputs.get("OldFooOut") == "bar-v1", f"OldFoo wrong: {outputs}"
+        assert outputs.get("NewFooOut") == "bar-v2", f"NewFoo wrong: {outputs}"
     finally:
         cfn.delete_stack(StackName="cr-t04")
         _wait_stack(cfn, "cr-t04")
