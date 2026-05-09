@@ -3362,3 +3362,98 @@ def test_account_from_arn_lambda_runtime_helper_matches():
         assert runtime_helper("") == "fallback_key"
         assert runtime_helper(None) == "fallback_key"
         assert runtime_helper("arn:aws:lambda") == "fallback_key"
+
+
+def test_nodejs_worker_aws_sdk_v3_stub_resolves():
+    """@aws-sdk/client-lambda resolves to the built-in stub when not installed.
+
+    The CDK Provider Framework's framework.js requires this package at import
+    time; on real AWS, Node.js 18+ ships it built-in. Ministack injects a stub
+    so framework.js initialises without errors even when the package isn't on
+    disk.  This test exercises the stub by running the worker script with a
+    tiny handler that requires the package and returns its exported names.
+    """
+    import io
+    import json
+    import os
+    import shutil
+    import subprocess
+    import sys
+    import tempfile
+    import zipfile
+
+    from ministack.core.lambda_runtime import _NODEJS_WORKER_SCRIPT
+
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node not found on PATH")
+
+    handler_js = """\
+const { LambdaClient, InvokeCommand } = require("@aws-sdk/client-lambda");
+exports.handler = async (_event, _ctx) => ({
+  hasLambdaClient: typeof LambdaClient === "function",
+  hasInvokeCommand: typeof InvokeCommand === "function",
+});
+"""
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("index.js", handler_js)
+    code_zip = buf.getvalue()
+
+    tmpdir = tempfile.mkdtemp(prefix="test-sdk-stub-")
+    try:
+        worker_path = os.path.join(tmpdir, "_worker.js")
+        with open(worker_path, "w") as f:
+            f.write(_NODEJS_WORKER_SCRIPT)
+
+        code_dir = os.path.join(tmpdir, "code")
+        os.makedirs(code_dir)
+        zip_path = os.path.join(tmpdir, "code.zip")
+        with open(zip_path, "wb") as f:
+            f.write(code_zip)
+        with zipfile.ZipFile(zip_path) as zf:
+            zf.extractall(code_dir)
+
+        proc = subprocess.Popen(
+            [node, worker_path],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+            env={**os.environ, "AWS_ENDPOINT_URL": "http://127.0.0.1:4566"},
+        )
+
+        init = json.dumps({
+            "code_dir": code_dir,
+            "module": "index",
+            "handler": "handler",
+            "env": {},
+            "function_name": "test-sdk-stub",
+            "memory": 128,
+            "arn": "arn:aws:lambda:us-east-1:000000000000:function:test-sdk-stub",
+        })
+        proc.stdin.write(init + "\n")
+        proc.stdin.flush()
+
+        # Read init response
+        init_resp = json.loads(proc.stdout.readline())
+        assert init_resp.get("status") == "ready", (
+            f"Worker init failed: {init_resp}; stderr: {proc.stderr.read(2048)}"
+        )
+
+        # Invoke the handler
+        event = json.dumps({"_request_id": "test-req-1"})
+        proc.stdin.write(event + "\n")
+        proc.stdin.flush()
+
+        invoke_resp = json.loads(proc.stdout.readline())
+        proc.terminate()
+
+        assert invoke_resp.get("status") == "ok", f"Invocation failed: {invoke_resp}"
+        result = invoke_resp["result"]
+        assert result["hasLambdaClient"] is True, "LambdaClient not a function"
+        assert result["hasInvokeCommand"] is True, "InvokeCommand not a function"
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)

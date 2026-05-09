@@ -103,6 +103,7 @@ const path = require("path");
 const http = require("http");
 const https = require("https");
 const url = require("url");
+const Module = require("module");
 
 // Redirect stdout to stderr so stdout stays clean for JSON-line protocol
 const _realStdoutWrite = process.stdout.write.bind(process.stdout);
@@ -110,6 +111,77 @@ const _stderrWrite = process.stderr.write.bind(process.stderr);
 process.stdout.write = function(chunk, encoding, callback) {
   return _stderrWrite(chunk, encoding, callback);
 };
+
+// Synthetic AWS SDK v3 stubs — real AWS Lambda (Node.js 18+) ships these
+// built-in, but the host runtime does not.  Try the real package first so
+// a Lambda Layer with the actual SDK takes precedence; fall back to a stub
+// that routes through AWS_ENDPOINT_URL (Ministack).
+(function _installAwsSdkV3Stubs() {
+  function _makeLambdaClientModule() {
+    return {
+      LambdaClient: class LambdaClient {
+        constructor(_cfg) {}
+        async send(cmd) { return cmd._run(); }
+      },
+      InvokeCommand: class InvokeCommand {
+        constructor(params) { this._p = params; }
+        _run() {
+          const ep = new URL(
+            process.env.AWS_ENDPOINT_URL || "http://127.0.0.1:4566"
+          );
+          const fn = encodeURIComponent(this._p.FunctionName || "");
+          const qs = this._p.Qualifier
+            ? "?Qualifier=" + encodeURIComponent(this._p.Qualifier)
+            : "";
+          let body = this._p.Payload || "";
+          if (body instanceof Uint8Array) body = Buffer.from(body);
+          return new Promise((resolve, reject) => {
+            const req = http.request(
+              {
+                hostname: ep.hostname,
+                port: parseInt(ep.port || "4566", 10),
+                method: "POST",
+                path: "/2015-03-31/functions/" + fn + "/invocations" + qs,
+                headers: { "Content-Type": "application/json" },
+              },
+              (res) => {
+                const chunks = [];
+                res.on("data", (c) => chunks.push(c));
+                res.on("end", () =>
+                  resolve({
+                    StatusCode: res.statusCode,
+                    Payload: Buffer.concat(chunks),
+                    FunctionError: res.headers["x-amz-function-error"],
+                  })
+                );
+              }
+            );
+            req.on("error", reject);
+            if (body) req.write(body);
+            req.end();
+          });
+        }
+      },
+    };
+  }
+
+  const _sdkFactories = {
+    "@aws-sdk/client-lambda": _makeLambdaClientModule,
+  };
+
+  const _origRequire = Module.prototype.require;
+  Module.prototype.require = function (id) {
+    const factory = _sdkFactories[id];
+    if (factory) {
+      try {
+        return _origRequire.apply(this, arguments);
+      } catch (_) {
+        return factory();
+      }
+    }
+    return _origRequire.apply(this, arguments);
+  };
+}());
 
 function patchAwsSdk() {
   const endpoint = process.env.AWS_ENDPOINT_URL
