@@ -3364,21 +3364,13 @@ def test_account_from_arn_lambda_runtime_helper_matches():
         assert runtime_helper("arn:aws:lambda") == "fallback_key"
 
 
-def test_nodejs_worker_aws_sdk_v3_stub_resolves():
-    """@aws-sdk/client-lambda resolves to the built-in stub when not installed.
-
-    The CDK Provider Framework's framework.js requires this package at import
-    time; on real AWS, Node.js 18+ ships it built-in. Ministack injects a stub
-    so framework.js initialises without errors even when the package isn't on
-    disk.  This test exercises the stub by running the worker script with a
-    tiny handler that requires the package and returns its exported names.
-    """
+def _run_nodejs_worker(handler_js, event_payload=None, env_extra=None):
+    """Spin up a Node.js Lambda worker with the given handler, return invoke result."""
     import io
     import json
     import os
     import shutil
     import subprocess
-    import sys
     import tempfile
     import zipfile
 
@@ -3388,20 +3380,12 @@ def test_nodejs_worker_aws_sdk_v3_stub_resolves():
     if not node:
         pytest.skip("node not found on PATH")
 
-    handler_js = """\
-const { LambdaClient, InvokeCommand } = require("@aws-sdk/client-lambda");
-exports.handler = async (_event, _ctx) => ({
-  hasLambdaClient: typeof LambdaClient === "function",
-  hasInvokeCommand: typeof InvokeCommand === "function",
-});
-"""
-
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w") as zf:
         zf.writestr("index.js", handler_js)
     code_zip = buf.getvalue()
 
-    tmpdir = tempfile.mkdtemp(prefix="test-sdk-stub-")
+    tmpdir = tempfile.mkdtemp(prefix="test-node-worker-")
     try:
         worker_path = os.path.join(tmpdir, "_worker.js")
         with open(worker_path, "w") as f:
@@ -3415,6 +3399,10 @@ exports.handler = async (_event, _ctx) => ({
         with zipfile.ZipFile(zip_path) as zf:
             zf.extractall(code_dir)
 
+        env = {**os.environ, "AWS_ENDPOINT_URL": "http://127.0.0.1:4566"}
+        if env_extra:
+            env.update(env_extra)
+
         proc = subprocess.Popen(
             [node, worker_path],
             stdin=subprocess.PIPE,
@@ -3422,7 +3410,7 @@ exports.handler = async (_event, _ctx) => ({
             stderr=subprocess.PIPE,
             text=True,
             bufsize=1,
-            env={**os.environ, "AWS_ENDPOINT_URL": "http://127.0.0.1:4566"},
+            env=env,
         )
 
         init = json.dumps({
@@ -3430,30 +3418,112 @@ exports.handler = async (_event, _ctx) => ({
             "module": "index",
             "handler": "handler",
             "env": {},
-            "function_name": "test-sdk-stub",
+            "function_name": "test-worker",
             "memory": 128,
-            "arn": "arn:aws:lambda:us-east-1:000000000000:function:test-sdk-stub",
+            "arn": "arn:aws:lambda:us-east-1:000000000000:function:test-worker",
         })
         proc.stdin.write(init + "\n")
         proc.stdin.flush()
 
-        # Read init response
         init_resp = json.loads(proc.stdout.readline())
         assert init_resp.get("status") == "ready", (
             f"Worker init failed: {init_resp}; stderr: {proc.stderr.read(2048)}"
         )
 
-        # Invoke the handler
-        event = json.dumps({"_request_id": "test-req-1"})
+        event = json.dumps({**(event_payload or {}), "_request_id": "test-req-1"})
         proc.stdin.write(event + "\n")
         proc.stdin.flush()
 
         invoke_resp = json.loads(proc.stdout.readline())
         proc.terminate()
-
-        assert invoke_resp.get("status") == "ok", f"Invocation failed: {invoke_resp}"
-        result = invoke_resp["result"]
-        assert result["hasLambdaClient"] is True, "LambdaClient not a function"
-        assert result["hasInvokeCommand"] is True, "InvokeCommand not a function"
+        return invoke_resp
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_nodejs_worker_aws_sdk_v3_stub_resolves():
+    """@aws-sdk/client-lambda and @aws-sdk/client-sfn resolve to built-in stubs.
+
+    The CDK Provider Framework's outbound.js requires both packages at module
+    load time; on real AWS (Node.js 18+) they're built-in. Ministack injects
+    stubs so framework.js initialises without errors even when the packages
+    aren't on disk. The framework uses Lambda (not LambdaClient) and SFN.
+    """
+    handler_js = """\
+const { Lambda, LambdaClient, InvokeCommand, waitUntilFunctionActiveV2 } = require("@aws-sdk/client-lambda");
+const { SFN, SFNClient } = require("@aws-sdk/client-sfn");
+exports.handler = async (_event, _ctx) => ({
+  hasLambda: typeof Lambda === "function",
+  hasLambdaClient: typeof LambdaClient === "function",
+  hasInvokeCommand: typeof InvokeCommand === "function",
+  hasWaiter: typeof waitUntilFunctionActiveV2 === "function",
+  hasSFN: typeof SFN === "function",
+  hasSFNClient: typeof SFNClient === "function",
+});
+"""
+    result = _run_nodejs_worker(handler_js)
+    assert result.get("status") == "ok", f"Invocation failed: {result}"
+    r = result["result"]
+    assert r["hasLambda"] is True, "Lambda class not exported"
+    assert r["hasLambdaClient"] is True, "LambdaClient not exported"
+    assert r["hasInvokeCommand"] is True, "InvokeCommand not exported"
+    assert r["hasWaiter"] is True, "waitUntilFunctionActiveV2 not exported"
+    assert r["hasSFN"] is True, "SFN class not exported"
+    assert r["hasSFNClient"] is True, "SFNClient not exported"
+
+
+def test_nodejs_worker_https_localhost_downgraded_to_http():
+    """https.request to localhost is downgraded to HTTP so cfn-response.js works.
+
+    The CDK Provider Framework's cfn-response.js calls https.request
+    unconditionally for the ResponseURL PUT and drops the port from the URL.
+    patchAwsSdk() intercepts this and redirects to HTTP on the Ministack port.
+    """
+    import http.server
+    import threading
+
+    # Start a tiny HTTP server to catch the PUT
+    received = {}
+
+    class _Handler(http.server.BaseHTTPRequestHandler):
+        def do_PUT(self):
+            length = int(self.headers.get("Content-Length", 0))
+            received["body"] = self.rfile.read(length).decode()
+            received["path"] = self.path
+            self.send_response(200)
+            self.end_headers()
+
+        def log_message(self, *args):
+            pass
+
+    srv = http.server.HTTPServer(("127.0.0.1", 0), _Handler)
+    port = srv.server_address[1]
+    t = threading.Thread(target=srv.handle_request, daemon=True)
+    t.start()
+
+    handler_js = f"""\
+const https = require("https");
+exports.handler = (event, ctx, cb) => {{
+  // Simulate cfn-response.js: https.request with no port (port dropped from URL)
+  const req = https.request({{
+    hostname: "127.0.0.1",
+    port: {port},
+    path: "/test-cfn-response",
+    method: "PUT",
+    headers: {{"content-type": "", "content-length": 4}},
+  }}, (res) => {{
+    res.resume();
+    cb(null, {{ statusCode: res.statusCode }});
+  }});
+  req.on("error", (e) => cb(e.message));
+  req.write("test");
+  req.end();
+}};
+"""
+    result = _run_nodejs_worker(handler_js)
+    t.join(timeout=5)
+    srv.server_close()
+
+    assert result.get("status") == "ok", f"Handler failed: {result}"
+    assert received.get("path") == "/test-cfn-response", "PUT not received by HTTP server"
+    assert received.get("body") == "test"

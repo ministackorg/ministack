@@ -117,56 +117,88 @@ process.stdout.write = function(chunk, encoding, callback) {
 // a Lambda Layer with the actual SDK takes precedence; fall back to a stub
 // that routes through AWS_ENDPOINT_URL (Ministack).
 (function _installAwsSdkV3Stubs() {
-  function _makeLambdaClientModule() {
-    return {
-      LambdaClient: class LambdaClient {
-        constructor(_cfg) {}
-        async send(cmd) { return cmd._run(); }
-      },
-      InvokeCommand: class InvokeCommand {
-        constructor(params) { this._p = params; }
-        _run() {
-          const ep = new URL(
-            process.env.AWS_ENDPOINT_URL || "http://127.0.0.1:4566"
+  // Shared helper: invoke a Lambda function via the Ministack HTTP endpoint.
+  function _lambdaInvoke(params) {
+    const ep = new URL(process.env.AWS_ENDPOINT_URL || "http://127.0.0.1:4566");
+    const fn = encodeURIComponent(params.FunctionName || "");
+    const qs = params.Qualifier
+      ? "?Qualifier=" + encodeURIComponent(params.Qualifier)
+      : "";
+    let body = params.Payload || "";
+    if (body instanceof Uint8Array) body = Buffer.from(body);
+    return new Promise((resolve, reject) => {
+      const req = http.request(
+        {
+          hostname: ep.hostname,
+          port: parseInt(ep.port || "4566", 10),
+          method: "POST",
+          path: "/2015-03-31/functions/" + fn + "/invocations" + qs,
+          headers: { "Content-Type": "application/json" },
+        },
+        (res) => {
+          const chunks = [];
+          res.on("data", (c) => chunks.push(c));
+          res.on("end", () =>
+            resolve({
+              StatusCode: res.statusCode,
+              Payload: Buffer.concat(chunks),
+              FunctionError: res.headers["x-amz-function-error"],
+            })
           );
-          const fn = encodeURIComponent(this._p.FunctionName || "");
-          const qs = this._p.Qualifier
-            ? "?Qualifier=" + encodeURIComponent(this._p.Qualifier)
-            : "";
-          let body = this._p.Payload || "";
-          if (body instanceof Uint8Array) body = Buffer.from(body);
-          return new Promise((resolve, reject) => {
-            const req = http.request(
-              {
-                hostname: ep.hostname,
-                port: parseInt(ep.port || "4566", 10),
-                method: "POST",
-                path: "/2015-03-31/functions/" + fn + "/invocations" + qs,
-                headers: { "Content-Type": "application/json" },
-              },
-              (res) => {
-                const chunks = [];
-                res.on("data", (c) => chunks.push(c));
-                res.on("end", () =>
-                  resolve({
-                    StatusCode: res.statusCode,
-                    Payload: Buffer.concat(chunks),
-                    FunctionError: res.headers["x-amz-function-error"],
-                  })
-                );
-              }
-            );
-            req.on("error", reject);
-            if (body) req.write(body);
-            req.end();
-          });
         }
-      },
-    };
+      );
+      req.on("error", reject);
+      if (body) req.write(body);
+      req.end();
+    });
+  }
+
+  // @aws-sdk/client-lambda stub.
+  // CDK Provider Framework uses the "bare" Lambda class (lambda.invoke(params))
+  // rather than LambdaClient + InvokeCommand — export both forms for safety.
+  function _makeLambdaClientModule() {
+    class Lambda {
+      constructor(_cfg) {}
+      invoke(params) { return _lambdaInvoke(params); }
+    }
+    class LambdaClient {
+      constructor(_cfg) {}
+      async send(cmd) { return cmd._run(); }
+    }
+    class InvokeCommand {
+      constructor(params) { this._p = params; }
+      _run() { return _lambdaInvoke(this._p); }
+    }
+    // Ministack functions are always "active"; no-op waiter.
+    async function waitUntilFunctionActiveV2(_params, _input) {
+      return { state: "SUCCESS" };
+    }
+    return { Lambda, LambdaClient, InvokeCommand, waitUntilFunctionActiveV2 };
+  }
+
+  // @aws-sdk/client-sfn stub.
+  // CDK Provider Framework requires this at module load time (outbound.js top-level).
+  // Only used for async custom resources with isComplete; stub startExecution so
+  // synchronous resources work without the full SFN service.
+  function _makeSfnClientModule() {
+    class SFN {
+      constructor(_cfg) {}
+      async startExecution(_req) {
+        throw new Error("SFN.startExecution: Step Functions not implemented in Ministack");
+      }
+    }
+    class SFNClient {
+      constructor(_cfg) {}
+      async send(_cmd) {
+        throw new Error("SFNClient.send: Step Functions not implemented in Ministack");
+      }
+    }
+    return { SFN, SFNClient };
   }
 
   const _sdkFactories = {
     "@aws-sdk/client-lambda": _makeLambdaClientModule,
+    "@aws-sdk/client-sfn": _makeSfnClientModule,
   };
 
   const _origRequire = Module.prototype.require;
@@ -228,6 +260,23 @@ function patchAwsSdk() {
       options.host = msHost + ":" + msPort;
       options.port = msPort;
       options.path = options.path || "/";
+      if (options.agent instanceof https.Agent) {
+        options.agent = new http.Agent({ keepAlive: true });
+      } else if (options.agent === undefined) {
+        options.agent = new http.Agent({ keepAlive: true });
+      }
+      delete options._defaultAgent;
+      return http.request(options, callback);
+    }
+
+    // Downgrade HTTPS to HTTP for localhost — CDK Provider Framework's
+    // cfn-response.js calls https.request unconditionally for the ResponseURL
+    // PUT, and also drops the port when constructing options.  Intercept here
+    // so the PUT reaches Ministack's HTTP server on msPort, not port 443.
+    if (host === "127.0.0.1" || host === "localhost" || host === msHost) {
+      options.protocol = "http:";
+      options.port = options.port || msPort;
+      options.host = host + ":" + options.port;
       if (options.agent instanceof https.Agent) {
         options.agent = new http.Agent({ keepAlive: true });
       } else if (options.agent === undefined) {
