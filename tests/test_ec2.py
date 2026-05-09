@@ -1222,7 +1222,7 @@ def test_ec2_vpn_gateway_crud(ec2):
         ec2.delete_vpc(VpcId=vpc_id)
 
 def test_ec2_vgw_route_propagation(ec2):
-    """EnableVgwRoutePropagation / DisableVgwRoutePropagation."""
+    """EnableVgwRoutePropagation / DisableVgwRoutePropagation with DescribeRouteTables verification."""
     vpc = ec2.create_vpc(CidrBlock="10.94.0.0/16")
     vpc_id = vpc["Vpc"]["VpcId"]
     try:
@@ -1231,11 +1231,23 @@ def test_ec2_vgw_route_propagation(ec2):
         vgw = ec2.create_vpn_gateway(Type="ipsec.1")
         vgw_id = vgw["VpnGateway"]["VpnGatewayId"]
 
+        # Enable and verify it appears in DescribeRouteTables
         ec2.enable_vgw_route_propagation(RouteTableId=rtb_id, GatewayId=vgw_id)
-        # No error = success (propagation stored server-side)
+        desc = ec2.describe_route_tables(RouteTableIds=[rtb_id])
+        propagating = desc["RouteTables"][0].get("PropagatingVgws", [])
+        assert {"GatewayId": vgw_id} in propagating
 
+        # Idempotent — enabling again doesn't duplicate
+        ec2.enable_vgw_route_propagation(RouteTableId=rtb_id, GatewayId=vgw_id)
+        desc = ec2.describe_route_tables(RouteTableIds=[rtb_id])
+        propagating = desc["RouteTables"][0].get("PropagatingVgws", [])
+        assert len([v for v in propagating if v["GatewayId"] == vgw_id]) == 1
+
+        # Disable and verify it's removed
         ec2.disable_vgw_route_propagation(RouteTableId=rtb_id, GatewayId=vgw_id)
-        # No error = success
+        desc = ec2.describe_route_tables(RouteTableIds=[rtb_id])
+        propagating = desc["RouteTables"][0].get("PropagatingVgws", [])
+        assert {"GatewayId": vgw_id} not in propagating
 
         ec2.delete_vpn_gateway(VpnGatewayId=vgw_id)
         ec2.delete_route_table(RouteTableId=rtb_id)
@@ -1259,6 +1271,68 @@ def test_ec2_customer_gateway_crud(ec2):
     desc = ec2.describe_customer_gateways(CustomerGatewayIds=[cgw_id])
     assert len(desc["CustomerGateways"]) == 0
 
+
+def test_ec2_vpn_connection_crud(ec2):
+    """CreateVpnConnection, DescribeVpnConnections, DeleteVpnConnection."""
+    cgw = ec2.create_customer_gateway(BgpAsn=65000, IpAddress="203.0.113.1", Type="ipsec.1")
+    cgw_id = cgw["CustomerGateway"]["CustomerGatewayId"]
+    vgw = ec2.create_vpn_gateway(Type="ipsec.1")
+    vgw_id = vgw["VpnGateway"]["VpnGatewayId"]
+
+    vpn = ec2.create_vpn_connection(
+        Type="ipsec.1",
+        CustomerGatewayId=cgw_id,
+        VpnGatewayId=vgw_id,
+        Options={"StaticRoutesOnly": True},
+    )
+    conn = vpn["VpnConnection"]
+    vpn_id = conn["VpnConnectionId"]
+    assert vpn_id.startswith("vpn-")
+    assert conn["State"] == "available"
+    assert conn["Type"] == "ipsec.1"
+    assert conn["CustomerGatewayId"] == cgw_id
+    assert conn["VpnGatewayId"] == vgw_id
+    assert conn["Options"]["StaticRoutesOnly"] is True
+
+    # Describe
+    desc = ec2.describe_vpn_connections(VpnConnectionIds=[vpn_id])
+    assert len(desc["VpnConnections"]) == 1
+    assert desc["VpnConnections"][0]["VpnConnectionId"] == vpn_id
+
+    # Delete
+    ec2.delete_vpn_connection(VpnConnectionId=vpn_id)
+    desc = ec2.describe_vpn_connections(VpnConnectionIds=[vpn_id])
+    assert len(desc["VpnConnections"]) == 0
+
+    ec2.delete_vpn_gateway(VpnGatewayId=vgw_id)
+    ec2.delete_customer_gateway(CustomerGatewayId=cgw_id)
+
+
+
+def test_ec2_vpn_connection_route(ec2):
+    """CreateVpnConnectionRoute / DeleteVpnConnectionRoute."""
+    cgw = ec2.create_customer_gateway(BgpAsn=65000, IpAddress="203.0.113.2", Type="ipsec.1")
+    cgw_id = cgw["CustomerGateway"]["CustomerGatewayId"]
+    vgw = ec2.create_vpn_gateway(Type="ipsec.1")
+    vgw_id = vgw["VpnGateway"]["VpnGatewayId"]
+    vpn = ec2.create_vpn_connection(Type="ipsec.1", CustomerGatewayId=cgw_id, VpnGatewayId=vgw_id, Options={"StaticRoutesOnly": True})
+    vpn_id = vpn["VpnConnection"]["VpnConnectionId"]
+
+    # Create route
+    ec2.create_vpn_connection_route(VpnConnectionId=vpn_id, DestinationCidrBlock="10.0.0.0/16")
+    desc = ec2.describe_vpn_connections(VpnConnectionIds=[vpn_id])
+    routes = desc["VpnConnections"][0]["Routes"]
+    assert any(r["DestinationCidrBlock"] == "10.0.0.0/16" for r in routes)
+
+    # Delete route
+    ec2.delete_vpn_connection_route(VpnConnectionId=vpn_id, DestinationCidrBlock="10.0.0.0/16")
+    desc = ec2.describe_vpn_connections(VpnConnectionIds=[vpn_id])
+    routes = desc["VpnConnections"][0]["Routes"]
+    assert not any(r["DestinationCidrBlock"] == "10.0.0.0/16" for r in routes)
+
+    ec2.delete_vpn_connection(VpnConnectionId=vpn_id)
+    ec2.delete_vpn_gateway(VpnGatewayId=vgw_id)
+    ec2.delete_customer_gateway(CustomerGatewayId=cgw_id)
 def test_ec2_create_route_nat_gateway(ec2):
     """CreateRoute with NatGatewayId stores it separately from GatewayId."""
     vpc = ec2.create_vpc(CidrBlock="10.93.0.0/16")
