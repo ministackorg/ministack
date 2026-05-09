@@ -1005,48 +1005,45 @@ def _cfn_wait_condition_handle_create(logical_id, props, stack_name):
 
 # --- CloudFormation Custom Resource ---
 
-def _custom_resource_create(logical_id, props, stack_name, resource_type="AWS::CloudFormation::CustomResource"):
+def _cr_stack_id(stack_name: str) -> str:
+    """Return the StackId for stack_name, falling back to a synthesised ARN."""
     from ministack.services.cloudformation import _stacks
     stack = _stacks.get(stack_name) or {}
-    stack_id = stack.get("StackId", f"arn:aws:cloudformation:us-east-1:000000000000:stack/{stack_name}/unknown")
+    return stack.get(
+        "StackId",
+        f"arn:aws:cloudformation:{get_region()}:{get_account_id()}:stack/{stack_name}/unknown",
+    )
+
+
+def _custom_resource_create(logical_id, props, stack_name, resource_type="AWS::CloudFormation::CustomResource"):
     from ministack.services.cloudformation import custom_resource as _cr
     return _cr.invoke_custom_resource(
-        "Create", logical_id, props, stack_name, stack_id, resource_type,
+        "Create", logical_id, props, stack_name, _cr_stack_id(stack_name), resource_type,
     )
 
 
 def _custom_resource_update(physical_id, old_props, new_props, stack_name,
                              logical_id=None, resource_type="AWS::CloudFormation::CustomResource"):
-    from ministack.services.cloudformation import _stacks
-    stack = _stacks.get(stack_name) or {}
-    stack_id = stack.get("StackId", f"arn:aws:cloudformation:us-east-1:000000000000:stack/{stack_name}/unknown")
-    effective_logical_id = logical_id or physical_id
     from ministack.services.cloudformation import custom_resource as _cr
     return _cr.invoke_custom_resource(
-        "Update", effective_logical_id, new_props, stack_name, stack_id, resource_type,
+        "Update", logical_id or physical_id, new_props, stack_name,
+        _cr_stack_id(stack_name), resource_type,
         physical_id=physical_id, old_props=old_props,
     )
 
 
 def _custom_resource_delete(physical_id, props, stack_name=None, logical_id=None,
                              resource_type="AWS::CloudFormation::CustomResource"):
-    from ministack.services.cloudformation import _stacks
     # CDK uses a marker physical ID when Create failed — treat as no-op
     if not physical_id or physical_id == "FAILED_CREATE_MARKER":
         return
     effective_stack_name = stack_name or ""
-    stack = _stacks.get(effective_stack_name) or {}
-    stack_id = stack.get("StackId", f"arn:aws:cloudformation:us-east-1:000000000000:stack/{effective_stack_name}/unknown")
-    effective_logical_id = logical_id or physical_id
     from ministack.services.cloudformation import custom_resource as _cr
-    try:
-        _cr.invoke_custom_resource(
-            "Delete", effective_logical_id, props, effective_stack_name, stack_id, resource_type,
-            physical_id=physical_id,
-        )
-    except Exception as exc:
-        logger.warning("Custom resource Delete failed for %s: %s", physical_id, exc)
-        raise
+    _cr.invoke_custom_resource(
+        "Delete", logical_id or physical_id, props, effective_stack_name,
+        _cr_stack_id(effective_stack_name), resource_type,
+        physical_id=physical_id,
+    )
 
 
 # --- API Gateway REST API ---
