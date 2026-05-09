@@ -7,6 +7,20 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [1.3.32] — 2026-05-09
+
+### Added
+- **EC2 VPN Connection support** — `CreateVpnConnection`, `DescribeVpnConnections`, `DeleteVpnConnection`, `CreateVpnConnectionRoute`, `DeleteVpnConnectionRoute`. Stores `Type`, `CustomerGatewayId`, `VpnGatewayId`, `TransitGatewayId`, `Options.StaticRoutesOnly`, and per-connection `Routes`. Contributed by @tmq107.
+
+### Fixed
+- **Cognito OIDC autodiscovery** — `/.well-known/openid-configuration` now returns reachable endpoint URLs at the MiniStack gateway instead of unreachable `cognito-idp.{region}.amazonaws.com` URLs that don't serve OAuth2 anywhere. `response_types_supported` now advertises both `code` and `token`, matching real AWS Cognito. Amplify and other OIDC clients can now auto-configure against MiniStack without manual endpoint setup. Reported by @coezbek.
+- **Cognito OAuth2 / OIDC endpoints send CORS** — `/oauth2/authorize`, `/oauth2/token`, `/oauth2/userInfo`, `/logout`, and `/.well-known/*` were returning raw response tuples that bypassed `_with_data_plane_headers`, so browser-based OIDC clients (Amplify, `oidc-client-ts`, `react-oidc-context`) failed cross-origin discovery and token exchange with `No 'Access-Control-Allow-Origin' header`. The dispatchers are now routed through the same wildcard-CORS wrapper every other data-plane response uses. Contributed by @coezbek.
+- **EC2 `RunInstances` honors `PrivateIpAddress` and `IamInstanceProfile`** — `--private-ip-address` was ignored and the auto-generated default IP was malformed (`10.0193.216` from a missing dot separator in `_random_ip`). `--iam-instance-profile` was dropped entirely, so the launched instance had no `IamInstanceProfile` field in `RunInstances` or `DescribeInstances`. Both parameters are now stored on the instance record and emitted in the XML response (`<iamInstanceProfile><arn/><id/></iamInstanceProfile>`). Reported by @coseym.
+- **EC2 `DescribeRouteTables` emits `propagatingVgwSet`** — `EnableVgwRoutePropagation` stored the gateway ID on the route table but `DescribeRouteTables` always returned an empty `<propagatingVgwSet/>`, so any IaC tool that round-trips through Describe lost the propagation. Now serializes whatever `EnableVgwRoutePropagation` recorded. Contributed by @tmq107.
+- **DynamoDB GSI Query pagination with non-unique sort keys** — when multiple items shared the same `(GSI_HASH, GSI_RANGE)` value (or for hash-only GSIs), `ExclusiveStartKey` either dropped items silently from page 2 onward or cycled the caller through the same items indefinitely. Real DynamoDB orders GSI results by `(INDEX_HASH, INDEX_SORT, BASE_PK, BASE_SK)`; MiniStack now uses the same hidden tiebreak so cursors advance correctly across pages. Common pattern with single-table designs / ElectroDB collections. Reported by @bensont1 and @mspiller.
+
+---
+
 ## [1.3.31] — 2026-05-07
 
 ### Added
