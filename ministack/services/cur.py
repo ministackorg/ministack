@@ -5,9 +5,10 @@ JSON 1.1 protocol with X-Amz-Target prefix ``AWSOrigamiServiceGateway``.
 
 Implemented:
   DeleteReportDefinition, DescribeReportDefinitions, ListTagsForResource,
-  ModifyReportDefinition, PutReportDefinition
+  ModifyReportDefinition, PutReportDefinition.
 
 Deferred:
+  None.
 """
 
 import copy
@@ -154,12 +155,73 @@ def _put_report_definition(payload: dict):
     return _json(200, {})
 
 
+def _tag_resource(payload: dict):
+    report_name = payload.get("ReportName")
+    if not isinstance(report_name, str) or not report_name.strip():
+        return error_response_json("ValidationException", "ReportName is required", 400)
+
+    if report_name not in _report_definitions:
+        return error_response_json(
+            "ResourceNotFoundException",
+            f"Report definition not found: {report_name}",
+            400,
+        )
+
+    tags = payload.get("Tags")
+    if not isinstance(tags, list):
+        return error_response_json("ValidationException", "Tags is required", 400)
+
+    # Validate each tag has Key and Value.
+    for tag in tags:
+        if not isinstance(tag, dict):
+            return error_response_json("ValidationException", "Tag must be a dict", 400)
+        if "Key" not in tag or "Value" not in tag:
+            return error_response_json(
+                "ValidationException",
+                "Each tag must have Key and Value",
+                400,
+            )
+
+    # Merge tags into the report's tag dict.
+    tag_dict = _report_tags.setdefault(report_name, {})
+    for tag in tags:
+        tag_dict[tag["Key"]] = tag["Value"]
+
+    return _json(200, {})
+
+
+def _untag_resource(payload: dict):
+    report_name = payload.get("ReportName")
+    if not isinstance(report_name, str) or not report_name.strip():
+        return error_response_json("ValidationException", "ReportName is required", 400)
+
+    if report_name not in _report_definitions:
+        return error_response_json(
+            "ResourceNotFoundException",
+            f"Report definition not found: {report_name}",
+            400,
+        )
+
+    tag_keys = payload.get("TagKeys")
+    if not isinstance(tag_keys, list):
+        return error_response_json("ValidationException", "TagKeys is required", 400)
+
+    # Remove tags by key.
+    tag_dict = _report_tags.get(report_name, {})
+    for key in tag_keys:
+        tag_dict.pop(key, None)
+
+    return _json(200, {})
+
+
 _DISPATCH = {
-    "PutReportDefinition": _put_report_definition,
-    "DescribeReportDefinitions": _describe_report_definitions,
-    "ModifyReportDefinition": _modify_report_definition,
     "DeleteReportDefinition": _delete_report_definition,
+    "DescribeReportDefinitions": _describe_report_definitions,
     "ListTagsForResource": _list_tags_for_resource,
+    "ModifyReportDefinition": _modify_report_definition,
+    "PutReportDefinition": _put_report_definition,
+    "TagResource": _tag_resource,
+    "UntagResource": _untag_resource,
 }
 
 
