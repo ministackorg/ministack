@@ -7,10 +7,14 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
-## [Unreleased]
+## [1.3.34] — 2026-05-11
 
 ### Added
-- **ECR Docker Registry HTTP API V2 (`docker push` / `docker pull`)** — the registry V2 wire protocol now coexists with the AWS API on the same gateway, matching real ECR's behaviour. Implements `GET /v2/` (version probe), `GET /v2/_catalog`, chunked blob upload (`POST` / `PATCH` / `PUT /v2/<name>/blobs/uploads/[<uuid>]`), single-shot blob upload (`POST /v2/<name>/blobs/uploads/?digest=...`), cross-repo blob mount (`POST /v2/<name>/blobs/uploads/?mount=<digest>&from=<other>`), `HEAD` / `GET` / `DELETE /v2/<name>/blobs/<digest>`, manifest `PUT` / `GET` / `HEAD` / `DELETE /v2/<name>/manifests/<reference>` (tag or digest), and `GET /v2/<name>/tags/list`. Layer bytes and manifest bytes are persisted across warm-boot under `PERSIST_STATE=1`; in-flight upload sessions are deliberately ephemeral (clients retry on 404, matching real registry semantics). A push via `docker push` becomes immediately visible to `aws ecr describe-images`, and tag mutability is honoured. Routing fix bundled: `/v2/<repo>/...` paths previously fell through to S3 path-style addressing and returned `405 Method Not Allowed` to the Docker daemon; the new pre-empt routes them to ECR before generic detection (the `/v2/email...` SES carve-out is preserved). Reported by @LeTrungNguyen1703.
+- **ECR Docker Registry HTTP API V2 (`docker push` / `docker pull`)** — the registry V2 wire protocol now serves alongside the AWS API on the same gateway, matching real ECR. Covers `/v2/` ping, `/v2/_catalog`, chunked and single-shot blob upload, cross-repo blob mount, blob HEAD/GET/DELETE, manifest PUT/GET/HEAD/DELETE (by tag or digest), and `/tags/list`. Pushed images surface immediately in `aws ecr describe-images`; layer and manifest bytes persist under `PERSIST_STATE=1`. Routing fix bundled: registry paths previously fell through to S3 path-style and returned `405`; the new pre-empt matches only registry shapes (`/blobs/`, `/manifests/`, `/tags/list`) so API Gateway v2, AppSync Events, and SES v2 are unaffected. Reported by @LeTrungNguyen1703.
+- **CloudFormation Custom Resource protocol** — `Custom::*` and `AWS::CloudFormation::CustomResource` now run the full Create / Update / Delete lifecycle. MiniStack mints a local `/_ministack/cfn-response/{token}` intercept in place of a pre-signed S3 ResponseURL, and the provisioner runs in `asyncio.to_thread` so the loop stays free for the Lambda's PUT callback — required for CDK `cr.Provider`-backed Lambdas. `Update` forwards `OldResourceProperties`; `Delete` carries the `PhysicalResourceId` from `Create`; `PhysicalResourceId` falls back to `RequestId` when the Lambda omits it. `ServiceToken` accepts bare function names or full Lambda ARNs. Contributed by @hiddengearz.
+
+### Fixed
+- **Cognito OAuth2 `nonce` echoed into `id_token`** — the authorize endpoint already stored the client-supplied `nonce` on the auth code, but `/oauth2/token` never threaded it into the minted id_token. Per OIDC Core 1.0 §3.1.3.7, strict OIDC libraries (`oidc-client-ts`, `react-oidc-context`, Auth0 / Microsoft clients) discard tokens missing an expected nonce. Now stamped on the id_token only; access and refresh tokens unchanged. Contributed by @coezbek.
 
 ---
 
