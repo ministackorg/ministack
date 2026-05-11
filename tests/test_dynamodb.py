@@ -1053,6 +1053,125 @@ def test_dynamodb_ttl_expiry(ddb):
     assert desc["TimeToLiveStatus"] == "ENABLED"
     assert desc["AttributeName"] == "expires_at"
 
+def test_dynamodb_gsi_query_pagination_with_collisions(ddb):
+    """GSI Query with ExclusiveStartKey must paginate correctly when multiple
+    items share the same GSI sort-key value. Real DynamoDB tiebreaks on the
+    base table's primary key — emulator must do the same or pagination silently
+    drops items from page 2 onwards. Regression for issue #597."""
+    table = "t_gsi_pag_collide"
+    ddb.create_table(
+        TableName=table,
+        KeySchema=[
+            {"AttributeName": "pk", "KeyType": "HASH"},
+            {"AttributeName": "sk", "KeyType": "RANGE"},
+        ],
+        AttributeDefinitions=[
+            {"AttributeName": "pk", "AttributeType": "S"},
+            {"AttributeName": "sk", "AttributeType": "S"},
+            {"AttributeName": "gsi1pk", "AttributeType": "S"},
+            {"AttributeName": "gsi1sk", "AttributeType": "S"},
+        ],
+        GlobalSecondaryIndexes=[
+            {
+                "IndexName": "gsi1",
+                "KeySchema": [
+                    {"AttributeName": "gsi1pk", "KeyType": "HASH"},
+                    {"AttributeName": "gsi1sk", "KeyType": "RANGE"},
+                ],
+                "Projection": {"ProjectionType": "ALL"},
+            }
+        ],
+        BillingMode="PAY_PER_REQUEST",
+    )
+    # Five items sharing the SAME (gsi1pk, gsi1sk); only base pk differs.
+    for i in range(5):
+        ddb.put_item(
+            TableName=table,
+            Item={
+                "pk": {"S": f"item-{i}"},
+                "sk": {"S": "X"},
+                "gsi1pk": {"S": "GROUP"},
+                "gsi1sk": {"S": "X"},
+            },
+        )
+
+    seen, last_key, pages = [], None, 0
+    while True:
+        pages += 1
+        kwargs = dict(
+            TableName=table,
+            IndexName="gsi1",
+            KeyConditionExpression="gsi1pk = :v",
+            ExpressionAttributeValues={":v": {"S": "GROUP"}},
+            Limit=3,
+        )
+        if last_key is not None:
+            kwargs["ExclusiveStartKey"] = last_key
+        out = ddb.query(**kwargs)
+        seen.extend(it["pk"]["S"] for it in out.get("Items", []))
+        last_key = out.get("LastEvaluatedKey")
+        if last_key is None or pages >= 10:
+            break
+
+    assert pages < 10, f"pagination did not terminate: {pages} pages, seen={seen}"
+    assert sorted(seen) == [f"item-{i}" for i in range(5)], (
+        f"expected all 5 items via cursor, got {seen}"
+    )
+
+
+def test_dynamodb_gsi_hash_only_query_pagination(ddb):
+    """GSI with no sort key must paginate without cycling through the same
+    items. Regression for issue #593."""
+    table = "t_gsi_hash_only_pag"
+    ddb.create_table(
+        TableName=table,
+        KeySchema=[{"AttributeName": "id", "KeyType": "HASH"}],
+        AttributeDefinitions=[
+            {"AttributeName": "id", "AttributeType": "S"},
+            {"AttributeName": "bucket", "AttributeType": "N"},
+        ],
+        GlobalSecondaryIndexes=[
+            {
+                "IndexName": "bucket-index",
+                "KeySchema": [{"AttributeName": "bucket", "KeyType": "HASH"}],
+                "Projection": {"ProjectionType": "ALL"},
+            }
+        ],
+        BillingMode="PAY_PER_REQUEST",
+    )
+    n = 25
+    for i in range(n):
+        ddb.put_item(
+            TableName=table,
+            Item={
+                "id": {"S": f"row-{i:04d}"},
+                "bucket": {"N": "0"},
+            },
+        )
+
+    seen, last_key, pages = [], None, 0
+    while True:
+        pages += 1
+        kwargs = dict(
+            TableName=table,
+            IndexName="bucket-index",
+            KeyConditionExpression="bucket = :v",
+            ExpressionAttributeValues={":v": {"N": "0"}},
+            Limit=8,
+        )
+        if last_key is not None:
+            kwargs["ExclusiveStartKey"] = last_key
+        out = ddb.query(**kwargs)
+        seen.extend(it["id"]["S"] for it in out.get("Items", []))
+        last_key = out.get("LastEvaluatedKey")
+        if last_key is None or pages >= 10:
+            break
+
+    assert pages < 10, f"pagination did not terminate: {pages} pages, seen={seen}"
+    assert len(seen) == n, f"expected {n} unique items, got {len(seen)}: {seen}"
+    assert len(set(seen)) == n, f"items duplicated across pages: {seen}"
+
+
 def test_dynamodb_query_pagination_hash_only(ddb):
     """Pagination on a hash-only table (no sort key) must return results after the ESK."""
     table = "t_hash_paginate"

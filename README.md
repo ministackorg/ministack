@@ -891,6 +891,53 @@ Layers that ship npm packages work too — MiniStack resolves the `nodejs/node_m
 
 MiniStack also sets the standard Lambda runtime environment before the handler module is loaded, including `LAMBDA_TASK_ROOT`, `AWS_LAMBDA_FUNCTION_NAME`, `AWS_LAMBDA_FUNCTION_MEMORY_SIZE`, and `_LAMBDA_FUNCTION_ARN`. That keeps import-time Lambda detection and conditional handler setup aligned with AWS warm runtime behaviour.
 
+### Lambda Proxy (BYO container)
+
+For languages AWS doesn't ship a runtime for (PHP, Deno, Bun, custom builds), point a function at your own running container instead of having MiniStack execute a deployment package. MiniStack forwards the Lambda event to that container as an HTTP POST and returns its JSON response as the function result.
+
+The function is a real Lambda in MiniStack's registry — it has an ARN, shows up in `list-functions`, and works as a target for API Gateway `AWS_PROXY` integrations, EventBridge rules, SQS event sources, Step Functions tasks, and any other Lambda trigger. Only the execute hop is redirected.
+
+Configure it per-function via the standard `CreateFunction` API:
+
+```python
+import boto3
+lam = boto3.client("lambda", endpoint_url="http://localhost:4566", region_name="us-east-1",
+                   aws_access_key_id="test", aws_secret_access_key="test")
+
+lam.create_function(
+    FunctionName="phpapi",
+    Runtime="provided",                                # any value; ignored in proxy mode
+    Role="arn:aws:iam::000000000000:role/r",
+    Handler="index.handler",                           # any value; ignored in proxy mode
+    Code={"ZipFile": b"PK\x05\x06" + b"\x00" * 18},    # empty zip stub
+    Environment={"Variables": {
+        "MINISTACK_LAMBDA_PROXY_URL": "http://host.docker.internal:9000/invoke",
+    }},
+)
+```
+
+Or globally via env var at startup: `MINISTACK_LAMBDA_PROXY_<func-name>=http://...`.
+
+Your container receives the Lambda event JSON as the request body. Reply with the function's response as JSON (or a Lambda Proxy response shape `{"statusCode", "headers", "body"}` if it sits behind API Gateway). MiniStack passes these context headers on every forward:
+
+| Header | Value |
+|---|---|
+| `X-Amzn-Lambda-Function-Name` | `phpapi` |
+| `X-Amzn-Lambda-Function-Version` | `$LATEST` |
+| `X-Amzn-Lambda-Function-Arn` | `arn:aws:lambda:us-east-1:000000000000:function:phpapi` |
+| `X-Amzn-Lambda-Request-Id` | per-invocation UUID |
+| `X-Amzn-Lambda-Deadline-Ms` | epoch-ms when the function timeout expires |
+
+Errors map to Lambda's standard error shape so async-invoke retry, DLQ, destinations, and CloudWatch error metrics behave the same as for any other executor:
+
+| What happened | `errorType` | `errorMessage` |
+|---|---|---|
+| Container unreachable | `Runtime.HandlerError` | `Proxy target … unreachable: …` |
+| Took longer than the function `Timeout` | `Sandbox.Timedout` | `Task timed out after N.00 seconds` |
+| Container returned non-2xx | `Runtime.HandlerError` | `Proxy target returned HTTP <code>: <body…>` |
+
+**What this is not:** AWS Lambda doesn't have a feature called "register an externally-running container as my function." If you want byte-for-byte parity in production, ship the same container as a Lambda container image (`PackageType=Image`) and use the AWS Lambda Runtime Interface inside it. Proxy mode is a local-dev shortcut for the inner-loop case; what your production code sees from MiniStack at the SDK boundary is identical to AWS, but the handler signature inside your container differs from a real Lambda runtime contract.
+
 ---
 
 ## Architecture

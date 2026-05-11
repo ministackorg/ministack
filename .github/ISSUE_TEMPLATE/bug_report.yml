@@ -12,26 +12,66 @@ body:
     attributes:
       label: Affected Service
       options:
-        - S3
-        - SQS
-        - SNS
-        - DynamoDB
-        - Lambda
-        - IAM / STS
-        - SecretsManager
-        - CloudWatch Logs
-        - SSM
-        - EventBridge
-        - Kinesis
-        - CloudWatch Metrics
-        - SES
-        - Step Functions
-        - ECS
-        - RDS
-        - ElastiCache
-        - Glue
+        - Account
+        - ACM
+        - API Gateway (v1)
+        - API Gateway (v2)
+        - AppConfig
+        - AppSync
+        - AppSync Events
         - Athena
+        - Auto Scaling
+        - Backup
+        - Batch
+        - CloudFormation
+        - CloudFront
+        - CloudFront KeyValueStore
+        - CloudTrail
+        - CloudWatch
+        - CloudWatch Logs
+        - CodeBuild
+        - Cognito
+        - DynamoDB
+        - DynamoDB Streams
+        - EC2
+        - ECR
+        - ECS
+        - EFS
+        - EKS
+        - ElastiCache
+        - ELB / ALB
+        - EMR
+        - EventBridge
+        - EventBridge Pipes
+        - EventBridge Scheduler
+        - Firehose
+        - Glue
+        - IAM
+        - IMDS
+        - Kinesis
+        - KMS
+        - Lambda
+        - OpenSearch
+        - Organizations
+        - RDS
+        - RDS Data
+        - Resource Groups Tagging API
+        - Route53
+        - S3
+        - Secrets Manager
+        - Service Discovery / Cloud Map
+        - SES (v1)
+        - SES v2
+        - SNS
+        - SQS
+        - SSM
+        - Step Functions
+        - STS
+        - Transfer Family
+        - WAF Classic
+        - WAFv2
         - Router / General
+        - Other (specify in description)
     validations:
       required: true
 
