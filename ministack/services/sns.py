@@ -10,7 +10,7 @@ Supports: CreateTopic, DeleteTopic, ListTopics, GetTopicAttributes, SetTopicAttr
 SNS → Lambda fanout dispatches via _execute_function (synchronous).
 FIFO topics: .fifo naming validation, MessageGroupId/MessageDeduplicationId enforcement,
              5-minute deduplication window, sequence numbers, content-based deduplication,
-             FIFO SQS subscription validation, PublishBatch FIFO support.
+             PublishBatch FIFO support.
 """
 
 import asyncio
@@ -293,16 +293,6 @@ def _subscribe(params):
 
     if not protocol:
         return _error("InvalidParameterException", "Protocol is required", 400)
-
-    # FIFO subscription validation: SQS endpoints must be FIFO queues
-    if _is_fifo_topic(topic) and protocol == "sqs":
-        queue_name = (endpoint or "").split(":")[-1]
-        if not queue_name.endswith(".fifo"):
-            return _error(
-                "InvalidParameterException",
-                "Invalid parameter: Invalid parameter: Topic with FIFO requires a subscription to a FIFO SQS Queue",
-                400,
-            )
 
     for existing in topic["subscriptions"]:
         if existing["protocol"] == protocol and existing["endpoint"] == endpoint:
