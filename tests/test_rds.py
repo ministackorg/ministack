@@ -42,6 +42,39 @@ def test_rds_cluster(rds):
     resp = rds.describe_db_clusters(DBClusterIdentifier="test-cluster")
     assert resp["DBClusters"][0]["DBClusterIdentifier"] == "test-cluster"
 
+def test_rds_cluster_default_field_serialization(rds):
+    """Regression: DescribeDBClusters defaults must match real AWS for
+    DatabaseName (absent/None), NetworkType ("IPV4"), and EngineLifecycleSupport
+    ("open-source-rds-extended-support") when not supplied at create time."""
+    rds.create_db_cluster(
+        DBClusterIdentifier="cluster-defaults",
+        Engine="aurora-mysql",
+        MasterUsername="root",
+        MasterUserPassword="password123",
+    )
+    cluster = rds.describe_db_clusters(DBClusterIdentifier="cluster-defaults")["DBClusters"][0]
+    # AWS returns null/absent when no initial database was specified, not "".
+    assert cluster.get("DatabaseName") is None
+    assert cluster.get("NetworkType") == "IPV4"
+    assert cluster.get("EngineLifecycleSupport") == "open-source-rds-extended-support"
+
+def test_rds_cluster_explicit_field_round_trip(rds):
+    """Explicit DatabaseName / NetworkType / EngineLifecycleSupport round-trip
+    through DescribeDBClusters."""
+    rds.create_db_cluster(
+        DBClusterIdentifier="cluster-explicit",
+        Engine="aurora-mysql",
+        MasterUsername="root",
+        MasterUserPassword="password123",
+        DatabaseName="mydb",
+        NetworkType="DUAL",
+        EngineLifecycleSupport="open-source-rds-extended-support-disabled",
+    )
+    cluster = rds.describe_db_clusters(DBClusterIdentifier="cluster-explicit")["DBClusters"][0]
+    assert cluster.get("DatabaseName") == "mydb"
+    assert cluster.get("NetworkType") == "DUAL"
+    assert cluster.get("EngineLifecycleSupport") == "open-source-rds-extended-support-disabled"
+
 def test_rds_create_instance_v2(rds):
     resp = rds.create_db_instance(
         DBInstanceIdentifier="rds-ci-v2",
