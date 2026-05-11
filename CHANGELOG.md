@@ -7,6 +7,13 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [Unreleased]
+
+### Fixed
+- **RDS `CreateDBInstance` honors `PreferredMaintenanceWindow`** — the field was hardcoded to `sun:05:00-sun:06:00` on the instance record at creation time, silently discarding any caller-supplied value. `ModifyDBInstance` already honored it, and the cluster-level `PreferredMaintenanceWindow` already worked, so the divergence was per-instance only and only on create. The create path now reads the user value and only falls back to `sun:05:00-sun:06:00` when none is supplied. Closes #612. Surfaced by Terraform `aws_rds_cluster_instance.preferred_maintenance_window` round-trip diffing against a real-AWS capture.
+
+---
+
 ## [1.3.34] — 2026-05-11
 
 ### Added

@@ -469,7 +469,7 @@ def _create_db_instance(p):
         }],
         "AvailabilityZone": _p(p, "AvailabilityZone") or f"{get_region()}a",
         "DBSubnetGroup": subnet_group,
-        "PreferredMaintenanceWindow": "sun:05:00-sun:06:00",
+        "PreferredMaintenanceWindow": _p(p, "PreferredMaintenanceWindow") or "sun:05:00-sun:06:00",
         "PendingModifiedValues": {},
         "LatestRestorableTime": _format_time(now_ts),
         "MultiAZ": _p(p, "MultiAZ") == "true",
