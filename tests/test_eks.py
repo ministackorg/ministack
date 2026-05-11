@@ -251,3 +251,53 @@ def test_eks_cfn_cluster(cfn, eks):
 
     cfn.delete_stack(StackName=stack_name)
     time.sleep(2)
+
+
+# -- k3s container run kwargs ----------------------------------------------
+#
+# Issue #611: k3s requires `--privileged` to remount /sys/fs/cgroup; without
+# it the container exits on boot with "failed to evacuate root cgroup". The
+# kwargs builder is unit-tested in isolation so this doesn't depend on Docker
+# being available in CI.
+
+
+def test_eks_k3s_run_kwargs_includes_privileged():
+    """Regression for #611: k3s server mode needs privileged=True."""
+    from ministack.services.eks import _k3s_run_kwargs
+
+    kwargs = _k3s_run_kwargs(name="test-cluster", port=16443)
+
+    assert kwargs["privileged"] is True, (
+        "k3s requires privileged=True — without it the cgroup remount fails "
+        "with 'failed to evacuate root cgroup' (issue #611)"
+    )
+
+
+def test_eks_k3s_run_kwargs_port_mapping():
+    """The 6443 port mapping must be present (the issue report flagged this
+    as missing — it wasn't, but lock it in so it stays present)."""
+    from ministack.services.eks import _k3s_run_kwargs
+
+    kwargs = _k3s_run_kwargs(name="test-cluster", port=16443)
+    assert kwargs["ports"] == {"6443/tcp": 16443}
+
+
+def test_eks_k3s_run_kwargs_network_optional():
+    """`network` is set only when ms_network is provided."""
+    from ministack.services.eks import _k3s_run_kwargs
+
+    no_net = _k3s_run_kwargs(name="c1", port=16443)
+    assert "network" not in no_net
+
+    with_net = _k3s_run_kwargs(name="c1", port=16443, ms_network="ministack-net")
+    assert with_net["network"] == "ministack-net"
+
+
+def test_eks_k3s_run_kwargs_container_name_and_labels():
+    """Each cluster's k3s container is named and labelled so `_stop_all_k3s`
+    can find it. Lock the shape used by that lookup."""
+    from ministack.services.eks import _k3s_run_kwargs
+
+    kwargs = _k3s_run_kwargs(name="my-cluster", port=16443)
+    assert kwargs["name"] == "ministack-eks-my-cluster"
+    assert kwargs["labels"] == {"ministack": "eks", "cluster_name": "my-cluster"}

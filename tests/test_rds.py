@@ -119,6 +119,36 @@ def test_rds_modify_instance_v2(rds):
     assert inst["DBInstanceClass"] == "db.t3.small"
     assert inst["AllocatedStorage"] == 50
 
+def test_rds_create_instance_honors_preferred_maintenance_window(rds):
+    # Regression: CreateDBInstance previously hardcoded
+    # PreferredMaintenanceWindow to "sun:05:00-sun:06:00", silently
+    # discarding any user-supplied value.
+    rds.create_db_instance(
+        DBInstanceIdentifier="rds-pmw-v2",
+        DBInstanceClass="db.t3.micro",
+        Engine="postgres",
+        MasterUsername="admin",
+        MasterUserPassword="pass",
+        AllocatedStorage=20,
+        PreferredMaintenanceWindow="tue:03:00-tue:04:00",
+    )
+    resp = rds.describe_db_instances(DBInstanceIdentifier="rds-pmw-v2")
+    inst = resp["DBInstances"][0]
+    assert inst["PreferredMaintenanceWindow"] == "tue:03:00-tue:04:00"
+
+def test_rds_create_instance_default_preferred_maintenance_window(rds):
+    rds.create_db_instance(
+        DBInstanceIdentifier="rds-pmw-default-v2",
+        DBInstanceClass="db.t3.micro",
+        Engine="postgres",
+        MasterUsername="admin",
+        MasterUserPassword="pass",
+        AllocatedStorage=20,
+    )
+    resp = rds.describe_db_instances(DBInstanceIdentifier="rds-pmw-default-v2")
+    inst = resp["DBInstances"][0]
+    assert inst["PreferredMaintenanceWindow"] == "sun:05:00-sun:06:00"
+
 def test_rds_create_cluster_v2(rds):
     resp = rds.create_db_cluster(
         DBClusterIdentifier="rds-cc-v2",
