@@ -1483,6 +1483,7 @@ def _describe_db_cluster_parameters(p):
             f"<Parameter>"
             f"<ParameterName>{pname}</ParameterName>"
             f"<ParameterValue>{pvalue}</ParameterValue>"
+            f"<Source>user</Source>"
             f"<ApplyMethod>{apply_method}</ApplyMethod>"
             f"<IsModifiable>true</IsModifiable>"
             f"<ApplyType>dynamic</ApplyType>"

@@ -607,6 +607,36 @@ def test_rds_modify_and_describe_cluster_parameters(rds):
     assert len(resp2["Parameters"]) == 0
 
 
+def test_rds_describe_cluster_parameters_emits_source(rds):
+    """DescribeDBClusterParameters must emit Source=user for modified params.
+
+    Regression test for omission of <Source> in the cluster parameter
+    response XML, which caused botocore to materialize Source as None.
+    """
+    rds.create_db_cluster_parameter_group(
+        DBClusterParameterGroupName="test-cparam-source",
+        DBParameterGroupFamily="aurora-mysql8.0",
+        Description="cluster param source test",
+    )
+    rds.modify_db_cluster_parameter_group(
+        DBClusterParameterGroupName="test-cparam-source",
+        Parameters=[
+            {
+                "ParameterName": "binlog_format",
+                "ParameterValue": "ROW",
+                "ApplyMethod": "pending-reboot",
+            },
+        ],
+    )
+    resp = rds.describe_db_cluster_parameters(
+        DBClusterParameterGroupName="test-cparam-source"
+    )
+    p = next(
+        p for p in resp["Parameters"] if p["ParameterName"] == "binlog_format"
+    )
+    assert p.get("Source") == "user"
+
+
 def test_rds_reset_cluster_parameters(rds):
     """ResetDBClusterParameterGroup clears targeted overrides and full group state."""
     rds.create_db_cluster_parameter_group(
