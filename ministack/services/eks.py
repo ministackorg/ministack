@@ -173,6 +173,46 @@ def _wait_for_port(host, port, timeout=30):
     return False
 
 
+def _k3s_run_kwargs(name: str, port: int, ms_network: str | None = None) -> dict:
+    """Build the docker run kwargs for a k3s server container.
+
+    `privileged=True` is required: k3s server mode remounts `/sys/fs/cgroup`,
+    which the granular `cap_add` list below cannot grant. Without it k3s
+    fails on boot with "failed to evacuate root cgroup: mkdir
+    /sys/fs/cgroup/init: read-only file system" (issue #611). The cap_add
+    list and unconfined security_opt are kept as defence-in-depth so that
+    hardened Docker setups still get the right capability set.
+    """
+    run_kwargs = dict(
+        image=apply_image_prefix(EKS_K3S_IMAGE),
+        command=["server",
+                 "--disable=traefik,metrics-server,servicelb",
+                 "--tls-san=0.0.0.0",
+                 "--https-listen-port=6443"],
+        detach=True,
+        privileged=True,
+        cap_add=[
+            "SYS_ADMIN", "NET_ADMIN", "NET_RAW", "NET_BIND_SERVICE",
+            "SYS_PTRACE", "SYS_RESOURCE", "SYS_CHROOT",
+            "DAC_OVERRIDE", "DAC_READ_SEARCH",
+            "FOWNER", "FSETID", "CHOWN", "MKNOD",
+            "KILL", "SETGID", "SETUID", "SETPCAP", "SETFCAP",
+            "AUDIT_WRITE",
+        ],
+        security_opt=["seccomp=unconfined", "apparmor=unconfined"],
+        devices=["/dev/fuse"],
+        ports={"6443/tcp": port},
+        name=f"ministack-eks-{name}",
+        labels={"ministack": "eks", "cluster_name": name},
+        environment={"K3S_KUBECONFIG_MODE": "644"},
+        volumes={"/lib/modules": {"bind": "/lib/modules", "mode": "ro"}},
+        tmpfs={"/run": "", "/var/run": "", "/tmp": ""},
+    )
+    if ms_network:
+        run_kwargs["network"] = ms_network
+    return run_kwargs
+
+
 def _stop_all_k3s():
     """Stop all k3s containers managed by MiniStack."""
     client = _get_docker()
@@ -276,32 +316,7 @@ def _create_cluster(body):
             return
         try:
             ms_network = _get_ministack_network(client)
-            run_kwargs = dict(
-                image=apply_image_prefix(EKS_K3S_IMAGE),
-                command=["server",
-                         "--disable=traefik,metrics-server,servicelb",
-                         "--tls-san=0.0.0.0",
-                         "--https-listen-port=6443"],
-                detach=True,
-                cap_add=[
-                    "SYS_ADMIN", "NET_ADMIN", "NET_RAW", "NET_BIND_SERVICE",
-                    "SYS_PTRACE", "SYS_RESOURCE", "SYS_CHROOT",
-                    "DAC_OVERRIDE", "DAC_READ_SEARCH",
-                    "FOWNER", "FSETID", "CHOWN", "MKNOD",
-                    "KILL", "SETGID", "SETUID", "SETPCAP", "SETFCAP",
-                    "AUDIT_WRITE",
-                ],
-                security_opt=["seccomp=unconfined", "apparmor=unconfined"],
-                devices=["/dev/fuse"],
-                ports={"6443/tcp": port},
-                name=f"ministack-eks-{name}",
-                labels={"ministack": "eks", "cluster_name": name},
-                environment={"K3S_KUBECONFIG_MODE": "644"},
-                volumes={"/lib/modules": {"bind": "/lib/modules", "mode": "ro"}},
-                tmpfs={"/run": "", "/var/run": "", "/tmp": ""},
-            )
-            if ms_network:
-                run_kwargs["network"] = ms_network
+            run_kwargs = _k3s_run_kwargs(name=name, port=port, ms_network=ms_network)
 
             container = client.containers.run(**run_kwargs)
             cluster["_docker_id"] = container.id
