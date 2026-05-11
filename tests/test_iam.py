@@ -558,11 +558,54 @@ def test_iam_cannot_tag_aws_managed_policy(iam):
     assert exc.value.response["Error"]["Code"] == "AccessDenied"
 
 
-def test_iam_unknown_aws_managed_policy_is_autocreated(iam):
-    """For AWS-managed ARNs we don't pre-seed, GetPolicy autovivifies a
-    permissive stub so terraform plans still complete. Strict mode is
-    opt-in via MINISTACK_AUTOCREATE_AWS_MANAGED=0."""
-    arn = "arn:aws:iam::aws:policy/AmazonEKSClusterPolicy"
-    resp = iam.get_policy(PolicyArn=arn)
-    assert resp["Policy"]["Arn"] == arn
-    assert resp["Policy"]["PolicyName"] == "AmazonEKSClusterPolicy"
+def test_iam_unknown_aws_managed_policy_is_not_found_by_default(iam):
+    """Real AWS returns NoSuchEntity for AWS-managed ARNs that don't
+    exist (e.g. typos like ``AdminstratorAccess`` — missing ``i``).
+    Ministack defaults to the same behaviour so that typos surface
+    locally the same way they would in real AWS, instead of silently
+    autovivifying a permissive stub and masking the bug until apply
+    against real AWS."""
+    arn = "arn:aws:iam::aws:policy/AdminstratorAccess"  # missing 'i'
+    with pytest.raises(ClientError) as exc:
+        iam.get_policy(PolicyArn=arn)
+    assert exc.value.response["Error"]["Code"] == "NoSuchEntity"
+
+
+def test_iam_aws_managed_attachment_count_is_per_account(iam):
+    """AWS-managed AttachmentCount must reflect the calling account's
+    own attachments — real AWS scopes the counter per-account. Attach
+    to two roles and a user under the same session, then GetPolicy and
+    expect AttachmentCount == 3."""
+    role_a = f"awsmgd-count-role-a-{_uuid_mod.uuid4().hex[:8]}"
+    role_b = f"awsmgd-count-role-b-{_uuid_mod.uuid4().hex[:8]}"
+    user = f"awsmgd-count-user-{_uuid_mod.uuid4().hex[:8]}"
+    assume = json.dumps({"Version": "2012-10-17", "Statement": []})
+    # ReadOnlyAccess so the test doesn't contend with other tests that
+    # attach AdministratorAccess.
+    arn = "arn:aws:iam::aws:policy/ReadOnlyAccess"
+    baseline = iam.get_policy(PolicyArn=arn)["Policy"]["AttachmentCount"]
+    iam.create_role(RoleName=role_a, AssumeRolePolicyDocument=assume)
+    iam.create_role(RoleName=role_b, AssumeRolePolicyDocument=assume)
+    iam.create_user(UserName=user)
+    try:
+        iam.attach_role_policy(RoleName=role_a, PolicyArn=arn)
+        iam.attach_role_policy(RoleName=role_b, PolicyArn=arn)
+        iam.attach_user_policy(UserName=user, PolicyArn=arn)
+        got = iam.get_policy(PolicyArn=arn)["Policy"]
+        assert got["AttachmentCount"] == baseline + 3
+        # Detach decrements.
+        iam.detach_role_policy(RoleName=role_a, PolicyArn=arn)
+        got2 = iam.get_policy(PolicyArn=arn)["Policy"]
+        assert got2["AttachmentCount"] == baseline + 2
+    finally:
+        for r in (role_a, role_b):
+            try:
+                iam.detach_role_policy(RoleName=r, PolicyArn=arn)
+            except ClientError:
+                pass
+            iam.delete_role(RoleName=r)
+        try:
+            iam.detach_user_policy(UserName=user, PolicyArn=arn)
+        except ClientError:
+            pass
+        iam.delete_user(UserName=user)
