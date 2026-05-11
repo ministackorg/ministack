@@ -9,6 +9,8 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+- **RDS `DescribeDBClusterParameters` emits `<Source>` element** — the cluster-parameter response XML omitted the `<Source>` element entirely, so botocore materialized `Parameters[].Source` as `None` for every entry, including parameters set explicitly via `ModifyDBClusterParameterGroup` (which real AWS reports as `Source: "user"`). The instance-level `DescribeDBParameters` path was already correct; only the cluster path was broken. Each emitted `<Parameter>` now includes `<Source>user</Source>`, matching the existing instance-level behavior. Surfaced by brownfield-import diffing against a real-AWS captured Aurora cluster parameter group. Contributed by @jayjanssen.
+
 ### Added
 - **Cost & Usage Reports** — 7 of 7 CUR API actions supported.
 ## [1.3.35] — 2026-05-11
@@ -17,7 +19,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 - **EKS `CreateCluster` — k3s container now starts with `privileged=True`** — the k3s server container was being launched with a granular `cap_add` list + unconfined seccomp/apparmor in an attempt to avoid privileged mode, but k3s server mode remounts `/sys/fs/cgroup` and no capability set short of `--privileged` permits that. The container exited on boot with `failed to evacuate root cgroup: mkdir /sys/fs/cgroup/init: read-only file system`, breaking EKS cluster creation entirely. The container is now launched with `privileged=True`; the cap_add list is retained as defence-in-depth. Documented as a host-security trade-off in the EKS section of the README. Reported by @zkoncir.
 - **SNS FIFO topic → standard SQS queue subscription** — MiniStack rejected the subscribe with `InvalidParameterException: Topic with FIFO requires a subscription to a FIFO SQS Queue`, which was the AWS rule until 2023-09-14 when AWS added support for FIFO topics fanning out to standard SQS queues. The stale validation is removed; the existing fanout path already attaches `MessageGroupId` / `MessageDeduplicationId` to delivered messages and SQS standard queues ignore those fields, matching real AWS where consumers of a standard queue subscribed to a FIFO topic "may receive messages out of order, and more than once." Contributed by @ellouzeskandercs.
 - **RDS `CreateDBInstance` honors `PreferredMaintenanceWindow`** — the field was hardcoded to `sun:05:00-sun:06:00` on the instance record at creation time, silently discarding any caller-supplied value. `ModifyDBInstance` and cluster-level `PreferredMaintenanceWindow` already worked, so the divergence was per-instance only on create. The create path now reads the user value and falls back to the default only when none is supplied. Surfaced by Terraform `aws_rds_cluster_instance.preferred_maintenance_window` round-trip diffing against a real-AWS capture. Contributed by @jayjanssen.
-- **RDS `DescribeDBClusterParameters` emits `<Source>` element** — the cluster-parameter response XML omitted the `<Source>` element entirely, so botocore materialized `Parameters[].Source` as `None` for every entry, including parameters set explicitly via `ModifyDBClusterParameterGroup` (which real AWS reports as `Source: "user"`). The instance-level `DescribeDBParameters` path was already correct; only the cluster path was broken. Each emitted `<Parameter>` now includes `<Source>user</Source>`, matching the existing instance-level behavior. Surfaced by brownfield-import diffing against a real-AWS captured Aurora cluster parameter group. Contributed by @jayjanssen.
+
 
 ---
 
