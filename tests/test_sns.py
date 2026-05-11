@@ -727,22 +727,22 @@ def test_sns_fifo_sequence_numbers_monotonically_increasing(sns):
 # ---------------------------------------------------------------------------
 
 
-def test_sns_fifo_subscribe_non_fifo_sqs_queue_returns_error(sns, sqs):
-    """Subscribing a non-FIFO SQS queue to a FIFO topic returns InvalidParameterException."""
+def test_sns_fifo_subscribe_standard_sqs_queue_succeeds(sns, sqs):
+    """Subscribing a standard SQS queue to a FIFO topic succeeds."""
     uid = _uuid_mod.uuid4().hex[:8]
     topic_arn = sns.create_topic(
-        Name=f"intg-fifo-sub-nonfifo-{uid}.fifo",
+        Name=f"intg-fifo-sub-std-{uid}.fifo",
         Attributes={"FifoTopic": "true"},
     )["TopicArn"]
 
-    q_url = sqs.create_queue(QueueName=f"intg-fifo-sub-nonfifo-q-{uid}")["QueueUrl"]
+    q_url = sqs.create_queue(QueueName=f"intg-fifo-sub-std-q-{uid}")["QueueUrl"]
     q_arn = sqs.get_queue_attributes(
         QueueUrl=q_url, AttributeNames=["QueueArn"],
     )["Attributes"]["QueueArn"]
 
-    with pytest.raises(ClientError) as exc:
-        sns.subscribe(TopicArn=topic_arn, Protocol="sqs", Endpoint=q_arn)
-    assert exc.value.response["Error"]["Code"] == "InvalidParameterException"
+    resp = sns.subscribe(TopicArn=topic_arn, Protocol="sqs", Endpoint=q_arn)
+    assert "SubscriptionArn" in resp
+    assert resp["SubscriptionArn"] != "PendingConfirmation"
 
 
 def test_sns_fifo_subscribe_fifo_sqs_queue_succeeds(sns, sqs):
