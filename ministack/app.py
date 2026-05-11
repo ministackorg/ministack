@@ -550,7 +550,8 @@ async def _handle_cognito_get_request(method: str, path: str, headers: dict, que
             pool_id = path.rsplit("/.well-known/openid-configuration", 1)[0].lstrip("/")
             if pool_id:
                 region = extract_region(headers) or "us-east-1"
-                return _get_module("cognito").well_known_openid_configuration(pool_id, region)
+                host = headers.get("host") or headers.get("Host")
+                return _get_module("cognito").well_known_openid_configuration(pool_id, region, host)
 
     if path == "/oauth2/authorize" and method == "GET":
         return _get_module("cognito").handle_oauth2_authorize(method, path, headers, query_params)
@@ -662,7 +663,11 @@ async def _handle_pre_body_request(method: str, path: str, headers: dict, query_
 
     response = await _handle_cognito_get_request(method, path, headers, query_params)
     if response is not None:
-        return response
+        # Cognito's OAuth2/OIDC endpoints (Hosted UI, /oauth2/*, /.well-known/*)
+        # are typically called by browser-based OIDC clients and must therefore
+        # carry the same `Access-Control-Allow-Origin: *` that every other data
+        # plane response gets via _with_data_plane_headers.
+        return _with_data_plane_headers(response, request_id)
 
     response = await _handle_ses_messages_request(method, path, headers, query_params)
     if response is not None:
@@ -764,7 +769,7 @@ async def _handle_admin_config_request(path: str, method: str, body: bytes):
     return 200, {"Content-Type": "application/json"}, json.dumps({"applied": applied}).encode()
 
 
-async def _handle_post_body_shortcuts(method: str, path: str, headers: dict, body: bytes, query_params: dict):
+async def _handle_post_body_shortcuts(method: str, path: str, headers: dict, body: bytes, query_params: dict, request_id: str):
     """Handle body-dependent routes before the generic service router."""
     # CloudFormation custom resource ResponseURL intercept
     if method == "PUT" and path.startswith("/_ministack/cfn-response/"):
@@ -782,7 +787,8 @@ async def _handle_post_body_shortcuts(method: str, path: str, headers: dict, bod
 
     response = await _handle_cognito_body_request(method, path, headers, body, query_params)
     if response is not None:
-        return response
+        # See _handle_pre_body_request: browser-based OIDC clients need CORS.
+        return _with_data_plane_headers(response, request_id)
     return await _handle_admin_config_request(path, method, body)
 
 
@@ -1450,7 +1456,7 @@ async def app(scope, receive, send):
 
     body = await _read_request_body(receive, method, headers)
 
-    if await _send_if_handled(send, await _handle_post_body_shortcuts(method, path, headers, body, query_params)):
+    if await _send_if_handled(send, await _handle_post_body_shortcuts(method, path, headers, body, query_params, request_id)):
         return
 
     if await _send_if_handled(

@@ -64,6 +64,54 @@ def test_ec2_run_describe_terminate_instances(ec2):
     assert term["TerminatingInstances"][0]["CurrentState"]["Name"] == "terminated"
 
 
+def test_ec2_run_instances_honors_private_ip_and_iam_profile(ec2):
+    """RunInstances must reflect --private-ip-address and --iam-instance-profile
+    on the created instance and in DescribeInstances. Regression for issue #594."""
+    profile_arn = "arn:aws:iam::000000000000:instance-profile/ec2-test-profile"
+    resp = ec2.run_instances(
+        ImageId="ami-12345678",
+        MinCount=1,
+        MaxCount=1,
+        InstanceType="t3.micro",
+        PrivateIpAddress="172.31.0.42",
+        IamInstanceProfile={"Arn": profile_arn},
+    )
+    inst = resp["Instances"][0]
+    iid = inst["InstanceId"]
+    try:
+        # PrivateIpAddress is the value the caller passed, not a random one,
+        # and is well-formed (4 octets ≤ 255).
+        assert inst["PrivateIpAddress"] == "172.31.0.42"
+        assert all(0 <= int(o) <= 255 for o in inst["PrivateIpAddress"].split("."))
+        # PrivateDnsName is derived from the assigned IP, not malformed.
+        assert inst["PrivateDnsName"] == "ip-172-31-0-42.ec2.internal"
+        # IamInstanceProfile is attached and surfaced.
+        assert inst["IamInstanceProfile"]["Arn"] == profile_arn
+        assert inst["IamInstanceProfile"]["Id"]
+
+        # DescribeInstances surfaces the same.
+        desc = ec2.describe_instances(InstanceIds=[iid])
+        d_inst = desc["Reservations"][0]["Instances"][0]
+        assert d_inst["PrivateIpAddress"] == "172.31.0.42"
+        assert d_inst["IamInstanceProfile"]["Arn"] == profile_arn
+    finally:
+        ec2.terminate_instances(InstanceIds=[iid])
+
+
+def test_ec2_run_instances_default_private_ip_is_well_formed(ec2):
+    """When the caller does not pass --private-ip-address, the auto-generated
+    address must still be a valid IPv4. Regression for the 10.0193.216 bug
+    in #594 (missing dot separator in _random_ip prefix)."""
+    resp = ec2.run_instances(ImageId="ami-1", MinCount=1, MaxCount=1)
+    inst = resp["Instances"][0]
+    try:
+        octets = inst["PrivateIpAddress"].split(".")
+        assert len(octets) == 4, f"malformed IP: {inst['PrivateIpAddress']}"
+        assert all(0 <= int(o) <= 255 for o in octets)
+    finally:
+        ec2.terminate_instances(InstanceIds=[inst["InstanceId"]])
+
+
 def test_ec2_run_instances_emits_default_root_block_device_mapping(ec2):
     """RunInstances without an explicit BDM must auto-attach a root EBS volume,
     matching real AWS. Cloud Custodian / AWS Config use BlockDeviceMappings to
@@ -1174,7 +1222,7 @@ def test_ec2_vpn_gateway_crud(ec2):
         ec2.delete_vpc(VpcId=vpc_id)
 
 def test_ec2_vgw_route_propagation(ec2):
-    """EnableVgwRoutePropagation / DisableVgwRoutePropagation."""
+    """EnableVgwRoutePropagation / DisableVgwRoutePropagation with DescribeRouteTables verification."""
     vpc = ec2.create_vpc(CidrBlock="10.94.0.0/16")
     vpc_id = vpc["Vpc"]["VpcId"]
     try:
@@ -1183,11 +1231,23 @@ def test_ec2_vgw_route_propagation(ec2):
         vgw = ec2.create_vpn_gateway(Type="ipsec.1")
         vgw_id = vgw["VpnGateway"]["VpnGatewayId"]
 
+        # Enable and verify it appears in DescribeRouteTables
         ec2.enable_vgw_route_propagation(RouteTableId=rtb_id, GatewayId=vgw_id)
-        # No error = success (propagation stored server-side)
+        desc = ec2.describe_route_tables(RouteTableIds=[rtb_id])
+        propagating = desc["RouteTables"][0].get("PropagatingVgws", [])
+        assert {"GatewayId": vgw_id} in propagating
 
+        # Idempotent — enabling again doesn't duplicate
+        ec2.enable_vgw_route_propagation(RouteTableId=rtb_id, GatewayId=vgw_id)
+        desc = ec2.describe_route_tables(RouteTableIds=[rtb_id])
+        propagating = desc["RouteTables"][0].get("PropagatingVgws", [])
+        assert len([v for v in propagating if v["GatewayId"] == vgw_id]) == 1
+
+        # Disable and verify it's removed
         ec2.disable_vgw_route_propagation(RouteTableId=rtb_id, GatewayId=vgw_id)
-        # No error = success
+        desc = ec2.describe_route_tables(RouteTableIds=[rtb_id])
+        propagating = desc["RouteTables"][0].get("PropagatingVgws", [])
+        assert {"GatewayId": vgw_id} not in propagating
 
         ec2.delete_vpn_gateway(VpnGatewayId=vgw_id)
         ec2.delete_route_table(RouteTableId=rtb_id)
@@ -1211,6 +1271,68 @@ def test_ec2_customer_gateway_crud(ec2):
     desc = ec2.describe_customer_gateways(CustomerGatewayIds=[cgw_id])
     assert len(desc["CustomerGateways"]) == 0
 
+
+def test_ec2_vpn_connection_crud(ec2):
+    """CreateVpnConnection, DescribeVpnConnections, DeleteVpnConnection."""
+    cgw = ec2.create_customer_gateway(BgpAsn=65000, IpAddress="203.0.113.1", Type="ipsec.1")
+    cgw_id = cgw["CustomerGateway"]["CustomerGatewayId"]
+    vgw = ec2.create_vpn_gateway(Type="ipsec.1")
+    vgw_id = vgw["VpnGateway"]["VpnGatewayId"]
+
+    vpn = ec2.create_vpn_connection(
+        Type="ipsec.1",
+        CustomerGatewayId=cgw_id,
+        VpnGatewayId=vgw_id,
+        Options={"StaticRoutesOnly": True},
+    )
+    conn = vpn["VpnConnection"]
+    vpn_id = conn["VpnConnectionId"]
+    assert vpn_id.startswith("vpn-")
+    assert conn["State"] == "available"
+    assert conn["Type"] == "ipsec.1"
+    assert conn["CustomerGatewayId"] == cgw_id
+    assert conn["VpnGatewayId"] == vgw_id
+    assert conn["Options"]["StaticRoutesOnly"] is True
+
+    # Describe
+    desc = ec2.describe_vpn_connections(VpnConnectionIds=[vpn_id])
+    assert len(desc["VpnConnections"]) == 1
+    assert desc["VpnConnections"][0]["VpnConnectionId"] == vpn_id
+
+    # Delete
+    ec2.delete_vpn_connection(VpnConnectionId=vpn_id)
+    desc = ec2.describe_vpn_connections(VpnConnectionIds=[vpn_id])
+    assert len(desc["VpnConnections"]) == 0
+
+    ec2.delete_vpn_gateway(VpnGatewayId=vgw_id)
+    ec2.delete_customer_gateway(CustomerGatewayId=cgw_id)
+
+
+
+def test_ec2_vpn_connection_route(ec2):
+    """CreateVpnConnectionRoute / DeleteVpnConnectionRoute."""
+    cgw = ec2.create_customer_gateway(BgpAsn=65000, IpAddress="203.0.113.2", Type="ipsec.1")
+    cgw_id = cgw["CustomerGateway"]["CustomerGatewayId"]
+    vgw = ec2.create_vpn_gateway(Type="ipsec.1")
+    vgw_id = vgw["VpnGateway"]["VpnGatewayId"]
+    vpn = ec2.create_vpn_connection(Type="ipsec.1", CustomerGatewayId=cgw_id, VpnGatewayId=vgw_id, Options={"StaticRoutesOnly": True})
+    vpn_id = vpn["VpnConnection"]["VpnConnectionId"]
+
+    # Create route
+    ec2.create_vpn_connection_route(VpnConnectionId=vpn_id, DestinationCidrBlock="10.0.0.0/16")
+    desc = ec2.describe_vpn_connections(VpnConnectionIds=[vpn_id])
+    routes = desc["VpnConnections"][0]["Routes"]
+    assert any(r["DestinationCidrBlock"] == "10.0.0.0/16" for r in routes)
+
+    # Delete route
+    ec2.delete_vpn_connection_route(VpnConnectionId=vpn_id, DestinationCidrBlock="10.0.0.0/16")
+    desc = ec2.describe_vpn_connections(VpnConnectionIds=[vpn_id])
+    routes = desc["VpnConnections"][0]["Routes"]
+    assert not any(r["DestinationCidrBlock"] == "10.0.0.0/16" for r in routes)
+
+    ec2.delete_vpn_connection(VpnConnectionId=vpn_id)
+    ec2.delete_vpn_gateway(VpnGatewayId=vgw_id)
+    ec2.delete_customer_gateway(CustomerGatewayId=cgw_id)
 def test_ec2_create_route_nat_gateway(ec2):
     """CreateRoute with NatGatewayId stores it separately from GatewayId."""
     vpc = ec2.create_vpc(CidrBlock="10.93.0.0/16")

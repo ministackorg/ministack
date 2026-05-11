@@ -34,10 +34,13 @@ import json
 import logging
 import os
 import re
+import socket
 import subprocess
 import tempfile
 import threading
 import time
+import urllib.error
+import urllib.request
 import zipfile
 from datetime import datetime, timezone
 from typing import Any
@@ -85,6 +88,29 @@ LAMBDA_DOCKER_FLAGS = os.environ.get("LAMBDA_DOCKER_FLAGS", "")
 # instead of silently degrading to an in-process execution that diverges from
 # real AWS semantics.
 LAMBDA_STRICT = os.environ.get("LAMBDA_STRICT", "0").lower() in ("1", "true", "yes")
+
+# Lambda proxy mode: invocations are forwarded to a user-managed HTTP
+# container instead of running in ministack's worker pool. The container
+# receives the Lambda event JSON as the request body and replies with the
+# response JSON. Lets users back languages AWS doesn't ship a runtime for
+# (PHP, Deno, etc.) with their existing dev container, without bloating
+# ministack's image with per-language runtimes.
+#
+# Configured per-function via the standard CreateFunction API by setting
+# Environment.Variables.MINISTACK_LAMBDA_PROXY_URL, or globally per name via
+# the env var MINISTACK_LAMBDA_PROXY_<func_name>.
+_PROXY_ENV_VAR = "MINISTACK_LAMBDA_PROXY_URL"
+_PROXY_PREFIX = "MINISTACK_LAMBDA_PROXY_"
+
+
+def _proxy_url_for(config: dict) -> str | None:
+    env = (config.get("Environment") or {}).get("Variables") or {}
+    url = env.get(_PROXY_ENV_VAR)
+    if url:
+        return url
+    name = config.get("FunctionName") or ""
+    return os.environ.get(_PROXY_PREFIX + name) or None
+
 
 try:
     docker_lib: Any = importlib.import_module("docker")
@@ -2532,11 +2558,12 @@ def _execute_function(func: dict, event: dict) -> dict:
     request_id = new_uuid()
     started = time.time()
 
-    # LAMBDA_STRICT=1 forces ALL runtimes through the Docker RIE pool, matching
-    # real AWS ("every invocation runs in a container"). Without it, only
-    # Image-type and LAMBDA_EXECUTOR=docker go through Docker; everything else
-    # uses the in-process fallbacks below.
-    if LAMBDA_STRICT:
+    # Proxy mode wins over every other executor: the function is bound to a
+    # user-managed container, ministack only forwards the event.
+    proxy_url = _proxy_url_for(config)
+    if proxy_url:
+        result = _execute_function_proxy(func, event, proxy_url, request_id)
+    elif LAMBDA_STRICT:
         result = _execute_function_docker(func, event)
     elif config.get("PackageType") == "Image" and config.get("ImageUri"):
         result = _execute_function_docker(func, event)
@@ -2605,6 +2632,74 @@ def lambda_execute_result_to_api_proxy_response(exec_result: dict) -> tuple[dict
                 pass
         return {"statusCode": 200, "body": payload}, None
     return {"statusCode": 200, "body": json.dumps(payload, ensure_ascii=False)}, None
+
+
+def _execute_function_proxy(func: dict, event: dict, url: str, request_id: str) -> dict:
+    """Forward a Lambda invocation to a user-managed HTTP container.
+
+    The container receives the Lambda event JSON as the request body and is
+    expected to reply with the response JSON. Errors (timeout, connection
+    refused, non-2xx, malformed JSON) are returned in Lambda's standard
+    {"errorMessage", "errorType"} shape so async-invoke retry, DLQ,
+    destinations, and CloudWatch error metrics behave the same as for any
+    other executor.
+    """
+    config = func.get("config") or func
+    func_name = config.get("FunctionName", "")
+    timeout = int(config.get("Timeout") or 3)
+
+    payload = json.dumps(event, ensure_ascii=False).encode("utf-8")
+    headers = {
+        "Content-Type": "application/json",
+        "X-Amzn-Lambda-Function-Name": func_name,
+        "X-Amzn-Lambda-Function-Version": config.get("Version", "$LATEST"),
+        "X-Amzn-Lambda-Function-Arn": config.get("FunctionArn", ""),
+        "X-Amzn-Lambda-Request-Id": request_id,
+        "X-Amzn-Lambda-Deadline-Ms": str(int((time.time() + timeout) * 1000)),
+    }
+    req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            body_bytes = resp.read()
+            status = resp.getcode()
+    except urllib.error.HTTPError as e:
+        body_bytes = e.read() or b""
+        status = e.code
+    except (urllib.error.URLError, TimeoutError, socket.timeout) as e:
+        is_timeout = isinstance(e, (TimeoutError, socket.timeout)) or (
+            isinstance(e, urllib.error.URLError) and isinstance(e.reason, (TimeoutError, socket.timeout))
+        )
+        return {
+            "body": {
+                "errorMessage": f"Task timed out after {timeout}.00 seconds" if is_timeout
+                else f"Proxy target {url} unreachable: {e}",
+                "errorType": "Sandbox.Timedout" if is_timeout else "Runtime.HandlerError",
+            },
+            "error": True,
+        }
+    except Exception as e:  # pragma: no cover - defensive
+        return {
+            "body": {"errorMessage": str(e), "errorType": "Runtime.HandlerError"},
+            "error": True,
+        }
+
+    if status < 200 or status >= 300:
+        return {
+            "body": {
+                "errorMessage": f"Proxy target returned HTTP {status}: "
+                                f"{body_bytes[:512].decode('utf-8', 'replace')}",
+                "errorType": "Runtime.HandlerError",
+            },
+            "error": True,
+        }
+
+    text = body_bytes.decode("utf-8", "replace")
+    if not text:
+        return {"body": None}
+    try:
+        return {"body": json.loads(text)}
+    except json.JSONDecodeError:
+        return {"body": text}
 
 
 def _execute_function_warm(func: dict, event: dict) -> dict:
