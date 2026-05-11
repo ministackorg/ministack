@@ -57,6 +57,188 @@ _oidc_providers = AccountScopedDict()
 _service_linked_role_deletion_tasks = AccountScopedDict()
 
 
+# -- AWS-managed policies ---------------------------------------------------
+#
+# Real AWS hosts AWS-managed policies under a virtual `aws` account
+# (ARN form ``arn:aws:iam::aws:policy/<Name>``). Every customer can read
+# them regardless of their own account. Ministack stores customer
+# resources in ``AccountScopedDict``, which keys by the caller's account
+# — so a 12-digit session can never read entries under the literal
+# ``aws`` account. That breaks the common Terraform pattern:
+#
+#     data "aws_iam_policy" "admin" {
+#       arn = "arn:aws:iam::aws:policy/AdministratorAccess"
+#     }
+#
+# We model AWS-managed policies as a *separate*, non-account-scoped
+# dict that every session reads from. They are immutable from a session
+# perspective: CreatePolicy/DeletePolicy/Tag* on an AWS-managed ARN
+# return AWS-parity errors (real AWS does not let customers mutate
+# them). Attach/Detach work against any role or user — only the
+# AttachmentCount counter is a no-op for AWS-managed policies.
+_AWS_MANAGED_POLICY_PREFIX = "arn:aws:iam::aws:policy/"
+
+# Maps full ARN -> policy record (same shape as customer-managed
+# entries in ``_policies``). Populated at import time by
+# ``_seed_aws_managed_policies`` and grown lazily by GetPolicy when
+# autocreate is enabled (default on, opt out with
+# ``MINISTACK_AUTOCREATE_AWS_MANAGED=0``).
+_aws_managed_policies: dict = {}
+
+
+def _is_aws_managed_arn(arn: str) -> bool:
+    return isinstance(arn, str) and arn.startswith(_AWS_MANAGED_POLICY_PREFIX)
+
+
+def _autocreate_aws_managed_enabled() -> bool:
+    return os.environ.get("MINISTACK_AUTOCREATE_AWS_MANAGED", "1").lower() not in (
+        "0", "false", "no",
+    )
+
+
+def _autovivify_aws_managed_policy(arn: str) -> dict:
+    """Lazily create a permissive AWS-managed policy record for ``arn``.
+
+    Real AWS publishes ~1k AWS-managed policies; we pre-seed the most
+    commonly referenced ones (see ``_seed_aws_managed_policies``) and
+    fall back to this on first GetPolicy for anything else. The
+    fallback document allows every action so terraform plans that
+    attach the policy to a role still produce a sensible diff.
+    """
+    name = arn[len(_AWS_MANAGED_POLICY_PREFIX):]
+    if not name:
+        return None  # type: ignore[return-value]
+    doc = json.dumps({
+        "Version": "2012-10-17",
+        "Statement": [{"Effect": "Allow", "Action": "*", "Resource": "*"}],
+    })
+    record = _make_aws_managed_record(name, doc, description=f"AWS-managed policy {name} (autocreated by Ministack).")
+    _aws_managed_policies[arn] = record
+    return record
+
+
+def _make_aws_managed_record(name: str, document: str, description: str = "") -> dict:
+    """Build a policy record matching the shape ``_create_policy`` stores."""
+    arn = f"{_AWS_MANAGED_POLICY_PREFIX}{name}"
+    created = _now()
+    return {
+        "PolicyName": name,
+        "Arn": arn,
+        "PolicyId": _gen_id("ANPA"),
+        "CreateDate": created,
+        "UpdateDate": created,
+        "DefaultVersionId": "v1",
+        "AttachmentCount": 0,
+        "IsAttachable": True,
+        "Path": "/",
+        "Description": description,
+        "Tags": [],
+        "Versions": {
+            "v1": {
+                "Document": document,
+                "VersionId": "v1",
+                "IsDefaultVersion": True,
+                "CreateDate": created,
+            }
+        },
+    }
+
+
+def _lookup_policy(arn: str):
+    """Return the policy record for ``arn`` from either the
+    account-scoped customer-managed store or the global AWS-managed
+    store, autoviving on the AWS-managed side if enabled."""
+    if _is_aws_managed_arn(arn):
+        record = _aws_managed_policies.get(arn)
+        if record is None and _autocreate_aws_managed_enabled():
+            record = _autovivify_aws_managed_policy(arn)
+        return record
+    return _policies.get(arn)
+
+
+def _policy_exists(arn: str) -> bool:
+    return _lookup_policy(arn) is not None
+
+
+def _seed_aws_managed_policies() -> None:
+    """Seed the global AWS-managed policy store with a curated set of
+    the most commonly referenced policies. Documents are minimal but
+    accurate-enough stubs — emulate is for plan-time iteration, not for
+    matching every policy statement against real AWS."""
+    allow_all = json.dumps({
+        "Version": "2012-10-17",
+        "Statement": [{"Effect": "Allow", "Action": "*", "Resource": "*"}],
+    })
+    deny_all = json.dumps({
+        "Version": "2012-10-17",
+        "Statement": [{"Effect": "Allow", "Action": "*", "Resource": "*"},
+                      {"Effect": "Deny",  "Action": "iam:*", "Resource": "*"}],
+    })
+    read_only = json.dumps({
+        "Version": "2012-10-17",
+        "Statement": [{"Effect": "Allow", "Action": ["*:Describe*", "*:Get*", "*:List*"], "Resource": "*"}],
+    })
+
+    def _svc(actions):
+        return json.dumps({
+            "Version": "2012-10-17",
+            "Statement": [{"Effect": "Allow", "Action": actions, "Resource": "*"}],
+        })
+
+    seeds = [
+        # Job-function policies — the big four.
+        ("AdministratorAccess",          allow_all, "Provides full access to AWS services and resources."),
+        ("PowerUserAccess",              deny_all,  "Provides full access to AWS services and resources, but does not allow management of Users and groups."),
+        ("ReadOnlyAccess",               read_only, "Provides read-only access to AWS services and resources."),
+        ("SecurityAudit",                read_only, "The security audit template grants access to read security configuration metadata."),
+        # IAM.
+        ("IAMFullAccess",                _svc(["iam:*", "organizations:DescribeAccount", "organizations:DescribeOrganization"]),
+                                                   "Provides full access to IAM via the AWS Management Console."),
+        ("IAMReadOnlyAccess",            _svc(["iam:Get*", "iam:List*", "iam:Simulate*"]),
+                                                   "Provides read only access to IAM via the AWS Management Console."),
+        # S3.
+        ("AmazonS3FullAccess",           _svc(["s3:*", "s3-object-lambda:*"]),
+                                                   "Provides full access to all buckets via the AWS Management Console."),
+        ("AmazonS3ReadOnlyAccess",       _svc(["s3:Get*", "s3:List*", "s3-object-lambda:Get*", "s3-object-lambda:List*"]),
+                                                   "Provides read-only access to all buckets via the AWS Management Console."),
+        # EC2.
+        ("AmazonEC2FullAccess",          _svc(["ec2:*", "elasticloadbalancing:*", "cloudwatch:*", "autoscaling:*"]),
+                                                   "Provides full access to Amazon EC2 via the AWS Management Console."),
+        ("AmazonEC2ReadOnlyAccess",      _svc(["ec2:Describe*", "elasticloadbalancing:Describe*", "cloudwatch:ListMetrics", "cloudwatch:GetMetricStatistics", "cloudwatch:Describe*", "autoscaling:Describe*"]),
+                                                   "Provides read only access to Amazon EC2 via the AWS Management Console."),
+        ("AmazonSSMManagedInstanceCore", _svc(["ssm:DescribeAssociation", "ssm:GetDocument", "ssm:UpdateInstanceInformation", "ec2messages:*", "ssmmessages:*"]),
+                                                   "The policy for Amazon EC2 Role to enable AWS Systems Manager service core functionality."),
+        # DynamoDB.
+        ("AmazonDynamoDBFullAccess",     _svc(["dynamodb:*", "dax:*", "application-autoscaling:*Scaling*", "cloudwatch:DescribeAlarms", "cloudwatch:GetMetricStatistics"]),
+                                                   "Provides full access to Amazon DynamoDB via the AWS Management Console."),
+        # Lambda execution roles.
+        ("AWSLambdaBasicExecutionRole",  _svc(["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"]),
+                                                   "Provides write permissions to CloudWatch Logs."),
+        ("AWSLambdaVPCAccessExecutionRole", _svc(["ec2:CreateNetworkInterface", "ec2:DescribeNetworkInterfaces", "ec2:DeleteNetworkInterface", "logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"]),
+                                                   "Provides minimum permissions for a Lambda function to execute while accessing a resource within a VPC."),
+        # Messaging.
+        ("AmazonSQSFullAccess",          _svc(["sqs:*"]),
+                                                   "Provides full access to Amazon SQS via the AWS Management Console."),
+        ("AmazonSNSFullAccess",          _svc(["sns:*"]),
+                                                   "Provides full access to Amazon SNS via the AWS Management Console."),
+        # ECS.
+        ("AmazonECSTaskExecutionRolePolicy", _svc(["ecr:GetAuthorizationToken", "ecr:BatchCheckLayerAvailability", "ecr:GetDownloadUrlForLayer", "ecr:BatchGetImage", "logs:CreateLogStream", "logs:PutLogEvents"]),
+                                                   "Provides access to other AWS service resources that are required to run Amazon ECS tasks."),
+        # CloudWatch.
+        ("CloudWatchAgentServerPolicy",  _svc(["cloudwatch:PutMetricData", "ec2:DescribeVolumes", "ec2:DescribeTags", "logs:PutLogEvents", "logs:DescribeLogStreams", "logs:DescribeLogGroups", "logs:CreateLogStream", "logs:CreateLogGroup"]),
+                                                   "Permissions required to use AmazonCloudWatchAgent on servers."),
+        ("CloudWatchLogsFullAccess",     _svc(["logs:*"]),
+                                                   "Provides full access to CloudWatch Logs."),
+        # CloudFormation.
+        ("AWSCloudFormationFullAccess",  _svc(["cloudformation:*"]),
+                                                   "Provides access to AWS CloudFormation via the AWS Management Console."),
+    ]
+    for name, document, description in seeds:
+        _aws_managed_policies[f"{_AWS_MANAGED_POLICY_PREFIX}{name}"] = _make_aws_managed_record(
+            name, document, description,
+        )
+
+
 # ── Persistence ────────────────────────────────────────────
 
 def get_state():
@@ -295,6 +477,10 @@ def _create_policy(p):
     name = _p(p, "PolicyName")
     path = _p(p, "Path") or "/"
     arn = f"arn:aws:iam::{get_account_id()}:policy{path}{name}" if path != "/" else f"arn:aws:iam::{get_account_id()}:policy/{name}"
+    if _is_aws_managed_arn(arn):
+        return _error(400, "InvalidInput",
+                      "Cannot create customer-managed policies under the reserved AWS-managed account.",
+                      ns="iam")
     if arn in _policies:
         return _error(409, "EntityAlreadyExists",
                       f"A policy called {name} already exists.", ns="iam")
@@ -332,7 +518,7 @@ def _create_policy(p):
 
 def _get_policy(p):
     arn = _p(p, "PolicyArn")
-    if arn not in _policies:
+    if not _policy_exists(arn):
         return _error(404, "NoSuchEntity",
                       f"Policy {arn} not found.", ns="iam")
     return _xml(200, "GetPolicyResponse",
@@ -343,7 +529,7 @@ def _get_policy(p):
 def _get_policy_version(p):
     arn = _p(p, "PolicyArn")
     vid = _p(p, "VersionId")
-    pol = _policies.get(arn)
+    pol = _lookup_policy(arn)
     if not pol:
         return _error(404, "NoSuchEntity", "Policy not found.", ns="iam")
     ver = pol["Versions"].get(vid)
@@ -364,7 +550,7 @@ def _get_policy_version(p):
 
 def _list_policy_versions(p):
     arn = _p(p, "PolicyArn")
-    pol = _policies.get(arn)
+    pol = _lookup_policy(arn)
     if not pol:
         return _error(404, "NoSuchEntity", "Policy not found.", ns="iam")
     members = ""
@@ -381,6 +567,10 @@ def _list_policy_versions(p):
 
 def _create_policy_version(p):
     arn = _p(p, "PolicyArn")
+    if _is_aws_managed_arn(arn):
+        return _error(403, "AccessDenied",
+                      f"Cannot create a new version on AWS-managed policy {arn}.",
+                      ns="iam")
     pol = _policies.get(arn)
     if not pol:
         return _error(404, "NoSuchEntity", "Policy not found.", ns="iam")
@@ -415,6 +605,10 @@ def _create_policy_version(p):
 def _delete_policy_version(p):
     arn = _p(p, "PolicyArn")
     vid = _p(p, "VersionId")
+    if _is_aws_managed_arn(arn):
+        return _error(403, "AccessDenied",
+                      f"Cannot delete versions of AWS-managed policy {arn}.",
+                      ns="iam")
     pol = _policies.get(arn)
     if not pol:
         return _error(404, "NoSuchEntity", "Policy not found.", ns="iam")
@@ -433,12 +627,18 @@ def _list_policies(p):
     scope = _p(p, "Scope") or "All"
     prefix = _p(p, "PathPrefix") or "/"
     members = ""
-    for arn, pol in _policies.items():
-        if not pol.get("Path", "/").startswith(prefix):
-            continue
-        if scope == "Local" and arn.startswith("arn:aws:iam::aws:"):
-            continue
-        members += f"<member>{_managed_policy_xml(arn)}</member>"
+    # Customer-managed policies — always returned unless scope == "AWS".
+    if scope != "AWS":
+        for arn, pol in _policies.items():
+            if not pol.get("Path", "/").startswith(prefix):
+                continue
+            members += f"<member>{_managed_policy_xml(arn)}</member>"
+    # AWS-managed policies — returned for scope "All" or "AWS".
+    if scope != "Local":
+        for arn, pol in _aws_managed_policies.items():
+            if not pol.get("Path", "/").startswith(prefix):
+                continue
+            members += f"<member>{_managed_policy_xml(arn)}</member>"
     return _xml(200, "ListPoliciesResponse",
                 f"<ListPoliciesResult><Policies>{members}</Policies>"
                 "<IsTruncated>false</IsTruncated></ListPoliciesResult>",
@@ -447,6 +647,9 @@ def _list_policies(p):
 
 def _delete_policy(p):
     arn = _p(p, "PolicyArn")
+    if _is_aws_managed_arn(arn):
+        return _error(403, "AccessDenied",
+                      f"Cannot delete AWS-managed policy {arn}.", ns="iam")
     if arn not in _policies:
         return _error(404, "NoSuchEntity", f"Policy {arn} not found.", ns="iam")
     pol = _policies[arn]
@@ -461,7 +664,7 @@ def _delete_policy(p):
 
 def _list_entities_for_policy(p):
     arn = _p(p, "PolicyArn")
-    if arn not in _policies:
+    if not _policy_exists(arn):
         return _error(404, "NoSuchEntity", f"Policy {arn} not found.", ns="iam")
     entity_filter = _p(p, "EntityFilter") or ""
     path_prefix = _p(p, "PathPrefix") or "/"
@@ -514,6 +717,9 @@ def _attach_role_policy(p):
                       f"Role {role_name} not found.", ns="iam")
     if policy_arn not in role["AttachedPolicies"]:
         role["AttachedPolicies"].append(policy_arn)
+        # AttachmentCount is tracked on customer-managed policies only;
+        # AWS-managed records are shared across sessions and treated as
+        # read-only for counter purposes.
         pol = _policies.get(policy_arn)
         if pol:
             pol["AttachmentCount"] = pol.get("AttachmentCount", 0) + 1
@@ -545,7 +751,7 @@ def _list_attached_role_policies(p):
                       f"Role {role_name} not found.", ns="iam")
     members = ""
     for arn in role["AttachedPolicies"]:
-        pol = _policies.get(arn)
+        pol = _lookup_policy(arn)
         pname = pol["PolicyName"] if pol else arn.rsplit("/", 1)[-1]
         members += (f"<member><PolicyName>{pname}</PolicyName>"
                     f"<PolicyArn>{arn}</PolicyArn></member>")
@@ -668,7 +874,7 @@ def _list_attached_user_policies(p):
                       f"The user with name {user_name} cannot be found.", ns="iam")
     members = ""
     for arn in user["AttachedPolicies"]:
-        pol = _policies.get(arn)
+        pol = _lookup_policy(arn)
         pname = pol["PolicyName"] if pol else arn.rsplit("/", 1)[-1]
         members += (f"<member><PolicyName>{pname}</PolicyName>"
                     f"<PolicyArn>{arn}</PolicyArn></member>")
@@ -1318,6 +1524,9 @@ def _delete_oidc_provider(p):
 
 def _tag_policy(p):
     arn = _p(p, "PolicyArn")
+    if _is_aws_managed_arn(arn):
+        return _error(403, "AccessDenied",
+                      f"Cannot tag AWS-managed policy {arn}.", ns="iam")
     pol = _policies.get(arn)
     if not pol:
         return _error(404, "NoSuchEntity",
@@ -1332,6 +1541,9 @@ def _tag_policy(p):
 
 def _untag_policy(p):
     arn = _p(p, "PolicyArn")
+    if _is_aws_managed_arn(arn):
+        return _error(403, "AccessDenied",
+                      f"Cannot untag AWS-managed policy {arn}.", ns="iam")
     pol = _policies.get(arn)
     if not pol:
         return _error(404, "NoSuchEntity",
@@ -1343,7 +1555,7 @@ def _untag_policy(p):
 
 def _list_policy_tags(p):
     arn = _p(p, "PolicyArn")
-    pol = _policies.get(arn)
+    pol = _lookup_policy(arn)
     if not pol:
         return _error(404, "NoSuchEntity",
                       f"Policy {arn} not found.", ns="iam")
@@ -1466,7 +1678,7 @@ def _role_xml(name):
 
 
 def _managed_policy_xml(arn):
-    pol = _policies[arn]
+    pol = _lookup_policy(arn)
     # Description is omitted when empty to match real AWS (#438).
     description = pol.get("Description") or ""
     description_xml = f"<Description>{description}</Description>" if description else ""
@@ -1625,3 +1837,14 @@ def reset():
     _user_inline_policies.clear()
     _oidc_providers.clear()
     _service_linked_role_deletion_tasks.clear()
+    # Re-seed AWS-managed policies. They're not customer state, so a
+    # reset call should restore the canonical set rather than leave the
+    # store empty.
+    _aws_managed_policies.clear()
+    _seed_aws_managed_policies()
+
+
+# Populate AWS-managed policies after all helper definitions are in
+# scope (``_make_aws_managed_record`` references ``_now`` / ``_gen_id``
+# defined further down).
+_seed_aws_managed_policies()

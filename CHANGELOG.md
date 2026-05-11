@@ -13,6 +13,8 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 - **Cost & Usage Reports** — 7 of 7 CUR API actions supported.
+- **IAM AWS-managed policies (`arn:aws:iam::aws:policy/<Name>`)** — real AWS hosts AWS-managed policies under a virtual `aws` account that every customer can read regardless of their own session account. MiniStack stored every policy in `AccountScopedDict`, keyed by `(caller_account, arn)`, so a 12-digit-numeric session could never resolve them — `GetPolicy` returned `NoSuchEntity` and Terraform's `data "aws_iam_policy" { arn = "arn:aws:iam::aws:policy/AdministratorAccess" }` (and every other consumer that references AWS-managed ARNs) failed. AWS-managed policies are now held in a separate non-account-scoped store, pre-seeded with ~20 of the most commonly referenced policies (`AdministratorAccess`, `ReadOnlyAccess`, `PowerUserAccess`, `SecurityAudit`, `IAMFullAccess`, `AmazonS3FullAccess`, `AmazonEC2FullAccess`, `AmazonDynamoDBFullAccess`, `AWSLambdaBasicExecutionRole`, `AWSLambdaVPCAccessExecutionRole`, `AmazonSSMManagedInstanceCore`, `AmazonSQSFullAccess`, `AmazonSNSFullAccess`, `AmazonECSTaskExecutionRolePolicy`, `CloudWatchAgentServerPolicy`, `CloudWatchLogsFullAccess`, `AWSCloudFormationFullAccess`, `IAMReadOnlyAccess`, `AmazonS3ReadOnlyAccess`, `AmazonEC2ReadOnlyAccess`). Unknown AWS-managed ARNs are autovivified with a permissive stub on first `GetPolicy` (opt out with `MINISTACK_AUTOCREATE_AWS_MANAGED=0`). `ListPolicies` respects `Scope=All`/`AWS`/`Local`, attach / detach to roles and users works against any AWS-managed ARN, and mutation operations (`CreatePolicy` into the `aws` namespace, `DeletePolicy`, `TagPolicy`, `UntagPolicy`, `CreatePolicyVersion`, `DeletePolicyVersion`) return `AccessDenied` / `InvalidInput` to match real-AWS parity.
+
 ## [1.3.35] — 2026-05-11
 
 ### Fixed
@@ -22,6 +24,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 
 ---
+
 
 ## [1.3.34] — 2026-05-11
 

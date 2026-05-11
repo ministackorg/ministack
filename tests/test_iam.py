@@ -454,3 +454,115 @@ def test_iam_list_entities_for_policy(iam):
     resp3 = iam.list_entities_for_policy(PolicyArn=policy_arn, EntityFilter="Role")
     assert len(resp3["PolicyRoles"]) >= 1
     assert len(resp3.get("PolicyUsers", [])) == 0
+
+
+# -- AWS-managed policies (arn:aws:iam::aws:policy/<Name>) -----------------
+#
+# AWS-managed policies live under a virtual ``aws`` account that every
+# customer can read regardless of their own session account. These
+# tests cover the global store and its interaction with role/user
+# attachment, ListPolicies scoping, and mutation rejection.
+
+_ADMIN_ARN = "arn:aws:iam::aws:policy/AdministratorAccess"
+
+
+def test_iam_get_aws_managed_policy_administrator_access(iam):
+    """GetPolicy must succeed for a seeded AWS-managed policy even
+    though no session can authenticate as the ``aws`` virtual account."""
+    resp = iam.get_policy(PolicyArn=_ADMIN_ARN)
+    assert resp["Policy"]["PolicyName"] == "AdministratorAccess"
+    assert resp["Policy"]["Arn"] == _ADMIN_ARN
+    assert resp["Policy"]["DefaultVersionId"] == "v1"
+
+
+def test_iam_get_aws_managed_policy_version_returns_document(iam):
+    resp = iam.get_policy_version(PolicyArn=_ADMIN_ARN, VersionId="v1")
+    doc = resp["PolicyVersion"]["Document"]
+    # boto3 deserialises PolicyDocument; stringify before checking.
+    assert "Allow" in json.dumps(doc)
+
+
+def test_iam_list_policies_scope_all_includes_aws_managed(iam):
+    resp = iam.list_policies(Scope="All")
+    arns = [p["Arn"] for p in resp["Policies"]]
+    assert _ADMIN_ARN in arns
+
+
+def test_iam_list_policies_scope_aws_returns_only_aws_managed(iam):
+    # Seed a customer-managed policy so we can prove it's filtered out.
+    doc = json.dumps({"Version": "2012-10-17",
+                      "Statement": [{"Effect": "Allow", "Action": "*", "Resource": "*"}]})
+    name = f"awsmgd-filter-cust-{_uuid_mod.uuid4().hex[:8]}"
+    cust = iam.create_policy(PolicyName=name, PolicyDocument=doc)["Policy"]["Arn"]
+    try:
+        resp = iam.list_policies(Scope="AWS")
+        arns = [p["Arn"] for p in resp["Policies"]]
+        assert _ADMIN_ARN in arns
+        assert all(a.startswith("arn:aws:iam::aws:") for a in arns)
+        assert cust not in arns
+    finally:
+        iam.delete_policy(PolicyArn=cust)
+
+
+def test_iam_list_policies_scope_local_excludes_aws_managed(iam):
+    resp = iam.list_policies(Scope="Local")
+    arns = [p["Arn"] for p in resp["Policies"]]
+    assert all(not a.startswith("arn:aws:iam::aws:") for a in arns)
+
+
+def test_iam_attach_aws_managed_policy_to_role(iam):
+    """The original motivating use case: terraform attaches an
+    AWS-managed policy by ARN to a customer role."""
+    role_name = f"awsmgd-role-{_uuid_mod.uuid4().hex[:8]}"
+    iam.create_role(
+        RoleName=role_name,
+        AssumeRolePolicyDocument=json.dumps({"Version": "2012-10-17", "Statement": []}),
+    )
+    try:
+        iam.attach_role_policy(RoleName=role_name, PolicyArn=_ADMIN_ARN)
+        attached = iam.list_attached_role_policies(RoleName=role_name)["AttachedPolicies"]
+        names = [p["PolicyName"] for p in attached]
+        arns = [p["PolicyArn"] for p in attached]
+        assert "AdministratorAccess" in names
+        assert _ADMIN_ARN in arns
+        iam.detach_role_policy(RoleName=role_name, PolicyArn=_ADMIN_ARN)
+    finally:
+        iam.delete_role(RoleName=role_name)
+
+
+def test_iam_cannot_create_policy_under_aws_account(iam, monkeypatch):
+    """Customer code must never be able to author into the AWS-managed
+    namespace. Real AWS rejects this with InvalidInput."""
+    # We can't change the session account at request time from boto3,
+    # so this test is best-effort: we ensure a normal CreatePolicy
+    # response still lands under the session account, not under ``aws``.
+    doc = json.dumps({"Version": "2012-10-17",
+                      "Statement": [{"Effect": "Allow", "Action": "*", "Resource": "*"}]})
+    name = f"awsmgd-bounds-{_uuid_mod.uuid4().hex[:8]}"
+    resp = iam.create_policy(PolicyName=name, PolicyDocument=doc)
+    try:
+        assert not resp["Policy"]["Arn"].startswith("arn:aws:iam::aws:")
+    finally:
+        iam.delete_policy(PolicyArn=resp["Policy"]["Arn"])
+
+
+def test_iam_cannot_delete_aws_managed_policy(iam):
+    with pytest.raises(ClientError) as exc:
+        iam.delete_policy(PolicyArn=_ADMIN_ARN)
+    assert exc.value.response["Error"]["Code"] == "AccessDenied"
+
+
+def test_iam_cannot_tag_aws_managed_policy(iam):
+    with pytest.raises(ClientError) as exc:
+        iam.tag_policy(PolicyArn=_ADMIN_ARN, Tags=[{"Key": "k", "Value": "v"}])
+    assert exc.value.response["Error"]["Code"] == "AccessDenied"
+
+
+def test_iam_unknown_aws_managed_policy_is_autocreated(iam):
+    """For AWS-managed ARNs we don't pre-seed, GetPolicy autovivifies a
+    permissive stub so terraform plans still complete. Strict mode is
+    opt-in via MINISTACK_AUTOCREATE_AWS_MANAGED=0."""
+    arn = "arn:aws:iam::aws:policy/AmazonEKSClusterPolicy"
+    resp = iam.get_policy(PolicyArn=arn)
+    assert resp["Policy"]["Arn"] == arn
+    assert resp["Policy"]["PolicyName"] == "AmazonEKSClusterPolicy"
