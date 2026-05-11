@@ -37,6 +37,7 @@ from urllib.parse import quote as url_quote
 from urllib.parse import unquote as url_unquote
 from xml.etree.ElementTree import Element, SubElement, tostring
 from xml.sax.saxutils import escape as _esc
+import fnmatch
 
 from defusedxml.ElementTree import fromstring
 
@@ -408,6 +409,27 @@ async def handle_request(
 ) -> tuple:
     bucket, key = _parse_bucket_key(path, headers)
 
+    # Enforce bucket-policy Deny statements before dispatch.
+    if bucket:
+        # Policy management always escapes — otherwise a deny-all bricks the bucket.
+        if "policy" in query_params and method in ("GET", "PUT", "DELETE"):
+            action = None
+        else:
+            action_map = {
+                "GET":    "s3:GetObject" if key else "s3:ListBucket",
+                "HEAD":   "s3:GetObject" if key else "s3:ListBucket",
+                "PUT":    "s3:PutObject" if key else "s3:CreateBucket",
+                "POST":   "s3:PutObject",
+                "DELETE": "s3:DeleteObject" if key else "s3:DeleteBucket",
+            }
+            action = action_map.get(method)
+        if action:
+            denied = _check_bucket_policy(bucket, action, key)
+            if denied:
+                status, h, body_out = denied
+                h.setdefault("x-amz-request-id", new_uuid())
+                return status, h, body_out
+
     result = _dispatch(method, bucket, key, headers, body, query_params)
 
     status, resp_headers, resp_body = result
@@ -749,6 +771,54 @@ def _delete_bucket_policy(name: str):
         return _no_such_bucket(name)
     _bucket_policies.pop(name, None)
     return 204, {}, b""
+
+# ---------------------------------------------------------------------------
+# Bucket-policy enforcement (minimal: explicit Deny only)
+# ---------------------------------------------------------------------------
+
+
+def _check_bucket_policy(bucket_name: str, action: str, key: str = ""):
+    """Return an _error tuple if a Deny statement matches the request, else None.
+
+    Honors only Effect=Deny on Action + Resource. Conditions, Principal
+    scoping, and Allow logic are not implemented — everything not explicitly
+    denied is allowed (bucket-owner default).
+    """
+    raw = _bucket_policies.get(bucket_name)
+    if not raw:
+        return None
+    try:
+        policy = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return None
+
+    statements = policy.get("Statement", [])
+    if isinstance(statements, dict):
+        statements = [statements]
+
+    bucket_arn = f"arn:aws:s3:::{bucket_name}"
+    object_arn = f"arn:aws:s3:::{bucket_name}/{key}" if key else bucket_arn
+
+    for stmt in statements:
+        if stmt.get("Effect") != "Deny":
+            continue
+        actions = stmt.get("Action", [])
+        if isinstance(actions, str):
+            actions = [actions]
+        if not any(fnmatch.fnmatchcase(action, a) for a in actions):
+            continue
+        resources = stmt.get("Resource", [])
+        if isinstance(resources, str):
+            resources = [resources]
+        if any(fnmatch.fnmatchcase(c, r)
+               for r in resources for c in (bucket_arn, object_arn)):
+            return _error(
+                "AccessDenied",
+                "User is not authorized to perform this action on the resource.",
+                403,
+                f"/{bucket_name}/{key}" if key else f"/{bucket_name}",
+            )
+    return None
 
 
 def _get_bucket_versioning(name: str):
