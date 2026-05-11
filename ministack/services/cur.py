@@ -5,7 +5,7 @@ JSON 1.1 protocol with X-Amz-Target prefix ``AWSOrigamiServiceGateway``.
 
 Implemented:
   DeleteReportDefinition, DescribeReportDefinitions, ListTagsForResource,
-  ModifyReportDefinition, PutReportDefinition.
+  ModifyReportDefinition, PutReportDefinition, TagResource, UntagResource.
 
 Deferred:
   None.
