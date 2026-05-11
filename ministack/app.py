@@ -892,24 +892,34 @@ async def _handle_ses_v2_request(method: str, path: str, headers: dict, body: by
     return await _get_module("ses_v2").handle_request(method, path, headers, body, query_params)
 
 
+def _is_ecr_registry_path(path: str) -> bool:
+    """Return True iff `path` is a Docker Registry HTTP API V2 endpoint.
+
+    Shares the `/v2/` prefix with API Gateway v2 (`/v2/apis/...`,
+    `/v2/tags/{arn}`), AppSync Events (`/v2/apis`), and SES v2 (`/v2/email/...`).
+    Registry paths are distinguished by `/blobs/`, `/manifests/`, or the
+    `/tags/list` suffix — none appear in any other `/v2/*` consumer.
+    """
+    if path in ("/v2", "/v2/", "/v2/_catalog"):
+        return True
+    if not path.startswith("/v2/") or path.startswith(_SES_V2_PREFIX):
+        return False
+    return "/blobs/" in path or "/manifests/" in path or path.endswith("/tags/list")
+
+
 async def _handle_ecr_registry_request(method: str, path: str, headers: dict, body: bytes, query_params: dict):
     """Handle Docker Registry HTTP API V2 requests (`docker push`/`docker pull`).
 
-    Real ECR exposes the V2 protocol on the same endpoint as the AWS API. The
-    registry paths (`/v2/`, `/v2/_catalog`, `/v2/<repo>/blobs/...`,
-    `/v2/<repo>/manifests/...`, `/v2/<repo>/tags/list`) collide with S3's
-    path-style addressing (`/<bucket>/<key>`), so this handler must run
-    *before* the generic router, after the SES v2 carve-out (`/v2/email...`).
+    Real ECR exposes the V2 protocol on the same endpoint as the AWS API. We
+    must run this before the generic router so the path doesn't fall through
+    to S3 path-style addressing. The shape check above keeps every other
+    `/v2/...` consumer (apigwv2, AppSync Events, SES v2) untouched.
     """
-    if not path.startswith("/v2"):
+    if not _is_ecr_registry_path(path):
         return None
-    if path == "/v2" or path.startswith("/v2/"):
-        if path.startswith(_SES_V2_PREFIX):
-            return None
-        return await _get_module("ecr").handle_registry_request(
-            method, path, headers, body, query_params
-        )
-    return None
+    return await _get_module("ecr").handle_registry_request(
+        method, path, headers, body, query_params
+    )
 
 
 def _parse_execute_api_url(host: str, path: str) -> tuple[str, str, str] | None:

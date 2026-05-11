@@ -400,6 +400,22 @@ def test_v2_cancel_upload(ecr):
     assert r.status_code == 404
 
 
+def test_v2_apis_path_still_routes_to_apigwv2():
+    """Regression: `/v2/apis/...` is the API Gateway v2 management API, not ECR.
+    Earlier iteration of the registry routing hijacked every `/v2/*` path and
+    broke 60+ apigwv2 tests in CI."""
+    apigwv2 = boto3.client(
+        "apigatewayv2",
+        endpoint_url=ENDPOINT,
+        region_name=REGION,
+        aws_access_key_id="test",
+        aws_secret_access_key="test",
+    )
+    api = apigwv2.create_api(Name="v2-routing-regression-" + _uuid_mod.uuid4().hex[:8], ProtocolType="HTTP")
+    assert "ApiId" in api
+    apigwv2.delete_api(ApiId=api["ApiId"])
+
+
 def test_v2_email_path_still_routes_to_ses(ses):
     """The SES v2 carve-out (`/v2/email/...`) must NOT be hijacked by ECR."""
     # boto3 SES v2 client uses /v2/email/identities under the hood — verify the
