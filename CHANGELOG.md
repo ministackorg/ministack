@@ -7,6 +7,10 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [Unreleased]
+
+### Added
+- **Cost & Usage Reports** — 7 of 7 CUR API actions supported.
 ## [1.3.35] — 2026-05-11
 
 ### Fixed
@@ -423,7 +427,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 ## [1.3.6] — 2026-04-20
 
 ### Added
-- **API Gateway path-based data plane** — REST + HTTP + WebSocket APIs are now reachable without `*.execute-api.localhost` Host overrides: `http(s)://localhost:4566/_aws/execute-api/{apiId}/{stage}/{path}` (v1 + v2 HTTP + v2 WS) and the LocalStack-legacy `http://localhost:4566/restapis/{apiId}/{stage}/_user_request_/{path}` (v1). Unblocks macOS browsers (no `*.localhost` DNS resolution) and strict HTTP clients with no Host override. 
+- **API Gateway path-based data plane** — REST + HTTP + WebSocket APIs are now reachable without `*.execute-api.localhost` Host overrides: `http(s)://localhost:4566/_aws/execute-api/{apiId}/{stage}/{path}` (v1 + v2 HTTP + v2 WS) and the LocalStack-legacy `http://localhost:4566/restapis/{apiId}/{stage}/_user_request_/{path}` (v1). Unblocks macOS browsers (no `*.localhost` DNS resolution) and strict HTTP clients with no Host override.
 - **Custom/predictable API Gateway IDs** — `aws_apigatewayv2_api` and `aws_apigateway_rest_api` honour an `ms-custom-id` tag on `CreateApi` / `CreateRestApi` and pin the generated `apiId` / REST API id to the tag value. Duplicates in the same account return `ConflictException` (409). The LocalStack `ls-custom-id` tag is intentionally rejected with a clear `BadRequestException` (400) pointing callers at the ministack-native key. Reported by @whittin3. Fixes #400
 - **Cognito `AWS::Cognito::UserPoolClient` CFN `GenerateSecret`** — CloudFormation-provisioned user pool clients now generate a client secret when `GenerateSecret: true`, matching the native Cognito API path. Contributed by @mgius-ae (#403)
 
@@ -664,7 +668,7 @@ These services stored per-tenant data in plain `dict` / `list`, so `List*` / `De
 ## [1.2.18] — 2026-04-15
 
 ### Fixed
-- **ECS services/tasks invisible when created via CloudFormation** — CF provisioner stored services with ARN keys instead of `cluster/name`, causing `list-services` and `list-tasks` to return empty. Fixed key format, added task spawning on service create/update/delete, and replaced stale tasks on task definition updates. CF provisioner now delegates to the ECS module for a single code path. Reported by @Vagator-Prostovich 
+- **ECS services/tasks invisible when created via CloudFormation** — CF provisioner stored services with ARN keys instead of `cluster/name`, causing `list-services` and `list-tasks` to return empty. Fixed key format, added task spawning on service create/update/delete, and replaced stale tasks on task definition updates. CF provisioner now delegates to the ECS module for a single code path. Reported by @Vagator-Prostovich
 - **ECS CF container definitions PascalCase mismatch** — CloudFormation container definitions used PascalCase keys (`Name`, `Image`, `PortMappings`) but the ECS runtime expected camelCase, causing `KeyError` when spawning tasks. Added `_normalize_container_defs` to convert keys.
 - **ECS `_task_def_latest` stored string instead of integer** — CF provisioner stored `"family:1"` instead of `1`, producing malformed keys like `"family:family:1"` on subsequent registrations.
 - **ECS CF task definition and service delete used wrong keys** — delete handlers used ARN but dicts were keyed by `family:revision` and `cluster/name` respectively.
@@ -712,7 +716,7 @@ These services stored per-tenant data in plain `dict` / `list`, so `List*` / `De
 - **EC2 AuthorizeSecurityGroup returns rules** — `AuthorizeSecurityGroupIngress` and `AuthorizeSecurityGroupEgress` now return `SecurityGroupRules` in the response with rule IDs, group ownership, protocol, port range, and CIDR details. Required by Terraform AWS provider v6. Reported by @mspiller (#325)
 
 ### Fixed
-- **Cognito token claims correctness** — `origin_jti` and `auth_time` claims are now only included in `IdToken` and `AccessToken` (not `RefreshToken`), matching real AWS Cognito behavior. Refresh tokens use minimal claims with only `client_id`. 
+- **Cognito token claims correctness** — `origin_jti` and `auth_time` claims are now only included in `IdToken` and `AccessToken` (not `RefreshToken`), matching real AWS Cognito behavior. Refresh tokens use minimal claims with only `client_id`.
 
 ---
 
@@ -796,7 +800,7 @@ These services stored per-tenant data in plain `dict` / `list`, so `List*` / `De
 ## [1.2.7] — 2026-04-12
 
 ### Added
-- **EC2 CreateDefaultVpc** — new action creates a default VPC with all associated resources (3 default subnets, internet gateway, route table, network ACL, security group), matching real AWS behavior. Returns `DefaultVpcAlreadyExists` if one already exists. Reported by @staranto 
+- **EC2 CreateDefaultVpc** — new action creates a default VPC with all associated resources (3 default subnets, internet gateway, route table, network ACL, security group), matching real AWS behavior. Returns `DefaultVpcAlreadyExists` if one already exists. Reported by @staranto
 - **DynamoDB ExecuteStatement (PartiQL)** — supports `SELECT`, `INSERT`, `UPDATE`, `DELETE` PartiQL statements with `?` parameter binding. Enables IntelliJ database integration and other PartiQL-based tooling. Reported by @mspiller
 - **SNS FIFO topic support** — `.fifo` naming validation, `MessageGroupId`/`MessageDeduplicationId` enforcement, 5-minute deduplication window, sequence numbers, content-based deduplication, FIFO SQS subscription validation, `PublishBatch` FIFO support, thread-safe dedup cache. Contributed by @yskarparis (#279)
 
@@ -1062,7 +1066,7 @@ and reference by the sha256 over the code image. In the future this should be a 
 - **RDS Data API service** — `ExecuteStatement`, `BatchExecuteStatement`, `BeginTransaction`, `CommitTransaction`, `RollbackTransaction`. Routes SQL to the real database containers MiniStack spins up for RDS instances. Supports both MySQL and PostgreSQL engines. Contributed by @jayjanssen (#193)
 
 ### Fixed
-- **CDK deploy "implicit NaN" deserialization error** — the CloudFormation SSM provisioner stored `LastModifiedDate` as an ISO 8601 string instead of a Unix epoch float. The JS SDK v3 (bundled in CDK CLI) uses `AwsJson1_1Protocol` for SSM and calls `parseEpochTimestamp()` on the value, which expects a number. `cdk deploy` would fail immediately after bootstrap when checking the SSM bootstrap version parameter. Reported by @youngkwangk @jolo-dev and @ben-shearlaw 
+- **CDK deploy "implicit NaN" deserialization error** — the CloudFormation SSM provisioner stored `LastModifiedDate` as an ISO 8601 string instead of a Unix epoch float. The JS SDK v3 (bundled in CDK CLI) uses `AwsJson1_1Protocol` for SSM and calls `parseEpochTimestamp()` on the value, which expects a number. `cdk deploy` would fail immediately after bootstrap when checking the SSM bootstrap version parameter. Reported by @youngkwangk @jolo-dev and @ben-shearlaw
 - **RDS Data API thread safety** — added `threading.Lock` to protect transaction state against concurrent access
 - **RDS Data API parameter binding** — `ExecuteStatement` and `BatchExecuteStatement` now convert RDS Data API `:name` parameters to DB-API parameterized queries instead of ignoring them
 - **RDS Data API connection leak** — connections are now properly closed on exceptions in non-transaction execute paths
@@ -1542,7 +1546,7 @@ Thanks to @moabukar for #104 (error handling, routing conflicts, persistence har
 - **Lambda handler validation** — returns proper `Runtime.InvalidEntrypoint` error if handler name has no `.` separator instead of crashing
 - **RDS error code** — `DBInstanceAlreadyExists` corrected to `DBInstanceAlreadyExistsFault` matching AWS error codes
 
-- Thanks to @lubond @jimmyd-be @abedurftig @mig_mit for reporting issues and testing                       
+- Thanks to @lubond @jimmyd-be @abedurftig @mig_mit for reporting issues and testing
 - Thanks to @jv2222 and @santiagodoldan for their massive contributions
 
 ### Tests
@@ -1706,7 +1710,7 @@ Thanks to @moabukar for #104 (error handling, routing conflicts, persistence har
 ## [1.1.7] — 2026-03-30
 
 ### Added
-- **Athena engine control** — new `ATHENA_ENGINE` env var (`auto` | `duckdb` | `mock`) to select the SQL backend at startup; `auto` keeps existing behaviour (DuckDB if installed, mock otherwise). New `/_ministack/config` endpoint accepts `POST {"athena.ATHENA_ENGINE": "mock"}` to switch engines at runtime without restart — useful in CI to force mock mode without DuckDB installed. 
+- **Athena engine control** — new `ATHENA_ENGINE` env var (`auto` | `duckdb` | `mock`) to select the SQL backend at startup; `auto` keeps existing behaviour (DuckDB if installed, mock otherwise). New `/_ministack/config` endpoint accepts `POST {"athena.ATHENA_ENGINE": "mock"}` to switch engines at runtime without restart — useful in CI to force mock mode without DuckDB installed.
 - **VPC gap coverage** — 6 new EC2 resource types, 22 new actions, 11 new tests
   - **NAT Gateways**: `CreateNatGateway`, `DescribeNatGateways`, `DeleteNatGateway` — supports `SubnetId`, `ConnectivityType` (public/private), state transitions, `vpc-id`/`subnet-id`/`state` filters
   - **Network ACLs**: `CreateNetworkAcl`, `DescribeNetworkAcls`, `DeleteNetworkAcl`, `CreateNetworkAclEntry`, `DeleteNetworkAclEntry`, `ReplaceNetworkAclEntry`, `ReplaceNetworkAclAssociation` — full CRUD with rule entries and subnet associations

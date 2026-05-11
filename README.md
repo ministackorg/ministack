@@ -379,6 +379,8 @@ subnet = ec2.create_subnet(
 | **CloudFront KeyValueStore (data plane)** | DescribeKeyValueStore, ListKeys, GetKey, PutKey, DeleteKey, UpdateKeys | Separate `cloudfront-keyvaluestore` SDK service (REST/JSON, signing name `cloudfront-keyvaluestore`); ETag-based optimistic concurrency on every mutating op; `UpdateKeys` is atomic (validates whole batch, rejects on first invalid entry); `ListKeys` paginates with opaque `NextToken` capped at 50 results per AWS spec; bridges to the management plane via the shared KVS ARN |
 | **CloudTrail** | LookupEvents, CreateTrail, DeleteTrail, GetTrail, DescribeTrails, ListTrails, UpdateTrail, GetTrailStatus, StartLogging, StopLogging, PutEventSelectors, GetEventSelectors, AddTags, ListTags, RemoveTags | In-memory audit log; recording opt-in via `CLOUDTRAIL_RECORDING=1` (or runtime config endpoint); per-account ring buffer (`CLOUDTRAIL_MAX_EVENTS=10000`); `LookupEvents` supports all 8 AWS `LookupAttributes`; `IsLogging` flips on Start/StopLogging |
 | **Resource Groups** | CreateGroup, GetGroup, DeleteGroup, UpdateGroup, ListGroups, GetGroupQuery, UpdateGroupQuery, GetGroupConfiguration, PutGroupConfiguration, GroupResources, UngroupResources, ListGroupResources, ListGroupingStatuses, SearchResources, Tag, Untag, GetTags, GetAccountSettings, UpdateAccountSettings | 19 of 23 spec ops; tag-sync ops omitted (not exposed by AWS CLI / Terraform); `Group` accepts bare name or full ARN |
+| **Cost & Usage Reports** | DeleteReportDefinition, DescribeReportDefinitions, ListTagsForResource, ModifyReportDefinition, PutReportDefinition, TagResource, UntagResource | 7 of 7 spec ops |
+
 
 ### CloudFormation
 
@@ -760,7 +762,7 @@ Install DuckDB for full Athena SQL compatibility: `pip install ministack[full]`.
 
 When `PERSIST_STATE=1`, MiniStack saves service state to `STATE_DIR` on shutdown and reloads it on startup. Writes are atomic (write-to-tmp then rename) to prevent corruption on crash.
 
-Services currently supporting persistence: **All services** — API Gateway v1/v2, ALB, ACM, AppConfig, AppSync, Athena, Cloud Map, CloudFront, CloudWatch, CloudWatch Logs, CodeBuild, Cognito, DynamoDB, EC2, ECR, ECS, EFS, EKS, ElastiCache, EMR, EventBridge, EventBridge Scheduler, Firehose, Glue, IAM/STS, Kinesis, KMS, Lambda, RDS, Route 53, S3, Secrets Manager, SES, SES v2, SNS, SQS, SSM, Step Functions, Transfer Family, WAF v2 
+Services currently supporting persistence: **All services** — API Gateway v1/v2, ALB, ACM, AppConfig, AppSync, Athena, Cloud Map, CloudFront, CloudWatch, CloudWatch Logs, CodeBuild, Cognito, DynamoDB, EC2, ECR, ECS, EFS, EKS, ElastiCache, EMR, EventBridge, EventBridge Scheduler, Firehose, Glue, IAM/STS, Kinesis, KMS, Lambda, RDS, Route 53, S3, Secrets Manager, SES, SES v2, SNS, SQS, SSM, Step Functions, Transfer Family, WAF v2
 
 ```bash
 docker run -p 4566:4566 \
