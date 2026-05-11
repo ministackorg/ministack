@@ -7,6 +7,13 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [Unreleased]
+
+### Added
+- **ECR Docker Registry HTTP API V2 (`docker push` / `docker pull`)** — the registry V2 wire protocol now coexists with the AWS API on the same gateway, matching real ECR's behaviour. Implements `GET /v2/` (version probe), `GET /v2/_catalog`, chunked blob upload (`POST` / `PATCH` / `PUT /v2/<name>/blobs/uploads/[<uuid>]`), single-shot blob upload (`POST /v2/<name>/blobs/uploads/?digest=...`), cross-repo blob mount (`POST /v2/<name>/blobs/uploads/?mount=<digest>&from=<other>`), `HEAD` / `GET` / `DELETE /v2/<name>/blobs/<digest>`, manifest `PUT` / `GET` / `HEAD` / `DELETE /v2/<name>/manifests/<reference>` (tag or digest), and `GET /v2/<name>/tags/list`. Layer bytes and manifest bytes are persisted across warm-boot under `PERSIST_STATE=1`; in-flight upload sessions are deliberately ephemeral (clients retry on 404, matching real registry semantics). A push via `docker push` becomes immediately visible to `aws ecr describe-images`, and tag mutability is honoured. Routing fix bundled: `/v2/<repo>/...` paths previously fell through to S3 path-style addressing and returned `405 Method Not Allowed` to the Docker daemon; the new pre-empt routes them to ECR before generic detection (the `/v2/email...` SES carve-out is preserved). Reported by @LeTrungNguyen1703.
+
+---
+
 ## [1.3.33] — 2026-05-09
 
 ### Added

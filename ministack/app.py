@@ -892,6 +892,26 @@ async def _handle_ses_v2_request(method: str, path: str, headers: dict, body: by
     return await _get_module("ses_v2").handle_request(method, path, headers, body, query_params)
 
 
+async def _handle_ecr_registry_request(method: str, path: str, headers: dict, body: bytes, query_params: dict):
+    """Handle Docker Registry HTTP API V2 requests (`docker push`/`docker pull`).
+
+    Real ECR exposes the V2 protocol on the same endpoint as the AWS API. The
+    registry paths (`/v2/`, `/v2/_catalog`, `/v2/<repo>/blobs/...`,
+    `/v2/<repo>/manifests/...`, `/v2/<repo>/tags/list`) collide with S3's
+    path-style addressing (`/<bucket>/<key>`), so this handler must run
+    *before* the generic router, after the SES v2 carve-out (`/v2/email...`).
+    """
+    if not path.startswith("/v2"):
+        return None
+    if path == "/v2" or path.startswith("/v2/"):
+        if path.startswith(_SES_V2_PREFIX):
+            return None
+        return await _get_module("ecr").handle_registry_request(
+            method, path, headers, body, query_params
+        )
+    return None
+
+
 def _parse_execute_api_url(host: str, path: str) -> tuple[str, str, str] | None:
     """Resolve an execute-api request into (api_id, stage, execute_path).
 
@@ -1101,6 +1121,8 @@ async def _handle_special_data_plane_request(
         return response
     if response := await _handle_ses_v2_request(method, path, headers, body, query_params):
         return response
+    if response := await _handle_ecr_registry_request(method, path, headers, body, query_params):
+        return _with_data_plane_headers(response, request_id)
 
     host = headers.get("host", "")
     if response := await _handle_execute_api_request(host, path, method, headers, body, query_params):
