@@ -856,6 +856,8 @@ aws --endpoint-url=http://localhost:4566 eks delete-cluster --name my-cluster
 
 > **Note:** EKS requires Docker socket access (`-v /var/run/docker.sock:/var/run/docker.sock`) to spawn k3s containers. The k3s image is pulled on first `CreateCluster` call.
 
+> **Security trade-off:** the k3s container is launched with `--privileged`. k3s server mode needs to remount `/sys/fs/cgroup`, which no granular Linux capability set permits — running unprivileged fails with `failed to evacuate root cgroup`. This grants the k3s container significant access on the Docker host. The trade-off is acceptable for local development against an emulator but should be considered before running MiniStack EKS on shared infrastructure. Omitting the Docker socket mount cleanly disables k3s and falls back to a static EKS mock.
+
 ### Lambda Warm Starts
 
 MiniStack keeps Python and Node.js Lambda functions warm between invocations. After the first call (cold start), the handler module stays loaded in a persistent subprocess. Subsequent calls skip the import/require step, matching real AWS warm-start behaviour and making test suites significantly faster.
