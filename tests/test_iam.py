@@ -609,3 +609,23 @@ def test_iam_aws_managed_attachment_count_is_per_account(iam):
         except ClientError:
             pass
         iam.delete_user(UserName=user)
+
+
+def test_iam_aws_managed_attachment_count_persists_through_state_round_trip():
+    """Regression for 1.3.36: the _aws_managed_attachment_counts sidecar
+    added with the AWS-managed policy work (1.3.36) was missing from
+    get_state/restore_state, so attachment counts on AWS-managed policies
+    reset to zero on every warm-boot."""
+    from ministack.services import iam as _iam
+
+    arn = "arn:aws:iam::aws:policy/AdministratorAccess"
+    _iam._aws_managed_attachment_counts.clear()
+    _iam._bump_aws_managed_attachment(arn, +2)
+    assert _iam._aws_managed_attachment_counts.get(arn) == 2
+
+    snapshot = _iam.get_state()
+    _iam._aws_managed_attachment_counts.clear()
+    assert _iam._aws_managed_attachment_counts.get(arn, 0) == 0
+
+    _iam.restore_state(snapshot)
+    assert _iam._aws_managed_attachment_counts.get(arn) == 2

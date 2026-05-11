@@ -299,3 +299,39 @@ def test_cur_untag_resource_nonexistent_keys(cur):
     tags = cur.list_tags_for_resource(ReportName=name)["Tags"]
     assert len(tags) == 2
     assert all(tag in tags for tag in test_tags)
+
+# -- Persistence ----------------------------------------------------------
+#
+# Regression for 1.3.36: the CUR module declared `get_state()` and
+# `restore_state()` but the load_state() call at import time was missing,
+# so MS wrote state on shutdown but never read it back on warm-boot.
+
+
+def test_cur_state_round_trips_through_get_and_restore():
+    from ministack.services import cur
+
+    cur.reset()
+    cur._report_definitions["r1"] = {
+        "ReportName": "r1",
+        "TimeUnit": "HOURLY",
+        "Format": "Parquet",
+        "S3Bucket": "billing",
+    }
+    cur._report_tags["r1"] = {"team": "finops"}
+
+    snapshot = cur.get_state()
+    cur.reset()
+    assert "r1" not in cur._report_definitions
+
+    cur.restore_state(snapshot)
+    assert cur._report_definitions["r1"]["S3Bucket"] == "billing"
+    assert cur._report_tags["r1"] == {"team": "finops"}
+
+
+def test_cur_module_calls_load_state_on_import():
+    """The bug we fixed: load_state was never invoked at import time, so
+    every warm-boot lost CUR state. Verify the module exposes _restored
+    (set by the import-time block whether or not anything was found)."""
+    from ministack.services import cur
+
+    assert hasattr(cur, "_restored")

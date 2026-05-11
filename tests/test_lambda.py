@@ -3362,3 +3362,11 @@ def test_account_from_arn_lambda_runtime_helper_matches():
         assert runtime_helper("") == "fallback_key"
         assert runtime_helper(None) == "fallback_key"
         assert runtime_helper("arn:aws:lambda") == "fallback_key"
+
+
+def test_lambda_ruby_4_0_runtime_maps_to_official_image():
+    """Lambda Ruby 4.0 runtime support (botocore 1.42.94 added the runtime).
+    Maps to AWS's official Lambda Ruby 4.0 base image."""
+    from ministack.services.lambda_svc import _RUNTIME_IMAGE_MAP
+
+    assert _RUNTIME_IMAGE_MAP.get("ruby4.0") == "public.ecr.aws/lambda/ruby:4.0"

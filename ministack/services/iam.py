@@ -268,6 +268,7 @@ def get_state():
         "oidc_providers": copy.deepcopy(_oidc_providers),
         "service_linked_role_deletion_tasks": copy.deepcopy(_service_linked_role_deletion_tasks),
         "user_inline_policies": copy.deepcopy(_user_inline_policies),
+        "aws_managed_attachment_counts": copy.deepcopy(_aws_managed_attachment_counts),
     }
 
 
@@ -282,6 +283,7 @@ def restore_state(data):
         _oidc_providers.update(data.get("oidc_providers", {}))
         _service_linked_role_deletion_tasks.update(data.get("service_linked_role_deletion_tasks", {}))
         _user_inline_policies.update(data.get("user_inline_policies", {}))
+        _aws_managed_attachment_counts.update(data.get("aws_managed_attachment_counts", {}))
 
 
 try:
