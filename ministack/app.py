@@ -96,7 +96,7 @@ _NON_S3_VHOST_NAMES = frozenset({
     "s3", "s3-control", "sqs", "sns", "dynamodb", "lambda", "iam", "sts",
     "secretsmanager", "logs", "ssm", "events", "kinesis", "monitoring", "ses",
     "states", "ecs", "rds", "rds-data", "elasticache", "glue", "athena",
-    "apigateway", "cloudformation", "autoscaling", "codebuild", "transfer",
+    "apigateway", "cloudformation", "autoscaling", "codebuild", "transfer", "cur",
     "cloudfront-kvs",
     "appsync-api", "appsync-realtime-api",
 })
@@ -252,6 +252,7 @@ SERVICE_REGISTRY = {
     "waf-regional": {"module": "waf_v1"},
     "wafv2": {"module": "waf"},
     "cloudtrail": {"module": "cloudtrail"},
+    "cur": {"module": "cur"},
 }
 
 SERVICE_HANDLERS = {
