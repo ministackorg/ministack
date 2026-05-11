@@ -526,6 +526,196 @@ def test_s3_bucket_policy(s3):
     assert stored["Version"] == "2012-10-17"
     assert len(stored["Statement"]) == 1
 
+
+def _deny_all_policy(bkt: str) -> str:
+    return json.dumps({
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Sid": "DenyAll",
+            "Effect": "Deny",
+            "Principal": "*",
+            "Action": "s3:*",
+            "Resource": [f"arn:aws:s3:::{bkt}", f"arn:aws:s3:::{bkt}/*"],
+        }],
+    })
+
+
+def test_s3_policy_deny_blocks_get_object(s3):
+    bkt = "intg-s3-policy-deny-get"
+    s3.create_bucket(Bucket=bkt)
+    s3.put_object(Bucket=bkt, Key="secret.txt", Body=b"secret")
+    s3.put_bucket_policy(Bucket=bkt, Policy=_deny_all_policy(bkt))
+
+    with pytest.raises(ClientError) as exc:
+        s3.get_object(Bucket=bkt, Key="secret.txt")
+    assert exc.value.response["Error"]["Code"] == "AccessDenied"
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 403
+
+
+def test_s3_policy_deny_blocks_head_object(s3):
+    bkt = "intg-s3-policy-deny-head"
+    s3.create_bucket(Bucket=bkt)
+    s3.put_object(Bucket=bkt, Key="secret.txt", Body=b"secret")
+    s3.put_bucket_policy(Bucket=bkt, Policy=_deny_all_policy(bkt))
+
+    with pytest.raises(ClientError) as exc:
+        s3.head_object(Bucket=bkt, Key="secret.txt")
+    # HEAD responses carry no body — botocore reports an empty error code.
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 403
+
+
+def test_s3_policy_deny_blocks_list_objects(s3):
+    bkt = "intg-s3-policy-deny-list"
+    s3.create_bucket(Bucket=bkt)
+    s3.put_object(Bucket=bkt, Key="a.txt", Body=b"a")
+    s3.put_bucket_policy(Bucket=bkt, Policy=_deny_all_policy(bkt))
+
+    with pytest.raises(ClientError) as exc:
+        s3.list_objects_v2(Bucket=bkt)
+    assert exc.value.response["Error"]["Code"] == "AccessDenied"
+
+
+def test_s3_policy_deny_blocks_put_object(s3):
+    bkt = "intg-s3-policy-deny-put"
+    s3.create_bucket(Bucket=bkt)
+    s3.put_bucket_policy(Bucket=bkt, Policy=_deny_all_policy(bkt))
+
+    with pytest.raises(ClientError) as exc:
+        s3.put_object(Bucket=bkt, Key="new.txt", Body=b"nope")
+    assert exc.value.response["Error"]["Code"] == "AccessDenied"
+
+
+def test_s3_policy_deny_blocks_delete_object(s3):
+    bkt = "intg-s3-policy-deny-del"
+    s3.create_bucket(Bucket=bkt)
+    s3.put_object(Bucket=bkt, Key="doomed.txt", Body=b"x")
+    s3.put_bucket_policy(Bucket=bkt, Policy=_deny_all_policy(bkt))
+
+    with pytest.raises(ClientError) as exc:
+        s3.delete_object(Bucket=bkt, Key="doomed.txt")
+    assert exc.value.response["Error"]["Code"] == "AccessDenied"
+
+
+def test_s3_policy_deny_scoped_to_specific_action(s3):
+    """Deny s3:GetObject should NOT block PutObject."""
+    bkt = "intg-s3-policy-deny-scoped"
+    s3.create_bucket(Bucket=bkt)
+    s3.put_object(Bucket=bkt, Key="existing.txt", Body=b"x")
+
+    policy = json.dumps({
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Effect": "Deny",
+            "Principal": "*",
+            "Action": "s3:GetObject",
+            "Resource": f"arn:aws:s3:::{bkt}/*",
+        }],
+    })
+    s3.put_bucket_policy(Bucket=bkt, Policy=policy)
+
+    # Get is denied
+    with pytest.raises(ClientError) as exc:
+        s3.get_object(Bucket=bkt, Key="existing.txt")
+    assert exc.value.response["Error"]["Code"] == "AccessDenied"
+
+    # Put is not — different action
+    s3.put_object(Bucket=bkt, Key="allowed.txt", Body=b"ok")
+
+
+def test_s3_policy_deny_scoped_to_specific_object(s3):
+    """Deny on arn:aws:s3:::bkt/private/* should not block bkt/public/*."""
+    bkt = "intg-s3-policy-deny-prefix"
+    s3.create_bucket(Bucket=bkt)
+    s3.put_object(Bucket=bkt, Key="private/hidden.txt", Body=b"hush")
+    s3.put_object(Bucket=bkt, Key="public/open.txt", Body=b"hi")
+
+    policy = json.dumps({
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Effect": "Deny",
+            "Principal": "*",
+            "Action": "s3:GetObject",
+            "Resource": f"arn:aws:s3:::{bkt}/private/*",
+        }],
+    })
+    s3.put_bucket_policy(Bucket=bkt, Policy=policy)
+
+    with pytest.raises(ClientError) as exc:
+        s3.get_object(Bucket=bkt, Key="private/hidden.txt")
+    assert exc.value.response["Error"]["Code"] == "AccessDenied"
+
+    resp = s3.get_object(Bucket=bkt, Key="public/open.txt")
+    assert resp["Body"].read() == b"hi"
+
+
+def test_s3_policy_management_escapes_deny(s3):
+    """Even under a deny-all policy, Get/Put/Delete-BucketPolicy must keep working.
+
+    Without this escape hatch, applying a blanket deny would brick the bucket —
+    there would be no way to inspect or remove the policy via the API.
+    """
+    bkt = "intg-s3-policy-escape"
+    s3.create_bucket(Bucket=bkt)
+    s3.put_bucket_policy(Bucket=bkt, Policy=_deny_all_policy(bkt))
+
+    # Still readable
+    resp = s3.get_bucket_policy(Bucket=bkt)
+    assert "DenyAll" in resp["Policy"]
+
+    # Still replaceable
+    s3.put_bucket_policy(Bucket=bkt, Policy=_deny_all_policy(bkt))
+
+    # Still deletable — and after deletion, access is restored
+    s3.delete_bucket_policy(Bucket=bkt)
+    s3.put_object(Bucket=bkt, Key="after.txt", Body=b"free")
+    resp = s3.get_object(Bucket=bkt, Key="after.txt")
+    assert resp["Body"].read() == b"free"
+
+
+def test_s3_policy_allow_statements_are_ignored(s3):
+    """Current evaluator is Deny-only — Allow statements shouldn't grant or
+    revoke access on their own. This test documents the intentional gap so a
+    future implementer notices it if they add Allow logic.
+    """
+    bkt = "intg-s3-policy-allow-noop"
+    s3.create_bucket(Bucket=bkt)
+    s3.put_object(Bucket=bkt, Key="hello.txt", Body=b"hi")
+
+    # An Allow-only policy — in real AWS this wouldn't grant anything extra
+    # beyond the default owner access; we just verify it doesn't break GET.
+    policy = json.dumps({
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Effect": "Allow",
+            "Principal": "*",
+            "Action": "s3:GetObject",
+            "Resource": f"arn:aws:s3:::{bkt}/*",
+        }],
+    })
+    s3.put_bucket_policy(Bucket=bkt, Policy=policy)
+
+    resp = s3.get_object(Bucket=bkt, Key="hello.txt")
+    assert resp["Body"].read() == b"hi"
+
+
+def test_s3_policy_malformed_json_does_not_crash_evaluator(s3):
+    """A stored non-JSON policy should not raise from the evaluator — it
+    should fail open (log-and-continue) rather than 500 on every request.
+    """
+    bkt = "intg-s3-policy-malformed"
+    s3.create_bucket(Bucket=bkt)
+    s3.put_object(Bucket=bkt, Key="ok.txt", Body=b"ok")
+
+    # Bypass the CRUD API to plant garbage directly. Even against AWS-SDK
+    # validation this would fail; here we reach into the store.
+    from ministack.services.s3 import _bucket_policies
+    _bucket_policies[bkt] = "not a json document"
+
+    # Must not crash; request should proceed as if no policy existed.
+    resp = s3.get_object(Bucket=bkt, Key="ok.txt")
+    assert resp["Body"].read() == b"ok"
+
+
 def test_s3_object_tagging(s3):
     bkt = "intg-s3-objtags"
     s3.create_bucket(Bucket=bkt)
