@@ -771,6 +771,20 @@ async def _handle_admin_config_request(path: str, method: str, body: bytes):
 
 async def _handle_post_body_shortcuts(method: str, path: str, headers: dict, body: bytes, query_params: dict, request_id: str):
     """Handle body-dependent routes before the generic service router."""
+    # CloudFormation custom resource ResponseURL intercept
+    if method == "PUT" and path.startswith("/_ministack/cfn-response/"):
+        token = path[len("/_ministack/cfn-response/"):]
+        try:
+            payload = json.loads(body) if body else {}
+        except (json.JSONDecodeError, ValueError):
+            payload = {}
+        from ministack.services.cloudformation import custom_resource as _cfn_cr
+        if not _cfn_cr.deliver_response(token, payload):
+            logging.getLogger("cloudformation").warning(
+                "CFN ResponseURL PUT for unknown token %r — ignoring", token
+            )
+        return 200, {}, b""
+
     response = await _handle_cognito_body_request(method, path, headers, body, query_params)
     if response is not None:
         # See _handle_pre_body_request: browser-based OIDC clients need CORS.

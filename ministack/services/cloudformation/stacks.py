@@ -23,6 +23,10 @@ from .provisioners import REGION, _delete_resource, _provision_resource, _update
 logger = logging.getLogger("cloudformation")
 
 
+def _is_custom_resource(resource_type: str) -> bool:
+    return resource_type.startswith("Custom::") or resource_type == "AWS::CloudFormation::CustomResource"
+
+
 # ===========================================================================
 # Stack Events helper
 # ===========================================================================
@@ -124,13 +128,24 @@ async def _deploy_stack_async(stack_name: str, stack_id: str, template: dict,
             if prev_resource:
                 old_pid = prev_resource.get("PhysicalResourceId", logical_id)
                 old_props = prev_resource.get("Properties", {})
-                physical_id, attrs = _update_resource(
-                    resource_type, old_pid, old_props, resolved_props, stack_name
-                )
+                if _is_custom_resource(resource_type):
+                    physical_id, attrs = await asyncio.to_thread(
+                        _update_resource, resource_type, old_pid, old_props,
+                        resolved_props, stack_name, logical_id
+                    )
+                else:
+                    physical_id, attrs = _update_resource(
+                        resource_type, old_pid, old_props, resolved_props, stack_name
+                    )
             else:
-                physical_id, attrs = _provision_resource(
-                    resource_type, logical_id, resolved_props, stack_name
-                )
+                if _is_custom_resource(resource_type):
+                    physical_id, attrs = await asyncio.to_thread(
+                        _provision_resource, resource_type, logical_id, resolved_props, stack_name
+                    )
+                else:
+                    physical_id, attrs = _provision_resource(
+                        resource_type, logical_id, resolved_props, stack_name
+                    )
         except Exception as exc:
             logger.error("Failed to provision %s (%s): %s",
                          logical_id, resource_type, exc)
@@ -163,7 +178,13 @@ async def _deploy_stack_async(stack_name: str, stack_id: str, template: dict,
             pid = old_res.get("PhysicalResourceId", "")
             old_props = old_res.get("Properties", {})
             try:
-                _delete_resource(rtype, pid, old_props)
+                if _is_custom_resource(rtype):
+                    await asyncio.to_thread(
+                        _delete_resource, rtype, pid, old_props,
+                        stack_name, logical_id
+                    )
+                else:
+                    _delete_resource(rtype, pid, old_props, stack_name, logical_id)
             except Exception as exc:
                 logger.warning("Failed to delete old resource %s: %s",
                                logical_id, exc)
@@ -191,7 +212,13 @@ async def _deploy_stack_async(stack_name: str, stack_id: str, template: dict,
                 pid = res.get("PhysicalResourceId", "")
                 res_props = res.get("Properties", {})
                 try:
-                    _delete_resource(rtype, pid, res_props)
+                    if _is_custom_resource(rtype):
+                        await asyncio.to_thread(
+                            _delete_resource, rtype, pid, res_props,
+                            stack_name, logical_id
+                        )
+                    else:
+                        _delete_resource(rtype, pid, res_props, stack_name, logical_id)
                     _add_event(stack_id, stack_name, logical_id, rtype,
                                "DELETE_COMPLETE", physical_id=pid)
                 except Exception as del_exc:
@@ -293,7 +320,13 @@ async def _delete_stack_async(stack_name: str, stack_id: str):
         _add_event(stack_id, stack_name, logical_id, rtype,
                    "DELETE_IN_PROGRESS", physical_id=pid)
         try:
-            _delete_resource(rtype, pid, res_props)
+            if _is_custom_resource(rtype):
+                await asyncio.to_thread(
+                    _delete_resource, rtype, pid, res_props,
+                    stack_name, logical_id
+                )
+            else:
+                _delete_resource(rtype, pid, res_props, stack_name, logical_id)
             _add_event(stack_id, stack_name, logical_id, rtype,
                        "DELETE_COMPLETE", physical_id=pid)
         except Exception as exc:
