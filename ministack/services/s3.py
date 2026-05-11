@@ -25,6 +25,7 @@ Storage: In-memory (optionally backed by S3_DATA_DIR).
 import base64
 import copy
 import datetime as _dt
+import fnmatch
 import hashlib
 import json
 import logging
@@ -37,7 +38,6 @@ from urllib.parse import quote as url_quote
 from urllib.parse import unquote as url_unquote
 from xml.etree.ElementTree import Element, SubElement, tostring
 from xml.sax.saxutils import escape as _esc
-import fnmatch
 
 from defusedxml.ElementTree import fromstring
 
