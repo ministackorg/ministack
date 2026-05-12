@@ -1190,11 +1190,13 @@ def _apigw_method_delete(physical_id, props):
 def _apigw_authorizer_create(logical_id, props, stack_name):
     """Provision an AWS::ApiGateway::Authorizer.
 
-    Properties match the CFN resource spec: Name, Type (TOKEN / REQUEST /
-    COGNITO_USER_POOLS), AuthorizerUri, IdentitySource, AuthorizerCredentials,
-    AuthorizerResultTtlInSeconds, IdentityValidationExpression, ProviderARNs,
-    RestApiId. ``AuthType`` is accepted but stored only as metadata on the
-    authorizer (real AWS uses it for `aws_iam` / `custom` documentation).
+    Maps CFN properties to the existing apigateway_v1 authorizer store:
+    Name, Type (TOKEN / REQUEST / COGNITO_USER_POOLS), AuthorizerUri,
+    AuthorizerCredentials, IdentitySource, IdentityValidationExpression,
+    AuthorizerResultTtlInSeconds, ProviderARNs, RestApiId. ``AuthType`` is
+    documented in the AWS CFN spec as informational only; the underlying
+    apigateway_v1._create_authorizer record does not currently expose it,
+    so the field is dropped here.
     """
     api_id = props.get("RestApiId", "")
     data = {

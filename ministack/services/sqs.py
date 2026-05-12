@@ -571,11 +571,14 @@ def _act_add_permission(data: dict, qurl: str) -> dict:
             f"Value {label} for parameter Label is invalid. Reason: Already exists.",
         )
 
+    # AWS canonical Policy shape per the SQS developer guide:
+    # Principal.AWS holds bare 12-digit account IDs; Action uses the
+    # lowercase IAM namespace prefix `sqs:`.
     statements.append({
         "Sid": label,
         "Effect": "Allow",
-        "Principal": {"AWS": [f"arn:aws:iam::{a}:root" for a in account_ids]},
-        "Action": [a if a.startswith("SQS:") else f"SQS:{a}" for a in actions],
+        "Principal": {"AWS": list(account_ids)},
+        "Action": [a if a.startswith("sqs:") else f"sqs:{a[4:]}" if a.startswith("SQS:") else f"sqs:{a}" for a in actions],
         "Resource": queue_arn,
     })
     q["attributes"]["Policy"] = json.dumps(policy)

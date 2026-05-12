@@ -639,8 +639,9 @@ def test_sqs_add_permission_appends_policy_statement(sqs):
     assert "perm-1" in sids
     stmt = next(s for s in policy["Statement"] if s["Sid"] == "perm-1")
     assert stmt["Effect"] == "Allow"
-    assert "arn:aws:iam::123456789012:root" in stmt["Principal"]["AWS"]
-    assert "SQS:SendMessage" in stmt["Action"]
+    # AWS canonical Policy shape: bare 12-digit account ID, lowercase sqs: prefix.
+    assert "123456789012" in stmt["Principal"]["AWS"]
+    assert "sqs:SendMessage" in stmt["Action"]
 
 
 def test_sqs_add_permission_rejects_duplicate_label(sqs):
