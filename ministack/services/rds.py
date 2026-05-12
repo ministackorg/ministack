@@ -17,6 +17,7 @@ Supports: CreateDBInstance, DeleteDBInstance, DescribeDBInstances, ModifyDBInsta
           CreateDBInstanceReadReplica (stub), RestoreDBInstanceFromDBSnapshot (stub),
           ListTagsForResource, AddTagsToResource, RemoveTagsFromResource,
           DescribeDBEngineVersions, DescribeOrderableDBInstanceOptions,
+          DescribePendingMaintenanceActions,
           CreateGlobalCluster, DescribeGlobalClusters, DeleteGlobalCluster,
           RemoveFromGlobalCluster, ModifyGlobalCluster.
 
@@ -1760,6 +1761,15 @@ def _describe_option_group_options(p):
 
 
 # ---------------------------------------------------------------------------
+# Maintenance actions
+# ---------------------------------------------------------------------------
+
+def _describe_pending_maintenance_actions(p):
+    return _xml(200, "DescribePendingMaintenanceActionsResponse",
+        "<DescribePendingMaintenanceActionsResult><PendingMaintenanceActions/></DescribePendingMaintenanceActionsResult>")
+
+
+# ---------------------------------------------------------------------------
 # Tags
 # ---------------------------------------------------------------------------
 
@@ -2722,6 +2732,7 @@ _ACTION_MAP = {
     "RemoveTagsFromResource": _remove_tags,
     "DescribeDBEngineVersions": _describe_engine_versions,
     "DescribeOrderableDBInstanceOptions": _describe_orderable_options,
+    "DescribePendingMaintenanceActions": _describe_pending_maintenance_actions,
     "CreateGlobalCluster": _create_global_cluster,
     "DescribeGlobalClusters": _describe_global_clusters,
     "DeleteGlobalCluster": _delete_global_cluster,

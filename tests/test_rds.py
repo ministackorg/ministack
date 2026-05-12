@@ -182,6 +182,30 @@ def test_rds_create_instance_default_preferred_maintenance_window(rds):
     inst = resp["DBInstances"][0]
     assert inst["PreferredMaintenanceWindow"] == "sun:05:00-sun:06:00"
 
+def test_rds_describe_pending_maintenance_actions_noop(rds):
+    cid = f"pending-maint-{_uuid_mod.uuid4().hex[:10]}"
+    rds.create_db_cluster(
+        DBClusterIdentifier=cid,
+        Engine="aurora-postgresql",
+        MasterUsername="admin",
+        MasterUserPassword="password123",
+    )
+    cluster_arn = rds.describe_db_clusters(DBClusterIdentifier=cid)["DBClusters"][0]["DBClusterArn"]
+
+    resp = rds.describe_pending_maintenance_actions(ResourceIdentifier=cluster_arn)
+    assert resp["PendingMaintenanceActions"] == []
+
+    resp = rds.describe_pending_maintenance_actions()
+    assert resp["PendingMaintenanceActions"] == []
+
+    resp = rds.describe_pending_maintenance_actions(
+        ResourceIdentifier=cluster_arn,
+        Filters=[{"Name": "db-cluster-id", "Values": [cid]}],
+        Marker="ignored-marker",
+        MaxRecords=20,
+    )
+    assert resp["PendingMaintenanceActions"] == []
+
 def test_rds_create_cluster_v2(rds):
     resp = rds.create_db_cluster(
         DBClusterIdentifier="rds-cc-v2",
