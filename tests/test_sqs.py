@@ -29,6 +29,14 @@ def test_sqs_delete_queue(sqs):
     with pytest.raises(ClientError):
         sqs.get_queue_attributes(QueueUrl=url, AttributeNames=["All"])
 
+def test_sqs_delete_queue_nonexistent_raises(sqs):
+    url = sqs.create_queue(QueueName="intg-sqs-delete-404")["QueueUrl"]
+    sqs.delete_queue(QueueUrl=url)
+    with pytest.raises(ClientError) as exc:
+        sqs.delete_queue(QueueUrl=url)          # second delete — queue is already gone
+    assert exc.value.response["Error"]["Code"] == "AWS.SimpleQueueService.NonExistentQueue"
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+
 def test_sqs_list_queues(sqs):
     sqs.create_queue(QueueName="intg-sqs-list-alpha")
     sqs.create_queue(QueueName="intg-sqs-list-beta")
