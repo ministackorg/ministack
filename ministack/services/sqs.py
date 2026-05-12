@@ -236,9 +236,9 @@ def _act_create_queue(data: dict, _u: str) -> dict:
 
 def _act_delete_queue(data: dict, qurl: str) -> dict:
     url = data.get("QueueUrl", qurl)
-    if url in _queues:
-        _queue_name_to_url.pop(_queues[url]["name"], None)
-        del _queues[url]
+    q = _get_q(url)
+    canonical_url = _queue_name_to_url.pop(q["name"], url)
+    _queues.pop(canonical_url, None)
     return {}
 
 
