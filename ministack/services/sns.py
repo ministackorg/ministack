@@ -553,6 +553,16 @@ def _publish(params):
 
     topic = _topics[topic_arn]
     msg_attrs = _parse_message_attributes(params)
+
+    # AWS rejects Publish requests whose Message + MessageAttributes exceed
+    # 256 KiB. Real-AWS error code is InvalidParameter (400).
+    if _message_payload_size(message, msg_attrs) > _SNS_MAX_PAYLOAD_BYTES:
+        return _error(
+            "InvalidParameter",
+            f"Invalid parameter: Message too long. Maximum size is {_SNS_MAX_PAYLOAD_BYTES} bytes.",
+            400,
+        )
+
     fifo = _is_fifo_topic(topic)
 
     # ── FIFO validation, deduplication, and sequencing ──
@@ -677,6 +687,19 @@ def _publish_batch(params):
         msg_attrs = entry.get("message_attributes", {})
         group_id = entry.get("message_group_id", "")
         entry_dedup_id = entry.get("message_dedup_id", "")
+
+        # Per-entry payload size check: real AWS surfaces each oversized entry
+        # as a per-entry failure rather than failing the whole batch.
+        if _message_payload_size(message, msg_attrs) > _SNS_MAX_PAYLOAD_BYTES:
+            failed += (
+                "<member>"
+                f"<Id>{_xml_escape(eid)}</Id>"
+                f"<Code>InvalidParameter</Code>"
+                f"<Message>Invalid parameter: Message too long. Maximum size is {_SNS_MAX_PAYLOAD_BYTES} bytes.</Message>"
+                f"<SenderFault>true</SenderFault>"
+                "</member>"
+            )
+            continue
 
         # ── FIFO per-entry validation ──
         if fifo:
@@ -1122,6 +1145,28 @@ def _refresh_subscription_counts(topic: dict):
     pending = sum(1 for s in subs if not s.get("confirmed"))
     topic["attributes"]["SubscriptionsConfirmed"] = str(confirmed)
     topic["attributes"]["SubscriptionsPending"] = str(pending)
+
+
+_SNS_MAX_PAYLOAD_BYTES = 262144  # 256 KiB, per AWS SNS Publish docs
+
+
+def _message_payload_size(message: str, attrs: dict) -> int:
+    """Return the byte size of a Publish payload (Message + MessageAttributes).
+
+    Subject is intentionally excluded — AWS docs limit it to 100 chars but
+    don't count it toward the 256 KiB Publish size limit.
+    """
+    total = len((message or "").encode("utf-8"))
+    for name, attr in (attrs or {}).items():
+        total += len(name.encode("utf-8"))
+        total += len((attr.get("DataType") or "").encode("utf-8"))
+        sv = attr.get("StringValue")
+        if sv:
+            total += len(sv.encode("utf-8"))
+        bv = attr.get("BinaryValue")
+        if bv:
+            total += len(bv) if isinstance(bv, (bytes, bytearray)) else len(bv.encode("utf-8"))
+    return total
 
 
 def _parse_message_attributes(params) -> dict:
