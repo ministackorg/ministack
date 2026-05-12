@@ -96,7 +96,7 @@ _NON_S3_VHOST_NAMES = frozenset({
     "s3", "s3-control", "sqs", "sns", "dynamodb", "lambda", "iam", "sts",
     "secretsmanager", "logs", "ssm", "events", "kinesis", "monitoring", "ses",
     "states", "ecs", "rds", "rds-data", "elasticache", "glue", "athena",
-    "apigateway", "cloudformation", "autoscaling", "codebuild", "transfer",
+    "apigateway", "cloudformation", "autoscaling", "codebuild", "transfer", "cur",
     "cloudfront-kvs",
     "appsync-api", "appsync-realtime-api",
 })
@@ -252,6 +252,7 @@ SERVICE_REGISTRY = {
     "waf-regional": {"module": "waf_v1"},
     "wafv2": {"module": "waf"},
     "cloudtrail": {"module": "cloudtrail"},
+    "cur": {"module": "cur"},
 }
 
 SERVICE_HANDLERS = {
@@ -550,7 +551,8 @@ async def _handle_cognito_get_request(method: str, path: str, headers: dict, que
             pool_id = path.rsplit("/.well-known/openid-configuration", 1)[0].lstrip("/")
             if pool_id:
                 region = extract_region(headers) or "us-east-1"
-                return _get_module("cognito").well_known_openid_configuration(pool_id, region)
+                host = headers.get("host") or headers.get("Host")
+                return _get_module("cognito").well_known_openid_configuration(pool_id, region, host)
 
     if path == "/oauth2/authorize" and method == "GET":
         return _get_module("cognito").handle_oauth2_authorize(method, path, headers, query_params)
@@ -662,7 +664,11 @@ async def _handle_pre_body_request(method: str, path: str, headers: dict, query_
 
     response = await _handle_cognito_get_request(method, path, headers, query_params)
     if response is not None:
-        return response
+        # Cognito's OAuth2/OIDC endpoints (Hosted UI, /oauth2/*, /.well-known/*)
+        # are typically called by browser-based OIDC clients and must therefore
+        # carry the same `Access-Control-Allow-Origin: *` that every other data
+        # plane response gets via _with_data_plane_headers.
+        return _with_data_plane_headers(response, request_id)
 
     response = await _handle_ses_messages_request(method, path, headers, query_params)
     if response is not None:
@@ -764,11 +770,26 @@ async def _handle_admin_config_request(path: str, method: str, body: bytes):
     return 200, {"Content-Type": "application/json"}, json.dumps({"applied": applied}).encode()
 
 
-async def _handle_post_body_shortcuts(method: str, path: str, headers: dict, body: bytes, query_params: dict):
+async def _handle_post_body_shortcuts(method: str, path: str, headers: dict, body: bytes, query_params: dict, request_id: str):
     """Handle body-dependent routes before the generic service router."""
+    # CloudFormation custom resource ResponseURL intercept
+    if method == "PUT" and path.startswith("/_ministack/cfn-response/"):
+        token = path[len("/_ministack/cfn-response/"):]
+        try:
+            payload = json.loads(body) if body else {}
+        except (json.JSONDecodeError, ValueError):
+            payload = {}
+        from ministack.services.cloudformation import custom_resource as _cfn_cr
+        if not _cfn_cr.deliver_response(token, payload):
+            logging.getLogger("cloudformation").warning(
+                "CFN ResponseURL PUT for unknown token %r — ignoring", token
+            )
+        return 200, {}, b""
+
     response = await _handle_cognito_body_request(method, path, headers, body, query_params)
     if response is not None:
-        return response
+        # See _handle_pre_body_request: browser-based OIDC clients need CORS.
+        return _with_data_plane_headers(response, request_id)
     return await _handle_admin_config_request(path, method, body)
 
 
@@ -884,6 +905,36 @@ async def _handle_ses_v2_request(method: str, path: str, headers: dict, body: by
     if not path.startswith(_SES_V2_PREFIX):
         return None
     return await _get_module("ses_v2").handle_request(method, path, headers, body, query_params)
+
+
+def _is_ecr_registry_path(path: str) -> bool:
+    """Return True iff `path` is a Docker Registry HTTP API V2 endpoint.
+
+    Shares the `/v2/` prefix with API Gateway v2 (`/v2/apis/...`,
+    `/v2/tags/{arn}`), AppSync Events (`/v2/apis`), and SES v2 (`/v2/email/...`).
+    Registry paths are distinguished by `/blobs/`, `/manifests/`, or the
+    `/tags/list` suffix — none appear in any other `/v2/*` consumer.
+    """
+    if path in ("/v2", "/v2/", "/v2/_catalog"):
+        return True
+    if not path.startswith("/v2/") or path.startswith(_SES_V2_PREFIX):
+        return False
+    return "/blobs/" in path or "/manifests/" in path or path.endswith("/tags/list")
+
+
+async def _handle_ecr_registry_request(method: str, path: str, headers: dict, body: bytes, query_params: dict):
+    """Handle Docker Registry HTTP API V2 requests (`docker push`/`docker pull`).
+
+    Real ECR exposes the V2 protocol on the same endpoint as the AWS API. We
+    must run this before the generic router so the path doesn't fall through
+    to S3 path-style addressing. The shape check above keeps every other
+    `/v2/...` consumer (apigwv2, AppSync Events, SES v2) untouched.
+    """
+    if not _is_ecr_registry_path(path):
+        return None
+    return await _get_module("ecr").handle_registry_request(
+        method, path, headers, body, query_params
+    )
 
 
 def _parse_execute_api_url(host: str, path: str) -> tuple[str, str, str] | None:
@@ -1095,6 +1146,8 @@ async def _handle_special_data_plane_request(
         return response
     if response := await _handle_ses_v2_request(method, path, headers, body, query_params):
         return response
+    if response := await _handle_ecr_registry_request(method, path, headers, body, query_params):
+        return _with_data_plane_headers(response, request_id)
 
     host = headers.get("host", "")
     if response := await _handle_execute_api_request(host, path, method, headers, body, query_params):
@@ -1436,7 +1489,7 @@ async def app(scope, receive, send):
 
     body = await _read_request_body(receive, method, headers)
 
-    if await _send_if_handled(send, await _handle_post_body_shortcuts(method, path, headers, body, query_params)):
+    if await _send_if_handled(send, await _handle_post_body_shortcuts(method, path, headers, body, query_params, request_id)):
         return
 
     if await _send_if_handled(

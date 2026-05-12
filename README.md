@@ -379,6 +379,8 @@ subnet = ec2.create_subnet(
 | **CloudFront KeyValueStore (data plane)** | DescribeKeyValueStore, ListKeys, GetKey, PutKey, DeleteKey, UpdateKeys | Separate `cloudfront-keyvaluestore` SDK service (REST/JSON, signing name `cloudfront-keyvaluestore`); ETag-based optimistic concurrency on every mutating op; `UpdateKeys` is atomic (validates whole batch, rejects on first invalid entry); `ListKeys` paginates with opaque `NextToken` capped at 50 results per AWS spec; bridges to the management plane via the shared KVS ARN |
 | **CloudTrail** | LookupEvents, CreateTrail, DeleteTrail, GetTrail, DescribeTrails, ListTrails, UpdateTrail, GetTrailStatus, StartLogging, StopLogging, PutEventSelectors, GetEventSelectors, AddTags, ListTags, RemoveTags | In-memory audit log; recording opt-in via `CLOUDTRAIL_RECORDING=1` (or runtime config endpoint); per-account ring buffer (`CLOUDTRAIL_MAX_EVENTS=10000`); `LookupEvents` supports all 8 AWS `LookupAttributes`; `IsLogging` flips on Start/StopLogging |
 | **Resource Groups** | CreateGroup, GetGroup, DeleteGroup, UpdateGroup, ListGroups, GetGroupQuery, UpdateGroupQuery, GetGroupConfiguration, PutGroupConfiguration, GroupResources, UngroupResources, ListGroupResources, ListGroupingStatuses, SearchResources, Tag, Untag, GetTags, GetAccountSettings, UpdateAccountSettings | 19 of 23 spec ops; tag-sync ops omitted (not exposed by AWS CLI / Terraform); `Group` accepts bare name or full ARN |
+| **Cost & Usage Reports** | DeleteReportDefinition, DescribeReportDefinitions, ListTagsForResource, ModifyReportDefinition, PutReportDefinition, TagResource, UntagResource | 7 of 7 spec ops |
+
 
 ### CloudFormation
 
@@ -760,7 +762,7 @@ Install DuckDB for full Athena SQL compatibility: `pip install ministack[full]`.
 
 When `PERSIST_STATE=1`, MiniStack saves service state to `STATE_DIR` on shutdown and reloads it on startup. Writes are atomic (write-to-tmp then rename) to prevent corruption on crash.
 
-Services currently supporting persistence: **All services** — API Gateway v1/v2, ALB, ACM, AppConfig, AppSync, Athena, Cloud Map, CloudFront, CloudWatch, CloudWatch Logs, CodeBuild, Cognito, DynamoDB, EC2, ECR, ECS, EFS, EKS, ElastiCache, EMR, EventBridge, EventBridge Scheduler, Firehose, Glue, IAM/STS, Kinesis, KMS, Lambda, RDS, Route 53, S3, Secrets Manager, SES, SES v2, SNS, SQS, SSM, Step Functions, Transfer Family, WAF v2 
+Services currently supporting persistence: **All services** — API Gateway v1/v2, ALB, ACM, AppConfig, AppSync, Athena, Cloud Map, CloudFront, CloudWatch, CloudWatch Logs, CodeBuild, Cognito, DynamoDB, EC2, ECR, ECS, EFS, EKS, ElastiCache, EMR, EventBridge, EventBridge Scheduler, Firehose, Glue, IAM/STS, Kinesis, KMS, Lambda, RDS, Route 53, S3, Secrets Manager, SES, SES v2, SNS, SQS, SSM, Step Functions, Transfer Family, WAF v2
 
 ```bash
 docker run -p 4566:4566 \
@@ -856,6 +858,8 @@ aws --endpoint-url=http://localhost:4566 eks delete-cluster --name my-cluster
 
 > **Note:** EKS requires Docker socket access (`-v /var/run/docker.sock:/var/run/docker.sock`) to spawn k3s containers. The k3s image is pulled on first `CreateCluster` call.
 
+> **Security trade-off:** the k3s container is launched with `--privileged`. k3s server mode needs to remount `/sys/fs/cgroup`, which no granular Linux capability set permits — running unprivileged fails with `failed to evacuate root cgroup`. This grants the k3s container significant access on the Docker host. The trade-off is acceptable for local development against an emulator but should be considered before running MiniStack EKS on shared infrastructure. Omitting the Docker socket mount cleanly disables k3s and falls back to a static EKS mock.
+
 ### Lambda Warm Starts
 
 MiniStack keeps Python and Node.js Lambda functions warm between invocations. After the first call (cold start), the handler module stays loaded in a persistent subprocess. Subsequent calls skip the import/require step, matching real AWS warm-start behaviour and making test suites significantly faster.
@@ -890,6 +894,53 @@ print(json.loads(resp["Payload"].read()))  # {'statusCode': 200, 'body': '{"hell
 Layers that ship npm packages work too — MiniStack resolves the `nodejs/node_modules` subdirectory inside each layer zip and prepends it to the module search path.
 
 MiniStack also sets the standard Lambda runtime environment before the handler module is loaded, including `LAMBDA_TASK_ROOT`, `AWS_LAMBDA_FUNCTION_NAME`, `AWS_LAMBDA_FUNCTION_MEMORY_SIZE`, and `_LAMBDA_FUNCTION_ARN`. That keeps import-time Lambda detection and conditional handler setup aligned with AWS warm runtime behaviour.
+
+### Lambda Proxy (BYO container)
+
+For languages AWS doesn't ship a runtime for (PHP, Deno, Bun, custom builds), point a function at your own running container instead of having MiniStack execute a deployment package. MiniStack forwards the Lambda event to that container as an HTTP POST and returns its JSON response as the function result.
+
+The function is a real Lambda in MiniStack's registry — it has an ARN, shows up in `list-functions`, and works as a target for API Gateway `AWS_PROXY` integrations, EventBridge rules, SQS event sources, Step Functions tasks, and any other Lambda trigger. Only the execute hop is redirected.
+
+Configure it per-function via the standard `CreateFunction` API:
+
+```python
+import boto3
+lam = boto3.client("lambda", endpoint_url="http://localhost:4566", region_name="us-east-1",
+                   aws_access_key_id="test", aws_secret_access_key="test")
+
+lam.create_function(
+    FunctionName="phpapi",
+    Runtime="provided",                                # any value; ignored in proxy mode
+    Role="arn:aws:iam::000000000000:role/r",
+    Handler="index.handler",                           # any value; ignored in proxy mode
+    Code={"ZipFile": b"PK\x05\x06" + b"\x00" * 18},    # empty zip stub
+    Environment={"Variables": {
+        "MINISTACK_LAMBDA_PROXY_URL": "http://host.docker.internal:9000/invoke",
+    }},
+)
+```
+
+Or globally via env var at startup: `MINISTACK_LAMBDA_PROXY_<func-name>=http://...`.
+
+Your container receives the Lambda event JSON as the request body. Reply with the function's response as JSON (or a Lambda Proxy response shape `{"statusCode", "headers", "body"}` if it sits behind API Gateway). MiniStack passes these context headers on every forward:
+
+| Header | Value |
+|---|---|
+| `X-Amzn-Lambda-Function-Name` | `phpapi` |
+| `X-Amzn-Lambda-Function-Version` | `$LATEST` |
+| `X-Amzn-Lambda-Function-Arn` | `arn:aws:lambda:us-east-1:000000000000:function:phpapi` |
+| `X-Amzn-Lambda-Request-Id` | per-invocation UUID |
+| `X-Amzn-Lambda-Deadline-Ms` | epoch-ms when the function timeout expires |
+
+Errors map to Lambda's standard error shape so async-invoke retry, DLQ, destinations, and CloudWatch error metrics behave the same as for any other executor:
+
+| What happened | `errorType` | `errorMessage` |
+|---|---|---|
+| Container unreachable | `Runtime.HandlerError` | `Proxy target … unreachable: …` |
+| Took longer than the function `Timeout` | `Sandbox.Timedout` | `Task timed out after N.00 seconds` |
+| Container returned non-2xx | `Runtime.HandlerError` | `Proxy target returned HTTP <code>: <body…>` |
+
+**What this is not:** AWS Lambda doesn't have a feature called "register an externally-running container as my function." If you want byte-for-byte parity in production, ship the same container as a Lambda container image (`PackageType=Image`) and use the AWS Lambda Runtime Interface inside it. Proxy mode is a local-dev shortcut for the inner-loop case; what your production code sees from MiniStack at the SDK boundary is identical to AWS, but the handler signature inside your container differs from a real Lambda runtime contract.
 
 ---
 

@@ -771,6 +771,94 @@ def test_cfn_auto_name_dynamodb_follows_aws_pattern(cfn, ddb):
     cfn.delete_stack(StackName="cfn-autoname-ddb")
     _wait_stack(cfn, "cfn-autoname-ddb")
 
+
+def test_cfn_dynamodb_global_table_pay_per_request(cfn, ddb):
+    """AWS::DynamoDB::GlobalTable with PAY_PER_REQUEST billing — the common
+    CDK TableV2 default. Replicas is required by CFN; locally it's ignored.
+    Regression for issue #596."""
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "MyGlobal": {
+                "Type": "AWS::DynamoDB::GlobalTable",
+                "Properties": {
+                    "TableName": "cfn-global-table-1",
+                    "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+                    "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+                    "BillingMode": "PAY_PER_REQUEST",
+                    "StreamSpecification": {"StreamViewType": "NEW_AND_OLD_IMAGES"},
+                    "Replicas": [
+                        {"Region": "us-east-1"},
+                        {"Region": "eu-west-1"},
+                    ],
+                },
+            },
+        },
+        "Outputs": {"TableName": {"Value": {"Ref": "MyGlobal"}}},
+    }
+    cfn.create_stack(StackName="cfn-global-table-ppr", TemplateBody=json.dumps(template))
+    stack = _wait_stack(cfn, "cfn-global-table-ppr")
+    assert stack["StackStatus"] == "CREATE_COMPLETE"
+
+    table_name = next(o["OutputValue"] for o in stack["Outputs"] if o["OutputKey"] == "TableName")
+    desc = ddb.describe_table(TableName=table_name)["Table"]
+    assert desc["TableName"] == "cfn-global-table-1"
+    assert desc["LatestStreamArn"]  # StreamSpecification was honoured
+
+    cfn.delete_stack(StackName="cfn-global-table-ppr")
+    _wait_stack(cfn, "cfn-global-table-ppr")
+
+
+def test_cfn_dynamodb_global_table_provisioned_throughput(cfn, ddb):
+    """AWS::DynamoDB::GlobalTable with PROVISIONED billing carries capacity
+    via WriteProvisionedThroughputSettings / ReadProvisionedThroughputSettings
+    (no top-level ProvisionedThroughput on this resource type). The CFN
+    provisioner translates them to the engine's expected
+    ProvisionedThroughput shape so DescribeTable returns the configured RCU /
+    WCU instead of the engine's default 5/5. Mirrors what CDK TableV2 emits
+    for a provisioned-billing table."""
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "MyGlobal": {
+                "Type": "AWS::DynamoDB::GlobalTable",
+                "Properties": {
+                    "TableName": "cfn-global-table-prov",
+                    "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+                    "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+                    "BillingMode": "PROVISIONED",
+                    "Replicas": [{"Region": "us-east-1"}],
+                    "WriteProvisionedThroughputSettings": {
+                        "WriteCapacityAutoScalingSettings": {
+                            "MinCapacity": 7,
+                            "MaxCapacity": 100,
+                            "TargetTrackingScalingPolicyConfiguration": {"TargetValue": 70},
+                        }
+                    },
+                    "ReadProvisionedThroughputSettings": {
+                        "ReadCapacityAutoScalingSettings": {
+                            "MinCapacity": 13,
+                            "MaxCapacity": 200,
+                            "TargetTrackingScalingPolicyConfiguration": {"TargetValue": 70},
+                        }
+                    },
+                },
+            },
+        },
+        "Outputs": {"TableName": {"Value": {"Ref": "MyGlobal"}}},
+    }
+    cfn.create_stack(StackName="cfn-global-table-prov", TemplateBody=json.dumps(template))
+    stack = _wait_stack(cfn, "cfn-global-table-prov")
+    assert stack["StackStatus"] == "CREATE_COMPLETE"
+
+    table_name = next(o["OutputValue"] for o in stack["Outputs"] if o["OutputKey"] == "TableName")
+    desc = ddb.describe_table(TableName=table_name)["Table"]
+    assert desc["ProvisionedThroughput"]["WriteCapacityUnits"] == 7
+    assert desc["ProvisionedThroughput"]["ReadCapacityUnits"] == 13
+
+    cfn.delete_stack(StackName="cfn-global-table-prov")
+    _wait_stack(cfn, "cfn-global-table-prov")
+
 def test_cfn_explicit_name_not_overridden(cfn, s3):
     """Explicit BucketName must be used as-is, not overridden by auto-name logic."""
     template = {

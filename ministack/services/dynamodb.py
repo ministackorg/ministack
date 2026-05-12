@@ -736,7 +736,16 @@ def _query(data):
     else:
         candidates = list(table["items"].get(pk_val, {}).values())
 
-    if sk_name:
+    if is_gsi or index_name:
+        # GSI/LSI: order by (INDEX_SORT, BASE_PK, BASE_SK). The base-table keys
+        # tiebreak rows with equal INDEX_SORT (or hash-only GSIs), matching
+        # real DynamoDB's hidden ordering and making pagination cursors stable.
+        sort_keys = _index_order_keys(table, sk_name)
+        candidates.sort(
+            key=lambda it: tuple(_index_order_value(it, n, t) for n, t in sort_keys),
+            reverse=not scan_forward,
+        )
+    elif sk_name:
         sk_type = _get_attr_type(table, sk_name)
         candidates.sort(key=lambda it: _sort_key_value(it.get(sk_name), sk_type), reverse=not scan_forward)
 
@@ -746,7 +755,7 @@ def _query(data):
         candidates = [it for it in candidates if _evaluate_condition(key_cond, it, eav, ean)]
 
     if esk:
-        candidates = _apply_exclusive_start_key(candidates, esk, pk_name, sk_name, scan_forward)
+        candidates = _apply_exclusive_start_key(candidates, esk, pk_name, sk_name, scan_forward, table=table)
 
     has_more = False
     if limit is not None and len(candidates) > limit:
@@ -2506,11 +2515,39 @@ def _extract_pk_from_condition(condition, attr_values, attr_names, pk_name):
 # Pagination helpers
 # ---------------------------------------------------------------------------
 
-def _apply_exclusive_start_key(candidates, esk, pk_name, sk_name, scan_forward=True):
+def _index_order_value(item, name, type_hint):
+    """Single position in the GSI/LSI ordering tuple. Hash-only items, sparse
+    GSIs, or items missing a key get a stable filler so tuples remain
+    comparable across the candidate set."""
+    if not name or name not in item:
+        return Decimal(0) if type_hint == "N" else ""
+    return _sort_key_value(item.get(name), type_hint)
+
+
+def _index_order_keys(table, sk_name):
+    """Ordered list of (attr_name, attr_type) used to sort a GSI/LSI Query
+    result deterministically: (INDEX_SORT, BASE_PK, BASE_SK). Real DynamoDB
+    orders by (INDEX_HASH, INDEX_SORT, BASE_PK, BASE_SK); INDEX_HASH is fixed
+    per Query so it drops out of the ordering. The base-table keys break ties
+    when multiple items share the same INDEX_SORT value (or when the GSI is
+    hash-only)."""
+    seen = set()
+    keys = []
+    for n in (sk_name, table.get("pk_name"), table.get("sk_name")):
+        if n and n not in seen:
+            seen.add(n)
+            keys.append((n, _get_attr_type(table, n)))
+    return keys
+
+
+def _apply_exclusive_start_key(candidates, esk, pk_name, sk_name, scan_forward=True, table=None):
+    """Skip past the ESK cursor item, breaking ties on the GSI sort key with
+    the base table's primary key — same hidden ordering real DynamoDB uses."""
     if not esk or not candidates:
         return candidates
-    # Hash-only table: no sort key — find the item matching the PK and return everything after it
-    if not sk_name or sk_name not in esk:
+    # Hash-only base-table query — candidates are uniquely keyed by pk, so a
+    # cursor at all simply means "we already returned this one item."
+    if table is None and not sk_name:
         start_pk = _extract_key_val(esk.get(pk_name, {}))
         found = False
         result = []
@@ -2520,17 +2557,30 @@ def _apply_exclusive_start_key(candidates, esk, pk_name, sk_name, scan_forward=T
             elif _extract_key_val(item.get(pk_name, {})) == start_pk:
                 found = True
         return result
-    start_sk = esk[sk_name]
+    keys = _index_order_keys(table, sk_name) if table is not None else []
+    if not keys:
+        # Fall back to the legacy single-key compare for callers that didn't
+        # pass `table` (no GSI tiebreak available).
+        if not sk_name or sk_name not in esk:
+            return candidates
+        start_sk = esk[sk_name]
+        result = []
+        for item in candidates:
+            if item.get(sk_name) is None:
+                continue
+            op = '>' if scan_forward else '<'
+            if _compare_ddb(item.get(sk_name), op, start_sk):
+                result.append(item)
+        return result
+    cursor = tuple(_index_order_value(esk, n, t) for n, t in keys)
     result = []
     for item in candidates:
-        item_sk = item.get(sk_name)
-        if item_sk is None:
-            continue
+        item_tuple = tuple(_index_order_value(item, n, t) for n, t in keys)
         if scan_forward:
-            if _compare_ddb(item_sk, '>', start_sk):
+            if item_tuple > cursor:
                 result.append(item)
         else:
-            if _compare_ddb(item_sk, '<', start_sk):
+            if item_tuple < cursor:
                 result.append(item)
     return result
 

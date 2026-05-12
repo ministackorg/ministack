@@ -63,6 +63,89 @@ def test_ec2_run_describe_terminate_instances(ec2):
     term = ec2.terminate_instances(InstanceIds=[instance_id])
     assert term["TerminatingInstances"][0]["CurrentState"]["Name"] == "terminated"
 
+
+def test_ec2_run_instances_honors_private_ip_and_iam_profile(ec2):
+    """RunInstances must reflect --private-ip-address and --iam-instance-profile
+    on the created instance and in DescribeInstances. Regression for issue #594."""
+    profile_arn = "arn:aws:iam::000000000000:instance-profile/ec2-test-profile"
+    resp = ec2.run_instances(
+        ImageId="ami-12345678",
+        MinCount=1,
+        MaxCount=1,
+        InstanceType="t3.micro",
+        PrivateIpAddress="172.31.0.42",
+        IamInstanceProfile={"Arn": profile_arn},
+    )
+    inst = resp["Instances"][0]
+    iid = inst["InstanceId"]
+    try:
+        # PrivateIpAddress is the value the caller passed, not a random one,
+        # and is well-formed (4 octets ≤ 255).
+        assert inst["PrivateIpAddress"] == "172.31.0.42"
+        assert all(0 <= int(o) <= 255 for o in inst["PrivateIpAddress"].split("."))
+        # PrivateDnsName is derived from the assigned IP, not malformed.
+        assert inst["PrivateDnsName"] == "ip-172-31-0-42.ec2.internal"
+        # IamInstanceProfile is attached and surfaced.
+        assert inst["IamInstanceProfile"]["Arn"] == profile_arn
+        assert inst["IamInstanceProfile"]["Id"]
+
+        # DescribeInstances surfaces the same.
+        desc = ec2.describe_instances(InstanceIds=[iid])
+        d_inst = desc["Reservations"][0]["Instances"][0]
+        assert d_inst["PrivateIpAddress"] == "172.31.0.42"
+        assert d_inst["IamInstanceProfile"]["Arn"] == profile_arn
+    finally:
+        ec2.terminate_instances(InstanceIds=[iid])
+
+
+def test_ec2_run_instances_default_private_ip_is_well_formed(ec2):
+    """When the caller does not pass --private-ip-address, the auto-generated
+    address must still be a valid IPv4. Regression for the 10.0193.216 bug
+    in #594 (missing dot separator in _random_ip prefix)."""
+    resp = ec2.run_instances(ImageId="ami-1", MinCount=1, MaxCount=1)
+    inst = resp["Instances"][0]
+    try:
+        octets = inst["PrivateIpAddress"].split(".")
+        assert len(octets) == 4, f"malformed IP: {inst['PrivateIpAddress']}"
+        assert all(0 <= int(o) <= 255 for o in octets)
+    finally:
+        ec2.terminate_instances(InstanceIds=[inst["InstanceId"]])
+
+
+def test_ec2_run_instances_emits_default_root_block_device_mapping(ec2):
+    """RunInstances without an explicit BDM must auto-attach a root EBS volume,
+    matching real AWS. Cloud Custodian / AWS Config use BlockDeviceMappings to
+    classify EBS-backed vs ephemeral instances; a missing BDM breaks them."""
+    resp = ec2.run_instances(
+        ImageId="ami-12345678", MinCount=1, MaxCount=1, InstanceType="t2.micro"
+    )
+    iid = resp["Instances"][0]["InstanceId"]
+
+    bdms = resp["Instances"][0].get("BlockDeviceMappings")
+    assert bdms, "RunInstances response must include BlockDeviceMappings"
+    assert len(bdms) == 1
+    root = bdms[0]
+    assert root["DeviceName"] == "/dev/xvda"
+    ebs = root["Ebs"]
+    assert ebs["VolumeId"].startswith("vol-")
+    assert ebs["Status"] == "attached"
+    assert ebs["DeleteOnTermination"] is True
+    assert "AttachTime" in ebs
+
+    desc = ec2.describe_instances(InstanceIds=[iid])
+    inst = desc["Reservations"][0]["Instances"][0]
+    desc_bdms = inst.get("BlockDeviceMappings", [])
+    assert len(desc_bdms) == 1
+    assert desc_bdms[0]["DeviceName"] == "/dev/xvda"
+    assert desc_bdms[0]["Ebs"]["VolumeId"] == ebs["VolumeId"]
+    assert desc_bdms[0]["Ebs"]["Status"] == "attached"
+
+    vols = ec2.describe_volumes(VolumeIds=[ebs["VolumeId"]])["Volumes"]
+    assert len(vols) == 1
+    atts = vols[0]["Attachments"]
+    assert atts and atts[0]["InstanceId"] == iid
+    assert atts[0]["Device"] == "/dev/xvda"
+
 def test_ec2_describe_instance_status(ec2):
     resp = ec2.run_instances(ImageId="ami-00000000", MinCount=1, MaxCount=1, InstanceType="t2.micro")
     iid = resp["Instances"][0]["InstanceId"]
@@ -1019,6 +1102,90 @@ def test_ec2_managed_prefix_list_crud(ec2):
     desc = ec2.describe_managed_prefix_lists(PrefixListIds=[pl_id])
     assert len(desc["PrefixLists"]) == 0
 
+
+def test_ec2_aws_managed_prefix_lists_in_describe_managed(ec2):
+    """DescribeManagedPrefixLists includes AWS-managed prefix lists with OwnerId=AWS."""
+    result = ec2.describe_managed_prefix_lists()
+    aws_pls = [pl for pl in result["PrefixLists"] if pl.get("OwnerId") == "AWS"]
+    assert len(aws_pls) > 0
+    names = [pl["PrefixListName"] for pl in aws_pls]
+    assert any("s3" in n for n in names)
+    assert any("dynamodb" in n for n in names)
+
+
+def test_ec2_aws_managed_prefix_list_filter_by_owner(ec2):
+    """Filtering DescribeManagedPrefixLists by owner-id=AWS returns only AWS-managed lists."""
+    result = ec2.describe_managed_prefix_lists(
+        Filters=[{"Name": "owner-id", "Values": ["AWS"]}]
+    )
+    assert all(pl.get("OwnerId") == "AWS" for pl in result["PrefixLists"])
+    assert len(result["PrefixLists"]) > 0
+
+
+def test_ec2_aws_managed_prefix_list_get_entries(ec2):
+    """GetManagedPrefixListEntries works for AWS-managed prefix lists."""
+    # Get an AWS-managed prefix list ID
+    result = ec2.describe_managed_prefix_lists(
+        Filters=[{"Name": "owner-id", "Values": ["AWS"]}]
+    )
+    aws_pl = next(pl for pl in result["PrefixLists"] if "s3" in pl["PrefixListName"])
+    entries = ec2.get_managed_prefix_list_entries(PrefixListId=aws_pl["PrefixListId"])
+    assert len(entries["Entries"]) >= 1
+    # CIDR should be in CGNAT space (100.64.0.0/10)
+    cidr = entries["Entries"][0]["Cidr"]
+    assert cidr.startswith("100.")
+
+
+def test_ec2_aws_managed_prefix_list_deterministic_cidr(ec2):
+    """AWS-managed prefix list CIDRs are deterministic across calls."""
+    result1 = ec2.describe_prefix_lists()
+    result2 = ec2.describe_prefix_lists()
+    for pl1, pl2 in zip(result1["PrefixLists"], result2["PrefixLists"]):
+        assert pl1["Cidrs"] == pl2["Cidrs"]
+
+
+def test_ec2_aws_managed_prefix_list_cannot_modify(ec2):
+    """Modifying an AWS-managed prefix list returns UnsupportedOperation."""
+    result = ec2.describe_managed_prefix_lists(
+        Filters=[{"Name": "owner-id", "Values": ["AWS"]}]
+    )
+    aws_pl_id = result["PrefixLists"][0]["PrefixListId"]
+    with pytest.raises(ClientError) as exc_info:
+        ec2.modify_managed_prefix_list(
+            PrefixListId=aws_pl_id, CurrentVersion=1,
+            AddEntries=[{"Cidr": "10.0.0.0/8", "Description": "should fail"}],
+        )
+    assert exc_info.value.response["Error"]["Code"] == "UnsupportedOperation"
+
+
+def test_ec2_aws_managed_prefix_list_cannot_delete(ec2):
+    """Deleting an AWS-managed prefix list returns UnsupportedOperation."""
+    result = ec2.describe_managed_prefix_lists(
+        Filters=[{"Name": "owner-id", "Values": ["AWS"]}]
+    )
+    aws_pl_id = result["PrefixLists"][0]["PrefixListId"]
+    with pytest.raises(ClientError) as exc_info:
+        ec2.delete_managed_prefix_list(PrefixListId=aws_pl_id)
+    assert exc_info.value.response["Error"]["Code"] == "UnsupportedOperation"
+
+
+def test_ec2_describe_prefix_lists_cidr_not_placeholder(ec2):
+    """DescribePrefixLists returns real CIDRs, not 0.0.0.0/0 placeholders."""
+    result = ec2.describe_prefix_lists()
+    for pl in result["PrefixLists"]:
+        for cidr in pl["Cidrs"]:
+            assert cidr != "0.0.0.0/0"
+
+
+def test_ec2_aws_managed_prefix_list_cannot_create(ec2):
+    """Creating a prefix list with an AWS-managed name returns UnsupportedOperation."""
+    with pytest.raises(ClientError) as exc_info:
+        ec2.create_managed_prefix_list(
+            PrefixListName="com.amazonaws.us-east-1.s3",
+            MaxEntries=5, AddressFamily="IPv4",
+        )
+    assert exc_info.value.response["Error"]["Code"] == "UnsupportedOperation"
+
 def test_ec2_vpn_gateway_crud(ec2):
     """Full lifecycle: create, attach, describe, detach, delete."""
     vpc = ec2.create_vpc(CidrBlock="10.95.0.0/16")
@@ -1055,7 +1222,7 @@ def test_ec2_vpn_gateway_crud(ec2):
         ec2.delete_vpc(VpcId=vpc_id)
 
 def test_ec2_vgw_route_propagation(ec2):
-    """EnableVgwRoutePropagation / DisableVgwRoutePropagation."""
+    """EnableVgwRoutePropagation / DisableVgwRoutePropagation with DescribeRouteTables verification."""
     vpc = ec2.create_vpc(CidrBlock="10.94.0.0/16")
     vpc_id = vpc["Vpc"]["VpcId"]
     try:
@@ -1064,11 +1231,23 @@ def test_ec2_vgw_route_propagation(ec2):
         vgw = ec2.create_vpn_gateway(Type="ipsec.1")
         vgw_id = vgw["VpnGateway"]["VpnGatewayId"]
 
+        # Enable and verify it appears in DescribeRouteTables
         ec2.enable_vgw_route_propagation(RouteTableId=rtb_id, GatewayId=vgw_id)
-        # No error = success (propagation stored server-side)
+        desc = ec2.describe_route_tables(RouteTableIds=[rtb_id])
+        propagating = desc["RouteTables"][0].get("PropagatingVgws", [])
+        assert {"GatewayId": vgw_id} in propagating
 
+        # Idempotent — enabling again doesn't duplicate
+        ec2.enable_vgw_route_propagation(RouteTableId=rtb_id, GatewayId=vgw_id)
+        desc = ec2.describe_route_tables(RouteTableIds=[rtb_id])
+        propagating = desc["RouteTables"][0].get("PropagatingVgws", [])
+        assert len([v for v in propagating if v["GatewayId"] == vgw_id]) == 1
+
+        # Disable and verify it's removed
         ec2.disable_vgw_route_propagation(RouteTableId=rtb_id, GatewayId=vgw_id)
-        # No error = success
+        desc = ec2.describe_route_tables(RouteTableIds=[rtb_id])
+        propagating = desc["RouteTables"][0].get("PropagatingVgws", [])
+        assert {"GatewayId": vgw_id} not in propagating
 
         ec2.delete_vpn_gateway(VpnGatewayId=vgw_id)
         ec2.delete_route_table(RouteTableId=rtb_id)
@@ -1092,6 +1271,68 @@ def test_ec2_customer_gateway_crud(ec2):
     desc = ec2.describe_customer_gateways(CustomerGatewayIds=[cgw_id])
     assert len(desc["CustomerGateways"]) == 0
 
+
+def test_ec2_vpn_connection_crud(ec2):
+    """CreateVpnConnection, DescribeVpnConnections, DeleteVpnConnection."""
+    cgw = ec2.create_customer_gateway(BgpAsn=65000, IpAddress="203.0.113.1", Type="ipsec.1")
+    cgw_id = cgw["CustomerGateway"]["CustomerGatewayId"]
+    vgw = ec2.create_vpn_gateway(Type="ipsec.1")
+    vgw_id = vgw["VpnGateway"]["VpnGatewayId"]
+
+    vpn = ec2.create_vpn_connection(
+        Type="ipsec.1",
+        CustomerGatewayId=cgw_id,
+        VpnGatewayId=vgw_id,
+        Options={"StaticRoutesOnly": True},
+    )
+    conn = vpn["VpnConnection"]
+    vpn_id = conn["VpnConnectionId"]
+    assert vpn_id.startswith("vpn-")
+    assert conn["State"] == "available"
+    assert conn["Type"] == "ipsec.1"
+    assert conn["CustomerGatewayId"] == cgw_id
+    assert conn["VpnGatewayId"] == vgw_id
+    assert conn["Options"]["StaticRoutesOnly"] is True
+
+    # Describe
+    desc = ec2.describe_vpn_connections(VpnConnectionIds=[vpn_id])
+    assert len(desc["VpnConnections"]) == 1
+    assert desc["VpnConnections"][0]["VpnConnectionId"] == vpn_id
+
+    # Delete
+    ec2.delete_vpn_connection(VpnConnectionId=vpn_id)
+    desc = ec2.describe_vpn_connections(VpnConnectionIds=[vpn_id])
+    assert len(desc["VpnConnections"]) == 0
+
+    ec2.delete_vpn_gateway(VpnGatewayId=vgw_id)
+    ec2.delete_customer_gateway(CustomerGatewayId=cgw_id)
+
+
+
+def test_ec2_vpn_connection_route(ec2):
+    """CreateVpnConnectionRoute / DeleteVpnConnectionRoute."""
+    cgw = ec2.create_customer_gateway(BgpAsn=65000, IpAddress="203.0.113.2", Type="ipsec.1")
+    cgw_id = cgw["CustomerGateway"]["CustomerGatewayId"]
+    vgw = ec2.create_vpn_gateway(Type="ipsec.1")
+    vgw_id = vgw["VpnGateway"]["VpnGatewayId"]
+    vpn = ec2.create_vpn_connection(Type="ipsec.1", CustomerGatewayId=cgw_id, VpnGatewayId=vgw_id, Options={"StaticRoutesOnly": True})
+    vpn_id = vpn["VpnConnection"]["VpnConnectionId"]
+
+    # Create route
+    ec2.create_vpn_connection_route(VpnConnectionId=vpn_id, DestinationCidrBlock="10.0.0.0/16")
+    desc = ec2.describe_vpn_connections(VpnConnectionIds=[vpn_id])
+    routes = desc["VpnConnections"][0]["Routes"]
+    assert any(r["DestinationCidrBlock"] == "10.0.0.0/16" for r in routes)
+
+    # Delete route
+    ec2.delete_vpn_connection_route(VpnConnectionId=vpn_id, DestinationCidrBlock="10.0.0.0/16")
+    desc = ec2.describe_vpn_connections(VpnConnectionIds=[vpn_id])
+    routes = desc["VpnConnections"][0]["Routes"]
+    assert not any(r["DestinationCidrBlock"] == "10.0.0.0/16" for r in routes)
+
+    ec2.delete_vpn_connection(VpnConnectionId=vpn_id)
+    ec2.delete_vpn_gateway(VpnGatewayId=vgw_id)
+    ec2.delete_customer_gateway(CustomerGatewayId=cgw_id)
 def test_ec2_create_route_nat_gateway(ec2):
     """CreateRoute with NatGatewayId stores it separately from GatewayId."""
     vpc = ec2.create_vpc(CidrBlock="10.93.0.0/16")

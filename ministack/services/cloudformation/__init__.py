@@ -74,6 +74,8 @@ def reset():
     _stack_events.clear()
     _exports.clear()
     _change_sets.clear()
+    from ministack.services.cloudformation import custom_resource as _cr
+    _cr.reset()
 
 
 # Must be last — handlers imports from this module

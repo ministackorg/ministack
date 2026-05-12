@@ -1117,6 +1117,50 @@ def test_cognito_openid_configuration():
     assert pool_id in data["issuer"]
     assert "jwks_uri" in data
     assert "token_endpoint" in data
+    # AWS Cognito advertises both code and token grants
+    assert "code" in data["response_types_supported"]
+    assert "token" in data["response_types_supported"]
+
+
+def test_cognito_browser_endpoints_send_cors_headers():
+    """Cognito's OAuth2/OIDC endpoints must send `Access-Control-Allow-Origin`
+    so browser-based OIDC clients can fetch them. Regression for the bug
+    where the dispatcher in app.py returned raw response tuples for
+    /.well-known/*, /oauth2/*, /login and /logout, bypassing the
+    `_with_data_plane_headers` wrapper that every other data-plane response
+    goes through."""
+    import urllib.request
+
+    from conftest import make_client
+    cognito = make_client("cognito-idp")
+    pool_id = cognito.create_user_pool(PoolName="cors-pool")["UserPool"]["Id"]
+
+    # Public well-known endpoints — fetched cross-origin during OIDC discovery.
+    for path in (
+        f"/{pool_id}/.well-known/openid-configuration",
+        f"/{pool_id}/.well-known/jwks.json",
+    ):
+        with urllib.request.urlopen(f"http://localhost:4566{path}") as r:
+            assert r.headers.get("Access-Control-Allow-Origin") == "*", (
+                f"missing CORS header on {path}"
+            )
+
+    # Token endpoint — POSTed cross-origin by the OIDC client. We don't care
+    # about the body (an empty form yields a 4xx) — only that the CORS header
+    # is present on the response.
+    req = urllib.request.Request(
+        "http://localhost:4566/oauth2/token",
+        data=b"grant_type=authorization_code",
+        method="POST",
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+    try:
+        resp = urllib.request.urlopen(req)
+    except urllib.error.HTTPError as e:
+        resp = e
+    assert resp.headers.get("Access-Control-Allow-Origin") == "*", (
+        "missing CORS header on /oauth2/token"
+    )
 
 
 # ===========================================================================
@@ -1866,6 +1910,35 @@ def test_oauth2_token_authorization_code():
     assert 'refresh_token' in resp
     assert resp['token_type'] == 'Bearer'
     assert resp['expires_in'] == 3600
+
+
+def test_oauth2_id_token_echoes_nonce():
+    """OIDC requires the id_token to echo the nonce from the authorize request
+    so clients can mitigate replay. Strict OIDC clients (oidc-client-ts,
+    Auth0/MS libs) silently discard tokens that omit an expected nonce.
+    Regression for the bug where the nonce was stored on the auth code but
+    never propagated into the id_token."""
+    cognito_idp = make_client('cognito-idp')
+    pool_id, client = _setup_pool_with_user(cognito_idp)
+    client_id = client['ClientId']
+    client_secret = client.get('ClientSecret', '')
+
+    expected_nonce = 'a-nonce-the-client-sent-' + secrets.token_hex(8)
+    code = _do_login_and_get_code(cognito_idp, client_id, {'nonce': expected_nonce})
+
+    status, _, body = _post_form(f'{ENDPOINT}/oauth2/token', {
+        'grant_type': 'authorization_code',
+        'code': code,
+        'redirect_uri': 'http://localhost:3000/callback',
+        'client_id': client_id,
+        'client_secret': client_secret,
+    })
+    assert status == 200
+    id_token = json.loads(body)['id_token']
+    payload_b64 = id_token.split('.')[1]
+    payload_b64 += '=' * (-len(payload_b64) % 4)
+    claims = json.loads(base64.urlsafe_b64decode(payload_b64))
+    assert claims.get('nonce') == expected_nonce
 
 
 def test_oauth2_token_authorization_code_with_pkce():

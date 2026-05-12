@@ -46,7 +46,10 @@ Supports:
                    DeleteManagedPrefixList
   VPN Gateways:    CreateVpnGateway, DescribeVpnGateways, AttachVpnGateway,
                    DetachVpnGateway, DeleteVpnGateway,
-                   EnableVgwRoutePropagation, DisableVgwRoutePropagation
+                   EnableVgwRoutePropagation, DisableVgwRoutePropagation,
+                   CreateVpnConnection, DescribeVpnConnections,
+                   DeleteVpnConnection, CreateVpnConnectionRoute,
+                   DeleteVpnConnectionRoute
   Customer GW:     CreateCustomerGateway, DescribeCustomerGateways,
                    DeleteCustomerGateway
   Launch Tmpl:     CreateLaunchTemplate, CreateLaunchTemplateVersion,
@@ -59,6 +62,7 @@ import hashlib
 import logging
 import os
 import random
+import re
 import string
 import time
 from urllib.parse import parse_qs
@@ -97,6 +101,7 @@ _egress_igws = AccountScopedDict()     # eigw_id -> egress-only internet gateway
 _prefix_lists = AccountScopedDict()    # pl_id -> managed prefix list record
 _vpn_gateways = AccountScopedDict()    # vgw_id -> VPN gateway record
 _customer_gateways = AccountScopedDict()  # cgw_id -> customer gateway record
+_vpn_connections = AccountScopedDict()    # vpn_id -> VPN connection record
 _launch_templates = AccountScopedDict()   # lt_id -> launch template record (includes versions list)
 
 
@@ -126,6 +131,7 @@ def get_state():
         "prefix_lists": copy.deepcopy(_prefix_lists),
         "vpn_gateways": copy.deepcopy(_vpn_gateways),
         "customer_gateways": copy.deepcopy(_customer_gateways),
+        "vpn_connections": copy.deepcopy(_vpn_connections),
         "launch_templates": copy.deepcopy(_launch_templates),
     }
 
@@ -154,6 +160,7 @@ def restore_state(data):
         _prefix_lists.update(data.get("prefix_lists", {}))
         _vpn_gateways.update(data.get("vpn_gateways", {}))
         _customer_gateways.update(data.get("customer_gateways", {}))
+        _vpn_connections.update(data.get("vpn_connections", {}))
         _launch_templates.update(data.get("launch_templates", {}))
 
 
@@ -302,10 +309,59 @@ def _run_instances(p):
         sg_ids = [_DEFAULT_SG_ID]
 
     now = _now_ts()
+    # Optional caller-provided values: respect them if set; fall back to defaults otherwise.
+    requested_private_ip = _p(p, "PrivateIpAddress")
+    iam_arn = _p(p, "IamInstanceProfile.Arn")
+    iam_name = _p(p, "IamInstanceProfile.Name")
+    iam_profile = None
+    if iam_arn or iam_name:
+        # Real AWS returns both Arn and Id. We synthesize a stable Id from the
+        # name/arn so DescribeInstances reads back as it does on AWS.
+        if not iam_arn and iam_name:
+            iam_arn = f"arn:aws:iam::{get_account_id()}:instance-profile/{iam_name}"
+        iam_id = "AIPA" + new_uuid().replace("-", "").upper()[:17]
+        iam_profile = {"Arn": iam_arn, "Id": iam_id}
     created = []
     for _ in range(max(1, min(min_count, max_count))):
         instance_id = _new_instance_id()
-        private_ip = _random_ip("10.0")
+        private_ip = requested_private_ip or _random_ip("10.0.")
+        # Synthesize a real root EBS volume so DescribeVolumes / DescribeInstances
+        # surface the same volume id, matching real AWS where every EBS-backed AMI
+        # auto-attaches a root volume regardless of whether the launch request
+        # specified BlockDeviceMappings. Cloud Custodian, AWS Config, and policy
+        # tools rely on the BDM presence to classify instance storage.
+        root_device = "/dev/xvda"
+        vol_id = _new_volume_id()
+        _volumes[vol_id] = {
+            "VolumeId": vol_id,
+            "Size": 8,
+            "AvailabilityZone": f"{get_region()}a",
+            "State": "in-use",
+            "VolumeType": "gp3",
+            "SnapshotId": "",
+            "Iops": 3000,
+            "Encrypted": False,
+            "CreateTime": now,
+            "Attachments": [{
+                "VolumeId": vol_id,
+                "InstanceId": instance_id,
+                "Device": root_device,
+                "State": "attached",
+                "AttachTime": now,
+                "DeleteOnTermination": True,
+            }],
+            "MultiAttachEnabled": False,
+            "Throughput": 125,
+        }
+        block_device_mappings = [{
+            "DeviceName": root_device,
+            "Ebs": {
+                "VolumeId": vol_id,
+                "Status": "attached",
+                "AttachTime": now,
+                "DeleteOnTermination": True,
+            },
+        }]
         _instances[instance_id] = {
             "InstanceId": instance_id,
             "ImageId": image_id,
@@ -327,7 +383,7 @@ def _run_instances(p):
             ],
             "Architecture": "x86_64",
             "RootDeviceType": "ebs",
-            "RootDeviceName": "/dev/xvda",
+            "RootDeviceName": root_device,
             "Hypervisor": "xen",
             "Virtualization": "hvm",
             "Placement": {"AvailabilityZone": f"{get_region()}a", "Tenancy": "default"},
@@ -335,6 +391,8 @@ def _run_instances(p):
             "AmiLaunchIndex": 0,
             "UserData": user_data,
             "LaunchTime": now,
+            "BlockDeviceMappings": block_device_mappings,
+            "IamInstanceProfile": iam_profile,
         }
         created.append(_instances[instance_id])
 
@@ -2140,13 +2198,48 @@ def _instance_xml(inst):
         <architecture>{inst['Architecture']}</architecture>
         <rootDeviceType>{inst['RootDeviceType']}</rootDeviceType>
         <rootDeviceName>{inst['RootDeviceName']}</rootDeviceName>
-        <virtualizationType>{inst['Virtualization']}</virtualizationType>
+        <blockDeviceMapping>{_inst_bdm_xml(inst)}</blockDeviceMapping>
+        {_inst_iam_xml(inst)}<virtualizationType>{inst['Virtualization']}</virtualizationType>
         <hypervisor>{inst['Hypervisor']}</hypervisor>
         <monitoring><state>{inst['Monitoring']['State']}</state></monitoring>
         <groupSet>{sgs}</groupSet>
         <tagSet>{tags}</tagSet>
         <amiLaunchIndex>{inst['AmiLaunchIndex']}</amiLaunchIndex>
     </item>"""
+
+
+def _inst_iam_xml(inst):
+    """Emit <iamInstanceProfile> block when an IAM profile is attached."""
+    iip = inst.get("IamInstanceProfile")
+    if not iip or not (iip.get("Arn") or iip.get("Id")):
+        return ""
+    return (
+        "<iamInstanceProfile>"
+        f"<arn>{_esc(iip.get('Arn', ''))}</arn>"
+        f"<id>{_esc(iip.get('Id', ''))}</id>"
+        "</iamInstanceProfile>"
+    )
+
+
+def _inst_bdm_xml(inst):
+    """Emit the running-instance BlockDeviceMapping shape. Distinct from the
+    launch-spec shape which carries VolumeSize/VolumeType/Encrypted; the
+    instance-runtime shape carries VolumeId/Status/AttachTime/DeleteOnTermination."""
+    out = ""
+    for bdm in inst.get("BlockDeviceMappings", []):
+        ebs = bdm.get("Ebs", {})
+        out += "<item>"
+        out += f"<deviceName>{_esc(bdm.get('DeviceName', ''))}</deviceName>"
+        out += "<ebs>"
+        if "VolumeId" in ebs:
+            out += f"<volumeId>{_esc(ebs['VolumeId'])}</volumeId>"
+        out += f"<status>{_esc(ebs.get('Status', 'attached'))}</status>"
+        if "AttachTime" in ebs:
+            out += f"<attachTime>{ebs['AttachTime']}</attachTime>"
+        out += f"<deleteOnTermination>{str(ebs.get('DeleteOnTermination', True)).lower()}</deleteOnTermination>"
+        out += "</ebs>"
+        out += "</item>"
+    return out
 
 
 def _sg_xml(sg):
@@ -2278,7 +2371,7 @@ def _rtb_fields_xml(rtb, tag="item"):
         <ownerId>{rtb['OwnerId']}</ownerId>
         <routeSet>{routes}</routeSet>
         <associationSet>{assocs}</associationSet>
-        <propagatingVgwSet/>
+        <propagatingVgwSet>{"".join(f"<item><gatewayId>{g}</gatewayId></item>" for g in rtb.get("PropagatingVgws", []))}</propagatingVgwSet>
         {_tag_set_xml(rtb['RouteTableId'])}
     </{tag}>"""
 
@@ -2537,7 +2630,8 @@ def _new_igw_id():
 
 
 def _random_ip(prefix):
-    return f"{prefix}{random.randint(1,254)}.{random.randint(1,254)}"
+    sep = "" if prefix.endswith(".") else "."
+    return f"{prefix}{sep}{random.randint(1,254)}.{random.randint(1,254)}"
 
 
 def _now_ts():
@@ -3177,27 +3271,151 @@ def _modify_vpc_endpoint(p):
 # DescribePrefixLists
 # ---------------------------------------------------------------------------
 
-_AWS_PREFIX_LISTS = {
-    "com.amazonaws.{region}.s3": ("pl-63a5400a", "com.amazonaws.{region}.s3"),
-    "com.amazonaws.{region}.dynamodb": ("pl-02cd2c6b", "com.amazonaws.{region}.dynamodb"),
-}
+# Regex to detect AWS managed prefix list names.
+# Matches: com.amazonaws.<region>.<service> or com.amazonaws.global.<service>
+# Optional ipv6 segment: com.amazonaws.<region>.ipv6.<service>
+_AWS_PREFIX_NAME_RE = re.compile(r"^com\.amazonaws\.([\w-]+)\.(ipv6\.)?([\w.-]+)$")
+
+# Fixed CIDR prefix lengths for AWS managed prefix lists.
+_AWS_PL_IPV4_PREFIX_LEN = 24
+_AWS_PL_IPV6_PREFIX_LEN = 56
+
+# Well-known AWS managed prefix list suffixes (single source of truth).
+# Used for enumeration in DescribeManagedPrefixLists and reverse ID lookup.
+_AWS_PL_REGIONAL_SUFFIXES = [
+    "s3", "dynamodb", "s3express", "vpc-lattice",
+    "route53-healthchecks", "ec2-instance-connect",
+    "ipv6.s3", "ipv6.dynamodb", "ipv6.s3express",
+    "ipv6.vpc-lattice", "ipv6.route53-healthchecks",
+    "ipv6.ec2-instance-connect",
+]
+
+_AWS_PL_GLOBAL_SUFFIXES = [
+    "cloudfront.origin-facing", "groundstation",
+    "ipv6.cloudfront.origin-facing",
+]
+
+
+def _aws_pl_id_from_name(prefix_name: str) -> str:
+    """Deterministic prefix-list ID derived from the name hash."""
+    h = hashlib.sha256(prefix_name.encode()).hexdigest()
+    return f"pl-{h[:17]}"
+
+
+def _aws_prefix_list_to_cidr(prefix_name: str, ipv6: bool = False) -> str:
+    """Deterministic mock: hash AWS managed prefix list name into a single CIDR.
+
+    IPv4: Forces result into 100.64.0.0/10 (CGNAT space) to avoid collision with real private ranges.
+    IPv6: Generates a deterministic /56 in the 64:ff9b:1::/48 space.
+    """
+    h = hashlib.sha256(prefix_name.encode()).digest()
+
+    if ipv6:
+        prefix_len = _AWS_PL_IPV6_PREFIX_LEN
+        # 64:ff9b:1::/48 space
+        base_bytes = bytes([0x00, 0x64, 0xff, 0x9b, 0x00, 0x01]) + b"\x00" * 10
+        base_int = int.from_bytes(base_bytes, "big")
+        usable_bits = prefix_len - 48
+        hash_int = int.from_bytes(h[:8], "big")
+        subnet_id = (hash_int >> (64 - usable_bits)) & ((1 << usable_bits) - 1)
+        network = base_int | (subnet_id << (128 - prefix_len))
+        groups = [format((network >> (112 - 16 * i)) & 0xFFFF, "x") for i in range(8)]
+        return f"{':'.join(groups)}/{prefix_len}"
+
+    # IPv4 — 100.64.0.0/10 = 0x64400000
+    prefix_len = _AWS_PL_IPV4_PREFIX_LEN
+    base = 0x64400000
+    usable_bits = prefix_len - 10
+    hash_int = int.from_bytes(h[:4], "big")
+    subnet_id = (hash_int >> (32 - usable_bits)) & ((1 << usable_bits) - 1)
+    network = base | (subnet_id << (32 - prefix_len))
+    octets = [(network >> (8 * i)) & 0xFF for i in range(3, -1, -1)]
+    return f"{'.'.join(map(str, octets))}/{prefix_len}"
+
+
+def _is_aws_managed_prefix_name(name: str) -> bool:
+    """Return True if the name matches the AWS managed prefix list pattern."""
+    return bool(_AWS_PREFIX_NAME_RE.match(name))
+
+
+def _is_aws_managed_prefix_id(pl_id: str) -> bool:
+    """Return True if the prefix-list ID belongs to an AWS managed prefix list."""
+    # AWS managed IDs are generated deterministically; check against known names
+    # by looking up in the resolve cache or checking the ID format.
+    # We use a fast path: if it's not in user-created lists, try to resolve it.
+    return pl_id not in _prefix_lists and _resolve_aws_pl_by_id(pl_id) is not None
+
+
+def _resolve_aws_pl(name: str) -> dict | None:
+    """Build an AWS managed prefix list record from a name if it matches the pattern."""
+    m = _AWS_PREFIX_NAME_RE.match(name)
+    if not m:
+        return None
+    is_ipv6 = m.group(2) is not None
+    return {
+        "PrefixListId": _aws_pl_id_from_name(name),
+        "PrefixListName": name,
+        "Cidr": _aws_prefix_list_to_cidr(name, ipv6=is_ipv6),
+        "AddressFamily": "IPv6" if is_ipv6 else "IPv4",
+        "MaxEntries": 20,
+        "OwnerId": "AWS",
+    }
+
+
+def _resolve_aws_pl_by_id(pl_id: str) -> dict | None:
+    """Reverse-lookup: given a prefix-list ID, find the matching AWS managed PL.
+
+    Since IDs are derived from names, we check against the well-known service names
+    for the current region and global scope.
+    """
+    region = get_region()
+    for suffix in _AWS_PL_REGIONAL_SUFFIXES:
+        name = f"com.amazonaws.{region}.{suffix}"
+        if _aws_pl_id_from_name(name) == pl_id:
+            return _resolve_aws_pl(name)
+    for suffix in _AWS_PL_GLOBAL_SUFFIXES:
+        name = f"com.amazonaws.global.{suffix}"
+        if _aws_pl_id_from_name(name) == pl_id:
+            return _resolve_aws_pl(name)
+    return None
+
+
+def _get_aws_managed_prefix_lists() -> list[dict]:
+    """Return the set of well-known AWS managed prefix lists for the current region."""
+    region = get_region()
+    result = []
+    for suffix in _AWS_PL_REGIONAL_SUFFIXES:
+        name = f"com.amazonaws.{region}.{suffix}"
+        pl = _resolve_aws_pl(name)
+        if pl:
+            result.append(pl)
+    for suffix in _AWS_PL_GLOBAL_SUFFIXES:
+        name = f"com.amazonaws.global.{suffix}"
+        pl = _resolve_aws_pl(name)
+        if pl:
+            result.append(pl)
+    return result
+
 
 def _describe_prefix_lists(p):
     filter_ids = _parse_member_list(p, "PrefixListId")
     filters = _parse_filters(p)
     items = ""
     # Built-in AWS service prefix lists
-    for tpl_svc, (pl_id, tpl_name) in _AWS_PREFIX_LISTS.items():
-        svc = tpl_svc.replace("{region}", get_region())
-        name = tpl_name.replace("{region}", get_region())
+    for aws_pl in _get_aws_managed_prefix_lists():
+        pl_id = aws_pl["PrefixListId"]
+        name = aws_pl["PrefixListName"]
+        cidr = aws_pl["Cidr"]
         if filter_ids and pl_id not in filter_ids:
             continue
         if filters.get("prefix-list-name") and name not in filters["prefix-list-name"]:
             continue
+        if filters.get("prefix-list-id") and pl_id not in filters["prefix-list-id"]:
+            continue
         items += f"""<item>
             <prefixListId>{pl_id}</prefixListId>
             <prefixListName>{name}</prefixListName>
-            <cidrSet><item><cidr>0.0.0.0/0</cidr></item></cidrSet>
+            <cidrSet><item>{cidr}</item></cidrSet>
         </item>"""
     # User-created managed prefix lists
     for pl in _prefix_lists.values():
@@ -3207,7 +3425,7 @@ def _describe_prefix_lists(p):
             continue
         if filters.get("prefix-list-name") and pl.get("PrefixListName", "") not in filters["prefix-list-name"]:
             continue
-        entries = "".join(f"<item><cidr>{e['Cidr']}</cidr></item>" for e in pl.get("Entries", []))
+        entries = "".join(f"<item>{e['Cidr']}</item>" for e in pl.get("Entries", []))
         items += f"""<item>
             <prefixListId>{pl['PrefixListId']}</prefixListId>
             <prefixListName>{pl.get('PrefixListName','')}</prefixListName>
@@ -3222,6 +3440,9 @@ def _describe_prefix_lists(p):
 
 def _create_managed_prefix_list(p):
     name = _p(p, "PrefixListName") or ""
+    # Reject creation of prefix lists that collide with AWS managed names
+    if _is_aws_managed_prefix_name(name):
+        return _error("UnsupportedOperation", "The action is not supported for an AWS-managed prefix list.", 400)
     max_entries = int(_p(p, "MaxEntries") or "10")
     af = _p(p, "AddressFamily") or "IPv4"
     pl_id = "pl-" + "".join(random.choices(string.hexdigits[:16], k=17))
@@ -3246,6 +3467,30 @@ def _describe_managed_prefix_lists(p):
     filter_ids = _parse_member_list(p, "PrefixListId")
     filters = _parse_filters(p)
     items = ""
+    # AWS managed prefix lists
+    for aws_pl in _get_aws_managed_prefix_lists():
+        pl_id = aws_pl["PrefixListId"]
+        name = aws_pl["PrefixListName"]
+        if filter_ids and pl_id not in filter_ids:
+            continue
+        if filters.get("prefix-list-name") and name not in filters["prefix-list-name"]:
+            continue
+        if filters.get("prefix-list-id") and pl_id not in filters["prefix-list-id"]:
+            continue
+        if filters.get("owner-id") and "AWS" not in filters["owner-id"]:
+            continue
+        items += f"""<item>
+        <prefixListId>{pl_id}</prefixListId>
+        <prefixListName>{name}</prefixListName>
+        <state>create-complete</state>
+        <addressFamily>{aws_pl['AddressFamily']}</addressFamily>
+        <maxEntries>{aws_pl['MaxEntries']}</maxEntries>
+        <version>1</version>
+        <prefixListArn>arn:aws:ec2:{get_region()}:aws:prefix-list/{pl_id}</prefixListArn>
+        <ownerId>AWS</ownerId>
+        <tagSet/>
+    </item>"""
+    # User-created managed prefix lists
     for pl in _prefix_lists.values():
         if filter_ids and pl["PrefixListId"] not in filter_ids:
             continue
@@ -3253,12 +3498,25 @@ def _describe_managed_prefix_lists(p):
             continue
         if filters.get("prefix-list-name") and pl.get("PrefixListName", "") not in filters["prefix-list-name"]:
             continue
+        if filters.get("owner-id") and pl.get("OwnerId", get_account_id()) not in filters["owner-id"]:
+            continue
         items += _prefix_list_xml(pl)
     return _xml(200, "DescribeManagedPrefixListsResponse", f"<prefixListSet>{items}</prefixListSet>")
 
 
 def _get_managed_prefix_list_entries(p):
     pl_id = _p(p, "PrefixListId")
+    # Check AWS managed prefix lists first
+    aws_pl = _resolve_aws_pl_by_id(pl_id)
+    if aws_pl:
+        cidr = aws_pl["Cidr"]
+        name = aws_pl["PrefixListName"]
+        entries = f"""<item>
+        <cidr>{cidr}</cidr>
+        <description>{name}</description>
+    </item>"""
+        return _xml(200, "GetManagedPrefixListEntriesResponse", f"<entrySet>{entries}</entrySet>")
+    # User-created managed prefix lists
     pl = _prefix_lists.get(pl_id)
     if not pl:
         return _error("InvalidPrefixListID.NotFound", f"Prefix list '{pl_id}' not found", 400)
@@ -3271,6 +3529,9 @@ def _get_managed_prefix_list_entries(p):
 
 def _modify_managed_prefix_list(p):
     pl_id = _p(p, "PrefixListId")
+    # Reject modifications to AWS managed prefix lists
+    if _is_aws_managed_prefix_id(pl_id):
+        return _error("UnsupportedOperation", "The action is not supported for an AWS-managed prefix list.", 400)
     pl = _prefix_lists.get(pl_id)
     if not pl:
         return _error("InvalidPrefixListID.NotFound", f"Prefix list '{pl_id}' not found", 400)
@@ -3294,15 +3555,20 @@ def _modify_managed_prefix_list(p):
     if rm_cidrs:
         pl["Entries"] = [e for e in pl["Entries"] if e["Cidr"] not in rm_cidrs]
     pl["Version"] = pl.get("Version", 1) + 1
+    pl["State"] = "modify-complete"
     return _xml(200, "ModifyManagedPrefixListResponse", _prefix_list_xml(pl, tag="prefixList"))
 
 
 def _delete_managed_prefix_list(p):
     pl_id = _p(p, "PrefixListId")
+    # Reject deletion of AWS managed prefix lists
+    if _is_aws_managed_prefix_id(pl_id):
+        return _error("UnsupportedOperation", "The action is not supported for an AWS-managed prefix list.", 400)
     if pl_id not in _prefix_lists:
         return _error("InvalidPrefixListID.NotFound", f"Prefix list '{pl_id}' not found", 400)
-    del _prefix_lists[pl_id]
-    return _xml(200, "DeleteManagedPrefixListResponse", "<return>true</return>")
+    pl = _prefix_lists.pop(pl_id)
+    pl["State"] = "delete-complete"
+    return _xml(200, "DeleteManagedPrefixListResponse", _prefix_list_xml(pl, tag="prefixList"))
 
 
 def _prefix_list_xml(pl, tag="item"):
@@ -3478,6 +3744,88 @@ def _cgw_xml(cgw, tag="item"):
 
 
 # ---------------------------------------------------------------------------
+# VPN Connections
+# ---------------------------------------------------------------------------
+
+def _create_vpn_connection(p):
+    conn_type = _p(p, "Type") or "ipsec.1"
+    cgw_id = _p(p, "CustomerGatewayId")
+    vgw_id = _p(p, "VpnGatewayId") or ""
+    tgw_id = _p(p, "TransitGatewayId") or ""
+    static_only = _p(p, "Options.StaticRoutesOnly") or "false"
+    tags = _parse_tags(p)
+    vpn_id = "vpn-" + "".join(random.choices(string.hexdigits[:16], k=17))
+    _vpn_connections[vpn_id] = {
+        "VpnConnectionId": vpn_id, "State": "available", "Type": conn_type,
+        "CustomerGatewayId": cgw_id, "VpnGatewayId": vgw_id,
+        "TransitGatewayId": tgw_id, "Category": "VPN",
+        "Options": {"StaticRoutesOnly": static_only.lower() == "true"},
+        "Routes": [], "Tags": tags, "OwnerId": get_account_id(),
+    }
+    if tags:
+        _tags[vpn_id] = tags
+    return _xml(200, "CreateVpnConnectionResponse", _vpn_conn_xml(_vpn_connections[vpn_id], tag="vpnConnection"))
+
+
+def _vpn_conn_xml(vpn, tag="item"):
+    routes = "".join(
+        f"<item><destinationCidrBlock>{r['DestinationCidrBlock']}</destinationCidrBlock><state>{r['State']}</state></item>"
+        for r in vpn.get("Routes", [])
+    )
+    return f"""<{tag}>
+        <vpnConnectionId>{vpn['VpnConnectionId']}</vpnConnectionId>
+        <state>{vpn['State']}</state>
+        <type>{vpn['Type']}</type>
+        <customerGatewayId>{vpn['CustomerGatewayId']}</customerGatewayId>
+        <vpnGatewayId>{vpn['VpnGatewayId']}</vpnGatewayId>
+        <transitGatewayId>{vpn['TransitGatewayId']}</transitGatewayId>
+        <category>{vpn['Category']}</category>
+        <options><staticRoutesOnly>{'true' if vpn['Options']['StaticRoutesOnly'] else 'false'}</staticRoutesOnly></options>
+        <routes>{routes}</routes>
+        {_tag_set_xml(vpn['VpnConnectionId'])}
+    </{tag}>"""
+
+
+def _describe_vpn_connections(p):
+    filter_ids = _parse_member_list(p, "VpnConnectionId")
+    items = ""
+    for vpn in _vpn_connections.values():
+        if filter_ids and vpn["VpnConnectionId"] not in filter_ids:
+            continue
+        items += _vpn_conn_xml(vpn)
+    return _xml(200, "DescribeVpnConnectionsResponse", f"<vpnConnectionSet>{items}</vpnConnectionSet>")
+
+
+def _delete_vpn_connection(p):
+    vpn_id = _p(p, "VpnConnectionId")
+    if vpn_id not in _vpn_connections:
+        return _error("InvalidVpnConnectionID.NotFound", f"VPN connection '{vpn_id}' not found", 400)
+    _vpn_connections[vpn_id]["State"] = "deleted"
+    del _vpn_connections[vpn_id]
+    return _xml(200, "DeleteVpnConnectionResponse", "<return>true</return>")
+
+
+def _create_vpn_connection_route(p):
+    vpn_id = _p(p, "VpnConnectionId")
+    cidr = _p(p, "DestinationCidrBlock")
+    if vpn_id not in _vpn_connections:
+        return _error("InvalidVpnConnectionID.NotFound", f"VPN connection '{vpn_id}' not found", 400)
+    routes = _vpn_connections[vpn_id]["Routes"]
+    if not any(r["DestinationCidrBlock"] == cidr for r in routes):
+        routes.append({"DestinationCidrBlock": cidr, "State": "available"})
+    return _xml(200, "CreateVpnConnectionRouteResponse", "<return>true</return>")
+
+
+def _delete_vpn_connection_route(p):
+    vpn_id = _p(p, "VpnConnectionId")
+    cidr = _p(p, "DestinationCidrBlock")
+    if vpn_id not in _vpn_connections:
+        return _error("InvalidVpnConnectionID.NotFound", f"VPN connection '{vpn_id}' not found", 400)
+    _vpn_connections[vpn_id]["Routes"] = [r for r in _vpn_connections[vpn_id]["Routes"] if r["DestinationCidrBlock"] != cidr]
+    return _xml(200, "DeleteVpnConnectionRouteResponse", "<return>true</return>")
+
+
+# ---------------------------------------------------------------------------
 # Reset
 # ---------------------------------------------------------------------------
 
@@ -3504,6 +3852,7 @@ def reset():
     _prefix_lists.clear()
     _vpn_gateways.clear()
     _customer_gateways.clear()
+    _vpn_connections.clear()
     _launch_templates.clear()
     _init_defaults()
 
@@ -4321,6 +4670,12 @@ _ACTION_MAP = {
     "CreateCustomerGateway": _create_customer_gateway,
     "DescribeCustomerGateways": _describe_customer_gateways,
     "DeleteCustomerGateway": _delete_customer_gateway,
+    # VPN Connections
+    "CreateVpnConnection": _create_vpn_connection,
+    "DescribeVpnConnections": _describe_vpn_connections,
+    "DeleteVpnConnection": _delete_vpn_connection,
+    "CreateVpnConnectionRoute": _create_vpn_connection_route,
+    "DeleteVpnConnectionRoute": _delete_vpn_connection_route,
     # EBS Volumes
     "CreateVolume": _create_volume,
     "DeleteVolume": _delete_volume,

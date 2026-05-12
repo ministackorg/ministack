@@ -79,6 +79,9 @@ def _provision_resource(resource_type: str, logical_id: str, props: dict,
     handler = _RESOURCE_HANDLERS.get(resource_type)
     if handler and "create" in handler:
         return handler["create"](logical_id, props, stack_name)
+    # Custom resource types (Custom::* handled here; AWS::CloudFormation::CustomResource goes through handler)
+    if resource_type.startswith("Custom::"):
+        return _custom_resource_create(logical_id, props, stack_name, resource_type)
     # CloudFormation internal types are no-ops
     if resource_type.startswith("AWS::CloudFormation::"):
         logger.info("CloudFormation internal type %s for %s -- noop", resource_type, logical_id)
@@ -87,18 +90,28 @@ def _provision_resource(resource_type: str, logical_id: str, props: dict,
     raise ValueError(f"Unsupported resource type: {resource_type}")
 
 
-def _delete_resource(resource_type: str, physical_id: str, props: dict):
+def _delete_resource(resource_type: str, physical_id: str, props: dict,
+                     stack_name: str | None = None, logical_id: str | None = None):
     """Delete a provisioned resource."""
     handler = _RESOURCE_HANDLERS.get(resource_type)
     if handler and "delete" in handler:
         handler["delete"](physical_id, props)
+        return
+    # Custom resource types
+    if resource_type.startswith("Custom::") or resource_type == "AWS::CloudFormation::CustomResource":
+        _custom_resource_delete(
+            physical_id, props,
+            stack_name=stack_name, logical_id=logical_id,
+            resource_type=resource_type,
+        )
         return
     logger.warning("No delete handler for resource type %s (id=%s)",
                    resource_type, physical_id)
 
 
 def _update_resource(resource_type: str, physical_id: str, old_props: dict,
-                     new_props: dict, stack_name: str) -> tuple:
+                     new_props: dict, stack_name: str,
+                     logical_id: str | None = None) -> tuple:
     """Update a provisioned resource in place when the type provides an ``update``
     handler. Falls back to ``create`` (which provisioners are expected to
     implement idempotently) when no explicit update handler is registered.
@@ -107,6 +120,13 @@ def _update_resource(resource_type: str, physical_id: str, old_props: dict,
     handler = _RESOURCE_HANDLERS.get(resource_type)
     if handler and "update" in handler:
         return handler["update"](physical_id, old_props, new_props, stack_name)
+    # Custom resource types
+    if resource_type.startswith("Custom::") or resource_type == "AWS::CloudFormation::CustomResource":
+        return _custom_resource_update(
+            physical_id, old_props, new_props, stack_name,
+            logical_id=logical_id,
+            resource_type=resource_type,
+        )
     # No update handler — fall through to create. Most resource types make
     # their create idempotent; CFN never sees a fresh physical id this way.
     return _provision_resource(resource_type, physical_id, new_props, stack_name)
@@ -414,6 +434,51 @@ def _ddb_create(logical_id, props, stack_name):
 
 def _ddb_delete(physical_id, props):
     _dynamodb._tables.pop(physical_id, None)
+
+
+def _ddb_global_table_create(logical_id, props, stack_name):
+    """Provision an AWS::DynamoDB::GlobalTable.
+
+    GlobalTable's CFN schema diverges from Table's in three places that affect
+    a single-process emulator:
+      * No `ProvisionedThroughput` — capacity comes from
+        `WriteProvisionedThroughputSettings` and `ReadProvisionedThroughputSettings`,
+        each wrapping a `<Read|Write>CapacityAutoScalingSettings.MinCapacity`.
+      * `Replicas` is required (one entry per region). Cross-region replication
+        has no meaning here, so we accept the field and ignore its contents.
+      * Multi-region settings (`MultiRegionConsistency`, `GlobalTableWitnesses`,
+        `GlobalTableSourceArn`, `WarmThroughput`) are accepted and ignored.
+
+    Everything else (`KeySchema`, `AttributeDefinitions`, `BillingMode`, GSIs,
+    LSIs, `StreamSpecification`, `SSESpecification`, `TimeToLiveSpecification`,
+    `TableName`) routes through the regular Table provisioner.
+    """
+    translated = dict(props)
+    translated.pop("Replicas", None)
+    translated.pop("MultiRegionConsistency", None)
+    translated.pop("GlobalTableWitnesses", None)
+    translated.pop("GlobalTableSourceArn", None)
+    translated.pop("WarmThroughput", None)
+    translated.pop("WriteOnDemandThroughputSettings", None)
+    translated.pop("ReadOnDemandThroughputSettings", None)
+
+    write = (props.get("WriteProvisionedThroughputSettings") or {})
+    read = (props.get("ReadProvisionedThroughputSettings") or {})
+    write_cap = (write.get("WriteCapacityAutoScalingSettings") or {}).get("MinCapacity")
+    read_cap = (read.get("ReadCapacityAutoScalingSettings") or {}).get("MinCapacity")
+    if write_cap is not None or read_cap is not None:
+        translated["ProvisionedThroughput"] = {
+            "WriteCapacityUnits": int(write_cap) if write_cap is not None else 5,
+            "ReadCapacityUnits": int(read_cap) if read_cap is not None else 5,
+        }
+    translated.pop("WriteProvisionedThroughputSettings", None)
+    translated.pop("ReadProvisionedThroughputSettings", None)
+
+    return _ddb_create(logical_id, translated, stack_name)
+
+
+def _ddb_global_table_delete(physical_id, props):
+    _ddb_delete(physical_id, props)
 
 
 # --- Lambda Function ---
@@ -981,6 +1046,49 @@ def _cfn_wait_condition_handle_create(logical_id, props, stack_name):
     pid = f"{stack_name}-{logical_id}-{new_uuid()[:8]}"
     url = f"https://cloudformation-waitcondition-{get_region()}.s3.amazonaws.com/{pid}"
     return pid, {"Ref": url}
+
+
+# --- CloudFormation Custom Resource ---
+
+def _cr_stack_id(stack_name: str) -> str:
+    """Return the StackId for stack_name, falling back to a synthesised ARN."""
+    from ministack.services.cloudformation import _stacks
+    stack = _stacks.get(stack_name) or {}
+    return stack.get(
+        "StackId",
+        f"arn:aws:cloudformation:{get_region()}:{get_account_id()}:stack/{stack_name}/unknown",
+    )
+
+
+def _custom_resource_create(logical_id, props, stack_name, resource_type="AWS::CloudFormation::CustomResource"):
+    from ministack.services.cloudformation import custom_resource as _cr
+    return _cr.invoke_custom_resource(
+        "Create", logical_id, props, stack_name, _cr_stack_id(stack_name), resource_type,
+    )
+
+
+def _custom_resource_update(physical_id, old_props, new_props, stack_name,
+                             logical_id=None, resource_type="AWS::CloudFormation::CustomResource"):
+    from ministack.services.cloudformation import custom_resource as _cr
+    return _cr.invoke_custom_resource(
+        "Update", logical_id or physical_id, new_props, stack_name,
+        _cr_stack_id(stack_name), resource_type,
+        physical_id=physical_id, old_props=old_props,
+    )
+
+
+def _custom_resource_delete(physical_id, props, stack_name=None, logical_id=None,
+                             resource_type="AWS::CloudFormation::CustomResource"):
+    # CDK uses a marker physical ID when Create failed — treat as no-op
+    if not physical_id or physical_id == "FAILED_CREATE_MARKER":
+        return
+    sname = stack_name or ""
+    from ministack.services.cloudformation import custom_resource as _cr
+    _cr.invoke_custom_resource(
+        "Delete", logical_id or physical_id, props, sname,
+        _cr_stack_id(sname), resource_type,
+        physical_id=physical_id,
+    )
 
 
 # --- API Gateway REST API ---
@@ -3027,6 +3135,12 @@ _RESOURCE_HANDLERS = {
     "AWS::SNS::Topic": {"create": _sns_create, "delete": _sns_delete},
     "AWS::SNS::Subscription": {"create": _sns_sub_create, "delete": _sns_sub_delete},
     "AWS::DynamoDB::Table": {"create": _ddb_create, "delete": _ddb_delete},
+    # CDK TableV2 emits AWS::DynamoDB::GlobalTable, even for single-region
+    # tables. The schema differs from Table (no ProvisionedThroughput; capacity
+    # comes from WriteProvisionedThroughputSettings; Replicas is required and
+    # ignored locally), so it gets a dedicated provisioner that translates
+    # before delegating to the Table engine.
+    "AWS::DynamoDB::GlobalTable": {"create": _ddb_global_table_create, "delete": _ddb_global_table_delete},
     "AWS::Lambda::Function": {"create": _lambda_create, "delete": _lambda_delete},
     "AWS::IAM::Role": {"create": _iam_role_create, "delete": _iam_role_delete},
     "AWS::IAM::Policy": {"create": _iam_policy_create, "delete": _iam_policy_delete},
@@ -3040,6 +3154,11 @@ _RESOURCE_HANDLERS = {
     "AWS::Lambda::Version": {"create": _lambda_version_create},
     "AWS::CloudFormation::WaitCondition": {"create": _cfn_wait_condition_create},
     "AWS::CloudFormation::WaitConditionHandle": {"create": _cfn_wait_condition_handle_create},
+    # The "create" entry is load-bearing: without it, _provision_resource would
+    # hit the generic "AWS::CloudFormation::*" no-op branch. Update and delete
+    # are intentionally absent — they route through the explicit if-branches in
+    # _update_resource/_delete_resource so stack_name and logical_id reach the handler.
+    "AWS::CloudFormation::CustomResource": {"create": _custom_resource_create},
     "AWS::ApiGateway::RestApi": {"create": _apigw_rest_api_create, "delete": _apigw_rest_api_delete},
     "AWS::ApiGateway::Resource": {"create": _apigw_resource_create, "delete": _apigw_resource_delete},
     "AWS::ApiGateway::Method": {"create": _apigw_method_create, "delete": _apigw_method_delete},

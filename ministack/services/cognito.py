@@ -159,18 +159,27 @@ def well_known_jwks(pool_id: str):
     return 200, {"Content-Type": "application/json"}, json.dumps({"keys": [_JWKS_KEY]}).encode()
 
 
-def well_known_openid_configuration(pool_id: str, region: str | None = None):
-    """Return OpenID Connect discovery document."""
+def well_known_openid_configuration(pool_id: str, region: str | None = None, host: str | None = None):
+    """Return OpenID Connect discovery document.
+
+    `issuer` matches the JWT `iss` claim (real AWS URL) so OIDC clients that
+    verify `iss == discovery.issuer` keep working. Endpoint URLs point at the
+    MiniStack gateway where /oauth2/authorize, /oauth2/token, /oauth2/userInfo
+    and /logout are actually served (added by PR #344). Real AWS serves these
+    on the pool-domain host; MiniStack serves them on the gateway.
+    """
     r = region or get_region()
     issuer = f"https://cognito-idp.{r}.amazonaws.com/{pool_id}"
+    base = f"http://{host}" if host else f"http://{_MINISTACK_HOST}:{_MINISTACK_PORT}"
+    pool_base = f"{base}/{pool_id}"
     doc = {
         "issuer": issuer,
-        "jwks_uri": f"{issuer}/.well-known/jwks.json",
-        "authorization_endpoint": f"{issuer}/oauth2/authorize",
-        "token_endpoint": f"{issuer}/oauth2/token",
-        "userinfo_endpoint": f"{issuer}/oauth2/userInfo",
-        "end_session_endpoint": f"{issuer}/logout",
-        "response_types_supported": ["code"],
+        "jwks_uri": f"{pool_base}/.well-known/jwks.json",
+        "authorization_endpoint": f"{base}/oauth2/authorize",
+        "token_endpoint": f"{base}/oauth2/token",
+        "userinfo_endpoint": f"{base}/oauth2/userInfo",
+        "end_session_endpoint": f"{base}/logout",
+        "response_types_supported": ["code", "token"],
         "subject_types_supported": ["public"],
         "id_token_signing_alg_values_supported": ["RS256"],
         "scopes_supported": ["openid", "email", "phone", "profile"],
@@ -328,6 +337,7 @@ def _identity_id(pool_id: str) -> str:
 def _fake_token(sub: str, pool_id: str, client_id: str, token_type: str = "access",
                  username: str = "", user_attrs: dict | None = None,
                  groups: list[str] | None = None,
+                 nonce: str = "",
                  trigger_source: str = "TokenGeneration_Authentication") -> str:
     """Return a JWT signed with the RSA key when cryptography is available.
 
@@ -353,6 +363,12 @@ def _fake_token(sub: str, pool_id: str, client_id: str, token_type: str = "acces
         claims["aud"] = client_id
         claims["auth_time"] = now
         claims["origin_jti"] = origin_jti
+        # OIDC requires the nonce from the authorize request to be echoed back
+        # in the id_token so the client can mitigate replay attacks. Strict
+        # OIDC clients (e.g. oidc-client-ts) silently discard tokens missing
+        # an expected nonce.
+        if nonce:
+            claims["nonce"] = nonce
         if username:
             claims["cognito:username"] = username
         if groups:
@@ -1490,7 +1506,7 @@ def _mfa_challenge_for_user(pool: dict, user: dict, pid: str, username: str) -> 
     }
 
 
-def _build_auth_result(pool_id: str, client_id: str, user: dict) -> dict:
+def _build_auth_result(pool_id: str, client_id: str, user: dict, nonce: str = "") -> dict:
     attrs = _attr_list_to_dict(user.get("Attributes", []))
     sub = attrs.get("sub", user["Username"])
     username = user.get("Username", "")
@@ -1499,7 +1515,7 @@ def _build_auth_result(pool_id: str, client_id: str, user: dict) -> dict:
         "AccessToken": _fake_token(sub, pool_id, client_id, "access", username=username,
                                     user_attrs=attrs, groups=groups),
         "IdToken": _fake_token(sub, pool_id, client_id, "id", username=username,
-                               user_attrs=attrs, groups=groups),
+                               user_attrs=attrs, groups=groups, nonce=nonce),
         "RefreshToken": _fake_token(sub, pool_id, client_id, "refresh"),
         "TokenType": "Bearer",
         "ExpiresIn": 3600,
@@ -2827,7 +2843,7 @@ def _oauth2_token(data, query_params, raw_body: bytes = b"", headers: dict | Non
             if client and client.get("ClientSecret") and csec != client["ClientSecret"]:
                 return _oauth2_error("invalid_client", "Invalid client credentials.")
 
-            result = _build_auth_result(pool_id, cid, user)
+            result = _build_auth_result(pool_id, cid, user, nonce=entry.get("nonce", ""))
             refresh_val = result["RefreshToken"]
             _refresh_tokens[refresh_val] = {
                 "pool_id": pool_id,

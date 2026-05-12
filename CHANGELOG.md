@@ -12,6 +12,72 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 ### Fixed
 - **S3 `_parse_bucket_key` absolute-form request targets** — AWS SDK for .NET v4 sends HTTP/1.1 requests with absolute-form targets (e.g. `PUT http://ministack:4566/bucket/key`). hypercorn passes the raw target as `scope["path"]`, causing `_parse_bucket_key` to parse `http:` as the bucket name. The function now strips the scheme and authority before parsing, matching the behaviour of LocalStack.
 
+## [1.3.36] — 2026-05-11
+
+### Added
+- **IAM AWS-managed policies (`arn:aws:iam::aws:policy/<Name>`)** — real AWS hosts these under a virtual `aws` account every customer can read; MiniStack used to key every policy by the caller's account so `GetPolicy(arn:aws:iam::aws:policy/AdministratorAccess)` returned `NoSuchEntity`. AWS-managed policies now live in a separate non-account-scoped store, pre-seeded with 20 of the most commonly referenced policies (`AdministratorAccess`, `PowerUserAccess`, `ReadOnlyAccess`, `SecurityAudit`, `AWSLambdaBasicExecutionRole`, `AmazonS3FullAccess`/`ReadOnlyAccess`, `AmazonEC2FullAccess`/`ReadOnlyAccess`, `AmazonSSMManagedInstanceCore`, `AmazonDynamoDBFullAccess`, `AWSLambdaVPCAccessExecutionRole`, and friends) carrying their canonical AWS documents verbatim. Unknown AWS-managed ARNs return `NoSuchEntity` by default so typos surface locally; opt in to permissive autovivify with `MINISTACK_AUTOCREATE_AWS_MANAGED=1`. `AttachmentCount` is tracked per-(session-account, arn) via an account-scoped sidecar, matching real AWS where the counter is per-account. `ListPolicies` respects `Scope=All`/`AWS`/`Local`; attach/detach work against any AWS-managed ARN; mutation operations (`CreatePolicy` into the `aws` namespace, `DeletePolicy`, `TagPolicy`, `UntagPolicy`, `CreatePolicyVersion`, `DeletePolicyVersion`) return `AccessDenied` / `InvalidInput` to match real AWS. Contributed by @spicykay.
+- **Cost and Usage Reports (CUR)** — full 7-operation surface (`PutReportDefinition`, `DescribeReportDefinitions`, `ModifyReportDefinition`, `DeleteReportDefinition`, `TagResource`, `UntagResource`, `ListTagsForResource`). Report definitions persist; report file generation is not emulated (MiniStack doesn't track usage or compute costs), so this targets IaC validation — Terraform / CDK / Bash automation that manages `aws_cur_report_definition` resources can now plan and apply against MiniStack without hitting real AWS billing. Contributed by @staranto.
+- **Lambda Ruby 4.0 runtime** — `ruby4.0` maps to `public.ecr.aws/lambda/ruby:4.0`, tracking the runtime AWS added in May 2026 (botocore 1.42.94).
+
+### Fixed
+- **RDS `DescribeDBClusters` serialization — `DatabaseName`, `NetworkType`, `EngineLifecycleSupport`** — three independent shape bugs on the same code path. `DatabaseName` was stored as `""` and always emitted, so botocore parsed it as the empty string instead of `null`; the field is now stored as `None` when unset and only emitted when truthy, matching real-AWS XML elision. `NetworkType` and `EngineLifecycleSupport` were never stored or serialized; they're now accepted from the request and emit with the AWS-documented defaults (`IPV4` and `open-source-rds-extended-support`). Surfaced by brownfield-import diffing against a real-AWS captured Aurora cluster. Contributed by @jayjanssen.
+- **RDS `DescribeDBClusterParameters` emits `<Source>` element** — the cluster-parameter response XML omitted `<Source>` entirely, so botocore materialized `Parameters[].Source` as `None` for every entry. Each emitted `<Parameter>` now includes `<Source>user</Source>`, matching the existing instance-level path. Note: MiniStack only stores user-modified parameters (engine defaults are not modelled); the literal `user` is correct for the slice MS currently returns but will need to become conditional once engine-defaults are added. Surfaced by the same brownfield-import diffing. Contributed by @jayjanssen.
+- **CUR report definitions lost on warm-boot** — the CUR module declared `get_state()` and `restore_state()` but the `load_state("cur")` call at import time was missing, so MiniStack wrote state on shutdown and never read it on restart. Standard import-time block added; `PERSIST_STATE=1` now correctly survives across container restarts for CUR.
+- **IAM `AttachmentCount` on AWS-managed policies reset on warm-boot** — the per-(session-account, arn) sidecar `_aws_managed_attachment_counts` added with the AWS-managed-policies work was missing from `get_state` / `restore_state`. Customer-managed `AttachmentCount` already persisted via the policy record itself; only the AWS-managed-policy sidecar was dropped. Now wired in.
+
+## [1.3.35] — 2026-05-11
+
+### Fixed
+- **EKS `CreateCluster` — k3s container now starts with `privileged=True`** — the k3s server container was being launched with a granular `cap_add` list + unconfined seccomp/apparmor in an attempt to avoid privileged mode, but k3s server mode remounts `/sys/fs/cgroup` and no capability set short of `--privileged` permits that. The container exited on boot with `failed to evacuate root cgroup: mkdir /sys/fs/cgroup/init: read-only file system`, breaking EKS cluster creation entirely. The container is now launched with `privileged=True`; the cap_add list is retained as defence-in-depth. Documented as a host-security trade-off in the EKS section of the README. Reported by @zkoncir.
+- **SNS FIFO topic → standard SQS queue subscription** — MiniStack rejected the subscribe with `InvalidParameterException: Topic with FIFO requires a subscription to a FIFO SQS Queue`, which was the AWS rule until 2023-09-14 when AWS added support for FIFO topics fanning out to standard SQS queues. The stale validation is removed; the existing fanout path already attaches `MessageGroupId` / `MessageDeduplicationId` to delivered messages and SQS standard queues ignore those fields, matching real AWS where consumers of a standard queue subscribed to a FIFO topic "may receive messages out of order, and more than once." Contributed by @ellouzeskandercs.
+- **RDS `CreateDBInstance` honors `PreferredMaintenanceWindow`** — the field was hardcoded to `sun:05:00-sun:06:00` on the instance record at creation time, silently discarding any caller-supplied value. `ModifyDBInstance` and cluster-level `PreferredMaintenanceWindow` already worked, so the divergence was per-instance only on create. The create path now reads the user value and falls back to the default only when none is supplied. Surfaced by Terraform `aws_rds_cluster_instance.preferred_maintenance_window` round-trip diffing against a real-AWS capture. Contributed by @jayjanssen.
+
+
+---
+
+
+## [1.3.34] — 2026-05-11
+
+### Added
+- **ECR Docker Registry HTTP API V2 (`docker push` / `docker pull`)** — the registry V2 wire protocol now serves alongside the AWS API on the same gateway, matching real ECR. Covers `/v2/` ping, `/v2/_catalog`, chunked and single-shot blob upload, cross-repo blob mount, blob HEAD/GET/DELETE, manifest PUT/GET/HEAD/DELETE (by tag or digest), and `/tags/list`. Pushed images surface immediately in `aws ecr describe-images`; layer and manifest bytes persist under `PERSIST_STATE=1`. Routing fix bundled: registry paths previously fell through to S3 path-style and returned `405`; the new pre-empt matches only registry shapes (`/blobs/`, `/manifests/`, `/tags/list`) so API Gateway v2, AppSync Events, and SES v2 are unaffected. Reported by @LeTrungNguyen1703.
+- **CloudFormation Custom Resource protocol** — `Custom::*` and `AWS::CloudFormation::CustomResource` now run the full Create / Update / Delete lifecycle. MiniStack mints a local `/_ministack/cfn-response/{token}` intercept in place of a pre-signed S3 ResponseURL, and the provisioner runs in `asyncio.to_thread` so the loop stays free for the Lambda's PUT callback — required for CDK `cr.Provider`-backed Lambdas. `Update` forwards `OldResourceProperties`; `Delete` carries the `PhysicalResourceId` from `Create`; `PhysicalResourceId` falls back to `RequestId` when the Lambda omits it. `ServiceToken` accepts bare function names or full Lambda ARNs. Contributed by @hiddengearz.
+
+### Fixed
+- **Cognito OAuth2 `nonce` echoed into `id_token`** — the authorize endpoint already stored the client-supplied `nonce` on the auth code, but `/oauth2/token` never threaded it into the minted id_token. Per OIDC Core 1.0 §3.1.3.7, strict OIDC libraries (`oidc-client-ts`, `react-oidc-context`, Auth0 / Microsoft clients) discard tokens missing an expected nonce. Now stamped on the id_token only; access and refresh tokens unchanged. Contributed by @coezbek.
+
+---
+
+## [1.3.33] — 2026-05-09
+
+### Added
+- **CloudFormation `AWS::DynamoDB::GlobalTable`** — covers the schema CDK `TableV2` emits. Honors `KeySchema`, `AttributeDefinitions`, `BillingMode`, `StreamSpecification`, `GlobalSecondaryIndexes`, `LocalSecondaryIndexes`, `SSESpecification`, `TimeToLiveSpecification`, and `TableName`. For PROVISIONED billing, `WriteProvisionedThroughputSettings.WriteCapacityAutoScalingSettings.MinCapacity` and `ReadProvisionedThroughputSettings.ReadCapacityAutoScalingSettings.MinCapacity` are translated to the engine's static `ProvisionedThroughput.{Write,Read}CapacityUnits` (since a single-process emulator doesn't simulate auto-scaling). `Replicas` is accepted and ignored — cross-region replication has no meaning here — along with `MultiRegionConsistency`, `GlobalTableWitnesses`, `GlobalTableSourceArn`, `WarmThroughput`, `ReadOnDemandThroughputSettings`, and `WriteOnDemandThroughputSettings`. Stacks that mix `AWS::DynamoDB::Table` and `AWS::DynamoDB::GlobalTable` deploy unmodified. Reported by @youngkwangk.
+
+---
+
+## [1.3.32] — 2026-05-09
+
+### Added
+- **EC2 VPN Connection support** — `CreateVpnConnection`, `DescribeVpnConnections`, `DeleteVpnConnection`, `CreateVpnConnectionRoute`, `DeleteVpnConnectionRoute`. Stores `Type`, `CustomerGatewayId`, `VpnGatewayId`, `TransitGatewayId`, `Options.StaticRoutesOnly`, and per-connection `Routes`. Contributed by @tmq107.
+
+### Fixed
+- **Cognito OIDC autodiscovery** — `/.well-known/openid-configuration` now returns reachable endpoint URLs at the MiniStack gateway instead of unreachable `cognito-idp.{region}.amazonaws.com` URLs that don't serve OAuth2 anywhere. `response_types_supported` now advertises both `code` and `token`, matching real AWS Cognito. Amplify and other OIDC clients can now auto-configure against MiniStack without manual endpoint setup. Reported by @coezbek.
+- **Cognito OAuth2 / OIDC endpoints send CORS** — `/oauth2/authorize`, `/oauth2/token`, `/oauth2/userInfo`, `/logout`, and `/.well-known/*` were returning raw response tuples that bypassed `_with_data_plane_headers`, so browser-based OIDC clients (Amplify, `oidc-client-ts`, `react-oidc-context`) failed cross-origin discovery and token exchange with `No 'Access-Control-Allow-Origin' header`. The dispatchers are now routed through the same wildcard-CORS wrapper every other data-plane response uses. Contributed by @coezbek.
+- **EC2 `RunInstances` honors `PrivateIpAddress` and `IamInstanceProfile`** — `--private-ip-address` was ignored and the auto-generated default IP was malformed (`10.0193.216` from a missing dot separator in `_random_ip`). `--iam-instance-profile` was dropped entirely, so the launched instance had no `IamInstanceProfile` field in `RunInstances` or `DescribeInstances`. Both parameters are now stored on the instance record and emitted in the XML response (`<iamInstanceProfile><arn/><id/></iamInstanceProfile>`). Reported by @coseym.
+- **EC2 `DescribeRouteTables` emits `propagatingVgwSet`** — `EnableVgwRoutePropagation` stored the gateway ID on the route table but `DescribeRouteTables` always returned an empty `<propagatingVgwSet/>`, so any IaC tool that round-trips through Describe lost the propagation. Now serializes whatever `EnableVgwRoutePropagation` recorded. Contributed by @tmq107.
+- **DynamoDB GSI Query pagination with non-unique sort keys** — when multiple items shared the same `(GSI_HASH, GSI_RANGE)` value (or for hash-only GSIs), `ExclusiveStartKey` either dropped items silently from page 2 onward or cycled the caller through the same items indefinitely. Real DynamoDB orders GSI results by `(INDEX_HASH, INDEX_SORT, BASE_PK, BASE_SK)`; MiniStack now uses the same hidden tiebreak so cursors advance correctly across pages. Common pattern with single-table designs / ElectroDB collections. Reported by @bensont1 and @mspiller.
+
+---
+
+## [1.3.31] — 2026-05-07
+
+### Added
+- **EC2 AWS-managed prefix lists** — `DescribePrefixLists`, `DescribeManagedPrefixLists`, and `GetManagedPrefixListEntries` now return deterministic CIDRs (instead of `0.0.0.0/0`) for the standard AWS-managed prefix list names: `s3`, `dynamodb`, `s3express`, `vpc-lattice`, `route53-healthchecks`, `ec2-instance-connect`, `cloudfront`, `groundstation`. IPv4 entries use the CGNAT range (`100.64.0.0/10`), IPv6 uses `64:ff9b:1::/48`. IDs and entries are stable across calls so VPC endpoint provisioning of type `Gateway` resolves consistently. Contributed by @jgrumboe.
+
+### Fixed
+- **Lambda multi-account isolation** — function workers spawned under non-default accounts now receive `AWS_ACCESS_KEY_ID` derived from the function ARN instead of the host process env var, so `STS GetCallerIdentity` and internal SDK calls inside the handler resolve to the correct account. The warm-worker pool key is now `{account}:{function}:{qualifier}`, preventing two accounts that deploy the same function name from sharing a worker. Fixes all four execution paths (warm worker, provided runtime, local subprocess, Docker container). Contributed by @jgrumboe.
+- **S3 `GetObject` by `VersionId` `Last-Modified` header** — the versioned `GetObject` path emitted the internal ISO-8601 timestamp directly into the HTTP `Last-Modified` header, where AWS returns RFC 7231 HTTP-date. AWS SDK for JavaScript v3 strictly parses the header and threw after the 200 response. Now wrapped through `iso_to_rfc7231`, matching the non-versioned path. Contributed by @mgius-ae.
+- **EC2 `RunInstances` and `DescribeInstances` emit `BlockDeviceMappings`** — every launched instance now auto-attaches a root EBS volume (`/dev/xvda`, gp3, 8 GiB, `DeleteOnTermination: true`) registered with `_volumes` and surfaced through both `DescribeInstances` (with `<volumeId>`, `<status>`, `<attachTime>`, `<deleteOnTermination>`) and `DescribeVolumes` (with the matching `Attachments` link), matching real AWS where every EBS-backed AMI auto-attaches a root volume regardless of whether the launch request specified `BlockDeviceMappings`. Cloud Custodian, AWS Config rules, and any policy tool that classifies instances by BDM presence now work. Reported by @Aeres-u99.
+
 ---
 
 ## [1.3.30] — 2026-05-06
@@ -376,7 +442,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 ## [1.3.6] — 2026-04-20
 
 ### Added
-- **API Gateway path-based data plane** — REST + HTTP + WebSocket APIs are now reachable without `*.execute-api.localhost` Host overrides: `http(s)://localhost:4566/_aws/execute-api/{apiId}/{stage}/{path}` (v1 + v2 HTTP + v2 WS) and the LocalStack-legacy `http://localhost:4566/restapis/{apiId}/{stage}/_user_request_/{path}` (v1). Unblocks macOS browsers (no `*.localhost` DNS resolution) and strict HTTP clients with no Host override. 
+- **API Gateway path-based data plane** — REST + HTTP + WebSocket APIs are now reachable without `*.execute-api.localhost` Host overrides: `http(s)://localhost:4566/_aws/execute-api/{apiId}/{stage}/{path}` (v1 + v2 HTTP + v2 WS) and the LocalStack-legacy `http://localhost:4566/restapis/{apiId}/{stage}/_user_request_/{path}` (v1). Unblocks macOS browsers (no `*.localhost` DNS resolution) and strict HTTP clients with no Host override.
 - **Custom/predictable API Gateway IDs** — `aws_apigatewayv2_api` and `aws_apigateway_rest_api` honour an `ms-custom-id` tag on `CreateApi` / `CreateRestApi` and pin the generated `apiId` / REST API id to the tag value. Duplicates in the same account return `ConflictException` (409). The LocalStack `ls-custom-id` tag is intentionally rejected with a clear `BadRequestException` (400) pointing callers at the ministack-native key. Reported by @whittin3. Fixes #400
 - **Cognito `AWS::Cognito::UserPoolClient` CFN `GenerateSecret`** — CloudFormation-provisioned user pool clients now generate a client secret when `GenerateSecret: true`, matching the native Cognito API path. Contributed by @mgius-ae (#403)
 
@@ -617,7 +683,7 @@ These services stored per-tenant data in plain `dict` / `list`, so `List*` / `De
 ## [1.2.18] — 2026-04-15
 
 ### Fixed
-- **ECS services/tasks invisible when created via CloudFormation** — CF provisioner stored services with ARN keys instead of `cluster/name`, causing `list-services` and `list-tasks` to return empty. Fixed key format, added task spawning on service create/update/delete, and replaced stale tasks on task definition updates. CF provisioner now delegates to the ECS module for a single code path. Reported by @Vagator-Prostovich 
+- **ECS services/tasks invisible when created via CloudFormation** — CF provisioner stored services with ARN keys instead of `cluster/name`, causing `list-services` and `list-tasks` to return empty. Fixed key format, added task spawning on service create/update/delete, and replaced stale tasks on task definition updates. CF provisioner now delegates to the ECS module for a single code path. Reported by @Vagator-Prostovich
 - **ECS CF container definitions PascalCase mismatch** — CloudFormation container definitions used PascalCase keys (`Name`, `Image`, `PortMappings`) but the ECS runtime expected camelCase, causing `KeyError` when spawning tasks. Added `_normalize_container_defs` to convert keys.
 - **ECS `_task_def_latest` stored string instead of integer** — CF provisioner stored `"family:1"` instead of `1`, producing malformed keys like `"family:family:1"` on subsequent registrations.
 - **ECS CF task definition and service delete used wrong keys** — delete handlers used ARN but dicts were keyed by `family:revision` and `cluster/name` respectively.
@@ -665,7 +731,7 @@ These services stored per-tenant data in plain `dict` / `list`, so `List*` / `De
 - **EC2 AuthorizeSecurityGroup returns rules** — `AuthorizeSecurityGroupIngress` and `AuthorizeSecurityGroupEgress` now return `SecurityGroupRules` in the response with rule IDs, group ownership, protocol, port range, and CIDR details. Required by Terraform AWS provider v6. Reported by @mspiller (#325)
 
 ### Fixed
-- **Cognito token claims correctness** — `origin_jti` and `auth_time` claims are now only included in `IdToken` and `AccessToken` (not `RefreshToken`), matching real AWS Cognito behavior. Refresh tokens use minimal claims with only `client_id`. 
+- **Cognito token claims correctness** — `origin_jti` and `auth_time` claims are now only included in `IdToken` and `AccessToken` (not `RefreshToken`), matching real AWS Cognito behavior. Refresh tokens use minimal claims with only `client_id`.
 
 ---
 
@@ -749,7 +815,7 @@ These services stored per-tenant data in plain `dict` / `list`, so `List*` / `De
 ## [1.2.7] — 2026-04-12
 
 ### Added
-- **EC2 CreateDefaultVpc** — new action creates a default VPC with all associated resources (3 default subnets, internet gateway, route table, network ACL, security group), matching real AWS behavior. Returns `DefaultVpcAlreadyExists` if one already exists. Reported by @staranto 
+- **EC2 CreateDefaultVpc** — new action creates a default VPC with all associated resources (3 default subnets, internet gateway, route table, network ACL, security group), matching real AWS behavior. Returns `DefaultVpcAlreadyExists` if one already exists. Reported by @staranto
 - **DynamoDB ExecuteStatement (PartiQL)** — supports `SELECT`, `INSERT`, `UPDATE`, `DELETE` PartiQL statements with `?` parameter binding. Enables IntelliJ database integration and other PartiQL-based tooling. Reported by @mspiller
 - **SNS FIFO topic support** — `.fifo` naming validation, `MessageGroupId`/`MessageDeduplicationId` enforcement, 5-minute deduplication window, sequence numbers, content-based deduplication, FIFO SQS subscription validation, `PublishBatch` FIFO support, thread-safe dedup cache. Contributed by @yskarparis (#279)
 
@@ -1015,7 +1081,7 @@ and reference by the sha256 over the code image. In the future this should be a 
 - **RDS Data API service** — `ExecuteStatement`, `BatchExecuteStatement`, `BeginTransaction`, `CommitTransaction`, `RollbackTransaction`. Routes SQL to the real database containers MiniStack spins up for RDS instances. Supports both MySQL and PostgreSQL engines. Contributed by @jayjanssen (#193)
 
 ### Fixed
-- **CDK deploy "implicit NaN" deserialization error** — the CloudFormation SSM provisioner stored `LastModifiedDate` as an ISO 8601 string instead of a Unix epoch float. The JS SDK v3 (bundled in CDK CLI) uses `AwsJson1_1Protocol` for SSM and calls `parseEpochTimestamp()` on the value, which expects a number. `cdk deploy` would fail immediately after bootstrap when checking the SSM bootstrap version parameter. Reported by @youngkwangk @jolo-dev and @ben-shearlaw 
+- **CDK deploy "implicit NaN" deserialization error** — the CloudFormation SSM provisioner stored `LastModifiedDate` as an ISO 8601 string instead of a Unix epoch float. The JS SDK v3 (bundled in CDK CLI) uses `AwsJson1_1Protocol` for SSM and calls `parseEpochTimestamp()` on the value, which expects a number. `cdk deploy` would fail immediately after bootstrap when checking the SSM bootstrap version parameter. Reported by @youngkwangk @jolo-dev and @ben-shearlaw
 - **RDS Data API thread safety** — added `threading.Lock` to protect transaction state against concurrent access
 - **RDS Data API parameter binding** — `ExecuteStatement` and `BatchExecuteStatement` now convert RDS Data API `:name` parameters to DB-API parameterized queries instead of ignoring them
 - **RDS Data API connection leak** — connections are now properly closed on exceptions in non-transaction execute paths
@@ -1495,7 +1561,7 @@ Thanks to @moabukar for #104 (error handling, routing conflicts, persistence har
 - **Lambda handler validation** — returns proper `Runtime.InvalidEntrypoint` error if handler name has no `.` separator instead of crashing
 - **RDS error code** — `DBInstanceAlreadyExists` corrected to `DBInstanceAlreadyExistsFault` matching AWS error codes
 
-- Thanks to @lubond @jimmyd-be @abedurftig @mig_mit for reporting issues and testing                       
+- Thanks to @lubond @jimmyd-be @abedurftig @mig_mit for reporting issues and testing
 - Thanks to @jv2222 and @santiagodoldan for their massive contributions
 
 ### Tests
@@ -1659,7 +1725,7 @@ Thanks to @moabukar for #104 (error handling, routing conflicts, persistence har
 ## [1.1.7] — 2026-03-30
 
 ### Added
-- **Athena engine control** — new `ATHENA_ENGINE` env var (`auto` | `duckdb` | `mock`) to select the SQL backend at startup; `auto` keeps existing behaviour (DuckDB if installed, mock otherwise). New `/_ministack/config` endpoint accepts `POST {"athena.ATHENA_ENGINE": "mock"}` to switch engines at runtime without restart — useful in CI to force mock mode without DuckDB installed. 
+- **Athena engine control** — new `ATHENA_ENGINE` env var (`auto` | `duckdb` | `mock`) to select the SQL backend at startup; `auto` keeps existing behaviour (DuckDB if installed, mock otherwise). New `/_ministack/config` endpoint accepts `POST {"athena.ATHENA_ENGINE": "mock"}` to switch engines at runtime without restart — useful in CI to force mock mode without DuckDB installed.
 - **VPC gap coverage** — 6 new EC2 resource types, 22 new actions, 11 new tests
   - **NAT Gateways**: `CreateNatGateway`, `DescribeNatGateways`, `DeleteNatGateway` — supports `SubnetId`, `ConnectivityType` (public/private), state transitions, `vpc-id`/`subnet-id`/`state` filters
   - **Network ACLs**: `CreateNetworkAcl`, `DescribeNetworkAcls`, `DeleteNetworkAcl`, `CreateNetworkAclEntry`, `DeleteNetworkAclEntry`, `ReplaceNetworkAclEntry`, `ReplaceNetworkAclAssociation` — full CRUD with rule entries and subnet associations

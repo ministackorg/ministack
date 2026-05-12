@@ -42,6 +42,39 @@ def test_rds_cluster(rds):
     resp = rds.describe_db_clusters(DBClusterIdentifier="test-cluster")
     assert resp["DBClusters"][0]["DBClusterIdentifier"] == "test-cluster"
 
+def test_rds_cluster_default_field_serialization(rds):
+    """Regression: DescribeDBClusters defaults must match real AWS for
+    DatabaseName (absent/None), NetworkType ("IPV4"), and EngineLifecycleSupport
+    ("open-source-rds-extended-support") when not supplied at create time."""
+    rds.create_db_cluster(
+        DBClusterIdentifier="cluster-defaults",
+        Engine="aurora-mysql",
+        MasterUsername="root",
+        MasterUserPassword="password123",
+    )
+    cluster = rds.describe_db_clusters(DBClusterIdentifier="cluster-defaults")["DBClusters"][0]
+    # AWS returns null/absent when no initial database was specified, not "".
+    assert cluster.get("DatabaseName") is None
+    assert cluster.get("NetworkType") == "IPV4"
+    assert cluster.get("EngineLifecycleSupport") == "open-source-rds-extended-support"
+
+def test_rds_cluster_explicit_field_round_trip(rds):
+    """Explicit DatabaseName / NetworkType / EngineLifecycleSupport round-trip
+    through DescribeDBClusters."""
+    rds.create_db_cluster(
+        DBClusterIdentifier="cluster-explicit",
+        Engine="aurora-mysql",
+        MasterUsername="root",
+        MasterUserPassword="password123",
+        DatabaseName="mydb",
+        NetworkType="DUAL",
+        EngineLifecycleSupport="open-source-rds-extended-support-disabled",
+    )
+    cluster = rds.describe_db_clusters(DBClusterIdentifier="cluster-explicit")["DBClusters"][0]
+    assert cluster.get("DatabaseName") == "mydb"
+    assert cluster.get("NetworkType") == "DUAL"
+    assert cluster.get("EngineLifecycleSupport") == "open-source-rds-extended-support-disabled"
+
 def test_rds_create_instance_v2(rds):
     resp = rds.create_db_instance(
         DBInstanceIdentifier="rds-ci-v2",
@@ -118,6 +151,36 @@ def test_rds_modify_instance_v2(rds):
     inst = resp["DBInstances"][0]
     assert inst["DBInstanceClass"] == "db.t3.small"
     assert inst["AllocatedStorage"] == 50
+
+def test_rds_create_instance_honors_preferred_maintenance_window(rds):
+    # Regression: CreateDBInstance previously hardcoded
+    # PreferredMaintenanceWindow to "sun:05:00-sun:06:00", silently
+    # discarding any user-supplied value.
+    rds.create_db_instance(
+        DBInstanceIdentifier="rds-pmw-v2",
+        DBInstanceClass="db.t3.micro",
+        Engine="postgres",
+        MasterUsername="admin",
+        MasterUserPassword="pass",
+        AllocatedStorage=20,
+        PreferredMaintenanceWindow="tue:03:00-tue:04:00",
+    )
+    resp = rds.describe_db_instances(DBInstanceIdentifier="rds-pmw-v2")
+    inst = resp["DBInstances"][0]
+    assert inst["PreferredMaintenanceWindow"] == "tue:03:00-tue:04:00"
+
+def test_rds_create_instance_default_preferred_maintenance_window(rds):
+    rds.create_db_instance(
+        DBInstanceIdentifier="rds-pmw-default-v2",
+        DBInstanceClass="db.t3.micro",
+        Engine="postgres",
+        MasterUsername="admin",
+        MasterUserPassword="pass",
+        AllocatedStorage=20,
+    )
+    resp = rds.describe_db_instances(DBInstanceIdentifier="rds-pmw-default-v2")
+    inst = resp["DBInstances"][0]
+    assert inst["PreferredMaintenanceWindow"] == "sun:05:00-sun:06:00"
 
 def test_rds_create_cluster_v2(rds):
     resp = rds.create_db_cluster(
@@ -575,6 +638,36 @@ def test_rds_modify_and_describe_cluster_parameters(rds):
         DBClusterParameterGroupName="test-cparam-persist", Source="engine-default"
     )
     assert len(resp2["Parameters"]) == 0
+
+
+def test_rds_describe_cluster_parameters_emits_source(rds):
+    """DescribeDBClusterParameters must emit Source=user for modified params.
+
+    Regression test for omission of <Source> in the cluster parameter
+    response XML, which caused botocore to materialize Source as None.
+    """
+    rds.create_db_cluster_parameter_group(
+        DBClusterParameterGroupName="test-cparam-source",
+        DBParameterGroupFamily="aurora-mysql8.0",
+        Description="cluster param source test",
+    )
+    rds.modify_db_cluster_parameter_group(
+        DBClusterParameterGroupName="test-cparam-source",
+        Parameters=[
+            {
+                "ParameterName": "binlog_format",
+                "ParameterValue": "ROW",
+                "ApplyMethod": "pending-reboot",
+            },
+        ],
+    )
+    resp = rds.describe_db_cluster_parameters(
+        DBClusterParameterGroupName="test-cparam-source"
+    )
+    p = next(
+        p for p in resp["Parameters"] if p["ParameterName"] == "binlog_format"
+    )
+    assert p.get("Source") == "user"
 
 
 def test_rds_reset_cluster_parameters(rds):
