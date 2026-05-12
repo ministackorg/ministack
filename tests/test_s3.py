@@ -504,6 +504,27 @@ class TestS3VhostGetPutObject:
         assert resp["Body"].read() == b"vhost content"
 
 
+class TestParseAbsoluteFormRequestTarget:
+    """_parse_bucket_key must strip scheme+authority when hypercorn passes an
+    absolute-form request target (e.g. AWS SDK for .NET v4 over HTTP/1.1)."""
+
+    def _parse(self, path):
+        from ministack.services.s3 import _parse_bucket_key
+        return _parse_bucket_key(path, {})
+
+    def test_http_absolute_form(self):
+        assert self._parse("http://ministack:4566/mybucket/mykey") == ("mybucket", "mykey")
+
+    def test_https_absolute_form(self):
+        assert self._parse("https://ministack:4566/mybucket/mykey") == ("mybucket", "mykey")
+
+    def test_absolute_form_bucket_only(self):
+        assert self._parse("http://ministack:4566/mybucket") == ("mybucket", "")
+
+    def test_path_style_unaffected(self):
+        assert self._parse("/mybucket/mykey") == ("mybucket", "mykey")
+
+
 def test_s3_bucket_policy(s3):
     bkt = "intg-s3-policy"
     s3.create_bucket(Bucket=bkt)
