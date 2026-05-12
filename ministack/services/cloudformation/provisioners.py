@@ -1185,6 +1185,44 @@ def _apigw_method_delete(physical_id, props):
     _apigw_v1._delete_method(api_id, resource_id, http_method)
 
 
+# --- API Gateway Authorizer ---
+
+def _apigw_authorizer_create(logical_id, props, stack_name):
+    """Provision an AWS::ApiGateway::Authorizer.
+
+    Maps CFN properties to the existing apigateway_v1 authorizer store:
+    Name, Type (TOKEN / REQUEST / COGNITO_USER_POOLS), AuthorizerUri,
+    AuthorizerCredentials, IdentitySource, IdentityValidationExpression,
+    AuthorizerResultTtlInSeconds, ProviderARNs, RestApiId. ``AuthType`` is
+    documented in the AWS CFN spec as informational only; the underlying
+    apigateway_v1._create_authorizer record does not currently expose it,
+    so the field is dropped here.
+    """
+    api_id = props.get("RestApiId", "")
+    data = {
+        "name": props.get("Name", logical_id),
+        "type": props.get("Type", "TOKEN"),
+        "authorizerUri": props.get("AuthorizerUri", ""),
+        "authorizerCredentials": props.get("AuthorizerCredentials"),
+        "identitySource": props.get("IdentitySource", "method.request.header.Authorization"),
+        "identityValidationExpression": props.get("IdentityValidationExpression", ""),
+        "authorizerResultTtlInSeconds": props.get("AuthorizerResultTtlInSeconds", 300),
+        "providerARNs": props.get("ProviderARNs", []),
+    }
+    status, headers, body = _apigw_v1._create_authorizer(api_id, data)
+    if status >= 400:
+        raise ValueError(f"AWS::ApiGateway::Authorizer create failed: {body!r}")
+    authorizer = json.loads(body) if isinstance(body, (bytes, bytearray)) else json.loads(body)
+    authorizer_id = authorizer.get("id", "")
+    return authorizer_id, {"AuthorizerId": authorizer_id}
+
+
+def _apigw_authorizer_delete(physical_id, props):
+    api_id = props.get("RestApiId", "")
+    authorizers = _apigw_v1._authorizers_v1.get(api_id, {})
+    authorizers.pop(physical_id, None)
+
+
 # --- API Gateway Deployment ---
 
 def _apigw_deployment_create(logical_id, props, stack_name):
@@ -3162,6 +3200,7 @@ _RESOURCE_HANDLERS = {
     "AWS::ApiGateway::RestApi": {"create": _apigw_rest_api_create, "delete": _apigw_rest_api_delete},
     "AWS::ApiGateway::Resource": {"create": _apigw_resource_create, "delete": _apigw_resource_delete},
     "AWS::ApiGateway::Method": {"create": _apigw_method_create, "delete": _apigw_method_delete},
+    "AWS::ApiGateway::Authorizer": {"create": _apigw_authorizer_create, "delete": _apigw_authorizer_delete},
     "AWS::ApiGateway::Deployment": {"create": _apigw_deployment_create, "delete": _apigw_deployment_delete},
     "AWS::ApiGateway::Stage": {"create": _apigw_stage_create, "delete": _apigw_stage_delete},
     "AWS::Lambda::EventSourceMapping": {"create": _lambda_esm_create, "delete": _lambda_esm_delete},

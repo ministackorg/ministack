@@ -942,7 +942,7 @@ def _invoke_target(target, event, rule):
         if ":lambda:" in arn or ":function:" in arn:
             _dispatch_to_lambda(arn, event_payload)
         elif ":sqs:" in arn:
-            _dispatch_to_sqs(arn, event_payload)
+            _dispatch_to_sqs(arn, event_payload, target.get("SqsParameters") or {})
         elif ":sns:" in arn:
             _dispatch_to_sns(arn, event_payload)
         else:
@@ -1013,7 +1013,16 @@ def _dispatch_to_lambda(arn, payload):
     logger.info("EventBridge → Lambda %s: dispatched", func_name)
 
 
-def _dispatch_to_sqs(arn, payload):
+def _dispatch_to_sqs(arn, payload, sqs_parameters=None):
+    """Dispatch an EventBridge event to an SQS queue.
+
+    ``sqs_parameters`` carries the target's ``SqsParameters`` block from the
+    rule definition. For FIFO target queues, ``SqsParameters.MessageGroupId``
+    is required by AWS and must be stamped on the delivered message; for
+    standard queues it is ignored. Real EventBridge also derives a
+    content-based ``MessageDeduplicationId`` for FIFO queues when content
+    deduplication is enabled — we mirror that here.
+    """
     from ministack.services import sqs as _sqs
 
     queue_name = arn.split(":")[-1]
@@ -1023,10 +1032,11 @@ def _dispatch_to_sqs(arn, payload):
         logger.warning("EventBridge → SQS: queue %s not found", queue_name)
         return
 
+    sqs_parameters = sqs_parameters or {}
     msg_id = new_uuid()
     md5 = hashlib.md5(payload.encode()).hexdigest()
     now = time.time()
-    queue["messages"].append({
+    msg = {
         "id": msg_id,
         "body": payload,
         "md5_body": md5,
@@ -1040,7 +1050,25 @@ def _dispatch_to_sqs(arn, payload):
             "SenderId": "AROAEXAMPLE",
             "SentTimestamp": str(int(now * 1000)),
         },
-    })
+    }
+    if queue.get("is_fifo"):
+        group_id = sqs_parameters.get("MessageGroupId") or ""
+        if not group_id:
+            logger.warning(
+                "EventBridge → SQS %s is FIFO but target SqsParameters.MessageGroupId is empty; "
+                "real AWS would refuse to deliver. Generating a fallback so the message is not lost.",
+                queue_name,
+            )
+            group_id = "ministack-eventbridge-default"
+        msg["group_id"] = group_id
+        # Mirror real EventBridge: derive a content-based dedup ID when none is
+        # supplied so retries are idempotent within the FIFO dedup window.
+        msg["dedup_id"] = hashlib.sha256(payload.encode()).hexdigest()
+        # Maintain sequence numbering so subsequent ReceiveMessage calls see
+        # the same ordering as native SQS FIFO deliveries.
+        queue["fifo_seq"] = queue.get("fifo_seq", 0) + 1
+        msg["seq"] = str(queue["fifo_seq"]).zfill(20)
+    queue["messages"].append(msg)
     if hasattr(_sqs, "_ensure_msg_fields"):
         _sqs._ensure_msg_fields(queue["messages"][-1])
     logger.info("EventBridge → SQS %s", queue_name)

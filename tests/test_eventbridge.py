@@ -1500,3 +1500,47 @@ def test_scheduler_first_sight_with_recent_creation_time_waits(isolated_schedule
     _eb._targets._data[_STATE_KEY] = list(_DUMMY_TARGET)
     _eb._tick_scheduled_rules()
     isolated_scheduler.assert_not_called()
+
+
+# -- EventBridge → FIFO SQS target requires MessageGroupId --------------
+
+
+def test_eventbridge_dispatch_to_fifo_sqs_stamps_message_group_id(eb, sqs):
+    """When a rule's target is a FIFO SQS queue, EventBridge must read
+    SqsParameters.MessageGroupId from the target spec and stamp it on the
+    delivered message. Before this fix MS dropped MessageGroupId at
+    dispatch, so FIFO targets received messages with no group_id."""
+    q_url = sqs.create_queue(
+        QueueName=f"intg-eb-fifo-{_uuid_mod.uuid4().hex[:8]}.fifo",
+        Attributes={"FifoQueue": "true", "ContentBasedDeduplication": "true"},
+    )["QueueUrl"]
+    q_arn = sqs.get_queue_attributes(QueueUrl=q_url, AttributeNames=["QueueArn"])["Attributes"]["QueueArn"]
+
+    rule_name = f"intg-eb-fifo-rule-{_uuid_mod.uuid4().hex[:8]}"
+    eb.put_rule(Name=rule_name, EventPattern=json.dumps({"source": ["app.test"]}))
+    eb.put_targets(
+        Rule=rule_name,
+        Targets=[{
+            "Id": "1",
+            "Arn": q_arn,
+            "SqsParameters": {"MessageGroupId": "orders"},
+        }],
+    )
+    eb.put_events(Entries=[{
+        "Source": "app.test",
+        "DetailType": "Order",
+        "Detail": json.dumps({"orderId": "o1"}),
+    }])
+
+    # FIFO queues require MessageGroupId; ReceiveMessage with the attribute name
+    # surfaces it.
+    time.sleep(0.5)
+    resp = sqs.receive_message(
+        QueueUrl=q_url,
+        MaxNumberOfMessages=10,
+        AttributeNames=["MessageGroupId"],
+    )
+    msgs = resp.get("Messages") or []
+    assert msgs, "FIFO queue received no messages from EventBridge"
+    attrs = msgs[0].get("Attributes", {})
+    assert attrs.get("MessageGroupId") == "orders"

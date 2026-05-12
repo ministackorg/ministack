@@ -270,6 +270,20 @@ def _act_send_message(data: dict, qurl: str) -> dict:
         raise _Err("MissingParameter",
                     "The request must contain the parameter MessageBody.")
 
+    # AWS SQS rejects messages exceeding the queue's MaximumMessageSize attribute
+    # (default 262144 bytes; configurable up to 1 MiB / 1048576). Real AWS error
+    # is InvalidParameterValue (400) with the queue-configured limit in the message.
+    try:
+        max_size = int(q["attributes"].get("MaximumMessageSize", "262144"))
+    except (TypeError, ValueError):
+        max_size = 262144
+    body_bytes = len(body_text.encode("utf-8"))
+    if body_bytes > max_size:
+        raise _Err(
+            "InvalidParameterValue",
+            f"One or more parameters are invalid. Reason: Message must be shorter than {max_size} bytes.",
+        )
+
     delay = int(data.get("DelaySeconds")
                 or q["attributes"].get("DelaySeconds", "0"))
     msg_attrs = data.get("MessageAttributes") or {}
@@ -507,6 +521,102 @@ def _act_set_queue_attributes(data: dict, qurl: str) -> dict:
     return {}
 
 
+# ── AddPermission / RemovePermission ───────────────────────
+#
+# AddPermission appends a Statement to the queue's IAM resource policy
+# (stored as the ``Policy`` queue attribute, exactly the same JSON shape
+# that ``SetQueueAttributes`` accepts and ``GetQueueAttributes`` returns).
+# RemovePermission removes the Statement whose ``Sid`` matches the
+# supplied Label. Both surface the result through the existing Policy
+# attribute, so consumers that read it via ``GetQueueAttributes`` see
+# the change.
+
+def _act_add_permission(data: dict, qurl: str) -> dict:
+    url = data.get("QueueUrl", qurl)
+    q = _get_q(url)
+    label = data.get("Label") or ""
+    if not label:
+        raise _Err("MissingParameter",
+                   "The request must contain the parameter Label.")
+    account_ids = data.get("AWSAccountIds") or []
+    if isinstance(account_ids, str):
+        account_ids = [account_ids]
+    actions = data.get("Actions") or []
+    if isinstance(actions, str):
+        actions = [actions]
+    if not account_ids:
+        raise _Err("MissingParameter",
+                   "The request must contain the parameter AWSAccountIds.")
+    if not actions:
+        raise _Err("MissingParameter",
+                   "The request must contain the parameter Actions.")
+
+    queue_arn = q["attributes"].get("QueueArn")
+    raw = q["attributes"].get("Policy") or ""
+    try:
+        policy = json.loads(raw) if raw else {}
+    except (TypeError, json.JSONDecodeError):
+        policy = {}
+    policy.setdefault("Version", "2012-10-17")
+    policy.setdefault("Id", f"{queue_arn}/SQSDefaultPolicy")
+    statements = policy.setdefault("Statement", [])
+    if isinstance(statements, dict):
+        statements = [statements]
+        policy["Statement"] = statements
+
+    # AWS rejects a duplicate Label with InvalidParameterValue.
+    if any(s.get("Sid") == label for s in statements):
+        raise _Err(
+            "InvalidParameterValue",
+            f"Value {label} for parameter Label is invalid. Reason: Already exists.",
+        )
+
+    # AWS canonical Policy shape per the SQS developer guide:
+    # Principal.AWS holds bare 12-digit account IDs; Action uses the
+    # lowercase IAM namespace prefix `sqs:`.
+    statements.append({
+        "Sid": label,
+        "Effect": "Allow",
+        "Principal": {"AWS": list(account_ids)},
+        "Action": [a if a.startswith("sqs:") else f"sqs:{a[4:]}" if a.startswith("SQS:") else f"sqs:{a}" for a in actions],
+        "Resource": queue_arn,
+    })
+    q["attributes"]["Policy"] = json.dumps(policy)
+    q["attributes"]["LastModifiedTimestamp"] = str(int(time.time()))
+    return {}
+
+
+def _act_remove_permission(data: dict, qurl: str) -> dict:
+    url = data.get("QueueUrl", qurl)
+    q = _get_q(url)
+    label = data.get("Label") or ""
+    if not label:
+        raise _Err("MissingParameter",
+                   "The request must contain the parameter Label.")
+
+    raw = q["attributes"].get("Policy") or ""
+    if not raw:
+        # Real AWS is idempotent — no policy means nothing to remove, no error.
+        return {}
+    try:
+        policy = json.loads(raw)
+    except (TypeError, json.JSONDecodeError):
+        return {}
+    statements = policy.get("Statement") or []
+    if isinstance(statements, dict):
+        statements = [statements]
+    remaining = [s for s in statements if s.get("Sid") != label]
+    if remaining:
+        policy["Statement"] = remaining
+        q["attributes"]["Policy"] = json.dumps(policy)
+    else:
+        # No statements left — drop the Policy attribute entirely so
+        # GetQueueAttributes reflects "no policy" the way AWS does.
+        q["attributes"].pop("Policy", None)
+    q["attributes"]["LastModifiedTimestamp"] = str(int(time.time()))
+    return {}
+
+
 # ── PurgeQueue ──────────────────────────────────────────────
 
 def _act_purge_queue(data: dict, qurl: str) -> dict:
@@ -614,6 +724,8 @@ _HANDLERS.update({
     "ChangeMessageVisibilityBatch": _act_change_visibility_batch,
     "GetQueueAttributes":           _act_get_queue_attributes,
     "SetQueueAttributes":           _act_set_queue_attributes,
+    "AddPermission":                _act_add_permission,
+    "RemovePermission":             _act_remove_permission,
     "PurgeQueue":                   _act_purge_queue,
     "SendMessageBatch":             _act_send_message_batch,
     "DeleteMessageBatch":           _act_delete_message_batch,

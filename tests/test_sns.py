@@ -1239,3 +1239,53 @@ def test_sns_http_subscription_basic_auth_userinfo(sns):
     finally:
         httpd.shutdown()
         httpd.server_close()
+
+
+# -- 256 KiB payload limit (AWS Publish docs) --------------------------
+
+
+def test_sns_publish_rejects_message_over_256_kib(sns):
+    """SNS Publish rejects payloads (Message + MessageAttributes) over
+    256 KiB with InvalidParameter (400). Before this fix MS silently
+    accepted oversized payloads locally while real AWS rejected."""
+    topic_arn = sns.create_topic(Name=f"intg-sns-size-{_uuid_mod.uuid4().hex[:8]}")["TopicArn"]
+    oversized = "x" * (262144 + 1)
+    with pytest.raises(ClientError) as exc:
+        sns.publish(TopicArn=topic_arn, Message=oversized)
+    assert exc.value.response["Error"]["Code"] == "InvalidParameter"
+
+
+def test_sns_publish_attributes_count_toward_size_limit(sns):
+    """A Message that fits under 256 KiB on its own but is pushed past the
+    limit by MessageAttributes must still be rejected."""
+    topic_arn = sns.create_topic(Name=f"intg-sns-size-attr-{_uuid_mod.uuid4().hex[:8]}")["TopicArn"]
+    msg = "x" * 250000
+    big_attr_value = "y" * 20000
+    with pytest.raises(ClientError) as exc:
+        sns.publish(
+            TopicArn=topic_arn,
+            Message=msg,
+            MessageAttributes={
+                "k1": {"DataType": "String", "StringValue": big_attr_value},
+            },
+        )
+    assert exc.value.response["Error"]["Code"] == "InvalidParameter"
+
+
+def test_sns_publish_batch_rejects_oversized_entry_per_entry(sns):
+    """PublishBatch surfaces each oversized entry as a per-entry failure
+    rather than failing the whole batch."""
+    topic_arn = sns.create_topic(Name=f"intg-sns-batch-size-{_uuid_mod.uuid4().hex[:8]}")["TopicArn"]
+    resp = sns.publish_batch(
+        TopicArn=topic_arn,
+        PublishBatchRequestEntries=[
+            {"Id": "ok", "Message": "small"},
+            {"Id": "too-big", "Message": "x" * (262144 + 1)},
+        ],
+    )
+    ok_ids = [r["Id"] for r in resp.get("Successful", [])]
+    failed_ids = [r["Id"] for r in resp.get("Failed", [])]
+    assert "ok" in ok_ids
+    assert "too-big" in failed_ids
+    failed = next(r for r in resp["Failed"] if r["Id"] == "too-big")
+    assert failed["Code"] == "InvalidParameter"

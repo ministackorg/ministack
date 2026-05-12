@@ -7,6 +7,11 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [Unreleased]
+
+### Fixed
+- **S3 `_parse_bucket_key` absolute-form request targets** — AWS SDK for .NET v4 sends HTTP/1.1 requests with absolute-form targets (e.g. `PUT http://ministack:4566/bucket/key`). hypercorn passes the raw target as `scope["path"]`, causing `_parse_bucket_key` to parse `http:` as the bucket name. The function now strips the scheme and authority before parsing, matching the behaviour of LocalStack.
+
 ## [1.3.36] — 2026-05-11
 
 ### Added
