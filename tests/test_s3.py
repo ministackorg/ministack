@@ -1775,6 +1775,84 @@ def test_s3_upload_part_copy(s3):
     resp = s3.get_object(Bucket=bkt, Key=dst_key)
     assert resp["Body"].read() == src_data
 
+
+def test_s3_upload_part_copy_with_valid_range(s3):
+    """UploadPartCopy with a valid x-amz-copy-source-range slices the source."""
+    bkt = "intg-s3-partcopy-range"
+    s3.create_bucket(Bucket=bkt)
+    s3.put_object(Bucket=bkt, Key="src", Body=b"0123456789")
+
+    mpu = s3.create_multipart_upload(Bucket=bkt, Key="dst")
+    upload_id = mpu["UploadId"]
+    resp = s3.upload_part_copy(
+        Bucket=bkt, Key="dst", UploadId=upload_id, PartNumber=1,
+        CopySource={"Bucket": bkt, "Key": "src"},
+        CopySourceRange="bytes=2-5",
+    )
+    s3.complete_multipart_upload(
+        Bucket=bkt, Key="dst", UploadId=upload_id,
+        MultipartUpload={"Parts": [{"PartNumber": 1, "ETag": resp["CopyPartResult"]["ETag"]}]},
+    )
+    assert s3.get_object(Bucket=bkt, Key="dst")["Body"].read() == b"2345"
+
+
+@pytest.mark.parametrize("bad_range", [
+    "bytes=garbage",        # no hyphen
+    "bytes=abc-def",        # non-numeric
+    "bytes=10-20-30",       # too many segments
+    "bytes=-",              # both empty
+    "bytes=5-",             # missing end
+    "bytes=-5",             # missing start
+    "bytes=5-2",            # reversed
+    "bytes=0-1,3-4",        # multi-range not allowed for UploadPartCopy
+    "rows=0-5",             # wrong unit
+    "0-5",                  # missing bytes= prefix
+])
+def test_s3_upload_part_copy_rejects_malformed_range(s3, bad_range):
+    """Malformed x-amz-copy-source-range must return 400 InvalidArgument, not 500."""
+    import requests
+    bkt = "intg-s3-partcopy-bad-" + str(abs(hash(bad_range)))[:8]
+    s3.create_bucket(Bucket=bkt)
+    s3.put_object(Bucket=bkt, Key="src", Body=b"0123456789")
+
+    upload_id = s3.create_multipart_upload(Bucket=bkt, Key="dst")["UploadId"]
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+    r = requests.put(
+        f"{endpoint}/{bkt}/dst",
+        params={"partNumber": 1, "uploadId": upload_id},
+        headers={
+            "x-amz-copy-source": f"/{bkt}/src",
+            "x-amz-copy-source-range": bad_range,
+        },
+        timeout=10,
+    )
+    assert r.status_code == 400, f"got {r.status_code} for {bad_range!r}: {r.text[:200]}"
+    assert b"InvalidArgument" in r.content
+
+
+def test_s3_upload_part_copy_rejects_out_of_bounds_range(s3):
+    """Range past the end of the source object must return 400 InvalidArgument."""
+    import requests
+    bkt = "intg-s3-partcopy-oob"
+    s3.create_bucket(Bucket=bkt)
+    s3.put_object(Bucket=bkt, Key="src", Body=b"0123456789")  # 10 bytes
+
+    upload_id = s3.create_multipart_upload(Bucket=bkt, Key="dst")["UploadId"]
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+    r = requests.put(
+        f"{endpoint}/{bkt}/dst",
+        params={"partNumber": 1, "uploadId": upload_id},
+        headers={
+            "x-amz-copy-source": f"/{bkt}/src",
+            "x-amz-copy-source-range": "bytes=0-99",
+        },
+        timeout=10,
+    )
+    assert r.status_code == 400
+    assert b"InvalidArgument" in r.content
+    assert b"size: 10" in r.content
+
+
 def test_s3_event_to_sqs(s3, sqs):
     """S3 notification delivers event to SQS on object creation and deletion."""
     bucket = "intg-s3evt-sqs"
