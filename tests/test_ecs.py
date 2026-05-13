@@ -610,3 +610,36 @@ def test_ecs_cfn_service_visible(ecs, cfn):
 
     # Cleanup
     cfn.delete_stack(StackName=stack_name)
+
+
+def test_ecs_cfn_taskdef_populates_registered_fields(ecs, cfn):
+    """CFN-created TaskDefinitions must surface registeredAt/registeredBy/compatibilities,
+    matching what RegisterTaskDefinition emits. Workloads like Go-SDK reconcilers fall
+    back to time.Now() and emit warnings when registeredAt is missing."""
+    from datetime import datetime
+    stack_name = "ecs-cfn-td-fields"
+    template = json.dumps({
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "TaskDef": {
+                "Type": "AWS::ECS::TaskDefinition",
+                "Properties": {
+                    "Family": "cfn-td-fields",
+                    "ContainerDefinitions": [
+                        {"Name": "app", "Image": "nginx", "Memory": 128},
+                    ],
+                },
+            },
+        },
+    })
+    cfn.create_stack(StackName=stack_name, TemplateBody=template)
+    try:
+        td = ecs.describe_task_definition(taskDefinition="cfn-td-fields")["taskDefinition"]
+        assert isinstance(td.get("registeredAt"), datetime), \
+            f"registeredAt missing or wrong type: {td.get('registeredAt')!r}"
+        assert td.get("registeredBy", "").startswith("arn:aws:iam::"), \
+            f"registeredBy missing: {td.get('registeredBy')!r}"
+        assert "EC2" in td.get("compatibilities", []), \
+            f"compatibilities missing/empty: {td.get('compatibilities')!r}"
+    finally:
+        cfn.delete_stack(StackName=stack_name)

@@ -136,6 +136,11 @@ async def handle_request(method, path, headers, body, query_params):
     method = method.upper()
     path = path.rstrip("/") or path
 
+    if path.startswith("/v2/credentials/"):
+        if method != "GET":
+            return _text("Method Not Allowed", 405)
+        return _json_resp(_credentials_doc())
+
     if path.startswith("/latest/api/token"):
         if method != "PUT":
             return _text("Method Not Allowed", 405)

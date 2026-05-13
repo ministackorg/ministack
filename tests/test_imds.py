@@ -68,3 +68,26 @@ def test_imds_placement_region():
     r = requests.get(f"{ENDPOINT}/latest/meta-data/placement/region")
     assert r.status_code == 200
     assert r.text.strip()
+
+
+def test_container_credentials_returns_imds_shape():
+    """ECS task role endpoint: AWS_CONTAINER_CREDENTIALS_RELATIVE_URI=/v2/credentials/<uuid>."""
+    r = requests.get(f"{ENDPOINT}/v2/credentials/68e5868d-1bde-4f9e-9921-6e0442cb567b")
+    assert r.status_code == 200
+    doc = r.json()
+    assert doc["Code"] == "Success"
+    assert doc["Type"] == "AWS-HMAC"
+    for k in ("AccessKeyId", "SecretAccessKey", "Token", "Expiration", "LastUpdated"):
+        assert k in doc and doc[k]
+
+
+def test_container_credentials_requires_id_segment():
+    r = requests.get(f"{ENDPOINT}/v2/credentials/")
+    assert r.status_code == 404
+    r = requests.get(f"{ENDPOINT}/v2/credentials")
+    assert r.status_code == 404
+
+
+def test_container_credentials_rejects_non_get():
+    r = requests.post(f"{ENDPOINT}/v2/credentials/abc")
+    assert r.status_code == 405

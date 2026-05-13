@@ -2107,13 +2107,15 @@ def _ecs_task_def_create(logical_id, props, stack_name):
     revision = 1
     td_key = f"{family}:{revision}"
     arn = f"arn:aws:ecs:{get_region()}:{get_account_id()}:task-definition/{td_key}"
+    compat = props.get("RequiresCompatibilities", ["EC2"])
     td = {
         "taskDefinitionArn": arn,
         "family": family,
         "revision": revision,
         "status": "ACTIVE",
         "containerDefinitions": _normalize_container_defs(props.get("ContainerDefinitions", [])),
-        "requiresCompatibilities": props.get("RequiresCompatibilities", ["EC2"]),
+        "requiresCompatibilities": compat,
+        "compatibilities": compat + (["EC2"] if "FARGATE" in compat and "EC2" not in compat else []),
         "networkMode": props.get("NetworkMode", "bridge"),
         "cpu": props.get("Cpu", "256"),
         "memory": props.get("Memory", "512"),
@@ -2123,6 +2125,8 @@ def _ecs_task_def_create(logical_id, props, stack_name):
         "pidMode": props.get("PidMode", ""),
         "ipcMode": props.get("IpcMode", ""),
         "placementConstraints": props.get("PlacementConstraints", []),
+        "registeredAt": now_iso(),
+        "registeredBy": f"arn:aws:iam::{get_account_id()}:root",
     }
     _ecs._task_defs[td_key] = td
     _ecs._task_def_latest[family] = revision

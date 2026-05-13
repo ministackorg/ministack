@@ -7,6 +7,16 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [Unreleased]
+
+### Added
+- **ECS task IAM role credentials endpoint (`GET /v2/credentials/<uuid>`)** — real ECS injects `AWS_CONTAINER_CREDENTIALS_RELATIVE_URI=/v2/credentials/<uuid>` per task and SDKs fetch credentials by GETting that path against `169.254.170.2`. MiniStack now serves the same path on the gateway and returns the IMDS-shape credentials document (`Code`, `LastUpdated`, `Type`, `AccessKeyId`, `SecretAccessKey`, `Token`, `Expiration`); the path-`<uuid>` segment is opaque and treated as the auth token, mirroring real ECS.
+- **ECS task env injection for SDK-driven workloads** — tasks launched by MiniStack's ECS emulator now also get `AWS_CONTAINER_CREDENTIALS_FULL_URI` (so SDKs in task containers fetch emulated credentials automatically from the new `/v2/credentials/<uuid>` endpoint), `AWS_CONTAINER_AUTHORIZATION_TOKEN` (satisfies botocore's allow-list when the gateway host is not loopback, e.g. `host.docker.internal` or a Docker bridge IP), and `AWS_ENDPOINT_URL` (so SDK service calls auto-route to the gateway). Together with the existing `ECS_CONTAINER_METADATA_URI_V4`, unmodified AWS SDKs running inside an emulated ECS task now use MiniStack end-to-end with no client config.
+
+### Fixed
+- **ECS `connectivityAt` and `stoppingAt` timestamps wire-formatted as numbers** — both fields are set on tasks but were missing from the `_ECS_TIMESTAMP_FIELDS` normalization set, so they shipped as ISO strings in `DescribeTasks` / `ListTasks` responses. The Go AWS SDK v2 (which strictly requires `Timestamp` to be a JSON number under the JSON 1.1 protocol) rejected the response with `deserialization failed, expected Timestamp to be a JSON Number, got string instead`. boto3 is lenient and accepted the strings, hiding the issue. Both fields are now epoch-normalized alongside the other task timestamps.
+- **CloudFormation `AWS::ECS::TaskDefinition` populates `registeredAt`, `registeredBy`, and `compatibilities`** — the CFN provisioner constructed the task-definition record without these three fields, so `DescribeTaskDefinition` returned them as missing for CFN-created TDs even though the equivalent CLI/SDK path (`RegisterTaskDefinition`) always set them. Workloads that read `registeredAt` (e.g. the ARMO ECS operator and other reconcilers) had to fall back to "now". The CFN path now mirrors the CLI path and emits the same three fields with the same values.
+
 ## [1.3.37] — 2026-05-12
 
 ### Added

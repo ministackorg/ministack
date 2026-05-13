@@ -771,6 +771,8 @@ def detect_service(method: str, path: str, headers: dict, query_params: dict) ->
     path_lower = path.lower()
     if path_lower.startswith("/latest/"):
         return "imds"
+    if path_lower.startswith("/v2/credentials"):
+        return "imds"
     if path_lower.startswith("/v1/apis") or path_lower.startswith("/v1/tags/arn:aws:appsync"):
         return "appsync"
     if path_lower.startswith("/key-value-stores/"):
