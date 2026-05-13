@@ -14,6 +14,7 @@ import time
 import zipfile
 from collections import defaultdict
 
+import ministack.services.acm as _acm
 import ministack.services.alb as _alb
 import ministack.services.apigateway as _apigw_v2
 import ministack.services.apigateway_v1 as _apigw_v1
@@ -2433,10 +2434,48 @@ def _lambda_layer_delete(physical_id, props):
 def _sfn_state_machine_create(logical_id, props, stack_name):
     name = props.get("StateMachineName") or _physical_name(stack_name, logical_id, max_len=80)
     role_arn = props.get("RoleArn", f"arn:aws:iam::{get_account_id()}:role/StepFunctionsRole")
-    definition = props.get("DefinitionString", "{}")
-    if isinstance(definition, dict):
-        import json as _json
-        definition = _json.dumps(definition)
+    import json as _json
+
+    # Real CFN accepts three mutually-exclusive definition shapes:
+    #   DefinitionString       (inline JSON/YAML string — pre-existing)
+    #   Definition             (inline JSON object — CDK DefinitionBody.fromString uses this)
+    #   DefinitionS3Location   ({Bucket, Key, Version} — CDK DefinitionBody.fromFile uses this)
+    # DefinitionSubstitutions is a Map<String, String> applied to whichever
+    # source produced the definition; placeholders are `${KEY}` per the AWS spec.
+    definition = None
+    if props.get("DefinitionS3Location"):
+        loc = props["DefinitionS3Location"] or {}
+        bucket = loc.get("Bucket") or ""
+        key = loc.get("Key") or ""
+        version = loc.get("Version")
+        if bucket and key:
+            from ministack.services import s3 as _s3_svc
+            try:
+                blob = _s3_svc._get_object_data(bucket, key, version_id=version)
+            except Exception as e:
+                raise ValueError(
+                    f"AWS::StepFunctions::StateMachine DefinitionS3Location fetch failed "
+                    f"for s3://{bucket}/{key}: {e}"
+                )
+            if blob is None:
+                raise ValueError(
+                    f"AWS::StepFunctions::StateMachine DefinitionS3Location object not found: "
+                    f"s3://{bucket}/{key}"
+                )
+            definition = blob.decode("utf-8", errors="replace")
+    if definition is None and props.get("Definition") is not None:
+        d = props["Definition"]
+        definition = _json.dumps(d) if isinstance(d, (dict, list)) else str(d)
+    if definition is None:
+        definition = props.get("DefinitionString", "{}")
+        if isinstance(definition, dict):
+            definition = _json.dumps(definition)
+
+    subs = props.get("DefinitionSubstitutions") or {}
+    if subs:
+        for k, v in subs.items():
+            definition = definition.replace("${" + str(k) + "}", str(v))
+
     sm_type = props.get("StateMachineType", "STANDARD")
 
     arn = f"arn:aws:states:{get_region()}:{get_account_id()}:stateMachine:{name}"
@@ -2456,6 +2495,194 @@ def _sfn_state_machine_create(logical_id, props, stack_name):
 
 def _sfn_state_machine_delete(physical_id, props):
     _sfn._state_machines.pop(physical_id, None)
+
+
+# ---------------------------------------------------------------------------
+# AWS Certificate Manager (ACM)
+# ---------------------------------------------------------------------------
+
+def _acm_certificate_create(logical_id, props, stack_name):
+    """Provision an AWS::CertificateManager::Certificate.
+
+    Maps CFN props to acm._request_certificate: DomainName, SubjectAlternativeNames,
+    ValidationMethod, Tags. Returns the CertificateArn as the physical id, so
+    `Ref` resolves to the ARN (matching real CFN).
+    """
+    domain = props.get("DomainName", "")
+    if not domain:
+        raise ValueError(
+            "AWS::CertificateManager::Certificate requires DomainName"
+        )
+    sans = props.get("SubjectAlternativeNames") or [domain]
+    if isinstance(sans, str):
+        sans = [sans]
+    if domain not in sans:
+        sans = [domain] + list(sans)
+    method = props.get("ValidationMethod", "DNS")
+
+    arn = _acm._cert_arn()
+    now = now_iso()
+    _acm._certificates[arn] = {
+        "CertificateArn": arn,
+        "DomainName": domain,
+        "SubjectAlternativeNames": sans,
+        "Status": "ISSUED",
+        "Type": "AMAZON_ISSUED",
+        "CreatedAt": now,
+        "IssuedAt": now,
+        "NotBefore": now,
+        "NotAfter": _acm._future_iso(365 * 24 * 3600),
+        "DomainValidationOptions": [_acm._validation_options(d, method) for d in sans],
+        "ValidationMethod": method,
+        "Tags": props.get("Tags", []),
+        "Options": {
+            "CertificateTransparencyLoggingPreference":
+                (props.get("CertificateTransparencyLoggingPreference")
+                 or (props.get("Options") or {}).get("CertificateTransparencyLoggingPreference")
+                 or "ENABLED"),
+        },
+        "KeyAlgorithm": props.get("KeyAlgorithm", "RSA_2048"),
+        "_pem_body": _acm._synthetic_pem(domain),
+        "_pem_chain": "",
+        "_private_key": "",
+    }
+    return arn, {"CertificateArn": arn, "Arn": arn}
+
+
+def _acm_certificate_delete(physical_id, props):
+    _acm._certificates.pop(physical_id, None)
+
+
+# ---------------------------------------------------------------------------
+# ELBv2 TargetGroup + ListenerRule
+# ---------------------------------------------------------------------------
+
+def _elbv2_target_group_create(logical_id, props, stack_name):
+    """Provision an AWS::ElasticLoadBalancingV2::TargetGroup matching what
+    `CreateTargetGroup` produces; physical id = TargetGroupArn."""
+    name = props.get("Name") or _physical_name(stack_name, logical_id, max_len=32)
+    matcher = props.get("Matcher") or {}
+    import random as _random
+    import string as _string
+    tid = "".join(_random.choices(_string.ascii_lowercase + _string.digits, k=16))
+    arn = f"arn:aws:elasticloadbalancing:{get_region()}:{get_account_id()}:targetgroup/{name}/{tid}"
+    tg = {
+        "TargetGroupArn": arn,
+        "TargetGroupName": name,
+        "Protocol": props.get("Protocol", "HTTP"),
+        "Port": int(props.get("Port", 80) or 80),
+        "VpcId": props.get("VpcId", ""),
+        "HealthCheckProtocol": props.get("HealthCheckProtocol", "HTTP"),
+        "HealthCheckPort": props.get("HealthCheckPort", "traffic-port"),
+        "HealthCheckEnabled": (
+            props.get("HealthCheckEnabled", True)
+            if isinstance(props.get("HealthCheckEnabled"), bool)
+            else str(props.get("HealthCheckEnabled", "true")).lower() == "true"
+        ),
+        "HealthCheckPath": props.get("HealthCheckPath", "/"),
+        "HealthCheckIntervalSeconds": int(props.get("HealthCheckIntervalSeconds", 30) or 30),
+        "HealthCheckTimeoutSeconds": int(props.get("HealthCheckTimeoutSeconds", 5) or 5),
+        "HealthyThresholdCount": int(props.get("HealthyThresholdCount", 5) or 5),
+        "UnhealthyThresholdCount": int(props.get("UnhealthyThresholdCount", 2) or 2),
+        "Matcher": {"HttpCode": matcher.get("HttpCode", "200")},
+        "LoadBalancerArns": [],
+        "TargetType": props.get("TargetType", "instance"),
+    }
+    _alb._tgs[arn] = tg
+    _alb._targets[arn] = []
+    _alb._tags[arn] = {t["Key"]: t["Value"] for t in (props.get("Tags") or [])}
+    _alb._tg_attrs[arn] = [
+        {"Key": a.get("Key", ""), "Value": a.get("Value", "")}
+        for a in (props.get("TargetGroupAttributes") or [])
+    ] or [
+        {"Key": "deregistration_delay.timeout_seconds", "Value": "300"},
+        {"Key": "stickiness.enabled", "Value": "false"},
+        {"Key": "stickiness.type", "Value": "lb_cookie"},
+    ]
+    return arn, {"TargetGroupArn": arn, "TargetGroupName": name, "TargetGroupFullName": arn.split(":targetgroup/", 1)[-1]}
+
+
+def _elbv2_target_group_delete(physical_id, props):
+    _alb._tgs.pop(physical_id, None)
+    _alb._targets.pop(physical_id, None)
+    _alb._tags.pop(physical_id, None)
+    _alb._tg_attrs.pop(physical_id, None)
+
+
+def _flatten_listener_rule_conditions(cfn_conditions):
+    """CFN ListenerRule Conditions accept both the flat `{Field, Values}` shape
+    and the per-field nested config form (`PathPatternConfig.Values`,
+    `HostHeaderConfig.Values`, `HttpHeaderConfig`, `HttpRequestMethodConfig`,
+    `QueryStringConfig`, `SourceIpConfig`). MS' ALB stores the simple
+    `{Field, Values}` form, so collapse the nested form into Values for the
+    fields where it makes sense.
+    """
+    out = []
+    for c in cfn_conditions or []:
+        field = c.get("Field", "")
+        values = c.get("Values") or []
+        config_key = {
+            "path-pattern": "PathPatternConfig",
+            "host-header": "HostHeaderConfig",
+            "http-header": "HttpHeaderConfig",
+            "http-request-method": "HttpRequestMethodConfig",
+            "query-string": "QueryStringConfig",
+            "source-ip": "SourceIpConfig",
+        }.get(field)
+        if not values and config_key and c.get(config_key):
+            cfg = c[config_key]
+            values = cfg.get("Values") or []
+            if not values and field == "query-string" and cfg.get("Values") is None:
+                values = [f"{q.get('Key','')}={q.get('Value','')}" for q in (cfg.get("Values") or [])]
+        out.append({"Field": field, "Values": list(values)})
+    return out
+
+
+def _elbv2_listener_rule_create(logical_id, props, stack_name):
+    """Provision an AWS::ElasticLoadBalancingV2::ListenerRule. Conditions and
+    Actions match the shape MS' ALB stores in `_alb._rules`.
+    """
+    l_arn = props.get("ListenerArn", "")
+    if not l_arn:
+        raise ValueError("AWS::ElasticLoadBalancingV2::ListenerRule requires ListenerArn")
+    if l_arn not in _alb._listeners:
+        raise ValueError(f"Listener '{l_arn}' not found for ListenerRule {logical_id}")
+    listener = _alb._listeners[l_arn]
+    lb_arn = listener["LoadBalancerArn"]
+    lb_name = _alb._lbs[lb_arn]["LoadBalancerName"]
+    lb_id = lb_arn.split("/")[-1]
+    l_id = l_arn.split("/")[-1]
+    import random as _random
+    import string as _string
+    rule_id = "".join(_random.choices(_string.ascii_lowercase + _string.digits, k=16))
+    rule_arn = (f"arn:aws:elasticloadbalancing:{get_region()}:{get_account_id()}"
+                f":listener-rule/app/{lb_name}/{lb_id}/{l_id}/{rule_id}")
+    # CFN Actions: list of dicts with Type, Order, TargetGroupArn / RedirectConfig
+    # / FixedResponseConfig. MS' native shape matches this directly.
+    actions = []
+    for i, a in enumerate(props.get("Actions") or [], start=1):
+        record = {"Type": a.get("Type", "forward"), "Order": int(a.get("Order", i))}
+        if a.get("TargetGroupArn"):
+            record["TargetGroupArn"] = a["TargetGroupArn"]
+        if a.get("RedirectConfig"):
+            record["RedirectConfig"] = dict(a["RedirectConfig"])
+        if a.get("FixedResponseConfig"):
+            record["FixedResponseConfig"] = dict(a["FixedResponseConfig"])
+        actions.append(record)
+    rule = {
+        "RuleArn": rule_arn,
+        "ListenerArn": l_arn,
+        "Priority": str(props.get("Priority", 1)),
+        "Conditions": _flatten_listener_rule_conditions(props.get("Conditions") or []),
+        "Actions": actions,
+        "IsDefault": False,
+    }
+    _alb._rules[rule_arn] = rule
+    return rule_arn, {"RuleArn": rule_arn}
+
+
+def _elbv2_listener_rule_delete(physical_id, props):
+    _alb._rules.pop(physical_id, None)
 
 
 # ---------------------------------------------------------------------------
@@ -2990,6 +3217,149 @@ def _rds_db_cluster_delete(physical_id, props):
 
 
 # ---------------------------------------------------------------------------
+# RDS DBInstance
+# ---------------------------------------------------------------------------
+
+def _rds_db_instance_create(logical_id, props, stack_name):
+    """Provision an AWS::RDS::DBInstance.
+
+    Writes the instance record directly into rds._instances with the same
+    shape `CreateDBInstance` produces, but does NOT spawn the Docker DB
+    container (CFN provisioning is metadata-only; real DB connectivity
+    happens via the CLI / SDK path which already handles container spawn).
+    """
+    db_id = props.get("DBInstanceIdentifier") or _physical_name(
+        stack_name, logical_id, lowercase=True, max_len=63
+    )
+    engine = props.get("Engine", "postgres")
+    engine_version = props.get("EngineVersion") or _rds._default_engine_version(engine)
+    db_class = props.get("DBInstanceClass", "db.t3.micro")
+    master_user = props.get("MasterUsername", "admin")
+    master_pass = props.get("MasterUserPassword", "password")
+    db_name = props.get("DBName", "")
+    cluster_id = props.get("DBClusterIdentifier", "")
+
+    # Aurora cluster members inherit master creds from the cluster.
+    if cluster_id and cluster_id in _rds._clusters:
+        parent = _rds._clusters[cluster_id]
+        master_user = props.get("MasterUsername") or parent.get("MasterUsername", master_user)
+        master_pass = props.get("MasterUserPassword") or parent.get("_MasterUserPassword", master_pass)
+        if not db_name:
+            db_name = parent.get("DatabaseName", "")
+
+    port = int(props.get("Port") or _rds._default_port(engine))
+    allocated_storage = int(props.get("AllocatedStorage") or 20)
+    storage_type = props.get("StorageType", "gp2")
+    subnet_group_name = props.get("DBSubnetGroupName", "default")
+    arn = f"arn:aws:rds:{get_region()}:{get_account_id()}:db:{db_id}"
+    dbi_resource_id = f"db-{new_uuid().replace('-', '')[:20].upper()}"
+    param_group_name = (
+        props.get("DBParameterGroupName")
+        or f"default.{engine}{engine_version.split('.')[0]}"
+    )
+
+    vpc_sgs = props.get("VPCSecurityGroups") or props.get("VpcSecurityGroupIds") or []
+    if isinstance(vpc_sgs, str):
+        vpc_sgs = [vpc_sgs]
+    vpc_sg_list = [{"VpcSecurityGroupId": sg, "Status": "active"} for sg in vpc_sgs]
+
+    subnet_group = _rds._subnet_groups.get(subnet_group_name, {
+        "DBSubnetGroupName": subnet_group_name,
+        "DBSubnetGroupDescription": "default",
+        "SubnetGroupStatus": "Complete",
+        "Subnets": [],
+        "VpcId": "vpc-00000000",
+        "DBSubnetGroupArn": f"arn:aws:rds:{get_region()}:{get_account_id()}:subgrp:{subnet_group_name}",
+    })
+
+    instance = {
+        "DBInstanceIdentifier": db_id,
+        "DBInstanceClass": db_class,
+        "Engine": engine,
+        "EngineVersion": engine_version,
+        "DBInstanceStatus": "available",
+        "MasterUsername": master_user,
+        "_MasterUserPassword": master_pass,
+        "DBName": db_name or "mydb",
+        "Endpoint": {
+            "Address": f"{db_id}.{new_uuid()[:8]}.{get_region()}.rds.amazonaws.com",
+            "Port": port,
+            "HostedZoneId": "Z2R2ITUGPM61AM",
+        },
+        "AllocatedStorage": allocated_storage,
+        "InstanceCreateTime": _rds._format_time(time.time()),
+        "PreferredBackupWindow": props.get("PreferredBackupWindow", "03:00-04:00"),
+        "BackupRetentionPeriod": int(props.get("BackupRetentionPeriod", 1)),
+        "DBSecurityGroups": [],
+        "VpcSecurityGroups": vpc_sg_list,
+        "DBParameterGroups": [{
+            "DBParameterGroupName": param_group_name,
+            "ParameterApplyStatus": "in-sync",
+        }],
+        "AvailabilityZone": props.get("AvailabilityZone", f"{get_region()}a"),
+        "DBSubnetGroup": subnet_group,
+        "PreferredMaintenanceWindow": props.get("PreferredMaintenanceWindow", "sun:05:00-sun:06:00"),
+        "PendingModifiedValues": {},
+        "MultiAZ": bool(props.get("MultiAZ", False)),
+        "AutoMinorVersionUpgrade": bool(props.get("AutoMinorVersionUpgrade", True)),
+        "ReadReplicaDBInstanceIdentifiers": [],
+        "ReadReplicaSourceDBInstanceIdentifier": "",
+        "LicenseModel": _rds._license_model(engine),
+        "OptionGroupMemberships": [{
+            "OptionGroupName": f"default:{engine}-{engine_version.split('.')[0]}",
+            "Status": "in-sync",
+        }],
+        "PubliclyAccessible": bool(props.get("PubliclyAccessible", False)),
+        "StorageType": storage_type,
+        "StorageEncrypted": bool(props.get("StorageEncrypted", False)),
+        "KmsKeyId": props.get("KmsKeyId", ""),
+        "DbiResourceId": dbi_resource_id,
+        "CACertificateIdentifier": "rds-ca-rsa2048-g1",
+        "CopyTagsToSnapshot": bool(props.get("CopyTagsToSnapshot", False)),
+        "MonitoringInterval": int(props.get("MonitoringInterval", 0)),
+        "MonitoringRoleArn": props.get("MonitoringRoleArn", ""),
+        "PromotionTier": int(props.get("PromotionTier", 1)),
+        "DBInstanceArn": arn,
+        "DBClusterIdentifier": cluster_id,
+        "IAMDatabaseAuthenticationEnabled": bool(props.get("EnableIAMDatabaseAuthentication", False)),
+        "DeletionProtection": bool(props.get("DeletionProtection", False)),
+        "PerformanceInsightsEnabled": bool(props.get("EnablePerformanceInsights", False)),
+        "TagList": props.get("Tags", []),
+    }
+    import time as _time
+    instance["LatestRestorableTime"] = _rds._format_time(_time.time())
+
+    _rds._instances[db_id] = instance
+    if cluster_id and cluster_id in _rds._clusters:
+        members = _rds._clusters[cluster_id].setdefault("DBClusterMembers", [])
+        if not any(m.get("DBInstanceIdentifier") == db_id for m in members):
+            members.append({
+                "DBInstanceIdentifier": db_id,
+                "IsClusterWriter": True,
+                "DBClusterParameterGroupStatus": "in-sync",
+                "PromotionTier": int(props.get("PromotionTier", 1)),
+            })
+
+    return db_id, {
+        "Endpoint.Address": instance["Endpoint"]["Address"],
+        "Endpoint.Port": str(port),
+        "DbiResourceId": dbi_resource_id,
+        "DBInstanceArn": arn,
+    }
+
+
+def _rds_db_instance_delete(physical_id, props):
+    instance = _rds._instances.pop(physical_id, None)
+    if instance:
+        cluster_id = instance.get("DBClusterIdentifier")
+        if cluster_id and cluster_id in _rds._clusters:
+            members = _rds._clusters[cluster_id].get("DBClusterMembers", [])
+            _rds._clusters[cluster_id]["DBClusterMembers"] = [
+                m for m in members if m.get("DBInstanceIdentifier") != physical_id
+            ]
+
+
+# ---------------------------------------------------------------------------
 # AutoScaling Group
 # ---------------------------------------------------------------------------
 
@@ -3223,6 +3593,9 @@ _RESOURCE_HANDLERS = {
     "AWS::Cognito::IdentityPool": {"create": _cognito_identity_pool_create, "delete": _cognito_identity_pool_delete},
     "AWS::Cognito::UserPoolDomain": {"create": _cognito_user_pool_domain_create, "delete": _cognito_user_pool_domain_delete},
     "AWS::ECR::Repository": {"create": _ecr_repo_create, "delete": _ecr_repo_delete},
+    "AWS::CertificateManager::Certificate": {"create": _acm_certificate_create, "delete": _acm_certificate_delete},
+    "AWS::ElasticLoadBalancingV2::TargetGroup": {"create": _elbv2_target_group_create, "delete": _elbv2_target_group_delete},
+    "AWS::ElasticLoadBalancingV2::ListenerRule": {"create": _elbv2_listener_rule_create, "delete": _elbv2_listener_rule_delete},
     "AWS::CodeBuild::Project": {"create": _codebuild_project_create, "delete": _codebuild_project_delete},
     "AWS::IAM::ManagedPolicy": {"create": _iam_managed_policy_create, "delete": _iam_managed_policy_delete},
     "AWS::KMS::Key": {"create": _kms_key_create, "delete": _kms_key_delete},
@@ -3255,6 +3628,7 @@ _RESOURCE_HANDLERS = {
     "AWS::CloudFront::KeyValueStore": {"create": _cf_kvs_create, "update": _cf_kvs_update, "delete": _cf_kvs_delete},
     "AWS::CloudWatch::Alarm": {"create": _cw_metric_alarm_create, "delete": _cw_metric_alarm_delete},
     "AWS::RDS::DBCluster": {"create": _rds_db_cluster_create, "delete": _rds_db_cluster_delete},
+    "AWS::RDS::DBInstance": {"create": _rds_db_instance_create, "delete": _rds_db_instance_delete},
     # EventBridge Scheduler
     "AWS::Scheduler::Schedule": {"create": _scheduler_schedule_create, "delete": _scheduler_schedule_delete},
     "AWS::Scheduler::ScheduleGroup": {"create": _scheduler_group_create, "delete": _scheduler_group_delete},

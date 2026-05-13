@@ -87,6 +87,7 @@ def _issue_token(headers: dict):
 
 
 def _credentials_doc() -> dict:
+    """EC2 IMDS credentials document shape (`/latest/meta-data/iam/security-credentials/<role>`)."""
     return {
         "Code": "Success",
         "LastUpdated": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -95,6 +96,23 @@ def _credentials_doc() -> dict:
         "SecretAccessKey": _gen_secret(),
         "Token": _gen_session_token(),
         "Expiration": _future(3600),
+    }
+
+
+def _ecs_task_credentials_doc() -> dict:
+    """ECS task IAM role credentials document shape (`/v2/credentials/<uuid>`).
+
+    Strict per AWS docs: AccessKeyId, SecretAccessKey, Token, Expiration, RoleArn.
+    No Code / Type / LastUpdated — those are EC2 IMDS-only and confuse strict
+    consumers that distinguish the two endpoints (e.g. some Go SDK behaviour
+    around iam.RoleName extraction).
+    """
+    return {
+        "AccessKeyId": _gen_session_access_key(),
+        "SecretAccessKey": _gen_secret(),
+        "Token": _gen_session_token(),
+        "Expiration": _future(3600),
+        "RoleArn": f"arn:aws:iam::{get_account_id()}:role/ministack-ecs-task-role",
     }
 
 
@@ -139,7 +157,7 @@ async def handle_request(method, path, headers, body, query_params):
     if path.startswith("/v2/credentials/"):
         if method != "GET":
             return _text("Method Not Allowed", 405)
-        return _json_resp(_credentials_doc())
+        return _json_resp(_ecs_task_credentials_doc())
 
     if path.startswith("/latest/api/token"):
         if method != "PUT":
