@@ -7,6 +7,11 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## Unreleased
+
+### Fixed
+- **Step Functions JSONata `Arguments` for `aws-sdk` Task states** — Task states with `QueryLanguage: "JSONata"` now evaluate `Arguments` before dispatching service integrations and evaluate success/Catch `Output` with `$states.input`, `$states.result`, and `$states.errorOutput`. This lets per-state JSONata workflows pass required SDK parameters locally instead of invoking services with an empty JSONPath-style payload.
+
 ## [1.3.38] — 2026-05-13
 
 ### Added

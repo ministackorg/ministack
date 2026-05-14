@@ -23,6 +23,7 @@ Executions run in background threads and transition through RUNNING ->
 SUCCEEDED / FAILED / TIMED_OUT / ABORTED.
 """
 
+import ast
 import asyncio
 import copy
 import json
@@ -1150,6 +1151,7 @@ def _run_execution(exec_arn):
         current_input = {}
 
     ctx = {
+        "QueryLanguage": definition.get("QueryLanguage", "JSONPath"),
         "Execution": {
             "Id": exec_arn,
             "Input": current_input,
@@ -1274,6 +1276,7 @@ def _execute_pass(state_def, raw_input):
 def _execute_task(state_def, raw_input, execution, ctx):
     resource = state_def.get("Resource", "")
     is_callback = ".waitForTaskToken" in resource
+    query_language = _state_query_language(state_def, ctx)
 
     # SFN mock config — return canned response if configured (AWS SFN Local format)
     if _sfn_mock_config and execution:
@@ -1290,16 +1293,27 @@ def _execute_task(state_def, raw_input, execution, ctx):
                     mock["Throw"].get("Error", "MockError"),
                     mock["Throw"].get("Cause", "Mocked failure"))
             mock_result = mock.get("Return", {})
-            result = _apply_result_selector(state_def, mock_result)
-            output = _apply_result_path(state_def, raw_input, result)
-            output = _apply_output_path(state_def, output)
+            if query_language == "JSONata":
+                output = _apply_jsonata_output(
+                    state_def,
+                    raw_input,
+                    ctx,
+                    result=mock_result,
+                    default=mock_result,
+                )
+            else:
+                result = _apply_result_selector(state_def, mock_result)
+                output = _apply_result_path(state_def, raw_input, result)
+                output = _apply_output_path(state_def, output)
             return output, _next_or_end(state_def)
 
     if is_callback:
         ctx["Task"] = {"Token": new_uuid()}
 
-    effective = _apply_input_path(state_def, raw_input)
-    effective = _apply_parameters(state_def, effective, ctx)
+    effective = None
+    if query_language != "JSONata":
+        effective = _apply_input_path(state_def, raw_input)
+        effective = _apply_parameters(state_def, effective, ctx)
 
     retriers = state_def.get("Retry", [])
     catchers = state_def.get("Catch", [])
@@ -1308,6 +1322,9 @@ def _execute_task(state_def, raw_input, execution, ctx):
 
     while True:
         try:
+            if query_language == "JSONata":
+                effective = _apply_jsonata_arguments(state_def, raw_input, ctx)
+
             _add_event(execution, "TaskScheduled", {
                 "taskScheduledEventDetails": {
                     "resourceType": "lambda" if "lambda" in resource else "states",
@@ -1328,9 +1345,18 @@ def _execute_task(state_def, raw_input, execution, ctx):
                 },
             })
 
-            result = _apply_result_selector(state_def, task_result)
-            output = _apply_result_path(state_def, raw_input, result)
-            output = _apply_output_path(state_def, output)
+            if query_language == "JSONata":
+                output = _apply_jsonata_output(
+                    state_def,
+                    raw_input,
+                    ctx,
+                    result=task_result,
+                    default=task_result,
+                )
+            else:
+                result = _apply_result_selector(state_def, task_result)
+                output = _apply_result_path(state_def, raw_input, result)
+                output = _apply_output_path(state_def, output)
             return output, _next_or_end(state_def)
 
         except _ExecutionError as err:
@@ -1358,8 +1384,17 @@ def _execute_task(state_def, raw_input, execution, ctx):
         catcher = _find_matching_catcher(catchers, last_error.error)
         if catcher:
             error_output = {"Error": last_error.error, "Cause": last_error.cause}
-            output = _apply_result_path_raw(
-                catcher.get("ResultPath", "$"), raw_input, error_output)
+            if query_language == "JSONata" and "Output" in catcher:
+                output = _apply_jsonata_output(
+                    catcher,
+                    raw_input,
+                    ctx,
+                    error_output=error_output,
+                    default=error_output,
+                )
+            else:
+                output = _apply_result_path_raw(
+                    catcher.get("ResultPath", "$"), raw_input, error_output)
             return output, catcher["Next"]
         raise last_error
 
@@ -1832,6 +1867,232 @@ def _apply_result_path_raw(result_path, original, result):
         cur = cur[p]
     cur[parts[-1]] = result
     return output
+
+
+def _state_query_language(state_def, ctx=None):
+    return state_def.get("QueryLanguage") or (ctx or {}).get("QueryLanguage", "JSONPath")
+
+
+def _apply_jsonata_arguments(state_def, raw_input, ctx=None):
+    if "Arguments" not in state_def:
+        return raw_input
+    return _apply_jsonata_template(
+        state_def["Arguments"],
+        raw_input,
+        ctx,
+    )
+
+
+def _apply_jsonata_output(state_def, raw_input, ctx=None, result=None, error_output=None, default=None):
+    if "Output" not in state_def:
+        return default
+    return _apply_jsonata_template(
+        state_def["Output"],
+        raw_input,
+        ctx,
+        result=result,
+        error_output=error_output,
+    )
+
+
+def _apply_jsonata_template(value, raw_input, ctx=None, result=None, error_output=None):
+    if isinstance(value, str):
+        if value.startswith("{%") and value.endswith("%}"):
+            expr = value[2:-2].strip()
+            return _evaluate_jsonata(expr, raw_input, ctx, result, error_output)
+        return value
+    if isinstance(value, dict):
+        return {
+            key: _apply_jsonata_template(val, raw_input, ctx, result, error_output)
+            for key, val in value.items()
+        }
+    if isinstance(value, list):
+        return [
+            _apply_jsonata_template(item, raw_input, ctx, result, error_output)
+            for item in value
+        ]
+    return value
+
+
+def _evaluate_jsonata(expression, raw_input, ctx=None, result=None, error_output=None):
+    states = {
+        "input": raw_input,
+        "result": result,
+        "errorOutput": error_output,
+        "context": ctx or {},
+    }
+    try:
+        return _eval_jsonata_expr(expression.strip(), states)
+    except _ExecutionError:
+        raise
+    except Exception as exc:
+        raise _ExecutionError("States.QueryEvaluationError", str(exc))
+
+
+def _eval_jsonata_expr(expr, states):
+    expr = expr.strip()
+    if not expr:
+        raise ValueError("Empty JSONata expression")
+
+    q_pos = _find_top_level_token(expr, "?")
+    if q_pos >= 0:
+        c_pos = _find_matching_ternary_colon(expr, q_pos)
+        if c_pos < 0:
+            raise ValueError(f"Invalid JSONata conditional: {expr}")
+        condition = _eval_jsonata_expr(expr[:q_pos], states)
+        if condition:
+            return _eval_jsonata_expr(expr[q_pos + 1:c_pos], states)
+        return _eval_jsonata_expr(expr[c_pos + 1:], states)
+
+    for op in ("!=", "="):
+        op_pos = _find_top_level_token(expr, op)
+        if op_pos >= 0:
+            left = _eval_jsonata_expr(expr[:op_pos], states)
+            right = _eval_jsonata_expr(expr[op_pos + len(op):], states)
+            return left != right if op == "!=" else left == right
+
+    if expr.startswith("$merge(") and expr.endswith(")"):
+        args = _eval_jsonata_expr(expr[len("$merge("):-1], states)
+        if not isinstance(args, list):
+            raise ValueError("$merge expects an array")
+        merged = {}
+        for item in args:
+            if isinstance(item, dict):
+                merged.update(item)
+        return merged
+
+    if expr.startswith("[") and expr.endswith("]"):
+        body = expr[1:-1].strip()
+        if not body:
+            return []
+        return [_eval_jsonata_expr(part, states) for part in _split_top_level(body, ",")]
+
+    if expr.startswith("{") and expr.endswith("}"):
+        body = expr[1:-1].strip()
+        if not body:
+            return {}
+        result = {}
+        for part in _split_top_level(body, ","):
+            key_expr, value_expr = _split_object_member(part)
+            key_expr = key_expr.strip()
+            if key_expr.startswith(("'", '"')):
+                key = ast.literal_eval(key_expr)
+            else:
+                key = key_expr
+            result[key] = _eval_jsonata_expr(value_expr, states)
+        return result
+
+    if expr.startswith("$states."):
+        return _resolve_jsonata_states_path(expr, states)
+
+    if expr in ("true", "false", "null"):
+        return {"true": True, "false": False, "null": None}[expr]
+
+    try:
+        return ast.literal_eval(expr)
+    except (SyntaxError, ValueError):
+        pass
+
+    raise ValueError(f"Unsupported JSONata expression: {expr}")
+
+
+def _resolve_jsonata_states_path(expr, states):
+    suffix = expr[len("$states."):]
+    root, _, rest = suffix.partition(".")
+    if root not in states:
+        raise ValueError(f"Unsupported $states field: {root}")
+    current = states[root]
+    if not rest:
+        return current
+    return _resolve_dotted_path(rest, current)
+
+
+def _resolve_dotted_path(path, data):
+    current = data
+    for raw_part in path.split("."):
+        part = raw_part
+        while part:
+            match = re.match(r"([A-Za-z_][A-Za-z0-9_]*)(?:\[(\d+)])?(.*)", part)
+            if not match:
+                raise ValueError(f"Unsupported JSONata path segment: {raw_part}")
+            field, idx, part = match.groups()
+            if isinstance(current, dict) and field in current:
+                current = current[field]
+            else:
+                return None
+            if idx is not None:
+                if isinstance(current, list) and int(idx) < len(current):
+                    current = current[int(idx)]
+                else:
+                    return None
+    return current
+
+
+def _split_object_member(member):
+    for idx, ch in _iter_top_level_chars(member):
+        if ch == ":":
+            return member[:idx], member[idx + 1:]
+    raise ValueError(f"Invalid JSONata object member: {member}")
+
+
+def _split_top_level(text, separator):
+    parts = []
+    start = 0
+    for idx, ch in _iter_top_level_chars(text):
+        if ch == separator:
+            parts.append(text[start:idx].strip())
+            start = idx + 1
+    parts.append(text[start:].strip())
+    return parts
+
+
+def _find_top_level_token(text, token):
+    for idx, ch in _iter_top_level_chars(text):
+        if text.startswith(token, idx):
+            if token == "=":
+                prev_ch = text[idx - 1] if idx > 0 else ""
+                next_ch = text[idx + 1] if idx + 1 < len(text) else ""
+                if prev_ch in ("!", "<", ">", "=") or next_ch == "=":
+                    continue
+            return idx
+    return -1
+
+
+def _find_matching_ternary_colon(text, question_pos):
+    nested = 0
+    for idx, ch in _iter_top_level_chars(text[question_pos + 1:]):
+        real_idx = question_pos + 1 + idx
+        if ch == "?":
+            nested += 1
+        elif ch == ":":
+            if nested == 0:
+                return real_idx
+            nested -= 1
+    return -1
+
+
+def _iter_top_level_chars(text):
+    depth = 0
+    quote = None
+    escape = False
+    for idx, ch in enumerate(text):
+        if quote:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == quote:
+                quote = None
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+            continue
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+        elif depth == 0:
+            yield idx, ch
 
 
 def _resolve_path(path, data):
