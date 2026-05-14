@@ -10,7 +10,8 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 ## Unreleased
 
 ### Fixed
-- **Step Functions JSONata `Arguments` for `aws-sdk` Task states** — Task states with `QueryLanguage: "JSONata"` now evaluate `Arguments` before dispatching service integrations and evaluate success/Catch `Output` with `$states.input`, `$states.result`, and `$states.errorOutput`. This lets per-state JSONata workflows pass required SDK parameters locally instead of invoking services with an empty JSONPath-style payload.
+- **Step Functions JSONata `Arguments` for `aws-sdk` Task states** — Task states with `QueryLanguage: "JSONata"` now evaluate `Arguments` before dispatching service integrations and evaluate success/Catch `Output` with `$states.input`, `$states.result`, and `$states.errorOutput`. This lets per-state JSONata workflows pass required SDK parameters locally instead of invoking services with an empty JSONPath-style payload. Contributed by @jayjanssen.
+- **Step Functions JSONata coverage for Pass and Choice states** — Pass states now evaluate `Output` (previously the field was accepted and silently ignored, passing input through unchanged). Choice states now evaluate per-branch `Condition` and route accordingly (previously every `{% ... %}` condition was treated as falsy, so workflows always fell through to `Default`), and apply per-branch `Output` on the matched rule. The evaluator gained `< <= > >= + - * / % & and or in $count $length $not $string $number`, paren grouping, unary minus, and proper left-associative arithmetic — covering the JSONata operators used in real workflows. Reported by @youngkwangk.
 
 ## [1.3.38] — 2026-05-13
 

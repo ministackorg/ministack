@@ -947,6 +947,10 @@ def _test_state(data):
     ctx.setdefault("Execution", {"Id": f"arn:aws:states:{get_region()}:{get_account_id()}:execution:test:{new_uuid()}", "Name": "test", "StartTime": now_iso()})
     ctx.setdefault("StateMachine", {"Id": "test", "Name": "test"})
     ctx["State"] = {"Name": state_name, "EnteredTime": now_iso()}
+    # Inherit top-level QueryLanguage when the definition is a full state machine;
+    # for single-state definitions the state's own QueryLanguage still wins via
+    # `_state_query_language`.
+    ctx.setdefault("QueryLanguage", definition.get("QueryLanguage", "JSONPath"))
 
     inspection_data = {}
     if inspection_level in ("DEBUG", "TRACE"):
@@ -955,19 +959,19 @@ def _test_state(data):
     result = {}
     try:
         if state_type == "Pass":
-            output, next_state = _execute_pass(state_def, input_data)
+            output, next_state = _execute_pass(state_def, input_data, ctx)
             result = {"status": "SUCCEEDED", "output": json.dumps(output)}
             if next_state:
                 result["nextState"] = next_state
 
         elif state_type == "Choice":
-            output, next_state = _execute_choice(state_def, input_data)
+            output, next_state = _execute_choice(state_def, input_data, ctx)
             result = {"status": "SUCCEEDED", "output": json.dumps(output)}
             if next_state:
                 result["nextState"] = next_state
 
         elif state_type == "Wait":
-            output, next_state = _execute_wait(state_def, input_data)
+            output, next_state = _execute_wait(state_def, input_data, ctx)
             result = {"status": "SUCCEEDED", "output": json.dumps(output)}
             if next_state:
                 result["nextState"] = next_state
@@ -1217,7 +1221,7 @@ def _run_execution(exec_arn):
                     state_def, current_input, execution, ctx)
             else:
                 current_input, next_name = handler_fn(
-                    state_def, current_input)
+                    state_def, current_input, ctx)
 
             _add_event(execution, f"{state_type}StateExited", {
                 "stateExitedEventDetails": {
@@ -1258,7 +1262,14 @@ def _fail_execution(execution, error, cause):
 # Pass state
 # ---------------------------------------------------------------------------
 
-def _execute_pass(state_def, raw_input):
+def _execute_pass(state_def, raw_input, ctx=None):
+    if _state_query_language(state_def, ctx) == "JSONata":
+        # JSONata Pass: `Output` replaces the JSONPath chain. Missing Output
+        # passes input through unchanged (matches AWS behavior — Pass with no
+        # transformation is the identity state).
+        output = _apply_jsonata_output(state_def, raw_input, ctx, default=raw_input)
+        return output, _next_or_end(state_def)
+
     effective = _apply_input_path(state_def, raw_input)
     effective = _apply_parameters(state_def, effective)
 
@@ -1545,7 +1556,20 @@ def _call_lambda(func_name, event):
 # Choice state
 # ---------------------------------------------------------------------------
 
-def _execute_choice(state_def, raw_input):
+def _execute_choice(state_def, raw_input, ctx=None):
+    if _state_query_language(state_def, ctx) == "JSONata":
+        for choice in state_def.get("Choices", []):
+            if _evaluate_jsonata_choice_rule(choice, raw_input, ctx):
+                # Per-branch Output (if present) takes precedence; otherwise
+                # input passes through unchanged.
+                output = _apply_jsonata_output(choice, raw_input, ctx, default=raw_input)
+                return output, choice["Next"]
+        default = state_def.get("Default")
+        if default:
+            return raw_input, default
+        raise _ExecutionError("States.NoChoiceMatched",
+                              "No choice rule matched and no Default")
+
     effective = _apply_input_path(state_def, raw_input)
 
     for choice in state_def.get("Choices", []):
@@ -1558,6 +1582,20 @@ def _execute_choice(state_def, raw_input):
 
     raise _ExecutionError("States.NoChoiceMatched",
                           "No choice rule matched and no Default")
+
+
+def _evaluate_jsonata_choice_rule(rule, raw_input, ctx):
+    condition = rule.get("Condition")
+    if condition is None:
+        return False
+    if isinstance(condition, bool):
+        return condition
+    if isinstance(condition, str) and condition.startswith("{%") and condition.endswith("%}"):
+        expr = condition[2:-2].strip()
+        return _truthy(_evaluate_jsonata(expr, raw_input, ctx))
+    # Non-expression literal — JSONata Choice without {% %} is invalid per AWS,
+    # but treat as plain truthy for parity with how literal Output is handled.
+    return _truthy(condition)
 
 
 def _evaluate_rule(rule, data):
@@ -1641,7 +1679,7 @@ def _evaluate_rule(rule, data):
 # Wait state
 # ---------------------------------------------------------------------------
 
-def _execute_wait(state_def, raw_input):
+def _execute_wait(state_def, raw_input, ctx=None):
     effective = _apply_input_path(state_def, raw_input)
 
     if "Seconds" in state_def:
@@ -1810,7 +1848,7 @@ def _run_sub_machine(states, start_at, input_data, execution, ctx):
                 state_def, current_input, execution, ctx)
         else:
             current_input, current_name = handler_fn(
-                state_def, current_input)
+                state_def, current_input, ctx)
 
     return current_input
 
@@ -1930,44 +1968,117 @@ def _evaluate_jsonata(expression, raw_input, ctx=None, result=None, error_output
 
 
 def _eval_jsonata_expr(expr, states):
+    """Tiny JSONata evaluator. Precedence layered low → high:
+       ternary `?:`, `or`, `and`, comparison (`= != < <= > >=`), `in`,
+       additive (`+ - &`), multiplicative (`* / %`), unary `-`, primary.
+
+    Anything outside this surface raises `States.QueryEvaluationError` so callers
+    fail fast and explicitly rather than silently producing wrong data.
+    """
     expr = expr.strip()
     if not expr:
         raise ValueError("Empty JSONata expression")
 
+    # 1. Ternary (right-associative — peel outermost `?`)
     q_pos = _find_top_level_token(expr, "?")
     if q_pos >= 0:
         c_pos = _find_matching_ternary_colon(expr, q_pos)
         if c_pos < 0:
             raise ValueError(f"Invalid JSONata conditional: {expr}")
         condition = _eval_jsonata_expr(expr[:q_pos], states)
-        if condition:
+        if _truthy(condition):
             return _eval_jsonata_expr(expr[q_pos + 1:c_pos], states)
         return _eval_jsonata_expr(expr[c_pos + 1:], states)
 
-    for op in ("!=", "="):
-        op_pos = _find_top_level_token(expr, op)
-        if op_pos >= 0:
-            left = _eval_jsonata_expr(expr[:op_pos], states)
-            right = _eval_jsonata_expr(expr[op_pos + len(op):], states)
-            return left != right if op == "!=" else left == right
+    # 2. `or` (short-circuit, left-assoc → rightmost split)
+    pos, _ = _find_top_level_any_op(expr, ("or",), keyword=True)
+    if pos >= 0:
+        left = _eval_jsonata_expr(expr[:pos], states)
+        if _truthy(left):
+            return True
+        return _truthy(_eval_jsonata_expr(expr[pos + 2:], states))
 
-    if expr.startswith("$merge(") and expr.endswith(")"):
-        args = _eval_jsonata_expr(expr[len("$merge("):-1], states)
-        if not isinstance(args, list):
-            raise ValueError("$merge expects an array")
-        merged = {}
-        for item in args:
-            if isinstance(item, dict):
-                merged.update(item)
-        return merged
+    # 3. `and` (short-circuit)
+    pos, _ = _find_top_level_any_op(expr, ("and",), keyword=True)
+    if pos >= 0:
+        left = _eval_jsonata_expr(expr[:pos], states)
+        if not _truthy(left):
+            return False
+        return _truthy(_eval_jsonata_expr(expr[pos + 3:], states))
 
-    if expr.startswith("[") and expr.endswith("]"):
+    # 4. Comparison
+    pos, op = _find_top_level_any_op(
+        expr, ("!=", "<=", ">=", "=", "<", ">"), keyword=False)
+    if pos >= 0:
+        left = _eval_jsonata_expr(expr[:pos], states)
+        right = _eval_jsonata_expr(expr[pos + len(op):], states)
+        return _apply_binary_op(op, left, right)
+    pos, _ = _find_top_level_any_op(expr, ("in",), keyword=True)
+    if pos >= 0:
+        left = _eval_jsonata_expr(expr[:pos], states)
+        right = _eval_jsonata_expr(expr[pos + 2:], states)
+        if right is None:
+            return False
+        try:
+            return left in right
+        except TypeError as exc:
+            raise ValueError(f"`in` failed: {exc}")
+
+    # 5. Additive
+    pos, op = _find_top_level_any_op(expr, ("+", "-", "&"), keyword=False)
+    if pos >= 0:
+        left = _eval_jsonata_expr(expr[:pos], states)
+        right = _eval_jsonata_expr(expr[pos + 1:], states)
+        return _apply_binary_op(op, left, right)
+
+    # 6. Multiplicative
+    pos, op = _find_top_level_any_op(expr, ("*", "/", "%"), keyword=False)
+    if pos >= 0:
+        left = _eval_jsonata_expr(expr[:pos], states)
+        right = _eval_jsonata_expr(expr[pos + 1:], states)
+        return _apply_binary_op(op, left, right)
+
+    # 7. Unary minus
+    if expr.startswith("-"):
+        inner = _eval_jsonata_expr(expr[1:].lstrip(), states)
+        if isinstance(inner, bool) or not isinstance(inner, (int, float)):
+            raise ValueError(f"Cannot negate non-numeric: {inner!r}")
+        return -inner
+
+    # 8. Primary
+    return _eval_jsonata_primary(expr, states)
+
+
+def _eval_jsonata_primary(expr, states):
+    # Paren grouping
+    if expr.startswith("(") and expr.endswith(")") and _is_balanced_outer(expr, "(", ")"):
+        return _eval_jsonata_expr(expr[1:-1], states)
+
+    # Built-in functions (AWS-supported JSONata subset)
+    for name, fn in (
+        ("$merge", _jsonata_merge),
+        ("$count", _jsonata_count),
+        ("$length", _jsonata_length),
+        ("$not", _jsonata_not),
+        ("$string", _jsonata_string),
+        ("$number", _jsonata_number),
+    ):
+        prefix = name + "("
+        if expr.startswith(prefix) and expr.endswith(")") \
+                and _is_balanced_outer(expr[len(name):], "(", ")"):
+            arg_expr = expr[len(prefix):-1].strip()
+            arg = _eval_jsonata_expr(arg_expr, states) if arg_expr else None
+            return fn(arg)
+
+    # Array literal
+    if expr.startswith("[") and expr.endswith("]") and _is_balanced_outer(expr, "[", "]"):
         body = expr[1:-1].strip()
         if not body:
             return []
         return [_eval_jsonata_expr(part, states) for part in _split_top_level(body, ",")]
 
-    if expr.startswith("{") and expr.endswith("}"):
+    # Object literal
+    if expr.startswith("{") and expr.endswith("}") and _is_balanced_outer(expr, "{", "}"):
         body = expr[1:-1].strip()
         if not body:
             return {}
@@ -1994,6 +2105,206 @@ def _eval_jsonata_expr(expr, states):
         pass
 
     raise ValueError(f"Unsupported JSONata expression: {expr}")
+
+
+def _truthy(value):
+    """JSONata truthiness: null/false/0/empty string/empty array/empty object are falsy."""
+    if value is None or value is False:
+        return False
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and value == 0:
+        return False
+    if isinstance(value, (str, list, dict)) and len(value) == 0:
+        return False
+    return True
+
+
+def _apply_binary_op(op, left, right):
+    try:
+        if op == "=":
+            return left == right
+        if op == "!=":
+            return left != right
+        if op == "<":
+            return left < right
+        if op == "<=":
+            return left <= right
+        if op == ">":
+            return left > right
+        if op == ">=":
+            return left >= right
+        if op == "+":
+            return left + right
+        if op == "-":
+            return left - right
+        if op == "&":
+            return _jsonata_string(left) + _jsonata_string(right)
+        if op == "*":
+            return left * right
+        if op == "/":
+            if right == 0:
+                raise ValueError("Division by zero")
+            return left / right
+        if op == "%":
+            if right == 0:
+                raise ValueError("Modulo by zero")
+            return left % right
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Operator '{op}' failed: {exc}")
+    raise ValueError(f"Unknown operator: {op}")
+
+
+def _jsonata_merge(args):
+    if not isinstance(args, list):
+        raise ValueError("$merge expects an array")
+    merged = {}
+    for item in args:
+        if isinstance(item, dict):
+            merged.update(item)
+    return merged
+
+
+def _jsonata_count(arg):
+    if arg is None:
+        return 0
+    if isinstance(arg, list):
+        return len(arg)
+    return 1
+
+
+def _jsonata_length(arg):
+    if not isinstance(arg, str):
+        raise ValueError("$length expects a string")
+    return len(arg)
+
+
+def _jsonata_not(arg):
+    return not _truthy(arg)
+
+
+def _jsonata_string(arg):
+    if arg is None:
+        return ""
+    if isinstance(arg, bool):
+        return "true" if arg else "false"
+    if isinstance(arg, (dict, list)):
+        return json.dumps(arg)
+    return str(arg)
+
+
+def _jsonata_number(arg):
+    if isinstance(arg, bool):
+        raise ValueError("$number cannot coerce boolean")
+    if isinstance(arg, (int, float)):
+        return arg
+    if isinstance(arg, str):
+        try:
+            return int(arg)
+        except ValueError:
+            return float(arg)
+    raise ValueError(f"$number cannot coerce {type(arg).__name__}")
+
+
+def _find_top_level_any_op(text, ops, keyword=False):
+    """Return (position, op) of the rightmost top-level occurrence of any op in ops.
+
+    `ops` is tried longest-first at each candidate position so e.g. `<=` wins
+    over `<`. For left-associative operators this returns the rightmost match,
+    which the caller splits on — yielding standard left-assoc evaluation when
+    the resulting left-hand side is recursed into.
+    """
+    ops_sorted = sorted(ops, key=len, reverse=True)
+    found = []
+    for idx, _ in _iter_top_level_chars(text):
+        for op in ops_sorted:
+            if not text.startswith(op, idx):
+                continue
+            if not _op_disambiguation_ok(text, idx, op, keyword):
+                continue
+            found.append((idx, op))
+            break
+    if not found:
+        return -1, None
+    return found[-1]
+
+
+def _op_disambiguation_ok(text, idx, op, keyword):
+    """Reject overlapping/ambiguous matches: `=` inside `!=`/`<=`/`>=`/`==`,
+    `<` / `>` inside `<=` / `>=`, leading-`-` as unary minus, and keyword ops
+    that aren't whitespace-bounded (so `or` in `$states.input.order` is skipped).
+    """
+    if keyword:
+        prev_ch = text[idx - 1] if idx > 0 else " "
+        next_idx = idx + len(op)
+        next_ch = text[next_idx] if next_idx < len(text) else " "
+        if not prev_ch.isspace():
+            return False
+        if not next_ch.isspace():
+            return False
+        return True
+    if op == "=":
+        prev_ch = text[idx - 1] if idx > 0 else ""
+        next_ch = text[idx + 1] if idx + 1 < len(text) else ""
+        if prev_ch in ("!", "<", ">", "="):
+            return False
+        if next_ch == "=":
+            return False
+    elif op in ("<", ">"):
+        next_ch = text[idx + 1] if idx + 1 < len(text) else ""
+        if next_ch == "=":
+            return False
+    elif op == "-":
+        # Treat `-` as unary when it's at the start or follows another operator /
+        # opening bracket. Only count it as binary subtract when the preceding
+        # non-space char is an operand terminator.
+        prev_idx = idx - 1
+        while prev_idx >= 0 and text[prev_idx] == " ":
+            prev_idx -= 1
+        if prev_idx < 0:
+            return False
+        prev_ch = text[prev_idx]
+        if not (prev_ch.isalnum() or prev_ch in "_)]}\"'"):
+            return False
+    elif op == "+":
+        prev_idx = idx - 1
+        while prev_idx >= 0 and text[prev_idx] == " ":
+            prev_idx -= 1
+        if prev_idx < 0:
+            return False
+        prev_ch = text[prev_idx]
+        if not (prev_ch.isalnum() or prev_ch in "_)]}\"'"):
+            return False
+    return True
+
+
+def _is_balanced_outer(expr, open_ch, close_ch):
+    """True when the outer pair of brackets in `expr` matches each other —
+    i.e. `(a)(b)` returns False, `(a + (b))` returns True. Quote-aware so
+    brackets inside string literals don't count.
+    """
+    depth = 0
+    in_quote = None
+    escape = False
+    for i, ch in enumerate(expr):
+        if in_quote:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == in_quote:
+                in_quote = None
+            continue
+        if ch in ("'", '"'):
+            in_quote = ch
+            continue
+        if ch == open_ch:
+            depth += 1
+        elif ch == close_ch:
+            depth -= 1
+            if depth == 0 and i < len(expr) - 1:
+                return False
+    return depth == 0
 
 
 def _resolve_jsonata_states_path(expr, states):
