@@ -25,6 +25,7 @@ SUCCEEDED / FAILED / TIMED_OUT / ABORTED.
 
 import ast
 import asyncio
+import contextvars
 import copy
 import json
 import logging
@@ -532,8 +533,18 @@ def _start_execution(data):
         ],
     }
 
+    # Propagate the request's contextvars (notably the account ID set by
+    # set_request_account_id) into the background execution thread. Python's
+    # threading.Thread does NOT automatically copy contextvars, so without
+    # this snapshot the worker runs under the default account and silently
+    # fails to find the execution stored in AccountScopedDict under the
+    # caller's account. See issue #639.
+    ctx_snapshot = contextvars.copy_context()
     threading.Thread(
-        target=_run_execution, args=(exec_arn,), daemon=True).start()
+        target=ctx_snapshot.run,
+        args=(_run_execution, exec_arn),
+        daemon=True,
+    ).start()
 
     logger.info("Step Functions execution started: %s", exec_arn)
     return json_response({"executionArn": exec_arn, "startDate": start_date})
@@ -1736,8 +1747,19 @@ def _execute_parallel(state_def, raw_input, execution, ctx):
         except Exception as exc:
             errors[idx] = exc
 
-    threads = [threading.Thread(target=run_branch, args=(i, b), daemon=True)
-               for i, b in enumerate(branches)]
+    # Each branch runs in its own thread; propagate the parent's contextvars
+    # so AccountScopedDict lookups (account ID, region) keep resolving to the
+    # current execution's tenant. Take a fresh copy_context() per branch —
+    # a single Context cannot be entered by two threads concurrently. See
+    # issue #639.
+    threads = [
+        threading.Thread(
+            target=contextvars.copy_context().run,
+            args=(run_branch, i, b),
+            daemon=True,
+        )
+        for i, b in enumerate(branches)
+    ]
     for t in threads:
         t.start()
     for t in threads:
@@ -1790,8 +1812,16 @@ def _execute_map(state_def, raw_input, execution, ctx):
             errors[idx] = exc
 
     workers = max_conc if max_conc > 0 else (len(items) or 1)
+    # ThreadPoolExecutor workers do not inherit the submitting thread's
+    # contextvars, so wrap each submitted callable with copy_context().run
+    # to keep AccountScopedDict lookups bound to the current tenant. Take
+    # a fresh copy_context() per item — a single Context cannot be entered
+    # by two threads concurrently. See issue #639.
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        futs = [pool.submit(run_item, i, item) for i, item in enumerate(items)]
+        futs = [
+            pool.submit(contextvars.copy_context().run, run_item, i, item)
+            for i, item in enumerate(items)
+        ]
         futures_wait(futs)
 
     for err in errors:
