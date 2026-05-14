@@ -363,6 +363,7 @@ SERVICE_REGISTRY = {
     "cognito-identity": {"module": "cognito"},
     "cognito-idp": {"module": "cognito"},
     "config": {"module": "config"},
+    "documentdb": {"module": "documentdb"},
     "dynamodb": {"module": "dynamodb"},
     "dynamodbstreams": {"module": "dynamodb_streams"},
     "dsql": {"module": "dsql"},

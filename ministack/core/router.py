@@ -86,6 +86,9 @@ SERVICE_PATTERNS = {
     "lambda-microvms": {
         "path_patterns": [r"^/2025-09-09/microvm"],
         "host_patterns": [r"lambda-microvms\."],
+    "documentdb": {
+        "target_prefixes": ["AmazonRDS", "DocDB"],
+        "host_patterns": [r"docdb\.", r"documentdb\."],
     },
     "lambda": {
         "path_patterns": [
