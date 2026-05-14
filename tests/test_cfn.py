@@ -3014,3 +3014,45 @@ def test_cfn_lambda_s3_ref_bucket_has_code_size(cfn, lam, s3):
 
     cfn.delete_stack(StackName=stack_name)
     _wait_stack(cfn, stack_name)
+
+
+# -- AWS::ApiGateway::Authorizer ---------------------------------------
+
+
+def test_cfn_apigateway_authorizer_provisions(cfn):
+    """AWS::ApiGateway::Authorizer was previously not registered in the
+    CFN resource handler map, so stacks that declared a custom authorizer
+    failed with `Unsupported resource type`. The handler now provisions
+    the authorizer against the existing apigateway_v1 store."""
+    stack_name = f"intg-cfn-authz-{_uuid_mod.uuid4().hex[:8]}"
+    template = {
+        "Resources": {
+            "Api": {
+                "Type": "AWS::ApiGateway::RestApi",
+                "Properties": {"Name": "intg-authz-api"},
+            },
+            "Auth": {
+                "Type": "AWS::ApiGateway::Authorizer",
+                "Properties": {
+                    "Name": "intg-token-authz",
+                    "Type": "TOKEN",
+                    "RestApiId": {"Ref": "Api"},
+                    "AuthorizerUri": "arn:aws:apigateway:us-east-1:lambda:path/2015-03-31/functions/arn:aws:lambda:us-east-1:000000000000:function:noop/invocations",
+                    "IdentitySource": "method.request.header.Authorization",
+                    "AuthorizerResultTtlInSeconds": 300,
+                },
+            },
+        },
+        "Outputs": {
+            "AuthorizerId": {"Value": {"Ref": "Auth"}},
+        },
+    }
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(template))
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "CREATE_COMPLETE"
+
+    outputs = {o["OutputKey"]: o["OutputValue"] for o in stack.get("Outputs", [])}
+    assert outputs.get("AuthorizerId"), "AuthorizerId output should be populated"
+
+    cfn.delete_stack(StackName=stack_name)
+    _wait_stack(cfn, stack_name)

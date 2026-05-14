@@ -35,6 +35,7 @@ import time
 from urllib.parse import parse_qs as _parse_qs
 from urllib.parse import quote as url_quote
 from urllib.parse import unquote as url_unquote
+from urllib.parse import urlparse as _urlparse
 from xml.etree.ElementTree import Element, SubElement, tostring
 from xml.sax.saxutils import escape as _esc
 
@@ -262,6 +263,8 @@ def _parse_bucket_key(path: str, headers: dict):
     # Vhost extraction lives in app.py:_extract_s3_vhost_bucket, which
     # rewrites the path to /{bucket}{key} before this handler runs. By the
     # time we get here, every request is path-style.
+    if path.startswith(("http://", "https://")):
+        path = _urlparse(path).path
     parts = path.lstrip("/").split("/", 1)
     bucket = parts[0] if parts else ""
     key = parts[1] if len(parts) > 1 else ""
@@ -3087,10 +3090,34 @@ def _upload_part_copy(bucket_name: str, dest_key: str, query_params: dict, heade
 
     # Handle x-amz-copy-source-range
     copy_range = headers.get("x-amz-copy-source-range", "")
-    if copy_range and copy_range.startswith("bytes="):
-        rng = copy_range[6:]
-        start, end = rng.split("-")
-        src_body = src_body[int(start):int(end) + 1]
+    if copy_range:
+        _malformed = _error(
+            "InvalidArgument",
+            "The x-amz-copy-source-range value must be of the form "
+            "bytes=first-last where first and last are the zero-based offsets "
+            "of the first and last bytes to copy",
+            400,
+        )
+        if not copy_range.startswith("bytes=") or "," in copy_range:
+            return _malformed
+        rng = copy_range[len("bytes="):]
+        parts = rng.split("-")
+        if len(parts) != 2 or parts[0] == "" or parts[1] == "":
+            return _malformed
+        try:
+            start, end = int(parts[0]), int(parts[1])
+        except ValueError:
+            return _malformed
+        if start < 0 or end < start:
+            return _malformed
+        object_size = len(src_body)
+        if start > object_size - 1 or end > object_size - 1:
+            return _error(
+                "InvalidArgument",
+                f"Range specified is not valid for source object of size: {object_size}",
+                400,
+            )
+        src_body = src_body[start:end + 1]
 
     etag = f'"{md5_hash(src_body)}"'
     _multipart_uploads[upload_id]["parts"][part_number] = {

@@ -330,6 +330,11 @@ SERVICE_PATTERNS = {
         "host_patterns": [r"cloudtrail\."],
         "credential_scope": "cloudtrail",
     },
+    "cur": {
+        "target_prefixes": ["AWSOrigamiServiceGateway"],
+        "host_patterns": [r"cur\."],
+        "credential_scope": "cur",
+    },
 }
 
 
@@ -409,6 +414,7 @@ def detect_service(method: str, path: str, headers: dict, query_params: dict) ->
                 "tagging": "tagging",
                 "resource-groups": "resource-groups",
                 "cloudtrail": "cloudtrail",
+                "cur": "cur",
             }
             if svc_name in scope_map:
                 return scope_map[svc_name]
@@ -764,6 +770,8 @@ def detect_service(method: str, path: str, headers: dict, query_params: dict) ->
     # 4. Check URL path patterns
     path_lower = path.lower()
     if path_lower.startswith("/latest/"):
+        return "imds"
+    if path_lower.startswith("/v2/credentials"):
         return "imds"
     if path_lower.startswith("/v1/apis") or path_lower.startswith("/v1/tags/arn:aws:appsync"):
         return "appsync"

@@ -17,6 +17,7 @@ Supports: CreateDBInstance, DeleteDBInstance, DescribeDBInstances, ModifyDBInsta
           CreateDBInstanceReadReplica (stub), RestoreDBInstanceFromDBSnapshot (stub),
           ListTagsForResource, AddTagsToResource, RemoveTagsFromResource,
           DescribeDBEngineVersions, DescribeOrderableDBInstanceOptions,
+          DescribePendingMaintenanceActions,
           CreateGlobalCluster, DescribeGlobalClusters, DeleteGlobalCluster,
           RemoveFromGlobalCluster, ModifyGlobalCluster.
 
@@ -469,7 +470,7 @@ def _create_db_instance(p):
         }],
         "AvailabilityZone": _p(p, "AvailabilityZone") or f"{get_region()}a",
         "DBSubnetGroup": subnet_group,
-        "PreferredMaintenanceWindow": "sun:05:00-sun:06:00",
+        "PreferredMaintenanceWindow": _p(p, "PreferredMaintenanceWindow") or "sun:05:00-sun:06:00",
         "PendingModifiedValues": {},
         "LatestRestorableTime": _format_time(now_ts),
         "MultiAZ": _p(p, "MultiAZ") == "true",
@@ -900,7 +901,9 @@ def _create_db_cluster(p):
         "Status": "available",
         "MasterUsername": master_user,
         "_MasterUserPassword": master_pass,
-        "DatabaseName": _p(p, "DatabaseName") or "",
+        "DatabaseName": _p(p, "DatabaseName") or None,
+        "NetworkType": _p(p, "NetworkType") or "IPV4",
+        "EngineLifecycleSupport": _p(p, "EngineLifecycleSupport") or "open-source-rds-extended-support",
         "Endpoint": f"{cluster_id}.cluster-{unique_suffix}.{get_region()}.rds.amazonaws.com",
         "ReaderEndpoint": f"{cluster_id}.cluster-ro-{unique_suffix}.{get_region()}.rds.amazonaws.com",
         "Port": port,
@@ -1483,6 +1486,7 @@ def _describe_db_cluster_parameters(p):
             f"<Parameter>"
             f"<ParameterName>{pname}</ParameterName>"
             f"<ParameterValue>{pvalue}</ParameterValue>"
+            f"<Source>user</Source>"
             f"<ApplyMethod>{apply_method}</ApplyMethod>"
             f"<IsModifiable>true</IsModifiable>"
             f"<ApplyType>dynamic</ApplyType>"
@@ -1754,6 +1758,15 @@ def _describe_option_groups(p):
 def _describe_option_group_options(p):
     return _xml(200, "DescribeOptionGroupOptionsResponse",
         "<DescribeOptionGroupOptionsResult><OptionGroupOptions/></DescribeOptionGroupOptionsResult>")
+
+
+# ---------------------------------------------------------------------------
+# Maintenance actions
+# ---------------------------------------------------------------------------
+
+def _describe_pending_maintenance_actions(p):
+    return _xml(200, "DescribePendingMaintenanceActionsResponse",
+        "<DescribePendingMaintenanceActionsResult><PendingMaintenanceActions/></DescribePendingMaintenanceActionsResult>")
 
 
 # ---------------------------------------------------------------------------
@@ -2273,6 +2286,11 @@ def _cluster_xml(c):
     for t in c.get("TagList", []):
         tag_xml += f"<Tag><Key>{_esc(t['Key'])}</Key><Value>{_esc(t['Value'])}</Value></Tag>"
 
+    # AWS omits <DatabaseName> entirely when no initial database was specified;
+    # emitting an empty element would surface as "" instead of None to clients.
+    db_name = c.get("DatabaseName")
+    db_name_xml = f"<DatabaseName>{db_name}</DatabaseName>" if db_name else ""
+
     return f"""<DBClusterIdentifier>{c['DBClusterIdentifier']}</DBClusterIdentifier>
         <DBClusterArn>{c['DBClusterArn']}</DBClusterArn>
         <Engine>{c['Engine']}</Engine>
@@ -2280,7 +2298,7 @@ def _cluster_xml(c):
         <EngineMode>{c.get('EngineMode','provisioned')}</EngineMode>
         <Status>{c['Status']}</Status>
         <MasterUsername>{c.get('MasterUsername','admin')}</MasterUsername>
-        <DatabaseName>{c.get('DatabaseName','')}</DatabaseName>
+        {db_name_xml}
         <Endpoint>{c.get('Endpoint','')}</Endpoint>
         <ReaderEndpoint>{c.get('ReaderEndpoint','')}</ReaderEndpoint>
         <Port>{c['Port']}</Port>
@@ -2308,7 +2326,9 @@ def _cluster_xml(c):
         <AssociatedRoles/>
         <TagList>{tag_xml}</TagList>
         <AllocatedStorage>{c.get('AllocatedStorage',1)}</AllocatedStorage>
-        <ActivityStreamStatus>{c.get('ActivityStreamStatus','stopped')}</ActivityStreamStatus>"""
+        <ActivityStreamStatus>{c.get('ActivityStreamStatus','stopped')}</ActivityStreamStatus>
+        <NetworkType>{c.get('NetworkType','IPV4')}</NetworkType>
+        <EngineLifecycleSupport>{c.get('EngineLifecycleSupport','open-source-rds-extended-support')}</EngineLifecycleSupport>"""
 
 
 def _snapshot_xml(s):
@@ -2712,6 +2732,7 @@ _ACTION_MAP = {
     "RemoveTagsFromResource": _remove_tags,
     "DescribeDBEngineVersions": _describe_engine_versions,
     "DescribeOrderableDBInstanceOptions": _describe_orderable_options,
+    "DescribePendingMaintenanceActions": _describe_pending_maintenance_actions,
     "CreateGlobalCluster": _create_global_cluster,
     "DescribeGlobalClusters": _describe_global_clusters,
     "DeleteGlobalCluster": _delete_global_cluster,

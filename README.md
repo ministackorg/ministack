@@ -354,6 +354,7 @@ subnet = ec2.create_subnet(
 | **STS** | GetCallerIdentity, AssumeRole, GetSessionToken, AssumeRoleWithWebIdentity | |
 | **IMDS** (EC2 Instance Metadata) | `PUT /latest/api/token`, `GET /latest/meta-data/instance-id`, `GET /latest/meta-data/iam/security-credentials/`, `GET /latest/meta-data/iam/security-credentials/<role>`, `GET /latest/meta-data/iam/info`, `GET /latest/meta-data/placement/{region,availability-zone,...}`, `GET /latest/dynamic/instance-identity/document` | IMDSv1 + IMDSv2; default credential chain falls through to a `ministack-instance-role` document with `ASIA*` session creds. Point SDKs at ministack via `AWS_EC2_METADATA_SERVICE_ENDPOINT=http://localhost:4566` (or `ec2_metadata_service_endpoint` in `~/.aws/config`); set `MINISTACK_IMDS_V2_REQUIRED=1` to require the token PUT |
 | **ECS Task Metadata V4** | `GET /v4/<token>`, `GET /v4/<token>/task`, `GET /v4/<token>/stats`, `GET /v4/<token>/task/stats` | Per-container token injected as `ECS_CONTAINER_METADATA_URI_V4` on every container started by `RunTask`. `/task` returns sibling containers in the same task. Containers reach the gateway via `host.docker.internal` (mapped through `extra_hosts: host-gateway`, so it works on user-defined Docker networks); `networkMode: host` containers use loopback. Volatile by design (stripped on persistence, cleared by `/_ministack/reset`) |
+| **ECS Container Credentials** | `GET /v2/credentials/<uuid>` | The path real ECS exposes via `AWS_CONTAINER_CREDENTIALS_RELATIVE_URI=/v2/credentials/<uuid>` (resolved by SDKs against `169.254.170.2`). MiniStack serves the same path on the gateway and returns the AWS-strict 5-field credentials document (`AccessKeyId`, `SecretAccessKey`, `Token`, `Expiration`, `RoleArn`) — distinct from the IMDS shape served at `/latest/meta-data/iam/security-credentials/<role>`. `RunTask` injects `AWS_CONTAINER_CREDENTIALS_FULL_URI`, `AWS_CONTAINER_AUTHORIZATION_TOKEN` (satisfies botocore's allow-list for non-loopback gateway hosts), and `AWS_ENDPOINT_URL` so unmodified SDKs inside the task fetch credentials and route service calls through MiniStack with no client config |
 | **SecretsManager** | CreateSecret, GetSecretValue, ListSecrets, DeleteSecret, UpdateSecret, DescribeSecret, PutSecretValue, UpdateSecretVersionStage, RestoreSecret, RotateSecret, GetRandomPassword, ListSecretVersionIds, ReplicateSecretToRegions, TagResource, UntagResource, PutResourcePolicy, GetResourcePolicy, DeleteResourcePolicy, ValidateResourcePolicy | |
 | **CloudWatch Logs** | CreateLogGroup, DeleteLogGroup, DescribeLogGroups, CreateLogStream, DeleteLogStream, DescribeLogStreams, PutLogEvents, GetLogEvents, FilterLogEvents, PutRetentionPolicy, DeleteRetentionPolicy, PutSubscriptionFilter, DeleteSubscriptionFilter, DescribeSubscriptionFilters, PutMetricFilter, DeleteMetricFilter, DescribeMetricFilters, TagLogGroup, UntagLogGroup, ListTagsLogGroup, TagResource, UntagResource, ListTagsForResource, StartQuery, GetQueryResults, StopQuery, PutDestination, DeleteDestination, DescribeDestinations, PutDestinationPolicy | `FilterLogEvents` supports `*`/`?` globs, multi-term AND, `-term` exclusion |
 
@@ -379,6 +380,8 @@ subnet = ec2.create_subnet(
 | **CloudFront KeyValueStore (data plane)** | DescribeKeyValueStore, ListKeys, GetKey, PutKey, DeleteKey, UpdateKeys | Separate `cloudfront-keyvaluestore` SDK service (REST/JSON, signing name `cloudfront-keyvaluestore`); ETag-based optimistic concurrency on every mutating op; `UpdateKeys` is atomic (validates whole batch, rejects on first invalid entry); `ListKeys` paginates with opaque `NextToken` capped at 50 results per AWS spec; bridges to the management plane via the shared KVS ARN |
 | **CloudTrail** | LookupEvents, CreateTrail, DeleteTrail, GetTrail, DescribeTrails, ListTrails, UpdateTrail, GetTrailStatus, StartLogging, StopLogging, PutEventSelectors, GetEventSelectors, AddTags, ListTags, RemoveTags | In-memory audit log; recording opt-in via `CLOUDTRAIL_RECORDING=1` (or runtime config endpoint); per-account ring buffer (`CLOUDTRAIL_MAX_EVENTS=10000`); `LookupEvents` supports all 8 AWS `LookupAttributes`; `IsLogging` flips on Start/StopLogging |
 | **Resource Groups** | CreateGroup, GetGroup, DeleteGroup, UpdateGroup, ListGroups, GetGroupQuery, UpdateGroupQuery, GetGroupConfiguration, PutGroupConfiguration, GroupResources, UngroupResources, ListGroupResources, ListGroupingStatuses, SearchResources, Tag, Untag, GetTags, GetAccountSettings, UpdateAccountSettings | 19 of 23 spec ops; tag-sync ops omitted (not exposed by AWS CLI / Terraform); `Group` accepts bare name or full ARN |
+| **Cost & Usage Reports** | DeleteReportDefinition, DescribeReportDefinitions, ListTagsForResource, ModifyReportDefinition, PutReportDefinition, TagResource, UntagResource | 7 of 7 spec ops |
+
 
 ### CloudFormation
 
@@ -641,7 +644,12 @@ ecs.stop_task(cluster="dev", task=task_arn)
 Each container also gets the standard ECS Task Metadata V4 endpoint injected as
 `ECS_CONTAINER_METADATA_URI_V4`, so anything inside the container that uses the
 AWS SDK for ECS metadata (X-Ray, OpenTelemetry, application code calling
-`GET $ECS_CONTAINER_METADATA_URI_V4/task`) works without changes.
+`GET $ECS_CONTAINER_METADATA_URI_V4/task`) works without changes. Alongside it,
+`RunTask` injects `AWS_CONTAINER_CREDENTIALS_FULL_URI`,
+`AWS_CONTAINER_AUTHORIZATION_TOKEN`, and `AWS_ENDPOINT_URL` so unmodified AWS
+SDKs running inside the task fetch emulated credentials from the new
+`/v2/credentials/<uuid>` endpoint and route service calls through MiniStack
+end-to-end without any client config.
 
 ---
 
@@ -760,7 +768,7 @@ Install DuckDB for full Athena SQL compatibility: `pip install ministack[full]`.
 
 When `PERSIST_STATE=1`, MiniStack saves service state to `STATE_DIR` on shutdown and reloads it on startup. Writes are atomic (write-to-tmp then rename) to prevent corruption on crash.
 
-Services currently supporting persistence: **All services** — API Gateway v1/v2, ALB, ACM, AppConfig, AppSync, Athena, Cloud Map, CloudFront, CloudWatch, CloudWatch Logs, CodeBuild, Cognito, DynamoDB, EC2, ECR, ECS, EFS, EKS, ElastiCache, EMR, EventBridge, EventBridge Scheduler, Firehose, Glue, IAM/STS, Kinesis, KMS, Lambda, RDS, Route 53, S3, Secrets Manager, SES, SES v2, SNS, SQS, SSM, Step Functions, Transfer Family, WAF v2 
+Services currently supporting persistence: **All services** — API Gateway v1/v2, ALB, ACM, AppConfig, AppSync, Athena, Cloud Map, CloudFront, CloudWatch, CloudWatch Logs, CodeBuild, Cognito, DynamoDB, EC2, ECR, ECS, EFS, EKS, ElastiCache, EMR, EventBridge, EventBridge Scheduler, Firehose, Glue, IAM/STS, Kinesis, KMS, Lambda, RDS, Route 53, S3, Secrets Manager, SES, SES v2, SNS, SQS, SSM, Step Functions, Transfer Family, WAF v2
 
 ```bash
 docker run -p 4566:4566 \
@@ -855,6 +863,8 @@ aws --endpoint-url=http://localhost:4566 eks delete-cluster --name my-cluster
 ```
 
 > **Note:** EKS requires Docker socket access (`-v /var/run/docker.sock:/var/run/docker.sock`) to spawn k3s containers. The k3s image is pulled on first `CreateCluster` call.
+
+> **Security trade-off:** the k3s container is launched with `--privileged`. k3s server mode needs to remount `/sys/fs/cgroup`, which no granular Linux capability set permits — running unprivileged fails with `failed to evacuate root cgroup`. This grants the k3s container significant access on the Docker host. The trade-off is acceptable for local development against an emulator but should be considered before running MiniStack EKS on shared infrastructure. Omitting the Docker socket mount cleanly disables k3s and falls back to a static EKS mock.
 
 ### Lambda Warm Starts
 

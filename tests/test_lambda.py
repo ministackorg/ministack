@@ -3616,3 +3616,9 @@ exports.handler = (event, ctx, cb) => {{
     assert result.get("status") == "ok", f"Handler failed: {result}"
     assert received.get("path") == "/test-cfn-response", "PUT not received by HTTP server"
     assert received.get("body") == "test"
+def test_lambda_ruby_4_0_runtime_maps_to_official_image():
+    """Lambda Ruby 4.0 runtime support (botocore 1.42.94 added the runtime).
+    Maps to AWS's official Lambda Ruby 4.0 base image."""
+    from ministack.services.lambda_svc import _RUNTIME_IMAGE_MAP
+
+    assert _RUNTIME_IMAGE_MAP.get("ruby4.0") == "public.ecr.aws/lambda/ruby:4.0"

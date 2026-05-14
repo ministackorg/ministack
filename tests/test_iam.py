@@ -454,3 +454,178 @@ def test_iam_list_entities_for_policy(iam):
     resp3 = iam.list_entities_for_policy(PolicyArn=policy_arn, EntityFilter="Role")
     assert len(resp3["PolicyRoles"]) >= 1
     assert len(resp3.get("PolicyUsers", [])) == 0
+
+
+# -- AWS-managed policies (arn:aws:iam::aws:policy/<Name>) -----------------
+#
+# AWS-managed policies live under a virtual ``aws`` account that every
+# customer can read regardless of their own session account. These
+# tests cover the global store and its interaction with role/user
+# attachment, ListPolicies scoping, and mutation rejection.
+
+_ADMIN_ARN = "arn:aws:iam::aws:policy/AdministratorAccess"
+
+
+def test_iam_get_aws_managed_policy_administrator_access(iam):
+    """GetPolicy must succeed for a seeded AWS-managed policy even
+    though no session can authenticate as the ``aws`` virtual account."""
+    resp = iam.get_policy(PolicyArn=_ADMIN_ARN)
+    assert resp["Policy"]["PolicyName"] == "AdministratorAccess"
+    assert resp["Policy"]["Arn"] == _ADMIN_ARN
+    assert resp["Policy"]["DefaultVersionId"] == "v1"
+
+
+def test_iam_get_aws_managed_policy_version_returns_document(iam):
+    resp = iam.get_policy_version(PolicyArn=_ADMIN_ARN, VersionId="v1")
+    doc = resp["PolicyVersion"]["Document"]
+    # boto3 deserialises PolicyDocument; stringify before checking.
+    assert "Allow" in json.dumps(doc)
+
+
+def test_iam_list_policies_scope_all_includes_aws_managed(iam):
+    resp = iam.list_policies(Scope="All")
+    arns = [p["Arn"] for p in resp["Policies"]]
+    assert _ADMIN_ARN in arns
+
+
+def test_iam_list_policies_scope_aws_returns_only_aws_managed(iam):
+    # Seed a customer-managed policy so we can prove it's filtered out.
+    doc = json.dumps({"Version": "2012-10-17",
+                      "Statement": [{"Effect": "Allow", "Action": "*", "Resource": "*"}]})
+    name = f"awsmgd-filter-cust-{_uuid_mod.uuid4().hex[:8]}"
+    cust = iam.create_policy(PolicyName=name, PolicyDocument=doc)["Policy"]["Arn"]
+    try:
+        resp = iam.list_policies(Scope="AWS")
+        arns = [p["Arn"] for p in resp["Policies"]]
+        assert _ADMIN_ARN in arns
+        assert all(a.startswith("arn:aws:iam::aws:") for a in arns)
+        assert cust not in arns
+    finally:
+        iam.delete_policy(PolicyArn=cust)
+
+
+def test_iam_list_policies_scope_local_excludes_aws_managed(iam):
+    resp = iam.list_policies(Scope="Local")
+    arns = [p["Arn"] for p in resp["Policies"]]
+    assert all(not a.startswith("arn:aws:iam::aws:") for a in arns)
+
+
+def test_iam_attach_aws_managed_policy_to_role(iam):
+    """The original motivating use case: terraform attaches an
+    AWS-managed policy by ARN to a customer role."""
+    role_name = f"awsmgd-role-{_uuid_mod.uuid4().hex[:8]}"
+    iam.create_role(
+        RoleName=role_name,
+        AssumeRolePolicyDocument=json.dumps({"Version": "2012-10-17", "Statement": []}),
+    )
+    try:
+        iam.attach_role_policy(RoleName=role_name, PolicyArn=_ADMIN_ARN)
+        attached = iam.list_attached_role_policies(RoleName=role_name)["AttachedPolicies"]
+        names = [p["PolicyName"] for p in attached]
+        arns = [p["PolicyArn"] for p in attached]
+        assert "AdministratorAccess" in names
+        assert _ADMIN_ARN in arns
+        iam.detach_role_policy(RoleName=role_name, PolicyArn=_ADMIN_ARN)
+    finally:
+        iam.delete_role(RoleName=role_name)
+
+
+def test_iam_cannot_create_policy_under_aws_account(iam, monkeypatch):
+    """Customer code must never be able to author into the AWS-managed
+    namespace. Real AWS rejects this with InvalidInput."""
+    # We can't change the session account at request time from boto3,
+    # so this test is best-effort: we ensure a normal CreatePolicy
+    # response still lands under the session account, not under ``aws``.
+    doc = json.dumps({"Version": "2012-10-17",
+                      "Statement": [{"Effect": "Allow", "Action": "*", "Resource": "*"}]})
+    name = f"awsmgd-bounds-{_uuid_mod.uuid4().hex[:8]}"
+    resp = iam.create_policy(PolicyName=name, PolicyDocument=doc)
+    try:
+        assert not resp["Policy"]["Arn"].startswith("arn:aws:iam::aws:")
+    finally:
+        iam.delete_policy(PolicyArn=resp["Policy"]["Arn"])
+
+
+def test_iam_cannot_delete_aws_managed_policy(iam):
+    with pytest.raises(ClientError) as exc:
+        iam.delete_policy(PolicyArn=_ADMIN_ARN)
+    assert exc.value.response["Error"]["Code"] == "AccessDenied"
+
+
+def test_iam_cannot_tag_aws_managed_policy(iam):
+    with pytest.raises(ClientError) as exc:
+        iam.tag_policy(PolicyArn=_ADMIN_ARN, Tags=[{"Key": "k", "Value": "v"}])
+    assert exc.value.response["Error"]["Code"] == "AccessDenied"
+
+
+def test_iam_unknown_aws_managed_policy_is_not_found_by_default(iam):
+    """Real AWS returns NoSuchEntity for AWS-managed ARNs that don't
+    exist (e.g. typos like ``AdminstratorAccess`` — missing ``i``).
+    Ministack defaults to the same behaviour so that typos surface
+    locally the same way they would in real AWS, instead of silently
+    autovivifying a permissive stub and masking the bug until apply
+    against real AWS."""
+    arn = "arn:aws:iam::aws:policy/AdminstratorAccess"  # missing 'i'
+    with pytest.raises(ClientError) as exc:
+        iam.get_policy(PolicyArn=arn)
+    assert exc.value.response["Error"]["Code"] == "NoSuchEntity"
+
+
+def test_iam_aws_managed_attachment_count_is_per_account(iam):
+    """AWS-managed AttachmentCount must reflect the calling account's
+    own attachments — real AWS scopes the counter per-account. Attach
+    to two roles and a user under the same session, then GetPolicy and
+    expect AttachmentCount == 3."""
+    role_a = f"awsmgd-count-role-a-{_uuid_mod.uuid4().hex[:8]}"
+    role_b = f"awsmgd-count-role-b-{_uuid_mod.uuid4().hex[:8]}"
+    user = f"awsmgd-count-user-{_uuid_mod.uuid4().hex[:8]}"
+    assume = json.dumps({"Version": "2012-10-17", "Statement": []})
+    # ReadOnlyAccess so the test doesn't contend with other tests that
+    # attach AdministratorAccess.
+    arn = "arn:aws:iam::aws:policy/ReadOnlyAccess"
+    baseline = iam.get_policy(PolicyArn=arn)["Policy"]["AttachmentCount"]
+    iam.create_role(RoleName=role_a, AssumeRolePolicyDocument=assume)
+    iam.create_role(RoleName=role_b, AssumeRolePolicyDocument=assume)
+    iam.create_user(UserName=user)
+    try:
+        iam.attach_role_policy(RoleName=role_a, PolicyArn=arn)
+        iam.attach_role_policy(RoleName=role_b, PolicyArn=arn)
+        iam.attach_user_policy(UserName=user, PolicyArn=arn)
+        got = iam.get_policy(PolicyArn=arn)["Policy"]
+        assert got["AttachmentCount"] == baseline + 3
+        # Detach decrements.
+        iam.detach_role_policy(RoleName=role_a, PolicyArn=arn)
+        got2 = iam.get_policy(PolicyArn=arn)["Policy"]
+        assert got2["AttachmentCount"] == baseline + 2
+    finally:
+        for r in (role_a, role_b):
+            try:
+                iam.detach_role_policy(RoleName=r, PolicyArn=arn)
+            except ClientError:
+                pass
+            iam.delete_role(RoleName=r)
+        try:
+            iam.detach_user_policy(UserName=user, PolicyArn=arn)
+        except ClientError:
+            pass
+        iam.delete_user(UserName=user)
+
+
+def test_iam_aws_managed_attachment_count_persists_through_state_round_trip():
+    """Regression for 1.3.36: the _aws_managed_attachment_counts sidecar
+    added with the AWS-managed policy work (1.3.36) was missing from
+    get_state/restore_state, so attachment counts on AWS-managed policies
+    reset to zero on every warm-boot."""
+    from ministack.services import iam as _iam
+
+    arn = "arn:aws:iam::aws:policy/AdministratorAccess"
+    _iam._aws_managed_attachment_counts.clear()
+    _iam._bump_aws_managed_attachment(arn, +2)
+    assert _iam._aws_managed_attachment_counts.get(arn) == 2
+
+    snapshot = _iam.get_state()
+    _iam._aws_managed_attachment_counts.clear()
+    assert _iam._aws_managed_attachment_counts.get(arn, 0) == 0
+
+    _iam.restore_state(snapshot)
+    assert _iam._aws_managed_attachment_counts.get(arn) == 2

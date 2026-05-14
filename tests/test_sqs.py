@@ -29,6 +29,14 @@ def test_sqs_delete_queue(sqs):
     with pytest.raises(ClientError):
         sqs.get_queue_attributes(QueueUrl=url, AttributeNames=["All"])
 
+def test_sqs_delete_queue_nonexistent_raises(sqs):
+    url = sqs.create_queue(QueueName="intg-sqs-delete-404")["QueueUrl"]
+    sqs.delete_queue(QueueUrl=url)
+    with pytest.raises(ClientError) as exc:
+        sqs.delete_queue(QueueUrl=url)          # second delete — queue is already gone
+    assert exc.value.response["Error"]["Code"] == "AWS.SimpleQueueService.NonExistentQueue"
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+
 def test_sqs_list_queues(sqs):
     sqs.create_queue(QueueName="intg-sqs-list-alpha")
     sqs.create_queue(QueueName="intg-sqs-list-beta")
@@ -584,3 +592,97 @@ def test_sqs_bare_queue_name_as_url(sqs):
     assert len(msgs) == 2
     bodies = sorted(m["Body"] for m in msgs)
     assert bodies == ["via-name", "via-url"]
+
+
+# -- AWS-parity gaps from competitor audit ------------------------------
+# Three regressions, all surfaced when comparing MS behaviour against the
+# AWS SQS API reference: SendMessage size enforcement, AddPermission,
+# RemovePermission.
+
+
+def test_sqs_send_message_rejects_oversized_body(sqs):
+    """SendMessage must reject bodies exceeding the queue's MaximumMessageSize
+    attribute with InvalidParameterValue (400). MaximumMessageSize defaults to
+    262144 (256 KiB) per AWS. Before this fix MS silently accepted oversized
+    messages locally while real AWS rejected — masking client bugs."""
+    import pytest as _pytest
+
+    q = sqs.create_queue(QueueName="intg-sqs-size-default")["QueueUrl"]
+    body = "x" * (262144 + 1)
+    with _pytest.raises(ClientError) as exc:
+        sqs.send_message(QueueUrl=q, MessageBody=body)
+    assert exc.value.response["Error"]["Code"] == "InvalidParameterValue"
+
+
+def test_sqs_send_message_respects_configured_maximum_message_size(sqs):
+    """A queue with a tighter MaximumMessageSize must reject bodies that fit
+    in the default 262144 but exceed the configured value."""
+    import pytest as _pytest
+
+    q = sqs.create_queue(
+        QueueName="intg-sqs-size-tight",
+        Attributes={"MaximumMessageSize": "1024"},
+    )["QueueUrl"]
+    body = "x" * 2048
+    with _pytest.raises(ClientError) as exc:
+        sqs.send_message(QueueUrl=q, MessageBody=body)
+    assert exc.value.response["Error"]["Code"] == "InvalidParameterValue"
+    assert "1024" in exc.value.response["Error"]["Message"]
+
+
+def test_sqs_add_permission_appends_policy_statement(sqs):
+    """AddPermission appends an Allow statement to the queue's Policy
+    attribute matching the AWS resource-policy shape."""
+    q = sqs.create_queue(QueueName="intg-sqs-addperm-basic")["QueueUrl"]
+    sqs.add_permission(
+        QueueUrl=q,
+        Label="perm-1",
+        AWSAccountIds=["123456789012"],
+        Actions=["SendMessage", "ReceiveMessage"],
+    )
+    attrs = sqs.get_queue_attributes(QueueUrl=q, AttributeNames=["Policy"])
+    policy = json.loads(attrs["Attributes"]["Policy"])
+    assert policy["Version"] == "2012-10-17"
+    sids = [s["Sid"] for s in policy["Statement"]]
+    assert "perm-1" in sids
+    stmt = next(s for s in policy["Statement"] if s["Sid"] == "perm-1")
+    assert stmt["Effect"] == "Allow"
+    # AWS canonical Policy shape: bare 12-digit account ID, lowercase sqs: prefix.
+    assert "123456789012" in stmt["Principal"]["AWS"]
+    assert "sqs:SendMessage" in stmt["Action"]
+
+
+def test_sqs_add_permission_rejects_duplicate_label(sqs):
+    """Real AWS rejects duplicate Labels with InvalidParameterValue."""
+    import pytest as _pytest
+
+    q = sqs.create_queue(QueueName="intg-sqs-addperm-dup")["QueueUrl"]
+    sqs.add_permission(
+        QueueUrl=q, Label="dup", AWSAccountIds=["111111111111"],
+        Actions=["SendMessage"],
+    )
+    with _pytest.raises(ClientError) as exc:
+        sqs.add_permission(
+            QueueUrl=q, Label="dup", AWSAccountIds=["222222222222"],
+            Actions=["ReceiveMessage"],
+        )
+    assert exc.value.response["Error"]["Code"] == "InvalidParameterValue"
+
+
+def test_sqs_remove_permission_drops_matching_statement(sqs):
+    """RemovePermission removes only the statement with the matching Label."""
+    q = sqs.create_queue(QueueName="intg-sqs-remperm")["QueueUrl"]
+    sqs.add_permission(
+        QueueUrl=q, Label="keep", AWSAccountIds=["111111111111"],
+        Actions=["SendMessage"],
+    )
+    sqs.add_permission(
+        QueueUrl=q, Label="drop", AWSAccountIds=["222222222222"],
+        Actions=["ReceiveMessage"],
+    )
+    sqs.remove_permission(QueueUrl=q, Label="drop")
+    attrs = sqs.get_queue_attributes(QueueUrl=q, AttributeNames=["Policy"])
+    policy = json.loads(attrs["Attributes"]["Policy"])
+    sids = [s["Sid"] for s in policy["Statement"]]
+    assert "keep" in sids
+    assert "drop" not in sids

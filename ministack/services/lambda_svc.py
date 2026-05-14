@@ -1474,6 +1474,7 @@ _RUNTIME_IMAGE_MAP: dict[str, str] = {
     "dotnet10": "public.ecr.aws/lambda/dotnet:10",
     "dotnet8": "public.ecr.aws/lambda/dotnet:8",
     "dotnet6": "public.ecr.aws/lambda/dotnet:6",
+    "ruby4.0": "public.ecr.aws/lambda/ruby:4.0",
     "ruby3.4": "public.ecr.aws/lambda/ruby:3.4",
     "ruby3.3": "public.ecr.aws/lambda/ruby:3.3",
     "ruby3.2": "public.ecr.aws/lambda/ruby:3.2",

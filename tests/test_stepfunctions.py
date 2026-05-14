@@ -445,6 +445,209 @@ def test_sfn_aws_sdk_secretsmanager_create_and_get(sfn, sfn_sync, sm):
 
     sfn_sync.delete_state_machine(stateMachineArn=sm_arn)
 
+
+def test_sfn_jsonata_arguments_output_and_catch_output(sfn, sfn_sync, sm):
+    """JSONata Task states evaluate Arguments and Output for aws-sdk integrations."""
+    import uuid as _uuid
+
+    secret_name = f"sfn-jsonata-secret-{_uuid.uuid4().hex[:8]}"
+    sm_name = f"sfn-jsonata-{_uuid.uuid4().hex[:8]}"
+
+    definition = json.dumps({
+        "StartAt": "CreateSecret",
+        "States": {
+            "CreateSecret": {
+                "Type": "Task",
+                "QueryLanguage": "JSONata",
+                "Resource": "arn:aws:states:::aws-sdk:secretsmanager:createSecret",
+                "Arguments": "{% $merge([{'Name': $states.input.secretName, 'SecretString': $states.input.secretValue}, $states.input.kmsKeyId != '' ? {'KmsKeyId': $states.input.kmsKeyId} : {}]) %}",
+                "Output": "{% $merge([$states.input, {'createResult': $states.result}]) %}",
+                "Next": "CreateDuplicate",
+            },
+            "CreateDuplicate": {
+                "Type": "Task",
+                "QueryLanguage": "JSONata",
+                "Resource": "arn:aws:states:::aws-sdk:secretsmanager:createSecret",
+                "Arguments": {
+                    "Name": "{% $states.input.secretName %}",
+                    "SecretString": "duplicate",
+                },
+                "Catch": [
+                    {
+                        "ErrorEquals": ["SecretsManager.ResourceExistsException"],
+                        "Output": "{% $merge([$states.input, {'createError': $states.errorOutput}]) %}",
+                        "Next": "Done",
+                    }
+                ],
+                "End": True,
+            },
+            "Done": {"Type": "Succeed"},
+        },
+    })
+
+    sm_arn = sfn_sync.create_state_machine(
+        name=sm_name,
+        definition=definition,
+        roleArn="arn:aws:iam::000000000000:role/sfn-role",
+    )["stateMachineArn"]
+
+    try:
+        resp = sfn_sync.start_sync_execution(
+            stateMachineArn=sm_arn,
+            input=json.dumps({
+                "secretName": secret_name,
+                "secretValue": "jsonata-value",
+                "kmsKeyId": "",
+            }),
+        )
+        assert resp["status"] == "SUCCEEDED", f"Execution failed: {resp.get('error')} - {resp.get('cause')}"
+        output = json.loads(resp["output"])
+
+        assert output["createResult"]["Name"] == secret_name
+        assert output["createError"]["Error"] == "SecretsManager.ResourceExistsException"
+        assert sm.get_secret_value(SecretId=secret_name)["SecretString"] == "jsonata-value"
+    finally:
+        sfn_sync.delete_state_machine(stateMachineArn=sm_arn)
+        try:
+            sm.delete_secret(SecretId=secret_name, ForceDeleteWithoutRecovery=True)
+        except ClientError:
+            pass
+
+
+def test_sfn_jsonata_pass_output_string_concat_and_arithmetic(sfn, sfn_sync):
+    """JSONata Pass state evaluates Output with `&` concat and `*` arithmetic
+    (the exact form from issue #636 Test 1)."""
+    import uuid as _uuid
+
+    sm_name = f"sfn-jsonata-pass-{_uuid.uuid4().hex[:8]}"
+    definition = json.dumps({
+        "QueryLanguage": "JSONata",
+        "StartAt": "Transform",
+        "States": {
+            "Transform": {
+                "Type": "Pass",
+                "Output": {
+                    "greeting": "{% 'Hello, ' & $states.input.name & '!' %}",
+                    "doubled": "{% $states.input.value * 2 %}",
+                },
+                "End": True,
+            }
+        },
+    })
+
+    sm_arn = sfn_sync.create_state_machine(
+        name=sm_name,
+        definition=definition,
+        roleArn="arn:aws:iam::000000000000:role/sfn-role",
+    )["stateMachineArn"]
+    try:
+        resp = sfn_sync.start_sync_execution(
+            stateMachineArn=sm_arn,
+            input=json.dumps({"name": "World", "value": 21}),
+        )
+        assert resp["status"] == "SUCCEEDED", f"Execution failed: {resp.get('error')} - {resp.get('cause')}"
+        out = json.loads(resp["output"])
+        assert out == {"greeting": "Hello, World!", "doubled": 42}
+    finally:
+        sfn_sync.delete_state_machine(stateMachineArn=sm_arn)
+
+
+def test_sfn_jsonata_choice_condition_routes_branches(sfn, sfn_sync):
+    """JSONata Choice state evaluates per-branch `Condition` and routes correctly
+    (issue #636 Test 3)."""
+    import uuid as _uuid
+
+    sm_name = f"sfn-jsonata-choice-{_uuid.uuid4().hex[:8]}"
+    definition = json.dumps({
+        "QueryLanguage": "JSONata",
+        "StartAt": "Route",
+        "States": {
+            "Route": {
+                "Type": "Choice",
+                "Choices": [
+                    {
+                        "Condition": "{% $states.input.value > 10 %}",
+                        "Next": "BigValue",
+                    }
+                ],
+                "Default": "SmallValue",
+            },
+            "BigValue": {
+                "Type": "Pass",
+                "Output": {"branch": "big"},
+                "End": True,
+            },
+            "SmallValue": {
+                "Type": "Pass",
+                "Output": {"branch": "small"},
+                "End": True,
+            },
+        },
+    })
+
+    sm_arn = sfn_sync.create_state_machine(
+        name=sm_name,
+        definition=definition,
+        roleArn="arn:aws:iam::000000000000:role/sfn-role",
+    )["stateMachineArn"]
+    try:
+        big = sfn_sync.start_sync_execution(
+            stateMachineArn=sm_arn,
+            input=json.dumps({"value": 50}),
+        )
+        assert big["status"] == "SUCCEEDED"
+        assert json.loads(big["output"]) == {"branch": "big"}
+
+        small = sfn_sync.start_sync_execution(
+            stateMachineArn=sm_arn,
+            input=json.dumps({"value": 5}),
+        )
+        assert small["status"] == "SUCCEEDED"
+        assert json.loads(small["output"]) == {"branch": "small"}
+    finally:
+        sfn_sync.delete_state_machine(stateMachineArn=sm_arn)
+
+
+def test_sfn_jsonata_choice_with_per_branch_output(sfn, sfn_sync):
+    """Per-branch JSONata Output transforms input on the matched Choice rule."""
+    import uuid as _uuid
+
+    sm_name = f"sfn-jsonata-choice-output-{_uuid.uuid4().hex[:8]}"
+    definition = json.dumps({
+        "QueryLanguage": "JSONata",
+        "StartAt": "Route",
+        "States": {
+            "Route": {
+                "Type": "Choice",
+                "Choices": [
+                    {
+                        "Condition": "{% $states.input.priority = 'high' %}",
+                        "Output": {"tier": "premium", "name": "{% $states.input.name %}"},
+                        "Next": "End",
+                    }
+                ],
+                "Default": "End",
+            },
+            "End": {"Type": "Pass", "End": True},
+        },
+    })
+
+    sm_arn = sfn_sync.create_state_machine(
+        name=sm_name,
+        definition=definition,
+        roleArn="arn:aws:iam::000000000000:role/sfn-role",
+    )["stateMachineArn"]
+    try:
+        resp = sfn_sync.start_sync_execution(
+            stateMachineArn=sm_arn,
+            input=json.dumps({"name": "Alice", "priority": "high"}),
+        )
+        assert resp["status"] == "SUCCEEDED"
+        assert json.loads(resp["output"]) == {"tier": "premium", "name": "Alice"}
+    finally:
+        sfn_sync.delete_state_machine(stateMachineArn=sm_arn)
+
+
 def test_sfn_aws_sdk_dynamodb_put_and_get(sfn, sfn_sync, ddb):
     """aws-sdk:dynamodb integration puts and gets an item."""
     import uuid as _uuid
