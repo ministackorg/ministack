@@ -179,8 +179,9 @@ process.stdout.write = function(chunk, encoding, callback) {
     // Target prefixes match Ministack's router.py SERVICE_PATTERNS target_prefixes.
     "ssm":                         "AmazonSSM",
     "sfn":                         "AWSStepFunctions",
-    "sts":                         "AWSSecurityTokenService",
-    "cloudwatch":                  "GraniteServiceVersion20100801",
+    // sts, sns: query protocol — @aws-sdk/client-{sts,sns} sends Action= form-encoded POST
+    // cloudwatch: smithy-rpc-v2-cbor — @aws-sdk/client-cloudwatch sends path-based requests
+    // All three are handled by Ministack's native query/path routing when the real SDK is present
     "cloudwatch-logs":             "Logs_20140328",
     "logs":                        "Logs_20140328",
     "secretsmanager":              "secretsmanager",
@@ -191,7 +192,6 @@ process.stdout.write = function(chunk, encoding, callback) {
     "dynamodb":                    "DynamoDB_20120810",
     "dynamodb-streams":            "DynamoDBStreams_20120810",
     "sqs":                         "AmazonSQS",
-    "sns":                         "AmazonSNS",
     "glue":                        "AWSGlue",
     "athena":                      "AmazonAthena",
     "firehose":                    "Firehose_20150804",

@@ -3518,10 +3518,14 @@ exports.handler = () => new Promise((res) => {
 
 
 def test_nodejs_worker_aws_sdk_v3_stub_resolves_extended():
-    """All newly added JSON-RPC service stubs resolve (SQS, SNS, KMS, Cognito, etc.)."""
+    """JSON-RPC service stubs resolve for all awsJson1.x services.
+
+    sts, sns, cloudwatch are intentionally excluded: they use query/smithy-rpc-v2-cbor
+    protocols, not awsJson1.x, so their real SDK packages format requests correctly
+    without a stub.
+    """
     handler_js = """\
 const { SQSClient, SendMessageCommand } = require("@aws-sdk/client-sqs");
-const { SNSClient, PublishCommand } = require("@aws-sdk/client-sns");
 const { KMSClient, EncryptCommand } = require("@aws-sdk/client-kms");
 const { CognitoIdentityProviderClient, AdminGetUserCommand } = require("@aws-sdk/client-cognito-identity-provider");
 const { CognitoIdentityClient } = require("@aws-sdk/client-cognito-identity");
@@ -3536,7 +3540,6 @@ const { CloudTrailClient, LookupEventsCommand } = require("@aws-sdk/client-cloud
 const { ServiceDiscoveryClient, ListServicesCommand } = require("@aws-sdk/client-servicediscovery");
 exports.handler = async () => ({
   sqs:   typeof SQSClient === "function" && typeof SendMessageCommand === "function",
-  sns:   typeof SNSClient === "function" && typeof PublishCommand === "function",
   kms:   typeof KMSClient === "function" && typeof EncryptCommand === "function",
   cidp:  typeof CognitoIdentityProviderClient === "function" && typeof AdminGetUserCommand === "function",
   ci:    typeof CognitoIdentityClient === "function",
