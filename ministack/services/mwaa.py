@@ -57,16 +57,23 @@ def restore_state(data):
     envs_data = data.get("environments")
     if not envs_data:
         return
+    names_to_restart = []
     if isinstance(envs_data, AccountScopedDict):
         for key, env in list(envs_data._data.items()):
             env["_docker_container_id"] = None
-            env["Status"] = "AVAILABLE"
+            env["Status"] = "CREATING"
             _environments._data[key] = env
+            names_to_restart.append((env.get("Name", key), env))
     else:
         for name, env in envs_data.items():
             env["_docker_container_id"] = None
-            env["Status"] = "AVAILABLE"
+            env["Status"] = "CREATING"
             _environments[name] = env
+            names_to_restart.append((name, env))
+
+    # Re-spin containers for persisted environments
+    for name, env in names_to_restart:
+        threading.Thread(target=_start_airflow_container, args=(name, env), daemon=True).start()
 
 
 try:
