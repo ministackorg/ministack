@@ -2063,6 +2063,20 @@ def _eval_set_value(tokens, item, attr_values, attr_names):
     if not tokens:
         return None
 
+    # Strip a single layer of matched outer parens — e.g.
+    # `(if_not_exists(#v, :default) - :amt)`. Without this the binary-operator
+    # scan below never sees the `-` at depth 0 and silently drops the
+    # arithmetic, leaving the attribute at its original value (issue #648).
+    # Only strip when the opening paren's matching close is the LAST token,
+    # so `(a) + (b)` (two separate groups) isn't accidentally flattened.
+    while (len(tokens) >= 2
+           and tokens[0][0] == 'LPAREN'
+           and tokens[-1][0] == 'RPAREN'
+           and _find_matching_paren(tokens, 0) == len(tokens) - 1):
+        tokens = tokens[1:-1]
+        if not tokens:
+            return None
+
     paren_depth = 0
     for i, tok in enumerate(tokens):
         if tok[0] == 'LPAREN':

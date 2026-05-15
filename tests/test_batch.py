@@ -98,3 +98,156 @@ def test_batch_account_isolation():
     b_qs = [q["jobQueueName"] for q in b.describe_job_queues()["jobQueues"]]
     assert name in a_qs
     assert name not in b_qs
+
+
+# ---------------------------------------------------------------------------
+# SubmitJob host-resource gate (issue #650)
+# ---------------------------------------------------------------------------
+
+def _register(batch, name, reqs=None):
+    container = {"image": "alpine:3.20", "command": ["echo", "hi"]}
+    if reqs is not None:
+        container["resourceRequirements"] = reqs
+    return batch.register_job_definition(
+        jobDefinitionName=name, type="container", containerProperties=container,
+    )
+
+
+def test_batch_submit_job_refused_when_jobdef_exceeds_host(batch):
+    """Issue #650: jobdef requesting more resources than MS' host can provide
+    must surface at the SubmitJob call (400 ClientException) — not silently
+    return SUCCEEDED for a job that could never run.
+    """
+    from botocore.exceptions import ClientError
+    name = f"oversize-{_uid()}"
+    _register(batch, name, reqs=[
+        {"type": "VCPU", "value": "256"},     # impossibly high
+        {"type": "MEMORY", "value": "9999999"},
+    ])
+    with pytest.raises(ClientError) as exc:
+        batch.submit_job(jobName=f"r-{_uid()}", jobQueue="q",
+                         jobDefinition=f"{name}:1")
+    err = exc.value.response["Error"]
+    assert err["Code"] == "ClientException"
+    msg = err["Message"]
+    assert "SubmitJob refused" in msg
+    assert "VCPU=256" in msg
+    assert "MEMORY=9999999" in msg
+
+
+def test_batch_submit_job_vcpu_only_over_fails(batch):
+    """When only VCPU exceeds, the message reports only VCPU."""
+    from botocore.exceptions import ClientError
+    name = f"vcpu-{_uid()}"
+    _register(batch, name, reqs=[
+        {"type": "VCPU", "value": "256"},
+        {"type": "MEMORY", "value": "64"},
+    ])
+    with pytest.raises(ClientError) as exc:
+        batch.submit_job(jobName=f"r-{_uid()}", jobQueue="q",
+                         jobDefinition=f"{name}:1")
+    msg = exc.value.response["Error"]["Message"]
+    assert "VCPU=256" in msg
+    assert "MEMORY" not in msg  # only the over-capacity dimension surfaces
+
+
+def test_batch_submit_job_memory_only_over_fails(batch):
+    from botocore.exceptions import ClientError
+    name = f"mem-{_uid()}"
+    _register(batch, name, reqs=[
+        {"type": "VCPU", "value": "1"},
+        {"type": "MEMORY", "value": "9999999"},
+    ])
+    with pytest.raises(ClientError) as exc:
+        batch.submit_job(jobName=f"r-{_uid()}", jobQueue="q",
+                         jobDefinition=f"{name}:1")
+    msg = exc.value.response["Error"]["Message"]
+    assert "MEMORY=9999999" in msg
+    assert "VCPU" not in msg
+
+
+def test_batch_submit_job_fitting_resources_succeeds(batch):
+    """Regression: a jobdef well within the host's ceiling must still pass
+    through to the stub-SUCCEEDED behavior MS has always had.
+    """
+    name = f"fit-{_uid()}"
+    _register(batch, name, reqs=[
+        {"type": "VCPU", "value": "1"},
+        {"type": "MEMORY", "value": "128"},
+    ])
+    resp = batch.submit_job(jobName=f"r-{_uid()}", jobQueue="q",
+                            jobDefinition=f"{name}:1")
+    assert "jobId" in resp
+    desc = batch.describe_jobs(jobs=[resp["jobId"]])["jobs"][0]
+    assert desc["status"] == "SUCCEEDED"
+
+
+def test_batch_submit_job_no_resource_requirements_succeeds(batch):
+    """A jobdef without `resourceRequirements` has nothing to compare against;
+    pass through unchanged.
+    """
+    name = f"noreqs-{_uid()}"
+    _register(batch, name, reqs=None)
+    resp = batch.submit_job(jobName=f"r-{_uid()}", jobQueue="q",
+                            jobDefinition=f"{name}:1")
+    assert "jobId" in resp
+
+
+def test_batch_submit_job_unknown_jobdef_passes_through(batch):
+    """When the `jobDefinition` reference can't be resolved, MS preserves its
+    existing permissive behavior (don't introduce a *new* failure mode while
+    fixing a different one).
+    """
+    resp = batch.submit_job(jobName=f"r-{_uid()}", jobQueue="q",
+                            jobDefinition="does-not-exist:99")
+    assert "jobId" in resp
+
+
+def test_batch_submit_job_resolves_by_name_takes_latest_revision(batch):
+    """`jobDefinition='name'` (no `:rev`) resolves to the latest revision."""
+    name = f"byname-{_uid()}"
+    _register(batch, name, reqs=[{"type": "VCPU", "value": "1"},
+                                  {"type": "MEMORY", "value": "128"}])
+    # Bump revision; the latest one is still small, gate must still pass.
+    _register(batch, name, reqs=[{"type": "VCPU", "value": "1"},
+                                  {"type": "MEMORY", "value": "64"}])
+    resp = batch.submit_job(jobName=f"r-{_uid()}", jobQueue="q",
+                            jobDefinition=name)  # no :rev
+    assert "jobId" in resp
+
+
+def test_batch_resource_check_skipped_when_host_unmeasurable(monkeypatch):
+    """If host detection returns None for every dimension (exotic platform),
+    the gate must skip silently — no false-positive refusals.
+    """
+    from ministack.services import batch as batch_mod
+    monkeypatch.setattr(
+        batch_mod, "_detect_host_limits",
+        lambda: {"vcpu": None, "memory_mib": None},
+    )
+    container = {
+        "image": "alpine:3.20",
+        "command": ["echo", "hi"],
+        "resourceRequirements": [
+            {"type": "VCPU", "value": "9999"},
+            {"type": "MEMORY", "value": "9999999"},
+        ],
+    }
+    assert batch_mod._check_host_fit(container) is None
+
+
+def test_batch_resource_check_skipped_when_jobdef_dimension_unmeasurable(monkeypatch):
+    """If the jobdef declares one dimension but not the other, only the
+    declared one is compared — no spurious failures from absent fields.
+    """
+    from ministack.services import batch as batch_mod
+    monkeypatch.setattr(
+        batch_mod, "_detect_host_limits",
+        lambda: {"vcpu": 2, "memory_mib": 1024},
+    )
+    container = {
+        "image": "alpine:3.20",
+        "command": ["echo", "hi"],
+        "resourceRequirements": [{"type": "VCPU", "value": "1"}],  # only VCPU
+    }
+    assert batch_mod._check_host_fit(container) is None

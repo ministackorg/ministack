@@ -1016,6 +1016,144 @@ def test_s3_put_notification_sends_test_event(s3, sqs):
     assert "Records" not in body
 
 
+def _wait_lambda_invoked(logs_client, function_name, marker, timeout=5.0):
+    """Poll the function's log group for a marker substring. Returns True on
+    first match, False after timeout."""
+    log_group = f"/aws/lambda/{function_name}"
+    end = time.time() + timeout
+    while time.time() < end:
+        try:
+            streams = logs_client.describe_log_streams(logGroupName=log_group)["logStreams"]
+        except Exception:
+            time.sleep(0.2)
+            continue
+        for s in streams:
+            try:
+                events = logs_client.get_log_events(
+                    logGroupName=log_group, logStreamName=s["logStreamName"],
+                )["events"]
+            except Exception:
+                continue
+            if any(marker in (e.get("message") or "") for e in events):
+                return True
+        time.sleep(0.2)
+    return False
+
+
+def _create_event_lambda(lam, name):
+    import io as _io
+    import zipfile as _zip
+    code = (
+        "def handler(event, context):\n"
+        "    import json\n"
+        "    print('S3EVT', json.dumps(event))\n"
+        "    return {'ok': True}\n"
+    )
+    buf = _io.BytesIO()
+    with _zip.ZipFile(buf, "w") as z:
+        z.writestr("lambda_function.py", code)
+    lam.create_function(
+        FunctionName=name,
+        Runtime="python3.13",
+        Role="arn:aws:iam::000000000000:role/test",
+        Handler="lambda_function.handler",
+        Code={"ZipFile": buf.getvalue()},
+    )
+    return lam.get_function(FunctionName=name)["Configuration"]["FunctionArn"]
+
+
+def test_s3_event_notification_to_lambda_boto3_default(s3, lam, logs):
+    """Regression: boto3's default put_bucket_notification_configuration
+    (botocore wire serializes LambdaFunctionArn as <CloudFunction>) must keep
+    invoking the Lambda on uploads.
+    """
+    fname = "s3-evt-lam-boto3"
+    arn = _create_event_lambda(lam, fname)
+    s3.create_bucket(Bucket="s3-evt-lam-boto3-bkt")
+    s3.put_bucket_notification_configuration(
+        Bucket="s3-evt-lam-boto3-bkt",
+        NotificationConfiguration={
+            "LambdaFunctionConfigurations": [
+                {"LambdaFunctionArn": arn, "Events": ["s3:ObjectCreated:*"]},
+            ],
+        },
+    )
+    s3.put_object(Bucket="s3-evt-lam-boto3-bkt", Key="boto3.txt", Body=b"hi")
+    assert _wait_lambda_invoked(logs, fname, "boto3.txt"), \
+        "Lambda was not invoked for boto3-shaped notification config"
+
+
+def test_s3_event_notification_to_lambda_modern_xml(s3, lam, logs):
+    """Issue #649: AWS SDK for Java v2, Go SDK, Terraform, and hand-crafted XML
+    all send <LambdaFunctionArn> instead of the legacy <CloudFunction> tag.
+    MS used to drop these configs silently — uploads succeeded but the
+    Lambda never fired. Modern shape is now parsed.
+    """
+    import urllib.request as _urlreq
+    fname = "s3-evt-lam-modern"
+    arn = _create_event_lambda(lam, fname)
+    s3.create_bucket(Bucket="s3-evt-lam-modern-bkt")
+
+    modern_xml = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<NotificationConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">'
+        '<LambdaFunctionConfiguration>'
+        '<Id>modern</Id>'
+        f'<LambdaFunctionArn>{arn}</LambdaFunctionArn>'
+        '<Event>s3:ObjectCreated:*</Event>'
+        '</LambdaFunctionConfiguration>'
+        '</NotificationConfiguration>'
+    )
+    req = _urlreq.Request(
+        "http://localhost:4566/s3-evt-lam-modern-bkt?notification",
+        data=modern_xml.encode(),
+        method="PUT",
+        headers={"Content-Type": "application/xml", "Authorization": "AWS test:test"},
+    )
+    _urlreq.urlopen(req)
+
+    s3.put_object(Bucket="s3-evt-lam-modern-bkt", Key="modern.txt", Body=b"hi")
+    assert _wait_lambda_invoked(logs, fname, "modern.txt"), \
+        "Lambda was not invoked for modern <LambdaFunctionArn> XML — regression for #649"
+
+
+def test_s3_event_notification_to_lambda_with_filter(s3, lam, logs):
+    """Modern XML + prefix filter — only matching keys invoke the Lambda."""
+    import urllib.request as _urlreq
+    fname = "s3-evt-lam-filter"
+    arn = _create_event_lambda(lam, fname)
+    s3.create_bucket(Bucket="s3-evt-lam-filter-bkt")
+
+    modern_xml = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<NotificationConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">'
+        '<LambdaFunctionConfiguration>'
+        '<Id>filtered</Id>'
+        f'<LambdaFunctionArn>{arn}</LambdaFunctionArn>'
+        '<Event>s3:ObjectCreated:*</Event>'
+        '<Filter><S3Key><FilterRule><Name>prefix</Name><Value>data/</Value></FilterRule></S3Key></Filter>'
+        '</LambdaFunctionConfiguration>'
+        '</NotificationConfiguration>'
+    )
+    req = _urlreq.Request(
+        "http://localhost:4566/s3-evt-lam-filter-bkt?notification",
+        data=modern_xml.encode(), method="PUT",
+        headers={"Content-Type": "application/xml", "Authorization": "AWS test:test"},
+    )
+    _urlreq.urlopen(req)
+
+    s3.put_object(Bucket="s3-evt-lam-filter-bkt", Key="other/skipme.txt", Body=b"x")
+    s3.put_object(Bucket="s3-evt-lam-filter-bkt", Key="data/match.txt", Body=b"x")
+
+    assert _wait_lambda_invoked(logs, fname, "data/match.txt"), \
+        "Lambda was not invoked for filter-matched key"
+    # The non-matching key must NOT show up in logs. Short additional wait to
+    # be sure no late delivery sneaks through.
+    time.sleep(0.5)
+    saw_skipme = _wait_lambda_invoked(logs, fname, "skipme", timeout=0.1)
+    assert not saw_skipme, "Lambda was invoked for a filter-mismatched key"
+
+
 def test_s3_put_notification_no_test_event_for_missing_bucket(s3, sqs):
     queue_url = sqs.create_queue(QueueName="s3-test-evt-missing-q")["QueueUrl"]
     queue_arn = sqs.get_queue_attributes(

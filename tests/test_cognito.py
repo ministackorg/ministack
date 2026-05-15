@@ -2720,6 +2720,124 @@ def test_auth_codes_survive_warm_boot(_enable_persistence):
     mod.reset()
 
 
+def test_cognito_alias_attributes_lookup_by_email(cognito_idp):
+    """AliasAttributes=['email'] lets users be looked up by email as Username."""
+    pid = cognito_idp.create_user_pool(
+        PoolName="AliasEmailPool",
+        AliasAttributes=["email"],
+        AutoVerifiedAttributes=["email"],
+    )["UserPool"]["Id"]
+    cognito_idp.admin_create_user(
+        UserPoolId=pid,
+        Username="alias-email-user",
+        UserAttributes=[
+            {"Name": "email", "Value": "alice@example.com"},
+            {"Name": "email_verified", "Value": "true"},
+        ],
+    )
+    user = cognito_idp.admin_get_user(UserPoolId=pid, Username="alice@example.com")
+    assert user["Username"] == "alias-email-user"
+
+
+def test_cognito_alias_attributes_lookup_by_preferred_username(cognito_idp):
+    """preferred_username alias doesn't require verification."""
+    pid = cognito_idp.create_user_pool(
+        PoolName="AliasPreferredPool",
+        AliasAttributes=["preferred_username"],
+    )["UserPool"]["Id"]
+    cognito_idp.admin_create_user(
+        UserPoolId=pid,
+        Username="alias-pref-user",
+        UserAttributes=[{"Name": "preferred_username", "Value": "alice_pref"}],
+    )
+    user = cognito_idp.admin_get_user(UserPoolId=pid, Username="alice_pref")
+    assert user["Username"] == "alias-pref-user"
+
+
+def test_cognito_alias_attributes_unverified_email_not_found(cognito_idp):
+    """Unverified email aliases should NOT resolve when email_verified=false."""
+    pid = cognito_idp.create_user_pool(
+        PoolName="AliasUnverifiedPool",
+        AliasAttributes=["email"],
+    )["UserPool"]["Id"]
+    cognito_idp.admin_create_user(
+        UserPoolId=pid,
+        Username="alias-unverified",
+        UserAttributes=[
+            {"Name": "email", "Value": "bob@example.com"},
+            {"Name": "email_verified", "Value": "false"},
+        ],
+    )
+    with pytest.raises(ClientError) as ex:
+        cognito_idp.admin_get_user(UserPoolId=pid, Username="bob@example.com")
+    assert ex.value.response["Error"]["Code"] == "UserNotFoundException"
+
+
+def test_cognito_alias_attributes_email_without_verified_flag_not_found(cognito_idp):
+    """Absent email_verified means alias is not resolvable (matches Cognito docs)."""
+    pid = cognito_idp.create_user_pool(
+        PoolName="AliasMissingVerifiedPool",
+        AliasAttributes=["email"],
+    )["UserPool"]["Id"]
+    cognito_idp.admin_create_user(
+        UserPoolId=pid,
+        Username="alias-missing-verified",
+        UserAttributes=[{"Name": "email", "Value": "noverify@example.com"}],
+    )
+    with pytest.raises(ClientError) as ex:
+        cognito_idp.admin_get_user(UserPoolId=pid, Username="noverify@example.com")
+    assert ex.value.response["Error"]["Code"] == "UserNotFoundException"
+
+
+def test_cognito_alias_attributes_auth_with_email(cognito_idp):
+    """InitiateAuth USER_PASSWORD_AUTH accepts the email alias as USERNAME."""
+    pid = cognito_idp.create_user_pool(
+        PoolName="AliasAuthPool",
+        AliasAttributes=["email"],
+    )["UserPool"]["Id"]
+    cid = cognito_idp.create_user_pool_client(
+        UserPoolId=pid,
+        ClientName="AliasAuthClient",
+        ExplicitAuthFlows=["ALLOW_USER_PASSWORD_AUTH"],
+    )["UserPoolClient"]["ClientId"]
+    cognito_idp.admin_create_user(
+        UserPoolId=pid,
+        Username="alias-auth-user",
+        UserAttributes=[
+            {"Name": "email", "Value": "carol@example.com"},
+            {"Name": "email_verified", "Value": "true"},
+        ],
+    )
+    cognito_idp.admin_set_user_password(
+        UserPoolId=pid, Username="alias-auth-user",
+        Password="StrongPass1!", Permanent=True,
+    )
+    resp = cognito_idp.initiate_auth(
+        ClientId=cid,
+        AuthFlow="USER_PASSWORD_AUTH",
+        AuthParameters={"USERNAME": "carol@example.com", "PASSWORD": "StrongPass1!"},
+    )
+    assert "AuthenticationResult" in resp
+
+
+def test_cognito_username_attributes_lookup_by_email(cognito_idp):
+    """UsernameAttributes also enables email-based lookup."""
+    pid = cognito_idp.create_user_pool(
+        PoolName="UsernameAttrsPool",
+        UsernameAttributes=["email"],
+    )["UserPool"]["Id"]
+    cognito_idp.admin_create_user(
+        UserPoolId=pid,
+        Username="dave-sub-uuid",
+        UserAttributes=[
+            {"Name": "email", "Value": "dave@example.com"},
+            {"Name": "email_verified", "Value": "true"},
+        ],
+    )
+    user = cognito_idp.admin_get_user(UserPoolId=pid, Username="dave@example.com")
+    assert user["Username"] == "dave-sub-uuid"
+
+
 def test_auth_codes_dict_types_are_plain_builtin_dict():
     """`_auth_codes` and `_authorization_codes` must remain plain `dict`
     instances. They're looked up by random unguessable token from a public
@@ -2729,3 +2847,219 @@ def test_auth_codes_dict_types_are_plain_builtin_dict():
     mod = _cognito_module()
     assert type(mod._auth_codes) is dict
     assert type(mod._authorization_codes) is dict
+
+
+# ---------------------------------------------------------------------------
+# Invitation / verification email delivery via SES
+# ---------------------------------------------------------------------------
+
+def _fetch_ses_messages():
+    """Pull SES outbox via the public inspection endpoint (account 000000000000)."""
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+    url = f"{endpoint}/_ministack/ses/messages"
+    with urllib.request.urlopen(urllib.request.Request(url, method="GET"), timeout=5) as r:
+        data = json.loads(r.read().decode())
+    return data.get("messages", {}).get("000000000000", [])
+
+
+def _messages_to(addr: str, type_name: str | None = None):
+    msgs = _fetch_ses_messages()
+    return [
+        m for m in msgs
+        if addr in (m.get("To") or [])
+        and (type_name is None or m.get("Type") == type_name)
+    ]
+
+
+def test_cognito_admin_create_user_sends_invitation_email(cognito_idp):
+    pid = cognito_idp.create_user_pool(
+        PoolName="InvitePool",
+        AdminCreateUserConfig={
+            "AllowAdminCreateUserOnly": True,
+            "InviteMessageTemplate": {
+                "EmailSubject": "Welcome {username}!",
+                "EmailMessage": "Hi {username}, your temp password is {####}.",
+            },
+        },
+    )["UserPool"]["Id"]
+
+    email = f"invite-{_uuid_mod.uuid4().hex[:8]}@example.com"
+    cognito_idp.admin_create_user(
+        UserPoolId=pid,
+        Username="invitee",
+        UserAttributes=[{"Name": "email", "Value": email}],
+        TemporaryPassword="TempPw1!aa",
+        DesiredDeliveryMediums=["EMAIL"],
+    )
+
+    msgs = _messages_to(email, "CognitoInvitationMessage")
+    assert len(msgs) == 1, f"expected 1 invitation message, got {len(msgs)}"
+    msg = msgs[0]
+    assert msg["Subject"] == "Welcome invitee!"
+    body = msg["BodyText"] or msg["BodyHtml"]
+    assert "TempPw1!aa" in body
+    assert "invitee" in body
+    # Default sender when EmailConfiguration is unset matches AWS's COGNITO_DEFAULT.
+    assert msg["Source"] == "no-reply@verificationemail.com"
+
+
+def test_cognito_admin_create_user_suppress_skips_email(cognito_idp):
+    pid = cognito_idp.create_user_pool(PoolName="SuppressPool")["UserPool"]["Id"]
+
+    email = f"suppress-{_uuid_mod.uuid4().hex[:8]}@example.com"
+    cognito_idp.admin_create_user(
+        UserPoolId=pid,
+        Username="quiet",
+        UserAttributes=[{"Name": "email", "Value": email}],
+        TemporaryPassword="TempPw1!bb",
+        MessageAction="SUPPRESS",
+        DesiredDeliveryMediums=["EMAIL"],
+    )
+
+    assert _messages_to(email) == []
+
+
+def test_cognito_admin_create_user_resend_sends_again(cognito_idp):
+    pid = cognito_idp.create_user_pool(PoolName="ResendPool")["UserPool"]["Id"]
+
+    email = f"resend-{_uuid_mod.uuid4().hex[:8]}@example.com"
+    cognito_idp.admin_create_user(
+        UserPoolId=pid,
+        Username="reinv",
+        UserAttributes=[{"Name": "email", "Value": email}],
+        TemporaryPassword="TempPw1!cc",
+        DesiredDeliveryMediums=["EMAIL"],
+    )
+    cognito_idp.admin_create_user(
+        UserPoolId=pid,
+        Username="reinv",
+        MessageAction="RESEND",
+        DesiredDeliveryMediums=["EMAIL"],
+    )
+
+    msgs = _messages_to(email, "CognitoInvitationMessage")
+    assert len(msgs) == 2
+
+
+def test_cognito_admin_create_user_sms_only_no_email(cognito_idp):
+    """If only SMS is requested, MiniStack must not push an EMAIL invitation."""
+    pid = cognito_idp.create_user_pool(PoolName="SmsOnlyPool")["UserPool"]["Id"]
+
+    email = f"smsonly-{_uuid_mod.uuid4().hex[:8]}@example.com"
+    cognito_idp.admin_create_user(
+        UserPoolId=pid,
+        Username="smsuser",
+        UserAttributes=[
+            {"Name": "email", "Value": email},
+            {"Name": "phone_number", "Value": "+15555550100"},
+        ],
+        TemporaryPassword="TempPw1!dd",
+        DesiredDeliveryMediums=["SMS"],
+    )
+
+    assert _messages_to(email) == []
+
+
+def test_cognito_admin_create_user_uses_pool_email_configuration(cognito_idp):
+    custom_from = f"custom-{_uuid_mod.uuid4().hex[:8]}@example.com"
+    pid = cognito_idp.create_user_pool(
+        PoolName="CustomFromPool",
+        EmailConfiguration={
+            "From": custom_from,
+            "ReplyToEmailAddress": "support@example.com",
+            "EmailSendingAccount": "DEVELOPER",
+        },
+    )["UserPool"]["Id"]
+
+    email = f"custom-{_uuid_mod.uuid4().hex[:8]}@example.com"
+    cognito_idp.admin_create_user(
+        UserPoolId=pid,
+        Username="branded",
+        UserAttributes=[{"Name": "email", "Value": email}],
+        TemporaryPassword="TempPw1!ee",
+        DesiredDeliveryMediums=["EMAIL"],
+    )
+
+    msgs = _messages_to(email, "CognitoInvitationMessage")
+    assert len(msgs) == 1
+    assert msgs[0]["Source"] == custom_from
+
+
+def test_cognito_signup_sends_verification_email(cognito_idp):
+    pid = cognito_idp.create_user_pool(PoolName="SignupVerifyPool")["UserPool"]["Id"]
+    cid = cognito_idp.create_user_pool_client(
+        UserPoolId=pid, ClientName="VerifyApp",
+    )["UserPoolClient"]["ClientId"]
+
+    email = f"signup-{_uuid_mod.uuid4().hex[:8]}@example.com"
+    cognito_idp.sign_up(
+        ClientId=cid,
+        Username="signer",
+        Password="Sup3rSecret!",
+        UserAttributes=[{"Name": "email", "Value": email}],
+    )
+
+    msgs = _messages_to(email, "CognitoVerificationMessage")
+    assert len(msgs) == 1
+    assert "123456" in (msgs[0]["BodyText"] or msgs[0]["BodyHtml"])
+
+
+def test_cognito_forgot_password_sends_verification_email(cognito_idp):
+    pid = cognito_idp.create_user_pool(PoolName="ForgotVerifyPool")["UserPool"]["Id"]
+    cid = cognito_idp.create_user_pool_client(
+        UserPoolId=pid, ClientName="ForgotMailApp",
+    )["UserPoolClient"]["ClientId"]
+    email = f"forgot-{_uuid_mod.uuid4().hex[:8]}@example.com"
+    cognito_idp.admin_create_user(
+        UserPoolId=pid,
+        Username="forgetter",
+        UserAttributes=[{"Name": "email", "Value": email}],
+        TemporaryPassword="TempPw1!ff",
+        MessageAction="SUPPRESS",
+    )
+
+    cognito_idp.forgot_password(ClientId=cid, Username="forgetter")
+
+    msgs = _messages_to(email, "CognitoVerificationMessage")
+    assert len(msgs) == 1
+    assert "654321" in (msgs[0]["BodyText"] or msgs[0]["BodyHtml"])
+
+
+def test_cognito_resend_confirmation_code_sends_email(cognito_idp):
+    pid = cognito_idp.create_user_pool(PoolName="ResendCodePool")["UserPool"]["Id"]
+    cid = cognito_idp.create_user_pool_client(
+        UserPoolId=pid, ClientName="ResendCodeApp",
+    )["UserPoolClient"]["ClientId"]
+
+    email = f"resendcode-{_uuid_mod.uuid4().hex[:8]}@example.com"
+    cognito_idp.sign_up(
+        ClientId=cid,
+        Username="resender",
+        Password="Sup3rSecret!",
+        UserAttributes=[{"Name": "email", "Value": email}],
+    )
+    cognito_idp.resend_confirmation_code(ClientId=cid, Username="resender")
+
+    msgs = _messages_to(email, "CognitoVerificationMessage")
+    assert len(msgs) == 2
+
+
+def test_cognito_email_disabled_env_skips_send(cognito_idp, monkeypatch):
+    """COGNITO_EMAIL_ENABLED=false must short-circuit delivery in-process."""
+    mod = _cognito_module()
+    ses_mod = importlib.import_module("ministack.services.ses")
+    monkeypatch.setenv("COGNITO_EMAIL_ENABLED", "false")
+    before = len(ses_mod._sent_emails_list())
+
+    pool_resp = mod._create_user_pool({"PoolName": "DisabledMailPool"})
+    pid = json.loads(pool_resp[2])["UserPool"]["Id"]
+    email = f"disabled-{_uuid_mod.uuid4().hex[:8]}@example.com"
+    mod._admin_create_user({
+        "UserPoolId": pid,
+        "Username": "muted",
+        "UserAttributes": [{"Name": "email", "Value": email}],
+        "TemporaryPassword": "TempPw1!gg",
+        "DesiredDeliveryMediums": ["EMAIL"],
+    })
+
+    assert len(ses_mod._sent_emails_list()) == before

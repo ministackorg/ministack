@@ -4139,3 +4139,191 @@ def test_sfn_map_iterations_proceed_under_non_default_account_id():
         assert out == [1, 2, 3, 4, 5], f"Map items dropped silently: {out}"
     finally:
         sfn.delete_state_machine(stateMachineArn=sm)
+
+
+# ---------------------------------------------------------------------------
+# JSONata variable assignment (`Assign` field + `$variable` refs) — issue #645
+# ---------------------------------------------------------------------------
+
+def test_sfn_jsonata_assign_pass_then_choice_references_variable(sfn, sfn_sync):
+    """Regression for #645: exact issue repro. A Pass state's `Assign` binds
+    a variable from `$states.result`; a downstream Choice's `Condition`
+    references it via `$myList`. Before the fix the evaluator raised
+    `States.QueryEvaluationError: Unsupported JSONata expression: $myList`.
+    """
+    import uuid as _uuid_local
+    sm_name = f"jsonata-assign-{_uuid_local.uuid4().hex[:8]}"
+    sm_arn = sfn_sync.create_state_machine(
+        name=sm_name,
+        roleArn="arn:aws:iam::000000000000:role/test-role",
+        definition=json.dumps({
+            "QueryLanguage": "JSONata",
+            "StartAt": "SetVars",
+            "States": {
+                "SetVars": {
+                    "Type": "Pass",
+                    "Output": {"items": ["a", "b"]},
+                    "Assign": {"myList": "{% $states.result.items %}"},
+                    "Next": "CheckList",
+                },
+                "CheckList": {
+                    "Type": "Choice",
+                    "Choices": [{
+                        "Next": "HasItems",
+                        "Condition": "{% $count($myList) > 0 %}",
+                    }],
+                    "Default": "Empty",
+                },
+                "HasItems": {"Type": "Succeed"},
+                "Empty": {"Type": "Succeed"},
+            },
+        }),
+    )["stateMachineArn"]
+    try:
+        resp = sfn_sync.start_sync_execution(stateMachineArn=sm_arn, input="{}")
+        assert resp["status"] == "SUCCEEDED", f"Status: {resp.get('status')} cause={resp.get('cause')}"
+        # `Empty` is the fallback — if the variable lookup or $count failed,
+        # we'd land there instead of `HasItems`.
+        events = sfn.get_execution_history(executionArn=resp["executionArn"])["events"]
+        entered = [e["stateEnteredEventDetails"]["name"]
+                   for e in events if "stateEnteredEventDetails" in e]
+        assert "HasItems" in entered, f"Expected HasItems; entered={entered}"
+        assert "Empty" not in entered
+    finally:
+        sfn_sync.delete_state_machine(stateMachineArn=sm_arn)
+
+
+def test_sfn_jsonata_assign_variable_survives_across_states(sfn_sync):
+    """Variables set on one state must be visible on every subsequent state
+    (execution-scoped, not state-scoped)."""
+    import uuid as _uuid_local
+    sm_name = f"jsonata-assign-chain-{_uuid_local.uuid4().hex[:8]}"
+    sm_arn = sfn_sync.create_state_machine(
+        name=sm_name,
+        roleArn="arn:aws:iam::000000000000:role/test-role",
+        definition=json.dumps({
+            "QueryLanguage": "JSONata",
+            "StartAt": "A",
+            "States": {
+                "A": {
+                    "Type": "Pass",
+                    "Assign": {"x": 41},
+                    "Next": "B",
+                },
+                "B": {
+                    "Type": "Pass",
+                    "Assign": {"y": "{% $x + 1 %}"},
+                    "Next": "C",
+                },
+                "C": {
+                    "Type": "Pass",
+                    "Output": "{% $y %}",
+                    "End": True,
+                },
+            },
+        }),
+    )["stateMachineArn"]
+    try:
+        resp = sfn_sync.start_sync_execution(stateMachineArn=sm_arn, input="{}")
+        assert resp["status"] == "SUCCEEDED"
+        assert json.loads(resp["output"]) == 42
+    finally:
+        sfn_sync.delete_state_machine(stateMachineArn=sm_arn)
+
+
+def test_sfn_jsonata_assign_dotted_variable_path(sfn_sync):
+    """`$user.email` resolves the `email` key inside the assigned `$user` dict."""
+    import uuid as _uuid_local
+    sm_name = f"jsonata-assign-dotted-{_uuid_local.uuid4().hex[:8]}"
+    sm_arn = sfn_sync.create_state_machine(
+        name=sm_name,
+        roleArn="arn:aws:iam::000000000000:role/test-role",
+        definition=json.dumps({
+            "QueryLanguage": "JSONata",
+            "StartAt": "Bind",
+            "States": {
+                "Bind": {
+                    "Type": "Pass",
+                    "Assign": {"user": {"email": "alice@example.com", "id": 7}},
+                    "Next": "Use",
+                },
+                "Use": {
+                    "Type": "Pass",
+                    "Output": "{% $user.email %}",
+                    "End": True,
+                },
+            },
+        }),
+    )["stateMachineArn"]
+    try:
+        resp = sfn_sync.start_sync_execution(stateMachineArn=sm_arn, input="{}")
+        assert resp["status"] == "SUCCEEDED"
+        assert json.loads(resp["output"]) == "alice@example.com"
+    finally:
+        sfn_sync.delete_state_machine(stateMachineArn=sm_arn)
+
+
+def test_sfn_jsonata_undefined_variable_raises_query_eval_error(sfn_sync):
+    """Referencing an unbound `$var` must surface as `States.QueryEvaluationError`
+    (the documented AWS error code for JSONata evaluation failures), not as a
+    generic Runtime error or silent fallthrough.
+    """
+    import uuid as _uuid_local
+    sm_name = f"jsonata-undef-{_uuid_local.uuid4().hex[:8]}"
+    sm_arn = sfn_sync.create_state_machine(
+        name=sm_name,
+        roleArn="arn:aws:iam::000000000000:role/test-role",
+        definition=json.dumps({
+            "QueryLanguage": "JSONata",
+            "StartAt": "Use",
+            "States": {
+                "Use": {
+                    "Type": "Pass",
+                    "Output": "{% $never_set %}",
+                    "End": True,
+                },
+            },
+        }),
+    )["stateMachineArn"]
+    try:
+        resp = sfn_sync.start_sync_execution(stateMachineArn=sm_arn, input="{}")
+        assert resp["status"] == "FAILED"
+        assert resp.get("error") == "States.QueryEvaluationError"
+    finally:
+        sfn_sync.delete_state_machine(stateMachineArn=sm_arn)
+
+
+def test_sfn_jsonata_assign_reuses_input(sfn_sync):
+    """`Assign` can reference `$states.input` (always available)."""
+    import uuid as _uuid_local
+    sm_name = f"jsonata-input-{_uuid_local.uuid4().hex[:8]}"
+    sm_arn = sfn_sync.create_state_machine(
+        name=sm_name,
+        roleArn="arn:aws:iam::000000000000:role/test-role",
+        definition=json.dumps({
+            "QueryLanguage": "JSONata",
+            "StartAt": "Bind",
+            "States": {
+                "Bind": {
+                    "Type": "Pass",
+                    "Assign": {"name": "{% $states.input.who %}"},
+                    "Next": "Out",
+                },
+                "Out": {
+                    "Type": "Pass",
+                    "Output": "{% 'hello ' & $name %}",
+                    "End": True,
+                },
+            },
+        }),
+    )["stateMachineArn"]
+    try:
+        resp = sfn_sync.start_sync_execution(
+            stateMachineArn=sm_arn,
+            input=json.dumps({"who": "world"}),
+        )
+        assert resp["status"] == "SUCCEEDED"
+        assert json.loads(resp["output"]) == "hello world"
+    finally:
+        sfn_sync.delete_state_machine(stateMachineArn=sm_arn)
+
