@@ -170,6 +170,36 @@ async def _dispatch(action: str, data: dict, qurl: str) -> dict:
 #  CORE ACTIONS
 # ────────────────────────────────────────────────────────────
 
+def _validate_redrive_policy(rp_str: str) -> None:
+    """Real-AWS-parity validation for the RedrivePolicy queue attribute.
+
+    AWS rejects malformed values at CreateQueue/SetQueueAttributes time with
+    `InvalidAttributeValue` (HTTP 400). Without this gate, MS stores the bad
+    value and `_dlq_sweep` later crashes on receive because `json.loads` of a
+    double-encoded string returns a string, not a dict, and `.get()` blows up.
+    """
+    err_msg = ("Invalid value for the parameter RedrivePolicy. Value must be a "
+               "JSON object containing string fields deadLetterTargetArn and "
+               "maxReceiveCount (an integer between 1 and 1000).")
+    try:
+        parsed = json.loads(rp_str)
+    except (TypeError, ValueError):
+        raise _Err("InvalidAttributeValue", err_msg, 400)
+    if not isinstance(parsed, dict):
+        raise _Err("InvalidAttributeValue", err_msg, 400)
+    dlta = parsed.get("deadLetterTargetArn")
+    mrc = parsed.get("maxReceiveCount")
+    if not isinstance(dlta, str) or not dlta:
+        raise _Err("InvalidAttributeValue", err_msg, 400)
+    # AWS accepts maxReceiveCount as either int or string-encoded int.
+    try:
+        mrc_int = int(mrc)
+    except (TypeError, ValueError):
+        raise _Err("InvalidAttributeValue", err_msg, 400)
+    if mrc_int < 1 or mrc_int > 1000:
+        raise _Err("InvalidAttributeValue", err_msg, 400)
+
+
 def _act_create_queue(data: dict, _u: str) -> dict:
     name = data.get("QueueName", "")
     if not name:
@@ -177,6 +207,8 @@ def _act_create_queue(data: dict, _u: str) -> dict:
                     "The request must contain the parameter QueueName.")
 
     attrs = data.get("Attributes") or {}
+    if "RedrivePolicy" in attrs:
+        _validate_redrive_policy(str(attrs["RedrivePolicy"]))
     is_fifo = name.endswith(".fifo") or attrs.get("FifoQueue") == "true"
 
     if is_fifo and not name.endswith(".fifo"):
@@ -515,7 +547,10 @@ def _act_get_queue_attributes(data: dict, qurl: str) -> dict:
 def _act_set_queue_attributes(data: dict, qurl: str) -> dict:
     url = data.get("QueueUrl", qurl)
     q = _get_q(url)
-    for k, v in (data.get("Attributes") or {}).items():
+    incoming = data.get("Attributes") or {}
+    if "RedrivePolicy" in incoming:
+        _validate_redrive_policy(str(incoming["RedrivePolicy"]))
+    for k, v in incoming.items():
         q["attributes"][k] = str(v)
     q["attributes"]["LastModifiedTimestamp"] = str(int(time.time()))
     return {}
@@ -863,7 +898,17 @@ def _dlq_sweep(q: dict) -> None:
         rp = json.loads(rp_raw)
     except Exception:
         return
-    max_rc = int(rp.get("maxReceiveCount", 0))
+    # Belt-and-suspenders: persisted state from older MS versions (pre-fix)
+    # may have stored a double-encoded RedrivePolicy that decodes to a string,
+    # not a dict. CreateQueue/SetQueueAttributes now reject this at intake
+    # (InvalidAttributeValue), but skip rather than crash if a legacy value
+    # slips through.
+    if not isinstance(rp, dict):
+        return
+    try:
+        max_rc = int(rp.get("maxReceiveCount", 0))
+    except (TypeError, ValueError):
+        return
     arn = rp.get("deadLetterTargetArn", "")
     if not max_rc or not arn:
         return

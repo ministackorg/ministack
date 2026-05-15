@@ -1348,11 +1348,20 @@ def _parse_notification_config(bucket_name: str) -> list[dict]:
 
     configs: list[dict] = []
 
+    # Real S3 accepts two ARN-tag forms for Lambda-targeted notifications.
+    # boto3's botocore wire serializes `LambdaFunctionArn` as the legacy
+    # `<CloudFunction>` tag, so MS used to parse only that. Other clients
+    # (AWS SDK for Java v2, Go SDK, hand-crafted XML, Terraform's
+    # `aws_s3_bucket_notification` provider) send the modern
+    # `<LambdaFunctionArn>` tag — MS silently dropped those configs, so
+    # uploads succeeded but the Lambda never fired (issue #649).
     _CONFIG_MAP = {
         "QueueConfiguration": ("sqs", ("Queue",)),
         "TopicConfiguration": ("sns", ("Topic",)),
         "CloudFunctionConfiguration": ("lambda", ("CloudFunction", "Function")),
-        "LambdaFunctionConfiguration": ("lambda", ("Function", "CloudFunction")),
+        "LambdaFunctionConfiguration": (
+            "lambda", ("LambdaFunctionArn", "CloudFunction", "Function"),
+        ),
     }
 
     for tag_suffix, (target_type, arn_tags) in _CONFIG_MAP.items():

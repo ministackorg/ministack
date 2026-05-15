@@ -686,3 +686,146 @@ def test_sqs_remove_permission_drops_matching_statement(sqs):
     sids = [s["Sid"] for s in policy["Statement"]]
     assert "keep" in sids
     assert "drop" not in sids
+
+
+# ---------------------------------------------------------------------------
+# RedrivePolicy validation (issue #644)
+# ---------------------------------------------------------------------------
+
+def _make_dlq(sqs, name="rp-dlq"):
+    url = sqs.create_queue(QueueName=name)["QueueUrl"]
+    arn = sqs.get_queue_attributes(QueueUrl=url, AttributeNames=["QueueArn"])["Attributes"]["QueueArn"]
+    return url, arn
+
+
+def test_sqs_create_queue_rejects_double_encoded_redrive_policy(sqs):
+    """Regression for #644: a double-JSON-encoded RedrivePolicy (jq tostring
+    quirk) used to slip through CreateQueue, get stored as `"\\"{...}\\""`,
+    and then crash ReceiveMessage with `'str' object has no attribute 'get'`
+    when `_dlq_sweep` tried to `.get(...)` on the inner string. CreateQueue
+    now rejects this at intake with InvalidAttributeValue, matching AWS.
+    """
+    _, dlq_arn = _make_dlq(sqs, name="rp-double-dlq")
+    # Inner JSON wrapped in an additional pair of quotes — what `jq tostring`
+    # produces if the caller doesn't realize it already serializes to JSON.
+    bad = '"' + json.dumps({"deadLetterTargetArn": dlq_arn, "maxReceiveCount": "2"}).replace('"', '\\"') + '"'
+    with pytest.raises(ClientError) as exc:
+        sqs.create_queue(
+            QueueName="rp-double-src",
+            Attributes={"RedrivePolicy": bad},
+        )
+    assert exc.value.response["Error"]["Code"] == "InvalidAttributeValue"
+    assert "RedrivePolicy" in exc.value.response["Error"]["Message"]
+
+
+@pytest.mark.parametrize("bad_value,label", [
+    ("not json at all",                          "non-json"),
+    ("[1, 2, 3]",                                "json-array"),
+    ('"just a string"',                          "json-string"),
+    ("42",                                       "json-number"),
+    ('{"maxReceiveCount":"2"}',                  "missing-arn"),
+    ('{"deadLetterTargetArn":"arn:x"}',          "missing-mrc"),
+    ('{"deadLetterTargetArn":"arn:x","maxReceiveCount":"NaN"}', "non-numeric-mrc"),
+    ('{"deadLetterTargetArn":"arn:x","maxReceiveCount":0}',     "mrc-too-low"),
+    ('{"deadLetterTargetArn":"arn:x","maxReceiveCount":1001}',  "mrc-too-high"),
+    ('{"deadLetterTargetArn":"","maxReceiveCount":2}',          "empty-arn"),
+])
+def test_sqs_create_queue_redrive_policy_invalid_shape(sqs, bad_value, label):
+    """All malformed RedrivePolicy shapes return InvalidAttributeValue (400),
+    not InternalError (500) — covering every branch of the validator.
+    """
+    with pytest.raises(ClientError) as exc:
+        sqs.create_queue(
+            QueueName=f"rp-bad-{label}",
+            Attributes={"RedrivePolicy": bad_value},
+        )
+    assert exc.value.response["Error"]["Code"] == "InvalidAttributeValue", f"label={label}"
+
+
+def test_sqs_create_queue_redrive_policy_accepts_int_max_receive_count(sqs):
+    """maxReceiveCount as a JSON integer (not string) is accepted — AWS allows
+    both, and the existing test in this file already uses the string form.
+    """
+    _, dlq_arn = _make_dlq(sqs, name="rp-int-dlq")
+    sqs.create_queue(
+        QueueName="rp-int-src",
+        Attributes={"RedrivePolicy": json.dumps(
+            {"deadLetterTargetArn": dlq_arn, "maxReceiveCount": 5}
+        )},
+    )
+
+
+def test_sqs_set_queue_attributes_validates_redrive_policy(sqs):
+    """SetQueueAttributes runs the same validator — otherwise CreateQueue
+    rejects the bad value but SetQueueAttributes would let it through and
+    crash later receives, defeating the gate.
+    """
+    _, dlq_arn = _make_dlq(sqs, name="rp-setattr-dlq")
+    src_url = sqs.create_queue(QueueName="rp-setattr-src")["QueueUrl"]
+    bad = '"' + json.dumps({"deadLetterTargetArn": dlq_arn, "maxReceiveCount": "2"}).replace('"', '\\"') + '"'
+    with pytest.raises(ClientError) as exc:
+        sqs.set_queue_attributes(QueueUrl=src_url, Attributes={"RedrivePolicy": bad})
+    assert exc.value.response["Error"]["Code"] == "InvalidAttributeValue"
+
+
+def test_sqs_fifo_receive_with_redrive_policy_does_not_500(sqs):
+    """The original symptom from #644: ReceiveMessage on a FIFO queue with a
+    valid RedrivePolicy attached must not crash with InternalError.
+    """
+    _, dlq_arn = _make_dlq(sqs, name="rp-fifo-recv-dlq.fifo")  # name irrelevant
+    # Actually make a FIFO DLQ for parity with the issue's repro.
+    dlq_url = sqs.create_queue(
+        QueueName="rp-fifo-dlq.fifo",
+        Attributes={"FifoQueue": "true", "ContentBasedDeduplication": "false"},
+    )["QueueUrl"]
+    fifo_dlq_arn = sqs.get_queue_attributes(
+        QueueUrl=dlq_url, AttributeNames=["QueueArn"]
+    )["Attributes"]["QueueArn"]
+    src_url = sqs.create_queue(
+        QueueName="rp-fifo-src.fifo",
+        Attributes={
+            "FifoQueue": "true",
+            "ContentBasedDeduplication": "false",
+            "VisibilityTimeout": "5",
+            "RedrivePolicy": json.dumps(
+                {"deadLetterTargetArn": fifo_dlq_arn, "maxReceiveCount": "2"}
+            ),
+        },
+    )["QueueUrl"]
+
+    # Empty-queue receive must not 500.
+    r = sqs.receive_message(QueueUrl=src_url, MaxNumberOfMessages=1, WaitTimeSeconds=1)
+    assert "Messages" not in r or r["Messages"] == []
+
+    # After a SendMessage, the message must come back via ReceiveMessage.
+    sqs.send_message(
+        QueueUrl=src_url,
+        MessageBody="hello",
+        MessageGroupId="g1",
+        MessageDeduplicationId="d-1",
+    )
+    r = sqs.receive_message(QueueUrl=src_url, MaxNumberOfMessages=1, WaitTimeSeconds=2)
+    assert len(r["Messages"]) == 1
+    assert r["Messages"][0]["Body"] == "hello"
+
+
+def test_sqs_dlq_sweep_survives_legacy_double_encoded_policy():
+    """Defence-in-depth unit test: if a legacy queue carried a double-encoded
+    RedrivePolicy from a pre-fix MS version (persistence-load can't be
+    rejected the way an API call is), `_dlq_sweep` must skip rather than
+    crash. Called directly here — boto3 over HTTP would talk to a separately
+    process with its own `_queues` instance, so we can't inject the bad state
+    that way.
+    """
+    from ministack.services.sqs import _dlq_sweep
+
+    bad_rp = '"' + json.dumps(
+        {"deadLetterTargetArn": "arn:x", "maxReceiveCount": "2"}
+    ).replace('"', '\\"') + '"'
+    fake_q = {
+        "messages": [],
+        "attributes": {"RedrivePolicy": bad_rp},
+    }
+    # Pre-fix this raised: AttributeError: 'str' object has no attribute 'get'
+    _dlq_sweep(fake_q)
+    assert fake_q["messages"] == []  # nothing to sweep, no crash
