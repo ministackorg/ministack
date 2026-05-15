@@ -668,6 +668,11 @@ def _acs_url() -> str:
     return f"http://{_MINISTACK_HOST}:{_MINISTACK_PORT}/saml2/idpresponse"
 
 
+def _oidc_callback_url() -> str:
+    """OIDC callback URL — external OIDC IdPs redirect back here with `code`+`state`."""
+    return f"http://{_MINISTACK_HOST}:{_MINISTACK_PORT}/oauth2/idpresponse"
+
+
 def _build_saml_authn_request(pool_id: str, destination: str) -> str:
     """Build a minimal SAML AuthnRequest, deflate + base64-encode for HTTP-Redirect binding."""
     req = Element("{urn:oasis:names:tc:SAML:2.0:protocol}AuthnRequest")
@@ -796,6 +801,8 @@ async def handle_request(method, path, headers, body, query_params):
         return handle_oauth2_authorize(method, path, headers, query_params)
     if path.startswith("/saml2/idpresponse"):
         return _saml2_idp_response(body, query_params)
+    if path.startswith("/oauth2/idpresponse"):
+        return _oauth2_idp_response(method, body, query_params)
     if path.startswith("/oauth2/token"):
         return _oauth2_token({}, query_params, body, headers)
 
@@ -2542,7 +2549,7 @@ def _oauth2_authorize_federation(query_params):
         redirect_url = authorize_url + ("&" if "?" in authorize_url else "?") + urlencode({
             "response_type": response_type or "code",
             "client_id": oidc_client_id,
-            "redirect_uri": _acs_url(),
+            "redirect_uri": _oidc_callback_url(),
             "scope": details.get("authorize_scopes", scope),
             "state": relay_key,
         })
@@ -2711,6 +2718,210 @@ def _saml2_idp_response(body: bytes, query_params):
         params["state"] = state
     location = redirect_uri + ("&" if "?" in redirect_uri else "?") + urlencode(params)
     logger.info("Cognito: SAML IdP response — user %s created/updated, redirecting to app", username)
+    return 302, {"Location": location, "Content-Type": "text/html"}, b""
+
+
+# -- /oauth2/idpresponse (GET/POST) -----------------------------------------
+
+def _decode_id_token_unverified(id_token: str) -> dict:
+    """Decode a JWT id_token payload without verifying its signature.
+
+    Matches MiniStack's wider stance on emulator-side crypto checks: we don't
+    verify SigV4 on AWS requests and we don't verify SAML response signatures
+    on `/saml2/idpresponse`, so we don't verify OIDC id_token signatures here
+    either. The threat model for a local emulator is developer testing, not
+    token forgery, and adding a JWKS fetch + RS256 verify would be inconsistent
+    with the rest of the codebase. Documented gap from real AWS Cognito.
+    """
+    parts = id_token.split(".")
+    if len(parts) < 2:
+        raise ValueError("id_token is not a JWT (expected at least header.payload)")
+    payload_b64 = parts[1]
+    payload_b64 += "=" * (-len(payload_b64) % 4)  # base64url padding
+    payload_bytes = base64.urlsafe_b64decode(payload_b64.encode("ascii"))
+    return json.loads(payload_bytes.decode("utf-8"))
+
+
+def _oauth2_idp_response(method, body, query_params):
+    """GET/POST /oauth2/idpresponse — external OIDC IdP callback.
+
+    Mirrors `_saml2_idp_response` for the OIDC `authorization_code` flow:
+    the IdP redirects back to MiniStack with `code` and `state` in the query
+    string (or POST body, depending on the IdP's `response_mode`). MiniStack
+    exchanges the code for tokens at the IdP's `token_url`, decodes the
+    returned id_token (no signature verification — see
+    `_decode_id_token_unverified`), provisions or refreshes the federated
+    user, and redirects to the app's `redirect_uri` with a MiniStack-issued
+    authorization code so the app's existing `/oauth2/token` flow continues
+    to work.
+    """
+    import urllib.error
+    import urllib.request
+
+    # Pull `code` + `state` from query string first, then POST form body.
+    code = _qp(query_params, "code")
+    state = _qp(query_params, "state")
+    if (not code or not state) and body and method == "POST":
+        try:
+            form = parse_qs(body.decode("utf-8", errors="replace"), keep_blank_values=True)
+            code = code or (form.get("code", [""])[0])
+            state = state or (form.get("state", [""])[0])
+        except Exception:
+            pass
+
+    if not code:
+        return error_response_json("InvalidParameterException", "code is required.", 400)
+    if not state:
+        return error_response_json("InvalidParameterException", "state is required.", 400)
+
+    relay = _auth_codes.pop(state, None)
+    if not relay or relay.get("type") != "relay":
+        return error_response_json("InvalidParameterException", "Invalid or expired state.", 400)
+
+    pool_id = relay["pool_id"]
+    client_id = relay["client_id"]
+    redirect_uri = relay["redirect_uri"]
+    app_state = relay.get("state", "")
+    provider_name = relay["provider_name"]
+
+    pool = _get_pool_unscoped(pool_id)
+    if not pool:
+        return error_response_json("ResourceNotFoundException", f"User pool {pool_id} not found.", 400)
+
+    provider = pool.get("_identity_providers", {}).get(provider_name)
+    if not provider or provider.get("ProviderType", "") != "OIDC":
+        return error_response_json("ResourceNotFoundException",
+                                   f"OIDC provider {provider_name} not found.", 400)
+
+    details = provider.get("ProviderDetails", {})
+    oidc_issuer = details.get("oidc_issuer", "")
+    token_url = details.get("token_url") or (f"{oidc_issuer}/token" if oidc_issuer else "")
+    if not token_url:
+        return error_response_json("InvalidParameterException",
+                                   "OIDC provider has no token_url or oidc_issuer.", 400)
+
+    oidc_client_id = details.get("client_id", "")
+    oidc_client_secret = details.get("client_secret", "")
+
+    # Exchange code for tokens at the IdP's token endpoint.
+    token_body = urlencode({
+        "grant_type": "authorization_code",
+        "code": code,
+        "redirect_uri": _oidc_callback_url(),
+        "client_id": oidc_client_id,
+        "client_secret": oidc_client_secret,
+    }).encode("ascii")
+    req = urllib.request.Request(
+        token_url,
+        data=token_body,
+        headers={"Content-Type": "application/x-www-form-urlencoded",
+                 "Accept": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            token_payload = resp.read()
+    except urllib.error.HTTPError as exc:
+        logger.warning("Cognito: OIDC token exchange failed: HTTP %s — %s",
+                       exc.code, exc.reason)
+        return error_response_json("InvalidParameterException",
+                                   f"OIDC token exchange failed: HTTP {exc.code}", 400)
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        logger.warning("Cognito: OIDC token exchange failed: %s", exc)
+        return error_response_json("InvalidParameterException",
+                                   f"OIDC token exchange failed: {exc}", 400)
+
+    try:
+        token_data = json.loads(token_payload.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError) as exc:
+        return error_response_json("InvalidParameterException",
+                                   f"OIDC token endpoint returned non-JSON: {exc}", 400)
+
+    id_token = token_data.get("id_token", "")
+    access_token = token_data.get("access_token", "")
+    if not id_token:
+        return error_response_json("InvalidParameterException",
+                                   "OIDC token response missing id_token.", 400)
+
+    try:
+        claims = _decode_id_token_unverified(id_token)
+    except (ValueError, json.JSONDecodeError, base64.binascii.Error) as exc:
+        return error_response_json("InvalidParameterException",
+                                   f"Could not decode id_token: {exc}", 400)
+
+    # Apply attribute mapping (IdP claim → Cognito attribute), same shape
+    # as the SAML branch.
+    attr_mapping = provider.get("AttributeMapping", {})
+    reverse_mapping = {v: k for k, v in attr_mapping.items()}
+    user_attrs = {}
+    for idp_claim, value in claims.items():
+        if idp_claim in ("iss", "aud", "exp", "iat", "nbf", "jti", "azp", "auth_time"):
+            continue
+        if not isinstance(value, (str, int, float, bool)):
+            continue
+        cognito_attr = reverse_mapping.get(idp_claim, idp_claim)
+        user_attrs[cognito_attr] = str(value)
+
+    # Stable identifier: prefer `sub` from id_token, fall back to `email` or
+    # a generated UUID so users can be re-found on subsequent logins.
+    name_id = (claims.get("sub")
+               or claims.get("email")
+               or user_attrs.get("email")
+               or "")
+    if not name_id:
+        return error_response_json("InvalidParameterException",
+                                   "OIDC id_token has no `sub` or `email` claim.", 400)
+
+    username = f"{provider_name}_{name_id}"
+    existing_user = pool["_users"].get(username)
+    now = _now_epoch()
+
+    if existing_user:
+        existing_dict = _attr_list_to_dict(existing_user.get("Attributes", []))
+        existing_dict.update(user_attrs)
+        existing_user["Attributes"] = _dict_to_attr_list(existing_dict)
+        existing_user["UserLastModifiedDate"] = now
+        sub = existing_dict.get("sub", new_uuid())
+    else:
+        sub = new_uuid()
+        user_attrs["sub"] = sub
+        if "email" not in user_attrs and "@" in name_id:
+            user_attrs["email"] = name_id
+        user = {
+            "Username": username,
+            "Attributes": _dict_to_attr_list(user_attrs),
+            "UserCreateDate": now,
+            "UserLastModifiedDate": now,
+            "Enabled": True,
+            "UserStatus": "EXTERNAL_PROVIDER",
+            "MFAOptions": [],
+            "_password": "",
+            "_groups": [],
+            "_tokens": [],
+        }
+        pool["_users"][username] = user
+        pool["EstimatedNumberOfUsers"] = len(pool["_users"])
+
+    # Issue MiniStack auth code so the app's /oauth2/token call works.
+    _cleanup_expired_relay_codes()
+    ms_code = secrets.token_urlsafe(32)
+    _auth_codes[ms_code] = {
+        "type": "code",
+        "pool_id": pool_id,
+        "client_id": client_id,
+        "username": username,
+        "sub": sub,
+        "redirect_uri": redirect_uri,
+        "scopes": relay.get("scope", "openid"),
+        "created_at": time.time(),
+        "_oidc_access_token": access_token,  # kept for /oauth2/userInfo passthrough
+    }
+
+    params = {"code": ms_code}
+    if app_state:
+        params["state"] = app_state
+    location = redirect_uri + ("&" if "?" in redirect_uri else "?") + urlencode(params)
+    logger.info("Cognito: OIDC IdP response — user %s created/updated, redirecting to app", username)
     return 302, {"Location": location, "Content-Type": "text/html"}, b""
 
 
