@@ -4041,3 +4041,101 @@ def test_sfn_execution_proceeds_under_non_default_account_id():
         )
     finally:
         sfn.delete_state_machine(stateMachineArn=sm_arn)
+
+
+def _alt_account_sfn_client(account_id):
+    import boto3
+    from botocore.config import Config
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+    region = os.environ.get("MINISTACK_REGION", "us-east-1")
+    return boto3.client(
+        "stepfunctions",
+        endpoint_url=endpoint,
+        aws_access_key_id=account_id,
+        aws_secret_access_key="test",
+        region_name=region,
+        config=Config(region_name=region, retries={"max_attempts": 0}),
+    )
+
+
+def test_sfn_parallel_branches_proceed_under_non_default_account_id():
+    """Each Parallel branch thread must inherit the request's account context.
+
+    Before #640 the Parallel branch wrapper shared a single Context across N
+    concurrent threads — the second branch to start raised RuntimeError in
+    Thread._bootstrap_inner, which was logged to stderr but never reached
+    errors[idx], so the Parallel state returned [result_0, None, None, ...]
+    silently. Per-branch contextvars.copy_context() fixes both the account
+    lookup and the shared-context contention.
+    """
+    sfn = _alt_account_sfn_client("123456789012")
+    uid = _uuid_mod.uuid4().hex[:8]
+    sm_name = f"ctxvars-parallel-{uid}"
+    sm = sfn.create_state_machine(
+        name=sm_name,
+        definition=json.dumps({
+            "StartAt": "Fan",
+            "States": {
+                "Fan": {
+                    "Type": "Parallel",
+                    "End": True,
+                    "Branches": [
+                        {"StartAt": f"B{i}", "States": {f"B{i}": {"Type": "Pass", "Result": i, "End": True}}}
+                        for i in range(4)
+                    ],
+                }
+            },
+        }),
+        roleArn="arn:aws:iam::123456789012:role/r",
+        type="STANDARD",
+    )["stateMachineArn"]
+    try:
+        exec_resp = sfn.start_execution(stateMachineArn=sm, name=f"e-{uid}", input="{}")
+        desc = _wait_sfn(sfn, exec_resp["executionArn"], timeout=10)
+        assert desc["status"] == "SUCCEEDED", f"Parallel stalled: {desc.get('status')}"
+        out = json.loads(desc["output"])
+        assert out == [0, 1, 2, 3], f"Branches dropped silently: {out}"
+    finally:
+        sfn.delete_state_machine(stateMachineArn=sm)
+
+
+def test_sfn_map_iterations_proceed_under_non_default_account_id():
+    """Each Map ThreadPoolExecutor worker must inherit the request's account
+    context. Same shared-Context regression mode as Parallel, but for Map.
+    Use MaxConcurrency: 0 (unbounded) so workers definitely run concurrently.
+    """
+    sfn = _alt_account_sfn_client("123456789012")
+    uid = _uuid_mod.uuid4().hex[:8]
+    sm_name = f"ctxvars-map-{uid}"
+    sm = sfn.create_state_machine(
+        name=sm_name,
+        definition=json.dumps({
+            "StartAt": "Loop",
+            "States": {
+                "Loop": {
+                    "Type": "Map",
+                    "ItemsPath": "$.items",
+                    "MaxConcurrency": 0,
+                    "Iterator": {
+                        "StartAt": "Echo",
+                        "States": {"Echo": {"Type": "Pass", "End": True}},
+                    },
+                    "End": True,
+                }
+            },
+        }),
+        roleArn="arn:aws:iam::123456789012:role/r",
+        type="STANDARD",
+    )["stateMachineArn"]
+    try:
+        exec_resp = sfn.start_execution(
+            stateMachineArn=sm,
+            name=f"e-{uid}",
+            input=json.dumps({"items": [1, 2, 3, 4, 5]}),
+        )
+        desc = _wait_sfn(sfn, exec_resp["executionArn"], timeout=10)
+        assert desc["status"] == "SUCCEEDED", f"Map stalled: {desc.get('status')}"
+        out = json.loads(desc["output"])
+        assert out == [1, 2, 3, 4, 5], f"Map items dropped silently: {out}"
+    finally:
+        sfn.delete_state_machine(stateMachineArn=sm)

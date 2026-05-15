@@ -7,12 +7,18 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
-## Unreleased
+## [1.3.39] — 2026-05-15
+
+### Added
+- **Node.js Lambda — `@aws-sdk/client-*` built-in stubs** — real Node.js 18+ Lambda ships the AWS SDK v3 built-in; MiniStack's worker now intercepts `require('@aws-sdk/client-*')` and returns lightweight stubs that route through `AWS_ENDPOINT_URL` when the real package isn't installed (Lambda Layers still win). `@aws-sdk/client-lambda` gets a REST stub; 28 `awsJson1.x` services resolve via a generic `X-Amz-Target` Proxy. `err.name`/`err.code` set per v3 catch-by-name convention. HTTPS→HTTP localhost downgrade extended to CDK Provider Framework's `cfn-response.js` PUT. Query-protocol / REST-XML / REST-path clients still need bundling or a Layer, as on real AWS outside a managed runtime. Contributed by @hiddengearz.
 
 ### Fixed
-- **Cognito OIDC federation callback (`/oauth2/idpresponse`)** — federating Cognito to an external OIDC IdP (Keycloak, Auth0, Google, etc.) was half-wired: `/oauth2/authorize?identity_provider=<oidc-provider>` redirected the user to the IdP correctly, but routed the IdP's callback at `/saml2/idpresponse`, which only accepts SAML responses, so the IdP's `code`+`state` callback always 400'd. MiniStack now serves the canonical Cognito `/oauth2/idpresponse` endpoint: it looks up the relay context, exchanges the `code` against the IdP's `token_url` (`grant_type=authorization_code`), decodes the returned `id_token` (without signature verification — consistent with how MiniStack treats SigV4 and SAML signatures on the emulator side), applies `AttributeMapping` to the claims, provisions or refreshes the `{provider}_{sub}` federated user, and 302s the app back to its `redirect_uri` with a MiniStack-issued auth code. SAML federation continues to use `/saml2/idpresponse` unchanged. Reported by @ocr-lasagna.
-- **Step Functions JSONata `Arguments` for `aws-sdk` Task states** — Task states with `QueryLanguage: "JSONata"` now evaluate `Arguments` before dispatching service integrations and evaluate success/Catch `Output` with `$states.input`, `$states.result`, and `$states.errorOutput`. This lets per-state JSONata workflows pass required SDK parameters locally instead of invoking services with an empty JSONPath-style payload. Contributed by @jayjanssen.
-- **Step Functions JSONata coverage for Pass and Choice states** — Pass states now evaluate `Output` (previously the field was accepted and silently ignored, passing input through unchanged). Choice states now evaluate per-branch `Condition` and route accordingly (previously every `{% ... %}` condition was treated as falsy, so workflows always fell through to `Default`), and apply per-branch `Output` on the matched rule. The evaluator gained `< <= > >= + - * / % & and or in $count $length $not $string $number`, paren grouping, unary minus, and proper left-associative arithmetic — covering the JSONata operators used in real workflows. Reported by @youngkwangk.
+- **Cognito OIDC federation callback (`/oauth2/idpresponse`)** — OIDC federation was half-wired: `/oauth2/authorize` redirected to the IdP correctly but routed the callback at `/saml2/idpresponse`, which only accepts SAML, so every IdP `code`+`state` callback 400'd. MiniStack now serves `/oauth2/idpresponse`: exchanges the code at the IdP's `token_url`, decodes the `id_token` (no signature verification — same posture as SAML), applies `AttributeMapping`, provisions the `{provider}_{sub}` user, and 302s back to the app with a MiniStack-issued code. Reported by @ocr-lasagna.
+- **Step Functions executions stalling at `ExecutionStarted` under non-default account IDs** — `_executions` is an `AccountScopedDict` keyed by `get_account_id()` (a `ContextVar`); the background worker was spawned via plain `threading.Thread` which doesn't propagate contextvars, so the worker looked up the execution under the default account, found nothing, and silently returned. Fixed with `contextvars.copy_context().run` on each thread target, with per-thread snapshots at the Parallel and Map spawn sites (a single `Context` cannot be entered by two threads concurrently). Contributed by @michael-denyer.
+- **Step Functions JSONata `Arguments` on `aws-sdk` Task states** — Tasks with `QueryLanguage: "JSONata"` now evaluate `Arguments` and success/Catch `Output` against `$states.input` / `$states.result` / `$states.errorOutput`, instead of dispatching with an empty JSONPath payload. Contributed by @jayjanssen.
+- **Step Functions JSONata coverage for Pass and Choice** — Pass now evaluates `Output` (previously silently ignored). Choice now evaluates per-branch `Condition` (previously always treated as falsy, falling through to `Default`) and applies per-branch `Output` on the matched rule. Evaluator extended with comparison/arithmetic/string-concat/and/or/in/not, `$count`/`$length`/`$string`/`$number`, paren grouping, unary minus, left-associative parsing. Reported by @youngkwangk.
+
+---
 
 ## [1.3.38] — 2026-05-13
 
@@ -29,6 +35,8 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 - **ECS `connectivityAt` and `stoppingAt` timestamps wire-formatted as numbers** — both fields are set on tasks but were missing from the `_ECS_TIMESTAMP_FIELDS` normalization set, so they shipped as ISO strings in `DescribeTasks` / `ListTasks` responses. The Go AWS SDK v2 (strict JSON 1.1 timestamp parsing) rejected the response; boto3 was lenient and hid the issue. Both fields are now epoch-normalized alongside the other task timestamps. Contributed by @YakirOren.
 - **CloudFormation `AWS::ECS::TaskDefinition` populates `registeredAt`, `registeredBy`, and `compatibilities`** — the CFN provisioner constructed the task-definition record without these three fields, so `DescribeTaskDefinition` returned them as missing for CFN-created TDs even though the CLI/SDK path (`RegisterTaskDefinition`) always set them. Workloads that read `registeredAt` (e.g. the ARMO ECS operator and other reconcilers) had to fall back to "now". The CFN path now mirrors the CLI path. Contributed by @YakirOren.
 
+---
+
 ## [1.3.37] — 2026-05-12
 
 ### Added
@@ -44,6 +52,8 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 - **S3 `UploadPartCopy` validates `x-amz-copy-source-range`** — the header was parsed with `rng.split("-")` and no validation, so malformed values (`bytes=abc-def`, extra dashes, missing prefix) raised an unhandled `ValueError` and surfaced as HTTP 500; reversed and out-of-bounds ranges silently produced wrong-sized parts. All malformed inputs now return 400 `InvalidArgument`; out-of-bounds includes the source object size in the error message. boto3 retries 5xx but fails fast on 4xx, so the prior 500 behaviour caused infinite client retry loops against MiniStack where real S3 would have failed immediately. Contributed by @mfurqaan31.
 - **S3 `_parse_bucket_key` strips absolute-form request targets** — AWS SDK for .NET v4 sends HTTP/1.1 requests with absolute-form targets (e.g. `PUT http://ministack:4566/bucket/key`); hypercorn passes the raw target through, so MS was parsing `http:` as the bucket name. The function now strips scheme + authority before parsing. Contributed by @mark-bray.
 
+---
+
 ## [1.3.36] — 2026-05-11
 
 ### Added
@@ -56,6 +66,8 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 - **RDS `DescribeDBClusterParameters` emits `<Source>` element** — the cluster-parameter response XML omitted `<Source>` entirely, so botocore materialized `Parameters[].Source` as `None` for every entry. Each emitted `<Parameter>` now includes `<Source>user</Source>`, matching the existing instance-level path. Note: MiniStack only stores user-modified parameters (engine defaults are not modelled); the literal `user` is correct for the slice MS currently returns but will need to become conditional once engine-defaults are added. Surfaced by the same brownfield-import diffing. Contributed by @jayjanssen.
 - **CUR report definitions lost on warm-boot** — the CUR module declared `get_state()` and `restore_state()` but the `load_state("cur")` call at import time was missing, so MiniStack wrote state on shutdown and never read it on restart. Standard import-time block added; `PERSIST_STATE=1` now correctly survives across container restarts for CUR.
 - **IAM `AttachmentCount` on AWS-managed policies reset on warm-boot** — the per-(session-account, arn) sidecar `_aws_managed_attachment_counts` added with the AWS-managed-policies work was missing from `get_state` / `restore_state`. Customer-managed `AttachmentCount` already persisted via the policy record itself; only the AWS-managed-policy sidecar was dropped. Now wired in.
+
+---
 
 ## [1.3.35] — 2026-05-11
 
