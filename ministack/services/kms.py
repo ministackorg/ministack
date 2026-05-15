@@ -580,9 +580,18 @@ def _decrypt(data):
         rec = _resolve_key(embedded_id)
 
     if not rec:
+        # AWS rule: NotFoundException only when the caller named a specific
+        # KeyId that doesn't exist. A short/garbage ciphertext with no
+        # explicit KeyId can't be parsed → InvalidCiphertextException.
+        if key_id_from_data:
+            return error_response_json(
+                "NotFoundException",
+                f"Key {key_id_from_data} not found",
+                400,
+            )
         return error_response_json(
-            "NotFoundException",
-            "Unable to find the key for decryption",
+            "InvalidCiphertextException",
+            "",
             400,
         )
     err = _check_key_state(rec)
