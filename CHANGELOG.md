@@ -7,6 +7,13 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [1.3.41] — 2026-05-16
+
+### Fixed
+- **KMS `Decrypt` error code on malformed ciphertext** — when the caller omitted `KeyId` and the ciphertext was too short or otherwise unparseable, MiniStack returned `NotFoundException` ("Unable to find the key for decryption"); real AWS returns `InvalidCiphertextException` in that case. The two errors are distinguished by AWS-SDK clients that catch encryption faults separately from key-lookup faults (e.g., wrapper libraries that retry on `NotFound` but surface `InvalidCiphertext` immediately). `NotFoundException` is still returned when the caller did pass an explicit `KeyId` that doesn't resolve, matching real AWS.
+
+---
+
 ## [1.3.40] — 2026-05-15
 
 ### Added
