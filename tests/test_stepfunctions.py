@@ -3963,3 +3963,81 @@ def test_sfn_create_alias_rejects_malformed_routing_config(sfn):
             assert exc_info.value.response["Error"]["Code"] == "ValidationException"
     finally:
         sfn.delete_state_machine(stateMachineArn=sm_arn)
+
+
+# ---------------------------------------------------------------------------
+# Regression: contextvars propagation to background execution thread (#639)
+# ---------------------------------------------------------------------------
+
+
+def test_sfn_execution_proceeds_under_non_default_account_id():
+    """Execution background thread must inherit the request's account context.
+
+    When a caller uses a 12-digit access-key as their account ID (the
+    documented per-account-isolation pattern), the execution record is stored
+    in AccountScopedDict under that account. Without contextvars propagation
+    into the threading.Thread that runs _run_execution, the worker thread
+    looks up the execution under the default account and silently returns,
+    leaving the execution stuck at ExecutionStarted forever.
+
+    Regression for #639. The fix wraps the background thread target with
+    contextvars.copy_context().run so the request's account/region context
+    survives the thread hop.
+    """
+    import boto3
+    from botocore.config import Config
+
+    # Borrow ENDPOINT + REGION from conftest's _default_kwargs without
+    # importing private names; rebuild a client with a 12-digit access key.
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+    region = os.environ.get("MINISTACK_REGION", "us-east-1")
+
+    alt_account_id = "123456789012"  # AWS docs placeholder account
+    alt_kwargs = dict(
+        endpoint_url=endpoint,
+        aws_access_key_id=alt_account_id,
+        aws_secret_access_key="test",
+        region_name=region,
+        config=Config(region_name=region, retries={"max_attempts": 0}),
+    )
+    sfn = boto3.client("stepfunctions", **alt_kwargs)
+
+    uid = _uuid_mod.uuid4().hex[:8]
+    sm_name = f"ctxvars-{uid}"
+    sm = sfn.create_state_machine(
+        name=sm_name,
+        definition=json.dumps(
+            {
+                "StartAt": "P",
+                "States": {"P": {"Type": "Pass", "End": True}},
+            }
+        ),
+        roleArn=f"arn:aws:iam::{alt_account_id}:role/r",
+        type="STANDARD",
+    )
+    sm_arn = sm["stateMachineArn"]
+    try:
+        # ARN must be scoped to the alt account, not 000000000000.
+        assert f":states:{region}:{alt_account_id}:stateMachine:" in sm_arn
+
+        exec_resp = sfn.start_execution(
+            stateMachineArn=sm_arn,
+            name=f"e-{uid}",
+            input="{}",
+        )
+        desc = _wait_sfn(sfn, exec_resp["executionArn"], timeout=10)
+        assert desc["status"] == "SUCCEEDED", (
+            f"Execution under account {alt_account_id} stalled at "
+            f"{desc['status']!r}. Background thread lost the account "
+            f"contextvars — see issue #639."
+        )
+
+        # History must have progressed past ExecutionStarted.
+        hist = sfn.get_execution_history(executionArn=exec_resp["executionArn"])
+        event_types = [e["type"] for e in hist["events"]]
+        assert "ExecutionStarted" in event_types
+        assert "ExecutionSucceeded" in event_types, (
+            f"Execution never reached terminal Succeed; events: {event_types}"
+        )
+    finally:
+        sfn.delete_state_machine(stateMachineArn=sm_arn)
