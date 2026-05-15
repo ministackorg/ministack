@@ -1,7 +1,9 @@
+import io
 import json
 import os
 import re
 import time
+import zipfile
 from datetime import datetime
 from urllib.parse import urlparse
 
@@ -943,6 +945,148 @@ def test_s3_event_notification_to_sqs(s3, sqs):
     body = json.loads(s3_msgs[0]["Body"])
     assert body["Records"][0]["eventSource"] == "aws:s3"
     assert body["Records"][0]["s3"]["object"]["key"] == "test-notify.txt"
+
+
+def test_s3_event_notification_to_lambda(s3, lam):
+    """S3 → Lambda direct notification: PutObject invokes the configured Lambda.
+
+    Regression test for the (closed-as-invalid) silent-no-op claim — the code
+    path at ministack.services.s3._deliver_event_to_lambda was implemented but
+    had no end-to-end test, so reports of breakage couldn't be verified without
+    spinning up a full reproducer.
+
+    The Lambda writes a marker key back into the source bucket; the test
+    asserts the marker exists after PutObject + a brief async wait.
+    """
+    bucket = "s3-evt-lambda-bkt"
+    marker = "lambda-invoked-marker"
+    func_name = "s3-evt-lambda-handler"
+
+    code = (
+        "import boto3, os\n"
+        "def handler(event, context):\n"
+        f"    s3 = boto3.client('s3', endpoint_url=os.environ.get('AWS_ENDPOINT_URL'))\n"
+        f"    s3.put_object(Bucket='{bucket}', Key='{marker}', Body=b'invoked')\n"
+        "    return {'ok': True}\n"
+    )
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("index.py", code)
+    zip_bytes = buf.getvalue()
+
+    lam.create_function(
+        FunctionName=func_name,
+        Runtime="python3.12",
+        Role="arn:aws:iam::000000000000:role/lambda-role",
+        Handler="index.handler",
+        Code={"ZipFile": zip_bytes},
+        Environment={"Variables": {"AWS_ENDPOINT_URL": "http://ministack:4566"}},
+    )
+    func_arn = (
+        f"arn:aws:lambda:us-east-1:000000000000:function:{func_name}"
+    )
+
+    s3.create_bucket(Bucket=bucket)
+    s3.put_bucket_notification_configuration(
+        Bucket=bucket,
+        NotificationConfiguration={
+            "LambdaFunctionConfigurations": [{
+                "Id": "lambda-cfg",
+                "LambdaFunctionArn": func_arn,
+                "Events": ["s3:ObjectCreated:*"],
+            }],
+        },
+    )
+    s3.put_object(Bucket=bucket, Key="trigger.txt", Body=b"fire")
+
+    # Async invocation — poll briefly for the marker.
+    for _ in range(20):
+        try:
+            s3.head_object(Bucket=bucket, Key=marker)
+            return  # Lambda fired and wrote the marker.
+        except Exception:
+            time.sleep(0.25)
+    pytest.fail(
+        f"Lambda was not invoked: marker {marker!r} never appeared in "
+        f"bucket {bucket!r} after PutObject (5s wait)."
+    )
+
+
+def test_s3_event_notification_to_lambda_with_filter(s3, lam):
+    """S3 → Lambda notification respects S3Key prefix/suffix filters.
+
+    Same regression class as the basic Lambda test: the filter code at
+    ministack.services.s3._key_matches_filter is wired into the SQS+SNS+Lambda
+    dispatch paths uniformly, but only SQS had an end-to-end test of filter
+    application; Lambda's path was untested.
+    """
+    bucket = "s3-evt-lambda-filter-bkt"
+    func_name = "s3-evt-lambda-filter-handler"
+
+    code = (
+        "import boto3, os, json\n"
+        "def handler(event, context):\n"
+        "    s3 = boto3.client('s3', endpoint_url=os.environ.get('AWS_ENDPOINT_URL'))\n"
+        f"    key = event['Records'][0]['s3']['object']['key']\n"
+        f"    s3.put_object(Bucket='{bucket}', Key=f'invoked-for-' + key, Body=b'1')\n"
+        "    return {'ok': True}\n"
+    )
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("index.py", code)
+    zip_bytes = buf.getvalue()
+
+    lam.create_function(
+        FunctionName=func_name,
+        Runtime="python3.12",
+        Role="arn:aws:iam::000000000000:role/lambda-role",
+        Handler="index.handler",
+        Code={"ZipFile": zip_bytes},
+        Environment={"Variables": {"AWS_ENDPOINT_URL": "http://ministack:4566"}},
+    )
+    func_arn = (
+        f"arn:aws:lambda:us-east-1:000000000000:function:{func_name}"
+    )
+
+    s3.create_bucket(Bucket=bucket)
+    s3.put_bucket_notification_configuration(
+        Bucket=bucket,
+        NotificationConfiguration={
+            "LambdaFunctionConfigurations": [{
+                "Id": "lambda-filter-cfg",
+                "LambdaFunctionArn": func_arn,
+                "Events": ["s3:ObjectCreated:*"],
+                "Filter": {"Key": {"FilterRules": [
+                    {"Name": "suffix", "Value": ".csv"},
+                ]}},
+            }],
+        },
+    )
+    s3.put_object(Bucket=bucket, Key="data.txt", Body=b"no match")
+    s3.put_object(Bucket=bucket, Key="data.csv", Body=b"match")
+
+    # Wait briefly, then assert the filter applied — only the .csv invocation
+    # should have produced an "invoked-for-data.csv" marker, NOT one for .txt.
+    seen_csv = False
+    seen_txt = False
+    for _ in range(20):
+        try:
+            s3.head_object(Bucket=bucket, Key="invoked-for-data.csv")
+            seen_csv = True
+        except Exception:
+            pass
+        try:
+            s3.head_object(Bucket=bucket, Key="invoked-for-data.txt")
+            seen_txt = True
+        except Exception:
+            pass
+        if seen_csv:
+            break
+        time.sleep(0.25)
+
+    assert seen_csv, "Lambda was not invoked for the .csv match"
+    assert not seen_txt, "Lambda was incorrectly invoked for the filtered-out .txt object"
+
 
 def test_s3_event_notification_filter(s3, sqs):
     s3.create_bucket(Bucket="s3-evt-filter-bkt")
