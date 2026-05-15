@@ -13,7 +13,7 @@ User Pools operations:
   AdminSetUserPassword, AdminUpdateUserAttributes,
   AdminInitiateAuth, AdminRespondToAuthChallenge,
   InitiateAuth, RespondToAuthChallenge, SignUp, ConfirmSignUp,
-  ForgotPassword, ConfirmForgotPassword, ChangePassword,
+  ResendConfirmationCode, ForgotPassword, ConfirmForgotPassword, ChangePassword,
   GetUser, UpdateUserAttributes, DeleteUser,
   AdminAddUserToGroup, AdminRemoveUserFromGroup,
   AdminListGroupsForUser, AdminListUserAuthEvents,
@@ -866,6 +866,7 @@ def _dispatch_idp(action: str, data: dict):
         # Self-service
         "SignUp": _sign_up,
         "ConfirmSignUp": _confirm_sign_up,
+        "ResendConfirmationCode": _resend_confirmation_code,
         "ForgotPassword": _forgot_password,
         "ConfirmForgotPassword": _confirm_forgot_password,
         "ChangePassword": _change_password,
@@ -1204,6 +1205,176 @@ def _validate_password(pool, password):
 
 
 # ===========================================================================
+# EMAIL DELIVERY (invitation + verification)
+# ===========================================================================
+
+# AWS Cognito's COGNITO_DEFAULT sender; can be overridden per pool via
+# EmailConfiguration.From or globally via the COGNITO_DEFAULT_FROM env var.
+_COGNITO_DEFAULT_FROM = "no-reply@verificationemail.com"
+
+# Default templates Cognito uses when InviteMessageTemplate /
+# VerificationMessageTemplate are not configured on the pool.
+_DEFAULT_INVITE_SUBJECT = "Your temporary password"
+_DEFAULT_INVITE_MESSAGE = (
+    "Your username is {username} and temporary password is {####}."
+)
+_DEFAULT_VERIFICATION_SUBJECT = "Your verification code"
+_DEFAULT_VERIFICATION_MESSAGE = "Your verification code is {####}."
+_DEFAULT_VERIFICATION_LINK_MESSAGE = (
+    "Please click the link below to verify your email address. {##Verify Email##}"
+)
+
+
+def _cognito_email_enabled() -> bool:
+    val = os.environ.get("COGNITO_EMAIL_ENABLED", "true").strip().lower()
+    return val not in ("0", "false", "no", "off", "disabled")
+
+
+def _resolve_email_sender(pool: dict) -> tuple:
+    """Resolve (from, reply_to, configuration_set) from the pool's EmailConfiguration.
+
+    Falls back to the COGNITO_DEFAULT sender, mirroring real AWS behaviour
+    where EmailSendingAccount=COGNITO_DEFAULT uses no-reply@verificationemail.com.
+    A user-supplied From always wins, regardless of EmailSendingAccount.
+    """
+    cfg = pool.get("EmailConfiguration") or {}
+    from_addr = cfg.get("From") or cfg.get("FromEmailAddress") or ""
+    if not from_addr:
+        from_addr = os.environ.get("COGNITO_DEFAULT_FROM", _COGNITO_DEFAULT_FROM)
+    reply_to = cfg.get("ReplyToEmailAddress") or ""
+    config_set = cfg.get("ConfigurationSet") or ""
+    return from_addr, reply_to, config_set
+
+
+def _expand_template(template: str, username: str, code: str) -> str:
+    """Apply Cognito's `{username}` and `{####}` placeholder substitutions."""
+    if not template:
+        return ""
+    return template.replace("{username}", username or "").replace("{####}", code or "")
+
+
+def _resolve_invite_template(pool: dict) -> tuple:
+    """Return (subject, message_text, message_html) for invitation mail."""
+    tpl = (pool.get("AdminCreateUserConfig") or {}).get("InviteMessageTemplate") or {}
+    subject = tpl.get("EmailSubject") or _DEFAULT_INVITE_SUBJECT
+    body = tpl.get("EmailMessage") or _DEFAULT_INVITE_MESSAGE
+    # AWS lets EmailMessage be HTML; we store the same text in both slots when
+    # the template doesn't disambiguate. SMS template is intentionally ignored.
+    return subject, body, ""
+
+
+def _resolve_verification_template(pool: dict, by_link: bool = False) -> tuple:
+    """Return (subject, message_text) for verification/forgot-password mail."""
+    tpl = pool.get("VerificationMessageTemplate") or {}
+    if by_link:
+        subject = (
+            tpl.get("EmailSubjectByLink")
+            or pool.get("EmailVerificationSubject")
+            or _DEFAULT_VERIFICATION_SUBJECT
+        )
+        body = (
+            tpl.get("EmailMessageByLink")
+            or _DEFAULT_VERIFICATION_LINK_MESSAGE
+        )
+        return subject, body
+    subject = (
+        tpl.get("EmailSubject")
+        or pool.get("EmailVerificationSubject")
+        or _DEFAULT_VERIFICATION_SUBJECT
+    )
+    body = (
+        tpl.get("EmailMessage")
+        or pool.get("EmailVerificationMessage")
+        or _DEFAULT_VERIFICATION_MESSAGE
+    )
+    return subject, body
+
+
+def _looks_like_html(text: str) -> bool:
+    if not text:
+        return False
+    return bool(re.search(r"<[a-zA-Z/!][^>]*>", text))
+
+
+def _deliver_cognito_email(pool, to_email, subject, body, type_name, extra=None):
+    """Hand a fully-rendered message off to the SES recorder.
+
+    Skipped when COGNITO_EMAIL_ENABLED=false or recipient is missing.
+    Errors are swallowed so user-facing Cognito calls never fail because of
+    email-only problems (matches AWS, which reports delivery failures async).
+    """
+    if not _cognito_email_enabled() or not to_email:
+        return None
+    from_addr, reply_to, config_set = _resolve_email_sender(pool)
+    extras = dict(extra or {})
+    extras["UserPoolId"] = pool.get("Id", "")
+    if reply_to:
+        extras["ReplyToAddresses"] = [reply_to]
+    body_text = "" if _looks_like_html(body) else body
+    body_html = body if _looks_like_html(body) else ""
+    try:
+        from ministack.services import ses as ses_mod  # local import: avoid cycle
+        return ses_mod.send_internal_email(
+            source=from_addr,
+            to_addrs=[to_email],
+            subject=subject,
+            body_text=body_text,
+            body_html=body_html,
+            type_name=type_name,
+            config_set=config_set,
+            extra=extras,
+        )
+    except Exception:
+        logger.exception("Cognito: failed to record %s for pool %s", type_name, pool.get("Id"))
+        return None
+
+
+def _wants_email_delivery(data: dict) -> bool:
+    """Per AWS, DesiredDeliveryMediums defaults to ['SMS']. We treat the
+    parameter being absent as 'EMAIL' too so out-of-the-box flows that don't
+    pass it still surface invitation mail — AWS itself falls back when no
+    SmsConfiguration is set on the pool, which mirrors our SMS-less emulator.
+    """
+    mediums = data.get("DesiredDeliveryMediums")
+    if not mediums:
+        return True
+    return "EMAIL" in [str(m).upper() for m in mediums]
+
+
+def _send_invitation_email(pool, username, temp_password, attr_dict):
+    email = (attr_dict or {}).get("email")
+    if not email:
+        return None
+    subject_tpl, body_tpl, _ = _resolve_invite_template(pool)
+    subject = _expand_template(subject_tpl, username, temp_password)
+    body = _expand_template(body_tpl, username, temp_password)
+    return _deliver_cognito_email(
+        pool, email, subject, body,
+        type_name="CognitoInvitationMessage",
+        extra={"Username": username},
+    )
+
+
+def _send_verification_email(pool, username, attr_dict, code, attribute_name="email"):
+    email = (attr_dict or {}).get("email")
+    if not email:
+        return None
+    # CONFIRM_WITH_LINK means body uses {##...##} link placeholder; we still
+    # interpolate {####} as the verification code for compatibility.
+    by_link = (pool.get("VerificationMessageTemplate") or {}).get(
+        "DefaultEmailOption"
+    ) == "CONFIRM_WITH_LINK"
+    subject_tpl, body_tpl = _resolve_verification_template(pool, by_link=by_link)
+    subject = _expand_template(subject_tpl, username, code)
+    body = _expand_template(body_tpl, username, code)
+    return _deliver_cognito_email(
+        pool, email, subject, body,
+        type_name="CognitoVerificationMessage",
+        extra={"Username": username, "AttributeName": attribute_name},
+    )
+
+
+# ===========================================================================
 # USER MANAGEMENT
 # ===========================================================================
 
@@ -1216,7 +1387,21 @@ def _admin_create_user(data):
     username = data.get("Username")
     if not username:
         return error_response_json("InvalidParameterException", "Username is required.", 400)
-    if username in pool["_users"]:
+
+    message_action = (data.get("MessageAction") or "").upper()
+    existing = pool["_users"].get(username)
+    if message_action == "RESEND":
+        if not existing:
+            return error_response_json(
+                "UserNotFoundException", "User does not exist.", 400,
+            )
+        existing["UserLastModifiedDate"] = _now_epoch()
+        attr_dict = _attr_list_to_dict(existing.get("Attributes", []))
+        if _wants_email_delivery(data):
+            _send_invitation_email(pool, username, existing.get("_password", ""), attr_dict)
+        return json_response({"User": _user_out(existing)})
+
+    if existing:
         return error_response_json(
             "UsernameExistsException",
             "User account already exists.", 400,
@@ -1249,6 +1434,10 @@ def _admin_create_user(data):
     pool["_users"][username] = user
     pool["EstimatedNumberOfUsers"] = len(pool["_users"])
     logger.info("Cognito: AdminCreateUser %s in pool %s", username, pid)
+
+    if message_action != "SUPPRESS" and _wants_email_delivery(data):
+        _send_invitation_email(pool, username, temp_password, attr_dict)
+
     return json_response({"User": _user_out(user)})
 
 
@@ -1404,7 +1593,40 @@ def _admin_reset_user_password(data):
         return err
     user["UserStatus"] = "RESET_REQUIRED"
     user["UserLastModifiedDate"] = _now_epoch()
+    code = "654321"
+    user["_reset_code"] = code
+    attrs = _attr_list_to_dict(user.get("Attributes", []))
+    _send_verification_email(pool, username, attrs, code, attribute_name="password")
     return json_response({})
+
+
+def _resend_confirmation_code(data):
+    cid = data.get("ClientId")
+    username = data.get("Username")
+
+    pool = None
+    for p in _user_pools.values():
+        if cid in p["_clients"]:
+            pool = p
+            break
+    if not pool:
+        return error_response_json("ResourceNotFoundException", f"Client {cid} not found.", 400)
+
+    user = pool["_users"].get(username)
+    if not user:
+        return error_response_json("UserNotFoundException", "User does not exist.", 400)
+
+    code = user.get("_confirmation_code") or "123456"
+    user["_confirmation_code"] = code
+    attrs = _attr_list_to_dict(user.get("Attributes", []))
+    _send_verification_email(pool, username, attrs, code)
+    return json_response({
+        "CodeDeliveryDetails": {
+            "Destination": attrs.get("email", ""),
+            "DeliveryMedium": "EMAIL",
+            "AttributeName": "email",
+        }
+    })
 
 
 def _admin_user_global_sign_out(data):
@@ -1819,6 +2041,7 @@ def _sign_up(data):
             "DeliveryMedium": "EMAIL",
             "AttributeName": "email",
         }
+        _send_verification_email(pool, username, attr_dict, user["_confirmation_code"])
     return json_response(resp)
 
 
@@ -1861,8 +2084,10 @@ def _forgot_password(data):
     if not user:
         return error_response_json("UserNotFoundException", "User does not exist.", 400)
 
-    user["_reset_code"] = "654321"
+    code = "654321"
+    user["_reset_code"] = code
     attrs = _attr_list_to_dict(user.get("Attributes", []))
+    _send_verification_email(pool, username, attrs, code, attribute_name="password")
     return json_response({
         "CodeDeliveryDetails": {
             "Destination": attrs.get("email", ""),

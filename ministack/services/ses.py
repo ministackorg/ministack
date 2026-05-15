@@ -159,6 +159,32 @@ def _send_email(params):
     cc_addrs = _collect_list(params, "Destination.CcAddresses.member")
     bcc_addrs = _collect_list(params, "Destination.BccAddresses.member")
 
+    msg_id = _record_send(
+        source=source,
+        to_addrs=to_addrs,
+        cc_addrs=cc_addrs,
+        bcc_addrs=bcc_addrs,
+        subject=subject,
+        body_text=body_text,
+        body_html=body_html,
+        type_name="SendEmail",
+        config_set=config_set,
+    )
+    return _xml(200, "SendEmailResponse",
+                f"<SendEmailResult><MessageId>{msg_id}</MessageId></SendEmailResult>")
+
+
+def _record_send(source, to_addrs, cc_addrs=None, bcc_addrs=None,
+                 subject="", body_text="", body_html="",
+                 type_name="SendEmail", config_set="", extra=None):
+    """Record a sent email and best-effort SMTP relay. Returns MessageId.
+
+    Used by both HTTP handlers and other in-process services (e.g. Cognito's
+    invitation/verification flows) so all simulated mail flows through SES.
+    """
+    to_addrs = list(to_addrs or [])
+    cc_addrs = list(cc_addrs or [])
+    bcc_addrs = list(bcc_addrs or [])
     msg_id = f"{new_uuid()}@email.amazonses.com"
     record = {
         "MessageId": msg_id,
@@ -167,22 +193,41 @@ def _send_email(params):
         "CC": cc_addrs,
         "BCC": bcc_addrs,
         "Subject": subject,
-        "BodyText": body_text,
-        "BodyHtml": body_html,
+        "BodyText": body_text or "",
+        "BodyHtml": body_html or "",
         "Timestamp": time.time(),
-        "Type": "SendEmail",
+        "Type": type_name,
     }
     if config_set:
         record["ConfigurationSetName"] = config_set
+    if extra:
+        record.update(extra)
     _sent_emails_list().append(record)
-    logger.info("SES SendEmail: %s -> %s | %s", source, to_addrs, subject)
+    logger.info("SES %s: %s -> %s | %s", type_name, source, to_addrs, subject)
     all_addrs = to_addrs + cc_addrs + bcc_addrs
     if all_addrs:
         mime_str = _build_mime_message(source, to_addrs, cc_addrs, bcc_addrs,
                                        subject, body_text, body_html, msg_id)
         _smtp_relay(source, all_addrs, mime_str)
-    return _xml(200, "SendEmailResponse",
-                f"<SendEmailResult><MessageId>{msg_id}</MessageId></SendEmailResult>")
+    return msg_id
+
+
+def send_internal_email(source, to_addrs, subject, body_text="", body_html="",
+                        type_name="InternalSend", config_set="", extra=None):
+    """Public hook for other emulated services to deliver mail through SES.
+
+    Returns the MessageId of the stored record.
+    """
+    return _record_send(
+        source=source,
+        to_addrs=to_addrs,
+        subject=subject,
+        body_text=body_text,
+        body_html=body_html,
+        type_name=type_name,
+        config_set=config_set,
+        extra=extra,
+    )
 
 
 def _send_raw_email(params):
