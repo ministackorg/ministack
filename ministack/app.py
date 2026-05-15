@@ -1539,14 +1539,21 @@ async def _handle_lifespan(scope, receive, send):
                 _load_persisted_state()
             # Start the Transfer Family SFTP listener after persistence is
             # loaded (so any restored Transfer servers/users are visible to
-            # the SSH auth callback). Cheap no-op if asyncssh isn't
-            # installed or SFTP_ENABLED=0.
-            try:
-                from ministack.services import transfer
+            # the SSH auth callback). When the user opts out via
+            # SFTP_ENABLED=0 we skip importing the transfer module entirely
+            # — its top-level `import asyncssh` pulls cryptography+OpenSSL
+            # (~2–4 MiB of heap, plus C-level SSL contexts) which is pure
+            # overhead for callers that aren't using Transfer Family.
+            _sftp_env = os.environ.get("SFTP_ENABLED", "").strip().lower()
+            if _sftp_env in ("0", "false", "no", "off"):
+                logger.debug("SFTP_ENABLED=%s — skipping transfer module import.", _sftp_env)
+            else:
+                try:
+                    from ministack.services import transfer
 
-                await transfer.sftp_start()
-            except Exception as e:
-                logger.warning("Transfer SFTP startup failed: %s", e)
+                    await transfer.sftp_start()
+                except Exception as e:
+                    logger.warning("Transfer SFTP startup failed: %s", e)
             # Start the EventBridge scheduler daemon explicitly. Module-import
             # autostart is gated by MINISTACK_TEST_NO_AUTOSTART so unit tests
             # don't race; lifespan.startup is the canonical place to spin it up.
@@ -1585,7 +1592,17 @@ async def _handle_lifespan(scope, receive, send):
 
 def _stop_docker_containers():
     """Stop all Docker containers managed by MiniStack (RDS, ECS, ElastiCache).
-    Uses container labels to find them — does not touch service state."""
+    Uses container labels to find them — does not touch service state.
+
+    Skip entirely if no Docker socket is available: importing the docker
+    SDK (and its requests/urllib3/idna transitive deps) costs ~1 MiB of
+    Python heap before we even know whether there's anything to clean.
+    """
+    sock = os.environ.get("DOCKER_HOST") or "unix:///var/run/docker.sock"
+    if sock.startswith("unix://"):
+        sock_path = sock[len("unix://"):]
+        if not os.path.exists(sock_path):
+            return
     try:
         import docker
 
