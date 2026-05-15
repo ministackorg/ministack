@@ -1924,6 +1924,14 @@ def main():
         config.keep_alive_timeout = 75
         config.loglevel = LOG_LEVEL.upper()
 
+        # USE_SSL=1 enables HTTPS — matches the behaviour previously provided
+        # by ministack/core/hypercorn_conf.py when the entrypoint was the
+        # hypercorn CLI. Self-signed cert auto-generated under TMPDIR, or BYO
+        # via MINISTACK_SSL_CERT + MINISTACK_SSL_KEY.
+        from ministack.core import tls as _tls
+        if _tls.use_ssl_enabled():
+            config.certfile, config.keyfile = _tls.resolve_tls_material()
+
         asyncio.run(hypercorn_serve(app, config))
     finally:
         _cleanup()
