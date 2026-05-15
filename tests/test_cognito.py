@@ -2720,6 +2720,124 @@ def test_auth_codes_survive_warm_boot(_enable_persistence):
     mod.reset()
 
 
+def test_cognito_alias_attributes_lookup_by_email(cognito_idp):
+    """AliasAttributes=['email'] lets users be looked up by email as Username."""
+    pid = cognito_idp.create_user_pool(
+        PoolName="AliasEmailPool",
+        AliasAttributes=["email"],
+        AutoVerifiedAttributes=["email"],
+    )["UserPool"]["Id"]
+    cognito_idp.admin_create_user(
+        UserPoolId=pid,
+        Username="alias-email-user",
+        UserAttributes=[
+            {"Name": "email", "Value": "alice@example.com"},
+            {"Name": "email_verified", "Value": "true"},
+        ],
+    )
+    user = cognito_idp.admin_get_user(UserPoolId=pid, Username="alice@example.com")
+    assert user["Username"] == "alias-email-user"
+
+
+def test_cognito_alias_attributes_lookup_by_preferred_username(cognito_idp):
+    """preferred_username alias doesn't require verification."""
+    pid = cognito_idp.create_user_pool(
+        PoolName="AliasPreferredPool",
+        AliasAttributes=["preferred_username"],
+    )["UserPool"]["Id"]
+    cognito_idp.admin_create_user(
+        UserPoolId=pid,
+        Username="alias-pref-user",
+        UserAttributes=[{"Name": "preferred_username", "Value": "alice_pref"}],
+    )
+    user = cognito_idp.admin_get_user(UserPoolId=pid, Username="alice_pref")
+    assert user["Username"] == "alias-pref-user"
+
+
+def test_cognito_alias_attributes_unverified_email_not_found(cognito_idp):
+    """Unverified email aliases should NOT resolve when email_verified=false."""
+    pid = cognito_idp.create_user_pool(
+        PoolName="AliasUnverifiedPool",
+        AliasAttributes=["email"],
+    )["UserPool"]["Id"]
+    cognito_idp.admin_create_user(
+        UserPoolId=pid,
+        Username="alias-unverified",
+        UserAttributes=[
+            {"Name": "email", "Value": "bob@example.com"},
+            {"Name": "email_verified", "Value": "false"},
+        ],
+    )
+    with pytest.raises(ClientError) as ex:
+        cognito_idp.admin_get_user(UserPoolId=pid, Username="bob@example.com")
+    assert ex.value.response["Error"]["Code"] == "UserNotFoundException"
+
+
+def test_cognito_alias_attributes_email_without_verified_flag_not_found(cognito_idp):
+    """Absent email_verified means alias is not resolvable (matches Cognito docs)."""
+    pid = cognito_idp.create_user_pool(
+        PoolName="AliasMissingVerifiedPool",
+        AliasAttributes=["email"],
+    )["UserPool"]["Id"]
+    cognito_idp.admin_create_user(
+        UserPoolId=pid,
+        Username="alias-missing-verified",
+        UserAttributes=[{"Name": "email", "Value": "noverify@example.com"}],
+    )
+    with pytest.raises(ClientError) as ex:
+        cognito_idp.admin_get_user(UserPoolId=pid, Username="noverify@example.com")
+    assert ex.value.response["Error"]["Code"] == "UserNotFoundException"
+
+
+def test_cognito_alias_attributes_auth_with_email(cognito_idp):
+    """InitiateAuth USER_PASSWORD_AUTH accepts the email alias as USERNAME."""
+    pid = cognito_idp.create_user_pool(
+        PoolName="AliasAuthPool",
+        AliasAttributes=["email"],
+    )["UserPool"]["Id"]
+    cid = cognito_idp.create_user_pool_client(
+        UserPoolId=pid,
+        ClientName="AliasAuthClient",
+        ExplicitAuthFlows=["ALLOW_USER_PASSWORD_AUTH"],
+    )["UserPoolClient"]["ClientId"]
+    cognito_idp.admin_create_user(
+        UserPoolId=pid,
+        Username="alias-auth-user",
+        UserAttributes=[
+            {"Name": "email", "Value": "carol@example.com"},
+            {"Name": "email_verified", "Value": "true"},
+        ],
+    )
+    cognito_idp.admin_set_user_password(
+        UserPoolId=pid, Username="alias-auth-user",
+        Password="StrongPass1!", Permanent=True,
+    )
+    resp = cognito_idp.initiate_auth(
+        ClientId=cid,
+        AuthFlow="USER_PASSWORD_AUTH",
+        AuthParameters={"USERNAME": "carol@example.com", "PASSWORD": "StrongPass1!"},
+    )
+    assert "AuthenticationResult" in resp
+
+
+def test_cognito_username_attributes_lookup_by_email(cognito_idp):
+    """UsernameAttributes also enables email-based lookup."""
+    pid = cognito_idp.create_user_pool(
+        PoolName="UsernameAttrsPool",
+        UsernameAttributes=["email"],
+    )["UserPool"]["Id"]
+    cognito_idp.admin_create_user(
+        UserPoolId=pid,
+        Username="dave-sub-uuid",
+        UserAttributes=[
+            {"Name": "email", "Value": "dave@example.com"},
+            {"Name": "email_verified", "Value": "true"},
+        ],
+    )
+    user = cognito_idp.admin_get_user(UserPoolId=pid, Username="dave@example.com")
+    assert user["Username"] == "dave-sub-uuid"
+
+
 def test_auth_codes_dict_types_are_plain_builtin_dict():
     """`_auth_codes` and `_authorization_codes` must remain plain `dict`
     instances. They're looked up by random unguessable token from a public
