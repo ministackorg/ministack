@@ -3616,6 +3616,67 @@ exports.handler = (event, ctx, cb) => {{
     assert result.get("status") == "ok", f"Handler failed: {result}"
     assert received.get("path") == "/test-cfn-response", "PUT not received by HTTP server"
     assert received.get("body") == "test"
+
+
+def test_nodejs_worker_aws_sdk_v3_stub_wire_roundtrip(lam, ssm):
+    """End-to-end: a Node.js Lambda using @aws-sdk/client-ssm's
+    PutParameterCommand actually creates a parameter on MiniStack's SSM
+    service. Guards against the JSON-RPC stub silently 404'ing or routing
+    to the wrong target prefix (the per-service hardcoded map can drift from
+    router.py undetected by the resolution-only tests).
+    """
+    import shutil
+
+    import uuid as _uuid
+    if not shutil.which("node"):
+        pytest.skip("node not found on PATH")
+
+    fname = f"sdk-roundtrip-{_uuid.uuid4().hex[:8]}"
+    param_name = f"/ministack-test/{_uuid.uuid4().hex[:8]}"
+    param_value = f"value-{_uuid.uuid4().hex[:8]}"
+    code = (
+        "const { SSMClient, PutParameterCommand } = require('@aws-sdk/client-ssm');\n"
+        "exports.handler = async (event) => {\n"
+        "  const client = new SSMClient({});\n"
+        "  await client.send(new PutParameterCommand({\n"
+        "    Name: event.name, Value: event.value, Type: 'String', Overwrite: true,\n"
+        "  }));\n"
+        "  return { ok: true };\n"
+        "};\n"
+    )
+    try:
+        lam.create_function(
+            FunctionName=fname,
+            Runtime="nodejs20.x",
+            Role="arn:aws:iam::000000000000:role/test-role",
+            Handler="index.handler",
+            Code={"ZipFile": _make_zip_js(code, "index.js")},
+        )
+        resp = lam.invoke(
+            FunctionName=fname,
+            Payload=json.dumps({"name": param_name, "value": param_value}).encode(),
+        )
+        body = resp["Payload"].read().decode()
+        assert resp["StatusCode"] == 200, f"Invoke failed: {body}"
+        assert "FunctionError" not in resp, f"Handler errored: {body}"
+        assert json.loads(body) == {"ok": True}, f"Unexpected body: {body}"
+
+        # The stub must have actually called SSM. Verify via boto3 — if the
+        # X-Amz-Target was wrong or the body didn't reach MS, this raises
+        # ParameterNotFound and the test fails.
+        fetched = ssm.get_parameter(Name=param_name)["Parameter"]
+        assert fetched["Value"] == param_value
+    finally:
+        try:
+            lam.delete_function(FunctionName=fname)
+        except Exception:
+            pass
+        try:
+            ssm.delete_parameter(Name=param_name)
+        except Exception:
+            pass
+
+
 def test_lambda_ruby_4_0_runtime_maps_to_official_image():
     """Lambda Ruby 4.0 runtime support (botocore 1.42.94 added the runtime).
     Maps to AWS's official Lambda Ruby 4.0 base image."""

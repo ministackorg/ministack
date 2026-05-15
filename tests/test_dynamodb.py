@@ -2652,3 +2652,123 @@ def test_dynamodb_attribute_updates_add_on_string_attribute_raises(ddb):
     assert exc_info.value.response["Error"]["Code"] == "ValidationException"
 
 
+# ---------------------------------------------------------------------------
+# UpdateExpression arithmetic + if_not_exists (issue #648)
+# ---------------------------------------------------------------------------
+
+def _make_counter_table(ddb, name):
+    ddb.create_table(
+        TableName=name,
+        AttributeDefinitions=[{"AttributeName": "PK", "AttributeType": "S"}],
+        KeySchema=[{"AttributeName": "PK", "KeyType": "HASH"}],
+        BillingMode="PAY_PER_REQUEST",
+    )
+
+
+def test_dynamodb_update_if_not_exists_minus_in_outer_parens(ddb):
+    """Regression for #648: `SET v = (if_not_exists(v, :d) - :amt)` lost the
+    arithmetic and assigned the resolved value directly. The outer parens
+    pinned every token to depth>0, so the top-level operator scan skipped
+    the `-` and silently dropped the subtraction.
+    """
+    table = "if-not-exists-minus-parens"
+    _make_counter_table(ddb, table)
+    try:
+        ddb.put_item(TableName=table, Item={"PK": {"S": "x"}, "v": {"N": "10000"}})
+        ddb.update_item(
+            TableName=table,
+            Key={"PK": {"S": "x"}},
+            UpdateExpression="SET #v = (if_not_exists(#v, :d) - :amt)",
+            ExpressionAttributeNames={"#v": "v"},
+            ExpressionAttributeValues={":d": {"N": "0"}, ":amt": {"N": "3000"}},
+        )
+        got = ddb.get_item(TableName=table, Key={"PK": {"S": "x"}})["Item"]["v"]
+        assert got == {"N": "7000"}
+    finally:
+        ddb.delete_table(TableName=table)
+
+
+def test_dynamodb_update_if_not_exists_plus_in_outer_parens(ddb):
+    """Same shape with `+` rather than `-` — both PLUS and MINUS go through
+    the same operator-scan branch, so both need the outer-paren strip.
+    """
+    table = "if-not-exists-plus-parens"
+    _make_counter_table(ddb, table)
+    try:
+        ddb.put_item(TableName=table, Item={"PK": {"S": "x"}, "v": {"N": "100"}})
+        ddb.update_item(
+            TableName=table,
+            Key={"PK": {"S": "x"}},
+            UpdateExpression="SET #v = (if_not_exists(#v, :d) + :amt)",
+            ExpressionAttributeNames={"#v": "v"},
+            ExpressionAttributeValues={":d": {"N": "0"}, ":amt": {"N": "42"}},
+        )
+        got = ddb.get_item(TableName=table, Key={"PK": {"S": "x"}})["Item"]["v"]
+        assert got == {"N": "142"}
+    finally:
+        ddb.delete_table(TableName=table)
+
+
+def test_dynamodb_update_if_not_exists_arithmetic_when_attribute_missing(ddb):
+    """When the attribute doesn't exist yet, `if_not_exists` resolves to the
+    default and the arithmetic still applies: `0 - 3000 = -3000`.
+    """
+    table = "if-not-exists-arith-missing"
+    _make_counter_table(ddb, table)
+    try:
+        ddb.put_item(TableName=table, Item={"PK": {"S": "x"}})  # no `v`
+        ddb.update_item(
+            TableName=table,
+            Key={"PK": {"S": "x"}},
+            UpdateExpression="SET #v = (if_not_exists(#v, :d) - :amt)",
+            ExpressionAttributeNames={"#v": "v"},
+            ExpressionAttributeValues={":d": {"N": "0"}, ":amt": {"N": "3000"}},
+        )
+        got = ddb.get_item(TableName=table, Key={"PK": {"S": "x"}})["Item"]["v"]
+        assert got == {"N": "-3000"}
+    finally:
+        ddb.delete_table(TableName=table)
+
+
+def test_dynamodb_update_arithmetic_without_outer_parens_still_works(ddb):
+    """Sanity: the pre-existing no-outer-parens form must keep working too —
+    `SET v = if_not_exists(v, :d) - :amt`.
+    """
+    table = "if-not-exists-no-parens"
+    _make_counter_table(ddb, table)
+    try:
+        ddb.put_item(TableName=table, Item={"PK": {"S": "x"}, "v": {"N": "10"}})
+        ddb.update_item(
+            TableName=table,
+            Key={"PK": {"S": "x"}},
+            UpdateExpression="SET #v = if_not_exists(#v, :d) - :amt",
+            ExpressionAttributeNames={"#v": "v"},
+            ExpressionAttributeValues={":d": {"N": "0"}, ":amt": {"N": "3"}},
+        )
+        got = ddb.get_item(TableName=table, Key={"PK": {"S": "x"}})["Item"]["v"]
+        assert got == {"N": "7"}
+    finally:
+        ddb.delete_table(TableName=table)
+
+
+def test_dynamodb_update_nested_parens_do_not_flatten_two_groups(ddb):
+    """`(a) + (b)` must NOT be flattened by the outer-paren strip — the
+    opening LPAREN doesn't match the final RPAREN. Numeric value of
+    `(:left) + (:right)` should be 10.
+    """
+    table = "nested-parens-two-groups"
+    _make_counter_table(ddb, table)
+    try:
+        ddb.put_item(TableName=table, Item={"PK": {"S": "x"}})
+        ddb.update_item(
+            TableName=table,
+            Key={"PK": {"S": "x"}},
+            UpdateExpression="SET v = (:left) + (:right)",
+            ExpressionAttributeValues={":left": {"N": "3"}, ":right": {"N": "7"}},
+        )
+        got = ddb.get_item(TableName=table, Key={"PK": {"S": "x"}})["Item"]["v"]
+        assert got == {"N": "10"}
+    finally:
+        ddb.delete_table(TableName=table)
+
+

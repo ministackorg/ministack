@@ -962,6 +962,7 @@ def _test_state(data):
     # for single-state definitions the state's own QueryLanguage still wins via
     # `_state_query_language`.
     ctx.setdefault("QueryLanguage", definition.get("QueryLanguage", "JSONPath"))
+    ctx.setdefault("variables", {})
 
     inspection_data = {}
     if inspection_level in ("DEBUG", "TRACE"):
@@ -1177,6 +1178,11 @@ def _run_execution(exec_arn):
             "Id": execution["stateMachineArn"],
             "Name": sm["name"],
         },
+        # JSONata workflow variables — bound via state `Assign` fields and
+        # referenced as `$name` in subsequent JSONata expressions. Scope is
+        # the whole execution (per AWS); Map/Parallel sub-branches share
+        # this dict with the parent, matching AWS semantics.
+        "variables": {},
     }
 
     try:
@@ -1279,6 +1285,9 @@ def _execute_pass(state_def, raw_input, ctx=None):
         # passes input through unchanged (matches AWS behavior — Pass with no
         # transformation is the identity state).
         output = _apply_jsonata_output(state_def, raw_input, ctx, default=raw_input)
+        # Pass has no API call, so `$states.result` in Assign expressions
+        # refers to the state's computed Output (per AWS docs).
+        _apply_state_assign(state_def, raw_input, ctx, result=output)
         return output, _next_or_end(state_def)
 
     effective = _apply_input_path(state_def, raw_input)
@@ -1375,6 +1384,9 @@ def _execute_task(state_def, raw_input, execution, ctx):
                     result=task_result,
                     default=task_result,
                 )
+                # Task `Assign` sees `$states.result` = raw API result (per
+                # AWS), not the post-Output transformed value.
+                _apply_state_assign(state_def, raw_input, ctx, result=task_result)
             else:
                 result = _apply_result_selector(state_def, task_result)
                 output = _apply_result_path(state_def, raw_input, result)
@@ -1417,6 +1429,10 @@ def _execute_task(state_def, raw_input, execution, ctx):
             else:
                 output = _apply_result_path_raw(
                     catcher.get("ResultPath", "$"), raw_input, error_output)
+            if query_language == "JSONata":
+                # Catch handlers can also carry `Assign`. `$states.errorOutput`
+                # is available here; `$states.result` is not (per AWS).
+                _apply_state_assign(catcher, raw_input, ctx, error_output=error_output)
             return output, catcher["Next"]
         raise last_error
 
@@ -1574,9 +1590,15 @@ def _execute_choice(state_def, raw_input, ctx=None):
                 # Per-branch Output (if present) takes precedence; otherwise
                 # input passes through unchanged.
                 output = _apply_jsonata_output(choice, raw_input, ctx, default=raw_input)
+                # Per-branch Assign — `$states.result` is not applicable on
+                # Choice (no API call); only `$states.input` and existing
+                # variables are usable.
+                _apply_state_assign(choice, raw_input, ctx)
                 return output, choice["Next"]
         default = state_def.get("Default")
         if default:
+            # State-level Assign applies when falling through to Default.
+            _apply_state_assign(state_def, raw_input, ctx)
             return raw_input, default
         raise _ExecutionError("States.NoChoiceMatched",
                               "No choice rule matched and no Default")
@@ -1963,6 +1985,29 @@ def _apply_jsonata_output(state_def, raw_input, ctx=None, result=None, error_out
     )
 
 
+def _apply_state_assign(state_def, raw_input, ctx, result=None, error_output=None):
+    """Evaluate a state's `Assign` field (JSONata only) and merge results
+    into ``ctx['variables']`` so later JSONata expressions can reference them
+    as ``$name``. Variables are execution-scoped per AWS.
+
+    Called after the state's output is computed so that `$states.result` in
+    Assign expressions sees the state's actual result.
+    """
+    if ctx is None:
+        return
+    if _state_query_language(state_def, ctx) != "JSONata":
+        return
+    assign = state_def.get("Assign")
+    if not isinstance(assign, dict):
+        return
+    variables = ctx.setdefault("variables", {})
+    for name, template in assign.items():
+        variables[name] = _apply_jsonata_template(
+            template, raw_input, ctx,
+            result=result, error_output=error_output,
+        )
+
+
 def _apply_jsonata_template(value, raw_input, ctx=None, result=None, error_output=None):
     if isinstance(value, str):
         if value.startswith("{%") and value.endswith("%}"):
@@ -1985,6 +2030,9 @@ def _apply_jsonata_template(value, raw_input, ctx=None, result=None, error_outpu
 def _evaluate_jsonata(expression, raw_input, ctx=None, result=None, error_output=None):
     states = {
         "input": raw_input,
+        # workflow-scoped variables — looked up by bare `$name` references
+        # in expressions. See `_eval_jsonata_primary`.
+        "_variables": (ctx or {}).get("variables", {}),
         "result": result,
         "errorOutput": error_output,
         "context": ctx or {},
@@ -2125,6 +2173,23 @@ def _eval_jsonata_primary(expr, states):
 
     if expr.startswith("$states."):
         return _resolve_jsonata_states_path(expr, states)
+
+    # Bare workflow variable reference: `$name` or `$name.dotted.path`.
+    # `$states.…` is already handled above; `$func(…)` was handled by the
+    # built-in function block above (variable refs have no `(`); so anything
+    # else starting with `$<alpha>` is a variable lookup. Issue #645.
+    if (len(expr) > 1
+            and expr[0] == "$"
+            and "(" not in expr
+            and re.fullmatch(r"\$[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*", expr)):
+        head, _dot, rest = expr[1:].partition(".")
+        variables = states.get("_variables", {})
+        if head not in variables:
+            raise ValueError(f"Undefined variable: ${head}")
+        value = variables[head]
+        if rest:
+            value = _resolve_dotted_path(rest, value)
+        return value
 
     if expr in ("true", "false", "null"):
         return {"true": True, "false": False, "null": None}[expr]

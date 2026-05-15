@@ -7,6 +7,20 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [1.3.40] — 2026-05-15
+
+### Added
+- **Cognito invitation and verification emails via SES** — `AdminCreateUser`, `SignUp`, `ResendConfirmationCode`, `ForgotPassword`, and `AdminResetUserPassword` now hand their welcome / temporary-password / verification mail to the in-process SES emulator, so simulated apps see the message in `/_ministack/ses/messages` and it relays via SMTP when `SMTP_HOST` is set. Mirrors AWS behaviour: `MessageAction=SUPPRESS` skips, `RESEND` re-sends, `DesiredDeliveryMediums=["SMS"]` excludes email, and template placeholders (`{username}`, `{####}`) expand. Sender resolves to `EmailConfiguration.From`, falling back to `no-reply@verificationemail.com` (overridable via `COGNITO_DEFAULT_FROM`); set `COGNITO_EMAIL_ENABLED=false` to short-circuit globally. Adds the previously-missing `ResendConfirmationCode` action while wiring the delivery path. Contributed by @kjdev.
+- **Step Functions JSONata `Assign` + workflow variables** — state-level `Assign` fields now bind values into an execution-scoped variable store, and later JSONata expressions can reference them as `$name` (with dotted-path access like `$user.email`). Pass `$states.result` resolves to the computed Output; Task `$states.result` to the raw API result; Catch handlers expose `$states.errorOutput`. Undefined references surface as `States.QueryEvaluationError`, matching the AWS error code for JSONata evaluation failures. Reported by @youngkwangk.
+
+### Fixed
+- **Cognito alias-attribute user lookup** — `_resolve_user` now honors the pool's `AliasAttributes` and `UsernameAttributes`, so signing in by `email` / `phone_number` / `preferred_username` resolves correctly. Email and phone aliases require the corresponding `_verified` attribute to equal `"true"` (matches AWS); `preferred_username` has no verification gate. The change routes `AdminInitiateAuth`, `InitiateAuth`, `AdminRespondToAuthChallenge`, `RespondToAuthChallenge`, `ConfirmSignUp`, `ForgotPassword`, `ConfirmForgotPassword`, and the hosted-UI `/login` form through the resolver — internal call sites that need the canonical username (group iteration, create-time uniqueness, post-code token issuance) are left untouched. Contributed by @rjmackay.
+- **SQS `ReceiveMessage` `InternalError` on FIFO queues with `RedrivePolicy`** — a double-JSON-encoded `RedrivePolicy` value slipped past `CreateQueue` / `SetQueueAttributes`, then crashed `_dlq_sweep` on receive because `json.loads` returned a string (not a dict) and `.get()` raised `AttributeError`. MiniStack now validates `RedrivePolicy` at intake (parseable JSON object with non-empty `deadLetterTargetArn` and numeric `maxReceiveCount` between 1 and 1000) and rejects malformed values with `InvalidAttributeValue` (400), matching real AWS. Receive carries a defensive guard so legacy persisted state doesn't crash. Reported by @rbonestell.
+- **DynamoDB `if_not_exists` arithmetic in `SET` expressions** — `SET v = (if_not_exists(v, :d) - :amt)` previously dropped the arithmetic and assigned the resolved value directly: the outer parens kept every token at depth > 0, so the top-level operator scan never saw the `-` at depth 0. `_eval_set_value` now strips a single layer of matched outer parens before parsing, guarded so `(a) + (b)` (two adjacent groups) isn't accidentally flattened. Reported by @youngkwangk.
+- **S3 → Lambda notifications fire for non-boto3 SDK clients** — MiniStack's notification XML parser only recognised the legacy `<CloudFunction>` ARN tag, which is what botocore wire-serialises `LambdaFunctionArn` as. AWS SDK for Java v2, Go SDK, Terraform's `aws_s3_bucket_notification`, and any hand-crafted XML send the modern `<LambdaFunctionArn>` tag — MiniStack silently dropped those configs, so uploads succeeded but the Lambda never fired. Both shapes are now accepted, matching real S3. Reported by @michael-denyer.
+
+---
+
 ## [1.3.39] — 2026-05-15
 
 ### Added

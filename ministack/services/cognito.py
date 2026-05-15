@@ -616,20 +616,44 @@ def _resolve_pool(pool_id: str):
 
 
 def _resolve_user(pool: dict, username: str):
+    if username is None:
+        return None, error_response_json(
+            "UserNotFoundException", "User does not exist.", 400,
+        )
+
     user = pool["_users"].get(username)
-    if not user:
-        # Real AWS also accepts the user's 'sub' UUID as Username.
+    if user:
+        return user, None
+
+    # Real AWS also accepts the user's 'sub' UUID as Username.
+    for u in pool["_users"].values():
+        attrs = _attr_list_to_dict(u.get("Attributes", []))
+        if attrs.get("sub") == username:
+            return u, None
+
+    # AliasAttributes (email, phone_number, preferred_username) and
+    # UsernameAttributes (email, phone_number) let users sign in / be looked
+    # up via those attribute values. Real Cognito requires email/phone aliases
+    # to be verified (email_verified/phone_number_verified == "true") before
+    # the alias resolves; preferred_username has no verification requirement.
+    alias_attrs = set(pool.get("AliasAttributes") or []) | set(
+        pool.get("UsernameAttributes") or []
+    )
+    if alias_attrs:
         for u in pool["_users"].values():
             attrs = _attr_list_to_dict(u.get("Attributes", []))
-            if attrs.get("sub") == username:
-                user = u
-                break
-    if not user:
-        return None, error_response_json(
-            "UserNotFoundException",
-            f"User {username} does not exist.", 400,
-        )
-    return user, None
+            for alias in alias_attrs:
+                if attrs.get(alias) != username:
+                    continue
+                if alias in ("email", "phone_number"):
+                    if str(attrs.get(f"{alias}_verified", "")).lower() != "true":
+                        continue
+                return u, None
+
+    return None, error_response_json(
+        "UserNotFoundException",
+        f"User {username} does not exist.", 400,
+    )
 
 
 def _user_out(user: dict) -> dict:
@@ -1766,9 +1790,9 @@ def _admin_initiate_auth(data):
     if auth_flow in ("ADMIN_USER_PASSWORD_AUTH", "ADMIN_NO_SRP_AUTH"):
         username = auth_params.get("USERNAME")
         password = auth_params.get("PASSWORD")
-        user = pool["_users"].get(username)
-        if not user:
-            return error_response_json("UserNotFoundException", "User does not exist.", 400)
+        user, _err = _resolve_user(pool, username)
+        if _err:
+            return _err
         if not user.get("Enabled", True):
             return error_response_json("NotAuthorizedException", "User is disabled.", 400)
         if user.get("_password") and user["_password"] != password:
@@ -1821,9 +1845,9 @@ def _admin_respond_to_auth_challenge(data):
     if challenge_name == "NEW_PASSWORD_REQUIRED":
         username = responses.get("USERNAME")
         new_password = responses.get("NEW_PASSWORD")
-        user = pool["_users"].get(username)
-        if not user:
-            return error_response_json("UserNotFoundException", "User does not exist.", 400)
+        user, _err = _resolve_user(pool, username)
+        if _err:
+            return _err
         if new_password:
             user["_password"] = new_password
         user["UserStatus"] = "CONFIRMED"
@@ -1832,25 +1856,25 @@ def _admin_respond_to_auth_challenge(data):
 
     if challenge_name == "SMS_MFA":
         username = responses.get("USERNAME")
-        user = pool["_users"].get(username)
-        if not user:
-            return error_response_json("UserNotFoundException", "User does not exist.", 400)
+        user, _err = _resolve_user(pool, username)
+        if _err:
+            return _err
         return json_response({"AuthenticationResult": _build_auth_result(pid, cid, user)})
 
     if challenge_name == "SOFTWARE_TOKEN_MFA":
         username = responses.get("USERNAME")
-        user = pool["_users"].get(username)
-        if not user:
-            return error_response_json("UserNotFoundException", "User does not exist.", 400)
+        user, _err = _resolve_user(pool, username)
+        if _err:
+            return _err
         # Accept any TOTP code in emulator — no real TOTP validation
         return json_response({"AuthenticationResult": _build_auth_result(pid, cid, user)})
 
     if challenge_name == "MFA_SETUP":
         # Triggered when pool MFA=ON but user hasn't enrolled yet
         username = responses.get("USERNAME")
-        user = pool["_users"].get(username)
-        if not user:
-            return error_response_json("UserNotFoundException", "User does not exist.", 400)
+        user, _err = _resolve_user(pool, username)
+        if _err:
+            return _err
         return json_response({"AuthenticationResult": _build_auth_result(pid, cid, user)})
 
     return error_response_json("InvalidParameterException", f"Unsupported challenge: {challenge_name}", 400)
@@ -1876,9 +1900,9 @@ def _initiate_auth(data):
     if auth_flow in ("USER_PASSWORD_AUTH",):
         username = auth_params.get("USERNAME")
         password = auth_params.get("PASSWORD")
-        user = pool["_users"].get(username)
-        if not user:
-            return error_response_json("UserNotFoundException", "User does not exist.", 400)
+        user, _err = _resolve_user(pool, username)
+        if _err:
+            return _err
         if not user.get("Enabled", True):
             return error_response_json("NotAuthorizedException", "User is disabled.", 400)
         if user.get("_password") and user["_password"] != password:
@@ -1949,9 +1973,9 @@ def _respond_to_auth_challenge(data):
     if challenge_name in ("NEW_PASSWORD_REQUIRED", "PASSWORD_VERIFIER"):
         username = responses.get("USERNAME")
         new_password = responses.get("NEW_PASSWORD") or responses.get("PASSWORD")
-        user = pool["_users"].get(username)
-        if not user:
-            return error_response_json("UserNotFoundException", "User does not exist.", 400)
+        user, _err = _resolve_user(pool, username)
+        if _err:
+            return _err
         if new_password:
             user["_password"] = new_password
         user["UserStatus"] = "CONFIRMED"
@@ -1960,9 +1984,9 @@ def _respond_to_auth_challenge(data):
 
     if challenge_name in ("SOFTWARE_TOKEN_MFA", "MFA_SETUP"):
         username = responses.get("USERNAME")
-        user = pool["_users"].get(username)
-        if not user:
-            return error_response_json("UserNotFoundException", "User does not exist.", 400)
+        user, _err = _resolve_user(pool, username)
+        if _err:
+            return _err
         # Accept any TOTP code in emulator
         return json_response({"AuthenticationResult": _build_auth_result(pid, cid, user)})
 
@@ -2058,9 +2082,9 @@ def _confirm_sign_up(data):
     if not pool:
         return error_response_json("ResourceNotFoundException", f"Client {cid} not found.", 400)
 
-    user = pool["_users"].get(username)
-    if not user:
-        return error_response_json("UserNotFoundException", "User does not exist.", 400)
+    user, err = _resolve_user(pool, username)
+    if err:
+        return err
 
     # Accept any code in emulation
     user["UserStatus"] = "CONFIRMED"
@@ -2080,9 +2104,9 @@ def _forgot_password(data):
     if not pool:
         return error_response_json("ResourceNotFoundException", f"Client {cid} not found.", 400)
 
-    user = pool["_users"].get(username)
-    if not user:
-        return error_response_json("UserNotFoundException", "User does not exist.", 400)
+    user, _err = _resolve_user(pool, username)
+    if _err:
+        return _err
 
     code = "654321"
     user["_reset_code"] = code
@@ -2110,9 +2134,9 @@ def _confirm_forgot_password(data):
     if not pool:
         return error_response_json("ResourceNotFoundException", f"Client {cid} not found.", 400)
 
-    user = pool["_users"].get(username)
-    if not user:
-        return error_response_json("UserNotFoundException", "User does not exist.", 400)
+    user, _err = _resolve_user(pool, username)
+    if _err:
+        return _err
 
     # Accept any confirmation code in emulation (real AWS validates against issued code)
     pw_err = _validate_password(pool, new_password)
@@ -3179,8 +3203,9 @@ def handle_login_submit(method, path, headers, body, query_params):
 
     # Authenticate user
     error_msg = ""
-    user = pool["_users"].get(username)
-    if not user:
+    user, _err = _resolve_user(pool, username)
+    if _err:
+        user = None
         error_msg = "Incorrect username or password."
     elif not user.get("Enabled", True):
         error_msg = "User is disabled."
