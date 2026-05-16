@@ -149,8 +149,34 @@ def _wait_for_port(host, port, timeout=120):
     return False
 
 
+def _capture_v2_admin_password(env, container):
+    """Pull the Airflow 2 standalone admin password out of the container so
+    proxied REST calls can authenticate. Standalone writes the password to
+    ``/opt/airflow/standalone_admin_password.txt`` on first launch.
+    """
+    for _ in range(12):  # up to ~60s — standalone writes the file after webserver init
+        try:
+            rc, out = container.exec_run(
+                "cat /opt/airflow/standalone_admin_password.txt"
+            )
+            if rc == 0:
+                pw = (out.decode("utf-8") if isinstance(out, bytes) else str(out)).strip()
+                if pw:
+                    env["_v2_admin_password"] = pw
+                    logger.info("MWAA: captured Airflow 2 standalone admin password for %s", env.get("Name"))
+                    return
+        except Exception:
+            pass
+        time.sleep(5)
+    logger.warning("MWAA: failed to capture Airflow 2 standalone admin password for %s", env.get("Name"))
+
+
 def _sync_dags_from_s3(env, docker_client, container):
-    """Copy DAG files from ministack S3 into the Airflow container's dags folder."""
+    """Copy DAG files from ministack S3 into the Airflow container's dags folder.
+
+    Reads directly from the S3 service's internal ``_buckets`` store rather
+    than going through HTTP — same process, same account context, much faster.
+    """
     try:
         from ministack.services import s3 as s3_svc
         bucket_arn = env.get("SourceBucketArn", "")
@@ -160,9 +186,21 @@ def _sync_dags_from_s3(env, docker_client, container):
         if not bucket_name:
             return
 
-        objects = s3_svc._list_objects(bucket_name, prefix=dag_path)
-        if not objects:
-            logger.info("MWAA: no DAGs found in s3://%s/%s", bucket_name, dag_path)
+        bucket = s3_svc._buckets.get(bucket_name)
+        if not bucket:
+            logger.info("MWAA: source bucket %s not found in S3", bucket_name)
+            return
+
+        # Collect every object under DagS3Path. S3 keys are flat strings; treat
+        # DagS3Path as a prefix and recurse implicitly (any key starting with
+        # it is in scope).
+        prefix = dag_path if dag_path.endswith("/") else dag_path + "/"
+        matched = [
+            (key, obj) for key, obj in bucket.get("objects", {}).items()
+            if key.startswith(prefix) and key.endswith(".py")
+        ]
+        if not matched:
+            logger.info("MWAA: no DAGs found in s3://%s/%s", bucket_name, prefix)
             return
 
         import io
@@ -170,20 +208,25 @@ def _sync_dags_from_s3(env, docker_client, container):
 
         tar_buffer = io.BytesIO()
         with tarfile.open(fileobj=tar_buffer, mode="w") as tar:
-            for obj_key, obj_data in objects:
-                relative = obj_key[len(dag_path):].lstrip("/")
-                if not relative or not relative.endswith(".py"):
+            for obj_key, obj_data in matched:
+                relative = obj_key[len(prefix):].lstrip("/")
+                if not relative:
                     continue
-                body = obj_data.get("body", b"")
+                body = obj_data.get("body", b"") if isinstance(obj_data, dict) else b""
                 if isinstance(body, str):
                     body = body.encode("utf-8")
                 info = tarfile.TarInfo(name=f"dags/{relative}")
                 info.size = len(body)
+                info.mode = 0o644
+                info.mtime = int(time.time())
                 tar.addfile(info, io.BytesIO(body))
 
         tar_buffer.seek(0)
         container.put_archive("/opt/airflow", tar_buffer)
-        logger.info("MWAA: synced DAGs from s3://%s/%s", bucket_name, dag_path)
+        logger.info(
+            "MWAA: synced %d DAG file(s) from s3://%s/%s",
+            len(matched), bucket_name, prefix,
+        )
     except Exception:
         logger.exception("MWAA: failed to sync DAGs from S3")
 
@@ -210,6 +253,12 @@ def _start_airflow_container(env_name, env):
         "AIRFLOW__CORE__EXECUTOR": "SequentialExecutor",
         "AIRFLOW__CORE__LOAD_EXAMPLES": "false",
         "AIRFLOW__CORE__DAGS_FOLDER": "/opt/airflow/dags",
+        # Force the dag-processor to scan aggressively so DAGs synced after
+        # container boot become visible within seconds, not minutes. MWAA in
+        # real AWS lets users tune this via AirflowConfigurationOptions; we
+        # default to fast to keep local iteration tight.
+        "AIRFLOW__SCHEDULER__MIN_FILE_PROCESS_INTERVAL": "5",
+        "AIRFLOW__SCHEDULER__DAG_DIR_LIST_INTERVAL": "5",
     }
 
     if is_v3:
@@ -273,6 +322,14 @@ def _start_airflow_container(env_name, env):
                 env["Status"] = "AVAILABLE"
                 # Sync DAGs from S3 once Airflow is ready
                 _sync_dags_from_s3(env, docker_client, container)
+                # Airflow 2 standalone generates a random admin password and
+                # writes it to standalone_admin_password.txt. Capture it so
+                # _invoke_rest_api can authenticate against /api/v1/ — basic
+                # auth `admin:admin` from the env vars only takes effect
+                # outside standalone mode. v3 uses Simple Auth Manager with
+                # ALL_ADMINS=true so no token is needed.
+                if not is_v3:
+                    _capture_v2_admin_password(env, container)
             else:
                 logger.warning("MWAA: Airflow container for %s not ready after timeout", env_name)
                 env["Status"] = "CREATE_FAILED"
@@ -447,9 +504,14 @@ async def _invoke_rest_api(method, path, headers, body, query_params):
     The outbound HTTP call uses the blocking ``requests`` client off-loaded
     to a worker thread so it does not stall the single-process event loop
     while Airflow processes the request (which can take seconds).
+
+    boto3 places the environment ``Name`` in the URL path (``/restapi/{Name}``)
+    per the MWAA service model, not in the JSON body. Extract from the path,
+    fall back to the body for callers that bypass the SDK.
     """
     data = json.loads(body) if body else {}
-    name = data.get("Name", "")
+    parts = [p for p in path.strip("/").split("/") if p]
+    name = (parts[-1] if parts else "") or data.get("Name", "")
     env = _environments.get(name)
     if not env:
         return error_response_json("ResourceNotFoundException",
@@ -474,9 +536,13 @@ async def _invoke_rest_api(method, path, headers, body, query_params):
 
     req_headers = {"Content-Type": "application/json"}
     if not is_v3:
-        # Airflow 2: basic auth
+        # Airflow 2 standalone generates a random admin password; we captured
+        # it after the container reached AVAILABLE. Fall back to admin/admin
+        # if capture failed so the caller at least sees a clean 401 instead
+        # of a TypeError.
         import base64
-        creds = base64.b64encode(b"admin:admin").decode()
+        pw = env.get("_v2_admin_password") or "admin"
+        creds = base64.b64encode(f"admin:{pw}".encode()).decode()
         req_headers["Authorization"] = f"Basic {creds}"
 
     def _do_call():
