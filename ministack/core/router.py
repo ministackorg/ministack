@@ -124,6 +124,17 @@ SERVICE_PATTERNS = {
         "target_prefixes": ["AmazonAthena"],
         "host_patterns": [r"athena\."],
     },
+    "airflow": {
+        "host_patterns": [r"airflow\."],
+        "path_patterns": [
+            r"^/environments",
+            r"^/webtoken/",
+            r"^/clitoken/",
+            r"^/restapi/",
+            r"^/metrics/environments/",
+        ],
+        "credential_scope": "airflow",
+    },
     "firehose": {
         "target_prefixes": ["Firehose_20150804"],
         "host_patterns": [r"firehose\.", r"kinesis-firehose\."],

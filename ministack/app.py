@@ -95,7 +95,7 @@ _ALB_PATH_PREFIX = "/_alb/"
 _NON_S3_VHOST_NAMES = frozenset({
     "s3", "s3-control", "sqs", "sns", "dynamodb", "lambda", "iam", "sts",
     "secretsmanager", "logs", "ssm", "events", "kinesis", "monitoring", "ses",
-    "states", "ecs", "rds", "rds-data", "elasticache", "glue", "athena",
+    "states", "ecs", "rds", "rds-data", "elasticache", "glue", "athena", "airflow",
     "apigateway", "cloudformation", "autoscaling", "codebuild", "transfer", "cur",
     "cloudfront-kvs",
     "appsync-api", "appsync-realtime-api",
@@ -222,6 +222,7 @@ SERVICE_REGISTRY = {
     "events": {"module": "eventbridge", "aliases": ("eventbridge",)},
     "firehose": {"module": "firehose", "aliases": ("kinesis-firehose",)},
     "glue": {"module": "glue"},
+    "airflow": {"module": "mwaa", "aliases": ("mwaa",)},
     "iam": {"module": "iam"},
     "imds": {"module": "imds"},
     "kinesis": {"module": "kinesis"},
@@ -277,7 +278,7 @@ _state_map = {
     "elasticache": "elasticache", "appsync": "appsync",
     "appsync_events": "appsync_events",
     "stepfunctions": "stepfunctions", "alb": "alb",
-    "glue": "glue", "efs": "efs", "waf": "waf",
+    "glue": "glue", "mwaa": "mwaa", "efs": "efs", "waf": "waf",
     "athena": "athena", "emr": "emr", "cloudfront": "cloudfront",
     "codebuild": "codebuild", "acm": "acm", "firehose": "firehose",
     "ses": "ses", "ses_v2": "ses_v2",
@@ -1096,6 +1097,21 @@ async def _handle_s3_vhost_request(host: str, path: str, method: str, headers: d
     # so guard explicitly here too.
     if path.startswith("/key-value-stores/"):
         return None
+    # MWAA REST endpoints (api.airflow.{region}, env.airflow.{region}) — boto3
+    # expands the model's hostPrefix even when endpoint_url is overridden, so
+    # the host arrives as `api.localhost:4566`, and `api` looks like an S3
+    # bucket. Short-circuit any path that matches a real MWAA operation:
+    #   /environments, /environments/{Name}, /webtoken/{Name},
+    #   /clitoken/{Name}, /restapi/{Name}, /metrics/environments/{Name}
+    if (
+        path == "/environments"
+        or path.startswith("/environments/")
+        or path.startswith("/webtoken/")
+        or path.startswith("/clitoken/")
+        or path.startswith("/restapi/")
+        or path.startswith("/metrics/environments/")
+    ):
+        return None
 
     vhost_path = "/" + bucket + path if path != "/" else "/" + bucket + "/"
     try:
@@ -1539,14 +1555,21 @@ async def _handle_lifespan(scope, receive, send):
                 _load_persisted_state()
             # Start the Transfer Family SFTP listener after persistence is
             # loaded (so any restored Transfer servers/users are visible to
-            # the SSH auth callback). Cheap no-op if asyncssh isn't
-            # installed or SFTP_ENABLED=0.
-            try:
-                from ministack.services import transfer
+            # the SSH auth callback). When the user opts out via
+            # SFTP_ENABLED=0 we skip importing the transfer module entirely
+            # — its top-level `import asyncssh` pulls cryptography+OpenSSL
+            # (~2–4 MiB of heap, plus C-level SSL contexts) which is pure
+            # overhead for callers that aren't using Transfer Family.
+            _sftp_env = os.environ.get("SFTP_ENABLED", "").strip().lower()
+            if _sftp_env in ("0", "false", "no", "off"):
+                logger.debug("SFTP_ENABLED=%s — skipping transfer module import.", _sftp_env)
+            else:
+                try:
+                    from ministack.services import transfer
 
-                await transfer.sftp_start()
-            except Exception as e:
-                logger.warning("Transfer SFTP startup failed: %s", e)
+                    await transfer.sftp_start()
+                except Exception as e:
+                    logger.warning("Transfer SFTP startup failed: %s", e)
             # Start the EventBridge scheduler daemon explicitly. Module-import
             # autostart is gated by MINISTACK_TEST_NO_AUTOSTART so unit tests
             # don't race; lifespan.startup is the canonical place to spin it up.
@@ -1585,7 +1608,17 @@ async def _handle_lifespan(scope, receive, send):
 
 def _stop_docker_containers():
     """Stop all Docker containers managed by MiniStack (RDS, ECS, ElastiCache).
-    Uses container labels to find them — does not touch service state."""
+    Uses container labels to find them — does not touch service state.
+
+    Skip entirely if no Docker socket is available: importing the docker
+    SDK (and its requests/urllib3/idna transitive deps) costs ~1 MiB of
+    Python heap before we even know whether there's anything to clean.
+    """
+    sock = os.environ.get("DOCKER_HOST") or "unix:///var/run/docker.sock"
+    if sock.startswith("unix://"):
+        sock_path = sock[len("unix://"):]
+        if not os.path.exists(sock_path):
+            return
     try:
         import docker
 
@@ -1923,6 +1956,14 @@ def main():
         config.bind = [f"{bind_host}:{port}"]
         config.keep_alive_timeout = 75
         config.loglevel = LOG_LEVEL.upper()
+
+        # USE_SSL=1 enables HTTPS — matches the behaviour previously provided
+        # by ministack/core/hypercorn_conf.py when the entrypoint was the
+        # hypercorn CLI. Self-signed cert auto-generated under TMPDIR, or BYO
+        # via MINISTACK_SSL_CERT + MINISTACK_SSL_KEY.
+        from ministack.core import tls as _tls
+        if _tls.use_ssl_enabled():
+            config.certfile, config.keyfile = _tls.resolve_tls_material()
 
         asyncio.run(hypercorn_serve(app, config))
     finally:
