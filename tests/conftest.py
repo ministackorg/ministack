@@ -96,17 +96,56 @@ def pytest_collection_modifyitems(config, items):
 
 
 @pytest.fixture(scope="session", autouse=True)
-def reset_server():
-    """Reset all server state once before the test session starts."""
-    req = urllib.request.Request(
-        f"{ENDPOINT}/_ministack/reset",
-        data=b"",
-        method="POST",
-    )
+def reset_server(tmp_path_factory, worker_id):
+    """Reset all server state once before the test session starts.
+
+    Under pytest-xdist, every worker spawns its own session. If each worker
+    calls /_ministack/reset on startup, a slow worker's reset can fire AFTER
+    a faster worker has already begun creating fixtures, wiping that state
+    mid-test. Use a filesystem barrier so only the first worker resets;
+    the others wait for the marker and skip.
+    """
+    if worker_id == "master":
+        # Single-process pytest run — no xdist.
+        try:
+            urllib.request.urlopen(
+                urllib.request.Request(f"{ENDPOINT}/_ministack/reset",
+                                       data=b"", method="POST"),
+                timeout=5,
+            )
+        except Exception:
+            pass
+        return
+
+    # xdist mode — coordinate via the shared root tmp dir (one level above
+    # the per-worker tmp). Only the worker that creates the marker resets.
+    root_tmp = tmp_path_factory.getbasetemp().parent
+    marker = root_tmp / ".ministack_reset_done"
+    lock = root_tmp / ".ministack_reset.lock"
     try:
-        urllib.request.urlopen(req, timeout=5)
-    except Exception:
-        pass  # server may not be up yet; individual tests will fail naturally
+        # O_CREAT|O_EXCL ensures only one worker wins the race.
+        fd = os.open(str(lock), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        os.close(fd)
+        won = True
+    except FileExistsError:
+        won = False
+    if won:
+        try:
+            urllib.request.urlopen(
+                urllib.request.Request(f"{ENDPOINT}/_ministack/reset",
+                                       data=b"", method="POST"),
+                timeout=5,
+            )
+        except Exception:
+            pass
+        marker.write_text("ok")
+    else:
+        # Wait briefly for the chosen worker to finish its reset before
+        # any tests on this worker touch the server.
+        import time as _t
+        deadline = _t.time() + 10
+        while not marker.exists() and _t.time() < deadline:
+            _t.sleep(0.1)
 
 
 @pytest.fixture(scope="session")
