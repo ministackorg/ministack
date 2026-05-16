@@ -253,6 +253,47 @@ def test_lambda_invoke_async(lam):
     )
     assert resp["StatusCode"] == 202
 
+
+def test_lambda_invoke_emits_cloudwatch_metrics(lam, cw):
+    """After invocation, AWS/Lambda namespace must carry Invocations + Duration
+    metrics dimensioned by FunctionName. Mirrors real Lambda observability —
+    the four canonical metrics (Invocations, Errors, Duration, Throttles) are
+    published per call.
+    """
+    fname = "lam-cw-metrics-test"
+    lam.create_function(
+        FunctionName=fname,
+        Runtime="python3.12",
+        Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _make_zip(_LAMBDA_CODE)},
+    )
+    lam.invoke(FunctionName=fname, Payload=json.dumps({"x": 1}))
+    lam.invoke(FunctionName=fname, Payload=json.dumps({"x": 2}))
+
+    end = time.time()
+    start = end - 600
+    invocations = cw.get_metric_statistics(
+        Namespace="AWS/Lambda",
+        MetricName="Invocations",
+        Dimensions=[{"Name": "FunctionName", "Value": fname}],
+        StartTime=start, EndTime=end,
+        Period=60, Statistics=["Sum"],
+    )
+    total = sum(p["Sum"] for p in invocations["Datapoints"])
+    assert total >= 2, f"expected >=2 invocations, got {total}"
+
+    duration = cw.get_metric_statistics(
+        Namespace="AWS/Lambda",
+        MetricName="Duration",
+        Dimensions=[{"Name": "FunctionName", "Value": fname}],
+        StartTime=start, EndTime=end,
+        Period=60, Statistics=["Average", "Maximum"],
+    )
+    assert duration["Datapoints"], "no Duration datapoints recorded"
+    assert duration["Datapoints"][0]["Average"] > 0
+    lam.delete_function(FunctionName=fname)
+
 def test_lambda_update_code(lam):
     lam.update_function_code(
         FunctionName="lam-invoke-test",

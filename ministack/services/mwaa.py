@@ -12,6 +12,7 @@ The Airflow REST API (v2) is served directly by the container — no proxying ne
 Callers use the WebserverUrl from GetEnvironment to hit Airflow's /api/v2/ endpoints.
 """
 
+import asyncio
 import copy
 import json
 import logging
@@ -40,6 +41,9 @@ DEFAULT_AIRFLOW_IMAGE = os.environ.get("MWAA_AIRFLOW_IMAGE", "apache/airflow:3.0
 
 _environments = AccountScopedDict()
 _port_counter = [BASE_PORT]
+_allocated_ports: set[int] = set()
+_freed_ports: list[int] = []
+_port_lock = threading.Lock()
 _docker = None
 _ministack_network = None
 
@@ -115,9 +119,23 @@ def _get_ministack_network(docker_client):
 
 
 def _next_port():
-    port = _port_counter[0]
-    _port_counter[0] += 1
+    with _port_lock:
+        if _freed_ports:
+            port = _freed_ports.pop()
+        else:
+            port = _port_counter[0]
+            _port_counter[0] += 1
+        _allocated_ports.add(port)
     return port
+
+
+def _release_port(port):
+    if not port:
+        return
+    with _port_lock:
+        if port in _allocated_ports:
+            _allocated_ports.discard(port)
+            _freed_ports.append(port)
 
 
 def _wait_for_port(host, port, timeout=120):
@@ -179,6 +197,7 @@ def _start_airflow_container(env_name, env):
         return
 
     host_port = _next_port()
+    env["_host_port"] = host_port
     ms_network = _get_ministack_network(docker_client)
 
     airflow_version = env.get("AirflowVersion", "3.0.6")
@@ -355,6 +374,7 @@ def _delete_environment(method, path, headers, body, query_params):
             except Exception:
                 logger.debug("MWAA: container cleanup for %s failed (may be already gone)", name)
 
+    _release_port(env.get("_host_port"))
     del _environments[name]
     return json_response({}, status=200)
 
@@ -419,8 +439,13 @@ def _create_cli_token(method, path, headers, body, query_params):
     })
 
 
-def _invoke_rest_api(method, path, headers, body, query_params):
-    """Proxy InvokeRestApi to the local Airflow container's REST API."""
+async def _invoke_rest_api(method, path, headers, body, query_params):
+    """Proxy InvokeRestApi to the local Airflow container's REST API.
+
+    The outbound HTTP call uses the blocking ``requests`` client off-loaded
+    to a worker thread so it does not stall the single-process event loop
+    while Airflow processes the request (which can take seconds).
+    """
     data = json.loads(body) if body else {}
     name = data.get("Name", "")
     env = _environments.get(name)
@@ -433,38 +458,40 @@ def _invoke_rest_api(method, path, headers, body, query_params):
         return error_response_json("InternalServerException",
                                    "Environment webserver not available", 500)
 
-    api_method = data.get("Method", "GET")
+    api_method = (data.get("Method") or "GET").upper()
+    if api_method not in ("GET", "POST", "PATCH", "DELETE"):
+        return error_response_json("ValidationException",
+                                   f"Unsupported method: {api_method}", 400)
+
     api_path = data.get("Path", "/")
     api_body = data.get("Body", {})
 
-    try:
+    is_v3 = env.get("_is_v3", True)
+    api_base = "/api/v2" if is_v3 else "/api/v1"
+    url = f"http://{webserver_url}{api_base}{api_path}"
+
+    req_headers = {"Content-Type": "application/json"}
+    if not is_v3:
+        # Airflow 2: basic auth
+        import base64
+        creds = base64.b64encode(b"admin:admin").decode()
+        req_headers["Authorization"] = f"Basic {creds}"
+
+    def _do_call():
         import requests as req_lib
-        is_v3 = env.get("_is_v3", True)
-        api_base = "/api/v2" if is_v3 else "/api/v1"
-        url = f"http://{webserver_url}{api_base}{api_path}"
+        if api_method == "GET":
+            return req_lib.get(url, headers=req_headers, timeout=30)
+        if api_method in ("POST", "PATCH"):
+            return req_lib.request(api_method, url, headers=req_headers, json=api_body, timeout=30)
+        return req_lib.delete(url, headers=req_headers, timeout=30)
 
-        req_headers = {"Content-Type": "application/json"}
-        if not is_v3:
-            # Airflow 2: basic auth
-            import base64
-            creds = base64.b64encode(b"admin:admin").decode()
-            req_headers["Authorization"] = f"Basic {creds}"
-
-        if api_method.upper() == "GET":
-            resp = req_lib.get(url, headers=req_headers, timeout=30)
-        elif api_method.upper() == "POST":
-            resp = req_lib.post(url, headers=req_headers, json=api_body, timeout=30)
-        elif api_method.upper() == "PATCH":
-            resp = req_lib.patch(url, headers=req_headers, json=api_body, timeout=30)
-        elif api_method.upper() == "DELETE":
-            resp = req_lib.delete(url, headers=req_headers, timeout=30)
-        else:
-            return error_response_json("ValidationException",
-                                       f"Unsupported method: {api_method}", 400)
-
+    try:
+        resp = await asyncio.to_thread(_do_call)
+        ctype = resp.headers.get("content-type", "")
+        payload = resp.json() if ctype.startswith("application/json") else {"body": resp.text}
         return json_response({
             "RestApiStatusCode": resp.status_code,
-            "RestApiResponse": resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {"body": resp.text},
+            "RestApiResponse": payload,
         })
     except Exception as e:
         return error_response_json("InternalServerException", str(e)[:500], 500)
@@ -502,7 +529,7 @@ async def handle_request(method, path, headers, body, query_params):
 
     # InvokeRestApi
     if method == "POST" and "/restapi" in clean_path:
-        return _invoke_rest_api(method, path, headers, body, query_params)
+        return await _invoke_rest_api(method, path, headers, body, query_params)
 
     # ListEnvironments
     if method == "GET" and clean_path.rstrip("/") in ("/environments", "/api/environments"):
@@ -535,4 +562,5 @@ def reset():
                 container.remove(force=True)
             except Exception:
                 pass
+        _release_port(env.get("_host_port"))
     _environments.clear()

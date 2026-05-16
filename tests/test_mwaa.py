@@ -155,7 +155,10 @@ with DAG("test_dag", start_date=datetime(2026, 1, 1), schedule=None, catchup=Fal
             assert "Arn" in resp
 
             env = mwaa_client.get_environment(Name=env_name)["Environment"]
-            assert env["Status"] in ("CREATING", "AVAILABLE", "CREATE_FAILED")
+            assert env["SourceBucketArn"] == f"arn:aws:s3:::{bucket_name}"
+            assert env["DagS3Path"] == "dags/"
+            listed = mwaa_client.list_environments()["Environments"]
+            assert env_name in listed
         finally:
             try:
                 mwaa_client.delete_environment(Name=env_name)
