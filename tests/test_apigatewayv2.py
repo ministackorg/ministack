@@ -2258,5 +2258,224 @@ def test_apigateway_get_state_returns_independent_copy(mod_name):
         "would corrupt the persisted JSON. Wrap each value in copy.deepcopy(...)."
     )
 
-    if hasattr(mod, "reset"):
-        mod.reset()
+
+def test_apigw_integration_response_crud(apigw):
+    """IntegrationResponse create, get, list, delete lifecycle."""
+    api_id = apigw.create_api(Name=f"ir-test-{_uuid_mod.uuid4().hex[:8]}", ProtocolType="WEBSOCKET")["ApiId"]
+    int_id = apigw.create_integration(
+        ApiId=api_id,
+        IntegrationType="MOCK",
+    )["IntegrationId"]
+    resp = apigw.create_integration_response(
+        ApiId=api_id,
+        IntegrationId=int_id,
+        IntegrationResponseKey="$default",
+    )
+    assert resp["IntegrationResponseKey"] == "$default"
+    ir_id = resp["IntegrationResponseId"]
+
+    got = apigw.get_integration_response(ApiId=api_id, IntegrationId=int_id, IntegrationResponseId=ir_id)
+    assert got["IntegrationResponseId"] == ir_id
+
+    listed = apigw.get_integration_responses(ApiId=api_id, IntegrationId=int_id)
+    assert any(i["IntegrationResponseId"] == ir_id for i in listed["Items"])
+
+    apigw.update_integration_response(
+        ApiId=api_id,
+        IntegrationId=int_id,
+        IntegrationResponseId=ir_id,
+        ContentHandlingStrategy="CONVERT_TO_TEXT",
+    )
+    got2 = apigw.get_integration_response(ApiId=api_id, IntegrationId=int_id, IntegrationResponseId=ir_id)
+    assert got2.get("ContentHandlingStrategy") == "CONVERT_TO_TEXT"
+
+    apigw.delete_integration_response(ApiId=api_id, IntegrationId=int_id, IntegrationResponseId=ir_id)
+    listed2 = apigw.get_integration_responses(ApiId=api_id, IntegrationId=int_id)
+    assert not any(i["IntegrationResponseId"] == ir_id for i in listed2["Items"])
+
+    apigw.delete_api(ApiId=api_id)
+
+
+def test_apigw_route_response_crud(apigw):
+    """RouteResponse create, get, list, delete lifecycle."""
+    api_id = apigw.create_api(Name=f"rr-test-{_uuid_mod.uuid4().hex[:8]}", ProtocolType="WEBSOCKET")["ApiId"]
+    route_id = apigw.create_route(ApiId=api_id, RouteKey="$connect")["RouteId"]
+    resp = apigw.create_route_response(
+        ApiId=api_id,
+        RouteId=route_id,
+        RouteResponseKey="$default",
+    )
+    assert resp["RouteResponseKey"] == "$default"
+    rr_id = resp["RouteResponseId"]
+
+    got = apigw.get_route_response(ApiId=api_id, RouteId=route_id, RouteResponseId=rr_id)
+    assert got["RouteResponseId"] == rr_id
+
+    listed = apigw.get_route_responses(ApiId=api_id, RouteId=route_id)
+    assert any(r["RouteResponseId"] == rr_id for r in listed["Items"])
+
+    apigw.update_route_response(
+        ApiId=api_id,
+        RouteId=route_id,
+        RouteResponseId=rr_id,
+        ResponseModels={"application/json": "Empty"},
+    )
+    got2 = apigw.get_route_response(ApiId=api_id, RouteId=route_id, RouteResponseId=rr_id)
+    assert got2.get("ResponseModels") == {"application/json": "Empty"}
+
+    apigw.delete_route_response(ApiId=api_id, RouteId=route_id, RouteResponseId=rr_id)
+    listed2 = apigw.get_route_responses(ApiId=api_id, RouteId=route_id)
+    assert not any(r["RouteResponseId"] == rr_id for r in listed2["Items"])
+
+    apigw.delete_api(ApiId=api_id)
+
+
+def test_apigw_model_crud(apigw):
+    """Model create, get, list, delete lifecycle."""
+    api_id = apigw.create_api(Name=f"model-test-{_uuid_mod.uuid4().hex[:8]}", ProtocolType="HTTP")["ApiId"]
+    resp = apigw.create_model(
+        ApiId=api_id,
+        Name="MyModel",
+        Schema={"type": "object", "properties": {"name": {"type": "string"}}},
+        ContentType="application/json",
+    )
+    assert resp["Name"] == "MyModel"
+    model_id = resp["ModelId"]
+
+    got = apigw.get_model(ApiId=api_id, ModelId=model_id)
+    assert got["ModelId"] == model_id
+
+    listed = apigw.get_models(ApiId=api_id)
+    assert any(m["ModelId"] == model_id for m in listed["Items"])
+
+    apigw.update_model(ApiId=api_id, ModelId=model_id, Description="Updated description")
+    got2 = apigw.get_model(ApiId=api_id, ModelId=model_id)
+    assert got2.get("Description") == "Updated description"
+
+    apigw.delete_model(ApiId=api_id, ModelId=model_id)
+    with pytest.raises(ClientError) as exc:
+        apigw.get_model(ApiId=api_id, ModelId=model_id)
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 404
+
+    apigw.delete_api(ApiId=api_id)
+
+
+def test_apigw_domain_name_crud(apigw):
+    """DomainName create, get, list, delete lifecycle."""
+    resp = apigw.create_domain_name(
+        DomainName="api.example.com",
+        DomainNameConfigurations=[{"EndpointType": "REGIONAL"}],
+    )
+    assert resp["DomainName"] == "api.example.com"
+
+    got = apigw.get_domain_name(DomainName="api.example.com")
+    assert got["DomainName"] == "api.example.com"
+
+    listed = apigw.get_domain_names()
+    assert any(d["DomainName"] == "api.example.com" for d in listed["Items"])
+
+    apigw.delete_domain_name(DomainName="api.example.com")
+    with pytest.raises(ClientError) as exc:
+        apigw.get_domain_name(DomainName="api.example.com")
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 404
+
+
+def test_apigw_api_mapping_crud(apigw):
+    """ApiMapping create, get, list, delete lifecycle."""
+    api_id = apigw.create_api(Name=f"mapping-api-{_uuid_mod.uuid4().hex[:8]}", ProtocolType="HTTP")["ApiId"]
+    apigw.create_stage(ApiId=api_id, StageName="prod")
+    apigw.create_domain_name(DomainName="map.example.com")
+
+    resp = apigw.create_api_mapping(
+        DomainName="map.example.com",
+        ApiId=api_id,
+        Stage="prod",
+        ApiMappingKey="v1",
+    )
+    assert resp["ApiId"] == api_id
+    mapping_id = resp["Id"]
+
+    got = apigw.get_api_mapping(DomainName="map.example.com", ApiMappingId=mapping_id)
+    assert got["ApiMappingId"] == mapping_id
+
+    listed = apigw.get_api_mappings(DomainName="map.example.com")
+    assert any(m["ApiMappingId"] == mapping_id for m in listed["Items"])
+
+    apigw.update_api_mapping(
+        DomainName="map.example.com",
+        ApiMappingId=mapping_id,
+        ApiMappingKey="v2",
+    )
+    got2 = apigw.get_api_mapping(DomainName="map.example.com", ApiMappingId=mapping_id)
+    assert got2["ApiMappingKey"] == "v2"
+
+    apigw.delete_api_mapping(DomainName="map.example.com", ApiMappingId=mapping_id)
+    with pytest.raises(ClientError) as exc:
+        apigw.get_api_mapping(DomainName="map.example.com", ApiMappingId=mapping_id)
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 404
+
+    apigw.delete_domain_name(DomainName="map.example.com")
+    apigw.delete_api(ApiId=api_id)
+
+
+def test_apigw_vpc_link_crud(apigw):
+    """VpcLink create, get, list, delete lifecycle."""
+    resp = apigw.create_vpc_link(
+        Name="v2-test-link",
+        SubnetIds=["subnet-12345"],
+        SecurityGroupIds=["sg-12345"],
+    )
+    assert resp["Name"] == "v2-test-link"
+    assert resp["Status"] == "AVAILABLE"
+    vpc_link_id = resp["VpcLinkId"]
+
+    got = apigw.get_vpc_link(VpcLinkId=vpc_link_id)
+    assert got["VpcLinkId"] == vpc_link_id
+
+    listed = apigw.get_vpc_links()
+    assert any(v["VpcLinkId"] == vpc_link_id for v in listed["Items"])
+
+    apigw.update_vpc_link(VpcLinkId=vpc_link_id, Description="Updated link")
+    got2 = apigw.get_vpc_link(VpcLinkId=vpc_link_id)
+    assert got2.get("Description") == "Updated link"
+
+    apigw.delete_vpc_link(VpcLinkId=vpc_link_id)
+    with pytest.raises(ClientError) as exc:
+        apigw.get_vpc_link(VpcLinkId=vpc_link_id)
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 404
+
+
+def test_apigw_routing_rule_crud(apigw):
+    """RoutingRule create, get, list, delete lifecycle."""
+    api_id = apigw.create_api(Name=f"rr-rule-{_uuid_mod.uuid4().hex[:8]}", ProtocolType="HTTP")["ApiId"]
+    resp = apigw.create_routing_rule(
+        ApiId=api_id,
+        Condition={"Expression": "method.request.header.x-custom = 'override'"},
+        StageOverride={"Stage": "prod"},
+        Priority=1,
+    )
+    assert resp["Priority"] == 1
+    rule_id = resp["RoutingRuleId"]
+
+    got = apigw.get_routing_rule(ApiId=api_id, RoutingRuleId=rule_id)
+    assert got["RoutingRuleId"] == rule_id
+
+    listed = apigw.get_routing_rules(ApiId=api_id)
+    assert any(r["RoutingRuleId"] == rule_id for r in listed["Items"])
+
+    apigw.update_routing_rule(ApiId=api_id, RoutingRuleId=rule_id, Priority=5)
+    got2 = apigw.get_routing_rule(ApiId=api_id, RoutingRuleId=rule_id)
+    assert got2["Priority"] == 5
+
+    apigw.delete_routing_rule(ApiId=api_id, RoutingRuleId=rule_id)
+    with pytest.raises(ClientError) as exc:
+        apigw.get_routing_rule(ApiId=api_id, RoutingRuleId=rule_id)
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 404
+
+    apigw.delete_api(ApiId=api_id)
+
+
+def test_apigw_api_gateway_managed_overrides(apigw):
+    """ApiGatewayManagedOverrides is a CFN-only construct; provisioner is a no-op."""
+    api_id = apigw.create_api(Name=f"overrides-{_uuid_mod.uuid4().hex[:8]}", ProtocolType="HTTP")["ApiId"]
+    apigw.delete_api(ApiId=api_id)

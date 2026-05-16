@@ -1748,3 +1748,169 @@ def test_apigateway_v1_create_domain_name_default_tls_policy(apigw_v1):
         certificateName="c2",
     )
     assert r["securityPolicy"] == "TLS_1_2"
+
+
+def test_apigwv1_request_validator_crud(apigw_v1):
+    """RequestValidator create, get, list, update, delete lifecycle."""
+    api_id = apigw_v1.create_rest_api(name="v1-rv-crud")["id"]
+    rv = apigw_v1.create_request_validator(
+        restApiId=api_id,
+        name="body-and-params",
+        validateRequestBody=True,
+        validateRequestParameters=True,
+    )
+    rv_id = rv["id"]
+    assert rv["name"] == "body-and-params"
+    assert rv["validateRequestBody"] is True
+    assert rv["validateRequestParameters"] is True
+
+    got = apigw_v1.get_request_validator(restApiId=api_id, requestValidatorId=rv_id)
+    assert got["id"] == rv_id
+
+    listed = apigw_v1.get_request_validators(restApiId=api_id)["items"]
+    assert any(r["id"] == rv_id for r in listed)
+
+    apigw_v1.update_request_validator(
+        restApiId=api_id,
+        requestValidatorId=rv_id,
+        patchOperations=[{"op": "replace", "path": "/name", "value": "renamed-rv"}],
+    )
+    got2 = apigw_v1.get_request_validator(restApiId=api_id, requestValidatorId=rv_id)
+    assert got2["name"] == "renamed-rv"
+
+    apigw_v1.delete_request_validator(restApiId=api_id, requestValidatorId=rv_id)
+    with pytest.raises(ClientError) as exc:
+        apigw_v1.get_request_validator(restApiId=api_id, requestValidatorId=rv_id)
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 404
+
+    apigw_v1.delete_rest_api(restApiId=api_id)
+
+
+def test_apigwv1_gateway_response_crud(apigw_v1):
+    """GatewayResponse put, get, list, delete lifecycle."""
+    api_id = apigw_v1.create_rest_api(name="v1-gr-crud")["id"]
+    resp = apigw_v1.put_gateway_response(
+        restApiId=api_id,
+        responseType="DEFAULT_4XX",
+        statusCode="400",
+        responseParameters={"gatewayresponse.header.Access-Control-Allow-Origin": "'*'"},
+    )
+    assert resp["responseType"] == "DEFAULT_4XX"
+
+    got = apigw_v1.get_gateway_response(restApiId=api_id, responseType="DEFAULT_4XX")
+    assert got["statusCode"] == "400"
+
+    listed = apigw_v1.get_gateway_responses(restApiId=api_id)["items"]
+    assert any(r["responseType"] == "DEFAULT_4XX" for r in listed)
+
+    apigw_v1.delete_gateway_response(restApiId=api_id, responseType="DEFAULT_4XX")
+    with pytest.raises(ClientError) as exc:
+        apigw_v1.get_gateway_response(restApiId=api_id, responseType="DEFAULT_4XX")
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 404
+
+    apigw_v1.delete_rest_api(restApiId=api_id)
+
+
+def test_apigwv1_client_certificate_crud(apigw_v1):
+    """ClientCertificate create, get, list, delete lifecycle."""
+    resp = apigw_v1.create_client_certificate(description="v1-test-cert")
+    cert_id = resp["clientCertificateId"]
+    assert resp["description"] == "v1-test-cert"
+
+    got = apigw_v1.get_client_certificate(clientCertificateId=cert_id)
+    assert got["clientCertificateId"] == cert_id
+
+    listed = apigw_v1.get_client_certificates()["items"]
+    assert any(c["clientCertificateId"] == cert_id for c in listed)
+
+    apigw_v1.delete_client_certificate(clientCertificateId=cert_id)
+    with pytest.raises(ClientError) as exc:
+        apigw_v1.get_client_certificate(clientCertificateId=cert_id)
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 404
+
+
+def test_apigwv1_vpc_link_crud(apigw_v1):
+    """VpcLink create, get, list, delete lifecycle."""
+    resp = apigw_v1.create_vpc_link(
+        name="v1-test-link",
+        targetArns=["arn:aws:elasticloadbalancing:us-east-1:000000000000:loadbalancer/net/mylb/123"],
+    )
+    link_id = resp["id"]
+    assert resp["name"] == "v1-test-link"
+    assert resp["status"] == "AVAILABLE"
+
+    got = apigw_v1.get_vpc_link(vpcLinkId=link_id)
+    assert got["id"] == link_id
+
+    listed = apigw_v1.get_vpc_links()["items"]
+    assert any(v["id"] == link_id for v in listed)
+
+    apigw_v1.delete_vpc_link(vpcLinkId=link_id)
+    with pytest.raises(ClientError) as exc:
+        apigw_v1.get_vpc_link(vpcLinkId=link_id)
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 404
+
+
+def test_apigwv1_documentation_part_crud(apigw_v1):
+    """DocumentationPart create, get, list, update, delete lifecycle."""
+    api_id = apigw_v1.create_rest_api(name="v1-doc-part-crud")["id"]
+    dp = apigw_v1.create_documentation_part(
+        restApiId=api_id,
+        location={"type": "API"},
+        properties='{"summary": "My API", "description": "The API"}',
+    )
+    dp_id = dp["id"]
+    assert dp["location"]["type"] == "API"
+
+    got = apigw_v1.get_documentation_part(restApiId=api_id, documentationPartId=dp_id)
+    assert got["id"] == dp_id
+
+    listed = apigw_v1.get_documentation_parts(restApiId=api_id)["items"]
+    assert any(d["id"] == dp_id for d in listed)
+
+    apigw_v1.update_documentation_part(
+        restApiId=api_id,
+        documentationPartId=dp_id,
+        patchOperations=[{"op": "replace", "path": "/properties", "value": '{"summary": "Updated"}'}],
+    )
+    got2 = apigw_v1.get_documentation_part(restApiId=api_id, documentationPartId=dp_id)
+    assert "Updated" in got2["properties"]
+
+    apigw_v1.delete_documentation_part(restApiId=api_id, documentationPartId=dp_id)
+    with pytest.raises(ClientError) as exc:
+        apigw_v1.get_documentation_part(restApiId=api_id, documentationPartId=dp_id)
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 404
+
+    apigw_v1.delete_rest_api(restApiId=api_id)
+
+
+def test_apigwv1_documentation_version_crud(apigw_v1):
+    """DocumentationVersion create, get, list, delete lifecycle."""
+    api_id = apigw_v1.create_rest_api(name="v1-doc-ver-crud")["id"]
+    resp = apigw_v1.create_documentation_version(
+        restApiId=api_id,
+        documentationVersion="v1.0",
+        description="First version",
+    )
+    assert resp["version"] == "v1.0"
+
+    got = apigw_v1.get_documentation_version(restApiId=api_id, documentationVersion="v1.0")
+    assert got["version"] == "v1.0"
+
+    listed = apigw_v1.get_documentation_versions(restApiId=api_id)["items"]
+    assert any(d["version"] == "v1.0" for d in listed)
+
+    apigw_v1.update_documentation_version(
+        restApiId=api_id,
+        documentationVersion="v1.0",
+        patchOperations=[{"op": "replace", "path": "/description", "value": "Updated version"}],
+    )
+    got2 = apigw_v1.get_documentation_version(restApiId=api_id, documentationVersion="v1.0")
+    assert got2["description"] == "Updated version"
+
+    apigw_v1.delete_documentation_version(restApiId=api_id, documentationVersion="v1.0")
+    with pytest.raises(ClientError) as exc:
+        apigw_v1.get_documentation_version(restApiId=api_id, documentationVersion="v1.0")
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 404
+
+    apigw_v1.delete_rest_api(restApiId=api_id)

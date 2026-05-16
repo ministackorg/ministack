@@ -34,6 +34,41 @@ Control plane endpoints implemented:
   GET    /v2/apis/{apiId}/authorizers/{authId}      — GetAuthorizer
   PATCH  /v2/apis/{apiId}/authorizers/{authId}      — UpdateAuthorizer
   DELETE /v2/apis/{apiId}/authorizers/{authId}      — DeleteAuthorizer
+  POST   /v2/apis/{apiId}/models                     — CreateModel
+  GET    /v2/apis/{apiId}/models                     — GetModels
+  GET    /v2/apis/{apiId}/models/{modelId}           — GetModel
+  PATCH  /v2/apis/{apiId}/models/{modelId}           — UpdateModel
+  DELETE /v2/apis/{apiId}/models/{modelId}           — DeleteModel
+  POST   /v2/apis/{apiId}/routes/{routeId}/routeresponses           — CreateRouteResponse
+  GET    /v2/apis/{apiId}/routes/{routeId}/routeresponses           — GetRouteResponses
+  GET    /v2/apis/{apiId}/routes/{routeId}/routeresponses/{rrId}    — GetRouteResponse
+  PATCH  /v2/apis/{apiId}/routes/{routeId}/routeresponses/{rrId}    — UpdateRouteResponse
+  DELETE /v2/apis/{apiId}/routes/{routeId}/routeresponses/{rrId}    — DeleteRouteResponse
+  POST   /v2/apis/{apiId}/integrations/{integId}/integrationresponses           — CreateIntegrationResponse
+  GET    /v2/apis/{apiId}/integrations/{integId}/integrationresponses           — GetIntegrationResponses
+  GET    /v2/apis/{apiId}/integrations/{integId}/integrationresponses/{irId}    — GetIntegrationResponse
+  PATCH  /v2/apis/{apiId}/integrations/{integId}/integrationresponses/{irId}    — UpdateIntegrationResponse
+  DELETE /v2/apis/{apiId}/integrations/{integId}/integrationresponses/{irId}    — DeleteIntegrationResponse
+  POST   /v2/apis/{apiId}/routingrules               — CreateRoutingRule
+  GET    /v2/apis/{apiId}/routingrules               — GetRoutingRules
+  GET    /v2/apis/{apiId}/routingrules/{ruleId}      — GetRoutingRule
+  PATCH  /v2/apis/{apiId}/routingrules/{ruleId}      — UpdateRoutingRule
+  DELETE /v2/apis/{apiId}/routingrules/{ruleId}      — DeleteRoutingRule
+  POST   /v2/domainnames                             — CreateDomainName
+  GET    /v2/domainnames                             — GetDomainNames
+  GET    /v2/domainnames/{domainName}                — GetDomainName
+  PATCH  /v2/domainnames/{domainName}                — UpdateDomainName
+  DELETE /v2/domainnames/{domainName}                — DeleteDomainName
+  POST   /v2/domainnames/{domainName}/apimappings    — CreateApiMapping
+  GET    /v2/domainnames/{domainName}/apimappings    — GetApiMappings
+  GET    /v2/domainnames/{domainName}/apimappings/{mappingId}  — GetApiMapping
+  PATCH  /v2/domainnames/{domainName}/apimappings/{mappingId}  — UpdateApiMapping
+  DELETE /v2/domainnames/{domainName}/apimappings/{mappingId}  — DeleteApiMapping
+  POST   /v2/vpclinks                                — CreateVpcLink
+  GET    /v2/vpclinks                                — GetVpcLinks
+  GET    /v2/vpclinks/{vpcLinkId}                    — GetVpcLink
+  PATCH  /v2/vpclinks/{vpcLinkId}                    — UpdateVpcLink
+  DELETE /v2/vpclinks/{vpcLinkId}                    — DeleteVpcLink
 
 Data plane:
   Requests to /{apiId}.execute-api.localhost/{stage}/{path} are forwarded to
@@ -98,6 +133,11 @@ _authorizers = AccountScopedDict()   # api_id -> {authorizer_id -> authorizer ob
 _api_tags = AccountScopedDict()      # resource_arn -> {key -> value}
 _route_responses = AccountScopedDict()         # api_id -> {route_id -> {rr_id -> route_response}}
 _integration_responses = AccountScopedDict()   # api_id -> {integration_id -> {ir_id -> int_response}}
+_domain_names = AccountScopedDict()  # domain_name -> DomainName
+_api_mappings = AccountScopedDict()  # domain_name -> {mapping_id -> ApiMapping}
+_models = AccountScopedDict()        # api_id -> {model_id -> Model}
+_vpc_links = AccountScopedDict()     # vpc_link_id -> VpcLink
+_routing_rules = AccountScopedDict() # api_id -> {rule_id -> RoutingRule}
 # JWKS cache is account-scoped because issuer URLs in MiniStack can resolve
 # to per-account local Cognito user pools — the same URL string may legitimately
 # serve different keys in different accounts.
@@ -211,6 +251,11 @@ def get_state() -> dict:
         "api_tags": copy.deepcopy(_api_tags),
         "route_responses": copy.deepcopy(_route_responses),
         "integration_responses": copy.deepcopy(_integration_responses),
+        "domain_names": copy.deepcopy(_domain_names),
+        "api_mappings": copy.deepcopy(_api_mappings),
+        "models": copy.deepcopy(_models),
+        "vpc_links": copy.deepcopy(_vpc_links),
+        "routing_rules": copy.deepcopy(_routing_rules),
     }
 
 
@@ -225,6 +270,11 @@ def load_persisted_state(data: dict) -> None:
     _api_tags.update(data.get("api_tags", {}))
     _route_responses.update(data.get("route_responses", {}))
     _integration_responses.update(data.get("integration_responses", {}))
+    _domain_names.update(data.get("domain_names", {}))
+    _api_mappings.update(data.get("api_mappings", {}))
+    _models.update(data.get("models", {}))
+    _vpc_links.update(data.get("vpc_links", {}))
+    _routing_rules.update(data.get("routing_rules", {}))
 
 
 # ---- Control plane router ----
@@ -386,6 +436,83 @@ async def handle_request(method, path, headers, body, query_params):
                     return _update_authorizer(api_id, sub_id, data)
                 if method == "DELETE":
                     return _delete_authorizer(api_id, sub_id)
+
+        # /v2/apis/{apiId}/models[/{modelId}]
+        if api_id and sub == "models":
+            if not sub_id:
+                if method == "POST":
+                    return _create_model(api_id, data)
+                if method == "GET":
+                    return _get_models(api_id)
+            else:
+                if method == "GET":
+                    return _get_model(api_id, sub_id)
+                if method == "PATCH":
+                    return _update_model(api_id, sub_id, data)
+                if method == "DELETE":
+                    return _delete_model(api_id, sub_id)
+
+        # /v2/apis/{apiId}/routingrules[/{ruleId}]
+        if api_id and sub == "routingrules":
+            if not sub_id:
+                if method == "POST":
+                    return _create_routing_rule(api_id, data)
+                if method == "GET":
+                    return _get_routing_rules(api_id)
+            else:
+                if method == "GET":
+                    return _get_routing_rule(api_id, sub_id)
+                if method == "PATCH":
+                    return _update_routing_rule(api_id, sub_id, data)
+                if method == "DELETE":
+                    return _delete_routing_rule(api_id, sub_id)
+
+    # /v2/domainnames[/{domainName}[/{resource}]]
+    if resource == "domainnames":
+        domain_name = parts[2] if len(parts) > 2 else None
+        sub = parts[3] if len(parts) > 3 else None
+        sub_id = parts[4] if len(parts) > 4 else None
+        if not domain_name:
+            if method == "GET":
+                return _get_domain_names()
+            if method == "POST":
+                return _create_domain_name(data)
+        elif sub == "apimappings":
+            if not sub_id:
+                if method == "GET":
+                    return _get_api_mappings(domain_name)
+                if method == "POST":
+                    return _create_api_mapping(domain_name, data)
+            else:
+                if method == "GET":
+                    return _get_api_mapping(domain_name, sub_id)
+                if method == "PATCH":
+                    return _update_api_mapping(domain_name, sub_id, data)
+                if method == "DELETE":
+                    return _delete_api_mapping(domain_name, sub_id)
+        else:
+            if method == "GET":
+                return _get_domain_name(domain_name)
+            if method == "PATCH":
+                return _update_domain_name(domain_name, data)
+            if method == "DELETE":
+                return _delete_domain_name(domain_name)
+
+    # /v2/vpclinks[/{vpcLinkId}]
+    if resource == "vpclinks":
+        vpc_link_id = parts[2] if len(parts) > 2 else None
+        if not vpc_link_id:
+            if method == "GET":
+                return _get_vpc_links()
+            if method == "POST":
+                return _create_vpc_link(data)
+        else:
+            if method == "GET":
+                return _get_vpc_link(vpc_link_id)
+            if method == "PATCH":
+                return _update_vpc_link(vpc_link_id, data)
+            if method == "DELETE":
+                return _delete_vpc_link(vpc_link_id)
 
     return _apigw_error("NotFoundException", f"Unknown API Gateway path: {path}", 404)
 
@@ -1457,6 +1584,11 @@ def reset():
     _api_tags.clear()
     _route_responses.clear()
     _integration_responses.clear()
+    _domain_names.clear()
+    _api_mappings.clear()
+    _models.clear()
+    _vpc_links.clear()
+    _routing_rules.clear()
     # Signal any live WS connections to shut down, then drop registry.
     for conn in list(_ws_connections.values()):
         ev = conn.get("close_event")
@@ -1563,6 +1695,227 @@ def _update_integration_response(api_id, integration_id, ir_id, data):
 
 def _delete_integration_response(api_id, integration_id, ir_id):
     _integration_responses.get(api_id, {}).get(integration_id, {}).pop(ir_id, None)
+    return 204, {}, b""
+
+
+# ---- Control plane: Domain Names ----
+
+def _create_domain_name(data):
+    domain_name = data.get("domainName", "")
+    if not domain_name:
+        return _apigw_error("BadRequestException", "DomainName is required", 400)
+    if domain_name in _domain_names:
+        return _apigw_error("ConflictException", f"Domain name {domain_name} already exists", 409)
+    dn = {
+        "domainName": domain_name,
+        "domainNameConfigurations": data.get("domainNameConfigurations", []),
+        "tags": data.get("tags", {}),
+    }
+    _domain_names[domain_name] = dn
+    _api_mappings[domain_name] = {}
+    return _apigw_response(dn, 201)
+
+
+def _get_domain_names():
+    return _apigw_response({"items": list(_domain_names.values())})
+
+
+def _get_domain_name(domain_name):
+    dn = _domain_names.get(domain_name)
+    if not dn:
+        return _apigw_error("NotFoundException", f"Domain name {domain_name} not found", 404)
+    return _apigw_response(dn)
+
+
+def _update_domain_name(domain_name, data):
+    dn = _domain_names.get(domain_name)
+    if not dn:
+        return _apigw_error("NotFoundException", f"Domain name {domain_name} not found", 404)
+    for k in ("domainNameConfigurations",):
+        if k in data:
+            dn[k] = data[k]
+    return _apigw_response(dn)
+
+
+def _delete_domain_name(domain_name):
+    _domain_names.pop(domain_name, None)
+    _api_mappings.pop(domain_name, None)
+    return 204, {}, b""
+
+
+# ---- Control plane: Api Mappings ----
+
+def _create_api_mapping(domain_name, data):
+    if domain_name not in _domain_names:
+        return _apigw_error("NotFoundException", f"Domain name {domain_name} not found", 404)
+    mapping_id = new_uuid()[:8]
+    mapping = {
+        "apiId": data.get("apiId", ""),
+        "stage": data.get("stage", ""),
+        "apiMappingKey": data.get("apiMappingKey", ""),
+        "id": mapping_id,
+    }
+    _api_mappings.setdefault(domain_name, {})[mapping_id] = mapping
+    return _apigw_response(mapping, 201)
+
+
+def _get_api_mappings(domain_name):
+    if domain_name not in _domain_names:
+        return _apigw_error("NotFoundException", f"Domain name {domain_name} not found", 404)
+    return _apigw_response({"items": list(_api_mappings.get(domain_name, {}).values())})
+
+
+def _get_api_mapping(domain_name, mapping_id):
+    mapping = _api_mappings.get(domain_name, {}).get(mapping_id)
+    if not mapping:
+        return _apigw_error("NotFoundException", f"ApiMapping {mapping_id} not found", 404)
+    return _apigw_response(mapping)
+
+
+def _update_api_mapping(domain_name, mapping_id, data):
+    mapping = _api_mappings.get(domain_name, {}).get(mapping_id)
+    if not mapping:
+        return _apigw_error("NotFoundException", f"ApiMapping {mapping_id} not found", 404)
+    for k in ("apiId", "stage", "apiMappingKey"):
+        if k in data:
+            mapping[k] = data[k]
+    return _apigw_response(mapping)
+
+
+def _delete_api_mapping(domain_name, mapping_id):
+    _api_mappings.get(domain_name, {}).pop(mapping_id, None)
+    return 204, {}, b""
+
+
+# ---- Control plane: Models ----
+
+def _create_model(api_id, data):
+    if api_id not in _apis:
+        return _apigw_error("NotFoundException", f"API {api_id} not found", 404)
+    model_id = new_uuid()[:8]
+    model = {
+        "modelId": model_id,
+        "name": data.get("name", ""),
+        "schema": data.get("schema", {}),
+        "contentType": data.get("contentType", "application/json"),
+        "description": data.get("description", ""),
+    }
+    _models.setdefault(api_id, {})[model_id] = model
+    return _apigw_response(model, 201)
+
+
+def _get_models(api_id):
+    if api_id not in _apis:
+        return _apigw_error("NotFoundException", f"API {api_id} not found", 404)
+    return _apigw_response({"items": list(_models.get(api_id, {}).values())})
+
+
+def _get_model(api_id, model_id):
+    model = _models.get(api_id, {}).get(model_id)
+    if not model:
+        return _apigw_error("NotFoundException", f"Model {model_id} not found", 404)
+    return _apigw_response(model)
+
+
+def _update_model(api_id, model_id, data):
+    model = _models.get(api_id, {}).get(model_id)
+    if not model:
+        return _apigw_error("NotFoundException", f"Model {model_id} not found", 404)
+    for k in ("name", "schema", "contentType", "description"):
+        if k in data:
+            model[k] = data[k]
+    return _apigw_response(model)
+
+
+def _delete_model(api_id, model_id):
+    _models.get(api_id, {}).pop(model_id, None)
+    return 204, {}, b""
+
+
+# ---- Control plane: Vpc Links ----
+
+def _create_vpc_link(data):
+    vpc_link_id = new_uuid()[:8]
+    vpc_link = {
+        "vpcLinkId": vpc_link_id,
+        "name": data.get("name", ""),
+        "description": data.get("description", ""),
+        "status": "AVAILABLE",
+        "subnetIds": data.get("subnetIds", []),
+        "securityGroupIds": data.get("securityGroupIds", []),
+        "tags": data.get("tags", {}),
+    }
+    _vpc_links[vpc_link_id] = vpc_link
+    return _apigw_response(vpc_link, 201)
+
+
+def _get_vpc_links():
+    return _apigw_response({"items": list(_vpc_links.values())})
+
+
+def _get_vpc_link(vpc_link_id):
+    vpc_link = _vpc_links.get(vpc_link_id)
+    if not vpc_link:
+        return _apigw_error("NotFoundException", f"VpcLink {vpc_link_id} not found", 404)
+    return _apigw_response(vpc_link)
+
+
+def _update_vpc_link(vpc_link_id, data):
+    vpc_link = _vpc_links.get(vpc_link_id)
+    if not vpc_link:
+        return _apigw_error("NotFoundException", f"VpcLink {vpc_link_id} not found", 404)
+    for k in ("name", "description", "subnetIds", "securityGroupIds"):
+        if k in data:
+            vpc_link[k] = data[k]
+    return _apigw_response(vpc_link)
+
+
+def _delete_vpc_link(vpc_link_id):
+    _vpc_links.pop(vpc_link_id, None)
+    return 204, {}, b""
+
+
+# ---- Control plane: Routing Rules ----
+
+def _create_routing_rule(api_id, data):
+    if api_id not in _apis:
+        return _apigw_error("NotFoundException", f"API {api_id} not found", 404)
+    rule_id = new_uuid()[:8]
+    rule = {
+        "routingRuleId": rule_id,
+        "condition": data.get("condition", {}),
+        "stageOverride": data.get("stageOverride", {}),
+        "priority": data.get("priority", 0),
+    }
+    _routing_rules.setdefault(api_id, {})[rule_id] = rule
+    return _apigw_response(rule, 201)
+
+
+def _get_routing_rules(api_id):
+    if api_id not in _apis:
+        return _apigw_error("NotFoundException", f"API {api_id} not found", 404)
+    return _apigw_response({"items": list(_routing_rules.get(api_id, {}).values())})
+
+
+def _get_routing_rule(api_id, rule_id):
+    rule = _routing_rules.get(api_id, {}).get(rule_id)
+    if not rule:
+        return _apigw_error("NotFoundException", f"RoutingRule {rule_id} not found", 404)
+    return _apigw_response(rule)
+
+
+def _update_routing_rule(api_id, rule_id, data):
+    rule = _routing_rules.get(api_id, {}).get(rule_id)
+    if not rule:
+        return _apigw_error("NotFoundException", f"RoutingRule {rule_id} not found", 404)
+    for k in ("condition", "stageOverride", "priority"):
+        if k in data:
+            rule[k] = data[k]
+    return _apigw_response(rule)
+
+
+def _delete_routing_rule(api_id, rule_id):
+    _routing_rules.get(api_id, {}).pop(rule_id, None)
     return 204, {}, b""
 
 

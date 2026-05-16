@@ -43,6 +43,25 @@ Control plane endpoints implemented:
   GET    /restapis/{id}/models                                             — GetModels
   GET    /restapis/{id}/models/{modelName}                                 — GetModel
   DELETE /restapis/{id}/models/{modelName}                                 — DeleteModel
+  POST   /restapis/{id}/requestvalidators                                  — CreateRequestValidator
+  GET    /restapis/{id}/requestvalidators                                  — GetRequestValidators
+  GET    /restapis/{id}/requestvalidators/{validatorId}                    — GetRequestValidator
+  PATCH  /restapis/{id}/requestvalidators/{validatorId}                    — UpdateRequestValidator
+  DELETE /restapis/{id}/requestvalidators/{validatorId}                    — DeleteRequestValidator
+  PUT    /restapis/{id}/gatewayresponses/{responseType}                    — PutGatewayResponse
+  GET    /restapis/{id}/gatewayresponses                                   — GetGatewayResponses
+  GET    /restapis/{id}/gatewayresponses/{responseType}                    — GetGatewayResponse
+  DELETE /restapis/{id}/gatewayresponses/{responseType}                    — DeleteGatewayResponse
+  POST   /restapis/{id}/documentation/parts                                — CreateDocumentationPart
+  GET    /restapis/{id}/documentation/parts                                — GetDocumentationParts
+  GET    /restapis/{id}/documentation/parts/{partId}                       — GetDocumentationPart
+  PATCH  /restapis/{id}/documentation/parts/{partId}                       — UpdateDocumentationPart
+  DELETE /restapis/{id}/documentation/parts/{partId}                       — DeleteDocumentationPart
+  POST   /restapis/{id}/documentation/versions                             — CreateDocumentationVersion
+  GET    /restapis/{id}/documentation/versions                             — GetDocumentationVersions
+  GET    /restapis/{id}/documentation/versions/{version}                   — GetDocumentationVersion
+  PATCH  /restapis/{id}/documentation/versions/{version}                   — UpdateDocumentationVersion
+  DELETE /restapis/{id}/documentation/versions/{version}                   — DeleteDocumentationVersion
   GET    /apikeys                                                          — GetApiKeys
   POST   /apikeys                                                          — CreateApiKey
   GET    /apikeys/{keyId}                                                  — GetApiKey
@@ -58,6 +77,18 @@ Control plane endpoints implemented:
   POST   /domainnames                                                      — CreateDomainName
   GET    /domainnames/{domainName}                                         — GetDomainName
   DELETE /domainnames/{domainName}                                         — DeleteDomainName
+  GET    /domainnames/{domainName}/basepathmappings                        — GetBasePathMappings
+  POST   /domainnames/{domainName}/basepathmappings                        — CreateBasePathMapping
+  GET    /domainnames/{domainName}/basepathmappings/{basePath}             — GetBasePathMapping
+  DELETE /domainnames/{domainName}/basepathmappings/{basePath}             — DeleteBasePathMapping
+  GET    /clientcertificates                                               — GetClientCertificates
+  POST   /clientcertificates                                               — CreateClientCertificate
+  GET    /clientcertificates/{certId}                                      — GetClientCertificate
+  DELETE /clientcertificates/{certId}                                      — DeleteClientCertificate
+  GET    /vpclinks                                                         — GetVpcLinks
+  POST   /vpclinks                                                         — CreateVpcLink
+  GET    /vpclinks/{linkId}                                                — GetVpcLink
+  DELETE /vpclinks/{linkId}                                                — DeleteVpcLink
   GET    /tags/{resourceArn}                                               — GetTags
   PUT    /tags/{resourceArn}                                               — TagResource
   DELETE /tags/{resourceArn}                                               — UntagResource
@@ -110,6 +141,12 @@ _domain_names = AccountScopedDict()        # domain_name -> DomainName
 _base_path_mappings = AccountScopedDict()  # domain_name -> {base_path -> BasePathMapping}
 _v1_tags = AccountScopedDict()             # resource_arn -> {key -> value}
 _account_settings = AccountScopedDict()    # singleton per account: stores fields set via UpdateAccount
+_request_validators = AccountScopedDict()  # rest_api_id -> {validator_id -> RequestValidator}
+_gateway_responses = AccountScopedDict()   # rest_api_id -> {response_type -> GatewayResponse}
+_client_certificates = AccountScopedDict() # cert_id -> ClientCertificate
+_vpc_links = AccountScopedDict()           # link_id -> VpcLink
+_documentation_parts = AccountScopedDict() # rest_api_id -> {part_id -> DocumentationPart}
+_documentation_versions = AccountScopedDict()  # rest_api_id -> {version -> DocumentationVersion}
 
 
 # ---- Helpers ----
@@ -584,6 +621,12 @@ def reset():
     _base_path_mappings.clear()
     _v1_tags.clear()
     _account_settings.clear()
+    _request_validators.clear()
+    _gateway_responses.clear()
+    _client_certificates.clear()
+    _vpc_links.clear()
+    _documentation_parts.clear()
+    _documentation_versions.clear()
 
 
 # ---- Control plane router ----
@@ -853,6 +896,100 @@ async def handle_request(method, path, headers, body, query_params):
                     return _update_model(api_id, model_name, data)
                 if method == "DELETE":
                     return _delete_model(api_id, model_name)
+
+        # /restapis/{id}/requestvalidators[/{validatorId}]
+        elif sub == "requestvalidators":
+            validator_id = parts[3] if len(parts) > 3 else None
+            if not validator_id:
+                if method == "POST":
+                    return _create_request_validator(api_id, data)
+                if method == "GET":
+                    return _get_request_validators(api_id, query_params)
+            else:
+                if method == "GET":
+                    return _get_request_validator(api_id, validator_id)
+                if method == "PATCH":
+                    return _update_request_validator(api_id, validator_id, data)
+                if method == "DELETE":
+                    return _delete_request_validator(api_id, validator_id)
+
+        # /restapis/{id}/gatewayresponses[/{responseType}]
+        elif sub == "gatewayresponses":
+            response_type = parts[3] if len(parts) > 3 else None
+            if not response_type:
+                if method == "GET":
+                    return _get_gateway_responses(api_id, query_params)
+            else:
+                if method == "PUT":
+                    return _put_gateway_response(api_id, response_type, data)
+                if method == "GET":
+                    return _get_gateway_response(api_id, response_type)
+                if method == "DELETE":
+                    return _delete_gateway_response(api_id, response_type)
+
+        # /restapis/{id}/documentation/parts[/{partId}]
+        elif sub == "documentation":
+            doc_sub = parts[3] if len(parts) > 3 else None
+            if doc_sub == "parts":
+                part_id = parts[4] if len(parts) > 4 else None
+                if not part_id:
+                    if method == "POST":
+                        return _create_documentation_part(api_id, data)
+                    if method == "GET":
+                        return _get_documentation_parts(api_id, query_params)
+                else:
+                    if method == "GET":
+                        return _get_documentation_part(api_id, part_id)
+                    if method == "PATCH":
+                        return _update_documentation_part(api_id, part_id, data)
+                    if method == "DELETE":
+                        return _delete_documentation_part(api_id, part_id)
+            elif doc_sub == "versions":
+                version = parts[4] if len(parts) > 4 else None
+                if not version:
+                    if method == "POST":
+                        return _create_documentation_version(api_id, data)
+                    if method == "GET":
+                        return _get_documentation_versions(api_id, query_params)
+                else:
+                    if method == "GET":
+                        return _get_documentation_version(api_id, version)
+                    if method == "PATCH":
+                        return _update_documentation_version(api_id, version, data)
+                    if method == "DELETE":
+                        return _delete_documentation_version(api_id, version)
+
+    # /clientcertificates[/{certId}]
+    if top == "clientcertificates":
+        cert_id = parts[1] if len(parts) > 1 else None
+        if not cert_id:
+            if method == "GET":
+                return _get_client_certificates(query_params)
+            if method == "POST":
+                return _create_client_certificate(data)
+        else:
+            if method == "GET":
+                return _get_client_certificate(cert_id)
+            if method == "PATCH":
+                return _update_client_certificate(cert_id, data)
+            if method == "DELETE":
+                return _delete_client_certificate(cert_id)
+
+    # /vpclinks[/{linkId}]
+    if top == "vpclinks":
+        link_id = parts[1] if len(parts) > 1 else None
+        if not link_id:
+            if method == "GET":
+                return _get_vpc_links(query_params)
+            if method == "POST":
+                return _create_vpc_link(data)
+        else:
+            if method == "GET":
+                return _get_vpc_link(link_id)
+            if method == "PATCH":
+                return _update_vpc_link(link_id, data)
+            if method == "DELETE":
+                return _delete_vpc_link(link_id)
 
     return _v1_error("NotFoundException", f"Unknown API Gateway v1 path: {path}", 404)
 
@@ -1945,3 +2082,256 @@ def _update_account(data):
     _apply_patch(current, data.get("patchOperations", []))
     _account_settings["settings"] = current
     return _get_account()
+
+
+# ---- Control plane: Request Validators ----
+
+def _create_request_validator(api_id, data):
+    if api_id not in _rest_apis:
+        return _v1_error("NotFoundException", "Invalid API identifier specified", 404)
+    validator_id = _new_id()[:8]
+    validator = {
+        "id": validator_id,
+        "name": data.get("name", ""),
+        "validateRequestBody": data.get("validateRequestBody", False),
+        "validateRequestParameters": data.get("validateRequestParameters", False),
+    }
+    _request_validators.setdefault(api_id, {})[validator_id] = validator
+    return _v1_response(validator, 201)
+
+
+def _get_request_validators(api_id, query_params):
+    if api_id not in _rest_apis:
+        return _v1_error("NotFoundException", "Invalid API identifier specified", 404)
+    return _v1_paginated_response(list(_request_validators.get(api_id, {}).values()), query_params)
+
+
+def _get_request_validator(api_id, validator_id):
+    validator = _request_validators.get(api_id, {}).get(validator_id)
+    if not validator:
+        return _v1_error("NotFoundException", "Invalid RequestValidator identifier specified", 404)
+    return _v1_response(validator)
+
+
+def _update_request_validator(api_id, validator_id, data):
+    validator = _request_validators.get(api_id, {}).get(validator_id)
+    if not validator:
+        return _v1_error("NotFoundException", "Invalid RequestValidator identifier specified", 404)
+    patch_ops = data.get("patchOperations", [])
+    _apply_patch(validator, patch_ops)
+    return _v1_response(validator)
+
+
+def _delete_request_validator(api_id, validator_id):
+    _request_validators.get(api_id, {}).pop(validator_id, None)
+    return 202, {}, b""
+
+
+# ---- Control plane: Gateway Responses ----
+
+def _put_gateway_response(api_id, response_type, data):
+    if api_id not in _rest_apis:
+        return _v1_error("NotFoundException", "Invalid API identifier specified", 404)
+    response = {
+        "responseType": response_type,
+        "statusCode": data.get("statusCode", ""),
+        "responseParameters": data.get("responseParameters", {}),
+        "responseTemplates": data.get("responseTemplates", {}),
+    }
+    _gateway_responses.setdefault(api_id, {})[response_type] = response
+    return _v1_response(response, 201)
+
+
+def _get_gateway_responses(api_id, query_params):
+    if api_id not in _rest_apis:
+        return _v1_error("NotFoundException", "Invalid API identifier specified", 404)
+    return _v1_paginated_response(list(_gateway_responses.get(api_id, {}).values()), query_params)
+
+
+def _get_gateway_response(api_id, response_type):
+    response = _gateway_responses.get(api_id, {}).get(response_type)
+    if not response:
+        return _v1_error("NotFoundException", "Invalid GatewayResponse identifier specified", 404)
+    return _v1_response(response)
+
+
+def _delete_gateway_response(api_id, response_type):
+    _gateway_responses.get(api_id, {}).pop(response_type, None)
+    return 202, {}, b""
+
+
+# ---- Control plane: Client Certificates ----
+
+def _create_client_certificate(data):
+    cert_id = _new_id()[:8]
+    cert = {
+        "clientCertificateId": cert_id,
+        "description": data.get("description", ""),
+        "createdDate": _now_unix(),
+        "expirationDate": _now_unix() + 365 * 24 * 3600,
+        "tags": data.get("tags", {}),
+    }
+    _client_certificates[cert_id] = cert
+    return _v1_response(cert, 201)
+
+
+def _get_client_certificates(query_params):
+    return _v1_paginated_response(list(_client_certificates.values()), query_params)
+
+
+def _get_client_certificate(cert_id):
+    cert = _client_certificates.get(cert_id)
+    if not cert:
+        return _v1_error("NotFoundException", "Invalid ClientCertificate identifier specified", 404)
+    return _v1_response(cert)
+
+
+def _update_client_certificate(cert_id, data):
+    cert = _client_certificates.get(cert_id)
+    if not cert:
+        return _v1_error("NotFoundException", "Invalid ClientCertificate identifier specified", 404)
+    patch_ops = data.get("patchOperations", [])
+    _apply_patch(cert, patch_ops)
+    return _v1_response(cert)
+
+
+def _delete_client_certificate(cert_id):
+    _client_certificates.pop(cert_id, None)
+    return 202, {}, b""
+
+
+# ---- Control plane: Vpc Links ----
+
+def _create_vpc_link(data):
+    link_id = _new_id()[:8]
+    vpc_link = {
+        "id": link_id,
+        "name": data.get("name", ""),
+        "description": data.get("description", ""),
+        "status": "AVAILABLE",
+        "protocol": data.get("protocol", "HTTP1"),
+        "targetArns": data.get("targetArns", []),
+        "tags": data.get("tags", {}),
+    }
+    _vpc_links[link_id] = vpc_link
+    return _v1_response(vpc_link, 201)
+
+
+def _get_vpc_links(query_params):
+    return _v1_paginated_response(list(_vpc_links.values()), query_params)
+
+
+def _get_vpc_link(link_id):
+    vpc_link = _vpc_links.get(link_id)
+    if not vpc_link:
+        return _v1_error("NotFoundException", "Invalid VpcLink identifier specified", 404)
+    return _v1_response(vpc_link)
+
+
+def _update_vpc_link(link_id, data):
+    vpc_link = _vpc_links.get(link_id)
+    if not vpc_link:
+        return _v1_error("NotFoundException", "Invalid VpcLink identifier specified", 404)
+    patch_ops = data.get("patchOperations", [])
+    _apply_patch(vpc_link, patch_ops)
+    return _v1_response(vpc_link)
+
+
+def _delete_vpc_link(link_id):
+    _vpc_links.pop(link_id, None)
+    return 202, {}, b""
+
+
+# ---- Control plane: Documentation Parts ----
+
+def _create_documentation_part(api_id, data):
+    if api_id not in _rest_apis:
+        return _v1_error("NotFoundException", "Invalid API identifier specified", 404)
+    part_id = _new_id()[:8]
+    location = data.get("location", {})
+    doc_part = {
+        "id": part_id,
+        "location": {
+            "type": location.get("type", "API"),
+            "path": location.get("path", ""),
+            "method": location.get("method", ""),
+            "statusCode": location.get("statusCode", ""),
+            "name": location.get("name", ""),
+        },
+        "properties": data.get("properties", "{}"),
+    }
+    _documentation_parts.setdefault(api_id, {})[part_id] = doc_part
+    return _v1_response(doc_part, 201)
+
+
+def _get_documentation_parts(api_id, query_params):
+    if api_id not in _rest_apis:
+        return _v1_error("NotFoundException", "Invalid API identifier specified", 404)
+    return _v1_paginated_response(list(_documentation_parts.get(api_id, {}).values()), query_params)
+
+
+def _get_documentation_part(api_id, part_id):
+    part = _documentation_parts.get(api_id, {}).get(part_id)
+    if not part:
+        return _v1_error("NotFoundException", "Invalid DocumentationPart identifier specified", 404)
+    return _v1_response(part)
+
+
+def _update_documentation_part(api_id, part_id, data):
+    part = _documentation_parts.get(api_id, {}).get(part_id)
+    if not part:
+        return _v1_error("NotFoundException", "Invalid DocumentationPart identifier specified", 404)
+    patch_ops = data.get("patchOperations", [])
+    _apply_patch(part, patch_ops)
+    return _v1_response(part)
+
+
+def _delete_documentation_part(api_id, part_id):
+    _documentation_parts.get(api_id, {}).pop(part_id, None)
+    return 202, {}, b""
+
+
+# ---- Control plane: Documentation Versions ----
+
+def _create_documentation_version(api_id, data):
+    if api_id not in _rest_apis:
+        return _v1_error("NotFoundException", "Invalid API identifier specified", 404)
+    version = data.get("version", "")
+    if not version:
+        return _v1_error("BadRequestException", "Version is required", 400)
+    if version in _documentation_versions.get(api_id, {}):
+        return _v1_error("ConflictException", "DocumentationVersion already exists", 409)
+    doc_version = {
+        "version": version,
+        "createdDate": _now_unix(),
+        "description": data.get("description", ""),
+    }
+    _documentation_versions.setdefault(api_id, {})[version] = doc_version
+    return _v1_response(doc_version, 201)
+
+
+def _get_documentation_versions(api_id, query_params):
+    if api_id not in _rest_apis:
+        return _v1_error("NotFoundException", "Invalid API identifier specified", 404)
+    return _v1_paginated_response(list(_documentation_versions.get(api_id, {}).values()), query_params)
+
+
+def _get_documentation_version(api_id, version):
+    doc_version = _documentation_versions.get(api_id, {}).get(version)
+    if not doc_version:
+        return _v1_error("NotFoundException", "Invalid DocumentationVersion identifier specified", 404)
+    return _v1_response(doc_version)
+
+
+def _update_documentation_version(api_id, version, data):
+    doc_version = _documentation_versions.get(api_id, {}).get(version)
+    if not doc_version:
+        return _v1_error("NotFoundException", "Invalid DocumentationVersion identifier specified", 404)
+    patch_ops = data.get("patchOperations", [])
+    _apply_patch(doc_version, patch_ops)
+    return _v1_response(doc_version)
+
+
+def _delete_documentation_version(api_id, version):
+    _documentation_versions.get(api_id, {}).pop(version, None)
+    return 202, {}, b""

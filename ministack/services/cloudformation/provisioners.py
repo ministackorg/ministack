@@ -1292,6 +1292,290 @@ def _apigw_account_delete(physical_id, props):
     _apigw_v1._account_settings["settings"] = settings
 
 
+# --- API Gateway ApiKey ---
+
+def _apigw_api_key_create(logical_id, props, stack_name):
+    data = {
+        "name": props.get("Name") or _physical_name(stack_name, logical_id, max_len=128),
+        "description": props.get("Description", ""),
+        "enabled": props.get("Enabled", True),
+        "stageKeys": props.get("StageKeys", []),
+        "tags": {t["Key"]: t["Value"] for t in props.get("Tags", [])},
+    }
+    status, headers, body = _apigw_v1._create_api_key(data)
+    if status >= 400:
+        raise ValueError(f"AWS::ApiGateway::ApiKey create failed: {body!r}")
+    api_key = json.loads(body) if isinstance(body, (bytes, bytearray)) else json.loads(body)
+    key_id = api_key.get("id", "")
+    return key_id, {"Id": key_id}
+
+
+def _apigw_api_key_delete(physical_id, props):
+    _apigw_v1._delete_api_key(physical_id)
+
+
+# --- API Gateway UsagePlan ---
+
+def _apigw_usage_plan_create(logical_id, props, stack_name):
+    data = {
+        "name": props.get("Name") or _physical_name(stack_name, logical_id, max_len=128),
+        "description": props.get("Description", ""),
+        "apiStages": props.get("ApiStages", []),
+        "throttle": props.get("Throttle", {}),
+        "quota": props.get("Quota", {}),
+        "tags": {t["Key"]: t["Value"] for t in props.get("Tags", [])},
+    }
+    status, headers, body = _apigw_v1._create_usage_plan(data)
+    if status >= 400:
+        raise ValueError(f"AWS::ApiGateway::UsagePlan create failed: {body!r}")
+    plan = json.loads(body) if isinstance(body, (bytes, bytearray)) else json.loads(body)
+    plan_id = plan.get("id", "")
+    return plan_id, {"Id": plan_id}
+
+
+def _apigw_usage_plan_delete(physical_id, props):
+    _apigw_v1._delete_usage_plan(physical_id)
+
+
+# --- API Gateway UsagePlanKey ---
+
+def _apigw_usage_plan_key_create(logical_id, props, stack_name):
+    plan_id = props.get("KeyId", "")
+    data = {
+        "keyId": props.get("KeyId", ""),
+        "keyType": props.get("KeyType", "API_KEY"),
+    }
+    status, headers, body = _apigw_v1._create_usage_plan_key(plan_id, data)
+    if status >= 400:
+        raise ValueError(f"AWS::ApiGateway::UsagePlanKey create failed: {body!r}")
+    key = json.loads(body) if isinstance(body, (bytes, bytearray)) else json.loads(body)
+    key_id = key.get("id", "")
+    pid = f"{plan_id}/{key_id}"
+    return pid, {"Id": key_id}
+
+
+def _apigw_usage_plan_key_delete(physical_id, props):
+    parts = physical_id.split("/", 1)
+    if len(parts) == 2:
+        plan_id, key_id = parts
+        _apigw_v1._delete_usage_plan_key(plan_id, key_id)
+
+
+# --- API Gateway DomainName ---
+
+def _apigw_domain_name_create(logical_id, props, stack_name):
+    data = {
+        "domainName": props.get("DomainName") or _physical_name(stack_name, logical_id, lowercase=True, max_len=128),
+        "certificateName": props.get("CertificateName", ""),
+        "certificateArn": props.get("CertificateArn", ""),
+        "endpointConfiguration": props.get("EndpointConfiguration", {"types": ["REGIONAL"]}),
+        "securityPolicy": props.get("SecurityPolicy", "TLS_1_2"),
+        "tags": {t["Key"]: t["Value"] for t in props.get("Tags", [])},
+    }
+    status, headers, body = _apigw_v1._create_domain_name(data)
+    if status >= 400:
+        raise ValueError(f"AWS::ApiGateway::DomainName create failed: {body!r}")
+    dn = json.loads(body) if isinstance(body, (bytes, bytearray)) else json.loads(body)
+    domain_name = dn.get("domainName", "")
+    return domain_name, {
+        "RegionalDomainName": dn.get("regionalDomainName", ""),
+        "DistributionDomainName": dn.get("distributionDomainName", ""),
+        "RegionalHostedZoneId": dn.get("regionalHostedZoneId", ""),
+    }
+
+
+def _apigw_domain_name_delete(physical_id, props):
+    _apigw_v1._delete_domain_name(physical_id)
+
+
+# --- API Gateway BasePathMapping ---
+
+def _apigw_base_path_mapping_create(logical_id, props, stack_name):
+    domain_name = props.get("DomainName", "")
+    data = {
+        "basePath": props.get("BasePath", "(none)"),
+        "restApiId": props.get("RestApiId", ""),
+        "stage": props.get("Stage", ""),
+    }
+    status, headers, body = _apigw_v1._create_base_path_mapping(domain_name, data)
+    if status >= 400:
+        raise ValueError(f"AWS::ApiGateway::BasePathMapping create failed: {body!r}")
+    mapping = json.loads(body) if isinstance(body, (bytes, bytearray)) else json.loads(body)
+    base_path = mapping.get("basePath", "(none)")
+    pid = f"{domain_name}/{base_path}"
+    return pid, {}
+
+
+def _apigw_base_path_mapping_delete(physical_id, props):
+    domain_name = props.get("DomainName", "")
+    base_path = props.get("BasePath", "(none)")
+    _apigw_v1._delete_base_path_mapping(domain_name, base_path)
+
+
+# --- API Gateway Model ---
+
+def _apigw_model_create(logical_id, props, stack_name):
+    api_id = props.get("RestApiId", "")
+    data = {
+        "name": props.get("Name") or logical_id,
+        "description": props.get("Description", ""),
+        "schema": props.get("Schema", "{}"),
+        "contentType": props.get("ContentType", "application/json"),
+    }
+    status, headers, body = _apigw_v1._create_model(api_id, data)
+    if status >= 400:
+        raise ValueError(f"AWS::ApiGateway::Model create failed: {body!r}")
+    model = json.loads(body) if isinstance(body, (bytes, bytearray)) else json.loads(body)
+    model_name = model.get("name", "")
+    return f"{api_id}/{model_name}", {"Name": model_name}
+
+
+def _apigw_model_delete(physical_id, props):
+    api_id = props.get("RestApiId", "")
+    parts = physical_id.split("/", 1)
+    if len(parts) == 2:
+        model_name = parts[1]
+        _apigw_v1._delete_model(api_id, model_name)
+
+
+# --- API Gateway RequestValidator ---
+
+def _apigw_request_validator_create(logical_id, props, stack_name):
+    api_id = props.get("RestApiId", "")
+    name = props.get("Name") or logical_id
+    validator_id = new_uuid()[:8]
+    validator = {
+        "id": validator_id,
+        "name": name,
+        "validateRequestBody": props.get("ValidateRequestBody", False),
+        "validateRequestParameters": props.get("ValidateRequestParameters", False),
+    }
+    _apigw_v1._request_validators.setdefault(api_id, {})[validator_id] = validator
+    return validator_id, {"Id": validator_id}
+
+
+def _apigw_request_validator_delete(physical_id, props):
+    api_id = props.get("RestApiId", "")
+    validators = _apigw_v1._request_validators.get(api_id, {})
+    validators.pop(physical_id, None)
+
+
+# --- API Gateway GatewayResponse ---
+
+def _apigw_gateway_response_create(logical_id, props, stack_name):
+    api_id = props.get("RestApiId", "")
+    response_type = props.get("ResponseType", "DEFAULT_4XX")
+    response = {
+        "responseType": response_type,
+        "statusCode": props.get("StatusCode", ""),
+        "responseParameters": props.get("ResponseParameters", {}),
+        "responseTemplates": props.get("ResponseTemplates", {}),
+    }
+    _apigw_v1._gateway_responses.setdefault(api_id, {})[response_type] = response
+    pid = f"{api_id}/{response_type}"
+    return pid, {}
+
+
+def _apigw_gateway_response_delete(physical_id, props):
+    api_id = props.get("RestApiId", "")
+    parts = physical_id.split("/", 1)
+    if len(parts) == 2:
+        response_type = parts[1]
+        responses = _apigw_v1._gateway_responses.get(api_id, {})
+        responses.pop(response_type, None)
+
+
+# --- API Gateway ClientCertificate ---
+
+def _apigw_client_certificate_create(logical_id, props, stack_name):
+    cert_id = new_uuid()[:8]
+    cert = {
+        "clientCertificateId": cert_id,
+        "description": props.get("Description", ""),
+        "createdDate": int(time.time()),
+        "expirationDate": int(time.time()) + 365 * 24 * 3600,
+        "tags": {t["Key"]: t["Value"] for t in props.get("Tags", [])},
+    }
+    _apigw_v1._client_certificates[cert_id] = cert
+    return cert_id, {"ClientCertificateId": cert_id}
+
+
+def _apigw_client_certificate_delete(physical_id, props):
+    _apigw_v1._client_certificates.pop(physical_id, None)
+
+
+# --- API Gateway VpcLink ---
+
+def _apigw_vpc_link_create(logical_id, props, stack_name):
+    name = props.get("Name") or _physical_name(stack_name, logical_id, max_len=128)
+    link_id = new_uuid()[:8]
+    vpc_link = {
+        "id": link_id,
+        "name": name,
+        "description": props.get("Description", ""),
+        "status": "AVAILABLE",
+        "protocol": props.get("Protocol", "HTTP1"),
+        "targetArns": props.get("TargetArns", []),
+        "tags": {t["Key"]: t["Value"] for t in props.get("Tags", [])},
+    }
+    _apigw_v1._vpc_links[link_id] = vpc_link
+    return link_id, {"Id": link_id}
+
+
+def _apigw_vpc_link_delete(physical_id, props):
+    _apigw_v1._vpc_links.pop(physical_id, None)
+
+
+# --- API Gateway DocumentationPart ---
+
+def _apigw_documentation_part_create(logical_id, props, stack_name):
+    api_id = props.get("RestApiId", "")
+    part_id = new_uuid()[:8]
+    location = props.get("Location", {})
+    doc_part = {
+        "id": part_id,
+        "location": {
+            "type": location.get("Type", "API"),
+            "path": location.get("Path", ""),
+            "method": location.get("Method", ""),
+            "statusCode": location.get("StatusCode", ""),
+            "name": location.get("Name", ""),
+        },
+        "properties": props.get("Properties", "{}"),
+    }
+    _apigw_v1._documentation_parts.setdefault(api_id, {})[part_id] = doc_part
+    return part_id, {"Id": part_id}
+
+
+def _apigw_documentation_part_delete(physical_id, props):
+    api_id = props.get("RestApiId", "")
+    parts_store = _apigw_v1._documentation_parts.get(api_id, {})
+    parts_store.pop(physical_id, None)
+
+
+# --- API Gateway DocumentationVersion ---
+
+def _apigw_documentation_version_create(logical_id, props, stack_name):
+    api_id = props.get("RestApiId", "")
+    version = props.get("Version", "")
+    doc_version = {
+        "version": version,
+        "createdDate": int(time.time()),
+        "description": props.get("Description", ""),
+    }
+    _apigw_v1._documentation_versions.setdefault(api_id, {})[version] = doc_version
+    return f"{api_id}/{version}", {"Version": version}
+
+
+def _apigw_documentation_version_delete(physical_id, props):
+    api_id = props.get("RestApiId", "")
+    parts = physical_id.split("/", 1)
+    if len(parts) == 2:
+        version = parts[1]
+        versions = _apigw_v1._documentation_versions.get(api_id, {})
+        versions.pop(version, None)
+
+
 # --- Lambda EventSourceMapping ---
 
 def _lambda_esm_create(logical_id, props, stack_name):
@@ -3076,6 +3360,240 @@ def _apigw_v2_route_delete(physical_id, props):
         routes.pop(route_id, None)
 
 
+# --- API Gateway V2 Authorizer ---
+
+def _apigw_v2_authorizer_create(logical_id, props, stack_name):
+    api_id = props.get("ApiId", "")
+    data = {
+        "name": props.get("Name") or logical_id,
+        "authorizerType": props.get("AuthorizerType", "JWT"),
+        "identitySource": props.get("IdentitySource", ["$request.header.Authorization"]),
+        "jwtConfiguration": props.get("JwtConfiguration", {}),
+        "authorizerUri": props.get("AuthorizerUri", ""),
+        "authorizerPayloadFormatVersion": props.get("AuthorizerPayloadFormatVersion", "2.0"),
+        "authorizerResultTtlInSeconds": props.get("AuthorizerResultTtlInSeconds", 300),
+        "enableSimpleResponses": props.get("EnableSimpleResponses", False),
+    }
+    status, headers, body = _apigw_v2._create_authorizer(api_id, data)
+    if status >= 400:
+        raise ValueError(f"AWS::ApiGatewayV2::Authorizer create failed: {body!r}")
+    result = json.loads(body) if isinstance(body, (bytes, bytearray)) else json.loads(body)
+    auth_id = result.get("authorizerId", "")
+    return auth_id, {"AuthorizerId": auth_id}
+
+
+def _apigw_v2_authorizer_delete(physical_id, props):
+    api_id = props.get("ApiId", "")
+    authorizers = _apigw_v2._authorizers.get(api_id, {})
+    authorizers.pop(physical_id, None)
+
+
+# --- API Gateway V2 Deployment ---
+
+def _apigw_v2_deployment_create(logical_id, props, stack_name):
+    api_id = props.get("ApiId", "")
+    data = {
+        "description": props.get("Description", ""),
+    }
+    status, headers, body = _apigw_v2._create_deployment(api_id, data)
+    if status >= 400:
+        raise ValueError(f"AWS::ApiGatewayV2::Deployment create failed: {body!r}")
+    result = json.loads(body) if isinstance(body, (bytes, bytearray)) else json.loads(body)
+    deployment_id = result.get("deploymentId", "")
+    return deployment_id, {"DeploymentId": deployment_id}
+
+
+def _apigw_v2_deployment_delete(physical_id, props):
+    api_id = props.get("ApiId", "")
+    _apigw_v2._deployments.get(api_id, {}).pop(physical_id, None)
+
+
+# --- API Gateway V2 IntegrationResponse ---
+
+def _apigw_v2_integration_response_create(logical_id, props, stack_name):
+    api_id = props.get("ApiId", "")
+    integration_id = props.get("IntegrationId", "")
+    data = {
+        "integrationResponseKey": props.get("IntegrationResponseKey", "$default"),
+        "contentHandlingStrategy": props.get("ContentHandlingStrategy"),
+        "templateSelectionExpression": props.get("TemplateSelectionExpression"),
+        "responseParameters": props.get("ResponseParameters", {}),
+        "responseTemplates": props.get("ResponseTemplates", {}),
+    }
+    status, headers, body = _apigw_v2._create_integration_response(api_id, integration_id, data)
+    if status >= 400:
+        raise ValueError(f"AWS::ApiGatewayV2::IntegrationResponse create failed: {body!r}")
+    result = json.loads(body) if isinstance(body, (bytes, bytearray)) else json.loads(body)
+    ir_id = result.get("integrationResponseId", "")
+    pid = f"{api_id}/{integration_id}/{ir_id}"
+    return pid, {"IntegrationResponseId": ir_id}
+
+
+def _apigw_v2_integration_response_delete(physical_id, props):
+    api_id = props.get("ApiId", "")
+    integration_id = props.get("IntegrationId", "")
+    parts = physical_id.split("/")
+    if len(parts) >= 3:
+        ir_id = parts[-1]
+        _apigw_v2._integration_responses.get(api_id, {}).get(integration_id, {}).pop(ir_id, None)
+
+
+# --- API Gateway V2 Model ---
+
+def _apigw_v2_model_create(logical_id, props, stack_name):
+    api_id = props.get("ApiId", "")
+    data = {
+        "name": props.get("Name") or logical_id,
+        "schema": props.get("Schema", {}),
+        "contentType": props.get("ContentType", "application/json"),
+        "description": props.get("Description", ""),
+    }
+    status, headers, body = _apigw_v2._create_model(api_id, data)
+    if status >= 400:
+        raise ValueError(f"AWS::ApiGatewayV2::Model create failed: {body!r}")
+    result = json.loads(body) if isinstance(body, (bytes, bytearray)) else json.loads(body)
+    model_id = result.get("modelId", "")
+    return model_id, {"ModelId": model_id}
+
+
+def _apigw_v2_model_delete(physical_id, props):
+    api_id = props.get("ApiId", "")
+    _apigw_v2._models.get(api_id, {}).pop(physical_id, None)
+
+
+# --- API Gateway V2 RouteResponse ---
+
+def _apigw_v2_route_response_create(logical_id, props, stack_name):
+    api_id = props.get("ApiId", "")
+    route_id = props.get("RouteId", "")
+    data = {
+        "routeResponseKey": props.get("RouteResponseKey", "$default"),
+        "modelSelectionExpression": props.get("ModelSelectionExpression"),
+        "responseModels": props.get("ResponseModels", {}),
+        "responseParameters": props.get("ResponseParameters", {}),
+    }
+    status, headers, body = _apigw_v2._create_route_response(api_id, route_id, data)
+    if status >= 400:
+        raise ValueError(f"AWS::ApiGatewayV2::RouteResponse create failed: {body!r}")
+    result = json.loads(body) if isinstance(body, (bytes, bytearray)) else json.loads(body)
+    rr_id = result.get("routeResponseId", "")
+    pid = f"{api_id}/{route_id}/{rr_id}"
+    return pid, {"RouteResponseId": rr_id}
+
+
+def _apigw_v2_route_response_delete(physical_id, props):
+    api_id = props.get("ApiId", "")
+    route_id = props.get("RouteId", "")
+    parts = physical_id.split("/")
+    if len(parts) >= 3:
+        rr_id = parts[-1]
+        _apigw_v2._route_responses.get(api_id, {}).get(route_id, {}).pop(rr_id, None)
+
+
+# --- API Gateway V2 DomainName ---
+
+def _apigw_v2_domain_name_create(logical_id, props, stack_name):
+    data = {
+        "domainName": props.get("DomainName") or _physical_name(stack_name, logical_id, lowercase=True, max_len=128),
+        "domainNameConfigurations": props.get("DomainNameConfigurations", []),
+        "tags": {t["Key"]: t["Value"] for t in props.get("Tags", [])},
+    }
+    status, headers, body = _apigw_v2._create_domain_name(data)
+    if status >= 400:
+        raise ValueError(f"AWS::ApiGatewayV2::DomainName create failed: {body!r}")
+    result = json.loads(body) if isinstance(body, (bytes, bytearray)) else json.loads(body)
+    domain_name = result.get("domainName", "")
+    return domain_name, {"RegionalDomainName": domain_name}
+
+
+def _apigw_v2_domain_name_delete(physical_id, props):
+    _apigw_v2._delete_domain_name(physical_id)
+
+
+# --- API Gateway V2 ApiMapping ---
+
+def _apigw_v2_api_mapping_create(logical_id, props, stack_name):
+    domain_name = props.get("DomainName", "")
+    data = {
+        "apiId": props.get("ApiId", ""),
+        "stage": props.get("Stage", ""),
+        "apiMappingKey": props.get("ApiMappingKey", ""),
+    }
+    status, headers, body = _apigw_v2._create_api_mapping(domain_name, data)
+    if status >= 400:
+        raise ValueError(f"AWS::ApiGatewayV2::ApiMapping create failed: {body!r}")
+    result = json.loads(body) if isinstance(body, (bytes, bytearray)) else json.loads(body)
+    mapping_id = result.get("id", "")
+    pid = f"{domain_name}/{mapping_id}"
+    return pid, {"Id": mapping_id}
+
+
+def _apigw_v2_api_mapping_delete(physical_id, props):
+    domain_name = props.get("DomainName", "")
+    parts = physical_id.split("/", 1)
+    if len(parts) == 2:
+        mapping_id = parts[1]
+        _apigw_v2._api_mappings.get(domain_name, {}).pop(mapping_id, None)
+
+
+# --- API Gateway V2 VpcLink ---
+
+def _apigw_v2_vpc_link_create(logical_id, props, stack_name):
+    data = {
+        "name": props.get("Name") or _physical_name(stack_name, logical_id, max_len=128),
+        "description": props.get("Description", ""),
+        "subnetIds": props.get("SubnetIds", []),
+        "securityGroupIds": props.get("SecurityGroupIds", []),
+        "tags": {t["Key"]: t["Value"] for t in props.get("Tags", [])},
+    }
+    status, headers, body = _apigw_v2._create_vpc_link(data)
+    if status >= 400:
+        raise ValueError(f"AWS::ApiGatewayV2::VpcLink create failed: {body!r}")
+    result = json.loads(body) if isinstance(body, (bytes, bytearray)) else json.loads(body)
+    vpc_link_id = result.get("vpcLinkId", "")
+    return vpc_link_id, {"VpcLinkId": vpc_link_id}
+
+
+def _apigw_v2_vpc_link_delete(physical_id, props):
+    _apigw_v2._vpc_links.pop(physical_id, None)
+
+
+# --- API Gateway V2 RoutingRule ---
+
+def _apigw_v2_routing_rule_create(logical_id, props, stack_name):
+    api_id = props.get("ApiId", "")
+    data = {
+        "condition": props.get("Condition", {}),
+        "stageOverride": props.get("StageOverride", {}),
+        "priority": props.get("Priority", 0),
+    }
+    status, headers, body = _apigw_v2._create_routing_rule(api_id, data)
+    if status >= 400:
+        raise ValueError(f"AWS::ApiGatewayV2::RoutingRule create failed: {body!r}")
+    result = json.loads(body) if isinstance(body, (bytes, bytearray)) else json.loads(body)
+    rule_id = result.get("routingRuleId", "")
+    return rule_id, {"RoutingRuleId": rule_id}
+
+
+def _apigw_v2_routing_rule_delete(physical_id, props):
+    api_id = props.get("ApiId", "")
+    _apigw_v2._routing_rules.get(api_id, {}).pop(physical_id, None)
+
+
+# --- API Gateway V2 ApiGatewayManagedOverrides ---
+
+def _apigw_v2_managed_overrides_create(logical_id, props, stack_name):
+    """``AWS::ApiGatewayV2::ApiGatewayManagedOverrides`` is a CFN-only construct
+    that stores override settings for managed APIs. No runtime API exists,
+    so this is a no-op provisioner that returns a stable physical id."""
+    pid = f"{stack_name}-{logical_id}-{new_uuid()[:8]}"
+    return pid, {}
+
+
+def _apigw_v2_managed_overrides_delete(physical_id, props):
+    pass
+
+
 # ---------------------------------------------------------------------------
 # SES EmailIdentity
 # ---------------------------------------------------------------------------
@@ -3601,6 +4119,18 @@ _RESOURCE_HANDLERS = {
     "AWS::ApiGateway::Deployment": {"create": _apigw_deployment_create, "delete": _apigw_deployment_delete},
     "AWS::ApiGateway::Stage": {"create": _apigw_stage_create, "delete": _apigw_stage_delete},
     "AWS::ApiGateway::Account": {"create": _apigw_account_create, "delete": _apigw_account_delete},
+    "AWS::ApiGateway::ApiKey": {"create": _apigw_api_key_create, "delete": _apigw_api_key_delete},
+    "AWS::ApiGateway::UsagePlan": {"create": _apigw_usage_plan_create, "delete": _apigw_usage_plan_delete},
+    "AWS::ApiGateway::UsagePlanKey": {"create": _apigw_usage_plan_key_create, "delete": _apigw_usage_plan_key_delete},
+    "AWS::ApiGateway::DomainName": {"create": _apigw_domain_name_create, "delete": _apigw_domain_name_delete},
+    "AWS::ApiGateway::BasePathMapping": {"create": _apigw_base_path_mapping_create, "delete": _apigw_base_path_mapping_delete},
+    "AWS::ApiGateway::Model": {"create": _apigw_model_create, "delete": _apigw_model_delete},
+    "AWS::ApiGateway::RequestValidator": {"create": _apigw_request_validator_create, "delete": _apigw_request_validator_delete},
+    "AWS::ApiGateway::GatewayResponse": {"create": _apigw_gateway_response_create, "delete": _apigw_gateway_response_delete},
+    "AWS::ApiGateway::ClientCertificate": {"create": _apigw_client_certificate_create, "delete": _apigw_client_certificate_delete},
+    "AWS::ApiGateway::VpcLink": {"create": _apigw_vpc_link_create, "delete": _apigw_vpc_link_delete},
+    "AWS::ApiGateway::DocumentationPart": {"create": _apigw_documentation_part_create, "delete": _apigw_documentation_part_delete},
+    "AWS::ApiGateway::DocumentationVersion": {"create": _apigw_documentation_version_create, "delete": _apigw_documentation_version_delete},
     "AWS::Lambda::EventSourceMapping": {"create": _lambda_esm_create, "delete": _lambda_esm_delete},
     "AWS::Pipes::Pipe": {"create": _pipes_pipe_create, "delete": _pipes_pipe_delete},
     "AWS::Lambda::Alias": {"create": _lambda_alias_create, "delete": _lambda_alias_delete},
@@ -3646,6 +4176,16 @@ _RESOURCE_HANDLERS = {
     "AWS::ApiGatewayV2::Stage": {"create": _apigw_v2_stage_create, "delete": _apigw_v2_stage_delete},
     "AWS::ApiGatewayV2::Integration": {"create": _apigw_v2_integration_create, "delete": _apigw_v2_integration_delete},
     "AWS::ApiGatewayV2::Route": {"create": _apigw_v2_route_create, "delete": _apigw_v2_route_delete},
+    "AWS::ApiGatewayV2::Authorizer": {"create": _apigw_v2_authorizer_create, "delete": _apigw_v2_authorizer_delete},
+    "AWS::ApiGatewayV2::Deployment": {"create": _apigw_v2_deployment_create, "delete": _apigw_v2_deployment_delete},
+    "AWS::ApiGatewayV2::IntegrationResponse": {"create": _apigw_v2_integration_response_create, "delete": _apigw_v2_integration_response_delete},
+    "AWS::ApiGatewayV2::Model": {"create": _apigw_v2_model_create, "delete": _apigw_v2_model_delete},
+    "AWS::ApiGatewayV2::RouteResponse": {"create": _apigw_v2_route_response_create, "delete": _apigw_v2_route_response_delete},
+    "AWS::ApiGatewayV2::DomainName": {"create": _apigw_v2_domain_name_create, "delete": _apigw_v2_domain_name_delete},
+    "AWS::ApiGatewayV2::ApiMapping": {"create": _apigw_v2_api_mapping_create, "delete": _apigw_v2_api_mapping_delete},
+    "AWS::ApiGatewayV2::VpcLink": {"create": _apigw_v2_vpc_link_create, "delete": _apigw_v2_vpc_link_delete},
+    "AWS::ApiGatewayV2::RoutingRule": {"create": _apigw_v2_routing_rule_create, "delete": _apigw_v2_routing_rule_delete},
+    "AWS::ApiGatewayV2::ApiGatewayManagedOverrides": {"create": _apigw_v2_managed_overrides_create, "delete": _apigw_v2_managed_overrides_delete},
     "AWS::SES::EmailIdentity": {"create": _ses_email_identity_create, "delete": _ses_email_identity_delete},
     "AWS::WAFv2::WebACL": {"create": _waf_web_acl_create, "delete": _waf_web_acl_delete},
     "AWS::CloudFront::Distribution": {"create": _cf_distribution_create, "delete": _cf_distribution_delete},
