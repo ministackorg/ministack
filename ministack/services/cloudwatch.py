@@ -223,6 +223,7 @@ def _evaluate_alarm(alarm):
         alarm["StateReason"] = reason
         alarm["StateUpdatedTimestamp"] = int(time.time())
         _record_history(alarm["AlarmName"], old_state, new_state, reason)
+        _dispatch_alarm_actions(alarm, old_state, new_state, reason)
 
 
 def _evaluate_all_alarms():
@@ -250,6 +251,88 @@ def _record_history(alarm_name, old_state, new_state, reason):
             ),
         }
     )
+
+
+def record_metric(namespace: str, metric_name: str, value: float,
+                  unit: str = "None", dimensions: dict | None = None) -> None:
+    """Internal entry point for other services to publish CloudWatch metrics
+    against AWS namespaces (``AWS/Lambda``, ``AWS/SQS``, etc.) without going
+    through the public PutMetricData wire path.
+
+    Multi-tenancy: writes into the *current* account-scoped bucket, so the
+    caller's contextvar account_id is used automatically. Safe to call from
+    any service handler. Errors are swallowed — instrumentation must never
+    break the primary operation.
+    """
+    dims = dimensions or {}
+    try:
+        _metric_bucket((namespace, metric_name, _dims_key(dims))).append(
+            {
+                "Timestamp": time.time(),
+                "Value": float(value),
+                "Unit": unit,
+                "Dimensions": dict(dims),
+            }
+        )
+    except Exception:
+        logger.debug("record_metric failed for %s/%s", namespace, metric_name, exc_info=True)
+
+
+def _dispatch_alarm_actions(alarm, old_state, new_state, reason):
+    """Fire SNS notifications for AlarmActions/OKActions/InsufficientDataActions
+    on alarm state transitions.
+
+    Mirrors real CloudWatch: each *Actions list is consulted only for the
+    matching destination state. Only SNS topic ARNs are dispatched; other
+    action types (autoscaling, EC2, SSM) are stored but not yet executed.
+    """
+    if not alarm.get("ActionsEnabled", True):
+        return
+    action_field = {
+        "ALARM": "AlarmActions",
+        "OK": "OKActions",
+        "INSUFFICIENT_DATA": "InsufficientDataActions",
+    }.get(new_state)
+    if not action_field:
+        return
+    actions = alarm.get(action_field) or []
+    sns_arns = [a for a in actions if isinstance(a, str) and a.startswith("arn:aws:sns:")]
+    if not sns_arns:
+        return
+    try:
+        from ministack.services import sns as _sns
+    except Exception:
+        logger.debug("alarm actions: SNS module unavailable", exc_info=True)
+        return
+
+    payload = {
+        "AlarmName": alarm.get("AlarmName", ""),
+        "AlarmDescription": alarm.get("AlarmDescription", ""),
+        "AWSAccountId": get_account_id(),
+        "NewStateValue": new_state,
+        "NewStateReason": reason,
+        "StateChangeTime": _ts_iso(time.time()),
+        "Region": get_region(),
+        "OldStateValue": old_state,
+        "Trigger": {
+            "MetricName": alarm.get("MetricName", ""),
+            "Namespace": alarm.get("Namespace", ""),
+            "Statistic": alarm.get("Statistic", ""),
+            "Unit": alarm.get("Unit"),
+            "Period": alarm.get("Period", 60),
+            "EvaluationPeriods": alarm.get("EvaluationPeriods", 1),
+            "ComparisonOperator": alarm.get("ComparisonOperator", ""),
+            "Threshold": alarm.get("Threshold", 0),
+            "Dimensions": alarm.get("Dimensions", []),
+        },
+    }
+    message = json.dumps(payload)
+    subject = f'{new_state}: "{alarm.get("AlarmName", "")}" in {get_region()}'[:100]
+    for topic_arn in sns_arns:
+        try:
+            _sns._fanout(topic_arn, new_uuid(), message, subject)
+        except Exception:
+            logger.exception("alarm actions: SNS fanout failed for %s", topic_arn)
 
 
 # ---------------------------------------------------------------------------
@@ -1140,6 +1223,7 @@ def _set_alarm_state(params, cbor_data, is_cbor, is_json=False):
 
     if old_state != new_state:
         _record_history(name, old_state, new_state, reason)
+        _dispatch_alarm_actions(alarm, old_state, new_state, reason)
 
     if is_cbor:
         return _cbor_ok({})

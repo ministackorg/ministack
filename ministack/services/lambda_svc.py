@@ -63,6 +63,35 @@ from ministack.core.responses import (
 logger = logging.getLogger("lambda")
 
 
+def _emit_lambda_metrics(function_name: str, duration_ms: float,
+                         error: bool, throttle: bool) -> None:
+    """Publish ``AWS/Lambda`` metrics for a single invocation.
+
+    Mirrors the four headline CloudWatch metrics every Lambda function emits:
+    Invocations (count), Errors (count), Duration (ms), Throttles (count).
+    Errors are swallowed; instrumentation must never break the primary call.
+    """
+    try:
+        from ministack.services import cloudwatch as _cw
+    except Exception:
+        return
+    dims = {"FunctionName": function_name}
+    try:
+        _cw.record_metric("AWS/Lambda", "Invocations", 1, "Count", dims)
+        _cw.record_metric(
+            "AWS/Lambda", "Errors", 1 if error else 0, "Count", dims,
+        )
+        _cw.record_metric(
+            "AWS/Lambda", "Throttles", 1 if throttle else 0, "Count", dims,
+        )
+        if duration_ms > 0:
+            _cw.record_metric(
+                "AWS/Lambda", "Duration", duration_ms, "Milliseconds", dims,
+            )
+    except Exception:
+        logger.debug("emit lambda metrics failed", exc_info=True)
+
+
 def _account_from_arn(arn: str) -> str:
     """Extract the 12-digit account ID from a Lambda function ARN.
 
@@ -1404,11 +1433,20 @@ async def _invoke(name: str, event: dict, headers: dict, path_qualifier: str | N
         # helper so event-source fan-out (S3, EventBridge, SNS → Lambda, etc.)
         # gets identical semantics.
         invoke_async_with_retry(exec_record, event)
+        _emit_lambda_metrics(name, duration_ms=0.0, error=False, throttle=False)
         return 202, {"X-Amz-Executed-Version": executed_version}, b""
 
     # RequestResponse — execute in worker thread so nested SDK calls
     # from the Lambda process can still reach this ASGI server.
+    _t_start = time.time()
     result = await asyncio.to_thread(_execute_function, exec_record, event)
+    _duration_ms = (time.time() - _t_start) * 1000.0
+    _emit_lambda_metrics(
+        name,
+        duration_ms=_duration_ms,
+        error=bool(result.get("error")),
+        throttle=bool(result.get("throttle")),
+    )
 
     resp_headers: dict = {
         "Content-Type": "application/json",

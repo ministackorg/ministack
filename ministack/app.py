@@ -95,7 +95,7 @@ _ALB_PATH_PREFIX = "/_alb/"
 _NON_S3_VHOST_NAMES = frozenset({
     "s3", "s3-control", "sqs", "sns", "dynamodb", "lambda", "iam", "sts",
     "secretsmanager", "logs", "ssm", "events", "kinesis", "monitoring", "ses",
-    "states", "ecs", "rds", "rds-data", "elasticache", "glue", "athena",
+    "states", "ecs", "rds", "rds-data", "elasticache", "glue", "athena", "airflow",
     "apigateway", "cloudformation", "autoscaling", "codebuild", "transfer", "cur",
     "cloudfront-kvs",
     "appsync-api", "appsync-realtime-api",
@@ -222,6 +222,7 @@ SERVICE_REGISTRY = {
     "events": {"module": "eventbridge", "aliases": ("eventbridge",)},
     "firehose": {"module": "firehose", "aliases": ("kinesis-firehose",)},
     "glue": {"module": "glue"},
+    "airflow": {"module": "mwaa", "aliases": ("mwaa",)},
     "iam": {"module": "iam"},
     "imds": {"module": "imds"},
     "kinesis": {"module": "kinesis"},
@@ -277,7 +278,7 @@ _state_map = {
     "elasticache": "elasticache", "appsync": "appsync",
     "appsync_events": "appsync_events",
     "stepfunctions": "stepfunctions", "alb": "alb",
-    "glue": "glue", "efs": "efs", "waf": "waf",
+    "glue": "glue", "mwaa": "mwaa", "efs": "efs", "waf": "waf",
     "athena": "athena", "emr": "emr", "cloudfront": "cloudfront",
     "codebuild": "codebuild", "acm": "acm", "firehose": "firehose",
     "ses": "ses", "ses_v2": "ses_v2",
@@ -1095,6 +1096,21 @@ async def _handle_s3_vhost_request(host: str, path: str, method: str, headers: d
     # prefixed by /key-value-stores/. Host-name exclusion above doesn't fire,
     # so guard explicitly here too.
     if path.startswith("/key-value-stores/"):
+        return None
+    # MWAA REST endpoints (api.airflow.{region}, env.airflow.{region}) — boto3
+    # expands the model's hostPrefix even when endpoint_url is overridden, so
+    # the host arrives as `api.localhost:4566`, and `api` looks like an S3
+    # bucket. Short-circuit any path that matches a real MWAA operation:
+    #   /environments, /environments/{Name}, /webtoken/{Name},
+    #   /clitoken/{Name}, /restapi/{Name}, /metrics/environments/{Name}
+    if (
+        path == "/environments"
+        or path.startswith("/environments/")
+        or path.startswith("/webtoken/")
+        or path.startswith("/clitoken/")
+        or path.startswith("/restapi/")
+        or path.startswith("/metrics/environments/")
+    ):
         return None
 
     vhost_path = "/" + bucket + path if path != "/" else "/" + bucket + "/"
