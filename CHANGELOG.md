@@ -7,6 +7,16 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [Unreleased]
+
+### Added
+- **API Gateway v1 — 12 new CloudFormation resource types** — `AWS::ApiGateway::ApiKey`, `UsagePlan`, `UsagePlanKey`, `DomainName`, `BasePathMapping`, `Model`, `RequestValidator`, `GatewayResponse`, `ClientCertificate`, `VpcLink`, `DocumentationPart`, `DocumentationVersion`. Each has a CFN provisioner (create/delete) backed by new REST API control-plane endpoints in `apigateway_v1.py`. CDK stacks referencing any of these types now deploy without `Unsupported resource type` errors.
+- **API Gateway v2 — 10 new CloudFormation resource types** — `AWS::ApiGatewayV2::Authorizer`, `Deployment`, `IntegrationResponse`, `Model`, `RouteResponse`, `DomainName`, `ApiMapping`, `VpcLink`, `RoutingRule`, `ApiGatewayManagedOverrides`. Same pattern: CFN provisioners backed by new `apigateway.py` control-plane handlers.
+- **API Gateway v1 — 24 new REST API control-plane endpoints** — full CRUD for RequestValidator, GatewayResponse, ClientCertificate, VpcLink, DocumentationPart, DocumentationVersion under `/restapis/{id}/...`, `/clientcertificates`, and `/vpclinks`.
+- **API Gateway v2 — 25 new REST API control-plane endpoints** — full CRUD for DomainName, ApiMapping, Model, VpcLink, RoutingRule under `/v2/domainnames`, `/v2/vpclinks`, `/v2/apis/{id}/models`, `/v2/apis/{id}/routingrules`.
+
+---
+
 ## [1.3.42] — 2026-05-16
 
 ### Added

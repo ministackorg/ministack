@@ -423,11 +423,25 @@ subnet = ec2.create_subnet(
 | `AWS::S3::BucketPolicy` | Bucket name | — |
 | `AWS::SQS::QueuePolicy` | Policy ID | — |
 | `AWS::SNS::TopicPolicy` | Policy ID | — |
-| `AWS::ApiGateway::RestApi` | API ID | RootResourceId |
-| `AWS::ApiGateway::Resource` | Resource ID | — |
+| `AWS::ApiGateway::RestApi` | API ID | RootResourceId, Arn |
+| `AWS::ApiGateway::Resource` | Resource ID | ResourceId |
 | `AWS::ApiGateway::Method` | Method ID | — |
-| `AWS::ApiGateway::Deployment` | Deployment ID | — |
-| `AWS::ApiGateway::Stage` | Stage name | — |
+| `AWS::ApiGateway::Authorizer` | Authorizer ID | AuthorizerId |
+| `AWS::ApiGateway::Deployment` | Deployment ID | DeploymentId |
+| `AWS::ApiGateway::Stage` | Stage name | StageName |
+| `AWS::ApiGateway::Account` | Logical ID | — |
+| `AWS::ApiGateway::ApiKey` | Key ID | Id |
+| `AWS::ApiGateway::UsagePlan` | Plan ID | Id |
+| `AWS::ApiGateway::UsagePlanKey` | Key ID | Id |
+| `AWS::ApiGateway::DomainName` | Domain name | RegionalDomainName, DistributionDomainName, RegionalHostedZoneId |
+| `AWS::ApiGateway::BasePathMapping` | Mapping ID | — |
+| `AWS::ApiGateway::Model` | Model name | Name |
+| `AWS::ApiGateway::RequestValidator` | Validator ID | Id |
+| `AWS::ApiGateway::GatewayResponse` | Response ID | — |
+| `AWS::ApiGateway::ClientCertificate` | Certificate ID | ClientCertificateId |
+| `AWS::ApiGateway::VpcLink` | VpcLink ID | Id |
+| `AWS::ApiGateway::DocumentationPart` | Part ID | Id |
+| `AWS::ApiGateway::DocumentationVersion` | Version ID | Version |
 | `AWS::AppSync::GraphQLApi` | API ID | Arn, GraphQLUrl, ApiId |
 | `AWS::AppSync::DataSource` | DataSource name | DataSourceArn |
 | `AWS::AppSync::Resolver` | Resolver ARN | ResolverArn |
@@ -464,6 +478,16 @@ subnet = ec2.create_subnet(
 | `AWS::ApiGatewayV2::Stage` | Stage ID | StageName |
 | `AWS::ApiGatewayV2::Integration` | Integration ID | IntegrationId |
 | `AWS::ApiGatewayV2::Route` | Route ID | RouteId |
+| `AWS::ApiGatewayV2::Authorizer` | Authorizer ID | AuthorizerId |
+| `AWS::ApiGatewayV2::Deployment` | Deployment ID | DeploymentId |
+| `AWS::ApiGatewayV2::IntegrationResponse` | IntegrationResponse ID | IntegrationResponseId |
+| `AWS::ApiGatewayV2::Model` | Model ID | ModelId |
+| `AWS::ApiGatewayV2::RouteResponse` | RouteResponse ID | RouteResponseId |
+| `AWS::ApiGatewayV2::DomainName` | Domain name | RegionalDomainName |
+| `AWS::ApiGatewayV2::ApiMapping` | Mapping ID | Id |
+| `AWS::ApiGatewayV2::VpcLink` | VpcLink ID | VpcLinkId |
+| `AWS::ApiGatewayV2::RoutingRule` | RoutingRule ID | RoutingRuleId |
+| `AWS::ApiGatewayV2::ApiGatewayManagedOverrides` | Logical ID | — |
 | `AWS::SES::EmailIdentity` | Identity | EmailIdentity |
 | `AWS::WAFv2::WebACL` | WebACL ID | Arn, Id |
 | `AWS::CloudFront::Distribution` | Distribution ID | Arn, DomainName, Id |
