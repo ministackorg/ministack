@@ -1269,6 +1269,29 @@ def _apigw_stage_delete(physical_id, props):
     _apigw_v1._delete_stage(api_id, stage_name)
 
 
+def _apigw_account_create(logical_id, props, stack_name):
+    """``AWS::ApiGateway::Account`` is a singleton per AWS account storing the
+    IAM role API Gateway uses to push logs to CloudWatch. CDK's
+    ``RestApi({ cloudWatchRole: true })`` generates this automatically.
+
+    We persist ``CloudWatchRoleArn`` into the same store the runtime
+    ``UpdateAccount`` API writes to, so a subsequent ``GetAccount`` call
+    round-trips the value. No real side effect — the role isn't used.
+    """
+    role_arn = props.get("CloudWatchRoleArn")
+    settings = dict(_apigw_v1._account_settings.get("settings") or {})
+    if role_arn is not None:
+        settings["cloudwatchRoleArn"] = role_arn
+    _apigw_v1._account_settings["settings"] = settings
+    return logical_id, {}
+
+
+def _apigw_account_delete(physical_id, props):
+    settings = dict(_apigw_v1._account_settings.get("settings") or {})
+    settings.pop("cloudwatchRoleArn", None)
+    _apigw_v1._account_settings["settings"] = settings
+
+
 # --- Lambda EventSourceMapping ---
 
 def _lambda_esm_create(logical_id, props, stack_name):
@@ -3577,6 +3600,7 @@ _RESOURCE_HANDLERS = {
     "AWS::ApiGateway::Authorizer": {"create": _apigw_authorizer_create, "delete": _apigw_authorizer_delete},
     "AWS::ApiGateway::Deployment": {"create": _apigw_deployment_create, "delete": _apigw_deployment_delete},
     "AWS::ApiGateway::Stage": {"create": _apigw_stage_create, "delete": _apigw_stage_delete},
+    "AWS::ApiGateway::Account": {"create": _apigw_account_create, "delete": _apigw_account_delete},
     "AWS::Lambda::EventSourceMapping": {"create": _lambda_esm_create, "delete": _lambda_esm_delete},
     "AWS::Pipes::Pipe": {"create": _pipes_pipe_create, "delete": _pipes_pipe_delete},
     "AWS::Lambda::Alias": {"create": _lambda_alias_create, "delete": _lambda_alias_delete},
