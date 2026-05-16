@@ -7,6 +7,19 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [1.3.42] — 2026-05-16
+
+### Added
+- **MWAA (Managed Workflows for Apache Airflow)** — new service emulating the AWS MWAA REST API for both Airflow 2.x and Airflow 3.x. `CreateEnvironment` spins up a real `apache/airflow:<version>` container in standalone mode on the same Docker network as MiniStack, syncs DAGs from the configured `SourceBucketArn` + `DagS3Path` into `/opt/airflow/dags/` once the container reaches AVAILABLE, and forces an aggressive scan interval so DAGs become visible within seconds. `CreateWebLoginToken` and `CreateCliToken` return the correct field names (`WebToken` / `CliToken`) per the boto3 MWAA model. `InvokeRestApi` proxies to the running Airflow REST API — `/api/v2/` for v3 (open via Simple Auth Manager with `ALL_ADMINS=true`), `/api/v1/` for v2 (basic auth using the standalone-generated admin password captured from the container after boot). `GetEnvironment`, `UpdateEnvironment`, `ListEnvironments`, `DeleteEnvironment` and full container lifecycle (stop + remove on delete) included; per-environment host port released on delete so long-running stacks don't leak ports. Host-prefix routing (`api.airflow.<region>`) correctly bypassed by the S3 vhost extractor so requests reach the MWAA handler instead of being misread as bucket names. End-to-end verified with real DAGs visible via `InvokeRestApi GET /dags` on both Airflow 2.10.4 and Airflow 3.0.6.
+- **CloudWatch Alarm `AlarmActions` → SNS publish** — alarm state transitions (`OK` ↔ `ALARM` ↔ `INSUFFICIENT_DATA`) now dispatch the configured `AlarmActions` / `OKActions` / `InsufficientDataActions` lists. SNS topic ARNs are published with the AWS-shaped JSON payload (`AlarmName`, `NewStateValue`, `NewStateReason`, `StateChangeTime`, `Region`, `OldStateValue`, `Trigger` sub-object with metric/threshold/comparison). Fires on both `SetAlarmState` (manual) and the auto-evaluation path triggered by `PutMetricData`. `ActionsEnabled=False` (or `DisableAlarmActions`) suppresses dispatch. Closes the largest single inter-service integration gap — alerting-driven testing now works end-to-end.
+- **Lambda → CloudWatch Metrics** — every Lambda invocation now publishes the four canonical `AWS/Lambda` metrics dimensioned by `FunctionName`: `Invocations` (count), `Errors` (count, 1 on handled/unhandled failure), `Duration` (ms, wall-clock around the worker call), `Throttles` (count, 1 when reserved-concurrency rejected the call). Recorded for both `RequestResponse` and `Event` invocation types. Queryable via the standard `GetMetricStatistics` API, same shape and granularity real CloudWatch emits.
+- **CloudFormation `AWS::ApiGateway::Account`** — the singleton CFN resource that stores `CloudWatchRoleArn` for the API Gateway account. Previously failed with `Unsupported resource type`, which blocked any CDK stack using `new RestApi({ cloudWatchRole: true })` — a very common pattern. The handler writes the role ARN into the same store the runtime `UpdateAccount` / `GetAccount` API reads from, so the value round-trips end-to-end. Reported by @sajansharmanz.
+
+### Changed
+- **Test harness — xdist session-startup reset coordination** — the per-worker `autouse` `reset_server` fixture previously had every xdist worker hit `/_ministack/reset` on session start, so a slower worker's reset could fire after a faster worker had already begun creating fixtures, wiping that state mid-test (most visibly as occasional `list_functions()` empty results in `test_lambda_create_invoke`). The first worker now wins an `O_EXCL` file lock and runs the reset; the others wait briefly for a marker file and skip. Single-process pytest (no xdist) keeps the original behaviour. Removes a class of CI flakes that only reproduced under parallel load.
+
+---
+
 ## [1.3.41] — 2026-05-16
 
 ### Fixed
