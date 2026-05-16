@@ -126,7 +126,13 @@ SERVICE_PATTERNS = {
     },
     "airflow": {
         "host_patterns": [r"airflow\."],
-        "path_patterns": [r"^/environments", r"^/restapi"],
+        "path_patterns": [
+            r"^/environments",
+            r"^/webtoken/",
+            r"^/clitoken/",
+            r"^/restapi/",
+            r"^/metrics/environments/",
+        ],
         "credential_scope": "airflow",
     },
     "firehose": {

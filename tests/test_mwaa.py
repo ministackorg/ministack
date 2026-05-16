@@ -20,7 +20,7 @@ class TestCreateEnvironment:
             DagS3Path="dags/",
             ExecutionRoleArn="arn:aws:iam::000000000000:role/test-role",
             SourceBucketArn="arn:aws:s3:::test-bucket",
-            NetworkConfiguration={"SubnetIds": ["subnet-1"], "SecurityGroupIds": ["sg-1"]},
+            NetworkConfiguration={"SubnetIds": ["subnet-1", "subnet-2"], "SecurityGroupIds": ["sg-1"]},
         )
         assert "Arn" in resp
         assert ENV_NAME in resp["Arn"]
@@ -32,7 +32,7 @@ class TestCreateEnvironment:
                 DagS3Path="dags/",
                 ExecutionRoleArn="arn:aws:iam::000000000000:role/test-role",
                 SourceBucketArn="arn:aws:s3:::test-bucket",
-                NetworkConfiguration={"SubnetIds": ["subnet-1"], "SecurityGroupIds": ["sg-1"]},
+                NetworkConfiguration={"SubnetIds": ["subnet-1", "subnet-2"], "SecurityGroupIds": ["sg-1"]},
             )
         assert "already exists" in str(exc_info.value).lower() or "ResourceAlreadyExists" in str(exc_info.value)
 
@@ -73,7 +73,7 @@ class TestUpdateEnvironment:
 class TestCreateWebLoginToken:
     def test_returns_token(self):
         resp = mwaa_client.create_web_login_token(Name=ENV_NAME)
-        assert "WebLoginToken" in resp
+        assert "WebToken" in resp
         assert "WebServerHostname" in resp
 
 
@@ -108,7 +108,7 @@ class TestAirflow2Environment:
             DagS3Path="dags/",
             ExecutionRoleArn="arn:aws:iam::000000000000:role/test-role",
             SourceBucketArn="arn:aws:s3:::test-bucket",
-            NetworkConfiguration={"SubnetIds": ["subnet-1"], "SecurityGroupIds": ["sg-1"]},
+            NetworkConfiguration={"SubnetIds": ["subnet-1", "subnet-2"], "SecurityGroupIds": ["sg-1"]},
         )
         assert "Arn" in resp
 
@@ -150,7 +150,7 @@ with DAG("test_dag", start_date=datetime(2026, 1, 1), schedule=None, catchup=Fal
                 DagS3Path="dags/",
                 ExecutionRoleArn="arn:aws:iam::000000000000:role/test-role",
                 SourceBucketArn=f"arn:aws:s3:::{bucket_name}",
-                NetworkConfiguration={"SubnetIds": ["subnet-1"], "SecurityGroupIds": ["sg-1"]},
+                NetworkConfiguration={"SubnetIds": ["subnet-1", "subnet-2"], "SecurityGroupIds": ["sg-1"]},
             )
             assert "Arn" in resp
 

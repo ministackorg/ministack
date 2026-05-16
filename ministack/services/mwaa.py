@@ -405,7 +405,8 @@ def _list_environments(method, path, headers, body, query_params):
 
 def _create_web_login_token(method, path, headers, body, query_params):
     data = json.loads(body) if body else {}
-    name = data.get("Name") or path.strip("/").split("/")[-2]
+    parts = [p for p in path.strip("/").split("/") if p]
+    name = data.get("Name") or (parts[-1] if parts else "")
     env = _environments.get(name)
     if not env:
         return error_response_json("ResourceNotFoundException",
@@ -415,7 +416,7 @@ def _create_web_login_token(method, path, headers, body, query_params):
     token = new_uuid()
 
     return json_response({
-        "WebLoginToken": token,
+        "WebToken": token,
         "WebServerHostname": webserver_url,
         "IamIdentity": f"arn:aws:iam::{get_account_id()}:user/ministack",
         "AirflowIdentity": "admin",
@@ -424,7 +425,8 @@ def _create_web_login_token(method, path, headers, body, query_params):
 
 def _create_cli_token(method, path, headers, body, query_params):
     data = json.loads(body) if body else {}
-    name = data.get("Name") or path.strip("/").split("/")[-2]
+    parts = [p for p in path.strip("/").split("/") if p]
+    name = data.get("Name") or (parts[-1] if parts else "")
     env = _environments.get(name)
     if not env:
         return error_response_json("ResourceNotFoundException",
@@ -507,36 +509,37 @@ async def handle_request(method, path, headers, body, query_params):
       - api.airflow.{region}.amazonaws.com — management (CRUD environments)
       - env.airflow.{region}.amazonaws.com — runtime (tokens, CLI, InvokeRestApi)
 
-    In ministack, both are served from the same handler. Routing by path:
-      PUT    /environments/{Name}       → CreateEnvironment
-      GET    /environments/{Name}       → GetEnvironment
-      PATCH  /environments/{Name}       → UpdateEnvironment
-      DELETE /environments/{Name}       → DeleteEnvironment
-      GET    /environments              → ListEnvironments
-      POST   /environments/{Name}/login → CreateWebLoginToken (runtime)
-      POST   /environments/{Name}/cli   → CreateCliToken (runtime)
-      POST   /restapi/{Name}            → InvokeRestApi (runtime)
+    In ministack, both are served from the same handler. Paths match the
+    botocore MWAA service model exactly:
+      PUT    /environments/{Name}    → CreateEnvironment
+      GET    /environments/{Name}    → GetEnvironment
+      PATCH  /environments/{Name}    → UpdateEnvironment
+      DELETE /environments/{Name}    → DeleteEnvironment
+      GET    /environments           → ListEnvironments
+      POST   /webtoken/{Name}        → CreateWebLoginToken (runtime)
+      POST   /clitoken/{Name}        → CreateCliToken (runtime)
+      POST   /restapi/{Name}         → InvokeRestApi (runtime)
     """
     clean_path = path.rstrip("/")
 
-    # CreateWebLoginToken
-    if method == "POST" and clean_path.endswith("/login"):
+    # CreateWebLoginToken (real AWS path: /webtoken/{Name})
+    if method == "POST" and clean_path.startswith("/webtoken/"):
         return _create_web_login_token(method, path, headers, body, query_params)
 
-    # CreateCliToken
-    if method == "POST" and clean_path.endswith("/cli"):
+    # CreateCliToken (real AWS path: /clitoken/{Name})
+    if method == "POST" and clean_path.startswith("/clitoken/"):
         return _create_cli_token(method, path, headers, body, query_params)
 
     # InvokeRestApi
-    if method == "POST" and "/restapi" in clean_path:
+    if method == "POST" and clean_path.startswith("/restapi/"):
         return await _invoke_rest_api(method, path, headers, body, query_params)
 
     # ListEnvironments
-    if method == "GET" and clean_path.rstrip("/") in ("/environments", "/api/environments"):
+    if method == "GET" and clean_path in ("/environments", "/api/environments"):
         return _list_environments(method, path, headers, body, query_params)
 
     # CRUD on /environments/{Name}
-    if "/environments/" in clean_path:
+    if clean_path.startswith("/environments/"):
         if method == "PUT":
             return _create_environment(method, path, headers, body, query_params)
         if method == "GET":

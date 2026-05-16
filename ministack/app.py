@@ -1097,6 +1097,21 @@ async def _handle_s3_vhost_request(host: str, path: str, method: str, headers: d
     # so guard explicitly here too.
     if path.startswith("/key-value-stores/"):
         return None
+    # MWAA REST endpoints (api.airflow.{region}, env.airflow.{region}) — boto3
+    # expands the model's hostPrefix even when endpoint_url is overridden, so
+    # the host arrives as `api.localhost:4566`, and `api` looks like an S3
+    # bucket. Short-circuit any path that matches a real MWAA operation:
+    #   /environments, /environments/{Name}, /webtoken/{Name},
+    #   /clitoken/{Name}, /restapi/{Name}, /metrics/environments/{Name}
+    if (
+        path == "/environments"
+        or path.startswith("/environments/")
+        or path.startswith("/webtoken/")
+        or path.startswith("/clitoken/")
+        or path.startswith("/restapi/")
+        or path.startswith("/metrics/environments/")
+    ):
+        return None
 
     vhost_path = "/" + bucket + path if path != "/" else "/" + bucket + "/"
     try:
