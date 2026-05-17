@@ -8,7 +8,7 @@ Routing reaches us either through credential-scope detection (the SDK signs
 requests with the ``iotdata`` scope) or via the host pattern
 ``data-ats.iot.{region}.{host}`` / ``data.iot.{region}.{host}``.
 
-Bridges into the in-memory MQTT broker via :mod:`ministack.services.iot_broker`,
+Bridges into the in-memory MQTT broker via :mod:`ministack.services.iot`,
 which applies account-scoped topic prefixing transparently.
 """
 
@@ -23,7 +23,7 @@ from ministack.core.responses import (
     get_account_id,
     json_response,
 )
-from ministack.services import iot_broker
+from ministack.services import iot as _iot_module
 
 logger = logging.getLogger("iot_data")
 
@@ -67,7 +67,7 @@ def restore_state(data: dict | None) -> None:
 
 
 def reset() -> None:
-    iot_broker.reset()
+    _iot_module.broker_reset()
 
 
 # ---------------------------------------------------------------------------
@@ -126,7 +126,7 @@ async def _publish(raw_topic: str, body: bytes, qp: dict) -> tuple:
         )
     retain = str(qp.get("retain", "")).lower() in ("1", "true", "yes")
 
-    if not iot_broker.is_available():
+    if not _iot_module.broker_is_available():
         return error_response_json(
             "InternalFailureException",
             "IoT broker is not available",
@@ -134,7 +134,7 @@ async def _publish(raw_topic: str, body: bytes, qp: dict) -> tuple:
         )
 
     try:
-        await iot_broker.publish(
+        await _iot_module.broker_publish(
             get_account_id(), topic, body or b"", qos=qos, retain=retain
         )
     except Exception as e:

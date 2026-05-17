@@ -744,9 +744,9 @@ def _handle_iot_ca_request(method: str, path: str):
     if path != "/_ministack/iot/ca.pem" or method != "GET":
         return None
     try:
-        from ministack.core import local_ca
+        from ministack.services import iot
 
-        cert_pem = local_ca.get_ca_cert_pem()
+        cert_pem = iot.get_ca_cert_pem()
     except RuntimeError as e:
         return (
             503,
@@ -1548,7 +1548,7 @@ async def app(scope, receive, send):
                 # IoT MQTT-over-WS — resolve account_id from SigV4 query
                 # params or Authorization header, fall back to default.
                 account_id = _ws_resolve_iot_account_id(scope, ws_headers)
-                await _get_module("iot_broker").handle_websocket(
+                await _get_module("iot").handle_websocket(
                     scope, receive, send, account_id
                 )
         except Exception:

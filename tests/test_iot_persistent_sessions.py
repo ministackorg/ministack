@@ -3,7 +3,7 @@
 import asyncio
 import struct
 
-from ministack.services.iot_broker import (
+from ministack.services.iot import (
     PKT_CONNECT,
     PKT_CONNACK,
     PKT_DISCONNECT,
@@ -12,9 +12,9 @@ from ministack.services.iot_broker import (
     _WSSession,
     _encode_string,
     _persistent_sessions,
-    publish,
-    reset,
-    subscribe,
+    broker_publish as publish,
+    broker_reset as reset,
+    broker_subscribe as subscribe,
 )
 
 

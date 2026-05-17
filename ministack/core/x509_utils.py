@@ -1,21 +1,14 @@
-"""Local Certificate Authority for Ministack.
+"""X.509 certificate utilities for Ministack.
 
-Generates a self-signed root CA on first use and signs leaf certificates
-for IoT ``CreateKeysAndCertificate``, ACM certificate issuance, and API
-Gateway custom domain TLS.
+Generic crypto helpers for generating self-signed CAs, signing leaf
+certificates, and computing certificate fingerprints. Used by the IoT
+service for its local CA and available for reuse by ACM, API Gateway
+custom domains, or any other service that needs local certificate
+operations.
 
-IMPORTANT: Unlike the gateway TLS cert in ``tls.py`` (ephemeral, regenerated
-on cold start), the Local CA is a mocked AWS resource. The CA key and cert
-MUST be persisted via the standard persistence mechanism (``STATE_DIR``)
-when ``PERSIST_STATE=1`` because:
-
-  - Client certs issued by ``CreateKeysAndCertificate`` reference this CA
-  - mTLS validation in P2 requires the CA to be stable across restarts
-  - Losing the CA key invalidates all previously issued certs
-
-The ``cryptography`` library is required (declared as part of ``[full]``
-optional deps). Functions that need it raise ``RuntimeError`` with a clear
-message when it is not importable.
+Requires the ``cryptography`` library (declared as part of ``[full]``
+optional deps). Functions raise ``RuntimeError`` with a clear message
+when it is not importable.
 """
 
 from __future__ import annotations
@@ -23,10 +16,8 @@ from __future__ import annotations
 import datetime as _dt
 import hashlib
 import logging
-import os
-import threading
 
-logger = logging.getLogger("local_ca")
+logger = logging.getLogger("x509_utils")
 
 try:
     from cryptography import x509
@@ -39,34 +30,35 @@ except ImportError:  # pragma: no cover - exercised only when extras missing
     HAS_CRYPTO = False
 
 
-_CA_LOCK = threading.Lock()
-# In-memory cached state. ``_ca_cert_pem`` and ``_ca_key_pem`` are populated
-# either by lazy generation on first use or by ``restore_state``.
-_ca_cert_pem: str | None = None
-_ca_key_pem: str | None = None
-
-
 def _require_crypto() -> None:
     if not HAS_CRYPTO:
         raise RuntimeError(
-            "ministack.core.local_ca requires the `cryptography` package. "
+            "ministack.core.x509_utils requires the `cryptography` package. "
             "Install Ministack with `[full]` extras or add cryptography>=41.0."
         )
 
 
-# ---------------------------------------------------------------------------
-# CA generation / accessors
-# ---------------------------------------------------------------------------
+def generate_ca(
+    org_name: str = "Ministack",
+    common_name: str = "Ministack Local CA",
+    days_valid: int = 3650,
+) -> tuple[str, str]:
+    """Create a fresh self-signed root CA.
 
+    Args:
+        org_name: Organization name for the CA subject.
+        common_name: Common name for the CA subject.
+        days_valid: Validity period in days.
 
-def _generate_ca() -> tuple[str, str]:
-    """Create a fresh self-signed root CA. Returns (cert_pem, key_pem)."""
+    Returns:
+        Tuple ``(cert_pem, key_pem)`` as UTF-8 strings.
+    """
     _require_crypto()
 
     key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     subject = issuer = x509.Name([
-        x509.NameAttribute(NameOID.ORGANIZATION_NAME, "Ministack"),
-        x509.NameAttribute(NameOID.COMMON_NAME, "Ministack Local CA"),
+        x509.NameAttribute(NameOID.ORGANIZATION_NAME, org_name),
+        x509.NameAttribute(NameOID.COMMON_NAME, common_name),
     ])
     now = _dt.datetime.now(_dt.timezone.utc)
     cert = (
@@ -76,7 +68,7 @@ def _generate_ca() -> tuple[str, str]:
         .public_key(key.public_key())
         .serial_number(x509.random_serial_number())
         .not_valid_before(now - _dt.timedelta(minutes=1))
-        .not_valid_after(now + _dt.timedelta(days=3650))
+        .not_valid_after(now + _dt.timedelta(days=days_valid))
         .add_extension(x509.BasicConstraints(ca=True, path_length=0), critical=True)
         .add_extension(
             x509.KeyUsage(
@@ -104,56 +96,23 @@ def _generate_ca() -> tuple[str, str]:
         format=serialization.PrivateFormat.TraditionalOpenSSL,
         encryption_algorithm=serialization.NoEncryption(),
     ).decode("utf-8")
-    logger.info("Local CA: generated new self-signed root certificate")
     return cert_pem, key_pem
 
 
-def _ensure_ca() -> tuple[str, str]:
-    """Return (cert_pem, key_pem), generating lazily on first use."""
-    global _ca_cert_pem, _ca_key_pem
-    if _ca_cert_pem is not None and _ca_key_pem is not None:
-        return _ca_cert_pem, _ca_key_pem
-    with _CA_LOCK:
-        if _ca_cert_pem is not None and _ca_key_pem is not None:
-            return _ca_cert_pem, _ca_key_pem
-        cert_pem, key_pem = _generate_ca()
-        _ca_cert_pem = cert_pem
-        _ca_key_pem = key_pem
-        return cert_pem, key_pem
-
-
-def get_ca_cert_pem() -> str:
-    """Return the CA certificate in PEM format. Generates the CA on first call."""
-    cert_pem, _ = _ensure_ca()
-    return cert_pem
-
-
-def get_ca_key_pem() -> str:
-    """Return the CA private key in PEM format.
-
-    Used internally for signing leaf certificates and must NOT be exposed
-    through any public API. Persisted through ``get_state`` so previously
-    issued certificates remain valid across restarts.
-    """
-    _, key_pem = _ensure_ca()
-    return key_pem
-
-
-# ---------------------------------------------------------------------------
-# Leaf certificate signing
-# ---------------------------------------------------------------------------
-
-
 def sign_leaf_certificate(
+    ca_cert_pem: str,
+    ca_key_pem: str,
     common_name: str,
     san_dns: list[str] | None = None,
     san_ips: list[str] | None = None,
     days_valid: int = 825,
     key_type: str = "rsa2048",
 ) -> tuple[str, str, str]:
-    """Generate a fresh keypair and sign a leaf certificate with the Local CA.
+    """Generate a fresh keypair and sign a leaf certificate with the given CA.
 
     Args:
+        ca_cert_pem: CA certificate in PEM format.
+        ca_key_pem: CA private key in PEM format.
         common_name: Subject CN of the issued certificate.
         san_dns: Optional list of DNS names to include as SubjectAltName.
         san_ips: Optional list of IPv4/IPv6 strings to include as SubjectAltName.
@@ -165,7 +124,6 @@ def sign_leaf_certificate(
     """
     _require_crypto()
 
-    ca_cert_pem, ca_key_pem = _ensure_ca()
     ca_cert = x509.load_pem_x509_certificate(ca_cert_pem.encode("utf-8"))
     ca_key = serialization.load_pem_private_key(
         ca_key_pem.encode("utf-8"), password=None
@@ -252,45 +210,3 @@ def get_certificate_id(cert_pem: str) -> str:
     cert = x509.load_pem_x509_certificate(cert_pem.encode("utf-8"))
     der = cert.public_bytes(serialization.Encoding.DER)
     return hashlib.sha256(der).hexdigest()
-
-
-# ---------------------------------------------------------------------------
-# Persistence
-# ---------------------------------------------------------------------------
-
-
-def get_state() -> dict:
-    """Return the CA cert + key for persistence.
-
-    Called by ``ministack/services/iot.py``'s ``get_state`` so the Local CA
-    rides along inside the IoT service state file when ``PERSIST_STATE=1``.
-    """
-    if _ca_cert_pem is None or _ca_key_pem is None:
-        return {}
-    return {"ca_cert_pem": _ca_cert_pem, "ca_key_pem": _ca_key_pem}
-
-
-def restore_state(data: dict | None) -> None:
-    """Restore the CA from a previous ``get_state`` snapshot."""
-    global _ca_cert_pem, _ca_key_pem
-    if not data:
-        return
-    cert = data.get("ca_cert_pem")
-    key = data.get("ca_key_pem")
-    if cert and key:
-        with _CA_LOCK:
-            _ca_cert_pem = cert
-            _ca_key_pem = key
-        logger.info("Local CA: restored from persisted state")
-
-
-def reset() -> None:
-    """Drop the in-memory CA so the next call regenerates it.
-
-    Used by ``/_ministack/reset``. Issued certificates become invalid after
-    a reset (just like real AWS — deleting the CA invalidates everything).
-    """
-    global _ca_cert_pem, _ca_key_pem
-    with _CA_LOCK:
-        _ca_cert_pem = None
-        _ca_key_pem = None

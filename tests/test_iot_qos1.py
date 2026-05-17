@@ -7,7 +7,7 @@ packet ID tracking), and 18.3 (PUBACK handling and retransmission).
 import asyncio
 import struct
 
-from ministack.services.iot_broker import (
+from ministack.services.iot import (
     PKT_CONNECT,
     PKT_PUBACK,
     PKT_PUBLISH,
@@ -20,9 +20,9 @@ from ministack.services.iot_broker import (
     _encode_string,
     _make_puback,
     _make_suback,
-    publish,
-    reset,
-    subscribe,
+    broker_publish as publish,
+    broker_reset as reset,
+    broker_subscribe as subscribe,
 )
 
 
@@ -521,7 +521,7 @@ def test_retransmit_sends_dup_flag():
             if now - m.sent_at >= _RETRANSMIT_INTERVAL_SECONDS:
                 m.retransmit_count += 1
                 m.sent_at = now
-                from ministack.services.iot_broker import _make_publish
+                from ministack.services.iot import _make_publish
                 await session.send_bytes(
                     _make_publish(m.topic, m.payload, qos=1, packet_id=p, dup=True)
                 )
