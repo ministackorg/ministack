@@ -105,6 +105,44 @@ def get_ca_cert_pem() -> str:
 
 
 # ---------------------------------------------------------------------------
+# Broker state
+# ---------------------------------------------------------------------------
+
+_retained: dict[str, "_RetainedMessage"] = {}
+
+
+class _RetainedMessage:
+    __slots__ = ("payload", "qos", "topic", "ts")
+
+    def __init__(self, topic: str, payload: bytes, qos: int):
+        self.topic = topic
+        self.payload = payload
+        self.qos = qos
+        self.ts = time.time()
+
+
+def _broker_get_state() -> dict:
+    retained_list = []
+    for topic, msg in _retained.items():
+        retained_list.append({
+            "topic": msg.topic,
+            "payload": base64.b64encode(msg.payload).decode("ascii"),
+            "qos": msg.qos,
+        })
+    return {"retained": retained_list}
+
+
+def _broker_restore_state(data: dict | None) -> None:
+    if not data:
+        return
+    for entry in data.get("retained", []):
+        topic = entry["topic"]
+        payload = base64.b64decode(entry["payload"])
+        qos = entry.get("qos", 0)
+        _retained[topic] = _RetainedMessage(topic, payload, qos)
+
+
+# ---------------------------------------------------------------------------
 # Persistence
 # ---------------------------------------------------------------------------
 
@@ -1306,49 +1344,12 @@ _broker_logger = logging.getLogger("iot_broker")
 # ---------------------------------------------------------------------------
 
 _subscriptions: dict[str, set["_Subscription"]] = {}
-_retained: dict[str, "_RetainedMessage"] = {}
 _connected_clients: dict[tuple[str, str], "_WSSession"] = {}
 _persistent_sessions: dict[tuple[str, str], "_PersistentSessionState"] = {}
 _broker_lock = asyncio.Lock()
 
 _SESSION_EXPIRY_SECONDS: int = int(os.environ.get("IOT_SESSION_EXPIRY_SECONDS", "3600"))
 _MAX_QUEUED_MESSAGES = 1000
-
-
-class _RetainedMessage:
-    __slots__ = ("payload", "qos", "topic", "ts")
-
-    def __init__(self, topic: str, payload: bytes, qos: int):
-        self.topic = topic
-        self.payload = payload
-        self.qos = qos
-        self.ts = time.time()
-
-
-# ---------------------------------------------------------------------------
-# Broker persistence (retained messages)
-# ---------------------------------------------------------------------------
-
-
-def _broker_get_state() -> dict:
-    retained_list = []
-    for topic, msg in _retained.items():
-        retained_list.append({
-            "topic": msg.topic,
-            "payload": base64.b64encode(msg.payload).decode("ascii"),
-            "qos": msg.qos,
-        })
-    return {"retained": retained_list}
-
-
-def _broker_restore_state(data: dict | None) -> None:
-    if not data:
-        return
-    for entry in data.get("retained", []):
-        topic = entry["topic"]
-        payload = base64.b64decode(entry["payload"])
-        qos = entry.get("qos", 0)
-        _retained[topic] = _RetainedMessage(topic, payload, qos)
 
 
 class _PersistentSessionState:
