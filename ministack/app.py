@@ -336,7 +336,7 @@ _state_map = {
     "eks": "eks", "backup": "backup", "pipes": "pipes",
     "cloudfront_keyvaluestore": "cloudfront_keyvaluestore",
     "resource_groups": "resource_groups",
-    "cloudtrail": "cloudtrail",
+    "cloudtrail": "cloudtrail", "iot": "iot",
 }
 
 SERVICE_NAME_ALIASES = {
