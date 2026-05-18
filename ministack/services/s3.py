@@ -892,9 +892,16 @@ def _put_bucket_lifecycle(name: str, body: bytes):
         ns = {"s3": "http://s3.amazonaws.com/doc/2006-03-01/"}
         for rule_el in root.findall("Rule", ns) or root.findall("s3:Rule", ns):
             rule: dict = {}
-            _lc_text = lambda el, tag: (el.findtext(tag) or el.findtext(f"s3:{tag}", namespaces=ns) or "")
-            _lc_find = lambda el, tag: (el.find(tag) or el.find(f"s3:{tag}", ns))
-            _lc_findall = lambda el, tag: (el.findall(tag) or el.findall(f"s3:{tag}", ns))
+
+            def _lc_text(el, tag):
+                return el.findtext(tag) or el.findtext(f"s3:{tag}", namespaces=ns) or ""
+
+            def _lc_find(el, tag):
+                return el.find(tag) or el.find(f"s3:{tag}", ns)
+
+            def _lc_findall(el, tag):
+                return el.findall(tag) or el.findall(f"s3:{tag}", ns)
+
             id_val = _lc_text(rule_el, "ID")
             if id_val:
                 rule["ID"] = id_val

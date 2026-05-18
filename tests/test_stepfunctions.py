@@ -741,6 +741,69 @@ def test_sfn_aws_sdk_unknown_service_fails(sfn, sfn_sync):
     sfn_sync.delete_state_machine(stateMachineArn=sm_arn)
 
 
+def test_sfn_aws_sdk_lambda_get_alias_and_configuration(sfn_sync, lam):
+    """aws-sdk:lambda getAlias/getFunctionConfiguration supports JSONPath params."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    fn = f"sfn-sdk-lambda-{suffix}"
+    sm_name = f"sfn-sdk-lambda-{suffix}"
+
+    lam.create_function(
+        FunctionName=fn,
+        Runtime="python3.12",
+        Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _make_zip("def handler(e, c): return {'ok': True}")},
+    )
+    version = lam.publish_version(FunctionName=fn)["Version"]
+    lam.create_alias(FunctionName=fn, Name="live", FunctionVersion=version)
+
+    function_arn = f"arn:aws:lambda:us-east-1:000000000000:function:{fn}"
+    definition = json.dumps({
+        "StartAt": "ReadAlias",
+        "States": {
+            "ReadAlias": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::aws-sdk:lambda:getAlias",
+                "Parameters": {
+                    "FunctionName.$": "$.functionName",
+                    "Name.$": "$.aliasName",
+                },
+                "ResultPath": "$.alias",
+                "Next": "ReadConfig",
+            },
+            "ReadConfig": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::aws-sdk:lambda:getFunctionConfiguration",
+                "Parameters": {
+                    "FunctionName.$": "$.functionName",
+                    "Qualifier.$": "$.alias.FunctionVersion",
+                },
+                "ResultPath": "$.config",
+                "End": True,
+            },
+        },
+    })
+
+    sm_arn = sfn_sync.create_state_machine(
+        name=sm_name,
+        definition=definition,
+        roleArn="arn:aws:iam::000000000000:role/sfn-role",
+    )["stateMachineArn"]
+
+    resp = sfn_sync.start_sync_execution(
+        stateMachineArn=sm_arn,
+        input=json.dumps({"functionName": function_arn, "aliasName": "live"}),
+    )
+    assert resp["status"] == "SUCCEEDED", f"Execution failed: {resp.get('error')} — {resp.get('cause')}"
+    output = json.loads(resp["output"])
+    assert output["alias"]["Name"] == "live"
+    assert output["alias"]["FunctionVersion"] == version
+    assert output["config"]["FunctionName"] == fn
+    assert output["config"]["Version"] == version
+
+    sfn_sync.delete_state_machine(stateMachineArn=sm_arn)
+
+
 def test_sfn_optimized_start_execution_returns_execution_arn(sfn, sfn_sync):
     """Optimized states:startExecution returns the child ExecutionArn."""
     suffix = _uuid_mod.uuid4().hex[:8]
@@ -4326,4 +4389,3 @@ def test_sfn_jsonata_assign_reuses_input(sfn_sync):
         assert json.loads(resp["output"]) == "hello world"
     finally:
         sfn_sync.delete_state_machine(stateMachineArn=sm_arn)
-

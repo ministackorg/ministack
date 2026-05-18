@@ -20,9 +20,9 @@ Supports: CreateEventBus, UpdateEventBus, DeleteEventBus, ListEventBuses, Descri
           ListEventSources, PutPartnerEvents.
 """
 
+import calendar
 import copy
 import fnmatch
-import calendar
 import hashlib
 import json
 import logging

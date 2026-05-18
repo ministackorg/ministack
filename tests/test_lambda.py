@@ -1213,6 +1213,40 @@ def test_lambda_publish_version_snapshot(lam):
     assert "1" in version_nums
     assert "$LATEST" in version_nums
 
+
+def test_lambda_published_version_readiness_follows_function(lam):
+    """Published versions created during function bootstrap become Active."""
+    fn = f"qa-lam-version-ready-{_uuid_mod.uuid4().hex[:8]}"
+    lam.create_function(
+        FunctionName=fn,
+        Runtime="python3.12",
+        Role="arn:aws:iam::000000000000:role/r",
+        Handler="index.handler",
+        Code={"ZipFile": _zip_lambda("def handler(e,c): return 'v1'")},
+        Publish=True,
+    )
+
+    deadline = time.time() + 3
+    latest = version = None
+    while time.time() < deadline:
+        latest = lam.get_function_configuration(FunctionName=fn)
+        version = lam.get_function_configuration(FunctionName=fn, Qualifier="1")
+        if (
+            latest["State"] == "Active"
+            and latest["LastUpdateStatus"] == "Successful"
+            and version["State"] == "Active"
+            and version["LastUpdateStatus"] == "Successful"
+        ):
+            break
+        time.sleep(0.1)
+
+    assert latest["State"] == "Active"
+    assert latest["LastUpdateStatus"] == "Successful"
+    assert version["Version"] == "1"
+    assert version["State"] == "Active"
+    assert version["LastUpdateStatus"] == "Successful"
+
+
 def test_lambda_function_concurrency(lam):
     """PutFunctionConcurrency / GetFunctionConcurrency / DeleteFunctionConcurrency."""
     code = _zip_lambda("def handler(e,c): return {}")
@@ -3675,8 +3709,8 @@ def test_nodejs_worker_aws_sdk_v3_stub_wire_roundtrip(lam, ssm):
     router.py undetected by the resolution-only tests).
     """
     import shutil
-
     import uuid as _uuid
+
     if not shutil.which("node"):
         pytest.skip("node not found on PATH")
 

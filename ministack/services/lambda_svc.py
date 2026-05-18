@@ -1741,6 +1741,14 @@ def _schedule_state_transition(func_name: str, delay: float) -> None:
     """Flip State and LastUpdateStatus to the post-ready values after `delay`."""
     acct = get_account_id()
 
+    def _mark_ready(cfg: dict) -> None:
+        cfg["State"] = "Active"
+        cfg["StateReason"] = ""
+        cfg["StateReasonCode"] = ""
+        cfg["LastUpdateStatus"] = "Successful"
+        cfg["LastUpdateStatusReason"] = ""
+        cfg["LastUpdateStatusReasonCode"] = ""
+
     def _flip():
         time.sleep(delay)
         # Re-fetch under the correct account context so multi-tenant cases work.
@@ -1749,13 +1757,14 @@ def _schedule_state_transition(func_name: str, delay: float) -> None:
             fn = _functions.get(func_name)
             if not fn:
                 return
-            cfg = fn.get("config", {})
-            cfg["State"] = "Active"
-            cfg["StateReason"] = ""
-            cfg["StateReasonCode"] = ""
-            cfg["LastUpdateStatus"] = "Successful"
-            cfg["LastUpdateStatusReason"] = ""
-            cfg["LastUpdateStatusReasonCode"] = ""
+            _mark_ready(fn.get("config", {}))
+            for version in fn.get("versions", {}).values():
+                cfg = version.get("config", {})
+                if (
+                    cfg.get("State") == "Pending"
+                    or cfg.get("LastUpdateStatus") == "InProgress"
+                ):
+                    _mark_ready(cfg)
         finally:
             _request_account_id.reset(token)
 

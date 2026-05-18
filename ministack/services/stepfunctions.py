@@ -3055,7 +3055,6 @@ _AWS_SDK_SERVICE_MAP = {
     "rdsdata": {"protocol": "rest-json", "service_key": "rds-data"},
     # REST-XML services: per-op path templates, header/querystring routing, XML responses
     "s3": {"protocol": "rest-xml", "service_key": "s3"},
-    # REST services (not yet supported via aws-sdk dispatcher)
     "lambda": {"protocol": "rest"},
 }
 
@@ -3691,6 +3690,87 @@ def _dispatch_aws_sdk_rest_json(service_info, service_name, action, input_data):
     return _convert_keys_to_sfn_convention(result)
 
 
+def _dispatch_aws_sdk_lambda_rest(service_info, service_name, action, input_data):
+    """Dispatch the Lambda REST aws-sdk calls needed by Step Functions workflows."""
+    from urllib.parse import quote
+
+    from ministack import app
+
+    service_key = service_info.get("service_key", service_name)
+    handler = app.SERVICE_HANDLERS.get(service_key)
+    if not handler:
+        raise _ExecutionError(
+            "States.Runtime",
+            f"Service '{service_key}' is not available in MiniStack",
+        )
+
+    pascal_action = action[0].upper() + action[1:] if action else action
+    input_data = input_data or {}
+    query_params = {}
+
+    if pascal_action == "GetAlias":
+        function_name = input_data.get("FunctionName", "")
+        alias_name = input_data.get("Name", "")
+        path = (
+            "/2015-03-31/functions/"
+            f"{quote(str(function_name), safe=':')}/aliases/{quote(str(alias_name), safe='')}"
+        )
+    elif pascal_action == "GetFunctionConfiguration":
+        function_name = input_data.get("FunctionName", "")
+        path = f"/2015-03-31/functions/{quote(str(function_name), safe=':')}/configuration"
+        qualifier = input_data.get("Qualifier")
+        if qualifier is not None:
+            query_params["Qualifier"] = str(qualifier)
+    else:
+        raise _ExecutionError(
+            "States.Runtime",
+            f"aws-sdk:{service_name}:{action} is not yet implemented in MiniStack "
+            "(lambda REST dispatcher covers getAlias and getFunctionConfiguration)",
+        )
+
+    headers = {
+        "content-type": "application/json",
+        "host": f"{service_key}.{get_region()}.amazonaws.com",
+        "authorization": (
+            f"AWS4-HMAC-SHA256 Credential=test/20260101/{get_region()}/{service_key}/aws4_request"
+        ),
+    }
+
+    coro = handler("GET", path, headers, b"", query_params)
+    try:
+        coro.send(None)
+    except StopIteration as stop:
+        status, resp_headers, resp_body = stop.value
+    else:
+        coro.close()
+        loop = asyncio.new_event_loop()
+        try:
+            status, resp_headers, resp_body = loop.run_until_complete(
+                handler("GET", path, headers, b"", query_params)
+            )
+        finally:
+            loop.close()
+
+    decoded = resp_body.decode("utf-8") if isinstance(resp_body, bytes) else resp_body
+    if status >= 400:
+        try:
+            err_data = json.loads(decoded)
+            code = err_data.get("__type") or err_data.get("code") or "ServiceException"
+            msg = err_data.get("message") or err_data.get("Message") or decoded
+            raise _ExecutionError(_prefix_sdk_error(service_name, code), msg)
+        except _ExecutionError:
+            raise
+        except Exception:
+            raise _ExecutionError(_prefix_sdk_error(service_name, "ServiceException"), decoded)
+
+    try:
+        result = json.loads(decoded) if decoded else {}
+    except (json.JSONDecodeError, TypeError):
+        return decoded
+
+    return _convert_keys_to_sfn_convention(result)
+
+
 # ---------------------------------------------------------------------------
 # REST-XML aws-sdk dispatch (S3)
 # ---------------------------------------------------------------------------
@@ -4044,6 +4124,8 @@ def _invoke_aws_sdk_integration(resource, input_data):
         return _dispatch_aws_sdk_rest_json(service_info, service_name, action, input_data)
     elif protocol == "rest-xml":
         return _dispatch_aws_sdk_rest_xml(service_info, service_name, action, input_data)
+    elif protocol == "rest" and service_name == "lambda":
+        return _dispatch_aws_sdk_lambda_rest(service_info, service_name, action, input_data)
     else:
         raise _ExecutionError(
             "States.Runtime",

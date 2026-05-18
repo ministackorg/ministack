@@ -18,6 +18,10 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 ### Changed
 - **Test harness — xdist session-startup reset coordination** — the per-worker `autouse` `reset_server` fixture previously had every xdist worker hit `/_ministack/reset` on session start, so a slower worker's reset could fire after a faster worker had already begun creating fixtures, wiping that state mid-test (most visibly as occasional `list_functions()` empty results in `test_lambda_create_invoke`). The first worker now wins an `O_EXCL` file lock and runs the reset; the others wait briefly for a marker file and skip. Single-process pytest (no xdist) keeps the original behaviour. Removes a class of CI flakes that only reproduced under parallel load.
 
+### Fixed
+- **Step Functions Lambda AWS SDK integrations** — `arn:aws:states:::aws-sdk:lambda:getAlias` and `getFunctionConfiguration` now dispatch through the Lambda REST emulator, including JSONPath-resolved `FunctionName`, `Name`, and `Qualifier` parameters. This unblocks readiness workflows that verify a Lambda alias and its published version before invoking it.
+- **Lambda published-version readiness** — published version snapshots created while `$LATEST` is still `Pending/InProgress` now transition to `Active/Successful` with the function, so `GetFunctionConfiguration --qualifier <version>` converges instead of staying stuck after the alias points at the version.
+
 ---
 
 ## [1.3.41] — 2026-05-16
