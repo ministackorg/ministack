@@ -486,6 +486,41 @@ def _list_state_machines(data):
 # Execution lifecycle
 # ---------------------------------------------------------------------------
 
+def _resolve_state_machine_arn(arn):
+    """Resolve a state-machine, version, or alias ARN to the base state-machine
+    ARN. Returns None when the ARN doesn't match anything in any of the three
+    stores.
+
+    Real AWS accepts all three shapes wherever a ``stateMachineArn`` is taken
+    (StartExecution, DescribeExecution, EventBridge target Arn, …):
+
+      * ``arn:aws:states:<r>:<a>:stateMachine:<name>``           — base
+      * ``arn:aws:states:<r>:<a>:stateMachine:<name>:<version>`` — published version
+      * ``arn:aws:states:<r>:<a>:stateMachine:<name>:<alias>``   — alias
+
+    For an alias, we pick the highest-weighted version in the routing config
+    and resolve that version back to its base state machine.
+    """
+    if arn in _state_machines:
+        return arn
+    version = _state_machine_versions.get(arn)
+    if version:
+        return version.get("stateMachineArn")
+    alias = _state_machine_aliases.get(arn)
+    if alias:
+        routing = alias.get("routingConfiguration") or []
+        # AWS picks one of the configured versions by weight on each
+        # invocation. For determinism in test contexts we pick the
+        # highest-weighted entry (ties → first listed).
+        if routing:
+            chosen = max(routing, key=lambda r: r.get("weight", 0))
+            version_arn = chosen.get("stateMachineVersionArn", "")
+            ver = _state_machine_versions.get(version_arn)
+            if ver:
+                return ver.get("stateMachineArn")
+    return None
+
+
 def _start_execution(data):
     sm_arn_raw = data.get("stateMachineArn", "")
     # Support #TestCaseName suffix for mock config
@@ -494,10 +529,12 @@ def _start_execution(data):
         sm_arn, test_case = sm_arn_raw.rsplit("#", 1)
     else:
         sm_arn = sm_arn_raw
-    if sm_arn not in _state_machines:
+    base_arn = _resolve_state_machine_arn(sm_arn)
+    if base_arn is None:
         return error_response_json(
             "StateMachineDoesNotExist",
             f"State machine {sm_arn} not found", 400)
+    sm_arn = base_arn
 
     sm = _state_machines[sm_arn]
     name = data.get("name") or new_uuid()
@@ -3728,28 +3765,43 @@ def _dispatch_aws_sdk_lambda_rest(service_info, service_name, action, input_data
             "(lambda REST dispatcher covers getAlias and getFunctionConfiguration)",
         )
 
+    # Embed the current SFN execution's account ID as the access-key segment
+    # of the synthetic Authorization header so the called handler resolves to
+    # the same account the execution is running in. Hardcoding "test" here
+    # would force every aws-sdk:lambda call into the default account and break
+    # any non-default-account caller. ``app.py`` parses the credential scope
+    # and only treats a 12-digit access key as an account override, so a
+    # default-account caller still resolves correctly.
+    caller_account = get_account_id()
     headers = {
         "content-type": "application/json",
         "host": f"{service_key}.{get_region()}.amazonaws.com",
         "authorization": (
-            f"AWS4-HMAC-SHA256 Credential=test/20260101/{get_region()}/{service_key}/aws4_request"
+            f"AWS4-HMAC-SHA256 Credential={caller_account}/20260101/"
+            f"{get_region()}/{service_key}/aws4_request"
         ),
     }
 
+    # Drive the async handler synchronously. SFN state execution runs inside
+    # the request's event loop, so spawning a fresh loop here would raise
+    # "Cannot run the event loop while another loop is running". The Lambda
+    # REST handlers we dispatch to (GetAlias, GetFunctionConfiguration) only
+    # touch in-memory dicts and never await, so a single ``coro.send(None)``
+    # completes via ``StopIteration`` with the response tuple.
     coro = handler("GET", path, headers, b"", query_params)
     try:
         coro.send(None)
     except StopIteration as stop:
         status, resp_headers, resp_body = stop.value
     else:
+        # Fallback for an async handler that does await — extremely rare on
+        # this dispatch surface, but guard so we don't return None silently.
         coro.close()
-        loop = asyncio.new_event_loop()
-        try:
-            status, resp_headers, resp_body = loop.run_until_complete(
-                handler("GET", path, headers, b"", query_params)
-            )
-        finally:
-            loop.close()
+        raise _ExecutionError(
+            "States.Runtime",
+            f"aws-sdk:{service_name}:{action} handler awaited unexpectedly; "
+            "cannot drive from sync SFN executor",
+        )
 
     decoded = resp_body.decode("utf-8") if isinstance(resp_body, bytes) else resp_body
     if status >= 400:

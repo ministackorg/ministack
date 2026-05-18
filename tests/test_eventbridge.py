@@ -296,6 +296,76 @@ def test_eventbridge_stepfunctions_target(eb, sfn):
     sfn.delete_state_machine(stateMachineArn=sm_arn)
 
 
+def test_eventbridge_stepfunctions_version_and_alias_targets(eb, sfn):
+    """EventBridge accepts both published-version and alias ARNs as SFN targets.
+
+    Real AWS dispatches `PutEvents` to a `stateMachine:<name>:<version>` or
+    `stateMachine:<name>:<alias>` target. The resolver in stepfunctions walks
+    base / version / alias stores so both forms reach the right executor.
+    """
+    sm_name = f"intg-eb-sfn-vers-{_uuid_mod.uuid4().hex[:8]}"
+    bus_name = f"intg-eb-bus-{_uuid_mod.uuid4().hex[:8]}"
+
+    sm_arn = sfn.create_state_machine(
+        name=sm_name,
+        definition=json.dumps({
+            "StartAt": "Done",
+            "States": {"Done": {"Type": "Pass", "End": True}},
+        }),
+        roleArn="arn:aws:iam::000000000000:role/sfn-role",
+    )["stateMachineArn"]
+
+    pub = sfn.publish_state_machine_version(stateMachineArn=sm_arn)
+    version_arn = pub["stateMachineVersionArn"]
+    alias = sfn.create_state_machine_alias(
+        name="live",
+        routingConfiguration=[{
+            "stateMachineVersionArn": version_arn,
+            "weight": 100,
+        }],
+    )
+    alias_arn = alias["stateMachineAliasArn"]
+
+    eb.create_event_bus(Name=bus_name)
+
+    for target_arn, marker in [(version_arn, "vers"), (alias_arn, "alias")]:
+        rule_name = f"intg-eb-rule-{marker}-{_uuid_mod.uuid4().hex[:6]}"
+        eb.put_rule(
+            Name=rule_name,
+            EventBusName=bus_name,
+            EventPattern=json.dumps({"source": [f"myapp.{marker}"]}),
+            State="ENABLED",
+        )
+        eb.put_targets(
+            Rule=rule_name,
+            EventBusName=bus_name,
+            Targets=[{"Id": f"sfn-{marker}", "Arn": target_arn}],
+        )
+        eb.put_events(Entries=[{
+            "Source": f"myapp.{marker}",
+            "DetailType": "PingEvent",
+            "Detail": json.dumps({"marker": marker}),
+            "EventBusName": bus_name,
+        }])
+
+    # The base state machine should accumulate one execution per dispatch.
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        execs = sfn.list_executions(stateMachineArn=sm_arn)["executions"]
+        if len(execs) >= 2:
+            break
+        time.sleep(0.1)
+    assert len(execs) >= 2, (
+        f"version+alias targets should each have dispatched an execution; got {len(execs)}"
+    )
+
+    # Cleanup
+    eb.delete_event_bus(Name=bus_name)
+    sfn.delete_state_machine_alias(stateMachineAliasArn=alias_arn)
+    sfn.delete_state_machine_version(stateMachineVersionArn=version_arn)
+    sfn.delete_state_machine(stateMachineArn=sm_arn)
+
+
 # Migrated from test_eb.py
 def test_eventbridge_create_event_bus_v2(eb):
     resp = eb.create_event_bus(Name="eb-bus-v2")

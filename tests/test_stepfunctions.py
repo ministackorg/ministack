@@ -801,7 +801,81 @@ def test_sfn_aws_sdk_lambda_get_alias_and_configuration(sfn_sync, lam):
     assert output["config"]["FunctionName"] == fn
     assert output["config"]["Version"] == version
 
-    sfn_sync.delete_state_machine(stateMachineArn=sm_arn)
+
+def test_sfn_aws_sdk_lambda_respects_caller_account():
+    """aws-sdk:lambda dispatch threads the caller's account through to the
+    Lambda lookup. Previously the dispatcher hardcoded ``Credential=test/...``
+    in its synthetic Authorization header, so an SFN execution running under
+    a non-default 12-digit account would resolve into the default account
+    and fail to find Lambdas created in the caller's own account.
+    """
+    import boto3
+    from botocore.config import Config as _Config
+
+    ACCOUNT = "987654321098"
+    suffix = _uuid_mod.uuid4().hex[:8]
+    fn = f"sfn-acct-{suffix}"
+    sm_name = f"sfn-acct-{suffix}"
+
+    def _client(service):
+        return boto3.client(
+            service,
+            endpoint_url="http://localhost:4566",
+            aws_access_key_id=ACCOUNT,
+            aws_secret_access_key="secret",
+            region_name="us-east-1",
+            config=_Config(
+                retries={"mode": "standard"},
+                # SFN's start_sync_execution prepends `sync-` to the host; the
+                # default sfn_sync fixture disables that, we need the same.
+                inject_host_prefix=False,
+            ),
+        )
+
+    lam_a = _client("lambda")
+    sfn_a = _client("stepfunctions")
+
+    lam_a.create_function(
+        FunctionName=fn,
+        Runtime="python3.12",
+        Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _make_zip("def handler(e, c): return {'ok': True}")},
+    )
+
+    function_arn = f"arn:aws:lambda:us-east-1:{ACCOUNT}:function:{fn}"
+    definition = json.dumps({
+        "StartAt": "ReadConfig",
+        "States": {
+            "ReadConfig": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::aws-sdk:lambda:getFunctionConfiguration",
+                "Parameters": {"FunctionName.$": "$.functionName"},
+                "End": True,
+            },
+        },
+    })
+    sm_arn = sfn_a.create_state_machine(
+        name=sm_name,
+        definition=definition,
+        roleArn=f"arn:aws:iam::{ACCOUNT}:role/sfn-role",
+    )["stateMachineArn"]
+
+    resp = sfn_a.start_sync_execution(
+        stateMachineArn=sm_arn,
+        input=json.dumps({"functionName": function_arn}),
+    )
+    assert resp["status"] == "SUCCEEDED", (
+        f"Execution failed under non-default account: "
+        f"{resp.get('error')} — {resp.get('cause')}"
+    )
+    output = json.loads(resp["output"])
+    assert output["FunctionName"] == fn
+    # FunctionArn must come back scoped to OUR account, not the default
+    assert output["FunctionArn"] == function_arn
+
+    lam_a.delete_function(FunctionName=fn)
+    sfn_a.delete_state_machine(stateMachineArn=sm_arn)
 
 
 def test_sfn_optimized_start_execution_returns_execution_arn(sfn, sfn_sync):

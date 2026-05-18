@@ -1098,7 +1098,11 @@ def _dispatch_to_sns(arn, payload):
 def _dispatch_to_stepfunctions(arn, payload):
     from ministack.services import stepfunctions as _sfn
 
-    if arn not in _sfn._state_machines:
+    # Accept all three SFN target ARN shapes EventBridge supports in real
+    # AWS: base state machine, published version, and alias. The resolver
+    # walks all three stores; ``None`` means the target ARN doesn't match
+    # any state machine the caller's account can see.
+    if _sfn._resolve_state_machine_arn(arn) is None:
         logger.warning("EventBridge → Step Functions: state machine %s not found", arn)
         return
 
