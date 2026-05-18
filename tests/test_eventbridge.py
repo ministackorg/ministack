@@ -230,6 +230,72 @@ def test_eventbridge_lambda_target(eb, lam):
     eb.delete_event_bus(Name=bus_name)
     lam.delete_function(FunctionName=fname)
 
+
+def test_eventbridge_stepfunctions_target(eb, sfn):
+    """PutEvents dispatches to a Step Functions state machine target when the rule matches."""
+    sm_name = f"intg-eb-sfn-{_uuid_mod.uuid4().hex[:8]}"
+    bus_name = f"intg-eb-bus-{_uuid_mod.uuid4().hex[:8]}"
+    rule_name = f"intg-eb-rule-{_uuid_mod.uuid4().hex[:8]}"
+
+    sm_arn = sfn.create_state_machine(
+        name=sm_name,
+        definition=json.dumps({
+            "StartAt": "Done",
+            "States": {"Done": {"Type": "Pass", "End": True}},
+        }),
+        roleArn="arn:aws:iam::000000000000:role/sfn-role",
+    )["stateMachineArn"]
+
+    eb.create_event_bus(Name=bus_name)
+    eb.put_rule(
+        Name=rule_name,
+        EventBusName=bus_name,
+        EventPattern=json.dumps({"source": ["myapp.test"]}),
+        State="ENABLED",
+    )
+    eb.put_targets(
+        Rule=rule_name,
+        EventBusName=bus_name,
+        Targets=[{
+            "Id": "sfn-target",
+            "Arn": sm_arn,
+            "RoleArn": "arn:aws:iam::000000000000:role/eb-invoke-sfn",
+        }],
+    )
+
+    resp = eb.put_events(Entries=[{
+        "Source": "myapp.test",
+        "DetailType": "TestEvent",
+        "Detail": json.dumps({"key": "value"}),
+        "EventBusName": bus_name,
+    }])
+    assert resp["FailedEntryCount"] == 0
+
+    # Dispatch runs in a background daemon thread; poll briefly.
+    deadline = time.time() + 5
+    executions = []
+    while time.time() < deadline:
+        executions = sfn.list_executions(stateMachineArn=sm_arn)["executions"]
+        if executions:
+            break
+        time.sleep(0.1)
+
+    assert len(executions) == 1, "EventBridge should have started one execution"
+    exec_arn = executions[0]["executionArn"]
+
+    desc = sfn.describe_execution(executionArn=exec_arn)
+    payload = json.loads(desc["input"])
+    assert payload["source"] == "myapp.test"
+    assert payload["detail-type"] == "TestEvent"
+    assert payload["detail"] == {"key": "value"}
+
+    # Cleanup
+    eb.remove_targets(Rule=rule_name, EventBusName=bus_name, Ids=["sfn-target"])
+    eb.delete_rule(Name=rule_name, EventBusName=bus_name)
+    eb.delete_event_bus(Name=bus_name)
+    sfn.delete_state_machine(stateMachineArn=sm_arn)
+
+
 # Migrated from test_eb.py
 def test_eventbridge_create_event_bus_v2(eb):
     resp = eb.create_event_bus(Name="eb-bus-v2")
