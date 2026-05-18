@@ -49,6 +49,7 @@ dev = [
     "ruff>=0.4",
     "mypy-boto3-lambda (>=1.42.85,<2.0.0)",
     "asyncssh>=2.14",
+    "websockets>=12.0",
 ]
 
 [project.urls]
