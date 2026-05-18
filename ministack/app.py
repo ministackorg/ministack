@@ -41,9 +41,14 @@ _EXECUTE_API_RE = re.compile(
 # AppSync Events realtime WebSocket: {apiId}.appsync-realtime-api.<anything>[:port].
 _APPSYNC_REALTIME_RE = re.compile(r"^([a-z0-9]+)\.appsync-realtime-api\.")
 # IoT data plane WebSocket: anything containing ".iot." in the host header.
-# Match all four AWS-shaped variants (data-ats.iot, data.iot, plain iot, plus
-# an account-prefixed iot endpoint as returned by DescribeEndpoint).
-_IOT_DATA_WS_RE = re.compile(r"\.iot\.")
+# Match AWS-shaped IoT hosts only — `iot.<region>.<host>`,
+# `data-ats.iot.<region>.<host>`, `data.iot.<region>.<host>`, and the
+# account-prefixed endpoint returned by DescribeEndpoint
+# (`<prefix>.iot.<region>.<host>`). Anchored at a host-segment boundary
+# (start-of-host or after a dot) so custom domains that happen to contain
+# `.iot.` as a substring (e.g. an S3 bucket `mybucket.iot.example.com`) are
+# not misrouted into the MQTT WebSocket handler.
+_IOT_DATA_WS_RE = re.compile(r"(^|\.)iot\.[a-z0-9-]+\.")
 
 
 def _ws_has_mqtt_subprotocol(ws_headers: dict) -> bool:

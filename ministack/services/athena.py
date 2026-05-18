@@ -322,69 +322,83 @@ async def _execute_query(query_id, query, database):
 
 
 async def _run_duckdb(query, database):
+    """Run a DuckDB query off the event loop.
+
+    DuckDB's ``conn.execute()`` is a blocking C-extension call — running it
+    directly on the asyncio loop stalls every other in-flight request for
+    the duration of the query. Offload to a worker thread via
+    ``asyncio.to_thread`` so multiple concurrent Athena queries on the
+    single-process server stay non-blocking.
+    """
     import duckdb
-    conn = duckdb.connect(":memory:")
 
     rewritten = await _rewrite_data_paths(query, database)
 
-    try:
-        result = conn.execute(rewritten)
-        columns = []
-        column_types = []
-        if result.description:
-            for desc in result.description:
-                columns.append(desc[0])
-                raw_type = desc[1] if len(desc) > 1 else "VARCHAR"
-                if isinstance(raw_type, str):
-                    type_key = raw_type.upper().split("(")[0].strip()
-                else:
-                    type_key = str(raw_type).upper().split("(")[0].strip()
-                athena_type = _DUCKDB_TYPE_MAP.get(type_key, "varchar")
-                column_types.append(athena_type)
-        rows = result.fetchall()
-        conn.close()
-        return {
-            "columns": columns,
-            "column_types": column_types,
-            "rows": [list(r) for r in rows],
-        }
-    except Exception as e:
-        conn.close()
-        raise e
+    def _execute_blocking():
+        conn = duckdb.connect(":memory:")
+        try:
+            result = conn.execute(rewritten)
+            columns = []
+            column_types = []
+            if result.description:
+                for desc in result.description:
+                    columns.append(desc[0])
+                    raw_type = desc[1] if len(desc) > 1 else "VARCHAR"
+                    if isinstance(raw_type, str):
+                        type_key = raw_type.upper().split("(")[0].strip()
+                    else:
+                        type_key = str(raw_type).upper().split("(")[0].strip()
+                    athena_type = _DUCKDB_TYPE_MAP.get(type_key, "varchar")
+                    column_types.append(athena_type)
+            rows = result.fetchall()
+            return {
+                "columns": columns,
+                "column_types": column_types,
+                "rows": [list(r) for r in rows],
+            }
+        finally:
+            conn.close()
+
+    return await asyncio.to_thread(_execute_blocking)
 
 
 async def _rewrite_data_paths(query, database):
     from ministack.services import glue as glue_svc
 
-    pattern = r'(?:FROM|JOIN)\s+([a-zA-Z0-9_".\-/]+(?:\(.*?\))?)'
+    # Skip identifiers that look like function calls (read_csv('s3://...'))
+    # or already contain a path separator. Restrict to bare table references
+    # — optional database qualifier, then table name — letters/digits/dots/
+    # underscores/hyphens. Quoted identifiers (e.g. "my-db"."my-table") are
+    # left to a future pass.
+    pattern = r'(?:FROM|JOIN)\s+([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)?)\b'
     tables_to_resolve = re.findall(pattern, query, re.IGNORECASE)
 
     for full_name in tables_to_resolve:
-        if "/" in full_name or "(" in full_name:
-            continue
-
         parts = full_name.split(".")
         db_name, table_name = (parts[0], parts[1]) if len(parts) > 1 else (database or "default", parts[0])
 
-        body = json.dumps({"DatabaseName": db_name, "Name": table_name}).encode("utf-8")
-        headers = {"x-amz-target": "AWSGlue.GetTable"}
-        status, _, response_body = await glue_svc.handle_request("POST", "/", headers, body, {})
+        # Read directly from glue's internal store rather than going through
+        # the HTTP handler. The store is account-scoped via AccountScopedDict
+        # and reads the current request's contextvar, so multi-tenancy is
+        # preserved without crafting synthetic Authorization headers.
+        table_data = glue_svc._tables.get(f"{db_name}/{table_name}")
+        if not table_data:
+            continue
 
-        if status == 200:
-            table_data = json.loads(response_body).get("Table", {})
-            sd = table_data.get('StorageDescriptor', {})
-            s3_location = sd.get("Location")
+        sd = table_data.get("StorageDescriptor", {})
+        s3_location = sd.get("Location")
+        if not s3_location:
+            continue
 
-            if s3_location:
-                account_id = get_account_id()
-                p = urlparse(s3_location)
-                stripped = f"{p.netloc}{p.path}".rstrip("/")
-                classification = table_data.get("Parameters", {}).get("classification", "csv")
+        account_id = get_account_id()
+        p = urlparse(s3_location)
+        stripped = f"{p.netloc}{p.path}".rstrip("/")
+        classification = table_data.get("Parameters", {}).get("classification", "csv")
 
-                local_path = f"{ATHENA_DATA_DIR}/{account_id}/{stripped}"
-                duck_path = f"{local_path}/**/*.{classification}"
+        local_path = f"{ATHENA_DATA_DIR}/{account_id}/{stripped}"
+        duck_path = f"{local_path}/**/*.{classification}"
 
-                query = re.sub(rf"{re.escape(full_name)}", f"'{duck_path}'", query)
+        query = re.sub(rf"\b{re.escape(full_name)}\b", f"'{duck_path}'", query)
 
     query = _rewrite_s3_paths(query)
     return query
@@ -433,6 +447,10 @@ async def _save_query_results(query_id):
 
     output = io.StringIO()
     writer = csv.writer(output)
+    # Real Athena writes the column names as the first row of the result
+    # CSV; downstream consumers (Glue crawlers, csv readers using
+    # header=True, BI tools) rely on it.
+    writer.writerow(results['columns'])
     writer.writerows(results['rows'])
     csv_content = output.getvalue().encode("utf-8")
 
@@ -442,36 +460,44 @@ async def _save_query_results(query_id):
 
     output_location = execution["ResultConfiguration"]["OutputLocation"]
     p = urlparse(output_location)
-    local_path = f"{p.netloc}{p.path}".rstrip("/")
+    bucket_name = p.netloc
+    key_prefix = p.path.lstrip("/").rstrip("/")
+    # Athena writes <id>.csv and <id>.csv.metadata under the OutputLocation
+    # prefix. If the prefix is empty (output_location == "s3://bucket/"),
+    # the files land at bucket root.
+    csv_key = f"{key_prefix}/{query_id}.csv" if key_prefix else f"{query_id}.csv"
+    meta_key = f"{csv_key}.metadata"
 
-    async def upload(path, data):
-        account_id = get_account_id()
-        aws_region = get_region()
-        dt = date.today().strftime("%Y%m%d")
-
-        credential = f"{account_id}/{dt}/{aws_region}/s3/aws4_request"
-
-        headers = {
-            "content-type": "application/octet-stream",
-            "content-length": str(len(data)),
-            "x-amz-account-id": account_id,
-            "Authorization": f"AWS4-HMAC-SHA256 Credential={credential}"
-        }
-        status, _, body = await s3_svc.handle_request("PUT", path, headers, data, {})
-        if status != 200:
+    # Write directly to the S3 service's in-memory store via the public
+    # internal helper, which is account-scoped through the request's
+    # contextvar — no synthetic Authorization header needed and no
+    # round-trip through the HTTP handler.
+    def _upload(key, data, content_type):
+        resp = s3_svc._put_object(
+            bucket_name,
+            key,
+            data,
+            {"content-type": content_type, "content-length": str(len(data))},
+        )
+        # _put_object returns (status, headers, body) on error; a successful
+        # write returns the same tuple with status 200. Surface any failure
+        # onto the execution so callers see the cause via GetQueryExecution.
+        if isinstance(resp, tuple) and resp[0] >= 300:
             try:
-                root = ET.fromstring(body)
+                root = ET.fromstring(resp[2])
                 code = root.findtext("Code", "UnknownError")
                 message = root.findtext("Message", "An unexpected S3 error occurred")
             except Exception:
                 code, message = "InternalError", "Failed to parse S3 error response"
             execution["Status"]["State"] = "FAILED"
-            execution["Status"]["StateChangeReason"] = f"An error occurred while writing to S3. {code}: {message}"
+            execution["Status"]["StateChangeReason"] = (
+                f"An error occurred while writing to S3. {code}: {message}"
+            )
             return False
         return True
 
-    if await upload(local_path, csv_content):
-        await upload(f"{local_path}.metadata", metadata_content)
+    if _upload(csv_key, csv_content, "text/csv"):
+        _upload(meta_key, metadata_content, "text/plain")
 
 
 def _mock_query_results(query):
