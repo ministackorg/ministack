@@ -367,6 +367,119 @@ def test_sqs_message_system_attribute_names_modern_field(sqs):
     assert attrs.get("ApproximateReceiveCount") == "1"
     assert "SentTimestamp" in attrs
 
+
+def test_sqs_tag_queue_rejects_null_tag_value(sqs):
+    """TagQueue rejects JSON null tag VALUES with InvalidParameterValue (400).
+
+    boto3's Python client enforces the `string -> string` map shape locally so
+    we can't trigger this through it directly. Java SDK v2, Go SDK, and raw
+    HTTP callers can send `{"Tags": {"key": null}}`; previously the null was
+    stored as Python None then serialised back as the literal string "null".
+    Real AWS rejects at intake.
+    """
+    import urllib.request, json as _json
+    url = sqs.create_queue(QueueName="intg-sqs-tag-null")["QueueUrl"]
+
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+    req = urllib.request.Request(
+        endpoint + "/",
+        data=_json.dumps({
+            "QueueUrl": url,
+            "Tags": {"valid": "ok", "broken": None},
+        }).encode(),
+        headers={
+            "Content-Type": "application/x-amz-json-1.0",
+            "X-Amz-Target": "AmazonSQS.TagQueue",
+            "Authorization": "AWS4-HMAC-SHA256 Credential=test/20260101/us-east-1/sqs/aws4_request",
+        },
+        method="POST",
+    )
+    try:
+        urllib.request.urlopen(req, timeout=5).read()
+        pytest.fail("expected 400 InvalidParameterValue for null tag value")
+    except urllib.error.HTTPError as e:
+        assert e.code == 400
+        body = e.read().decode()
+        assert "InvalidParameterValue" in body, body[:300]
+        assert "null" in body.lower(), body[:300]
+
+    # And — the valid tag in the same call MUST NOT have been partially
+    # applied. AWS is all-or-nothing on this validation.
+    tags = sqs.list_queue_tags(QueueUrl=url).get("Tags", {})
+    assert "valid" not in tags
+    assert "broken" not in tags
+
+
+def test_sqs_send_message_batch_rejects_oversized_aggregate(sqs):
+    """SendMessageBatch's aggregate payload cap is 1 MiB. The contributor PR
+    enforced per-message size against the queue's MaximumMessageSize but never
+    checked the batch sum, so 10 × 150 KiB messages (queue allows them
+    individually) snuck through. Real AWS returns BatchRequestTooLong (400)
+    for the whole batch when the sum is over.
+    See: https://docs.aws.amazon.com/AWSSimpleQueueService/latest/APIReference/API_SendMessageBatch.html
+    """
+    url = sqs.create_queue(
+        QueueName="intg-sqs-batch-too-long",
+        Attributes={"MaximumMessageSize": "262144"},  # default
+    )["QueueUrl"]
+
+    # 10 × 150 KiB → 1.5 MiB total. Each individual entry is within the queue's
+    # 256-KiB MaximumMessageSize, but the batch aggregate exceeds the 1-MiB cap.
+    body = "x" * (150 * 1024)
+    entries = [{"Id": f"m{i}", "MessageBody": body} for i in range(10)]
+
+    with pytest.raises(ClientError) as exc:
+        sqs.send_message_batch(QueueUrl=url, Entries=entries)
+    code = exc.value.response["Error"]["Code"]
+    assert code in (
+        "AWS.SimpleQueueService.BatchRequestTooLong",
+        "BatchRequestTooLong",
+    ), f"unexpected error code: {code}"
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+
+    # Under-cap batch should succeed (5 × 150 KiB = 750 KiB).
+    ok = sqs.send_message_batch(QueueUrl=url, Entries=entries[:5])
+    assert len(ok["Successful"]) == 5
+    assert not ok.get("Failed")
+
+
+def test_sqs_send_message_preserves_awstraceheader(sqs):
+    """SendMessage's MessageSystemAttributes.AWSTraceHeader carries an X-Ray
+    trace context that AWS preserves through the queue and returns to the
+    receiver via ReceiveMessage's MessageSystemAttributeNames=['AWSTraceHeader']
+    (or 'All'). Previously this was captured then dropped silently.
+    See: https://docs.aws.amazon.com/AWSSimpleQueueService/latest/APIReference/API_SendMessage.html
+    """
+    url = sqs.create_queue(QueueName="intg-sqs-trace-hdr")["QueueUrl"]
+    trace = "Root=1-5759e988-bd862e3fe1be46a994272793;Parent=53995c3f42cd8ad8;Sampled=1"
+    sqs.send_message(
+        QueueUrl=url,
+        MessageBody="traced",
+        MessageSystemAttributes={
+            "AWSTraceHeader": {"DataType": "String", "StringValue": trace},
+        },
+    )
+
+    # Explicit name
+    msgs = sqs.receive_message(
+        QueueUrl=url,
+        MaxNumberOfMessages=1,
+        MessageSystemAttributeNames=["AWSTraceHeader"],
+    )
+    assert msgs["Messages"][0]["Attributes"]["AWSTraceHeader"] == trace
+
+    # Re-receive after the visibility window via "All"
+    msg = msgs["Messages"][0]
+    sqs.change_message_visibility(
+        QueueUrl=url, ReceiptHandle=msg["ReceiptHandle"], VisibilityTimeout=0,
+    )
+    msgs2 = sqs.receive_message(
+        QueueUrl=url,
+        MaxNumberOfMessages=1,
+        MessageSystemAttributeNames=["All"],
+    )
+    assert msgs2["Messages"][0]["Attributes"]["AWSTraceHeader"] == trace
+
 def test_sqs_nonexistent_queue(sqs):
     with pytest.raises(ClientError) as exc:
         sqs.get_queue_url(QueueName="intg-sqs-does-not-exist")

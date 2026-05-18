@@ -1237,6 +1237,12 @@ def _list_tasks(data):
     for arn, t in _tasks.items():
         if t.get("clusterArn") != cluster_arn:
             continue
+        # Reconcile lifecycle on the fly: a task whose container has exited
+        # naturally (handler returned, process crashed) should report STOPPED
+        # — not the stale RUNNING that survives until someone calls
+        # DescribeTasks. _maybe_mark_stopped is a no-op for tasks not in
+        # RUNNING or without docker ids, so the hot path is cheap.
+        _maybe_mark_stopped(t)
         if t.get("desiredStatus") != status_filter:
             continue
         if family:
