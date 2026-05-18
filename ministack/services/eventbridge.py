@@ -945,6 +945,8 @@ def _invoke_target(target, event, rule):
             _dispatch_to_sqs(arn, event_payload, target.get("SqsParameters") or {})
         elif ":sns:" in arn:
             _dispatch_to_sns(arn, event_payload)
+        elif ":states:" in arn:
+            _dispatch_to_stepfunctions(arn, event_payload)
         else:
             logger.warning("EventBridge: unsupported target type for ARN %s", arn)
     except Exception as e:
@@ -1091,6 +1093,21 @@ def _dispatch_to_sns(arn, payload):
     })
     _sns._fanout(arn, msg_id, payload, "EventBridge Notification")
     logger.info("EventBridge → SNS %s", arn)
+
+
+def _dispatch_to_stepfunctions(arn, payload):
+    from ministack.services import stepfunctions as _sfn
+
+    if arn not in _sfn._state_machines:
+        logger.warning("EventBridge → Step Functions: state machine %s not found", arn)
+        return
+
+    sm_name = arn.rsplit(":", 1)[-1]
+    _sfn._start_execution({
+        "stateMachineArn": arn,
+        "input": payload,
+    })
+    logger.info("EventBridge → Step Functions %s: dispatched", sm_name)
 
 
 # ---------------------------------------------------------------------------
