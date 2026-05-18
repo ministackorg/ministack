@@ -180,6 +180,111 @@ def _wait_for_port(host, port, timeout=60):
     return False
 
 
+def _is_mysql_engine(engine):
+    return any(e in engine for e in ("mysql", "aurora-mysql", "mariadb"))
+
+
+def _is_postgres_engine(engine):
+    return any(e in engine for e in ("postgres", "aurora-postgresql"))
+
+
+def _grant_mysql_master_user_privileges(host, port, master_user, master_pass, db_id):
+    """Grant the emulated MySQL master user AWS/RDS-like admin privileges."""
+    try:
+        import pymysql
+        conn = pymysql.connect(
+            host=host, port=int(port), user="root",
+            password=master_pass, autocommit=True)
+        cur = conn.cursor()
+        cur.execute(
+            "CREATE USER IF NOT EXISTS %s@'%%' IDENTIFIED BY %s",
+            (master_user, master_pass),
+        )
+        cur.execute(
+            "GRANT ALL PRIVILEGES ON *.* TO %s@'%%' WITH GRANT OPTION",
+            (master_user,),
+        )
+        for privilege in ("APPLICATION_PASSWORD_ADMIN",):
+            try:
+                cur.execute(f"GRANT {privilege} ON *.* TO %s@'%%'", (master_user,))
+            except Exception as e:
+                logger.debug(
+                    "RDS: MySQL privilege %s unsupported for %s: %s",
+                    privilege, db_id, e)
+        cur.execute("FLUSH PRIVILEGES")
+        cur.close()
+        conn.close()
+        logger.info("RDS: granted MySQL master privileges for %s", db_id)
+    except Exception as e:
+        logger.warning(
+            "RDS: failed to grant MySQL master privileges for %s: %s",
+            db_id, e)
+
+
+def _wait_for_database_ready(host, port, engine, user, password, db_name, timeout=60):
+    """Block until the database accepts an authenticated connection.
+
+    TCP readiness is not enough for MySQL/Postgres images: they can accept a
+    socket before bootstrap has created users and databases. When a DB driver is
+    unavailable in the lightweight install, fall back to TCP readiness so RDS
+    control-plane behavior remains usable without optional dependencies.
+    """
+    deadline = time.time() + timeout
+    last_error = None
+    while time.time() < deadline:
+        try:
+            if _is_mysql_engine(engine):
+                try:
+                    import pymysql
+                except ImportError:
+                    return _wait_for_port(host, port, timeout=max(1, deadline - time.time()))
+                conn = pymysql.connect(
+                    host=host, port=int(port), user="root",
+                    password=password, database=db_name or None,
+                    connect_timeout=2, read_timeout=2, write_timeout=2,
+                    autocommit=True)
+            elif _is_postgres_engine(engine):
+                try:
+                    import psycopg2
+                except ImportError:
+                    return _wait_for_port(host, port, timeout=max(1, deadline - time.time()))
+                conn = psycopg2.connect(
+                    host=host, port=int(port), user=user,
+                    password=password, dbname=db_name or "postgres",
+                    connect_timeout=2)
+            else:
+                return _wait_for_port(host, port, timeout=max(1, deadline - time.time()))
+            conn.close()
+            return True
+        except Exception as e:
+            last_error = e
+            time.sleep(0.5)
+    if last_error:
+        logger.debug("RDS: database readiness check failed: %s", last_error)
+    return False
+
+
+def _refresh_cluster_status(cluster_id):
+    if not cluster_id:
+        return
+    cluster = _clusters.get(cluster_id)
+    if not cluster:
+        return
+    if cluster.get("Status") in ("stopped", "deleting"):
+        return
+    member_ids = {
+        m.get("DBInstanceIdentifier")
+        for m in cluster.get("DBClusterMembers", [])
+        if m.get("DBInstanceIdentifier")
+    }
+    if any(
+        inst.get("DBInstanceIdentifier") in member_ids
+        and inst.get("DBInstanceStatus") != "available"
+        for inst in _instances.values()
+    ):
+        cluster["Status"] = "creating"
+    else:
+        cluster["Status"] = "available"
 _port_lock = threading.Lock()
 
 
@@ -288,6 +393,26 @@ def _resolve_instance(db_id):
     return None
 
 
+def _sync_cluster_endpoints(cluster):
+    """Point Aurora cluster endpoints at reachable local DB instance endpoints."""
+    members = cluster.get("DBClusterMembers") or []
+    if not members:
+        return
+
+    writer = next((m for m in members if m.get("IsClusterWriter")), members[0])
+    writer_inst = _instances.get(writer.get("DBInstanceIdentifier"))
+    reader_member = next((m for m in members if not m.get("IsClusterWriter")), writer)
+    reader_inst = _instances.get(reader_member.get("DBInstanceIdentifier")) or writer_inst
+
+    if writer_inst and writer_inst.get("Endpoint"):
+        writer_ep = writer_inst["Endpoint"]
+        cluster["Endpoint"] = writer_ep.get("Address", cluster.get("Endpoint", ""))
+        cluster["Port"] = int(writer_ep.get("Port", cluster.get("Port", 0)))
+    if reader_inst and reader_inst.get("Endpoint"):
+        cluster["ReaderEndpoint"] = reader_inst["Endpoint"].get(
+            "Address", cluster.get("ReaderEndpoint", ""))
+
+
 def _register_instance_in_cluster(instance):
     """Append instance to parent cluster ``DBClusterMembers`` (Aurora parity)."""
     cid = instance.get("DBClusterIdentifier")
@@ -306,6 +431,8 @@ def _register_instance_in_cluster(instance):
         "IsClusterWriter": is_writer,
         "PromotionTier": int(instance.get("PromotionTier", 1)),
     })
+    _sync_cluster_endpoints(cluster)
+    _refresh_cluster_status(cid)
 
 
 def _unregister_instance_from_clusters(db_id):
@@ -313,6 +440,8 @@ def _unregister_instance_from_clusters(db_id):
     for cl in _clusters.values():
         mem = cl.get("DBClusterMembers") or []
         cl["DBClusterMembers"] = [m for m in mem if m.get("DBInstanceIdentifier") != db_id]
+        _sync_cluster_endpoints(cl)
+        _refresh_cluster_status(cl.get("DBClusterIdentifier"))
 
 
 # ---------------------------------------------------------------------------
@@ -357,17 +486,20 @@ def _create_db_instance(p):
     docker_container_id = None
     internal_host = None
     internal_port = None
+    real_container_started = False
+    readiness_host = None
+    readiness_port = None
 
     docker_client = _get_docker()
     if docker_client:
-        host_port = _next_port()
-        endpoint_port = host_port
         ms_network = _get_ministack_network(docker_client)
         image, env, container_port, data_path = _docker_image_for_engine(
             engine, engine_version, master_user, master_pass, db_name
         )
         if image:
             try:
+                host_port = _next_port()
+                endpoint_port = host_port
                 container_kwargs = dict(
                     image=image, detach=True,
                     environment=env,
@@ -391,6 +523,7 @@ def _create_db_instance(p):
                     }
                 container = docker_client.containers.run(**container_kwargs)
                 docker_container_id = container.id
+                real_container_started = True
                 if ms_network:
                     container.reload()
                     networks = container.attrs.get(
@@ -402,30 +535,15 @@ def _create_db_instance(p):
                         internal_port = container_port
                         endpoint_host = container_ip
                         endpoint_port = container_port
-                        def _bg_wait(cip=container_ip, cport=container_port,
-                                     eng=engine, did=db_id, net=ms_network):
-                            if _wait_for_port(cip, cport):
-                                logger.info(
-                                    "RDS: %s container for %s ready at "
-                                    "%s:%s (network %s)", eng, did,
-                                    cip, cport, net)
-                            else:
-                                logger.warning(
-                                    "RDS: %s container for %s at %s:%s "
-                                    "not ready after timeout", eng,
-                                    did, cip, cport)
-                        threading.Thread(target=_bg_wait, daemon=True).start()
+                        readiness_host = container_ip
+                        readiness_port = container_port
                     else:
                         logger.info(
                             "RDS: started %s container for %s on port %s",
                             engine, db_id, host_port)
                 else:
-                    def _bg_wait_port(hp=host_port, eng=engine, did=db_id):
-                        if _wait_for_port("127.0.0.1", hp):
-                            logger.info("RDS: %s container for %s ready on port %s", eng, did, hp)
-                        else:
-                            logger.warning("RDS: %s container for %s on port %s not ready after timeout", eng, did, hp)
-                    threading.Thread(target=_bg_wait_port, daemon=True).start()
+                    readiness_host = "127.0.0.1"
+                    readiness_port = host_port
             except Exception as e:
                 logger.warning("RDS: Docker failed for %s: %s", db_id, e)
 
@@ -450,7 +568,7 @@ def _create_db_instance(p):
         "DBInstanceClass": db_class,
         "Engine": engine,
         "EngineVersion": engine_version,
-        "DBInstanceStatus": "available",
+        "DBInstanceStatus": "creating" if real_container_started else "available",
         "MasterUsername": master_user,
         "DBName": db_name,
         "Endpoint": {
@@ -534,6 +652,33 @@ def _create_db_instance(p):
     }
     _instances[db_id] = instance
     _register_instance_in_cluster(instance)
+
+    if real_container_started:
+        ready_host = readiness_host or endpoint_host
+        ready_port = readiness_port or endpoint_port
+        if _wait_for_database_ready(
+            ready_host, ready_port, engine, master_user, master_pass, db_name):
+            if _is_mysql_engine(engine):
+                _grant_mysql_master_user_privileges(
+                    ready_host, ready_port, master_user, master_pass, db_id)
+            instance["DBInstanceStatus"] = "available"
+            if cluster_id:
+                cluster = _clusters.get(cluster_id)
+                if cluster:
+                    _sync_cluster_endpoints(cluster)
+            _refresh_cluster_status(cluster_id)
+            if ms_network and internal_host:
+                logger.info(
+                    "RDS: %s container for %s ready at %s:%s (network %s)",
+                    engine, db_id, internal_host, internal_port, ms_network)
+            else:
+                logger.info(
+                    "RDS: %s container for %s ready on port %s",
+                    engine, db_id, endpoint_port)
+        else:
+            logger.warning(
+                "RDS: %s container for %s at %s:%s not ready after timeout",
+                engine, db_id, ready_host, ready_port)
 
     req_tags = _parse_tags(p)
     if req_tags:

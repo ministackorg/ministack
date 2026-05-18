@@ -33,6 +33,10 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 ### Changed
 - **Test harness — xdist session-startup reset coordination** — the per-worker `autouse` `reset_server` fixture previously had every xdist worker hit `/_ministack/reset` on session start, so a slower worker's reset could fire after a faster worker had already begun creating fixtures, wiping that state mid-test (most visibly as occasional `list_functions()` empty results in `test_lambda_create_invoke`). The first worker now wins an `O_EXCL` file lock and runs the reset; the others wait briefly for a marker file and skip. Single-process pytest (no xdist) keeps the original behaviour. Removes a class of CI flakes that only reproduced under parallel load.
 
+### Fixed
+- **RDS Data API no longer acknowledges writes through the SQL stub for real containers that are still booting** — Docker-backed RDS instances now wait for an authenticated database connection before reporting `available`, and their parent clusters remain `creating` while member instances are not ready. If an endpoint-backed container still cannot be reached, RDS Data API returns `DatabaseUnavailableException` instead of silently tracking `CREATE USER` / `GRANT` statements in memory. Stub SQL mode remains available for control-plane-only clusters without a real backing container. Contributed by @jayjanssen.
+- **RDS Aurora MySQL local endpoint and master-user parity** — Aurora cluster endpoints now track the reachable backing DB instance endpoint after cluster members are created, so Lambda containers using `DescribeDBClusters.Endpoint` can connect to MiniStack-backed databases. MySQL and Aurora MySQL containers also grant the configured master username AWS/RDS-like global privileges after the server is reachable, with version-specific dynamic privileges treated as best-effort. Contributed by @jayjanssen.
+
 ---
 
 ## [1.3.41] — 2026-05-16

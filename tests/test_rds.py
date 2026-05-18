@@ -899,6 +899,90 @@ def test_rds_aurora_cluster_lists_instance_member(rds):
     assert any(m["DBInstanceIdentifier"] == iid for m in members)
 
 
+def test_rds_aurora_cluster_endpoints_follow_backing_instance(rds):
+    """Aurora cluster endpoints should be reachable through the local instance."""
+    cid = f"epclus-{_uuid_mod.uuid4().hex[:10]}"
+    iid = f"{cid}-writer"
+    rds.create_db_cluster(
+        DBClusterIdentifier=cid,
+        Engine="aurora-mysql",
+        MasterUsername="admin",
+        MasterUserPassword="pw",
+    )
+    rds.create_db_instance(
+        DBInstanceIdentifier=iid,
+        DBClusterIdentifier=cid,
+        DBInstanceClass="db.r6g.large",
+        Engine="aurora-mysql",
+    )
+
+    inst = rds.describe_db_instances(DBInstanceIdentifier=iid)["DBInstances"][0]
+    cluster = rds.describe_db_clusters(DBClusterIdentifier=cid)["DBClusters"][0]
+
+    assert cluster["Endpoint"] == inst["Endpoint"]["Address"]
+    assert cluster["ReaderEndpoint"] == inst["Endpoint"]["Address"]
+    assert cluster["Port"] == inst["Endpoint"]["Port"]
+
+
+def test_rds_mysql_master_user_privilege_grants(monkeypatch):
+    """MySQL master users get admin grants, with dynamic grants best-effort."""
+    import sys
+    import types
+
+    from ministack.services import rds as m
+
+    calls = []
+
+    class FakeCursor:
+        def execute(self, sql, params=None):
+            calls.append((sql, params))
+            if "APPLICATION_PASSWORD_ADMIN" in sql:
+                raise Exception("unsupported privilege")
+
+        def close(self):
+            calls.append(("cursor.close", None))
+
+    class FakeConnection:
+        def cursor(self):
+            return FakeCursor()
+
+        def close(self):
+            calls.append(("connection.close", None))
+
+    def fake_connect(**kwargs):
+        calls.append(("connect", kwargs))
+        return FakeConnection()
+
+    monkeypatch.setitem(
+        sys.modules,
+        "pymysql",
+        types.SimpleNamespace(connect=fake_connect),
+    )
+
+    m._grant_mysql_master_user_privileges(
+        "10.0.0.12", 3306, "admin", "password123", "mysql-test")
+
+    assert calls[0] == (
+        "connect",
+        {
+            "host": "10.0.0.12",
+            "port": 3306,
+            "user": "root",
+            "password": "password123",
+            "autocommit": True,
+        },
+    )
+    assert (
+        "CREATE USER IF NOT EXISTS %s@'%%' IDENTIFIED BY %s",
+        ("admin", "password123"),
+    ) in calls
+    assert (
+        "GRANT ALL PRIVILEGES ON *.* TO %s@'%%' WITH GRANT OPTION",
+        ("admin",),
+    ) in calls
+    assert ("FLUSH PRIVILEGES", None) in calls
+
+
 def test_rds_modify_cluster_password(rds):
     """ModifyDBCluster with MasterUserPassword succeeds."""
     rds.create_db_cluster(

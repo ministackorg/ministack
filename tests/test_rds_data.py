@@ -364,6 +364,140 @@ def test_rds_data_stub_drop_user(rds, sm):
     assert "tempuser" not in names
 
 
+def test_rds_data_real_endpoint_connection_failure_is_transient(monkeypatch):
+    """Endpoint-backed clusters must not acknowledge writes through stub mode."""
+    from ministack.services import rds_data
+
+    rds_data.reset()
+    resource_arn = f"arn:aws:rds:{REGION}:{ACCOUNT_ID}:cluster:real-cluster"
+    instance = {
+        "Endpoint": {"Address": "10.0.0.10", "Port": 3306},
+        "_docker_container_id": "container-id",
+        "Engine": "aurora-mysql",
+    }
+
+    monkeypatch.setattr(rds_data, "_resolve_cluster", lambda _arn: (instance, "aurora-mysql"))
+    monkeypatch.setattr(rds_data, "_get_secret_credentials", lambda _arn: ("admin", "pw"))
+
+    def _raise_connection_error(*_args, **_kwargs):
+        raise OSError("Connection refused")
+
+    monkeypatch.setattr(rds_data, "_connect", _raise_connection_error)
+
+    status, headers, body = rds_data._execute_statement({
+        "resourceArn": resource_arn,
+        "secretArn": FAKE_SECRET_ARN,
+        "sql": "CREATE USER 'lost_write'@'%' IDENTIFIED BY 'pw'",
+    })
+    payload = json.loads(body)
+
+    assert status == 504
+    assert headers["x-amzn-errortype"] == "DatabaseUnavailableException"
+    assert payload["__type"] == "DatabaseUnavailableException"
+    assert "lost_write" not in rds_data._stub_users.get("real-cluster", set())
+
+
+def test_rds_data_non_container_endpoint_keeps_stub_mode(monkeypatch):
+    """Control-plane-only instances still use the lightweight SQL stub."""
+    from ministack.services import rds_data
+
+    rds_data.reset()
+    resource_arn = f"arn:aws:rds:{REGION}:{ACCOUNT_ID}:cluster:stub-cluster"
+    instance = {
+        "Endpoint": {"Address": "localhost", "Port": 3306},
+        "_docker_container_id": None,
+        "Engine": "aurora-mysql",
+    }
+    monkeypatch.setattr(rds_data, "_resolve_cluster", lambda _arn: (instance, "aurora-mysql"))
+
+    status, _headers, body = rds_data._execute_statement({
+        "resourceArn": resource_arn,
+        "secretArn": FAKE_SECRET_ARN,
+        "sql": "CREATE USER 'stub_user'@'%' IDENTIFIED BY 'pw'",
+    })
+    payload = json.loads(body)
+
+    assert status == 200
+    assert payload["records"] == []
+    assert "stub_user" in rds_data._stub_users.get("stub-cluster", set())
+
+
+def test_rds_data_lock_wait_timeout_is_not_connection_error():
+    """MySQL lock wait timeout is a SQL error, not endpoint unavailability."""
+    from ministack.services import rds_data
+
+    assert not rds_data._is_connection_error(
+        Exception("(1205, 'Lock wait timeout exceeded; try restarting transaction')")
+    )
+
+
+def test_rds_cluster_status_tracks_member_readiness():
+    """Parent clusters remain creating until their member instance is available."""
+    from ministack.services import rds
+
+    cluster_id = "readiness-cluster"
+    instance_id = "readiness-instance"
+    rds._clusters[cluster_id] = {
+        "DBClusterIdentifier": cluster_id,
+        "Status": "available",
+        "DBClusterMembers": [],
+    }
+    rds._instances[instance_id] = {
+        "DBInstanceIdentifier": instance_id,
+        "DBClusterIdentifier": cluster_id,
+        "DBInstanceStatus": "creating",
+        "PromotionTier": 1,
+    }
+
+    try:
+        rds._register_instance_in_cluster(rds._instances[instance_id])
+        assert rds._clusters[cluster_id]["Status"] == "creating"
+
+        rds._instances[instance_id]["DBInstanceStatus"] = "available"
+        rds._refresh_cluster_status(cluster_id)
+        assert rds._clusters[cluster_id]["Status"] == "available"
+    finally:
+        rds._instances.pop(instance_id, None)
+        rds._clusters.pop(cluster_id, None)
+
+
+def test_rds_cluster_endpoints_sync_to_backing_instance():
+    """Aurora cluster endpoints track the registered local writer instance."""
+    from ministack.services import rds
+
+    cluster_id = "endpoint-sync-cluster"
+    instance_id = "endpoint-sync-instance"
+    rds._clusters[cluster_id] = {
+        "DBClusterIdentifier": cluster_id,
+        "Status": "available",
+        "Endpoint": "original.cluster.local",
+        "ReaderEndpoint": "original-ro.cluster.local",
+        "Port": 3306,
+        "DBClusterMembers": [],
+    }
+    rds._instances[instance_id] = {
+        "DBInstanceIdentifier": instance_id,
+        "DBClusterIdentifier": cluster_id,
+        "DBInstanceStatus": "available",
+        "Endpoint": {
+            "Address": "10.0.0.12",
+            "Port": 3306,
+        },
+        "PromotionTier": 1,
+    }
+
+    try:
+        rds._register_instance_in_cluster(rds._instances[instance_id])
+
+        cluster = rds._clusters[cluster_id]
+        assert cluster["Endpoint"] == "10.0.0.12"
+        assert cluster["ReaderEndpoint"] == "10.0.0.12"
+        assert cluster["Port"] == 3306
+    finally:
+        rds._instances.pop(instance_id, None)
+        rds._clusters.pop(cluster_id, None)
+
+
 def test_rds_data_secret_credentials_parsing():
     """_get_secret_credentials extracts username and password from secret."""
     from ministack.core.responses import set_request_account_id

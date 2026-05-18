@@ -32,6 +32,35 @@ def _error(code, message, status=400):
     return error_response_json(code, message, status)
 
 
+def _transient_database_error(message):
+    return _error("DatabaseUnavailableException", message, 504)
+
+
+def _has_real_endpoint(instance):
+    """Return true when RDS assigned an endpoint backed by a real container."""
+    endpoint = instance.get("Endpoint", {})
+    return (
+        isinstance(endpoint, dict)
+        and bool(endpoint.get("Port"))
+        and bool(instance.get("_docker_container_id"))
+    )
+
+
+def _is_connection_error(exc):
+    err_str = str(exc)
+    return any(
+        marker in err_str
+        for marker in (
+            "Can't connect",
+            "Connection refused",
+            "Connection reset",
+            "timed out",
+            "Name or service not known",
+            "Temporary failure in name resolution",
+        )
+    )
+
+
 def _stub_success():
     """Return a minimal successful ExecuteStatement response for mock environments."""
     return json_response({
@@ -420,10 +449,10 @@ def _execute_statement(data):
         return _error("BadRequestException",
                        f"Database cluster not found for ARN: {resource_arn}")
 
-    # Check if instance has a real endpoint (Docker container running).
-    # Clusters have Endpoint as a string (hostname); instances have it as a dict.
-    endpoint = instance.get("Endpoint", {})
-    if isinstance(endpoint, str) or not endpoint.get("Port"):
+    # Keep stub mode for intentional mock environments only. Once RDS has a
+    # real container-backed endpoint, connection failures must surface as
+    # transient errors instead of acknowledging writes that never reached MySQL.
+    if not _has_real_endpoint(instance):
         logger.info("No endpoint for %s, using stub mode", resource_arn)
         return _stub_execute(resource_arn, sql)
 
@@ -478,21 +507,13 @@ def _execute_statement(data):
     except ImportError as e:
         if own_conn and conn:
             conn.close()
-        if not getattr(_execute_statement, "_import_warned", False):
-            logger.warning("DB driver not available, using stub: %s", e)
-            _execute_statement._import_warned = True
-        return _stub_execute(resource_arn, sql)
+        return _error("BadRequestException", str(e))
     except Exception as e:
         if own_conn and conn:
             conn.close()
-        # Connection errors (e.g. when RDS containers are not reachable from
-        # within the MiniStack container) should fall back to stubs rather than
-        # failing the caller.  This covers LAMBDA_EXECUTOR=local where the
-        # MySQL sidecar container is not network-accessible.
-        err_str = str(e)
-        if "Can't connect" in err_str or "Connection refused" in err_str:
-            logger.warning("DB connection failed, using stub: %s", e)
-            return _stub_execute(resource_arn, sql)
+        if _is_connection_error(e):
+            logger.warning("DB connection failed for real endpoint: %s", e)
+            return _transient_database_error(f"Database endpoint is not available: {e}")
         return _error("BadRequestException", f"Database error: {e}")
 
 
