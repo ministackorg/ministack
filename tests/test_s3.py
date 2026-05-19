@@ -327,6 +327,84 @@ def test_s3_get_object_range(s3):
     assert "bytes" in resp.get("ContentRange", "")
     assert resp["ResponseMetadata"]["HTTPStatusCode"] == 206
 
+
+def test_s3_get_object_rejects_response_overrides_on_unsigned_request(s3):
+    """AWS rejects unsigned GetObject requests carrying any of the six
+    ``response-*`` override query parameters with HTTP 400 InvalidRequest.
+
+    Reference: https://docs.aws.amazon.com/AmazonS3/latest/API/API_GetObject.html
+    "When you use these parameters, you must sign the request by using
+    either an Authorization header or a presigned URL. These parameters
+    cannot be used with an unsigned (anonymous) request."
+    """
+    import urllib.request
+    bkt = "intg-s3-unsigned-resp-override"
+    s3.create_bucket(Bucket=bkt)
+    s3.put_object(Bucket=bkt, Key="data.txt", Body=b"hello")
+
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+    # No Authorization header, no presign markers — raw anonymous GET.
+    for param in (
+        "response-cache-control=no-cache",
+        "response-content-disposition=attachment%3B%20filename%3Dfoo.txt",
+        "response-content-encoding=gzip",
+        "response-content-language=en",
+        "response-content-type=text%2Fplain",
+        "response-expires=0",
+    ):
+        url = f"{endpoint}/{bkt}/data.txt?{param}"
+        try:
+            urllib.request.urlopen(url, timeout=5).read()
+            pytest.fail(f"expected 400 for unsigned request with {param}")
+        except urllib.error.HTTPError as e:
+            assert e.code == 400, f"{param} → wrong status {e.code}"
+            body = e.read().decode()
+            assert "InvalidRequest" in body, f"{param} → missing InvalidRequest in {body[:200]}"
+            assert "anonymous" in body, f"{param} → missing 'anonymous' phrase in {body[:200]}"
+
+    # And — same params on a SIGNED boto3 call must still work, untouched.
+    resp = s3.get_object(
+        Bucket=bkt,
+        Key="data.txt",
+        ResponseContentDisposition="attachment; filename=foo.txt",
+    )
+    assert resp["Body"].read() == b"hello"
+
+
+def test_s3_get_object_response_overrides_replace_headers(s3):
+    """Real S3 lets a signed GetObject override response headers via six
+    ``response-*`` query parameters: Cache-Control, Content-Disposition,
+    Content-Encoding, Content-Language, Content-Type, Expires. boto3 exposes
+    them as ``ResponseCacheControl`` / ``ResponseContentDisposition`` / etc.
+    Each override REPLACES the corresponding header on the response.
+    """
+    bkt = "intg-s3-resp-overrides"
+    s3.create_bucket(Bucket=bkt)
+    s3.put_object(
+        Bucket=bkt, Key="orig.txt", Body=b"payload",
+        ContentType="text/x-original",
+        CacheControl="max-age=600",
+    )
+
+    resp = s3.get_object(
+        Bucket=bkt, Key="orig.txt",
+        ResponseContentType="application/json",
+        ResponseContentDisposition='attachment; filename="renamed.json"',
+        ResponseCacheControl="no-store",
+        ResponseContentEncoding="identity",
+        ResponseContentLanguage="en-US",
+        ResponseExpires="Thu, 01 Jan 1970 00:00:00 GMT",
+    )
+    assert resp["Body"].read() == b"payload"
+    assert resp["ContentType"] == "application/json"
+    h = resp["ResponseMetadata"]["HTTPHeaders"]
+    assert h["content-type"] == "application/json"
+    assert h["content-disposition"] == 'attachment; filename="renamed.json"'
+    assert h["cache-control"] == "no-store"
+    assert h["content-encoding"] == "identity"
+    assert h["content-language"] == "en-US"
+    assert h["expires"] == "Thu, 01 Jan 1970 00:00:00 GMT"
+
 def test_s3_object_metadata(s3):
     bkt = "intg-s3-meta"
     s3.create_bucket(Bucket=bkt)

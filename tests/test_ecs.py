@@ -71,6 +71,48 @@ def test_ecs_run_task_stops_after_exit(ecs):
             break
     assert stopped, "Task should transition to STOPPED after container exits"
 
+
+def test_ecs_list_tasks_reflects_natural_container_exit(ecs):
+    """ListTasks must also reconcile lifecycle when a container has exited
+    on its own. Previously only DescribeTasks ran the reconciler, so a user
+    who only ever called ListTasks(desiredStatus=RUNNING) saw the dead task
+    forever, and ListTasks(desiredStatus=STOPPED) returned an empty list.
+
+    Reference: https://docs.aws.amazon.com/AmazonECS/latest/developerguide/task-lifecycle-explanation.html
+    "Some tasks are meant to run as batch jobs that naturally progress
+    through from PENDING to RUNNING to STOPPED."
+    """
+    cluster = "task-lifecycle-listtasks"
+    ecs.create_cluster(clusterName=cluster)
+    ecs.register_task_definition(
+        family="short-lived-list",
+        containerDefinitions=[{
+            "name": "worker",
+            "image": "alpine:latest",
+            "command": ["sh", "-c", "echo done"],
+            "essential": True,
+        }],
+    )
+    resp = ecs.run_task(cluster=cluster, taskDefinition="short-lived-list")
+    task_arn = resp["tasks"][0]["taskArn"]
+
+    # Give the container time to actually exit before we test the reconciler.
+    # 6s is enough for `echo done` + Docker bookkeeping on every CI host
+    # the existing run_task tests already pass on.
+    time.sleep(6)
+
+    # NOTE: explicitly NOT calling describe_tasks — the bug is that
+    # list_tasks alone never reconciled.
+    running = ecs.list_tasks(cluster=cluster, desiredStatus="RUNNING")["taskArns"]
+    assert task_arn not in running, (
+        "list_tasks(RUNNING) should not return a task whose container exited"
+    )
+    stopped = ecs.list_tasks(cluster=cluster, desiredStatus="STOPPED")["taskArns"]
+    assert task_arn in stopped, (
+        "list_tasks(STOPPED) should surface the naturally-exited task"
+    )
+
+
 def test_ecs_run_task_network_connectivity(ecs):
     """ECS container can reach Ministack (proves network detection works)."""
     endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
