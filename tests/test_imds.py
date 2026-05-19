@@ -68,3 +68,31 @@ def test_imds_placement_region():
     r = requests.get(f"{ENDPOINT}/latest/meta-data/placement/region")
     assert r.status_code == 200
     assert r.text.strip()
+
+
+def test_container_credentials_returns_ecs_strict_shape():
+    """ECS task role endpoint: AWS_CONTAINER_CREDENTIALS_RELATIVE_URI=/v2/credentials/<uuid>.
+    Real AWS returns the strict 5-field shape (AccessKeyId, SecretAccessKey,
+    Token, Expiration, RoleArn). The IMDS-only fields (Code, Type, LastUpdated)
+    must NOT be present — distinguishing the ECS endpoint from the EC2 IMDS
+    endpoint at /latest/meta-data/iam/security-credentials/<role>."""
+    r = requests.get(f"{ENDPOINT}/v2/credentials/68e5868d-1bde-4f9e-9921-6e0442cb567b")
+    assert r.status_code == 200
+    doc = r.json()
+    for k in ("AccessKeyId", "SecretAccessKey", "Token", "Expiration", "RoleArn"):
+        assert k in doc and doc[k], f"missing or empty: {k}"
+    assert doc["RoleArn"].startswith("arn:aws:iam::") and ":role/" in doc["RoleArn"]
+    for k in ("Code", "Type", "LastUpdated"):
+        assert k not in doc, f"{k} is IMDS-only and must not leak into the ECS endpoint"
+
+
+def test_container_credentials_requires_id_segment():
+    r = requests.get(f"{ENDPOINT}/v2/credentials/")
+    assert r.status_code == 404
+    r = requests.get(f"{ENDPOINT}/v2/credentials")
+    assert r.status_code == 404
+
+
+def test_container_credentials_rejects_non_get():
+    r = requests.post(f"{ENDPOINT}/v2/credentials/abc")
+    assert r.status_code == 405

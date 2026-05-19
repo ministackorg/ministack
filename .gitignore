@@ -38,6 +38,7 @@ htmlcov/
 *.swp
 *.swo
 .DS_Store
+.kiro/
 
 # Docker
 data/

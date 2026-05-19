@@ -354,6 +354,7 @@ subnet = ec2.create_subnet(
 | **STS** | GetCallerIdentity, AssumeRole, GetSessionToken, AssumeRoleWithWebIdentity | |
 | **IMDS** (EC2 Instance Metadata) | `PUT /latest/api/token`, `GET /latest/meta-data/instance-id`, `GET /latest/meta-data/iam/security-credentials/`, `GET /latest/meta-data/iam/security-credentials/<role>`, `GET /latest/meta-data/iam/info`, `GET /latest/meta-data/placement/{region,availability-zone,...}`, `GET /latest/dynamic/instance-identity/document` | IMDSv1 + IMDSv2; default credential chain falls through to a `ministack-instance-role` document with `ASIA*` session creds. Point SDKs at ministack via `AWS_EC2_METADATA_SERVICE_ENDPOINT=http://localhost:4566` (or `ec2_metadata_service_endpoint` in `~/.aws/config`); set `MINISTACK_IMDS_V2_REQUIRED=1` to require the token PUT |
 | **ECS Task Metadata V4** | `GET /v4/<token>`, `GET /v4/<token>/task`, `GET /v4/<token>/stats`, `GET /v4/<token>/task/stats` | Per-container token injected as `ECS_CONTAINER_METADATA_URI_V4` on every container started by `RunTask`. `/task` returns sibling containers in the same task. Containers reach the gateway via `host.docker.internal` (mapped through `extra_hosts: host-gateway`, so it works on user-defined Docker networks); `networkMode: host` containers use loopback. Volatile by design (stripped on persistence, cleared by `/_ministack/reset`) |
+| **ECS Container Credentials** | `GET /v2/credentials/<uuid>` | The path real ECS exposes via `AWS_CONTAINER_CREDENTIALS_RELATIVE_URI=/v2/credentials/<uuid>` (resolved by SDKs against `169.254.170.2`). MiniStack serves the same path on the gateway and returns the AWS-strict 5-field credentials document (`AccessKeyId`, `SecretAccessKey`, `Token`, `Expiration`, `RoleArn`) — distinct from the IMDS shape served at `/latest/meta-data/iam/security-credentials/<role>`. `RunTask` injects `AWS_CONTAINER_CREDENTIALS_FULL_URI`, `AWS_CONTAINER_AUTHORIZATION_TOKEN` (satisfies botocore's allow-list for non-loopback gateway hosts), and `AWS_ENDPOINT_URL` so unmodified SDKs inside the task fetch credentials and route service calls through MiniStack with no client config |
 | **SecretsManager** | CreateSecret, GetSecretValue, ListSecrets, DeleteSecret, UpdateSecret, DescribeSecret, PutSecretValue, UpdateSecretVersionStage, RestoreSecret, RotateSecret, GetRandomPassword, ListSecretVersionIds, ReplicateSecretToRegions, TagResource, UntagResource, PutResourcePolicy, GetResourcePolicy, DeleteResourcePolicy, ValidateResourcePolicy | |
 | **CloudWatch Logs** | CreateLogGroup, DeleteLogGroup, DescribeLogGroups, CreateLogStream, DeleteLogStream, DescribeLogStreams, PutLogEvents, GetLogEvents, FilterLogEvents, PutRetentionPolicy, DeleteRetentionPolicy, PutSubscriptionFilter, DeleteSubscriptionFilter, DescribeSubscriptionFilters, PutMetricFilter, DeleteMetricFilter, DescribeMetricFilters, TagLogGroup, UntagLogGroup, ListTagsLogGroup, TagResource, UntagResource, ListTagsForResource, StartQuery, GetQueryResults, StopQuery, PutDestination, DeleteDestination, DescribeDestinations, PutDestinationPolicy | `FilterLogEvents` supports `*`/`?` globs, multi-term AND, `-term` exclusion |
 
@@ -505,6 +506,7 @@ Unsupported resource types fail with `CREATE_FAILED` (or `ROLLBACK_COMPLETE` if 
 | **CodeBuild** | CreateProject, BatchGetProjects, ListProjects, UpdateProject, DeleteProject, StartBuild, BatchGetBuilds, StopBuild, ListBuilds, ListBuildsForProject, BatchDeleteBuilds | 11 actions; builds complete immediately with SUCCEEDED status; project and build metadata stored in-memory |
 | **AppConfig** | CreateApplication, GetApplication, ListApplications, UpdateApplication, DeleteApplication, CreateEnvironment, GetEnvironment, ListEnvironments, UpdateEnvironment, DeleteEnvironment, CreateConfigurationProfile, GetConfigurationProfile, ListConfigurationProfiles, UpdateConfigurationProfile, DeleteConfigurationProfile, CreateHostedConfigurationVersion, GetHostedConfigurationVersion, ListHostedConfigurationVersions, DeleteHostedConfigurationVersion, CreateDeploymentStrategy, GetDeploymentStrategy, ListDeploymentStrategies, UpdateDeploymentStrategy, DeleteDeploymentStrategy, StartDeployment, GetDeployment, ListDeployments, StopDeployment, TagResource, UntagResource, ListTagsForResource, StartConfigurationSession, GetLatestConfiguration | 33 operations; control plane + data plane; hosted configuration versions; deployments complete immediately; session-based configuration retrieval with token rotation |
 | **Transfer Family** | CreateServer, DescribeServer, DeleteServer, ListServers, StartServer, StopServer, CreateUser, DescribeUser, DeleteUser, ListUsers, ImportSshPublicKey, DeleteSshPublicKey | 12 operations; **real SFTP listener** on `:2222` (override with `SFTP_PORT`) backed by S3 — `ls`, `put`, `get`, `mkdir`, `rename` work end-to-end against the local S3 emulator; `SFTP_PORT_PER_SERVER=1` allocates one port per `CreateServer` from `SFTP_BASE_PORT` (default 2300); SSH key auth scans every user across every server and account; `LOGICAL` and `PATH` home-directory mappings; host key persists across restarts when `PERSIST_STATE=1` |
+| **IoT Core** | CreateThing, DescribeThing, ListThings, UpdateThing, DeleteThing, CreateThingType, CreateThingGroup, AddThingToThingGroup, ListThingsInThingGroup, CreateKeysAndCertificate, RegisterCertificate, UpdateCertificate, DeleteCertificate, AttachThingPrincipal, DetachThingPrincipal, ListThingPrincipals, ListPrincipalThings, CreatePolicy, CreatePolicyVersion, AttachPolicy, DetachPolicy, ListAttachedPolicies, ListTargetsForPolicy, DescribeEndpoint, Publish (HTTP), MQTT-over-WebSocket pub/sub | 24 operations + **real MQTT 3.1.1 over WebSocket** on the gateway port — clients use the address returned by `DescribeEndpoint`; local CA signs `CreateKeysAndCertificate` certificates (CA persists across restarts when `PERSIST_STATE=1`); multi-tenancy via transparent topic prefixing (same pattern as Transfer Family's shared SFTP listener); no plain TCP 1883 (real AWS IoT requires TLS or SigV4 on every connection); local CA cert available at `GET /_ministack/iot/ca.pem` for SDK trust configuration; IoT policies are stored but **not enforced** on the data plane |
 | **EventBridge Scheduler** | CreateSchedule, GetSchedule, UpdateSchedule, DeleteSchedule, ListSchedules, CreateScheduleGroup, GetScheduleGroup, DeleteScheduleGroup, ListScheduleGroups, TagResource, UntagResource, ListTagsForResource | 12 actions; schedule groups with cascading deletes; `rate()`, `cron()`, `at()` expressions; group/prefix/state filters on list; default group auto-created; CFN `AWS::Scheduler::Schedule` and `AWS::Scheduler::ScheduleGroup` supported |
 | **EKS** | CreateCluster, DescribeCluster, ListClusters, DeleteCluster, CreateNodegroup, DescribeNodegroup, ListNodegroups, DeleteNodegroup, TagResource, UntagResource, ListTagsForResource | 11 operations; `CreateCluster` spawns a real **k3s** container (75 MB) with a full Kubernetes API server; `kubectl`, Helm, and any K8s tooling work out of the box; cascading delete removes nodegroups and k3s container; CFN `AWS::EKS::Cluster` and `AWS::EKS::Nodegroup` supported |
 | **OpenSearch Service** | CreateDomain, DescribeDomain, DescribeDomains, DeleteDomain, ListDomainNames, UpdateDomainConfig, DescribeDomainConfig, DescribeDomainChangeProgress, ListVersions, GetCompatibleVersions, AddTags, ListTags, RemoveTags | Management plane on `/2021-01-01/*` (`boto3.client("opensearch")`, SigV4 scope `es`). Default data plane is a stub endpoint (`<domain>.ministack.local:9200`) — set `OPENSEARCH_DATAPLANE=1` to spawn one real `opensearchproject/opensearch` container per `CreateDomain` (same pattern as ElastiCache/RDS); `DescribeDomain.Endpoint` then points at that container and `_cluster/health`/`/_search` work end-to-end. Add `OPENSEARCH_DASHBOARDS=1` (with dataplane on) to also spawn a per-domain `opensearch-dashboards` sidecar; `DescribeDomain.DashboardEndpoint` is populated. ARNs follow `arn:aws:es:<region>:<account>:domain/<name>`; Terraform `aws_opensearch_domain` resource compatible. |
@@ -643,7 +645,12 @@ ecs.stop_task(cluster="dev", task=task_arn)
 Each container also gets the standard ECS Task Metadata V4 endpoint injected as
 `ECS_CONTAINER_METADATA_URI_V4`, so anything inside the container that uses the
 AWS SDK for ECS metadata (X-Ray, OpenTelemetry, application code calling
-`GET $ECS_CONTAINER_METADATA_URI_V4/task`) works without changes.
+`GET $ECS_CONTAINER_METADATA_URI_V4/task`) works without changes. Alongside it,
+`RunTask` injects `AWS_CONTAINER_CREDENTIALS_FULL_URI`,
+`AWS_CONTAINER_AUTHORIZATION_TOKEN`, and `AWS_ENDPOINT_URL` so unmodified AWS
+SDKs running inside the task fetch emulated credentials from the new
+`/v2/credentials/<uuid>` endpoint and route service calls through MiniStack
+end-to-end without any client config.
 
 ---
 
@@ -975,7 +982,7 @@ Errors map to Lambda's standard error shape so async-invoke retry, DLQ, destinat
                     │  │  AppSync  Cloud Map   CodeBuild    │  │
                     │  │  AutoScaling  AppConfig     EKS    │  │
                     │  │  RDS Data  S3 Files  Scheduler     │  │
-                    │  │  Transfer Family                   │  │
+                    │  │  Transfer Family   IoT Core        │  │
                     │  └────────────────────────────────────┘  │
                     │                                          │
                     │  In-Memory Storage + Optional Docker     │
@@ -998,7 +1005,7 @@ pip install boto3 pytest duckdb docker cbor2
 # Start MiniStack
 docker compose up -d
 
-# Run the full test suite (2,200+ tests across all services)
+# Run the full test suite (2,500+ tests across all services)
 pytest tests/ -v
 ```
 
@@ -1212,6 +1219,7 @@ See [`Testcontainers/java-testcontainers`](Testcontainers/java-testcontainers), 
 | **Cloud Map** | ✅ | ❌ | ✅ |
 | **CodeBuild** | ✅ | ✅ | ✅ |
 | **Transfer Family** | ✅ | ❌ | ❌ |
+| **IoT Core** | ✅ (control + WS data plane) | ❌ | ✅ (paid tier) |
 | **S3 Files** | ✅ | ❌ | ❌ |
 | Cost | **Free forever** | Was free, now paid | $35+/mo |
 | Docker image size | ~250MB | ~1GB | ~1GB |

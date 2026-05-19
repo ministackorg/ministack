@@ -1475,6 +1475,214 @@ def test_cognito_saml_full_flow(cognito_idp):
     assert attrs.get("name") == "John Doe"
 
 
+# ---------------------------------------------------------------------------
+# OIDC federation (external OIDC IdP — e.g. Keycloak in front of Cognito)
+# ---------------------------------------------------------------------------
+
+def _b64url(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
+
+
+def _unsigned_id_token(claims: dict) -> str:
+    """Build a JWS-Compact id_token with header.payload.signature.
+    Signature is a dummy `notsigned` string — MiniStack doesn't verify."""
+    header = _b64url(json.dumps({"alg": "RS256", "typ": "JWT"}).encode())
+    payload = _b64url(json.dumps(claims).encode())
+    return f"{header}.{payload}.notsigned"
+
+
+def _start_fake_oidc_idp(claims):
+    """Spin up a local HTTP server acting as an OIDC IdP's token endpoint.
+
+    Returns (token_url, recorded_request, stop_fn). recorded_request is mutated
+    in place when the IdP receives the token exchange POST so tests can assert
+    on what MiniStack actually sent on the wire.
+    """
+    import http.server
+    import threading
+
+    recorded = {}
+
+    class _Handler(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length", "0"))
+            body_bytes = self.rfile.read(length)
+            recorded["path"] = self.path
+            recorded["headers"] = dict(self.headers)
+            recorded["body"] = body_bytes.decode("utf-8")
+            recorded["form"] = {
+                k: v[0] for k, v in _parse_qs(recorded["body"]).items()
+            }
+            payload = json.dumps({
+                "access_token": "fake-access-token",
+                "id_token": _unsigned_id_token(claims),
+                "token_type": "Bearer",
+                "expires_in": 3600,
+            }).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, *args, **kwargs):
+            pass
+
+    srv = http.server.HTTPServer(("127.0.0.1", 0), _Handler)
+    port = srv.server_address[1]
+    thread = threading.Thread(target=srv.serve_forever, daemon=True)
+    thread.start()
+    token_url = f"http://127.0.0.1:{port}/token"
+
+    def stop():
+        srv.shutdown()
+        srv.server_close()
+        thread.join(timeout=2)
+
+    return token_url, recorded, stop
+
+
+def _setup_oidc_pool(cognito_idp, token_url):
+    pid = cognito_idp.create_user_pool(PoolName="OIDCFedPool")["UserPool"]["Id"]
+    client = cognito_idp.create_user_pool_client(
+        UserPoolId=pid,
+        ClientName="OIDCApp",
+        CallbackURLs=["http://localhost:3000/callback"],
+        AllowedOAuthFlows=["code"],
+        AllowedOAuthScopes=["openid", "email"],
+        SupportedIdentityProviders=["TestOIDC"],
+    )["UserPoolClient"]
+    cognito_idp.create_identity_provider(
+        UserPoolId=pid,
+        ProviderName="TestOIDC",
+        ProviderType="OIDC",
+        ProviderDetails={
+            "oidc_issuer": "https://idp.example.com",
+            "authorize_url": "https://idp.example.com/authorize",
+            "token_url": token_url,
+            "client_id": "oidc-client-id",
+            "client_secret": "oidc-client-secret",
+            "authorize_scopes": "openid email profile",
+        },
+        AttributeMapping={"email": "email", "name": "name"},
+    )
+    return pid, client["ClientId"]
+
+
+def test_cognito_oauth2_authorize_oidc_redirect(cognito_idp):
+    """GET /oauth2/authorize with an OIDC identity_provider 302s to the IdP
+    with redirect_uri pointing at MiniStack's /oauth2/idpresponse."""
+    token_url, _recorded, stop = _start_fake_oidc_idp({"sub": "ignored"})
+    try:
+        _pid, cid = _setup_oidc_pool(cognito_idp, token_url)
+        url = (
+            f"{ENDPOINT}/oauth2/authorize?"
+            f"response_type=code&client_id={cid}"
+            f"&redirect_uri=http://localhost:3000/callback"
+            f"&identity_provider=TestOIDC&state=mystate&scope=openid"
+        )
+        try:
+            _no_redirect_opener.open(url)
+            assert False, "Expected 302"
+        except urllib.error.HTTPError as e:
+            assert e.code == 302
+            location = e.headers.get("Location", "")
+        assert "idp.example.com/authorize" in location
+        qs = _parse_qs(urlparse(location).query)
+        assert qs["client_id"] == ["oidc-client-id"]
+        # The redirect_uri MS hands to the IdP must point at MS's OIDC
+        # callback, not the SAML one (regression guard for the original bug).
+        assert qs["redirect_uri"] == [f"{ENDPOINT}/oauth2/idpresponse"]
+        assert qs["state"]  # relay key present
+    finally:
+        stop()
+
+
+def test_cognito_oidc_full_flow(cognito_idp):
+    """End-to-end OIDC federation: authorize → IdP callback → token exchange
+    against fake IdP → user provisioned → app redirect with MS auth code."""
+    claims = {
+        "sub": "user-9001",
+        "email": "alice@example.com",
+        "name": "Alice External",
+    }
+    token_url, recorded, stop = _start_fake_oidc_idp(claims)
+    try:
+        pid, cid = _setup_oidc_pool(cognito_idp, token_url)
+
+        # Step 1: kick off authorize, grab the relay state from the IdP redirect.
+        authorize_url = (
+            f"{ENDPOINT}/oauth2/authorize?"
+            f"response_type=code&client_id={cid}"
+            f"&redirect_uri=http://localhost:3000/callback"
+            f"&identity_provider=TestOIDC&state=appstate&scope=openid"
+        )
+        try:
+            _no_redirect_opener.open(authorize_url)
+            assert False, "Expected 302"
+        except urllib.error.HTTPError as e:
+            idp_redirect = e.headers.get("Location", "")
+        relay_state = _parse_qs(urlparse(idp_redirect).query)["state"][0]
+
+        # Step 2: simulate the OIDC IdP calling back with code+state.
+        cb_url = (
+            f"{ENDPOINT}/oauth2/idpresponse?"
+            f"code=idp-issued-code&state={relay_state}"
+        )
+        try:
+            _no_redirect_opener.open(cb_url)
+            assert False, "Expected 302 back to the app"
+        except urllib.error.HTTPError as e:
+            callback_location = e.headers.get("Location", "")
+
+        # Step 3: MS must have called the IdP's token endpoint with the right
+        # grant_type / code / redirect_uri / client credentials.
+        assert recorded.get("path") == "/token"
+        form = recorded["form"]
+        assert form["grant_type"] == "authorization_code"
+        assert form["code"] == "idp-issued-code"
+        assert form["redirect_uri"] == f"{ENDPOINT}/oauth2/idpresponse"
+        assert form["client_id"] == "oidc-client-id"
+        assert form["client_secret"] == "oidc-client-secret"
+
+        # Step 4: MS must redirect to the app callback with a MS-issued code
+        # and the original app state.
+        assert "localhost:3000/callback" in callback_location
+        cb_qs = _parse_qs(urlparse(callback_location).query)
+        assert cb_qs["state"] == ["appstate"]
+        ms_code = cb_qs["code"][0]
+        assert ms_code
+
+        # Step 5: the federated user was provisioned under the OIDC provider
+        # namespace, with the id_token claims mapped through AttributeMapping.
+        federated_username = "TestOIDC_user-9001"
+        user = cognito_idp.admin_get_user(UserPoolId=pid, Username=federated_username)
+        assert user["UserStatus"] == "EXTERNAL_PROVIDER"
+        attrs = {a["Name"]: a["Value"] for a in user["UserAttributes"]}
+        assert attrs["email"] == "alice@example.com"
+        assert attrs["name"] == "Alice External"
+    finally:
+        stop()
+
+
+def test_cognito_oidc_callback_invalid_state(cognito_idp):
+    """`/oauth2/idpresponse` with an unknown state returns 400 — relay codes
+    are single-use, expired, and tied to a prior /oauth2/authorize call."""
+    token_url, _recorded, stop = _start_fake_oidc_idp({"sub": "ignored"})
+    try:
+        _setup_oidc_pool(cognito_idp, token_url)
+        cb_url = f"{ENDPOINT}/oauth2/idpresponse?code=x&state=nonexistent"
+        try:
+            _no_redirect_opener.open(cb_url)
+            assert False, "Expected 400"
+        except urllib.error.HTTPError as e:
+            assert e.code == 400
+            body = json.loads(e.read())
+            assert "InvalidParameterException" in body.get("__type", "")
+    finally:
+        stop()
+
+
 def test_cognito_oauth2_token_invalid_code():
     """POST /oauth2/token with invalid code returns 400."""
     data = b"grant_type=authorization_code&code=invalid_code&client_id=x"
@@ -2512,6 +2720,124 @@ def test_auth_codes_survive_warm_boot(_enable_persistence):
     mod.reset()
 
 
+def test_cognito_alias_attributes_lookup_by_email(cognito_idp):
+    """AliasAttributes=['email'] lets users be looked up by email as Username."""
+    pid = cognito_idp.create_user_pool(
+        PoolName="AliasEmailPool",
+        AliasAttributes=["email"],
+        AutoVerifiedAttributes=["email"],
+    )["UserPool"]["Id"]
+    cognito_idp.admin_create_user(
+        UserPoolId=pid,
+        Username="alias-email-user",
+        UserAttributes=[
+            {"Name": "email", "Value": "alice@example.com"},
+            {"Name": "email_verified", "Value": "true"},
+        ],
+    )
+    user = cognito_idp.admin_get_user(UserPoolId=pid, Username="alice@example.com")
+    assert user["Username"] == "alias-email-user"
+
+
+def test_cognito_alias_attributes_lookup_by_preferred_username(cognito_idp):
+    """preferred_username alias doesn't require verification."""
+    pid = cognito_idp.create_user_pool(
+        PoolName="AliasPreferredPool",
+        AliasAttributes=["preferred_username"],
+    )["UserPool"]["Id"]
+    cognito_idp.admin_create_user(
+        UserPoolId=pid,
+        Username="alias-pref-user",
+        UserAttributes=[{"Name": "preferred_username", "Value": "alice_pref"}],
+    )
+    user = cognito_idp.admin_get_user(UserPoolId=pid, Username="alice_pref")
+    assert user["Username"] == "alias-pref-user"
+
+
+def test_cognito_alias_attributes_unverified_email_not_found(cognito_idp):
+    """Unverified email aliases should NOT resolve when email_verified=false."""
+    pid = cognito_idp.create_user_pool(
+        PoolName="AliasUnverifiedPool",
+        AliasAttributes=["email"],
+    )["UserPool"]["Id"]
+    cognito_idp.admin_create_user(
+        UserPoolId=pid,
+        Username="alias-unverified",
+        UserAttributes=[
+            {"Name": "email", "Value": "bob@example.com"},
+            {"Name": "email_verified", "Value": "false"},
+        ],
+    )
+    with pytest.raises(ClientError) as ex:
+        cognito_idp.admin_get_user(UserPoolId=pid, Username="bob@example.com")
+    assert ex.value.response["Error"]["Code"] == "UserNotFoundException"
+
+
+def test_cognito_alias_attributes_email_without_verified_flag_not_found(cognito_idp):
+    """Absent email_verified means alias is not resolvable (matches Cognito docs)."""
+    pid = cognito_idp.create_user_pool(
+        PoolName="AliasMissingVerifiedPool",
+        AliasAttributes=["email"],
+    )["UserPool"]["Id"]
+    cognito_idp.admin_create_user(
+        UserPoolId=pid,
+        Username="alias-missing-verified",
+        UserAttributes=[{"Name": "email", "Value": "noverify@example.com"}],
+    )
+    with pytest.raises(ClientError) as ex:
+        cognito_idp.admin_get_user(UserPoolId=pid, Username="noverify@example.com")
+    assert ex.value.response["Error"]["Code"] == "UserNotFoundException"
+
+
+def test_cognito_alias_attributes_auth_with_email(cognito_idp):
+    """InitiateAuth USER_PASSWORD_AUTH accepts the email alias as USERNAME."""
+    pid = cognito_idp.create_user_pool(
+        PoolName="AliasAuthPool",
+        AliasAttributes=["email"],
+    )["UserPool"]["Id"]
+    cid = cognito_idp.create_user_pool_client(
+        UserPoolId=pid,
+        ClientName="AliasAuthClient",
+        ExplicitAuthFlows=["ALLOW_USER_PASSWORD_AUTH"],
+    )["UserPoolClient"]["ClientId"]
+    cognito_idp.admin_create_user(
+        UserPoolId=pid,
+        Username="alias-auth-user",
+        UserAttributes=[
+            {"Name": "email", "Value": "carol@example.com"},
+            {"Name": "email_verified", "Value": "true"},
+        ],
+    )
+    cognito_idp.admin_set_user_password(
+        UserPoolId=pid, Username="alias-auth-user",
+        Password="StrongPass1!", Permanent=True,
+    )
+    resp = cognito_idp.initiate_auth(
+        ClientId=cid,
+        AuthFlow="USER_PASSWORD_AUTH",
+        AuthParameters={"USERNAME": "carol@example.com", "PASSWORD": "StrongPass1!"},
+    )
+    assert "AuthenticationResult" in resp
+
+
+def test_cognito_username_attributes_lookup_by_email(cognito_idp):
+    """UsernameAttributes also enables email-based lookup."""
+    pid = cognito_idp.create_user_pool(
+        PoolName="UsernameAttrsPool",
+        UsernameAttributes=["email"],
+    )["UserPool"]["Id"]
+    cognito_idp.admin_create_user(
+        UserPoolId=pid,
+        Username="dave-sub-uuid",
+        UserAttributes=[
+            {"Name": "email", "Value": "dave@example.com"},
+            {"Name": "email_verified", "Value": "true"},
+        ],
+    )
+    user = cognito_idp.admin_get_user(UserPoolId=pid, Username="dave@example.com")
+    assert user["Username"] == "dave-sub-uuid"
+
+
 def test_auth_codes_dict_types_are_plain_builtin_dict():
     """`_auth_codes` and `_authorization_codes` must remain plain `dict`
     instances. They're looked up by random unguessable token from a public
@@ -2521,3 +2847,219 @@ def test_auth_codes_dict_types_are_plain_builtin_dict():
     mod = _cognito_module()
     assert type(mod._auth_codes) is dict
     assert type(mod._authorization_codes) is dict
+
+
+# ---------------------------------------------------------------------------
+# Invitation / verification email delivery via SES
+# ---------------------------------------------------------------------------
+
+def _fetch_ses_messages():
+    """Pull SES outbox via the public inspection endpoint (account 000000000000)."""
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+    url = f"{endpoint}/_ministack/ses/messages"
+    with urllib.request.urlopen(urllib.request.Request(url, method="GET"), timeout=5) as r:
+        data = json.loads(r.read().decode())
+    return data.get("messages", {}).get("000000000000", [])
+
+
+def _messages_to(addr: str, type_name: str | None = None):
+    msgs = _fetch_ses_messages()
+    return [
+        m for m in msgs
+        if addr in (m.get("To") or [])
+        and (type_name is None or m.get("Type") == type_name)
+    ]
+
+
+def test_cognito_admin_create_user_sends_invitation_email(cognito_idp):
+    pid = cognito_idp.create_user_pool(
+        PoolName="InvitePool",
+        AdminCreateUserConfig={
+            "AllowAdminCreateUserOnly": True,
+            "InviteMessageTemplate": {
+                "EmailSubject": "Welcome {username}!",
+                "EmailMessage": "Hi {username}, your temp password is {####}.",
+            },
+        },
+    )["UserPool"]["Id"]
+
+    email = f"invite-{_uuid_mod.uuid4().hex[:8]}@example.com"
+    cognito_idp.admin_create_user(
+        UserPoolId=pid,
+        Username="invitee",
+        UserAttributes=[{"Name": "email", "Value": email}],
+        TemporaryPassword="TempPw1!aa",
+        DesiredDeliveryMediums=["EMAIL"],
+    )
+
+    msgs = _messages_to(email, "CognitoInvitationMessage")
+    assert len(msgs) == 1, f"expected 1 invitation message, got {len(msgs)}"
+    msg = msgs[0]
+    assert msg["Subject"] == "Welcome invitee!"
+    body = msg["BodyText"] or msg["BodyHtml"]
+    assert "TempPw1!aa" in body
+    assert "invitee" in body
+    # Default sender when EmailConfiguration is unset matches AWS's COGNITO_DEFAULT.
+    assert msg["Source"] == "no-reply@verificationemail.com"
+
+
+def test_cognito_admin_create_user_suppress_skips_email(cognito_idp):
+    pid = cognito_idp.create_user_pool(PoolName="SuppressPool")["UserPool"]["Id"]
+
+    email = f"suppress-{_uuid_mod.uuid4().hex[:8]}@example.com"
+    cognito_idp.admin_create_user(
+        UserPoolId=pid,
+        Username="quiet",
+        UserAttributes=[{"Name": "email", "Value": email}],
+        TemporaryPassword="TempPw1!bb",
+        MessageAction="SUPPRESS",
+        DesiredDeliveryMediums=["EMAIL"],
+    )
+
+    assert _messages_to(email) == []
+
+
+def test_cognito_admin_create_user_resend_sends_again(cognito_idp):
+    pid = cognito_idp.create_user_pool(PoolName="ResendPool")["UserPool"]["Id"]
+
+    email = f"resend-{_uuid_mod.uuid4().hex[:8]}@example.com"
+    cognito_idp.admin_create_user(
+        UserPoolId=pid,
+        Username="reinv",
+        UserAttributes=[{"Name": "email", "Value": email}],
+        TemporaryPassword="TempPw1!cc",
+        DesiredDeliveryMediums=["EMAIL"],
+    )
+    cognito_idp.admin_create_user(
+        UserPoolId=pid,
+        Username="reinv",
+        MessageAction="RESEND",
+        DesiredDeliveryMediums=["EMAIL"],
+    )
+
+    msgs = _messages_to(email, "CognitoInvitationMessage")
+    assert len(msgs) == 2
+
+
+def test_cognito_admin_create_user_sms_only_no_email(cognito_idp):
+    """If only SMS is requested, MiniStack must not push an EMAIL invitation."""
+    pid = cognito_idp.create_user_pool(PoolName="SmsOnlyPool")["UserPool"]["Id"]
+
+    email = f"smsonly-{_uuid_mod.uuid4().hex[:8]}@example.com"
+    cognito_idp.admin_create_user(
+        UserPoolId=pid,
+        Username="smsuser",
+        UserAttributes=[
+            {"Name": "email", "Value": email},
+            {"Name": "phone_number", "Value": "+15555550100"},
+        ],
+        TemporaryPassword="TempPw1!dd",
+        DesiredDeliveryMediums=["SMS"],
+    )
+
+    assert _messages_to(email) == []
+
+
+def test_cognito_admin_create_user_uses_pool_email_configuration(cognito_idp):
+    custom_from = f"custom-{_uuid_mod.uuid4().hex[:8]}@example.com"
+    pid = cognito_idp.create_user_pool(
+        PoolName="CustomFromPool",
+        EmailConfiguration={
+            "From": custom_from,
+            "ReplyToEmailAddress": "support@example.com",
+            "EmailSendingAccount": "DEVELOPER",
+        },
+    )["UserPool"]["Id"]
+
+    email = f"custom-{_uuid_mod.uuid4().hex[:8]}@example.com"
+    cognito_idp.admin_create_user(
+        UserPoolId=pid,
+        Username="branded",
+        UserAttributes=[{"Name": "email", "Value": email}],
+        TemporaryPassword="TempPw1!ee",
+        DesiredDeliveryMediums=["EMAIL"],
+    )
+
+    msgs = _messages_to(email, "CognitoInvitationMessage")
+    assert len(msgs) == 1
+    assert msgs[0]["Source"] == custom_from
+
+
+def test_cognito_signup_sends_verification_email(cognito_idp):
+    pid = cognito_idp.create_user_pool(PoolName="SignupVerifyPool")["UserPool"]["Id"]
+    cid = cognito_idp.create_user_pool_client(
+        UserPoolId=pid, ClientName="VerifyApp",
+    )["UserPoolClient"]["ClientId"]
+
+    email = f"signup-{_uuid_mod.uuid4().hex[:8]}@example.com"
+    cognito_idp.sign_up(
+        ClientId=cid,
+        Username="signer",
+        Password="Sup3rSecret!",
+        UserAttributes=[{"Name": "email", "Value": email}],
+    )
+
+    msgs = _messages_to(email, "CognitoVerificationMessage")
+    assert len(msgs) == 1
+    assert "123456" in (msgs[0]["BodyText"] or msgs[0]["BodyHtml"])
+
+
+def test_cognito_forgot_password_sends_verification_email(cognito_idp):
+    pid = cognito_idp.create_user_pool(PoolName="ForgotVerifyPool")["UserPool"]["Id"]
+    cid = cognito_idp.create_user_pool_client(
+        UserPoolId=pid, ClientName="ForgotMailApp",
+    )["UserPoolClient"]["ClientId"]
+    email = f"forgot-{_uuid_mod.uuid4().hex[:8]}@example.com"
+    cognito_idp.admin_create_user(
+        UserPoolId=pid,
+        Username="forgetter",
+        UserAttributes=[{"Name": "email", "Value": email}],
+        TemporaryPassword="TempPw1!ff",
+        MessageAction="SUPPRESS",
+    )
+
+    cognito_idp.forgot_password(ClientId=cid, Username="forgetter")
+
+    msgs = _messages_to(email, "CognitoVerificationMessage")
+    assert len(msgs) == 1
+    assert "654321" in (msgs[0]["BodyText"] or msgs[0]["BodyHtml"])
+
+
+def test_cognito_resend_confirmation_code_sends_email(cognito_idp):
+    pid = cognito_idp.create_user_pool(PoolName="ResendCodePool")["UserPool"]["Id"]
+    cid = cognito_idp.create_user_pool_client(
+        UserPoolId=pid, ClientName="ResendCodeApp",
+    )["UserPoolClient"]["ClientId"]
+
+    email = f"resendcode-{_uuid_mod.uuid4().hex[:8]}@example.com"
+    cognito_idp.sign_up(
+        ClientId=cid,
+        Username="resender",
+        Password="Sup3rSecret!",
+        UserAttributes=[{"Name": "email", "Value": email}],
+    )
+    cognito_idp.resend_confirmation_code(ClientId=cid, Username="resender")
+
+    msgs = _messages_to(email, "CognitoVerificationMessage")
+    assert len(msgs) == 2
+
+
+def test_cognito_email_disabled_env_skips_send(cognito_idp, monkeypatch):
+    """COGNITO_EMAIL_ENABLED=false must short-circuit delivery in-process."""
+    mod = _cognito_module()
+    ses_mod = importlib.import_module("ministack.services.ses")
+    monkeypatch.setenv("COGNITO_EMAIL_ENABLED", "false")
+    before = len(ses_mod._sent_emails_list())
+
+    pool_resp = mod._create_user_pool({"PoolName": "DisabledMailPool"})
+    pid = json.loads(pool_resp[2])["UserPool"]["Id"]
+    email = f"disabled-{_uuid_mod.uuid4().hex[:8]}@example.com"
+    mod._admin_create_user({
+        "UserPoolId": pid,
+        "Username": "muted",
+        "UserAttributes": [{"Name": "email", "Value": email}],
+        "TemporaryPassword": "TempPw1!gg",
+        "DesiredDeliveryMediums": ["EMAIL"],
+    })
+
+    assert len(ses_mod._sent_emails_list()) == before

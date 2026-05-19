@@ -892,9 +892,16 @@ def _put_bucket_lifecycle(name: str, body: bytes):
         ns = {"s3": "http://s3.amazonaws.com/doc/2006-03-01/"}
         for rule_el in root.findall("Rule", ns) or root.findall("s3:Rule", ns):
             rule: dict = {}
-            _lc_text = lambda el, tag: (el.findtext(tag) or el.findtext(f"s3:{tag}", namespaces=ns) or "")
-            _lc_find = lambda el, tag: (el.find(tag) or el.find(f"s3:{tag}", ns))
-            _lc_findall = lambda el, tag: (el.findall(tag) or el.findall(f"s3:{tag}", ns))
+
+            def _lc_text(el, tag):
+                return el.findtext(tag) or el.findtext(f"s3:{tag}", namespaces=ns) or ""
+
+            def _lc_find(el, tag):
+                return el.find(tag) or el.find(f"s3:{tag}", ns)
+
+            def _lc_findall(el, tag):
+                return el.findall(tag) or el.findall(f"s3:{tag}", ns)
+
             id_val = _lc_text(rule_el, "ID")
             if id_val:
                 rule["ID"] = id_val
@@ -1348,11 +1355,20 @@ def _parse_notification_config(bucket_name: str) -> list[dict]:
 
     configs: list[dict] = []
 
+    # Real S3 accepts two ARN-tag forms for Lambda-targeted notifications.
+    # boto3's botocore wire serializes `LambdaFunctionArn` as the legacy
+    # `<CloudFunction>` tag, so MS used to parse only that. Other clients
+    # (AWS SDK for Java v2, Go SDK, hand-crafted XML, Terraform's
+    # `aws_s3_bucket_notification` provider) send the modern
+    # `<LambdaFunctionArn>` tag — MS silently dropped those configs, so
+    # uploads succeeded but the Lambda never fired (issue #649).
     _CONFIG_MAP = {
         "QueueConfiguration": ("sqs", ("Queue",)),
         "TopicConfiguration": ("sns", ("Topic",)),
         "CloudFunctionConfiguration": ("lambda", ("CloudFunction", "Function")),
-        "LambdaFunctionConfiguration": ("lambda", ("Function", "CloudFunction")),
+        "LambdaFunctionConfiguration": (
+            "lambda", ("LambdaFunctionArn", "CloudFunction", "Function"),
+        ),
     }
 
     for tag_suffix, (target_type, arn_tags) in _CONFIG_MAP.items():

@@ -12,14 +12,19 @@ Supports: StartQueryExecution, GetQueryExecution, GetQueryResults,
           GetTableMetadata, ListTableMetadata,
           TagResource, UntagResource, ListTagsForResource.
 """
-
+import asyncio
 import copy
+import csv
+import io
 import json
 import logging
 import os
 import re
 import threading
 import time
+import xml.etree.ElementTree as ET
+from datetime import date
+from urllib.parse import urlparse
 
 from ministack.core.persistence import PERSIST_STATE, load_state
 from ministack.core.responses import (
@@ -36,6 +41,7 @@ logger = logging.getLogger("athena")
 REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 S3_DATA_DIR = os.environ.get("S3_DATA_DIR", "/tmp/ministack-data/s3")
 ATHENA_ENGINE = os.environ.get("ATHENA_ENGINE", "auto")  # "auto" | "duckdb" | "mock"
+ATHENA_DATA_DIR = S3_DATA_DIR
 
 
 def get_athena_engine():
@@ -270,15 +276,12 @@ def _start_query_execution(data):
     }
     _executions[query_id] = execution
 
-    thread = threading.Thread(
-        target=_execute_query, args=(query_id, query, db), daemon=True
-    )
-    thread.start()
+    asyncio.create_task(_execute_query(query_id, query, db))
 
     return json_response({"QueryExecutionId": query_id})
 
 
-def _execute_query(query_id, query, database):
+async def _execute_query(query_id, query, database):
     execution = _executions.get(query_id)
     if not execution:
         return
@@ -290,7 +293,7 @@ def _execute_query(query_id, query, database):
         engine = get_athena_engine()
 
         if engine == "duckdb":
-            results = _run_duckdb(query, database)
+            results = await _run_duckdb(query, database)
         else:
             results = _mock_query_results(query)
 
@@ -307,6 +310,8 @@ def _execute_query(query_id, query, database):
         execution["Statistics"]["DataScannedInBytes"] = sum(
             len(str(row)) for row in results.get("rows", [])
         )
+
+        await _save_query_results(query_id)
     except Exception as e:
         logger.error("Athena query %s failed: %s", query_id, e)
         execution["Status"]["State"] = "FAILED"
@@ -316,36 +321,87 @@ def _execute_query(query_id, query, database):
     execution["Status"]["CompletionDateTime"] = int(time.time())
 
 
-def _run_duckdb(query, database):
+async def _run_duckdb(query, database):
+    """Run a DuckDB query off the event loop.
+
+    DuckDB's ``conn.execute()`` is a blocking C-extension call — running it
+    directly on the asyncio loop stalls every other in-flight request for
+    the duration of the query. Offload to a worker thread via
+    ``asyncio.to_thread`` so multiple concurrent Athena queries on the
+    single-process server stay non-blocking.
+    """
     import duckdb
 
-    conn = duckdb.connect(":memory:")
-    rewritten = _rewrite_s3_paths(query)
+    rewritten = await _rewrite_data_paths(query, database)
 
-    try:
-        result = conn.execute(rewritten)
-        columns = []
-        column_types = []
-        if result.description:
-            for desc in result.description:
-                columns.append(desc[0])
-                raw_type = desc[1] if len(desc) > 1 else "VARCHAR"
-                if isinstance(raw_type, str):
-                    type_key = raw_type.upper().split("(")[0].strip()
-                else:
-                    type_key = str(raw_type).upper().split("(")[0].strip()
-                athena_type = _DUCKDB_TYPE_MAP.get(type_key, "varchar")
-                column_types.append(athena_type)
-        rows = result.fetchall()
-        conn.close()
-        return {
-            "columns": columns,
-            "column_types": column_types,
-            "rows": [list(r) for r in rows],
-        }
-    except Exception as e:
-        conn.close()
-        raise e
+    def _execute_blocking():
+        conn = duckdb.connect(":memory:")
+        try:
+            result = conn.execute(rewritten)
+            columns = []
+            column_types = []
+            if result.description:
+                for desc in result.description:
+                    columns.append(desc[0])
+                    raw_type = desc[1] if len(desc) > 1 else "VARCHAR"
+                    if isinstance(raw_type, str):
+                        type_key = raw_type.upper().split("(")[0].strip()
+                    else:
+                        type_key = str(raw_type).upper().split("(")[0].strip()
+                    athena_type = _DUCKDB_TYPE_MAP.get(type_key, "varchar")
+                    column_types.append(athena_type)
+            rows = result.fetchall()
+            return {
+                "columns": columns,
+                "column_types": column_types,
+                "rows": [list(r) for r in rows],
+            }
+        finally:
+            conn.close()
+
+    return await asyncio.to_thread(_execute_blocking)
+
+
+async def _rewrite_data_paths(query, database):
+    from ministack.services import glue as glue_svc
+
+    # Skip identifiers that look like function calls (read_csv('s3://...'))
+    # or already contain a path separator. Restrict to bare table references
+    # — optional database qualifier, then table name — letters/digits/dots/
+    # underscores/hyphens. Quoted identifiers (e.g. "my-db"."my-table") are
+    # left to a future pass.
+    pattern = r'(?:FROM|JOIN)\s+([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)?)\b'
+    tables_to_resolve = re.findall(pattern, query, re.IGNORECASE)
+
+    for full_name in tables_to_resolve:
+        parts = full_name.split(".")
+        db_name, table_name = (parts[0], parts[1]) if len(parts) > 1 else (database or "default", parts[0])
+
+        # Read directly from glue's internal store rather than going through
+        # the HTTP handler. The store is account-scoped via AccountScopedDict
+        # and reads the current request's contextvar, so multi-tenancy is
+        # preserved without crafting synthetic Authorization headers.
+        table_data = glue_svc._tables.get(f"{db_name}/{table_name}")
+        if not table_data:
+            continue
+
+        sd = table_data.get("StorageDescriptor", {})
+        s3_location = sd.get("Location")
+        if not s3_location:
+            continue
+
+        account_id = get_account_id()
+        p = urlparse(s3_location)
+        stripped = f"{p.netloc}{p.path}".rstrip("/")
+        classification = table_data.get("Parameters", {}).get("classification", "csv")
+
+        local_path = f"{ATHENA_DATA_DIR}/{account_id}/{stripped}"
+        duck_path = f"{local_path}/**/*.{classification}"
+
+        query = re.sub(rf"\b{re.escape(full_name)}\b", f"'{duck_path}'", query)
+
+    query = _rewrite_s3_paths(query)
+    return query
 
 
 def _rewrite_s3_paths(query):
@@ -364,9 +420,10 @@ def _rewrite_s3_paths(query):
         elif stripped.startswith("s3a://"):
             stripped = stripped[6:]
         parts = stripped.split("/", 1)
+        account_id = get_account_id()
         bucket = parts[0]
         key = parts[1] if len(parts) > 1 else ""
-        local_path = os.path.join(S3_DATA_DIR, bucket, key)
+        local_path = os.path.join(ATHENA_DATA_DIR, account_id, bucket, key)
         return f"{prefix}{local_path}{suffix}"
 
     result = re.sub(
@@ -381,6 +438,66 @@ def _rewrite_s3_paths(query):
         flags=re.IGNORECASE,
     )
     return result
+
+
+async def _save_query_results(query_id):
+    from ministack.services import s3 as s3_svc
+    execution = _executions.get(query_id)
+    results = execution.get('_results', [])
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    # Real Athena writes the column names as the first row of the result
+    # CSV; downstream consumers (Glue crawlers, csv readers using
+    # header=True, BI tools) rely on it.
+    writer.writerow(results['columns'])
+    writer.writerows(results['rows'])
+    csv_content = output.getvalue().encode("utf-8")
+
+    col_types = execution.get('_column_types', [])
+    metadata_text = ",".join(results['columns']) + "\n" + ",".join(col_types)
+    metadata_content = metadata_text.encode("utf-8")
+
+    output_location = execution["ResultConfiguration"]["OutputLocation"]
+    p = urlparse(output_location)
+    bucket_name = p.netloc
+    key_prefix = p.path.lstrip("/").rstrip("/")
+    # Athena writes <id>.csv and <id>.csv.metadata under the OutputLocation
+    # prefix. If the prefix is empty (output_location == "s3://bucket/"),
+    # the files land at bucket root.
+    csv_key = f"{key_prefix}/{query_id}.csv" if key_prefix else f"{query_id}.csv"
+    meta_key = f"{csv_key}.metadata"
+
+    # Write directly to the S3 service's in-memory store via the public
+    # internal helper, which is account-scoped through the request's
+    # contextvar — no synthetic Authorization header needed and no
+    # round-trip through the HTTP handler.
+    def _upload(key, data, content_type):
+        resp = s3_svc._put_object(
+            bucket_name,
+            key,
+            data,
+            {"content-type": content_type, "content-length": str(len(data))},
+        )
+        # _put_object returns (status, headers, body) on error; a successful
+        # write returns the same tuple with status 200. Surface any failure
+        # onto the execution so callers see the cause via GetQueryExecution.
+        if isinstance(resp, tuple) and resp[0] >= 300:
+            try:
+                root = ET.fromstring(resp[2])
+                code = root.findtext("Code", "UnknownError")
+                message = root.findtext("Message", "An unexpected S3 error occurred")
+            except Exception:
+                code, message = "InternalError", "Failed to parse S3 error response"
+            execution["Status"]["State"] = "FAILED"
+            execution["Status"]["StateChangeReason"] = (
+                f"An error occurred while writing to S3. {code}: {message}"
+            )
+            return False
+        return True
+
+    if _upload(csv_key, csv_content, "text/csv"):
+        _upload(meta_key, metadata_content, "text/plain")
 
 
 def _mock_query_results(query):

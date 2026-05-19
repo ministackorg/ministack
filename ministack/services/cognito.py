@@ -13,7 +13,7 @@ User Pools operations:
   AdminSetUserPassword, AdminUpdateUserAttributes,
   AdminInitiateAuth, AdminRespondToAuthChallenge,
   InitiateAuth, RespondToAuthChallenge, SignUp, ConfirmSignUp,
-  ForgotPassword, ConfirmForgotPassword, ChangePassword,
+  ResendConfirmationCode, ForgotPassword, ConfirmForgotPassword, ChangePassword,
   GetUser, UpdateUserAttributes, DeleteUser,
   AdminAddUserToGroup, AdminRemoveUserFromGroup,
   AdminListGroupsForUser, AdminListUserAuthEvents,
@@ -616,20 +616,44 @@ def _resolve_pool(pool_id: str):
 
 
 def _resolve_user(pool: dict, username: str):
+    if username is None:
+        return None, error_response_json(
+            "UserNotFoundException", "User does not exist.", 400,
+        )
+
     user = pool["_users"].get(username)
-    if not user:
-        # Real AWS also accepts the user's 'sub' UUID as Username.
+    if user:
+        return user, None
+
+    # Real AWS also accepts the user's 'sub' UUID as Username.
+    for u in pool["_users"].values():
+        attrs = _attr_list_to_dict(u.get("Attributes", []))
+        if attrs.get("sub") == username:
+            return u, None
+
+    # AliasAttributes (email, phone_number, preferred_username) and
+    # UsernameAttributes (email, phone_number) let users sign in / be looked
+    # up via those attribute values. Real Cognito requires email/phone aliases
+    # to be verified (email_verified/phone_number_verified == "true") before
+    # the alias resolves; preferred_username has no verification requirement.
+    alias_attrs = set(pool.get("AliasAttributes") or []) | set(
+        pool.get("UsernameAttributes") or []
+    )
+    if alias_attrs:
         for u in pool["_users"].values():
             attrs = _attr_list_to_dict(u.get("Attributes", []))
-            if attrs.get("sub") == username:
-                user = u
-                break
-    if not user:
-        return None, error_response_json(
-            "UserNotFoundException",
-            f"User {username} does not exist.", 400,
-        )
-    return user, None
+            for alias in alias_attrs:
+                if attrs.get(alias) != username:
+                    continue
+                if alias in ("email", "phone_number"):
+                    if str(attrs.get(f"{alias}_verified", "")).lower() != "true":
+                        continue
+                return u, None
+
+    return None, error_response_json(
+        "UserNotFoundException",
+        f"User {username} does not exist.", 400,
+    )
 
 
 def _user_out(user: dict) -> dict:
@@ -666,6 +690,11 @@ def _merge_attributes(existing: list, updates: list) -> list:
 def _acs_url() -> str:
     """Assertion Consumer Service URL for SAML responses."""
     return f"http://{_MINISTACK_HOST}:{_MINISTACK_PORT}/saml2/idpresponse"
+
+
+def _oidc_callback_url() -> str:
+    """OIDC callback URL — external OIDC IdPs redirect back here with `code`+`state`."""
+    return f"http://{_MINISTACK_HOST}:{_MINISTACK_PORT}/oauth2/idpresponse"
 
 
 def _build_saml_authn_request(pool_id: str, destination: str) -> str:
@@ -796,6 +825,8 @@ async def handle_request(method, path, headers, body, query_params):
         return handle_oauth2_authorize(method, path, headers, query_params)
     if path.startswith("/saml2/idpresponse"):
         return _saml2_idp_response(body, query_params)
+    if path.startswith("/oauth2/idpresponse"):
+        return _oauth2_idp_response(method, body, query_params)
     if path.startswith("/oauth2/token"):
         return _oauth2_token({}, query_params, body, headers)
 
@@ -859,6 +890,7 @@ def _dispatch_idp(action: str, data: dict):
         # Self-service
         "SignUp": _sign_up,
         "ConfirmSignUp": _confirm_sign_up,
+        "ResendConfirmationCode": _resend_confirmation_code,
         "ForgotPassword": _forgot_password,
         "ConfirmForgotPassword": _confirm_forgot_password,
         "ChangePassword": _change_password,
@@ -1197,6 +1229,176 @@ def _validate_password(pool, password):
 
 
 # ===========================================================================
+# EMAIL DELIVERY (invitation + verification)
+# ===========================================================================
+
+# AWS Cognito's COGNITO_DEFAULT sender; can be overridden per pool via
+# EmailConfiguration.From or globally via the COGNITO_DEFAULT_FROM env var.
+_COGNITO_DEFAULT_FROM = "no-reply@verificationemail.com"
+
+# Default templates Cognito uses when InviteMessageTemplate /
+# VerificationMessageTemplate are not configured on the pool.
+_DEFAULT_INVITE_SUBJECT = "Your temporary password"
+_DEFAULT_INVITE_MESSAGE = (
+    "Your username is {username} and temporary password is {####}."
+)
+_DEFAULT_VERIFICATION_SUBJECT = "Your verification code"
+_DEFAULT_VERIFICATION_MESSAGE = "Your verification code is {####}."
+_DEFAULT_VERIFICATION_LINK_MESSAGE = (
+    "Please click the link below to verify your email address. {##Verify Email##}"
+)
+
+
+def _cognito_email_enabled() -> bool:
+    val = os.environ.get("COGNITO_EMAIL_ENABLED", "true").strip().lower()
+    return val not in ("0", "false", "no", "off", "disabled")
+
+
+def _resolve_email_sender(pool: dict) -> tuple:
+    """Resolve (from, reply_to, configuration_set) from the pool's EmailConfiguration.
+
+    Falls back to the COGNITO_DEFAULT sender, mirroring real AWS behaviour
+    where EmailSendingAccount=COGNITO_DEFAULT uses no-reply@verificationemail.com.
+    A user-supplied From always wins, regardless of EmailSendingAccount.
+    """
+    cfg = pool.get("EmailConfiguration") or {}
+    from_addr = cfg.get("From") or cfg.get("FromEmailAddress") or ""
+    if not from_addr:
+        from_addr = os.environ.get("COGNITO_DEFAULT_FROM", _COGNITO_DEFAULT_FROM)
+    reply_to = cfg.get("ReplyToEmailAddress") or ""
+    config_set = cfg.get("ConfigurationSet") or ""
+    return from_addr, reply_to, config_set
+
+
+def _expand_template(template: str, username: str, code: str) -> str:
+    """Apply Cognito's `{username}` and `{####}` placeholder substitutions."""
+    if not template:
+        return ""
+    return template.replace("{username}", username or "").replace("{####}", code or "")
+
+
+def _resolve_invite_template(pool: dict) -> tuple:
+    """Return (subject, message_text, message_html) for invitation mail."""
+    tpl = (pool.get("AdminCreateUserConfig") or {}).get("InviteMessageTemplate") or {}
+    subject = tpl.get("EmailSubject") or _DEFAULT_INVITE_SUBJECT
+    body = tpl.get("EmailMessage") or _DEFAULT_INVITE_MESSAGE
+    # AWS lets EmailMessage be HTML; we store the same text in both slots when
+    # the template doesn't disambiguate. SMS template is intentionally ignored.
+    return subject, body, ""
+
+
+def _resolve_verification_template(pool: dict, by_link: bool = False) -> tuple:
+    """Return (subject, message_text) for verification/forgot-password mail."""
+    tpl = pool.get("VerificationMessageTemplate") or {}
+    if by_link:
+        subject = (
+            tpl.get("EmailSubjectByLink")
+            or pool.get("EmailVerificationSubject")
+            or _DEFAULT_VERIFICATION_SUBJECT
+        )
+        body = (
+            tpl.get("EmailMessageByLink")
+            or _DEFAULT_VERIFICATION_LINK_MESSAGE
+        )
+        return subject, body
+    subject = (
+        tpl.get("EmailSubject")
+        or pool.get("EmailVerificationSubject")
+        or _DEFAULT_VERIFICATION_SUBJECT
+    )
+    body = (
+        tpl.get("EmailMessage")
+        or pool.get("EmailVerificationMessage")
+        or _DEFAULT_VERIFICATION_MESSAGE
+    )
+    return subject, body
+
+
+def _looks_like_html(text: str) -> bool:
+    if not text:
+        return False
+    return bool(re.search(r"<[a-zA-Z/!][^>]*>", text))
+
+
+def _deliver_cognito_email(pool, to_email, subject, body, type_name, extra=None):
+    """Hand a fully-rendered message off to the SES recorder.
+
+    Skipped when COGNITO_EMAIL_ENABLED=false or recipient is missing.
+    Errors are swallowed so user-facing Cognito calls never fail because of
+    email-only problems (matches AWS, which reports delivery failures async).
+    """
+    if not _cognito_email_enabled() or not to_email:
+        return None
+    from_addr, reply_to, config_set = _resolve_email_sender(pool)
+    extras = dict(extra or {})
+    extras["UserPoolId"] = pool.get("Id", "")
+    if reply_to:
+        extras["ReplyToAddresses"] = [reply_to]
+    body_text = "" if _looks_like_html(body) else body
+    body_html = body if _looks_like_html(body) else ""
+    try:
+        from ministack.services import ses as ses_mod  # local import: avoid cycle
+        return ses_mod.send_internal_email(
+            source=from_addr,
+            to_addrs=[to_email],
+            subject=subject,
+            body_text=body_text,
+            body_html=body_html,
+            type_name=type_name,
+            config_set=config_set,
+            extra=extras,
+        )
+    except Exception:
+        logger.exception("Cognito: failed to record %s for pool %s", type_name, pool.get("Id"))
+        return None
+
+
+def _wants_email_delivery(data: dict) -> bool:
+    """Per AWS, DesiredDeliveryMediums defaults to ['SMS']. We treat the
+    parameter being absent as 'EMAIL' too so out-of-the-box flows that don't
+    pass it still surface invitation mail — AWS itself falls back when no
+    SmsConfiguration is set on the pool, which mirrors our SMS-less emulator.
+    """
+    mediums = data.get("DesiredDeliveryMediums")
+    if not mediums:
+        return True
+    return "EMAIL" in [str(m).upper() for m in mediums]
+
+
+def _send_invitation_email(pool, username, temp_password, attr_dict):
+    email = (attr_dict or {}).get("email")
+    if not email:
+        return None
+    subject_tpl, body_tpl, _ = _resolve_invite_template(pool)
+    subject = _expand_template(subject_tpl, username, temp_password)
+    body = _expand_template(body_tpl, username, temp_password)
+    return _deliver_cognito_email(
+        pool, email, subject, body,
+        type_name="CognitoInvitationMessage",
+        extra={"Username": username},
+    )
+
+
+def _send_verification_email(pool, username, attr_dict, code, attribute_name="email"):
+    email = (attr_dict or {}).get("email")
+    if not email:
+        return None
+    # CONFIRM_WITH_LINK means body uses {##...##} link placeholder; we still
+    # interpolate {####} as the verification code for compatibility.
+    by_link = (pool.get("VerificationMessageTemplate") or {}).get(
+        "DefaultEmailOption"
+    ) == "CONFIRM_WITH_LINK"
+    subject_tpl, body_tpl = _resolve_verification_template(pool, by_link=by_link)
+    subject = _expand_template(subject_tpl, username, code)
+    body = _expand_template(body_tpl, username, code)
+    return _deliver_cognito_email(
+        pool, email, subject, body,
+        type_name="CognitoVerificationMessage",
+        extra={"Username": username, "AttributeName": attribute_name},
+    )
+
+
+# ===========================================================================
 # USER MANAGEMENT
 # ===========================================================================
 
@@ -1209,7 +1411,21 @@ def _admin_create_user(data):
     username = data.get("Username")
     if not username:
         return error_response_json("InvalidParameterException", "Username is required.", 400)
-    if username in pool["_users"]:
+
+    message_action = (data.get("MessageAction") or "").upper()
+    existing = pool["_users"].get(username)
+    if message_action == "RESEND":
+        if not existing:
+            return error_response_json(
+                "UserNotFoundException", "User does not exist.", 400,
+            )
+        existing["UserLastModifiedDate"] = _now_epoch()
+        attr_dict = _attr_list_to_dict(existing.get("Attributes", []))
+        if _wants_email_delivery(data):
+            _send_invitation_email(pool, username, existing.get("_password", ""), attr_dict)
+        return json_response({"User": _user_out(existing)})
+
+    if existing:
         return error_response_json(
             "UsernameExistsException",
             "User account already exists.", 400,
@@ -1242,6 +1458,10 @@ def _admin_create_user(data):
     pool["_users"][username] = user
     pool["EstimatedNumberOfUsers"] = len(pool["_users"])
     logger.info("Cognito: AdminCreateUser %s in pool %s", username, pid)
+
+    if message_action != "SUPPRESS" and _wants_email_delivery(data):
+        _send_invitation_email(pool, username, temp_password, attr_dict)
+
     return json_response({"User": _user_out(user)})
 
 
@@ -1397,7 +1617,40 @@ def _admin_reset_user_password(data):
         return err
     user["UserStatus"] = "RESET_REQUIRED"
     user["UserLastModifiedDate"] = _now_epoch()
+    code = "654321"
+    user["_reset_code"] = code
+    attrs = _attr_list_to_dict(user.get("Attributes", []))
+    _send_verification_email(pool, username, attrs, code, attribute_name="password")
     return json_response({})
+
+
+def _resend_confirmation_code(data):
+    cid = data.get("ClientId")
+    username = data.get("Username")
+
+    pool = None
+    for p in _user_pools.values():
+        if cid in p["_clients"]:
+            pool = p
+            break
+    if not pool:
+        return error_response_json("ResourceNotFoundException", f"Client {cid} not found.", 400)
+
+    user = pool["_users"].get(username)
+    if not user:
+        return error_response_json("UserNotFoundException", "User does not exist.", 400)
+
+    code = user.get("_confirmation_code") or "123456"
+    user["_confirmation_code"] = code
+    attrs = _attr_list_to_dict(user.get("Attributes", []))
+    _send_verification_email(pool, username, attrs, code)
+    return json_response({
+        "CodeDeliveryDetails": {
+            "Destination": attrs.get("email", ""),
+            "DeliveryMedium": "EMAIL",
+            "AttributeName": "email",
+        }
+    })
 
 
 def _admin_user_global_sign_out(data):
@@ -1537,9 +1790,9 @@ def _admin_initiate_auth(data):
     if auth_flow in ("ADMIN_USER_PASSWORD_AUTH", "ADMIN_NO_SRP_AUTH"):
         username = auth_params.get("USERNAME")
         password = auth_params.get("PASSWORD")
-        user = pool["_users"].get(username)
-        if not user:
-            return error_response_json("UserNotFoundException", "User does not exist.", 400)
+        user, _err = _resolve_user(pool, username)
+        if _err:
+            return _err
         if not user.get("Enabled", True):
             return error_response_json("NotAuthorizedException", "User is disabled.", 400)
         if user.get("_password") and user["_password"] != password:
@@ -1592,9 +1845,9 @@ def _admin_respond_to_auth_challenge(data):
     if challenge_name == "NEW_PASSWORD_REQUIRED":
         username = responses.get("USERNAME")
         new_password = responses.get("NEW_PASSWORD")
-        user = pool["_users"].get(username)
-        if not user:
-            return error_response_json("UserNotFoundException", "User does not exist.", 400)
+        user, _err = _resolve_user(pool, username)
+        if _err:
+            return _err
         if new_password:
             user["_password"] = new_password
         user["UserStatus"] = "CONFIRMED"
@@ -1603,25 +1856,25 @@ def _admin_respond_to_auth_challenge(data):
 
     if challenge_name == "SMS_MFA":
         username = responses.get("USERNAME")
-        user = pool["_users"].get(username)
-        if not user:
-            return error_response_json("UserNotFoundException", "User does not exist.", 400)
+        user, _err = _resolve_user(pool, username)
+        if _err:
+            return _err
         return json_response({"AuthenticationResult": _build_auth_result(pid, cid, user)})
 
     if challenge_name == "SOFTWARE_TOKEN_MFA":
         username = responses.get("USERNAME")
-        user = pool["_users"].get(username)
-        if not user:
-            return error_response_json("UserNotFoundException", "User does not exist.", 400)
+        user, _err = _resolve_user(pool, username)
+        if _err:
+            return _err
         # Accept any TOTP code in emulator — no real TOTP validation
         return json_response({"AuthenticationResult": _build_auth_result(pid, cid, user)})
 
     if challenge_name == "MFA_SETUP":
         # Triggered when pool MFA=ON but user hasn't enrolled yet
         username = responses.get("USERNAME")
-        user = pool["_users"].get(username)
-        if not user:
-            return error_response_json("UserNotFoundException", "User does not exist.", 400)
+        user, _err = _resolve_user(pool, username)
+        if _err:
+            return _err
         return json_response({"AuthenticationResult": _build_auth_result(pid, cid, user)})
 
     return error_response_json("InvalidParameterException", f"Unsupported challenge: {challenge_name}", 400)
@@ -1647,9 +1900,9 @@ def _initiate_auth(data):
     if auth_flow in ("USER_PASSWORD_AUTH",):
         username = auth_params.get("USERNAME")
         password = auth_params.get("PASSWORD")
-        user = pool["_users"].get(username)
-        if not user:
-            return error_response_json("UserNotFoundException", "User does not exist.", 400)
+        user, _err = _resolve_user(pool, username)
+        if _err:
+            return _err
         if not user.get("Enabled", True):
             return error_response_json("NotAuthorizedException", "User is disabled.", 400)
         if user.get("_password") and user["_password"] != password:
@@ -1720,9 +1973,9 @@ def _respond_to_auth_challenge(data):
     if challenge_name in ("NEW_PASSWORD_REQUIRED", "PASSWORD_VERIFIER"):
         username = responses.get("USERNAME")
         new_password = responses.get("NEW_PASSWORD") or responses.get("PASSWORD")
-        user = pool["_users"].get(username)
-        if not user:
-            return error_response_json("UserNotFoundException", "User does not exist.", 400)
+        user, _err = _resolve_user(pool, username)
+        if _err:
+            return _err
         if new_password:
             user["_password"] = new_password
         user["UserStatus"] = "CONFIRMED"
@@ -1731,9 +1984,9 @@ def _respond_to_auth_challenge(data):
 
     if challenge_name in ("SOFTWARE_TOKEN_MFA", "MFA_SETUP"):
         username = responses.get("USERNAME")
-        user = pool["_users"].get(username)
-        if not user:
-            return error_response_json("UserNotFoundException", "User does not exist.", 400)
+        user, _err = _resolve_user(pool, username)
+        if _err:
+            return _err
         # Accept any TOTP code in emulator
         return json_response({"AuthenticationResult": _build_auth_result(pid, cid, user)})
 
@@ -1812,6 +2065,7 @@ def _sign_up(data):
             "DeliveryMedium": "EMAIL",
             "AttributeName": "email",
         }
+        _send_verification_email(pool, username, attr_dict, user["_confirmation_code"])
     return json_response(resp)
 
 
@@ -1828,9 +2082,9 @@ def _confirm_sign_up(data):
     if not pool:
         return error_response_json("ResourceNotFoundException", f"Client {cid} not found.", 400)
 
-    user = pool["_users"].get(username)
-    if not user:
-        return error_response_json("UserNotFoundException", "User does not exist.", 400)
+    user, err = _resolve_user(pool, username)
+    if err:
+        return err
 
     # Accept any code in emulation
     user["UserStatus"] = "CONFIRMED"
@@ -1850,12 +2104,14 @@ def _forgot_password(data):
     if not pool:
         return error_response_json("ResourceNotFoundException", f"Client {cid} not found.", 400)
 
-    user = pool["_users"].get(username)
-    if not user:
-        return error_response_json("UserNotFoundException", "User does not exist.", 400)
+    user, _err = _resolve_user(pool, username)
+    if _err:
+        return _err
 
-    user["_reset_code"] = "654321"
+    code = "654321"
+    user["_reset_code"] = code
     attrs = _attr_list_to_dict(user.get("Attributes", []))
+    _send_verification_email(pool, username, attrs, code, attribute_name="password")
     return json_response({
         "CodeDeliveryDetails": {
             "Destination": attrs.get("email", ""),
@@ -1878,9 +2134,9 @@ def _confirm_forgot_password(data):
     if not pool:
         return error_response_json("ResourceNotFoundException", f"Client {cid} not found.", 400)
 
-    user = pool["_users"].get(username)
-    if not user:
-        return error_response_json("UserNotFoundException", "User does not exist.", 400)
+    user, _err = _resolve_user(pool, username)
+    if _err:
+        return _err
 
     # Accept any confirmation code in emulation (real AWS validates against issued code)
     pw_err = _validate_password(pool, new_password)
@@ -2542,7 +2798,7 @@ def _oauth2_authorize_federation(query_params):
         redirect_url = authorize_url + ("&" if "?" in authorize_url else "?") + urlencode({
             "response_type": response_type or "code",
             "client_id": oidc_client_id,
-            "redirect_uri": _acs_url(),
+            "redirect_uri": _oidc_callback_url(),
             "scope": details.get("authorize_scopes", scope),
             "state": relay_key,
         })
@@ -2714,6 +2970,210 @@ def _saml2_idp_response(body: bytes, query_params):
     return 302, {"Location": location, "Content-Type": "text/html"}, b""
 
 
+# -- /oauth2/idpresponse (GET/POST) -----------------------------------------
+
+def _decode_id_token_unverified(id_token: str) -> dict:
+    """Decode a JWT id_token payload without verifying its signature.
+
+    Matches MiniStack's wider stance on emulator-side crypto checks: we don't
+    verify SigV4 on AWS requests and we don't verify SAML response signatures
+    on `/saml2/idpresponse`, so we don't verify OIDC id_token signatures here
+    either. The threat model for a local emulator is developer testing, not
+    token forgery, and adding a JWKS fetch + RS256 verify would be inconsistent
+    with the rest of the codebase. Documented gap from real AWS Cognito.
+    """
+    parts = id_token.split(".")
+    if len(parts) < 2:
+        raise ValueError("id_token is not a JWT (expected at least header.payload)")
+    payload_b64 = parts[1]
+    payload_b64 += "=" * (-len(payload_b64) % 4)  # base64url padding
+    payload_bytes = base64.urlsafe_b64decode(payload_b64.encode("ascii"))
+    return json.loads(payload_bytes.decode("utf-8"))
+
+
+def _oauth2_idp_response(method, body, query_params):
+    """GET/POST /oauth2/idpresponse — external OIDC IdP callback.
+
+    Mirrors `_saml2_idp_response` for the OIDC `authorization_code` flow:
+    the IdP redirects back to MiniStack with `code` and `state` in the query
+    string (or POST body, depending on the IdP's `response_mode`). MiniStack
+    exchanges the code for tokens at the IdP's `token_url`, decodes the
+    returned id_token (no signature verification — see
+    `_decode_id_token_unverified`), provisions or refreshes the federated
+    user, and redirects to the app's `redirect_uri` with a MiniStack-issued
+    authorization code so the app's existing `/oauth2/token` flow continues
+    to work.
+    """
+    import urllib.error
+    import urllib.request
+
+    # Pull `code` + `state` from query string first, then POST form body.
+    code = _qp(query_params, "code")
+    state = _qp(query_params, "state")
+    if (not code or not state) and body and method == "POST":
+        try:
+            form = parse_qs(body.decode("utf-8", errors="replace"), keep_blank_values=True)
+            code = code or (form.get("code", [""])[0])
+            state = state or (form.get("state", [""])[0])
+        except Exception:
+            pass
+
+    if not code:
+        return error_response_json("InvalidParameterException", "code is required.", 400)
+    if not state:
+        return error_response_json("InvalidParameterException", "state is required.", 400)
+
+    relay = _auth_codes.pop(state, None)
+    if not relay or relay.get("type") != "relay":
+        return error_response_json("InvalidParameterException", "Invalid or expired state.", 400)
+
+    pool_id = relay["pool_id"]
+    client_id = relay["client_id"]
+    redirect_uri = relay["redirect_uri"]
+    app_state = relay.get("state", "")
+    provider_name = relay["provider_name"]
+
+    pool = _get_pool_unscoped(pool_id)
+    if not pool:
+        return error_response_json("ResourceNotFoundException", f"User pool {pool_id} not found.", 400)
+
+    provider = pool.get("_identity_providers", {}).get(provider_name)
+    if not provider or provider.get("ProviderType", "") != "OIDC":
+        return error_response_json("ResourceNotFoundException",
+                                   f"OIDC provider {provider_name} not found.", 400)
+
+    details = provider.get("ProviderDetails", {})
+    oidc_issuer = details.get("oidc_issuer", "")
+    token_url = details.get("token_url") or (f"{oidc_issuer}/token" if oidc_issuer else "")
+    if not token_url:
+        return error_response_json("InvalidParameterException",
+                                   "OIDC provider has no token_url or oidc_issuer.", 400)
+
+    oidc_client_id = details.get("client_id", "")
+    oidc_client_secret = details.get("client_secret", "")
+
+    # Exchange code for tokens at the IdP's token endpoint.
+    token_body = urlencode({
+        "grant_type": "authorization_code",
+        "code": code,
+        "redirect_uri": _oidc_callback_url(),
+        "client_id": oidc_client_id,
+        "client_secret": oidc_client_secret,
+    }).encode("ascii")
+    req = urllib.request.Request(
+        token_url,
+        data=token_body,
+        headers={"Content-Type": "application/x-www-form-urlencoded",
+                 "Accept": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            token_payload = resp.read()
+    except urllib.error.HTTPError as exc:
+        logger.warning("Cognito: OIDC token exchange failed: HTTP %s — %s",
+                       exc.code, exc.reason)
+        return error_response_json("InvalidParameterException",
+                                   f"OIDC token exchange failed: HTTP {exc.code}", 400)
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        logger.warning("Cognito: OIDC token exchange failed: %s", exc)
+        return error_response_json("InvalidParameterException",
+                                   f"OIDC token exchange failed: {exc}", 400)
+
+    try:
+        token_data = json.loads(token_payload.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError) as exc:
+        return error_response_json("InvalidParameterException",
+                                   f"OIDC token endpoint returned non-JSON: {exc}", 400)
+
+    id_token = token_data.get("id_token", "")
+    access_token = token_data.get("access_token", "")
+    if not id_token:
+        return error_response_json("InvalidParameterException",
+                                   "OIDC token response missing id_token.", 400)
+
+    try:
+        claims = _decode_id_token_unverified(id_token)
+    except (ValueError, json.JSONDecodeError, base64.binascii.Error) as exc:
+        return error_response_json("InvalidParameterException",
+                                   f"Could not decode id_token: {exc}", 400)
+
+    # Apply attribute mapping (IdP claim → Cognito attribute), same shape
+    # as the SAML branch.
+    attr_mapping = provider.get("AttributeMapping", {})
+    reverse_mapping = {v: k for k, v in attr_mapping.items()}
+    user_attrs = {}
+    for idp_claim, value in claims.items():
+        if idp_claim in ("iss", "aud", "exp", "iat", "nbf", "jti", "azp", "auth_time"):
+            continue
+        if not isinstance(value, (str, int, float, bool)):
+            continue
+        cognito_attr = reverse_mapping.get(idp_claim, idp_claim)
+        user_attrs[cognito_attr] = str(value)
+
+    # Stable identifier: prefer `sub` from id_token, fall back to `email` or
+    # a generated UUID so users can be re-found on subsequent logins.
+    name_id = (claims.get("sub")
+               or claims.get("email")
+               or user_attrs.get("email")
+               or "")
+    if not name_id:
+        return error_response_json("InvalidParameterException",
+                                   "OIDC id_token has no `sub` or `email` claim.", 400)
+
+    username = f"{provider_name}_{name_id}"
+    existing_user = pool["_users"].get(username)
+    now = _now_epoch()
+
+    if existing_user:
+        existing_dict = _attr_list_to_dict(existing_user.get("Attributes", []))
+        existing_dict.update(user_attrs)
+        existing_user["Attributes"] = _dict_to_attr_list(existing_dict)
+        existing_user["UserLastModifiedDate"] = now
+        sub = existing_dict.get("sub", new_uuid())
+    else:
+        sub = new_uuid()
+        user_attrs["sub"] = sub
+        if "email" not in user_attrs and "@" in name_id:
+            user_attrs["email"] = name_id
+        user = {
+            "Username": username,
+            "Attributes": _dict_to_attr_list(user_attrs),
+            "UserCreateDate": now,
+            "UserLastModifiedDate": now,
+            "Enabled": True,
+            "UserStatus": "EXTERNAL_PROVIDER",
+            "MFAOptions": [],
+            "_password": "",
+            "_groups": [],
+            "_tokens": [],
+        }
+        pool["_users"][username] = user
+        pool["EstimatedNumberOfUsers"] = len(pool["_users"])
+
+    # Issue MiniStack auth code so the app's /oauth2/token call works.
+    _cleanup_expired_relay_codes()
+    ms_code = secrets.token_urlsafe(32)
+    _auth_codes[ms_code] = {
+        "type": "code",
+        "pool_id": pool_id,
+        "client_id": client_id,
+        "username": username,
+        "sub": sub,
+        "redirect_uri": redirect_uri,
+        "scopes": relay.get("scope", "openid"),
+        "created_at": time.time(),
+        "_oidc_access_token": access_token,  # kept for /oauth2/userInfo passthrough
+    }
+
+    params = {"code": ms_code}
+    if app_state:
+        params["state"] = app_state
+    location = redirect_uri + ("&" if "?" in redirect_uri else "?") + urlencode(params)
+    logger.info("Cognito: OIDC IdP response — user %s created/updated, redirecting to app", username)
+    return 302, {"Location": location, "Content-Type": "text/html"}, b""
+
+
 # -- /login (POST) ----------------------------------------------------------
 
 def handle_login_submit(method, path, headers, body, query_params):
@@ -2743,8 +3203,9 @@ def handle_login_submit(method, path, headers, body, query_params):
 
     # Authenticate user
     error_msg = ""
-    user = pool["_users"].get(username)
-    if not user:
+    user, _err = _resolve_user(pool, username)
+    if _err:
+        user = None
         error_msg = "Incorrect username or password."
     elif not user.get("Enabled", True):
         error_msg = "User is disabled."

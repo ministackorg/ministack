@@ -103,6 +103,7 @@ const path = require("path");
 const http = require("http");
 const https = require("https");
 const url = require("url");
+const Module = require("module");
 
 // Redirect stdout to stderr so stdout stays clean for JSON-line protocol
 const _realStdoutWrite = process.stdout.write.bind(process.stdout);
@@ -110,6 +111,222 @@ const _stderrWrite = process.stderr.write.bind(process.stderr);
 process.stdout.write = function(chunk, encoding, callback) {
   return _stderrWrite(chunk, encoding, callback);
 };
+
+// Synthetic AWS SDK v3 stubs — real AWS Lambda (Node.js 18+) ships these
+// built-in, but the host runtime does not.  Try the real package first so
+// a Lambda Layer with the actual SDK takes precedence; fall back to a stub
+// that routes through AWS_ENDPOINT_URL (Ministack).
+(function _installAwsSdkV3Stubs() {
+  // ── Lambda stub (REST-based, not JSON-RPC) ─────────────────────────────
+  function _lambdaInvoke(params) {
+    const ep = new URL(process.env.AWS_ENDPOINT_URL || "http://127.0.0.1:4566");
+    const fn = encodeURIComponent(params.FunctionName || "");
+    const qs = params.Qualifier
+      ? "?Qualifier=" + encodeURIComponent(params.Qualifier)
+      : "";
+    const body = params.Payload instanceof Uint8Array
+      ? Buffer.from(params.Payload)
+      : (params.Payload || "");
+    return new Promise((resolve, reject) => {
+      const req = http.request(
+        {
+          hostname: ep.hostname,
+          port: parseInt(ep.port || "4566", 10),
+          method: "POST",
+          path: "/2015-03-31/functions/" + fn + "/invocations" + qs,
+          headers: { "Content-Type": "application/json" },
+        },
+        (res) => {
+          const chunks = [];
+          res.on("data", (c) => chunks.push(c));
+          res.on("end", () =>
+            resolve({
+              StatusCode: res.statusCode,
+              Payload: Buffer.concat(chunks),
+              FunctionError: res.headers["x-amz-function-error"],
+            })
+          );
+        }
+      );
+      req.on("error", reject);
+      if (body) req.write(body);
+      req.end();
+    });
+  }
+
+  function _makeLambdaClientModule() {
+    class Lambda {
+      constructor(_cfg) {}
+      invoke(params) { return _lambdaInvoke(params); }
+    }
+    class LambdaClient {
+      constructor(_cfg) {}
+      send(cmd) { return cmd._run(); }
+    }
+    class InvokeCommand {
+      constructor(params) { this._p = params; }
+      _run() { return _lambdaInvoke(this._p); }
+    }
+    async function waitUntilFunctionActiveV2() { return { state: "SUCCESS" }; }
+    return { Lambda, LambdaClient, InvokeCommand, waitUntilFunctionActiveV2 };
+  }
+
+  // ── Generic JSON-RPC stub (covers SSM, SFN, STS, CloudWatch, Logs, etc.) ─
+  // Most AWS SDK v3 packages use awsJson1.x: POST / with X-Amz-Target header.
+  // Ministack's router maps target prefixes to service modules.
+  const _JSON_RPC_TARGETS = {
+    // JSON-RPC (awsJson1.x) services — keyed by @aws-sdk/client-{key} suffix.
+    // Target prefixes match Ministack's router.py SERVICE_PATTERNS target_prefixes.
+    "ssm":                         "AmazonSSM",
+    "sfn":                         "AWSStepFunctions",
+    // sts, sns: query protocol — @aws-sdk/client-{sts,sns} sends Action= form-encoded POST
+    // cloudwatch: smithy-rpc-v2-cbor — @aws-sdk/client-cloudwatch sends path-based requests
+    // All three are handled by Ministack's native query/path routing when the real SDK is present
+    "cloudwatch-logs":             "Logs_20140328",
+    "logs":                        "Logs_20140328",
+    "secretsmanager":              "secretsmanager",
+    "events":                      "AmazonEventBridge",
+    "eventbridge":                 "AmazonEventBridge",
+    "kinesis":                     "Kinesis_20131202",
+    "ecs":                         "AmazonEC2ContainerServiceV20141113",
+    "dynamodb":                    "DynamoDB_20120810",
+    "dynamodb-streams":            "DynamoDBStreams_20120810",
+    "sqs":                         "AmazonSQS",
+    "glue":                        "AWSGlue",
+    "athena":                      "AmazonAthena",
+    "firehose":                    "Firehose_20150804",
+    "cognito-identity-provider":   "AWSCognitoIdentityProviderService",
+    "cognito-identity":            "AWSCognitoIdentityService",
+    "emr":                         "ElasticMapReduce",
+    "ecr":                         "AmazonEC2ContainerRegistry_V20150921",
+    "acm":                         "CertificateManager",
+    "wafv2":                       "AWSWAF_20190729",
+    "waf":                         "AWSWAF_20150824",
+    "waf-regional":                "AWSWAF_Regional_20161128",
+    "organizations":               "AWSOrganizationsV20161128",
+    "kms":                         "TrentService",
+    "codebuild":                   "CodeBuild_20161006",
+    "transfer":                    "TransferService",
+    "servicediscovery":            "Route53AutoNaming_v20170314",
+    "resource-groups-tagging-api": "ResourceGroupsTaggingAPI_20170126",
+    "cloudtrail":                  "com.amazonaws.cloudtrail.v20131101.CloudTrail_20131101",
+  };
+
+  function _jsonRpcRequest(targetPrefix, opName, params) {
+    const ep = new URL(process.env.AWS_ENDPOINT_URL || "http://127.0.0.1:4566");
+    const body = JSON.stringify(params || {});
+    return new Promise((resolve, reject) => {
+      const req = http.request(
+        {
+          hostname: ep.hostname,
+          port: parseInt(ep.port || "4566", 10),
+          method: "POST",
+          path: "/",
+          headers: {
+            "Content-Type": "application/x-amz-json-1.1",
+            "X-Amz-Target": targetPrefix + "." + opName,
+            "Content-Length": Buffer.byteLength(body),
+          },
+        },
+        (res) => {
+          const chunks = [];
+          res.on("data", (c) => chunks.push(c));
+          res.on("end", () => {
+            const text = Buffer.concat(chunks).toString();
+            let parsed;
+            try { parsed = JSON.parse(text); } catch (_) { parsed = {}; }
+            if (res.statusCode >= 400) {
+              const err = new Error(
+                parsed.Message || parsed.message || text || "Service error"
+              );
+              err.statusCode = res.statusCode;
+              err.code = parsed.__type || parsed.Code || "ServiceError";
+              err.name = err.code;
+              reject(err);
+            } else {
+              resolve(parsed);
+            }
+          });
+        }
+      );
+      req.on("error", reject);
+      req.write(body);
+      req.end();
+    });
+  }
+
+  function _makeGenericJsonServiceModule(targetPrefix) {
+    // Command class factory: new PutParameterCommand(params) → has _run()
+    function _cmdClass(opName) {
+      return class {
+        constructor(params) { this._params = params; }
+        _run() { return _jsonRpcRequest(targetPrefix, opName, this._params); }
+      };
+    }
+
+    // v3-style client: new SSMClient({}).send(new PutParameterCommand({}))
+    class GenericClient {
+      constructor(_cfg) {}
+      send(cmd) { return cmd._run(); }
+    }
+
+    // Bare client: new SSM({}).putParameter(params)  (any method → operation)
+    const BareClient = new Proxy(function() {}, {
+      construct(_target, _args) {
+        return new Proxy({}, {
+          get(_, prop) {
+            if (typeof prop !== "string") return undefined;
+            const opName = prop[0].toUpperCase() + prop.slice(1);
+            return (params) => _jsonRpcRequest(targetPrefix, opName, params);
+          },
+        });
+      },
+    });
+
+    // Module proxy: any named export resolves on demand.
+    //   *Client  → GenericClient (v3 style)
+    //   *Command → command class  (strip "Command" suffix → op name)
+    //   other uppercase name → BareClient (bare/convenience style)
+    return new Proxy(
+      {},
+      {
+        get(_, prop) {
+          if (typeof prop !== "string") return undefined;
+          if (prop.endsWith("Client")) return GenericClient;
+          if (prop.endsWith("Command")) {
+            return _cmdClass(prop.slice(0, -7));
+          }
+          if (/^[A-Z]/.test(prop)) return BareClient;
+          return undefined;
+        },
+      }
+    );
+  }
+
+  // ── require() intercept ────────────────────────────────────────────────
+  const _SPECIFIC_STUBS = {
+    "@aws-sdk/client-lambda": _makeLambdaClientModule(),
+  };
+  const _SDK_CLIENT_RE = /^@aws-sdk\/client-(.+)$/;
+
+  const _origRequire = Module.prototype.require;
+  Module.prototype.require = function (id) {
+    // 1. Specific stubs (Lambda uses REST, not JSON-RPC)
+    const specific = _SPECIFIC_STUBS[id];
+    if (specific) {
+      try { return _origRequire.apply(this, arguments); } catch (_) {}
+      return specific;
+    }
+    // 2. Generic JSON-RPC stubs for known @aws-sdk/client-* packages
+    const m = id.match(_SDK_CLIENT_RE);
+    if (m) {
+      try { return _origRequire.apply(this, arguments); } catch (_) {}
+      const prefix = _JSON_RPC_TARGETS[m[1]];
+      if (prefix) return _makeGenericJsonServiceModule(prefix);
+    }
+    return _origRequire.apply(this, arguments);
+  };
+}());
 
 function patchAwsSdk() {
   const endpoint = process.env.AWS_ENDPOINT_URL
@@ -165,6 +382,19 @@ function patchAwsSdk() {
       return http.request(options, callback);
     }
 
+    // Downgrade HTTPS to HTTP for localhost — CDK Provider Framework's
+    // cfn-response.js calls https.request unconditionally for the ResponseURL
+    // PUT, and also drops the port when constructing options.  Intercept here
+    // so the PUT reaches Ministack's HTTP server on msPort, not port 443.
+    if (host === "127.0.0.1" || host === "localhost" || host === msHost) {
+      options.protocol = "http:";
+      options.port = options.port || msPort;
+      options.host = host + ":" + options.port;
+      options.agent = new http.Agent({ keepAlive: true });
+      delete options._defaultAgent;
+      return http.request(options, callback);
+    }
+
     // Downgrade ES HTTPS to HTTP for local Elasticsearch
     var esHost = process.env.ES_ENDPOINT ? process.env.ES_ENDPOINT.split(":")[0] : null;
     if (esHost && (host === esHost || host.startsWith(esHost + ":"))) {
@@ -174,11 +404,7 @@ function patchAwsSdk() {
       options.host = esHost + ":" + esPort;
       options.port = esPort;
       options.rejectUnauthorized = false;
-      if (options.agent instanceof https.Agent) {
-        options.agent = new http.Agent({ keepAlive: true });
-      } else if (options.agent === undefined) {
-        options.agent = new http.Agent({ keepAlive: true });
-      }
+      options.agent = new http.Agent({ keepAlive: true });
       delete options._defaultAgent;
       return http.request(options, callback);
     }

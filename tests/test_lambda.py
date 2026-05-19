@@ -253,6 +253,55 @@ def test_lambda_invoke_async(lam):
     )
     assert resp["StatusCode"] == 202
 
+
+@pytest.mark.serial
+def test_lambda_invoke_emits_cloudwatch_metrics(lam, cw):
+    """After invocation, AWS/Lambda namespace must carry Invocations + Duration
+    metrics dimensioned by FunctionName. Mirrors real Lambda observability —
+    the four canonical metrics (Invocations, Errors, Duration, Throttles) are
+    published per call.
+
+    Marked ``serial`` because xdist workers share one ministack container, and
+    any concurrent test calling ``/_ministack/reset`` would wipe the metric
+    store between our invoke and query. The function name is also UUID-suffixed
+    so re-runs against a persistent store don't pick up stale datapoints.
+    """
+    fname = f"lam-cw-metrics-{_uuid_mod.uuid4().hex[:8]}"
+    lam.create_function(
+        FunctionName=fname,
+        Runtime="python3.12",
+        Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _make_zip(_LAMBDA_CODE)},
+    )
+    try:
+        lam.invoke(FunctionName=fname, Payload=json.dumps({"x": 1}))
+        lam.invoke(FunctionName=fname, Payload=json.dumps({"x": 2}))
+
+        end = time.time()
+        start = end - 600
+        invocations = cw.get_metric_statistics(
+            Namespace="AWS/Lambda",
+            MetricName="Invocations",
+            Dimensions=[{"Name": "FunctionName", "Value": fname}],
+            StartTime=start, EndTime=end,
+            Period=60, Statistics=["Sum"],
+        )
+        total = sum(p["Sum"] for p in invocations["Datapoints"])
+        assert total >= 2, f"expected >=2 invocations, got {total}"
+
+        duration = cw.get_metric_statistics(
+            Namespace="AWS/Lambda",
+            MetricName="Duration",
+            Dimensions=[{"Name": "FunctionName", "Value": fname}],
+            StartTime=start, EndTime=end,
+            Period=60, Statistics=["Average", "Maximum"],
+        )
+        assert duration["Datapoints"], "no Duration datapoints recorded"
+        assert duration["Datapoints"][0]["Average"] > 0
+    finally:
+        lam.delete_function(FunctionName=fname)
+
 def test_lambda_update_code(lam):
     lam.update_function_code(
         FunctionName="lam-invoke-test",
@@ -1163,6 +1212,40 @@ def test_lambda_publish_version_snapshot(lam):
     version_nums = [v["Version"] for v in versions]
     assert "1" in version_nums
     assert "$LATEST" in version_nums
+
+
+def test_lambda_published_version_readiness_follows_function(lam):
+    """Published versions created during function bootstrap become Active."""
+    fn = f"qa-lam-version-ready-{_uuid_mod.uuid4().hex[:8]}"
+    lam.create_function(
+        FunctionName=fn,
+        Runtime="python3.12",
+        Role="arn:aws:iam::000000000000:role/r",
+        Handler="index.handler",
+        Code={"ZipFile": _zip_lambda("def handler(e,c): return 'v1'")},
+        Publish=True,
+    )
+
+    deadline = time.time() + 3
+    latest = version = None
+    while time.time() < deadline:
+        latest = lam.get_function_configuration(FunctionName=fn)
+        version = lam.get_function_configuration(FunctionName=fn, Qualifier="1")
+        if (
+            latest["State"] == "Active"
+            and latest["LastUpdateStatus"] == "Successful"
+            and version["State"] == "Active"
+            and version["LastUpdateStatus"] == "Successful"
+        ):
+            break
+        time.sleep(0.1)
+
+    assert latest["State"] == "Active"
+    assert latest["LastUpdateStatus"] == "Successful"
+    assert version["Version"] == "1"
+    assert version["State"] == "Active"
+    assert version["LastUpdateStatus"] == "Successful"
+
 
 def test_lambda_function_concurrency(lam):
     """PutFunctionConcurrency / GetFunctionConcurrency / DeleteFunctionConcurrency."""
@@ -3362,6 +3445,319 @@ def test_account_from_arn_lambda_runtime_helper_matches():
         assert runtime_helper("") == "fallback_key"
         assert runtime_helper(None) == "fallback_key"
         assert runtime_helper("arn:aws:lambda") == "fallback_key"
+
+
+def _run_nodejs_worker(handler_js, event_payload=None, env_extra=None):
+    """Spin up a Node.js Lambda worker with the given handler, return invoke result."""
+    import io
+    import json
+    import os
+    import shutil
+    import subprocess
+    import tempfile
+    import zipfile
+
+    from ministack.core.lambda_runtime import _NODEJS_WORKER_SCRIPT
+
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node not found on PATH")
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("index.js", handler_js)
+    code_zip = buf.getvalue()
+
+    tmpdir = tempfile.mkdtemp(prefix="test-node-worker-")
+    try:
+        worker_path = os.path.join(tmpdir, "_worker.js")
+        with open(worker_path, "w") as f:
+            f.write(_NODEJS_WORKER_SCRIPT)
+
+        code_dir = os.path.join(tmpdir, "code")
+        os.makedirs(code_dir)
+        zip_path = os.path.join(tmpdir, "code.zip")
+        with open(zip_path, "wb") as f:
+            f.write(code_zip)
+        with zipfile.ZipFile(zip_path) as zf:
+            zf.extractall(code_dir)
+
+        env = {**os.environ, "AWS_ENDPOINT_URL": "http://127.0.0.1:4566"}
+        if env_extra:
+            env.update(env_extra)
+
+        proc = subprocess.Popen(
+            [node, worker_path],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+            env=env,
+        )
+
+        init = json.dumps({
+            "code_dir": code_dir,
+            "module": "index",
+            "handler": "handler",
+            "env": {},
+            "function_name": "test-worker",
+            "memory": 128,
+            "arn": "arn:aws:lambda:us-east-1:000000000000:function:test-worker",
+        })
+        proc.stdin.write(init + "\n")
+        proc.stdin.flush()
+
+        init_resp = json.loads(proc.stdout.readline())
+        assert init_resp.get("status") == "ready", (
+            f"Worker init failed: {init_resp}; stderr: {proc.stderr.read(2048)}"
+        )
+
+        event = json.dumps({**(event_payload or {}), "_request_id": "test-req-1"})
+        proc.stdin.write(event + "\n")
+        proc.stdin.flush()
+
+        invoke_resp = json.loads(proc.stdout.readline())
+        proc.terminate()
+        return invoke_resp
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_nodejs_worker_aws_sdk_v3_stub_resolves():
+    """@aws-sdk/client-lambda, @aws-sdk/client-sfn, @aws-sdk/client-ssm resolve.
+
+    Real AWS Lambda (Node.js 18+) ships these built-in. Ministack injects
+    stubs: Lambda uses a dedicated REST stub; sfn/ssm use the generic JSON-RPC
+    stub backed by Ministack's own service implementations.
+    """
+    handler_js = """\
+const { Lambda, LambdaClient, InvokeCommand, waitUntilFunctionActiveV2 } = require("@aws-sdk/client-lambda");
+const { SFN, SFNClient } = require("@aws-sdk/client-sfn");
+const { SSM, SSMClient, PutParameterCommand, GetParameterCommand } = require("@aws-sdk/client-ssm");
+exports.handler = async (_event, _ctx) => ({
+  hasLambda: typeof Lambda === "function",
+  hasLambdaClient: typeof LambdaClient === "function",
+  hasInvokeCommand: typeof InvokeCommand === "function",
+  hasWaiter: typeof waitUntilFunctionActiveV2 === "function",
+  hasSFN: typeof SFN === "function",
+  hasSFNClient: typeof SFNClient === "function",
+  hasSSM: typeof SSM === "function",
+  hasSSMClient: typeof SSMClient === "function",
+  hasPutParameterCommand: typeof PutParameterCommand === "function",
+  hasGetParameterCommand: typeof GetParameterCommand === "function",
+});
+"""
+    result = _run_nodejs_worker(handler_js)
+    assert result.get("status") == "ok", f"Invocation failed: {result}"
+    r = result["result"]
+    assert r["hasLambda"] is True
+    assert r["hasLambdaClient"] is True
+    assert r["hasInvokeCommand"] is True
+    assert r["hasWaiter"] is True
+    assert r["hasSFN"] is True
+    assert r["hasSFNClient"] is True
+    assert r["hasSSM"] is True
+    assert r["hasSSMClient"] is True
+    assert r["hasPutParameterCommand"] is True
+    assert r["hasGetParameterCommand"] is True
+
+
+def test_nodejs_worker_json_rpc_error_has_name():
+    """Service errors from the JSON-RPC stub expose err.name (not just err.code).
+
+    AWS SDK v3 handlers typically catch errors by name, e.g.:
+      if (e.name !== 'ParameterNotFound') throw e;
+    The stub must set both .name and .code so that pattern works.
+    """
+    handler_js = """\
+const http = require("http");
+// Spin up a tiny server that returns a ParameterNotFound error body.
+const srv = http.createServer((req, res) => {
+  res.writeHead(400, { "Content-Type": "application/x-amz-json-1.1" });
+  res.end(JSON.stringify({ __type: "ParameterNotFound", Message: "param not found" }));
+});
+srv.listen(0, "127.0.0.1", () => {
+  const port = srv.address().port;
+  process.env.AWS_ENDPOINT_URL = "http://127.0.0.1:" + port;
+  const { SSMClient, GetParameterCommand } = require("@aws-sdk/client-ssm");
+  const client = new SSMClient({});
+  client.send(new GetParameterCommand({ Name: "/does/not/exist" }))
+    .catch((e) => {
+      srv.close();
+      exports._result = { name: e.name, code: e.code };
+    });
+});
+exports.handler = () => new Promise((res) => {
+  const wait = () => exports._result ? res(exports._result) : setTimeout(wait, 10);
+  wait();
+});
+"""
+    result = _run_nodejs_worker(handler_js)
+    assert result.get("status") == "ok", f"Invocation failed: {result}"
+    r = result["result"]
+    assert r["name"] == "ParameterNotFound", f"err.name was {r['name']!r}, expected 'ParameterNotFound'"
+    assert r["code"] == "ParameterNotFound", f"err.code was {r['code']!r}"
+
+
+def test_nodejs_worker_aws_sdk_v3_stub_resolves_extended():
+    """JSON-RPC service stubs resolve for all awsJson1.x services.
+
+    sts, sns, cloudwatch are intentionally excluded: they use query/smithy-rpc-v2-cbor
+    protocols, not awsJson1.x, so their real SDK packages format requests correctly
+    without a stub.
+    """
+    handler_js = """\
+const { SQSClient, SendMessageCommand } = require("@aws-sdk/client-sqs");
+const { KMSClient, EncryptCommand } = require("@aws-sdk/client-kms");
+const { CognitoIdentityProviderClient, AdminGetUserCommand } = require("@aws-sdk/client-cognito-identity-provider");
+const { CognitoIdentityClient } = require("@aws-sdk/client-cognito-identity");
+const { ECRClient, DescribeRepositoriesCommand } = require("@aws-sdk/client-ecr");
+const { GlueClient, GetDatabaseCommand } = require("@aws-sdk/client-glue");
+const { AthenaClient, StartQueryExecutionCommand } = require("@aws-sdk/client-athena");
+const { FirehoseClient, PutRecordCommand } = require("@aws-sdk/client-firehose");
+const { ACMClient, ListCertificatesCommand } = require("@aws-sdk/client-acm");
+const { OrganizationsClient, ListAccountsCommand } = require("@aws-sdk/client-organizations");
+const { CodeBuildClient, ListProjectsCommand } = require("@aws-sdk/client-codebuild");
+const { CloudTrailClient, LookupEventsCommand } = require("@aws-sdk/client-cloudtrail");
+const { ServiceDiscoveryClient, ListServicesCommand } = require("@aws-sdk/client-servicediscovery");
+exports.handler = async () => ({
+  sqs:   typeof SQSClient === "function" && typeof SendMessageCommand === "function",
+  kms:   typeof KMSClient === "function" && typeof EncryptCommand === "function",
+  cidp:  typeof CognitoIdentityProviderClient === "function" && typeof AdminGetUserCommand === "function",
+  ci:    typeof CognitoIdentityClient === "function",
+  ecr:   typeof ECRClient === "function" && typeof DescribeRepositoriesCommand === "function",
+  glue:  typeof GlueClient === "function" && typeof GetDatabaseCommand === "function",
+  ath:   typeof AthenaClient === "function" && typeof StartQueryExecutionCommand === "function",
+  fh:    typeof FirehoseClient === "function" && typeof PutRecordCommand === "function",
+  acm:   typeof ACMClient === "function" && typeof ListCertificatesCommand === "function",
+  org:   typeof OrganizationsClient === "function" && typeof ListAccountsCommand === "function",
+  cb:    typeof CodeBuildClient === "function" && typeof ListProjectsCommand === "function",
+  ct:    typeof CloudTrailClient === "function" && typeof LookupEventsCommand === "function",
+  sd:    typeof ServiceDiscoveryClient === "function" && typeof ListServicesCommand === "function",
+});
+"""
+    result = _run_nodejs_worker(handler_js)
+    assert result.get("status") == "ok", f"Invocation failed: {result}"
+    r = result["result"]
+    for svc, ok in r.items():
+        assert ok is True, f"Stub not resolved for service key: {svc!r}"
+
+
+def test_nodejs_worker_https_localhost_downgraded_to_http():
+    """https.request to localhost is downgraded to HTTP so cfn-response.js works.
+
+    The CDK Provider Framework's cfn-response.js calls https.request
+    unconditionally for the ResponseURL PUT and drops the port from the URL.
+    patchAwsSdk() intercepts this and redirects to HTTP on the Ministack port.
+    """
+    import http.server
+    import threading
+
+    # Start a tiny HTTP server to catch the PUT
+    received = {}
+
+    class _Handler(http.server.BaseHTTPRequestHandler):
+        def do_PUT(self):
+            length = int(self.headers.get("Content-Length", 0))
+            received["body"] = self.rfile.read(length).decode()
+            received["path"] = self.path
+            self.send_response(200)
+            self.end_headers()
+
+        def log_message(self, *args):
+            pass
+
+    srv = http.server.HTTPServer(("127.0.0.1", 0), _Handler)
+    port = srv.server_address[1]
+    t = threading.Thread(target=srv.handle_request, daemon=True)
+    t.start()
+
+    handler_js = f"""\
+const https = require("https");
+exports.handler = (event, ctx, cb) => {{
+  // Simulate cfn-response.js: https.request with no port (port dropped from URL)
+  const req = https.request({{
+    hostname: "127.0.0.1",
+    port: {port},
+    path: "/test-cfn-response",
+    method: "PUT",
+    headers: {{"content-type": "", "content-length": 4}},
+  }}, (res) => {{
+    res.resume();
+    cb(null, {{ statusCode: res.statusCode }});
+  }});
+  req.on("error", (e) => cb(e.message));
+  req.write("test");
+  req.end();
+}};
+"""
+    result = _run_nodejs_worker(handler_js)
+    t.join(timeout=5)
+    srv.server_close()
+
+    assert result.get("status") == "ok", f"Handler failed: {result}"
+    assert received.get("path") == "/test-cfn-response", "PUT not received by HTTP server"
+    assert received.get("body") == "test"
+
+
+def test_nodejs_worker_aws_sdk_v3_stub_wire_roundtrip(lam, ssm):
+    """End-to-end: a Node.js Lambda using @aws-sdk/client-ssm's
+    PutParameterCommand actually creates a parameter on MiniStack's SSM
+    service. Guards against the JSON-RPC stub silently 404'ing or routing
+    to the wrong target prefix (the per-service hardcoded map can drift from
+    router.py undetected by the resolution-only tests).
+    """
+    import shutil
+    import uuid as _uuid
+
+    if not shutil.which("node"):
+        pytest.skip("node not found on PATH")
+
+    fname = f"sdk-roundtrip-{_uuid.uuid4().hex[:8]}"
+    param_name = f"/ministack-test/{_uuid.uuid4().hex[:8]}"
+    param_value = f"value-{_uuid.uuid4().hex[:8]}"
+    code = (
+        "const { SSMClient, PutParameterCommand } = require('@aws-sdk/client-ssm');\n"
+        "exports.handler = async (event) => {\n"
+        "  const client = new SSMClient({});\n"
+        "  await client.send(new PutParameterCommand({\n"
+        "    Name: event.name, Value: event.value, Type: 'String', Overwrite: true,\n"
+        "  }));\n"
+        "  return { ok: true };\n"
+        "};\n"
+    )
+    try:
+        lam.create_function(
+            FunctionName=fname,
+            Runtime="nodejs20.x",
+            Role="arn:aws:iam::000000000000:role/test-role",
+            Handler="index.handler",
+            Code={"ZipFile": _make_zip_js(code, "index.js")},
+        )
+        resp = lam.invoke(
+            FunctionName=fname,
+            Payload=json.dumps({"name": param_name, "value": param_value}).encode(),
+        )
+        body = resp["Payload"].read().decode()
+        assert resp["StatusCode"] == 200, f"Invoke failed: {body}"
+        assert "FunctionError" not in resp, f"Handler errored: {body}"
+        assert json.loads(body) == {"ok": True}, f"Unexpected body: {body}"
+
+        # The stub must have actually called SSM. Verify via boto3 — if the
+        # X-Amz-Target was wrong or the body didn't reach MS, this raises
+        # ParameterNotFound and the test fails.
+        fetched = ssm.get_parameter(Name=param_name)["Parameter"]
+        assert fetched["Value"] == param_value
+    finally:
+        try:
+            lam.delete_function(FunctionName=fname)
+        except Exception:
+            pass
+        try:
+            ssm.delete_parameter(Name=param_name)
+        except Exception:
+            pass
 
 
 def test_lambda_ruby_4_0_runtime_maps_to_official_image():

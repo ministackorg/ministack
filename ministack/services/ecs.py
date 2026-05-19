@@ -191,9 +191,9 @@ def _iso():
 # ---------------------------------------------------------------------------
 
 _ECS_TIMESTAMP_FIELDS = {
-    "createdAt", "startedAt", "stoppedAt", "registeredAt",
+    "createdAt", "startedAt", "stoppedAt", "stoppingAt", "registeredAt",
     "deregisteredAt", "updatedAt", "lastModified", "runningAt",
-    "pullStartedAt", "pullStoppedAt", "executionStoppedAt",
+    "connectivityAt", "pullStartedAt", "pullStoppedAt", "executionStoppedAt",
 }
 
 
@@ -879,6 +879,9 @@ def _register_metadata(task_arn, cluster_arn, td, cdef, launch_type, env,
         host = "host.docker.internal"
     port = os.environ.get("GATEWAY_PORT") or os.environ.get("EDGE_PORT") or "4566"
     env["ECS_CONTAINER_METADATA_URI_V4"] = f"http://{host}:{port}/v4/{token}"
+    env["AWS_CONTAINER_CREDENTIALS_FULL_URI"] = f"http://{host}:{port}/v2/credentials/{new_uuid()}"
+    env["AWS_CONTAINER_AUTHORIZATION_TOKEN"] = secrets.token_urlsafe(32)
+    env["AWS_ENDPOINT_URL"] = f"http://{host}:{port}"
     ecs_metadata.register_container(
         token,
         task_arn,

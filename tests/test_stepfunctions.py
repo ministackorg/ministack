@@ -445,6 +445,209 @@ def test_sfn_aws_sdk_secretsmanager_create_and_get(sfn, sfn_sync, sm):
 
     sfn_sync.delete_state_machine(stateMachineArn=sm_arn)
 
+
+def test_sfn_jsonata_arguments_output_and_catch_output(sfn, sfn_sync, sm):
+    """JSONata Task states evaluate Arguments and Output for aws-sdk integrations."""
+    import uuid as _uuid
+
+    secret_name = f"sfn-jsonata-secret-{_uuid.uuid4().hex[:8]}"
+    sm_name = f"sfn-jsonata-{_uuid.uuid4().hex[:8]}"
+
+    definition = json.dumps({
+        "StartAt": "CreateSecret",
+        "States": {
+            "CreateSecret": {
+                "Type": "Task",
+                "QueryLanguage": "JSONata",
+                "Resource": "arn:aws:states:::aws-sdk:secretsmanager:createSecret",
+                "Arguments": "{% $merge([{'Name': $states.input.secretName, 'SecretString': $states.input.secretValue}, $states.input.kmsKeyId != '' ? {'KmsKeyId': $states.input.kmsKeyId} : {}]) %}",
+                "Output": "{% $merge([$states.input, {'createResult': $states.result}]) %}",
+                "Next": "CreateDuplicate",
+            },
+            "CreateDuplicate": {
+                "Type": "Task",
+                "QueryLanguage": "JSONata",
+                "Resource": "arn:aws:states:::aws-sdk:secretsmanager:createSecret",
+                "Arguments": {
+                    "Name": "{% $states.input.secretName %}",
+                    "SecretString": "duplicate",
+                },
+                "Catch": [
+                    {
+                        "ErrorEquals": ["SecretsManager.ResourceExistsException"],
+                        "Output": "{% $merge([$states.input, {'createError': $states.errorOutput}]) %}",
+                        "Next": "Done",
+                    }
+                ],
+                "End": True,
+            },
+            "Done": {"Type": "Succeed"},
+        },
+    })
+
+    sm_arn = sfn_sync.create_state_machine(
+        name=sm_name,
+        definition=definition,
+        roleArn="arn:aws:iam::000000000000:role/sfn-role",
+    )["stateMachineArn"]
+
+    try:
+        resp = sfn_sync.start_sync_execution(
+            stateMachineArn=sm_arn,
+            input=json.dumps({
+                "secretName": secret_name,
+                "secretValue": "jsonata-value",
+                "kmsKeyId": "",
+            }),
+        )
+        assert resp["status"] == "SUCCEEDED", f"Execution failed: {resp.get('error')} - {resp.get('cause')}"
+        output = json.loads(resp["output"])
+
+        assert output["createResult"]["Name"] == secret_name
+        assert output["createError"]["Error"] == "SecretsManager.ResourceExistsException"
+        assert sm.get_secret_value(SecretId=secret_name)["SecretString"] == "jsonata-value"
+    finally:
+        sfn_sync.delete_state_machine(stateMachineArn=sm_arn)
+        try:
+            sm.delete_secret(SecretId=secret_name, ForceDeleteWithoutRecovery=True)
+        except ClientError:
+            pass
+
+
+def test_sfn_jsonata_pass_output_string_concat_and_arithmetic(sfn, sfn_sync):
+    """JSONata Pass state evaluates Output with `&` concat and `*` arithmetic
+    (the exact form from issue #636 Test 1)."""
+    import uuid as _uuid
+
+    sm_name = f"sfn-jsonata-pass-{_uuid.uuid4().hex[:8]}"
+    definition = json.dumps({
+        "QueryLanguage": "JSONata",
+        "StartAt": "Transform",
+        "States": {
+            "Transform": {
+                "Type": "Pass",
+                "Output": {
+                    "greeting": "{% 'Hello, ' & $states.input.name & '!' %}",
+                    "doubled": "{% $states.input.value * 2 %}",
+                },
+                "End": True,
+            }
+        },
+    })
+
+    sm_arn = sfn_sync.create_state_machine(
+        name=sm_name,
+        definition=definition,
+        roleArn="arn:aws:iam::000000000000:role/sfn-role",
+    )["stateMachineArn"]
+    try:
+        resp = sfn_sync.start_sync_execution(
+            stateMachineArn=sm_arn,
+            input=json.dumps({"name": "World", "value": 21}),
+        )
+        assert resp["status"] == "SUCCEEDED", f"Execution failed: {resp.get('error')} - {resp.get('cause')}"
+        out = json.loads(resp["output"])
+        assert out == {"greeting": "Hello, World!", "doubled": 42}
+    finally:
+        sfn_sync.delete_state_machine(stateMachineArn=sm_arn)
+
+
+def test_sfn_jsonata_choice_condition_routes_branches(sfn, sfn_sync):
+    """JSONata Choice state evaluates per-branch `Condition` and routes correctly
+    (issue #636 Test 3)."""
+    import uuid as _uuid
+
+    sm_name = f"sfn-jsonata-choice-{_uuid.uuid4().hex[:8]}"
+    definition = json.dumps({
+        "QueryLanguage": "JSONata",
+        "StartAt": "Route",
+        "States": {
+            "Route": {
+                "Type": "Choice",
+                "Choices": [
+                    {
+                        "Condition": "{% $states.input.value > 10 %}",
+                        "Next": "BigValue",
+                    }
+                ],
+                "Default": "SmallValue",
+            },
+            "BigValue": {
+                "Type": "Pass",
+                "Output": {"branch": "big"},
+                "End": True,
+            },
+            "SmallValue": {
+                "Type": "Pass",
+                "Output": {"branch": "small"},
+                "End": True,
+            },
+        },
+    })
+
+    sm_arn = sfn_sync.create_state_machine(
+        name=sm_name,
+        definition=definition,
+        roleArn="arn:aws:iam::000000000000:role/sfn-role",
+    )["stateMachineArn"]
+    try:
+        big = sfn_sync.start_sync_execution(
+            stateMachineArn=sm_arn,
+            input=json.dumps({"value": 50}),
+        )
+        assert big["status"] == "SUCCEEDED"
+        assert json.loads(big["output"]) == {"branch": "big"}
+
+        small = sfn_sync.start_sync_execution(
+            stateMachineArn=sm_arn,
+            input=json.dumps({"value": 5}),
+        )
+        assert small["status"] == "SUCCEEDED"
+        assert json.loads(small["output"]) == {"branch": "small"}
+    finally:
+        sfn_sync.delete_state_machine(stateMachineArn=sm_arn)
+
+
+def test_sfn_jsonata_choice_with_per_branch_output(sfn, sfn_sync):
+    """Per-branch JSONata Output transforms input on the matched Choice rule."""
+    import uuid as _uuid
+
+    sm_name = f"sfn-jsonata-choice-output-{_uuid.uuid4().hex[:8]}"
+    definition = json.dumps({
+        "QueryLanguage": "JSONata",
+        "StartAt": "Route",
+        "States": {
+            "Route": {
+                "Type": "Choice",
+                "Choices": [
+                    {
+                        "Condition": "{% $states.input.priority = 'high' %}",
+                        "Output": {"tier": "premium", "name": "{% $states.input.name %}"},
+                        "Next": "End",
+                    }
+                ],
+                "Default": "End",
+            },
+            "End": {"Type": "Pass", "End": True},
+        },
+    })
+
+    sm_arn = sfn_sync.create_state_machine(
+        name=sm_name,
+        definition=definition,
+        roleArn="arn:aws:iam::000000000000:role/sfn-role",
+    )["stateMachineArn"]
+    try:
+        resp = sfn_sync.start_sync_execution(
+            stateMachineArn=sm_arn,
+            input=json.dumps({"name": "Alice", "priority": "high"}),
+        )
+        assert resp["status"] == "SUCCEEDED"
+        assert json.loads(resp["output"]) == {"tier": "premium", "name": "Alice"}
+    finally:
+        sfn_sync.delete_state_machine(stateMachineArn=sm_arn)
+
+
 def test_sfn_aws_sdk_dynamodb_put_and_get(sfn, sfn_sync, ddb):
     """aws-sdk:dynamodb integration puts and gets an item."""
     import uuid as _uuid
@@ -536,6 +739,143 @@ def test_sfn_aws_sdk_unknown_service_fails(sfn, sfn_sync):
     assert "neptune" in resp.get("cause", "").lower() or "neptune" in resp.get("error", "").lower()
 
     sfn_sync.delete_state_machine(stateMachineArn=sm_arn)
+
+
+def test_sfn_aws_sdk_lambda_get_alias_and_configuration(sfn_sync, lam):
+    """aws-sdk:lambda getAlias/getFunctionConfiguration supports JSONPath params."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    fn = f"sfn-sdk-lambda-{suffix}"
+    sm_name = f"sfn-sdk-lambda-{suffix}"
+
+    lam.create_function(
+        FunctionName=fn,
+        Runtime="python3.12",
+        Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _make_zip("def handler(e, c): return {'ok': True}")},
+    )
+    version = lam.publish_version(FunctionName=fn)["Version"]
+    lam.create_alias(FunctionName=fn, Name="live", FunctionVersion=version)
+
+    function_arn = f"arn:aws:lambda:us-east-1:000000000000:function:{fn}"
+    definition = json.dumps({
+        "StartAt": "ReadAlias",
+        "States": {
+            "ReadAlias": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::aws-sdk:lambda:getAlias",
+                "Parameters": {
+                    "FunctionName.$": "$.functionName",
+                    "Name.$": "$.aliasName",
+                },
+                "ResultPath": "$.alias",
+                "Next": "ReadConfig",
+            },
+            "ReadConfig": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::aws-sdk:lambda:getFunctionConfiguration",
+                "Parameters": {
+                    "FunctionName.$": "$.functionName",
+                    "Qualifier.$": "$.alias.FunctionVersion",
+                },
+                "ResultPath": "$.config",
+                "End": True,
+            },
+        },
+    })
+
+    sm_arn = sfn_sync.create_state_machine(
+        name=sm_name,
+        definition=definition,
+        roleArn="arn:aws:iam::000000000000:role/sfn-role",
+    )["stateMachineArn"]
+
+    resp = sfn_sync.start_sync_execution(
+        stateMachineArn=sm_arn,
+        input=json.dumps({"functionName": function_arn, "aliasName": "live"}),
+    )
+    assert resp["status"] == "SUCCEEDED", f"Execution failed: {resp.get('error')} — {resp.get('cause')}"
+    output = json.loads(resp["output"])
+    assert output["alias"]["Name"] == "live"
+    assert output["alias"]["FunctionVersion"] == version
+    assert output["config"]["FunctionName"] == fn
+    assert output["config"]["Version"] == version
+
+
+def test_sfn_aws_sdk_lambda_respects_caller_account():
+    """aws-sdk:lambda dispatch threads the caller's account through to the
+    Lambda lookup. Previously the dispatcher hardcoded ``Credential=test/...``
+    in its synthetic Authorization header, so an SFN execution running under
+    a non-default 12-digit account would resolve into the default account
+    and fail to find Lambdas created in the caller's own account.
+    """
+    import boto3
+    from botocore.config import Config as _Config
+
+    ACCOUNT = "987654321098"
+    suffix = _uuid_mod.uuid4().hex[:8]
+    fn = f"sfn-acct-{suffix}"
+    sm_name = f"sfn-acct-{suffix}"
+
+    def _client(service):
+        return boto3.client(
+            service,
+            endpoint_url="http://localhost:4566",
+            aws_access_key_id=ACCOUNT,
+            aws_secret_access_key="secret",
+            region_name="us-east-1",
+            config=_Config(
+                retries={"mode": "standard"},
+                # SFN's start_sync_execution prepends `sync-` to the host; the
+                # default sfn_sync fixture disables that, we need the same.
+                inject_host_prefix=False,
+            ),
+        )
+
+    lam_a = _client("lambda")
+    sfn_a = _client("stepfunctions")
+
+    lam_a.create_function(
+        FunctionName=fn,
+        Runtime="python3.12",
+        Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _make_zip("def handler(e, c): return {'ok': True}")},
+    )
+
+    function_arn = f"arn:aws:lambda:us-east-1:{ACCOUNT}:function:{fn}"
+    definition = json.dumps({
+        "StartAt": "ReadConfig",
+        "States": {
+            "ReadConfig": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::aws-sdk:lambda:getFunctionConfiguration",
+                "Parameters": {"FunctionName.$": "$.functionName"},
+                "End": True,
+            },
+        },
+    })
+    sm_arn = sfn_a.create_state_machine(
+        name=sm_name,
+        definition=definition,
+        roleArn=f"arn:aws:iam::{ACCOUNT}:role/sfn-role",
+    )["stateMachineArn"]
+
+    resp = sfn_a.start_sync_execution(
+        stateMachineArn=sm_arn,
+        input=json.dumps({"functionName": function_arn}),
+    )
+    assert resp["status"] == "SUCCEEDED", (
+        f"Execution failed under non-default account: "
+        f"{resp.get('error')} — {resp.get('cause')}"
+    )
+    output = json.loads(resp["output"])
+    assert output["FunctionName"] == fn
+    # FunctionArn must come back scoped to OUR account, not the default
+    assert output["FunctionArn"] == function_arn
+
+    lam_a.delete_function(FunctionName=fn)
+    sfn_a.delete_state_machine(stateMachineArn=sm_arn)
 
 
 def test_sfn_optimized_start_execution_returns_execution_arn(sfn, sfn_sync):
@@ -3760,3 +4100,366 @@ def test_sfn_create_alias_rejects_malformed_routing_config(sfn):
             assert exc_info.value.response["Error"]["Code"] == "ValidationException"
     finally:
         sfn.delete_state_machine(stateMachineArn=sm_arn)
+
+
+# ---------------------------------------------------------------------------
+# Regression: contextvars propagation to background execution thread (#639)
+# ---------------------------------------------------------------------------
+
+
+def test_sfn_execution_proceeds_under_non_default_account_id():
+    """Execution background thread must inherit the request's account context.
+
+    When a caller uses a 12-digit access-key as their account ID (the
+    documented per-account-isolation pattern), the execution record is stored
+    in AccountScopedDict under that account. Without contextvars propagation
+    into the threading.Thread that runs _run_execution, the worker thread
+    looks up the execution under the default account and silently returns,
+    leaving the execution stuck at ExecutionStarted forever.
+
+    Regression for #639. The fix wraps the background thread target with
+    contextvars.copy_context().run so the request's account/region context
+    survives the thread hop.
+    """
+    import boto3
+    from botocore.config import Config
+
+    # Borrow ENDPOINT + REGION from conftest's _default_kwargs without
+    # importing private names; rebuild a client with a 12-digit access key.
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+    region = os.environ.get("MINISTACK_REGION", "us-east-1")
+
+    alt_account_id = "123456789012"  # AWS docs placeholder account
+    alt_kwargs = dict(
+        endpoint_url=endpoint,
+        aws_access_key_id=alt_account_id,
+        aws_secret_access_key="test",
+        region_name=region,
+        config=Config(region_name=region, retries={"max_attempts": 0}),
+    )
+    sfn = boto3.client("stepfunctions", **alt_kwargs)
+
+    uid = _uuid_mod.uuid4().hex[:8]
+    sm_name = f"ctxvars-{uid}"
+    sm = sfn.create_state_machine(
+        name=sm_name,
+        definition=json.dumps(
+            {
+                "StartAt": "P",
+                "States": {"P": {"Type": "Pass", "End": True}},
+            }
+        ),
+        roleArn=f"arn:aws:iam::{alt_account_id}:role/r",
+        type="STANDARD",
+    )
+    sm_arn = sm["stateMachineArn"]
+    try:
+        # ARN must be scoped to the alt account, not 000000000000.
+        assert f":states:{region}:{alt_account_id}:stateMachine:" in sm_arn
+
+        exec_resp = sfn.start_execution(
+            stateMachineArn=sm_arn,
+            name=f"e-{uid}",
+            input="{}",
+        )
+        desc = _wait_sfn(sfn, exec_resp["executionArn"], timeout=10)
+        assert desc["status"] == "SUCCEEDED", (
+            f"Execution under account {alt_account_id} stalled at "
+            f"{desc['status']!r}. Background thread lost the account "
+            f"contextvars — see issue #639."
+        )
+
+        # History must have progressed past ExecutionStarted.
+        hist = sfn.get_execution_history(executionArn=exec_resp["executionArn"])
+        event_types = [e["type"] for e in hist["events"]]
+        assert "ExecutionStarted" in event_types
+        assert "ExecutionSucceeded" in event_types, (
+            f"Execution never reached terminal Succeed; events: {event_types}"
+        )
+    finally:
+        sfn.delete_state_machine(stateMachineArn=sm_arn)
+
+
+def _alt_account_sfn_client(account_id):
+    import boto3
+    from botocore.config import Config
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+    region = os.environ.get("MINISTACK_REGION", "us-east-1")
+    return boto3.client(
+        "stepfunctions",
+        endpoint_url=endpoint,
+        aws_access_key_id=account_id,
+        aws_secret_access_key="test",
+        region_name=region,
+        config=Config(region_name=region, retries={"max_attempts": 0}),
+    )
+
+
+def test_sfn_parallel_branches_proceed_under_non_default_account_id():
+    """Each Parallel branch thread must inherit the request's account context.
+
+    Before #640 the Parallel branch wrapper shared a single Context across N
+    concurrent threads — the second branch to start raised RuntimeError in
+    Thread._bootstrap_inner, which was logged to stderr but never reached
+    errors[idx], so the Parallel state returned [result_0, None, None, ...]
+    silently. Per-branch contextvars.copy_context() fixes both the account
+    lookup and the shared-context contention.
+    """
+    sfn = _alt_account_sfn_client("123456789012")
+    uid = _uuid_mod.uuid4().hex[:8]
+    sm_name = f"ctxvars-parallel-{uid}"
+    sm = sfn.create_state_machine(
+        name=sm_name,
+        definition=json.dumps({
+            "StartAt": "Fan",
+            "States": {
+                "Fan": {
+                    "Type": "Parallel",
+                    "End": True,
+                    "Branches": [
+                        {"StartAt": f"B{i}", "States": {f"B{i}": {"Type": "Pass", "Result": i, "End": True}}}
+                        for i in range(4)
+                    ],
+                }
+            },
+        }),
+        roleArn="arn:aws:iam::123456789012:role/r",
+        type="STANDARD",
+    )["stateMachineArn"]
+    try:
+        exec_resp = sfn.start_execution(stateMachineArn=sm, name=f"e-{uid}", input="{}")
+        desc = _wait_sfn(sfn, exec_resp["executionArn"], timeout=10)
+        assert desc["status"] == "SUCCEEDED", f"Parallel stalled: {desc.get('status')}"
+        out = json.loads(desc["output"])
+        assert out == [0, 1, 2, 3], f"Branches dropped silently: {out}"
+    finally:
+        sfn.delete_state_machine(stateMachineArn=sm)
+
+
+def test_sfn_map_iterations_proceed_under_non_default_account_id():
+    """Each Map ThreadPoolExecutor worker must inherit the request's account
+    context. Same shared-Context regression mode as Parallel, but for Map.
+    Use MaxConcurrency: 0 (unbounded) so workers definitely run concurrently.
+    """
+    sfn = _alt_account_sfn_client("123456789012")
+    uid = _uuid_mod.uuid4().hex[:8]
+    sm_name = f"ctxvars-map-{uid}"
+    sm = sfn.create_state_machine(
+        name=sm_name,
+        definition=json.dumps({
+            "StartAt": "Loop",
+            "States": {
+                "Loop": {
+                    "Type": "Map",
+                    "ItemsPath": "$.items",
+                    "MaxConcurrency": 0,
+                    "Iterator": {
+                        "StartAt": "Echo",
+                        "States": {"Echo": {"Type": "Pass", "End": True}},
+                    },
+                    "End": True,
+                }
+            },
+        }),
+        roleArn="arn:aws:iam::123456789012:role/r",
+        type="STANDARD",
+    )["stateMachineArn"]
+    try:
+        exec_resp = sfn.start_execution(
+            stateMachineArn=sm,
+            name=f"e-{uid}",
+            input=json.dumps({"items": [1, 2, 3, 4, 5]}),
+        )
+        desc = _wait_sfn(sfn, exec_resp["executionArn"], timeout=10)
+        assert desc["status"] == "SUCCEEDED", f"Map stalled: {desc.get('status')}"
+        out = json.loads(desc["output"])
+        assert out == [1, 2, 3, 4, 5], f"Map items dropped silently: {out}"
+    finally:
+        sfn.delete_state_machine(stateMachineArn=sm)
+
+
+# ---------------------------------------------------------------------------
+# JSONata variable assignment (`Assign` field + `$variable` refs) — issue #645
+# ---------------------------------------------------------------------------
+
+def test_sfn_jsonata_assign_pass_then_choice_references_variable(sfn, sfn_sync):
+    """Regression for #645: exact issue repro. A Pass state's `Assign` binds
+    a variable from `$states.result`; a downstream Choice's `Condition`
+    references it via `$myList`. Before the fix the evaluator raised
+    `States.QueryEvaluationError: Unsupported JSONata expression: $myList`.
+    """
+    import uuid as _uuid_local
+    sm_name = f"jsonata-assign-{_uuid_local.uuid4().hex[:8]}"
+    sm_arn = sfn_sync.create_state_machine(
+        name=sm_name,
+        roleArn="arn:aws:iam::000000000000:role/test-role",
+        definition=json.dumps({
+            "QueryLanguage": "JSONata",
+            "StartAt": "SetVars",
+            "States": {
+                "SetVars": {
+                    "Type": "Pass",
+                    "Output": {"items": ["a", "b"]},
+                    "Assign": {"myList": "{% $states.result.items %}"},
+                    "Next": "CheckList",
+                },
+                "CheckList": {
+                    "Type": "Choice",
+                    "Choices": [{
+                        "Next": "HasItems",
+                        "Condition": "{% $count($myList) > 0 %}",
+                    }],
+                    "Default": "Empty",
+                },
+                "HasItems": {"Type": "Succeed"},
+                "Empty": {"Type": "Succeed"},
+            },
+        }),
+    )["stateMachineArn"]
+    try:
+        resp = sfn_sync.start_sync_execution(stateMachineArn=sm_arn, input="{}")
+        assert resp["status"] == "SUCCEEDED", f"Status: {resp.get('status')} cause={resp.get('cause')}"
+        # `Empty` is the fallback — if the variable lookup or $count failed,
+        # we'd land there instead of `HasItems`.
+        events = sfn.get_execution_history(executionArn=resp["executionArn"])["events"]
+        entered = [e["stateEnteredEventDetails"]["name"]
+                   for e in events if "stateEnteredEventDetails" in e]
+        assert "HasItems" in entered, f"Expected HasItems; entered={entered}"
+        assert "Empty" not in entered
+    finally:
+        sfn_sync.delete_state_machine(stateMachineArn=sm_arn)
+
+
+def test_sfn_jsonata_assign_variable_survives_across_states(sfn_sync):
+    """Variables set on one state must be visible on every subsequent state
+    (execution-scoped, not state-scoped)."""
+    import uuid as _uuid_local
+    sm_name = f"jsonata-assign-chain-{_uuid_local.uuid4().hex[:8]}"
+    sm_arn = sfn_sync.create_state_machine(
+        name=sm_name,
+        roleArn="arn:aws:iam::000000000000:role/test-role",
+        definition=json.dumps({
+            "QueryLanguage": "JSONata",
+            "StartAt": "A",
+            "States": {
+                "A": {
+                    "Type": "Pass",
+                    "Assign": {"x": 41},
+                    "Next": "B",
+                },
+                "B": {
+                    "Type": "Pass",
+                    "Assign": {"y": "{% $x + 1 %}"},
+                    "Next": "C",
+                },
+                "C": {
+                    "Type": "Pass",
+                    "Output": "{% $y %}",
+                    "End": True,
+                },
+            },
+        }),
+    )["stateMachineArn"]
+    try:
+        resp = sfn_sync.start_sync_execution(stateMachineArn=sm_arn, input="{}")
+        assert resp["status"] == "SUCCEEDED"
+        assert json.loads(resp["output"]) == 42
+    finally:
+        sfn_sync.delete_state_machine(stateMachineArn=sm_arn)
+
+
+def test_sfn_jsonata_assign_dotted_variable_path(sfn_sync):
+    """`$user.email` resolves the `email` key inside the assigned `$user` dict."""
+    import uuid as _uuid_local
+    sm_name = f"jsonata-assign-dotted-{_uuid_local.uuid4().hex[:8]}"
+    sm_arn = sfn_sync.create_state_machine(
+        name=sm_name,
+        roleArn="arn:aws:iam::000000000000:role/test-role",
+        definition=json.dumps({
+            "QueryLanguage": "JSONata",
+            "StartAt": "Bind",
+            "States": {
+                "Bind": {
+                    "Type": "Pass",
+                    "Assign": {"user": {"email": "alice@example.com", "id": 7}},
+                    "Next": "Use",
+                },
+                "Use": {
+                    "Type": "Pass",
+                    "Output": "{% $user.email %}",
+                    "End": True,
+                },
+            },
+        }),
+    )["stateMachineArn"]
+    try:
+        resp = sfn_sync.start_sync_execution(stateMachineArn=sm_arn, input="{}")
+        assert resp["status"] == "SUCCEEDED"
+        assert json.loads(resp["output"]) == "alice@example.com"
+    finally:
+        sfn_sync.delete_state_machine(stateMachineArn=sm_arn)
+
+
+def test_sfn_jsonata_undefined_variable_raises_query_eval_error(sfn_sync):
+    """Referencing an unbound `$var` must surface as `States.QueryEvaluationError`
+    (the documented AWS error code for JSONata evaluation failures), not as a
+    generic Runtime error or silent fallthrough.
+    """
+    import uuid as _uuid_local
+    sm_name = f"jsonata-undef-{_uuid_local.uuid4().hex[:8]}"
+    sm_arn = sfn_sync.create_state_machine(
+        name=sm_name,
+        roleArn="arn:aws:iam::000000000000:role/test-role",
+        definition=json.dumps({
+            "QueryLanguage": "JSONata",
+            "StartAt": "Use",
+            "States": {
+                "Use": {
+                    "Type": "Pass",
+                    "Output": "{% $never_set %}",
+                    "End": True,
+                },
+            },
+        }),
+    )["stateMachineArn"]
+    try:
+        resp = sfn_sync.start_sync_execution(stateMachineArn=sm_arn, input="{}")
+        assert resp["status"] == "FAILED"
+        assert resp.get("error") == "States.QueryEvaluationError"
+    finally:
+        sfn_sync.delete_state_machine(stateMachineArn=sm_arn)
+
+
+def test_sfn_jsonata_assign_reuses_input(sfn_sync):
+    """`Assign` can reference `$states.input` (always available)."""
+    import uuid as _uuid_local
+    sm_name = f"jsonata-input-{_uuid_local.uuid4().hex[:8]}"
+    sm_arn = sfn_sync.create_state_machine(
+        name=sm_name,
+        roleArn="arn:aws:iam::000000000000:role/test-role",
+        definition=json.dumps({
+            "QueryLanguage": "JSONata",
+            "StartAt": "Bind",
+            "States": {
+                "Bind": {
+                    "Type": "Pass",
+                    "Assign": {"name": "{% $states.input.who %}"},
+                    "Next": "Out",
+                },
+                "Out": {
+                    "Type": "Pass",
+                    "Output": "{% 'hello ' & $name %}",
+                    "End": True,
+                },
+            },
+        }),
+    )["stateMachineArn"]
+    try:
+        resp = sfn_sync.start_sync_execution(
+            stateMachineArn=sm_arn,
+            input=json.dumps({"who": "world"}),
+        )
+        assert resp["status"] == "SUCCEEDED"
+        assert json.loads(resp["output"]) == "hello world"
+    finally:
+        sfn_sync.delete_state_machine(stateMachineArn=sm_arn)

@@ -23,7 +23,9 @@ Executions run in background threads and transition through RUNNING ->
 SUCCEEDED / FAILED / TIMED_OUT / ABORTED.
 """
 
+import ast
 import asyncio
+import contextvars
 import copy
 import json
 import logging
@@ -484,6 +486,41 @@ def _list_state_machines(data):
 # Execution lifecycle
 # ---------------------------------------------------------------------------
 
+def _resolve_state_machine_arn(arn):
+    """Resolve a state-machine, version, or alias ARN to the base state-machine
+    ARN. Returns None when the ARN doesn't match anything in any of the three
+    stores.
+
+    Real AWS accepts all three shapes wherever a ``stateMachineArn`` is taken
+    (StartExecution, DescribeExecution, EventBridge target Arn, …):
+
+      * ``arn:aws:states:<r>:<a>:stateMachine:<name>``           — base
+      * ``arn:aws:states:<r>:<a>:stateMachine:<name>:<version>`` — published version
+      * ``arn:aws:states:<r>:<a>:stateMachine:<name>:<alias>``   — alias
+
+    For an alias, we pick the highest-weighted version in the routing config
+    and resolve that version back to its base state machine.
+    """
+    if arn in _state_machines:
+        return arn
+    version = _state_machine_versions.get(arn)
+    if version:
+        return version.get("stateMachineArn")
+    alias = _state_machine_aliases.get(arn)
+    if alias:
+        routing = alias.get("routingConfiguration") or []
+        # AWS picks one of the configured versions by weight on each
+        # invocation. For determinism in test contexts we pick the
+        # highest-weighted entry (ties → first listed).
+        if routing:
+            chosen = max(routing, key=lambda r: r.get("weight", 0))
+            version_arn = chosen.get("stateMachineVersionArn", "")
+            ver = _state_machine_versions.get(version_arn)
+            if ver:
+                return ver.get("stateMachineArn")
+    return None
+
+
 def _start_execution(data):
     sm_arn_raw = data.get("stateMachineArn", "")
     # Support #TestCaseName suffix for mock config
@@ -492,10 +529,12 @@ def _start_execution(data):
         sm_arn, test_case = sm_arn_raw.rsplit("#", 1)
     else:
         sm_arn = sm_arn_raw
-    if sm_arn not in _state_machines:
+    base_arn = _resolve_state_machine_arn(sm_arn)
+    if base_arn is None:
         return error_response_json(
             "StateMachineDoesNotExist",
             f"State machine {sm_arn} not found", 400)
+    sm_arn = base_arn
 
     sm = _state_machines[sm_arn]
     name = data.get("name") or new_uuid()
@@ -531,8 +570,18 @@ def _start_execution(data):
         ],
     }
 
+    # Propagate the request's contextvars (notably the account ID set by
+    # set_request_account_id) into the background execution thread. Python's
+    # threading.Thread does NOT automatically copy contextvars, so without
+    # this snapshot the worker runs under the default account and silently
+    # fails to find the execution stored in AccountScopedDict under the
+    # caller's account. See issue #639.
+    ctx_snapshot = contextvars.copy_context()
     threading.Thread(
-        target=_run_execution, args=(exec_arn,), daemon=True).start()
+        target=ctx_snapshot.run,
+        args=(_run_execution, exec_arn),
+        daemon=True,
+    ).start()
 
     logger.info("Step Functions execution started: %s", exec_arn)
     return json_response({"executionArn": exec_arn, "startDate": start_date})
@@ -946,6 +995,11 @@ def _test_state(data):
     ctx.setdefault("Execution", {"Id": f"arn:aws:states:{get_region()}:{get_account_id()}:execution:test:{new_uuid()}", "Name": "test", "StartTime": now_iso()})
     ctx.setdefault("StateMachine", {"Id": "test", "Name": "test"})
     ctx["State"] = {"Name": state_name, "EnteredTime": now_iso()}
+    # Inherit top-level QueryLanguage when the definition is a full state machine;
+    # for single-state definitions the state's own QueryLanguage still wins via
+    # `_state_query_language`.
+    ctx.setdefault("QueryLanguage", definition.get("QueryLanguage", "JSONPath"))
+    ctx.setdefault("variables", {})
 
     inspection_data = {}
     if inspection_level in ("DEBUG", "TRACE"):
@@ -954,19 +1008,19 @@ def _test_state(data):
     result = {}
     try:
         if state_type == "Pass":
-            output, next_state = _execute_pass(state_def, input_data)
+            output, next_state = _execute_pass(state_def, input_data, ctx)
             result = {"status": "SUCCEEDED", "output": json.dumps(output)}
             if next_state:
                 result["nextState"] = next_state
 
         elif state_type == "Choice":
-            output, next_state = _execute_choice(state_def, input_data)
+            output, next_state = _execute_choice(state_def, input_data, ctx)
             result = {"status": "SUCCEEDED", "output": json.dumps(output)}
             if next_state:
                 result["nextState"] = next_state
 
         elif state_type == "Wait":
-            output, next_state = _execute_wait(state_def, input_data)
+            output, next_state = _execute_wait(state_def, input_data, ctx)
             result = {"status": "SUCCEEDED", "output": json.dumps(output)}
             if next_state:
                 result["nextState"] = next_state
@@ -1150,6 +1204,7 @@ def _run_execution(exec_arn):
         current_input = {}
 
     ctx = {
+        "QueryLanguage": definition.get("QueryLanguage", "JSONPath"),
         "Execution": {
             "Id": exec_arn,
             "Input": current_input,
@@ -1160,6 +1215,11 @@ def _run_execution(exec_arn):
             "Id": execution["stateMachineArn"],
             "Name": sm["name"],
         },
+        # JSONata workflow variables — bound via state `Assign` fields and
+        # referenced as `$name` in subsequent JSONata expressions. Scope is
+        # the whole execution (per AWS); Map/Parallel sub-branches share
+        # this dict with the parent, matching AWS semantics.
+        "variables": {},
     }
 
     try:
@@ -1215,7 +1275,7 @@ def _run_execution(exec_arn):
                     state_def, current_input, execution, ctx)
             else:
                 current_input, next_name = handler_fn(
-                    state_def, current_input)
+                    state_def, current_input, ctx)
 
             _add_event(execution, f"{state_type}StateExited", {
                 "stateExitedEventDetails": {
@@ -1256,7 +1316,17 @@ def _fail_execution(execution, error, cause):
 # Pass state
 # ---------------------------------------------------------------------------
 
-def _execute_pass(state_def, raw_input):
+def _execute_pass(state_def, raw_input, ctx=None):
+    if _state_query_language(state_def, ctx) == "JSONata":
+        # JSONata Pass: `Output` replaces the JSONPath chain. Missing Output
+        # passes input through unchanged (matches AWS behavior — Pass with no
+        # transformation is the identity state).
+        output = _apply_jsonata_output(state_def, raw_input, ctx, default=raw_input)
+        # Pass has no API call, so `$states.result` in Assign expressions
+        # refers to the state's computed Output (per AWS docs).
+        _apply_state_assign(state_def, raw_input, ctx, result=output)
+        return output, _next_or_end(state_def)
+
     effective = _apply_input_path(state_def, raw_input)
     effective = _apply_parameters(state_def, effective)
 
@@ -1274,6 +1344,7 @@ def _execute_pass(state_def, raw_input):
 def _execute_task(state_def, raw_input, execution, ctx):
     resource = state_def.get("Resource", "")
     is_callback = ".waitForTaskToken" in resource
+    query_language = _state_query_language(state_def, ctx)
 
     # SFN mock config — return canned response if configured (AWS SFN Local format)
     if _sfn_mock_config and execution:
@@ -1290,16 +1361,27 @@ def _execute_task(state_def, raw_input, execution, ctx):
                     mock["Throw"].get("Error", "MockError"),
                     mock["Throw"].get("Cause", "Mocked failure"))
             mock_result = mock.get("Return", {})
-            result = _apply_result_selector(state_def, mock_result)
-            output = _apply_result_path(state_def, raw_input, result)
-            output = _apply_output_path(state_def, output)
+            if query_language == "JSONata":
+                output = _apply_jsonata_output(
+                    state_def,
+                    raw_input,
+                    ctx,
+                    result=mock_result,
+                    default=mock_result,
+                )
+            else:
+                result = _apply_result_selector(state_def, mock_result)
+                output = _apply_result_path(state_def, raw_input, result)
+                output = _apply_output_path(state_def, output)
             return output, _next_or_end(state_def)
 
     if is_callback:
         ctx["Task"] = {"Token": new_uuid()}
 
-    effective = _apply_input_path(state_def, raw_input)
-    effective = _apply_parameters(state_def, effective, ctx)
+    effective = None
+    if query_language != "JSONata":
+        effective = _apply_input_path(state_def, raw_input)
+        effective = _apply_parameters(state_def, effective, ctx)
 
     retriers = state_def.get("Retry", [])
     catchers = state_def.get("Catch", [])
@@ -1308,6 +1390,9 @@ def _execute_task(state_def, raw_input, execution, ctx):
 
     while True:
         try:
+            if query_language == "JSONata":
+                effective = _apply_jsonata_arguments(state_def, raw_input, ctx)
+
             _add_event(execution, "TaskScheduled", {
                 "taskScheduledEventDetails": {
                     "resourceType": "lambda" if "lambda" in resource else "states",
@@ -1328,9 +1413,21 @@ def _execute_task(state_def, raw_input, execution, ctx):
                 },
             })
 
-            result = _apply_result_selector(state_def, task_result)
-            output = _apply_result_path(state_def, raw_input, result)
-            output = _apply_output_path(state_def, output)
+            if query_language == "JSONata":
+                output = _apply_jsonata_output(
+                    state_def,
+                    raw_input,
+                    ctx,
+                    result=task_result,
+                    default=task_result,
+                )
+                # Task `Assign` sees `$states.result` = raw API result (per
+                # AWS), not the post-Output transformed value.
+                _apply_state_assign(state_def, raw_input, ctx, result=task_result)
+            else:
+                result = _apply_result_selector(state_def, task_result)
+                output = _apply_result_path(state_def, raw_input, result)
+                output = _apply_output_path(state_def, output)
             return output, _next_or_end(state_def)
 
         except _ExecutionError as err:
@@ -1358,8 +1455,21 @@ def _execute_task(state_def, raw_input, execution, ctx):
         catcher = _find_matching_catcher(catchers, last_error.error)
         if catcher:
             error_output = {"Error": last_error.error, "Cause": last_error.cause}
-            output = _apply_result_path_raw(
-                catcher.get("ResultPath", "$"), raw_input, error_output)
+            if query_language == "JSONata" and "Output" in catcher:
+                output = _apply_jsonata_output(
+                    catcher,
+                    raw_input,
+                    ctx,
+                    error_output=error_output,
+                    default=error_output,
+                )
+            else:
+                output = _apply_result_path_raw(
+                    catcher.get("ResultPath", "$"), raw_input, error_output)
+            if query_language == "JSONata":
+                # Catch handlers can also carry `Assign`. `$states.errorOutput`
+                # is available here; `$states.result` is not (per AWS).
+                _apply_state_assign(catcher, raw_input, ctx, error_output=error_output)
             return output, catcher["Next"]
         raise last_error
 
@@ -1510,7 +1620,26 @@ def _call_lambda(func_name, event):
 # Choice state
 # ---------------------------------------------------------------------------
 
-def _execute_choice(state_def, raw_input):
+def _execute_choice(state_def, raw_input, ctx=None):
+    if _state_query_language(state_def, ctx) == "JSONata":
+        for choice in state_def.get("Choices", []):
+            if _evaluate_jsonata_choice_rule(choice, raw_input, ctx):
+                # Per-branch Output (if present) takes precedence; otherwise
+                # input passes through unchanged.
+                output = _apply_jsonata_output(choice, raw_input, ctx, default=raw_input)
+                # Per-branch Assign — `$states.result` is not applicable on
+                # Choice (no API call); only `$states.input` and existing
+                # variables are usable.
+                _apply_state_assign(choice, raw_input, ctx)
+                return output, choice["Next"]
+        default = state_def.get("Default")
+        if default:
+            # State-level Assign applies when falling through to Default.
+            _apply_state_assign(state_def, raw_input, ctx)
+            return raw_input, default
+        raise _ExecutionError("States.NoChoiceMatched",
+                              "No choice rule matched and no Default")
+
     effective = _apply_input_path(state_def, raw_input)
 
     for choice in state_def.get("Choices", []):
@@ -1523,6 +1652,20 @@ def _execute_choice(state_def, raw_input):
 
     raise _ExecutionError("States.NoChoiceMatched",
                           "No choice rule matched and no Default")
+
+
+def _evaluate_jsonata_choice_rule(rule, raw_input, ctx):
+    condition = rule.get("Condition")
+    if condition is None:
+        return False
+    if isinstance(condition, bool):
+        return condition
+    if isinstance(condition, str) and condition.startswith("{%") and condition.endswith("%}"):
+        expr = condition[2:-2].strip()
+        return _truthy(_evaluate_jsonata(expr, raw_input, ctx))
+    # Non-expression literal — JSONata Choice without {% %} is invalid per AWS,
+    # but treat as plain truthy for parity with how literal Output is handled.
+    return _truthy(condition)
 
 
 def _evaluate_rule(rule, data):
@@ -1606,7 +1749,7 @@ def _evaluate_rule(rule, data):
 # Wait state
 # ---------------------------------------------------------------------------
 
-def _execute_wait(state_def, raw_input):
+def _execute_wait(state_def, raw_input, ctx=None):
     effective = _apply_input_path(state_def, raw_input)
 
     if "Seconds" in state_def:
@@ -1663,8 +1806,19 @@ def _execute_parallel(state_def, raw_input, execution, ctx):
         except Exception as exc:
             errors[idx] = exc
 
-    threads = [threading.Thread(target=run_branch, args=(i, b), daemon=True)
-               for i, b in enumerate(branches)]
+    # Each branch runs in its own thread; propagate the parent's contextvars
+    # so AccountScopedDict lookups (account ID, region) keep resolving to the
+    # current execution's tenant. Take a fresh copy_context() per branch —
+    # a single Context cannot be entered by two threads concurrently. See
+    # issue #639.
+    threads = [
+        threading.Thread(
+            target=contextvars.copy_context().run,
+            args=(run_branch, i, b),
+            daemon=True,
+        )
+        for i, b in enumerate(branches)
+    ]
     for t in threads:
         t.start()
     for t in threads:
@@ -1717,8 +1871,16 @@ def _execute_map(state_def, raw_input, execution, ctx):
             errors[idx] = exc
 
     workers = max_conc if max_conc > 0 else (len(items) or 1)
+    # ThreadPoolExecutor workers do not inherit the submitting thread's
+    # contextvars, so wrap each submitted callable with copy_context().run
+    # to keep AccountScopedDict lookups bound to the current tenant. Take
+    # a fresh copy_context() per item — a single Context cannot be entered
+    # by two threads concurrently. See issue #639.
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        futs = [pool.submit(run_item, i, item) for i, item in enumerate(items)]
+        futs = [
+            pool.submit(contextvars.copy_context().run, run_item, i, item)
+            for i, item in enumerate(items)
+        ]
         futures_wait(futs)
 
     for err in errors:
@@ -1775,7 +1937,7 @@ def _run_sub_machine(states, start_at, input_data, execution, ctx):
                 state_def, current_input, execution, ctx)
         else:
             current_input, current_name = handler_fn(
-                state_def, current_input)
+                state_def, current_input, ctx)
 
     return current_input
 
@@ -1832,6 +1994,548 @@ def _apply_result_path_raw(result_path, original, result):
         cur = cur[p]
     cur[parts[-1]] = result
     return output
+
+
+def _state_query_language(state_def, ctx=None):
+    return state_def.get("QueryLanguage") or (ctx or {}).get("QueryLanguage", "JSONPath")
+
+
+def _apply_jsonata_arguments(state_def, raw_input, ctx=None):
+    if "Arguments" not in state_def:
+        return raw_input
+    return _apply_jsonata_template(
+        state_def["Arguments"],
+        raw_input,
+        ctx,
+    )
+
+
+def _apply_jsonata_output(state_def, raw_input, ctx=None, result=None, error_output=None, default=None):
+    if "Output" not in state_def:
+        return default
+    return _apply_jsonata_template(
+        state_def["Output"],
+        raw_input,
+        ctx,
+        result=result,
+        error_output=error_output,
+    )
+
+
+def _apply_state_assign(state_def, raw_input, ctx, result=None, error_output=None):
+    """Evaluate a state's `Assign` field (JSONata only) and merge results
+    into ``ctx['variables']`` so later JSONata expressions can reference them
+    as ``$name``. Variables are execution-scoped per AWS.
+
+    Called after the state's output is computed so that `$states.result` in
+    Assign expressions sees the state's actual result.
+    """
+    if ctx is None:
+        return
+    if _state_query_language(state_def, ctx) != "JSONata":
+        return
+    assign = state_def.get("Assign")
+    if not isinstance(assign, dict):
+        return
+    variables = ctx.setdefault("variables", {})
+    for name, template in assign.items():
+        variables[name] = _apply_jsonata_template(
+            template, raw_input, ctx,
+            result=result, error_output=error_output,
+        )
+
+
+def _apply_jsonata_template(value, raw_input, ctx=None, result=None, error_output=None):
+    if isinstance(value, str):
+        if value.startswith("{%") and value.endswith("%}"):
+            expr = value[2:-2].strip()
+            return _evaluate_jsonata(expr, raw_input, ctx, result, error_output)
+        return value
+    if isinstance(value, dict):
+        return {
+            key: _apply_jsonata_template(val, raw_input, ctx, result, error_output)
+            for key, val in value.items()
+        }
+    if isinstance(value, list):
+        return [
+            _apply_jsonata_template(item, raw_input, ctx, result, error_output)
+            for item in value
+        ]
+    return value
+
+
+def _evaluate_jsonata(expression, raw_input, ctx=None, result=None, error_output=None):
+    states = {
+        "input": raw_input,
+        # workflow-scoped variables — looked up by bare `$name` references
+        # in expressions. See `_eval_jsonata_primary`.
+        "_variables": (ctx or {}).get("variables", {}),
+        "result": result,
+        "errorOutput": error_output,
+        "context": ctx or {},
+    }
+    try:
+        return _eval_jsonata_expr(expression.strip(), states)
+    except _ExecutionError:
+        raise
+    except Exception as exc:
+        raise _ExecutionError("States.QueryEvaluationError", str(exc))
+
+
+def _eval_jsonata_expr(expr, states):
+    """Tiny JSONata evaluator. Precedence layered low → high:
+       ternary `?:`, `or`, `and`, comparison (`= != < <= > >=`), `in`,
+       additive (`+ - &`), multiplicative (`* / %`), unary `-`, primary.
+
+    Anything outside this surface raises `States.QueryEvaluationError` so callers
+    fail fast and explicitly rather than silently producing wrong data.
+    """
+    expr = expr.strip()
+    if not expr:
+        raise ValueError("Empty JSONata expression")
+
+    # 1. Ternary (right-associative — peel outermost `?`)
+    q_pos = _find_top_level_token(expr, "?")
+    if q_pos >= 0:
+        c_pos = _find_matching_ternary_colon(expr, q_pos)
+        if c_pos < 0:
+            raise ValueError(f"Invalid JSONata conditional: {expr}")
+        condition = _eval_jsonata_expr(expr[:q_pos], states)
+        if _truthy(condition):
+            return _eval_jsonata_expr(expr[q_pos + 1:c_pos], states)
+        return _eval_jsonata_expr(expr[c_pos + 1:], states)
+
+    # 2. `or` (short-circuit, left-assoc → rightmost split)
+    pos, _ = _find_top_level_any_op(expr, ("or",), keyword=True)
+    if pos >= 0:
+        left = _eval_jsonata_expr(expr[:pos], states)
+        if _truthy(left):
+            return True
+        return _truthy(_eval_jsonata_expr(expr[pos + 2:], states))
+
+    # 3. `and` (short-circuit)
+    pos, _ = _find_top_level_any_op(expr, ("and",), keyword=True)
+    if pos >= 0:
+        left = _eval_jsonata_expr(expr[:pos], states)
+        if not _truthy(left):
+            return False
+        return _truthy(_eval_jsonata_expr(expr[pos + 3:], states))
+
+    # 4. Comparison
+    pos, op = _find_top_level_any_op(
+        expr, ("!=", "<=", ">=", "=", "<", ">"), keyword=False)
+    if pos >= 0:
+        left = _eval_jsonata_expr(expr[:pos], states)
+        right = _eval_jsonata_expr(expr[pos + len(op):], states)
+        return _apply_binary_op(op, left, right)
+    pos, _ = _find_top_level_any_op(expr, ("in",), keyword=True)
+    if pos >= 0:
+        left = _eval_jsonata_expr(expr[:pos], states)
+        right = _eval_jsonata_expr(expr[pos + 2:], states)
+        if right is None:
+            return False
+        try:
+            return left in right
+        except TypeError as exc:
+            raise ValueError(f"`in` failed: {exc}")
+
+    # 5. Additive
+    pos, op = _find_top_level_any_op(expr, ("+", "-", "&"), keyword=False)
+    if pos >= 0:
+        left = _eval_jsonata_expr(expr[:pos], states)
+        right = _eval_jsonata_expr(expr[pos + 1:], states)
+        return _apply_binary_op(op, left, right)
+
+    # 6. Multiplicative
+    pos, op = _find_top_level_any_op(expr, ("*", "/", "%"), keyword=False)
+    if pos >= 0:
+        left = _eval_jsonata_expr(expr[:pos], states)
+        right = _eval_jsonata_expr(expr[pos + 1:], states)
+        return _apply_binary_op(op, left, right)
+
+    # 7. Unary minus
+    if expr.startswith("-"):
+        inner = _eval_jsonata_expr(expr[1:].lstrip(), states)
+        if isinstance(inner, bool) or not isinstance(inner, (int, float)):
+            raise ValueError(f"Cannot negate non-numeric: {inner!r}")
+        return -inner
+
+    # 8. Primary
+    return _eval_jsonata_primary(expr, states)
+
+
+def _eval_jsonata_primary(expr, states):
+    # Paren grouping
+    if expr.startswith("(") and expr.endswith(")") and _is_balanced_outer(expr, "(", ")"):
+        return _eval_jsonata_expr(expr[1:-1], states)
+
+    # Built-in functions (AWS-supported JSONata subset)
+    for name, fn in (
+        ("$merge", _jsonata_merge),
+        ("$count", _jsonata_count),
+        ("$length", _jsonata_length),
+        ("$not", _jsonata_not),
+        ("$string", _jsonata_string),
+        ("$number", _jsonata_number),
+    ):
+        prefix = name + "("
+        if expr.startswith(prefix) and expr.endswith(")") \
+                and _is_balanced_outer(expr[len(name):], "(", ")"):
+            arg_expr = expr[len(prefix):-1].strip()
+            arg = _eval_jsonata_expr(arg_expr, states) if arg_expr else None
+            return fn(arg)
+
+    # Array literal
+    if expr.startswith("[") and expr.endswith("]") and _is_balanced_outer(expr, "[", "]"):
+        body = expr[1:-1].strip()
+        if not body:
+            return []
+        return [_eval_jsonata_expr(part, states) for part in _split_top_level(body, ",")]
+
+    # Object literal
+    if expr.startswith("{") and expr.endswith("}") and _is_balanced_outer(expr, "{", "}"):
+        body = expr[1:-1].strip()
+        if not body:
+            return {}
+        result = {}
+        for part in _split_top_level(body, ","):
+            key_expr, value_expr = _split_object_member(part)
+            key_expr = key_expr.strip()
+            if key_expr.startswith(("'", '"')):
+                key = ast.literal_eval(key_expr)
+            else:
+                key = key_expr
+            result[key] = _eval_jsonata_expr(value_expr, states)
+        return result
+
+    if expr.startswith("$states."):
+        return _resolve_jsonata_states_path(expr, states)
+
+    # Bare workflow variable reference: `$name` or `$name.dotted.path`.
+    # `$states.…` is already handled above; `$func(…)` was handled by the
+    # built-in function block above (variable refs have no `(`); so anything
+    # else starting with `$<alpha>` is a variable lookup. Issue #645.
+    if (len(expr) > 1
+            and expr[0] == "$"
+            and "(" not in expr
+            and re.fullmatch(r"\$[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*", expr)):
+        head, _dot, rest = expr[1:].partition(".")
+        variables = states.get("_variables", {})
+        if head not in variables:
+            raise ValueError(f"Undefined variable: ${head}")
+        value = variables[head]
+        if rest:
+            value = _resolve_dotted_path(rest, value)
+        return value
+
+    if expr in ("true", "false", "null"):
+        return {"true": True, "false": False, "null": None}[expr]
+
+    try:
+        return ast.literal_eval(expr)
+    except (SyntaxError, ValueError):
+        pass
+
+    raise ValueError(f"Unsupported JSONata expression: {expr}")
+
+
+def _truthy(value):
+    """JSONata truthiness: null/false/0/empty string/empty array/empty object are falsy."""
+    if value is None or value is False:
+        return False
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and value == 0:
+        return False
+    if isinstance(value, (str, list, dict)) and len(value) == 0:
+        return False
+    return True
+
+
+def _apply_binary_op(op, left, right):
+    try:
+        if op == "=":
+            return left == right
+        if op == "!=":
+            return left != right
+        if op == "<":
+            return left < right
+        if op == "<=":
+            return left <= right
+        if op == ">":
+            return left > right
+        if op == ">=":
+            return left >= right
+        if op == "+":
+            return left + right
+        if op == "-":
+            return left - right
+        if op == "&":
+            return _jsonata_string(left) + _jsonata_string(right)
+        if op == "*":
+            return left * right
+        if op == "/":
+            if right == 0:
+                raise ValueError("Division by zero")
+            return left / right
+        if op == "%":
+            if right == 0:
+                raise ValueError("Modulo by zero")
+            return left % right
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Operator '{op}' failed: {exc}")
+    raise ValueError(f"Unknown operator: {op}")
+
+
+def _jsonata_merge(args):
+    if not isinstance(args, list):
+        raise ValueError("$merge expects an array")
+    merged = {}
+    for item in args:
+        if isinstance(item, dict):
+            merged.update(item)
+    return merged
+
+
+def _jsonata_count(arg):
+    if arg is None:
+        return 0
+    if isinstance(arg, list):
+        return len(arg)
+    return 1
+
+
+def _jsonata_length(arg):
+    if not isinstance(arg, str):
+        raise ValueError("$length expects a string")
+    return len(arg)
+
+
+def _jsonata_not(arg):
+    return not _truthy(arg)
+
+
+def _jsonata_string(arg):
+    if arg is None:
+        return ""
+    if isinstance(arg, bool):
+        return "true" if arg else "false"
+    if isinstance(arg, (dict, list)):
+        return json.dumps(arg)
+    return str(arg)
+
+
+def _jsonata_number(arg):
+    if isinstance(arg, bool):
+        raise ValueError("$number cannot coerce boolean")
+    if isinstance(arg, (int, float)):
+        return arg
+    if isinstance(arg, str):
+        try:
+            return int(arg)
+        except ValueError:
+            return float(arg)
+    raise ValueError(f"$number cannot coerce {type(arg).__name__}")
+
+
+def _find_top_level_any_op(text, ops, keyword=False):
+    """Return (position, op) of the rightmost top-level occurrence of any op in ops.
+
+    `ops` is tried longest-first at each candidate position so e.g. `<=` wins
+    over `<`. For left-associative operators this returns the rightmost match,
+    which the caller splits on — yielding standard left-assoc evaluation when
+    the resulting left-hand side is recursed into.
+    """
+    ops_sorted = sorted(ops, key=len, reverse=True)
+    found = []
+    for idx, _ in _iter_top_level_chars(text):
+        for op in ops_sorted:
+            if not text.startswith(op, idx):
+                continue
+            if not _op_disambiguation_ok(text, idx, op, keyword):
+                continue
+            found.append((idx, op))
+            break
+    if not found:
+        return -1, None
+    return found[-1]
+
+
+def _op_disambiguation_ok(text, idx, op, keyword):
+    """Reject overlapping/ambiguous matches: `=` inside `!=`/`<=`/`>=`/`==`,
+    `<` / `>` inside `<=` / `>=`, leading-`-` as unary minus, and keyword ops
+    that aren't whitespace-bounded (so `or` in `$states.input.order` is skipped).
+    """
+    if keyword:
+        prev_ch = text[idx - 1] if idx > 0 else " "
+        next_idx = idx + len(op)
+        next_ch = text[next_idx] if next_idx < len(text) else " "
+        if not prev_ch.isspace():
+            return False
+        if not next_ch.isspace():
+            return False
+        return True
+    if op == "=":
+        prev_ch = text[idx - 1] if idx > 0 else ""
+        next_ch = text[idx + 1] if idx + 1 < len(text) else ""
+        if prev_ch in ("!", "<", ">", "="):
+            return False
+        if next_ch == "=":
+            return False
+    elif op in ("<", ">"):
+        next_ch = text[idx + 1] if idx + 1 < len(text) else ""
+        if next_ch == "=":
+            return False
+    elif op == "-":
+        # Treat `-` as unary when it's at the start or follows another operator /
+        # opening bracket. Only count it as binary subtract when the preceding
+        # non-space char is an operand terminator.
+        prev_idx = idx - 1
+        while prev_idx >= 0 and text[prev_idx] == " ":
+            prev_idx -= 1
+        if prev_idx < 0:
+            return False
+        prev_ch = text[prev_idx]
+        if not (prev_ch.isalnum() or prev_ch in "_)]}\"'"):
+            return False
+    elif op == "+":
+        prev_idx = idx - 1
+        while prev_idx >= 0 and text[prev_idx] == " ":
+            prev_idx -= 1
+        if prev_idx < 0:
+            return False
+        prev_ch = text[prev_idx]
+        if not (prev_ch.isalnum() or prev_ch in "_)]}\"'"):
+            return False
+    return True
+
+
+def _is_balanced_outer(expr, open_ch, close_ch):
+    """True when the outer pair of brackets in `expr` matches each other —
+    i.e. `(a)(b)` returns False, `(a + (b))` returns True. Quote-aware so
+    brackets inside string literals don't count.
+    """
+    depth = 0
+    in_quote = None
+    escape = False
+    for i, ch in enumerate(expr):
+        if in_quote:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == in_quote:
+                in_quote = None
+            continue
+        if ch in ("'", '"'):
+            in_quote = ch
+            continue
+        if ch == open_ch:
+            depth += 1
+        elif ch == close_ch:
+            depth -= 1
+            if depth == 0 and i < len(expr) - 1:
+                return False
+    return depth == 0
+
+
+def _resolve_jsonata_states_path(expr, states):
+    suffix = expr[len("$states."):]
+    root, _, rest = suffix.partition(".")
+    if root not in states:
+        raise ValueError(f"Unsupported $states field: {root}")
+    current = states[root]
+    if not rest:
+        return current
+    return _resolve_dotted_path(rest, current)
+
+
+def _resolve_dotted_path(path, data):
+    current = data
+    for raw_part in path.split("."):
+        part = raw_part
+        while part:
+            match = re.match(r"([A-Za-z_][A-Za-z0-9_]*)(?:\[(\d+)])?(.*)", part)
+            if not match:
+                raise ValueError(f"Unsupported JSONata path segment: {raw_part}")
+            field, idx, part = match.groups()
+            if isinstance(current, dict) and field in current:
+                current = current[field]
+            else:
+                return None
+            if idx is not None:
+                if isinstance(current, list) and int(idx) < len(current):
+                    current = current[int(idx)]
+                else:
+                    return None
+    return current
+
+
+def _split_object_member(member):
+    for idx, ch in _iter_top_level_chars(member):
+        if ch == ":":
+            return member[:idx], member[idx + 1:]
+    raise ValueError(f"Invalid JSONata object member: {member}")
+
+
+def _split_top_level(text, separator):
+    parts = []
+    start = 0
+    for idx, ch in _iter_top_level_chars(text):
+        if ch == separator:
+            parts.append(text[start:idx].strip())
+            start = idx + 1
+    parts.append(text[start:].strip())
+    return parts
+
+
+def _find_top_level_token(text, token):
+    for idx, ch in _iter_top_level_chars(text):
+        if text.startswith(token, idx):
+            if token == "=":
+                prev_ch = text[idx - 1] if idx > 0 else ""
+                next_ch = text[idx + 1] if idx + 1 < len(text) else ""
+                if prev_ch in ("!", "<", ">", "=") or next_ch == "=":
+                    continue
+            return idx
+    return -1
+
+
+def _find_matching_ternary_colon(text, question_pos):
+    nested = 0
+    for idx, ch in _iter_top_level_chars(text[question_pos + 1:]):
+        real_idx = question_pos + 1 + idx
+        if ch == "?":
+            nested += 1
+        elif ch == ":":
+            if nested == 0:
+                return real_idx
+            nested -= 1
+    return -1
+
+
+def _iter_top_level_chars(text):
+    depth = 0
+    quote = None
+    escape = False
+    for idx, ch in enumerate(text):
+        if quote:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == quote:
+                quote = None
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+            continue
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+        elif depth == 0:
+            yield idx, ch
 
 
 def _resolve_path(path, data):
@@ -2388,7 +3092,6 @@ _AWS_SDK_SERVICE_MAP = {
     "rdsdata": {"protocol": "rest-json", "service_key": "rds-data"},
     # REST-XML services: per-op path templates, header/querystring routing, XML responses
     "s3": {"protocol": "rest-xml", "service_key": "s3"},
-    # REST services (not yet supported via aws-sdk dispatcher)
     "lambda": {"protocol": "rest"},
 }
 
@@ -3024,6 +3727,102 @@ def _dispatch_aws_sdk_rest_json(service_info, service_name, action, input_data):
     return _convert_keys_to_sfn_convention(result)
 
 
+def _dispatch_aws_sdk_lambda_rest(service_info, service_name, action, input_data):
+    """Dispatch the Lambda REST aws-sdk calls needed by Step Functions workflows."""
+    from urllib.parse import quote
+
+    from ministack import app
+
+    service_key = service_info.get("service_key", service_name)
+    handler = app.SERVICE_HANDLERS.get(service_key)
+    if not handler:
+        raise _ExecutionError(
+            "States.Runtime",
+            f"Service '{service_key}' is not available in MiniStack",
+        )
+
+    pascal_action = action[0].upper() + action[1:] if action else action
+    input_data = input_data or {}
+    query_params = {}
+
+    if pascal_action == "GetAlias":
+        function_name = input_data.get("FunctionName", "")
+        alias_name = input_data.get("Name", "")
+        path = (
+            "/2015-03-31/functions/"
+            f"{quote(str(function_name), safe=':')}/aliases/{quote(str(alias_name), safe='')}"
+        )
+    elif pascal_action == "GetFunctionConfiguration":
+        function_name = input_data.get("FunctionName", "")
+        path = f"/2015-03-31/functions/{quote(str(function_name), safe=':')}/configuration"
+        qualifier = input_data.get("Qualifier")
+        if qualifier is not None:
+            query_params["Qualifier"] = str(qualifier)
+    else:
+        raise _ExecutionError(
+            "States.Runtime",
+            f"aws-sdk:{service_name}:{action} is not yet implemented in MiniStack "
+            "(lambda REST dispatcher covers getAlias and getFunctionConfiguration)",
+        )
+
+    # Embed the current SFN execution's account ID as the access-key segment
+    # of the synthetic Authorization header so the called handler resolves to
+    # the same account the execution is running in. Hardcoding "test" here
+    # would force every aws-sdk:lambda call into the default account and break
+    # any non-default-account caller. ``app.py`` parses the credential scope
+    # and only treats a 12-digit access key as an account override, so a
+    # default-account caller still resolves correctly.
+    caller_account = get_account_id()
+    headers = {
+        "content-type": "application/json",
+        "host": f"{service_key}.{get_region()}.amazonaws.com",
+        "authorization": (
+            f"AWS4-HMAC-SHA256 Credential={caller_account}/20260101/"
+            f"{get_region()}/{service_key}/aws4_request"
+        ),
+    }
+
+    # Drive the async handler synchronously. SFN state execution runs inside
+    # the request's event loop, so spawning a fresh loop here would raise
+    # "Cannot run the event loop while another loop is running". The Lambda
+    # REST handlers we dispatch to (GetAlias, GetFunctionConfiguration) only
+    # touch in-memory dicts and never await, so a single ``coro.send(None)``
+    # completes via ``StopIteration`` with the response tuple.
+    coro = handler("GET", path, headers, b"", query_params)
+    try:
+        coro.send(None)
+    except StopIteration as stop:
+        status, resp_headers, resp_body = stop.value
+    else:
+        # Fallback for an async handler that does await — extremely rare on
+        # this dispatch surface, but guard so we don't return None silently.
+        coro.close()
+        raise _ExecutionError(
+            "States.Runtime",
+            f"aws-sdk:{service_name}:{action} handler awaited unexpectedly; "
+            "cannot drive from sync SFN executor",
+        )
+
+    decoded = resp_body.decode("utf-8") if isinstance(resp_body, bytes) else resp_body
+    if status >= 400:
+        try:
+            err_data = json.loads(decoded)
+            code = err_data.get("__type") or err_data.get("code") or "ServiceException"
+            msg = err_data.get("message") or err_data.get("Message") or decoded
+            raise _ExecutionError(_prefix_sdk_error(service_name, code), msg)
+        except _ExecutionError:
+            raise
+        except Exception:
+            raise _ExecutionError(_prefix_sdk_error(service_name, "ServiceException"), decoded)
+
+    try:
+        result = json.loads(decoded) if decoded else {}
+    except (json.JSONDecodeError, TypeError):
+        return decoded
+
+    return _convert_keys_to_sfn_convention(result)
+
+
 # ---------------------------------------------------------------------------
 # REST-XML aws-sdk dispatch (S3)
 # ---------------------------------------------------------------------------
@@ -3377,6 +4176,8 @@ def _invoke_aws_sdk_integration(resource, input_data):
         return _dispatch_aws_sdk_rest_json(service_info, service_name, action, input_data)
     elif protocol == "rest-xml":
         return _dispatch_aws_sdk_rest_xml(service_info, service_name, action, input_data)
+    elif protocol == "rest" and service_name == "lambda":
+        return _dispatch_aws_sdk_lambda_rest(service_info, service_name, action, input_data)
     else:
         raise _ExecutionError(
             "States.Runtime",

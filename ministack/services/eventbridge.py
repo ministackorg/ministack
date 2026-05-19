@@ -20,9 +20,9 @@ Supports: CreateEventBus, UpdateEventBus, DeleteEventBus, ListEventBuses, Descri
           ListEventSources, PutPartnerEvents.
 """
 
+import calendar
 import copy
 import fnmatch
-import calendar
 import hashlib
 import json
 import logging
@@ -945,6 +945,8 @@ def _invoke_target(target, event, rule):
             _dispatch_to_sqs(arn, event_payload, target.get("SqsParameters") or {})
         elif ":sns:" in arn:
             _dispatch_to_sns(arn, event_payload)
+        elif ":states:" in arn:
+            _dispatch_to_stepfunctions(arn, event_payload)
         else:
             logger.warning("EventBridge: unsupported target type for ARN %s", arn)
     except Exception as e:
@@ -1091,6 +1093,25 @@ def _dispatch_to_sns(arn, payload):
     })
     _sns._fanout(arn, msg_id, payload, "EventBridge Notification")
     logger.info("EventBridge → SNS %s", arn)
+
+
+def _dispatch_to_stepfunctions(arn, payload):
+    from ministack.services import stepfunctions as _sfn
+
+    # Accept all three SFN target ARN shapes EventBridge supports in real
+    # AWS: base state machine, published version, and alias. The resolver
+    # walks all three stores; ``None`` means the target ARN doesn't match
+    # any state machine the caller's account can see.
+    if _sfn._resolve_state_machine_arn(arn) is None:
+        logger.warning("EventBridge → Step Functions: state machine %s not found", arn)
+        return
+
+    sm_name = arn.rsplit(":", 1)[-1]
+    _sfn._start_execution({
+        "stateMachineArn": arn,
+        "input": payload,
+    })
+    logger.info("EventBridge → Step Functions %s: dispatched", sm_name)
 
 
 # ---------------------------------------------------------------------------

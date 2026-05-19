@@ -124,6 +124,17 @@ SERVICE_PATTERNS = {
         "target_prefixes": ["AmazonAthena"],
         "host_patterns": [r"athena\."],
     },
+    "airflow": {
+        "host_patterns": [r"airflow\."],
+        "path_patterns": [
+            r"^/environments",
+            r"^/webtoken/",
+            r"^/clitoken/",
+            r"^/restapi/",
+            r"^/metrics/environments/",
+        ],
+        "credential_scope": "airflow",
+    },
     "firehose": {
         "target_prefixes": ["Firehose_20150804"],
         "host_patterns": [r"firehose\.", r"kinesis-firehose\."],
@@ -252,6 +263,30 @@ SERVICE_PATTERNS = {
         "target_prefixes": ["TransferService"],
         "host_patterns": [r"transfer\."],
         "credential_scope": "transfer",
+    },
+    # IoT data plane (iot-data API) MUST come before "iot" because the host
+    # `data-ats.iot.{region}.{host}` matches both `iot\.` and the more
+    # specific `data-ats\.iot\.` regexes — first-match-wins routing in
+    # detect_service() means we want iot-data to win for data plane traffic.
+    "iot-data": {
+        "host_patterns": [r"data-ats\.iot\.", r"data\.iot\."],
+        "credential_scope": "iotdata",
+        "path_prefixes": ["/topics/", "/retainedMessage"],
+    },
+    "iot": {
+        "host_patterns": [r"iot\."],
+        "credential_scope": "iot",
+        "path_prefixes": [
+            "/things",
+            "/thing-types",
+            "/thing-groups",
+            "/policies",
+            "/certificates",
+            "/keys-and-certificate",
+            "/principals",
+            "/endpoint",
+            "/target-policies",
+        ],
     },
     "appsync": {
         "host_patterns": [r"appsync\."],
@@ -402,6 +437,9 @@ def detect_service(method: str, path: str, headers: dict, query_params: dict) ->
                 "cloudfront": "cloudfront",
                 "codebuild": "codebuild",
                 "transfer": "transfer",
+                "iot": "iot",
+                "iotdata": "iot-data",
+                "iotdevicegateway": "iot-data",
                 "appsync": "appsync",
                 "servicediscovery": "servicediscovery",
                 "s3files": "s3files",
@@ -770,6 +808,8 @@ def detect_service(method: str, path: str, headers: dict, query_params: dict) ->
     # 4. Check URL path patterns
     path_lower = path.lower()
     if path_lower.startswith("/latest/"):
+        return "imds"
+    if path_lower.startswith("/v2/credentials"):
         return "imds"
     if path_lower.startswith("/v1/apis") or path_lower.startswith("/v1/tags/arn:aws:appsync"):
         return "appsync"

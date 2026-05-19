@@ -35,7 +35,7 @@ jobs:
 
       - name: Start MiniStack
         run: |
-          REDIS_HOST=localhost python -m hypercorn ministack.app:app --bind 0.0.0.0:4566 --keep-alive 75 &
+          REDIS_HOST=localhost python -m hypercorn ministack.app:app --bind 0.0.0.0:4566 --keep-alive 75 > ministack.log 2>&1 &
           sleep 3
           curl -sf http://localhost:4566/_ministack/health
 
@@ -44,3 +44,10 @@ jobs:
 
       - name: Run tests (serial global-state set)
         run: pytest tests/ -v --tb=short -m "serial"
+
+      - name: Upload MiniStack log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ministack.log
+          path: ministack.log

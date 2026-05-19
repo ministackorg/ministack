@@ -40,6 +40,57 @@ _EXECUTE_API_RE = re.compile(
 )
 # AppSync Events realtime WebSocket: {apiId}.appsync-realtime-api.<anything>[:port].
 _APPSYNC_REALTIME_RE = re.compile(r"^([a-z0-9]+)\.appsync-realtime-api\.")
+# IoT data plane WebSocket: anything containing ".iot." in the host header.
+# Match AWS-shaped IoT hosts only — `iot.<region>.<host>`,
+# `data-ats.iot.<region>.<host>`, `data.iot.<region>.<host>`, and the
+# account-prefixed endpoint returned by DescribeEndpoint
+# (`<prefix>.iot.<region>.<host>`). Anchored at a host-segment boundary
+# (start-of-host or after a dot) so custom domains that happen to contain
+# `.iot.` as a substring (e.g. an S3 bucket `mybucket.iot.example.com`) are
+# not misrouted into the MQTT WebSocket handler.
+_IOT_DATA_WS_RE = re.compile(r"(^|\.)iot\.[a-z0-9-]+\.")
+
+
+def _ws_has_mqtt_subprotocol(ws_headers: dict) -> bool:
+    """Check whether the upgrade request advertises an ``mqtt`` subprotocol."""
+    raw = ws_headers.get("sec-websocket-protocol", "")
+    for proto in (p.strip().lower() for p in raw.split(",") if p.strip()):
+        if proto in ("mqtt", "mqttv3.1", "mqttv5"):
+            return True
+    return False
+
+
+def _ws_resolve_iot_account_id(scope: dict, ws_headers: dict) -> str:
+    """Pick the account ID for an inbound IoT WebSocket upgrade.
+
+    Resolution order:
+
+    1. ``X-Amz-Credential`` query parameter (SigV4-signed WS) — extract the
+       access key portion. If it's a 12-digit number, use it as the account.
+    2. ``Authorization: AWS4-HMAC-SHA256`` header — same extraction.
+    3. Fall back to ``MINISTACK_ACCOUNT_ID`` / ``000000000000``.
+
+    SigV4 signature *verification* is intentionally lax (any
+    well-formed credential is accepted); IoT policy enforcement is not yet
+    feature. The point here is multi-tenancy isolation, not auth.
+    """
+    qs = scope.get("query_string", b"").decode("utf-8", errors="replace")
+    qp = parse_qs(qs, keep_blank_values=True) if qs else {}
+
+    cred = ""
+    raw = qp.get("X-Amz-Credential") or qp.get("x-amz-credential")
+    if raw:
+        cred = raw[0] if isinstance(raw, list) else raw
+    if not cred:
+        auth = ws_headers.get("authorization", "")
+        m = re.search(r"Credential=([^,/]+)/", auth)
+        if m:
+            cred = m.group(1)
+
+    access_key = cred.split("/", 1)[0] if cred else ""
+    if access_key and re.match(r"^\d{12}$", access_key):
+        return access_key
+    return os.environ.get("MINISTACK_ACCOUNT_ID", "000000000000")
 # Virtual-hosted S3 bucket extraction. AWS-aligned per
 # docs.aws.amazon.com/AmazonS3/latest/userguide/VirtualHosting.html and
 # bucketnamingrules.html (HTTP vhost — ministack is HTTP). Works for any
@@ -84,7 +135,7 @@ def _extract_s3_vhost_bucket(host: str):
     if first_tail_segment == "s3" or first_tail_segment.startswith(("s3-", "s3express-")):
         return candidate
     return None
-_S3_VHOST_EXCLUDE_RE = re.compile(r"\.(execute-api|alb|emr|efs|elasticache|s3-control|appsync-api|appsync-realtime-api)\.")
+_S3_VHOST_EXCLUDE_RE = re.compile(r"\.(execute-api|alb|emr|efs|elasticache|s3-control|appsync-api|appsync-realtime-api|iot)\.")
 _HEALTH_PATHS = ("/_ministack/health", "/_localstack/health", "/health")
 _BODY_METHODS = ("POST", "PUT", "PATCH")
 _COGNITO_USERINFO_PATHS = ("/oauth2/userInfo", "/oauth2/userinfo")
@@ -95,7 +146,7 @@ _ALB_PATH_PREFIX = "/_alb/"
 _NON_S3_VHOST_NAMES = frozenset({
     "s3", "s3-control", "sqs", "sns", "dynamodb", "lambda", "iam", "sts",
     "secretsmanager", "logs", "ssm", "events", "kinesis", "monitoring", "ses",
-    "states", "ecs", "rds", "rds-data", "elasticache", "glue", "athena",
+    "states", "ecs", "rds", "rds-data", "elasticache", "glue", "athena", "airflow",
     "apigateway", "cloudformation", "autoscaling", "codebuild", "transfer", "cur",
     "cloudfront-kvs",
     "appsync-api", "appsync-realtime-api",
@@ -222,8 +273,11 @@ SERVICE_REGISTRY = {
     "events": {"module": "eventbridge", "aliases": ("eventbridge",)},
     "firehose": {"module": "firehose", "aliases": ("kinesis-firehose",)},
     "glue": {"module": "glue"},
+    "airflow": {"module": "mwaa", "aliases": ("mwaa",)},
     "iam": {"module": "iam"},
     "imds": {"module": "imds"},
+    "iot": {"module": "iot"},
+    "iot-data": {"module": "iot_data"},
     "kinesis": {"module": "kinesis"},
     "kms": {"module": "kms"},
     "lambda": {"module": "lambda_svc"},
@@ -277,7 +331,7 @@ _state_map = {
     "elasticache": "elasticache", "appsync": "appsync",
     "appsync_events": "appsync_events",
     "stepfunctions": "stepfunctions", "alb": "alb",
-    "glue": "glue", "efs": "efs", "waf": "waf",
+    "glue": "glue", "mwaa": "mwaa", "efs": "efs", "waf": "waf",
     "athena": "athena", "emr": "emr", "cloudfront": "cloudfront",
     "codebuild": "codebuild", "acm": "acm", "firehose": "firehose",
     "ses": "ses", "ses_v2": "ses_v2",
@@ -287,7 +341,7 @@ _state_map = {
     "eks": "eks", "backup": "backup", "pipes": "pipes",
     "cloudfront_keyvaluestore": "cloudfront_keyvaluestore",
     "resource_groups": "resource_groups",
-    "cloudtrail": "cloudtrail",
+    "cloudtrail": "cloudtrail", "iot": "iot",
 }
 
 SERVICE_NAME_ALIASES = {
@@ -331,7 +385,8 @@ BANNER = r"""
           SSM, EventBridge, Kinesis, CloudWatch, SES, SES v2, ACM, WAF v2, Step Functions,
           ECS, RDS, ElastiCache, Glue, Athena, API Gateway, Firehose, Route53,
           Cognito, EC2, EMR, EBS, EFS, ALB/ELBv2, CloudFormation, KMS, ECR, CloudFront,
-          AppSync, Cloud Map, S3 Files, RDS Data API, CodeBuild, AppConfig, Transfer, EKS
+          AppSync, Cloud Map, S3 Files, RDS Data API, CodeBuild, AppConfig, Transfer, EKS,
+          IoT Core
 """
 
 
@@ -678,7 +733,45 @@ async def _handle_pre_body_request(method: str, path: str, headers: dict, query_
     if response is not None:
         return response
 
+    response = _handle_iot_ca_request(method, path)
+    if response is not None:
+        return response
+
     return await _handle_admin_reset(path, method, query_params)
+
+
+def _handle_iot_ca_request(method: str, path: str):
+    """`GET /_ministack/iot/ca.pem` returns the Local CA root certificate.
+
+    Test code and IoT SDKs use this to configure trust for mTLS connections
+    to the local broker. The CA is generated lazily on first call.
+    """
+    if path != "/_ministack/iot/ca.pem" or method != "GET":
+        return None
+    try:
+        from ministack.services import iot
+
+        cert_pem = iot.get_ca_cert_pem()
+    except RuntimeError as e:
+        return (
+            503,
+            {"Content-Type": "application/json"},
+            json.dumps({"message": str(e)}).encode(),
+        )
+    except Exception as e:
+        return (
+            500,
+            {"Content-Type": "application/json"},
+            json.dumps({"message": str(e)}).encode(),
+        )
+    return (
+        200,
+        {
+            "Content-Type": "application/x-pem-file",
+            "Content-Disposition": "attachment; filename=\"ministack-iot-ca.pem\"",
+        },
+        cert_pem.encode("utf-8"),
+    )
 
 
 def _handle_transfer_sftp_ports_request(method: str, path: str):
@@ -1096,6 +1189,21 @@ async def _handle_s3_vhost_request(host: str, path: str, method: str, headers: d
     # so guard explicitly here too.
     if path.startswith("/key-value-stores/"):
         return None
+    # MWAA REST endpoints (api.airflow.{region}, env.airflow.{region}) — boto3
+    # expands the model's hostPrefix even when endpoint_url is overridden, so
+    # the host arrives as `api.localhost:4566`, and `api` looks like an S3
+    # bucket. Short-circuit any path that matches a real MWAA operation:
+    #   /environments, /environments/{Name}, /webtoken/{Name},
+    #   /clitoken/{Name}, /restapi/{Name}, /metrics/environments/{Name}
+    if (
+        path == "/environments"
+        or path.startswith("/environments/")
+        or path.startswith("/webtoken/")
+        or path.startswith("/clitoken/")
+        or path.startswith("/restapi/")
+        or path.startswith("/metrics/environments/")
+    ):
+        return None
 
     vhost_path = "/" + bucket + path if path != "/" else "/" + bucket + "/"
     try:
@@ -1425,7 +1533,8 @@ async def app(scope, receive, send):
         ws_path = scope.get("path", "")
         parsed = _parse_execute_api_url(ws_host, ws_path)
         appsync_rt_m = _APPSYNC_REALTIME_RE.match(ws_host)
-        if not parsed and not appsync_rt_m:
+        iot_ws_m = _IOT_DATA_WS_RE.search(ws_host) and _ws_has_mqtt_subprotocol(ws_headers)
+        if not parsed and not appsync_rt_m and not iot_ws_m:
             msg = await receive()
             if msg.get("type") == "websocket.connect":
                 await send({"type": "websocket.close", "code": 1008})
@@ -1436,9 +1545,16 @@ async def app(scope, receive, send):
                 await _get_module("apigateway").handle_websocket(
                     scope, receive, send, ws_api_id, path_override=_execute_path,
                 )
-            else:
+            elif appsync_rt_m:
                 await _get_module("appsync_events").handle_websocket(
                     scope, receive, send, appsync_rt_m.group(1)
+                )
+            else:
+                # IoT MQTT-over-WS — resolve account_id from SigV4 query
+                # params or Authorization header, fall back to default.
+                account_id = _ws_resolve_iot_account_id(scope, ws_headers)
+                await _get_module("iot").handle_websocket(
+                    scope, receive, send, account_id
                 )
         except Exception:
             logger.exception("Error in WebSocket dispatch")
@@ -1539,14 +1655,21 @@ async def _handle_lifespan(scope, receive, send):
                 _load_persisted_state()
             # Start the Transfer Family SFTP listener after persistence is
             # loaded (so any restored Transfer servers/users are visible to
-            # the SSH auth callback). Cheap no-op if asyncssh isn't
-            # installed or SFTP_ENABLED=0.
-            try:
-                from ministack.services import transfer
+            # the SSH auth callback). When the user opts out via
+            # SFTP_ENABLED=0 we skip importing the transfer module entirely
+            # — its top-level `import asyncssh` pulls cryptography+OpenSSL
+            # (~2–4 MiB of heap, plus C-level SSL contexts) which is pure
+            # overhead for callers that aren't using Transfer Family.
+            _sftp_env = os.environ.get("SFTP_ENABLED", "").strip().lower()
+            if _sftp_env in ("0", "false", "no", "off"):
+                logger.debug("SFTP_ENABLED=%s — skipping transfer module import.", _sftp_env)
+            else:
+                try:
+                    from ministack.services import transfer
 
-                await transfer.sftp_start()
-            except Exception as e:
-                logger.warning("Transfer SFTP startup failed: %s", e)
+                    await transfer.sftp_start()
+                except Exception as e:
+                    logger.warning("Transfer SFTP startup failed: %s", e)
             # Start the EventBridge scheduler daemon explicitly. Module-import
             # autostart is gated by MINISTACK_TEST_NO_AUTOSTART so unit tests
             # don't race; lifespan.startup is the canonical place to spin it up.
@@ -1585,7 +1708,17 @@ async def _handle_lifespan(scope, receive, send):
 
 def _stop_docker_containers():
     """Stop all Docker containers managed by MiniStack (RDS, ECS, ElastiCache).
-    Uses container labels to find them — does not touch service state."""
+    Uses container labels to find them — does not touch service state.
+
+    Skip entirely if no Docker socket is available: importing the docker
+    SDK (and its requests/urllib3/idna transitive deps) costs ~1 MiB of
+    Python heap before we even know whether there's anything to clean.
+    """
+    sock = os.environ.get("DOCKER_HOST") or "unix:///var/run/docker.sock"
+    if sock.startswith("unix://"):
+        sock_path = sock[len("unix://"):]
+        if not os.path.exists(sock_path):
+            return
     try:
         import docker
 
@@ -1923,6 +2056,14 @@ def main():
         config.bind = [f"{bind_host}:{port}"]
         config.keep_alive_timeout = 75
         config.loglevel = LOG_LEVEL.upper()
+
+        # USE_SSL=1 enables HTTPS — matches the behaviour previously provided
+        # by ministack/core/hypercorn_conf.py when the entrypoint was the
+        # hypercorn CLI. Self-signed cert auto-generated under TMPDIR, or BYO
+        # via MINISTACK_SSL_CERT + MINISTACK_SSL_KEY.
+        from ministack.core import tls as _tls
+        if _tls.use_ssl_enabled():
+            config.certfile, config.keyfile = _tls.resolve_tls_material()
 
         asyncio.run(hypercorn_serve(app, config))
     finally:

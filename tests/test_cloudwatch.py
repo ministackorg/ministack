@@ -411,6 +411,96 @@ def test_cloudwatch_enable_alarm_actions(cw):
     cw.delete_alarms(AlarmNames=["heimdall-enable-actions"])
 
 
+def test_cloudwatch_alarm_actions_publish_to_sns(cw, sns, sqs):
+    """AlarmActions/OKActions: state transition fans out to the SNS topic.
+
+    Subscribes an SQS queue to a topic, sets that topic ARN as the alarm's
+    AlarmActions + OKActions, flips state ALARM → OK, and asserts the SQS
+    queue received both notifications with the AWS-shaped JSON payload.
+    """
+    topic_arn = sns.create_topic(Name="cw-alarm-actions-topic")["TopicArn"]
+    queue_url = sqs.create_queue(QueueName="cw-alarm-actions-q")["QueueUrl"]
+    queue_arn = sqs.get_queue_attributes(
+        QueueUrl=queue_url, AttributeNames=["QueueArn"]
+    )["Attributes"]["QueueArn"]
+    sns.subscribe(TopicArn=topic_arn, Protocol="sqs", Endpoint=queue_arn)
+
+    cw.put_metric_alarm(
+        AlarmName="cw-actions-fanout",
+        MetricName="M",
+        Namespace="N",
+        Statistic="Sum",
+        Period=60,
+        EvaluationPeriods=1,
+        Threshold=1.0,
+        ComparisonOperator="GreaterThanThreshold",
+        ActionsEnabled=True,
+        AlarmActions=[topic_arn],
+        OKActions=[topic_arn],
+    )
+
+    cw.set_alarm_state(
+        AlarmName="cw-actions-fanout",
+        StateValue="ALARM",
+        StateReason="forced",
+    )
+    cw.set_alarm_state(
+        AlarmName="cw-actions-fanout",
+        StateValue="OK",
+        StateReason="recovered",
+    )
+
+    seen_states = set()
+    deadline = time.time() + 5
+    while time.time() < deadline and len(seen_states) < 2:
+        msgs = sqs.receive_message(
+            QueueUrl=queue_url, MaxNumberOfMessages=10, WaitTimeSeconds=1,
+        ).get("Messages", [])
+        for m in msgs:
+            envelope = json.loads(m["Body"])
+            payload = json.loads(envelope["Message"])
+            seen_states.add(payload["NewStateValue"])
+            assert payload["AlarmName"] == "cw-actions-fanout"
+            assert payload["Trigger"]["MetricName"] == "M"
+            sqs.delete_message(QueueUrl=queue_url, ReceiptHandle=m["ReceiptHandle"])
+    assert seen_states == {"ALARM", "OK"}, f"got states: {seen_states}"
+    cw.delete_alarms(AlarmNames=["cw-actions-fanout"])
+
+
+def test_cloudwatch_alarm_actions_disabled_does_not_publish(cw, sns, sqs):
+    """ActionsEnabled=False suppresses dispatch even on state transition."""
+    topic_arn = sns.create_topic(Name="cw-alarm-disabled-topic")["TopicArn"]
+    queue_url = sqs.create_queue(QueueName="cw-alarm-disabled-q")["QueueUrl"]
+    queue_arn = sqs.get_queue_attributes(
+        QueueUrl=queue_url, AttributeNames=["QueueArn"]
+    )["Attributes"]["QueueArn"]
+    sns.subscribe(TopicArn=topic_arn, Protocol="sqs", Endpoint=queue_arn)
+
+    cw.put_metric_alarm(
+        AlarmName="cw-actions-disabled",
+        MetricName="M",
+        Namespace="N",
+        Statistic="Sum",
+        Period=60,
+        EvaluationPeriods=1,
+        Threshold=1.0,
+        ComparisonOperator="GreaterThanThreshold",
+        ActionsEnabled=False,
+        AlarmActions=[topic_arn],
+    )
+    cw.set_alarm_state(
+        AlarmName="cw-actions-disabled",
+        StateValue="ALARM",
+        StateReason="forced",
+    )
+    time.sleep(0.5)
+    msgs = sqs.receive_message(
+        QueueUrl=queue_url, MaxNumberOfMessages=10, WaitTimeSeconds=1,
+    ).get("Messages", [])
+    assert msgs == []
+    cw.delete_alarms(AlarmNames=["cw-actions-disabled"])
+
+
 def test_cloudwatch_disable_alarm_actions(cw):
     cw.put_metric_alarm(
         AlarmName="heimdall-disable-actions",

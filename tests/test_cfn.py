@@ -3056,3 +3056,32 @@ def test_cfn_apigateway_authorizer_provisions(cfn):
 
     cfn.delete_stack(StackName=stack_name)
     _wait_stack(cfn, stack_name)
+
+
+def test_cfn_apigateway_account_provisions(cfn, apigw_v1):
+    """AWS::ApiGateway::Account is the CDK ``cloudWatchRole: true`` resource.
+    Without a registered handler, stacks fail with ``Unsupported resource
+    type: AWS::ApiGateway::Account``. We persist the CloudWatchRoleArn into
+    the same store the runtime GetAccount API reads from, so the value round-
+    trips end-to-end. Regression for issue #657.
+    """
+    stack_name = f"intg-cfn-apigw-account-{_uuid_mod.uuid4().hex[:8]}"
+    role_arn = f"arn:aws:iam::000000000000:role/cfn-apigw-cw-{_uuid_mod.uuid4().hex[:6]}"
+    template = {
+        "Resources": {
+            "Account": {
+                "Type": "AWS::ApiGateway::Account",
+                "Properties": {"CloudWatchRoleArn": role_arn},
+            },
+        },
+    }
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(template))
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "CREATE_COMPLETE"
+
+    # GetAccount must reflect the role arn the stack just set.
+    settings = apigw_v1.get_account()
+    assert settings.get("cloudwatchRoleArn") == role_arn
+
+    cfn.delete_stack(StackName=stack_name)
+    _wait_stack(cfn, stack_name)
