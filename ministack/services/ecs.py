@@ -934,7 +934,8 @@ def _docker_binds_from_taskdef(td, cdef):
 
 
 def _build_run_kwargs(cdef, td, env, port_bindings, ecs_network,
-                      host_mode, task_id, task_arn, ministack_net_ip):
+                      host_mode, task_id, task_arn, ministack_net_ip,
+                      cluster_arn):
     """Build kwargs for docker_client.containers.run from a container
     definition + task definition (privileged, cap_add, pid_mode, networking,
     bind mounts).
@@ -949,7 +950,14 @@ def _build_run_kwargs(cdef, td, env, port_bindings, ecs_network,
         environment=env,
         ports=port_bindings or None,
         name=f"ministack-ecs-{task_id[:8]}-{cdef['name']}",
-        labels={"ministack": "ecs", "task_arn": task_arn},
+        labels={
+            "ministack": "ecs",
+            "com.amazonaws.ecs.cluster": cluster_arn,
+            "com.amazonaws.ecs.container-name": cdef["name"],
+            "com.amazonaws.ecs.task-arn": task_arn,
+            "com.amazonaws.ecs.task-definition-family": td.get("family", ""),
+            "com.amazonaws.ecs.task-definition-version": str(td.get("revision", 1)),
+        },
         command=cdef.get("command"),
         privileged=bool(cdef.get("privileged") or cdef.get("Privileged")),
     )
@@ -1087,6 +1095,7 @@ def _run_task(data):
                 run_kwargs = _build_run_kwargs(
                     cdef, td, env, port_bindings, ecs_network,
                     host_mode, task_id, task_arn, ministack_net_ip,
+                    _clusters[cluster_name]["clusterArn"],
                 )
 
                 try:
