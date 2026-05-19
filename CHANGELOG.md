@@ -7,6 +7,19 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [1.3.44] — 2026-05-19
+
+### Fixed
+- **RDS Data API no longer acknowledges writes through the SQL stub for real containers that are still booting** — when a Docker-backed RDS instance is configured but its container is still bootstrapping, `ExecuteStatement` / `BatchExecuteStatement` previously fell back to the in-memory SQL stub on any connection error and returned a 200 acknowledging `CREATE USER` / `GRANT` statements that never reached MySQL. The fallback now only applies to control-plane-only clusters (no real container). Container-backed clusters whose endpoint can't be reached surface `DatabaseUnavailableException` (HTTP 504, the canonical AWS error code), so callers see the same transient-error shape they'd see against real RDS. Real SQL errors (lock-wait timeout, etc.) still surface as `BadRequestException`, not transient-unavailable. Contributed by @jayjanssen.
+- **`CreateDBInstance` now returns immediately with `DBInstanceStatus="creating"` for Docker-backed instances**, matching real AWS shape — readiness finalisation (authenticated-connection probe, MySQL master-user `GRANT`, transition to `available`, Aurora cluster endpoint sync) runs on a daemon thread with the request's contextvars snapshot so the account-scoped instance lookup hits the right tenant. Previously the create call blocked inline for up to 60s waiting for the database to be reachable. Configurable via `RDS_READINESS_TIMEOUT_S` (default 120s) — fits cold-pull + bootstrap on a typical CI runner without hanging a background thread forever on a broken image.
+- **RDS Aurora MySQL local endpoint and master-user parity** — Aurora cluster endpoints now track the reachable backing DB instance endpoint after cluster members are created, so Lambda containers using `DescribeDBClusters.Endpoint` can connect to MiniStack-backed databases. MySQL and Aurora MySQL containers also grant the configured master username AWS/RDS-like global privileges after the server is reachable, with version-specific dynamic privileges treated as best-effort. Contributed by @jayjanssen.
+
+### Added
+- **Standard AWS ECS Docker labels on `RunTask` containers** — every container MiniStack spawns for an ECS task now carries the five canonical `com.amazonaws.ecs.*` labels real ECS sets (cluster ARN, container-name, task-arn, task-definition-family, task-definition-version), matching the keys and values documented in the AWS ECS container metadata file spec. Lets host-side log shippers, monitoring agents, and `docker ps --filter "label=…"` queries identify containers the same way they would against real ECS. Contributed by @YakirOren.
+- **Step Functions JSONata standard library expanded** — the JSONata evaluator now ships every built-in function called out in the ticket, plus the parity-edge cases AWS/JSONata require: string (`$uppercase`, `$lowercase`, `$substring`, `$trim`, `$contains`, `$split`, `$join`, `$replace`, `$pad`), numeric (`$sum`, `$average`, `$max`, `$min`, `$abs`, `$floor`, `$ceil`, `$round`, `$power`, `$sqrt`, `$formatNumber`), array (`$sort` — including the `function($l, $r){...}` comparator form — `$reverse`, `$distinct`, `$append`), object (`$keys`, `$values`, `$lookup` over both objects and arrays-of-objects, `$exists` distinguishing missing paths from explicit `null` per JSONata spec), type (`$type`, `$boolean` — falsy for arrays of only-falsy values), date/time (`$now()` / `$now(picture)` / `$now(picture, timezone)` with the XPath-3.1 picture-string subset, `$millis`), and utility (`$uuid`, `$base64encode`, `$base64decode`). `$contains`, `$split`, and `$replace` accept JSONata regex literals (`/pattern/flags`), with `$1`/`$&` substitution refs supported in `$replace`. The headline ticket example `"Condition": "{% $exists($states.input.userId) %}"` now routes correctly whether the field is present, explicitly `null`, or missing. Implemented natively in Python with no new runtime dependency. Reported by @youngkwangk.
+
+---
+
 ## [1.3.43] — 2026-05-18
 
 ### Added
@@ -32,10 +45,6 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Changed
 - **Test harness — xdist session-startup reset coordination** — the per-worker `autouse` `reset_server` fixture previously had every xdist worker hit `/_ministack/reset` on session start, so a slower worker's reset could fire after a faster worker had already begun creating fixtures, wiping that state mid-test (most visibly as occasional `list_functions()` empty results in `test_lambda_create_invoke`). The first worker now wins an `O_EXCL` file lock and runs the reset; the others wait briefly for a marker file and skip. Single-process pytest (no xdist) keeps the original behaviour. Removes a class of CI flakes that only reproduced under parallel load.
-
-### Fixed
-- **RDS Data API no longer acknowledges writes through the SQL stub for real containers that are still booting** — Docker-backed RDS instances now wait for an authenticated database connection before reporting `available`, and their parent clusters remain `creating` while member instances are not ready. If an endpoint-backed container still cannot be reached, RDS Data API returns `DatabaseUnavailableException` instead of silently tracking `CREATE USER` / `GRANT` statements in memory. Stub SQL mode remains available for control-plane-only clusters without a real backing container. Contributed by @jayjanssen.
-- **RDS Aurora MySQL local endpoint and master-user parity** — Aurora cluster endpoints now track the reachable backing DB instance endpoint after cluster members are created, so Lambda containers using `DescribeDBClusters.Endpoint` can connect to MiniStack-backed databases. MySQL and Aurora MySQL containers also grant the configured master username AWS/RDS-like global privileges after the server is reachable, with version-specific dynamic privileges treated as best-effort. Contributed by @jayjanssen.
 
 ---
 

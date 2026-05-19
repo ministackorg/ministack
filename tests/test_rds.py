@@ -983,6 +983,46 @@ def test_rds_mysql_master_user_privilege_grants(monkeypatch):
     assert ("FLUSH PRIVILEGES", None) in calls
 
 
+def test_rds_create_db_instance_returns_before_container_is_ready(rds):
+    """CreateDBInstance must return immediately matching real AWS:
+    status=creating now, status=available after the background readiness
+    finalisation flips it.
+
+    Real AWS docs: CreateDBInstance "creates a new DB instance" — the
+    response is the freshly-created record with `DBInstanceStatus=creating`,
+    not a blocking wait until provisioning completes.
+    """
+    iid = f"intg-rds-nonblock-{_uuid_mod.uuid4().hex[:8]}"
+    t0 = time.time()
+    resp = rds.create_db_instance(
+        DBInstanceIdentifier=iid,
+        DBInstanceClass="db.t3.micro",
+        Engine="postgres",
+        MasterUsername="admin",
+        MasterUserPassword="secret",
+        AllocatedStorage=20,
+    )
+    elapsed = time.time() - t0
+    # Even with Docker boot, the handler must not block on readiness — it
+    # should return within a couple of seconds, certainly far under the
+    # default 120s readiness timeout.
+    assert elapsed < 10, (
+        f"CreateDBInstance blocked {elapsed:.1f}s — should return immediately "
+        "with status=creating and let a background thread finalise readiness"
+    )
+
+    status = resp["DBInstance"]["DBInstanceStatus"]
+    # Either "creating" (real container still booting) or "available"
+    # (the unit-test path with no Docker — endpoint_host is stub, no real
+    # readiness check fires). Both are valid AWS shapes for the early return.
+    assert status in ("creating", "available"), f"unexpected status: {status}"
+
+    try:
+        rds.delete_db_instance(DBInstanceIdentifier=iid, SkipFinalSnapshot=True)
+    except Exception:
+        pass
+
+
 def test_rds_modify_cluster_password(rds):
     """ModifyDBCluster with MasterUserPassword succeeds."""
     rds.create_db_cluster(

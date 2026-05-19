@@ -2094,6 +2094,20 @@ def _eval_jsonata_expr(expr, states):
     if not expr:
         raise ValueError("Empty JSONata expression")
 
+    # 0a. Regex literal `/pattern/flags` — short-circuit before the
+    # multiplicative-`/`-split would mis-tokenize it.
+    if expr.startswith("/"):
+        rx = _try_parse_regex_literal(expr)
+        if rx is not None:
+            return rx
+
+    # 0b. Function literal `function(...) {...}` — short-circuit so the body
+    # isn't sliced by operator splitters.
+    if expr.startswith("function"):
+        fn = _try_parse_function_literal(expr, states)
+        if fn is not None:
+            return fn
+
     # 1. Ternary (right-associative — peel outermost `?`)
     q_pos = _find_top_level_token(expr, "?")
     if q_pos >= 0:
@@ -2169,21 +2183,25 @@ def _eval_jsonata_primary(expr, states):
     if expr.startswith("(") and expr.endswith(")") and _is_balanced_outer(expr, "(", ")"):
         return _eval_jsonata_expr(expr[1:-1], states)
 
-    # Built-in functions (AWS-supported JSONata subset)
-    for name, fn in (
-        ("$merge", _jsonata_merge),
-        ("$count", _jsonata_count),
-        ("$length", _jsonata_length),
-        ("$not", _jsonata_not),
-        ("$string", _jsonata_string),
-        ("$number", _jsonata_number),
-    ):
-        prefix = name + "("
-        if expr.startswith(prefix) and expr.endswith(")") \
-                and _is_balanced_outer(expr[len(name):], "(", ")"):
-            arg_expr = expr[len(prefix):-1].strip()
-            arg = _eval_jsonata_expr(arg_expr, states) if arg_expr else None
-            return fn(arg)
+    # Built-in JSONata function call: ``$name(arg1, arg2, ...)``. Dispatch by
+    # name to the registry; ``$exists`` is special-cased because it must catch
+    # resolution errors raised by evaluating its argument.
+    fn_match = re.match(r"^\$([A-Za-z_][A-Za-z0-9_]*)\(", expr)
+    if fn_match and expr.endswith(")") and _is_balanced_outer(
+            expr[len(fn_match.group(0)) - 1:], "(", ")"):
+        name = "$" + fn_match.group(1)
+        args_body = expr[len(fn_match.group(0)):-1].strip()
+        if name == "$exists":
+            # `$exists(expr)` distinguishes "missing path" (false) from
+            # "explicit null value" (true) per JSONata spec — see
+            # `_exists_jsonata_expr` for the walk.
+            if not args_body:
+                return False
+            return _exists_jsonata_expr(args_body, states)
+        if name in _JSONATA_FUNCS:
+            arg_exprs = _split_top_level(args_body, ",") if args_body else []
+            args = [_eval_jsonata_expr(a, states) for a in arg_exprs]
+            return _JSONATA_FUNCS[name](*args)
 
     # Array literal
     if expr.startswith("[") and expr.endswith("]") and _is_balanced_outer(expr, "[", "]"):
@@ -2240,16 +2258,128 @@ def _eval_jsonata_primary(expr, states):
 
 
 def _truthy(value):
-    """JSONata truthiness: null/false/0/empty string/empty array/empty object are falsy."""
+    """JSONata truthiness: null/false/0/empty string/empty array/empty object are falsy.
+    For arrays, an array containing only falsy values is itself falsy (JSONata spec)."""
     if value is None or value is False:
         return False
     if isinstance(value, bool):
         return value
     if isinstance(value, (int, float)) and value == 0:
         return False
-    if isinstance(value, (str, list, dict)) and len(value) == 0:
+    if isinstance(value, str) and len(value) == 0:
         return False
+    if isinstance(value, dict) and len(value) == 0:
+        return False
+    if isinstance(value, list):
+        if len(value) == 0:
+            return False
+        return any(_truthy(v) for v in value)
     return True
+
+
+# Sentinel returned by `_resolve_jsonata_path_with_missing` to mark a path that
+# did not match. Distinguished from an explicit JSON `null`, which $exists
+# treats as "exists" per JSONata spec.
+class _Missing:
+    _singleton = None
+
+    def __repr__(self):
+        return "<missing>"
+
+
+_MISSING = _Missing()
+_Missing._singleton = _MISSING
+
+
+class _JsonataFunctionLiteral:
+    """A `function($a, $b){<body>}` literal compiled into a callable that can
+    be passed to higher-order functions like `$sort`."""
+
+    def __init__(self, params, body, states):
+        self.params = params  # list of str, each like "$a"
+        self.body = body
+        self.outer_states = states
+
+    def __call__(self, *args):
+        if len(args) != len(self.params):
+            raise ValueError(
+                f"function expected {len(self.params)} args, got {len(args)}")
+        # Build a child states with the params bound as variables. `$name`
+        # variable lookups go through `states["_variables"]`.
+        child = dict(self.outer_states)
+        variables = dict(child.get("_variables", {}))
+        for pname, pvalue in zip(self.params, args):
+            # Strip leading `$` to match the variable-store convention.
+            variables[pname[1:]] = pvalue
+        child["_variables"] = variables
+        return _eval_jsonata_expr(self.body, child)
+
+
+def _try_parse_regex_literal(expr):
+    """Recognize a JSONata regex literal `/pattern/flags`. Returns a compiled
+    `re.Pattern` or `None` if `expr` is not a regex literal."""
+    if not expr.startswith("/") or len(expr) < 2:
+        return None
+    # Walk to find the closing `/`, skipping `\/` escapes.
+    i = 1
+    while i < len(expr):
+        ch = expr[i]
+        if ch == "\\" and i + 1 < len(expr):
+            i += 2
+            continue
+        if ch == "/":
+            break
+        i += 1
+    if i >= len(expr) or expr[i] != "/":
+        return None
+    pattern = expr[1:i]
+    flags_str = expr[i + 1:]
+    if flags_str and not re.fullmatch(r"[imsxu]*", flags_str):
+        return None
+    flags = 0
+    for f in flags_str:
+        flags |= {"i": re.IGNORECASE, "m": re.MULTILINE, "s": re.DOTALL,
+                  "x": re.VERBOSE, "u": re.UNICODE}[f]
+    try:
+        return re.compile(pattern, flags)
+    except re.error:
+        return None
+
+
+def _try_parse_function_literal(expr, states):
+    """Recognize `function($a, $b, ...) { <body> }` and return a
+    `_JsonataFunctionLiteral`, or `None`."""
+    m = re.match(r"^function\s*\(", expr)
+    if not m:
+        return None
+    # Find matching close paren for params.
+    depth = 0
+    paren_close = -1
+    for idx, ch in enumerate(expr[m.end() - 1:], start=m.end() - 1):
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                paren_close = idx
+                break
+    if paren_close < 0:
+        return None
+    params_body = expr[m.end():paren_close].strip()
+    rest = expr[paren_close + 1:].lstrip()
+    if not rest.startswith("{") or not rest.endswith("}"):
+        return None
+    body = rest[1:-1].strip()
+    if not _is_balanced_outer(rest, "{", "}"):
+        return None
+    if not params_body:
+        params = []
+    else:
+        params = [p.strip() for p in _split_top_level(params_body, ",")]
+        for p in params:
+            if not re.fullmatch(r"\$[A-Za-z_][A-Za-z0-9_]*", p):
+                return None
+    return _JsonataFunctionLiteral(params, body, states)
 
 
 def _apply_binary_op(op, left, right):
@@ -2287,17 +2417,34 @@ def _apply_binary_op(op, left, right):
     raise ValueError(f"Unknown operator: {op}")
 
 
-def _jsonata_merge(args):
-    if not isinstance(args, list):
-        raise ValueError("$merge expects an array")
+# ---------------------------------------------------------------------------
+# JSONata built-in functions
+# ---------------------------------------------------------------------------
+#
+# AWS Step Functions exposes a subset of the JSONata standard library. The
+# dispatcher in `_eval_jsonata_primary` resolves `$name(args)` against the
+# `_JSONATA_FUNCS` registry below. Each handler takes the already-evaluated
+# positional arguments. Type validation raises `ValueError`, which the
+# caller wraps into `States.QueryEvaluationError`.
+#
+# `$exists` is special-cased in the dispatcher because it must intercept
+# resolution errors on its argument; the rest go through this table.
+
+
+def _jsonata_merge(*args):
+    if len(args) != 1 or not isinstance(args[0], list):
+        raise ValueError("$merge expects a single array argument")
     merged = {}
-    for item in args:
+    for item in args[0]:
         if isinstance(item, dict):
             merged.update(item)
     return merged
 
 
-def _jsonata_count(arg):
+def _jsonata_count(*args):
+    if len(args) != 1:
+        raise ValueError("$count expects 1 argument")
+    arg = args[0]
     if arg is None:
         return 0
     if isinstance(arg, list):
@@ -2305,17 +2452,22 @@ def _jsonata_count(arg):
     return 1
 
 
-def _jsonata_length(arg):
-    if not isinstance(arg, str):
+def _jsonata_length(*args):
+    if len(args) != 1 or not isinstance(args[0], str):
         raise ValueError("$length expects a string")
-    return len(arg)
+    return len(args[0])
 
 
-def _jsonata_not(arg):
-    return not _truthy(arg)
+def _jsonata_not(*args):
+    if len(args) != 1:
+        raise ValueError("$not expects 1 argument")
+    return not _truthy(args[0])
 
 
-def _jsonata_string(arg):
+def _jsonata_string(*args):
+    if len(args) != 1:
+        raise ValueError("$string expects 1 argument")
+    arg = args[0]
     if arg is None:
         return ""
     if isinstance(arg, bool):
@@ -2325,7 +2477,10 @@ def _jsonata_string(arg):
     return str(arg)
 
 
-def _jsonata_number(arg):
+def _jsonata_number(*args):
+    if len(args) != 1:
+        raise ValueError("$number expects 1 argument")
+    arg = args[0]
     if isinstance(arg, bool):
         raise ValueError("$number cannot coerce boolean")
     if isinstance(arg, (int, float)):
@@ -2336,6 +2491,661 @@ def _jsonata_number(arg):
         except ValueError:
             return float(arg)
     raise ValueError(f"$number cannot coerce {type(arg).__name__}")
+
+
+# --- String functions ------------------------------------------------------
+
+
+def _require_str(name, value):
+    if not isinstance(value, str):
+        raise ValueError(f"{name} expects a string")
+    return value
+
+
+def _jsonata_uppercase(*args):
+    if len(args) != 1:
+        raise ValueError("$uppercase expects 1 argument")
+    return _require_str("$uppercase", args[0]).upper()
+
+
+def _jsonata_lowercase(*args):
+    if len(args) != 1:
+        raise ValueError("$lowercase expects 1 argument")
+    return _require_str("$lowercase", args[0]).lower()
+
+
+def _jsonata_substring(*args):
+    # $substring(str, start) or $substring(str, start, length)
+    if len(args) not in (2, 3):
+        raise ValueError("$substring expects 2 or 3 arguments")
+    s = _require_str("$substring", args[0])
+    start = int(args[1])
+    # JSONata: negative start counts from end
+    if start < 0:
+        start = max(len(s) + start, 0)
+    if len(args) == 2:
+        return s[start:]
+    length = int(args[2])
+    if length < 0:
+        length = 0
+    return s[start:start + length]
+
+
+def _jsonata_trim(*args):
+    # JSONata $trim: strip and collapse internal whitespace runs to a single space.
+    if len(args) != 1:
+        raise ValueError("$trim expects 1 argument")
+    return re.sub(r"\s+", " ", _require_str("$trim", args[0])).strip()
+
+
+def _jsonata_contains(*args):
+    # JSONata $contains(str, pattern) — pattern may be a string OR a regex.
+    if len(args) != 2:
+        raise ValueError("$contains expects 2 arguments")
+    s = _require_str("$contains", args[0])
+    pat = args[1]
+    if isinstance(pat, re.Pattern):
+        return pat.search(s) is not None
+    return _require_str("$contains", pat) in s
+
+
+def _jsonata_split(*args):
+    # JSONata $split(str, separator, limit) — separator may be a string OR a regex.
+    if len(args) not in (2, 3):
+        raise ValueError("$split expects 2 or 3 arguments")
+    s = _require_str("$split", args[0])
+    sep = args[1]
+    limit = None
+    if len(args) == 3:
+        limit = int(args[2])
+        if limit < 0:
+            raise ValueError("$split limit must be non-negative")
+    if isinstance(sep, re.Pattern):
+        parts = sep.split(s)
+    else:
+        sep_str = _require_str("$split", sep)
+        parts = s.split(sep_str) if sep_str else list(s)
+    return parts[:limit] if limit is not None else parts
+
+
+def _jsonata_join(*args):
+    # JSONata $join(array_of_strings, separator). Per spec, array values must
+    # all be strings — otherwise raise. Single string is treated as a 1-element
+    # array (consistent with JSONata's "singleton sequence" semantics).
+    if len(args) not in (1, 2):
+        raise ValueError("$join expects 1 or 2 arguments")
+    arr = args[0]
+    if isinstance(arr, str):
+        arr = [arr]
+    if not isinstance(arr, list):
+        raise ValueError("$join expects an array of strings")
+    for v in arr:
+        if not isinstance(v, str):
+            raise ValueError("$join: array elements must all be strings")
+    sep = _require_str("$join", args[1]) if len(args) == 2 else ""
+    return sep.join(arr)
+
+
+def _jsonata_replace(*args):
+    # JSONata $replace(str, pattern, replacement, limit) — pattern may be a
+    # string OR a regex. With regex, `replacement` honours `$1`/`$&` etc. per
+    # the spec; we map those to Python's `\1`/`\g<0>` equivalents.
+    if len(args) not in (3, 4):
+        raise ValueError("$replace expects 3 or 4 arguments")
+    s = _require_str("$replace", args[0])
+    pattern = args[1]
+    replacement = _require_str("$replace", args[2])
+    limit = None
+    if len(args) == 4:
+        limit = int(args[3])
+        if limit < 0:
+            raise ValueError("$replace limit must be non-negative")
+    if isinstance(pattern, re.Pattern):
+        # Translate JSONata/JS substitution refs into Python's: `$&` → \g<0>,
+        # `$1`..`$9` → \1..\9, literal `$` written as `$$` → `$`.
+        def _translate(repl):
+            return re.sub(
+                r"\$(\$|&|[1-9])",
+                lambda m: {"$": "$", "&": r"\g<0>"}.get(
+                    m.group(1), r"\%s" % m.group(1)),
+                repl,
+            )
+        py_repl = _translate(replacement)
+        return pattern.sub(py_repl, s, count=limit if limit is not None else 0)
+    pattern_str = _require_str("$replace", pattern)
+    if limit is not None:
+        return s.replace(pattern_str, replacement, limit)
+    return s.replace(pattern_str, replacement)
+
+
+def _jsonata_pad(*args):
+    # $pad(str, width) — negative width left-pads, positive right-pads.
+    # $pad(str, width, char) — single-char fill.
+    if len(args) not in (2, 3):
+        raise ValueError("$pad expects 2 or 3 arguments")
+    s = _require_str("$pad", args[0])
+    width = int(args[1])
+    fill = _require_str("$pad", args[2]) if len(args) == 3 else " "
+    if not fill:
+        return s
+    fill_char = fill[0]
+    if width >= 0:
+        return s.ljust(width, fill_char)
+    return s.rjust(-width, fill_char)
+
+
+# --- Numeric functions ----------------------------------------------------
+
+
+def _coerce_number_list(name, arr):
+    if not isinstance(arr, list):
+        raise ValueError(f"{name} expects an array of numbers")
+    out = []
+    for v in arr:
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            raise ValueError(f"{name} expects an array of numbers")
+        out.append(v)
+    return out
+
+
+def _jsonata_sum(*args):
+    if len(args) != 1:
+        raise ValueError("$sum expects 1 argument")
+    return sum(_coerce_number_list("$sum", args[0]))
+
+
+def _jsonata_average(*args):
+    if len(args) != 1:
+        raise ValueError("$average expects 1 argument")
+    nums = _coerce_number_list("$average", args[0])
+    if not nums:
+        raise ValueError("$average of empty array is undefined")
+    return sum(nums) / len(nums)
+
+
+def _jsonata_max(*args):
+    if len(args) != 1:
+        raise ValueError("$max expects 1 argument")
+    nums = _coerce_number_list("$max", args[0])
+    if not nums:
+        raise ValueError("$max of empty array is undefined")
+    return max(nums)
+
+
+def _jsonata_min(*args):
+    if len(args) != 1:
+        raise ValueError("$min expects 1 argument")
+    nums = _coerce_number_list("$min", args[0])
+    if not nums:
+        raise ValueError("$min of empty array is undefined")
+    return min(nums)
+
+
+def _require_num(name, value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{name} expects a number")
+    return value
+
+
+def _jsonata_abs(*args):
+    if len(args) != 1:
+        raise ValueError("$abs expects 1 argument")
+    return abs(_require_num("$abs", args[0]))
+
+
+def _jsonata_floor(*args):
+    import math
+    if len(args) != 1:
+        raise ValueError("$floor expects 1 argument")
+    return math.floor(_require_num("$floor", args[0]))
+
+
+def _jsonata_ceil(*args):
+    import math
+    if len(args) != 1:
+        raise ValueError("$ceil expects 1 argument")
+    return math.ceil(_require_num("$ceil", args[0]))
+
+
+def _jsonata_round(*args):
+    # JSONata uses banker's rounding (round-half-to-even). Python's built-in
+    # `round` does the same — defer to it. Optional precision argument.
+    if len(args) not in (1, 2):
+        raise ValueError("$round expects 1 or 2 arguments")
+    n = _require_num("$round", args[0])
+    if len(args) == 2:
+        precision = int(args[1])
+        return round(n, precision)
+    return round(n)
+
+
+def _jsonata_power(*args):
+    if len(args) != 2:
+        raise ValueError("$power expects 2 arguments")
+    base = _require_num("$power", args[0])
+    exp = _require_num("$power", args[1])
+    return base ** exp
+
+
+def _jsonata_sqrt(*args):
+    import math
+    if len(args) != 1:
+        raise ValueError("$sqrt expects 1 argument")
+    n = _require_num("$sqrt", args[0])
+    if n < 0:
+        raise ValueError("$sqrt of negative number is undefined")
+    return math.sqrt(n)
+
+
+# --- Array functions ------------------------------------------------------
+
+
+def _jsonata_sort(*args):
+    # $sort(array) — natural ascending.
+    # $sort(array, function($l, $r){...}) — JSONata: comparator returns true
+    # if $l should sort *after* $r (i.e. positive).
+    if len(args) not in (1, 2):
+        raise ValueError("$sort expects 1 or 2 arguments")
+    if not isinstance(args[0], list):
+        raise ValueError("$sort expects an array")
+    if len(args) == 1:
+        try:
+            return sorted(args[0])
+        except TypeError as e:
+            raise ValueError(f"$sort: items not mutually comparable ({e})")
+    comparator = args[1]
+    if not callable(comparator):
+        raise ValueError("$sort: second argument must be a function")
+    import functools
+
+    def _cmp(a, b):
+        # JSONata comparator returns truthy if `a > b`, falsy otherwise.
+        if _truthy(comparator(a, b)):
+            return 1
+        if _truthy(comparator(b, a)):
+            return -1
+        return 0
+    return sorted(args[0], key=functools.cmp_to_key(_cmp))
+
+
+def _jsonata_reverse(*args):
+    if len(args) != 1:
+        raise ValueError("$reverse expects 1 argument")
+    if not isinstance(args[0], list):
+        raise ValueError("$reverse expects an array")
+    return list(reversed(args[0]))
+
+
+def _jsonata_distinct(*args):
+    # JSONata $distinct preserves first-occurrence order.
+    if len(args) != 1:
+        raise ValueError("$distinct expects 1 argument")
+    if not isinstance(args[0], list):
+        raise ValueError("$distinct expects an array")
+    seen = []
+    seen_keys = set()
+    for item in args[0]:
+        # JSON-comparable representation as the dedup key — unhashable items
+        # (dicts, lists) fall back to a stable repr.
+        try:
+            key = item if isinstance(item, (str, int, float, bool)) or item is None else json.dumps(item, sort_keys=True)
+        except TypeError:
+            key = repr(item)
+        if key not in seen_keys:
+            seen_keys.add(key)
+            seen.append(item)
+    return seen
+
+
+def _jsonata_append(*args):
+    if len(args) != 2:
+        raise ValueError("$append expects 2 arguments")
+    left = args[0] if isinstance(args[0], list) else [args[0]]
+    right = args[1] if isinstance(args[1], list) else [args[1]]
+    return left + right
+
+
+# --- Object functions -----------------------------------------------------
+
+
+def _jsonata_keys(*args):
+    if len(args) != 1:
+        raise ValueError("$keys expects 1 argument")
+    if not isinstance(args[0], dict):
+        raise ValueError("$keys expects an object")
+    return list(args[0].keys())
+
+
+def _jsonata_values(*args):
+    if len(args) != 1:
+        raise ValueError("$values expects 1 argument")
+    if not isinstance(args[0], dict):
+        raise ValueError("$values expects an object")
+    return list(args[0].values())
+
+
+def _jsonata_lookup(*args):
+    # JSONata $lookup(object, key). If `object` is an array of objects, all
+    # matching values are returned as an array; a single match returns the
+    # value scalar (per JSONata's "singleton sequence" semantics).
+    if len(args) != 2:
+        raise ValueError("$lookup expects 2 arguments")
+    obj, key = args
+    key = _require_str("$lookup", key)
+    if isinstance(obj, dict):
+        return obj.get(key)
+    if isinstance(obj, list):
+        hits = [o[key] for o in obj if isinstance(o, dict) and key in o]
+        if not hits:
+            return None
+        return hits[0] if len(hits) == 1 else hits
+    raise ValueError("$lookup expects an object or array of objects")
+
+
+# --- Type / coercion ------------------------------------------------------
+
+
+def _jsonata_type(*args):
+    # JSONata returns: "string" | "number" | "boolean" | "array" | "object" |
+    # "null". Functions are out of scope — we don't expose first-class fns.
+    if len(args) != 1:
+        raise ValueError("$type expects 1 argument")
+    v = args[0]
+    if v is None:
+        return "null"
+    if isinstance(v, bool):
+        return "boolean"
+    if isinstance(v, (int, float)):
+        return "number"
+    if isinstance(v, str):
+        return "string"
+    if isinstance(v, list):
+        return "array"
+    if isinstance(v, dict):
+        return "object"
+    raise ValueError(f"$type: unsupported value type {type(v).__name__}")
+
+
+def _jsonata_boolean(*args):
+    # JSONata truthy rules: boolean unchanged; "" / 0 / [] / {} / null → false.
+    if len(args) != 1:
+        raise ValueError("$boolean expects 1 argument")
+    return _truthy(args[0])
+
+
+# --- Date / Time ----------------------------------------------------------
+
+
+def _jsonata_now(*args):
+    # JSONata $now() / $now(picture) / $now(picture, timezone).
+    # Without args: ISO-8601 UTC, millisecond precision, e.g. "2024-...Z".
+    # With picture: XPath-3.1 date/time picture (subset — see
+    # `_format_datetime_picture`). With timezone: "+HH:MM" / "-HH:MM" offset
+    # applied before formatting.
+    from datetime import datetime, timezone, timedelta
+    if len(args) > 2:
+        raise ValueError("$now expects 0, 1, or 2 arguments")
+    now = datetime.now(timezone.utc)
+    if len(args) == 2:
+        tz = _require_str("$now", args[1])
+        m = re.fullmatch(r"([+-])(\d{2}):?(\d{2})", tz)
+        if not m:
+            raise ValueError(f"$now: invalid timezone offset {tz!r}")
+        sign = 1 if m.group(1) == "+" else -1
+        offset = timedelta(hours=int(m.group(2)), minutes=int(m.group(3))) * sign
+        now = now.astimezone(timezone(offset))
+    if args:
+        picture = _require_str("$now", args[0])
+        return _format_datetime_picture(now, picture)
+    return now.strftime("%Y-%m-%dT%H:%M:%S.") + f"{now.microsecond // 1000:03d}Z"
+
+
+def _format_datetime_picture(dt, picture):
+    """Subset of the XPath 3.1 format-dateTime picture used by JSONata.
+    Supports the variable markers documented in the JSONata docs:
+      [Y0001] / [Y] year, [M01] / [M] month, [D01] / [D] day,
+      [H01] / [H] hour-24, [m01] / [m] minute, [s01] / [s] second,
+      [f001] millisecond, [Z] / [z] tz offset.
+    Other markers raise so callers get a clear error rather than wrong data."""
+    out = []
+    i = 0
+    while i < len(picture):
+        ch = picture[i]
+        if ch != "[":
+            if ch == "]" and i + 1 < len(picture) and picture[i + 1] == "]":
+                out.append("]")
+                i += 2
+                continue
+            out.append(ch)
+            i += 1
+            continue
+        end = picture.find("]", i)
+        if end < 0:
+            raise ValueError(f"$now: unterminated marker in picture {picture!r}")
+        marker = picture[i + 1:end].strip()
+        i = end + 1
+        if not marker:
+            raise ValueError(f"$now: empty marker in picture {picture!r}")
+        comp = marker[0]
+        width_spec = marker[1:].strip()
+        # Width spec like "01" / "0001" / "1" — leading-zero pad to that width.
+        pad = 0
+        if width_spec:
+            m = re.fullmatch(r"(\d+)", width_spec)
+            if not m:
+                raise ValueError(
+                    f"$now: unsupported picture width {width_spec!r}")
+            pad = len(width_spec)
+        if comp == "Y":
+            out.append(str(dt.year).zfill(pad or 4))
+        elif comp == "M":
+            out.append(str(dt.month).zfill(pad or 1))
+        elif comp == "D":
+            out.append(str(dt.day).zfill(pad or 1))
+        elif comp == "H":
+            out.append(str(dt.hour).zfill(pad or 1))
+        elif comp == "m":
+            out.append(str(dt.minute).zfill(pad or 1))
+        elif comp == "s":
+            out.append(str(dt.second).zfill(pad or 1))
+        elif comp == "f":
+            out.append(str(dt.microsecond // 1000).zfill(pad or 3))
+        elif comp in ("Z", "z"):
+            off = dt.utcoffset()
+            if off is None or off.total_seconds() == 0:
+                out.append("Z" if comp == "Z" else "+00:00")
+            else:
+                total = int(off.total_seconds())
+                sign = "+" if total >= 0 else "-"
+                total = abs(total)
+                hh, mm = divmod(total // 60, 60)
+                out.append(f"{sign}{hh:02d}:{mm:02d}")
+        else:
+            raise ValueError(
+                f"$now: unsupported picture component {comp!r} in {picture!r}")
+    return "".join(out)
+
+
+def _jsonata_millis(*args):
+    if args:
+        raise ValueError("$millis takes no arguments")
+    return int(time.time() * 1000)
+
+
+# --- Utility --------------------------------------------------------------
+
+
+def _jsonata_uuid(*args):
+    import uuid as _uuid
+    if args:
+        raise ValueError("$uuid takes no arguments")
+    return str(_uuid.uuid4())
+
+
+def _jsonata_format_number(*args):
+    # JSONata $formatNumber(number, picture[, options]). Implements the
+    # XPath-3.1 "decimal-format" subset most workflows use:
+    #   `0` mandatory digit, `#` optional digit, `,` grouping separator,
+    #   `.` decimal separator, `;` positive;negative subpictures, `%` percent
+    #   (×100), and an optional `-` sign in the negative subpicture.
+    # Locale-specific overrides via the `options` arg are not supported and
+    # raise — callers see a clear error rather than wrong data.
+    if len(args) not in (2, 3):
+        raise ValueError("$formatNumber expects 2 or 3 arguments")
+    if len(args) == 3:
+        raise ValueError("$formatNumber: options argument is not supported")
+    n = _require_num("$formatNumber", args[0])
+    picture = _require_str("$formatNumber", args[1])
+
+    # Split positive;negative subpictures.
+    if ";" in picture:
+        pos_pic, neg_pic = picture.split(";", 1)
+    else:
+        pos_pic, neg_pic = picture, None
+
+    def _apply(pic, value):
+        # Percent / per-mille suffixes scale the value before formatting.
+        scale = 1
+        suffix = ""
+        prefix = ""
+        body = pic
+        if body.endswith("%"):
+            scale = 100
+            suffix = "%"
+            body = body[:-1]
+        elif body.endswith("‰"):
+            scale = 1000
+            suffix = "‰"
+            body = body[:-1]
+        # Leading literal `-` etc. — strip non-format chars from the front into
+        # `prefix`, and trailing into `suffix`. Format chars: 0 # , .
+        while body and body[0] not in "0#":
+            prefix += body[0]
+            body = body[1:]
+        trailing = ""
+        while body and body[-1] not in "0#":
+            if body[-1] in ",.":
+                break
+            trailing = body[-1] + trailing
+            body = body[:-1]
+        suffix = trailing + suffix
+
+        scaled = value * scale
+        if "." in body:
+            int_pic, frac_pic = body.split(".", 1)
+        else:
+            int_pic, frac_pic = body, ""
+
+        # Decimals: count digits in frac picture; pad zeros for `0`s, trim
+        # trailing zeros only where `#`s sit.
+        frac_digits = sum(1 for c in frac_pic if c in "0#")
+        frac_min = sum(1 for c in frac_pic if c == "0")
+        rounded = round(scaled, frac_digits) if frac_digits else round(scaled)
+        # Use absolute value — sign handled by subpicture selection.
+        rounded = abs(rounded)
+        if frac_digits == 0:
+            int_part = str(int(round(rounded)))
+            frac_part = ""
+        else:
+            s = f"{rounded:.{frac_digits}f}"
+            int_part, frac_part = s.split(".")
+            # Trim trailing zeros down to the minimum required by `0`s.
+            while len(frac_part) > frac_min and frac_part.endswith("0"):
+                frac_part = frac_part[:-1]
+
+        # Int picture: pad to required leading zeros (count of `0`s).
+        int_min = sum(1 for c in int_pic if c == "0")
+        if len(int_part) < int_min:
+            int_part = int_part.rjust(int_min, "0")
+
+        # Grouping: if int_pic has `,`, group from the right by the distance
+        # between the rightmost `,` and the decimal point (typical 3).
+        if "," in int_pic:
+            # Distance from rightmost `,` to end of int_pic gives group size.
+            last_comma = int_pic.rfind(",")
+            group_size = len(int_pic) - last_comma - 1
+            if group_size > 0:
+                # Insert separators every `group_size` from the right.
+                rev = int_part[::-1]
+                chunks = [rev[i:i + group_size] for i in range(0, len(rev), group_size)]
+                int_part = ",".join(chunks)[::-1]
+
+        result = int_part + (("." + frac_part) if frac_part else "")
+        return prefix + result + suffix
+
+    if n < 0:
+        if neg_pic is not None:
+            return _apply(neg_pic, n)
+        return "-" + _apply(pos_pic, n)
+    return _apply(pos_pic, n)
+
+
+def _jsonata_base64encode(*args):
+    import base64
+    if len(args) != 1:
+        raise ValueError("$base64encode expects 1 argument")
+    return base64.b64encode(_require_str("$base64encode", args[0]).encode("utf-8")).decode("ascii")
+
+
+def _jsonata_base64decode(*args):
+    import base64
+    if len(args) != 1:
+        raise ValueError("$base64decode expects 1 argument")
+    return base64.b64decode(_require_str("$base64decode", args[0])).decode("utf-8")
+
+
+# Registry consumed by `_eval_jsonata_primary`. `$exists` is handled inline
+# because it must intercept evaluation errors on its argument.
+_JSONATA_FUNCS = {
+    # core (pre-existing)
+    "$merge":         _jsonata_merge,
+    "$count":         _jsonata_count,
+    "$length":        _jsonata_length,
+    "$not":           _jsonata_not,
+    "$string":        _jsonata_string,
+    "$number":        _jsonata_number,
+    # string
+    "$uppercase":     _jsonata_uppercase,
+    "$lowercase":     _jsonata_lowercase,
+    "$substring":     _jsonata_substring,
+    "$trim":          _jsonata_trim,
+    "$contains":      _jsonata_contains,
+    "$split":         _jsonata_split,
+    "$join":          _jsonata_join,
+    "$replace":       _jsonata_replace,
+    "$pad":           _jsonata_pad,
+    # numeric
+    "$sum":           _jsonata_sum,
+    "$average":       _jsonata_average,
+    "$max":           _jsonata_max,
+    "$min":           _jsonata_min,
+    "$abs":           _jsonata_abs,
+    "$floor":         _jsonata_floor,
+    "$ceil":          _jsonata_ceil,
+    "$round":         _jsonata_round,
+    "$power":         _jsonata_power,
+    "$sqrt":          _jsonata_sqrt,
+    # array
+    "$sort":          _jsonata_sort,
+    "$reverse":       _jsonata_reverse,
+    "$distinct":      _jsonata_distinct,
+    "$append":        _jsonata_append,
+    # object
+    "$keys":          _jsonata_keys,
+    "$values":        _jsonata_values,
+    "$lookup":        _jsonata_lookup,
+    # type
+    "$type":          _jsonata_type,
+    "$boolean":       _jsonata_boolean,
+    # date/time
+    "$now":           _jsonata_now,
+    "$millis":        _jsonata_millis,
+    # utility
+    "$uuid":          _jsonata_uuid,
+    "$base64encode":  _jsonata_base64encode,
+    "$base64decode":  _jsonata_base64decode,
+    "$formatNumber":  _jsonata_format_number,
+}
 
 
 def _find_top_level_any_op(text, ops, keyword=False):
@@ -2448,6 +3258,68 @@ def _resolve_jsonata_states_path(expr, states):
     if not rest:
         return current
     return _resolve_dotted_path(rest, current)
+
+
+def _exists_jsonata_expr(expr, states):
+    """JSONata `$exists`: true iff the expression resolves to a *value* —
+    including explicit `null`. Returns false when a `$states.…` path or
+    `$variable.…` path has a missing segment, or when evaluation raises.
+
+    For non-path expressions we fall back to "evaluates without raising and
+    is not the missing sentinel".
+    """
+    expr = expr.strip()
+
+    # `$states.<root>.<a>.<b>.…` — walk segments with missing-vs-null distinction.
+    if expr.startswith("$states."):
+        suffix = expr[len("$states."):]
+        root, _, rest = suffix.partition(".")
+        if root not in states:
+            return False
+        current = states[root]
+        if not rest:
+            return True  # the root itself exists (even if null)
+        return _path_exists(rest, current)
+
+    # `$varname.<a>.<b>.…` — variable lookup.
+    m = re.fullmatch(
+        r"\$([A-Za-z_][A-Za-z0-9_]*)(?:\.(.+))?", expr)
+    if m:
+        head, rest = m.group(1), m.group(2)
+        variables = states.get("_variables", {})
+        if head not in variables:
+            return False
+        if not rest:
+            return True
+        return _path_exists(rest, variables[head])
+
+    # General expression: exists iff it evaluates without raising.
+    try:
+        _eval_jsonata_expr(expr, states)
+        return True
+    except Exception:
+        return False
+
+
+def _path_exists(path, data):
+    """Walk a dotted JSONata path and return True iff every segment matches.
+    Distinguishes `{"x": null}` (path "x" → True) from `{}` (path "x" → False)."""
+    current = data
+    for raw_part in path.split("."):
+        part = raw_part
+        while part:
+            match = re.match(r"([A-Za-z_][A-Za-z0-9_]*)(?:\[(\d+)])?(.*)", part)
+            if not match:
+                return False
+            field, idx, part = match.groups()
+            if not isinstance(current, dict) or field not in current:
+                return False
+            current = current[field]
+            if idx is not None:
+                if not isinstance(current, list) or int(idx) >= len(current):
+                    return False
+                current = current[int(idx)]
+    return True
 
 
 def _resolve_dotted_path(path, data):

@@ -32,6 +32,7 @@ parameters.
 
 import copy
 import datetime
+import contextvars
 import json
 import logging
 import os
@@ -221,7 +222,25 @@ def _grant_mysql_master_user_privileges(host, port, master_user, master_pass, db
             db_id, e)
 
 
-def _wait_for_database_ready(host, port, engine, user, password, db_name, timeout=60):
+def _readiness_timeout_s() -> int:
+    """Per-call readiness timeout in seconds.
+
+    Defaults to 120s — fits cold-pull + bootstrap on a typical CI runner
+    without hanging a background thread forever on a broken image. Override
+    with ``RDS_READINESS_TIMEOUT_S`` (positive integer). Invalid values fall
+    back to the default rather than crashing the create path.
+    """
+    raw = os.environ.get("RDS_READINESS_TIMEOUT_S", "")
+    try:
+        v = int(raw)
+        if v > 0:
+            return v
+    except (TypeError, ValueError):
+        pass
+    return 120
+
+
+def _wait_for_database_ready(host, port, engine, user, password, db_name, timeout=None):
     """Block until the database accepts an authenticated connection.
 
     TCP readiness is not enough for MySQL/Postgres images: they can accept a
@@ -229,6 +248,8 @@ def _wait_for_database_ready(host, port, engine, user, password, db_name, timeou
     unavailable in the lightweight install, fall back to TCP readiness so RDS
     control-plane behavior remains usable without optional dependencies.
     """
+    if timeout is None:
+        timeout = _readiness_timeout_s()
     deadline = time.time() + timeout
     last_error = None
     while time.time() < deadline:
@@ -654,14 +675,46 @@ def _create_db_instance(p):
     _register_instance_in_cluster(instance)
 
     if real_container_started:
+        # Real AWS CreateDBInstance returns immediately with status="creating"
+        # and the caller polls (or uses get_waiter('db_instance_available'))
+        # until the database becomes reachable. Do the same: run the readiness
+        # wait + grant on a daemon thread so the request handler returns now.
+        #
+        # contextvars.copy_context() carries the request's account_id into
+        # the daemon — _instances is account-scoped, so without the snapshot
+        # the worker would look the instance up under the default account
+        # and silently fail to flip status to "available".
         ready_host = readiness_host or endpoint_host
         ready_port = readiness_port or endpoint_port
-        if _wait_for_database_ready(
-            ready_host, ready_port, engine, master_user, master_pass, db_name):
+        ctx = contextvars.copy_context()
+
+        def _bg_finalize_ready(
+            db_id=db_id, cluster_id=cluster_id, engine=engine,
+            master_user=master_user, master_pass=master_pass,
+            db_name=db_name, ready_host=ready_host, ready_port=ready_port,
+            ms_network=ms_network, internal_host=internal_host,
+            internal_port=internal_port, endpoint_port=endpoint_port,
+        ):
+            if not _wait_for_database_ready(
+                ready_host, ready_port, engine, master_user,
+                master_pass, db_name,
+            ):
+                logger.warning(
+                    "RDS: %s container for %s at %s:%s not ready after timeout",
+                    engine, db_id, ready_host, ready_port,
+                )
+                inst = _instances.get(db_id)
+                if inst is not None:
+                    inst["DBInstanceStatus"] = "failed"
+                _refresh_cluster_status(cluster_id)
+                return
             if _is_mysql_engine(engine):
                 _grant_mysql_master_user_privileges(
-                    ready_host, ready_port, master_user, master_pass, db_id)
-            instance["DBInstanceStatus"] = "available"
+                    ready_host, ready_port, master_user, master_pass, db_id,
+                )
+            inst = _instances.get(db_id)
+            if inst is not None:
+                inst["DBInstanceStatus"] = "available"
             if cluster_id:
                 cluster = _clusters.get(cluster_id)
                 if cluster:
@@ -670,15 +723,17 @@ def _create_db_instance(p):
             if ms_network and internal_host:
                 logger.info(
                     "RDS: %s container for %s ready at %s:%s (network %s)",
-                    engine, db_id, internal_host, internal_port, ms_network)
+                    engine, db_id, internal_host, internal_port, ms_network,
+                )
             else:
                 logger.info(
                     "RDS: %s container for %s ready on port %s",
-                    engine, db_id, endpoint_port)
-        else:
-            logger.warning(
-                "RDS: %s container for %s at %s:%s not ready after timeout",
-                engine, db_id, ready_host, ready_port)
+                    engine, db_id, endpoint_port,
+                )
+
+        threading.Thread(
+            target=ctx.run, args=(_bg_finalize_ready,), daemon=True,
+        ).start()
 
     req_tags = _parse_tags(p)
     if req_tags:

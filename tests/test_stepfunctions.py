@@ -4463,3 +4463,296 @@ def test_sfn_jsonata_assign_reuses_input(sfn_sync):
         assert json.loads(resp["output"]) == "hello world"
     finally:
         sfn_sync.delete_state_machine(stateMachineArn=sm_arn)
+
+
+# ---------------------------------------------------------------------------
+# JSONata standard library — issue #669
+# ---------------------------------------------------------------------------
+
+def _sfn_run_pass_output(sfn_sync, output_expr, input_obj=None):
+    """Round-trip helper: build a single Pass state whose Output is `output_expr`,
+    run it sync, return the parsed JSON output."""
+    sm_name = f"jsonata-fn-{_uuid_mod.uuid4().hex[:8]}"
+    sm_arn = sfn_sync.create_state_machine(
+        name=sm_name,
+        roleArn="arn:aws:iam::000000000000:role/sfn-role",
+        definition=json.dumps({
+            "QueryLanguage": "JSONata",
+            "StartAt": "Run",
+            "States": {
+                "Run": {
+                    "Type": "Pass",
+                    "Output": output_expr,
+                    "End": True,
+                },
+            },
+        }),
+    )["stateMachineArn"]
+    try:
+        resp = sfn_sync.start_sync_execution(
+            stateMachineArn=sm_arn,
+            input=json.dumps(input_obj or {}),
+        )
+        assert resp["status"] == "SUCCEEDED", \
+            f"Execution failed: {resp.get('error')} - {resp.get('cause')}"
+        return json.loads(resp["output"])
+    finally:
+        sfn_sync.delete_state_machine(stateMachineArn=sm_arn)
+
+
+def test_sfn_jsonata_exists_in_choice_condition_issue_669(sfn_sync):
+    """The exact example from issue #669: `$exists($states.input.userId)` used
+    as a Choice `Condition` must route correctly whether the field is present
+    or missing (returning false on missing rather than failing the execution)."""
+    sm_name = f"jsonata-exists-{_uuid_mod.uuid4().hex[:8]}"
+    sm_arn = sfn_sync.create_state_machine(
+        name=sm_name,
+        roleArn="arn:aws:iam::000000000000:role/sfn-role",
+        definition=json.dumps({
+            "QueryLanguage": "JSONata",
+            "StartAt": "Route",
+            "States": {
+                "Route": {
+                    "Type": "Choice",
+                    "Choices": [
+                        {
+                            "Condition": "{% $exists($states.input.userId) %}",
+                            "Next": "HasUser",
+                        },
+                    ],
+                    "Default": "NoUser",
+                },
+                "HasUser": {"Type": "Pass", "Output": {"branch": "has"}, "End": True},
+                "NoUser":  {"Type": "Pass", "Output": {"branch": "missing"}, "End": True},
+            },
+        }),
+    )["stateMachineArn"]
+    try:
+        has = sfn_sync.start_sync_execution(
+            stateMachineArn=sm_arn, input=json.dumps({"userId": "u-42"}))
+        assert has["status"] == "SUCCEEDED"
+        assert json.loads(has["output"]) == {"branch": "has"}
+
+        miss = sfn_sync.start_sync_execution(
+            stateMachineArn=sm_arn, input=json.dumps({}))
+        assert miss["status"] == "SUCCEEDED"
+        assert json.loads(miss["output"]) == {"branch": "missing"}
+    finally:
+        sfn_sync.delete_state_machine(stateMachineArn=sm_arn)
+
+
+def test_sfn_jsonata_string_functions(sfn_sync):
+    out = _sfn_run_pass_output(sfn_sync, {
+        "upper":     "{% $uppercase('hello') %}",
+        "lower":     "{% $lowercase('HELLO') %}",
+        "sub2":      "{% $substring('abcdef', 2) %}",
+        "sub3":      "{% $substring('abcdef', 1, 3) %}",
+        "trim":      "{% $trim('  a   b  ') %}",
+        "contains":  "{% $contains('hello world', 'world') %}",
+        "split":     "{% $split('a,b,c', ',') %}",
+        "join":      "{% $join(['a', 'b', 'c'], '-') %}",
+        "replace":   "{% $replace('aXbXc', 'X', '_') %}",
+        "pad_right": "{% $pad('x', 4, '.') %}",
+        "pad_left":  "{% $pad('x', -4, '.') %}",
+    })
+    assert out == {
+        "upper": "HELLO", "lower": "hello",
+        "sub2": "cdef", "sub3": "bcd",
+        "trim": "a b", "contains": True,
+        "split": ["a", "b", "c"], "join": "a-b-c",
+        "replace": "a_b_c", "pad_right": "x...", "pad_left": "...x",
+    }
+
+
+def test_sfn_jsonata_numeric_functions(sfn_sync):
+    out = _sfn_run_pass_output(sfn_sync, {
+        "sum":     "{% $sum([1, 2, 3, 4]) %}",
+        "avg":     "{% $average([2, 4, 6]) %}",
+        "max":     "{% $max([3, 1, 2]) %}",
+        "min":     "{% $min([3, 1, 2]) %}",
+        "abs":     "{% $abs(-7) %}",
+        "floor":   "{% $floor(2.9) %}",
+        "ceil":    "{% $ceil(2.1) %}",
+        "round":   "{% $round(2.5) %}",
+        "roundp":  "{% $round(2.345, 2) %}",
+        "power":   "{% $power(2, 8) %}",
+        "sqrt":    "{% $sqrt(16) %}",
+    })
+    # $round uses banker's rounding: 2.5 -> 2 (round-half-to-even)
+    assert out == {
+        "sum": 10, "avg": 4, "max": 3, "min": 1,
+        "abs": 7, "floor": 2, "ceil": 3,
+        "round": 2, "roundp": 2.35,
+        "power": 256, "sqrt": 4,
+    }
+
+
+def test_sfn_jsonata_array_functions(sfn_sync):
+    out = _sfn_run_pass_output(sfn_sync, {
+        "sort":     "{% $sort([3, 1, 2]) %}",
+        "reverse":  "{% $reverse([1, 2, 3]) %}",
+        "distinct": "{% $distinct([1, 2, 2, 3, 1]) %}",
+        "append":   "{% $append([1, 2], [3, 4]) %}",
+    })
+    assert out == {
+        "sort": [1, 2, 3],
+        "reverse": [3, 2, 1],
+        "distinct": [1, 2, 3],
+        "append": [1, 2, 3, 4],
+    }
+
+
+def test_sfn_jsonata_object_functions(sfn_sync):
+    out = _sfn_run_pass_output(
+        sfn_sync,
+        {
+            "keys":   "{% $keys($states.input.obj) %}",
+            "values": "{% $values($states.input.obj) %}",
+            "look":   "{% $lookup($states.input.obj, 'a') %}",
+        },
+        input_obj={"obj": {"a": 1, "b": 2}},
+    )
+    assert out == {"keys": ["a", "b"], "values": [1, 2], "look": 1}
+
+
+def test_sfn_jsonata_type_and_boolean(sfn_sync):
+    out = _sfn_run_pass_output(sfn_sync, {
+        "t_str":  "{% $type('s') %}",
+        "t_num":  "{% $type(1) %}",
+        "t_arr":  "{% $type([1]) %}",
+        "t_obj":  "{% $type({'k': 1}) %}",
+        "b_empty": "{% $boolean('') %}",
+        "b_str":   "{% $boolean('x') %}",
+        "b_zero":  "{% $boolean(0) %}",
+    })
+    assert out == {
+        "t_str": "string", "t_num": "number",
+        "t_arr": "array", "t_obj": "object",
+        "b_empty": False, "b_str": True, "b_zero": False,
+    }
+
+
+def test_sfn_jsonata_datetime_and_util(sfn_sync):
+    out = _sfn_run_pass_output(sfn_sync, {
+        "now":          "{% $now() %}",
+        "millis":       "{% $millis() %}",
+        "uuid":         "{% $uuid() %}",
+        "b64_encode":   "{% $base64encode('hello') %}",
+        "b64_decode":   "{% $base64decode('aGVsbG8=') %}",
+    })
+    # $now: ISO-8601 UTC with millisecond precision ending in 'Z'
+    assert isinstance(out["now"], str) and out["now"].endswith("Z")
+    assert "T" in out["now"]
+    assert isinstance(out["millis"], int) and out["millis"] > 0
+    assert isinstance(out["uuid"], str) and len(out["uuid"]) == 36
+    assert out["b64_encode"] == "aGVsbG8="
+    assert out["b64_decode"] == "hello"
+
+
+def test_sfn_jsonata_exists_distinguishes_null_from_missing(sfn_sync):
+    """JSONata spec: `$exists` returns true for an explicit null value (the path
+    matches a value), and false only for a missing path. The previous fix
+    collapsed both to false — this regression-locks the spec distinction."""
+    out = _sfn_run_pass_output(
+        sfn_sync,
+        {
+            "present_value": "{% $exists($states.input.a) %}",
+            "explicit_null": "{% $exists($states.input.b) %}",
+            "missing_key":   "{% $exists($states.input.c) %}",
+            "nested_null":   "{% $exists($states.input.d.x) %}",
+            "nested_miss":   "{% $exists($states.input.d.y) %}",
+        },
+        input_obj={"a": 1, "b": None, "d": {"x": None}},
+    )
+    assert out == {
+        "present_value": True,
+        "explicit_null": True,
+        "missing_key": False,
+        "nested_null": True,
+        "nested_miss": False,
+    }
+
+
+def test_sfn_jsonata_regex_literal_in_string_fns(sfn_sync):
+    """$contains/$split/$replace accept `/pattern/flags` regex literals."""
+    out = _sfn_run_pass_output(sfn_sync, {
+        "ci_match":  "{% $contains('Hello World', /hello/i) %}",
+        "no_match":  "{% $contains('Hello World', /xyz/) %}",
+        "split_ws":  "{% $split('a   b    c', /\\s+/) %}",
+        "replace":   "{% $replace('foo123bar456', /[0-9]+/, '#') %}",
+        "backref":   "{% $replace('John Smith', /(\\w+) (\\w+)/, '$2 $1') %}",
+    })
+    assert out == {
+        "ci_match": True,
+        "no_match": False,
+        "split_ws": ["a", "b", "c"],
+        "replace": "foo#bar#",
+        "backref": "Smith John",
+    }
+
+
+def test_sfn_jsonata_sort_with_comparator_function(sfn_sync):
+    """$sort accepts a `function($l, $r){...}` comparator. Sorting descending
+    via a custom comparator is the canonical JSONata example."""
+    out = _sfn_run_pass_output(sfn_sync, {
+        "desc": "{% $sort([3, 1, 4, 1, 5, 9, 2, 6], function($l, $r){$l < $r}) %}",
+    })
+    assert out == {"desc": [9, 6, 5, 4, 3, 2, 1, 1]}
+
+
+def test_sfn_jsonata_join_strict_and_lookup_array(sfn_sync):
+    """$join requires all-string arrays; $lookup over an array of objects
+    returns the matching values."""
+    out = _sfn_run_pass_output(
+        sfn_sync,
+        {
+            "join":   "{% $join($states.input.names, '|') %}",
+            "look1":  "{% $lookup($states.input.users, 'id') %}",
+        },
+        input_obj={
+            "names": ["a", "b", "c"],
+            "users": [{"id": 1}, {"id": 2}, {"id": 3}],
+        },
+    )
+    assert out == {"join": "a|b|c", "look1": [1, 2, 3]}
+
+
+def test_sfn_jsonata_boolean_array_of_falsy_is_false(sfn_sync):
+    """JSONata: array of only-false values is itself false; an array with at
+    least one truthy value is true."""
+    out = _sfn_run_pass_output(sfn_sync, {
+        "all_false": "{% $boolean([false, false, 0, '']) %}",
+        "any_true":  "{% $boolean([false, 'x']) %}",
+    })
+    assert out == {"all_false": False, "any_true": True}
+
+
+def test_sfn_jsonata_now_picture_and_timezone(sfn_sync):
+    """$now(picture) and $now(picture, timezone) format per XPath picture."""
+    out = _sfn_run_pass_output(sfn_sync, {
+        "date_only":   "{% $now('[Y0001]-[M01]-[D01]') %}",
+        "with_tz":     "{% $now('[H01]:[m01][Z]', '+05:30') %}",
+        "default":     "{% $now() %}",
+    })
+    import re as _re
+    assert _re.fullmatch(r"\d{4}-\d{2}-\d{2}", out["date_only"])
+    assert _re.fullmatch(r"\d{2}:\d{2}\+05:30", out["with_tz"])
+    assert out["default"].endswith("Z")
+
+
+def test_sfn_jsonata_format_number(sfn_sync):
+    """$formatNumber supports grouping, decimals, percent, and pos;neg subpictures."""
+    out = _sfn_run_pass_output(sfn_sync, {
+        "grouped":  "{% $formatNumber(12345.6, '#,###.00') %}",
+        "percent":  "{% $formatNumber(0.5, '00.0%') %}",
+        "pad":      "{% $formatNumber(7, '000') %}",
+        "neg_sub":  "{% $formatNumber(-1234.5, '#,##0.00;(#,##0.00)') %}",
+        "plain":    "{% $formatNumber(1234, '0,000') %}",
+    })
+    assert out == {
+        "grouped": "12,345.60",
+        "percent": "50.0%",
+        "pad": "007",
+        "neg_sub": "(1,234.50)",
+        "plain": "1,234",
+    }
