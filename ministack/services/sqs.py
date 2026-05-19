@@ -374,10 +374,7 @@ def _act_send_message(data: dict, qurl: str) -> dict:
         "receive_count": 0,
         "first_receive_at": None,
         "message_attributes": msg_attrs,
-        "sys": {
-            "SenderId": get_account_id(),
-            "SentTimestamp": str(int(now * 1000)),
-        },
+        "sys": _build_send_sys_attrs(now, sys_attrs),
         "group_id": group_id,
         "dedup_id": dedup_id,
         "dedup_cache_key": dedup_cache_key if q["is_fifo"] else None,
@@ -670,6 +667,24 @@ def _act_send_message_batch(data: dict, qurl: str) -> dict:
     if len(entries) > 10:
         raise _Err("TooManyEntriesInBatchRequest",
                    "Too many messages in a batch request. A maximum of 10 messages are allowed.")
+
+    # AWS rule: "The maximum allowed individual message size and the maximum
+    # total payload size (the sum of the individual lengths of all of the
+    # batched messages) are both 1 MiB 1,048,576 bytes." Reject the entire
+    # batch with BatchRequestTooLong (HTTP 400) if the aggregate is over.
+    # See https://docs.aws.amazon.com/AWSSimpleQueueService/latest/APIReference/API_SendMessageBatch.html
+    _BATCH_MAX_BYTES = 1_048_576
+    total_bytes = sum(
+        len((e.get("MessageBody") or "").encode("utf-8"))
+        for e in entries
+    )
+    if total_bytes > _BATCH_MAX_BYTES:
+        raise _Err(
+            "BatchRequestTooLong",
+            "Batch requests cannot be longer than 1048576 bytes. "
+            f"You have sent {total_bytes} bytes.",
+        )
+
     ok: list = []
     fail: list = []
     for e in entries:
@@ -733,7 +748,23 @@ def _act_list_queue_tags(data: dict, qurl: str) -> dict:
 def _act_tag_queue(data: dict, qurl: str) -> dict:
     url = data.get("QueueUrl", qurl)
     q = _get_q(url)
-    q.setdefault("tags", {}).update(data.get("Tags") or {})
+    raw_tags = data.get("Tags") or {}
+    # Real AWS rejects null tag VALUES (a JSON null in the wire payload) with
+    # InvalidParameterValue (400). boto3's Python client blocks this at the
+    # client-side via shape validation, but Java SDK v2, Go SDK, and raw HTTP
+    # callers can ship `{"Tags": {"key": null}}`. Previously we stored the
+    # Python None as-is, which then serialised back to literal "null"
+    # via XML serialisation. Refuse them at the door instead.
+    # Tags map is `string -> string` per the service-2 model — a null value
+    # is not a valid string.
+    for k, v in raw_tags.items():
+        if v is None:
+            raise _Err(
+                "InvalidParameterValue",
+                f"Value for parameter Tag.Value is invalid. Reason: "
+                f"Tag value for key '{k}' is null.",
+            )
+    q.setdefault("tags", {}).update(raw_tags)
     return {}
 
 
@@ -943,6 +974,29 @@ def _prune_dedup(q: dict) -> None:
 
 # ── Build system attributes for a received message ────────
 
+def _build_send_sys_attrs(now: float, sys_attrs_input: dict) -> dict:
+    """Build the per-message ``sys`` dict for SendMessage.
+
+    AWS allows callers to ship ``MessageSystemAttributes`` on SendMessage —
+    currently only ``AWSTraceHeader`` (X-Ray propagation) is accepted, with
+    ``DataType=String``. Receivers see the value back via ReceiveMessage's
+    ``MessageSystemAttributeNames=['AWSTraceHeader']`` (or ``All``).
+    See https://docs.aws.amazon.com/AWSSimpleQueueService/latest/APIReference/API_SendMessage.html
+    """
+    sys: dict = {
+        "SenderId": get_account_id(),
+        "SentTimestamp": str(int(now * 1000)),
+    }
+    if not sys_attrs_input:
+        return sys
+    trace = sys_attrs_input.get("AWSTraceHeader")
+    if isinstance(trace, dict):
+        v = trace.get("StringValue") or trace.get("stringValue")
+        if v:
+            sys["AWSTraceHeader"] = v
+    return sys
+
+
 def _build_sys_attrs(msg: dict, names: list) -> dict:
     if not names:
         return {}
@@ -964,6 +1018,9 @@ def _build_sys_attrs(msg: dict, names: list) -> dict:
         r["MessageDeduplicationId"] = msg["dedup_id"]
     if msg.get("group_id") and (want_all or "MessageGroupId" in names):
         r["MessageGroupId"] = msg["group_id"]
+    trace = msg["sys"].get("AWSTraceHeader")
+    if trace and (want_all or "AWSTraceHeader" in names):
+        r["AWSTraceHeader"] = trace
     return r
 
 

@@ -294,6 +294,97 @@ def _parse_range(range_header: str, total: int):
     return start, end
 
 
+_RESPONSE_OVERRIDE_PARAMS = (
+    "response-cache-control",
+    "response-content-disposition",
+    "response-content-encoding",
+    "response-content-language",
+    "response-content-type",
+    "response-expires",
+)
+
+
+def _apply_response_overrides(resp_headers: dict, query_params: dict) -> None:
+    """Apply the six ``response-*`` GetObject query-string overrides to the
+    outgoing response headers, matching real S3:
+
+      response-cache-control       → Cache-Control
+      response-content-disposition → Content-Disposition
+      response-content-encoding    → Content-Encoding
+      response-content-language    → Content-Language
+      response-content-type        → Content-Type
+      response-expires             → Expires
+
+    Each override REPLACES the corresponding response header. Empty values
+    are ignored (boto3 doesn't send the param if you pass ``None``). The
+    signedness gate runs separately in ``_reject_response_overrides_if_unsigned``;
+    by the time this helper runs we've already accepted the request.
+    """
+    overrides = (
+        ("response-cache-control",       "Cache-Control"),
+        ("response-content-disposition", "Content-Disposition"),
+        ("response-content-encoding",    "Content-Encoding"),
+        ("response-content-language",    "Content-Language"),
+        ("response-content-type",        "Content-Type"),
+        ("response-expires",             "Expires"),
+    )
+    for qkey, hkey in overrides:
+        val = _qp(query_params, qkey, "")
+        if not val:
+            continue
+        # Replace, don't append: the put-side preserved-headers dict stores
+        # keys lowercased (cache-control, content-disposition, …) and the
+        # default headers dict uses mixed case (Cache-Control). HTTP libs
+        # serialise both, so without an explicit case-insensitive remove the
+        # client sees the override appended to the original (e.g.
+        # "max-age=600, no-store"). Strip every case variant of the target
+        # before writing the override value.
+        target_lc = hkey.lower()
+        for existing in list(resp_headers):
+            if existing.lower() == target_lc:
+                del resp_headers[existing]
+        resp_headers[hkey] = val
+
+
+def _reject_response_overrides_if_unsigned(
+    headers: dict, query_params: dict, bucket_name: str, key: str,
+):
+    """Implement the AWS rule for GetObject's six ``response-*`` query params.
+
+    Per the AWS API reference:
+
+      "When you use these parameters, you must sign the request by using
+       either an Authorization header or a presigned URL. These parameters
+       cannot be used with an unsigned (anonymous) request."
+
+    A request is considered signed if it carries an ``Authorization`` header
+    or a presigned-URL marker (``X-Amz-Signature`` / ``X-Amz-Algorithm`` in
+    the query string — boto3 lower-cases query keys when calling our
+    handlers, so check both cases). Otherwise the six ``response-*`` params
+    are rejected with ``InvalidRequest`` (400) and the AWS-canonical message
+    "Request specific response headers cannot be used for anonymous GET
+    requests."
+    """
+    has_override = any(
+        _qp(query_params, p, "") for p in _RESPONSE_OVERRIDE_PARAMS
+    )
+    if not has_override:
+        return None
+    if headers.get("authorization"):
+        return None
+    if (_qp(query_params, "X-Amz-Signature", "")
+            or _qp(query_params, "x-amz-signature", "")
+            or _qp(query_params, "X-Amz-Algorithm", "")
+            or _qp(query_params, "x-amz-algorithm", "")):
+        return None
+    return _error(
+        "InvalidRequest",
+        "Request specific response headers cannot be used for anonymous GET requests.",
+        400,
+        f"/{bucket_name}/{key}",
+    )
+
+
 def _validate_content_md5(headers: dict, body: bytes):
     md5_header = headers.get("content-md5", "")
     if not md5_header:
@@ -1987,6 +2078,14 @@ def _get_object(bucket_name: str, key: str, headers: dict, query_params: dict = 
     if bucket is None:
         return _no_such_bucket(bucket_name)
 
+    # AWS rule: the six response-* override query parameters require a signed
+    # request (Authorization header or presigned URL). An unsigned/anonymous
+    # GET that carries any of them is rejected with InvalidRequest (400).
+    # See: https://docs.aws.amazon.com/AmazonS3/latest/API/API_GetObject.html
+    err = _reject_response_overrides_if_unsigned(headers, query_params, bucket_name, key)
+    if err is not None:
+        return err
+
     version_id = _qp(query_params, "versionId", "")
     if version_id:
         vkey = (bucket_name, key)
@@ -2031,8 +2130,10 @@ def _get_object(bucket_name: str, key: str, headers: dict, query_params: dict = 
         slice_body = body[start : end + 1]
         resp_headers["Content-Length"] = str(len(slice_body))
         resp_headers["Content-Range"] = f"bytes {start}-{end}/{obj['size']}"
+        _apply_response_overrides(resp_headers, query_params)
         return 206, resp_headers, slice_body
 
+    _apply_response_overrides(resp_headers, query_params)
     return 200, resp_headers, body
 
 

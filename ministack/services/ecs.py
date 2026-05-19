@@ -937,7 +937,8 @@ def _docker_binds_from_taskdef(td, cdef):
 
 
 def _build_run_kwargs(cdef, td, env, port_bindings, ecs_network,
-                      host_mode, task_id, task_arn, ministack_net_ip):
+                      host_mode, task_id, task_arn, ministack_net_ip,
+                      cluster_arn):
     """Build kwargs for docker_client.containers.run from a container
     definition + task definition (privileged, cap_add, pid_mode, networking,
     bind mounts).
@@ -952,7 +953,14 @@ def _build_run_kwargs(cdef, td, env, port_bindings, ecs_network,
         environment=env,
         ports=port_bindings or None,
         name=f"ministack-ecs-{task_id[:8]}-{cdef['name']}",
-        labels={"ministack": "ecs", "task_arn": task_arn},
+        labels={
+            "ministack": "ecs",
+            "com.amazonaws.ecs.cluster": cluster_arn,
+            "com.amazonaws.ecs.container-name": cdef["name"],
+            "com.amazonaws.ecs.task-arn": task_arn,
+            "com.amazonaws.ecs.task-definition-family": td.get("family", ""),
+            "com.amazonaws.ecs.task-definition-version": str(td.get("revision", 1)),
+        },
         command=cdef.get("command"),
         privileged=bool(cdef.get("privileged") or cdef.get("Privileged")),
     )
@@ -1090,6 +1098,7 @@ def _run_task(data):
                 run_kwargs = _build_run_kwargs(
                     cdef, td, env, port_bindings, ecs_network,
                     host_mode, task_id, task_arn, ministack_net_ip,
+                    _clusters[cluster_name]["clusterArn"],
                 )
 
                 try:
@@ -1237,6 +1246,12 @@ def _list_tasks(data):
     for arn, t in _tasks.items():
         if t.get("clusterArn") != cluster_arn:
             continue
+        # Reconcile lifecycle on the fly: a task whose container has exited
+        # naturally (handler returned, process crashed) should report STOPPED
+        # — not the stale RUNNING that survives until someone calls
+        # DescribeTasks. _maybe_mark_stopped is a no-op for tasks not in
+        # RUNNING or without docker ids, so the hot path is cheap.
+        _maybe_mark_stopped(t)
         if t.get("desiredStatus") != status_filter:
             continue
         if family:
