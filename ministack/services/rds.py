@@ -222,67 +222,80 @@ def _grant_mysql_master_user_privileges(host, port, master_user, master_pass, db
             db_id, e)
 
 
-def _readiness_timeout_s() -> int:
-    """Per-call readiness timeout in seconds.
-
-    Defaults to 120s — fits cold-pull + bootstrap on a typical CI runner
-    without hanging a background thread forever on a broken image. Override
-    with ``RDS_READINESS_TIMEOUT_S`` (positive integer). Invalid values fall
-    back to the default rather than crashing the create path.
+def _try_database_connect(host, port, engine, user, password, db_name):
+    """Single auth-probe attempt. Returns True on success, False on a
+    transient failure. TCP readiness alone is not enough for MySQL/Postgres
+    images — they accept sockets before bootstrap creates users/databases —
+    so we open and close an authenticated connection. When the DB driver
+    isn't installed (lightweight image) we fall back to a one-shot TCP check.
     """
-    raw = os.environ.get("RDS_READINESS_TIMEOUT_S", "")
     try:
-        v = int(raw)
-        if v > 0:
-            return v
-    except (TypeError, ValueError):
-        pass
-    return 120
+        if _is_mysql_engine(engine):
+            try:
+                import pymysql
+            except ImportError:
+                return _wait_for_port(host, port, timeout=1)
+            conn = pymysql.connect(
+                host=host, port=int(port), user="root",
+                password=password, database=db_name or None,
+                connect_timeout=2, read_timeout=2, write_timeout=2,
+                autocommit=True)
+        elif _is_postgres_engine(engine):
+            try:
+                import psycopg2
+            except ImportError:
+                return _wait_for_port(host, port, timeout=1)
+            conn = psycopg2.connect(
+                host=host, port=int(port), user=user,
+                password=password, dbname=db_name or "postgres",
+                connect_timeout=2)
+        else:
+            return _wait_for_port(host, port, timeout=1)
+        conn.close()
+        return True
+    except Exception as e:
+        # Distinguish *permanent* auth failures from transient boot-time errors.
+        # A transient failure (server still starting, socket refused, etc.) is
+        # expected during the readiness loop. A permanent auth failure means
+        # the container's image is configured with a different password than
+        # the one ministack handed it — the loop would spin forever and the
+        # user would see nothing. Surface that case at WARNING level with a
+        # concrete hint so it shows up in ministack logs.
+        msg = str(e)
+        is_auth_denied = (
+            # pymysql: OperationalError with MySQL error code 1045
+            (getattr(e, "args", None) and isinstance(e.args[0], int) and e.args[0] == 1045)
+            # psycopg2 and generic driver messages
+            or "password authentication failed" in msg.lower()
+            or "access denied for user" in msg.lower()
+        )
+        if is_auth_denied:
+            logger.warning(
+                "RDS: authentication denied probing %s:%s — the container's "
+                "image is configured with a different password than ministack "
+                "passed at start-up. The instance will stay in `creating` until "
+                "the container exits. Driver error: %s",
+                host, port, msg,
+            )
+        else:
+            logger.debug("RDS: readiness probe transient failure: %s", e)
+        return False
 
 
-def _wait_for_database_ready(host, port, engine, user, password, db_name, timeout=None):
-    """Block until the database accepts an authenticated connection.
-
-    TCP readiness is not enough for MySQL/Postgres images: they can accept a
-    socket before bootstrap has created users and databases. When a DB driver is
-    unavailable in the lightweight install, fall back to TCP readiness so RDS
-    control-plane behavior remains usable without optional dependencies.
+def _wait_for_database_ready(host, port, engine, user, password, db_name,
+                             is_container_alive):
+    """Poll until the database accepts an authenticated connection. No wall
+    clock — real AWS `CreateDBInstance` has no caller-visible timeout, so
+    neither do we. The loop terminates on success or when the backing
+    container stops being alive (mirrors how real RDS flips an instance to
+    `failed` based on hardware state, not a fixed deadline).
     """
-    if timeout is None:
-        timeout = _readiness_timeout_s()
-    deadline = time.time() + timeout
-    last_error = None
-    while time.time() < deadline:
-        try:
-            if _is_mysql_engine(engine):
-                try:
-                    import pymysql
-                except ImportError:
-                    return _wait_for_port(host, port, timeout=max(1, deadline - time.time()))
-                conn = pymysql.connect(
-                    host=host, port=int(port), user="root",
-                    password=password, database=db_name or None,
-                    connect_timeout=2, read_timeout=2, write_timeout=2,
-                    autocommit=True)
-            elif _is_postgres_engine(engine):
-                try:
-                    import psycopg2
-                except ImportError:
-                    return _wait_for_port(host, port, timeout=max(1, deadline - time.time()))
-                conn = psycopg2.connect(
-                    host=host, port=int(port), user=user,
-                    password=password, dbname=db_name or "postgres",
-                    connect_timeout=2)
-            else:
-                return _wait_for_port(host, port, timeout=max(1, deadline - time.time()))
-            conn.close()
+    while True:
+        if not is_container_alive():
+            return False
+        if _try_database_connect(host, port, engine, user, password, db_name):
             return True
-        except Exception as e:
-            last_error = e
-            time.sleep(0.5)
-    if last_error:
-        logger.debug("RDS: database readiness check failed: %s", last_error)
-    return False
+        time.sleep(0.5)
 
 
 def _refresh_cluster_status(cluster_id):
@@ -694,13 +707,30 @@ def _create_db_instance(p):
             db_name=db_name, ready_host=ready_host, ready_port=ready_port,
             ms_network=ms_network, internal_host=internal_host,
             internal_port=internal_port, endpoint_port=endpoint_port,
+            container_id=docker_container_id,
         ):
+            # Tie readiness to backing-container liveness rather than a wall
+            # clock: real RDS `CreateDBInstance` has no caller-visible timeout
+            # and flips status to `failed` based on hardware state. We do the
+            # same — instance stays `creating` while the container is up and
+            # booting, transitions to `failed` if the container dies before
+            # accepting an authenticated connection.
+            def _container_alive():
+                client = _get_docker()
+                if not client or not container_id:
+                    return True  # control-plane-only — nothing to monitor
+                try:
+                    c = client.containers.get(container_id)
+                    c.reload()
+                    return c.status not in ("exited", "dead", "removing")
+                except Exception:
+                    return False
             if not _wait_for_database_ready(
                 ready_host, ready_port, engine, master_user,
-                master_pass, db_name,
+                master_pass, db_name, _container_alive,
             ):
                 logger.warning(
-                    "RDS: %s container for %s at %s:%s not ready after timeout",
+                    "RDS: %s container for %s at %s:%s exited before becoming reachable",
                     engine, db_id, ready_host, ready_port,
                 )
                 inst = _instances.get(db_id)

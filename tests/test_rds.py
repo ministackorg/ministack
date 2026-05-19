@@ -1003,9 +1003,9 @@ def test_rds_create_db_instance_returns_before_container_is_ready(rds):
         AllocatedStorage=20,
     )
     elapsed = time.time() - t0
-    # Even with Docker boot, the handler must not block on readiness — it
-    # should return within a couple of seconds, certainly far under the
-    # default 120s readiness timeout.
+    # Real AWS `CreateDBInstance` returns within milliseconds — readiness is
+    # observed asynchronously via `DescribeDBInstances`. We allow a couple of
+    # seconds for docker-client setup but must not block on the boot itself.
     assert elapsed < 10, (
         f"CreateDBInstance blocked {elapsed:.1f}s — should return immediately "
         "with status=creating and let a background thread finalise readiness"
