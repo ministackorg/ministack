@@ -7,7 +7,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
-## [Unreleased]
+## [1.3.45] — 2026-05-20
 
 ### Fixed
 - **CloudWatch Logs `GetLogEvents` / `FilterLogEvents` accept `logGroupIdentifier`** — both ops now resolve the target log group from the AWS-documented `logGroupIdentifier` parameter (either the bare group name or a full `arn:aws:logs:<region>:<account>:log-group:<name>[:*]` ARN), as well as the original `logGroupName`. Calls that pass an ARN — common from AWS SDK code that has the group ARN handy — no longer fail with `ResourceNotFoundException: The specified log group does not exist: None`. Reported by @msulima.
