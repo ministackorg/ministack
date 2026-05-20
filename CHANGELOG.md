@@ -7,6 +7,15 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [Unreleased]
+
+### Fixed
+- **CloudWatch Logs `GetLogEvents` / `FilterLogEvents` accept `logGroupIdentifier`** — both ops now resolve the target log group from the AWS-documented `logGroupIdentifier` parameter (either the bare group name or a full `arn:aws:logs:<region>:<account>:log-group:<name>[:*]` ARN), as well as the original `logGroupName`. Calls that pass an ARN — common from AWS SDK code that has the group ARN handy — no longer fail with `ResourceNotFoundException: The specified log group does not exist: None`. Reported by @msulima.
+- **ElastiCache `DescribeCacheClusters` emits full `CacheNode` shape** — the per-node XML now includes `CacheNodeCreateTime` (ISO8601), `ParameterGroupStatus`, `CustomerAvailabilityZone` (derived from the cluster's preferred AZ), and `SourceCacheNodeId` (when non-empty) in addition to the previous `CacheNodeId` / `CacheNodeStatus` / `Endpoint`. `hashicorp/terraform-provider-aws` v6.45.0 deref's `CacheNodeCreateTime` without a nil check during read after `aws_elasticache_cluster` apply, causing `Unexpected nil pointer in: {CacheNodeCreateTime:<nil> …}` and preventing Terraform from confirming cluster availability. Reported by @trackme-ddisley.
+- **API Gateway v1 `UpdateStage` boolean fields parsed from patch strings** — AWS sends `patchOperations[].value` as strings, but the v1 PATCH handler previously assigned them as-is via the generic patch path. SDK clients (e.g. Pulumi / AWS SDK Go v2) that read back `tracingEnabled` and `cacheClusterEnabled` then failed deserialization with `expected Boolean to be of type *bool, got string instead`. Those two root-stage fields are now coerced to `bool` (`"true"` → `True`) before being applied, with an exact path match so a stage variable named `tracingEnabled` is unaffected. Contributed by @duc12597.
+
+---
+
 ## [1.3.44] — 2026-05-19
 
 ### Added

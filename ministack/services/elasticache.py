@@ -1598,14 +1598,29 @@ def _cluster_xml_inner(c):
     ep = c.get("_endpoint", {})
     nodes_xml = ""
     # CacheNodeList.member.locationName = "CacheNode"
+    az = c.get("PreferredAvailabilityZone", "")
     for node in c.get("CacheNodes", []):
         nep = node.get("Endpoint", {})
+        # CacheNodeCreateTime is a TStamp (ISO8601); fall back to cluster create if absent.
+        created = node.get("CacheNodeCreateTime") or c.get("CacheClusterCreateTime") or time.time()
+        if isinstance(created, (int, float)):
+            created_iso = time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(created))
+        else:
+            created_iso = str(created)
+        node_az = node.get("CustomerAvailabilityZone") or az
+        pgs = node.get("ParameterGroupStatus", "in-sync")
+        src = node.get("SourceCacheNodeId") or ""
+        src_xml = f"<SourceCacheNodeId>{src}</SourceCacheNodeId>" if src else ""
         nodes_xml += (
             f"<CacheNode>"
             f"<CacheNodeId>{node['CacheNodeId']}</CacheNodeId>"
             f"<CacheNodeStatus>{node['CacheNodeStatus']}</CacheNodeStatus>"
+            f"<CacheNodeCreateTime>{created_iso}</CacheNodeCreateTime>"
             f"<Endpoint><Address>{nep.get('Address', 'localhost')}</Address>"
             f"<Port>{nep.get('Port', 6379)}</Port></Endpoint>"
+            f"<ParameterGroupStatus>{pgs}</ParameterGroupStatus>"
+            f"<CustomerAvailabilityZone>{node_az}</CustomerAvailabilityZone>"
+            f"{src_xml}"
             f"</CacheNode>"
         )
     return (

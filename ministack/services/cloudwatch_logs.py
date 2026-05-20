@@ -427,8 +427,27 @@ def _put_log_events(data):
     return json_response({"nextSequenceToken": token})
 
 
+def _resolve_log_group_name(data):
+    """Per AWS: GetLogEvents / FilterLogEvents accept either `logGroupName` or
+    `logGroupIdentifier` (name or ARN), but not both. Returns the resolved name
+    or None."""
+    name = data.get("logGroupName")
+    if name:
+        return name
+    ident = data.get("logGroupIdentifier")
+    if not ident:
+        return None
+    if ident.startswith("arn:"):
+        # arn:aws:logs:<region>:<account>:log-group:<name>[:*]
+        parts = ident.split(":log-group:", 1)
+        if len(parts) == 2:
+            tail = parts[1]
+            return tail[:-2] if tail.endswith(":*") else tail
+    return ident
+
+
 def _get_log_events(data):
-    group = data.get("logGroupName")
+    group = _resolve_log_group_name(data)
     stream = data.get("logStreamName")
     limit = min(data.get("limit", 10000), 10000)
     start_from_head = data.get("startFromHead", False)
@@ -519,7 +538,7 @@ def _compile_filter_pattern(raw: str):
 
 
 def _filter_log_events(data):
-    group = data.get("logGroupName")
+    group = _resolve_log_group_name(data)
     raw_pattern = data.get("filterPattern", "")
     pattern_fn = _compile_filter_pattern(raw_pattern)
     limit = min(data.get("limit", 10000), 10000)

@@ -28,6 +28,35 @@ def test_logs_filter(logs):
     resp = logs.filter_log_events(logGroupName="/test/ministack", filterPattern="MiniStack")
     assert len(resp["events"]) >= 1
 
+
+def test_logs_get_log_events_by_identifier_arn(logs):
+    logs.create_log_group(logGroupName="/cwl/ident-arn")
+    logs.create_log_stream(logGroupName="/cwl/ident-arn", logStreamName="s1")
+    logs.put_log_events(
+        logGroupName="/cwl/ident-arn",
+        logStreamName="s1",
+        logEvents=[{"timestamp": int(time.time() * 1000), "message": "hi"}],
+    )
+    arn = "arn:aws:logs:us-east-1:000000000000:log-group:/cwl/ident-arn:*"
+    resp = logs.get_log_events(logGroupIdentifier=arn, logStreamName="s1")
+    assert len(resp["events"]) == 1
+    # Bare name accepted as identifier too.
+    resp2 = logs.get_log_events(logGroupIdentifier="/cwl/ident-arn", logStreamName="s1")
+    assert len(resp2["events"]) == 1
+
+
+def test_logs_filter_log_events_by_identifier_arn(logs):
+    logs.create_log_group(logGroupName="/cwl/ident-arn-flt")
+    logs.create_log_stream(logGroupName="/cwl/ident-arn-flt", logStreamName="s1")
+    logs.put_log_events(
+        logGroupName="/cwl/ident-arn-flt",
+        logStreamName="s1",
+        logEvents=[{"timestamp": int(time.time() * 1000), "message": "ERROR boom"}],
+    )
+    arn = "arn:aws:logs:us-east-1:000000000000:log-group:/cwl/ident-arn-flt"
+    resp = logs.filter_log_events(logGroupIdentifier=arn, filterPattern="ERROR")
+    assert len(resp["events"]) >= 1
+
 def test_logs_create_group_v2(logs):
     logs.create_log_group(logGroupName="/cwl/cg-v2")
     resp = logs.describe_log_groups(logGroupNamePrefix="/cwl/cg-v2")

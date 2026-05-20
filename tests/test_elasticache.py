@@ -25,6 +25,24 @@ def test_elasticache_create(ec):
     assert clusters[0]["CacheClusterId"] == "test-redis"
     assert clusters[0]["Engine"] == "redis"
 
+def test_elasticache_cache_node_full_fields(ec):
+    """terraform-provider-aws v6 derefs CacheNodeCreateTime / ParameterGroupStatus /
+    CustomerAvailabilityZone without nil checks. Issue #675."""
+    ec.create_cache_cluster(
+        CacheClusterId="cn-fields",
+        Engine="redis",
+        CacheNodeType="cache.t3.micro",
+        NumCacheNodes=1,
+    )
+    resp = ec.describe_cache_clusters(CacheClusterId="cn-fields", ShowCacheNodeInfo=True)
+    node = resp["CacheClusters"][0]["CacheNodes"][0]
+    assert "CacheNodeCreateTime" in node
+    assert node["ParameterGroupStatus"] == "in-sync"
+    assert node["CustomerAvailabilityZone"]  # non-empty
+    assert node["CacheNodeId"] == "0001"
+    assert node["CacheNodeStatus"] == "available"
+
+
 def test_elasticache_replication_group(ec):
     ec.create_replication_group(
         ReplicationGroupId="test-rg",
