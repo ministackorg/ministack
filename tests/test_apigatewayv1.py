@@ -275,10 +275,14 @@ def test_apigwv1_update_stage(apigw_v1):
     apigw_v1.update_stage(
         restApiId=api_id,
         stageName="dev",
-        patchOperations=[{"op": "replace", "path": "/variables/myVar", "value": "myVal"}],
+        patchOperations=[
+            {"op": "replace", "path": "/variables/myVar", "value": "myVal"},
+            {"op": "replace", "path": "/tracingEnabled", "value": "true"},
+        ],
     )
     resp = apigw_v1.get_stage(restApiId=api_id, stageName="dev")
     assert resp["variables"]["myVar"] == "myVal"
+    assert resp["tracingEnabled"] is True
     apigw_v1.delete_rest_api(restApiId=api_id)
 
 

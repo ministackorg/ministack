@@ -448,6 +448,11 @@ def _apply_stage_patch(stage, patch_ops):
     leftover = []
     for op in patch_ops:
         if not _try_apply_method_settings_patch(stage, op):
+            if "value" in op:
+                path = op.get("path", "")
+                if "tracingEnabled" in path or "cacheClusterEnabled" in path:
+                    # UpdateStage sends patch `value` as strings (e.g. `"true"` for `tracingEnabled`)
+                    op["value"] = str(op["value"]).lower() == "true"
             leftover.append(op)
     if leftover:
         _apply_patch(stage, leftover)
