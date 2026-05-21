@@ -7,6 +7,16 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [1.3.46] — 2026-05-21
+
+### Added
+- **S3 `PutObject` conditional writes** — `If-None-Match: "*"` (create-once) and `If-Match: "<etag>"` (optimistic concurrency) are now enforced on `PutObject`, matching the AWS feature shipped November 2024. Precondition violations return 412 `PreconditionFailed`, except `If-Match: "<etag>"` against a missing key which returns 404 `NoSuchKey` per the AWS user guide. ETag comparison strips surrounding quotes on both sides. The symmetric `x-amz-copy-source-if-match` headers on `CopyObject` were already supported; this closes the gap on plain `PutObject`. Contributed by @mattcookio.
+
+### Fixed
+- **Cognito JWT `iss` claim uses the pool's region, not the request region** — when a SigV4 scope carried a different region from the pool's creation region, the JWT `iss` mismatched the pool ID prefix and standards-compliant validators rejected the token. A new `_pool_region(pool_id)` resolver parses the region from the pool ID (`{region}_{suffix}`) and is applied to the `iss` claim, the PreTokenGeneration trigger event region, the user-pool ARN, the OIDC discovery `issuer`, and the hosted-UI CloudFront URL on `CreateUserPoolDomain` / `DescribeUserPoolDomain`. The parser accepts 3-segment commercial regions and 4-segment GovCloud / ISO regions (`us-gov-east-1`, `us-iso-east-1`, etc.). Contributed by @subrotosanyal.
+
+---
+
 ## [1.3.45] — 2026-05-20
 
 ### Fixed

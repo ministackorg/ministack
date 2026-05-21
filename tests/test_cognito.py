@@ -3101,6 +3101,100 @@ def test_cognito_iss_claim_uses_pool_region():
     )
 
 
+def test_cognito_pool_region_parser_govcloud():
+    """`_pool_region` must accept 4-segment GovCloud / ISO region prefixes.
+
+    Cognito is available in GovCloud (us-gov-east-1, us-gov-west-1) and the ISO
+    regions. The original `_pool_region` regex (`^[a-z]+-[a-z]+-\\d+$`) only
+    matched 3-segment commercial regions, so GovCloud pools silently fell back
+    to `get_region()` and reproduced the iss-claim bug there.
+    """
+    mod = _cognito_module()
+    cases = [
+        ("us-east-1_abc123def", "us-east-1"),
+        ("eu-central-1_abc123def", "eu-central-1"),
+        ("us-gov-east-1_abc123def", "us-gov-east-1"),
+        ("us-gov-west-1_abc123def", "us-gov-west-1"),
+        ("us-iso-east-1_abc123def", "us-iso-east-1"),
+        ("us-isob-east-1_abc123def", "us-isob-east-1"),
+        ("eu-isoe-west-1_abc123def", "eu-isoe-west-1"),
+        ("cn-northwest-1_abc123def", "cn-northwest-1"),
+        ("ap-southeast-4_abc123def", "ap-southeast-4"),
+    ]
+    for pool_id, expected in cases:
+        assert mod._pool_region(pool_id) == expected, (
+            f"_pool_region({pool_id!r}) should return {expected!r}, got {mod._pool_region(pool_id)!r}"
+        )
+
+
+def test_cognito_pool_arn_uses_pool_region():
+    """`_pool_arn` must encode the pool's region, not the request region.
+
+    A pool created in eu-central-1 and described from any other request context
+    must still return an ARN whose region segment is `eu-central-1` — that is
+    real-AWS behavior (the pool is a regional resource) and CloudFormation /
+    cross-account-trust policies depend on a stable ARN.
+    """
+    mod = _cognito_module()
+    arn = mod._pool_arn("eu-central-1_abcdef")
+    assert ":cognito-idp:eu-central-1:" in arn, arn
+    arn_gov = mod._pool_arn("us-gov-east-1_abcdef")
+    assert ":cognito-idp:us-gov-east-1:" in arn_gov, arn_gov
+
+
+def test_cognito_openid_discovery_issuer_uses_pool_region():
+    """OIDC discovery's `issuer` must match the JWT `iss` — both derived from pool region.
+
+    OIDC clients verify `iss == discovery.issuer`. If discovery returns the
+    request-scope region but the JWT carries the pool-scope region, every
+    standards-compliant validator rejects the token. Regression coverage for
+    the same root-cause class as #678.
+    """
+    mod = _cognito_module()
+    pool_id = "eu-central-1_abcdef123"
+    # Even if the request scope says us-east-1, discovery must return eu-central-1
+    # because that's what the JWT iss will encode.
+    _status, _headers, body = mod.well_known_openid_configuration(pool_id, region="us-east-1", host="localhost:4566")
+    doc = json.loads(body)
+    assert doc["issuer"] == f"https://cognito-idp.eu-central-1.amazonaws.com/{pool_id}", doc["issuer"]
+
+
+def test_cognito_user_pool_domain_cloudfront_uses_pool_region():
+    """CreateUserPoolDomain / DescribeUserPoolDomain CloudFront URL must reflect the pool's region.
+
+    Real AWS user pool domains are regional — the hosted-UI CloudFront URL is
+    `{domain}.auth.{pool-region}.amazoncognito.com`. Using the request region
+    would point clients at the wrong region's domain.
+    """
+    import boto3
+
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+    region = "eu-central-1"
+    client = boto3.client(
+        "cognito-idp",
+        endpoint_url=endpoint,
+        aws_access_key_id="test",
+        aws_secret_access_key="test",
+        region_name=region,
+    )
+    pid = client.create_user_pool(PoolName="DomainRegionPool")["UserPool"]["Id"]
+    assert pid.startswith("eu-central-1_")
+
+    # Pool ARN should encode eu-central-1.
+    desc = client.describe_user_pool(UserPoolId=pid)
+    assert ":cognito-idp:eu-central-1:" in desc["UserPool"]["Arn"], desc["UserPool"]["Arn"]
+
+    domain = f"domain-region-{pid.split('_', 1)[1].lower()}"
+    create_resp = client.create_user_pool_domain(Domain=domain, UserPoolId=pid)
+    assert create_resp["CloudFrontDomain"].endswith(".auth.eu-central-1.amazoncognito.com"), (
+        create_resp["CloudFrontDomain"]
+    )
+    desc_resp = client.describe_user_pool_domain(Domain=domain)
+    assert desc_resp["DomainDescription"]["CloudFrontDistribution"].endswith(
+        ".auth.eu-central-1.amazoncognito.com"
+    ), desc_resp["DomainDescription"]["CloudFrontDistribution"]
+
+
 def test_cognito_email_disabled_env_skips_send(cognito_idp, monkeypatch):
     """COGNITO_EMAIL_ENABLED=false must short-circuit delivery in-process."""
     mod = _cognito_module()
