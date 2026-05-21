@@ -3044,6 +3044,63 @@ def test_cognito_resend_confirmation_code_sends_email(cognito_idp):
     assert len(msgs) == 2
 
 
+def test_cognito_iss_claim_uses_pool_region():
+    """Regression test for #678: JWT iss claim must reflect the pool's region.
+
+    Creates a user pool via a client configured with eu-central-1 and verifies
+    that both IdToken and AccessToken carry eu-central-1 in their iss claim,
+    not the server's default us-east-1.
+    """
+    import boto3
+
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+    region = "eu-central-1"
+    client = boto3.client(
+        "cognito-idp",
+        endpoint_url=endpoint,
+        aws_access_key_id="test",
+        aws_secret_access_key="test",
+        region_name=region,
+    )
+
+    pid = client.create_user_pool(PoolName="IssRegionPool")["UserPool"]["Id"]
+    assert pid.startswith("eu-central-1_"), f"pool_id should encode region: {pid}"
+
+    cid = client.create_user_pool_client(
+        UserPoolId=pid,
+        ClientName="IssRegionApp",
+        ExplicitAuthFlows=["ALLOW_USER_PASSWORD_AUTH", "ALLOW_REFRESH_TOKEN_AUTH"],
+    )["UserPoolClient"]["ClientId"]
+
+    client.admin_create_user(UserPoolId=pid, Username="isstest")
+    client.admin_set_user_password(
+        UserPoolId=pid, Username="isstest", Password="IssTest1!", Permanent=True
+    )
+
+    auth = client.initiate_auth(
+        ClientId=cid,
+        AuthFlow="USER_PASSWORD_AUTH",
+        AuthParameters={"USERNAME": "isstest", "PASSWORD": "IssTest1!"},
+    )
+    result = auth["AuthenticationResult"]
+
+    def _decode_payload(token: str) -> dict:
+        payload_b64 = token.split(".")[1]
+        payload_b64 += "=" * (-len(payload_b64) % 4)
+        return json.loads(base64.urlsafe_b64decode(payload_b64))
+
+    id_claims = _decode_payload(result["IdToken"])
+    access_claims = _decode_payload(result["AccessToken"])
+
+    expected_iss = f"https://cognito-idp.{region}.amazonaws.com/{pid}"
+    assert id_claims["iss"] == expected_iss, (
+        f"IdToken iss should be {expected_iss!r}, got {id_claims['iss']!r}"
+    )
+    assert access_claims["iss"] == expected_iss, (
+        f"AccessToken iss should be {expected_iss!r}, got {access_claims['iss']!r}"
+    )
+
+
 def test_cognito_email_disabled_env_skips_send(cognito_idp, monkeypatch):
     """COGNITO_EMAIL_ENABLED=false must short-circuit delivery in-process."""
     mod = _cognito_module()
