@@ -318,6 +318,19 @@ def _pool_id() -> str:
     return f"{get_region()}_{suffix[:9]}"
 
 
+def _pool_region(pool_id: str) -> str:
+    """Return the region encoded in a pool_id (format ``{region}_{suffix}``).
+
+    Falls back to get_region() for empty or non-standard IDs so callers
+    never have to special-case the edge cases.
+    """
+    if pool_id and "_" in pool_id:
+        candidate = pool_id.rsplit("_", 1)[0]
+        if re.match(r"^[a-z]+-[a-z]+-\d+$", candidate):
+            return candidate
+    return get_region()
+
+
 def _client_id() -> str:
     return "".join(secrets.choice(string.digits + string.ascii_letters) for _ in range(26))
 
@@ -352,7 +365,7 @@ def _fake_token(sub: str, pool_id: str, client_id: str, token_type: str = "acces
     origin_jti = new_uuid()
     claims = {
         "sub": sub,
-        "iss": f"https://cognito-idp.{get_region()}.amazonaws.com/{pool_id}",
+        "iss": f"https://cognito-idp.{_pool_region(pool_id)}.amazonaws.com/{pool_id}",
         "token_use": token_type,
         "iat": now,
         "exp": now + 3600,
@@ -554,7 +567,7 @@ def _build_pretoken_event(pool_id: str, client_id: str, username: str,
     return {
         "version": "1",
         "triggerSource": trigger_source,
-        "region": get_region(),
+        "region": _pool_region(pool_id),
         "userPoolId": pool_id,
         "userName": username or "",
         "callerContext": {
