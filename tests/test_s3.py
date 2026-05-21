@@ -75,6 +75,170 @@ def test_s3_put_object_no_bucket(s3):
         s3.put_object(Bucket="intg-s3-nobucket-xyz", Key="k", Body=b"x")
     assert exc.value.response["Error"]["Code"] == "NoSuchBucket"
 
+
+# ─── Conditional PUT (If-Match / If-None-Match) ──────────────────────────────
+
+def test_s3_put_object_if_none_match_star_no_existing(s3):
+    """If-None-Match: * succeeds when no object exists at the key (create-once)."""
+    bucket = "intg-s3-ifnm-star-create"
+    s3.create_bucket(Bucket=bucket)
+
+    # botocore strips IfNoneMatch on PutObject (added by S3 in 2024); send via low-level
+    # event handler so the header reaches the wire.
+    def _add_ifnm(request, **_kwargs):
+        request.headers["If-None-Match"] = "*"
+
+    s3.meta.events.register_first(
+        "before-send.s3.PutObject", _add_ifnm,
+    )
+    try:
+        s3.put_object(Bucket=bucket, Key="first.txt", Body=b"hello")
+    finally:
+        s3.meta.events.unregister("before-send.s3.PutObject", _add_ifnm)
+
+    resp = s3.get_object(Bucket=bucket, Key="first.txt")
+    assert resp["Body"].read() == b"hello"
+
+
+def test_s3_put_object_if_none_match_star_existing_fails(s3):
+    """If-None-Match: * returns 412 when an object already exists at the key."""
+    bucket = "intg-s3-ifnm-star-conflict"
+    s3.create_bucket(Bucket=bucket)
+    s3.put_object(Bucket=bucket, Key="taken.txt", Body=b"original")
+
+    def _add_ifnm(request, **_kwargs):
+        request.headers["If-None-Match"] = "*"
+
+    s3.meta.events.register_first(
+        "before-send.s3.PutObject", _add_ifnm,
+    )
+    try:
+        with pytest.raises(ClientError) as exc:
+            s3.put_object(Bucket=bucket, Key="taken.txt", Body=b"second")
+    finally:
+        s3.meta.events.unregister("before-send.s3.PutObject", _add_ifnm)
+
+    assert exc.value.response["Error"]["Code"] == "PreconditionFailed"
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 412
+
+    # The original bytes must remain — the failed PUT must not overwrite.
+    resp = s3.get_object(Bucket=bucket, Key="taken.txt")
+    assert resp["Body"].read() == b"original"
+
+
+def test_s3_put_object_if_none_match_etag(s3):
+    """If-None-Match: <etag> succeeds when existing ETag differs, fails when it matches."""
+    bucket = "intg-s3-ifnm-etag"
+    s3.create_bucket(Bucket=bucket)
+    first = s3.put_object(Bucket=bucket, Key="obj.txt", Body=b"v1")
+    first_etag = first["ETag"]
+
+    # Wrong ETag → condition satisfied, PUT succeeds.
+    def _add_wrong(request, **_kwargs):
+        request.headers["If-None-Match"] = '"00000000000000000000000000000000"'
+
+    s3.meta.events.register_first("before-send.s3.PutObject", _add_wrong)
+    try:
+        s3.put_object(Bucket=bucket, Key="obj.txt", Body=b"v2")
+    finally:
+        s3.meta.events.unregister("before-send.s3.PutObject", _add_wrong)
+
+    # Matching ETag → condition violated, PUT fails 412.
+    def _add_match(request, **_kwargs):
+        # Use the new ETag from v2.
+        v2_etag = s3.head_object(Bucket=bucket, Key="obj.txt")["ETag"]
+        request.headers["If-None-Match"] = v2_etag
+
+    s3.meta.events.register_first("before-send.s3.PutObject", _add_match)
+    try:
+        with pytest.raises(ClientError) as exc:
+            s3.put_object(Bucket=bucket, Key="obj.txt", Body=b"v3")
+    finally:
+        s3.meta.events.unregister("before-send.s3.PutObject", _add_match)
+
+    assert exc.value.response["Error"]["Code"] == "PreconditionFailed"
+    _ = first_etag  # unused; kept to show v1 etag captured at write time
+
+
+def test_s3_put_object_if_match_star_requires_existing(s3):
+    """If-Match: * succeeds when an object exists, fails when none does."""
+    bucket = "intg-s3-ifm-star"
+    s3.create_bucket(Bucket=bucket)
+
+    def _add_ifm_star(request, **_kwargs):
+        request.headers["If-Match"] = "*"
+
+    # No existing object → 412.
+    s3.meta.events.register_first("before-send.s3.PutObject", _add_ifm_star)
+    try:
+        with pytest.raises(ClientError) as exc:
+            s3.put_object(Bucket=bucket, Key="missing.txt", Body=b"x")
+    finally:
+        s3.meta.events.unregister("before-send.s3.PutObject", _add_ifm_star)
+    assert exc.value.response["Error"]["Code"] == "PreconditionFailed"
+
+    # Now create it, then If-Match: * succeeds.
+    s3.put_object(Bucket=bucket, Key="present.txt", Body=b"a")
+    s3.meta.events.register_first("before-send.s3.PutObject", _add_ifm_star)
+    try:
+        s3.put_object(Bucket=bucket, Key="present.txt", Body=b"b")
+    finally:
+        s3.meta.events.unregister("before-send.s3.PutObject", _add_ifm_star)
+    assert s3.get_object(Bucket=bucket, Key="present.txt")["Body"].read() == b"b"
+
+
+def test_s3_put_object_if_match_etag(s3):
+    """If-Match: <etag> succeeds when ETag matches, 412 when stale."""
+    bucket = "intg-s3-ifm-etag"
+    s3.create_bucket(Bucket=bucket)
+    initial = s3.put_object(Bucket=bucket, Key="obj.txt", Body=b"v1")
+    initial_etag = initial["ETag"]
+
+    def _add_match(request, **_kwargs):
+        request.headers["If-Match"] = initial_etag
+
+    # Matching ETag → succeed.
+    s3.meta.events.register_first("before-send.s3.PutObject", _add_match)
+    try:
+        s3.put_object(Bucket=bucket, Key="obj.txt", Body=b"v2")
+    finally:
+        s3.meta.events.unregister("before-send.s3.PutObject", _add_match)
+
+    # Old (stale) ETag against the new object → 412.
+    s3.meta.events.register_first("before-send.s3.PutObject", _add_match)
+    try:
+        with pytest.raises(ClientError) as exc:
+            s3.put_object(Bucket=bucket, Key="obj.txt", Body=b"v3")
+    finally:
+        s3.meta.events.unregister("before-send.s3.PutObject", _add_match)
+
+    assert exc.value.response["Error"]["Code"] == "PreconditionFailed"
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 412
+
+
+def test_s3_put_object_if_match_etag_missing_object_returns_404(s3):
+    """If-Match: <etag> against a non-existent key returns 404 NoSuchKey (per AWS docs).
+
+    AWS S3 specifically returns 404 — not 412 — when If-Match: <etag> targets a key
+    that doesn't exist (or whose current version is a delete marker). Documented at
+    https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-writes.html#conditional-error-response
+    """
+    bucket = "intg-s3-ifm-missing"
+    s3.create_bucket(Bucket=bucket)
+
+    def _add_etag(request, **_kwargs):
+        request.headers["If-Match"] = '"00000000000000000000000000000000"'
+
+    s3.meta.events.register_first("before-send.s3.PutObject", _add_etag)
+    try:
+        with pytest.raises(ClientError) as exc:
+            s3.put_object(Bucket=bucket, Key="absent.txt", Body=b"x")
+    finally:
+        s3.meta.events.unregister("before-send.s3.PutObject", _add_etag)
+
+    assert exc.value.response["Error"]["Code"] == "NoSuchKey"
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 404
+
 def test_s3_put_get_json_chunked(s3):
     """AWS SDK v2 sends PutObject with chunked Transfer-Encoding — body must be decoded cleanly."""
     import json as _json

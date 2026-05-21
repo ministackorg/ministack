@@ -405,6 +405,83 @@ def _validate_content_md5(headers: dict, body: bytes):
     return None
 
 
+def _check_put_preconditions(headers: dict, existing_obj: dict | None):
+    """Evaluate `If-Match` and `If-None-Match` on PUT.
+
+    AWS S3 added native conditional writes on PutObject in November 2024:
+      - `If-None-Match: "*"` — succeed only when no object exists at the key.
+        Used to implement create-once semantics (idempotent writes, distributed
+        leader election via S3, two-file pair serialization).
+      - `If-None-Match: "<etag>"` — succeed only when the existing object's
+        ETag does NOT match.
+      - `If-Match: "*"` — succeed only when an object already exists.
+      - `If-Match: "<etag>"` — succeed only when the existing object's ETag
+        matches.
+
+    Returns a 412 PreconditionFailed tuple when a condition is violated;
+    otherwise returns None and the caller proceeds with the PUT.
+
+    ETag comparison strips surrounding quotes on both sides — S3 stores ETags
+    with quotes but client code is inconsistent about including them.
+    """
+    if_none_match = headers.get("if-none-match", "").strip()
+    if_match = headers.get("if-match", "").strip()
+
+    if not if_none_match and not if_match:
+        return None
+
+    existing_etag = (
+        existing_obj["etag"].strip('"') if existing_obj is not None else None
+    )
+
+    if if_none_match:
+        # "*" form: any existing object violates the condition.
+        if if_none_match == "*":
+            if existing_obj is not None:
+                return _error(
+                    "PreconditionFailed",
+                    "At least one of the pre-conditions you specified did not hold",
+                    412,
+                )
+        # ETag form: existing object with matching ETag violates the condition.
+        elif existing_obj is not None and if_none_match.strip('"') == existing_etag:
+            return _error(
+                "PreconditionFailed",
+                "At least one of the pre-conditions you specified did not hold",
+                412,
+            )
+
+    if if_match:
+        # "*" form: any existing object satisfies the condition; missing → 412 per RFC 7232.
+        # (AWS docs don't explicitly document If-Match:* for PutObject, but the inverse case
+        # is well-defined by RFC and real S3 follows it.)
+        if if_match == "*":
+            if existing_obj is None:
+                return _error(
+                    "PreconditionFailed",
+                    "At least one of the pre-conditions you specified did not hold",
+                    412,
+                )
+        elif existing_obj is None:
+            # AWS S3 specifically returns 404 (NoSuchKey) — not 412 — when If-Match: <etag>
+            # targets a key that doesn't exist (or whose current version is a delete marker).
+            # Documented under "Conditional write behavior" in the user guide:
+            # https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-writes.html#conditional-error-response
+            return _error(
+                "NoSuchKey",
+                "The specified key does not exist.",
+                404,
+            )
+        elif if_match.strip('"') != existing_etag:
+            return _error(
+                "PreconditionFailed",
+                "At least one of the pre-conditions you specified did not hold",
+                412,
+            )
+
+    return None
+
+
 def _find_xml_tag(parent, tag_name, ns=S3_NS):
     el = parent.find("{%s}%s" % (ns, tag_name))
     if el is None:
@@ -1775,6 +1852,10 @@ def _put_object(bucket_name: str, key: str, body: bytes, headers: dict):
     _, sc_err = _resolve_storage_class(headers)
     if sc_err:
         return sc_err
+
+    precondition_err = _check_put_preconditions(headers, bucket.get("objects", {}).get(key))
+    if precondition_err:
+        return precondition_err
 
     etag = f'"{md5_hash(body)}"'
     obj = _build_object_record(body, headers, etag=etag)
