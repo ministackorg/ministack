@@ -3148,6 +3148,7 @@ def _delete_objects(bucket_name: str, body: bytes, headers: dict = None):
             _object_tags.pop((bucket_name, k), None)
             _object_retention.pop((bucket_name, k), None)
             _object_legal_hold.pop((bucket_name, k), None)
+            _delete_persisted_object(bucket_name, k)
             deleted_keys.append(k)
 
     resp = Element("DeleteResult", xmlns=S3_NS)
