@@ -7,6 +7,13 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [1.3.47] — 2026-05-22
+
+### Fixed
+- **S3 `DeleteObjects`** — Objects deleted in a batch will now be deleted from disk, much like `DeleteObject`.
+
+---
+
 ## [1.3.46] — 2026-05-21
 
 ### Added
