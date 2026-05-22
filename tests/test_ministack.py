@@ -698,6 +698,9 @@ class TestExtractS3VhostBucket:
     def test_bare_bucket(self):
         assert _extract_s3_vhost_bucket("mybucket.localhost") == "mybucket"
 
+    def test_custom_local_endpoint_bucket(self):
+        assert _extract_s3_vhost_bucket("bucket.ministack:4566") == "bucket"
+
     def test_single_segment_s3_nested_bucket(self):
         assert _extract_s3_vhost_bucket("mybucket.s3.localhost") == "mybucket"
 
@@ -707,7 +710,6 @@ class TestExtractS3VhostBucket:
     def test_single_segment_region_nested_bucket_with_port(self):
         assert _extract_s3_vhost_bucket("mybucket.s3.us-east-1.localhost:4566") == "mybucket"
 
-    @pytest.mark.skip(reason="Dotted Nested Bucket is not supported yet")
     def test_double_segment_s3_nested_bucket(self):
         assert _extract_s3_vhost_bucket("dotted.mybucket.s3.localhost") == "dotted.mybucket"
 

@@ -122,6 +122,18 @@ def _extract_s3_vhost_bucket(host: str):
         host = host.rsplit(":", 1)[0]
     if not host or _IPV4_RE.match(host) or "." not in host:
         return None
+    labels = host.split(".")
+
+    # ex: dotted.mybucket.s3.us-east-1.localhost -> bucket dotted.mybucket.
+    for idx, label in enumerate(labels[1:], start=1):
+        if label == "s3" or label.startswith(("s3-", "s3express-")):
+            candidate = ".".join(labels[:idx])
+            if not _BUCKET_LABEL_RE.match(candidate):
+                return None
+            if ".." in candidate or _IPV4_RE.match(candidate):
+                return None
+            return candidate
+
     candidate, tail = host.split(".", 1)
     if not tail or tail.startswith("."):
         return None
@@ -129,12 +141,14 @@ def _extract_s3_vhost_bucket(host: str):
         return None
     if ".." in candidate or _IPV4_RE.match(candidate):
         return None
+    if candidate == "s3":
+        return None
     if tail == _MINISTACK_HOST or tail.endswith("." + _MINISTACK_HOST):
         return candidate
-    first_tail_segment = tail.split(".", 1)[0]
-    if first_tail_segment == "s3" or first_tail_segment.startswith(("s3-", "s3express-")):
-        return candidate
-    return None
+    # Custom local endpoint names are common in Docker/dev setups, e.g.
+    # `bucket.ministack:4566`. Treat any valid leading DNS label as the bucket;
+    # service-host false positives are filtered by _handle_s3_vhost_request.
+    return candidate
 _S3_VHOST_EXCLUDE_RE = re.compile(r"\.(execute-api|alb|emr|efs|elasticache|s3-control|appsync-api|appsync-realtime-api|iot)\.")
 _HEALTH_PATHS = ("/_ministack/health", "/_localstack/health", "/health")
 _BODY_METHODS = ("POST", "PUT", "PATCH")
@@ -1205,7 +1219,7 @@ async def _handle_s3_vhost_request(host: str, path: str, method: str, headers: d
     ):
         return None
 
-    vhost_path = "/" + bucket + path if path != "/" else "/" + bucket + "/"
+    vhost_path = "/" + bucket + path if path != "/" else "/" + bucket
     try:
         return await _get_module("s3").handle_request(method, vhost_path, headers, body, query_params)
     except Exception as e:
