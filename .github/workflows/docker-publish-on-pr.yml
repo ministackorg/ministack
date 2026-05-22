@@ -1,7 +1,7 @@
 name: Docker Publish on PR
 
 on:
-  pull_request_target:
+  pull_request:
     types: [opened, synchronize, reopened, labeled]
 
 env:
@@ -9,6 +9,10 @@ env:
 
 jobs:
   publish-pr:
+    # Only publish preview images for trusted PRs whose source branch lives in
+    # this repository. Forked PRs run without repository secrets on
+    # `pull_request`, and this guard prevents accidental publish attempts, and cache poisoning.
+    if: github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
 
     permissions:
