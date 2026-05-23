@@ -1049,6 +1049,292 @@ def _cfn_wait_condition_handle_create(logical_id, props, stack_name):
     return pid, {"Ref": url}
 
 
+# --- CloudFormation Nested Stack (AWS::CloudFormation::Stack) ---
+
+def _cfn_nested_stack_deploy(logical_id, props, parent_stack_name, *,
+                             previous_physical_id=None, previous_props=None):
+    """Provision an `AWS::CloudFormation::Stack` nested-stack resource.
+
+    Mirrors the synchronous core of `stacks._deploy_stack_async` but runs
+    inline so the parent's deploy loop can read the child's Outputs (exposed
+    as `Outputs.<Name>` keys on the returned attrs dict so `Fn::GetAtt:
+    [Nested, Outputs.X]` resolves natively).
+
+    Returns ``(child_stack_id, attrs)`` where ``attrs["Outputs.<Name>"]``
+    carries each output value. ``Outputs.<Name>`` keys match the dotted
+    sub-attribute form CDK and console-built templates emit.
+    """
+    import copy
+    from ministack.core.responses import get_account_id, get_region, new_uuid
+    from ministack.services.cloudformation import (
+        _stack_events, _stacks,
+    )
+    from ministack.services.cloudformation.engine import (
+        _evaluate_conditions, _parse_template, _resolve_parameters,
+        _resolve_refs, _topological_sort,
+    )
+    from ministack.services.cloudformation.helpers import _resolve_template
+    from ministack.services.cloudformation.stacks import _add_event
+
+    template_url = props.get("TemplateURL")
+    if not template_url:
+        raise ValueError(
+            "AWS::CloudFormation::Stack requires TemplateURL "
+            "(inline TemplateBody is not supported by real AWS either)"
+        )
+
+    template_body, err = _resolve_template({"TemplateURL": [template_url]})
+    if err is not None:
+        raise ValueError(f"Failed to fetch nested-stack template: {template_url}")
+    if not template_body:
+        raise ValueError(f"Nested-stack template empty at {template_url}")
+
+    template = _parse_template(template_body)
+
+    raw_param_props = props.get("Parameters") or {}
+    if isinstance(raw_param_props, dict):
+        provided_params = [
+            {"Key": k, "Value": "" if v is None else str(v)}
+            for k, v in raw_param_props.items()
+        ]
+    else:
+        provided_params = []
+    param_values = _resolve_parameters(template, provided_params)
+
+    is_update = previous_physical_id is not None
+    if is_update and previous_physical_id in _stacks:
+        child_name = previous_physical_id
+        previous_stack_snapshot = copy.deepcopy(_stacks[child_name])
+    else:
+        child_name = f"{parent_stack_name}-{logical_id}-{new_uuid()[:12]}"
+        previous_stack_snapshot = None
+
+    child_stack_id = (
+        f"arn:aws:cloudformation:{get_region()}:{get_account_id()}:"
+        f"stack/{child_name}/{new_uuid()}"
+    )
+    if previous_stack_snapshot:
+        child_stack_id = previous_stack_snapshot.get("StackId", child_stack_id)
+
+    status_prefix = "UPDATE" if is_update else "CREATE"
+    child_stack = {
+        "StackName": child_name,
+        "StackId": child_stack_id,
+        "StackStatus": f"{status_prefix}_IN_PROGRESS",
+        "StackStatusReason": "",
+        "CreationTime": now_iso(),
+        "LastUpdatedTime": now_iso(),
+        "Description": template.get("Description", ""),
+        "Parameters": [
+            {"ParameterKey": k, "ParameterValue": v["Value"], "NoEcho": v["NoEcho"]}
+            for k, v in param_values.items()
+        ],
+        "Tags": [],
+        "Outputs": [],
+        "DisableRollback": True,
+        "_resources": (previous_stack_snapshot.get("_resources", {})
+                       if previous_stack_snapshot else {}),
+        "_template": template,
+        "_template_body": template_body,
+        "_resolved_params": param_values,
+        "_conditions": _evaluate_conditions(template, param_values),
+        "_parent_stack_name": parent_stack_name,
+        "RootId": _cr_stack_id(parent_stack_name),
+        "ParentId": _cr_stack_id(parent_stack_name),
+    }
+    _stacks[child_name] = child_stack
+    _stack_events.setdefault(child_stack_id, [])
+
+    _add_event(child_stack_id, child_name, child_name,
+               "AWS::CloudFormation::Stack", f"{status_prefix}_IN_PROGRESS",
+               physical_id=child_stack_id)
+
+    mappings = template.get("Mappings", {})
+    conditions = child_stack["_conditions"]
+    resources_defs = template.get("Resources", {})
+    outputs_defs = template.get("Outputs", {})
+
+    try:
+        ordered = _topological_sort(resources_defs, conditions)
+    except ValueError as exc:
+        child_stack["StackStatus"] = f"{status_prefix}_FAILED"
+        child_stack["StackStatusReason"] = str(exc)
+        _add_event(child_stack_id, child_name, child_name,
+                   "AWS::CloudFormation::Stack", f"{status_prefix}_FAILED",
+                   str(exc), child_stack_id)
+        raise
+
+    provisioned: dict = child_stack["_resources"]
+    prev_resources = (previous_stack_snapshot.get("_resources", {})
+                      if previous_stack_snapshot else {})
+
+    for child_logical_id in ordered:
+        res_def = resources_defs[child_logical_id]
+        cond = res_def.get("Condition")
+        if cond and not conditions.get(cond, True):
+            continue
+        resource_type = res_def.get("Type", "AWS::CloudFormation::CustomResource")
+        raw_props = res_def.get("Properties", {})
+        resolved_props = _resolve_refs(
+            copy.deepcopy(raw_props), provisioned, param_values,
+            conditions, mappings, child_name, child_stack_id,
+        )
+        if isinstance(resolved_props, dict):
+            resolved_props = {k: v for k, v in resolved_props.items()
+                              if v is not _NO_VALUE_SENTINEL()}
+
+        _add_event(child_stack_id, child_name, child_logical_id, resource_type,
+                   f"{status_prefix}_IN_PROGRESS")
+        try:
+            prev = prev_resources.get(child_logical_id)
+            if prev:
+                physical_id, attrs = _update_resource(
+                    resource_type, prev.get("PhysicalResourceId", child_logical_id),
+                    prev.get("Properties", {}), resolved_props, child_name,
+                    child_logical_id,
+                )
+            else:
+                physical_id, attrs = _provision_resource(
+                    resource_type, child_logical_id, resolved_props, child_name,
+                )
+        except Exception as exc:
+            child_stack["StackStatus"] = f"{status_prefix}_FAILED"
+            child_stack["StackStatusReason"] = (
+                f"Resource {child_logical_id} failed: {exc}"
+            )
+            _add_event(child_stack_id, child_name, child_logical_id, resource_type,
+                       f"{status_prefix}_FAILED", str(exc))
+            raise
+
+        provisioned[child_logical_id] = {
+            "PhysicalResourceId": physical_id,
+            "ResourceType": resource_type,
+            "ResourceStatus": f"{status_prefix}_COMPLETE",
+            "LogicalResourceId": child_logical_id,
+            "Properties": resolved_props,
+            "Attributes": attrs,
+            "Timestamp": now_iso(),
+        }
+        _add_event(child_stack_id, child_name, child_logical_id, resource_type,
+                   f"{status_prefix}_COMPLETE", physical_id=physical_id)
+
+    if is_update:
+        for stale_id in set(prev_resources) - set(provisioned):
+            old = prev_resources[stale_id]
+            try:
+                _delete_resource(old.get("ResourceType", ""),
+                                 old.get("PhysicalResourceId", ""),
+                                 old.get("Properties", {}),
+                                 child_name, stale_id)
+            except Exception as exc:
+                logger.warning("Nested-stack %s: failed to delete pruned %s: %s",
+                               child_name, stale_id, exc)
+
+    resolved_outputs = []
+    output_attrs: dict[str, str] = {}
+    for out_name, out_def in outputs_defs.items():
+        cond = out_def.get("Condition")
+        if cond and not conditions.get(cond, True):
+            continue
+        out_value = _resolve_refs(
+            copy.deepcopy(out_def.get("Value", "")),
+            provisioned, param_values, conditions,
+            mappings, child_name, child_stack_id,
+        )
+        resolved_outputs.append({
+            "OutputKey": out_name,
+            "OutputValue": str(out_value),
+            "Description": out_def.get("Description", ""),
+        })
+        output_attrs[f"Outputs.{out_name}"] = str(out_value)
+
+    child_stack["Outputs"] = resolved_outputs
+    child_stack["StackStatus"] = f"{status_prefix}_COMPLETE"
+    _add_event(child_stack_id, child_name, child_name,
+               "AWS::CloudFormation::Stack", f"{status_prefix}_COMPLETE",
+               physical_id=child_stack_id)
+
+    # Real AWS: Ref of AWS::CloudFormation::Stack returns the child StackId
+    # (ARN), not the stack name. DescribeStacks/_delete handlers below accept
+    # either form for lookup so callers using Ref->DescribeStacks keep working.
+    return child_stack_id, output_attrs
+
+
+def _NO_VALUE_SENTINEL():
+    from ministack.services.cloudformation.engine import _NO_VALUE
+    return _NO_VALUE
+
+
+def _cfn_nested_stack_create(logical_id, props, stack_name):
+    return _cfn_nested_stack_deploy(logical_id, props, stack_name)
+
+
+def _cfn_nested_stack_update(physical_id, old_props, new_props, stack_name):
+    return _cfn_nested_stack_deploy(
+        physical_id, new_props, stack_name,
+        previous_physical_id=_nested_stack_lookup_name(physical_id),
+        previous_props=old_props,
+    )
+
+
+def _nested_stack_lookup_name(physical_id_or_arn):
+    """Resolve a nested-stack physical id (StackId ARN or stack name) to its
+    `_stacks` dict key. Returns the input if no ARN match is found."""
+    from ministack.services.cloudformation import _stacks
+    if physical_id_or_arn in _stacks:
+        return physical_id_or_arn
+    for name, stk in _stacks.items():
+        if stk.get("StackId") == physical_id_or_arn:
+            return name
+    return physical_id_or_arn
+
+
+def _cfn_nested_stack_delete(physical_id, props):
+    from ministack.services.cloudformation import _exports, _stacks
+    child_name = _nested_stack_lookup_name(physical_id)
+    child_stack = _stacks.get(child_name)
+    if not child_stack:
+        return
+
+    child_stack_id = child_stack.get("StackId", physical_id)
+    resources = child_stack.get("_resources", {})
+    template = child_stack.get("_template", {})
+    res_defs = template.get("Resources", {}) if template else {}
+    conditions = child_stack.get("_conditions", {})
+    try:
+        from ministack.services.cloudformation.engine import _topological_sort
+        ordered = (_topological_sort(res_defs, conditions)
+                   if res_defs else list(resources.keys()))
+    except Exception:
+        ordered = list(resources.keys())
+
+    for child_logical_id in reversed(ordered):
+        res = resources.get(child_logical_id)
+        if not res:
+            continue
+        try:
+            _delete_resource(
+                res.get("ResourceType", ""),
+                res.get("PhysicalResourceId", ""),
+                res.get("Properties", {}),
+                child_name, child_logical_id,
+            )
+        except Exception as exc:
+            logger.warning("Nested-stack %s: delete of %s failed: %s",
+                           child_name, child_logical_id, exc)
+
+    for out in child_stack.get("Outputs", []):
+        export_name = out.get("ExportName")
+        if export_name:
+            _exports.pop(export_name, None)
+
+    child_stack["StackStatus"] = "DELETE_COMPLETE"
+    child_stack["_resources"] = {}
+    # Leave the stack entry in _stacks so DescribeStacks on the child id still
+    # returns DELETE_COMPLETE, matching real AWS behaviour for nested stacks
+    # whose parents are torn down.
+
+
 # --- CloudFormation Custom Resource ---
 
 def _cr_stack_id(stack_name: str) -> str:
@@ -3589,6 +3875,11 @@ _RESOURCE_HANDLERS = {
     "AWS::Lambda::Version": {"create": _lambda_version_create},
     "AWS::CloudFormation::WaitCondition": {"create": _cfn_wait_condition_create},
     "AWS::CloudFormation::WaitConditionHandle": {"create": _cfn_wait_condition_handle_create},
+    "AWS::CloudFormation::Stack": {
+        "create": _cfn_nested_stack_create,
+        "update": _cfn_nested_stack_update,
+        "delete": _cfn_nested_stack_delete,
+    },
     # The "create" entry is load-bearing: without it, _provision_resource would
     # hit the generic "AWS::CloudFormation::*" no-op branch. Update and delete
     # are intentionally absent — they route through the explicit if-branches in

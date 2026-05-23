@@ -3085,3 +3085,86 @@ def test_cfn_apigateway_account_provisions(cfn, apigw_v1):
 
     cfn.delete_stack(StackName=stack_name)
     _wait_stack(cfn, stack_name)
+
+
+# ============================================================================
+# Nested Stacks (AWS::CloudFormation::Stack)
+# ============================================================================
+
+def test_cfn_nested_stack_basic(cfn, s3):
+    """Parent stack provisions a nested stack via TemplateURL. The nested
+    stack creates an S3 bucket and exposes its name as an Output, which the
+    parent reads back via Fn::GetAtt: [Nested, Outputs.BucketName]."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    templates_bucket = f"cfn-nested-templates-{suffix}"
+    s3.create_bucket(Bucket=templates_bucket)
+
+    child_template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Parameters": {
+            "BucketSuffix": {"Type": "String"},
+        },
+        "Resources": {
+            "ChildBucket": {
+                "Type": "AWS::S3::Bucket",
+                "Properties": {
+                    "BucketName": {"Fn::Sub": "cfn-nested-child-${BucketSuffix}"},
+                },
+            },
+        },
+        "Outputs": {
+            "BucketName": {"Value": {"Ref": "ChildBucket"}},
+        },
+    }
+    s3.put_object(Bucket=templates_bucket, Key="child.json",
+                  Body=json.dumps(child_template).encode())
+
+    parent_template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "Nested": {
+                "Type": "AWS::CloudFormation::Stack",
+                "Properties": {
+                    "TemplateURL": f"http://localhost:4566/{templates_bucket}/child.json",
+                    "Parameters": {"BucketSuffix": suffix},
+                },
+            },
+            "ParentParam": {
+                "Type": "AWS::SSM::Parameter",
+                "Properties": {
+                    "Name": f"/cfn-nested-parent-{suffix}/child-bucket",
+                    "Type": "String",
+                    "Value": {"Fn::GetAtt": ["Nested", "Outputs.BucketName"]},
+                },
+            },
+        },
+        "Outputs": {
+            "NestedBucketName": {
+                "Value": {"Fn::GetAtt": ["Nested", "Outputs.BucketName"]},
+            },
+        },
+    }
+
+    parent_name = f"cfn-nested-parent-{suffix}"
+    cfn.create_stack(StackName=parent_name,
+                     TemplateBody=json.dumps(parent_template))
+    stack = _wait_stack(cfn, parent_name)
+    assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+
+    outputs = {o["OutputKey"]: o["OutputValue"] for o in stack.get("Outputs", [])}
+    expected_bucket = f"cfn-nested-child-{suffix}"
+    assert outputs.get("NestedBucketName") == expected_bucket
+
+    # The nested-created bucket really exists
+    buckets = [b["Name"] for b in s3.list_buckets()["Buckets"]]
+    assert expected_bucket in buckets
+
+    # Delete the parent — child resources are cleaned up too
+    cfn.delete_stack(StackName=parent_name)
+    _wait_stack(cfn, parent_name)
+    buckets_after = [b["Name"] for b in s3.list_buckets()["Buckets"]]
+    assert expected_bucket not in buckets_after, \
+        "Nested stack delete did not propagate to child resources"
+
+    s3.delete_object(Bucket=templates_bucket, Key="child.json")
+    s3.delete_bucket(Bucket=templates_bucket)

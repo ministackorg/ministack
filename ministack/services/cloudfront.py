@@ -931,7 +931,7 @@ def _create_invalidation(dist_id, body):
     for existing in invs:
         if existing["InvalidationBatch"]["CallerReference"] == caller_ref:
             existing_paths = existing["InvalidationBatch"]["Paths"]["Items"]
-            if existing_paths != path_items:
+            if set(existing_paths) != set(path_items):
                 return _error(
                     "InvalidationBatchAlreadyExists",
                     "An invalidation batch with this CallerReference already exists.",

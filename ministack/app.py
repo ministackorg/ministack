@@ -598,16 +598,26 @@ def _handle_lambda_download_request(path: str, method: str):
 async def _handle_cognito_get_request(method: str, path: str, headers: dict, query_params: dict):
     """Handle Cognito GET endpoints that do not require request body parsing."""
     if "/.well-known/" in path and method == "GET":
+        # Only treat /<pool-id>/.well-known/... as Cognito if pool-id is an
+        # actual registered user pool. Otherwise the request is for an S3
+        # object that happens to use a .well-known/ key prefix (e.g. apps
+        # serving their own OIDC discovery doc from a static S3 bucket), so
+        # fall through to the S3 handler instead of shadowing it with a fake
+        # Cognito JWKS. Real AWS S3 never returns Cognito JWKS for an S3 path.
         if path.endswith("/.well-known/jwks.json"):
             pool_id = path.rsplit("/.well-known/jwks.json", 1)[0].lstrip("/")
             if pool_id:
-                return _get_module("cognito").well_known_jwks(pool_id)
+                cognito = _get_module("cognito")
+                if cognito._get_pool_unscoped(pool_id) is not None:
+                    return cognito.well_known_jwks(pool_id)
         elif path.endswith("/.well-known/openid-configuration"):
             pool_id = path.rsplit("/.well-known/openid-configuration", 1)[0].lstrip("/")
             if pool_id:
-                region = extract_region(headers) or "us-east-1"
-                host = headers.get("host") or headers.get("Host")
-                return _get_module("cognito").well_known_openid_configuration(pool_id, region, host)
+                cognito = _get_module("cognito")
+                if cognito._get_pool_unscoped(pool_id) is not None:
+                    region = extract_region(headers) or "us-east-1"
+                    host = headers.get("host") or headers.get("Host")
+                    return cognito.well_known_openid_configuration(pool_id, region, host)
 
     if path == "/oauth2/authorize" and method == "GET":
         return _get_module("cognito").handle_oauth2_authorize(method, path, headers, query_params)

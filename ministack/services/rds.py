@@ -114,14 +114,14 @@ def restore_state(data):
             inst["_docker_container_id"] = None
             inst["DBInstanceStatus"] = "creating"
             _instances._data[key] = inst
-            to_respawn.append((inst.get("DBInstanceIdentifier") or key[1], inst))
+            to_respawn.append((key[0], inst.get("DBInstanceIdentifier") or key[1], inst))
     else:
         # Legacy format: plain dict keyed by instance name
         for name, inst in instances_data.items():
             inst["_docker_container_id"] = None
             inst["DBInstanceStatus"] = "creating"
             _instances[name] = inst
-            to_respawn.append((name, inst))
+            to_respawn.append((None, name, inst))
 
     # Re-spin backing containers for persisted instances. Mirrors the MWAA
     # restore pattern: persistence saves the instance metadata but the Docker
@@ -129,12 +129,16 @@ def restore_state(data):
     # to bring it back. Without this, restored instances stay marked
     # "available" with no running container, and StartDBInstance is
     # metadata-only so it can't recover them either.
-    for db_id, inst in to_respawn:
-        threading.Thread(
-            target=_start_rds_container_for_instance,
-            args=(db_id, inst),
-            daemon=True,
-        ).start()
+    from ministack.core.responses import _request_account_id
+    for account_id, db_id, inst in to_respawn:
+        ctx = contextvars.copy_context()
+
+        def _runner(account_id=account_id, db_id=db_id, inst=inst):
+            if account_id is not None:
+                _request_account_id.set(account_id)
+            _start_rds_container_for_instance(db_id, inst)
+
+        threading.Thread(target=ctx.run, args=(_runner,), daemon=True).start()
 
 
 def _start_rds_container_for_instance(db_id, instance):

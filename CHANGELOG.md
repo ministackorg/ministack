@@ -9,9 +9,15 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [1.3.47] — 2026-05-22
 
+### Added
+- **CloudFormation nested stacks** — `AWS::CloudFormation::Stack` resources now provision their child template (fetched from `TemplateURL`), pass `Parameters` through, expose child `Outputs` via `Fn::GetAtt: [Nested, Outputs.<Name>]`, and cascade delete/update with the parent. `Ref` of the nested resource resolves to the child stack ARN, matching real AWS. Reported by @jayalfredprufrock.
+
 ### Fixed
-- **CloudFront invalidations** — repeated `CreateInvalidation` calls with the same `CallerReference` now return the existing invalidation for that distribution.
-- **S3 `DeleteObjects`** — Objects deleted in a batch will now be deleted from disk, much like `DeleteObject`.
+- **CloudFront invalidations** — repeated `CreateInvalidation` calls with the same `CallerReference` now return the existing invalidation for that distribution; path comparison is set-based so re-submitting the same paths in a different order is treated as idempotent rather than as a divergent batch. Contributed by @CoffeeRaptor.
+- **S3 `DeleteObjects`** — objects deleted in a batch are now removed from disk, mirroring `DeleteObject`. Contributed by @parafoxia.
+- **RDS persistence-restore** — backing Docker containers are now respawned for persisted DB instances at restart, with status flowing `creating → available/failed` based on container liveness instead of staying frozen as zombie metadata. Per-instance threads now carry the original account context so multi-tenant restores land writes on the correct account. Reported by @doodaz.
+- **Cognito `/oauth2/idpresponse` and `/saml2/idpresponse`** — distinct error messages and a server-side WARNING log when the OIDC `state` / SAML `RelayState` doesn't match any pending authorize flow, so configuration drift (expired or unknown state) is diagnosable without staring at an opaque `InvalidParameterException`. Reported by @ocr-lasagna.
+- **Cognito `.well-known/{jwks.json,openid-configuration}` no longer shadows S3** — these endpoints now fall through to S3 when the pool prefix doesn't match a registered user pool, so apps storing their own `.well-known/*` documents in an S3 bucket get the actual object back instead of a fake Cognito JWKS.
 
 ---
 

@@ -2896,12 +2896,25 @@ def _saml2_idp_response(body: bytes, query_params):
     relay_state = form.get("RelayState", "")
 
     if not saml_response_b64:
-        return error_response_json("InvalidParameterException", "SAMLResponse is required.", 400)
+        logger.warning("Cognito SAML callback: missing `SAMLResponse` form field")
+        return error_response_json("InvalidParameterException",
+                                   "SAML callback missing `SAMLResponse` form field.", 400)
 
     # Look up relay context
     relay = _auth_codes.pop(relay_state, None)
     if not relay or relay.get("type") != "relay":
-        return error_response_json("InvalidParameterException", "Invalid or expired RelayState.", 400)
+        logger.warning(
+            "Cognito SAML callback: no matching relay for RelayState=%s (expired after %ds, "
+            "already consumed, or never issued by /oauth2/authorize). "
+            "Re-start the federated login flow from /oauth2/authorize.",
+            relay_state, _AUTH_CODE_TTL,
+        )
+        return error_response_json(
+            "InvalidParameterException",
+            "SAML callback `RelayState` does not match any pending authorize flow "
+            "(expired, already consumed, or unknown).",
+            400,
+        )
 
     pool_id = relay["pool_id"]
     client_id = relay["client_id"]
@@ -3041,13 +3054,28 @@ def _oauth2_idp_response(method, body, query_params):
             pass
 
     if not code:
-        return error_response_json("InvalidParameterException", "code is required.", 400)
+        logger.warning("Cognito OIDC callback: missing `code` query param")
+        return error_response_json("InvalidParameterException",
+                                   "OIDC callback missing `code` query parameter.", 400)
     if not state:
-        return error_response_json("InvalidParameterException", "state is required.", 400)
+        logger.warning("Cognito OIDC callback: missing `state` query param")
+        return error_response_json("InvalidParameterException",
+                                   "OIDC callback missing `state` query parameter.", 400)
 
     relay = _auth_codes.pop(state, None)
     if not relay or relay.get("type") != "relay":
-        return error_response_json("InvalidParameterException", "Invalid or expired state.", 400)
+        logger.warning(
+            "Cognito OIDC callback: no matching relay for state=%s (expired after %ds, "
+            "already consumed, or never issued by /oauth2/authorize). "
+            "Re-start the federated login flow from /oauth2/authorize.",
+            state, _AUTH_CODE_TTL,
+        )
+        return error_response_json(
+            "InvalidParameterException",
+            "OIDC callback `state` does not match any pending authorize flow "
+            "(expired, already consumed, or unknown).",
+            400,
+        )
 
     pool_id = relay["pool_id"]
     client_id = relay["client_id"]
