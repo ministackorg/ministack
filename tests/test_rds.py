@@ -1445,6 +1445,153 @@ def test_rds_create_db_instance_postgres_18(rds):
         rds.delete_db_instance(DBInstanceIdentifier="pg18-test", SkipFinalSnapshot=True)
 
 
+def test_rds_restore_state_respawns_docker_container(monkeypatch):
+    """restore_state must spawn a Docker container for every persisted
+    instance. Without this, instances come back marked "available" with no
+    running container, and the metadata-only StartDBInstance /
+    RebootDBInstance ops can't recover them. Regression test for #692.
+    """
+    from ministack.services import rds as m
+
+    runs = []
+
+    class FakeContainer:
+        def __init__(self, name, container_id="cid-fake"):
+            self.id = container_id
+            self.name = name
+            self.attrs = {"NetworkSettings": {"Networks": {}}}
+
+        def reload(self): pass
+        def stop(self, timeout=2): pass
+        def remove(self, v=False): pass
+
+    class FakeContainers:
+        def get(self, name):
+            raise Exception("not found")
+
+        def run(self, **kwargs):
+            runs.append(kwargs)
+            return FakeContainer(kwargs["name"])
+
+    class FakeDocker:
+        def __init__(self):
+            self.containers = FakeContainers()
+
+    monkeypatch.setattr(m, "_get_docker", lambda: FakeDocker())
+    monkeypatch.setattr(m, "_get_ministack_network", lambda c: None)
+
+    db_id = "respawn-test-db"
+    persisted_state = {
+        "instances": {db_id: {
+            "DBInstanceIdentifier": db_id,
+            "Engine": "postgres",
+            "EngineVersion": "16.3",
+            "MasterUsername": "admin",
+            "_MasterUserPassword": "password123",
+            "DBName": "mydb",
+            "DBInstanceStatus": "available",
+            "Endpoint": {"Address": "localhost", "Port": 15500, "HostedZoneId": "Z"},
+        }},
+        "clusters": {}, "subnet_groups": {}, "param_groups": {},
+        "snapshots": {}, "db_cluster_param_groups": {},
+        "db_cluster_snapshots": {}, "option_groups": {},
+        "global_clusters": {}, "tags": {}, "port_counter": 15500,
+    }
+
+    m._instances.clear()
+    m.restore_state(persisted_state)
+
+    deadline = time.time() + 5
+    while time.time() < deadline and not runs:
+        time.sleep(0.05)
+
+    assert runs, "restore_state did not respawn the Docker container"
+    assert runs[0]["name"] == f"ministack-rds-{db_id}"
+    assert runs[0]["image"].endswith("postgres:16-alpine")
+    assert runs[0]["environment"]["POSTGRES_USER"] == "admin"
+    assert runs[0]["environment"]["POSTGRES_PASSWORD"] == "password123"
+    assert runs[0]["environment"]["POSTGRES_DB"] == "mydb"
+    assert runs[0]["labels"] == {"ministack": "rds", "db_id": db_id}
+
+    restored = m._instances.get(db_id)
+    assert restored is not None
+    assert restored["_docker_container_id"] == "cid-fake"
+    assert restored["DBInstanceStatus"] == "available"
+
+    m._instances.clear()
+
+
+def test_rds_restore_state_removes_stale_container_before_respawn(monkeypatch):
+    """If a container with the deterministic name already exists, restore
+    must remove the stale one before re-creating, otherwise containers.run
+    would fail with a name conflict.
+    """
+    from ministack.services import rds as m
+
+    runs = []
+    removed = []
+
+    class FakeContainer:
+        def __init__(self, name, container_id="cid-new"):
+            self.id = container_id
+            self.name = name
+            self.attrs = {"NetworkSettings": {"Networks": {}}}
+
+        def reload(self): pass
+        def stop(self, timeout=2): pass
+        def remove(self, v=False):
+            removed.append(self.name)
+
+    stale = FakeContainer(name="ministack-rds-stale-db", container_id="cid-stale")
+
+    class FakeContainers:
+        def get(self, name):
+            if name == "ministack-rds-stale-db":
+                return stale
+            raise Exception("not found")
+
+        def run(self, **kwargs):
+            runs.append(kwargs)
+            return FakeContainer(kwargs["name"])
+
+    class FakeDocker:
+        def __init__(self):
+            self.containers = FakeContainers()
+
+    monkeypatch.setattr(m, "_get_docker", lambda: FakeDocker())
+    monkeypatch.setattr(m, "_get_ministack_network", lambda c: None)
+
+    persisted = {
+        "instances": {"stale-db": {
+            "DBInstanceIdentifier": "stale-db",
+            "Engine": "postgres",
+            "EngineVersion": "16.3",
+            "MasterUsername": "admin",
+            "_MasterUserPassword": "pw",
+            "DBName": "db",
+            "DBInstanceStatus": "available",
+            "Endpoint": {"Address": "localhost", "Port": 15501, "HostedZoneId": "Z"},
+        }},
+        "clusters": {}, "subnet_groups": {}, "param_groups": {},
+        "snapshots": {}, "db_cluster_param_groups": {},
+        "db_cluster_snapshots": {}, "option_groups": {},
+        "global_clusters": {}, "tags": {}, "port_counter": 15501,
+    }
+
+    m._instances.clear()
+    m.restore_state(persisted)
+
+    deadline = time.time() + 5
+    while time.time() < deadline and not runs:
+        time.sleep(0.05)
+
+    assert "ministack-rds-stale-db" in removed, "stale container not removed"
+    assert runs, "fresh container not spawned after removing stale one"
+    assert runs[0]["name"] == "ministack-rds-stale-db"
+
+    m._instances.clear()
+
+
 # ========== from test_rds_lambda_network.py ==========
 # RDS+Lambda network reachability via DOCKER_NETWORK auto-detect.
 import io
@@ -1454,11 +1601,6 @@ import time
 import zipfile
 
 import pytest
-
-pytestmark = pytest.mark.skipif(
-    not os.environ.get("DOCKER_NETWORK"),
-    reason="DOCKER_NETWORK not set — skipping network connectivity test",
-)
 
 _LAMBDA_ROLE = "arn:aws:iam::000000000000:role/lambda-role"
 
@@ -1489,6 +1631,10 @@ def _wait_for_rds(rds_client, db_id, timeout=120):
     raise TimeoutError(f"RDS instance {db_id} not available after {timeout}s")
 
 
+@pytest.mark.skipif(
+    not os.environ.get("DOCKER_NETWORK"),
+    reason="DOCKER_NETWORK not set — skipping network connectivity test",
+)
 def test_rds_lambda_network_connectivity(rds, lam):
     """Prove that Lambda containers can TCP-connect to an RDS container."""
     db_id = "net-test-pg"
