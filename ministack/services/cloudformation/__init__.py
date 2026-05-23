@@ -66,6 +66,7 @@ async def handle_request(method: str, path: str, headers: dict,
     if not handler:
         from .helpers import _error
         return _error("InvalidAction", f"Unknown action: {action}", 400)
+    logger.debug(f"CloudFormation action: {action}")
     return handler(params)
 
 
