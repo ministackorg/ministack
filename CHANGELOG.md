@@ -7,7 +7,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
-## [1.3.47] — 2026-05-22
+## [1.3.47] — 2026-05-23
 
 ### Added
 - **CloudFormation nested stacks** — `AWS::CloudFormation::Stack` resources now provision their child template (fetched from `TemplateURL`), pass `Parameters` through, expose child `Outputs` via `Fn::GetAtt: [Nested, Outputs.<Name>]`, and cascade delete/update with the parent. `Ref` of the nested resource resolves to the child stack ARN, matching real AWS. Reported by @jayalfredprufrock.
