@@ -318,6 +318,7 @@ def test_cloudfront_create_invalidation_same_caller_reference_different_paths_er
             InvalidationBatch={"Paths": {"Quantity": 1, "Items": ["/two"]}, "CallerReference": caller_ref},
         )
     assert exc.value.response["Error"]["Code"] == "InvalidationBatchAlreadyExists"
+    assert cloudfront.list_invalidations(DistributionId=dist_id)["InvalidationList"]["Quantity"] == 1
 
 
 def test_cloudfront_tags(cloudfront):
