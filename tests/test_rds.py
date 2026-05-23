@@ -87,7 +87,10 @@ def test_rds_create_instance_v2(rds):
     )
     inst = resp["DBInstance"]
     assert inst["DBInstanceIdentifier"] == "rds-ci-v2"
-    assert inst["DBInstanceStatus"] == "available"
+    # Real AWS CreateDBInstance returns "creating" when a backing container
+    # is being spawned, "available" when the call is control-plane-only.
+    # Both are valid post-create states; ministack mirrors that.
+    assert inst["DBInstanceStatus"] in ("available", "creating")
     assert inst["Engine"] == "postgres"
     assert "Address" in inst["Endpoint"]
     assert "Port" in inst["Endpoint"]
@@ -1198,6 +1201,22 @@ def test_rds_restore_from_snapshot_not_found(rds):
     assert exc.value.response["Error"]["Code"] == "DBSnapshotNotFound"
 
 
+def _wait_for_status(rds, db_id, expected, timeout=10):
+    """Poll DescribeDBInstances until status == expected. Needed because
+    CreateDBInstance spawns a background readiness thread that flips status
+    to "available" on its own clock, which can race with a subsequent
+    StopDBInstance and overwrite the "stopped" state we just set."""
+    deadline = time.time() + timeout
+    last = None
+    while time.time() < deadline:
+        last = rds.describe_db_instances(
+            DBInstanceIdentifier=db_id)["DBInstances"][0]["DBInstanceStatus"]
+        if last == expected:
+            return last
+        time.sleep(0.2)
+    return last
+
+
 def test_rds_start_db_instance(rds):
     """StartDBInstance transitions a stopped instance to available."""
     rds.create_db_instance(
@@ -1209,9 +1228,11 @@ def test_rds_start_db_instance(rds):
         AllocatedStorage=10,
     )
     try:
+        # Let the bg readiness thread (if any) settle before stopping, so it
+        # can't race-overwrite "stopped" back to "available".
+        _wait_for_status(rds, "start-test", "available")
         rds.stop_db_instance(DBInstanceIdentifier="start-test")
-        stopped = rds.describe_db_instances(DBInstanceIdentifier="start-test")["DBInstances"][0]
-        assert stopped["DBInstanceStatus"] == "stopped"
+        assert _wait_for_status(rds, "start-test", "stopped") == "stopped"
 
         resp = rds.start_db_instance(DBInstanceIdentifier="start-test")
         assert resp["DBInstance"]["DBInstanceStatus"] == "available"
@@ -1240,11 +1261,13 @@ def test_rds_stop_db_instance(rds):
         AllocatedStorage=10,
     )
     try:
+        # Wait for bg readiness thread to settle so it can't race-overwrite
+        # the "stopped" state.
+        _wait_for_status(rds, "stop-test", "available")
         resp = rds.stop_db_instance(DBInstanceIdentifier="stop-test")
         assert resp["DBInstance"]["DBInstanceStatus"] == "stopped"
 
-        desc = rds.describe_db_instances(DBInstanceIdentifier="stop-test")["DBInstances"][0]
-        assert desc["DBInstanceStatus"] == "stopped"
+        assert _wait_for_status(rds, "stop-test", "stopped") == "stopped"
     finally:
         rds.delete_db_instance(DBInstanceIdentifier="stop-test", SkipFinalSnapshot=True)
 
