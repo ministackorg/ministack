@@ -1788,6 +1788,12 @@ def _error(status, code, message, ns="iam"):
             f'</ErrorResponse>').encode("utf-8")
     return status, {"Content-Type": "application/xml"}, body
 
+POLICY_ARN_PATTERN = r"^arn:aws:iam::\d{12}:policy/(?:[\w+=,.@-]+/)*[\w+=,.@-]+$"
+
+def _is_valid_policy_arn(arn:str):
+    import re
+    return bool(re.match(POLICY_ARN_PATTERN, arn))
+
 
 # -------------------- Handler dispatch table --------------------
 

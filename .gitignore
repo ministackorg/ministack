@@ -41,7 +41,7 @@ htmlcov/
 .kiro/
 
 # Docker
-data/
+./data/
 
 # Secrets / local config
 .env

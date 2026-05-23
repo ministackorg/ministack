@@ -107,6 +107,14 @@ def _create_change_set(params):
     except Exception as e:
         return _error("ValidationError", f"Template format error: {e}")
 
+    # Create transitive resources automatically (use-case: SAM Function) .
+    try:
+        transitive_resources = _generate_transitive_resources(cs_name, template)
+        template.get("Resources").update(transitive_resources)
+        _manage_interdependent_resources(cs_name, template)
+    except (ValueError, TypeError) as e:
+        return _error(e.args[0], e.args[1])
+
     try:
         param_values = _resolve_parameters(template, provided_params)
     except ValueError as exc:
@@ -327,3 +335,130 @@ def _list_change_sets(params):
 
 # --- GetTemplateSummary ---
 
+#TODO: Ask Maintainers if we shall move this to a new file ?
+
+# ===========================================================================
+# Transitive resources
+# ===========================================================================
+def _generate_transitive_resources(cs_name: str, template: dict):
+    """Generate transitive resources automatically if needed"""
+    new_resources = {}
+    existing_resource_names = list(template.get("Resources", dict()).keys())
+    for name, res_def in template.get("Resources", {}).items():
+        resource_type = res_def.get("Type", "AWS::CloudFormation::CustomResource")
+        if resource_type in _TRANSITIVE_RESOURCES.keys() and _TRANSITIVE_RESOURCES[resource_type].get("generate_transitive") is not None:
+            handler = _TRANSITIVE_RESOURCES[resource_type]["generate_transitive"]
+            added_resources = handler(name, res_def, existing_resource_names)
+            new_resources.update(added_resources)
+    logger.debug("Generated %n transitive resources for changeset %s", len(new_resources), cs_name)
+    return new_resources
+
+def _generate_transitive_sam_function_resources(res_name: str,res_def: dict, prohibited_resource_names: list[str]) -> dict:
+    """
+    Generate transitive resources for sam function if needed.
+    This will generate AWS::IAM::Role for the function if no Role is set.
+    The new role will have the Policies attached to its ManagedPolicyArns, only managed policy and aws-managed policy aliases will be supported.
+    #TODO: Support inline Policies and SAM Policy template.
+    """
+    role = res_def.get("Properties", {}).get("Role")
+    new_resources = {}
+    if role is None:
+
+
+        role_name = res_name+"Role"
+        while role_name in prohibited_resource_names:
+            role_name= res_name+"Role"+ new_uuid()[:4]
+
+        role = {
+            "Metadata": {
+                "SamResourceId": role_name
+            },
+            "Properties": {
+                "AssumeRolePolicyDocument": {
+                    "Statement": [
+                        {
+                            "Action": "sts:AssumeRole",
+                            "Effect": "Allow",
+                            "Principal": {
+                                "Service": "lambda.amazonaws.com"
+                            }
+                        }
+                    ],
+                    "Version": "2012-10-17"
+                },
+                "ManagedPolicyArns": [],
+                "Tags": [
+                    {
+                        "Value": "SAM",
+                        "Key": "lambda:createdBy"
+                    }
+                ]
+            },
+            "Type": "AWS::IAM::Role"
+        }
+
+        # Attach the role to the function
+        res_def.get("Properties", {}).update({"Role":{'Fn::GetAtt': [role_name, 'Arn']}})
+
+        new_resources[role_name] = role
+
+    return new_resources
+
+
+# ===========================================================================
+# Interdependent resources
+# ===========================================================================
+def _manage_interdependent_resources(cs_name: str, template: dict):
+    """Manage relationships between interdependent resources"""
+    for name, res_def in template.get("Resources", {}).items():
+        resource_type = res_def.get("Type", "AWS::CloudFormation::CustomResource")
+        if resource_type in _TRANSITIVE_RESOURCES.keys() and _TRANSITIVE_RESOURCES[resource_type].get("manage_interdependent") is not None:
+            handler = _TRANSITIVE_RESOURCES[resource_type]["manage_interdependent"]
+            handler(name, res_def, template.get("Resources",{}))
+            logger.debug("Managed interdependent resource for %s in ChangeSet", name,cs_name)
+
+def _manage_interdependencies_sam_function(res_name: str,res_def: dict,resources:dict):
+    def map_policies(policies):
+        managed_policies: list[str] = []
+        if policies is None:
+            return None
+
+        if isinstance(policies, str):
+            policies = [policies]
+
+        if isinstance(policies, list):
+            for policy in policies:
+                import data.iam
+                from services.iam import _is_valid_policy_arn
+                if policy in data.iam.AWS_MANAGED_POLICY_ALIASES:
+                    managed_policies.append(data.iam.get_full_policy_arn(policy))
+                elif _is_valid_policy_arn(policy):
+                    managed_policies.append(policy)
+                else:
+                    # Todo: returning _error() in nested function to represent errors is hard to manage.
+                    # Todo: Ask the maintainers if it's okay to depend on exception rather than _error() ( it will be a lot of effort, because nesting level is deep ).
+                    raise ValueError("InvalidPolicyArnException",
+                                     f"Invalid policy arn: {policy} attached to {res_name}")
+        else:
+            raise TypeError("InvalidPolicyTypeException", f"Invalid policies type attached to {res_name}")
+
+        return managed_policies
+
+    if "Policies" in res_def.get("Properties", {}):
+        policies = res_def.get("Properties", {}).get("Policies")
+        mapped_policies = map_policies(policies)
+        role_name = res_def["Properties"]["Role"].get("Fn::GetAtt",[])[0]
+
+        role = resources.get(role_name, None)
+        if role is None:
+            raise ValueError("InvalidRoleException", f"Can't find role definition for {role_name} attached to {res_name}")
+        if mapped_policies is not None:
+            managed_policy_arns = set(role.get("Properties").get("ManagedPolicyArns", []))
+            managed_policy_arns.update(mapped_policies)
+            role.get("Properties").update({"ManagedPolicyArns": list(managed_policy_arns)})
+
+
+
+_TRANSITIVE_RESOURCES = {
+    "AWS::Serverless::Function": { "generate_transitive": _generate_transitive_sam_function_resources, "manage_interdependent": _manage_interdependencies_sam_function }
+}
