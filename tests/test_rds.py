@@ -87,7 +87,10 @@ def test_rds_create_instance_v2(rds):
     )
     inst = resp["DBInstance"]
     assert inst["DBInstanceIdentifier"] == "rds-ci-v2"
-    assert inst["DBInstanceStatus"] == "available"
+    # Real AWS CreateDBInstance returns "creating" when a backing container
+    # is being spawned, "available" when the call is control-plane-only.
+    # Both are valid post-create states; ministack mirrors that.
+    assert inst["DBInstanceStatus"] in ("available", "creating")
     assert inst["Engine"] == "postgres"
     assert "Address" in inst["Endpoint"]
     assert "Port" in inst["Endpoint"]
@@ -1198,6 +1201,22 @@ def test_rds_restore_from_snapshot_not_found(rds):
     assert exc.value.response["Error"]["Code"] == "DBSnapshotNotFound"
 
 
+def _wait_for_status(rds, db_id, expected, timeout=10):
+    """Poll DescribeDBInstances until status == expected. Needed because
+    CreateDBInstance spawns a background readiness thread that flips status
+    to "available" on its own clock, which can race with a subsequent
+    StopDBInstance and overwrite the "stopped" state we just set."""
+    deadline = time.time() + timeout
+    last = None
+    while time.time() < deadline:
+        last = rds.describe_db_instances(
+            DBInstanceIdentifier=db_id)["DBInstances"][0]["DBInstanceStatus"]
+        if last == expected:
+            return last
+        time.sleep(0.2)
+    return last
+
+
 def test_rds_start_db_instance(rds):
     """StartDBInstance transitions a stopped instance to available."""
     rds.create_db_instance(
@@ -1209,9 +1228,11 @@ def test_rds_start_db_instance(rds):
         AllocatedStorage=10,
     )
     try:
+        # Let the bg readiness thread (if any) settle before stopping, so it
+        # can't race-overwrite "stopped" back to "available".
+        _wait_for_status(rds, "start-test", "available")
         rds.stop_db_instance(DBInstanceIdentifier="start-test")
-        stopped = rds.describe_db_instances(DBInstanceIdentifier="start-test")["DBInstances"][0]
-        assert stopped["DBInstanceStatus"] == "stopped"
+        assert _wait_for_status(rds, "start-test", "stopped") == "stopped"
 
         resp = rds.start_db_instance(DBInstanceIdentifier="start-test")
         assert resp["DBInstance"]["DBInstanceStatus"] == "available"
@@ -1240,11 +1261,13 @@ def test_rds_stop_db_instance(rds):
         AllocatedStorage=10,
     )
     try:
+        # Wait for bg readiness thread to settle so it can't race-overwrite
+        # the "stopped" state.
+        _wait_for_status(rds, "stop-test", "available")
         resp = rds.stop_db_instance(DBInstanceIdentifier="stop-test")
         assert resp["DBInstance"]["DBInstanceStatus"] == "stopped"
 
-        desc = rds.describe_db_instances(DBInstanceIdentifier="stop-test")["DBInstances"][0]
-        assert desc["DBInstanceStatus"] == "stopped"
+        assert _wait_for_status(rds, "stop-test", "stopped") == "stopped"
     finally:
         rds.delete_db_instance(DBInstanceIdentifier="stop-test", SkipFinalSnapshot=True)
 
@@ -1445,6 +1468,153 @@ def test_rds_create_db_instance_postgres_18(rds):
         rds.delete_db_instance(DBInstanceIdentifier="pg18-test", SkipFinalSnapshot=True)
 
 
+def test_rds_restore_state_respawns_docker_container(monkeypatch):
+    """restore_state must spawn a Docker container for every persisted
+    instance. Without this, instances come back marked "available" with no
+    running container, and the metadata-only StartDBInstance /
+    RebootDBInstance ops can't recover them. Regression test for #692.
+    """
+    from ministack.services import rds as m
+
+    runs = []
+
+    class FakeContainer:
+        def __init__(self, name, container_id="cid-fake"):
+            self.id = container_id
+            self.name = name
+            self.attrs = {"NetworkSettings": {"Networks": {}}}
+
+        def reload(self): pass
+        def stop(self, timeout=2): pass
+        def remove(self, v=False): pass
+
+    class FakeContainers:
+        def get(self, name):
+            raise Exception("not found")
+
+        def run(self, **kwargs):
+            runs.append(kwargs)
+            return FakeContainer(kwargs["name"])
+
+    class FakeDocker:
+        def __init__(self):
+            self.containers = FakeContainers()
+
+    monkeypatch.setattr(m, "_get_docker", lambda: FakeDocker())
+    monkeypatch.setattr(m, "_get_ministack_network", lambda c: None)
+
+    db_id = "respawn-test-db"
+    persisted_state = {
+        "instances": {db_id: {
+            "DBInstanceIdentifier": db_id,
+            "Engine": "postgres",
+            "EngineVersion": "16.3",
+            "MasterUsername": "admin",
+            "_MasterUserPassword": "password123",
+            "DBName": "mydb",
+            "DBInstanceStatus": "available",
+            "Endpoint": {"Address": "localhost", "Port": 15500, "HostedZoneId": "Z"},
+        }},
+        "clusters": {}, "subnet_groups": {}, "param_groups": {},
+        "snapshots": {}, "db_cluster_param_groups": {},
+        "db_cluster_snapshots": {}, "option_groups": {},
+        "global_clusters": {}, "tags": {}, "port_counter": 15500,
+    }
+
+    m._instances.clear()
+    m.restore_state(persisted_state)
+
+    deadline = time.time() + 5
+    while time.time() < deadline and not runs:
+        time.sleep(0.05)
+
+    assert runs, "restore_state did not respawn the Docker container"
+    assert runs[0]["name"] == f"ministack-rds-{db_id}"
+    assert runs[0]["image"].endswith("postgres:16-alpine")
+    assert runs[0]["environment"]["POSTGRES_USER"] == "admin"
+    assert runs[0]["environment"]["POSTGRES_PASSWORD"] == "password123"
+    assert runs[0]["environment"]["POSTGRES_DB"] == "mydb"
+    assert runs[0]["labels"] == {"ministack": "rds", "db_id": db_id}
+
+    restored = m._instances.get(db_id)
+    assert restored is not None
+    assert restored["_docker_container_id"] == "cid-fake"
+    assert restored["DBInstanceStatus"] == "available"
+
+    m._instances.clear()
+
+
+def test_rds_restore_state_removes_stale_container_before_respawn(monkeypatch):
+    """If a container with the deterministic name already exists, restore
+    must remove the stale one before re-creating, otherwise containers.run
+    would fail with a name conflict.
+    """
+    from ministack.services import rds as m
+
+    runs = []
+    removed = []
+
+    class FakeContainer:
+        def __init__(self, name, container_id="cid-new"):
+            self.id = container_id
+            self.name = name
+            self.attrs = {"NetworkSettings": {"Networks": {}}}
+
+        def reload(self): pass
+        def stop(self, timeout=2): pass
+        def remove(self, v=False):
+            removed.append(self.name)
+
+    stale = FakeContainer(name="ministack-rds-stale-db", container_id="cid-stale")
+
+    class FakeContainers:
+        def get(self, name):
+            if name == "ministack-rds-stale-db":
+                return stale
+            raise Exception("not found")
+
+        def run(self, **kwargs):
+            runs.append(kwargs)
+            return FakeContainer(kwargs["name"])
+
+    class FakeDocker:
+        def __init__(self):
+            self.containers = FakeContainers()
+
+    monkeypatch.setattr(m, "_get_docker", lambda: FakeDocker())
+    monkeypatch.setattr(m, "_get_ministack_network", lambda c: None)
+
+    persisted = {
+        "instances": {"stale-db": {
+            "DBInstanceIdentifier": "stale-db",
+            "Engine": "postgres",
+            "EngineVersion": "16.3",
+            "MasterUsername": "admin",
+            "_MasterUserPassword": "pw",
+            "DBName": "db",
+            "DBInstanceStatus": "available",
+            "Endpoint": {"Address": "localhost", "Port": 15501, "HostedZoneId": "Z"},
+        }},
+        "clusters": {}, "subnet_groups": {}, "param_groups": {},
+        "snapshots": {}, "db_cluster_param_groups": {},
+        "db_cluster_snapshots": {}, "option_groups": {},
+        "global_clusters": {}, "tags": {}, "port_counter": 15501,
+    }
+
+    m._instances.clear()
+    m.restore_state(persisted)
+
+    deadline = time.time() + 5
+    while time.time() < deadline and not runs:
+        time.sleep(0.05)
+
+    assert "ministack-rds-stale-db" in removed, "stale container not removed"
+    assert runs, "fresh container not spawned after removing stale one"
+    assert runs[0]["name"] == "ministack-rds-stale-db"
+
+    m._instances.clear()
+
+
 # ========== from test_rds_lambda_network.py ==========
 # RDS+Lambda network reachability via DOCKER_NETWORK auto-detect.
 import io
@@ -1454,11 +1624,6 @@ import time
 import zipfile
 
 import pytest
-
-pytestmark = pytest.mark.skipif(
-    not os.environ.get("DOCKER_NETWORK"),
-    reason="DOCKER_NETWORK not set — skipping network connectivity test",
-)
 
 _LAMBDA_ROLE = "arn:aws:iam::000000000000:role/lambda-role"
 
@@ -1489,6 +1654,10 @@ def _wait_for_rds(rds_client, db_id, timeout=120):
     raise TimeoutError(f"RDS instance {db_id} not available after {timeout}s")
 
 
+@pytest.mark.skipif(
+    not os.environ.get("DOCKER_NETWORK"),
+    reason="DOCKER_NETWORK not set — skipping network connectivity test",
+)
 def test_rds_lambda_network_connectivity(rds, lam):
     """Prove that Lambda containers can TCP-connect to an RDS container."""
     db_id = "net-test-pg"
