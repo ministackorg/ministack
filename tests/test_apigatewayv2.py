@@ -840,12 +840,14 @@ def test_apigw_integration_without_request_parameters_optional_map(apigw):
     apigw.delete_api(ApiId=api_id)
 
 
-def test_apigw_jwt_authorizer_enforced_in_data_plane(apigw):
+def test_apigw_jwt_authorizer_enforced_in_data_plane(apigw, cognito_idp):
     import urllib.error as _urlerr
     import urllib.request as _urlreq
 
     from ministack.services import cognito as _cognito
 
+    pool_id = cognito_idp.create_user_pool(PoolName=f"jwt-enforce-{_uuid_mod.uuid4().hex[:8]}")["UserPool"]["Id"]
+    issuer = f"https://cognito-idp.us-east-1.amazonaws.com/{pool_id}"
     api_id = apigw.create_api(Name=f"jwt-enforce-{_uuid_mod.uuid4().hex[:8]}", ProtocolType="HTTP")["ApiId"]
     server, _thread, _captured = _start_echo_server()
     try:
@@ -860,7 +862,7 @@ def test_apigw_jwt_authorizer_enforced_in_data_plane(apigw):
             AuthorizerType="JWT",
             Name="jwt-auth",
             IdentitySource=["$request.header.Authorization"],
-            JwtConfiguration={"Audience": ["ms-client"], "Issuer": "https://cognito-idp.us-east-1.amazonaws.com/test-pool"},
+            JwtConfiguration={"Audience": ["ms-client"], "Issuer": issuer},
         )["AuthorizerId"]
         apigw.create_route(
             ApiId=api_id,
@@ -878,7 +880,7 @@ def test_apigw_jwt_authorizer_enforced_in_data_plane(apigw):
             _urlreq.urlopen(req_missing)
         assert exc.value.code == 401
 
-        token = _cognito._fake_token("user-1", "test-pool", "ms-client", token_type="access")
+        token = _cognito._fake_token("user-1", pool_id, "ms-client", token_type="access")
         req_ok = _urlreq.Request(url, method="GET")
         req_ok.add_header("Host", f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}")
         req_ok.add_header("Authorization", f"Bearer {token}")
@@ -888,11 +890,14 @@ def test_apigw_jwt_authorizer_enforced_in_data_plane(apigw):
         server.shutdown()
         server.server_close()
         apigw.delete_api(ApiId=api_id)
+        cognito_idp.delete_user_pool(UserPoolId=pool_id)
 
 
-def test_apigw_request_mapping_claims_to_headers(apigw):
+def test_apigw_request_mapping_claims_to_headers(apigw, cognito_idp):
     import urllib.request as _urlreq
 
+    pool_id = cognito_idp.create_user_pool(PoolName=f"jwt-map-{_uuid_mod.uuid4().hex[:8]}")["UserPool"]["Id"]
+    issuer = f"https://cognito-idp.us-east-1.amazonaws.com/{pool_id}"
     api_id = apigw.create_api(Name=f"jwt-map-{_uuid_mod.uuid4().hex[:8]}", ProtocolType="HTTP")["ApiId"]
     server, _thread, _captured = _start_echo_server()
     try:
@@ -913,7 +918,7 @@ def test_apigw_request_mapping_claims_to_headers(apigw):
             AuthorizerType="JWT",
             Name="jwt-map-auth",
             IdentitySource=["$request.header.Authorization"],
-            JwtConfiguration={"Audience": ["ms-client"], "Issuer": "https://cognito-idp.us-east-1.amazonaws.com/test-pool"},
+            JwtConfiguration={"Audience": ["ms-client"], "Issuer": issuer},
         )["AuthorizerId"]
         apigw.create_route(
             ApiId=api_id,
@@ -928,7 +933,7 @@ def test_apigw_request_mapping_claims_to_headers(apigw):
         token = _make_signed_token(
             {
                 "sub": "auth0|abc123",
-                "iss": "https://cognito-idp.us-east-1.amazonaws.com/test-pool",
+                "iss": issuer,
                 "aud": "ms-client",
                 "iat": now,
                 "nbf": now - 1,
@@ -953,6 +958,7 @@ def test_apigw_request_mapping_claims_to_headers(apigw):
         server.shutdown()
         server.server_close()
         apigw.delete_api(ApiId=api_id)
+        cognito_idp.delete_user_pool(UserPoolId=pool_id)
 
 
 def test_apigw_http_proxy_does_not_block_parallel_ddb(monkeypatch):

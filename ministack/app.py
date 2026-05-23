@@ -598,12 +598,10 @@ def _handle_lambda_download_request(path: str, method: str):
 async def _handle_cognito_get_request(method: str, path: str, headers: dict, query_params: dict):
     """Handle Cognito GET endpoints that do not require request body parsing."""
     if "/.well-known/" in path and method == "GET":
-        # Only treat /<pool-id>/.well-known/... as Cognito if pool-id is an
-        # actual registered user pool. Otherwise the request is for an S3
-        # object that happens to use a .well-known/ key prefix (e.g. apps
-        # serving their own OIDC discovery doc from a static S3 bucket), so
-        # fall through to the S3 handler instead of shadowing it with a fake
-        # Cognito JWKS. Real AWS S3 never returns Cognito JWKS for an S3 path.
+        # Real AWS serves /<poolId>/.well-known/jwks.json only for actual user
+        # pools — any other pool prefix errors. Fall through to S3 when the
+        # pool isn't registered so an S3 object stored under a .well-known/
+        # key isn't shadowed by a fake Cognito JWKS body.
         if path.endswith("/.well-known/jwks.json"):
             pool_id = path.rsplit("/.well-known/jwks.json", 1)[0].lstrip("/")
             if pool_id:

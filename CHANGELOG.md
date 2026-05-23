@@ -17,7 +17,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 - **S3 `DeleteObjects`** — objects deleted in a batch are now removed from disk, mirroring `DeleteObject`. Contributed by @parafoxia.
 - **RDS persistence-restore** — backing Docker containers are now respawned for persisted DB instances at restart, with status flowing `creating → available/failed` based on container liveness instead of staying frozen as zombie metadata. Per-instance threads now carry the original account context so multi-tenant restores land writes on the correct account. Reported by @doodaz.
 - **Cognito `/oauth2/idpresponse` and `/saml2/idpresponse`** — distinct error messages and a server-side WARNING log when the OIDC `state` / SAML `RelayState` doesn't match any pending authorize flow, so configuration drift (expired or unknown state) is diagnosable without staring at an opaque `InvalidParameterException`. Reported by @ocr-lasagna.
-- **Cognito `.well-known/{jwks.json,openid-configuration}` no longer shadows S3** — these endpoints now fall through to S3 when the pool prefix doesn't match a registered user pool, so apps storing their own `.well-known/*` documents in an S3 bucket get the actual object back instead of a fake Cognito JWKS.
+- **Cognito `/{poolId}/.well-known/jwks.json` and `/{poolId}/.well-known/openid-configuration`** no longer shadow S3 — these endpoints now fall through to the S3 handler when the pool prefix doesn't match a registered user pool, so apps storing their own `.well-known/*` documents in an S3 bucket get the actual object back instead of a fake Cognito JWKS. Real AWS only serves these for actual pools.
 
 ---
 
