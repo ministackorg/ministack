@@ -10,6 +10,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 ## [1.3.47] — 2026-05-22
 
 ### Fixed
+- **CloudFront invalidations** — repeated `CreateInvalidation` calls with the same `CallerReference` now return the existing invalidation for that distribution.
 - **S3 `DeleteObjects`** — Objects deleted in a batch will now be deleted from disk, much like `DeleteObject`.
 
 ---

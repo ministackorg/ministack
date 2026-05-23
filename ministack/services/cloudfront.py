@@ -927,6 +927,29 @@ def _create_invalidation(dist_id, body):
                 if child.text:
                     path_items.append(child.text)
 
+    invs = _invalidations[dist_id]
+    for existing in invs:
+        if existing["InvalidationBatch"]["CallerReference"] == caller_ref:
+            existing_paths = existing["InvalidationBatch"]["Paths"]["Items"]
+            if existing_paths != path_items:
+                return _error(
+                    "InvalidationBatchAlreadyExists",
+                    "An invalidation batch with this CallerReference already exists.",
+                    400,
+                )
+
+            def build(root, _inv=existing):
+                _build_invalidation_xml(root, _inv)
+
+            return _xml_response(
+                "Invalidation",
+                build,
+                status=201,
+                extra_headers={
+                    "Location": f"/2020-05-31/distribution/{dist_id}/invalidation/{existing['Id']}",
+                },
+            )
+
     inv_id = _inv_id()
     now = _now_iso()
     inv = {

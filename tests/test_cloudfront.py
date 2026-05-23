@@ -185,6 +185,60 @@ def test_cloudfront_create_invalidation(cloudfront):
     assert inv_resp["ResponseMetadata"]["HTTPStatusCode"] == 201
 
 
+def test_cloudfront_create_get_list_invalidation_idempotent(cloudfront):
+    cfg = {
+        **_CF_DIST_CONFIG,
+        "CallerReference": f"cf-inv-basic-{_uuid_mod.uuid4().hex[:12]}",
+        "Comment": "inv-basic-test",
+    }
+    create_resp = cloudfront.create_distribution(DistributionConfig=cfg)
+    dist_id = create_resp["Distribution"]["Id"]
+    caller_ref = f"inv-basic-{_uuid_mod.uuid4().hex[:12]}"
+
+    resp = cloudfront.create_invalidation(
+        DistributionId=dist_id,
+        InvalidationBatch={
+            "Paths": {
+                "Quantity": 2,
+                "Items": ["/index.html", "/assets/*"],
+            },
+            "CallerReference": caller_ref,
+        },
+    )
+
+    invalidation = resp["Invalidation"]
+    invalidation_id = invalidation["Id"]
+    assert invalidation_id.startswith("I")
+    assert invalidation["Status"] == "Completed"
+    assert invalidation["InvalidationBatch"]["CallerReference"] == caller_ref
+    assert invalidation["InvalidationBatch"]["Paths"]["Quantity"] == 2
+    assert "/index.html" in invalidation["InvalidationBatch"]["Paths"]["Items"]
+
+    duplicate_resp = cloudfront.create_invalidation(
+        DistributionId=dist_id,
+        InvalidationBatch={
+            "Paths": {
+                "Quantity": 2,
+                "Items": ["/index.html", "/assets/*"],
+            },
+            "CallerReference": caller_ref,
+        },
+    )
+    assert duplicate_resp["Invalidation"]["Id"] == invalidation_id
+
+    get_resp = cloudfront.get_invalidation(
+        DistributionId=dist_id,
+        Id=invalidation_id,
+    )
+    assert get_resp["Invalidation"]["Id"] == invalidation_id
+    assert get_resp["Invalidation"]["Status"] == "Completed"
+
+    list_resp = cloudfront.list_invalidations(DistributionId=dist_id)
+    inv_list = list_resp["InvalidationList"]
+    assert inv_list["Quantity"] == 1
+    assert inv_list["Items"][0]["Id"] == invalidation_id
+
+
 def test_cloudfront_list_invalidations(cloudfront):
     cfg = {**_CF_DIST_CONFIG, "CallerReference": "cf-listinv-1", "Comment": "listinv-test"}
     create_resp = cloudfront.create_distribution(DistributionConfig=cfg)
@@ -224,6 +278,46 @@ def test_cloudfront_get_invalidation(cloudfront):
     assert inv["Id"] == inv_id
     assert inv["Status"] == "Completed"
     assert "/getinv-path" in inv["InvalidationBatch"]["Paths"]["Items"]
+
+
+def test_cloudfront_get_missing_invalidation_returns_error(cloudfront):
+    cfg = {
+        **_CF_DIST_CONFIG,
+        "CallerReference": f"cf-inv-missing-{_uuid_mod.uuid4().hex[:12]}",
+        "Comment": "inv-missing-test",
+    }
+    create_resp = cloudfront.create_distribution(DistributionConfig=cfg)
+    dist_id = create_resp["Distribution"]["Id"]
+
+    with pytest.raises(ClientError) as exc:
+        cloudfront.get_invalidation(
+            DistributionId=dist_id,
+            Id="IMISSING1234567",
+        )
+    assert exc.value.response["Error"]["Code"] == "NoSuchInvalidation"
+
+
+def test_cloudfront_create_invalidation_same_caller_reference_different_paths_errors(cloudfront):
+    cfg = {
+        **_CF_DIST_CONFIG,
+        "CallerReference": f"cf-inv-conflict-{_uuid_mod.uuid4().hex[:12]}",
+        "Comment": "inv-conflict-test",
+    }
+    create_resp = cloudfront.create_distribution(DistributionConfig=cfg)
+    dist_id = create_resp["Distribution"]["Id"]
+    caller_ref = f"inv-conflict-{_uuid_mod.uuid4().hex[:12]}"
+
+    cloudfront.create_invalidation(
+        DistributionId=dist_id,
+        InvalidationBatch={"Paths": {"Quantity": 1, "Items": ["/one"]}, "CallerReference": caller_ref},
+    )
+
+    with pytest.raises(ClientError) as exc:
+        cloudfront.create_invalidation(
+            DistributionId=dist_id,
+            InvalidationBatch={"Paths": {"Quantity": 1, "Items": ["/two"]}, "CallerReference": caller_ref},
+        )
+    assert exc.value.response["Error"]["Code"] == "InvalidationBatchAlreadyExists"
 
 
 def test_cloudfront_tags(cloudfront):
