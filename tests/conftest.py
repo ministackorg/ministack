@@ -53,6 +53,7 @@ def make_client(service, additional_config_kwargs=None):
 
 _SERIAL_TESTS = {
     "tests/test_athena.py::test_athena_engine_mock_via_config",
+    "tests/test_athena.py::test_athena_mixed_glue_and_s3_uri",
     "tests/test_ec2.py::test_ec2_create_default_vpc",
     "tests/test_eks.py::test_eks_cfn_cluster",
     "tests/test_eks.py::test_eks_create_describe_delete_cluster",
