@@ -3849,6 +3849,33 @@ def _backup_plan_delete(physical_id, props):
     _backup._plans.pop(physical_id, None)
 
 
+def _serverless_function_create(logical_id, props, stack_name):
+    # Map CodeUri -> Code
+    code = None
+    code_uri = props.get("CodeUri")
+    # This is FunctionCode block
+    if isinstance(code_uri, dict):
+        code = dict()
+        code['S3Bucket'] = code_uri.get('Bucket')
+        code['S3Key'] = code_uri.get('Key')
+        code['S3ObjectVersion'] = code_uri.get('Version')
+    elif isinstance(code_uri, str):
+        code_uri = code_uri.removeprefix("s3://")
+        bucket,key = code_uri.split("/",1)
+        code = dict()
+        code['S3Bucket'] = bucket
+        code['S3Key'] = key
+    del props['CodeUri']
+    props["Code"] = code
+
+    #Map
+    tracing = props.get("Tracing", None)
+    # The third possible value is Disabled, which AWS leaves it out when translated to Lambda function.
+    if tracing in ['Active','PassThrough']:
+        tracing_config = {'Mode':tracing}
+        props["TracingConfig"] = tracing_config
+    return _lambda_create(logical_id, props, stack_name)
+
 _RESOURCE_HANDLERS = {
     "AWS::S3::Bucket": {"create": _s3_create, "update": _s3_update, "delete": _s3_delete},
     "AWS::S3::BucketPolicy": {"create": _s3_bucket_policy_create, "delete": _s3_bucket_policy_delete},
@@ -3961,4 +3988,8 @@ _RESOURCE_HANDLERS = {
     "AWS::AutoScaling::ScalingPolicy": {"create": _asg_policy_create, "delete": _asg_policy_delete},
     "AWS::AutoScaling::LifecycleHook": {"create": _asg_hook_create, "delete": _asg_hook_delete},
     "AWS::AutoScaling::ScheduledAction": {"create": _asg_scheduled_create, "delete": _asg_scheduled_delete},
+    # Serverless
+    "AWS::Serverless::Function": {"create": _serverless_function_create, "delete": _lambda_delete},
+    # "AWS::Serverless::LayerVersion": {"create": _lambda_layer_create, "delete": _lambda_layer_delete},
+    # "AWS::Serverless::StateMachine": {"create": _sfn_state_machine_create, "delete": _sfn_state_machine_delete},
 }

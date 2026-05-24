@@ -7,6 +7,7 @@ import copy
 import json
 import logging
 
+from data.iam import get_full_policy_arn
 from ministack.core.responses import get_account_id, new_uuid, now_iso
 
 from .engine import (
@@ -444,20 +445,33 @@ def _manage_interdependencies_sam_function(res_name: str,res_def: dict,resources
 
         return managed_policies
 
-    if "Policies" in res_def.get("Properties", {}):
-        policies = res_def.get("Properties", {}).get("Policies")
-        mapped_policies = map_policies(policies)
-        role_name = res_def["Properties"]["Role"].get("Fn::GetAtt",[])[0]
+    def extract_role() -> dict:
+        role_name = res_def["Properties"]["Role"].get("Fn::GetAtt", [])[0]
 
         role = resources.get(role_name, None)
         if role is None:
-            raise ValueError("InvalidRoleException", f"Can't find role definition for {role_name} attached to {res_name}")
+            raise ValueError("InvalidRoleException",
+                             f"Can't find role definition for {role_name} attached to {res_name}")
+        return role
+
+    if "Policies" in res_def.get("Properties", {}):
+        policies = res_def.get("Properties", {}).get("Policies")
+        mapped_policies = map_policies(policies)
         if mapped_policies is not None:
+            role = extract_role()
             managed_policy_arns = set(role.get("Properties").get("ManagedPolicyArns", []))
             managed_policy_arns.update(mapped_policies)
             role.get("Properties").update({"ManagedPolicyArns": list(managed_policy_arns)})
 
-
+    # Attach AWSXrayWriteOnlyAccess Policy according to Tracing, if and only if we created the role
+    if res_def.get("Properties", {}).get("Tracing") in ["Active", "PassThrough"]:
+        role = extract_role()
+        tags = role.get("Properties", {}).get("Tags", [])
+        role_created_by_sam = next((tag for tag in tags if tag["Key"] == "lambda:createdBy" and tag["Value"] == "SAM" ), None) is not None
+        if role_created_by_sam:
+            managed_policy_arns = set(role.get("Properties").get("ManagedPolicyArns", []))
+            managed_policy_arns.add(get_full_policy_arn("AWSXrayWriteOnlyAccess"))
+            role.get("Properties").update({"ManagedPolicyArns": list(managed_policy_arns)})
 
 _TRANSITIVE_RESOURCES = {
     "AWS::Serverless::Function": { "generate_transitive": _generate_transitive_sam_function_resources, "manage_interdependent": _manage_interdependencies_sam_function }
