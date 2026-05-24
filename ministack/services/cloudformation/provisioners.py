@@ -3848,12 +3848,12 @@ def _backup_plan_create(logical_id, props, stack_name):
 def _backup_plan_delete(physical_id, props):
     _backup._plans.pop(physical_id, None)
 
+# ---------------------------------------------------------------------------
+# Serverless Resources
+# ---------------------------------------------------------------------------
 
-def _serverless_function_create(logical_id, props, stack_name):
-    # Map CodeUri -> Code
+def _map_serverless_code_uri(code_uri: dict|str) -> dict|None:
     code = None
-    code_uri = props.get("CodeUri")
-    # This is FunctionCode block
     if isinstance(code_uri, dict):
         code = dict()
         code['S3Bucket'] = code_uri.get('Bucket')
@@ -3865,8 +3865,13 @@ def _serverless_function_create(logical_id, props, stack_name):
         code = dict()
         code['S3Bucket'] = bucket
         code['S3Key'] = key
-    del props['CodeUri']
-    props["Code"] = code
+
+    return code
+
+def _serverless_function_create(logical_id, props, stack_name):
+    # Map CodeUri -> Code
+    code_uri = props.pop("CodeUri", None)
+    props["Code"] = _map_serverless_code_uri(code_uri)
 
     #Map
     tracing = props.get("Tracing", None)
@@ -3875,6 +3880,13 @@ def _serverless_function_create(logical_id, props, stack_name):
         tracing_config = {'Mode':tracing}
         props["TracingConfig"] = tracing_config
     return _lambda_create(logical_id, props, stack_name)
+
+def _serverless_layer_create(logical_id, props, stack_name):
+    props.pop("PublishLambdaVersion", None) # Not Supported
+    props.pop("RetentionPolicy", None) # Not Supported
+    # The same structure is used for both ContentUri and CodeUri and their respective mappings.
+    props["Content"] = _map_serverless_code_uri(props.pop("ContentUri", None))
+    return _lambda_layer_create(logical_id, props, stack_name)
 
 _RESOURCE_HANDLERS = {
     "AWS::S3::Bucket": {"create": _s3_create, "update": _s3_update, "delete": _s3_delete},
@@ -3990,6 +4002,6 @@ _RESOURCE_HANDLERS = {
     "AWS::AutoScaling::ScheduledAction": {"create": _asg_scheduled_create, "delete": _asg_scheduled_delete},
     # Serverless
     "AWS::Serverless::Function": {"create": _serverless_function_create, "delete": _lambda_delete},
-    # "AWS::Serverless::LayerVersion": {"create": _lambda_layer_create, "delete": _lambda_layer_delete},
+    "AWS::Serverless::LayerVersion": {"create": _serverless_layer_create, "delete": _lambda_layer_delete},
     # "AWS::Serverless::StateMachine": {"create": _sfn_state_machine_create, "delete": _sfn_state_machine_delete},
 }
