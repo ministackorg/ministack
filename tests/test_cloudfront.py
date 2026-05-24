@@ -1,3 +1,4 @@
+import copy
 import io
 import json
 import os
@@ -35,6 +36,51 @@ _CF_DIST_CONFIG = {
     "Comment": "test distribution",
     "Enabled": True,
 }
+
+
+def _custom_origin_distribution_config(caller_reference):
+    return {
+        "CallerReference": caller_reference,
+        "Origins": {
+            "Quantity": 1,
+            "Items": [
+                {
+                    "Id": "custom-origin",
+                    "DomainName": "origin.example.com",
+                    "OriginPath": "/app",
+                    "CustomHeaders": {
+                        "Quantity": 1,
+                        "Items": [{"HeaderName": "X-Origin-Test", "HeaderValue": "yes"}],
+                    },
+                    "CustomOriginConfig": {
+                        "HTTPPort": 80,
+                        "HTTPSPort": 443,
+                        "OriginProtocolPolicy": "https-only",
+                        "OriginSslProtocols": {"Quantity": 1, "Items": ["TLSv1.2"]},
+                        "OriginReadTimeout": 30,
+                        "OriginKeepaliveTimeout": 5,
+                    },
+                }
+            ],
+        },
+        "DefaultCacheBehavior": {
+            "TargetOriginId": "custom-origin",
+            "ViewerProtocolPolicy": "redirect-to-https",
+            "ForwardedValues": {
+                "QueryString": True,
+                "Cookies": {"Forward": "all"},
+            },
+            "MinTTL": 0,
+        },
+        "Comment": "custom origin distribution",
+        "Enabled": True,
+    }
+
+
+def _first_distribution_origin(config_or_summary):
+    origins = config_or_summary["Origins"]
+    assert origins["Quantity"] == 1
+    return origins["Items"][0]
 
 
 def test_cloudfront_create_distribution(cloudfront):
@@ -105,6 +151,41 @@ def test_cloudfront_get_distribution_config(cloudfront):
     assert resp["ETag"] == etag
     assert resp["DistributionConfig"]["Comment"] == "getcfg-test"
     assert resp["DistributionConfig"]["OriginGroups"]["Quantity"] == 0
+
+
+def test_cloudfront_origin_configuration_round_trips(cloudfront):
+    cfg = _custom_origin_distribution_config(f"cf-origin-{_uuid_mod.uuid4().hex[:12]}")
+    create_resp = cloudfront.create_distribution(DistributionConfig=cfg)
+    dist_id = create_resp["Distribution"]["Id"]
+
+    get_resp = cloudfront.get_distribution(Id=dist_id)
+    get_origin = _first_distribution_origin(get_resp["Distribution"]["DistributionConfig"])
+    assert get_origin["Id"] == "custom-origin"
+    assert get_origin["DomainName"] == "origin.example.com"
+    assert get_origin["OriginPath"] == "/app"
+    assert get_origin["CustomHeaders"]["Items"][0]["HeaderValue"] == "yes"
+    assert get_origin["CustomOriginConfig"]["OriginProtocolPolicy"] == "https-only"
+    assert get_origin["CustomOriginConfig"]["OriginSslProtocols"]["Items"] == ["TLSv1.2"]
+
+    config_resp = cloudfront.get_distribution_config(Id=dist_id)
+    config_origin = _first_distribution_origin(config_resp["DistributionConfig"])
+    assert config_origin["CustomOriginConfig"]["HTTPPort"] == 80
+    assert config_origin["CustomOriginConfig"]["HTTPSPort"] == 443
+
+    list_resp = cloudfront.list_distributions()
+    summary = next(item for item in list_resp["DistributionList"]["Items"] if item["Id"] == dist_id)
+    summary_origin = _first_distribution_origin(summary)
+    assert summary_origin["CustomOriginConfig"]["OriginReadTimeout"] == 30
+    assert summary["DefaultCacheBehavior"]["TargetOriginId"] == "custom-origin"
+
+    updated_cfg = copy.deepcopy(cfg)
+    updated_cfg["Origins"]["Items"][0]["OriginPath"] = "/next"
+    update_resp = cloudfront.update_distribution(
+        DistributionConfig=updated_cfg,
+        Id=dist_id,
+        IfMatch=create_resp["ETag"],
+    )
+    assert update_resp["Distribution"]["DistributionConfig"]["Origins"]["Items"][0]["OriginPath"] == "/next"
 
 
 def test_cloudfront_update_distribution(cloudfront):
