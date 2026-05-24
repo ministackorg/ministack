@@ -87,6 +87,8 @@ def test_rds_create_instance_v2(rds):
     )
     inst = resp["DBInstance"]
     assert inst["DBInstanceIdentifier"] == "rds-ci-v2"
+    assert inst["DBInstanceStatus"] in ("creating", "available")
+    inst = _wait_for_rds(rds, "rds-ci-v2")
     assert inst["DBInstanceStatus"] == "available"
     assert inst["Engine"] == "postgres"
     assert "Address" in inst["Endpoint"]
@@ -1050,6 +1052,7 @@ def test_rds_modify_instance_password(rds):
         MasterUserPassword="old_pass",
         AllocatedStorage=20,
     )
+    _wait_for_rds(rds, "pw-mod-inst")
     # Password change should succeed without error
     rds.modify_db_instance(
         DBInstanceIdentifier="pw-mod-inst",
@@ -1455,11 +1458,6 @@ import zipfile
 
 import pytest
 
-pytestmark = pytest.mark.skipif(
-    not os.environ.get("DOCKER_NETWORK"),
-    reason="DOCKER_NETWORK not set — skipping network connectivity test",
-)
-
 _LAMBDA_ROLE = "arn:aws:iam::000000000000:role/lambda-role"
 
 
@@ -1489,6 +1487,10 @@ def _wait_for_rds(rds_client, db_id, timeout=120):
     raise TimeoutError(f"RDS instance {db_id} not available after {timeout}s")
 
 
+@pytest.mark.skipif(
+    not os.environ.get("DOCKER_NETWORK"),
+    reason="DOCKER_NETWORK not set -- skipping network connectivity test",
+)
 def test_rds_lambda_network_connectivity(rds, lam):
     """Prove that Lambda containers can TCP-connect to an RDS container."""
     db_id = "net-test-pg"
