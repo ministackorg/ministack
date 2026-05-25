@@ -1943,18 +1943,28 @@ def _reset_all_state():
     # still need reset() — REST API v1 (served via the apigateway module),
     # SES v2 (served via the ses module), and EventBridge Pipes (CFN-only
     # provisioner with a background poller thread that reset() must stop).
+    # Kept for documentation / safety even though the `sys.modules` fallback
+    # below catches every imported module regardless.
     _extra_reset_modules = ("apigateway_v1", "ses_v2", "pipes")
 
     module_names = {cfg["module"] for cfg in SERVICE_REGISTRY.values()}
     module_names.update(_extra_reset_modules)
 
     for mod_name in module_names:
-        if mod_name in _loaded_modules:
-            mod = _loaded_modules[mod_name]
-            try:
-                mod.reset()
-            except Exception as e:
-                logger.warning("reset() failed for %s: %s", mod_name, e)
+        # Same class fix as the shutdown save loop: a module reached only via
+        # sibling import from another service (e.g. `appsync` -> `appsync_events`,
+        # `apigateway` -> `apigateway_v1`, `lambda` -> `cloudwatch_logs`) is
+        # imported into `sys.modules` but never registered in `_loaded_modules`.
+        # Without the `sys.modules` fallback, those modules silently skip reset
+        # — leaving state across `/_ministack/reset` calls and breaking test
+        # isolation.
+        mod = _loaded_modules.get(mod_name) or sys.modules.get(f"ministack.services.{mod_name}")
+        if mod is None or not hasattr(mod, "reset"):
+            continue
+        try:
+            mod.reset()
+        except Exception as e:
+            logger.warning("reset() failed for %s: %s", mod_name, e)
 
     S3_DATA_DIR = os.environ.get("S3_DATA_DIR", "/tmp/ministack-data/s3")
     S3_PERSIST = os.environ.get("S3_PERSIST", "0") == "1"
