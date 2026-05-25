@@ -183,6 +183,21 @@ def _local_tag_name(el) -> str:
     return t.split("}")[-1] if "}" in t else t
 
 
+def _add_xml_block(parent, source_el):
+    block = SubElement(parent, _local_tag_name(source_el))
+    block.text = source_el.text
+    block.attrib.update(source_el.attrib)
+    for child in source_el:
+        _add_xml_block(block, child)
+    return block
+
+
+def _add_config_block(parent, config_el, tag):
+    child = _find(config_el, tag)
+    if child is not None:
+        _add_xml_block(parent, child)
+
+
 def _unwrap_distribution_create_xml(root_el):
     """Return ``(DistributionConfig element, Tags element or None)``.
 
@@ -839,6 +854,9 @@ def _list_distributions():
                 SubElement(ds, "DomainName").text = dist["DomainName"]
                 SubElement(ds, "Enabled").text = str(dist["enabled"]).lower()
                 SubElement(ds, "Comment").text = _text(fromstring(dist["config_xml"]), "Comment")
+                config_el = fromstring(dist["config_xml"])
+                _add_config_block(ds, config_el, "Origins")
+                _add_config_block(ds, config_el, "DefaultCacheBehavior")
 
     return _xml_response("DistributionList", build)
 
