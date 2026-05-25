@@ -267,6 +267,8 @@ def _create_table(data):
         "PartitionKeys": table_input.get("PartitionKeys", []),
         "TableType": table_input.get("TableType", "EXTERNAL_TABLE"),
         "Parameters": table_input.get("Parameters", {}),
+        "ViewOriginalText": table_input.get("ViewOriginalText"),
+        "ViewExpandedText": table_input.get("ViewExpandedText"),
         "IsRegisteredWithLakeFormation": False,
         "CatalogId": get_account_id(),
     }
