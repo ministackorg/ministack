@@ -492,3 +492,8 @@ def tagging():
 @pytest.fixture(scope="session")
 def cur():
     return make_client("cur")
+
+
+@pytest.fixture(scope="session")
+def inspector2():
+    return make_client("inspector2")

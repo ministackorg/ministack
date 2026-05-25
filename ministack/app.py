@@ -150,6 +150,7 @@ _NON_S3_VHOST_NAMES = frozenset({
     "apigateway", "cloudformation", "autoscaling", "codebuild", "transfer", "cur",
     "cloudfront-kvs",
     "appsync-api", "appsync-realtime-api",
+    "inspector2",
 })
 
 from ministack.core.hypercorn_compat import install as _install_hypercorn_compat
@@ -307,6 +308,7 @@ SERVICE_REGISTRY = {
     "wafv2": {"module": "waf"},
     "cloudtrail": {"module": "cloudtrail"},
     "cur": {"module": "cur"},
+    "inspector2": {"module": "inspector2"},
 }
 
 SERVICE_HANDLERS = {
@@ -342,6 +344,7 @@ _state_map = {
     "cloudfront_keyvaluestore": "cloudfront_keyvaluestore",
     "resource_groups": "resource_groups",
     "cloudtrail": "cloudtrail", "iot": "iot",
+    "inspector2": "inspector2",
 }
 
 SERVICE_NAME_ALIASES = {
@@ -381,12 +384,12 @@ BANNER = r"""
  |_|  |_|_|_| |_|_|____/ \__\__,_|\___|_|\_\
 
  Local AWS Service Emulator — Port {port}
- Services: S3, SQS, SNS, DynamoDB, Lambda, IAM, STS, SecretsManager, CloudWatch Logs,
-          SSM, EventBridge, Kinesis, CloudWatch, SES, SES v2, ACM, WAF v2, Step Functions,
-          ECS, RDS, ElastiCache, Glue, Athena, API Gateway, Firehose, Route53,
-          Cognito, EC2, EMR, EBS, EFS, ALB/ELBv2, CloudFormation, KMS, ECR, CloudFront,
-          AppSync, Cloud Map, S3 Files, RDS Data API, CodeBuild, AppConfig, Transfer, EKS,
-          IoT Core
+  Services: S3, SQS, SNS, DynamoDB, Lambda, IAM, STS, SecretsManager, CloudWatch Logs,
+           SSM, EventBridge, Kinesis, CloudWatch, SES, SES v2, ACM, WAF v2, Step Functions,
+           ECS, RDS, ElastiCache, Glue, Athena, API Gateway, Firehose, Route53,
+           Cognito, EC2, EMR, EBS, EFS, ALB/ELBv2, CloudFormation, KMS, ECR, CloudFront,
+           AppSync, Cloud Map, S3 Files, RDS Data API, CodeBuild, AppConfig, Transfer, EKS,
+           Inspector2, IoT Core
 """
 
 
