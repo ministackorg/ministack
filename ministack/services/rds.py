@@ -163,7 +163,23 @@ def _start_rds_container_for_instance(db_id, instance):
     master_pass = instance.get("_MasterUserPassword", "password")
     db_name = instance.get("DBName") or "mydb"
     endpoint = instance.get("Endpoint") or {}
-    host_port = endpoint.get("Port") or _next_port()
+    # Host port must come from `_HostPort` (stored at create time), NOT from
+    # `Endpoint.Port` — the latter is overwritten to `container_port` (e.g.
+    # 5432 for postgres) to match real AWS, so reading it here would try to
+    # bind 5432 on the host and collide on every respawn (#692 follow-up).
+    # Legacy instances persisted before `_HostPort` was stored fall back to a
+    # fresh free port from `_next_port()`.
+    host_port = instance.get("_HostPort") or _next_port()
+    # If the stored host port was claimed by something else between
+    # restarts (another ministack, another db instance, a user app),
+    # docker bind would fail with "port is already allocated". Fall
+    # back to a fresh free port and persist it so subsequent restarts
+    # converge on a stable mapping again.
+    if not _is_host_port_free(host_port):
+        logger.info("RDS: persisted host port %d for %s is in use; "
+                    "allocating fresh free port", host_port, db_id)
+        host_port = _next_port()
+    instance["_HostPort"] = host_port
 
     image, env_vars, container_port, data_path = _docker_image_for_engine(
         engine, engine_version, master_user, master_pass, db_name,
@@ -175,15 +191,27 @@ def _start_rds_container_for_instance(db_id, instance):
     container_name = f"ministack-rds-{db_id}"
     try:
         existing = docker_client.containers.get(container_name)
+        # `force=True` stops AND removes in one shot, including
+        # half-spawned "Created" containers that didn't fully start
+        # — those still hold port mappings and would collide with
+        # the next `containers.run` (#692 follow-up: doodaz saw
+        # a `Created` container blocking the bind).
         try:
-            existing.stop(timeout=2)
-        except Exception:
-            pass
-        try:
-            existing.remove(v=False)
+            existing.remove(force=True, v=False)
         except Exception as e:
             logger.warning("RDS: failed to remove stale container %s: %s",
                            container_name, e)
+        # Verify the name is actually free now; if removal silently
+        # failed, abort respawn rather than crash inside `containers.run`
+        # with a confusing name-conflict error.
+        try:
+            docker_client.containers.get(container_name)
+            logger.warning("RDS: stale container %s still present after "
+                           "force-remove — aborting respawn", container_name)
+            instance["DBInstanceStatus"] = "failed"
+            return
+        except Exception:
+            pass  # Good — name is gone.
     except Exception:
         pass  # No existing container with that name — fine
 
@@ -427,8 +455,40 @@ def _refresh_cluster_status(cluster_id):
 _port_lock = threading.Lock()
 
 
+def _is_host_port_free(port: int) -> bool:
+    """Probe that no other process holds host TCP `port`. Best-effort
+    pre-flight check so respawn can pick a different port instead of
+    failing at `docker run` with `port is already allocated` (#692
+    follow-up). There is a small TOCTOU window between probe and
+    `containers.run`, but it closes the common case of stale or
+    user-process bindings."""
+    import socket
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        s.bind(("0.0.0.0", port))
+        return True
+    except OSError:
+        return False
+    finally:
+        s.close()
+
+
 def _next_port():
+    """Return the next free host port for an RDS container. Increments
+    the persisted counter, but skips ports that are already bound on the
+    host (e.g. by another ministack instance or the user's own services).
+    Caps probing to avoid infinite loops if the entire upper range is
+    saturated — in that pathological case the caller will get a port and
+    likely fail at `docker run`, but we won't spin forever."""
     with _port_lock:
+        for _ in range(200):
+            port = _port_counter[0]
+            _port_counter[0] += 1
+            if _is_host_port_free(port):
+                return port
+        # Saturated — return the next counter value and let docker surface
+        # whatever it surfaces. Better than a silent hang.
         port = _port_counter[0]
         _port_counter[0] += 1
         return port
@@ -637,7 +697,8 @@ def _create_db_instance(p):
         )
         if image:
             try:
-                host_port = _next_port()
+                host_port = instance.get("_HostPort") or _next_port()
+                instance["_HostPort"] = host_port
                 endpoint_port = host_port
                 container_kwargs = dict(
                     image=image, detach=True,
