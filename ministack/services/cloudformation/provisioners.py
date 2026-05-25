@@ -78,6 +78,7 @@ def _provision_resource(resource_type: str, logical_id: str, props: dict,
                         stack_name: str) -> tuple:
     """Provision a resource. Returns (physical_id, attributes)."""
     handler = _RESOURCE_HANDLERS.get(resource_type)
+    from services.iam import _policies
     if handler and "create" in handler:
         return handler["create"](logical_id, props, stack_name)
     # Custom resource types (Custom::* handled here; AWS::CloudFormation::CustomResource goes through handler)

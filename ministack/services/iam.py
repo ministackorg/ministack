@@ -771,8 +771,13 @@ def _list_attached_role_policies(p):
         return _error(404, "NoSuchEntity",
                       f"Role {role_name} not found.", ns="iam")
     members = ""
-    for arn in role["AttachedPolicies"]:
-        pol = _lookup_policy(arn)
+    for pol in role["AttachedPolicies"]:
+        arn = None
+        if isinstance(pol, str):
+            arn = pol
+            pol = _lookup_policy(arn)
+        elif isinstance(pol, dict):
+            arn = pol.get("PolicyArn")
         pname = pol["PolicyName"] if pol else arn.rsplit("/", 1)[-1]
         members += (f"<member><PolicyName>{pname}</PolicyName>"
                     f"<PolicyArn>{arn}</PolicyArn></member>")

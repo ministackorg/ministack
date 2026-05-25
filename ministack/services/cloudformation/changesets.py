@@ -406,7 +406,7 @@ def _generate_transitive_sam_function_resources(res_name: str,res_def: dict, pro
     Generate transitive resources for sam function if needed.
     This will generate AWS::IAM::Role for the function if no Role is set.
     The new role will have the Policies attached to its ManagedPolicyArns, only managed policy and aws-managed policy aliases will be supported.
-    #TODO: Support inline Policies and SAM Policy template.
+    #TODO: Support inline Policies.
     """
     role = res_def.get("Properties", {}).get("Role")
     new_resources = {}
@@ -485,19 +485,74 @@ def _map_policies(policies, res_name: str) -> list[str] | None:
 
     managed_policies: list[str] = []
     for policy in policies:
+        if isinstance(policy, dict):
+            # SAM policy template — handled separately by _expand_sam_policy_templates
+            continue
         if policy in data.iam.AWS_MANAGED_POLICY_ALIASES:
             managed_policies.append(data.iam.get_full_policy_arn(policy))
         elif _is_valid_policy_arn(policy):
             managed_policies.append(policy)
         else:
-            # Todo: returning _error() in nested function to represent errors is hard to manage.
-            # Todo: Ask the maintainers if it's okay to depend on exception rather than _error() ( it will be a lot of effort, because nesting level is deep ).
             raise ValueError("InvalidPolicyArnException",
                              f"Invalid policy arn: {policy} attached to {res_name}")
     return managed_policies
 
 
+def _substitute_template_params(obj, params: dict):
+    """Recursively replace {"Ref": "ParamName"} placeholders with caller-supplied values."""
+    if isinstance(obj, dict):
+        if list(obj.keys()) == ["Ref"] and obj["Ref"] in params:
+            return params[obj["Ref"]]
+        return {k: _substitute_template_params(v, params) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_substitute_template_params(item, params) for item in obj]
+    return obj
+
+
+def _expand_sam_policy_templates(policies, res_name: str) -> list[dict]:
+    """Expand SAM policy template entries (dicts) into CFN inline policy dicts.
+
+    Each entry is expected to be a single-key dict like::
+
+        {"LambdaInvokePolicy": {"FunctionName": {"Ref": "HelloFunction"}}}
+
+    Returns a list of ``{"PolicyName": ..., "PolicyDocument": {...}}`` dicts
+    suitable for the ``Policies`` list on an ``AWS::IAM::Role`` resource.
+    Entries that are not dicts, or whose template name is unknown, are skipped.
+    """
+    import copy
+    from data.sam_policy_templates import SAM_POLICY_TEMPLATES
+
+    if policies is None:
+        return []
+    if not isinstance(policies, list):
+        policies = [policies]
+
+    inline_policies = []
+    for idx, policy in enumerate(policies):
+        if not isinstance(policy, dict):
+            continue
+        for template_name, param_values in policy.items():
+            statements = SAM_POLICY_TEMPLATES.get(template_name)
+            if statements is None:
+                raise ValueError(
+                    "UnknownSAMPolicyTemplate",
+                    f"Unknown SAM policy template '{template_name}' on resource {res_name}",
+                )
+            if not isinstance(param_values, dict):
+                param_values = {}
+            expanded = _substitute_template_params(copy.deepcopy(statements), param_values)
+            inline_policies.append({
+                "PolicyName": f"{template_name}-{idx}",
+                "PolicyDocument": {"Version": "2012-10-17", "Statement": expanded},
+            })
+    return inline_policies
+
+
 def _manage_interdependencies_sam_function(res_name: str,res_def: dict,resources:dict):
+    """
+    Create a Role if not configured for Serverless function, and assign policies to it.
+    """
     def extract_role() -> dict:
         role_name = res_def["Properties"]["Role"].get("Fn::GetAtt", [])[0]
 
@@ -510,11 +565,15 @@ def _manage_interdependencies_sam_function(res_name: str,res_def: dict,resources
     if "Policies" in res_def.get("Properties", {}):
         policies = res_def.get("Properties", {}).get("Policies")
         mapped_policies = _map_policies(policies, res_name)
-        if mapped_policies is not None:
+        if mapped_policies:
             role = extract_role()
             managed_policy_arns = set(role.get("Properties").get("ManagedPolicyArns", []))
             managed_policy_arns.update(mapped_policies)
             role.get("Properties").update({"ManagedPolicyArns": list(managed_policy_arns)})
+        expanded_templates = _expand_sam_policy_templates(policies, res_name)
+        if expanded_templates:
+            role = extract_role()
+            role["Properties"].setdefault("Policies", []).extend(expanded_templates)
 
     # Attach AWSXrayWriteOnlyAccess Policy according to Tracing, if and only if we created the role
     if res_def.get("Properties", {}).get("Tracing") in ["Active", "PassThrough"]:
@@ -587,11 +646,15 @@ def _manage_interdependencies_sam_state_machine(res_name: str, res_def: dict, re
     if "Policies" in res_def.get("Properties", {}):
         policies = res_def.get("Properties", {}).get("Policies")
         mapped_policies = _map_policies(policies, res_name)
-        if mapped_policies is not None:
+        if mapped_policies:
             role = extract_role()
             managed_policy_arns = set(role.get("Properties").get("ManagedPolicyArns", []))
             managed_policy_arns.update(mapped_policies)
             role.get("Properties").update({"ManagedPolicyArns": list(managed_policy_arns)})
+        expanded_templates = _expand_sam_policy_templates(policies, res_name)
+        if expanded_templates:
+            role = extract_role()
+            role["Properties"].setdefault("Policies", []).extend(expanded_templates)
 
 
 _TRANSITIVE_RESOURCES = {
