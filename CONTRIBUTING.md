@@ -24,6 +24,23 @@ ministack/
 └── CHANGELOG.md
 ```
 
+## FOR NEW SERVICES — Open an Issue First
+
+> **This section applies only when you are adding a brand-new AWS service** (a new file under `ministack/services/`).
+
+**Before writing any code for a new service, open a GitHub issue.** Use the `enhancement` label and describe:
+
+1. **Which AWS service** (full name + the API namespace, e.g. `inspector2`, `appconfig`, `qbusiness`).
+2. **Which operations** you actually need — not the full API surface. MiniStack favors the operations real users hit (CRUD + the handful of list/get calls SDKs and Terraform providers rely on) over wire-format completeness for every action.
+3. **A real use case** — what tool, framework, or workflow drove the need (Terraform module, CDK construct, app code, integration test, etc.). "I want full parity" is not a use case.
+4. **Scope boundaries** — what's explicitly out of scope for the first PR (e.g. "no async job lifecycle, no findings persistence, no scheduled scans" for Inspector v2). It's fine to ship a partial service; it's not fine to ship a 50-operation stub where 45 return empty lists.
+
+A maintainer will confirm the scope, flag overlap with existing work, and point you at the right protocol (JSON vs XML/Query vs REST) before you write code. This saves you from large PRs that get rejected for scope drift, AWS-parity gaps, or duplicating in-flight work.
+
+**PRs that add a new service without a corresponding scoped issue will be closed and the contributor asked to open one.** This rule is specific to new services — it's the only way we keep MiniStack's AWS parity bar high while staying a one-file-per-service codebase.
+
+---
+
 ## Adding a New Service
 
 Every service follows the same 4-step pattern:

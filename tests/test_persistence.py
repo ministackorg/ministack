@@ -121,6 +121,77 @@ def test_state_map_services_without_endpoint_are_eagerly_imported():
         )
 
 
+def test_save_dict_includes_sibling_imported_modules():
+    """Regression for #704. `appsync_events` is reached only via sibling
+    import from `appsync.py` for REST traffic — the routed handler for
+    `appsync-events` never fires (Event API traffic arrives under the
+    `appsync` credential scope). Same shape: `apigateway_v1` is reached
+    via sibling import from `apigateway.py`. If the shutdown save loop
+    only consults `_loaded_modules` (populated by `_get_module`), those
+    sibling-imported modules are silently skipped and their state is
+    dropped. The fallback through `sys.modules` is the fix."""
+    import sys as _sys
+
+    from ministack.app import _build_persistence_save_dict, _loaded_modules
+
+    # Force-import appsync_events the way appsync.py does it — a plain
+    # sibling import that bypasses `_get_module` and therefore does NOT
+    # populate `_loaded_modules`.
+    import ministack.services.appsync_events  # noqa: F401
+
+    # Simulate the bug condition: module is in sys.modules but absent
+    # from _loaded_modules.
+    saved = _loaded_modules.pop("appsync_events", None)
+    try:
+        assert "ministack.services.appsync_events" in _sys.modules, (
+            "test premise broken — module isn't in sys.modules"
+        )
+        assert "appsync_events" not in _loaded_modules, (
+            "test premise broken — module is still in _loaded_modules"
+        )
+
+        save_dict = _build_persistence_save_dict()
+
+        assert "appsync_events" in save_dict, (
+            "shutdown save loop dropped appsync_events even though the "
+            "module was imported via a sibling import. The sys.modules "
+            "fallback in `_build_persistence_save_dict` is missing or broken."
+        )
+        # The value must be the bound get_state method, not the result.
+        assert callable(save_dict["appsync_events"]), (
+            "save_dict should map to a callable (get_state method ref) — "
+            "save_all invokes it. Got %r" % (save_dict["appsync_events"],)
+        )
+    finally:
+        if saved is not None:
+            _loaded_modules["appsync_events"] = saved
+
+
+def test_save_dict_skips_modules_never_imported():
+    """The sys.modules fallback must NOT save state for modules that
+    were never imported at all — there's no state to capture and any
+    `get_state()` call on a non-imported module would attribute-error.
+    Defensive guard: ensure the fallback path's `hasattr` check works."""
+    import sys as _sys
+
+    from ministack.app import _build_persistence_save_dict, _loaded_modules, _state_map
+
+    # Pick any persisted module and ensure it's truly absent from both
+    # `_loaded_modules` and `sys.modules`. `cur` is an obscure one that
+    # most test sessions won't have touched.
+    target = "ecs_metadata"  # not in _state_map → guaranteed absent from save_dict
+    assert target not in {v for v in _state_map.values()}, (
+        "test premise broken — pick a module not in _state_map"
+    )
+
+    # Even after the fallback path runs, ecs_metadata must not appear.
+    save_dict = _build_persistence_save_dict()
+    assert "ecs_metadata" not in save_dict, (
+        "save_dict picked up a module that isn't even in _state_map — "
+        "the loop's key-membership check is broken."
+    )
+
+
 # ── Functional round-trip tests ────────────────────────────────────────
 
 def _round_trip(mod_name, svc_key, populate_fn, observe_fn):

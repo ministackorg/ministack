@@ -1562,14 +1562,18 @@ def test_rds_restore_state_removes_stale_container_before_respawn(monkeypatch):
 
         def reload(self): pass
         def stop(self, timeout=2): pass
-        def remove(self, v=False):
+        def remove(self, **kwargs):
             removed.append(self.name)
 
     stale = FakeContainer(name="ministack-rds-stale-db", container_id="cid-stale")
 
     class FakeContainers:
         def get(self, name):
-            if name == "ministack-rds-stale-db":
+            # First call returns the stale container; after .remove() is
+            # called and `removed` is populated, subsequent .get()s for
+            # the same name raise "not found" — mirrors real docker after
+            # a successful force-remove.
+            if name == "ministack-rds-stale-db" and "ministack-rds-stale-db" not in removed:
                 return stale
             raise Exception("not found")
 
@@ -1611,6 +1615,256 @@ def test_rds_restore_state_removes_stale_container_before_respawn(monkeypatch):
     assert "ministack-rds-stale-db" in removed, "stale container not removed"
     assert runs, "fresh container not spawned after removing stale one"
     assert runs[0]["name"] == "ministack-rds-stale-db"
+
+    m._instances.clear()
+
+
+def test_rds_respawn_does_not_bind_engine_port_on_host(monkeypatch):
+    """Real AWS reports `Endpoint.Port` as the engine's standard port
+    (5432 for postgres) regardless of the docker host port mapping.
+    Respawn must NOT read `Endpoint.Port` as the host bind port — doing
+    so makes every restart try to bind 0.0.0.0:5432 and collide.
+    Regression for the bug doodaz reported on #692 after 1.3.48: the
+    1.3.47 + 1.3.48 fixes covered restore-then-respawn but left this
+    port-reuse bug live."""
+    from ministack.services import rds as m
+
+    runs = []
+
+    class FakeContainer:
+        def __init__(self, name):
+            self.id = "cid-fake"
+            self.name = name
+            self.attrs = {"NetworkSettings": {"Networks": {}}}
+        def reload(self): pass
+        def stop(self, timeout=2): pass
+        def remove(self, v=False): pass
+
+    class FakeContainers:
+        def get(self, name): raise Exception("not found")
+        def run(self, **kwargs):
+            runs.append(kwargs)
+            return FakeContainer(kwargs["name"])
+
+    class FakeDocker:
+        def __init__(self):
+            self.containers = FakeContainers()
+
+    monkeypatch.setattr(m, "_get_docker", lambda: FakeDocker())
+    monkeypatch.setattr(m, "_get_ministack_network", lambda c: None)
+
+    db_id = "port-collision-db"
+    # Simulate state as persisted by a real run: Endpoint.Port has been
+    # overwritten to the container port (5432 for postgres) to match AWS.
+    persisted_state = {
+        "instances": {db_id: {
+            "DBInstanceIdentifier": db_id,
+            "Engine": "postgres",
+            "EngineVersion": "16.3",
+            "MasterUsername": "admin",
+            "_MasterUserPassword": "password123",
+            "DBName": "mydb",
+            "DBInstanceStatus": "available",
+            "Endpoint": {"Address": "localhost", "Port": 5432, "HostedZoneId": "Z"},
+        }},
+        "clusters": {}, "subnet_groups": {}, "param_groups": {},
+        "snapshots": {}, "db_cluster_param_groups": {},
+        "db_cluster_snapshots": {}, "option_groups": {},
+        "global_clusters": {}, "tags": {}, "port_counter": 15500,
+    }
+
+    m._instances.clear()
+    m.restore_state(persisted_state)
+
+    deadline = time.time() + 5
+    while time.time() < deadline and not runs:
+        time.sleep(0.05)
+
+    assert runs, "restore_state did not respawn the Docker container"
+    port_mapping = runs[0]["ports"]
+    # ports == {"5432/tcp": host_port} — host_port must NOT be 5432.
+    assert port_mapping == {"5432/tcp": runs[0]["ports"]["5432/tcp"]}, port_mapping
+    host_port = port_mapping["5432/tcp"]
+    assert host_port != 5432, (
+        f"respawn tried to bind container port 5432 to host port 5432 — "
+        f"will collide with anything else listening on 5432. "
+        f"ports={port_mapping}"
+    )
+    assert host_port >= 15432, (
+        f"respawn host port {host_port} not in MiniStack's allocated range "
+        f"(>=15432) — looks like Endpoint.Port leaked through again."
+    )
+
+    # The instance must now carry _HostPort so subsequent respawns reuse
+    # the same host port instead of allocating a new one each time.
+    restored = m._instances.get(db_id)
+    assert restored.get("_HostPort") == host_port, (
+        "respawn did not persist _HostPort on the instance — next restart "
+        "will pick a different port and break clients with cached connection strings."
+    )
+
+    m._instances.clear()
+
+
+def test_rds_next_port_skips_busy_ports(monkeypatch):
+    """`_next_port` must probe each candidate and skip ports already
+    bound on the host. Without this, a counter-only allocator hands out
+    a port that `docker run` will immediately fail to bind."""
+    from ministack.services import rds as m
+
+    busy_ports = {15432, 15433, 15434}
+    monkeypatch.setattr(m, "_is_host_port_free", lambda p: p not in busy_ports)
+    monkeypatch.setattr(m, "_port_counter", [15432])
+
+    port = m._next_port()
+    assert port == 15435, (
+        f"_next_port returned {port} but ports 15432-15434 were busy — "
+        f"it must skip taken ports, not blindly hand them out."
+    )
+
+
+def test_rds_respawn_falls_back_when_persisted_host_port_taken(monkeypatch):
+    """If `_HostPort` from persisted state is taken by another process
+    on the host, respawn must fall back to a fresh free port instead
+    of trying to bind a port we know is unavailable."""
+    from ministack.services import rds as m
+
+    runs = []
+
+    class FakeContainer:
+        def __init__(self, name):
+            self.id = "cid-fake"; self.name = name
+            self.attrs = {"NetworkSettings": {"Networks": {}}}
+        def reload(self): pass
+        def stop(self, timeout=2): pass
+        def remove(self, **kwargs): pass
+
+    class FakeContainers:
+        def get(self, name): raise Exception("not found")
+        def run(self, **kwargs):
+            runs.append(kwargs)
+            return FakeContainer(kwargs["name"])
+
+    class FakeDocker:
+        def __init__(self): self.containers = FakeContainers()
+
+    monkeypatch.setattr(m, "_get_docker", lambda: FakeDocker())
+    monkeypatch.setattr(m, "_get_ministack_network", lambda c: None)
+    # Persisted port 15500 is "taken"; anything else is free.
+    monkeypatch.setattr(m, "_is_host_port_free", lambda p: p != 15500)
+    monkeypatch.setattr(m, "_port_counter", [15600])
+
+    db_id = "fallback-db"
+    persisted_state = {
+        "instances": {db_id: {
+            "DBInstanceIdentifier": db_id,
+            "Engine": "postgres",
+            "EngineVersion": "16.3",
+            "MasterUsername": "admin",
+            "_MasterUserPassword": "p",
+            "DBName": "mydb",
+            "DBInstanceStatus": "available",
+            "Endpoint": {"Address": "localhost", "Port": 5432, "HostedZoneId": "Z"},
+            "_HostPort": 15500,
+        }},
+        "clusters": {}, "subnet_groups": {}, "param_groups": {},
+        "snapshots": {}, "db_cluster_param_groups": {},
+        "db_cluster_snapshots": {}, "option_groups": {},
+        "global_clusters": {}, "tags": {}, "port_counter": 15600,
+    }
+
+    m._instances.clear()
+    m.restore_state(persisted_state)
+
+    deadline = time.time() + 5
+    while time.time() < deadline and not runs:
+        time.sleep(0.05)
+
+    assert runs, "respawn never happened"
+    host_port = runs[0]["ports"]["5432/tcp"]
+    assert host_port != 15500, (
+        f"respawn used stored _HostPort=15500 despite it being busy — "
+        f"will fail at docker bind. Got host_port={host_port}."
+    )
+    assert m._instances[db_id]["_HostPort"] == host_port, (
+        "fallback port not persisted on instance — next restart will "
+        "try the same busy port again."
+    )
+
+    m._instances.clear()
+
+
+def test_rds_respawn_force_removes_stale_created_container(monkeypatch):
+    """Doodaz observed a half-spawned `Created`-status container with
+    the deterministic name blocking respawn. Plain `.remove()` doesn't
+    handle running/created containers; respawn must use `force=True`."""
+    from ministack.services import rds as m
+
+    remove_calls = []
+
+    class FakeStaleContainer:
+        def remove(self, **kwargs):
+            remove_calls.append(kwargs)
+            if not kwargs.get("force"):
+                raise Exception("cannot remove non-stopped container without force")
+
+    class FakeContainer:
+        def __init__(self, name):
+            self.id = "cid-fake"; self.name = name
+            self.attrs = {"NetworkSettings": {"Networks": {}}}
+        def reload(self): pass
+        def stop(self, timeout=2): pass
+        def remove(self, **kwargs): pass
+
+    name_present = {"yes": True}
+
+    class FakeContainers:
+        def get(self, name):
+            if name_present["yes"]:
+                name_present["yes"] = False  # second .get() (verification) returns "not found"
+                return FakeStaleContainer()
+            raise Exception("not found")
+        def run(self, **kwargs):
+            return FakeContainer(kwargs["name"])
+
+    class FakeDocker:
+        def __init__(self): self.containers = FakeContainers()
+
+    monkeypatch.setattr(m, "_get_docker", lambda: FakeDocker())
+    monkeypatch.setattr(m, "_get_ministack_network", lambda c: None)
+    monkeypatch.setattr(m, "_is_host_port_free", lambda p: True)
+    monkeypatch.setattr(m, "_port_counter", [15700])
+
+    db_id = "stale-created-db"
+    persisted_state = {
+        "instances": {db_id: {
+            "DBInstanceIdentifier": db_id,
+            "Engine": "postgres",
+            "EngineVersion": "16.3",
+            "MasterUsername": "admin",
+            "_MasterUserPassword": "p",
+            "DBName": "mydb",
+            "DBInstanceStatus": "available",
+            "Endpoint": {"Address": "localhost", "Port": 5432, "HostedZoneId": "Z"},
+        }},
+        "clusters": {}, "subnet_groups": {}, "param_groups": {},
+        "snapshots": {}, "db_cluster_param_groups": {},
+        "db_cluster_snapshots": {}, "option_groups": {},
+        "global_clusters": {}, "tags": {}, "port_counter": 15700,
+    }
+
+    m._instances.clear()
+    m.restore_state(persisted_state)
+
+    deadline = time.time() + 5
+    while time.time() < deadline and m._instances.get(db_id, {}).get("DBInstanceStatus") not in ("available", "failed"):
+        time.sleep(0.05)
+
+    assert remove_calls, "respawn did not attempt to remove stale container"
+    assert any(c.get("force") for c in remove_calls), (
+        f"respawn called .remove() without force=True (calls={remove_calls}) — "
+        f"will fail on Created/Running containers like the one doodaz hit."
+    )
 
     m._instances.clear()
 
