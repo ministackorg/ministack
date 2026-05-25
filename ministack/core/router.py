@@ -370,6 +370,10 @@ SERVICE_PATTERNS = {
         "host_patterns": [r"cur\."],
         "credential_scope": "cur",
     },
+    "inspector2": {
+        "host_patterns": [r"inspector2\."],
+        "credential_scope": "inspector2",
+    },
 }
 
 
@@ -453,6 +457,7 @@ def detect_service(method: str, path: str, headers: dict, query_params: dict) ->
                 "resource-groups": "resource-groups",
                 "cloudtrail": "cloudtrail",
                 "cur": "cur",
+                "inspector2": "inspector2",
             }
             if svc_name in scope_map:
                 return scope_map[svc_name]

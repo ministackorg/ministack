@@ -4,7 +4,7 @@
 
 <h1 align="center">MiniStack</h1>
 <p align="center"><strong>Free, open-source local AWS emulator. Free forever.</strong></p>
-<p align="center">55+ AWS services on a single port · Terraform compatible · Real databases · MIT licensed</p>
+<p align="center">56+ AWS services on a single port · Terraform compatible · Real databases · MIT licensed</p>
 
 <p align="center">
   <a href="https://github.com/ministackorg/ministack/releases"><img src="https://img.shields.io/github/v/release/ministackorg/ministack" alt="GitHub release"></a>
@@ -25,7 +25,7 @@
 
 LocalStack recently moved its core services behind a paid plan. If you relied on LocalStack Community for local development and CI/CD pipelines, MiniStack is your free alternative.
 
-- **55+ AWS services** emulated on a single port (4566)
+- **56+ AWS services** emulated on a single port (4566)
 - **Drop-in compatible** — works with `boto3`, AWS CLI, Terraform, CDK, Pulumi, any SDK
 - **Real infrastructure** — RDS spins up actual Postgres/MySQL containers, ElastiCache spins up real Redis, Athena runs real SQL via DuckDB (full image only), ECS runs real Docker containers
 - **Tiny footprint** — ~270MB image, ~30MB RAM at idle vs LocalStack's ~1GB image and ~500MB RAM
@@ -380,6 +380,7 @@ subnet = ec2.create_subnet(
 | **CloudTrail** | LookupEvents, CreateTrail, DeleteTrail, GetTrail, DescribeTrails, ListTrails, UpdateTrail, GetTrailStatus, StartLogging, StopLogging, PutEventSelectors, GetEventSelectors, AddTags, ListTags, RemoveTags | In-memory audit log; recording opt-in via `CLOUDTRAIL_RECORDING=1` (or runtime config endpoint); per-account ring buffer (`CLOUDTRAIL_MAX_EVENTS=10000`); `LookupEvents` supports all 8 AWS `LookupAttributes`; `IsLogging` flips on Start/StopLogging |
 | **Resource Groups** | CreateGroup, GetGroup, DeleteGroup, UpdateGroup, ListGroups, GetGroupQuery, UpdateGroupQuery, GetGroupConfiguration, PutGroupConfiguration, GroupResources, UngroupResources, ListGroupResources, ListGroupingStatuses, SearchResources, Tag, Untag, GetTags, GetAccountSettings, UpdateAccountSettings | 19 of 23 spec ops; tag-sync ops omitted (not exposed by AWS CLI / Terraform); `Group` accepts bare name or full ARN |
 | **Cost & Usage Reports** | DeleteReportDefinition, DescribeReportDefinitions, ListTagsForResource, ModifyReportDefinition, PutReportDefinition, TagResource, UntagResource | 7 of 7 spec ops |
+| **Inspector2** | Enable, Disable, ListFindings, BatchGetFindingDetails, ListCoverage, ListCoverageStatistics, ListFindingAggregations, SearchVulnerabilities, TagResource, UntagResource, ListTagsForResource, CreateFilter, ListFilters, DeleteFilter | 14 operations; deterministic stub vulnerability findings for ECR images, Lambda functions, and EC2 instances; filtering, sorting, pagination |
 
 
 ### CloudFormation
@@ -1219,6 +1220,7 @@ See [`Testcontainers/java-testcontainers`](Testcontainers/java-testcontainers), 
 | **Cloud Map** | ✅ | ❌ | ✅ |
 | **CodeBuild** | ✅ | ✅ | ✅ |
 | **Transfer Family** | ✅ | ❌ | ❌ |
+| **Inspector2** | ✅ | ❌ | ❌ |
 | **IoT Core** | ✅ (control + WS data plane) | ❌ | ✅ (paid tier) |
 | **S3 Files** | ✅ | ❌ | ❌ |
 | Cost | **Free forever** | Was free, now paid | $35+/mo |

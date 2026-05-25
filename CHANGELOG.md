@@ -7,6 +7,13 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [1.3.49] — 2026-05-24
+
+### Added
+- **Amazon Inspector2** — new service emulator with 14 API operations: `Enable`, `Disable`, `ListFindings` (with filtering, sorting, pagination), `BatchGetFindingDetails`, `ListCoverage`, `ListCoverageStatistics`, `ListFindingAggregations`, `SearchVulnerabilities`, `TagResource`, `UntagResource`, `ListTagsForResource`, `CreateFilter`, `ListFilters`, `DeleteFilter`. Generates deterministic stub vulnerability findings for ECR container images, Lambda functions, and EC2 instances when enabled.
+
+---
+
 ## [1.3.48] — 2026-05-24
 
 ### Added
