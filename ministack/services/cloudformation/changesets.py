@@ -113,6 +113,7 @@ def _create_change_set(params):
         transitive_resources = _generate_transitive_resources(cs_name, template)
         template.get("Resources").update(transitive_resources)
         _manage_interdependent_resources(cs_name, template)
+        _handle_globals(cs_name, template)
     except (ValueError, TypeError) as e:
         return _error(e.args[0], e.args[1])
 
@@ -338,6 +339,52 @@ def _list_change_sets(params):
 
 #TODO: Ask Maintainers if we shall move this to a new file ?
 
+# ===========================================================================
+# Globals inheritance
+# ===========================================================================
+def _merge_property(global_val, resource_val, res_name, cs_name):
+    """Merge a global property with a resource property, giving priority to the resource.
+    Assumption: both global_val and resource_val are of the same type, or one of them is None. Otherwise, the behavior is undefined."""
+    if resource_val is None:
+        return global_val
+    if global_val is None:
+        return resource_val
+    if isinstance(global_val, (int, float, str, bool)):
+        return resource_val
+    if isinstance(global_val, dict):
+        keys = global_val.keys() | resource_val.keys()
+        return {k: _merge_property(global_val.get(k), resource_val.get(k), res_name, cs_name) for k in keys}
+    if isinstance(global_val, list):
+        return list(set(global_val + resource_val))
+    logger.info("Unsupported complex type when applying globals for resource %s in change-set %s", res_name, cs_name)
+    raise TypeError("UnsupportedGlobalsPropertyType",
+                    f"Unsupported complex type when applying globals for resource {res_name} in change-set {cs_name}")
+
+
+def _handle_globals(cs_name: str, template: dict):
+    """
+    Handle Globals section for SAM Resources
+    """
+    template_globals = template.get("Globals")
+    if not template_globals:
+        return
+
+    for res_name, res_def in template.get("Resources", {}).items():
+        ignored_globals = res_def.get("IgnoreGlobals", [])
+        if ignored_globals == "*":
+            continue
+
+        parts = res_def.get("Type", "AWS::CloudFormation::CustomResource").split("::")
+        if len(parts) != 3 or parts[0] != "AWS" or parts[1] != "Serverless" or parts[2] not in template_globals:
+            continue
+
+        res_properties = res_def.setdefault("Properties", {})
+        for prop_name, prop_value in template_globals[parts[2]].items():
+            if prop_name in ignored_globals:
+                continue
+            merged = _merge_property(prop_value, res_properties.get(prop_name), res_name, cs_name)
+            if merged is not None:
+                res_properties[prop_name] = merged
 # ===========================================================================
 # Transitive resources
 # ===========================================================================
