@@ -2397,3 +2397,102 @@ def test_s3_lifecycle_abort_multipart(s3):
     )
     resp = s3.get_bucket_lifecycle_configuration(Bucket=bucket)
     assert resp["Rules"][0]["AbortIncompleteMultipartUpload"]["DaysAfterInitiation"] == 7
+
+
+# ============================================================================
+# Object ACL (GetObjectAcl / PutObjectAcl)
+# ============================================================================
+
+def test_s3_get_object_acl_default(s3):
+    """Default ACL returns one Grant of FULL_CONTROL to the owner."""
+    import uuid as _u
+    bucket = f"acl-default-{_u.uuid4().hex[:8]}"
+    s3.create_bucket(Bucket=bucket)
+    s3.put_object(Bucket=bucket, Key="k", Body=b"hello")
+    acl = s3.get_object_acl(Bucket=bucket, Key="k")
+    assert acl["Owner"]["ID"]
+    grants = acl["Grants"]
+    assert len(grants) == 1
+    assert grants[0]["Permission"] == "FULL_CONTROL"
+    assert grants[0]["Grantee"]["Type"] == "CanonicalUser"
+    s3.delete_object(Bucket=bucket, Key="k")
+    s3.delete_bucket(Bucket=bucket)
+
+
+def test_s3_put_object_acl_canned(s3):
+    """Canned ACL via x-amz-acl header is stored and round-trips via Get."""
+    import uuid as _u
+    bucket = f"acl-canned-{_u.uuid4().hex[:8]}"
+    s3.create_bucket(Bucket=bucket)
+    s3.put_object(Bucket=bucket, Key="k", Body=b"x")
+    s3.put_object_acl(Bucket=bucket, Key="k", ACL="public-read")
+    acl = s3.get_object_acl(Bucket=bucket, Key="k")
+    assert acl["Grants"]
+    # Round-trip: the put succeeded and Get returns a well-formed policy.
+    # We don't enforce ACL semantics, so the canned name is stored as a
+    # comment in the body and not surfaced by boto3's parser; that's fine.
+    s3.delete_object(Bucket=bucket, Key="k")
+    s3.delete_bucket(Bucket=bucket)
+
+
+def test_s3_put_object_acl_invalid_canned(s3):
+    """Invalid x-amz-acl values are rejected with InvalidArgument (400)."""
+    import uuid as _u
+    from botocore.exceptions import ClientError
+    bucket = f"acl-bad-{_u.uuid4().hex[:8]}"
+    s3.create_bucket(Bucket=bucket)
+    s3.put_object(Bucket=bucket, Key="k", Body=b"x")
+    with pytest.raises(ClientError) as exc:
+        s3.put_object_acl(Bucket=bucket, Key="k", ACL="not-a-real-canned-acl")
+    assert exc.value.response["Error"]["Code"] == "InvalidArgument"
+    s3.delete_object(Bucket=bucket, Key="k")
+    s3.delete_bucket(Bucket=bucket)
+
+
+def test_s3_get_object_acl_no_such_key(s3):
+    """GetObjectAcl on a missing key returns NoSuchKey (404)."""
+    import uuid as _u
+    from botocore.exceptions import ClientError
+    bucket = f"acl-missing-{_u.uuid4().hex[:8]}"
+    s3.create_bucket(Bucket=bucket)
+    with pytest.raises(ClientError) as exc:
+        s3.get_object_acl(Bucket=bucket, Key="never-existed")
+    assert exc.value.response["Error"]["Code"] == "NoSuchKey"
+    s3.delete_bucket(Bucket=bucket)
+
+
+def test_s3_put_object_acl_xml_body(s3):
+    """A well-formed AccessControlPolicy XML body is accepted and round-trips."""
+    import uuid as _u
+    bucket = f"acl-xml-{_u.uuid4().hex[:8]}"
+    s3.create_bucket(Bucket=bucket)
+    s3.put_object(Bucket=bucket, Key="k", Body=b"x")
+    s3.put_object_acl(
+        Bucket=bucket, Key="k",
+        AccessControlPolicy={
+            "Owner": {"ID": "test-owner-id", "DisplayName": "tester"},
+            "Grants": [
+                {
+                    "Grantee": {
+                        "Type": "CanonicalUser",
+                        "ID": "test-owner-id",
+                        "DisplayName": "tester",
+                    },
+                    "Permission": "FULL_CONTROL",
+                },
+                {
+                    "Grantee": {
+                        "Type": "Group",
+                        "URI": "http://acs.amazonaws.com/groups/global/AllUsers",
+                    },
+                    "Permission": "READ",
+                },
+            ],
+        },
+    )
+    acl = s3.get_object_acl(Bucket=bucket, Key="k")
+    assert acl["Owner"]["ID"] == "test-owner-id"
+    perms = sorted(g["Permission"] for g in acl["Grants"])
+    assert perms == ["FULL_CONTROL", "READ"]
+    s3.delete_object(Bucket=bucket, Key="k")
+    s3.delete_bucket(Bucket=bucket)

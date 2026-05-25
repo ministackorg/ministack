@@ -237,17 +237,6 @@ def _start_rds_container_for_instance(db_id, instance):
                 container_name, db_id)
 
 
-try:
-    _restored = load_state("rds")
-    if _restored:
-        restore_state(_restored)
-except Exception:
-    import logging
-    logging.getLogger(__name__).exception(
-        "Failed to restore persisted state; continuing with fresh store"
-    )
-
-
 def _get_docker():
     global _docker
     if _docker is None:
@@ -3111,3 +3100,19 @@ def reset():
     _global_clusters.clear()
     _tags.clear()
     _port_counter[0] = BASE_PORT
+
+
+# Load persisted state at module import. Must run AFTER every helper this
+# code path may touch (notably `_get_docker`, `_docker_image_for_engine`,
+# `_get_ministack_network`) is defined — `restore_state` spawns daemon threads
+# that race against the rest of module parsing, and a thread reaching an
+# undefined name raises NameError mid-restore (issue #692 follow-up).
+try:
+    _restored = load_state("rds")
+    if _restored:
+        restore_state(_restored)
+except Exception:
+    import logging
+    logging.getLogger(__name__).exception(
+        "Failed to restore persisted state; continuing with fresh store"
+    )

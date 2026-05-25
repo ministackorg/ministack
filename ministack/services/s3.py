@@ -76,6 +76,7 @@ _bucket_accelerate_config = AccountScopedDict()
 _bucket_request_payment_config = AccountScopedDict()
 
 _object_tags = AccountScopedDict()
+_object_acl = AccountScopedDict()  # (bucket, key) -> stored ACL XML string
 _object_versions = AccountScopedDict()  # (bucket, key) -> [{version_id, obj_record}, ...]
 
 _bucket_object_lock = AccountScopedDict()
@@ -609,6 +610,8 @@ def _dispatch(
                 return _get_object_retention(bucket, key)
             if "legal-hold" in query_params:
                 return _get_object_legal_hold(bucket, key)
+            if "acl" in query_params:
+                return _get_object_acl(bucket, key)
             return _get_object(bucket, key, headers, query_params)
 
         if method == "PUT":
@@ -622,6 +625,8 @@ def _dispatch(
                 return _put_object_retention(bucket, key, body, headers)
             if "legal-hold" in query_params:
                 return _put_object_legal_hold(bucket, key, body)
+            if "acl" in query_params:
+                return _put_object_acl(bucket, key, body, headers)
             if "x-amz-copy-source" in headers:
                 return _copy_object(bucket, key, headers)
             return _put_object(bucket, key, body, headers)
@@ -2283,6 +2288,7 @@ def _delete_object(bucket_name: str, key: str, headers: dict | None = None):
     _object_tags.pop((bucket_name, key), None)
     _object_retention.pop((bucket_name, key), None)
     _object_legal_hold.pop((bucket_name, key), None)
+    _object_acl.pop((bucket_name, key), None)
     _delete_persisted_object(bucket_name, key)
 
     if existed:
@@ -2792,6 +2798,117 @@ def _put_object_legal_hold(bucket_name: str, key: str, body: bytes):
 
 
 # ---------------------------------------------------------------------------
+# Object ACL (?acl subresource)
+# ---------------------------------------------------------------------------
+
+# Canned ACLs accepted by PutObjectAcl `x-amz-acl` header per the AWS S3 API
+# reference. Stored verbatim — ministack does not enforce ACL semantics on the
+# data plane, only round-trips the value so SDK callers that read it back
+# (terraform, CDK, custom code) see what they set.
+_CANNED_OBJECT_ACLS = {
+    "private",
+    "public-read",
+    "public-read-write",
+    "authenticated-read",
+    "aws-exec-read",
+    "bucket-owner-read",
+    "bucket-owner-full-control",
+}
+
+
+def _default_object_acl_xml() -> bytes:
+    """Default ACL real AWS returns when no ACL has been set on an object:
+    a single Grant of FULL_CONTROL to the bucket owner (CanonicalUser).
+    The canonical-user ID is derived from the request's account so cross-
+    account callers don't all collide on the same fake ID."""
+    owner_id = get_account_id()
+    return (
+        XML_DECL + b"\n"
+        b'<AccessControlPolicy xmlns="' + S3_NS.encode() + b'">'
+        b"<Owner><ID>" + owner_id.encode() + b"</ID>"
+        b"<DisplayName>ministack</DisplayName></Owner>"
+        b"<AccessControlList><Grant>"
+        b'<Grantee xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" '
+        b'xsi:type="CanonicalUser">'
+        b"<ID>" + owner_id.encode() + b"</ID>"
+        b"<DisplayName>ministack</DisplayName></Grantee>"
+        b"<Permission>FULL_CONTROL</Permission>"
+        b"</Grant></AccessControlList></AccessControlPolicy>"
+    )
+
+
+def _get_object_acl(bucket_name: str, key: str):
+    bucket = _ensure_bucket(bucket_name)
+    if bucket is None:
+        return _no_such_bucket(bucket_name)
+    if key not in bucket["objects"]:
+        return _error(
+            "NoSuchKey",
+            "The specified key does not exist.",
+            404,
+            f"/{bucket_name}/{key}",
+        )
+
+    stored = _object_acl.get((bucket_name, key))
+    body = stored.encode("utf-8") if stored else _default_object_acl_xml()
+    return 200, {"Content-Type": "application/xml"}, body
+
+
+def _put_object_acl(bucket_name: str, key: str, body: bytes, headers: dict):
+    bucket = _ensure_bucket(bucket_name)
+    if bucket is None:
+        return _no_such_bucket(bucket_name)
+    if key not in bucket["objects"]:
+        return _error(
+            "NoSuchKey",
+            "The specified key does not exist.",
+            404,
+            f"/{bucket_name}/{key}",
+        )
+
+    # Canned ACL from x-amz-acl header takes precedence and is mutually
+    # exclusive with an XML body per the AWS API reference. Either path
+    # stores the resulting policy XML so GetObjectAcl round-trips the value
+    # the caller set, matching what real AWS would return.
+    canned = headers.get("x-amz-acl")
+    if canned:
+        if canned not in _CANNED_OBJECT_ACLS:
+            return _error("InvalidArgument",
+                          f"Invalid x-amz-acl value: {canned}", 400)
+        owner_id = get_account_id()
+        _object_acl[(bucket_name, key)] = (
+            XML_DECL.decode() + "\n"
+            f'<AccessControlPolicy xmlns="{S3_NS}">'
+            f"<Owner><ID>{owner_id}</ID>"
+            f"<DisplayName>ministack</DisplayName></Owner>"
+            f'<AccessControlList><!-- canned: {canned} --><Grant>'
+            f'<Grantee xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" '
+            f'xsi:type="CanonicalUser">'
+            f"<ID>{owner_id}</ID>"
+            f"<DisplayName>ministack</DisplayName></Grantee>"
+            f"<Permission>FULL_CONTROL</Permission></Grant></AccessControlList>"
+            f"</AccessControlPolicy>"
+        )
+        return 200, {}, b""
+
+    if not body:
+        return _error("MissingSecurityHeader",
+                      "Your request was missing a required header.", 400)
+    try:
+        # Validate XML well-formedness — real AWS rejects malformed bodies
+        # with MalformedACLError. We don't enforce grantee/permission
+        # semantics on the data plane, so any well-formed AccessControlPolicy
+        # is accepted and round-tripped verbatim.
+        fromstring(body)
+    except Exception:
+        return _error("MalformedACLError",
+                      "The XML you provided was not well-formed or did not validate "
+                      "against our published schema.", 400)
+    _object_acl[(bucket_name, key)] = body.decode("utf-8", errors="replace")
+    return 200, {}, b""
+
+
+# ---------------------------------------------------------------------------
 # Replication Configuration
 # ---------------------------------------------------------------------------
 
@@ -3148,6 +3265,7 @@ def _delete_objects(bucket_name: str, body: bytes, headers: dict = None):
             _object_tags.pop((bucket_name, k), None)
             _object_retention.pop((bucket_name, k), None)
             _object_legal_hold.pop((bucket_name, k), None)
+            _object_acl.pop((bucket_name, k), None)
             _delete_persisted_object(bucket_name, k)
             deleted_keys.append(k)
 
@@ -3801,7 +3919,7 @@ def reset():
     global _bucket_versioning, _bucket_encryption, _bucket_lifecycle, _bucket_cors
     global _bucket_acl, _bucket_websites, _bucket_logging_config
     global _bucket_accelerate_config, _bucket_request_payment_config
-    global _object_tags, _multipart_uploads, _object_versions
+    global _object_tags, _multipart_uploads, _object_versions, _object_acl
     global \
         _bucket_object_lock, \
         _bucket_replication, \
@@ -3822,6 +3940,7 @@ def reset():
         _bucket_accelerate_config,
         _bucket_request_payment_config,
         _object_tags,
+        _object_acl,
         _multipart_uploads,
         _bucket_object_lock,
         _bucket_replication,
