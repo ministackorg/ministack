@@ -328,6 +328,10 @@ def _create_table(data):
         "PartitionKeys": table_input.get("PartitionKeys", []),
         "TableType": table_input.get("TableType", "EXTERNAL_TABLE"),
         "Parameters": table_input.get("Parameters", {}),
+        "ViewOriginalText": table_input.get("ViewOriginalText"),
+        "ViewExpandedText": table_input.get("ViewExpandedText"),
+        "ViewDefinition": table_input.get("ViewDefinition"),
+        "IsMultiDialectView": table_input.get("IsMultiDialectView"),
         "IsRegisteredWithLakeFormation": False,
         "CatalogId": get_account_id(),
     }
@@ -373,7 +377,8 @@ def _update_table(data):
     if key not in _tables:
         return error_response_json("EntityNotFoundException", f"Table {name} not found", 400)
     safe_keys = {"Description", "Owner", "StorageDescriptor", "PartitionKeys",
-                 "TableType", "Parameters", "ViewOriginalText", "ViewExpandedText"}
+                 "TableType", "Parameters", "ViewOriginalText", "ViewExpandedText",
+                 "ViewDefinition", "IsMultiDialectView"}
     for k in safe_keys:
         if k in table_input:
             _tables[key][k] = table_input[k]

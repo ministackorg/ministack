@@ -123,6 +123,36 @@ def test_glue_table_v2(glue):
         glue.get_table(DatabaseName="glue_tbl_v2db", Name="tbl_v2")
     assert exc.value.response["Error"]["Code"] == "EntityNotFoundException"
 
+def test_glue_view_original_text_roundtrip(glue):
+    glue.create_database(DatabaseInput={"Name": "glue_view_db"})
+    original = "/* Presto View: eyJjYXRhbG9nIjoiaWNlYmVyZyJ9 */"
+    expanded = "/* Presto View */"
+    glue.create_table(
+        DatabaseName="glue_view_db",
+        TableInput={
+            "Name": "vw_x",
+            "TableType": "VIRTUAL_VIEW",
+            "ViewOriginalText": original,
+            "ViewExpandedText": expanded,
+        },
+    )
+    resp = glue.get_table(DatabaseName="glue_view_db", Name="vw_x")
+    assert resp["Table"]["ViewOriginalText"] == original
+    assert resp["Table"]["ViewExpandedText"] == expanded
+
+    glue.update_table(
+        DatabaseName="glue_view_db",
+        TableInput={
+            "Name": "vw_x",
+            "TableType": "VIRTUAL_VIEW",
+            "ViewOriginalText": original + " v2",
+            "ViewExpandedText": expanded + " v2",
+        },
+    )
+    resp2 = glue.get_table(DatabaseName="glue_view_db", Name="vw_x")
+    assert resp2["Table"]["ViewOriginalText"] == original + " v2"
+    assert resp2["Table"]["ViewExpandedText"] == expanded + " v2"
+
 def test_glue_list_v2(glue):
     glue.create_database(DatabaseInput={"Name": "glue_lst_v2db"})
     glue.create_table(
