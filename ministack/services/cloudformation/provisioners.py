@@ -3888,6 +3888,40 @@ def _serverless_layer_create(logical_id, props, stack_name):
     props["Content"] = _map_serverless_code_uri(props.pop("ContentUri", None))
     return _lambda_layer_create(logical_id, props, stack_name)
 
+def _serverless_state_machine_create(logical_id, props, stack_name):
+    # Map SAM property names to CFN AWS::StepFunctions::StateMachine equivalents.
+    # DefinitionUri -> DefinitionS3Location
+    definition_uri = props.pop("DefinitionUri", None)
+    if definition_uri is not None:
+        if isinstance(definition_uri, dict):
+            props["DefinitionS3Location"] = {
+                "Bucket": definition_uri.get("Bucket", ""),
+                "Key": definition_uri.get("Key", ""),
+                "Version": definition_uri.get("Version"),
+            }
+        elif isinstance(definition_uri, str):
+            uri = definition_uri.removeprefix("s3://")
+            bucket, key = uri.split("/", 1)
+            props["DefinitionS3Location"] = {"Bucket": bucket, "Key": key}
+
+    # Name -> StateMachineName
+    if "Name" in props:
+        props.setdefault("StateMachineName", props.pop("Name"))
+
+    # Role -> RoleArn
+    if "Role" in props:
+        props.setdefault("RoleArn", props.pop("Role"))
+
+    # Type -> StateMachineType
+    if "Type" in props:
+        props.setdefault("StateMachineType", props.pop("Type"))
+
+    # Logging -> LoggingConfiguration
+    if "Logging" in props:
+        props.setdefault("LoggingConfiguration", props.pop("Logging"))
+
+    return _sfn_state_machine_create(logical_id, props, stack_name)
+
 _RESOURCE_HANDLERS = {
     "AWS::S3::Bucket": {"create": _s3_create, "update": _s3_update, "delete": _s3_delete},
     "AWS::S3::BucketPolicy": {"create": _s3_bucket_policy_create, "delete": _s3_bucket_policy_delete},
@@ -4003,5 +4037,5 @@ _RESOURCE_HANDLERS = {
     # Serverless
     "AWS::Serverless::Function": {"create": _serverless_function_create, "delete": _lambda_delete},
     "AWS::Serverless::LayerVersion": {"create": _serverless_layer_create, "delete": _lambda_layer_delete},
-    # "AWS::Serverless::StateMachine": {"create": _sfn_state_machine_create, "delete": _sfn_state_machine_delete},
+    "AWS::Serverless::StateMachine": {"create": _serverless_state_machine_create, "delete": _sfn_state_machine_delete},
 }

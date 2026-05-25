@@ -465,33 +465,39 @@ def _manage_interdependent_resources(cs_name: str, template: dict):
             handler(name, res_def, template.get("Resources",{}))
             logger.debug("Managed interdependent resource for %s in ChangeSet", name,cs_name)
 
-def _manage_interdependencies_sam_function(res_name: str,res_def: dict,resources:dict):
-    def map_policies(policies):
-        managed_policies: list[str] = []
-        if policies is None:
-            return None
+def _map_policies(policies, res_name: str) -> list[str] | None:
+    """Map a SAM Policies value to a list of managed policy ARNs.
 
-        if isinstance(policies, str):
-            policies = [policies]
+    Accepts None, a single string, or a list of strings. Each entry must be
+    either a known AWS-managed policy alias or a full policy ARN.
+    """
+    if policies is None:
+        return None
 
-        if isinstance(policies, list):
-            for policy in policies:
-                import data.iam
-                from services.iam import _is_valid_policy_arn
-                if policy in data.iam.AWS_MANAGED_POLICY_ALIASES:
-                    managed_policies.append(data.iam.get_full_policy_arn(policy))
-                elif _is_valid_policy_arn(policy):
-                    managed_policies.append(policy)
-                else:
-                    # Todo: returning _error() in nested function to represent errors is hard to manage.
-                    # Todo: Ask the maintainers if it's okay to depend on exception rather than _error() ( it will be a lot of effort, because nesting level is deep ).
-                    raise ValueError("InvalidPolicyArnException",
-                                     f"Invalid policy arn: {policy} attached to {res_name}")
+    import data.iam
+    from services.iam import _is_valid_policy_arn
+
+    if isinstance(policies, str):
+        policies = [policies]
+
+    if not isinstance(policies, list):
+        raise TypeError("InvalidPolicyTypeException", f"Invalid policies type attached to {res_name}")
+
+    managed_policies: list[str] = []
+    for policy in policies:
+        if policy in data.iam.AWS_MANAGED_POLICY_ALIASES:
+            managed_policies.append(data.iam.get_full_policy_arn(policy))
+        elif _is_valid_policy_arn(policy):
+            managed_policies.append(policy)
         else:
-            raise TypeError("InvalidPolicyTypeException", f"Invalid policies type attached to {res_name}")
+            # Todo: returning _error() in nested function to represent errors is hard to manage.
+            # Todo: Ask the maintainers if it's okay to depend on exception rather than _error() ( it will be a lot of effort, because nesting level is deep ).
+            raise ValueError("InvalidPolicyArnException",
+                             f"Invalid policy arn: {policy} attached to {res_name}")
+    return managed_policies
 
-        return managed_policies
 
+def _manage_interdependencies_sam_function(res_name: str,res_def: dict,resources:dict):
     def extract_role() -> dict:
         role_name = res_def["Properties"]["Role"].get("Fn::GetAtt", [])[0]
 
@@ -503,7 +509,7 @@ def _manage_interdependencies_sam_function(res_name: str,res_def: dict,resources
 
     if "Policies" in res_def.get("Properties", {}):
         policies = res_def.get("Properties", {}).get("Policies")
-        mapped_policies = map_policies(policies)
+        mapped_policies = _map_policies(policies, res_name)
         if mapped_policies is not None:
             role = extract_role()
             managed_policy_arns = set(role.get("Properties").get("ManagedPolicyArns", []))
@@ -520,6 +526,75 @@ def _manage_interdependencies_sam_function(res_name: str,res_def: dict,resources
             managed_policy_arns.add(get_full_policy_arn("AWSXrayWriteOnlyAccess"))
             role.get("Properties").update({"ManagedPolicyArns": list(managed_policy_arns)})
 
+def _generate_transitive_sam_state_machine_resources(res_name: str, res_def: dict, prohibited_resource_names: list[str]) -> dict:
+    """
+    Generate transitive resources for a SAM state machine if needed.
+    This will generate AWS::IAM::Role for the state machine if no Role is set.
+    The new role will have the Policies attached to its ManagedPolicyArns, only managed policy and aws-managed policy aliases will be supported.
+    """
+    role = res_def.get("Properties", {}).get("Role")
+    new_resources = {}
+    if role is None:
+        role_name = res_name + "Role"
+        while role_name in prohibited_resource_names:
+            role_name = res_name + "Role" + new_uuid()[:4]
+
+        role = {
+            "Metadata": {
+                "SamResourceId": role_name
+            },
+            "Properties": {
+                "AssumeRolePolicyDocument": {
+                    "Statement": [
+                        {
+                            "Action": "sts:AssumeRole",
+                            "Effect": "Allow",
+                            "Principal": {
+                                "Service": "states.amazonaws.com"
+                            }
+                        }
+                    ],
+                    "Version": "2012-10-17"
+                },
+                "ManagedPolicyArns": [],
+                "Tags": [
+                    {
+                        "Value": "SAM",
+                        "Key": "stateMachine:createdBy"
+                    }
+                ]
+            },
+            "Type": "AWS::IAM::Role"
+        }
+
+        # Attach the role to the state machine
+        res_def.get("Properties", {}).update({"Role": {"Fn::GetAtt": [role_name, "Arn"]}})
+
+        new_resources[role_name] = role
+
+    return new_resources
+
+
+def _manage_interdependencies_sam_state_machine(res_name: str, res_def: dict, resources: dict):
+    def extract_role() -> dict:
+        role_name = res_def["Properties"]["Role"].get("Fn::GetAtt", [])[0]
+        role = resources.get(role_name, None)
+        if role is None:
+            raise ValueError("InvalidRoleException",
+                             f"Can't find role definition for {role_name} attached to {res_name}")
+        return role
+
+    if "Policies" in res_def.get("Properties", {}):
+        policies = res_def.get("Properties", {}).get("Policies")
+        mapped_policies = _map_policies(policies, res_name)
+        if mapped_policies is not None:
+            role = extract_role()
+            managed_policy_arns = set(role.get("Properties").get("ManagedPolicyArns", []))
+            managed_policy_arns.update(mapped_policies)
+            role.get("Properties").update({"ManagedPolicyArns": list(managed_policy_arns)})
+
+
 _TRANSITIVE_RESOURCES = {
-    "AWS::Serverless::Function": { "generate_transitive": _generate_transitive_sam_function_resources, "manage_interdependent": _manage_interdependencies_sam_function }
+    "AWS::Serverless::Function": { "generate_transitive": _generate_transitive_sam_function_resources, "manage_interdependent": _manage_interdependencies_sam_function },
+    "AWS::Serverless::StateMachine": { "generate_transitive": _generate_transitive_sam_state_machine_resources, "manage_interdependent": _manage_interdependencies_sam_state_machine },
 }
