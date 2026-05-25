@@ -1700,12 +1700,7 @@ async def _handle_lifespan(scope, receive, send):
         elif message["type"] == "lifespan.shutdown":
             logger.info("MiniStack shutting down...")
             if PERSIST_STATE:
-                # Only save state for modules that were actually loaded
-                save_dict = {}
-                for key, mod_name in _state_map.items():
-                    if mod_name in _loaded_modules:
-                        save_dict[key] = _loaded_modules[mod_name].get_state
-                save_all(save_dict)
+                save_all(_build_persistence_save_dict())
             try:
                 from ministack.services import transfer
 
@@ -1749,6 +1744,27 @@ def _stop_docker_containers():
             pass
 
 
+def _build_persistence_save_dict():
+    """Build the {state_key: get_state} mapping that `save_all` consumes
+    at shutdown. Primary source is `_loaded_modules`, populated by
+    `_get_module()` on every routed request. Falls back to `sys.modules`
+    so modules reached only via sibling imports from other services
+    (e.g. `appsync` -> `appsync_events`, `apigateway` -> `apigateway_v1`,
+    `lambda` -> `cloudwatch_logs` for auto-created log groups, S3
+    notifications -> `eventbridge`) are still persisted. Without this
+    fallback, state created exclusively through cross-service code paths
+    is silently dropped at shutdown (#704 and class)."""
+    save_dict = {}
+    for key, mod_name in _state_map.items():
+        mod = _loaded_modules.get(mod_name)
+        if mod is None:
+            mod = sys.modules.get(f"ministack.services.{mod_name}")
+            if mod is None or not hasattr(mod, "get_state"):
+                continue
+        save_dict[key] = mod.get_state
+    return save_dict
+
+
 def _load_persisted_state():
     """Load persisted state for services that support it."""
     for svc_key in ("apigateway", "apigateway_v1", "servicediscovery"):
@@ -1759,18 +1775,27 @@ def _load_persisted_state():
 
     # Eagerly import persisted services whose restore path depends on
     # a module-level `load_state()` side-effect, but which would not
-    # otherwise be imported during startup. These are NOT covered by
-    # the explicit central-restore loop above (no
-    # `load_persisted_state` method), and the lazy router will not
-    # pull them in early enough — for example, `ses_v2` is reached
-    # via the `/v2/email/*` path-prefix shortcut and `pipes` via
-    # CloudFormation, neither of which fires at lifespan startup.
-    # Importing here triggers the restore (and, for `pipes`, also
-    # restarts the background poller for any RUNNING pipe). Keep this
-    # list narrow — every entry costs a cold-start import. Enforced
-    # by `tests/test_persistence_symmetry.py::test_state_map_
-    # services_without_endpoint_are_eagerly_imported`.
-    for svc_key in ("pipes", "ses_v2"):
+    # otherwise be imported during startup. The lazy router does not
+    # pull them in early enough in any of these cases:
+    #   - `ses_v2` is reached via the `/v2/email/*` path-prefix shortcut.
+    #   - `pipes` is created only via CloudFormation provisioners.
+    #   - `appsync_events` is routable (SERVICE_REGISTRY has
+    #     "appsync-events") but real traffic arrives under the
+    #     `appsync` credential scope at `/v2/apis`, so the
+    #     `appsync-events` lazy handler never fires; the module is
+    #     reached only via a sibling import from `appsync.py`, which
+    #     bypasses `_get_module` and leaves it out of
+    #     `_loaded_modules` → shutdown skips persistence (#704).
+    #   - `apigateway_v1` is restored above only when a state file
+    #     already exists; on first-ever boot the conditional skips
+    #     it, the module is reached only via `apigateway.py`'s
+    #     sibling import (line 237), and the first save is silently
+    #     dropped. Same bug class as #704.
+    # Importing here triggers the module-level restore (and, for
+    # `pipes`, also restarts the background poller for any RUNNING
+    # pipe). Keep this list narrow — every entry costs a cold-start
+    # import.
+    for svc_key in ("pipes", "ses_v2", "appsync_events", "apigateway_v1"):
         _get_module(svc_key)
 
 
@@ -1921,18 +1946,28 @@ def _reset_all_state():
     # still need reset() — REST API v1 (served via the apigateway module),
     # SES v2 (served via the ses module), and EventBridge Pipes (CFN-only
     # provisioner with a background poller thread that reset() must stop).
+    # Kept for documentation / safety even though the `sys.modules` fallback
+    # below catches every imported module regardless.
     _extra_reset_modules = ("apigateway_v1", "ses_v2", "pipes")
 
     module_names = {cfg["module"] for cfg in SERVICE_REGISTRY.values()}
     module_names.update(_extra_reset_modules)
 
     for mod_name in module_names:
-        if mod_name in _loaded_modules:
-            mod = _loaded_modules[mod_name]
-            try:
-                mod.reset()
-            except Exception as e:
-                logger.warning("reset() failed for %s: %s", mod_name, e)
+        # Same class fix as the shutdown save loop: a module reached only via
+        # sibling import from another service (e.g. `appsync` -> `appsync_events`,
+        # `apigateway` -> `apigateway_v1`, `lambda` -> `cloudwatch_logs`) is
+        # imported into `sys.modules` but never registered in `_loaded_modules`.
+        # Without the `sys.modules` fallback, those modules silently skip reset
+        # — leaving state across `/_ministack/reset` calls and breaking test
+        # isolation.
+        mod = _loaded_modules.get(mod_name) or sys.modules.get(f"ministack.services.{mod_name}")
+        if mod is None or not hasattr(mod, "reset"):
+            continue
+        try:
+            mod.reset()
+        except Exception as e:
+            logger.warning("reset() failed for %s: %s", mod_name, e)
 
     S3_DATA_DIR = os.environ.get("S3_DATA_DIR", "/tmp/ministack-data/s3")
     S3_PERSIST = os.environ.get("S3_PERSIST", "0") == "1"
