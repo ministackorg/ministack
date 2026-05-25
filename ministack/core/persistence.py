@@ -10,7 +10,7 @@ import logging
 import os
 import tempfile
 
-from ministack.core.responses import AccountScopedDict
+from ministack.core.responses import AccountRegionScopedDict, AccountScopedDict
 
 logger = logging.getLogger("persistence")
 
@@ -19,7 +19,7 @@ STATE_DIR = os.environ.get("STATE_DIR", "/tmp/ministack-state")
 
 
 def _json_default(obj):
-    """JSON encoder fallback for AccountScopedDict, tuple keys, and bytes.
+    """JSON encoder fallback for scoped dicts, tuple keys, and bytes.
 
     Historically, several S3 (and other service) stores held raw request
     bodies as ``bytes``. ``json.dump`` raised ``TypeError`` and
@@ -27,6 +27,13 @@ def _json_default(obj):
     absent on disk (issue #422). Bytes are now serialized as base64 inside a
     tagged dict so round-trip fidelity is preserved even for non-UTF-8
     payloads."""
+    if isinstance(obj, AccountRegionScopedDict):
+        # Serialize all accounts' and regions' data with string keys
+        result = {}
+        for k, v in obj._data.items():
+            # k is (account_id, region, original_key) tuple
+            result[f"{k[0]}\x00{k[1]}\x00{k[2]!r}"] = v
+        return {"__account_region_scoped__": True, "data": result}
     if isinstance(obj, AccountScopedDict):
         # Serialize all accounts' data with string keys
         result = {}
@@ -41,7 +48,18 @@ def _json_default(obj):
 
 
 def _json_object_hook(obj):
-    """JSON decoder hook to restore AccountScopedDict and bytes from serialized form."""
+    """JSON decoder hook to restore scoped dicts and bytes from serialized form."""
+    if obj.get("__account_region_scoped__"):
+        arsd = AccountRegionScopedDict()
+        for k, v in obj["data"].items():
+            account_id, region, key_repr = k.split("\x00", 2)
+            # Restore the original key (was serialized with repr())
+            try:
+                original_key = ast.literal_eval(key_repr)
+            except (ValueError, SyntaxError):
+                original_key = key_repr
+            arsd._data[(account_id, region, original_key)] = v
+        return arsd
     if obj.get("__scoped__"):
         asd = AccountScopedDict()
         for k, v in obj["data"].items():
