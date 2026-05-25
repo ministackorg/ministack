@@ -198,6 +198,32 @@ def _add_config_block(parent, config_el, tag):
         _add_xml_block(parent, child)
 
 
+# Minimal empty XML for each REQUIRED-block field on DistributionSummary.
+# Real AWS emits these even when the distribution was created with nothing
+# in them; SDKs that strict-parse (Go v2, Java v2) reject responses that
+# omit required members.
+_EMPTY_SUMMARY_BLOCKS = {
+    "Aliases": "<Aliases><Quantity>0</Quantity></Aliases>",
+    "Origins": "<Origins><Quantity>0</Quantity></Origins>",
+    "CacheBehaviors": "<CacheBehaviors><Quantity>0</Quantity></CacheBehaviors>",
+    "CustomErrorResponses": "<CustomErrorResponses><Quantity>0</Quantity></CustomErrorResponses>",
+    "ViewerCertificate": "<ViewerCertificate><CloudFrontDefaultCertificate>true</CloudFrontDefaultCertificate><MinimumProtocolVersion>TLSv1</MinimumProtocolVersion><CertificateSource>cloudfront</CertificateSource></ViewerCertificate>",
+    "Restrictions": "<Restrictions><GeoRestriction><RestrictionType>none</RestrictionType><Quantity>0</Quantity></GeoRestriction></Restrictions>",
+    "DefaultCacheBehavior": "<DefaultCacheBehavior><TargetOriginId></TargetOriginId><ViewerProtocolPolicy>allow-all</ViewerProtocolPolicy></DefaultCacheBehavior>",
+}
+
+
+def _add_config_block_with_default(parent, config_el, tag):
+    """Like `_add_config_block` but emits a minimal-but-valid empty block
+    when the source config doesn't contain `tag` — keeps DistributionSummary
+    schema-complete for strict-parsing SDKs."""
+    child = _find(config_el, tag)
+    if child is not None:
+        _add_xml_block(parent, child)
+    elif tag in _EMPTY_SUMMARY_BLOCKS:
+        _add_xml_block(parent, fromstring(_EMPTY_SUMMARY_BLOCKS[tag]))
+
+
 def _unwrap_distribution_create_xml(root_el):
     """Return ``(DistributionConfig element, Tags element or None)``.
 
@@ -852,11 +878,24 @@ def _list_distributions():
                 SubElement(ds, "Status").text = dist["Status"]
                 SubElement(ds, "LastModifiedTime").text = dist["LastModifiedTime"]
                 SubElement(ds, "DomainName").text = dist["DomainName"]
-                SubElement(ds, "Enabled").text = str(dist["enabled"]).lower()
-                SubElement(ds, "Comment").text = _text(fromstring(dist["config_xml"]), "Comment")
                 config_el = fromstring(dist["config_xml"])
-                _add_config_block(ds, config_el, "Origins")
-                _add_config_block(ds, config_el, "DefaultCacheBehavior")
+                # Field order matches real AWS DistributionSummary shape so
+                # SDKs that strict-parse (Go v2, Java v2) don't reject it.
+                # All 19 fields below are REQUIRED per botocore service-2.json.
+                _add_config_block_with_default(ds, config_el, "Aliases")
+                _add_config_block_with_default(ds, config_el, "Origins")
+                _add_config_block_with_default(ds, config_el, "DefaultCacheBehavior")
+                _add_config_block_with_default(ds, config_el, "CacheBehaviors")
+                _add_config_block_with_default(ds, config_el, "CustomErrorResponses")
+                SubElement(ds, "Comment").text = _text(config_el, "Comment") or ""
+                SubElement(ds, "PriceClass").text = _text(config_el, "PriceClass") or "PriceClass_All"
+                SubElement(ds, "Enabled").text = str(dist["enabled"]).lower()
+                _add_config_block_with_default(ds, config_el, "ViewerCertificate")
+                _add_config_block_with_default(ds, config_el, "Restrictions")
+                SubElement(ds, "WebACLId").text = _text(config_el, "WebACLId") or ""
+                SubElement(ds, "HttpVersion").text = _text(config_el, "HttpVersion") or "http2"
+                SubElement(ds, "IsIPV6Enabled").text = (_text(config_el, "IsIPV6Enabled") or "true").lower()
+                SubElement(ds, "Staging").text = str(dist.get("Staging", False)).lower()
 
     return _xml_response("DistributionList", build)
 

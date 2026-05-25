@@ -1798,6 +1798,19 @@ def _load_persisted_state():
     for svc_key in ("pipes", "ses_v2", "appsync_events", "apigateway_v1"):
         _get_module(svc_key)
 
+    # RDS is intentionally NOT in the unconditional list above —
+    # eager-importing it for every user would pull in ~13 MB of module
+    # objects (and, lazily, the docker SDK) even on stacks that don't
+    # use RDS. Instead, only eager-import when a persisted state file
+    # exists: importing the module triggers its bottom-of-file
+    # `load_state("rds")` which spawns the respawn threads for every
+    # persisted instance. Without this, users have to make one client
+    # call after every restart to lazily trigger the import + respawn
+    # (#692 follow-up after doodaz's confirmation).
+    if load_state("rds"):
+        _get_module("rds")
+        logger.info("RDS: eager-loaded module to respawn persisted containers at boot")
+
 
 async def _wait_for_port(port, timeout=30):
     """Wait until the server is accepting TCP connections."""
