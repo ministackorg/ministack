@@ -1507,6 +1507,7 @@ def _create_vpc_endpoint(p):
         "SubnetIds": _parse_member_list(p, "SubnetId"),
         "OwnerId": get_account_id(),
     }
+    _parse_tag_specs(p, "vpc-endpoint", vpce_id)
     return _xml(200, "CreateVpcEndpointResponse",
                 _vpce_fields_xml(_vpc_endpoints[vpce_id], tag="vpcEndpoint"))
 
@@ -2653,6 +2654,7 @@ def _guess_resource_type(resource_id):
         "snap-": "snapshot",
         "acl-": "network-acl",
         "nat-": "natgateway",
+        "fl-": "flow-log",
         "dopt-": "dhcp-options",
         "eigw-": "egress-only-internet-gateway",
         "lt-": "launch-template",
@@ -2945,6 +2947,7 @@ def _create_flow_logs(params):
             "FlowLogStatus": "ACTIVE",
             "CreationTime": _now_ts(),
         }
+        _parse_tag_specs(params, "flow-log", fl_id)
         created.append(fl_id)
     ids_xml = "".join(f"<item>{fid}</item>" for fid in created)
     return _xml(200, "CreateFlowLogsResponse",
@@ -2970,6 +2973,7 @@ def _describe_flow_logs(params):
             <logDestination>{fl.get('LogDestination','')}</logDestination>
             <flowLogStatus>{fl['FlowLogStatus']}</flowLogStatus>
             <creationTime>{fl['CreationTime']}</creationTime>
+            {_tag_set_xml(fl['FlowLogId'])}
         </item>"""
     return _xml(200, "DescribeFlowLogsResponse", f"<flowLogSet>{items}</flowLogSet>")
 
@@ -2978,6 +2982,7 @@ def _delete_flow_logs(params):
     ids = _parse_member_list(params, "FlowLogId")
     for fid in ids:
         _flow_logs.pop(fid, None)
+        _tags.pop(fid, None)
     return _xml(200, "DeleteFlowLogsResponse", "<unsuccessful/>")
 
 

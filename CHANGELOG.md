@@ -7,6 +7,13 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [Unreleased]
+
+### Fixed
+- **EC2 `CreateVpcEndpoint` and `CreateFlowLogs` now persist `TagSpecifications`** — tags passed at creation time were silently dropped. Tags are now stored, returned by `DescribeFlowLogs`, and cleaned up on `DeleteFlowLogs`. The `fl-` prefix is also registered in the resource-type guesser so flow-log IDs are correctly resolved by the Resource Groups Tagging API.
+
+---
+
 ## [1.3.49] — 2026-05-25
 
 ### Added
