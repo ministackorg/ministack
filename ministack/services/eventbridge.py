@@ -997,22 +997,18 @@ def _apply_input_transformer(transformer, event):
 def _dispatch_to_lambda(arn, payload):
     from ministack.services import lambda_svc
 
-    parts = arn.split(":")
-    func_name = parts[-1].split("/")[-1] if "/" in parts[-1] else parts[-1]
-    if func_name.startswith("function:"):
-        func_name = func_name[len("function:"):]
-
     try:
         event = json.loads(payload)
     except (json.JSONDecodeError, TypeError):
         event = {"body": payload}
 
-    func = lambda_svc._functions.get(func_name)
-    if not func:
+    func, config, func_name = lambda_svc._get_func_record_for_ref(arn)
+    if not func or not config:
         logger.warning("EventBridge → Lambda: function %s not found", func_name)
         return
+    exec_record = lambda_svc._execution_record_for_config(func, config)
     threading.Thread(
-        target=lambda_svc._execute_function, args=(func, event), daemon=True
+        target=lambda_svc._execute_function_with_config_scope, args=(exec_record, event), daemon=True
     ).start()
     logger.info("EventBridge → Lambda %s: dispatched", func_name)
 

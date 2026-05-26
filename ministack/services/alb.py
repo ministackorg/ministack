@@ -16,6 +16,7 @@ Supports:
   Tags:                 AddTags, RemoveTags, DescribeTags
 """
 
+import asyncio
 import base64
 import copy
 import fnmatch
@@ -27,6 +28,7 @@ import string
 import time
 from urllib.parse import parse_qs
 
+from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.persistence import PERSIST_STATE, load_state
 from ministack.core.responses import AccountScopedDict, get_account_id, get_region, new_uuid
 
@@ -1016,22 +1018,33 @@ async def _forward_to_tg(tg_arn, method, path, headers, body, query_params):
 
     if target_type == "lambda":
         func_id = registered[0]["Id"]
-        func_name = func_id.split(":function:")[-1].split(":")[0] if ":function:" in func_id else func_id
-        return await _invoke_lambda_target(func_name, tg_arn, method, path,
+        return await _invoke_lambda_target(func_id, tg_arn, method, path,
                                            headers, body, query_params)
 
     return (502, {"Content-Type": "application/json"},
             json.dumps({"message": f"Target type '{target_type}' not supported."}).encode())
 
 
-async def _invoke_lambda_target(func_name, tg_arn, method, path, headers, body, query_params):
+async def _invoke_lambda_target(function_ref, tg_arn, method, path, headers, body, query_params):
     try:
         from ministack.services import lambda_svc
     except ImportError:
         return (502, {"Content-Type": "application/json"},
                 json.dumps({"message": "Lambda service unavailable"}).encode())
 
-    if func_name not in lambda_svc._functions:
+    try:
+        tg_spec = parse_arn(tg_arn)
+    except ArnParseError:
+        tg_spec = None
+    owner_account_id = tg_spec.account_id if tg_spec else get_account_id()
+    owner_region = tg_spec.region if tg_spec else get_region()
+
+    func, config, func_name = lambda_svc._get_func_record_for_ref_in_scope(
+        function_ref,
+        account_id=owner_account_id,
+        region=owner_region,
+    )
+    if not func or not config:
         return (502, {"Content-Type": "application/json"},
                 json.dumps({"message": f"Lambda function '{func_name}' not found"}).encode())
 
@@ -1059,7 +1072,35 @@ async def _invoke_lambda_target(func_name, tg_arn, method, path, headers, body, 
         "isBase64Encoded": is_b64,
     }
 
-    _, resp_headers, resp_body = await lambda_svc._invoke(func_name, event, {})
+    exec_record = lambda_svc._execution_record_for_config(func, config)
+
+    def _invoke_and_record_metrics():
+        started = time.time()
+        invocation_result = lambda_svc._execute_function_with_config_scope(exec_record, event)
+        duration_ms = (time.time() - started) * 1000.0
+        lambda_svc._run_with_function_config_scope(
+            config,
+            lambda_svc._emit_lambda_metrics,
+            func_name,
+            duration_ms=duration_ms,
+            error=bool(invocation_result.get("error")),
+            throttle=bool(invocation_result.get("throttle")),
+        )
+        return invocation_result
+
+    result = await asyncio.to_thread(_invoke_and_record_metrics)
+    resp_headers = {}
+    if result.get("error"):
+        resp_headers["X-Amz-Function-Error"] = result.get("function_error") or "Unhandled"
+    payload = result.get("body")
+    if payload is None:
+        resp_body = b"null"
+    elif isinstance(payload, bytes):
+        resp_body = payload
+    elif isinstance(payload, str):
+        resp_body = payload.encode("utf-8")
+    else:
+        resp_body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
 
     if resp_headers.get("X-Amz-Function-Error"):
         raw = resp_body.decode("utf-8", errors="replace") if isinstance(resp_body, bytes) else str(resp_body)

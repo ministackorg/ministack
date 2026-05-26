@@ -26,6 +26,7 @@ import os
 import time
 
 from ministack.core.responses import (
+    AccountRegionScopedDict,
     AccountScopedDict,
     error_response_json,
     get_account_id,
@@ -40,7 +41,7 @@ REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 
 from ministack.core.persistence import PERSIST_STATE, load_state
 
-_log_groups = AccountScopedDict()
+_log_groups = AccountRegionScopedDict()
 # group_name -> {
 #   arn, creationTime, retentionInDays (int|None), tags: {str: str},
 #   subscriptionFilters: {filterName: {filterName, logGroupName, filterPattern,
@@ -53,7 +54,7 @@ _log_groups = AccountScopedDict()
 _destinations = AccountScopedDict()
 # dest_name -> {destinationName, targetArn, roleArn, accessPolicy, arn, creationTime}
 
-_metric_filters = AccountScopedDict()
+_metric_filters = AccountRegionScopedDict()
 # (log_group_name, filter_name) -> {filterName, logGroupName, filterPattern, metricTransformations, creationTime}
 
 _queries = AccountScopedDict()

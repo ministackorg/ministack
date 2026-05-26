@@ -26,6 +26,7 @@ SQS event source mappings poll the queue in a background thread.
 
 import asyncio
 import base64
+import contextvars
 import copy
 import hashlib
 import importlib
@@ -46,12 +47,15 @@ from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import unquote
 
+from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.lambda_runtime import get_or_create_worker, invalidate_worker
 from ministack.core.persistence import PERSIST_STATE, load_state
 from ministack.core.responses import (
     _12_DIGIT_RE,
+    AccountRegionScopedDict,
     AccountScopedDict,
     _request_account_id,
+    _request_region,
     apply_image_prefix,
     error_response_json,
     get_account_id,
@@ -187,21 +191,47 @@ def _get_docker_client():
     except Exception:
         return None
 
-_functions = AccountScopedDict()  # function_name -> FunctionRecord
-_layers = AccountScopedDict()  # layer_name -> {"versions": [...], "next_version": int}
-_esms = AccountScopedDict()  # uuid -> esm dict
-_function_urls = AccountScopedDict()  # function_name -> FunctionUrlConfig dict
+_functions = AccountRegionScopedDict()  # function_name -> FunctionRecord
+_layers = AccountRegionScopedDict()  # layer_name -> {"versions": [...], "next_version": int}
+_esms = AccountRegionScopedDict()  # uuid -> esm dict
+_function_urls = AccountRegionScopedDict()  # function_name -> FunctionUrlConfig dict
 _poller_started = False
 _poller_lock = threading.Lock()
+
+_RESERVED_RUNTIME_ENV_VARS = {
+    "AWS_REGION",
+    "AWS_DEFAULT_REGION",
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "AWS_LAMBDA_FUNCTION_NAME",
+    "AWS_LAMBDA_FUNCTION_MEMORY_SIZE",
+    "AWS_LAMBDA_FUNCTION_VERSION",
+    "AWS_LAMBDA_LOG_STREAM_NAME",
+    "AWS_LAMBDA_RUNTIME_API",
+    "_HANDLER",
+    "_LAMBDA_CODE_DIR",
+    "_LAMBDA_HANDLER_MODULE",
+    "_LAMBDA_HANDLER_FUNC",
+    "_LAMBDA_FUNCTION_ARN",
+    "_LAMBDA_LAYERS_DIRS",
+    "_LAMBDA_TIMEOUT",
+    "LAMBDA_TASK_ROOT",
+}
+
+
+def _runtime_env_vars(config: dict) -> dict:
+    env = (config.get("Environment") or {}).get("Variables") or {}
+    return {key: value for key, value in env.items() if key not in _RESERVED_RUNTIME_ENV_VARS}
 
 
 # ── Persistence ────────────────────────────────────────────
 
 def get_state():
     """Return JSON-serializable state. code_zip bytes are base64-encoded."""
-    from ministack.core.responses import AccountScopedDict
-    funcs = AccountScopedDict()
-    # Iterate _data directly to capture ALL accounts, not just current request context
+    funcs = AccountRegionScopedDict()
+    # Iterate _data directly to capture ALL accounts and regions, not just
+    # current request context.
     for scoped_key, func in _functions._data.items():
         f = copy.deepcopy(func)
         if f.get("code_zip") and isinstance(f["code_zip"], bytes):
@@ -226,9 +256,8 @@ def get_state():
 
 def restore_state(data):
     if data:
-        from ministack.core.responses import AccountScopedDict
         funcs = data.get("functions", {})
-        if isinstance(funcs, AccountScopedDict):
+        if isinstance(funcs, AccountRegionScopedDict):
             for scoped_key, func in funcs._data.items():
                 if func.get("code_zip") and isinstance(func["code_zip"], str):
                     func["code_zip"] = base64.b64decode(func["code_zip"])
@@ -236,6 +265,15 @@ def restore_state(data):
                     if ver.get("code_zip") and isinstance(ver["code_zip"], str):
                         ver["code_zip"] = base64.b64decode(ver["code_zip"])
                 _functions._data[scoped_key] = func
+        elif isinstance(funcs, AccountScopedDict):
+            for (account_id, name), func in funcs._data.items():
+                if func.get("code_zip") and isinstance(func["code_zip"], str):
+                    func["code_zip"] = base64.b64decode(func["code_zip"])
+                for ver in func.get("versions", {}).values():
+                    if ver.get("code_zip") and isinstance(ver["code_zip"], str):
+                        ver["code_zip"] = base64.b64decode(ver["code_zip"])
+                region = _region_from_function_record(func)
+                _functions._data[(account_id, region, name)] = func
         else:
             for name, func in funcs.items():
                 if func.get("code_zip") and isinstance(func["code_zip"], str):
@@ -247,10 +285,51 @@ def restore_state(data):
         _layers.update(data.get("layers", {}))
         _esms.update(data.get("esms", {}))
         _function_urls.update(data.get("function_urls", {}))
-        _kinesis_positions.update(data.get("kinesis_positions", {}))
-        _dynamodb_stream_positions.update(data.get("dynamodb_stream_positions", {}))
-        if _esms:
+        _restore_esm_positions(_kinesis_positions, data.get("kinesis_positions", {}))
+        _restore_esm_positions(_dynamodb_stream_positions, data.get("dynamodb_stream_positions", {}))
+        if _esms.has_any():
             _ensure_poller()
+
+
+def _region_from_function_record(func: dict) -> str:
+    arn = (func.get("config") or {}).get("FunctionArn") or func.get("FunctionArn") or ""
+    if arn:
+        try:
+            _account_id, region = _lambda_function_account_region_from_arn(arn)
+            return region
+        except ArnParseError:
+            pass
+    return get_region()
+
+
+def _restore_esm_positions(store: AccountRegionScopedDict, positions) -> None:
+    if isinstance(positions, AccountRegionScopedDict):
+        store.update(positions)
+        return
+
+    esm_scopes = {
+        (account_id, esm_id): region
+        for (account_id, region, esm_id) in _esms._data
+    }
+
+    if isinstance(positions, AccountScopedDict):
+        for (account_id, esm_id), value in positions._data.items():
+            region = esm_scopes.get((account_id, esm_id), get_region())
+            store._data[(account_id, region, esm_id)] = value
+        return
+
+    if isinstance(positions, dict):
+        for key, value in positions.items():
+            if isinstance(key, tuple) and len(key) == 3:
+                store._data[key] = value
+            elif isinstance(key, tuple) and len(key) == 2:
+                account_id, esm_id = key
+                region = esm_scopes.get((account_id, esm_id), get_region())
+                store._data[(account_id, region, esm_id)] = value
+            else:
+                account_id = get_account_id()
+                region = esm_scopes.get((account_id, key), get_region())
+                store._data[(account_id, region, key)] = value
 
 
 # NOTE: the persisted-state load used to run here, but ``restore_state`` calls
@@ -433,8 +512,8 @@ def _resolve_name(name_or_arn: str) -> str:
     if not name_or_arn:
         return ""
     if name_or_arn.startswith("arn:"):
-        segs = name_or_arn.split(":")
-        return segs[6] if len(segs) >= 7 else name_or_arn
+        name, _qualifier = _lambda_function_name_and_qualifier_from_arn(name_or_arn)
+        return name or name_or_arn
     if ":" in name_or_arn:
         return name_or_arn.split(":")[0]
     return name_or_arn
@@ -452,14 +531,210 @@ def _resolve_name_and_qualifier(name_or_arn: str) -> tuple[str, str | None]:
     if not name_or_arn:
         return "", None
     if name_or_arn.startswith("arn:"):
-        segs = name_or_arn.split(":")
-        name = segs[6] if len(segs) >= 7 else name_or_arn
-        qualifier = segs[7] if len(segs) >= 8 and segs[7] else None
-        return name, qualifier
+        name, qualifier = _lambda_function_name_and_qualifier_from_arn(name_or_arn)
+        return (name, qualifier) if name else (name_or_arn, None)
     if ":" in name_or_arn:
         name, qualifier = name_or_arn.split(":", 1)
         return name, qualifier or None
     return name_or_arn, None
+
+
+def _lambda_function_name_and_qualifier_from_arn(value: str) -> tuple[str, str | None]:
+    try:
+        spec = parse_arn(value)
+    except ArnParseError:
+        return "", None
+    if spec.service != "lambda":
+        return "", None
+    parts = spec.resource.split(":", 2)
+    if len(parts) < 2 or parts[0] != "function" or not parts[1]:
+        return "", None
+    qualifier = parts[2] if len(parts) == 3 and parts[2] else None
+    return parts[1], qualifier
+
+
+def _resolve_request_scoped_name(name_or_arn: str) -> str:
+    """Resolve a Lambda API target without crossing account/region scope."""
+    name, _qualifier = _resolve_request_scoped_name_and_qualifier(name_or_arn)
+    return name
+
+
+def _resolve_request_scoped_name_and_qualifier(name_or_arn: str) -> tuple[str, str | None]:
+    if not name_or_arn:
+        return "", None
+    if not name_or_arn.startswith("arn:"):
+        return _resolve_name_and_qualifier(name_or_arn)
+    try:
+        spec = parse_arn(name_or_arn)
+    except ArnParseError:
+        return name_or_arn, None
+    if (
+        spec.service != "lambda"
+        or spec.account_id != get_account_id()
+        or spec.region != get_region()
+    ):
+        return name_or_arn, None
+    name, qualifier = _lambda_function_name_and_qualifier_from_arn(name_or_arn)
+    return (name, qualifier) if name else (name_or_arn, None)
+
+
+def _lambda_function_account_region_from_arn(value: str) -> tuple[str, str]:
+    spec = parse_arn(value)
+    if spec.service != "lambda":
+        raise ArnParseError("arn: expected lambda service")
+    if not _12_DIGIT_RE.match(spec.account_id):
+        raise ArnParseError("arn: expected 12-digit account id")
+    if not spec.region:
+        raise ArnParseError("arn: expected region")
+    name, _qualifier = _lambda_function_name_and_qualifier_from_arn(value)
+    if not name:
+        raise ArnParseError("arn: expected lambda function resource")
+    return spec.account_id, spec.region
+
+
+def _account_region_from_function_config(config: dict) -> tuple[str, str]:
+    arn = config.get("FunctionArn", "")
+    if not arn:
+        raise ArnParseError("arn: missing lambda function arn")
+    return _lambda_function_account_region_from_arn(arn)
+
+
+def _parse_required_arn(value: str, param_name: str):
+    try:
+        return parse_arn(value), None
+    except ArnParseError:
+        return None, error_response_json(
+            "ValidationException",
+            f"Value '{value}' at '{param_name}' failed to satisfy constraint: Member must satisfy regular expression pattern: arn:",
+            400,
+        )
+
+
+def _invalid_parameter_value(message: str):
+    return error_response_json("InvalidParameterValueException", message, 400)
+
+
+def _sqs_queue_name_from_arn_spec(spec) -> str | None:
+    if spec.service != "sqs" or not spec.resource or ":" in spec.resource:
+        return None
+    return spec.resource
+
+
+def _sns_topic_name_from_arn_spec(spec) -> str | None:
+    if spec.service != "sns" or not spec.resource or ":" in spec.resource:
+        return None
+    return spec.resource
+
+
+def _kinesis_stream_name_from_arn_spec(spec) -> str | None:
+    prefix = "stream/"
+    if spec.service != "kinesis" or not spec.resource.startswith(prefix):
+        return None
+    name = spec.resource[len(prefix):]
+    if not name or "/" in name:
+        return None
+    return name
+
+
+def _dynamodb_stream_table_from_arn_spec(spec) -> tuple[str, str] | None:
+    prefix = "table/"
+    marker = "/stream/"
+    if spec.service != "dynamodb" or not spec.resource.startswith(prefix) or marker not in spec.resource:
+        return None
+    table_name, stream_label = spec.resource[len(prefix):].split(marker, 1)
+    if not table_name or not stream_label or "/" in table_name:
+        return None
+    return table_name, stream_label
+
+
+def _lambda_function_name_from_arn_spec(spec) -> str | None:
+    if spec.service != "lambda":
+        return None
+    parts = spec.resource.split(":", 2)
+    if len(parts) < 2 or parts[0] != "function" or not parts[1]:
+        return None
+    return parts[1]
+
+
+def _require_same_account_region_arn(spec, target_arn: str, target_kind: str):
+    if spec.account_id != get_account_id():
+        return _invalid_parameter_value(f"The {target_kind} ARN {target_arn} is invalid.")
+    if spec.region != get_region():
+        return _invalid_parameter_value(
+            f"The {target_kind} ARN {target_arn} must be in the same region as the Lambda function."
+        )
+    return None
+
+
+def _validate_event_source_arn(event_source_arn: str):
+    spec, err = _parse_required_arn(event_source_arn, "eventSourceArn")
+    if err:
+        return None, err
+    if spec.service not in {"sqs", "kinesis", "dynamodb"}:
+        return None, _invalid_parameter_value(f"Unsupported event source ARN: {event_source_arn}")
+    scope_err = _require_same_account_region_arn(spec, event_source_arn, "event source")
+    if scope_err:
+        return None, scope_err
+    if spec.service == "sqs" and not _sqs_queue_name_from_arn_spec(spec):
+        return None, _invalid_parameter_value(f"Invalid event source ARN: {event_source_arn}")
+    if spec.service == "kinesis" and not _kinesis_stream_name_from_arn_spec(spec):
+        return None, _invalid_parameter_value(f"Invalid event source ARN: {event_source_arn}")
+    if spec.service == "dynamodb" and not _dynamodb_stream_table_from_arn_spec(spec):
+        return None, _invalid_parameter_value(f"Invalid event source ARN: {event_source_arn}")
+    return spec, None
+
+
+def _validate_async_destination_arn(destination_arn: str):
+    spec, err = _parse_required_arn(destination_arn, "destinationConfig.destination")
+    if err:
+        return err
+    if spec.service not in {"sqs", "sns", "lambda", "events", "s3"}:
+        return _invalid_parameter_value(f"The destination ARN {destination_arn} is invalid.")
+    if spec.service in {"sqs", "sns", "lambda"}:
+        scope_err = _require_same_account_region_arn(spec, destination_arn, "destination")
+        if scope_err:
+            return scope_err
+    if spec.service == "sqs" and not _sqs_queue_name_from_arn_spec(spec):
+        return _invalid_parameter_value(f"The destination ARN {destination_arn} is invalid.")
+    if spec.service == "sns" and not _sns_topic_name_from_arn_spec(spec):
+        return _invalid_parameter_value(f"The destination ARN {destination_arn} is invalid.")
+    if spec.service == "lambda" and not _lambda_function_name_from_arn_spec(spec):
+        return _invalid_parameter_value(f"The destination ARN {destination_arn} is invalid.")
+    return None
+
+
+def _validate_destination_config(destination_config: dict | None):
+    if not destination_config:
+        return None
+    for key in ("OnSuccess", "OnFailure"):
+        destination_arn = (destination_config.get(key) or {}).get("Destination")
+        if not destination_arn:
+            continue
+        err = _validate_async_destination_arn(destination_arn)
+        if err:
+            return err
+    return None
+
+
+def _validate_dead_letter_config(dead_letter_config: dict | None):
+    target_arn = (dead_letter_config or {}).get("TargetArn")
+    if not target_arn:
+        return None
+    spec, err = _parse_required_arn(target_arn, "deadLetterConfig.targetArn")
+    if err:
+        return err
+    if spec.service not in {"sqs", "sns"}:
+        return _invalid_parameter_value(
+            "Invalid dead letter queue ARN: The service specified by the TargetArn is not supported."
+        )
+    scope_err = _require_same_account_region_arn(spec, target_arn, "dead letter queue")
+    if scope_err:
+        return scope_err
+    if spec.service == "sqs" and not _sqs_queue_name_from_arn_spec(spec):
+        return _invalid_parameter_value(f"Invalid dead letter queue ARN: {target_arn}")
+    if spec.service == "sns" and not _sns_topic_name_from_arn_spec(spec):
+        return _invalid_parameter_value(f"Invalid dead letter queue ARN: {target_arn}")
+    return None
 
 
 def _func_arn(name: str) -> str:
@@ -631,6 +906,10 @@ def _get_func_record_for_qualifier(name: str, qualifier: str | None) -> tuple[di
     For an alias, resolves to the alias target version.
     """
     func = _functions.get(name)
+    return _effective_func_record_for_qualifier(func, qualifier)
+
+
+def _effective_func_record_for_qualifier(func: dict | None, qualifier: str | None) -> tuple[dict | None, dict | None]:
     if func is None:
         return None, None
 
@@ -651,6 +930,77 @@ def _get_func_record_for_qualifier(name: str, qualifier: str | None) -> tuple[di
         return ver, ver["config"]
 
     return func, func["config"]
+
+
+def _function_qualifier_exists(func: dict | None, qualifier: str | None) -> bool:
+    if func is None:
+        return False
+    if qualifier is None or qualifier == "$LATEST":
+        return True
+    return qualifier in func.get("aliases", {}) or qualifier in func.get("versions", {})
+
+
+def _get_func_record_for_ref(function_ref: str) -> tuple[dict | None, dict | None, str]:
+    if isinstance(function_ref, str) and function_ref.startswith("arn:"):
+        try:
+            spec = parse_arn(function_ref)
+        except ArnParseError:
+            spec = None
+        if spec and spec.service == "lambda":
+            name, qualifier = _lambda_function_name_and_qualifier_from_arn(function_ref)
+            if name:
+                if spec.account_id != get_account_id():
+                    return None, None, name
+                func = _functions.get_scoped(get_account_id(), spec.region, name)
+                if not _function_qualifier_exists(func, qualifier):
+                    return None, None, name
+                record, config = _effective_func_record_for_qualifier(func, qualifier)
+                return record, config, name
+
+    name, qualifier = _resolve_name_and_qualifier(function_ref)
+    func = _functions.get(name)
+    if not _function_qualifier_exists(func, qualifier):
+        return None, None, name
+    record, config = _effective_func_record_for_qualifier(func, qualifier)
+    return record, config, name
+
+
+def _get_func_record_for_ref_in_scope(
+    function_ref: str,
+    *,
+    account_id: str | None = None,
+    region: str | None = None,
+) -> tuple[dict | None, dict | None, str]:
+    account_token = _request_account_id.set(account_id) if account_id else None
+    region_token = _request_region.set(region) if region else None
+    try:
+        return _get_func_record_for_ref(function_ref)
+    finally:
+        if region_token is not None:
+            _request_region.reset(region_token)
+        if account_token is not None:
+            _request_account_id.reset(account_token)
+
+
+def _run_with_function_config_scope(func_or_config: dict, callback, *args, **kwargs):
+    def _run():
+        config = func_or_config.get("config") or func_or_config
+        account_id, region = _account_region_from_function_config(config)
+        _request_account_id.set(account_id)
+        _request_region.set(region)
+        return callback(*args, **kwargs)
+
+    return contextvars.copy_context().run(_run)
+
+
+def _execution_record_for_config(func: dict, config: dict) -> dict:
+    record = dict(func or {})
+    record["config"] = config
+    return record
+
+
+def _execute_function_with_config_scope(func: dict, event: dict) -> dict:
+    return _run_with_function_config_scope(func, _execute_function, func, event)
 
 
 # ---------------------------------------------------------------------------
@@ -733,14 +1083,14 @@ async def handle_request(method: str, path: str, headers: dict, body: bytes, que
     # --- Event Invoke Config list: GET /2019-09-25/functions/{name}/event-invoke-config/list ---
     if "/event-invoke-config/list" in path:
         m = re.search(r"/functions/([^/]+)/event-invoke-config/list", path)
-        fname = _resolve_name(m.group(1)) if m else ""
+        fname = _resolve_request_scoped_name(m.group(1)) if m else ""
         if method == "GET":
             return _list_function_event_invoke_configs(fname, query_params)
 
     # --- Event Invoke Config: /2019-09-25/functions/{name}/event-invoke-config ---
     if "event-invoke-config" in path:
         m = re.search(r"/functions/([^/]+)/event-invoke-config", path)
-        fname = _resolve_name(m.group(1)) if m else ""
+        fname = _resolve_request_scoped_name(m.group(1)) if m else ""
         if method == "GET":
             return _get_event_invoke_config(fname)
         if method == "PUT":
@@ -751,7 +1101,7 @@ async def handle_request(method: str, path: str, headers: dict, body: bytes, que
     # --- Provisioned Concurrency: /2019-09-30/functions/{name}/provisioned-concurrency ---
     if "provisioned-concurrency" in path:
         m = re.search(r"/functions/([^/]+)/provisioned-concurrency", path)
-        fname = _resolve_name(m.group(1)) if m else ""
+        fname = _resolve_request_scoped_name(m.group(1)) if m else ""
         qualifier = _qp_first(query_params, "Qualifier")
         if method == "GET":
             return _get_provisioned_concurrency(fname, qualifier)
@@ -765,7 +1115,7 @@ async def handle_request(method: str, path: str, headers: dict, body: bytes, que
     # CSC ARN (empty when no config is attached).
     if "code-signing-config" in path:
         m = re.search(r"/functions/([^/]+)/code-signing-config", path)
-        fname = _resolve_name(m.group(1)) if m else ""
+        fname = _resolve_request_scoped_name(m.group(1)) if m else ""
         if fname and fname in _functions:
             csc_arn = _functions[fname].get("code_signing_config_arn", "") or ""
             if method == "GET":
@@ -787,12 +1137,12 @@ async def handle_request(method: str, path: str, headers: dict, body: bytes, que
     # --- Function URL Config ---
     if "/urls" in path and "/functions/" in path:
         m = re.search(r"/functions/([^/]+)/urls", path)
-        fname = _resolve_name(m.group(1)) if m else ""
+        fname = _resolve_request_scoped_name(m.group(1)) if m else ""
         if method == "GET":
             return _list_function_url_configs(fname, query_params)
     if "/url" in path and "/functions/" in path:
         m = re.search(r"/functions/([^/]+)/url", path)
-        fname = _resolve_name(m.group(1)) if m else ""
+        fname = _resolve_request_scoped_name(m.group(1)) if m else ""
         qualifier = _qp_first(query_params, "Qualifier") or None
         if method == "POST":
             return _create_function_url_config(fname, data, qualifier)
@@ -815,7 +1165,7 @@ async def handle_request(method: str, path: str, headers: dict, body: bytes, que
         if not raw_name:
             return error_response_json("InvalidParameterValueException", "Missing function name", 400)
 
-        func_name, path_qualifier = _resolve_name_and_qualifier(raw_name)
+        func_name, path_qualifier = _resolve_request_scoped_name_and_qualifier(raw_name)
         sub = parts[4] if len(parts) > 4 else None
         sub2 = parts[5] if len(parts) > 5 else None
 
@@ -941,6 +1291,10 @@ def _create_function(data: dict):
             "Runtime is required for .zip deployment packages.",
             400,
         )
+
+    err = _validate_dead_letter_config(data.get("DeadLetterConfig"))
+    if err:
+        return err
 
     config = _build_config(name, data, code_zip)
     if image_uri:
@@ -1078,15 +1432,21 @@ def _presigned_code_url(func_name: str) -> str:
         f"&X-Amz-SignedHeaders=host"
         f"&X-Amz-Signature=ministack-local-presigned"
     )
-    return f"http://{host}:{port}/_ministack/lambda-code/{func_name}{qs}"
+    return (
+        f"http://{host}:{port}/_ministack/lambda-code/"
+        f"{get_account_id()}/{get_region()}/{func_name}{qs}"
+    )
 
 
-def serve_function_code(func_name: str):
+def serve_function_code(func_name: str, account_id: str | None = None, region: str | None = None):
     """Serve the stored zip bytes for a Lambda function. Called by app.py
     when a client follows the pre-signed `Code.Location` URL."""
-    if func_name not in _functions:
+    if account_id and region:
+        func = _functions.get_scoped(account_id, region, func_name)
+    else:
+        func = _functions.get(func_name)
+    if not func:
         return 404, {"Content-Type": "text/plain"}, b"Function not found"
-    func = _functions[func_name]
     zip_bytes = func.get("code_zip") or b""
     return 200, {"Content-Type": "application/zip"}, zip_bytes
 
@@ -1266,7 +1626,7 @@ def _delete_function(name: str, query_params: dict):
         _functions[name]["versions"].pop(qualifier, None)
     else:
         del _functions[name]
-        invalidate_worker(name)
+        invalidate_worker(name, account=get_account_id(), region=get_region())
     return 204, {}, b""
 
 
@@ -1318,7 +1678,7 @@ def _update_code(name: str, data: dict):
     func["config"]["RevisionId"] = new_uuid()
 
     # Invalidate only the old $LATEST worker — published version workers stay alive
-    invalidate_worker(name, qualifier="$LATEST")
+    invalidate_worker(name, qualifier="$LATEST", account=get_account_id(), region=get_region())
     _schedule_state_transition(name, _LAMBDA_STATE_TRANSITION_DELAY)
 
     if data.get("Publish"):
@@ -1342,6 +1702,9 @@ def _update_config(name: str, data: dict):
             f"Function not found: {_func_arn(name)}",
             404,
         )
+    err = _validate_dead_letter_config(data.get("DeadLetterConfig"))
+    if err:
+        return err
     config = _functions[name]["config"]
     for key in (
         "Runtime",
@@ -1439,7 +1802,7 @@ async def _invoke(name: str, event: dict, headers: dict, path_qualifier: str | N
     # RequestResponse — execute in worker thread so nested SDK calls
     # from the Lambda process can still reach this ASGI server.
     _t_start = time.time()
-    result = await asyncio.to_thread(_execute_function, exec_record, event)
+    result = await asyncio.to_thread(_execute_function_with_config_scope, exec_record, event)
     _duration_ms = (time.time() - _t_start) * 1000.0
     _emit_lambda_metrics(
         name,
@@ -1584,10 +1947,10 @@ _reaper_lock = threading.Lock()
 
 
 def _warm_pool_key(func_name: str, config: dict) -> str:
-    acct = get_account_id()
+    acct, region = _account_region_from_function_config(config)
     if config.get("PackageType") == "Image":
-        return f"{acct}:{func_name}:image:{config.get('ImageUri', '')}"
-    return f"{acct}:{func_name}:zip:{config.get('CodeSha256', 'nosha')}"
+        return f"{acct}:{region}:{func_name}:image:{config.get('ImageUri', '')}"
+    return f"{acct}:{region}:{func_name}:zip:{config.get('CodeSha256', 'nosha')}"
 
 
 def _is_container_running(container) -> bool:
@@ -1739,36 +2102,33 @@ _LAMBDA_STATE_TRANSITION_DELAY = float(os.environ.get("LAMBDA_STATE_TRANSITION_S
 
 def _schedule_state_transition(func_name: str, delay: float) -> None:
     """Flip State and LastUpdateStatus to the post-ready values after `delay`."""
-    acct = get_account_id()
-
-    def _mark_ready(cfg: dict) -> None:
-        cfg["State"] = "Active"
-        cfg["StateReason"] = ""
-        cfg["StateReasonCode"] = ""
-        cfg["LastUpdateStatus"] = "Successful"
-        cfg["LastUpdateStatusReason"] = ""
-        cfg["LastUpdateStatusReasonCode"] = ""
-
     def _flip():
         time.sleep(delay)
-        # Re-fetch under the correct account context so multi-tenant cases work.
-        token = _request_account_id.set(acct)
-        try:
-            fn = _functions.get(func_name)
-            if not fn:
-                return
-            _mark_ready(fn.get("config", {}))
-            for version in fn.get("versions", {}).values():
-                cfg = version.get("config", {})
-                if (
-                    cfg.get("State") == "Pending"
-                    or cfg.get("LastUpdateStatus") == "InProgress"
-                ):
-                    _mark_ready(cfg)
-        finally:
-            _request_account_id.reset(token)
+        # Re-fetch under the request's account and region context so
+        # multi-tenant, multi-region cases update the function that was just
+        # created or modified.
+        fn = _functions.get(func_name)
+        if not fn:
+            return
+        configs = [fn.get("config", {})]
+        configs.extend(ver.get("config", {}) for ver in fn.get("versions", {}).values())
+        for cfg in configs:
+            if not cfg:
+                continue
+            if (
+                cfg.get("State") not in (None, "", "Pending")
+                and cfg.get("LastUpdateStatus") not in (None, "", "InProgress")
+            ):
+                continue
+            cfg["State"] = "Active"
+            cfg["StateReason"] = ""
+            cfg["StateReasonCode"] = ""
+            cfg["LastUpdateStatus"] = "Successful"
+            cfg["LastUpdateStatusReason"] = ""
+            cfg["LastUpdateStatusReasonCode"] = ""
 
-    threading.Thread(target=_flip, daemon=True).start()
+    ctx_snapshot = contextvars.copy_context()
+    threading.Thread(target=ctx_snapshot.run, args=(_flip,), daemon=True).start()
 
 
 # AWS-match: real Lambda async retry spacing is exponential backoff
@@ -1791,6 +2151,9 @@ def invoke_async_with_retry(func: dict, event: dict) -> None:
     """
     def _run():
         config = func.get("config") or func
+        account_id, region = _account_region_from_function_config(config)
+        _request_account_id.set(account_id)
+        _request_region.set(region)
         fn_name = config.get("FunctionName", "unknown")
         eic = func.get("event_invoke_config") or {}
         max_retries = eic.get("MaximumRetryAttempts")
@@ -1826,7 +2189,8 @@ def invoke_async_with_retry(func: dict, event: dict) -> None:
         if on_failure_arn and last_result is not None:
             _route_async_failure(on_failure_arn, fn_name, event, last_result)
 
-    threading.Thread(target=_run, daemon=True).start()
+    ctx_snapshot = contextvars.copy_context()
+    threading.Thread(target=ctx_snapshot.run, args=(_run,), daemon=True).start()
 
 
 def _match_esm_filter(record: dict, pattern: dict) -> bool:
@@ -1945,12 +2309,24 @@ def _route_async_failure(target_arn: str, func_name: str, event: dict, result: d
     }
     try:
         body = json.dumps(envelope)
-        if ":sqs:" in target_arn:
+        try:
+            spec = parse_arn(target_arn)
+        except ArnParseError:
+            logger.warning("Lambda %s DLQ target is not a valid ARN: %s", func_name, target_arn)
+            return
+        if spec.account_id != get_account_id() or spec.region != get_region():
+            logger.warning("Lambda %s DLQ target not in function scope: %s", func_name, target_arn)
+            return
+
+        if spec.service == "sqs":
             import ministack.services.sqs as _sqs
-            qname = target_arn.rsplit(":", 1)[-1]
+            qname = _sqs_queue_name_from_arn_spec(spec)
+            if not qname:
+                logger.warning("Lambda %s DLQ target is not a valid SQS ARN: %s", func_name, target_arn)
+                return
             target_q = None
             for url, q in _sqs._queues.items():
-                if q.get("attributes", {}).get("QueueArn") == target_arn or url.endswith("/" + qname):
+                if q.get("attributes", {}).get("QueueArn") == target_arn:
                     target_q = q
                     break
             if target_q is not None:
@@ -1974,17 +2350,20 @@ def _route_async_failure(target_arn: str, func_name: str, event: dict, result: d
                     "dedup_cache_key": None, "seq": None,
                 })
                 return
-        elif ":sns:" in target_arn:
+        elif spec.service == "sns":
             import ministack.services.sns as _sns
-            if target_arn in _sns._topics:
+            if _sns_topic_name_from_arn_spec(spec) and target_arn in _sns._topics:
                 _sns._fanout(target_arn, new_uuid(), body, "Lambda async failure", "", {})
                 return
-        elif ":lambda:" in target_arn:
-            dest_name = target_arn.rsplit(":", 1)[-1]
-            if dest_name in _functions:
+        elif spec.service == "lambda":
+            if not _lambda_function_name_from_arn_spec(spec):
+                logger.warning("Lambda %s destination target is not a valid Lambda ARN: %s", func_name, target_arn)
+                return
+            dest_func, _dest_config, dest_name = _get_func_record_for_ref(target_arn)
+            if dest_func:
                 threading.Thread(
-                    target=_execute_function,
-                    args=(_functions[dest_name], envelope),
+                    target=_execute_function_with_config_scope,
+                    args=(dest_func, envelope),
                     daemon=True,
                 ).start()
                 return
@@ -2180,7 +2559,7 @@ def _spawn_lambda_container(config: dict, code_zip: bytes | None):
     runtime = config.get("Runtime", "python3.12")
     handler = config.get("Handler", "index.handler")
     timeout = int(config.get("Timeout", 30 if package_type == "Image" else 3))
-    env_vars = (config.get("Environment") or {}).get("Variables") or {}
+    env_vars = _runtime_env_vars(config)
     image_config = ((config.get("ImageConfigResponse") or {}).get("ImageConfig")
                     or config.get("ImageConfig") or {})
 
@@ -2235,7 +2614,7 @@ def _spawn_lambda_container(config: dict, code_zip: bytes | None):
     container_env: dict[str, str] = {
         "AWS_DEFAULT_REGION": get_region(),
         "AWS_REGION": get_region(),
-        "AWS_ACCESS_KEY_ID": _account_from_arn(config.get("FunctionArn", "")),
+        "AWS_ACCESS_KEY_ID": _account_region_from_function_config(config)[0],
         "AWS_SECRET_ACCESS_KEY": os.environ.get("AWS_SECRET_ACCESS_KEY", "test"),
         "AWS_SESSION_TOKEN": os.environ.get("AWS_SESSION_TOKEN", ""),
         "AWS_LAMBDA_FUNCTION_NAME": config["FunctionName"],
@@ -2779,7 +3158,7 @@ def _execute_function_warm(func: dict, event: dict) -> dict:
             }
     except Exception as e:
         logger.error("Warm worker execution error for %s: %s", func_name, e)
-        invalidate_worker(func_name, qualifier=qualifier)
+        invalidate_worker(func_name, qualifier=qualifier, account=get_account_id(), region=get_region())
         return {
             "body": {"errorMessage": str(e), "errorType": type(e).__name__},
             "error": True,
@@ -2795,7 +3174,7 @@ def _execute_function_provided(func: dict, event: dict) -> dict:
         return {"body": {"statusCode": 200, "body": "Mock response - no code deployed"}}
 
     timeout = config.get("Timeout", 30)
-    env_vars = config.get("Environment", {}).get("Variables", {})
+    env_vars = _runtime_env_vars(config)
 
     try:
         import http.server
@@ -2916,7 +3295,7 @@ def _execute_function_provided(func: dict, event: dict) -> dict:
                     "AWS_LAMBDA_RUNTIME_API": f"127.0.0.1:{port}",
                     "AWS_DEFAULT_REGION": get_region(),
                     "AWS_REGION": get_region(),
-                    "AWS_ACCESS_KEY_ID": _account_from_arn(config.get("FunctionArn", "")),
+                    "AWS_ACCESS_KEY_ID": _account_region_from_function_config(config)[0],
                     "AWS_SECRET_ACCESS_KEY": os.environ.get("AWS_SECRET_ACCESS_KEY", "test"),
                     "AWS_LAMBDA_FUNCTION_NAME": config.get("FunctionName", "unknown"),
                     "LAMBDA_TASK_ROOT": code_dir,
@@ -2981,7 +3360,7 @@ def _execute_function_local(func: dict, event: dict) -> dict:
     handler = config["Handler"]
     runtime = config["Runtime"]
     timeout = config.get("Timeout", 3)
-    env_vars = config.get("Environment", {}).get("Variables", {})
+    env_vars = _runtime_env_vars(config)
 
     is_node = runtime.startswith("nodejs")
     if not runtime.startswith("python") and not is_node:
@@ -3054,7 +3433,7 @@ def _execute_function_local(func: dict, event: dict) -> dict:
                 {
                     "AWS_DEFAULT_REGION": get_region(),
                     "AWS_REGION": get_region(),
-                    "AWS_ACCESS_KEY_ID": _account_from_arn(config.get("FunctionArn", "")),
+                    "AWS_ACCESS_KEY_ID": _account_region_from_function_config(config)[0],
                     "AWS_SECRET_ACCESS_KEY": os.environ.get("AWS_SECRET_ACCESS_KEY", "test"),
                     "AWS_SESSION_TOKEN": os.environ.get("AWS_SESSION_TOKEN", ""),
                     "AWS_LAMBDA_FUNCTION_NAME": config["FunctionName"],
@@ -3145,15 +3524,25 @@ def _execute_function_local(func: dict, event: dict) -> dict:
 
 def _resolve_layer_zip(layer_arn_str: str) -> bytes | None:
     """Given a layer version ARN return the stored zip bytes, or None."""
-    segs = layer_arn_str.split(":")
-    if len(segs) < 8:
-        return None
-    layer_name = segs[6]
     try:
-        version = int(segs[7])
-    except (ValueError, IndexError):
+        spec = parse_arn(layer_arn_str)
+    except ArnParseError:
         return None
-    layer = _layers.get(layer_name)
+    if spec.service != "lambda":
+        return None
+    if spec.account_id != get_account_id():
+        return None
+    if spec.region != get_region():
+        return None
+    parts = spec.resource.split(":", 2)
+    if len(parts) != 3 or parts[0] != "layer":
+        return None
+    layer_name = parts[1]
+    try:
+        version = int(parts[2])
+    except ValueError:
+        return None
+    layer = _layers.get_scoped(spec.account_id, spec.region, layer_name)
     if not layer:
         return None
     for v in layer["versions"]:
@@ -3473,7 +3862,7 @@ def _list_tags(resource_arn: str):
                 404,
             )
         return json_response({"Tags": esm.get("Tags", {})})
-    func_name = _resolve_name(resource_arn)
+    func_name = _resolve_request_scoped_name(resource_arn)
     if func_name not in _functions:
         return error_response_json(
             "ResourceNotFoundException",
@@ -3495,7 +3884,7 @@ def _tag_resource(resource_arn: str, data: dict):
             )
         esm.setdefault("Tags", {}).update(data.get("Tags", {}))
         return 204, {}, b""
-    func_name = _resolve_name(resource_arn)
+    func_name = _resolve_request_scoped_name(resource_arn)
     if func_name not in _functions:
         return error_response_json(
             "ResourceNotFoundException",
@@ -3529,7 +3918,7 @@ def _untag_resource(resource_arn: str, query_params: dict):
             tags.pop(k.strip(), None)
         return 204, {}, b""
 
-    func_name = _resolve_name(resource_arn)
+    func_name = _resolve_request_scoped_name(resource_arn)
     if func_name not in _functions:
         return error_response_json(
             "ResourceNotFoundException",
@@ -3550,7 +3939,10 @@ def _untag_resource(resource_arn: str, query_params: dict):
 def _layer_content_url(layer_name: str, version: int) -> str:
     host = os.environ.get("MINISTACK_HOST", "localhost")
     port = os.environ.get("GATEWAY_PORT", "4566")
-    return f"http://{host}:{port}/_ministack/lambda-layers/{layer_name}/{version}/content"
+    return (
+        f"http://{host}:{port}/_ministack/lambda-layers/"
+        f"{get_account_id()}/{get_region()}/{layer_name}/{version}/content"
+    )
 
 
 def _publish_layer_version(layer_name: str, data: dict):
@@ -3677,8 +4069,15 @@ def _get_layer_version(layer_name: str, version: int):
 
 
 def _get_layer_version_by_arn(arn: str):
-    segs = arn.split(":")
-    if len(segs) < 8 or not segs[7].isdigit():
+    try:
+        spec = parse_arn(arn)
+    except ArnParseError:
+        spec = None
+    if spec and spec.service == "lambda":
+        parts = spec.resource.split(":", 2)
+    else:
+        parts = []
+    if len(parts) != 3 or parts[0] != "layer" or not parts[2].isdigit():
         return error_response_json(
             "ValidationException",
             f"Value '{arn}' at 'arn' failed to satisfy constraint: "
@@ -3686,8 +4085,20 @@ def _get_layer_version_by_arn(arn: str):
             "arn:(aws[a-zA-Z-]*)?:lambda:[a-z]{2}((-gov)|(-iso([a-z]?)))?-[a-z]+-\\d{{1}}:\\d{{12}}:layer:[a-zA-Z0-9-_]+:[0-9]+",
             400,
         )
-    layer_name = segs[6]
-    version = int(segs[7])
+    if spec.account_id != get_account_id():
+        return error_response_json(
+            "AccessDeniedException",
+            "User is not authorized to access this resource.",
+            403,
+        )
+    if spec.region != get_region():
+        return error_response_json(
+            "ResourceNotFoundException",
+            "The resource you requested does not exist.",
+            404,
+        )
+    layer_name = parts[1]
+    version = int(parts[2])
     return _get_layer_version(layer_name, version)
 
 
@@ -3743,9 +4154,17 @@ def _list_layers(query_params: dict):
 # ---------------------------------------------------------------------------
 
 
-def _find_layer_version(layer_name: str, version: int):
+def _find_layer_version(
+    layer_name: str,
+    version: int,
+    account_id: str | None = None,
+    region: str | None = None,
+):
     """Return (layer_version_config, error_response) — one will be None."""
-    layer = _layers.get(layer_name)
+    if account_id and region:
+        layer = _layers.get_scoped(account_id, region, layer_name)
+    else:
+        layer = _layers.get(layer_name)
     lv_arn = f"{_layer_arn(layer_name)}:{version}"
     if not layer:
         return None, error_response_json(
@@ -3846,9 +4265,14 @@ def _get_layer_version_policy(layer_name: str, version: int):
     )
 
 
-def serve_layer_content(layer_name: str, version: int):
+def serve_layer_content(
+    layer_name: str,
+    version: int,
+    account_id: str | None = None,
+    region: str | None = None,
+):
     """Serve raw zip bytes for a layer version (called from app.py)."""
-    vc, err = _find_layer_version(layer_name, version)
+    vc, err = _find_layer_version(layer_name, version, account_id=account_id, region=region)
     if err:
         return err
     zip_data = vc.get("_zip_data")
@@ -3886,18 +4310,22 @@ def _put_event_invoke_config(func_name: str, data: dict):
             f"Function not found: {_func_arn(func_name)}",
             404,
         )
+    destination_config = data.get(
+        "DestinationConfig",
+        {
+            "OnSuccess": {},
+            "OnFailure": {},
+        },
+    )
+    err = _validate_destination_config(destination_config)
+    if err:
+        return err
     eic = {
         "FunctionArn": _func_arn(func_name),
         "MaximumRetryAttempts": data.get("MaximumRetryAttempts", 2),
         "MaximumEventAgeInSeconds": data.get("MaximumEventAgeInSeconds", 21600),
         "LastModified": int(time.time()),
-        "DestinationConfig": data.get(
-            "DestinationConfig",
-            {
-                "OnSuccess": {},
-                "OnFailure": {},
-            },
-        ),
+        "DestinationConfig": destination_config,
     }
     _functions[func_name]["event_invoke_config"] = eic
     return json_response(eic)
@@ -4020,12 +4448,30 @@ def _esm_response(esm: dict) -> dict:
     return {k: v for k, v in esm.items() if k not in ("FunctionName", "Enabled")}
 
 
+def _resolve_existing_esm_function(function_ref: str):
+    func_name, qualifier = _resolve_request_scoped_name_and_qualifier(function_ref)
+    if not func_name or func_name not in _functions:
+        return None, None, error_response_json(
+            "ResourceNotFoundException",
+            f"Function not found: {function_ref}",
+            404,
+        )
+    return func_name, qualifier, None
+
+
 def _create_esm(data: dict):
     esm_id = new_uuid()
     # Preserve the alias/version qualifier if the caller supplied one so
     # poller invocations route to the correct target (#407).
-    func_name, qualifier = _resolve_name_and_qualifier(data.get("FunctionName", ""))
+    func_name, qualifier, err = _resolve_existing_esm_function(
+        data.get("FunctionName", ""),
+    )
+    if err:
+        return err
     event_source_arn = data.get("EventSourceArn", "")
+    event_source_spec, err = _validate_event_source_arn(event_source_arn)
+    if err:
+        return err
 
     enabled = data.get("Enabled", True)
     if isinstance(enabled, str):
@@ -4045,7 +4491,7 @@ def _create_esm(data: dict):
         "Enabled": enabled,
         "FunctionResponseTypes": data.get("FunctionResponseTypes", []),
     }
-    if ":sqs:" not in event_source_arn:
+    if event_source_spec.service != "sqs":
         esm["StartingPosition"] = data.get("StartingPosition", "LATEST")
     # #442: Tags are accepted on CreateEventSourceMapping. Stored inline on
     # the ESM record; surfaced via _list_tags for the ESM ARN.
@@ -4069,7 +4515,7 @@ def _get_esm(esm_id: str):
 
 
 def _list_esms(query_params: dict):
-    func = _resolve_name(_qp_first(query_params, "FunctionName"))
+    func = _resolve_request_scoped_name(_qp_first(query_params, "FunctionName"))
     source_arn = _qp_first(query_params, "EventSourceArn")
     marker = _qp_first(query_params, "Marker")
     max_items = int(_qp_first(query_params, "MaxItems", "100"))
@@ -4119,9 +4565,12 @@ def _update_esm(esm_id: str, data: dict):
         esm["Enabled"] = data["Enabled"]
         esm["State"] = "Enabled" if data["Enabled"] else "Disabled"
     if "FunctionName" in data:
-        new_name = _resolve_name(data["FunctionName"])
+        new_name, qualifier, err = _resolve_existing_esm_function(data["FunctionName"])
+        if err:
+            return err
         esm["FunctionName"] = new_name
-        esm["FunctionArn"] = _func_arn(new_name)
+        esm["Qualifier"] = qualifier
+        esm["FunctionArn"] = _func_arn(new_name) + (f":{qualifier}" if qualifier else "")
     esm["LastModified"] = int(time.time())
     return json_response(_esm_response(esm))
 
@@ -4143,9 +4592,9 @@ def _delete_esm(esm_id: str):
 # ---------------------------------------------------------------------------
 
 # Per-ESM Kinesis iterator tracking: esm_uuid -> {shard_id: position}
-_kinesis_positions = AccountScopedDict()
+_kinesis_positions = AccountRegionScopedDict()
 # Per-ESM DynamoDB stream tracking: esm_uuid -> {shard_id: position}
-_dynamodb_stream_positions = AccountScopedDict()
+_dynamodb_stream_positions = AccountRegionScopedDict()
 _dynamodb_stream_positions_lock = threading.Lock()
 
 
@@ -4173,203 +4622,89 @@ def _poll_loop():
             _poll_dynamodb_streams()
         except Exception as e:
             logger.error("ESM DynamoDB streams poller error: %s", e)
-        time.sleep(1 if _esms else 5)
+        time.sleep(1 if _esms.has_any() else 5)
+
+
+def _iter_all_esms():
+    for scoped_key, esm in list(_esms._data.items()):
+        if len(scoped_key) == 3:
+            acct_id, region, _esm_key = scoped_key
+        else:
+            acct_id, _esm_key = scoped_key
+            region = REGION
+        yield acct_id, region, esm
 
 
 def _poll_sqs():
     from ministack.services import sqs as _sqs
 
-    for (acct_id, _esm_key), esm in list(_esms._data.items()):
-        _request_account_id.set(acct_id)
-        if not esm.get("Enabled", True):
-            continue
-        source_arn = esm.get("EventSourceArn", "")
-        if ":sqs:" not in source_arn:
-            continue
-
-        func_name = esm["FunctionName"]
-        qualifier = esm.get("Qualifier")
-        func_rec, _cfg = _get_func_record_for_qualifier(func_name, qualifier)
-        if func_rec is None:
-            continue
-
-        queue_name = source_arn.split(":")[-1]
-        queue_url = _sqs._queue_url(queue_name)
-        queue = _sqs._queues.get(queue_url)
-        if not queue:
-            continue
-
-        batch_size = esm.get("BatchSize", 10)
-        now = time.time()
-
-        batch = _sqs._receive_messages_for_esm(queue_url, batch_size)
-        if not batch:
-            continue
-
-        records = []
-        for msg in batch:
-            first_recv = msg.get("first_receive_at") or now
-            records.append({
-                "messageId": msg["id"],
-                "receiptHandle": msg["receipt_handle"],
-                "body": msg["body"],
-                "attributes": {
-                    "ApproximateReceiveCount": str(msg.get("receive_count", 1)),
-                    "SentTimestamp": str(int(msg["sent_at"] * 1000)),
-                    "SenderId": get_account_id(),
-                    "ApproximateFirstReceiveTimestamp": str(int(first_recv * 1000)),
-                },
-                "messageAttributes": msg.get("message_attributes", {}),
-                "md5OfBody": msg.get("md5_body") or msg.get("md5") or "",
-                "eventSource": "aws:sqs",
-                "eventSourceARN": source_arn,
-                "awsRegion": get_region(),
-            })
-
-        # Apply FilterCriteria before invoking — AWS filters records out
-        # *before* the handler runs, so non-matching records are silently
-        # dropped (and immediately deleted from the queue like successful ones).
-        records = _apply_filter_criteria(records, esm)
-        if not records:
-            # All records filtered out — treat the batch as processed.
-            for msg in batch:
-                queue["messages"].remove(msg)
-            continue
-
-        event = {"Records": records}
-        result = _execute_function(func_rec, event)
-
-        if result.get("error"):
-            err_body = result.get("body") or {}
-            err_type = err_body.get("errorType") if isinstance(err_body, dict) else None
-            err_msg = err_body.get("errorMessage") if isinstance(err_body, dict) else None
-            esm["LastProcessingResult"] = "FAILED"
-            logger.warning(
-                "ESM: Lambda %s failed processing SQS batch from %s (errorType=%s errorMessage=%s)\n%s",
-                func_name, queue_name, err_type, err_msg, result.get("log", ""),
-            )
-        else:
-            # Check for ReportBatchItemFailures — partial batch response
-            failed_ids = set()
-            if "ReportBatchItemFailures" in esm.get("FunctionResponseTypes", []):
-                body = result.get("body")
-                if isinstance(body, dict):
-                    for failure in body.get("batchItemFailures", []):
-                        fid = failure.get("itemIdentifier", "")
-                        if fid:
-                            failed_ids.add(fid)
-                elif isinstance(body, str):
-                    try:
-                        parsed = json.loads(body)
-                        for failure in parsed.get("batchItemFailures", []):
-                            fid = failure.get("itemIdentifier", "")
-                            if fid:
-                                failed_ids.add(fid)
-                    except (json.JSONDecodeError, AttributeError):
-                        pass
-
-            # Delete only the messages that succeeded (not in failed_ids)
-            succeeded = [msg for msg in batch if msg["id"] not in failed_ids]
-            receipt_handles = {msg["receipt_handle"] for msg in succeeded if msg.get("receipt_handle")}
-            if receipt_handles:
-                _sqs._delete_messages_for_esm(queue_url, receipt_handles)
-
-            n_failed = len(batch) - len(succeeded)
-            if n_failed:
-                esm["LastProcessingResult"] = f"OK - {len(succeeded)} records, {n_failed} partial failures"
-                logger.info("ESM: Lambda %s processed %d SQS messages from %s (%d partial failures)",
-                            func_name, len(succeeded), queue_name, n_failed)
-            else:
-                esm["LastProcessingResult"] = f"OK - {len(batch)} records"
-                logger.info("ESM: Lambda %s processed %d SQS messages from %s", func_name, len(batch), queue_name)
-            log_output = result.get("log", "")
-            if log_output:
-                logger.info("ESM: Lambda %s output:\n%s", func_name, log_output)
-
-
-def _poll_kinesis():
-    from ministack.services import kinesis as _kin
-
-    for (acct_id, _esm_key), esm in list(_esms._data.items()):
-        _request_account_id.set(acct_id)
-        if not esm.get("Enabled", True):
-            continue
-        source_arn = esm.get("EventSourceArn", "")
-        if ":kinesis:" not in source_arn:
-            continue
-
-        func_name = esm["FunctionName"]
-        qualifier = esm.get("Qualifier")
-        func_rec, _cfg = _get_func_record_for_qualifier(func_name, qualifier)
-        if func_rec is None:
-            continue
-
-        stream_name = source_arn.split("/")[-1]
-        stream = _kin._streams.get(stream_name)
-        if not stream or stream["StreamStatus"] != "ACTIVE":
-            continue
-
-        esm_id = esm["UUID"]
-        if esm_id not in _kinesis_positions:
-            starting = esm.get("StartingPosition", "LATEST")
-            _kinesis_positions[esm_id] = {}
-            for shard_id, shard in stream["shards"].items():
-                if starting == "TRIM_HORIZON":
-                    _kinesis_positions[esm_id][shard_id] = 0
-                else:
-                    _kinesis_positions[esm_id][shard_id] = len(shard["records"])
-
-        batch_size = esm.get("BatchSize", 100)
-        positions = _kinesis_positions[esm_id]
-
-        for shard_id, shard in stream["shards"].items():
-            if shard_id not in positions:
-                positions[shard_id] = len(shard["records"])
+    for acct_id, region, esm in _iter_all_esms():
+        account_token = _request_account_id.set(acct_id)
+        region_token = _request_region.set(region)
+        try:
+            if not esm.get("Enabled", True):
+                continue
+            source_arn = esm.get("EventSourceArn", "")
+            try:
+                source_spec = parse_arn(source_arn)
+            except ArnParseError:
+                continue
+            if (
+                source_spec.service != "sqs"
+                or source_spec.account_id != get_account_id()
+                or source_spec.region != get_region()
+            ):
+                continue
+            queue_name = _sqs_queue_name_from_arn_spec(source_spec)
+            if not queue_name:
                 continue
 
-            pos = positions[shard_id]
-            raw_records = shard["records"][pos:pos + batch_size]
-            if not raw_records:
+            func_name = esm["FunctionName"]
+            qualifier = esm.get("Qualifier")
+            func_rec, _cfg = _get_func_record_for_qualifier(func_name, qualifier)
+            if func_rec is None:
+                continue
+
+            queue_url = _sqs._queue_url(queue_name)
+            queue = _sqs._queues.get(queue_url)
+            if not queue or queue.get("attributes", {}).get("QueueArn") != source_arn:
+                continue
+
+            batch_size = esm.get("BatchSize", 10)
+            now = time.time()
+
+            batch = _sqs._receive_messages_for_esm(queue_url, batch_size)
+            if not batch:
                 continue
 
             records = []
-            for r in raw_records:
-                data_val = r["Data"]
-                if isinstance(data_val, bytes):
-                    data_b64 = base64.b64encode(data_val).decode("ascii")
-                elif isinstance(data_val, str):
-                    try:
-                        base64.b64decode(data_val, validate=True)
-                        data_b64 = data_val
-                    except Exception:
-                        data_b64 = base64.b64encode(data_val.encode("utf-8")).decode("ascii")
-                else:
-                    data_b64 = base64.b64encode(str(data_val).encode("utf-8")).decode("ascii")
-
+            for msg in batch:
+                first_recv = msg.get("first_receive_at") or now
                 records.append({
-                    "kinesis": {
-                        "kinesisSchemaVersion": "1.0",
-                        "partitionKey": r["PartitionKey"],
-                        "sequenceNumber": r["SequenceNumber"],
-                        "data": data_b64,
-                        "approximateArrivalTimestamp": r["ApproximateArrivalTimestamp"],
+                    "messageId": msg["id"],
+                    "receiptHandle": msg["receipt_handle"],
+                    "body": msg["body"],
+                    "attributes": {
+                        "ApproximateReceiveCount": str(msg.get("receive_count", 1)),
+                        "SentTimestamp": str(int(msg["sent_at"] * 1000)),
+                        "SenderId": get_account_id(),
+                        "ApproximateFirstReceiveTimestamp": str(int(first_recv * 1000)),
                     },
-                    "eventSource": "aws:kinesis",
-                    "eventVersion": "1.0",
-                    "eventID": f"{shard_id}:{r['SequenceNumber']}",
-                    "eventName": "aws:kinesis:record",
-                    "invokeIdentityArn": f"arn:aws:iam::{get_account_id()}:role/lambda-role",
-                    "awsRegion": get_region(),
+                    "messageAttributes": msg.get("message_attributes", {}),
+                    "md5OfBody": msg.get("md5_body") or msg.get("md5") or "",
+                    "eventSource": "aws:sqs",
                     "eventSourceARN": source_arn,
+                    "awsRegion": get_region(),
                 })
 
-            # AWS drops records that don't match FilterCriteria before invoke.
-            # Advance past the raw batch we consumed — filtered records are
-            # treated as "successfully processed" (same semantics as the
-            # normal success path below, which adds len(raw_records)).
+            # Apply FilterCriteria before invoking — AWS filters records out
+            # *before* the handler runs, so non-matching records are silently
+            # dropped (and immediately deleted from the queue like successful ones).
             records = _apply_filter_criteria(records, esm)
             if not records:
-                _kinesis_positions[esm_id][shard_id] = pos + len(raw_records)
+                # All records filtered out — treat the batch as processed.
+                for msg in batch:
+                    queue["messages"].remove(msg)
                 continue
 
             event = {"Records": records}
@@ -4381,19 +4716,173 @@ def _poll_kinesis():
                 err_msg = err_body.get("errorMessage") if isinstance(err_body, dict) else None
                 esm["LastProcessingResult"] = "FAILED"
                 logger.warning(
-                    "ESM: Lambda %s failed processing Kinesis batch from %s/%s (errorType=%s errorMessage=%s)\n%s",
-                    func_name, stream_name, shard_id, err_type, err_msg, result.get("log", ""),
+                    "ESM: Lambda %s failed processing SQS batch from %s (errorType=%s errorMessage=%s)\n%s",
+                    func_name, queue_name, err_type, err_msg, result.get("log", ""),
                 )
             else:
-                positions[shard_id] = pos + len(raw_records)
-                esm["LastProcessingResult"] = f"OK - {len(raw_records)} records"
+                # Check for ReportBatchItemFailures — partial batch response
+                failed_ids = set()
+                if "ReportBatchItemFailures" in esm.get("FunctionResponseTypes", []):
+                    body = result.get("body")
+                    if isinstance(body, dict):
+                        for failure in body.get("batchItemFailures", []):
+                            fid = failure.get("itemIdentifier", "")
+                            if fid:
+                                failed_ids.add(fid)
+                    elif isinstance(body, str):
+                        try:
+                            parsed = json.loads(body)
+                            for failure in parsed.get("batchItemFailures", []):
+                                fid = failure.get("itemIdentifier", "")
+                                if fid:
+                                    failed_ids.add(fid)
+                        except (json.JSONDecodeError, AttributeError):
+                            pass
+
+                # Delete only the messages that succeeded (not in failed_ids)
+                succeeded = [msg for msg in batch if msg["id"] not in failed_ids]
+                receipt_handles = {msg["receipt_handle"] for msg in succeeded if msg.get("receipt_handle")}
+                if receipt_handles:
+                    _sqs._delete_messages_for_esm(queue_url, receipt_handles)
+
+                n_failed = len(batch) - len(succeeded)
+                if n_failed:
+                    esm["LastProcessingResult"] = f"OK - {len(succeeded)} records, {n_failed} partial failures"
+                    logger.info("ESM: Lambda %s processed %d SQS messages from %s (%d partial failures)",
+                                func_name, len(succeeded), queue_name, n_failed)
+                else:
+                    esm["LastProcessingResult"] = f"OK - {len(batch)} records"
+                    logger.info("ESM: Lambda %s processed %d SQS messages from %s", func_name, len(batch), queue_name)
                 log_output = result.get("log", "")
                 if log_output:
                     logger.info("ESM: Lambda %s output:\n%s", func_name, log_output)
-                logger.info(
-                    "ESM: Lambda %s processed %d Kinesis records from %s/%s",
-                    func_name, len(raw_records), stream_name, shard_id,
-                )
+        finally:
+            _request_account_id.reset(account_token)
+            _request_region.reset(region_token)
+
+
+def _poll_kinesis():
+    from ministack.services import kinesis as _kin
+
+    for acct_id, region, esm in _iter_all_esms():
+        account_token = _request_account_id.set(acct_id)
+        region_token = _request_region.set(region)
+        try:
+            if not esm.get("Enabled", True):
+                continue
+            source_arn = esm.get("EventSourceArn", "")
+            try:
+                source_spec = parse_arn(source_arn)
+            except ArnParseError:
+                continue
+            if (
+                source_spec.service != "kinesis"
+                or source_spec.account_id != get_account_id()
+                or source_spec.region != get_region()
+            ):
+                continue
+            stream_name = _kinesis_stream_name_from_arn_spec(source_spec)
+            if not stream_name:
+                continue
+
+            func_name = esm["FunctionName"]
+            qualifier = esm.get("Qualifier")
+            func_rec, _cfg = _get_func_record_for_qualifier(func_name, qualifier)
+            if func_rec is None:
+                continue
+
+            stream = _kin._streams.get(stream_name)
+            if not stream or stream.get("StreamARN") != source_arn or stream["StreamStatus"] != "ACTIVE":
+                continue
+
+            esm_id = esm["UUID"]
+            if esm_id not in _kinesis_positions:
+                starting = esm.get("StartingPosition", "LATEST")
+                _kinesis_positions[esm_id] = {}
+                for shard_id, shard in stream["shards"].items():
+                    if starting == "TRIM_HORIZON":
+                        _kinesis_positions[esm_id][shard_id] = 0
+                    else:
+                        _kinesis_positions[esm_id][shard_id] = len(shard["records"])
+
+            batch_size = esm.get("BatchSize", 100)
+            positions = _kinesis_positions[esm_id]
+
+            for shard_id, shard in stream["shards"].items():
+                if shard_id not in positions:
+                    positions[shard_id] = len(shard["records"])
+                    continue
+
+                pos = positions[shard_id]
+                raw_records = shard["records"][pos:pos + batch_size]
+                if not raw_records:
+                    continue
+
+                records = []
+                for r in raw_records:
+                    data_val = r["Data"]
+                    if isinstance(data_val, bytes):
+                        data_b64 = base64.b64encode(data_val).decode("ascii")
+                    elif isinstance(data_val, str):
+                        try:
+                            base64.b64decode(data_val, validate=True)
+                            data_b64 = data_val
+                        except Exception:
+                            data_b64 = base64.b64encode(data_val.encode("utf-8")).decode("ascii")
+                    else:
+                        data_b64 = base64.b64encode(str(data_val).encode("utf-8")).decode("ascii")
+
+                    records.append({
+                        "kinesis": {
+                            "kinesisSchemaVersion": "1.0",
+                            "partitionKey": r["PartitionKey"],
+                            "sequenceNumber": r["SequenceNumber"],
+                            "data": data_b64,
+                            "approximateArrivalTimestamp": r["ApproximateArrivalTimestamp"],
+                        },
+                        "eventSource": "aws:kinesis",
+                        "eventVersion": "1.0",
+                        "eventID": f"{shard_id}:{r['SequenceNumber']}",
+                        "eventName": "aws:kinesis:record",
+                        "invokeIdentityArn": f"arn:aws:iam::{get_account_id()}:role/lambda-role",
+                        "awsRegion": get_region(),
+                        "eventSourceARN": source_arn,
+                    })
+
+                # AWS drops records that don't match FilterCriteria before invoke.
+                # Advance past the raw batch we consumed — filtered records are
+                # treated as "successfully processed" (same semantics as the
+                # normal success path below, which adds len(raw_records)).
+                records = _apply_filter_criteria(records, esm)
+                if not records:
+                    _kinesis_positions[esm_id][shard_id] = pos + len(raw_records)
+                    continue
+
+                event = {"Records": records}
+                result = _execute_function(func_rec, event)
+
+                if result.get("error"):
+                    err_body = result.get("body") or {}
+                    err_type = err_body.get("errorType") if isinstance(err_body, dict) else None
+                    err_msg = err_body.get("errorMessage") if isinstance(err_body, dict) else None
+                    esm["LastProcessingResult"] = "FAILED"
+                    logger.warning(
+                        "ESM: Lambda %s failed processing Kinesis batch from %s/%s (errorType=%s errorMessage=%s)\n%s",
+                        func_name, stream_name, shard_id, err_type, err_msg, result.get("log", ""),
+                    )
+                else:
+                    positions[shard_id] = pos + len(raw_records)
+                    esm["LastProcessingResult"] = f"OK - {len(raw_records)} records"
+                    log_output = result.get("log", "")
+                    if log_output:
+                        logger.info("ESM: Lambda %s output:\n%s", func_name, log_output)
+                    logger.info(
+                        "ESM: Lambda %s processed %d Kinesis records from %s/%s",
+                        func_name, len(raw_records), stream_name, shard_id,
+                    )
+        finally:
+            _request_account_id.reset(account_token)
+            _request_region.reset(region_token)
 
 
 def _poll_dynamodb_streams():
@@ -4403,71 +4892,89 @@ def _poll_dynamodb_streams():
     if not stream_records:
         return
 
-    for (acct_id, _esm_key), esm in list(_esms._data.items()):
-        _request_account_id.set(acct_id)
-        if not esm.get("Enabled", True):
-            continue
-        source_arn = esm.get("EventSourceArn", "")
-        if ":dynamodb:" not in source_arn or "/stream/" not in source_arn:
-            continue
+    for acct_id, region, esm in _iter_all_esms():
+        account_token = _request_account_id.set(acct_id)
+        region_token = _request_region.set(region)
+        try:
+            if not esm.get("Enabled", True):
+                continue
+            source_arn = esm.get("EventSourceArn", "")
+            try:
+                source_spec = parse_arn(source_arn)
+            except ArnParseError:
+                continue
+            if (
+                source_spec.service != "dynamodb"
+                or source_spec.account_id != get_account_id()
+                or source_spec.region != get_region()
+            ):
+                continue
+            table_stream = _dynamodb_stream_table_from_arn_spec(source_spec)
+            if table_stream is None:
+                continue
+            table_name, _stream_label = table_stream
 
-        func_name = esm["FunctionName"]
-        qualifier = esm.get("Qualifier")
-        func_rec, _cfg = _get_func_record_for_qualifier(func_name, qualifier)
-        if func_rec is None:
-            continue
+            func_name = esm["FunctionName"]
+            qualifier = esm.get("Qualifier")
+            func_rec, _cfg = _get_func_record_for_qualifier(func_name, qualifier)
+            if func_rec is None:
+                continue
 
-        table_arn = source_arn.split("/stream/")[0]
-        table_name = table_arn.split("/")[-1]
-        table_records = stream_records.get(table_name, [])
-        if not table_records:
-            continue
+            table = _ddb._tables.get(table_name)
+            if not table or table.get("LatestStreamArn") != source_arn:
+                continue
+            table_records = stream_records.get(table_name, [])
+            if not table_records:
+                continue
 
-        esm_id = esm["UUID"]
-        with _dynamodb_stream_positions_lock:
-            if esm_id not in _dynamodb_stream_positions:
-                starting = esm.get("StartingPosition", "LATEST")
-                if starting == "TRIM_HORIZON":
-                    _dynamodb_stream_positions[esm_id] = 0
-                else:
-                    _dynamodb_stream_positions[esm_id] = len(table_records)
-            pos = _dynamodb_stream_positions[esm_id]
-
-        batch_size = esm.get("BatchSize", 100)
-        batch = table_records[pos:pos + batch_size]
-        if not batch:
-            continue
-
-        batch = _apply_filter_criteria(batch, esm)
-        if not batch:
-            # All records filtered — advance position so we don't re-evaluate.
+            esm_id = esm["UUID"]
             with _dynamodb_stream_positions_lock:
-                _dynamodb_stream_positions[esm_id] = pos + batch_size
-            continue
+                if esm_id not in _dynamodb_stream_positions:
+                    starting = esm.get("StartingPosition", "LATEST")
+                    if starting == "TRIM_HORIZON":
+                        _dynamodb_stream_positions[esm_id] = 0
+                    else:
+                        _dynamodb_stream_positions[esm_id] = len(table_records)
+                pos = _dynamodb_stream_positions[esm_id]
 
-        event = {"Records": batch}
-        result = _execute_function(func_rec, event)
+            batch_size = esm.get("BatchSize", 100)
+            batch = table_records[pos:pos + batch_size]
+            if not batch:
+                continue
 
-        if result.get("error"):
-            err_body = result.get("body") or {}
-            err_type = err_body.get("errorType") if isinstance(err_body, dict) else None
-            err_msg = err_body.get("errorMessage") if isinstance(err_body, dict) else None
-            esm["LastProcessingResult"] = "FAILED"
-            logger.warning(
-                "ESM: Lambda %s failed processing DynamoDB stream batch from %s (errorType=%s errorMessage=%s)\n%s",
-                func_name, table_name, err_type, err_msg, result.get("log", ""),
-            )
-        else:
-            with _dynamodb_stream_positions_lock:
-                _dynamodb_stream_positions[esm_id] = pos + len(batch)
-            esm["LastProcessingResult"] = f"OK - {len(batch)} records"
-            log_output = result.get("log", "")
-            if log_output:
-                logger.info("ESM: Lambda %s output:\n%s", func_name, log_output)
-            logger.info(
-                "ESM: Lambda %s processed %d DynamoDB stream records from %s",
-                func_name, len(batch), table_name,
-            )
+            batch = _apply_filter_criteria(batch, esm)
+            if not batch:
+                # All records filtered — advance position so we don't re-evaluate.
+                with _dynamodb_stream_positions_lock:
+                    _dynamodb_stream_positions[esm_id] = pos + batch_size
+                continue
+
+            event = {"Records": batch}
+            result = _execute_function(func_rec, event)
+
+            if result.get("error"):
+                err_body = result.get("body") or {}
+                err_type = err_body.get("errorType") if isinstance(err_body, dict) else None
+                err_msg = err_body.get("errorMessage") if isinstance(err_body, dict) else None
+                esm["LastProcessingResult"] = "FAILED"
+                logger.warning(
+                    "ESM: Lambda %s failed processing DynamoDB stream batch from %s (errorType=%s errorMessage=%s)\n%s",
+                    func_name, table_name, err_type, err_msg, result.get("log", ""),
+                )
+            else:
+                with _dynamodb_stream_positions_lock:
+                    _dynamodb_stream_positions[esm_id] = pos + len(batch)
+                esm["LastProcessingResult"] = f"OK - {len(batch)} records"
+                log_output = result.get("log", "")
+                if log_output:
+                    logger.info("ESM: Lambda %s output:\n%s", func_name, log_output)
+                logger.info(
+                    "ESM: Lambda %s processed %d DynamoDB stream records from %s",
+                    func_name, len(batch), table_name,
+                )
+        finally:
+            _request_account_id.reset(account_token)
+            _request_region.reset(region_token)
 
 
 # ---------------------------------------------------------------------------

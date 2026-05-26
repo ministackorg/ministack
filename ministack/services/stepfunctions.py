@@ -1502,16 +1502,15 @@ def _execute_task(state_def, raw_input, execution, ctx):
 def _invoke_resource(resource, input_data):
     """Dispatch to Lambda or return a mock/passthrough."""
     if "states:::lambda:invoke" in resource:
-        func_name = input_data.get("FunctionName", "")
+        func_ref = input_data.get("FunctionName", "")
         payload = input_data.get("Payload", input_data)
-        if ":function:" in func_name:
-            func_name = func_name.split(":function:")[-1].split(":")[0]
-        result = _call_lambda(func_name, payload)
+        func_ref = _resolve_lambda_function_ref(func_ref, optimized=True)
+        result = _call_lambda(func_ref, payload)
         return {"StatusCode": 200, "Payload": result}
 
-    func_name = _extract_lambda_name(resource)
-    if func_name:
-        return _call_lambda(func_name, input_data)
+    func_ref = _extract_lambda_ref(resource)
+    if func_ref:
+        return _call_lambda(func_ref, input_data)
 
     # Activity resource — enqueue task and wait for worker to call GetActivityTask + SendTask*
     if ":activity:" in resource:
@@ -1574,15 +1573,14 @@ def _invoke_with_callback(resource, input_data, token, state_def):
         "event": evt, "result": None, "error": None, "heartbeat": None}
 
     clean_resource = resource.replace(".waitForTaskToken", "")
-    func_name = _extract_lambda_name(clean_resource)
-    if not func_name and "states:::lambda:invoke" in clean_resource:
-        func_name = input_data.get("FunctionName", "")
-        if ":function:" in func_name:
-            func_name = func_name.split(":function:")[-1].split(":")[0]
+    func_ref = _extract_lambda_ref(clean_resource)
+    if not func_ref and "states:::lambda:invoke" in clean_resource:
+        func_ref = input_data.get("FunctionName", "")
+        func_ref = _resolve_lambda_function_ref(func_ref, optimized=True)
 
-    if func_name:
+    if func_ref:
         try:
-            _call_lambda(func_name, input_data)
+            _call_lambda(func_ref, input_data)
         except _ExecutionError:
             pass
 
@@ -1604,21 +1602,22 @@ def _invoke_with_callback(resource, input_data, token, state_def):
         return result_raw
 
 
-def _call_lambda(func_name, event):
+def _call_lambda(func_ref, event):
     """Invoke a Lambda via the co-located lambda_svc module (synchronous)."""
     try:
         from ministack.services import lambda_svc
     except ImportError:
-        logger.warning("lambda_svc unavailable; returning passthrough for %s", func_name)
+        logger.warning("lambda_svc unavailable; returning passthrough for %s", func_ref)
         return event
 
-    func = lambda_svc._functions.get(func_name)
-    if not func:
+    func, config, func_name = lambda_svc._get_func_record_for_ref(func_ref)
+    if not func or not config:
         raise _ExecutionError(
             "Lambda.ResourceNotFoundException",
             f"Function not found: {func_name}")
 
-    result = lambda_svc._execute_function(func, event)
+    exec_record = lambda_svc._execution_record_for_config(func, config)
+    result = lambda_svc._execute_function_with_config_scope(exec_record, event)
 
     if result.get("error"):
         body = result.get("body", {})
@@ -3705,11 +3704,106 @@ def _find_matching_catcher(catchers, error):
 # ===================================================================
 
 def _extract_lambda_name(resource):
+    func_ref = _extract_lambda_ref(resource)
+    if not func_ref:
+        return None
+    if isinstance(func_ref, str) and func_ref.startswith("arn:"):
+        try:
+            spec = parse_arn(func_ref)
+        except ArnParseError:
+            return None
+        parts = spec.resource.split(":", 2)
+        if len(parts) >= 2 and parts[0] == "function":
+            return parts[1]
+    if isinstance(func_ref, str) and ":" in func_ref:
+        return func_ref.split(":", 1)[0]
+    return func_ref
+
+
+def _extract_lambda_ref(resource):
     if not resource:
         return None
     if ":function:" in resource:
-        return resource.split(":function:")[-1].split(":")[0]
+        return _resolve_lambda_function_ref(resource, optimized=False)
     return None
+
+
+def _resolve_lambda_function_name(value, optimized):
+    func_ref = _resolve_lambda_function_ref(value, optimized)
+    if not isinstance(func_ref, str):
+        return func_ref
+    if func_ref.startswith("arn:"):
+        try:
+            spec = parse_arn(func_ref)
+        except ArnParseError:
+            return func_ref
+        parts = spec.resource.split(":", 2)
+        if len(parts) >= 2 and parts[0] == "function":
+            return parts[1]
+    if ":" in func_ref:
+        return func_ref.split(":", 1)[0]
+    return func_ref
+
+
+def _lambda_ref_error(value, optimized, message):
+    if optimized:
+        raise _ExecutionError(
+            "Lambda.ResourceNotFoundException",
+            f"Function not found: {value}. {message}",
+        )
+    raise _ExecutionError(
+        "States.Runtime",
+        f"Invalid Lambda resource '{value}': {message}",
+    )
+
+
+def _resolve_lambda_function_ref(value, optimized):
+    if not value:
+        return value
+    if not isinstance(value, str):
+        return value
+    if ":function:" not in value:
+        return value
+
+    if not value.startswith("arn:"):
+        return value.split(":function:")[-1]
+
+    try:
+        spec = parse_arn(value)
+    except ArnParseError as exc:
+        _lambda_ref_error(value, optimized, str(exc))
+    if spec.service != "lambda":
+        _lambda_ref_error(value, optimized, f"expected Lambda ARN, got {spec.service!r}")
+
+    parts = spec.resource.split(":", 2)
+    if len(parts) < 2 or parts[0] != "function":
+        _lambda_ref_error(value, optimized, "expected resource shape function:<name>[:qualifier]")
+
+    if spec.account_id != get_account_id():
+        if optimized:
+            raise _ExecutionError(
+                "Lambda.AWSLambdaException",
+                f"User is not authorized to access function {value}",
+            )
+        raise _ExecutionError(
+            "States.Runtime",
+            f"The resource '{value}' belongs to a different account. "
+            f"Expected '{get_account_id()}', was '{spec.account_id}'.",
+        )
+
+    if spec.region != get_region():
+        if optimized:
+            raise _ExecutionError(
+                "Lambda.ResourceNotFoundException",
+                f"Functions from '{spec.region}' are not reachable in this region ('{get_region()}')",
+            )
+        raise _ExecutionError(
+            "States.Runtime",
+            f"The resource '{value}' belongs to a different region. "
+            f"Expected '{get_region()}', was '{spec.region}'.",
+        )
+
+    return value
 
 
 def _next_or_end(state_def):

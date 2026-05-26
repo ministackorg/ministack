@@ -76,15 +76,14 @@ def invoke_custom_resource(
     from ministack.core.responses import new_uuid
 
     service_token = props.get("ServiceToken", "")
-    func_name = _func_name_from_arn(service_token)
+    func_record, func_config, func_name = _lambda_svc._get_func_record_for_ref(service_token)
 
-    if func_name not in _lambda_svc._functions:
+    if func_record is None or func_config is None:
         raise ValueError(
             f"Custom resource ServiceToken {service_token!r} not found. "
             "Ensure the Lambda function is provisioned before the custom resource."
         )
 
-    func_record = _lambda_svc._functions[func_name]
     try:
         service_timeout = int(props.get("ServiceTimeout", 3600))
     except (ValueError, TypeError):
@@ -110,7 +109,8 @@ def invoke_custom_resource(
     event_obj = register_token(token)
 
     try:
-        _lambda_svc._execute_function(func_record, cfn_event)
+        exec_record = _lambda_svc._execution_record_for_config(func_record, func_config)
+        _lambda_svc._execute_function_with_config_scope(exec_record, cfn_event)
     except Exception as exc:
         logger.warning("Custom resource Lambda raised synchronously: %s", exc)
 

@@ -2242,6 +2242,49 @@ def test_sfn_integration_lambda_invoke(sfn, lam):
     output = json.loads(desc["output"])
     assert output["result"]["doubled"] == 42
 
+
+def test_sfn_lambda_invoke_missing_non_arn_qualifier_fails(sfn, lam):
+    import uuid as _uuid
+
+    fn = f"sfn-lam-missing-alias-{_uuid.uuid4().hex[:8]}"
+    code = "def handler(event, context):\n    return {'called': True}\n"
+    lam.create_function(
+        FunctionName=fn,
+        Runtime="python3.12",
+        Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _make_zip(code)},
+    )
+
+    definition = json.dumps(
+        {
+            "StartAt": "InvokeLambda",
+            "States": {
+                "InvokeLambda": {
+                    "Type": "Task",
+                    "Resource": "arn:aws:states:::lambda:invoke",
+                    "Parameters": {
+                        "FunctionName": f"{fn}:missingAlias",
+                        "Payload": {},
+                    },
+                    "End": True,
+                }
+            },
+        }
+    )
+    sm = sfn.create_state_machine(
+        name=f"sfn-lam-missing-alias-{_uuid.uuid4().hex[:8]}",
+        definition=definition,
+        roleArn="arn:aws:iam::000000000000:role/R",
+    )
+    ex = sfn.start_execution(stateMachineArn=sm["stateMachineArn"], input="{}")
+
+    desc = _wait_sfn(sfn, ex["executionArn"], timeout=10)
+    assert desc["status"] == "FAILED"
+    assert desc["error"] == "Lambda.ResourceNotFoundException"
+    assert fn in desc["cause"]
+
+
 def test_sfn_choice_state(sfn):
     """Choice state routes to correct branch based on input."""
     definition = json.dumps(

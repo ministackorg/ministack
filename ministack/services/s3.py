@@ -1776,9 +1776,8 @@ def _deliver_event_to_sns(arn: str, event_payload: dict) -> None:
 def _deliver_event_to_lambda(arn: str, event_payload: dict) -> None:
     from ministack.services import lambda_svc as _lambda
 
-    func_name = arn.rsplit(":", 1)[-1]
-    func = _lambda._functions.get(func_name)
-    if not func:
+    func, config, func_name = _lambda._get_func_record_for_ref(arn)
+    if not func or not config:
         logger.warning("S3 notification: Lambda function %s not found", func_name)
         return
 
@@ -1786,7 +1785,7 @@ def _deliver_event_to_lambda(arn: str, event_payload: dict) -> None:
     # (MaximumRetryAttempts, default 2) and routing to the function's DLQ /
     # DestinationConfig.OnFailure on final failure. Shared helper keeps the
     # semantics identical to direct Invoke(InvocationType=Event).
-    _lambda.invoke_async_with_retry(func, event_payload)
+    _lambda.invoke_async_with_retry(_lambda._execution_record_for_config(func, config), event_payload)
     logger.info("S3 notification → Lambda %s (async with retry+DLQ)", func_name)
 
 

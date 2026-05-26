@@ -374,10 +374,12 @@ def _alb_teardown(elbv2, lam, lb_arn, tg_arn, l_arn, fn_name):
     except Exception:
         pass
 
-def test_elbv2_dataplane_forward_lambda(elbv2, lam):
+@pytest.mark.serial
+def test_elbv2_dataplane_forward_lambda(elbv2, lam, cw):
     """ALB forwards request to Lambda via /_alb/{lb-name}/ path prefix."""
     import urllib.request as _req
 
+    fn_name = "dp-alb-fwd-fn"
     fn_code = (
         "import json\n"
         "def handler(event, context):\n"
@@ -387,7 +389,7 @@ def test_elbv2_dataplane_forward_lambda(elbv2, lam):
         "        'body': json.dumps({'method': event['httpMethod'], 'path': event['path']}),\n"
         "    }\n"
     )
-    lb_arn, tg_arn, l_arn, fn_arn = _alb_setup(elbv2, lam, "dp-alb-fwd", "dp-alb-fwd-fn", fn_code)
+    lb_arn, tg_arn, l_arn, fn_arn = _alb_setup(elbv2, lam, "dp-alb-fwd", fn_name, fn_code)
     try:
         url = f"{_endpoint}/_alb/dp-alb-fwd/api/hello"
         resp = _req.urlopen(_req.Request(url, method="GET"))
@@ -395,8 +397,22 @@ def test_elbv2_dataplane_forward_lambda(elbv2, lam):
         body = json.loads(resp.read())
         assert body["method"] == "GET"
         assert body["path"] == "/api/hello"
+
+        end = time.time() + 60
+        start = end - 600
+        invocations = cw.get_metric_statistics(
+            Namespace="AWS/Lambda",
+            MetricName="Invocations",
+            Dimensions=[{"Name": "FunctionName", "Value": fn_name}],
+            StartTime=start,
+            EndTime=end,
+            Period=60,
+            Statistics=["Sum"],
+        )
+        total = sum(p["Sum"] for p in invocations["Datapoints"])
+        assert total >= 1, f"expected ALB Lambda target to emit metrics, got {total}"
     finally:
-        _alb_teardown(elbv2, lam, lb_arn, tg_arn, l_arn, "dp-alb-fwd-fn")
+        _alb_teardown(elbv2, lam, lb_arn, tg_arn, l_arn, fn_name)
 
 def test_elbv2_dataplane_event_shape(elbv2, lam):
     """ALB event passed to Lambda contains all required fields."""

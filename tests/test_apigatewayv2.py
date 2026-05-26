@@ -1999,6 +1999,108 @@ def _wrapped_uri(fn_arn: str) -> str:
     return f"arn:aws:apigateway:us-east-1:lambda:path/2015-03-31/functions/{fn_arn}/invocations"
 
 
+def _lambda_client(region: str):
+    import boto3
+
+    return boto3.client(
+        "lambda",
+        endpoint_url=_endpoint,
+        aws_access_key_id="test",
+        aws_secret_access_key="test",
+        region_name=region,
+    )
+
+
+def _regional_marker_code(marker: str) -> str:
+    return f"""
+def handler(event, context):
+    return {{
+        'statusCode': 200,
+        'body': '{marker}:' + context.invoked_function_arn,
+    }}
+"""
+
+
+def _make_regional_fn(lam, name: str, marker: str) -> str:
+    created = lam.create_function(
+        FunctionName=name,
+        Runtime="python3.12",
+        Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _make_zip(_regional_marker_code(marker))},
+    )
+    lam.invoke(
+        FunctionName=name,
+        InvocationType="RequestResponse",
+        Payload=b'{"_ministack_warmup": true}',
+    )
+    return created["FunctionArn"]
+
+
+def test_apigwv2_lambda_integration_uses_function_arn_region(apigw, lam):
+    import urllib.request
+
+    west_lam = _lambda_client("us-west-2")
+    fn_name = f"apigw-region-{uuid.uuid4().hex[:6]}"
+    _make_regional_fn(lam, fn_name, "east")
+    west_arn = _make_regional_fn(west_lam, fn_name, "west")
+
+    api_id = apigw.create_api(Name="regional-lambda-api", ProtocolType="HTTP")["ApiId"]
+    integ = apigw.create_integration(
+        ApiId=api_id,
+        IntegrationType="AWS_PROXY",
+        IntegrationUri=_wrapped_uri(west_arn),
+        IntegrationMethod="POST",
+    )
+    apigw.create_route(ApiId=api_id, RouteKey="GET /hello", Target=f"integrations/{integ['IntegrationId']}")
+    apigw.create_stage(ApiId=api_id, StageName="$default", AutoDeploy=True)
+
+    req = urllib.request.Request(f"http://{api_id}.execute-api.localhost:{_EXECUTE_PORT}/hello")
+    req.add_header("Host", f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}")
+    resp = urllib.request.urlopen(req, timeout=30)
+
+    assert resp.status == 200
+    body = resp.read().decode()
+    assert body.startswith("west:")
+    assert ":us-west-2:" in body
+
+
+def test_apigwv1_lambda_integration_uses_function_arn_region(apigw_v1, lam):
+    import urllib.request
+
+    west_lam = _lambda_client("us-west-2")
+    fn_name = f"apigwv1-region-{uuid.uuid4().hex[:6]}"
+    _make_regional_fn(lam, fn_name, "east")
+    west_arn = _make_regional_fn(west_lam, fn_name, "west")
+
+    api_id = apigw_v1.create_rest_api(name="regional-v1-api")["id"]
+    root = apigw_v1.get_resources(restApiId=api_id)["items"][0]["id"]
+    res_id = apigw_v1.create_resource(restApiId=api_id, parentId=root, pathPart="hello")["id"]
+    apigw_v1.put_method(
+        restApiId=api_id,
+        resourceId=res_id,
+        httpMethod="GET",
+        authorizationType="NONE",
+    )
+    apigw_v1.put_integration(
+        restApiId=api_id,
+        resourceId=res_id,
+        httpMethod="GET",
+        type="AWS_PROXY",
+        integrationHttpMethod="POST",
+        uri=_wrapped_uri(west_arn),
+    )
+    apigw_v1.create_deployment(restApiId=api_id, stageName="prod")
+
+    url = f"http://localhost:{_EXECUTE_PORT}/restapis/{api_id}/prod/_user_request_/hello"
+    resp = urllib.request.urlopen(url, timeout=30)
+
+    assert resp.status == 200
+    body = resp.read().decode()
+    assert body.startswith("west:")
+    assert ":us-west-2:" in body
+
+
 def test_apigwv2_integration_wrapped_function_arn(apigw, lam):
     """Wrapped integrationUri pointing at an unqualified Lambda ARN must invoke
     the function — regression test for 1.3.6's wrapper mis-parse (#409)."""

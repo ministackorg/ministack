@@ -1,3 +1,4 @@
+import asyncio
 import io
 import json
 import os
@@ -44,6 +45,299 @@ def _zip_lambda(code: str) -> bytes:
     with zipfile.ZipFile(buf, "w") as zf:
         zf.writestr("index.py", code)
     return buf.getvalue()
+
+
+def _regional_client(service: str, region: str):
+    return boto3.client(
+        service,
+        endpoint_url=_endpoint,
+        aws_access_key_id="test",
+        aws_secret_access_key="test",
+        region_name=region,
+        config=Config(
+            region_name=region,
+            retries={"mode": "standard"},
+            max_pool_connections=50,
+        ),
+    )
+
+
+def _region_marker_code(marker: str) -> bytes:
+    code = f"""
+import os
+
+def handler(event, context):
+    return {{
+        "marker": "{marker}",
+        "region": os.environ.get("AWS_REGION"),
+        "arn": context.invoked_function_arn,
+        "event": event,
+    }}
+"""
+    return _make_zip(code)
+
+
+def _region_log_marker_code(marker: str) -> bytes:
+    code = f"""
+import os
+
+def handler(event, context):
+    print("{marker}")
+    return {{
+        "marker": "{marker}",
+        "region": os.environ.get("AWS_REGION"),
+        "arn": context.invoked_function_arn,
+        "event": event,
+    }}
+"""
+    return _make_zip(code)
+
+
+def _wait_log_marker(logs, log_group: str, marker: str, timeout: float = 5.0) -> list[str]:
+    end = time.time() + timeout
+    messages: list[str] = []
+    while time.time() < end:
+        messages = _collect_log_messages(logs, log_group)
+        if any(marker in msg for msg in messages):
+            return messages
+        time.sleep(0.2)
+    return messages
+
+
+def _collect_log_messages(logs, log_group: str) -> list[str]:
+    try:
+        streams = logs.describe_log_streams(logGroupName=log_group)["logStreams"]
+    except ClientError:
+        return []
+    messages: list[str] = []
+    for stream in streams:
+        events = logs.get_log_events(
+            logGroupName=log_group,
+            logStreamName=stream["logStreamName"],
+        )["events"]
+        messages.extend(event["message"] for event in events)
+    return messages
+
+
+def test_lambda_functions_are_region_scoped():
+    east = _regional_client("lambda", "us-east-1")
+    west = _regional_client("lambda", "us-west-2")
+    name = f"lambda-region-scope-{_uuid_mod.uuid4().hex}"
+
+    east_created = east.create_function(
+        FunctionName=name,
+        Runtime="python3.12",
+        Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _region_marker_code("east")},
+    )
+    west_created = west.create_function(
+        FunctionName=name,
+        Runtime="python3.12",
+        Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _region_marker_code("west")},
+    )
+
+    assert ":us-east-1:" in east_created["FunctionArn"]
+    assert ":us-west-2:" in west_created["FunctionArn"]
+    assert east_created["FunctionArn"] != west_created["FunctionArn"]
+
+    east_names = {fn["FunctionName"] for fn in east.list_functions()["Functions"]}
+    west_names = {fn["FunctionName"] for fn in west.list_functions()["Functions"]}
+    assert name in east_names
+    assert name in west_names
+
+    east_resp = east.invoke(FunctionName=name, Payload=json.dumps({"region": "east"}))
+    west_resp = west.invoke(FunctionName=name, Payload=json.dumps({"region": "west"}))
+    east_payload = json.loads(east_resp["Payload"].read())
+    west_payload = json.loads(west_resp["Payload"].read())
+    assert east_payload["marker"] == "east"
+    assert west_payload["marker"] == "west"
+    assert east_payload["region"] == "us-east-1"
+    assert west_payload["region"] == "us-west-2"
+    assert ":us-east-1:" in east_payload["arn"]
+    assert ":us-west-2:" in west_payload["arn"]
+
+
+def test_lambda_cloudwatch_logs_are_region_scoped():
+    east = _regional_client("lambda", "us-east-1")
+    west = _regional_client("lambda", "us-west-2")
+    east_logs = _regional_client("logs", "us-east-1")
+    west_logs = _regional_client("logs", "us-west-2")
+    name = f"lambda-log-region-{_uuid_mod.uuid4().hex}"
+    east_marker = f"east-{_uuid_mod.uuid4().hex}"
+    west_marker = f"west-{_uuid_mod.uuid4().hex}"
+
+    east.create_function(
+        FunctionName=name,
+        Runtime="python3.12",
+        Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _region_log_marker_code(east_marker)},
+    )
+    west.create_function(
+        FunctionName=name,
+        Runtime="python3.12",
+        Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _region_log_marker_code(west_marker)},
+    )
+
+    east.invoke(FunctionName=name, Payload=json.dumps({"region": "east"}))
+    west.invoke(FunctionName=name, Payload=json.dumps({"region": "west"}))
+
+    log_group = f"/aws/lambda/{name}"
+    east_messages = _wait_log_marker(east_logs, log_group, east_marker)
+    west_messages = _wait_log_marker(west_logs, log_group, west_marker)
+    assert any(east_marker in msg for msg in east_messages)
+    assert all(west_marker not in msg for msg in east_messages)
+    assert any(west_marker in msg for msg in west_messages)
+    assert all(east_marker not in msg for msg in west_messages)
+
+
+def test_lambda_full_function_arn_must_match_request_region():
+    east = _regional_client("lambda", "us-east-1")
+    west = _regional_client("lambda", "us-west-2")
+    name = f"lambda-arn-scope-{_uuid_mod.uuid4().hex}"
+
+    east_created = east.create_function(
+        FunctionName=name,
+        Runtime="python3.12",
+        Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _region_marker_code("east")},
+    )
+    west_created = west.create_function(
+        FunctionName=name,
+        Runtime="python3.12",
+        Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _region_marker_code("west")},
+    )
+
+    same_region = east.get_function(FunctionName=east_created["FunctionArn"])
+    assert same_region["Configuration"]["FunctionArn"] == east_created["FunctionArn"]
+
+    with pytest.raises(ClientError) as exc:
+        east.get_function(FunctionName=west_created["FunctionArn"])
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
+def test_lambda_versions_aliases_tags_and_urls_are_region_scoped():
+    east = _regional_client("lambda", "us-east-1")
+    west = _regional_client("lambda", "us-west-2")
+    name = f"lambda-region-version-{_uuid_mod.uuid4().hex}"
+
+    east_created = east.create_function(
+        FunctionName=name,
+        Runtime="python3.12",
+        Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _region_marker_code("east")},
+        Tags={"region": "east"},
+    )
+    west_created = west.create_function(
+        FunctionName=name,
+        Runtime="python3.12",
+        Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _region_marker_code("west")},
+        Tags={"region": "west"},
+    )
+
+    east_version = east.publish_version(FunctionName=name)
+    west_version = west.publish_version(FunctionName=name)
+    assert ":us-east-1:" in east_version["FunctionArn"]
+    assert ":us-west-2:" in west_version["FunctionArn"]
+
+    east_alias = east.create_alias(FunctionName=name, Name="live", FunctionVersion=east_version["Version"])
+    west_alias = west.create_alias(FunctionName=name, Name="live", FunctionVersion=west_version["Version"])
+    assert ":us-east-1:" in east_alias["AliasArn"]
+    assert ":us-west-2:" in west_alias["AliasArn"]
+    assert east.get_alias(FunctionName=name, Name="live")["AliasArn"] == east_alias["AliasArn"]
+    assert west.get_alias(FunctionName=name, Name="live")["AliasArn"] == west_alias["AliasArn"]
+
+    assert east.list_tags(Resource=east_created["FunctionArn"])["Tags"]["region"] == "east"
+    assert west.list_tags(Resource=west_created["FunctionArn"])["Tags"]["region"] == "west"
+
+    east_url = east.create_function_url_config(FunctionName=name, Qualifier="live", AuthType="NONE")
+    west_url = west.create_function_url_config(FunctionName=name, Qualifier="live", AuthType="NONE")
+    assert ".us-east-1." in east_url["FunctionUrl"]
+    assert ".us-west-2." in west_url["FunctionUrl"]
+    assert east.get_function_url_config(FunctionName=name, Qualifier="live")["FunctionUrl"] == east_url["FunctionUrl"]
+    assert west.get_function_url_config(FunctionName=name, Qualifier="live")["FunctionUrl"] == west_url["FunctionUrl"]
+
+
+def test_sfn_lambda_invoke_uses_execution_region():
+    east_lam = _regional_client("lambda", "us-east-1")
+    west_lam = _regional_client("lambda", "us-west-2")
+    east_sfn = _regional_client("stepfunctions", "us-east-1")
+    west_sfn = _regional_client("stepfunctions", "us-west-2")
+    name = f"lambda-sfn-region-{_uuid_mod.uuid4().hex}"
+
+    east = east_lam.create_function(
+        FunctionName=name,
+        Runtime="python3.12",
+        Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _region_marker_code("east")},
+    )
+    west = west_lam.create_function(
+        FunctionName=name,
+        Runtime="python3.12",
+        Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _region_marker_code("west")},
+    )
+
+    def _definition(function_arn):
+        return json.dumps(
+            {
+                "StartAt": "Invoke",
+                "States": {
+                    "Invoke": {
+                        "Type": "Task",
+                        "Resource": "arn:aws:states:::lambda:invoke",
+                        "Parameters": {
+                            "FunctionName": function_arn,
+                            "Payload": {"hello": "region"},
+                        },
+                        "End": True,
+                    }
+                },
+            }
+        )
+
+    east_sm = east_sfn.create_state_machine(
+        name=name,
+        definition=_definition(east["FunctionArn"]),
+        roleArn="arn:aws:iam::000000000000:role/R",
+    )
+    west_sm = west_sfn.create_state_machine(
+        name=name,
+        definition=_definition(west["FunctionArn"]),
+        roleArn="arn:aws:iam::000000000000:role/R",
+    )
+
+    east_ex = east_sfn.start_execution(stateMachineArn=east_sm["stateMachineArn"], input="{}")
+    west_ex = west_sfn.start_execution(stateMachineArn=west_sm["stateMachineArn"], input="{}")
+
+    def _wait(sfn, execution_arn):
+        for _ in range(50):
+            time.sleep(0.1)
+            desc = sfn.describe_execution(executionArn=execution_arn)
+            if desc["status"] != "RUNNING":
+                return desc
+        return desc
+
+    east_desc = _wait(east_sfn, east_ex["executionArn"])
+    west_desc = _wait(west_sfn, west_ex["executionArn"])
+    assert east_desc["status"] == "SUCCEEDED"
+    assert west_desc["status"] == "SUCCEEDED"
+    assert json.loads(east_desc["output"])["Payload"]["marker"] == "east"
+    assert json.loads(west_desc["output"])["Payload"]["marker"] == "west"
+
 
 def test_lambda_create_invoke(lam):
     code = b'def handler(event, context):\n    return {"statusCode": 200, "body": "Hello!", "event": event}\n'
@@ -278,7 +572,10 @@ def test_lambda_invoke_emits_cloudwatch_metrics(lam, cw):
         lam.invoke(FunctionName=fname, Payload=json.dumps({"x": 1}))
         lam.invoke(FunctionName=fname, Payload=json.dumps({"x": 2}))
 
-        end = time.time()
+        # Botocore serializes Query-protocol timestamps at whole-second
+        # precision and CloudWatch EndTime is exclusive, so leave a small
+        # buffer for metrics emitted in the current second.
+        end = time.time() + 1
         start = end - 600
         invocations = cw.get_metric_statistics(
             Namespace="AWS/Lambda",
@@ -412,6 +709,37 @@ def test_lambda_esm_sqs_comprehensive(lam, sqs):
     assert any(e["UUID"] == esm_uuid for e in listed["EventSourceMappings"])
 
     lam.delete_event_source_mapping(UUID=esm_uuid)
+
+
+@pytest.mark.parametrize("event_source_arn", [
+    "arn:aws:sns:us-east-1:000000000000:esm-wrong-service",
+    "arn:aws:sqs:us-west-2:000000000000:esm-foreign-region",
+    "arn:aws:sqs:us-east-1:000000000000:",
+])
+def test_lambda_create_event_source_mapping_rejects_invalid_event_source_arns(lam, event_source_arn):
+    fn_name = f"esm-invalid-source-{_uuid_mod.uuid4().hex[:8]}"
+    lam.create_function(
+        FunctionName=fn_name,
+        Runtime="python3.12",
+        Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _make_zip(_LAMBDA_CODE)},
+    )
+
+    try:
+        with pytest.raises(ClientError) as exc:
+            lam.create_event_source_mapping(
+                EventSourceArn=event_source_arn,
+                FunctionName=fn_name,
+                BatchSize=1,
+            )
+
+        assert exc.value.response["Error"]["Code"] == "InvalidParameterValueException"
+        listed = lam.list_event_source_mappings(FunctionName=fn_name)["EventSourceMappings"]
+        assert all(e["EventSourceArn"] != event_source_arn for e in listed)
+    finally:
+        lam.delete_function(FunctionName=fn_name)
+
 
 def test_lambda_esm_sqs_failure_respects_visibility_timeout(lam, sqs):
     """On Lambda failure, the message should remain in-flight until VisibilityTimeout expires."""
@@ -2282,6 +2610,64 @@ def test_lambda_empty_dead_letter_config(lam):
         lam.delete_function(FunctionName=fname)
 
 
+@pytest.mark.parametrize("target_arn", [
+    "arn:aws:lambda:us-east-1:000000000000:function:not-a-dlq",
+    "arn:aws:sqs:us-west-2:000000000000:foreign-dlq",
+    "arn:aws:sqs:us-east-1:000000000000:",
+])
+def test_lambda_dead_letter_config_rejects_invalid_target_arns(lam, target_arn):
+    fname = f"tf-compat-invalid-dlq-{_uuid_mod.uuid4().hex[:8]}"
+    lam.create_function(
+        FunctionName=fname,
+        Runtime="python3.12",
+        Handler="index.handler",
+        Role=_LAMBDA_ROLE,
+        Code={"ZipFile": _make_zip(_LAMBDA_CODE)},
+    )
+    try:
+        with pytest.raises(ClientError) as exc:
+            lam.update_function_configuration(
+                FunctionName=fname,
+                DeadLetterConfig={"TargetArn": target_arn},
+            )
+
+        assert exc.value.response["Error"]["Code"] == "InvalidParameterValueException"
+        cfg = lam.get_function_configuration(FunctionName=fname)
+        assert "DeadLetterConfig" not in cfg or not cfg["DeadLetterConfig"].get("TargetArn")
+    finally:
+        lam.delete_function(FunctionName=fname)
+
+
+@pytest.mark.parametrize("destination_arn", [
+    "arn:aws:states:us-east-1:000000000000:stateMachine:not-a-destination",
+    "arn:aws:sqs:us-west-2:000000000000:foreign-destination",
+    "arn:aws:sqs:us-east-1:000000000000:",
+])
+def test_lambda_event_invoke_config_rejects_invalid_destination_arns(lam, destination_arn):
+    fname = f"tf-compat-invalid-dest-{_uuid_mod.uuid4().hex[:8]}"
+    lam.create_function(
+        FunctionName=fname,
+        Runtime="python3.12",
+        Handler="index.handler",
+        Role=_LAMBDA_ROLE,
+        Code={"ZipFile": _make_zip(_LAMBDA_CODE)},
+    )
+    try:
+        with pytest.raises(ClientError) as exc:
+            lam.put_function_event_invoke_config(
+                FunctionName=fname,
+                MaximumRetryAttempts=0,
+                DestinationConfig={"OnFailure": {"Destination": destination_arn}},
+            )
+
+        assert exc.value.response["Error"]["Code"] == "InvalidParameterValueException"
+        with pytest.raises(ClientError) as get_exc:
+            lam.get_function_event_invoke_config(FunctionName=fname)
+        assert get_exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+    finally:
+        lam.delete_function(FunctionName=fname)
+
+
 def test_esm_sqs_no_starting_position(lam, sqs):
     """SQS event source mappings must not include StartingPosition."""
     fname = "tf-compat-esm-sqs"
@@ -2456,7 +2842,7 @@ from unittest.mock import MagicMock
 import pytest
 
 import ministack.services.lambda_svc as lsvc
-from ministack.core.responses import set_request_account_id
+from ministack.core.responses import get_account_id, get_region, set_request_account_id, set_request_region
 
 
 @pytest.fixture(autouse=True)
@@ -2478,14 +2864,370 @@ def _mk_container(running: bool = True):
     return c
 
 
+def test_lambda_function_config_account_region_rejects_malformed_arn():
+    from ministack.core.arn import ArnParseError
+    from ministack.core.lambda_runtime import _account_region_from_function_config as _runtime_account_region
+    from ministack.services.lambda_svc import _account_region_from_function_config
+
+    with pytest.raises(ArnParseError):
+        _account_region_from_function_config({
+            "FunctionArn": "arn:aws:lambda:us-east-1:not-a-number:function:my-func",
+        })
+    with pytest.raises(ArnParseError):
+        _account_region_from_function_config({})
+    with pytest.raises(ArnParseError):
+        _runtime_account_region({
+            "FunctionArn": "arn:aws:lambda:us-east-1:not-a-number:function:my-func",
+        })
+    with pytest.raises(ArnParseError):
+        _runtime_account_region({})
+
+
+def _install_region_scoped_lambda(function_name, region, account_id="000000000000"):
+    function_arn = f"arn:aws:lambda:{region}:{account_id}:function:{function_name}"
+    config = {
+        "FunctionName": function_name,
+        "FunctionArn": function_arn,
+        "Runtime": "python3.12",
+        "Handler": "index.handler",
+        "Timeout": 3,
+        "MemorySize": 128,
+        "CodeSha256": "test",
+    }
+    func = {
+        "config": config,
+        "versions": {},
+        "aliases": {},
+    }
+    lsvc._functions.set_scoped(account_id, region, function_name, func)
+    return function_arn
+
+
+def _remove_region_scoped_lambda(function_name, region, account_id="000000000000"):
+    lsvc._functions.pop_scoped(account_id, region, function_name, None)
+
+
+def test_apigatewayv2_plain_lambda_name_uses_api_owner_region(monkeypatch):
+    """HTTP API plain-name integrations resolve in the API's owning Region."""
+    from ministack.services import apigateway as _apigw
+
+    account_id = "000000000000"
+    region = "us-west-2"
+    function_name = f"apigw-v2-plain-region-{_uuid_mod.uuid4().hex}"
+    expected_arn = _install_region_scoped_lambda(function_name, region, account_id)
+    original_account = get_account_id()
+    original_region = get_region()
+    captured = {}
+
+    def _fake_execute(exec_record, event):
+        captured["arn"] = exec_record["config"]["FunctionArn"]
+        return {"body": {"statusCode": 207, "headers": {}, "body": "v2-ok"}}
+
+    monkeypatch.setattr(lsvc, "_execute_function_with_config_scope", _fake_execute)
+    set_request_account_id(account_id)
+    set_request_region("us-east-1")
+    try:
+        status, _headers, body = asyncio.run(_apigw._invoke_lambda_proxy(
+            {"integrationUri": function_name},
+            "api123",
+            "$default",
+            "/test",
+            "GET",
+            {},
+            b"",
+            {},
+            owner_account_id=account_id,
+            owner_region=region,
+        ))
+        assert status == 207
+        assert body == b"v2-ok"
+        assert captured["arn"] == expected_arn
+    finally:
+        _remove_region_scoped_lambda(function_name, region, account_id)
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
+def test_apigatewayv1_plain_lambda_name_uses_api_owner_region(monkeypatch):
+    """REST API plain-name integrations resolve in the API's owning Region."""
+    from ministack.services import apigateway_v1 as _apigw_v1
+
+    account_id = "000000000000"
+    region = "us-west-2"
+    function_name = f"apigw-v1-plain-region-{_uuid_mod.uuid4().hex}"
+    expected_arn = _install_region_scoped_lambda(function_name, region, account_id)
+    original_account = get_account_id()
+    original_region = get_region()
+    captured = {}
+
+    def _fake_execute(exec_record, event):
+        captured["arn"] = exec_record["config"]["FunctionArn"]
+        return {"body": {"statusCode": 208, "headers": {}, "body": "v1-ok"}}
+
+    monkeypatch.setattr(lsvc, "_execute_function_with_config_scope", _fake_execute)
+    set_request_account_id(account_id)
+    set_request_region("us-east-1")
+    try:
+        status, _headers, body = asyncio.run(_apigw_v1._invoke_lambda_proxy_v1(
+            {"uri": function_name},
+            "rest123",
+            "prod",
+            {"variables": {}},
+            {"id": "resource123", "path": "/test"},
+            "/test",
+            "GET",
+            {},
+            b"",
+            {},
+            {},
+            owner_account_id=account_id,
+            owner_region=region,
+        ))
+        assert status == 208
+        assert body == b"v1-ok"
+        assert captured["arn"] == expected_arn
+    finally:
+        _remove_region_scoped_lambda(function_name, region, account_id)
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
+def test_alb_plain_lambda_target_uses_target_group_region(monkeypatch):
+    """ALB Lambda target names resolve in the target group's owning Region."""
+    from ministack.services import alb as _alb
+
+    account_id = "000000000000"
+    region = "us-west-2"
+    function_name = f"alb-plain-region-{_uuid_mod.uuid4().hex}"
+    expected_arn = _install_region_scoped_lambda(function_name, region, account_id)
+    target_group_arn = f"arn:aws:elasticloadbalancing:{region}:{account_id}:targetgroup/test/abc123"
+    original_account = get_account_id()
+    original_region = get_region()
+    captured = {}
+
+    def _fake_execute(exec_record, event):
+        captured["arn"] = exec_record["config"]["FunctionArn"]
+        return {"body": {"statusCode": 209, "headers": {}, "body": "alb-ok"}}
+
+    monkeypatch.setattr(lsvc, "_execute_function_with_config_scope", _fake_execute)
+    monkeypatch.setattr(lsvc, "_emit_lambda_metrics", lambda *args, **kwargs: None)
+    set_request_account_id(account_id)
+    set_request_region("us-east-1")
+    try:
+        status, _headers, body = asyncio.run(_alb._invoke_lambda_target(
+            function_name,
+            target_group_arn,
+            "GET",
+            "/test",
+            {},
+            b"",
+            {},
+        ))
+        assert status == 209
+        assert body == b"alb-ok"
+        assert captured["arn"] == expected_arn
+    finally:
+        _remove_region_scoped_lambda(function_name, region, account_id)
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
+def test_lambda_runtime_env_vars_filters_reserved_scope_values():
+    env = lsvc._runtime_env_vars({
+        "Environment": {
+            "Variables": {
+                "AWS_REGION": "us-west-2",
+                "AWS_DEFAULT_REGION": "us-west-2",
+                "AWS_ACCESS_KEY_ID": "999999999999",
+                "AWS_SECRET_ACCESS_KEY": "not-used",
+                "AWS_ENDPOINT_URL": "http://example.com",
+                "CUSTOM_VAR": "kept",
+            }
+        }
+    })
+
+    assert env == {
+        "AWS_ENDPOINT_URL": "http://example.com",
+        "CUSTOM_VAR": "kept",
+    }
+
+
+def test_lambda_sqs_poller_does_not_tail_match_foreign_region_event_source(monkeypatch):
+    import ministack.services.sqs as _sqs
+
+    original_account = get_account_id()
+    original_region = get_region()
+    original_functions = dict(lsvc._functions._data)
+    original_esms = dict(lsvc._esms._data)
+    original_queues = dict(_sqs._queues._data)
+    called = {"value": False}
+
+    def _unexpected_invoke(_func, _event):
+        called["value"] = True
+        return {"error": False, "body": {}}
+
+    try:
+        set_request_account_id("000000000000")
+        set_request_region("us-east-1")
+        lsvc._functions.clear()
+        lsvc._esms.clear()
+        _sqs._queues.clear()
+
+        queue_name = "esm-runtime-region-guard"
+        queue_url = f"http://localhost:4566/000000000000/{queue_name}"
+        _sqs._queues[queue_url] = {
+            "name": queue_name,
+            "messages": [{
+                "id": "msg-1",
+                "body": "payload",
+                "md5_body": "",
+                "receipt_handle": "rh-1",
+                "sent_at": time.time(),
+                "visible_at": 0,
+                "receive_count": 0,
+                "first_receive_at": None,
+                "message_attributes": {},
+            }],
+            "attributes": {"QueueArn": f"arn:aws:sqs:us-east-1:000000000000:{queue_name}"},
+            "is_fifo": False,
+            "dedup_cache": {},
+            "fifo_seq": 0,
+        }
+        lsvc._functions["esm-runtime-region-guard-fn"] = {
+            "config": {
+                "FunctionName": "esm-runtime-region-guard-fn",
+                "FunctionArn": "arn:aws:lambda:us-east-1:000000000000:function:esm-runtime-region-guard-fn",
+            },
+            "versions": {},
+            "aliases": {},
+        }
+        lsvc._esms["esm-runtime-region-guard"] = {
+            "UUID": "esm-runtime-region-guard",
+            "EventSourceArn": f"arn:aws:sqs:us-west-2:000000000000:{queue_name}",
+            "FunctionName": "esm-runtime-region-guard-fn",
+            "State": "Enabled",
+            "Enabled": True,
+            "BatchSize": 1,
+        }
+        monkeypatch.setattr(lsvc, "_execute_function", _unexpected_invoke)
+
+        lsvc._poll_sqs()
+
+        assert called["value"] is False
+        assert len(_sqs._queues[queue_url]["messages"]) == 1
+    finally:
+        lsvc._functions.clear()
+        lsvc._functions._data.update(original_functions)
+        lsvc._esms.clear()
+        lsvc._esms._data.update(original_esms)
+        _sqs._queues.clear()
+        _sqs._queues._data.update(original_queues)
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
+def test_lambda_create_esm_rejects_unresolved_function_arn():
+    original_account = get_account_id()
+    original_region = get_region()
+    original_functions = dict(lsvc._functions._data)
+    original_esms = dict(lsvc._esms._data)
+    west_arn = "arn:aws:lambda:us-west-2:000000000000:function:esm-west-fn"
+
+    try:
+        lsvc._functions.clear()
+        lsvc._esms.clear()
+        lsvc._functions.set_scoped(
+            "000000000000",
+            "us-west-2",
+            "esm-west-fn",
+            {"config": {"FunctionName": "esm-west-fn", "FunctionArn": west_arn}, "versions": {}},
+        )
+        set_request_account_id("000000000000")
+        set_request_region("us-east-1")
+
+        status, _headers, body = lsvc._create_esm({
+            "EventSourceArn": "arn:aws:sqs:us-east-1:000000000000:source",
+            "FunctionName": west_arn,
+        })
+
+        assert status == 404
+        assert json.loads(body)["__type"] == "ResourceNotFoundException"
+        assert not lsvc._esms.values()
+    finally:
+        lsvc._functions.clear()
+        lsvc._functions._data.update(original_functions)
+        lsvc._esms.clear()
+        lsvc._esms._data.update(original_esms)
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
+def test_lambda_update_esm_rejects_unresolved_function_arn():
+    original_account = get_account_id()
+    original_region = get_region()
+    original_functions = dict(lsvc._functions._data)
+    original_esms = dict(lsvc._esms._data)
+    east_arn = "arn:aws:lambda:us-east-1:000000000000:function:esm-east-fn"
+    west_arn = "arn:aws:lambda:us-west-2:000000000000:function:esm-west-fn"
+
+    try:
+        lsvc._functions.clear()
+        lsvc._esms.clear()
+        lsvc._functions.set_scoped(
+            "000000000000",
+            "us-east-1",
+            "esm-east-fn",
+            {"config": {"FunctionName": "esm-east-fn", "FunctionArn": east_arn}, "versions": {}},
+        )
+        lsvc._functions.set_scoped(
+            "000000000000",
+            "us-west-2",
+            "esm-west-fn",
+            {"config": {"FunctionName": "esm-west-fn", "FunctionArn": west_arn}, "versions": {}},
+        )
+        set_request_account_id("000000000000")
+        set_request_region("us-east-1")
+        lsvc._esms["esm-1"] = {
+            "UUID": "esm-1",
+            "EventSourceArn": "arn:aws:sqs:us-east-1:000000000000:source",
+            "FunctionArn": east_arn,
+            "FunctionName": "esm-east-fn",
+            "Qualifier": None,
+            "State": "Enabled",
+            "Enabled": True,
+        }
+
+        status, _headers, body = lsvc._update_esm("esm-1", {"FunctionName": west_arn})
+
+        assert status == 404
+        assert json.loads(body)["__type"] == "ResourceNotFoundException"
+        assert lsvc._esms["esm-1"]["FunctionArn"] == east_arn
+        assert lsvc._esms["esm-1"]["FunctionName"] == "esm-east-fn"
+    finally:
+        lsvc._functions.clear()
+        lsvc._functions._data.update(original_functions)
+        lsvc._esms.clear()
+        lsvc._esms._data.update(original_esms)
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
 # ──────────────────────────────── pool key ──────────────────────────────────
+
+def _pool_config(account_id: str, function_name: str = "fn", **overrides):
+    config = {
+        "FunctionArn": f"arn:aws:lambda:us-east-1:{account_id}:function:{function_name}",
+    }
+    config.update(overrides)
+    return config
+
 
 def test_pool_key_scopes_by_account():
     """Same function in two accounts → two distinct keys → two distinct pools."""
     set_request_account_id("111111111111")
-    k_a = lsvc._warm_pool_key("fn", {"CodeSha256": "abc"})
+    k_a = lsvc._warm_pool_key("fn", _pool_config("111111111111", CodeSha256="abc"))
     set_request_account_id("222222222222")
-    k_b = lsvc._warm_pool_key("fn", {"CodeSha256": "abc"})
+    k_b = lsvc._warm_pool_key("fn", _pool_config("222222222222", CodeSha256="abc"))
     assert k_a != k_b
     assert k_a.startswith("111111111111:")
     assert k_b.startswith("222222222222:")
@@ -2493,8 +3235,8 @@ def test_pool_key_scopes_by_account():
 
 def test_pool_key_differs_by_package_type():
     set_request_account_id("111111111111")
-    k_zip = lsvc._warm_pool_key("fn", {"CodeSha256": "abc"})
-    k_img = lsvc._warm_pool_key("fn", {"PackageType": "Image", "ImageUri": "my/img:v1"})
+    k_zip = lsvc._warm_pool_key("fn", _pool_config("111111111111", CodeSha256="abc"))
+    k_img = lsvc._warm_pool_key("fn", _pool_config("111111111111", PackageType="Image", ImageUri="my/img:v1"))
     assert k_zip != k_img
     assert ":zip:" in k_zip
     assert ":image:" in k_img
@@ -2503,15 +3245,15 @@ def test_pool_key_differs_by_package_type():
 def test_pool_key_differs_by_code_sha():
     """Code update → new key → cold start (doesn't accidentally reuse old container)."""
     set_request_account_id("111111111111")
-    k1 = lsvc._warm_pool_key("fn", {"CodeSha256": "sha-v1"})
-    k2 = lsvc._warm_pool_key("fn", {"CodeSha256": "sha-v2"})
+    k1 = lsvc._warm_pool_key("fn", _pool_config("111111111111", CodeSha256="sha-v1"))
+    k2 = lsvc._warm_pool_key("fn", _pool_config("111111111111", CodeSha256="sha-v2"))
     assert k1 != k2
 
 
 def test_pool_key_differs_by_image_uri():
     set_request_account_id("111111111111")
-    k1 = lsvc._warm_pool_key("fn", {"PackageType": "Image", "ImageUri": "img:v1"})
-    k2 = lsvc._warm_pool_key("fn", {"PackageType": "Image", "ImageUri": "img:v2"})
+    k1 = lsvc._warm_pool_key("fn", _pool_config("111111111111", PackageType="Image", ImageUri="img:v1"))
+    k2 = lsvc._warm_pool_key("fn", _pool_config("111111111111", PackageType="Image", ImageUri="img:v2"))
     assert k1 != k2
 
 
@@ -2654,13 +3396,13 @@ def test_pool_clear_all_kills_everything():
 def test_two_accounts_get_independent_pools():
     """Invocations in account A must not pick up account B's containers."""
     set_request_account_id("111111111111")
-    k_a = lsvc._warm_pool_key("fn", {"CodeSha256": "sha"})
+    k_a = lsvc._warm_pool_key("fn", _pool_config("111111111111", CodeSha256="sha"))
     c_a = _mk_container()
     e_a = lsvc._pool_register(k_a, c_a, tmpdir=None)
     lsvc._pool_release(e_a)
 
     set_request_account_id("222222222222")
-    k_b = lsvc._warm_pool_key("fn", {"CodeSha256": "sha"})
+    k_b = lsvc._warm_pool_key("fn", _pool_config("222222222222", CodeSha256="sha"))
     assert k_a != k_b
 
     entry, reason = lsvc._pool_acquire(k_b, max_concurrency=None)
@@ -2689,7 +3431,11 @@ def test_throttle_response_shape_matches_aws():
 def test_route_async_failure_to_sqs_dlq():
     """Async invoke final failure routes an AWS-shaped envelope to the SQS DLQ."""
     import ministack.services.sqs as _sqs
+
+    original_account = get_account_id()
+    original_region = get_region()
     set_request_account_id("000000000000")
+    set_request_region("us-east-1")
     # Create a queue directly in the internal state
     url = "http://localhost:4566/000000000000/dlq-test"
     arn = "arn:aws:sqs:us-east-1:000000000000:dlq-test"
@@ -2714,12 +3460,46 @@ def test_route_async_failure_to_sqs_dlq():
         assert envelope["responsePayload"]["errorMessage"] == "boom"
     finally:
         _sqs._queues.pop(url, None)
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
+def test_route_async_failure_to_sqs_does_not_tail_match_foreign_region():
+    """A stale foreign-Region target ARN must not route to a same-named local queue."""
+    import ministack.services.sqs as _sqs
+
+    original_account = get_account_id()
+    original_region = get_region()
+    set_request_account_id("000000000000")
+    set_request_region("us-east-1")
+    url = "http://localhost:4566/000000000000/dlq-region-guard"
+    arn = "arn:aws:sqs:us-east-1:000000000000:dlq-region-guard"
+    _sqs._queues[url] = {
+        "messages": [], "attributes": {"QueueArn": arn},
+        "is_fifo": False, "dedup_cache": {}, "fifo_seq": 0,
+    }
+    try:
+        lsvc._route_async_failure(
+            target_arn="arn:aws:sqs:us-west-2:000000000000:dlq-region-guard",
+            func_name="doesnt-matter",
+            event={"input": "hi"},
+            result={"error": True, "body": {}},
+        )
+        assert _sqs._queues[url]["messages"] == []
+    finally:
+        _sqs._queues.pop(url, None)
+        set_request_account_id(original_account)
+        set_request_region(original_region)
 
 
 def test_route_async_failure_to_sns_topic():
     """Async invoke final failure can target an SNS topic (OnFailure destination)."""
     import ministack.services.sns as _sns
+
+    original_account = get_account_id()
+    original_region = get_region()
     set_request_account_id("000000000000")
+    set_request_region("us-east-1")
     arn = "arn:aws:sns:us-east-1:000000000000:async-fail"
     _sns._topics[arn] = {
         "arn": arn, "name": "async-fail",
@@ -2748,16 +3528,25 @@ def test_route_async_failure_to_sns_topic():
             _sns._fanout = real_fanout
     finally:
         _sns._topics.pop(arn, None)
+        set_request_account_id(original_account)
+        set_request_region(original_region)
 
 
 def test_route_async_failure_unknown_target_logs_and_returns():
     """Unknown DLQ ARN must not raise — just logs."""
+    original_account = get_account_id()
+    original_region = get_region()
     set_request_account_id("000000000000")
+    set_request_region("us-east-1")
     # Should NOT raise
-    lsvc._route_async_failure(
-        target_arn="arn:aws:sqs:us-east-1:000000000000:does-not-exist",
-        func_name="x", event={}, result={"error": True, "body": {}},
-    )
+    try:
+        lsvc._route_async_failure(
+            target_arn="arn:aws:sqs:us-east-1:000000000000:does-not-exist",
+            func_name="x", event={}, result={"error": True, "body": {}},
+        )
+    finally:
+        set_request_account_id(original_account)
+        set_request_region(original_region)
 
 
 # ──────────────────── RIE result → function_error classification ────────────
@@ -3147,10 +3936,21 @@ def test_lambda_docker_flags_applied_to_run_kwargs(monkeypatch):
 
     lsvc._spawn_lambda_container(
         {"FunctionName": "test-fn", "Runtime": "python3.12", "Handler": "index.handler",
-         "PackageType": "Zip", "Timeout": 3, "MemorySize": 128},
+         "PackageType": "Zip", "Timeout": 3, "MemorySize": 128,
+         "FunctionArn": "arn:aws:lambda:us-east-1:000000000000:function:test-fn",
+         "Environment": {"Variables": {
+             "AWS_REGION": "us-west-2",
+             "AWS_DEFAULT_REGION": "us-west-2",
+             "AWS_ACCESS_KEY_ID": "999999999999",
+             "MY_VAR": "kept",
+         }}},
         code,
     )
 
+    assert captured["environment"]["AWS_REGION"] == "us-east-1"
+    assert captured["environment"]["AWS_DEFAULT_REGION"] == "us-east-1"
+    assert captured["environment"]["AWS_ACCESS_KEY_ID"] == "000000000000"
+    assert captured["environment"]["MY_VAR"] == "kept"
     assert captured["environment"]["SSL_CERT_FILE"] == "/opt/ca/ca.crt"
     assert captured["environment"]["NODE_EXTRA_CA_CERTS"] == "/opt/ca/ca.crt"
     ca_mount = [m for m in captured["mounts"] if m["Target"] == "/opt/ca"]
@@ -3304,7 +4104,7 @@ def test_account_context_another_non_default_account():
 
 
 # ---------------------------------------------------------------------------
-# Preservation Tests: Default account and explicit overrides unchanged
+# Preservation Tests: Default account works and reserved AWS env stays scoped.
 # ---------------------------------------------------------------------------
 
 
@@ -3337,9 +4137,9 @@ def test_account_context_default_account_still_works():
             pass
 
 
-def test_account_context_explicit_env_override_takes_precedence():
+def test_account_context_explicit_reserved_env_override_does_not_cross_scope():
     """Deploy a function with an explicit AWS_ACCESS_KEY_ID in Environment.Variables.
-    The explicit value should take precedence over the ARN-derived account."""
+    Lambda's reserved AWS env values should still come from the function ARN."""
     lam = _account_context_client("lambda", access_key="000000000001")
 
     func_name = "account-context-test-override"
@@ -3353,6 +4153,7 @@ def test_account_context_explicit_env_override_takes_precedence():
             Environment={
                 "Variables": {
                     "AWS_ACCESS_KEY_ID": "999999999999",
+                    "AWS_REGION": "us-west-2",
                 }
             },
         )
@@ -3360,9 +4161,13 @@ def test_account_context_explicit_env_override_takes_precedence():
         resp = lam.invoke(FunctionName=func_name, Payload=json.dumps({}))
         payload = json.loads(resp["Payload"].read())
 
-        assert payload["aws_access_key_id"] == "999999999999", (
-            f"Expected AWS_ACCESS_KEY_ID='999999999999' (explicit override), "
+        assert payload["aws_access_key_id"] == "000000000001", (
+            f"Expected AWS_ACCESS_KEY_ID='000000000001' (from ARN), "
             f"got '{payload['aws_access_key_id']}'"
+        )
+        assert payload["aws_region"] == _ACCOUNT_CONTEXT_REGION, (
+            f"Expected AWS_REGION='{_ACCOUNT_CONTEXT_REGION}' (from ARN), "
+            f"got '{payload['aws_region']}'"
         )
     finally:
         try:

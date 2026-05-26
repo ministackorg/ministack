@@ -590,11 +590,24 @@ def _handle_lambda_download_request(path: str, method: str):
     """Serve MiniStack's Lambda layer and function-code download endpoints."""
     if path.startswith("/_ministack/lambda-layers/") and method == "GET":
         path_parts = path.split("/")
+        if len(path_parts) >= 8 and path_parts[7] == "content" and path_parts[6].isdigit():
+            return _get_module("lambda_svc").serve_layer_content(
+                path_parts[5],
+                int(path_parts[6]),
+                account_id=path_parts[3],
+                region=path_parts[4],
+            )
         if len(path_parts) >= 6 and path_parts[5] == "content" and path_parts[4].isdigit():
             return _get_module("lambda_svc").serve_layer_content(path_parts[3], int(path_parts[4]))
 
     if path.startswith("/_ministack/lambda-code/") and method == "GET":
         path_parts = path.split("/")
+        if len(path_parts) >= 6:
+            return _get_module("lambda_svc").serve_function_code(
+                path_parts[5],
+                account_id=path_parts[3],
+                region=path_parts[4],
+            )
         if len(path_parts) >= 4:
             return _get_module("lambda_svc").serve_function_code(path_parts[3])
     return None
