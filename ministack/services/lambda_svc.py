@@ -2775,7 +2775,7 @@ def _execute_function_warm(func: dict, event: dict) -> dict:
                     "errorType": error_type,
                 },
                 "error": True,
-                "log": result.get("trace", result.get("error", "")),
+                "log": "\n".join(filter(None, [result.get("log", ""), result.get("trace", result.get("error", ""))])),
             }
     except Exception as e:
         logger.error("Warm worker execution error for %s: %s", func_name, e)

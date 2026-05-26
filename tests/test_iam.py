@@ -199,12 +199,84 @@ def test_iam_list_role_policies(iam):
     assert "inline-logs" in resp["PolicyNames"]
 
 def test_iam_create_access_key(iam):
-    resp = iam.create_access_key(UserName="iam-test-user")
-    key = resp["AccessKey"]
-    assert key["UserName"] == "iam-test-user"
-    assert key["AccessKeyId"].startswith("AKIA")
-    assert len(key["SecretAccessKey"]) > 0
-    assert key["Status"] == "Active"
+    username = f"create-key-user-{_uuid_mod.uuid4().hex[:8]}"
+    iam.create_user(UserName=username)
+    try:
+        resp = iam.create_access_key(UserName=username)
+        key = resp["AccessKey"]
+        assert key["UserName"] == username
+        assert key["AccessKeyId"].startswith("AKIA")
+        assert len(key["SecretAccessKey"]) > 0
+        assert key["Status"] == "Active"
+    finally:
+        keys = iam.list_access_keys(UserName=username)["AccessKeyMetadata"]
+        for k in keys:
+            iam.delete_access_key(AccessKeyId=k["AccessKeyId"])
+        iam.delete_user(UserName=username)
+
+
+def test_iam_update_access_key(iam):
+    username = f"upd-key-user-{_uuid_mod.uuid4().hex[:8]}"
+    iam.create_user(UserName=username)
+    resp = iam.create_access_key(UserName=username)
+    key_id = resp["AccessKey"]["AccessKeyId"]
+    try:
+        iam.update_access_key(UserName=username, AccessKeyId=key_id, Status="Inactive")
+        keys = iam.list_access_keys(UserName=username)["AccessKeyMetadata"]
+        found = next(k for k in keys if k["AccessKeyId"] == key_id)
+        assert found["Status"] == "Inactive"
+
+        iam.update_access_key(UserName=username, AccessKeyId=key_id, Status="Active")
+        keys = iam.list_access_keys(UserName=username)["AccessKeyMetadata"]
+        found = next(k for k in keys if k["AccessKeyId"] == key_id)
+        assert found["Status"] == "Active"
+    finally:
+        iam.delete_access_key(AccessKeyId=key_id)
+        iam.delete_user(UserName=username)
+
+
+def test_iam_update_access_key_not_found(iam):
+    with pytest.raises(ClientError) as exc:
+        iam.update_access_key(AccessKeyId="AKIAIOSFODNN7EXAMPLE", Status="Inactive")
+    assert exc.value.response["Error"]["Code"] == "NoSuchEntity"
+
+
+def test_iam_update_access_key_invalid_status(iam):
+    username = f"inv-status-user-{_uuid_mod.uuid4().hex[:8]}"
+    iam.create_user(UserName=username)
+    resp = iam.create_access_key(UserName=username)
+    key_id = resp["AccessKey"]["AccessKeyId"]
+    try:
+        with pytest.raises(ClientError) as exc:
+            iam.update_access_key(AccessKeyId=key_id, Status="Disabled")
+        assert exc.value.response["Error"]["Code"] == "InvalidInput"
+    finally:
+        iam.delete_access_key(AccessKeyId=key_id)
+        iam.delete_user(UserName=username)
+
+
+def test_iam_get_access_key_last_used(iam):
+    username = f"key-last-used-{_uuid_mod.uuid4().hex[:8]}"
+    iam.create_user(UserName=username)
+    resp = iam.create_access_key(UserName=username)
+    key_id = resp["AccessKey"]["AccessKeyId"]
+    try:
+        result = iam.get_access_key_last_used(AccessKeyId=key_id)
+        assert result["UserName"] == username
+        last_used = result["AccessKeyLastUsed"]
+        assert last_used["Region"] == "N/A"
+        assert last_used["ServiceName"] == "N/A"
+        assert "LastUsedDate" not in last_used
+    finally:
+        iam.delete_access_key(AccessKeyId=key_id)
+        iam.delete_user(UserName=username)
+
+
+def test_iam_get_access_key_last_used_not_found(iam):
+    with pytest.raises(ClientError) as exc:
+        iam.get_access_key_last_used(AccessKeyId="AKIAIOSFODNN7EXAMPLE")
+    assert exc.value.response["Error"]["Code"] == "NoSuchEntity"
+
 
 def test_iam_instance_profile(iam):
     assume = json.dumps({"Version": "2012-10-17", "Statement": []})
