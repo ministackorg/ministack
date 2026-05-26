@@ -7,13 +7,17 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
-## [Unreleased]
+## [1.3.50] — 2026-05-26
+
+### Added
+- **S3 Tables (`s3tables`)** — new service emulator for the AWS S3 Tables API: table buckets, namespaces, and Iceberg-format tables. Control plane covers `CreateTableBucket`, `ListTableBuckets`, `GetTableBucket`, `DeleteTableBucket`, `CreateNamespace`, `ListNamespaces`, `GetNamespace`, `DeleteNamespace`, `CreateTable`, `ListTables`, `GetTable`, `DeleteTable`, `GetTableMetadataLocation`, `UpdateTableMetadataLocation`. Ships with an embedded **Iceberg REST catalog** at `/iceberg` so Spark jobs configured with `spark.sql.catalog.*.type=rest` and `spark.sql.catalog.*.uri=http://<ministack>/iceberg` can create, load, and commit Iceberg tables without an external catalog server. Data files land in MiniStack's S3 service; table metadata (schemas, snapshots, manifests) lives in memory.
+- **Glue Spark jobs run on the official `amazon/aws-glue-libs` PySpark image** — `GlueVersion: 4.0` and `3.0` map to their canonical AWS Glue images (`glue_libs_4.0.0_image_01` / `glue_libs_3.0.0_image_01`); override the image via `GLUE_DOCKER_IMAGE`. Job containers run on MiniStack's Docker network so they reach S3, RDS, and other ministack services by container hostname.
+- **IAM `UpdateAccessKey`** — enables toggling an access key between `Active` and `Inactive`, matching the two statuses the real AWS API accepts. Optional `UserName` is validated when provided. Contributed by @lahmish.
+- **IAM `GetAccessKeyLastUsed`** — returns the AWS "never used" shape (`Region`/`ServiceName` = `N/A`, no `LastUsedDate`) since MiniStack does not track per-key usage history. Contributed by @lahmish.
 
 ### Fixed
-- **EC2 `CreateVpcEndpoint` and `CreateFlowLogs` now persist `TagSpecifications`** — tags passed at creation time were silently dropped. Tags are now stored, returned by `DescribeFlowLogs`, and cleaned up on `DeleteFlowLogs`. The `fl-` prefix is also registered in the resource-type guesser so flow-log IDs are correctly resolved by the Resource Groups Tagging API.
-### Added
-- **IAM `UpdateAccessKey`** — enables toggling an access key between `Active` and `Inactive`, matching the two statuses the real AWS API accepts. Optional `UserName` is validated when provided.
-- **IAM `GetAccessKeyLastUsed`** — returns the AWS "never used" shape (`Region`/`ServiceName` = `N/A`, no `LastUsedDate`) since MiniStack does not track per-key usage history.
+- **Lambda invocation log includes user output alongside the traceback on error** — when a handler raised after printing, the response log dropped the user output and only returned the traceback. Both are now returned, newline-separated, matching real Lambda CloudWatch Logs output. Contributed by @Baptiste-Garcin.
+- **EC2 `CreateVpcEndpoint` and `CreateFlowLogs` now persist `TagSpecifications`** — tags passed at creation time were silently dropped. Tags are now stored, returned by `DescribeFlowLogs`, and cleaned up on `DeleteFlowLogs`. The `fl-` prefix is also registered in the resource-type guesser so flow-log IDs are correctly resolved by the Resource Groups Tagging API. Contributed by @lahmish.
 
 ---
 

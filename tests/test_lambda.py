@@ -598,6 +598,45 @@ def test_lambda_warm_start(lam, apigw):
     apigw.delete_api(ApiId=api_id)
     lam.delete_function(FunctionName=fname)
 
+def test_lambda_invoke_log_includes_user_output_and_traceback_on_error(lam):
+    """When a handler prints then raises, the decoded LogResult tail must contain
+    BOTH the user output AND the exception traceback. Regression for the
+    error-path log drop where only the traceback was returned."""
+    fname = f"lam-log-err-{_uuid_mod.uuid4().hex[:8]}"
+    code = (
+        "def handler(event, context):\n"
+        "    print('user-step-1')\n"
+        "    print('user-step-2')\n"
+        "    raise ValueError('boom-from-handler')\n"
+    )
+
+    lam.create_function(
+        FunctionName=fname,
+        Runtime="python3.12",
+        Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _make_zip(code)},
+    )
+
+    try:
+        import base64 as _b64
+        resp = lam.invoke(
+            FunctionName=fname,
+            Payload=json.dumps({}),
+            LogType="Tail",
+        )
+        assert resp.get("FunctionError") == "Unhandled"
+        log_b64 = resp.get("LogResult", "")
+        assert log_b64, "LogResult should be present when LogType=Tail"
+        decoded = _b64.b64decode(log_b64).decode("utf-8", errors="replace")
+        assert "user-step-1" in decoded, f"user print missing from log: {decoded!r}"
+        assert "user-step-2" in decoded, f"second user print missing from log: {decoded!r}"
+        assert "ValueError" in decoded or "boom-from-handler" in decoded, \
+            f"traceback missing from log: {decoded!r}"
+    finally:
+        lam.delete_function(FunctionName=fname)
+
+
 def test_lambda_warm_invoke_with_stderr_logging(lam):
     """Warm invoke should succeed repeatedly even when the worker writes to stderr."""
     fname = f"lam-warm-stderr-{_uuid_mod.uuid4().hex[:8]}"

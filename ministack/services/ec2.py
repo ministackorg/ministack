@@ -1516,6 +1516,7 @@ def _delete_vpc_endpoints(p):
     ids = _parse_member_list(p, "VpcEndpointId")
     for vpce_id in ids:
         _vpc_endpoints.pop(vpce_id, None)
+        _tags.pop(vpce_id, None)
     return _xml(200, "DeleteVpcEndpointsResponse", "<unsuccessful/>")
 
 
