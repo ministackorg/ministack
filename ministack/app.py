@@ -309,6 +309,7 @@ SERVICE_REGISTRY = {
     "cloudtrail": {"module": "cloudtrail"},
     "cur": {"module": "cur"},
     "inspector2": {"module": "inspector2"},
+    "s3tables": {"module": "s3tables"},
 }
 
 SERVICE_HANDLERS = {
@@ -345,6 +346,7 @@ _state_map = {
     "resource_groups": "resource_groups",
     "cloudtrail": "cloudtrail", "iot": "iot",
     "inspector2": "inspector2",
+    "s3tables": "s3tables",
 }
 
 SERVICE_NAME_ALIASES = {
@@ -1259,6 +1261,13 @@ async def _handle_special_data_plane_request(
     request_id: str,
 ):
     """Handle special-case service entrypoints before the generic router."""
+    # Iceberg REST catalog — route /iceberg/* to s3tables service
+    if path.startswith("/iceberg"):
+        try:
+            return await _get_module("s3tables").handle_request(method, path, headers, body, query_params)
+        except Exception as e:
+            logger.exception("Error in Iceberg REST catalog: %s", e)
+            return 500, {"Content-Type": "application/json"}, json.dumps({"error": str(e)}).encode()
     if response := await _handle_s3_control_request(path, method, body, query_params, request_id):
         return response
     if response := await _handle_rds_data_request(method, path, headers, body, query_params):
