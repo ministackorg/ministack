@@ -1341,6 +1341,7 @@ def test_eventbridge_log_config_round_trip(eb):
 # ---------------------------------------------------------------------------
 
 import pytest as _pytest
+
 from ministack.services import eventbridge as _eb
 
 
@@ -1435,6 +1436,36 @@ def test_scheduler_fires_after_interval(isolated_scheduler):
     assert target_arg["Id"] == "t1"
 
 
+def test_scheduler_restores_rule_region_while_dispatching(isolated_scheduler):
+    from ministack.core.responses import get_region, set_request_region
+
+    original_region = get_region()
+    observed = []
+    try:
+        set_request_region("us-east-1")
+        _seed_rule()
+        _eb._rules._data[_STATE_KEY]["Arn"] = (
+            "arn:aws:events:us-west-2:000000000000:rule/unit-test-rule"
+        )
+        _eb._targets._data[_STATE_KEY] = [
+            {
+                "Id": "sfn",
+                "Arn": "arn:aws:states:us-west-2:000000000000:stateMachine:scheduled",
+            }
+        ]
+        _eb._rule_last_fired[_STATE_KEY] = _eb._now_ts() - 65
+        isolated_scheduler.side_effect = (
+            lambda _target, event, _rule: observed.append((_eb.get_region(), event["Region"]))
+        )
+
+        _eb._tick_scheduled_rules()
+
+        assert observed == [("us-west-2", "us-west-2")]
+        assert get_region() == "us-east-1"
+    finally:
+        set_request_region(original_region)
+
+
 def test_scheduler_skips_rule_before_interval(isolated_scheduler):
     """Tick must NOT dispatch when interval hasn't elapsed."""
     _seed_rule()
@@ -1479,7 +1510,8 @@ def test_scheduler_parse_cron_fields_validity(expr, valid):
 
 def test_scheduler_cron_next_fire_same_day():
     """cron(0 12 * * ? *): next noon after 11:00 is 12:00 same day."""
-    from datetime import datetime as _dt, timezone as _tz
+    from datetime import datetime as _dt
+    from datetime import timezone as _tz
     fields = _eb._parse_cron_fields("cron(0 12 * * ? *)")
     after = _dt(2024, 1, 1, 11, 0, tzinfo=_tz.utc)
     assert _eb._cron_next_fire(fields, after) == _dt(2024, 1, 1, 12, 0, tzinfo=_tz.utc)
@@ -1487,7 +1519,8 @@ def test_scheduler_cron_next_fire_same_day():
 
 def test_scheduler_cron_next_fire_wraps_to_next_day():
     """cron(0 12 * * ? *): after noon, next occurrence is noon tomorrow."""
-    from datetime import datetime as _dt, timezone as _tz
+    from datetime import datetime as _dt
+    from datetime import timezone as _tz
     fields = _eb._parse_cron_fields("cron(0 12 * * ? *)")
     after = _dt(2024, 1, 1, 12, 0, tzinfo=_tz.utc)
     assert _eb._cron_next_fire(fields, after) == _dt(2024, 1, 2, 12, 0, tzinfo=_tz.utc)
@@ -1495,7 +1528,8 @@ def test_scheduler_cron_next_fire_wraps_to_next_day():
 
 def test_scheduler_cron_next_fire_weekday():
     """cron(0 0 ? * MON-FRI *): after Friday 23:00, next is Monday 00:00."""
-    from datetime import datetime as _dt, timezone as _tz
+    from datetime import datetime as _dt
+    from datetime import timezone as _tz
     fields = _eb._parse_cron_fields("cron(0 0 ? * MON-FRI *)")
     after = _dt(2024, 1, 5, 23, 0, tzinfo=_tz.utc)   # Friday
     assert _eb._cron_next_fire(fields, after) == _dt(2024, 1, 8, 0, 0, tzinfo=_tz.utc)  # Monday
@@ -1529,7 +1563,8 @@ def test_scheduler_cron_skips_before_scheduled_time(isolated_scheduler):
 
 def test_scheduler_cron_last_day_of_month():
     """cron(0 0 L * ? *): next fire after Jan 30 is Jan 31 (last day)."""
-    from datetime import datetime as _dt, timezone as _tz
+    from datetime import datetime as _dt
+    from datetime import timezone as _tz
     fields = _eb._parse_cron_fields("cron(0 0 L * ? *)")
     after = _dt(2024, 1, 30, 12, 0, tzinfo=_tz.utc)
     # Jan has 31 days
@@ -1541,7 +1576,8 @@ def test_scheduler_cron_last_day_of_month():
 
 def test_scheduler_cron_last_weekday_of_month():
     """cron(0 0 LW * ? *): last Mon-Fri of the month."""
-    from datetime import datetime as _dt, timezone as _tz
+    from datetime import datetime as _dt
+    from datetime import timezone as _tz
     fields = _eb._parse_cron_fields("cron(0 0 LW * ? *)")
     # March 2024: 31st = Sunday → last weekday is Fri Mar 29.
     after = _dt(2024, 3, 1, 0, 0, tzinfo=_tz.utc)
@@ -1550,7 +1586,8 @@ def test_scheduler_cron_last_weekday_of_month():
 
 def test_scheduler_cron_nearest_weekday():
     """cron(0 12 15W * ? *): nearest Mon-Fri to the 15th, never crossing month."""
-    from datetime import datetime as _dt, timezone as _tz
+    from datetime import datetime as _dt
+    from datetime import timezone as _tz
     fields = _eb._parse_cron_fields("cron(0 12 15W * ? *)")
     # Jan 15 2024 = Monday → fires on the 15th itself.
     assert _eb._cron_next_fire(fields, _dt(2024, 1, 14, 0, 0, tzinfo=_tz.utc)) == _dt(2024, 1, 15, 12, 0, tzinfo=_tz.utc)
@@ -1562,7 +1599,8 @@ def test_scheduler_cron_nearest_weekday():
 
 def test_scheduler_cron_last_dow_of_month():
     """cron(0 12 ? * 6L *): last Friday of the month (AWS Friday = 6)."""
-    from datetime import datetime as _dt, timezone as _tz
+    from datetime import datetime as _dt
+    from datetime import timezone as _tz
     fields = _eb._parse_cron_fields("cron(0 12 ? * 6L *)")
     # Jan 2024: Fridays are 5, 12, 19, 26 → last is Fri Jan 26.
     assert _eb._cron_next_fire(fields, _dt(2024, 1, 1, 0, 0, tzinfo=_tz.utc)) == _dt(2024, 1, 26, 12, 0, tzinfo=_tz.utc)
@@ -1572,7 +1610,8 @@ def test_scheduler_cron_last_dow_of_month():
 
 def test_scheduler_cron_nth_dow_of_month():
     """cron(0 9 ? * 2#1 *): first Monday of every month (AWS Monday = 2)."""
-    from datetime import datetime as _dt, timezone as _tz
+    from datetime import datetime as _dt
+    from datetime import timezone as _tz
     fields = _eb._parse_cron_fields("cron(0 9 ? * 2#1 *)")
     # Jan 2024: Mondays are 1, 8, 15, 22, 29 → 1st Monday = Jan 1.
     assert _eb._cron_next_fire(fields, _dt(2023, 12, 31, 0, 0, tzinfo=_tz.utc)) == _dt(2024, 1, 1, 9, 0, tzinfo=_tz.utc)

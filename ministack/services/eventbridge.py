@@ -32,6 +32,7 @@ import threading
 import time
 from datetime import datetime, timedelta, timezone
 
+from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.responses import (
     AccountScopedDict,
     error_response_json,
@@ -40,6 +41,7 @@ from ministack.core.responses import (
     json_response,
     new_uuid,
     set_request_account_id,
+    set_request_region,
 )
 
 logger = logging.getLogger("events")
@@ -2154,28 +2156,54 @@ def _tick_scheduled_rules():
         targets = _targets._data.get((account_id, rule_key), [])
         if not targets:
             continue
-        # Set the account context so ARN-building and Lambda dispatch use the
-        # correct account for this rule's tenant.
+        try:
+            rule_arn = parse_arn(rule.get("Arn", ""))
+        except ArnParseError:
+            logger.warning(
+                "EventBridge scheduler: skipping rule %s with malformed ARN %s",
+                rule_key,
+                rule.get("Arn", ""),
+            )
+            continue
+        if (
+            rule_arn.service != "events"
+            or not rule_arn.region
+            or rule_arn.account_id != account_id
+            or not rule_arn.resource.startswith("rule/")
+        ):
+            logger.warning(
+                "EventBridge scheduler: skipping rule %s with out-of-scope ARN %s",
+                rule_key,
+                rule.get("Arn", ""),
+            )
+            continue
+        previous_account = get_account_id()
+        previous_region = get_region()
         set_request_account_id(account_id)
-        event = {
-            "EventId": new_uuid(),
-            "Source": "aws.events",
-            "DetailType": "Scheduled Event",
-            "Detail": "{}",
-            "EventBusName": rule.get("EventBusName", "default"),
-            "Time": now,
-            "Resources": [rule.get("Arn", "")],
-            "Account": account_id,
-            "Region": get_region(),
-        }
-        for target in targets:
-            try:
-                _invoke_target(target, event, rule)
-            except Exception:
-                logger.exception(
-                    "EventBridge scheduler: dispatch error for rule %s account %s",
-                    rule_key, account_id,
-                )
+        set_request_region(rule_arn.region)
+        try:
+            event = {
+                "EventId": new_uuid(),
+                "Source": "aws.events",
+                "DetailType": "Scheduled Event",
+                "Detail": "{}",
+                "EventBusName": rule.get("EventBusName", "default"),
+                "Time": now,
+                "Resources": [rule.get("Arn", "")],
+                "Account": account_id,
+                "Region": get_region(),
+            }
+            for target in targets:
+                try:
+                    _invoke_target(target, event, rule)
+                except Exception:
+                    logger.exception(
+                        "EventBridge scheduler: dispatch error for rule %s account %s",
+                        rule_key, account_id,
+                    )
+        finally:
+            set_request_account_id(previous_account)
+            set_request_region(previous_region)
 
 
 def _scheduler_loop():

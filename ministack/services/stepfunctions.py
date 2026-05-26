@@ -38,8 +38,10 @@ from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import wait as futures_wait
 from datetime import datetime, timezone
 
+from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.persistence import PERSIST_STATE, load_state
 from ministack.core.responses import (
+    AccountRegionScopedDict,
     AccountScopedDict,
     error_response_json,
     get_account_id,
@@ -119,24 +121,24 @@ def _get_mock_response(sm_name: str, test_case: str, state_name: str, attempt: i
                 continue
     return None
 
-_state_machines = AccountScopedDict()
-_executions = AccountScopedDict()
-_task_tokens = AccountScopedDict()
-_tags = AccountScopedDict()
-_activities = AccountScopedDict()
-_activity_tasks = AccountScopedDict()
+_state_machines = AccountRegionScopedDict()
+_executions = AccountRegionScopedDict()
+_task_tokens = AccountRegionScopedDict()
+_tags = AccountRegionScopedDict()
+_activities = AccountRegionScopedDict()
+_activity_tasks = AccountRegionScopedDict()
 
 # version_arn -> {stateMachineVersionArn, stateMachineRevisionId,
 #                 description, creationDate, definition, roleArn, type,
 #                 loggingConfiguration}
 # Version ARN shape: arn:aws:states:<region>:<acct>:stateMachine:<name>:<N>
-_state_machine_versions = AccountScopedDict()
+_state_machine_versions = AccountRegionScopedDict()
 
 # alias_arn -> {stateMachineAliasArn, name, description,
 #               routingConfiguration: [{stateMachineVersionArn, weight}],
 #               creationDate, updateDate}
 # Alias ARN shape: arn:aws:states:<region>:<acct>:stateMachine:<name>:<aliasName>
-_state_machine_aliases = AccountScopedDict()
+_state_machine_aliases = AccountRegionScopedDict()
 
 # ── Persistence ────────────────────────────────────────────
 
@@ -162,7 +164,7 @@ def restore_state(data):
     _state_machine_aliases.update(data.get("state_machine_aliases", {}))
     # Executions that were RUNNING when the process died cannot resume —
     # mark them FAILED, following the ECS precedent (tasks → STOPPED).
-    for exc in _executions.values():
+    for exc in _executions.all_values():
         if exc.get("status") == "RUNNING":
             exc["status"] = "FAILED"
             exc["stopDate"] = now_iso()
@@ -570,12 +572,12 @@ def _start_execution(data):
         ],
     }
 
-    # Propagate the request's contextvars (notably the account ID set by
+    # Propagate the request's contextvars (notably the account ID and region set by
     # set_request_account_id) into the background execution thread. Python's
     # threading.Thread does NOT automatically copy contextvars, so without
-    # this snapshot the worker runs under the default account and silently
-    # fails to find the execution stored in AccountScopedDict under the
-    # caller's account. See issue #639.
+    # this snapshot the worker runs under the default scope and silently
+    # fails to find the execution stored under the caller's account and
+    # region. See issue #639.
     ctx_snapshot = contextvars.copy_context()
     threading.Thread(
         target=ctx_snapshot.run,
@@ -891,7 +893,11 @@ async def _get_activity_task(data):
 def _tag_resource(data):
     arn = data.get("resourceArn")
     new_tags = data.get("tags", [])
-    existing = _tags.setdefault(arn, [])
+    account_id, region = _scope_from_resource_arn(arn)
+    existing = _tags.get_scoped(account_id, region, arn)
+    if existing is None:
+        existing = []
+        _tags.set_scoped(account_id, region, arn, existing)
     existing_map = {t["key"]: i for i, t in enumerate(existing)}
     for tag in new_tags:
         idx = existing_map.get(tag["key"])
@@ -906,14 +912,31 @@ def _tag_resource(data):
 def _untag_resource(data):
     arn = data.get("resourceArn")
     keys_to_remove = set(data.get("tagKeys", []))
-    existing = _tags.get(arn, [])
-    _tags[arn] = [t for t in existing if t["key"] not in keys_to_remove]
+    account_id, region = _scope_from_resource_arn(arn)
+    existing = _tags.get_scoped(account_id, region, arn, [])
+    _tags.set_scoped(
+        account_id,
+        region,
+        arn,
+        [t for t in existing if t["key"] not in keys_to_remove],
+    )
     return json_response({})
 
 
 def _list_tags_for_resource(data):
     arn = data.get("resourceArn")
-    return json_response({"tags": _tags.get(arn, [])})
+    account_id, region = _scope_from_resource_arn(arn)
+    return json_response({"tags": _tags.get_scoped(account_id, region, arn, [])})
+
+
+def _scope_from_resource_arn(arn):
+    try:
+        spec = parse_arn(arn)
+    except ArnParseError:
+        return get_account_id(), get_region()
+    if spec.service != "states":
+        return get_account_id(), get_region()
+    return get_account_id(), spec.region or get_region()
 
 
 # ---------------------------------------------------------------------------
@@ -1807,7 +1830,7 @@ def _execute_parallel(state_def, raw_input, execution, ctx):
             errors[idx] = exc
 
     # Each branch runs in its own thread; propagate the parent's contextvars
-    # so AccountScopedDict lookups (account ID, region) keep resolving to the
+    # so scoped store lookups (account ID, region) keep resolving to the
     # current execution's tenant. Take a fresh copy_context() per branch —
     # a single Context cannot be entered by two threads concurrently. See
     # issue #639.
@@ -1873,7 +1896,7 @@ def _execute_map(state_def, raw_input, execution, ctx):
     workers = max_conc if max_conc > 0 else (len(items) or 1)
     # ThreadPoolExecutor workers do not inherit the submitting thread's
     # contextvars, so wrap each submitted callable with copy_context().run
-    # to keep AccountScopedDict lookups bound to the current tenant. Take
+    # to keep scoped store lookups bound to the current tenant. Take
     # a fresh copy_context() per item — a single Context cannot be entered
     # by two threads concurrently. See issue #639.
     with ThreadPoolExecutor(max_workers=workers) as pool:
@@ -2882,7 +2905,7 @@ def _jsonata_now(*args):
     # With picture: XPath-3.1 date/time picture (subset — see
     # `_format_datetime_picture`). With timezone: "+HH:MM" / "-HH:MM" offset
     # applied before formatting.
-    from datetime import datetime, timezone, timedelta
+    from datetime import datetime, timedelta, timezone
     if len(args) > 2:
         raise ValueError("$now expects 0, 1, or 2 arguments")
     now = datetime.now(timezone.utc)
