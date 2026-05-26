@@ -629,6 +629,28 @@ def test_ec2_vpc_endpoint_crud(ec2):
 
     ec2.delete_vpc(VpcId=vpc_id)
 
+
+def test_ec2_vpc_endpoint_tags(ec2):
+    vpc_id = ec2.create_vpc(CidrBlock="10.41.0.0/16")["Vpc"]["VpcId"]
+
+    vpce_id = ec2.create_vpc_endpoint(
+        VpcId=vpc_id,
+        ServiceName="com.amazonaws.us-east-1.s3",
+        VpcEndpointType="Gateway",
+        TagSpecifications=[{
+            "ResourceType": "vpc-endpoint",
+            "Tags": [{"Key": "Env", "Value": "test"}, {"Key": "Team", "Value": "infra"}],
+        }],
+    )["VpcEndpoint"]["VpcEndpointId"]
+
+    desc = ec2.describe_vpc_endpoints(VpcEndpointIds=[vpce_id])
+    tags = {t["Key"]: t["Value"] for t in desc["VpcEndpoints"][0].get("Tags", [])}
+    assert tags == {"Env": "test", "Team": "infra"}
+
+    ec2.delete_vpc_endpoints(VpcEndpointIds=[vpce_id])
+    ec2.delete_vpc(VpcId=vpc_id)
+
+
 def test_ec2_describe_vpc_endpoint_services(ec2):
     resp = ec2.describe_vpc_endpoint_services()
     names = resp["ServiceNames"]
@@ -769,6 +791,34 @@ def test_ec2_flow_logs_crud(ec2):
     ec2.delete_flow_logs(FlowLogIds=fl_ids)
     desc2 = ec2.describe_flow_logs(FlowLogIds=fl_ids)
     assert len(desc2["FlowLogs"]) == 0
+
+
+def test_ec2_flow_log_tags(ec2):
+    vpc = ec2.create_vpc(CidrBlock="10.105.0.0/16")
+    vpc_id = vpc["Vpc"]["VpcId"]
+
+    fl_ids = ec2.create_flow_logs(
+        ResourceIds=[vpc_id],
+        ResourceType="VPC",
+        TrafficType="ALL",
+        LogDestinationType="cloud-watch-logs",
+        LogGroupName="/aws/vpc/flowlogs-tags",
+        TagSpecifications=[{
+            "ResourceType": "flow-log",
+            "Tags": [{"Key": "Project", "Value": "ministack"}],
+        }],
+    )["FlowLogIds"]
+
+    desc = ec2.describe_flow_logs(FlowLogIds=fl_ids)
+    tags = {t["Key"]: t["Value"] for t in desc["FlowLogs"][0].get("Tags", [])}
+    assert tags == {"Project": "ministack"}
+
+    ec2.delete_flow_logs(FlowLogIds=fl_ids)
+    tag_resp = ec2.describe_tags(Filters=[{"Name": "resource-id", "Values": fl_ids}])
+    assert tag_resp["Tags"] == []
+
+    ec2.delete_vpc(VpcId=vpc_id)
+
 
 def test_ec2_vpc_peering_crud(ec2):
     vpc1 = ec2.create_vpc(CidrBlock="10.105.0.0/16")

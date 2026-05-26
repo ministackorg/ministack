@@ -374,6 +374,11 @@ SERVICE_PATTERNS = {
         "host_patterns": [r"inspector2\."],
         "credential_scope": "inspector2",
     },
+    "s3tables": {
+        "host_patterns": [r"s3tables\."],
+        "credential_scope": "s3tables",
+        "path_prefixes": ["/buckets", "/iceberg"],
+    },
 }
 
 
@@ -458,6 +463,7 @@ def detect_service(method: str, path: str, headers: dict, query_params: dict) ->
                 "cloudtrail": "cloudtrail",
                 "cur": "cur",
                 "inspector2": "inspector2",
+                "s3tables": "s3tables",
             }
             if svc_name in scope_map:
                 return scope_map[svc_name]

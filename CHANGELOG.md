@@ -9,6 +9,8 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **EC2 `CreateVpcEndpoint` and `CreateFlowLogs` now persist `TagSpecifications`** — tags passed at creation time were silently dropped. Tags are now stored, returned by `DescribeFlowLogs`, and cleaned up on `DeleteFlowLogs`. The `fl-` prefix is also registered in the resource-type guesser so flow-log IDs are correctly resolved by the Resource Groups Tagging API.
 ### Added
 - **IAM `UpdateAccessKey`** — enables toggling an access key between `Active` and `Inactive`, matching the two statuses the real AWS API accepts. Optional `UserName` is validated when provided.
 - **IAM `GetAccessKeyLastUsed`** — returns the AWS "never used" shape (`Region`/`ServiceName` = `N/A`, no `LastUsedDate`) since MiniStack does not track per-key usage history.
