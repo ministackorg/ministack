@@ -12,7 +12,7 @@ IAM actions:
   PutRolePolicy, GetRolePolicy, DeleteRolePolicy, ListRolePolicies,
   AttachUserPolicy, DetachUserPolicy, ListAttachedUserPolicies,
   PutUserPolicy, GetUserPolicy, DeleteUserPolicy, ListUserPolicies,
-  CreateAccessKey, ListAccessKeys, DeleteAccessKey,
+  CreateAccessKey, ListAccessKeys, DeleteAccessKey, UpdateAccessKey, GetAccessKeyLastUsed,
   CreateInstanceProfile, DeleteInstanceProfile, GetInstanceProfile,
   AddRoleToInstanceProfile, RemoveRoleFromInstanceProfile,
   ListInstanceProfiles, ListInstanceProfilesForRole,
@@ -965,6 +965,49 @@ def _delete_access_key(p):
     return _xml(200, "DeleteAccessKeyResponse", "", ns="iam")
 
 
+def _update_access_key(p):
+    key_id = _p(p, "AccessKeyId")
+    status = _p(p, "Status")
+    user_name = _p(p, "UserName")
+
+    if not key_id:
+        return _error(400, "InvalidInput", "AccessKeyId is required.", ns="iam")
+    if status not in ("Active", "Inactive"):
+        return _error(400, "InvalidInput",
+                      f"Invalid status value: {status!r}. Must be Active or Inactive.",
+                      ns="iam")
+    if key_id not in _access_keys:
+        return _error(404, "NoSuchEntity",
+                      f"The Access Key with id {key_id} cannot be found.", ns="iam")
+    if user_name and _access_keys[key_id]["UserName"] != user_name:
+        return _error(404, "NoSuchEntity",
+                      f"The Access Key with id {key_id} cannot be found.", ns="iam")
+    _access_keys[key_id]["Status"] = status
+    return _xml(200, "UpdateAccessKeyResponse", "", ns="iam")
+
+
+def _get_access_key_last_used(p):
+    key_id = _p(p, "AccessKeyId")
+    if not key_id:
+        return _error(400, "InvalidInput", "AccessKeyId is required.", ns="iam")
+    if key_id not in _access_keys:
+        return _error(404, "NoSuchEntity",
+                      f"The Access Key with id {key_id} cannot be found.", ns="iam")
+    user_name = _access_keys[key_id]["UserName"]
+    # Ministack does not track per-key usage; return the "never used" shape
+    # that real AWS returns for keys that have never made a signed request
+    # (no LastUsedDate element, Region/ServiceName = "N/A").
+    return _xml(200, "GetAccessKeyLastUsedResponse",
+                f"<GetAccessKeyLastUsedResult>"
+                f"<UserName>{user_name}</UserName>"
+                f"<AccessKeyLastUsed>"
+                f"<Region>N/A</Region>"
+                f"<ServiceName>N/A</ServiceName>"
+                f"</AccessKeyLastUsed>"
+                f"</GetAccessKeyLastUsedResult>",
+                ns="iam")
+
+
 # -------------------- Instance profiles --------------------
 
 def _create_instance_profile(p):
@@ -1823,6 +1866,8 @@ _IAM_HANDLERS = {
     "CreateAccessKey": _create_access_key,
     "ListAccessKeys": _list_access_keys,
     "DeleteAccessKey": _delete_access_key,
+    "UpdateAccessKey": _update_access_key,
+    "GetAccessKeyLastUsed": _get_access_key_last_used,
     "CreateInstanceProfile": _create_instance_profile,
     "DeleteInstanceProfile": _delete_instance_profile,
     "GetInstanceProfile": _get_instance_profile,

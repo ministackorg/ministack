@@ -7,6 +7,14 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [Unreleased]
+
+### Added
+- **IAM `UpdateAccessKey`** — enables toggling an access key between `Active` and `Inactive`, matching the two statuses the real AWS API accepts. Optional `UserName` is validated when provided.
+- **IAM `GetAccessKeyLastUsed`** — returns the AWS "never used" shape (`Region`/`ServiceName` = `N/A`, no `LastUsedDate`) since MiniStack does not track per-key usage history.
+
+---
+
 ## [1.3.49] — 2026-05-25
 
 ### Added
