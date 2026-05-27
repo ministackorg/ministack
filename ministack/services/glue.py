@@ -846,10 +846,19 @@ def _start_job_run(data):
         resolved = _resolve_script(script_location)
 
         docker_client = _get_docker()
-        use_docker = _is_spark_job(job) and docker_client and resolved
+        use_docker = False
+        if _is_spark_job(job) and docker_client and resolved:
+            image = _glue_image_for_version(job.get("GlueVersion", "4.0"))
+            try:
+                docker_client.images.get(image)
+                use_docker = True
+            except Exception:
+                logger.info("Glue: image %s not available — stubbing job %s", image, job_name)
 
         if use_docker:
             _execute_spark_docker(run, job, job_name, args, resolved, docker_client)
+        elif _is_spark_job(job):
+            run["JobRunState"] = "SUCCEEDED"
         elif resolved and resolved.endswith(".py"):
             _execute_subprocess(run, job, args, resolved)
         else:
