@@ -1387,9 +1387,15 @@ def test_dynamodb_transact_write_multiple_failures_all_returned(ddb):
 
 
 def test_dynamodb_batch_get_missing_table(ddb):
-    """BatchGetItem with non-existent table returns it in UnprocessedKeys."""
-    resp = ddb.batch_get_item(RequestItems={"qa-ddb-nonexistent-xyz": {"Keys": [{"pk": {"S": "k1"}}]}})
-    assert "qa-ddb-nonexistent-xyz" in resp["UnprocessedKeys"]
+    """BatchGetItem with non-existent table raises ResourceNotFoundException.
+
+    Real AWS rejects the whole batch upfront when any RequestItems key names
+    a table that doesn't exist — it does NOT silently put the entry into
+    UnprocessedKeys. This matches dynamodb-conformance.org's batchGetItem
+    "Non-existent table" test."""
+    with pytest.raises(ClientError) as e:
+        ddb.batch_get_item(RequestItems={"qa-ddb-nonexistent-xyz": {"Keys": [{"pk": {"S": "k1"}}]}})
+    assert e.value.response["Error"]["Code"] == "ResourceNotFoundException"
 
 def test_dynamodb_scan_filter_legacy(ddb):
     """Scan with legacy ScanFilter (ComparisonOperator style) returns matching items."""
@@ -2971,3 +2977,271 @@ def test_dynamodb_describe_import_not_found(ddb):
     with pytest.raises(ClientError) as e:
         ddb.describe_import(ImportArn="arn:aws:dynamodb:us-east-1:000000000000:import/nope")
     assert e.value.response["Error"]["Code"] == "ImportNotFoundException"
+
+
+# ---------------------------------------------------------------------------
+# Limits — AWS-spec enforcement (item size, batch caps, number precision,
+# empty sets/strings). Verified against AWS DynamoDB Developer Guide
+# "Service, account, and table quotas".
+# ---------------------------------------------------------------------------
+
+def _basic_table(ddb, name, with_sk=False):
+    try:
+        ddb.delete_table(TableName=name)
+    except Exception:
+        pass
+    ks = [{"AttributeName": "pk", "KeyType": "HASH"}]
+    ad = [{"AttributeName": "pk", "AttributeType": "S"}]
+    if with_sk:
+        ks.append({"AttributeName": "sk", "KeyType": "RANGE"})
+        ad.append({"AttributeName": "sk", "AttributeType": "S"})
+    ddb.create_table(
+        TableName=name, KeySchema=ks, AttributeDefinitions=ad, BillingMode="PAY_PER_REQUEST",
+    )
+
+
+def test_dynamodb_batch_write_cap_25(ddb):
+    name = "bw-cap"
+    _basic_table(ddb, name)
+    try:
+        # 26 items must be rejected per AWS quota.
+        reqs = [{"PutRequest": {"Item": {"pk": {"S": f"k{i}"}}}} for i in range(26)]
+        with pytest.raises(ClientError) as e:
+            ddb.batch_write_item(RequestItems={name: reqs})
+        assert e.value.response["Error"]["Code"] == "ValidationException"
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_batch_get_cap_100(ddb):
+    name = "bg-cap"
+    _basic_table(ddb, name)
+    try:
+        keys = [{"pk": {"S": f"k{i}"}} for i in range(101)]
+        with pytest.raises(ClientError) as e:
+            ddb.batch_get_item(RequestItems={name: {"Keys": keys}})
+        assert e.value.response["Error"]["Code"] == "ValidationException"
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_batch_write_duplicate_key_rejected(ddb):
+    name = "bw-dup"
+    _basic_table(ddb, name)
+    try:
+        reqs = [
+            {"PutRequest": {"Item": {"pk": {"S": "same"}, "x": {"N": "1"}}}},
+            {"PutRequest": {"Item": {"pk": {"S": "same"}, "x": {"N": "2"}}}},
+        ]
+        with pytest.raises(ClientError) as e:
+            ddb.batch_write_item(RequestItems={name: reqs})
+        assert e.value.response["Error"]["Code"] == "ValidationException"
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_batch_get_duplicate_key_rejected(ddb):
+    name = "bg-dup"
+    _basic_table(ddb, name)
+    try:
+        ddb.put_item(TableName=name, Item={"pk": {"S": "a"}})
+        with pytest.raises(ClientError) as e:
+            ddb.batch_get_item(RequestItems={name: {"Keys": [{"pk": {"S": "a"}}, {"pk": {"S": "a"}}]}})
+        assert e.value.response["Error"]["Code"] == "ValidationException"
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_empty_string_set_rejected(ddb):
+    name = "empty-ss"
+    _basic_table(ddb, name)
+    try:
+        with pytest.raises(ClientError) as e:
+            ddb.put_item(TableName=name, Item={"pk": {"S": "k"}, "tags": {"SS": []}})
+        assert e.value.response["Error"]["Code"] == "ValidationException"
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_empty_number_set_rejected(ddb):
+    name = "empty-ns"
+    _basic_table(ddb, name)
+    try:
+        with pytest.raises(ClientError) as e:
+            ddb.put_item(TableName=name, Item={"pk": {"S": "k"}, "scores": {"NS": []}})
+        assert e.value.response["Error"]["Code"] == "ValidationException"
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_empty_binary_set_rejected(ddb):
+    name = "empty-bs"
+    _basic_table(ddb, name)
+    try:
+        with pytest.raises(ClientError) as e:
+            ddb.put_item(TableName=name, Item={"pk": {"S": "k"}, "blobs": {"BS": []}})
+        assert e.value.response["Error"]["Code"] == "ValidationException"
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_duplicate_ss_values_rejected(ddb):
+    name = "dup-ss"
+    _basic_table(ddb, name)
+    try:
+        with pytest.raises(ClientError) as e:
+            ddb.put_item(TableName=name, Item={"pk": {"S": "k"}, "tags": {"SS": ["a", "a", "b"]}})
+        assert e.value.response["Error"]["Code"] == "ValidationException"
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_empty_string_hash_key_rejected(ddb):
+    name = "empty-pk"
+    _basic_table(ddb, name)
+    try:
+        with pytest.raises(ClientError) as e:
+            ddb.put_item(TableName=name, Item={"pk": {"S": ""}})
+        assert e.value.response["Error"]["Code"] == "ValidationException"
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_empty_string_sort_key_rejected(ddb):
+    name = "empty-sk"
+    _basic_table(ddb, name, with_sk=True)
+    try:
+        with pytest.raises(ClientError) as e:
+            ddb.put_item(TableName=name, Item={"pk": {"S": "p"}, "sk": {"S": ""}})
+        assert e.value.response["Error"]["Code"] == "ValidationException"
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_item_over_400kb_rejected(ddb):
+    name = "huge-item"
+    _basic_table(ddb, name)
+    try:
+        big = "x" * (400 * 1024 + 100)
+        with pytest.raises(ClientError) as e:
+            ddb.put_item(TableName=name, Item={"pk": {"S": "k"}, "blob": {"S": big}})
+        assert e.value.response["Error"]["Code"] == "ValidationException"
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_number_39_digits_rejected(ddb):
+    name = "huge-num"
+    _basic_table(ddb, name)
+    try:
+        # 39 significant digits — AWS limit is 38.
+        n = "1" * 39
+        with pytest.raises(ClientError) as e:
+            ddb.put_item(TableName=name, Item={"pk": {"S": "k"}, "n": {"N": n}})
+        assert e.value.response["Error"]["Code"] == "ValidationException"
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_number_above_max_magnitude_rejected(ddb):
+    name = "num-mag"
+    _basic_table(ddb, name)
+    try:
+        # Magnitude > 9.99...E+125 rejected per AWS quota.
+        with pytest.raises(ClientError) as e:
+            ddb.put_item(TableName=name, Item={"pk": {"S": "k"}, "n": {"N": "1E126"}})
+        assert e.value.response["Error"]["Code"] == "ValidationException"
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_number_canonicalization_leading_zeros(ddb):
+    """AWS canonicalizes numbers: strips leading zeros, normalizes negative
+    zero to 0, trims trailing zeros after the decimal."""
+    name = "num-canon"
+    _basic_table(ddb, name)
+    try:
+        ddb.put_item(TableName=name, Item={"pk": {"S": "a"}, "v": {"N": "000123"}})
+        got = ddb.get_item(TableName=name, Key={"pk": {"S": "a"}})["Item"]["v"]["N"]
+        assert got == "123"
+        ddb.put_item(TableName=name, Item={"pk": {"S": "b"}, "v": {"N": "-0"}})
+        got = ddb.get_item(TableName=name, Key={"pk": {"S": "b"}})["Item"]["v"]["N"]
+        assert got == "0"
+        ddb.put_item(TableName=name, Item={"pk": {"S": "c"}, "v": {"N": "1.500"}})
+        got = ddb.get_item(TableName=name, Key={"pk": {"S": "c"}})["Item"]["v"]["N"]
+        assert got == "1.5"
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_transact_write_cap_100(ddb):
+    name = "tw-cap"
+    _basic_table(ddb, name)
+    try:
+        items = [{"Put": {"TableName": name, "Item": {"pk": {"S": f"k{i}"}}}} for i in range(101)]
+        with pytest.raises(ClientError) as e:
+            ddb.transact_write_items(TransactItems=items)
+        assert e.value.response["Error"]["Code"] == "ValidationException"
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_transact_get_cap_100(ddb):
+    name = "tg-cap"
+    _basic_table(ddb, name)
+    try:
+        items = [{"Get": {"TableName": name, "Key": {"pk": {"S": f"k{i}"}}}} for i in range(101)]
+        with pytest.raises(ClientError) as e:
+            ddb.transact_get_items(TransactItems=items)
+        assert e.value.response["Error"]["Code"] == "ValidationException"
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def _raw_ddb(target: str, body: dict):
+    """Direct HTTP DDB call — bypasses boto3's client-side validation so we
+    can verify the server's own length checks (which is what the conformance
+    suite hits)."""
+    import urllib.request, urllib.error
+    req = urllib.request.Request(
+        "http://localhost:4566/",
+        data=json.dumps(body).encode("utf-8"),
+        headers={
+            "Content-Type": "application/x-amz-json-1.0",
+            "X-Amz-Target": f"DynamoDB_20120810.{target}",
+            "Authorization": "AWS4-HMAC-SHA256 Credential=test/20200101/us-east-1/dynamodb/aws4_request, SignedHeaders=host;x-amz-date;x-amz-target, Signature=00",
+            "X-Amz-Date": "20200101T000000Z",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req) as r:
+            return r.getcode(), json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        return e.code, json.loads(e.read())
+
+
+def test_dynamodb_transact_write_empty_rejected():
+    code, body = _raw_ddb("TransactWriteItems", {"TransactItems": []})
+    assert code == 400
+    assert "ValidationException" in body.get("__type", "")
+
+
+def test_dynamodb_transact_get_empty_rejected():
+    code, body = _raw_ddb("TransactGetItems", {"TransactItems": []})
+    assert code == 400
+    assert "ValidationException" in body.get("__type", "")
+
+
+def test_dynamodb_transact_write_duplicate_keys_rejected(ddb):
+    name = "tw-dup"
+    _basic_table(ddb, name)
+    try:
+        items = [
+            {"Put": {"TableName": name, "Item": {"pk": {"S": "same"}, "a": {"N": "1"}}}},
+            {"Put": {"TableName": name, "Item": {"pk": {"S": "same"}, "a": {"N": "2"}}}},
+        ]
+        with pytest.raises(ClientError) as e:
+            ddb.transact_write_items(TransactItems=items)
+        assert e.value.response["Error"]["Code"] == "ValidationException"
+    finally:
+        ddb.delete_table(TableName=name)

@@ -127,6 +127,295 @@ except Exception:
         "Failed to restore persisted state; continuing with fresh store"
     )
 
+
+# ---------------------------------------------------------------------------
+# Validation helpers — AWS-canonical limit + format enforcement.
+#
+# Sources:
+#   * botocore service-2.json (2012-08-10) — shape ranges and required fields.
+#   * AWS DynamoDB Developer Guide:
+#     - "Service, account, and table quotas" (400 KB items, 38-digit numbers,
+#        1E+126/-1E-130 magnitude bounds, 25 items per BatchWriteItem,
+#        100 items per BatchGetItem, 100/4MB per TransactWriteItems).
+#     - "Working with items" (empty sets rejected, no duplicate set elements,
+#        attribute-name + value bytes count toward size).
+#     - "Reserved words" (https://docs.aws.amazon.com/amazondynamodb/latest/
+#        developerguide/ReservedWords.html).
+# ---------------------------------------------------------------------------
+
+# Numeric bounds per AWS docs.
+_DDB_NUM_MAX_DIGITS = 38
+_DDB_NUM_POS_MAX_EXP = 126   # |n| <= 9.9999...E+125 (positive 126 inclusive)
+_DDB_NUM_NEG_MIN_EXP = -130  # smallest non-zero magnitude is 1E-130
+
+# Item size caps.
+_DDB_ITEM_MAX_BYTES = 400 * 1024
+# TransactWriteItems / TransactGetItems caps.
+_DDB_TXN_WRITE_MAX_ITEMS = 100
+_DDB_TXN_GET_MAX_ITEMS = 100
+_DDB_TXN_MAX_BYTES = 4 * 1024 * 1024
+# Batch caps.
+_DDB_BATCH_WRITE_MAX = 25
+_DDB_BATCH_GET_MAX = 100
+
+
+def _ddb_canonicalize_number(s: str) -> str | None:
+    """Validate a DynamoDB Number string and return its canonical form, or None
+    if invalid. Mirrors AWS behavior: numbers are stored as variable-precision
+    decimals (up to 38 significant digits, magnitude between 1E-130 and
+    9.9999E+125 inclusive). AWS canonicalizes: strips leading zeros, strips
+    trailing zeros after the decimal point, normalizes negative zero to "0".
+    Returns the canonical string the caller should persist, or None if the
+    value is out of range / malformed.
+    """
+    if s is None:
+        return None
+    if not isinstance(s, str) or not s:
+        return None
+    raw = s.strip()
+    # Reject empty / sign-only / non-numeric.
+    try:
+        d = Decimal(raw)
+    except InvalidOperation:
+        return None
+    if d.is_nan() or d.is_infinite():
+        return None
+    # Significant-digit count: digits of the coefficient excluding leading zeros.
+    sign, digits, exp = d.as_tuple()
+    # Strip trailing zeros from significand to get true significant-digit count.
+    sig = list(digits)
+    while len(sig) > 1 and sig[-1] == 0:
+        sig.pop()
+        exp += 1
+    while len(sig) > 1 and sig[0] == 0:
+        sig.pop(0)
+    if len(sig) > _DDB_NUM_MAX_DIGITS:
+        return None
+    if d == 0:
+        return "0"
+    # Magnitude check: AWS limits magnitude such that the decimal exponent of
+    # the leading digit lies in [-130, 125]. Compute as adjusted exponent =
+    # exp + (number_of_digits - 1). DynamoDB accepts 1E-130 through 9.9999E+125.
+    adjusted = exp + len(sig) - 1
+    if adjusted > _DDB_NUM_POS_MAX_EXP - 1:  # > 125
+        return None
+    if adjusted < _DDB_NUM_NEG_MIN_EXP:  # < -130
+        return None
+    # Canonical string: use Decimal's normalize but format without trailing zeros
+    # and without unnecessary leading zeros.
+    norm = d.normalize()
+    # Decimal's normalize() returns scientific notation for very large/small;
+    # we want the human-readable form when reasonable. Format manually.
+    sign_str = "-" if sign else ""
+    digits_str = "".join(str(x) for x in sig)
+    if exp >= 0:
+        text = digits_str + "0" * exp
+        return sign_str + text
+    # exp < 0
+    point = len(digits_str) + exp
+    if point <= 0:
+        text = "0." + "0" * (-point) + digits_str
+    else:
+        text = digits_str[:point] + "." + digits_str[point:]
+    # Strip trailing dot if any.
+    if text.endswith("."):
+        text = text[:-1]
+    return sign_str + text
+
+
+def _validate_attribute_value(attr_name: str, value: dict) -> tuple | None:
+    """Recursively validate a single attribute value. Returns an error response
+    tuple if invalid, or None if OK. May mutate `value` to canonicalize numbers.
+    """
+    if not isinstance(value, dict) or not value:
+        return error_response_json("ValidationException",
+            "Supplied AttributeValue has more than one datatypes set, must contain exactly one of the supported datatypes", 400)
+    if len(value) != 1:
+        return error_response_json("ValidationException",
+            "Supplied AttributeValue has more than one datatypes set, must contain exactly one of the supported datatypes", 400)
+    (vtype, vval), = value.items()
+    if vtype == "S":
+        if not isinstance(vval, str):
+            return error_response_json("ValidationException",
+                f"Supplied AttributeValue is empty, must contain exactly one of the supported datatypes", 400)
+    elif vtype == "N":
+        canon = _ddb_canonicalize_number(vval)
+        if canon is None:
+            return error_response_json("ValidationException",
+                f"The parameter cannot be converted to a numeric value: {vval}", 400)
+        value["N"] = canon
+    elif vtype == "B":
+        if not isinstance(vval, (str, bytes)) or not vval:
+            return error_response_json("ValidationException",
+                "One or more parameter values were invalid: Binary attribute value is empty", 400)
+    elif vtype == "BOOL":
+        if not isinstance(vval, bool):
+            return error_response_json("ValidationException",
+                "One or more parameter values were invalid: BOOL value must be true or false", 400)
+    elif vtype == "NULL":
+        if vval is not True:
+            return error_response_json("ValidationException",
+                "One or more parameter values were invalid: Null attribute value must be true", 400)
+    elif vtype == "SS":
+        if not isinstance(vval, list) or not vval:
+            return error_response_json("ValidationException",
+                "One or more parameter values were invalid: An string set  may not be empty", 400)
+        if len(set(vval)) != len(vval):
+            return error_response_json("ValidationException",
+                "Input collection contains duplicates", 400)
+        for s in vval:
+            if not isinstance(s, str) or s == "":
+                return error_response_json("ValidationException",
+                    "One or more parameter values were invalid: An string set may not be empty", 400)
+    elif vtype == "NS":
+        if not isinstance(vval, list) or not vval:
+            return error_response_json("ValidationException",
+                "One or more parameter values were invalid: An number set  may not be empty", 400)
+        seen = set()
+        new_vals = []
+        for n in vval:
+            canon = _ddb_canonicalize_number(n if isinstance(n, str) else str(n))
+            if canon is None:
+                return error_response_json("ValidationException",
+                    f"The parameter cannot be converted to a numeric value: {n}", 400)
+            if canon in seen:
+                return error_response_json("ValidationException",
+                    "Input collection contains duplicates", 400)
+            seen.add(canon)
+            new_vals.append(canon)
+        value["NS"] = new_vals
+    elif vtype == "BS":
+        if not isinstance(vval, list) or not vval:
+            return error_response_json("ValidationException",
+                "One or more parameter values were invalid: An binary set  may not be empty", 400)
+        seen = set()
+        for b in vval:
+            key = b if isinstance(b, str) else (b.decode("latin-1") if isinstance(b, bytes) else None)
+            if key is None or key == "":
+                return error_response_json("ValidationException",
+                    "One or more parameter values were invalid: Binary set element may not be empty", 400)
+            if key in seen:
+                return error_response_json("ValidationException",
+                    "Input collection contains duplicates", 400)
+            seen.add(key)
+    elif vtype == "L":
+        if not isinstance(vval, list):
+            return error_response_json("ValidationException",
+                "One or more parameter values were invalid: List must be a list", 400)
+        for sub in vval:
+            err = _validate_attribute_value(attr_name, sub)
+            if err:
+                return err
+    elif vtype == "M":
+        if not isinstance(vval, dict):
+            return error_response_json("ValidationException",
+                "One or more parameter values were invalid: Map must be a map", 400)
+        for k, sub in vval.items():
+            err = _validate_attribute_value(attr_name, sub)
+            if err:
+                return err
+    else:
+        return error_response_json("ValidationException",
+            f"Supplied AttributeValue is empty, must contain exactly one of the supported datatypes", 400)
+    return None
+
+
+def _attribute_value_size(value: dict) -> int:
+    """Estimated byte size of an AttributeValue per AWS accounting.
+
+    AWS docs: "The size of an item is the sum of the lengths of its attribute
+    names and values." Per-type rules approximated from public guidance:
+      - String/Binary: byte length of the value.
+      - Number: 1 byte + ceil(digits / 2) bytes (max 21 bytes per number).
+      - Boolean/Null: 1 byte.
+      - List/Map: 3 bytes overhead + 1 byte per element + sum of child sizes.
+      - SS/NS/BS: sum of element sizes.
+    """
+    if not isinstance(value, dict) or len(value) != 1:
+        return 0
+    (vtype, vval), = value.items()
+    if vtype == "S":
+        return len(vval.encode("utf-8")) if isinstance(vval, str) else 0
+    if vtype == "N":
+        # Strip sign, decimal, leading zeros for digit count.
+        s = (vval or "").lstrip("-").replace(".", "").lstrip("0") or "0"
+        return 1 + (len(s) + 1) // 2
+    if vtype == "B":
+        if isinstance(vval, bytes):
+            return len(vval)
+        try:
+            import base64
+            return len(base64.b64decode(vval))
+        except Exception:
+            return len(vval) if isinstance(vval, str) else 0
+    if vtype in ("BOOL", "NULL"):
+        return 1
+    if vtype == "SS":
+        return sum(len(s.encode("utf-8")) for s in vval if isinstance(s, str))
+    if vtype == "NS":
+        total = 0
+        for n in vval:
+            s = (n or "").lstrip("-").replace(".", "").lstrip("0") or "0"
+            total += 1 + (len(s) + 1) // 2
+        return total
+    if vtype == "BS":
+        total = 0
+        for b in vval:
+            if isinstance(b, bytes):
+                total += len(b)
+            else:
+                try:
+                    import base64
+                    total += len(base64.b64decode(b))
+                except Exception:
+                    total += len(b) if isinstance(b, str) else 0
+        return total
+    if vtype == "L":
+        return 3 + sum(1 + _attribute_value_size(sub) for sub in vval if isinstance(sub, dict))
+    if vtype == "M":
+        total = 3
+        for k, sub in vval.items():
+            total += 1 + len(k.encode("utf-8")) + _attribute_value_size(sub)
+        return total
+    return 0
+
+
+def _item_size_bytes(item: dict) -> int:
+    total = 0
+    if not isinstance(item, dict):
+        return 0
+    for name, value in item.items():
+        total += len(name.encode("utf-8"))
+        total += _attribute_value_size(value)
+    return total
+
+
+def _validate_item(item: dict, pk_name: str | None = None, sk_name: str | None = None) -> tuple | None:
+    """Validate a full item: each attribute, then total size cap. Mutates
+    Number values to canonical form."""
+    if not isinstance(item, dict):
+        return error_response_json("ValidationException",
+            "Item must be a structure", 400)
+    for name, value in item.items():
+        # Empty string/binary not allowed for hash/sort key attributes
+        if name in (pk_name, sk_name):
+            if isinstance(value, dict):
+                (vtype, vval), = value.items()
+                if vtype == "S" and vval == "":
+                    return error_response_json("ValidationException",
+                        f"One or more parameter values are not valid. The AttributeValue for a key attribute cannot contain an empty string value. Key: {name}", 400)
+                if vtype == "B" and (vval == "" or vval == b""):
+                    return error_response_json("ValidationException",
+                        f"One or more parameter values are not valid. The AttributeValue for a key attribute cannot contain an empty binary value. Key: {name}", 400)
+        err = _validate_attribute_value(name, value)
+        if err:
+            return err
+    size = _item_size_bytes(item)
+    if size > _DDB_ITEM_MAX_BYTES:
+        return error_response_json("ValidationException",
+            f"Item size has exceeded the maximum allowed size", 400)
+    return None
+
 # DynamoDB Streams: table_name -> list of stream records
 # Each record follows the DynamoDB Streams event format consumed by Lambda ESMs.
 _stream_records = AccountScopedDict()
@@ -579,6 +868,16 @@ def _put_item(data):
         return error_response_json("ResourceNotFoundException", f"Requested resource not found: Table: {name} not found", 400)
 
     item = data.get("Item", {})
+    err = _validate_item(item, table.get("pk_name"), table.get("sk_name"))
+    if err:
+        return err
+    # Hash key must be present.
+    if table.get("pk_name") and table["pk_name"] not in item:
+        return error_response_json("ValidationException",
+            f"One or more parameter values were invalid: Missing the key {table['pk_name']} in the item", 400)
+    if table.get("sk_name") and table["sk_name"] not in item:
+        return error_response_json("ValidationException",
+            f"One or more parameter values were invalid: Missing the key {table['sk_name']} in the item", 400)
     pk_val = _extract_key_val(item.get(table["pk_name"]))
     sk_val = _extract_key_val(item.get(table["sk_name"])) if table["sk_name"] else "__no_sort__"
     old_item = table["items"].get(pk_val, {}).get(sk_val)
@@ -1244,7 +1543,41 @@ def _split_top_level(s, delimiter):
 # ---------------------------------------------------------------------------
 
 def _batch_write_item(data):
-    request_items = data.get("RequestItems", {})
+    request_items = data.get("RequestItems")
+    if not request_items:
+        return error_response_json("ValidationException",
+            "1 validation error detected: Value '{}' at 'requestItems' failed to satisfy constraint: Member must have length greater than or equal to 1", 400)
+    # Total request count cap (25 per BatchWriteItem call).
+    total = sum(len(v) for v in request_items.values())
+    if total > _DDB_BATCH_WRITE_MAX:
+        return error_response_json("ValidationException",
+            f"Too many items requested for the BatchWriteItem call", 400)
+    # Duplicate target key detection — AWS rejects two writes to the same key
+    # in a single BatchWriteItem call.
+    seen_keys = set()
+    for table_name, requests in request_items.items():
+        table = _tables.get(table_name)
+        if not table:
+            return error_response_json(
+                "ResourceNotFoundException",
+                "Requested resource not found",
+                400,
+            )
+        for req in requests:
+            if "PutRequest" in req:
+                key_repr = (table_name,
+                            _extract_key_val(req["PutRequest"]["Item"].get(table.get("pk_name") or "")),
+                            _extract_key_val(req["PutRequest"]["Item"].get(table.get("sk_name") or "")) if table.get("sk_name") else None)
+            elif "DeleteRequest" in req:
+                key_repr = (table_name,
+                            _extract_key_val(req["DeleteRequest"]["Key"].get(table.get("pk_name") or "")),
+                            _extract_key_val(req["DeleteRequest"]["Key"].get(table.get("sk_name") or "")) if table.get("sk_name") else None)
+            else:
+                continue
+            if key_repr in seen_keys:
+                return error_response_json("ValidationException",
+                    "Provided list of item keys contains duplicates", 400)
+            seen_keys.add(key_repr)
     unprocessed = {}
     for table_name, requests in request_items.items():
         table = _tables.get(table_name)
@@ -1257,6 +1590,9 @@ def _batch_write_item(data):
         for req in requests:
             if "PutRequest" in req:
                 item = req["PutRequest"]["Item"]
+                item_err = _validate_item(item, table.get("pk_name"), table.get("sk_name"))
+                if item_err:
+                    return item_err
                 pk_val, sk_val, key_err = _resolve_table_key_values(table, item, allow_extra=True)
                 if key_err:
                     return key_err
@@ -1294,7 +1630,33 @@ def _batch_write_item(data):
 
 
 def _batch_get_item(data):
-    request_items = data.get("RequestItems", {})
+    request_items = data.get("RequestItems")
+    if not request_items:
+        return error_response_json("ValidationException",
+            "1 validation error detected: Value '{}' at 'requestItems' failed to satisfy constraint: Member must have length greater than or equal to 1", 400)
+    # Total key count cap (100 per BatchGetItem call).
+    total = sum(len(cfg.get("Keys", [])) for cfg in request_items.values())
+    if total > _DDB_BATCH_GET_MAX:
+        return error_response_json("ValidationException",
+            "Too many items requested for the BatchGetItem call", 400)
+    # Non-existent table check before processing (AWS validates upfront).
+    for table_name in request_items:
+        if table_name not in _tables:
+            return error_response_json("ResourceNotFoundException",
+                f"Requested resource not found", 400)
+    # Duplicate-key rejection.
+    for table_name, cfg in request_items.items():
+        table = _tables[table_name]
+        seen = set()
+        for key in cfg.get("Keys", []):
+            key_repr = (
+                _extract_key_val(key.get(table.get("pk_name") or "")),
+                _extract_key_val(key.get(table.get("sk_name") or "")) if table.get("sk_name") else None,
+            )
+            if key_repr in seen:
+                return error_response_json("ValidationException",
+                    "Provided list of item keys contains duplicates", 400)
+            seen.add(key_repr)
     responses = {}
     unprocessed = {}
     for table_name, config in request_items.items():
@@ -1323,6 +1685,40 @@ def _batch_get_item(data):
 
 def _transact_write_items(data):
     items_list = data.get("TransactItems", [])
+    if not items_list:
+        return error_response_json("ValidationException",
+            "1 validation error detected: Value '[]' at 'transactItems' failed to satisfy constraint: Member must have length greater than or equal to 1", 400)
+    if len(items_list) > _DDB_TXN_WRITE_MAX_ITEMS:
+        return error_response_json("ValidationException",
+            f"1 validation error detected: Value at 'transactItems' failed to satisfy constraint: Member must have length less than or equal to {_DDB_TXN_WRITE_MAX_ITEMS}", 400)
+    # 4MB total payload cap.
+    try:
+        if len(json.dumps(data).encode("utf-8")) > _DDB_TXN_MAX_BYTES:
+            return error_response_json("ValidationException",
+                "Transaction request exceeds the 4MB transaction size limit", 400)
+    except (TypeError, ValueError):
+        pass
+    # Duplicate-key rejection across the transaction.
+    seen_targets = set()
+    for transact in items_list:
+        op_type, op = _extract_transact_op(transact)
+        if op is None:
+            continue
+        tn = op.get("TableName", "")
+        tbl = _tables.get(tn)
+        if not tbl:
+            continue
+        if op_type == "Put":
+            key_src = op.get("Item", {})
+        else:
+            key_src = op.get("Key", {})
+        target = (tn,
+                  _extract_key_val(key_src.get(tbl.get("pk_name") or "")),
+                  _extract_key_val(key_src.get(tbl.get("sk_name") or "")) if tbl.get("sk_name") else None)
+        if target in seen_targets:
+            return error_response_json("ValidationException",
+                "Transaction request cannot include multiple operations on one item", 400)
+        seen_targets.add(target)
 
     # Phase 1: evaluate ALL conditions and collect failures (AWS returns all,
     # not just the first).
@@ -1388,6 +1784,28 @@ def _transact_write_items(data):
 
 def _transact_get_items(data):
     items_list = data.get("TransactItems", [])
+    if not items_list:
+        return error_response_json("ValidationException",
+            "1 validation error detected: Value '[]' at 'transactItems' failed to satisfy constraint: Member must have length greater than or equal to 1", 400)
+    if len(items_list) > _DDB_TXN_GET_MAX_ITEMS:
+        return error_response_json("ValidationException",
+            f"1 validation error detected: Value at 'transactItems' failed to satisfy constraint: Member must have length less than or equal to {_DDB_TXN_GET_MAX_ITEMS}", 400)
+    # Duplicate-key rejection.
+    seen = set()
+    for transact in items_list:
+        get_op = transact.get("Get", {})
+        tbl = _tables.get(get_op.get("TableName", ""))
+        if not tbl:
+            return error_response_json("ResourceNotFoundException",
+                f"Requested resource not found: Table: {get_op.get('TableName')} not found", 400)
+        key = get_op.get("Key", {})
+        key_repr = (get_op.get("TableName"),
+                    _extract_key_val(key.get(tbl.get("pk_name") or "")),
+                    _extract_key_val(key.get(tbl.get("sk_name") or "")) if tbl.get("sk_name") else None)
+        if key_repr in seen:
+            return error_response_json("ValidationException",
+                "Transaction request cannot include multiple operations on one item", 400)
+        seen.add(key_repr)
     responses = []
     for transact in items_list:
         get_op = transact.get("Get", {})
