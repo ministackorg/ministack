@@ -347,6 +347,7 @@ _state_map = {
     "cloudtrail": "cloudtrail", "iot": "iot",
     "inspector2": "inspector2",
     "s3tables": "s3tables",
+    "lambda_durable": "lambda_durable",
 }
 
 SERVICE_NAME_ALIASES = {

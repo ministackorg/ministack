@@ -20,7 +20,9 @@ logger = logging.getLogger("ministack")
 # and routes via credential scope, but raw HTTP/curl/runtime API don't).
 _LAMBDA_PATH_RE = re.compile(
     r"^/\d{4}-\d{2}-\d{2}/(?:functions|layers|event-source-mappings|"
-    r"account-settings|runtime|tags|code-signing-configs)(?:/|$)"
+    r"account-settings|runtime|tags|code-signing-configs|"
+    # Durable Functions (preview, Dec 2025).
+    r"durable-executions)(?:/|$)"
 )
 
 # ECS Task Metadata V4 paths: /v4/<token>[/task|/stats|...]. Token is
@@ -60,7 +62,13 @@ SERVICE_PATTERNS = {
         "host_patterns": [r"dynamodb\."],
     },
     "lambda": {
-        "path_patterns": [r"^/2015-03-31/", r"^/2018-10-31/layers"],
+        "path_patterns": [
+            r"^/2015-03-31/",
+            r"^/2018-10-31/layers",
+            # Durable Functions (preview, Dec 2025) — surface lives on the
+            # Lambda endpoint under a fresh API-version prefix.
+            r"^/2025-12-01/(durable-executions|functions)",
+        ],
         "host_patterns": [r"lambda\."],
     },
     "iam": {

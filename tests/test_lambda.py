@@ -556,7 +556,7 @@ def test_lambda_warm_start(lam, apigw):
     import urllib.request as _urlreq
     import uuid as _uuid
 
-    fname = f"intg-warm-{_uuid.uuid4().hex[:8]}"
+    fname = f"intg-warm-{_uuid_mod.uuid4().hex[:8]}"
     code = (
         b"import time\n"
         b"_boot_time = time.time()\n"
@@ -1916,7 +1916,7 @@ def test_apigwv2_nodejs_lambda_proxy(lam, apigw):
 
     from botocore.exceptions import ClientError
 
-    fname = f"apigwv2-node-{_uuid.uuid4().hex[:8]}"
+    fname = f"apigwv2-node-{_uuid_mod.uuid4().hex[:8]}"
     api_id = None
     code = (
         "exports.handler = async (event) => ({"
@@ -3753,9 +3753,9 @@ def test_nodejs_worker_aws_sdk_v3_stub_wire_roundtrip(lam, ssm):
     if not shutil.which("node"):
         pytest.skip("node not found on PATH")
 
-    fname = f"sdk-roundtrip-{_uuid.uuid4().hex[:8]}"
-    param_name = f"/ministack-test/{_uuid.uuid4().hex[:8]}"
-    param_value = f"value-{_uuid.uuid4().hex[:8]}"
+    fname = f"sdk-roundtrip-{_uuid_mod.uuid4().hex[:8]}"
+    param_name = f"/ministack-test/{_uuid_mod.uuid4().hex[:8]}"
+    param_value = f"value-{_uuid_mod.uuid4().hex[:8]}"
     code = (
         "const { SSMClient, PutParameterCommand } = require('@aws-sdk/client-ssm');\n"
         "exports.handler = async (event) => {\n"
@@ -3805,3 +3805,242 @@ def test_lambda_ruby_4_0_runtime_maps_to_official_image():
     from ministack.services.lambda_svc import _RUNTIME_IMAGE_MAP
 
     assert _RUNTIME_IMAGE_MAP.get("ruby4.0") == "public.ecr.aws/lambda/ruby:4.0"
+
+
+# ---------------------------------------------------------------------------
+# Lambda Durable Functions (Durable Execution).
+# Shapes verified against:
+#   https://docs.aws.amazon.com/lambda/latest/api/API_CheckpointDurableExecution.html
+#   https://docs.aws.amazon.com/lambda/latest/api/API_GetDurableExecutionState.html
+#   https://docs.aws.amazon.com/lambda/latest/api/API_GetDurableExecution.html
+#   https://docs.aws.amazon.com/lambda/latest/api/API_ListDurableExecutionsByFunction.html
+#   https://docs.aws.amazon.com/lambda/latest/api/API_GetDurableExecutionHistory.html
+#   https://docs.aws.amazon.com/lambda/latest/api/API_StopDurableExecution.html
+# ---------------------------------------------------------------------------
+
+import urllib.request
+import urllib.error
+
+
+def _ms_endpoint():
+    return os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+
+
+def _raw_durable(method: str, path: str, body: dict | None = None,
+                 query: dict | None = None):
+    """Hit ministack with a raw HTTP call for the durable-execution surface.
+    Boto3 doesn't carry the preview shapes yet, so use urllib."""
+    import json as _json
+    from urllib.parse import urlencode
+    qstr = ("?" + urlencode(query)) if query else ""
+    req = urllib.request.Request(
+        f"{_ms_endpoint()}{path}{qstr}",
+        method=method,
+        data=(_json.dumps(body).encode("utf-8") if body is not None else None),
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req) as r:
+            payload = r.read()
+            return r.getcode(), _json.loads(payload) if payload else {}
+    except urllib.error.HTTPError as e:
+        body_bytes = e.read()
+        try:
+            return e.code, _json.loads(body_bytes) if body_bytes else {}
+        except Exception:
+            return e.code, {"raw": body_bytes.decode("utf-8", "replace")}
+
+
+def _create_durable_execution_directly(lam):
+    """Create a function with DurableConfig.Enabled, invoke it, and read
+    the resulting DurableExecutionArn from the X-Amz-Durable-Execution-Arn
+    response header. Returns (function_name, function_arn, dict with
+    DurableExecutionArn + CheckpointToken)."""
+    import base64 as _b64
+    import json as _json
+    fname = f"durable-fn-{_uuid_mod.uuid4().hex[:8]}"
+    try:
+        lam.delete_function(FunctionName=fname)
+    except Exception:
+        pass
+    zip_b64 = _b64.b64encode(_make_zip("def handler(e,c): return e")).decode()
+    code, body = _raw_durable("POST", "/2015-03-31/functions", body={
+        "FunctionName": fname,
+        "Runtime": "python3.12",
+        "Role": _LAMBDA_ROLE,
+        "Handler": "index.handler",
+        "Code": {"ZipFile": zip_b64},
+        "DurableConfig": {"Enabled": True},
+    })
+    fn_arn = body["FunctionArn"]
+    # Invoke to create a durable execution.
+    invoke_req = urllib.request.Request(
+        f"{_ms_endpoint()}/2015-03-31/functions/{fname}/invocations",
+        method="POST",
+        data=b'{"hello":"world"}',
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(invoke_req) as r:
+        arn = r.headers.get("X-Amz-Durable-Execution-Arn")
+        token = r.headers.get("X-Amz-Durable-Checkpoint-Token")
+        r.read()
+    assert arn, "expected X-Amz-Durable-Execution-Arn header on invoke response"
+    assert token, "expected X-Amz-Durable-Checkpoint-Token header on invoke response"
+    return fname, fn_arn, {"DurableExecutionArn": arn, "CheckpointToken": token}
+
+
+def test_lambda_durable_function_config_round_trip(lam):
+    """CreateFunction accepts DurableConfig via raw HTTP (boto3 client-side
+    rejects unknown params until its model is updated) and GetFunction
+    echoes it back."""
+    fname = f"durable-cfg-{_uuid_mod.uuid4().hex[:8]}"
+    try:
+        lam.delete_function(FunctionName=fname)
+    except Exception:
+        pass
+    import json as _json
+    import base64 as _b64
+    zip_b64 = _b64.b64encode(_make_zip("def handler(e,c): return e")).decode()
+    code, body = _raw_durable("POST", "/2015-03-31/functions", body={
+        "FunctionName": fname,
+        "Runtime": "python3.12",
+        "Role": _LAMBDA_ROLE,
+        "Handler": "index.handler",
+        "Code": {"ZipFile": zip_b64},
+        "DurableConfig": {"Enabled": True},
+    })
+    try:
+        assert code in (200, 201), body
+        assert body.get("DurableConfig") == {"Enabled": True}
+        # Boto3 strips unknown fields, so verify the round-trip via raw HTTP.
+        code, gf = _raw_durable("GET", f"/2015-03-31/functions/{fname}")
+        assert code == 200
+        assert gf["Configuration"].get("DurableConfig") == {"Enabled": True}
+    finally:
+        try:
+            lam.delete_function(FunctionName=fname)
+        except Exception:
+            pass
+
+
+def test_lambda_durable_get_execution(lam):
+    fname, fn_arn, rec = _create_durable_execution_directly(lam)
+    try:
+        from urllib.parse import quote
+        path = f"/2025-12-01/durable-executions/{quote(rec['DurableExecutionArn'], safe='/:$')}"
+        code, body = _raw_durable("GET", path)
+        assert code == 200
+        assert body["DurableExecutionArn"] == rec["DurableExecutionArn"]
+        assert body["Status"] == "RUNNING"
+        assert json.loads(body["InputPayload"]) == {"hello": "world"}
+        assert body["FunctionArn"] == fn_arn
+    finally:
+        lam.delete_function(FunctionName=fname)
+
+
+def test_lambda_durable_get_state_requires_token(lam):
+    fname, _, rec = _create_durable_execution_directly(lam)
+    try:
+        from urllib.parse import quote
+        arn = quote(rec["DurableExecutionArn"], safe="/:$")
+        # Wrong token rejected.
+        code, body = _raw_durable("GET", f"/2025-12-01/durable-executions/{arn}/state",
+                                  query={"CheckpointToken": "wrong"})
+        assert code == 400
+        # Correct token succeeds with empty operations list.
+        code, body = _raw_durable("GET", f"/2025-12-01/durable-executions/{arn}/state",
+                                  query={"CheckpointToken": rec["CheckpointToken"]})
+        assert code == 200
+        assert body["Operations"] == []
+    finally:
+        lam.delete_function(FunctionName=fname)
+
+
+def test_lambda_durable_checkpoint_rotates_token_and_records_operations(lam):
+    fname, _, rec = _create_durable_execution_directly(lam)
+    try:
+        from urllib.parse import quote
+        arn = quote(rec["DurableExecutionArn"], safe="/:$")
+        original_token = rec["CheckpointToken"]
+        # Checkpoint a single Step succeed.
+        code, body = _raw_durable("POST", f"/2025-12-01/durable-executions/{arn}/checkpoint", body={
+            "CheckpointToken": original_token,
+            "Updates": [{
+                "Id": "step-1",
+                "Type": "STEP",
+                "Action": "SUCCEED",
+                "Name": "first-step",
+                "Payload": '{"value":42}',
+            }],
+        })
+        assert code == 200
+        assert body["CheckpointToken"] != original_token
+        ops = body["NewExecutionState"]["Operations"]
+        assert any(op["Id"] == "step-1" and op["Status"] == "SUCCEEDED" for op in ops)
+        # Replaying with the OLD token must fail.
+        code, _ = _raw_durable("POST", f"/2025-12-01/durable-executions/{arn}/checkpoint", body={
+            "CheckpointToken": original_token,
+            "Updates": [],
+        })
+        assert code == 400
+    finally:
+        lam.delete_function(FunctionName=fname)
+
+
+def test_lambda_durable_get_history(lam):
+    fname, _, rec = _create_durable_execution_directly(lam)
+    try:
+        from urllib.parse import quote
+        arn = quote(rec["DurableExecutionArn"], safe="/:$")
+        # Run a checkpoint so we have a non-trivial history.
+        _raw_durable("POST", f"/2025-12-01/durable-executions/{arn}/checkpoint", body={
+            "CheckpointToken": rec["CheckpointToken"],
+            "Updates": [{"Id": "s", "Type": "STEP", "Action": "SUCCEED",
+                         "Name": "n", "Payload": "1"}],
+        })
+        code, body = _raw_durable("GET", f"/2025-12-01/durable-executions/{arn}/history")
+        assert code == 200
+        events = body["Events"]
+        assert any(e["EventType"] == "ExecutionStarted" for e in events)
+        assert any(e["EventType"] == "StepSucceeded" for e in events)
+    finally:
+        lam.delete_function(FunctionName=fname)
+
+
+def test_lambda_durable_stop(lam):
+    fname, _, rec = _create_durable_execution_directly(lam)
+    try:
+        from urllib.parse import quote
+        arn = quote(rec["DurableExecutionArn"], safe="/:$")
+        code, body = _raw_durable("POST", f"/2025-12-01/durable-executions/{arn}/stop", body={
+            "ErrorMessage": "stop-test",
+        })
+        assert code == 200
+        assert "StopTimestamp" in body
+        # GetDurableExecution reflects the STOPPED status + error.
+        code, body = _raw_durable("GET", f"/2025-12-01/durable-executions/{arn}")
+        assert body["Status"] == "STOPPED"
+        assert body["Error"]["ErrorMessage"] == "stop-test"
+    finally:
+        lam.delete_function(FunctionName=fname)
+
+
+def test_lambda_durable_list_by_function(lam):
+    fname, fn_arn, rec = _create_durable_execution_directly(lam)
+    try:
+        from urllib.parse import quote
+        code, body = _raw_durable("GET", f"/2025-12-01/functions/{fname}/durable-executions")
+        assert code == 200
+        arns = [s["DurableExecutionArn"] for s in body["DurableExecutions"]]
+        assert rec["DurableExecutionArn"] in arns
+    finally:
+        lam.delete_function(FunctionName=fname)
+
+
+def test_lambda_durable_unknown_execution_404(lam):
+    code, body = _raw_durable(
+        "GET",
+        "/2025-12-01/durable-executions/arn:aws:lambda:us-east-1:000000000000:function:nofn:$LATEST/durable-execution/aaa/bbb",
+    )
+    assert code == 404
+    assert "ResourceNotFoundException" in body.get("__type", "")

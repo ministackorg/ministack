@@ -526,6 +526,19 @@ def _validate_unzipped_size(zip_data: bytes | None):
     return None
 
 
+def _durable_arn_lookup(name_or_arn: str) -> str | None:
+    """Resolve a function name or ARN to the canonical function ARN, or None
+    if the function doesn't exist. Used by lambda_durable.handle_list_by_function."""
+    try:
+        canonical = _resolve_name(name_or_arn)
+    except Exception:
+        return None
+    func = _functions.get(canonical)
+    if not func:
+        return None
+    return func.get("FunctionArn") or _func_arn(canonical)
+
+
 def _build_config(name: str, data: dict, code_zip: bytes | None = None) -> dict:
     code_size = len(code_zip) if code_zip else 0
     code_sha = base64.b64encode(hashlib.sha256(code_zip).digest()).decode() if code_zip else ""
@@ -663,6 +676,15 @@ async def handle_request(method: str, path: str, headers: dict, body: bytes, que
 
     path = unquote(path)
     parts = path.rstrip("/").split("/")
+
+    # --- Durable Execution surface (preview, API version 2025-12-01) ---
+    # Routed first because some paths embed the function ARN as a path segment
+    # which can otherwise be misclassified.
+    from ministack.services import lambda_durable
+    durable_resp = lambda_durable.try_route(method, path, body, query_params,
+                                             function_arn_lookup=_durable_arn_lookup)
+    if durable_resp is not None:
+        return durable_resp
 
     try:
         data = json.loads(body) if body else {}
@@ -1428,6 +1450,24 @@ async def _invoke(name: str, event: dict, headers: dict, path_qualifier: str | N
     if invocation_type == "DryRun":
         return 204, {"X-Amz-Executed-Version": executed_version}, b""
 
+    # If the function has DurableConfig.Enabled, spin up a durable execution
+    # record so the SDK calls (Checkpoint / GetState) inside the function
+    # have a target. The ARN is surfaced back via the X-Amz-Durable-Execution-
+    # Arn response header so callers can wire it to follow-up management ops.
+    durable_arn = None
+    if (func.get("config", {}) or {}).get("DurableConfig", {}).get("Enabled"):
+        from ministack.services import lambda_durable
+        try:
+            event_payload = json.dumps(event) if not isinstance(event, str) else event
+        except (TypeError, ValueError):
+            event_payload = ""
+        rec = lambda_durable.create_execution_for_invoke(
+            function_arn=_func_arn(name),
+            version=executed_version,
+            input_payload=event_payload,
+        )
+        durable_arn = rec["DurableExecutionArn"]
+
     if invocation_type == "Event":
         # AWS async invocation: retry + DLQ routing handled by the shared
         # helper so event-source fan-out (S3, EventBridge, SNS → Lambda, etc.)
@@ -1452,6 +1492,14 @@ async def _invoke(name: str, event: dict, headers: dict, path_qualifier: str | N
         "Content-Type": "application/json",
         "X-Amz-Executed-Version": executed_version,
     }
+    if durable_arn:
+        resp_headers["X-Amz-Durable-Execution-Arn"] = durable_arn
+        # Real AWS hands the initial CheckpointToken to the runtime via Lambda
+        # context; ministack surfaces it on the response header so test clients
+        # and SDK-less callers can drive the management ops directly.
+        _de_rec = lambda_durable._executions.get(durable_arn)
+        if _de_rec:
+            resp_headers["X-Amz-Durable-Checkpoint-Token"] = _de_rec["CheckpointToken"]
 
     log_output = result.get("log", "")
     if log_output:
