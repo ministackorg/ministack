@@ -5043,3 +5043,114 @@ def test_dynamodb_query_missing_hash_key_in_kce_rejected(ddb):
         assert e.value.response["Error"]["Code"] == "ValidationException"
     finally:
         ddb.delete_table(TableName=name)
+
+
+# ---------------------------------------------------------------------------
+# Validation-ordering — per AWS, tableName errors fire first (stop early),
+# multi-param errors accumulate into one envelope, non-existent indexes
+# return ValidationException.
+# ---------------------------------------------------------------------------
+
+def test_dynamodb_putitem_invalid_table_pattern_reports_only_table():
+    """An invalid TableName pattern + simultaneously-invalid ReturnValues
+    should report ONLY the tableName error (early stop)."""
+    code, body = _raw_ddb("PutItem", {
+        "TableName": "bad name with spaces",
+        "Item": {"pk": {"S": "x"}},
+        "ReturnValues": "BOGUS",
+    })
+    assert code == 400
+    msg = body.get("message", "")
+    assert "tableName" in msg
+    assert "returnValues" not in msg
+
+
+def test_dynamodb_putitem_multi_enum_errors_accumulated():
+    code, body = _raw_ddb("PutItem", {
+        "TableName": "intg-multi-enum",
+        "Item": {"pk": {"S": "x"}},
+        "ReturnValues": "BOGUS",
+        "ReturnConsumedCapacity": "ALSO_BAD",
+        "ReturnItemCollectionMetrics": "NOPE",
+    })
+    assert code == 400
+    msg = body.get("message", "")
+    # AWS envelope: "3 validation errors detected: ...; ...; ..."
+    assert "3 validation errors detected" in msg
+    assert "returnValues" in msg
+    assert "returnConsumedCapacity" in msg
+    assert "returnItemCollectionMetrics" in msg
+
+
+def test_dynamodb_deleteitem_multi_enum_errors_accumulated():
+    code, body = _raw_ddb("DeleteItem", {
+        "TableName": "intg-multi-del",
+        "Key": {"pk": {"S": "x"}},
+        "ReturnValues": "BOGUS",
+        "ReturnConsumedCapacity": "BAD",
+    })
+    assert code == 400
+    msg = body.get("message", "")
+    assert "2 validation errors detected" in msg
+
+
+def test_dynamodb_updateitem_multi_enum_errors_accumulated():
+    code, body = _raw_ddb("UpdateItem", {
+        "TableName": "intg-multi-upd",
+        "Key": {"pk": {"S": "x"}},
+        "ReturnValues": "BOGUS",
+        "ReturnConsumedCapacity": "BAD",
+    })
+    assert code == 400
+    msg = body.get("message", "")
+    assert "2 validation errors detected" in msg
+
+
+def test_dynamodb_query_invalid_table_pattern():
+    code, body = _raw_ddb("Query", {
+        "TableName": "bad name pattern",
+        "KeyConditionExpression": "pk = :v",
+        "ExpressionAttributeValues": {":v": {"S": "x"}},
+    })
+    assert code == 400
+    assert "tableName" in body.get("message", "")
+
+
+def test_dynamodb_query_non_existent_index_validation(ddb):
+    name = "q-noidx"
+    _basic_table(ddb, name)
+    try:
+        with pytest.raises(ClientError) as e:
+            ddb.query(
+                TableName=name,
+                IndexName="does-not-exist",
+                KeyConditionExpression="pk = :v",
+                ExpressionAttributeValues={":v": {"S": "x"}},
+            )
+        assert e.value.response["Error"]["Code"] == "ValidationException"
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_scan_non_existent_index_validation(ddb):
+    name = "s-noidx"
+    _basic_table(ddb, name)
+    try:
+        with pytest.raises(ClientError) as e:
+            ddb.scan(TableName=name, IndexName="does-not-exist")
+        assert e.value.response["Error"]["Code"] == "ValidationException"
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_batch_write_cap_message_includes_count(ddb):
+    name = "bw-msg-count"
+    _basic_table(ddb, name)
+    try:
+        reqs = [{"PutRequest": {"Item": {"pk": {"S": f"k{i}"}}}} for i in range(30)]
+        with pytest.raises(ClientError) as e:
+            ddb.batch_write_item(RequestItems={name: reqs})
+        msg = e.value.response["Error"]["Message"]
+        assert "30" in msg or "25" in msg
+    finally:
+        ddb.delete_table(TableName=name)
