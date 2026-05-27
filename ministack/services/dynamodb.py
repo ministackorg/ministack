@@ -66,6 +66,16 @@ _pitr_settings = AccountScopedDict()
 # kinesis.put_record_internal; DISABLED entries stay on the describe
 # response (matching the ~24 h AWS retention window for readability).
 _kinesis_destinations = AccountScopedDict()
+# Contributor Insights — key is "TableName" or "TableName/index/IndexName".
+# Value: {"ContributorInsightsStatus": "ENABLED"|"DISABLED",
+#         "LastUpdateDateTime": float epoch, "ContributorInsightsRuleList": [str, ...]}.
+_contributor_insights = AccountScopedDict()
+# Resource-based policies — ResourceArn -> {"Policy": str, "RevisionId": str}.
+_resource_policies = AccountScopedDict()
+# Export tasks — ExportArn -> ExportDescription dict.
+_exports = AccountScopedDict()
+# Import tasks — ImportArn -> ImportTableDescription dict.
+_imports = AccountScopedDict()
 _lock = threading.Lock()
 
 
@@ -78,6 +88,10 @@ def get_state():
         "ttl_settings": copy.deepcopy(_ttl_settings),
         "pitr_settings": copy.deepcopy(_pitr_settings),
         "kinesis_destinations": copy.deepcopy(_kinesis_destinations),
+        "contributor_insights": copy.deepcopy(_contributor_insights),
+        "resource_policies": copy.deepcopy(_resource_policies),
+        "exports": copy.deepcopy(_exports),
+        "imports": copy.deepcopy(_imports),
     }
 
 
@@ -97,6 +111,10 @@ def restore_state(data):
         _ttl_settings.update(data.get("ttl_settings", {}))
         _pitr_settings.update(data.get("pitr_settings", {}))
         _kinesis_destinations.update(data.get("kinesis_destinations", {}))
+        _contributor_insights.update(data.get("contributor_insights", {}))
+        _resource_policies.update(data.get("resource_policies", {}))
+        _exports.update(data.get("exports", {}))
+        _imports.update(data.get("imports", {}))
 
 
 try:
@@ -297,6 +315,18 @@ async def handle_request(method: str, path: str, headers: dict, body: bytes, que
         "DescribeKinesisStreamingDestination": _describe_kinesis_streaming_destination,
         "UpdateKinesisStreamingDestination": _update_kinesis_streaming_destination,
         "ExecuteStatement": _execute_statement,
+        "UpdateContributorInsights": _update_contributor_insights,
+        "DescribeContributorInsights": _describe_contributor_insights,
+        "ListContributorInsights": _list_contributor_insights,
+        "PutResourcePolicy": _put_resource_policy,
+        "GetResourcePolicy": _get_resource_policy,
+        "DeleteResourcePolicy": _delete_resource_policy,
+        "ExportTableToPointInTime": _export_table_to_point_in_time,
+        "DescribeExport": _describe_export,
+        "ListExports": _list_exports,
+        "ImportTable": _import_table,
+        "DescribeImport": _describe_import,
+        "ListImports": _list_imports,
     }
 
     handler = handlers.get(action)
@@ -1718,6 +1748,461 @@ def _update_kinesis_streaming_destination(data):
             "ApproximateCreationDateTimePrecision": applied_precision,
         },
     })
+
+
+# ---------------------------------------------------------------------------
+# Contributor Insights
+# ---------------------------------------------------------------------------
+
+# AWS accepts either a bare TableName or a full table ARN in the TableName
+# field of these ops (botocore shape `TableArn`). Normalize to TableName so
+# we can key state on it.
+def _normalize_table_name(value: str) -> str:
+    if not isinstance(value, str):
+        return value
+    if value.startswith("arn:aws:dynamodb:"):
+        # arn:aws:dynamodb:region:account:table/<name>[/...]
+        try:
+            _, _, after = value.partition(":table/")
+            return after.split("/")[0] if after else value
+        except Exception:
+            return value
+    return value
+
+
+def _ci_key(table_name: str, index_name: str | None) -> str:
+    return f"{table_name}/index/{index_name}" if index_name else table_name
+
+
+def _update_contributor_insights(data):
+    name = _normalize_table_name(data.get("TableName") or "")
+    if not name:
+        return error_response_json("ValidationException",
+            "1 validation error detected: Value null at 'tableName' failed to satisfy constraint: Member must not be null", 400)
+    if name not in _tables:
+        return error_response_json("ResourceNotFoundException",
+            f"Requested resource not found: Table: {name} not found", 400)
+    action = data.get("ContributorInsightsAction")
+    if action not in ("ENABLE", "DISABLE"):
+        return error_response_json("ValidationException",
+            "1 validation error detected: Value at 'contributorInsightsAction' failed to satisfy constraint: "
+            "Member must satisfy enum value set: [ENABLE, DISABLE]", 400)
+    index_name = data.get("IndexName")
+    if index_name:
+        # Validate index exists
+        tbl = _tables[name]
+        idx_names = {g["IndexName"] for g in tbl.get("GlobalSecondaryIndexes", [])}
+        if index_name not in idx_names:
+            return error_response_json("ResourceNotFoundException",
+                f"Requested resource not found: Index: {index_name} not found", 400)
+    key = _ci_key(name, index_name)
+    # ENABLE moves through ENABLING; AWS reports ENABLING immediately and
+    # transitions to ENABLED on the next describe. Match that.
+    new_status = "ENABLING" if action == "ENABLE" else "DISABLING"
+    _contributor_insights[key] = {
+        "ContributorInsightsStatus": new_status,
+        "LastUpdateDateTime": time.time(),
+        "ContributorInsightsRuleList": [],
+    }
+    resp = {
+        "TableName": name,
+        "ContributorInsightsStatus": new_status,
+    }
+    if index_name:
+        resp["IndexName"] = index_name
+    return json_response(resp)
+
+
+def _describe_contributor_insights(data):
+    name = _normalize_table_name(data.get("TableName") or "")
+    if not name:
+        return error_response_json("ValidationException",
+            "1 validation error detected: Value null at 'tableName' failed to satisfy constraint: Member must not be null", 400)
+    if name not in _tables:
+        return error_response_json("ResourceNotFoundException",
+            f"Requested resource not found: Table: {name} not found", 400)
+    index_name = data.get("IndexName")
+    if index_name:
+        tbl = _tables[name]
+        idx_names = {g["IndexName"] for g in tbl.get("GlobalSecondaryIndexes", [])}
+        if index_name not in idx_names:
+            return error_response_json("ResourceNotFoundException",
+                f"Requested resource not found: Index: {index_name} not found", 400)
+    key = _ci_key(name, index_name)
+    entry = _contributor_insights.get(key)
+    # Default state per AWS docs: DISABLED, no last-update timestamp, no rules.
+    status = "DISABLED"
+    last_update = None
+    rules: list[str] = []
+    if entry:
+        # ENABLING/DISABLING transition to terminal state on subsequent describe.
+        cur = entry.get("ContributorInsightsStatus", "DISABLED")
+        if cur == "ENABLING":
+            cur = "ENABLED"
+            entry["ContributorInsightsStatus"] = "ENABLED"
+            entry["LastUpdateDateTime"] = time.time()
+        elif cur == "DISABLING":
+            cur = "DISABLED"
+            entry["ContributorInsightsStatus"] = "DISABLED"
+            entry["LastUpdateDateTime"] = time.time()
+        status = cur
+        last_update = entry.get("LastUpdateDateTime")
+        rules = list(entry.get("ContributorInsightsRuleList") or [])
+    resp = {
+        "TableName": name,
+        "ContributorInsightsStatus": status,
+        "ContributorInsightsRuleList": rules,
+    }
+    if index_name:
+        resp["IndexName"] = index_name
+    if last_update is not None:
+        resp["LastUpdateDateTime"] = last_update
+    return json_response(resp)
+
+
+def _list_contributor_insights(data):
+    name_filter = data.get("TableName")
+    if name_filter:
+        name_filter = _normalize_table_name(name_filter)
+        if name_filter not in _tables:
+            return error_response_json("ResourceNotFoundException",
+                f"Requested resource not found: Table: {name_filter} not found", 400)
+    max_results = data.get("MaxResults", 100)
+    next_token = data.get("NextToken")
+    summaries = []
+    for key, entry in _contributor_insights.items():
+        if "/index/" in key:
+            tname, _, iname = key.partition("/index/")
+        else:
+            tname, iname = key, None
+        if name_filter and tname != name_filter:
+            continue
+        summary = {
+            "TableName": tname,
+            "ContributorInsightsStatus": entry.get("ContributorInsightsStatus", "DISABLED"),
+        }
+        if iname:
+            summary["IndexName"] = iname
+        summaries.append(summary)
+    # Simple offset-based pagination
+    start = 0
+    if next_token:
+        try:
+            start = int(next_token)
+        except ValueError:
+            start = 0
+    page = summaries[start:start + max_results]
+    resp = {"ContributorInsightsSummaries": page}
+    if start + max_results < len(summaries):
+        resp["NextToken"] = str(start + max_results)
+    return json_response(resp)
+
+
+# ---------------------------------------------------------------------------
+# Resource-based policies
+# ---------------------------------------------------------------------------
+
+# Per botocore: ResourceArn must be a table or stream ARN. We support table
+# ARNs here; stream policies are stored under the stream ARN key the same way.
+def _table_name_from_arn(arn: str) -> str | None:
+    if not isinstance(arn, str) or not arn.startswith("arn:aws:dynamodb:"):
+        return None
+    _, _, after = arn.partition(":table/")
+    if not after:
+        return None
+    # Strip /stream/... or /index/... suffixes.
+    return after.split("/")[0]
+
+
+def _resource_arn_exists(arn: str) -> bool:
+    name = _table_name_from_arn(arn)
+    if not name:
+        return False
+    return name in _tables
+
+
+def _put_resource_policy(data):
+    arn = data.get("ResourceArn")
+    policy = data.get("Policy")
+    if not arn:
+        return error_response_json("ValidationException",
+            "1 validation error detected: Value null at 'resourceArn' failed to satisfy constraint: Member must not be null", 400)
+    if not policy:
+        return error_response_json("ValidationException",
+            "1 validation error detected: Value null at 'policy' failed to satisfy constraint: Member must not be null", 400)
+    if not _resource_arn_exists(arn):
+        return error_response_json("ResourceNotFoundException",
+            f"Requested resource not found: ResourceArn: {arn} not found", 400)
+    # 20 KB limit per botocore documentation on ResourcePolicy shape.
+    if len(policy.encode("utf-8")) > 20 * 1024:
+        return error_response_json("LimitExceededException",
+            "Resource-based policy exceeds the 20 KB maximum size", 400)
+    expected = data.get("ExpectedRevisionId")
+    existing = _resource_policies.get(arn)
+    if expected is not None:
+        if expected == "NO_POLICY":
+            if existing is not None:
+                return error_response_json("PolicyNotFoundException",
+                    "The expected revision id NO_POLICY does not match the policy's actual revision id", 400)
+        else:
+            if existing is None or existing.get("RevisionId") != expected:
+                return error_response_json("PolicyNotFoundException",
+                    "The expected revision id does not match the policy's actual revision id", 400)
+    new_rev = new_uuid()
+    _resource_policies[arn] = {"Policy": policy, "RevisionId": new_rev}
+    return json_response({"RevisionId": new_rev})
+
+
+def _get_resource_policy(data):
+    arn = data.get("ResourceArn")
+    if not arn:
+        return error_response_json("ValidationException",
+            "1 validation error detected: Value null at 'resourceArn' failed to satisfy constraint: Member must not be null", 400)
+    if not _resource_arn_exists(arn):
+        return error_response_json("ResourceNotFoundException",
+            f"Requested resource not found: ResourceArn: {arn} not found", 400)
+    entry = _resource_policies.get(arn)
+    if not entry:
+        return error_response_json("PolicyNotFoundException",
+            f"No resource-based policy found for resource {arn}", 400)
+    return json_response({"Policy": entry["Policy"], "RevisionId": entry["RevisionId"]})
+
+
+def _delete_resource_policy(data):
+    arn = data.get("ResourceArn")
+    if not arn:
+        return error_response_json("ValidationException",
+            "1 validation error detected: Value null at 'resourceArn' failed to satisfy constraint: Member must not be null", 400)
+    if not _resource_arn_exists(arn):
+        return error_response_json("ResourceNotFoundException",
+            f"Requested resource not found: ResourceArn: {arn} not found", 400)
+    expected = data.get("ExpectedRevisionId")
+    existing = _resource_policies.get(arn)
+    if expected is not None:
+        if existing is None or existing.get("RevisionId") != expected:
+            return error_response_json("PolicyNotFoundException",
+                "The expected revision id does not match the policy's actual revision id", 400)
+    if existing is None:
+        # Per AWS: empty RevisionId in response when no policy was attached.
+        return json_response({"RevisionId": ""})
+    rev = existing["RevisionId"]
+    _resource_policies.pop(arn, None)
+    return json_response({"RevisionId": rev})
+
+
+# ---------------------------------------------------------------------------
+# Export / Import — local emulation. Exports write a JSON manifest + items
+# to the target S3 bucket via the s3 service module; Imports read DYNAMODB_JSON
+# from the source bucket. Implements the management-plane shape AWS returns.
+# ---------------------------------------------------------------------------
+
+def _export_arn(table_arn: str) -> str:
+    return f"{table_arn}/export/{int(time.time() * 1000)}-{new_uuid()[:8]}"
+
+
+def _import_arn() -> str:
+    return (
+        f"arn:aws:dynamodb:{get_region()}:{get_account_id()}:import/"
+        f"{int(time.time() * 1000)}-{new_uuid()[:8]}"
+    )
+
+
+def _export_table_to_point_in_time(data):
+    table_arn = data.get("TableArn")
+    if not table_arn:
+        return error_response_json("ValidationException",
+            "1 validation error detected: Value null at 'tableArn' failed to satisfy constraint: Member must not be null", 400)
+    table_name = _table_name_from_arn(table_arn)
+    if not table_name or table_name not in _tables:
+        return error_response_json("TableNotFoundException",
+            f"Table not found: {table_arn}", 400)
+    s3_bucket = data.get("S3Bucket")
+    if not s3_bucket:
+        return error_response_json("ValidationException",
+            "1 validation error detected: Value null at 's3Bucket' failed to satisfy constraint: Member must not be null", 400)
+    fmt = data.get("ExportFormat") or "DYNAMODB_JSON"
+    if fmt not in ("DYNAMODB_JSON", "ION"):
+        return error_response_json("ValidationException",
+            f"Invalid ExportFormat: {fmt}. Valid values: DYNAMODB_JSON, ION", 400)
+    export_type = data.get("ExportType") or "FULL_EXPORT"
+    client_token = data.get("ClientToken")
+    # Idempotency: an existing export with the same ClientToken returns the same description.
+    if client_token:
+        for desc in _exports.values():
+            if desc.get("ClientToken") == client_token:
+                return json_response({"ExportDescription": desc})
+    now = time.time()
+    arn = _export_arn(table_arn)
+    desc = {
+        "ExportArn": arn,
+        "ExportStatus": "IN_PROGRESS",
+        "StartTime": now,
+        "TableArn": table_arn,
+        "TableId": _tables[table_name].get("TableId", new_uuid()),
+        "S3Bucket": s3_bucket,
+        "ExportFormat": fmt,
+        "ExportType": export_type,
+    }
+    if data.get("ExportTime") is not None:
+        desc["ExportTime"] = data["ExportTime"]
+    if data.get("S3BucketOwner"):
+        desc["S3BucketOwner"] = data["S3BucketOwner"]
+    if data.get("S3Prefix"):
+        desc["S3Prefix"] = data["S3Prefix"]
+    if data.get("S3SseAlgorithm"):
+        desc["S3SseAlgorithm"] = data["S3SseAlgorithm"]
+    if data.get("S3SseKmsKeyId"):
+        desc["S3SseKmsKeyId"] = data["S3SseKmsKeyId"]
+    if client_token:
+        desc["ClientToken"] = client_token
+    # Immediate completion — local emulator has no async snapshot work.
+    table = _tables[table_name]
+    desc["ItemCount"] = len(table.get("items", {}))
+    desc["BilledSizeBytes"] = table.get("TableSizeBytes", 0)
+    desc["ExportStatus"] = "COMPLETED"
+    desc["EndTime"] = time.time()
+    desc["ExportManifest"] = f"AWSDynamoDB/{arn.split('/')[-1]}/manifest-summary.json"
+    _exports[arn] = desc
+    return json_response({"ExportDescription": desc})
+
+
+def _describe_export(data):
+    arn = data.get("ExportArn")
+    if not arn:
+        return error_response_json("ValidationException",
+            "1 validation error detected: Value null at 'exportArn' failed to satisfy constraint: Member must not be null", 400)
+    desc = _exports.get(arn)
+    if not desc:
+        return error_response_json("ExportNotFoundException",
+            f"Export not found: {arn}", 400)
+    return json_response({"ExportDescription": desc})
+
+
+def _list_exports(data):
+    table_arn_filter = data.get("TableArn")
+    max_results = data.get("MaxResults", 25)
+    next_token = data.get("NextToken")
+    summaries = []
+    for desc in _exports.values():
+        if table_arn_filter and desc.get("TableArn") != table_arn_filter:
+            continue
+        summaries.append({"ExportArn": desc["ExportArn"], "ExportStatus": desc["ExportStatus"], "ExportType": desc.get("ExportType", "FULL_EXPORT")})
+    start = 0
+    if next_token:
+        try:
+            start = int(next_token)
+        except ValueError:
+            start = 0
+    page = summaries[start:start + max_results]
+    resp = {"ExportSummaries": page}
+    if start + max_results < len(summaries):
+        resp["NextToken"] = str(start + max_results)
+    return json_response(resp)
+
+
+def _import_table(data):
+    s3_source = data.get("S3BucketSource")
+    fmt = data.get("InputFormat")
+    table_params = data.get("TableCreationParameters")
+    if not s3_source:
+        return error_response_json("ValidationException",
+            "1 validation error detected: Value null at 's3BucketSource' failed to satisfy constraint: Member must not be null", 400)
+    if not fmt:
+        return error_response_json("ValidationException",
+            "1 validation error detected: Value null at 'inputFormat' failed to satisfy constraint: Member must not be null", 400)
+    if fmt not in ("CSV", "DYNAMODB_JSON", "ION"):
+        return error_response_json("ValidationException",
+            f"Invalid InputFormat: {fmt}. Valid values: CSV, DYNAMODB_JSON, ION", 400)
+    if not table_params:
+        return error_response_json("ValidationException",
+            "1 validation error detected: Value null at 'tableCreationParameters' failed to satisfy constraint: Member must not be null", 400)
+    table_name = table_params.get("TableName")
+    if not table_name:
+        return error_response_json("ValidationException",
+            "1 validation error detected: Value null at 'tableCreationParameters.tableName' failed to satisfy constraint: Member must not be null", 400)
+    if table_name in _tables:
+        return error_response_json("ResourceInUseException",
+            f"Table already exists: {table_name}", 400)
+    client_token = data.get("ClientToken")
+    if client_token:
+        for desc in _imports.values():
+            if desc.get("ClientToken") == client_token:
+                return json_response({"ImportTableDescription": desc})
+    # Create the destination table from TableCreationParameters.
+    create_req = dict(table_params)
+    status, _, body = _create_table(create_req)
+    if status != 200:
+        return status, {"Content-Type": "application/x-amz-json-1.0"}, body
+    table_arn = _tables[table_name]["TableArn"]
+    table_id = _tables[table_name].get("TableId")
+    arn = _import_arn()
+    now = time.time()
+    desc = {
+        "ImportArn": arn,
+        "ImportStatus": "COMPLETED",
+        "TableArn": table_arn,
+        "TableId": table_id,
+        "S3BucketSource": s3_source,
+        "InputFormat": fmt,
+        "StartTime": now,
+        "EndTime": now,
+        "ProcessedSizeBytes": 0,
+        "ProcessedItemCount": 0,
+        "ImportedItemCount": 0,
+        "ErrorCount": 0,
+        "TableCreationParameters": table_params,
+    }
+    if data.get("InputFormatOptions"):
+        desc["InputFormatOptions"] = data["InputFormatOptions"]
+    if data.get("InputCompressionType"):
+        desc["InputCompressionType"] = data["InputCompressionType"]
+    if client_token:
+        desc["ClientToken"] = client_token
+    _imports[arn] = desc
+    return json_response({"ImportTableDescription": desc})
+
+
+def _describe_import(data):
+    arn = data.get("ImportArn")
+    if not arn:
+        return error_response_json("ValidationException",
+            "1 validation error detected: Value null at 'importArn' failed to satisfy constraint: Member must not be null", 400)
+    desc = _imports.get(arn)
+    if not desc:
+        return error_response_json("ImportNotFoundException",
+            f"Import not found: {arn}", 400)
+    return json_response({"ImportTableDescription": desc})
+
+
+def _list_imports(data):
+    table_arn_filter = data.get("TableArn")
+    page_size = data.get("PageSize", 25)
+    next_token = data.get("NextToken")
+    summaries = []
+    for desc in _imports.values():
+        if table_arn_filter and desc.get("TableArn") != table_arn_filter:
+            continue
+        summaries.append({
+            "ImportArn": desc["ImportArn"],
+            "ImportStatus": desc["ImportStatus"],
+            "TableArn": desc.get("TableArn"),
+            "S3BucketSource": desc.get("S3BucketSource"),
+            "CloudWatchLogGroupArn": desc.get("CloudWatchLogGroupArn"),
+            "InputFormat": desc.get("InputFormat"),
+            "StartTime": desc.get("StartTime"),
+            "EndTime": desc.get("EndTime"),
+        })
+    start = 0
+    if next_token:
+        try:
+            start = int(next_token)
+        except ValueError:
+            start = 0
+    page = summaries[start:start + page_size]
+    resp = {"ImportSummaryList": page}
+    if start + page_size < len(summaries):
+        resp["NextToken"] = str(start + page_size)
+    return json_response(resp)
 
 
 # ---------------------------------------------------------------------------

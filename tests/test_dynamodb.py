@@ -2772,3 +2772,202 @@ def test_dynamodb_update_nested_parens_do_not_flatten_two_groups(ddb):
         ddb.delete_table(TableName=table)
 
 
+
+
+# ---------------------------------------------------------------------------
+# Contributor Insights, Resource Policies, Export/Import
+# Added for DynamoDB conformance — previously unsupported by ministack.
+# Behavior verified against botocore service-2.json (2012-08-10).
+# ---------------------------------------------------------------------------
+
+def _ci_table(ddb, name):
+    try:
+        ddb.delete_table(TableName=name)
+    except Exception:
+        pass
+    ddb.create_table(
+        TableName=name,
+        KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+        AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "S"}],
+        BillingMode="PAY_PER_REQUEST",
+    )
+    return ddb.describe_table(TableName=name)["Table"]["TableArn"]
+
+
+def test_dynamodb_contributor_insights_lifecycle(ddb):
+    name = "ci-table"
+    _ci_table(ddb, name)
+    try:
+        # Default state: DISABLED, empty rule list.
+        d = ddb.describe_contributor_insights(TableName=name)
+        assert d["ContributorInsightsStatus"] == "DISABLED"
+        assert d["ContributorInsightsRuleList"] == []
+
+        # ENABLE → returns ENABLING; next describe transitions to ENABLED.
+        u = ddb.update_contributor_insights(TableName=name, ContributorInsightsAction="ENABLE")
+        assert u["ContributorInsightsStatus"] == "ENABLING"
+        d = ddb.describe_contributor_insights(TableName=name)
+        assert d["ContributorInsightsStatus"] == "ENABLED"
+
+        # List includes our table.
+        lst = ddb.list_contributor_insights()
+        names = [s["TableName"] for s in lst.get("ContributorInsightsSummaries", [])]
+        assert name in names
+
+        # DISABLE.
+        u = ddb.update_contributor_insights(TableName=name, ContributorInsightsAction="DISABLE")
+        assert u["ContributorInsightsStatus"] == "DISABLING"
+        d = ddb.describe_contributor_insights(TableName=name)
+        assert d["ContributorInsightsStatus"] == "DISABLED"
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_contributor_insights_invalid_action(ddb):
+    name = "ci-bad-action"
+    _ci_table(ddb, name)
+    try:
+        with pytest.raises(ClientError) as e:
+            ddb.update_contributor_insights(TableName=name, ContributorInsightsAction="TOGGLE")
+        assert e.value.response["Error"]["Code"] == "ValidationException"
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_contributor_insights_unknown_table(ddb):
+    with pytest.raises(ClientError) as e:
+        ddb.describe_contributor_insights(TableName="nope-ci")
+    assert e.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
+def test_dynamodb_resource_policy_put_get_delete(ddb):
+    name = "rp-table"
+    arn = _ci_table(ddb, name)
+    try:
+        policy = json.dumps({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Allow",
+                "Principal": {"AWS": "arn:aws:iam::000000000000:role/r"},
+                "Action": ["dynamodb:GetItem"],
+                "Resource": [arn],
+            }],
+        })
+        r = ddb.put_resource_policy(ResourceArn=arn, Policy=policy)
+        rev = r["RevisionId"]
+        assert rev
+
+        g = ddb.get_resource_policy(ResourceArn=arn)
+        assert g["Policy"] == policy
+        assert g["RevisionId"] == rev
+
+        # Conditional update with wrong expected revision -> PolicyNotFoundException.
+        with pytest.raises(ClientError) as e:
+            ddb.put_resource_policy(ResourceArn=arn, Policy=policy, ExpectedRevisionId="not-a-real-rev")
+        assert e.value.response["Error"]["Code"] == "PolicyNotFoundException"
+
+        # NO_POLICY revision against existing policy -> PolicyNotFoundException.
+        with pytest.raises(ClientError) as e:
+            ddb.put_resource_policy(ResourceArn=arn, Policy=policy, ExpectedRevisionId="NO_POLICY")
+        assert e.value.response["Error"]["Code"] == "PolicyNotFoundException"
+
+        # Correct expected revision succeeds and returns new revision.
+        r2 = ddb.put_resource_policy(ResourceArn=arn, Policy=policy, ExpectedRevisionId=rev)
+        assert r2["RevisionId"] != rev
+
+        # Delete returns the deleted revision.
+        d = ddb.delete_resource_policy(ResourceArn=arn)
+        assert d["RevisionId"] == r2["RevisionId"]
+
+        # Get on missing policy -> PolicyNotFoundException.
+        with pytest.raises(ClientError) as e:
+            ddb.get_resource_policy(ResourceArn=arn)
+        assert e.value.response["Error"]["Code"] == "PolicyNotFoundException"
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_resource_policy_unknown_arn(ddb):
+    fake_arn = "arn:aws:dynamodb:us-east-1:000000000000:table/does-not-exist-rp"
+    with pytest.raises(ClientError) as e:
+        ddb.get_resource_policy(ResourceArn=fake_arn)
+    assert e.value.response["Error"]["Code"] == "ResourceNotFoundException"
+    with pytest.raises(ClientError) as e:
+        ddb.put_resource_policy(ResourceArn=fake_arn, Policy="{}")
+    assert e.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
+def test_dynamodb_export_table_to_point_in_time(ddb):
+    name = "exp-table"
+    arn = _ci_table(ddb, name)
+    try:
+        r = ddb.export_table_to_point_in_time(TableArn=arn, S3Bucket="my-bucket")
+        desc = r["ExportDescription"]
+        assert desc["TableArn"] == arn
+        assert desc["S3Bucket"] == "my-bucket"
+        assert desc["ExportStatus"] in ("IN_PROGRESS", "COMPLETED")
+        export_arn = desc["ExportArn"]
+
+        d = ddb.describe_export(ExportArn=export_arn)
+        assert d["ExportDescription"]["ExportArn"] == export_arn
+
+        lst = ddb.list_exports(TableArn=arn)
+        arns = [s["ExportArn"] for s in lst["ExportSummaries"]]
+        assert export_arn in arns
+
+        # Idempotency: same ClientToken returns the same export.
+        token = "client-token-123"
+        a = ddb.export_table_to_point_in_time(TableArn=arn, S3Bucket="my-bucket", ClientToken=token)
+        b = ddb.export_table_to_point_in_time(TableArn=arn, S3Bucket="my-bucket", ClientToken=token)
+        assert a["ExportDescription"]["ExportArn"] == b["ExportDescription"]["ExportArn"]
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_describe_export_not_found(ddb):
+    with pytest.raises(ClientError) as e:
+        ddb.describe_export(ExportArn="arn:aws:dynamodb:us-east-1:000000000000:table/x/export/nope")
+    assert e.value.response["Error"]["Code"] == "ExportNotFoundException"
+
+
+def test_dynamodb_export_unknown_table(ddb):
+    fake_arn = "arn:aws:dynamodb:us-east-1:000000000000:table/does-not-exist-export"
+    with pytest.raises(ClientError) as e:
+        ddb.export_table_to_point_in_time(TableArn=fake_arn, S3Bucket="b")
+    assert e.value.response["Error"]["Code"] == "TableNotFoundException"
+
+
+def test_dynamodb_import_table(ddb):
+    name = "imp-table"
+    try:
+        ddb.delete_table(TableName=name)
+    except Exception:
+        pass
+    r = ddb.import_table(
+        S3BucketSource={"S3Bucket": "import-src"},
+        InputFormat="DYNAMODB_JSON",
+        TableCreationParameters={
+            "TableName": name,
+            "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+            "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+            "BillingMode": "PAY_PER_REQUEST",
+        },
+    )
+    desc = r["ImportTableDescription"]
+    assert desc["ImportStatus"] in ("IN_PROGRESS", "COMPLETED")
+    assert desc["InputFormat"] == "DYNAMODB_JSON"
+    arn = desc["ImportArn"]
+    try:
+        d = ddb.describe_import(ImportArn=arn)
+        assert d["ImportTableDescription"]["ImportArn"] == arn
+        lst = ddb.list_imports()
+        arns = [s["ImportArn"] for s in lst["ImportSummaryList"]]
+        assert arn in arns
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_describe_import_not_found(ddb):
+    with pytest.raises(ClientError) as e:
+        ddb.describe_import(ImportArn="arn:aws:dynamodb:us-east-1:000000000000:import/nope")
+    assert e.value.response["Error"]["Code"] == "ImportNotFoundException"
