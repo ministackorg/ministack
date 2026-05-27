@@ -281,7 +281,8 @@ def restore_state(data):
                 for ver in func.get("versions", {}).values():
                     if ver.get("code_zip") and isinstance(ver["code_zip"], str):
                         ver["code_zip"] = base64.b64decode(ver["code_zip"])
-                _functions[name] = func
+                region = _region_from_function_record(func)
+                _functions._data[(get_account_id(), region, name)] = func
         _layers.update(data.get("layers", {}))
         _esms.update(data.get("esms", {}))
         _function_urls.update(data.get("function_urls", {}))
@@ -888,6 +889,27 @@ def _build_config(name: str, data: dict, code_zip: bytes | None = None) -> dict:
     return config
 
 
+def _validate_layer_regions(layers: list | None):
+    for layer in layers or []:
+        layer_arn = layer if isinstance(layer, str) else (layer or {}).get("Arn")
+        if not layer_arn:
+            continue
+        try:
+            spec = parse_arn(layer_arn)
+        except ArnParseError:
+            continue
+        if spec.service != "lambda" or not spec.resource.startswith("layer:"):
+            continue
+        if spec.region != get_region():
+            return error_response_json(
+                "InvalidParameterValueException",
+                f"Layer version ARN {layer_arn} is in region {spec.region}; "
+                f"function region is {get_region()}",
+                400,
+            )
+    return None
+
+
 
 
 def _qp_first(query_params: dict, key: str, default: str = "") -> str:
@@ -965,6 +987,25 @@ def _get_func_record_for_ref(function_ref: str) -> tuple[dict | None, dict | Non
     return record, config, name
 
 
+def _get_base_func_record_for_ref(function_ref: str) -> tuple[dict | None, dict | None, str]:
+    if isinstance(function_ref, str) and function_ref.startswith("arn:"):
+        try:
+            spec = parse_arn(function_ref)
+        except ArnParseError:
+            spec = None
+        if spec and spec.service == "lambda":
+            name, _qualifier = _lambda_function_name_and_qualifier_from_arn(function_ref)
+            if name:
+                if spec.account_id != get_account_id():
+                    return None, None, name
+                func = _functions.get_scoped(get_account_id(), spec.region, name)
+                return func, (func or {}).get("config"), name
+
+    name, _qualifier = _resolve_name_and_qualifier(function_ref)
+    func = _functions.get(name)
+    return func, (func or {}).get("config"), name
+
+
 def _get_func_record_for_ref_in_scope(
     function_ref: str,
     *,
@@ -1001,6 +1042,14 @@ def _execution_record_for_config(func: dict, config: dict) -> dict:
 
 def _execute_function_with_config_scope(func: dict, event: dict) -> dict:
     return _run_with_function_config_scope(func, _execute_function, func, event)
+
+
+def _function_config_scope_mismatch(config: dict) -> bool:
+    try:
+        account_id, region = _account_region_from_function_config(config)
+    except ArnParseError:
+        return False
+    return account_id != get_account_id() or region != get_region()
 
 
 # ---------------------------------------------------------------------------
@@ -1293,6 +1342,9 @@ def _create_function(data: dict):
         )
 
     err = _validate_dead_letter_config(data.get("DeadLetterConfig"))
+    if err:
+        return err
+    err = _validate_layer_regions(data.get("Layers"))
     if err:
         return err
 
@@ -1705,6 +1757,10 @@ def _update_config(name: str, data: dict):
     err = _validate_dead_letter_config(data.get("DeadLetterConfig"))
     if err:
         return err
+    if "Layers" in data:
+        err = _validate_layer_regions(data.get("Layers"))
+        if err:
+            return err
     config = _functions[name]["config"]
     for key in (
         "Runtime",
@@ -2982,6 +3038,9 @@ def _execute_function(func: dict, event: dict) -> dict:
     Metric Filters, subscription filters, and CloudWatch alarms all work.
     """
     config = func.get("config") or func
+    if _function_config_scope_mismatch(config):
+        return _run_with_function_config_scope(config, _execute_function, func, event)
+
     request_id = new_uuid()
     started = time.time()
 

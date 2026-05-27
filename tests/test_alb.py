@@ -398,6 +398,48 @@ def test_elbv2_dataplane_forward_lambda(elbv2, lam):
     finally:
         _alb_teardown(elbv2, lam, lb_arn, tg_arn, l_arn, "dp-alb-fwd-fn")
 
+
+@pytest.mark.serial
+def test_elbv2_dataplane_lambda_target_emits_metrics(elbv2, lam, cw):
+    import urllib.request as _req
+
+    suffix = _uuid_mod.uuid4().hex[:8]
+    lb_name = f"alb-met-{suffix}"
+    fn_name = f"alb-met-fn-{suffix}"
+    fn_code = (
+        "def handler(event, context):\n"
+        "    return {'statusCode': 200, 'body': 'ok'}\n"
+    )
+    lb_arn, tg_arn, l_arn, _fn_arn = _alb_setup(elbv2, lam, lb_name, fn_name, fn_code)
+    try:
+        url = f"{_endpoint}/_alb/{lb_name}/metrics"
+        resp = _req.urlopen(_req.Request(url, method="GET"))
+        assert resp.status == 200
+
+        end = time.time() + 1
+        start = end - 600
+        invocations = cw.get_metric_statistics(
+            Namespace="AWS/Lambda",
+            MetricName="Invocations",
+            Dimensions=[{"Name": "FunctionName", "Value": fn_name}],
+            StartTime=start, EndTime=end,
+            Period=60, Statistics=["Sum"],
+        )
+        total = sum(p["Sum"] for p in invocations["Datapoints"])
+        assert total >= 1, f"expected >=1 invocation, got {total}"
+
+        duration = cw.get_metric_statistics(
+            Namespace="AWS/Lambda",
+            MetricName="Duration",
+            Dimensions=[{"Name": "FunctionName", "Value": fn_name}],
+            StartTime=start, EndTime=end,
+            Period=60, Statistics=["Average"],
+        )
+        assert duration["Datapoints"], "no Duration datapoints recorded"
+    finally:
+        _alb_teardown(elbv2, lam, lb_arn, tg_arn, l_arn, fn_name)
+
+
 def test_elbv2_dataplane_event_shape(elbv2, lam):
     """ALB event passed to Lambda contains all required fields."""
     import urllib.parse as _parse

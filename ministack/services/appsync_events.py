@@ -448,8 +448,7 @@ def _events_authorizer_invoke(
     }
     try:
         from ministack.services import lambda_svc
-        name, q = lambda_svc._resolve_name_and_qualifier(arn)  # noqa: SLF001
-        fn, _cfg = lambda_svc._get_func_record_for_qualifier(name, q)  # noqa: SLF001
+        fn, _cfg, _name = lambda_svc._get_func_record_for_ref(arn)  # noqa: SLF001
     except Exception as e:
         logger.error("AppSync Events authorizer resolve %s: %s", arn, e)
         return False, None

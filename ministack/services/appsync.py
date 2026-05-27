@@ -1004,8 +1004,7 @@ def _resolve_lambda(data_source, args):
         return args
 
     import ministack.services.lambda_svc as _lambda_svc
-    func_name = func_arn.rsplit(":", 1)[-1]
-    func = _lambda_svc._functions.get(func_name)
+    func, _config, _func_name = _lambda_svc._get_func_record_for_ref(func_arn)
     if not func:
         return args
 

@@ -87,11 +87,52 @@ def get_state():
     }
 
 
+def _region_for_log_group(account_id: str, log_group_name: str | None) -> str | None:
+    if not log_group_name:
+        return None
+    for (acct, region, name), _group in _log_groups.all_items():
+        if acct == account_id and name == log_group_name:
+            return region
+    return None
+
+
+def _metric_filter_log_group_name(key, value) -> str | None:
+    if isinstance(key, (list, tuple)) and key:
+        return key[0]
+    if isinstance(value, dict):
+        return value.get("logGroupName")
+    return None
+
+
+def _metric_filter_restore_region(account_id: str, key, value) -> str:
+    group_name = _metric_filter_log_group_name(key, value)
+    return (
+        _region_for_log_group(account_id, group_name)
+        or _metric_filters._region_for_legacy_value(key, value)
+    )
+
+
+def _restore_metric_filters(metric_filters):
+    if isinstance(metric_filters, AccountRegionScopedDict):
+        _metric_filters.update(metric_filters)
+        return
+    if isinstance(metric_filters, AccountScopedDict):
+        for (account_id, key), value in metric_filters._data.items():
+            region = _metric_filter_restore_region(account_id, key, value)
+            _metric_filters.set_scoped(account_id, region, key, value)
+        return
+    if isinstance(metric_filters, dict):
+        account_id = get_account_id()
+        for key, value in metric_filters.items():
+            region = _metric_filter_restore_region(account_id, key, value)
+            _metric_filters.set_scoped(account_id, region, key, value)
+
+
 def restore_state(data):
     if data:
         _log_groups.update(data.get("log_groups", {}))
         _destinations.update(data.get("destinations", {}))
-        _metric_filters.update(data.get("metric_filters", {}))
+        _restore_metric_filters(data.get("metric_filters", {}))
         _queries.update(data.get("queries", {}))
         _delivery_sources.update(data.get("delivery_sources", {}))
         _delivery_destinations.update(data.get("delivery_destinations", {}))

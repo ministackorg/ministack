@@ -263,10 +263,10 @@ def _write_lambda(arn, tags):
     Raises ``_ResourceNotFound`` if the function does not exist in the caller's
     account (AWS returns InvalidParameterException in that case)."""
     import ministack.services.lambda_svc as svc
-    name = arn.split("function:")[-1]
-    if name not in svc._functions:
+    func, _config, _name = svc._get_base_func_record_for_ref(arn)
+    if func is None:
         raise _ResourceNotFound(arn)
-    svc._functions[name].setdefault("tags", {}).update(tags)
+    func.setdefault("tags", {}).update(tags)
 
 
 def _write_sqs(arn, tags):
@@ -424,10 +424,10 @@ def _remove_lambda(arn, keys):
 
     Raises ``_ResourceNotFound`` if the function does not exist."""
     import ministack.services.lambda_svc as svc
-    name = arn.split("function:")[-1]
-    if name not in svc._functions:
+    func, _config, _name = svc._get_base_func_record_for_ref(arn)
+    if func is None:
         raise _ResourceNotFound(arn)
-    tags = svc._functions[name].get("tags", {})
+    tags = func.get("tags", {})
     for k in keys:
         tags.pop(k, None)
 

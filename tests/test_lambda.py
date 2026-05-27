@@ -195,6 +195,53 @@ def test_lambda_cloudwatch_logs_are_region_scoped():
     assert all(east_marker not in msg for msg in west_messages)
 
 
+@pytest.mark.serial
+def test_lambda_cloudwatch_metrics_are_region_scoped():
+    east = _regional_client("lambda", "us-east-1")
+    west = _regional_client("lambda", "us-west-2")
+    east_cw = _regional_client("cloudwatch", "us-east-1")
+    west_cw = _regional_client("cloudwatch", "us-west-2")
+    name = f"lambda-metric-region-{_uuid_mod.uuid4().hex}"
+
+    east.create_function(
+        FunctionName=name,
+        Runtime="python3.12",
+        Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _region_marker_code("east")},
+    )
+    west.create_function(
+        FunctionName=name,
+        Runtime="python3.12",
+        Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _region_marker_code("west")},
+    )
+
+    east.invoke(FunctionName=name, Payload=json.dumps({"region": "east"}))
+
+    end = time.time() + 1
+    start = end - 600
+    dims = [{"Name": "FunctionName", "Value": name}]
+    east_metrics = east_cw.get_metric_statistics(
+        Namespace="AWS/Lambda",
+        MetricName="Invocations",
+        Dimensions=dims,
+        StartTime=start, EndTime=end,
+        Period=60, Statistics=["Sum"],
+    )
+    west_metrics = west_cw.get_metric_statistics(
+        Namespace="AWS/Lambda",
+        MetricName="Invocations",
+        Dimensions=dims,
+        StartTime=start, EndTime=end,
+        Period=60, Statistics=["Sum"],
+    )
+
+    assert sum(p["Sum"] for p in east_metrics["Datapoints"]) >= 1
+    assert sum(p["Sum"] for p in west_metrics["Datapoints"]) == 0
+
+
 def test_lambda_full_function_arn_must_match_request_region():
     east = _regional_client("lambda", "us-east-1")
     west = _regional_client("lambda", "us-west-2")
@@ -1811,6 +1858,48 @@ def test_lambda_function_with_layer(lam):
     fn = lam.get_function(FunctionName="fn-with-layer")
     assert layer_arn in fn["Configuration"]["Layers"][0]["Arn"]
 
+
+def test_lambda_rejects_cross_region_layers_on_create_and_update():
+    east = _regional_client("lambda", "us-east-1")
+    west = _regional_client("lambda", "us-west-2")
+    suffix = _uuid_mod.uuid4().hex[:8]
+
+    layer_buf = io.BytesIO()
+    with zipfile.ZipFile(layer_buf, "w") as z:
+        z.writestr("layer.py", "")
+    layer_arn = west.publish_layer_version(
+        LayerName=f"cross-region-layer-{suffix}",
+        Content={"ZipFile": layer_buf.getvalue()},
+    )["LayerVersionArn"]
+
+    create_name = f"cross-layer-create-{suffix}"
+    with pytest.raises(ClientError) as create_exc:
+        east.create_function(
+            FunctionName=create_name,
+            Runtime="python3.12",
+            Role=_LAMBDA_ROLE,
+            Handler="index.handler",
+            Code={"ZipFile": _make_zip(_LAMBDA_CODE)},
+            Layers=[layer_arn],
+        )
+    assert create_exc.value.response["Error"]["Code"] == "InvalidParameterValueException"
+
+    update_name = f"cross-layer-update-{suffix}"
+    east.create_function(
+        FunctionName=update_name,
+        Runtime="python3.12",
+        Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _make_zip(_LAMBDA_CODE)},
+    )
+    try:
+        with pytest.raises(ClientError) as update_exc:
+            east.update_function_configuration(FunctionName=update_name, Layers=[layer_arn])
+        assert update_exc.value.response["Error"]["Code"] == "InvalidParameterValueException"
+    finally:
+        east.delete_function(FunctionName=update_name)
+
+
 def test_lambda_layer_content_location(lam):
     """Content.Location should be a non-empty URL pointing to the layer zip."""
     buf = io.BytesIO()
@@ -2880,6 +2969,122 @@ def test_lambda_function_config_account_region_rejects_malformed_arn():
         })
     with pytest.raises(ArnParseError):
         _runtime_account_region({})
+
+
+def test_lambda_integration_lookup_preserves_full_arn_region():
+    account_id = "000000000000"
+    function_name = f"integration-arn-scope-{_uuid_mod.uuid4().hex}"
+    function_arn = f"arn:aws:lambda:us-west-2:{account_id}:function:{function_name}"
+    original_account = get_account_id()
+    original_region = get_region()
+
+    lsvc._functions.set_scoped(
+        account_id,
+        "us-west-2",
+        function_name,
+        {
+            "config": {"FunctionName": function_name, "FunctionArn": function_arn},
+            "versions": {},
+            "aliases": {},
+        },
+    )
+    try:
+        set_request_account_id(account_id)
+        set_request_region("us-east-1")
+
+        record, config, resolved_name = lsvc._get_func_record_for_ref(function_arn)
+        assert record is not None
+        assert resolved_name == function_name
+        assert config["FunctionArn"] == function_arn
+
+        request_scoped_name, request_scoped_qualifier = lsvc._resolve_request_scoped_name_and_qualifier(function_arn)
+        request_record, request_config = lsvc._get_func_record_for_qualifier(
+            request_scoped_name,
+            request_scoped_qualifier,
+        )
+        assert request_record is None
+        assert request_config is None
+    finally:
+        lsvc._functions.pop_scoped(account_id, "us-west-2", function_name, None)
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
+def test_lambda_restore_legacy_plain_functions_uses_arn_region():
+    account_id = "000000000000"
+    function_name = f"restore-legacy-region-{_uuid_mod.uuid4().hex}"
+    function_arn = f"arn:aws:lambda:us-west-2:{account_id}:function:{function_name}"
+    original_account = get_account_id()
+    original_region = get_region()
+    original_functions = dict(lsvc._functions._data)
+
+    legacy_func = {
+        "config": {
+            "FunctionName": function_name,
+            "FunctionArn": function_arn,
+        },
+        "versions": {},
+        "aliases": {},
+    }
+    try:
+        lsvc._functions.clear()
+        set_request_account_id(account_id)
+        set_request_region("us-east-1")
+
+        lsvc.restore_state({"functions": {function_name: legacy_func}})
+
+        assert lsvc._functions.get_scoped(account_id, "us-west-2", function_name) is legacy_func
+        assert lsvc._functions.get_scoped(account_id, "us-east-1", function_name) is None
+    finally:
+        lsvc._functions._data.clear()
+        lsvc._functions._data.update(original_functions)
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
+def test_execute_function_uses_function_config_region_for_logs(monkeypatch):
+    from ministack.services import cloudwatch_logs as cwl
+
+    account_id = "000000000000"
+    function_name = f"indirect-exec-region-{_uuid_mod.uuid4().hex}"
+    log_group = f"/aws/lambda/{function_name}"
+    function_arn = f"arn:aws:lambda:us-west-2:{account_id}:function:{function_name}"
+    original_account = get_account_id()
+    original_region = get_region()
+
+    func = {
+        "config": {
+            "FunctionName": function_name,
+            "FunctionArn": function_arn,
+            "Runtime": "python3.12",
+            "MemorySize": 128,
+            "LoggingConfig": {"LogGroup": log_group},
+        },
+        "code_zip": b"dummy",
+        "versions": {},
+        "aliases": {},
+    }
+
+    monkeypatch.setattr(
+        lsvc,
+        "_execute_function_warm",
+        lambda _func, _event: {"body": {"ok": True}, "log": "ran in target region"},
+    )
+    cwl.reset()
+    try:
+        set_request_account_id(account_id)
+        set_request_region("us-east-1")
+        result = lsvc._execute_function(func, {})
+        assert result["body"] == {"ok": True}
+
+        set_request_region("us-west-2")
+        assert log_group in cwl._log_groups
+        set_request_region("us-east-1")
+        assert log_group not in cwl._log_groups
+    finally:
+        cwl.reset()
+        set_request_account_id(original_account)
+        set_request_region(original_region)
 
 
 def test_lambda_runtime_env_vars_filters_reserved_scope_values():

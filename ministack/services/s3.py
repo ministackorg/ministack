@@ -1776,8 +1776,7 @@ def _deliver_event_to_sns(arn: str, event_payload: dict) -> None:
 def _deliver_event_to_lambda(arn: str, event_payload: dict) -> None:
     from ministack.services import lambda_svc as _lambda
 
-    func_name = arn.rsplit(":", 1)[-1]
-    func = _lambda._functions.get(func_name)
+    func, _config, func_name = _lambda._get_func_record_for_ref(arn)
     if not func:
         logger.warning("S3 notification: Lambda function %s not found", func_name)
         return

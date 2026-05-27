@@ -945,7 +945,7 @@ async def _invoke_lambda_proxy(
     # Bare Lambda ARNs and plain function names keep working via the fallback.
     lambda_ref = _extract_lambda_ref_from_integration_uri(integration.get("integrationUri", ""))
     func_name, qualifier = lambda_svc._resolve_name_and_qualifier(lambda_ref)
-    func_data, func_config = lambda_svc._get_func_record_for_qualifier(func_name, qualifier)
+    func_data, func_config, func_name = lambda_svc._get_func_record_for_ref(lambda_ref)
     if func_data is None:
         return 502, {"Content-Type": "application/json"}, json.dumps({
             "message": f"Lambda function '{func_name}'" +
@@ -998,7 +998,7 @@ async def _invoke_lambda_proxy(
     # Response shaping (throttle→429, error→502, body→envelope) goes through
     # the shared helper so v1/v2 stay consistent and we get 429s on
     # ConcurrentInvocationLimitExceeded.
-    exec_record = {"config": func_config, "code_zip": func_data.get("code_zip")}
+    exec_record = lambda_svc._execution_record_for_config(func_data, func_config)
     result = await asyncio.to_thread(lambda_svc._execute_function, exec_record, event)
     lambda_response, _ = lambda_svc.lambda_execute_result_to_api_proxy_response(result)
 
@@ -1688,7 +1688,7 @@ async def _invoke_ws_lambda(api_id: str, account_id: str, route: dict, stage: st
     # that nests the Lambda ARN between /functions/ and /invocations.
     lambda_ref = _extract_lambda_ref_from_integration_uri(integration.get("integrationUri", ""))
     func_name, qualifier = lambda_svc._resolve_name_and_qualifier(lambda_ref)
-    func_data, func_config = lambda_svc._get_func_record_for_qualifier(func_name, qualifier)
+    func_data, func_config, func_name = lambda_svc._get_func_record_for_ref(lambda_ref)
     if func_data is None:
         return None
 
@@ -1745,11 +1745,18 @@ async def _invoke_ws_lambda(api_id: str, account_id: str, route: dict, stage: st
         # SDK invoke path populates and forcing a cold start on every WS
         # message. That's why pre-warming the function via the SDK didn't
         # help WebSocket dispatch — keys didn't match.
-        worker = get_or_create_worker(
-            func_name, func_config, code_zip,
-            qualifier=qualifier or "$LATEST",
+        def _invoke_worker():
+            worker = get_or_create_worker(
+                func_name, func_config, code_zip,
+                qualifier=qualifier or "$LATEST",
+            )
+            return worker.invoke(event, message_id)
+
+        result = await asyncio.to_thread(
+            lambda_svc._run_with_function_config_scope,
+            func_config,
+            _invoke_worker,
         )
-        result = await asyncio.to_thread(worker.invoke, event, message_id)
         if result.get("status") == "error":
             return {"statusCode": 500, "body": result.get("error", "")}
         return result.get("result", {})

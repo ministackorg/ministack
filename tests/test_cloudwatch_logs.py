@@ -861,6 +861,52 @@ def test_metric_filters_survive_warm_boot():
     mod.reset()
 
 
+def test_legacy_metric_filters_restore_to_log_group_region():
+    from ministack.core.responses import AccountScopedDict, get_region, set_request_region
+
+    mod = _module()
+    mod.reset()
+    group = f"/aws/lambda/legacy-filter-{_uuid_mod.uuid4().hex[:8]}"
+    original_region = get_region()
+
+    legacy_metric_filters = AccountScopedDict()
+    legacy_metric_filters[(group, "ErrorCount")] = {
+        "filterName": "ErrorCount",
+        "logGroupName": group,
+        "filterPattern": "ERROR",
+        "metricTransformations": [{
+            "metricName": "Errors",
+            "metricNamespace": "Lambda",
+            "metricValue": "1",
+        }],
+        "creationTime": 1700000000000,
+    }
+
+    try:
+        set_request_region("us-east-1")
+        mod.restore_state({
+            "log_groups": {
+                group: {
+                    "arn": f"arn:aws:logs:us-west-2:000000000000:log-group:{group}:*",
+                    "creationTime": 1700000000000,
+                    "retentionInDays": None,
+                    "tags": {},
+                    "subscriptionFilters": {},
+                    "streams": {},
+                },
+            },
+            "metric_filters": legacy_metric_filters,
+        })
+
+        set_request_region("us-west-2")
+        assert (group, "ErrorCount") in mod._metric_filters
+        set_request_region("us-east-1")
+        assert (group, "ErrorCount") not in mod._metric_filters
+    finally:
+        set_request_region(original_region)
+        mod.reset()
+
+
 # ── _queries ───────────────────────────────────────────────────────────
 
 def test_queries_survive_warm_boot():

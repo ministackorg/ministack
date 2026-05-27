@@ -1,12 +1,35 @@
+import io
 import os
+import uuid
+import zipfile
 
+import boto3
 import pytest
+from botocore.config import Config
 from botocore.exceptions import ClientError
 
 # ========== Resource Groups Tagging API ==========
 
 # Unique tag key scopes all resources to this test file — avoids collisions with other tests
 _TAG_KEY = "tagging-test"
+
+
+def _regional_client(service, region):
+    return boto3.client(
+        service,
+        endpoint_url=os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566"),
+        region_name=region,
+        aws_access_key_id="test",
+        aws_secret_access_key="test",
+        config=Config(region_name=region, retries={"mode": "standard"}),
+    )
+
+
+def _lambda_zip():
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("index.py", "def handler(event, context):\n    return 'ok'\n")
+    return buf.getvalue()
 
 
 # ========== S3 ==========
@@ -656,6 +679,68 @@ def test_tagging_tag_resources_missing_lambda_surfaces_in_failed_map(tagging):
     entry = resp["FailedResourcesMap"][arn]
     assert entry["ErrorCode"] == "InvalidParameterException"
     assert entry["StatusCode"] == 400
+
+
+def test_tagging_tag_resources_lambda_arn_uses_resource_region(lam, tagging):
+    west_lam = _regional_client("lambda", "us-west-2")
+    fname = f"tg-lambda-region-{uuid.uuid4().hex[:8]}"
+    code = _lambda_zip()
+
+    east_arn = None
+    west_arn = None
+    try:
+        east_arn = lam.create_function(
+            FunctionName=fname,
+            Runtime="python3.12",
+            Role="arn:aws:iam::000000000000:role/test-role",
+            Handler="index.handler",
+            Code={"ZipFile": code},
+        )["FunctionArn"]
+        west_arn = west_lam.create_function(
+            FunctionName=fname,
+            Runtime="python3.12",
+            Role="arn:aws:iam::000000000000:role/test-role",
+            Handler="index.handler",
+            Code={"ZipFile": code},
+        )["FunctionArn"]
+
+        lam.tag_resource(Resource=east_arn, Tags={"region": "east"})
+        tagging.tag_resources(ResourceARNList=[west_arn], Tags={"region": "west"})
+
+        assert lam.list_tags(Resource=east_arn)["Tags"]["region"] == "east"
+        assert west_lam.list_tags(Resource=west_arn)["Tags"]["region"] == "west"
+
+        tagging.untag_resources(ResourceARNList=[west_arn], TagKeys=["region"])
+        assert lam.list_tags(Resource=east_arn)["Tags"]["region"] == "east"
+        assert "region" not in west_lam.list_tags(Resource=west_arn)["Tags"]
+    finally:
+        if east_arn:
+            lam.delete_function(FunctionName=fname)
+        if west_arn:
+            west_lam.delete_function(FunctionName=fname)
+
+
+def test_tagging_tag_resources_qualified_lambda_arn_tags_base_function(lam, tagging):
+    fname = f"tg-lambda-qualified-{uuid.uuid4().hex[:8]}"
+    base_arn = None
+    try:
+        base_arn = lam.create_function(
+            FunctionName=fname,
+            Runtime="python3.12",
+            Role="arn:aws:iam::000000000000:role/test-role",
+            Handler="index.handler",
+            Code={"ZipFile": _lambda_zip()},
+        )["FunctionArn"]
+        version_arn = lam.publish_version(FunctionName=fname)["FunctionArn"]
+
+        tagging.tag_resources(ResourceARNList=[version_arn], Tags={"qualified": "yes"})
+        assert lam.list_tags(Resource=base_arn)["Tags"]["qualified"] == "yes"
+
+        tagging.untag_resources(ResourceARNList=[version_arn], TagKeys=["qualified"])
+        assert "qualified" not in lam.list_tags(Resource=base_arn)["Tags"]
+    finally:
+        if base_arn:
+            lam.delete_function(FunctionName=fname)
 
 
 def test_tagging_untag_missing_sns_surfaces_in_failed_map(tagging):

@@ -501,15 +501,29 @@ def _match_recursive(resources, parent_id, segments, params):
     return None, params
 
 
-async def _call_lambda(func_name, event, qualifier=None):
+def _extract_lambda_ref_from_integration_uri(uri: str) -> str:
+    if not uri:
+        return ""
+    if "/functions/" in uri:
+        inner = uri.split("/functions/", 1)[1]
+        if "/invocations" in inner:
+            inner = inner.split("/invocations", 1)[0]
+        return inner
+    if uri.endswith("/invocations"):
+        return uri[: -len("/invocations")]
+    return uri
+
+
+async def _call_lambda(function_ref, event):
     """Invoke a Lambda function and return the parsed response dict.
 
-    ``qualifier`` may be a version number or alias name; aliases resolve to
-    their target version via ``_get_func_record_for_qualifier`` so aliased
-    integration URIs (arn:...:function:<name>:<alias>) invoke correctly (#407)."""
+    ``function_ref`` may be a function name, qualified name, or full ARN.
+    Full ARNs resolve in their ARN region so API Gateway integrations keep
+    working after Lambda state became region-scoped."""
     from ministack.services import lambda_svc
 
-    func_data, func_config = lambda_svc._get_func_record_for_qualifier(func_name, qualifier)
+    func_name, qualifier = lambda_svc._resolve_name_and_qualifier(function_ref)
+    func_data, func_config, func_name = lambda_svc._get_func_record_for_ref(function_ref)
     if func_data is None:
         label = f"{func_name}:{qualifier}" if qualifier else func_name
         return None, f"Lambda function '{label}' not found"
@@ -518,7 +532,7 @@ async def _call_lambda(func_name, event, qualifier=None):
     # Logs emission and Docker log output work for API Gateway invocations.
     # Response shaping (throttle→429, error→502, body→envelope) goes through
     # the shared helper so v1/v2 stay consistent.
-    exec_record = {"config": func_config, "code_zip": func_data.get("code_zip")}
+    exec_record = lambda_svc._execution_record_for_config(func_data, func_config)
     result = await asyncio.to_thread(lambda_svc._execute_function, exec_record, event)
     lambda_response, _ = lambda_svc.lambda_execute_result_to_api_proxy_response(result)
     # On error the helper returns {statusCode: 502, body: <msg>}; preserve
@@ -915,14 +929,7 @@ async def _invoke_lambda_proxy_v1(integration, api_id, stage_name, stage, resour
     #   1. arn:aws:apigateway:{region}:lambda:path/2015-03-31/functions/arn:aws:lambda:{region}:{acct}:function:{name}[:{qualifier}]/invocations
     #   2. arn:aws:lambda:{region}:{acct}:function:{name}[:{qualifier}]
     #   3. plain function name: MyFunction[:{qualifier}]
-    from ministack.services import lambda_svc as _lambda_svc
-    if "function:" in uri:
-        # Strip wrapper up through 'function:' and any trailing /invocations.
-        tail = uri.split("function:")[-1].split("/")[0]
-        # tail is now "<name>" or "<name>:<qualifier>".
-        func_name, qualifier = _lambda_svc._resolve_name_and_qualifier(tail)
-    else:
-        func_name, qualifier = _lambda_svc._resolve_name_and_qualifier(uri)
+    lambda_ref = _extract_lambda_ref_from_integration_uri(uri)
 
     qs_params = {k: v[0] for k, v in query_params.items()} if query_params else None
     mv_qs_params = {k: list(v) for k, v in query_params.items()} if query_params else None
@@ -970,7 +977,7 @@ async def _invoke_lambda_proxy_v1(integration, api_id, stage_name, stage, resour
         "isBase64Encoded": False,
     }
 
-    lambda_response, err = await _call_lambda(func_name, event, qualifier=qualifier)
+    lambda_response, err = await _call_lambda(lambda_ref, event)
     if err:
         return 502, {"Content-Type": "application/json"}, json.dumps({"message": err}).encode()
 

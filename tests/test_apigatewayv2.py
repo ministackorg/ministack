@@ -1087,6 +1087,72 @@ def test_apigw_integration_content_handling_strategy_roundtrip(apigw):
     integ = apigw.get_integration(ApiId=api_id, IntegrationId=integ_id)
     assert integ.get("ContentHandlingStrategy") == "CONVERT_TO_BINARY"
 
+
+def test_apigw_websocket_lambda_worker_uses_function_region(monkeypatch):
+    import asyncio
+
+    from ministack.core import lambda_runtime
+    from ministack.core.responses import get_region, set_request_region
+    from ministack.services import apigateway as apigw_mod
+    from ministack.services import lambda_svc
+
+    api_id = f"ws-scope-{_uuid_mod.uuid4().hex[:8]}"
+    integration_id = f"int-{_uuid_mod.uuid4().hex[:8]}"
+    func_name = f"ws-scope-fn-{_uuid_mod.uuid4().hex[:8]}"
+    func_arn = f"arn:aws:lambda:us-west-2:000000000000:function:{func_name}"
+    func_config = {
+        "FunctionName": func_name,
+        "FunctionArn": func_arn,
+        "Runtime": "python3.12",
+    }
+    func_record = {"config": func_config, "code_zip": b"fake-zip"}
+    seen_regions = []
+
+    def fake_get_func_record_for_ref(function_ref):
+        assert function_ref == func_arn
+        return func_record, func_config, func_name
+
+    class FakeWorker:
+        def invoke(self, event, message_id):
+            seen_regions.append(("invoke", get_region()))
+            return {"status": "ok", "result": {"statusCode": 200, "body": "ok"}}
+
+    def fake_get_or_create_worker(name, config, code_zip, *, qualifier):
+        seen_regions.append(("spawn", get_region(), name, qualifier))
+        return FakeWorker()
+
+    monkeypatch.setattr(lambda_svc, "_get_func_record_for_ref", fake_get_func_record_for_ref)
+    monkeypatch.setattr(lambda_runtime, "get_or_create_worker", fake_get_or_create_worker)
+
+    apigw_mod._integrations[api_id] = {
+        integration_id: {"integrationType": "AWS_PROXY", "integrationUri": func_arn}
+    }
+    route = {"routeKey": "$default", "target": f"integrations/{integration_id}"}
+    set_request_region("us-east-1")
+    try:
+        result = asyncio.run(apigw_mod._invoke_ws_lambda(
+            api_id,
+            "000000000000",
+            route,
+            "$default",
+            "conn-1",
+            "MESSAGE",
+            "msg-1",
+            "{}",
+            "127.0.0.1",
+            {},
+        ))
+    finally:
+        apigw_mod._integrations.pop(api_id, None)
+        set_request_region("us-east-1")
+
+    assert result == {"statusCode": 200, "body": "ok"}
+    assert seen_regions == [
+        ("spawn", "us-west-2", func_name, "$LATEST"),
+        ("invoke", "us-west-2"),
+    ]
+
+
 def test_apigw_delete_route_v2(apigw):
     """DeleteRoute removes the route from GetRoutes."""
     api_id = apigw.create_api(Name="qa-apigw-del-route", ProtocolType="HTTP")["ApiId"]

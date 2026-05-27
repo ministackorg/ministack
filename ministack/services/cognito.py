@@ -489,8 +489,7 @@ def _apply_pretoken_trigger(pool_id: str, claims: dict, token_type: str,
     try:
         # Lazy import to avoid a circular dependency between cognito and lambda_svc.
         from ministack.services import lambda_svc
-        name, qualifier = lambda_svc._resolve_name_and_qualifier(arn)
-        record, alias = lambda_svc._get_func_record_for_qualifier(name, qualifier)
+        record, _config, _name = lambda_svc._get_func_record_for_ref(arn)
         if record is None:
             raise RuntimeError(f"PreTokenGeneration Lambda not found: {arn}")
         result = lambda_svc._execute_function(record, event)

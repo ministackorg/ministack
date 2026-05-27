@@ -21,17 +21,17 @@ from datetime import datetime, timezone
 from urllib.parse import parse_qs
 
 from ministack.core.persistence import PERSIST_STATE, load_state
-from ministack.core.responses import AccountScopedDict, get_account_id, get_region, new_uuid
+from ministack.core.responses import AccountRegionScopedDict, AccountScopedDict, get_account_id, get_region, new_uuid
 
 logger = logging.getLogger("cloudwatch")
 
 REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 TWO_WEEKS_SECONDS = 14 * 24 * 3600
 
-# Per-tenant metric store — keyed by (namespace, metric_name, dims_key) per
-# account via AccountScopedDict so GetMetricStatistics / ListMetrics from one
-# account cannot see another account's data points.
-_metrics = AccountScopedDict()
+# Per-tenant, per-region metric store — keyed by (namespace, metric_name,
+# dims_key) via AccountRegionScopedDict so regional CloudWatch clients do not
+# see metrics emitted in another AWS region.
+_metrics = AccountRegionScopedDict()
 _alarms = AccountScopedDict()
 _composite_alarms = AccountScopedDict()
 # Alarm state-change history, per-account. Stored as AccountScopedDict under
@@ -573,12 +573,20 @@ def _get_metric_statistics(params, cbor_data, is_cbor, is_json=False):
         start_time = _parse_ts(cbor_data.get("StartTime"))
         end_time = _parse_ts(cbor_data.get("EndTime"))
         req_stats = cbor_data.get("Statistics", [])
+        req_dims = _dims_from_list(cbor_data.get("Dimensions") or [])
     else:
         namespace = _p(params, "Namespace")
         metric_name = _p(params, "MetricName")
         period = int(_p(params, "Period") or 60)
         start_time = _parse_ts(_p(params, "StartTime"))
         end_time = _parse_ts(_p(params, "EndTime"))
+        req_dims = {}
+        di = 1
+        while _p(params, f"Dimensions.member.{di}.Name"):
+            req_dims[_p(params, f"Dimensions.member.{di}.Name")] = _p(
+                params, f"Dimensions.member.{di}.Value"
+            )
+            di += 1
         req_stats = []
         si = 1
         while _p(params, f"Statistics.member.{si}"):
@@ -589,8 +597,11 @@ def _get_metric_statistics(params, cbor_data, is_cbor, is_json=False):
         req_stats = ["SampleCount", "Sum", "Average", "Minimum", "Maximum"]
 
     all_points = []
-    for (ns, mn, _), pts in _metrics.items():
+    req_dims_key = _dims_key(req_dims) if req_dims else None
+    for (ns, mn, dk), pts in _metrics.items():
         if ns == namespace and mn == metric_name:
+            if req_dims_key is not None and dk != req_dims_key:
+                continue
             all_points.extend(pts)
 
     if start_time is not None:
@@ -1470,6 +1481,14 @@ def _list_dashboards(params, cbor_data, is_cbor, is_json=False):
 
 def _dims_key(dims: dict) -> str:
     return "|".join(f"{k}={v}" for k, v in sorted(dims.items()))
+
+
+def _dims_from_list(dimensions: list[dict]) -> dict:
+    return {
+        d["Name"]: d.get("Value", "")
+        for d in dimensions
+        if isinstance(d, dict) and d.get("Name")
+    }
 
 
 def _p(params, key, default=""):
