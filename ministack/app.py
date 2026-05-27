@@ -1821,6 +1821,16 @@ def _load_persisted_state():
         _get_module("rds")
         logger.info("RDS: eager-loaded module to respawn persisted containers at boot")
 
+    # `lambda_durable` is reached only via `lambda_svc.handle_request`, never
+    # directly through the lazy router (no SERVICE_REGISTRY entry — it has no
+    # AWS endpoint of its own). Without an eager import at boot, persisted
+    # durable executions silently disappear until something happens to invoke
+    # a durable endpoint. Same conditional-import pattern as RDS — only pay
+    # the cold-start cost when state actually exists.
+    if load_state("lambda_durable"):
+        _get_module("lambda_durable")
+        logger.info("Lambda Durable: eager-loaded module to restore persisted executions")
+
 
 async def _wait_for_port(port, timeout=30):
     """Wait until the server is accepting TCP connections."""
