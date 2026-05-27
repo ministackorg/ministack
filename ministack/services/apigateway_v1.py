@@ -98,7 +98,6 @@ REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 # All per-tenant state uses AccountScopedDict so the same REST API id in two
 # different accounts never collides and list operations don't leak cross-account.
 _rest_apis = AccountScopedDict()           # rest_api_id -> RestApi
-_rest_api_regions = AccountScopedDict()    # rest_api_id -> owning region
 _resources = AccountScopedDict()           # rest_api_id -> {resource_id -> Resource}
 _stages_v1 = AccountScopedDict()           # rest_api_id -> {stage_name -> Stage}
 _deployments_v1 = AccountScopedDict()      # rest_api_id -> {deployment_id -> Deployment}
@@ -502,29 +501,25 @@ def _match_recursive(resources, parent_id, segments, params):
     return None, params
 
 
-async def _call_lambda(function_ref, event, *, account_id=None, region=None):
+async def _call_lambda(func_name, event, qualifier=None):
     """Invoke a Lambda function and return the parsed response dict.
 
-    ``function_ref`` may be a name, partial ARN, or full ARN. Full ARNs are
-    resolved through Lambda's scoped lookup so region-qualified integration URIs
-    invoke the function named in the ARN instead of the request/default region."""
+    ``qualifier`` may be a version number or alias name; aliases resolve to
+    their target version via ``_get_func_record_for_qualifier`` so aliased
+    integration URIs (arn:...:function:<name>:<alias>) invoke correctly (#407)."""
     from ministack.services import lambda_svc
 
-    func_data, func_config, func_name = lambda_svc._get_func_record_for_ref_in_scope(
-        function_ref,
-        account_id=account_id,
-        region=region,
-    )
+    func_data, func_config = lambda_svc._get_func_record_for_qualifier(func_name, qualifier)
     if func_data is None:
-        label = function_ref or func_name
+        label = f"{func_name}:{qualifier}" if qualifier else func_name
         return None, f"Lambda function '{label}' not found"
 
     # Route through the central _execute_function dispatcher so CloudWatch
     # Logs emission and Docker log output work for API Gateway invocations.
     # Response shaping (throttle→429, error→502, body→envelope) goes through
     # the shared helper so v1/v2 stay consistent.
-    exec_record = lambda_svc._execution_record_for_config(func_data, func_config)
-    result = await asyncio.to_thread(lambda_svc._execute_function_with_config_scope, exec_record, event)
+    exec_record = {"config": func_config, "code_zip": func_data.get("code_zip")}
+    result = await asyncio.to_thread(lambda_svc._execute_function, exec_record, event)
     lambda_response, _ = lambda_svc.lambda_execute_result_to_api_proxy_response(result)
     # On error the helper returns {statusCode: 502, body: <msg>}; preserve
     # the _call_lambda contract of (None, error_msg) so callers that check
@@ -547,7 +542,6 @@ def get_state():
     import copy
     return {
         "rest_apis": copy.deepcopy(_rest_apis),
-        "rest_api_regions": copy.deepcopy(_rest_api_regions),
         "resources": copy.deepcopy(_resources),
         "stages_v1": copy.deepcopy(_stages_v1),
         "deployments_v1": copy.deepcopy(_deployments_v1),
@@ -566,7 +560,6 @@ def get_state():
 def load_persisted_state(data):
     """Restore module state from a previously persisted snapshot."""
     _rest_apis.update(data.get("rest_apis", {}))
-    _rest_api_regions.update(data.get("rest_api_regions", {}))
     _resources.update(data.get("resources", {}))
     _stages_v1.update(data.get("stages_v1", {}))
     _deployments_v1.update(data.get("deployments_v1", {}))
@@ -584,7 +577,6 @@ def load_persisted_state(data):
 def reset():
     """Clear all module state."""
     _rest_apis.clear()
-    _rest_api_regions.clear()
     _resources.clear()
     _stages_v1.clear()
     _deployments_v1.clear()
@@ -904,9 +896,7 @@ async def handle_execute(api_id, stage_name, method, path, headers, body, query_
     if int_type in ("AWS_PROXY", "AWS"):
         return await _invoke_lambda_proxy_v1(
             integration, api_id, stage_name, stage, resource, path, method,
-            headers, body, query_params, path_params,
-            owner_account_id=get_account_id(),
-            owner_region=_rest_api_regions.get(api_id, get_region()),
+            headers, body, query_params, path_params
         )
     elif int_type in ("HTTP_PROXY", "HTTP"):
         return await _invoke_http_proxy_v1(
@@ -918,36 +908,21 @@ async def handle_execute(api_id, stage_name, method, path, headers, body, query_
         return 500, {"Content-Type": "application/json"}, json.dumps({"message": f"Unsupported integration type: {int_type}"}).encode()
 
 
-async def _invoke_lambda_proxy_v1(
-    integration,
-    api_id,
-    stage_name,
-    stage,
-    resource,
-    request_path,
-    method,
-    headers,
-    body,
-    query_params,
-    path_params,
-    *,
-    owner_account_id=None,
-    owner_region=None,
-):
+async def _invoke_lambda_proxy_v1(integration, api_id, stage_name, stage, resource, request_path, method, headers, body, query_params, path_params):
     """Invoke Lambda with API Gateway v1 payload format 1.0."""
     uri = integration.get("uri", "")
     # Supported URI formats:
     #   1. arn:aws:apigateway:{region}:lambda:path/2015-03-31/functions/arn:aws:lambda:{region}:{acct}:function:{name}[:{qualifier}]/invocations
     #   2. arn:aws:lambda:{region}:{acct}:function:{name}[:{qualifier}]
     #   3. plain function name: MyFunction[:{qualifier}]
-    if "/functions/" in uri:
-        lambda_ref = uri.split("/functions/", 1)[1]
-        if "/invocations" in lambda_ref:
-            lambda_ref = lambda_ref.split("/invocations", 1)[0]
-    elif uri.endswith("/invocations"):
-        lambda_ref = uri[: -len("/invocations")]
+    from ministack.services import lambda_svc as _lambda_svc
+    if "function:" in uri:
+        # Strip wrapper up through 'function:' and any trailing /invocations.
+        tail = uri.split("function:")[-1].split("/")[0]
+        # tail is now "<name>" or "<name>:<qualifier>".
+        func_name, qualifier = _lambda_svc._resolve_name_and_qualifier(tail)
     else:
-        lambda_ref = uri
+        func_name, qualifier = _lambda_svc._resolve_name_and_qualifier(uri)
 
     qs_params = {k: v[0] for k, v in query_params.items()} if query_params else None
     mv_qs_params = {k: list(v) for k, v in query_params.items()} if query_params else None
@@ -995,12 +970,7 @@ async def _invoke_lambda_proxy_v1(
         "isBase64Encoded": False,
     }
 
-    lambda_response, err = await _call_lambda(
-        lambda_ref,
-        event,
-        account_id=owner_account_id,
-        region=owner_region,
-    )
+    lambda_response, err = await _call_lambda(func_name, event, qualifier=qualifier)
     if err:
         return 502, {"Content-Type": "application/json"}, json.dumps({"message": err}).encode()
 
@@ -1160,7 +1130,6 @@ def _create_rest_api(data):
         "disableExecuteApiEndpoint": data.get("disableExecuteApiEndpoint", False),
     }
     _rest_apis[api_id] = api
-    _rest_api_regions[api_id] = get_region()
     _resources[api_id] = {}
     _stages_v1[api_id] = {}
     _deployments_v1[api_id] = {}
@@ -1206,7 +1175,6 @@ def _delete_rest_api(api_id):
     if api_id not in _rest_apis:
         return _v1_error("NotFoundException", "Invalid API identifier specified", 404)
     _rest_apis.pop(api_id, None)
-    _rest_api_regions.pop(api_id, None)
     _resources.pop(api_id, None)
     _stages_v1.pop(api_id, None)
     _deployments_v1.pop(api_id, None)
