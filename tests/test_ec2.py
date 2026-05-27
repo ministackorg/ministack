@@ -217,14 +217,18 @@ def test_ec2_describe_images_has_root_device_and_block_mappings(ec2):
     assert win["BlockDeviceMappings"][0]["DeviceName"] == "/dev/sda1"
 
 def test_ec2_security_group_crud(ec2):
-    sg_id = ec2.create_security_group(GroupName="qa-ec2-sg", Description="test sg")["GroupId"]
+    created = ec2.create_security_group(GroupName="qa-ec2-sg", Description="test sg")
+    sg_id = created["GroupId"]
     assert sg_id.startswith("sg-")
+    assert created["SecurityGroupArn"] == f"arn:aws:ec2:us-east-1:000000000000:security-group/{sg_id}"
 
     desc = ec2.describe_security_groups(GroupIds=[sg_id])
     assert desc["SecurityGroups"][0]["GroupName"] == "qa-ec2-sg"
     assert desc["SecurityGroups"][0]["Description"] == "test sg"
 
-    ec2.delete_security_group(GroupId=sg_id)
+    deleted = ec2.delete_security_group(GroupId=sg_id)
+    assert deleted["Return"] is True
+    assert deleted["GroupId"] == sg_id
     desc2 = ec2.describe_security_groups()
     assert not any(sg["GroupId"] == sg_id for sg in desc2["SecurityGroups"])
 
@@ -265,6 +269,31 @@ def test_ec2_sg_authorize_revoke_ingress(ec2):
     )
     desc2 = ec2.describe_security_groups(GroupIds=[sg_id])
     assert not any(p.get("FromPort") == 80 for p in desc2["SecurityGroups"][0]["IpPermissions"])
+
+    ec2.delete_security_group(GroupId=sg_id)
+
+
+def test_ec2_revoke_security_group_egress_returns_revoked_rules(ec2):
+    sg_id = ec2.create_security_group(GroupName="qa-ec2-sg-revoke-egress", Description="egress")["GroupId"]
+
+    resp = ec2.revoke_security_group_egress(
+        GroupId=sg_id,
+        IpPermissions=[
+            {
+                "IpProtocol": "-1",
+                "IpRanges": [{"CidrIp": "0.0.0.0/0"}],
+            }
+        ],
+    )
+
+    assert resp["Return"] is True
+    revoked = resp["RevokedSecurityGroupRules"]
+    assert len(revoked) == 1
+    assert revoked[0]["SecurityGroupRuleId"].startswith("sgr-")
+    assert revoked[0]["GroupId"] == sg_id
+    assert revoked[0]["IsEgress"] is True
+    assert revoked[0]["IpProtocol"] == "-1"
+    assert revoked[0]["CidrIpv4"] == "0.0.0.0/0"
 
     ec2.delete_security_group(GroupId=sg_id)
 

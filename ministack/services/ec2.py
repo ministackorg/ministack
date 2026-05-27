@@ -623,6 +623,10 @@ def _describe_images(p):
 # Security Groups
 # ---------------------------------------------------------------------------
 
+def _security_group_arn(sg_id):
+    return f"arn:aws:ec2:{get_region()}:{get_account_id()}:security-group/{sg_id}"
+
+
 def _create_security_group(p):
     name = _p(p, "GroupName")
     desc = _p(p, "GroupDescription") or name
@@ -650,7 +654,7 @@ def _create_security_group(p):
     }
     _parse_tag_specs(p, "security-group", sg_id)
     return _xml(200, "CreateSecurityGroupResponse",
-                f"<return>true</return><groupId>{sg_id}</groupId>")
+                f"<return>true</return><groupId>{sg_id}</groupId><securityGroupArn>{_security_group_arn(sg_id)}</securityGroupArn>")
 
 
 def _delete_security_group(p):
@@ -664,7 +668,8 @@ def _delete_security_group(p):
     elif sg_id:
         return _error("InvalidGroup.NotFound",
                       f"The security group '{sg_id}' does not exist", 400)
-    return _xml(200, "DeleteSecurityGroupResponse", "<return>true</return>")
+    group_id_xml = f"<groupId>{sg_id}</groupId>" if sg_id else ""
+    return _xml(200, "DeleteSecurityGroupResponse", f"<return>true</return>{group_id_xml}")
 
 
 def _describe_security_groups(p):
@@ -732,6 +737,45 @@ def _sg_rule_xml(sg_id, rule, idx, is_egress=False):
     return items
 
 
+def _revoked_sg_rule_xml(sg_id, rule, idx, is_egress=False):
+    direction = "egress" if is_egress else "ingress"
+    rule_id = f"sgr-{sg_id[3:]}-{direction}-{idx}"
+
+    def _item(extra_xml=""):
+        from_port = f"<fromPort>{rule['FromPort']}</fromPort>" if "FromPort" in rule else ""
+        to_port = f"<toPort>{rule['ToPort']}</toPort>" if "ToPort" in rule else ""
+        return (
+            "<item>"
+            f"<securityGroupRuleId>{rule_id}</securityGroupRuleId>"
+            f"<groupId>{sg_id}</groupId>"
+            f"<isEgress>{'true' if is_egress else 'false'}</isEgress>"
+            f"<ipProtocol>{rule.get('IpProtocol', '-1')}</ipProtocol>"
+            f"{from_port}{to_port}{extra_xml}"
+            "</item>"
+        )
+
+    items = ""
+    for cidr in rule.get("IpRanges", []):
+        desc_xml = f"<description>{_esc(cidr['Description'])}</description>" if cidr.get("Description") else ""
+        items += _item(f"<cidrIpv4>{cidr.get('CidrIp', '')}</cidrIpv4>{desc_xml}")
+    for cidr6 in rule.get("Ipv6Ranges", []):
+        desc_xml = f"<description>{_esc(cidr6['Description'])}</description>" if cidr6.get("Description") else ""
+        items += _item(f"<cidrIpv6>{cidr6.get('CidrIpv6', '')}</cidrIpv6>{desc_xml}")
+    for prefix in rule.get("PrefixListIds", []):
+        if isinstance(prefix, dict):
+            prefix_id = prefix.get("PrefixListId", "")
+            desc_xml = f"<description>{_esc(prefix['Description'])}</description>" if prefix.get("Description") else ""
+        else:
+            prefix_id = prefix
+            desc_xml = ""
+        items += _item(f"<prefixListId>{prefix_id}</prefixListId>{desc_xml}")
+    for pair in rule.get("UserIdGroupPairs", []):
+        ref_group_id = pair.get("GroupId", "") if isinstance(pair, dict) else str(pair)
+        desc_xml = f"<description>{_esc(pair['Description'])}</description>" if isinstance(pair, dict) and pair.get("Description") else ""
+        items += _item(f"<referencedGroupId>{ref_group_id}</referencedGroupId>{desc_xml}")
+    return items or _item()
+
+
 def _strip_descriptions(rule):
     """Return a copy of rule with Description stripped from all range entries for comparison."""
     r = dict(rule)
@@ -796,9 +840,16 @@ def _revoke_sg_egress(p):
     if not sg:
         return _error("InvalidGroup.NotFound", f"Security group {sg_id} not found", 400)
     rules = _parse_ip_permissions(p, "IpPermissions")
-    for r in rules:
-        sg["IpPermissionsEgress"] = [e for e in sg["IpPermissionsEgress"] if not _rules_match(r, e)]
-    return _xml(200, "RevokeSecurityGroupEgressResponse", "<return>true</return>")
+    revoked_items = ""
+    remaining = []
+    for idx, existing in enumerate(sg["IpPermissionsEgress"]):
+        if any(_rules_match(r, existing) for r in rules):
+            revoked_items += _revoked_sg_rule_xml(sg_id, existing, idx, is_egress=True)
+        else:
+            remaining.append(existing)
+    sg["IpPermissionsEgress"] = remaining
+    return _xml(200, "RevokeSecurityGroupEgressResponse",
+                f"<return>true</return><revokedSecurityGroupRuleSet>{revoked_items}</revokedSecurityGroupRuleSet>")
 
 
 # ---------------------------------------------------------------------------
