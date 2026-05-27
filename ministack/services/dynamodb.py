@@ -33,6 +33,7 @@ from ministack.core.responses import (
     new_uuid,
     now_iso,
 )
+from ministack.services._dynamodb_keywords import AWS_KEYWORDS
 
 logger = logging.getLogger("dynamodb")
 
@@ -69,6 +70,7 @@ _kinesis_destinations = AccountScopedDict()
 # Contributor Insights — key is "TableName" or "TableName/index/IndexName".
 # Value: {"ContributorInsightsStatus": "ENABLED"|"DISABLED",
 #         "LastUpdateDateTime": float epoch, "ContributorInsightsRuleList": [str, ...]}.
+_backups = AccountScopedDict()  # BackupArn -> BackupDescription dict
 _contributor_insights = AccountScopedDict()
 # Resource-based policies — ResourceArn -> {"Policy": str, "RevisionId": str}.
 _resource_policies = AccountScopedDict()
@@ -89,6 +91,7 @@ def get_state():
         "pitr_settings": copy.deepcopy(_pitr_settings),
         "kinesis_destinations": copy.deepcopy(_kinesis_destinations),
         "contributor_insights": copy.deepcopy(_contributor_insights),
+        "backups": copy.deepcopy(_backups),
         "resource_policies": copy.deepcopy(_resource_policies),
         "exports": copy.deepcopy(_exports),
         "imports": copy.deepcopy(_imports),
@@ -112,6 +115,7 @@ def restore_state(data):
         _pitr_settings.update(data.get("pitr_settings", {}))
         _kinesis_destinations.update(data.get("kinesis_destinations", {}))
         _contributor_insights.update(data.get("contributor_insights", {}))
+        _backups.update(data.get("backups", {}))
         _resource_policies.update(data.get("resource_policies", {}))
         _exports.update(data.get("exports", {}))
         _imports.update(data.get("imports", {}))
@@ -604,6 +608,8 @@ async def handle_request(method: str, path: str, headers: dict, body: bytes, que
         "DescribeKinesisStreamingDestination": _describe_kinesis_streaming_destination,
         "UpdateKinesisStreamingDestination": _update_kinesis_streaming_destination,
         "ExecuteStatement": _execute_statement,
+        "BatchExecuteStatement": _batch_execute_statement,
+        "ExecuteTransaction": _execute_transaction,
         "UpdateContributorInsights": _update_contributor_insights,
         "DescribeContributorInsights": _describe_contributor_insights,
         "ListContributorInsights": _list_contributor_insights,
@@ -616,6 +622,13 @@ async def handle_request(method: str, path: str, headers: dict, body: bytes, que
         "ImportTable": _import_table,
         "DescribeImport": _describe_import,
         "ListImports": _list_imports,
+        "CreateBackup": _create_backup,
+        "DescribeBackup": _describe_backup,
+        "DeleteBackup": _delete_backup,
+        "ListBackups": _list_backups,
+        "RestoreTableFromBackup": _restore_table_from_backup,
+        "RestoreTableToPointInTime": _restore_table_to_point_in_time,
+        "DescribeLimits": _describe_limits,
     }
 
     handler = handlers.get(action)
@@ -653,26 +666,119 @@ def _sse_description_from_spec(spec: dict | None) -> dict | None:
     if not spec:
         return None
     enabled = bool(spec.get("Enabled", False))
-    sse_type = spec.get("SSEType") or ("KMS" if spec.get("KMSMasterKeyId") else "AES256")
+    # AWS default: when SSEType is omitted and Enabled is true, SSE-KMS with
+    # the AWS-managed key (alias/aws/dynamodb) is configured. SSEType "AES256"
+    # is not a valid CreateTable input — only "KMS" or omission.
+    sse_type = spec.get("SSEType") or "KMS"
     desc = {
         "Status": "ENABLED" if enabled else "DISABLED",
         "SSEType": sse_type,
     }
     if sse_type == "KMS":
-        kms_key = spec.get("KMSMasterKeyId") or spec.get("KMSMasterKeyArn", "")
+        kms_key = spec.get("KMSMasterKeyId") or spec.get("KMSMasterKeyArn")
+        if not kms_key:
+            # AWS-managed key — fabricate a deterministic alias ARN.
+            kms_key = f"arn:aws:kms:{get_region()}:{get_account_id()}:alias/aws/dynamodb"
         desc["KMSMasterKeyArn"] = kms_key
     return desc
 
 
+_TABLE_NAME_RE = re.compile(r"^[A-Za-z0-9_.\-]+$")
+_INDEX_NAME_RE = re.compile(r"^[A-Za-z0-9_.\-]+$")
+_VALID_ATTR_TYPES = {"S", "N", "B"}
+_VALID_KEY_TYPES = {"HASH", "RANGE"}
+_VALID_BILLING_MODES = {"PROVISIONED", "PAY_PER_REQUEST"}
+_VALID_TABLE_CLASSES = {"STANDARD", "STANDARD_INFREQUENT_ACCESS"}
+_VALID_PROJECTION_TYPES = {"ALL", "KEYS_ONLY", "INCLUDE"}
+
+
+def _validate_table_name(name: str) -> tuple | None:
+    """Per AWS DynamoDB Developer Guide: 3-255 chars, pattern [A-Za-z0-9_.-]."""
+    if not isinstance(name, str) or not name:
+        return error_response_json("ValidationException",
+            "1 validation error detected: Value null at 'tableName' failed to satisfy constraint: Member must not be null", 400)
+    if len(name) < 3 or len(name) > 255:
+        return error_response_json("ValidationException",
+            f"1 validation error detected: Value '{name}' at 'tableName' failed to satisfy constraint: Member must have length between 3 and 255", 400)
+    if not _TABLE_NAME_RE.match(name):
+        return error_response_json("ValidationException",
+            f"1 validation error detected: Value '{name}' at 'tableName' failed to satisfy constraint: Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+", 400)
+    return None
+
+
+def _validate_key_schema(key_schema: list, attr_defs: list, context: str = "tableName") -> tuple | None:
+    """Validates KeySchema + AttributeDefinitions per AWS rules:
+       - 1 HASH required; 0 or 1 RANGE allowed.
+       - Every key attribute must appear in AttributeDefinitions.
+       - No duplicate attribute names in KeySchema.
+    """
+    if not key_schema:
+        return error_response_json("ValidationException",
+            "1 validation error detected: Value null at 'keySchema' failed to satisfy constraint: Member must not be null", 400)
+    if not isinstance(key_schema, list) or len(key_schema) == 0 or len(key_schema) > 2:
+        return error_response_json("ValidationException",
+            "1 validation error detected: KeySchema must contain 1 or 2 elements", 400)
+    hash_count = 0
+    range_count = 0
+    seen_names = set()
+    for ks in key_schema:
+        attr = ks.get("AttributeName")
+        kt = ks.get("KeyType")
+        if not attr or kt not in _VALID_KEY_TYPES:
+            return error_response_json("ValidationException",
+                f"1 validation error detected: KeySchema element invalid: {ks}", 400)
+        if attr in seen_names:
+            return error_response_json("ValidationException",
+                f"Two keys cannot have the same name: {attr}", 400)
+        seen_names.add(attr)
+        if kt == "HASH":
+            hash_count += 1
+        elif kt == "RANGE":
+            range_count += 1
+    if hash_count != 1:
+        return error_response_json("ValidationException",
+            "1 validation error detected: KeySchema must contain exactly one HASH key", 400)
+    # Every key attribute must be defined in AttributeDefinitions.
+    defined = {a.get("AttributeName"): a.get("AttributeType") for a in (attr_defs or [])}
+    for ks in key_schema:
+        attr = ks["AttributeName"]
+        if attr not in defined:
+            return error_response_json("ValidationException",
+                f"Hash Key not specified in Attribute Definitions. Type unknown: {attr}", 400)
+        if defined[attr] not in _VALID_ATTR_TYPES:
+            return error_response_json("ValidationException",
+                f"Invalid AttributeType for attribute {attr}: {defined[attr]}", 400)
+    return None
+
+
 def _create_table(data):
     name = data.get("TableName")
-    if not name:
-        return error_response_json("ValidationException", "TableName is required", 400)
+    err = _validate_table_name(name)
+    if err:
+        return err
     if name in _tables:
         return error_response_json("ResourceInUseException", f"Table already exists: {name}", 400)
 
-    key_schema = data.get("KeySchema", [])
-    attr_defs = data.get("AttributeDefinitions", [])
+    key_schema = data.get("KeySchema")
+    attr_defs = data.get("AttributeDefinitions") or []
+    # Validate AttributeDefinitions structure.
+    seen_attr_names = set()
+    for ad in attr_defs:
+        an = ad.get("AttributeName")
+        at = ad.get("AttributeType")
+        if not an:
+            return error_response_json("ValidationException",
+                "1 validation error detected: AttributeDefinitions element missing AttributeName", 400)
+        if at not in _VALID_ATTR_TYPES:
+            return error_response_json("ValidationException",
+                f"1 validation error detected: Value '{at}' at 'attributeDefinitions..attributeType' failed to satisfy constraint: Member must satisfy enum value set: [B, N, S]", 400)
+        if an in seen_attr_names:
+            return error_response_json("ValidationException",
+                f"Duplicate AttributeName in AttributeDefinitions: {an}", 400)
+        seen_attr_names.add(an)
+    err = _validate_key_schema(key_schema, attr_defs)
+    if err:
+        return err
     pk_name = sk_name = None
     for ks in key_schema:
         if ks["KeyType"] == "HASH":
@@ -680,9 +786,70 @@ def _create_table(data):
         elif ks["KeyType"] == "RANGE":
             sk_name = ks["AttributeName"]
 
+    # BillingMode validation.
+    billing_mode = data.get("BillingMode", "PROVISIONED")
+    if billing_mode not in _VALID_BILLING_MODES:
+        return error_response_json("ValidationException",
+            f"1 validation error detected: Value '{billing_mode}' at 'billingMode' failed to satisfy constraint: Member must satisfy enum value set: {sorted(_VALID_BILLING_MODES)}", 400)
+    # TableClass validation.
+    table_class = data.get("TableClass")
+    if table_class is not None and table_class not in _VALID_TABLE_CLASSES:
+        return error_response_json("ValidationException",
+            f"1 validation error detected: Value '{table_class}' at 'tableClass' failed to satisfy constraint: Member must satisfy enum value set: {sorted(_VALID_TABLE_CLASSES)}", 400)
+    # ProvisionedThroughput required when PROVISIONED.
+    pt = data.get("ProvisionedThroughput")
+    if billing_mode == "PROVISIONED":
+        if not pt or not isinstance(pt, dict):
+            return error_response_json("ValidationException",
+                "One or more parameter values were invalid: ProvisionedThroughput must be specified when BillingMode is PROVISIONED", 400)
+        if int(pt.get("ReadCapacityUnits", 0)) <= 0 or int(pt.get("WriteCapacityUnits", 0)) <= 0:
+            return error_response_json("ValidationException",
+                "One or more parameter values were invalid: ReadCapacityUnits and WriteCapacityUnits must be greater than zero", 400)
+    elif pt is not None:
+        return error_response_json("ValidationException",
+            "One or more parameter values were invalid: ProvisionedThroughput should not be specified when BillingMode is PAY_PER_REQUEST", 400)
+
     gsis = copy.deepcopy(data.get("GlobalSecondaryIndexes", []))
     lsis = copy.deepcopy(data.get("LocalSecondaryIndexes", []))
-    billing_mode = data.get("BillingMode", "PROVISIONED")
+
+    # LSI validation: requires the base table to have a RANGE key, and each LSI
+    # must have the same HASH key as the base table.
+    if lsis and not sk_name:
+        return error_response_json("ValidationException",
+            "Local Secondary indices are not allowed on hash tables, only hash and range tables", 400)
+    for lsi in lsis:
+        lks = lsi.get("KeySchema") or []
+        if not any(k.get("KeyType") == "HASH" and k.get("AttributeName") == pk_name for k in lks):
+            return error_response_json("ValidationException",
+                f"Local Secondary Index '{lsi.get('IndexName')}' must use the table's hash key", 400)
+
+    # Duplicate-index-name detection across LSI + GSI.
+    seen_index_names = set()
+    for idx in lsis + gsis:
+        iname = idx.get("IndexName")
+        if iname and iname in seen_index_names:
+            return error_response_json("ValidationException",
+                f"Two indexes cannot have the same name: {iname}", 400)
+        if iname:
+            seen_index_names.add(iname)
+    # Every attribute referenced in any index KeySchema must be in AttributeDefinitions.
+    referenced_attrs = set()
+    for ks in key_schema:
+        referenced_attrs.add(ks["AttributeName"])
+    for idx_group in (gsis, lsis):
+        for idx in idx_group:
+            for k in idx.get("KeySchema") or []:
+                referenced_attrs.add(k.get("AttributeName"))
+    for ad_name in referenced_attrs:
+        if ad_name not in seen_attr_names:
+            return error_response_json("ValidationException",
+                f"Some AttributeDefinitions are not present in KeySchema: {ad_name}", 400)
+    # AttributeDefinitions must not include unused attrs (real AWS rejects).
+    unused = seen_attr_names - referenced_attrs
+    if unused:
+        return error_response_json("ValidationException",
+            f"One or more parameter values were invalid: Some AttributeDefinitions are not used: {sorted(unused)}", 400)
+
     gsi_default_throughput = (
         {"ReadCapacityUnits": 0, "WriteCapacityUnits": 0}
         if billing_mode == "PAY_PER_REQUEST"
@@ -715,13 +882,27 @@ def _create_table(data):
         "GlobalSecondaryIndexes": gsis,
         "LocalSecondaryIndexes": lsis,
         "ProvisionedThroughput": {"ReadCapacityUnits": 0, "WriteCapacityUnits": 0}
-            if data.get("BillingMode") == "PAY_PER_REQUEST"
+            if billing_mode == "PAY_PER_REQUEST"
             else data.get("ProvisionedThroughput", {"ReadCapacityUnits": 5, "WriteCapacityUnits": 5}),
-        "BillingModeSummary": {"BillingMode": data.get("BillingMode", "PROVISIONED")},
+        "BillingModeSummary": {"BillingMode": billing_mode},
         "StreamSpecification": data.get("StreamSpecification"),
         "SSEDescription": _sse_description_from_spec(data.get("SSESpecification")),
         "DeletionProtectionEnabled": data.get("DeletionProtectionEnabled", False),
     }
+    # TableClass round-trip — DescribeTable echoes the configured class via
+    # TableClassSummary (real AWS shape).
+    if table_class:
+        _tables[name]["TableClassSummary"] = {
+            "TableClass": table_class,
+            "LastUpdateDateTime": int(time.time()),
+        }
+    # OnDemandThroughput round-trip — only meaningful for PAY_PER_REQUEST.
+    on_demand = data.get("OnDemandThroughput")
+    if on_demand is not None:
+        _tables[name]["OnDemandThroughput"] = {
+            "MaxReadRequestUnits": int(on_demand.get("MaxReadRequestUnits", -1)),
+            "MaxWriteRequestUnits": int(on_demand.get("MaxWriteRequestUnits", -1)),
+        }
     if data.get("StreamSpecification"):
         stream_label = now_iso()
         _tables[name]["LatestStreamLabel"] = stream_label
@@ -775,11 +956,37 @@ def _update_table(data):
         return error_response_json("ResourceNotFoundException", f"Requested resource not found: Table: {name} not found", 400)
     table = _tables[name]
 
-    if "ProvisionedThroughput" in data:
-        table["ProvisionedThroughput"] = data["ProvisionedThroughput"]
-    if "BillingMode" in data:
-        table["BillingModeSummary"] = {"BillingMode": data["BillingMode"]}
-        if data["BillingMode"] == "PAY_PER_REQUEST":
+    current_billing = table.get("BillingModeSummary", {}).get("BillingMode", "PROVISIONED")
+    new_billing = data.get("BillingMode")
+    # ProvisionedThroughput validation when supplied.
+    pt = data.get("ProvisionedThroughput")
+    if pt is not None:
+        # PAY_PER_REQUEST + ProvisionedThroughput is invalid.
+        if new_billing == "PAY_PER_REQUEST" or (new_billing is None and current_billing == "PAY_PER_REQUEST"):
+            return error_response_json("ValidationException",
+                "One or more parameter values were invalid: ProvisionedThroughput should not be specified when BillingMode is PAY_PER_REQUEST", 400)
+        rcu = int(pt.get("ReadCapacityUnits", 0))
+        wcu = int(pt.get("WriteCapacityUnits", 0))
+        if rcu <= 0 or wcu <= 0:
+            return error_response_json("ValidationException",
+                "One or more parameter values were invalid: ReadCapacityUnits and WriteCapacityUnits must be greater than zero", 400)
+        existing_pt = table.get("ProvisionedThroughput") or {}
+        # AWS rejects an UpdateTable that would result in no change.
+        if (
+            new_billing is None
+            and current_billing == "PROVISIONED"
+            and rcu == int(existing_pt.get("ReadCapacityUnits", 0))
+            and wcu == int(existing_pt.get("WriteCapacityUnits", 0))
+        ):
+            return error_response_json("ValidationException",
+                "The provisioned throughput for the table will not change. The requested value equals the current value.", 400)
+        table["ProvisionedThroughput"] = pt
+    if new_billing is not None:
+        if new_billing not in _VALID_BILLING_MODES:
+            return error_response_json("ValidationException",
+                f"1 validation error detected: Value '{new_billing}' at 'billingMode' failed to satisfy constraint: Member must satisfy enum value set: {sorted(_VALID_BILLING_MODES)}", 400)
+        table["BillingModeSummary"] = {"BillingMode": new_billing, "LastUpdateToPayPerRequestDateTime": int(time.time())}
+        if new_billing == "PAY_PER_REQUEST":
             table["ProvisionedThroughput"] = {"ReadCapacityUnits": 0, "WriteCapacityUnits": 0}
     if "AttributeDefinitions" in data:
         table["AttributeDefinitions"] = data["AttributeDefinitions"]
@@ -793,27 +1000,60 @@ def _update_table(data):
         table["SSEDescription"] = _sse_description_from_spec(data["SSESpecification"])
     if "DeletionProtectionEnabled" in data:
         table["DeletionProtectionEnabled"] = data["DeletionProtectionEnabled"]
+    # TableClass change round-trip.
+    if "TableClass" in data:
+        tc = data["TableClass"]
+        if tc not in _VALID_TABLE_CLASSES:
+            return error_response_json("ValidationException",
+                f"1 validation error detected: Value '{tc}' at 'tableClass' failed to satisfy constraint: Member must satisfy enum value set: {sorted(_VALID_TABLE_CLASSES)}", 400)
+        table["TableClassSummary"] = {"TableClass": tc, "LastUpdateDateTime": int(time.time())}
+    # OnDemandThroughput change round-trip.
+    if "OnDemandThroughput" in data:
+        odt = data["OnDemandThroughput"] or {}
+        table["OnDemandThroughput"] = {
+            "MaxReadRequestUnits": int(odt.get("MaxReadRequestUnits", -1)),
+            "MaxWriteRequestUnits": int(odt.get("MaxWriteRequestUnits", -1)),
+        }
 
+    existing_idx_names = {g["IndexName"] for g in table.get("GlobalSecondaryIndexes", [])}
+    defined_attrs = {a["AttributeName"] for a in table.get("AttributeDefinitions", [])}
     for update in data.get("GlobalSecondaryIndexUpdates", []):
         if "Create" in update:
             gsi_def = copy.deepcopy(update["Create"])
+            idx_name = gsi_def.get("IndexName")
+            if idx_name in existing_idx_names:
+                return error_response_json("ValidationException",
+                    f"Attempting to create a duplicate index: {idx_name}", 400)
+            # Every key attribute of the new GSI must be in AttributeDefinitions.
+            for k in gsi_def.get("KeySchema") or []:
+                if k.get("AttributeName") not in defined_attrs:
+                    return error_response_json("ValidationException",
+                        f"One or more parameter values were invalid: AttributeDefinitions does not contain {k.get('AttributeName')} referenced by GSI {idx_name}", 400)
             gsi_def.setdefault("IndexStatus", "ACTIVE")
-            current_billing = table.get("BillingModeSummary", {}).get("BillingMode", "PROVISIONED")
+            gsi_billing = table.get("BillingModeSummary", {}).get("BillingMode", "PROVISIONED")
             gsi_def.setdefault(
                 "ProvisionedThroughput",
                 {"ReadCapacityUnits": 0, "WriteCapacityUnits": 0}
-                if current_billing == "PAY_PER_REQUEST"
+                if gsi_billing == "PAY_PER_REQUEST"
                 else {"ReadCapacityUnits": 5, "WriteCapacityUnits": 5},
             )
             gsi_def["IndexArn"] = f"arn:aws:dynamodb:{get_region()}:{get_account_id()}:table/{name}/index/{gsi_def['IndexName']}"
             gsi_def["IndexSizeBytes"] = 0
             gsi_def["ItemCount"] = 0
             table["GlobalSecondaryIndexes"].append(gsi_def)
+            existing_idx_names.add(idx_name)
         elif "Delete" in update:
             idx_name = update["Delete"]["IndexName"]
+            if idx_name not in existing_idx_names:
+                return error_response_json("ResourceNotFoundException",
+                    f"Attempt to remove a non-existent index: {idx_name}", 400)
             table["GlobalSecondaryIndexes"] = [g for g in table["GlobalSecondaryIndexes"] if g["IndexName"] != idx_name]
+            existing_idx_names.discard(idx_name)
         elif "Update" in update:
             idx_name = update["Update"]["IndexName"]
+            if idx_name not in existing_idx_names:
+                return error_response_json("ResourceNotFoundException",
+                    f"Attempt to update a non-existent index: {idx_name}", 400)
             for gsi in table["GlobalSecondaryIndexes"]:
                 if gsi["IndexName"] == idx_name:
                     if "ProvisionedThroughput" in update["Update"]:
@@ -848,6 +1088,10 @@ def _table_description(name):
         desc["LatestStreamArn"] = t.get("LatestStreamArn", "")
     if t.get("SSEDescription"):
         desc["SSEDescription"] = t["SSEDescription"]
+    if t.get("TableClassSummary"):
+        desc["TableClassSummary"] = t["TableClassSummary"]
+    if t.get("OnDemandThroughput"):
+        desc["OnDemandThroughput"] = t["OnDemandThroughput"]
     desc["DeletionProtectionEnabled"] = t.get("DeletionProtectionEnabled", False)
     desc["WarmThroughput"] = t.get("WarmThroughput", {
         "ReadUnitsPerSecond": 0,
@@ -861,11 +1105,124 @@ def _table_description(name):
 # Item operations
 # ---------------------------------------------------------------------------
 
+_PUT_DELETE_RV_VALUES = {"NONE", "ALL_OLD"}
+_UPDATE_RV_VALUES = {"NONE", "ALL_OLD", "ALL_NEW", "UPDATED_OLD", "UPDATED_NEW"}
+_RETURN_ITEM_COLLECTION_METRICS = {"NONE", "SIZE"}
+_RETURN_CONSUMED_CAPACITY_VALUES = {"NONE", "TOTAL", "INDEXES"}
+
+
+def _validate_return_consumed_capacity(data) -> tuple | None:
+    rcc = data.get("ReturnConsumedCapacity")
+    if rcc is None:
+        return None
+    if rcc not in _RETURN_CONSUMED_CAPACITY_VALUES:
+        return error_response_json("ValidationException",
+            f"1 validation error detected: Value '{rcc}' at 'returnConsumedCapacity' failed to satisfy constraint: Member must satisfy enum value set: [INDEXES, TOTAL, NONE]", 400)
+    return None
+
+
+def _validate_expression_attrs(data, expression_fields: tuple) -> tuple | None:
+    """AWS rejects ExpressionAttributeValues / ExpressionAttributeNames when
+    no expression field references them at all, AND when any defined alias
+    isn't used by any of the expressions, AND when any `:foo` or `#bar`
+    referenced by an expression isn't defined."""
+    has_any_expr = any(data.get(f) for f in expression_fields)
+    eav = data.get("ExpressionAttributeValues")
+    ean = data.get("ExpressionAttributeNames")
+    if eav and not has_any_expr:
+        return error_response_json("ValidationException",
+            "ExpressionAttributeValues must not be empty", 400)
+    if ean and not has_any_expr:
+        return error_response_json("ValidationException",
+            "ExpressionAttributeNames must not be empty", 400)
+    # Build a string of all referenced expressions for substring scanning.
+    expr_text = " ".join(data.get(f) or "" for f in expression_fields)
+    if eav:
+        for placeholder in eav.keys():
+            if placeholder not in expr_text:
+                return error_response_json("ValidationException",
+                    f"Value provided in ExpressionAttributeValues unused in expressions: keys: {{{placeholder}}}", 400)
+    if ean:
+        for alias in ean.keys():
+            if alias not in expr_text:
+                return error_response_json("ValidationException",
+                    f"Value provided in ExpressionAttributeNames unused in expressions: keys: {{{alias}}}", 400)
+    # Inverse: every `:foo` / `#bar` in expressions must be defined.
+    if expr_text:
+        for ref in re.findall(r":[A-Za-z_][A-Za-z0-9_]*", expr_text):
+            if not eav or ref not in eav:
+                return error_response_json("ValidationException",
+                    f"An expression attribute value used in expression is not defined; attribute value: {ref}", 400)
+        for ref in re.findall(r"#[A-Za-z_][A-Za-z0-9_]*", expr_text):
+            if not ean or ref not in ean:
+                return error_response_json("ValidationException",
+                    f"An expression attribute name used in expression is not defined; attribute name: {ref}", 400)
+    return None
+
+
+def _validate_return_values(data, allowed: set) -> tuple | None:
+    rv = data.get("ReturnValues")
+    if rv is None:
+        return None
+    if rv not in allowed:
+        return error_response_json("ValidationException",
+            f"1 validation error detected: Value '{rv}' at 'returnValues' failed to satisfy constraint: Member must satisfy enum value set: {sorted(allowed)}", 400)
+    return None
+
+
+def _validate_return_item_collection_metrics(data) -> tuple | None:
+    ricm = data.get("ReturnItemCollectionMetrics")
+    if ricm is None:
+        return None
+    if ricm not in _RETURN_ITEM_COLLECTION_METRICS:
+        return error_response_json("ValidationException",
+            f"1 validation error detected: Value '{ricm}' at 'returnItemCollectionMetrics' failed to satisfy constraint: Member must satisfy enum value set: ['NONE', 'SIZE']", 400)
+    return None
+
+
+def _add_item_collection_metrics(result: dict, data: dict, table: dict, item: dict | None, key: dict | None):
+    """Populate result["ItemCollectionMetrics"] when the caller requested SIZE
+    and the table has at least one LSI. AWS returns the ItemCollectionKey
+    (just the hash key of the affected item) and a SizeEstimateRangeGB
+    placeholder."""
+    if data.get("ReturnItemCollectionMetrics") != "SIZE":
+        return
+    if not table.get("LocalSecondaryIndexes"):
+        return
+    pk_name = table.get("pk_name")
+    if not pk_name:
+        return
+    source = item or key or {}
+    if pk_name not in source:
+        return
+    result["ItemCollectionMetrics"] = {
+        "ItemCollectionKey": {pk_name: source[pk_name]},
+        "SizeEstimateRangeGB": [0.0, 1.0],
+    }
+
+
 def _put_item(data):
     name = data.get("TableName")
+    if not isinstance(name, str) or not name:
+        return error_response_json("ValidationException",
+            "1 validation error detected: Value null at 'tableName' failed to satisfy constraint: Member must not be null", 400)
     table = _tables.get(name)
     if not table:
-        return error_response_json("ResourceNotFoundException", f"Requested resource not found: Table: {name} not found", 400)
+        return error_response_json("ResourceNotFoundException",
+            f"Cannot do operations on a non-existent table", 400)
+
+    err = _validate_return_values(data, _PUT_DELETE_RV_VALUES)
+    if err:
+        return err
+    err = _validate_return_item_collection_metrics(data)
+    if err:
+        return err
+    err = _validate_return_consumed_capacity(data)
+    if err:
+        return err
+    err = _validate_expression_attrs(data, ("ConditionExpression",))
+    if err:
+        return err
 
     item = data.get("Item", {})
     err = _validate_item(item, table.get("pk_name"), table.get("sk_name"))
@@ -887,7 +1244,11 @@ def _put_item(data):
     if cond_expr and expected:
         return error_response_json("ValidationException", "Can not use both expression and non-expression parameters in the same request: Non-expression parameters: {Expected} Expression parameters: {ConditionExpression}", 400)
     if cond_expr:
-        if not _evaluate_condition(cond_expr, old_item or {}, data.get("ExpressionAttributeValues", {}), data.get("ExpressionAttributeNames", {})):
+        try:
+            cond_eval = _evaluate_condition(cond_expr, old_item or {}, data.get("ExpressionAttributeValues", {}), data.get("ExpressionAttributeNames", {}))
+        except ValueError as exc:
+            return error_response_json("ValidationException", str(exc), 400)
+        if not cond_eval:
             return _conditional_check_failed(data, old_item)
     elif expected:
         if not _evaluate_expected(old_item or {}, expected, data.get("ConditionalOperator", "AND")):
@@ -903,14 +1264,28 @@ def _put_item(data):
     if data.get("ReturnValues") == "ALL_OLD" and old_item:
         result["Attributes"] = old_item
     _add_consumed_capacity(result, data, name, write=True)
+    _add_item_collection_metrics(result, data, table, item, None)
     return json_response(result)
 
 
 def _get_item(data):
     name = data.get("TableName")
+    if not isinstance(name, str) or not name:
+        return error_response_json("ValidationException",
+            "1 validation error detected: Value null at 'tableName' failed to satisfy constraint: Member must not be null", 400)
     table = _tables.get(name)
     if not table:
-        return error_response_json("ResourceNotFoundException", f"Requested resource not found: Table: {name} not found", 400)
+        return error_response_json("ResourceNotFoundException",
+            f"Cannot do operations on a non-existent table", 400)
+    if data.get("ProjectionExpression") and data.get("AttributesToGet"):
+        return error_response_json("ValidationException",
+            "Can not use both expression and non-expression parameters in the same request: Non-expression parameters: {AttributesToGet} Expression parameters: {ProjectionExpression}", 400)
+    err = _validate_return_consumed_capacity(data)
+    if err:
+        return err
+    err = _validate_expression_attrs(data, ("ProjectionExpression",))
+    if err:
+        return err
 
     key = data.get("Key", {})
     pk_val, sk_val, key_err = _resolve_table_key_values(table, key, allow_extra=False)
@@ -920,16 +1295,36 @@ def _get_item(data):
 
     result = {}
     if item:
-        result["Item"] = _apply_projection(item, data)
+        try:
+            result["Item"] = _apply_projection(item, data)
+        except ValueError as exc:
+            return error_response_json("ValidationException", str(exc), 400)
     _add_consumed_capacity(result, data, name)
     return json_response(result)
 
 
 def _delete_item(data):
     name = data.get("TableName")
+    if not isinstance(name, str) or not name:
+        return error_response_json("ValidationException",
+            "1 validation error detected: Value null at 'tableName' failed to satisfy constraint: Member must not be null", 400)
     table = _tables.get(name)
     if not table:
-        return error_response_json("ResourceNotFoundException", f"Requested resource not found: Table: {name} not found", 400)
+        return error_response_json("ResourceNotFoundException",
+            f"Cannot do operations on a non-existent table", 400)
+
+    err = _validate_return_values(data, _PUT_DELETE_RV_VALUES)
+    if err:
+        return err
+    err = _validate_return_item_collection_metrics(data)
+    if err:
+        return err
+    err = _validate_return_consumed_capacity(data)
+    if err:
+        return err
+    err = _validate_expression_attrs(data, ("ConditionExpression",))
+    if err:
+        return err
 
     key = data.get("Key", {})
     pk_val, sk_val, key_err = _resolve_table_key_values(table, key, allow_extra=False)
@@ -942,7 +1337,11 @@ def _delete_item(data):
     if cond_expr and expected:
         return error_response_json("ValidationException", "Can not use both expression and non-expression parameters in the same request: Non-expression parameters: {Expected} Expression parameters: {ConditionExpression}", 400)
     if cond_expr:
-        if not _evaluate_condition(cond_expr, old_item or {}, data.get("ExpressionAttributeValues", {}), data.get("ExpressionAttributeNames", {})):
+        try:
+            cond_eval = _evaluate_condition(cond_expr, old_item or {}, data.get("ExpressionAttributeValues", {}), data.get("ExpressionAttributeNames", {}))
+        except ValueError as exc:
+            return error_response_json("ValidationException", str(exc), 400)
+        if not cond_eval:
             return _conditional_check_failed(data, old_item)
     elif expected:
         if not _evaluate_expected(old_item or {}, expected, data.get("ConditionalOperator", "AND")):
@@ -957,14 +1356,32 @@ def _delete_item(data):
     if data.get("ReturnValues") == "ALL_OLD" and old_item:
         result["Attributes"] = old_item
     _add_consumed_capacity(result, data, name, write=True)
+    _add_item_collection_metrics(result, data, table, None, key)
     return json_response(result)
 
 
 def _update_item(data):
     name = data.get("TableName")
+    if not isinstance(name, str) or not name:
+        return error_response_json("ValidationException",
+            "1 validation error detected: Value null at 'tableName' failed to satisfy constraint: Member must not be null", 400)
     table = _tables.get(name)
     if not table:
-        return error_response_json("ResourceNotFoundException", f"Requested resource not found: Table: {name} not found", 400)
+        return error_response_json("ResourceNotFoundException",
+            f"Cannot do operations on a non-existent table", 400)
+
+    err = _validate_return_values(data, _UPDATE_RV_VALUES)
+    if err:
+        return err
+    err = _validate_return_item_collection_metrics(data)
+    if err:
+        return err
+    err = _validate_return_consumed_capacity(data)
+    if err:
+        return err
+    err = _validate_expression_attrs(data, ("ConditionExpression", "UpdateExpression"))
+    if err:
+        return err
 
     key = data.get("Key", {})
     pk_val, sk_val, key_err = _resolve_table_key_values(table, key, allow_extra=False)
@@ -981,7 +1398,11 @@ def _update_item(data):
         return error_response_json("ValidationException", "Can not use both expression and non-expression parameters in the same request: Non-expression parameters: {Expected} Expression parameters: {ConditionExpression}", 400)
     if cond_expr:
         cond_target = existing or {}
-        if not _evaluate_condition(cond_expr, cond_target, data.get("ExpressionAttributeValues", {}), data.get("ExpressionAttributeNames", {})):
+        try:
+            cond_eval = _evaluate_condition(cond_expr, cond_target, data.get("ExpressionAttributeValues", {}), data.get("ExpressionAttributeNames", {}))
+        except ValueError as exc:
+            return error_response_json("ValidationException", str(exc), 400)
+        if not cond_eval:
             return _conditional_check_failed(data, existing)
     elif expected:
         if not _evaluate_expected(existing or {}, expected, data.get("ConditionalOperator", "AND")):
@@ -994,14 +1415,27 @@ def _update_item(data):
 
     if update_expr and attribute_updates:
         return error_response_json("ValidationException", "Can not use both expression and non-expression parameters in the same request: Non-expression parameters: {AttributeUpdates} Expression parameters: {UpdateExpression}", 400)
+    # An empty UpdateExpression string is rejected by AWS.
+    if "UpdateExpression" in data and not update_expr.strip():
+        return error_response_json("ValidationException",
+            "Invalid UpdateExpression: The expression can not be empty", 400)
 
     if update_expr:
-        item = _apply_update_expression(item, update_expr, eav, ean)
+        try:
+            item = _apply_update_expression(item, update_expr, eav, ean)
+        except ValueError as exc:
+            return error_response_json("ValidationException", str(exc), 400)
     elif attribute_updates:
         try:
             item = _apply_attribute_updates(item, attribute_updates)
         except _AttributeUpdatesValidationError as exc:
             return error_response_json("ValidationException", str(exc), 400)
+    # AWS rejects any update that would mutate a hash or range key value.
+    for key_name in (table.get("pk_name"), table.get("sk_name")):
+        if key_name and key_name in item and existing is not None:
+            if item.get(key_name) != existing.get(key_name):
+                return error_response_json("ValidationException",
+                    f"One or more parameter values were invalid: Cannot update attribute {key_name}. This attribute is part of the key", 400)
 
     table["items"][pk_val][sk_val] = item
     _update_counts(table)
@@ -1018,8 +1452,13 @@ def _update_item(data):
     elif rv == "UPDATED_OLD" and old_item:
         result["Attributes"] = _diff_attributes(old_item, item, return_old=True)
     elif rv == "UPDATED_NEW":
-        result["Attributes"] = _diff_attributes(old_item or {}, item, return_old=False)
+        # AWS omits Attributes from the response when the only operation was
+        # REMOVE — there are no "new" values to return.
+        new_attrs = _diff_attributes(old_item or {}, item, return_old=False)
+        if new_attrs:
+            result["Attributes"] = new_attrs
     _add_consumed_capacity(result, data, name, write=True)
+    _add_item_collection_metrics(result, data, table, item, key)
     return json_response(result)
 
 
@@ -1029,9 +1468,19 @@ def _update_item(data):
 
 def _query(data):
     name = data.get("TableName")
+    if not isinstance(name, str) or not name:
+        return error_response_json("ValidationException",
+            "1 validation error detected: Value null at 'tableName' failed to satisfy constraint: Member must not be null", 400)
     table = _tables.get(name)
     if not table:
-        return error_response_json("ResourceNotFoundException", f"Requested resource not found: Table: {name} not found", 400)
+        return error_response_json("ResourceNotFoundException",
+            f"Cannot do operations on a non-existent table", 400)
+    err = _validate_return_consumed_capacity(data)
+    if err:
+        return err
+    err = _validate_expression_attrs(data, ("KeyConditionExpression", "FilterExpression", "ProjectionExpression"))
+    if err:
+        return err
 
     eav = data.get("ExpressionAttributeValues", {})
     ean = data.get("ExpressionAttributeNames", {})
@@ -1046,15 +1495,78 @@ def _query(data):
 
     if key_cond and key_conditions:
         return error_response_json("ValidationException", "Can not use both expression and non-expression parameters in the same request: Non-expression parameters: {KeyConditions} Expression parameters: {KeyConditionExpression}", 400)
+    if data.get("ProjectionExpression") and data.get("AttributesToGet"):
+        return error_response_json("ValidationException",
+            "Can not use both expression and non-expression parameters in the same request: Non-expression parameters: {AttributesToGet} Expression parameters: {ProjectionExpression}", 400)
+    if data.get("FilterExpression") and data.get("QueryFilter"):
+        return error_response_json("ValidationException",
+            "Can not use both expression and non-expression parameters in the same request: Non-expression parameters: {QueryFilter} Expression parameters: {FilterExpression}", 400)
+    # Empty KeyConditionExpression rejected explicitly.
+    if "KeyConditionExpression" in data and not (data["KeyConditionExpression"] or "").strip():
+        return error_response_json("ValidationException",
+            "KeyConditionExpression is empty", 400)
+    # Select must be one of the canonical enum values when supplied.
+    if "Select" in data and data["Select"] not in {"ALL_ATTRIBUTES", "ALL_PROJECTED_ATTRIBUTES", "SPECIFIC_ATTRIBUTES", "COUNT"}:
+        return error_response_json("ValidationException",
+            f"1 validation error detected: Value '{data['Select']}' at 'select' failed to satisfy constraint: Member must satisfy enum value set: [ALL_ATTRIBUTES, ALL_PROJECTED_ATTRIBUTES, SPECIFIC_ATTRIBUTES, COUNT]", 400)
+    # Malformed ExclusiveStartKey: must include all key attributes of the
+    # table (and the index, if querying an index).
+    esk_val = data.get("ExclusiveStartKey")
+    if esk_val is not None and not isinstance(esk_val, dict):
+        return error_response_json("ValidationException",
+            "The provided starting key is invalid", 400)
+    # Limit must be >= 1 when supplied.
+    if limit is not None and int(limit) <= 0:
+        return error_response_json("ValidationException",
+            f"1 validation error detected: Value '{limit}' at 'limit' failed to satisfy constraint: Member must have value greater than or equal to 1", 400)
+    # Select validation per AWS: ALL_PROJECTED_ATTRIBUTES is only valid on an
+    # index; SPECIFIC_ATTRIBUTES requires a ProjectionExpression / AttributesToGet.
+    if select == "ALL_PROJECTED_ATTRIBUTES" and not index_name:
+        return error_response_json("ValidationException",
+            "ALL_PROJECTED_ATTRIBUTES can be used only when Querying an index", 400)
+    if select == "SPECIFIC_ATTRIBUTES" and not data.get("ProjectionExpression") and not data.get("AttributesToGet"):
+        return error_response_json("ValidationException",
+            "SPECIFIC_ATTRIBUTES requires ProjectionExpression or AttributesToGet", 400)
 
     pk_name, sk_name, is_gsi = _resolve_index_keys(table, index_name)
+    # ConsistentRead on a GSI is invalid (only LSIs support strongly-consistent reads).
+    if data.get("ConsistentRead") and is_gsi:
+        return error_response_json("ValidationException",
+            f"Consistent reads are not supported on global secondary indexes", 400)
 
     if key_conditions:
         pk_val = _extract_pk_from_key_conditions(key_conditions, pk_name)
     else:
         pk_val = _extract_pk_from_condition(key_cond, eav, ean, pk_name)
     if pk_val is None:
-        return error_response_json("ValidationException", "Query condition missed key schema element", 400)
+        return error_response_json("ValidationException",
+            f"Query condition missed key schema element: {pk_name}", 400)
+    # Reject non-key attributes in KeyConditionExpression: every bare identifier
+    # in the expression must be either the hash key or the sort key (resolved
+    # via ExpressionAttributeNames if aliased).
+    if key_cond:
+        try:
+            kce_tokens = _tokenize(key_cond)
+        except Exception:
+            kce_tokens = []
+        allowed = {pk_name}
+        if sk_name:
+            allowed.add(sk_name)
+        for tok in kce_tokens:
+            if tok[0] == "IDENT":
+                name_ = tok[1]
+                if name_.lower() in _DDB_EXPR_FUNCTIONS:
+                    continue
+                if name_.upper() in ("AND", "OR", "NOT", "BETWEEN"):
+                    continue
+                if name_ not in allowed:
+                    return error_response_json("ValidationException",
+                        f"Query condition missed key schema element: {name_}", 400)
+            elif tok[0] == "NAME_REF":
+                resolved = ean.get(tok[1])
+                if resolved and resolved not in allowed:
+                    return error_response_json("ValidationException",
+                        f"Query condition missed key schema element: {resolved}", 400)
 
     if is_gsi or index_name:
         candidates = []
@@ -1081,7 +1593,10 @@ def _query(data):
     if key_conditions:
         candidates = [it for it in candidates if _evaluate_key_conditions_item(it, key_conditions, pk_name)]
     elif key_cond:
-        candidates = [it for it in candidates if _evaluate_condition(key_cond, it, eav, ean)]
+        try:
+            candidates = [it for it in candidates if _evaluate_condition(key_cond, it, eav, ean)]
+        except ValueError as exc:
+            return error_response_json("ValidationException", str(exc), 400)
 
     if esk:
         candidates = _apply_exclusive_start_key(candidates, esk, pk_name, sk_name, scan_forward, table=table)
@@ -1103,8 +1618,12 @@ def _query(data):
     if select == "COUNT":
         result = {"Count": len(filtered), "ScannedCount": scanned_count}
     else:
+        try:
+            projected = [_apply_projection(it, data) for it in filtered]
+        except ValueError as exc:
+            return error_response_json("ValidationException", str(exc), 400)
         result = {
-            "Items": [_apply_projection(it, data) for it in filtered],
+            "Items": projected,
             "Count": len(filtered),
             "ScannedCount": scanned_count,
         }
@@ -1123,9 +1642,19 @@ def _query(data):
 
 def _scan(data):
     name = data.get("TableName")
+    if not isinstance(name, str) or not name:
+        return error_response_json("ValidationException",
+            "1 validation error detected: Value null at 'tableName' failed to satisfy constraint: Member must not be null", 400)
     table = _tables.get(name)
     if not table:
-        return error_response_json("ResourceNotFoundException", f"Requested resource not found: Table: {name} not found", 400)
+        return error_response_json("ResourceNotFoundException",
+            f"Cannot do operations on a non-existent table", 400)
+    err = _validate_return_consumed_capacity(data)
+    if err:
+        return err
+    err = _validate_expression_attrs(data, ("FilterExpression", "ProjectionExpression"))
+    if err:
+        return err
 
     filter_expr = data.get("FilterExpression", "")
     eav = data.get("ExpressionAttributeValues", {})
@@ -1134,6 +1663,48 @@ def _scan(data):
     esk = data.get("ExclusiveStartKey")
     index_name = data.get("IndexName")
     select = data.get("Select", "ALL_ATTRIBUTES")
+
+    # Limit must be > 0 when provided (AWS rejects Limit=0).
+    if limit is not None and int(limit) <= 0:
+        return error_response_json("ValidationException",
+            f"1 validation error detected: Value '{limit}' at 'limit' failed to satisfy constraint: Member must have value greater than or equal to 1", 400)
+    if data.get("ProjectionExpression") and data.get("AttributesToGet"):
+        return error_response_json("ValidationException",
+            "Can not use both expression and non-expression parameters in the same request: Non-expression parameters: {AttributesToGet} Expression parameters: {ProjectionExpression}", 400)
+    if data.get("FilterExpression") and data.get("ScanFilter"):
+        return error_response_json("ValidationException",
+            "Can not use both expression and non-expression parameters in the same request: Non-expression parameters: {ScanFilter} Expression parameters: {FilterExpression}", 400)
+    # Segment / TotalSegments validation per AWS.
+    segment = data.get("Segment")
+    total_segments = data.get("TotalSegments")
+    if segment is not None and total_segments is None:
+        return error_response_json("ValidationException",
+            "The TotalSegments parameter is required when Segment is provided", 400)
+    if total_segments is not None and segment is None:
+        return error_response_json("ValidationException",
+            "The Segment parameter is required when TotalSegments is provided", 400)
+    if segment is not None and total_segments is not None:
+        seg = int(segment); ts = int(total_segments)
+        if ts < 1 or ts > 1_000_000:
+            return error_response_json("ValidationException",
+                f"TotalSegments must be between 1 and 1000000", 400)
+        if seg < 0 or seg >= ts:
+            return error_response_json("ValidationException",
+                f"Segment must be greater than or equal to 0 and less than TotalSegments", 400)
+    # Select validation.
+    if select == "ALL_PROJECTED_ATTRIBUTES" and not index_name:
+        return error_response_json("ValidationException",
+            "ALL_PROJECTED_ATTRIBUTES can be used only when Scanning an index", 400)
+    if select == "SPECIFIC_ATTRIBUTES" and not data.get("ProjectionExpression") and not data.get("AttributesToGet"):
+        return error_response_json("ValidationException",
+            "SPECIFIC_ATTRIBUTES requires ProjectionExpression or AttributesToGet", 400)
+    # ConsistentRead on a GSI is invalid.
+    if index_name and data.get("ConsistentRead"):
+        _, _, is_gsi_scan = _resolve_index_keys(table, index_name)
+        if is_gsi_scan:
+            return error_response_json("ValidationException",
+                "Consistent reads are not supported on global secondary indexes", 400)
+    # Query Limit also validated above for parity.
 
     all_items = []
     for pk in sorted(table["items"].keys()):
@@ -1160,15 +1731,22 @@ def _scan(data):
     if scan_filter and not filter_expr:
         filtered = [it for it in all_items if _evaluate_legacy_filter(it, scan_filter)]
     elif filter_expr:
-        filtered = [it for it in all_items if _evaluate_condition(filter_expr, it, eav, ean)]
+        try:
+            filtered = [it for it in all_items if _evaluate_condition(filter_expr, it, eav, ean)]
+        except ValueError as exc:
+            return error_response_json("ValidationException", str(exc), 400)
     else:
         filtered = all_items
 
     if select == "COUNT":
         result = {"Count": len(filtered), "ScannedCount": scanned_count}
     else:
+        try:
+            projected = [_apply_projection(it, data) for it in filtered]
+        except ValueError as exc:
+            return error_response_json("ValidationException", str(exc), 400)
         result = {
-            "Items": [_apply_projection(it, data) for it in filtered],
+            "Items": projected,
             "Count": len(filtered),
             "ScannedCount": scanned_count,
         }
@@ -1189,7 +1767,7 @@ def _execute_statement(data):
     parameters = data.get("Parameters", [])
 
     if not statement or not statement.strip():
-        return error_response_json("ValidationException", "Statement must not be empty", 400)
+        return error_response_json("ValidationException", "Statement must not be null or empty", 400)
 
     try:
         parsed = _parse_partiql(statement, parameters)
@@ -1204,15 +1782,28 @@ def _execute_statement(data):
                                    f"Requested resource not found: Table: {table_name} not found", 400)
 
     if op == "SELECT":
-        return _partiql_select(table, parsed)
+        status, headers, body = _partiql_select(table, parsed)
     elif op == "INSERT":
-        return _partiql_insert(table, parsed)
+        status, headers, body = _partiql_insert(table, parsed)
     elif op == "UPDATE":
-        return _partiql_update(table, parsed)
+        status, headers, body = _partiql_update(table, parsed)
     elif op == "DELETE":
-        return _partiql_delete(table, parsed)
+        status, headers, body = _partiql_delete(table, parsed)
     else:
         return error_response_json("ValidationException", f"Unsupported PartiQL operation: {op}", 400)
+    # Attach ConsumedCapacity per AWS when ReturnConsumedCapacity != NONE.
+    rc = data.get("ReturnConsumedCapacity", "NONE")
+    if status == 200 and rc != "NONE":
+        try:
+            payload = json.loads(body)
+        except (TypeError, ValueError):
+            payload = None
+        if isinstance(payload, dict):
+            units = max(1.0, float(len(payload.get("Items", []) or [1])))
+            payload["ConsumedCapacity"] = {"TableName": table_name, "CapacityUnits": units}
+            new_body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            return status, headers, new_body
+    return status, headers, body
 
 
 def _partiql_select(table, parsed):
@@ -1249,11 +1840,13 @@ def _partiql_insert(table, parsed):
     if not pk_val:
         return error_response_json("ValidationException",
                                    "Missing partition key in INSERT", 400)
-    # DynamoDB PartiQL INSERT fails on duplicate key
+    # DynamoDB PartiQL INSERT on an existing primary key returns
+    # DuplicateItemException (verified against AWS docs + botocore error list).
     if pk_val in table["items"] and sk_val in table["items"][pk_val]:
-        return error_response_json("ConditionalCheckFailedException",
+        return error_response_json("DuplicateItemException",
                                    "Duplicate primary key exists in table", 400)
     table["items"][pk_val][sk_val] = item
+    _update_counts(table)
     return json_response({})
 
 
@@ -1263,16 +1856,13 @@ def _partiql_update(table, parsed):
     if not where_fn or not set_attrs:
         return error_response_json("ValidationException",
                                    "UPDATE requires SET and WHERE clauses", 400)
-    updated = False
     for pk in list(table["items"].keys()):
         for sk in list(table["items"][pk].keys()):
             it = table["items"][pk][sk]
             if where_fn(it):
                 for attr, val in set_attrs.items():
                     it[attr] = val
-                updated = True
-    if updated:
-        return json_response({})
+    return json_response({})
 
 
 def _partiql_delete(table, parsed):
@@ -1290,8 +1880,172 @@ def _partiql_delete(table, parsed):
         del table["items"][pk][sk]
         if not table["items"][pk]:
             del table["items"][pk]
-    if to_delete:
-        return json_response({})
+    _update_counts(table)
+    return json_response({})
+
+
+# ---------------------------------------------------------------------------
+# PartiQL — BatchExecuteStatement
+# ---------------------------------------------------------------------------
+
+_DDB_BATCH_PARTIQL_MAX = 25
+
+
+def _batch_execute_statement(data):
+    statements = data.get("Statements")
+    if not statements:
+        return error_response_json("ValidationException",
+            "1 validation error detected: Value '[]' at 'statements' failed to satisfy constraint: Member must have length greater than or equal to 1", 400)
+    if len(statements) > _DDB_BATCH_PARTIQL_MAX:
+        return error_response_json("ValidationException",
+            f"Member must have length less than or equal to {_DDB_BATCH_PARTIQL_MAX}", 400)
+    responses = []
+    rc = data.get("ReturnConsumedCapacity", "NONE")
+    per_table_units: dict[str, float] = {}
+    for stmt in statements:
+        sub = {"Statement": stmt.get("Statement"), "Parameters": stmt.get("Parameters", [])}
+        status, _, body = _execute_statement(sub)
+        try:
+            payload = json.loads(body)
+        except (TypeError, ValueError):
+            payload = {}
+        if status == 200:
+            entry: dict = {}
+            if payload.get("Items") is not None:
+                entry["Item"] = payload["Items"][0] if payload["Items"] else None
+            if entry.get("Item") is None and "Item" in entry:
+                entry.pop("Item")
+            responses.append(entry)
+        else:
+            err_code = payload.get("__type", "ValidationException")
+            err_msg = payload.get("message", "")
+            responses.append({"Error": {"Code": err_code.split("#")[-1], "Message": err_msg}})
+        # Crude per-table unit attribution.
+        try:
+            parsed = _parse_partiql(stmt.get("Statement", ""), stmt.get("Parameters", []))
+            per_table_units[parsed["table"]] = per_table_units.get(parsed["table"], 0.0) + 1.0
+        except Exception:
+            pass
+    result = {"Responses": responses}
+    if rc != "NONE":
+        result["ConsumedCapacity"] = [
+            {"TableName": t, "CapacityUnits": u}
+            for t, u in per_table_units.items()
+        ]
+    return json_response(result)
+
+
+# ---------------------------------------------------------------------------
+# PartiQL — ExecuteTransaction
+# ---------------------------------------------------------------------------
+
+_DDB_TXN_PARTIQL_MAX = 100
+
+
+def _execute_transaction(data):
+    statements = data.get("TransactStatements")
+    if not statements:
+        return error_response_json("ValidationException",
+            "1 validation error detected: Value '[]' at 'transactStatements' failed to satisfy constraint: Member must have length greater than or equal to 1", 400)
+    if len(statements) > _DDB_TXN_PARTIQL_MAX:
+        return error_response_json("ValidationException",
+            f"Member must have length less than or equal to {_DDB_TXN_PARTIQL_MAX}", 400)
+
+    # ClientRequestToken idempotency parity with TransactWriteItems.
+    crt = data.get("ClientRequestToken")
+    signature = None
+    if crt:
+        prior = _txn_idempotency.get(crt)
+        signature = {k: v for k, v in data.items() if k != "ClientRequestToken"}
+        if prior is not None:
+            if prior.get("signature") == signature:
+                return json_response(prior.get("response", {}))
+            return error_response_json("IdempotentParameterMismatchException",
+                "Request token already in use for another request with a different payload", 400)
+
+    # Parse every statement and detect duplicate-INSERT pre-emptively so the
+    # whole transaction is rejected (matches AWS semantics — all-or-nothing).
+    parsed_list = []
+    for stmt in statements:
+        statement = stmt.get("Statement", "")
+        parameters = stmt.get("Parameters", [])
+        try:
+            parsed = _parse_partiql(statement, parameters)
+        except ValueError as e:
+            return error_response_json("ValidationException", str(e), 400)
+        table = _tables.get(parsed["table"])
+        if not table:
+            return error_response_json("ResourceNotFoundException",
+                f"Requested resource not found: Table: {parsed['table']} not found", 400)
+        parsed_list.append((parsed, table))
+
+    # Apply each statement; collect any failures to roll back. Take ONE
+    # snapshot per table up front so rollback restores the pre-transaction
+    # state, not the state mid-transaction.
+    snapshots: dict[str, dict] = {}
+    for parsed, table in parsed_list:
+        tname = table["TableName"]
+        if tname not in snapshots:
+            snapshots[tname] = copy.deepcopy(dict(table["items"]))
+    rc = data.get("ReturnConsumedCapacity", "NONE")
+    responses = []
+    failure = None
+    for idx, (parsed, table) in enumerate(parsed_list):
+        if parsed["op"] == "SELECT":
+            status, _, body = _partiql_select(table, parsed)
+        elif parsed["op"] == "INSERT":
+            status, _, body = _partiql_insert(table, parsed)
+        elif parsed["op"] == "UPDATE":
+            status, _, body = _partiql_update(table, parsed)
+        elif parsed["op"] == "DELETE":
+            status, _, body = _partiql_delete(table, parsed)
+        else:
+            failure = (idx, "ValidationException", f"Unsupported op: {parsed['op']}")
+            break
+        if status != 200:
+            try:
+                err_body = json.loads(body)
+            except (TypeError, ValueError):
+                err_body = {}
+            failure = (idx, err_body.get("__type", "ValidationException"), err_body.get("message", ""))
+            break
+        try:
+            payload = json.loads(body)
+        except (TypeError, ValueError):
+            payload = {}
+        entry = {}
+        if "Items" in payload and payload["Items"]:
+            entry["Item"] = payload["Items"][0]
+        responses.append(entry)
+
+    if failure is not None:
+        # Roll back: restore each table's items from its snapshot.
+        for tname, items in snapshots.items():
+            tbl = _tables.get(tname)
+            if tbl is not None:
+                tbl["items"] = defaultdict(dict, items)
+        idx, code, msg = failure
+        reasons = [{"Code": "None"} for _ in statements]
+        reasons[idx] = {"Code": code.split("#")[-1], "Message": msg}
+        # AWS returns TransactionCanceledException with per-statement reasons.
+        body = json.dumps({
+            "__type": "TransactionCanceledException",
+            "message": f"Transaction cancelled, please refer cancellation reasons for specific reasons [{', '.join(r['Code'] for r in reasons)}]",
+            "CancellationReasons": reasons,
+        }).encode("utf-8")
+        return 400, {"Content-Type": "application/x-amz-json-1.0", "x-amzn-errortype": "TransactionCanceledException"}, body
+
+    result = {"Responses": responses}
+    if rc != "NONE":
+        per_table: dict[str, float] = {}
+        for parsed, _ in parsed_list:
+            per_table[parsed["table"]] = per_table.get(parsed["table"], 0.0) + 2.0
+        result["ConsumedCapacity"] = [
+            {"TableName": t, "CapacityUnits": u} for t, u in per_table.items()
+        ]
+    if crt:
+        _txn_idempotency[crt] = {"signature": signature, "response": result}
+    return json_response(result)
 
 
 def _parse_partiql(statement, parameters):
@@ -1560,7 +2314,7 @@ def _batch_write_item(data):
         if not table:
             return error_response_json(
                 "ResourceNotFoundException",
-                "Requested resource not found",
+                "Cannot do operations on a non-existent table",
                 400,
             )
         for req in requests:
@@ -1643,7 +2397,7 @@ def _batch_get_item(data):
     for table_name in request_items:
         if table_name not in _tables:
             return error_response_json("ResourceNotFoundException",
-                f"Requested resource not found", 400)
+                "Cannot do operations on a non-existent table", 400)
     # Duplicate-key rejection.
     for table_name, cfg in request_items.items():
         table = _tables[table_name]
@@ -1666,6 +2420,10 @@ def _batch_get_item(data):
             continue
         responses[table_name] = []
         proj = config.get("ProjectionExpression")
+        atg = config.get("AttributesToGet")
+        if proj and atg:
+            return error_response_json("ValidationException",
+                "Can not use both expression and non-expression parameters in the same request: Non-expression parameters: {AttributesToGet} Expression parameters: {ProjectionExpression}", 400)
         config_ean = config.get("ExpressionAttributeNames", {})
         for key in config.get("Keys", []):
             pk_val, sk_val, key_err = _resolve_table_key_values(table, key, allow_extra=False)
@@ -1675,6 +2433,8 @@ def _batch_get_item(data):
             if item:
                 if proj:
                     item = _project_item(item, proj, config_ean)
+                elif atg:
+                    item = {k: item[k] for k in atg if k in item}
                 responses[table_name].append(item)
     return json_response({"Responses": responses, "UnprocessedKeys": unprocessed})
 
@@ -1698,6 +2458,20 @@ def _transact_write_items(data):
                 "Transaction request exceeds the 4MB transaction size limit", 400)
     except (TypeError, ValueError):
         pass
+    # ClientRequestToken idempotency. AWS keeps the token<->payload mapping
+    # for 10 minutes; a second call with the same token but different payload
+    # raises IdempotentParameterMismatchException.
+    crt = data.get("ClientRequestToken")
+    if crt:
+        prior = _txn_idempotency.get(crt)
+        # Drop the ClientRequestToken from the payload signature so equality
+        # is on the actual transaction body.
+        signature = {k: v for k, v in data.items() if k != "ClientRequestToken"}
+        if prior is not None:
+            if prior.get("signature") == signature:
+                return json_response(prior.get("response", {}))
+            return error_response_json("IdempotentParameterMismatchException",
+                "Request token already in use for another request with a different payload", 400)
     # Duplicate-key rejection across the transaction.
     seen_targets = set()
     for transact in items_list:
@@ -1779,7 +2553,33 @@ def _transact_write_items(data):
             _emit_stream_event(table_name, "MODIFY" if old_item else "INSERT", old_item, item)
         _update_counts(tbl)
 
-    return json_response({})
+    # ConsumedCapacity (2 units per item for transactions).
+    result = {}
+    rc = data.get("ReturnConsumedCapacity", "NONE")
+    if rc != "NONE":
+        per_table_units: dict[str, float] = {}
+        for transact in items_list:
+            op_type, op = _extract_transact_op(transact)
+            if op is None:
+                continue
+            tname = op.get("TableName", "")
+            per_table_units[tname] = per_table_units.get(tname, 0.0) + 2.0
+        consumed = []
+        for tname, units in per_table_units.items():
+            entry = {"TableName": tname, "CapacityUnits": units, "WriteCapacityUnits": units}
+            if rc == "INDEXES" and _tables.get(tname, {}).get("GlobalSecondaryIndexes"):
+                entry["GlobalSecondaryIndexes"] = {
+                    gsi["IndexName"]: {"CapacityUnits": units, "WriteCapacityUnits": units}
+                    for gsi in _tables[tname].get("GlobalSecondaryIndexes", [])
+                }
+            consumed.append(entry)
+        result["ConsumedCapacity"] = consumed
+    if crt:
+        _txn_idempotency[crt] = {"signature": signature, "response": result}
+    return json_response(result)
+
+
+_txn_idempotency = AccountScopedDict()
 
 
 def _transact_get_items(data):
@@ -1807,12 +2607,16 @@ def _transact_get_items(data):
                 "Transaction request cannot include multiple operations on one item", 400)
         seen.add(key_repr)
     responses = []
+    per_table_units: dict[str, float] = {}
     for transact in items_list:
         get_op = transact.get("Get", {})
-        tbl = _tables.get(get_op.get("TableName", ""))
+        tname = get_op.get("TableName", "")
+        tbl = _tables.get(tname)
         if not tbl:
             responses.append({})
             continue
+        # TransactGetItems consumes 2x RCU per item (vs 1 for a regular Get).
+        per_table_units[tname] = per_table_units.get(tname, 0.0) + 2.0
         item = _get_item_by_key(tbl, get_op.get("Key", {}))
         if item:
             proj = get_op.get("ProjectionExpression")
@@ -1822,7 +2626,20 @@ def _transact_get_items(data):
             responses.append({"Item": item})
         else:
             responses.append({})
-    return json_response({"Responses": responses})
+    result = {"Responses": responses}
+    rc = data.get("ReturnConsumedCapacity", "NONE")
+    if rc != "NONE":
+        consumed = []
+        for tname, units in per_table_units.items():
+            entry = {"TableName": tname, "CapacityUnits": units, "ReadCapacityUnits": units}
+            if rc == "INDEXES" and _tables.get(tname, {}).get("GlobalSecondaryIndexes"):
+                entry["GlobalSecondaryIndexes"] = {
+                    gsi["IndexName"]: {"CapacityUnits": units, "ReadCapacityUnits": units}
+                    for gsi in _tables[tname].get("GlobalSecondaryIndexes", [])
+                }
+            consumed.append(entry)
+        result["ConsumedCapacity"] = consumed
+    return json_response(result)
 
 
 def _extract_transact_op(transact):
@@ -1879,9 +2696,13 @@ def _update_ttl(data):
         return error_response_json("ResourceNotFoundException", f"Table {name} not found", 400)
     spec = data.get("TimeToLiveSpecification", {})
     enabled = spec.get("Enabled", False)
+    attr_name = spec.get("AttributeName", "")
+    if not isinstance(attr_name, str) or attr_name == "":
+        return error_response_json("ValidationException",
+            "1 validation error detected: Value '' at 'timeToLiveSpecification.attributeName' failed to satisfy constraint: Member must have length greater than or equal to 1", 400)
     _ttl_settings[name] = {
         "TimeToLiveStatus": "ENABLED" if enabled else "DISABLED",
-        "AttributeName": spec.get("AttributeName", ""),
+        "AttributeName": attr_name,
     }
     return json_response({"TimeToLiveSpecification": spec})
 
@@ -1950,8 +2771,23 @@ def _describe_endpoints(data):
 # Tag operations
 # ---------------------------------------------------------------------------
 
+def _validate_tag_arn(arn: str) -> tuple | None:
+    """ARN must (a) look like a DynamoDB ARN, (b) reference an existing table."""
+    if not isinstance(arn, str) or not arn.startswith("arn:aws:dynamodb:"):
+        return error_response_json("ValidationException",
+            f"1 validation error detected: Value '{arn}' at 'resourceArn' failed to satisfy constraint: Member must satisfy regular expression pattern: arn:[a-z\\-]+:dynamodb:[a-z]{{2}}-[a-z]+-[0-9]:[0-9]{{12}}:.*", 400)
+    tname = _table_name_from_arn(arn)
+    if not tname or tname not in _tables:
+        return error_response_json("ResourceNotFoundException",
+            f"Requested resource not found: ResourceArn: {arn}", 400)
+    return None
+
+
 def _tag_resource(data):
     arn = data.get("ResourceArn", "")
+    err = _validate_tag_arn(arn)
+    if err:
+        return err
     tags = data.get("Tags", [])
     existing = _tags.setdefault(arn, [])
     key_map = {t["Key"]: i for i, t in enumerate(existing)}
@@ -1965,6 +2801,9 @@ def _tag_resource(data):
 
 def _untag_resource(data):
     arn = data.get("ResourceArn", "")
+    err = _validate_tag_arn(arn)
+    if err:
+        return err
     keys = set(data.get("TagKeys", []))
     if arn in _tags:
         _tags[arn] = [t for t in _tags[arn] if t["Key"] not in keys]
@@ -1973,6 +2812,9 @@ def _untag_resource(data):
 
 def _list_tags(data):
     arn = data.get("ResourceArn", "")
+    err = _validate_tag_arn(arn)
+    if err:
+        return err
     return json_response({"Tags": _tags.get(arn, [])})
 
 
@@ -2624,6 +3466,212 @@ def _list_imports(data):
 
 
 # ---------------------------------------------------------------------------
+# Backups — local emulation. CreateBackup snapshots the table; Restore re-creates
+# the table from the snapshot. Shapes verified against botocore service-2.json.
+# ---------------------------------------------------------------------------
+
+def _backup_arn(table_name: str, backup_name: str) -> str:
+    return (
+        f"arn:aws:dynamodb:{get_region()}:{get_account_id()}:table/{table_name}/"
+        f"backup/{int(time.time() * 1000)}-{new_uuid()[:8]}"
+    )
+
+
+def _create_backup(data):
+    raw = data.get("TableName")
+    if not raw:
+        return error_response_json("ValidationException",
+            "1 validation error detected: Value null at 'tableName' failed to satisfy constraint: Member must not be null", 400)
+    name = _normalize_table_name(raw)
+    if name not in _tables:
+        return error_response_json("TableNotFoundException", f"Table not found: {raw}", 400)
+    backup_name = data.get("BackupName")
+    if not backup_name:
+        return error_response_json("ValidationException",
+            "1 validation error detected: Value null at 'backupName' failed to satisfy constraint: Member must not be null", 400)
+    table = _tables[name]
+    arn = _backup_arn(name, backup_name)
+    now = time.time()
+    details = {
+        "BackupArn": arn,
+        "BackupName": backup_name,
+        "BackupCreationDateTime": now,
+        "BackupStatus": "AVAILABLE",
+        "BackupType": "USER",
+        "BackupSizeBytes": table.get("TableSizeBytes", 0),
+    }
+    desc = {
+        "BackupDetails": details,
+        "SourceTableDetails": {
+            "TableName": name,
+            "TableId": table.get("TableId"),
+            "TableArn": table.get("TableArn"),
+            "TableSizeBytes": table.get("TableSizeBytes", 0),
+            "KeySchema": table.get("KeySchema", []),
+            "TableCreationDateTime": table.get("CreationDateTime"),
+            "ProvisionedThroughput": table.get("ProvisionedThroughput", {}),
+            "ItemCount": table.get("ItemCount", 0),
+            "BillingMode": table.get("BillingModeSummary", {}).get("BillingMode", "PROVISIONED"),
+        },
+        "SourceTableFeatureDetails": {
+            "LocalSecondaryIndexes": table.get("LocalSecondaryIndexes", []),
+            "GlobalSecondaryIndexes": table.get("GlobalSecondaryIndexes", []),
+            "StreamDescription": table.get("StreamSpecification"),
+            "TimeToLiveDescription": _ttl_settings.get(name),
+            "SSEDescription": table.get("SSEDescription"),
+        },
+        # Stash a deep snapshot of the items so Restore can rebuild the table.
+        "_items_snapshot": copy.deepcopy(dict(table.get("items", {}))),
+    }
+    _backups[arn] = desc
+    return json_response({"BackupDetails": details})
+
+
+def _describe_backup(data):
+    arn = data.get("BackupArn")
+    if not arn:
+        return error_response_json("ValidationException",
+            "1 validation error detected: Value null at 'backupArn' failed to satisfy constraint: Member must not be null", 400)
+    desc = _backups.get(arn)
+    if not desc:
+        return error_response_json("BackupNotFoundException", f"Backup not found: {arn}", 400)
+    # Strip the internal items snapshot from the wire response.
+    public = {k: v for k, v in desc.items() if not k.startswith("_")}
+    return json_response({"BackupDescription": public})
+
+
+def _delete_backup(data):
+    arn = data.get("BackupArn")
+    if not arn:
+        return error_response_json("ValidationException",
+            "1 validation error detected: Value null at 'backupArn' failed to satisfy constraint: Member must not be null", 400)
+    desc = _backups.pop(arn, None)
+    if not desc:
+        return error_response_json("BackupNotFoundException", f"Backup not found: {arn}", 400)
+    public = {k: v for k, v in desc.items() if not k.startswith("_")}
+    return json_response({"BackupDescription": public})
+
+
+def _list_backups(data):
+    table_filter = _normalize_table_name(data.get("TableName") or "")
+    limit = data.get("Limit", 100)
+    next_token = data.get("ExclusiveStartBackupArn")
+    summaries = []
+    for arn, desc in _backups.items():
+        src = desc.get("SourceTableDetails", {})
+        if table_filter and src.get("TableName") != table_filter:
+            continue
+        details = desc["BackupDetails"]
+        summaries.append({
+            "TableName": src.get("TableName"),
+            "TableId": src.get("TableId"),
+            "TableArn": src.get("TableArn"),
+            "BackupArn": arn,
+            "BackupName": details["BackupName"],
+            "BackupCreationDateTime": details["BackupCreationDateTime"],
+            "BackupStatus": details["BackupStatus"],
+            "BackupType": details["BackupType"],
+            "BackupSizeBytes": details["BackupSizeBytes"],
+        })
+    start = 0
+    if next_token:
+        for i, s in enumerate(summaries):
+            if s["BackupArn"] == next_token:
+                start = i + 1
+                break
+    page = summaries[start:start + limit]
+    resp = {"BackupSummaries": page}
+    if start + limit < len(summaries) and page:
+        resp["LastEvaluatedBackupArn"] = page[-1]["BackupArn"]
+    return json_response(resp)
+
+
+def _restore_table_from_backup(data):
+    target = data.get("TargetTableName")
+    arn = data.get("BackupArn")
+    if not target:
+        return error_response_json("ValidationException",
+            "1 validation error detected: Value null at 'targetTableName' failed to satisfy constraint: Member must not be null", 400)
+    if not arn:
+        return error_response_json("ValidationException",
+            "1 validation error detected: Value null at 'backupArn' failed to satisfy constraint: Member must not be null", 400)
+    desc = _backups.get(arn)
+    if not desc:
+        return error_response_json("BackupNotFoundException", f"Backup not found: {arn}", 400)
+    if target in _tables:
+        return error_response_json("TableAlreadyExistsException",
+            f"Target table {target} already exists", 400)
+    src = desc.get("SourceTableDetails", {})
+    feat = desc.get("SourceTableFeatureDetails", {})
+    create_req = {
+        "TableName": target,
+        "KeySchema": src.get("KeySchema", []),
+        "AttributeDefinitions": _tables.get(src.get("TableName"), {}).get("AttributeDefinitions", []),
+        "BillingMode": data.get("BillingModeOverride") or src.get("BillingMode", "PROVISIONED"),
+    }
+    if create_req["BillingMode"] == "PROVISIONED":
+        create_req["ProvisionedThroughput"] = src.get("ProvisionedThroughput") or {"ReadCapacityUnits": 5, "WriteCapacityUnits": 5}
+    if data.get("GlobalSecondaryIndexOverride") is not None:
+        create_req["GlobalSecondaryIndexes"] = data["GlobalSecondaryIndexOverride"]
+    elif feat.get("GlobalSecondaryIndexes"):
+        create_req["GlobalSecondaryIndexes"] = feat["GlobalSecondaryIndexes"]
+    if data.get("LocalSecondaryIndexOverride") is not None:
+        create_req["LocalSecondaryIndexes"] = data["LocalSecondaryIndexOverride"]
+    elif feat.get("LocalSecondaryIndexes"):
+        create_req["LocalSecondaryIndexes"] = feat["LocalSecondaryIndexes"]
+    status, _, body = _create_table(create_req)
+    if status != 200:
+        return status, {"Content-Type": "application/x-amz-json-1.0"}, body
+    # Restore items.
+    snap = desc.get("_items_snapshot") or {}
+    _tables[target]["items"] = defaultdict(dict, copy.deepcopy(snap))
+    _update_counts(_tables[target])
+    return json_response({"TableDescription": _table_description(target)})
+
+
+def _restore_table_to_point_in_time(data):
+    src_name = data.get("SourceTableName") or _normalize_table_name(data.get("SourceTableArn") or "")
+    target = data.get("TargetTableName")
+    if not src_name or src_name not in _tables:
+        return error_response_json("TableNotFoundException",
+            f"Source table not found: {data.get('SourceTableName') or data.get('SourceTableArn')}", 400)
+    if not target:
+        return error_response_json("ValidationException",
+            "1 validation error detected: Value null at 'targetTableName' failed to satisfy constraint: Member must not be null", 400)
+    if target in _tables:
+        return error_response_json("TableAlreadyExistsException",
+            f"Target table {target} already exists", 400)
+    src = _tables[src_name]
+    create_req = {
+        "TableName": target,
+        "KeySchema": src.get("KeySchema", []),
+        "AttributeDefinitions": src.get("AttributeDefinitions", []),
+        "BillingMode": data.get("BillingModeOverride") or src.get("BillingModeSummary", {}).get("BillingMode", "PROVISIONED"),
+    }
+    if create_req["BillingMode"] == "PROVISIONED":
+        create_req["ProvisionedThroughput"] = src.get("ProvisionedThroughput") or {"ReadCapacityUnits": 5, "WriteCapacityUnits": 5}
+    status, _, body = _create_table(create_req)
+    if status != 200:
+        return status, {"Content-Type": "application/x-amz-json-1.0"}, body
+    _tables[target]["items"] = defaultdict(dict, copy.deepcopy(dict(src.get("items", {}))))
+    _update_counts(_tables[target])
+    return json_response({"TableDescription": _table_description(target)})
+
+
+# ---------------------------------------------------------------------------
+# Account-level — DescribeLimits.
+# ---------------------------------------------------------------------------
+
+def _describe_limits(data):
+    return json_response({
+        "AccountMaxReadCapacityUnits": 80000,
+        "AccountMaxWriteCapacityUnits": 80000,
+        "TableMaxReadCapacityUnits": 40000,
+        "TableMaxWriteCapacityUnits": 40000,
+    })
+
+
+# ---------------------------------------------------------------------------
 # Expression tokenizer
 # ---------------------------------------------------------------------------
 
@@ -2870,15 +3918,33 @@ class _ExprEval:
         if "S" in attr and "S" in substr:
             return attr["S"].startswith(substr["S"])
         if "B" in attr and "B" in substr:
-            return str(attr["B"]).startswith(str(substr["B"]))
-        return False
+            import base64
+            def _b(v):
+                if isinstance(v, bytes):
+                    return v
+                try:
+                    return base64.b64decode(v)
+                except Exception:
+                    return v.encode("latin-1") if isinstance(v, str) else b""
+            return _b(attr["B"]).startswith(_b(substr["B"]))
+        # AWS rejects begins_with on a non-string/binary operand.
+        raise ValueError("Incorrect operand type for operator or function; operator or function: begins_with")
 
     def _fn_contains(self):
         self.advance();  self.expect('LPAREN')
+        # Capture raw position so we can detect `contains(x, x)` with identical
+        # path and operand — AWS rejects that as "operands must be distinct".
+        path_start = self.pos
         path = self._parse_path()
         self.expect('COMMA')
+        operand_start = self.pos
         val = self._operand()
         self.expect('RPAREN')
+        # Cheap structural check: same token sequence for path and operand.
+        path_tokens = self.tokens[path_start:operand_start - 1]
+        operand_tokens = self.tokens[operand_start:self.pos - 1]
+        if path_tokens == operand_tokens and path_tokens:
+            raise ValueError("Invalid ConditionExpression: The first operand must be distinct from the remaining operands for this function; function: contains")
         attr = _get_at_path(self.item, path)
         if attr is None or val is None:
             return False
@@ -2904,11 +3970,71 @@ class _ExprEval:
         return {"N": str(_ddb_size(attr))}
 
 
+_DDB_EXPR_FUNCTIONS = {
+    "attribute_exists", "attribute_not_exists", "attribute_type",
+    "begins_with", "contains", "size", "if_not_exists", "list_append",
+}
+
+
+def _check_reserved_keyword_usage(tokens) -> str | None:
+    """AWS rejects any bare identifier in an expression that matches one of
+    its system keywords; the user must alias the name with `#alias`. Detect
+    by scanning IDENT tokens that aren't a known function name."""
+    for tok in tokens:
+        if tok[0] != "IDENT":
+            continue
+        name = tok[1]
+        # Built-in functions and the logical/comparison operators are NOT
+        # identifiers in user-name position.
+        if name.lower() in _DDB_EXPR_FUNCTIONS:
+            continue
+        if name.upper() in ("AND", "OR", "NOT", "BETWEEN", "IN"):
+            continue
+        if name.upper() in AWS_KEYWORDS:
+            return f"Invalid UpdateExpression: Attribute name is a reserved keyword; reserved keyword: {name}"
+    return None
+
+
+def _check_redundant_parens(tokens) -> str | None:
+    """AWS rejects ConditionExpression / FilterExpression / KeyConditionExpression
+    that contain redundant parentheses. The unambiguous, low-false-positive
+    detection rule: an LPAREN whose immediately-following token is another
+    LPAREN whose matching RPAREN is followed directly by the outer RPAREN —
+    i.e. the `((expr))` pattern.
+
+    Returns the AWS-canonical error string when redundancy is detected, or
+    None when the expression is fine.
+    """
+    n = len(tokens)
+    for i in range(n - 1):
+        if tokens[i][0] == 'LPAREN' and tokens[i + 1][0] == 'LPAREN':
+            # Find matching RPAREN for the INNER LPAREN.
+            depth = 0
+            inner_end = None
+            for j in range(i + 1, n):
+                if tokens[j][0] == 'LPAREN':
+                    depth += 1
+                elif tokens[j][0] == 'RPAREN':
+                    depth -= 1
+                    if depth == 0:
+                        inner_end = j
+                        break
+            if inner_end is not None and inner_end + 1 < n and tokens[inner_end + 1][0] == 'RPAREN':
+                return "Invalid ConditionExpression: The expression has redundant parentheses"
+    return None
+
+
 def _evaluate_condition(expr, item, attr_values, attr_names):
     if not expr or not expr.strip():
         return True
     try:
         tokens = _tokenize(expr)
+        err = _check_redundant_parens(tokens)
+        if err:
+            raise ValueError(err)
+        err = _check_reserved_keyword_usage(tokens)
+        if err:
+            raise ValueError(err)
         return _ExprEval(tokens, item, attr_values, attr_names).evaluate()
     except Exception as e:
         logger.warning("Expression evaluation error: %s for expr: %s", e, expr)
@@ -2922,6 +4048,15 @@ def _evaluate_condition(expr, item, attr_values, attr_names):
 def _apply_update_expression(item, expr, attr_values, attr_names):
     item = copy.deepcopy(item)
     tokens = _tokenize(expr)
+    err = _check_redundant_parens(tokens)
+    if err:
+        raise ValueError(err)
+    # Strip SET/REMOVE/ADD/DELETE clause keywords before reserved-word scanning;
+    # they're clause introducers, not user attribute names.
+    scan_toks = [t for t in tokens if not (t[0] == "IDENT" and t[1].upper() in ("SET", "REMOVE", "ADD", "DELETE"))]
+    err = _check_reserved_keyword_usage(scan_toks)
+    if err:
+        raise ValueError(err)
     clauses = {}
     current_clause = None
     current_tokens = []
@@ -2948,6 +4083,11 @@ def _apply_update_expression(item, expr, attr_values, attr_names):
 
 
 def _apply_set(item, tokens, attr_values, attr_names):
+    # AWS semantics: all RHS references resolve against the pre-update snapshot
+    # of the item. Resolve every value first, then apply assignments — so
+    # `SET a = b, b = :v` sets `a` to the OLD value of `b`.
+    pre_snapshot = copy.deepcopy(item)
+    pending = []
     for assignment in _split_by_comma(tokens):
         eq_idx = None
         for i, tok in enumerate(assignment):
@@ -2957,9 +4097,18 @@ def _apply_set(item, tokens, attr_values, attr_names):
         if eq_idx is None:
             continue
         path_parts = _parse_path_from_tokens(assignment[:eq_idx], attr_names)
-        value = _eval_set_value(assignment[eq_idx + 1:], item, attr_values, attr_names)
+        value = _eval_set_value(assignment[eq_idx + 1:], pre_snapshot, attr_values, attr_names)
         if path_parts and value is not None:
-            _set_at_path(item, path_parts, value)
+            # AWS rejects SET on a path whose intermediate ancestor doesn't exist.
+            if len(path_parts) > 1:
+                ancestor = _get_at_path(item, path_parts[:-1])
+                if ancestor is None:
+                    raise ValueError(
+                        f"The document path provided in the update expression is invalid for update: {'.'.join(str(p) for p in path_parts[:-1])}"
+                    )
+            pending.append((path_parts, value))
+    for path_parts, value in pending:
+        _set_at_path(item, path_parts, value)
 
 
 def _eval_set_value(tokens, item, attr_values, attr_names):
@@ -3291,7 +4440,16 @@ def _ddb_comparable(val):
             except (InvalidOperation, TypeError, ValueError):
                 return ("N", Decimal(0))
         if "B" in val:
-            return ("B", val["B"])
+            # AWS sorts/compares binary values bytewise. Wire form is base64
+            # (str) — decode to bytes before comparing so b'\x01' < b'\xff'.
+            b = val["B"]
+            if isinstance(b, bytes):
+                return ("B", b)
+            try:
+                import base64
+                return ("B", base64.b64decode(b))
+            except Exception:
+                return ("B", b if isinstance(b, str) else b"")
         if "BOOL" in val:
             return ("BOOL", val["BOOL"])
         if "NULL" in val:
@@ -3324,9 +4482,25 @@ def _ddb_type(val):
 
 
 def _ddb_size(val):
+    """AWS size() returns the size of a value per AWS rules:
+    - S: number of UTF-16 code units (a surrogate pair counts as 2).
+    - B: number of bytes in the decoded binary value.
+    - SS/NS/BS/L/M: element count.
+    """
     if isinstance(val, dict):
-        if "S" in val:  return len(val["S"])
-        if "B" in val:  return len(val["B"])
+        if "S" in val:
+            s = val["S"]
+            # Sum: 1 unit for BMP chars, 2 for astral (surrogate pair) chars.
+            return sum(2 if ord(c) > 0xFFFF else 1 for c in s)
+        if "B" in val:
+            b = val["B"]
+            if isinstance(b, bytes):
+                return len(b)
+            try:
+                import base64
+                return len(base64.b64decode(b))
+            except Exception:
+                return len(b) if isinstance(b, str) else 0
         if "SS" in val: return len(val["SS"])
         if "NS" in val: return len(val["NS"])
         if "BS" in val: return len(val["BS"])
@@ -3401,13 +4575,26 @@ def _get_attr_type(table, attr_name):
 
 def _sort_key_value(attr, sk_type):
     if attr is None:
-        return "" if sk_type != "N" else Decimal(0)
+        if sk_type == "N":
+            return Decimal(0)
+        if sk_type == "B":
+            return b""
+        return ""
     val = _extract_key_val(attr)
     if sk_type == "N":
         try:
             return Decimal(val)
         except (InvalidOperation, TypeError, ValueError):
             return Decimal(0)
+    if sk_type == "B":
+        # Bytewise ordering matches real DynamoDB. Wire form is base64.
+        if isinstance(val, bytes):
+            return val
+        try:
+            import base64
+            return base64.b64decode(val)
+        except Exception:
+            return b""
     return val
 
 
@@ -3532,19 +4719,135 @@ def _build_key(item, pk_name, sk_name):
 def _apply_projection(item, data):
     proj = data.get("ProjectionExpression")
     ean = data.get("ExpressionAttributeNames", {})
-    if not proj:
-        return item
-    return _project_item(item, proj, ean)
+    if proj:
+        return _project_item(item, proj, ean)
+    atg = data.get("AttributesToGet")
+    if atg:
+        # Legacy AttributesToGet: return ONLY the specified attributes, do NOT
+        # auto-include key attributes (matches real AWS behavior).
+        return {k: item[k] for k in atg if k in item}
+    return item
+
+
+def _parse_projection_path(path: str, attr_names: dict) -> list:
+    """Parse a ProjectionExpression path segment list.
+
+    Examples:
+        "a"            -> [("name","a")]
+        "a.b"          -> [("name","a"),("name","b")]
+        "a[0]"         -> [("name","a"),("index",0)]
+        "#root.sub[2]" -> [("name","ROOT"),("name","sub"),("index",2)] (after EAN sub)
+    """
+    parts = []
+    i = 0
+    s = path.strip()
+    while i < len(s):
+        if s[i] == ".":
+            i += 1
+            continue
+        if s[i] == "[":
+            j = s.index("]", i)
+            parts.append(("index", int(s[i + 1:j])))
+            i = j + 1
+            continue
+        # Read a name token up to next . or [
+        j = i
+        while j < len(s) and s[j] not in (".", "["):
+            j += 1
+        token = s[i:j]
+        if token.startswith("#"):
+            token = attr_names.get(token, token)
+        parts.append(("name", token))
+        i = j
+    return parts
+
+
+def _project_one(node, path_parts):
+    """Walk `path_parts` into a DynamoDB AttributeValue `node` and return a
+    pruned copy that contains only the path, or None if the path doesn't
+    exist."""
+    if not path_parts:
+        return node
+    if not isinstance(node, dict) or len(node) != 1:
+        return None
+    (vtype, vval), = node.items()
+    kind, key = path_parts[0]
+    rest = path_parts[1:]
+    if kind == "name":
+        if vtype != "M" or not isinstance(vval, dict) or key not in vval:
+            return None
+        sub = _project_one(vval[key], rest)
+        if sub is None:
+            return None
+        return {"M": {key: sub}}
+    if kind == "index":
+        if vtype != "L" or not isinstance(vval, list):
+            return None
+        if key < 0 or key >= len(vval):
+            return None
+        sub = _project_one(vval[key], rest)
+        if sub is None:
+            return None
+        return {"L": [sub]}
+    return None
+
+
+def _merge_projection(into: dict | None, add: dict | None) -> dict | None:
+    """Merge two projection-result AttributeValues at the same level.
+    Both must share the same wrapping type (M or L); merging M unions keys,
+    merging L unions indices (kept in original order)."""
+    if into is None:
+        return add
+    if add is None:
+        return into
+    if not isinstance(into, dict) or not isinstance(add, dict):
+        return into
+    if len(into) != 1 or len(add) != 1:
+        return into
+    (it_t, it_v), = into.items()
+    (ad_t, ad_v), = add.items()
+    if it_t != ad_t:
+        return into
+    if it_t == "M" and isinstance(it_v, dict) and isinstance(ad_v, dict):
+        merged = dict(it_v)
+        for k, v in ad_v.items():
+            merged[k] = _merge_projection(merged.get(k), v) if k in merged else v
+        return {"M": merged}
+    if it_t == "L" and isinstance(it_v, list) and isinstance(ad_v, list):
+        # When two paths reference the same list, AWS preserves the union of
+        # indices in original order.
+        return {"L": it_v + [x for x in ad_v if x not in it_v]}
+    return into
 
 
 def _project_item(item, proj_expr, attr_names):
-    attrs = [a.strip() for a in proj_expr.split(",")]
-    result = {}
-    for attr in attrs:
-        first = attr.split(".")[0].split("[")[0]
-        resolved = attr_names.get(first, first) if first.startswith("#") else first
-        if resolved in item:
-            result[resolved] = item[resolved]
+    """Apply a ProjectionExpression to an item, supporting nested map paths
+    and list indexes. Multiple paths under the same root attribute are merged."""
+    if not proj_expr:
+        return item
+    # AWS-keyword check on each unaliased root identifier.
+    paths = [a.strip() for a in proj_expr.split(",") if a.strip()]
+    for path in paths:
+        head = path.split(".")[0].split("[")[0].strip()
+        if head and not head.startswith("#") and head.upper() in AWS_KEYWORDS:
+            raise ValueError(f"Invalid ProjectionExpression: Attribute name is a reserved keyword; reserved keyword: {head}")
+    result: dict = {}
+    for path in paths:
+        parts = _parse_projection_path(path, attr_names or {})
+        if not parts:
+            continue
+        root_kind, root_name = parts[0]
+        if root_kind != "name":
+            continue
+        if root_name not in item:
+            continue
+        sub = _project_one(item[root_name], parts[1:])
+        if sub is None:
+            continue
+        if root_name in result:
+            result[root_name] = _merge_projection(result[root_name], sub)
+        else:
+            result[root_name] = sub
     return result
 
 
@@ -3815,13 +5118,27 @@ def _extract_key_from_item(table, item):
 
 
 def _diff_attributes(old_item, new_item, return_old=True):
+    """Return only the attributes that changed.
+
+    - UPDATED_OLD: report the prior value of each attribute that was modified
+      or removed (omit additions, since there is no prior value).
+    - UPDATED_NEW: report the new value of each attribute that was created or
+      modified (omit removals, since there is no new value to report — per
+      AWS, REMOVE-only updates with UPDATED_NEW omit Attributes entirely).
+    """
     result = {}
     all_keys = set(list(old_item.keys()) + list(new_item.keys()))
     for k in all_keys:
         ov = old_item.get(k)
         nv = new_item.get(k)
-        if ov != nv:
-            result[k] = ov if return_old and ov is not None else nv if nv is not None else {}
+        if ov == nv:
+            continue
+        if return_old:
+            if ov is not None:
+                result[k] = ov
+        else:
+            if nv is not None:
+                result[k] = nv
     return result
 
 
