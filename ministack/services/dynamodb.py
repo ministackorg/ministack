@@ -683,6 +683,58 @@ def _sse_description_from_spec(spec: dict | None) -> dict | None:
     return desc
 
 
+def _validate_data_plane_table_name(name) -> tuple | None:
+    """Used by PutItem/GetItem/DeleteItem/UpdateItem/Query/Scan: returns a
+    ValidationException for null, empty, too-long, or pattern-violating
+    table names — BEFORE any other validators fire so the conformance
+    'reports only tableName' tests match."""
+    if name is None:
+        return error_response_json("ValidationException",
+            "1 validation error detected: Value null at 'tableName' failed to satisfy constraint: Member must not be null", 400)
+    if not isinstance(name, str):
+        return error_response_json("ValidationException",
+            "1 validation error detected: Value at 'tableName' failed to satisfy constraint: Member must be a string", 400)
+    if len(name) < 3 or len(name) > 255:
+        return error_response_json("ValidationException",
+            f"1 validation error detected: Value '{name}' at 'tableName' failed to satisfy constraint: Member must have length between 3 and 255", 400)
+    if not re.match(r"^[A-Za-z0-9_.\-]+$", name):
+        return error_response_json("ValidationException",
+            f"1 validation error detected: Value '{name}' at 'tableName' failed to satisfy constraint: Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+", 400)
+    return None
+
+
+def _multi_validation_error(failures: list[tuple]) -> tuple | None:
+    """AWS returns ONE ValidationException with all simultaneously-invalid
+    parameters concatenated:
+        '2 validation errors detected: Value ... at 'p1' ...; Value ... at 'p2' ...'
+    `failures` is a list of (value, param_path, constraint) tuples.
+    """
+    if not failures:
+        return None
+    pieces = [
+        f"Value '{val}' at '{path}' failed to satisfy constraint: {constraint}"
+        for val, path, constraint in failures
+    ]
+    return error_response_json("ValidationException",
+        f"{len(pieces)} validation error{'s' if len(pieces) > 1 else ''} detected: " + "; ".join(pieces), 400)
+
+
+def _check_per_op_param_enums(data: dict, rv_allowed: set | None) -> tuple | None:
+    """Collect every enum-style validation error in one envelope so the
+    'reports X and Y together' conformance tests match AWS exactly."""
+    failures: list[tuple] = []
+    rv = data.get("ReturnValues")
+    if rv is not None and rv_allowed is not None and rv not in rv_allowed:
+        failures.append((rv, "returnValues", f"Member must satisfy enum value set: {sorted(rv_allowed)}"))
+    rcc = data.get("ReturnConsumedCapacity")
+    if rcc is not None and rcc not in _RETURN_CONSUMED_CAPACITY_VALUES:
+        failures.append((rcc, "returnConsumedCapacity", "Member must satisfy enum value set: [INDEXES, TOTAL, NONE]"))
+    ricm = data.get("ReturnItemCollectionMetrics")
+    if ricm is not None and ricm not in _RETURN_ITEM_COLLECTION_METRICS:
+        failures.append((ricm, "returnItemCollectionMetrics", "Member must satisfy enum value set: [NONE, SIZE]"))
+    return _multi_validation_error(failures)
+
+
 _TABLE_NAME_RE = re.compile(r"^[A-Za-z0-9_.\-]+$")
 _INDEX_NAME_RE = re.compile(r"^[A-Za-z0-9_.\-]+$")
 _VALID_ATTR_TYPES = {"S", "N", "B"}
@@ -1203,23 +1255,16 @@ def _add_item_collection_metrics(result: dict, data: dict, table: dict, item: di
 
 def _put_item(data):
     name = data.get("TableName")
-    if not isinstance(name, str) or not name:
-        return error_response_json("ValidationException",
-            "1 validation error detected: Value null at 'tableName' failed to satisfy constraint: Member must not be null", 400)
+    err = _validate_data_plane_table_name(name)
+    if err:
+        return err
+    err = _check_per_op_param_enums(data, _PUT_DELETE_RV_VALUES)
+    if err:
+        return err
     table = _tables.get(name)
     if not table:
         return error_response_json("ResourceNotFoundException",
             f"Cannot do operations on a non-existent table", 400)
-
-    err = _validate_return_values(data, _PUT_DELETE_RV_VALUES)
-    if err:
-        return err
-    err = _validate_return_item_collection_metrics(data)
-    if err:
-        return err
-    err = _validate_return_consumed_capacity(data)
-    if err:
-        return err
     err = _validate_expression_attrs(data, ("ConditionExpression",))
     if err:
         return err
@@ -1270,9 +1315,12 @@ def _put_item(data):
 
 def _get_item(data):
     name = data.get("TableName")
-    if not isinstance(name, str) or not name:
-        return error_response_json("ValidationException",
-            "1 validation error detected: Value null at 'tableName' failed to satisfy constraint: Member must not be null", 400)
+    err = _validate_data_plane_table_name(name)
+    if err:
+        return err
+    err = _check_per_op_param_enums(data, None)
+    if err:
+        return err
     table = _tables.get(name)
     if not table:
         return error_response_json("ResourceNotFoundException",
@@ -1280,9 +1328,6 @@ def _get_item(data):
     if data.get("ProjectionExpression") and data.get("AttributesToGet"):
         return error_response_json("ValidationException",
             "Can not use both expression and non-expression parameters in the same request: Non-expression parameters: {AttributesToGet} Expression parameters: {ProjectionExpression}", 400)
-    err = _validate_return_consumed_capacity(data)
-    if err:
-        return err
     err = _validate_expression_attrs(data, ("ProjectionExpression",))
     if err:
         return err
@@ -1305,23 +1350,16 @@ def _get_item(data):
 
 def _delete_item(data):
     name = data.get("TableName")
-    if not isinstance(name, str) or not name:
-        return error_response_json("ValidationException",
-            "1 validation error detected: Value null at 'tableName' failed to satisfy constraint: Member must not be null", 400)
+    err = _validate_data_plane_table_name(name)
+    if err:
+        return err
+    err = _check_per_op_param_enums(data, _PUT_DELETE_RV_VALUES)
+    if err:
+        return err
     table = _tables.get(name)
     if not table:
         return error_response_json("ResourceNotFoundException",
             f"Cannot do operations on a non-existent table", 400)
-
-    err = _validate_return_values(data, _PUT_DELETE_RV_VALUES)
-    if err:
-        return err
-    err = _validate_return_item_collection_metrics(data)
-    if err:
-        return err
-    err = _validate_return_consumed_capacity(data)
-    if err:
-        return err
     err = _validate_expression_attrs(data, ("ConditionExpression",))
     if err:
         return err
@@ -1362,23 +1400,16 @@ def _delete_item(data):
 
 def _update_item(data):
     name = data.get("TableName")
-    if not isinstance(name, str) or not name:
-        return error_response_json("ValidationException",
-            "1 validation error detected: Value null at 'tableName' failed to satisfy constraint: Member must not be null", 400)
+    err = _validate_data_plane_table_name(name)
+    if err:
+        return err
+    err = _check_per_op_param_enums(data, _UPDATE_RV_VALUES)
+    if err:
+        return err
     table = _tables.get(name)
     if not table:
         return error_response_json("ResourceNotFoundException",
             f"Cannot do operations on a non-existent table", 400)
-
-    err = _validate_return_values(data, _UPDATE_RV_VALUES)
-    if err:
-        return err
-    err = _validate_return_item_collection_metrics(data)
-    if err:
-        return err
-    err = _validate_return_consumed_capacity(data)
-    if err:
-        return err
     err = _validate_expression_attrs(data, ("ConditionExpression", "UpdateExpression"))
     if err:
         return err
@@ -1468,16 +1499,24 @@ def _update_item(data):
 
 def _query(data):
     name = data.get("TableName")
-    if not isinstance(name, str) or not name:
-        return error_response_json("ValidationException",
-            "1 validation error detected: Value null at 'tableName' failed to satisfy constraint: Member must not be null", 400)
+    err = _validate_data_plane_table_name(name)
+    if err:
+        return err
+    err = _check_per_op_param_enums(data, None)
+    if err:
+        return err
     table = _tables.get(name)
     if not table:
         return error_response_json("ResourceNotFoundException",
             f"Cannot do operations on a non-existent table", 400)
-    err = _validate_return_consumed_capacity(data)
-    if err:
-        return err
+    # Non-existent IndexName → ValidationException (not ResourceNotFoundException).
+    idx_req = data.get("IndexName")
+    if idx_req:
+        known = {g["IndexName"] for g in table.get("GlobalSecondaryIndexes", [])} | \
+                {l["IndexName"] for l in table.get("LocalSecondaryIndexes", [])}
+        if idx_req not in known:
+            return error_response_json("ValidationException",
+                f"The table does not have the specified index: {idx_req}", 400)
     err = _validate_expression_attrs(data, ("KeyConditionExpression", "FilterExpression", "ProjectionExpression"))
     if err:
         return err
@@ -1642,16 +1681,24 @@ def _query(data):
 
 def _scan(data):
     name = data.get("TableName")
-    if not isinstance(name, str) or not name:
-        return error_response_json("ValidationException",
-            "1 validation error detected: Value null at 'tableName' failed to satisfy constraint: Member must not be null", 400)
+    err = _validate_data_plane_table_name(name)
+    if err:
+        return err
+    err = _check_per_op_param_enums(data, None)
+    if err:
+        return err
     table = _tables.get(name)
     if not table:
         return error_response_json("ResourceNotFoundException",
             f"Cannot do operations on a non-existent table", 400)
-    err = _validate_return_consumed_capacity(data)
-    if err:
-        return err
+    # Non-existent IndexName → ValidationException.
+    idx_req = data.get("IndexName")
+    if idx_req:
+        known = {g["IndexName"] for g in table.get("GlobalSecondaryIndexes", [])} | \
+                {l["IndexName"] for l in table.get("LocalSecondaryIndexes", [])}
+        if idx_req not in known:
+            return error_response_json("ValidationException",
+                f"The table does not have the specified index: {idx_req}", 400)
     err = _validate_expression_attrs(data, ("FilterExpression", "ProjectionExpression"))
     if err:
         return err
@@ -2305,7 +2352,7 @@ def _batch_write_item(data):
     total = sum(len(v) for v in request_items.values())
     if total > _DDB_BATCH_WRITE_MAX:
         return error_response_json("ValidationException",
-            f"Too many items requested for the BatchWriteItem call", 400)
+            f"Too many items requested for the BatchWriteItem call: {total} (maximum allowed is {_DDB_BATCH_WRITE_MAX})", 400)
     # Duplicate target key detection — AWS rejects two writes to the same key
     # in a single BatchWriteItem call.
     seen_keys = set()
@@ -2392,7 +2439,7 @@ def _batch_get_item(data):
     total = sum(len(cfg.get("Keys", [])) for cfg in request_items.values())
     if total > _DDB_BATCH_GET_MAX:
         return error_response_json("ValidationException",
-            "Too many items requested for the BatchGetItem call", 400)
+            f"Too many items requested for the BatchGetItem call: {total} (maximum allowed is {_DDB_BATCH_GET_MAX})", 400)
     # Non-existent table check before processing (AWS validates upfront).
     for table_name in request_items:
         if table_name not in _tables:
