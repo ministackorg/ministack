@@ -3947,11 +3947,14 @@ def test_lambda_durable_get_state_requires_token(lam):
         code, body = _raw_durable("GET", f"/2025-12-01/durable-executions/{arn}/state",
                                   query={"CheckpointToken": "wrong"})
         assert code == 400
-        # Correct token succeeds with empty operations list.
+        # Correct token succeeds. AWS seeds an EXECUTION-type operation on
+        # invoke so the SDK can read the input payload via
+        # state.get_execution_operation; expect exactly that op here.
         code, body = _raw_durable("GET", f"/2025-12-01/durable-executions/{arn}/state",
                                   query={"CheckpointToken": rec["CheckpointToken"]})
         assert code == 200
-        assert body["Operations"] == []
+        assert len(body["Operations"]) == 1
+        assert body["Operations"][0]["Type"] == "EXECUTION"
     finally:
         lam.delete_function(FunctionName=fname)
 
@@ -4044,3 +4047,200 @@ def test_lambda_durable_unknown_execution_404(lam):
     )
     assert code == 404
     assert "ResourceNotFoundException" in body.get("__type", "")
+
+
+# ---------------------------------------------------------------------------
+# Durable Lambda — runtime env injection + chained invoke + persistence.
+# ---------------------------------------------------------------------------
+
+def test_lambda_durable_runtime_env_vars_present(lam):
+    """A function with DurableConfig.Enabled gets the durable ARN + initial
+    CheckpointToken injected as env vars in its execution environment."""
+    import base64 as _b64
+    import json as _json
+    fname = f"durable-env-{_uuid_mod.uuid4().hex[:8]}"
+    try:
+        lam.delete_function(FunctionName=fname)
+    except Exception:
+        pass
+    # Handler echoes the durable env vars back so the test can verify them.
+    code = """
+import os, json
+def handler(event, context):
+    return {
+        "arn": os.environ.get("AWS_LAMBDA_DURABLE_EXECUTION_ARN"),
+        "token": os.environ.get("AWS_LAMBDA_DURABLE_CHECKPOINT_TOKEN"),
+        "name": os.environ.get("AWS_LAMBDA_DURABLE_EXECUTION_NAME"),
+    }
+"""
+    zip_b64 = _b64.b64encode(_make_zip(code)).decode()
+    _raw_durable("POST", "/2015-03-31/functions", body={
+        "FunctionName": fname,
+        "Runtime": "python3.12",
+        "Role": _LAMBDA_ROLE,
+        "Handler": "index.handler",
+        "Code": {"ZipFile": zip_b64},
+        "DurableConfig": {"Enabled": True},
+    })
+    try:
+        resp = lam.invoke(FunctionName=fname, Payload=b"{}")
+        body = _json.loads(resp["Payload"].read())
+        assert body["arn"] and body["arn"].startswith("arn:aws:lambda:")
+        assert "/durable-execution/" in body["arn"]
+        assert body["token"]
+        assert body["name"]
+    finally:
+        try:
+            lam.delete_function(FunctionName=fname)
+        except Exception:
+            pass
+
+
+def test_lambda_durable_chained_invoke_runs_child(lam):
+    """A CHAINED_INVOKE checkpoint update with Action=START actually spawns
+    the child function and records the result back into the parent's
+    operation log."""
+    import base64 as _b64
+    import json as _json
+    parent = f"durable-parent-{_uuid_mod.uuid4().hex[:8]}"
+    child = f"durable-child-{_uuid_mod.uuid4().hex[:8]}"
+    for n in (parent, child):
+        try:
+            lam.delete_function(FunctionName=n)
+        except Exception:
+            pass
+    # Child handler returns a deterministic marker.
+    child_code = "def handler(e,c): return {'child_marker': 'CHILD_OK'}"
+    _raw_durable("POST", "/2015-03-31/functions", body={
+        "FunctionName": child,
+        "Runtime": "python3.12",
+        "Role": _LAMBDA_ROLE,
+        "Handler": "index.handler",
+        "Code": {"ZipFile": _b64.b64encode(_make_zip(child_code)).decode()},
+    })
+    parent_code = "def handler(e,c): return {}"
+    _raw_durable("POST", "/2015-03-31/functions", body={
+        "FunctionName": parent,
+        "Runtime": "python3.12",
+        "Role": _LAMBDA_ROLE,
+        "Handler": "index.handler",
+        "Code": {"ZipFile": _b64.b64encode(_make_zip(parent_code)).decode()},
+        "DurableConfig": {"Enabled": True},
+    })
+    try:
+        # Invoke parent to spin up its durable execution.
+        invoke_req = urllib.request.Request(
+            f"{_ms_endpoint()}/2015-03-31/functions/{parent}/invocations",
+            method="POST", data=b"{}", headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(invoke_req) as r:
+            arn = r.headers.get("X-Amz-Durable-Execution-Arn")
+            token = r.headers.get("X-Amz-Durable-Checkpoint-Token")
+            r.read()
+        from urllib.parse import quote
+        arn_enc = quote(arn, safe="/:$")
+        # Post a CHAINED_INVOKE START targeting the child.
+        code, body = _raw_durable("POST",
+            f"/2025-12-01/durable-executions/{arn_enc}/checkpoint", body={
+                "CheckpointToken": token,
+                "Updates": [{
+                    "Id": "chain-1",
+                    "Type": "CHAINED_INVOKE",
+                    "Action": "START",
+                    "Name": "call-child",
+                    "ChainedInvokeOptions": {"FunctionName": child},
+                }],
+            })
+        assert code == 200
+        # The child runs in a daemon thread; give it a moment.
+        import time as _time
+        for _ in range(30):
+            _time.sleep(0.1)
+            code, history = _raw_durable("GET",
+                f"/2025-12-01/durable-executions/{arn_enc}/history")
+            if any(e["EventType"] == "ChainedInvokeSucceeded" for e in history.get("Events", [])):
+                break
+        events = history["Events"]
+        assert any(e["EventType"] == "ChainedInvokeSucceeded" for e in events), \
+            f"expected ChainedInvokeSucceeded, got {[e['EventType'] for e in events]}"
+        # Confirm the child's marker is in the result payload.
+        for e in events:
+            if e["EventType"] == "ChainedInvokeSucceeded":
+                payload = e["ChainedInvokeSucceededDetails"]["Result"]["Payload"]
+                assert "CHILD_OK" in payload
+                break
+    finally:
+        for n in (parent, child):
+            try:
+                lam.delete_function(FunctionName=n)
+            except Exception:
+                pass
+
+
+def test_lambda_durable_persistence_round_trip():
+    """get_state / restore_state round-trip preserves the executions map."""
+    from ministack.services import lambda_durable
+    # Snapshot original state.
+    original = lambda_durable.get_state()
+    try:
+        # Create a synthetic execution.
+        lambda_durable._executions.clear()
+        rec = lambda_durable.create_execution_for_invoke(
+            function_arn="arn:aws:lambda:us-east-1:000000000000:function:persist-test",
+            version="$LATEST",
+            input_payload='{"k":"v"}',
+        )
+        snap = lambda_durable.get_state()
+        # Wipe and restore.
+        lambda_durable._executions.clear()
+        assert not lambda_durable._executions
+        lambda_durable.restore_state(snap)
+        assert rec["DurableExecutionArn"] in lambda_durable._executions
+        restored = lambda_durable._executions[rec["DurableExecutionArn"]]
+        assert restored["Status"] == "RUNNING"
+        assert restored["InputPayload"] == '{"k":"v"}'
+    finally:
+        lambda_durable._executions.clear()
+        lambda_durable.restore_state(original)
+
+
+def test_lambda_durable_event_wrapped_with_sdk_fields(lam):
+    """A durable invocation's event payload is wrapped with the fields the
+    aws-durable-execution-sdk-python SDK reads from the Lambda event:
+    DurableExecutionArn, CheckpointToken, InitialExecutionState.
+    Without this wrapping the SDK's `@durable_execution` decorator raises
+    ExecutionError on the first line of its wrapper."""
+    import base64 as _b64
+    import json as _json
+    fname = f"durable-wrap-{_uuid_mod.uuid4().hex[:8]}"
+    try:
+        lam.delete_function(FunctionName=fname)
+    except Exception:
+        pass
+    # Handler echoes the keys it received.
+    code = """
+def handler(event, context):
+    return {"keys": sorted(list(event.keys())), "event": event}
+"""
+    _raw_durable("POST", "/2015-03-31/functions", body={
+        "FunctionName": fname,
+        "Runtime": "python3.12",
+        "Role": _LAMBDA_ROLE,
+        "Handler": "index.handler",
+        "Code": {"ZipFile": _b64.b64encode(_make_zip(code)).decode()},
+        "DurableConfig": {"Enabled": True},
+    })
+    try:
+        resp = lam.invoke(FunctionName=fname, Payload=b'{"user":"data"}')
+        body = _json.loads(resp["Payload"].read())
+        # SDK requires these three top-level keys.
+        for key in ("DurableExecutionArn", "CheckpointToken", "InitialExecutionState"):
+            assert key in body["keys"], f"missing {key} in {body['keys']}"
+        ops = body["event"]["InitialExecutionState"]["Operations"]
+        # AWS seeds the synthetic EXECUTION-type op with the input payload.
+        assert len(ops) == 1 and ops[0]["Type"] == "EXECUTION"
+    finally:
+        try:
+            lam.delete_function(FunctionName=fname)
+        except Exception:
+            pass

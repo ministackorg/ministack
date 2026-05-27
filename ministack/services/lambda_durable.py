@@ -59,6 +59,17 @@ from ministack.core.persistence import load_state
 #     "NextEventId": int,
 #   }
 _executions = AccountScopedDict()
+
+# Resume scheduler — heapq of (resume_at_epoch, durable_arn, account_id).
+# When a durable invocation returns Status=PENDING with WAIT operations still
+# scheduled, ministack schedules a re-invocation at the earliest WAIT expiry.
+import heapq
+import threading as _threading
+
+_resume_queue: list[tuple[float, str, str]] = []
+_resume_lock = _threading.Lock()
+_resume_event = _threading.Event()
+_resume_thread_started = False
 # Function-level DurableConfig is stored on the function config in lambda_svc;
 # we expose helpers here for serialization parity.
 
@@ -138,6 +149,51 @@ def _now() -> float:
     return time.time()
 
 
+_TIMESTAMP_FIELDS_ON_OP = ("StartTimestamp", "EndTimestamp")
+_TIMESTAMP_FIELDS_NESTED = {
+    "StepDetails": ("NextAttemptTimestamp",),
+    "WaitDetails": ("ScheduledEndTimestamp",),
+}
+
+
+def _to_unix_millis(v) -> int | None:
+    """Convert a float-seconds timestamp to int Unix-millis. The Java SDK's
+    Jackson parser rejects float timestamps with
+    `DateTimeParseException: could not be parsed at index 0`. The Python SDK
+    accepts the same int-millis form via `TimestampConverter.from_unix_millis`,
+    so this is the canonical wire shape across all language SDKs."""
+    if v is None:
+        return None
+    try:
+        return int(float(v) * 1000)
+    except (TypeError, ValueError):
+        return None
+
+
+def _serialize_operations(operations: list[dict]) -> list[dict]:
+    """Return the wire-shape list of Operation objects the SDK reads via
+    `Operation.from_json_dict`. Timestamp fields are converted from internal
+    float-seconds to AWS-canonical int-millis."""
+    out = []
+    for op in (operations or []):
+        clone = copy.deepcopy(op)
+        for f in _TIMESTAMP_FIELDS_ON_OP:
+            if f in clone:
+                m = _to_unix_millis(clone[f])
+                if m is not None:
+                    clone[f] = m
+        for sub_key, fields in _TIMESTAMP_FIELDS_NESTED.items():
+            sub = clone.get(sub_key)
+            if isinstance(sub, dict):
+                for f in fields:
+                    if f in sub:
+                        m = _to_unix_millis(sub[f])
+                        if m is not None:
+                            sub[f] = m
+        out.append(clone)
+    return out
+
+
 def _execution_summary(rec: dict) -> dict:
     out = {
         "DurableExecutionArn": rec["DurableExecutionArn"],
@@ -185,6 +241,20 @@ def create_execution_for_invoke(function_arn: str, version: str,
     runtime is expected to read the ARN from the AWS_DURABLE_EXECUTION_ARN
     env var and call Checkpoint/GetState through the regular Lambda endpoint."""
     arn, exec_name, _ = build_durable_execution_arn(function_arn, version, name)
+    # AWS seeds a synthetic EXECUTION-type operation into the operations log
+    # so the SDK can read the original user input via
+    # execution_state.get_input_payload() on every invocation (including
+    # replays). The SDK looks this operation up by `arn.split("/")[-1]`
+    # (state.py:get_execution_operation), so its Id must match the trailing
+    # ARN segment exactly.
+    invocation_id = arn.split("/")[-1]
+    execution_op = {
+        "Id": invocation_id,
+        "Type": "EXECUTION",
+        "Status": "STARTED",
+        "StartTimestamp": _now(),
+        "ExecutionDetails": {"InputPayload": input_payload or ""},
+    }
     rec = {
         "DurableExecutionArn": arn,
         "DurableExecutionName": exec_name,
@@ -198,7 +268,7 @@ def create_execution_for_invoke(function_arn: str, version: str,
         "Error": None,
         "TraceHeader": {"XAmznTraceId": trace_id} if trace_id else None,
         "CheckpointToken": new_checkpoint_token(),
-        "Operations": [],
+        "Operations": [execution_op],
         "History": [],
         "NextEventId": 0,
     }
@@ -233,6 +303,81 @@ def mark_execution_completed(arn: str, result_payload: str | None,
 # Handlers — wired in from lambda_svc.handle_request based on path matching.
 # ---------------------------------------------------------------------------
 
+def _fire_chained_invoke(parent_rec: dict, op_id: str, ci_opts: dict,
+                         payload: str | None) -> None:
+    """Asynchronously invoke a child durable function as part of a chain.
+    The child runs via the existing lambda_svc executor; ministack records
+    its result back onto the parent's ChainedInvoke operation when the child
+    completes."""
+    import threading
+    from ministack.services import lambda_svc
+
+    target = ci_opts.get("FunctionName")
+    tenant_id = ci_opts.get("TenantId")
+
+    def _run():
+        try:
+            event_str = payload or "{}"
+            try:
+                event = json.loads(event_str) if isinstance(event_str, str) else event_str
+            except (TypeError, ValueError):
+                event = {}
+            func_record = lambda_svc._functions.get(lambda_svc._resolve_name(target))
+            if not func_record:
+                # Surface failure back onto the parent's operation log.
+                _append_chained_result(parent_rec, op_id, success=False, result=None,
+                                       err={"ErrorType": "ResourceNotFoundException",
+                                            "ErrorMessage": f"Function not found: {target}",
+                                            "StackTrace": []})
+                return
+            # Run via the existing executor. The child runs synchronously here
+            # but in a worker thread so we don't block ministack's ASGI loop.
+            result = lambda_svc._execute_function(func_record, event)
+            if result.get("error"):
+                _append_chained_result(parent_rec, op_id, success=False, result=None,
+                                       err={"ErrorType": str(result.get("function_error") or "Unhandled"),
+                                            "ErrorMessage": str(result.get("body") or ""),
+                                            "StackTrace": []})
+            else:
+                _append_chained_result(parent_rec, op_id, success=True,
+                                       result=json.dumps(result.get("body"))
+                                       if not isinstance(result.get("body"), str)
+                                       else result.get("body"), err=None)
+        except Exception as exc:
+            _append_chained_result(parent_rec, op_id, success=False, result=None,
+                                   err={"ErrorType": type(exc).__name__,
+                                        "ErrorMessage": str(exc),
+                                        "StackTrace": []})
+
+    threading.Thread(target=_run, daemon=True, name=f"chained-invoke-{op_id}").start()
+
+
+def _append_chained_result(parent_rec: dict, op_id: str, success: bool,
+                           result: str | None, err: dict | None) -> None:
+    """Apply the child invocation's outcome onto the parent ChainedInvoke
+    operation in the operation log + emit a history event."""
+    for op in parent_rec["Operations"]:
+        if op.get("Id") == op_id and op.get("Type") == "CHAINED_INVOKE":
+            op["Status"] = "SUCCEEDED" if success else "FAILED"
+            op["EndTimestamp"] = _now()
+            details = op.setdefault("ChainedInvokeDetails", {})
+            if success and result is not None:
+                details["Result"] = result
+            if err:
+                details["Error"] = err
+            break
+    if success:
+        _emit_history_event(parent_rec, "ChainedInvokeSucceeded",
+                            "ChainedInvokeSucceededDetails",
+                            {"Result": {"Payload": result or "", "Truncated": False}},
+                            event_id=op_id)
+    else:
+        _emit_history_event(parent_rec, "ChainedInvokeFailed",
+                            "ChainedInvokeFailedDetails",
+                            {"Error": {"Payload": err or {}, "Truncated": False}},
+                            event_id=op_id)
+
+
 def handle_checkpoint(arn_path: str, body: bytes) -> tuple:
     rec, err = _require_execution(arn_path)
     if err:
@@ -263,7 +408,7 @@ def handle_checkpoint(arn_path: str, body: bytes) -> tuple:
         "CheckpointToken": new_token,
         "NewExecutionState": {
             "NextMarker": "",
-            "Operations": copy.deepcopy(rec["Operations"]),
+            "Operations": _serialize_operations(rec["Operations"]),
         },
     })
 
@@ -345,6 +490,11 @@ def _apply_update(rec: dict, upd: dict) -> None:
             details["Result"] = payload
         if err is not None:
             details["Error"] = err
+        # On START, kick off the child function invocation asynchronously so
+        # downstream durable workflows actually run (item #3 in the parity gap).
+        ci_opts = upd.get("ChainedInvokeOptions") or {}
+        if action == "START" and ci_opts.get("FunctionName"):
+            _fire_chained_invoke(rec, op_id, ci_opts, payload)
     elif op_type == "EXECUTION":
         details = existing.setdefault("ExecutionDetails", {})
         if rec.get("InputPayload"):
@@ -410,7 +560,7 @@ def handle_get_state(arn_path: str, query_params: dict) -> tuple:
         except ValueError:
             start = 0
     page = ops[start:start + max_items]
-    resp = {"Operations": copy.deepcopy(page)}
+    resp = {"Operations": _serialize_operations(page)}
     if start + max_items < len(ops):
         resp["NextMarker"] = str(start + max_items)
     return json_response(resp)
@@ -625,3 +775,118 @@ def try_route(method: str, path: str, body: bytes, query_params: dict,
 
 def reset() -> None:
     _executions.clear()
+    with _resume_lock:
+        _resume_queue.clear()
+
+
+# ---------------------------------------------------------------------------
+# Resume scheduler — fires re-invocations when WAIT operations expire so
+# paused durable executions actually resume the way they do on real AWS.
+# ---------------------------------------------------------------------------
+
+def _next_wait_expiry(rec: dict) -> float | None:
+    """Return the earliest scheduled WAIT expiry across all STARTED WAIT ops,
+    or None when nothing is pending."""
+    soonest = None
+    for op in rec.get("Operations", []):
+        if op.get("Type") != "WAIT":
+            continue
+        if op.get("Status") != "STARTED":
+            continue
+        ts = (op.get("WaitDetails") or {}).get("ScheduledEndTimestamp")
+        if ts is None:
+            continue
+        if soonest is None or ts < soonest:
+            soonest = ts
+    return soonest
+
+
+def schedule_resume(arn: str, account_id: str | None = None) -> bool:
+    """Inspect the execution's operations log; if any WAIT op is still
+    pending, enqueue a re-invocation at the earliest expiry. Returns True
+    when something was scheduled."""
+    rec = _executions.get(arn)
+    if not rec or rec.get("Status") != "RUNNING":
+        return False
+    expiry = _next_wait_expiry(rec)
+    if expiry is None:
+        return False
+    with _resume_lock:
+        heapq.heappush(_resume_queue, (expiry, arn, account_id or "000000000000"))
+    _resume_event.set()
+    _ensure_resume_thread()
+    return True
+
+
+def _ensure_resume_thread() -> None:
+    global _resume_thread_started
+    if _resume_thread_started:
+        return
+    _resume_thread_started = True
+    t = _threading.Thread(target=_resume_loop, daemon=True, name="durable-resume")
+    t.start()
+
+
+def _resume_loop() -> None:
+    """Forever: pop the earliest entry from the resume queue, sleep until
+    its expiry, then ask lambda_svc to re-invoke the function with the
+    accumulated operations log so the SDK can replay completed steps."""
+    while True:
+        with _resume_lock:
+            head = _resume_queue[0] if _resume_queue else None
+        if head is None:
+            _resume_event.wait(timeout=1.0)
+            _resume_event.clear()
+            continue
+        wait_for = max(0.0, head[0] - time.time())
+        if wait_for > 0:
+            if _resume_event.wait(timeout=wait_for):
+                _resume_event.clear()
+                continue
+        # Time elapsed — pop and resume.
+        with _resume_lock:
+            if not _resume_queue or _resume_queue[0] != head:
+                continue
+            _, arn, account_id = heapq.heappop(_resume_queue)
+        try:
+            _resume_execution(arn)
+        except Exception:
+            import logging
+            logging.getLogger(__name__).exception(
+                "Failed to resume durable execution %s", arn,
+            )
+
+
+def _resume_execution(arn: str) -> None:
+    """Mark all STARTED WAIT ops with elapsed timers as SUCCEEDED, then
+    re-invoke the function so the SDK picks up where it left off."""
+    rec = _executions.get(arn)
+    if not rec or rec.get("Status") != "RUNNING":
+        return
+    now = _now()
+    for op in rec.get("Operations", []):
+        if op.get("Type") == "WAIT" and op.get("Status") == "STARTED":
+            ts = (op.get("WaitDetails") or {}).get("ScheduledEndTimestamp")
+            if ts is not None and ts <= now:
+                op["Status"] = "SUCCEEDED"
+                op["EndTimestamp"] = now
+                _emit_history_event(rec, "WaitSucceeded", "WaitSucceededDetails", {
+                    "Duration": (op.get("WaitDetails") or {}).get("Duration", 0),
+                }, event_id=op.get("Id"), name=op.get("Name"))
+    # Rotate token so the resumed invocation gets a fresh one.
+    rec["CheckpointToken"] = new_checkpoint_token()
+    # Trigger a fresh invocation through lambda_svc with the populated
+    # operations log — the SDK's `InitialExecutionState` will replay the
+    # completed steps and continue from the WAIT.
+    from ministack.services import lambda_svc
+    function_name = rec["FunctionArn"].rsplit(":", 1)[-1]
+    try:
+        try:
+            event = json.loads(rec.get("InputPayload") or "{}")
+        except (TypeError, ValueError):
+            event = {}
+        lambda_svc.invoke_durable_resume(function_name, arn, event)
+    except Exception:
+        import logging
+        logging.getLogger(__name__).exception("Resume invocation for %s failed", arn)
+

@@ -526,6 +526,87 @@ def _validate_unzipped_size(zip_data: bytes | None):
     return None
 
 
+import contextvars
+
+# Per-invocation durable-execution context, set by `_invoke` and read by the
+# executor functions to inject env vars into the Lambda container. Keeps
+# the data flow explicit and concurrency-safe (each request has its own
+# context — ASGI + asyncio.to_thread both propagate ContextVars).
+_durable_ctx: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
+    "lambda_durable_ctx", default=None,
+)
+
+
+def _durable_env_overlay() -> dict[str, str]:
+    """Return env vars to layer onto the Lambda container when the current
+    invocation belongs to a durable execution. Empty dict otherwise."""
+    ctx = _durable_ctx.get()
+    if not ctx:
+        return {}
+    return {
+        "AWS_LAMBDA_DURABLE_EXECUTION_ARN": ctx.get("arn", ""),
+        "AWS_LAMBDA_DURABLE_CHECKPOINT_TOKEN": ctx.get("token", ""),
+        "AWS_LAMBDA_DURABLE_EXECUTION_NAME": ctx.get("name", ""),
+    }
+
+
+def invoke_durable_resume(function_name: str, durable_arn: str, original_event: dict) -> None:
+    """Re-invoke a paused durable function with the existing execution ARN
+    and the now-populated operations log. Called by the resume scheduler
+    when a WAIT expires."""
+    from ministack.services import lambda_durable
+    rec = lambda_durable._executions.get(durable_arn)
+    if not rec:
+        return
+    canonical = _resolve_name(function_name)
+    func = _functions.get(canonical)
+    if not func:
+        return
+    config = func.get("config") or func
+    # Set the durable context to the SAME ARN/token so the SDK reads the
+    # accumulated operations as InitialExecutionState (replay path).
+    _durable_ctx.set({
+        "arn": durable_arn,
+        "token": rec["CheckpointToken"],
+        "name": rec["DurableExecutionName"],
+    })
+    resume_event = {
+        "DurableExecutionArn": durable_arn,
+        "CheckpointToken": rec["CheckpointToken"],
+        "InitialExecutionState": {
+            "Operations": lambda_durable._serialize_operations(rec["Operations"]),
+            "NextMarker": "",
+        },
+    }
+    try:
+        result = _execute_function(func, resume_event)
+        # If the resume still returns PENDING, schedule the next wakeup.
+        try:
+            payload = result.get("body")
+            if isinstance(payload, (bytes, bytearray)):
+                payload = payload.decode("utf-8", errors="replace")
+            if isinstance(payload, str):
+                payload = json.loads(payload)
+            if isinstance(payload, dict) and payload.get("Status") == "PENDING":
+                lambda_durable.schedule_resume(durable_arn)
+            elif isinstance(payload, dict) and payload.get("Status") == "SUCCEEDED":
+                lambda_durable.mark_execution_completed(
+                    durable_arn,
+                    result_payload=payload.get("Result"),
+                    error=None,
+                )
+            elif isinstance(payload, dict) and payload.get("Status") == "FAILED":
+                lambda_durable.mark_execution_completed(
+                    durable_arn,
+                    result_payload=None,
+                    error=payload.get("Error"),
+                )
+        except (TypeError, ValueError, json.JSONDecodeError):
+            pass
+    finally:
+        _durable_ctx.set(None)
+
+
 def _durable_arn_lookup(name_or_arn: str) -> str | None:
     """Resolve a function name or ARN to the canonical function ARN, or None
     if the function doesn't exist. Used by lambda_durable.handle_list_by_function."""
@@ -1467,6 +1548,29 @@ async def _invoke(name: str, event: dict, headers: dict, path_qualifier: str | N
             input_payload=event_payload,
         )
         durable_arn = rec["DurableExecutionArn"]
+        _durable_ctx.set({
+            "arn": durable_arn,
+            "token": rec["CheckpointToken"],
+            "name": rec["DurableExecutionName"],
+        })
+        # AWS sends a durable Lambda an event containing ONLY the durable
+        # context fields the SDK reads via `from_json_dict`: DurableExecutionArn,
+        # CheckpointToken, InitialExecutionState. The user's actual payload
+        # lives inside the InitialExecutionState as a synthetic EXECUTION-type
+        # operation (see lambda_durable.create_execution_for_invoke); the SDK
+        # reads it via execution_state.get_input_payload().
+        # We pass back the operations list (with the seeded EXECUTION op) so
+        # the SDK has the input on every invocation, including replays.
+        # Operations are serialized via lambda_durable._serialize_operations.
+        from ministack.services import lambda_durable as _ld
+        event = {
+            "DurableExecutionArn": durable_arn,
+            "CheckpointToken": rec["CheckpointToken"],
+            "InitialExecutionState": {
+                "Operations": _ld._serialize_operations(rec["Operations"]),
+                "NextMarker": "",
+            },
+        }
 
     if invocation_type == "Event":
         # AWS async invocation: retry + DLQ routing handled by the shared
@@ -1500,6 +1604,32 @@ async def _invoke(name: str, event: dict, headers: dict, path_qualifier: str | N
         _de_rec = lambda_durable._executions.get(durable_arn)
         if _de_rec:
             resp_headers["X-Amz-Durable-Checkpoint-Token"] = _de_rec["CheckpointToken"]
+        # Inspect the SDK's return value: PENDING → schedule the next wakeup
+        # from the latest WAIT timestamp; SUCCEEDED/FAILED → mark terminal.
+        try:
+            payload_obj = result.get("body")
+            if isinstance(payload_obj, (bytes, bytearray)):
+                payload_obj = payload_obj.decode("utf-8", errors="replace")
+            if isinstance(payload_obj, str):
+                payload_obj = json.loads(payload_obj)
+            if isinstance(payload_obj, dict):
+                status = payload_obj.get("Status")
+                if status == "PENDING":
+                    lambda_durable.schedule_resume(durable_arn)
+                elif status == "SUCCEEDED":
+                    lambda_durable.mark_execution_completed(
+                        durable_arn,
+                        result_payload=payload_obj.get("Result"),
+                        error=None,
+                    )
+                elif status == "FAILED":
+                    lambda_durable.mark_execution_completed(
+                        durable_arn,
+                        result_payload=None,
+                        error=payload_obj.get("Error"),
+                    )
+        except (TypeError, ValueError, json.JSONDecodeError):
+            pass
 
     log_output = result.get("log", "")
     if log_output:
@@ -2301,6 +2431,9 @@ def _spawn_lambda_container(config: dict, code_zip: bytes | None):
             f"/opt/layer_{i}" for i in range(len(layers_dirs))
         )
     container_env.update(env_vars)
+    # Per-invocation durable-execution overlay (no-op when the call isn't
+    # inside a durable function).
+    container_env.update(_durable_env_overlay())
     # AWS_ENDPOINT_URL set *after* function env so it always points at ministack.
     # Replace localhost/127.0.0.1 with host.docker.internal so the container
     # can reach the host where ministack is running.
@@ -2669,10 +2802,21 @@ def _execute_function(func: dict, event: dict) -> dict:
         runtime = config.get("Runtime", "python3.12")
         if runtime.startswith("provided"):
             result = _execute_function_provided(func, event)
-        elif runtime.startswith("python") or runtime.startswith("nodejs"):
+        elif (runtime.startswith("python") or runtime.startswith("nodejs")) \
+                and not _durable_ctx.get():
+            # Warm pool reuses worker subprocesses whose env was fixed at
+            # spawn time. Durable invocations need per-call env (the
+            # DurableExecutionArn + CheckpointToken change every invoke),
+            # so route them through the per-call local executor.
             result = _execute_function_warm(func, event)
-        else:
+        elif runtime.startswith(("python", "nodejs")):
+            # Durable python/nodejs falls through to local subprocess (per
+            # the elif above we already filtered durable out of warm).
             result = _execute_function_local(func, event)
+        else:
+            # java*/dotnet*/ruby* need the real RIE image — there's no
+            # in-process executor that can run JVM bytecode or .NET IL.
+            result = _execute_function_docker(func, event)
 
     duration_ms = int((time.time() - started) * 1000)
     _emit_lambda_logs(
@@ -2971,6 +3115,7 @@ def _execute_function_provided(func: dict, event: dict) -> dict:
                     "_HANDLER": config.get("Handler", "bootstrap"),
                 })
                 proc_env.update(env_vars)
+                proc_env.update(_durable_env_overlay())
                 # Override AWS_ENDPOINT_URL *after* function env vars so
                 # Lambda binaries always call back to this MiniStack
                 # instance.  Function-level env vars may carry the
@@ -3122,9 +3267,15 @@ def _execute_function_local(func: dict, event: dict) -> dict:
                 endpoint = _normalize_endpoint_url(env_vars.get("AWS_ENDPOINT_URL", ""))
             if not endpoint:
                 endpoint = _normalize_endpoint_url(env_vars.get("LOCALSTACK_HOSTNAME", ""))
+            if not endpoint:
+                # Subprocess runs on the same host as ministack — point it at
+                # ourselves so boto3 calls land back here, not at real AWS.
+                gateway_port = os.environ.get("GATEWAY_PORT", "4566")
+                endpoint = f"http://localhost:{gateway_port}"
             if endpoint:
                 env["AWS_ENDPOINT_URL"] = endpoint
             env.update(env_vars)
+            env.update(_durable_env_overlay())
 
             cmd = ["node", wrapper_path] if is_node else ["python3", wrapper_path]
             proc = subprocess.run(
