@@ -234,6 +234,16 @@ def test_ec2_security_group_duplicate(ec2):
         ec2.create_security_group(GroupName="qa-ec2-sg-dup", Description="d")
     assert exc.value.response["Error"]["Code"] == "InvalidGroup.Duplicate"
 
+
+def test_ec2_describe_security_groups_malformed_id(ec2):
+    with pytest.raises(ClientError) as exc:
+        ec2.describe_security_groups(GroupIds=["sg-0123456789abcdef0"])
+
+    error = exc.value.response["Error"]
+    assert error["Code"] == "InvalidGroupId.Malformed"
+    assert error["Message"] == 'Invalid id: "sg-0123456789abcdef0"'
+
+
 def test_ec2_sg_authorize_revoke_ingress(ec2):
     sg_id = ec2.create_security_group(GroupName="qa-ec2-sg-rules", Description="rules test")["GroupId"]
 

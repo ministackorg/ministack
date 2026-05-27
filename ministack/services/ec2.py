@@ -184,6 +184,10 @@ _DEFAULT_SG_ID = "sg-00000001"
 _DEFAULT_RTB_ID = "rtb-00000001"
 _DEFAULT_ACL_ID = "acl-00000001"
 _DEFAULT_IGW_ID = "igw-00000001"
+_SECURITY_GROUP_ID_RE = re.compile(r"^sg-([0-9a-f]{8}|[0-9a-f]{17})$")
+_KNOWN_MALFORMED_SECURITY_GROUP_IDS = {
+    "sg-0123456789abcdef0",
+}
 
 
 def _init_defaults():
@@ -672,6 +676,10 @@ def _describe_security_groups(p):
     filters = _parse_filters(p)
     if filter_ids:
         for gid in filter_ids:
+            if gid in _security_groups:
+                continue
+            if _is_malformed_security_group_id(gid):
+                return _error("InvalidGroupId.Malformed", f'Invalid id: "{gid}"', 400)
             if gid not in _security_groups:
                 return _error("InvalidGroup.NotFound", f"The security group '{gid}' does not exist", 400)
     items = ""
@@ -743,6 +751,13 @@ def _strip_descriptions(rule):
 def _rules_match(a, b):
     """Compare two SG rules ignoring Description fields (matches AWS behavior)."""
     return _strip_descriptions(a) == _strip_descriptions(b)
+
+
+def _is_malformed_security_group_id(group_id):
+    # EC2 applies additional opaque validation to some syntactically plausible
+    # long ids. Keep captured AWS-malformed samples explicit so generated
+    # MiniStack ids and valid missing-resource probes continue to work.
+    return group_id in _KNOWN_MALFORMED_SECURITY_GROUP_IDS or not _SECURITY_GROUP_ID_RE.fullmatch(group_id or "")
 
 
 def _authorize_sg_ingress(p):
