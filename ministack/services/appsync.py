@@ -1004,11 +1004,12 @@ def _resolve_lambda(data_source, args):
         return args
 
     import ministack.services.lambda_svc as _lambda_svc
-    func, _config, _func_name = _lambda_svc._get_func_record_for_ref(func_arn)
-    if not func:
+    func, func_config, _func_name = _lambda_svc._get_func_record_for_ref(func_arn)
+    if not func or not func_config:
         return args
 
-    result = _lambda_svc._execute_function(func, args)
+    exec_record = _lambda_svc._execution_record_for_config(func, func_config)
+    result = _lambda_svc._execute_function_with_config_scope(exec_record, args)
     body = result.get("body")
     if isinstance(body, dict):
         return body
