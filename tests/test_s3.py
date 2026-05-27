@@ -1339,7 +1339,7 @@ def test_s3_event_notification_to_lambda_boto3_default(s3, lam, logs):
         "Lambda was not invoked for boto3-shaped notification config"
 
 
-def test_s3_event_notification_to_lambda_uses_function_arn_region(s3, lam):
+def test_s3_event_notification_to_lambda_validates_bucket_region(s3, lam):
     fname = "s3-evt-lam-region"
     _create_event_lambda(lam, fname, marker="east")
     west_lam = _regional_client("lambda", "us-west-2")
@@ -1347,15 +1347,30 @@ def test_s3_event_notification_to_lambda_uses_function_arn_region(s3, lam):
     west_arn = _create_event_lambda(west_lam, fname, marker="west")
 
     s3.create_bucket(Bucket="s3-evt-lam-region-bkt")
+    with pytest.raises(ClientError) as exc:
+        s3.put_bucket_notification_configuration(
+            Bucket="s3-evt-lam-region-bkt",
+            NotificationConfiguration={
+                "LambdaFunctionConfigurations": [
+                    {"LambdaFunctionArn": west_arn, "Events": ["s3:ObjectCreated:*"]},
+                ],
+            },
+        )
+    assert exc.value.response["Error"]["Code"] == "InvalidArgument"
+
+    s3.create_bucket(
+        Bucket="s3-evt-lam-west-bkt",
+        CreateBucketConfiguration={"LocationConstraint": "us-west-2"},
+    )
     s3.put_bucket_notification_configuration(
-        Bucket="s3-evt-lam-region-bkt",
+        Bucket="s3-evt-lam-west-bkt",
         NotificationConfiguration={
             "LambdaFunctionConfigurations": [
                 {"LambdaFunctionArn": west_arn, "Events": ["s3:ObjectCreated:*"]},
             ],
         },
     )
-    s3.put_object(Bucket="s3-evt-lam-region-bkt", Key="regional.txt", Body=b"hi")
+    s3.put_object(Bucket="s3-evt-lam-west-bkt", Key="regional.txt", Body=b"hi")
 
     assert _wait_lambda_invoked(west_logs, fname, "regional.txt"), \
         "S3 notification did not invoke the Lambda from the ARN's region"
