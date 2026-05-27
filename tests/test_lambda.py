@@ -1,3 +1,4 @@
+import asyncio
 import io
 import json
 import os
@@ -3263,6 +3264,115 @@ def test_lambda_update_esm_rejects_unresolved_function_arn():
         lsvc._functions._data.update(original_functions)
         lsvc._esms.clear()
         lsvc._esms._data.update(original_esms)
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
+def _install_region_scoped_lambda(function_name, region, account_id="000000000000"):
+    function_arn = f"arn:aws:lambda:{region}:{account_id}:function:{function_name}"
+    config = {
+        "FunctionName": function_name,
+        "FunctionArn": function_arn,
+        "Runtime": "python3.12",
+        "Handler": "index.handler",
+        "Timeout": 3,
+        "MemorySize": 128,
+        "CodeSha256": "test",
+    }
+    func = {
+        "config": config,
+        "versions": {},
+        "aliases": {},
+    }
+    lsvc._functions.set_scoped(account_id, region, function_name, func)
+    return function_arn
+
+
+def _remove_region_scoped_lambda(function_name, region, account_id="000000000000"):
+    lsvc._functions.pop_scoped(account_id, region, function_name, None)
+
+
+def test_apigatewayv2_plain_lambda_name_uses_api_owner_region(monkeypatch):
+    """HTTP API plain-name integrations resolve in the API's owning Region."""
+    from ministack.services import apigateway as _apigw
+
+    account_id = "000000000000"
+    region = "us-west-2"
+    function_name = f"apigw-v2-plain-region-{_uuid_mod.uuid4().hex}"
+    expected_arn = _install_region_scoped_lambda(function_name, region, account_id)
+    original_account = get_account_id()
+    original_region = get_region()
+    captured = {}
+
+    def _fake_execute(exec_record, event):
+        captured["arn"] = exec_record["config"]["FunctionArn"]
+        return {"body": {"statusCode": 207, "headers": {}, "body": "v2-ok"}}
+
+    monkeypatch.setattr(lsvc, "_execute_function_with_config_scope", _fake_execute)
+    set_request_account_id(account_id)
+    set_request_region("us-east-1")
+    try:
+        status, _headers, body = asyncio.run(_apigw._invoke_lambda_proxy(
+            {"integrationUri": function_name},
+            "api123",
+            "$default",
+            "/test",
+            "GET",
+            {},
+            b"",
+            {},
+            owner_account_id=account_id,
+            owner_region=region,
+        ))
+        assert status == 207
+        assert body == b"v2-ok"
+        assert captured["arn"] == expected_arn
+    finally:
+        _remove_region_scoped_lambda(function_name, region, account_id)
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
+def test_apigatewayv1_plain_lambda_name_uses_api_owner_region(monkeypatch):
+    """REST API plain-name integrations resolve in the API's owning Region."""
+    from ministack.services import apigateway_v1 as _apigw_v1
+
+    account_id = "000000000000"
+    region = "us-west-2"
+    function_name = f"apigw-v1-plain-region-{_uuid_mod.uuid4().hex}"
+    expected_arn = _install_region_scoped_lambda(function_name, region, account_id)
+    original_account = get_account_id()
+    original_region = get_region()
+    captured = {}
+
+    def _fake_execute(exec_record, event):
+        captured["arn"] = exec_record["config"]["FunctionArn"]
+        return {"body": {"statusCode": 208, "headers": {}, "body": "v1-ok"}}
+
+    monkeypatch.setattr(lsvc, "_execute_function_with_config_scope", _fake_execute)
+    set_request_account_id(account_id)
+    set_request_region("us-east-1")
+    try:
+        status, _headers, body = asyncio.run(_apigw_v1._invoke_lambda_proxy_v1(
+            {"uri": function_name},
+            "rest123",
+            "prod",
+            {"variables": {}},
+            {"id": "resource123", "path": "/test"},
+            "/test",
+            "GET",
+            {},
+            b"",
+            {},
+            {},
+            owner_account_id=account_id,
+            owner_region=region,
+        ))
+        assert status == 208
+        assert body == b"v1-ok"
+        assert captured["arn"] == expected_arn
+    finally:
+        _remove_region_scoped_lambda(function_name, region, account_id)
         set_request_account_id(original_account)
         set_request_region(original_region)
 

@@ -113,6 +113,31 @@ def test_apigw_delete_api(apigw):
         apigw.get_api(ApiId=api_id)
     assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 404
 
+def test_apigw_cfn_api_tracks_owner_region():
+    from ministack.core.responses import get_region, set_request_region
+    from ministack.services import apigateway as _apigw
+    from ministack.services.cloudformation import provisioners as _provisioners
+
+    original_region = get_region()
+    api_id = None
+    try:
+        set_request_region("us-west-2")
+        api_id, _attrs = _provisioners._apigw_v2_api_create(
+            "HttpApi",
+            {"Name": "cfn-apigwv2-region-owner", "ProtocolType": "HTTP"},
+            "cfn-apigwv2-region",
+        )
+
+        assert _apigw._api_regions[api_id] == "us-west-2"
+
+        _provisioners._apigw_v2_api_delete(api_id, {})
+        assert api_id not in _apigw._api_regions
+        api_id = None
+    finally:
+        if api_id is not None:
+            _provisioners._apigw_v2_api_delete(api_id, {})
+        set_request_region(original_region)
+
 def test_apigw_create_route(apigw):
     api_id = apigw.create_api(Name="route-api", ProtocolType="HTTP")["ApiId"]
     resp = apigw.create_route(ApiId=api_id, RouteKey="GET /items")
@@ -1133,6 +1158,7 @@ def test_apigw_websocket_lambda_worker_uses_function_region(monkeypatch):
         result = asyncio.run(apigw_mod._invoke_ws_lambda(
             api_id,
             "000000000000",
+            "us-east-1",
             route,
             "$default",
             "conn-1",
@@ -1140,6 +1166,7 @@ def test_apigw_websocket_lambda_worker_uses_function_region(monkeypatch):
             "msg-1",
             "{}",
             "127.0.0.1",
+            {},
             {},
         ))
     finally:
@@ -2063,6 +2090,108 @@ def test_apigwv2_named_stage_still_requires_prefix(apigw, lam):
 def _wrapped_uri(fn_arn: str) -> str:
     """Build the APIGW integration URI Terraform/AWS actually send."""
     return f"arn:aws:apigateway:us-east-1:lambda:path/2015-03-31/functions/{fn_arn}/invocations"
+
+
+def _lambda_client(region: str):
+    import boto3
+
+    return boto3.client(
+        "lambda",
+        endpoint_url=_endpoint,
+        aws_access_key_id="test",
+        aws_secret_access_key="test",
+        region_name=region,
+    )
+
+
+def _regional_marker_code(marker: str) -> str:
+    return f"""
+def handler(event, context):
+    return {{
+        'statusCode': 200,
+        'body': '{marker}:' + context.invoked_function_arn,
+    }}
+"""
+
+
+def _make_regional_fn(lam, name: str, marker: str) -> str:
+    created = lam.create_function(
+        FunctionName=name,
+        Runtime="python3.12",
+        Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _make_zip(_regional_marker_code(marker))},
+    )
+    lam.invoke(
+        FunctionName=name,
+        InvocationType="RequestResponse",
+        Payload=b'{"_ministack_warmup": true}',
+    )
+    return created["FunctionArn"]
+
+
+def test_apigwv2_lambda_integration_uses_function_arn_region(apigw, lam):
+    import urllib.request
+
+    west_lam = _lambda_client("us-west-2")
+    fn_name = f"apigw-region-{uuid.uuid4().hex[:6]}"
+    _make_regional_fn(lam, fn_name, "east")
+    west_arn = _make_regional_fn(west_lam, fn_name, "west")
+
+    api_id = apigw.create_api(Name="regional-lambda-api", ProtocolType="HTTP")["ApiId"]
+    integ = apigw.create_integration(
+        ApiId=api_id,
+        IntegrationType="AWS_PROXY",
+        IntegrationUri=_wrapped_uri(west_arn),
+        IntegrationMethod="POST",
+    )
+    apigw.create_route(ApiId=api_id, RouteKey="GET /hello", Target=f"integrations/{integ['IntegrationId']}")
+    apigw.create_stage(ApiId=api_id, StageName="$default", AutoDeploy=True)
+
+    req = urllib.request.Request(f"http://{api_id}.execute-api.localhost:{_EXECUTE_PORT}/hello")
+    req.add_header("Host", f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}")
+    resp = urllib.request.urlopen(req, timeout=30)
+
+    assert resp.status == 200
+    body = resp.read().decode()
+    assert body.startswith("west:")
+    assert ":us-west-2:" in body
+
+
+def test_apigwv1_lambda_integration_uses_function_arn_region(apigw_v1, lam):
+    import urllib.request
+
+    west_lam = _lambda_client("us-west-2")
+    fn_name = f"apigwv1-region-{uuid.uuid4().hex[:6]}"
+    _make_regional_fn(lam, fn_name, "east")
+    west_arn = _make_regional_fn(west_lam, fn_name, "west")
+
+    api_id = apigw_v1.create_rest_api(name="regional-v1-api")["id"]
+    root = apigw_v1.get_resources(restApiId=api_id)["items"][0]["id"]
+    res_id = apigw_v1.create_resource(restApiId=api_id, parentId=root, pathPart="hello")["id"]
+    apigw_v1.put_method(
+        restApiId=api_id,
+        resourceId=res_id,
+        httpMethod="GET",
+        authorizationType="NONE",
+    )
+    apigw_v1.put_integration(
+        restApiId=api_id,
+        resourceId=res_id,
+        httpMethod="GET",
+        type="AWS_PROXY",
+        integrationHttpMethod="POST",
+        uri=_wrapped_uri(west_arn),
+    )
+    apigw_v1.create_deployment(restApiId=api_id, stageName="prod")
+
+    url = f"http://localhost:{_EXECUTE_PORT}/restapis/{api_id}/prod/_user_request_/hello"
+    resp = urllib.request.urlopen(url, timeout=30)
+
+    assert resp.status == 200
+    body = resp.read().decode()
+    assert body.startswith("west:")
+    assert ":us-west-2:" in body
 
 
 def test_apigwv2_integration_wrapped_function_arn(apigw, lam):

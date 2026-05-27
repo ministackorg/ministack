@@ -1065,13 +1065,18 @@ def _cfn_nested_stack_deploy(logical_id, props, parent_stack_name, *,
     sub-attribute form CDK and console-built templates emit.
     """
     import copy
+
     from ministack.core.responses import get_account_id, get_region, new_uuid
     from ministack.services.cloudformation import (
-        _stack_events, _stacks,
+        _stack_events,
+        _stacks,
     )
     from ministack.services.cloudformation.engine import (
-        _evaluate_conditions, _parse_template, _resolve_parameters,
-        _resolve_refs, _topological_sort,
+        _evaluate_conditions,
+        _parse_template,
+        _resolve_parameters,
+        _resolve_refs,
+        _topological_sort,
     )
     from ministack.services.cloudformation.helpers import _resolve_template
     from ministack.services.cloudformation.stacks import _add_event
@@ -3246,6 +3251,7 @@ def _apigw_v2_api_create(logical_id, props, stack_name):
     if props.get("CorsConfiguration"):
         api["corsConfiguration"] = props["CorsConfiguration"]
     _apigw_v2._apis[api_id] = api
+    _apigw_v2._api_regions[api_id] = get_region()
     _apigw_v2._routes[api_id] = {}
     _apigw_v2._integrations[api_id] = {}
     _apigw_v2._stages[api_id] = {}
@@ -3255,6 +3261,7 @@ def _apigw_v2_api_create(logical_id, props, stack_name):
 
 def _apigw_v2_api_delete(physical_id, props):
     _apigw_v2._apis.pop(physical_id, None)
+    _apigw_v2._api_regions.pop(physical_id, None)
     _apigw_v2._routes.pop(physical_id, None)
     _apigw_v2._integrations.pop(physical_id, None)
     _apigw_v2._stages.pop(physical_id, None)
