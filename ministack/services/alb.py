@@ -28,6 +28,7 @@ import string
 import time
 from urllib.parse import parse_qs
 
+from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.persistence import PERSIST_STATE, load_state
 from ministack.core.responses import AccountScopedDict, get_account_id, get_region, new_uuid
 
@@ -1016,23 +1017,34 @@ async def _forward_to_tg(tg_arn, method, path, headers, body, query_params):
     target_type = tg.get("TargetType", "instance")
 
     if target_type == "lambda":
-        func_ref = registered[0]["Id"]
-        return await _invoke_lambda_target(func_ref, tg_arn, method, path,
+        func_id = registered[0]["Id"]
+        return await _invoke_lambda_target(func_id, tg_arn, method, path,
                                            headers, body, query_params)
 
     return (502, {"Content-Type": "application/json"},
             json.dumps({"message": f"Target type '{target_type}' not supported."}).encode())
 
 
-async def _invoke_lambda_target(func_ref, tg_arn, method, path, headers, body, query_params):
+async def _invoke_lambda_target(function_ref, tg_arn, method, path, headers, body, query_params):
     try:
         from ministack.services import lambda_svc
     except ImportError:
         return (502, {"Content-Type": "application/json"},
                 json.dumps({"message": "Lambda service unavailable"}).encode())
 
-    func_data, func_config, func_name = lambda_svc._get_func_record_for_ref(func_ref)
-    if func_data is None:
+    try:
+        tg_spec = parse_arn(tg_arn)
+    except ArnParseError:
+        tg_spec = None
+    owner_account_id = tg_spec.account_id if tg_spec else get_account_id()
+    owner_region = tg_spec.region if tg_spec else get_region()
+
+    func, config, func_name = lambda_svc._get_func_record_for_ref_in_scope(
+        function_ref,
+        account_id=owner_account_id,
+        region=owner_region,
+    )
+    if not func or not config:
         return (502, {"Content-Type": "application/json"},
                 json.dumps({"message": f"Lambda function '{func_name}' not found"}).encode())
 
@@ -1060,18 +1072,23 @@ async def _invoke_lambda_target(func_ref, tg_arn, method, path, headers, body, q
         "isBase64Encoded": is_b64,
     }
 
-    exec_record = lambda_svc._execution_record_for_config(func_data, func_config)
-    started = time.time()
-    exec_result = await asyncio.to_thread(lambda_svc._execute_function, exec_record, event)
-    duration_ms = (time.time() - started) * 1000.0
-    lambda_svc._run_with_function_config_scope(
-        func_config,
-        lambda_svc._emit_lambda_metrics,
-        func_name,
-        duration_ms=duration_ms,
-        error=bool(exec_result.get("error")),
-        throttle=bool(exec_result.get("throttle")),
-    )
+    exec_record = lambda_svc._execution_record_for_config(func, config)
+
+    def _invoke_and_record_metrics():
+        started = time.time()
+        invocation_result = lambda_svc._execute_function_with_config_scope(exec_record, event)
+        duration_ms = (time.time() - started) * 1000.0
+        lambda_svc._run_with_function_config_scope(
+            config,
+            lambda_svc._emit_lambda_metrics,
+            func_name,
+            duration_ms=duration_ms,
+            error=bool(invocation_result.get("error")),
+            throttle=bool(invocation_result.get("throttle")),
+        )
+        return invocation_result
+
+    exec_result = await asyncio.to_thread(_invoke_and_record_metrics)
     lambda_response, _err = lambda_svc.lambda_execute_result_to_api_proxy_response(exec_result)
 
     if exec_result.get("error"):
