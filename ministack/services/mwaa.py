@@ -280,13 +280,22 @@ def _start_airflow_container(env_name, env):
         container_env[f"AIRFLOW__{env_key}"] = value
 
     try:
+        container_name = f"ministack-mwaa-{env_name}"
+
+        # Remove stale container from previous runs (same pattern as RDS)
+        try:
+            existing = docker_client.containers.get(container_name)
+            existing.remove(force=True)
+        except Exception:
+            pass
+
         container_kwargs = dict(
             image=image,
             detach=True,
             command="standalone",
             environment=container_env,
             ports={f"{container_port}/tcp": host_port},
-            name=f"ministack-mwaa-{env_name}",
+            name=container_name,
             labels={"ministack": "mwaa", "env_name": env_name},
         )
 
