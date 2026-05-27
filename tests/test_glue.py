@@ -943,6 +943,40 @@ def test_glue_partition_indexes(glue):
 
 # ── Spark job image selection (1.3.50) ─────────────────────
 
+def test_glue_spark_skips_docker_when_image_missing(glue):
+    """glueetl job falls back to subprocess when the Spark Docker image is not pulled.
+    The job should not crash MiniStack — it either runs via subprocess (and fails
+    on pyspark import) or stubs as SUCCEEDED if the script can't be resolved."""
+    import time
+    job_name = "test-spark-no-image"
+    try:
+        glue.delete_job(JobName=job_name)
+    except Exception:
+        pass
+
+    glue.create_job(
+        Name=job_name,
+        Role="arn:aws:iam::000000000000:role/GlueRole",
+        Command={"Name": "glueetl", "ScriptLocation": "s3://nonexistent/script.py"},
+        GlueVersion="4.0",
+    )
+    resp = glue.start_job_run(JobName=job_name)
+    run_id = resp["JobRunId"]
+
+    # Poll until terminal state
+    for _ in range(20):
+        run = glue.get_job_run(JobName=job_name, RunId=run_id)["JobRun"]
+        if run["JobRunState"] in ("SUCCEEDED", "FAILED", "TIMEOUT"):
+            break
+        time.sleep(0.5)
+
+    # Script can't be resolved (nonexistent S3 path) so it should stub as SUCCEEDED
+    # The key assertion: it does NOT hang or crash — it reaches a terminal state
+    assert run["JobRunState"] in ("SUCCEEDED", "FAILED"), (
+        f"Job should reach terminal state without Docker image. Got: {run['JobRunState']}"
+    )
+
+
 def test_glue_spark_image_for_version_maps_to_official_aws_image():
     """`GlueVersion: 4.0` and `3.0` map to the canonical `amazon/aws-glue-libs`
     images real AWS Glue uses for Spark. Override via `GLUE_DOCKER_IMAGE`."""
