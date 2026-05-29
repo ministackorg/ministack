@@ -806,6 +806,57 @@ def _resolve_cluster_in_request_region(cluster_id):
     return _request_region_get(_clusters, cluster_id, "cluster")
 
 
+def _resolve_global_cluster(global_id):
+    """Look up a global cluster by identifier."""
+    if _parse_rds_arn(global_id):
+        return None
+    return _global_clusters.get(global_id)
+
+
+def _global_cluster_member(cluster, is_writer):
+    return {
+        "DBClusterArn": cluster["DBClusterArn"],
+        "Readers": [],
+        "IsWriter": is_writer,
+        "GlobalWriteForwardingStatus": cluster.get("GlobalWriteForwardingStatus", "disabled"),
+        "SynchronizationStatus": "connected",
+    }
+
+
+def _global_cluster_member_in_request_region(global_cluster):
+    for member in global_cluster.get("GlobalClusterMembers", []):
+        parsed = _parse_rds_arn(member.get("DBClusterArn", ""))
+        if not parsed:
+            continue
+        spec, resource_type, _resource_id = parsed
+        if (
+            resource_type == "cluster"
+            and spec.account_id == get_account_id()
+            and spec.region == get_region()
+        ):
+            return member
+    return None
+
+
+def _refresh_global_cluster_readers(global_cluster):
+    members = global_cluster.get("GlobalClusterMembers", [])
+    reader_arns = [m["DBClusterArn"] for m in members if not m.get("IsWriter")]
+    for member in members:
+        member["Readers"] = reader_arns if member.get("IsWriter") else []
+
+
+def _attach_cluster_to_global(global_cluster, cluster, is_writer):
+    members = [
+        m for m in global_cluster.setdefault("GlobalClusterMembers", [])
+        if m.get("DBClusterArn") != cluster["DBClusterArn"]
+    ]
+    members.append(_global_cluster_member(cluster, is_writer))
+    global_cluster["GlobalClusterMembers"] = members
+    _refresh_global_cluster_readers(global_cluster)
+    cluster["GlobalClusterIdentifier"] = global_cluster["GlobalClusterIdentifier"]
+    cluster["GlobalWriteForwardingStatus"] = "disabled"
+
+
 def _resolve_instance(db_id):
     """Look up an instance by DBInstanceIdentifier or DbiResourceId.
 
@@ -1548,8 +1599,47 @@ def _create_db_cluster(p):
         return _error("DBClusterAlreadyExistsFault",
             f"DB cluster {cluster_id} already exists.", 400)
 
+    global_cluster_id = _p(p, "GlobalClusterIdentifier")
+    invalid_global_id = _invalid_global_cluster_identifier_error(global_cluster_id)
+    if invalid_global_id:
+        return invalid_global_id
+    global_cluster = _resolve_global_cluster(global_cluster_id) if global_cluster_id else None
+    if global_cluster_id and not global_cluster:
+        return _error("GlobalClusterNotFoundFault",
+            f"Global cluster {global_cluster_id} not found.", 404)
+    if global_cluster and _global_cluster_member_in_request_region(global_cluster):
+        return _error(
+            "InvalidParameterValue",
+            f"Global cluster {global_cluster_id} already has a member in {get_region()}.",
+            400,
+        )
+
     engine = _p(p, "Engine") or "aurora-postgresql"
+    if global_cluster:
+        expected_engine = global_cluster.get("Engine")
+        if _p(p, "Engine") and expected_engine and engine != expected_engine:
+            return _error(
+                "InvalidParameterValue",
+                f"Engine {engine} is incompatible with global cluster "
+                f"{global_cluster_id} engine {expected_engine}.",
+                400,
+            )
+        engine = expected_engine or engine
     engine_version = _p(p, "EngineVersion") or _default_engine_version(engine)
+    if global_cluster:
+        expected_engine_version = global_cluster.get("EngineVersion")
+        if (
+            _p(p, "EngineVersion")
+            and expected_engine_version
+            and engine_version != expected_engine_version
+        ):
+            return _error(
+                "InvalidParameterValue",
+                f"EngineVersion {engine_version} is incompatible with global "
+                f"cluster {global_cluster_id} engine version {expected_engine_version}.",
+                400,
+            )
+        engine_version = expected_engine_version or engine_version
     port = int(_p(p, "Port") or _default_port(engine))
     master_user = _p(p, "MasterUsername") or "admin"
     arn = f"arn:aws:rds:{get_region()}:{get_account_id()}:cluster:{cluster_id}"
@@ -1609,6 +1699,9 @@ def _create_db_cluster(p):
         "ClusterScalabilityType": "standard",
     }
     _clusters[cluster_id] = cluster
+    if global_cluster:
+        is_first_member = not global_cluster.get("GlobalClusterMembers")
+        _attach_cluster_to_global(global_cluster, cluster, is_writer=is_first_member)
 
     req_tags = _parse_tags(p)
     if req_tags:
@@ -1631,6 +1724,10 @@ def _delete_db_cluster(p):
     if cluster.get("DeletionProtection"):
         return _error("InvalidParameterCombination",
             "Cannot delete a DB cluster when DeletionProtection is enabled.", 400)
+
+    if cluster.get("GlobalClusterIdentifier"):
+        return _error("InvalidDBClusterStateFault",
+            "Cannot delete a DB cluster while it is a member of a global cluster.", 400)
 
     skip_snapshot = _p(p, "SkipFinalSnapshot") == "true"
     final_snap_id = _p(p, "FinalDBSnapshotIdentifier")
@@ -2589,11 +2686,10 @@ def _invalid_global_cluster_identifier_error(global_id):
 # ---------------------------------------------------------------------------
 # Global Clusters
 #
-# Emulation scope: single-member global clusters only.  A global cluster can
-# be created standalone or attached to one existing DB cluster via
-# SourceDBClusterIdentifier.  Multi-member membership (secondary clusters
-# in other regions), FailoverGlobalCluster, and SwitchoverGlobalCluster are
-# not supported — MiniStack is a single-region emulator.
+# Emulation scope: metadata-level Aurora Global Database membership.  This
+# supports the create/read/update/delete control-plane path needed by local
+# acceptance tests, without simulating storage replication, failover, or
+# switchover.
 # ---------------------------------------------------------------------------
 
 def _create_global_cluster(p):
@@ -2628,6 +2724,14 @@ def _create_global_cluster(p):
                 return wrong_region
             return _error("DBClusterNotFoundFault",
                 f"DBCluster {source_cluster_id} not found.", 404)
+        existing_global_id = source_cluster.get("GlobalClusterIdentifier")
+        if existing_global_id:
+            return _error(
+                "InvalidDBClusterStateFault",
+                f"DBCluster {source_cluster_id} is already a member of "
+                f"global cluster {existing_global_id}.",
+                400,
+            )
         engine = source_cluster["Engine"]
         engine_version = source_cluster["EngineVersion"]
 
@@ -2644,11 +2748,7 @@ def _create_global_cluster(p):
         "DatabaseName": _p(p, "DatabaseName") or "",
     }
     if source_cluster:
-        gc["GlobalClusterMembers"].append({
-            "DBClusterArn": source_cluster["DBClusterArn"],
-            "IsWriter": True,
-            "GlobalWriteForwardingStatus": "disabled",
-        })
+        _attach_cluster_to_global(gc, source_cluster, is_writer=True)
     _global_clusters[gc_id] = gc
     return _xml(200, "CreateGlobalClusterResponse",
         f"<CreateGlobalClusterResult><GlobalCluster>{_global_cluster_xml(gc)}</GlobalCluster></CreateGlobalClusterResult>")
@@ -2657,10 +2757,10 @@ def _create_global_cluster(p):
 def _describe_global_clusters(p):
     gc_id = _p(p, "GlobalClusterIdentifier")
     if gc_id:
-        invalid_arn = _invalid_global_cluster_identifier_error(gc_id)
-        if invalid_arn:
-            return invalid_arn
-        gc = _global_clusters.get(gc_id)
+        invalid_id = _invalid_global_cluster_identifier_error(gc_id)
+        if invalid_id:
+            return invalid_id
+        gc = _resolve_global_cluster(gc_id)
         if not gc:
             return _error("GlobalClusterNotFoundFault",
                 f"Global cluster {gc_id} not found.", 404)
@@ -2677,10 +2777,10 @@ def _describe_global_clusters(p):
 
 def _delete_global_cluster(p):
     gc_id = _p(p, "GlobalClusterIdentifier")
-    invalid_arn = _invalid_global_cluster_identifier_error(gc_id)
-    if invalid_arn:
-        return invalid_arn
-    gc = _global_clusters.get(gc_id)
+    invalid_id = _invalid_global_cluster_identifier_error(gc_id)
+    if invalid_id:
+        return invalid_id
+    gc = _resolve_global_cluster(gc_id)
     if not gc:
         return _error("GlobalClusterNotFoundFault",
             f"Global cluster {gc_id} not found.", 404)
@@ -2689,13 +2789,12 @@ def _delete_global_cluster(p):
         return _error("InvalidParameterCombination",
             "Cannot delete a global cluster when DeletionProtection is enabled.", 400)
 
-    writer_members = [m for m in gc.get("GlobalClusterMembers", []) if m.get("IsWriter")]
-    if writer_members:
+    if gc.get("GlobalClusterMembers"):
         return _error("InvalidGlobalClusterStateFault",
             "Global cluster still has member clusters. Remove them before deleting.", 400)
 
     gc["Status"] = "deleting"
-    del _global_clusters[gc_id]
+    del _global_clusters[gc["GlobalClusterIdentifier"]]
     return _xml(200, "DeleteGlobalClusterResponse",
         f"<DeleteGlobalClusterResult><GlobalCluster>{_global_cluster_xml(gc)}</GlobalCluster></DeleteGlobalClusterResult>")
 
@@ -2703,34 +2802,43 @@ def _delete_global_cluster(p):
 def _remove_from_global_cluster(p):
     gc_id = _p(p, "GlobalClusterIdentifier")
     db_cluster_id = _p(p, "DbClusterIdentifier")
-    invalid_arn = _invalid_global_cluster_identifier_error(gc_id)
-    if invalid_arn:
-        return invalid_arn
-    gc = _global_clusters.get(gc_id)
+    invalid_id = _invalid_global_cluster_identifier_error(gc_id)
+    if invalid_id:
+        return invalid_id
+    gc = _resolve_global_cluster(gc_id)
     if not gc:
         return _error("GlobalClusterNotFoundFault",
             f"Global cluster {gc_id} not found.", 404)
 
     members = gc.get("GlobalClusterMembers", [])
-    new_members = [m for m in members if m["DBClusterArn"] != db_cluster_id]
-    if len(new_members) == len(members):
-        for cl in _clusters.values():
-            if cl["DBClusterIdentifier"] == db_cluster_id:
-                db_cluster_id = cl["DBClusterArn"]
-                break
-        new_members = [m for m in members if m["DBClusterArn"] != db_cluster_id]
+    cluster = _resolve_cluster(db_cluster_id)
+    db_cluster_arn = cluster["DBClusterArn"] if cluster else db_cluster_id
+    member = next((m for m in members if m["DBClusterArn"] == db_cluster_arn), None)
+    if not member:
+        return _error("DBClusterNotFoundFault",
+            f"DBCluster {db_cluster_id} is not a member of global cluster {gc_id}.", 404)
+    if member.get("IsWriter") and len(members) > 1:
+        return _error("InvalidGlobalClusterStateFault",
+            "Cannot remove the writer DB cluster while reader members remain.", 400)
 
+    new_members = [m for m in members if m["DBClusterArn"] != db_cluster_arn]
     gc["GlobalClusterMembers"] = new_members
+    _refresh_global_cluster_readers(gc)
+    if not cluster:
+        cluster = _resolve_cluster(db_cluster_arn)
+    if cluster:
+        cluster.pop("GlobalClusterIdentifier", None)
+        cluster.pop("GlobalWriteForwardingStatus", None)
     return _xml(200, "RemoveFromGlobalClusterResponse",
         f"<RemoveFromGlobalClusterResult><GlobalCluster>{_global_cluster_xml(gc)}</GlobalCluster></RemoveFromGlobalClusterResult>")
 
 
 def _modify_global_cluster(p):
     gc_id = _p(p, "GlobalClusterIdentifier")
-    invalid_arn = _invalid_global_cluster_identifier_error(gc_id)
-    if invalid_arn:
-        return invalid_arn
-    gc = _global_clusters.get(gc_id)
+    invalid_id = _invalid_global_cluster_identifier_error(gc_id)
+    if invalid_id:
+        return invalid_id
+    gc = _resolve_global_cluster(gc_id)
     if not gc:
         return _error("GlobalClusterNotFoundFault",
             f"Global cluster {gc_id} not found.", 404)
@@ -2743,10 +2851,15 @@ def _modify_global_cluster(p):
         if new_id in _global_clusters:
             return _error("GlobalClusterAlreadyExistsFault",
                 f"Global cluster {new_id} already exists.", 400)
+        old_id = gc["GlobalClusterIdentifier"]
         gc["GlobalClusterIdentifier"] = new_id
         gc["GlobalClusterArn"] = f"arn:aws:rds::{get_account_id()}:global-cluster:{new_id}"
         _global_clusters[new_id] = gc
-        del _global_clusters[gc_id]
+        del _global_clusters[old_id]
+        for member in gc.get("GlobalClusterMembers", []):
+            cluster = _resolve_cluster(member["DBClusterArn"])
+            if cluster:
+                cluster["GlobalClusterIdentifier"] = new_id
 
     if _p(p, "DeletionProtection"):
         gc["DeletionProtection"] = _p(p, "DeletionProtection") == "true"
@@ -2774,12 +2887,16 @@ def _enable_http_endpoint(p):
 
 
 def _global_cluster_xml(gc):
+    _refresh_global_cluster_readers(gc)
     member_xml = ""
     for m in gc.get("GlobalClusterMembers", []):
+        readers_xml = "".join(f"<member>{_esc(reader)}</member>" for reader in m.get("Readers", []))
         member_xml += f"""<GlobalClusterMember>
             <DBClusterArn>{m['DBClusterArn']}</DBClusterArn>
+            <Readers>{readers_xml}</Readers>
             <IsWriter>{str(m.get('IsWriter', False)).lower()}</IsWriter>
             <GlobalWriteForwardingStatus>{m.get('GlobalWriteForwardingStatus', 'disabled')}</GlobalWriteForwardingStatus>
+            <SynchronizationStatus>{m.get('SynchronizationStatus', 'connected')}</SynchronizationStatus>
         </GlobalClusterMember>"""
     return f"""<GlobalClusterIdentifier>{gc['GlobalClusterIdentifier']}</GlobalClusterIdentifier>
         <GlobalClusterArn>{gc['GlobalClusterArn']}</GlobalClusterArn>
@@ -2822,6 +2939,7 @@ def _describe_engine_versions(p):
     }
     versions = versions_map.get(engine, [("15.3", "15")])
     members = ""
+    supports_global = engine in ("aurora-mysql", "aurora-postgresql")
     for ver, family in versions:
         if version_filter and ver != version_filter:
             continue
@@ -2838,7 +2956,7 @@ def _describe_engine_versions(p):
             <SupportedFeatureNames/>
             <Status>available</Status>
             <SupportsParallelQuery>false</SupportsParallelQuery>
-            <SupportsGlobalDatabases>false</SupportsGlobalDatabases>
+            <SupportsGlobalDatabases>{str(supports_global).lower()}</SupportsGlobalDatabases>
             <SupportsBabelfish>false</SupportsBabelfish>
             <SupportsCertificateRotationWithoutRestart>true</SupportsCertificateRotationWithoutRestart>
         </DBEngineVersion>"""
@@ -3067,6 +3185,16 @@ def _cluster_xml(c):
     # emitting an empty element would surface as "" instead of None to clients.
     db_name = c.get("DatabaseName")
     db_name_xml = f"<DatabaseName>{db_name}</DatabaseName>" if db_name else ""
+    global_cluster_id = c.get("GlobalClusterIdentifier")
+    global_cluster_xml = (
+        f"<GlobalClusterIdentifier>{global_cluster_id}</GlobalClusterIdentifier>"
+        if global_cluster_id else ""
+    )
+    global_write_forwarding = c.get("GlobalWriteForwardingStatus")
+    global_write_forwarding_xml = (
+        f"<GlobalWriteForwardingStatus>{global_write_forwarding}</GlobalWriteForwardingStatus>"
+        if global_write_forwarding else ""
+    )
 
     return f"""<DBClusterIdentifier>{c['DBClusterIdentifier']}</DBClusterIdentifier>
         <DBClusterArn>{c['DBClusterArn']}</DBClusterArn>
@@ -3105,6 +3233,8 @@ def _cluster_xml(c):
         <AllocatedStorage>{c.get('AllocatedStorage',1)}</AllocatedStorage>
         <ActivityStreamStatus>{c.get('ActivityStreamStatus','stopped')}</ActivityStreamStatus>
         <NetworkType>{c.get('NetworkType','IPV4')}</NetworkType>
+        {global_cluster_xml}
+        {global_write_forwarding_xml}
         <EngineLifecycleSupport>{c.get('EngineLifecycleSupport','open-source-rds-extended-support')}</EngineLifecycleSupport>"""
 
 
