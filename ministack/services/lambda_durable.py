@@ -684,10 +684,16 @@ def handle_get_state(arn_path: str, query_params: dict) -> tuple:
     marker = _qp_first(query_params, "Marker", "")
     max_items_raw = _qp_first(query_params, "MaxItems", "100")
     try:
-        max_items = int(max_items_raw) or 100
+        max_items = int(max_items_raw)
     except ValueError:
+        return error_response_json("InvalidParameterValueException",
+            f"MaxItems must be an integer, got {max_items_raw!r}", 400)
+    # AWS docs: "Valid Range: Minimum value of 0. Maximum value of 1000."
+    if max_items < 0 or max_items > 1000:
+        return error_response_json("InvalidParameterValueException",
+            "MaxItems must be between 0 and 1000", 400)
+    if max_items == 0:
         max_items = 100
-    max_items = min(max(1, max_items), 1000)
 
     ops = list(rec["Operations"])
     start = 0
@@ -735,10 +741,15 @@ def handle_get_history(arn_path: str, query_params: dict) -> tuple:
     reverse = _qp_first(query_params, "ReverseOrder", "false").lower() == "true"
     max_items_raw = _qp_first(query_params, "MaxItems", "100")
     try:
-        max_items = int(max_items_raw) or 100
+        max_items = int(max_items_raw)
     except ValueError:
+        return error_response_json("InvalidParameterValueException",
+            f"MaxItems must be an integer, got {max_items_raw!r}", 400)
+    if max_items < 0 or max_items > 1000:
+        return error_response_json("InvalidParameterValueException",
+            "MaxItems must be between 0 and 1000", 400)
+    if max_items == 0:
         max_items = 100
-    max_items = min(max(1, max_items), 1000)
 
     events = list(rec["History"])
     if reverse:
@@ -782,10 +793,16 @@ def handle_list_by_function(function_name: str, query_params: dict,
     marker = _qp_first(query_params, "Marker", "")
     max_items_raw = _qp_first(query_params, "MaxItems", "100")
     try:
-        max_items = int(max_items_raw) or 100
+        max_items = int(max_items_raw)
     except ValueError:
+        return error_response_json("InvalidParameterValueException",
+            f"MaxItems must be an integer, got {max_items_raw!r}", 400)
+    # AWS docs: "Valid Range: Minimum value of 0. Maximum value of 1000."
+    if max_items < 0 or max_items > 1000:
+        return error_response_json("InvalidParameterValueException",
+            "MaxItems must be between 0 and 1000", 400)
+    if max_items == 0:
         max_items = 100
-    max_items = min(max(1, max_items), 1000)
 
     summaries = []
     for rec in _executions.values():

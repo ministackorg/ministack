@@ -4546,19 +4546,19 @@ def test_lambda_durable_restore_skips_non_running_executions():
 # the ticket with confidence rather than just on happy-path verification.
 # ---------------------------------------------------------------------------
 
-def test_lambda_durable_stop_idempotent_on_terminal(lam):
-    """StopDurableExecution on an already-terminal execution must return a
-    deterministic error (not 500), so SDKs can treat it as a no-op."""
+def test_lambda_durable_stop_on_terminal_returns_invalid_parameter(lam):
+    """Per AWS docs ('Stops a running durable execution'), Stop on a
+    non-running execution must return 400 InvalidParameterValueException —
+    the only 4xx-class error the API documents for input failures."""
     from urllib.parse import quote
     fname, _, rec = _create_durable_execution_directly(lam)
     try:
         arn_q = quote(rec["DurableExecutionArn"], safe="/:$")
         code1, _ = _raw_durable("POST", f"/2025-12-01/durable-executions/{arn_q}/stop", body={})
         assert code1 == 200
-        # Second stop on the same (now SUCCEEDED/STOPPED) execution: must be
-        # a 4xx, not 5xx, with a recognizable error type.
         code2, body2 = _raw_durable("POST", f"/2025-12-01/durable-executions/{arn_q}/stop", body={})
-        assert 400 <= code2 < 500, f"expected 4xx, got {code2}: {body2}"
+        assert code2 == 400, f"expected 400, got {code2}: {body2}"
+        assert body2.get("__type") == "InvalidParameterValueException", body2
     finally:
         lam.delete_function(FunctionName=fname)
 
@@ -4602,46 +4602,45 @@ def test_lambda_durable_checkpoint_unknown_op_type_rejected(lam):
         lam.delete_function(FunctionName=fname)
 
 
-def test_lambda_durable_list_pagination_max_results(lam):
-    """ListDurableExecutionsByFunction should respect MaxResults bounds; an
-    out-of-range value must not 500."""
+def test_lambda_durable_list_pagination_max_items(lam):
+    """Per AWS docs, ListDurableExecutionsByFunction uses MaxItems (not
+    MaxResults) with 'Valid Range: Minimum 0, Maximum 1000'. Out-of-range
+    must 400 with InvalidParameterValueException."""
     fname, _, _ = _create_durable_execution_directly(lam)
     try:
-        # Bogus MaxResults — must not 500.
+        # Out-of-range → 400 InvalidParameterValueException.
         code, body = _raw_durable("GET",
             f"/2025-12-01/functions/{fname}/durable-executions",
-            query={"MaxResults": "9999999"})
-        assert code in (200, 400), f"got {code}: {body}"
-        if code == 200:
-            assert "DurableExecutions" in body
-        # MaxResults=1 with a single execution → still returns it.
+            query={"MaxItems": "9999999"})
+        assert code == 400, f"expected 400, got {code}: {body}"
+        assert body.get("__type") == "InvalidParameterValueException", body
+        # MaxItems=1 with a single execution → still returns it.
         code, body = _raw_durable("GET",
             f"/2025-12-01/functions/{fname}/durable-executions",
-            query={"MaxResults": "1"})
+            query={"MaxItems": "1"})
         assert code == 200, f"got {code}: {body}"
         assert len(body.get("DurableExecutions", [])) >= 1
     finally:
         lam.delete_function(FunctionName=fname)
 
 
-def test_lambda_durable_get_history_pagination_token_round_trip(lam):
-    """GetDurableExecutionHistory with NextToken/MaxResults must not 500 and
-    must surface NextToken=None (or missing) on the final page."""
+def test_lambda_durable_get_history_pagination_marker(lam):
+    """Per AWS docs, the Lambda pagination contract uses Marker (not
+    NextToken) and MaxItems (not MaxResults). MaxItems > 1000 must 400."""
     from urllib.parse import quote
     fname, _, rec = _create_durable_execution_directly(lam)
     try:
         arn_q = quote(rec["DurableExecutionArn"], safe="/:$")
-        # Page through with MaxResults=1.
         code, body = _raw_durable("GET",
             f"/2025-12-01/durable-executions/{arn_q}/history",
-            query={"MaxResults": "1"})
+            query={"MaxItems": "1"})
         assert code == 200, body
         assert "Events" in body
-        # An invalid NextToken must 400, not 500.
         code, body = _raw_durable("GET",
             f"/2025-12-01/durable-executions/{arn_q}/history",
-            query={"NextToken": "obviously-garbage-token"})
-        assert code in (200, 400), f"got {code}: {body}"
+            query={"MaxItems": "9999999"})
+        assert code == 400, body
+        assert body.get("__type") == "InvalidParameterValueException", body
     finally:
         lam.delete_function(FunctionName=fname)
 
