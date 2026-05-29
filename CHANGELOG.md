@@ -7,6 +7,21 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [1.3.52] — 2026-05-29
+
+### Added
+- **Lambda Durable Functions (Durable Execution)** — full support for the AWS Lambda durable functions preview API (`2025-12-01`), including `CreateFunction` with `DurableConfig`, `CheckpointDurableExecution`, `GetDurableExecutionState`, `GetDurableExecution`, `GetDurableExecutionHistory`, `ListDurableExecutionsByFunction`, `StopDurableExecution`, and the three external callback ops `SendDurableExecutionCallbackSuccess`, `SendDurableExecutionCallbackFailure`, `SendDurableExecutionCallbackHeartbeat`. End-to-end verified against the official `aws-durable-execution-sdk-python` (1.5.0) and `aws-durable-execution-sdk-java` (2.44.13). A resume scheduler fires `WAIT` expiries, callback timeouts (`Callback.Timeout` / `Callback.Heartbeat`), and step-retry backoffs (`NextAttemptDelaySeconds`). State persists across restarts — the in-memory callback index is rebuilt from restored executions on boot and pending timers are re-armed. Reported by @youngkwangk.
+- **S3 object tagging by `versionId`** — `GET`/`PUT`/`DELETE` `?tagging` honor the `versionId` query parameter, and `PutObject` / `POST` form upload now store the `x-amz-tagging` header against the resulting version rather than the object key, matching AWS's versioned-tagging semantics. Reported by @barrywilks7.
+- **CloudFormation `AWS::AppConfig::Application`** — create and delete provisioners for the AppConfig application resource type, wired into the existing CloudFormation dispatcher. Reported by @zmartinec.
+
+### Fixed
+- **DynamoDB gap closing** — additional alignment work across DynamoDB validators and response shapes.
+- **Lambda durable `MaxItems` pagination** — `ListDurableExecutionsByFunction`, `GetDurableExecutionState`, and `GetDurableExecutionHistory` now return 400 `InvalidParameterValueException` when `MaxItems` is outside the AWS-documented `[0, 1000]` range, instead of silently clamping.
+- **Lambda durable `CheckpointDurableExecution` validation** — `OperationUpdate` entries with missing `Id`/`Type`/`Action` or with a `Type` outside `EXECUTION`/`CONTEXT`/`STEP`/`WAIT`/`CALLBACK`/`CHAINED_INVOKE` are rejected with 400 `InvalidParameterValueException` instead of being silently stored as garbage operations.
+- **Lambda durable `StopDurableExecution` on terminal** — calling Stop on an already-terminal execution returns 400 `InvalidParameterValueException` per the AWS-documented "Stops a running durable execution" contract.
+
+---
+
 ## [1.3.51] — 2026-05-27
 
 ### Added
