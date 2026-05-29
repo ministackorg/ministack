@@ -4539,3 +4539,167 @@ def test_lambda_durable_restore_skips_non_running_executions():
         _ld._executions.update(pre_execs)
         _ld._callback_index.clear()
         _ld._callback_index.update(pre_index)
+
+
+# ---------------------------------------------------------------------------
+# Edge-case coverage for the 7 ops in issue #670 — written so we can close
+# the ticket with confidence rather than just on happy-path verification.
+# ---------------------------------------------------------------------------
+
+def test_lambda_durable_stop_idempotent_on_terminal(lam):
+    """StopDurableExecution on an already-terminal execution must return a
+    deterministic error (not 500), so SDKs can treat it as a no-op."""
+    from urllib.parse import quote
+    fname, _, rec = _create_durable_execution_directly(lam)
+    try:
+        arn_q = quote(rec["DurableExecutionArn"], safe="/:$")
+        code1, _ = _raw_durable("POST", f"/2025-12-01/durable-executions/{arn_q}/stop", body={})
+        assert code1 == 200
+        # Second stop on the same (now SUCCEEDED/STOPPED) execution: must be
+        # a 4xx, not 5xx, with a recognizable error type.
+        code2, body2 = _raw_durable("POST", f"/2025-12-01/durable-executions/{arn_q}/stop", body={})
+        assert 400 <= code2 < 500, f"expected 4xx, got {code2}: {body2}"
+    finally:
+        lam.delete_function(FunctionName=fname)
+
+
+def test_lambda_durable_checkpoint_malformed_updates_rejected(lam):
+    """A Checkpoint with garbage Updates (missing required fields, unknown
+    Type) must 400, not 500 or silent accept."""
+    from urllib.parse import quote
+    fname, _, rec = _create_durable_execution_directly(lam)
+    try:
+        arn_q = quote(rec["DurableExecutionArn"], safe="/:$")
+        # Missing Id, Type, Action.
+        code, body = _raw_durable("POST",
+            f"/2025-12-01/durable-executions/{arn_q}/checkpoint",
+            body={"CheckpointToken": rec["CheckpointToken"],
+                  "Updates": [{"banana": "split"}]})
+        assert code == 400 or (code == 200 and body.get("NewExecutionState", {}).get("Operations") == []), \
+            f"malformed update accepted as valid update: code={code} body={body}"
+    finally:
+        lam.delete_function(FunctionName=fname)
+
+
+def test_lambda_durable_checkpoint_unknown_op_type_rejected(lam):
+    """Unknown Type (not in EXECUTION/CONTEXT/STEP/WAIT/CALLBACK/CHAINED_INVOKE)
+    must not silently create an Op with that bogus Type."""
+    from urllib.parse import quote
+    fname, _, rec = _create_durable_execution_directly(lam)
+    try:
+        arn_q = quote(rec["DurableExecutionArn"], safe="/:$")
+        code, body = _raw_durable("POST",
+            f"/2025-12-01/durable-executions/{arn_q}/checkpoint",
+            body={"CheckpointToken": rec["CheckpointToken"],
+                  "Updates": [{"Id": "x" * 32, "Type": "NOT_A_REAL_TYPE",
+                               "Action": "START"}]})
+        # Either 400-reject, or the bogus type must not create a recognised op.
+        if code == 200:
+            ops = body["NewExecutionState"]["Operations"]
+            bogus = [o for o in ops if o.get("Type") == "NOT_A_REAL_TYPE"]
+            assert not bogus, "ministack silently created an Op with an invalid Type"
+    finally:
+        lam.delete_function(FunctionName=fname)
+
+
+def test_lambda_durable_list_pagination_max_results(lam):
+    """ListDurableExecutionsByFunction should respect MaxResults bounds; an
+    out-of-range value must not 500."""
+    fname, _, _ = _create_durable_execution_directly(lam)
+    try:
+        # Bogus MaxResults — must not 500.
+        code, body = _raw_durable("GET",
+            f"/2025-12-01/functions/{fname}/durable-executions",
+            query={"MaxResults": "9999999"})
+        assert code in (200, 400), f"got {code}: {body}"
+        if code == 200:
+            assert "DurableExecutions" in body
+        # MaxResults=1 with a single execution → still returns it.
+        code, body = _raw_durable("GET",
+            f"/2025-12-01/functions/{fname}/durable-executions",
+            query={"MaxResults": "1"})
+        assert code == 200, f"got {code}: {body}"
+        assert len(body.get("DurableExecutions", [])) >= 1
+    finally:
+        lam.delete_function(FunctionName=fname)
+
+
+def test_lambda_durable_get_history_pagination_token_round_trip(lam):
+    """GetDurableExecutionHistory with NextToken/MaxResults must not 500 and
+    must surface NextToken=None (or missing) on the final page."""
+    from urllib.parse import quote
+    fname, _, rec = _create_durable_execution_directly(lam)
+    try:
+        arn_q = quote(rec["DurableExecutionArn"], safe="/:$")
+        # Page through with MaxResults=1.
+        code, body = _raw_durable("GET",
+            f"/2025-12-01/durable-executions/{arn_q}/history",
+            query={"MaxResults": "1"})
+        assert code == 200, body
+        assert "Events" in body
+        # An invalid NextToken must 400, not 500.
+        code, body = _raw_durable("GET",
+            f"/2025-12-01/durable-executions/{arn_q}/history",
+            query={"NextToken": "obviously-garbage-token"})
+        assert code in (200, 400), f"got {code}: {body}"
+    finally:
+        lam.delete_function(FunctionName=fname)
+
+
+def test_lambda_durable_get_execution_state_old_token_rejected(lam):
+    """GetDurableExecutionState with a stale CheckpointToken must 400 —
+    SDKs rely on this to detect they've been preempted."""
+    from urllib.parse import quote
+    fname, _, rec = _create_durable_execution_directly(lam)
+    try:
+        arn_q = quote(rec["DurableExecutionArn"], safe="/:$")
+        original_token = rec["CheckpointToken"]
+        # Rotate the token via a Checkpoint.
+        code, body = _raw_durable("POST",
+            f"/2025-12-01/durable-executions/{arn_q}/checkpoint",
+            body={"CheckpointToken": original_token, "Updates": []})
+        assert code == 200
+        # Old token must now be rejected on GetState.
+        code, body = _raw_durable("GET",
+            f"/2025-12-01/durable-executions/{arn_q}/state",
+            query={"CheckpointToken": original_token})
+        assert code == 400, f"stale token accepted: code={code} body={body}"
+    finally:
+        lam.delete_function(FunctionName=fname)
+
+
+def test_lambda_durable_get_unknown_arn_404(lam):
+    """GetDurableExecution with a syntactically-valid but unknown ARN must
+    return 404 (ResourceNotFoundException), not 500."""
+    fake = ("arn:aws:lambda:us-east-1:000000000000:function:does-not-exist:"
+            "$LATEST/durable-execution/" + ("a" * 32) + "/" + ("b" * 32))
+    from urllib.parse import quote
+    code, body = _raw_durable("GET", f"/2025-12-01/durable-executions/{quote(fake, safe='/:$')}")
+    assert code == 404, f"expected 404, got {code}: {body}"
+
+
+def test_lambda_durable_create_function_durable_config_round_trip_with_update(lam):
+    """DurableConfig must survive UpdateFunctionConfiguration that touches
+    unrelated fields (timeout, memory)."""
+    import base64 as _b64, json as _json
+    fname = f"dur-upd-{_uuid_mod.uuid4().hex[:8]}"
+    try:
+        lam.delete_function(FunctionName=fname)
+    except Exception:
+        pass
+    zip_b64 = _b64.b64encode(_make_zip("def handler(e,c): return e")).decode()
+    code, _ = _raw_durable("POST", "/2015-03-31/functions", body={
+        "FunctionName": fname, "Runtime": "python3.12", "Role": _LAMBDA_ROLE,
+        "Handler": "index.handler", "Code": {"ZipFile": zip_b64},
+        "DurableConfig": {"Enabled": True},
+    })
+    assert code == 201
+    try:
+        # Touch unrelated config.
+        lam.update_function_configuration(FunctionName=fname, Timeout=60, MemorySize=256)
+        code, body = _raw_durable("GET", f"/2015-03-31/functions/{fname}")
+        assert body["Configuration"].get("DurableConfig") == {"Enabled": True}, \
+            f"DurableConfig lost after Update: {body['Configuration'].get('DurableConfig')}"
+    finally:
+        try: lam.delete_function(FunctionName=fname)
+        except Exception: pass

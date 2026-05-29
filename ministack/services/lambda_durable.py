@@ -490,7 +490,11 @@ def handle_checkpoint(arn_path: str, body: bytes) -> tuple:
             f"Cannot checkpoint a durable execution in status {rec['Status']}", 400)
 
     for upd in updates:
-        _apply_update(rec, upd)
+        try:
+            _apply_update(rec, upd)
+        except _InvalidUpdate as e:
+            return error_response_json("InvalidParameterValueException",
+                str(e), 400)
 
     new_token = new_checkpoint_token()
     rec["CheckpointToken"] = new_token
@@ -503,12 +507,35 @@ def handle_checkpoint(arn_path: str, body: bytes) -> tuple:
     })
 
 
+_VALID_OP_TYPES = frozenset({
+    "EXECUTION", "CONTEXT", "STEP", "WAIT", "CALLBACK", "CHAINED_INVOKE",
+})
+_VALID_OP_ACTIONS = frozenset({
+    "START", "SUCCEED", "FAIL", "CANCEL", "RETRY",
+})
+
+
+class _InvalidUpdate(ValueError):
+    """Signal to handle_checkpoint that an OperationUpdate failed validation
+    and the whole Checkpoint should be rejected with InvalidParameterValueException."""
+
+
 def _apply_update(rec: dict, upd: dict) -> None:
     """Translate one OperationUpdate into both an Operation log entry and a
-    matching history event. The mapping mirrors the AWS docs Event types."""
+    matching history event. The mapping mirrors the AWS docs Event types.
+
+    Raises _InvalidUpdate when the update is structurally invalid (missing
+    Id/Type/Action, unknown Type or Action) so the caller surfaces a 400
+    rather than silently storing a garbage op."""
     op_id = upd.get("Id")
     op_type = upd.get("Type")
     action = upd.get("Action")
+    if not op_id or not isinstance(op_id, str):
+        raise _InvalidUpdate("OperationUpdate.Id is required and must be a string")
+    if op_type not in _VALID_OP_TYPES:
+        raise _InvalidUpdate(f"OperationUpdate.Type must be one of {sorted(_VALID_OP_TYPES)}, got {op_type!r}")
+    if action not in _VALID_OP_ACTIONS:
+        raise _InvalidUpdate(f"OperationUpdate.Action must be one of {sorted(_VALID_OP_ACTIONS)}, got {action!r}")
     sub_type = upd.get("SubType")
     name = upd.get("Name")
     parent_id = upd.get("ParentId")
