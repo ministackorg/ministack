@@ -324,7 +324,7 @@ def _iceberg_get_namespace(namespace):
         ns_name = ns["namespace"][0] if isinstance(ns.get("namespace"), list) else ns.get("namespace", "")
         if ns_name == namespace:
             return json_response({"namespace": [namespace], "properties": {}})
-    return error_response_json("NoSuchNamespaceException", f"Namespace {namespace} not found", 404)
+    return error_response_json("NotFoundException", f"Namespace {namespace} not found", 404)
 
 
 def _iceberg_list_tables(namespace):
@@ -348,7 +348,7 @@ def _iceberg_load_table(namespace, table_name):
                     "s3.endpoint": "http://localhost:4566", "s3.path-style-access": "true",
                 },
             })
-    return error_response_json("NoSuchTableException", f"Table {namespace}.{table_name} not found", 404)
+    return error_response_json("NotFoundException", f"Table {namespace}.{table_name} not found", 404)
 
 
 def _iceberg_commit_table(namespace, table_name, data):
@@ -396,7 +396,7 @@ def _iceberg_commit_table(namespace, table_name, data):
             table["modifiedAt"] = now_iso()
             return json_response({"metadata-location": new_loc, "metadata": metadata})
 
-    return error_response_json("NoSuchTableException", f"Table {namespace}.{table_name} not found", 404)
+    return error_response_json("NotFoundException", f"Table {namespace}.{table_name} not found", 404)
 
 
 def _iceberg_create_table(namespace, data):
@@ -409,7 +409,7 @@ def _iceberg_create_table(namespace, data):
             bucket_arn = ns.get("tableBucketARN")
             break
     if not bucket_arn:
-        return error_response_json("NoSuchNamespaceException", f"Namespace {namespace} not found", 404)
+        return error_response_json("NotFoundException", f"Namespace {namespace} not found", 404)
 
     schema_fields = [{"name": f.get("name", ""), "type": f.get("type", "string") if isinstance(f.get("type"), str) else "string",
                        "required": f.get("required", False)} for f in schema.get("fields", [])]

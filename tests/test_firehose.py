@@ -332,3 +332,56 @@ def test_firehose_describe_nonexistent_carries_errortype(fh):
         fh.describe_delivery_stream(DeliveryStreamName="missing-fh")
     assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
     assert exc.value.response["ResponseMetadata"]["HTTPHeaders"].get("x-amzn-errortype") == "ResourceNotFoundException"
+
+
+def test_firehose_kinesis_stream_as_source_fans_out_to_s3(fh, kin, s3):
+    """KinesisStreamAsSource: records put into the source Kinesis stream
+    must reach the configured S3 destination. Issue #744."""
+    import base64 as _b64, time as _time, uuid as _uuid
+    stream_name = f"src-stream-{_uuid.uuid4().hex[:8]}"
+    delivery_name = f"fh-{_uuid.uuid4().hex[:8]}"
+    bucket = f"fh-src-bucket-{_uuid.uuid4().hex[:8]}"
+    s3.create_bucket(Bucket=bucket)
+    try:
+        kin.create_stream(StreamName=stream_name, ShardCount=1)
+        stream_arn = kin.describe_stream(
+            StreamName=stream_name)["StreamDescription"]["StreamARN"]
+        fh.create_delivery_stream(
+            DeliveryStreamName=delivery_name,
+            DeliveryStreamType="KinesisStreamAsSource",
+            KinesisStreamSourceConfiguration={
+                "KinesisStreamARN": stream_arn,
+                "RoleARN": "arn:aws:iam::000000000000:role/test",
+            },
+            ExtendedS3DestinationConfiguration={
+                "RoleARN": "arn:aws:iam::000000000000:role/test",
+                "BucketARN": f"arn:aws:s3:::{bucket}",
+                "Prefix": "out/",
+                "CompressionFormat": "UNCOMPRESSED",
+            },
+        )
+        # Single PutRecord.
+        kin.put_record(
+            StreamName=stream_name, PartitionKey="pk", Data=b'{"a":1}')
+        # Batch PutRecords.
+        kin.put_records(StreamName=stream_name, Records=[
+            {"PartitionKey": "pk1", "Data": b'{"a":2}'},
+            {"PartitionKey": "pk2", "Data": b'{"a":3}'},
+        ])
+        for _ in range(20):
+            objs = s3.list_objects_v2(Bucket=bucket, Prefix="out/").get("Contents", [])
+            if len(objs) >= 3:
+                break
+            _time.sleep(0.1)
+        objs = s3.list_objects_v2(Bucket=bucket, Prefix="out/").get("Contents", [])
+        assert len(objs) >= 3, f"expected 3 records delivered to S3, got {len(objs)}"
+        bodies = sorted(
+            s3.get_object(Bucket=bucket, Key=o["Key"])["Body"].read()
+            for o in objs
+        )
+        assert bodies == [b'{"a":1}', b'{"a":2}', b'{"a":3}']
+    finally:
+        try: fh.delete_delivery_stream(DeliveryStreamName=delivery_name)
+        except Exception: pass
+        try: kin.delete_stream(StreamName=stream_name)
+        except Exception: pass

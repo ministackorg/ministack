@@ -249,7 +249,7 @@ async def handle_request(method, path, headers, body, query_params):
 
     parts = [p for p in path.strip("/").split("/") if p]
     if not parts:
-        return error_response_json("InvalidRequest", "Missing path", 400)
+        return error_response_json("ClientException", "Missing path", 400)
 
     return _finalize_ecs_response(_dispatch_path(method, parts, data))
 
@@ -319,7 +319,7 @@ def _dispatch_path(method, parts, data):
         if method == "GET":
             return _list_tags_for_resource(data)
 
-    return error_response_json("InvalidRequest", f"Unknown ECS path: /{'/'.join(parts)}", 400)
+    return error_response_json("ClientException", f"Unknown ECS path: /{'/'.join(parts)}", 400)
 
 
 # ---------------------------------------------------------------------------
@@ -634,7 +634,9 @@ def _create_service(data):
 
     svc_key = f"{cluster_name}/{name}"
     if svc_key in _services and _services[svc_key]["status"] == "ACTIVE":
-        return error_response_json("ServiceAlreadyExists",
+        # Per botocore ECS service model there is no ServiceAlreadyExistsException;
+        # the documented surface for this case is ClientException with a message.
+        return error_response_json("ClientException",
             "Creation of service was not idempotent.", 400)
 
     td_ref = data.get("taskDefinition", "")

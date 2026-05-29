@@ -633,7 +633,7 @@ async def handle_request(method, path, headers, body, query_params):
             return _get_account()
         if method == "PATCH":
             return _update_account(data)
-        return _v1_error("MethodNotAllowedException", f"Method not allowed: {method} /account", 405)
+        return _v1_error("BadRequestException", f"Method not allowed: {method} /account", 400)
 
     if top == "tags":
         # /tags/{resourceArn} — ARN may contain slashes
