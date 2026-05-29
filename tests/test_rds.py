@@ -1478,6 +1478,7 @@ def test_rds_restore_state_respawns_docker_container(monkeypatch):
     running container, and the metadata-only StartDBInstance /
     RebootDBInstance ops can't recover them. Regression test for #692.
     """
+    from ministack.core.responses import get_account_id, get_region
     from ministack.services import rds as m
 
     runs = []
@@ -1533,12 +1534,17 @@ def test_rds_restore_state_respawns_docker_container(monkeypatch):
         time.sleep(0.05)
 
     assert runs, "restore_state did not respawn the Docker container"
-    assert runs[0]["name"] == f"ministack-rds-{db_id}"
+    assert runs[0]["name"] == m._rds_docker_name(db_id)
     assert runs[0]["image"].endswith("postgres:16-alpine")
     assert runs[0]["environment"]["POSTGRES_USER"] == "admin"
     assert runs[0]["environment"]["POSTGRES_PASSWORD"] == "password123"
     assert runs[0]["environment"]["POSTGRES_DB"] == "mydb"
-    assert runs[0]["labels"] == {"ministack": "rds", "db_id": db_id}
+    assert runs[0]["labels"] == {
+        "ministack": "rds",
+        "db_id": db_id,
+        "account_id": get_account_id(),
+        "region": get_region(),
+    }
 
     restored = m._instances.get(db_id)
     assert restored is not None
@@ -1569,7 +1575,8 @@ def test_rds_restore_state_removes_stale_container_before_respawn(monkeypatch):
         def remove(self, **kwargs):
             removed.append(self.name)
 
-    stale = FakeContainer(name="ministack-rds-stale-db", container_id="cid-stale")
+    stale_name = m._rds_docker_name("stale-db")
+    stale = FakeContainer(name=stale_name, container_id="cid-stale")
 
     class FakeContainers:
         def get(self, name):
@@ -1577,7 +1584,7 @@ def test_rds_restore_state_removes_stale_container_before_respawn(monkeypatch):
             # called and `removed` is populated, subsequent .get()s for
             # the same name raise "not found" — mirrors real docker after
             # a successful force-remove.
-            if name == "ministack-rds-stale-db" and "ministack-rds-stale-db" not in removed:
+            if name == stale_name and stale_name not in removed:
                 return stale
             raise Exception("not found")
 
@@ -1616,9 +1623,86 @@ def test_rds_restore_state_removes_stale_container_before_respawn(monkeypatch):
     while time.time() < deadline and not runs:
         time.sleep(0.05)
 
-    assert "ministack-rds-stale-db" in removed, "stale container not removed"
+    assert stale_name in removed, "stale container not removed"
     assert runs, "fresh container not spawned after removing stale one"
-    assert runs[0]["name"] == "ministack-rds-stale-db"
+    assert runs[0]["name"] == stale_name
+
+    m._instances.clear()
+
+
+def test_rds_restore_state_preserves_legacy_persistent_volume_name(monkeypatch):
+    from ministack.services import rds as m
+
+    runs = []
+    removed = []
+
+    class FakeContainer:
+        def __init__(self, name):
+            self.id = "cid-fake"
+            self.name = name
+            self.attrs = {"NetworkSettings": {"Networks": {}}}
+
+        def reload(self): pass
+        def stop(self, timeout=2): pass
+        def remove(self, **kwargs):
+            removed.append(self.name)
+
+    class FakeContainers:
+        def __init__(self, legacy_name):
+            self.legacy_name = legacy_name
+
+        def get(self, name):
+            if name == self.legacy_name and name not in removed:
+                return FakeContainer(name)
+            raise Exception("not found")
+
+        def run(self, **kwargs):
+            runs.append(kwargs)
+            return FakeContainer(kwargs["name"])
+
+    class FakeDocker:
+        def __init__(self, legacy_name):
+            self.containers = FakeContainers(legacy_name)
+
+    monkeypatch.setattr(m, "RDS_PERSIST", True)
+    db_id = "legacy-volume-db"
+    legacy_container_name = m._legacy_rds_docker_name(db_id)
+    monkeypatch.setattr(m, "_get_docker", lambda: FakeDocker(legacy_container_name))
+    monkeypatch.setattr(m, "_get_ministack_network", lambda c: None)
+
+    persisted = {
+        "instances": {db_id: {
+            "DBInstanceIdentifier": db_id,
+            "Engine": "postgres",
+            "EngineVersion": "16.3",
+            "MasterUsername": "admin",
+            "_MasterUserPassword": "pw",
+            "DBName": "db",
+            "DBInstanceStatus": "available",
+            "Endpoint": {"Address": "localhost", "Port": 15501, "HostedZoneId": "Z"},
+        }},
+        "clusters": {}, "subnet_groups": {}, "param_groups": {},
+        "snapshots": {}, "db_cluster_param_groups": {},
+        "db_cluster_snapshots": {}, "option_groups": {},
+        "global_clusters": {}, "tags": {}, "port_counter": 15501,
+    }
+
+    m._instances.clear()
+    m.restore_state(persisted)
+
+    deadline = time.time() + 5
+    while time.time() < deadline and not runs:
+        time.sleep(0.05)
+
+    assert runs, "restore_state did not respawn the Docker container"
+    assert legacy_container_name in removed
+    assert runs[0]["volumes"] == {
+        m._legacy_rds_docker_volume_name(db_id): {
+            "bind": "/var/lib/postgresql/data",
+            "mode": "rw",
+        },
+    }
+    assert m._instances[db_id]["_docker_volume_name"] == m._legacy_rds_docker_volume_name(db_id)
 
     m._instances.clear()
 
@@ -1737,7 +1821,8 @@ def test_rds_respawn_falls_back_when_persisted_host_port_taken(monkeypatch):
 
     class FakeContainer:
         def __init__(self, name):
-            self.id = "cid-fake"; self.name = name
+            self.id = "cid-fake"
+            self.name = name
             self.attrs = {"NetworkSettings": {"Networks": {}}}
         def reload(self): pass
         def stop(self, timeout=2): pass
@@ -1814,7 +1899,8 @@ def test_rds_respawn_force_removes_stale_created_container(monkeypatch):
 
     class FakeContainer:
         def __init__(self, name):
-            self.id = "cid-fake"; self.name = name
+            self.id = "cid-fake"
+            self.name = name
             self.attrs = {"NetworkSettings": {"Networks": {}}}
         def reload(self): pass
         def stop(self, timeout=2): pass

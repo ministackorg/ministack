@@ -33,6 +33,7 @@ parameters.
 import contextvars
 import copy
 import datetime
+import hashlib
 import json
 import logging
 import os
@@ -44,7 +45,14 @@ from xml.sax.saxutils import escape as _esc
 
 from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.persistence import load_state
-from ministack.core.responses import AccountScopedDict, apply_image_prefix, get_account_id, get_region, new_uuid
+from ministack.core.responses import (
+    AccountRegionScopedDict,
+    AccountScopedDict,
+    apply_image_prefix,
+    get_account_id,
+    get_region,
+    new_uuid,
+)
 
 logger = logging.getLogger("rds")
 
@@ -54,14 +62,14 @@ RDS_TMPFS_SIZE = os.environ.get("RDS_TMPFS_SIZE", "256m")
 RDS_PERSIST = os.environ.get("RDS_PERSIST", "0").lower() in ("1", "true", "yes")
 DOCKER_NETWORK = os.environ.get("DOCKER_NETWORK", "")
 
-_instances = AccountScopedDict()
-_clusters = AccountScopedDict()
-_subnet_groups = AccountScopedDict()
-_param_groups = AccountScopedDict()
-_snapshots = AccountScopedDict()
-_db_cluster_param_groups = AccountScopedDict()
-_db_cluster_snapshots = AccountScopedDict()
-_option_groups = AccountScopedDict()
+_instances = AccountRegionScopedDict()
+_clusters = AccountRegionScopedDict()
+_subnet_groups = AccountRegionScopedDict()
+_param_groups = AccountRegionScopedDict()
+_snapshots = AccountRegionScopedDict()
+_db_cluster_param_groups = AccountRegionScopedDict()
+_db_cluster_snapshots = AccountRegionScopedDict()
+_option_groups = AccountRegionScopedDict()
 _global_clusters = AccountScopedDict()
 _tags = AccountScopedDict()
 _port_counter = [BASE_PORT]
@@ -109,20 +117,38 @@ def restore_state(data):
         _port_counter[0] = data["port_counter"]
     instances_data = data.get("instances", {})
     to_respawn = []
-    if isinstance(instances_data, AccountScopedDict):
-        # New format: AccountScopedDict with full multi-account data
+    if isinstance(instances_data, AccountRegionScopedDict):
         for key, inst in list(instances_data._data.items()):
+            account_id, region, instance_id = key
             inst["_docker_container_id"] = None
             inst["DBInstanceStatus"] = "creating"
+            if RDS_PERSIST:
+                inst.setdefault("_docker_volume_name", _rds_docker_volume_name(instance_id, account_id, region))
             _instances._data[key] = inst
-            to_respawn.append((key[0], inst.get("DBInstanceIdentifier") or key[1], inst))
+            to_respawn.append((account_id, region, instance_id, inst))
+    elif isinstance(instances_data, AccountScopedDict):
+        # Legacy account-scoped format: preserve the instance ARN region when available.
+        for key, inst in list(instances_data._data.items()):
+            account_id, instance_id = key
+            inst["_docker_container_id"] = None
+            inst["DBInstanceStatus"] = "creating"
+            region = _best_effort_region_from_record_arn(inst, "DBInstanceArn")
+            if RDS_PERSIST:
+                inst.setdefault("_docker_volume_name", _legacy_rds_docker_volume_name(instance_id))
+                inst["_legacy_docker_container_name"] = _legacy_rds_docker_name(instance_id)
+            _instances._data[(account_id, region, instance_id)] = inst
+            to_respawn.append((account_id, region, inst.get("DBInstanceIdentifier") or instance_id, inst))
     else:
         # Legacy format: plain dict keyed by instance name
         for name, inst in instances_data.items():
             inst["_docker_container_id"] = None
             inst["DBInstanceStatus"] = "creating"
-            _instances[name] = inst
-            to_respawn.append((None, name, inst))
+            region = _best_effort_region_from_record_arn(inst, "DBInstanceArn")
+            if RDS_PERSIST:
+                inst.setdefault("_docker_volume_name", _legacy_rds_docker_volume_name(name))
+                inst["_legacy_docker_container_name"] = _legacy_rds_docker_name(name)
+            _instances.set_scoped(get_account_id(), region, name, inst)
+            to_respawn.append((None, region, name, inst))
 
     # Re-spin backing containers for persisted instances. Mirrors the MWAA
     # restore pattern: persistence saves the instance metadata but the Docker
@@ -130,16 +156,54 @@ def restore_state(data):
     # to bring it back. Without this, restored instances stay marked
     # "available" with no running container, and StartDBInstance is
     # metadata-only so it can't recover them either.
-    from ministack.core.responses import _request_account_id
-    for account_id, db_id, inst in to_respawn:
+    from ministack.core.responses import _request_account_id, _request_region
+    for account_id, region, db_id, inst in to_respawn:
         ctx = contextvars.copy_context()
 
-        def _runner(account_id=account_id, db_id=db_id, inst=inst):
+        def _runner(account_id=account_id, region=region, db_id=db_id, inst=inst):
             if account_id is not None:
                 _request_account_id.set(account_id)
+            if region is not None:
+                _request_region.set(region)
             _start_rds_container_for_instance(db_id, inst)
 
         threading.Thread(target=ctx.run, args=(_runner,), daemon=True).start()
+
+
+def _best_effort_region_from_record_arn(record, field):
+    """Return a region while restoring legacy RDS state.
+
+    This is intentionally best-effort persistence migration logic, not request
+    validation.
+    """
+    arn = record.get(field, "") if isinstance(record, dict) else ""
+    try:
+        region = parse_arn(arn).region
+    except ArnParseError:
+        return get_region()
+    return region or get_region()
+
+
+def _rds_docker_scope(account_id=None, region=None):
+    account_id = account_id or get_account_id()
+    region = region or get_region()
+    return hashlib.sha1(f"{account_id}:{region}".encode()).hexdigest()[:12]
+
+
+def _rds_docker_name(db_id, account_id=None, region=None):
+    return f"ministack-rds-{_rds_docker_scope(account_id, region)}-{db_id}"
+
+
+def _rds_docker_volume_name(db_id, account_id=None, region=None):
+    return f"ministack-rds-{_rds_docker_scope(account_id, region)}-{db_id}-data"
+
+
+def _legacy_rds_docker_name(db_id):
+    return f"ministack-rds-{db_id}"
+
+
+def _legacy_rds_docker_volume_name(db_id):
+    return f"ministack-rds-{db_id}-data"
 
 
 def _start_rds_container_for_instance(db_id, instance):
@@ -147,9 +211,9 @@ def _start_rds_container_for_instance(db_id, instance):
 
     Reads engine, credentials, and endpoint info from the persisted instance
     dict instead of CreateDBInstance request params. If a container with the
-    deterministic name ``ministack-rds-{db_id}`` already exists (e.g. host
-    rebooted but Docker preserved stopped containers), it is removed first so
-    a clean run can attach to the persistent named volume. Sets
+    deterministic account+Region scoped name already exists (e.g. host rebooted
+    but Docker preserved stopped containers), it is removed first so a clean run
+    can attach to the persistent named volume. Sets
     ``DBInstanceStatus`` to ``available`` on success, ``failed`` on Docker
     error.
     """
@@ -189,32 +253,37 @@ def _start_rds_container_for_instance(db_id, instance):
         instance["DBInstanceStatus"] = "available"
         return
 
-    container_name = f"ministack-rds-{db_id}"
-    try:
-        existing = docker_client.containers.get(container_name)
-        # `force=True` stops AND removes in one shot, including
-        # half-spawned "Created" containers that didn't fully start
-        # — those still hold port mappings and would collide with
-        # the next `containers.run` (#692 follow-up: doodaz saw
-        # a `Created` container blocking the bind).
+    container_name = _rds_docker_name(db_id)
+    stale_names = [container_name]
+    legacy_container_name = instance.pop("_legacy_docker_container_name", None)
+    if legacy_container_name and legacy_container_name != container_name:
+        stale_names.append(legacy_container_name)
+    for stale_name in stale_names:
         try:
-            existing.remove(force=True, v=False)
-        except Exception as e:
-            logger.warning("RDS: failed to remove stale container %s: %s",
-                           container_name, e)
-        # Verify the name is actually free now; if removal silently
-        # failed, abort respawn rather than crash inside `containers.run`
-        # with a confusing name-conflict error.
-        try:
-            docker_client.containers.get(container_name)
-            logger.warning("RDS: stale container %s still present after "
-                           "force-remove — aborting respawn", container_name)
-            instance["DBInstanceStatus"] = "failed"
-            return
+            existing = docker_client.containers.get(stale_name)
+            # `force=True` stops AND removes in one shot, including
+            # half-spawned "Created" containers that didn't fully start
+            # — those still hold port mappings and would collide with
+            # the next `containers.run` (#692 follow-up: doodaz saw
+            # a `Created` container blocking the bind).
+            try:
+                existing.remove(force=True, v=False)
+            except Exception as e:
+                logger.warning("RDS: failed to remove stale container %s: %s",
+                               stale_name, e)
+            # Verify the name is actually free now; if removal silently
+            # failed, abort respawn rather than crash inside `containers.run`
+            # with a confusing name-conflict error.
+            try:
+                docker_client.containers.get(stale_name)
+                logger.warning("RDS: stale container %s still present after "
+                               "force-remove — aborting respawn", stale_name)
+                instance["DBInstanceStatus"] = "failed"
+                return
+            except Exception:
+                pass  # Good — name is gone.
         except Exception:
-            pass  # Good — name is gone.
-    except Exception:
-        pass  # No existing container with that name — fine
+            pass  # No existing container with that name — fine
 
     ms_network = _get_ministack_network(docker_client)
     container_kwargs = dict(
@@ -222,13 +291,20 @@ def _start_rds_container_for_instance(db_id, instance):
         environment=env_vars,
         ports={f"{container_port}/tcp": host_port},
         name=container_name,
-        labels={"ministack": "rds", "db_id": db_id},
+        labels={
+            "ministack": "rds",
+            "db_id": db_id,
+            "account_id": get_account_id(),
+            "region": get_region(),
+        },
     )
     if ms_network:
         container_kwargs["network"] = ms_network
     if RDS_PERSIST:
+        volume_name = instance.get("_docker_volume_name") or _rds_docker_volume_name(db_id)
+        instance["_docker_volume_name"] = volume_name
         container_kwargs["volumes"] = {
-            f"ministack-rds-{db_id}-data": {"bind": data_path, "mode": "rw"},
+            volume_name: {"bind": data_path, "mode": "rw"},
         }
     else:
         container_kwargs["tmpfs"] = {
@@ -590,6 +666,32 @@ def _parse_rds_arn(value):
     return spec, resource_type, resource_id
 
 
+def _regional_get(store, identifier, resource_type):
+    parsed = _parse_rds_arn(identifier)
+    if parsed:
+        spec, parsed_type, resource_id = parsed
+        if parsed_type != resource_type:
+            return None
+        if spec.account_id != get_account_id():
+            return None
+        return store.get_scoped(spec.account_id, spec.region, resource_id)
+    return store.get(identifier)
+
+
+def _request_region_get(store, identifier, resource_type):
+    parsed = _parse_rds_arn(identifier)
+    if parsed:
+        spec, parsed_type, resource_id = parsed
+        if parsed_type != resource_type:
+            return None
+        if spec.account_id != get_account_id():
+            return None
+        if spec.region != get_region():
+            return None
+        return store.get(resource_id)
+    return store.get(identifier)
+
+
 def _request_region_identifier(identifier, resource_type, store=None, arn_key=None):
     resource_id = _request_region_resource_identifier(identifier, resource_type)
     if resource_id is None:
@@ -689,9 +791,19 @@ def _resource_not_found_error_for_arn(identifier):
 
 
 def _resolve_cluster(cluster_id):
-    """Look up a DB cluster by identifier or same-region ARN."""
-    cluster_id = _request_region_identifier(cluster_id, "cluster", _clusters, "DBClusterArn")
-    return _clusters.get(cluster_id) if cluster_id is not None else None
+    """Look up a DB cluster by identifier in the request Region or by ARN Region.
+
+    Use this only for data-plane or global-topology operations whose AWS
+    semantics intentionally follow same-account member ARNs across Regions.
+    Normal regional control-plane APIs should use
+    ``_resolve_cluster_in_request_region``.
+    """
+    return _regional_get(_clusters, cluster_id, "cluster")
+
+
+def _resolve_cluster_in_request_region(cluster_id):
+    """Look up a DB cluster only in the request Region."""
+    return _request_region_get(_clusters, cluster_id, "cluster")
 
 
 def _resolve_instance(db_id):
@@ -700,8 +812,7 @@ def _resolve_instance(db_id):
     AWS accepts either value for the DBInstanceIdentifier parameter in
     DescribeDBInstances and related APIs.
     """
-    db_id = _request_region_identifier(db_id, "db", _instances, "DBInstanceArn")
-    inst = _instances.get(db_id)
+    inst = _request_region_get(_instances, db_id, "db")
     if inst:
         return inst
     if isinstance(db_id, str) and db_id.startswith("db-"):
@@ -736,7 +847,7 @@ def _register_instance_in_cluster(instance):
     cid = instance.get("DBClusterIdentifier")
     if not cid:
         return
-    cluster = _clusters.get(cid)
+    cluster = _resolve_cluster_in_request_region(cid)
     if not cluster:
         return
     members = cluster.setdefault("DBClusterMembers", [])
@@ -783,7 +894,7 @@ def _create_db_instance(p):
 
     # Inherit credentials from cluster when instance is a cluster member.
     cluster_id_param = _p(p, "DBClusterIdentifier")
-    parent = _resolve_cluster(cluster_id_param) if cluster_id_param else None
+    parent = _resolve_cluster_in_request_region(cluster_id_param) if cluster_id_param else None
     if parent:
         cluster_id_param = parent["DBClusterIdentifier"]
         if not _p(p, "MasterUsername"):
@@ -809,6 +920,7 @@ def _create_db_instance(p):
     endpoint_port = port
     host_port = None
     docker_container_id = None
+    docker_volume_name = None
     internal_host = None
     internal_port = None
     real_container_started = False
@@ -833,8 +945,13 @@ def _create_db_instance(p):
                     image=image, detach=True,
                     environment=env,
                     ports={f"{container_port}/tcp": host_port},
-                    name=f"ministack-rds-{db_id}",
-                    labels={"ministack": "rds", "db_id": db_id},
+                    name=_rds_docker_name(db_id),
+                    labels={
+                        "ministack": "rds",
+                        "db_id": db_id,
+                        "account_id": get_account_id(),
+                        "region": get_region(),
+                    },
                 )
                 if ms_network:
                     container_kwargs["network"] = ms_network
@@ -843,8 +960,9 @@ def _create_db_instance(p):
                 # is harmless but wasteful and complicates the Postgres 18+
                 # layout change (where the path differs from earlier majors).
                 if RDS_PERSIST:
+                    docker_volume_name = _rds_docker_volume_name(db_id)
                     container_kwargs["volumes"] = {
-                        f"ministack-rds-{db_id}-data": {"bind": data_path, "mode": "rw"},
+                        docker_volume_name: {"bind": data_path, "mode": "rw"},
                     }
                 else:
                     container_kwargs["tmpfs"] = {
@@ -980,6 +1098,7 @@ def _create_db_instance(p):
         "IsStorageConfigUpgradeAvailable": False,
         "MultiTenant": False,
         "_docker_container_id": docker_container_id,
+        "_docker_volume_name": docker_volume_name,
         "_internal_address": internal_host,
         "_internal_port": internal_port,
         "_MasterUserPassword": master_pass,
@@ -1502,7 +1621,7 @@ def _create_db_cluster(p):
 
 def _delete_db_cluster(p):
     cluster_id = _p(p, "DBClusterIdentifier")
-    cluster = _resolve_cluster(cluster_id)
+    cluster = _resolve_cluster_in_request_region(cluster_id)
     if not cluster:
         wrong_region = _invalid_cluster_identifier_error(cluster_id)
         if wrong_region:
@@ -1528,7 +1647,7 @@ def _delete_db_cluster(p):
 def _describe_db_clusters(p):
     cluster_id = _p(p, "DBClusterIdentifier")
     if cluster_id:
-        cluster = _resolve_cluster(cluster_id)
+        cluster = _resolve_cluster_in_request_region(cluster_id)
         if not cluster:
             wrong_region = _invalid_region_arn_error(cluster_id, "DBClusterIdentifier")
             if wrong_region:
@@ -1582,7 +1701,7 @@ def _rotate_real_password(cluster, old_pass, new_pass):
 
 def _modify_db_cluster(p):
     cluster_id = _p(p, "DBClusterIdentifier")
-    cluster = _resolve_cluster(cluster_id)
+    cluster = _resolve_cluster_in_request_region(cluster_id)
     if not cluster:
         wrong_region = _invalid_cluster_identifier_error(cluster_id)
         if wrong_region:
@@ -2132,7 +2251,7 @@ def _create_db_cluster_snapshot(p):
         return _error("DBClusterSnapshotAlreadyExistsFault",
             f"DB cluster snapshot {snap_id} already exists.", 400)
 
-    cluster = _resolve_cluster(cluster_id)
+    cluster = _resolve_cluster_in_request_region(cluster_id)
     if not cluster:
         wrong_region = _invalid_region_arn_error(cluster_id, "DBClusterIdentifier")
         if wrong_region:
@@ -2252,7 +2371,7 @@ def _modify_subnet_group(p):
 
 def _start_db_cluster(p):
     cluster_id = _p(p, "DBClusterIdentifier")
-    cluster = _resolve_cluster(cluster_id)
+    cluster = _resolve_cluster_in_request_region(cluster_id)
     if not cluster:
         wrong_region = _invalid_cluster_identifier_error(cluster_id)
         if wrong_region:
@@ -2265,7 +2384,7 @@ def _start_db_cluster(p):
 
 def _stop_db_cluster(p):
     cluster_id = _p(p, "DBClusterIdentifier")
-    cluster = _resolve_cluster(cluster_id)
+    cluster = _resolve_cluster_in_request_region(cluster_id)
     if not cluster:
         wrong_region = _invalid_cluster_identifier_error(cluster_id)
         if wrong_region:
@@ -2499,7 +2618,7 @@ def _create_global_cluster(p):
 
     source_cluster = None
     if source_cluster_id:
-        source_cluster = _resolve_cluster(source_cluster_id)
+        source_cluster = _resolve_cluster_in_request_region(source_cluster_id)
         if not source_cluster:
             wrong_region = _invalid_region_arn_error(
                 source_cluster_id,
@@ -3403,7 +3522,7 @@ _ACTION_MAP = {
 def reset():
     docker_client = _get_docker()
     if docker_client:
-        for instance in _instances.values():
+        for instance in _instances.all_values():
             cid = instance.get("_docker_container_id")
             if cid:
                 try:

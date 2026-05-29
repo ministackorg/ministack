@@ -11,7 +11,7 @@ import threading
 import uuid
 
 from ministack.core.arn import ArnParseError, parse_arn
-from ministack.core.responses import AccountScopedDict, error_response_json, json_response
+from ministack.core.responses import AccountScopedDict, error_response_json, get_account_id, json_response
 
 logger = logging.getLogger("rds-data")
 
@@ -69,17 +69,14 @@ def _stub_success():
 
 
 def _cluster_id_from_arn(resource_arn):
-    """Extract cluster identifier from an ARN."""
+    """Return a stable, region-qualified key for per-cluster stub state."""
     try:
         spec = parse_arn(resource_arn)
     except ArnParseError:
         return resource_arn
-    if spec.service != "rds":
-        return resource_arn
-    _resource_type, sep, resource_id = spec.resource.partition(":")
-    if not sep:
-        return resource_arn
-    return resource_id
+    if spec.service == "rds":
+        return f"{spec.account_id}:{spec.region}:{spec.resource}"
+    return resource_arn
 
 
 _CREATE_DB_RE = re.compile(
@@ -233,9 +230,11 @@ def _resolve_cluster(resource_arn):
     if not parsed:
         return None, None
 
-    _spec, resource_type, _resource_id = parsed
+    spec, resource_type, resource_id = parsed
     if resource_type == "db":
-        instance = rds._resolve_instance(resource_arn)
+        if spec.account_id != get_account_id():
+            return None, None
+        instance = rds._instances.get_scoped(spec.account_id, spec.region, resource_id)
         if instance:
             return instance, instance.get("Engine", "postgres")
         return None, None
@@ -251,7 +250,7 @@ def _resolve_cluster(resource_arn):
     cluster_id = cluster["DBClusterIdentifier"]
 
     # Find an instance belonging to this cluster
-    for inst in rds._instances.values():
+    for inst in rds._instances.values_scoped(spec.account_id, spec.region):
         if inst.get("DBClusterIdentifier") == cluster_id:
             return inst, engine
 

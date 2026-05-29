@@ -143,31 +143,58 @@ def test_execute_nonexistent_cluster():
     assert "not found" in body.get("message", body.get("Message", "")).lower()
 
 
-def test_execute_rejects_foreign_region_cluster_arn():
-    """ExecuteStatement should not resolve a cluster ARN from another region."""
-    west = _regional_client("rds", "us-west-2")
-    cluster_id = f"rds-data-foreign-region-{uuid.uuid4().hex[:8]}"
+def test_rds_data_resolves_cluster_arn_by_arn_region(rds, sm):
+    east_rds = _regional_client("rds", "us-east-1")
+    west_rds = _regional_client("rds", "us-west-2")
+    east_data = _regional_client("rds-data", "us-east-1")
+    cluster_id = f"rds-data-region-{uuid.uuid4().hex[:8]}"
+    secret_arn = sm.create_secret(
+        Name=f"rds-data-region-secret-{uuid.uuid4().hex[:8]}",
+        SecretString='{"username":"admin","password":"testpass123"}',
+    )["ARN"]
 
     try:
-        cluster = west.create_db_cluster(
+        east_rds.create_db_cluster(
             DBClusterIdentifier=cluster_id,
             Engine="aurora-mysql",
             MasterUsername="admin",
-            MasterUserPassword="password123",
-        )["DBCluster"]
+            MasterUserPassword="testpass123",
+        )
+        west_rds.create_db_cluster(
+            DBClusterIdentifier=cluster_id,
+            Engine="aurora-mysql",
+            MasterUsername="admin",
+            MasterUserPassword="testpass123",
+        )
+        east_arn = east_rds.describe_db_clusters(DBClusterIdentifier=cluster_id)["DBClusters"][0]["DBClusterArn"]
+        west_arn = west_rds.describe_db_clusters(DBClusterIdentifier=cluster_id)["DBClusters"][0]["DBClusterArn"]
 
-        status, body = _raw_post("/Execute", {
-            "resourceArn": cluster["DBClusterArn"],
-            "secretArn": FAKE_SECRET_ARN,
-            "sql": "SELECT 1",
-        })
-        assert status == 400
-        assert "not found" in body.get("message", body.get("Message", "")).lower()
+        east_data.execute_statement(
+            resourceArn=west_arn,
+            secretArn=secret_arn,
+            sql="CREATE DATABASE west_only_db",
+        )
+        east_resp = east_data.execute_statement(
+            resourceArn=east_arn,
+            secretArn=secret_arn,
+            sql="SHOW DATABASES",
+        )
+        west_resp = east_data.execute_statement(
+            resourceArn=west_arn,
+            secretArn=secret_arn,
+            sql="SHOW DATABASES",
+        )
+
+        east_names = [r[0]["stringValue"] for r in east_resp.get("records", [])]
+        west_names = [r[0]["stringValue"] for r in west_resp.get("records", [])]
+        assert "west_only_db" not in east_names
+        assert "west_only_db" in west_names
     finally:
-        try:
-            west.delete_db_cluster(DBClusterIdentifier=cluster_id, SkipFinalSnapshot=True)
-        except ClientError:
-            pass
+        for client in (east_rds, west_rds):
+            try:
+                client.delete_db_cluster(DBClusterIdentifier=cluster_id, SkipFinalSnapshot=True)
+            except ClientError:
+                pass
 
 
 def test_execute_rejects_foreign_account_cluster_arn():
@@ -199,15 +226,98 @@ def test_execute_rejects_foreign_account_cluster_arn():
             pass
 
 
-def test_cluster_id_from_arn_preserves_colon_resource_tail():
+def test_cluster_id_from_arn_includes_account_region_and_resource_tail():
     from ministack.services import rds_data
 
     assert (
         rds_data._cluster_id_from_arn(
             "arn:aws:rds:us-east-1:000000000000:cluster:cluster-id:tail",
         )
-        == "cluster-id:tail"
+        == "000000000000:us-east-1:cluster:cluster-id:tail"
     )
+
+
+def test_rds_data_member_lookup_uses_resource_arn_region():
+    from ministack.core.responses import (
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+    from ministack.services import rds, rds_data
+
+    original_account = get_account_id()
+    original_region = get_region()
+    cluster_id = f"rds-data-member-{uuid.uuid4().hex[:8]}"
+    east_arn = f"arn:aws:rds:us-east-1:{ACCOUNT_ID}:cluster:{cluster_id}"
+    west_arn = f"arn:aws:rds:us-west-2:{ACCOUNT_ID}:cluster:{cluster_id}"
+    east_instance = {
+        "DBInstanceIdentifier": f"{cluster_id}-east",
+        "DBClusterIdentifier": cluster_id,
+        "Engine": "aurora-mysql",
+        "Endpoint": {"Address": "east.example", "Port": 3306},
+    }
+    west_instance = {
+        "DBInstanceIdentifier": f"{cluster_id}-west",
+        "DBClusterIdentifier": cluster_id,
+        "Engine": "aurora-mysql",
+        "Endpoint": {"Address": "west.example", "Port": 3306},
+    }
+
+    try:
+        set_request_account_id(ACCOUNT_ID)
+        rds.reset()
+        rds._clusters.set_scoped(
+            ACCOUNT_ID,
+            "us-east-1",
+            cluster_id,
+            {"DBClusterIdentifier": cluster_id, "DBClusterArn": east_arn, "Engine": "aurora-mysql"},
+        )
+        rds._clusters.set_scoped(
+            ACCOUNT_ID,
+            "us-west-2",
+            cluster_id,
+            {"DBClusterIdentifier": cluster_id, "DBClusterArn": west_arn, "Engine": "aurora-mysql"},
+        )
+        rds._instances.set_scoped(ACCOUNT_ID, "us-east-1", east_instance["DBInstanceIdentifier"], east_instance)
+        rds._instances.set_scoped(ACCOUNT_ID, "us-west-2", west_instance["DBInstanceIdentifier"], west_instance)
+
+        set_request_region("us-east-1")
+        instance, engine = rds_data._resolve_cluster(west_arn)
+
+        assert instance is west_instance
+        assert engine == "aurora-mysql"
+    finally:
+        rds.reset()
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
+def test_rds_data_db_arn_lookup_rejects_foreign_account():
+    from ministack.core.responses import (
+        get_account_id,
+        set_request_account_id,
+    )
+    from ministack.services import rds, rds_data
+
+    original_account = get_account_id()
+    db_id = f"rds-data-db-{uuid.uuid4().hex[:8]}"
+    db_arn = f"arn:aws:rds:us-east-1:111111111111:db:{db_id}"
+    instance = {
+        "DBInstanceIdentifier": db_id,
+        "Engine": "aurora-mysql",
+        "Endpoint": {"Address": "foreign.example", "Port": 3306},
+    }
+
+    try:
+        rds.reset()
+        rds._instances.set_scoped("111111111111", "us-east-1", db_id, instance)
+        set_request_account_id(ACCOUNT_ID)
+
+        assert rds_data._resolve_cluster(db_arn) == (None, None)
+    finally:
+        rds.reset()
+        set_request_account_id(original_account)
 
 
 def test_begin_transaction_nonexistent_cluster():
@@ -500,7 +610,10 @@ def test_rds_data_non_container_endpoint_keeps_stub_mode(monkeypatch):
 
     assert status == 200
     assert payload["records"] == []
-    assert "stub_user" in rds_data._stub_users.get("stub-cluster", set())
+    assert "stub_user" in rds_data._stub_users.get(
+        rds_data._cluster_id_from_arn(resource_arn),
+        set(),
+    )
 
 
 def test_rds_data_lock_wait_timeout_is_not_connection_error():
