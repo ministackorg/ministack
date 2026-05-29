@@ -988,7 +988,10 @@ async def handle_request(method, path, headers, body, query_params):
             return handler(data, account_id) if "account_id" in handler.__code__.co_varnames else handler(data)
     except Exception as e:
         logger.exception("Error handling %s: %s", path, e)
-        return error_response_json("InternalServerError", str(e), 500)
+        # Don't surface the Python exception text — AWS InternalServerError
+        # responses don't leak internal exception details.
+        return error_response_json("InternalServerError",
+            "An internal server error occurred.", 500)
 
 
 def get_state():

@@ -4564,7 +4564,8 @@ def test_dynamodb_put_item_nonexistent_table_canonical(ddb):
     with pytest.raises(ClientError) as e:
         ddb.put_item(TableName="does-not-exist-pi-xyz", Item={"pk": {"S": "k"}})
     assert e.value.response["Error"]["Code"] == "ResourceNotFoundException"
-    assert "non-existent table" in e.value.response["Error"]["Message"].lower()
+    # AWS-canonical message (dynamodb-conformance.org capture).
+    assert e.value.response["Error"]["Message"] == "Requested resource not found"
 
 
 def test_dynamodb_get_item_nonexistent_table_canonical(ddb):
