@@ -3377,6 +3377,81 @@ def test_apigatewayv1_plain_lambda_name_uses_api_owner_region(monkeypatch):
         set_request_region(original_region)
 
 
+def test_alb_plain_lambda_target_uses_target_group_region(monkeypatch):
+    """ALB Lambda target names resolve in the target group's owning Region."""
+    from ministack.services import alb as _alb
+
+    account_id = "000000000000"
+    region = "us-west-2"
+    function_name = f"alb-plain-region-{_uuid_mod.uuid4().hex}"
+    expected_arn = _install_region_scoped_lambda(function_name, region, account_id)
+    target_group_arn = f"arn:aws:elasticloadbalancing:{region}:{account_id}:targetgroup/test/abc123"
+    original_account = get_account_id()
+    original_region = get_region()
+    captured = {}
+
+    def _fake_execute(exec_record, event):
+        captured["arn"] = exec_record["config"]["FunctionArn"]
+        return {"body": {"statusCode": 209, "headers": {}, "body": "alb-ok"}}
+
+    monkeypatch.setattr(lsvc, "_execute_function_with_config_scope", _fake_execute)
+    monkeypatch.setattr(lsvc, "_emit_lambda_metrics", lambda *args, **kwargs: None)
+    set_request_account_id(account_id)
+    set_request_region("us-east-1")
+    try:
+        status, _headers, body = asyncio.run(_alb._invoke_lambda_target(
+            function_name,
+            target_group_arn,
+            "GET",
+            "/test",
+            {},
+            b"",
+            {},
+        ))
+        assert status == 209
+        assert body == b"alb-ok"
+        assert captured["arn"] == expected_arn
+    finally:
+        _remove_region_scoped_lambda(function_name, region, account_id)
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
+def test_alb_lambda_target_preserves_plain_json_payload(monkeypatch):
+    """ALB Lambda targets keep non-proxy JSON returns as response bodies."""
+    from ministack.services import alb as _alb
+
+    account_id = "000000000000"
+    region = "us-west-2"
+    function_name = f"alb-json-payload-{_uuid_mod.uuid4().hex}"
+    _install_region_scoped_lambda(function_name, region, account_id)
+    target_group_arn = f"arn:aws:elasticloadbalancing:{region}:{account_id}:targetgroup/test/abc123"
+    original_account = get_account_id()
+    original_region = get_region()
+
+    monkeypatch.setattr(lsvc, "_execute_function_with_config_scope", lambda _exec_record, _event: {"body": {"ok": True}})
+    monkeypatch.setattr(lsvc, "_emit_lambda_metrics", lambda *args, **kwargs: None)
+    set_request_account_id(account_id)
+    set_request_region("us-east-1")
+    try:
+        status, headers, body = asyncio.run(_alb._invoke_lambda_target(
+            function_name,
+            target_group_arn,
+            "GET",
+            "/test",
+            {},
+            b"",
+            {},
+        ))
+        assert status == 200
+        assert headers == {}
+        assert json.loads(body) == {"ok": True}
+    finally:
+        _remove_region_scoped_lambda(function_name, region, account_id)
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
 # ──────────────────────────────── pool key ──────────────────────────────────
 
 def _pool_config(account_id: str, function_name: str = "fn", **overrides):
