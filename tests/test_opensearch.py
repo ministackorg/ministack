@@ -253,6 +253,29 @@ def test_opensearch_list_versions_includes_recent(os_client):
     assert "Elasticsearch_7.10" in versions
 
 
+def test_opensearch_list_versions_includes_current_aws_set(os_client):
+    """Engine versions AWS OpenSearch Service currently supports for new
+    domains, per the developer-guide ``what-is`` page."""
+    versions = os_client.list_versions()["Versions"]
+    for v in (
+        "OpenSearch_3.5", "OpenSearch_3.3", "OpenSearch_3.1",
+        "OpenSearch_2.19", "OpenSearch_2.17",
+    ):
+        assert v in versions, f"missing {v}"
+
+
+def test_opensearch_default_version_is_latest_opensearch(os_client):
+    """Domains created without an explicit EngineVersion get the latest
+    OpenSearch major.minor AWS currently ships."""
+    name = f"defver-{_uid()}"
+    os_client.create_domain(DomainName=name)
+    try:
+        d = os_client.describe_domain(DomainName=name)["DomainStatus"]
+        assert d["EngineVersion"] == "OpenSearch_3.5"
+    finally:
+        os_client.delete_domain(DomainName=name)
+
+
 def test_opensearch_get_compatible_versions_for_domain(os_client):
     name = f"compat-{_uid()}"
     os_client.create_domain(DomainName=name, EngineVersion="OpenSearch_2.11")

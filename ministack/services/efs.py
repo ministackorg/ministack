@@ -294,7 +294,18 @@ def _delete_access_point(ap_id):
 def _tag_resource(resource_id, body):
     resource = _find_resource(resource_id)
     if resource is None:
-        return _error(404, "ResourceNotFound", f"Resource '{resource_id}' does not exist.")
+        # Per AWS EFS docs the resource-not-found error is keyed by the
+        # resource type — FileSystemNotFound for fs-* / file-system ARNs,
+        # AccessPointNotFound for fsap-* / access-point ARNs. Falling back
+        # to BadRequest for anything else matches the EFS regex on ResourceId.
+        if resource_id.startswith("fs-") or "file-system/fs-" in resource_id:
+            return _error(404, "FileSystemNotFound",
+                f"File system '{resource_id}' does not exist.")
+        if resource_id.startswith("fsap-") or "access-point/fsap-" in resource_id:
+            return _error(404, "AccessPointNotFound",
+                f"Access point '{resource_id}' does not exist.")
+        return _error(400, "BadRequest",
+            f"Resource id '{resource_id}' is not a valid EFS resource.")
     tags = body.get("Tags", [])
     existing = {t["Key"]: i for i, t in enumerate(resource.get("Tags", []))}
     tag_list = resource.setdefault("Tags", [])
@@ -310,7 +321,18 @@ def _tag_resource(resource_id, body):
 def _untag_resource(resource_id, keys):
     resource = _find_resource(resource_id)
     if resource is None:
-        return _error(404, "ResourceNotFound", f"Resource '{resource_id}' does not exist.")
+        # Per AWS EFS docs the resource-not-found error is keyed by the
+        # resource type — FileSystemNotFound for fs-* / file-system ARNs,
+        # AccessPointNotFound for fsap-* / access-point ARNs. Falling back
+        # to BadRequest for anything else matches the EFS regex on ResourceId.
+        if resource_id.startswith("fs-") or "file-system/fs-" in resource_id:
+            return _error(404, "FileSystemNotFound",
+                f"File system '{resource_id}' does not exist.")
+        if resource_id.startswith("fsap-") or "access-point/fsap-" in resource_id:
+            return _error(404, "AccessPointNotFound",
+                f"Access point '{resource_id}' does not exist.")
+        return _error(400, "BadRequest",
+            f"Resource id '{resource_id}' is not a valid EFS resource.")
     resource["Tags"] = [t for t in resource.get("Tags", []) if t["Key"] not in keys]
     return _json(200, {})
 
@@ -318,7 +340,18 @@ def _untag_resource(resource_id, keys):
 def _list_tags_for_resource(resource_id):
     resource = _find_resource(resource_id)
     if resource is None:
-        return _error(404, "ResourceNotFound", f"Resource '{resource_id}' does not exist.")
+        # Per AWS EFS docs the resource-not-found error is keyed by the
+        # resource type — FileSystemNotFound for fs-* / file-system ARNs,
+        # AccessPointNotFound for fsap-* / access-point ARNs. Falling back
+        # to BadRequest for anything else matches the EFS regex on ResourceId.
+        if resource_id.startswith("fs-") or "file-system/fs-" in resource_id:
+            return _error(404, "FileSystemNotFound",
+                f"File system '{resource_id}' does not exist.")
+        if resource_id.startswith("fsap-") or "access-point/fsap-" in resource_id:
+            return _error(404, "AccessPointNotFound",
+                f"Access point '{resource_id}' does not exist.")
+        return _error(400, "BadRequest",
+            f"Resource id '{resource_id}' is not a valid EFS resource.")
     return _json(200, {"Tags": resource.get("Tags", [])})
 
 

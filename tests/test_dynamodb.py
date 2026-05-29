@@ -4379,7 +4379,12 @@ def test_dynamodb_list_tags_unknown_arn_rejected(ddb):
     fake = "arn:aws:dynamodb:us-east-1:000000000000:table/does-not-exist-tag-XX"
     with pytest.raises(ClientError) as e:
         ddb.list_tags_of_resource(ResourceArn=fake)
-    assert e.value.response["Error"]["Code"] == "ResourceNotFoundException"
+    # AWS-canonical (dynamodb-conformance.org capture): ListTagsOfResource on
+    # a syntactically-valid but non-existent ARN returns AccessDeniedException
+    # (security through obscurity — the API doesn't reveal whether the
+    # resource exists). Other tag ops (TagResource, UntagResource) still use
+    # ResourceNotFoundException since those mutate by ARN.
+    assert e.value.response["Error"]["Code"] == "AccessDeniedException"
 
 
 def test_dynamodb_ttl_empty_attribute_name_rejected(ddb):
@@ -4564,7 +4569,8 @@ def test_dynamodb_put_item_nonexistent_table_canonical(ddb):
     with pytest.raises(ClientError) as e:
         ddb.put_item(TableName="does-not-exist-pi-xyz", Item={"pk": {"S": "k"}})
     assert e.value.response["Error"]["Code"] == "ResourceNotFoundException"
-    assert "non-existent table" in e.value.response["Error"]["Message"].lower()
+    # AWS-canonical message (dynamodb-conformance.org capture).
+    assert e.value.response["Error"]["Message"] == "Requested resource not found"
 
 
 def test_dynamodb_get_item_nonexistent_table_canonical(ddb):

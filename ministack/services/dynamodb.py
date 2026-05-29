@@ -249,9 +249,13 @@ def _validate_attribute_value(attr_name: str, value: dict) -> tuple | None:
                 f"The parameter cannot be converted to a numeric value: {vval}", 400)
         value["N"] = canon
     elif vtype == "B":
-        if not isinstance(vval, (str, bytes)) or not vval:
+        # Per AWS docs: "An attribute value can be an empty string or empty
+        # binary value if the attribute is not used for a table or index key."
+        # The key-specific empty-binary rejection is enforced separately at
+        # PutItem / UpdateItem level, so accept empty binary for non-key here.
+        if not isinstance(vval, (str, bytes)):
             return error_response_json("ValidationException",
-                "One or more parameter values were invalid: Binary attribute value is empty", 400)
+                "One or more parameter values were invalid: Binary attribute value type mismatch", 400)
     elif vtype == "BOOL":
         if not isinstance(vval, bool):
             return error_response_json("ValidationException",
@@ -259,14 +263,14 @@ def _validate_attribute_value(attr_name: str, value: dict) -> tuple | None:
     elif vtype == "NULL":
         if vval is not True:
             return error_response_json("ValidationException",
-                "One or more parameter values were invalid: Null attribute value must be true", 400)
+                "One or more parameter values were invalid: NULL attribute value must be true.", 400)
     elif vtype == "SS":
         if not isinstance(vval, list) or not vval:
             return error_response_json("ValidationException",
                 "One or more parameter values were invalid: An string set  may not be empty", 400)
         if len(set(vval)) != len(vval):
             return error_response_json("ValidationException",
-                "Input collection contains duplicates", 400)
+                "One or more parameter values were invalid: Input collection contains duplicates", 400)
         for s in vval:
             if not isinstance(s, str) or s == "":
                 return error_response_json("ValidationException",
@@ -284,14 +288,14 @@ def _validate_attribute_value(attr_name: str, value: dict) -> tuple | None:
                     f"The parameter cannot be converted to a numeric value: {n}", 400)
             if canon in seen:
                 return error_response_json("ValidationException",
-                    "Input collection contains duplicates", 400)
+                    "One or more parameter values were invalid: Input collection contains duplicates", 400)
             seen.add(canon)
             new_vals.append(canon)
         value["NS"] = new_vals
     elif vtype == "BS":
         if not isinstance(vval, list) or not vval:
             return error_response_json("ValidationException",
-                "One or more parameter values were invalid: An binary set  may not be empty", 400)
+                "One or more parameter values were invalid: Binary sets should not be empty", 400)
         seen = set()
         for b in vval:
             key = b if isinstance(b, str) else (b.decode("latin-1") if isinstance(b, bytes) else None)
@@ -300,7 +304,7 @@ def _validate_attribute_value(attr_name: str, value: dict) -> tuple | None:
                     "One or more parameter values were invalid: Binary set element may not be empty", 400)
             if key in seen:
                 return error_response_json("ValidationException",
-                    "Input collection contains duplicates", 400)
+                    "One or more parameter values were invalid: Input collection contains duplicates", 400)
             seen.add(key)
     elif vtype == "L":
         if not isinstance(vval, list):
@@ -768,20 +772,25 @@ def _validate_key_schema(key_schema: list, attr_defs: list, context: str = "tabl
         return error_response_json("ValidationException",
             "1 validation error detected: Value null at 'keySchema' failed to satisfy constraint: Member must not be null", 400)
     if not isinstance(key_schema, list) or len(key_schema) == 0 or len(key_schema) > 2:
+        # AWS-canonical (dynamodb-conformance.org capture).
         return error_response_json("ValidationException",
-            "1 validation error detected: KeySchema must contain 1 or 2 elements", 400)
+            f"1 validation error detected: Value '{key_schema}' at 'keySchema' failed to satisfy constraint: Member must have length less than or equal to 2", 400)
     hash_count = 0
     range_count = 0
     seen_names = set()
     for ks in key_schema:
         attr = ks.get("AttributeName")
         kt = ks.get("KeyType")
-        if not attr or kt not in _VALID_KEY_TYPES:
+        if not attr:
             return error_response_json("ValidationException",
-                f"1 validation error detected: KeySchema element invalid: {ks}", 400)
+                "1 validation error detected: Value null at 'keySchema.member.attributeName' failed to satisfy constraint: Member must not be null", 400)
+        if kt not in _VALID_KEY_TYPES:
+            return error_response_json("ValidationException",
+                f"1 validation error detected: Value '{kt}' at 'keySchema.{len(seen_names)+1}.member.keyType' failed to satisfy constraint: Member must satisfy enum value set: [HASH, RANGE]", 400)
         if attr in seen_names:
+            # AWS-canonical: duplicate-attribute-in-KeySchema rejection.
             return error_response_json("ValidationException",
-                f"Two keys cannot have the same name: {attr}", 400)
+                f"Invalid KeySchema: Some index key attributes are repeated. RepeatedKeyElement: {attr}", 400)
         seen_names.add(attr)
         if kt == "HASH":
             hash_count += 1
@@ -842,12 +851,12 @@ def _create_table(data):
     billing_mode = data.get("BillingMode", "PROVISIONED")
     if billing_mode not in _VALID_BILLING_MODES:
         return error_response_json("ValidationException",
-            f"1 validation error detected: Value '{billing_mode}' at 'billingMode' failed to satisfy constraint: Member must satisfy enum value set: {sorted(_VALID_BILLING_MODES)}", 400)
+            f"1 validation error detected: Value '{billing_mode}' at 'billingMode' failed to satisfy constraint: Member must satisfy enum value set: [PROVISIONED, PAY_PER_REQUEST]", 400)
     # TableClass validation.
     table_class = data.get("TableClass")
     if table_class is not None and table_class not in _VALID_TABLE_CLASSES:
         return error_response_json("ValidationException",
-            f"1 validation error detected: Value '{table_class}' at 'tableClass' failed to satisfy constraint: Member must satisfy enum value set: {sorted(_VALID_TABLE_CLASSES)}", 400)
+            f"1 validation error detected: Value '{table_class}' at 'tableClass' failed to satisfy constraint: Member must satisfy enum value set: [STANDARD, STANDARD_INFREQUENT_ACCESS]", 400)
     # ProvisionedThroughput required when PROVISIONED.
     pt = data.get("ProvisionedThroughput")
     if billing_mode == "PROVISIONED":
@@ -867,8 +876,11 @@ def _create_table(data):
     # LSI validation: requires the base table to have a RANGE key, and each LSI
     # must have the same HASH key as the base table.
     if lsis and not sk_name:
+        # AWS-canonical (dynamodb-conformance.org capture): the
+        # documented LSI rejection on a hash-only table is the
+        # generic "One or more parameter values were invalid:" prefix.
         return error_response_json("ValidationException",
-            "Local Secondary indices are not allowed on hash tables, only hash and range tables", 400)
+            "One or more parameter values were invalid: Table KeySchema does not have a range key, which is required when specifying a LocalSecondaryIndex", 400)
     for lsi in lsis:
         lks = lsi.get("KeySchema") or []
         if not any(k.get("KeyType") == "HASH" and k.get("AttributeName") == pk_name for k in lks):
@@ -881,7 +893,7 @@ def _create_table(data):
         iname = idx.get("IndexName")
         if iname and iname in seen_index_names:
             return error_response_json("ValidationException",
-                f"Two indexes cannot have the same name: {iname}", 400)
+                f"One or more parameter values were invalid: Duplicate index name: {iname}", 400)
         if iname:
             seen_index_names.add(iname)
     # Every attribute referenced in any index KeySchema must be in AttributeDefinitions.
@@ -971,7 +983,7 @@ def _delete_table(data):
         return error_response_json("ResourceNotFoundException", f"Requested resource not found: Table: {name} not found", 400)
     if _tables[name].get("DeletionProtectionEnabled"):
         return error_response_json("ValidationException",
-            "Table can't be deleted as deletion protection is enabled", 400)
+            "Table is protected against deletion. To delete the table, disable deletion protection.", 400)
     desc = _table_description(name)
     desc["TableStatus"] = "DELETING"
     del _tables[name]
@@ -1036,7 +1048,7 @@ def _update_table(data):
     if new_billing is not None:
         if new_billing not in _VALID_BILLING_MODES:
             return error_response_json("ValidationException",
-                f"1 validation error detected: Value '{new_billing}' at 'billingMode' failed to satisfy constraint: Member must satisfy enum value set: {sorted(_VALID_BILLING_MODES)}", 400)
+                f"1 validation error detected: Value '{new_billing}' at 'billingMode' failed to satisfy constraint: Member must satisfy enum value set: [PROVISIONED, PAY_PER_REQUEST]", 400)
         table["BillingModeSummary"] = {"BillingMode": new_billing, "LastUpdateToPayPerRequestDateTime": int(time.time())}
         if new_billing == "PAY_PER_REQUEST":
             table["ProvisionedThroughput"] = {"ReadCapacityUnits": 0, "WriteCapacityUnits": 0}
@@ -1057,7 +1069,7 @@ def _update_table(data):
         tc = data["TableClass"]
         if tc not in _VALID_TABLE_CLASSES:
             return error_response_json("ValidationException",
-                f"1 validation error detected: Value '{tc}' at 'tableClass' failed to satisfy constraint: Member must satisfy enum value set: {sorted(_VALID_TABLE_CLASSES)}", 400)
+                f"1 validation error detected: Value '{tc}' at 'tableClass' failed to satisfy constraint: Member must satisfy enum value set: [STANDARD, STANDARD_INFREQUENT_ACCESS]", 400)
         table["TableClassSummary"] = {"TableClass": tc, "LastUpdateDateTime": int(time.time())}
     # OnDemandThroughput change round-trip.
     if "OnDemandThroughput" in data:
@@ -1098,14 +1110,14 @@ def _update_table(data):
             idx_name = update["Delete"]["IndexName"]
             if idx_name not in existing_idx_names:
                 return error_response_json("ResourceNotFoundException",
-                    f"Attempt to remove a non-existent index: {idx_name}", 400)
+                    f"Requested resource not found: Index: {idx_name}", 400)
             table["GlobalSecondaryIndexes"] = [g for g in table["GlobalSecondaryIndexes"] if g["IndexName"] != idx_name]
             existing_idx_names.discard(idx_name)
         elif "Update" in update:
             idx_name = update["Update"]["IndexName"]
             if idx_name not in existing_idx_names:
                 return error_response_json("ResourceNotFoundException",
-                    f"Attempt to update a non-existent index: {idx_name}", 400)
+                    f"Requested resource not found: Index: {idx_name}", 400)
             for gsi in table["GlobalSecondaryIndexes"]:
                 if gsi["IndexName"] == idx_name:
                     if "ProvisionedThroughput" in update["Update"]:
@@ -1182,11 +1194,13 @@ def _validate_expression_attrs(data, expression_fields: tuple) -> tuple | None:
     eav = data.get("ExpressionAttributeValues")
     ean = data.get("ExpressionAttributeNames")
     if eav and not has_any_expr:
+        # AWS-canonical: EAV without any expression is rejected with the
+        # "can only be used when..." wording.
         return error_response_json("ValidationException",
-            "ExpressionAttributeValues must not be empty", 400)
+            "ExpressionAttributeValues can only be specified when using expressions", 400)
     if ean and not has_any_expr:
         return error_response_json("ValidationException",
-            "ExpressionAttributeNames must not be empty", 400)
+            "ExpressionAttributeNames can only be specified when using expressions: KeyConditionExpression, ConditionExpression, ProjectionExpression, FilterExpression, UpdateExpression", 400)
     # Build a string of all referenced expressions for substring scanning.
     expr_text = " ".join(data.get(f) or "" for f in expression_fields)
     if eav:
@@ -1200,15 +1214,21 @@ def _validate_expression_attrs(data, expression_fields: tuple) -> tuple | None:
                 return error_response_json("ValidationException",
                     f"Value provided in ExpressionAttributeNames unused in expressions: keys: {{{alias}}}", 400)
     # Inverse: every `:foo` / `#bar` in expressions must be defined.
-    if expr_text:
-        for ref in re.findall(r":[A-Za-z_][A-Za-z0-9_]*", expr_text):
+    # AWS scopes the error to the *specific* expression that contains the bad
+    # reference: "Invalid FilterExpression: An expression attribute value
+    # used in expression is not defined; attribute value: :v".
+    for fname in expression_fields:
+        body = data.get(fname) or ""
+        if not body:
+            continue
+        for ref in re.findall(r":[A-Za-z_][A-Za-z0-9_]*", body):
             if not eav or ref not in eav:
                 return error_response_json("ValidationException",
-                    f"An expression attribute value used in expression is not defined; attribute value: {ref}", 400)
-        for ref in re.findall(r"#[A-Za-z_][A-Za-z0-9_]*", expr_text):
+                    f"Invalid {fname}: An expression attribute value used in expression is not defined; attribute value: {ref}", 400)
+        for ref in re.findall(r"#[A-Za-z_][A-Za-z0-9_]*", body):
             if not ean or ref not in ean:
                 return error_response_json("ValidationException",
-                    f"An expression attribute name used in expression is not defined; attribute name: {ref}", 400)
+                    f"Invalid {fname}: An expression attribute name used in expression is not defined; attribute name: {ref}", 400)
     return None
 
 
@@ -1264,7 +1284,7 @@ def _put_item(data):
     table = _tables.get(name)
     if not table:
         return error_response_json("ResourceNotFoundException",
-            f"Cannot do operations on a non-existent table", 400)
+            "Requested resource not found", 400)
     err = _validate_expression_attrs(data, ("ConditionExpression",))
     if err:
         return err
@@ -1324,7 +1344,7 @@ def _get_item(data):
     table = _tables.get(name)
     if not table:
         return error_response_json("ResourceNotFoundException",
-            f"Cannot do operations on a non-existent table", 400)
+            "Requested resource not found", 400)
     if data.get("ProjectionExpression") and data.get("AttributesToGet"):
         return error_response_json("ValidationException",
             "Can not use both expression and non-expression parameters in the same request: Non-expression parameters: {AttributesToGet} Expression parameters: {ProjectionExpression}", 400)
@@ -1359,7 +1379,7 @@ def _delete_item(data):
     table = _tables.get(name)
     if not table:
         return error_response_json("ResourceNotFoundException",
-            f"Cannot do operations on a non-existent table", 400)
+            "Requested resource not found", 400)
     err = _validate_expression_attrs(data, ("ConditionExpression",))
     if err:
         return err
@@ -1409,7 +1429,7 @@ def _update_item(data):
     table = _tables.get(name)
     if not table:
         return error_response_json("ResourceNotFoundException",
-            f"Cannot do operations on a non-existent table", 400)
+            "Requested resource not found", 400)
     err = _validate_expression_attrs(data, ("ConditionExpression", "UpdateExpression"))
     if err:
         return err
@@ -1449,7 +1469,7 @@ def _update_item(data):
     # An empty UpdateExpression string is rejected by AWS.
     if "UpdateExpression" in data and not update_expr.strip():
         return error_response_json("ValidationException",
-            "Invalid UpdateExpression: The expression can not be empty", 400)
+            "Invalid UpdateExpression: The expression cannot be empty;", 400)
 
     if update_expr:
         try:
@@ -1508,7 +1528,7 @@ def _query(data):
     table = _tables.get(name)
     if not table:
         return error_response_json("ResourceNotFoundException",
-            f"Cannot do operations on a non-existent table", 400)
+            "Requested resource not found", 400)
     # Non-existent IndexName → ValidationException (not ResourceNotFoundException).
     idx_req = data.get("IndexName")
     if idx_req:
@@ -1542,8 +1562,9 @@ def _query(data):
             "Can not use both expression and non-expression parameters in the same request: Non-expression parameters: {QueryFilter} Expression parameters: {FilterExpression}", 400)
     # Empty KeyConditionExpression rejected explicitly.
     if "KeyConditionExpression" in data and not (data["KeyConditionExpression"] or "").strip():
+        # AWS-canonical (dynamodb-conformance.org capture).
         return error_response_json("ValidationException",
-            "KeyConditionExpression is empty", 400)
+            "Invalid KeyConditionExpression: The expression cannot be empty;", 400)
     # Select must be one of the canonical enum values when supplied.
     if "Select" in data and data["Select"] not in {"ALL_ATTRIBUTES", "ALL_PROJECTED_ATTRIBUTES", "SPECIFIC_ATTRIBUTES", "COUNT"}:
         return error_response_json("ValidationException",
@@ -1557,7 +1578,7 @@ def _query(data):
     # Limit must be >= 1 when supplied.
     if limit is not None and int(limit) <= 0:
         return error_response_json("ValidationException",
-            f"1 validation error detected: Value '{limit}' at 'limit' failed to satisfy constraint: Member must have value greater than or equal to 1", 400)
+            f"1 validation error detected: Value at 'limit' failed to satisfy constraint: Member must have value greater than or equal to 1", 400)
     # Select validation per AWS: ALL_PROJECTED_ATTRIBUTES is only valid on an
     # index; SPECIFIC_ATTRIBUTES requires a ProjectionExpression / AttributesToGet.
     if select == "ALL_PROJECTED_ATTRIBUTES" and not index_name:
@@ -1658,7 +1679,12 @@ def _query(data):
         result = {"Count": len(filtered), "ScannedCount": scanned_count}
     else:
         try:
-            projected = [_apply_projection(it, data) for it in filtered]
+            # Two-stage projection: first restrict to what the index projects
+            # (when querying a GSI/LSI), then apply any user ProjectionExpression
+            # / AttributesToGet. AWS only exposes attributes the index actually
+            # projects through index reads.
+            stage1 = [_apply_index_projection(it, table, index_name) for it in filtered]
+            projected = [_apply_projection(it, data) for it in stage1]
         except ValueError as exc:
             return error_response_json("ValidationException", str(exc), 400)
         result = {
@@ -1690,7 +1716,7 @@ def _scan(data):
     table = _tables.get(name)
     if not table:
         return error_response_json("ResourceNotFoundException",
-            f"Cannot do operations on a non-existent table", 400)
+            "Requested resource not found", 400)
     # Non-existent IndexName → ValidationException.
     idx_req = data.get("IndexName")
     if idx_req:
@@ -1714,7 +1740,7 @@ def _scan(data):
     # Limit must be > 0 when provided (AWS rejects Limit=0).
     if limit is not None and int(limit) <= 0:
         return error_response_json("ValidationException",
-            f"1 validation error detected: Value '{limit}' at 'limit' failed to satisfy constraint: Member must have value greater than or equal to 1", 400)
+            f"1 validation error detected: Value at 'limit' failed to satisfy constraint: Member must have value greater than or equal to 1", 400)
     if data.get("ProjectionExpression") and data.get("AttributesToGet"):
         return error_response_json("ValidationException",
             "Can not use both expression and non-expression parameters in the same request: Non-expression parameters: {AttributesToGet} Expression parameters: {ProjectionExpression}", 400)
@@ -1728,16 +1754,18 @@ def _scan(data):
         return error_response_json("ValidationException",
             "The TotalSegments parameter is required when Segment is provided", 400)
     if total_segments is not None and segment is None:
+        # AWS-canonical (dynamodb-conformance.org capture).
         return error_response_json("ValidationException",
-            "The Segment parameter is required when TotalSegments is provided", 400)
+            "The Segment parameter is required but no value was provided.", 400)
     if segment is not None and total_segments is not None:
         seg = int(segment); ts = int(total_segments)
         if ts < 1 or ts > 1_000_000:
             return error_response_json("ValidationException",
                 f"TotalSegments must be between 1 and 1000000", 400)
         if seg < 0 or seg >= ts:
+            # AWS-canonical.
             return error_response_json("ValidationException",
-                f"Segment must be greater than or equal to 0 and less than TotalSegments", 400)
+                "The Segment parameter is zero-based and must be less than parameter TotalSegments.", 400)
     # Select validation.
     if select == "ALL_PROJECTED_ATTRIBUTES" and not index_name:
         return error_response_json("ValidationException",
@@ -1759,9 +1787,31 @@ def _scan(data):
             all_items.append(table["items"][pk][sk])
 
     if index_name:
-        pk_name_idx, _, is_gsi = _resolve_index_keys(table, index_name)
+        pk_name_idx, sk_name_idx, is_gsi = _resolve_index_keys(table, index_name)
         if is_gsi:
+            # Sparse GSI semantics: items lacking the index's HASH attribute
+            # don't appear in the index.
             all_items = [it for it in all_items if pk_name_idx in it]
+        else:
+            # LSI: items lacking the index's RANGE attribute don't appear.
+            if sk_name_idx:
+                all_items = [it for it in all_items if sk_name_idx in it]
+
+    # Parallel scan: partition items deterministically across segments by
+    # hashing the partition key. AWS guarantees segments return disjoint
+    # subsets and their union equals the full table scan.
+    if segment is not None and total_segments is not None:
+        import hashlib as _hl
+        seg_n = int(segment); ts_n = int(total_segments)
+        if index_name:
+            pk_attr = pk_name_idx
+        else:
+            pk_attr = table.get("pk_name") or "pk"
+        def _seg_match(it):
+            pk_val = _extract_key_val(it.get(pk_attr, {}))
+            h = _hl.sha1(str(pk_val).encode("utf-8")).digest()
+            return (int.from_bytes(h[:4], "big") % ts_n) == seg_n
+        all_items = [it for it in all_items if _seg_match(it)]
 
     if esk:
         all_items = _apply_exclusive_start_key_scan(all_items, esk, table)
@@ -1789,7 +1839,8 @@ def _scan(data):
         result = {"Count": len(filtered), "ScannedCount": scanned_count}
     else:
         try:
-            projected = [_apply_projection(it, data) for it in filtered]
+            stage1 = [_apply_index_projection(it, table, index_name) for it in filtered]
+            projected = [_apply_projection(it, data) for it in stage1]
         except ValueError as exc:
             return error_response_json("ValidationException", str(exc), 400)
         result = {
@@ -2346,13 +2397,14 @@ def _split_top_level(s, delimiter):
 def _batch_write_item(data):
     request_items = data.get("RequestItems")
     if not request_items:
+        # AWS-captured exact message (dynamodb-conformance.org suite).
         return error_response_json("ValidationException",
-            "1 validation error detected: Value '{}' at 'requestItems' failed to satisfy constraint: Member must have length greater than or equal to 1", 400)
+            "The requestItems parameter is required.", 400)
     # Total request count cap (25 per BatchWriteItem call).
     total = sum(len(v) for v in request_items.values())
     if total > _DDB_BATCH_WRITE_MAX:
         return error_response_json("ValidationException",
-            f"Too many items requested for the BatchWriteItem call: {total} (maximum allowed is {_DDB_BATCH_WRITE_MAX})", 400)
+            f"1 validation error detected: Value '{request_items}' at 'requestItems' failed to satisfy constraint: Member must have length less than or equal to {_DDB_BATCH_WRITE_MAX}", 400)
     # Duplicate target key detection — AWS rejects two writes to the same key
     # in a single BatchWriteItem call.
     seen_keys = set()
@@ -2361,7 +2413,7 @@ def _batch_write_item(data):
         if not table:
             return error_response_json(
                 "ResourceNotFoundException",
-                "Cannot do operations on a non-existent table",
+                "Requested resource not found",
                 400,
             )
         for req in requests:
@@ -2433,18 +2485,19 @@ def _batch_write_item(data):
 def _batch_get_item(data):
     request_items = data.get("RequestItems")
     if not request_items:
+        # AWS-captured exact message (dynamodb-conformance.org suite).
         return error_response_json("ValidationException",
-            "1 validation error detected: Value '{}' at 'requestItems' failed to satisfy constraint: Member must have length greater than or equal to 1", 400)
+            "The requestItems parameter is required.", 400)
     # Total key count cap (100 per BatchGetItem call).
     total = sum(len(cfg.get("Keys", [])) for cfg in request_items.values())
     if total > _DDB_BATCH_GET_MAX:
         return error_response_json("ValidationException",
-            f"Too many items requested for the BatchGetItem call: {total} (maximum allowed is {_DDB_BATCH_GET_MAX})", 400)
+            f"1 validation error detected: Value at 'requestItems' failed to satisfy constraint: Member must have length less than or equal to {_DDB_BATCH_GET_MAX}", 400)
     # Non-existent table check before processing (AWS validates upfront).
     for table_name in request_items:
         if table_name not in _tables:
             return error_response_json("ResourceNotFoundException",
-                "Cannot do operations on a non-existent table", 400)
+                "Requested resource not found", 400)
     # Duplicate-key rejection.
     for table_name, cfg in request_items.items():
         table = _tables[table_name]
@@ -2550,7 +2603,7 @@ def _transact_write_items(data):
             continue
         tbl = _tables.get(op.get("TableName", ""))
         if not tbl:
-            return error_response_json("ResourceNotFoundException", f"Table {op.get('TableName')} not found", 400)
+            return error_response_json("ResourceNotFoundException", "Requested resource not found", 400)
         cond = op.get("ConditionExpression", "")
         if cond:
             if op_type == "Put":
@@ -2644,7 +2697,7 @@ def _transact_get_items(data):
         tbl = _tables.get(get_op.get("TableName", ""))
         if not tbl:
             return error_response_json("ResourceNotFoundException",
-                f"Requested resource not found: Table: {get_op.get('TableName')} not found", 400)
+                "Requested resource not found", 400)
         key = get_op.get("Key", {})
         key_repr = (get_op.get("TableName"),
                     _extract_key_val(key.get(tbl.get("pk_name") or "")),
@@ -2859,9 +2912,16 @@ def _untag_resource(data):
 
 def _list_tags(data):
     arn = data.get("ResourceArn", "")
-    err = _validate_tag_arn(arn)
-    if err:
-        return err
+    # ListTagsOfResource on a non-existent (but syntactically valid) ARN
+    # returns AccessDeniedException on AWS — the API does not reveal whether
+    # the resource exists. Syntactic validation still uses ValidationException.
+    if not isinstance(arn, str) or not arn.startswith("arn:aws:dynamodb:"):
+        return error_response_json("ValidationException",
+            f"1 validation error detected: Value '{arn}' at 'resourceArn' failed to satisfy constraint: Member must satisfy regular expression pattern: arn:[a-z\\-]+:dynamodb:[a-z]{{2}}-[a-z]+-[0-9]:[0-9]{{12}}:.*", 400)
+    tname = _table_name_from_arn(arn)
+    if not tname or tname not in _tables:
+        return error_response_json("AccessDeniedException",
+            "Access denied. The user is not authorized to access this resource.", 400)
     return json_response({"Tags": _tags.get(arn, [])})
 
 
@@ -4083,9 +4143,22 @@ def _evaluate_condition(expr, item, attr_values, attr_names):
         if err:
             raise ValueError(err)
         return _ExprEval(tokens, item, attr_values, attr_names).evaluate()
+    except ValueError as e:
+        msg = str(e)
+        # If the inner error is already an AWS-canonical message
+        # (e.g. "Invalid ConditionExpression: ..." or "Invalid UpdateExpression: ..."),
+        # propagate it verbatim. Otherwise wrap in the generic prefix.
+        if msg.startswith("Invalid ConditionExpression:") \
+                or msg.startswith("Invalid UpdateExpression:") \
+                or msg.startswith("Invalid FilterExpression:") \
+                or msg.startswith("Invalid KeyConditionExpression:") \
+                or msg.startswith("Invalid ProjectionExpression:"):
+            raise
+        logger.warning("Expression evaluation error: %s for expr: %s", e, expr)
+        raise ValueError(f"Invalid ConditionExpression: {e}")
     except Exception as e:
         logger.warning("Expression evaluation error: %s for expr: %s", e, expr)
-        raise ValueError(f"Invalid expression: {e}")
+        raise ValueError(f"Invalid ConditionExpression: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -4774,6 +4847,43 @@ def _apply_projection(item, data):
         # auto-include key attributes (matches real AWS behavior).
         return {k: item[k] for k in atg if k in item}
     return item
+
+
+def _apply_index_projection(item, table, index_name):
+    """Restrict an item to the attributes that the queried index actually
+    projects. AWS GSIs/LSIs declare a Projection of ALL / KEYS_ONLY / INCLUDE
+    [NonKeyAttributes]; only those attributes are visible through the index.
+    Returns the trimmed dict (with original wrapping)."""
+    if not index_name:
+        return item
+    idx_def = None
+    for collection in ("GlobalSecondaryIndexes", "LocalSecondaryIndexes"):
+        for idx in (table.get(collection) or []):
+            if idx.get("IndexName") == index_name:
+                idx_def = idx
+                break
+        if idx_def:
+            break
+    if not idx_def:
+        return item
+    proj_cfg = idx_def.get("Projection") or {}
+    ptype = proj_cfg.get("ProjectionType", "ALL")
+    if ptype == "ALL":
+        return item
+    # Always keep base-table keys + the index's own keys.
+    keep = set()
+    keep.add(table.get("pk_name"))
+    if table.get("sk_name"):
+        keep.add(table["sk_name"])
+    for ks in (idx_def.get("KeySchema") or []):
+        an = ks.get("AttributeName")
+        if an:
+            keep.add(an)
+    if ptype == "INCLUDE":
+        for nk in (proj_cfg.get("NonKeyAttributes") or []):
+            keep.add(nk)
+    # KEYS_ONLY: only the keys (already added).
+    return {k: v for k, v in item.items() if k in keep}
 
 
 def _parse_projection_path(path: str, attr_names: dict) -> list:
