@@ -4244,3 +4244,298 @@ def handler(event, context):
             lam.delete_function(FunctionName=fname)
         except Exception:
             pass
+
+
+# ---------------------------------------------------------------------------
+# Durable execution — external callbacks (SendCallback{Success,Failure,Heartbeat}).
+# Spec: callbacks suspend the SDK; external systems resolve them via REST.
+#   https://docs.aws.amazon.com/lambda/latest/api/API_SendDurableExecutionCallbackSuccess.html
+#   https://docs.aws.amazon.com/lambda/latest/api/API_SendDurableExecutionCallbackFailure.html
+#   https://docs.aws.amazon.com/lambda/latest/api/API_SendDurableExecutionCallbackHeartbeat.html
+# ---------------------------------------------------------------------------
+
+def _start_callback(lam):
+    """Create a durable execution and checkpoint a CALLBACK START so a callback
+    is registered and resolvable externally. Returns (fname, arn, callback_id,
+    new_checkpoint_token)."""
+    fname, _, rec = _create_durable_execution_directly(lam)
+    from urllib.parse import quote
+    arn_q = quote(rec["DurableExecutionArn"], safe="/:$")
+    code, body = _raw_durable("POST", f"/2025-12-01/durable-executions/{arn_q}/checkpoint", body={
+        "CheckpointToken": rec["CheckpointToken"],
+        "Updates": [{
+            "Id": "cbop1aaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "Type": "CALLBACK",
+            "Action": "START",
+            "Name": "ext-cb",
+            "CallbackOptions": {"TimeoutSeconds": 120, "HeartbeatTimeoutSeconds": 30},
+        }],
+    })
+    assert code == 200, body
+    ops = body["NewExecutionState"]["Operations"]
+    op = next(o for o in ops if o["Id"] == "cbop1aaaaaaaaaaaaaaaaaaaaaaaaaa")
+    cb_id = (op.get("CallbackDetails") or {}).get("CallbackId")
+    assert cb_id, f"no CallbackId in {op}"
+    return fname, rec["DurableExecutionArn"], cb_id, body["CheckpointToken"]
+
+
+def test_lambda_durable_send_callback_success_then_already_closed(lam):
+    """First succeed returns 200; second call against the same closed callback
+    must return CallbackTimeoutException (400) per the spec."""
+    import urllib.request, urllib.error
+    from urllib.parse import quote
+    fname, arn, cb_id, _ = _start_callback(lam)
+    try:
+        url = f"{_ms_endpoint()}/2025-12-01/durable-execution-callbacks/{quote(cb_id, safe='')}/succeed"
+        req = urllib.request.Request(url, method="POST", data=b'"first"',
+                                     headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req) as r:
+            assert r.status == 200
+        # Re-fire: already-closed callback → 400.
+        req2 = urllib.request.Request(url, method="POST", data=b'"second"',
+                                      headers={"Content-Type": "application/json"})
+        try:
+            urllib.request.urlopen(req2)
+            assert False, "expected 400 on already-closed callback"
+        except urllib.error.HTTPError as e:
+            assert e.code == 400
+    finally:
+        lam.delete_function(FunctionName=fname)
+
+
+def test_lambda_durable_send_callback_success_records_result(lam):
+    fname, arn, cb_id, _ = _start_callback(lam)
+    try:
+        import urllib.request
+        from urllib.parse import quote
+        req = urllib.request.Request(
+            f"{_ms_endpoint()}/2025-12-01/durable-execution-callbacks/{quote(cb_id, safe='')}/succeed",
+            method="POST", data=b'"forty-two"',
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req) as r:
+            assert r.status == 200
+        # History should include CallbackSucceeded with the Result payload.
+        code, hist = _raw_durable("GET",
+            f"/2025-12-01/durable-executions/{quote(arn, safe='/:$')}/history")
+        assert code == 200
+        types = [e["EventType"] for e in hist["Events"]]
+        assert "CallbackSucceeded" in types
+        ev = next(e for e in hist["Events"] if e["EventType"] == "CallbackSucceeded")
+        assert ev["CallbackSucceededDetails"]["Result"]["Payload"] == '"forty-two"'
+    finally:
+        lam.delete_function(FunctionName=fname)
+
+
+def test_lambda_durable_send_callback_failure(lam):
+    fname, arn, cb_id, _ = _start_callback(lam)
+    try:
+        import urllib.request, json as _json
+        from urllib.parse import quote
+        req = urllib.request.Request(
+            f"{_ms_endpoint()}/2025-12-01/durable-execution-callbacks/{quote(cb_id, safe='')}/fail",
+            method="POST",
+            data=_json.dumps({
+                "ErrorType": "ExternalTimeout",
+                "ErrorMessage": "third-party timed out",
+                "ErrorData": "extra-context",
+            }).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req) as r:
+            assert r.status == 200
+        code, hist = _raw_durable("GET",
+            f"/2025-12-01/durable-executions/{quote(arn, safe='/:$')}/history")
+        assert code == 200
+        ev = next(e for e in hist["Events"] if e["EventType"] == "CallbackFailed")
+        err = ev["CallbackFailedDetails"]["Error"]["Payload"]
+        assert err["ErrorType"] == "ExternalTimeout"
+        assert err["ErrorMessage"] == "third-party timed out"
+    finally:
+        lam.delete_function(FunctionName=fname)
+
+
+def test_lambda_durable_send_callback_heartbeat(lam):
+    """Heartbeat must return 200 and must NOT close the callback — a
+    subsequent succeed on the same id must still work."""
+    import urllib.request
+    from urllib.parse import quote
+    fname, arn, cb_id, _ = _start_callback(lam)
+    try:
+        hb_url = f"{_ms_endpoint()}/2025-12-01/durable-execution-callbacks/{quote(cb_id, safe='')}/heartbeat"
+        for _ in range(3):
+            req = urllib.request.Request(hb_url, method="POST", data=b"",
+                                         headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req) as r:
+                assert r.status == 200
+        # Callback should still be live → succeed returns 200.
+        ok_url = f"{_ms_endpoint()}/2025-12-01/durable-execution-callbacks/{quote(cb_id, safe='')}/succeed"
+        req = urllib.request.Request(ok_url, method="POST", data=b'"done"',
+                                     headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req) as r:
+            assert r.status == 200
+    finally:
+        lam.delete_function(FunctionName=fname)
+
+
+def test_lambda_durable_send_callback_unknown_id_400(lam):
+    """Unknown CallbackId returns InvalidParameterValueException, not 500."""
+    import urllib.request, urllib.error
+    req = urllib.request.Request(
+        f"{_ms_endpoint()}/2025-12-01/durable-execution-callbacks/does-not-exist/succeed",
+        method="POST", data=b'"x"',
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        urllib.request.urlopen(req)
+        assert False, "expected 400"
+    except urllib.error.HTTPError as e:
+        assert e.code == 400
+
+
+def test_lambda_durable_get_execution_rejects_malformed_arn(lam):
+    """Malformed DurableExecutionArn → 400 InvalidParameterValueException."""
+    code, body = _raw_durable("GET", "/2025-12-01/durable-executions/not-a-real-arn")
+    assert code == 400
+    assert body.get("__type") == "InvalidParameterValueException"
+
+
+# ---------------------------------------------------------------------------
+# Resume scheduler — fires WAIT/CALLBACK expiries and survives restart.
+# These exercise lambda_durable._resume_execution and restore_state directly
+# (they're internal but they ARE the AWS-parity contract for in-flight
+# durable executions: timers keep ticking, callbacks stay resolvable across
+# restarts).
+# ---------------------------------------------------------------------------
+
+def test_lambda_durable_heartbeat_extends_callback_timeout():
+    """Pushing the HeartbeatDeadline forward must actually delay the
+    CallbackTimedOut firing. Stale heap entries must be no-ops."""
+    from ministack.services import lambda_durable as _ld
+    arn = "arn:aws:lambda:us-east-1:000000000000:function:hb-test:$LATEST/durable-execution/" \
+          "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    now = _ld._now()
+    op_id = "hbop1aaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    rec = {
+        "DurableExecutionArn": arn,
+        "FunctionArn": "arn:aws:lambda:us-east-1:000000000000:function:hb-test",
+        "Status": "RUNNING",
+        "Operations": [{
+            "Id": op_id, "Type": "CALLBACK", "Status": "STARTED",
+            "CallbackDetails": {
+                "CallbackId": op_id,
+                "HeartbeatTimeoutSeconds": 30.0,
+                "HeartbeatDeadline": now - 5,  # already past
+                "TimeoutDeadline": now + 600,
+            },
+        }],
+        "History": [], "NextEventId": 1, "CheckpointToken": "tok",
+        "InputPayload": "{}",
+    }
+    _ld._executions[arn] = rec
+    _ld._callback_index[op_id] = (arn, op_id)
+    try:
+        # Heartbeat now → pushes HeartbeatDeadline to now+30s.
+        status, _, _ = _ld.handle_callback_heartbeat(op_id, b"")
+        assert status == 200
+        new_deadline = rec["Operations"][0]["CallbackDetails"]["HeartbeatDeadline"]
+        assert new_deadline > _ld._now() + 25
+        # Simulate the stale heap entry firing now — must be a no-op
+        # (callback not timed out, status still STARTED).
+        _ld._resume_execution(arn)
+        assert rec["Operations"][0]["Status"] == "STARTED"
+        assert (rec["Operations"][0].get("CallbackDetails") or {}).get("Error") is None
+    finally:
+        _ld._executions.pop(arn, None)
+        _ld._callback_index.pop(op_id, None)
+
+
+def test_lambda_durable_restore_rebuilds_callback_index_and_rearms_timers():
+    """After restore_state, in-flight callbacks must be resolvable and
+    pending timers must be back on the heap."""
+    from ministack.services import lambda_durable as _ld
+    arn = "arn:aws:lambda:us-east-1:000000000000:function:restore-test:$LATEST/durable-execution/" \
+          "cccccccccccccccccccccccccccccccc/dddddddddddddddddddddddddddddddd"
+    cb_op_id = "rstcbaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    wait_op_id = "rstwaitaaaaaaaaaaaaaaaaaaaaaaaaa"
+    now = _ld._now()
+    rec = {
+        "DurableExecutionArn": arn,
+        "FunctionArn": "arn:aws:lambda:us-east-1:000000000000:function:restore-test",
+        "Status": "RUNNING",
+        "Operations": [
+            {"Id": cb_op_id, "Type": "CALLBACK", "Status": "STARTED",
+             "CallbackDetails": {"CallbackId": cb_op_id,
+                                 "TimeoutDeadline": now + 300}},
+            {"Id": wait_op_id, "Type": "WAIT", "Status": "STARTED",
+             "WaitDetails": {"ScheduledEndTimestamp": now + 60, "Duration": 60}},
+        ],
+        "History": [], "NextEventId": 1, "CheckpointToken": "tok",
+        "InputPayload": "{}",
+    }
+    # Wipe live state so the test is hermetic.
+    pre_index = dict(_ld._callback_index)
+    pre_execs = dict(_ld._executions)
+    pre_queue = list(_ld._resume_queue)
+    _ld._executions.clear()
+    _ld._callback_index.clear()
+    with _ld._resume_lock:
+        _ld._resume_queue.clear()
+    try:
+        # Pretend ministack just booted and read this rec from disk.
+        _ld.restore_state({"executions": {arn: rec}})
+        # Index must contain the STARTED callback.
+        assert cb_op_id in _ld._callback_index
+        assert _ld._callback_index[cb_op_id] == (arn, cb_op_id)
+        # Heap must have at least one entry for this arn at or before the
+        # earliest deadline (the WAIT at now+60).
+        with _ld._resume_lock:
+            entries = [(t, a) for (t, a, _acct) in _ld._resume_queue if a == arn]
+        assert entries, "no resume entry queued after restore"
+        assert min(t for t, _ in entries) <= now + 60 + 1
+        # And Send*Callback resolves the restored callback (no 404).
+        target, op, err = _ld._resolve_callback(cb_op_id)
+        assert err is None and target is rec and op["Id"] == cb_op_id
+    finally:
+        _ld._executions.clear()
+        _ld._executions.update(pre_execs)
+        _ld._callback_index.clear()
+        _ld._callback_index.update(pre_index)
+        with _ld._resume_lock:
+            _ld._resume_queue.clear()
+            for e in pre_queue:
+                _ld._resume_queue.append(e)
+
+
+def test_lambda_durable_restore_skips_non_running_executions():
+    """SUCCEEDED/FAILED/STOPPED executions must NOT be re-armed (they would
+    pin a function arn that may not exist anymore) and their callbacks must
+    NOT be re-indexed."""
+    from ministack.services import lambda_durable as _ld
+    arn_done = "arn:aws:lambda:us-east-1:000000000000:function:done-fn:$LATEST/durable-execution/" \
+               "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee/ffffffffffffffffffffffffffffffff"
+    cb_op_id = "donecbaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    rec = {
+        "DurableExecutionArn": arn_done,
+        "FunctionArn": "arn:aws:lambda:us-east-1:000000000000:function:done-fn",
+        "Status": "SUCCEEDED",
+        "Operations": [
+            {"Id": cb_op_id, "Type": "CALLBACK", "Status": "SUCCEEDED",
+             "CallbackDetails": {"CallbackId": cb_op_id, "Result": "x"}},
+        ],
+        "History": [], "NextEventId": 1, "CheckpointToken": "tok",
+        "InputPayload": "{}",
+    }
+    pre_index = dict(_ld._callback_index)
+    pre_execs = dict(_ld._executions)
+    _ld._executions.clear()
+    _ld._callback_index.clear()
+    try:
+        _ld.restore_state({"executions": {arn_done: rec}})
+        # SUCCEEDED callback must NOT be indexed (only STARTED ones).
+        assert cb_op_id not in _ld._callback_index
+    finally:
+        _ld._executions.clear()
+        _ld._executions.update(pre_execs)
+        _ld._callback_index.clear()
+        _ld._callback_index.update(pre_index)

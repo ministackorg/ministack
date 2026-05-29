@@ -8,10 +8,21 @@ on:
 env:
   DOCKERHUB_IMAGE: nahuelnucera/ministack
   DOCKERHUB_IMAGE_ORG: ministackorg/ministack
+  # Free-to-pull mirror on the GitHub Container Registry. Repo-scoped under
+  # the same org as Docker Hub so `ghcr.io/ministackorg/ministack:<tag>` is a
+  # drop-in pull. Anonymous pulls are free; rate limits are per-IP and much
+  # higher than Docker Hub's, which is the reason this mirror exists.
+  GHCR_IMAGE: ghcr.io/ministackorg/ministack
 
 jobs:
   publish:
     runs-on: ubuntu-latest
+    # `packages: write` lets GITHUB_TOKEN push to ghcr.io for this repo's
+    # org-scoped package; `contents: read` is the standard default kept
+    # explicit since we now set permissions at the job level.
+    permissions:
+      contents: read
+      packages: write
 
     steps:
       - uses: actions/checkout@v4
@@ -28,6 +39,13 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
       # ── Regular (Alpine) image — :latest, :{version}, :{major}.{minor} ──
       - name: Extract metadata (regular)
         id: meta
@@ -36,6 +54,7 @@ jobs:
           images: |
             ${{ env.DOCKERHUB_IMAGE }}
             ${{ env.DOCKERHUB_IMAGE_ORG }}
+            ${{ env.GHCR_IMAGE }}
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
@@ -67,6 +86,7 @@ jobs:
           images: |
             ${{ env.DOCKERHUB_IMAGE }}
             ${{ env.DOCKERHUB_IMAGE_ORG }}
+            ${{ env.GHCR_IMAGE }}
           flavor: |
             latest=false
           tags: |

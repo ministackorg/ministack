@@ -70,6 +70,15 @@ _resume_queue: list[tuple[float, str, str]] = []
 _resume_lock = _threading.Lock()
 _resume_event = _threading.Event()
 _resume_thread_started = False
+
+# Maps CallbackId → (DurableExecutionArn, OperationId) so external
+# SendCallback{Success,Failure,Heartbeat} can find their target without
+# scanning every execution. Defined HERE (above restore_state) because
+# restore_state rebuilds this index from persisted executions at module
+# import time — if the name were defined later, restore_state would
+# NameError on cold start.
+_callback_index: dict[str, tuple[str, str]] = {}
+
 # Function-level DurableConfig is stored on the function config in lambda_svc;
 # we expose helpers here for serialization parity.
 
@@ -83,8 +92,37 @@ def get_state():
 
 
 def restore_state(data):
-    if data:
-        _executions.update(data.get("executions", {}))
+    if not data:
+        return
+    _executions.update(data.get("executions", {}))
+    # AWS contract: callbacks and timers survive process restarts. The live
+    # in-memory `_callback_index` and resume heap are NOT persisted (the
+    # heap entries are wall-clock-relative, the index is derivable), so
+    # rebuild both from the restored execution records.
+    # `_executions` is an AccountScopedDict; iterating yields composite
+    # (account, arn) keys, so always read the bare arn off the record itself.
+    for _key, rec in _executions.items():
+        if not isinstance(rec, dict):
+            continue
+        arn = rec.get("DurableExecutionArn")
+        if not arn:
+            continue
+        for op in rec.get("Operations", []):
+            if op.get("Type") == "CALLBACK" and op.get("Status") == "STARTED":
+                op_id = op.get("Id")
+                if op_id:
+                    _callback_index[op_id] = (arn, op_id)
+        # Re-arm WAIT and CALLBACK timers for executions that were still
+        # RUNNING when the process went down. Without this, restored
+        # executions stall forever — timers never fire.
+        if rec.get("Status") == "RUNNING":
+            try:
+                schedule_resume(arn)
+            except Exception:
+                import logging
+                logging.getLogger(__name__).exception(
+                    "Failed to re-arm timer on restore for %s", arn,
+                )
 
 
 try:
@@ -128,13 +166,44 @@ def build_durable_execution_arn(function_arn: str, version: str = "$LATEST",
     return arn, (name or token_id), token_id
 
 
+import re as _re
+
+# AWS spec Pattern for DurableExecutionArn (verified against
+# https://docs.aws.amazon.com/lambda/latest/api/API_GetDurableExecution.html
+# and the AWS SDK for Java v2 2.44.13 model).
+_DURABLE_EXEC_ARN_RE = _re.compile(
+    r"^arn:([a-zA-Z0-9-]+):lambda:([a-zA-Z0-9-]+):(\d{12})"
+    r":function:([a-zA-Z0-9_-]+):(\$LATEST(?:\.PUBLISHED)?|[0-9]+)"
+    r"/durable-execution/([a-zA-Z0-9_-]+)/([a-zA-Z0-9_-]+)$"
+)
+
+# CallbackId pattern from API_SendDurableExecutionCallback* (base64).
+_CALLBACK_ID_RE = _re.compile(r"^[A-Za-z0-9+/]+={0,2}$")
+
+
 def _parse_execution_arn(path_arn: str) -> str:
     """Decode + normalize the URL-embedded ARN (boto3 may URL-encode colons)."""
     return unquote(path_arn)
 
 
+def _validate_execution_arn(arn: str) -> tuple | None:
+    """AWS returns InvalidParameterValueException 400 for a structurally
+    malformed DurableExecutionArn (separate from ResourceNotFound 404 for a
+    well-formed but unknown one)."""
+    if not isinstance(arn, str) or not _DURABLE_EXEC_ARN_RE.match(arn):
+        return error_response_json(
+            "InvalidParameterValueException",
+            f"Invalid DurableExecutionArn: {arn}",
+            400,
+        )
+    return None
+
+
 def _require_execution(arn: str):
     arn = _parse_execution_arn(arn)
+    err = _validate_execution_arn(arn)
+    if err:
+        return None, err
     rec = _executions.get(arn)
     if not rec:
         return None, error_response_json(
@@ -157,11 +226,10 @@ _TIMESTAMP_FIELDS_NESTED = {
 
 
 def _to_unix_millis(v) -> int | None:
-    """Convert a float-seconds timestamp to int Unix-millis. The Java SDK's
-    Jackson parser rejects float timestamps with
-    `DateTimeParseException: could not be parsed at index 0`. The Python SDK
-    accepts the same int-millis form via `TimestampConverter.from_unix_millis`,
-    so this is the canonical wire shape across all language SDKs."""
+    """Float-seconds → int Unix-millis. Used on the EVENT path only
+    (InitialExecutionState.Operations) because the durable SDK reads that path
+    via `Operation.from_json_dict` which calls `TimestampConverter.from_unix_millis`.
+    The boto3 API-response path uses `_to_unix_seconds` instead."""
     if v is None:
         return None
     try:
@@ -170,26 +238,48 @@ def _to_unix_millis(v) -> int | None:
         return None
 
 
-def _serialize_operations(operations: list[dict]) -> list[dict]:
-    """Return the wire-shape list of Operation objects the SDK reads via
-    `Operation.from_json_dict`. Timestamp fields are converted from internal
-    float-seconds to AWS-canonical int-millis."""
+def _to_unix_seconds(v) -> int | None:
+    """Float-seconds → int Unix-seconds. Used on every boto3 API-RESPONSE
+    timestamp because botocore's `parse_timestamp` interprets numeric values
+    as seconds via `datetime.fromtimestamp(value, tzinfo())`. Ministack-wide
+    JSON convention is int (not float) so the strict-deserializing Java SDK v2
+    and Go SDK v2 don't reject it — see feedback_timestamps_int_epoch."""
+    if v is None:
+        return None
+    try:
+        return int(float(v))
+    except (TypeError, ValueError):
+        return None
+
+
+def _serialize_operations(operations: list[dict], *, for_event: bool = False) -> list[dict]:
+    """Return the wire-shape list of Operation objects.
+
+    Two paths, two timestamp units (the wire shape really is different):
+      - `for_event=True`  → InitialExecutionState.Operations on the Lambda
+        event payload. The durable SDK reads this via `Operation.from_json_dict`
+        which expects int Unix-millis.
+      - `for_event=False` → Checkpoint / GetState API response bodies. boto3
+        parses these via `botocore.utils.parse_timestamp` which expects
+        Unix-seconds (the protocol-default for restJson1 timestamps).
+    """
+    convert = _to_unix_millis if for_event else _to_unix_seconds
     out = []
     for op in (operations or []):
         clone = copy.deepcopy(op)
         for f in _TIMESTAMP_FIELDS_ON_OP:
             if f in clone:
-                m = _to_unix_millis(clone[f])
-                if m is not None:
-                    clone[f] = m
+                c = convert(clone[f])
+                if c is not None:
+                    clone[f] = c
         for sub_key, fields in _TIMESTAMP_FIELDS_NESTED.items():
             sub = clone.get(sub_key)
             if isinstance(sub, dict):
                 for f in fields:
                     if f in sub:
-                        m = _to_unix_millis(sub[f])
-                        if m is not None:
-                            sub[f] = m
+                        c = convert(sub[f])
+                        if c is not None:
+                            sub[f] = c
         out.append(clone)
     return out
 
@@ -199,11 +289,11 @@ def _execution_summary(rec: dict) -> dict:
         "DurableExecutionArn": rec["DurableExecutionArn"],
         "DurableExecutionName": rec["DurableExecutionName"],
         "FunctionArn": rec["FunctionArn"],
-        "StartTimestamp": rec["StartTimestamp"],
+        "StartTimestamp": _to_unix_seconds(rec["StartTimestamp"]),
         "Status": rec["Status"],
     }
     if rec.get("EndTimestamp") is not None:
-        out["EndTimestamp"] = rec["EndTimestamp"]
+        out["EndTimestamp"] = _to_unix_seconds(rec["EndTimestamp"])
     return out
 
 
@@ -476,6 +566,26 @@ def _apply_update(rec: dict, upd: dict) -> None:
             details["Result"] = payload
         if err is not None:
             details["Error"] = err
+        # AWS-spec CallbackOptions per API_CheckpointDurableExecution:
+        # TimeoutSeconds (overall expiry) + HeartbeatTimeoutSeconds (heartbeat
+        # interval cap). Real AWS fires "Callback.Timeout" when either elapses
+        # without resolution. Store both as absolute epoch deadlines so the
+        # resume scheduler can poll them alongside WAIT expiries.
+        cb_opts = upd.get("CallbackOptions") or {}
+        if action == "START":
+            details["CallbackId"] = op_id  # SDK uses Operation.Id as CallbackId
+            timeout_s = cb_opts.get("TimeoutSeconds")
+            if timeout_s is not None:
+                details["TimeoutDeadline"] = now + float(timeout_s)
+            hb_s = cb_opts.get("HeartbeatTimeoutSeconds")
+            if hb_s is not None:
+                details["HeartbeatTimeoutSeconds"] = float(hb_s)
+                details["HeartbeatDeadline"] = now + float(hb_s)
+            # Index so Send*Callback handlers can look us up by the bare id.
+            _callback_index[op_id] = (rec["DurableExecutionArn"], op_id)
+        elif action in ("SUCCEED", "FAIL", "CANCEL"):
+            # Callback resolved internally — drop from the live index.
+            _callback_index.pop(op_id, None)
     elif op_type == "CONTEXT":
         details = existing.setdefault("ContextDetails", {})
         if payload is not None and action == "SUCCEED":
@@ -577,10 +687,10 @@ def handle_get_execution(arn_path: str) -> tuple:
         "Version": rec["Version"],
         "InputPayload": rec["InputPayload"],
         "Status": rec["Status"],
-        "StartTimestamp": rec["StartTimestamp"],
+        "StartTimestamp": _to_unix_seconds(rec["StartTimestamp"]),
     }
     if rec.get("EndTimestamp") is not None:
-        out["EndTimestamp"] = rec["EndTimestamp"]
+        out["EndTimestamp"] = _to_unix_seconds(rec["EndTimestamp"])
     if rec.get("Result") is not None:
         out["Result"] = rec["Result"]
     if rec.get("Error") is not None:
@@ -613,7 +723,14 @@ def handle_get_history(arn_path: str, query_params: dict) -> tuple:
         except ValueError:
             start = 0
     page = events[start:start + max_items]
-    resp = {"Events": copy.deepcopy(page)}
+    # Convert EventTimestamp from float-seconds to int-seconds for boto3.
+    serialized = []
+    for ev in page:
+        clone = copy.deepcopy(ev)
+        if "EventTimestamp" in clone:
+            clone["EventTimestamp"] = _to_unix_seconds(clone["EventTimestamp"])
+        serialized.append(clone)
+    resp = {"Events": serialized}
     if start + max_items < len(events):
         resp["NextMarker"] = str(start + max_items)
     return json_response(resp)
@@ -702,7 +819,7 @@ def handle_stop(arn_path: str, body: bytes) -> tuple:
     _emit_history_event(rec, "ExecutionStopped", "ExecutionStoppedDetails", {
         "Error": {"Payload": rec["Error"], "Truncated": False},
     })
-    return json_response({"StopTimestamp": rec["EndTimestamp"]})
+    return json_response({"StopTimestamp": _to_unix_seconds(rec["EndTimestamp"])})
 
 
 # ---------------------------------------------------------------------------
@@ -714,6 +831,126 @@ def _qp_first(query_params: dict, key: str, default: str = "") -> str:
     if isinstance(v, list):
         return v[0] if v else default
     return v
+
+
+# ---------------------------------------------------------------------------
+# Send*Callback handlers — POST /2025-12-01/durable-execution-callbacks/{id}/{action}
+# Sources verified against:
+#   API_SendDurableExecutionCallbackSuccess.html
+#   API_SendDurableExecutionCallbackFailure.html
+#   API_SendDurableExecutionCallbackHeartbeat.html
+# Each returns HTTP 200 with empty body on success.
+# ---------------------------------------------------------------------------
+
+def _resolve_callback(callback_id: str):
+    """Look up a callback by its id. Returns (rec, callback_op, err)."""
+    if not isinstance(callback_id, str) or not _CALLBACK_ID_RE.match(callback_id):
+        return None, None, error_response_json(
+            "InvalidParameterValueException",
+            f"Invalid CallbackId: {callback_id}",
+            400,
+        )
+    entry = _callback_index.get(callback_id)
+    if not entry:
+        return None, None, error_response_json(
+            "ResourceNotFoundException",
+            f"Callback not found: {callback_id}",
+            404,
+        )
+    arn, op_id = entry
+    rec = _executions.get(arn)
+    if not rec:
+        return None, None, error_response_json(
+            "ResourceNotFoundException",
+            f"Durable execution not found for callback: {callback_id}",
+            404,
+        )
+    op = next((o for o in rec["Operations"] if o.get("Id") == op_id and o.get("Type") == "CALLBACK"), None)
+    if not op or op.get("Status") != "STARTED":
+        # AWS docs: "callback associated with the token has already been closed"
+        return None, None, error_response_json(
+            "CallbackTimeoutException",
+            "The callback ID token has either expired or the callback associated with the token has already been closed.",
+            400,
+        )
+    return rec, op, None
+
+
+def handle_callback_success(callback_id: str, body: bytes) -> tuple:
+    rec, op, err = _resolve_callback(callback_id)
+    if err:
+        return err
+    # AWS: body is the raw Result blob (max 256 KB). Surface as a UTF-8 string
+    # for the operation details; the SDK reads it back via the operation log.
+    result_payload = ""
+    if body:
+        if len(body) > 262144:
+            return error_response_json("InvalidParameterValueException",
+                "Result exceeds the 256 KB maximum size", 400)
+        try:
+            result_payload = body.decode("utf-8")
+        except UnicodeDecodeError:
+            import base64 as _b64
+            result_payload = _b64.b64encode(body).decode("ascii")
+    op["Status"] = "SUCCEEDED"
+    op["EndTimestamp"] = _now()
+    details = op.setdefault("CallbackDetails", {})
+    details["Result"] = result_payload
+    _emit_history_event(rec, "CallbackSucceeded", "CallbackSucceededDetails",
+                        {"Result": {"Payload": result_payload, "Truncated": False}},
+                        event_id=op.get("Id"), name=op.get("Name"))
+    # Leave the entry in _callback_index — a subsequent call against the same
+    # id must hit _resolve_callback's "not STARTED" branch and return
+    # CallbackTimeoutException (400), matching the AWS contract.
+    # Wake the execution so it can resume the SDK handler.
+    schedule_resume(rec["DurableExecutionArn"])
+    return 200, {"Content-Type": "application/json"}, b""
+
+
+def handle_callback_failure(callback_id: str, body: bytes) -> tuple:
+    rec, op, err = _resolve_callback(callback_id)
+    if err:
+        return err
+    try:
+        data = json.loads(body) if body else {}
+    except json.JSONDecodeError:
+        data = {}
+    error_obj = {
+        "ErrorType": data.get("ErrorType") or "CallbackFailure",
+        "ErrorMessage": data.get("ErrorMessage") or "Callback failed",
+        "ErrorData": data.get("ErrorData") or "",
+        "StackTrace": data.get("StackTrace") or [],
+    }
+    op["Status"] = "FAILED"
+    op["EndTimestamp"] = _now()
+    details = op.setdefault("CallbackDetails", {})
+    details["Error"] = error_obj
+    _emit_history_event(rec, "CallbackFailed", "CallbackFailedDetails",
+                        {"Error": {"Payload": error_obj, "Truncated": False}},
+                        event_id=op.get("Id"), name=op.get("Name"))
+    # Index entry retained — see handle_callback_success for the rationale.
+    schedule_resume(rec["DurableExecutionArn"])
+    return 200, {"Content-Type": "application/json"}, b""
+
+
+def handle_callback_heartbeat(callback_id: str, body: bytes) -> tuple:
+    """Heartbeat resets the heartbeat deadline so a long-running external
+    operation doesn't trip its HeartbeatTimeoutSeconds. Overall TimeoutSeconds
+    is unaffected."""
+    rec, op, err = _resolve_callback(callback_id)
+    if err:
+        return err
+    details = op.setdefault("CallbackDetails", {})
+    hb_s = details.get("HeartbeatTimeoutSeconds")
+    if hb_s is not None:
+        details["HeartbeatDeadline"] = _now() + float(hb_s)
+        # The previously-queued resume entry still points at the OLD
+        # deadline. We do NOT push a fresh entry here — heartbeats can fire
+        # frequently and each extra entry would trigger a spurious re-invoke
+        # when it pops. Instead, _resume_execution re-arms the heap from
+        # current deadlines when nothing has actually elapsed (see the
+        # `nothing_elapsed` path below).
+    return 200, {"Content-Type": "application/json"}, b""
 
 
 # ---------------------------------------------------------------------------
@@ -740,6 +977,18 @@ def try_route(method: str, path: str, body: bytes, query_params: dict,
             return None
         function_name = parts[2]
         return handle_list_by_function(function_name, query_params, function_arn_lookup)
+
+    # /2025-12-01/durable-execution-callbacks/{CallbackId}/{succeed|fail|heartbeat}
+    if parts[1] == "durable-execution-callbacks" and len(parts) >= 4 and method == "POST":
+        callback_id = unquote(parts[2])
+        action = parts[3]
+        if action == "succeed":
+            return handle_callback_success(callback_id, body)
+        if action == "fail":
+            return handle_callback_failure(callback_id, body)
+        if action == "heartbeat":
+            return handle_callback_heartbeat(callback_id, body)
+        return None
 
     if parts[1] != "durable-executions" or len(parts) < 3:
         return None
@@ -784,35 +1033,66 @@ def reset() -> None:
 # paused durable executions actually resume the way they do on real AWS.
 # ---------------------------------------------------------------------------
 
-def _next_wait_expiry(rec: dict) -> float | None:
-    """Return the earliest scheduled WAIT expiry across all STARTED WAIT ops,
-    or None when nothing is pending."""
+def _next_expiry(rec: dict) -> float | None:
+    """Return the earliest scheduled expiry across all STARTED WAIT and
+    CALLBACK ops, or None when nothing is pending. Callback ops contribute
+    BOTH their HeartbeatDeadline (resets on incoming heartbeats) and their
+    overall TimeoutDeadline; whichever fires first cancels the callback as
+    `Callback.Timeout` per AWS docs."""
     soonest = None
     for op in rec.get("Operations", []):
-        if op.get("Type") != "WAIT":
-            continue
         if op.get("Status") != "STARTED":
             continue
-        ts = (op.get("WaitDetails") or {}).get("ScheduledEndTimestamp")
-        if ts is None:
-            continue
-        if soonest is None or ts < soonest:
-            soonest = ts
+        if op.get("Type") == "WAIT":
+            ts = (op.get("WaitDetails") or {}).get("ScheduledEndTimestamp")
+            if ts is None:
+                continue
+            if soonest is None or ts < soonest:
+                soonest = ts
+        elif op.get("Type") == "CALLBACK":
+            details = op.get("CallbackDetails") or {}
+            for ts in (details.get("HeartbeatDeadline"), details.get("TimeoutDeadline")):
+                if ts is None:
+                    continue
+                if soonest is None or ts < soonest:
+                    soonest = ts
+        elif op.get("Type") == "STEP":
+            # SDK's RETRY checkpoint records NextAttemptTimestamp = now+delay
+            # and returns PENDING expecting a re-invoke once the delay elapses.
+            # See aws_durable_execution_sdk_python/operation/step.py:336 (the
+            # create_step_retry path) — without scanning STEP ops here, retries
+            # would never fire and the execution would hang at STARTED.
+            ts = (op.get("StepDetails") or {}).get("NextAttemptTimestamp")
+            if ts is None:
+                continue
+            if soonest is None or ts < soonest:
+                soonest = ts
     return soonest
 
 
 def schedule_resume(arn: str, account_id: str | None = None) -> bool:
-    """Inspect the execution's operations log; if any WAIT op is still
-    pending, enqueue a re-invocation at the earliest expiry. Returns True
-    when something was scheduled."""
+    """Inspect the execution's operations log; if any WAIT or CALLBACK op
+    has a pending expiry, enqueue a re-invocation at the earliest one. Also
+    fires immediately when a callback has already been resolved externally
+    (Send*Callback handlers call us). Returns True when scheduled."""
     rec = _executions.get(arn)
     if not rec or rec.get("Status") != "RUNNING":
         return False
-    expiry = _next_wait_expiry(rec)
-    if expiry is None:
+    expiry = _next_expiry(rec)
+    # When called from a Send*Callback handler we want to wake the execution
+    # immediately so the SDK observes the resolution on its next replay.
+    has_resolved_callback = any(
+        op.get("Type") == "CALLBACK" and op.get("Status") in ("SUCCEEDED", "FAILED")
+        and not (op.get("CallbackDetails") or {}).get("_replayed")
+        for op in rec.get("Operations", [])
+    )
+    if expiry is None and not has_resolved_callback:
         return False
+    when = _now() if expiry is None else expiry
+    if has_resolved_callback:
+        when = min(when, _now())
     with _resume_lock:
-        heapq.heappush(_resume_queue, (expiry, arn, account_id or "000000000000"))
+        heapq.heappush(_resume_queue, (when, arn, account_id or "000000000000"))
     _resume_event.set()
     _ensure_resume_thread()
     return True
@@ -858,21 +1138,86 @@ def _resume_loop() -> None:
 
 
 def _resume_execution(arn: str) -> None:
-    """Mark all STARTED WAIT ops with elapsed timers as SUCCEEDED, then
-    re-invoke the function so the SDK picks up where it left off."""
+    """Settle elapsed timers (WAIT expiries, CALLBACK heartbeat/timeout
+    deadlines) then re-invoke the function so the SDK picks up where it
+    left off. When called with a stale heap entry (heartbeat pushed the
+    deadline forward after the entry was queued) we detect that nothing
+    elapsed and simply re-enqueue at the current earliest deadline rather
+    than triggering a spurious re-invoke."""
     rec = _executions.get(arn)
     if not rec or rec.get("Status") != "RUNNING":
         return
     now = _now()
+    anything_elapsed = False
+    has_resolved_callback = any(
+        op.get("Type") == "CALLBACK" and op.get("Status") in ("SUCCEEDED", "FAILED")
+        and not (op.get("CallbackDetails") or {}).get("_replayed")
+        for op in rec.get("Operations", [])
+    )
     for op in rec.get("Operations", []):
-        if op.get("Type") == "WAIT" and op.get("Status") == "STARTED":
+        if op.get("Status") != "STARTED":
+            continue
+        if op.get("Type") == "WAIT":
             ts = (op.get("WaitDetails") or {}).get("ScheduledEndTimestamp")
             if ts is not None and ts <= now:
                 op["Status"] = "SUCCEEDED"
                 op["EndTimestamp"] = now
+                anything_elapsed = True
                 _emit_history_event(rec, "WaitSucceeded", "WaitSucceededDetails", {
                     "Duration": (op.get("WaitDetails") or {}).get("Duration", 0),
                 }, event_id=op.get("Id"), name=op.get("Name"))
+        elif op.get("Type") == "STEP":
+            # STEP RETRY: the SDK will re-execute the step body on replay; we
+            # just need to wake the function once the recorded delay elapses.
+            # The STEP stays Status=STARTED across attempts (the SDK uses
+            # StepDetails.Attempt for counting), so this branch only marks
+            # "something elapsed" so _resume_execution invokes rather than
+            # taking the stale-entry no-op path.
+            ts = (op.get("StepDetails") or {}).get("NextAttemptTimestamp")
+            if ts is not None and ts <= now:
+                anything_elapsed = True
+        elif op.get("Type") == "CALLBACK":
+            details = op.get("CallbackDetails") or {}
+            t_overall = details.get("TimeoutDeadline")
+            t_heartbeat = details.get("HeartbeatDeadline")
+            fired = None
+            if t_overall is not None and t_overall <= now:
+                fired = "Callback.Timeout"
+            elif t_heartbeat is not None and t_heartbeat <= now:
+                fired = "Callback.Heartbeat"
+            if fired is not None:
+                op["Status"] = "TIMED_OUT"
+                op["EndTimestamp"] = now
+                anything_elapsed = True
+                err_obj = {
+                    "ErrorType": fired,
+                    "ErrorMessage": f"Callback timed out: {fired}",
+                    "ErrorData": "",
+                    "StackTrace": [],
+                }
+                details["Error"] = err_obj
+                _emit_history_event(rec, "CallbackTimedOut", "CallbackTimedOutDetails",
+                                    {"Error": {"Payload": err_obj, "Truncated": False}},
+                                    event_id=op.get("Id"), name=op.get("Name"))
+                # Index entry stays so a late Send*Callback returns 400
+                # CallbackTimeoutException rather than 404.
+    # Stale heap entry (e.g. heartbeat extended the deadline after we were
+    # queued, or schedule_resume queued an immediate wake that lost a race
+    # with a checkpoint): nothing to settle and no external resolution to
+    # replay. Re-arm at the current earliest deadline and skip the invoke.
+    if not anything_elapsed and not has_resolved_callback:
+        expiry = _next_expiry(rec)
+        if expiry is not None:
+            with _resume_lock:
+                heapq.heappush(_resume_queue, (expiry, arn, "000000000000"))
+            _resume_event.set()
+        return
+    # Mark externally-resolved callbacks as replayed so the next schedule_resume
+    # doesn't loop.
+    for op in rec.get("Operations", []):
+        if op.get("Type") == "CALLBACK" and op.get("Status") in ("SUCCEEDED", "FAILED"):
+            details = op.setdefault("CallbackDetails", {})
+            details["_replayed"] = True
     # Rotate token so the resumed invocation gets a fresh one.
     rec["CheckpointToken"] = new_checkpoint_token()
     # Trigger a fresh invocation through lambda_svc with the populated

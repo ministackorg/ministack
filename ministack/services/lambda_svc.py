@@ -574,7 +574,7 @@ def invoke_durable_resume(function_name: str, durable_arn: str, original_event: 
         "DurableExecutionArn": durable_arn,
         "CheckpointToken": rec["CheckpointToken"],
         "InitialExecutionState": {
-            "Operations": lambda_durable._serialize_operations(rec["Operations"]),
+            "Operations": lambda_durable._serialize_operations(rec["Operations"], for_event=True),
             "NextMarker": "",
         },
     }
@@ -1567,7 +1567,7 @@ async def _invoke(name: str, event: dict, headers: dict, path_qualifier: str | N
             "DurableExecutionArn": durable_arn,
             "CheckpointToken": rec["CheckpointToken"],
             "InitialExecutionState": {
-                "Operations": _ld._serialize_operations(rec["Operations"]),
+                "Operations": _ld._serialize_operations(rec["Operations"], for_event=True),
                 "NextMarker": "",
             },
         }

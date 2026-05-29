@@ -22,7 +22,7 @@ _LAMBDA_PATH_RE = re.compile(
     r"^/\d{4}-\d{2}-\d{2}/(?:functions|layers|event-source-mappings|"
     r"account-settings|runtime|tags|code-signing-configs|"
     # Durable Functions (preview, Dec 2025).
-    r"durable-executions)(?:/|$)"
+    r"durable-executions|durable-execution-callbacks)(?:/|$)"
 )
 
 # ECS Task Metadata V4 paths: /v4/<token>[/task|/stats|...]. Token is
@@ -67,7 +67,7 @@ SERVICE_PATTERNS = {
             r"^/2018-10-31/layers",
             # Durable Functions (preview, Dec 2025) — surface lives on the
             # Lambda endpoint under a fresh API-version prefix.
-            r"^/2025-12-01/(durable-executions|functions)",
+            r"^/2025-12-01/(durable-executions|durable-execution-callbacks|functions)",
         ],
         "host_patterns": [r"lambda\."],
     },
