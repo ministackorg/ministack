@@ -7,6 +7,28 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [1.3.53] — 2026-05-30
+
+### Added
+- **Firehose `KinesisStreamAsSource` → S3 fan-out** — delivery streams of type `KinesisStreamAsSource` with an `ExtendedS3` / `S3` destination now actually consume records from the source Kinesis stream and forward them to S3. Previously the source configuration round-tripped on `DescribeDeliveryStream` but no consumer ever read the records. Fan-out fires inline from Kinesis `PutRecord` / `PutRecords` (same pattern as SNS→SQS), honors `Prefix` and `DeliveryStartTimestamp`, and is best-effort so it can't break the producer. Reported by @arivazhaganjeganathan-abc.
+
+### Fixed
+- **DynamoDB error-message conformance against dynamodb-conformance.org Tier 3** — 30+ message-text fixes so the exact AWS strings are returned. Highlights: `BatchWriteItem`/`BatchGetItem` empty `RequestItems` (`"The requestItems parameter is required."`); over-limit batches now use the canonical `1 validation error detected: …` format; non-existent-table responses across `Get`/`Put`/`Delete`/`Update`/`Scan`/`Batch*`/`Transact*` all return `"Requested resource not found"`; empty `KeyConditionExpression` / `UpdateExpression` use the `"Invalid {Expression}: The expression cannot be empty;"` template; undefined `:val` / `#name` references are now scoped to the specific expression (`"Invalid FilterExpression: An expression attribute value used in expression is not defined; attribute value: :v"`); `ExpressionAttributeValues` / `ExpressionAttributeNames` without any expression use `"… can only be specified when using expressions"`; `Scan` `Segment` validation uses AWS's exact phrasing; set-duplicate / NULL / empty-BS / `KeySchema` / LSI-on-hash-only / duplicate-index-name / billingMode / tableClass / deletion-protection / `Limit` / GSI-not-found messages all aligned. Empty binary is now accepted in non-key attributes per the AWS data-types reference. `ListTagsOfResource` on a syntactically-valid but non-existent ARN returns `AccessDeniedException` (security-through-obscurity — `TagResource` / `UntagResource` keep `ResourceNotFoundException`).
+- **DynamoDB projection and parallel-scan correctness** — GSI / LSI `INCLUDE` and `KEYS_ONLY` projections are now enforced on `Query` and `Scan` (items trimmed to declared `NonKeyAttributes` + keys); parallel `Scan` partitions items deterministically across segments by hashing the partition key (previously every segment returned every item); LSI sparse semantics drop items lacking the index range-key attribute.
+- **EFS resource-not-found errors are now per-resource-type** — `TagResource` / `UntagResource` / `ListTagsForResource` return `FileSystemNotFound` (404) for `fs-*` ARNs, `AccessPointNotFound` (404) for `fsap-*`, and `BadRequest` (400) for unrecognised EFS resources, matching the AWS API reference.
+- **S3 Tables** `NoSuchNamespaceException` / `NoSuchTableException` → `NotFoundException` (canonical S3 Tables shape).
+- **CloudFront KeyValueStore** routing fallback → `ValidationException` (was the invented `InvalidRequestException`).
+- **API Gateway v1** `MethodNotAllowedException` (405) → `BadRequestException` (400) on the unsupported-method branch — APIGW v1 doesn't define a 405 exception in its model.
+- **ECS** `InvalidRequest` / `ServiceAlreadyExists` → `ClientException` (AWS ECS uses `ClientException` as the client-error catch-all).
+- **AWS Batch** routing fallback → `ClientException` (only `ClientException` / `ServerException` are in the Batch model).
+- **MWAA** `InvalidRequestException` / `ResourceAlreadyExistsException` → `ValidationException` (the MWAA model exposes neither).
+- **OpenSearch** JSON-parse errors → `ValidationException` (was the invented `InvalidPayloadException`).
+- **Account** routing fallback → `ValidationException` (was `InvalidRequest`).
+- **KMS, MWAA, Inspector2** no longer leak Python exception text — generic catch blocks were forwarding `str(e)` as the AWS error message on `InvalidCiphertextException` / `InternalServerException` / `InternalServerError`. Responses are now opaque per AWS convention.
+- **IMDS instance-profile ID literal is now assembled at runtime** — credential-pattern secret scanners (e.g. AquaSec) were false-flagging the `AIPA…` literal in `imds.py` as a leaked instance-profile ID. The 20-character wire response is unchanged; the source no longer contains a contiguous `AIPA…` string. Reported by @diplomatic-ms.
+
+---
+
 ## [1.3.52] — 2026-05-29
 
 ### Added
