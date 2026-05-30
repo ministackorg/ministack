@@ -349,6 +349,118 @@ def test_apigw_execute_lambda_proxy(apigw, lam):
     apigw.delete_api(ApiId=api_id)
     lam.delete_function(FunctionName=fname)
 
+def test_apigw_execute_lambda_proxy_cookies(apigw, lam):
+    """Payload format 2.0 `cookies` array yields one Set-Cookie header per entry.
+
+    Real APIGW v2 emits each `cookies` entry as a separate Set-Cookie response
+    header (RFC 6265 §3 forbids comma-folding them). A regular header returned
+    alongside must still pass through.
+    """
+    import urllib.request as _urlreq
+    import uuid as _uuid
+
+    fname = f"intg-apigw-cookie-{_uuid.uuid4().hex[:8]}"
+    code = (
+        b"def handler(event, context):\n"
+        b"    return {\n"
+        b"        'statusCode': 200,\n"
+        b"        'headers': {'X-App': 'yes'},\n"
+        b"        'cookies': ['session=abc123; Path=/; HttpOnly', 'flag=on; Path=/; SameSite=Lax'],\n"
+        b"        'body': 'ok',\n"
+        b"    }\n"
+    )
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("index.py", code)
+    lam.create_function(
+        FunctionName=fname,
+        Runtime="python3.12",
+        Role="arn:aws:iam::000000000000:role/test-role",
+        Handler="index.handler",
+        Code={"ZipFile": buf.getvalue()},
+    )
+
+    api_id = apigw.create_api(Name=f"cookie-api-{fname}", ProtocolType="HTTP")["ApiId"]
+    int_id = apigw.create_integration(
+        ApiId=api_id,
+        IntegrationType="AWS_PROXY",
+        IntegrationUri=f"arn:aws:lambda:us-east-1:000000000000:function:{fname}",
+        PayloadFormatVersion="2.0",
+    )["IntegrationId"]
+    route_id = apigw.create_route(
+        ApiId=api_id,
+        RouteKey="GET /cookie",
+        Target=f"integrations/{int_id}",
+    )["RouteId"]
+    apigw.create_stage(ApiId=api_id, StageName="$default")
+
+    url = f"http://{api_id}.execute-api.localhost:{_EXECUTE_PORT}/$default/cookie"
+    req = _urlreq.Request(url, method="GET")
+    req.add_header("Host", f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}")
+    resp = _urlreq.urlopen(req)
+    assert resp.status == 200
+    set_cookies = resp.headers.get_all("Set-Cookie") or []
+    assert set_cookies == [
+        "session=abc123; Path=/; HttpOnly",
+        "flag=on; Path=/; SameSite=Lax",
+    ]
+    # A normal header returned alongside the cookies still passes through.
+    assert resp.headers.get("X-App") == "yes"
+
+    # Cleanup
+    apigw.delete_route(ApiId=api_id, RouteId=route_id)
+    apigw.delete_integration(ApiId=api_id, IntegrationId=int_id)
+    apigw.delete_api(ApiId=api_id)
+    lam.delete_function(FunctionName=fname)
+
+def test_apigw_execute_lambda_proxy_empty_cookies(apigw, lam):
+    """An empty `cookies` array emits zero Set-Cookie headers (no empty header)."""
+    import urllib.request as _urlreq
+    import uuid as _uuid
+
+    fname = f"intg-apigw-nocookie-{_uuid.uuid4().hex[:8]}"
+    code = (
+        b"def handler(event, context):\n"
+        b"    return {'statusCode': 200, 'cookies': [], 'body': 'ok'}\n"
+    )
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("index.py", code)
+    lam.create_function(
+        FunctionName=fname,
+        Runtime="python3.12",
+        Role="arn:aws:iam::000000000000:role/test-role",
+        Handler="index.handler",
+        Code={"ZipFile": buf.getvalue()},
+    )
+
+    api_id = apigw.create_api(Name=f"nocookie-api-{fname}", ProtocolType="HTTP")["ApiId"]
+    int_id = apigw.create_integration(
+        ApiId=api_id,
+        IntegrationType="AWS_PROXY",
+        IntegrationUri=f"arn:aws:lambda:us-east-1:000000000000:function:{fname}",
+        PayloadFormatVersion="2.0",
+    )["IntegrationId"]
+    route_id = apigw.create_route(
+        ApiId=api_id,
+        RouteKey="GET /nocookie",
+        Target=f"integrations/{int_id}",
+    )["RouteId"]
+    apigw.create_stage(ApiId=api_id, StageName="$default")
+
+    url = f"http://{api_id}.execute-api.localhost:{_EXECUTE_PORT}/$default/nocookie"
+    req = _urlreq.Request(url, method="GET")
+    req.add_header("Host", f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}")
+    resp = _urlreq.urlopen(req)
+    assert resp.status == 200
+    assert (resp.headers.get_all("Set-Cookie") or []) == []
+
+    # Cleanup
+    apigw.delete_route(ApiId=api_id, RouteId=route_id)
+    apigw.delete_integration(ApiId=api_id, IntegrationId=int_id)
+    apigw.delete_api(ApiId=api_id)
+    lam.delete_function(FunctionName=fname)
+
 def test_apigw_execute_no_route(apigw):
     """execute-api returns 404 when no matching route exists."""
     import urllib.error as _urlerr

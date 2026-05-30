@@ -977,6 +977,13 @@ async def _invoke_lambda_proxy_v1(integration, api_id, stage_name, stage, resour
     status = lambda_response.get("statusCode", 200)
     resp_headers = {"Content-Type": "application/json"}
     resp_headers.update(lambda_response.get("headers", {}))
+    # Payload format 1.0 carries multi-value headers (notably Set-Cookie) in
+    # `multiValueHeaders`. AWS merges these over `headers`, with multiValueHeaders
+    # winning on key collision. Each list value is expanded into one header line
+    # per entry by _send_response.
+    for k, v in (lambda_response.get("multiValueHeaders") or {}).items():
+        if v:
+            resp_headers[k] = list(v)
     resp_body = lambda_response.get("body", "")
     if isinstance(resp_body, str):
         resp_body = resp_body.encode("utf-8")
