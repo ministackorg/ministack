@@ -7,6 +7,18 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [1.3.54] — 2026-05-30
+
+### Added
+- **EKS addons** — `CreateAddon`, `DescribeAddon`, `ListAddons`, `UpdateAddon`, `DeleteAddon` at `/clusters/{name}/addons[/{addonName}[/update]]`. Status flips to `ACTIVE` on create / update (the same shortcut the nodegroup path already uses — Terraform polls until `ACTIVE` so a slow-roll status would only stall plans). Tags + persistence wired through the existing patterns. Unblocks `aws_eks_addon` for the standard cluster bootstrap (`vpc-cni`, `coredns`, `kube-proxy`, `aws-ebs-csi-driver`). Reported by @b-rajesh.
+
+### Fixed
+- **API Gateway Lambda-proxy `Set-Cookie` and `multiValueHeaders` now reach the client** — v2 maps the payload-format-2.0 `cookies` array to a list-valued `Set-Cookie` (RFC 6265 §3 forbids comma-folding); v1 folds the format-1.0 `multiValueHeaders` into the response with multiValueHeaders winning over `headers` on key collision per the AWS contract; `app.py:_send_response` expands list-valued headers into one wire line per entry. Collision check is case-insensitive (HTTP headers are case-insensitive per RFC 7230 §3.2), so `Set-Cookie` in `headers` plus `set-cookie` in `multiValueHeaders` correctly resolves to MVH wins instead of shipping both. Contributed by @rmlasseter.
+- **DynamoDB data-plane table-name length range** — `PutItem` / `GetItem` / `UpdateItem` / `DeleteItem` / `Query` / `Scan` now accept the AWS-documented 1..255 range (the 3-char minimum is a control-plane-only rule on `CreateTable`). NULL-attribute error message text aligned to `"Null attribute value types must have the value of true"`.
+- **EC2 launch template version XML shape** — `CreateLaunchTemplateVersion` returns a single `<launchTemplateVersion>` struct; `DescribeLaunchTemplateVersions` wraps the same struct in `<launchTemplateVersionSet><item>…</item></launchTemplateVersionSet>`. The `<item>` wrapper now belongs at the list-context boundary, not on the inner struct — matching the AWS Query-protocol response. Reported by @b-rajesh.
+
+---
+
 ## [1.3.53] — 2026-05-30
 
 ### Added
