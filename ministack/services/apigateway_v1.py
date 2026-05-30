@@ -976,7 +976,16 @@ async def _invoke_lambda_proxy_v1(integration, api_id, stage_name, stage, resour
 
     status = lambda_response.get("statusCode", 200)
     resp_headers = {"Content-Type": "application/json"}
-    resp_headers.update(lambda_response.get("headers", {}))
+    # Apply the Lambda's `headers` with case-insensitive override of any seeded
+    # default, the same way the multiValueHeaders merge below already case-folds
+    # collisions (added in #750 by @Nahuel990). HTTP field names are
+    # case-insensitive (RFC 9110 §5.1), so a lowercase `content-type` from the
+    # function must replace the default `Content-Type`, not ship alongside it.
+    for k, v in (lambda_response.get("headers") or {}).items():
+        lower_k = k.lower()
+        for existing in [h for h in resp_headers if h.lower() == lower_k]:
+            del resp_headers[existing]
+        resp_headers[k] = v
     # Payload format 1.0 carries multi-value headers (notably Set-Cookie) in
     # `multiValueHeaders`. AWS docs: "If you specify values for both `headers`
     # and `multiValueHeaders`, API Gateway merges them into a single list. If
