@@ -474,7 +474,17 @@ async def _send_response(send, status, headers, body):
     body_bytes = body if isinstance(body, bytes) else body.encode("utf-8")
     if "content-length" not in {k.lower() for k in headers}:
         headers["Content-Length"] = str(len(body_bytes))
-    header_list = [(k.encode("latin-1"), _encode_header_value(str(v))) for k, v in headers.items()]
+    # A list/tuple header value expands to one header line per item. This is
+    # required for Set-Cookie, which RFC 6265 §3 forbids folding into a single
+    # comma-joined header; APIGW Lambda-proxy responses surface multiple
+    # cookies this way. Scalar values keep their existing single-line behavior.
+    header_list = []
+    for k, v in headers.items():
+        if isinstance(v, (list, tuple)):
+            for item in v:
+                header_list.append((k.encode("latin-1"), _encode_header_value(str(item))))
+        else:
+            header_list.append((k.encode("latin-1"), _encode_header_value(str(v))))
     await send(
         {
             "type": "http.response.start",
