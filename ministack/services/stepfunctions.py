@@ -4113,6 +4113,18 @@ _AWS_SDK_ERROR_PREFIX = {
     "lambda": "Lambda",
 }
 
+_AWS_SDK_ERROR_CODE_OVERRIDES = {
+    "rds": {
+        "GlobalClusterNotFoundFault": "GlobalClusterNotFoundException",
+        "DBClusterNotFoundFault": "DbClusterNotFoundException",
+        "GlobalClusterAlreadyExistsFault": "GlobalClusterAlreadyExistsException",
+        "InvalidGlobalClusterStateFault": "InvalidGlobalClusterStateException",
+        "InvalidDBClusterStateFault": "InvalidDbClusterStateException",
+        "InvalidParameterCombination": "RdsException",
+        "InvalidParameterValue": "RdsException",
+    },
+}
+
 
 def _prefix_sdk_error(service_name: str, error_code: str) -> str:
     """Prefix an SDK error code with the service name, matching real AWS SFN behavior.
@@ -4123,6 +4135,7 @@ def _prefix_sdk_error(service_name: str, error_code: str) -> str:
     """
     if error_code.startswith("States."):
         return error_code
+    error_code = _AWS_SDK_ERROR_CODE_OVERRIDES.get(service_name, {}).get(error_code, error_code)
     prefix = _AWS_SDK_ERROR_PREFIX.get(service_name, service_name.capitalize())
     if error_code.startswith(f"{prefix}."):
         return error_code
@@ -4291,7 +4304,7 @@ _XML_LIST_WRAPPER_TAGS = frozenset({
     "OptionGroupMemberships", "StatusInfos", "DomainMemberships",
     "AssociatedRoles", "TagList", "ProcessorFeatures",
     "EnabledCloudwatchLogsExports", "GlobalClusterMembers",
-    "DBParameterGroups", "DBInstances", "DBClusters",
+    "DBParameterGroups", "DBInstances", "DBClusters", "Readers",
     "SupportedNetworkTypes",
 })
 _XML_BOOLEAN_FIELDS = frozenset({

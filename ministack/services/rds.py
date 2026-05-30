@@ -433,12 +433,19 @@ def _grant_mysql_master_user_privileges(host, port, master_user, master_pass, db
 
 
 def _try_database_connect(host, port, engine, user, password, db_name):
-    """Single auth-probe attempt. Returns True on success, False on a
-    transient failure. TCP readiness alone is not enough for MySQL/Postgres
-    images — they accept sockets before bootstrap creates users/databases —
-    so we open and close an authenticated connection. When the DB driver
-    isn't installed (lightweight image) we fall back to a one-shot TCP check.
+    """Single auth + query probe attempt.
+
+    TCP readiness alone is not enough for MySQL/Postgres images, and MySQL can
+    accept authenticated connections before it can reliably execute setup SQL.
+    When the DB driver isn't installed (lightweight image), fall back to TCP.
     """
+    def _execute_probe(conn):
+        cur = conn.cursor()
+        try:
+            cur.execute("SELECT 1")
+        finally:
+            cur.close()
+
     try:
         if _is_mysql_engine(engine):
             try:
@@ -450,6 +457,10 @@ def _try_database_connect(host, port, engine, user, password, db_name):
                 password=password, database=db_name or None,
                 connect_timeout=2, read_timeout=2, write_timeout=2,
                 autocommit=True)
+            try:
+                _execute_probe(conn)
+            finally:
+                conn.close()
         elif _is_postgres_engine(engine):
             try:
                 import psycopg2
@@ -459,9 +470,12 @@ def _try_database_connect(host, port, engine, user, password, db_name):
                 host=host, port=int(port), user=user,
                 password=password, dbname=db_name or "postgres",
                 connect_timeout=2)
+            try:
+                _execute_probe(conn)
+            finally:
+                conn.close()
         else:
             return _wait_for_port(host, port, timeout=1)
-        conn.close()
         return True
     except Exception as e:
         # Distinguish *permanent* auth failures from transient boot-time errors.
@@ -874,7 +888,7 @@ def _resolve_instance(db_id):
 
 
 def _sync_cluster_endpoints(cluster):
-    """Point Aurora cluster endpoints at reachable local DB instance endpoints."""
+    """Point Aurora cluster endpoint names at local DB instance endpoints."""
     members = cluster.get("DBClusterMembers") or []
     if not members:
         return
@@ -887,7 +901,6 @@ def _sync_cluster_endpoints(cluster):
     if writer_inst and writer_inst.get("Endpoint"):
         writer_ep = writer_inst["Endpoint"]
         cluster["Endpoint"] = writer_ep.get("Address", cluster.get("Endpoint", ""))
-        cluster["Port"] = int(writer_ep.get("Port", cluster.get("Port", 0)))
     if reader_inst and reader_inst.get("Endpoint"):
         cluster["ReaderEndpoint"] = reader_inst["Endpoint"].get(
             "Address", cluster.get("ReaderEndpoint", ""))
@@ -1781,6 +1794,13 @@ def _rotate_real_password(cluster, old_pass, new_pass):
             port = int(endpoint.get("Port", 3306))
         try:
             import pymysql
+        except Exception as e:
+            logger.warning("RDS: password rotation failed on %s: %s",
+                           cluster_id, e)
+            return False
+        conn = None
+        cur = None
+        try:
             conn = pymysql.connect(
                 host=host, port=port, user="root",
                 password=old_pass, autocommit=True)
@@ -1788,12 +1808,26 @@ def _rotate_real_password(cluster, old_pass, new_pass):
             cur.execute(
                 "ALTER USER 'root'@'%%' IDENTIFIED BY %s", (new_pass,))
             cur.close()
+            cur = None
             conn.close()
+            conn = None
             logger.info("RDS: rotated root password on %s", cluster_id)
+            return True
         except Exception as e:
+            if cur:
+                try:
+                    cur.close()
+                except Exception:
+                    pass
+            if conn:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
             logger.warning("RDS: password rotation failed on %s: %s",
                            cluster_id, e)
-        break
+            return False
+    return True
 
 
 def _modify_db_cluster(p):

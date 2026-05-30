@@ -906,7 +906,7 @@ def test_rds_aurora_cluster_lists_instance_member(rds):
 
 
 def test_rds_aurora_cluster_endpoints_follow_backing_instance(rds):
-    """Aurora cluster endpoints should be reachable through the local instance."""
+    """Aurora cluster endpoint host follows the local instance, but port stays AWS-shaped."""
     cid = f"epclus-{_uuid_mod.uuid4().hex[:10]}"
     iid = f"{cid}-writer"
     rds.create_db_cluster(
@@ -927,7 +927,7 @@ def test_rds_aurora_cluster_endpoints_follow_backing_instance(rds):
 
     assert cluster["Endpoint"] == inst["Endpoint"]["Address"]
     assert cluster["ReaderEndpoint"] == inst["Endpoint"]["Address"]
-    assert cluster["Port"] == inst["Endpoint"]["Port"]
+    assert cluster["Port"] == 3306
 
 
 def test_rds_mysql_master_user_privilege_grants(monkeypatch):
