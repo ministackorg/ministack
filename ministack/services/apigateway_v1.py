@@ -978,12 +978,22 @@ async def _invoke_lambda_proxy_v1(integration, api_id, stage_name, stage, resour
     resp_headers = {"Content-Type": "application/json"}
     resp_headers.update(lambda_response.get("headers", {}))
     # Payload format 1.0 carries multi-value headers (notably Set-Cookie) in
-    # `multiValueHeaders`. AWS merges these over `headers`, with multiValueHeaders
-    # winning on key collision. Each list value is expanded into one header line
-    # per entry by _send_response.
+    # `multiValueHeaders`. AWS docs: "If you specify values for both `headers`
+    # and `multiValueHeaders`, API Gateway merges them into a single list. If
+    # the same key-value pair is specified in both, only the values from
+    # `multiValueHeaders` will appear in the merged list." HTTP headers are
+    # case-insensitive (RFC 7230 §3.2), so the collision check must compare
+    # case-folded — `Set-Cookie` in `headers` plus `set-cookie` in
+    # `multiValueHeaders` is the SAME header. Each list value is then expanded
+    # into one header line per entry by _send_response.
     for k, v in (lambda_response.get("multiValueHeaders") or {}).items():
-        if v:
-            resp_headers[k] = list(v)
+        if not v:
+            continue
+        lower_k = k.lower()
+        for existing in list(resp_headers):
+            if existing.lower() == lower_k:
+                del resp_headers[existing]
+        resp_headers[k] = list(v)
     resp_body = lambda_response.get("body", "")
     if isinstance(resp_body, str):
         resp_body = resp_body.encode("utf-8")

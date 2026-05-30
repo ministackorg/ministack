@@ -562,6 +562,78 @@ def test_apigwv1_execute_lambda_proxy_multi_value_headers(apigw_v1, lam):
     lam.delete_function(FunctionName=fname)
 
 
+def test_apigwv1_execute_lambda_proxy_mvh_wins_case_insensitive(apigw_v1, lam):
+    """Case-insensitive collision between `headers` and `multiValueHeaders`.
+
+    Per AWS docs: "If the same key-value pair is specified in both, only the
+    values from `multiValueHeaders` will appear in the merged list." HTTP
+    headers are case-insensitive, so `Set-Cookie` in `headers` plus
+    `set-cookie` in `multiValueHeaders` must NOT both ship — only the MVH
+    values win.
+    """
+    import urllib.request as _urlreq
+    import uuid as _uuid
+
+    fname = f"intg-v1-mvh-case-{_uuid.uuid4().hex[:8]}"
+    code = (
+        b"def handler(event, context):\n"
+        b"    return {\n"
+        b"        'statusCode': 200,\n"
+        b"        'headers': {'Set-Cookie': 'should-be-dropped=1; Path=/'},\n"
+        b"        'multiValueHeaders': {'set-cookie': ['a=1; Path=/', 'b=2; Path=/']},\n"
+        b"        'body': 'ok',\n"
+        b"    }\n"
+    )
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("index.py", code)
+    lam.create_function(
+        FunctionName=fname,
+        Runtime="python3.12",
+        Role="arn:aws:iam::000000000000:role/test-role",
+        Handler="index.handler",
+        Code={"ZipFile": buf.getvalue()},
+    )
+
+    api_id = apigw_v1.create_rest_api(name=f"v1-mvh-case-{fname}")["id"]
+    root = next(r for r in apigw_v1.get_resources(restApiId=api_id)["items"] if r["path"] == "/")
+    resource_id = apigw_v1.create_resource(
+        restApiId=api_id,
+        parentId=root["id"],
+        pathPart="cookie",
+    )["id"]
+    apigw_v1.put_method(
+        restApiId=api_id,
+        resourceId=resource_id,
+        httpMethod="GET",
+        authorizationType="NONE",
+    )
+    apigw_v1.put_integration(
+        restApiId=api_id,
+        resourceId=resource_id,
+        httpMethod="GET",
+        type="AWS_PROXY",
+        integrationHttpMethod="POST",
+        uri=f"arn:aws:apigateway:us-east-1:lambda:path/2015-03-31/functions/arn:aws:lambda:us-east-1:000000000000:function:{fname}/invocations",
+    )
+    dep_id = apigw_v1.create_deployment(restApiId=api_id)["id"]
+    apigw_v1.create_stage(restApiId=api_id, stageName="test", deploymentId=dep_id)
+
+    url = f"http://{api_id}.execute-api.localhost:{_EXECUTE_PORT}/test/cookie"
+    req = _urlreq.Request(url, method="GET")
+    req.add_header("Host", f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}")
+    resp = _urlreq.urlopen(req)
+    assert resp.status == 200
+    set_cookies = resp.headers.get_all("Set-Cookie") or []
+    # Only MVH values ship; the scalar `Set-Cookie` from `headers` is dropped.
+    assert set_cookies == ["a=1; Path=/", "b=2; Path=/"]
+    # And the scalar value is not somewhere else in the response.
+    assert all("should-be-dropped" not in c for c in set_cookies)
+
+    apigw_v1.delete_rest_api(restApiId=api_id)
+    lam.delete_function(FunctionName=fname)
+
+
 @pytest.mark.skipif(not shutil.which("curl"), reason="provided bootstrap uses curl for Runtime API")
 def test_apigwv1_execute_lambda_proxy_provided_runtime(apigw_v1, lam):
     """execute-api AWS_PROXY must run provided.* zips via lambda_svc (Go/terraform parity)."""
