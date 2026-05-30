@@ -1650,6 +1650,39 @@ def test_ec2_launch_template_versions(ec2):
     ec2.delete_launch_template(LaunchTemplateId=lt_id)
 
 
+def test_ec2_create_launch_template_version_returns_version_number(ec2):
+    """CreateLaunchTemplateVersion must return VersionNumber at the
+    `launchTemplateVersion` root, not wrapped in `<item>` — otherwise the
+    Go SDK reads it as null and Terraform sends ``SetDefaultVersion=0`` to
+    the follow-up ModifyLaunchTemplate, which AWS rejects with
+    ``InvalidLaunchTemplateId.VersionNotFound``. Repro for issue #753."""
+    resp = ec2.create_launch_template(
+        LaunchTemplateName="qa-lt-vnum",
+        LaunchTemplateData={"InstanceType": "t3.micro"},
+    )
+    lt_id = resp["LaunchTemplate"]["LaunchTemplateId"]
+    try:
+        v2 = ec2.create_launch_template_version(
+            LaunchTemplateId=lt_id,
+            LaunchTemplateData={"InstanceType": "t3.small"},
+        )
+        # botocore parses the response shape; if the inner XML is wrong, this
+        # field reads as None / missing rather than the version number.
+        assert "LaunchTemplateVersion" in v2
+        v = v2["LaunchTemplateVersion"]
+        assert v.get("VersionNumber") == 2, v
+        assert v.get("LaunchTemplateId") == lt_id
+
+        # End-to-end: Terraform-style follow-up that previously failed.
+        modified = ec2.modify_launch_template(
+            LaunchTemplateId=lt_id,
+            DefaultVersion=str(v["VersionNumber"]),
+        )
+        assert modified["LaunchTemplate"]["DefaultVersionNumber"] == 2
+    finally:
+        ec2.delete_launch_template(LaunchTemplateId=lt_id)
+
+
 def test_ec2_launch_template_with_block_devices(ec2):
     """Create a template with block device mappings."""
     resp = ec2.create_launch_template(

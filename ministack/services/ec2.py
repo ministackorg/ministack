@@ -4395,19 +4395,28 @@ def _lt_data_xml(data):
     return xml
 
 
-def _lt_version_xml(ver):
-    """Render a single launch template version as XML."""
-    xml = f"""<item>
-        <launchTemplateId>{_esc(ver['LaunchTemplateId'])}</launchTemplateId>
+def _lt_version_inner_xml(ver):
+    """Render the inner fields of a launch template version (no wrapper).
+
+    AWS uses two response shapes for the same struct: a SINGLE
+    `<launchTemplateVersion>{fields}</launchTemplateVersion>` for
+    CreateLaunchTemplateVersion, and a LIST
+    `<launchTemplateVersionSet><item>{fields}</item>...</launchTemplateVersionSet>`
+    for DescribeLaunchTemplateVersions. The `<item>` wrapper belongs at the
+    list-context boundary, not on the inner struct."""
+    return f"""<launchTemplateId>{_esc(ver['LaunchTemplateId'])}</launchTemplateId>
         <launchTemplateName>{_esc(ver['LaunchTemplateName'])}</launchTemplateName>
         <versionNumber>{ver['VersionNumber']}</versionNumber>
         <versionDescription>{_esc(ver.get('VersionDescription', ''))}</versionDescription>
         <defaultVersion>{str(ver.get('DefaultVersion', False)).lower()}</defaultVersion>
         <createTime>{ver['CreateTime']}</createTime>
         <createdBy>arn:aws:iam::{get_account_id()}:root</createdBy>
-        <launchTemplateData>{_lt_data_xml(ver.get('LaunchTemplateData', {}))}</launchTemplateData>
-    </item>"""
-    return xml
+        <launchTemplateData>{_lt_data_xml(ver.get('LaunchTemplateData', {}))}</launchTemplateData>"""
+
+
+def _lt_version_xml(ver):
+    """List-context wrapper used by DescribeLaunchTemplateVersions."""
+    return f"<item>{_lt_version_inner_xml(ver)}</item>"
 
 
 def _create_launch_template(p):
@@ -4516,7 +4525,7 @@ def _create_launch_template_version(p):
     lt["Versions"].append(version)
     lt["LatestVersionNumber"] = ver_num
     return _xml(200, "CreateLaunchTemplateVersionResponse",
-                f"<launchTemplateVersion>{_lt_version_xml(version)}</launchTemplateVersion>")
+                f"<launchTemplateVersion>{_lt_version_inner_xml(version)}</launchTemplateVersion>")
 
 
 def _describe_launch_templates(p):

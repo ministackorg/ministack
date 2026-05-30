@@ -52,6 +52,7 @@ except ImportError:
 
 _clusters = AccountScopedDict()       # name -> cluster record
 _nodegroups = AccountScopedDict()     # "cluster/nodegroup" -> nodegroup record
+_addons = AccountScopedDict()         # "cluster/addonName" -> addon record
 _tags = AccountScopedDict()           # arn -> {key: value}
 _port_counter_lock = threading.Lock()
 _port_counter = [EKS_BASE_PORT]
@@ -60,6 +61,7 @@ _port_counter = [EKS_BASE_PORT]
 def reset():
     _clusters.clear()
     _nodegroups.clear()
+    _addons.clear()
     _tags.clear()
     _port_counter[0] = EKS_BASE_PORT
     _stop_all_k3s()
@@ -77,6 +79,7 @@ def get_state():
     return {
         "clusters": clusters,
         "nodegroups": copy.deepcopy(_nodegroups),
+        "addons": copy.deepcopy(_addons),
         "tags": copy.deepcopy(_tags),
         "port_counter": _port_counter[0],
     }
@@ -85,6 +88,7 @@ def get_state():
 def restore_state(data):
     _clusters.update(data.get("clusters", {}))
     _nodegroups.update(data.get("nodegroups", {}))
+    _addons.update(data.get("addons", {}))
     _tags.update(data.get("tags", {}))
     if "port_counter" in data:
         _port_counter[0] = data["port_counter"]
@@ -123,6 +127,11 @@ def _cluster_arn(name):
 
 def _nodegroup_arn(cluster_name, ng_name):
     return f"arn:aws:eks:{get_region()}:{get_account_id()}:nodegroup/{cluster_name}/{ng_name}/{new_uuid()[:8]}"
+
+
+def _addon_arn(cluster_name, addon_name):
+    # AWS uses arn:aws:eks:{region}:{account}:addon/{cluster}/{addonName}/{uuid}.
+    return f"arn:aws:eks:{get_region()}:{get_account_id()}:addon/{cluster_name}/{addon_name}/{new_uuid()[:8]}"
 
 
 def _now():
@@ -482,6 +491,103 @@ def _delete_nodegroup(cluster_name, ng_name):
 
 
 # ---------------------------------------------------------------------------
+# Addons
+# ---------------------------------------------------------------------------
+# CreateAddon / DescribeAddon / DeleteAddon / ListAddons / UpdateAddon.
+# Status flips ACTIVE on Create / Update (same shortcut as nodegroups —
+# Terraform polls until ACTIVE so a slow-roll status would only stall tests).
+# Delete returns the record with status=DELETING and drops the entry.
+
+def _create_addon(cluster_name, body):
+    if cluster_name not in _clusters:
+        return _error(404, "ResourceNotFoundException",
+                      f"No cluster found for name: {cluster_name}.")
+    addon_name = body.get("addonName", "")
+    if not addon_name:
+        return _error(400, "InvalidParameterException", "Addon name is required.")
+
+    key = f"{cluster_name}/{addon_name}"
+    if key in _addons:
+        return _error(409, "ResourceInUseException",
+                      f"Addon already exists with name: {addon_name}")
+
+    arn = _addon_arn(cluster_name, addon_name)
+    now = _now()
+    addon = {
+        "addonName": addon_name,
+        "clusterName": cluster_name,
+        "status": "ACTIVE",
+        "addonVersion": body.get("addonVersion", ""),
+        "addonArn": arn,
+        "createdAt": now,
+        "modifiedAt": now,
+        "serviceAccountRoleArn": body.get("serviceAccountRoleArn", ""),
+        "tags": body.get("tags", {}),
+        "configurationValues": body.get("configurationValues", ""),
+        "podIdentityAssociations": body.get("podIdentityAssociations", []),
+        "health": {"issues": []},
+        "owner": "aws",
+        "publisher": "eks",
+    }
+    _addons[key] = addon
+    if addon["tags"]:
+        _tags[arn] = dict(addon["tags"])
+    return _json_resp(200, {"addon": addon})
+
+
+def _describe_addon(cluster_name, addon_name):
+    addon = _addons.get(f"{cluster_name}/{addon_name}")
+    if not addon:
+        return _error(404, "ResourceNotFoundException",
+                      f"No addon found for cluster {cluster_name} addon {addon_name}")
+    return _json_resp(200, {"addon": addon})
+
+
+def _list_addons(cluster_name, query):
+    if cluster_name not in _clusters:
+        return _error(404, "ResourceNotFoundException",
+                      f"No cluster found for name: {cluster_name}.")
+    max_results = int(query.get("maxResults", 100))
+    names = [a["addonName"] for k, a in _addons.items()
+             if k.startswith(f"{cluster_name}/")][:max_results]
+    return _json_resp(200, {"addons": names})
+
+
+def _delete_addon(cluster_name, addon_name):
+    key = f"{cluster_name}/{addon_name}"
+    addon = _addons.get(key)
+    if not addon:
+        return _error(404, "ResourceNotFoundException",
+                      f"No addon found for cluster {cluster_name} addon {addon_name}")
+    addon["status"] = "DELETING"
+    result = dict(addon)
+    _addons.pop(key, None)
+    _tags.pop(addon.get("addonArn", ""), None)
+    return _json_resp(200, {"addon": result})
+
+
+def _update_addon(cluster_name, addon_name, body):
+    key = f"{cluster_name}/{addon_name}"
+    addon = _addons.get(key)
+    if not addon:
+        return _error(404, "ResourceNotFoundException",
+                      f"No addon found for cluster {cluster_name} addon {addon_name}")
+    for field in ("addonVersion", "serviceAccountRoleArn",
+                  "configurationValues", "podIdentityAssociations"):
+        if field in body:
+            addon[field] = body[field]
+    addon["modifiedAt"] = _now()
+    addon["status"] = "ACTIVE"
+    update = {
+        "id": new_uuid(),
+        "status": "Successful",
+        "type": "AddonUpdate",
+        "createdAt": _now(),
+    }
+    return _json_resp(200, {"update": update})
+
+
+# ---------------------------------------------------------------------------
 # Tags
 # ---------------------------------------------------------------------------
 
@@ -565,6 +671,33 @@ async def handle_request(method, path, headers, body_bytes, query_params):
             return _describe_nodegroup(cluster_name, ng_name)
         if method == "DELETE":
             return _delete_nodegroup(cluster_name, ng_name)
+
+    # POST/GET /clusters/{name}/addons
+    m = re.fullmatch(r"/clusters/([A-Za-z0-9_-]+)/addons", path)
+    if m:
+        cluster_name = m.group(1)
+        if method == "POST":
+            return _create_addon(cluster_name, body)
+        if method == "GET":
+            return _list_addons(cluster_name, query)
+
+    # POST /clusters/{name}/addons/{addonName}/update — UpdateAddon.
+    # Must come BEFORE the generic /addons/{addonName} pattern so the
+    # `/update` suffix isn't swallowed by the wider regex.
+    m = re.fullmatch(r"/clusters/([A-Za-z0-9_-]+)/addons/([A-Za-z0-9_.-]+)/update", path)
+    if m:
+        cluster_name, addon_name = m.group(1), m.group(2)
+        if method == "POST":
+            return _update_addon(cluster_name, addon_name, body)
+
+    # GET/DELETE /clusters/{name}/addons/{addonName}
+    m = re.fullmatch(r"/clusters/([A-Za-z0-9_-]+)/addons/([A-Za-z0-9_.-]+)", path)
+    if m:
+        cluster_name, addon_name = m.group(1), m.group(2)
+        if method == "GET":
+            return _describe_addon(cluster_name, addon_name)
+        if method == "DELETE":
+            return _delete_addon(cluster_name, addon_name)
 
     # Tags: /tags/{arn+}
     if path.startswith("/tags/"):

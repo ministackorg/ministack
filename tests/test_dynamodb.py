@@ -5138,6 +5138,49 @@ def test_dynamodb_query_non_existent_index_validation(ddb):
         ddb.delete_table(TableName=name)
 
 
+def test_dynamodb_query_esk_schema_mismatch_rejected(ddb):
+    """ExclusiveStartKey missing the table's key attrs must be rejected.
+
+    Mirrors nubo-db/dynamodb-conformance tier1/query/basic.test.ts —
+    expects ValidationException matching /provided starting key is invalid/.
+    """
+    name = "q-esk-schema"
+    _basic_table(ddb, name, with_sk=True)
+    try:
+        with pytest.raises(ClientError) as e:
+            ddb.query(
+                TableName=name,
+                KeyConditionExpression="pk = :pk",
+                ExpressionAttributeValues={":pk": {"S": "x"}},
+                ExclusiveStartKey={"bad": {"S": "p"}},
+            )
+        assert e.value.response["Error"]["Code"] == "ValidationException"
+        assert "provided starting key is invalid" in e.value.response["Error"]["Message"]
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_query_esk_missing_gsi_key_rejected(ddb):
+    """ExclusiveStartKey missing the GSI's key attrs on an index query must be
+    rejected. Mirrors the conformance suite case where the ESK carries only
+    base-table keys and omits the GSI hash key."""
+    name = "q-esk-gsi"
+    _gsi_table(ddb, name)
+    try:
+        with pytest.raises(ClientError) as e:
+            ddb.query(
+                TableName=name,
+                IndexName="byGsiPk",
+                KeyConditionExpression="gsi_pk = :v",
+                ExpressionAttributeValues={":v": {"S": "x"}},
+                ExclusiveStartKey={"pk": {"S": "x"}},
+            )
+        assert e.value.response["Error"]["Code"] == "ValidationException"
+        assert "provided starting key is invalid" in e.value.response["Error"]["Message"]
+    finally:
+        ddb.delete_table(TableName=name)
+
+
 def test_dynamodb_scan_non_existent_index_validation(ddb):
     name = "s-noidx"
     _basic_table(ddb, name)

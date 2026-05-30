@@ -263,7 +263,7 @@ def _validate_attribute_value(attr_name: str, value: dict) -> tuple | None:
     elif vtype == "NULL":
         if vval is not True:
             return error_response_json("ValidationException",
-                "One or more parameter values were invalid: NULL attribute value must be true.", 400)
+                "One or more parameter values were invalid: Null attribute value types must have the value of true", 400)
     elif vtype == "SS":
         if not isinstance(vval, list) or not vval:
             return error_response_json("ValidationException",
@@ -691,16 +691,20 @@ def _validate_data_plane_table_name(name) -> tuple | None:
     """Used by PutItem/GetItem/DeleteItem/UpdateItem/Query/Scan: returns a
     ValidationException for null, empty, too-long, or pattern-violating
     table names — BEFORE any other validators fire so the conformance
-    'reports only tableName' tests match."""
+    'reports only tableName' tests match. Data-plane length range is 1..255
+    (the 3-char minimum is a control-plane rule)."""
     if name is None:
         return error_response_json("ValidationException",
             "1 validation error detected: Value null at 'tableName' failed to satisfy constraint: Member must not be null", 400)
     if not isinstance(name, str):
         return error_response_json("ValidationException",
             "1 validation error detected: Value at 'tableName' failed to satisfy constraint: Member must be a string", 400)
-    if len(name) < 3 or len(name) > 255:
+    if len(name) < 1:
         return error_response_json("ValidationException",
-            f"1 validation error detected: Value '{name}' at 'tableName' failed to satisfy constraint: Member must have length between 3 and 255", 400)
+            f"1 validation error detected: Value '{name}' at 'tableName' failed to satisfy constraint: Member must have length greater than or equal to 1", 400)
+    if len(name) > 255:
+        return error_response_json("ValidationException",
+            f"1 validation error detected: Value '{name}' at 'tableName' failed to satisfy constraint: Member must have length less than or equal to 255", 400)
     if not re.match(r"^[A-Za-z0-9_.\-]+$", name):
         return error_response_json("ValidationException",
             f"1 validation error detected: Value '{name}' at 'tableName' failed to satisfy constraint: Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+", 400)
@@ -749,13 +753,18 @@ _VALID_PROJECTION_TYPES = {"ALL", "KEYS_ONLY", "INCLUDE"}
 
 
 def _validate_table_name(name: str) -> tuple | None:
-    """Per AWS DynamoDB Developer Guide: 3-255 chars, pattern [A-Za-z0-9_.-]."""
+    """Per AWS DynamoDB Developer Guide: 3-255 chars, pattern [A-Za-z0-9_.-].
+    Used by CreateTable; data-plane uses a wider 1..255 range via
+    `_validate_data_plane_table_name`."""
     if not isinstance(name, str) or not name:
         return error_response_json("ValidationException",
             "1 validation error detected: Value null at 'tableName' failed to satisfy constraint: Member must not be null", 400)
-    if len(name) < 3 or len(name) > 255:
+    if len(name) < 3:
         return error_response_json("ValidationException",
-            f"1 validation error detected: Value '{name}' at 'tableName' failed to satisfy constraint: Member must have length between 3 and 255", 400)
+            f"1 validation error detected: Value '{name}' at 'tableName' failed to satisfy constraint: Member must have length greater than or equal to 3", 400)
+    if len(name) > 255:
+        return error_response_json("ValidationException",
+            f"1 validation error detected: Value '{name}' at 'tableName' failed to satisfy constraint: Member must have length less than or equal to 255", 400)
     if not _TABLE_NAME_RE.match(name):
         return error_response_json("ValidationException",
             f"1 validation error detected: Value '{name}' at 'tableName' failed to satisfy constraint: Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+", 400)
@@ -778,7 +787,7 @@ def _validate_key_schema(key_schema: list, attr_defs: list, context: str = "tabl
     hash_count = 0
     range_count = 0
     seen_names = set()
-    for ks in key_schema:
+    for idx, ks in enumerate(key_schema, start=1):
         attr = ks.get("AttributeName")
         kt = ks.get("KeyType")
         if not attr:
@@ -786,11 +795,10 @@ def _validate_key_schema(key_schema: list, attr_defs: list, context: str = "tabl
                 "1 validation error detected: Value null at 'keySchema.member.attributeName' failed to satisfy constraint: Member must not be null", 400)
         if kt not in _VALID_KEY_TYPES:
             return error_response_json("ValidationException",
-                f"1 validation error detected: Value '{kt}' at 'keySchema.{len(seen_names)+1}.member.keyType' failed to satisfy constraint: Member must satisfy enum value set: [HASH, RANGE]", 400)
+                f"1 validation error detected: Value '{kt}' at 'keySchema.{idx}.member.keyType' failed to satisfy constraint: Member must satisfy enum value set: [HASH, RANGE]", 400)
         if attr in seen_names:
-            # AWS-canonical: duplicate-attribute-in-KeySchema rejection.
             return error_response_json("ValidationException",
-                f"Invalid KeySchema: Some index key attributes are repeated. RepeatedKeyElement: {attr}", 400)
+                "Invalid KeySchema: Some index key attribute have no definition", 400)
         seen_names.add(attr)
         if kt == "HASH":
             hash_count += 1
@@ -813,6 +821,11 @@ def _validate_key_schema(key_schema: list, attr_defs: list, context: str = "tabl
 
 
 def _create_table(data):
+    # AWS distinguishes absent-TableName (parameter required) from null/empty
+    # TableName (length / pattern violations). Match both message classes.
+    if "TableName" not in data:
+        return error_response_json("ValidationException",
+            "The parameter 'TableName' is required but was not present in the request", 400)
     name = data.get("TableName")
     err = _validate_table_name(name)
     if err:
@@ -824,7 +837,7 @@ def _create_table(data):
     attr_defs = data.get("AttributeDefinitions") or []
     # Validate AttributeDefinitions structure.
     seen_attr_names = set()
-    for ad in attr_defs:
+    for idx, ad in enumerate(attr_defs, start=1):
         an = ad.get("AttributeName")
         at = ad.get("AttributeType")
         if not an:
@@ -832,7 +845,7 @@ def _create_table(data):
                 "1 validation error detected: AttributeDefinitions element missing AttributeName", 400)
         if at not in _VALID_ATTR_TYPES:
             return error_response_json("ValidationException",
-                f"1 validation error detected: Value '{at}' at 'attributeDefinitions..attributeType' failed to satisfy constraint: Member must satisfy enum value set: [B, N, S]", 400)
+                f"1 validation error detected: Value '{at}' at 'attributeDefinitions.{idx}.member.attributeType' failed to satisfy constraint: Member must satisfy enum value set: [B, N, S]", 400)
         if an in seen_attr_names:
             return error_response_json("ValidationException",
                 f"Duplicate AttributeName in AttributeDefinitions: {an}", 400)
@@ -1228,7 +1241,7 @@ def _validate_expression_attrs(data, expression_fields: tuple) -> tuple | None:
         for ref in re.findall(r"#[A-Za-z_][A-Za-z0-9_]*", body):
             if not ean or ref not in ean:
                 return error_response_json("ValidationException",
-                    f"Invalid {fname}: An expression attribute name used in expression is not defined; attribute name: {ref}", 400)
+                    f"Invalid {fname}: An expression attribute name used in the document path is not defined; attribute name: {ref}", 400)
     return None
 
 
@@ -1469,7 +1482,7 @@ def _update_item(data):
     # An empty UpdateExpression string is rejected by AWS.
     if "UpdateExpression" in data and not update_expr.strip():
         return error_response_json("ValidationException",
-            "Invalid UpdateExpression: The expression cannot be empty;", 400)
+            "Invalid UpdateExpression: The expression can not be empty;", 400)
 
     if update_expr:
         try:
@@ -1564,11 +1577,11 @@ def _query(data):
     if "KeyConditionExpression" in data and not (data["KeyConditionExpression"] or "").strip():
         # AWS-canonical (dynamodb-conformance.org capture).
         return error_response_json("ValidationException",
-            "Invalid KeyConditionExpression: The expression cannot be empty;", 400)
+            "Invalid KeyConditionExpression: The expression can not be empty;", 400)
     # Select must be one of the canonical enum values when supplied.
     if "Select" in data and data["Select"] not in {"ALL_ATTRIBUTES", "ALL_PROJECTED_ATTRIBUTES", "SPECIFIC_ATTRIBUTES", "COUNT"}:
         return error_response_json("ValidationException",
-            f"1 validation error detected: Value '{data['Select']}' at 'select' failed to satisfy constraint: Member must satisfy enum value set: [ALL_ATTRIBUTES, ALL_PROJECTED_ATTRIBUTES, SPECIFIC_ATTRIBUTES, COUNT]", 400)
+            f"1 validation error detected: Value '{data['Select']}' at 'select' failed to satisfy constraint: Member must satisfy enum value set: [SPECIFIC_ATTRIBUTES, COUNT, ALL_ATTRIBUTES, ALL_PROJECTED_ATTRIBUTES]", 400)
     # Malformed ExclusiveStartKey: must include all key attributes of the
     # table (and the index, if querying an index).
     esk_val = data.get("ExclusiveStartKey")
@@ -1578,7 +1591,7 @@ def _query(data):
     # Limit must be >= 1 when supplied.
     if limit is not None and int(limit) <= 0:
         return error_response_json("ValidationException",
-            f"1 validation error detected: Value at 'limit' failed to satisfy constraint: Member must have value greater than or equal to 1", 400)
+            f"1 validation error detected: Value at 'Limit' failed to satisfy constraint: Member must have value greater than or equal to 1", 400)
     # Select validation per AWS: ALL_PROJECTED_ATTRIBUTES is only valid on an
     # index; SPECIFIC_ATTRIBUTES requires a ProjectionExpression / AttributesToGet.
     if select == "ALL_PROJECTED_ATTRIBUTES" and not index_name:
@@ -1593,6 +1606,22 @@ def _query(data):
     if data.get("ConsistentRead") and is_gsi:
         return error_response_json("ValidationException",
             f"Consistent reads are not supported on global secondary indexes", 400)
+
+    # ExclusiveStartKey must contain the base table's key attributes; when
+    # querying an index, it must also contain the index's key attributes.
+    # Real DynamoDB's LastEvaluatedKey always carries both sets, so a missing
+    # attribute means the cursor wasn't issued by a previous Query response.
+    if esk:
+        required = {table["pk_name"]}
+        if table.get("sk_name"):
+            required.add(table["sk_name"])
+        if index_name:
+            required.add(pk_name)
+            if sk_name:
+                required.add(sk_name)
+        if not required.issubset(esk.keys()):
+            return error_response_json("ValidationException",
+                "The provided starting key is invalid", 400)
 
     if key_conditions:
         pk_val = _extract_pk_from_key_conditions(key_conditions, pk_name)
@@ -1654,7 +1683,7 @@ def _query(data):
         candidates = [it for it in candidates if _evaluate_key_conditions_item(it, key_conditions, pk_name)]
     elif key_cond:
         try:
-            candidates = [it for it in candidates if _evaluate_condition(key_cond, it, eav, ean)]
+            candidates = [it for it in candidates if _evaluate_condition(key_cond, it, eav, ean, slot="KeyConditionExpression")]
         except ValueError as exc:
             return error_response_json("ValidationException", str(exc), 400)
 
@@ -1671,7 +1700,10 @@ def _query(data):
     if query_filter and not filter_expr:
         filtered = [it for it in candidates if _evaluate_legacy_filter(it, query_filter)]
     elif filter_expr:
-        filtered = [it for it in candidates if _evaluate_condition(filter_expr, it, eav, ean)]
+        try:
+            filtered = [it for it in candidates if _evaluate_condition(filter_expr, it, eav, ean, slot="FilterExpression")]
+        except ValueError as exc:
+            return error_response_json("ValidationException", str(exc), 400)
     else:
         filtered = candidates
 
@@ -1752,20 +1784,18 @@ def _scan(data):
     total_segments = data.get("TotalSegments")
     if segment is not None and total_segments is None:
         return error_response_json("ValidationException",
-            "The TotalSegments parameter is required when Segment is provided", 400)
+            "The TotalSegments parameter is required but was not present in the request when Segment parameter is present", 400)
     if total_segments is not None and segment is None:
-        # AWS-canonical (dynamodb-conformance.org capture).
         return error_response_json("ValidationException",
-            "The Segment parameter is required but no value was provided.", 400)
+            "The Segment parameter is required but was not present in the request when parameter TotalSegments is present", 400)
     if segment is not None and total_segments is not None:
         seg = int(segment); ts = int(total_segments)
         if ts < 1 or ts > 1_000_000:
             return error_response_json("ValidationException",
                 f"TotalSegments must be between 1 and 1000000", 400)
         if seg < 0 or seg >= ts:
-            # AWS-canonical.
             return error_response_json("ValidationException",
-                "The Segment parameter is zero-based and must be less than parameter TotalSegments.", 400)
+                f"The Segment parameter is zero-based and must be less than parameter TotalSegments: Segment: {seg} is not less than TotalSegments: {ts}", 400)
     # Select validation.
     if select == "ALL_PROJECTED_ATTRIBUTES" and not index_name:
         return error_response_json("ValidationException",
@@ -1814,6 +1844,19 @@ def _scan(data):
         all_items = [it for it in all_items if _seg_match(it)]
 
     if esk:
+        # ESK must contain the base-table key attributes (and the index's keys
+        # when scanning an index). AWS LastEvaluatedKey always carries both sets;
+        # a missing attribute indicates the cursor wasn't issued by Scan.
+        required = {table["pk_name"]}
+        if table.get("sk_name"):
+            required.add(table["sk_name"])
+        if index_name:
+            required.add(pk_name_idx)
+            if sk_name_idx:
+                required.add(sk_name_idx)
+        if not required.issubset(esk.keys()):
+            return error_response_json("ValidationException",
+                "The provided starting key is invalid: The provided key element does not match the schema", 400)
         all_items = _apply_exclusive_start_key_scan(all_items, esk, table)
 
     has_more = False
@@ -1829,7 +1872,7 @@ def _scan(data):
         filtered = [it for it in all_items if _evaluate_legacy_filter(it, scan_filter)]
     elif filter_expr:
         try:
-            filtered = [it for it in all_items if _evaluate_condition(filter_expr, it, eav, ean)]
+            filtered = [it for it in all_items if _evaluate_condition(filter_expr, it, eav, ean, slot="FilterExpression")]
         except ValueError as exc:
             return error_response_json("ValidationException", str(exc), 400)
     else:
@@ -2397,9 +2440,8 @@ def _split_top_level(s, delimiter):
 def _batch_write_item(data):
     request_items = data.get("RequestItems")
     if not request_items:
-        # AWS-captured exact message (dynamodb-conformance.org suite).
         return error_response_json("ValidationException",
-            "The requestItems parameter is required.", 400)
+            "The requestItems parameter is required for BatchWriteItem", 400)
     # Total request count cap (25 per BatchWriteItem call).
     total = sum(len(v) for v in request_items.values())
     if total > _DDB_BATCH_WRITE_MAX:
@@ -2485,14 +2527,14 @@ def _batch_write_item(data):
 def _batch_get_item(data):
     request_items = data.get("RequestItems")
     if not request_items:
-        # AWS-captured exact message (dynamodb-conformance.org suite).
         return error_response_json("ValidationException",
-            "The requestItems parameter is required.", 400)
-    # Total key count cap (100 per BatchGetItem call).
-    total = sum(len(cfg.get("Keys", [])) for cfg in request_items.values())
-    if total > _DDB_BATCH_GET_MAX:
-        return error_response_json("ValidationException",
-            f"1 validation error detected: Value at 'requestItems' failed to satisfy constraint: Member must have length less than or equal to {_DDB_BATCH_GET_MAX}", 400)
+            "The requestItems parameter is required for BatchGetItem", 400)
+    # Per-table key cap (100 per BatchGetItem call, per-table path in the error).
+    for _bg_table_name, _bg_cfg in request_items.items():
+        _bg_keys = _bg_cfg.get("Keys", [])
+        if len(_bg_keys) > _DDB_BATCH_GET_MAX:
+            return error_response_json("ValidationException",
+                f"1 validation error detected: Value at 'RequestItems.{_bg_table_name}.member.Keys' failed to satisfy constraint: Member must have length less than or equal to {_DDB_BATCH_GET_MAX}", 400)
     # Non-existent table check before processing (AWS validates upfront).
     for table_name in request_items:
         if table_name not in _tables:
@@ -2943,7 +2985,7 @@ def _validate_kinesis_destination_request(data: dict) -> tuple[str | None, str |
     table_name = data.get("TableName")
     stream_arn = data.get("StreamArn")
     if not table_name:
-        return None, None, error_response_json("ValidationException", "TableName is required", 400)
+        return None, None, error_response_json("ValidationException", "The parameter 'TableName' is required but was not present in the request", 400)
     if table_name not in _tables:
         return None, None, error_response_json(
             "ResourceNotFoundException", f"Table not found: {table_name}", 400
@@ -3053,7 +3095,7 @@ def _disable_kinesis_streaming_destination(data):
 def _describe_kinesis_streaming_destination(data):
     table_name = data.get("TableName")
     if not table_name:
-        return error_response_json("ValidationException", "TableName is required", 400)
+        return error_response_json("ValidationException", "The parameter 'TableName' is required but was not present in the request", 400)
     if table_name not in _tables:
         return error_response_json(
             "ResourceNotFoundException", f"Table not found: {table_name}", 400
@@ -4034,8 +4076,11 @@ class _ExprEval:
                 except Exception:
                     return v.encode("latin-1") if isinstance(v, str) else b""
             return _b(attr["B"]).startswith(_b(substr["B"]))
-        # AWS rejects begins_with on a non-string/binary operand.
-        raise ValueError("Incorrect operand type for operator or function; operator or function: begins_with")
+        # AWS rejects begins_with on a non-string/binary operand. The caller's
+        # error wrapper prepends "Invalid <slot>:". Report the operand's type
+        # (first key of the AttributeValue map: N, BOOL, NULL, …).
+        op_type = next(iter(substr.keys())) if isinstance(substr, dict) and substr else "?"
+        raise ValueError(f"Incorrect operand type for operator or function; operator or function: begins_with, operand type: {op_type}")
 
     def _fn_contains(self):
         self.advance();  self.expect('LPAREN')
@@ -4102,15 +4147,16 @@ def _check_reserved_keyword_usage(tokens) -> str | None:
     return None
 
 
-def _check_redundant_parens(tokens) -> str | None:
+def _check_redundant_parens(tokens, slot: str = "ConditionExpression") -> str | None:
     """AWS rejects ConditionExpression / FilterExpression / KeyConditionExpression
     that contain redundant parentheses. The unambiguous, low-false-positive
     detection rule: an LPAREN whose immediately-following token is another
     LPAREN whose matching RPAREN is followed directly by the outer RPAREN —
     i.e. the `((expr))` pattern.
 
-    Returns the AWS-canonical error string when redundancy is detected, or
-    None when the expression is fine.
+    Returns the AWS-canonical error string (`"Invalid <slot>: The expression
+    has redundant parentheses;"`) when redundancy is detected, or None when
+    the expression is fine.
     """
     n = len(tokens)
     for i in range(n - 1):
@@ -4127,16 +4173,21 @@ def _check_redundant_parens(tokens) -> str | None:
                         inner_end = j
                         break
             if inner_end is not None and inner_end + 1 < n and tokens[inner_end + 1][0] == 'RPAREN':
-                return "Invalid ConditionExpression: The expression has redundant parentheses"
+                return f"Invalid {slot}: The expression has redundant parentheses;"
     return None
 
 
-def _evaluate_condition(expr, item, attr_values, attr_names):
+def _evaluate_condition(expr, item, attr_values, attr_names,
+                        slot: str = "ConditionExpression"):
+    """Evaluate a DynamoDB expression. ``slot`` controls the "Invalid <X>:"
+    prefix on error strings — pass "FilterExpression" / "KeyConditionExpression"
+    / "ConditionExpression" so AWS-canonical wrapping matches the request
+    parameter the expression came from."""
     if not expr or not expr.strip():
         return True
     try:
         tokens = _tokenize(expr)
-        err = _check_redundant_parens(tokens)
+        err = _check_redundant_parens(tokens, slot)
         if err:
             raise ValueError(err)
         err = _check_reserved_keyword_usage(tokens)
@@ -4145,9 +4196,7 @@ def _evaluate_condition(expr, item, attr_values, attr_names):
         return _ExprEval(tokens, item, attr_values, attr_names).evaluate()
     except ValueError as e:
         msg = str(e)
-        # If the inner error is already an AWS-canonical message
-        # (e.g. "Invalid ConditionExpression: ..." or "Invalid UpdateExpression: ..."),
-        # propagate it verbatim. Otherwise wrap in the generic prefix.
+        # If the inner error is already an AWS-canonical message, propagate.
         if msg.startswith("Invalid ConditionExpression:") \
                 or msg.startswith("Invalid UpdateExpression:") \
                 or msg.startswith("Invalid FilterExpression:") \
@@ -4155,10 +4204,10 @@ def _evaluate_condition(expr, item, attr_values, attr_names):
                 or msg.startswith("Invalid ProjectionExpression:"):
             raise
         logger.warning("Expression evaluation error: %s for expr: %s", e, expr)
-        raise ValueError(f"Invalid ConditionExpression: {e}")
+        raise ValueError(f"Invalid {slot}: {e}")
     except Exception as e:
         logger.warning("Expression evaluation error: %s for expr: %s", e, expr)
-        raise ValueError(f"Invalid ConditionExpression: {e}")
+        raise ValueError(f"Invalid {slot}: {e}")
 
 
 # ---------------------------------------------------------------------------
