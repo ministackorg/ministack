@@ -492,6 +492,71 @@ def test_kms_ecc_get_public_key(kms_client):
     assert resp["PublicKey"]
     assert "ECDSA_SHA_256" in resp["SigningAlgorithms"]
 
+def test_kms_create_ecc_nist_edwards25519_key(kms_client):
+    resp = kms_client.create_key(
+        KeySpec="ECC_NIST_EDWARDS25519",
+        KeyUsage="SIGN_VERIFY",
+        Description="ed25519 signing key",
+    )
+    meta = resp["KeyMetadata"]
+    assert meta["KeySpec"] == "ECC_NIST_EDWARDS25519"
+    assert meta["KeyUsage"] == "SIGN_VERIFY"
+    assert meta["SigningAlgorithms"] == ["ED25519_SHA_512"]
+    assert meta["EncryptionAlgorithms"] == []
+
+def test_kms_ecc_nist_edwards25519_sign_verify(kms_client):
+    key = kms_client.create_key(KeySpec="ECC_NIST_EDWARDS25519", KeyUsage="SIGN_VERIFY")
+    key_id = key["KeyMetadata"]["KeyId"]
+    message = b"hello ed25519"
+
+    sign_resp = kms_client.sign(
+        KeyId=key_id,
+        Message=message,
+        MessageType="RAW",
+        SigningAlgorithm="ED25519_SHA_512",
+    )
+    assert key_id in sign_resp["KeyId"]
+    assert sign_resp["SigningAlgorithm"] == "ED25519_SHA_512"
+    assert len(sign_resp["Signature"]) > 0
+
+    verify_resp = kms_client.verify(
+        KeyId=key_id,
+        Message=message,
+        MessageType="RAW",
+        Signature=sign_resp["Signature"],
+        SigningAlgorithm="ED25519_SHA_512",
+    )
+    assert verify_resp["SignatureValid"] is True
+
+def test_kms_ecc_nist_edwards25519_verify_wrong_message(kms_client):
+    key = kms_client.create_key(KeySpec="ECC_NIST_EDWARDS25519", KeyUsage="SIGN_VERIFY")
+    key_id = key["KeyMetadata"]["KeyId"]
+
+    sign_resp = kms_client.sign(
+        KeyId=key_id,
+        Message=b"original ed25519",
+        MessageType="RAW",
+        SigningAlgorithm="ED25519_SHA_512",
+    )
+    with pytest.raises(kms_client.exceptions.KMSInvalidSignatureException):
+        kms_client.verify(
+            KeyId=key_id,
+            Message=b"tampered ed25519",
+            MessageType="RAW",
+            Signature=sign_resp["Signature"],
+            SigningAlgorithm="ED25519_SHA_512",
+        )
+
+def test_kms_ecc_nist_edwards25519_get_public_key(kms_client):
+    key = kms_client.create_key(KeySpec="ECC_NIST_EDWARDS25519", KeyUsage="SIGN_VERIFY")
+    key_id = key["KeyMetadata"]["KeyId"]
+
+    resp = kms_client.get_public_key(KeyId=key_id)
+    assert key_id in resp["KeyId"]
+    assert resp["KeySpec"] == "ECC_NIST_EDWARDS25519"
+    assert resp["PublicKey"]
+    assert resp["SigningAlgorithms"] == ["ED25519_SHA_512"]
+
 def test_kms_ecc_nist_p256_sign_verify(kms_client):
     key = kms_client.create_key(KeySpec="ECC_NIST_P256", KeyUsage="SIGN_VERIFY")
     key_id = key["KeyMetadata"]["KeyId"]
