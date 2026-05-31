@@ -837,6 +837,102 @@ def _build_session_list(session: dict) -> list:
 
 
 # ---------------------------------------------------------------------------
+# CUSTOM_AUTH Lambda Trigger Event Builders (Phase 3)
+# ---------------------------------------------------------------------------
+
+def _build_define_auth_challenge_event(pool_id: str, client_id: str, username: str,
+                                       user_attrs: dict, session: dict) -> dict:
+    """Build DefineAuthChallenge Lambda event.
+    
+    Called at both InitiateAuth and RespondToAuthChallenge to determine
+    the next step in the authentication flow.
+    """
+    return {
+        "version": "1",
+        "triggerSource": "DefineAuthChallenge_Authentication",
+        "region": _pool_region(pool_id),
+        "userPoolId": pool_id,
+        "userName": username,
+        "callerContext": {
+            "awsSdkVersion": "ministack",
+            "clientId": client_id,
+        },
+        "request": {
+            "userAttributes": user_attrs or {},
+            "sessionList": _build_session_list(session),
+            "clientMetadata": {},
+        },
+        "response": {
+            "challengeName": None,
+            "issueTokens": False,
+            "failAuthentication": False,
+        },
+    }
+
+
+def _build_create_auth_challenge_event(pool_id: str, client_id: str, username: str,
+                                       user_attrs: dict, session: dict,
+                                       client_metadata: dict) -> dict:
+    """Build CreateAuthChallenge Lambda event.
+    
+    Called to generate the challenge (e.g., magic link, SMS OTP) that is sent
+    to the user.
+    """
+    return {
+        "version": "1",
+        "triggerSource": "CreateAuthChallenge_Authentication",
+        "region": _pool_region(pool_id),
+        "userPoolId": pool_id,
+        "userName": username,
+        "callerContext": {
+            "awsSdkVersion": "ministack",
+            "clientId": client_id,
+        },
+        "request": {
+            "userAttributes": user_attrs or {},
+            "sessionList": _build_session_list(session),
+            "clientMetadata": client_metadata or {},
+        },
+        "response": {
+            "publicChallengeParameters": None,
+            "privateChallengeParameters": None,
+            "challengeMetadata": None,
+        },
+    }
+
+
+def _build_verify_auth_challenge_event(pool_id: str, client_id: str, username: str,
+                                       user_attrs: dict, session: dict,
+                                       challenge_answer: str,
+                                       client_metadata: dict) -> dict:
+    """Build VerifyAuthChallengeResponse Lambda event.
+    
+    Called to verify the challenge response (e.g., validate the magic link token
+    or SMS OTP).
+    """
+    return {
+        "version": "1",
+        "triggerSource": "VerifyAuthChallengeResponse_Authentication",
+        "region": _pool_region(pool_id),
+        "userPoolId": pool_id,
+        "userName": username,
+        "callerContext": {
+            "awsSdkVersion": "ministack",
+            "clientId": client_id,
+        },
+        "request": {
+            "userAttributes": user_attrs or {},
+            "sessionList": _build_session_list(session),
+            "challengeAnswer": challenge_answer,
+            "clientMetadata": client_metadata or {},
+        },
+        "response": {
+            "answerCorrect": None,
+        },
+    }
+
+
+# ---------------------------------------------------------------------------
 # SAML / OAuth2 helpers
 # ---------------------------------------------------------------------------
 
