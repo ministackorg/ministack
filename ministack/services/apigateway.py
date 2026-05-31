@@ -1004,12 +1004,27 @@ async def _invoke_lambda_proxy(
 
     status = lambda_response.get("statusCode", 200)
     resp_headers = {"Content-Type": "application/json"}
-    resp_headers.update(lambda_response.get("headers", {}))
-    # Payload format 2.0 emits multiple Set-Cookie headers via the top-level
-    # `cookies` array, not the headers map. The list value is expanded into one
-    # Set-Cookie line per entry by _send_response.
+    # Apply the Lambda's headers, letting each override any case-insensitive
+    # default already present. HTTP field names are case-insensitive (RFC 9110
+    # §5.1), so a lowercase `content-type` from the function must replace the
+    # seeded `Content-Type`, not ship alongside it — the same case-insensitive
+    # handling #750 applied to the v1 multiValueHeaders merge.
+    for k, v in (lambda_response.get("headers") or {}).items():
+        lower_k = k.lower()
+        for existing in [h for h in resp_headers if h.lower() == lower_k]:
+            del resp_headers[existing]
+        resp_headers[k] = v
+    # Payload format 2.0 delivers cookies via the top-level `cookies` array,
+    # which AWS turns into one Set-Cookie header per entry. The array is the
+    # documented cookie mechanism — AWS guidance is "don't manually add
+    # set-cookie headers; use the cookies array" (Lambda Function URLs / HTTP
+    # API v2 docs) — so when it is present it supersedes any Set-Cookie carried
+    # in `headers` (the structured source wins, as in #750's v1 collision rule).
+    # _send_response expands the list into one Set-Cookie line per entry.
     cookies = lambda_response.get("cookies")
     if cookies:
+        for existing in [h for h in resp_headers if h.lower() == "set-cookie"]:
+            del resp_headers[existing]
         resp_headers["Set-Cookie"] = list(cookies)
     resp_body = lambda_response.get("body", "")
     if isinstance(resp_body, str):

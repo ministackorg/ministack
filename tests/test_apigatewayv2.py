@@ -461,6 +461,115 @@ def test_apigw_execute_lambda_proxy_empty_cookies(apigw, lam):
     apigw.delete_api(ApiId=api_id)
     lam.delete_function(FunctionName=fname)
 
+def test_apigw_execute_lambda_proxy_cookies_supersede_header_set_cookie(apigw, lam):
+    """The `cookies` array supersedes a `Set-Cookie` carried in `headers`.
+
+    Follow-up to #750. For v2 the `cookies` array is the documented cookie
+    mechanism ("don't manually add set-cookie headers" — AWS Lambda Function
+    URLs / HTTP API v2 docs), so when both are returned only the array's cookies
+    ship — mirroring #759's v1 rule where the structured source wins on a
+    case-insensitive collision.
+    """
+    import urllib.request as _urlreq
+    import uuid as _uuid
+
+    fname = f"intg-apigw-cookiewin-{_uuid.uuid4().hex[:8]}"
+    code = (
+        b"def handler(event, context):\n"
+        b"    return {\n"
+        b"        'statusCode': 200,\n"
+        b"        'headers': {'set-cookie': 'should-be-dropped=1; Path=/'},\n"
+        b"        'cookies': ['a=1; Path=/', 'b=2; Path=/'],\n"
+        b"        'body': 'x',\n"
+        b"    }\n"
+    )
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("index.py", code)
+    lam.create_function(
+        FunctionName=fname, Runtime="python3.12",
+        Role="arn:aws:iam::000000000000:role/test-role",
+        Handler="index.handler", Code={"ZipFile": buf.getvalue()},
+    )
+
+    api_id = apigw.create_api(Name=f"cookiewin-api-{fname}", ProtocolType="HTTP")["ApiId"]
+    int_id = apigw.create_integration(
+        ApiId=api_id, IntegrationType="AWS_PROXY",
+        IntegrationUri=f"arn:aws:lambda:us-east-1:000000000000:function:{fname}",
+        PayloadFormatVersion="2.0",
+    )["IntegrationId"]
+    route_id = apigw.create_route(
+        ApiId=api_id, RouteKey="GET /cookiewin", Target=f"integrations/{int_id}",
+    )["RouteId"]
+    apigw.create_stage(ApiId=api_id, StageName="$default")
+
+    url = f"http://{api_id}.execute-api.localhost:{_EXECUTE_PORT}/$default/cookiewin"
+    req = _urlreq.Request(url, method="GET")
+    req.add_header("Host", f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}")
+    resp = _urlreq.urlopen(req)
+    assert resp.status == 200
+    set_cookies = resp.headers.get_all("Set-Cookie") or []
+    # Only the array's cookies ship; the header `Set-Cookie` is superseded.
+    assert set_cookies == ["a=1; Path=/", "b=2; Path=/"]
+    assert all("should-be-dropped" not in c for c in set_cookies)
+
+    apigw.delete_route(ApiId=api_id, RouteId=route_id)
+    apigw.delete_integration(ApiId=api_id, IntegrationId=int_id)
+    apigw.delete_api(ApiId=api_id)
+    lam.delete_function(FunctionName=fname)
+
+def test_apigw_execute_lambda_proxy_header_case_override(apigw, lam):
+    """A lowercase `content-type` overrides the default, not duplicates it.
+
+    Follow-up to #750: HTTP field names are case-insensitive (RFC 9110 §5.1),
+    so a Lambda's `content-type` must replace MiniStack's seeded default
+    `Content-Type` rather than ship as a second header.
+    """
+    import urllib.request as _urlreq
+    import uuid as _uuid
+
+    fname = f"intg-apigw-ctcase-{_uuid.uuid4().hex[:8]}"
+    code = (
+        b"def handler(event, context):\n"
+        b"    return {\n"
+        b"        'statusCode': 200,\n"
+        b"        'headers': {'content-type': 'text/plain'},\n"
+        b"        'body': 'x',\n"
+        b"    }\n"
+    )
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("index.py", code)
+    lam.create_function(
+        FunctionName=fname, Runtime="python3.12",
+        Role="arn:aws:iam::000000000000:role/test-role",
+        Handler="index.handler", Code={"ZipFile": buf.getvalue()},
+    )
+
+    api_id = apigw.create_api(Name=f"ctcase-api-{fname}", ProtocolType="HTTP")["ApiId"]
+    int_id = apigw.create_integration(
+        ApiId=api_id, IntegrationType="AWS_PROXY",
+        IntegrationUri=f"arn:aws:lambda:us-east-1:000000000000:function:{fname}",
+        PayloadFormatVersion="2.0",
+    )["IntegrationId"]
+    route_id = apigw.create_route(
+        ApiId=api_id, RouteKey="GET /ct", Target=f"integrations/{int_id}",
+    )["RouteId"]
+    apigw.create_stage(ApiId=api_id, StageName="$default")
+
+    url = f"http://{api_id}.execute-api.localhost:{_EXECUTE_PORT}/$default/ct"
+    req = _urlreq.Request(url, method="GET")
+    req.add_header("Host", f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}")
+    resp = _urlreq.urlopen(req)
+    assert resp.status == 200
+    # Exactly one Content-Type, and it's the Lambda's value (not the default).
+    assert (resp.headers.get_all("Content-Type") or []) == ["text/plain"]
+
+    apigw.delete_route(ApiId=api_id, RouteId=route_id)
+    apigw.delete_integration(ApiId=api_id, IntegrationId=int_id)
+    apigw.delete_api(ApiId=api_id)
+    lam.delete_function(FunctionName=fname)
+
 def test_apigw_execute_no_route(apigw):
     """execute-api returns 404 when no matching route exists."""
     import urllib.error as _urlerr
