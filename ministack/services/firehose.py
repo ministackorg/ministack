@@ -239,6 +239,58 @@ def _record_id() -> str:
     return f"{ts:020d}{uid}"
 
 
+# ─── Kinesis-source ingestion ────────────────────────────────────────────────
+# Public hook called by kinesis.py whenever PutRecord / PutRecords lands a
+# record. For any ACTIVE delivery stream whose Source is configured to the
+# Kinesis stream ARN, the record is forwarded to the configured destination
+# (currently S3 / ExtendedS3 — others buffer in-memory the same way the
+# direct PutRecord path does).
+#
+# AWS parity notes:
+# - AWS only forwards records that arrived at or after the delivery stream's
+#   DeliveryStartTimestamp. Records older than that are skipped, matching
+#   how the AWS shard iterator opens at that timestamp.
+# - Delivery is best-effort (any S3 / runtime error is logged and swallowed)
+#   so a Firehose problem can never break the Kinesis write path.
+# - The `records` argument is a list of `(partition_key, raw_bytes)` tuples;
+#   `raw_bytes` is the already-decoded record payload (matches what AWS would
+#   read off the Kinesis shard).
+def ingest_from_kinesis_source(stream_arn: str, records: list) -> None:
+    if not stream_arn or not records:
+        return
+    now_ts = now_epoch()
+    with _lock:
+        targets = [
+            s for s in _streams.values()
+            if s.get("type") == "KinesisStreamAsSource"
+            and s.get("status") == "ACTIVE"
+            and (s.get("kinesis_source") or {}).get("KinesisStreamARN") == stream_arn
+        ]
+        # Snapshot delivery targets so the lock can be released before we
+        # schedule S3 writes (which dispatch on the event loop and should
+        # never run under this lock).
+        plan = []
+        for stream in targets:
+            start_ts = (stream.get("kinesis_source") or {}).get("DeliveryStartTimestamp") or 0
+            if now_ts < start_ts:
+                continue
+            for dest in stream.get("destinations", []):
+                if dest.get("type") not in ("ExtendedS3", "S3"):
+                    continue
+                for _pkey, raw in records:
+                    rid = _record_id()
+                    dest["records"].append({"id": rid, "data": raw, "ts": now_ts})
+                    plan.append((stream, dest, raw))
+    for stream, dest, raw in plan:
+        try:
+            _deliver_to_s3(stream, dest, raw)
+        except Exception as exc:
+            logger.warning(
+                "Firehose Kinesis-source delivery to %s failed: %s",
+                stream.get("name"), exc,
+            )
+
+
 # ─── operations ──────────────────────────────────────────────────────────────
 
 def _create_delivery_stream(data: dict):

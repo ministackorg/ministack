@@ -605,7 +605,7 @@ def _dispatch(
             if "uploadId" in query_params:
                 return _list_parts(bucket, key, query_params)
             if "tagging" in query_params:
-                return _get_object_tagging(bucket, key)
+                return _get_object_tagging(bucket, key, query_params)
             if "retention" in query_params:
                 return _get_object_retention(bucket, key)
             if "legal-hold" in query_params:
@@ -620,7 +620,7 @@ def _dispatch(
                     return _upload_part_copy(bucket, key, query_params, headers)
                 return _upload_part(bucket, key, body, query_params, headers)
             if "tagging" in query_params:
-                return _put_object_tagging(bucket, key, body)
+                return _put_object_tagging(bucket, key, body, query_params)
             if "retention" in query_params:
                 return _put_object_retention(bucket, key, body, headers)
             if "legal-hold" in query_params:
@@ -649,7 +649,7 @@ def _dispatch(
             if "uploadId" in query_params:
                 return _abort_multipart_upload(bucket, key, query_params)
             if "tagging" in query_params:
-                return _delete_object_tagging(bucket, key)
+                return _delete_object_tagging(bucket, key, query_params)
             return _delete_object(bucket, key, headers)
 
         return _error(
@@ -1870,12 +1870,14 @@ def _put_object(bucket_name: str, key: str, body: bytes, headers: dict):
     _apply_object_lock_from_headers(bucket_name, key, headers)
 
     # --- x-amz-tagging header on PutObject ---
+    # Parse + validate up front so the count error returns before persist/event,
+    # but defer the dict write until version_id is assigned (tags are per-version).
+    pending_tags = None
     tagging_header = headers.get("x-amz-tagging", "")
     if tagging_header:
-        tags = {k: v[0] for k, v in _parse_qs(tagging_header).items()}
-        if len(tags) > 10:
+        pending_tags = {k: v[0] for k, v in _parse_qs(tagging_header).items()}
+        if len(pending_tags) > 10:
             return _error("BadRequest", "Object tags cannot be greater than 10", 400)
-        _object_tags[(bucket_name, key)] = tags
 
     if S3_PERSIST:
         _persist_object(bucket_name, key, obj)
@@ -1904,6 +1906,9 @@ def _put_object(bucket_name: str, key: str, body: bytes, headers: dict):
         # Mark all previous versions as not latest
         for v in _object_versions[vkey][:-1]:
             v["is_latest"] = False
+
+    if pending_tags is not None:
+        _object_tags[(bucket_name, key, obj.get("version_id"))] = pending_tags
     return 200, resp_headers, b""
 
 
@@ -2061,11 +2066,13 @@ def _post_object(bucket_name: str, body: bytes, headers: dict):
     bucket["objects"][key] = obj
     _apply_object_lock_from_headers(bucket_name, key, synth)
 
+    # Defer tag write until version_id is assigned (tags are per-version).
+    pending_tags = None
     tagging_header = synth.get("x-amz-tagging", "")
     if tagging_header:
-        tags = {k: v[0] for k, v in _parse_qs(tagging_header).items()}
-        if len(tags) <= 10:
-            _object_tags[(bucket_name, key)] = tags
+        parsed = {k: v[0] for k, v in _parse_qs(tagging_header).items()}
+        if len(parsed) <= 10:
+            pending_tags = parsed
 
     if S3_PERSIST:
         _persist_object(bucket_name, key, obj)
@@ -2092,6 +2099,9 @@ def _post_object(bucket_name: str, body: bytes, headers: dict):
         })
         for v in _object_versions[vkey][:-1]:
             v["is_latest"] = False
+
+    if pending_tags is not None:
+        _object_tags[(bucket_name, key, version_id)] = pending_tags
 
     location = f"http://{bucket_name}.s3.amazonaws.com/{url_quote(key, safe='/')}"
     base_resp = {"ETag": etag, "Location": location}
@@ -2285,7 +2295,7 @@ def _delete_object(bucket_name: str, key: str, headers: dict | None = None):
 
     existed = key in bucket["objects"]
     bucket["objects"].pop(key, None)
-    _object_tags.pop((bucket_name, key), None)
+    _object_tags.pop((bucket_name, key, None), None)
     _object_retention.pop((bucket_name, key), None)
     _object_legal_hold.pop((bucket_name, key), None)
     _object_acl.pop((bucket_name, key), None)
@@ -2413,22 +2423,22 @@ def _copy_object(bucket_name: str, dest_key: str, headers: dict):
     }
     dest_bucket["objects"][dest_key] = dest_obj
 
-    # --- Preserve / replace tags ---
+    # --- Resolve tag payload now; commit after dest version_id is assigned
+    #     (object tags are per-version per AWS).
     tagging_directive = headers.get("x-amz-tagging-directive", "COPY").upper()
+    pending_dest_tags: dict | None = None
     if tagging_directive == "REPLACE":
         tagging_header = headers.get("x-amz-tagging", "")
         if tagging_header:
-            _object_tags[(bucket_name, dest_key)] = {
+            pending_dest_tags = {
                 k: v[0] for k, v in _parse_qs(tagging_header).items()
             }
-        else:
-            _object_tags.pop((bucket_name, dest_key), None)
     else:
-        src_tags = _object_tags.get((src_bucket_name, src_key))
+        src_tags = _object_tags.get(
+            (src_bucket_name, src_key, src_obj.get("version_id"))
+        )
         if src_tags:
-            _object_tags[(bucket_name, dest_key)] = dict(src_tags)
-        else:
-            _object_tags.pop((bucket_name, dest_key), None)
+            pending_dest_tags = dict(src_tags)
 
     # --- Preserve lock / retention ---
     src_retention = _object_retention.get((src_bucket_name, src_key))
@@ -2476,6 +2486,12 @@ def _copy_object(bucket_name: str, dest_key: str, headers: dict):
         for v in _object_versions[vkey][:-1]:
             v["is_latest"] = False
 
+    dest_version_id = dest_obj.get("version_id")
+    if pending_dest_tags is not None:
+        _object_tags[(bucket_name, dest_key, dest_version_id)] = pending_dest_tags
+    else:
+        _object_tags.pop((bucket_name, dest_key, dest_version_id), None)
+
     root = Element("CopyObjectResult", xmlns=S3_NS)
     SubElement(root, "LastModified").text = last_modified
     SubElement(root, "ETag").text = new_etag
@@ -2487,7 +2503,21 @@ def _copy_object(bucket_name: str, dest_key: str, headers: dict):
 # ---------------------------------------------------------------------------
 
 
-def _get_object_tagging(bucket_name: str, key: str):
+def _resolve_tagging_version(query_params: dict, bucket: dict, key: str):
+    """Resolve the (key, version_id) pair an Object Tagging op should act on.
+
+    Per AWS, object tags are per-version: when ``?versionId=`` is present the
+    op targets that specific version; otherwise it targets the current object.
+    The literal ``versionId=null`` means the pre-versioning object (stored as
+    ``None`` in our key tuple)."""
+    vid = _qp(query_params or {}, "versionId", "")
+    if vid:
+        return None if vid == "null" else vid
+    obj = bucket["objects"].get(key)
+    return obj.get("version_id") if obj else None
+
+
+def _get_object_tagging(bucket_name: str, key: str, query_params: dict | None = None):
     bucket = _ensure_bucket(bucket_name)
     if bucket is None:
         return _no_such_bucket(bucket_name)
@@ -2499,17 +2529,23 @@ def _get_object_tagging(bucket_name: str, key: str):
             f"/{bucket_name}/{key}",
         )
 
-    tags = _object_tags.get((bucket_name, key), {})
+    version_id = _resolve_tagging_version(query_params, bucket, key)
+    tags = _object_tags.get((bucket_name, key, version_id), {})
     root = Element("Tagging", xmlns=S3_NS)
     tag_set = SubElement(root, "TagSet")
     for k, v in tags.items():
         tag = SubElement(tag_set, "Tag")
         SubElement(tag, "Key").text = k
         SubElement(tag, "Value").text = v
-    return 200, {"Content-Type": "application/xml"}, _xml_body(root)
+    resp_headers = {"Content-Type": "application/xml"}
+    if version_id:
+        resp_headers["x-amz-version-id"] = version_id
+    return 200, resp_headers, _xml_body(root)
 
 
-def _put_object_tagging(bucket_name: str, key: str, body: bytes):
+def _put_object_tagging(
+    bucket_name: str, key: str, body: bytes, query_params: dict | None = None
+):
     bucket = _ensure_bucket(bucket_name)
     if bucket is None:
         return _no_such_bucket(bucket_name)
@@ -2526,11 +2562,17 @@ def _put_object_tagging(bucket_name: str, key: str, body: bytes):
         return _error("MalformedXML", "The XML you provided was not well-formed", 400)
     if len(tags) > 10:
         return _error("BadRequest", "Object tags cannot be greater than 10", 400)
-    _object_tags[(bucket_name, key)] = tags
-    return 200, {"Content-Type": "application/xml"}, b""
+    version_id = _resolve_tagging_version(query_params, bucket, key)
+    _object_tags[(bucket_name, key, version_id)] = tags
+    resp_headers = {"Content-Type": "application/xml"}
+    if version_id:
+        resp_headers["x-amz-version-id"] = version_id
+    return 200, resp_headers, b""
 
 
-def _delete_object_tagging(bucket_name: str, key: str):
+def _delete_object_tagging(
+    bucket_name: str, key: str, query_params: dict | None = None
+):
     bucket = _ensure_bucket(bucket_name)
     if bucket is None:
         return _no_such_bucket(bucket_name)
@@ -2541,8 +2583,12 @@ def _delete_object_tagging(bucket_name: str, key: str):
             404,
             f"/{bucket_name}/{key}",
         )
-    _object_tags.pop((bucket_name, key), None)
-    return 204, {}, b""
+    version_id = _resolve_tagging_version(query_params, bucket, key)
+    _object_tags.pop((bucket_name, key, version_id), None)
+    resp_headers = {}
+    if version_id:
+        resp_headers["x-amz-version-id"] = version_id
+    return 204, resp_headers, b""
 
 
 # ---------------------------------------------------------------------------
@@ -3262,7 +3308,7 @@ def _delete_objects(bucket_name: str, body: bytes, headers: dict = None):
                     )
                     continue
             bucket["objects"].pop(k, None)
-            _object_tags.pop((bucket_name, k), None)
+            _object_tags.pop((bucket_name, k, None), None)
             _object_retention.pop((bucket_name, k), None)
             _object_legal_hold.pop((bucket_name, k), None)
             _object_acl.pop((bucket_name, k), None)

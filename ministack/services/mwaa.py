@@ -280,13 +280,22 @@ def _start_airflow_container(env_name, env):
         container_env[f"AIRFLOW__{env_key}"] = value
 
     try:
+        container_name = f"ministack-mwaa-{env_name}"
+
+        # Remove stale container from previous runs (same pattern as RDS)
+        try:
+            existing = docker_client.containers.get(container_name)
+            existing.remove(force=True)
+        except Exception:
+            pass
+
         container_kwargs = dict(
             image=image,
             detach=True,
             command="standalone",
             environment=container_env,
             ports={f"{container_port}/tcp": host_port},
-            name=f"ministack-mwaa-{env_name}",
+            name=container_name,
             labels={"ministack": "mwaa", "env_name": env_name},
         )
 
@@ -364,8 +373,11 @@ def _create_environment(method, path, headers, body, query_params):
     name = path.strip("/").split("/")[-1]
 
     if name in _environments:
-        return error_response_json("ResourceAlreadyExistsException",
-                                   f"Environment {name} already exists", 409)
+        # AWS MWAA service model has no ResourceAlreadyExistsException — the
+        # documented errors for CreateEnvironment are ValidationException,
+        # InternalServerException, and ServiceUnavailableException only.
+        return error_response_json("ValidationException",
+                                   f"Environment {name} already exists", 400)
 
     account_id = get_account_id()
     region = get_region()
@@ -562,7 +574,11 @@ async def _invoke_rest_api(method, path, headers, body, query_params):
             "RestApiResponse": payload,
         })
     except Exception as e:
-        return error_response_json("InternalServerException", str(e)[:500], 500)
+        logger.exception("MWAA InvokeRestApi failure")
+        # AWS doesn't leak the underlying Python exception text. The
+        # InternalServerException message is opaque to the caller.
+        return error_response_json("InternalServerException",
+            "InternalServerException: An internal error has occurred.", 500)
 
 
 # ── Request Router ────────────────────────────────────────────────────────────
@@ -615,7 +631,7 @@ async def handle_request(method, path, headers, body, query_params):
         if method == "DELETE":
             return _delete_environment(method, path, headers, body, query_params)
 
-    return error_response_json("InvalidRequestException",
+    return error_response_json("ValidationException",
                                f"Unknown MWAA path: {method} {path}", 400)
 
 

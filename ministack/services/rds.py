@@ -682,6 +682,7 @@ def _create_db_instance(p):
     dbi_resource_id = f"db-{new_uuid().replace('-', '')[:20].upper()}"
     endpoint_host = "localhost"
     endpoint_port = port
+    host_port = None
     docker_container_id = None
     internal_host = None
     internal_port = None
@@ -697,8 +698,11 @@ def _create_db_instance(p):
         )
         if image:
             try:
-                host_port = instance.get("_HostPort") or _next_port()
-                instance["_HostPort"] = host_port
+                # Create path: the `instance` dict doesn't exist yet
+                # (it's built ~70 lines below). Allocate a fresh free port
+                # and we'll stamp `_HostPort` onto the instance dict at
+                # construction time so subsequent respawns reuse it.
+                host_port = _next_port()
                 endpoint_port = host_port
                 container_kwargs = dict(
                     image=image, detach=True,
@@ -776,6 +780,11 @@ def _create_db_instance(p):
             "Port": endpoint_port,
             "HostedZoneId": "Z2R2ITUGPM61AM",
         },
+        # `_HostPort` is the actual docker host port; `Endpoint.Port` gets
+        # overwritten to the engine's container port later (5432 for
+        # postgres) to match real AWS, so respawn after restart needs the
+        # original host mapping stored separately (#692 follow-up).
+        "_HostPort": host_port,
         "AllocatedStorage": allocated_storage,
         "InstanceCreateTime": _format_time(now_ts),
         "PreferredBackupWindow": "03:00-04:00",

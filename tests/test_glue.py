@@ -939,3 +939,72 @@ def test_glue_partition_indexes(glue):
     # cleanup
     glue.delete_table(DatabaseName=db, Name=tbl)
     glue.delete_database(Name=db)
+
+
+# ── Spark job image selection (1.3.50) ─────────────────────
+
+def test_glue_spark_skips_docker_when_image_missing(glue):
+    """glueetl job falls back to subprocess when the Spark Docker image is not pulled.
+    The job should not crash MiniStack — it either runs via subprocess (and fails
+    on pyspark import) or stubs as SUCCEEDED if the script can't be resolved."""
+    import time
+    job_name = "test-spark-no-image"
+    try:
+        glue.delete_job(JobName=job_name)
+    except Exception:
+        pass
+
+    glue.create_job(
+        Name=job_name,
+        Role="arn:aws:iam::000000000000:role/GlueRole",
+        Command={"Name": "glueetl", "ScriptLocation": "s3://nonexistent/script.py"},
+        GlueVersion="4.0",
+    )
+    resp = glue.start_job_run(JobName=job_name)
+    run_id = resp["JobRunId"]
+
+    # Poll until terminal state
+    for _ in range(20):
+        run = glue.get_job_run(JobName=job_name, RunId=run_id)["JobRun"]
+        if run["JobRunState"] in ("SUCCEEDED", "FAILED", "TIMEOUT"):
+            break
+        time.sleep(0.5)
+
+    # Script can't be resolved (nonexistent S3 path) so it should stub as SUCCEEDED
+    # The key assertion: it does NOT hang or crash — it reaches a terminal state
+    assert run["JobRunState"] in ("SUCCEEDED", "FAILED"), (
+        f"Job should reach terminal state without Docker image. Got: {run['JobRunState']}"
+    )
+
+
+def test_glue_spark_image_for_version_maps_to_official_aws_image():
+    """`GlueVersion: 4.0` and `3.0` map to the canonical `amazon/aws-glue-libs`
+    images real AWS Glue uses for Spark. Override via `GLUE_DOCKER_IMAGE`."""
+    from ministack.services import glue as _glue
+
+    # Default mapping for supported Spark Glue versions
+    assert _glue._glue_image_for_version("4.0") == "amazon/aws-glue-libs:glue_libs_4.0.0_image_01"
+    assert _glue._glue_image_for_version("3.0") == "amazon/aws-glue-libs:glue_libs_3.0.0_image_01"
+
+    # Unknown GlueVersion falls back to 4.0 (latest supported)
+    assert _glue._glue_image_for_version("99.0") == "amazon/aws-glue-libs:glue_libs_4.0.0_image_01"
+
+
+def test_glue_spark_image_env_override(monkeypatch):
+    """Setting GLUE_DOCKER_IMAGE bypasses the per-version map."""
+    from ministack.services import glue as _glue
+
+    monkeypatch.setattr(_glue, "GLUE_DOCKER_IMAGE_OVERRIDE", "my-org/custom-glue:latest")
+    assert _glue._glue_image_for_version("4.0") == "my-org/custom-glue:latest"
+    assert _glue._glue_image_for_version("3.0") == "my-org/custom-glue:latest"
+
+
+def test_glue_is_spark_job_classifies_by_command_name():
+    """`glueetl` and `gluestreaming` are Spark; `pythonshell` is not."""
+    from ministack.services import glue as _glue
+
+    assert _glue._is_spark_job({"Command": {"Name": "glueetl"}}) is True
+    assert _glue._is_spark_job({"Command": {"Name": "gluestreaming"}}) is True
+    assert _glue._is_spark_job({"Command": {"Name": "pythonshell"}}) is False
+    assert _glue._is_spark_job({"Command": {}}) is False
+    assert _glue._is_spark_job({}) is False

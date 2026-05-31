@@ -18,6 +18,7 @@ import ministack.services.acm as _acm
 import ministack.services.alb as _alb
 import ministack.services.apigateway as _apigw_v2
 import ministack.services.apigateway_v1 as _apigw_v1
+import ministack.services.appconfig as _appconfig
 import ministack.services.appsync as _appsync
 import ministack.services.autoscaling as _asg
 import ministack.services.backup as _backup
@@ -739,6 +740,30 @@ def _ssm_create(logical_id, props, stack_name):
 
 def _ssm_delete(physical_id, props):
     _ssm._parameters.pop(physical_id, None)
+
+
+# --- AppConfig Application ---
+
+def _appconfig_application_create(logical_id, props, stack_name):
+    name = props.get("Name") or _physical_name(stack_name, logical_id)
+    app_id = _appconfig._gen_id()
+    _appconfig._applications[app_id] = {
+        "Id": app_id,
+        "Name": name,
+        "Description": props.get("Description", ""),
+    }
+    cfn_tags = props.get("Tags") or []
+    if cfn_tags:
+        _appconfig._apply_tags(
+            _appconfig._app_arn(app_id),
+            {t["Key"]: t["Value"] for t in cfn_tags if "Key" in t},
+        )
+    return app_id, {"ApplicationId": app_id}
+
+
+def _appconfig_application_delete(physical_id, props):
+    _appconfig._applications.pop(physical_id, None)
+    _appconfig._tags.pop(_appconfig._app_arn(physical_id), None)
 
 
 # --- CloudWatch Logs LogGroup ---
@@ -3867,6 +3892,10 @@ _RESOURCE_HANDLERS = {
     "AWS::IAM::Policy": {"create": _iam_policy_create, "delete": _iam_policy_delete},
     "AWS::IAM::InstanceProfile": {"create": _iam_ip_create, "delete": _iam_ip_delete},
     "AWS::SSM::Parameter": {"create": _ssm_create, "delete": _ssm_delete},
+    "AWS::AppConfig::Application": {
+        "create": _appconfig_application_create,
+        "delete": _appconfig_application_delete,
+    },
     "AWS::Logs::LogGroup": {"create": _cwlogs_create, "delete": _cwlogs_delete},
     "AWS::Events::Rule": {"create": _eb_rule_create, "delete": _eb_rule_delete},
     "AWS::Events::EventBus": {"create": _eb_event_bus_create, "delete": _eb_event_bus_delete},

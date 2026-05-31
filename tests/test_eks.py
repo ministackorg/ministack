@@ -301,3 +301,74 @@ def test_eks_k3s_run_kwargs_container_name_and_labels():
     kwargs = _k3s_run_kwargs(name="my-cluster", port=16443)
     assert kwargs["name"] == "ministack-eks-my-cluster"
     assert kwargs["labels"] == {"ministack": "eks", "cluster_name": "my-cluster"}
+
+
+def test_eks_addon_lifecycle(eks):
+    """CreateAddon / DescribeAddon / ListAddons / UpdateAddon / DeleteAddon.
+    Issue #752: terraform aws_eks_addon fails on missing POST /clusters/{name}/addons."""
+    import uuid as _uuid
+    cn = f"addons-{_uuid.uuid4().hex[:8]}"
+    eks.create_cluster(
+        name=cn, roleArn="arn:aws:iam::000000000000:role/eks",
+        resourcesVpcConfig={"subnetIds": ["subnet-1", "subnet-2"]},
+    )
+    try:
+        # Create the 4 standard addons in one go.
+        for name in ("vpc-cni", "coredns", "kube-proxy", "aws-ebs-csi-driver"):
+            r = eks.create_addon(clusterName=cn, addonName=name)
+            assert r["addon"]["addonName"] == name
+            assert r["addon"]["status"] == "ACTIVE"
+            assert f":addon/{cn}/{name}/" in r["addon"]["addonArn"]
+
+        # Describe one.
+        r = eks.describe_addon(clusterName=cn, addonName="coredns")
+        assert r["addon"]["status"] == "ACTIVE"
+        assert r["addon"]["addonName"] == "coredns"
+
+        # List all.
+        lst = eks.list_addons(clusterName=cn)["addons"]
+        assert set(lst) == {"vpc-cni", "coredns", "kube-proxy", "aws-ebs-csi-driver"}
+
+        # Update changes the version and surfaces a successful update record.
+        upd = eks.update_addon(
+            clusterName=cn, addonName="coredns",
+            addonVersion="v1.11.4-eksbuild.1",
+        )
+        assert upd["update"]["status"] == "Successful"
+        r = eks.describe_addon(clusterName=cn, addonName="coredns")
+        assert r["addon"]["addonVersion"] == "v1.11.4-eksbuild.1"
+
+        # Delete returns DELETING and the addon is gone afterwards.
+        d = eks.delete_addon(clusterName=cn, addonName="vpc-cni")
+        assert d["addon"]["status"] == "DELETING"
+        with pytest.raises(ClientError) as e:
+            eks.describe_addon(clusterName=cn, addonName="vpc-cni")
+        assert e.value.response["Error"]["Code"] == "ResourceNotFoundException"
+    finally:
+        try: eks.delete_cluster(name=cn)
+        except Exception: pass
+
+
+def test_eks_addon_create_on_missing_cluster_404(eks):
+    import uuid as _uuid
+    missing = f"no-such-cluster-{_uuid.uuid4().hex[:6]}"
+    with pytest.raises(ClientError) as e:
+        eks.create_addon(clusterName=missing, addonName="vpc-cni")
+    assert e.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
+def test_eks_addon_create_duplicate_returns_resource_in_use(eks):
+    import uuid as _uuid
+    cn = f"addons-dup-{_uuid.uuid4().hex[:8]}"
+    eks.create_cluster(
+        name=cn, roleArn="arn:aws:iam::000000000000:role/eks",
+        resourcesVpcConfig={"subnetIds": ["subnet-1"]},
+    )
+    try:
+        eks.create_addon(clusterName=cn, addonName="vpc-cni")
+        with pytest.raises(ClientError) as e:
+            eks.create_addon(clusterName=cn, addonName="vpc-cni")
+        assert e.value.response["Error"]["Code"] == "ResourceInUseException"
+    finally:
+        try: eks.delete_cluster(name=cn)
+        except Exception: pass

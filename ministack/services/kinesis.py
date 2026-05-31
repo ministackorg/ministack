@@ -444,6 +444,7 @@ def _put_record(data):
         return error_response_json("ValidationException",
             "1 validation error detected: Value at 'partitionKey' failed to satisfy constraint: "
             "Member must have length less than or equal to 256", 400)
+    raw = b""
     if record_data:
         try:
             raw = base64.b64decode(record_data)
@@ -464,6 +465,17 @@ def _put_record(data):
         "Data": record_data,
         "PartitionKey": partition_key,
     })
+
+    # Fan out to any Firehose delivery stream configured with this Kinesis
+    # stream as its source. Best-effort, must not break this PutRecord.
+    try:
+        from ministack.services import firehose as _firehose
+        _firehose.ingest_from_kinesis_source(
+            stream["StreamARN"], [(partition_key, raw)],
+        )
+    except Exception:
+        logger.exception("Firehose fan-out from Kinesis PutRecord failed")
+
     return json_response({
         "ShardId": shard_id,
         "SequenceNumber": seq,
@@ -508,6 +520,7 @@ def _put_records(data):
             "Records total payload size exceeds 5 MB limit", 400)
 
     results = []
+    fanout_pairs = []
     for rec in records:
         pk = rec.get("PartitionKey", "")
         rd = rec.get("Data", "")
@@ -526,6 +539,20 @@ def _put_records(data):
             "ShardId": sid,
             "EncryptionType": stream.get("EncryptionType", "NONE"),
         })
+        try:
+            raw = base64.b64decode(rd) if rd else b""
+        except Exception:
+            raw = rd.encode() if isinstance(rd, str) else rd
+        fanout_pairs.append((pk, raw))
+
+    # Fan out the whole batch to any Firehose delivery stream configured with
+    # this Kinesis stream as its source. Best-effort, must not break PutRecords.
+    try:
+        from ministack.services import firehose as _firehose
+        _firehose.ingest_from_kinesis_source(stream["StreamARN"], fanout_pairs)
+    except Exception:
+        logger.exception("Firehose fan-out from Kinesis PutRecords failed")
+
     return json_response({
         "FailedRecordCount": 0,
         "Records": results,

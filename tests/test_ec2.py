@@ -217,14 +217,18 @@ def test_ec2_describe_images_has_root_device_and_block_mappings(ec2):
     assert win["BlockDeviceMappings"][0]["DeviceName"] == "/dev/sda1"
 
 def test_ec2_security_group_crud(ec2):
-    sg_id = ec2.create_security_group(GroupName="qa-ec2-sg", Description="test sg")["GroupId"]
+    created = ec2.create_security_group(GroupName="qa-ec2-sg", Description="test sg")
+    sg_id = created["GroupId"]
     assert sg_id.startswith("sg-")
+    assert created["SecurityGroupArn"] == f"arn:aws:ec2:us-east-1:000000000000:security-group/{sg_id}"
 
     desc = ec2.describe_security_groups(GroupIds=[sg_id])
     assert desc["SecurityGroups"][0]["GroupName"] == "qa-ec2-sg"
     assert desc["SecurityGroups"][0]["Description"] == "test sg"
 
-    ec2.delete_security_group(GroupId=sg_id)
+    deleted = ec2.delete_security_group(GroupId=sg_id)
+    assert deleted["Return"] is True
+    assert deleted["GroupId"] == sg_id
     desc2 = ec2.describe_security_groups()
     assert not any(sg["GroupId"] == sg_id for sg in desc2["SecurityGroups"])
 
@@ -233,6 +237,16 @@ def test_ec2_security_group_duplicate(ec2):
     with pytest.raises(ClientError) as exc:
         ec2.create_security_group(GroupName="qa-ec2-sg-dup", Description="d")
     assert exc.value.response["Error"]["Code"] == "InvalidGroup.Duplicate"
+
+
+def test_ec2_describe_security_groups_malformed_id(ec2):
+    with pytest.raises(ClientError) as exc:
+        ec2.describe_security_groups(GroupIds=["sg-0123456789abcdef0"])
+
+    error = exc.value.response["Error"]
+    assert error["Code"] == "InvalidGroupId.Malformed"
+    assert error["Message"] == 'Invalid id: "sg-0123456789abcdef0"'
+
 
 def test_ec2_sg_authorize_revoke_ingress(ec2):
     sg_id = ec2.create_security_group(GroupName="qa-ec2-sg-rules", Description="rules test")["GroupId"]
@@ -265,6 +279,31 @@ def test_ec2_sg_authorize_revoke_ingress(ec2):
     )
     desc2 = ec2.describe_security_groups(GroupIds=[sg_id])
     assert not any(p.get("FromPort") == 80 for p in desc2["SecurityGroups"][0]["IpPermissions"])
+
+    ec2.delete_security_group(GroupId=sg_id)
+
+
+def test_ec2_revoke_security_group_egress_returns_revoked_rules(ec2):
+    sg_id = ec2.create_security_group(GroupName="qa-ec2-sg-revoke-egress", Description="egress")["GroupId"]
+
+    resp = ec2.revoke_security_group_egress(
+        GroupId=sg_id,
+        IpPermissions=[
+            {
+                "IpProtocol": "-1",
+                "IpRanges": [{"CidrIp": "0.0.0.0/0"}],
+            }
+        ],
+    )
+
+    assert resp["Return"] is True
+    revoked = resp["RevokedSecurityGroupRules"]
+    assert len(revoked) == 1
+    assert revoked[0]["SecurityGroupRuleId"].startswith("sgr-")
+    assert revoked[0]["GroupId"] == sg_id
+    assert revoked[0]["IsEgress"] is True
+    assert revoked[0]["IpProtocol"] == "-1"
+    assert revoked[0]["CidrIpv4"] == "0.0.0.0/0"
 
     ec2.delete_security_group(GroupId=sg_id)
 
@@ -629,6 +668,28 @@ def test_ec2_vpc_endpoint_crud(ec2):
 
     ec2.delete_vpc(VpcId=vpc_id)
 
+
+def test_ec2_vpc_endpoint_tags(ec2):
+    vpc_id = ec2.create_vpc(CidrBlock="10.41.0.0/16")["Vpc"]["VpcId"]
+
+    vpce_id = ec2.create_vpc_endpoint(
+        VpcId=vpc_id,
+        ServiceName="com.amazonaws.us-east-1.s3",
+        VpcEndpointType="Gateway",
+        TagSpecifications=[{
+            "ResourceType": "vpc-endpoint",
+            "Tags": [{"Key": "Env", "Value": "test"}, {"Key": "Team", "Value": "infra"}],
+        }],
+    )["VpcEndpoint"]["VpcEndpointId"]
+
+    desc = ec2.describe_vpc_endpoints(VpcEndpointIds=[vpce_id])
+    tags = {t["Key"]: t["Value"] for t in desc["VpcEndpoints"][0].get("Tags", [])}
+    assert tags == {"Env": "test", "Team": "infra"}
+
+    ec2.delete_vpc_endpoints(VpcEndpointIds=[vpce_id])
+    ec2.delete_vpc(VpcId=vpc_id)
+
+
 def test_ec2_describe_vpc_endpoint_services(ec2):
     resp = ec2.describe_vpc_endpoint_services()
     names = resp["ServiceNames"]
@@ -769,6 +830,34 @@ def test_ec2_flow_logs_crud(ec2):
     ec2.delete_flow_logs(FlowLogIds=fl_ids)
     desc2 = ec2.describe_flow_logs(FlowLogIds=fl_ids)
     assert len(desc2["FlowLogs"]) == 0
+
+
+def test_ec2_flow_log_tags(ec2):
+    vpc = ec2.create_vpc(CidrBlock="10.105.0.0/16")
+    vpc_id = vpc["Vpc"]["VpcId"]
+
+    fl_ids = ec2.create_flow_logs(
+        ResourceIds=[vpc_id],
+        ResourceType="VPC",
+        TrafficType="ALL",
+        LogDestinationType="cloud-watch-logs",
+        LogGroupName="/aws/vpc/flowlogs-tags",
+        TagSpecifications=[{
+            "ResourceType": "flow-log",
+            "Tags": [{"Key": "Project", "Value": "ministack"}],
+        }],
+    )["FlowLogIds"]
+
+    desc = ec2.describe_flow_logs(FlowLogIds=fl_ids)
+    tags = {t["Key"]: t["Value"] for t in desc["FlowLogs"][0].get("Tags", [])}
+    assert tags == {"Project": "ministack"}
+
+    ec2.delete_flow_logs(FlowLogIds=fl_ids)
+    tag_resp = ec2.describe_tags(Filters=[{"Name": "resource-id", "Values": fl_ids}])
+    assert tag_resp["Tags"] == []
+
+    ec2.delete_vpc(VpcId=vpc_id)
+
 
 def test_ec2_vpc_peering_crud(ec2):
     vpc1 = ec2.create_vpc(CidrBlock="10.105.0.0/16")
@@ -1559,6 +1648,39 @@ def test_ec2_launch_template_versions(ec2):
 
     # Cleanup
     ec2.delete_launch_template(LaunchTemplateId=lt_id)
+
+
+def test_ec2_create_launch_template_version_returns_version_number(ec2):
+    """CreateLaunchTemplateVersion must return VersionNumber at the
+    `launchTemplateVersion` root, not wrapped in `<item>` — otherwise the
+    Go SDK reads it as null and Terraform sends ``SetDefaultVersion=0`` to
+    the follow-up ModifyLaunchTemplate, which AWS rejects with
+    ``InvalidLaunchTemplateId.VersionNotFound``. Repro for issue #753."""
+    resp = ec2.create_launch_template(
+        LaunchTemplateName="qa-lt-vnum",
+        LaunchTemplateData={"InstanceType": "t3.micro"},
+    )
+    lt_id = resp["LaunchTemplate"]["LaunchTemplateId"]
+    try:
+        v2 = ec2.create_launch_template_version(
+            LaunchTemplateId=lt_id,
+            LaunchTemplateData={"InstanceType": "t3.small"},
+        )
+        # botocore parses the response shape; if the inner XML is wrong, this
+        # field reads as None / missing rather than the version number.
+        assert "LaunchTemplateVersion" in v2
+        v = v2["LaunchTemplateVersion"]
+        assert v.get("VersionNumber") == 2, v
+        assert v.get("LaunchTemplateId") == lt_id
+
+        # End-to-end: Terraform-style follow-up that previously failed.
+        modified = ec2.modify_launch_template(
+            LaunchTemplateId=lt_id,
+            DefaultVersion=str(v["VersionNumber"]),
+        )
+        assert modified["LaunchTemplate"]["DefaultVersionNumber"] == 2
+    finally:
+        ec2.delete_launch_template(LaunchTemplateId=lt_id)
 
 
 def test_ec2_launch_template_with_block_devices(ec2):

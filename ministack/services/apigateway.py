@@ -1005,6 +1005,12 @@ async def _invoke_lambda_proxy(
     status = lambda_response.get("statusCode", 200)
     resp_headers = {"Content-Type": "application/json"}
     resp_headers.update(lambda_response.get("headers", {}))
+    # Payload format 2.0 emits multiple Set-Cookie headers via the top-level
+    # `cookies` array, not the headers map. The list value is expanded into one
+    # Set-Cookie line per entry by _send_response.
+    cookies = lambda_response.get("cookies")
+    if cookies:
+        resp_headers["Set-Cookie"] = list(cookies)
     resp_body = lambda_response.get("body", "")
     if isinstance(resp_body, str):
         resp_body = resp_body.encode("utf-8")

@@ -632,10 +632,13 @@ def _decrypt(data):
                     label=None,
                 ),
             )
-        except ValueError as e:
+        except ValueError:
+            # AWS KMS doesn't surface the underlying crypto library's error
+            # text; the documented InvalidCiphertextException message format
+            # is empty / opaque.
             return error_response_json(
                 "InvalidCiphertextException",
-                str(e),
+                "",
                 400,
             )
     else:

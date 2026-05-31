@@ -1402,6 +1402,52 @@ def test_cfn_ssm_parameter_timestamp_is_epoch(cfn, ssm):
         _wait_stack(cfn, "cfn-ssm-epoch")
 
 
+def test_cfn_appconfig_application(cfn, appconfig_client):
+    """AWS::AppConfig::Application provisions via CFN and is reachable via the
+    AppConfig API. Mirrors the CDK template from the reporter."""
+    template = json.dumps({
+        "Resources": {
+            "AppConfig1FDF3617": {
+                "Type": "AWS::AppConfig::Application",
+                "Properties": {
+                    "Name": "digital-cdk-template-test-master-AppConfig",
+                    "Tags": [
+                        {"Key": "application-id", "Value": "digital-cdk-template"},
+                    ],
+                },
+            },
+        },
+    })
+    cfn.create_stack(StackName="cfn-appconfig-app", TemplateBody=template)
+    _wait_stack(cfn, "cfn-appconfig-app")
+
+    try:
+        apps = appconfig_client.list_applications()["Items"]
+        match = [
+            a for a in apps
+            if a["Name"] == "digital-cdk-template-test-master-AppConfig"
+        ]
+        assert len(match) == 1
+        app_id = match[0]["Id"]
+
+        resources = cfn.describe_stack_resources(StackName="cfn-appconfig-app")
+        cfn_res = [
+            r for r in resources["StackResources"]
+            if r["LogicalResourceId"] == "AppConfig1FDF3617"
+        ]
+        assert len(cfn_res) == 1
+        assert cfn_res[0]["PhysicalResourceId"] == app_id
+    finally:
+        cfn.delete_stack(StackName="cfn-appconfig-app")
+        _wait_stack(cfn, "cfn-appconfig-app")
+
+    apps_after = appconfig_client.list_applications()["Items"]
+    assert not any(
+        a["Name"] == "digital-cdk-template-test-master-AppConfig"
+        for a in apps_after
+    )
+
+
 def test_cfn_lambda_nodejs_inline_zip(cfn, lam):
     """CFN inline ZipFile with Node.js runtime should write index.js, not index.py."""
     template = json.dumps({

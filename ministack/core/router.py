@@ -20,7 +20,9 @@ logger = logging.getLogger("ministack")
 # and routes via credential scope, but raw HTTP/curl/runtime API don't).
 _LAMBDA_PATH_RE = re.compile(
     r"^/\d{4}-\d{2}-\d{2}/(?:functions|layers|event-source-mappings|"
-    r"account-settings|runtime|tags|code-signing-configs)(?:/|$)"
+    r"account-settings|runtime|tags|code-signing-configs|"
+    # Durable Functions (preview, Dec 2025).
+    r"durable-executions|durable-execution-callbacks)(?:/|$)"
 )
 
 # ECS Task Metadata V4 paths: /v4/<token>[/task|/stats|...]. Token is
@@ -60,7 +62,13 @@ SERVICE_PATTERNS = {
         "host_patterns": [r"dynamodb\."],
     },
     "lambda": {
-        "path_patterns": [r"^/2015-03-31/", r"^/2018-10-31/layers"],
+        "path_patterns": [
+            r"^/2015-03-31/",
+            r"^/2018-10-31/layers",
+            # Durable Functions (preview, Dec 2025) — surface lives on the
+            # Lambda endpoint under a fresh API-version prefix.
+            r"^/2025-12-01/(durable-executions|durable-execution-callbacks|functions)",
+        ],
         "host_patterns": [r"lambda\."],
     },
     "iam": {
@@ -374,6 +382,11 @@ SERVICE_PATTERNS = {
         "host_patterns": [r"inspector2\."],
         "credential_scope": "inspector2",
     },
+    "s3tables": {
+        "host_patterns": [r"s3tables\."],
+        "credential_scope": "s3tables",
+        "path_prefixes": ["/buckets", "/iceberg"],
+    },
 }
 
 
@@ -458,6 +471,7 @@ def detect_service(method: str, path: str, headers: dict, query_params: dict) ->
                 "cloudtrail": "cloudtrail",
                 "cur": "cur",
                 "inspector2": "inspector2",
+                "s3tables": "s3tables",
             }
             if svc_name in scope_map:
                 return scope_map[svc_name]

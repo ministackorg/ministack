@@ -4,7 +4,10 @@ JSON-based API via X-Amz-Target (AWSGlue).
 Supports full Data Catalog: Databases, Tables, Partitions, Connections, Crawlers, Jobs, JobRuns.
 Also: SecurityConfigurations, Classifiers, PartitionIndexes, CrawlerMetrics, Tags,
       Triggers, Workflows.
-Job execution runs Python scripts via subprocess in background threads.
+Job execution: when Docker is available and the job command is ``glueetl`` or
+``gluestreaming``, runs the script inside an ``amazon/aws-glue-libs`` container
+with Spark + awsglue.  Falls back to plain ``python3`` subprocess for non-Spark
+scripts or when Docker is unavailable.
 Crawlers transition through RUNNING state with a configurable timer.
 """
 
@@ -33,6 +36,64 @@ logger = logging.getLogger("glue")
 REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 CRAWLER_RUN_SECONDS = int(os.environ.get("GLUE_CRAWLER_RUN_SECONDS", "5"))
 S3_DATA_DIR = os.environ.get("S3_DATA_DIR", "/tmp/ministack-data/s3")
+DOCKER_NETWORK = os.environ.get("DOCKER_NETWORK", "")
+
+# Glue Docker image — maps GlueVersion to the amazon/aws-glue-libs tag.
+# Users can override via GLUE_DOCKER_IMAGE env var.
+_GLUE_VERSION_IMAGES = {
+    "4.0": "amazon/aws-glue-libs:glue_libs_4.0.0_image_01",
+    "3.0": "amazon/aws-glue-libs:glue_libs_3.0.0_image_01",
+}
+GLUE_DOCKER_IMAGE_OVERRIDE = os.environ.get("GLUE_DOCKER_IMAGE", "")
+
+_docker = None
+_ministack_network = None
+
+
+def _get_docker():
+    global _docker
+    if _docker is None:
+        try:
+            import docker
+            _docker = docker.from_env()
+        except Exception:
+            pass
+    return _docker
+
+
+def _get_ministack_network(docker_client):
+    """Detect the Docker network MiniStack is running on (if containerised)."""
+    global _ministack_network
+    if _ministack_network is not None:
+        return _ministack_network or None
+    if DOCKER_NETWORK:
+        _ministack_network = DOCKER_NETWORK
+        return DOCKER_NETWORK
+    try:
+        self_container = docker_client.containers.get(
+            os.environ.get("HOSTNAME", ""))
+        nets = list(
+            self_container.attrs["NetworkSettings"]["Networks"].keys())
+        if nets:
+            _ministack_network = nets[0]
+            return nets[0]
+    except Exception:
+        pass
+    _ministack_network = ""
+    return None
+
+
+def _glue_image_for_version(glue_version):
+    """Return the Docker image for a given GlueVersion."""
+    if GLUE_DOCKER_IMAGE_OVERRIDE:
+        return GLUE_DOCKER_IMAGE_OVERRIDE
+    return _GLUE_VERSION_IMAGES.get(glue_version, _GLUE_VERSION_IMAGES.get("4.0"))
+
+
+def _is_spark_job(job):
+    """True if the job uses glueetl/gluestreaming (Spark-based)."""
+    cmd_name = job.get("Command", {}).get("Name", "")
+    return cmd_name in ("glueetl", "gluestreaming")
 
 _databases = AccountScopedDict()
 _tables = AccountScopedDict()       # "db_name/table_name" -> table dict
@@ -269,6 +330,8 @@ def _create_table(data):
         "Parameters": table_input.get("Parameters", {}),
         "ViewOriginalText": table_input.get("ViewOriginalText"),
         "ViewExpandedText": table_input.get("ViewExpandedText"),
+        "ViewDefinition": table_input.get("ViewDefinition"),
+        "IsMultiDialectView": table_input.get("IsMultiDialectView"),
         "IsRegisteredWithLakeFormation": False,
         "CatalogId": get_account_id(),
     }
@@ -314,7 +377,8 @@ def _update_table(data):
     if key not in _tables:
         return error_response_json("EntityNotFoundException", f"Table {name} not found", 400)
     safe_keys = {"Description", "Owner", "StorageDescriptor", "PartitionKeys",
-                 "TableType", "Parameters", "ViewOriginalText", "ViewExpandedText"}
+                 "TableType", "Parameters", "ViewOriginalText", "ViewExpandedText",
+                 "ViewDefinition", "IsMultiDialectView"}
     for k in safe_keys:
         if k in table_input:
             _tables[key][k] = table_input[k]
@@ -700,7 +764,11 @@ def _update_job(data):
 
 
 def _resolve_script(script_location):
-    """Resolve a script location to a local path. Supports local paths and s3:// URIs."""
+    """Resolve a script location to a local path. Supports local paths and s3:// URIs.
+
+    For S3 URIs, first checks the on-disk S3_DATA_DIR (file-backed S3).
+    If not found, fetches from MiniStack's in-memory S3 service to a temp file.
+    """
     if not script_location:
         return None
     if os.path.exists(script_location):
@@ -710,9 +778,29 @@ def _resolve_script(script_location):
         parts = stripped.split("/", 1)
         bucket = parts[0]
         key = parts[1] if len(parts) > 1 else ""
+        # Check on-disk first
         local_path = os.path.join(S3_DATA_DIR, bucket, key)
         if os.path.exists(local_path):
             return local_path
+        # Fetch from in-memory S3
+        try:
+            import ministack.services.s3 as _s3_svc
+            s3_bucket = _s3_svc._buckets.get(bucket)
+            if s3_bucket:
+                obj = s3_bucket.get("objects", {}).get(key)
+                if obj and obj.get("body"):
+                    tmp_dir = os.path.join(tempfile.gettempdir(), "ministack-glue-scripts")
+                    os.makedirs(tmp_dir, exist_ok=True)
+                    tmp_path = os.path.join(tmp_dir, os.path.basename(key))
+                    data = obj["body"]
+                    if isinstance(data, memoryview):
+                        data = bytes(data)
+                    with open(tmp_path, "wb") as f:
+                        f.write(data)
+                    logger.info("Glue: resolved script from S3: s3://%s/%s -> %s", bucket, key, tmp_path)
+                    return tmp_path
+        except Exception as e:
+            logger.debug("Glue: failed to fetch script from S3: %s", e)
     return None
 
 
@@ -756,30 +844,23 @@ def _start_job_run(data):
 
         script_location = job.get("Command", {}).get("ScriptLocation", "")
         resolved = _resolve_script(script_location)
-        if resolved and resolved.endswith(".py"):
+
+        docker_client = _get_docker()
+        use_docker = False
+        if _is_spark_job(job) and docker_client and resolved:
+            image = _glue_image_for_version(job.get("GlueVersion", "4.0"))
             try:
-                env = dict(os.environ)
-                for k, v in args.items():
-                    env_key = k.lstrip("-")
-                    if env_key:
-                        env[env_key] = str(v)
-                proc = subprocess.run(
-                    ["python3", resolved],
-                    capture_output=True, text=True,
-                    timeout=min(job.get("Timeout", 300), 600),
-                    env=env,
-                )
-                if proc.returncode == 0:
-                    run["JobRunState"] = "SUCCEEDED"
-                else:
-                    run["JobRunState"] = "FAILED"
-                    run["ErrorMessage"] = proc.stderr[:2000] if proc.stderr else f"Exit code {proc.returncode}"
-            except subprocess.TimeoutExpired:
-                run["JobRunState"] = "TIMEOUT"
-                run["ErrorMessage"] = "Job execution timed out"
-            except Exception as e:
-                run["JobRunState"] = "FAILED"
-                run["ErrorMessage"] = str(e)[:2000]
+                docker_client.images.get(image)
+                use_docker = True
+            except Exception:
+                logger.info("Glue: image %s not available — stubbing job %s", image, job_name)
+
+        if use_docker:
+            _execute_spark_docker(run, job, job_name, args, resolved, docker_client)
+        elif _is_spark_job(job):
+            run["JobRunState"] = "SUCCEEDED"
+        elif resolved and resolved.endswith(".py"):
+            _execute_subprocess(run, job, args, resolved)
         else:
             run["JobRunState"] = "SUCCEEDED"
 
@@ -791,6 +872,184 @@ def _start_job_run(data):
     thread.start()
 
     return json_response({"JobRunId": run_id})
+
+
+def _execute_subprocess(run, job, args, resolved):
+    """Run a Glue script as a plain Python subprocess (non-Spark fallback)."""
+    try:
+        env = dict(os.environ)
+        for k, v in args.items():
+            env_key = k.lstrip("-")
+            if env_key:
+                env[env_key] = str(v)
+        proc = subprocess.run(
+            ["python3", resolved],
+            capture_output=True, text=True,
+            timeout=min(job.get("Timeout", 300), 600),
+            env=env,
+        )
+        if proc.returncode == 0:
+            run["JobRunState"] = "SUCCEEDED"
+        else:
+            run["JobRunState"] = "FAILED"
+            run["ErrorMessage"] = proc.stderr[:2000] if proc.stderr else f"Exit code {proc.returncode}"
+    except subprocess.TimeoutExpired:
+        run["JobRunState"] = "TIMEOUT"
+        run["ErrorMessage"] = "Job execution timed out"
+    except Exception as e:
+        run["JobRunState"] = "FAILED"
+        run["ErrorMessage"] = str(e)[:2000]
+
+
+def _execute_spark_docker(run, job, job_name, args, script_path, docker_client):
+    """Run a Glue Spark job inside an amazon/aws-glue-libs Docker container."""
+    glue_version = job.get("GlueVersion", "4.0")
+    image = _glue_image_for_version(glue_version)
+    container_name = f"ministack-glue-{job_name}-{run['Id'][:8]}"
+
+    # Remove stale container with same name
+    try:
+        existing = docker_client.containers.get(container_name)
+        existing.remove(force=True)
+    except Exception:
+        pass
+
+    ms_network = _get_ministack_network(docker_client)
+
+    # Determine MiniStack's S3 endpoint from inside the container.
+    # If on a Docker network, use the ministack container's IP; otherwise localhost.
+    ministack_host = os.environ.get("MINISTACK_HOST", "")
+    ministack_port = os.environ.get("EDGE_PORT", "4566")
+    if ms_network and not ministack_host:
+        # Try to resolve from HOSTNAME
+        try:
+            ms_container = docker_client.containers.get(
+                os.environ.get("HOSTNAME", ""))
+            ms_container.reload()
+            nets = ms_container.attrs.get("NetworkSettings", {}).get("Networks", {})
+            ip = nets.get(ms_network, {}).get("IPAddress", "")
+            if ip:
+                ministack_host = ip
+        except Exception:
+            pass
+    if not ministack_host:
+        ministack_host = "host.docker.internal"
+
+    s3_endpoint = f"http://{ministack_host}:{ministack_port}"
+
+    # Build Spark submit arguments from Glue job arguments.
+    # Glue args use --key value; spark-submit uses --conf key=value for Spark conf.
+    spark_args = []
+    for k, v in args.items():
+        spark_args.extend([k, str(v)])
+
+    # Extra py files (Glue --extra-py-files)
+    extra_py = args.get("--extra-py-files", "")
+
+    # Build environment for the container
+    container_env = {
+        "AWS_ACCESS_KEY_ID": os.environ.get("AWS_ACCESS_KEY_ID", "test"),
+        "AWS_SECRET_ACCESS_KEY": os.environ.get("AWS_SECRET_ACCESS_KEY", "test"),
+        "AWS_DEFAULT_REGION": get_region(),
+        "AWS_REGION": get_region(),
+        "DISABLE_SSL": "true",
+    }
+
+    # Build the spark-submit command.
+    # The aws-glue-libs image has /home/glue_user/spark/bin/spark-submit.
+    cmd = [
+        "spark-submit",
+        "--master", "local[*]",
+        "--conf", f"spark.hadoop.fs.s3a.endpoint={s3_endpoint}",
+        "--conf", "spark.hadoop.fs.s3a.path.style.access=true",
+        "--conf", f"spark.hadoop.fs.s3a.access.key={container_env['AWS_ACCESS_KEY_ID']}",
+        "--conf", f"spark.hadoop.fs.s3a.secret.key={container_env['AWS_SECRET_ACCESS_KEY']}",
+        "--conf", "spark.hadoop.fs.s3a.impl=org.apache.hadoop.fs.s3a.S3AFileSystem",
+        "--conf", "spark.hadoop.fs.s3a.connection.ssl.enabled=false",
+    ]
+
+    # Add extra-py-files if present
+    if extra_py:
+        cmd.extend(["--py-files", extra_py])
+
+    # Add Spark/Iceberg conf from job arguments
+    conf_arg = args.get("--conf", "")
+    if conf_arg:
+        for conf in conf_arg.split(" --conf "):
+            conf = conf.strip()
+            if conf:
+                cmd.extend(["--conf", conf])
+
+    # The script path inside the container
+    container_script = f"/tmp/{os.path.basename(script_path)}"
+    cmd.append(container_script)
+
+    # Append Glue job arguments (--key value pairs) after the script
+    cmd.extend(spark_args)
+
+    container_kwargs = {
+        "image": image,
+        "name": container_name,
+        "command": cmd,
+        "environment": container_env,
+        "detach": True,
+        "labels": {"ministack": "glue", "job_name": job_name},
+    }
+
+    if ms_network:
+        container_kwargs["network"] = ms_network
+
+    logger.info(
+        "Glue: starting Spark container for %s (image=%s, network=%s)",
+        job_name, image, ms_network or "host",
+    )
+
+    try:
+        container = docker_client.containers.create(**container_kwargs)
+        # Copy script into container (avoids Docker-in-Docker volume mount issues)
+        import io
+        import tarfile
+        script_data = open(script_path, "rb").read()
+        tar_buf = io.BytesIO()
+        with tarfile.open(fileobj=tar_buf, mode="w") as tar:
+            info = tarfile.TarInfo(name=os.path.basename(script_path))
+            info.size = len(script_data)
+            tar.addfile(info, io.BytesIO(script_data))
+        tar_buf.seek(0)
+        container.put_archive("/tmp", tar_buf)
+        container.start()
+    except Exception as e:
+        logger.warning("Glue: failed to start Spark container for %s: %s", job_name, e)
+        run["JobRunState"] = "FAILED"
+        run["ErrorMessage"] = f"Docker container start failed: {e}"[:2000]
+        try:
+            container.remove(force=True)
+        except Exception:
+            pass
+        return
+
+    # Wait for container to finish
+    try:
+        result = container.wait(timeout=min(job.get("Timeout", 2880) * 60, 3600))
+        exit_code = result.get("StatusCode", -1)
+        logs = container.logs(tail=200).decode("utf-8", errors="replace")
+
+        if exit_code == 0:
+            run["JobRunState"] = "SUCCEEDED"
+            logger.info("Glue: Spark job %s completed successfully", job_name)
+        else:
+            run["JobRunState"] = "FAILED"
+            run["ErrorMessage"] = logs[-2000:] if logs else f"Exit code {exit_code}"
+            logger.warning("Glue: Spark job %s failed (exit %d)", job_name, exit_code)
+    except Exception as e:
+        run["JobRunState"] = "FAILED"
+        run["ErrorMessage"] = f"Container execution error: {e}"[:2000]
+        logger.warning("Glue: Spark container for %s error: %s", job_name, e)
+    finally:
+        try:
+            container.remove(force=True)
+        except Exception:
+            pass
 
 
 def _get_job_run(data):

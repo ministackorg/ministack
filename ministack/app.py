@@ -309,6 +309,7 @@ SERVICE_REGISTRY = {
     "cloudtrail": {"module": "cloudtrail"},
     "cur": {"module": "cur"},
     "inspector2": {"module": "inspector2"},
+    "s3tables": {"module": "s3tables"},
 }
 
 SERVICE_HANDLERS = {
@@ -345,6 +346,8 @@ _state_map = {
     "resource_groups": "resource_groups",
     "cloudtrail": "cloudtrail", "iot": "iot",
     "inspector2": "inspector2",
+    "s3tables": "s3tables",
+    "lambda_durable": "lambda_durable",
 }
 
 SERVICE_NAME_ALIASES = {
@@ -471,7 +474,17 @@ async def _send_response(send, status, headers, body):
     body_bytes = body if isinstance(body, bytes) else body.encode("utf-8")
     if "content-length" not in {k.lower() for k in headers}:
         headers["Content-Length"] = str(len(body_bytes))
-    header_list = [(k.encode("latin-1"), _encode_header_value(str(v))) for k, v in headers.items()]
+    # A list/tuple header value expands to one header line per item. This is
+    # required for Set-Cookie, which RFC 6265 §3 forbids folding into a single
+    # comma-joined header; APIGW Lambda-proxy responses surface multiple
+    # cookies this way. Scalar values keep their existing single-line behavior.
+    header_list = []
+    for k, v in headers.items():
+        if isinstance(v, (list, tuple)):
+            for item in v:
+                header_list.append((k.encode("latin-1"), _encode_header_value(str(item))))
+        else:
+            header_list.append((k.encode("latin-1"), _encode_header_value(str(v))))
     await send(
         {
             "type": "http.response.start",
@@ -1259,6 +1272,13 @@ async def _handle_special_data_plane_request(
     request_id: str,
 ):
     """Handle special-case service entrypoints before the generic router."""
+    # Iceberg REST catalog — route /iceberg/* to s3tables service
+    if path.startswith("/iceberg"):
+        try:
+            return await _get_module("s3tables").handle_request(method, path, headers, body, query_params)
+        except Exception as e:
+            logger.exception("Error in Iceberg REST catalog: %s", e)
+            return 500, {"Content-Type": "application/json"}, json.dumps({"error": str(e)}).encode()
     if response := await _handle_s3_control_request(path, method, body, query_params, request_id):
         return response
     if response := await _handle_rds_data_request(method, path, headers, body, query_params):
@@ -1797,6 +1817,29 @@ def _load_persisted_state():
     # import.
     for svc_key in ("pipes", "ses_v2", "appsync_events", "apigateway_v1"):
         _get_module(svc_key)
+
+    # RDS is intentionally NOT in the unconditional list above —
+    # eager-importing it for every user would pull in ~13 MB of module
+    # objects (and, lazily, the docker SDK) even on stacks that don't
+    # use RDS. Instead, only eager-import when a persisted state file
+    # exists: importing the module triggers its bottom-of-file
+    # `load_state("rds")` which spawns the respawn threads for every
+    # persisted instance. Without this, users have to make one client
+    # call after every restart to lazily trigger the import + respawn
+    # (#692 follow-up after doodaz's confirmation).
+    if load_state("rds"):
+        _get_module("rds")
+        logger.info("RDS: eager-loaded module to respawn persisted containers at boot")
+
+    # `lambda_durable` is reached only via `lambda_svc.handle_request`, never
+    # directly through the lazy router (no SERVICE_REGISTRY entry — it has no
+    # AWS endpoint of its own). Without an eager import at boot, persisted
+    # durable executions silently disappear until something happens to invoke
+    # a durable endpoint. Same conditional-import pattern as RDS — only pay
+    # the cold-start cost when state actually exists.
+    if load_state("lambda_durable"):
+        _get_module("lambda_durable")
+        logger.info("Lambda Durable: eager-loaded module to restore persisted executions")
 
 
 async def _wait_for_port(port, timeout=30):

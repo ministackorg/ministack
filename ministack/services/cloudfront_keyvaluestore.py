@@ -127,7 +127,7 @@ async def handle_request(method, path, headers, body, query_params):
         if method == "GET":
             return _describe_store(arn)
 
-    return _error("InvalidRequestException", f"No route for {method} {path}", 400)
+    return _error("ValidationException", f"No route for {method} {path}", 400)
 
 
 # ---------------------------------------------------------------------------

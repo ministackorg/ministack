@@ -246,7 +246,7 @@ _DISPATCH = {
 
 async def handle_request(method, path, headers, body, query_params):
     if method != "POST":
-        return error_response_json("InvalidRequest",
+        return error_response_json("ClientException",
                                    f"Unsupported method {method}", 400)
     fn = _DISPATCH.get(path.rstrip("/").lower())
     if fn is None:

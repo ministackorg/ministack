@@ -612,7 +612,7 @@ async def handle_request(method, path, headers, body, query_params):
             return _get_account()
         if method == "PATCH":
             return _update_account(data)
-        return _v1_error("MethodNotAllowedException", f"Method not allowed: {method} /account", 405)
+        return _v1_error("BadRequestException", f"Method not allowed: {method} /account", 400)
 
     if top == "tags":
         # /tags/{resourceArn} — ARN may contain slashes
@@ -976,7 +976,33 @@ async def _invoke_lambda_proxy_v1(integration, api_id, stage_name, stage, resour
 
     status = lambda_response.get("statusCode", 200)
     resp_headers = {"Content-Type": "application/json"}
-    resp_headers.update(lambda_response.get("headers", {}))
+    # Apply the Lambda's `headers` with case-insensitive override of any seeded
+    # default, the same way the multiValueHeaders merge below already case-folds
+    # collisions (added in #750 by @Nahuel990). HTTP field names are
+    # case-insensitive (RFC 9110 §5.1), so a lowercase `content-type` from the
+    # function must replace the default `Content-Type`, not ship alongside it.
+    for k, v in (lambda_response.get("headers") or {}).items():
+        lower_k = k.lower()
+        for existing in [h for h in resp_headers if h.lower() == lower_k]:
+            del resp_headers[existing]
+        resp_headers[k] = v
+    # Payload format 1.0 carries multi-value headers (notably Set-Cookie) in
+    # `multiValueHeaders`. AWS docs: "If you specify values for both `headers`
+    # and `multiValueHeaders`, API Gateway merges them into a single list. If
+    # the same key-value pair is specified in both, only the values from
+    # `multiValueHeaders` will appear in the merged list." HTTP headers are
+    # case-insensitive (RFC 7230 §3.2), so the collision check must compare
+    # case-folded — `Set-Cookie` in `headers` plus `set-cookie` in
+    # `multiValueHeaders` is the SAME header. Each list value is then expanded
+    # into one header line per entry by _send_response.
+    for k, v in (lambda_response.get("multiValueHeaders") or {}).items():
+        if not v:
+            continue
+        lower_k = k.lower()
+        for existing in list(resp_headers):
+            if existing.lower() == lower_k:
+                del resp_headers[existing]
+        resp_headers[k] = list(v)
     resp_body = lambda_response.get("body", "")
     if isinstance(resp_body, str):
         resp_body = resp_body.encode("utf-8")

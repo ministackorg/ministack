@@ -711,10 +711,12 @@ def test_dynamodb_update_item_extra_key_attribute_fails_validation(ddb):
 
 def test_dynamodb_update_item_add(ddb):
     ddb.put_item(TableName="t_hash_only", Item={"pk": {"S": "upd_add"}, "counter": {"N": "5"}})
+    # 'counter' is in the AWS reserved-keyword list — must be aliased.
     resp = ddb.update_item(
         TableName="t_hash_only",
         Key={"pk": {"S": "upd_add"}},
-        UpdateExpression="ADD counter :inc",
+        UpdateExpression="ADD #c :inc",
+        ExpressionAttributeNames={"#c": "counter"},
         ExpressionAttributeValues={":inc": {"N": "3"}},
         ReturnValues="ALL_NEW",
     )
@@ -1155,7 +1157,8 @@ def test_dynamodb_gsi_hash_only_query_pagination(ddb):
         kwargs = dict(
             TableName=table,
             IndexName="bucket-index",
-            KeyConditionExpression="bucket = :v",
+            KeyConditionExpression="#b = :v",
+            ExpressionAttributeNames={"#b": "bucket"},
             ExpressionAttributeValues={":v": {"N": "0"}},
             Limit=8,
         )
@@ -1387,9 +1390,15 @@ def test_dynamodb_transact_write_multiple_failures_all_returned(ddb):
 
 
 def test_dynamodb_batch_get_missing_table(ddb):
-    """BatchGetItem with non-existent table returns it in UnprocessedKeys."""
-    resp = ddb.batch_get_item(RequestItems={"qa-ddb-nonexistent-xyz": {"Keys": [{"pk": {"S": "k1"}}]}})
-    assert "qa-ddb-nonexistent-xyz" in resp["UnprocessedKeys"]
+    """BatchGetItem with non-existent table raises ResourceNotFoundException.
+
+    Real AWS rejects the whole batch upfront when any RequestItems key names
+    a table that doesn't exist — it does NOT silently put the entry into
+    UnprocessedKeys. This matches dynamodb-conformance.org's batchGetItem
+    "Non-existent table" test."""
+    with pytest.raises(ClientError) as e:
+        ddb.batch_get_item(RequestItems={"qa-ddb-nonexistent-xyz": {"Keys": [{"pk": {"S": "k1"}}]}})
+    assert e.value.response["Error"]["Code"] == "ResourceNotFoundException"
 
 def test_dynamodb_scan_filter_legacy(ddb):
     """Scan with legacy ScanFilter (ComparisonOperator style) returns matching items."""
@@ -1687,7 +1696,9 @@ def test_partiql_insert_duplicate_rejected(ddb):
             Statement=f"INSERT INTO \"{tname}\" VALUE {{'pk': ?}}",
             Parameters=[{"S": "dup"}],
         )
-    assert "ConditionalCheckFailed" in exc.value.response["Error"]["Code"]
+    # Real AWS returns DuplicateItemException — matches the conformance
+    # suite's expected error type.
+    assert exc.value.response["Error"]["Code"] == "DuplicateItemException"
 
 
 def test_partiql_update(ddb):
@@ -2772,3 +2783,2423 @@ def test_dynamodb_update_nested_parens_do_not_flatten_two_groups(ddb):
         ddb.delete_table(TableName=table)
 
 
+
+
+# ---------------------------------------------------------------------------
+# Contributor Insights, Resource Policies, Export/Import
+# Added for DynamoDB conformance — previously unsupported by ministack.
+# Behavior verified against botocore service-2.json (2012-08-10).
+# ---------------------------------------------------------------------------
+
+def _ci_table(ddb, name):
+    try:
+        ddb.delete_table(TableName=name)
+    except Exception:
+        pass
+    ddb.create_table(
+        TableName=name,
+        KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+        AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "S"}],
+        BillingMode="PAY_PER_REQUEST",
+    )
+    return ddb.describe_table(TableName=name)["Table"]["TableArn"]
+
+
+def test_dynamodb_contributor_insights_lifecycle(ddb):
+    name = "ci-table"
+    _ci_table(ddb, name)
+    try:
+        # Default state: DISABLED, empty rule list.
+        d = ddb.describe_contributor_insights(TableName=name)
+        assert d["ContributorInsightsStatus"] == "DISABLED"
+        assert d["ContributorInsightsRuleList"] == []
+
+        # ENABLE → returns ENABLING; next describe transitions to ENABLED.
+        u = ddb.update_contributor_insights(TableName=name, ContributorInsightsAction="ENABLE")
+        assert u["ContributorInsightsStatus"] == "ENABLING"
+        d = ddb.describe_contributor_insights(TableName=name)
+        assert d["ContributorInsightsStatus"] == "ENABLED"
+
+        # List includes our table.
+        lst = ddb.list_contributor_insights()
+        names = [s["TableName"] for s in lst.get("ContributorInsightsSummaries", [])]
+        assert name in names
+
+        # DISABLE.
+        u = ddb.update_contributor_insights(TableName=name, ContributorInsightsAction="DISABLE")
+        assert u["ContributorInsightsStatus"] == "DISABLING"
+        d = ddb.describe_contributor_insights(TableName=name)
+        assert d["ContributorInsightsStatus"] == "DISABLED"
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_contributor_insights_invalid_action(ddb):
+    name = "ci-bad-action"
+    _ci_table(ddb, name)
+    try:
+        with pytest.raises(ClientError) as e:
+            ddb.update_contributor_insights(TableName=name, ContributorInsightsAction="TOGGLE")
+        assert e.value.response["Error"]["Code"] == "ValidationException"
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_contributor_insights_unknown_table(ddb):
+    with pytest.raises(ClientError) as e:
+        ddb.describe_contributor_insights(TableName="nope-ci")
+    assert e.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
+def test_dynamodb_resource_policy_put_get_delete(ddb):
+    name = "rp-table"
+    arn = _ci_table(ddb, name)
+    try:
+        policy = json.dumps({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Allow",
+                "Principal": {"AWS": "arn:aws:iam::000000000000:role/r"},
+                "Action": ["dynamodb:GetItem"],
+                "Resource": [arn],
+            }],
+        })
+        r = ddb.put_resource_policy(ResourceArn=arn, Policy=policy)
+        rev = r["RevisionId"]
+        assert rev
+
+        g = ddb.get_resource_policy(ResourceArn=arn)
+        assert g["Policy"] == policy
+        assert g["RevisionId"] == rev
+
+        # Conditional update with wrong expected revision -> PolicyNotFoundException.
+        with pytest.raises(ClientError) as e:
+            ddb.put_resource_policy(ResourceArn=arn, Policy=policy, ExpectedRevisionId="not-a-real-rev")
+        assert e.value.response["Error"]["Code"] == "PolicyNotFoundException"
+
+        # NO_POLICY revision against existing policy -> PolicyNotFoundException.
+        with pytest.raises(ClientError) as e:
+            ddb.put_resource_policy(ResourceArn=arn, Policy=policy, ExpectedRevisionId="NO_POLICY")
+        assert e.value.response["Error"]["Code"] == "PolicyNotFoundException"
+
+        # Correct expected revision succeeds and returns new revision.
+        r2 = ddb.put_resource_policy(ResourceArn=arn, Policy=policy, ExpectedRevisionId=rev)
+        assert r2["RevisionId"] != rev
+
+        # Delete returns the deleted revision.
+        d = ddb.delete_resource_policy(ResourceArn=arn)
+        assert d["RevisionId"] == r2["RevisionId"]
+
+        # Get on missing policy -> PolicyNotFoundException.
+        with pytest.raises(ClientError) as e:
+            ddb.get_resource_policy(ResourceArn=arn)
+        assert e.value.response["Error"]["Code"] == "PolicyNotFoundException"
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_resource_policy_unknown_arn(ddb):
+    fake_arn = "arn:aws:dynamodb:us-east-1:000000000000:table/does-not-exist-rp"
+    with pytest.raises(ClientError) as e:
+        ddb.get_resource_policy(ResourceArn=fake_arn)
+    assert e.value.response["Error"]["Code"] == "ResourceNotFoundException"
+    with pytest.raises(ClientError) as e:
+        ddb.put_resource_policy(ResourceArn=fake_arn, Policy="{}")
+    assert e.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
+def test_dynamodb_export_table_to_point_in_time(ddb):
+    name = "exp-table"
+    arn = _ci_table(ddb, name)
+    try:
+        r = ddb.export_table_to_point_in_time(TableArn=arn, S3Bucket="my-bucket")
+        desc = r["ExportDescription"]
+        assert desc["TableArn"] == arn
+        assert desc["S3Bucket"] == "my-bucket"
+        assert desc["ExportStatus"] in ("IN_PROGRESS", "COMPLETED")
+        export_arn = desc["ExportArn"]
+
+        d = ddb.describe_export(ExportArn=export_arn)
+        assert d["ExportDescription"]["ExportArn"] == export_arn
+
+        lst = ddb.list_exports(TableArn=arn)
+        arns = [s["ExportArn"] for s in lst["ExportSummaries"]]
+        assert export_arn in arns
+
+        # Idempotency: same ClientToken returns the same export.
+        token = "client-token-123"
+        a = ddb.export_table_to_point_in_time(TableArn=arn, S3Bucket="my-bucket", ClientToken=token)
+        b = ddb.export_table_to_point_in_time(TableArn=arn, S3Bucket="my-bucket", ClientToken=token)
+        assert a["ExportDescription"]["ExportArn"] == b["ExportDescription"]["ExportArn"]
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_describe_export_not_found(ddb):
+    with pytest.raises(ClientError) as e:
+        ddb.describe_export(ExportArn="arn:aws:dynamodb:us-east-1:000000000000:table/x/export/nope")
+    assert e.value.response["Error"]["Code"] == "ExportNotFoundException"
+
+
+def test_dynamodb_export_unknown_table(ddb):
+    fake_arn = "arn:aws:dynamodb:us-east-1:000000000000:table/does-not-exist-export"
+    with pytest.raises(ClientError) as e:
+        ddb.export_table_to_point_in_time(TableArn=fake_arn, S3Bucket="b")
+    assert e.value.response["Error"]["Code"] == "TableNotFoundException"
+
+
+def test_dynamodb_import_table(ddb):
+    name = "imp-table"
+    try:
+        ddb.delete_table(TableName=name)
+    except Exception:
+        pass
+    r = ddb.import_table(
+        S3BucketSource={"S3Bucket": "import-src"},
+        InputFormat="DYNAMODB_JSON",
+        TableCreationParameters={
+            "TableName": name,
+            "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+            "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+            "BillingMode": "PAY_PER_REQUEST",
+        },
+    )
+    desc = r["ImportTableDescription"]
+    assert desc["ImportStatus"] in ("IN_PROGRESS", "COMPLETED")
+    assert desc["InputFormat"] == "DYNAMODB_JSON"
+    arn = desc["ImportArn"]
+    try:
+        d = ddb.describe_import(ImportArn=arn)
+        assert d["ImportTableDescription"]["ImportArn"] == arn
+        lst = ddb.list_imports()
+        arns = [s["ImportArn"] for s in lst["ImportSummaryList"]]
+        assert arn in arns
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_describe_import_not_found(ddb):
+    with pytest.raises(ClientError) as e:
+        ddb.describe_import(ImportArn="arn:aws:dynamodb:us-east-1:000000000000:import/nope")
+    assert e.value.response["Error"]["Code"] == "ImportNotFoundException"
+
+
+# ---------------------------------------------------------------------------
+# Limits — AWS-spec enforcement (item size, batch caps, number precision,
+# empty sets/strings). Verified against AWS DynamoDB Developer Guide
+# "Service, account, and table quotas".
+# ---------------------------------------------------------------------------
+
+def _basic_table(ddb, name, with_sk=False):
+    try:
+        ddb.delete_table(TableName=name)
+    except Exception:
+        pass
+    ks = [{"AttributeName": "pk", "KeyType": "HASH"}]
+    ad = [{"AttributeName": "pk", "AttributeType": "S"}]
+    if with_sk:
+        ks.append({"AttributeName": "sk", "KeyType": "RANGE"})
+        ad.append({"AttributeName": "sk", "AttributeType": "S"})
+    ddb.create_table(
+        TableName=name, KeySchema=ks, AttributeDefinitions=ad, BillingMode="PAY_PER_REQUEST",
+    )
+
+
+def test_dynamodb_batch_write_cap_25(ddb):
+    name = "bw-cap"
+    _basic_table(ddb, name)
+    try:
+        # 26 items must be rejected per AWS quota.
+        reqs = [{"PutRequest": {"Item": {"pk": {"S": f"k{i}"}}}} for i in range(26)]
+        with pytest.raises(ClientError) as e:
+            ddb.batch_write_item(RequestItems={name: reqs})
+        assert e.value.response["Error"]["Code"] == "ValidationException"
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_batch_get_cap_100(ddb):
+    name = "bg-cap"
+    _basic_table(ddb, name)
+    try:
+        keys = [{"pk": {"S": f"k{i}"}} for i in range(101)]
+        with pytest.raises(ClientError) as e:
+            ddb.batch_get_item(RequestItems={name: {"Keys": keys}})
+        assert e.value.response["Error"]["Code"] == "ValidationException"
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_batch_write_duplicate_key_rejected(ddb):
+    name = "bw-dup"
+    _basic_table(ddb, name)
+    try:
+        reqs = [
+            {"PutRequest": {"Item": {"pk": {"S": "same"}, "x": {"N": "1"}}}},
+            {"PutRequest": {"Item": {"pk": {"S": "same"}, "x": {"N": "2"}}}},
+        ]
+        with pytest.raises(ClientError) as e:
+            ddb.batch_write_item(RequestItems={name: reqs})
+        assert e.value.response["Error"]["Code"] == "ValidationException"
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_batch_get_duplicate_key_rejected(ddb):
+    name = "bg-dup"
+    _basic_table(ddb, name)
+    try:
+        ddb.put_item(TableName=name, Item={"pk": {"S": "a"}})
+        with pytest.raises(ClientError) as e:
+            ddb.batch_get_item(RequestItems={name: {"Keys": [{"pk": {"S": "a"}}, {"pk": {"S": "a"}}]}})
+        assert e.value.response["Error"]["Code"] == "ValidationException"
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_empty_string_set_rejected(ddb):
+    name = "empty-ss"
+    _basic_table(ddb, name)
+    try:
+        with pytest.raises(ClientError) as e:
+            ddb.put_item(TableName=name, Item={"pk": {"S": "k"}, "tags": {"SS": []}})
+        assert e.value.response["Error"]["Code"] == "ValidationException"
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_empty_number_set_rejected(ddb):
+    name = "empty-ns"
+    _basic_table(ddb, name)
+    try:
+        with pytest.raises(ClientError) as e:
+            ddb.put_item(TableName=name, Item={"pk": {"S": "k"}, "scores": {"NS": []}})
+        assert e.value.response["Error"]["Code"] == "ValidationException"
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_empty_binary_set_rejected(ddb):
+    name = "empty-bs"
+    _basic_table(ddb, name)
+    try:
+        with pytest.raises(ClientError) as e:
+            ddb.put_item(TableName=name, Item={"pk": {"S": "k"}, "blobs": {"BS": []}})
+        assert e.value.response["Error"]["Code"] == "ValidationException"
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_duplicate_ss_values_rejected(ddb):
+    name = "dup-ss"
+    _basic_table(ddb, name)
+    try:
+        with pytest.raises(ClientError) as e:
+            ddb.put_item(TableName=name, Item={"pk": {"S": "k"}, "tags": {"SS": ["a", "a", "b"]}})
+        assert e.value.response["Error"]["Code"] == "ValidationException"
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_empty_string_hash_key_rejected(ddb):
+    name = "empty-pk"
+    _basic_table(ddb, name)
+    try:
+        with pytest.raises(ClientError) as e:
+            ddb.put_item(TableName=name, Item={"pk": {"S": ""}})
+        assert e.value.response["Error"]["Code"] == "ValidationException"
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_empty_string_sort_key_rejected(ddb):
+    name = "empty-sk"
+    _basic_table(ddb, name, with_sk=True)
+    try:
+        with pytest.raises(ClientError) as e:
+            ddb.put_item(TableName=name, Item={"pk": {"S": "p"}, "sk": {"S": ""}})
+        assert e.value.response["Error"]["Code"] == "ValidationException"
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_item_over_400kb_rejected(ddb):
+    name = "huge-item"
+    _basic_table(ddb, name)
+    try:
+        big = "x" * (400 * 1024 + 100)
+        with pytest.raises(ClientError) as e:
+            ddb.put_item(TableName=name, Item={"pk": {"S": "k"}, "blob": {"S": big}})
+        assert e.value.response["Error"]["Code"] == "ValidationException"
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_number_39_digits_rejected(ddb):
+    name = "huge-num"
+    _basic_table(ddb, name)
+    try:
+        # 39 significant digits — AWS limit is 38.
+        n = "1" * 39
+        with pytest.raises(ClientError) as e:
+            ddb.put_item(TableName=name, Item={"pk": {"S": "k"}, "n": {"N": n}})
+        assert e.value.response["Error"]["Code"] == "ValidationException"
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_number_above_max_magnitude_rejected(ddb):
+    name = "num-mag"
+    _basic_table(ddb, name)
+    try:
+        # Magnitude > 9.99...E+125 rejected per AWS quota.
+        with pytest.raises(ClientError) as e:
+            ddb.put_item(TableName=name, Item={"pk": {"S": "k"}, "n": {"N": "1E126"}})
+        assert e.value.response["Error"]["Code"] == "ValidationException"
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_number_canonicalization_leading_zeros(ddb):
+    """AWS canonicalizes numbers: strips leading zeros, normalizes negative
+    zero to 0, trims trailing zeros after the decimal."""
+    name = "num-canon"
+    _basic_table(ddb, name)
+    try:
+        ddb.put_item(TableName=name, Item={"pk": {"S": "a"}, "v": {"N": "000123"}})
+        got = ddb.get_item(TableName=name, Key={"pk": {"S": "a"}})["Item"]["v"]["N"]
+        assert got == "123"
+        ddb.put_item(TableName=name, Item={"pk": {"S": "b"}, "v": {"N": "-0"}})
+        got = ddb.get_item(TableName=name, Key={"pk": {"S": "b"}})["Item"]["v"]["N"]
+        assert got == "0"
+        ddb.put_item(TableName=name, Item={"pk": {"S": "c"}, "v": {"N": "1.500"}})
+        got = ddb.get_item(TableName=name, Key={"pk": {"S": "c"}})["Item"]["v"]["N"]
+        assert got == "1.5"
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_transact_write_cap_100(ddb):
+    name = "tw-cap"
+    _basic_table(ddb, name)
+    try:
+        items = [{"Put": {"TableName": name, "Item": {"pk": {"S": f"k{i}"}}}} for i in range(101)]
+        with pytest.raises(ClientError) as e:
+            ddb.transact_write_items(TransactItems=items)
+        assert e.value.response["Error"]["Code"] == "ValidationException"
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_transact_get_cap_100(ddb):
+    name = "tg-cap"
+    _basic_table(ddb, name)
+    try:
+        items = [{"Get": {"TableName": name, "Key": {"pk": {"S": f"k{i}"}}}} for i in range(101)]
+        with pytest.raises(ClientError) as e:
+            ddb.transact_get_items(TransactItems=items)
+        assert e.value.response["Error"]["Code"] == "ValidationException"
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def _raw_ddb(target: str, body: dict):
+    """Direct HTTP DDB call — bypasses boto3's client-side validation so we
+    can verify the server's own length checks (which is what the conformance
+    suite hits)."""
+    import urllib.request, urllib.error
+    req = urllib.request.Request(
+        "http://localhost:4566/",
+        data=json.dumps(body).encode("utf-8"),
+        headers={
+            "Content-Type": "application/x-amz-json-1.0",
+            "X-Amz-Target": f"DynamoDB_20120810.{target}",
+            "Authorization": "AWS4-HMAC-SHA256 Credential=test/20200101/us-east-1/dynamodb/aws4_request, SignedHeaders=host;x-amz-date;x-amz-target, Signature=00",
+            "X-Amz-Date": "20200101T000000Z",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req) as r:
+            return r.getcode(), json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        return e.code, json.loads(e.read())
+
+
+def test_dynamodb_transact_write_empty_rejected():
+    code, body = _raw_ddb("TransactWriteItems", {"TransactItems": []})
+    assert code == 400
+    assert "ValidationException" in body.get("__type", "")
+
+
+def test_dynamodb_transact_get_empty_rejected():
+    code, body = _raw_ddb("TransactGetItems", {"TransactItems": []})
+    assert code == 400
+    assert "ValidationException" in body.get("__type", "")
+
+
+def test_dynamodb_transact_write_duplicate_keys_rejected(ddb):
+    name = "tw-dup"
+    _basic_table(ddb, name)
+    try:
+        items = [
+            {"Put": {"TableName": name, "Item": {"pk": {"S": "same"}, "a": {"N": "1"}}}},
+            {"Put": {"TableName": name, "Item": {"pk": {"S": "same"}, "a": {"N": "2"}}}},
+        ]
+        with pytest.raises(ClientError) as e:
+            ddb.transact_write_items(TransactItems=items)
+        assert e.value.response["Error"]["Code"] == "ValidationException"
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+# ---------------------------------------------------------------------------
+# CreateTable validation — AWS-canonical name/key/LSI rules.
+# Verified against botocore service-2.json (2012-08-10) and AWS Developer
+# Guide "CreateTable" reference (pattern [a-zA-Z0-9_.-]+, length 3-255,
+# LSI requires range key on base table, etc.).
+# ---------------------------------------------------------------------------
+
+def test_dynamodb_create_table_name_too_short(ddb):
+    with pytest.raises(ClientError) as e:
+        ddb.create_table(
+            TableName="xy",
+            KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+            AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "S"}],
+            BillingMode="PAY_PER_REQUEST",
+        )
+    assert e.value.response["Error"]["Code"] == "ValidationException"
+
+
+def test_dynamodb_create_table_name_too_long(ddb):
+    with pytest.raises(ClientError) as e:
+        ddb.create_table(
+            TableName="a" * 256,
+            KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+            AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "S"}],
+            BillingMode="PAY_PER_REQUEST",
+        )
+    assert e.value.response["Error"]["Code"] == "ValidationException"
+
+
+def test_dynamodb_create_table_invalid_chars(ddb):
+    with pytest.raises(ClientError) as e:
+        ddb.create_table(
+            TableName="bad table",  # space — invalid char
+            KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+            AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "S"}],
+            BillingMode="PAY_PER_REQUEST",
+        )
+    assert e.value.response["Error"]["Code"] == "ValidationException"
+
+
+def test_dynamodb_create_table_missing_key_schema(ddb):
+    # boto3 client-side rejects KeySchema=[] outright. Use direct HTTP so the
+    # server gets the chance to apply its own validation (this is what the
+    # conformance suite exercises).
+    code, body = _raw_ddb("CreateTable", {
+        "TableName": "ms-no-ks",
+        "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+        "BillingMode": "PAY_PER_REQUEST",
+    })
+    assert code == 400
+    assert "ValidationException" in body.get("__type", "")
+
+
+def test_dynamodb_create_table_unused_attribute_definition(ddb):
+    """Attributes in AttributeDefinitions that don't appear in any KeySchema
+    are rejected by real AWS."""
+    with pytest.raises(ClientError) as e:
+        ddb.create_table(
+            TableName="unused-attr-defs",
+            KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+            AttributeDefinitions=[
+                {"AttributeName": "pk", "AttributeType": "S"},
+                {"AttributeName": "extra", "AttributeType": "S"},  # unused
+            ],
+            BillingMode="PAY_PER_REQUEST",
+        )
+    assert e.value.response["Error"]["Code"] == "ValidationException"
+
+
+def test_dynamodb_create_table_lsi_on_hash_only_rejected(ddb):
+    """LSI requires the base table to have a sort key."""
+    with pytest.raises(ClientError) as e:
+        ddb.create_table(
+            TableName="lsi-hash-only",
+            KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+            AttributeDefinitions=[
+                {"AttributeName": "pk", "AttributeType": "S"},
+                {"AttributeName": "alt", "AttributeType": "S"},
+            ],
+            LocalSecondaryIndexes=[{
+                "IndexName": "lsi1",
+                "KeySchema": [
+                    {"AttributeName": "pk", "KeyType": "HASH"},
+                    {"AttributeName": "alt", "KeyType": "RANGE"},
+                ],
+                "Projection": {"ProjectionType": "ALL"},
+            }],
+            BillingMode="PAY_PER_REQUEST",
+        )
+    assert e.value.response["Error"]["Code"] == "ValidationException"
+
+
+def test_dynamodb_create_table_lsi_different_hash_key_rejected(ddb):
+    """LSI's HASH key must match the base table's HASH key."""
+    with pytest.raises(ClientError) as e:
+        ddb.create_table(
+            TableName="lsi-bad-hash",
+            KeySchema=[
+                {"AttributeName": "pk", "KeyType": "HASH"},
+                {"AttributeName": "sk", "KeyType": "RANGE"},
+            ],
+            AttributeDefinitions=[
+                {"AttributeName": "pk", "AttributeType": "S"},
+                {"AttributeName": "sk", "AttributeType": "S"},
+                {"AttributeName": "other", "AttributeType": "S"},
+                {"AttributeName": "lsisk", "AttributeType": "S"},
+            ],
+            LocalSecondaryIndexes=[{
+                "IndexName": "lsi1",
+                "KeySchema": [
+                    {"AttributeName": "other", "KeyType": "HASH"},  # != base hash
+                    {"AttributeName": "lsisk", "KeyType": "RANGE"},
+                ],
+                "Projection": {"ProjectionType": "ALL"},
+            }],
+            BillingMode="PAY_PER_REQUEST",
+        )
+    assert e.value.response["Error"]["Code"] == "ValidationException"
+
+
+def test_dynamodb_create_table_class_standard_ia_roundtrip(ddb):
+    name = "tc-ia"
+    try:
+        ddb.delete_table(TableName=name)
+    except Exception:
+        pass
+    try:
+        ddb.create_table(
+            TableName=name,
+            KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+            AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "S"}],
+            BillingMode="PAY_PER_REQUEST",
+            TableClass="STANDARD_INFREQUENT_ACCESS",
+        )
+        d = ddb.describe_table(TableName=name)["Table"]
+        assert d.get("TableClassSummary", {}).get("TableClass") == "STANDARD_INFREQUENT_ACCESS"
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_create_table_on_demand_throughput_roundtrip(ddb):
+    name = "tc-odt"
+    try:
+        ddb.delete_table(TableName=name)
+    except Exception:
+        pass
+    try:
+        ddb.create_table(
+            TableName=name,
+            KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+            AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "S"}],
+            BillingMode="PAY_PER_REQUEST",
+            OnDemandThroughput={"MaxReadRequestUnits": 1000, "MaxWriteRequestUnits": 500},
+        )
+        d = ddb.describe_table(TableName=name)["Table"]
+        odt = d.get("OnDemandThroughput") or {}
+        assert odt.get("MaxReadRequestUnits") == 1000
+        assert odt.get("MaxWriteRequestUnits") == 500
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_create_table_sse_aws_managed_key(ddb):
+    """SSESpecification with Enabled=true and no KMSMasterKeyId picks the
+    AWS-managed key (alias/aws/dynamodb)."""
+    name = "tc-sse-mgmt"
+    try:
+        ddb.delete_table(TableName=name)
+    except Exception:
+        pass
+    try:
+        ddb.create_table(
+            TableName=name,
+            KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+            AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "S"}],
+            BillingMode="PAY_PER_REQUEST",
+            SSESpecification={"Enabled": True, "SSEType": "KMS"},
+        )
+        d = ddb.describe_table(TableName=name)["Table"]
+        sse = d.get("SSEDescription") or {}
+        assert sse.get("Status") == "ENABLED"
+        assert sse.get("SSEType") == "KMS"
+        assert "alias/aws/dynamodb" in (sse.get("KMSMasterKeyArn") or "")
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+# ---------------------------------------------------------------------------
+# UpdateTable validation — AWS-canonical billing/throughput/index rules.
+# ---------------------------------------------------------------------------
+
+def test_dynamodb_update_table_provisioned_noop_rejected(ddb):
+    name = "ut-noop"
+    try:
+        ddb.delete_table(TableName=name)
+    except Exception:
+        pass
+    ddb.create_table(
+        TableName=name,
+        KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+        AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "S"}],
+        BillingMode="PROVISIONED",
+        ProvisionedThroughput={"ReadCapacityUnits": 5, "WriteCapacityUnits": 5},
+    )
+    try:
+        with pytest.raises(ClientError) as e:
+            ddb.update_table(
+                TableName=name,
+                ProvisionedThroughput={"ReadCapacityUnits": 5, "WriteCapacityUnits": 5},
+            )
+        assert e.value.response["Error"]["Code"] == "ValidationException"
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_update_table_invalid_throughput_rejected(ddb):
+    """Boto3 client-side validates ReadCapacityUnits>=1, so hit the server
+    with raw HTTP to exercise its own validator (matches the conformance
+    suite's approach)."""
+    name = "ut-zero"
+    try:
+        ddb.delete_table(TableName=name)
+    except Exception:
+        pass
+    ddb.create_table(
+        TableName=name,
+        KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+        AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "S"}],
+        BillingMode="PROVISIONED",
+        ProvisionedThroughput={"ReadCapacityUnits": 5, "WriteCapacityUnits": 5},
+    )
+    try:
+        code, body = _raw_ddb("UpdateTable", {
+            "TableName": name,
+            "ProvisionedThroughput": {"ReadCapacityUnits": 0, "WriteCapacityUnits": 5},
+        })
+        assert code == 400
+        assert "ValidationException" in body.get("__type", "")
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_update_table_ppr_with_throughput_rejected(ddb):
+    name = "ut-ppr-pt"
+    _basic_table(ddb, name)
+    try:
+        with pytest.raises(ClientError) as e:
+            ddb.update_table(
+                TableName=name,
+                ProvisionedThroughput={"ReadCapacityUnits": 5, "WriteCapacityUnits": 5},
+            )
+        assert e.value.response["Error"]["Code"] == "ValidationException"
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_update_table_class_change(ddb):
+    name = "ut-tc"
+    _basic_table(ddb, name)
+    try:
+        ddb.update_table(TableName=name, TableClass="STANDARD_INFREQUENT_ACCESS")
+        d = ddb.describe_table(TableName=name)["Table"]
+        assert d["TableClassSummary"]["TableClass"] == "STANDARD_INFREQUENT_ACCESS"
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_update_table_on_demand_throughput_change(ddb):
+    name = "ut-odt"
+    _basic_table(ddb, name)
+    try:
+        ddb.update_table(
+            TableName=name,
+            OnDemandThroughput={"MaxReadRequestUnits": 2000, "MaxWriteRequestUnits": 1000},
+        )
+        d = ddb.describe_table(TableName=name)["Table"]
+        assert d["OnDemandThroughput"]["MaxReadRequestUnits"] == 2000
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_delete_table_deletion_protection_enforced(ddb):
+    name = "ut-dp"
+    try:
+        ddb.delete_table(TableName=name)
+    except Exception:
+        pass
+    ddb.create_table(
+        TableName=name,
+        KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+        AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "S"}],
+        BillingMode="PAY_PER_REQUEST",
+        DeletionProtectionEnabled=True,
+    )
+    try:
+        with pytest.raises(ClientError) as e:
+            ddb.delete_table(TableName=name)
+        assert e.value.response["Error"]["Code"] == "ValidationException"
+        # Disable protection and confirm delete succeeds.
+        ddb.update_table(TableName=name, DeletionProtectionEnabled=False)
+        ddb.delete_table(TableName=name)
+    except Exception:
+        try:
+            ddb.update_table(TableName=name, DeletionProtectionEnabled=False)
+            ddb.delete_table(TableName=name)
+        except Exception:
+            pass
+        raise
+
+
+def test_dynamodb_update_table_add_duplicate_gsi_rejected(ddb):
+    name = "ut-gsi-dup"
+    try:
+        ddb.delete_table(TableName=name)
+    except Exception:
+        pass
+    ddb.create_table(
+        TableName=name,
+        KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+        AttributeDefinitions=[
+            {"AttributeName": "pk", "AttributeType": "S"},
+            {"AttributeName": "gsi_pk", "AttributeType": "S"},
+        ],
+        GlobalSecondaryIndexes=[{
+            "IndexName": "gsi1",
+            "KeySchema": [{"AttributeName": "gsi_pk", "KeyType": "HASH"}],
+            "Projection": {"ProjectionType": "ALL"},
+        }],
+        BillingMode="PAY_PER_REQUEST",
+    )
+    try:
+        with pytest.raises(ClientError) as e:
+            ddb.update_table(
+                TableName=name,
+                AttributeDefinitions=[
+                    {"AttributeName": "pk", "AttributeType": "S"},
+                    {"AttributeName": "gsi_pk", "AttributeType": "S"},
+                ],
+                GlobalSecondaryIndexUpdates=[{
+                    "Create": {
+                        "IndexName": "gsi1",  # already exists
+                        "KeySchema": [{"AttributeName": "gsi_pk", "KeyType": "HASH"}],
+                        "Projection": {"ProjectionType": "ALL"},
+                    }
+                }],
+            )
+        assert e.value.response["Error"]["Code"] == "ValidationException"
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_update_table_delete_nonexistent_gsi_rejected(ddb):
+    name = "ut-gsi-del"
+    _basic_table(ddb, name)
+    try:
+        with pytest.raises(ClientError) as e:
+            ddb.update_table(
+                TableName=name,
+                GlobalSecondaryIndexUpdates=[{"Delete": {"IndexName": "nope"}}],
+            )
+        assert e.value.response["Error"]["Code"] == "ResourceNotFoundException"
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_update_table_add_gsi_undefined_attribute_rejected(ddb):
+    name = "ut-gsi-undef"
+    _basic_table(ddb, name)
+    try:
+        with pytest.raises(ClientError) as e:
+            ddb.update_table(
+                TableName=name,
+                GlobalSecondaryIndexUpdates=[{
+                    "Create": {
+                        "IndexName": "gsi-x",
+                        "KeySchema": [{"AttributeName": "undefined_attr", "KeyType": "HASH"}],
+                        "Projection": {"ProjectionType": "ALL"},
+                    }
+                }],
+            )
+        assert e.value.response["Error"]["Code"] == "ValidationException"
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+# ---------------------------------------------------------------------------
+# GetItem ProjectionExpression — nested map paths and list indexes per AWS.
+# ---------------------------------------------------------------------------
+
+def _proj_table(ddb, name):
+    try:
+        ddb.delete_table(TableName=name)
+    except Exception:
+        pass
+    ddb.create_table(
+        TableName=name,
+        KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+        AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "S"}],
+        BillingMode="PAY_PER_REQUEST",
+    )
+
+
+def test_dynamodb_projection_nested_map_path(ddb):
+    name = "pe-map"
+    _proj_table(ddb, name)
+    try:
+        ddb.put_item(TableName=name, Item={
+            "pk": {"S": "a"},
+            "data": {"M": {
+                "name": {"S": "alice"},
+                "age": {"N": "30"},
+                "email": {"S": "a@b.c"},
+            }},
+        })
+        r = ddb.get_item(
+            TableName=name, Key={"pk": {"S": "a"}},
+            ProjectionExpression="#d.#n",
+            ExpressionAttributeNames={"#d": "data", "#n": "name"},
+        )
+        assert r["Item"] == {"data": {"M": {"name": {"S": "alice"}}}}
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_projection_list_index(ddb):
+    name = "pe-list"
+    _proj_table(ddb, name)
+    try:
+        ddb.put_item(TableName=name, Item={
+            "pk": {"S": "a"},
+            "items": {"L": [{"S": "first"}, {"S": "second"}, {"S": "third"}]},
+        })
+        r = ddb.get_item(
+            TableName=name, Key={"pk": {"S": "a"}},
+            ProjectionExpression="#i[1]",
+            ExpressionAttributeNames={"#i": "items"},
+        )
+        assert r["Item"] == {"items": {"L": [{"S": "second"}]}}
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_projection_nested_path_and_list_index(ddb):
+    name = "pe-mix"
+    _proj_table(ddb, name)
+    try:
+        ddb.put_item(TableName=name, Item={
+            "pk": {"S": "a"},
+            "rec": {"M": {
+                "tags": {"L": [{"S": "red"}, {"S": "blue"}]},
+                "name": {"S": "x"},
+            }},
+        })
+        r = ddb.get_item(TableName=name, Key={"pk": {"S": "a"}}, ProjectionExpression="rec.tags[0]")
+        assert r["Item"] == {"rec": {"M": {"tags": {"L": [{"S": "red"}]}}}}
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_projection_deep_nested(ddb):
+    name = "pe-deep"
+    _proj_table(ddb, name)
+    try:
+        ddb.put_item(TableName=name, Item={
+            "pk": {"S": "a"},
+            "level1": {"M": {
+                "level2": {"M": {
+                    "leaf": {"S": "deep"},
+                    "other": {"S": "skip"},
+                }},
+                "sibling": {"S": "skip"},
+            }},
+        })
+        r = ddb.get_item(TableName=name, Key={"pk": {"S": "a"}}, ProjectionExpression="level1.level2.leaf")
+        assert r["Item"] == {"level1": {"M": {"level2": {"M": {"leaf": {"S": "deep"}}}}}}
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_projection_multiple_sibling_paths(ddb):
+    """Two paths under the same root map merge in the projected result."""
+    name = "pe-sib"
+    _proj_table(ddb, name)
+    try:
+        ddb.put_item(TableName=name, Item={
+            "pk": {"S": "a"},
+            "p": {"M": {
+                "x": {"S": "X"},
+                "y": {"S": "Y"},
+                "z": {"S": "Z"},
+            }},
+        })
+        r = ddb.get_item(
+            TableName=name,
+            Key={"pk": {"S": "a"}},
+            ProjectionExpression="p.x, p.y",
+        )
+        got = r["Item"]
+        assert "p" in got
+        assert got["p"]["M"].get("x") == {"S": "X"}
+        assert got["p"]["M"].get("y") == {"S": "Y"}
+        assert "z" not in got["p"]["M"]
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+# ---------------------------------------------------------------------------
+# ReturnValues + ReturnItemCollectionMetrics enum + shape validation.
+# ---------------------------------------------------------------------------
+
+def test_dynamodb_put_item_invalid_return_values_rejected(ddb):
+    name = "pi-rv"
+    _basic_table(ddb, name)
+    try:
+        # ALL_NEW is invalid for PutItem (only NONE | ALL_OLD).
+        code, body = _raw_ddb("PutItem", {
+            "TableName": name,
+            "Item": {"pk": {"S": "x"}},
+            "ReturnValues": "ALL_NEW",
+        })
+        assert code == 400
+        assert "ValidationException" in body.get("__type", "")
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_put_item_collection_metrics_size(ddb):
+    """ReturnItemCollectionMetrics=SIZE returns ItemCollectionMetrics when the
+    table has at least one LSI."""
+    name = "pi-icm"
+    try:
+        ddb.delete_table(TableName=name)
+    except Exception:
+        pass
+    ddb.create_table(
+        TableName=name,
+        KeySchema=[
+            {"AttributeName": "pk", "KeyType": "HASH"},
+            {"AttributeName": "sk", "KeyType": "RANGE"},
+        ],
+        AttributeDefinitions=[
+            {"AttributeName": "pk", "AttributeType": "S"},
+            {"AttributeName": "sk", "AttributeType": "S"},
+            {"AttributeName": "lsk", "AttributeType": "S"},
+        ],
+        LocalSecondaryIndexes=[{
+            "IndexName": "byLsk",
+            "KeySchema": [
+                {"AttributeName": "pk", "KeyType": "HASH"},
+                {"AttributeName": "lsk", "KeyType": "RANGE"},
+            ],
+            "Projection": {"ProjectionType": "ALL"},
+        }],
+        BillingMode="PAY_PER_REQUEST",
+    )
+    try:
+        r = ddb.put_item(
+            TableName=name,
+            Item={"pk": {"S": "k"}, "sk": {"S": "a"}, "lsk": {"S": "l"}},
+            ReturnItemCollectionMetrics="SIZE",
+        )
+        icm = r.get("ItemCollectionMetrics") or {}
+        assert icm.get("ItemCollectionKey", {}).get("pk") == {"S": "k"}
+        assert "SizeEstimateRangeGB" in icm
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_delete_item_collection_metrics_size(ddb):
+    name = "di-icm"
+    try:
+        ddb.delete_table(TableName=name)
+    except Exception:
+        pass
+    ddb.create_table(
+        TableName=name,
+        KeySchema=[
+            {"AttributeName": "pk", "KeyType": "HASH"},
+            {"AttributeName": "sk", "KeyType": "RANGE"},
+        ],
+        AttributeDefinitions=[
+            {"AttributeName": "pk", "AttributeType": "S"},
+            {"AttributeName": "sk", "AttributeType": "S"},
+            {"AttributeName": "lsk", "AttributeType": "S"},
+        ],
+        LocalSecondaryIndexes=[{
+            "IndexName": "byLsk",
+            "KeySchema": [
+                {"AttributeName": "pk", "KeyType": "HASH"},
+                {"AttributeName": "lsk", "KeyType": "RANGE"},
+            ],
+            "Projection": {"ProjectionType": "ALL"},
+        }],
+        BillingMode="PAY_PER_REQUEST",
+    )
+    try:
+        ddb.put_item(TableName=name, Item={"pk": {"S": "k"}, "sk": {"S": "a"}, "lsk": {"S": "l"}})
+        r = ddb.delete_item(
+            TableName=name,
+            Key={"pk": {"S": "k"}, "sk": {"S": "a"}},
+            ReturnItemCollectionMetrics="SIZE",
+        )
+        icm = r.get("ItemCollectionMetrics") or {}
+        assert icm.get("ItemCollectionKey", {}).get("pk") == {"S": "k"}
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_update_item_collection_metrics_size(ddb):
+    name = "ui-icm"
+    try:
+        ddb.delete_table(TableName=name)
+    except Exception:
+        pass
+    ddb.create_table(
+        TableName=name,
+        KeySchema=[
+            {"AttributeName": "pk", "KeyType": "HASH"},
+            {"AttributeName": "sk", "KeyType": "RANGE"},
+        ],
+        AttributeDefinitions=[
+            {"AttributeName": "pk", "AttributeType": "S"},
+            {"AttributeName": "sk", "AttributeType": "S"},
+            {"AttributeName": "lsk", "AttributeType": "S"},
+        ],
+        LocalSecondaryIndexes=[{
+            "IndexName": "byLsk",
+            "KeySchema": [
+                {"AttributeName": "pk", "KeyType": "HASH"},
+                {"AttributeName": "lsk", "KeyType": "RANGE"},
+            ],
+            "Projection": {"ProjectionType": "ALL"},
+        }],
+        BillingMode="PAY_PER_REQUEST",
+    )
+    try:
+        ddb.put_item(TableName=name, Item={"pk": {"S": "k"}, "sk": {"S": "a"}, "lsk": {"S": "l"}})
+        r = ddb.update_item(
+            TableName=name,
+            Key={"pk": {"S": "k"}, "sk": {"S": "a"}},
+            UpdateExpression="SET v = :v",
+            ExpressionAttributeValues={":v": {"S": "value"}},
+            ReturnItemCollectionMetrics="SIZE",
+        )
+        icm = r.get("ItemCollectionMetrics") or {}
+        assert icm.get("ItemCollectionKey", {}).get("pk") == {"S": "k"}
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_update_remove_updated_new_omits_attributes(ddb):
+    """UpdateItem with REMOVE-only and ReturnValues=UPDATED_NEW must NOT
+    return Attributes (no new values to report)."""
+    name = "ur-un"
+    _basic_table(ddb, name)
+    try:
+        ddb.put_item(TableName=name, Item={"pk": {"S": "k"}, "x": {"S": "X"}})
+        r = ddb.update_item(
+            TableName=name,
+            Key={"pk": {"S": "k"}},
+            UpdateExpression="REMOVE x",
+            ReturnValues="UPDATED_NEW",
+        )
+        assert "Attributes" not in r
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+# ---------------------------------------------------------------------------
+# UpdateItem semantics — pre-update snapshot, key protection, missing path.
+# ---------------------------------------------------------------------------
+
+def test_dynamodb_update_set_reads_pre_update_value(ddb):
+    """SET reads RHS against the pre-update snapshot — `SET a = b, b = :v`
+    must set `a` to the OLD value of `b`."""
+    name = "u-snap"
+    _basic_table(ddb, name)
+    try:
+        ddb.put_item(TableName=name, Item={"pk": {"S": "k"}, "b": {"S": "OLD"}})
+        ddb.update_item(
+            TableName=name,
+            Key={"pk": {"S": "k"}},
+            UpdateExpression="SET a = b, b = :v",
+            ExpressionAttributeValues={":v": {"S": "NEW"}},
+        )
+        got = ddb.get_item(TableName=name, Key={"pk": {"S": "k"}})["Item"]
+        assert got["a"] == {"S": "OLD"}
+        assert got["b"] == {"S": "NEW"}
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_update_set_missing_intermediate_path_rejected(ddb):
+    """`SET a.b.c = :v` where `a.b` doesn't exist must be rejected."""
+    name = "u-bad-path"
+    _basic_table(ddb, name)
+    try:
+        ddb.put_item(TableName=name, Item={"pk": {"S": "k"}})
+        with pytest.raises(ClientError) as e:
+            ddb.update_item(
+                TableName=name,
+                Key={"pk": {"S": "k"}},
+                UpdateExpression="SET a.b.c = :v",
+                ExpressionAttributeValues={":v": {"S": "x"}},
+            )
+        assert e.value.response["Error"]["Code"] == "ValidationException"
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_update_cannot_modify_hash_key(ddb):
+    name = "u-pk"
+    _basic_table(ddb, name)
+    try:
+        ddb.put_item(TableName=name, Item={"pk": {"S": "k"}})
+        with pytest.raises(ClientError) as e:
+            ddb.update_item(
+                TableName=name,
+                Key={"pk": {"S": "k"}},
+                UpdateExpression="SET pk = :v",
+                ExpressionAttributeValues={":v": {"S": "newkey"}},
+            )
+        assert e.value.response["Error"]["Code"] == "ValidationException"
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_update_cannot_modify_range_key(ddb):
+    name = "u-sk"
+    _basic_table(ddb, name, with_sk=True)
+    try:
+        ddb.put_item(TableName=name, Item={"pk": {"S": "k"}, "sk": {"S": "a"}})
+        with pytest.raises(ClientError) as e:
+            ddb.update_item(
+                TableName=name,
+                Key={"pk": {"S": "k"}, "sk": {"S": "a"}},
+                UpdateExpression="SET sk = :v",
+                ExpressionAttributeValues={":v": {"S": "b"}},
+            )
+        assert e.value.response["Error"]["Code"] == "ValidationException"
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_update_nested_set_updated_new(ddb):
+    """SET on a nested map path with ReturnValues=UPDATED_NEW returns the
+    affected attribute's projected new value."""
+    name = "u-nest-un"
+    _basic_table(ddb, name)
+    try:
+        ddb.put_item(TableName=name, Item={
+            "pk": {"S": "k"},
+            "m": {"M": {"a": {"S": "A"}, "b": {"S": "B"}}},
+        })
+        r = ddb.update_item(
+            TableName=name,
+            Key={"pk": {"S": "k"}},
+            UpdateExpression="SET m.a = :v",
+            ExpressionAttributeValues={":v": {"S": "A2"}},
+            ReturnValues="UPDATED_NEW",
+        )
+        # The attribute `m` is the one that changed; AWS returns it in
+        # full as the projected new-value tree.
+        assert "m" in r.get("Attributes", {})
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+# ---------------------------------------------------------------------------
+# Query / Scan validation — ConsistentRead-on-GSI, Select rules,
+# Segment/TotalSegments, Limit, binary sort ordering, size() UTF-16.
+# ---------------------------------------------------------------------------
+
+def _gsi_table(ddb, name):
+    try:
+        ddb.delete_table(TableName=name)
+    except Exception:
+        pass
+    ddb.create_table(
+        TableName=name,
+        KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+        AttributeDefinitions=[
+            {"AttributeName": "pk", "AttributeType": "S"},
+            {"AttributeName": "gsi_pk", "AttributeType": "S"},
+        ],
+        GlobalSecondaryIndexes=[{
+            "IndexName": "byGsiPk",
+            "KeySchema": [{"AttributeName": "gsi_pk", "KeyType": "HASH"}],
+            "Projection": {"ProjectionType": "ALL"},
+        }],
+        BillingMode="PAY_PER_REQUEST",
+    )
+
+
+def test_dynamodb_query_consistent_read_on_gsi_rejected(ddb):
+    name = "q-cr-gsi"
+    _gsi_table(ddb, name)
+    try:
+        with pytest.raises(ClientError) as e:
+            ddb.query(
+                TableName=name,
+                IndexName="byGsiPk",
+                KeyConditionExpression="gsi_pk = :v",
+                ExpressionAttributeValues={":v": {"S": "x"}},
+                ConsistentRead=True,
+            )
+        assert e.value.response["Error"]["Code"] == "ValidationException"
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_query_limit_zero_rejected(ddb):
+    name = "q-lim-zero"
+    _basic_table(ddb, name)
+    try:
+        code, body = _raw_ddb("Query", {
+            "TableName": name,
+            "KeyConditionExpression": "pk = :v",
+            "ExpressionAttributeValues": {":v": {"S": "k"}},
+            "Limit": 0,
+        })
+        assert code == 400
+        assert "ValidationException" in body.get("__type", "")
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_scan_segment_without_total_rejected(ddb):
+    name = "s-seg-only"
+    _basic_table(ddb, name)
+    try:
+        code, body = _raw_ddb("Scan", {"TableName": name, "Segment": 0})
+        assert code == 400
+        assert "ValidationException" in body.get("__type", "")
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_scan_total_without_segment_rejected(ddb):
+    name = "s-tot-only"
+    _basic_table(ddb, name)
+    try:
+        code, body = _raw_ddb("Scan", {"TableName": name, "TotalSegments": 4})
+        assert code == 400
+        assert "ValidationException" in body.get("__type", "")
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_scan_segment_out_of_range_rejected(ddb):
+    name = "s-seg-oob"
+    _basic_table(ddb, name)
+    try:
+        code, body = _raw_ddb("Scan", {"TableName": name, "Segment": 4, "TotalSegments": 4})
+        assert code == 400
+        assert "ValidationException" in body.get("__type", "")
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_scan_limit_zero_rejected(ddb):
+    name = "s-lim-zero"
+    _basic_table(ddb, name)
+    try:
+        code, body = _raw_ddb("Scan", {"TableName": name, "Limit": 0})
+        assert code == 400
+        assert "ValidationException" in body.get("__type", "")
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_query_binary_sort_key_ordering(ddb):
+    """Binary sort keys must order bytewise (not lexicographic on base64)."""
+    import base64
+    name = "q-bsk"
+    try:
+        ddb.delete_table(TableName=name)
+    except Exception:
+        pass
+    ddb.create_table(
+        TableName=name,
+        KeySchema=[
+            {"AttributeName": "pk", "KeyType": "HASH"},
+            {"AttributeName": "bsk", "KeyType": "RANGE"},
+        ],
+        AttributeDefinitions=[
+            {"AttributeName": "pk", "AttributeType": "S"},
+            {"AttributeName": "bsk", "AttributeType": "B"},
+        ],
+        BillingMode="PAY_PER_REQUEST",
+    )
+    try:
+        for raw in (b"\x01", b"\xff", b"\x10"):
+            ddb.put_item(TableName=name, Item={
+                "pk": {"S": "k"},
+                "bsk": {"B": raw},
+            })
+        r = ddb.query(
+            TableName=name,
+            KeyConditionExpression="pk = :p",
+            ExpressionAttributeValues={":p": {"S": "k"}},
+        )
+        items = r["Items"]
+        bs_bytes = []
+        for it in items:
+            v = it["bsk"]
+            if isinstance(v, dict):
+                v = v.get("B")
+            if not isinstance(v, (bytes, bytearray)):
+                v = base64.b64decode(v)
+            bs_bytes.append(bytes(v))
+        assert bs_bytes == sorted(bs_bytes)
+        assert bs_bytes[0] == b"\x01"
+        assert bs_bytes[-1] == b"\xff"
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_query_select_all_projected_attrs_without_index_rejected(ddb):
+    name = "q-apa"
+    _basic_table(ddb, name)
+    try:
+        with pytest.raises(ClientError) as e:
+            ddb.query(
+                TableName=name,
+                KeyConditionExpression="pk = :v",
+                ExpressionAttributeValues={":v": {"S": "x"}},
+                Select="ALL_PROJECTED_ATTRIBUTES",
+            )
+        assert e.value.response["Error"]["Code"] == "ValidationException"
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_query_select_specific_without_projection_rejected(ddb):
+    name = "q-spec"
+    _basic_table(ddb, name)
+    try:
+        with pytest.raises(ClientError) as e:
+            ddb.query(
+                TableName=name,
+                KeyConditionExpression="pk = :v",
+                ExpressionAttributeValues={":v": {"S": "x"}},
+                Select="SPECIFIC_ATTRIBUTES",
+            )
+        assert e.value.response["Error"]["Code"] == "ValidationException"
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_size_utf16_units(ddb):
+    """AWS size(s) returns UTF-16 code-unit count, NOT Python char count."""
+    name = "u16"
+    _basic_table(ddb, name)
+    try:
+        # "😀" is one Python char but two UTF-16 units (surrogate pair).
+        ddb.put_item(TableName=name, Item={"pk": {"S": "k"}, "s": {"S": "😀"}})
+        # FilterExpression `size(s) = :two` should match.
+        r = ddb.scan(
+            TableName=name,
+            FilterExpression="size(s) = :two",
+            ExpressionAttributeValues={":two": {"N": "2"}},
+        )
+        assert r["Count"] == 1
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+# ---------------------------------------------------------------------------
+# Transactions — ConsumedCapacity (2x per item) and ClientRequestToken
+# idempotency per AWS Developer Guide.
+# ---------------------------------------------------------------------------
+
+def test_dynamodb_transact_write_consumed_capacity(ddb):
+    name = "tw-cc"
+    _basic_table(ddb, name)
+    try:
+        r = ddb.transact_write_items(
+            TransactItems=[
+                {"Put": {"TableName": name, "Item": {"pk": {"S": "a"}}}},
+                {"Put": {"TableName": name, "Item": {"pk": {"S": "b"}}}},
+            ],
+            ReturnConsumedCapacity="TOTAL",
+        )
+        cc = r.get("ConsumedCapacity")
+        assert cc and cc[0]["TableName"] == name
+        # 2 items × 2 units = 4.
+        assert cc[0]["CapacityUnits"] == 4.0
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_transact_get_consumed_capacity(ddb):
+    name = "tg-cc"
+    _basic_table(ddb, name)
+    try:
+        ddb.put_item(TableName=name, Item={"pk": {"S": "a"}})
+        ddb.put_item(TableName=name, Item={"pk": {"S": "b"}})
+        r = ddb.transact_get_items(
+            TransactItems=[
+                {"Get": {"TableName": name, "Key": {"pk": {"S": "a"}}}},
+                {"Get": {"TableName": name, "Key": {"pk": {"S": "b"}}}},
+            ],
+            ReturnConsumedCapacity="TOTAL",
+        )
+        cc = r.get("ConsumedCapacity")
+        assert cc and cc[0]["TableName"] == name
+        assert cc[0]["CapacityUnits"] == 4.0
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_transact_write_idempotency_token_mismatch(ddb):
+    name = "tw-crt"
+    _basic_table(ddb, name)
+    try:
+        token = "idem-1"
+        # First call lands.
+        ddb.transact_write_items(
+            ClientRequestToken=token,
+            TransactItems=[{"Put": {"TableName": name, "Item": {"pk": {"S": "a"}}}}],
+        )
+        # Second call with same token but DIFFERENT payload must fail.
+        with pytest.raises(ClientError) as e:
+            ddb.transact_write_items(
+                ClientRequestToken=token,
+                TransactItems=[{"Put": {"TableName": name, "Item": {"pk": {"S": "DIFFERENT"}}}}],
+            )
+        assert e.value.response["Error"]["Code"] == "IdempotentParameterMismatchException"
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_transact_write_idempotency_token_same_payload(ddb):
+    name = "tw-crt-same"
+    _basic_table(ddb, name)
+    try:
+        token = "idem-same"
+        items = [{"Put": {"TableName": name, "Item": {"pk": {"S": "a"}}}}]
+        ddb.transact_write_items(ClientRequestToken=token, TransactItems=items)
+        # Same payload is a no-op replay — should succeed.
+        ddb.transact_write_items(ClientRequestToken=token, TransactItems=items)
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+# ---------------------------------------------------------------------------
+# Legacy parameters — mutual-exclusion + projection semantics per AWS.
+# ---------------------------------------------------------------------------
+
+def test_dynamodb_get_item_atg_and_pe_mutually_exclusive(ddb):
+    name = "atg-pe"
+    _basic_table(ddb, name)
+    try:
+        ddb.put_item(TableName=name, Item={"pk": {"S": "k"}, "a": {"S": "A"}})
+        with pytest.raises(ClientError) as e:
+            ddb.get_item(
+                TableName=name,
+                Key={"pk": {"S": "k"}},
+                ProjectionExpression="a",
+                AttributesToGet=["a"],
+            )
+        assert e.value.response["Error"]["Code"] == "ValidationException"
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_get_item_attributes_to_get_only(ddb):
+    """AttributesToGet returns exactly the requested attributes — does NOT
+    auto-include the hash/sort key."""
+    name = "atg-keys"
+    _basic_table(ddb, name)
+    try:
+        ddb.put_item(TableName=name, Item={"pk": {"S": "k"}, "a": {"S": "A"}, "b": {"S": "B"}})
+        r = ddb.get_item(TableName=name, Key={"pk": {"S": "k"}}, AttributesToGet=["a"])
+        assert r["Item"] == {"a": {"S": "A"}}
+        assert "pk" not in r["Item"]
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_scan_filter_and_filter_expression_mutually_exclusive(ddb):
+    name = "sf-fe"
+    _basic_table(ddb, name)
+    try:
+        with pytest.raises(ClientError) as e:
+            ddb.scan(
+                TableName=name,
+                FilterExpression="a = :v",
+                ExpressionAttributeValues={":v": {"S": "x"}},
+                ScanFilter={"a": {"AttributeValueList": [{"S": "x"}], "ComparisonOperator": "EQ"}},
+            )
+        assert e.value.response["Error"]["Code"] == "ValidationException"
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_attribute_updates_cannot_modify_key(ddb):
+    name = "au-key"
+    _basic_table(ddb, name)
+    try:
+        ddb.put_item(TableName=name, Item={"pk": {"S": "k"}})
+        with pytest.raises(ClientError) as e:
+            ddb.update_item(
+                TableName=name,
+                Key={"pk": {"S": "k"}},
+                AttributeUpdates={"pk": {"Value": {"S": "newkey"}, "Action": "PUT"}},
+            )
+        assert e.value.response["Error"]["Code"] == "ValidationException"
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+# ---------------------------------------------------------------------------
+# Tags / TTL validation.
+# ---------------------------------------------------------------------------
+
+def test_dynamodb_tag_resource_invalid_arn_rejected(ddb):
+    with pytest.raises(ClientError) as e:
+        ddb.tag_resource(ResourceArn="not-an-arn", Tags=[{"Key": "k", "Value": "v"}])
+    assert e.value.response["Error"]["Code"] == "ValidationException"
+
+
+def test_dynamodb_list_tags_unknown_arn_rejected(ddb):
+    fake = "arn:aws:dynamodb:us-east-1:000000000000:table/does-not-exist-tag-XX"
+    with pytest.raises(ClientError) as e:
+        ddb.list_tags_of_resource(ResourceArn=fake)
+    # AWS-canonical (dynamodb-conformance.org capture): ListTagsOfResource on
+    # a syntactically-valid but non-existent ARN returns AccessDeniedException
+    # (security through obscurity — the API doesn't reveal whether the
+    # resource exists). Other tag ops (TagResource, UntagResource) still use
+    # ResourceNotFoundException since those mutate by ARN.
+    assert e.value.response["Error"]["Code"] == "AccessDeniedException"
+
+
+def test_dynamodb_ttl_empty_attribute_name_rejected(ddb):
+    name = "ttl-empty"
+    _basic_table(ddb, name)
+    try:
+        code, body = _raw_ddb("UpdateTimeToLive", {
+            "TableName": name,
+            "TimeToLiveSpecification": {"Enabled": True, "AttributeName": ""},
+        })
+        assert code == 400
+        assert "ValidationException" in body.get("__type", "")
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+# ---------------------------------------------------------------------------
+# PartiQL — BatchExecuteStatement and ExecuteTransaction.
+# Verified against botocore service-2.json (2012-08-10).
+# ---------------------------------------------------------------------------
+
+def test_dynamodb_batch_execute_statement_multi_select(ddb):
+    name = "bxs-sel"
+    _basic_table(ddb, name)
+    try:
+        ddb.put_item(TableName=name, Item={"pk": {"S": "a"}, "v": {"N": "1"}})
+        ddb.put_item(TableName=name, Item={"pk": {"S": "b"}, "v": {"N": "2"}})
+        r = ddb.batch_execute_statement(Statements=[
+            {"Statement": f'SELECT * FROM "{name}" WHERE pk = ?', "Parameters": [{"S": "a"}]},
+            {"Statement": f'SELECT * FROM "{name}" WHERE pk = ?', "Parameters": [{"S": "b"}]},
+        ])
+        responses = r["Responses"]
+        assert len(responses) == 2
+        # Each entry should carry an Item with the matching pk.
+        pks = sorted([resp.get("Item", {}).get("pk", {}).get("S") for resp in responses])
+        assert pks == ["a", "b"]
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_batch_execute_statement_partial_failure(ddb):
+    name = "bxs-pf"
+    _basic_table(ddb, name)
+    try:
+        ddb.put_item(TableName=name, Item={"pk": {"S": "a"}})
+        r = ddb.batch_execute_statement(Statements=[
+            {"Statement": f'INSERT INTO "{name}" VALUE {{\'pk\': ?}}', "Parameters": [{"S": "a"}]},  # dup
+            {"Statement": f'INSERT INTO "{name}" VALUE {{\'pk\': ?}}', "Parameters": [{"S": "b"}]},  # OK
+        ])
+        # The whole batch returns 200 with per-statement results.
+        assert len(r["Responses"]) == 2
+        assert r["Responses"][0].get("Error", {}).get("Code") == "DuplicateItemException"
+        assert "Error" not in r["Responses"][1]
+        # Confirm "b" landed.
+        got = ddb.get_item(TableName=name, Key={"pk": {"S": "b"}})
+        assert "Item" in got
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_batch_execute_statement_empty_rejected():
+    code, body = _raw_ddb("BatchExecuteStatement", {"Statements": []})
+    assert code == 400
+    assert "ValidationException" in body.get("__type", "")
+
+
+def test_dynamodb_execute_transaction_multi_insert(ddb):
+    name = "et-ins"
+    _basic_table(ddb, name)
+    try:
+        r = ddb.execute_transaction(TransactStatements=[
+            {"Statement": f'INSERT INTO "{name}" VALUE {{\'pk\': ?}}', "Parameters": [{"S": "a"}]},
+            {"Statement": f'INSERT INTO "{name}" VALUE {{\'pk\': ?}}', "Parameters": [{"S": "b"}]},
+        ])
+        assert len(r["Responses"]) == 2
+        for pk in ("a", "b"):
+            got = ddb.get_item(TableName=name, Key={"pk": {"S": pk}})
+            assert "Item" in got
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_execute_transaction_rollback_on_duplicate(ddb):
+    """If one INSERT in a transaction fails (dup key), the whole transaction
+    rolls back — no statements take effect."""
+    name = "et-rb"
+    _basic_table(ddb, name)
+    try:
+        ddb.put_item(TableName=name, Item={"pk": {"S": "existing"}})
+        with pytest.raises(ClientError) as e:
+            ddb.execute_transaction(TransactStatements=[
+                {"Statement": f'INSERT INTO "{name}" VALUE {{\'pk\': ?}}', "Parameters": [{"S": "new"}]},
+                {"Statement": f'INSERT INTO "{name}" VALUE {{\'pk\': ?}}', "Parameters": [{"S": "existing"}]},  # dup
+            ])
+        assert e.value.response["Error"]["Code"] == "TransactionCanceledException"
+        # "new" must NOT have landed (rollback).
+        got = ddb.get_item(TableName=name, Key={"pk": {"S": "new"}})
+        assert "Item" not in got
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_execute_transaction_empty_rejected():
+    code, body = _raw_ddb("ExecuteTransaction", {"TransactStatements": []})
+    assert code == 400
+    assert "ValidationException" in body.get("__type", "")
+
+
+def test_dynamodb_execute_statement_insert_existing_dup_exception(ddb):
+    """ExecuteStatement INSERT on existing item returns DuplicateItemException
+    (not ConditionalCheckFailedException)."""
+    name = "es-dup"
+    _basic_table(ddb, name)
+    try:
+        ddb.put_item(TableName=name, Item={"pk": {"S": "a"}})
+        with pytest.raises(ClientError) as e:
+            ddb.execute_statement(
+                Statement=f'INSERT INTO "{name}" VALUE {{\'pk\': ?}}',
+                Parameters=[{"S": "a"}],
+            )
+        assert e.value.response["Error"]["Code"] == "DuplicateItemException"
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_execute_statement_consumed_capacity(ddb):
+    name = "es-cc"
+    _basic_table(ddb, name)
+    try:
+        ddb.put_item(TableName=name, Item={"pk": {"S": "a"}})
+        r = ddb.execute_statement(
+            Statement=f'SELECT * FROM "{name}" WHERE pk = ?',
+            Parameters=[{"S": "a"}],
+            ReturnConsumedCapacity="TOTAL",
+        )
+        cc = r.get("ConsumedCapacity") or {}
+        assert cc.get("TableName") == name
+        assert cc.get("CapacityUnits", 0) > 0
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+# ---------------------------------------------------------------------------
+# Error-message canonicalization — AWS-canonical strings + new validators
+# (EAV/EAN-without-expression, non-existent table standardization).
+# ---------------------------------------------------------------------------
+
+def test_dynamodb_expression_attribute_values_without_expression_rejected(ddb):
+    name = "eav-no-expr"
+    _basic_table(ddb, name)
+    try:
+        ddb.put_item(TableName=name, Item={"pk": {"S": "k"}})
+        with pytest.raises(ClientError) as e:
+            ddb.put_item(
+                TableName=name,
+                Item={"pk": {"S": "k"}},
+                ExpressionAttributeValues={":v": {"S": "x"}},
+                # NO ConditionExpression — should reject.
+            )
+        assert e.value.response["Error"]["Code"] == "ValidationException"
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_expression_attribute_names_without_expression_rejected(ddb):
+    name = "ean-no-expr"
+    _basic_table(ddb, name)
+    try:
+        with pytest.raises(ClientError) as e:
+            ddb.get_item(
+                TableName=name,
+                Key={"pk": {"S": "k"}},
+                ExpressionAttributeNames={"#a": "a"},
+                # NO ProjectionExpression — should reject.
+            )
+        assert e.value.response["Error"]["Code"] == "ValidationException"
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_put_item_nonexistent_table_canonical(ddb):
+    with pytest.raises(ClientError) as e:
+        ddb.put_item(TableName="does-not-exist-pi-xyz", Item={"pk": {"S": "k"}})
+    assert e.value.response["Error"]["Code"] == "ResourceNotFoundException"
+    # AWS-canonical message (dynamodb-conformance.org capture).
+    assert e.value.response["Error"]["Message"] == "Requested resource not found"
+
+
+def test_dynamodb_get_item_nonexistent_table_canonical(ddb):
+    with pytest.raises(ClientError) as e:
+        ddb.get_item(TableName="does-not-exist-gi-xyz", Key={"pk": {"S": "k"}})
+    assert e.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
+def test_dynamodb_query_invalid_return_consumed_capacity_rejected(ddb):
+    name = "q-rcc-bad"
+    _basic_table(ddb, name)
+    try:
+        # Boto3 client-side rejects non-enum values, so use raw HTTP.
+        code, body = _raw_ddb("Query", {
+            "TableName": name,
+            "KeyConditionExpression": "pk = :v",
+            "ExpressionAttributeValues": {":v": {"S": "k"}},
+            "ReturnConsumedCapacity": "BOGUS",
+        })
+        assert code == 400
+        assert "ValidationException" in body.get("__type", "")
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+# ---------------------------------------------------------------------------
+# Redundant parentheses — AWS rejects `((expr))` patterns in expressions.
+# ---------------------------------------------------------------------------
+
+def test_dynamodb_delete_item_redundant_parens_rejected(ddb):
+    name = "rp-di"
+    _basic_table(ddb, name)
+    try:
+        ddb.put_item(TableName=name, Item={"pk": {"S": "k"}, "x": {"N": "1"}})
+        with pytest.raises(ClientError) as e:
+            ddb.delete_item(
+                TableName=name,
+                Key={"pk": {"S": "k"}},
+                ConditionExpression="((x = :v))",
+                ExpressionAttributeValues={":v": {"N": "1"}},
+            )
+        assert e.value.response["Error"]["Code"] == "ValidationException"
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_put_item_redundant_parens_rejected(ddb):
+    name = "rp-pi"
+    _basic_table(ddb, name)
+    try:
+        with pytest.raises(ClientError) as e:
+            ddb.put_item(
+                TableName=name,
+                Item={"pk": {"S": "k"}},
+                ConditionExpression="((attribute_not_exists(pk)))",
+            )
+        assert e.value.response["Error"]["Code"] == "ValidationException"
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_scan_redundant_parens_rejected(ddb):
+    name = "rp-sc"
+    _basic_table(ddb, name)
+    try:
+        ddb.put_item(TableName=name, Item={"pk": {"S": "k"}, "x": {"N": "1"}})
+        with pytest.raises(ClientError) as e:
+            ddb.scan(
+                TableName=name,
+                FilterExpression="((x = :v))",
+                ExpressionAttributeValues={":v": {"N": "1"}},
+            )
+        assert e.value.response["Error"]["Code"] == "ValidationException"
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_legitimate_parens_still_work(ddb):
+    """`(a) OR (b)` is NOT redundant — those parens group operands."""
+    name = "rp-ok"
+    _basic_table(ddb, name)
+    try:
+        ddb.put_item(TableName=name, Item={"pk": {"S": "k"}, "x": {"N": "1"}, "y": {"N": "2"}})
+        r = ddb.scan(
+            TableName=name,
+            FilterExpression="(x = :v1) OR (y = :v2)",
+            ExpressionAttributeValues={":v1": {"N": "9"}, ":v2": {"N": "2"}},
+        )
+        assert r["Count"] == 1
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+# ---------------------------------------------------------------------------
+# Backups (CreateBackup, DescribeBackup, DeleteBackup, ListBackups,
+# RestoreTableFromBackup, RestoreTableToPointInTime) and DescribeLimits.
+# ---------------------------------------------------------------------------
+
+def test_dynamodb_create_describe_list_delete_backup(ddb):
+    name = "bk-table"
+    _basic_table(ddb, name)
+    try:
+        ddb.put_item(TableName=name, Item={"pk": {"S": "a"}, "v": {"N": "1"}})
+        r = ddb.create_backup(TableName=name, BackupName="bk1")
+        details = r["BackupDetails"]
+        arn = details["BackupArn"]
+        assert details["BackupName"] == "bk1"
+        assert details["BackupStatus"] == "AVAILABLE"
+
+        d = ddb.describe_backup(BackupArn=arn)
+        assert d["BackupDescription"]["BackupDetails"]["BackupArn"] == arn
+
+        lst = ddb.list_backups(TableName=name)
+        arns = [s["BackupArn"] for s in lst["BackupSummaries"]]
+        assert arn in arns
+
+        deleted = ddb.delete_backup(BackupArn=arn)
+        assert deleted["BackupDescription"]["BackupDetails"]["BackupArn"] == arn
+
+        with pytest.raises(ClientError) as e:
+            ddb.describe_backup(BackupArn=arn)
+        assert e.value.response["Error"]["Code"] == "BackupNotFoundException"
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_restore_table_from_backup(ddb):
+    src = "bk-src"
+    target = "bk-restored"
+    _basic_table(ddb, src)
+    try:
+        ddb.put_item(TableName=src, Item={"pk": {"S": "a"}, "v": {"N": "42"}})
+        arn = ddb.create_backup(TableName=src, BackupName="snap1")["BackupDetails"]["BackupArn"]
+        try:
+            ddb.delete_table(TableName=target)
+        except Exception:
+            pass
+        r = ddb.restore_table_from_backup(TargetTableName=target, BackupArn=arn)
+        assert r["TableDescription"]["TableName"] == target
+        # Items should be restored.
+        got = ddb.get_item(TableName=target, Key={"pk": {"S": "a"}})
+        assert got["Item"]["v"]["N"] == "42"
+    finally:
+        try:
+            ddb.delete_backup(BackupArn=arn)
+        except Exception:
+            pass
+        for t in (src, target):
+            try:
+                ddb.delete_table(TableName=t)
+            except Exception:
+                pass
+
+
+def test_dynamodb_restore_table_target_already_exists_rejected(ddb):
+    src = "rt-src"
+    target = "rt-target"
+    _basic_table(ddb, src)
+    _basic_table(ddb, target)
+    try:
+        arn = ddb.create_backup(TableName=src, BackupName="snap")["BackupDetails"]["BackupArn"]
+        with pytest.raises(ClientError) as e:
+            ddb.restore_table_from_backup(TargetTableName=target, BackupArn=arn)
+        assert e.value.response["Error"]["Code"] == "TableAlreadyExistsException"
+        ddb.delete_backup(BackupArn=arn)
+    finally:
+        for t in (src, target):
+            try:
+                ddb.delete_table(TableName=t)
+            except Exception:
+                pass
+
+
+def test_dynamodb_restore_table_to_point_in_time(ddb):
+    src = "pitr-src"
+    target = "pitr-target"
+    _basic_table(ddb, src)
+    try:
+        ddb.put_item(TableName=src, Item={"pk": {"S": "x"}, "v": {"S": "live"}})
+        try:
+            ddb.delete_table(TableName=target)
+        except Exception:
+            pass
+        r = ddb.restore_table_to_point_in_time(SourceTableName=src, TargetTableName=target)
+        assert r["TableDescription"]["TableName"] == target
+        got = ddb.get_item(TableName=target, Key={"pk": {"S": "x"}})
+        assert got["Item"]["v"]["S"] == "live"
+    finally:
+        for t in (src, target):
+            try:
+                ddb.delete_table(TableName=t)
+            except Exception:
+                pass
+
+
+def test_dynamodb_describe_backup_not_found(ddb):
+    with pytest.raises(ClientError) as e:
+        ddb.describe_backup(BackupArn="arn:aws:dynamodb:us-east-1:000000000000:table/x/backup/nope")
+    assert e.value.response["Error"]["Code"] == "BackupNotFoundException"
+
+
+def test_dynamodb_create_backup_unknown_table(ddb):
+    with pytest.raises(ClientError) as e:
+        ddb.create_backup(TableName="does-not-exist-bk", BackupName="bk-snap")
+    assert e.value.response["Error"]["Code"] == "TableNotFoundException"
+
+
+def test_dynamodb_describe_limits(ddb):
+    r = ddb.describe_limits()
+    assert r["AccountMaxReadCapacityUnits"] > 0
+    assert r["AccountMaxWriteCapacityUnits"] > 0
+    assert r["TableMaxReadCapacityUnits"] > 0
+    assert r["TableMaxWriteCapacityUnits"] > 0
+
+
+# ---------------------------------------------------------------------------
+# AWS-keyword detection in expressions — every name must be #-aliased if it
+# matches a system keyword. Source: AWS DynamoDB Developer Guide.
+# ---------------------------------------------------------------------------
+
+def test_dynamodb_keyword_in_condition_expression_rejected(ddb):
+    name = "kw-ce"
+    _basic_table(ddb, name)
+    try:
+        ddb.put_item(TableName=name, Item={"pk": {"S": "k"}, "status": {"S": "x"}})
+        with pytest.raises(ClientError) as e:
+            ddb.put_item(
+                TableName=name,
+                Item={"pk": {"S": "k"}, "status": {"S": "y"}},
+                ConditionExpression="status = :v",  # STATUS is a system keyword
+                ExpressionAttributeValues={":v": {"S": "x"}},
+            )
+        assert e.value.response["Error"]["Code"] == "ValidationException"
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_keyword_in_update_expression_rejected(ddb):
+    name = "kw-ue"
+    _basic_table(ddb, name)
+    try:
+        ddb.put_item(TableName=name, Item={"pk": {"S": "k"}})
+        with pytest.raises(ClientError) as e:
+            ddb.update_item(
+                TableName=name,
+                Key={"pk": {"S": "k"}},
+                UpdateExpression="SET name = :v",  # NAME is a system keyword
+                ExpressionAttributeValues={":v": {"S": "x"}},
+            )
+        assert e.value.response["Error"]["Code"] == "ValidationException"
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_keyword_in_projection_expression_rejected(ddb):
+    name = "kw-pe"
+    _basic_table(ddb, name)
+    try:
+        ddb.put_item(TableName=name, Item={"pk": {"S": "k"}, "name": {"S": "n"}})
+        with pytest.raises(ClientError) as e:
+            ddb.get_item(
+                TableName=name,
+                Key={"pk": {"S": "k"}},
+                ProjectionExpression="name",
+            )
+        assert e.value.response["Error"]["Code"] == "ValidationException"
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_keyword_in_filter_expression_rejected(ddb):
+    name = "kw-fe"
+    _basic_table(ddb, name)
+    try:
+        ddb.put_item(TableName=name, Item={"pk": {"S": "k"}, "status": {"S": "x"}})
+        with pytest.raises(ClientError) as e:
+            ddb.scan(
+                TableName=name,
+                FilterExpression="status = :v",
+                ExpressionAttributeValues={":v": {"S": "x"}},
+            )
+        assert e.value.response["Error"]["Code"] == "ValidationException"
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_keyword_with_alias_accepted(ddb):
+    name = "kw-alias"
+    _basic_table(ddb, name)
+    try:
+        ddb.put_item(TableName=name, Item={"pk": {"S": "k"}, "status": {"S": "live"}})
+        r = ddb.get_item(
+            TableName=name,
+            Key={"pk": {"S": "k"}},
+            ProjectionExpression="#s",
+            ExpressionAttributeNames={"#s": "status"},
+        )
+        assert r["Item"] == {"status": {"S": "live"}}
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+# ---------------------------------------------------------------------------
+# Exact-error-message coverage — conformance Tier 3 error-messages bucket.
+# ---------------------------------------------------------------------------
+
+def test_dynamodb_create_table_duplicate_index_names_rejected(ddb):
+    with pytest.raises(ClientError) as e:
+        ddb.create_table(
+            TableName="dup-idx",
+            KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+            AttributeDefinitions=[
+                {"AttributeName": "pk", "AttributeType": "S"},
+                {"AttributeName": "gpk", "AttributeType": "S"},
+            ],
+            GlobalSecondaryIndexes=[
+                {
+                    "IndexName": "same-idx",
+                    "KeySchema": [{"AttributeName": "gpk", "KeyType": "HASH"}],
+                    "Projection": {"ProjectionType": "ALL"},
+                },
+                {
+                    "IndexName": "same-idx",  # duplicate name
+                    "KeySchema": [{"AttributeName": "gpk", "KeyType": "HASH"}],
+                    "Projection": {"ProjectionType": "ALL"},
+                },
+            ],
+            BillingMode="PAY_PER_REQUEST",
+        )
+    assert e.value.response["Error"]["Code"] == "ValidationException"
+
+
+def test_dynamodb_query_empty_key_condition_rejected(ddb):
+    name = "q-empty-kce"
+    _basic_table(ddb, name)
+    try:
+        code, body = _raw_ddb("Query", {
+            "TableName": name,
+            "KeyConditionExpression": "",
+        })
+        assert code == 400
+        assert "ValidationException" in body.get("__type", "")
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_query_invalid_select_value_rejected(ddb):
+    name = "q-bad-sel"
+    _basic_table(ddb, name)
+    try:
+        code, body = _raw_ddb("Query", {
+            "TableName": name,
+            "KeyConditionExpression": "pk = :v",
+            "ExpressionAttributeValues": {":v": {"S": "x"}},
+            "Select": "BOGUS",
+        })
+        assert code == 400
+        assert "ValidationException" in body.get("__type", "")
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_update_item_empty_update_expression_rejected(ddb):
+    name = "u-empty-ue"
+    _basic_table(ddb, name)
+    try:
+        ddb.put_item(TableName=name, Item={"pk": {"S": "k"}})
+        code, body = _raw_ddb("UpdateItem", {
+            "TableName": name,
+            "Key": {"pk": {"S": "k"}},
+            "UpdateExpression": "",
+        })
+        assert code == 400
+        assert "ValidationException" in body.get("__type", "")
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_update_unused_expression_attribute_name_rejected(ddb):
+    name = "u-unused-ean"
+    _basic_table(ddb, name)
+    try:
+        ddb.put_item(TableName=name, Item={"pk": {"S": "k"}})
+        with pytest.raises(ClientError) as e:
+            ddb.update_item(
+                TableName=name,
+                Key={"pk": {"S": "k"}},
+                UpdateExpression="SET a = :v",
+                ExpressionAttributeNames={"#unused": "ghost"},  # defined but never used
+                ExpressionAttributeValues={":v": {"S": "x"}},
+            )
+        assert e.value.response["Error"]["Code"] == "ValidationException"
+        assert "unused" in e.value.response["Error"]["Message"].lower()
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_update_unused_expression_attribute_value_rejected(ddb):
+    name = "u-unused-eav"
+    _basic_table(ddb, name)
+    try:
+        ddb.put_item(TableName=name, Item={"pk": {"S": "k"}})
+        with pytest.raises(ClientError) as e:
+            ddb.update_item(
+                TableName=name,
+                Key={"pk": {"S": "k"}},
+                UpdateExpression="SET a = :v",
+                ExpressionAttributeValues={":v": {"S": "x"}, ":unused": {"S": "ghost"}},
+            )
+        assert e.value.response["Error"]["Code"] == "ValidationException"
+        assert "unused" in e.value.response["Error"]["Message"].lower()
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_update_missing_value_reference_rejected(ddb):
+    name = "u-missing-ref"
+    _basic_table(ddb, name)
+    try:
+        ddb.put_item(TableName=name, Item={"pk": {"S": "k"}})
+        with pytest.raises(ClientError) as e:
+            ddb.update_item(
+                TableName=name,
+                Key={"pk": {"S": "k"}},
+                UpdateExpression="SET a = :v",
+                # NOT defining :v in EAV
+            )
+        assert e.value.response["Error"]["Code"] == "ValidationException"
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_contains_with_distinct_operands_required(ddb):
+    name = "c-distinct"
+    _basic_table(ddb, name)
+    try:
+        ddb.put_item(TableName=name, Item={"pk": {"S": "k"}, "a": {"S": "abc"}})
+        with pytest.raises(ClientError) as e:
+            ddb.scan(
+                TableName=name,
+                FilterExpression="contains(a, a)",  # same path and operand
+            )
+        assert e.value.response["Error"]["Code"] == "ValidationException"
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_query_non_key_attribute_in_kce_rejected(ddb):
+    name = "q-nonkey-kce"
+    _basic_table(ddb, name, with_sk=True)
+    try:
+        with pytest.raises(ClientError) as e:
+            ddb.query(
+                TableName=name,
+                # Try filtering on a non-key attribute in KeyConditionExpression.
+                KeyConditionExpression="pk = :p AND other = :o",
+                ExpressionAttributeValues={":p": {"S": "k"}, ":o": {"S": "x"}},
+            )
+        assert e.value.response["Error"]["Code"] == "ValidationException"
+        assert "key schema" in e.value.response["Error"]["Message"].lower()
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_query_missing_hash_key_in_kce_rejected(ddb):
+    name = "q-missing-pk"
+    _basic_table(ddb, name, with_sk=True)
+    try:
+        with pytest.raises(ClientError) as e:
+            ddb.query(
+                TableName=name,
+                # No pk condition.
+                KeyConditionExpression="sk = :s",
+                ExpressionAttributeValues={":s": {"S": "a"}},
+            )
+        assert e.value.response["Error"]["Code"] == "ValidationException"
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+# ---------------------------------------------------------------------------
+# Validation-ordering — per AWS, tableName errors fire first (stop early),
+# multi-param errors accumulate into one envelope, non-existent indexes
+# return ValidationException.
+# ---------------------------------------------------------------------------
+
+def test_dynamodb_putitem_invalid_table_pattern_reports_only_table():
+    """An invalid TableName pattern + simultaneously-invalid ReturnValues
+    should report ONLY the tableName error (early stop)."""
+    code, body = _raw_ddb("PutItem", {
+        "TableName": "bad name with spaces",
+        "Item": {"pk": {"S": "x"}},
+        "ReturnValues": "BOGUS",
+    })
+    assert code == 400
+    msg = body.get("message", "")
+    assert "tableName" in msg
+    assert "returnValues" not in msg
+
+
+def test_dynamodb_putitem_multi_enum_errors_accumulated():
+    code, body = _raw_ddb("PutItem", {
+        "TableName": "intg-multi-enum",
+        "Item": {"pk": {"S": "x"}},
+        "ReturnValues": "BOGUS",
+        "ReturnConsumedCapacity": "ALSO_BAD",
+        "ReturnItemCollectionMetrics": "NOPE",
+    })
+    assert code == 400
+    msg = body.get("message", "")
+    # AWS envelope: "3 validation errors detected: ...; ...; ..."
+    assert "3 validation errors detected" in msg
+    assert "returnValues" in msg
+    assert "returnConsumedCapacity" in msg
+    assert "returnItemCollectionMetrics" in msg
+
+
+def test_dynamodb_deleteitem_multi_enum_errors_accumulated():
+    code, body = _raw_ddb("DeleteItem", {
+        "TableName": "intg-multi-del",
+        "Key": {"pk": {"S": "x"}},
+        "ReturnValues": "BOGUS",
+        "ReturnConsumedCapacity": "BAD",
+    })
+    assert code == 400
+    msg = body.get("message", "")
+    assert "2 validation errors detected" in msg
+
+
+def test_dynamodb_updateitem_multi_enum_errors_accumulated():
+    code, body = _raw_ddb("UpdateItem", {
+        "TableName": "intg-multi-upd",
+        "Key": {"pk": {"S": "x"}},
+        "ReturnValues": "BOGUS",
+        "ReturnConsumedCapacity": "BAD",
+    })
+    assert code == 400
+    msg = body.get("message", "")
+    assert "2 validation errors detected" in msg
+
+
+def test_dynamodb_query_invalid_table_pattern():
+    code, body = _raw_ddb("Query", {
+        "TableName": "bad name pattern",
+        "KeyConditionExpression": "pk = :v",
+        "ExpressionAttributeValues": {":v": {"S": "x"}},
+    })
+    assert code == 400
+    assert "tableName" in body.get("message", "")
+
+
+def test_dynamodb_query_non_existent_index_validation(ddb):
+    name = "q-noidx"
+    _basic_table(ddb, name)
+    try:
+        with pytest.raises(ClientError) as e:
+            ddb.query(
+                TableName=name,
+                IndexName="does-not-exist",
+                KeyConditionExpression="pk = :v",
+                ExpressionAttributeValues={":v": {"S": "x"}},
+            )
+        assert e.value.response["Error"]["Code"] == "ValidationException"
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_query_esk_schema_mismatch_rejected(ddb):
+    """ExclusiveStartKey missing the table's key attrs must be rejected.
+
+    Mirrors nubo-db/dynamodb-conformance tier1/query/basic.test.ts —
+    expects ValidationException matching /provided starting key is invalid/.
+    """
+    name = "q-esk-schema"
+    _basic_table(ddb, name, with_sk=True)
+    try:
+        with pytest.raises(ClientError) as e:
+            ddb.query(
+                TableName=name,
+                KeyConditionExpression="pk = :pk",
+                ExpressionAttributeValues={":pk": {"S": "x"}},
+                ExclusiveStartKey={"bad": {"S": "p"}},
+            )
+        assert e.value.response["Error"]["Code"] == "ValidationException"
+        assert "provided starting key is invalid" in e.value.response["Error"]["Message"]
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_query_esk_missing_gsi_key_rejected(ddb):
+    """ExclusiveStartKey missing the GSI's key attrs on an index query must be
+    rejected. Mirrors the conformance suite case where the ESK carries only
+    base-table keys and omits the GSI hash key."""
+    name = "q-esk-gsi"
+    _gsi_table(ddb, name)
+    try:
+        with pytest.raises(ClientError) as e:
+            ddb.query(
+                TableName=name,
+                IndexName="byGsiPk",
+                KeyConditionExpression="gsi_pk = :v",
+                ExpressionAttributeValues={":v": {"S": "x"}},
+                ExclusiveStartKey={"pk": {"S": "x"}},
+            )
+        assert e.value.response["Error"]["Code"] == "ValidationException"
+        assert "provided starting key is invalid" in e.value.response["Error"]["Message"]
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_scan_non_existent_index_validation(ddb):
+    name = "s-noidx"
+    _basic_table(ddb, name)
+    try:
+        with pytest.raises(ClientError) as e:
+            ddb.scan(TableName=name, IndexName="does-not-exist")
+        assert e.value.response["Error"]["Code"] == "ValidationException"
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_batch_write_cap_message_includes_count(ddb):
+    name = "bw-msg-count"
+    _basic_table(ddb, name)
+    try:
+        reqs = [{"PutRequest": {"Item": {"pk": {"S": f"k{i}"}}}} for i in range(30)]
+        with pytest.raises(ClientError) as e:
+            ddb.batch_write_item(RequestItems={name: reqs})
+        msg = e.value.response["Error"]["Message"]
+        assert "30" in msg or "25" in msg
+    finally:
+        ddb.delete_table(TableName=name)

@@ -808,6 +808,52 @@ def test_s3_object_tagging(s3):
     assert tags["status"] == "active"
     assert tags["priority"] == "high"
 
+
+def test_s3_object_tagging_per_version(s3):
+    """Tags must be stored per object version, not collapsed onto the key.
+
+    Repro for #N: in a versioned bucket, tagging two versions of the same
+    object resulted in only the last-written tag set being returned for
+    either version.
+    """
+    bkt = "intg-s3-objtags-versioned"
+    s3.create_bucket(Bucket=bkt)
+    s3.put_bucket_versioning(
+        Bucket=bkt, VersioningConfiguration={"Status": "Enabled"}
+    )
+
+    v1 = s3.put_object(Bucket=bkt, Key="k", Body=b"one")["VersionId"]
+    v2 = s3.put_object(Bucket=bkt, Key="k", Body=b"two")["VersionId"]
+    assert v1 and v2 and v1 != v2
+
+    s3.put_object_tagging(
+        Bucket=bkt, Key="k", VersionId=v1,
+        Tagging={"TagSet": [{"Key": "ver", "Value": "1"}]},
+    )
+    s3.put_object_tagging(
+        Bucket=bkt, Key="k", VersionId=v2,
+        Tagging={"TagSet": [{"Key": "ver", "Value": "2"}]},
+    )
+
+    g1 = s3.get_object_tagging(Bucket=bkt, Key="k", VersionId=v1)
+    g2 = s3.get_object_tagging(Bucket=bkt, Key="k", VersionId=v2)
+    assert {t["Key"]: t["Value"] for t in g1["TagSet"]} == {"ver": "1"}
+    assert {t["Key"]: t["Value"] for t in g2["TagSet"]} == {"ver": "2"}
+    assert g1["VersionId"] == v1
+    assert g2["VersionId"] == v2
+
+    # GetObjectTagging without VersionId targets the current version (v2).
+    g_current = s3.get_object_tagging(Bucket=bkt, Key="k")
+    assert {t["Key"]: t["Value"] for t in g_current["TagSet"]} == {"ver": "2"}
+
+    # DeleteObjectTagging on v1 must not touch v2's tag set.
+    s3.delete_object_tagging(Bucket=bkt, Key="k", VersionId=v1)
+    g1_after = s3.get_object_tagging(Bucket=bkt, Key="k", VersionId=v1)
+    g2_after = s3.get_object_tagging(Bucket=bkt, Key="k", VersionId=v2)
+    assert g1_after["TagSet"] == []
+    assert {t["Key"]: t["Value"] for t in g2_after["TagSet"]} == {"ver": "2"}
+
+
 def test_s3_public_access_block(s3):
     bkt = "intg-s3-pab"
     s3.create_bucket(Bucket=bkt)

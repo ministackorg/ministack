@@ -52,10 +52,12 @@ DASHBOARDS_IMAGE = os.environ.get(
 ENDPOINT_OVERRIDE = os.environ.get("MINISTACK_OPENSEARCH_ENDPOINT", "")
 
 # Versions returned by ListVersions / used by GetCompatibleVersions. Mirrors the
-# subset AWS still supports for new domains (managed-service availability page,
-# 2026-Q1).
+# versions AWS OpenSearch Service currently supports for new domains
+# (managed-service availability page).
 _SUPPORTED_VERSIONS = [
-    "OpenSearch_2.15", "OpenSearch_2.13", "OpenSearch_2.11", "OpenSearch_2.9",
+    "OpenSearch_3.5", "OpenSearch_3.3", "OpenSearch_3.1",
+    "OpenSearch_2.19", "OpenSearch_2.17", "OpenSearch_2.15",
+    "OpenSearch_2.13", "OpenSearch_2.11", "OpenSearch_2.9",
     "OpenSearch_2.7", "OpenSearch_2.5", "OpenSearch_2.3", "OpenSearch_1.3",
     "OpenSearch_1.2", "OpenSearch_1.1", "OpenSearch_1.0",
     "Elasticsearch_7.10", "Elasticsearch_7.9", "Elasticsearch_7.8",
@@ -64,9 +66,10 @@ _SUPPORTED_VERSIONS = [
     "Elasticsearch_6.4", "Elasticsearch_6.3", "Elasticsearch_6.2",
     "Elasticsearch_6.0", "Elasticsearch_5.6", "Elasticsearch_5.5",
     "Elasticsearch_5.3", "Elasticsearch_5.1",
+    "Elasticsearch_2.3", "Elasticsearch_1.5",
 ]
 
-_DEFAULT_VERSION = "OpenSearch_2.15"
+_DEFAULT_VERSION = "OpenSearch_3.5"
 
 # AWS allows lowercase letters, digits, hyphens; first character must be
 # lowercase letter; 3-28 chars.
@@ -680,7 +683,9 @@ async def handle_request(method, path, headers, body_bytes, query_params):
     try:
         payload = json.loads(body_text) if body_text else {}
     except json.JSONDecodeError:
-        return _error(400, "InvalidPayloadException", "Request body is not valid JSON")
+        # Botocore opensearch model has no InvalidPayloadException — JSON
+        # parsing failures map to the generic ValidationException (400).
+        return _error(400, "ValidationException", "Request body is not valid JSON")
 
     p = path.rstrip("/")
 
