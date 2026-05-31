@@ -736,6 +736,107 @@ def _merge_attributes(existing: list, updates: list) -> list:
 
 
 # ---------------------------------------------------------------------------
+# CUSTOM_AUTH Challenge Session Helpers (Phase 2)
+# ---------------------------------------------------------------------------
+
+def _create_challenge_session(pool_id: str, client_id: str, username: str) -> tuple:
+    """Create a new challenge session and return (token, session).
+    
+    Args:
+        pool_id: User pool ID
+        client_id: Client/App ID
+        username: Authenticated username
+        
+    Returns:
+        (token: str, session: dict)
+    """
+    token = base64.b64encode(secrets.token_bytes(32)).decode()
+    now = time.time()
+    
+    # Compute TTL from client's AuthSessionValidity (in minutes), falling back to _CHALLENGE_SESSION_TTL
+    pool = _user_pools.get(pool_id)
+    client = (pool or {}).get("_clients", {}).get(client_id, {})
+    ttl = client.get("AuthSessionValidity", 3) * 60  # AuthSessionValidity is in minutes
+    
+    session = {
+        "pool_id": pool_id,
+        "client_id": client_id,
+        "username": username,
+        "created_at": now,
+        "expires_at": now + ttl,
+        "challenges": [],
+        "last_challenge_metadata": None,
+    }
+    _challenge_sessions[token] = session
+    return (token, session)
+
+
+def _get_challenge_session(token: str) -> tuple:
+    """Retrieve a challenge session from storage.
+    
+    Args:
+        token: Session token (base64-encoded)
+        
+    Returns:
+        (session: dict | None, error_str: str | None)
+    """
+    session = _challenge_sessions.get(token)
+    if session is None:
+        return (None, "InvalidParameterException: Session does not exist")
+    
+    if time.time() > session["expires_at"]:
+        del _challenge_sessions[token]
+        return (None, "NotAuthorizedException: Session has expired")
+    
+    return (session, None)
+
+
+def _append_challenge_to_session(session: dict, challenge_name: str,
+                                 challenge_result: bool | None,
+                                 challenge_metadata: str | None,
+                                 public_params: dict | None,
+                                 private_params: dict | None) -> None:
+    """Append a challenge record to a session's challenge history.
+    
+    Args:
+        session: The session dict
+        challenge_name: Challenge name (e.g., 'CUSTOM_CHALLENGE')
+        challenge_result: None (pending), True (correct), or False (incorrect)
+        challenge_metadata: Metadata string (e.g., 'MAGIC_LINK')
+        public_params: Public challenge parameters dict
+        private_params: Private challenge parameters dict
+    """
+    session["challenges"].append({
+        "challengeName": challenge_name,
+        "challengeResult": challenge_result,
+        "challengeMetadata": challenge_metadata,
+        "publicChallengeParameters": public_params or {},
+        "privateChallengeParameters": private_params or {},
+        "timestamp": time.time(),
+    })
+    session["last_challenge_metadata"] = challenge_metadata
+
+
+def _build_session_list(session: dict) -> list:
+    """Build the session list for Lambda events (challenge history).
+    
+    Args:
+        session: The session dict
+        
+    Returns:
+        List of challenge records (challengeName, challengeMetadata, challengeResult)
+    """
+    return [
+        {
+            "challengeName": c["challengeName"],
+            "challengeMetadata": c["challengeMetadata"],
+            "challengeResult": c["challengeResult"],
+        }
+        for c in session["challenges"]
+    ]
+
+
+# ---------------------------------------------------------------------------
 # SAML / OAuth2 helpers
 # ---------------------------------------------------------------------------
 
