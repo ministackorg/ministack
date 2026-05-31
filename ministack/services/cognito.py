@@ -933,6 +933,183 @@ def _build_verify_auth_challenge_event(pool_id: str, client_id: str, username: s
 
 
 # ---------------------------------------------------------------------------
+# CUSTOM_AUTH Lambda Invocation Wrappers (Phase 4)
+# ---------------------------------------------------------------------------
+
+def _parse_custom_auth_error(err_str: str) -> tuple:
+    """Parse Lambda error into proper error response.
+    
+    Converts "ExceptionType: Message" format into (None, error_response_json).
+    """
+    if ":" in err_str:
+        code, _, msg = err_str.partition(":")
+        return (None, error_response_json(code.strip(), msg.strip(), 400))
+    return (None, error_response_json("InvalidLambdaResponseException", err_str, 400))
+
+
+def _invoke_define_auth_challenge_trigger(pool_id: str, client_id: str, username: str,
+                                          user_attrs: dict, session: dict) -> tuple:
+    """Invoke DefineAuthChallenge Lambda trigger.
+    
+    Returns:
+        (payload_dict | None, error_response | None)
+    """
+    pool = _user_pools.get(pool_id)
+    if pool is None:
+        return (None, None)
+    
+    arn = (pool.get("LambdaConfig") or {}).get("DefineAuthChallenge")
+    if not arn:
+        return (None, None)
+    
+    event = _build_define_auth_challenge_event(pool_id, client_id, username, user_attrs, session)
+    
+    try:
+        from ministack.services import lambda_svc
+        name, qualifier = lambda_svc._resolve_name_and_qualifier(arn)
+        record, _ = lambda_svc._get_func_record_for_qualifier(name, qualifier)
+        if record is None:
+            return (None, error_response_json("InvalidLambdaResponseException",
+                    f"DefineAuthChallenge Lambda not found: {arn}", 400))
+        result = lambda_svc._execute_function(record, event)
+    except Exception as e:
+        return (None, error_response_json("InvalidLambdaResponseException",
+                f"DefineAuthChallenge invocation failed: {str(e)}", 400))
+    
+    if result.get("error"):
+        return (None, error_response_json("InvalidLambdaResponseException",
+                f"DefineAuthChallenge returned error: {str(result.get('body', ''))}", 400))
+    
+    body = result.get("body")
+    if body is None:
+        return (None, error_response_json("InvalidLambdaResponseException",
+                "DefineAuthChallenge returned null body", 400))
+    
+    if isinstance(body, (str, bytes)):
+        try:
+            body = json.loads(body)
+        except (ValueError, TypeError):
+            return (None, error_response_json("InvalidLambdaResponseException",
+                    "DefineAuthChallenge returned invalid JSON", 400))
+    
+    if not isinstance(body, dict):
+        return (None, error_response_json("InvalidLambdaResponseException",
+                "DefineAuthChallenge returned unexpected body type", 400))
+    
+    return (body, None)
+
+
+def _invoke_create_auth_challenge_trigger(pool_id: str, client_id: str, username: str,
+                                          user_attrs: dict, session: dict,
+                                          client_metadata: dict) -> tuple:
+    """Invoke CreateAuthChallenge Lambda trigger.
+    
+    Returns:
+        (payload_dict | None, error_response | None)
+    """
+    pool = _user_pools.get(pool_id)
+    if pool is None:
+        return (None, None)
+    
+    arn = (pool.get("LambdaConfig") or {}).get("CreateAuthChallenge")
+    if not arn:
+        return (None, None)
+    
+    event = _build_create_auth_challenge_event(pool_id, client_id, username,
+                                               user_attrs, session, client_metadata)
+    
+    try:
+        from ministack.services import lambda_svc
+        name, qualifier = lambda_svc._resolve_name_and_qualifier(arn)
+        record, _ = lambda_svc._get_func_record_for_qualifier(name, qualifier)
+        if record is None:
+            return (None, error_response_json("InvalidLambdaResponseException",
+                    f"CreateAuthChallenge Lambda not found: {arn}", 400))
+        result = lambda_svc._execute_function(record, event)
+    except Exception as e:
+        return (None, error_response_json("InvalidLambdaResponseException",
+                f"CreateAuthChallenge invocation failed: {str(e)}", 400))
+    
+    if result.get("error"):
+        return (None, error_response_json("InvalidLambdaResponseException",
+                f"CreateAuthChallenge returned error: {str(result.get('body', ''))}", 400))
+    
+    body = result.get("body")
+    if body is None:
+        return (None, error_response_json("InvalidLambdaResponseException",
+                "CreateAuthChallenge returned null body", 400))
+    
+    if isinstance(body, (str, bytes)):
+        try:
+            body = json.loads(body)
+        except (ValueError, TypeError):
+            return (None, error_response_json("InvalidLambdaResponseException",
+                    "CreateAuthChallenge returned invalid JSON", 400))
+    
+    if not isinstance(body, dict):
+        return (None, error_response_json("InvalidLambdaResponseException",
+                "CreateAuthChallenge returned unexpected body type", 400))
+    
+    return (body, None)
+
+
+def _invoke_verify_auth_challenge_trigger(pool_id: str, client_id: str, username: str,
+                                          user_attrs: dict, session: dict,
+                                          challenge_answer: str,
+                                          client_metadata: dict) -> tuple:
+    """Invoke VerifyAuthChallengeResponse Lambda trigger.
+    
+    Returns:
+        (payload_dict | None, error_response | None)
+    """
+    pool = _user_pools.get(pool_id)
+    if pool is None:
+        return (None, None)
+    
+    arn = (pool.get("LambdaConfig") or {}).get("VerifyAuthChallengeResponse")
+    if not arn:
+        return (None, None)
+    
+    event = _build_verify_auth_challenge_event(pool_id, client_id, username,
+                                               user_attrs, session,
+                                               challenge_answer, client_metadata)
+    
+    try:
+        from ministack.services import lambda_svc
+        name, qualifier = lambda_svc._resolve_name_and_qualifier(arn)
+        record, _ = lambda_svc._get_func_record_for_qualifier(name, qualifier)
+        if record is None:
+            return (None, error_response_json("InvalidLambdaResponseException",
+                    f"VerifyAuthChallengeResponse Lambda not found: {arn}", 400))
+        result = lambda_svc._execute_function(record, event)
+    except Exception as e:
+        return (None, error_response_json("InvalidLambdaResponseException",
+                f"VerifyAuthChallengeResponse invocation failed: {str(e)}", 400))
+    
+    if result.get("error"):
+        return (None, error_response_json("InvalidLambdaResponseException",
+                f"VerifyAuthChallengeResponse returned error: {str(result.get('body', ''))}", 400))
+    
+    body = result.get("body")
+    if body is None:
+        return (None, error_response_json("InvalidLambdaResponseException",
+                "VerifyAuthChallengeResponse returned null body", 400))
+    
+    if isinstance(body, (str, bytes)):
+        try:
+            body = json.loads(body)
+        except (ValueError, TypeError):
+            return (None, error_response_json("InvalidLambdaResponseException",
+                    "VerifyAuthChallengeResponse returned invalid JSON", 400))
+    
+    if not isinstance(body, dict):
+        return (None, error_response_json("InvalidLambdaResponseException",
+                "VerifyAuthChallengeResponse returned unexpected body type", 400))
+    
+    return (body, None)
+
+
+# ---------------------------------------------------------------------------
 # SAML / OAuth2 helpers
 # ---------------------------------------------------------------------------
 
