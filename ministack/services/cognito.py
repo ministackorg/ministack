@@ -269,6 +269,34 @@ _identity_tags = AccountScopedDict()   # identity_pool_id -> {key: value}
 _auth_codes = {}   # code -> {pool_id, client_id, username, redirect_uri, scopes, state, created_at}
 _AUTH_CODE_TTL = 300  # 5 minutes
 
+# ---------------------------------------------------------------------------
+# In-memory state — CUSTOM_AUTH Challenge Sessions
+# ---------------------------------------------------------------------------
+
+_challenge_sessions = AccountScopedDict()
+# token (base64-encoded session token, opaque to client) -> {
+#   'pool_id': str,
+#   'client_id': str,
+#   'username': str,
+#   'created_at': float (epoch seconds),
+#   'expires_at': float (epoch seconds),
+#   'challenges': [
+#     {
+#       'challengeName': 'CUSTOM_CHALLENGE',
+#       'challengeResult': bool | None,   # None = pending (not yet verified)
+#       'challengeMetadata': str | None,  # 'MAGIC_LINK', 'SMS_OTP', etc.
+#       'publicChallengeParameters': dict,
+#       'privateChallengeParameters': dict,
+#       'timestamp': float,
+#     },
+#     ...
+#   ],
+#   'last_challenge_metadata': str | None,
+# }
+
+_CHALLENGE_SESSION_TTL = 3600  # fallback only — see _create_challenge_session for TTL from client config
+_MAX_CHALLENGE_ATTEMPTS = 3    # AWS parity — terminate CUSTOM_AUTH after 3 answered rounds
+
 
 # ── Persistence ────────────────────────────────────────────
 
@@ -281,6 +309,7 @@ def get_state():
         "authorization_codes": copy.deepcopy(_authorization_codes),
         "refresh_tokens": copy.deepcopy(_refresh_tokens),
         "auth_codes": copy.deepcopy(_auth_codes),
+        "challenge_sessions": copy.deepcopy(_challenge_sessions),
     }
 
 
@@ -293,6 +322,7 @@ def restore_state(data):
         _authorization_codes.update(data.get("authorization_codes", {}))
         _refresh_tokens.update(data.get("refresh_tokens", {}))
         _auth_codes.update(data.get("auth_codes", {}))
+        _challenge_sessions.update(data.get("challenge_sessions", {}))
 
 
 try:
