@@ -352,12 +352,13 @@ def test_custom_auth_multi_round(cognito_idp, lam):
     define_handler = (
         "def handler(event, ctx):\n"
         "    session = event['request']['session']\n"
+        "    answered = [s for s in session if s.get('challengeResult) is not None]\n"
         "    if not session:\n"
         "        event['response']['challengeName'] = 'CUSTOM_CHALLENGE'\n"
-        "    elif session[-1].get('challengeResult'):\n"
+        "    elif len(answered) >=2:\n"
         "        event['response']['issueTokens'] = True\n"
         "    else:\n"
-        "        event['response']['failAuthentication'] = True\n"
+        "        event['response']['failAuthentication'] = 'CUSTOM_CHALLENGE'\n"
         "    return event\n"
     )
     create_arn = _create_lambda(lam, "create-multi", create_handler)
