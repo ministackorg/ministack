@@ -1040,17 +1040,19 @@ async def _invoke_lambda_proxy(
             del resp_headers[existing]
         resp_headers[k] = v
     # Payload format 2.0 delivers cookies via the top-level `cookies` array,
-    # which AWS turns into one Set-Cookie header per entry. The array is the
-    # documented cookie mechanism — AWS guidance is "don't manually add
-    # set-cookie headers; use the cookies array" (Lambda Function URLs / HTTP
-    # API v2 docs) — so when it is present it supersedes any Set-Cookie carried
-    # in `headers` (the structured source wins, as in #750's v1 collision rule).
-    # _send_response expands the list into one Set-Cookie line per entry.
+    # which AWS turns into one Set-Cookie header per entry. Observed AWS
+    # behavior when both `cookies` and a `Set-Cookie` in `headers` are
+    # returned: both ship, with the array's entries emitted first followed by
+    # any header Set-Cookie. Merge case-insensitively on the header key, then
+    # reassign under the canonical `Set-Cookie`. _send_response expands the
+    # list into one Set-Cookie line per entry.
     cookies = lambda_response.get("cookies")
     if cookies:
+        prior = []
         for existing in [h for h in resp_headers if h.lower() == "set-cookie"]:
-            del resp_headers[existing]
-        resp_headers["Set-Cookie"] = list(cookies)
+            val = resp_headers.pop(existing)
+            prior.extend(val if isinstance(val, (list, tuple)) else [val])
+        resp_headers["Set-Cookie"] = list(cookies) + prior
     resp_body = lambda_response.get("body", "")
     # A base64-encoded body (isBase64Encoded=true) is decoded to its raw bytes
     # before sending. HTTP APIs (v2) honor this unconditionally — there is no

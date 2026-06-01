@@ -461,24 +461,22 @@ def test_apigw_execute_lambda_proxy_empty_cookies(apigw, lam):
     apigw.delete_api(ApiId=api_id)
     lam.delete_function(FunctionName=fname)
 
-def test_apigw_execute_lambda_proxy_cookies_supersede_header_set_cookie(apigw, lam):
-    """The `cookies` array supersedes a `Set-Cookie` carried in `headers`.
+def test_apigw_execute_lambda_proxy_cookies_and_header_set_cookie_both_ship(apigw, lam):
+    """Both the `cookies` array AND a `Set-Cookie` in `headers` ship.
 
-    Follow-up to #750. For v2 the `cookies` array is the documented cookie
-    mechanism ("don't manually add set-cookie headers" — AWS Lambda Function
-    URLs / HTTP API v2 docs), so when both are returned only the array's cookies
-    ship — mirroring #759's v1 rule where the structured source wins on a
-    case-insensitive collision.
+    Observed real-AWS behavior for HTTP API (v2) Lambda-proxy: when both are
+    returned, AWS emits the array entries first, followed by the header
+    `Set-Cookie`. Case-insensitive on the header key.
     """
     import urllib.request as _urlreq
     import uuid as _uuid
 
-    fname = f"intg-apigw-cookiewin-{_uuid.uuid4().hex[:8]}"
+    fname = f"intg-apigw-bothcookie-{_uuid.uuid4().hex[:8]}"
     code = (
         b"def handler(event, context):\n"
         b"    return {\n"
         b"        'statusCode': 200,\n"
-        b"        'headers': {'set-cookie': 'should-be-dropped=1; Path=/'},\n"
+        b"        'headers': {'set-cookie': 'h=1; Path=/'},\n"
         b"        'cookies': ['a=1; Path=/', 'b=2; Path=/'],\n"
         b"        'body': 'x',\n"
         b"    }\n"
@@ -492,26 +490,25 @@ def test_apigw_execute_lambda_proxy_cookies_supersede_header_set_cookie(apigw, l
         Handler="index.handler", Code={"ZipFile": buf.getvalue()},
     )
 
-    api_id = apigw.create_api(Name=f"cookiewin-api-{fname}", ProtocolType="HTTP")["ApiId"]
+    api_id = apigw.create_api(Name=f"bothcookie-api-{fname}", ProtocolType="HTTP")["ApiId"]
     int_id = apigw.create_integration(
         ApiId=api_id, IntegrationType="AWS_PROXY",
         IntegrationUri=f"arn:aws:lambda:us-east-1:000000000000:function:{fname}",
         PayloadFormatVersion="2.0",
     )["IntegrationId"]
     route_id = apigw.create_route(
-        ApiId=api_id, RouteKey="GET /cookiewin", Target=f"integrations/{int_id}",
+        ApiId=api_id, RouteKey="GET /bothcookie", Target=f"integrations/{int_id}",
     )["RouteId"]
     apigw.create_stage(ApiId=api_id, StageName="$default")
 
-    url = f"http://{api_id}.execute-api.localhost:{_EXECUTE_PORT}/$default/cookiewin"
+    url = f"http://{api_id}.execute-api.localhost:{_EXECUTE_PORT}/$default/bothcookie"
     req = _urlreq.Request(url, method="GET")
     req.add_header("Host", f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}")
     resp = _urlreq.urlopen(req)
     assert resp.status == 200
     set_cookies = resp.headers.get_all("Set-Cookie") or []
-    # Only the array's cookies ship; the header `Set-Cookie` is superseded.
-    assert set_cookies == ["a=1; Path=/", "b=2; Path=/"]
-    assert all("should-be-dropped" not in c for c in set_cookies)
+    # Array entries first, header `Set-Cookie` last.
+    assert set_cookies == ["a=1; Path=/", "b=2; Path=/", "h=1; Path=/"]
 
     apigw.delete_route(ApiId=api_id, RouteId=route_id)
     apigw.delete_integration(ApiId=api_id, IntegrationId=int_id)
