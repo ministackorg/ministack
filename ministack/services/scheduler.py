@@ -18,7 +18,7 @@ import re
 import time
 
 from ministack.core.persistence import load_state
-from ministack.core.responses import AccountScopedDict, get_account_id, get_region
+from ministack.core.responses import AccountRegionScopedDict, get_account_id, get_region
 
 logger = logging.getLogger("scheduler")
 
@@ -28,9 +28,9 @@ REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 # State
 # ---------------------------------------------------------------------------
 
-_schedules = AccountScopedDict()       # (group, name) -> schedule record
-_schedule_groups = AccountScopedDict()  # group_name -> group record
-_tags = AccountScopedDict()            # arn -> {key: value}
+_schedules = AccountRegionScopedDict()       # (group, name) -> schedule record
+_schedule_groups = AccountRegionScopedDict()  # group_name -> group record
+_tags = AccountRegionScopedDict()            # arn -> {key: value}
 
 
 def reset():

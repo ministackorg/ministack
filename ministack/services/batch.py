@@ -13,6 +13,7 @@ import logging
 import time
 
 from ministack.core.responses import (
+    AccountRegionScopedDict,
     AccountScopedDict,
     error_response_json,
     get_account_id,
@@ -22,10 +23,10 @@ from ministack.core.responses import (
 
 logger = logging.getLogger("batch")
 
-_compute_envs = AccountScopedDict()   # name -> dict
-_job_queues = AccountScopedDict()     # name -> dict
-_job_definitions = AccountScopedDict()  # name -> [revisions]
-_jobs = AccountScopedDict()           # job_id -> dict
+_compute_envs = AccountRegionScopedDict()   # name -> dict
+_job_queues = AccountRegionScopedDict()     # name -> dict
+_job_definitions = AccountRegionScopedDict()  # name -> [revisions]
+_jobs = AccountRegionScopedDict()           # job_id -> dict
 
 
 def reset():

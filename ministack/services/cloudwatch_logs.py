@@ -26,6 +26,7 @@ import os
 import time
 
 from ministack.core.responses import (
+    AccountRegionScopedDict,
     AccountScopedDict,
     error_response_json,
     get_account_id,
@@ -40,7 +41,7 @@ REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 
 from ministack.core.persistence import PERSIST_STATE, load_state
 
-_log_groups = AccountScopedDict()
+_log_groups = AccountRegionScopedDict()
 # group_name -> {
 #   arn, creationTime, retentionInDays (int|None), tags: {str: str},
 #   subscriptionFilters: {filterName: {filterName, logGroupName, filterPattern,
@@ -50,23 +51,23 @@ _log_groups = AccountScopedDict()
 #             firstEventTimestamp, lastEventTimestamp, lastIngestionTime}},
 # }
 
-_destinations = AccountScopedDict()
+_destinations = AccountRegionScopedDict()
 # dest_name -> {destinationName, targetArn, roleArn, accessPolicy, arn, creationTime}
 
-_metric_filters = AccountScopedDict()
+_metric_filters = AccountRegionScopedDict()
 # (log_group_name, filter_name) -> {filterName, logGroupName, filterPattern, metricTransformations, creationTime}
 
-_queries = AccountScopedDict()
+_queries = AccountRegionScopedDict()
 # query_id -> {queryId, logGroupName, startTime, endTime, queryString, status}
 
-_delivery_sources = AccountScopedDict()
+_delivery_sources = AccountRegionScopedDict()
 # source_name -> {name, arn, resourceArns: [str], logType, service, tags}
 
-_delivery_destinations = AccountScopedDict()
+_delivery_destinations = AccountRegionScopedDict()
 # dest_name -> {name, arn, deliveryDestinationType, outputFormat,
 #               deliveryDestinationConfiguration: {destinationResourceArn}, tags}
 
-_deliveries = AccountScopedDict()
+_deliveries = AccountRegionScopedDict()
 # delivery_id -> {id, arn, deliverySourceName, deliveryDestinationArn,
 #                 deliveryDestinationType, recordFields, fieldDelimiter,
 #                 s3DeliveryConfiguration, tags}

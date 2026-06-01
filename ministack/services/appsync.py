@@ -26,6 +26,7 @@ import time
 
 from ministack.core.persistence import PERSIST_STATE, load_state
 from ministack.core.responses import (
+    AccountRegionScopedDict,
     AccountScopedDict,
     error_response_json,
     get_account_id,
@@ -42,12 +43,12 @@ REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 # In-memory state
 # ---------------------------------------------------------------------------
 
-_apis = AccountScopedDict()            # apiId -> api record
-_api_keys = AccountScopedDict()        # apiId -> {keyId -> key record}
-_data_sources = AccountScopedDict()    # apiId -> {name -> data source record}
-_resolvers = AccountScopedDict()       # apiId -> {typeName -> {fieldName -> resolver record}}
-_types = AccountScopedDict()           # apiId -> {typeName -> type record}
-_tags = AccountScopedDict()            # resource_arn -> {key: value}
+_apis = AccountRegionScopedDict()            # apiId -> api record
+_api_keys = AccountRegionScopedDict()        # apiId -> {keyId -> key record}
+_data_sources = AccountRegionScopedDict()    # apiId -> {name -> data source record}
+_resolvers = AccountRegionScopedDict()       # apiId -> {typeName -> {fieldName -> resolver record}}
+_types = AccountRegionScopedDict()           # apiId -> {typeName -> type record}
+_tags = AccountRegionScopedDict()            # resource_arn -> {key: value}
 
 # ---------------------------------------------------------------------------
 # Persistence

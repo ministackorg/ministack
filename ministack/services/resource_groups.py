@@ -23,6 +23,7 @@ import re
 
 from ministack.core.persistence import load_state
 from ministack.core.responses import (
+    AccountRegionScopedDict,
     AccountScopedDict,
     get_account_id,
     get_region,
@@ -36,12 +37,12 @@ _GROUP_ARN_RE = re.compile(
 )
 _VALID_QUERY_TYPES = {"TAG_FILTERS_1_0", "CLOUDFORMATION_STACK_1_0"}
 
-_groups = AccountScopedDict()           # name -> Group dict
-_group_queries = AccountScopedDict()    # name -> ResourceQuery dict
-_group_configs = AccountScopedDict()    # name -> [GroupConfigurationItem]
-_group_members = AccountScopedDict()    # name -> [resource_arn]
-_group_tags = AccountScopedDict()       # name -> {tag_key: tag_value}
-_account_settings = AccountScopedDict()  # "settings" -> AccountSettings dict
+_groups = AccountRegionScopedDict()           # name -> Group dict
+_group_queries = AccountRegionScopedDict()    # name -> ResourceQuery dict
+_group_configs = AccountRegionScopedDict()    # name -> [GroupConfigurationItem]
+_group_members = AccountRegionScopedDict()    # name -> [resource_arn]
+_group_tags = AccountRegionScopedDict()       # name -> {tag_key: tag_value}
+_account_settings = AccountRegionScopedDict()  # "settings" -> AccountSettings dict
 
 
 def get_state():

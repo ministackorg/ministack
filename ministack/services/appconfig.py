@@ -34,7 +34,7 @@ import time
 import uuid
 
 from ministack.core.persistence import PERSIST_STATE, load_state
-from ministack.core.responses import AccountScopedDict, get_account_id, get_region
+from ministack.core.responses import AccountRegionScopedDict, get_account_id, get_region
 
 logger = logging.getLogger("appconfig")
 
@@ -44,14 +44,14 @@ REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 # State
 # ---------------------------------------------------------------------------
 
-_applications = AccountScopedDict()
-_environments = AccountScopedDict()          # "{app_id}/{env_id}" -> record
-_config_profiles = AccountScopedDict()       # "{app_id}/{profile_id}" -> record
-_hosted_versions = AccountScopedDict()       # "{app_id}/{profile_id}/{version}" -> record
-_deployment_strategies = AccountScopedDict()
-_deployments = AccountScopedDict()           # "{app_id}/{env_id}/{deploy_num}" -> record
-_tags = AccountScopedDict()                  # arn -> {key: value}
-_sessions = AccountScopedDict()              # token -> session record
+_applications = AccountRegionScopedDict()
+_environments = AccountRegionScopedDict()          # "{app_id}/{env_id}" -> record
+_config_profiles = AccountRegionScopedDict()       # "{app_id}/{profile_id}" -> record
+_hosted_versions = AccountRegionScopedDict()       # "{app_id}/{profile_id}/{version}" -> record
+_deployment_strategies = AccountRegionScopedDict()
+_deployments = AccountRegionScopedDict()           # "{app_id}/{env_id}/{deploy_num}" -> record
+_tags = AccountRegionScopedDict()                  # arn -> {key: value}
+_sessions = AccountRegionScopedDict()              # token -> session record
 
 # ---------------------------------------------------------------------------
 # Persistence

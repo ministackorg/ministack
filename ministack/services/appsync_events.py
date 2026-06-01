@@ -28,6 +28,7 @@ import time
 
 from ministack.core.persistence import load_state
 from ministack.core.responses import (
+    AccountRegionScopedDict,
     AccountScopedDict,
     error_response_json,
     get_account_id,
@@ -43,11 +44,11 @@ logger = logging.getLogger("appsync_events")
 # ---------------------------------------------------------------------------
 
 # apiId -> api record
-_apis = AccountScopedDict()
+_apis = AccountRegionScopedDict()
 # apiId -> {name -> channel namespace record}
-_channel_namespaces = AccountScopedDict()
+_channel_namespaces = AccountRegionScopedDict()
 # apiId -> {keyId -> api key record}
-_api_keys = AccountScopedDict()
+_api_keys = AccountRegionScopedDict()
 
 # Active realtime connections, keyed by opaque connection id assigned on accept.
 # {connection_id -> {"api_id": str, "account_id": str, "outbox": asyncio.Queue,

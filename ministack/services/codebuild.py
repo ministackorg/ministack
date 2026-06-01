@@ -17,6 +17,7 @@ import time
 
 from ministack.core.persistence import PERSIST_STATE, load_state
 from ministack.core.responses import (
+    AccountRegionScopedDict,
     AccountScopedDict,
     error_response_json,
     get_account_id,
@@ -32,8 +33,8 @@ REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 # ---------------------------------------------------------------------------
 # In-memory state
 # ---------------------------------------------------------------------------
-_projects = AccountScopedDict()    # project_name -> project record
-_builds = AccountScopedDict()      # build_id -> build record
+_projects = AccountRegionScopedDict()    # project_name -> project record
+_builds = AccountRegionScopedDict()      # build_id -> build record
 
 
 def reset():

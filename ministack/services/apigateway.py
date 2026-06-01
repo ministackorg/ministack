@@ -51,7 +51,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-from ministack.core.responses import AccountScopedDict, error_response_json, get_account_id, get_region, new_uuid
+from ministack.core.responses import AccountRegionScopedDict, error_response_json, get_account_id, get_region, new_uuid
 
 _HOST = os.environ.get("MINISTACK_HOST", "localhost")
 _PORT = os.environ.get("GATEWAY_PORT", "4566")
@@ -89,19 +89,19 @@ _PROXY_TIMEOUT_SECONDS = _timeout_from_env("MINISTACK_APIGW_PROXY_TIMEOUT_SECOND
 _JWKS_TIMEOUT_SECONDS = _timeout_from_env("MINISTACK_APIGW_JWKS_TIMEOUT_SECONDS", 5.0)
 
 # ---- Module-level state ----
-_apis = AccountScopedDict()          # api_id -> api object
-_routes = AccountScopedDict()        # api_id -> {route_id -> route object}
-_integrations = AccountScopedDict()  # api_id -> {integration_id -> integration object}
-_stages = AccountScopedDict()        # api_id -> {stage_name -> stage object}
-_deployments = AccountScopedDict()   # api_id -> {deployment_id -> deployment object}
-_authorizers = AccountScopedDict()   # api_id -> {authorizer_id -> authorizer object}
-_api_tags = AccountScopedDict()      # resource_arn -> {key -> value}
-_route_responses = AccountScopedDict()         # api_id -> {route_id -> {rr_id -> route_response}}
-_integration_responses = AccountScopedDict()   # api_id -> {integration_id -> {ir_id -> int_response}}
+_apis = AccountRegionScopedDict()          # api_id -> api object
+_routes = AccountRegionScopedDict()        # api_id -> {route_id -> route object}
+_integrations = AccountRegionScopedDict()  # api_id -> {integration_id -> integration object}
+_stages = AccountRegionScopedDict()        # api_id -> {stage_name -> stage object}
+_deployments = AccountRegionScopedDict()   # api_id -> {deployment_id -> deployment object}
+_authorizers = AccountRegionScopedDict()   # api_id -> {authorizer_id -> authorizer object}
+_api_tags = AccountRegionScopedDict()      # resource_arn -> {key -> value}
+_route_responses = AccountRegionScopedDict()         # api_id -> {route_id -> {rr_id -> route_response}}
+_integration_responses = AccountRegionScopedDict()   # api_id -> {integration_id -> {ir_id -> int_response}}
 # JWKS cache is account-scoped because issuer URLs in MiniStack can resolve
 # to per-account local Cognito user pools — the same URL string may legitimately
 # serve different keys in different accounts.
-_jwks_cache = AccountScopedDict()
+_jwks_cache = AccountRegionScopedDict()
 
 # WebSocket connection registry — connections are not per-account-scoped at the store level
 # because the @connections management API may arrive on any host/account; instead we store

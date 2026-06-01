@@ -28,6 +28,7 @@ from urllib.parse import urlparse
 
 from ministack.core.persistence import PERSIST_STATE, load_state
 from ministack.core.responses import (
+    AccountRegionScopedDict,
     AccountScopedDict,
     error_response_json,
     get_account_id,
@@ -54,14 +55,14 @@ def get_athena_engine():
     return engine
 
 
-_executions = AccountScopedDict()
+_executions = AccountRegionScopedDict()
 # Per-account workgroups / data catalogs. AWS's "primary" workgroup and
 # "AwsDataCatalog" exist in every account — we lazily seed them per-tenant
 # on first access so two accounts never share the same workgroup or catalog
 # state (creation times, configs, etc.).
-_workgroups = AccountScopedDict()
-_named_queries = AccountScopedDict()
-_data_catalogs = AccountScopedDict()
+_workgroups = AccountRegionScopedDict()
+_named_queries = AccountRegionScopedDict()
+_data_catalogs = AccountRegionScopedDict()
 
 
 def _ensure_default_workgroup():
@@ -85,8 +86,8 @@ def _ensure_default_data_catalog():
             "Type": "GLUE",
             "Parameters": {},
         }
-_prepared_statements = AccountScopedDict()  # "workgroup/name" -> statement dict
-_tags = AccountScopedDict()  # arn -> {key: value, ...}
+_prepared_statements = AccountRegionScopedDict()  # "workgroup/name" -> statement dict
+_tags = AccountRegionScopedDict()  # arn -> {key: value, ...}
 
 
 def get_state():

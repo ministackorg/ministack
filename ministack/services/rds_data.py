@@ -11,7 +11,7 @@ import re
 import threading
 import uuid
 
-from ministack.core.responses import AccountScopedDict, error_response_json, get_account_id, get_region, json_response
+from ministack.core.responses import AccountRegionScopedDict, error_response_json, get_account_id, get_region, json_response
 
 logger = logging.getLogger("rds-data")
 
@@ -23,9 +23,9 @@ _lock = threading.Lock()
 
 # In-memory tracking for stub mode: remember databases/users created via SQL.
 # Keyed by cluster identifier.
-_stub_databases = AccountScopedDict()   # cluster_id -> set of database names
-_stub_users = AccountScopedDict()       # cluster_id -> set of usernames
-_stub_grants = AccountScopedDict()      # cluster_id -> {username -> list of grant strings}
+_stub_databases = AccountRegionScopedDict()   # cluster_id -> set of database names
+_stub_users = AccountRegionScopedDict()       # cluster_id -> set of usernames
+_stub_grants = AccountRegionScopedDict()      # cluster_id -> {username -> list of grant strings}
 
 
 def _error(code, message, status=400):

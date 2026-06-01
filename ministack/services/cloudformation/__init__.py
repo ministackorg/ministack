@@ -14,17 +14,17 @@ import logging
 import os
 from urllib.parse import parse_qs
 
-from ministack.core.responses import AccountScopedDict
+from ministack.core.responses import AccountRegionScopedDict
 
 logger = logging.getLogger("cloudformation")
 
 REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 
 # In-memory state (shared across all submodules)
-_stacks = AccountScopedDict()          # stack_name -> stack dict
-_stack_events = AccountScopedDict()    # stack_id -> [event list]
-_exports = AccountScopedDict()         # export_name -> {StackId, Name, Value}
-_change_sets = AccountScopedDict()     # cs_id -> change set dict
+_stacks = AccountRegionScopedDict()          # stack_name -> stack dict
+_stack_events = AccountRegionScopedDict()    # stack_id -> [event list]
+_exports = AccountRegionScopedDict()         # export_name -> {StackId, Name, Value}
+_change_sets = AccountRegionScopedDict()     # cs_id -> change set dict
 
 # Re-exports for compatibility
 from .engine import (  # noqa: E402
@@ -79,6 +79,6 @@ def reset():
 
 
 # Must be last — handlers imports from this module
-from ministack.core.responses import AccountScopedDict, get_account_id
+from ministack.core.responses import AccountRegionScopedDict, get_account_id
 
 from .handlers import _ACTION_HANDLERS, _validate_template  # noqa: E402

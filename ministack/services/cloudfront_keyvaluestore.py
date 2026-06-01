@@ -17,7 +17,7 @@ from datetime import datetime
 from urllib.parse import unquote
 
 from ministack.core.persistence import load_state
-from ministack.core.responses import AccountScopedDict, json_response, new_uuid
+from ministack.core.responses import AccountRegionScopedDict, json_response, new_uuid
 
 logger = logging.getLogger("cloudfront-keyvaluestore")
 
@@ -33,7 +33,7 @@ _STORE_RE = re.compile(r"^/key-value-stores/(arn:.+)$")
 # ---------------------------------------------------------------------------
 # In-memory state — keyed by KVS ARN
 # ---------------------------------------------------------------------------
-_stores = AccountScopedDict()  # arn -> {"etag": str, "items": {key: value}}
+_stores = AccountRegionScopedDict()  # arn -> {"etag": str, "items": {key: value}}
 
 
 def reset():

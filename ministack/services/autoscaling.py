@@ -21,17 +21,17 @@ import time
 from collections import defaultdict
 
 from ministack.core.persistence import load_state
-from ministack.core.responses import AccountScopedDict, get_account_id, get_region, new_uuid, now_iso
+from ministack.core.responses import AccountRegionScopedDict, get_account_id, get_region, new_uuid, now_iso
 
 logger = logging.getLogger("autoscaling")
 REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 
-_asgs = AccountScopedDict()
-_launch_configs = AccountScopedDict()
-_policies = AccountScopedDict()
-_hooks = AccountScopedDict()
-_scheduled_actions = AccountScopedDict()
-_tags = AccountScopedDict()  # asg_name -> [{"Key":..., "Value":...}, ...]
+_asgs = AccountRegionScopedDict()
+_launch_configs = AccountRegionScopedDict()
+_policies = AccountRegionScopedDict()
+_hooks = AccountRegionScopedDict()
+_scheduled_actions = AccountRegionScopedDict()
+_tags = AccountRegionScopedDict()  # asg_name -> [{"Key":..., "Value":...}, ...]
 
 
 def get_state():

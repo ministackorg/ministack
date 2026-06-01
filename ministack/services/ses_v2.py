@@ -16,16 +16,16 @@ import re
 import time
 
 from ministack.core.persistence import PERSIST_STATE, load_state
-from ministack.core.responses import AccountScopedDict, get_account_id, get_region, json_response, new_uuid, now_iso
+from ministack.core.responses import AccountRegionScopedDict, get_account_id, get_region, json_response, new_uuid, now_iso
 from ministack.services.ses import _build_mime_message, _parse_raw_mime, _sent_emails_list, _smtp_relay
 
 logger = logging.getLogger("ses-v2")
 
 REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 
-_identities = AccountScopedDict()        # identity -> dict
-_config_sets = AccountScopedDict()       # name -> dict
-_ses_tags = AccountScopedDict()          # resource_arn -> [tags]
+_identities = AccountRegionScopedDict()        # identity -> dict
+_config_sets = AccountRegionScopedDict()       # name -> dict
+_ses_tags = AccountRegionScopedDict()          # resource_arn -> [tags]
 
 
 def get_state() -> dict:

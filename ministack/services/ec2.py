@@ -69,7 +69,7 @@ from urllib.parse import parse_qs
 from xml.sax.saxutils import escape as _esc
 
 from ministack.core.persistence import PERSIST_STATE, load_state
-from ministack.core.responses import AccountScopedDict, get_account_id, get_region, new_uuid
+from ministack.core.responses import AccountRegionScopedDict, get_account_id, get_region, new_uuid
 
 logger = logging.getLogger("ec2")
 
@@ -79,30 +79,30 @@ REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 # State
 # ---------------------------------------------------------------------------
 
-_instances = AccountScopedDict()
-_security_groups = AccountScopedDict()
-_key_pairs = AccountScopedDict()
-_vpcs = AccountScopedDict()
-_subnets = AccountScopedDict()
-_internet_gateways = AccountScopedDict()
-_addresses = AccountScopedDict()       # allocation_id -> address record
-_tags = AccountScopedDict()            # resource_id -> [{"Key": ..., "Value": ...}]
-_route_tables = AccountScopedDict()    # rtb_id -> route table record
-_network_interfaces = AccountScopedDict()  # eni_id -> ENI record
-_vpc_endpoints = AccountScopedDict()   # vpce_id -> endpoint record
-_volumes = AccountScopedDict()         # vol_id -> volume record
-_snapshots = AccountScopedDict()       # snap_id -> snapshot record
-_nat_gateways = AccountScopedDict()    # nat_id -> NAT gateway record
-_network_acls = AccountScopedDict()    # acl_id -> network ACL record
-_flow_logs = AccountScopedDict()       # flow_log_id -> flow log record
-_vpc_peering = AccountScopedDict()     # pcx_id -> peering connection record
-_dhcp_options = AccountScopedDict()    # dopt_id -> DHCP options record
-_egress_igws = AccountScopedDict()     # eigw_id -> egress-only internet gateway record
-_prefix_lists = AccountScopedDict()    # pl_id -> managed prefix list record
-_vpn_gateways = AccountScopedDict()    # vgw_id -> VPN gateway record
-_customer_gateways = AccountScopedDict()  # cgw_id -> customer gateway record
-_vpn_connections = AccountScopedDict()    # vpn_id -> VPN connection record
-_launch_templates = AccountScopedDict()   # lt_id -> launch template record (includes versions list)
+_instances = AccountRegionScopedDict()
+_security_groups = AccountRegionScopedDict()
+_key_pairs = AccountRegionScopedDict()
+_vpcs = AccountRegionScopedDict()
+_subnets = AccountRegionScopedDict()
+_internet_gateways = AccountRegionScopedDict()
+_addresses = AccountRegionScopedDict()       # allocation_id -> address record
+_tags = AccountRegionScopedDict()            # resource_id -> [{"Key": ..., "Value": ...}]
+_route_tables = AccountRegionScopedDict()    # rtb_id -> route table record
+_network_interfaces = AccountRegionScopedDict()  # eni_id -> ENI record
+_vpc_endpoints = AccountRegionScopedDict()   # vpce_id -> endpoint record
+_volumes = AccountRegionScopedDict()         # vol_id -> volume record
+_snapshots = AccountRegionScopedDict()       # snap_id -> snapshot record
+_nat_gateways = AccountRegionScopedDict()    # nat_id -> NAT gateway record
+_network_acls = AccountRegionScopedDict()    # acl_id -> network ACL record
+_flow_logs = AccountRegionScopedDict()       # flow_log_id -> flow log record
+_vpc_peering = AccountRegionScopedDict()     # pcx_id -> peering connection record
+_dhcp_options = AccountRegionScopedDict()    # dopt_id -> DHCP options record
+_egress_igws = AccountRegionScopedDict()     # eigw_id -> egress-only internet gateway record
+_prefix_lists = AccountRegionScopedDict()    # pl_id -> managed prefix list record
+_vpn_gateways = AccountRegionScopedDict()    # vgw_id -> VPN gateway record
+_customer_gateways = AccountRegionScopedDict()  # cgw_id -> customer gateway record
+_vpn_connections = AccountRegionScopedDict()    # vpn_id -> VPN connection record
+_launch_templates = AccountRegionScopedDict()   # lt_id -> launch template record (includes versions list)
 
 
 # ── Persistence ────────────────────────────────────────────

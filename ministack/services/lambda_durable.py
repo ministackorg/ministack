@@ -27,6 +27,7 @@ import uuid
 from urllib.parse import unquote
 
 from ministack.core.responses import (
+    AccountRegionScopedDict,
     AccountScopedDict,
     error_response_json,
     get_account_id,
@@ -58,7 +59,7 @@ from ministack.core.persistence import load_state
 #     "History": list[dict],            # append-only event log
 #     "NextEventId": int,
 #   }
-_executions = AccountScopedDict()
+_executions = AccountRegionScopedDict()
 
 # Resume scheduler — heapq of (resume_at_epoch, durable_arn, account_id).
 # When a durable invocation returns Status=PENDING with WAIT operations still

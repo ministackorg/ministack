@@ -25,6 +25,7 @@ from collections import defaultdict
 from decimal import Decimal, InvalidOperation
 
 from ministack.core.responses import (
+    AccountRegionScopedDict,
     AccountScopedDict,
     error_response_json,
     get_account_id,
@@ -56,28 +57,28 @@ REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 
 from ministack.core.persistence import PERSIST_STATE, load_state
 
-_tables = AccountScopedDict()
-_tags = AccountScopedDict()
-_ttl_settings = AccountScopedDict()
-_pitr_settings = AccountScopedDict()
+_tables = AccountRegionScopedDict()
+_tags = AccountRegionScopedDict()
+_ttl_settings = AccountRegionScopedDict()
+_pitr_settings = AccountRegionScopedDict()
 # Kinesis streaming destinations — TableName -> list of
 # {"StreamArn": str, "DestinationStatus": "ACTIVE"|"DISABLED",
 #  "ApproximateCreationDateTimePrecision": "MILLISECOND"|"MICROSECOND"}.
 # ACTIVE entries get each _emit_stream_event record fanned out via
 # kinesis.put_record_internal; DISABLED entries stay on the describe
 # response (matching the ~24 h AWS retention window for readability).
-_kinesis_destinations = AccountScopedDict()
+_kinesis_destinations = AccountRegionScopedDict()
 # Contributor Insights — key is "TableName" or "TableName/index/IndexName".
 # Value: {"ContributorInsightsStatus": "ENABLED"|"DISABLED",
 #         "LastUpdateDateTime": float epoch, "ContributorInsightsRuleList": [str, ...]}.
-_backups = AccountScopedDict()  # BackupArn -> BackupDescription dict
-_contributor_insights = AccountScopedDict()
+_backups = AccountRegionScopedDict()  # BackupArn -> BackupDescription dict
+_contributor_insights = AccountRegionScopedDict()
 # Resource-based policies — ResourceArn -> {"Policy": str, "RevisionId": str}.
-_resource_policies = AccountScopedDict()
+_resource_policies = AccountRegionScopedDict()
 # Export tasks — ExportArn -> ExportDescription dict.
-_exports = AccountScopedDict()
+_exports = AccountRegionScopedDict()
 # Import tasks — ImportArn -> ImportTableDescription dict.
-_imports = AccountScopedDict()
+_imports = AccountRegionScopedDict()
 _lock = threading.Lock()
 
 
@@ -426,7 +427,7 @@ def _validate_item(item: dict, pk_name: str | None = None, sk_name: str | None =
 
 # DynamoDB Streams: table_name -> list of stream records
 # Each record follows the DynamoDB Streams event format consumed by Lambda ESMs.
-_stream_records = AccountScopedDict()
+_stream_records = AccountRegionScopedDict()
 _stream_seq_counter = 0
 _stream_seq_lock = threading.Lock()
 
@@ -2721,7 +2722,7 @@ def _transact_write_items(data):
     return json_response(result)
 
 
-_txn_idempotency = AccountScopedDict()
+_txn_idempotency = AccountRegionScopedDict()
 
 
 def _transact_get_items(data):

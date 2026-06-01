@@ -27,7 +27,7 @@ import time
 from urllib.parse import parse_qs
 
 from ministack.core.persistence import load_state
-from ministack.core.responses import AccountScopedDict, apply_image_prefix, get_account_id, get_region, new_uuid
+from ministack.core.responses import AccountRegionScopedDict, apply_image_prefix, get_account_id, get_region, new_uuid
 
 logger = logging.getLogger("elasticache")
 
@@ -44,18 +44,18 @@ DOCKER_NETWORK = os.environ.get("DOCKER_NETWORK", "")
 # CI/dev deterministic; flip to "1" to exercise sharded discovery.
 ELASTICACHE_CLUSTER_MODE_REAL = os.environ.get("ELASTICACHE_CLUSTER_MODE_REAL", "") == "1"
 
-_clusters = AccountScopedDict()
-_replication_groups = AccountScopedDict()
-_subnet_groups = AccountScopedDict()
-_param_groups = AccountScopedDict()
-_param_group_params = AccountScopedDict()  # group_name -> {param_name -> param_dict}
-_tags = AccountScopedDict()  # arn -> [{"Key": ..., "Value": ...}, ...]
-_snapshots = AccountScopedDict()
-_users = AccountScopedDict()
-_user_groups = AccountScopedDict()
+_clusters = AccountRegionScopedDict()
+_replication_groups = AccountRegionScopedDict()
+_subnet_groups = AccountRegionScopedDict()
+_param_groups = AccountRegionScopedDict()
+_param_group_params = AccountRegionScopedDict()  # group_name -> {param_name -> param_dict}
+_tags = AccountRegionScopedDict()  # arn -> [{"Key": ..., "Value": ...}, ...]
+_snapshots = AccountRegionScopedDict()
+_users = AccountRegionScopedDict()
+_user_groups = AccountRegionScopedDict()
 # Per-account event log. AccountScopedDict under key "entries" so the list
 # manipulation stays simple and DescribeEvents never leaks cross-tenant rows.
-_events = AccountScopedDict()
+_events = AccountRegionScopedDict()
 
 
 def _events_list() -> list:

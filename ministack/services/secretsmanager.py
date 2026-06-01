@@ -20,6 +20,7 @@ import string
 import time
 
 from ministack.core.responses import (
+    AccountRegionScopedDict,
     AccountScopedDict,
     error_response_json,
     get_account_id,
@@ -34,8 +35,8 @@ REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 
 from ministack.core.persistence import PERSIST_STATE, load_state
 
-_secrets = AccountScopedDict()
-_resource_policies = AccountScopedDict()
+_secrets = AccountRegionScopedDict()
+_resource_policies = AccountRegionScopedDict()
 # name -> {
 #   ARN, Name, Description, Tags: [{Key, Value}],
 #   CreatedDate, LastChangedDate, LastAccessedDate,

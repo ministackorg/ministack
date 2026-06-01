@@ -27,6 +27,7 @@ import threading
 import time
 
 from ministack.core.responses import (
+    AccountRegionScopedDict,
     AccountScopedDict,
     apply_image_prefix,
     get_account_id,
@@ -79,9 +80,9 @@ _NAME_RE = re.compile(r"^[a-z][a-z0-9\-]{2,27}$")
 # State (account-scoped)
 # ---------------------------------------------------------------------------
 
-_domains = AccountScopedDict()        # name -> DomainStatus dict (+ private _* fields)
-_tags = AccountScopedDict()           # arn -> [{Key, Value}, ...]
-_change_progress = AccountScopedDict()  # name -> change progress record
+_domains = AccountRegionScopedDict()        # name -> DomainStatus dict (+ private _* fields)
+_tags = AccountRegionScopedDict()           # arn -> [{Key, Value}, ...]
+_change_progress = AccountRegionScopedDict()  # name -> change progress record
 
 # Port counter and Docker handle are process-global (data plane is shared).
 _port_counter = [BASE_PORT]

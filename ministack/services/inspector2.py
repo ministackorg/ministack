@@ -11,6 +11,7 @@ import uuid
 
 from ministack.core.persistence import load_state
 from ministack.core.responses import (
+    AccountRegionScopedDict,
     AccountScopedDict,
     error_response_json,
     get_account_id,
@@ -20,12 +21,12 @@ from ministack.core.responses import (
 
 logger = logging.getLogger("inspector2")
 
-_account_config = AccountScopedDict()
-_findings = AccountScopedDict()
-_coverage = AccountScopedDict()
-_scan_history = AccountScopedDict()
-_tags = AccountScopedDict()
-_filters = AccountScopedDict()
+_account_config = AccountRegionScopedDict()
+_findings = AccountRegionScopedDict()
+_coverage = AccountRegionScopedDict()
+_scan_history = AccountRegionScopedDict()
+_tags = AccountRegionScopedDict()
+_filters = AccountRegionScopedDict()
 
 
 def _now_iso():

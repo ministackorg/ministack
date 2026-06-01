@@ -36,6 +36,7 @@ from urllib.parse import unquote
 
 from ministack.core.persistence import PERSIST_STATE, load_state
 from ministack.core.responses import (
+    AccountRegionScopedDict,
     AccountScopedDict,
     error_response_json,
     get_account_id,
@@ -49,9 +50,9 @@ logger = logging.getLogger("s3tables")
 
 # ── In-memory state ────────────────────────────────────────
 
-_table_buckets = AccountScopedDict()
-_namespaces = AccountScopedDict()        # "bucket_arn\x00namespace" -> ns dict
-_tables = AccountScopedDict()            # "bucket_arn\x00namespace\x00table" -> table dict
+_table_buckets = AccountRegionScopedDict()
+_namespaces = AccountRegionScopedDict()        # "bucket_arn\x00namespace" -> ns dict
+_tables = AccountRegionScopedDict()            # "bucket_arn\x00namespace\x00table" -> table dict
 
 
 # ── Persistence ────────────────────────────────────────────

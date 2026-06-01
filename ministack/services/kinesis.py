@@ -22,6 +22,7 @@ import threading
 import time
 
 from ministack.core.responses import (
+    AccountRegionScopedDict,
     AccountScopedDict,
     error_response_json,
     get_account_id,
@@ -38,9 +39,9 @@ ITERATOR_EXPIRY_SECONDS = 300
 
 from ministack.core.persistence import PERSIST_STATE, load_state
 
-_streams = AccountScopedDict()
-_shard_iterators = AccountScopedDict()
-_consumers = AccountScopedDict()
+_streams = AccountRegionScopedDict()
+_shard_iterators = AccountRegionScopedDict()
+_consumers = AccountRegionScopedDict()
 _sequence_counter = 0
 _sequence_lock = threading.Lock()
 

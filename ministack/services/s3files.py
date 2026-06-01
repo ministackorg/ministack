@@ -22,6 +22,7 @@ from urllib.parse import unquote
 
 from ministack.core.persistence import load_state
 from ministack.core.responses import (
+    AccountRegionScopedDict,
     AccountScopedDict,
     error_response_json,
     get_account_id,
@@ -42,12 +43,12 @@ def _empty_200():
 
 logger = logging.getLogger("s3files")
 
-_file_systems = AccountScopedDict()
-_mount_targets = AccountScopedDict()
-_access_points = AccountScopedDict()
-_policies = AccountScopedDict()
-_sync_configs = AccountScopedDict()
-_tags = AccountScopedDict()
+_file_systems = AccountRegionScopedDict()
+_mount_targets = AccountRegionScopedDict()
+_access_points = AccountRegionScopedDict()
+_policies = AccountRegionScopedDict()
+_sync_configs = AccountRegionScopedDict()
+_tags = AccountRegionScopedDict()
 
 
 def get_state():
