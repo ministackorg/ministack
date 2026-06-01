@@ -896,7 +896,8 @@ async def handle_execute(api_id, stage_name, method, path, headers, body, query_
     if int_type in ("AWS_PROXY", "AWS"):
         return await _invoke_lambda_proxy_v1(
             integration, api_id, stage_name, stage, resource, path, method,
-            headers, body, query_params, path_params
+            headers, body, query_params, path_params,
+            binary_media_types=api.get("binaryMediaTypes") or [],
         )
     elif int_type in ("HTTP_PROXY", "HTTP"):
         return await _invoke_http_proxy_v1(
@@ -908,7 +909,26 @@ async def handle_execute(api_id, stage_name, method, path, headers, body, query_
         return 500, {"Content-Type": "application/json"}, json.dumps({"message": f"Unsupported integration type: {int_type}"}).encode()
 
 
-async def _invoke_lambda_proxy_v1(integration, api_id, stage_name, stage, resource, request_path, method, headers, body, query_params, path_params):
+def _media_type_matches(media_type, binary_media_types):
+    """Whether a request media type matches any configured ``binaryMediaTypes``.
+
+    Configured patterns may use wildcards (``*/*``, ``type/*``); the request
+    value is matched literally against them. A request value of ``*/*`` therefore
+    does NOT match a specific configured type — verified against real AWS.
+    """
+    mt = (media_type or "").split(";", 1)[0].strip().lower()
+    if not mt:
+        return False
+    for pat in binary_media_types or []:
+        pat = pat.strip().lower()
+        if pat == mt or pat == "*/*":
+            return True
+        if pat.endswith("/*") and "/" in mt and mt.split("/", 1)[0] == pat[:-2]:
+            return True
+    return False
+
+
+async def _invoke_lambda_proxy_v1(integration, api_id, stage_name, stage, resource, request_path, method, headers, body, query_params, path_params, binary_media_types=None):
     """Invoke Lambda with API Gateway v1 payload format 1.0."""
     uri = integration.get("uri", "")
     # Supported URI formats:
@@ -934,6 +954,17 @@ async def _invoke_lambda_proxy_v1(integration, api_id, stage_name, stage, resour
     now_epoch_ms = int(time.time() * 1000)
     request_time = datetime.datetime.utcnow().strftime("%d/%b/%Y:%H:%M:%S +0000")
     request_id = new_uuid()
+
+    # A request body whose Content-Type matches a configured binaryMediaType is
+    # delivered base64-encoded with isBase64Encoded=true; otherwise as a UTF-8
+    # string. Verified against real AWS.
+    if body:
+        if _media_type_matches(headers.get("content-type"), binary_media_types):
+            req_body, req_is_base64 = base64.b64encode(body).decode("ascii"), True
+        else:
+            req_body, req_is_base64 = body.decode("utf-8", errors="replace"), False
+    else:
+        req_body, req_is_base64 = None, False
 
     event = {
         "version": "1.0",
@@ -966,8 +997,8 @@ async def _invoke_lambda_proxy_v1(integration, api_id, stage_name, stage, resour
             "httpMethod": method,
             "apiId": api_id,
         },
-        "body": body.decode("utf-8", errors="replace") if body else None,
-        "isBase64Encoded": False,
+        "body": req_body,
+        "isBase64Encoded": req_is_base64,
     }
 
     lambda_response, err = await _call_lambda(func_name, event, qualifier=qualifier)
@@ -1004,7 +1035,13 @@ async def _invoke_lambda_proxy_v1(integration, api_id, stage_name, stage, resour
                 del resp_headers[existing]
         resp_headers[k] = list(v)
     resp_body = lambda_response.get("body", "")
-    if isinstance(resp_body, str):
+    # A base64 response body (isBase64Encoded) is decoded to raw bytes only when
+    # the request Accept matches a configured binaryMediaType; otherwise the
+    # base64 string is passed through as text. Verified against real AWS.
+    if (lambda_response.get("isBase64Encoded") and isinstance(resp_body, str)
+            and _media_type_matches(headers.get("accept"), binary_media_types)):
+        resp_body = base64.b64decode(resp_body)
+    elif isinstance(resp_body, str):
         resp_body = resp_body.encode("utf-8")
     elif isinstance(resp_body, dict):
         resp_body = json.dumps(resp_body, ensure_ascii=False).encode("utf-8")
