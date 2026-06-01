@@ -1519,6 +1519,93 @@ def test_sfn_aws_sdk_rds_remove_from_global_cluster(sfn, sfn_sync, rds):
         rds.delete_db_cluster(DBClusterIdentifier=cluster_id, SkipFinalSnapshot=True)
 
 
+def test_sfn_aws_sdk_rds_create_global_cluster_from_described_cluster_arn(sfn_sync, rds):
+    """aws-sdk:rds CreateGlobalCluster accepts a described DBClusterArn via JSONPath."""
+    primary_id = f"sfn-r2g-primary-{_uuid_mod.uuid4().hex[:8]}"
+    global_id = f"sfn-r2g-global-{_uuid_mod.uuid4().hex[:8]}"
+    sm_name = f"sdk-rds-r2g-{_uuid_mod.uuid4().hex[:8]}"
+    sm_arn = None
+
+    rds.create_db_cluster(
+        DBClusterIdentifier=primary_id,
+        Engine="aurora-postgresql",
+        MasterUsername="admin",
+        MasterUserPassword="testpass123",
+    )
+
+    definition = json.dumps({
+        "StartAt": "DescribePrimary",
+        "States": {
+            "DescribePrimary": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::aws-sdk:rds:describeDBClusters",
+                "Parameters": {
+                    "DbClusterIdentifier": primary_id,
+                },
+                "ResultPath": "$.primary",
+                "Next": "AttachGlobal",
+            },
+            "AttachGlobal": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::aws-sdk:rds:createGlobalCluster",
+                "Parameters": {
+                    "GlobalClusterIdentifier": global_id,
+                    "SourceDBClusterIdentifier.$": "$.primary.DbClusters[0].DbClusterArn",
+                },
+                "ResultPath": "$.attach",
+                "Next": "DescribeGlobal",
+            },
+            "DescribeGlobal": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::aws-sdk:rds:describeGlobalClusters",
+                "Parameters": {
+                    "GlobalClusterIdentifier": global_id,
+                },
+                "ResultPath": "$.global",
+                "End": True,
+            },
+        },
+    })
+
+    try:
+        sm_arn = sfn_sync.create_state_machine(
+            name=sm_name,
+            definition=definition,
+            roleArn="arn:aws:iam::000000000000:role/sfn-role",
+        )["stateMachineArn"]
+
+        resp = sfn_sync.start_sync_execution(stateMachineArn=sm_arn, input=json.dumps({}))
+        assert resp["status"] == "SUCCEEDED", f"Execution failed: {resp.get('error')} — {resp.get('cause')}"
+        output = json.loads(resp["output"])
+        global_cluster = output["global"]["GlobalClusters"][0]
+        members = global_cluster["GlobalClusterMembers"]
+        assert len(members) == 1
+        assert members[0]["IsWriter"] is True
+        assert members[0]["DbClusterArn"] == output["primary"]["DbClusters"][0]["DbClusterArn"]
+        attached = rds.describe_db_clusters(
+            DBClusterIdentifier=primary_id,
+        )["DBClusters"][0]
+        assert attached["GlobalClusterIdentifier"] == global_id
+    finally:
+        if sm_arn:
+            sfn_sync.delete_state_machine(stateMachineArn=sm_arn)
+        try:
+            rds.remove_from_global_cluster(
+                GlobalClusterIdentifier=global_id,
+                DbClusterIdentifier=primary_id,
+            )
+        except ClientError:
+            pass
+        try:
+            rds.delete_global_cluster(GlobalClusterIdentifier=global_id)
+        except ClientError:
+            pass
+        try:
+            rds.delete_db_cluster(DBClusterIdentifier=primary_id, SkipFinalSnapshot=True)
+        except ClientError:
+            pass
+
+
 def test_sfn_aws_sdk_rds_global_cluster_readers_are_lists(sfn_sync, rds):
     primary_id = f"sfn-global-primary-{_uuid_mod.uuid4().hex[:8]}"
     secondary_id = f"sfn-global-secondary-{_uuid_mod.uuid4().hex[:8]}"
