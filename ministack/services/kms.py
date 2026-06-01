@@ -14,6 +14,7 @@ import os
 import time
 
 from ministack.core.responses import (
+    AccountRegionScopedDict,
     AccountScopedDict,
     error_response_json,
     get_account_id,
@@ -42,7 +43,7 @@ REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 
 from ministack.core.persistence import PERSIST_STATE, load_state
 
-_keys = AccountScopedDict()
+_keys = AccountRegionScopedDict()
 # key_id -> {
 #     KeyId, Arn, KeyState, KeyUsage, KeySpec, Description,
 #     CreationDate, Enabled, Origin,
@@ -50,7 +51,7 @@ _keys = AccountScopedDict()
 #     _public_key_der (bytes, RSA/ECC only),
 #     _symmetric_key (bytes, SYMMETRIC_DEFAULT only),
 # }
-_aliases = AccountScopedDict()  # alias_name -> key_id (e.g. "alias/my-key" -> "uuid")
+_aliases = AccountRegionScopedDict()  # alias_name -> key_id (e.g. "alias/my-key" -> "uuid")
 
 
 # ── Persistence ────────────────────────────────────────────
@@ -58,8 +59,8 @@ _aliases = AccountScopedDict()  # alias_name -> key_id (e.g. "alias/my-key" -> "
 def get_state():
     """Return JSON-serializable state. Symmetric keys are base64-encoded;
     RSA private keys are PEM-encoded if cryptography is available."""
-    from ministack.core.responses import AccountScopedDict
-    serializable_keys = AccountScopedDict()
+    from ministack.core.responses import AccountRegionScopedDict
+    serializable_keys = AccountRegionScopedDict()
     # Iterate _data directly to capture ALL accounts
     for scoped_key, rec in _keys._data.items():
         entry = {k: v for k, v in rec.items()
@@ -84,7 +85,7 @@ def get_state():
 
 def restore_state(data):
     if data:
-        from ministack.core.responses import AccountScopedDict
+        from ministack.core.responses import AccountRegionScopedDict
         keys_data = data.get("keys", {})
         def _restore_key_entry(entry):
             if "_symmetric_key_b64" in entry:

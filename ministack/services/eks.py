@@ -23,6 +23,7 @@ import time
 
 from ministack.core.persistence import load_state
 from ministack.core.responses import (
+    AccountRegionScopedDict,
     AccountScopedDict,
     apply_image_prefix,
     error_response_json,
@@ -50,10 +51,10 @@ except ImportError:
 # State
 # ---------------------------------------------------------------------------
 
-_clusters = AccountScopedDict()       # name -> cluster record
-_nodegroups = AccountScopedDict()     # "cluster/nodegroup" -> nodegroup record
-_addons = AccountScopedDict()         # "cluster/addonName" -> addon record
-_tags = AccountScopedDict()           # arn -> {key: value}
+_clusters = AccountRegionScopedDict()       # name -> cluster record
+_nodegroups = AccountRegionScopedDict()     # "cluster/nodegroup" -> nodegroup record
+_addons = AccountRegionScopedDict()         # "cluster/addonName" -> addon record
+_tags = AccountRegionScopedDict()           # arn -> {key: value}
 _port_counter_lock = threading.Lock()
 _port_counter = [EKS_BASE_PORT]
 _oidc_keypair_lock = threading.Lock()

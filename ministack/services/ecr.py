@@ -13,6 +13,7 @@ import time
 
 from ministack.core.persistence import PERSIST_STATE, load_state
 from ministack.core.responses import (
+    AccountRegionScopedDict,
     AccountScopedDict,
     error_response_json,
     get_account_id,
@@ -25,17 +26,17 @@ logger = logging.getLogger("ecr")
 
 REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 
-_repositories = AccountScopedDict()
-_images = AccountScopedDict()
-_lifecycle_policies = AccountScopedDict()
-_repo_policies = AccountScopedDict()
+_repositories = AccountRegionScopedDict()
+_images = AccountRegionScopedDict()
+_lifecycle_policies = AccountRegionScopedDict()
+_repo_policies = AccountRegionScopedDict()
 # Docker Registry HTTP API V2 backing storage.
 # _layer_blobs[repo] = {digest: bytes}     — finalised layer + config bytes addressable by digest.
 # _manifest_blobs[repo] = {digest: bytes}  — raw manifest bytes addressable by digest (for HEAD/GET by digest).
 # _uploads[repo] = {upload_uuid: bytearray} — in-flight chunked uploads (cleared on PUT).
-_layer_blobs = AccountScopedDict()
-_manifest_blobs = AccountScopedDict()
-_uploads = AccountScopedDict()
+_layer_blobs = AccountRegionScopedDict()
+_manifest_blobs = AccountRegionScopedDict()
+_uploads = AccountRegionScopedDict()
 
 
 # ── Persistence ────────────────────────────────────────────

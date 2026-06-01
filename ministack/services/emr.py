@@ -24,6 +24,7 @@ import time
 
 from ministack.core.persistence import PERSIST_STATE, load_state
 from ministack.core.responses import (
+    AccountRegionScopedDict,
     AccountScopedDict,
     error_response_json,
     get_account_id,
@@ -40,8 +41,8 @@ REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 # State
 # ---------------------------------------------------------------------------
 
-_clusters = AccountScopedDict()   # cluster_id -> cluster record
-_steps = AccountScopedDict()      # cluster_id -> [step records]
+_clusters = AccountRegionScopedDict()   # cluster_id -> cluster record
+_steps = AccountRegionScopedDict()      # cluster_id -> [step records]
 _block_public_access: dict = {
     "BlockPublicSecurityGroupRules": False,
     "PermittedPublicSecurityGroupRuleRanges": [],

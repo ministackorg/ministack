@@ -39,18 +39,18 @@ from email.policy import default as default_policy
 from urllib.parse import parse_qs, unquote
 
 from ministack.core.persistence import PERSIST_STATE, load_state
-from ministack.core.responses import AccountScopedDict, get_account_id, get_region, new_uuid
+from ministack.core.responses import AccountRegionScopedDict, get_account_id, get_region, new_uuid
 
 logger = logging.getLogger("ses")
 
 REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 
-_identities = AccountScopedDict()
+_identities = AccountRegionScopedDict()
 # Per-account sent-mail record. AccountScopedDict under "entries" so the list
 # manipulation stays simple but GetSendStatistics / inspection is scoped.
-_sent_emails = AccountScopedDict()
-_templates = AccountScopedDict()
-_configuration_sets = AccountScopedDict()
+_sent_emails = AccountRegionScopedDict()
+_templates = AccountRegionScopedDict()
+_configuration_sets = AccountRegionScopedDict()
 
 
 def _sent_emails_list() -> list:

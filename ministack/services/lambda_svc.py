@@ -49,6 +49,7 @@ from urllib.parse import unquote
 from ministack.core.lambda_runtime import get_or_create_worker, invalidate_worker
 from ministack.core.persistence import PERSIST_STATE, load_state
 from ministack.core.responses import (
+    AccountRegionScopedDict,
     _12_DIGIT_RE,
     AccountScopedDict,
     _request_account_id,
@@ -187,10 +188,10 @@ def _get_docker_client():
     except Exception:
         return None
 
-_functions = AccountScopedDict()  # function_name -> FunctionRecord
-_layers = AccountScopedDict()  # layer_name -> {"versions": [...], "next_version": int}
-_esms = AccountScopedDict()  # uuid -> esm dict
-_function_urls = AccountScopedDict()  # function_name -> FunctionUrlConfig dict
+_functions = AccountRegionScopedDict()  # function_name -> FunctionRecord
+_layers = AccountRegionScopedDict()  # layer_name -> {"versions": [...], "next_version": int}
+_esms = AccountRegionScopedDict()  # uuid -> esm dict
+_function_urls = AccountRegionScopedDict()  # function_name -> FunctionUrlConfig dict
 _poller_started = False
 _poller_lock = threading.Lock()
 
@@ -199,8 +200,8 @@ _poller_lock = threading.Lock()
 
 def get_state():
     """Return JSON-serializable state. code_zip bytes are base64-encoded."""
-    from ministack.core.responses import AccountScopedDict
-    funcs = AccountScopedDict()
+    from ministack.core.responses import AccountRegionScopedDict
+    funcs = AccountRegionScopedDict()
     # Iterate _data directly to capture ALL accounts, not just current request context
     for scoped_key, func in _functions._data.items():
         f = copy.deepcopy(func)
@@ -226,7 +227,7 @@ def get_state():
 
 def restore_state(data):
     if data:
-        from ministack.core.responses import AccountScopedDict
+        from ministack.core.responses import AccountRegionScopedDict
         funcs = data.get("functions", {})
         if isinstance(funcs, AccountScopedDict):
             for scoped_key, func in funcs._data.items():
@@ -4342,9 +4343,9 @@ def _delete_esm(esm_id: str):
 # ---------------------------------------------------------------------------
 
 # Per-ESM Kinesis iterator tracking: esm_uuid -> {shard_id: position}
-_kinesis_positions = AccountScopedDict()
+_kinesis_positions = AccountRegionScopedDict()
 # Per-ESM DynamoDB stream tracking: esm_uuid -> {shard_id: position}
-_dynamodb_stream_positions = AccountScopedDict()
+_dynamodb_stream_positions = AccountRegionScopedDict()
 _dynamodb_stream_positions_lock = threading.Lock()
 
 

@@ -18,7 +18,7 @@ import logging
 import time
 
 from ministack.core.persistence import load_state
-from ministack.core.responses import AccountScopedDict, get_account_id, get_region, new_uuid
+from ministack.core.responses import AccountRegionScopedDict, get_account_id, get_region, new_uuid
 
 logger = logging.getLogger("backup")
 
@@ -26,10 +26,10 @@ logger = logging.getLogger("backup")
 # State
 # ---------------------------------------------------------------------------
 
-_vaults     = AccountScopedDict()     # vault_name -> vault record
-_plans      = AccountScopedDict()     # plan_id -> plan record
-_selections = AccountScopedDict()     # selection_id -> selection record
-_jobs       = AccountScopedDict()     # job_id -> job record
+_vaults     = AccountRegionScopedDict()     # vault_name -> vault record
+_plans      = AccountRegionScopedDict()     # plan_id -> plan record
+_selections = AccountRegionScopedDict()     # selection_id -> selection record
+_jobs       = AccountRegionScopedDict()     # job_id -> job record
 
 
 def reset():

@@ -11,6 +11,7 @@ import time
 import xml.etree.ElementTree as ET
 
 from ministack.core.responses import (
+    AccountRegionScopedDict,
     AccountScopedDict,
     error_response_json,
     get_account_id,
@@ -25,14 +26,14 @@ logger = logging.getLogger("servicediscovery")
 REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 
 # In-memory state
-_namespaces = AccountScopedDict()     # ns_id -> namespace dict
-_services = AccountScopedDict()       # svc_id -> service dict
-_instances = AccountScopedDict()      # svc_id -> {instance_id -> instance dict}
-_operations = AccountScopedDict()     # op_id -> operation dict
-_resource_tags = AccountScopedDict()  # resource_arn -> [{"Key": ..., "Value": ...}]
-_service_attributes = AccountScopedDict()      # svc_id -> {key: value}
-_instance_health_status = AccountScopedDict()  # svc_id -> {instance_id: status}
-_instances_revision = AccountScopedDict()      # svc_id -> int
+_namespaces = AccountRegionScopedDict()     # ns_id -> namespace dict
+_services = AccountRegionScopedDict()       # svc_id -> service dict
+_instances = AccountRegionScopedDict()      # svc_id -> {instance_id -> instance dict}
+_operations = AccountRegionScopedDict()     # op_id -> operation dict
+_resource_tags = AccountRegionScopedDict()  # resource_arn -> [{"Key": ..., "Value": ...}]
+_service_attributes = AccountRegionScopedDict()      # svc_id -> {key: value}
+_instance_health_status = AccountRegionScopedDict()  # svc_id -> {instance_id: status}
+_instances_revision = AccountRegionScopedDict()      # svc_id -> int
 
 
 def get_state():

@@ -15,14 +15,14 @@ import threading
 import time
 
 from ministack.core.persistence import load_state
-from ministack.core.responses import AccountScopedDict, get_account_id, get_region, new_uuid
+from ministack.core.responses import AccountRegionScopedDict, get_account_id, get_region, new_uuid
 
 logger = logging.getLogger("pipes")
 
 REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 
-_pipes = AccountScopedDict()       # pipe_name -> pipe record
-_positions = AccountScopedDict()   # pipe_arn -> next stream record index
+_pipes = AccountRegionScopedDict()       # pipe_name -> pipe record
+_positions = AccountRegionScopedDict()   # pipe_arn -> next stream record index
 _poller_started = False
 _poller_lock = threading.Lock()
 

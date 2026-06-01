@@ -70,6 +70,7 @@ from defusedxml.ElementTree import fromstring as safe_xml_parse
 
 from ministack.core.persistence import PERSIST_STATE, load_state
 from ministack.core.responses import (
+    AccountRegionScopedDict,
     AccountScopedDict,
     error_response_json,
     get_account_id,
@@ -211,7 +212,7 @@ _SAML_NS = {
 # In-memory state — User Pools (cognito-idp)
 # ---------------------------------------------------------------------------
 
-_user_pools = AccountScopedDict()
+_user_pools = AccountRegionScopedDict()
 # pool_id -> {
 #   Id, Name, Arn, CreationDate, LastModifiedDate, Status,
 #   Policies, Schema, AutoVerifiedAttributes, UsernameAttributes,
@@ -224,7 +225,7 @@ _user_pools = AccountScopedDict()
 #   _identity_providers: {provider_name -> provider_dict},
 # }
 
-_pool_domain_map = AccountScopedDict()   # domain -> pool_id
+_pool_domain_map = AccountRegionScopedDict()   # domain -> pool_id
 
 # ---------------------------------------------------------------------------
 # In-memory state — OAuth2 Authorization Codes & Refresh Tokens
@@ -237,7 +238,7 @@ _refresh_tokens: dict[str, dict] = {}        # refresh_token_value -> {pool_id, 
 # In-memory state — Identity Pools (cognito-identity)
 # ---------------------------------------------------------------------------
 
-_identity_pools = AccountScopedDict()
+_identity_pools = AccountRegionScopedDict()
 # identity_pool_id -> {
 #   IdentityPoolId, IdentityPoolName, AllowUnauthenticatedIdentities,
 #   SupportedLoginProviders, DeveloperProviderName,
@@ -247,7 +248,7 @@ _identity_pools = AccountScopedDict()
 #   _identities: {identity_id -> identity_dict},
 # }
 
-_identity_tags = AccountScopedDict()   # identity_pool_id -> {key: value}
+_identity_tags = AccountRegionScopedDict()   # identity_pool_id -> {key: value}
 
 # ---------------------------------------------------------------------------
 # In-memory state — OAuth2 authorization codes

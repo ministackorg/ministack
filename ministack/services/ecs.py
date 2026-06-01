@@ -33,6 +33,7 @@ import time
 
 from ministack.core.persistence import load_state
 from ministack.core.responses import (
+    AccountRegionScopedDict,
     AccountScopedDict,
     error_response_json,
     get_account_id,
@@ -47,20 +48,20 @@ logger = logging.getLogger("ecs")
 
 REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 
-_clusters = AccountScopedDict()
-_task_defs = AccountScopedDict()
-_task_def_latest = AccountScopedDict()
-_services = AccountScopedDict()
-_tasks = AccountScopedDict()
-_tags = AccountScopedDict()
-_account_settings = AccountScopedDict()
-_capacity_providers = AccountScopedDict()
+_clusters = AccountRegionScopedDict()
+_task_defs = AccountRegionScopedDict()
+_task_def_latest = AccountRegionScopedDict()
+_services = AccountRegionScopedDict()
+_tasks = AccountRegionScopedDict()
+_tags = AccountRegionScopedDict()
+_account_settings = AccountRegionScopedDict()
+_capacity_providers = AccountRegionScopedDict()
 # `_attributes` was originally declared next to its handler block much
 # further down the file. Moved up here so the import-time `load_state`
 # block (which calls `restore_state` and references `_attributes`) sees
 # it defined; otherwise warm-boot fires NameError, the surrounding
 # try/except swallows it, and ALL ECS state silently fails to restore.
-_attributes = AccountScopedDict()
+_attributes = AccountRegionScopedDict()
 
 _docker = None
 
@@ -120,8 +121,8 @@ def get_state():
     }
     # Save tasks but strip Docker container IDs.
     # Iterate _data directly to capture ALL accounts.
-    from ministack.core.responses import AccountScopedDict
-    tasks = AccountScopedDict()
+    from ministack.core.responses import AccountRegionScopedDict
+    tasks = AccountRegionScopedDict()
     for scoped_key, task in _tasks._data.items():
         t = copy.deepcopy(task)
         t.pop("_docker_ids", None)
@@ -142,7 +143,7 @@ def restore_state(data):
     _account_settings.update(data.get("account_settings", {}))
     _capacity_providers.update(data.get("capacity_providers", {}))
     _attributes.update(data.get("attributes", {}))
-    from ministack.core.responses import AccountScopedDict
+    from ministack.core.responses import AccountRegionScopedDict
     tasks_data = data.get("tasks", {})
     if isinstance(tasks_data, AccountScopedDict):
         for scoped_key, task in tasks_data._data.items():

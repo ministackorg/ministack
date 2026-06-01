@@ -33,6 +33,7 @@ import time
 from datetime import datetime, timedelta, timezone
 
 from ministack.core.responses import (
+    AccountRegionScopedDict,
     AccountScopedDict,
     error_response_json,
     get_account_id,
@@ -70,21 +71,21 @@ from ministack.core.persistence import PERSIST_STATE, load_state
 # Per-account bus registry. The "default" bus is lazily created per account
 # on first access so every tenant has its own default bus with an ARN whose
 # account-id segment matches the caller.
-_event_buses = AccountScopedDict()
-_rules = AccountScopedDict()
-_targets = AccountScopedDict()
+_event_buses = AccountRegionScopedDict()
+_rules = AccountRegionScopedDict()
+_targets = AccountRegionScopedDict()
 # Per-account event log — AccountScopedDict under "entries" keeps the list
 # semantics while scoping reads to the caller's account.
-_events_log = AccountScopedDict()
-_tags = AccountScopedDict()
-_archives = AccountScopedDict()
-_event_bus_policies = AccountScopedDict()  # bus_name -> {Statement: [...]}
-_connections = AccountScopedDict()         # connection_name -> {...}
-_api_destinations = AccountScopedDict()    # destination_name -> {...}
-_replays = AccountScopedDict()              # replay_name -> replay record
-_endpoints = AccountScopedDict()            # endpoint name -> endpoint record
+_events_log = AccountRegionScopedDict()
+_tags = AccountRegionScopedDict()
+_archives = AccountRegionScopedDict()
+_event_bus_policies = AccountRegionScopedDict()  # bus_name -> {Statement: [...]}
+_connections = AccountRegionScopedDict()         # connection_name -> {...}
+_api_destinations = AccountRegionScopedDict()    # destination_name -> {...}
+_replays = AccountRegionScopedDict()              # replay_name -> replay record
+_endpoints = AccountRegionScopedDict()            # endpoint name -> endpoint record
 # Partner event sources, per-account (key: "account|name" pattern inside each tenant).
-_partner_event_sources = AccountScopedDict()
+_partner_event_sources = AccountRegionScopedDict()
 
 # Tracks when each scheduled rule last fired: {(account_id, rule_key): timestamp}.
 # Plain dict (not AccountScopedDict) because the scheduler thread owns it globally.

@@ -16,6 +16,7 @@ import time
 from datetime import datetime, timezone
 
 from ministack.core.responses import (
+    AccountRegionScopedDict,
     AccountScopedDict,
     error_response_json,
     get_account_id,
@@ -31,9 +32,9 @@ DEFAULT_PAGE_SIZE = 10
 
 from ministack.core.persistence import PERSIST_STATE, load_state
 
-_parameters = AccountScopedDict()
-_parameter_history = AccountScopedDict()
-_tags = AccountScopedDict()
+_parameters = AccountRegionScopedDict()
+_parameter_history = AccountRegionScopedDict()
+_tags = AccountRegionScopedDict()
 
 
 # ── Persistence ────────────────────────────────────────────

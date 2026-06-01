@@ -25,7 +25,7 @@ import string
 import time
 
 from ministack.core.persistence import PERSIST_STATE, load_state
-from ministack.core.responses import AccountScopedDict, get_account_id, get_region
+from ministack.core.responses import AccountRegionScopedDict, get_account_id, get_region
 
 logger = logging.getLogger("efs")
 
@@ -35,9 +35,9 @@ REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 # State
 # ---------------------------------------------------------------------------
 
-_file_systems = AccountScopedDict()    # fs_id -> fs record
-_mount_targets = AccountScopedDict()   # mt_id -> mount target record
-_access_points = AccountScopedDict()   # ap_id -> access point record
+_file_systems = AccountRegionScopedDict()    # fs_id -> fs record
+_mount_targets = AccountRegionScopedDict()   # mt_id -> mount target record
+_access_points = AccountRegionScopedDict()   # ap_id -> access point record
 
 # ---------------------------------------------------------------------------
 # ID generators
@@ -373,8 +373,8 @@ def _find_resource(resource_id):
 # Lifecycle / Backup / Account (stubs)
 # ---------------------------------------------------------------------------
 
-_lifecycle_configs = AccountScopedDict()
-_backup_policies = AccountScopedDict()
+_lifecycle_configs = AccountRegionScopedDict()
+_backup_policies = AccountRegionScopedDict()
 
 
 def get_state():

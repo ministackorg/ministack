@@ -40,6 +40,7 @@ from datetime import datetime, timezone
 
 from ministack.core.persistence import PERSIST_STATE, load_state
 from ministack.core.responses import (
+    AccountRegionScopedDict,
     AccountScopedDict,
     error_response_json,
     get_account_id,
@@ -72,7 +73,7 @@ _SFN_WAIT_SCALE = _parse_wait_scale()
 REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 
 # SFN mock config — compatible with LocalStack's SFN_MOCK_CONFIG / LOCALSTACK_SFN_MOCK_CONFIG
-_sfn_mock_config = AccountScopedDict()
+_sfn_mock_config = AccountRegionScopedDict()
 _sfn_mock_config_path = (
     os.environ.get("SFN_MOCK_CONFIG")
     or os.environ.get("LOCALSTACK_SFN_MOCK_CONFIG")
@@ -119,24 +120,24 @@ def _get_mock_response(sm_name: str, test_case: str, state_name: str, attempt: i
                 continue
     return None
 
-_state_machines = AccountScopedDict()
-_executions = AccountScopedDict()
-_task_tokens = AccountScopedDict()
-_tags = AccountScopedDict()
-_activities = AccountScopedDict()
-_activity_tasks = AccountScopedDict()
+_state_machines = AccountRegionScopedDict()
+_executions = AccountRegionScopedDict()
+_task_tokens = AccountRegionScopedDict()
+_tags = AccountRegionScopedDict()
+_activities = AccountRegionScopedDict()
+_activity_tasks = AccountRegionScopedDict()
 
 # version_arn -> {stateMachineVersionArn, stateMachineRevisionId,
 #                 description, creationDate, definition, roleArn, type,
 #                 loggingConfiguration}
 # Version ARN shape: arn:aws:states:<region>:<acct>:stateMachine:<name>:<N>
-_state_machine_versions = AccountScopedDict()
+_state_machine_versions = AccountRegionScopedDict()
 
 # alias_arn -> {stateMachineAliasArn, name, description,
 #               routingConfiguration: [{stateMachineVersionArn, weight}],
 #               creationDate, updateDate}
 # Alias ARN shape: arn:aws:states:<region>:<acct>:stateMachine:<name>:<aliasName>
-_state_machine_aliases = AccountScopedDict()
+_state_machine_aliases = AccountRegionScopedDict()
 
 # ── Persistence ────────────────────────────────────────────
 

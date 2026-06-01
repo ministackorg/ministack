@@ -23,6 +23,7 @@ import time
 
 from ministack.core.persistence import PERSIST_STATE, load_state
 from ministack.core.responses import (
+    AccountRegionScopedDict,
     AccountScopedDict,
     error_response_json,
     get_account_id,
@@ -95,20 +96,20 @@ def _is_spark_job(job):
     cmd_name = job.get("Command", {}).get("Name", "")
     return cmd_name in ("glueetl", "gluestreaming")
 
-_databases = AccountScopedDict()
-_tables = AccountScopedDict()       # "db_name/table_name" -> table dict
-_partitions = AccountScopedDict()   # "db_name/table_name" -> [partition, ...]
-_partition_indexes = AccountScopedDict()  # "db_name/table_name" -> [index, ...]
-_connections = AccountScopedDict()
-_crawlers = AccountScopedDict()
-_jobs = AccountScopedDict()
-_job_runs = AccountScopedDict()     # job_name -> [run, ...]
-_tags = AccountScopedDict()         # arn -> {key: value, ...}
-_security_configs = AccountScopedDict()
-_classifiers = AccountScopedDict()
-_triggers = AccountScopedDict()     # trigger_name -> trigger dict
-_workflows = AccountScopedDict()    # workflow_name -> workflow dict
-_workflow_runs = AccountScopedDict() # workflow_name -> [run, ...]
+_databases = AccountRegionScopedDict()
+_tables = AccountRegionScopedDict()       # "db_name/table_name" -> table dict
+_partitions = AccountRegionScopedDict()   # "db_name/table_name" -> [partition, ...]
+_partition_indexes = AccountRegionScopedDict()  # "db_name/table_name" -> [index, ...]
+_connections = AccountRegionScopedDict()
+_crawlers = AccountRegionScopedDict()
+_jobs = AccountRegionScopedDict()
+_job_runs = AccountRegionScopedDict()     # job_name -> [run, ...]
+_tags = AccountRegionScopedDict()         # arn -> {key: value, ...}
+_security_configs = AccountRegionScopedDict()
+_classifiers = AccountRegionScopedDict()
+_triggers = AccountRegionScopedDict()     # trigger_name -> trigger dict
+_workflows = AccountRegionScopedDict()    # workflow_name -> workflow dict
+_workflow_runs = AccountRegionScopedDict() # workflow_name -> [run, ...]
 
 _ALL_STATE = {
     "databases": _databases,

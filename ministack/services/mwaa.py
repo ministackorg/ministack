@@ -23,6 +23,7 @@ import time
 
 from ministack.core.persistence import load_state
 from ministack.core.responses import (
+    AccountRegionScopedDict,
     AccountScopedDict,
     apply_image_prefix,
     error_response_json,
@@ -39,7 +40,7 @@ MWAA_PERSIST = os.environ.get("MWAA_PERSIST", "0").lower() in ("1", "true", "yes
 DOCKER_NETWORK = os.environ.get("DOCKER_NETWORK", "")
 DEFAULT_AIRFLOW_IMAGE = os.environ.get("MWAA_AIRFLOW_IMAGE", "apache/airflow:3.0.6")
 
-_environments = AccountScopedDict()
+_environments = AccountRegionScopedDict()
 _port_counter = [BASE_PORT]
 _allocated_ports: set[int] = set()
 _freed_ports: list[int] = []

@@ -21,7 +21,7 @@ from datetime import datetime, timezone
 from urllib.parse import parse_qs
 
 from ministack.core.persistence import PERSIST_STATE, load_state
-from ministack.core.responses import AccountScopedDict, get_account_id, get_region, new_uuid
+from ministack.core.responses import AccountRegionScopedDict, get_account_id, get_region, new_uuid
 
 logger = logging.getLogger("cloudwatch")
 
@@ -31,15 +31,15 @@ TWO_WEEKS_SECONDS = 14 * 24 * 3600
 # Per-tenant metric store — keyed by (namespace, metric_name, dims_key) per
 # account via AccountScopedDict so GetMetricStatistics / ListMetrics from one
 # account cannot see another account's data points.
-_metrics = AccountScopedDict()
-_alarms = AccountScopedDict()
-_composite_alarms = AccountScopedDict()
+_metrics = AccountRegionScopedDict()
+_alarms = AccountRegionScopedDict()
+_composite_alarms = AccountRegionScopedDict()
 # Alarm state-change history, per-account. Stored as AccountScopedDict under
 # a single key "entries" so the standard list manipulation still applies to
 # the caller's tenant only.
-_alarm_history = AccountScopedDict()
-_resource_tags = AccountScopedDict()
-_dashboards = AccountScopedDict()  # dashboard_name -> {DashboardName, DashboardBody, LastModified}
+_alarm_history = AccountRegionScopedDict()
+_resource_tags = AccountRegionScopedDict()
+_dashboards = AccountRegionScopedDict()  # dashboard_name -> {DashboardName, DashboardBody, LastModified}
 
 
 def _metric_bucket(key: tuple) -> list:

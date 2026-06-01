@@ -43,7 +43,7 @@ from urllib.parse import parse_qs
 from xml.sax.saxutils import escape as _esc
 
 from ministack.core.persistence import load_state
-from ministack.core.responses import AccountScopedDict, apply_image_prefix, get_account_id, get_region, new_uuid
+from ministack.core.responses import AccountRegionScopedDict, apply_image_prefix, get_account_id, get_region, new_uuid
 
 logger = logging.getLogger("rds")
 
@@ -53,16 +53,16 @@ RDS_TMPFS_SIZE = os.environ.get("RDS_TMPFS_SIZE", "256m")
 RDS_PERSIST = os.environ.get("RDS_PERSIST", "0").lower() in ("1", "true", "yes")
 DOCKER_NETWORK = os.environ.get("DOCKER_NETWORK", "")
 
-_instances = AccountScopedDict()
-_clusters = AccountScopedDict()
-_subnet_groups = AccountScopedDict()
-_param_groups = AccountScopedDict()
-_snapshots = AccountScopedDict()
-_db_cluster_param_groups = AccountScopedDict()
-_db_cluster_snapshots = AccountScopedDict()
-_option_groups = AccountScopedDict()
-_global_clusters = AccountScopedDict()
-_tags = AccountScopedDict()
+_instances = AccountRegionScopedDict()
+_clusters = AccountRegionScopedDict()
+_subnet_groups = AccountRegionScopedDict()
+_param_groups = AccountRegionScopedDict()
+_snapshots = AccountRegionScopedDict()
+_db_cluster_param_groups = AccountRegionScopedDict()
+_db_cluster_snapshots = AccountRegionScopedDict()
+_option_groups = AccountRegionScopedDict()
+_global_clusters = AccountRegionScopedDict()
+_tags = AccountRegionScopedDict()
 _port_counter = [BASE_PORT]
 
 _docker = None
@@ -109,7 +109,7 @@ def restore_state(data):
     instances_data = data.get("instances", {})
     to_respawn = []
     if isinstance(instances_data, AccountScopedDict):
-        # New format: AccountScopedDict with full multi-account data
+        # New format: AccountRegionScopedDict with full multi-account data
         for key, inst in list(instances_data._data.items()):
             inst["_docker_container_id"] = None
             inst["DBInstanceStatus"] = "creating"

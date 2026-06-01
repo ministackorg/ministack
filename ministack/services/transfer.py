@@ -44,6 +44,7 @@ from typing import AsyncIterator, Optional
 
 from ministack.core.persistence import load_state
 from ministack.core.responses import (
+    AccountRegionScopedDict,
     AccountScopedDict,
     error_response_json,
     get_account_id,
@@ -75,8 +76,8 @@ REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 # ---------------------------------------------------------------------------
 # In-memory state
 # ---------------------------------------------------------------------------
-_servers = AccountScopedDict()  # server_id -> server record
-_users = AccountScopedDict()    # "{server_id}/{user_name}" -> user record
+_servers = AccountRegionScopedDict()  # server_id -> server record
+_users = AccountRegionScopedDict()    # "{server_id}/{user_name}" -> user record
 
 
 def reset():

@@ -21,17 +21,17 @@ import os
 import time
 
 from ministack.core.persistence import load_state
-from ministack.core.responses import AccountScopedDict, get_account_id, get_region, new_uuid
+from ministack.core.responses import AccountRegionScopedDict, get_account_id, get_region, new_uuid
 
 logger = logging.getLogger("cloudtrail")
 
 _recording_enabled: bool = os.environ.get("CLOUDTRAIL_RECORDING", "0") == "1"
 _MAX_EVENTS: int = int(os.environ.get("CLOUDTRAIL_MAX_EVENTS", "10000"))
 
-_events = AccountScopedDict()           # "events" -> deque[event_dict]
-_trails = AccountScopedDict()           # trail_name -> trail_record
-_event_selectors = AccountScopedDict()  # trail_name -> list[EventSelector]
-_trail_tags = AccountScopedDict()       # trail_arn -> {tag_key: tag_value}
+_events = AccountRegionScopedDict()           # "events" -> deque[event_dict]
+_trails = AccountRegionScopedDict()           # trail_name -> trail_record
+_event_selectors = AccountRegionScopedDict()  # trail_name -> list[EventSelector]
+_trail_tags = AccountRegionScopedDict()       # trail_arn -> {tag_key: tag_value}
 
 _SCRUB_KEYS = frozenset(
     {

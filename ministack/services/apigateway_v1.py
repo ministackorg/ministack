@@ -79,7 +79,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-from ministack.core.responses import AccountScopedDict, get_account_id, get_region, new_uuid
+from ministack.core.responses import AccountRegionScopedDict, get_account_id, get_region, new_uuid
 from ministack.services.apigateway import _timeout_from_env, _urlopen_async
 
 
@@ -97,19 +97,19 @@ REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 # ---- Module-level state ----
 # All per-tenant state uses AccountScopedDict so the same REST API id in two
 # different accounts never collides and list operations don't leak cross-account.
-_rest_apis = AccountScopedDict()           # rest_api_id -> RestApi
-_resources = AccountScopedDict()           # rest_api_id -> {resource_id -> Resource}
-_stages_v1 = AccountScopedDict()           # rest_api_id -> {stage_name -> Stage}
-_deployments_v1 = AccountScopedDict()      # rest_api_id -> {deployment_id -> Deployment}
-_authorizers_v1 = AccountScopedDict()      # rest_api_id -> {authorizer_id -> Authorizer}
-_models = AccountScopedDict()              # rest_api_id -> {model_id -> Model}
-_api_keys = AccountScopedDict()            # key_id -> ApiKey
-_usage_plans = AccountScopedDict()         # plan_id -> UsagePlan
-_usage_plan_keys = AccountScopedDict()     # plan_id -> {key_id -> UsagePlanKey}
-_domain_names = AccountScopedDict()        # domain_name -> DomainName
-_base_path_mappings = AccountScopedDict()  # domain_name -> {base_path -> BasePathMapping}
-_v1_tags = AccountScopedDict()             # resource_arn -> {key -> value}
-_account_settings = AccountScopedDict()    # singleton per account: stores fields set via UpdateAccount
+_rest_apis = AccountRegionScopedDict()           # rest_api_id -> RestApi
+_resources = AccountRegionScopedDict()           # rest_api_id -> {resource_id -> Resource}
+_stages_v1 = AccountRegionScopedDict()           # rest_api_id -> {stage_name -> Stage}
+_deployments_v1 = AccountRegionScopedDict()      # rest_api_id -> {deployment_id -> Deployment}
+_authorizers_v1 = AccountRegionScopedDict()      # rest_api_id -> {authorizer_id -> Authorizer}
+_models = AccountRegionScopedDict()              # rest_api_id -> {model_id -> Model}
+_api_keys = AccountRegionScopedDict()            # key_id -> ApiKey
+_usage_plans = AccountRegionScopedDict()         # plan_id -> UsagePlan
+_usage_plan_keys = AccountRegionScopedDict()     # plan_id -> {key_id -> UsagePlanKey}
+_domain_names = AccountRegionScopedDict()        # domain_name -> DomainName
+_base_path_mappings = AccountRegionScopedDict()  # domain_name -> {base_path -> BasePathMapping}
+_v1_tags = AccountRegionScopedDict()             # resource_arn -> {key -> value}
+_account_settings = AccountRegionScopedDict()    # singleton per account: stores fields set via UpdateAccount
 
 
 # ---- Helpers ----

@@ -42,6 +42,7 @@ from typing import Awaitable, Callable
 
 from ministack.core.persistence import load_state
 from ministack.core.responses import (
+    AccountRegionScopedDict,
     AccountScopedDict,
     _request_account_id,
     error_response_json,
@@ -69,11 +70,11 @@ _NAME_RE = re.compile(r"^[a-zA-Z0-9:_-]{1,128}$")
 # Module-level state (account-scoped)
 # ---------------------------------------------------------------------------
 
-_things: AccountScopedDict = AccountScopedDict()  # thingName -> Thing dict
-_thing_types: AccountScopedDict = AccountScopedDict()
-_thing_groups: AccountScopedDict = AccountScopedDict()
-_certificates: AccountScopedDict = AccountScopedDict()  # certificateId -> Certificate dict
-_policies: AccountScopedDict = AccountScopedDict()  # policyName -> Policy dict
+_things: AccountRegionScopedDict = AccountRegionScopedDict()  # thingName -> Thing dict
+_thing_types: AccountRegionScopedDict = AccountRegionScopedDict()
+_thing_groups: AccountRegionScopedDict = AccountRegionScopedDict()
+_certificates: AccountRegionScopedDict = AccountRegionScopedDict()  # certificateId -> Certificate dict
+_policies: AccountRegionScopedDict = AccountRegionScopedDict()  # policyName -> Policy dict
 
 # Local CA state — lazily generated on first use, persisted across restarts.
 import threading

@@ -43,6 +43,7 @@ from defusedxml.ElementTree import fromstring
 
 from ministack.core.persistence import PERSIST_STATE, load_state
 from ministack.core.responses import (
+    AccountRegionScopedDict,
     AccountScopedDict,
     get_account_id,
     iso_to_rfc7231,
@@ -60,31 +61,31 @@ XML_DECL = b'<?xml version="1.0" encoding="UTF-8"?>'
 # ---------------------------------------------------------------------------
 # In-memory storage
 # ---------------------------------------------------------------------------
-_buckets = AccountScopedDict()
+_buckets = AccountRegionScopedDict()
 
-_bucket_policies = AccountScopedDict()
-_bucket_notifications = AccountScopedDict()
-_bucket_tags = AccountScopedDict()
-_bucket_versioning = AccountScopedDict()
-_bucket_encryption = AccountScopedDict()
-_bucket_lifecycle = AccountScopedDict()
-_bucket_cors = AccountScopedDict()
-_bucket_acl = AccountScopedDict()
-_bucket_websites = AccountScopedDict()
-_bucket_logging_config = AccountScopedDict()
-_bucket_accelerate_config = AccountScopedDict()
-_bucket_request_payment_config = AccountScopedDict()
+_bucket_policies = AccountRegionScopedDict()
+_bucket_notifications = AccountRegionScopedDict()
+_bucket_tags = AccountRegionScopedDict()
+_bucket_versioning = AccountRegionScopedDict()
+_bucket_encryption = AccountRegionScopedDict()
+_bucket_lifecycle = AccountRegionScopedDict()
+_bucket_cors = AccountRegionScopedDict()
+_bucket_acl = AccountRegionScopedDict()
+_bucket_websites = AccountRegionScopedDict()
+_bucket_logging_config = AccountRegionScopedDict()
+_bucket_accelerate_config = AccountRegionScopedDict()
+_bucket_request_payment_config = AccountRegionScopedDict()
 
-_object_tags = AccountScopedDict()
-_object_acl = AccountScopedDict()  # (bucket, key) -> stored ACL XML string
-_object_versions = AccountScopedDict()  # (bucket, key) -> [{version_id, obj_record}, ...]
+_object_tags = AccountRegionScopedDict()
+_object_acl = AccountRegionScopedDict()  # (bucket, key) -> stored ACL XML string
+_object_versions = AccountRegionScopedDict()  # (bucket, key) -> [{version_id, obj_record}, ...]
 
-_bucket_object_lock = AccountScopedDict()
-_bucket_replication = AccountScopedDict()
-_object_retention = AccountScopedDict()
-_object_legal_hold = AccountScopedDict()
+_bucket_object_lock = AccountRegionScopedDict()
+_bucket_replication = AccountRegionScopedDict()
+_object_retention = AccountRegionScopedDict()
+_object_legal_hold = AccountRegionScopedDict()
 
-_multipart_uploads = AccountScopedDict()
+_multipart_uploads = AccountRegionScopedDict()
 
 # ── Persistence (metadata only — object bodies are NOT persisted here) ────
 
@@ -116,7 +117,7 @@ _PERSISTED_BUCKET_DICTS = {
 def get_state():
     # Persist bucket metadata without object bodies.
     # Use _data directly to capture ALL accounts, not just the current one.
-    buckets_meta = AccountScopedDict()
+    buckets_meta = AccountRegionScopedDict()
     for scoped_key, bkt in _buckets._data.items():
         meta = {k: v for k, v in bkt.items() if k != "objects"}
         buckets_meta._data[scoped_key] = meta

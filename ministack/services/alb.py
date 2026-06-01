@@ -28,7 +28,7 @@ import time
 from urllib.parse import parse_qs
 
 from ministack.core.persistence import PERSIST_STATE, load_state
-from ministack.core.responses import AccountScopedDict, get_account_id, get_region, new_uuid
+from ministack.core.responses import AccountRegionScopedDict, get_account_id, get_region, new_uuid
 
 logger = logging.getLogger("alb")
 
@@ -38,15 +38,15 @@ NS = "http://elasticloadbalancing.amazonaws.com/doc/2015-12-01/"
 # ---------------------------------------------------------------------------
 # State
 # ---------------------------------------------------------------------------
-_lbs = AccountScopedDict()        # lb_arn   -> LB record
-_tgs = AccountScopedDict()        # tg_arn   -> TG record
-_listeners = AccountScopedDict()  # l_arn    -> Listener record
-_rules = AccountScopedDict()      # r_arn    -> Rule record
-_targets = AccountScopedDict()    # tg_arn   -> [target dict]
-_tags = AccountScopedDict()       # res_arn  -> [{Key, Value}]
-_lb_attrs = AccountScopedDict()   # lb_arn   -> [{Key, Value}]
-_tg_attrs = AccountScopedDict()   # tg_arn   -> [{Key, Value}]
-_listener_attrs = AccountScopedDict()  # l_arn -> [{Key, Value}]
+_lbs = AccountRegionScopedDict()        # lb_arn   -> LB record
+_tgs = AccountRegionScopedDict()        # tg_arn   -> TG record
+_listeners = AccountRegionScopedDict()  # l_arn    -> Listener record
+_rules = AccountRegionScopedDict()      # r_arn    -> Rule record
+_targets = AccountRegionScopedDict()    # tg_arn   -> [target dict]
+_tags = AccountRegionScopedDict()       # res_arn  -> [{Key, Value}]
+_lb_attrs = AccountRegionScopedDict()   # lb_arn   -> [{Key, Value}]
+_tg_attrs = AccountRegionScopedDict()   # tg_arn   -> [{Key, Value}]
+_listener_attrs = AccountRegionScopedDict()  # l_arn -> [{Key, Value}]
 
 
 def get_state():

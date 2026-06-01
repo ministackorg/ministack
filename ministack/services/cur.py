@@ -17,14 +17,15 @@ import logging
 
 from ministack.core.persistence import load_state
 from ministack.core.responses import (
+    AccountRegionScopedDict,
     AccountScopedDict,
     error_response_json,
 )
 
 logger = logging.getLogger("cur")
 
-_report_definitions = AccountScopedDict()  # report_name -> report_definition
-_report_tags = AccountScopedDict()  # report_name -> {tag_key: tag_value}
+_report_definitions = AccountRegionScopedDict()  # report_name -> report_definition
+_report_tags = AccountRegionScopedDict()  # report_name -> {tag_key: tag_value}
 
 
 def reset():
