@@ -921,6 +921,22 @@ def _path_matches(route_path: str, request_path: str) -> bool:
     return _extract_path_params(route_path, request_path) is not None
 
 
+def _v2_request_body_is_text(content_type: str | None) -> bool:
+    """Whether an HTTP API (v2) request body is delivered as a UTF-8 string.
+
+    Real AWS delivers the body as text (``isBase64Encoded`` false) only for a
+    whitelist of content types; everything else — including a missing content
+    type and ``application/x-www-form-urlencoded`` — is base64-encoded. The docs
+    don't enumerate this, so the set below was verified against live AWS.
+    """
+    ct = (content_type or "").split(";", 1)[0].strip().lower()
+    return ct.startswith("text/") or ct in (
+        "application/json",
+        "application/xml",
+        "application/javascript",
+    )
+
+
 async def _invoke_lambda_proxy(
     integration,
     api_id,
@@ -957,6 +973,15 @@ async def _invoke_lambda_proxy(
     # AWS API Gateway v2 joins multi-value query params with commas
     qs = {k: ",".join(v) for k, v in query_params.items()} if query_params else None
     raw_qs = "&".join(f"{k}={val}" for k, vals in query_params.items() for val in vals)
+    # Binary request bodies are base64-encoded with isBase64Encoded=true; only
+    # the text content types AWS recognizes are passed through as UTF-8 strings.
+    if body:
+        if _v2_request_body_is_text(headers.get("content-type")):
+            req_body, req_is_base64 = body.decode("utf-8", errors="replace"), False
+        else:
+            req_body, req_is_base64 = base64.b64encode(body).decode("ascii"), True
+    else:
+        req_body, req_is_base64 = None, False
     event = {
         "version": "2.0",
         "routeKey": route_key,
@@ -982,8 +1007,8 @@ async def _invoke_lambda_proxy(
             "timeEpoch": int(time.time() * 1000),
         },
         "pathParameters": path_params,
-        "body": body.decode("utf-8", errors="replace") if body else None,
-        "isBase64Encoded": False,
+        "body": req_body,
+        "isBase64Encoded": req_is_base64,
     }
     if authorizer_claims is not None:
         event["requestContext"]["authorizer"] = {
@@ -1027,7 +1052,13 @@ async def _invoke_lambda_proxy(
             del resp_headers[existing]
         resp_headers["Set-Cookie"] = list(cookies)
     resp_body = lambda_response.get("body", "")
-    if isinstance(resp_body, str):
+    # A base64-encoded body (isBase64Encoded=true) is decoded to its raw bytes
+    # before sending. HTTP APIs (v2) honor this unconditionally — there is no
+    # binaryMediaTypes negotiation as in REST (v1) — so a true flag always means
+    # "the body string is base64; emit the decoded bytes."
+    if lambda_response.get("isBase64Encoded") and isinstance(resp_body, str):
+        resp_body = base64.b64decode(resp_body)
+    elif isinstance(resp_body, str):
         resp_body = resp_body.encode("utf-8")
     elif isinstance(resp_body, dict):
         resp_body = json.dumps(resp_body, ensure_ascii=False).encode("utf-8")
