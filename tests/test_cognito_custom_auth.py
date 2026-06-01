@@ -325,7 +325,7 @@ def test_custom_auth_multi_round(cognito_idp, lam):
     """Three steps: InitiateAuth → Respond(magic link) → Respond(SMS OTP) → tokens."""
     create_handler = (
         "def handler(event, ctx):\n"
-        "    if len(event['request']['sessionList']) == 1:\n"
+        "    if len(event['request']['session']) == 1:\n"
         "        event['response']['publicChallengeParameters'] = {'challenge': 'MAGIC_LINK'}\n"
         "    else:\n"
         "        event['response']['publicChallengeParameters'] = {'challenge': 'SMS_OTP'}\n"
@@ -338,7 +338,7 @@ def test_custom_auth_multi_round(cognito_idp, lam):
     )
     define_handler = (
         "def handler(event, ctx):\n"
-        "    if len(event['request']['sessionList']) == 1:\n"
+        "    if len(event['request']['session']) == 1:\n"
         "        event['response']['challengeName'] = 'CUSTOM_CHALLENGE'\n"
         "    else:\n"
         "        event['response']['issueTokens'] = True\n"
@@ -655,7 +655,7 @@ def test_custom_auth_empty_answer_passed_to_lambda(cognito_idp, lam):
     )
     define_handler = (
         "def handler(event, ctx):\n"
-        "    if event['request']['sessionList'][-1].get('challengeResult'):\n"
+        "    if event['request']['session'][-1].get('challengeResult'):\n"
         "        event['response']['issueTokens'] = True\n"
         "    return event\n"
     )
@@ -863,7 +863,7 @@ def test_custom_auth_session_list_grows_across_rounds(cognito_idp, lam):
     """Each round appends one entry to session['challenges']; DefineAuth sees the correct history."""
     define_handler = (
         "def handler(event, ctx):\n"
-        "    session_len = len(event['request']['sessionList'])\n"
+        "    session_len = len(event['request']['session'])\n"
         "    event['response']['publicChallengeParameters']['round'] = str(session_len)\n"
         "    if session_len == 1:\n"
         "        event['response']['challengeName'] = 'CUSTOM_CHALLENGE'\n"
@@ -964,20 +964,29 @@ def test_custom_auth_max_attempts_exceeded(cognito_idp, lam):
 # ── Test 30: Issue #725 reproduction ─────────────────────────────────────────
 
 def test_custom_auth_issue_725_repro(cognito_idp, lam):
-    """Exact reproduction from ministackorg/ministack#725."""
+    """Exact reproduction from ministackorg/ministack#725 — exercises session[] and private-param carry-through."""
     define = (
         "def handler(event, ctx):\n"
-        "    event['response']['challengeName'] = 'CUSTOM_CHALLENGE'\n"
+        "    s = event['request']['session']\n"
+        "    if not s:\n"
+        "        event['response'].update(challengeName='CUSTOM_CHALLENGE', issueTokens=False, failAuthentication=False)\n"
+        "    elif s[-1].get('challengeResult'):\n"
+        "        event['response'].update(issueTokens=True, failAuthentication=False)\n"
+        "    else:\n"
+        "        event['response'].update(issueTokens=False, failAuthentication=True)\n"
         "    return event\n"
     )
     create = (
         "def handler(event, ctx):\n"
-        "    event['response']['publicChallengeParameters'] = {'challenge': 'MAGIC_LINK'}\n"
+        "    event['response']['publicChallengeParameters'] = {'type': 'MAGIC_LINK'}\n"
+        "    event['response']['privateChallengeParameters'] = {'answer': 'expected-token'}\n"
+        "    event['response']['challengeMetadata'] = 'MAGIC_LINK'\n"
         "    return event\n"
     )
     verify = (
         "def handler(event, ctx):\n"
-        "    event['response']['answerCorrect'] = True\n"
+        "    expected = event['request']['privateChallengeParameters']['answer']\n"
+        "    event['response']['answerCorrect'] = (event['request']['challengeAnswer'] == expected)\n"
         "    return event\n"
     )
     define_arn = _create_lambda(lam, "define-725", define)
@@ -1000,21 +1009,63 @@ def test_custom_auth_issue_725_repro(cognito_idp, lam):
         AuthFlow="CUSTOM_AUTH",
         AuthParameters={"USERNAME": "alice"},
     )
-    assert "Session" in r1
-
-    # Manually set answerCorrect to True in define to issue tokens
-    define2 = (
-        "def handler(event, ctx):\n"
-        "    event['response']['issueTokens'] = True\n"
-        "    return event\n"
-    )
-    define_arn2 = _create_lambda(lam, "define-725-2", define2)
-    cognito_idp.update_user_pool(UserPoolId=pid, LambdaConfig={"DefineAuthChallenge": define_arn2})
+    assert r1["ChallengeName"] == "CUSTOM_CHALLENGE"
+    assert r1["ChallengeParameters"]["type"] == "MAGIC_LINK"
 
     r2 = cognito_idp.respond_to_auth_challenge(
         ClientId=cid,
         ChallengeName="CUSTOM_CHALLENGE",
         Session=r1["Session"],
-        ChallengeResponses={"ANSWER": "test", "USERNAME": "alice"},
+        ChallengeResponses={"USERNAME": "alice", "ANSWER": "expected-token"},
+    )
+    assert "AccessToken" in r2["AuthenticationResult"]
+
+
+def test_custom_auth_issue_725_private_params_carry_through(cognito_idp, lam):
+    """Verify that privateChallengeParameters round-trip from CreateAuthChallenge to VerifyAuthChallenge."""
+    create = (
+        "def handler(event, ctx):\n"
+        "    event['response']['publicChallengeParameters'] = {'msg': 'send this to user'}\n"
+        "    event['response']['privateChallengeParameters'] = {'secret': 'only-server-knows'}\n"
+        "    return event\n"
+    )
+    verify = (
+        "def handler(event, ctx):\n"
+        "    # Verify handler can read privateChallengeParameters set by create\n"
+        "    secret = event['request']['privateChallengeParameters'].get('secret', '')\n"
+        "    answer = event['request']['challengeAnswer']\n"
+        "    event['response']['answerCorrect'] = (secret == answer)\n"
+        "    return event\n"
+    )
+    define = (
+        "def handler(event, ctx):\n"
+        "    if event['request']['session'] and event['request']['session'][-1].get('challengeResult'):\n"
+        "        event['response']['issueTokens'] = True\n"
+        "    else:\n"
+        "        event['response']['challengeName'] = 'CUSTOM_CHALLENGE'\n"
+        "    return event\n"
+    )
+    create_arn = _create_lambda(lam, "create-private-params", create)
+    verify_arn = _create_lambda(lam, "verify-private-params", verify)
+    define_arn = _create_lambda(lam, "define-private-params", define)
+
+    pid, cid = _setup_pool(cognito_idp, "PrivateParamsPool", {
+        "CreateAuthChallenge": create_arn,
+        "VerifyAuthChallengeResponse": verify_arn,
+        "DefineAuthChallenge": define_arn,
+    })
+
+    r1 = cognito_idp.initiate_auth(
+        ClientId=cid,
+        AuthFlow="CUSTOM_AUTH",
+        AuthParameters={"USERNAME": "user@example.com"},
+    )
+    assert r1["ChallengeParameters"]["msg"] == "send this to user"
+
+    r2 = cognito_idp.respond_to_auth_challenge(
+        ClientId=cid,
+        ChallengeName="CUSTOM_CHALLENGE",
+        Session=r1["Session"],
+        ChallengeResponses={"ANSWER": "only-server-knows", "USERNAME": "user@example.com"},
     )
     assert "AccessToken" in r2["AuthenticationResult"]

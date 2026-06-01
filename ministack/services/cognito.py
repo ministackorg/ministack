@@ -859,7 +859,8 @@ def _build_define_auth_challenge_event(pool_id: str, client_id: str, username: s
         },
         "request": {
             "userAttributes": user_attrs or {},
-            "sessionList": _build_session_list(session),
+            "session": _build_session_list(session),
+            "userNotFound": False,
             "clientMetadata": {},
         },
         "response": {
@@ -890,7 +891,9 @@ def _build_create_auth_challenge_event(pool_id: str, client_id: str, username: s
         },
         "request": {
             "userAttributes": user_attrs or {},
-            "sessionList": _build_session_list(session),
+            "challengeName": "CUSTOM_CHALLENGE",
+            "session": _build_session_list(session),
+            "userNotFound": False,
             "clientMetadata": client_metadata or {},
         },
         "response": {
@@ -910,6 +913,7 @@ def _build_verify_auth_challenge_event(pool_id: str, client_id: str, username: s
     Called to verify the challenge response (e.g., validate the magic link token
     or SMS OTP).
     """
+    last = session["challenges"][-1] if session["challenges"] else {}
     return {
         "version": "1",
         "triggerSource": "VerifyAuthChallengeResponse_Authentication",
@@ -922,8 +926,12 @@ def _build_verify_auth_challenge_event(pool_id: str, client_id: str, username: s
         },
         "request": {
             "userAttributes": user_attrs or {},
-            "sessionList": _build_session_list(session),
+            "challengeName": "CUSTOM_CHALLENGE",
+            "session": _build_session_list(session),
+            "userNotFound": False,
             "challengeAnswer": challenge_answer,
+            "publicChallengeParameters": last.get("publicChallengeParameters", {}),
+            "privateChallengeParameters": last.get("privateChallengeParameters", {}),
             "clientMetadata": client_metadata or {},
         },
         "response": {
@@ -936,15 +944,7 @@ def _build_verify_auth_challenge_event(pool_id: str, client_id: str, username: s
 # CUSTOM_AUTH Lambda Invocation Wrappers (Phase 4)
 # ---------------------------------------------------------------------------
 
-def _parse_custom_auth_error(err_str: str) -> tuple:
-    """Parse Lambda error into proper error response.
-    
-    Converts "ExceptionType: Message" format into (None, error_response_json).
-    """
-    if ":" in err_str:
-        code, _, msg = err_str.partition(":")
-        return (None, error_response_json(code.strip(), msg.strip(), 400))
-    return (None, error_response_json("InvalidLambdaResponseException", err_str, 400))
+
 
 
 def _invoke_define_auth_challenge_trigger(pool_id: str, client_id: str, username: str,
@@ -2309,9 +2309,10 @@ def _admin_initiate_auth(data):
             private_params = (create_result.get("response", {}) or {}).get("privateChallengeParameters") or {}
             challenge_metadata = (create_result.get("response", {}) or {}).get("challengeMetadata")
         else:
-            # Default: PROVIDE_AUTH_PARAMETERS
+            # Default: PROVIDE_AUTH_PARAMETERS — private MUST mirror public so a Verify
+            # Lambda can detect this round via privateChallengeParameters['challenge'].
             public_params = {"challenge": "PROVIDE_AUTH_PARAMETERS"}
-            private_params = {}
+            private_params = {"challenge": "PROVIDE_AUTH_PARAMETERS"}
             challenge_metadata = None
 
         # Update session with challenge parameters
@@ -2391,7 +2392,7 @@ def _admin_respond_to_auth_challenge(data):
 
         # Determine answer_correct
         if verify_result is not None:
-            answer_correct = (verify_result.get("response", {}) or {}).get("answerCorrect")
+            answer_correct = bool((verify_result.get("response", {}) or {}).get("answerCorrect", False))
         else:
             # No Lambda configured — auto-fail (caller must provide answer)
             answer_correct = False
@@ -2454,9 +2455,10 @@ def _admin_respond_to_auth_challenge(data):
                 private_params = (create_result.get("response", {}) or {}).get("privateChallengeParameters") or {}
                 challenge_metadata = (create_result.get("response", {}) or {}).get("challengeMetadata")
             else:
-                # Default: PROVIDE_AUTH_PARAMETERS
+                # Default: PROVIDE_AUTH_PARAMETERS — private MUST mirror public so a Verify
+                # Lambda can detect this round via privateChallengeParameters['challenge'].
                 public_params = {"challenge": "PROVIDE_AUTH_PARAMETERS"}
-                private_params = {}
+                private_params = {"challenge": "PROVIDE_AUTH_PARAMETERS"}
                 challenge_metadata = None
 
             # Append new pending challenge to session
@@ -2639,9 +2641,10 @@ def _initiate_auth(data):
             private_params = (create_result.get("response", {}) or {}).get("privateChallengeParameters") or {}
             challenge_metadata = (create_result.get("response", {}) or {}).get("challengeMetadata")
         else:
-            # Default: PROVIDE_AUTH_PARAMETERS
+            # Default: PROVIDE_AUTH_PARAMETERS — private MUST mirror public so a Verify
+            # Lambda can detect this round via privateChallengeParameters['challenge'].
             public_params = {"challenge": "PROVIDE_AUTH_PARAMETERS"}
-            private_params = {}
+            private_params = {"challenge": "PROVIDE_AUTH_PARAMETERS"}
             challenge_metadata = None
 
         # Update session with challenge parameters
@@ -2726,7 +2729,7 @@ def _respond_to_auth_challenge(data):
 
         # Determine answer_correct
         if verify_result is not None:
-            answer_correct = (verify_result.get("response", {}) or {}).get("answerCorrect")
+            answer_correct = bool((verify_result.get("response", {}) or {}).get("answerCorrect", False))
         else:
             # No Lambda configured — auto-fail (caller must provide answer)
             answer_correct = False
@@ -2789,9 +2792,10 @@ def _respond_to_auth_challenge(data):
                 private_params = (create_result.get("response", {}) or {}).get("privateChallengeParameters") or {}
                 challenge_metadata = (create_result.get("response", {}) or {}).get("challengeMetadata")
             else:
-                # Default: PROVIDE_AUTH_PARAMETERS
+                # Default: PROVIDE_AUTH_PARAMETERS — private MUST mirror public so a Verify
+                # Lambda can detect this round via privateChallengeParameters['challenge'].
                 public_params = {"challenge": "PROVIDE_AUTH_PARAMETERS"}
-                private_params = {}
+                private_params = {"challenge": "PROVIDE_AUTH_PARAMETERS"}
                 challenge_metadata = None
 
             # Append new pending challenge to session
