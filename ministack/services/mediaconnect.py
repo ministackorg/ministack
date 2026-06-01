@@ -7,6 +7,9 @@ streaming/transcoder backends — MediaConnect flows are metadata in this
 emulator. Sufficient for integration-testing services that call the
 MediaConnect control-plane API.
 
+Wire field names are camelCase per the AWS service model — the in-memory
+records also use camelCase so reads and writes round-trip without translation.
+
 Supports:
   Flows: CreateFlow, DescribeFlow, ListFlows, UpdateFlow
   Tags:  ListTagsForResource
@@ -35,7 +38,7 @@ logger = logging.getLogger("mediaconnect")
 # State
 # ---------------------------------------------------------------------------
 
-_flows = AccountScopedDict()   # FlowArn -> flow record
+_flows = AccountScopedDict()   # flowArn -> flow record (camelCase fields)
 _tags = AccountScopedDict()    # arn -> {key: value}
 
 
@@ -84,55 +87,55 @@ def _error(status, code, message):
 
 
 # Real AWS ListFlows returns a slimmer ``ListedFlow`` projection — not the
-# full Flow record. Keep this in sync with the AWS shape.
+# full Flow record. Keep in sync with the AWS shape.
 _LISTED_FLOW_FIELDS = (
-    "AvailabilityZone", "Description", "FlowArn", "Name",
-    "SourceType", "Status", "Maintenance",
+    "availabilityZone", "description", "flowArn", "name",
+    "sourceType", "status", "maintenance",
 )
 
 
-# UpdateFlow only accepts these top-level fields per the AWS API model. Any
-# other field on the request body is ignored to match real-AWS behavior.
+# UpdateFlow only accepts these top-level fields per the AWS API model.
 _UPDATE_FLOW_FIELDS = (
-    "SourceFailoverConfig", "Maintenance", "SourceMonitoringConfig", "NdiConfig",
+    "sourceFailoverConfig", "maintenance",
+    "sourceMonitoringConfig", "ndiConfig",
 )
 
 
 def _source_type(flow):
-    """Return ``OWNED`` for a flow whose Source comes from local inputs,
-    ``ENTITLED`` if Source references an entitlement. Mirrors real AWS."""
-    src = flow.get("Source") or {}
-    if src.get("EntitlementArn"):
+    """Return ``OWNED`` if Source comes from local input, ``ENTITLED`` if
+    Source references an entitlement. Mirrors real AWS."""
+    src = flow.get("source") or {}
+    if src.get("entitlementArn"):
         return "ENTITLED"
     return "OWNED"
 
 
 def _build_flow(body):
-    """Build a Flow record from a CreateFlow request body."""
-    name = body.get("Name", "")
+    """Build a Flow record from a CreateFlow request body (camelCase wire)."""
+    name = body.get("name", "")
     arn = _flow_arn(name)
     flow = {
-        "FlowArn": arn,
-        "Name": name,
-        "AvailabilityZone": body.get(
-            "AvailabilityZone", f"{get_region()}a"
+        "flowArn": arn,
+        "name": name,
+        "availabilityZone": body.get(
+            "availabilityZone", f"{get_region()}a"
         ),
-        "Description": body.get("Description", ""),
-        "EgressIp": "",
-        "Entitlements": body.get("Entitlements", []),
-        "MediaStreams": body.get("MediaStreams", []),
-        "Outputs": body.get("Outputs", []),
-        "Source": body.get("Source", {}),
-        "SourceFailoverConfig": body.get("SourceFailoverConfig", {}),
-        "Sources": body.get("Sources", []),
+        "description": body.get("description", ""),
+        "egressIp": "",
+        "entitlements": body.get("entitlements", []),
+        "mediaStreams": body.get("mediaStreams", []),
+        "outputs": body.get("outputs", []),
+        "source": body.get("source", {}),
+        "sourceFailoverConfig": body.get("sourceFailoverConfig", {}),
+        "sources": body.get("sources", []),
         # AWS starts new flows in STANDBY; StartFlow moves them to ACTIVE.
-        # We don't implement Start/Stop — clients typically just describe.
-        "Status": "STANDBY",
-        "VpcInterfaces": body.get("VpcInterfaces", []),
-        "Maintenance": body.get("Maintenance", {}),
-        "SourceMonitoringConfig": body.get("SourceMonitoringConfig", {}),
-        "FlowSize": body.get("FlowSize", "MEDIUM"),
-        "NdiConfig": body.get("NdiConfig", {}),
+        # Start/Stop are out of scope — clients typically just describe.
+        "status": "STANDBY",
+        "vpcInterfaces": body.get("vpcInterfaces", []),
+        "maintenance": body.get("maintenance", {}),
+        "sourceMonitoringConfig": body.get("sourceMonitoringConfig", {}),
+        "flowSize": body.get("flowSize", "MEDIUM"),
+        "ndiConfig": body.get("ndiConfig", {}),
     }
     return flow
 
@@ -142,15 +145,17 @@ def _build_flow(body):
 # ---------------------------------------------------------------------------
 
 def _create_flow(body):
-    name = body.get("Name", "")
+    name = body.get("name", "")
     if not name:
         return _error(400, "BadRequestException", "Flow Name is required.")
     flow = _build_flow(body)
-    _flows[flow["FlowArn"]] = flow
-    tags = body.get("Tags") or {}
+    _flows[flow["flowArn"]] = flow
+    # CreateFlow accepts an optional tags map on newer botocore models
+    # (``FlowTags`` in the SDK, ``flowTags`` on the wire); honor it if present.
+    tags = body.get("flowTags") or body.get("tags") or {}
     if tags:
-        _tags[flow["FlowArn"]] = dict(tags)
-    return json_response({"Flow": flow}, status=201)
+        _tags[flow["flowArn"]] = dict(tags)
+    return json_response({"flow": flow}, status=201)
 
 
 def _list_flows(query):
@@ -158,9 +163,9 @@ def _list_flows(query):
     listed = []
     for arn, f in _flows.items():
         projection = {k: f.get(k) for k in _LISTED_FLOW_FIELDS if k in f}
-        projection["SourceType"] = _source_type(f)
+        projection["sourceType"] = _source_type(f)
         listed.append(projection)
-    return json_response({"Flows": listed[:max_results]})
+    return json_response({"flows": listed[:max_results]})
 
 
 def _describe_flow(arn):
@@ -168,7 +173,7 @@ def _describe_flow(arn):
     if not flow:
         return _error(404, "NotFoundException",
                       f"Flow {arn} not found.")
-    return json_response({"Flow": flow})
+    return json_response({"flow": flow})
 
 
 def _update_flow(arn, body):
@@ -179,11 +184,11 @@ def _update_flow(arn, body):
     for field in _UPDATE_FLOW_FIELDS:
         if field in body:
             flow[field] = body[field]
-    return json_response({"Flow": flow})
+    return json_response({"flow": flow})
 
 
 def _list_tags(arn):
-    return json_response({"Tags": _tags.get(arn, {})})
+    return json_response({"tags": _tags.get(arn, {})})
 
 
 # ---------------------------------------------------------------------------

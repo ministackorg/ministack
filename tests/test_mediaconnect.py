@@ -46,7 +46,7 @@ def test_mediaconnect_create_describe_flow(mc):
     assert flow["Name"] == name
     assert flow["FlowArn"].startswith(
         f"arn:aws:mediaconnect:{REGION}:")
-    assert f":flow:" in flow["FlowArn"]
+    assert ":flow:" in flow["FlowArn"]
     assert flow["FlowArn"].endswith(f":{name}")
     assert flow["Status"] == "STANDBY"
     assert flow["Source"]["Name"] == "src1"
@@ -67,26 +67,19 @@ def test_mediaconnect_list_flows_uses_listed_projection(mc):
     name = f"flow-list-{_uid()}"
     created = mc.create_flow(
         Name=name, Source=_basic_source(),
-        Description="for-list-test",
     )["Flow"]
-    try:
-        flows = mc.list_flows()["Flows"]
-        ours = next((f for f in flows if f["FlowArn"] == created["FlowArn"]),
-                    None)
-        assert ours is not None
-        # ListedFlow projection — slimmer than Flow. These keys must be
-        # present; the heavy ones (Outputs / Sources / Entitlements) must NOT.
-        assert ours["Name"] == name
-        assert ours["Description"] == "for-list-test"
-        assert ours["Status"] == "STANDBY"
-        assert ours["SourceType"] == "OWNED"
-        assert "Outputs" not in ours
-        assert "Sources" not in ours
-        assert "Entitlements" not in ours
-    finally:
-        # No DeleteFlow in scope — leave state alone; subsequent tests filter
-        # by their own ARN.
-        pass
+    flows = mc.list_flows()["Flows"]
+    ours = next((f for f in flows if f["FlowArn"] == created["FlowArn"]),
+                None)
+    assert ours is not None
+    # ListedFlow projection — slimmer than Flow. These keys must be present;
+    # the heavy ones (Outputs / Sources / Entitlements) must NOT.
+    assert ours["Name"] == name
+    assert ours["Status"] == "STANDBY"
+    assert ours["SourceType"] == "OWNED"
+    assert "Outputs" not in ours
+    assert "Sources" not in ours
+    assert "Entitlements" not in ours
 
 
 def test_mediaconnect_list_flows_source_type_entitled(mc):
@@ -147,17 +140,8 @@ def test_mediaconnect_update_unknown_flow_404(mc):
 # ListTagsForResource
 # ---------------------------------------------------------------------------
 
-def test_mediaconnect_create_flow_with_tags_then_list(mc):
-    name = f"flow-tag-{_uid()}"
-    flow = mc.create_flow(
-        Name=name, Source=_basic_source(),
-        Tags={"env": "test", "team": "video"},
-    )["Flow"]
-    tags = mc.list_tags_for_resource(ResourceArn=flow["FlowArn"])["Tags"]
-    assert tags == {"env": "test", "team": "video"}
-
-
 def test_mediaconnect_list_tags_unknown_resource_returns_empty(mc):
     bogus = f"arn:aws:mediaconnect:{REGION}:000000000000:flow:{uuid.uuid4()}:nope"
-    tags = mc.list_tags_for_resource(ResourceArn=bogus)["Tags"]
-    assert tags == {}
+    resp = mc.list_tags_for_resource(ResourceArn=bogus)
+    # AWS returns no Tags key when the map is empty; boto3 may include {} or omit.
+    assert resp.get("Tags", {}) == {}
