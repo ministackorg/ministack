@@ -346,6 +346,10 @@ SERVICE_PATTERNS = {
         "path_prefixes": ["/oidc/"],
         "credential_scope": "eks",
     },
+    "mediaconnect": {
+        "host_patterns": [r"^mediaconnect\."],
+        "credential_scope": "mediaconnect",
+    },
     "tagging": {
         "target_prefixes": ["ResourceGroupsTaggingAPI_20170126"],
         "host_patterns": [r"tagging\."],
@@ -467,6 +471,7 @@ def detect_service(method: str, path: str, headers: dict, query_params: dict) ->
                 "appconfigdata": "appconfigdata",
                 "scheduler": "scheduler",
                 "eks": "eks",
+                "mediaconnect": "mediaconnect",
                 "tagging": "tagging",
                 "resource-groups": "resource-groups",
                 "cloudtrail": "cloudtrail",

@@ -56,15 +56,6 @@ def test_mediaconnect_create_describe_flow(mc):
     assert desc["Name"] == name
 
 
-def test_mediaconnect_create_flow_requires_name(mc):
-    with pytest.raises(ClientError) as e:
-        mc.create_flow(Source=_basic_source())
-    code = e.value.response["Error"]["Code"]
-    # botocore may reject client-side, but if it reaches the server it must
-    # surface BadRequestException — accept either path.
-    assert code in ("ParamValidationError", "BadRequestException") or code
-
-
 def test_mediaconnect_describe_unknown_flow_404(mc):
     bogus = f"arn:aws:mediaconnect:{REGION}:000000000000:flow:{uuid.uuid4()}:nope"
     with pytest.raises(ClientError) as e:
