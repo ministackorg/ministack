@@ -888,7 +888,7 @@ def _resolve_instance(db_id):
 
 
 def _sync_cluster_endpoints(cluster):
-    """Point Aurora cluster endpoint names at local DB instance endpoints."""
+    """Point Aurora cluster endpoints at reachable local DB instance endpoints."""
     members = cluster.get("DBClusterMembers") or []
     if not members:
         return
@@ -901,6 +901,7 @@ def _sync_cluster_endpoints(cluster):
     if writer_inst and writer_inst.get("Endpoint"):
         writer_ep = writer_inst["Endpoint"]
         cluster["Endpoint"] = writer_ep.get("Address", cluster.get("Endpoint", ""))
+        cluster["Port"] = int(writer_ep.get("Port", cluster.get("Port", 0)))
     if reader_inst and reader_inst.get("Endpoint"):
         cluster["ReaderEndpoint"] = reader_inst["Endpoint"].get(
             "Address", cluster.get("ReaderEndpoint", ""))
