@@ -51,3 +51,4 @@ data/
 
 # Logs
 *.log
+.tokensave

@@ -409,8 +409,57 @@ def _delete_cluster(name):
 
 # ---------------------------------------------------------------------------
 # Nodegroups
-# ---------------------------------------------------------------------------
+def _k3s_agent_run_kwargs(name: str, ng_name: str, server_url: str, token: str, ms_network: str | None = None) -> dict:
+    """Build docker run kwargs for a k3s agent (worker node) container."""
+    run_kwargs = dict(
+        image=apply_image_prefix(EKS_K3S_IMAGE),
+        command=["agent",
+                 f"--server={server_url}",
+                 f"--token={token}"],
+        detach=True,
+        privileged=True,
+        cap_add=["SYS_ADMIN", "NET_ADMIN", "NET_RAW", "NET_BIND_SERVICE",
+                 "SYS_PTRACE", "SYS_RESOURCE", "SYS_CHROOT",
+                 "DAC_OVERRIDE", "FSETID", "CHOWN", "MKNOD",
+                 "KILL", "SETGID", "SETUID", "SETPCAP", "SETFCAP"],
+        security_opt=["seccomp=unconfined", "apparmor=unconfined"],
+        name=f"ministack-eks-{name}-worker-{ng_name}-{new_uuid()[:8]}",
+        labels={"ministack": "eks", "cluster_name": name, "nodegroup": ng_name},
+        tmpfs={"/run": "", "/var/run": "", "/tmp": ""},
+        volumes={"/lib/modules": {"bind": "/lib/modules", "mode": "ro"}},
+    )
+    if ms_network:
+        run_kwargs["network"] = ms_network
+    return run_kwargs
 
+
+def _get_master_token(container):
+    """Extract the k3s node token from a running server container."""
+    try:
+        _, output = container.exec_run("cat /var/lib/rancher/k3s/server/node-token")
+        return output.decode("utf-8", errors="replace").strip()
+    except Exception:
+        return ""
+
+
+def _stop_nodegroup_containers(cluster_name: str, ng_name: str):
+    """Stop all k3s agent containers belonging to a nodegroup."""
+    client = _get_docker()
+    if not client:
+        return
+    try:
+        for c in client.containers.list(filters={"label": [
+            "ministack=eks",
+            f"cluster_name={cluster_name}",
+            f"nodegroup={ng_name}",
+        ]}):
+            try:
+                c.stop(timeout=5)
+                c.remove(v=True, force=True)
+            except Exception:
+                pass
+    except Exception:
+        pass
 def _create_nodegroup(cluster_name, body):
     if cluster_name not in _clusters:
         return _error(404, "ResourceNotFoundException", f"No cluster found for name: {cluster_name}.")
@@ -457,6 +506,38 @@ def _create_nodegroup(cluster_name, body):
     if nodegroup["tags"]:
         _tags[arn] = dict(nodegroup["tags"])
 
+    # Spawn real k3s agent containers (worker nodes)
+    cluster = _clusters[cluster_name]
+    desired = scaling.get("desiredSize", 1)
+    container_id = cluster.get("_docker_id")
+
+    def _bg_spawn_agents():
+        client = _get_docker()
+        if not client or not container_id:
+            return
+        try:
+            master = client.containers.get(container_id)
+            token = _get_master_token(master)
+            if not token:
+                logger.warning("EKS: could not get master token for %s, skipping agents", cluster_name)
+                return
+            ms_network = _get_ministack_network(client)
+            server_ip = ""
+            if ms_network:
+                master.reload()
+                nets = master.attrs.get("NetworkSettings", {}).get("Networks", {})
+                server_ip = nets.get(ms_network, {}).get("IPAddress", "")
+            server_url = f"https://{server_ip}:6443" if server_ip else f"https://localhost:{cluster['_port']}"
+
+            for i in range(desired):
+                agent_kwargs = _k3s_agent_run_kwargs(cluster_name, ng_name, server_url, token, ms_network)
+                container = client.containers.run(**agent_kwargs)
+                logger.info("EKS: spawned k3s agent %d/%d for nodegroup %s/%s", i + 1, desired, cluster_name, ng_name)
+        except Exception as e:
+            logger.warning("EKS: failed to spawn agents for %s/%s: %s", cluster_name, ng_name, e)
+
+    threading.Thread(target=_bg_spawn_agents, daemon=True, name=f"eks-agents-{cluster_name}-{ng_name}").start()
+
     return _json_resp(200, {"nodegroup": nodegroup})
 
 
@@ -488,6 +569,12 @@ def _delete_nodegroup(cluster_name, ng_name):
     result = dict(ng)
     _nodegroups.pop(key, None)
     _tags.pop(ng.get("nodegroupArn", ""), None)
+
+    # Stop agent containers in background
+    def _bg_stop():
+        _stop_nodegroup_containers(cluster_name, ng_name)
+    threading.Thread(target=_bg_stop, daemon=True, name=f"eks-del-{cluster_name}-{ng_name}").start()
+
     return _json_resp(200, {"nodegroup": result})
 
 

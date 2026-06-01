@@ -59,17 +59,109 @@ Supports:
 
 import copy
 import hashlib
+import importlib
 import logging
 import os
 import random
 import re
 import string
+import threading
 import time
 from urllib.parse import parse_qs
 from xml.sax.saxutils import escape as _esc
 
 from ministack.core.persistence import PERSIST_STATE, load_state
 from ministack.core.responses import AccountRegionScopedDict, get_account_id, get_region, new_uuid
+
+# Docker support for real EC2 instances as containers
+EC2_INSTANCE_IMAGE = os.environ.get("EC2_INSTANCE_IMAGE", "alpine:3.21")
+EC2_DOCKER_NETWORK = os.environ.get("DOCKER_NETWORK", "")
+
+try:
+    _docker_lib = importlib.import_module("docker")
+    _docker_available = True
+except ImportError:
+    _docker_lib = None
+    _docker_available = False
+
+
+def _get_docker():
+    if not _docker_available:
+        return None
+    try:
+        return _docker_lib.from_env()
+    except Exception:
+        return None
+
+
+def _spawn_instance(instance_id: str, private_ip: str, subnet_id: str, tags: list):
+    """Spawn a lightweight Alpine container as a real EC2 instance."""
+    client = _get_docker()
+    if not client:
+        return
+
+    # Build container name from instance ID and Name tag
+    name_tag = ""
+    for t in (tags or []):
+        if t.get("Key") == "Name":
+            name_tag = f"-{t['Value']}"
+            break
+    container_name = f"ministack-ec2-{instance_id}{name_tag}"[:255]
+
+    # Try to place on the same Docker network as MiniStack
+    network = EC2_DOCKER_NETWORK
+    if not network:
+        try:
+            hostname = os.environ.get("HOSTNAME", "")
+            if hostname:
+                self_c = client.containers.get(hostname)
+                nets = list(self_c.attrs["NetworkSettings"]["Networks"].keys())
+                network = nets[0] if nets else None
+        except Exception:
+            pass
+
+    env_vars = {
+        "MINISTACK_INSTANCE_ID": instance_id,
+        "MINISTACK_PRIVATE_IP": private_ip,
+        "MINISTACK_SUBNET_ID": subnet_id,
+    }
+
+    try:
+        run_kwargs = dict(
+            image=EC2_INSTANCE_IMAGE,
+            command=["sleep", "infinity"],
+            detach=True,
+            name=container_name,
+            labels={"ministack": "ec2", "instance_id": instance_id},
+            environment=env_vars,
+            hostname=f"ip-{private_ip.replace('.', '-')}.ec2.internal",
+        )
+        if network:
+            run_kwargs["network"] = network
+
+        container = client.containers.run(**run_kwargs)
+        logger.info("EC2: spawned container %s for instance %s (ip=%s)", container.id[:12], instance_id, private_ip)
+        return container.id
+    except Exception as e:
+        logger.warning("EC2: failed to spawn container for %s: %s", instance_id, e)
+        return None
+
+
+def _stop_instance(instance_id: str):
+    """Stop and remove the Docker container for an EC2 instance."""
+    client = _get_docker()
+    if not client:
+        return
+    try:
+        for c in client.containers.list(filters={"label": f"instance_id={instance_id}"}):
+            try:
+                c.stop(timeout=5)
+                c.remove(v=True, force=True)
+                logger.info("EC2: stopped container for instance %s", instance_id)
+            except Exception:
+                pass
+    except Exception:
+        pass
 
 logger = logging.getLogger("ec2")
 
@@ -417,6 +509,15 @@ def _run_instances(p):
                 _tags[inst["InstanceId"]] = spec_tags[:]
         i += 1
 
+    # Spawn real Alpine containers (Linux only, skip Windows AMIs)
+    is_windows = image_id.lower().startswith("ami-win") or "windows" in image_id.lower()
+    if not is_windows:
+        def _bg_spawn():
+            for inst in created:
+                tags = _tags.get(inst["InstanceId"], [])
+                _spawn_instance(inst["InstanceId"], inst["PrivateIpAddress"], inst["SubnetId"], tags)
+        threading.Thread(target=_bg_spawn, daemon=True, name=f"ec2-spawn-{created[0]['InstanceId']}").start()
+
     items = "".join(_instance_xml(i) for i in created)
     inner = f"""<instancesSet>{items}</instancesSet>
     <reservationId>r-{new_uuid().replace('-','')[:17]}</reservationId>
@@ -520,6 +621,10 @@ def _terminate_instances(p):
             prev = inst["State"].copy()
             inst["State"] = {"Code": 48, "Name": "terminated"}
             inst["_terminated_at"] = time.time()
+            # Stop Docker container in background
+            def _bg_stop(iid=iid):
+                _stop_instance(iid)
+            threading.Thread(target=_bg_stop, daemon=True, name=f"ec2-stop-{iid}").start()
             items += f"""<item>
                 <instanceId>{iid}</instanceId>
                 <previousState><code>{prev['Code']}</code><name>{prev['Name']}</name></previousState>
