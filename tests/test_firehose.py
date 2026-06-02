@@ -385,3 +385,224 @@ def test_firehose_kinesis_stream_as_source_fans_out_to_s3(fh, kin, s3):
         except Exception: pass
         try: kin.delete_stream(StreamName=stream_name)
         except Exception: pass
+
+
+# ---------------------------------------------------------------------------
+# ProcessingConfiguration — Lambda processor invocation.
+#
+# Real AWS Firehose invokes the configured Lambda for every batch of records
+# in flight, with payload shape:
+#   {invocationId, deliveryStreamArn, region, records:[{recordId, approximateArrivalTimestamp, data(base64)}]}
+# and expects a response shape:
+#   {records:[{recordId, result:"Ok"|"Dropped"|"ProcessingFailed", data(base64)}]}
+# Records marked Dropped/ProcessingFailed are not written to the destination;
+# Ok records are written with the transformed data. On any Lambda failure
+# Firehose passes records through unchanged (best-effort by AWS contract).
+# ---------------------------------------------------------------------------
+
+
+def _processor_lambda_zip(handler_src: str) -> bytes:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("index.py", handler_src)
+    return buf.getvalue()
+
+
+def _make_processor_fn(lam, name: str, handler_src: str) -> str:
+    lam.create_function(
+        FunctionName=name,
+        Runtime="python3.12",
+        Role="arn:aws:iam::000000000000:role/r",
+        Handler="index.handler",
+        Code={"ZipFile": _processor_lambda_zip(handler_src)},
+    )
+    return f"arn:aws:lambda:us-east-1:000000000000:function:{name}"
+
+
+def _create_firehose_with_processor(fh, name: str, bucket: str, lambda_arn: str,
+                                    delivery_type: str = "DirectPut",
+                                    kinesis_arn: str | None = None) -> None:
+    ext_s3 = {
+        "BucketARN": f"arn:aws:s3:::{bucket}",
+        "RoleARN": "arn:aws:iam::000000000000:role/firehose-role",
+        "BufferingHints": {"SizeInMBs": 1, "IntervalInSeconds": 1},
+        "CompressionFormat": "UNCOMPRESSED",
+        "Prefix": "out/",
+        "ProcessingConfiguration": {
+            "Enabled": True,
+            "Processors": [{
+                "Type": "Lambda",
+                "Parameters": [
+                    {"ParameterName": "LambdaArn", "ParameterValue": lambda_arn},
+                ],
+            }],
+        },
+    }
+    if delivery_type == "KinesisStreamAsSource" and kinesis_arn:
+        fh.create_delivery_stream(
+            DeliveryStreamName=name,
+            DeliveryStreamType="KinesisStreamAsSource",
+            KinesisStreamSourceConfiguration={
+                "KinesisStreamARN": kinesis_arn,
+                "RoleARN": "arn:aws:iam::000000000000:role/firehose-role",
+            },
+            ExtendedS3DestinationConfiguration=ext_s3,
+        )
+    else:
+        fh.create_delivery_stream(
+            DeliveryStreamName=name,
+            DeliveryStreamType="DirectPut",
+            ExtendedS3DestinationConfiguration=ext_s3,
+        )
+
+
+def test_firehose_lambda_processor_transforms_record(fh, s3, lam):
+    """Lambda processor returns transformed data → S3 object contains the
+    transform output, not the original record."""
+    import base64 as _b64
+    suffix = _uuid_mod.uuid4().hex[:8]
+    bucket = f"fh-proc-{suffix}"
+    fn = f"fh-proc-fn-{suffix}"
+    delivery = f"fh-proc-{suffix}"
+    s3.create_bucket(Bucket=bucket)
+    handler = (
+        "import base64, json\n"
+        "def handler(event, context):\n"
+        "    out = []\n"
+        "    for r in event['records']:\n"
+        "        raw = base64.b64decode(r['data'])\n"
+        "        transformed = raw.upper()\n"
+        "        out.append({\n"
+        "            'recordId': r['recordId'],\n"
+        "            'result': 'Ok',\n"
+        "            'data': base64.b64encode(transformed).decode(),\n"
+        "        })\n"
+        "    return {'records': out}\n"
+    )
+    arn = _make_processor_fn(lam, fn, handler)
+    _create_firehose_with_processor(fh, delivery, bucket, arn)
+    try:
+        fh.put_record(DeliveryStreamName=delivery, Record={"Data": b"hello"})
+        for _ in range(20):
+            objs = s3.list_objects_v2(Bucket=bucket, Prefix="out/").get("Contents", [])
+            if objs:
+                break
+            time.sleep(0.1)
+        objs = s3.list_objects_v2(Bucket=bucket, Prefix="out/").get("Contents", [])
+        assert len(objs) == 1, f"expected 1 transformed record, got {len(objs)}"
+        body = s3.get_object(Bucket=bucket, Key=objs[0]["Key"])["Body"].read()
+        assert body == b"HELLO", body
+    finally:
+        try: fh.delete_delivery_stream(DeliveryStreamName=delivery)
+        except Exception: pass
+        try: lam.delete_function(FunctionName=fn)
+        except Exception: pass
+
+
+def test_firehose_lambda_processor_dropped_record_not_written(fh, s3, lam):
+    """``result: Dropped`` → record is filtered out, no S3 object written."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    bucket = f"fh-drop-{suffix}"
+    fn = f"fh-drop-fn-{suffix}"
+    delivery = f"fh-drop-{suffix}"
+    s3.create_bucket(Bucket=bucket)
+    handler = (
+        "def handler(event, context):\n"
+        "    return {'records': [\n"
+        "        {'recordId': r['recordId'], 'result': 'Dropped', 'data': r['data']}\n"
+        "        for r in event['records']\n"
+        "    ]}\n"
+    )
+    arn = _make_processor_fn(lam, fn, handler)
+    _create_firehose_with_processor(fh, delivery, bucket, arn)
+    try:
+        fh.put_record(DeliveryStreamName=delivery, Record={"Data": b"hello"})
+        time.sleep(0.6)  # give the fire-and-forget S3 task time
+        objs = s3.list_objects_v2(Bucket=bucket, Prefix="out/").get("Contents", [])
+        assert objs == [], f"expected no S3 objects, got {objs}"
+    finally:
+        try: fh.delete_delivery_stream(DeliveryStreamName=delivery)
+        except Exception: pass
+        try: lam.delete_function(FunctionName=fn)
+        except Exception: pass
+
+
+def test_firehose_lambda_processor_not_found_passes_through(fh, s3):
+    """Configured LambdaArn that doesn't exist → record delivered unchanged
+    (Firehose is best-effort; processor failure must not break the stream)."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    bucket = f"fh-miss-{suffix}"
+    delivery = f"fh-miss-{suffix}"
+    s3.create_bucket(Bucket=bucket)
+    missing_arn = (
+        f"arn:aws:lambda:us-east-1:000000000000:function:fh-no-such-{suffix}"
+    )
+    _create_firehose_with_processor(fh, delivery, bucket, missing_arn)
+    try:
+        fh.put_record(DeliveryStreamName=delivery, Record={"Data": b"untouched"})
+        for _ in range(20):
+            objs = s3.list_objects_v2(Bucket=bucket, Prefix="out/").get("Contents", [])
+            if objs:
+                break
+            time.sleep(0.1)
+        objs = s3.list_objects_v2(Bucket=bucket, Prefix="out/").get("Contents", [])
+        assert len(objs) == 1
+        body = s3.get_object(Bucket=bucket, Key=objs[0]["Key"])["Body"].read()
+        assert body == b"untouched"
+    finally:
+        try: fh.delete_delivery_stream(DeliveryStreamName=delivery)
+        except Exception: pass
+
+
+def test_firehose_kinesis_source_with_lambda_processor(fh, s3, lam, kin):
+    """End-to-end Kinesis → Firehose → Lambda processor → S3 — the user's
+    exact repro from issue #744 follow-up."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    bucket = f"fh-kin-proc-{suffix}"
+    fn = f"fh-kin-proc-fn-{suffix}"
+    delivery = f"fh-kin-proc-{suffix}"
+    stream = f"fh-kin-proc-src-{suffix}"
+    s3.create_bucket(Bucket=bucket)
+    kin.create_stream(StreamName=stream, ShardCount=1)
+    # Wait for stream to be ACTIVE.
+    for _ in range(20):
+        if kin.describe_stream(StreamName=stream)["StreamDescription"]["StreamStatus"] == "ACTIVE":
+            break
+        time.sleep(0.1)
+    stream_arn = kin.describe_stream(StreamName=stream)["StreamDescription"]["StreamARN"]
+    handler = (
+        "import base64\n"
+        "def handler(event, context):\n"
+        "    out = []\n"
+        "    for r in event['records']:\n"
+        "        raw = base64.b64decode(r['data'])\n"
+        "        out.append({\n"
+        "            'recordId': r['recordId'],\n"
+        "            'result': 'Ok',\n"
+        "            'data': base64.b64encode(b'proc:' + raw).decode(),\n"
+        "        })\n"
+        "    return {'records': out}\n"
+    )
+    arn = _make_processor_fn(lam, fn, handler)
+    _create_firehose_with_processor(
+        fh, delivery, bucket, arn,
+        delivery_type="KinesisStreamAsSource", kinesis_arn=stream_arn,
+    )
+    try:
+        kin.put_record(StreamName=stream, PartitionKey="pk", Data=b"payload")
+        for _ in range(30):
+            objs = s3.list_objects_v2(Bucket=bucket, Prefix="out/").get("Contents", [])
+            if objs:
+                break
+            time.sleep(0.1)
+        objs = s3.list_objects_v2(Bucket=bucket, Prefix="out/").get("Contents", [])
+        assert len(objs) >= 1, "expected at least 1 record delivered to S3"
+        body = s3.get_object(Bucket=bucket, Key=objs[0]["Key"])["Body"].read()
+        assert body == b"proc:payload", body
+    finally:
+        try: fh.delete_delivery_stream(DeliveryStreamName=delivery)
+        except Exception: pass
+        try: lam.delete_function(FunctionName=fn)
+        except Exception: pass
+        try: kin.delete_stream(StreamName=stream)
+        except Exception: pass

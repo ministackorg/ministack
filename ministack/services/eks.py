@@ -20,6 +20,7 @@ import os
 import re
 import threading
 import time
+import urllib.parse
 
 from ministack.core.persistence import load_state
 from ministack.core.responses import (
@@ -53,6 +54,8 @@ except ImportError:
 _clusters = AccountScopedDict()       # name -> cluster record
 _nodegroups = AccountScopedDict()     # "cluster/nodegroup" -> nodegroup record
 _addons = AccountScopedDict()         # "cluster/addonName" -> addon record
+_access_entries = AccountScopedDict() # "cluster\x00principalArn" -> access entry record
+_access_policies = AccountScopedDict()# "cluster\x00principalArn\x00policyArn" -> associated policy
 _tags = AccountScopedDict()           # arn -> {key: value}
 _port_counter_lock = threading.Lock()
 _port_counter = [EKS_BASE_PORT]
@@ -109,6 +112,8 @@ def reset():
     _clusters.clear()
     _nodegroups.clear()
     _addons.clear()
+    _access_entries.clear()
+    _access_policies.clear()
     _tags.clear()
     _port_counter[0] = EKS_BASE_PORT
     _stop_all_k3s()
@@ -127,6 +132,8 @@ def get_state():
         "clusters": clusters,
         "nodegroups": copy.deepcopy(_nodegroups),
         "addons": copy.deepcopy(_addons),
+        "access_entries": copy.deepcopy(_access_entries),
+        "access_policies": copy.deepcopy(_access_policies),
         "tags": copy.deepcopy(_tags),
         "port_counter": _port_counter[0],
     }
@@ -136,6 +143,8 @@ def restore_state(data):
     _clusters.update(data.get("clusters", {}))
     _nodegroups.update(data.get("nodegroups", {}))
     _addons.update(data.get("addons", {}))
+    _access_entries.update(data.get("access_entries", {}))
+    _access_policies.update(data.get("access_policies", {}))
     _tags.update(data.get("tags", {}))
     if "port_counter" in data:
         _port_counter[0] = data["port_counter"]
@@ -179,6 +188,22 @@ def _nodegroup_arn(cluster_name, ng_name):
 def _addon_arn(cluster_name, addon_name):
     # AWS uses arn:aws:eks:{region}:{account}:addon/{cluster}/{addonName}/{uuid}.
     return f"arn:aws:eks:{get_region()}:{get_account_id()}:addon/{cluster_name}/{addon_name}/{new_uuid()[:8]}"
+
+
+def _access_entry_arn(cluster_name, principal_arn):
+    # AWS: arn:aws:eks:{region}:{account}:access-entry/{cluster}/{principalArnId}/{uuid}.
+    return (
+        f"arn:aws:eks:{get_region()}:{get_account_id()}:"
+        f"access-entry/{cluster_name}/{new_uuid()[:8]}"
+    )
+
+
+def _ae_key(cluster_name: str, principal_arn: str) -> str:
+    return f"{cluster_name}\x00{principal_arn}"
+
+
+def _ap_key(cluster_name: str, principal_arn: str, policy_arn: str) -> str:
+    return f"{cluster_name}\x00{principal_arn}\x00{policy_arn}"
 
 
 def _now():
@@ -635,6 +660,174 @@ def _update_addon(cluster_name, addon_name, body):
 
 
 # ---------------------------------------------------------------------------
+# Access Entries (modern EKS IAM bindings — replace aws-auth ConfigMap)
+# ---------------------------------------------------------------------------
+
+_VALID_ACCESS_ENTRY_TYPES = (
+    "STANDARD", "EC2_LINUX", "EC2_WINDOWS", "FARGATE_LINUX",
+)
+
+
+def _build_access_entry(cluster_name, principal_arn, body):
+    now = _now()
+    return {
+        "clusterName": cluster_name,
+        "principalArn": principal_arn,
+        "kubernetesGroups": body.get("kubernetesGroups", []),
+        "accessEntryArn": _access_entry_arn(cluster_name, principal_arn),
+        "createdAt": now,
+        "modifiedAt": now,
+        "tags": body.get("tags", {}),
+        "username": body.get("username", ""),
+        "type": body.get("type", "STANDARD"),
+    }
+
+
+def _create_access_entry(cluster_name, body):
+    if cluster_name not in _clusters:
+        return _error(404, "ResourceNotFoundException",
+                      f"No cluster found for name: {cluster_name}.")
+    principal_arn = body.get("principalArn", "")
+    if not principal_arn:
+        return _error(400, "InvalidParameterException",
+                      "principalArn is required.")
+    ae_type = body.get("type", "STANDARD")
+    if ae_type not in _VALID_ACCESS_ENTRY_TYPES:
+        return _error(400, "InvalidParameterException",
+                      f"Invalid type {ae_type}. Must be one of "
+                      f"{list(_VALID_ACCESS_ENTRY_TYPES)}.")
+    key = _ae_key(cluster_name, principal_arn)
+    if key in _access_entries:
+        return _error(409, "ResourceInUseException",
+                      f"Access entry already exists for principal {principal_arn}.")
+    entry = _build_access_entry(cluster_name, principal_arn, body)
+    _access_entries[key] = entry
+    if entry["tags"]:
+        _tags[entry["accessEntryArn"]] = dict(entry["tags"])
+    return _json_resp(200, {"accessEntry": entry})
+
+
+def _describe_access_entry(cluster_name, principal_arn):
+    entry = _access_entries.get(_ae_key(cluster_name, principal_arn))
+    if not entry:
+        return _error(404, "ResourceNotFoundException",
+                      f"No access entry for principal {principal_arn}.")
+    return _json_resp(200, {"accessEntry": entry})
+
+
+def _list_access_entries(cluster_name, query):
+    if cluster_name not in _clusters:
+        return _error(404, "ResourceNotFoundException",
+                      f"No cluster found for name: {cluster_name}.")
+    prefix = f"{cluster_name}\x00"
+    associated = query.get("associatedPolicyArn")
+    arns = []
+    for k, e in _access_entries.items():
+        if not k.startswith(prefix):
+            continue
+        if associated:
+            # Only include entries that have this policy associated.
+            if not any(
+                ak.startswith(f"{cluster_name}\x00{e['principalArn']}\x00")
+                and ak.endswith(f"\x00{associated}")
+                for ak in _access_policies
+            ):
+                continue
+        arns.append(e["principalArn"])
+    max_results = int(query.get("maxResults", 100))
+    return _json_resp(200, {"accessEntries": arns[:max_results]})
+
+
+def _delete_access_entry(cluster_name, principal_arn):
+    key = _ae_key(cluster_name, principal_arn)
+    entry = _access_entries.get(key)
+    if not entry:
+        return _error(404, "ResourceNotFoundException",
+                      f"No access entry for principal {principal_arn}.")
+    # Cascading: drop associated access policies for this entry.
+    ap_prefix = f"{cluster_name}\x00{principal_arn}\x00"
+    for ak in [k for k in _access_policies if k.startswith(ap_prefix)]:
+        _access_policies.pop(ak, None)
+    _tags.pop(entry.get("accessEntryArn", ""), None)
+    _access_entries.pop(key, None)
+    return _json_resp(200, {})
+
+
+def _update_access_entry(cluster_name, principal_arn, body):
+    key = _ae_key(cluster_name, principal_arn)
+    entry = _access_entries.get(key)
+    if not entry:
+        return _error(404, "ResourceNotFoundException",
+                      f"No access entry for principal {principal_arn}.")
+    # AWS-allowed update fields only (per botocore model).
+    for field in ("kubernetesGroups", "username"):
+        if field in body:
+            entry[field] = body[field]
+    entry["modifiedAt"] = _now()
+    return _json_resp(200, {"accessEntry": entry})
+
+
+def _associate_access_policy(cluster_name, principal_arn, body):
+    if _ae_key(cluster_name, principal_arn) not in _access_entries:
+        return _error(404, "ResourceNotFoundException",
+                      f"No access entry for principal {principal_arn}.")
+    policy_arn = body.get("policyArn", "")
+    if not policy_arn:
+        return _error(400, "InvalidParameterException",
+                      "policyArn is required.")
+    access_scope = body.get("accessScope") or {}
+    scope_type = access_scope.get("type")
+    if scope_type not in ("cluster", "namespace"):
+        return _error(400, "InvalidParameterException",
+                      "accessScope.type must be 'cluster' or 'namespace'.")
+    if scope_type == "namespace" and not access_scope.get("namespaces"):
+        return _error(400, "InvalidParameterException",
+                      "namespaces is required when accessScope.type is 'namespace'.")
+    now = _now()
+    associated = {
+        "policyArn": policy_arn,
+        "accessScope": {
+            "type": scope_type,
+            "namespaces": access_scope.get("namespaces", []),
+        },
+        "associatedAt": now,
+        "modifiedAt": now,
+    }
+    _access_policies[_ap_key(cluster_name, principal_arn, policy_arn)] = associated
+    return _json_resp(200, {
+        "clusterName": cluster_name,
+        "principalArn": principal_arn,
+        "associatedAccessPolicy": associated,
+    })
+
+
+def _disassociate_access_policy(cluster_name, principal_arn, policy_arn):
+    if _ae_key(cluster_name, principal_arn) not in _access_entries:
+        return _error(404, "ResourceNotFoundException",
+                      f"No access entry for principal {principal_arn}.")
+    key = _ap_key(cluster_name, principal_arn, policy_arn)
+    if key not in _access_policies:
+        return _error(404, "ResourceNotFoundException",
+                      f"Policy {policy_arn} is not associated with {principal_arn}.")
+    _access_policies.pop(key, None)
+    return _json_resp(200, {})
+
+
+def _list_associated_access_policies(cluster_name, principal_arn, query):
+    if _ae_key(cluster_name, principal_arn) not in _access_entries:
+        return _error(404, "ResourceNotFoundException",
+                      f"No access entry for principal {principal_arn}.")
+    prefix = f"{cluster_name}\x00{principal_arn}\x00"
+    policies = [p for k, p in _access_policies.items() if k.startswith(prefix)]
+    max_results = int(query.get("maxResults", 100))
+    return _json_resp(200, {
+        "clusterName": cluster_name,
+        "principalArn": principal_arn,
+        "associatedAccessPolicies": policies[:max_results],
+    })
+
+
+# ---------------------------------------------------------------------------
 # Encryption config (AssociateEncryptionConfig)
 # ---------------------------------------------------------------------------
 
@@ -818,6 +1011,51 @@ async def handle_request(method, path, headers, body_bytes, query_params):
             return _describe_addon(cluster_name, addon_name)
         if method == "DELETE":
             return _delete_addon(cluster_name, addon_name)
+
+    # Access Entries. principalArn is URL-encoded in the path; same for nested
+    # policyArn under /access-policies. Match the encoded form, decode at
+    # handler boundary.
+    # POST /clusters/{name}/access-entries/{principalArn}/access-policies — AssociateAccessPolicy
+    m = re.fullmatch(
+        r"/clusters/([A-Za-z0-9_-]+)/access-entries/([^/]+)/access-policies", path)
+    if m:
+        cluster_name = m.group(1)
+        principal_arn = urllib.parse.unquote(m.group(2))
+        if method == "POST":
+            return _associate_access_policy(cluster_name, principal_arn, body)
+        if method == "GET":
+            return _list_associated_access_policies(cluster_name, principal_arn, query)
+
+    # DELETE /clusters/{name}/access-entries/{principalArn}/access-policies/{policyArn}
+    m = re.fullmatch(
+        r"/clusters/([A-Za-z0-9_-]+)/access-entries/([^/]+)/access-policies/(.+)", path)
+    if m:
+        cluster_name = m.group(1)
+        principal_arn = urllib.parse.unquote(m.group(2))
+        policy_arn = urllib.parse.unquote(m.group(3))
+        if method == "DELETE":
+            return _disassociate_access_policy(cluster_name, principal_arn, policy_arn)
+
+    # POST/GET /clusters/{name}/access-entries — CreateAccessEntry / ListAccessEntries
+    m = re.fullmatch(r"/clusters/([A-Za-z0-9_-]+)/access-entries", path)
+    if m:
+        cluster_name = m.group(1)
+        if method == "POST":
+            return _create_access_entry(cluster_name, body)
+        if method == "GET":
+            return _list_access_entries(cluster_name, query)
+
+    # /clusters/{name}/access-entries/{principalArn} — Describe/Update/Delete
+    m = re.fullmatch(r"/clusters/([A-Za-z0-9_-]+)/access-entries/([^/]+)", path)
+    if m:
+        cluster_name = m.group(1)
+        principal_arn = urllib.parse.unquote(m.group(2))
+        if method == "GET":
+            return _describe_access_entry(cluster_name, principal_arn)
+        if method == "POST":
+            return _update_access_entry(cluster_name, principal_arn, body)
+        if method == "DELETE":
+            return _delete_access_entry(cluster_name, principal_arn)
 
     # Tags: /tags/{arn+}
     if path.startswith("/tags/"):

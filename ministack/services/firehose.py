@@ -199,6 +199,117 @@ def _resolve_dest_update_config(data: dict):
     return None, None
 
 
+def _apply_lambda_processors(stream: dict, dest: dict, records: list) -> list:
+    """Apply a destination's ProcessingConfiguration Lambda processors to a
+    batch of records.
+
+    ``records``: list of ``(recordId, raw_bytes)`` — pre-decoded so the
+    Lambda invocation matches AWS's contract (base64 over the wire).
+
+    Returns the post-processing list of ``(recordId, raw_bytes)`` to deliver
+    downstream. Per the AWS Firehose Lambda processor contract:
+      - ``result == "Ok"`` → use the Lambda's returned (base64) data.
+      - ``result == "Dropped"`` → omit from the output entirely.
+      - ``result == "ProcessingFailed"`` → omit; AWS routes to the
+        S3 backup destination if configured (ministack: omit + warn).
+
+    On any Lambda lookup / invocation / response-parsing error the original
+    record is passed through. Firehose is best-effort by AWS contract — a
+    processor problem must never break the producer side.
+    """
+    cfg = (dest.get("config") or {}).get("ProcessingConfiguration") or {}
+    if not cfg.get("Enabled"):
+        return records
+    processors = cfg.get("Processors") or []
+    lambda_arns = []
+    for proc in processors:
+        if proc.get("Type") != "Lambda":
+            continue
+        for p in proc.get("Parameters") or []:
+            if p.get("ParameterName") == "LambdaArn":
+                arn = p.get("ParameterValue", "")
+                if arn:
+                    lambda_arns.append(arn)
+                break
+    if not lambda_arns:
+        return records
+
+    from ministack.services import lambda_svc
+    current = list(records)
+    stream_arn = stream.get("arn", "")
+    stream_name = stream.get("name", "?")
+    for arn in lambda_arns:
+        try:
+            name, qualifier = lambda_svc._resolve_name_and_qualifier(arn)
+            func_record, _ = lambda_svc._get_func_record_for_qualifier(name, qualifier)
+        except Exception:
+            func_record = None
+        if func_record is None:
+            logger.warning(
+                "Firehose %s: processor Lambda %s not found; passing records through",
+                stream_name, arn,
+            )
+            continue
+        now_ms = int(time.time() * 1000)
+        event = {
+            "invocationId": new_uuid(),
+            "deliveryStreamArn": stream_arn,
+            "region": get_region(),
+            "records": [
+                {
+                    "recordId": rid,
+                    "approximateArrivalTimestamp": now_ms,
+                    "data": base64.b64encode(raw).decode(),
+                }
+                for rid, raw in current
+            ],
+        }
+        try:
+            result = lambda_svc._execute_function(func_record, event)
+        except Exception as exc:
+            logger.warning("Firehose %s: processor Lambda %s invocation failed: %s; passing through",
+                           stream_name, arn, exc)
+            continue
+        if result.get("error"):
+            logger.warning("Firehose %s: processor Lambda %s returned error: %s; passing through",
+                           stream_name, arn, result.get("body"))
+            continue
+        body = result.get("body")
+        if isinstance(body, (str, bytes)):
+            try:
+                body = json.loads(body)
+            except (ValueError, TypeError):
+                body = None
+        if not isinstance(body, dict) or "records" not in body:
+            logger.warning("Firehose %s: processor Lambda %s returned malformed body; passing through",
+                           stream_name, arn)
+            continue
+        by_id = {r.get("recordId"): r for r in body.get("records", []) if isinstance(r, dict)}
+        next_round = []
+        for rid, raw in current:
+            r = by_id.get(rid)
+            if r is None:
+                # Lambda didn't include this recordId — treat as pass-through
+                # rather than silently dropping.
+                next_round.append((rid, raw))
+                continue
+            outcome = r.get("result", "Ok")
+            if outcome in ("Dropped", "ProcessingFailed"):
+                continue
+            new_data_b64 = r.get("data")
+            if new_data_b64:
+                try:
+                    next_round.append((rid, base64.b64decode(new_data_b64)))
+                    continue
+                except Exception:
+                    pass
+            next_round.append((rid, raw))
+        current = next_round
+        if not current:
+            break
+    return current
+
+
 def _deliver_to_s3(stream: dict, dest: dict, record_data: bytes):
     """Best-effort delivery of a record to the local S3 emulator.
 
@@ -280,10 +391,13 @@ def ingest_from_kinesis_source(stream_arn: str, records: list) -> None:
                 for _pkey, raw in records:
                     rid = _record_id()
                     dest["records"].append({"id": rid, "data": raw, "ts": now_ts})
-                    plan.append((stream, dest, raw))
-    for stream, dest, raw in plan:
+                    plan.append((stream, dest, rid, raw))
+    for stream, dest, rid, raw in plan:
         try:
-            _deliver_to_s3(stream, dest, raw)
+            for _rid, payload in _apply_lambda_processors(
+                stream, dest, [(rid, raw)]
+            ):
+                _deliver_to_s3(stream, dest, payload)
         except Exception as exc:
             logger.warning(
                 "Firehose Kinesis-source delivery to %s failed: %s",
@@ -431,7 +545,11 @@ def _put_record(data: dict):
         for dest in stream["destinations"]:
             dest["records"].append({"id": record_id, "data": raw_data, "ts": now_epoch()})
             if dest["type"] in ("ExtendedS3", "S3"):
-                _deliver_to_s3(stream, dest, decoded)
+                # Apply ProcessingConfiguration.Lambda transforms before S3.
+                for _rid, payload in _apply_lambda_processors(
+                    stream, dest, [(record_id, decoded)]
+                ):
+                    _deliver_to_s3(stream, dest, payload)
 
     return json_response({"RecordId": record_id, "Encrypted": False})
 
@@ -464,7 +582,10 @@ def _put_record_batch(data: dict):
                 for dest in stream["destinations"]:
                     dest["records"].append({"id": record_id, "data": raw_data, "ts": now_epoch()})
                     if dest["type"] in ("ExtendedS3", "S3"):
-                        _deliver_to_s3(stream, dest, decoded)
+                        for _rid, payload in _apply_lambda_processors(
+                            stream, dest, [(record_id, decoded)]
+                        ):
+                            _deliver_to_s3(stream, dest, payload)
                 responses.append({"RecordId": record_id, "Encrypted": False})
             except Exception as e:
                 failed += 1
