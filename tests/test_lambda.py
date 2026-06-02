@@ -4702,3 +4702,123 @@ def test_lambda_durable_create_function_durable_config_round_trip_with_update(la
     finally:
         try: lam.delete_function(FunctionName=fname)
         except Exception: pass
+
+
+# ---------------------------------------------------------------------------
+# X-Ray active tracing — _X_AMZN_TRACE_ID injection per invocation.
+#
+# Real AWS injects this env var into the runtime when TracingConfig.Mode is
+# Active; the aws-xray-sdk reads it per-segment via os.getenv() and raises
+# "Missing AWS Lambda trace data for X-Ray" on absence. The warm Python
+# executor is the default for python3.* runtimes, so these tests pin its
+# behavior end-to-end. AWS RIE (the docker executor) does NOT support X-Ray
+# upstream, so the corresponding "supported here" guarantee is warm/local/
+# provided only.
+# ---------------------------------------------------------------------------
+
+_XRAY_TRACE_HEADER_RE = (
+    r"^Root=1-[0-9a-f]{8}-[0-9a-f]{24};Parent=[0-9a-f]{16};Sampled=1$"
+)
+
+_XRAY_ECHO_HANDLER = (
+    "import os\n"
+    "def handler(event, context):\n"
+    "    return {'trace_id': os.environ.get('_X_AMZN_TRACE_ID', '<UNSET>')}\n"
+)
+
+
+def _create_xray_fn(lam, name: str, mode: str) -> None:
+    lam.create_function(
+        FunctionName=name,
+        Runtime="python3.12",
+        Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _make_zip(_XRAY_ECHO_HANDLER)},
+        TracingConfig={"Mode": mode},
+    )
+
+
+def _invoke_trace_id(lam, name: str) -> str:
+    resp = lam.invoke(FunctionName=name, Payload=b"{}")
+    return json.loads(resp["Payload"].read())["trace_id"]
+
+
+def test_lambda_xray_active_injects_trace_id(lam):
+    """TracingConfig.Mode=Active → handler sees a properly-formatted
+    _X_AMZN_TRACE_ID (`Root=1-<8hex>-<24hex>;Parent=<16hex>;Sampled=1`)."""
+    import re as _re
+    fname = f"xray-active-{_uuid_mod.uuid4().hex[:8]}"
+    _create_xray_fn(lam, fname, "Active")
+    try:
+        trace_id = _invoke_trace_id(lam, fname)
+        assert _re.match(_XRAY_TRACE_HEADER_RE, trace_id), trace_id
+    finally:
+        try: lam.delete_function(FunctionName=fname)
+        except Exception: pass
+
+
+def test_lambda_xray_passthrough_does_not_set_trace_id(lam):
+    """TracingConfig.Mode=PassThrough (default) → no _X_AMZN_TRACE_ID. The
+    AWS X-Ray SDK opts itself out when the env var is absent, which is the
+    expected behavior for non-Active functions."""
+    fname = f"xray-pt-{_uuid_mod.uuid4().hex[:8]}"
+    _create_xray_fn(lam, fname, "PassThrough")
+    try:
+        assert _invoke_trace_id(lam, fname) == "<UNSET>"
+    finally:
+        try: lam.delete_function(FunctionName=fname)
+        except Exception: pass
+
+
+def test_lambda_xray_active_fresh_id_per_invocation(lam):
+    """Each invocation gets a distinct trace ID — the warm worker's
+    persistent subprocess must NOT cache the env var across invocations.
+    AWS contract: every Lambda invocation is a new root segment."""
+    import re as _re
+    fname = f"xray-fresh-{_uuid_mod.uuid4().hex[:8]}"
+    _create_xray_fn(lam, fname, "Active")
+    try:
+        t1 = _invoke_trace_id(lam, fname)
+        t2 = _invoke_trace_id(lam, fname)
+        assert _re.match(_XRAY_TRACE_HEADER_RE, t1), t1
+        assert _re.match(_XRAY_TRACE_HEADER_RE, t2), t2
+        assert t1 != t2, f"Trace ID was reused: {t1}"
+    finally:
+        try: lam.delete_function(FunctionName=fname)
+        except Exception: pass
+
+
+def test_lambda_xray_does_not_leak_across_functions(lam):
+    """Active on function A must not leave _X_AMZN_TRACE_ID set when
+    function B (PassThrough) runs afterward — verifies the worker bootstrap
+    clears the env var when no trace ID is injected for the call."""
+    fa = f"xray-leak-a-{_uuid_mod.uuid4().hex[:8]}"
+    fb = f"xray-leak-b-{_uuid_mod.uuid4().hex[:8]}"
+    _create_xray_fn(lam, fa, "Active")
+    _create_xray_fn(lam, fb, "PassThrough")
+    try:
+        # Prime A so its worker has _X_AMZN_TRACE_ID in os.environ.
+        _invoke_trace_id(lam, fa)
+        # B must not see the env var from A's invocation.
+        assert _invoke_trace_id(lam, fb) == "<UNSET>"
+    finally:
+        for f in (fa, fb):
+            try: lam.delete_function(FunctionName=f)
+            except Exception: pass
+
+
+def test_xray_trace_id_helper_unit():
+    """Direct unit test of the helper used by all executors."""
+    import re as _re
+    from ministack.services.lambda_svc import _xray_trace_id_for_invocation
+    # PassThrough / missing → None
+    assert _xray_trace_id_for_invocation({}) is None
+    assert _xray_trace_id_for_invocation({"TracingConfig": {"Mode": "PassThrough"}}) is None
+    # Active → synthesizes proper format
+    h = _xray_trace_id_for_invocation({"TracingConfig": {"Mode": "Active"}})
+    assert _re.match(_XRAY_TRACE_HEADER_RE, h), h
+    # Inbound header propagates regardless of mode (chained Lambda → Lambda
+    # invocation: parent's trace ID stitches into child via header).
+    inbound = "Root=1-12345678-aaaabbbbccccddddeeeeffff;Parent=1111222233334444;Sampled=1"
+    assert _xray_trace_id_for_invocation({}, inbound) == inbound
+    assert _xray_trace_id_for_invocation({"TracingConfig": {"Mode": "Active"}}, inbound) == inbound
