@@ -14,6 +14,7 @@ import os
 import threading
 import time
 
+from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.persistence import load_state
 from ministack.core.responses import AccountScopedDict, get_account_id, get_region, new_uuid
 
@@ -130,9 +131,7 @@ def _poll_once():
 
         source_arn = pipe.get("Source", "")
         target_arn = pipe.get("Target", "")
-        if ":dynamodb:" not in source_arn or "/stream/" not in source_arn:
-            continue
-        if ":sns:" not in target_arn:
+        if _arn_service(source_arn) != "dynamodb" or _arn_service(target_arn) != "sns":
             continue
 
         table_name = _table_name_from_stream_arn(source_arn)
@@ -175,10 +174,32 @@ def _publish_record_to_sns(topic_arn: str, pipe: dict, record: dict):
     _sns._fanout(topic_arn, msg_id, message, subject, "", {})
 
 
-def _table_name_from_stream_arn(stream_arn: str) -> str:
-    if "/stream/" not in stream_arn:
+def _arn_service(arn: str) -> str:
+    """Classify a target ARN for dispatch; invalid stored targets are ignored."""
+    try:
+        return parse_arn(arn).service
+    except ArnParseError:
         return ""
-    return stream_arn.split("/stream/", 1)[0].rsplit("/", 1)[-1]
+
+
+def _table_name_from_stream_arn(stream_arn: str) -> str:
+    """Return a DynamoDB table name for Pipes runtime dispatch, or empty string."""
+    try:
+        spec = parse_arn(stream_arn)
+    except ArnParseError:
+        return ""
+    if spec.service != "dynamodb":
+        return ""
+    parts = spec.resource.split("/")
+    if (
+        len(parts) < 4
+        or parts[0] != "table"
+        or parts[2] != "stream"
+        or not parts[1]
+        or not parts[3]
+    ):
+        return ""
+    return parts[1]
 
 
 def _initial_position(pipe: dict) -> int:

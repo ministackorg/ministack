@@ -11,6 +11,7 @@ import base64
 import json
 import logging
 
+from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.responses import error_response_json, json_response
 from ministack.services import dynamodb as _ddb
 
@@ -77,13 +78,27 @@ def _decode_iterator(token: str) -> dict | None:
 
 def _table_from_stream_arn(stream_arn: str) -> str | None:
     """Extract the table name from a stream ARN of the form
-    ``arn:aws:dynamodb:{region}:{account}:table/{name}/stream/{label}``."""
-    if not stream_arn or "/stream/" not in stream_arn:
+    ``arn:aws:dynamodb:{region}:{account}:table/{name}/stream/{label}``.
+
+    Invalid or out-of-shape stream ARNs map to ``None`` so describe/list paths
+    keep DynamoDB Streams' not-found behavior.
+    """
+    try:
+        spec = parse_arn(stream_arn)
+    except ArnParseError:
         return None
-    table_part = stream_arn.split("/stream/", 1)[0]
-    if ":table/" in table_part:
-        return table_part.split(":table/", 1)[1]
-    return None
+    if spec.service != "dynamodb":
+        return None
+    parts = spec.resource.split("/")
+    if (
+        len(parts) < 4
+        or parts[0] != "table"
+        or parts[2] != "stream"
+        or not parts[1]
+        or not parts[3]
+    ):
+        return None
+    return parts[1]
 
 
 def _records_for(table_name: str) -> list:
