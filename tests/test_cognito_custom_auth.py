@@ -1030,6 +1030,68 @@ def test_custom_auth_max_attempts_exceeded(cognito_idp, lam):
     assert last_exc.response["Error"]["Code"] == "NotAuthorizedException"
 
 
+# ── Test: issueTokens on cap-boundary attempt must win over MaxAttempts ──────
+
+def test_custom_auth_issue_tokens_on_third_attempt_boundary(cognito_idp, lam):
+    """A correct answer on attempt N == MAX_CHALLENGE_ATTEMPTS must issue
+    tokens, not be rejected for hitting the cap.
+
+    Regression for the order-of-checks bug: the cap is meant to prevent a
+    NEXT (4th) round, not penalize success on the boundary. Define returns
+    issueTokens=True only after the 3rd answer; the prior buggy ordering
+    rejected with `Max authentication attempts exceeded` before reaching the
+    issueTokens branch.
+    """
+    create_handler = (
+        "def handler(event, ctx):\n"
+        "    event['response']['publicChallengeParameters'] = {'challenge': 'TEST'}\n"
+        "    return event\n"
+    )
+    verify_handler = (
+        "def handler(event, ctx):\n"
+        "    event['response']['answerCorrect'] = True\n"
+        "    return event\n"
+    )
+    define_handler = (
+        "def handler(event, ctx):\n"
+        "    answered = sum(1 for c in event['request']['session']"
+        " if c.get('challengeResult') is not None)\n"
+        # Issue tokens exactly on the 3rd answered attempt (cap boundary).
+        "    if answered >= 3:\n"
+        "        event['response']['issueTokens'] = True\n"
+        "    else:\n"
+        "        event['response']['challengeName'] = 'CUSTOM_CHALLENGE'\n"
+        "    return event\n"
+    )
+    create_arn = _create_lambda(lam, "create-boundary", create_handler)
+    verify_arn = _create_lambda(lam, "verify-boundary", verify_handler)
+    define_arn = _create_lambda(lam, "define-boundary", define_handler)
+
+    pid, cid = _setup_pool(cognito_idp, "BoundaryPool", {
+        "CreateAuthChallenge": create_arn,
+        "VerifyAuthChallengeResponse": verify_arn,
+        "DefineAuthChallenge": define_arn,
+    })
+
+    step = cognito_idp.initiate_auth(
+        ClientId=cid, AuthFlow="CUSTOM_AUTH",
+        AuthParameters={"USERNAME": "user@example.com"},
+    )
+    session = step["Session"]
+    # Answer 3 times — the 3rd must issue tokens, not hit the cap.
+    last = None
+    for i in range(3):
+        last = cognito_idp.respond_to_auth_challenge(
+            ClientId=cid,
+            ChallengeName="CUSTOM_CHALLENGE",
+            Session=session,
+            ChallengeResponses={"ANSWER": f"attempt{i}", "USERNAME": "user@example.com"},
+        )
+        session = last.get("Session", session)
+    assert "AuthenticationResult" in last, last
+    assert last["AuthenticationResult"].get("AccessToken")
+
+
 # ── Test 30: Issue #725 reproduction ─────────────────────────────────────────
 
 def test_custom_auth_issue_725_repro(cognito_idp, lam):

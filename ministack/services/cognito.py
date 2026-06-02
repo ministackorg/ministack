@@ -2432,20 +2432,25 @@ def _admin_respond_to_auth_challenge(data):
             return error_response_json("NotAuthorizedException",
                     "Incorrect username or password", 400)
 
-        # Enforce the max challenge-attempts ceiling (AWS parity — issue #725 step 4)
+        # Check issueTokens FIRST — a correct answer on the Nth attempt must
+        # issue tokens even when N == MAX_CHALLENGE_ATTEMPTS. The cap is
+        # meant to prevent a NEXT (e.g. 4th) round of CreateAuthChallenge,
+        # not penalize success on the boundary attempt.
+        if define_resp.get("issueTokens"):
+            del _challenge_sessions[token]
+            return json_response({"AuthenticationResult": _build_auth_result(
+                session["pool_id"], session["client_id"], user
+            )})
+
+        # Enforce the max challenge-attempts ceiling (AWS parity — issue #725 step 4).
+        # Applied only after issueTokens has been ruled out so a correct
+        # answer on the cap-boundary attempt isn't silently rejected.
         answered_count = sum(1 for c in session["challenges"]
                             if c.get("challengeResult") is not None)
         if answered_count >= _MAX_CHALLENGE_ATTEMPTS:
             del _challenge_sessions[token]
             return error_response_json("NotAuthorizedException",
                     "Max authentication attempts exceeded", 400)
-
-        # Check if issueTokens
-        if define_resp.get("issueTokens"):
-            del _challenge_sessions[token]
-            return json_response({"AuthenticationResult": _build_auth_result(
-                session["pool_id"], session["client_id"], user
-            )})
 
         # Determine next challenge
         next_challenge = define_resp.get("challengeName")
@@ -2778,20 +2783,25 @@ def _respond_to_auth_challenge(data):
             return error_response_json("NotAuthorizedException",
                     "Incorrect username or password", 400)
 
-        # Enforce the max challenge-attempts ceiling (AWS parity — issue #725 step 4)
+        # Check issueTokens FIRST — a correct answer on the Nth attempt must
+        # issue tokens even when N == MAX_CHALLENGE_ATTEMPTS. The cap is
+        # meant to prevent a NEXT (e.g. 4th) round of CreateAuthChallenge,
+        # not penalize success on the boundary attempt.
+        if define_resp.get("issueTokens"):
+            del _challenge_sessions[token]
+            return json_response({"AuthenticationResult": _build_auth_result(
+                session["pool_id"], session["client_id"], user
+            )})
+
+        # Enforce the max challenge-attempts ceiling (AWS parity — issue #725 step 4).
+        # Applied only after issueTokens has been ruled out so a correct
+        # answer on the cap-boundary attempt isn't silently rejected.
         answered_count = sum(1 for c in session["challenges"]
                             if c.get("challengeResult") is not None)
         if answered_count >= _MAX_CHALLENGE_ATTEMPTS:
             del _challenge_sessions[token]
             return error_response_json("NotAuthorizedException",
                     "Max authentication attempts exceeded", 400)
-
-        # Check if issueTokens
-        if define_resp.get("issueTokens"):
-            del _challenge_sessions[token]
-            return json_response({"AuthenticationResult": _build_auth_result(
-                session["pool_id"], session["client_id"], user
-            )})
 
         # Determine next challenge
         next_challenge = define_resp.get("challengeName")
