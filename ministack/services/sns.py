@@ -27,6 +27,7 @@ _HOST = os.environ.get("MINISTACK_HOST", "localhost")
 _PORT = os.environ.get("GATEWAY_PORT", "4566")
 
 import ministack.services.lambda_svc as _lambda_svc
+from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.responses import AccountScopedDict, get_account_id, get_region, new_uuid
 from ministack.services import sqs as _sqs
 
@@ -46,6 +47,46 @@ def _normalize_arn(arn: str) -> str:
     if arn and _re.match(r"arn:aws:sns:[^:]+::[^:]+", arn):
         return _re.sub(r"(arn:aws:sns:[^:]+)::", rf"\1:{get_account_id()}:", arn)
     return arn
+
+
+def _sqs_queue_name_from_arn_spec(spec) -> str | None:
+    if spec.service != "sqs" or not spec.resource or ":" in spec.resource or "/" in spec.resource:
+        return None
+    return spec.resource
+
+
+def _lambda_function_name_from_arn_spec(spec) -> str | None:
+    if spec.service != "lambda":
+        return None
+    parts = spec.resource.split(":", 2)
+    if len(parts) < 2 or parts[0] != "function" or not parts[1]:
+        return None
+    return parts[1]
+
+
+def _invalid_subscription_endpoint(protocol: str, endpoint: str):
+    return _error(
+        "InvalidParameterException",
+        f"Invalid parameter: Endpoint {endpoint} is not a valid {protocol.upper()} ARN",
+        400,
+    )
+
+
+def _validate_subscription_endpoint(protocol: str, endpoint: str):
+    if protocol not in {"sqs", "lambda"}:
+        return None
+    try:
+        spec = parse_arn(endpoint)
+    except ArnParseError:
+        return _invalid_subscription_endpoint(protocol, endpoint)
+
+    if not spec.region or not spec.account_id:
+        return _invalid_subscription_endpoint(protocol, endpoint)
+    if protocol == "sqs" and not _sqs_queue_name_from_arn_spec(spec):
+        return _invalid_subscription_endpoint(protocol, endpoint)
+    if protocol == "lambda" and not _lambda_function_name_from_arn_spec(spec):
+        return _invalid_subscription_endpoint(protocol, endpoint)
+    return None
 
 from ministack.core.persistence import PERSIST_STATE, load_state
 
@@ -293,6 +334,9 @@ def _subscribe(params):
 
     if not protocol:
         return _error("InvalidParameterException", "Protocol is required", 400)
+    endpoint_error = _validate_subscription_endpoint(protocol, endpoint)
+    if endpoint_error:
+        return endpoint_error
 
     for existing in topic["subscriptions"]:
         if existing["protocol"] == protocol and existing["endpoint"] == endpoint:
@@ -857,9 +901,26 @@ def _fanout(topic_arn: str, msg_id: str, message: str, subject: str,
 def _deliver_to_sqs(endpoint: str, envelope: str, raw: bool, raw_message: str,
                     message_group_id: str = "", message_dedup_id: str = "",
                     message_attributes: dict | None = None):
-    queue_name = endpoint.split(":")[-1]
-    queue_url = _sqs._queue_url(queue_name)
-    queue = _sqs._queues.get(queue_url)
+    try:
+        spec = parse_arn(endpoint)
+    except ArnParseError:
+        logger.warning("SNS fanout: invalid SQS endpoint ARN %s", endpoint)
+        return
+    queue_name = _sqs_queue_name_from_arn_spec(spec)
+    if not queue_name:
+        logger.warning("SNS fanout: invalid SQS endpoint ARN %s", endpoint)
+        return
+    if spec.account_id != get_account_id():
+        logger.warning("SNS fanout: SQS queue %s is outside the current account scope", queue_name)
+        return
+    queue = next(
+        (
+            q
+            for q in _sqs._queues.values()
+            if q.get("attributes", {}).get("QueueArn") == str(spec)
+        ),
+        None,
+    )
     if not queue:
         logger.warning("SNS fanout: SQS queue %s not found", queue_name)
         return
