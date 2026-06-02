@@ -658,6 +658,37 @@ def test_logs_delivery_source_service_derived_from_resource_arn(logs):
     logs.delete_delivery_source(name=src_name)
 
 
+def test_logs_delivery_source_rejects_malformed_resource_arn(logs):
+    """Malformed delivery source ARNs fail before any source is stored."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    with pytest.raises(ClientError) as exc:
+        logs.put_delivery_source(
+            name=f"intg-svc-malformed-{uid}",
+            resourceArn="not-an-arn",
+            logType="APPLICATION_LOGS",
+        )
+    assert exc.value.response["Error"]["Code"] == "ValidationException"
+
+
+@pytest.mark.parametrize(
+    ("resource_arn", "expected_code"),
+    [
+        ("arn:aws:bedrock:us-west-2:000000000000:knowledge-base/test", "ValidationException"),
+        ("arn:aws:bedrock:us-east-1:111111111111:knowledge-base/test", "ValidationException"),
+        ("arn:aws:sns:us-east-1:000000000000:test", "ResourceNotFoundException"),
+    ],
+)
+def test_logs_delivery_source_rejects_wrong_scope_resource_arns(logs, resource_arn, expected_code):
+    uid = _uuid_mod.uuid4().hex[:8]
+    with pytest.raises(ClientError) as exc:
+        logs.put_delivery_source(
+            name=f"intg-svc-scope-{uid}",
+            resourceArn=resource_arn,
+            logType="APPLICATION_LOGS",
+        )
+    assert exc.value.response["Error"]["Code"] == expected_code
+
+
 def test_logs_delivery_destination_type_derived_from_arn(logs):
     """PutDeliveryDestination must compute ``deliveryDestinationType`` from
     the destinationResourceArn (S3 / CWL / FH)."""
@@ -677,6 +708,26 @@ def test_logs_delivery_destination_type_derived_from_arn(logs):
         logs.delete_delivery_destination(name=dest_name)
 
 
+@pytest.mark.parametrize(
+    "destination_resource_arn",
+    [
+        "arn:aws:logs:us-west-2:000000000000:log-group:/intg/foreign:*",
+        "arn:aws:logs:us-east-1:111111111111:log-group:/intg/bogus:*",
+        "arn:aws:firehose:us-west-2:000000000000:deliverystream/foreign",
+        "arn:aws:firehose:us-east-1:111111111111:deliverystream/bogus",
+        "arn:aws:s3:us-east-1:000000000000:bucket-with-region",
+    ],
+)
+def test_logs_delivery_destination_rejects_wrong_scope_target_arns(logs, destination_resource_arn):
+    uid = _uuid_mod.uuid4().hex[:8]
+    with pytest.raises(ClientError) as exc:
+        logs.put_delivery_destination(
+            name=f"intg-dest-scope-{uid}",
+            deliveryDestinationConfiguration={"destinationResourceArn": destination_resource_arn},
+        )
+    assert exc.value.response["Error"]["Code"] == "ValidationException"
+
+
 def test_logs_delivery_destination_rejects_unknown_output_format(logs):
     """outputFormat outside the AWS-allowed set is rejected."""
     uid = _uuid_mod.uuid4().hex[:8]
@@ -694,14 +745,19 @@ def test_logs_delivery_destination_rejects_unknown_output_format(logs):
 def test_logs_delivery_destination_rejects_unsupported_target(logs):
     """destinationResourceArn that isn't S3/CWL/FH is rejected upfront."""
     uid = _uuid_mod.uuid4().hex[:8]
-    with pytest.raises(ClientError) as exc:
-        logs.put_delivery_destination(
-            name=f"intg-bad-target-{uid}",
-            deliveryDestinationConfiguration={
-                "destinationResourceArn": f"arn:aws:lambda:us-east-1:000000000000:function:anything-{uid}",
-            },
-        )
-    assert exc.value.response["Error"]["Code"] == "ValidationException"
+    cases = [
+        "not-an-arn",
+        f"arn:aws:lambda:us-east-1:000000000000:function:anything-{uid}",
+    ]
+    for i, arn in enumerate(cases):
+        with pytest.raises(ClientError) as exc:
+            logs.put_delivery_destination(
+                name=f"intg-bad-target-{uid}-{i}",
+                deliveryDestinationConfiguration={
+                    "destinationResourceArn": arn,
+                },
+            )
+        assert exc.value.response["Error"]["Code"] == "ValidationException"
 
 
 def test_logs_create_delivery_requires_destination_to_exist(logs):
@@ -723,6 +779,25 @@ def test_logs_create_delivery_requires_destination_to_exist(logs):
         assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
     finally:
         logs.delete_delivery_source(name=src_name)
+
+
+@pytest.mark.parametrize(
+    ("delivery_destination_arn", "expected_code"),
+    [
+        ("arn:aws:logs:us-west-2:000000000000:delivery-destination:foreign", "ValidationException"),
+        ("arn:aws:logs:us-east-1:111111111111:delivery-destination:bogus", "AccessDeniedException"),
+        ("not-an-arn", "ValidationException"),
+        ("arn:aws:sns:us-east-1:000000000000:not-a-delivery-destination", "ValidationException"),
+    ],
+)
+def test_logs_create_delivery_rejects_invalid_destination_arn_before_source(logs, delivery_destination_arn, expected_code):
+    uid = _uuid_mod.uuid4().hex[:8]
+    with pytest.raises(ClientError) as exc:
+        logs.create_delivery(
+            deliverySourceName=f"missing-src-{uid}",
+            deliveryDestinationArn=delivery_destination_arn,
+        )
+    assert exc.value.response["Error"]["Code"] == expected_code
 
 
 def test_logs_create_delivery_rejects_duplicate_pair(logs):
