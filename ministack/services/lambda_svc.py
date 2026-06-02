@@ -28,6 +28,7 @@ import asyncio
 import base64
 import copy
 import hashlib
+import secrets
 import importlib
 import io
 import json
@@ -90,6 +91,29 @@ def _emit_lambda_metrics(function_name: str, duration_ms: float,
             )
     except Exception:
         logger.debug("emit lambda metrics failed", exc_info=True)
+
+
+def _xray_trace_id_for_invocation(config: dict, inbound_trace_header: str | None = None) -> str | None:
+    """Return the value to set as ``_X_AMZN_TRACE_ID`` for an invocation.
+
+    AWS Lambda exposes this env var to the runtime when ``TracingConfig.Mode``
+    is ``Active``. Format per AWS X-Ray docs:
+    ``Root=1-<8hex_epoch>-<24hex_random>;Parent=<16hex_random>;Sampled=1``.
+    If the inbound request already carries an ``X-Amzn-Trace-Id`` header (a
+    chained Lambda → Lambda invocation), prefer it so traces stitch across
+    hops; otherwise synthesize a fresh root segment. Returns ``None`` when
+    tracing is not Active and no inbound header is present, so the caller can
+    skip the env-var entirely.
+    """
+    if inbound_trace_header:
+        return inbound_trace_header
+    mode = (config.get("TracingConfig") or {}).get("Mode", "PassThrough")
+    if mode != "Active":
+        return None
+    epoch_hex = format(int(time.time()), "08x")
+    root_random = secrets.token_hex(12)   # 24 hex chars
+    parent = secrets.token_hex(8)          # 16 hex chars
+    return f"Root=1-{epoch_hex}-{root_random};Parent={parent};Sampled=1"
 
 
 def _account_from_arn(arn: str) -> str:
@@ -2434,6 +2458,23 @@ def _spawn_lambda_container(config: dict, code_zip: bytes | None):
     # Per-invocation durable-execution overlay (no-op when the call isn't
     # inside a durable function).
     container_env.update(_durable_env_overlay())
+    # NOTE: X-Ray active tracing is NOT supported in the docker RIE
+    # executor. AWS RIE explicitly does not implement X-Ray
+    # (https://github.com/aws/aws-lambda-runtime-interface-emulator —
+    # "The component does not support X-ray and other Lambda integrations
+    # locally") and the RIE container is pooled and reused, so baking
+    # ``_X_AMZN_TRACE_ID`` into ``container_env`` here would be stale on
+    # every reuse anyway. Functions that need X-Ray must use the warm
+    # Python/Node executor (default for those runtimes), the provided
+    # runtime, or the local subprocess executor.
+    if (config.get("TracingConfig") or {}).get("Mode") == "Active":
+        logger.warning(
+            "Lambda %s: TracingConfig.Mode=Active is not supported in the "
+            "docker RIE executor (AWS RIE limitation). _X_AMZN_TRACE_ID will "
+            "not be set in the runtime. Set LAMBDA_EXECUTOR= (empty) to use "
+            "the warm worker, which supports X-Ray.",
+            config.get("FunctionName", "?"),
+        )
     # AWS_ENDPOINT_URL set *after* function env so it always points at ministack.
     # Replace localhost/127.0.0.1 with host.docker.internal so the container
     # can reach the host where ministack is running.
@@ -2897,6 +2938,13 @@ def _execute_function_proxy(func: dict, event: dict, url: str, request_id: str) 
         "X-Amzn-Lambda-Request-Id": request_id,
         "X-Amzn-Lambda-Deadline-Ms": str(int((time.time() + timeout) * 1000)),
     }
+    # X-Ray active tracing — pass the trace header to the proxy. The user's
+    # container can translate it to ``_X_AMZN_TRACE_ID`` if their code reads
+    # X-Ray traces. Proxy mode is by definition not a Lambda runtime
+    # emulation, so this is best-effort header forwarding only.
+    _xray_trace_id = _xray_trace_id_for_invocation(config)
+    if _xray_trace_id:
+        headers["X-Amzn-Trace-Id"] = _xray_trace_id
     req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -2953,6 +3001,13 @@ def _execute_function_warm(func: dict, event: dict) -> dict:
     qualifier = config.get("Version", "$LATEST")
     try:
         worker = get_or_create_worker(func_name, config, code_zip, qualifier=qualifier)
+        # Inject X-Ray trace header into the event so the worker bootstrap
+        # can set ``_X_AMZN_TRACE_ID`` in os.environ before calling the
+        # handler. Per-invocation, not bake-time, so it can't live in the
+        # worker's spawn env.
+        _xray = _xray_trace_id_for_invocation(config)
+        if _xray:
+            event["_x_amzn_trace_id"] = _xray
         result = worker.invoke(event, new_uuid())
         if result.get("status") == "ok":
             return {"body": result.get("result"), "log": result.get("log", "")}
@@ -3116,6 +3171,13 @@ def _execute_function_provided(func: dict, event: dict) -> dict:
                 })
                 proc_env.update(env_vars)
                 proc_env.update(_durable_env_overlay())
+                # X-Ray active tracing. ``_execute_function_provided`` builds
+                # ``proc_env`` per-invocation, so a per-call trace ID is safe
+                # here (unlike the RIE pool). aws-xray-sdk reads this env var
+                # per-segment via ``os.getenv``, so the runtime sees it.
+                _xray_trace_id = _xray_trace_id_for_invocation(config)
+                if _xray_trace_id:
+                    proc_env["_X_AMZN_TRACE_ID"] = _xray_trace_id
                 # Override AWS_ENDPOINT_URL *after* function env vars so
                 # Lambda binaries always call back to this MiniStack
                 # instance.  Function-level env vars may carry the
@@ -3276,6 +3338,11 @@ def _execute_function_local(func: dict, event: dict) -> dict:
                 env["AWS_ENDPOINT_URL"] = endpoint
             env.update(env_vars)
             env.update(_durable_env_overlay())
+            # X-Ray active tracing — one-shot subprocess, env is per-invocation
+            # so a fresh trace ID per call is safe (unlike the pooled RIE).
+            _xray_trace_id = _xray_trace_id_for_invocation(config)
+            if _xray_trace_id:
+                env["_X_AMZN_TRACE_ID"] = _xray_trace_id
 
             cmd = ["node", wrapper_path] if is_node else ["python3", wrapper_path]
             proc = subprocess.run(
