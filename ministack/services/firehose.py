@@ -20,9 +20,11 @@ import copy
 import json
 import logging
 import os
+import re
 import threading
 import time
 
+from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.persistence import PERSIST_STATE, load_state
 from ministack.core.responses import (
     AccountScopedDict,
@@ -37,6 +39,9 @@ from ministack.core.responses import (
 logger = logging.getLogger("firehose")
 
 REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
+_S3_BUCKET_NAME_RE = re.compile(
+    r"^(?!\d+\.\d+\.\d+\.\d+$)(?!.*\.\.)[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$",
+)
 
 # ─── in-memory state ──────────────────────────────────────────────────────────
 
@@ -77,6 +82,34 @@ except Exception:
 
 def _stream_arn(name: str) -> str:
     return f"arn:aws:firehose:{get_region()}:{get_account_id()}:deliverystream/{name}"
+
+
+def _s3_bucket_from_arn(bucket_arn: str) -> str:
+    try:
+        spec = parse_arn(bucket_arn)
+    except ArnParseError as exc:
+        raise ValueError("BucketARN must be an S3 bucket ARN.") from exc
+
+    if (
+        spec.service != "s3"
+        or spec.region
+        or spec.account_id
+        or not spec.resource
+        or "/" in spec.resource
+        or not _S3_BUCKET_NAME_RE.fullmatch(spec.resource)
+    ):
+        raise ValueError("BucketARN must be an S3 bucket ARN.")
+    return spec.resource
+
+
+def _validate_s3_destination_config(dtype: str, cfg: dict):
+    if dtype not in ("ExtendedS3", "S3") or "BucketARN" not in cfg:
+        return None
+    try:
+        _s3_bucket_from_arn(cfg.get("BucketARN", ""))
+    except ValueError as exc:
+        return _invalid(str(exc))
+    return None
 
 
 def _next_dest_id() -> str:
@@ -321,7 +354,7 @@ def _deliver_to_s3(stream: dict, dest: dict, record_data: bytes):
 
         cfg = dest["config"]
         bucket_arn = cfg.get("BucketARN", "")
-        bucket = bucket_arn.split(":::")[-1] if ":::" in bucket_arn else bucket_arn
+        bucket = _s3_bucket_from_arn(bucket_arn)
         prefix = cfg.get("Prefix", "")
         ts = time.strftime("%Y/%m/%d/%H", time.gmtime())
         key = f"{prefix}{ts}/{stream['name']}-{new_uuid()}"
@@ -430,6 +463,9 @@ def _create_delivery_stream(data: dict):
         # A stream with no destination is valid (destination added later via UpdateDestination)
         destinations = []
         if dtype and cfg is not None:
+            validation_error = _validate_s3_destination_config(dtype, cfg)
+            if validation_error:
+                return validation_error
             destinations.append({
                 "id": _next_dest_id(),
                 "type": dtype,
@@ -626,6 +662,9 @@ def _update_destination(data: dict):
 
         dtype, cfg = _resolve_dest_update_config(data)
         if dtype and cfg is not None:
+            validation_error = _validate_s3_destination_config(dtype, cfg)
+            if validation_error:
+                return validation_error
             if dtype == dest["type"]:
                 # Same destination type — merge fields (AWS behaviour)
                 dest["config"] = {**dest["config"], **cfg}
