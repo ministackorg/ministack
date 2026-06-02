@@ -283,6 +283,7 @@ SERVICE_REGISTRY = {
     "kms": {"module": "kms"},
     "lambda": {"module": "lambda_svc"},
     "logs": {"module": "cloudwatch_logs", "aliases": ("cloudwatch-logs",)},
+    "mediaconnect": {"module": "mediaconnect"},
     "opensearch": {"module": "opensearch", "aliases": ("es", "elasticsearch")},
     "organizations": {"module": "organizations"},
     "monitoring": {"module": "cloudwatch", "aliases": ("cloudwatch",)},

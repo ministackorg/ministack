@@ -372,3 +372,104 @@ def test_eks_addon_create_duplicate_returns_resource_in_use(eks):
     finally:
         try: eks.delete_cluster(name=cn)
         except Exception: pass
+
+
+# ---------------------------------------------------------------------------
+# AssociateEncryptionConfig
+# ---------------------------------------------------------------------------
+
+def test_eks_associate_encryption_config(eks):
+    cn = f"enc-{_uid()}"
+    key_arn = f"arn:aws:kms:{REGION}:000000000000:key/{uuid.uuid4()}"
+    eks.create_cluster(
+        name=cn, roleArn="arn:aws:iam::000000000000:role/eks",
+        resourcesVpcConfig={"subnetIds": ["subnet-1"]},
+    )
+    try:
+        resp = eks.associate_encryption_config(
+            clusterName=cn,
+            encryptionConfig=[{"resources": ["secrets"], "provider": {"keyArn": key_arn}}],
+        )
+        upd = resp["update"]
+        assert upd["type"] == "AssociateEncryptionConfig"
+        assert upd["status"] == "Successful"
+        assert upd["id"]
+        desc = eks.describe_cluster(name=cn)["cluster"]
+        assert desc["encryptionConfig"][0]["provider"]["keyArn"] == key_arn
+    finally:
+        try: eks.delete_cluster(name=cn)
+        except Exception: pass
+
+
+def test_eks_associate_encryption_config_missing_cluster(eks):
+    with pytest.raises(ClientError) as e:
+        eks.associate_encryption_config(
+            clusterName=f"nope-{_uid()}",
+            encryptionConfig=[{"resources": ["secrets"],
+                               "provider": {"keyArn": "arn:aws:kms:us-east-1:000000000000:key/x"}}],
+        )
+    assert e.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
+def test_eks_associate_encryption_config_already_set(eks):
+    cn = f"enc-dup-{_uid()}"
+    cfg = [{"resources": ["secrets"],
+            "provider": {"keyArn": f"arn:aws:kms:{REGION}:000000000000:key/{uuid.uuid4()}"}}]
+    eks.create_cluster(
+        name=cn, roleArn="arn:aws:iam::000000000000:role/eks",
+        resourcesVpcConfig={"subnetIds": ["subnet-1"]},
+        encryptionConfig=cfg,
+    )
+    try:
+        with pytest.raises(ClientError) as e:
+            eks.associate_encryption_config(clusterName=cn, encryptionConfig=cfg)
+        assert e.value.response["Error"]["Code"] == "InvalidRequestException"
+    finally:
+        try: eks.delete_cluster(name=cn)
+        except Exception: pass
+
+
+# ---------------------------------------------------------------------------
+# OIDC discovery / JWKS (IRSA)
+# ---------------------------------------------------------------------------
+
+def test_eks_oidc_issuer_is_ministack_hosted(eks):
+    cn = f"oidc-{_uid()}"
+    eks.create_cluster(
+        name=cn, roleArn="arn:aws:iam::000000000000:role/eks",
+        resourcesVpcConfig={"subnetIds": ["subnet-1"]},
+    )
+    try:
+        issuer = eks.describe_cluster(name=cn)["cluster"]["identity"]["oidc"]["issuer"]
+        # Must be reachable from clients — points at ministack, not real AWS.
+        assert issuer.startswith("http://"), issuer
+        assert "/oidc/id/" in issuer, issuer
+        assert "amazonaws.com" not in issuer, issuer
+    finally:
+        try: eks.delete_cluster(name=cn)
+        except Exception: pass
+
+
+def test_eks_oidc_discovery_document(eks):
+    import urllib.request
+    cn = f"oidc-disc-{_uid()}"
+    eks.create_cluster(
+        name=cn, roleArn="arn:aws:iam::000000000000:role/eks",
+        resourcesVpcConfig={"subnetIds": ["subnet-1"]},
+    )
+    try:
+        issuer = eks.describe_cluster(name=cn)["cluster"]["identity"]["oidc"]["issuer"]
+        with urllib.request.urlopen(f"{issuer}/.well-known/openid-configuration") as r:
+            doc = json.loads(r.read())
+        assert doc["issuer"] == issuer
+        assert doc["jwks_uri"] == f"{issuer}/keys"
+        assert "RS256" in doc["id_token_signing_alg_values_supported"]
+        # JWKS must also be reachable and contain at least one RSA signing key.
+        with urllib.request.urlopen(doc["jwks_uri"]) as r:
+            jwks = json.loads(r.read())
+        assert jwks["keys"]
+        assert jwks["keys"][0]["kty"] == "RSA"
+        assert jwks["keys"][0]["use"] == "sig"
+    finally:
+        try: eks.delete_cluster(name=cn)
+        except Exception: pass

@@ -7,6 +7,21 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [1.3.55] — 2026-06-01
+
+### Added
+- **AWS Elemental MediaConnect — control-plane stub** — `CreateFlow`, `DescribeFlow`, `ListFlows`, `UpdateFlow`, `ListTagsForResource` at `/v1/flows[/{FlowArn}]` and `/tags/{ResourceArn}`. `ListFlows` returns the slimmer AWS `ListedFlow` projection (no Outputs/Sources/Entitlements); `UpdateFlow` is narrow to the AWS-allowed top-level fields (`SourceFailoverConfig`, `Maintenance`, `SourceMonitoringConfig`, `NdiConfig`); flow records use the wire-form camelCase keys per the AWS REST-JSON model. No real streaming/transcoder — flows are control-plane metadata, enough to integration-test services that wrap the MediaConnect API. Reported by @tashif-hoda.
+- **EKS `AssociateEncryptionConfig` + OIDC discovery / JWKS for IRSA** — new `POST /clusters/{name}/encryption-config/associate` returns an `update` envelope and rejects re-association (matches AWS, which only allows adding encryption to a cluster that has none). Cluster `identity.oidc.issuer` now points at a ministack-hosted URL (`/oidc/id/{32-char-id}`) instead of the real `oidc.eks.{region}.amazonaws.com` (unreachable from clients); `GET <issuer>/.well-known/openid-configuration` and `GET <issuer>/keys` are served at the AWS-shape paths, with `authorization_endpoint: "urn:kubernetes:programmatic_authorization"` and `claims_supported: ["sub","iss"]` matching the real EKS discovery document. A single RSA keypair is generated lazily on first request and shared across clusters — sufficient for Terraform's `aws_iam_openid_connect_provider` to fetch the document. Reported by @b-rajesh.
+
+### Fixed
+- **API Gateway v2 Lambda-proxy — `Set-Cookie` from `headers` and the `cookies` array now both ship** — observed real-AWS behavior is to emit the array entries first followed by any `Set-Cookie` carried in `headers`; the earlier supersede approach silently dropped the header cookie. Case-insensitive on the header key.Contributed by @rmlasseter.
+- **API Gateway v2 Lambda-proxy — `isBase64Encoded` honored in both directions** — request bodies for binary content types are now base64-encoded with `isBase64Encoded: true`; response bodies marked `isBase64Encoded: true` are decoded to raw bytes (HTTP API v2 has no `binaryMediaTypes` negotiation — it's unconditional). The text/binary split for the request body (only `text/*` and `application/json` / `application/xml` / `application/javascript` arrive as UTF-8 strings; everything else, including a missing `Content-Type` and `application/x-www-form-urlencoded`, is base64) matches the AWS-observed behavior. Contributed by @rmlasseter.
+- **API Gateway v1 Lambda-proxy — `binaryMediaTypes` is now wired** — request bodies whose `Content-Type` matches a configured `binaryMediaType` are delivered base64-encoded with `isBase64Encoded: true`; response bodies with `isBase64Encoded: true` are decoded to raw bytes only when the request `Accept` also matches a `binaryMediaType`. `binaryMediaTypes` was stored on the API record but inert at invocation before this. Wildcards (`*/*`, `type/*`) honored on the configured side; a request value of `*/*` does NOT auto-match specific configured types — verified against real AWS. Contributed by @rmlasseter.
+- **API Gateway v2 Lambda-proxy — case-insensitive header override** — a lowercase `content-type` (or any case-mismatched header) from a Lambda response now replaces ministack's seeded default rather than shipping a duplicate header. HTTP field names are case-insensitive per RFC 9110 §5.1. Contributed by @rmlasseter.
+- **API Gateway v1 Lambda-proxy — case-insensitive header override** — same fix on the `headers` merge for REST APIs: the v1 builder previously case-folded only the `multiValueHeaders` merge, so a lowercase `content-type` shipped twice; it now overrides the default and is emitted once. Contributed by @rmlasseter.
+
+---
+
 ## [1.3.54] — 2026-05-30
 
 ### Added

@@ -56,6 +56,53 @@ _addons = AccountScopedDict()         # "cluster/addonName" -> addon record
 _tags = AccountScopedDict()           # arn -> {key: value}
 _port_counter_lock = threading.Lock()
 _port_counter = [EKS_BASE_PORT]
+_oidc_keypair_lock = threading.Lock()
+_oidc_keypair = None                  # (private_key, jwk_dict, kid)
+
+
+def _ministack_issuer_base():
+    host = os.environ.get("MINISTACK_HOST", "localhost")
+    port = os.environ.get("GATEWAY_PORT", "4566")
+    return f"http://{host}:{port}/oidc"
+
+
+def _new_oidc_id():
+    return new_uuid()[:32].replace("-", "").upper()
+
+
+def _issuer_url(oidc_id):
+    return f"{_ministack_issuer_base()}/id/{oidc_id}"
+
+
+def _get_oidc_keypair():
+    """Lazily generate a single RSA keypair for OIDC discovery / JWKS.
+
+    Shared across all clusters — ministack does not issue real IRSA tokens, so
+    a single advertised key is sufficient for Terraform's
+    aws_iam_openid_connect_provider to fetch + thumbprint the issuer.
+    """
+    global _oidc_keypair
+    if _oidc_keypair is not None:
+        return _oidc_keypair
+    with _oidc_keypair_lock:
+        if _oidc_keypair is not None:
+            return _oidc_keypair
+        from cryptography.hazmat.primitives.asymmetric import rsa
+        priv = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        nums = priv.public_key().public_numbers()
+        n_bytes = nums.n.to_bytes((nums.n.bit_length() + 7) // 8, "big")
+        e_bytes = nums.e.to_bytes((nums.e.bit_length() + 7) // 8, "big")
+        kid = new_uuid()[:16]
+        jwk = {
+            "kty": "RSA",
+            "alg": "RS256",
+            "use": "sig",
+            "kid": kid,
+            "n": base64.urlsafe_b64encode(n_bytes).rstrip(b"=").decode(),
+            "e": base64.urlsafe_b64encode(e_bytes).rstrip(b"=").decode(),
+        }
+        _oidc_keypair = (priv, jwk, kid)
+        return _oidc_keypair
 
 
 def reset():
@@ -301,7 +348,7 @@ def _create_cluster(body):
         },
         "logging": body.get("logging", {"clusterLogging": []}),
         "identity": {
-            "oidc": {"issuer": f"https://oidc.eks.{get_region()}.amazonaws.com/id/{new_uuid()[:32].replace('-', '').upper()}"}
+            "oidc": {"issuer": _issuer_url(_new_oidc_id())}
         },
         "status": "CREATING",
         "certificateAuthority": {"data": ""},
@@ -588,6 +635,64 @@ def _update_addon(cluster_name, addon_name, body):
 
 
 # ---------------------------------------------------------------------------
+# Encryption config (AssociateEncryptionConfig)
+# ---------------------------------------------------------------------------
+
+def _associate_encryption_config(cluster_name, body):
+    cluster = _clusters.get(cluster_name)
+    if not cluster:
+        return _error(404, "ResourceNotFoundException",
+                      f"No cluster found for name: {cluster_name}.")
+    new_cfg = body.get("encryptionConfig") or []
+    if not new_cfg:
+        return _error(400, "InvalidParameterException",
+                      "encryptionConfig is required.")
+    if len(new_cfg) > 1:
+        return _error(400, "InvalidParameterException",
+                      "encryptionConfig array can have at most 1 item.")
+    if cluster.get("encryptionConfig"):
+        return _error(400, "InvalidRequestException",
+                      f"Cluster {cluster_name} already has encryption configuration associated.")
+    cluster["encryptionConfig"] = new_cfg
+    update = {
+        "id": new_uuid(),
+        "status": "Successful",
+        "type": "AssociateEncryptionConfig",
+        "params": [{"type": "EncryptionConfig", "value": json.dumps(new_cfg)}],
+        "createdAt": _now(),
+        "errors": [],
+    }
+    return _json_resp(200, {"update": update})
+
+
+# ---------------------------------------------------------------------------
+# OIDC discovery / JWKS (IRSA support)
+# ---------------------------------------------------------------------------
+
+def _oidc_discovery(oidc_id):
+    issuer = _issuer_url(oidc_id)
+    return _json_resp(200, {
+        "issuer": issuer,
+        "jwks_uri": f"{issuer}/keys",
+        # Real AWS EKS publishes this exact sentinel — IRSA never uses an
+        # interactive authorization flow, it just validates signed tokens.
+        "authorization_endpoint": "urn:kubernetes:programmatic_authorization",
+        "response_types_supported": ["id_token"],
+        "subject_types_supported": ["public"],
+        "id_token_signing_alg_values_supported": ["RS256"],
+        "claims_supported": ["sub", "iss"],
+    })
+
+
+def _oidc_jwks():
+    try:
+        _, jwk, _ = _get_oidc_keypair()
+    except ImportError:
+        return _error(500, "ServiceUnavailable", "cryptography library unavailable")
+    return _json_resp(200, {"keys": [jwk]})
+
+
+# ---------------------------------------------------------------------------
 # Tags
 # ---------------------------------------------------------------------------
 
@@ -671,6 +776,21 @@ async def handle_request(method, path, headers, body_bytes, query_params):
             return _describe_nodegroup(cluster_name, ng_name)
         if method == "DELETE":
             return _delete_nodegroup(cluster_name, ng_name)
+
+    # POST /clusters/{name}/encryption-config/associate — AssociateEncryptionConfig
+    m = re.fullmatch(r"/clusters/([A-Za-z0-9_-]+)/encryption-config/associate", path)
+    if m:
+        cluster_name = m.group(1)
+        if method == "POST":
+            return _associate_encryption_config(cluster_name, body)
+
+    # OIDC discovery + JWKS (IRSA). Path matches AWS shape under the ministack
+    # /oidc prefix because we can't own oidc.eks.{region}.amazonaws.com.
+    m = re.fullmatch(r"/oidc/id/([A-Z0-9]+)/\.well-known/openid-configuration", path)
+    if m and method == "GET":
+        return _oidc_discovery(m.group(1))
+    if re.fullmatch(r"/oidc/id/[A-Z0-9]+/keys", path) and method == "GET":
+        return _oidc_jwks()
 
     # POST/GET /clusters/{name}/addons
     m = re.fullmatch(r"/clusters/([A-Za-z0-9_-]+)/addons", path)

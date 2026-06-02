@@ -701,6 +701,96 @@ def test_apigwv1_execute_lambda_proxy_header_case_override(apigw_v1, lam):
     lam.delete_function(FunctionName=fname)
 
 
+def test_apigwv1_execute_lambda_proxy_binary_media_types(apigw_v1, lam):
+    """REST API (v1) binary support keyed off `binaryMediaTypes`.
+
+    Verified against real AWS: a request body whose Content-Type matches a
+    configured binaryMediaType is delivered base64 (isBase64Encoded=true); a
+    base64 response body is decoded only when the request Accept also matches.
+    """
+    import base64 as _b64
+    import hashlib
+    import json as _json
+    import urllib.request as _urlreq
+    import uuid as _uuid
+
+    fname = f"intg-v1-binmedia-{_uuid.uuid4().hex[:8]}"
+    code = (
+        b"import json, base64, hashlib\n"
+        b"def handler(event, context):\n"
+        b"    qs = event.get('queryStringParameters') or {}\n"
+        b"    if qs.get('mode') == 'resp':\n"
+        b"        return {'statusCode': 200, 'isBase64Encoded': True,\n"
+        b"                'headers': {'Content-Type': 'application/octet-stream'},\n"
+        b"                'body': base64.b64encode(bytes(range(8))).decode('ascii')}\n"
+        b"    b = event.get('body'); isb = bool(event.get('isBase64Encoded'))\n"
+        b"    if b is None: raw = b''\n"
+        b"    elif isb: raw = base64.b64decode(b)\n"
+        b"    else: raw = b.encode('utf-8', 'surrogateescape')\n"
+        b"    return {'statusCode': 200, 'headers': {'Content-Type': 'application/json'},\n"
+        b"            'body': json.dumps({'isB64': isb, 'sha': hashlib.sha256(raw).hexdigest()})}\n"
+    )
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("index.py", code)
+    lam.create_function(
+        FunctionName=fname, Runtime="python3.12",
+        Role="arn:aws:iam::000000000000:role/test-role",
+        Handler="index.handler", Code={"ZipFile": buf.getvalue()},
+    )
+
+    api_id = apigw_v1.create_rest_api(
+        name=f"v1-binmedia-{fname}", binaryMediaTypes=["application/octet-stream"],
+    )["id"]
+    root = next(r for r in apigw_v1.get_resources(restApiId=api_id)["items"] if r["path"] == "/")
+    resource_id = apigw_v1.create_resource(
+        restApiId=api_id, parentId=root["id"], pathPart="echo",
+    )["id"]
+    apigw_v1.put_method(
+        restApiId=api_id, resourceId=resource_id, httpMethod="ANY", authorizationType="NONE",
+    )
+    apigw_v1.put_integration(
+        restApiId=api_id, resourceId=resource_id, httpMethod="ANY",
+        type="AWS_PROXY", integrationHttpMethod="POST",
+        uri=f"arn:aws:apigateway:us-east-1:lambda:path/2015-03-31/functions/arn:aws:lambda:us-east-1:000000000000:function:{fname}/invocations",
+    )
+    dep_id = apigw_v1.create_deployment(restApiId=api_id)["id"]
+    apigw_v1.create_stage(restApiId=api_id, stageName="test", deploymentId=dep_id)
+
+    base = f"http://{api_id}.execute-api.localhost:{_EXECUTE_PORT}/test/echo"
+    host = f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}"
+
+    # Request: Content-Type matches binaryMediaTypes -> base64-encoded body.
+    payload = bytes(range(256))
+    req = _urlreq.Request(base, data=payload, method="POST")
+    req.add_header("Host", host)
+    req.add_header("Content-Type", "application/octet-stream")
+    got = _json.loads(_urlreq.urlopen(req).read())
+    assert got["isB64"] is True
+    assert got["sha"] == hashlib.sha256(payload).hexdigest()
+
+    # Request: Content-Type does NOT match -> UTF-8 string.
+    req2 = _urlreq.Request(base, data=b'{"x":1}', method="POST")
+    req2.add_header("Host", host)
+    req2.add_header("Content-Type", "application/json")
+    assert _json.loads(_urlreq.urlopen(req2).read())["isB64"] is False
+
+    # Response: Accept matches binaryMediaTypes -> base64 decoded to raw bytes.
+    req3 = _urlreq.Request(base + "?mode=resp", method="GET")
+    req3.add_header("Host", host)
+    req3.add_header("Accept", "application/octet-stream")
+    assert _urlreq.urlopen(req3).read() == bytes(range(8))
+
+    # Response: Accept does NOT match -> literal base64 string passed through.
+    req4 = _urlreq.Request(base + "?mode=resp", method="GET")
+    req4.add_header("Host", host)
+    req4.add_header("Accept", "application/json")
+    assert _urlreq.urlopen(req4).read() == _b64.b64encode(bytes(range(8)))
+
+    apigw_v1.delete_rest_api(restApiId=api_id)
+    lam.delete_function(FunctionName=fname)
+
+
 @pytest.mark.skipif(not shutil.which("curl"), reason="provided bootstrap uses curl for Runtime API")
 def test_apigwv1_execute_lambda_proxy_provided_runtime(apigw_v1, lam):
     """execute-api AWS_PROXY must run provided.* zips via lambda_svc (Go/terraform parity)."""

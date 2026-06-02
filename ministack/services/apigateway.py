@@ -921,6 +921,22 @@ def _path_matches(route_path: str, request_path: str) -> bool:
     return _extract_path_params(route_path, request_path) is not None
 
 
+def _v2_request_body_is_text(content_type: str | None) -> bool:
+    """Whether an HTTP API (v2) request body is delivered as a UTF-8 string.
+
+    Real AWS delivers the body as text (``isBase64Encoded`` false) only for a
+    whitelist of content types; everything else — including a missing content
+    type and ``application/x-www-form-urlencoded`` — is base64-encoded. The docs
+    don't enumerate this, so the set below was verified against live AWS.
+    """
+    ct = (content_type or "").split(";", 1)[0].strip().lower()
+    return ct.startswith("text/") or ct in (
+        "application/json",
+        "application/xml",
+        "application/javascript",
+    )
+
+
 async def _invoke_lambda_proxy(
     integration,
     api_id,
@@ -957,6 +973,15 @@ async def _invoke_lambda_proxy(
     # AWS API Gateway v2 joins multi-value query params with commas
     qs = {k: ",".join(v) for k, v in query_params.items()} if query_params else None
     raw_qs = "&".join(f"{k}={val}" for k, vals in query_params.items() for val in vals)
+    # Binary request bodies are base64-encoded with isBase64Encoded=true; only
+    # the text content types AWS recognizes are passed through as UTF-8 strings.
+    if body:
+        if _v2_request_body_is_text(headers.get("content-type")):
+            req_body, req_is_base64 = body.decode("utf-8", errors="replace"), False
+        else:
+            req_body, req_is_base64 = base64.b64encode(body).decode("ascii"), True
+    else:
+        req_body, req_is_base64 = None, False
     event = {
         "version": "2.0",
         "routeKey": route_key,
@@ -982,8 +1007,8 @@ async def _invoke_lambda_proxy(
             "timeEpoch": int(time.time() * 1000),
         },
         "pathParameters": path_params,
-        "body": body.decode("utf-8", errors="replace") if body else None,
-        "isBase64Encoded": False,
+        "body": req_body,
+        "isBase64Encoded": req_is_base64,
     }
     if authorizer_claims is not None:
         event["requestContext"]["authorizer"] = {
@@ -1004,15 +1029,38 @@ async def _invoke_lambda_proxy(
 
     status = lambda_response.get("statusCode", 200)
     resp_headers = {"Content-Type": "application/json"}
-    resp_headers.update(lambda_response.get("headers", {}))
-    # Payload format 2.0 emits multiple Set-Cookie headers via the top-level
-    # `cookies` array, not the headers map. The list value is expanded into one
-    # Set-Cookie line per entry by _send_response.
+    # Apply the Lambda's headers, letting each override any case-insensitive
+    # default already present. HTTP field names are case-insensitive (RFC 9110
+    # §5.1), so a lowercase `content-type` from the function must replace the
+    # seeded `Content-Type`, not ship alongside it — the same case-insensitive
+    # handling #750 applied to the v1 multiValueHeaders merge.
+    for k, v in (lambda_response.get("headers") or {}).items():
+        lower_k = k.lower()
+        for existing in [h for h in resp_headers if h.lower() == lower_k]:
+            del resp_headers[existing]
+        resp_headers[k] = v
+    # Payload format 2.0 delivers cookies via the top-level `cookies` array,
+    # which AWS turns into one Set-Cookie header per entry. Observed AWS
+    # behavior when both `cookies` and a `Set-Cookie` in `headers` are
+    # returned: both ship, with the array's entries emitted first followed by
+    # any header Set-Cookie. Merge case-insensitively on the header key, then
+    # reassign under the canonical `Set-Cookie`. _send_response expands the
+    # list into one Set-Cookie line per entry.
     cookies = lambda_response.get("cookies")
     if cookies:
-        resp_headers["Set-Cookie"] = list(cookies)
+        prior = []
+        for existing in [h for h in resp_headers if h.lower() == "set-cookie"]:
+            val = resp_headers.pop(existing)
+            prior.extend(val if isinstance(val, (list, tuple)) else [val])
+        resp_headers["Set-Cookie"] = list(cookies) + prior
     resp_body = lambda_response.get("body", "")
-    if isinstance(resp_body, str):
+    # A base64-encoded body (isBase64Encoded=true) is decoded to its raw bytes
+    # before sending. HTTP APIs (v2) honor this unconditionally — there is no
+    # binaryMediaTypes negotiation as in REST (v1) — so a true flag always means
+    # "the body string is base64; emit the decoded bytes."
+    if lambda_response.get("isBase64Encoded") and isinstance(resp_body, str):
+        resp_body = base64.b64decode(resp_body)
+    elif isinstance(resp_body, str):
         resp_body = resp_body.encode("utf-8")
     elif isinstance(resp_body, dict):
         resp_body = json.dumps(resp_body, ensure_ascii=False).encode("utf-8")
