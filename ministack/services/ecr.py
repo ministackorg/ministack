@@ -665,7 +665,7 @@ def _registry_error(status, code, message, detail=None):
 def _registry_ok(status, headers, body):
     out = dict(headers or {})
     out.setdefault(_REGISTRY_API_VERSION_HEADER[0], _REGISTRY_API_VERSION_HEADER[1])
-    return (status, out, body if body is not None else b"")
+    return status, out, body if body is not None else b""
 
 
 def _content_digest(data: bytes) -> str:
@@ -684,9 +684,9 @@ def _parse_v2_path(path: str):
     and treat everything before it as the name.
     """
     if path in ("/v2", "/v2/"):
-        return ("ping", "", "")
+        return "ping", "", ""
     if path == "/v2/_catalog":
-        return ("catalog", "", "")
+        return "catalog", "", ""
     if not path.startswith("/v2/"):
         return None
 
@@ -710,23 +710,23 @@ def _parse_v2_path(path: str):
             # /v2/<name>/blobs/uploads/<uuid>            → blob_upload_session
             uuid = "/".join(tail[1:]).rstrip("/")
             if uuid:
-                return ("blob_upload_session", name, uuid)
-            return ("blob_uploads", name, "")
+                return "blob_upload_session", name, uuid
+            return "blob_uploads", name, ""
         # /v2/<name>/blobs/<digest>
         digest = "/".join(tail).rstrip("/")
         if not digest:
             return None
-        return ("blob", name, digest)
+        return "blob", name, digest
 
     if keyword == "manifests":
         ref = "/".join(tail).rstrip("/")
         if not ref:
             return None
-        return ("manifest", name, ref)
+        return "manifest", name, ref
 
     if keyword == "tags":
         if tail and tail[0] == "list":
-            return ("tags_list", name, "")
+            return "tags_list", name, ""
         return None
 
     return None

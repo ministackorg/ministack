@@ -1813,7 +1813,7 @@ def _fire_s3_test_event(bucket_name: str) -> None:
         payload = {
             "Service": "Amazon S3",
             "Event": "s3:TestEvent",
-            "Time": _dt.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+            "Time": _dt.datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z"),
             "Bucket": bucket_name,
             "RequestId": new_uuid(),
             "HostId": new_uuid(),

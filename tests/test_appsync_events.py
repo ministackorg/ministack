@@ -234,12 +234,12 @@ def _minimal_sigv4_appsync_authorization() -> str:
     MiniStack's router only inspects the ``Credential=`` segment — real Lambdas
     sign with the same ``appsync`` service name as AppSync GraphQL.
     """
-    return (
+    return 
         "AWS4-HMAC-SHA256 "
         "Credential=testkey/20260127/us-east-1/appsync/aws4_request, "
         "SignedHeaders=host;x-amz-date, "
         "Signature=" + "0" * 64
-    )
+    
 
 
 def _publish_http(

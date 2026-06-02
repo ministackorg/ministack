@@ -319,7 +319,7 @@ def test_cloudwatch_get_metric_data_time_range(cw):
     """GetMetricData respects StartTime/EndTime filtering."""
     import datetime
 
-    now = datetime.datetime.utcnow()
+    now = datetime.datetime.now(timezone.utc)
     past = now - datetime.timedelta(hours=2)
     cw.put_metric_data(
         Namespace="qa/cw",

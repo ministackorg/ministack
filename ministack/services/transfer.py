@@ -514,7 +514,7 @@ def _delete_ssh_public_key(data):
 
 
 def _is_truthy(v):
-    return (v or "").lower() in ("1", "true", "yes", "on")
+    return v or "".lower() in ("1", "true", "yes", "on")
 
 
 def _sftp_enabled() -> bool:

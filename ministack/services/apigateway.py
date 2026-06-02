@@ -1629,7 +1629,7 @@ def _api_protocol(api_id: str) -> str | None:
 
     WebSocket connections arrive on the execute-api host before we've resolved
     which account owns the api. We scan every AccountScopedDict bucket to find
-    the owning account, then return (protocol, account_id).
+    the owning account, then return protocol, account_id.
     """
     info = _api_owner(api_id)
     return info[0] if info else None

@@ -177,7 +177,7 @@ def _parse_packet(buf: bytes) -> tuple[int, int, bytes, int] | None:
     total = header_end + remaining
     if len(buf) < total:
         return None
-    return (first >> 4) & 0x0F, first & 0x0F, buf[header_end:total], total
+    return first >> 4 & 0x0F, first & 0x0F, buf[header_end:total], total
 
 
 async def _ws_subscribe_and_collect(

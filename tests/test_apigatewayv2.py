@@ -1690,7 +1690,7 @@ def _wire_ws_api(apigw, lam, *, name_suffix: str,
                  connect_code: str | None = None,
                  default_code: str = _ECHO_CODE,
                  disconnect_code: str | None = None) -> tuple[str, dict]:
-    """Create a WS API + routes + integrations and return (apiId, metadata)."""
+    """Create a WS API + routes + integrations and return apiId, metadata."""
     api = apigw.create_api(Name=f"ws-{name_suffix}", ProtocolType="WEBSOCKET")
     api_id = api["ApiId"]
     meta = {"created_functions": []}

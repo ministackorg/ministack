@@ -519,7 +519,7 @@ def _handle_options_request(method: str, request_id: str):
     """Return the standard CORS preflight response when applicable."""
     if method != "OPTIONS":
         return None
-    return (
+    return 
         200,
         {
             "Access-Control-Allow-Origin": "*",
@@ -531,7 +531,7 @@ def _handle_options_request(method: str, request_id: str):
             "x-amzn-requestid": request_id,
         },
         b"",
-    )
+    
 
 
 def _handle_health_request(path: str, request_id: str):
@@ -935,14 +935,14 @@ async def _handle_s3_control_request(path: str, method: str, body: bytes, query_
                 f"<Tags>{tag_members}</Tags>"
                 "</ListTagsForResourceResult>"
             ).encode()
-            return (
+            return 
                 200,
                 {
                     "Content-Type": "application/xml",
                     "x-amzn-requestid": request_id,
                 },
                 xml_body,
-            )
+            
 
         if method in ("POST", "PUT"):
             # AWS SDK Go v2 (used by terraform-aws-provider v6+) sends
@@ -992,23 +992,23 @@ async def _handle_s3_control_request(path: str, method: str, body: bytes, query_
             _get_module("s3")._bucket_tags[bucket_name] = tags
             return 204, {"x-amzn-requestid": request_id}, b""
 
-        return (
+        return 
             200,
             {
                 "Content-Type": "application/json",
                 "x-amzn-requestid": request_id,
             },
             b"{}",
-        )
+        
 
-    return (
+    return 
         200,
         {
             "Content-Type": "application/json",
             "x-amzn-requestid": request_id,
         },
         b"{}",
-    )
+    
 
 
 async def _handle_rds_data_request(method: str, path: str, headers: dict, body: bytes, query_params: dict):

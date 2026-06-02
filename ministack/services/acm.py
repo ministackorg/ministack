@@ -65,11 +65,11 @@ def _synthetic_pem(domain):
     backfill path doesn't NameError when the load_state try block
     fires at module import."""
     _ = domain  # represented in cert metadata, not the base64 block
-    return (
+    return 
         "-----BEGIN CERTIFICATE-----\n"
         "AQIDBAUGBwgJCgsMDQ4PEA==\n"
         "-----END CERTIFICATE-----\n"
-    )
+    
 
 
 def restore_state(data):

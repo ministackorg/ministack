@@ -1716,12 +1716,12 @@ def _user_xml(name):
             for t in u["Tags"]
         )
         tags_xml = f"<Tags>{tag_members}</Tags>"
-    return (f"<UserName>{u['UserName']}</UserName>"
+    return f"<UserName>{u['UserName']}</UserName>"
             f"<UserId>{u['UserId']}</UserId>"
             f"<Arn>{u['Arn']}</Arn>"
             f"<Path>{u['Path']}</Path>"
             f"<CreateDate>{u['CreateDate']}</CreateDate>"
-            f"{tags_xml}")
+            f"{tags_xml}"
 
 
 def _role_xml(name):
@@ -1736,7 +1736,7 @@ def _role_xml(name):
             for t in r["Tags"]
         )
         tags_xml = f"<Tags>{tag_members}</Tags>"
-    return (f"<RoleName>{r['RoleName']}</RoleName>"
+    return f"<RoleName>{r['RoleName']}</RoleName>"
             f"<RoleId>{r['RoleId']}</RoleId>"
             f"<Arn>{r['Arn']}</Arn>"
             f"<Path>{r['Path']}</Path>"
@@ -1744,7 +1744,7 @@ def _role_xml(name):
             f"<AssumeRolePolicyDocument>{assume_doc}</AssumeRolePolicyDocument>"
             f"<Description>{desc}</Description>"
             f"<MaxSessionDuration>{max_dur}</MaxSessionDuration>"
-            f"{tags_xml}")
+            f"{tags_xml}"
 
 
 def _managed_policy_xml(arn):
@@ -1785,11 +1785,11 @@ def _managed_policy_xml(arn):
 
 def _group_xml(name):
     g = _groups[name]
-    return (f"<GroupName>{g['GroupName']}</GroupName>"
+    return f"<GroupName>{g['GroupName']}</GroupName>"
             f"<GroupId>{g['GroupId']}</GroupId>"
             f"<Arn>{g['Arn']}</Arn>"
             f"<Path>{g['Path']}</Path>"
-            f"<CreateDate>{g['CreateDate']}</CreateDate>")
+            f"<CreateDate>{g['CreateDate']}</CreateDate>"
 
 
 def _instance_profile_xml(name):
@@ -1798,12 +1798,12 @@ def _instance_profile_xml(name):
     for rname in ip["Roles"]:
         if rname in _roles:
             roles_xml += f"<member>{_role_xml(rname)}</member>"
-    return (f"<InstanceProfileName>{ip['InstanceProfileName']}</InstanceProfileName>"
+    return f"<InstanceProfileName>{ip['InstanceProfileName']}</InstanceProfileName>"
             f"<InstanceProfileId>{ip['InstanceProfileId']}</InstanceProfileId>"
             f"<Arn>{ip['Arn']}</Arn>"
             f"<Path>{ip['Path']}</Path>"
             f"<CreateDate>{ip['CreateDate']}</CreateDate>"
-            f"<Roles>{roles_xml}</Roles>")
+            f"<Roles>{roles_xml}</Roles>"
 
 
 def _xml(status, root_tag, inner, ns="iam"):

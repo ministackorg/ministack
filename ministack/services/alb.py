@@ -91,7 +91,7 @@ except Exception:
 
 def _p(params, key, default=""):
     val = params.get(key, [default])
-    return (val[0] if val else default) if isinstance(val, list) else val
+    return val[0] if val else default if isinstance(val, list) else val
 
 
 def _parse_member_list(params, prefix):
@@ -958,11 +958,11 @@ def _match_condition(cond, method, path, headers, query_params):
 def _rule_sort_key(rule):
     p = rule.get("Priority", "default")
     if p == "default":
-        return (1, 0)
+        return 1, 0
     try:
         return (0, int(p))
     except (ValueError, TypeError):
-        return (0, 9999)
+        return 0, 9999
 
 
 # ---------------------------------------------------------------------------

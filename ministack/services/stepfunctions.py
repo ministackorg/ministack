@@ -1683,9 +1683,9 @@ def _evaluate_rule(rule, data):
 
     # --- type checks ---
     if "IsPresent" in rule:
-        return (value is not None) == rule["IsPresent"]
+        return value is not None == rule["IsPresent"]
     if "IsNull" in rule:
-        return (value is None) == rule["IsNull"]
+        return value is None == rule["IsNull"]
     if "IsNumeric" in rule:
         return isinstance(value, (int, float)) == rule["IsNumeric"]
     if "IsString" in rule:
@@ -3520,7 +3520,7 @@ def _parse_intrinsic_call(s, pos):
     paren = s.index("(", pos)
     name = s[pos:paren].strip()
     args, end = _parse_intrinsic_args(s, paren + 1)
-    return ("call", name, args), end
+    return "call", name, args, end
 
 
 def _eval_intrinsic_arg(arg, data, ctx):

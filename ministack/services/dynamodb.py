@@ -4602,7 +4602,7 @@ def _compare_ddb(left, op, right):
 def _ddb_comparable(val):
     if isinstance(val, dict):
         if "S" in val:
-            return ("S", val["S"])
+            return "S", val["S"]
         if "N" in val:
             try:
                 return ("N", Decimal(val["N"]))
@@ -4613,23 +4613,23 @@ def _ddb_comparable(val):
             # (str) — decode to bytes before comparing so b'\x01' < b'\xff'.
             b = val["B"]
             if isinstance(b, bytes):
-                return ("B", b)
+                return "B", b
             try:
                 import base64
                 return ("B", base64.b64decode(b))
             except Exception:
                 return ("B", b if isinstance(b, str) else b"")
         if "BOOL" in val:
-            return ("BOOL", val["BOOL"])
+            return "BOOL", val["BOOL"]
         if "NULL" in val:
-            return ("NULL", None)
+            return "NULL", None
         if "SS" in val:
             return ("SS", frozenset(val["SS"]))
         if "NS" in val:
             return ("NS", frozenset(val["NS"]))
         if "BS" in val:
             return ("BS", frozenset(val["BS"]))
-    return ("UNKNOWN", None)
+    return "UNKNOWN", None
 
 
 def _ddb_equals(a, b):

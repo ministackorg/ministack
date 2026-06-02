@@ -1484,11 +1484,11 @@ def _cbor_ok(data: dict):
         body = cbor2.dumps(data)
     except Exception:
         body = json.dumps(data).encode()
-    return (
+    return 
         200,
         {"Content-Type": "application/cbor", "smithy-protocol": "rpc-v2-cbor"},
         body,
-    )
+    
 
 
 def _json_ok(data: dict):

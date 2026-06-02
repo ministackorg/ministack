@@ -952,7 +952,7 @@ async def _invoke_lambda_proxy_v1(integration, api_id, stage_name, stage, resour
     multi_headers = {k: [v] if isinstance(v, str) else list(v) for k, v in headers.items()}
 
     now_epoch_ms = int(time.time() * 1000)
-    request_time = datetime.datetime.utcnow().strftime("%d/%b/%Y:%H:%M:%S +0000")
+    request_time = datetime.datetime.now(timezone.utc).strftime("%d/%b/%Y:%H:%M:%S +0000")
     request_id = new_uuid()
 
     # A request body whose Content-Type matches a configured binaryMediaType is

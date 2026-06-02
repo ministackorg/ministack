@@ -277,7 +277,7 @@ process.stdout.write = function(chunk, encoding, callback) {
           get(_, prop) {
             if (typeof prop !== "string") return undefined;
             const opName = prop[0].toUpperCase() + prop.slice(1);
-            return (params) => _jsonRpcRequest(targetPrefix, opName, params);
+            return params => _jsonRpcRequest(targetPrefix, opName, params);
           },
         });
       },

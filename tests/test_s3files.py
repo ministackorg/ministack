@@ -19,11 +19,11 @@ ROLE_ARN = "arn:aws:iam::000000000000:role/s3files-role"
 
 
 def _auth(account="000000000000"):
-    return (
+    return 
         f"AWS4-HMAC-SHA256 "
         f"Credential={account}/20260504/us-east-1/s3files/aws4_request, "
         f"SignedHeaders=host, Signature=00"
-    )
+    
 
 
 _AUTH = _auth()

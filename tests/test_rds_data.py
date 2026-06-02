@@ -273,7 +273,7 @@ def _setup_stub_cluster(rds, sm):
 
 
 def _exec(cluster_arn, secret_arn, sql):
-    """Execute a SQL statement via the stub and return (status, body)."""
+    """Execute a SQL statement via the stub and return status, body."""
     return _raw_post("/Execute", {
         "resourceArn": cluster_arn,
         "secretArn": secret_arn,
