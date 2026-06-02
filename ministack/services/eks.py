@@ -1012,12 +1012,25 @@ async def handle_request(method, path, headers, body_bytes, query_params):
         if method == "DELETE":
             return _delete_addon(cluster_name, addon_name)
 
-    # Access Entries. principalArn is URL-encoded in the path; same for nested
-    # policyArn under /access-policies. Match the encoded form, decode at
-    # handler boundary.
-    # POST /clusters/{name}/access-entries/{principalArn}/access-policies — AssociateAccessPolicy
+    # Access Entries. botocore sends principalArn raw in the path (includes
+    # colons and forward slashes from the ARN, e.g.
+    # ``arn:aws:iam::000000000000:role/foo``), so the regex must accept
+    # slashes. Most-specific routes first; non-greedy `.+?` against the
+    # ``/access-policies`` suffix prevents the principalArn capture from
+    # swallowing the policy segment.
+    # DELETE /clusters/{name}/access-entries/{principalArn}/access-policies/{policyArn}
     m = re.fullmatch(
-        r"/clusters/([A-Za-z0-9_-]+)/access-entries/([^/]+)/access-policies", path)
+        r"/clusters/([A-Za-z0-9_-]+)/access-entries/(.+?)/access-policies/(.+)", path)
+    if m:
+        cluster_name = m.group(1)
+        principal_arn = urllib.parse.unquote(m.group(2))
+        policy_arn = urllib.parse.unquote(m.group(3))
+        if method == "DELETE":
+            return _disassociate_access_policy(cluster_name, principal_arn, policy_arn)
+
+    # POST/GET /clusters/{name}/access-entries/{principalArn}/access-policies
+    m = re.fullmatch(
+        r"/clusters/([A-Za-z0-9_-]+)/access-entries/(.+?)/access-policies", path)
     if m:
         cluster_name = m.group(1)
         principal_arn = urllib.parse.unquote(m.group(2))
@@ -1025,16 +1038,6 @@ async def handle_request(method, path, headers, body_bytes, query_params):
             return _associate_access_policy(cluster_name, principal_arn, body)
         if method == "GET":
             return _list_associated_access_policies(cluster_name, principal_arn, query)
-
-    # DELETE /clusters/{name}/access-entries/{principalArn}/access-policies/{policyArn}
-    m = re.fullmatch(
-        r"/clusters/([A-Za-z0-9_-]+)/access-entries/([^/]+)/access-policies/(.+)", path)
-    if m:
-        cluster_name = m.group(1)
-        principal_arn = urllib.parse.unquote(m.group(2))
-        policy_arn = urllib.parse.unquote(m.group(3))
-        if method == "DELETE":
-            return _disassociate_access_policy(cluster_name, principal_arn, policy_arn)
 
     # POST/GET /clusters/{name}/access-entries — CreateAccessEntry / ListAccessEntries
     m = re.fullmatch(r"/clusters/([A-Za-z0-9_-]+)/access-entries", path)
@@ -1045,8 +1048,10 @@ async def handle_request(method, path, headers, body_bytes, query_params):
         if method == "GET":
             return _list_access_entries(cluster_name, query)
 
-    # /clusters/{name}/access-entries/{principalArn} — Describe/Update/Delete
-    m = re.fullmatch(r"/clusters/([A-Za-z0-9_-]+)/access-entries/([^/]+)", path)
+    # /clusters/{name}/access-entries/{principalArn} — Describe / Update / Delete.
+    # Greedy `.+` is safe here only because the more-specific
+    # `/access-policies` routes above already matched and returned.
+    m = re.fullmatch(r"/clusters/([A-Za-z0-9_-]+)/access-entries/(.+)", path)
     if m:
         cluster_name = m.group(1)
         principal_arn = urllib.parse.unquote(m.group(2))
