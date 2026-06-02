@@ -56,6 +56,360 @@ def test_eventbridge_targets(eb):
     assert len(resp["Targets"]) == 1
 
 
+def test_eventbridge_put_targets_rejects_malformed_target_arn(eb):
+    rule_name = f"target-malformed-{_uuid_mod.uuid4().hex[:8]}"
+    eb.put_rule(Name=rule_name, ScheduleExpression="rate(1 minute)", State="ENABLED")
+
+    with pytest.raises(ClientError) as exc:
+        eb.put_targets(
+            Rule=rule_name,
+            Targets=[{"Id": "bad", "Arn": "not-an-arn"}],
+        )
+
+    assert exc.value.response["Error"]["Code"] == "ValidationException"
+    assert "Provided Arn is not in correct format" in exc.value.response["Error"]["Message"]
+    assert eb.list_targets_by_rule(Rule=rule_name)["Targets"] == []
+
+
+def test_eventbridge_put_targets_rejects_unsupported_target_service(eb):
+    rule_name = f"target-wrong-service-{_uuid_mod.uuid4().hex[:8]}"
+    eb.put_rule(Name=rule_name, ScheduleExpression="rate(1 minute)", State="ENABLED")
+
+    with pytest.raises(ClientError) as exc:
+        eb.put_targets(
+            Rule=rule_name,
+            Targets=[
+                {
+                    "Id": "rds",
+                    "Arn": "arn:aws:rds:us-east-1:000000000000:db:not-a-target",
+                }
+            ],
+        )
+
+    assert exc.value.response["Error"]["Code"] == "ValidationException"
+    assert "rds is not a supported service for a target" in exc.value.response["Error"]["Message"]
+    assert eb.list_targets_by_rule(Rule=rule_name)["Targets"] == []
+
+
+def test_eventbridge_put_targets_accepts_foreign_region_non_bus_target_arns(eb):
+    rule_name = f"target-foreign-{_uuid_mod.uuid4().hex[:8]}"
+    eb.put_rule(Name=rule_name, ScheduleExpression="rate(1 minute)", State="ENABLED")
+
+    resp = eb.put_targets(
+        Rule=rule_name,
+        Targets=[
+            {
+                "Id": "lambda-west",
+                "Arn": "arn:aws:lambda:us-west-2:000000000000:function:foreign-fn",
+            },
+            {
+                "Id": "sqs-west",
+                "Arn": "arn:aws:sqs:us-west-2:000000000000:foreign-q",
+            },
+            {
+                "Id": "sns-west",
+                "Arn": "arn:aws:sns:us-west-2:000000000000:foreign-topic",
+            },
+            {
+                "Id": "sfn-west",
+                "Arn": "arn:aws:states:us-west-2:000000000000:stateMachine:foreign-sm",
+            },
+        ],
+    )
+
+    assert resp["FailedEntryCount"] == 0
+    ids = {target["Id"] for target in eb.list_targets_by_rule(Rule=rule_name)["Targets"]}
+    assert ids == {"lambda-west", "sqs-west", "sns-west", "sfn-west"}
+
+
+def test_eventbridge_put_targets_accepts_supported_non_delivery_target_services(eb):
+    rule_name = f"target-services-{_uuid_mod.uuid4().hex[:8]}"
+    eb.put_rule(Name=rule_name, ScheduleExpression="rate(1 minute)", State="ENABLED")
+
+    resp = eb.put_targets(
+        Rule=rule_name,
+        Targets=[
+            {
+                "Id": "logs",
+                "Arn": "arn:aws:logs:us-east-1:000000000000:log-group:/aws/events/test",
+            },
+            {
+                "Id": "kinesis",
+                "Arn": "arn:aws:kinesis:us-east-1:000000000000:stream/test-stream",
+            },
+            {
+                "Id": "firehose",
+                "Arn": "arn:aws:firehose:us-east-1:000000000000:deliverystream/test-stream",
+            },
+            {
+                "Id": "batch",
+                "Arn": "arn:aws:batch:us-east-1:000000000000:job-queue/test-queue",
+            },
+            {
+                "Id": "ecs",
+                "Arn": "arn:aws:ecs:us-east-1:000000000000:cluster/test-cluster",
+            },
+            {
+                "Id": "apigw",
+                "Arn": "arn:aws:execute-api:us-east-1:000000000000:api-id/stage/GET/path",
+            },
+            {
+                "Id": "appsync",
+                "Arn": "arn:aws:appsync:us-east-1:000000000000:apis/api-id",
+            },
+            {
+                "Id": "ssm",
+                "Arn": "arn:aws:ssm:us-east-1:000000000000:document/AWS-RunShellScript",
+            },
+        ],
+    )
+
+    assert resp["FailedEntryCount"] == 0
+    ids = {target["Id"] for target in eb.list_targets_by_rule(Rule=rule_name)["Targets"]}
+    assert ids == {"logs", "kinesis", "firehose", "batch", "ecs", "apigw", "appsync", "ssm"}
+
+
+def test_eventbridge_put_targets_requires_role_for_foreign_region_event_bus(eb):
+    rule_name = f"target-foreign-bus-{_uuid_mod.uuid4().hex[:8]}"
+    eb.put_rule(Name=rule_name, ScheduleExpression="rate(1 minute)", State="ENABLED")
+
+    with pytest.raises(ClientError) as exc:
+        eb.put_targets(
+            Rule=rule_name,
+            Targets=[
+                {
+                    "Id": "bus-west",
+                    "Arn": "arn:aws:events:us-west-2:000000000000:event-bus/foreign-bus",
+                }
+            ],
+        )
+
+    assert exc.value.response["Error"]["Code"] == "ValidationException"
+    assert "RoleArn is required" in exc.value.response["Error"]["Message"]
+
+
+def test_eventbridge_foreign_region_sqs_target_does_not_deliver_to_same_name_queue(eb, sqs):
+    queue_name = f"target-foreign-sqs-{_uuid_mod.uuid4().hex[:8]}"
+    rule_name = f"target-foreign-sqs-{_uuid_mod.uuid4().hex[:8]}"
+    q_url = sqs.create_queue(QueueName=queue_name)["QueueUrl"]
+    west_arn = f"arn:aws:sqs:us-west-2:000000000000:{queue_name}"
+    eb.put_rule(
+        Name=rule_name,
+        EventPattern=json.dumps({"source": ["foreign.sqs"]}),
+        State="ENABLED",
+    )
+    eb.put_targets(
+        Rule=rule_name,
+        Targets=[{"Id": "foreign-sqs", "Arn": west_arn}],
+    )
+
+    eb.put_events(
+        Entries=[
+            {
+                "Source": "foreign.sqs",
+                "DetailType": "ForeignRegionSqs",
+                "Detail": json.dumps({"should": "not-deliver"}),
+                "EventBusName": "default",
+            }
+        ]
+    )
+
+    msgs = sqs.receive_message(QueueUrl=q_url, MaxNumberOfMessages=1, WaitTimeSeconds=1)
+    assert msgs.get("Messages", []) == []
+
+
+def test_eventbridge_foreign_region_bus_target_does_not_deliver_to_same_name_bus(eb, sqs):
+    bus_name = f"target-foreign-bus-{_uuid_mod.uuid4().hex[:8]}"
+    source_rule = f"source-foreign-bus-{_uuid_mod.uuid4().hex[:8]}"
+    local_rule = f"local-foreign-bus-{_uuid_mod.uuid4().hex[:8]}"
+    queue_name = f"target-foreign-bus-{_uuid_mod.uuid4().hex[:8]}"
+    q_url = sqs.create_queue(QueueName=queue_name)["QueueUrl"]
+    q_arn = sqs.get_queue_attributes(
+        QueueUrl=q_url,
+        AttributeNames=["QueueArn"],
+    )["Attributes"]["QueueArn"]
+
+    eb.create_event_bus(Name=bus_name)
+    eb.put_rule(
+        Name=local_rule,
+        EventBusName=bus_name,
+        EventPattern=json.dumps({"source": ["foreign.bus"]}),
+        State="ENABLED",
+    )
+    eb.put_targets(
+        Rule=local_rule,
+        EventBusName=bus_name,
+        Targets=[{"Id": "local-q", "Arn": q_arn}],
+    )
+    eb.put_rule(
+        Name=source_rule,
+        EventPattern=json.dumps({"source": ["foreign.bus"]}),
+        State="ENABLED",
+    )
+    eb.put_targets(
+        Rule=source_rule,
+        Targets=[
+            {
+                "Id": "foreign-bus",
+                "Arn": f"arn:aws:events:us-west-2:000000000000:event-bus/{bus_name}",
+                "RoleArn": "arn:aws:iam::000000000000:role/eb-cross-region",
+            },
+        ],
+    )
+
+    eb.put_events(
+        Entries=[
+            {
+                "Source": "foreign.bus",
+                "DetailType": "ForeignRegionBus",
+                "Detail": json.dumps({"should": "not-deliver"}),
+                "EventBusName": "default",
+            }
+        ]
+    )
+
+    msgs = sqs.receive_message(QueueUrl=q_url, MaxNumberOfMessages=1, WaitTimeSeconds=1)
+    assert msgs.get("Messages", []) == []
+
+
+def test_eventbridge_same_bus_target_does_not_recursively_dispatch(eb, sqs):
+    rule_name = f"target-self-bus-{_uuid_mod.uuid4().hex[:8]}"
+    queue_name = f"target-self-bus-{_uuid_mod.uuid4().hex[:8]}"
+    q_url = sqs.create_queue(QueueName=queue_name)["QueueUrl"]
+    q_arn = sqs.get_queue_attributes(QueueUrl=q_url, AttributeNames=["QueueArn"])["Attributes"]["QueueArn"]
+    eb.put_rule(
+        Name=rule_name,
+        EventPattern=json.dumps({"source": ["self.bus"]}),
+        State="ENABLED",
+    )
+    eb.put_targets(
+        Rule=rule_name,
+        Targets=[
+            {
+                "Id": "same-bus",
+                "Arn": "arn:aws:events:us-east-1:000000000000:event-bus/default",
+            },
+            {
+                "Id": "local-q",
+                "Arn": q_arn,
+            },
+        ],
+    )
+
+    resp = eb.put_events(
+        Entries=[
+            {
+                "Source": "self.bus",
+                "DetailType": "SelfBus",
+                "Detail": json.dumps({"ok": True}),
+                "EventBusName": "default",
+            }
+        ]
+    )
+
+    assert resp["FailedEntryCount"] == 0
+    msgs = sqs.receive_message(QueueUrl=q_url, MaxNumberOfMessages=10, WaitTimeSeconds=1)
+    assert len(msgs.get("Messages", [])) == 1
+
+
+def test_eventbridge_event_bus_target_archives_forwarded_event(eb):
+    source_bus = f"target-archive-source-{_uuid_mod.uuid4().hex[:8]}"
+    dest_bus = f"target-archive-dest-{_uuid_mod.uuid4().hex[:8]}"
+    source_rule = f"target-archive-rule-{_uuid_mod.uuid4().hex[:8]}"
+    archive_name = f"target-archive-{_uuid_mod.uuid4().hex[:8]}"
+    dest_bus_arn = f"arn:aws:events:us-east-1:000000000000:event-bus/{dest_bus}"
+    eb.create_event_bus(Name=source_bus)
+    eb.create_event_bus(Name=dest_bus)
+    eb.create_archive(ArchiveName=archive_name, EventSourceArn=dest_bus_arn)
+    eb.put_rule(
+        Name=source_rule,
+        EventBusName=source_bus,
+        EventPattern=json.dumps({"source": ["archive.forward"]}),
+        State="ENABLED",
+    )
+    eb.put_targets(
+        Rule=source_rule,
+        EventBusName=source_bus,
+        Targets=[
+            {
+                "Id": "dest-bus",
+                "Arn": dest_bus_arn,
+            },
+        ],
+    )
+
+    eb.put_events(
+        Entries=[
+            {
+                "Source": "archive.forward",
+                "DetailType": "ArchiveForward",
+                "Detail": json.dumps({"ok": True}),
+                "EventBusName": source_bus,
+            }
+        ]
+    )
+
+    assert eb.describe_archive(ArchiveName=archive_name)["EventCount"] == 1
+    eb.delete_archive(ArchiveName=archive_name)
+
+
+def test_eventbridge_event_bus_target_honors_input_override(eb, sqs):
+    source_bus = f"target-input-source-{_uuid_mod.uuid4().hex[:8]}"
+    dest_bus = f"target-input-dest-{_uuid_mod.uuid4().hex[:8]}"
+    source_rule = f"target-input-source-rule-{_uuid_mod.uuid4().hex[:8]}"
+    dest_rule = f"target-input-dest-rule-{_uuid_mod.uuid4().hex[:8]}"
+    queue_name = f"target-input-q-{_uuid_mod.uuid4().hex[:8]}"
+    dest_bus_arn = f"arn:aws:events:us-east-1:000000000000:event-bus/{dest_bus}"
+    q_url = sqs.create_queue(QueueName=queue_name)["QueueUrl"]
+    q_arn = sqs.get_queue_attributes(QueueUrl=q_url, AttributeNames=["QueueArn"])["Attributes"]["QueueArn"]
+    eb.create_event_bus(Name=source_bus)
+    eb.create_event_bus(Name=dest_bus)
+    eb.put_rule(
+        Name=dest_rule,
+        EventBusName=dest_bus,
+        EventPattern=json.dumps({"source": ["bus.input"]}),
+        State="ENABLED",
+    )
+    eb.put_targets(
+        Rule=dest_rule,
+        EventBusName=dest_bus,
+        Targets=[{"Id": "local-q", "Arn": q_arn}],
+    )
+    eb.put_rule(
+        Name=source_rule,
+        EventBusName=source_bus,
+        EventPattern=json.dumps({"source": ["bus.input"]}),
+        State="ENABLED",
+    )
+    eb.put_targets(
+        Rule=source_rule,
+        EventBusName=source_bus,
+        Targets=[
+            {
+                "Id": "dest-bus",
+                "Arn": dest_bus_arn,
+                "Input": json.dumps({"rewritten": True}),
+            },
+        ],
+    )
+
+    eb.put_events(
+        Entries=[
+            {
+                "Source": "bus.input",
+                "DetailType": "BusInput",
+                "Detail": json.dumps({"original": True}),
+                "EventBusName": source_bus,
+            }
+        ]
+    )
+
+    msgs = sqs.receive_message(QueueUrl=q_url, MaxNumberOfMessages=1, WaitTimeSeconds=1)
+    assert len(msgs.get("Messages", [])) == 1
+    body = json.loads(msgs["Messages"][0]["Body"])
+    assert body["detail"] == {"rewritten": True}
+
+
 def test_eventbridge_list_rule_names_by_target(eb):
     fn_arn = "arn:aws:lambda:us-east-1:000000000000:function:list-by-tgt-fn"
     eb.create_event_bus(Name="lrt-bus")
@@ -885,6 +1239,74 @@ def test_eventbridge_put_events_with_arn_as_bus_name(eb, sqs):
     assert len(msgs.get("Messages", [])) == 1
 
 
+def test_eventbridge_put_events_rejects_bad_bus_arn_without_local_fallback(eb, sqs):
+    bus_name = f"qa-eb-bad-bus-{_uuid_mod.uuid4().hex[:8]}"
+    eb.create_event_bus(Name=bus_name)
+    q_url = sqs.create_queue(QueueName=f"qa-eb-bad-bus-q-{_uuid_mod.uuid4().hex[:8]}")["QueueUrl"]
+    q_arn = sqs.get_queue_attributes(QueueUrl=q_url, AttributeNames=["QueueArn"])["Attributes"]["QueueArn"]
+    eb.put_rule(
+        Name="qa-eb-bad-bus-rule",
+        EventBusName=bus_name,
+        EventPattern=json.dumps({"source": ["myapp"]}),
+        State="ENABLED",
+    )
+    eb.put_targets(
+        Rule="qa-eb-bad-bus-rule",
+        EventBusName=bus_name,
+        Targets=[{"Id": "t1", "Arn": q_arn}],
+    )
+
+    response = eb.put_events(
+        Entries=[
+            {
+                "Source": "myapp",
+                "DetailType": "test",
+                "Detail": json.dumps({"key": "value"}),
+                "EventBusName": f"arn:aws:sqs:us-east-1:000000000000:event-bus/{bus_name}",
+            }
+        ]
+    )
+
+    assert response["FailedEntryCount"] == 1
+    assert response["Entries"][0]["ErrorCode"] == "ValidationException"
+    msgs = sqs.receive_message(QueueUrl=q_url, MaxNumberOfMessages=1, WaitTimeSeconds=1)
+    assert msgs.get("Messages", []) == []
+
+
+def test_eventbridge_put_events_rejects_foreign_region_bus_arn_without_local_fallback(eb, sqs):
+    bus_name = f"qa-eb-region-bus-{_uuid_mod.uuid4().hex[:8]}"
+    eb.create_event_bus(Name=bus_name)
+    q_url = sqs.create_queue(QueueName=f"qa-eb-region-bus-q-{_uuid_mod.uuid4().hex[:8]}")["QueueUrl"]
+    q_arn = sqs.get_queue_attributes(QueueUrl=q_url, AttributeNames=["QueueArn"])["Attributes"]["QueueArn"]
+    eb.put_rule(
+        Name="qa-eb-region-bus-rule",
+        EventBusName=bus_name,
+        EventPattern=json.dumps({"source": ["myapp"]}),
+        State="ENABLED",
+    )
+    eb.put_targets(
+        Rule="qa-eb-region-bus-rule",
+        EventBusName=bus_name,
+        Targets=[{"Id": "t1", "Arn": q_arn}],
+    )
+
+    response = eb.put_events(
+        Entries=[
+            {
+                "Source": "myapp",
+                "DetailType": "test",
+                "Detail": json.dumps({"key": "value"}),
+                "EventBusName": f"arn:aws:events:us-west-2:000000000000:event-bus/{bus_name}",
+            }
+        ]
+    )
+
+    assert response["FailedEntryCount"] == 1
+    assert response["Entries"][0]["ErrorCode"] == "ResourceNotFoundException"
+    msgs = sqs.receive_message(QueueUrl=q_url, MaxNumberOfMessages=1, WaitTimeSeconds=1)
+    assert msgs.get("Messages", []) == []
+
+
 def test_eventbridge_cfn_rule_accessible_via_api(eb, sqs, cfn):
     """Rules created via CloudFormation should be accessible via the EventBridge API."""
     bus_name = "qa-eb-cfn-bus"
@@ -1028,7 +1450,6 @@ def test_eventbridge_replay_completes(eb):
 
 def test_eventbridge_replay_not_found(eb):
     """StartReplay with a nonexistent archive returns ResourceNotFoundException."""
-    from botocore.exceptions import ClientError
     nonexistent_arn = "arn:aws:events:us-east-1:000000000000:archive/does-not-exist"
     rep_name = f"rep-nf-{_uuid_mod.uuid4().hex[:8]}"
     with pytest.raises(ClientError) as exc:
@@ -1040,6 +1461,92 @@ def test_eventbridge_replay_not_found(eb):
             Destination={"Arn": "arn:aws:events:us-east-1:000000000000:event-bus/default"},
         )
     assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
+def test_eventbridge_replay_rejects_wrong_service_source_arn_without_local_fallback(eb):
+    arch_name = f"replay-bad-src-{_uuid_mod.uuid4().hex[:8]}"
+    eb.create_archive(
+        ArchiveName=arch_name,
+        EventSourceArn="arn:aws:events:us-east-1:000000000000:event-bus/default",
+    )
+
+    with pytest.raises(ClientError) as exc:
+        eb.start_replay(
+            ReplayName=f"rep-bad-src-{_uuid_mod.uuid4().hex[:8]}",
+            EventSourceArn=f"arn:aws:sqs:us-east-1:000000000000:archive/{arch_name}",
+            EventStartTime=0,
+            EventEndTime=time.time() + 3600,
+            Destination={"Arn": "arn:aws:events:us-east-1:000000000000:event-bus/default"},
+        )
+
+    assert exc.value.response["Error"]["Code"] == "ValidationException"
+    eb.delete_archive(ArchiveName=arch_name)
+
+
+def test_eventbridge_replay_rejects_foreign_region_destination_without_local_fallback(eb):
+    arch_name = f"replay-bad-dest-{_uuid_mod.uuid4().hex[:8]}"
+    eb.create_archive(
+        ArchiveName=arch_name,
+        EventSourceArn="arn:aws:events:us-east-1:000000000000:event-bus/default",
+    )
+    archive_arn = eb.describe_archive(ArchiveName=arch_name)["ArchiveArn"]
+
+    with pytest.raises(ClientError) as exc:
+        eb.start_replay(
+            ReplayName=f"rep-bad-dest-{_uuid_mod.uuid4().hex[:8]}",
+            EventSourceArn=archive_arn,
+            EventStartTime=0,
+            EventEndTime=time.time() + 3600,
+            Destination={"Arn": "arn:aws:events:us-west-2:000000000000:event-bus/default"},
+        )
+
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+    eb.delete_archive(ArchiveName=arch_name)
+
+
+def test_eventbridge_replay_rejects_non_source_destination(eb):
+    arch_name = f"replay-wrong-dest-{_uuid_mod.uuid4().hex[:8]}"
+    replay_name = f"rep-wrong-dest-{_uuid_mod.uuid4().hex[:8]}"
+    other_bus = f"replay-other-{_uuid_mod.uuid4().hex[:8]}"
+    source_bus_arn = "arn:aws:events:us-east-1:000000000000:event-bus/default"
+    other_bus_arn = f"arn:aws:events:us-east-1:000000000000:event-bus/{other_bus}"
+    eb.create_event_bus(Name=other_bus)
+    eb.create_archive(ArchiveName=arch_name, EventSourceArn=source_bus_arn)
+    archive_arn = eb.describe_archive(ArchiveName=arch_name)["ArchiveArn"]
+
+    with pytest.raises(ClientError) as exc:
+        eb.start_replay(
+            ReplayName=replay_name,
+            EventSourceArn=archive_arn,
+            EventStartTime=0,
+            EventEndTime=time.time() + 3600,
+            Destination={"Arn": other_bus_arn},
+        )
+
+    assert exc.value.response["Error"]["Code"] == "ValidationException"
+    with pytest.raises(ClientError) as nf:
+        eb.describe_replay(ReplayName=replay_name)
+    assert nf.value.response["Error"]["Code"] == "ResourceNotFoundException"
+    eb.delete_archive(ArchiveName=arch_name)
+    eb.delete_event_bus(Name=other_bus)
+
+
+def test_eventbridge_replay_rejects_plain_name_source(eb):
+    arch_name = f"replay-plain-src-{_uuid_mod.uuid4().hex[:8]}"
+    source_bus_arn = "arn:aws:events:us-east-1:000000000000:event-bus/default"
+    eb.create_archive(ArchiveName=arch_name, EventSourceArn=source_bus_arn)
+
+    with pytest.raises(ClientError) as exc:
+        eb.start_replay(
+            ReplayName=f"rep-plain-src-{_uuid_mod.uuid4().hex[:8]}",
+            EventSourceArn=arch_name,
+            EventStartTime=0,
+            EventEndTime=time.time() + 3600,
+            Destination={"Arn": source_bus_arn},
+        )
+
+    assert exc.value.response["Error"]["Code"] == "ValidationException"
+    eb.delete_archive(ArchiveName=arch_name)
 
 
 def test_eventbridge_archive_event_count_accumulation(eb):
@@ -1140,22 +1647,24 @@ def test_eventbridge_replay_time_range_filtering(eb, sqs):
         Targets=[{"Id": "t1", "Arn": q_arn}],
     )
 
-    src_bus_arn = "arn:aws:events:us-east-1:000000000000:event-bus/default"
     arch_name = f"trange-arch-{_uuid_mod.uuid4().hex[:8]}"
-    eb.create_archive(ArchiveName=arch_name, EventSourceArn=src_bus_arn)
+    eb.create_archive(ArchiveName=arch_name, EventSourceArn=bus_arn)
 
-    # Put one event now — its Time will be approximately now (float)
+    # Put one event now; its Time will be approximately now.
     eb.put_events(
         Entries=[
             {
                 "Source": "trange.src",
                 "DetailType": "InRange",
                 "Detail": json.dumps({"marker": "in"}),
-                "EventBusName": "default",
+                "EventBusName": bus_name,
             }
         ]
     )
     now = time.time()
+    # Drain the live delivery from PutEvents so the assertion below isolates
+    # whether StartReplay dispatched anything outside the requested window.
+    sqs.receive_message(QueueUrl=q_url, MaxNumberOfMessages=10, WaitTimeSeconds=1)
 
     archive_arn = eb.describe_archive(ArchiveName=arch_name)["ArchiveArn"]
     rep_name = f"rep-trange-{_uuid_mod.uuid4().hex[:8]}"
@@ -1215,21 +1724,23 @@ def test_eventbridge_replay_destination_receives_events(eb, sqs):
         Targets=[{"Id": "t1", "Arn": q_arn}],
     )
 
-    src_bus_arn = "arn:aws:events:us-east-1:000000000000:event-bus/default"
     arch_name = f"dest-arch-{_uuid_mod.uuid4().hex[:8]}"
-    eb.create_archive(ArchiveName=arch_name, EventSourceArn=src_bus_arn)
+    eb.create_archive(ArchiveName=arch_name, EventSourceArn=bus_arn)
     eb.put_events(
         Entries=[
             {
                 "Source": "dest.replay",
                 "DetailType": "ReplayDelivery",
                 "Detail": json.dumps({"check": "delivered"}),
-                "EventBusName": "default",
+                "EventBusName": bus_name,
             }
         ]
     )
     archive_arn = eb.describe_archive(ArchiveName=arch_name)["ArchiveArn"]
     rep_name = f"rep-dest-{_uuid_mod.uuid4().hex[:8]}"
+    # Drain live delivery from the seed PutEvents call so the final assertion
+    # proves StartReplay delivered a fresh event.
+    sqs.receive_message(QueueUrl=q_url, MaxNumberOfMessages=10, WaitTimeSeconds=1)
     eb.start_replay(
         ReplayName=rep_name,
         EventSourceArn=archive_arn,
