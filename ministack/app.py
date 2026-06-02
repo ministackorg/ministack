@@ -754,6 +754,11 @@ async def _handle_pre_body_request(method: str, path: str, headers: dict, query_
     if response is not None:
         return response
 
+    response = _handle_ports_request(method, path)
+    if response is not None:
+        return response
+
+
     response = _handle_transfer_sftp_ports_request(method, path)
     if response is not None:
         return response
@@ -797,6 +802,68 @@ def _handle_iot_ca_request(method: str, path: str):
         },
         cert_pem.encode("utf-8"),
     )
+
+
+def _handle_ports_request(method: str, path: str):
+    """`GET /_ministack/ports` returns the Docker host-port mappings for RDS and
+    ElastiCache instances.  Useful when DOCKER_NETWORK is set and the emulator
+    uses internal container IPs as ``Endpoint.Address`` — the host port is not
+    returned by those service APIs but is needed to connect from outside the
+    Docker network.
+    """
+    if path != "/_ministack/ports" or method != "GET":
+        return None
+
+    result = {"rds": {}, "elasticache": {"clusters": {}, "replication_groups": {}}}
+
+    try:
+        rds = _get_module("rds")
+        for inst in rds._instances.values():
+            db_id = inst.get("DBInstanceIdentifier")
+            host_port = inst.get("_HostPort")
+            endpoint = inst.get("Endpoint", {})
+            if db_id and host_port:
+                result["rds"][db_id] = {
+                    "host_port": host_port,
+                    "endpoint_address": endpoint.get("Address"),
+                    "endpoint_port": endpoint.get("Port"),
+                    "engine": inst.get("Engine"),
+                    "status": inst.get("DBInstanceStatus"),
+                }
+    except Exception:
+        logger.warning("Failed to extract RDS ports for meta API: %s", e)
+
+    try:
+        ec = _get_module("elasticache")
+        for cluster_id, cl in ec._clusters.items():
+            host_port = cl.get("_HostPort")
+            ep = cl.get("_endpoint", {})
+            if host_port:
+                result["elasticache"]["clusters"][cluster_id] = {
+                    "host_port": host_port,
+                    "endpoint_address": ep.get("Address"),
+                    "endpoint_port": ep.get("Port"),
+                    "engine": cl.get("Engine"),
+                    "status": cl.get("CacheClusterStatus"),
+                }
+        for rg_id, rg in ec._replication_groups.items():
+            rg_ports = {}
+            for ng in rg.get("NodeGroups", []):
+                ng_id = ng.get("NodeGroupId")
+                host_port = ng.get("_HostPort")
+                primary = ng.get("PrimaryEndpoint", {})
+                if ng_id and host_port:
+                    rg_ports[ng_id] = {
+                        "host_port": host_port,
+                        "endpoint_address": primary.get("Address"),
+                        "endpoint_port": primary.get("Port"),
+                    }
+            if rg_ports:
+                result["elasticache"]["replication_groups"][rg_id] = rg_ports
+    except Exception:
+        pass
+
+    return 200, {"Content-Type": "application/json"}, json.dumps(result).encode()
 
 
 def _handle_transfer_sftp_ports_request(method: str, path: str):

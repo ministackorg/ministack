@@ -147,15 +147,16 @@ def _get_docker():
 def _spawn_redis_container(name, engine, engine_version, labels):
     """Start a redis/memcached container.
 
-    Returns ``(host, port, container_id)``. On any failure (docker unavailable,
-    image pull failed, etc.) returns ``(REDIS_DEFAULT_HOST, default_port, None)``
-    so callers always have a usable endpoint shape — same fallback contract as
-    the original inline spawn block.
+    Returns ``(host, port, container_id, host_port)``. On any failure (docker
+    unavailable, image pull failed, etc.) returns
+    ``(REDIS_DEFAULT_HOST, default_port, None, default_port)`` so callers
+    always have a usable endpoint shape — same fallback contract as the
+    original inline spawn block.
     """
     default_port = REDIS_DEFAULT_PORT if engine == "redis" else 11211
     docker_client = _get_docker()
     if not docker_client:
-        return REDIS_DEFAULT_HOST, default_port, None
+        return REDIS_DEFAULT_HOST, default_port, None, default_port
 
     host_port = _port_counter[0]
     _port_counter[0] += 1
@@ -193,10 +194,10 @@ def _spawn_redis_container(name, engine, engine_version, labels):
                 logger.info("ElastiCache: started %s container %s on port %s", engine, name, host_port)
         else:
             logger.info("ElastiCache: started %s container %s on port %s", engine, name, host_port)
-        return endpoint_host, endpoint_port, container.id
+        return endpoint_host, endpoint_port, container.id, host_port
     except Exception as e:
         logger.warning("ElastiCache: Docker failed for %s: %s", name, e)
-        return REDIS_DEFAULT_HOST, default_port, None
+        return REDIS_DEFAULT_HOST, default_port, None, default_port
 
 
 def _spawn_redis_cluster_node(name, engine_version, labels):
@@ -542,7 +543,7 @@ def _create_cache_cluster(p):
         return _error("CacheClusterAlreadyExists", f"Cluster {cluster_id} already exists", 400)
 
     arn = _arn_cluster(cluster_id)
-    endpoint_host, endpoint_port, docker_container_id = _spawn_redis_container(
+    endpoint_host, endpoint_port, docker_container_id, host_port = _spawn_redis_container(
         name=f"ministack-elasticache-{cluster_id}",
         engine=engine,
         engine_version=engine_version,
@@ -586,6 +587,7 @@ def _create_cache_cluster(p):
         ],
         "_docker_container_id": docker_container_id,
         "_endpoint": {"Address": endpoint_host, "Port": endpoint_port},
+        "_HostPort": host_port,
     }
 
     tags = _extract_tags(p)
@@ -752,7 +754,7 @@ def _create_replication_group(p):
         account_id = get_account_id()
         for ng_idx in range(1, num_node_groups + 1):
             ng_id = f"{ng_idx:04d}"
-            shard_host, shard_port, cid = _spawn_redis_container(
+            shard_host, shard_port, cid, shared_host_port = _spawn_redis_container(
                 name=f"ministack-elasticache-rg-{account_id}-{rg_id}-{ng_id}",
                 engine=engine,
                 engine_version=engine_version,
@@ -781,6 +783,7 @@ def _create_replication_group(p):
                 "PrimaryEndpoint": {"Address": shard_host, "Port": shard_port},
                 "ReaderEndpoint": {"Address": shard_host, "Port": shard_port},
                 "NodeGroupMembers": members,
+                "_HostPort": shared_host_port,
             })
 
     # Configuration endpoint (cluster-mode-enabled): point at the first shard's
