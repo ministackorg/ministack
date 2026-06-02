@@ -270,7 +270,7 @@ def _validate_attribute_value(attr_name: str, value: dict) -> tuple | None:
                 "One or more parameter values were invalid: An string set  may not be empty", 400)
         if len(set(vval)) != len(vval):
             return error_response_json("ValidationException",
-                "One or more parameter values were invalid: Input collection contains duplicates", 400)
+                f"One or more parameter values were invalid: Input collection [{', '.join(str(v) for v in vval)}] contains duplicates.", 400)
         for s in vval:
             if not isinstance(s, str) or s == "":
                 return error_response_json("ValidationException",
@@ -288,7 +288,7 @@ def _validate_attribute_value(attr_name: str, value: dict) -> tuple | None:
                     f"The parameter cannot be converted to a numeric value: {n}", 400)
             if canon in seen:
                 return error_response_json("ValidationException",
-                    "One or more parameter values were invalid: Input collection contains duplicates", 400)
+                    f"One or more parameter values were invalid: Input collection [{', '.join(str(v) for v in vval)}] contains duplicates.", 400)
             seen.add(canon)
             new_vals.append(canon)
         value["NS"] = new_vals
@@ -304,7 +304,7 @@ def _validate_attribute_value(attr_name: str, value: dict) -> tuple | None:
                     "One or more parameter values were invalid: Binary set element may not be empty", 400)
             if key in seen:
                 return error_response_json("ValidationException",
-                    "One or more parameter values were invalid: Input collection contains duplicates", 400)
+                    f"One or more parameter values were invalid: Input collection [{', '.join(str(v) for v in vval)}] contains duplicates.", 400)
             seen.add(key)
     elif vtype == "L":
         if not isinstance(vval, list):
@@ -781,9 +781,17 @@ def _validate_key_schema(key_schema: list, attr_defs: list, context: str = "tabl
         return error_response_json("ValidationException",
             "1 validation error detected: Value null at 'keySchema' failed to satisfy constraint: Member must not be null", 400)
     if not isinstance(key_schema, list) or len(key_schema) == 0 or len(key_schema) > 2:
-        # AWS-canonical (dynamodb-conformance.org capture).
+        # AWS dumps the key_schema as a Java-toString list of
+        # `KeySchemaElement(attributeName=…, keyType=…)` entries.
+        if isinstance(key_schema, list):
+            _dump = "[" + ", ".join(
+                f"KeySchemaElement(attributeName={(ks or {}).get('AttributeName', '')}, keyType={(ks or {}).get('KeyType', '')})"
+                for ks in key_schema
+            ) + "]"
+        else:
+            _dump = str(key_schema)
         return error_response_json("ValidationException",
-            f"1 validation error detected: Value '{key_schema}' at 'keySchema' failed to satisfy constraint: Member must have length less than or equal to 2", 400)
+            f"1 validation error detected: Value '{_dump}' at 'keySchema' failed to satisfy constraint: Member must have length less than or equal to 2", 400)
     hash_count = 0
     range_count = 0
     seen_names = set()
@@ -1049,8 +1057,9 @@ def _update_table(data):
                 "One or more parameter values were invalid: ReadCapacityUnits and WriteCapacityUnits must be greater than zero", 400)
         existing_pt = table.get("ProvisionedThroughput") or {}
         # AWS rejects an UpdateTable that would result in no change.
+        _effective_billing = new_billing or current_billing
         if (
-            new_billing is None
+            _effective_billing == "PROVISIONED"
             and current_billing == "PROVISIONED"
             and rcu == int(existing_pt.get("ReadCapacityUnits", 0))
             and wcu == int(existing_pt.get("WriteCapacityUnits", 0))
@@ -1198,6 +1207,33 @@ def _validate_return_consumed_capacity(data) -> tuple | None:
     return None
 
 
+def _validate_projection_expression_syntax(expr: str) -> str | None:
+    """AWS-shape syntax + reserved-keyword validator for ProjectionExpression.
+
+    Surfaces two AWS-canonical errors before per-item processing:
+      - `"Invalid ProjectionExpression: Syntax error; token: <c>, near: <ctx>"`
+        when the expression starts with a non-path-start character.
+      - `"Invalid ProjectionExpression: Attribute name is a reserved keyword;
+        reserved keyword: <kw>"` when any unaliased root identifier is a
+        reserved DynamoDB keyword.
+    """
+    s = expr.lstrip()
+    if not s:
+        return None
+    c = s[0]
+    if not (c.isalnum() or c == "#" or c == "_"):
+        near = s[: min(len(s), 2)]
+        return f'Invalid ProjectionExpression: Syntax error; token: "{c}", near: "{near}"'
+    # Reserved-keyword scan on each unaliased root identifier.
+    for path in (p.strip() for p in expr.split(",")):
+        if not path:
+            continue
+        head = path.split(".")[0].split("[")[0].strip()
+        if head and not head.startswith("#") and head.upper() in AWS_KEYWORDS:
+            return f"Invalid ProjectionExpression: Attribute name is a reserved keyword; reserved keyword: {head}"
+    return None
+
+
 def _validate_expression_attrs(data, expression_fields: tuple) -> tuple | None:
     """AWS rejects ExpressionAttributeValues / ExpressionAttributeNames when
     no expression field references them at all, AND when any defined alias
@@ -1208,9 +1244,14 @@ def _validate_expression_attrs(data, expression_fields: tuple) -> tuple | None:
     ean = data.get("ExpressionAttributeNames")
     if eav and not has_any_expr:
         # AWS-canonical: EAV without any expression is rejected with the
-        # "can only be used when..." wording.
+        # "can only be used when..." wording. Real AWS appends the first
+        # expression-slot name ("<Field> is null") for write ops; for ops
+        # with multiple expression slots the suffix is omitted.
+        suffix = ""
+        if len(expression_fields) == 1:
+            suffix = f": {expression_fields[0]} is null"
         return error_response_json("ValidationException",
-            "ExpressionAttributeValues can only be specified when using expressions", 400)
+            f"ExpressionAttributeValues can only be specified when using expressions{suffix}", 400)
     if ean and not has_any_expr:
         return error_response_json("ValidationException",
             "ExpressionAttributeNames can only be specified when using expressions: KeyConditionExpression, ConditionExpression, ProjectionExpression, FilterExpression, UpdateExpression", 400)
@@ -1361,6 +1402,11 @@ def _get_item(data):
     if data.get("ProjectionExpression") and data.get("AttributesToGet"):
         return error_response_json("ValidationException",
             "Can not use both expression and non-expression parameters in the same request: Non-expression parameters: {AttributesToGet} Expression parameters: {ProjectionExpression}", 400)
+    _pe = (data.get("ProjectionExpression") or "").strip()
+    if _pe:
+        _pe_err = _validate_projection_expression_syntax(_pe)
+        if _pe_err:
+            return error_response_json("ValidationException", _pe_err, 400)
     err = _validate_expression_attrs(data, ("ProjectionExpression",))
     if err:
         return err
@@ -1443,6 +1489,17 @@ def _update_item(data):
     if not table:
         return error_response_json("ResourceNotFoundException",
             "Requested resource not found", 400)
+    # Pre-validate UpdateExpression syntax BEFORE the unused-EAV check.
+    # AWS reports `"Invalid UpdateExpression: Syntax error; token: <first>,
+    # near: <first second>"` for a body that doesn't start with a clause
+    # keyword (SET / ADD / REMOVE / DELETE), regardless of EAV usage.
+    _ue_pre = (data.get("UpdateExpression") or "").strip()
+    if _ue_pre:
+        _ue_tokens = _ue_pre.split()
+        if _ue_tokens and _ue_tokens[0].upper() not in ("SET", "ADD", "REMOVE", "DELETE"):
+            _near = " ".join(_ue_tokens[:2])
+            return error_response_json("ValidationException",
+                f'Invalid UpdateExpression: Syntax error; token: "{_ue_tokens[0]}", near: "{_near}"', 400)
     err = _validate_expression_attrs(data, ("ConditionExpression", "UpdateExpression"))
     if err:
         return err
@@ -1483,6 +1540,34 @@ def _update_item(data):
     if "UpdateExpression" in data and not update_expr.strip():
         return error_response_json("ValidationException",
             "Invalid UpdateExpression: The expression can not be empty;", 400)
+
+    # AWS pre-validates UpdateExpression syntax — the first identifier must be
+    # a clause keyword (SET / ADD / REMOVE / DELETE). Anything else is
+    # `"Invalid UpdateExpression: Syntax error; token: <first>, near: <first second>"`.
+    if update_expr.strip():
+        _tokens_pre = update_expr.strip().split()
+        if _tokens_pre and _tokens_pre[0].upper() not in ("SET", "ADD", "REMOVE", "DELETE"):
+            _near = " ".join(_tokens_pre[:2])
+            return error_response_json("ValidationException",
+                f'Invalid UpdateExpression: Syntax error; token: "{_tokens_pre[0]}", near: "{_near}"', 400)
+
+    # AWS pre-rejects an UpdateExpression that targets a key attribute, even
+    # when the item doesn't exist yet — the rejection is parse-time, not
+    # diff-time. Cheap scan for `SET <keyAttr>[ =]` against the table's
+    # declared key names (alias-resolved via ExpressionAttributeNames).
+    if update_expr.strip():
+        _key_names = [n for n in (table.get("pk_name"), table.get("sk_name")) if n]
+        _resolved_ean = data.get("ExpressionAttributeNames") or {}
+        for _kn in _key_names:
+            # Direct mention of the key name as a SET / ADD / REMOVE / DELETE target.
+            if re.search(rf"(?i)\b(SET|ADD|REMOVE|DELETE)\b[^,]*?\b{re.escape(_kn)}\b", update_expr):
+                return error_response_json("ValidationException",
+                    f"One or more parameter values were invalid: Cannot update attribute {_kn}. This attribute is part of the key", 400)
+            # Alias that resolves to a key name.
+            for _alias, _resolved in _resolved_ean.items():
+                if _resolved == _kn and re.search(rf"(?i)\b(SET|ADD|REMOVE|DELETE)\b[^,]*?{re.escape(_alias)}\b", update_expr):
+                    return error_response_json("ValidationException",
+                        f"One or more parameter values were invalid: Cannot update attribute {_kn}. This attribute is part of the key", 400)
 
     if update_expr:
         try:
@@ -1550,6 +1635,23 @@ def _query(data):
         if idx_req not in known:
             return error_response_json("ValidationException",
                 f"The table does not have the specified index: {idx_req}", 400)
+    # AWS-canonical: empty KeyConditionExpression is rejected BEFORE the
+    # unused-EAV check (EAV is presumed valid in this case — the empty
+    # expression is the load-bearing error).
+    if "KeyConditionExpression" in data and not (data["KeyConditionExpression"] or "").strip():
+        return error_response_json("ValidationException",
+            "Invalid KeyConditionExpression: The expression can not be empty;", 400)
+    # AWS pre-validates redundant parentheses at parse time, not at evaluation
+    # time — so the check must fire even when no items match the query.
+    for _slot in ("KeyConditionExpression", "FilterExpression"):
+        _expr = (data.get(_slot) or "").strip()
+        if _expr:
+            try:
+                _err = _check_redundant_parens(_tokenize(_expr), _slot)
+                if _err:
+                    return error_response_json("ValidationException", _err, 400)
+            except Exception:
+                pass
     err = _validate_expression_attrs(data, ("KeyConditionExpression", "FilterExpression", "ProjectionExpression"))
     if err:
         return err
@@ -1757,6 +1859,27 @@ def _scan(data):
         if idx_req not in known:
             return error_response_json("ValidationException",
                 f"The table does not have the specified index: {idx_req}", 400)
+    # Pre-validate redundant parens on FilterExpression — AWS rejects at parse
+    # time, so the error must fire even when the table is empty.
+    _fexpr = (data.get("FilterExpression") or "").strip()
+    if _fexpr:
+        try:
+            _err = _check_redundant_parens(_tokenize(_fexpr), "FilterExpression")
+            if _err:
+                return error_response_json("ValidationException", _err, 400)
+        except Exception:
+            pass
+        # AWS rejects begins_with with a non-string/binary operand at parse
+        # time. The 2nd argument is referenced by EAV placeholder (:foo);
+        # peek at its declared type.
+        _eav = data.get("ExpressionAttributeValues") or {}
+        for _m in re.finditer(r"begins_with\s*\([^,]+,\s*(:[A-Za-z0-9_]+)\s*\)", _fexpr):
+            _ph = _m.group(1)
+            _av = _eav.get(_ph) or {}
+            _t = next(iter(_av.keys()), None) if isinstance(_av, dict) and _av else None
+            if _t and _t not in ("S", "B"):
+                return error_response_json("ValidationException",
+                    f"Invalid FilterExpression: Incorrect operand type for operator or function; operator or function: begins_with, operand type: {_t}", 400)
     err = _validate_expression_attrs(data, ("FilterExpression", "ProjectionExpression"))
     if err:
         return err
@@ -1772,7 +1895,7 @@ def _scan(data):
     # Limit must be > 0 when provided (AWS rejects Limit=0).
     if limit is not None and int(limit) <= 0:
         return error_response_json("ValidationException",
-            f"1 validation error detected: Value at 'limit' failed to satisfy constraint: Member must have value greater than or equal to 1", 400)
+            f"1 validation error detected: Value '{int(limit)}' at 'limit' failed to satisfy constraint: Member must have value greater than or equal to 1", 400)
     if data.get("ProjectionExpression") and data.get("AttributesToGet"):
         return error_response_json("ValidationException",
             "Can not use both expression and non-expression parameters in the same request: Non-expression parameters: {AttributesToGet} Expression parameters: {ProjectionExpression}", 400)
@@ -1793,7 +1916,13 @@ def _scan(data):
         if ts < 1 or ts > 1_000_000:
             return error_response_json("ValidationException",
                 f"TotalSegments must be between 1 and 1000000", 400)
-        if seg < 0 or seg >= ts:
+        # Negative segment uses the standard "1 validation error detected"
+        # envelope with the lowercase 'segment' slot and "greater than or
+        # equal to 0" floor — distinct from the segment>=totalSegments error.
+        if seg < 0:
+            return error_response_json("ValidationException",
+                f"1 validation error detected: Value '{seg}' at 'segment' failed to satisfy constraint: Member must have value greater than or equal to 0", 400)
+        if seg >= ts:
             return error_response_json("ValidationException",
                 f"The Segment parameter is zero-based and must be less than parameter TotalSegments: Segment: {seg} is not less than TotalSegments: {ts}", 400)
     # Select validation.
@@ -2060,7 +2189,12 @@ def _batch_execute_statement(data):
         else:
             err_code = payload.get("__type", "ValidationException")
             err_msg = payload.get("message", "")
-            responses.append({"Error": {"Code": err_code.split("#")[-1], "Message": err_msg}})
+            # Per-statement error code in BatchExecuteStatement is the short
+            # form ('ResourceNotFound', not 'ResourceNotFoundException').
+            short = err_code.split("#")[-1]
+            if short.endswith("Exception"):
+                short = short[: -len("Exception")]
+            responses.append({"Error": {"Code": short, "Message": err_msg}})
         # Crude per-table unit attribution.
         try:
             parsed = _parse_partiql(stmt.get("Statement", ""), stmt.get("Parameters", []))
@@ -2445,8 +2579,12 @@ def _batch_write_item(data):
     # Total request count cap (25 per BatchWriteItem call).
     total = sum(len(v) for v in request_items.values())
     if total > _DDB_BATCH_WRITE_MAX:
+        # AWS dumps the full RequestItems map in Java-toString shape:
+        # `{<tableName>=[<WriteRequest>, ...]}`. Match the structural envelope.
+        parts = [f"{tn}=[{', '.join(repr(r) for r in reqs)}]" for tn, reqs in request_items.items()]
+        dump = "{" + ", ".join(parts) + "}"
         return error_response_json("ValidationException",
-            f"1 validation error detected: Value '{request_items}' at 'requestItems' failed to satisfy constraint: Member must have length less than or equal to {_DDB_BATCH_WRITE_MAX}", 400)
+            f"1 validation error detected: Value '{dump}' at 'requestItems' failed to satisfy constraint: Map value must satisfy constraint: [Member must have length less than or equal to {_DDB_BATCH_WRITE_MAX}, Member must have length greater than or equal to 1]", 400)
     # Duplicate target key detection — AWS rejects two writes to the same key
     # in a single BatchWriteItem call.
     seen_keys = set()
@@ -2592,7 +2730,7 @@ def _transact_write_items(data):
             "1 validation error detected: Value '[]' at 'transactItems' failed to satisfy constraint: Member must have length greater than or equal to 1", 400)
     if len(items_list) > _DDB_TXN_WRITE_MAX_ITEMS:
         return error_response_json("ValidationException",
-            f"1 validation error detected: Value at 'transactItems' failed to satisfy constraint: Member must have length less than or equal to {_DDB_TXN_WRITE_MAX_ITEMS}", 400)
+            f"1 validation error detected: Value '[{', '.join(repr(i) for i in items_list)}]' at 'transactItems' failed to satisfy constraint: Member must have length less than or equal to {_DDB_TXN_WRITE_MAX_ITEMS}", 400)
     # 4MB total payload cap.
     try:
         if len(json.dumps(data).encode("utf-8")) > _DDB_TXN_MAX_BYTES:
@@ -2731,7 +2869,45 @@ def _transact_get_items(data):
             "1 validation error detected: Value '[]' at 'transactItems' failed to satisfy constraint: Member must have length greater than or equal to 1", 400)
     if len(items_list) > _DDB_TXN_GET_MAX_ITEMS:
         return error_response_json("ValidationException",
-            f"1 validation error detected: Value at 'transactItems' failed to satisfy constraint: Member must have length less than or equal to {_DDB_TXN_GET_MAX_ITEMS}", 400)
+            f"1 validation error detected: Value '[{', '.join(repr(i) for i in items_list)}]' at 'transactItems' failed to satisfy constraint: Member must have length less than or equal to {_DDB_TXN_GET_MAX_ITEMS}", 400)
+    # AWS pre-validates ProjectionExpression syntax + reserved keywords at the
+    # request level for TransactGetItems — surfaces as a ValidationException,
+    # not via the cancellation channel.
+    for transact in items_list:
+        _pe = (transact.get("Get", {}).get("ProjectionExpression") or "").strip()
+        if _pe:
+            _err = _validate_projection_expression_syntax(_pe)
+            if _err:
+                return error_response_json("ValidationException", _err, 400)
+    # Per-action ValidationError (e.g. empty Key) surfaces as
+    # TransactionCanceledException with reason "ValidationError" per AWS.
+    _cancel_reasons = []
+    _has_cancel = False
+    for transact in items_list:
+        get_op = transact.get("Get") or {}
+        tbl = _tables.get(get_op.get("TableName", ""))
+        if not tbl:
+            _cancel_reasons.append({"Code": "None"})
+            continue
+        key = get_op.get("Key") or {}
+        if not key:
+            _cancel_reasons.append({"Code": "ValidationError",
+                                    "Message": "The provided key element does not match the schema"})
+            _has_cancel = True
+        else:
+            _cancel_reasons.append({"Code": "None"})
+    if _has_cancel:
+        _msg = ("Transaction cancelled, please refer cancellation reasons for specific reasons [" +
+                ", ".join(r["Code"] for r in _cancel_reasons) + "]")
+        _body = json.dumps({
+            "__type": "TransactionCanceledException",
+            "message": _msg,
+            "CancellationReasons": _cancel_reasons,
+        }, ensure_ascii=False).encode("utf-8")
+        return 400, {
+            "Content-Type": "application/x-amz-json-1.0",
+            "x-amzn-errortype": "TransactionCanceledException",
+        }, _body
     # Duplicate-key rejection.
     seen = set()
     for transact in items_list:
@@ -2765,6 +2941,11 @@ def _transact_get_items(data):
             ean = get_op.get("ExpressionAttributeNames", {})
             if proj:
                 item = _project_item(item, proj, ean)
+                # AWS omits Item entirely when the projection matches no
+                # attribute on a present item (rather than returning {}).
+                if not item:
+                    responses.append({})
+                    continue
             responses.append({"Item": item})
         else:
             responses.append({})
@@ -2774,11 +2955,17 @@ def _transact_get_items(data):
         consumed = []
         for tname, units in per_table_units.items():
             entry = {"TableName": tname, "CapacityUnits": units, "ReadCapacityUnits": units}
-            if rc == "INDEXES" and _tables.get(tname, {}).get("GlobalSecondaryIndexes"):
-                entry["GlobalSecondaryIndexes"] = {
-                    gsi["IndexName"]: {"CapacityUnits": units, "ReadCapacityUnits": units}
-                    for gsi in _tables[tname].get("GlobalSecondaryIndexes", [])
-                }
+            # AWS's INDEXES breakdown always includes the base Table block —
+            # the ReadCapacityUnits attributed to the table itself, distinct
+            # from index-side reads (which TransactGetItems never has, since
+            # it can only read from the base table).
+            if rc == "INDEXES":
+                entry["Table"] = {"CapacityUnits": units, "ReadCapacityUnits": units}
+                if _tables.get(tname, {}).get("GlobalSecondaryIndexes"):
+                    entry["GlobalSecondaryIndexes"] = {
+                        gsi["IndexName"]: {"CapacityUnits": units, "ReadCapacityUnits": units}
+                        for gsi in _tables[tname].get("GlobalSecondaryIndexes", [])
+                    }
             consumed.append(entry)
         result["ConsumedCapacity"] = consumed
     return json_response(result)
@@ -3775,7 +3962,17 @@ def _restore_table_from_backup(data):
     snap = desc.get("_items_snapshot") or {}
     _tables[target]["items"] = defaultdict(dict, copy.deepcopy(snap))
     _update_counts(_tables[target])
-    return json_response({"TableDescription": _table_description(target)})
+    # AWS attaches a RestoreSummary to the response — clients (Terraform, the
+    # AWS SDK) read SourceBackupArn / RestoreInProgress to track the restore.
+    _tables[target]["RestoreSummary"] = {
+        "SourceBackupArn": arn,
+        "SourceTableArn": _tables[target].get("TableArn", ""),
+        "RestoreDateTime": int(time.time()),
+        "RestoreInProgress": True,
+    }
+    td = _table_description(target)
+    td["RestoreSummary"] = _tables[target]["RestoreSummary"]
+    return json_response({"TableDescription": td})
 
 
 def _restore_table_to_point_in_time(data):
@@ -4096,7 +4293,13 @@ class _ExprEval:
         path_tokens = self.tokens[path_start:operand_start - 1]
         operand_tokens = self.tokens[operand_start:self.pos - 1]
         if path_tokens == operand_tokens and path_tokens:
-            raise ValueError("Invalid ConditionExpression: The first operand must be distinct from the remaining operands for this function; function: contains")
+            # AWS reports the alias-resolved path. `path` is the parser's
+            # resolved component list (e.g. ['data'] for #a -> data).
+            try:
+                path_text = ".".join(str(c) for c in path) if isinstance(path, list) else str(path)
+            except Exception:
+                path_text = "".join(t for t in path_tokens)
+            raise ValueError(f"Invalid ConditionExpression: The first operand must be distinct from the remaining operands for this operator or function; operator: contains, first operand: [{path_text}]")
         attr = _get_at_path(self.item, path)
         if attr is None or val is None:
             return False
@@ -4309,7 +4512,13 @@ def _eval_set_value(tokens, item, attr_values, attr_names):
             right = _eval_set_value(tokens[i + 1:], item, attr_values, attr_names)
             if left and right and "N" in left and "N" in right:
                 lv, rv = Decimal(left["N"]), Decimal(right["N"])
-                return {"N": str(lv + rv if tok[0] == 'PLUS' else lv - rv)}
+                result = lv + rv if tok[0] == 'PLUS' else lv - rv
+                # Validate AWS magnitude bounds on the result — anything past
+                # 9.9999E+125 / below 1E-130 raises "Number overflow".
+                canon = _ddb_canonicalize_number(str(result))
+                if canon is None:
+                    raise ValueError("Number overflow. Attempting to store a number with magnitude larger than supported range")
+                return {"N": canon}
             return left
 
     if len(tokens) >= 2 and tokens[0][0] == 'IDENT' and tokens[1][0] == 'LPAREN':
