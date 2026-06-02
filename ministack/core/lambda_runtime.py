@@ -77,6 +77,14 @@ def run():
         if not line:
             break
         event = json.loads(line)
+        # X-Ray active tracing: ministack injects the per-invocation trace
+        # header into the event; pop it into os.environ so the AWS X-Ray SDK
+        # can read _X_AMZN_TRACE_ID on import.
+        _xray_tid = event.pop("_x_amzn_trace_id", None)
+        if _xray_tid:
+            os.environ["_X_AMZN_TRACE_ID"] = _xray_tid
+        elif "_X_AMZN_TRACE_ID" in os.environ:
+            del os.environ["_X_AMZN_TRACE_ID"]
         context = type("Context", (), {
             "function_name": init.get("function_name", ""),
             "memory_limit_in_mb": init.get("memory", 128),
@@ -495,6 +503,15 @@ rl.on("line", async (line) => {
       succeed: () => {},
       fail: () => {},
     };
+    // X-Ray active tracing: ministack injects the per-invocation trace
+    // header into the event; promote it to process.env so the AWS X-Ray SDK
+    // can read _X_AMZN_TRACE_ID on require().
+    if (event._x_amzn_trace_id) {
+      process.env._X_AMZN_TRACE_ID = event._x_amzn_trace_id;
+    } else if ("_X_AMZN_TRACE_ID" in process.env) {
+      delete process.env._X_AMZN_TRACE_ID;
+    }
+    delete event._x_amzn_trace_id;
     delete event._request_id;
     delete event._function_name;
     delete event._memory;
