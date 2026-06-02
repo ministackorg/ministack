@@ -3651,13 +3651,6 @@ def _export_table_to_point_in_time(data):
         desc["S3SseKmsKeyId"] = data["S3SseKmsKeyId"]
     if client_token:
         desc["ClientToken"] = client_token
-    # Immediate completion — local emulator has no async snapshot work.
-    table = _tables[table_name]
-    desc["ItemCount"] = len(table.get("items", {}))
-    desc["BilledSizeBytes"] = table.get("TableSizeBytes", 0)
-    desc["ExportStatus"] = "COMPLETED"
-    desc["EndTime"] = time.time()
-    desc["ExportManifest"] = f"AWSDynamoDB/{arn.split('/')[-1]}/manifest-summary.json"
     _exports[arn] = desc
     return json_response({"ExportDescription": desc})
 
@@ -3671,6 +3664,15 @@ def _describe_export(data):
     if not desc:
         return error_response_json("ExportNotFoundException",
             f"Export not found: {arn}", 400)
+    if desc.get("ExportStatus") == "IN_PROGRESS":
+        table_name = _table_name_from_arn(desc["TableArn"])
+        table = _tables.get(table_name)
+        if table:
+            desc["ItemCount"] = len(table.get("items", {}))
+            desc["BilledSizeBytes"] = table.get("TableSizeBytes", 0)
+        desc["ExportStatus"] = "COMPLETED"
+        desc["EndTime"] = time.time()
+        desc["ExportManifest"] = f"AWSDynamoDB/{arn.split('/')[-1]}/manifest-summary.json"
     return json_response({"ExportDescription": desc})
 
 
