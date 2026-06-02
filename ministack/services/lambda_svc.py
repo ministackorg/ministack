@@ -1038,6 +1038,10 @@ def _qp_first(query_params: dict, key: str, default: str = "") -> str:
     return val
 
 
+def _qualifier_from_path_or_query(path_qualifier: str | None, query_params: dict | None) -> str | None:
+    return path_qualifier or _qp_first(query_params or {}, "Qualifier") or None
+
+
 def _get_func_record_for_qualifier(name: str, qualifier: str | None) -> tuple[dict | None, dict | None]:
     """Return (func_record, effective_config) for a given name + qualifier.
 
@@ -1063,13 +1067,13 @@ def _effective_func_record_for_qualifier(func: dict | None, qualifier: str | Non
         ver = func["versions"].get(target_ver)
         if ver:
             return ver, ver["config"]
-        return func, func["config"]
+        return None, None
 
     ver = func["versions"].get(qualifier)
     if ver:
         return ver, ver["config"]
 
-    return func, func["config"]
+    return None, None
 
 
 def _function_qualifier_exists(func: dict | None, qualifier: str | None) -> bool:
@@ -1078,6 +1082,34 @@ def _function_qualifier_exists(func: dict | None, qualifier: str | None) -> bool
     if qualifier is None or qualifier == "$LATEST":
         return True
     return qualifier in func.get("aliases", {}) or qualifier in func.get("versions", {})
+
+
+def _function_qualifier_not_found(func_name: str, qualifier: str | None):
+    suffix = f":{qualifier}" if qualifier else ""
+    return error_response_json(
+        "ResourceNotFoundException",
+        f"Function not found: {_func_arn(func_name)}{suffix}",
+        404,
+    )
+
+
+def _validate_function_qualifier_exists(func_name: str, qualifier: str | None):
+    if not _function_qualifier_exists(_functions.get(func_name), qualifier):
+        return _function_qualifier_not_found(func_name, qualifier)
+    return None
+
+
+def _validate_latest_mutation_qualifier(func_name: str, qualifier: str | None):
+    if not qualifier or qualifier == "$LATEST":
+        return None
+    err = _validate_function_qualifier_exists(func_name, qualifier)
+    if err:
+        return err
+    return error_response_json(
+        "InvalidParameterValueException",
+        "Function updates can only target the unqualified function or $LATEST.",
+        400,
+    )
 
 
 def _get_func_record_for_ref(function_ref: str) -> tuple[dict | None, dict | None, str]:
@@ -1277,8 +1309,10 @@ async def handle_request(method: str, path: str, headers: dict, body: bytes, que
     # --- Provisioned Concurrency: /2019-09-30/functions/{name}/provisioned-concurrency ---
     if "provisioned-concurrency" in path:
         m = re.search(r"/functions/([^/]+)/provisioned-concurrency", path)
-        fname = _resolve_request_scoped_name(m.group(1)) if m else ""
-        qualifier = _qp_first(query_params, "Qualifier")
+        fname, path_qualifier = (
+            _resolve_request_scoped_name_and_qualifier(m.group(1)) if m else ("", None)
+        )
+        qualifier = _qualifier_from_path_or_query(path_qualifier, query_params)
         if method == "GET":
             return _get_provisioned_concurrency(fname, qualifier)
         if method == "PUT":
@@ -1318,8 +1352,10 @@ async def handle_request(method: str, path: str, headers: dict, body: bytes, que
             return _list_function_url_configs(fname, query_params)
     if "/url" in path and "/functions/" in path:
         m = re.search(r"/functions/([^/]+)/url", path)
-        fname = _resolve_request_scoped_name(m.group(1)) if m else ""
-        qualifier = _qp_first(query_params, "Qualifier") or None
+        fname, path_qualifier = (
+            _resolve_request_scoped_name_and_qualifier(m.group(1)) if m else ("", None)
+        )
+        qualifier = _qualifier_from_path_or_query(path_qualifier, query_params)
         if method == "POST":
             return _create_function_url_config(fname, data, qualifier)
         if method == "GET":
@@ -1379,11 +1415,11 @@ async def handle_request(method: str, path: str, headers: dict, body: bytes, que
         if sub == "policy":
             sid = sub2
             if method == "GET" and not sid:
-                return _get_policy(func_name, query_params)
+                return _get_policy(func_name, query_params, path_qualifier)
             if method == "POST" and not sid:
-                return _add_permission(func_name, data, query_params)
+                return _add_permission(func_name, data, query_params, path_qualifier)
             if method == "DELETE" and sid:
-                return _remove_permission(func_name, sid, query_params)
+                return _remove_permission(func_name, sid, query_params, path_qualifier)
 
         # --- Concurrency ---
         if sub == "concurrency":
@@ -1396,24 +1432,32 @@ async def handle_request(method: str, path: str, headers: dict, body: bytes, que
 
         # GetFunction
         if method == "GET" and not sub:
-            qualifier = path_qualifier or _qp_first(query_params, "Qualifier") or None
+            qualifier = _qualifier_from_path_or_query(path_qualifier, query_params)
             return _get_function(func_name, qualifier)
 
         # GetFunctionConfiguration
         if method == "GET" and sub == "configuration":
-            qualifier = path_qualifier or _qp_first(query_params, "Qualifier") or None
+            qualifier = _qualifier_from_path_or_query(path_qualifier, query_params)
             return _get_function_config(func_name, qualifier)
 
         # DeleteFunction
         if method == "DELETE" and not sub:
-            return _delete_function(func_name, query_params)
+            return _delete_function(func_name, query_params, path_qualifier)
 
         # UpdateFunctionCode
         if method == "PUT" and sub == "code":
+            qualifier = _qualifier_from_path_or_query(path_qualifier, query_params)
+            err = _validate_latest_mutation_qualifier(func_name, qualifier)
+            if err:
+                return err
             return _update_code(func_name, data)
 
         # UpdateFunctionConfiguration
         if method == "PUT" and sub == "configuration":
+            qualifier = _qualifier_from_path_or_query(path_qualifier, query_params)
+            err = _validate_latest_mutation_qualifier(func_name, qualifier)
+            if err:
+                return err
             return _update_config(func_name, data)
 
     return error_response_json("ResourceNotFoundException", f"Function not found: {path}", 404)
@@ -1793,8 +1837,8 @@ def _list_functions(query_params: dict):
     return json_response(result)
 
 
-def _delete_function(name: str, query_params: dict):
-    qualifier = _qp_first(query_params, "Qualifier")
+def _delete_function(name: str, query_params: dict, path_qualifier: str | None = None):
+    qualifier = _qualifier_from_path_or_query(path_qualifier, query_params)
     if name not in _functions:
         return error_response_json(
             "ResourceNotFoundException",
@@ -1802,6 +1846,22 @@ def _delete_function(name: str, query_params: dict):
             404,
         )
     if qualifier and qualifier != "$LATEST":
+        if qualifier not in _functions[name].get("versions", {}):
+            return _function_qualifier_not_found(name, qualifier)
+        alias_names = [
+            alias_name
+            for alias_name, alias in _functions[name].get("aliases", {}).items()
+            if (
+                alias.get("FunctionVersion") == qualifier
+                or qualifier in (alias.get("RoutingConfig", {}).get("AdditionalVersionWeights") or {})
+            )
+        ]
+        if alias_names:
+            return error_response_json(
+                "ResourceConflictException",
+                f"Function version {qualifier} cannot be deleted because it is referenced by an alias.",
+                409,
+            )
         _functions[name]["versions"].pop(qualifier, None)
     else:
         del _functions[name]
@@ -4072,13 +4132,29 @@ def _list_aliases(func_name: str, query_params: dict):
 # ---------------------------------------------------------------------------
 
 
-def _add_permission(func_name: str, data: dict, query_params: dict | None = None):
+def _policy_resource_arn(func_name: str, qualifier: str | None) -> str:
+    resource_arn = _func_arn(func_name)
+    if qualifier:
+        resource_arn = f"{resource_arn}:{qualifier}"
+    return resource_arn
+
+
+def _add_permission(
+    func_name: str,
+    data: dict,
+    query_params: dict | None = None,
+    path_qualifier: str | None = None,
+):
+    qualifier = _qualifier_from_path_or_query(path_qualifier, query_params)
     if func_name not in _functions:
         return error_response_json(
             "ResourceNotFoundException",
             f"Function not found: {_func_arn(func_name)}",
             404,
         )
+    err = _validate_function_qualifier_exists(func_name, qualifier)
+    if err:
+        return err
     func = _functions[func_name]
     sid = data.get("StatementId", new_uuid())
 
@@ -4099,12 +4175,7 @@ def _add_permission(func_name: str, data: dict, query_params: dict | None = None
     else:
         principal = {"AWS": principal_raw}
 
-    qualifier = (query_params or {}).get("Qualifier") if query_params else None
-    if isinstance(qualifier, list):
-        qualifier = qualifier[0] if qualifier else None
-    resource_arn = _func_arn(func_name)
-    if qualifier:
-        resource_arn = f"{resource_arn}:{qualifier}"
+    resource_arn = _policy_resource_arn(func_name, qualifier)
 
     statement: dict = {
         "Sid": sid,
@@ -4129,16 +4200,30 @@ def _add_permission(func_name: str, data: dict, query_params: dict | None = None
     return json_response({"Statement": json.dumps(statement)}, 201)
 
 
-def _remove_permission(func_name: str, sid: str, query_params: dict):
+def _remove_permission(
+    func_name: str,
+    sid: str,
+    query_params: dict,
+    path_qualifier: str | None = None,
+):
+    qualifier = _qualifier_from_path_or_query(path_qualifier, query_params)
     if func_name not in _functions:
         return error_response_json(
             "ResourceNotFoundException",
             f"Function not found: {_func_arn(func_name)}",
             404,
         )
+    err = _validate_function_qualifier_exists(func_name, qualifier)
+    if err:
+        return err
+    resource_arn = _policy_resource_arn(func_name, qualifier) if qualifier else None
     func = _functions[func_name]
     before = len(func["policy"]["Statement"])
-    func["policy"]["Statement"] = [s for s in func["policy"]["Statement"] if s.get("Sid") != sid]
+    func["policy"]["Statement"] = [
+        s
+        for s in func["policy"]["Statement"]
+        if s.get("Sid") != sid or (resource_arn is not None and s.get("Resource") != resource_arn)
+    ]
     if len(func["policy"]["Statement"]) == before:
         return error_response_json(
             "ResourceNotFoundException",
@@ -4148,17 +4233,35 @@ def _remove_permission(func_name: str, sid: str, query_params: dict):
     return 204, {}, b""
 
 
-def _get_policy(func_name: str, query_params: dict | None = None):
+def _get_policy(
+    func_name: str,
+    query_params: dict | None = None,
+    path_qualifier: str | None = None,
+):
+    qualifier = _qualifier_from_path_or_query(path_qualifier, query_params)
     if func_name not in _functions:
         return error_response_json(
             "ResourceNotFoundException",
             f"Function not found: {_func_arn(func_name)}",
             404,
         )
+    err = _validate_function_qualifier_exists(func_name, qualifier)
+    if err:
+        return err
     func = _functions[func_name]
+    policy = copy.deepcopy(func["policy"])
+    if qualifier:
+        resource_arn = _policy_resource_arn(func_name, qualifier)
+        policy["Statement"] = [s for s in policy["Statement"] if s.get("Resource") == resource_arn]
+        if not policy["Statement"]:
+            return error_response_json(
+                "ResourceNotFoundException",
+                "No policy is associated with the given resource.",
+                404,
+            )
     return json_response(
         {
-            "Policy": json.dumps(func["policy"]),
+            "Policy": json.dumps(policy),
             "RevisionId": func["config"]["RevisionId"],
         }
     )
@@ -4720,6 +4823,9 @@ def _get_provisioned_concurrency(func_name: str, qualifier: str):
             f"Function not found: {_func_arn(func_name)}",
             404,
         )
+    err = _validate_function_qualifier_exists(func_name, qualifier)
+    if err:
+        return err
     key = qualifier or "$LATEST"
     pc = _functions[func_name].get("provisioned_concurrency", {}).get(key)
     if not pc:
@@ -4738,6 +4844,9 @@ def _put_provisioned_concurrency(func_name: str, qualifier: str, data: dict):
             f"Function not found: {_func_arn(func_name)}",
             404,
         )
+    err = _validate_function_qualifier_exists(func_name, qualifier)
+    if err:
+        return err
     key = qualifier or "$LATEST"
     requested = data.get("ProvisionedConcurrentExecutions", 0)
     pc = {
@@ -4758,6 +4867,9 @@ def _delete_provisioned_concurrency(func_name: str, qualifier: str):
             f"Function not found: {_func_arn(func_name)}",
             404,
         )
+    err = _validate_function_qualifier_exists(func_name, qualifier)
+    if err:
+        return err
     key = qualifier or "$LATEST"
     _functions[func_name].get("provisioned_concurrency", {}).pop(key, None)
     return 204, {}, b""
@@ -4781,6 +4893,9 @@ def _resolve_existing_esm_function(function_ref: str):
             f"Function not found: {function_ref}",
             404,
         )
+    err = _validate_function_qualifier_exists(func_name, qualifier)
+    if err:
+        return None, None, err
     return func_name, qualifier, None
 
 
@@ -5308,12 +5423,28 @@ def _poll_dynamodb_streams():
 
 
 def _url_config_key(func_name: str, qualifier: str | None) -> str:
-    return f"{func_name}:{qualifier}" if qualifier else func_name
+    return f"{func_name}:{qualifier}" if qualifier and qualifier != "$LATEST" else func_name
+
+
+def _validate_function_url_qualifier(func_name: str, qualifier: str | None):
+    err = _validate_function_qualifier_exists(func_name, qualifier)
+    if err:
+        return err
+    if qualifier and qualifier != "$LATEST" and qualifier not in _functions[func_name].get("aliases", {}):
+        return error_response_json(
+            "InvalidParameterValueException",
+            "Function URLs can only be configured for an unqualified function or an alias.",
+            400,
+        )
+    return None
 
 
 def _create_function_url_config(func_name: str, data: dict, qualifier: str | None):
     if func_name not in _functions:
         return error_response_json("ResourceNotFoundException", f"Function not found: {_func_arn(func_name)}", 404)
+    err = _validate_function_url_qualifier(func_name, qualifier)
+    if err:
+        return err
     key = _url_config_key(func_name, qualifier)
     if key in _function_urls:
         return error_response_json(
@@ -5334,6 +5465,9 @@ def _create_function_url_config(func_name: str, data: dict, qualifier: str | Non
 
 
 def _get_function_url_config(func_name: str, qualifier: str | None):
+    err = _validate_function_url_qualifier(func_name, qualifier)
+    if err:
+        return err
     key = _url_config_key(func_name, qualifier)
     cfg = _function_urls.get(key)
     if not cfg:
@@ -5342,6 +5476,9 @@ def _get_function_url_config(func_name: str, qualifier: str | None):
 
 
 def _update_function_url_config(func_name: str, data: dict, qualifier: str | None):
+    err = _validate_function_url_qualifier(func_name, qualifier)
+    if err:
+        return err
     key = _url_config_key(func_name, qualifier)
     cfg = _function_urls.get(key)
     if not cfg:
@@ -5356,10 +5493,13 @@ def _update_function_url_config(func_name: str, data: dict, qualifier: str | Non
 
 def _delete_function_url_config(func_name: str, qualifier: str | None):
     key = _url_config_key(func_name, qualifier)
-    if key not in _function_urls:
-        return error_response_json("ResourceNotFoundException", f"Function URL config not found for {func_name}", 404)
-    del _function_urls[key]
-    return 204, {}, b""
+    if key in _function_urls:
+        del _function_urls[key]
+        return 204, {}, b""
+    err = _validate_function_url_qualifier(func_name, qualifier)
+    if err:
+        return err
+    return error_response_json("ResourceNotFoundException", f"Function URL config not found for {func_name}", 404)
 
 
 def _list_function_url_configs(func_name: str, query_params: dict):
