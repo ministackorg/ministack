@@ -25,6 +25,7 @@ import logging
 import os
 import time
 
+from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.responses import (
     AccountRegionScopedDict,
     AccountScopedDict,
@@ -1015,8 +1016,10 @@ def _make_delivery_arn(delivery_id):
 # not supply it; any value in the request is ignored. The field is
 # always server-computed so it stays stable across describe calls.
 def _derive_service_from_arn(arn):
-    parts = arn.split(":", 5)
-    return parts[2] if len(parts) >= 3 else ""
+    try:
+        return parse_arn(arn).service
+    except ArnParseError:
+        return ""
 
 
 # AWS derives deliveryDestinationType from the destination resource ARN
@@ -1025,10 +1028,10 @@ def _derive_destination_type_from_arn(arn):
     """Parse arn:aws:<svc>:region:acct:<resource>/... and map to the
     deliveryDestinationType label AWS returns. Returns None if the ARN
     doesn't match a supported target service."""
-    parts = arn.split(":", 5)
-    if len(parts) < 3:
+    try:
+        svc = parse_arn(arn).service
+    except ArnParseError:
         return None
-    svc = parts[2]
     if svc == "s3":
         return "S3"
     if svc == "logs":
@@ -1039,6 +1042,61 @@ def _derive_destination_type_from_arn(arn):
 
 
 _VALID_OUTPUT_FORMATS = {"json", "plain", "w3c", "raw", "parquet"}
+_DELIVERY_SOURCE_NON_SOURCES = {"firehose", "lambda", "logs", "s3", "sns", "sqs"}
+
+
+def _validation_error(message):
+    return error_response_json("ValidationException", message, 400)
+
+
+def _delivery_source_spec(resource_arn):
+    try:
+        spec = parse_arn(resource_arn)
+    except ArnParseError:
+        return None, _validation_error("Invalid ARN provided.")
+    if spec.region and spec.region != get_region():
+        return None, _validation_error("Cross-region Delivery Source is not supported. Please use a different region.")
+    if spec.account_id and spec.account_id != get_account_id():
+        return None, _validation_error("Account id from identity does not match the resourceArn.")
+    if spec.service in _DELIVERY_SOURCE_NON_SOURCES:
+        return None, error_response_json("ResourceNotFoundException", "Cannot access provided service.", 400)
+    return spec, None
+
+
+def _delivery_destination_resource_spec(destination_resource_arn):
+    try:
+        spec = parse_arn(destination_resource_arn)
+    except ArnParseError:
+        return None, _validation_error("Invalid ARN provided.")
+    if spec.service not in ("firehose", "logs", "s3"):
+        return None, _validation_error("Delivery Destination Resource ARN is of unsupported service.")
+    if spec.service == "s3":
+        if spec.region or spec.account_id:
+            return None, _validation_error("Invalid ARN provided.")
+        return spec, None
+    if spec.region != get_region():
+        return None, _validation_error("Region from identity does not match the Destination Resource ARN.")
+    if spec.account_id != get_account_id():
+        return None, _validation_error("Account id from identity does not match the Destination Resource ARN.")
+    return spec, None
+
+
+def _delivery_destination_spec(delivery_destination_arn):
+    try:
+        spec = parse_arn(delivery_destination_arn)
+    except ArnParseError:
+        return None, _validation_error("Invalid ARN provided.")
+    if spec.service != "logs" or not spec.resource.startswith("delivery-destination:"):
+        return None, _validation_error("Action logs:CreateDelivery should have a valid resource ARN to authorize against.")
+    if spec.region != get_region():
+        return None, _validation_error("Cross-region Delivery Destination is not supported. Please use a different region.")
+    if spec.account_id != get_account_id():
+        return None, error_response_json(
+            "AccessDeniedException",
+            f"User is not authorized to perform: logs:CreateDelivery on resource: {delivery_destination_arn}",
+            400,
+        )
+    return spec, None
 
 
 def _put_delivery_source(data):
@@ -1054,7 +1112,10 @@ def _put_delivery_source(data):
 
     # AWS derives the service label from the resource ARN; ignore any
     # caller-supplied value.
-    derived_service = _derive_service_from_arn(resource_arn)
+    resource_spec, err = _delivery_source_spec(resource_arn)
+    if err:
+        return err
+    derived_service = resource_spec.service
 
     existing = _delivery_sources.get(name)
     if existing:
@@ -1130,6 +1191,9 @@ def _put_delivery_destination(data):
     # AWS derives deliveryDestinationType from the destination resource
     # ARN (s3 -> S3, logs -> CWL, firehose -> FH); callers cannot
     # override it.
+    _dest_resource_spec, err = _delivery_destination_resource_spec(destination_resource_arn)
+    if err:
+        return err
     derived_type = _derive_destination_type_from_arn(destination_resource_arn)
     if derived_type is None:
         return error_response_json(
@@ -1216,11 +1280,10 @@ def _create_delivery(data):
         return error_response_json("ValidationException", "deliverySourceName is required.", 400)
     if not dest_arn:
         return error_response_json("ValidationException", "deliveryDestinationArn is required.", 400)
-    if source_name not in _delivery_sources:
-        return error_response_json(
-            "ResourceNotFoundException",
-            f"Delivery source does not exist: {source_name}", 400,
-        )
+
+    _dest_spec, err = _delivery_destination_spec(dest_arn)
+    if err:
+        return err
 
     # AWS rejects CreateDelivery unless the destination ARN resolves to a
     # destination we've previously recorded via PutDeliveryDestination —
@@ -1233,7 +1296,12 @@ def _create_delivery(data):
     if dest_type is None:
         return error_response_json(
             "ResourceNotFoundException",
-            f"Delivery destination does not exist: {dest_arn}", 400,
+            "Requested Delivery Destination does not exist in this account.", 400,
+        )
+    if source_name not in _delivery_sources:
+        return error_response_json(
+            "ResourceNotFoundException",
+            f"Delivery source does not exist: {source_name}", 400,
         )
 
     # AWS allows at most one Delivery per (deliverySourceName,
