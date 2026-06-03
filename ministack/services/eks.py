@@ -918,7 +918,9 @@ def _restart_k3s(cluster_name, oidc_args=None, idp_cfg_refs=None):
     if not client:
         return
 
-    cluster["status"] = "UPDATING"
+    # Real AWS keeps cluster status ACTIVE during IdP changes — the work is
+    # carried in the Update record, not on the cluster itself. Mutate cfg state
+    # only.
     oidc_args = oidc_args or []
     idp_cfg_refs = idp_cfg_refs or []
 
@@ -963,11 +965,9 @@ def _restart_k3s(cluster_name, oidc_args=None, idp_cfg_refs=None):
 
             cluster["endpoint"] = ep
             cluster["certificateAuthority"]["data"] = _extract_ca_cert(container)
-            cluster["status"] = "ACTIVE"
             _mark_idp_active()
         except Exception as e:
             logger.warning("EKS: failed to restart k3s for %s — falling back to mock: %s", cluster_name, e)
-            cluster["status"] = "ACTIVE"
             cluster["certificateAuthority"]["data"] = base64.b64encode(b"MOCK-CA-CERTIFICATE").decode()
             cluster["endpoint"] = f"https://localhost:{port}"
             _mark_idp_active()
@@ -994,17 +994,31 @@ def _associate_identity_provider_config(cluster_name, body):
     key = f"{cluster_name}\x00{idp_name}"
     if key in _idp_configs:
         return _error(409, "ResourceInUseException", f"OIDC provider configuration '{idp_name}' already exists on cluster '{cluster_name}'.")
+    # AWS allows only one OIDC IdP config per cluster regardless of name.
+    for existing_key in _idp_configs.keys():
+        if existing_key.startswith(f"{cluster_name}\x00"):
+            return _error(409, "ResourceInUseException", f"Cluster '{cluster_name}' already has an OIDC identity provider configuration.")
 
     arn = (
         f"arn:aws:eks:{get_region()}:{get_account_id()}"
         f":identityproviderconfig/{cluster_name}/oidc/{idp_name}/{new_uuid()}"
     )
+    tags = body.get("tags") or {}
     _idp_configs[key] = {
         "oidc": oidc,
         "status": "CREATING",
-        "tags": body.get("tags") or {},
+        "tags": tags,
         "arn": arn,
     }
+    if tags:
+        _tags[arn] = dict(tags)
+
+    logger.warning(
+        "EKS: AssociateIdentityProviderConfig on cluster %s triggers a k3s restart "
+        "which wipes in-cluster workloads (Pods/Deployments/Services). "
+        "Local-emulator limitation — real AWS rolls config without affecting the data plane.",
+        cluster_name,
+    )
 
     oidc_args, idp_cfg_refs = _collect_oidc_state(cluster_name)
     _restart_k3s(cluster_name, oidc_args=oidc_args, idp_cfg_refs=idp_cfg_refs)
@@ -1067,7 +1081,17 @@ def _disassociate_identity_provider_config(cluster_name, body):
     if key not in _idp_configs:
         return _error(404, "ResourceNotFoundException", f"OIDC provider configuration '{name}' not found on cluster '{cluster_name}'.")
 
-    _idp_configs.pop(key, None)
+    removed = _idp_configs.pop(key, None)
+    if removed and removed.get("arn"):
+        _tags.pop(removed["arn"], None)
+
+    logger.warning(
+        "EKS: DisassociateIdentityProviderConfig on cluster %s triggers a k3s restart "
+        "which wipes in-cluster workloads (Pods/Deployments/Services). "
+        "Local-emulator limitation — real AWS rolls config without affecting the data plane.",
+        cluster_name,
+    )
+
     oidc_args, idp_cfg_refs = _collect_oidc_state(cluster_name)
     _restart_k3s(cluster_name, oidc_args=oidc_args, idp_cfg_refs=idp_cfg_refs)
 

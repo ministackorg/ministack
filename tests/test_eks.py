@@ -345,8 +345,10 @@ def test_eks_addon_lifecycle(eks):
             eks.describe_addon(clusterName=cn, addonName="vpc-cni")
         assert e.value.response["Error"]["Code"] == "ResourceNotFoundException"
     finally:
-        try: eks.delete_cluster(name=cn)
-        except Exception: pass
+        try:
+            eks.delete_cluster(name=cn)
+        except Exception:
+            pass
 
 
 def test_eks_addon_create_on_missing_cluster_404(eks):
@@ -370,8 +372,10 @@ def test_eks_addon_create_duplicate_returns_resource_in_use(eks):
             eks.create_addon(clusterName=cn, addonName="vpc-cni")
         assert e.value.response["Error"]["Code"] == "ResourceInUseException"
     finally:
-        try: eks.delete_cluster(name=cn)
-        except Exception: pass
+        try:
+            eks.delete_cluster(name=cn)
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -397,8 +401,10 @@ def test_eks_associate_encryption_config(eks):
         desc = eks.describe_cluster(name=cn)["cluster"]
         assert desc["encryptionConfig"][0]["provider"]["keyArn"] == key_arn
     finally:
-        try: eks.delete_cluster(name=cn)
-        except Exception: pass
+        try:
+            eks.delete_cluster(name=cn)
+        except Exception:
+            pass
 
 
 def test_eks_associate_encryption_config_missing_cluster(eks):
@@ -425,8 +431,10 @@ def test_eks_associate_encryption_config_already_set(eks):
             eks.associate_encryption_config(clusterName=cn, encryptionConfig=cfg)
         assert e.value.response["Error"]["Code"] == "InvalidRequestException"
     finally:
-        try: eks.delete_cluster(name=cn)
-        except Exception: pass
+        try:
+            eks.delete_cluster(name=cn)
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -446,8 +454,10 @@ def test_eks_oidc_issuer_is_ministack_hosted(eks):
         assert "/oidc/id/" in issuer, issuer
         assert "amazonaws.com" not in issuer, issuer
     finally:
-        try: eks.delete_cluster(name=cn)
-        except Exception: pass
+        try:
+            eks.delete_cluster(name=cn)
+        except Exception:
+            pass
 
 
 def test_eks_oidc_discovery_document(eks):
@@ -471,8 +481,10 @@ def test_eks_oidc_discovery_document(eks):
         assert jwks["keys"][0]["kty"] == "RSA"
         assert jwks["keys"][0]["use"] == "sig"
     finally:
-        try: eks.delete_cluster(name=cn)
-        except Exception: pass
+        try:
+            eks.delete_cluster(name=cn)
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -520,8 +532,10 @@ def test_eks_access_entry_create_describe_delete(eks):
                 clusterName=cn, principalArn=principal)
         assert e.value.response["Error"]["Code"] == "ResourceNotFoundException"
     finally:
-        try: eks.delete_cluster(name=cn)
-        except Exception: pass
+        try:
+            eks.delete_cluster(name=cn)
+        except Exception:
+            pass
 
 
 def test_eks_access_entry_create_duplicate_rejected(eks):
@@ -533,8 +547,10 @@ def test_eks_access_entry_create_duplicate_rejected(eks):
             eks.create_access_entry(clusterName=cn, principalArn=principal)
         assert e.value.response["Error"]["Code"] == "ResourceInUseException"
     finally:
-        try: eks.delete_cluster(name=cn)
-        except Exception: pass
+        try:
+            eks.delete_cluster(name=cn)
+        except Exception:
+            pass
 
 
 def test_eks_access_entry_create_missing_cluster(eks):
@@ -556,8 +572,10 @@ def test_eks_access_entry_list_returns_principal_arns(eks):
         listed = eks.list_access_entries(clusterName=cn)["accessEntries"]
         assert set(listed) == {p1, p2}
     finally:
-        try: eks.delete_cluster(name=cn)
-        except Exception: pass
+        try:
+            eks.delete_cluster(name=cn)
+        except Exception:
+            pass
 
 
 def test_eks_access_entry_update_patches_allowed_fields(eks):
@@ -575,8 +593,10 @@ def test_eks_access_entry_update_patches_allowed_fields(eks):
         assert updated["kubernetesGroups"] == ["after"]
         assert updated["username"] == "new"
     finally:
-        try: eks.delete_cluster(name=cn)
-        except Exception: pass
+        try:
+            eks.delete_cluster(name=cn)
+        except Exception:
+            pass
 
 
 def test_eks_associate_access_policy_full_cycle(eks):
@@ -609,8 +629,10 @@ def test_eks_associate_access_policy_full_cycle(eks):
         )["associatedAccessPolicies"]
         assert listed_after == []
     finally:
-        try: eks.delete_cluster(name=cn)
-        except Exception: pass
+        try:
+            eks.delete_cluster(name=cn)
+        except Exception:
+            pass
 
 
 def test_eks_associate_access_policy_namespace_scope_requires_namespaces(eks):
@@ -628,8 +650,10 @@ def test_eks_associate_access_policy_namespace_scope_requires_namespaces(eks):
             )
         assert e.value.response["Error"]["Code"] == "InvalidParameterException"
     finally:
-        try: eks.delete_cluster(name=cn)
-        except Exception: pass
+        try:
+            eks.delete_cluster(name=cn)
+        except Exception:
+            pass
 
 
 def test_eks_delete_access_entry_cascades_associated_policies(eks):
@@ -652,8 +676,10 @@ def test_eks_delete_access_entry_cascades_associated_policies(eks):
         )["associatedAccessPolicies"]
         assert listed == []
     finally:
-        try: eks.delete_cluster(name=cn)
-        except Exception: pass
+        try:
+            eks.delete_cluster(name=cn)
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -708,3 +734,108 @@ def test_eks_identity_provider_config(eks):
         except Exception:
             pass
 
+
+# ---------------------------------------------------------------------------
+# IdP parity: cluster status, one-per-cluster, tag wiring
+# ---------------------------------------------------------------------------
+
+def _create_cluster_for_idp(eks, name):
+    eks.create_cluster(
+        name=name,
+        roleArn="arn:aws:iam::000000000000:role/eks",
+        resourcesVpcConfig={"subnetIds": ["subnet-1"]},
+    )
+
+
+def test_associate_idp_keeps_cluster_active(eks):
+    """AssociateIdentityProviderConfigResponse is {update, tags} — cluster
+    status must stay ACTIVE; UPDATING is never observable on the cluster."""
+    cn = f"idp-status-{_uid()}"
+    _create_cluster_for_idp(eks, cn)
+    try:
+        eks.associate_identity_provider_config(
+            clusterName=cn,
+            oidc={
+                "identityProviderConfigName": "idp-1",
+                "issuerUrl": "https://example/issuer",
+                "clientId": "client-1",
+            },
+        )
+        observed = set()
+        for _ in range(5):
+            observed.add(eks.describe_cluster(name=cn)["cluster"]["status"])
+        assert "UPDATING" not in observed
+        assert observed.issubset({"CREATING", "ACTIVE"})
+    finally:
+        try:
+            eks.delete_cluster(name=cn)
+        except Exception:
+            pass
+
+
+def test_only_one_oidc_idp_per_cluster(eks):
+    """Real AWS rejects a second OIDC IdP regardless of the new name."""
+    cn = f"idp-unique-{_uid()}"
+    _create_cluster_for_idp(eks, cn)
+    try:
+        eks.associate_identity_provider_config(
+            clusterName=cn,
+            oidc={
+                "identityProviderConfigName": "primary",
+                "issuerUrl": "https://example/issuer",
+                "clientId": "client-1",
+            },
+        )
+        with pytest.raises(ClientError) as exc:
+            eks.associate_identity_provider_config(
+                clusterName=cn,
+                oidc={
+                    "identityProviderConfigName": "secondary",
+                    "issuerUrl": "https://example/issuer2",
+                    "clientId": "client-2",
+                },
+            )
+        assert exc.value.response["Error"]["Code"] == "ResourceInUseException"
+    finally:
+        try:
+            eks.delete_cluster(name=cn)
+        except Exception:
+            pass
+
+
+def test_idp_tags_returned_by_list_tags_for_resource(eks):
+    """Tags set at associate time must be reachable via list_tags_for_resource
+    on the identityProviderConfigArn, and must clear after disassociate."""
+    cn = f"idp-tags-{_uid()}"
+    _create_cluster_for_idp(eks, cn)
+    try:
+        eks.associate_identity_provider_config(
+            clusterName=cn,
+            oidc={
+                "identityProviderConfigName": "tag-idp",
+                "issuerUrl": "https://example/issuer",
+                "clientId": "client-1",
+            },
+            tags={"env": "test", "owner": "platform"},
+        )
+        desc = eks.describe_identity_provider_config(
+            clusterName=cn,
+            identityProviderConfig={"type": "oidc", "name": "tag-idp"},
+        )
+        arn = desc["identityProviderConfig"]["oidc"]["identityProviderConfigArn"]
+        assert arn
+
+        tags = eks.list_tags_for_resource(resourceArn=arn)["tags"]
+        assert tags == {"env": "test", "owner": "platform"}
+
+        eks.disassociate_identity_provider_config(
+            clusterName=cn,
+            identityProviderConfig={"type": "oidc", "name": "tag-idp"},
+        )
+        tags_after = eks.list_tags_for_resource(resourceArn=arn)["tags"]
+        assert tags_after == {}
+    finally:
+        try:
+            eks.delete_cluster(name=cn)
+        except Exception:
+            pass

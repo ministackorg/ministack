@@ -4683,18 +4683,15 @@ def _delete_launch_template(p):
     </launchTemplate>""")
 
 
-def _fleet_instances_xml(instances_list, configs):
+def _fleet_instances_xml(instances_list):
     instances_xml = []
     for item in instances_list:
         inst_ids_xml = "".join(f"<item>{_esc(iid)}</item>" for iid in item["InstanceIds"])
-        lt_and_overrides_xml = ""
-        if configs:
-            cfg = configs[0]
-            spec = cfg.get("LaunchTemplateSpecification", {})
-            lt_id_val = spec.get("LaunchTemplateId") or ""
-            lt_name_val = spec.get("LaunchTemplateName") or ""
-            version_val = spec.get("Version") or "$Default"
-            lt_and_overrides_xml = f"""
+        spec = item.get("LaunchTemplateSpec") or {}
+        lt_id_val = spec.get("LaunchTemplateId") or ""
+        lt_name_val = spec.get("LaunchTemplateName") or ""
+        version_val = spec.get("Version") or "$Default"
+        lt_and_overrides_xml = f"""
             <launchTemplateAndOverrides>
                 <launchTemplateSpecification>
                     <launchTemplateId>{_esc(lt_id_val)}</launchTemplateId>
@@ -4702,7 +4699,7 @@ def _fleet_instances_xml(instances_list, configs):
                     <version>{_esc(version_val)}</version>
                 </launchTemplateSpecification>
             </launchTemplateAndOverrides>
-            """
+            """ if (lt_id_val or lt_name_val) else ""
         instances_xml.append(f"""<item>
             {lt_and_overrides_xml}
             <lifecycle>{_esc(item["Lifecycle"])}</lifecycle>
@@ -4710,6 +4707,54 @@ def _fleet_instances_xml(instances_list, configs):
             <instanceType>{_esc(item["InstanceType"])}</instanceType>
         </item>""")
     return "".join(instances_xml)
+
+
+def _resolve_launch_template_data(spec):
+    """Resolve a LaunchTemplateSpecification dict to (lt_data, lt_record, error)."""
+    lt_id = spec.get("LaunchTemplateId")
+    lt_name = spec.get("LaunchTemplateName")
+    version_str = spec.get("Version") or "$Default"
+
+    lt = None
+    if lt_id:
+        lt = _launch_templates.get(lt_id)
+    elif lt_name:
+        for t in _launch_templates.values():
+            if t["LaunchTemplateName"] == lt_name:
+                lt = t
+                break
+
+    if (lt_id or lt_name) and not lt:
+        return None, None, _error(
+            "InvalidLaunchTemplateId.NotFoundException",
+            f"The launch template '{lt_id or lt_name}' does not exist",
+            400,
+        )
+
+    if not lt:
+        return {}, None, None
+
+    versions = lt.get("Versions", [])
+    target_ver = 1
+    if version_str == "$Default":
+        target_ver = lt.get("DefaultVersionNumber", 1)
+    elif version_str == "$Latest":
+        target_ver = lt.get("LatestVersionNumber", 1)
+    else:
+        try:
+            target_ver = int(version_str)
+        except ValueError:
+            target_ver = 1
+
+    version = None
+    for v in versions:
+        if v["VersionNumber"] == target_ver:
+            version = v
+            break
+    if not version and versions:
+        version = versions[0]
+
+    return (version or {}).get("LaunchTemplateData", {}) or {}, lt, None
 
 
 def _create_fleet(p):
@@ -4720,6 +4765,13 @@ def _create_fleet(p):
         or _p(p, "TargetCapacitySpecification.SpotTargetCapacity")
         or "1"
     )
+    # AWS derives Spot vs On-Demand from DefaultTargetCapacityType, not from
+    # FleetType (which is {request, maintain, instant}).
+    default_capacity_type = (
+        _p(p, "TargetCapacitySpecification.DefaultTargetCapacityType") or "on-demand"
+    ).lower()
+    is_spot = default_capacity_type == "spot"
+    lifecycle = "spot" if is_spot else "on-demand"
 
     # Parse LaunchTemplateConfigs
     configs = []
@@ -4756,171 +4808,163 @@ def _create_fleet(p):
         })
         i += 1
 
-    # Resolve settings from the first launch template configuration
-    image_id = "ami-00000000"
-    instance_type = "t2.micro"
-    subnet_id = _DEFAULT_SUBNET_ID
-    key_name = ""
-    user_data = ""
-    sg_ids = None
-    iam_profile = None
-
-    if configs:
-        cfg = configs[0]
+    # Resolve LT data per config (so multi-config fleets work).
+    resolved_configs = []  # list of (spec, lt_data) per config
+    for cfg in configs:
         spec = cfg["LaunchTemplateSpecification"]
-        lt_id = spec.get("LaunchTemplateId")
-        lt_name = spec.get("LaunchTemplateName")
-        version_str = spec.get("Version") or "$Default"
+        lt_data, _lt, err = _resolve_launch_template_data(spec)
+        if err:
+            return err
+        resolved_configs.append((spec, lt_data, cfg.get("Overrides") or []))
 
-        lt = None
-        if lt_id:
-            lt = _launch_templates.get(lt_id)
-        elif lt_name:
-            for t in _launch_templates.values():
-                if t["LaunchTemplateName"] == lt_name:
-                    lt = t
-                    lt_id = lt["LaunchTemplateId"]
-                    break
+    # Build the (config, override) slot list — one slot per override per config,
+    # or a single slot per config when no overrides were specified.
+    slots = []  # list of dicts: {spec, image_id, instance_type, subnet_id, key_name, user_data, sg_ids, iam_profile}
+    for spec, lt_data, overrides in resolved_configs:
+        base = _slot_from_lt_data(spec, lt_data)
+        if overrides:
+            for ov in overrides:
+                slot = dict(base)
+                if ov.get("InstanceType"):
+                    slot["instance_type"] = ov["InstanceType"]
+                if ov.get("SubnetId"):
+                    slot["subnet_id"] = ov["SubnetId"]
+                slots.append(slot)
+        else:
+            slots.append(base)
 
-        if (lt_id or lt_name) and not lt:
-            return _error(
-                "InvalidLaunchTemplateId.NotFoundException",
-                f"The launch template '{lt_id or lt_name}' does not exist",
-                400
-            )
+    if not slots:
+        slots.append(_slot_from_lt_data({}, {}))
 
-        if lt:
-            versions = lt.get("Versions", [])
-            target_ver = 1
-            if version_str == "$Default":
-                target_ver = lt.get("DefaultVersionNumber", 1)
-            elif version_str == "$Latest":
-                target_ver = lt.get("LatestVersionNumber", 1)
-            else:
-                try:
-                    target_ver = int(version_str)
-                except ValueError:
-                    target_ver = 1
-
-            version = None
-            for v in versions:
-                if v["VersionNumber"] == target_ver:
-                    version = v
-                    break
-            if not version and versions:
-                version = versions[0]
-
-            if version:
-                lt_data = version.get("LaunchTemplateData", {})
-                image_id = lt_data.get("ImageId") or image_id
-                instance_type = lt_data.get("InstanceType") or instance_type
-                subnet_id = lt_data.get("SubnetId") or subnet_id
-                key_name = lt_data.get("KeyName") or key_name
-                user_data = lt_data.get("UserData") or user_data
-                sg_ids = lt_data.get("SecurityGroupIds") or sg_ids
-
-                lt_iam = lt_data.get("IamInstanceProfile", {})
-                iam_arn = lt_iam.get("Arn")
-                iam_name = lt_iam.get("Name")
-                if iam_arn or iam_name:
-                    if not iam_arn and iam_name:
-                        iam_arn = f"arn:aws:iam::{get_account_id()}:instance-profile/{iam_name}"
-                    iam_id = "AIPA" + new_uuid().replace("-", "").upper()[:17]
-                    iam_profile = {"Arn": iam_arn, "Id": iam_id}
-
-        # Apply overrides
-        if cfg.get("Overrides"):
-            override = cfg["Overrides"][0]
-            if override.get("InstanceType"):
-                instance_type = override["InstanceType"]
-            if override.get("SubnetId"):
-                subnet_id = override["SubnetId"]
-
-    # Launch instances
-    launched = _launch_instances_internal(
-        image_id=image_id,
-        instance_type=instance_type,
-        subnet_id=subnet_id,
-        count=total_capacity,
-        key_name=key_name,
-        user_data=user_data,
-        sg_ids=sg_ids,
-        iam_profile=iam_profile,
-    )
-
-    # Process tag specifications
+    # Process tag specifications (AWS uses TagSpecifications, not TagSpecification)
     fleet_tags = []
     instance_tags = []
-    i = 1
-    while _p(p, f"TagSpecification.{i}.ResourceType"):
-        rtype = _p(p, f"TagSpecification.{i}.ResourceType")
-        spec_tags = []
-        j = 1
-        while _p(p, f"TagSpecification.{i}.Tag.{j}.Key"):
-            spec_tags.append({
-                "Key": _p(p, f"TagSpecification.{i}.Tag.{j}.Key"),
-                "Value": _p(p, f"TagSpecification.{i}.Tag.{j}.Value", ""),
-            })
-            j += 1
-        if rtype == "fleet":
-            fleet_tags.extend(spec_tags)
-        elif rtype == "instance":
-            instance_tags.extend(spec_tags)
-        i += 1
-
-    if instance_tags:
-        for inst in launched:
-            _tags[inst["InstanceId"]] = instance_tags[:]
+    for tag_prefix in ("TagSpecification", "TagSpecifications"):
+        i = 1
+        while _p(p, f"{tag_prefix}.{i}.ResourceType"):
+            rtype = _p(p, f"{tag_prefix}.{i}.ResourceType")
+            spec_tags = []
+            for tag_key in ("Tag", "Tags"):
+                j = 1
+                while _p(p, f"{tag_prefix}.{i}.{tag_key}.{j}.Key"):
+                    spec_tags.append({
+                        "Key": _p(p, f"{tag_prefix}.{i}.{tag_key}.{j}.Key"),
+                        "Value": _p(p, f"{tag_prefix}.{i}.{tag_key}.{j}.Value", ""),
+                    })
+                    j += 1
+            if rtype == "fleet":
+                fleet_tags.extend(spec_tags)
+            elif rtype == "instance":
+                instance_tags.extend(spec_tags)
+            i += 1
 
     fleet_id = "fleet-" + new_uuid()
+
+    # AWS launches synchronously and returns Instances only when Type=instant.
+    # For maintain/request, fleets fulfil asynchronously — return FleetId alone.
+    instance_items = []
+    if fleet_type == "instant":
+        # Round-robin distribute total_capacity across slots.
+        slot_buckets = [[] for _ in slots]
+        for k in range(total_capacity):
+            slot_idx = k % len(slots)
+            slot = slots[slot_idx]
+            launched = _launch_instances_internal(
+                image_id=slot["image_id"],
+                instance_type=slot["instance_type"],
+                subnet_id=slot["subnet_id"],
+                count=1,
+                key_name=slot["key_name"],
+                user_data=slot["user_data"],
+                sg_ids=slot["sg_ids"],
+                iam_profile=slot["iam_profile"],
+            )
+            slot_buckets[slot_idx].extend(launched)
+        for slot, launched in zip(slots, slot_buckets):
+            if not launched:
+                continue
+            if instance_tags:
+                for inst in launched:
+                    _tags[inst["InstanceId"]] = instance_tags[:]
+            instance_items.append({
+                "InstanceIds": [inst["InstanceId"] for inst in launched],
+                "InstanceType": slot["instance_type"],
+                "Lifecycle": lifecycle,
+                "LaunchTemplateSpec": slot["spec"],
+            })
+
     if fleet_tags:
         _tags[fleet_id] = fleet_tags
 
     now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    fulfilled_total = float(total_capacity) if fleet_type == "instant" else 0.0
     fleet_record = {
         "FleetId": fleet_id,
         "FleetState": "active",
-        "ActivityStatus": "fulfilled",
+        "ActivityStatus": "fulfilled" if fleet_type == "instant" else "pending_fulfillment",
         "CreateTime": now_iso,
         "Type": fleet_type,
-        "FulfilledCapacity": float(total_capacity),
-        "FulfilledOnDemandCapacity": float(total_capacity) if fleet_type != "spot" else 0.0,
+        "FulfilledCapacity": fulfilled_total,
+        "FulfilledOnDemandCapacity": fulfilled_total if not is_spot else 0.0,
         "TargetCapacitySpecification": {
             "TotalTargetCapacity": total_capacity,
-            "OnDemandTargetCapacity": total_capacity if fleet_type != "spot" else 0,
-            "SpotTargetCapacity": total_capacity if fleet_type == "spot" else 0,
-            "DefaultTargetCapacityType": "on-demand" if fleet_type != "spot" else "spot",
+            "OnDemandTargetCapacity": total_capacity if not is_spot else 0,
+            "SpotTargetCapacity": total_capacity if is_spot else 0,
+            "DefaultTargetCapacityType": default_capacity_type,
         },
         "LaunchTemplateConfigs": configs,
-        "Instances": [
-            {
-                "InstanceIds": [inst["InstanceId"] for inst in launched],
-                "InstanceType": instance_type,
-                "Lifecycle": "on-demand" if fleet_type != "spot" else "spot",
-            }
-        ],
+        "Instances": instance_items,
         "Tags": fleet_tags,
     }
     _fleets[fleet_id] = fleet_record
 
-    instances_xml_str = _fleet_instances_xml(fleet_record["Instances"], configs)
-    inner = f"""<fleetId>{_esc(fleet_id)}</fleetId>
-    <fleetInstanceSet>{instances_xml_str}</fleetInstanceSet>
-    <errorSet/>"""
-    return _xml(200, "CreateFleetResponse", inner)
+    inner_parts = [f"<fleetId>{_esc(fleet_id)}</fleetId>"]
+    if fleet_type == "instant":
+        inner_parts.append(f"<fleetInstanceSet>{_fleet_instances_xml(instance_items)}</fleetInstanceSet>")
+        inner_parts.append("<errorSet/>")
+    return _xml(200, "CreateFleetResponse", "\n    ".join(inner_parts))
+
+
+def _slot_from_lt_data(spec, lt_data):
+    """Build a launch slot from a resolved LaunchTemplateData dict + spec."""
+    iam_profile = None
+    lt_iam = (lt_data or {}).get("IamInstanceProfile", {}) or {}
+    iam_arn = lt_iam.get("Arn")
+    iam_name = lt_iam.get("Name")
+    if iam_arn or iam_name:
+        if not iam_arn and iam_name:
+            iam_arn = f"arn:aws:iam::{get_account_id()}:instance-profile/{iam_name}"
+        iam_id = "AIPA" + new_uuid().replace("-", "").upper()[:17]
+        iam_profile = {"Arn": iam_arn, "Id": iam_id}
+    return {
+        "spec": spec or {},
+        "image_id": (lt_data or {}).get("ImageId") or "ami-00000000",
+        "instance_type": (lt_data or {}).get("InstanceType") or "t2.micro",
+        "subnet_id": (lt_data or {}).get("SubnetId") or _DEFAULT_SUBNET_ID,
+        "key_name": (lt_data or {}).get("KeyName") or "",
+        "user_data": (lt_data or {}).get("UserData") or "",
+        "sg_ids": (lt_data or {}).get("SecurityGroupIds") or None,
+        "iam_profile": iam_profile,
+    }
 
 
 def _describe_fleets(p):
     fleet_ids = _parse_member_list(p, "FleetId")
-    results = []
-    for f in _fleets.values():
-        if fleet_ids and f["FleetId"] not in fleet_ids:
-            continue
-        results.append(f)
+    if fleet_ids:
+        missing = [fid for fid in fleet_ids if fid not in _fleets]
+        if missing:
+            return _error(
+                "InvalidFleetId.NotFound",
+                f"The fleet ID '{missing[0]}' does not exist",
+                400,
+            )
+        results = [_fleets[fid] for fid in fleet_ids]
+    else:
+        results = list(_fleets.values())
 
     items = []
     for f in results:
-        instances_xml_str = _fleet_instances_xml(f["Instances"], f["LaunchTemplateConfigs"])
+        instances_xml_str = _fleet_instances_xml(f["Instances"])
         tag_set_xml = _tag_set_xml(f["FleetId"])
         tcs = f["TargetCapacitySpecification"]
         items.append(f"""<item>

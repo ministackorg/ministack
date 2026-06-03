@@ -2184,3 +2184,98 @@ def test_ec2_create_describe_fleet(ec2):
     assert f["TargetCapacitySpecification"]["TotalTargetCapacity"] == 2
     assert any(t["Key"] == "Environment" and t["Value"] == "Production" for t in f.get("Tags", []))
 
+
+def test_create_fleet_default_capacity_type_spot(ec2):
+    """DefaultTargetCapacityType=spot drives lifecycle + capacity-slot accounting,
+    not the top-level Type (which is {request, maintain, instant})."""
+    lt = ec2.create_launch_template(
+        LaunchTemplateName=f"spot-lt-{_uuid_mod.uuid4().hex[:8]}",
+        LaunchTemplateData={"ImageId": "ami-deadbeef", "InstanceType": "t3.small"},
+    )
+    lt_id = lt["LaunchTemplate"]["LaunchTemplateId"]
+    resp = ec2.create_fleet(
+        LaunchTemplateConfigs=[{
+            "LaunchTemplateSpecification": {"LaunchTemplateId": lt_id, "Version": "1"},
+        }],
+        TargetCapacitySpecification={
+            "TotalTargetCapacity": 2,
+            "SpotTargetCapacity": 2,
+            "DefaultTargetCapacityType": "spot",
+        },
+        Type="instant",
+    )
+    desc = ec2.describe_fleets(FleetIds=[resp["FleetId"]])["Fleets"][0]
+    tcs = desc["TargetCapacitySpecification"]
+    assert tcs["DefaultTargetCapacityType"] == "spot"
+    assert tcs["SpotTargetCapacity"] == 2
+    assert tcs["OnDemandTargetCapacity"] == 0
+    assert desc["Instances"][0]["Lifecycle"] == "spot"
+
+
+def test_create_fleet_distributes_across_configs_and_overrides(ec2):
+    """Multi-config × multi-override should produce one Instances[*] item
+    per (config, override) bucket, with capacity round-robin'd across them."""
+    lt1 = ec2.create_launch_template(
+        LaunchTemplateName=f"multi-lt1-{_uuid_mod.uuid4().hex[:8]}",
+        LaunchTemplateData={"ImageId": "ami-aaaaaaaa", "InstanceType": "t3.micro"},
+    )["LaunchTemplate"]["LaunchTemplateId"]
+    lt2 = ec2.create_launch_template(
+        LaunchTemplateName=f"multi-lt2-{_uuid_mod.uuid4().hex[:8]}",
+        LaunchTemplateData={"ImageId": "ami-bbbbbbbb", "InstanceType": "t3.micro"},
+    )["LaunchTemplate"]["LaunchTemplateId"]
+    resp = ec2.create_fleet(
+        LaunchTemplateConfigs=[
+            {
+                "LaunchTemplateSpecification": {"LaunchTemplateId": lt1, "Version": "1"},
+                "Overrides": [
+                    {"InstanceType": "t3.small"},
+                    {"InstanceType": "t3.medium"},
+                ],
+            },
+            {
+                "LaunchTemplateSpecification": {"LaunchTemplateId": lt2, "Version": "1"},
+                "Overrides": [
+                    {"InstanceType": "t3.large"},
+                    {"InstanceType": "t3.xlarge"},
+                ],
+            },
+        ],
+        TargetCapacitySpecification={"TotalTargetCapacity": 4, "OnDemandTargetCapacity": 4},
+        Type="instant",
+    )
+    instance_types = sorted(i["InstanceType"] for i in resp["Instances"])
+    assert instance_types == ["t3.large", "t3.medium", "t3.small", "t3.xlarge"]
+    total_ids = [iid for item in resp["Instances"] for iid in item["InstanceIds"]]
+    assert len(total_ids) == 4
+
+
+def test_create_fleet_maintain_returns_fleetid_only(ec2):
+    """For Type=maintain (and request), AWS does not launch synchronously —
+    response carries FleetId only; no Instances / no Errors."""
+    lt = ec2.create_launch_template(
+        LaunchTemplateName=f"maintain-lt-{_uuid_mod.uuid4().hex[:8]}",
+        LaunchTemplateData={"ImageId": "ami-11111111", "InstanceType": "t2.micro"},
+    )["LaunchTemplate"]["LaunchTemplateId"]
+    resp = ec2.create_fleet(
+        LaunchTemplateConfigs=[{
+            "LaunchTemplateSpecification": {"LaunchTemplateId": lt, "Version": "1"},
+        }],
+        TargetCapacitySpecification={"TotalTargetCapacity": 3, "OnDemandTargetCapacity": 3},
+        Type="maintain",
+    )
+    assert resp["FleetId"].startswith("fleet-")
+    assert not resp.get("Instances")
+    assert not resp.get("Errors")
+    desc = ec2.describe_fleets(FleetIds=[resp["FleetId"]])["Fleets"][0]
+    assert desc["Type"] == "maintain"
+    assert desc["FulfilledCapacity"] == 0.0
+    assert desc["ActivityStatus"] == "pending_fulfillment"
+    assert desc.get("Instances", []) == []
+
+
+def test_describe_fleets_unknown_id_returns_invalid_fleet_id(ec2):
+    bogus = f"fleet-{_uuid_mod.uuid4().hex}"
+    with pytest.raises(ClientError) as exc:
+        ec2.describe_fleets(FleetIds=[bogus])
+    assert exc.value.response["Error"]["Code"] == "InvalidFleetId.NotFound"
+
