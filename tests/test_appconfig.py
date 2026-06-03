@@ -528,6 +528,48 @@ def test_appconfig_data_plane_e2e(appconfig_client, appconfigdata_client):
     assert latest2["NextPollConfigurationToken"]
 
 
+def test_appconfig_data_plane_e2e_with_names(appconfig_client, appconfigdata_client):
+    app = appconfig_client.create_application(Name="data-plane-app-by-name")
+    env = appconfig_client.create_environment(ApplicationId=app["Id"], Name="live")
+    profile = appconfig_client.create_configuration_profile(
+        ApplicationId=app["Id"], Name="data-profile", LocationUri="hosted",
+    )
+    config_content = json.dumps({"feature_x": True, "max_retries": 3}).encode("utf-8")
+    appconfig_client.create_hosted_configuration_version(
+        ApplicationId=app["Id"],
+        ConfigurationProfileId=profile["Id"],
+        Content=config_content,
+        ContentType="application/json",
+    )
+    strategy = appconfig_client.create_deployment_strategy(
+        Name="e2e-strategy-by-name",
+        DeploymentDurationInMinutes=0,
+        GrowthFactor=100.0,
+        ReplicateTo="NONE",
+    )
+    appconfig_client.start_deployment(
+        ApplicationId=app["Id"],
+        EnvironmentId=env["Id"],
+        DeploymentStrategyId=strategy["Id"],
+        ConfigurationProfileId=profile["Id"],
+        ConfigurationVersion="1",
+    )
+
+    session = appconfigdata_client.start_configuration_session(
+        ApplicationIdentifier=app["Name"],
+        EnvironmentIdentifier=env["Name"],
+        ConfigurationProfileIdentifier=profile["Name"],
+    )
+    token = session["InitialConfigurationToken"]
+    assert token
+
+    latest = appconfigdata_client.get_latest_configuration(ConfigurationToken=token)
+    body = latest["Configuration"].read()
+    assert json.loads(body) == {"feature_x": True, "max_retries": 3}
+    assert latest["ContentType"] == "application/json"
+    assert latest["NextPollConfigurationToken"]
+
+
 # ---------------------------------------------------------------------------
 # Error cases
 # ---------------------------------------------------------------------------
@@ -570,3 +612,47 @@ def test_appconfig_get_nonexistent_deployment(appconfig_client):
             ApplicationId=app["Id"], EnvironmentId=env["Id"], DeploymentNumber=999,
         )
     assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
+def test_appconfig_start_configuration_session_rejects_missing_application(appconfigdata_client):
+    with pytest.raises(ClientError) as exc:
+        appconfigdata_client.start_configuration_session(
+            ApplicationIdentifier="missing-app",
+            EnvironmentIdentifier="live",
+            ConfigurationProfileIdentifier="data-profile",
+        )
+
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 404
+
+
+def test_appconfig_start_configuration_session_rejects_missing_environment(appconfig_client, appconfigdata_client):
+    app = appconfig_client.create_application(Name="session-env-app")
+
+    with pytest.raises(ClientError) as exc:
+        appconfigdata_client.start_configuration_session(
+            ApplicationIdentifier=app["Name"],
+            EnvironmentIdentifier="missing-env",
+            ConfigurationProfileIdentifier="data-profile",
+        )
+
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 404
+
+
+def test_appconfig_start_configuration_session_rejects_missing_configuration_profile(
+        appconfig_client,
+        appconfigdata_client,
+):
+    app = appconfig_client.create_application(Name="session-profile-app")
+    env = appconfig_client.create_environment(ApplicationId=app["Id"], Name="live")
+
+    with pytest.raises(ClientError) as exc:
+        appconfigdata_client.start_configuration_session(
+            ApplicationIdentifier=app["Name"],
+            EnvironmentIdentifier=env["Name"],
+            ConfigurationProfileIdentifier="missing-profile",
+        )
+
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 404

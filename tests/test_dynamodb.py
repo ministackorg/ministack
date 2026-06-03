@@ -2919,6 +2919,10 @@ def test_dynamodb_export_table_to_point_in_time(ddb):
         assert desc["ExportStatus"] == "IN_PROGRESS"
         export_arn = desc["ExportArn"]
 
+        # Export flips to COMPLETED only after the IN_PROGRESS grace window
+        # (MINISTACK_DDB_EXPORT_COMPLETE_AFTER_SEC, default 1s) — matches real
+        # AWS, which reports IN_PROGRESS at submit time.
+        time.sleep(1.2)
         d = ddb.describe_export(ExportArn=export_arn)
         assert d["ExportDescription"]["ExportArn"] == export_arn
         assert d["ExportDescription"]["ExportStatus"] == "COMPLETED"
@@ -5208,3 +5212,119 @@ def test_dynamodb_batch_write_cap_message_includes_count(ddb):
         assert "30" in msg or "25" in msg
     finally:
         ddb.delete_table(TableName=name)
+
+
+# ---------------------------------------------------------------------------
+# PartiQL: non-key predicate failures map to ConditionalCheckFailedException
+# ---------------------------------------------------------------------------
+
+def test_partiql_update_false_non_key_predicate_returns_ccf(ddb):
+    name = "partiql-upd-ccf"
+    _basic_table(ddb, name)
+    try:
+        ddb.put_item(TableName=name, Item={"pk": {"S": "x"}, "name": {"S": "alpha"}, "n": {"N": "1"}})
+        with pytest.raises(ClientError) as exc:
+            ddb.execute_statement(
+                Statement=f'UPDATE "{name}" SET n = 9 WHERE pk = \'x\' AND name = \'beta\''
+            )
+        assert exc.value.response["Error"]["Code"] == "ConditionalCheckFailedException"
+        after = ddb.get_item(TableName=name, Key={"pk": {"S": "x"}})["Item"]
+        assert after["n"]["N"] == "1"
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_partiql_delete_false_non_key_predicate_returns_ccf(ddb):
+    name = "partiql-del-ccf"
+    _basic_table(ddb, name)
+    try:
+        ddb.put_item(TableName=name, Item={"pk": {"S": "x"}, "name": {"S": "alpha"}})
+        with pytest.raises(ClientError) as exc:
+            ddb.execute_statement(
+                Statement=f'DELETE FROM "{name}" WHERE pk = \'x\' AND name = \'beta\''
+            )
+        assert exc.value.response["Error"]["Code"] == "ConditionalCheckFailedException"
+        still = ddb.get_item(TableName=name, Key={"pk": {"S": "x"}}).get("Item")
+        assert still is not None
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_partiql_update_missing_pk_clause_returns_validation(ddb):
+    """AWS PartiQL UPDATE requires every PK attribute as an equality predicate."""
+    name = "partiql-upd-nopk"
+    _basic_table(ddb, name, with_sk=True)
+    try:
+        ddb.put_item(TableName=name, Item={"pk": {"S": "x"}, "sk": {"S": "1"}, "n": {"N": "1"}})
+        with pytest.raises(ClientError) as exc:
+            ddb.execute_statement(
+                Statement=f'UPDATE "{name}" SET n = 9 WHERE pk = \'x\''
+            )
+        assert exc.value.response["Error"]["Code"] == "ValidationException"
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+# ---------------------------------------------------------------------------
+# Export/Import: IN_PROGRESS at submit, COMPLETED after delay
+# ---------------------------------------------------------------------------
+
+def test_export_returns_in_progress_then_completed(ddb, s3):
+    name = "exp-in-progress"
+    _basic_table(ddb, name)
+    bucket = f"exp-bucket-{_uuid_mod.uuid4().hex[:8]}"
+    s3.create_bucket(Bucket=bucket)
+    try:
+        ddb.update_continuous_backups(
+            TableName=name,
+            PointInTimeRecoverySpecification={"PointInTimeRecoveryEnabled": True},
+        )
+        table_arn = ddb.describe_table(TableName=name)["Table"]["TableArn"]
+        resp = ddb.export_table_to_point_in_time(TableArn=table_arn, S3Bucket=bucket)
+        export_arn = resp["ExportDescription"]["ExportArn"]
+        assert resp["ExportDescription"]["ExportStatus"] == "IN_PROGRESS"
+
+        first = ddb.describe_export(ExportArn=export_arn)["ExportDescription"]
+        assert first["ExportStatus"] == "IN_PROGRESS"
+
+        time.sleep(1.2)
+        later = ddb.describe_export(ExportArn=export_arn)["ExportDescription"]
+        assert later["ExportStatus"] == "COMPLETED"
+        assert "EndTime" in later
+    finally:
+        try:
+            ddb.delete_table(TableName=name)
+        except Exception:
+            pass
+
+
+def test_import_returns_in_progress_then_completed(ddb, s3):
+    bucket = f"imp-bucket-{_uuid_mod.uuid4().hex[:8]}"
+    s3.create_bucket(Bucket=bucket)
+    tname = f"imp-in-progress-{_uuid_mod.uuid4().hex[:8]}"
+    try:
+        resp = ddb.import_table(
+            S3BucketSource={"S3Bucket": bucket},
+            InputFormat="DYNAMODB_JSON",
+            TableCreationParameters={
+                "TableName": tname,
+                "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+                "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+                "BillingMode": "PAY_PER_REQUEST",
+            },
+        )
+        import_arn = resp["ImportTableDescription"]["ImportArn"]
+        assert resp["ImportTableDescription"]["ImportStatus"] == "IN_PROGRESS"
+
+        first = ddb.describe_import(ImportArn=import_arn)["ImportTableDescription"]
+        assert first["ImportStatus"] == "IN_PROGRESS"
+
+        time.sleep(1.2)
+        later = ddb.describe_import(ImportArn=import_arn)["ImportTableDescription"]
+        assert later["ImportStatus"] == "COMPLETED"
+        assert "EndTime" in later
+    finally:
+        try:
+            ddb.delete_table(TableName=tname)
+        except Exception:
+            pass

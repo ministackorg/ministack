@@ -54,6 +54,7 @@ logger = logging.getLogger("cloudformation")
 # Module-level REGION kept for legacy imports; new code must use get_region()
 # so AWS::Region / ARNs reflect the caller's request region (#398).
 REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
+_MINISTACK_HOST = os.environ.get("MINISTACK_HOST", "localhost")
 
 
 def _physical_name(stack_name: str, logical_id: str, *,
@@ -3264,7 +3265,7 @@ def _apigw_v2_api_create(logical_id, props, stack_name):
         "apiId": api_id,
         "name": name,
         "protocolType": protocol,
-        "apiEndpoint": f"http://{api_id}.execute-api.{os.environ.get('MINISTACK_HOST', 'localhost')}:{os.environ.get('GATEWAY_PORT', '4566')}",
+        "apiEndpoint": f"http://{api_id}.execute-api.{_MINISTACK_HOST}:{os.environ.get('GATEWAY_PORT', '4566')}",
         "createdDate": now_iso(),
         "routeSelectionExpression": props.get("RouteSelectionExpression", "$request.method $request.path"),
         "apiKeySelectionExpression": props.get("ApiKeySelectionExpression", "$request.header.x-api-key"),

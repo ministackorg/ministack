@@ -38,6 +38,8 @@ from ministack.core.responses import (
 
 logger = logging.getLogger("appsync_events")
 
+_MINISTACK_HOST = os.environ.get("MINISTACK_HOST", "localhost")
+
 # ---------------------------------------------------------------------------
 # In-memory state
 # ---------------------------------------------------------------------------
@@ -133,7 +135,7 @@ def _default_dns_for_api(api_id: str) -> dict[str, str]:
     """
     region = get_region()
     port = os.environ.get("GATEWAY_PORT") or os.environ.get("EDGE_PORT") or "4566"
-    mini_host = os.environ.get("MINISTACK_HOST", "localhost")
+    mini_host = _MINISTACK_HOST
     host_t = os.environ.get("APPSYNC_EVENTS_HTTP_HOST_TEMPLATE", "").strip()
     rt_t = os.environ.get("APPSYNC_EVENTS_REALTIME_HOST_TEMPLATE", "").strip()
     if host_t and rt_t:
