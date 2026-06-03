@@ -68,6 +68,7 @@ from xml.etree.ElementTree import tostring as xml_tostring
 
 from defusedxml.ElementTree import fromstring as safe_xml_parse
 
+from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.persistence import PERSIST_STATE, load_state
 from ministack.core.responses import (
     AccountScopedDict,
@@ -384,6 +385,28 @@ def _identity_pool_id() -> str:
 
 def _identity_id(pool_id: str) -> str:
     return f"{get_region()}:{new_uuid()}"
+
+
+class _InvalidCognitoIdentityArn(ValueError):
+    pass
+
+
+def _identity_pool_id_from_arn(resource_arn: str) -> str | None:
+    try:
+        spec = parse_arn(resource_arn)
+    except ArnParseError as exc:
+        raise _InvalidCognitoIdentityArn("Invalid Cognito Identity resource ARN.") from exc
+    if spec.service != "cognito-identity":
+        raise _InvalidCognitoIdentityArn("Invalid Cognito Identity resource ARN.")
+    if spec.region != get_region() or spec.account_id != get_account_id():
+        return None
+    prefix = "identitypool/"
+    if not spec.resource.startswith(prefix):
+        raise _InvalidCognitoIdentityArn("Invalid Cognito Identity resource ARN.")
+    pool_id = spec.resource[len(prefix):]
+    if not pool_id:
+        raise _InvalidCognitoIdentityArn("Invalid Cognito Identity resource ARN.")
+    return pool_id
 
 
 def _fake_token(sub: str, pool_id: str, client_id: str, token_type: str = "access",
@@ -4608,8 +4631,12 @@ def _unlink_identity(data):
 def _identity_tag_resource(data):
     arn = data.get("ResourceArn", "")
     tags = data.get("Tags", {})
-    # ARN format: arn:aws:cognito-identity:region:account:identitypool/id
-    iid = arn.split("/")[-1] if "/" in arn else arn
+    try:
+        iid = _identity_pool_id_from_arn(arn)
+    except _InvalidCognitoIdentityArn as exc:
+        return error_response_json("InvalidParameterException", str(exc), 400)
+    if not iid or iid not in _identity_pools:
+        return error_response_json("ResourceNotFoundException", f"Resource {arn} not found.", 400)
     _identity_tags.setdefault(iid, {}).update(tags)
     return json_response({})
 
@@ -4617,7 +4644,12 @@ def _identity_tag_resource(data):
 def _identity_untag_resource(data):
     arn = data.get("ResourceArn", "")
     tag_keys = data.get("TagKeys", [])
-    iid = arn.split("/")[-1] if "/" in arn else arn
+    try:
+        iid = _identity_pool_id_from_arn(arn)
+    except _InvalidCognitoIdentityArn as exc:
+        return error_response_json("InvalidParameterException", str(exc), 400)
+    if not iid or iid not in _identity_pools:
+        return error_response_json("ResourceNotFoundException", f"Resource {arn} not found.", 400)
     for k in tag_keys:
         _identity_tags.get(iid, {}).pop(k, None)
     return json_response({})
@@ -4625,7 +4657,12 @@ def _identity_untag_resource(data):
 
 def _identity_list_tags_for_resource(data):
     arn = data.get("ResourceArn", "")
-    iid = arn.split("/")[-1] if "/" in arn else arn
+    try:
+        iid = _identity_pool_id_from_arn(arn)
+    except _InvalidCognitoIdentityArn as exc:
+        return error_response_json("InvalidParameterException", str(exc), 400)
+    if not iid or iid not in _identity_pools:
+        return error_response_json("ResourceNotFoundException", f"Resource {arn} not found.", 400)
     return json_response({"Tags": _identity_tags.get(iid, {})})
 
 

@@ -21,6 +21,11 @@ from ministack.core import persistence
 
 # ========== from test_cognito.py ==========
 
+
+def _identity_pool_arn(identity_pool_id, region="us-east-1", account="000000000000"):
+    return f"arn:aws:cognito-identity:{region}:{account}:identitypool/{identity_pool_id}"
+
+
 def test_cognito_create_and_describe_user_pool(cognito_idp):
     resp = cognito_idp.create_user_pool(PoolName="TestPool")
     pool = resp["UserPool"]
@@ -409,6 +414,56 @@ def test_cognito_identity_pool_crud(cognito_identity):
     cognito_identity.delete_identity_pool(IdentityPoolId=iid)
     pools2 = cognito_identity.list_identity_pools(MaxResults=60)["IdentityPools"]
     assert not any(p["IdentityPoolId"] == iid for p in pools2)
+
+
+def test_cognito_identity_pool_tags(cognito_identity):
+    resp = cognito_identity.create_identity_pool(
+        IdentityPoolName="IdentityTagPool",
+        AllowUnauthenticatedIdentities=True,
+    )
+    arn = _identity_pool_arn(resp["IdentityPoolId"])
+
+    cognito_identity.tag_resource(ResourceArn=arn, Tags={"project": "ministack"})
+    tags = cognito_identity.list_tags_for_resource(ResourceArn=arn)["Tags"]
+    assert tags["project"] == "ministack"
+
+    cognito_identity.untag_resource(ResourceArn=arn, TagKeys=["project"])
+    tags = cognito_identity.list_tags_for_resource(ResourceArn=arn)["Tags"]
+    assert "project" not in tags
+
+
+def test_cognito_identity_pool_tag_apis_reject_invalid_arns(cognito_identity):
+    iid = cognito_identity.create_identity_pool(
+        IdentityPoolName="IdentityInvalidArnTagPool",
+        AllowUnauthenticatedIdentities=True,
+    )["IdentityPoolId"]
+    valid_arn = _identity_pool_arn(iid)
+    invalid_cases = [
+        ("not-an-arn-but-long-enough", "InvalidParameterException"),
+        ("arn:aws:cognito-identity:us-east-1", "InvalidParameterException"),
+        (f"arn:aws:cognito-idp:us-east-1:000000000000:identitypool/{iid}", "InvalidParameterException"),
+        (f"arn:aws:cognito-identity:us-east-1:000000000000:identity/{iid}", "InvalidParameterException"),
+        (_identity_pool_arn(iid, region="us-west-2"), "ResourceNotFoundException"),
+        (_identity_pool_arn(iid, account="111111111111"), "ResourceNotFoundException"),
+    ]
+
+    for bad_arn, expected_code in invalid_cases:
+        with pytest.raises(ClientError) as exc:
+            cognito_identity.tag_resource(ResourceArn=bad_arn, Tags={"bad": "value"})
+        assert exc.value.response["Error"]["Code"] == expected_code
+
+    assert cognito_identity.list_tags_for_resource(ResourceArn=valid_arn)["Tags"] == {}
+
+
+def test_cognito_identity_pool_list_and_untag_reject_invalid_arns(cognito_identity):
+    for operation, kwargs in [
+        (cognito_identity.list_tags_for_resource, {}),
+        (cognito_identity.untag_resource, {"TagKeys": ["missing"]}),
+    ]:
+        with pytest.raises(ClientError) as exc:
+            operation(ResourceArn="arn:aws:sqs:us-east-1:000000000000:identitypool/not-a-pool", **kwargs)
+        assert exc.value.response["Error"]["Code"] == "InvalidParameterException"
+
 
 def test_cognito_get_id_and_credentials(cognito_identity):
     resp = cognito_identity.create_identity_pool(
