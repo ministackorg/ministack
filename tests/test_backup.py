@@ -425,6 +425,37 @@ def test_backup_tag_plan(backup):
     assert resp["Tags"]["Owner"] == "data-team"
 
 
+def test_backup_tag_rejects_malformed_arn(backup):
+    with pytest.raises(ClientError) as exc:
+        backup.tag_resource(ResourceArn="not-an-arn", Tags={"k": "v"})
+    assert exc.value.response["Error"]["Code"] == "InvalidParameterValueException"
+
+
+def test_backup_tag_rejects_wrong_service_arn(backup):
+    arn = f"arn:aws:sns:{REGION}:000000000000:backup-vault:not-a-vault"
+    with pytest.raises(ClientError) as exc:
+        backup.tag_resource(ResourceArn=arn, Tags={"k": "v"})
+    assert exc.value.response["Error"]["Code"] == "InvalidParameterValueException"
+
+
+def test_backup_tag_does_not_resolve_foreign_region_arn_by_tail(backup):
+    name = f"tag-foreign-region-{_uid()}"
+    backup.create_backup_vault(BackupVaultName=name)
+    arn = f"arn:aws:backup:us-west-2:000000000000:backup-vault:{name}"
+    with pytest.raises(ClientError) as exc:
+        backup.tag_resource(ResourceArn=arn, Tags={"k": "v"})
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
+def test_backup_tag_does_not_resolve_foreign_account_arn_by_tail(backup):
+    name = f"tag-foreign-account-{_uid()}"
+    backup.create_backup_vault(BackupVaultName=name)
+    arn = f"arn:aws:backup:{REGION}:111111111111:backup-vault:{name}"
+    with pytest.raises(ClientError) as exc:
+        backup.tag_resource(ResourceArn=arn, Tags={"k": "v"})
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
 def test_backup_tag_not_found(backup):
     arn = "arn:aws:backup:us-east-1:000000000000:backup-vault:no-such-vault"
     with pytest.raises(ClientError) as exc:
