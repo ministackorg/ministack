@@ -21,7 +21,7 @@ services:
       redis:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:4566/_ministack/health')"]
+      test: ["CMD", "python", "-c", "import os,urllib.request; urllib.request.urlopen('http://'+os.environ.get('MINISTACK_HOST','localhost')+':'+os.environ.get('GATEWAY_PORT','4566')+'/_ministack/health')"]
       interval: 10s
       timeout: 3s
       retries: 3

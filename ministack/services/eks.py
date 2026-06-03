@@ -36,6 +36,7 @@ from ministack.core.responses import (
 logger = logging.getLogger("eks")
 
 REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
+_MINISTACK_HOST = os.environ.get("MINISTACK_HOST", "localhost")
 EKS_K3S_IMAGE = os.environ.get("EKS_K3S_IMAGE", "rancher/k3s:v1.31.4-k3s1")
 EKS_BASE_PORT = int(os.environ.get("EKS_BASE_PORT", "16443"))
 DOCKER_NETWORK = os.environ.get("DOCKER_NETWORK", "")
@@ -64,9 +65,8 @@ _oidc_keypair = None                  # (private_key, jwk_dict, kid)
 
 
 def _ministack_issuer_base():
-    host = os.environ.get("MINISTACK_HOST", "localhost")
     port = os.environ.get("GATEWAY_PORT", "4566")
-    return f"http://{host}:{port}/oidc"
+    return f"http://{_MINISTACK_HOST}:{port}/oidc"
 
 
 def _new_oidc_id():

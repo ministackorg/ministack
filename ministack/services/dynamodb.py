@@ -37,6 +37,8 @@ from ministack.services._dynamodb_keywords import AWS_KEYWORDS
 
 logger = logging.getLogger("dynamodb")
 
+_MINISTACK_HOST = os.environ.get("MINISTACK_HOST", "localhost")
+
 
 def _conditional_check_failed(data, old_item, message="The conditional request failed"):
     """Standard ConditionalCheckFailedException response, with `Item` populated
@@ -3089,10 +3091,9 @@ def _describe_endpoints(data):
     # Address for follow-up calls. Returning real-AWS hostname would redirect
     # SDKs AWAY from MiniStack on cache miss. Return MiniStack's own host so
     # endpoint-discovery-aware SDKs keep talking to us.
-    host = os.environ.get("MINISTACK_HOST", "localhost")
     port = os.environ.get("GATEWAY_PORT", "4566")
     return json_response({
-        "Endpoints": [{"Address": f"{host}:{port}", "CachePeriodInMinutes": 1440}]
+        "Endpoints": [{"Address": f"{_MINISTACK_HOST}:{port}", "CachePeriodInMinutes": 1440}]
     })
 
 

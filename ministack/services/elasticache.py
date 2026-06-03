@@ -32,6 +32,7 @@ from ministack.core.responses import AccountScopedDict, apply_image_prefix, get_
 logger = logging.getLogger("elasticache")
 
 REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
+_MINISTACK_HOST = os.environ.get("MINISTACK_HOST", "localhost")
 REDIS_DEFAULT_HOST = os.environ.get("REDIS_HOST", "redis")
 REDIS_DEFAULT_PORT = int(os.environ.get("REDIS_PORT", "6379"))
 BASE_PORT = int(os.environ.get("ELASTICACHE_BASE_PORT", "16379"))
@@ -159,7 +160,7 @@ def _spawn_redis_container(name, engine, engine_version, labels):
 
     host_port = _port_counter[0]
     _port_counter[0] += 1
-    endpoint_host = "localhost"
+    endpoint_host = _MINISTACK_HOST
     endpoint_port = host_port
 
     if engine == "redis":
