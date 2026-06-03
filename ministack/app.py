@@ -844,7 +844,7 @@ async def _handle_pre_body_request(method: str, path: str, headers: dict, query_
     if response is not None:
         return response
       
-    response = _handle_ports_request(method, path)
+    response = await _handle_ports_request(method, path, headers, query_params)
     if response is not None:
         return response
       
@@ -893,49 +893,73 @@ def _handle_iot_ca_request(method: str, path: str):
     )
 
 
-def _handle_ports_request(method: str, path: str):
+async def _handle_ports_request(method: str, path: str, headers: dict, query_params: dict):
     """`GET /_ministack/ports` returns the Docker host-port mappings for RDS and
-    ElastiCache instances.  Useful when DOCKER_NETWORK is set and the emulator
-    uses internal container IPs as ``Endpoint.Address`` — the host port is not
-    returned by those service APIs but is needed to connect from outside the
-    Docker network.
+    ElastiCache instances. Supports optional `account` query parameter — when
+    present returns resources only for that account (flat mapping). When
+    absent, returns all resources grouped by account to avoid identifier
+    collisions.
     """
     if path != "/_ministack/ports" or method != "GET":
         return None
 
+    account_id = None
+    if "account" in query_params:
+        raw_account = query_params["account"]
+        account_id = raw_account[0] if isinstance(raw_account, (list, tuple)) else raw_account
+        if not _12_DIGIT_RE.match(account_id):
+            return (
+                400,
+                {"Content-Type": "application/json"},
+                json.dumps({
+                    "__type": "InvalidAccountID",
+                    "message": f"Account ID must be 12 digits, got: {account_id}",
+                }).encode(),
+            )
+
     result = {"rds": {}, "elasticache": {"clusters": {}, "replication_groups": {}}}
+    errors: dict[str, str] = {}
 
     try:
         rds = _get_module("rds")
-        for inst in rds._instances.values():
+        all_instances = rds._instances.to_dict()
+        grouped = {}
+        for (acct, key), inst in all_instances.items():
             db_id = inst.get("DBInstanceIdentifier")
             host_port = inst.get("_HostPort")
             endpoint = inst.get("Endpoint", {})
-            if db_id and host_port:
-                result["rds"][db_id] = {
-                    "host_port": host_port,
-                    "endpoint_address": endpoint.get("Address"),
-                    "endpoint_port": endpoint.get("Port"),
-                    "engine": inst.get("Engine"),
-                    "status": inst.get("DBInstanceStatus"),
-                }
-    except Exception:
-        logger.warning("Failed to extract RDS ports for meta API: %s", e)
+            if not db_id or not host_port:
+                continue
+            grouped.setdefault(acct, {})[db_id] = {
+                "host_port": host_port,
+                "endpoint_address": endpoint.get("Address"),
+                "endpoint_port": endpoint.get("Port"),
+                "engine": inst.get("Engine"),
+                "status": inst.get("DBInstanceStatus"),
+            }
+        result["rds"] = {acct: mapping for acct, mapping in grouped.items() if account_id is None or acct == account_id}
+    except Exception as e:
+        logger.exception("Error building RDS ports mapping")
+        errors["rds"] = str(e) or "Error building RDS ports mapping"
 
     try:
         ec = _get_module("elasticache")
-        for cluster_id, cl in ec._clusters.items():
+        all_clusters = ec._clusters.to_dict()
+        all_rgs = ec._replication_groups.to_dict()
+        clusters_grouped = {}
+        for (acct, cluster_id), cl in all_clusters.items():
             host_port = cl.get("_HostPort")
             ep = cl.get("_endpoint", {})
             if host_port:
-                result["elasticache"]["clusters"][cluster_id] = {
+                clusters_grouped.setdefault(acct, {})[cluster_id] = {
                     "host_port": host_port,
                     "endpoint_address": ep.get("Address"),
                     "endpoint_port": ep.get("Port"),
                     "engine": cl.get("Engine"),
                     "status": cl.get("CacheClusterStatus"),
                 }
-        for rg_id, rg in ec._replication_groups.items():
+        rg_grouped = {}
+        for (acct, rg_id), rg in all_rgs.items():
             rg_ports = {}
             for ng in rg.get("NodeGroups", []):
                 ng_id = ng.get("NodeGroupId")
@@ -948,9 +972,22 @@ def _handle_ports_request(method: str, path: str):
                         "endpoint_port": primary.get("Port"),
                     }
             if rg_ports:
-                result["elasticache"]["replication_groups"][rg_id] = rg_ports
-    except Exception:
-        pass
+                rg_grouped.setdefault(acct, {})[rg_id] = rg_ports
+
+        result["elasticache"]["clusters"] = {acct: mapping for acct, mapping in clusters_grouped.items() if account_id is None or acct == account_id}
+        result["elasticache"]["replication_groups"] = {acct: mapping for acct, mapping in rg_grouped.items() if account_id is None or acct == account_id}
+    except Exception as e:
+        logger.exception("Error building ElastiCache ports mapping")
+        errors["elasticache"] = str(e) or "Error building ElastiCache ports mapping"
+
+    has_data = bool(result.get("rds")) or bool(result["elasticache"].get("clusters")) or bool(result["elasticache"].get("replication_groups"))
+
+    if errors:
+        if has_data:
+            result["errors"] = errors
+        else:
+            result = {"message": "Internal error while building ports mapping", "errors": errors}
+            return 500, {"Content-Type": "application/json"}, json.dumps(result).encode()
 
     return 200, {"Content-Type": "application/json"}, json.dumps(result).encode()
 
