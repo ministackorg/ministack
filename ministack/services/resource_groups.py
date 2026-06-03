@@ -21,6 +21,7 @@ import json
 import logging
 import re
 
+from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountScopedDict,
@@ -31,9 +32,7 @@ from ministack.core.responses import (
 logger = logging.getLogger("resource_groups")
 
 _GROUP_NAME_RE = re.compile(r"^[A-Za-z0-9_.\-]{1,300}$")
-_GROUP_ARN_RE = re.compile(
-    r"^arn:aws[-a-z]*:resource-groups:[^:]*:[^:]*:group/(?P<name>[A-Za-z0-9_.\-]+)$"
-)
+_AWS_PARTITION_RE = re.compile(r"^aws(?:-[a-z]+)*$")
 _VALID_QUERY_TYPES = {"TAG_FILTERS_1_0", "CLOUDFORMATION_STACK_1_0"}
 
 _groups = AccountScopedDict()           # name -> Group dict
@@ -91,6 +90,26 @@ def _arn(name):
     return f"arn:aws:resource-groups:{get_region()}:{get_account_id()}:group/{name}"
 
 
+class _InvalidResourceGroupsArn(ValueError):
+    pass
+
+
+def _validate_aws_partition(spec, message):
+    if not _AWS_PARTITION_RE.match(spec.partition):
+        raise _InvalidResourceGroupsArn(message)
+
+
+def _validate_resource_arn(arn):
+    try:
+        spec = parse_arn(arn)
+    except ArnParseError as exc:
+        raise _InvalidResourceGroupsArn("Invalid resource ARN.") from exc
+    _validate_aws_partition(spec, "Invalid resource ARN.")
+    if not spec.service or not spec.resource:
+        raise _InvalidResourceGroupsArn("Invalid resource ARN.")
+    return spec
+
+
 def _resolve_name(group_name=None, group=None):
     """Accepts either GroupName (bare) or Group (name or full ARN). Returns
     the bare name, or None if both inputs are missing."""
@@ -98,9 +117,8 @@ def _resolve_name(group_name=None, group=None):
         return group_name
     if not group:
         return None
-    m = _GROUP_ARN_RE.match(group)
-    if m:
-        return m.group("name")
+    if isinstance(group, str) and group.startswith("arn:"):
+        return _resolve_arn_group(group) or group
     return group
 
 
@@ -329,7 +347,9 @@ def _group_resources(data):
     arns = list(data.get("ResourceArns") or [])
     if not arns:
         return _bad_request("ResourceArns is required.")
-    members = _group_members.get(name) or []
+    for arn in arns:
+        _validate_resource_arn(arn)
+    members = list(_group_members.get(name) or [])
     seen = set(members)
     succeeded = []
     for arn in arns:
@@ -350,6 +370,8 @@ def _ungroup_resources(data):
     arns = list(data.get("ResourceArns") or [])
     if not arns:
         return _bad_request("ResourceArns is required.")
+    for arn in arns:
+        _validate_resource_arn(arn)
     members = list(_group_members.get(name) or [])
     target = set(arns)
     _group_members[name] = [a for a in members if a not in target]
@@ -433,10 +455,24 @@ def _update_account_settings(data):
 def _resolve_arn_group(arn):
     if not arn:
         return None
-    m = _GROUP_ARN_RE.match(arn)
-    if not m:
+    try:
+        spec = parse_arn(arn)
+    except ArnParseError as exc:
+        raise _InvalidResourceGroupsArn("Invalid Resource Groups group ARN.") from exc
+    _validate_aws_partition(spec, "Invalid Resource Groups group ARN.")
+    if spec.service != "resource-groups":
+        raise _InvalidResourceGroupsArn("Invalid Resource Groups group ARN.")
+    if not spec.region or not spec.account_id:
+        raise _InvalidResourceGroupsArn("Invalid Resource Groups group ARN.")
+    if spec.region != get_region() or spec.account_id != get_account_id():
         return None
-    return m.group("name")
+    prefix = "group/"
+    if not spec.resource.startswith(prefix):
+        raise _InvalidResourceGroupsArn("Invalid Resource Groups group ARN.")
+    name = spec.resource[len(prefix):]
+    if not _GROUP_NAME_RE.match(name):
+        raise _InvalidResourceGroupsArn("Invalid Resource Groups group ARN.")
+    return name
 
 
 def _tag(arn, data):
@@ -476,11 +512,9 @@ def _get_tags(arn):
 def _resource_type_from_arn(arn):
     """Best-effort extraction of `AWS::Service::ResourceType` from an ARN.
     Returns the raw ARN service slot uppercased when the type can't be inferred."""
-    parts = arn.split(":", 5) if isinstance(arn, str) else []
-    if len(parts) < 6:
-        return ""
-    service = parts[2]
-    tail = parts[5]
+    spec = _validate_resource_arn(arn)
+    service = spec.service
+    tail = spec.resource
     sub = tail.split("/", 1)[0] if "/" in tail else tail.split(":", 1)[0]
     if not sub:
         sub = "Resource"
@@ -523,17 +557,23 @@ async def handle_request(method, path, headers, body, query_params):
     if method == "POST":
         handler = _POST_ROUTES.get(path)
         if handler:
-            return handler(data)
+            try:
+                return handler(data)
+            except _InvalidResourceGroupsArn as exc:
+                return _bad_request(str(exc))
 
     m = _TAG_ARN_PATH_RE.match(path)
     if m:
         from urllib.parse import unquote
         arn = unquote(m.group("arn"))
-        if method == "GET":
-            return _get_tags(arn)
-        if method == "PUT":
-            return _tag(arn, data)
-        if method == "PATCH":
-            return _untag(arn, data)
+        try:
+            if method == "GET":
+                return _get_tags(arn)
+            if method == "PUT":
+                return _tag(arn, data)
+            if method == "PATCH":
+                return _untag(arn, data)
+        except _InvalidResourceGroupsArn as exc:
+            return _bad_request(str(exc))
 
     return _bad_request(f"Unknown Resource Groups route: {method} {path}")
