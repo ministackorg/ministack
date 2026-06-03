@@ -2919,6 +2919,10 @@ def test_dynamodb_export_table_to_point_in_time(ddb):
         assert desc["ExportStatus"] == "IN_PROGRESS"
         export_arn = desc["ExportArn"]
 
+        # Export flips to COMPLETED only after the IN_PROGRESS grace window
+        # (MINISTACK_DDB_EXPORT_COMPLETE_AFTER_SEC, default 1s) — matches real
+        # AWS, which reports IN_PROGRESS at submit time.
+        time.sleep(1.2)
         d = ddb.describe_export(ExportArn=export_arn)
         assert d["ExportDescription"]["ExportArn"] == export_arn
         assert d["ExportDescription"]["ExportStatus"] == "COMPLETED"
