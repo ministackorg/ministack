@@ -126,6 +126,39 @@ def _deployment_arn(app_id, env_id, deploy_num):
     )
 
 
+def _resolve_application_id(identifier):
+    if identifier in _applications:
+        return identifier
+
+    for app_id, record in _applications.items():
+        if record.get("Name") == identifier:
+            return app_id
+
+    return None
+
+
+def _resolve_environment_id(app_id, identifier):
+    if f"{app_id}/{identifier}" in _environments:
+        return identifier
+
+    for record in _environments.values():
+        if record.get("ApplicationId") == app_id and record.get("Name") == identifier:
+            return record.get("Id")
+
+    return None
+
+
+def _resolve_configuration_profile_id(app_id, identifier):
+    if f"{app_id}/{identifier}" in _config_profiles:
+        return identifier
+
+    for record in _config_profiles.values():
+        if record.get("ApplicationId") == app_id and record.get("Name") == identifier:
+            return record.get("Id")
+
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Applications
 # ---------------------------------------------------------------------------
@@ -578,14 +611,26 @@ def _list_tags_for_resource(resource_arn):
 
 
 def _start_configuration_session(body):
-    app_id = body.get("ApplicationIdentifier", "")
-    env_id = body.get("EnvironmentIdentifier", "")
-    profile_id = body.get("ConfigurationProfileIdentifier", "")
+    app_identifier = body.get("ApplicationIdentifier", "")
+    env_identifier = body.get("EnvironmentIdentifier", "")
+    profile_identifier = body.get("ConfigurationProfileIdentifier", "")
 
-    if not app_id or not env_id or not profile_id:
+    if not app_identifier or not env_identifier or not profile_identifier:
         return _error(400, "BadRequestException",
                       "ApplicationIdentifier, EnvironmentIdentifier, and "
                       "ConfigurationProfileIdentifier are required")
+
+    app_id = _resolve_application_id(app_identifier)
+    if not app_id:
+        return _error(404, "ResourceNotFoundException", f"Application {app_identifier} not found")
+
+    env_id = _resolve_environment_id(app_id, env_identifier)
+    if not env_id:
+        return _error(404, "ResourceNotFoundException", f"Environment {env_identifier} not found")
+
+    profile_id = _resolve_configuration_profile_id(app_id, profile_identifier)
+    if not profile_id:
+        return _error(404, "ResourceNotFoundException", f"Configuration profile {profile_identifier} not found")
 
     token = uuid.uuid4().hex
     _sessions[token] = {
