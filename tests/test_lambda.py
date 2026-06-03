@@ -271,6 +271,389 @@ def test_lambda_full_function_arn_must_match_request_region():
     assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
 
 
+def test_lambda_direct_function_arns_do_not_fallback_to_local_names():
+    lam = _regional_client("lambda", "us-east-1")
+    name = f"lambda-direct-arn-scope-{_uuid_mod.uuid4().hex}"
+    created = lam.create_function(
+        FunctionName=name,
+        Runtime="python3.12",
+        Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _region_marker_code("east")},
+    )
+
+    bad_refs = [
+        f"arn:aws:lambda:us-west-2:000000000000:function:{name}",
+        f"arn:aws:lambda:us-east-1:111111111111:function:{name}",
+        f"arn:aws:sns:us-east-1:000000000000:function:{name}",
+        f"arn:aws:lambda:us-east-1:000000000000:not-function:{name}",
+    ]
+    try:
+        for function_ref in bad_refs:
+            with pytest.raises(ClientError) as exc:
+                lam.get_function(FunctionName=function_ref)
+            assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+        same_region = lam.get_function(FunctionName=created["FunctionArn"])
+        assert same_region["Configuration"]["FunctionArn"] == created["FunctionArn"]
+    finally:
+        lam.delete_function(FunctionName=name)
+
+
+def test_lambda_direct_function_arn_missing_qualifier_does_not_fallback_to_latest():
+    lam = _regional_client("lambda", "us-east-1")
+    name = f"lambda-missing-qualifier-{_uuid_mod.uuid4().hex}"
+    created = lam.create_function(
+        FunctionName=name,
+        Runtime="python3.12",
+        Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _region_marker_code("east")},
+    )
+
+    try:
+        with pytest.raises(ClientError) as exc:
+            lam.get_function(FunctionName=f"{created['FunctionArn']}:missing")
+        assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+        latest = lam.get_function(FunctionName=created["FunctionArn"])
+        assert latest["Configuration"]["FunctionArn"] == created["FunctionArn"]
+    finally:
+        lam.delete_function(FunctionName=name)
+
+
+def test_lambda_direct_function_arn_missing_qualifier_mutations_fail():
+    lam = _regional_client("lambda", "us-east-1")
+    name = f"lambda-missing-qualifier-mutate-{_uuid_mod.uuid4().hex}"
+    created = lam.create_function(
+        FunctionName=name,
+        Runtime="python3.12",
+        Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _region_marker_code("east")},
+    )
+    missing_qualified_arn = f"{created['FunctionArn']}:missing"
+
+    try:
+        lam.add_permission(
+            FunctionName=name,
+            StatementId="base-policy",
+            Action="lambda:InvokeFunction",
+            Principal="s3.amazonaws.com",
+        )
+
+        with pytest.raises(ClientError) as delete_exc:
+            lam.delete_function(FunctionName=missing_qualified_arn)
+        assert delete_exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+        with pytest.raises(ClientError) as update_code_exc:
+            lam.update_function_code(FunctionName=missing_qualified_arn, ZipFile=_region_marker_code("updated"))
+        assert update_code_exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+        with pytest.raises(ClientError) as update_config_exc:
+            lam.update_function_configuration(FunctionName=missing_qualified_arn, Description="updated")
+        assert update_config_exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+        with pytest.raises(ClientError) as permission_exc:
+            lam.add_permission(
+                FunctionName=missing_qualified_arn,
+                StatementId="missing-qualified-path",
+                Action="lambda:InvokeFunction",
+                Principal="s3.amazonaws.com",
+            )
+        assert permission_exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+        with pytest.raises(ClientError) as url_exc:
+            lam.create_function_url_config(FunctionName=missing_qualified_arn, AuthType="NONE")
+        assert url_exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+        with pytest.raises(ClientError) as get_policy_exc:
+            lam.get_policy(FunctionName=missing_qualified_arn)
+        assert get_policy_exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+        with pytest.raises(ClientError) as remove_policy_exc:
+            lam.remove_permission(FunctionName=missing_qualified_arn, StatementId="base-policy")
+        assert remove_policy_exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+        policy = json.loads(lam.get_policy(FunctionName=name)["Policy"])
+        assert any(stmt["Sid"] == "base-policy" for stmt in policy["Statement"])
+
+        latest = lam.get_function(FunctionName=created["FunctionArn"])
+        assert latest["Configuration"]["FunctionArn"] == created["FunctionArn"]
+        assert latest["Configuration"].get("Description") != "updated"
+    finally:
+        lam.delete_function(FunctionName=name)
+
+
+def test_lambda_direct_arn_path_qualifier_controls_version_delete():
+    lam = _regional_client("lambda", "us-east-1")
+    name = f"lambda-delete-qualified-{_uuid_mod.uuid4().hex}"
+    lam.create_function(
+        FunctionName=name,
+        Runtime="python3.12",
+        Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _region_marker_code("latest")},
+    )
+    version = lam.publish_version(FunctionName=name)
+
+    lam.delete_function(FunctionName=version["FunctionArn"])
+
+    latest = lam.get_function(FunctionName=name)
+    assert latest["Configuration"]["FunctionName"] == name
+    with pytest.raises(ClientError) as exc:
+        lam.get_function(FunctionName=name, Qualifier=version["Version"])
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+    lam.delete_function(FunctionName=name)
+
+
+def test_lambda_direct_arn_alias_delete_does_not_succeed_as_noop():
+    lam = _regional_client("lambda", "us-east-1")
+    name = f"lambda-delete-alias-{_uuid_mod.uuid4().hex}"
+    lam.create_function(
+        FunctionName=name,
+        Runtime="python3.12",
+        Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _region_marker_code("latest")},
+    )
+    version = lam.publish_version(FunctionName=name)
+    alias = lam.create_alias(FunctionName=name, Name="live", FunctionVersion=version["Version"])
+
+    try:
+        with pytest.raises(ClientError) as exc:
+            lam.delete_function(FunctionName=alias["AliasArn"])
+        assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+        still_exists = lam.get_alias(FunctionName=name, Name="live")
+        assert still_exists["AliasArn"] == alias["AliasArn"]
+    finally:
+        lam.delete_function(FunctionName=name)
+
+
+def test_lambda_direct_arn_version_delete_rejects_aliased_version():
+    lam = _regional_client("lambda", "us-east-1")
+    name = f"lambda-delete-aliased-version-{_uuid_mod.uuid4().hex}"
+    lam.create_function(
+        FunctionName=name,
+        Runtime="python3.12",
+        Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _region_marker_code("latest")},
+    )
+    version = lam.publish_version(FunctionName=name)
+    alias = lam.create_alias(FunctionName=name, Name="live", FunctionVersion=version["Version"])
+
+    try:
+        with pytest.raises(ClientError) as exc:
+            lam.delete_function(FunctionName=version["FunctionArn"])
+        assert exc.value.response["Error"]["Code"] == "ResourceConflictException"
+
+        still_exists = lam.get_function(FunctionName=alias["AliasArn"])
+        assert still_exists["Configuration"]["FunctionArn"] == version["FunctionArn"]
+    finally:
+        lam.delete_function(FunctionName=name)
+
+
+def test_lambda_direct_arn_version_delete_rejects_weighted_alias_version():
+    lam = _regional_client("lambda", "us-east-1")
+    name = f"lambda-delete-weighted-alias-version-{_uuid_mod.uuid4().hex}"
+    lam.create_function(
+        FunctionName=name,
+        Runtime="python3.12",
+        Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _region_marker_code("latest")},
+    )
+    primary = lam.publish_version(FunctionName=name)
+    weighted = lam.publish_version(FunctionName=name)
+    lam.create_alias(
+        FunctionName=name,
+        Name="live",
+        FunctionVersion=primary["Version"],
+        RoutingConfig={"AdditionalVersionWeights": {weighted["Version"]: 0.1}},
+    )
+
+    try:
+        with pytest.raises(ClientError) as exc:
+            lam.delete_function(FunctionName=weighted["FunctionArn"])
+        assert exc.value.response["Error"]["Code"] == "ResourceConflictException"
+
+        still_exists = lam.get_function(FunctionName=name, Qualifier=weighted["Version"])
+        assert still_exists["Configuration"]["FunctionArn"] == weighted["FunctionArn"]
+    finally:
+        lam.delete_function(FunctionName=name)
+
+
+def test_lambda_direct_arn_path_qualifier_controls_permission_resource():
+    lam = _regional_client("lambda", "us-east-1")
+    name = f"lambda-permission-qualified-{_uuid_mod.uuid4().hex}"
+    lam.create_function(
+        FunctionName=name,
+        Runtime="python3.12",
+        Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _region_marker_code("latest")},
+    )
+    version = lam.publish_version(FunctionName=name)
+
+    try:
+        lam.add_permission(
+            FunctionName=name,
+            StatementId="base-path",
+            Action="lambda:InvokeFunction",
+            Principal="s3.amazonaws.com",
+        )
+        lam.add_permission(
+            FunctionName=version["FunctionArn"],
+            StatementId="qualified-path",
+            Action="lambda:InvokeFunction",
+            Principal="s3.amazonaws.com",
+        )
+        policy = json.loads(lam.get_policy(FunctionName=version["FunctionArn"])["Policy"])
+        statement = next(stmt for stmt in policy["Statement"] if stmt["Sid"] == "qualified-path")
+        assert statement["Resource"] == version["FunctionArn"]
+
+        with pytest.raises(ClientError) as remove_base_exc:
+            lam.remove_permission(FunctionName=version["FunctionArn"], StatementId="base-path")
+        assert remove_base_exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+        base_policy = json.loads(lam.get_policy(FunctionName=name)["Policy"])
+        assert any(stmt["Sid"] == "base-path" for stmt in base_policy["Statement"])
+
+        lam.remove_permission(FunctionName=version["FunctionArn"], StatementId="qualified-path")
+        with pytest.raises(ClientError) as missing_qualified_policy_exc:
+            lam.get_policy(FunctionName=version["FunctionArn"])
+        assert missing_qualified_policy_exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+    finally:
+        lam.delete_function(FunctionName=name)
+
+
+def test_lambda_function_url_config_uses_direct_arn_path_qualifier():
+    lam = _regional_client("lambda", "us-east-1")
+    name = f"lambda-url-qualified-{_uuid_mod.uuid4().hex}"
+    lam.create_function(
+        FunctionName=name,
+        Runtime="python3.12",
+        Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _region_marker_code("latest")},
+    )
+    version = lam.publish_version(FunctionName=name)
+    alias = lam.create_alias(FunctionName=name, Name="live", FunctionVersion=version["Version"])
+    url_created = False
+
+    try:
+        created = lam.create_function_url_config(FunctionName=alias["AliasArn"], AuthType="NONE")
+        url_created = True
+        by_alias_arn = lam.get_function_url_config(FunctionName=alias["AliasArn"])
+        assert by_alias_arn["FunctionUrl"] == created["FunctionUrl"]
+
+        with pytest.raises(ClientError) as exc:
+            lam.get_function_url_config(FunctionName=name)
+        assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+    finally:
+        if url_created:
+            lam.delete_function_url_config(FunctionName=alias["AliasArn"])
+        lam.delete_function(FunctionName=name)
+
+
+def test_lambda_function_url_config_delete_allows_alias_cleanup_after_alias_delete():
+    lam = _regional_client("lambda", "us-east-1")
+    name = f"lambda-url-deleted-alias-{_uuid_mod.uuid4().hex}"
+    lam.create_function(
+        FunctionName=name,
+        Runtime="python3.12",
+        Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _region_marker_code("latest")},
+    )
+    version = lam.publish_version(FunctionName=name)
+    alias = lam.create_alias(FunctionName=name, Name="live", FunctionVersion=version["Version"])
+    url_created = False
+
+    try:
+        lam.create_function_url_config(FunctionName=alias["AliasArn"], AuthType="NONE")
+        url_created = True
+
+        lam.delete_alias(FunctionName=name, Name="live")
+        lam.delete_function_url_config(FunctionName=alias["AliasArn"])
+        url_created = False
+
+        listed = lam.list_function_url_configs(FunctionName=name)["FunctionUrlConfigs"]
+        assert listed == []
+    finally:
+        if url_created:
+            try:
+                lam.delete_function_url_config(FunctionName=alias["AliasArn"])
+            except ClientError:
+                pass
+        lam.delete_function(FunctionName=name)
+
+
+def test_lambda_function_url_config_treats_latest_arn_as_unqualified():
+    lam = _regional_client("lambda", "us-east-1")
+    name = f"lambda-url-latest-{_uuid_mod.uuid4().hex}"
+    created_fn = lam.create_function(
+        FunctionName=name,
+        Runtime="python3.12",
+        Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _region_marker_code("latest")},
+    )
+    latest_arn = f"{created_fn['FunctionArn']}:$LATEST"
+    url_created = False
+
+    try:
+        created = lam.create_function_url_config(FunctionName=name, AuthType="NONE")
+        url_created = True
+        by_latest_arn = lam.get_function_url_config(FunctionName=latest_arn)
+        assert by_latest_arn["FunctionUrl"] == created["FunctionUrl"]
+
+        updated = lam.update_function_url_config(FunctionName=latest_arn, AuthType="AWS_IAM")
+        assert updated["AuthType"] == "AWS_IAM"
+        assert lam.get_function_url_config(FunctionName=name)["AuthType"] == "AWS_IAM"
+
+        lam.delete_function_url_config(FunctionName=latest_arn)
+        url_created = False
+        with pytest.raises(ClientError) as exc:
+            lam.get_function_url_config(FunctionName=name)
+        assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+    finally:
+        if url_created:
+            lam.delete_function_url_config(FunctionName=name)
+        lam.delete_function(FunctionName=name)
+
+
+def test_lambda_function_url_config_rejects_direct_version_arn():
+    lam = _regional_client("lambda", "us-east-1")
+    name = f"lambda-url-version-{_uuid_mod.uuid4().hex}"
+    lam.create_function(
+        FunctionName=name,
+        Runtime="python3.12",
+        Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _region_marker_code("latest")},
+    )
+    version = lam.publish_version(FunctionName=name)
+
+    try:
+        with pytest.raises(ClientError) as exc:
+            lam.create_function_url_config(FunctionName=version["FunctionArn"], AuthType="NONE")
+        assert exc.value.response["Error"]["Code"] == "InvalidParameterValueException"
+
+        with pytest.raises(ClientError) as get_version_exc:
+            lam.get_function_url_config(FunctionName=version["FunctionArn"])
+        assert get_version_exc.value.response["Error"]["Code"] == "InvalidParameterValueException"
+
+        with pytest.raises(ClientError) as missing_exc:
+            lam.get_function_url_config(FunctionName=name)
+        assert missing_exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+    finally:
+        lam.delete_function(FunctionName=name)
+
+
 def test_lambda_versions_aliases_tags_and_urls_are_region_scoped():
     east = _regional_client("lambda", "us-east-1")
     west = _regional_client("lambda", "us-west-2")
@@ -786,6 +1169,51 @@ def test_lambda_create_event_source_mapping_rejects_invalid_event_source_arns(la
         assert all(e["EventSourceArn"] != event_source_arn for e in listed)
     finally:
         lam.delete_function(FunctionName=fn_name)
+
+
+def test_lambda_event_source_mapping_rejects_missing_function_qualifier(lam, sqs):
+    fn_name = f"esm-missing-qualifier-{_uuid_mod.uuid4().hex[:8]}"
+    created = lam.create_function(
+        FunctionName=fn_name,
+        Runtime="python3.12",
+        Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _make_zip(_LAMBDA_CODE)},
+    )
+    q_url = sqs.create_queue(QueueName=f"esm-missing-qualifier-{_uuid_mod.uuid4().hex[:8]}")["QueueUrl"]
+    q_arn = sqs.get_queue_attributes(QueueUrl=q_url, AttributeNames=["QueueArn"])["Attributes"]["QueueArn"]
+
+    missing_qualified_arn = f"{created['FunctionArn']}:missing"
+    esm_uuid = None
+    try:
+        with pytest.raises(ClientError) as create_exc:
+            lam.create_event_source_mapping(
+                EventSourceArn=q_arn,
+                FunctionName=missing_qualified_arn,
+                BatchSize=1,
+            )
+        assert create_exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+        esm = lam.create_event_source_mapping(
+            EventSourceArn=q_arn,
+            FunctionName=fn_name,
+            BatchSize=1,
+        )
+        esm_uuid = esm["UUID"]
+        with pytest.raises(ClientError) as update_exc:
+            lam.update_event_source_mapping(
+                UUID=esm_uuid,
+                FunctionName=missing_qualified_arn,
+            )
+        assert update_exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+        got = lam.get_event_source_mapping(UUID=esm_uuid)
+        assert got["FunctionArn"] == created["FunctionArn"]
+    finally:
+        if esm_uuid:
+            lam.delete_event_source_mapping(UUID=esm_uuid)
+        lam.delete_function(FunctionName=fn_name)
+        sqs.delete_queue(QueueUrl=q_url)
 
 
 def test_lambda_esm_sqs_failure_respects_visibility_timeout(lam, sqs):
@@ -2027,6 +2455,36 @@ def test_lambda_layer_get_version_by_arn(lam):
     resp = lam.get_layer_version_by_arn(Arn=arn)
     assert resp["LayerVersionArn"] == arn
     assert resp["Version"] == pub["Version"]
+
+
+def test_lambda_layer_version_arn_errors_do_not_fallback_to_local_layer(lam):
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        z.writestr("ba.py", "")
+    pub = lam.publish_layer_version(
+        LayerName=f"by-arn-guard-{_uuid_mod.uuid4().hex}",
+        Content={"ZipFile": buf.getvalue()},
+    )
+    arn = pub["LayerVersionArn"]
+    wrong_region = arn.replace(":us-east-1:", ":us-west-2:")
+    wrong_account = arn.replace(":000000000000:", ":111111111111:")
+    wrong_service = arn.replace(":lambda:", ":sns:")
+    missing_version = arn.rsplit(":", 1)[0]
+
+    bad_refs = [
+        (wrong_region, "ResourceNotFoundException"),
+        (wrong_account, "AccessDeniedException"),
+        (wrong_service, "ValidationException"),
+        (missing_version, "ValidationException"),
+    ]
+    for layer_ref, expected_code in bad_refs:
+        with pytest.raises(ClientError) as exc:
+            lam.get_layer_version_by_arn(Arn=layer_ref)
+        assert exc.value.response["Error"]["Code"] == expected_code
+
+    same_layer = lam.get_layer_version_by_arn(Arn=arn)
+    assert same_layer["LayerVersionArn"] == arn
+
 
 def test_lambda_layer_version_permission_add(lam):
     """Add a layer version permission and verify response."""
@@ -4863,8 +5321,8 @@ def test_lambda_ruby_4_0_runtime_maps_to_official_image():
 #   https://docs.aws.amazon.com/lambda/latest/api/API_StopDurableExecution.html
 # ---------------------------------------------------------------------------
 
-import urllib.request
 import urllib.error
+import urllib.request
 
 
 def _ms_endpoint():
@@ -4943,8 +5401,8 @@ def test_lambda_durable_function_config_round_trip(lam):
         lam.delete_function(FunctionName=fname)
     except Exception:
         pass
-    import json as _json
     import base64 as _b64
+    import json as _json
     zip_b64 = _b64.b64encode(_make_zip("def handler(e,c): return e")).decode()
     code, body = _raw_durable("POST", "/2015-03-31/functions", body={
         "FunctionName": fname,
@@ -5327,8 +5785,10 @@ def _start_callback(lam):
 def test_lambda_durable_send_callback_success_then_already_closed(lam):
     """First succeed returns 200; second call against the same closed callback
     must return CallbackTimeoutException (400) per the spec."""
-    import urllib.request, urllib.error
+    import urllib.error
+    import urllib.request
     from urllib.parse import quote
+
     fname, arn, cb_id, _ = _start_callback(lam)
     try:
         url = f"{_ms_endpoint()}/2025-12-01/durable-execution-callbacks/{quote(cb_id, safe='')}/succeed"
@@ -5375,8 +5835,10 @@ def test_lambda_durable_send_callback_success_records_result(lam):
 def test_lambda_durable_send_callback_failure(lam):
     fname, arn, cb_id, _ = _start_callback(lam)
     try:
-        import urllib.request, json as _json
+        import json as _json
+        import urllib.request
         from urllib.parse import quote
+
         req = urllib.request.Request(
             f"{_ms_endpoint()}/2025-12-01/durable-execution-callbacks/{quote(cb_id, safe='')}/fail",
             method="POST",
@@ -5425,7 +5887,9 @@ def test_lambda_durable_send_callback_heartbeat(lam):
 
 def test_lambda_durable_send_callback_unknown_id_400(lam):
     """Unknown CallbackId returns InvalidParameterValueException, not 500."""
-    import urllib.request, urllib.error
+    import urllib.error
+    import urllib.request
+
     req = urllib.request.Request(
         f"{_ms_endpoint()}/2025-12-01/durable-execution-callbacks/does-not-exist/succeed",
         method="POST", data=b'"x"',
@@ -5725,7 +6189,9 @@ def test_lambda_durable_get_unknown_arn_404(lam):
 def test_lambda_durable_create_function_durable_config_round_trip_with_update(lam):
     """DurableConfig must survive UpdateFunctionConfiguration that touches
     unrelated fields (timeout, memory)."""
-    import base64 as _b64, json as _json
+    import base64 as _b64
+    import json as _json
+
     fname = f"dur-upd-{_uuid_mod.uuid4().hex[:8]}"
     try:
         lam.delete_function(FunctionName=fname)
@@ -5745,8 +6211,10 @@ def test_lambda_durable_create_function_durable_config_round_trip_with_update(la
         assert body["Configuration"].get("DurableConfig") == {"Enabled": True}, \
             f"DurableConfig lost after Update: {body['Configuration'].get('DurableConfig')}"
     finally:
-        try: lam.delete_function(FunctionName=fname)
-        except Exception: pass
+        try:
+            lam.delete_function(FunctionName=fname)
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------
