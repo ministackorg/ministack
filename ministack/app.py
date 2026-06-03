@@ -931,9 +931,14 @@ async def _handle_ports_request(method: str, path: str, headers: dict, query_par
             if not db_id or not host_port:
                 continue
             grouped.setdefault(acct, {})[db_id] = {
-                "host_port": host_port,
-                "endpoint_address": endpoint.get("Address"),
-                "endpoint_port": endpoint.get("Port"),
+                "host": {
+                    "address": _MINISTACK_HOST,
+                    "port": host_port,
+                },
+                "container": {
+                    "address": endpoint.get("Address"),
+                    "port": endpoint.get("Port"),
+                },
                 "engine": inst.get("Engine"),
                 "status": inst.get("DBInstanceStatus"),
             }
@@ -952,9 +957,14 @@ async def _handle_ports_request(method: str, path: str, headers: dict, query_par
             ep = cl.get("_endpoint", {})
             if host_port:
                 clusters_grouped.setdefault(acct, {})[cluster_id] = {
-                    "host_port": host_port,
-                    "endpoint_address": ep.get("Address"),
-                    "endpoint_port": ep.get("Port"),
+                    "host": {
+                        "address": _MINISTACK_HOST,
+                        "port": host_port,
+                    },
+                    "container": {
+                        "address": ep.get("Address"),
+                        "port": ep.get("Port"),
+                    },
                     "engine": cl.get("Engine"),
                     "status": cl.get("CacheClusterStatus"),
                 }
@@ -967,9 +977,14 @@ async def _handle_ports_request(method: str, path: str, headers: dict, query_par
                 primary = ng.get("PrimaryEndpoint", {})
                 if ng_id and host_port:
                     rg_ports[ng_id] = {
-                        "host_port": host_port,
-                        "endpoint_address": primary.get("Address"),
-                        "endpoint_port": primary.get("Port"),
+                        "host": {
+                            "address": _MINISTACK_HOST,
+                            "port": host_port,
+                        },
+                        "container": {
+                            "address": primary.get("Address"),
+                            "port": primary.get("Port"),
+                        },
                     }
             if rg_ports:
                 rg_grouped.setdefault(acct, {})[rg_id] = rg_ports
