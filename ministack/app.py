@@ -839,7 +839,7 @@ async def _handle_pre_body_request(method: str, path: str, headers: dict, query_
     response = await _handle_ses_messages_request(method, path, headers, query_params)
     if response is not None:
         return response
-     
+
     response = await _handle_sqs_messages_request(method, path, headers, query_params)
     if response is not None:
         return response
