@@ -4436,7 +4436,11 @@ def test_dynamodb_batch_execute_statement_partial_failure(ddb):
         ])
         # The whole batch returns 200 with per-statement results.
         assert len(r["Responses"]) == 2
-        assert r["Responses"][0].get("Error", {}).get("Code") == "DuplicateItemException"
+        # Per AWS BatchStatementErrorCodeEnum the per-statement error code
+        # for a duplicate INSERT is the bare ``DuplicateItem`` (no Exception
+        # suffix). Mismatch caught when this test ran against the
+        # AWS-canonical strip in _batch_execute_statement.
+        assert r["Responses"][0].get("Error", {}).get("Code") == "DuplicateItem"
         assert "Error" not in r["Responses"][1]
         # Confirm "b" landed.
         got = ddb.get_item(TableName=name, Key={"pk": {"S": "b"}})

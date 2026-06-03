@@ -269,6 +269,34 @@ _identity_tags = AccountScopedDict()   # identity_pool_id -> {key: value}
 _auth_codes = {}   # code -> {pool_id, client_id, username, redirect_uri, scopes, state, created_at}
 _AUTH_CODE_TTL = 300  # 5 minutes
 
+# ---------------------------------------------------------------------------
+# In-memory state — CUSTOM_AUTH Challenge Sessions
+# ---------------------------------------------------------------------------
+
+_challenge_sessions = AccountScopedDict()
+# token (base64-encoded session token, opaque to client) -> {
+#   'pool_id': str,
+#   'client_id': str,
+#   'username': str,
+#   'created_at': float (epoch seconds),
+#   'expires_at': float (epoch seconds),
+#   'challenges': [
+#     {
+#       'challengeName': 'CUSTOM_CHALLENGE',
+#       'challengeResult': bool | None,   # None = pending (not yet verified)
+#       'challengeMetadata': str | None,  # 'MAGIC_LINK', 'SMS_OTP', etc.
+#       'publicChallengeParameters': dict,
+#       'privateChallengeParameters': dict,
+#       'timestamp': float,
+#     },
+#     ...
+#   ],
+#   'last_challenge_metadata': str | None,
+# }
+
+_CHALLENGE_SESSION_TTL = 3600  # fallback only — see _create_challenge_session for TTL from client config
+_MAX_CHALLENGE_ATTEMPTS = 3    # AWS parity — terminate CUSTOM_AUTH after 3 answered rounds
+
 
 # ── Persistence ────────────────────────────────────────────
 
@@ -281,6 +309,7 @@ def get_state():
         "authorization_codes": copy.deepcopy(_authorization_codes),
         "refresh_tokens": copy.deepcopy(_refresh_tokens),
         "auth_codes": copy.deepcopy(_auth_codes),
+        "challenge_sessions": copy.deepcopy(_challenge_sessions),
     }
 
 
@@ -293,6 +322,7 @@ def restore_state(data):
         _authorization_codes.update(data.get("authorization_codes", {}))
         _refresh_tokens.update(data.get("refresh_tokens", {}))
         _auth_codes.update(data.get("auth_codes", {}))
+        _challenge_sessions.update(data.get("challenge_sessions", {}))
 
 
 try:
@@ -703,6 +733,380 @@ def _merge_attributes(existing: list, updates: list) -> list:
     d = _attr_list_to_dict(existing)
     d.update(_attr_list_to_dict(updates))
     return _dict_to_attr_list(d)
+
+
+# ---------------------------------------------------------------------------
+# CUSTOM_AUTH Challenge Session Helpers (Phase 2)
+# ---------------------------------------------------------------------------
+
+def _create_challenge_session(pool_id: str, client_id: str, username: str) -> tuple:
+    """Create a new challenge session and return (token, session).
+    
+    Args:
+        pool_id: User pool ID
+        client_id: Client/App ID
+        username: Authenticated username
+        
+    Returns:
+        (token: str, session: dict)
+    """
+    token = base64.b64encode(secrets.token_bytes(32)).decode()
+    now = time.time()
+    
+    # Compute TTL from client's AuthSessionValidity (in minutes), falling back to _CHALLENGE_SESSION_TTL
+    pool = _user_pools.get(pool_id)
+    client = (pool or {}).get("_clients", {}).get(client_id, {})
+    ttl = client.get("AuthSessionValidity", 3) * 60  # AuthSessionValidity is in minutes
+    
+    session = {
+        "pool_id": pool_id,
+        "client_id": client_id,
+        "username": username,
+        "created_at": now,
+        "expires_at": now + ttl,
+        "challenges": [],
+        "last_challenge_metadata": None,
+    }
+    _challenge_sessions[token] = session
+    return (token, session)
+
+
+def _get_challenge_session(token: str) -> tuple:
+    """Retrieve a challenge session from storage.
+    
+    Args:
+        token: Session token (base64-encoded)
+        
+    Returns:
+        (session: dict | None, error_str: str | None)
+    """
+    session = _challenge_sessions.get(token)
+    if session is None:
+        return (None, "InvalidParameterException: Session does not exist")
+    
+    if time.time() > session["expires_at"]:
+        del _challenge_sessions[token]
+        return (None, "NotAuthorizedException: Session has expired")
+    
+    return (session, None)
+
+
+def _append_challenge_to_session(session: dict, challenge_name: str,
+                                 challenge_result: bool | None,
+                                 challenge_metadata: str | None,
+                                 public_params: dict | None,
+                                 private_params: dict | None) -> None:
+    """Append a challenge record to a session's challenge history.
+    
+    Args:
+        session: The session dict
+        challenge_name: Challenge name (e.g., 'CUSTOM_CHALLENGE')
+        challenge_result: None (pending), True (correct), or False (incorrect)
+        challenge_metadata: Metadata string (e.g., 'MAGIC_LINK')
+        public_params: Public challenge parameters dict
+        private_params: Private challenge parameters dict
+    """
+    session["challenges"].append({
+        "challengeName": challenge_name,
+        "challengeResult": challenge_result,
+        "challengeMetadata": challenge_metadata,
+        "publicChallengeParameters": public_params or {},
+        "privateChallengeParameters": private_params or {},
+        "timestamp": time.time(),
+    })
+    session["last_challenge_metadata"] = challenge_metadata
+
+
+def _build_session_list(session: dict) -> list:
+    """Build the session list for Lambda events (challenge history).
+    
+    Args:
+        session: The session dict
+        
+    Returns:
+        List of challenge records (challengeName, challengeMetadata, challengeResult)
+    """
+    return [
+        {
+            "challengeName": c["challengeName"],
+            "challengeMetadata": c["challengeMetadata"],
+            "challengeResult": c["challengeResult"],
+        }
+        for c in session["challenges"]
+    ]
+
+
+# ---------------------------------------------------------------------------
+# CUSTOM_AUTH Lambda Trigger Event Builders (Phase 3)
+# ---------------------------------------------------------------------------
+
+def _build_define_auth_challenge_event(pool_id: str, client_id: str, username: str,
+                                       user_attrs: dict, session: dict) -> dict:
+    """Build DefineAuthChallenge Lambda event.
+    
+    Called at both InitiateAuth and RespondToAuthChallenge to determine
+    the next step in the authentication flow.
+    """
+    return {
+        "version": "1",
+        "triggerSource": "DefineAuthChallenge_Authentication",
+        "region": _pool_region(pool_id),
+        "userPoolId": pool_id,
+        "userName": username,
+        "callerContext": {
+            "awsSdkVersion": "ministack",
+            "clientId": client_id,
+        },
+        "request": {
+            "userAttributes": user_attrs or {},
+            "session": _build_session_list(session),
+            "userNotFound": False,
+            "clientMetadata": {},
+        },
+        "response": {
+            "challengeName": None,
+            "issueTokens": False,
+            "failAuthentication": False,
+        },
+    }
+
+
+def _build_create_auth_challenge_event(pool_id: str, client_id: str, username: str,
+                                       user_attrs: dict, session: dict,
+                                       client_metadata: dict) -> dict:
+    """Build CreateAuthChallenge Lambda event.
+    
+    Called to generate the challenge (e.g., magic link, SMS OTP) that is sent
+    to the user.
+    """
+    return {
+        "version": "1",
+        "triggerSource": "CreateAuthChallenge_Authentication",
+        "region": _pool_region(pool_id),
+        "userPoolId": pool_id,
+        "userName": username,
+        "callerContext": {
+            "awsSdkVersion": "ministack",
+            "clientId": client_id,
+        },
+        "request": {
+            "userAttributes": user_attrs or {},
+            "challengeName": "CUSTOM_CHALLENGE",
+            "session": _build_session_list(session),
+            "userNotFound": False,
+            "clientMetadata": client_metadata or {},
+        },
+        "response": {
+            "publicChallengeParameters": None,
+            "privateChallengeParameters": None,
+            "challengeMetadata": None,
+        },
+    }
+
+
+def _build_verify_auth_challenge_event(pool_id: str, client_id: str, username: str,
+                                       user_attrs: dict, session: dict,
+                                       challenge_answer: str,
+                                       client_metadata: dict) -> dict:
+    """Build VerifyAuthChallengeResponse Lambda event.
+    
+    Called to verify the challenge response (e.g., validate the magic link token
+    or SMS OTP).
+    """
+    last = session["challenges"][-1] if session["challenges"] else {}
+    return {
+        "version": "1",
+        "triggerSource": "VerifyAuthChallengeResponse_Authentication",
+        "region": _pool_region(pool_id),
+        "userPoolId": pool_id,
+        "userName": username,
+        "callerContext": {
+            "awsSdkVersion": "ministack",
+            "clientId": client_id,
+        },
+        "request": {
+            "userAttributes": user_attrs or {},
+            "challengeName": "CUSTOM_CHALLENGE",
+            "session": _build_session_list(session),
+            "userNotFound": False,
+            "challengeAnswer": challenge_answer,
+            "publicChallengeParameters": last.get("publicChallengeParameters", {}),
+            "privateChallengeParameters": last.get("privateChallengeParameters", {}),
+            "clientMetadata": client_metadata or {},
+        },
+        "response": {
+            "answerCorrect": None,
+        },
+    }
+
+
+# ---------------------------------------------------------------------------
+# CUSTOM_AUTH Lambda Invocation Wrappers (Phase 4)
+# ---------------------------------------------------------------------------
+
+
+
+
+def _invoke_define_auth_challenge_trigger(pool_id: str, client_id: str, username: str,
+                                          user_attrs: dict, session: dict) -> tuple:
+    """Invoke DefineAuthChallenge Lambda trigger.
+    
+    Returns:
+        (payload_dict | None, error_response | None)
+    """
+    pool = _user_pools.get(pool_id)
+    if pool is None:
+        return (None, None)
+    
+    arn = (pool.get("LambdaConfig") or {}).get("DefineAuthChallenge")
+    if not arn:
+        return (None, None)
+    
+    event = _build_define_auth_challenge_event(pool_id, client_id, username, user_attrs, session)
+    
+    try:
+        from ministack.services import lambda_svc
+        name, qualifier = lambda_svc._resolve_name_and_qualifier(arn)
+        record, _ = lambda_svc._get_func_record_for_qualifier(name, qualifier)
+        if record is None:
+            return (None, error_response_json("InvalidLambdaResponseException",
+                    f"DefineAuthChallenge Lambda not found: {arn}", 400))
+        result = lambda_svc._execute_function(record, event)
+    except Exception as e:
+        return (None, error_response_json("InvalidLambdaResponseException",
+                f"DefineAuthChallenge invocation failed: {str(e)}", 400))
+    
+    if result.get("error"):
+        return (None, error_response_json("InvalidLambdaResponseException",
+                f"DefineAuthChallenge returned error: {str(result.get('body', ''))}", 400))
+    
+    body = result.get("body")
+    if body is None:
+        return (None, error_response_json("InvalidLambdaResponseException",
+                "DefineAuthChallenge returned null body", 400))
+    
+    if isinstance(body, (str, bytes)):
+        try:
+            body = json.loads(body)
+        except (ValueError, TypeError):
+            return (None, error_response_json("InvalidLambdaResponseException",
+                    "DefineAuthChallenge returned invalid JSON", 400))
+    
+    if not isinstance(body, dict):
+        return (None, error_response_json("InvalidLambdaResponseException",
+                "DefineAuthChallenge returned unexpected body type", 400))
+    
+    return (body, None)
+
+
+def _invoke_create_auth_challenge_trigger(pool_id: str, client_id: str, username: str,
+                                          user_attrs: dict, session: dict,
+                                          client_metadata: dict) -> tuple:
+    """Invoke CreateAuthChallenge Lambda trigger.
+    
+    Returns:
+        (payload_dict | None, error_response | None)
+    """
+    pool = _user_pools.get(pool_id)
+    if pool is None:
+        return (None, None)
+    
+    arn = (pool.get("LambdaConfig") or {}).get("CreateAuthChallenge")
+    if not arn:
+        return (None, None)
+    
+    event = _build_create_auth_challenge_event(pool_id, client_id, username,
+                                               user_attrs, session, client_metadata)
+    
+    try:
+        from ministack.services import lambda_svc
+        name, qualifier = lambda_svc._resolve_name_and_qualifier(arn)
+        record, _ = lambda_svc._get_func_record_for_qualifier(name, qualifier)
+        if record is None:
+            return (None, error_response_json("InvalidLambdaResponseException",
+                    f"CreateAuthChallenge Lambda not found: {arn}", 400))
+        result = lambda_svc._execute_function(record, event)
+    except Exception as e:
+        return (None, error_response_json("InvalidLambdaResponseException",
+                f"CreateAuthChallenge invocation failed: {str(e)}", 400))
+    
+    if result.get("error"):
+        return (None, error_response_json("InvalidLambdaResponseException",
+                f"CreateAuthChallenge returned error: {str(result.get('body', ''))}", 400))
+    
+    body = result.get("body")
+    if body is None:
+        return (None, error_response_json("InvalidLambdaResponseException",
+                "CreateAuthChallenge returned null body", 400))
+    
+    if isinstance(body, (str, bytes)):
+        try:
+            body = json.loads(body)
+        except (ValueError, TypeError):
+            return (None, error_response_json("InvalidLambdaResponseException",
+                    "CreateAuthChallenge returned invalid JSON", 400))
+    
+    if not isinstance(body, dict):
+        return (None, error_response_json("InvalidLambdaResponseException",
+                "CreateAuthChallenge returned unexpected body type", 400))
+    
+    return (body, None)
+
+
+def _invoke_verify_auth_challenge_trigger(pool_id: str, client_id: str, username: str,
+                                          user_attrs: dict, session: dict,
+                                          challenge_answer: str,
+                                          client_metadata: dict) -> tuple:
+    """Invoke VerifyAuthChallengeResponse Lambda trigger.
+    
+    Returns:
+        (payload_dict | None, error_response | None)
+    """
+    pool = _user_pools.get(pool_id)
+    if pool is None:
+        return (None, None)
+    
+    arn = (pool.get("LambdaConfig") or {}).get("VerifyAuthChallengeResponse")
+    if not arn:
+        return (None, None)
+    
+    event = _build_verify_auth_challenge_event(pool_id, client_id, username,
+                                               user_attrs, session,
+                                               challenge_answer, client_metadata)
+    
+    try:
+        from ministack.services import lambda_svc
+        name, qualifier = lambda_svc._resolve_name_and_qualifier(arn)
+        record, _ = lambda_svc._get_func_record_for_qualifier(name, qualifier)
+        if record is None:
+            return (None, error_response_json("InvalidLambdaResponseException",
+                    f"VerifyAuthChallengeResponse Lambda not found: {arn}", 400))
+        result = lambda_svc._execute_function(record, event)
+    except Exception as e:
+        return (None, error_response_json("InvalidLambdaResponseException",
+                f"VerifyAuthChallengeResponse invocation failed: {str(e)}", 400))
+    
+    if result.get("error"):
+        return (None, error_response_json("InvalidLambdaResponseException",
+                f"VerifyAuthChallengeResponse returned error: {str(result.get('body', ''))}", 400))
+    
+    body = result.get("body")
+    if body is None:
+        return (None, error_response_json("InvalidLambdaResponseException",
+                "VerifyAuthChallengeResponse returned null body", 400))
+    
+    if isinstance(body, (str, bytes)):
+        try:
+            body = json.loads(body)
+        except (ValueError, TypeError):
+            return (None, error_response_json("InvalidLambdaResponseException",
+                    "VerifyAuthChallengeResponse returned invalid JSON", 400))
+    
+    if not isinstance(body, dict):
+        return (None, error_response_json("InvalidLambdaResponseException",
+                "VerifyAuthChallengeResponse returned unexpected body type", 400))
+    
+    return (body, None)
 
 
 # ---------------------------------------------------------------------------
@@ -1851,6 +2255,98 @@ def _admin_initiate_auth(data):
         result.pop("RefreshToken", None)  # AWS doesn't return a new refresh token here
         return json_response({"AuthenticationResult": result})
 
+    if auth_flow == "CUSTOM_AUTH":
+        # Validate ExplicitAuthFlows
+        client = pool["_clients"].get(cid, {})
+        if "ALLOW_CUSTOM_AUTH" not in client.get("ExplicitAuthFlows", []):
+            return error_response_json("InvalidParameterException",
+                    "CUSTOM_AUTH flow not allowed for this client.", 400)
+
+        # Get username
+        username = auth_params.get("USERNAME")
+        if not username:
+            return error_response_json("InvalidParameterException",
+                    "USERNAME is required.", 400)
+
+        # Validate user
+        user, err = _resolve_user(pool, username)
+        if err:
+            return err
+        if not user.get("Enabled", True):
+            return error_response_json("NotAuthorizedException",
+                    "User is disabled.", 400)
+
+        # Extract ClientMetadata (top-level field, NOT inside AuthParameters)
+        client_metadata = data.get("ClientMetadata", {})
+
+        # Build user_attrs dict
+        user_attrs = _attr_list_to_dict(user.get("Attributes", []))
+
+        # Create session
+        token, session = _create_challenge_session(pid, cid, username)
+
+        # Invoke DefineAuthChallenge first
+        define_result, err = _invoke_define_auth_challenge_trigger(
+            pid, cid, username, user_attrs, session
+        )
+        if err:
+            del _challenge_sessions[token]
+            return err
+
+        # Evaluate Define result before proceeding to Create
+        if define_result is not None:
+            resp = define_result.get("response", {}) or {}
+            if resp.get("failAuthentication"):
+                del _challenge_sessions[token]
+                return error_response_json("NotAuthorizedException", "Authentication failed", 400)
+            if resp.get("issueTokens"):
+                del _challenge_sessions[token]
+                return json_response({"AuthenticationResult": _build_auth_result(pid, cid, user)})
+            if not resp.get("challengeName"):
+                del _challenge_sessions[token]
+                return error_response_json("InvalidLambdaResponseException",
+                    "DefineAuthChallenge returned unexpected response — not issuing tokens, "
+                    "not failing auth, and no challengeName set", 400)
+
+        # Add a pending challenge to session before checking if define/create need to happen
+        _append_challenge_to_session(session, "CUSTOM_CHALLENGE", None, None, {}, {})
+
+        # Invoke CreateAuthChallenge
+        create_result, err = _invoke_create_auth_challenge_trigger(
+            pid, cid, username, user_attrs, session, client_metadata
+        )
+        if err:
+            del _challenge_sessions[token]
+            return err
+
+        # Extract challenge parameters
+        if create_result is not None:
+            public_params = (create_result.get("response", {}) or {}).get("publicChallengeParameters") or {}
+            private_params = (create_result.get("response", {}) or {}).get("privateChallengeParameters") or {}
+            challenge_metadata = (create_result.get("response", {}) or {}).get("challengeMetadata")
+        else:
+            # Default: PROVIDE_AUTH_PARAMETERS — private MUST mirror public so a Verify
+            # Lambda can detect this round via privateChallengeParameters['challenge'].
+            public_params = {"challenge": "PROVIDE_AUTH_PARAMETERS"}
+            private_params = {"challenge": "PROVIDE_AUTH_PARAMETERS"}
+            challenge_metadata = None
+
+        # Update session with challenge parameters
+        if session["challenges"]:
+            session["challenges"][-1].update({
+                "publicChallengeParameters": public_params,
+                "privateChallengeParameters": private_params,
+                "challengeMetadata": challenge_metadata or session["challenges"][-1].get("challengeMetadata"),
+            })
+            session["last_challenge_metadata"] = challenge_metadata
+
+        # Return challenge to client
+        return json_response({
+            "ChallengeName": "CUSTOM_CHALLENGE",
+            "Session": token,
+            "ChallengeParameters": public_params,
+        })
+
     return error_response_json("InvalidParameterException", f"Unsupported AuthFlow: {auth_flow}", 400)
 
 
@@ -1863,6 +2359,137 @@ def _admin_respond_to_auth_challenge(data):
 
     challenge_name = data.get("ChallengeName", "")
     responses = data.get("ChallengeResponses", {})
+
+    if challenge_name == "CUSTOM_CHALLENGE":
+        # Extract parameters
+        token = data.get("Session")
+        challenge_answer = responses.get("ANSWER", "")
+        client_metadata = data.get("ClientMetadata", {})
+
+        # Validate session
+        session, err = _get_challenge_session(token)
+        if err:
+            # Parse the error from the helper
+            if "Session does not exist" in err:
+                return error_response_json("InvalidParameterException",
+                        "Session does not exist", 400)
+            elif "expired" in err.lower():
+                return error_response_json("NotAuthorizedException",
+                        "Session has expired", 400)
+            return error_response_json("InvalidParameterException", err, 400)
+
+        # Re-resolve pool and user
+        pool = _user_pools.get(session["pool_id"])
+        if not pool:
+            return error_response_json("ResourceNotFoundException",
+                    f"Pool {session['pool_id']} not found.", 400)
+        
+        user, err = _resolve_user(pool, session["username"])
+        if err:
+            del _challenge_sessions[token]
+            return err
+
+        user_attrs = _attr_list_to_dict(user.get("Attributes", []))
+
+        # Invoke VerifyAuthChallenge
+        verify_result, err = _invoke_verify_auth_challenge_trigger(
+            session["pool_id"], session["client_id"], session["username"],
+            user_attrs, session, challenge_answer, client_metadata
+        )
+        if err:
+            return err
+
+        # Determine answer_correct
+        if verify_result is not None:
+            answer_correct = bool((verify_result.get("response", {}) or {}).get("answerCorrect", False))
+        else:
+            # No Lambda configured — auto-fail (caller must provide answer)
+            answer_correct = False
+
+        # Append verify result to session
+        _append_challenge_to_session(session, "CUSTOM_CHALLENGE", answer_correct, None, {}, {})
+
+        # Invoke DefineAuthChallenge (evaluates full session history)
+        define_result, err = _invoke_define_auth_challenge_trigger(
+            session["pool_id"], session["client_id"], session["username"],
+            user_attrs, session
+        )
+        if err:
+            return err
+
+        # Determine next action from DefineAuth response
+        if define_result is None:
+            # No Lambda configured — auto-fail
+            del _challenge_sessions[token]
+            return error_response_json("NotAuthorizedException",
+                    "Incorrect username or password", 400)
+
+        define_resp = (define_result.get("response") or {})
+        
+        # Check failAuthentication flag
+        if define_resp.get("failAuthentication"):
+            del _challenge_sessions[token]
+            return error_response_json("NotAuthorizedException",
+                    "Incorrect username or password", 400)
+
+        # Check issueTokens FIRST — a correct answer on the Nth attempt must
+        # issue tokens even when N == MAX_CHALLENGE_ATTEMPTS. The cap is
+        # meant to prevent a NEXT (e.g. 4th) round of CreateAuthChallenge,
+        # not penalize success on the boundary attempt.
+        if define_resp.get("issueTokens"):
+            del _challenge_sessions[token]
+            return json_response({"AuthenticationResult": _build_auth_result(
+                session["pool_id"], session["client_id"], user
+            )})
+
+        # Enforce the max challenge-attempts ceiling (AWS parity — issue #725 step 4).
+        # Applied only after issueTokens has been ruled out so a correct
+        # answer on the cap-boundary attempt isn't silently rejected.
+        answered_count = sum(1 for c in session["challenges"]
+                            if c.get("challengeResult") is not None)
+        if answered_count >= _MAX_CHALLENGE_ATTEMPTS:
+            del _challenge_sessions[token]
+            return error_response_json("NotAuthorizedException",
+                    "Max authentication attempts exceeded", 400)
+
+        # Determine next challenge
+        next_challenge = define_resp.get("challengeName")
+        if next_challenge == "CUSTOM_CHALLENGE":
+            # Invoke CreateAuthChallenge for the next round
+            create_result, err = _invoke_create_auth_challenge_trigger(
+                session["pool_id"], session["client_id"], session["username"],
+                user_attrs, session, client_metadata
+            )
+            if err:
+                return err
+
+            # Extract challenge parameters
+            if create_result is not None:
+                public_params = (create_result.get("response", {}) or {}).get("publicChallengeParameters") or {}
+                private_params = (create_result.get("response", {}) or {}).get("privateChallengeParameters") or {}
+                challenge_metadata = (create_result.get("response", {}) or {}).get("challengeMetadata")
+            else:
+                # Default: PROVIDE_AUTH_PARAMETERS — private MUST mirror public so a Verify
+                # Lambda can detect this round via privateChallengeParameters['challenge'].
+                public_params = {"challenge": "PROVIDE_AUTH_PARAMETERS"}
+                private_params = {"challenge": "PROVIDE_AUTH_PARAMETERS"}
+                challenge_metadata = None
+
+            # Append new pending challenge to session
+            _append_challenge_to_session(session, "CUSTOM_CHALLENGE", None, challenge_metadata,
+                                        public_params, private_params)
+
+            # Return challenge to client
+            return json_response({
+                "ChallengeName": "CUSTOM_CHALLENGE",
+                "Session": token,
+                "ChallengeParameters": public_params,
+            })
+        else:
+            # DefineAuth returned something unexpected — all flags false, no challengeName
+            del _challenge_sessions[token]  # clear to prevent infinite loop
+            return error_response_json("InvalidLambdaResponseException",
+                    "DefineAuthChallenge response invalid", 400)
 
     if challenge_name == "NEW_PASSWORD_REQUIRED":
         username = responses.get("USERNAME")
@@ -1974,6 +2601,98 @@ def _initiate_auth(data):
             },
         })
 
+    if auth_flow == "CUSTOM_AUTH":
+        # Validate ExplicitAuthFlows
+        client = pool["_clients"].get(cid, {})
+        if "ALLOW_CUSTOM_AUTH" not in client.get("ExplicitAuthFlows", []):
+            return error_response_json("InvalidParameterException",
+                    "CUSTOM_AUTH flow not allowed for this client.", 400)
+
+        # Get username
+        username = auth_params.get("USERNAME")
+        if not username:
+            return error_response_json("InvalidParameterException",
+                    "USERNAME is required.", 400)
+
+        # Validate user
+        user, err = _resolve_user(pool, username)
+        if err:
+            return err
+        if not user.get("Enabled", True):
+            return error_response_json("NotAuthorizedException",
+                    "User is disabled.", 400)
+
+        # Extract ClientMetadata (top-level field, NOT inside AuthParameters)
+        client_metadata = data.get("ClientMetadata", {})
+
+        # Build user_attrs dict
+        user_attrs = _attr_list_to_dict(user.get("Attributes", []))
+
+        # Create session
+        token, session = _create_challenge_session(pid, cid, username)
+
+        # Invoke DefineAuthChallenge first
+        define_result, err = _invoke_define_auth_challenge_trigger(
+            pid, cid, username, user_attrs, session
+        )
+        if err:
+            del _challenge_sessions[token]
+            return err
+
+        # Evaluate Define result before proceeding to Create
+        if define_result is not None:
+            resp = define_result.get("response", {}) or {}
+            if resp.get("failAuthentication"):
+                del _challenge_sessions[token]
+                return error_response_json("NotAuthorizedException", "Authentication failed", 400)
+            if resp.get("issueTokens"):
+                del _challenge_sessions[token]
+                return json_response({"AuthenticationResult": _build_auth_result(pid, cid, user)})
+            if not resp.get("challengeName"):
+                del _challenge_sessions[token]
+                return error_response_json("InvalidLambdaResponseException",
+                    "DefineAuthChallenge returned unexpected response — not issuing tokens, "
+                    "not failing auth, and no challengeName set", 400)
+
+        # Add a pending challenge to session before checking if define/create need to happen
+        _append_challenge_to_session(session, "CUSTOM_CHALLENGE", None, None, {}, {})
+
+        # Invoke CreateAuthChallenge
+        create_result, err = _invoke_create_auth_challenge_trigger(
+            pid, cid, username, user_attrs, session, client_metadata
+        )
+        if err:
+            del _challenge_sessions[token]
+            return err
+
+        # Extract challenge parameters
+        if create_result is not None:
+            public_params = (create_result.get("response", {}) or {}).get("publicChallengeParameters") or {}
+            private_params = (create_result.get("response", {}) or {}).get("privateChallengeParameters") or {}
+            challenge_metadata = (create_result.get("response", {}) or {}).get("challengeMetadata")
+        else:
+            # Default: PROVIDE_AUTH_PARAMETERS — private MUST mirror public so a Verify
+            # Lambda can detect this round via privateChallengeParameters['challenge'].
+            public_params = {"challenge": "PROVIDE_AUTH_PARAMETERS"}
+            private_params = {"challenge": "PROVIDE_AUTH_PARAMETERS"}
+            challenge_metadata = None
+
+        # Update session with challenge parameters
+        if session["challenges"]:
+            session["challenges"][-1].update({
+                "publicChallengeParameters": public_params,
+                "privateChallengeParameters": private_params,
+                "challengeMetadata": challenge_metadata or session["challenges"][-1].get("challengeMetadata"),
+            })
+            session["last_challenge_metadata"] = challenge_metadata
+
+        # Return challenge to client
+        return json_response({
+            "ChallengeName": "CUSTOM_CHALLENGE",
+            "Session": token,
+            "ChallengeParameters": public_params,
+        })
+
     return error_response_json("InvalidParameterException", f"Unsupported AuthFlow: {auth_flow}", 400)
 
 
@@ -1991,6 +2710,137 @@ def _respond_to_auth_challenge(data):
             break
     if not pool:
         return error_response_json("ResourceNotFoundException", f"Client {cid} not found.", 400)
+
+    if challenge_name == "CUSTOM_CHALLENGE":
+        # Extract parameters
+        token = data.get("Session")
+        challenge_answer = responses.get("ANSWER", "")
+        client_metadata = data.get("ClientMetadata", {})
+
+        # Validate session
+        session, err = _get_challenge_session(token)
+        if err:
+            # Parse the error from the helper
+            if "Session does not exist" in err:
+                return error_response_json("InvalidParameterException",
+                        "Session does not exist", 400)
+            elif "expired" in err.lower():
+                return error_response_json("NotAuthorizedException",
+                        "Session has expired", 400)
+            return error_response_json("InvalidParameterException", err, 400)
+
+        # Re-resolve pool and user
+        pool = _user_pools.get(session["pool_id"])
+        if not pool:
+            return error_response_json("ResourceNotFoundException",
+                    f"Pool {session['pool_id']} not found.", 400)
+        
+        user, err = _resolve_user(pool, session["username"])
+        if err:
+            del _challenge_sessions[token]
+            return err
+
+        user_attrs = _attr_list_to_dict(user.get("Attributes", []))
+
+        # Invoke VerifyAuthChallenge
+        verify_result, err = _invoke_verify_auth_challenge_trigger(
+            session["pool_id"], session["client_id"], session["username"],
+            user_attrs, session, challenge_answer, client_metadata
+        )
+        if err:
+            return err
+
+        # Determine answer_correct
+        if verify_result is not None:
+            answer_correct = bool((verify_result.get("response", {}) or {}).get("answerCorrect", False))
+        else:
+            # No Lambda configured — auto-fail (caller must provide answer)
+            answer_correct = False
+
+        # Append verify result to session
+        _append_challenge_to_session(session, "CUSTOM_CHALLENGE", answer_correct, None, {}, {})
+
+        # Invoke DefineAuthChallenge (evaluates full session history)
+        define_result, err = _invoke_define_auth_challenge_trigger(
+            session["pool_id"], session["client_id"], session["username"],
+            user_attrs, session
+        )
+        if err:
+            return err
+
+        # Determine next action from DefineAuth response
+        if define_result is None:
+            # No Lambda configured — auto-fail
+            del _challenge_sessions[token]
+            return error_response_json("NotAuthorizedException",
+                    "Incorrect username or password", 400)
+
+        define_resp = (define_result.get("response") or {})
+        
+        # Check failAuthentication flag
+        if define_resp.get("failAuthentication"):
+            del _challenge_sessions[token]
+            return error_response_json("NotAuthorizedException",
+                    "Incorrect username or password", 400)
+
+        # Check issueTokens FIRST — a correct answer on the Nth attempt must
+        # issue tokens even when N == MAX_CHALLENGE_ATTEMPTS. The cap is
+        # meant to prevent a NEXT (e.g. 4th) round of CreateAuthChallenge,
+        # not penalize success on the boundary attempt.
+        if define_resp.get("issueTokens"):
+            del _challenge_sessions[token]
+            return json_response({"AuthenticationResult": _build_auth_result(
+                session["pool_id"], session["client_id"], user
+            )})
+
+        # Enforce the max challenge-attempts ceiling (AWS parity — issue #725 step 4).
+        # Applied only after issueTokens has been ruled out so a correct
+        # answer on the cap-boundary attempt isn't silently rejected.
+        answered_count = sum(1 for c in session["challenges"]
+                            if c.get("challengeResult") is not None)
+        if answered_count >= _MAX_CHALLENGE_ATTEMPTS:
+            del _challenge_sessions[token]
+            return error_response_json("NotAuthorizedException",
+                    "Max authentication attempts exceeded", 400)
+
+        # Determine next challenge
+        next_challenge = define_resp.get("challengeName")
+        if next_challenge == "CUSTOM_CHALLENGE":
+            # Invoke CreateAuthChallenge for the next round
+            create_result, err = _invoke_create_auth_challenge_trigger(
+                session["pool_id"], session["client_id"], session["username"],
+                user_attrs, session, client_metadata
+            )
+            if err:
+                return err
+
+            # Extract challenge parameters
+            if create_result is not None:
+                public_params = (create_result.get("response", {}) or {}).get("publicChallengeParameters") or {}
+                private_params = (create_result.get("response", {}) or {}).get("privateChallengeParameters") or {}
+                challenge_metadata = (create_result.get("response", {}) or {}).get("challengeMetadata")
+            else:
+                # Default: PROVIDE_AUTH_PARAMETERS — private MUST mirror public so a Verify
+                # Lambda can detect this round via privateChallengeParameters['challenge'].
+                public_params = {"challenge": "PROVIDE_AUTH_PARAMETERS"}
+                private_params = {"challenge": "PROVIDE_AUTH_PARAMETERS"}
+                challenge_metadata = None
+
+            # Append new pending challenge to session
+            _append_challenge_to_session(session, "CUSTOM_CHALLENGE", None, challenge_metadata,
+                                        public_params, private_params)
+
+            # Return challenge to client
+            return json_response({
+                "ChallengeName": "CUSTOM_CHALLENGE",
+                "Session": token,
+                "ChallengeParameters": public_params,
+            })
+        else:
+            # DefineAuth returned something unexpected — all flags false, no challengeName
+            del _challenge_sessions[token]  # clear to prevent infinite loop
+            return error_response_json("InvalidLambdaResponseException",
+                    "DefineAuthChallenge response invalid", 400)
 
     if challenge_name in ("NEW_PASSWORD_REQUIRED", "PASSWORD_VERIFIER"):
         username = responses.get("USERNAME")

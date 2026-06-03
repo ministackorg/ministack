@@ -473,3 +473,184 @@ def test_eks_oidc_discovery_document(eks):
     finally:
         try: eks.delete_cluster(name=cn)
         except Exception: pass
+
+
+# ---------------------------------------------------------------------------
+# Access Entries — modern EKS IAM bindings (replace aws-auth ConfigMap).
+# Crossplane / Terraform `aws_eks_access_entry` + `aws_eks_access_policy_association`
+# both flow through these APIs.
+# ---------------------------------------------------------------------------
+
+
+def _create_basic_cluster(eks):
+    cn = f"ae-{_uid()}"
+    eks.create_cluster(
+        name=cn, roleArn="arn:aws:iam::000000000000:role/eks",
+        resourcesVpcConfig={"subnetIds": ["subnet-1"]},
+    )
+    return cn
+
+
+def test_eks_access_entry_create_describe_delete(eks):
+    cn = _create_basic_cluster(eks)
+    principal = f"arn:aws:iam::000000000000:user/test-{_uid()}"
+    try:
+        resp = eks.create_access_entry(
+            clusterName=cn, principalArn=principal,
+            kubernetesGroups=["admins"], username="admin",
+            type="STANDARD",
+        )
+        ae = resp["accessEntry"]
+        assert ae["clusterName"] == cn
+        assert ae["principalArn"] == principal
+        assert ae["kubernetesGroups"] == ["admins"]
+        assert ae["username"] == "admin"
+        assert ae["type"] == "STANDARD"
+        assert ae["accessEntryArn"].startswith(
+            f"arn:aws:eks:{REGION}:")
+
+        desc = eks.describe_access_entry(
+            clusterName=cn, principalArn=principal)["accessEntry"]
+        assert desc["principalArn"] == principal
+
+        # Delete returns empty body.
+        eks.delete_access_entry(clusterName=cn, principalArn=principal)
+        with pytest.raises(ClientError) as e:
+            eks.describe_access_entry(
+                clusterName=cn, principalArn=principal)
+        assert e.value.response["Error"]["Code"] == "ResourceNotFoundException"
+    finally:
+        try: eks.delete_cluster(name=cn)
+        except Exception: pass
+
+
+def test_eks_access_entry_create_duplicate_rejected(eks):
+    cn = _create_basic_cluster(eks)
+    principal = f"arn:aws:iam::000000000000:role/dup-{_uid()}"
+    try:
+        eks.create_access_entry(clusterName=cn, principalArn=principal)
+        with pytest.raises(ClientError) as e:
+            eks.create_access_entry(clusterName=cn, principalArn=principal)
+        assert e.value.response["Error"]["Code"] == "ResourceInUseException"
+    finally:
+        try: eks.delete_cluster(name=cn)
+        except Exception: pass
+
+
+def test_eks_access_entry_create_missing_cluster(eks):
+    bogus = f"no-such-{_uid()}"
+    with pytest.raises(ClientError) as e:
+        eks.create_access_entry(
+            clusterName=bogus,
+            principalArn="arn:aws:iam::000000000000:role/r")
+    assert e.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
+def test_eks_access_entry_list_returns_principal_arns(eks):
+    cn = _create_basic_cluster(eks)
+    p1 = f"arn:aws:iam::000000000000:role/list-1-{_uid()}"
+    p2 = f"arn:aws:iam::000000000000:role/list-2-{_uid()}"
+    try:
+        eks.create_access_entry(clusterName=cn, principalArn=p1)
+        eks.create_access_entry(clusterName=cn, principalArn=p2)
+        listed = eks.list_access_entries(clusterName=cn)["accessEntries"]
+        assert set(listed) == {p1, p2}
+    finally:
+        try: eks.delete_cluster(name=cn)
+        except Exception: pass
+
+
+def test_eks_access_entry_update_patches_allowed_fields(eks):
+    cn = _create_basic_cluster(eks)
+    principal = f"arn:aws:iam::000000000000:role/upd-{_uid()}"
+    try:
+        eks.create_access_entry(
+            clusterName=cn, principalArn=principal,
+            kubernetesGroups=["before"], username="old",
+        )
+        updated = eks.update_access_entry(
+            clusterName=cn, principalArn=principal,
+            kubernetesGroups=["after"], username="new",
+        )["accessEntry"]
+        assert updated["kubernetesGroups"] == ["after"]
+        assert updated["username"] == "new"
+    finally:
+        try: eks.delete_cluster(name=cn)
+        except Exception: pass
+
+
+def test_eks_associate_access_policy_full_cycle(eks):
+    cn = _create_basic_cluster(eks)
+    principal = f"arn:aws:iam::000000000000:role/policy-{_uid()}"
+    policy = ("arn:aws:eks::aws:cluster-access-policy/"
+              "AmazonEKSClusterAdminPolicy")
+    try:
+        eks.create_access_entry(clusterName=cn, principalArn=principal)
+
+        resp = eks.associate_access_policy(
+            clusterName=cn, principalArn=principal,
+            policyArn=policy,
+            accessScope={"type": "cluster", "namespaces": []},
+        )
+        ap = resp["associatedAccessPolicy"]
+        assert ap["policyArn"] == policy
+        assert ap["accessScope"]["type"] == "cluster"
+
+        listed = eks.list_associated_access_policies(
+            clusterName=cn, principalArn=principal,
+        )["associatedAccessPolicies"]
+        assert len(listed) == 1
+        assert listed[0]["policyArn"] == policy
+
+        eks.disassociate_access_policy(
+            clusterName=cn, principalArn=principal, policyArn=policy)
+        listed_after = eks.list_associated_access_policies(
+            clusterName=cn, principalArn=principal,
+        )["associatedAccessPolicies"]
+        assert listed_after == []
+    finally:
+        try: eks.delete_cluster(name=cn)
+        except Exception: pass
+
+
+def test_eks_associate_access_policy_namespace_scope_requires_namespaces(eks):
+    cn = _create_basic_cluster(eks)
+    principal = f"arn:aws:iam::000000000000:role/ns-{_uid()}"
+    policy = ("arn:aws:eks::aws:cluster-access-policy/"
+              "AmazonEKSEditPolicy")
+    try:
+        eks.create_access_entry(clusterName=cn, principalArn=principal)
+        with pytest.raises(ClientError) as e:
+            eks.associate_access_policy(
+                clusterName=cn, principalArn=principal,
+                policyArn=policy,
+                accessScope={"type": "namespace"},  # missing namespaces
+            )
+        assert e.value.response["Error"]["Code"] == "InvalidParameterException"
+    finally:
+        try: eks.delete_cluster(name=cn)
+        except Exception: pass
+
+
+def test_eks_delete_access_entry_cascades_associated_policies(eks):
+    cn = _create_basic_cluster(eks)
+    principal = f"arn:aws:iam::000000000000:role/casc-{_uid()}"
+    policy = ("arn:aws:eks::aws:cluster-access-policy/"
+              "AmazonEKSViewPolicy")
+    try:
+        eks.create_access_entry(clusterName=cn, principalArn=principal)
+        eks.associate_access_policy(
+            clusterName=cn, principalArn=principal,
+            policyArn=policy,
+            accessScope={"type": "cluster", "namespaces": []},
+        )
+        eks.delete_access_entry(clusterName=cn, principalArn=principal)
+        # Recreate to verify the policy was cascaded out (not lingering).
+        eks.create_access_entry(clusterName=cn, principalArn=principal)
+        listed = eks.list_associated_access_policies(
+            clusterName=cn, principalArn=principal,
+        )["associatedAccessPolicies"]
+        assert listed == []
+    finally:
+        try: eks.delete_cluster(name=cn)
+        except Exception: pass
