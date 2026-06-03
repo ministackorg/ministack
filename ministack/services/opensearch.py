@@ -36,6 +36,8 @@ from ministack.core.responses import (
 
 logger = logging.getLogger("opensearch")
 
+_MINISTACK_HOST = os.environ.get("MINISTACK_HOST", "localhost")
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
@@ -242,7 +244,7 @@ def _spawn_dataplane(domain_name: str, engine_version: str):
         run_kwargs["network"] = DOCKER_NETWORK
 
     cid = None
-    endpoint_host, endpoint_port = "localhost", host_port
+    endpoint_host, endpoint_port = _MINISTACK_HOST, host_port
     try:
         container = docker.containers.run(**run_kwargs)
         cid = container.id
@@ -279,7 +281,7 @@ def _spawn_dataplane(domain_name: str, engine_version: str):
                 dash_kwargs["network"] = DOCKER_NETWORK
             dash_container = docker.containers.run(**dash_kwargs)
             dash_cid = dash_container.id
-            dash_endpoint = f"localhost:{dash_host_port}"
+            dash_endpoint = f"{_MINISTACK_HOST}:{dash_host_port}"
             logger.info(
                 "OpenSearch Dashboards: started %s on port %s",
                 domain_name, dash_host_port,

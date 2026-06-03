@@ -48,6 +48,7 @@ from ministack.core.responses import AccountScopedDict, apply_image_prefix, get_
 logger = logging.getLogger("rds")
 
 REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
+_MINISTACK_HOST = os.environ.get("MINISTACK_HOST", "localhost")
 BASE_PORT = int(os.environ.get("RDS_BASE_PORT", "15432"))
 RDS_TMPFS_SIZE = os.environ.get("RDS_TMPFS_SIZE", "256m")
 RDS_PERSIST = os.environ.get("RDS_PERSIST", "0").lower() in ("1", "true", "yes")
@@ -680,7 +681,7 @@ def _create_db_instance(p):
 
     arn = f"arn:aws:rds:{get_region()}:{get_account_id()}:db:{db_id}"
     dbi_resource_id = f"db-{new_uuid().replace('-', '')[:20].upper()}"
-    endpoint_host = "localhost"
+    endpoint_host = _MINISTACK_HOST
     endpoint_port = port
     host_port = None
     docker_container_id = None
@@ -1178,7 +1179,7 @@ def _create_read_replica(p):
         "InstanceCreateTime": _format_time(time.time()),
         "ReadReplicaDBInstanceIdentifiers": [],
         "Endpoint": {
-            "Address": "localhost",
+            "Address": _MINISTACK_HOST,
             "Port": _next_port(),
             "HostedZoneId": "Z2R2ITUGPM61AM",
         },
@@ -1222,7 +1223,7 @@ def _restore_from_snapshot(p):
         "MasterUsername": snap.get("MasterUsername", "admin"),
         "DBName": snap.get("DBName", ""),
         "Endpoint": {
-            "Address": "localhost",
+            "Address": _MINISTACK_HOST,
             "Port": _next_port(),
             "HostedZoneId": "Z2R2ITUGPM61AM",
         },

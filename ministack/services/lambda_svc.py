@@ -63,6 +63,8 @@ from ministack.core.responses import (
 
 logger = logging.getLogger("lambda")
 
+_MINISTACK_HOST = os.environ.get("MINISTACK_HOST", "localhost")
+
 
 def _emit_lambda_metrics(function_name: str, duration_ms: float,
                          error: bool, throttle: bool) -> None:
@@ -1196,7 +1198,7 @@ def _presigned_code_url(func_name: str) -> str:
     ministack endpoint and dress the URL up with the query params SDKs and
     scripts expect, so `pip-style` pull-and-extract code works unchanged.
     """
-    host = os.environ.get("MINISTACK_HOST", "localhost")
+    host = _MINISTACK_HOST
     port = os.environ.get("GATEWAY_PORT", os.environ.get("EDGE_PORT", "4566"))
     qs = (
         f"?X-Amz-Algorithm=AWS4-HMAC-SHA256"
@@ -3333,7 +3335,7 @@ def _execute_function_local(func: dict, event: dict) -> dict:
                 # Subprocess runs on the same host as ministack — point it at
                 # ourselves so boto3 calls land back here, not at real AWS.
                 gateway_port = os.environ.get("GATEWAY_PORT", "4566")
-                endpoint = f"http://localhost:{gateway_port}"
+                endpoint = f"http://{_MINISTACK_HOST}:{gateway_port}"
             if endpoint:
                 env["AWS_ENDPOINT_URL"] = endpoint
             env.update(env_vars)
@@ -3814,9 +3816,8 @@ def _untag_resource(resource_arn: str, query_params: dict):
 
 
 def _layer_content_url(layer_name: str, version: int) -> str:
-    host = os.environ.get("MINISTACK_HOST", "localhost")
     port = os.environ.get("GATEWAY_PORT", "4566")
-    return f"http://{host}:{port}/_ministack/lambda-layers/{layer_name}/{version}/content"
+    return f"http://{_MINISTACK_HOST}:{port}/_ministack/lambda-layers/{layer_name}/{version}/content"
 
 
 def _publish_layer_version(layer_name: str, data: dict):
