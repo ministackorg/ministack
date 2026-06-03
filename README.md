@@ -90,9 +90,14 @@ curl http://localhost:4566/_ministack/ses/messages
 
 # Filter by account (12-digit access-key ID used as the account ID)
 curl "http://localhost:4566/_ministack/ses/messages?account=000000000000"
+
+# Inspect host-port mappings for Docker-backed services (RDS, ElastiCache)
+curl http://localhost:4566/_ministack/ports
 ```
 
 The reset endpoint is especially useful in CI pipelines and test suites — call it in `setUp`/`beforeEach` to get a clean environment for every test without restarting the container. Add `?init=1` to re-run your init scripts after the reset, restoring any resources they create (VPCs, queues, seed data, etc.).
+
+The `/_ministack/ports` endpoint is useful when `DOCKER_NETWORK` is enabled. In that mode, RDS and ElastiCache APIs may return Docker-internal endpoints that are only reachable from containers on the same network. This endpoint exposes the corresponding host port mappings, allowing clients outside the Docker network to connect to those services.
 
 The config endpoint supports these keys:
 
