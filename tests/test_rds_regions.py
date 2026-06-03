@@ -56,6 +56,21 @@ def _delete_global_cluster(client, global_id):
         pass
 
 
+def _cleanup_two_member_global(east, global_id, primary_arn=None, secondary_arn=None):
+    if primary_arn:
+        try:
+            east.switchover_global_cluster(
+                GlobalClusterIdentifier=global_id,
+                TargetDbClusterIdentifier=primary_arn,
+            )
+        except ClientError:
+            pass
+    for cluster_arn in (secondary_arn, primary_arn):
+        if cluster_arn:
+            _remove_global_member(east, global_id, cluster_arn)
+    _delete_global_cluster(east, global_id)
+
+
 def test_rds_clusters_are_region_scoped():
     east = _regional_rds("us-east-1")
     west = _regional_rds("us-west-2")
@@ -520,6 +535,154 @@ def test_aurora_global_metadata_spans_regions():
         _delete_global_cluster(east, global_id)
         _delete_cluster(west, secondary_id)
         _delete_cluster(east, primary_id)
+
+
+def test_switchover_global_cluster_promotes_foreign_region_member_arn():
+    east = _regional_rds("us-east-1")
+    west = _regional_rds("us-west-2")
+    suffix = uuid.uuid4().hex[:8]
+    primary_id = f"global-switch-primary-{suffix}"
+    secondary_id = f"global-switch-secondary-{suffix}"
+    global_id = f"global-switch-{suffix}"
+    primary_arn = None
+    secondary_arn = None
+
+    try:
+        primary = east.create_db_cluster(
+            DBClusterIdentifier=primary_id,
+            Engine="aurora-mysql",
+            MasterUsername="admin",
+            MasterUserPassword="password123",
+        )["DBCluster"]
+        primary_arn = primary["DBClusterArn"]
+        east.create_global_cluster(
+            GlobalClusterIdentifier=global_id,
+            SourceDBClusterIdentifier=primary_arn,
+        )
+        secondary = west.create_db_cluster(
+            DBClusterIdentifier=secondary_id,
+            Engine="aurora-mysql",
+            GlobalClusterIdentifier=global_id,
+            MasterUsername="admin",
+            MasterUserPassword="password123",
+        )["DBCluster"]
+        secondary_arn = secondary["DBClusterArn"]
+
+        response = east.switchover_global_cluster(
+            GlobalClusterIdentifier=global_id,
+            TargetDbClusterIdentifier=secondary_arn,
+        )["GlobalCluster"]
+        assert response["Status"] == "switching-over"
+        assert response["FailoverState"]["Status"] == "pending"
+        assert response["FailoverState"]["FromDbClusterArn"] == primary_arn
+        assert response["FailoverState"]["ToDbClusterArn"] == secondary_arn
+        assert response["FailoverState"]["IsDataLossAllowed"] is False
+
+        members = {m["DBClusterArn"]: m for m in response["GlobalClusterMembers"]}
+        assert members[primary_arn]["IsWriter"] is False
+        assert members[secondary_arn]["IsWriter"] is True
+        assert members[secondary_arn]["Readers"] == [primary_arn]
+
+        final = west.describe_global_clusters(
+            GlobalClusterIdentifier=global_id,
+        )["GlobalClusters"][0]
+        final_members = {m["DBClusterArn"]: m for m in final["GlobalClusterMembers"]}
+        assert final["Status"] == "available"
+        assert "FailoverState" not in final
+        assert final_members[primary_arn]["IsWriter"] is False
+        assert final_members[secondary_arn]["IsWriter"] is True
+
+        switchback = west.switchover_global_cluster(
+            GlobalClusterIdentifier=global_id,
+            TargetDbClusterIdentifier=primary_arn,
+        )["GlobalCluster"]
+        switchback_members = {
+            m["DBClusterArn"]: m for m in switchback["GlobalClusterMembers"]
+        }
+        assert switchback_members[primary_arn]["IsWriter"] is True
+        assert switchback_members[secondary_arn]["IsWriter"] is False
+    finally:
+        _cleanup_two_member_global(east, global_id, primary_arn, secondary_arn)
+        _delete_cluster(west, secondary_id)
+        _delete_cluster(east, primary_id)
+
+
+def test_failover_global_cluster_allows_data_loss_promotes_target():
+    east = _regional_rds("us-east-1")
+    west = _regional_rds("us-west-2")
+    suffix = uuid.uuid4().hex[:8]
+    primary_id = f"global-fail-primary-{suffix}"
+    secondary_id = f"global-fail-secondary-{suffix}"
+    global_id = f"global-fail-{suffix}"
+    primary_arn = None
+    secondary_arn = None
+
+    try:
+        primary = east.create_db_cluster(
+            DBClusterIdentifier=primary_id,
+            Engine="aurora-mysql",
+            MasterUsername="admin",
+            MasterUserPassword="password123",
+        )["DBCluster"]
+        primary_arn = primary["DBClusterArn"]
+        east.create_global_cluster(
+            GlobalClusterIdentifier=global_id,
+            SourceDBClusterIdentifier=primary_arn,
+        )
+        secondary = west.create_db_cluster(
+            DBClusterIdentifier=secondary_id,
+            Engine="aurora-mysql",
+            GlobalClusterIdentifier=global_id,
+            MasterUsername="admin",
+            MasterUserPassword="password123",
+        )["DBCluster"]
+        secondary_arn = secondary["DBClusterArn"]
+
+        response = east.failover_global_cluster(
+            GlobalClusterIdentifier=global_id,
+            TargetDbClusterIdentifier=secondary_arn,
+            AllowDataLoss=True,
+        )["GlobalCluster"]
+        assert response["Status"] == "failing-over"
+        assert response["FailoverState"]["Status"] == "pending"
+        assert response["FailoverState"]["IsDataLossAllowed"] is True
+        members = {m["DBClusterArn"]: m for m in response["GlobalClusterMembers"]}
+        assert members[primary_arn]["IsWriter"] is False
+        assert members[secondary_arn]["IsWriter"] is True
+
+        with pytest.raises(ClientError) as exc:
+            east.failover_global_cluster(
+                GlobalClusterIdentifier=global_id,
+                TargetDbClusterIdentifier=primary_arn,
+                AllowDataLoss=True,
+                Switchover=True,
+            )
+        assert exc.value.response["Error"]["Code"] == "InvalidParameterCombination"
+
+        with pytest.raises(ClientError) as exc:
+            east.failover_global_cluster(
+                GlobalClusterIdentifier=global_id,
+                TargetDbClusterIdentifier=primary_arn,
+                AllowDataLoss=False,
+                Switchover=True,
+            )
+        assert exc.value.response["Error"]["Code"] == "InvalidParameterCombination"
+    finally:
+        _cleanup_two_member_global(east, global_id, primary_arn, secondary_arn)
+        _delete_cluster(west, secondary_id)
+        _delete_cluster(east, primary_id)
+
+
+def test_failover_global_cluster_missing_global_validated_before_parameter_combo():
+    east = _regional_rds("us-east-1")
+    with pytest.raises(ClientError) as exc:
+        east.failover_global_cluster(
+            GlobalClusterIdentifier=f"missing-global-{uuid.uuid4().hex[:8]}",
+            TargetDbClusterIdentifier="arn:aws:rds:us-east-1:000000000000:cluster:missing-secondary",
+            AllowDataLoss=True,
+            Switchover=True,
+        )
+    assert exc.value.response["Error"]["Code"] == "GlobalClusterNotFoundFault"
 
 
 def test_create_global_cluster_rejects_already_attached_source_cluster():

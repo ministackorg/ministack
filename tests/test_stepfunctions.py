@@ -1606,6 +1606,114 @@ def test_sfn_aws_sdk_rds_create_global_cluster_from_described_cluster_arn(sfn_sy
             pass
 
 
+def test_sfn_aws_sdk_rds_switchover_global_cluster(sfn_sync):
+    """aws-sdk:rds SwitchoverGlobalCluster accepts a foreign-Region member ARN."""
+    east = _regional_rds("us-east-1")
+    west = _regional_rds("us-west-2")
+    suffix = _uuid_mod.uuid4().hex[:8]
+    primary_id = f"sfn-switch-primary-{suffix}"
+    secondary_id = f"sfn-switch-secondary-{suffix}"
+    global_id = f"sfn-switch-global-{suffix}"
+    sm_name = f"sdk-rds-switch-{suffix}"
+    sm_arn = None
+    primary_arn = None
+    secondary_arn = None
+
+    try:
+        primary = east.create_db_cluster(
+            DBClusterIdentifier=primary_id,
+            Engine="aurora-postgresql",
+            MasterUsername="admin",
+            MasterUserPassword="testpass123",
+        )["DBCluster"]
+        primary_arn = primary["DBClusterArn"]
+        east.create_global_cluster(
+            GlobalClusterIdentifier=global_id,
+            SourceDBClusterIdentifier=primary_arn,
+        )
+        secondary = west.create_db_cluster(
+            DBClusterIdentifier=secondary_id,
+            Engine="aurora-postgresql",
+            GlobalClusterIdentifier=global_id,
+            MasterUsername="admin",
+            MasterUserPassword="testpass123",
+        )["DBCluster"]
+        secondary_arn = secondary["DBClusterArn"]
+
+        definition = json.dumps({
+            "StartAt": "SwitchGlobal",
+            "States": {
+                "SwitchGlobal": {
+                    "Type": "Task",
+                    "Resource": "arn:aws:states:::aws-sdk:rds:switchoverGlobalCluster",
+                    "Parameters": {
+                        "GlobalClusterIdentifier": global_id,
+                        "TargetDbClusterIdentifier": secondary_arn,
+                    },
+                    "End": True,
+                },
+            },
+        })
+        sm_arn = sfn_sync.create_state_machine(
+            name=sm_name,
+            definition=definition,
+            roleArn="arn:aws:iam::000000000000:role/sfn-role",
+        )["stateMachineArn"]
+
+        resp = sfn_sync.start_sync_execution(stateMachineArn=sm_arn, input=json.dumps({}))
+        assert resp["status"] == "SUCCEEDED", f"Execution failed: {resp.get('error')} — {resp.get('cause')}"
+        output = json.loads(resp["output"])
+        assert output["GlobalCluster"]["Status"] == "switching-over"
+        assert output["GlobalCluster"]["FailoverState"]["Status"] == "pending"
+        assert output["GlobalCluster"]["FailoverState"]["IsDataLossAllowed"] is False
+        members = {
+            member["DbClusterArn"]: member
+            for member in output["GlobalCluster"]["GlobalClusterMembers"]
+        }
+        assert members[primary_arn]["IsWriter"] is False
+        assert members[secondary_arn]["IsWriter"] is True
+
+        final = east.describe_global_clusters(
+            GlobalClusterIdentifier=global_id,
+        )["GlobalClusters"][0]
+        final_members = {m["DBClusterArn"]: m for m in final["GlobalClusterMembers"]}
+        assert final["Status"] == "available"
+        assert final_members[primary_arn]["IsWriter"] is False
+        assert final_members[secondary_arn]["IsWriter"] is True
+    finally:
+        if sm_arn:
+            sfn_sync.delete_state_machine(stateMachineArn=sm_arn)
+        if primary_arn:
+            try:
+                east.switchover_global_cluster(
+                    GlobalClusterIdentifier=global_id,
+                    TargetDbClusterIdentifier=primary_arn,
+                )
+            except ClientError:
+                pass
+        for cluster_arn in (secondary_arn, primary_arn):
+            if cluster_arn:
+                try:
+                    east.remove_from_global_cluster(
+                        GlobalClusterIdentifier=global_id,
+                        DbClusterIdentifier=cluster_arn,
+                    )
+                except ClientError:
+                    pass
+        try:
+            east.delete_global_cluster(GlobalClusterIdentifier=global_id)
+        except ClientError:
+            pass
+        try:
+            west.delete_db_cluster(DBClusterIdentifier=secondary_id, SkipFinalSnapshot=True)
+        except ClientError:
+            pass
+        try:
+            east.delete_db_cluster(DBClusterIdentifier=primary_id, SkipFinalSnapshot=True)
+        except ClientError:
+            pass
+
+
 def test_sfn_aws_sdk_rds_global_cluster_readers_are_lists(sfn_sync, rds):
     primary_id = f"sfn-global-primary-{_uuid_mod.uuid4().hex[:8]}"
     secondary_id = f"sfn-global-secondary-{_uuid_mod.uuid4().hex[:8]}"
@@ -1840,6 +1948,36 @@ def test_sfn_aws_sdk_rds_global_not_found_error_uses_aws_name(sfn, sfn_sync):
                 "Resource": "arn:aws:states:::aws-sdk:rds:DescribeGlobalClusters",
                 "Parameters": {
                     "GlobalClusterIdentifier": "this-global-cluster-does-not-exist",
+                },
+                "End": True,
+            },
+        },
+    })
+    sm_arn = sfn_sync.create_state_machine(
+        name=sm_name,
+        definition=definition,
+        roleArn="arn:aws:iam::000000000000:role/sfn-role",
+    )["stateMachineArn"]
+
+    resp = sfn_sync.start_sync_execution(stateMachineArn=sm_arn, input=json.dumps({}))
+    assert resp["status"] == "FAILED"
+    assert resp.get("error") == "Rds.GlobalClusterNotFoundException"
+
+    sfn_sync.delete_state_machine(stateMachineArn=sm_arn)
+
+
+def test_sfn_aws_sdk_rds_switchover_missing_global_uses_aws_name(sfn_sync):
+    sm_name = f"sdk-rds-switch-notfound-{_uuid_mod.uuid4().hex[:8]}"
+
+    definition = json.dumps({
+        "StartAt": "SwitchMissing",
+        "States": {
+            "SwitchMissing": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::aws-sdk:rds:switchoverGlobalCluster",
+                "Parameters": {
+                    "GlobalClusterIdentifier": "this-global-cluster-does-not-exist",
+                    "TargetDbClusterIdentifier": "arn:aws:rds:us-east-1:000000000000:cluster:missing-secondary",
                 },
                 "End": True,
             },

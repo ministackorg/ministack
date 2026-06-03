@@ -19,7 +19,8 @@ Supports: CreateDBInstance, DeleteDBInstance, DescribeDBInstances, ModifyDBInsta
           DescribeDBEngineVersions, DescribeOrderableDBInstanceOptions,
           DescribePendingMaintenanceActions,
           CreateGlobalCluster, DescribeGlobalClusters, DeleteGlobalCluster,
-          RemoveFromGlobalCluster, ModifyGlobalCluster.
+          RemoveFromGlobalCluster, ModifyGlobalCluster,
+          SwitchoverGlobalCluster, FailoverGlobalCluster.
 
 When Docker is available, CreateDBInstance spins up a real Postgres/MySQL container
 and returns the actual host:port as the endpoint.
@@ -857,6 +858,12 @@ def _refresh_global_cluster_readers(global_cluster):
     reader_arns = [m["DBClusterArn"] for m in members if not m.get("IsWriter")]
     for member in members:
         member["Readers"] = reader_arns if member.get("IsWriter") else []
+
+
+def _set_global_cluster_writer(global_cluster, target_member):
+    for member in global_cluster.get("GlobalClusterMembers", []):
+        member["IsWriter"] = member["DBClusterArn"] == target_member["DBClusterArn"]
+    _refresh_global_cluster_readers(global_cluster)
 
 
 def _attach_cluster_to_global(global_cluster, cluster, is_writer):
@@ -2905,6 +2912,88 @@ def _modify_global_cluster(p):
         f"<ModifyGlobalClusterResult><GlobalCluster>{_global_cluster_xml(gc)}</GlobalCluster></ModifyGlobalClusterResult>")
 
 
+def _find_global_cluster_target_member(gc, target_cluster_id):
+    cluster = _resolve_cluster(target_cluster_id)
+    db_cluster_arn = cluster["DBClusterArn"] if cluster else target_cluster_id
+    members = gc.get("GlobalClusterMembers", [])
+    member = next((m for m in members if m["DBClusterArn"] == db_cluster_arn), None)
+    return cluster, member
+
+
+def _switch_global_cluster_writer(p, *, allow_data_loss=False):
+    gc_id = _p(p, "GlobalClusterIdentifier")
+    target_cluster_id = _p(p, "TargetDbClusterIdentifier")
+    invalid_id = _invalid_global_cluster_identifier_error(gc_id)
+    if invalid_id:
+        return invalid_id
+    gc = _resolve_global_cluster(gc_id)
+    if not gc:
+        return _error("GlobalClusterNotFoundFault",
+            f"Global cluster {gc_id} not found.", 404)
+    if not target_cluster_id:
+        return _error("MissingParameter", "TargetDbClusterIdentifier is required", 400)
+
+    _target_cluster, target_member = _find_global_cluster_target_member(gc, target_cluster_id)
+    if not target_member:
+        cluster = _resolve_cluster(target_cluster_id)
+        if not cluster:
+            return _error("DBClusterNotFoundFault",
+                f"DBCluster {target_cluster_id} not found.", 404)
+        return _error("InvalidGlobalClusterStateFault",
+            f"DBCluster {target_cluster_id} is not a secondary member of global cluster {gc_id}.", 400)
+
+    members = gc.get("GlobalClusterMembers", [])
+    current_writer = next((m for m in members if m.get("IsWriter")), None)
+    if not current_writer or target_member.get("IsWriter") or len(members) < 2:
+        return _error("InvalidGlobalClusterStateFault",
+            f"Global cluster {gc_id} does not have a secondary target to promote.", 400)
+
+    _set_global_cluster_writer(gc, target_member)
+    gc["Status"] = "available"
+
+    response_gc = copy.deepcopy(gc)
+    response_gc["Status"] = "switching-over" if not allow_data_loss else "failing-over"
+    response_gc["FailoverState"] = {
+        "Status": "pending",
+        "FromDbClusterArn": current_writer["DBClusterArn"],
+        "ToDbClusterArn": target_member["DBClusterArn"],
+        "IsDataLossAllowed": bool(allow_data_loss),
+    }
+    return response_gc
+
+
+def _switchover_global_cluster(p):
+    result = _switch_global_cluster_writer(p, allow_data_loss=False)
+    if isinstance(result, tuple):
+        return result
+    return _xml(200, "SwitchoverGlobalClusterResponse",
+        f"<SwitchoverGlobalClusterResult><GlobalCluster>{_global_cluster_xml(result)}</GlobalCluster></SwitchoverGlobalClusterResult>")
+
+
+def _failover_global_cluster(p):
+    gc_id = _p(p, "GlobalClusterIdentifier")
+    invalid_id = _invalid_global_cluster_identifier_error(gc_id)
+    if invalid_id:
+        return invalid_id
+    if not _resolve_global_cluster(gc_id):
+        return _error("GlobalClusterNotFoundFault",
+            f"Global cluster {gc_id} not found.", 404)
+
+    both_failover_modes_specified = "AllowDataLoss" in p and "Switchover" in p
+    allow_data_loss = str(_p(p, "AllowDataLoss")).lower() == "true"
+    if both_failover_modes_specified:
+        return _error(
+            "InvalidParameterCombination",
+            "AllowDataLoss and Switchover cannot both be specified.",
+            400,
+        )
+    result = _switch_global_cluster_writer(p, allow_data_loss=allow_data_loss)
+    if isinstance(result, tuple):
+        return result
+    return _xml(200, "FailoverGlobalClusterResponse",
+        f"<FailoverGlobalClusterResult><GlobalCluster>{_global_cluster_xml(result)}</GlobalCluster></FailoverGlobalClusterResult>")
+
+
 def _enable_http_endpoint(p):
     arn = _p(p, "ResourceArn")
     wrong_region = _resource_not_found_error_for_arn(arn)
@@ -2933,6 +3022,15 @@ def _global_cluster_xml(gc):
             <GlobalWriteForwardingStatus>{m.get('GlobalWriteForwardingStatus', 'disabled')}</GlobalWriteForwardingStatus>
             <SynchronizationStatus>{m.get('SynchronizationStatus', 'connected')}</SynchronizationStatus>
         </GlobalClusterMember>"""
+    failover_state = gc.get("FailoverState") or {}
+    failover_state_xml = ""
+    if failover_state:
+        failover_state_xml = f"""<FailoverState>
+            <Status>{failover_state.get('Status', '')}</Status>
+            <FromDbClusterArn>{_esc(failover_state.get('FromDbClusterArn', ''))}</FromDbClusterArn>
+            <ToDbClusterArn>{_esc(failover_state.get('ToDbClusterArn', ''))}</ToDbClusterArn>
+            <IsDataLossAllowed>{str(failover_state.get('IsDataLossAllowed', False)).lower()}</IsDataLossAllowed>
+        </FailoverState>"""
     return f"""<GlobalClusterIdentifier>{gc['GlobalClusterIdentifier']}</GlobalClusterIdentifier>
         <GlobalClusterArn>{gc['GlobalClusterArn']}</GlobalClusterArn>
         <GlobalClusterResourceId>{gc['GlobalClusterResourceId']}</GlobalClusterResourceId>
@@ -2942,6 +3040,7 @@ def _global_cluster_xml(gc):
         <DatabaseName>{gc.get('DatabaseName', '')}</DatabaseName>
         <StorageEncrypted>{str(gc.get('StorageEncrypted', False)).lower()}</StorageEncrypted>
         <DeletionProtection>{str(gc.get('DeletionProtection', False)).lower()}</DeletionProtection>
+        {failover_state_xml}
         <GlobalClusterMembers>{member_xml}</GlobalClusterMembers>"""
 
 
@@ -3680,6 +3779,8 @@ _ACTION_MAP = {
     "DeleteGlobalCluster": _delete_global_cluster,
     "RemoveFromGlobalCluster": _remove_from_global_cluster,
     "ModifyGlobalCluster": _modify_global_cluster,
+    "SwitchoverGlobalCluster": _switchover_global_cluster,
+    "FailoverGlobalCluster": _failover_global_cluster,
     "EnableHttpEndpoint": _enable_http_endpoint,
 }
 

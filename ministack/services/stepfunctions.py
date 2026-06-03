@@ -4313,7 +4313,7 @@ _XML_BOOLEAN_FIELDS = frozenset({
     "CopyTagsToSnapshot", "IamDatabaseAuthenticationEnabled",
     "PerformanceInsightsEnabled", "HttpEndpointEnabled",
     "CrossAccountClone", "CustomerOwnedIpEnabled",
-    "IsStorageConfigUpgradeAvailable", "IsWriter",
+    "IsStorageConfigUpgradeAvailable", "IsWriter", "IsDataLossAllowed",
 })
 
 
@@ -4406,11 +4406,17 @@ _AWS_ACRONYMS = frozenset({
 })
 
 # Most query-protocol RDS params expand SDK-style "Db" to wire-format "DB".
-# RemoveFromGlobalCluster is the AWS-shape exception: its member is
+# Some global-cluster operations are AWS-shape exceptions: their members use
 # "DbClusterIdentifier", and sending "DBClusterIdentifier" is ignored.
 _QUERY_PARAM_NAME_OVERRIDES = {
     ("rds", "RemoveFromGlobalCluster"): {
         "DbClusterIdentifier": "DbClusterIdentifier",
+    },
+    ("rds", "SwitchoverGlobalCluster"): {
+        "TargetDbClusterIdentifier": "TargetDbClusterIdentifier",
+    },
+    ("rds", "FailoverGlobalCluster"): {
+        "TargetDbClusterIdentifier": "TargetDbClusterIdentifier",
     },
     ("ec2", "CreateSecurityGroup"): {
         "Description": "GroupDescription",
