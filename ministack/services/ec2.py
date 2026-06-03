@@ -307,6 +307,11 @@ def _launch_instances_internal(image_id, instance_type, subnet_id, count, key_na
     for _ in range(count):
         instance_id = _new_instance_id()
         private_ip = requested_private_ip or _random_ip("10.0.")
+        # Synthesize a real root EBS volume so DescribeVolumes / DescribeInstances
+        # surface the same volume id, matching real AWS where every EBS-backed AMI
+        # auto-attaches a root volume regardless of whether the launch request
+        # specified BlockDeviceMappings. Cloud Custodian, AWS Config, and policy
+        # tools rely on the BDM presence to classify instance storage.
         root_device = "/dev/xvda"
         vol_id = _new_volume_id()
         _volumes[vol_id] = {
@@ -393,12 +398,14 @@ def _run_instances(p):
     if not sg_ids:
         sg_ids = [_DEFAULT_SG_ID]
 
-    # Optional caller-provided values
+    # Optional caller-provided values: respect them if set; fall back to defaults otherwise.
     requested_private_ip = _p(p, "PrivateIpAddress")
     iam_arn = _p(p, "IamInstanceProfile.Arn")
     iam_name = _p(p, "IamInstanceProfile.Name")
     iam_profile = None
     if iam_arn or iam_name:
+        # Real AWS returns both Arn and Id. We synthesize a stable Id from the
+        # name/arn so DescribeInstances reads back as it does on AWS.
         if not iam_arn and iam_name:
             iam_arn = f"arn:aws:iam::{get_account_id()}:instance-profile/{iam_name}"
         iam_id = "AIPA" + new_uuid().replace("-", "").upper()[:17]
@@ -4679,7 +4686,7 @@ def _delete_launch_template(p):
 def _fleet_instances_xml(instances_list, configs):
     instances_xml = []
     for item in instances_list:
-        inst_ids_xml = "".join(f"<item>{iid}</item>" for iid in item["InstanceIds"])
+        inst_ids_xml = "".join(f"<item>{_esc(iid)}</item>" for iid in item["InstanceIds"])
         lt_and_overrides_xml = ""
         if configs:
             cfg = configs[0]
@@ -4690,17 +4697,17 @@ def _fleet_instances_xml(instances_list, configs):
             lt_and_overrides_xml = f"""
             <launchTemplateAndOverrides>
                 <launchTemplateSpecification>
-                    <launchTemplateId>{lt_id_val}</launchTemplateId>
+                    <launchTemplateId>{_esc(lt_id_val)}</launchTemplateId>
                     <launchTemplateName>{_esc(lt_name_val)}</launchTemplateName>
-                    <version>{version_val}</version>
+                    <version>{_esc(version_val)}</version>
                 </launchTemplateSpecification>
             </launchTemplateAndOverrides>
             """
         instances_xml.append(f"""<item>
             {lt_and_overrides_xml}
-            <lifecycle>{item["Lifecycle"]}</lifecycle>
+            <lifecycle>{_esc(item["Lifecycle"])}</lifecycle>
             <instanceIds>{inst_ids_xml}</instanceIds>
-            <instanceType>{item["InstanceType"]}</instanceType>
+            <instanceType>{_esc(item["InstanceType"])}</instanceType>
         </item>""")
     return "".join(instances_xml)
 
@@ -4897,7 +4904,7 @@ def _create_fleet(p):
     _fleets[fleet_id] = fleet_record
 
     instances_xml_str = _fleet_instances_xml(fleet_record["Instances"], configs)
-    inner = f"""<fleetId>{fleet_id}</fleetId>
+    inner = f"""<fleetId>{_esc(fleet_id)}</fleetId>
     <fleetInstanceSet>{instances_xml_str}</fleetInstanceSet>
     <errorSet/>"""
     return _xml(200, "CreateFleetResponse", inner)
@@ -4909,28 +4916,27 @@ def _describe_fleets(p):
     for f in _fleets.values():
         if fleet_ids and f["FleetId"] not in fleet_ids:
             continue
-        if f["Type"] == "instant" and not fleet_ids:
-            continue
         results.append(f)
 
     items = []
     for f in results:
         instances_xml_str = _fleet_instances_xml(f["Instances"], f["LaunchTemplateConfigs"])
         tag_set_xml = _tag_set_xml(f["FleetId"])
+        tcs = f["TargetCapacitySpecification"]
         items.append(f"""<item>
-            <activityStatus>{f['ActivityStatus']}</activityStatus>
-            <createTime>{f['CreateTime']}</createTime>
-            <fleetId>{f['FleetId']}</fleetId>
-            <fleetState>{f['FleetState']}</fleetState>
+            <activityStatus>{_esc(f['ActivityStatus'])}</activityStatus>
+            <createTime>{_esc(f['CreateTime'])}</createTime>
+            <fleetId>{_esc(f['FleetId'])}</fleetId>
+            <fleetState>{_esc(f['FleetState'])}</fleetState>
             <fulfilledCapacity>{f['FulfilledCapacity']}</fulfilledCapacity>
             <fulfilledOnDemandCapacity>{f['FulfilledOnDemandCapacity']}</fulfilledOnDemandCapacity>
             <targetCapacitySpecification>
-                <totalTargetCapacity>{f['TargetCapacitySpecification']['TotalTargetCapacity']}</totalTargetCapacity>
-                <onDemandTargetCapacity>{f['TargetCapacitySpecification']['OnDemandTargetCapacity']}</onDemandTargetCapacity>
-                <spotTargetCapacity>{f['TargetCapacitySpecification']['SpotTargetCapacity']}</spotTargetCapacity>
-                <defaultTargetCapacityType>{f['TargetCapacitySpecification']['DefaultTargetCapacityType']}</defaultTargetCapacityType>
+                <totalTargetCapacity>{int(tcs['TotalTargetCapacity'])}</totalTargetCapacity>
+                <onDemandTargetCapacity>{int(tcs['OnDemandTargetCapacity'])}</onDemandTargetCapacity>
+                <spotTargetCapacity>{int(tcs['SpotTargetCapacity'])}</spotTargetCapacity>
+                <defaultTargetCapacityType>{_esc(tcs['DefaultTargetCapacityType'])}</defaultTargetCapacityType>
             </targetCapacitySpecification>
-            <type>{f['Type']}</type>
+            <type>{_esc(f['Type'])}</type>
             <fleetInstanceSet>{instances_xml_str}</fleetInstanceSet>
             <errorSet/>
             {tag_set_xml}
