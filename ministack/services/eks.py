@@ -57,6 +57,7 @@ _addons = AccountScopedDict()         # "cluster/addonName" -> addon record
 _access_entries = AccountScopedDict() # "cluster\x00principalArn" -> access entry record
 _access_policies = AccountScopedDict()# "cluster\x00principalArn\x00policyArn" -> associated policy
 _tags = AccountScopedDict()           # arn -> {key: value}
+_idp_configs = AccountScopedDict()     # "cluster\x00idp_name" -> idp record
 _port_counter_lock = threading.Lock()
 _port_counter = [EKS_BASE_PORT]
 _oidc_keypair_lock = threading.Lock()
@@ -115,6 +116,7 @@ def reset():
     _access_entries.clear()
     _access_policies.clear()
     _tags.clear()
+    _idp_configs.clear()
     _port_counter[0] = EKS_BASE_PORT
     _stop_all_k3s()
 
@@ -135,6 +137,7 @@ def get_state():
         "access_entries": copy.deepcopy(_access_entries),
         "access_policies": copy.deepcopy(_access_policies),
         "tags": copy.deepcopy(_tags),
+        "idp_configs": copy.deepcopy(_idp_configs),
         "port_counter": _port_counter[0],
     }
 
@@ -146,6 +149,7 @@ def restore_state(data):
     _access_entries.update(data.get("access_entries", {}))
     _access_policies.update(data.get("access_policies", {}))
     _tags.update(data.get("tags", {}))
+    _idp_configs.update(data.get("idp_configs", {}))
     if "port_counter" in data:
         _port_counter[0] = data["port_counter"]
     # Restored clusters have no running k3s container — keep ACTIVE with mock endpoint
@@ -156,6 +160,7 @@ def restore_state(data):
     else:
         for c in _clusters.values():
             c["_docker_id"] = None
+
 
 
 try:
@@ -254,7 +259,7 @@ def _wait_for_port(host, port, timeout=30):
     return False
 
 
-def _k3s_run_kwargs(name: str, port: int, ms_network: str | None = None) -> dict:
+def _k3s_run_kwargs(name: str, port: int, ms_network: str | None = None, account_id: str = "000000000000") -> dict:
     """Build the docker run kwargs for a k3s server container.
 
     `privileged=True` is required: k3s server mode remounts `/sys/fs/cgroup`,
@@ -264,12 +269,29 @@ def _k3s_run_kwargs(name: str, port: int, ms_network: str | None = None) -> dict
     list and unconfined security_opt are kept as defence-in-depth so that
     hardened Docker setups still get the right capability set.
     """
+    command = [
+        "server",
+        "--disable=traefik,metrics-server,servicelb",
+        "--tls-san=0.0.0.0",
+        "--https-listen-port=6443"
+    ]
+    # Append OIDC apiserver args if associated configuration is present
+    for (acct_id, scoped_key), cfg in list(_idp_configs._data.items()):
+        if acct_id == account_id:
+            parts = scoped_key.split("\x00", 1)
+            if len(parts) == 2 and parts[0] == name:
+                oidc = cfg.get("oidc", {})
+                if oidc:
+                    command.append(f"--kube-apiserver-arg=oidc-issuer-url={oidc.get('issuerUrl')}")
+                    command.append(f"--kube-apiserver-arg=oidc-client-id={oidc.get('clientId')}")
+                    if oidc.get("usernameClaim"):
+                        command.append(f"--kube-apiserver-arg=oidc-username-claim={oidc.get('usernameClaim')}")
+                    if oidc.get("groupsClaim"):
+                        command.append(f"--kube-apiserver-arg=oidc-groups-claim={oidc.get('groupsClaim')}")
+
     run_kwargs = dict(
         image=apply_image_prefix(EKS_K3S_IMAGE),
-        command=["server",
-                 "--disable=traefik,metrics-server,servicelb",
-                 "--tls-san=0.0.0.0",
-                 "--https-listen-port=6443"],
+        command=command,
         detach=True,
         privileged=True,
         cap_add=[
@@ -291,6 +313,7 @@ def _k3s_run_kwargs(name: str, port: int, ms_network: str | None = None) -> dict
     )
     if ms_network:
         run_kwargs["network"] = ms_network
+
     return run_kwargs
 
 
@@ -389,6 +412,8 @@ def _create_cluster(body):
     if cluster["tags"]:
         _tags[arn] = dict(cluster["tags"])
 
+    account_id = get_account_id()
+
     def _bg_start():
         client = _get_docker()
         if not client:
@@ -397,7 +422,8 @@ def _create_cluster(body):
             return
         try:
             ms_network = _get_ministack_network(client)
-            run_kwargs = _k3s_run_kwargs(name=name, port=port, ms_network=ms_network)
+            run_kwargs = _k3s_run_kwargs(name=name, port=port, ms_network=ms_network, account_id=account_id)
+
 
             container = client.containers.run(**run_kwargs)
             cluster["_docker_id"] = container.id
@@ -859,8 +885,187 @@ def _associate_encryption_config(cluster_name, body):
 
 
 # ---------------------------------------------------------------------------
+# OIDC Identity Provider Config (AssociateIdentityProviderConfig)
+# ---------------------------------------------------------------------------
+
+def _restart_k3s(cluster_name, account_id):
+    cluster = _clusters.get(cluster_name)
+    if not cluster:
+        return
+    client = _get_docker()
+    if not client:
+        return
+
+    cluster["status"] = "UPDATING"
+
+    def _bg_restart():
+        try:
+            docker_id = cluster.get("_docker_id")
+            if docker_id:
+                try:
+                    container = client.containers.get(docker_id)
+                    container.stop(timeout=5)
+                    container.remove(v=True, force=True)
+                except Exception:
+                    pass
+                cluster["_docker_id"] = None
+
+            port = cluster["_port"]
+            ms_network = _get_ministack_network(client)
+            run_kwargs = _k3s_run_kwargs(name=cluster_name, port=port, ms_network=ms_network, account_id=account_id)
+
+            container = client.containers.run(**run_kwargs)
+            cluster["_docker_id"] = container.id
+
+            ep = ""
+            if ms_network:
+                container.reload()
+                networks = container.attrs.get("NetworkSettings", {}).get("Networks", {})
+                container_ip = networks.get(ms_network, {}).get("IPAddress", "")
+                if container_ip and _wait_for_port(container_ip, 6443):
+                    ep = f"https://{container_ip}:6443"
+                    logger.info("EKS: k3s for %s restarted and ready at %s (network %s)", cluster_name, ep, ms_network)
+            if not ep:
+                if _wait_for_port("127.0.0.1", port):
+                    ep = f"https://localhost:{port}"
+                    logger.info("EKS: k3s for %s restarted and ready at %s", cluster_name, ep)
+                else:
+                    logger.warning("EKS: k3s for %s restarted but did not become ready on port %d", cluster_name, port)
+                    ep = f"https://localhost:{port}"
+
+            cluster["endpoint"] = ep
+            cluster["certificateAuthority"]["data"] = _extract_ca_cert(container)
+            cluster["status"] = "ACTIVE"
+
+            for (acct_id, scoped_key), cfg in list(_idp_configs._data.items()):
+                if acct_id == account_id:
+                    parts = scoped_key.split("\x00", 1)
+                    if len(parts) == 2 and parts[0] == cluster_name:
+                        cfg["status"] = "ACTIVE"
+        except Exception as e:
+            logger.warning("EKS: failed to restart k3s for %s — falling back to mock: %s", cluster_name, e)
+            cluster["status"] = "ACTIVE"
+            cluster["certificateAuthority"]["data"] = base64.b64encode(b"MOCK-CA-CERTIFICATE").decode()
+            cluster["endpoint"] = f"https://localhost:{port}"
+            for (acct_id, scoped_key), cfg in list(_idp_configs._data.items()):
+                if acct_id == account_id:
+                    parts = scoped_key.split("\x00", 1)
+                    if len(parts) == 2 and parts[0] == cluster_name:
+                        cfg["status"] = "ACTIVE"
+
+    threading.Thread(target=_bg_restart, daemon=True, name=f"eks-restart-{cluster_name}").start()
+
+
+def _associate_identity_provider_config(cluster_name, body):
+    cluster = _clusters.get(cluster_name)
+    if not cluster:
+        return _error(404, "ResourceNotFoundException", f"No cluster found for name: {cluster_name}.")
+
+    oidc = body.get("oidc")
+    if not oidc:
+        return _error(400, "InvalidParameterException", "oidc configuration is required.")
+
+    idp_name = oidc.get("identityProviderConfigName")
+    if not idp_name:
+        return _error(400, "InvalidParameterException", "identityProviderConfigName is required inside oidc config.")
+
+    if not oidc.get("issuerUrl") or not oidc.get("clientId"):
+        return _error(400, "InvalidParameterException", "issuerUrl and clientId are required inside oidc config.")
+
+    key = f"{cluster_name}\x00{idp_name}"
+    if key in _idp_configs:
+        return _error(409, "ResourceInUseException", f"OIDC provider configuration '{idp_name}' already exists on cluster '{cluster_name}'.")
+
+    _idp_configs[key] = {
+        "oidc": oidc,
+        "status": "CREATING",
+        "tags": body.get("tags") or {}
+    }
+
+    _restart_k3s(cluster_name, get_account_id())
+
+    update = {
+        "id": new_uuid(),
+        "status": "InProgress",
+        "type": "IdentityProviderConfigUpdate",
+        "params": [{"type": "IdentityProviderConfig", "value": idp_name}],
+        "createdAt": _now(),
+        "errors": [],
+    }
+    return _json_resp(200, {"update": update, "tags": body.get("tags") or {}})
+
+
+def _describe_identity_provider_config(cluster_name, body):
+    idp_cfg = body.get("identityProviderConfig") or {}
+    name = idp_cfg.get("name")
+    if not name:
+        return _error(400, "InvalidParameterException", "name is required in identityProviderConfig.")
+
+    key = f"{cluster_name}\x00{name}"
+    cfg = _idp_configs.get(key)
+    if not cfg:
+        return _error(404, "ResourceNotFoundException", f"OIDC provider configuration '{name}' not found on cluster '{cluster_name}'.")
+
+    oidc = cfg["oidc"]
+    response = {
+        "identityProviderConfig": {
+            "oidc": {
+                "clientId": oidc.get("clientId"),
+                "clusterName": cluster_name,
+                "groupsClaim": oidc.get("groupsClaim"),
+                "groupsPrefix": oidc.get("groupsPrefix"),
+                "identityProviderConfigArn": f"arn:aws:eks:{get_region()}:{get_account_id()}:identityproviderconfig/{cluster_name}/oidc/{name}/{new_uuid()}",
+                "identityProviderConfigName": name,
+                "issuerUrl": oidc.get("issuerUrl"),
+                "requiredClaims": oidc.get("requiredClaims") or {},
+                "status": cfg.get("status", "ACTIVE"),
+                "tags": cfg.get("tags") or {},
+                "usernameClaim": oidc.get("usernameClaim"),
+                "usernamePrefix": oidc.get("usernamePrefix"),
+            }
+        }
+    }
+    return _json_resp(200, response)
+
+
+def _disassociate_identity_provider_config(cluster_name, body):
+    cluster = _clusters.get(cluster_name)
+    if not cluster:
+        return _error(404, "ResourceNotFoundException", f"No cluster found for name: {cluster_name}.")
+
+    idp_cfg = body.get("identityProviderConfig") or {}
+    name = idp_cfg.get("name")
+    if not name:
+        return _error(400, "InvalidParameterException", "name is required in identityProviderConfig.")
+
+    key = f"{cluster_name}\x00{name}"
+    if key not in _idp_configs:
+        return _error(404, "ResourceNotFoundException", f"OIDC provider configuration '{name}' not found on cluster '{cluster_name}'.")
+
+    cfg = _idp_configs[key]
+    cfg["status"] = "DELETING"
+
+    def _bg_delete():
+        _idp_configs.pop(key, None)
+        _restart_k3s(cluster_name, get_account_id())
+
+    threading.Thread(target=_bg_delete, daemon=True, name=f"eks-delete-idp-{name}").start()
+
+    update = {
+        "id": new_uuid(),
+        "status": "InProgress",
+        "type": "IdentityProviderConfigUpdate",
+        "params": [{"type": "IdentityProviderConfig", "value": name}],
+        "createdAt": _now(),
+        "errors": [],
+    }
+    return _json_resp(200, {"update": update})
+
+
+# ---------------------------------------------------------------------------
 # OIDC discovery / JWKS (IRSA support)
 # ---------------------------------------------------------------------------
+
 
 def _oidc_discovery(oidc_id):
     issuer = _issuer_url(oidc_id)
@@ -976,6 +1181,28 @@ async def handle_request(method, path, headers, body_bytes, query_params):
         cluster_name = m.group(1)
         if method == "POST":
             return _associate_encryption_config(cluster_name, body)
+
+    # POST /clusters/{name}/identity-provider-configs/associate
+    m = re.fullmatch(r"/clusters/([A-Za-z0-9_-]+)/identity-provider-configs/associate", path)
+    if m:
+        cluster_name = m.group(1)
+        if method == "POST":
+            return _associate_identity_provider_config(cluster_name, body)
+
+    # POST /clusters/{name}/identity-provider-configs/disassociate
+    m = re.fullmatch(r"/clusters/([A-Za-z0-9_-]+)/identity-provider-configs/disassociate", path)
+    if m:
+        cluster_name = m.group(1)
+        if method == "POST":
+            return _disassociate_identity_provider_config(cluster_name, body)
+
+    # POST /clusters/{name}/identity-provider-configs/describe
+    m = re.fullmatch(r"/clusters/([A-Za-z0-9_-]+)/identity-provider-configs/describe", path)
+    if m:
+        cluster_name = m.group(1)
+        if method == "POST":
+            return _describe_identity_provider_config(cluster_name, body)
+
 
     # OIDC discovery + JWKS (IRSA). Path matches AWS shape under the ministack
     # /oidc prefix because we can't own oidc.eks.{region}.amazonaws.com.
