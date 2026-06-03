@@ -53,6 +53,12 @@ BASE_PORT = int(os.environ.get("RDS_BASE_PORT", "15432"))
 RDS_TMPFS_SIZE = os.environ.get("RDS_TMPFS_SIZE", "256m")
 RDS_PERSIST = os.environ.get("RDS_PERSIST", "0").lower() in ("1", "true", "yes")
 DOCKER_NETWORK = os.environ.get("DOCKER_NETWORK", "")
+# When set, skip ministack's own Docker network auto-detect so DescribeDBInstances
+# returns {MINISTACK_HOST, host_port} — the address that's actually reachable
+# from outside the Docker network (remote ministack deployments, host-side
+# clients of a containerised ministack). Off by default: existing in-network
+# behavior unchanged.
+RDS_PUBLIC_ENDPOINT = os.environ.get("MINISTACK_RDS_PUBLIC_ENDPOINT", "0").lower() in ("1", "true", "yes")
 
 _instances = AccountScopedDict()
 _clusters = AccountScopedDict()
@@ -278,8 +284,16 @@ def _get_docker():
 
 
 def _get_ministack_network(docker_client):
-    """Detect the Docker network MiniStack is running on (if containerised)."""
+    """Detect the Docker network MiniStack is running on (if containerised).
+
+    Honors MINISTACK_RDS_PUBLIC_ENDPOINT — when set, returns None so the
+    DescribeDBInstances endpoint resolves to {MINISTACK_HOST, host_port}
+    instead of the container-internal address (useful for remote-ministack
+    deployments where external clients can't reach the Docker network).
+    """
     global _ministack_network
+    if RDS_PUBLIC_ENDPOINT:
+        return None
     if _ministack_network is not None:
         return _ministack_network or None
     if DOCKER_NETWORK:

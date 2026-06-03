@@ -90,6 +90,13 @@ curl http://localhost:4566/_ministack/ses/messages
 
 # Filter by account (12-digit access-key ID used as the account ID)
 curl "http://localhost:4566/_ministack/ses/messages?account=000000000000"
+
+# Inspect SQS messages — returns every queue's messages grouped by account
+# (includes Body, MessageId, ReceiveCount, VisibleAt, IsVisible, MessageAttributes, FIFO group/dedup)
+curl http://localhost:4566/_ministack/sqs/messages
+
+# Filter by account and/or a specific queue
+curl "http://localhost:4566/_ministack/sqs/messages?account=000000000000&QueueUrl=http://localhost:4566/000000000000/my-queue"
 ```
 
 The reset endpoint is especially useful in CI pipelines and test suites — call it in `setUp`/`beforeEach` to get a clean environment for every test without restarting the container. Add `?init=1` to re-run your init scripts after the reset, restoring any resources they create (VPCs, queues, seed data, etc.).
@@ -674,6 +681,7 @@ end-to-end without any client config.
 | `RDS_TMPFS_SIZE` | `256m` | Tmpfs size for RDS database containers (when `RDS_PERSIST=0`). Set to `2g` or higher for large databases |
 | `GLUE_DOCKER_IMAGE` | (auto by `GlueVersion`) | Override the `amazon/aws-glue-libs` PySpark image used for Spark Glue jobs. Defaults: `glue_libs_4.0.0_image_01` (GlueVersion 4.0), `glue_libs_3.0.0_image_01` (GlueVersion 3.0) |
 | `RDS_PERSIST` | `0` | Set `1` to use Docker named volumes for RDS containers instead of tmpfs. Storage grows dynamically with no fixed cap |
+| `MINISTACK_RDS_PUBLIC_ENDPOINT` | `0` | Set `1` when MiniStack itself runs in a Docker container but RDS clients connect from outside that network (remote MiniStack host, host-side clients, CI runners). `DescribeDBInstances` then returns `{MINISTACK_HOST, host_port}` — the externally-reachable host-published port — instead of the container-internal address. Set `MINISTACK_HOST` to the host clients will use |
 | `DOCKER_NETWORK` | _(unset)_ | Docker network for all container-backed services (RDS, EKS, ElastiCache, Lambda). Set to your Docker Compose network name so containers can reach each other. Replaces `LAMBDA_DOCKER_NETWORK` |
 | `ELASTICACHE_BASE_PORT` | `16379` | Starting host port for ElastiCache containers |
 | `ELASTICACHE_CLUSTER_MODE_REAL` | `0` | Set `1` (requires `DOCKER_NETWORK`) to provision real Redis Cluster replication groups: `NumNodeGroups × (1+ReplicasPerNodeGroup)` cluster-enabled nodes wired with `redis-cli --cluster create`, serving real `CLUSTER SLOTS` / `MOVED` redirects for cluster-aware clients |

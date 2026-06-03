@@ -991,13 +991,12 @@ def _associate_identity_provider_config(cluster_name, body):
     if not oidc.get("issuerUrl") or not oidc.get("clientId"):
         return _error(400, "InvalidParameterException", "issuerUrl and clientId are required inside oidc config.")
 
-    key = f"{cluster_name}\x00{idp_name}"
-    if key in _idp_configs:
-        return _error(409, "ResourceInUseException", f"OIDC provider configuration '{idp_name}' already exists on cluster '{cluster_name}'.")
-    # AWS allows only one OIDC IdP config per cluster regardless of name.
+    # AWS allows only one OIDC IdP config per cluster regardless of name —
+    # this covers same-name and different-name duplicates in one check.
     for existing_key in _idp_configs.keys():
         if existing_key.startswith(f"{cluster_name}\x00"):
             return _error(409, "ResourceInUseException", f"Cluster '{cluster_name}' already has an OIDC identity provider configuration.")
+    key = f"{cluster_name}\x00{idp_name}"
 
     arn = (
         f"arn:aws:eks:{get_region()}:{get_account_id()}"
