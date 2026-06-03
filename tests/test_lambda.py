@@ -3640,6 +3640,151 @@ def test_lambda_sqs_poller_does_not_tail_match_foreign_region_event_source(monke
         set_request_region(original_region)
 
 
+def _kinesis_stream_record(stream_name: str, stream_arn: str) -> dict:
+    return {
+        "StreamName": stream_name,
+        "StreamARN": stream_arn,
+        "StreamStatus": "ACTIVE",
+        "shards": {
+            "shardId-000000000000": {
+                "records": [{
+                    "SequenceNumber": "1",
+                    "ApproximateArrivalTimestamp": int(time.time()),
+                    "Data": b"payload",
+                    "PartitionKey": "pk",
+                }],
+            },
+        },
+    }
+
+
+_INVALID_KINESIS_ESM_ARNS = [
+    "arn:aws:kinesis:us-east-1:000000000000:esm-kinesis-source",
+    "arn:aws:kinesis:us-west-2:000000000000:stream/esm-kinesis-source",
+    "arn:aws:kinesis:us-east-1:111111111111:stream/esm-kinesis-source",
+    "arn:aws:sns:us-east-1:000000000000:stream/esm-kinesis-source",
+]
+
+
+@pytest.mark.parametrize("event_source_arn", _INVALID_KINESIS_ESM_ARNS)
+def test_lambda_create_esm_rejects_invalid_kinesis_arns_without_stream_name_fallback(event_source_arn):
+    from ministack.services import kinesis as _kin
+
+    original_account = get_account_id()
+    original_region = get_region()
+    original_functions = dict(lsvc._functions._data)
+    original_esms = dict(lsvc._esms._data)
+    original_streams = dict(_kin._streams._data)
+
+    stream_name = "esm-kinesis-source"
+    local_stream_arn = f"arn:aws:kinesis:us-east-1:000000000000:stream/{stream_name}"
+    function_name = "esm-kinesis-source-fn"
+
+    try:
+        set_request_account_id("000000000000")
+        set_request_region("us-east-1")
+        lsvc._functions.clear()
+        lsvc._esms.clear()
+        _kin._streams.clear()
+
+        lsvc._functions[function_name] = {
+            "config": {
+                "FunctionName": function_name,
+                "FunctionArn": f"arn:aws:lambda:us-east-1:000000000000:function:{function_name}",
+            },
+            "versions": {},
+            "aliases": {},
+        }
+        _kin._streams[stream_name] = _kinesis_stream_record(stream_name, local_stream_arn)
+
+        status, _headers, body = lsvc._create_esm({
+            "EventSourceArn": event_source_arn,
+            "FunctionName": function_name,
+            "StartingPosition": "TRIM_HORIZON",
+        })
+
+        assert status == 400
+        assert json.loads(body)["__type"] == "InvalidParameterValueException"
+        assert not lsvc._esms.values()
+    finally:
+        lsvc._functions.clear()
+        lsvc._functions._data.update(original_functions)
+        lsvc._esms.clear()
+        lsvc._esms._data.update(original_esms)
+        _kin._streams.clear()
+        _kin._streams._data.update(original_streams)
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
+@pytest.mark.parametrize("event_source_arn", _INVALID_KINESIS_ESM_ARNS)
+def test_lambda_kinesis_poller_does_not_tail_match_invalid_event_source_arn(
+    monkeypatch,
+    event_source_arn,
+):
+    from ministack.services import kinesis as _kin
+
+    original_account = get_account_id()
+    original_region = get_region()
+    original_functions = dict(lsvc._functions._data)
+    original_esms = dict(lsvc._esms._data)
+    original_streams = dict(_kin._streams._data)
+    original_positions = dict(lsvc._kinesis_positions._data)
+    called = {"value": False}
+
+    def _unexpected_invoke(_func, _event):
+        called["value"] = True
+        return {"error": False, "body": {}}
+
+    stream_name = "esm-kinesis-source"
+    local_stream_arn = f"arn:aws:kinesis:us-east-1:000000000000:stream/{stream_name}"
+    function_name = "esm-kinesis-source-fn"
+
+    try:
+        set_request_account_id("000000000000")
+        set_request_region("us-east-1")
+        lsvc._functions.clear()
+        lsvc._esms.clear()
+        lsvc._kinesis_positions.clear()
+        _kin._streams.clear()
+
+        lsvc._functions[function_name] = {
+            "config": {
+                "FunctionName": function_name,
+                "FunctionArn": f"arn:aws:lambda:us-east-1:000000000000:function:{function_name}",
+            },
+            "versions": {},
+            "aliases": {},
+        }
+        _kin._streams[stream_name] = _kinesis_stream_record(stream_name, local_stream_arn)
+        lsvc._esms["esm-kinesis-source"] = {
+            "UUID": "esm-kinesis-source",
+            "EventSourceArn": event_source_arn,
+            "FunctionName": function_name,
+            "State": "Enabled",
+            "Enabled": True,
+            "BatchSize": 1,
+            "StartingPosition": "TRIM_HORIZON",
+        }
+        monkeypatch.setattr(lsvc, "_execute_function", _unexpected_invoke)
+
+        lsvc._poll_kinesis()
+
+        assert called["value"] is False
+        assert lsvc._kinesis_positions.get("esm-kinesis-source") is None
+    finally:
+        lsvc._functions.clear()
+        lsvc._functions._data.update(original_functions)
+        lsvc._esms.clear()
+        lsvc._esms._data.update(original_esms)
+        lsvc._kinesis_positions.clear()
+        lsvc._kinesis_positions._data.update(original_positions)
+        _kin._streams.clear()
+        _kin._streams._data.update(original_streams)
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
 def test_lambda_create_esm_rejects_unresolved_function_arn():
     original_account = get_account_id()
     original_region = get_region()
