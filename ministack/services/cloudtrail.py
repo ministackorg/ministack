@@ -20,6 +20,7 @@ import logging
 import os
 import time
 
+from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.persistence import load_state
 from ministack.core.responses import AccountScopedDict, get_account_id, get_region, new_uuid
 
@@ -90,6 +91,37 @@ def _scrub(params: dict) -> dict:
 
 def _trail_arn(name: str) -> str:
     return f"arn:aws:cloudtrail:{get_region()}:{get_account_id()}:trail/{name}"
+
+
+def _parse_trail_arn(arn: str):
+    try:
+        spec = parse_arn(arn)
+    except ArnParseError as exc:
+        raise ValueError("Invalid CloudTrail trail ARN.") from exc
+
+    if spec.service != "cloudtrail" or not spec.resource.startswith("trail/"):
+        raise ValueError("Invalid CloudTrail trail ARN.")
+    trail_name = spec.resource[len("trail/"):]
+    if not trail_name or "/" in trail_name:
+        raise ValueError("Invalid CloudTrail trail ARN.")
+    return spec, trail_name
+
+
+def _trail_name_from_arn(arn: str) -> str | None:
+    spec, trail_name = _parse_trail_arn(arn)
+    if spec.region != get_region() or spec.account_id != get_account_id():
+        return None
+    return trail_name
+
+
+def _trail_name_from_read_arn(arn: str) -> str | None:
+    spec, trail_name = _parse_trail_arn(arn)
+    if spec.account_id != get_account_id():
+        return None
+    trail = _trails.get(trail_name)
+    if trail is None or trail.get("TrailARN") != str(spec):
+        return None
+    return trail_name
 
 
 def _get_event_queue() -> collections.deque:
@@ -227,10 +259,38 @@ def _lookup_events(body: dict):
     return _ok({"Events": filtered})
 
 
-def _resolve_trail_name(name: str) -> str:
+def _resolve_trail_name(name: str, *, allow_cross_region_arn: bool = False) -> str | None:
     if name.startswith("arn:"):
-        return name.rsplit("/", 1)[-1]
+        if allow_cross_region_arn:
+            return _trail_name_from_read_arn(name)
+        return _trail_name_from_arn(name)
     return name
+
+
+def _resolve_trail_name_or_error(name: str, *, allow_cross_region_arn: bool = False):
+    try:
+        return _resolve_trail_name(name, allow_cross_region_arn=allow_cross_region_arn), None
+    except ValueError as exc:
+        return None, _err("CloudTrailARNInvalidException", str(exc))
+
+
+def _validate_trail_arn(arn: str):
+    try:
+        name = _trail_name_from_arn(arn)
+    except ValueError as exc:
+        return _err("CloudTrailARNInvalidException", str(exc))
+    if name is None:
+        return _err("CloudTrailARNInvalidException", "Invalid CloudTrail trail ARN.")
+    return None
+
+
+def _resolve_existing_trail_name_or_error(raw: str, *, allow_cross_region_arn: bool = False):
+    name, error = _resolve_trail_name_or_error(raw, allow_cross_region_arn=allow_cross_region_arn)
+    if error:
+        return None, error
+    if name is None or _trails.get(name) is None:
+        return None, _err("TrailNotFoundException", f"Unknown trail: {raw!r}", 404)
+    return name, None
 
 
 def _create_trail(body: dict):
@@ -274,7 +334,9 @@ def _delete_trail(body: dict):
     raw = body.get("Name", "").strip()
     if not raw:
         return _err("InvalidTrailNameException", "Trail name is required.")
-    name = _resolve_trail_name(raw)
+    name, error = _resolve_trail_name_or_error(raw)
+    if error:
+        return error
     if _trails.get(name) is None:
         return _err("TrailNotFoundException", f"Unknown trail: {name!r}", 404)
     del _trails[name]
@@ -286,7 +348,9 @@ def _get_trail(body: dict):
     raw = body.get("Name", "").strip()
     if not raw:
         return _err("InvalidTrailNameException", "Trail name is required.")
-    name = _resolve_trail_name(raw)
+    name, error = _resolve_trail_name_or_error(raw, allow_cross_region_arn=True)
+    if error:
+        return error
     trail = _trails.get(name)
     if trail is None:
         return _err("TrailNotFoundException", f"Unknown trail: {name!r}", 404)
@@ -297,7 +361,12 @@ def _describe_trails(body: dict):
     trail_names = body.get("trailNameList", [])
     all_trails = [v for _, v in _trails.items()]
     if trail_names:
-        resolved = {_resolve_trail_name(n) for n in trail_names}
+        resolved = set()
+        for trail_name in trail_names:
+            name, error = _resolve_trail_name_or_error(trail_name, allow_cross_region_arn=True)
+            if error:
+                return error
+            resolved.add(name)
         all_trails = [t for t in all_trails if t["Name"] in resolved]
     return _ok({"trailList": all_trails})
 
@@ -306,7 +375,9 @@ def _get_trail_status(body: dict):
     raw = body.get("Name", "").strip()
     if not raw:
         return _err("InvalidTrailNameException", "Trail name is required.")
-    name = _resolve_trail_name(raw)
+    name, error = _resolve_trail_name_or_error(raw, allow_cross_region_arn=True)
+    if error:
+        return error
     trail = _trails.get(name)
     if trail is None:
         return _err("TrailNotFoundException", f"Unknown trail: {name!r}", 404)
@@ -328,7 +399,9 @@ def _start_logging(body: dict):
     raw = body.get("Name", "").strip()
     if not raw:
         return _err("InvalidTrailNameException", "Trail name is required.")
-    name = _resolve_trail_name(raw)
+    name, error = _resolve_trail_name_or_error(raw)
+    if error:
+        return error
     trail = _trails.get(name)
     if trail is None:
         return _err("TrailNotFoundException", f"Unknown trail: {name!r}", 404)
@@ -342,7 +415,9 @@ def _stop_logging(body: dict):
     raw = body.get("Name", "").strip()
     if not raw:
         return _err("InvalidTrailNameException", "Trail name is required.")
-    name = _resolve_trail_name(raw)
+    name, error = _resolve_trail_name_or_error(raw)
+    if error:
+        return error
     trail = _trails.get(name)
     if trail is None:
         return _err("TrailNotFoundException", f"Unknown trail: {name!r}", 404)
@@ -369,7 +444,9 @@ def _update_trail(body: dict):
     raw = body.get("Name", "").strip()
     if not raw:
         return _err("InvalidTrailNameException", "Trail name is required.")
-    name = _resolve_trail_name(raw)
+    name, error = _resolve_trail_name_or_error(raw)
+    if error:
+        return error
     trail = _trails.get(name)
     if trail is None:
         return _err("TrailNotFoundException", f"Unknown trail: {name!r}", 404)
@@ -410,7 +487,9 @@ def _put_event_selectors(body: dict):
     raw = body.get("TrailName", "").strip()
     if not raw:
         return _err("InvalidTrailNameException", "Trail name is required.")
-    name = _resolve_trail_name(raw)
+    name, error = _resolve_existing_trail_name_or_error(raw)
+    if error:
+        return error
     selectors = body.get("EventSelectors", [])
     _event_selectors[name] = selectors
     return _ok({"TrailARN": _trail_arn(name), "EventSelectors": selectors})
@@ -420,11 +499,14 @@ def _get_event_selectors(body: dict):
     raw = body.get("TrailName", "").strip()
     if not raw:
         return _err("InvalidTrailNameException", "Trail name is required.")
-    name = _resolve_trail_name(raw)
+    name, error = _resolve_existing_trail_name_or_error(raw, allow_cross_region_arn=True)
+    if error:
+        return error
+    trail = _trails.get(name) or {}
     selectors = _event_selectors.get(name) or []
     return _ok(
         {
-            "TrailARN": _trail_arn(name),
+            "TrailARN": trail.get("TrailARN", _trail_arn(name)),
             "EventSelectors": selectors,
             "AdvancedEventSelectors": [],
         }
@@ -435,6 +517,9 @@ def _add_tags(body: dict):
     arn = body.get("ResourceId", "").strip()
     if not arn:
         return _err("CloudTrailARNInvalidException", "ResourceId (trail ARN) is required.")
+    error = _validate_trail_arn(arn)
+    if error:
+        return error
     existing = _trail_tags.get(arn) or {}
     for tag in body.get("TagsList", []):
         existing[tag["Key"]] = tag["Value"]
@@ -444,6 +529,10 @@ def _add_tags(body: dict):
 
 def _list_tags(body: dict):
     arns = body.get("ResourceIdList", [])
+    for arn in arns:
+        error = _validate_trail_arn(arn)
+        if error:
+            return error
     result = [
         {
             "ResourceId": arn,
@@ -458,6 +547,9 @@ def _remove_tags(body: dict):
     arn = body.get("ResourceId", "").strip()
     if not arn:
         return _err("CloudTrailARNInvalidException", "ResourceId (trail ARN) is required.")
+    error = _validate_trail_arn(arn)
+    if error:
+        return error
     existing = _trail_tags.get(arn) or {}
     for tag in body.get("TagsList", []):
         existing.pop(tag.get("Key", ""), None)
