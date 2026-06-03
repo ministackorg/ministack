@@ -2117,3 +2117,70 @@ def test_ebs_modify_volume_attribute(ec2):
     # Stub — just verify it doesn't error
     resp = ec2.describe_volume_attribute(VolumeId=vol_id, Attribute="autoEnableIO")
     assert resp["VolumeId"] == vol_id
+
+
+def test_ec2_create_describe_fleet(ec2):
+    lt = ec2.create_launch_template(
+        LaunchTemplateName="test-fleet-lt",
+        LaunchTemplateData={"ImageId": "ami-12345678", "InstanceType": "t2.small"}
+    )
+    lt_id = lt["LaunchTemplate"]["LaunchTemplateId"]
+
+    # Create fleet with overrides and tag specifications
+    fleet = ec2.create_fleet(
+        LaunchTemplateConfigs=[
+            {
+                "LaunchTemplateSpecification": {
+                    "LaunchTemplateId": lt_id,
+                    "Version": "1"
+                },
+                "Overrides": [
+                    {
+                        "InstanceType": "t2.medium"
+                    }
+                ]
+            }
+        ],
+        TargetCapacitySpecification={
+            "TotalTargetCapacity": 2,
+            "OnDemandTargetCapacity": 2,
+        },
+        Type="instant",
+        TagSpecifications=[
+            {
+                "ResourceType": "fleet",
+                "Tags": [
+                    {"Key": "Environment", "Value": "Production"}
+                ]
+            }
+        ]
+    )
+
+    fleet_id = fleet["FleetId"]
+    assert fleet_id.startswith("fleet-")
+    assert len(fleet["Instances"]) == 1
+    assert fleet["Instances"][0]["InstanceType"] == "t2.medium"
+    assert fleet["Instances"][0]["Lifecycle"] == "on-demand"
+    assert len(fleet["Instances"][0]["InstanceIds"]) == 2
+
+    # Verify instances are running
+    inst_ids = fleet["Instances"][0]["InstanceIds"]
+    desc_inst = ec2.describe_instances(InstanceIds=inst_ids)
+    reservations = desc_inst["Reservations"]
+    assert len(reservations) >= 1
+    launched_instances = [inst for r in reservations for inst in r["Instances"]]
+    assert len(launched_instances) == 2
+    for inst in launched_instances:
+        assert inst["InstanceType"] == "t2.medium"
+        assert inst["ImageId"] == "ami-12345678"
+
+    # Describe fleet and verify details and tags
+    resp = ec2.describe_fleets(FleetIds=[fleet_id])
+    assert len(resp["Fleets"]) == 1
+    f = resp["Fleets"][0]
+    assert f["FleetId"] == fleet_id
+    assert f["FulfilledCapacity"] == 2.0
+    assert f["FulfilledOnDemandCapacity"] == 2.0
+    assert f["TargetCapacitySpecification"]["TotalTargetCapacity"] == 2
+    assert any(t["Key"] == "Environment" and t["Value"] == "Production" for t in f.get("Tags", []))
+

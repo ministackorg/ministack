@@ -103,6 +103,8 @@ _vpn_gateways = AccountScopedDict()    # vgw_id -> VPN gateway record
 _customer_gateways = AccountScopedDict()  # cgw_id -> customer gateway record
 _vpn_connections = AccountScopedDict()    # vpn_id -> VPN connection record
 _launch_templates = AccountScopedDict()   # lt_id -> launch template record (includes versions list)
+_fleets = AccountScopedDict()             # fleet_id -> fleet record
+
 
 
 # ── Persistence ────────────────────────────────────────────
@@ -133,6 +135,7 @@ def get_state():
         "customer_gateways": copy.deepcopy(_customer_gateways),
         "vpn_connections": copy.deepcopy(_vpn_connections),
         "launch_templates": copy.deepcopy(_launch_templates),
+        "fleets": copy.deepcopy(_fleets),
     }
 
 
@@ -162,6 +165,7 @@ def restore_state(data):
         _customer_gateways.update(data.get("customer_gateways", {}))
         _vpn_connections.update(data.get("vpn_connections", {}))
         _launch_templates.update(data.get("launch_templates", {}))
+        _fleets.update(data.get("fleets", {}))
 
 
 try:
@@ -295,38 +299,12 @@ async def handle_request(method, path, headers, body, query_params):
 # Instances
 # ---------------------------------------------------------------------------
 
-def _run_instances(p):
-    image_id = _p(p, "ImageId") or "ami-00000000"
-    instance_type = _p(p, "InstanceType") or "t2.micro"
-    min_count = int(_p(p, "MinCount") or "1")
-    max_count = int(_p(p, "MaxCount") or "1")
-    if min_count > max_count:
-        return _error("InvalidParameterCombination",
-                      f"Value ({min_count}) for parameter MinCount is not valid. "
-                      f"MinCount must not exceed MaxCount.", 400)
-    key_name = _p(p, "KeyName") or ""
-    subnet_id = _p(p, "SubnetId") or _DEFAULT_SUBNET_ID
-    user_data = _p(p, "UserData") or ""
-
-    sg_ids = _parse_member_list(p, "SecurityGroupId")
+def _launch_instances_internal(image_id, instance_type, subnet_id, count, key_name="", user_data="", sg_ids=None, requested_private_ip=None, iam_profile=None):
+    now = _now_ts()
     if not sg_ids:
         sg_ids = [_DEFAULT_SG_ID]
-
-    now = _now_ts()
-    # Optional caller-provided values: respect them if set; fall back to defaults otherwise.
-    requested_private_ip = _p(p, "PrivateIpAddress")
-    iam_arn = _p(p, "IamInstanceProfile.Arn")
-    iam_name = _p(p, "IamInstanceProfile.Name")
-    iam_profile = None
-    if iam_arn or iam_name:
-        # Real AWS returns both Arn and Id. We synthesize a stable Id from the
-        # name/arn so DescribeInstances reads back as it does on AWS.
-        if not iam_arn and iam_name:
-            iam_arn = f"arn:aws:iam::{get_account_id()}:instance-profile/{iam_name}"
-        iam_id = "AIPA" + new_uuid().replace("-", "").upper()[:17]
-        iam_profile = {"Arn": iam_arn, "Id": iam_id}
     created = []
-    for _ in range(max(1, min(min_count, max_count))):
+    for _ in range(count):
         instance_id = _new_instance_id()
         private_ip = requested_private_ip or _random_ip("10.0.")
         # Synthesize a real root EBS volume so DescribeVolumes / DescribeInstances
@@ -366,7 +344,7 @@ def _run_instances(p):
                 "DeleteOnTermination": True,
             },
         }]
-        _instances[instance_id] = {
+        inst = {
             "InstanceId": instance_id,
             "ImageId": image_id,
             "InstanceType": instance_type,
@@ -398,7 +376,52 @@ def _run_instances(p):
             "BlockDeviceMappings": block_device_mappings,
             "IamInstanceProfile": iam_profile,
         }
-        created.append(_instances[instance_id])
+        _instances[instance_id] = inst
+        created.append(inst)
+    return created
+
+
+def _run_instances(p):
+    image_id = _p(p, "ImageId") or "ami-00000000"
+    instance_type = _p(p, "InstanceType") or "t2.micro"
+    min_count = int(_p(p, "MinCount") or "1")
+    max_count = int(_p(p, "MaxCount") or "1")
+    if min_count > max_count:
+        return _error("InvalidParameterCombination",
+                      f"Value ({min_count}) for parameter MinCount is not valid. "
+                      f"MinCount must not exceed MaxCount.", 400)
+    key_name = _p(p, "KeyName") or ""
+    subnet_id = _p(p, "SubnetId") or _DEFAULT_SUBNET_ID
+    user_data = _p(p, "UserData") or ""
+
+    sg_ids = _parse_member_list(p, "SecurityGroupId")
+    if not sg_ids:
+        sg_ids = [_DEFAULT_SG_ID]
+
+    # Optional caller-provided values: respect them if set; fall back to defaults otherwise.
+    requested_private_ip = _p(p, "PrivateIpAddress")
+    iam_arn = _p(p, "IamInstanceProfile.Arn")
+    iam_name = _p(p, "IamInstanceProfile.Name")
+    iam_profile = None
+    if iam_arn or iam_name:
+        # Real AWS returns both Arn and Id. We synthesize a stable Id from the
+        # name/arn so DescribeInstances reads back as it does on AWS.
+        if not iam_arn and iam_name:
+            iam_arn = f"arn:aws:iam::{get_account_id()}:instance-profile/{iam_name}"
+        iam_id = "AIPA" + new_uuid().replace("-", "").upper()[:17]
+        iam_profile = {"Arn": iam_arn, "Id": iam_id}
+
+    created = _launch_instances_internal(
+        image_id=image_id,
+        instance_type=instance_type,
+        subnet_id=subnet_id,
+        count=max(1, min(min_count, max_count)),
+        key_name=key_name,
+        user_data=user_data,
+        sg_ids=sg_ids,
+        requested_private_ip=requested_private_ip,
+        iam_profile=iam_profile
+    )
 
     # Process TagSpecifications
     i = 1
@@ -423,6 +446,7 @@ def _run_instances(p):
     <ownerId>{get_account_id()}</ownerId>
     <groupSet/>"""
     return _xml(200, "RunInstancesResponse", inner)
+
 
 
 _last_cleanup = [0.0]
@@ -3926,6 +3950,7 @@ def reset():
     _customer_gateways.clear()
     _vpn_connections.clear()
     _launch_templates.clear()
+    _fleets.clear()
     _init_defaults()
 
 
@@ -4658,8 +4683,272 @@ def _delete_launch_template(p):
     </launchTemplate>""")
 
 
+def _fleet_instances_xml(instances_list, configs):
+    instances_xml = []
+    for item in instances_list:
+        inst_ids_xml = "".join(f"<item>{_esc(iid)}</item>" for iid in item["InstanceIds"])
+        lt_and_overrides_xml = ""
+        if configs:
+            cfg = configs[0]
+            spec = cfg.get("LaunchTemplateSpecification", {})
+            lt_id_val = spec.get("LaunchTemplateId") or ""
+            lt_name_val = spec.get("LaunchTemplateName") or ""
+            version_val = spec.get("Version") or "$Default"
+            lt_and_overrides_xml = f"""
+            <launchTemplateAndOverrides>
+                <launchTemplateSpecification>
+                    <launchTemplateId>{_esc(lt_id_val)}</launchTemplateId>
+                    <launchTemplateName>{_esc(lt_name_val)}</launchTemplateName>
+                    <version>{_esc(version_val)}</version>
+                </launchTemplateSpecification>
+            </launchTemplateAndOverrides>
+            """
+        instances_xml.append(f"""<item>
+            {lt_and_overrides_xml}
+            <lifecycle>{_esc(item["Lifecycle"])}</lifecycle>
+            <instanceIds>{inst_ids_xml}</instanceIds>
+            <instanceType>{_esc(item["InstanceType"])}</instanceType>
+        </item>""")
+    return "".join(instances_xml)
+
+
+def _create_fleet(p):
+    fleet_type = _p(p, "Type") or "maintain"
+    total_capacity = int(
+        _p(p, "TargetCapacitySpecification.TotalTargetCapacity")
+        or _p(p, "TargetCapacitySpecification.OnDemandTargetCapacity")
+        or _p(p, "TargetCapacitySpecification.SpotTargetCapacity")
+        or "1"
+    )
+
+    # Parse LaunchTemplateConfigs
+    configs = []
+    i = 1
+    while True:
+        lt_id = _p(p, f"LaunchTemplateConfigs.{i}.LaunchTemplateSpecification.LaunchTemplateId")
+        lt_name = _p(p, f"LaunchTemplateConfigs.{i}.LaunchTemplateSpecification.LaunchTemplateName")
+        version = _p(p, f"LaunchTemplateConfigs.{i}.LaunchTemplateSpecification.Version")
+
+        # Overrides
+        overrides = []
+        j = 1
+        while True:
+            itype = _p(p, f"LaunchTemplateConfigs.{i}.Overrides.{j}.InstanceType")
+            sub_id = _p(p, f"LaunchTemplateConfigs.{i}.Overrides.{j}.SubnetId")
+            if not itype and not sub_id:
+                break
+            overrides.append({
+                "InstanceType": itype,
+                "SubnetId": sub_id
+            })
+            j += 1
+
+        if not lt_id and not lt_name and not overrides:
+            break
+
+        configs.append({
+            "LaunchTemplateSpecification": {
+                "LaunchTemplateId": lt_id,
+                "LaunchTemplateName": lt_name,
+                "Version": version or "$Default",
+            },
+            "Overrides": overrides,
+        })
+        i += 1
+
+    # Resolve settings from the first launch template configuration
+    image_id = "ami-00000000"
+    instance_type = "t2.micro"
+    subnet_id = _DEFAULT_SUBNET_ID
+    key_name = ""
+    user_data = ""
+    sg_ids = None
+    iam_profile = None
+
+    if configs:
+        cfg = configs[0]
+        spec = cfg["LaunchTemplateSpecification"]
+        lt_id = spec.get("LaunchTemplateId")
+        lt_name = spec.get("LaunchTemplateName")
+        version_str = spec.get("Version") or "$Default"
+
+        lt = None
+        if lt_id:
+            lt = _launch_templates.get(lt_id)
+        elif lt_name:
+            for t in _launch_templates.values():
+                if t["LaunchTemplateName"] == lt_name:
+                    lt = t
+                    lt_id = lt["LaunchTemplateId"]
+                    break
+
+        if (lt_id or lt_name) and not lt:
+            return _error(
+                "InvalidLaunchTemplateId.NotFoundException",
+                f"The launch template '{lt_id or lt_name}' does not exist",
+                400
+            )
+
+        if lt:
+            versions = lt.get("Versions", [])
+            target_ver = 1
+            if version_str == "$Default":
+                target_ver = lt.get("DefaultVersionNumber", 1)
+            elif version_str == "$Latest":
+                target_ver = lt.get("LatestVersionNumber", 1)
+            else:
+                try:
+                    target_ver = int(version_str)
+                except ValueError:
+                    target_ver = 1
+
+            version = None
+            for v in versions:
+                if v["VersionNumber"] == target_ver:
+                    version = v
+                    break
+            if not version and versions:
+                version = versions[0]
+
+            if version:
+                lt_data = version.get("LaunchTemplateData", {})
+                image_id = lt_data.get("ImageId") or image_id
+                instance_type = lt_data.get("InstanceType") or instance_type
+                subnet_id = lt_data.get("SubnetId") or subnet_id
+                key_name = lt_data.get("KeyName") or key_name
+                user_data = lt_data.get("UserData") or user_data
+                sg_ids = lt_data.get("SecurityGroupIds") or sg_ids
+
+                lt_iam = lt_data.get("IamInstanceProfile", {})
+                iam_arn = lt_iam.get("Arn")
+                iam_name = lt_iam.get("Name")
+                if iam_arn or iam_name:
+                    if not iam_arn and iam_name:
+                        iam_arn = f"arn:aws:iam::{get_account_id()}:instance-profile/{iam_name}"
+                    iam_id = "AIPA" + new_uuid().replace("-", "").upper()[:17]
+                    iam_profile = {"Arn": iam_arn, "Id": iam_id}
+
+        # Apply overrides
+        if cfg.get("Overrides"):
+            override = cfg["Overrides"][0]
+            if override.get("InstanceType"):
+                instance_type = override["InstanceType"]
+            if override.get("SubnetId"):
+                subnet_id = override["SubnetId"]
+
+    # Launch instances
+    launched = _launch_instances_internal(
+        image_id=image_id,
+        instance_type=instance_type,
+        subnet_id=subnet_id,
+        count=total_capacity,
+        key_name=key_name,
+        user_data=user_data,
+        sg_ids=sg_ids,
+        iam_profile=iam_profile,
+    )
+
+    # Process tag specifications
+    fleet_tags = []
+    instance_tags = []
+    i = 1
+    while _p(p, f"TagSpecification.{i}.ResourceType"):
+        rtype = _p(p, f"TagSpecification.{i}.ResourceType")
+        spec_tags = []
+        j = 1
+        while _p(p, f"TagSpecification.{i}.Tag.{j}.Key"):
+            spec_tags.append({
+                "Key": _p(p, f"TagSpecification.{i}.Tag.{j}.Key"),
+                "Value": _p(p, f"TagSpecification.{i}.Tag.{j}.Value", ""),
+            })
+            j += 1
+        if rtype == "fleet":
+            fleet_tags.extend(spec_tags)
+        elif rtype == "instance":
+            instance_tags.extend(spec_tags)
+        i += 1
+
+    if instance_tags:
+        for inst in launched:
+            _tags[inst["InstanceId"]] = instance_tags[:]
+
+    fleet_id = "fleet-" + new_uuid()
+    if fleet_tags:
+        _tags[fleet_id] = fleet_tags
+
+    now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    fleet_record = {
+        "FleetId": fleet_id,
+        "FleetState": "active",
+        "ActivityStatus": "fulfilled",
+        "CreateTime": now_iso,
+        "Type": fleet_type,
+        "FulfilledCapacity": float(total_capacity),
+        "FulfilledOnDemandCapacity": float(total_capacity) if fleet_type != "spot" else 0.0,
+        "TargetCapacitySpecification": {
+            "TotalTargetCapacity": total_capacity,
+            "OnDemandTargetCapacity": total_capacity if fleet_type != "spot" else 0,
+            "SpotTargetCapacity": total_capacity if fleet_type == "spot" else 0,
+            "DefaultTargetCapacityType": "on-demand" if fleet_type != "spot" else "spot",
+        },
+        "LaunchTemplateConfigs": configs,
+        "Instances": [
+            {
+                "InstanceIds": [inst["InstanceId"] for inst in launched],
+                "InstanceType": instance_type,
+                "Lifecycle": "on-demand" if fleet_type != "spot" else "spot",
+            }
+        ],
+        "Tags": fleet_tags,
+    }
+    _fleets[fleet_id] = fleet_record
+
+    instances_xml_str = _fleet_instances_xml(fleet_record["Instances"], configs)
+    inner = f"""<fleetId>{_esc(fleet_id)}</fleetId>
+    <fleetInstanceSet>{instances_xml_str}</fleetInstanceSet>
+    <errorSet/>"""
+    return _xml(200, "CreateFleetResponse", inner)
+
+
+def _describe_fleets(p):
+    fleet_ids = _parse_member_list(p, "FleetId")
+    results = []
+    for f in _fleets.values():
+        if fleet_ids and f["FleetId"] not in fleet_ids:
+            continue
+        results.append(f)
+
+    items = []
+    for f in results:
+        instances_xml_str = _fleet_instances_xml(f["Instances"], f["LaunchTemplateConfigs"])
+        tag_set_xml = _tag_set_xml(f["FleetId"])
+        tcs = f["TargetCapacitySpecification"]
+        items.append(f"""<item>
+            <activityStatus>{_esc(f['ActivityStatus'])}</activityStatus>
+            <createTime>{_esc(f['CreateTime'])}</createTime>
+            <fleetId>{_esc(f['FleetId'])}</fleetId>
+            <fleetState>{_esc(f['FleetState'])}</fleetState>
+            <fulfilledCapacity>{f['FulfilledCapacity']}</fulfilledCapacity>
+            <fulfilledOnDemandCapacity>{f['FulfilledOnDemandCapacity']}</fulfilledOnDemandCapacity>
+            <targetCapacitySpecification>
+                <totalTargetCapacity>{int(tcs['TotalTargetCapacity'])}</totalTargetCapacity>
+                <onDemandTargetCapacity>{int(tcs['OnDemandTargetCapacity'])}</onDemandTargetCapacity>
+                <spotTargetCapacity>{int(tcs['SpotTargetCapacity'])}</spotTargetCapacity>
+                <defaultTargetCapacityType>{_esc(tcs['DefaultTargetCapacityType'])}</defaultTargetCapacityType>
+            </targetCapacitySpecification>
+            <type>{_esc(f['Type'])}</type>
+            <fleetInstanceSet>{instances_xml_str}</fleetInstanceSet>
+            <errorSet/>
+            {tag_set_xml}
+        </item>""")
+
+    fleet_set_xml = "".join(items)
+    return _xml(200, "DescribeFleetsResponse", f"<fleetSet>{fleet_set_xml}</fleetSet>")
+
+
 _ACTION_MAP = {
     "RunInstances": _run_instances,
+
     "DescribeInstances": _describe_instances,
     "DescribeInstanceStatus": _describe_instance_status,
     "DescribeInstanceAttribute": _describe_instance_attribute,
@@ -4813,4 +5102,6 @@ _ACTION_MAP = {
     "DescribeLaunchTemplateVersions": _describe_launch_template_versions,
     "ModifyLaunchTemplate": _modify_launch_template,
     "DeleteLaunchTemplate": _delete_launch_template,
+    "CreateFleet": _create_fleet,
+    "DescribeFleets": _describe_fleets,
 }

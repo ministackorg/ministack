@@ -2916,11 +2916,12 @@ def test_dynamodb_export_table_to_point_in_time(ddb):
         desc = r["ExportDescription"]
         assert desc["TableArn"] == arn
         assert desc["S3Bucket"] == "my-bucket"
-        assert desc["ExportStatus"] in ("IN_PROGRESS", "COMPLETED")
+        assert desc["ExportStatus"] == "IN_PROGRESS"
         export_arn = desc["ExportArn"]
 
         d = ddb.describe_export(ExportArn=export_arn)
         assert d["ExportDescription"]["ExportArn"] == export_arn
+        assert d["ExportDescription"]["ExportStatus"] == "COMPLETED"
 
         lst = ddb.list_exports(TableArn=arn)
         arns = [s["ExportArn"] for s in lst["ExportSummaries"]]

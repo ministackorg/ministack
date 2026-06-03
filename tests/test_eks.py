@@ -654,3 +654,57 @@ def test_eks_delete_access_entry_cascades_associated_policies(eks):
     finally:
         try: eks.delete_cluster(name=cn)
         except Exception: pass
+
+
+# ---------------------------------------------------------------------------
+# AssociateIdentityProviderConfig
+# ---------------------------------------------------------------------------
+
+def test_eks_identity_provider_config(eks):
+    cn = f"idp-{_uid()}"
+    eks.create_cluster(
+        name=cn, roleArn="arn:aws:iam::000000000000:role/eks",
+        resourcesVpcConfig={"subnetIds": ["subnet-1"]},
+    )
+    try:
+        # 1. Associate OIDC config
+        resp = eks.associate_identity_provider_config(
+            clusterName=cn,
+            oidc={
+                "identityProviderConfigName": "cognito-idp",
+                "issuerUrl": "https://cognito-idp.us-east-1.amazonaws.com/us-east-1_000000000",
+                "clientId": "client-12345",
+                "usernameClaim": "sub",
+                "groupsClaim": "cognito:groups",
+            },
+            tags={"env": "test"}
+        )
+        upd = resp["update"]
+        assert upd["type"] == "IdentityProviderConfigUpdate"
+        assert upd["status"] in ("InProgress", "Successful")
+
+        # 2. Describe OIDC config
+        desc = eks.describe_identity_provider_config(
+            clusterName=cn,
+            identityProviderConfig={"type": "oidc", "name": "cognito-idp"}
+        )
+        oidc_desc = desc["identityProviderConfig"]["oidc"]
+        assert oidc_desc["identityProviderConfigName"] == "cognito-idp"
+        assert oidc_desc["clientId"] == "client-12345"
+        assert oidc_desc["issuerUrl"] == "https://cognito-idp.us-east-1.amazonaws.com/us-east-1_000000000"
+        assert oidc_desc["status"] in ("CREATING", "ACTIVE")
+
+        # 3. Disassociate OIDC config
+        dis_resp = eks.disassociate_identity_provider_config(
+            clusterName=cn,
+            identityProviderConfig={"type": "oidc", "name": "cognito-idp"}
+        )
+        dis_upd = dis_resp["update"]
+        assert dis_upd["type"] == "IdentityProviderConfigUpdate"
+
+    finally:
+        try:
+            eks.delete_cluster(name=cn)
+        except Exception:
+            pass
+
