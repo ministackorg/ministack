@@ -10,6 +10,9 @@ Operations covered:
 Shapes verified against `botocore.data.s3tables.2024-12-01.service-2`.
 """
 
+import json
+import urllib.error
+import urllib.request
 import uuid as _uuid_mod
 
 import boto3
@@ -21,13 +24,34 @@ from botocore.exceptions import ClientError
 _ENDPOINT = "http://localhost:4566"
 
 
-def _make_s3tables_client(access_key="test"):
+def _iceberg_json(path, method="GET", payload=None, region_name=None, authorization=None):
+    data = json.dumps(payload).encode("utf-8") if payload is not None else None
+    headers = {"Content-Type": "application/json"}
+    if authorization:
+        headers["Authorization"] = authorization
+    elif region_name:
+        headers["Authorization"] = (
+            "AWS4-HMAC-SHA256 "
+            f"Credential=test/20260604/{region_name}/s3tables/aws4_request, "
+            "SignedHeaders=host, Signature=test"
+        )
+    req = urllib.request.Request(
+        f"{_ENDPOINT}{path}",
+        data=data,
+        method=method,
+        headers=headers,
+    )
+    with urllib.request.urlopen(req) as resp:
+        return json.loads(resp.read().decode("utf-8") or "{}")
+
+
+def _make_s3tables_client(access_key="test", region_name="us-east-1"):
     return boto3.client(
         "s3tables",
         endpoint_url=_ENDPOINT,
         aws_access_key_id=access_key,
         aws_secret_access_key="test",
-        region_name="us-east-1",
+        region_name=region_name,
         config=Config(retries={"mode": "standard"}),
     )
 
@@ -67,6 +91,53 @@ def test_s3tables_get_bucket_missing_returns_not_found(s3tables):
     with pytest.raises(ClientError) as exc:
         s3tables.get_table_bucket(tableBucketARN=fake_arn)
     assert exc.value.response["Error"]["Code"] in ("NotFoundException", "404")
+
+
+def test_s3tables_bucket_arn_scope_does_not_fallback_to_local_bucket(s3tables):
+    bucket_name = f"tb-scope-{_uuid_mod.uuid4().hex[:8]}"
+    arn = s3tables.create_table_bucket(name=bucket_name)["arn"]
+    ns = f"ns_{_uuid_mod.uuid4().hex[:6]}"
+    table = f"t_{_uuid_mod.uuid4().hex[:6]}"
+    try:
+        s3tables.create_namespace(tableBucketARN=arn, namespace=[ns])
+        s3tables.create_table(
+            tableBucketARN=arn,
+            namespace=ns,
+            name=table,
+            format="ICEBERG",
+            metadata={"iceberg": {"schema": {"fields": [{"name": "id", "type": "long"}]}}},
+        )
+
+        wrong_region = arn.replace(":us-east-1:", ":us-west-2:")
+        wrong_account = arn.replace(":000000000000:", ":111111111111:")
+        wrong_service = arn.replace(":s3tables:", ":s3:")
+        wrong_resource = arn.replace(":bucket/", ":table/")
+        for bad_ref in (wrong_region, wrong_account, wrong_service, wrong_resource):
+            with pytest.raises(ClientError) as exc:
+                s3tables.get_table_bucket(tableBucketARN=bad_ref)
+            assert exc.value.response["Error"]["Code"] in ("NotFoundException", "404")
+
+            with pytest.raises(ClientError) as exc:
+                s3tables.create_namespace(tableBucketARN=bad_ref, namespace=[f"ns_{_uuid_mod.uuid4().hex[:6]}"])
+            assert exc.value.response["Error"]["Code"] in ("NotFoundException", "404")
+
+            with pytest.raises(ClientError) as exc:
+                s3tables.list_tables(tableBucketARN=bad_ref)
+            assert exc.value.response["Error"]["Code"] in ("NotFoundException", "404")
+
+            with pytest.raises(ClientError) as exc:
+                s3tables.get_table(tableBucketARN=bad_ref, namespace=ns, name=table)
+            assert exc.value.response["Error"]["Code"] in ("NotFoundException", "404")
+    finally:
+        try:
+            s3tables.delete_table(tableBucketARN=arn, namespace=ns, name=table)
+        except Exception:
+            pass
+        try:
+            s3tables.delete_namespace(tableBucketARN=arn, namespace=ns)
+        except Exception:
+            pass
+        s3tables.delete_table_bucket(tableBucketARN=arn)
 
 
 # ── Namespace lifecycle ─────────────────────────────────────
@@ -226,3 +297,144 @@ def test_s3tables_buckets_are_account_scoped(s3tables):
             client_b.delete_table_bucket(tableBucketARN=arn_b)
         except Exception:
             pass
+
+
+def test_s3tables_buckets_are_region_scoped():
+    name = f"regional-{_uuid_mod.uuid4().hex[:6]}"
+    east = _make_s3tables_client(region_name="us-east-1")
+    west = _make_s3tables_client(region_name="us-west-2")
+
+    east_arn = east.create_table_bucket(name=name)["arn"]
+    west_arn = west.create_table_bucket(name=name)["arn"]
+    try:
+        assert ":us-east-1:" in east_arn
+        assert ":us-west-2:" in west_arn
+        assert east_arn != west_arn
+
+        east_arns = {b.get("arn") for b in east.list_table_buckets().get("tableBuckets", [])}
+        west_arns = {b.get("arn") for b in west.list_table_buckets().get("tableBuckets", [])}
+        assert east_arn in east_arns
+        assert west_arn not in east_arns
+        assert west_arn in west_arns
+        assert east_arn not in west_arns
+
+        with pytest.raises(ClientError) as exc:
+            east.get_table_bucket(tableBucketARN=west_arn)
+        assert exc.value.response["Error"]["Code"] in ("NotFoundException", "404")
+    finally:
+        try:
+            east.delete_table_bucket(tableBucketARN=east_arn)
+        except Exception:
+            pass
+        try:
+            west.delete_table_bucket(tableBucketARN=west_arn)
+        except Exception:
+            pass
+
+
+def test_s3tables_iceberg_catalog_spans_control_plane_regions():
+    west = _make_s3tables_client(region_name="us-west-2")
+    bucket_name = f"iceberg-west-{_uuid_mod.uuid4().hex[:6]}"
+    bucket_arn = west.create_table_bucket(name=bucket_name)["arn"]
+    ns = f"ns_{_uuid_mod.uuid4().hex[:6]}"
+    table = f"t_{_uuid_mod.uuid4().hex[:6]}"
+    iceberg_table = f"t_{_uuid_mod.uuid4().hex[:6]}"
+    try:
+        west.create_namespace(tableBucketARN=bucket_arn, namespace=[ns])
+        west.create_table(
+            tableBucketARN=bucket_arn,
+            namespace=ns,
+            name=table,
+            format="ICEBERG",
+            metadata={"iceberg": {"schema": {"fields": [{"name": "id", "type": "long"}]}}},
+        )
+
+        namespaces = _iceberg_json("/iceberg/v1/catalog/namespaces")
+        assert [ns] in namespaces.get("namespaces", [])
+
+        tables = _iceberg_json(f"/iceberg/v1/catalog/namespaces/{ns}/tables")
+        assert {"namespace": [ns], "name": table} in tables.get("identifiers", [])
+
+        loaded = _iceberg_json(f"/iceberg/v1/catalog/namespaces/{ns}/tables/{table}")
+        assert loaded.get("metadata-location", "").startswith(f"s3://{bucket_name}/{ns}/{table}/")
+
+        bearer_loaded = _iceberg_json(
+            f"/iceberg/v1/catalog/namespaces/{ns}/tables/{table}",
+            authorization="Bearer test-token",
+        )
+        assert bearer_loaded.get("metadata-location", "").startswith(f"s3://{bucket_name}/{ns}/{table}/")
+
+        _iceberg_json(
+            f"/iceberg/v1/catalog/namespaces/{ns}/tables",
+            method="POST",
+            payload={
+                "name": iceberg_table,
+                "schema": {"type": "struct", "fields": [{"id": 1, "name": "id", "type": "long"}]},
+            },
+        )
+        got = west.get_table(tableBucketARN=bucket_arn, namespace=ns, name=iceberg_table)
+        assert got["name"] == iceberg_table
+    finally:
+        for candidate in (table, iceberg_table):
+            try:
+                west.delete_table(tableBucketARN=bucket_arn, namespace=ns, name=candidate)
+            except Exception:
+                pass
+        try:
+            west.delete_namespace(tableBucketARN=bucket_arn, namespace=ns)
+        except Exception:
+            pass
+        west.delete_table_bucket(tableBucketARN=bucket_arn)
+
+
+def test_s3tables_iceberg_catalog_prefers_signed_region_for_duplicate_names():
+    east = _make_s3tables_client(region_name="us-east-1")
+    west = _make_s3tables_client(region_name="us-west-2")
+    east_bucket = f"iceberg-east-{_uuid_mod.uuid4().hex[:6]}"
+    west_bucket = f"iceberg-west-{_uuid_mod.uuid4().hex[:6]}"
+    east_arn = east.create_table_bucket(name=east_bucket)["arn"]
+    west_arn = west.create_table_bucket(name=west_bucket)["arn"]
+    ns = f"ns_{_uuid_mod.uuid4().hex[:6]}"
+    table = f"t_{_uuid_mod.uuid4().hex[:6]}"
+    try:
+        for client, bucket_arn in ((east, east_arn), (west, west_arn)):
+            client.create_namespace(tableBucketARN=bucket_arn, namespace=[ns])
+            client.create_table(
+                tableBucketARN=bucket_arn,
+                namespace=ns,
+                name=table,
+                format="ICEBERG",
+                metadata={"iceberg": {"schema": {"fields": [{"name": "id", "type": "long"}]}}},
+            )
+
+        east_loaded = _iceberg_json(
+            f"/iceberg/v1/catalog/namespaces/{ns}/tables/{table}",
+            region_name="us-east-1",
+        )
+        west_loaded = _iceberg_json(
+            f"/iceberg/v1/catalog/namespaces/{ns}/tables/{table}",
+            region_name="us-west-2",
+        )
+        assert east_loaded.get("metadata-location", "").startswith(f"s3://{east_bucket}/{ns}/{table}/")
+        assert west_loaded.get("metadata-location", "").startswith(f"s3://{west_bucket}/{ns}/{table}/")
+
+        with pytest.raises(urllib.error.HTTPError) as exc:
+            _iceberg_json(
+                f"/iceberg/v1/catalog/namespaces/{ns}/tables/{table}",
+                region_name="us-east-2",
+            )
+        assert exc.value.code == 404
+    finally:
+        for client, bucket_arn in ((east, east_arn), (west, west_arn)):
+            try:
+                client.delete_table(tableBucketARN=bucket_arn, namespace=ns, name=table)
+            except Exception:
+                pass
+            try:
+                client.delete_namespace(tableBucketARN=bucket_arn, namespace=ns)
+            except Exception:
+                pass
+            try:
+                client.delete_table_bucket(tableBucketARN=bucket_arn)
+            except Exception:
+                pass
