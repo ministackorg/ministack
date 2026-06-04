@@ -173,7 +173,7 @@ def well_known_openid_configuration(pool_id: str, host: str | None = None):
     # from the pool's region (encoded in pool_id), so do the same here. The
     # `region` argument from the request scope is only used as a last-resort
     # fallback for malformed pool_ids.
-    issuer = _get_issuer_base_url(pool_id)
+    issuer = _get_issuer_url(pool_id)
     base = f"http://{host}" if host else f"http://{_MINISTACK_HOST}:{_MINISTACK_PORT}"
     pool_base = f"{base}/{pool_id}"
     doc = {
@@ -369,8 +369,8 @@ def _pool_region(pool_id: str) -> str:
     return get_region()
 
 
-def _get_issuer_base_url(pool_id: str) -> str:
-    """Return the issuer host for a pool, derived from environment variables or the pool's region."""
+def _get_issuer_url(pool_id: str) -> str:
+    """Return the issuer host for a pool, derived from environment variables and pool_id."""
     if issuer_env := os.getenv("MINISTACK_COGNITO_ISSUER_BASE_URL"):
         return f"{issuer_env}/{pool_id}"
 
@@ -416,7 +416,7 @@ def _fake_token(sub: str, pool_id: str, client_id: str, token_type: str = "acces
     origin_jti = new_uuid()
     claims = {
         "sub": sub,
-        "iss": _get_issuer_base_url(pool_id),
+        "iss": _get_issuer_url(pool_id),
         "token_use": token_type,
         "iat": now,
         "exp": now + 3600,
