@@ -49,6 +49,7 @@ Wire protocol:
   Routing is handled in app.py via two separate SERVICE_HANDLERS entries.
 """
 
+import asyncio
 import base64
 import copy
 import hashlib
@@ -1263,11 +1264,11 @@ async def handle_request(method, path, headers, body, query_params):
 
     if target.startswith("AWSCognitoIdentityService."):
         action = target.split(".")[-1]
-        return _dispatch_identity(action, data)
+        return await _dispatch_identity(action, data)
 
     if target.startswith("AWSCognitoIdentityProviderService."):
         action = target.split(".")[-1]
-        return _dispatch_idp(action, data)
+        return await _dispatch_idp(action, data)
 
     return error_response_json("InvalidAction", f"Unknown Cognito target: {target}", 400)
 
@@ -1276,7 +1277,7 @@ async def handle_request(method, path, headers, body, query_params):
 # IDP dispatcher
 # ---------------------------------------------------------------------------
 
-def _dispatch_idp(action: str, data: dict):
+async def _dispatch_idp(action: str, data: dict):
     handlers = {
         # User Pool CRUD
         "CreateUserPool": _create_user_pool,
@@ -1355,14 +1356,18 @@ def _dispatch_idp(action: str, data: dict):
     handler = handlers.get(action)
     if not handler:
         return error_response_json("InvalidAction", f"Unknown Cognito IDP action: {action}", 400)
-    return handler(data)
+    # Run the sync handler in a worker thread so trigger Lambdas (which call
+    # back into ministack over HTTP) don't deadlock against a blocked event
+    # loop. The Lambda response path needs the loop free to accept new
+    # requests while _execute_function is running.
+    return await asyncio.to_thread(handler, data)
 
 
 # ---------------------------------------------------------------------------
 # Identity Pool dispatcher
 # ---------------------------------------------------------------------------
 
-def _dispatch_identity(action: str, data: dict):
+async def _dispatch_identity(action: str, data: dict):
     handlers = {
         "CreateIdentityPool": _create_identity_pool,
         "DeleteIdentityPool": _delete_identity_pool,
@@ -1386,7 +1391,7 @@ def _dispatch_identity(action: str, data: dict):
     handler = handlers.get(action)
     if not handler:
         return error_response_json("InvalidAction", f"Unknown Cognito Identity action: {action}", 400)
-    return handler(data)
+    return await asyncio.to_thread(handler, data)
 
 
 # ===========================================================================
