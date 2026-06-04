@@ -47,6 +47,9 @@ from ministack.core.responses import (
 
 logger = logging.getLogger("s3tables")
 
+_MINISTACK_HOST = os.environ.get("MINISTACK_HOST", "localhost")
+_GATEWAY_PORT = os.environ.get("GATEWAY_PORT", "4566")
+
 # ── In-memory state ────────────────────────────────────────
 
 _table_buckets = AccountScopedDict()
@@ -345,7 +348,7 @@ def _iceberg_load_table(namespace, table_name):
                 "metadata": table.get("_iceberg_metadata", {}),
                 "config": {
                     "s3.access-key-id": "test", "s3.secret-access-key": "test",
-                    "s3.endpoint": "http://localhost:4566", "s3.path-style-access": "true",
+                    "s3.endpoint": f"http://{_MINISTACK_HOST}:{_GATEWAY_PORT}", "s3.path-style-access": "true",
                 },
             })
     return error_response_json("NotFoundException", f"Table {namespace}.{table_name} not found", 404)

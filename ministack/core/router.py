@@ -343,7 +343,12 @@ SERVICE_PATTERNS = {
     },
     "eks": {
         "host_patterns": [r"eks\."],
+        "path_prefixes": ["/oidc/"],
         "credential_scope": "eks",
+    },
+    "mediaconnect": {
+        "host_patterns": [r"^mediaconnect\."],
+        "credential_scope": "mediaconnect",
     },
     "tagging": {
         "target_prefixes": ["ResourceGroupsTaggingAPI_20170126"],
@@ -466,6 +471,7 @@ def detect_service(method: str, path: str, headers: dict, query_params: dict) ->
                 "appconfigdata": "appconfigdata",
                 "scheduler": "scheduler",
                 "eks": "eks",
+                "mediaconnect": "mediaconnect",
                 "tagging": "tagging",
                 "resource-groups": "resource-groups",
                 "cloudtrail": "cloudtrail",
@@ -861,6 +867,12 @@ def detect_service(method: str, path: str, headers: dict, query_params: dict) ->
         return "cognito-idp"
     if _ECS_METADATA_PATH_RE.match(path_lower):
         return "ecs-metadata"
+    # EKS OIDC discovery / JWKS for IRSA — Terraform's
+    # aws_iam_openid_connect_provider fetches these as plain unsigned HTTPS
+    # GETs, so we route by path before falling into the generic /clusters ECS
+    # rule below.
+    if path_lower.startswith("/oidc/"):
+        return "eks"
     if path_lower.startswith(("/clusters", "/taskdefinitions", "/tasks", "/services", "/stoptask")):
         return "ecs"
     # smithy-rpc-v2-cbor path: /service/ServiceName/operation/ActionName

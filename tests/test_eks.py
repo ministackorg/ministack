@@ -345,8 +345,10 @@ def test_eks_addon_lifecycle(eks):
             eks.describe_addon(clusterName=cn, addonName="vpc-cni")
         assert e.value.response["Error"]["Code"] == "ResourceNotFoundException"
     finally:
-        try: eks.delete_cluster(name=cn)
-        except Exception: pass
+        try:
+            eks.delete_cluster(name=cn)
+        except Exception:
+            pass
 
 
 def test_eks_addon_create_on_missing_cluster_404(eks):
@@ -370,5 +372,470 @@ def test_eks_addon_create_duplicate_returns_resource_in_use(eks):
             eks.create_addon(clusterName=cn, addonName="vpc-cni")
         assert e.value.response["Error"]["Code"] == "ResourceInUseException"
     finally:
-        try: eks.delete_cluster(name=cn)
-        except Exception: pass
+        try:
+            eks.delete_cluster(name=cn)
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# AssociateEncryptionConfig
+# ---------------------------------------------------------------------------
+
+def test_eks_associate_encryption_config(eks):
+    cn = f"enc-{_uid()}"
+    key_arn = f"arn:aws:kms:{REGION}:000000000000:key/{uuid.uuid4()}"
+    eks.create_cluster(
+        name=cn, roleArn="arn:aws:iam::000000000000:role/eks",
+        resourcesVpcConfig={"subnetIds": ["subnet-1"]},
+    )
+    try:
+        resp = eks.associate_encryption_config(
+            clusterName=cn,
+            encryptionConfig=[{"resources": ["secrets"], "provider": {"keyArn": key_arn}}],
+        )
+        upd = resp["update"]
+        assert upd["type"] == "AssociateEncryptionConfig"
+        assert upd["status"] == "Successful"
+        assert upd["id"]
+        desc = eks.describe_cluster(name=cn)["cluster"]
+        assert desc["encryptionConfig"][0]["provider"]["keyArn"] == key_arn
+    finally:
+        try:
+            eks.delete_cluster(name=cn)
+        except Exception:
+            pass
+
+
+def test_eks_associate_encryption_config_missing_cluster(eks):
+    with pytest.raises(ClientError) as e:
+        eks.associate_encryption_config(
+            clusterName=f"nope-{_uid()}",
+            encryptionConfig=[{"resources": ["secrets"],
+                               "provider": {"keyArn": "arn:aws:kms:us-east-1:000000000000:key/x"}}],
+        )
+    assert e.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
+def test_eks_associate_encryption_config_already_set(eks):
+    cn = f"enc-dup-{_uid()}"
+    cfg = [{"resources": ["secrets"],
+            "provider": {"keyArn": f"arn:aws:kms:{REGION}:000000000000:key/{uuid.uuid4()}"}}]
+    eks.create_cluster(
+        name=cn, roleArn="arn:aws:iam::000000000000:role/eks",
+        resourcesVpcConfig={"subnetIds": ["subnet-1"]},
+        encryptionConfig=cfg,
+    )
+    try:
+        with pytest.raises(ClientError) as e:
+            eks.associate_encryption_config(clusterName=cn, encryptionConfig=cfg)
+        assert e.value.response["Error"]["Code"] == "InvalidRequestException"
+    finally:
+        try:
+            eks.delete_cluster(name=cn)
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# OIDC discovery / JWKS (IRSA)
+# ---------------------------------------------------------------------------
+
+def test_eks_oidc_issuer_is_ministack_hosted(eks):
+    cn = f"oidc-{_uid()}"
+    eks.create_cluster(
+        name=cn, roleArn="arn:aws:iam::000000000000:role/eks",
+        resourcesVpcConfig={"subnetIds": ["subnet-1"]},
+    )
+    try:
+        issuer = eks.describe_cluster(name=cn)["cluster"]["identity"]["oidc"]["issuer"]
+        # Must be reachable from clients — points at ministack, not real AWS.
+        assert issuer.startswith("http://"), issuer
+        assert "/oidc/id/" in issuer, issuer
+        assert "amazonaws.com" not in issuer, issuer
+    finally:
+        try:
+            eks.delete_cluster(name=cn)
+        except Exception:
+            pass
+
+
+def test_eks_oidc_discovery_document(eks):
+    import urllib.request
+    cn = f"oidc-disc-{_uid()}"
+    eks.create_cluster(
+        name=cn, roleArn="arn:aws:iam::000000000000:role/eks",
+        resourcesVpcConfig={"subnetIds": ["subnet-1"]},
+    )
+    try:
+        issuer = eks.describe_cluster(name=cn)["cluster"]["identity"]["oidc"]["issuer"]
+        with urllib.request.urlopen(f"{issuer}/.well-known/openid-configuration") as r:
+            doc = json.loads(r.read())
+        assert doc["issuer"] == issuer
+        assert doc["jwks_uri"] == f"{issuer}/keys"
+        assert "RS256" in doc["id_token_signing_alg_values_supported"]
+        # JWKS must also be reachable and contain at least one RSA signing key.
+        with urllib.request.urlopen(doc["jwks_uri"]) as r:
+            jwks = json.loads(r.read())
+        assert jwks["keys"]
+        assert jwks["keys"][0]["kty"] == "RSA"
+        assert jwks["keys"][0]["use"] == "sig"
+    finally:
+        try:
+            eks.delete_cluster(name=cn)
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# Access Entries — modern EKS IAM bindings (replace aws-auth ConfigMap).
+# Crossplane / Terraform `aws_eks_access_entry` + `aws_eks_access_policy_association`
+# both flow through these APIs.
+# ---------------------------------------------------------------------------
+
+
+def _create_basic_cluster(eks):
+    cn = f"ae-{_uid()}"
+    eks.create_cluster(
+        name=cn, roleArn="arn:aws:iam::000000000000:role/eks",
+        resourcesVpcConfig={"subnetIds": ["subnet-1"]},
+    )
+    return cn
+
+
+def test_eks_access_entry_create_describe_delete(eks):
+    cn = _create_basic_cluster(eks)
+    principal = f"arn:aws:iam::000000000000:user/test-{_uid()}"
+    try:
+        resp = eks.create_access_entry(
+            clusterName=cn, principalArn=principal,
+            kubernetesGroups=["admins"], username="admin",
+            type="STANDARD",
+        )
+        ae = resp["accessEntry"]
+        assert ae["clusterName"] == cn
+        assert ae["principalArn"] == principal
+        assert ae["kubernetesGroups"] == ["admins"]
+        assert ae["username"] == "admin"
+        assert ae["type"] == "STANDARD"
+        assert ae["accessEntryArn"].startswith(
+            f"arn:aws:eks:{REGION}:")
+
+        desc = eks.describe_access_entry(
+            clusterName=cn, principalArn=principal)["accessEntry"]
+        assert desc["principalArn"] == principal
+
+        # Delete returns empty body.
+        eks.delete_access_entry(clusterName=cn, principalArn=principal)
+        with pytest.raises(ClientError) as e:
+            eks.describe_access_entry(
+                clusterName=cn, principalArn=principal)
+        assert e.value.response["Error"]["Code"] == "ResourceNotFoundException"
+    finally:
+        try:
+            eks.delete_cluster(name=cn)
+        except Exception:
+            pass
+
+
+def test_eks_access_entry_create_duplicate_rejected(eks):
+    cn = _create_basic_cluster(eks)
+    principal = f"arn:aws:iam::000000000000:role/dup-{_uid()}"
+    try:
+        eks.create_access_entry(clusterName=cn, principalArn=principal)
+        with pytest.raises(ClientError) as e:
+            eks.create_access_entry(clusterName=cn, principalArn=principal)
+        assert e.value.response["Error"]["Code"] == "ResourceInUseException"
+    finally:
+        try:
+            eks.delete_cluster(name=cn)
+        except Exception:
+            pass
+
+
+def test_eks_access_entry_create_missing_cluster(eks):
+    bogus = f"no-such-{_uid()}"
+    with pytest.raises(ClientError) as e:
+        eks.create_access_entry(
+            clusterName=bogus,
+            principalArn="arn:aws:iam::000000000000:role/r")
+    assert e.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
+def test_eks_access_entry_list_returns_principal_arns(eks):
+    cn = _create_basic_cluster(eks)
+    p1 = f"arn:aws:iam::000000000000:role/list-1-{_uid()}"
+    p2 = f"arn:aws:iam::000000000000:role/list-2-{_uid()}"
+    try:
+        eks.create_access_entry(clusterName=cn, principalArn=p1)
+        eks.create_access_entry(clusterName=cn, principalArn=p2)
+        listed = eks.list_access_entries(clusterName=cn)["accessEntries"]
+        assert set(listed) == {p1, p2}
+    finally:
+        try:
+            eks.delete_cluster(name=cn)
+        except Exception:
+            pass
+
+
+def test_eks_access_entry_update_patches_allowed_fields(eks):
+    cn = _create_basic_cluster(eks)
+    principal = f"arn:aws:iam::000000000000:role/upd-{_uid()}"
+    try:
+        eks.create_access_entry(
+            clusterName=cn, principalArn=principal,
+            kubernetesGroups=["before"], username="old",
+        )
+        updated = eks.update_access_entry(
+            clusterName=cn, principalArn=principal,
+            kubernetesGroups=["after"], username="new",
+        )["accessEntry"]
+        assert updated["kubernetesGroups"] == ["after"]
+        assert updated["username"] == "new"
+    finally:
+        try:
+            eks.delete_cluster(name=cn)
+        except Exception:
+            pass
+
+
+def test_eks_associate_access_policy_full_cycle(eks):
+    cn = _create_basic_cluster(eks)
+    principal = f"arn:aws:iam::000000000000:role/policy-{_uid()}"
+    policy = ("arn:aws:eks::aws:cluster-access-policy/"
+              "AmazonEKSClusterAdminPolicy")
+    try:
+        eks.create_access_entry(clusterName=cn, principalArn=principal)
+
+        resp = eks.associate_access_policy(
+            clusterName=cn, principalArn=principal,
+            policyArn=policy,
+            accessScope={"type": "cluster", "namespaces": []},
+        )
+        ap = resp["associatedAccessPolicy"]
+        assert ap["policyArn"] == policy
+        assert ap["accessScope"]["type"] == "cluster"
+
+        listed = eks.list_associated_access_policies(
+            clusterName=cn, principalArn=principal,
+        )["associatedAccessPolicies"]
+        assert len(listed) == 1
+        assert listed[0]["policyArn"] == policy
+
+        eks.disassociate_access_policy(
+            clusterName=cn, principalArn=principal, policyArn=policy)
+        listed_after = eks.list_associated_access_policies(
+            clusterName=cn, principalArn=principal,
+        )["associatedAccessPolicies"]
+        assert listed_after == []
+    finally:
+        try:
+            eks.delete_cluster(name=cn)
+        except Exception:
+            pass
+
+
+def test_eks_associate_access_policy_namespace_scope_requires_namespaces(eks):
+    cn = _create_basic_cluster(eks)
+    principal = f"arn:aws:iam::000000000000:role/ns-{_uid()}"
+    policy = ("arn:aws:eks::aws:cluster-access-policy/"
+              "AmazonEKSEditPolicy")
+    try:
+        eks.create_access_entry(clusterName=cn, principalArn=principal)
+        with pytest.raises(ClientError) as e:
+            eks.associate_access_policy(
+                clusterName=cn, principalArn=principal,
+                policyArn=policy,
+                accessScope={"type": "namespace"},  # missing namespaces
+            )
+        assert e.value.response["Error"]["Code"] == "InvalidParameterException"
+    finally:
+        try:
+            eks.delete_cluster(name=cn)
+        except Exception:
+            pass
+
+
+def test_eks_delete_access_entry_cascades_associated_policies(eks):
+    cn = _create_basic_cluster(eks)
+    principal = f"arn:aws:iam::000000000000:role/casc-{_uid()}"
+    policy = ("arn:aws:eks::aws:cluster-access-policy/"
+              "AmazonEKSViewPolicy")
+    try:
+        eks.create_access_entry(clusterName=cn, principalArn=principal)
+        eks.associate_access_policy(
+            clusterName=cn, principalArn=principal,
+            policyArn=policy,
+            accessScope={"type": "cluster", "namespaces": []},
+        )
+        eks.delete_access_entry(clusterName=cn, principalArn=principal)
+        # Recreate to verify the policy was cascaded out (not lingering).
+        eks.create_access_entry(clusterName=cn, principalArn=principal)
+        listed = eks.list_associated_access_policies(
+            clusterName=cn, principalArn=principal,
+        )["associatedAccessPolicies"]
+        assert listed == []
+    finally:
+        try:
+            eks.delete_cluster(name=cn)
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# AssociateIdentityProviderConfig
+# ---------------------------------------------------------------------------
+
+def test_eks_identity_provider_config(eks):
+    cn = f"idp-{_uid()}"
+    eks.create_cluster(
+        name=cn, roleArn="arn:aws:iam::000000000000:role/eks",
+        resourcesVpcConfig={"subnetIds": ["subnet-1"]},
+    )
+    try:
+        # 1. Associate OIDC config
+        resp = eks.associate_identity_provider_config(
+            clusterName=cn,
+            oidc={
+                "identityProviderConfigName": "cognito-idp",
+                "issuerUrl": "https://cognito-idp.us-east-1.amazonaws.com/us-east-1_000000000",
+                "clientId": "client-12345",
+                "usernameClaim": "sub",
+                "groupsClaim": "cognito:groups",
+            },
+            tags={"env": "test"}
+        )
+        upd = resp["update"]
+        assert upd["type"] == "IdentityProviderConfigUpdate"
+        assert upd["status"] in ("InProgress", "Successful")
+
+        # 2. Describe OIDC config
+        desc = eks.describe_identity_provider_config(
+            clusterName=cn,
+            identityProviderConfig={"type": "oidc", "name": "cognito-idp"}
+        )
+        oidc_desc = desc["identityProviderConfig"]["oidc"]
+        assert oidc_desc["identityProviderConfigName"] == "cognito-idp"
+        assert oidc_desc["clientId"] == "client-12345"
+        assert oidc_desc["issuerUrl"] == "https://cognito-idp.us-east-1.amazonaws.com/us-east-1_000000000"
+        assert oidc_desc["status"] in ("CREATING", "ACTIVE")
+
+        # 3. Disassociate OIDC config
+        dis_resp = eks.disassociate_identity_provider_config(
+            clusterName=cn,
+            identityProviderConfig={"type": "oidc", "name": "cognito-idp"}
+        )
+        dis_upd = dis_resp["update"]
+        assert dis_upd["type"] == "IdentityProviderConfigUpdate"
+
+    finally:
+        try:
+            eks.delete_cluster(name=cn)
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# IdP parity: cluster status, one-per-cluster, tag wiring
+# ---------------------------------------------------------------------------
+
+def _create_cluster_for_idp(eks, name):
+    eks.create_cluster(
+        name=name,
+        roleArn="arn:aws:iam::000000000000:role/eks",
+        resourcesVpcConfig={"subnetIds": ["subnet-1"]},
+    )
+
+
+def test_associate_idp_keeps_cluster_active(eks):
+    """AssociateIdentityProviderConfigResponse is {update, tags} — cluster
+    status must stay ACTIVE; UPDATING is never observable on the cluster."""
+    cn = f"idp-status-{_uid()}"
+    _create_cluster_for_idp(eks, cn)
+    try:
+        eks.associate_identity_provider_config(
+            clusterName=cn,
+            oidc={
+                "identityProviderConfigName": "idp-1",
+                "issuerUrl": "https://example/issuer",
+                "clientId": "client-1",
+            },
+        )
+        observed = set()
+        for _ in range(5):
+            observed.add(eks.describe_cluster(name=cn)["cluster"]["status"])
+        assert "UPDATING" not in observed
+        assert observed.issubset({"CREATING", "ACTIVE"})
+    finally:
+        try:
+            eks.delete_cluster(name=cn)
+        except Exception:
+            pass
+
+
+def test_only_one_oidc_idp_per_cluster(eks):
+    """Real AWS rejects a second OIDC IdP regardless of the new name."""
+    cn = f"idp-unique-{_uid()}"
+    _create_cluster_for_idp(eks, cn)
+    try:
+        eks.associate_identity_provider_config(
+            clusterName=cn,
+            oidc={
+                "identityProviderConfigName": "primary",
+                "issuerUrl": "https://example/issuer",
+                "clientId": "client-1",
+            },
+        )
+        with pytest.raises(ClientError) as exc:
+            eks.associate_identity_provider_config(
+                clusterName=cn,
+                oidc={
+                    "identityProviderConfigName": "secondary",
+                    "issuerUrl": "https://example/issuer2",
+                    "clientId": "client-2",
+                },
+            )
+        assert exc.value.response["Error"]["Code"] == "ResourceInUseException"
+    finally:
+        try:
+            eks.delete_cluster(name=cn)
+        except Exception:
+            pass
+
+
+def test_idp_tags_returned_by_list_tags_for_resource(eks):
+    """Tags set at associate time must be reachable via list_tags_for_resource
+    on the identityProviderConfigArn, and must clear after disassociate."""
+    cn = f"idp-tags-{_uid()}"
+    _create_cluster_for_idp(eks, cn)
+    try:
+        eks.associate_identity_provider_config(
+            clusterName=cn,
+            oidc={
+                "identityProviderConfigName": "tag-idp",
+                "issuerUrl": "https://example/issuer",
+                "clientId": "client-1",
+            },
+            tags={"env": "test", "owner": "platform"},
+        )
+        desc = eks.describe_identity_provider_config(
+            clusterName=cn,
+            identityProviderConfig={"type": "oidc", "name": "tag-idp"},
+        )
+        arn = desc["identityProviderConfig"]["oidc"]["identityProviderConfigArn"]
+        assert arn
+
+        tags = eks.list_tags_for_resource(resourceArn=arn)["tags"]
+        assert tags == {"env": "test", "owner": "platform"}
+
+        eks.disassociate_identity_provider_config(
+            clusterName=cn,
+            identityProviderConfig={"type": "oidc", "name": "tag-idp"},
+        )
+        tags_after = eks.list_tags_for_resource(resourceArn=arn)["tags"]
+        assert tags_after == {}
+    finally:
+        try:
+            eks.delete_cluster(name=cn)
+        except Exception:
+            pass

@@ -46,6 +46,8 @@ from ministack.services import ecs_metadata
 logger = logging.getLogger("ecs")
 
 REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
+_MINISTACK_HOST = os.environ.get("MINISTACK_HOST", "localhost")
+_GATEWAY_PORT = os.environ.get("GATEWAY_PORT", "4566")
 
 _clusters = AccountScopedDict()
 _task_defs = AccountScopedDict()
@@ -1737,7 +1739,8 @@ def _submit_attachment_state_changes(data):
 
 
 def _discover_poll_endpoint(data):
-    return json_response({"endpoint": "http://localhost:4566", "telemetryEndpoint": "http://localhost:4566"})
+    endpoint = f"http://{_MINISTACK_HOST}:{_GATEWAY_PORT}"
+    return json_response({"endpoint": endpoint, "telemetryEndpoint": endpoint})
 
 
 # ---------------------------------------------------------------------------

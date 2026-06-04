@@ -461,6 +461,238 @@ def test_apigw_execute_lambda_proxy_empty_cookies(apigw, lam):
     apigw.delete_api(ApiId=api_id)
     lam.delete_function(FunctionName=fname)
 
+def test_apigw_execute_lambda_proxy_cookies_and_header_set_cookie_both_ship(apigw, lam):
+    """Both the `cookies` array AND a `Set-Cookie` in `headers` ship.
+
+    Observed real-AWS behavior for HTTP API (v2) Lambda-proxy: when both are
+    returned, AWS emits the array entries first, followed by the header
+    `Set-Cookie`. Case-insensitive on the header key.
+    """
+    import urllib.request as _urlreq
+    import uuid as _uuid
+
+    fname = f"intg-apigw-bothcookie-{_uuid.uuid4().hex[:8]}"
+    code = (
+        b"def handler(event, context):\n"
+        b"    return {\n"
+        b"        'statusCode': 200,\n"
+        b"        'headers': {'set-cookie': 'h=1; Path=/'},\n"
+        b"        'cookies': ['a=1; Path=/', 'b=2; Path=/'],\n"
+        b"        'body': 'x',\n"
+        b"    }\n"
+    )
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("index.py", code)
+    lam.create_function(
+        FunctionName=fname, Runtime="python3.12",
+        Role="arn:aws:iam::000000000000:role/test-role",
+        Handler="index.handler", Code={"ZipFile": buf.getvalue()},
+    )
+
+    api_id = apigw.create_api(Name=f"bothcookie-api-{fname}", ProtocolType="HTTP")["ApiId"]
+    int_id = apigw.create_integration(
+        ApiId=api_id, IntegrationType="AWS_PROXY",
+        IntegrationUri=f"arn:aws:lambda:us-east-1:000000000000:function:{fname}",
+        PayloadFormatVersion="2.0",
+    )["IntegrationId"]
+    route_id = apigw.create_route(
+        ApiId=api_id, RouteKey="GET /bothcookie", Target=f"integrations/{int_id}",
+    )["RouteId"]
+    apigw.create_stage(ApiId=api_id, StageName="$default")
+
+    url = f"http://{api_id}.execute-api.localhost:{_EXECUTE_PORT}/$default/bothcookie"
+    req = _urlreq.Request(url, method="GET")
+    req.add_header("Host", f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}")
+    resp = _urlreq.urlopen(req)
+    assert resp.status == 200
+    set_cookies = resp.headers.get_all("Set-Cookie") or []
+    # Array entries first, header `Set-Cookie` last.
+    assert set_cookies == ["a=1; Path=/", "b=2; Path=/", "h=1; Path=/"]
+
+    apigw.delete_route(ApiId=api_id, RouteId=route_id)
+    apigw.delete_integration(ApiId=api_id, IntegrationId=int_id)
+    apigw.delete_api(ApiId=api_id)
+    lam.delete_function(FunctionName=fname)
+
+def test_apigw_execute_lambda_proxy_header_case_override(apigw, lam):
+    """A lowercase `content-type` overrides the default, not duplicates it.
+
+    Follow-up to #750: HTTP field names are case-insensitive (RFC 9110 §5.1),
+    so a Lambda's `content-type` must replace MiniStack's seeded default
+    `Content-Type` rather than ship as a second header.
+    """
+    import urllib.request as _urlreq
+    import uuid as _uuid
+
+    fname = f"intg-apigw-ctcase-{_uuid.uuid4().hex[:8]}"
+    code = (
+        b"def handler(event, context):\n"
+        b"    return {\n"
+        b"        'statusCode': 200,\n"
+        b"        'headers': {'content-type': 'text/plain'},\n"
+        b"        'body': 'x',\n"
+        b"    }\n"
+    )
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("index.py", code)
+    lam.create_function(
+        FunctionName=fname, Runtime="python3.12",
+        Role="arn:aws:iam::000000000000:role/test-role",
+        Handler="index.handler", Code={"ZipFile": buf.getvalue()},
+    )
+
+    api_id = apigw.create_api(Name=f"ctcase-api-{fname}", ProtocolType="HTTP")["ApiId"]
+    int_id = apigw.create_integration(
+        ApiId=api_id, IntegrationType="AWS_PROXY",
+        IntegrationUri=f"arn:aws:lambda:us-east-1:000000000000:function:{fname}",
+        PayloadFormatVersion="2.0",
+    )["IntegrationId"]
+    route_id = apigw.create_route(
+        ApiId=api_id, RouteKey="GET /ct", Target=f"integrations/{int_id}",
+    )["RouteId"]
+    apigw.create_stage(ApiId=api_id, StageName="$default")
+
+    url = f"http://{api_id}.execute-api.localhost:{_EXECUTE_PORT}/$default/ct"
+    req = _urlreq.Request(url, method="GET")
+    req.add_header("Host", f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}")
+    resp = _urlreq.urlopen(req)
+    assert resp.status == 200
+    # Exactly one Content-Type, and it's the Lambda's value (not the default).
+    assert (resp.headers.get_all("Content-Type") or []) == ["text/plain"]
+
+    apigw.delete_route(ApiId=api_id, RouteId=route_id)
+    apigw.delete_integration(ApiId=api_id, IntegrationId=int_id)
+    apigw.delete_api(ApiId=api_id)
+    lam.delete_function(FunctionName=fname)
+
+def test_apigw_execute_lambda_proxy_base64_body(apigw, lam):
+    """A base64 response body (isBase64Encoded) is decoded to raw bytes.
+
+    HTTP API (v2) honors isBase64Encoded unconditionally. The response must
+    carry the decoded binary, not the literal base64 string.
+    """
+    import urllib.request as _urlreq
+    import uuid as _uuid
+
+    fname = f"intg-apigw-b64-{_uuid.uuid4().hex[:8]}"
+    # All 256 byte values — definitely not valid UTF-8, so a literal-base64
+    # regression would not compare equal.
+    code = (
+        b"import base64\n"
+        b"def handler(event, context):\n"
+        b"    raw = bytes(range(256))\n"
+        b"    return {\n"
+        b"        'statusCode': 200,\n"
+        b"        'headers': {'Content-Type': 'application/octet-stream'},\n"
+        b"        'isBase64Encoded': True,\n"
+        b"        'body': base64.b64encode(raw).decode('ascii'),\n"
+        b"    }\n"
+    )
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("index.py", code)
+    lam.create_function(
+        FunctionName=fname, Runtime="python3.12",
+        Role="arn:aws:iam::000000000000:role/test-role",
+        Handler="index.handler", Code={"ZipFile": buf.getvalue()},
+    )
+
+    api_id = apigw.create_api(Name=f"b64-api-{fname}", ProtocolType="HTTP")["ApiId"]
+    int_id = apigw.create_integration(
+        ApiId=api_id, IntegrationType="AWS_PROXY",
+        IntegrationUri=f"arn:aws:lambda:us-east-1:000000000000:function:{fname}",
+        PayloadFormatVersion="2.0",
+    )["IntegrationId"]
+    route_id = apigw.create_route(
+        ApiId=api_id, RouteKey="GET /bin", Target=f"integrations/{int_id}",
+    )["RouteId"]
+    apigw.create_stage(ApiId=api_id, StageName="$default")
+
+    url = f"http://{api_id}.execute-api.localhost:{_EXECUTE_PORT}/$default/bin"
+    req = _urlreq.Request(url, method="GET")
+    req.add_header("Host", f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}")
+    resp = _urlreq.urlopen(req)
+    assert resp.status == 200
+    assert resp.read() == bytes(range(256))
+
+    apigw.delete_route(ApiId=api_id, RouteId=route_id)
+    apigw.delete_integration(ApiId=api_id, IntegrationId=int_id)
+    apigw.delete_api(ApiId=api_id)
+    lam.delete_function(FunctionName=fname)
+
+def test_apigw_execute_lambda_proxy_binary_request_body(apigw, lam):
+    """A binary request body is base64-encoded into the event.
+
+    Verified against real AWS (HTTP API v2): the inbound body is delivered as
+    base64 with isBase64Encoded=true for non-text content types (e.g.
+    application/octet-stream), and as a UTF-8 string for text types (e.g.
+    application/json).
+    """
+    import hashlib
+    import json as _json
+    import urllib.request as _urlreq
+    import uuid as _uuid
+
+    fname = f"intg-apigw-binreq-{_uuid.uuid4().hex[:8]}"
+    # Echo back what the function actually received in the event.
+    code = (
+        b"import json, base64, hashlib\n"
+        b"def handler(event, context):\n"
+        b"    b = event.get('body'); isb = bool(event.get('isBase64Encoded'))\n"
+        b"    if b is None: raw = b''\n"
+        b"    elif isb: raw = base64.b64decode(b)\n"
+        b"    else: raw = b.encode('utf-8', 'surrogateescape')\n"
+        b"    return {'statusCode': 200, 'headers': {'content-type': 'application/json'},\n"
+        b"            'body': json.dumps({'isB64': isb, 'sha': hashlib.sha256(raw).hexdigest()})}\n"
+    )
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("index.py", code)
+    lam.create_function(
+        FunctionName=fname, Runtime="python3.12",
+        Role="arn:aws:iam::000000000000:role/test-role",
+        Handler="index.handler", Code={"ZipFile": buf.getvalue()},
+    )
+
+    api_id = apigw.create_api(Name=f"binreq-api-{fname}", ProtocolType="HTTP")["ApiId"]
+    int_id = apigw.create_integration(
+        ApiId=api_id, IntegrationType="AWS_PROXY",
+        IntegrationUri=f"arn:aws:lambda:us-east-1:000000000000:function:{fname}",
+        PayloadFormatVersion="2.0",
+    )["IntegrationId"]
+    route_id = apigw.create_route(
+        ApiId=api_id, RouteKey="POST /echo", Target=f"integrations/{int_id}",
+    )["RouteId"]
+    apigw.create_stage(ApiId=api_id, StageName="$default")
+
+    url = f"http://{api_id}.execute-api.localhost:{_EXECUTE_PORT}/$default/echo"
+    host = f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}"
+
+    # Binary content type -> base64-encoded body, round-tripping the raw bytes.
+    payload = bytes(range(256))
+    expected_sha = hashlib.sha256(payload).hexdigest()
+    req = _urlreq.Request(url, data=payload, method="POST")
+    req.add_header("Host", host)
+    req.add_header("Content-Type", "application/octet-stream")
+    got = _json.loads(_urlreq.urlopen(req).read())
+    assert got["isB64"] is True
+    assert got["sha"] == expected_sha
+
+    # Text content type (application/json) -> passed through as a UTF-8 string.
+    req2 = _urlreq.Request(url, data=b'{"x":1}', method="POST")
+    req2.add_header("Host", host)
+    req2.add_header("Content-Type", "application/json")
+    got2 = _json.loads(_urlreq.urlopen(req2).read())
+    assert got2["isB64"] is False
+    assert got2["sha"] == hashlib.sha256(b'{"x":1}').hexdigest()
+
+    apigw.delete_route(ApiId=api_id, RouteId=route_id)
+    apigw.delete_integration(ApiId=api_id, IntegrationId=int_id)
+    apigw.delete_api(ApiId=api_id)
+    lam.delete_function(FunctionName=fname)
+
 def test_apigw_execute_no_route(apigw):
     """execute-api returns 404 when no matching route exists."""
     import urllib.error as _urlerr

@@ -942,3 +942,54 @@ def test_sqs_dlq_sweep_survives_legacy_double_encoded_policy():
     # Pre-fix this raised: AttributeError: 'str' object has no attribute 'get'
     _dlq_sweep(fake_q)
     assert fake_q["messages"] == []  # nothing to sweep, no crash
+
+
+# ---------------------------------------------------------------------------
+# /_ministack/sqs/messages — pure introspection over the queue store
+# ---------------------------------------------------------------------------
+
+def test_sqs_messages_endpoint_basic(sqs):
+    """GET /_ministack/sqs/messages returns sent messages grouped by account
+    and queue URL, without affecting subsequent ReceiveMessage."""
+    import urllib.request
+    qurl = sqs.create_queue(QueueName=f"intg-peek-{_uuid_mod.uuid4().hex[:8]}")["QueueUrl"]
+    sqs.send_message(QueueUrl=qurl, MessageBody="hello-peek-1")
+    sqs.send_message(QueueUrl=qurl, MessageBody="hello-peek-2")
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+
+    with urllib.request.urlopen(f"{endpoint}/_ministack/sqs/messages?QueueUrl={qurl}") as r:
+        data = json.loads(r.read())
+
+    # One account, one queue, two messages.
+    accts = list(data["messages"].keys())
+    assert len(accts) == 1
+    assert qurl in data["messages"][accts[0]]
+    msgs = data["messages"][accts[0]][qurl]
+    bodies = sorted(m["Body"] for m in msgs)
+    assert bodies == ["hello-peek-1", "hello-peek-2"]
+    # Peek must not have receive-counted the messages.
+    for m in msgs:
+        assert m["ReceiveCount"] == 0
+        assert m["IsVisible"] is True
+
+    # Subsequent ReceiveMessage still returns both — peek did not mutate.
+    received = []
+    for _ in range(2):
+        resp = sqs.receive_message(QueueUrl=qurl, MaxNumberOfMessages=1, VisibilityTimeout=0)
+        received.extend(resp.get("Messages", []))
+    assert sorted(m["Body"] for m in received) == ["hello-peek-1", "hello-peek-2"]
+    sqs.delete_queue(QueueUrl=qurl)
+
+
+def test_sqs_messages_endpoint_invalid_account_rejected(sqs):
+    """?account=<not-12-digit> returns 400 InvalidAccountID."""
+    import urllib.error
+    import urllib.request
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+    try:
+        urllib.request.urlopen(f"{endpoint}/_ministack/sqs/messages?account=abc")
+        raise AssertionError("expected 400")
+    except urllib.error.HTTPError as e:
+        assert e.code == 400
+        body = json.loads(e.read())
+        assert body["__type"] == "InvalidAccountID"

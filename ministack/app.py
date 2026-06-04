@@ -19,6 +19,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import time
 import uuid
 from urllib.parse import parse_qs, unquote
 
@@ -283,6 +284,7 @@ SERVICE_REGISTRY = {
     "kms": {"module": "kms"},
     "lambda": {"module": "lambda_svc"},
     "logs": {"module": "cloudwatch_logs", "aliases": ("cloudwatch-logs",)},
+    "mediaconnect": {"module": "mediaconnect"},
     "opensearch": {"module": "opensearch", "aliases": ("es", "elasticsearch")},
     "organizations": {"module": "organizations"},
     "monitoring": {"module": "cloudwatch", "aliases": ("cloudwatch",)},
@@ -724,6 +726,91 @@ async def _handle_ses_messages_request(method: str, path: str, headers: dict, qu
     return 200, {"Content-Type": "application/json"}, json.dumps(response).encode()
 
 
+async def _handle_sqs_messages_request(method: str, path: str, headers: dict, query_params: dict):
+    """Handle the SQS messages peek endpoint.
+
+    Pure introspection over `_queues[*].messages`. Does not touch
+    `visible_at`, `receive_count`, or any field the real SQS API mutates —
+    so calling this endpoint cannot affect a concurrent ReceiveMessage.
+
+    Filters:
+      ?account=<12-digit-id>   restrict to one account
+      ?QueueUrl=<url>          restrict to one queue (within whatever
+                               accounts pass the account filter)
+    """
+    if path != "/_ministack/sqs/messages" or method != "GET":
+        return None
+
+    account_id = None
+    if "account" in query_params:
+        raw_account = query_params["account"]
+        account_id = raw_account[0] if isinstance(raw_account, (list, tuple)) else raw_account
+        if not _12_DIGIT_RE.match(account_id):
+            return (
+                400,
+                {"Content-Type": "application/json"},
+                json.dumps(
+                    {
+                        "__type": "InvalidAccountID",
+                        "message": f"Account ID must be 12 digits, got: {account_id}",
+                    }
+                ).encode(),
+            )
+
+    queue_url_filter = None
+    if "QueueUrl" in query_params:
+        raw_qurl = query_params["QueueUrl"]
+        queue_url_filter = raw_qurl[0] if isinstance(raw_qurl, (list, tuple)) else raw_qurl
+
+    try:
+        mod = _get_module("sqs")
+        now = time.time()
+
+        # AccountScopedDict._data is keyed by (account_id, queue_url).
+        per_account: dict[str, dict[str, list]] = {}
+        try:
+            all_data = mod._queues.to_dict()
+        except Exception:
+            all_data = {}
+
+        for (acct, qurl), queue in all_data.items():
+            if account_id is not None and acct != account_id:
+                continue
+            if queue_url_filter is not None and qurl != queue_url_filter:
+                continue
+            if not isinstance(queue, dict):
+                continue
+            msgs = queue.get("messages") or []
+            rendered = []
+            for m in msgs:
+                rendered.append({
+                    "MessageId": m.get("id"),
+                    "Body": m.get("body", ""),
+                    "MD5OfBody": m.get("md5_body"),
+                    "MD5OfMessageAttributes": m.get("md5_attrs"),
+                    "SentTimestamp": int(m.get("sent_at", 0)),
+                    "VisibleAt": int(m.get("visible_at", 0)),
+                    "IsVisible": m.get("visible_at", 0) <= now,
+                    "ReceiveCount": m.get("receive_count", 0),
+                    "FirstReceiveTimestamp": (
+                        int(m["first_receive_at"]) if m.get("first_receive_at") else None
+                    ),
+                    "MessageAttributes": m.get("message_attributes") or {},
+                    "Attributes": m.get("sys") or {},
+                    "MessageGroupId": m.get("group_id"),
+                    "MessageDeduplicationId": m.get("dedup_id"),
+                    "SequenceNumber": m.get("seq"),
+                })
+            per_account.setdefault(acct, {})[qurl] = rendered
+
+        response = {"messages": per_account}
+    except Exception as e:
+        logger.exception("Error retrieving SQS messages: %s", e)
+        return 500, {"Content-Type": "application/json"}, json.dumps({"message": str(e)}).encode()
+
+    return 200, {"Content-Type": "application/json"}, json.dumps(response).encode()
+
+
 async def _handle_pre_body_request(method: str, path: str, headers: dict, query_params: dict, request_id: str):
     """Handle fast-path routes that do not require request body parsing."""
     # OPTIONS on an execute-api host / path MUST flow through apigateway.handle_execute
@@ -750,6 +837,10 @@ async def _handle_pre_body_request(method: str, path: str, headers: dict, query_
         return _with_data_plane_headers(response, request_id)
 
     response = await _handle_ses_messages_request(method, path, headers, query_params)
+    if response is not None:
+        return response
+
+    response = await _handle_sqs_messages_request(method, path, headers, query_params)
     if response is not None:
         return response
 
