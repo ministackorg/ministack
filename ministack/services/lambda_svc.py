@@ -654,8 +654,11 @@ def _build_config(name: str, data: dict, code_zip: bytes | None = None) -> dict:
     layers_cfg = []
     for layer in data.get("Layers", []):
         if isinstance(layer, str):
-            layers_cfg.append({"Arn": layer, "CodeSize": 0})
+            layers_cfg.append({"Arn": layer, "CodeSize": _layer_codesize_for_arn(layer)})
         elif isinstance(layer, dict):
+            layer = dict(layer)
+            if "CodeSize" not in layer and "Arn" in layer:
+                layer["CodeSize"] = _layer_codesize_for_arn(layer["Arn"])
             layers_cfg.append(layer)
 
     env = data.get("Environment")
@@ -1498,8 +1501,11 @@ def _update_config(name: str, data: dict):
                 layers_cfg = []
                 for layer in data["Layers"]:
                     if isinstance(layer, str):
-                        layers_cfg.append({"Arn": layer, "CodeSize": 0})
+                        layers_cfg.append({"Arn": layer, "CodeSize": _layer_codesize_for_arn(layer)})
                     elif isinstance(layer, dict):
+                        layer = dict(layer)
+                        if "CodeSize" not in layer and "Arn" in layer:
+                            layer["CodeSize"] = _layer_codesize_for_arn(layer["Arn"])
                         layers_cfg.append(layer)
                 config["Layers"] = layers_cfg
             else:
@@ -1514,6 +1520,20 @@ def _update_config(name: str, data: dict):
     config["StateReason"] = "The function is being updated."
     config["StateReasonCode"] = "Updating"
     config["RevisionId"] = new_uuid()
+    # AWS-match: UpdateFunctionConfiguration recycles the init container when
+    # spawn-time inputs change (Runtime/Handler/Layers/Env/MemorySize/Arch/
+    # VpcConfig/FileSystemConfigs). The ministack warm-pool key is just
+    # account:func:qualifier, so a stale worker would keep serving with the
+    # pre-update layers/env. Invalidate to force a fresh worker on next invoke,
+    # mirroring what _update_code already does. Otherwise PublishLayerVersion +
+    # UpdateFunctionConfiguration(Layers=[...]) leaves the previously-warm
+    # worker without the new layer extracted on disk (issue #816).
+    _WORKER_AFFECTING = {
+        "Runtime", "Handler", "Layers", "Environment", "MemorySize",
+        "Architectures", "VpcConfig", "FileSystemConfigs",
+    }
+    if any(k in data for k in _WORKER_AFFECTING):
+        invalidate_worker(name, qualifier="$LATEST")
     _schedule_state_transition(name, _LAMBDA_STATE_TRANSITION_DELAY)
     return json_response(config)
 
@@ -3428,6 +3448,28 @@ def _resolve_layer_zip(layer_arn_str: str) -> bytes | None:
         if v["Version"] == version:
             return v.get("_zip_data")
     return None
+
+
+def _layer_codesize_for_arn(layer_arn_str: str) -> int:
+    """Look up the stored layer version's CodeSize, or 0 if the layer
+    version can't be resolved. Real AWS surfaces the actual layer code size on
+    `GetFunctionConfiguration.Layers[*].CodeSize` so callers can sanity-check
+    against quotas (250 MB unzipped function + layers)."""
+    segs = layer_arn_str.split(":")
+    if len(segs) < 8:
+        return 0
+    layer_name = segs[6]
+    try:
+        version = int(segs[7])
+    except (ValueError, IndexError):
+        return 0
+    layer = _layers.get(layer_name)
+    if not layer:
+        return 0
+    for v in layer["versions"]:
+        if v["Version"] == version:
+            return v.get("Content", {}).get("CodeSize", 0)
+    return 0
 
 
 # ---------------------------------------------------------------------------

@@ -1484,6 +1484,93 @@ def test_lambda_function_with_layer(lam):
     fn = lam.get_function(FunctionName="fn-with-layer")
     assert layer_arn in fn["Configuration"]["Layers"][0]["Arn"]
 
+
+def test_lambda_function_with_layer_reports_real_code_size(lam):
+    """GetFunctionConfiguration.Layers[*].CodeSize must mirror the layer's
+    actual zip size, not hardcoded 0 (issue #816)."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        z.writestr("mod.py", "X = 'hello' * 1000")  # non-trivial size
+    layer_zip = buf.getvalue()
+    layer_resp = lam.publish_layer_version(
+        LayerName="codesize-layer",
+        Content={"ZipFile": layer_zip},
+    )
+    layer_arn = layer_resp["LayerVersionArn"]
+    expected_size = layer_resp["Content"]["CodeSize"]
+    assert expected_size > 0
+
+    fn_zip = io.BytesIO()
+    with zipfile.ZipFile(fn_zip, "w") as z:
+        z.writestr("index.py", "def handler(e, c): return {}")
+    lam.create_function(
+        FunctionName="codesize-fn",
+        Runtime="python3.12",
+        Role="arn:aws:iam::000000000000:role/test",
+        Handler="index.handler",
+        Code={"ZipFile": fn_zip.getvalue()},
+        Layers=[layer_arn],
+    )
+    cfg = lam.get_function_configuration(FunctionName="codesize-fn")
+    assert cfg["Layers"][0]["Arn"] == layer_arn
+    assert cfg["Layers"][0]["CodeSize"] == expected_size
+
+
+def test_lambda_update_function_configuration_layer_attachment_invokes_with_layer(lam):
+    """UpdateFunctionConfiguration(Layers=[arn]) must:
+      (a) surface the layer's real CodeSize on the next GetFunctionConfiguration, and
+      (b) recycle the warm worker so the next invoke actually loads the layer.
+    Regression for issue #816 (layer not found after association)."""
+    # Layer publishes a Python module the handler imports.
+    layer_buf = io.BytesIO()
+    with zipfile.ZipFile(layer_buf, "w") as z:
+        z.writestr("python/mylayermod.py", "VALUE = 'from-layer'")
+    layer_arn = lam.publish_layer_version(
+        LayerName="late-attach-layer",
+        Content={"ZipFile": layer_buf.getvalue()},
+        CompatibleRuntimes=["python3.12"],
+    )["LayerVersionArn"]
+
+    # Function created WITHOUT the layer first — handler tolerates the absence
+    # so the initial invoke can warm a worker.
+    fn_src = (
+        "def handler(event, context):\n"
+        "    try:\n"
+        "        import mylayermod\n"
+        "        return {'layer_value': mylayermod.VALUE}\n"
+        "    except ImportError:\n"
+        "        return {'layer_value': None}\n"
+    )
+    fn_buf = io.BytesIO()
+    with zipfile.ZipFile(fn_buf, "w") as z:
+        z.writestr("index.py", fn_src)
+    lam.create_function(
+        FunctionName="late-attach-fn",
+        Runtime="python3.12",
+        Role="arn:aws:iam::000000000000:role/test",
+        Handler="index.handler",
+        Code={"ZipFile": fn_buf.getvalue()},
+    )
+
+    # Pre-attach invoke warms a worker without the layer.
+    pre = lam.invoke(FunctionName="late-attach-fn", Payload=b"{}")
+    pre_body = json.loads(pre["Payload"].read())
+    assert pre_body == {"layer_value": None}
+
+    # Attach the layer via UpdateFunctionConfiguration.
+    lam.update_function_configuration(FunctionName="late-attach-fn", Layers=[layer_arn])
+
+    # (a) CodeSize on GetFunctionConfiguration matches the layer's real size.
+    cfg = lam.get_function_configuration(FunctionName="late-attach-fn")
+    assert cfg["Layers"][0]["Arn"] == layer_arn
+    assert cfg["Layers"][0]["CodeSize"] > 0
+
+    # (b) Next invoke must use a fresh worker that has the layer mounted on
+    #     /opt/python — the import succeeds and the handler returns the layer value.
+    post = lam.invoke(FunctionName="late-attach-fn", Payload=b"{}")
+    post_body = json.loads(post["Payload"].read())
+    assert post_body == {"layer_value": "from-layer"}
+
 def test_lambda_layer_content_location(lam):
     """Content.Location should be a non-empty URL pointing to the layer zip."""
     buf = io.BytesIO()
