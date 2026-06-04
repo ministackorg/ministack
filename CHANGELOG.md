@@ -5,9 +5,10 @@ All notable changes to MiniStack will be documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning follows [Semantic Versioning](https://semver.org/).
 
+
 ---
 
-## [Unreleased]
+## [1.3.58] — 2026-06-04
 
 ### Added
 - **EKS — default `topology.kubernetes.io/zone` and `topology.kubernetes.io/region` labels on k3s nodes** — every cluster's k3s container now receives `--node-label topology.kubernetes.io/zone={region}a` and `--node-label topology.kubernetes.io/region={region}`, matching the labels real EKS nodes carry via the AWS cloud-controller-manager. Unblocks topology-aware controllers (Karpenter, Cluster Autoscaler, scheduler `topologySpreadConstraints`) without manual `kubectl label node` workarounds. Region resolves through `get_region()`. Per-node-group label overrides belong on `CreateNodegroup.labels` — the AWS-shape-correct surface. Contributed by @b-rajesh.
@@ -22,6 +23,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 - **Glue — `UpdateTable` optimistic concurrency via `VersionId`** — table records now carry a monotonically-increasing `VersionId` (string, per the AWS `Table` output shape). `UpdateTable` with a stale `VersionId` returns `ConcurrentModificationException`; matching version bumps and applies. Calls without `VersionId` keep the old last-write-wins behaviour for back-compat.
 - **ECS — `DeleteService` marks INACTIVE instead of removing the record** — matches the AWS contract: "Services in the `DRAINING` or `INACTIVE` status can still be viewed with the `DescribeServices` API operation." Tasks are stopped synchronously, the service stays describable with `status=INACTIVE`, and tags remain attached. Re-creating a service with the same name is allowed once the prior incarnation is `INACTIVE` (matches the AWS-documented conflict-only-on-ACTIVE/DRAINING rule).
 - **Lambda — layer `CodeSize` and post-attachment invocation** — `CreateFunction(Layers=[...])` and `UpdateFunctionConfiguration(Layers=[...])` now surface each layer's real `CodeSize` on `GetFunctionConfiguration.Layers[*].CodeSize` (looked up from the published layer version) instead of a hardcoded `0`. `UpdateFunctionConfiguration` also recycles the `$LATEST` warm worker when worker-affecting fields change (`Layers`, `Runtime`, `Handler`, `Environment`, `MemorySize`, `Architectures`, `VpcConfig`, `FileSystemConfigs`) — without this, a layer attached after the first invoke was never extracted into `/opt/layer_N` for the running worker, and `import` from the layer failed at handler entry. Reported by @omargr299.
+- **Cognito — `CUSTOM_AUTH` trigger Lambdas no longer deadlock the event loop** — `_dispatch_idp` and `_dispatch_identity` are now `async` and run their sync handlers via `asyncio.to_thread`. Previously, a Cognito op that invoked a trigger Lambda (Define / Create / Verify auth challenge, pre-token, etc.) blocked the ASGI event loop while waiting for the Lambda HTTP callback that the same loop needed to serve — every CUSTOM_AUTH flow hung at the first trigger. Reported by @aahoughton.
 
 ---
 
