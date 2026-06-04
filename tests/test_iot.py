@@ -292,6 +292,37 @@ def test_iot_attach_detach_thing_principal(iot_client):
     iot_client.delete_thing(thingName=name)
 
 
+def test_iot_thing_arn_tail_parser_requires_iot_thing_scope():
+    from ministack.core.responses import (
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+    from ministack.services import iot as _iot
+
+    original_account = get_account_id()
+    original_region = get_region()
+    try:
+        set_request_account_id("000000000000")
+        set_request_region("us-east-1")
+        assert _iot._thing_name_from_arn(
+            "arn:aws:iot:us-east-1:000000000000:thing/parser-thing"
+        ) == "parser-thing"
+        assert _iot._thing_name_from_arn(
+            "arn:aws:sqs:us-east-1:000000000000:thing/parser-thing"
+        ) == ""
+        assert _iot._thing_name_from_arn(
+            "arn:aws:iot:us-west-2:000000000000:thing/parser-thing"
+        ) == ""
+        assert _iot._thing_name_from_arn(
+            "arn:aws:iot:us-east-1:000000000000:thing/parser-thing/extra"
+        ) == ""
+    finally:
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
 # ---------------------------------------------------------------------------
 # Policies
 # ---------------------------------------------------------------------------
