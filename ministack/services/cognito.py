@@ -370,6 +370,19 @@ def _pool_region(pool_id: str) -> str:
     return get_region()
 
 
+def _get_issuer_host(pool_id: str) -> str:
+    """Return the issuer host for a pool, derived from environment variables or pool region."""
+    if issuer_env := os.getenv("MINISTACK_COGNITO_ISSUER_HOST"):
+        return issuer_env
+
+    if host_env := os.getenv("MINISTACK_HOST"):
+        if not host_env.startswith("http://") and not host_env.startswith("https://"):
+            host_env = f"http://{host_env}"
+        return host_env
+
+    return f"https://cognito-idp.{_pool_region(pool_id)}.amazonaws.com/{pool_id}"
+
+
 def _client_id() -> str:
     return "".join(secrets.choice(string.digits + string.ascii_letters) for _ in range(26))
 
@@ -404,7 +417,7 @@ def _fake_token(sub: str, pool_id: str, client_id: str, token_type: str = "acces
     origin_jti = new_uuid()
     claims = {
         "sub": sub,
-        "iss": f"https://cognito-idp.{_pool_region(pool_id)}.amazonaws.com/{pool_id}",
+        "iss": _get_issuer_host(pool_id),
         "token_use": token_type,
         "iat": now,
         "exp": now + 3600,
