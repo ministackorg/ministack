@@ -170,6 +170,26 @@ def _resolve_group_by_arn(arn):
     return None
 
 
+def _log_group_name_from_identifier_arn(identifier: str) -> str | None:
+    try:
+        spec = parse_arn(identifier)
+    except ArnParseError:
+        return None
+    if (
+        spec.service != "logs"
+        or spec.account_id != get_account_id()
+        or spec.region != get_region()
+    ):
+        return None
+    prefix = "log-group:"
+    if not spec.resource.startswith(prefix):
+        return None
+    name = spec.resource[len(prefix):]
+    if name.endswith(":*"):
+        name = name[:-2]
+    return name or None
+
+
 def _decode_token(token):
     """Decode a pagination token to an integer offset."""
     if not token:
@@ -481,11 +501,7 @@ def _resolve_log_group_name(data):
     if not ident:
         return None
     if ident.startswith("arn:"):
-        # arn:aws:logs:<region>:<account>:log-group:<name>[:*]
-        parts = ident.split(":log-group:", 1)
-        if len(parts) == 2:
-            tail = parts[1]
-            return tail[:-2] if tail.endswith(":*") else tail
+        return _log_group_name_from_identifier_arn(ident) or ident
     return ident
 
 

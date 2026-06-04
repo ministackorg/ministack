@@ -64,6 +64,27 @@ def test_logs_get_log_events_by_identifier_arn(logs):
     assert len(resp2["events"]) == 1
 
 
+def test_logs_identifier_arn_scope_does_not_fallback_to_local_group(logs):
+    group = f"/cwl/ident-arn-scope-{_uuid_mod.uuid4().hex[:8]}"
+    logs.create_log_group(logGroupName=group)
+    logs.create_log_stream(logGroupName=group, logStreamName="s1")
+    logs.put_log_events(
+        logGroupName=group,
+        logStreamName="s1",
+        logEvents=[{"timestamp": int(time.time() * 1000), "message": "hi"}],
+    )
+
+    arn = f"arn:aws:logs:us-east-1:000000000000:log-group:{group}:*"
+    wrong_region = arn.replace(":us-east-1:", ":us-west-2:")
+    wrong_account = arn.replace(":000000000000:", ":111111111111:")
+    wrong_service = arn.replace(":logs:", ":lambda:")
+    wrong_resource = arn.replace(":log-group:", ":delivery:")
+    for bad_ref in (wrong_region, wrong_account, wrong_service, wrong_resource):
+        with pytest.raises(ClientError) as exc:
+            logs.get_log_events(logGroupIdentifier=bad_ref, logStreamName="s1")
+        assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
 def test_logs_filter_log_events_by_identifier_arn(logs):
     logs.create_log_group(logGroupName="/cwl/ident-arn-flt")
     logs.create_log_stream(logGroupName="/cwl/ident-arn-flt", logStreamName="s1")
