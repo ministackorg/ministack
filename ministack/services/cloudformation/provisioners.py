@@ -1002,19 +1002,38 @@ def _kinesis_stream_delete(physical_id, props):
 
 # --- Lambda Permission ---
 
+def _lambda_function_for_cfn_ref(function_ref: str) -> tuple[dict | None, str, str, str | None]:
+    if isinstance(function_ref, str) and function_ref.startswith("arn:"):
+        name, qualifier = _lambda_svc._resolve_request_scoped_name_and_qualifier(function_ref)
+        if name == function_ref:
+            return None, function_ref, function_ref, None
+        func = _lambda_svc._functions.get(name)
+        if not _lambda_svc._function_qualifier_exists(func, qualifier):
+            return None, function_ref, function_ref, qualifier
+    else:
+        name, qualifier = _lambda_svc._resolve_name_and_qualifier(function_ref)
+        func = _lambda_svc._functions.get(name)
+        if func is not None and not _lambda_svc._function_qualifier_exists(func, qualifier):
+            return None, function_ref, function_ref, qualifier
+
+    if func is None:
+        return None, function_ref, function_ref, qualifier
+
+    resource_arn = func["config"]["FunctionArn"]
+    if qualifier:
+        resource_arn = f"{resource_arn}:{qualifier}"
+    return func, name, resource_arn, qualifier
+
+
 def _lambda_permission_create(logical_id, props, stack_name):
-    func_name = props.get("FunctionName", "")
-    # Resolve ARN to function name
-    if func_name.startswith("arn:"):
-        func_name = func_name.rsplit(":", 1)[-1]
-    func = _lambda_svc._functions.get(func_name)
+    func, _func_name, resource_arn, _qualifier = _lambda_function_for_cfn_ref(props.get("FunctionName", ""))
     if func:
         stmt = {
             "Sid": props.get("Id") or logical_id,
             "Effect": "Allow",
             "Principal": props.get("Principal", "*"),
             "Action": props.get("Action", "lambda:InvokeFunction"),
-            "Resource": func["config"]["FunctionArn"],
+            "Resource": resource_arn,
         }
         source_arn = props.get("SourceArn")
         if source_arn:
@@ -1025,10 +1044,7 @@ def _lambda_permission_create(logical_id, props, stack_name):
 
 
 def _lambda_permission_delete(physical_id, props):
-    func_name = props.get("FunctionName", "")
-    if func_name.startswith("arn:"):
-        func_name = func_name.rsplit(":", 1)[-1]
-    func = _lambda_svc._functions.get(func_name)
+    func, _func_name, _resource_arn, _qualifier = _lambda_function_for_cfn_ref(props.get("FunctionName", ""))
     if func:
         sid = props.get("Id") or ""
         func["policy"]["Statement"] = [
@@ -1039,10 +1055,7 @@ def _lambda_permission_delete(physical_id, props):
 # --- Lambda Version ---
 
 def _lambda_version_create(logical_id, props, stack_name):
-    func_name = props.get("FunctionName", "")
-    if func_name.startswith("arn:"):
-        func_name = func_name.rsplit(":", 1)[-1]
-    func = _lambda_svc._functions.get(func_name)
+    func, func_name, _resource_arn, _qualifier = _lambda_function_for_cfn_ref(props.get("FunctionName", ""))
     if func:
         import copy
         ver_num = func["next_version"]
@@ -1612,18 +1625,16 @@ def _apigw_account_delete(physical_id, props):
 # --- Lambda EventSourceMapping ---
 
 def _lambda_esm_create(logical_id, props, stack_name):
-    func_name = props.get("FunctionName", "")
-    if func_name.startswith("arn:"):
-        func_name = func_name.rsplit(":", 1)[-1]
+    func, func_name, resource_arn, qualifier = _lambda_function_for_cfn_ref(props.get("FunctionName", ""))
     esm_id = new_uuid()
-    func = _lambda_svc._functions.get(func_name)
-    func_arn = func["config"]["FunctionArn"] if func else f"arn:aws:lambda:{get_region()}:{get_account_id()}:function:{func_name}"
+    func_arn = resource_arn if func else f"arn:aws:lambda:{get_region()}:{get_account_id()}:function:{func_name}"
 
     esm = {
         "UUID": esm_id,
         "EventSourceArn": props.get("EventSourceArn", ""),
         "FunctionArn": func_arn,
         "FunctionName": func_name,
+        "Qualifier": qualifier,
         "State": "Enabled",
         "StateTransitionReason": "USER_INITIATED",
         "BatchSize": int(props.get("BatchSize", 10)),
@@ -1674,13 +1685,10 @@ def _pipes_pipe_delete(physical_id, props):
 # --- Lambda Alias ---
 
 def _lambda_alias_create(logical_id, props, stack_name):
-    func_name = props.get("FunctionName", "")
-    if func_name.startswith("arn:"):
-        func_name = func_name.rsplit(":", 1)[-1]
+    func, func_name, _resource_arn, _qualifier = _lambda_function_for_cfn_ref(props.get("FunctionName", ""))
     alias_name = props.get("Name", "")
     func_version = props.get("FunctionVersion", "$LATEST")
 
-    func = _lambda_svc._functions.get(func_name)
     if func:
         alias = {
             "AliasArn": f"arn:aws:lambda:{get_region()}:{get_account_id()}:function:{func_name}:{alias_name}",
@@ -1700,11 +1708,8 @@ def _lambda_alias_create(logical_id, props, stack_name):
 
 
 def _lambda_alias_delete(physical_id, props):
-    func_name = props.get("FunctionName", "")
-    if func_name.startswith("arn:"):
-        func_name = func_name.rsplit(":", 1)[-1]
+    func, _func_name, _resource_arn, _qualifier = _lambda_function_for_cfn_ref(props.get("FunctionName", ""))
     alias_name = props.get("Name", "")
-    func = _lambda_svc._functions.get(func_name)
     if func:
         func["aliases"].pop(alias_name, None)
 
