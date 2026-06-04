@@ -118,6 +118,31 @@ def _parse_tags(params):
     return tags
 
 
+def _elbv2_resource_tail(arn: str, prefix: str) -> str:
+    """Return a stored ELBv2 ARN tail for ID generation, or empty string."""
+    try:
+        spec = parse_arn(arn)
+    except ArnParseError:
+        return ""
+    if spec.service != "elasticloadbalancing" or not spec.resource.startswith(prefix):
+        return ""
+    return spec.resource[len(prefix):]
+
+
+def _load_balancer_id_from_arn(arn: str) -> str:
+    tail = _elbv2_resource_tail(arn, "loadbalancer/")
+    return tail.rpartition("/")[2] if tail else ""
+
+
+def _listener_id_from_arn(arn: str) -> str:
+    tail = _elbv2_resource_tail(arn, "listener/")
+    return tail.rpartition("/")[2] if tail else ""
+
+
+def _target_group_full_name_from_arn(arn: str) -> str:
+    return _elbv2_resource_tail(arn, "targetgroup/")
+
+
 def _parse_actions(params, prefix="DefaultActions"):
     actions, i = [], 1
     while True:
@@ -574,7 +599,7 @@ def _create_listener(params):
     lid = _short_id()
     lb = _lbs[lb_arn]
     lb_name = lb["LoadBalancerName"]
-    lb_id = lb_arn.split("/")[-1]
+    lb_id = _load_balancer_id_from_arn(lb_arn)
     l_arn = (f"arn:aws:elasticloadbalancing:{get_region()}:{get_account_id()}"
              f":listener/app/{lb_name}/{lb_id}/{lid}")
     actions = _parse_actions(params, "DefaultActions")
@@ -689,8 +714,8 @@ def _create_rule(params):
     listener = _listeners[l_arn]
     lb_arn = listener["LoadBalancerArn"]
     lb_name = _lbs[lb_arn]["LoadBalancerName"]
-    lb_id = lb_arn.split("/")[-1]
-    l_id = l_arn.split("/")[-1]
+    lb_id = _load_balancer_id_from_arn(lb_arn)
+    l_id = _listener_id_from_arn(l_arn)
     rule_id = _short_id()
     rule_arn = (f"arn:aws:elasticloadbalancing:{get_region()}:{get_account_id()}"
                 f":listener-rule/app/{lb_name}/{lb_id}/{l_id}/{rule_id}")

@@ -12,6 +12,27 @@ from botocore.exceptions import ClientError
 _endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
 _EXECUTE_PORT = urlparse(_endpoint).port or 4566
 
+
+def test_elbv2_arn_tail_helpers_require_elbv2_resource_scope():
+    from ministack.services import alb
+
+    assert alb._load_balancer_id_from_arn(
+        "arn:aws:elasticloadbalancing:us-east-1:000000000000:loadbalancer/app/my-lb/lb-id"
+    ) == "lb-id"
+    assert alb._listener_id_from_arn(
+        "arn:aws:elasticloadbalancing:us-east-1:000000000000:listener/app/my-lb/lb-id/listener-id"
+    ) == "listener-id"
+    assert alb._target_group_full_name_from_arn(
+        "arn:aws:elasticloadbalancing:us-east-1:000000000000:targetgroup/my-tg/tg-id"
+    ) == "my-tg/tg-id"
+    assert alb._load_balancer_id_from_arn(
+        "arn:aws:sqs:us-east-1:000000000000:loadbalancer/app/my-lb/lb-id"
+    ) == ""
+    assert alb._listener_id_from_arn(
+        "arn:aws:elasticloadbalancing:us-east-1:000000000000:targetgroup/my-tg/tg-id"
+    ) == ""
+
+
 def test_elbv2_create_describe_delete_lb(elbv2):
     resp = elbv2.create_load_balancer(Name="qa-alb", Type="application", Scheme="internet-facing")
     lb = resp["LoadBalancers"][0]

@@ -2645,7 +2645,7 @@ def _elbv2_listener_create(logical_id, props, stack_name):
 
     listener_id = _alb._short_id()
     lb_name = lb["LoadBalancerName"]
-    lb_id = lb_arn.split("/")[-1]
+    lb_id = _alb._load_balancer_id_from_arn(lb_arn)
     listener_arn = (
         f"arn:aws:elasticloadbalancing:{get_region()}:{get_account_id()}:"
         f"listener/app/{lb_name}/{lb_id}/{listener_id}"
@@ -2939,7 +2939,11 @@ def _elbv2_target_group_create(logical_id, props, stack_name):
         {"Key": "stickiness.enabled", "Value": "false"},
         {"Key": "stickiness.type", "Value": "lb_cookie"},
     ]
-    return arn, {"TargetGroupArn": arn, "TargetGroupName": name, "TargetGroupFullName": arn.split(":targetgroup/", 1)[-1]}
+    return arn, {
+        "TargetGroupArn": arn,
+        "TargetGroupName": name,
+        "TargetGroupFullName": _alb._target_group_full_name_from_arn(arn),
+    }
 
 
 def _elbv2_target_group_delete(physical_id, props):
@@ -2990,8 +2994,8 @@ def _elbv2_listener_rule_create(logical_id, props, stack_name):
     listener = _alb._listeners[l_arn]
     lb_arn = listener["LoadBalancerArn"]
     lb_name = _alb._lbs[lb_arn]["LoadBalancerName"]
-    lb_id = lb_arn.split("/")[-1]
-    l_id = l_arn.split("/")[-1]
+    lb_id = _alb._load_balancer_id_from_arn(lb_arn)
+    l_id = _alb._listener_id_from_arn(l_arn)
     import random as _random
     import string as _string
     rule_id = "".join(_random.choices(_string.ascii_lowercase + _string.digits, k=16))
