@@ -88,6 +88,7 @@ REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 _PROXY_TIMEOUT_SECONDS = _timeout_from_env("MINISTACK_APIGW_PROXY_TIMEOUT_SECONDS", 30.0)
 _JWKS_TIMEOUT_SECONDS = _timeout_from_env("MINISTACK_APIGW_JWKS_TIMEOUT_SECONDS", 5.0)
 _OIDC_TIMEOUT_SECONDS = _timeout_from_env("MINISTACK_APIGW_OIDC_TIMEOUT_SECONDS", 5.0)
+_OIDC_CACHE_TTL_SECONDS = _timeout_from_env("MINISTACK_APIGW_OIDC_CACHE_TTL_SECONDS", 7200.0)
 
 # ---- Module-level state ----
 _apis = AccountScopedDict()          # api_id -> api object
@@ -104,7 +105,8 @@ _integration_responses = AccountScopedDict()   # api_id -> {integration_id -> {i
 # serve different keys in different accounts.
 _jwks_cache = AccountScopedDict()
 # OIDC discovery documents ({issuer}/.well-known/openid-configuration) are cached
-# per issuer so the jwks_uri lookup does not hit the network on every request.
+# by issuer (account-scoped, like _jwks_cache) so the jwks_uri lookup does not
+# hit the network on every request.
 _oidc_config_cache = AccountScopedDict()
 
 # WebSocket connection registry — connections are not per-account-scoped at the store level
@@ -504,6 +506,7 @@ async def _fetch_oidc_jwks_uri(issuer: str) -> str | None:
     Returns None (and caches the miss) if discovery is unavailable so callers
     can fall back to the conventional path.
     """
+    issuer = issuer.rstrip("/")
     cached = _oidc_config_cache.get(issuer)
     now = time.time()
     if cached and cached.get("expiresAt", 0) > now:
@@ -513,9 +516,9 @@ async def _fetch_oidc_jwks_uri(issuer: str) -> str | None:
         url = f"{issuer}/.well-known/openid-configuration"
         _, _, body = await _urlopen_async(url, _OIDC_TIMEOUT_SECONDS)
         jwks_uri = (json.loads(body or b"{}") or {}).get("jwks_uri")
-    except Exception:
+    except (OSError, ValueError, json.JSONDecodeError):
         jwks_uri = None
-    _oidc_config_cache[issuer] = {"jwks_uri": jwks_uri, "expiresAt": now + 7200}
+    _oidc_config_cache[issuer] = {"jwks_uri": jwks_uri, "expiresAt": now + _OIDC_CACHE_TTL_SECONDS}
     return jwks_uri
 
 
