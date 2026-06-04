@@ -710,6 +710,7 @@ end-to-end without any client config.
 | `MINISTACK_SSL_CERT` | _(unset)_ | Optional PEM-encoded server certificate path; required together with `MINISTACK_SSL_KEY`. When unset, MiniStack auto-generates a self-signed cert under `${TMPDIR}/ministack-tls/` (cached across restarts) |
 | `MINISTACK_SSL_KEY` | _(unset)_ | Optional PEM-encoded private key path; required together with `MINISTACK_SSL_CERT` |
 | `MINISTACK_IMDS_V2_REQUIRED` | `0` | Reject token-less GETs on `/latest/meta-data/...`. When set, callers must first `PUT /latest/api/token` and pass the token as `X-aws-ec2-metadata-token`, matching real-AWS hop-limit-1 IMDSv2-only instances |
+| `MINISTACK_COGNITO_ISSUER_BASE_URL` | _(unset)_ | Override the base URL used in Cognito User Pool JWT tokens' `iss` claim and JWKS fetches. If not set and the `MINISTACK_HOST` is set, the base URL is derived from the host and pool ID, otherwise defaults to `https://cognito-idp.{region}.amazonaws.com/{pool_id}` |
 
 ### API Gateway HTTP proxy execution model
 

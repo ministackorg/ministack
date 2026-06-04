@@ -3154,7 +3154,7 @@ def test_cognito_openid_discovery_issuer_uses_pool_region():
     pool_id = "eu-central-1_abcdef123"
     # Even if the request scope says us-east-1, discovery must return eu-central-1
     # because that's what the JWT iss will encode.
-    _status, _headers, body = mod.well_known_openid_configuration(pool_id, region="us-east-1", host="localhost:4566")
+    _status, _headers, body = mod.well_known_openid_configuration(pool_id, host="localhost:4566")
     doc = json.loads(body)
     assert doc["issuer"] == f"https://cognito-idp.eu-central-1.amazonaws.com/{pool_id}", doc["issuer"]
 

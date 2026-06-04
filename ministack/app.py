@@ -631,9 +631,8 @@ async def _handle_cognito_get_request(method: str, path: str, headers: dict, que
             if pool_id:
                 cognito = _get_module("cognito")
                 if cognito._get_pool_unscoped(pool_id) is not None:
-                    region = extract_region(headers) or "us-east-1"
                     host = headers.get("host") or headers.get("Host")
-                    return cognito.well_known_openid_configuration(pool_id, region, host)
+                    return cognito.well_known_openid_configuration(pool_id, host)
 
     if path == "/oauth2/authorize" and method == "GET":
         return _get_module("cognito").handle_oauth2_authorize(method, path, headers, query_params)

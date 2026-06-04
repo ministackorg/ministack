@@ -159,7 +159,7 @@ def well_known_jwks(pool_id: str):
     return 200, {"Content-Type": "application/json"}, json.dumps({"keys": [_JWKS_KEY]}).encode()
 
 
-def well_known_openid_configuration(pool_id: str, region: str | None = None, host: str | None = None):
+def well_known_openid_configuration(pool_id: str, host: str | None = None):
     """Return OpenID Connect discovery document.
 
     `issuer` matches the JWT `iss` claim (real AWS URL) so OIDC clients that
@@ -173,8 +173,7 @@ def well_known_openid_configuration(pool_id: str, region: str | None = None, hos
     # from the pool's region (encoded in pool_id), so do the same here. The
     # `region` argument from the request scope is only used as a last-resort
     # fallback for malformed pool_ids.
-    r = _pool_region(pool_id) if pool_id else (region or get_region())
-    issuer = f"https://cognito-idp.{r}.amazonaws.com/{pool_id}"
+    issuer = _get_issuer_base_url(pool_id)
     base = f"http://{host}" if host else f"http://{_MINISTACK_HOST}:{_MINISTACK_PORT}"
     pool_base = f"{base}/{pool_id}"
     doc = {
@@ -370,14 +369,14 @@ def _pool_region(pool_id: str) -> str:
     return get_region()
 
 
-def _get_issuer_host(pool_id: str) -> str:
-    """Return the issuer host for a pool, derived from environment variables or pool region."""
-    if issuer_env := os.getenv("MINISTACK_COGNITO_ISSUER_HOST"):
-        return issuer_env
+def _get_issuer_base_url(pool_id: str) -> str:
+    """Return the issuer host for a pool, derived from environment variables or the pool's region."""
+    if issuer_env := os.getenv("MINISTACK_COGNITO_ISSUER_BASE_URL"):
+        return f"{issuer_env}/{pool_id}"
 
     if host_env := os.getenv("MINISTACK_HOST"):
         if not host_env.startswith("http://") and not host_env.startswith("https://"):
-            host_env = f"http://{host_env}"
+            host_env = f"http://{host_env}/{pool_id}"
         return host_env
 
     return f"https://cognito-idp.{_pool_region(pool_id)}.amazonaws.com/{pool_id}"
@@ -417,7 +416,7 @@ def _fake_token(sub: str, pool_id: str, client_id: str, token_type: str = "acces
     origin_jti = new_uuid()
     claims = {
         "sub": sub,
-        "iss": _get_issuer_host(pool_id),
+        "iss": _get_issuer_base_url(pool_id),
         "token_use": token_type,
         "iat": now,
         "exp": now + 3600,
