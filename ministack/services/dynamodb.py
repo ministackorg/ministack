@@ -24,6 +24,7 @@ import time
 from collections import defaultdict
 from decimal import Decimal, InvalidOperation
 
+from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.responses import (
     AccountScopedDict,
     error_response_json,
@@ -55,6 +56,9 @@ def _conditional_check_failed(data, old_item, message="The conditional request f
     }, json.dumps(body, ensure_ascii=False).encode("utf-8")
 
 REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
+_DDB_PARTITION_RE = re.compile(r"^aws(?:-[a-z]+)*$")
+_DDB_REGION_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)+-[0-9]+$")
+_DDB_ACCOUNT_RE = re.compile(r"^[0-9]{12}$")
 
 # Real AWS reports Export/Import as IN_PROGRESS at submit time; the flip to
 # COMPLETED happens asynchronously. We simulate that by holding IN_PROGRESS
@@ -3155,9 +3159,24 @@ def _describe_endpoints(data):
 # Tag operations
 # ---------------------------------------------------------------------------
 
+def _dynamodb_arn_spec(arn: str):
+    try:
+        spec = parse_arn(arn)
+    except ArnParseError:
+        return None
+    if (
+        not _DDB_PARTITION_RE.match(spec.partition)
+        or spec.service != "dynamodb"
+        or not _DDB_REGION_RE.match(spec.region)
+        or not _DDB_ACCOUNT_RE.match(spec.account_id)
+    ):
+        return None
+    return spec
+
+
 def _validate_tag_arn(arn: str) -> tuple | None:
     """ARN must (a) look like a DynamoDB ARN, (b) reference an existing table."""
-    if not isinstance(arn, str) or not arn.startswith("arn:aws:dynamodb:"):
+    if not isinstance(arn, str) or _dynamodb_arn_spec(arn) is None:
         return error_response_json("ValidationException",
             f"1 validation error detected: Value '{arn}' at 'resourceArn' failed to satisfy constraint: Member must satisfy regular expression pattern: arn:[a-z\\-]+:dynamodb:[a-z]{{2}}-[a-z]+-[0-9]:[0-9]{{12}}:.*", 400)
     tname = _table_name_from_arn(arn)
@@ -3199,7 +3218,7 @@ def _list_tags(data):
     # ListTagsOfResource on a non-existent (but syntactically valid) ARN
     # returns AccessDeniedException on AWS — the API does not reveal whether
     # the resource exists. Syntactic validation still uses ValidationException.
-    if not isinstance(arn, str) or not arn.startswith("arn:aws:dynamodb:"):
+    if not isinstance(arn, str) or _dynamodb_arn_spec(arn) is None:
         return error_response_json("ValidationException",
             f"1 validation error detected: Value '{arn}' at 'resourceArn' failed to satisfy constraint: Member must satisfy regular expression pattern: arn:[a-z\\-]+:dynamodb:[a-z]{{2}}-[a-z]+-[0-9]:[0-9]{{12}}:.*", 400)
     tname = _table_name_from_arn(arn)
@@ -3411,13 +3430,8 @@ def _update_kinesis_streaming_destination(data):
 def _normalize_table_name(value: str) -> str:
     if not isinstance(value, str):
         return value
-    if value.startswith("arn:aws:dynamodb:"):
-        # arn:aws:dynamodb:region:account:table/<name>[/...]
-        try:
-            _, _, after = value.partition(":table/")
-            return after.split("/")[0] if after else value
-        except Exception:
-            return value
+    if value.startswith("arn:"):
+        return _table_name_from_arn(value) or value
     return value
 
 
@@ -3556,9 +3570,19 @@ def _list_contributor_insights(data):
 # Per botocore: ResourceArn must be a table or stream ARN. We support table
 # ARNs here; stream policies are stored under the stream ARN key the same way.
 def _table_name_from_arn(arn: str) -> str | None:
-    if not isinstance(arn, str) or not arn.startswith("arn:aws:dynamodb:"):
+    if not isinstance(arn, str):
         return None
-    _, _, after = arn.partition(":table/")
+    spec = _dynamodb_arn_spec(arn)
+    if (
+        spec is None
+        or spec.region != get_region()
+        or spec.account_id != get_account_id()
+    ):
+        return None
+    prefix = "table/"
+    if not spec.resource.startswith(prefix):
+        return None
+    after = spec.resource[len(prefix):]
     if not after:
         return None
     # Strip /stream/... or /index/... suffixes.

@@ -6,8 +6,24 @@ import uuid as _uuid_mod
 import zipfile
 from urllib.parse import urlparse
 
+import boto3
 import pytest
+from botocore.config import Config
 from botocore.exceptions import ClientError
+
+
+_ENDPOINT = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+
+
+def _ddb_client(region_name: str):
+    return boto3.client(
+        "dynamodb",
+        endpoint_url=_ENDPOINT,
+        aws_access_key_id="test",
+        aws_secret_access_key="test",
+        region_name=region_name,
+        config=Config(region_name=region_name, retries={"mode": "standard"}),
+    )
 
 
 def _make_zip(code: str) -> bytes:
@@ -2906,6 +2922,61 @@ def test_dynamodb_resource_policy_unknown_arn(ddb):
     with pytest.raises(ClientError) as e:
         ddb.put_resource_policy(ResourceArn=fake_arn, Policy="{}")
     assert e.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
+def test_dynamodb_table_arn_scope_does_not_fallback_to_local_table(ddb):
+    name = "arn-scope-table"
+    arn = _ci_table(ddb, name)
+    try:
+        assert ddb.describe_contributor_insights(TableName=arn)["TableName"] == name
+
+        wrong_region = arn.replace(":us-east-1:", ":us-west-2:")
+        wrong_account = arn.replace(":000000000000:", ":111111111111:")
+        for bad_ref in (wrong_region, wrong_account):
+            with pytest.raises(ClientError) as e:
+                ddb.tag_resource(ResourceArn=bad_ref, Tags=[{"Key": "env", "Value": "test"}])
+            assert e.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+            with pytest.raises(ClientError) as e:
+                ddb.list_tags_of_resource(ResourceArn=bad_ref)
+            assert e.value.response["Error"]["Code"] == "AccessDeniedException"
+
+            with pytest.raises(ClientError) as e:
+                ddb.describe_contributor_insights(TableName=bad_ref)
+            assert e.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+            with pytest.raises(ClientError) as e:
+                ddb.put_resource_policy(ResourceArn=bad_ref, Policy="{}")
+            assert e.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+            with pytest.raises(ClientError) as e:
+                ddb.export_table_to_point_in_time(TableArn=bad_ref, S3Bucket="bucket")
+            assert e.value.response["Error"]["Code"] == "TableNotFoundException"
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_table_arn_accepts_multi_segment_region():
+    ddb = _ddb_client("us-gov-west-1")
+    name = f"arn-region-{_uuid_mod.uuid4().hex[:8]}"
+    try:
+        created = ddb.create_table(
+            TableName=name,
+            KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+            AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "S"}],
+            BillingMode="PAY_PER_REQUEST",
+        )
+        arn = created["TableDescription"]["TableArn"]
+        assert ":us-gov-west-1:" in arn
+
+        ddb.tag_resource(ResourceArn=arn, Tags=[{"Key": "env", "Value": "test"}])
+        tags = ddb.list_tags_of_resource(ResourceArn=arn)["Tags"]
+        assert {"Key": "env", "Value": "test"} in tags
+    finally:
+        try:
+            ddb.delete_table(TableName=name)
+        except Exception:
+            pass
 
 
 def test_dynamodb_export_table_to_point_in_time(ddb):
