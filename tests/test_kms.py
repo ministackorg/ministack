@@ -501,7 +501,9 @@ def test_kms_create_ecc_nist_edwards25519_key(kms_client):
     meta = resp["KeyMetadata"]
     assert meta["KeySpec"] == "ECC_NIST_EDWARDS25519"
     assert meta["KeyUsage"] == "SIGN_VERIFY"
-    assert meta["SigningAlgorithms"] == ["ED25519_SHA_512"]
+    # Real AWS lists both algorithms for this key spec — Developer Guide
+    # "Supported signing algorithms for ECC key specs".
+    assert meta["SigningAlgorithms"] == ["ED25519_SHA_512", "ED25519_PH_SHA_512"]
     assert meta["EncryptionAlgorithms"] == []
 
 def test_kms_ecc_nist_edwards25519_sign_verify(kms_client):
@@ -555,7 +557,51 @@ def test_kms_ecc_nist_edwards25519_get_public_key(kms_client):
     assert key_id in resp["KeyId"]
     assert resp["KeySpec"] == "ECC_NIST_EDWARDS25519"
     assert resp["PublicKey"]
-    assert resp["SigningAlgorithms"] == ["ED25519_SHA_512"]
+    assert resp["SigningAlgorithms"] == ["ED25519_SHA_512", "ED25519_PH_SHA_512"]
+
+def test_kms_ed25519_sha_512_rejects_non_raw_message_type(kms_client):
+    """ED25519_SHA_512 requires MessageType=RAW (AWS Developer Guide / Sign API)."""
+    key = kms_client.create_key(KeySpec="ECC_NIST_EDWARDS25519", KeyUsage="SIGN_VERIFY")
+    key_id = key["KeyMetadata"]["KeyId"]
+    with pytest.raises(Exception) as exc:
+        kms_client.sign(
+            KeyId=key_id,
+            Message=b"a" * 64,
+            MessageType="DIGEST",
+            SigningAlgorithm="ED25519_SHA_512",
+        )
+    msg = str(exc.value)
+    assert "ED25519_SHA_512" in msg and "RAW" in msg
+
+
+def test_kms_ed25519_ph_sha_512_sign_returns_unsupported(kms_client):
+    """ED25519_PH_SHA_512 (Ed25519ph) is listed in metadata but Sign is not yet implemented."""
+    key = kms_client.create_key(KeySpec="ECC_NIST_EDWARDS25519", KeyUsage="SIGN_VERIFY")
+    key_id = key["KeyMetadata"]["KeyId"]
+    with pytest.raises(Exception) as exc:
+        kms_client.sign(
+            KeyId=key_id,
+            Message=b"a" * 64,
+            MessageType="DIGEST",
+            SigningAlgorithm="ED25519_PH_SHA_512",
+        )
+    assert "ED25519_PH_SHA_512" in str(exc.value)
+
+
+def test_kms_ed25519_ph_sha_512_verify_returns_unsupported(kms_client):
+    """ED25519_PH_SHA_512 Verify is also gated until Ed25519ph lands."""
+    key = kms_client.create_key(KeySpec="ECC_NIST_EDWARDS25519", KeyUsage="SIGN_VERIFY")
+    key_id = key["KeyMetadata"]["KeyId"]
+    with pytest.raises(Exception) as exc:
+        kms_client.verify(
+            KeyId=key_id,
+            Message=b"a" * 64,
+            MessageType="DIGEST",
+            Signature=b"\x00" * 64,
+            SigningAlgorithm="ED25519_PH_SHA_512",
+        )
+    assert "ED25519_PH_SHA_512" in str(exc.value)
+
 
 def test_kms_ecc_nist_p256_sign_verify(kms_client):
     key = kms_client.create_key(KeySpec="ECC_NIST_P256", KeyUsage="SIGN_VERIFY")

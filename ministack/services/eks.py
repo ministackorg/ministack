@@ -42,31 +42,6 @@ EKS_BASE_PORT = int(os.environ.get("EKS_BASE_PORT", "16443"))
 DOCKER_NETWORK = os.environ.get("DOCKER_NETWORK", "")
 
 
-def _parse_default_node_labels(raw: str | None) -> list[tuple[str, str]]:
-    """Parse MINISTACK_EKS_DEFAULT_NODE_LABELS="k1=v1,k2=v2" into a list of (key, value) pairs.
-
-    Silently drops malformed entries (no `=`) — extra labels are an opt-in convenience,
-    not a correctness contract, so a typo in one entry should not break cluster creation.
-    """
-    if not raw:
-        return []
-    pairs = []
-    for chunk in raw.split(","):
-        chunk = chunk.strip()
-        if not chunk or "=" not in chunk:
-            continue
-        k, _, v = chunk.partition("=")
-        k, v = k.strip(), v.strip()
-        if k:
-            pairs.append((k, v))
-    return pairs
-
-
-_DEFAULT_NODE_LABELS = _parse_default_node_labels(
-    os.environ.get("MINISTACK_EKS_DEFAULT_NODE_LABELS")
-)
-_NODE_LABEL_TAG_PREFIX = "ministack.node-label/"
-
 try:
     docker_lib = importlib.import_module("docker")
     _docker_available = True
@@ -312,28 +287,21 @@ def _collect_oidc_state(cluster_name: str):
 
 
 def _collect_node_labels(cluster: dict) -> list[str]:
-    """Return the list of `--node-label key=value` k3s args for a cluster.
+    """Return the AWS-default topology `--node-label` k3s args for a cluster.
 
-    Sources, in order of precedence (later wins for the same key):
-      1. AWS-default topology labels (zone, region) — always emitted unless overridden.
-      2. Org-wide labels from MINISTACK_EKS_DEFAULT_NODE_LABELS.
-      3. Per-cluster overrides from CreateCluster `tags` keyed by `ministack.node-label/<labelKey>`.
+    Real EKS nodes carry `topology.kubernetes.io/region` and
+    `topology.kubernetes.io/zone` (set by the AWS cloud-controller-manager) so
+    Karpenter / `topologySpreadConstraints` / Cluster Autoscaler can schedule.
+    Per-node-group label overrides belong on `CreateNodegroup.labels`, which is
+    the AWS-shape-correct surface — not a ministack-specific tag convention.
 
-    Zone defaults to `{region}a`; region from `get_region()` per Iron Rule 6
-    (never hardcode). MUST be called from a request context.
+    MUST be called from a request context (uses `get_region()`).
     """
     region = get_region()
-    labels: dict[str, str] = {
+    labels = {
         "topology.kubernetes.io/zone": f"{region}a",
         "topology.kubernetes.io/region": region,
     }
-    for k, v in _DEFAULT_NODE_LABELS:
-        labels[k] = v
-    for tag_key, tag_val in (cluster.get("tags") or {}).items():
-        if tag_key.startswith(_NODE_LABEL_TAG_PREFIX):
-            label_key = tag_key[len(_NODE_LABEL_TAG_PREFIX):]
-            if label_key:
-                labels[label_key] = tag_val
     return [f"--node-label={k}={v}" for k, v in labels.items()]
 
 

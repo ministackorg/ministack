@@ -290,7 +290,11 @@ def _create_key(data):
             serialization.Encoding.DER,
             serialization.PublicFormat.SubjectPublicKeyInfo,
         )
-        rec["SigningAlgorithms"] = ["ED25519_SHA_512"]
+        # Real AWS exposes both for ECC_NIST_EDWARDS25519 — verified against the
+        # KMS Developer Guide "Supported signing algorithms for ECC key specs"
+        # table. PH variant is listed in metadata even though Sign/Verify return
+        # UnsupportedOperationException below until Ed25519ph lands.
+        rec["SigningAlgorithms"] = ["ED25519_SHA_512", "ED25519_PH_SHA_512"]
         rec["EncryptionAlgorithms"] = []
     else:
         return error_response_json(
@@ -370,11 +374,31 @@ def _sign(data):
     else:
         message = message_b64
 
-    if algorithm == "ED25519_SHA_512":
+    if algorithm in ("ED25519_SHA_512", "ED25519_PH_SHA_512"):
         if rec["KeySpec"] != "ECC_NIST_EDWARDS25519":
             return error_response_json(
                 "UnsupportedOperationException",
                 f"Signing algorithm {algorithm} is not supported for this key",
+                400,
+            )
+        # AWS KMS: "ED25519_SHA_512 signing algorithm requires MessageType:RAW,
+        # while ED25519_PH_SHA_512 requires MessageType:DIGEST. These message
+        # types cannot be used interchangeably." (Developer Guide).
+        if algorithm == "ED25519_SHA_512" and message_type != "RAW":
+            return error_response_json(
+                "UnsupportedOperationException",
+                "ED25519_SHA_512 signing algorithm requires MessageType=RAW",
+                400,
+            )
+        if algorithm == "ED25519_PH_SHA_512":
+            # HashEdDSA (Ed25519ph) — RFC 8032 §5.1 / FIPS 186-5 §7.8. The
+            # cryptography library does not expose the dom2 prefix needed for a
+            # spec-correct implementation, so we surface the gap honestly
+            # instead of routing through pure Ed25519 (which would produce
+            # signatures incompatible with real AWS KMS).
+            return error_response_json(
+                "UnsupportedOperationException",
+                "ED25519_PH_SHA_512 (Ed25519ph) signing is not yet implemented in this emulator",
                 400,
             )
         signature = rec["_private_key"].sign(message)
@@ -446,11 +470,23 @@ def _verify(data):
     signature = base64.b64decode(signature_b64) if isinstance(signature_b64, str) else signature_b64
 
     public_key = rec["_private_key"].public_key()
-    if algorithm == "ED25519_SHA_512":
+    if algorithm in ("ED25519_SHA_512", "ED25519_PH_SHA_512"):
         if rec["KeySpec"] != "ECC_NIST_EDWARDS25519":
             return error_response_json(
                 "UnsupportedOperationException",
                 f"Signing algorithm {algorithm} is not supported for this key",
+                400,
+            )
+        if algorithm == "ED25519_SHA_512" and message_type != "RAW":
+            return error_response_json(
+                "UnsupportedOperationException",
+                "ED25519_SHA_512 signing algorithm requires MessageType=RAW",
+                400,
+            )
+        if algorithm == "ED25519_PH_SHA_512":
+            return error_response_json(
+                "UnsupportedOperationException",
+                "ED25519_PH_SHA_512 (Ed25519ph) verification is not yet implemented in this emulator",
                 400,
             )
         try:

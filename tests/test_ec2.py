@@ -637,7 +637,11 @@ def test_ec2_network_interface_attach_detach(ec2):
     assert attachment_id.startswith("eni-attach-")
 
     desc = ec2.describe_network_interfaces(NetworkInterfaceIds=[eni_id])
-    assert desc["NetworkInterfaces"][0]["Status"] == "in-use"
+    eni = desc["NetworkInterfaces"][0]
+    assert eni["Status"] == "in-use"
+    # Real EC2 surfaces Attachment.AttachTime on every attached ENI. Issue #1178.
+    assert "AttachTime" in eni["Attachment"]
+    assert eni["Attachment"]["AttachTime"] is not None
 
     ec2.detach_network_interface(AttachmentId=attachment_id)
     desc2 = ec2.describe_network_interfaces(NetworkInterfaceIds=[eni_id])

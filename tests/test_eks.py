@@ -859,57 +859,6 @@ def test_eks_collect_node_labels_emits_aws_topology_defaults():
     assert keyed["topology.kubernetes.io/zone"] == f"{region}a"
 
 
-def test_eks_collect_node_labels_honours_tag_overrides():
-    """ministack.node-label/<key> tags on CreateCluster override defaults."""
-    from ministack.services import eks as eks_mod
-
-    cluster = {
-        "tags": {
-            "ministack.node-label/topology.kubernetes.io/zone": "eu-west-1c",
-            "ministack.node-label/custom.io/team": "platform",
-            "Environment": "prod",  # non-prefixed tag must be ignored
-        }
-    }
-    args = eks_mod._collect_node_labels(cluster)
-    keyed = dict(arg.removeprefix("--node-label=").split("=", 1) for arg in args)
-
-    assert keyed["topology.kubernetes.io/zone"] == "eu-west-1c"
-    assert keyed["custom.io/team"] == "platform"
-    assert "Environment" not in keyed
-
-
-def test_eks_parse_default_node_labels_env_var():
-    """MINISTACK_EKS_DEFAULT_NODE_LABELS parses k1=v1,k2=v2 with whitespace tolerance."""
-    from ministack.services.eks import _parse_default_node_labels
-
-    assert _parse_default_node_labels(None) == []
-    assert _parse_default_node_labels("") == []
-    assert _parse_default_node_labels("k=v") == [("k", "v")]
-    assert _parse_default_node_labels(" a=1 , b=2 , malformed , =empty_key ") == [
-        ("a", "1"),
-        ("b", "2"),
-    ]
-
-
-def test_eks_collect_node_labels_env_var_layered_under_tags(monkeypatch):
-    """Env-var defaults are applied, then tag overrides win for the same key."""
-    from ministack.services import eks as eks_mod
-
-    monkeypatch.setattr(
-        eks_mod, "_DEFAULT_NODE_LABELS",
-        [("custom.io/team", "default"), ("custom.io/tier", "system")],
-    )
-    cluster = {
-        "tags": {"ministack.node-label/custom.io/team": "growth"},
-    }
-    args = eks_mod._collect_node_labels(cluster)
-    keyed = dict(arg.removeprefix("--node-label=").split("=", 1) for arg in args)
-
-    assert keyed["custom.io/team"] == "growth"      # tag overrides env-default
-    assert keyed["custom.io/tier"] == "system"      # env-default kept when no tag
-    assert keyed["topology.kubernetes.io/region"]  # AWS defaults still emitted
-
-
 def test_eks_k3s_run_kwargs_appends_node_labels():
     """node_labels list flows into the k3s server command verbatim."""
     from ministack.services.eks import _k3s_run_kwargs

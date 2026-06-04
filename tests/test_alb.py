@@ -631,3 +631,33 @@ def test_elbv2_dataplane_host_header_routing(elbv2, lam):
         assert body["routed"] is True
     finally:
         _alb_teardown(elbv2, lam, lb_arn, tg_arn, l_arn, "dp-alb-host-fn")
+
+
+def test_alb_set_subnets_updates_lb(elbv2):
+    """SetSubnets replaces the LB's Subnets and returns AvailabilityZones."""
+    arn = elbv2.create_load_balancer(
+        Name="qa-alb-setsub",
+        Subnets=["subnet-aaa"],
+    )["LoadBalancers"][0]["LoadBalancerArn"]
+    resp = elbv2.set_subnets(LoadBalancerArn=arn, Subnets=["subnet-bbb", "subnet-ccc"])
+    assert resp["IpAddressType"] in ("ipv4", "dualstack", "dualstack-without-public-ipv4")
+    zone_subnets = {z["SubnetId"] for z in resp["AvailabilityZones"]}
+    assert zone_subnets == {"subnet-bbb", "subnet-ccc"}
+
+
+def test_alb_set_ip_address_type(elbv2):
+    arn = elbv2.create_load_balancer(Name="qa-alb-setip")["LoadBalancers"][0]["LoadBalancerArn"]
+    resp = elbv2.set_ip_address_type(LoadBalancerArn=arn, IpAddressType="dualstack")
+    assert resp["IpAddressType"] == "dualstack"
+    desc = elbv2.describe_load_balancers(LoadBalancerArns=[arn])["LoadBalancers"][0]
+    assert desc["IpAddressType"] == "dualstack"
+
+
+def test_alb_set_security_groups(elbv2):
+    """SetSecurityGroups returns SecurityGroupIds per botocore output shape."""
+    arn = elbv2.create_load_balancer(
+        Name="qa-alb-setsg",
+        SecurityGroups=["sg-aaa"],
+    )["LoadBalancers"][0]["LoadBalancerArn"]
+    resp = elbv2.set_security_groups(LoadBalancerArn=arn, SecurityGroups=["sg-bbb", "sg-ccc"])
+    assert resp["SecurityGroupIds"] == ["sg-bbb", "sg-ccc"]
