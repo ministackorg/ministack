@@ -7,6 +7,13 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [Unreleased]
+
+### Added
+- **EKS — default `topology.kubernetes.io/zone` and `topology.kubernetes.io/region` labels on k3s nodes** — every cluster's k3s container now receives `--node-label topology.kubernetes.io/zone={region}a` and `--node-label topology.kubernetes.io/region={region}` so topology-aware controllers (Karpenter, Cluster Autoscaler, scheduler `topologySpreadConstraints`) can schedule pods without manual `kubectl label node` workarounds. Zone defaults to `{region}a` and is overridable per cluster via a `CreateCluster` tag key `ministack.node-label/topology.kubernetes.io/zone`. Region is sourced from `get_region()` (Iron Rule 6). Org-wide additional labels can be set via `MINISTACK_EKS_DEFAULT_NODE_LABELS="k1=v1,k2=v2"`; per-cluster tag overrides take precedence. Eliminates one Karpenter integration workaround. Contributed by @b-rajesh.
+
+---
+
 ## [1.3.57] — 2026-06-03
 
 ### Added
