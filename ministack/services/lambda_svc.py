@@ -4276,9 +4276,21 @@ def _get_policy(
 
 def _esm_id_from_arn(resource_arn: str) -> str | None:
     """Return the ESM UUID if the ARN points to an event-source-mapping, else None."""
-    if ":event-source-mapping:" in resource_arn:
-        return resource_arn.rsplit(":", 1)[-1]
-    return None
+    try:
+        spec = parse_arn(resource_arn)
+    except ArnParseError:
+        return None
+    if (
+        spec.service != "lambda"
+        or spec.account_id != get_account_id()
+        or spec.region != get_region()
+    ):
+        return None
+    prefix = "event-source-mapping:"
+    if not spec.resource.startswith(prefix):
+        return None
+    esm_id = spec.resource[len(prefix):]
+    return esm_id or None
 
 
 def _list_tags(resource_arn: str):

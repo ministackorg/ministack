@@ -2033,6 +2033,15 @@ def test_lambda_event_source_mapping_tags(lam, sqs):
     assert "Env" not in tags
     assert tags["Team"] == "platform"
 
+    wrong_region = esm_arn.replace(":us-east-1:", ":us-west-2:")
+    wrong_account = esm_arn.replace(":000000000000:", ":111111111111:")
+    wrong_service = esm_arn.replace(":lambda:", ":sns:")
+    wrong_resource = esm_arn.replace(":event-source-mapping:", ":function:")
+    for bad_ref in (wrong_region, wrong_account, wrong_service, wrong_resource):
+        with pytest.raises(ClientError) as exc:
+            lam.list_tags(Resource=bad_ref)
+        assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
     lam.delete_event_source_mapping(UUID=esm["UUID"])
     lam.delete_function(FunctionName=fn)
     sqs.delete_queue(QueueUrl=q["QueueUrl"])
