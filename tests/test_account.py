@@ -1,14 +1,17 @@
 import json
+import os
 import urllib.request
 
 import pytest
 
 import boto3
 
+_ENDPOINT = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+
 
 @pytest.fixture(scope="module")
 def acct():
-    return boto3.client("account", endpoint_url="http://localhost:4566",
+    return boto3.client("account", endpoint_url=_ENDPOINT,
                         region_name="us-east-1",
                         aws_access_key_id="test", aws_secret_access_key="test")
 
@@ -24,7 +27,7 @@ def test_account_get_account_information_includes_account_state_field():
     """AccountState added 2026-04-29; verify present on the wire even though
     older botocore may strip it."""
     req = urllib.request.Request(
-        "http://localhost:4566/getAccountInformation",
+        f"{_ENDPOINT}/getAccountInformation",
         data=b"{}",
         headers={
             "Content-Type": "application/json",
