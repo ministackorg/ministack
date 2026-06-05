@@ -677,8 +677,29 @@ def _resolve_api_by_key(api_key_value):
     return None
 
 
-def _invoke_lambda_authorizer(api_id, authorizer_config, request_headers):
-    """Invoke the Lambda authorizer; return an identity dict or None on failure/rejection.
+class _AuthorizerRejected(Exception):
+    """Sentinel raised when the Lambda authorizer denies a request.
+
+    AWS docs are explicit: an authorizer returning `isAuthorized:false`, an
+    authorizer Lambda that's unreachable, or an authorizer that raises must all
+    surface to the client as `UnauthorizedException` (HTTP 401). Callers catch
+    this and emit the standard AppSync error envelope.
+    """
+
+
+def _invoke_lambda_authorizer(
+    api_id, authorizer_config, request_headers,
+    *,
+    query: str = "",
+    variables: dict | None = None,
+    operation_name: str | None = None,
+):
+    """Invoke the Lambda authorizer.
+
+    Returns the identity dict (`{}` when authorized with no `resolverContext`,
+    or `{"resolverContext": {...}}` when present). Raises ``_AuthorizerRejected``
+    for any failure mode AWS treats as unauthorized: missing authorizer Lambda,
+    invocation error, malformed response, or ``isAuthorized:false``.
 
     AWS stores the authorizer Lambda under ``lambdaAuthorizerConfig.authorizerUri``
     (which ``_create_graphql_api`` persists verbatim). ministack's AppSync Events
@@ -686,19 +707,32 @@ def _invoke_lambda_authorizer(api_id, authorizer_config, request_headers):
     """
     func_arn = authorizer_config.get("authorizerUri") or authorizer_config.get("authorizer_uri")
     if not func_arn:
-        return None
+        # Misconfigured API (lambdaAuthorizerConfig present but no Uri). Treat
+        # as authorized — this is a config error surface, not a per-request
+        # rejection signal.
+        return {}
 
     import ministack.services.lambda_svc as _lambda_svc
 
     func_name = func_arn.rsplit(":", 1)[-1]
     func = _lambda_svc._functions.get(func_name)
     if not func:
-        logger.warning("Lambda authorizer %s not found in ministack — skipping auth", func_name)
-        return None
+        logger.warning("Lambda authorizer %s not found in ministack", func_name)
+        raise _AuthorizerRejected("authorizer Lambda not found")
 
+    # AWS-verified authorizer event shape — apiId / accountId / requestId /
+    # queryString / operationName / variables / requestHeaders all present per
+    # the AppSync Developer Guide AWS_LAMBDA authorization section.
     authorizer_event = {
         "authorizationToken": request_headers.get("authorization", ""),
-        "requestContext": {"operationName": "unknown"},
+        "requestContext": {
+            "apiId": api_id,
+            "accountId": get_account_id(),
+            "requestId": new_uuid(),
+            "queryString": query,
+            "operationName": operation_name or "unknown",
+            "variables": variables or {},
+        },
         "requestHeaders": request_headers,
     }
 
@@ -706,29 +740,40 @@ def _invoke_lambda_authorizer(api_id, authorizer_config, request_headers):
         result = _lambda_svc._execute_function(func, authorizer_event)
     except Exception as e:
         logger.warning("Lambda authorizer invocation failed: %s", e)
-        return None
+        raise _AuthorizerRejected("authorizer invocation failed") from e
 
     if not isinstance(result, dict) or result.get("error"):
         logger.warning("Lambda authorizer execution error")
-        return None
+        raise _AuthorizerRejected("authorizer execution error")
 
     body = result.get("body")
     if isinstance(body, str):
         try:
             body = json.loads(body)
         except Exception:
-            return None
+            raise _AuthorizerRejected("authorizer returned non-JSON body")
     if not isinstance(body, dict):
-        return None
+        raise _AuthorizerRejected("authorizer returned non-dict body")
 
     if not body.get("isAuthorized", False):
         logger.warning("Lambda authorizer rejected request")
-        return None
+        raise _AuthorizerRejected("isAuthorized=false")
 
     resolver_context = body.get("resolverContext")
     if resolver_context:
         return {"resolverContext": resolver_context}
-    return None
+    return {}
+
+
+def _unauthorized_response():
+    """AppSync's wire-shape for an authorizer rejection: HTTP 401 with a
+    GraphQL `errors` envelope carrying `UnauthorizedException`."""
+    return _json(401, {
+        "errors": [{
+            "errorType": "UnauthorizedException",
+            "message": "You are not authorized to make this call.",
+        }],
+    })
 
 
 def _execute_graphql(api_id, data, request_headers=None):
@@ -760,13 +805,20 @@ def _execute_graphql(api_id, data, request_headers=None):
     is_mutation = query_clean.strip().startswith("mutation")
 
     # Determine identity from the Lambda authorizer (AWS_LAMBDA auth mode).
+    # AWS contract: a rejected authorizer must surface as UnauthorizedException
+    # (HTTP 401), not as a HTTP 200 with identity=null.
     identity = None
     api = _apis.get(api_id, {})
     if api.get("lambdaAuthorizerConfig"):
-        identity = _invoke_lambda_authorizer(
-            api_id, api["lambdaAuthorizerConfig"], request_headers or {}
-        )
-        # If identity is None, the request proceeds with identity=None (API_KEY behavior).
+        try:
+            identity = _invoke_lambda_authorizer(
+                api_id, api["lambdaAuthorizerConfig"], request_headers or {},
+                query=query,
+                variables=variables,
+                operation_name=operation_name,
+            )
+        except _AuthorizerRejected:
+            return _unauthorized_response()
 
     results = {}
     errors = []
