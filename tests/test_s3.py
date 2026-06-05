@@ -2542,3 +2542,164 @@ def test_s3_put_object_acl_xml_body(s3):
     assert perms == ["FULL_CONTROL", "READ"]
     s3.delete_object(Bucket=bucket, Key="k")
     s3.delete_bucket(Bucket=bucket)
+
+
+def test_s3_put_object_with_sha256_checksum_roundtrips(s3):
+    """PutObject + ChecksumAlgorithm=SHA256 must be retrievable via
+    GetObject(ChecksumMode='ENABLED'). Issue #831."""
+    import base64
+    import hashlib
+
+    bucket = "checksum-sha256-bucket"
+    s3.create_bucket(Bucket=bucket)
+    body = b"hello checksum world" * 64
+    expected = base64.b64encode(hashlib.sha256(body).digest()).decode()
+
+    s3.put_object(Bucket=bucket, Key="k", Body=body, ChecksumAlgorithm="SHA256")
+
+    head = s3.head_object(Bucket=bucket, Key="k", ChecksumMode="ENABLED")
+    assert head["ChecksumSHA256"] == expected
+
+    got = s3.get_object(Bucket=bucket, Key="k", ChecksumMode="ENABLED")
+    assert got["ChecksumSHA256"] == expected
+    assert got["Body"].read() == body
+
+    s3.delete_object(Bucket=bucket, Key="k")
+    s3.delete_bucket(Bucket=bucket)
+
+
+def test_s3_put_object_with_explicit_sha256_value_validated(s3):
+    """PutObject with both ChecksumAlgorithm + ChecksumSHA256: the supplied
+    value must match the server-computed one (BadDigest otherwise)."""
+    import base64
+    import hashlib
+
+    from botocore.exceptions import ClientError
+
+    bucket = "checksum-validate-bucket"
+    s3.create_bucket(Bucket=bucket)
+    body = b"trust but verify"
+    good = base64.b64encode(hashlib.sha256(body).digest()).decode()
+
+    # Matching value → accepted.
+    s3.put_object(Bucket=bucket, Key="ok", Body=body,
+                  ChecksumAlgorithm="SHA256", ChecksumSHA256=good)
+    head = s3.head_object(Bucket=bucket, Key="ok", ChecksumMode="ENABLED")
+    assert head["ChecksumSHA256"] == good
+
+    # Mismatched value → BadDigest.
+    bad = base64.b64encode(hashlib.sha256(b"tampered").digest()).decode()
+    with pytest.raises(ClientError) as exc:
+        s3.put_object(Bucket=bucket, Key="bad", Body=body,
+                      ChecksumAlgorithm="SHA256", ChecksumSHA256=bad)
+    assert exc.value.response["Error"]["Code"] == "BadDigest"
+
+    s3.delete_object(Bucket=bucket, Key="ok")
+    s3.delete_bucket(Bucket=bucket)
+
+
+def test_s3_versioned_get_returns_stored_checksum(s3):
+    """A versioned GetObject(?versionId=X) with ChecksumMode=ENABLED must
+    return the per-version checksum that was stored at put time. Issue #831
+    in-scope follow-up: the original fix added checksums to the current-version
+    path; the versioned-read branch had its own early-return."""
+    import base64
+    import hashlib
+
+    bucket = "checksum-versioned-bucket"
+    s3.create_bucket(Bucket=bucket)
+    s3.put_bucket_versioning(
+        Bucket=bucket,
+        VersioningConfiguration={"Status": "Enabled"},
+    )
+
+    body_a = b"version A body"
+    body_b = b"version B body - different bytes entirely"
+    expected_a = base64.b64encode(hashlib.sha256(body_a).digest()).decode()
+    expected_b = base64.b64encode(hashlib.sha256(body_b).digest()).decode()
+
+    pa = s3.put_object(Bucket=bucket, Key="k", Body=body_a, ChecksumAlgorithm="SHA256")
+    pb = s3.put_object(Bucket=bucket, Key="k", Body=body_b, ChecksumAlgorithm="SHA256")
+    va = pa["VersionId"]
+    vb = pb["VersionId"]
+    assert va != vb
+
+    got_a = s3.get_object(Bucket=bucket, Key="k", VersionId=va, ChecksumMode="ENABLED")
+    got_b = s3.get_object(Bucket=bucket, Key="k", VersionId=vb, ChecksumMode="ENABLED")
+    assert got_a["ChecksumSHA256"] == expected_a
+    assert got_b["ChecksumSHA256"] == expected_b
+    assert got_a["Body"].read() == body_a
+    assert got_b["Body"].read() == body_b
+
+    s3.delete_object(Bucket=bucket, Key="k", VersionId=va)
+    s3.delete_object(Bucket=bucket, Key="k", VersionId=vb)
+    s3.delete_bucket(Bucket=bucket)
+
+
+def test_s3_put_object_rejects_unsupported_crc32c_explicitly(s3):
+    """CRC32C requires an optional native library ministack doesn't bundle.
+    Rather than silently accept-without-validation, the put must fail loudly
+    so clients see the gap. Issue #831 follow-up: no silent failures."""
+    import base64
+    import os
+
+    from botocore.exceptions import ClientError
+
+    bucket = "checksum-crc32c-reject-bucket"
+    s3.create_bucket(Bucket=bucket)
+    fake_crc32c = base64.b64encode(os.urandom(4)).decode()
+    with pytest.raises(ClientError) as exc:
+        s3.put_object(
+            Bucket=bucket, Key="k", Body=b"x",
+            ChecksumAlgorithm="CRC32C",
+            ChecksumCRC32C=fake_crc32c,
+        )
+    assert exc.value.response["Error"]["Code"] == "InvalidRequest"
+    s3.delete_bucket(Bucket=bucket)
+
+
+def test_s3_copy_object_preserves_source_checksum(s3):
+    """CopyObject must propagate the source's stored checksum to the
+    destination so GetObject(dest, ChecksumMode='ENABLED') returns the same
+    SHA256 as the source. Issue #831 in-scope follow-up."""
+    import base64
+    import hashlib
+
+    src_bucket = "checksum-copy-src"
+    dst_bucket = "checksum-copy-dst"
+    s3.create_bucket(Bucket=src_bucket)
+    s3.create_bucket(Bucket=dst_bucket)
+    body = b"copy me with my checksum intact"
+    expected = base64.b64encode(hashlib.sha256(body).digest()).decode()
+
+    s3.put_object(Bucket=src_bucket, Key="k", Body=body, ChecksumAlgorithm="SHA256")
+    s3.copy_object(
+        Bucket=dst_bucket, Key="k",
+        CopySource={"Bucket": src_bucket, "Key": "k"},
+    )
+    got = s3.get_object(Bucket=dst_bucket, Key="k", ChecksumMode="ENABLED")
+    assert got["ChecksumSHA256"] == expected
+
+    s3.delete_object(Bucket=src_bucket, Key="k")
+    s3.delete_object(Bucket=dst_bucket, Key="k")
+    s3.delete_bucket(Bucket=src_bucket)
+    s3.delete_bucket(Bucket=dst_bucket)
+
+
+def test_s3_put_object_with_crc32_checksum_roundtrips(s3):
+    """CRC32 is the other stdlib-supported algorithm — verify the same path."""
+    import base64
+    import struct
+    import zlib
+
+    bucket = "checksum-crc32-bucket"
+    s3.create_bucket(Bucket=bucket)
+    body = b"crc32 payload"
+    expected = base64.b64encode(struct.pack(">I", zlib.crc32(body) & 0xFFFFFFFF)).decode()
+
+    s3.put_object(Bucket=bucket, Key="k", Body=body, ChecksumAlgorithm="CRC32")
+    got = s3.get_object(Bucket=bucket, Key="k", ChecksumMode="ENABLED")
+    assert got["ChecksumCRC32"] == expected
+
+    s3.delete_object(Bucket=bucket, Key="k")
+    s3.delete_bucket(Bucket=bucket)

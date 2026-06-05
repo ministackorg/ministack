@@ -767,6 +767,227 @@ def _appconfig_application_delete(physical_id, props):
     _appconfig._tags.pop(_appconfig._app_arn(physical_id), None)
 
 
+# --- AppConfig Environment ---
+
+def _appconfig_environment_create(logical_id, props, stack_name):
+    app_id = props.get("ApplicationId")
+    if not app_id:
+        raise ValueError("AWS::AppConfig::Environment requires ApplicationId")
+    name = props.get("Name") or _physical_name(stack_name, logical_id, max_len=64)
+    env_id = _appconfig._gen_id()
+    _appconfig._environments[f"{app_id}/{env_id}"] = {
+        "ApplicationId": app_id,
+        "Id": env_id,
+        "Name": name,
+        "Description": props.get("Description", ""),
+        "State": "READY_FOR_DEPLOYMENT",
+        "Monitors": props.get("Monitors", []),
+        "DeletionProtectionCheck": props.get("DeletionProtectionCheck", "ACCOUNT_DEFAULT"),
+    }
+    cfn_tags = props.get("Tags") or []
+    if cfn_tags:
+        _appconfig._apply_tags(
+            _appconfig._env_arn(app_id, env_id),
+            {t["Key"]: t["Value"] for t in cfn_tags if "Key" in t},
+        )
+    # Ref → environment ID; GetAtt EnvironmentId per AWS CFN reference.
+    return env_id, {"EnvironmentId": env_id}
+
+
+def _appconfig_environment_delete(physical_id, props):
+    app_id = props.get("ApplicationId", "")
+    _appconfig._environments.pop(f"{app_id}/{physical_id}", None)
+    _appconfig._tags.pop(_appconfig._env_arn(app_id, physical_id), None)
+
+
+# --- AppConfig ConfigurationProfile ---
+
+def _appconfig_configuration_profile_create(logical_id, props, stack_name):
+    app_id = props.get("ApplicationId")
+    if not app_id:
+        raise ValueError("AWS::AppConfig::ConfigurationProfile requires ApplicationId")
+    name = props.get("Name") or _physical_name(stack_name, logical_id, max_len=128)
+    profile_id = _appconfig._gen_id()
+    _appconfig._config_profiles[f"{app_id}/{profile_id}"] = {
+        "ApplicationId": app_id,
+        "Id": profile_id,
+        "Name": name,
+        "Description": props.get("Description", ""),
+        "LocationUri": props.get("LocationUri", "hosted"),
+        "RetrievalRoleArn": props.get("RetrievalRoleArn", ""),
+        "Validators": props.get("Validators", []),
+        "Type": props.get("Type", "AWS.Freeform"),
+        "KmsKeyIdentifier": props.get("KmsKeyIdentifier", ""),
+        "DeletionProtectionCheck": props.get("DeletionProtectionCheck", "ACCOUNT_DEFAULT"),
+    }
+    cfn_tags = props.get("Tags") or []
+    if cfn_tags:
+        _appconfig._apply_tags(
+            _appconfig._profile_arn(app_id, profile_id),
+            {t["Key"]: t["Value"] for t in cfn_tags if "Key" in t},
+        )
+    # Ref → configuration profile ID; GetAtt ConfigurationProfileId, KmsKeyArn.
+    # KmsKeyArn is only populated when a KMS key was supplied; CDK reads it as
+    # an empty string in that case.
+    return profile_id, {
+        "ConfigurationProfileId": profile_id,
+        "KmsKeyArn": props.get("KmsKeyIdentifier", ""),
+    }
+
+
+def _appconfig_configuration_profile_delete(physical_id, props):
+    app_id = props.get("ApplicationId", "")
+    _appconfig._config_profiles.pop(f"{app_id}/{physical_id}", None)
+    _appconfig._tags.pop(_appconfig._profile_arn(app_id, physical_id), None)
+
+
+# --- AppConfig HostedConfigurationVersion ---
+
+def _appconfig_hosted_version_create(logical_id, props, stack_name):
+    app_id = props.get("ApplicationId")
+    profile_id = props.get("ConfigurationProfileId")
+    if not app_id or not profile_id:
+        raise ValueError(
+            "AWS::AppConfig::HostedConfigurationVersion requires "
+            "ApplicationId and ConfigurationProfileId"
+        )
+    content = props.get("Content", "")
+    # CDK / Fn::ToJsonString may pass parsed JSON; AWS wire shape is a string.
+    if isinstance(content, (dict, list)):
+        content = json.dumps(content)
+    existing = [
+        v for k, v in _appconfig._hosted_versions.items()
+        if k.startswith(f"{app_id}/{profile_id}/")
+    ]
+    version_number = len(existing) + 1
+    # AWS optimistic-concurrency: if LatestVersionNumber is supplied, it must
+    # match the most-recent version_number — otherwise reject with a
+    # ConflictException-shape error (mirrors real AppConfig's lock check).
+    latest_lock = props.get("LatestVersionNumber")
+    if latest_lock is not None and int(latest_lock) != version_number - 1:
+        raise ValueError(
+            f"AWS::AppConfig::HostedConfigurationVersion LatestVersionNumber "
+            f"mismatch: supplied {latest_lock}, current latest is {version_number - 1}"
+        )
+    _appconfig._hosted_versions[f"{app_id}/{profile_id}/{version_number}"] = {
+        "ApplicationId": app_id,
+        "ConfigurationProfileId": profile_id,
+        "VersionNumber": version_number,
+        "ContentType": props.get("ContentType", "application/json"),
+        "Content": content,
+        "Description": props.get("Description", ""),
+        "VersionLabel": props.get("VersionLabel", ""),
+    }
+    # Ref → version number; GetAtt VersionNumber.
+    return str(version_number), {"VersionNumber": version_number}
+
+
+def _appconfig_hosted_version_delete(physical_id, props):
+    app_id = props.get("ApplicationId", "")
+    profile_id = props.get("ConfigurationProfileId", "")
+    _appconfig._hosted_versions.pop(
+        f"{app_id}/{profile_id}/{physical_id}", None
+    )
+
+
+# --- AppConfig DeploymentStrategy ---
+
+def _appconfig_deployment_strategy_create(logical_id, props, stack_name):
+    name = props.get("Name") or _physical_name(stack_name, logical_id, max_len=64)
+    strategy_id = _appconfig._gen_id()
+    _appconfig._deployment_strategies[strategy_id] = {
+        "Id": strategy_id,
+        "Name": name,
+        "Description": props.get("Description", ""),
+        "DeploymentDurationInMinutes": props.get("DeploymentDurationInMinutes", 0),
+        "GrowthType": props.get("GrowthType", "LINEAR"),
+        "GrowthFactor": props.get("GrowthFactor", 100.0),
+        "FinalBakeTimeInMinutes": props.get("FinalBakeTimeInMinutes", 0),
+        "ReplicateTo": props.get("ReplicateTo", "NONE"),
+    }
+    cfn_tags = props.get("Tags") or []
+    if cfn_tags:
+        _appconfig._apply_tags(
+            _appconfig._strategy_arn(strategy_id),
+            {t["Key"]: t["Value"] for t in cfn_tags if "Key" in t},
+        )
+    # Ref → deployment strategy ID; GetAtt is `Id` (singular) per AWS reference.
+    return strategy_id, {"Id": strategy_id}
+
+
+def _appconfig_deployment_strategy_delete(physical_id, props):
+    _appconfig._deployment_strategies.pop(physical_id, None)
+    _appconfig._tags.pop(_appconfig._strategy_arn(physical_id), None)
+
+
+# --- AppConfig Deployment ---
+
+def _appconfig_deployment_create(logical_id, props, stack_name):
+    app_id = props.get("ApplicationId")
+    env_id = props.get("EnvironmentId")
+    strategy_id = props.get("DeploymentStrategyId")
+    profile_id = props.get("ConfigurationProfileId")
+    if not all([app_id, env_id, strategy_id, profile_id]):
+        raise ValueError(
+            "AWS::AppConfig::Deployment requires ApplicationId, EnvironmentId, "
+            "DeploymentStrategyId, and ConfigurationProfileId"
+        )
+    existing = [
+        v for k, v in _appconfig._deployments.items()
+        if k.startswith(f"{app_id}/{env_id}/")
+    ]
+    deploy_num = len(existing) + 1
+    now = _appconfig._now_iso()
+    _appconfig._deployments[f"{app_id}/{env_id}/{deploy_num}"] = {
+        "ApplicationId": app_id,
+        "EnvironmentId": env_id,
+        "DeploymentStrategyId": strategy_id,
+        "ConfigurationProfileId": profile_id,
+        "DeploymentNumber": deploy_num,
+        "ConfigurationName": _appconfig._config_profiles.get(
+            f"{app_id}/{profile_id}", {}
+        ).get("Name", ""),
+        "ConfigurationLocationUri": "hosted",
+        "ConfigurationVersion": props.get("ConfigurationVersion", ""),
+        "Description": props.get("Description", ""),
+        "State": "COMPLETE",
+        "PercentageComplete": 100.0,
+        "StartedAt": now,
+        "CompletedAt": now,
+        "KmsKeyIdentifier": props.get("KmsKeyIdentifier", ""),
+        "DynamicExtensionParameters": props.get("DynamicExtensionParameters", []),
+    }
+    cfn_tags = props.get("Tags") or []
+    if cfn_tags:
+        # Deployment doesn't have its own ARN helper; use the standard AppConfig
+        # ARN shape so ListTagsForResource keeps working post-create.
+        deploy_arn = (
+            f"arn:aws:appconfig:{_appconfig.get_region()}:"
+            f"{_appconfig.get_account_id()}:application/{app_id}/"
+            f"environment/{env_id}/deployment/{deploy_num}"
+        )
+        _appconfig._apply_tags(
+            deploy_arn,
+            {t["Key"]: t["Value"] for t in cfn_tags if "Key" in t},
+        )
+    # GetAtt DeploymentNumber, State. Ref is documented as having no return
+    # value on the AWS CFN page; we return the deploy_num as the physical id
+    # so CDK templates that Ref a Deployment still resolve.
+    return str(deploy_num), {"DeploymentNumber": deploy_num, "State": "COMPLETE"}
+
+
+def _appconfig_deployment_delete(physical_id, props):
+    app_id = props.get("ApplicationId", "")
+    env_id = props.get("EnvironmentId", "")
+    _appconfig._deployments.pop(f"{app_id}/{env_id}/{physical_id}", None)
+    deploy_arn = (
+        f"arn:aws:appconfig:{_appconfig.get_region()}:"
+        f"{_appconfig.get_account_id()}:application/{app_id}/"
+        f"environment/{env_id}/deployment/{physical_id}"
+    )
+    _appconfig._tags.pop(deploy_arn, None)
+
+
 # --- CloudWatch Logs LogGroup ---
 
 def _cwlogs_create(logical_id, props, stack_name):
@@ -3896,6 +4117,26 @@ _RESOURCE_HANDLERS = {
     "AWS::AppConfig::Application": {
         "create": _appconfig_application_create,
         "delete": _appconfig_application_delete,
+    },
+    "AWS::AppConfig::Environment": {
+        "create": _appconfig_environment_create,
+        "delete": _appconfig_environment_delete,
+    },
+    "AWS::AppConfig::ConfigurationProfile": {
+        "create": _appconfig_configuration_profile_create,
+        "delete": _appconfig_configuration_profile_delete,
+    },
+    "AWS::AppConfig::HostedConfigurationVersion": {
+        "create": _appconfig_hosted_version_create,
+        "delete": _appconfig_hosted_version_delete,
+    },
+    "AWS::AppConfig::DeploymentStrategy": {
+        "create": _appconfig_deployment_strategy_create,
+        "delete": _appconfig_deployment_strategy_delete,
+    },
+    "AWS::AppConfig::Deployment": {
+        "create": _appconfig_deployment_create,
+        "delete": _appconfig_deployment_delete,
     },
     "AWS::Logs::LogGroup": {"create": _cwlogs_create, "delete": _cwlogs_delete},
     "AWS::Events::Rule": {"create": _eb_rule_create, "delete": _eb_rule_delete},

@@ -30,8 +30,10 @@ import json
 import logging
 import os
 import re
+import struct
 import threading
 import time
+import zlib
 from urllib.parse import parse_qs as _parse_qs
 from urllib.parse import quote as url_quote
 from urllib.parse import unquote as url_unquote
@@ -518,7 +520,8 @@ def _extract_user_metadata(headers: dict) -> dict:
     return meta
 
 
-def _build_object_record(body: bytes, headers: dict, etag: str = None) -> dict:
+def _build_object_record(body: bytes, headers: dict, etag: str = None,
+                         checksums: dict | None = None) -> dict:
     content_type = headers.get("content-type", "application/octet-stream")
     content_encoding = headers.get("content-encoding")
     preserved = {}
@@ -537,10 +540,106 @@ def _build_object_record(body: bytes, headers: dict, etag: str = None) -> dict:
         "metadata": _extract_user_metadata(headers),
         "preserved_headers": preserved,
         "storage_class": headers.get("x-amz-storage-class") or "STANDARD",
+        # AWS-shape checksums (SHA256 / SHA1 / CRC32 / CRC32C / CRC64NVME),
+        # stored uppercase-keyed and base64-encoded per the S3 wire contract.
+        # Surfaced on Get/HeadObject via the `x-amz-checksum-*` headers only
+        # when the caller sends `x-amz-checksum-mode: ENABLED`.
+        "checksums": checksums or {},
     }
 
 
-def _object_response_headers(obj: dict, bucket_name: str = "", key: str = "") -> dict:
+# ---------------------------------------------------------------------------
+# AWS-shape checksum handling (SHA256 / SHA1 / CRC32 / CRC32C / CRC64NVME)
+# ---------------------------------------------------------------------------
+
+_S3_CHECKSUM_HEADERS = ("crc32", "crc32c", "crc64nvme", "sha1", "sha256")
+
+
+def _compute_s3_checksum(algorithm: str, body: bytes) -> str | None:
+    """Return base64-encoded checksum for the given AWS S3 algorithm name.
+
+    Supports SHA256 / SHA1 / CRC32 via stdlib. CRC32C / CRC64NVME require
+    optional native libs (`google-crc32c` / `crc64nvme-py`) that aren't part of
+    the stdlib; we return None for those, and the caller falls back to the
+    client-supplied value (if any) instead of failing the put.
+    """
+    algo = (algorithm or "").upper().replace("_", "")
+    if algo == "SHA256":
+        return base64.b64encode(hashlib.sha256(body).digest()).decode()
+    if algo == "SHA1":
+        return base64.b64encode(hashlib.sha1(body).digest()).decode()
+    if algo == "CRC32":
+        crc = zlib.crc32(body) & 0xFFFFFFFF
+        return base64.b64encode(struct.pack(">I", crc)).decode()
+    return None
+
+
+def _resolve_object_checksums(body: bytes, headers: dict):
+    """Build the stored checksum dict and validate any client-supplied values.
+
+    AWS PutObject contract:
+      - `x-amz-checksum-{alg}` headers carry a client-computed value.
+      - `x-amz-sdk-checksum-algorithm: ALG` asks the server to compute that
+        algorithm; the resulting value is returned alongside the response.
+      - When the SDK both names an algorithm AND supplies its value, the
+        server-computed value MUST match the supplied one or the request is
+        rejected with `BadDigest` (HTTP 400).
+
+    Ministack-specific: CRC32C / CRC64NVME require optional native libraries
+    that the "no new dependencies" rule forbids us from adding. Rather than
+    silently accept an unverifiable checksum (which would round-trip on Get
+    without ever being validated against the body — a worse failure mode than
+    refusing the request), we reject the put with a clear error. SHA256 / SHA1
+    / CRC32 work end-to-end.
+
+    Returns ``(checksums_dict, error_response_or_None)``.
+    """
+    provided = {}
+    unverifiable = set()
+    for alg in _S3_CHECKSUM_HEADERS:
+        val = headers.get(f"x-amz-checksum-{alg}")
+        if val:
+            provided[alg.upper()] = val
+            if _compute_s3_checksum(alg.upper(), b"") is None:
+                unverifiable.add(alg.upper())
+
+    sdk_alg_raw = headers.get("x-amz-sdk-checksum-algorithm")
+    if sdk_alg_raw:
+        sdk_key = sdk_alg_raw.upper().replace("_", "")
+        if _compute_s3_checksum(sdk_alg_raw, b"") is None:
+            unverifiable.add(sdk_key)
+
+    if unverifiable:
+        return {}, _error(
+            "InvalidRequest",
+            (
+                f"Checksum algorithm not supported in this ministack build: "
+                f"{', '.join(sorted(unverifiable))}. Supported: SHA256, SHA1, CRC32. "
+                f"CRC32C and CRC64NVME require optional native dependencies that "
+                f"ministack does not bundle; use SHA256 instead, or omit the "
+                f"checksum header."
+            ),
+            400,
+        )
+
+    checksums = dict(provided)
+    if sdk_alg_raw:
+        sdk_key = sdk_alg_raw.upper().replace("_", "")
+        computed = _compute_s3_checksum(sdk_alg_raw, body)
+        if computed is not None:
+            existing = provided.get(sdk_key)
+            if existing and existing != computed:
+                return {}, _error(
+                    "BadDigest",
+                    f"The {sdk_key} you specified did not match the calculated checksum.",
+                    400,
+                )
+            checksums[sdk_key] = computed
+    return checksums, None
+
+
+def _object_response_headers(obj: dict, bucket_name: str = "", key: str = "",
+                             include_checksums: bool = False) -> dict:
     h = {
         "Content-Type": obj["content_type"],
         "ETag": obj["etag"],
@@ -567,6 +666,18 @@ def _object_response_headers(obj: dict, bucket_name: str = "", key: str = "") ->
         hold = _object_legal_hold.get((bucket_name, key))
         if hold:
             h["x-amz-object-lock-legal-hold"] = hold
+    # AWS only returns x-amz-checksum-* headers when the request opted in via
+    # `x-amz-checksum-mode: ENABLED` — silent on Head/Get otherwise to match
+    # the documented contract and avoid leaking checksums into clients that
+    # didn't ask for them.
+    if include_checksums:
+        stored = obj.get("checksums") or {}
+        for alg, val in stored.items():
+            h[f"x-amz-checksum-{alg.lower()}"] = val
+        if stored:
+            # Single PutObject = FULL_OBJECT; multipart-uploaded objects would
+            # be COMPOSITE — out of scope here.
+            h["x-amz-checksum-type"] = "FULL_OBJECT"
     return h
 
 
@@ -643,7 +754,7 @@ def _dispatch(
             )
 
         if method == "HEAD":
-            return _head_object(bucket, key)
+            return _head_object(bucket, key, headers)
 
         if method == "DELETE":
             if "uploadId" in query_params:
@@ -1862,8 +1973,12 @@ def _put_object(bucket_name: str, key: str, body: bytes, headers: dict):
     if precondition_err:
         return precondition_err
 
+    checksums, csum_err = _resolve_object_checksums(body, headers)
+    if csum_err:
+        return csum_err
+
     etag = f'"{md5_hash(body)}"'
-    obj = _build_object_record(body, headers, etag=etag)
+    obj = _build_object_record(body, headers, etag=etag, checksums=checksums)
     bucket["objects"][key] = obj
 
     # --- Object Lock headers on PutObject ---
@@ -1902,6 +2017,7 @@ def _put_object(bucket_name: str, key: str, body: bytes, headers: dict):
             "is_latest": True,
             "data": body,
             "storage_class": obj.get("storage_class") or "STANDARD",
+            "checksums": obj.get("checksums") or {},
         })
         # Mark all previous versions as not latest
         for v in _object_versions[vkey][:-1]:
@@ -2195,6 +2311,15 @@ def _get_object(bucket_name: str, key: str, headers: dict, query_params: dict = 
                     "Last-Modified": iso_to_rfc7231(v["last_modified"]),
                     "x-amz-version-id": v["version_id"],
                 }
+                # Versioned reads honor `x-amz-checksum-mode: ENABLED` the same
+                # way current-version reads do — the stored per-version
+                # checksums are looked up and surfaced as `x-amz-checksum-*`.
+                if (headers.get("x-amz-checksum-mode") or "").upper() == "ENABLED":
+                    stored = v.get("checksums") or {}
+                    for alg, val in stored.items():
+                        resp_headers[f"x-amz-checksum-{alg.lower()}"] = val
+                    if stored:
+                        resp_headers["x-amz-checksum-type"] = "FULL_OBJECT"
                 return 200, resp_headers, v["data"]
         return _error("NoSuchVersion", "The specified version does not exist.", 404, f"/{bucket_name}/{key}")
 
@@ -2207,9 +2332,16 @@ def _get_object(bucket_name: str, key: str, headers: dict, query_params: dict = 
         )
 
     obj = bucket["objects"][key]
-    resp_headers = _object_response_headers(obj, bucket_name, key)
-
     range_header = headers.get("range", "")
+    # AWS returns whole-object checksums only on full-object responses (HTTP
+    # 200). On a 206 Partial Content reply the bytes are a slice, and a
+    # whole-object checksum can't validate them — boto3 raises
+    # `FlexibleChecksumError` if it sees one alongside sliced bytes.
+    checksum_mode_on = (headers.get("x-amz-checksum-mode") or "").upper() == "ENABLED"
+    include_checksums = checksum_mode_on and not range_header
+    resp_headers = _object_response_headers(obj, bucket_name, key,
+                                            include_checksums=include_checksums)
+
     body = _read_body(bucket_name, key, obj)
     if range_header:
         rng = _parse_range(range_header, obj["size"])
@@ -2242,7 +2374,8 @@ def _range_error_xml(bucket_name: str, key: str) -> Element:
     return root
 
 
-def _head_object(bucket_name: str, key: str):
+def _head_object(bucket_name: str, key: str, headers: dict | None = None):
+    headers = headers or {}
     bucket = _ensure_bucket(bucket_name)
     if bucket is None:
         return _no_such_bucket(bucket_name)
@@ -2255,7 +2388,9 @@ def _head_object(bucket_name: str, key: str):
         )
 
     obj = bucket["objects"][key]
-    return 200, _object_response_headers(obj, bucket_name, key), b""
+    include_checksums = (headers.get("x-amz-checksum-mode") or "").upper() == "ENABLED"
+    return 200, _object_response_headers(obj, bucket_name, key,
+                                         include_checksums=include_checksums), b""
 
 
 def _delete_object(bucket_name: str, key: str, headers: dict | None = None):
@@ -2410,6 +2545,18 @@ def _copy_object(bucket_name: str, dest_key: str, headers: dict):
     new_etag = src_obj["etag"]
     last_modified = now_iso()
     src_body = _read_body(src_bucket_name, src_key, src_obj)
+    # AWS CopyObject preserves the source's whole-object checksum unless the
+    # caller asks for a different algorithm via `x-amz-checksum-algorithm` /
+    # `x-amz-sdk-checksum-algorithm`. The latter case is handled by the same
+    # resolver as PutObject, against the copied body.
+    dest_checksums = dict(src_obj.get("checksums") or {})
+    if headers.get("x-amz-sdk-checksum-algorithm") or any(
+        headers.get(f"x-amz-checksum-{a}") for a in _S3_CHECKSUM_HEADERS
+    ):
+        resolved, csum_err = _resolve_object_checksums(src_body, headers)
+        if csum_err:
+            return csum_err
+        dest_checksums.update(resolved)
     dest_obj = {
         "body": src_body,
         "content_type": content_type,
@@ -2420,6 +2567,7 @@ def _copy_object(bucket_name: str, dest_key: str, headers: dict):
         "metadata": metadata,
         "preserved_headers": preserved,
         "storage_class": dest_sc,
+        "checksums": dest_checksums,
     }
     dest_bucket["objects"][dest_key] = dest_obj
 
@@ -3828,6 +3976,7 @@ def _persist_object(bucket: str, key: str, obj):
                 "metadata": obj.get("metadata", {}),
                 "preserved_headers": obj.get("preserved_headers", {}),
                 "storage_class": obj.get("storage_class", "STANDARD"),
+                "checksums": obj.get("checksums", {}),
             }
             _atomic_write(fpath + ".meta.json", json.dumps(meta), text=True)
         # Drop body from in-memory record to save RAM
@@ -3953,6 +4102,7 @@ def _load_persisted_bucket(account_id, bucket_name, bucket_path):
                 "metadata": meta.get("metadata", {}),
                 "preserved_headers": meta.get("preserved_headers", {}),
                 "storage_class": meta.get("storage_class", "STANDARD"),
+                "checksums": meta.get("checksums", {}),
             }
 
 
