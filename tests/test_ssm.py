@@ -324,5 +324,5 @@ def test_ssm_get_patch_baseline_unknown_id_returns_does_not_exist(ssm):
     from botocore.exceptions import ClientError
     import pytest
     with pytest.raises(ClientError) as exc:
-        ssm.get_patch_baseline(BaselineId="pb-deadbeef")
+        ssm.get_patch_baseline(BaselineId="pb-deadbeefdeadbeef0")
     assert exc.value.response["Error"]["Code"] == "DoesNotExistException"
