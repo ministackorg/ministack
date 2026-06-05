@@ -392,6 +392,28 @@ SERVICE_PATTERNS = {
         "credential_scope": "s3tables",
         "path_prefixes": ["/buckets", "/iceberg"],
     },
+    # NOTE: bedrock-runtime must be listed BEFORE bedrock because the host
+    # `bedrock-runtime.{region}.amazonaws.com` matches both `bedrock-runtime\.`
+    # and the looser `bedrock\.` regex — detect_service iterates in dict order.
+    "bedrock-runtime": {
+        "host_patterns": [r"bedrock-runtime\."],
+        "credential_scope": "bedrock",
+        "path_prefixes": ["/model/"],
+    },
+    "bedrock": {
+        "host_patterns": [r"bedrock\."],
+        "credential_scope": "bedrock",
+        "path_prefixes": ["/foundation-models", "/inference-profiles"],
+    },
+    "bedrock-mantle": {
+        "host_patterns": [r"bedrock-mantle\."],
+        "path_prefixes": ["/v1/chat/completions"],
+    },
+    "kafka": {
+        "host_patterns": [r"^kafka\."],
+        "credential_scope": "kafka",
+        "path_prefixes": ["/v1/clusters", "/v1/configurations", "/v1/tags", "/api/v2"],
+    },
 }
 
 
@@ -421,6 +443,49 @@ def detect_service(method: str, path: str, headers: dict, query_params: dict) ->
         match = re.search(r"Credential=[^/]+/[^/]+/[^/]+/([^/]+)/", auth)
         if match:
             svc_name = match.group(1)
+            # bedrock + bedrock-runtime both sign with credential scope
+            # "bedrock" (verified via botocore signing_name). Disambiguate by
+            # path (runtime hits /model/...) and host (real AWS endpoint).
+            # This must run before the SERVICE_PATTERNS early-return so the
+            # runtime branch isn't shadowed by the control-plane entry.
+            if svc_name == "bedrock":
+                # bedrock, bedrock-runtime, bedrock-agent, bedrock-agent-runtime
+                # all sign as "bedrock" (verified via botocore signing_name).
+                # Disambiguate by path + host. Order matters — runtime checks
+                # before control plane so /async-invoke wins over a generic
+                # bedrock control-plane fallback.
+                if "bedrock-agent-runtime" in host:
+                    return "bedrock-agent-runtime"
+                if "bedrock-agent" in host:
+                    return "bedrock-agent"
+                if "bedrock-runtime" in host:
+                    return "bedrock-runtime"
+                # bedrock-agent-runtime paths (case-sensitive vs bedrock-agent)
+                if (path.startswith("/retrieveAndGenerate")
+                    or path.startswith("/rerank")
+                    or path.startswith("/optimize-prompt")
+                    or path.startswith("/generateQuery")
+                    or path.startswith("/sessions")
+                    or re.match(r"^/agents/[^/]+/agentAliases/", path)
+                    or re.match(r"^/flows/[^/]+/aliases/[^/]+/executions", path)
+                    or re.match(r"^/flows/[^/]+/executions$", path)
+                    or (method == "POST" and re.match(r"^/flows/[^/]+/aliases/[^/]+$", path))
+                    or re.match(r"^/knowledgebases/[^/]+/retrieve$", path)):
+                    return "bedrock-agent-runtime"
+                # bedrock-agent control-plane paths
+                if (path.startswith("/agents/")
+                    or path.startswith("/agents")
+                    or path.startswith("/knowledgebases")
+                    or path.startswith("/flows")
+                    or path.startswith("/prompts")
+                    or path.startswith("/tags/")):
+                    return "bedrock-agent"
+                # bedrock-runtime data plane paths
+                if (path.startswith("/model/")
+                    or path.startswith("/guardrail/")
+                    or path.startswith("/async-invoke")):
+                    return "bedrock-runtime"
+                return "bedrock"
             if svc_name in SERVICE_PATTERNS:
                 return svc_name
             # Map common credential scope names
@@ -478,6 +543,7 @@ def detect_service(method: str, path: str, headers: dict, query_params: dict) ->
                 "cur": "cur",
                 "inspector2": "inspector2",
                 "s3tables": "s3tables",
+                "kafka": "kafka",
             }
             if svc_name in scope_map:
                 return scope_map[svc_name]
@@ -836,6 +902,11 @@ def detect_service(method: str, path: str, headers: dict, query_params: dict) ->
         return "imds"
     if path_lower.startswith("/v2/credentials"):
         return "imds"
+    if path_lower.startswith("/v1/chat/completions"):
+        # Bedrock Mantle OpenAI-shape inference. openai-python sends unsigned
+        # POSTs, so we route purely on path before falling into other /v1/...
+        # branches.
+        return "bedrock-mantle"
     if path_lower.startswith("/v1/apis") or path_lower.startswith("/v1/tags/arn:aws:appsync"):
         return "appsync"
     if path_lower.startswith("/key-value-stores/"):
