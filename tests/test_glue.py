@@ -603,6 +603,114 @@ def test_glue_batch_create_partition(glue):
 
 
 # ---------------------------------------------------------------------------
+# BatchUpdatePartition
+# ---------------------------------------------------------------------------
+
+def test_glue_batch_update_partition(glue):
+    db = "qa-bup-db"
+    tbl = "qa-bup-tbl"
+    glue.create_database(DatabaseInput={"Name": db})
+    glue.create_table(
+        DatabaseName=db,
+        TableInput={
+            "Name": tbl,
+            "StorageDescriptor": {
+                "Columns": [],
+                "Location": "s3://b/k",
+                "InputFormat": "",
+                "OutputFormat": "",
+                "SerdeInfo": {},
+            },
+            "PartitionKeys": [{"Name": "dt", "Type": "string"}],
+        },
+    )
+    glue.batch_create_partition(
+        DatabaseName=db,
+        TableName=tbl,
+        PartitionInputList=[
+            {
+                "Values": ["2024-05"],
+                "StorageDescriptor": {
+                    "Columns": [],
+                    "Location": "s3://b/k/dt=2024-05",
+                    "InputFormat": "",
+                    "OutputFormat": "",
+                    "SerdeInfo": {},
+                },
+            },
+        ],
+    )
+    before = glue.get_partition(
+        DatabaseName=db,
+        TableName=tbl,
+        PartitionValues=["2024-05"],
+    )["Partition"]
+    creation_time = before["CreationTime"]
+    resp = glue.batch_update_partition(
+        DatabaseName=db,
+        TableName=tbl,
+        Entries=[
+            {
+                "PartitionValueList": ["2024-05"],
+                "PartitionInput": {
+                    "Values": ["2024-05"],
+                    "StorageDescriptor": {
+                        "Columns": [],
+                        "Location": "s3://b/k/dt=2024-05-updated",
+                        "InputFormat": "",
+                        "OutputFormat": "",
+                        "SerdeInfo": {},
+                    },
+                },
+            },
+        ],
+    )
+    assert resp.get("Errors", []) == []
+    part = glue.get_partition(
+        DatabaseName=db,
+        TableName=tbl,
+        PartitionValues=["2024-05"],
+    )["Partition"]
+    assert part["StorageDescriptor"]["Location"] == "s3://b/k/dt=2024-05-updated"
+    # CreationTime is preserved across an update (LastAccessTime is refreshed)
+    assert part["CreationTime"] == creation_time
+    # updating a partition that does not exist returns an error entry
+    resp2 = glue.batch_update_partition(
+        DatabaseName=db,
+        TableName=tbl,
+        Entries=[
+            {
+                "PartitionValueList": ["no-such"],
+                "PartitionInput": {
+                    "Values": ["no-such"],
+                    "StorageDescriptor": {
+                        "Columns": [],
+                        "Location": "s3://b/k/dt=no-such",
+                        "InputFormat": "",
+                        "OutputFormat": "",
+                        "SerdeInfo": {},
+                    },
+                },
+            },
+        ],
+    )
+    assert len(resp2["Errors"]) == 1
+    assert resp2["Errors"][0]["PartitionValueList"] == ["no-such"]
+    assert resp2["Errors"][0]["ErrorDetail"]["ErrorCode"] == "EntityNotFoundException"
+    # updating against a nonexistent table fails at the request level
+    with pytest.raises(ClientError) as exc:
+        glue.batch_update_partition(
+            DatabaseName=db,
+            TableName="no-such-tbl",
+            Entries=[{"PartitionValueList": ["x"], "PartitionInput": {"Values": ["x"]}}],
+        )
+    assert exc.value.response["Error"]["Code"] == "EntityNotFoundException"
+    # cleanup
+    glue.delete_table(DatabaseName=db, Name=tbl)
+    glue.delete_database(Name=db)
+
+
+# ---------------------------------------------------------------------------
 # GetCrawlerMetrics
 # ---------------------------------------------------------------------------
 

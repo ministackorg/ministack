@@ -185,6 +185,7 @@ async def handle_request(method, path, headers, body, query_params):
         "GetPartitions": _get_partitions,
         "BatchCreatePartition": _batch_create_partition,
         "BatchGetPartition": _batch_get_partition,
+        "BatchUpdatePartition": _batch_update_partition,
         # Partition Indexes
         "CreatePartitionIndex": _create_partition_index,
         "GetPartitionIndexes": _get_partition_indexes,
@@ -532,6 +533,41 @@ def _batch_get_partition(data):
         else:
             unprocessed.append(entry)
     return json_response({"Partitions": partitions, "UnprocessedKeys": unprocessed})
+
+
+def _batch_update_partition(data):
+    db_name = data.get("DatabaseName")
+    table_name = data.get("TableName")
+    key = f"{db_name}/{table_name}"
+    if key not in _tables:
+        return error_response_json("EntityNotFoundException",
+            f"Table {table_name} not found in {db_name}", 400)
+    parts = _partitions.get(key, [])
+    errors = []
+    for entry in data.get("Entries", []):
+        values = entry.get("PartitionValueList", [])
+        partition_input = entry.get("PartitionInput", {})
+        target = None
+        for p in parts:
+            if p.get("Values") == values:
+                target = p
+                break
+        if target is None:
+            errors.append({"PartitionValueList": values, "ErrorDetail": {
+                "ErrorCode": "EntityNotFoundException",
+                "ErrorMessage": "Partition not found"}})
+            continue
+        creation_time = target.get("CreationTime")
+        target.clear()
+        target.update({
+            **partition_input,
+            "DatabaseName": db_name,
+            "TableName": table_name,
+            "CreationTime": creation_time,
+            "LastAccessTime": int(time.time()),
+            "CatalogId": get_account_id(),
+        })
+    return json_response({"Errors": errors})
 
 
 # ---- Partition Indexes ----
