@@ -87,6 +87,8 @@ async def _urlopen_async(request_or_url, timeout_seconds: float):
 REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 _PROXY_TIMEOUT_SECONDS = _timeout_from_env("MINISTACK_APIGW_PROXY_TIMEOUT_SECONDS", 30.0)
 _JWKS_TIMEOUT_SECONDS = _timeout_from_env("MINISTACK_APIGW_JWKS_TIMEOUT_SECONDS", 5.0)
+_OIDC_TIMEOUT_SECONDS = _timeout_from_env("MINISTACK_APIGW_OIDC_TIMEOUT_SECONDS", 5.0)
+_OIDC_CACHE_TTL_SECONDS = _timeout_from_env("MINISTACK_APIGW_OIDC_CACHE_TTL_SECONDS", 7200.0)
 
 # ---- Module-level state ----
 _apis = AccountScopedDict()          # api_id -> api object
@@ -102,6 +104,10 @@ _integration_responses = AccountScopedDict()   # api_id -> {integration_id -> {i
 # to per-account local Cognito user pools — the same URL string may legitimately
 # serve different keys in different accounts.
 _jwks_cache = AccountScopedDict()
+# OIDC discovery documents ({issuer}/.well-known/openid-configuration) are cached
+# by issuer (account-scoped, like _jwks_cache) so the jwks_uri lookup does not
+# hit the network on every request.
+_oidc_config_cache = AccountScopedDict()
 
 # WebSocket connection registry — connections are not per-account-scoped at the store level
 # because the @connections management API may arrive on any host/account; instead we store
@@ -493,7 +499,30 @@ def _extract_token_from_identity_source(identity_source, headers: dict, query_pa
     return None
 
 
-def _resolve_jwks_url(authorizer: dict) -> str | None:
+async def _fetch_oidc_jwks_uri(issuer: str) -> str | None:
+    """Resolve an issuer's jwks_uri via OIDC discovery, cached per issuer.
+
+    Reads {issuer}/.well-known/openid-configuration and returns its jwks_uri.
+    Returns None (and caches the miss) if discovery is unavailable so callers
+    can fall back to the conventional path.
+    """
+    issuer = issuer.rstrip("/")
+    cached = _oidc_config_cache.get(issuer)
+    now = time.time()
+    if cached and cached.get("expiresAt", 0) > now:
+        return cached.get("jwks_uri")
+    jwks_uri = None
+    try:
+        url = f"{issuer}/.well-known/openid-configuration"
+        _, _, body = await _urlopen_async(url, _OIDC_TIMEOUT_SECONDS)
+        jwks_uri = (json.loads(body or b"{}") or {}).get("jwks_uri")
+    except (OSError, ValueError, json.JSONDecodeError):
+        jwks_uri = None
+    _oidc_config_cache[issuer] = {"jwks_uri": jwks_uri, "expiresAt": now + _OIDC_CACHE_TTL_SECONDS}
+    return jwks_uri
+
+
+async def _resolve_jwks_url(authorizer: dict) -> str | None:
     jwt_cfg = authorizer.get("jwtConfiguration") or {}
     issuer = jwt_cfg.get("issuer") or jwt_cfg.get("Issuer")
     if not issuer:
@@ -502,7 +531,8 @@ def _resolve_jwks_url(authorizer: dict) -> str | None:
     if issuer.startswith("https://cognito-idp.") and ".amazonaws.com/" in issuer:
         pool_id = issuer.rsplit("/", 1)[-1]
         return f"http://{_HOST}:{_PORT}/{pool_id}/.well-known/jwks.json"
-    return f"{issuer}/.well-known/jwks.json"
+    discovered = await _fetch_oidc_jwks_uri(issuer)
+    return discovered or f"{issuer}/.well-known/jwks.json"
 
 
 async def _fetch_jwks(url: str) -> dict:
@@ -572,7 +602,7 @@ async def _validate_jwt_authorizer(route: dict, authorizer: dict, headers: dict,
         return None, None, _jwt_unauthorized()
 
     kid = header.get("kid")
-    jwks_url = _resolve_jwks_url(authorizer)
+    jwks_url = await _resolve_jwks_url(authorizer)
     if not kid or not jwks_url:
         return None, None, _jwt_unauthorized()
 
