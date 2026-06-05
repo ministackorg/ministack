@@ -1987,6 +1987,80 @@ def test_s3_storage_class_persisted_to_disk(tmp_path, monkeypatch):
     assert restored["storage_class"] == "GLACIER"
 
 
+def test_s3_create_bucket_persists_account_scoped(tmp_path, monkeypatch):
+    """CreateBucket persists under DATA_DIR/<account>/<bucket>, never DATA_DIR/<bucket> (#824)."""
+    from ministack.core import responses as respmod
+    from ministack.services import s3 as s3mod
+    monkeypatch.setattr(s3mod, "DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(s3mod, "S3_PERSIST", True)
+    monkeypatch.setattr(s3mod, "get_account_id", lambda: "000000000000")
+    monkeypatch.setattr(respmod, "get_account_id", lambda: "000000000000")
+    try:
+        status, _, _ = s3mod._create_bucket("issue824-create", b"")
+        assert status == 200
+        # The on-disk dir is account-scoped...
+        assert os.path.isdir(os.path.join(str(tmp_path), "000000000000", "issue824-create"))
+        # ...and there is NO spurious folder at the data-dir root.
+        assert not os.path.exists(os.path.join(str(tmp_path), "issue824-create"))
+    finally:
+        s3mod._buckets._data.pop(("000000000000", "issue824-create"), None)
+
+
+def test_s3_put_object_no_spurious_root_folder(tmp_path, monkeypatch):
+    """PutBucket + PutObject must not leave an empty folder at the data-dir root (#824).
+
+    Mirrors the issue's repro: create 'my-bucket', put 'my-file', and assert the
+    data-dir root contains only the account dir (no DATA_DIR/my-bucket)."""
+    from ministack.core import responses as respmod
+    from ministack.services import s3 as s3mod
+    monkeypatch.setattr(s3mod, "DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(s3mod, "S3_PERSIST", True)
+    monkeypatch.setattr(s3mod, "get_account_id", lambda: "000000000000")
+    monkeypatch.setattr(respmod, "get_account_id", lambda: "000000000000")
+    try:
+        s3mod._create_bucket("my-bucket", b"")
+        obj = {
+            "body": b"hello",
+            "content_type": "text/plain",
+            "content_encoding": None,
+            "etag": '"abc"',
+            "last_modified": s3mod.now_iso(),
+            "size": 5,
+            "metadata": {},
+            "preserved_headers": {},
+            "storage_class": "STANDARD",
+        }
+        s3mod._persist_object("my-bucket", "my-file", obj)
+        # Object data lands under the account-scoped path...
+        assert os.path.isfile(
+            os.path.join(str(tmp_path), "000000000000", "my-bucket", "my-file")
+        )
+        # ...and the only top-level entry is the account dir — no spurious 'my-bucket'.
+        assert sorted(os.listdir(str(tmp_path))) == ["000000000000"]
+    finally:
+        s3mod._buckets._data.pop(("000000000000", "my-bucket"), None)
+
+
+def test_s3_delete_bucket_removes_persisted_dir(tmp_path, monkeypatch):
+    """DeleteBucket removes the account-scoped on-disk directory (#824 cleanup gap)."""
+    from ministack.core import responses as respmod
+    from ministack.services import s3 as s3mod
+    monkeypatch.setattr(s3mod, "DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(s3mod, "S3_PERSIST", True)
+    monkeypatch.setattr(s3mod, "get_account_id", lambda: "000000000000")
+    monkeypatch.setattr(respmod, "get_account_id", lambda: "000000000000")
+    try:
+        s3mod._create_bucket("issue824-delete", b"")
+        bucket_dir = os.path.join(str(tmp_path), "000000000000", "issue824-delete")
+        assert os.path.isdir(bucket_dir)
+        status, _, _ = s3mod._delete_bucket("issue824-delete")
+        assert status == 204
+        # The on-disk directory is cleaned up, not orphaned.
+        assert not os.path.exists(bucket_dir)
+    finally:
+        s3mod._buckets._data.pop(("000000000000", "issue824-delete"), None)
+
+
 def test_s3_copy_object_propagates_storage_class(s3):
     """CopyObject with explicit StorageClass overrides the source's class (#534)."""
     s3.create_bucket(Bucket="qa-s3-sc-copy")

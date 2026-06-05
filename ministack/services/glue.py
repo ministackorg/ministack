@@ -11,6 +11,7 @@ scripts or when Docker is unavailable.
 Crawlers transition through RUNNING state with a configurable timer.
 """
 
+import contextvars
 import copy
 import fnmatch
 import json
@@ -185,6 +186,7 @@ async def handle_request(method, path, headers, body, query_params):
         "GetPartitions": _get_partitions,
         "BatchCreatePartition": _batch_create_partition,
         "BatchGetPartition": _batch_get_partition,
+        "BatchUpdatePartition": _batch_update_partition,
         # Partition Indexes
         "CreatePartitionIndex": _create_partition_index,
         "GetPartitionIndexes": _get_partition_indexes,
@@ -534,6 +536,41 @@ def _batch_get_partition(data):
     return json_response({"Partitions": partitions, "UnprocessedKeys": unprocessed})
 
 
+def _batch_update_partition(data):
+    db_name = data.get("DatabaseName")
+    table_name = data.get("TableName")
+    key = f"{db_name}/{table_name}"
+    if key not in _tables:
+        return error_response_json("EntityNotFoundException",
+            f"Table {table_name} not found in {db_name}", 400)
+    parts = _partitions.get(key, [])
+    errors = []
+    for entry in data.get("Entries", []):
+        values = entry.get("PartitionValueList", [])
+        partition_input = entry.get("PartitionInput", {})
+        target = None
+        for p in parts:
+            if p.get("Values") == values:
+                target = p
+                break
+        if target is None:
+            errors.append({"PartitionValueList": values, "ErrorDetail": {
+                "ErrorCode": "EntityNotFoundException",
+                "ErrorMessage": "Partition not found"}})
+            continue
+        creation_time = target.get("CreationTime")
+        target.clear()
+        target.update({
+            **partition_input,
+            "DatabaseName": db_name,
+            "TableName": table_name,
+            "CreationTime": creation_time,
+            "LastAccessTime": int(time.time()),
+            "CatalogId": get_account_id(),
+        })
+    return json_response({"Errors": errors})
+
+
 # ---- Partition Indexes ----
 
 def _create_partition_index(data):
@@ -688,7 +725,12 @@ def _start_crawler(data):
             }
             logger.info("Glue: Crawler %s finished after %ss", name, CRAWLER_RUN_SECONDS)
 
-    timer = threading.Timer(CRAWLER_RUN_SECONDS, _finish_crawl)
+    # threading.Timer (like threading.Thread) does NOT copy contextvars, so
+    # without this snapshot _finish_crawl runs under the default account and the
+    # account-scoped _crawlers guard never matches — the crawler would hang in
+    # RUNNING forever for non-default accounts. See issue #639 / stepfunctions.
+    ctx = contextvars.copy_context()
+    timer = threading.Timer(CRAWLER_RUN_SECONDS, lambda: ctx.run(_finish_crawl))
     timer.daemon = True
     timer.start()
 
@@ -808,8 +850,10 @@ def _resolve_script(script_location):
         parts = stripped.split("/", 1)
         bucket = parts[0]
         key = parts[1] if len(parts) > 1 else ""
-        # Check on-disk first
-        local_path = os.path.join(S3_DATA_DIR, bucket, key)
+        # Check on-disk first. Objects are persisted account-scoped at
+        # DATA_DIR/<account>/<bucket>/<key> (see s3._object_disk_path), so the
+        # account id MUST be part of the lookup path or it never matches.
+        local_path = os.path.join(S3_DATA_DIR, get_account_id(), bucket, key)
         if os.path.exists(local_path):
             return local_path
         # Fetch from in-memory S3
@@ -898,7 +942,12 @@ def _start_job_run(data):
         run["ExecutionTime"] = int(run["CompletedOn"] - run["StartedOn"])
         run["LastModifiedOn"] = int(time.time())
 
-    thread = threading.Thread(target=_execute, daemon=True)
+    # threading.Thread does NOT copy contextvars, so without this snapshot the
+    # worker would run under the default account and fail to resolve the
+    # account-scoped on-disk script (and AccountScopedDict lookups). Carry the
+    # request's account/region into the thread. See issue #639 / stepfunctions.
+    ctx = contextvars.copy_context()
+    thread = threading.Thread(target=ctx.run, args=(_execute,), daemon=True)
     thread.start()
 
     return json_response({"JobRunId": run_id})

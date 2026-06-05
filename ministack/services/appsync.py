@@ -508,14 +508,14 @@ async def handle_request(method, path, headers, body, query_params):
         if not api_id:
             return error_response_json("UnauthorizedException", "Valid API key required", 401)
         data = json.loads(body) if body else {}
-        return _execute_graphql(api_id, data)
+        return _execute_graphql(api_id, data, request_headers=headers)
 
     if path.startswith("/v1/apis/") and path.endswith("/graphql") and method == "POST":
         parts = path.split("/")
         if len(parts) >= 5:
             api_id = parts[3]
             data = json.loads(body) if body else {}
-            return _execute_graphql(api_id, data)
+            return _execute_graphql(api_id, data, request_headers=headers)
 
     m = _PATH_RE.match(path)
     if not m:
@@ -677,7 +677,61 @@ def _resolve_api_by_key(api_key_value):
     return None
 
 
-def _execute_graphql(api_id, data):
+def _invoke_lambda_authorizer(api_id, authorizer_config, request_headers):
+    """Invoke the Lambda authorizer; return an identity dict or None on failure/rejection.
+
+    AWS stores the authorizer Lambda under ``lambdaAuthorizerConfig.authorizerUri``
+    (which ``_create_graphql_api`` persists verbatim). ministack's AppSync Events
+    authorizer reads the same key.
+    """
+    func_arn = authorizer_config.get("authorizerUri") or authorizer_config.get("authorizer_uri")
+    if not func_arn:
+        return None
+
+    import ministack.services.lambda_svc as _lambda_svc
+
+    func_name = func_arn.rsplit(":", 1)[-1]
+    func = _lambda_svc._functions.get(func_name)
+    if not func:
+        logger.warning("Lambda authorizer %s not found in ministack — skipping auth", func_name)
+        return None
+
+    authorizer_event = {
+        "authorizationToken": request_headers.get("authorization", ""),
+        "requestContext": {"operationName": "unknown"},
+        "requestHeaders": request_headers,
+    }
+
+    try:
+        result = _lambda_svc._execute_function(func, authorizer_event)
+    except Exception as e:
+        logger.warning("Lambda authorizer invocation failed: %s", e)
+        return None
+
+    if not isinstance(result, dict) or result.get("error"):
+        logger.warning("Lambda authorizer execution error")
+        return None
+
+    body = result.get("body")
+    if isinstance(body, str):
+        try:
+            body = json.loads(body)
+        except Exception:
+            return None
+    if not isinstance(body, dict):
+        return None
+
+    if not body.get("isAuthorized", False):
+        logger.warning("Lambda authorizer rejected request")
+        return None
+
+    resolver_context = body.get("resolverContext")
+    if resolver_context:
+        return {"resolverContext": resolver_context}
+    return None
+
+
+def _execute_graphql(api_id, data, request_headers=None):
     """Execute a GraphQL query/mutation against the configured resolvers."""
     query = data.get("query", "")
     variables = data.get("variables", {})
@@ -705,13 +759,28 @@ def _execute_graphql(api_id, data):
     # Determine operation type
     is_mutation = query_clean.strip().startswith("mutation")
 
+    # Determine identity from the Lambda authorizer (AWS_LAMBDA auth mode).
+    identity = None
+    api = _apis.get(api_id, {})
+    if api.get("lambdaAuthorizerConfig"):
+        identity = _invoke_lambda_authorizer(
+            api_id, api["lambdaAuthorizerConfig"], request_headers or {}
+        )
+        # If identity is None, the request proceeds with identity=None (API_KEY behavior).
+
     results = {}
     errors = []
     for field_name, args, sub_fields in fields:
         resolver = _find_resolver(api_id, "Mutation" if is_mutation else "Query", field_name)
         if resolver:
             try:
-                result = _resolve_field(api_id, resolver, args, sub_fields, variables)
+                result = _resolve_field(
+                    api_id, resolver, args, sub_fields, variables,
+                    field_name=field_name,
+                    identity=identity,
+                    request_headers=request_headers or {},
+                    source={},
+                )
                 results[field_name] = result
             except Exception as e:
                 errors.append({"message": str(e), "path": [field_name]})
@@ -781,8 +850,9 @@ def _find_resolver(api_id, type_name, field_name):
     return None
 
 
-def _resolve_field(api_id, resolver, args, sub_fields, variables):
-    """Execute a resolver against its data source (DynamoDB)."""
+def _resolve_field(api_id, resolver, args, sub_fields, variables,
+                   field_name=None, identity=None, request_headers=None, source=None):
+    """Execute a resolver against its data source (DynamoDB or Lambda)."""
     ds_name = resolver.get("dataSourceName", "")
     data_source = _data_sources.get(api_id, {}).get(ds_name)
 
@@ -795,7 +865,17 @@ def _resolve_field(api_id, resolver, args, sub_fields, variables):
     if ds_type == "AMAZON_DYNAMODB":
         return _resolve_dynamodb(data_source, resolver, args, sub_fields)
     elif ds_type == "AWS_LAMBDA":
-        return _resolve_lambda(data_source, args)
+        return _resolve_lambda(
+            api_id=api_id,
+            resolver=resolver,
+            data_source=data_source,
+            args=args,
+            field_name=field_name or resolver.get("fieldName", ""),
+            identity=identity,
+            request_headers=request_headers or {},
+            source=source or {},
+            variables=variables or {},
+        )
     else:
         return args or {}
 
@@ -996,29 +1076,67 @@ def _strip_ddb_types(item, sub_fields):
     return result
 
 
-def _resolve_lambda(data_source, args):
-    """Execute a Lambda resolver."""
+def _resolve_lambda(api_id, resolver, data_source, args,
+                    field_name, identity, request_headers, source, variables=None):
+    """Execute a Lambda resolver by building the standard AWS AppSync resolver event."""
     config = data_source.get("lambdaConfig", {})
     func_arn = config.get("lambdaFunctionArn", "")
     if not func_arn:
-        return args
+        logger.warning("No lambdaFunctionArn in data source")
+        return args or {}
 
     import ministack.services.lambda_svc as _lambda_svc
     func_name = func_arn.rsplit(":", 1)[-1]
     func = _lambda_svc._functions.get(func_name)
     if not func:
-        return args
+        logger.warning("Lambda function %s not found", func_name)
+        return args or {}
 
-    result = _lambda_svc._execute_function(func, args)
+    # AWS-standard AppSync resolver event — fieldName lives only under info.
+    event = {
+        "arguments": args,
+        "source": source,
+        "request": {"headers": request_headers},
+        "prev": None,
+        "stash": {},
+        "info": {
+            "fieldName": field_name,
+            "parentTypeName": resolver.get("typeName", "Query"),
+            "variables": variables or {},
+        },
+    }
+    if identity is not None:
+        # Generic pass-through of the authorizer's resolverContext. Omitted for
+        # API_KEY auth; a consumer detects API-key auth via request.headers.
+        event["identity"] = identity
+
+    try:
+        result = _lambda_svc._execute_function(func, event)
+    except Exception as e:
+        logger.error("Lambda %s invocation failed: %s", func_name, e)
+        return {"errors": [f"Lambda invocation error: {str(e)}"]}
+
+    # RIE catches an unhandled Lambda exception and returns a normal dict with
+    # error=True (no Python exception bubbles up), so the try/except above does
+    # not cover it. Surface execution errors as GraphQL errors, not as data.
+    if not isinstance(result, dict) or result.get("error"):
+        err_body = result.get("body") if isinstance(result, dict) else None
+        msg = err_body.get("errorMessage") if isinstance(err_body, dict) else "Lambda execution error"
+        logger.error("Lambda %s returned error: %s", func_name, msg)
+        return {"errors": [msg or "Lambda execution error"]}
+
     body = result.get("body")
+    if body is None:
+        return None
     if isinstance(body, dict):
         return body
     if isinstance(body, (str, bytes)):
         try:
             return json.loads(body)
-        except Exception:
-            return {"result": body}
-    return args
+        except (json.JSONDecodeError, ValueError):
+            logger.error("Invalid JSON from Lambda %s", func_name)
+            return {"errors": ["Invalid response format"]}
+    return {"errors": ["Unexpected response type"]}
 
 # Load persisted state (must be after restore_state is defined)
 _load_persisted()
