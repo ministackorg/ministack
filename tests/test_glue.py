@@ -1,6 +1,7 @@
 import io
 import json
 import os
+import threading
 import time
 import uuid as _uuid_mod
 import zipfile
@@ -1101,3 +1102,93 @@ def test_glue_user_defined_function_crud(glue):
     with pytest.raises(ClientError) as exc2:
         glue.get_user_defined_function(DatabaseName="udf_db", FunctionName="upper_clean")
     assert exc2.value.response["Error"]["Code"] == "EntityNotFoundException"
+
+
+def test_glue_resolve_script_account_scoped(tmp_path, monkeypatch):
+    """_resolve_script finds an s3:// script persisted under the account-scoped
+    on-disk layout DATA_DIR/<account>/<bucket>/<key> (#827).
+
+    Regression: the on-disk lookup omitted the account id, so it could never
+    match an object written by the canonical account-scoped writer.
+    """
+    from ministack.core import responses as respmod
+    from ministack.services import s3 as s3mod
+    from ministack.services import glue as gluemod
+
+    monkeypatch.setattr(s3mod, "DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(s3mod, "S3_PERSIST", True)
+    monkeypatch.setattr(gluemod, "S3_DATA_DIR", str(tmp_path))
+
+    # A non-default account also pins that the account segment is honoured,
+    # not just the hardcoded default.
+    token = respmod._request_account_id.set("111111111111")
+    try:
+        s3mod._persist_object("scripts-bucket", "jobs/etl.py", b"print('ok')\n")
+        persisted = s3mod._object_disk_path("scripts-bucket", "jobs/etl.py")
+        assert os.path.isfile(persisted)
+
+        resolved = gluemod._resolve_script("s3://scripts-bucket/jobs/etl.py")
+        assert resolved is not None, "script not resolved — on-disk path is unscoped"
+        assert "111111111111" in resolved
+        assert os.path.samefile(resolved, persisted)
+    finally:
+        respmod._request_account_id.reset(token)
+
+
+def test_glue_start_job_run_resolves_script_in_worker_thread(tmp_path, monkeypatch):
+    """StartJobRun's worker thread resolves the account-scoped script under the
+    caller's account, not the default (#827, cf. #639).
+
+    Regression: _execute runs on a bare threading.Thread, which does not copy
+    contextvars, so get_account_id() inside _resolve_script reverted to the
+    default account and a non-default account's script was never found.
+    """
+    from ministack.core import responses as respmod
+    from ministack.services import s3 as s3mod
+    from ministack.services import glue as gluemod
+
+    monkeypatch.setattr(s3mod, "DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(s3mod, "S3_PERSIST", True)
+    monkeypatch.setattr(gluemod, "S3_DATA_DIR", str(tmp_path))
+
+    account = "210987654321"
+    captured = {}
+    done = threading.Event()
+
+    real_resolve = gluemod._resolve_script
+
+    def spy_resolve(location):
+        # Capture the account the worker thread actually runs under, then defer
+        # to the real resolver so the on-disk lookup is genuinely exercised.
+        captured["account"] = respmod.get_account_id()
+        captured["resolved"] = real_resolve(location)
+        done.set()
+        return captured["resolved"]
+
+    def noop_subprocess(run, job, args, resolved):
+        run["JobRunState"] = "SUCCEEDED"
+
+    monkeypatch.setattr(gluemod, "_resolve_script", spy_resolve)
+    monkeypatch.setattr(gluemod, "_execute_subprocess", noop_subprocess)
+
+    token = respmod._request_account_id.set(account)
+    try:
+        s3mod._persist_object("glue-scripts", "etl/main.py", b"print('ok')\n")
+        persisted = s3mod._object_disk_path("glue-scripts", "etl/main.py")
+
+        gluemod._create_job({
+            "Name": "ctx-job",
+            "Command": {"Name": "pythonshell", "ScriptLocation": "s3://glue-scripts/etl/main.py"},
+        })
+        gluemod._start_job_run({"JobName": "ctx-job"})
+
+        assert done.wait(5), "worker thread never invoked _resolve_script"
+        assert captured["account"] == account, (
+            f"worker ran under {captured.get('account')!r}, not caller account {account!r}"
+        )
+        assert captured["resolved"] is not None
+        assert os.path.samefile(captured["resolved"], persisted)
+    finally:
+        respmod._request_account_id.reset(token)
+        gluemod._jobs._data.pop((account, "ctx-job"), None)
+        gluemod._job_runs._data.pop((account, "ctx-job"), None)
