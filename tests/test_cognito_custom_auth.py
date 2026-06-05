@@ -1376,3 +1376,104 @@ def test_update_pending_challenge_result_merge_and_fallback():
     assert session["challenges"][0]["challengeResult"] is True
     assert session["challenges"][0]["challengeMetadata"] == "MAGIC_LINK"
     assert session["challenges"][1]["challengeResult"] is False
+
+
+# ── Regression: CreateAuthChallenge sees the AWS-faithful session length ───────
+#
+# AWS passes an EMPTY session array to the FIRST CreateAuthChallenge (the round
+# being created is not itself a session entry), then only COMPLETED rounds on
+# later invocations. AWS's own trigger examples branch on session.length, so the
+# observed length must match. The handler echoes the raw len it sees each round.
+_LEN_CREATE_HANDLER = (
+    "def handler(event, ctx):\n"
+    "    n = len(event['request']['session'])\n"
+    "    step = 'MAGIC_LINK' if n == 0 else 'SMS_OTP'\n"
+    "    event['response']['publicChallengeParameters'] = {'challenge': step, 'rawlen': str(n)}\n"
+    "    return event\n"
+)
+_LEN_DEFINE_HANDLER = (
+    "def handler(event, ctx):\n"
+    "    answered = [c for c in event['request']['session'] if c.get('challengeResult') is not None]\n"
+    "    if len(answered) >= 2:\n"
+    "        event['response']['issueTokens'] = True\n"
+    "    else:\n"
+    "        event['response']['challengeName'] = 'CUSTOM_CHALLENGE'\n"
+    "    return event\n"
+)
+
+
+def test_custom_auth_first_create_receives_empty_session(cognito_idp, lam):
+    """Round-1 CreateAuthChallenge sees an empty session (len 0); round-2 sees
+    one completed round (len 1) — RespondToAuthChallenge path."""
+    create_arn = _create_lambda(lam, "create-len", _LEN_CREATE_HANDLER)
+    verify_arn = _create_lambda(lam, "verify-len", _MERGE_VERIFY_HANDLER)
+    define_arn = _create_lambda(lam, "define-len", _LEN_DEFINE_HANDLER)
+
+    pid, cid = _setup_pool(cognito_idp, "SessionLenPool", {
+        "CreateAuthChallenge": create_arn,
+        "VerifyAuthChallengeResponse": verify_arn,
+        "DefineAuthChallenge": define_arn,
+    })
+
+    step1 = cognito_idp.initiate_auth(
+        ClientId=cid, AuthFlow="CUSTOM_AUTH",
+        AuthParameters={"USERNAME": "user@example.com"},
+    )
+    assert step1["ChallengeParameters"]["rawlen"] == "0"
+    assert step1["ChallengeParameters"]["challenge"] == "MAGIC_LINK"
+    session = step1["Session"]
+
+    step2 = cognito_idp.respond_to_auth_challenge(
+        ClientId=cid,
+        ChallengeName="CUSTOM_CHALLENGE",
+        Session=session,
+        ChallengeResponses={"ANSWER": "magic-link-token", "USERNAME": "user@example.com"},
+    )
+    assert step2["ChallengeParameters"]["rawlen"] == "1"
+    assert step2["ChallengeParameters"]["challenge"] == "SMS_OTP"
+
+    step3 = cognito_idp.respond_to_auth_challenge(
+        ClientId=cid,
+        ChallengeName="CUSTOM_CHALLENGE",
+        Session=session,
+        ChallengeResponses={"ANSWER": "123456", "USERNAME": "user@example.com"},
+    )
+    assert "AuthenticationResult" in step3
+
+
+def test_custom_auth_admin_first_create_receives_empty_session(cognito_idp, lam):
+    """Same empty-first-session contract on the AdminInitiateAuth path."""
+    create_arn = _create_lambda(lam, "create-len-admin", _LEN_CREATE_HANDLER)
+    verify_arn = _create_lambda(lam, "verify-len-admin", _MERGE_VERIFY_HANDLER)
+    define_arn = _create_lambda(lam, "define-len-admin", _LEN_DEFINE_HANDLER)
+
+    pid, cid = _setup_pool(cognito_idp, "SessionLenAdminPool", {
+        "CreateAuthChallenge": create_arn,
+        "VerifyAuthChallengeResponse": verify_arn,
+        "DefineAuthChallenge": define_arn,
+    })
+
+    step1 = cognito_idp.admin_initiate_auth(
+        UserPoolId=pid, ClientId=cid, AuthFlow="CUSTOM_AUTH",
+        AuthParameters={"USERNAME": "user@example.com"},
+    )
+    assert step1["ChallengeParameters"]["rawlen"] == "0"
+    assert step1["ChallengeParameters"]["challenge"] == "MAGIC_LINK"
+    session = step1["Session"]
+
+    step2 = cognito_idp.admin_respond_to_auth_challenge(
+        UserPoolId=pid, ClientId=cid,
+        ChallengeName="CUSTOM_CHALLENGE",
+        Session=session,
+        ChallengeResponses={"ANSWER": "magic-link-token", "USERNAME": "user@example.com"},
+    )
+    assert step2["ChallengeParameters"]["rawlen"] == "1"
+    assert step2["ChallengeParameters"]["challenge"] == "SMS_OTP"
+
+    step3 = cognito_idp.admin_respond_to_auth_challenge(
+        UserPoolId=pid, ClientId=cid,
+        ChallengeName="CUSTOM_CHALLENGE",
+        Session=session,
+        ChallengeResponses={"ANSWER": "123456", "USERNAME": "user@example.com"},
+    )
+    assert "AuthenticationResult" in step3
