@@ -20,6 +20,7 @@ from collections import defaultdict
 from datetime import datetime, timezone
 from urllib.parse import parse_qs
 
+from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.persistence import PERSIST_STATE, load_state
 from ministack.core.responses import AccountRegionScopedDict, AccountScopedDict, get_account_id, get_region, new_uuid
 
@@ -57,6 +58,46 @@ def _history_entries() -> list:
         entries = []
         _alarm_history["entries"] = entries
     return entries
+
+
+def _alarm_name_from_local_arn(arn):
+    try:
+        spec = parse_arn(arn)
+    except ArnParseError:
+        return None
+    if spec.service != "cloudwatch" or spec.account_id != get_account_id() or spec.region != get_region():
+        return None
+    prefix = "alarm:"
+    if not spec.resource.startswith(prefix):
+        return None
+    name = spec.resource[len(prefix):]
+    return name or None
+
+
+def _validate_alarm_tag_arn(arn, is_json=False, is_cbor=False):
+    alarm_name = _alarm_name_from_local_arn(arn)
+    alarm = _alarms.get(alarm_name) if alarm_name else None
+    if not alarm:
+        alarm = _composite_alarms.get(alarm_name) if alarm_name else None
+    if not alarm or alarm.get("AlarmArn") != arn:
+        return _error(
+            "ResourceNotFound",
+            f"Alarm resource {arn} not found",
+            404,
+            use_json=is_json,
+            use_cbor=is_cbor,
+        )
+    return None
+
+
+def _is_sns_action_arn(action):
+    if not isinstance(action, str):
+        return False
+    try:
+        spec = parse_arn(action)
+    except ArnParseError:
+        return False
+    return spec.service == "sns" and spec.account_id == get_account_id() and spec.region == get_region()
 
 
 # ── Persistence ────────────────────────────────────────────
@@ -296,7 +337,7 @@ def _dispatch_alarm_actions(alarm, old_state, new_state, reason):
     if not action_field:
         return
     actions = alarm.get(action_field) or []
-    sns_arns = [a for a in actions if isinstance(a, str) and a.startswith("arn:aws:sns:")]
+    sns_arns = [a for a in actions if _is_sns_action_arn(a)]
     if not sns_arns:
         return
     try:
@@ -1265,6 +1306,10 @@ def _tag_resource(params, cbor_data, is_cbor, is_json=False):
             )
             i += 1
 
+    validation_error = _validate_alarm_tag_arn(arn, is_json=is_json, is_cbor=is_cbor)
+    if validation_error:
+        return validation_error
+
     if arn not in _resource_tags:
         _resource_tags[arn] = {}
     for t in tags:
@@ -1289,6 +1334,10 @@ def _untag_resource(params, cbor_data, is_cbor, is_json=False):
             keys.append(_p(params, f"TagKeys.member.{i}"))
             i += 1
 
+    validation_error = _validate_alarm_tag_arn(arn, is_json=is_json, is_cbor=is_cbor)
+    if validation_error:
+        return validation_error
+
     tag_map = _resource_tags.get(arn, {})
     for k in keys:
         tag_map.pop(k, None)
@@ -1305,6 +1354,10 @@ def _list_tags_for_resource(params, cbor_data, is_cbor, is_json=False):
         arn = cbor_data.get("ResourceARN", "")
     else:
         arn = _p(params, "ResourceARN")
+
+    validation_error = _validate_alarm_tag_arn(arn, is_json=is_json, is_cbor=is_cbor)
+    if validation_error:
+        return validation_error
 
     tags = [{"Key": k, "Value": v} for k, v in _resource_tags.get(arn, {}).items()]
 

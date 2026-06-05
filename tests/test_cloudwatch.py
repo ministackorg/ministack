@@ -250,6 +250,39 @@ def test_cloudwatch_tags_v2(cw):
     assert not any(t["Key"] == "env" for t in resp2["Tags"])
     assert any(t["Key"] == "team" for t in resp2["Tags"])
 
+
+def test_cloudwatch_tags_reject_wrong_region_alarm_arn(cw):
+    import boto3
+    from conftest import ENDPOINT
+
+    cw.put_metric_alarm(
+        AlarmName="cw-tag-wrong-region",
+        MetricName="M",
+        Namespace="N",
+        Statistic="Sum",
+        Period=60,
+        EvaluationPeriods=1,
+        Threshold=1.0,
+        ComparisonOperator="GreaterThanThreshold",
+    )
+    arn = cw.describe_alarms(AlarmNames=["cw-tag-wrong-region"])["MetricAlarms"][0]["AlarmArn"]
+    arn_parts = arn.split(":")
+    arn_parts[3] = "us-west-2"
+    wrong_region_arn = ":".join(arn_parts)
+    west_cw = boto3.client(
+        "cloudwatch",
+        endpoint_url=ENDPOINT,
+        region_name="us-west-2",
+        aws_access_key_id="test",
+        aws_secret_access_key="test",
+    )
+
+    with pytest.raises(ClientError) as exc:
+        west_cw.tag_resource(ResourceARN=wrong_region_arn, Tags=[{"Key": "env", "Value": "prod"}])
+
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFound"
+
+
 def test_cloudwatch_composite_alarm(cw):
     import uuid as _uuid
 
@@ -520,4 +553,3 @@ def test_cloudwatch_disable_alarm_actions(cw):
     alarm = cw.describe_alarms(AlarmNames=["heimdall-disable-actions"])["MetricAlarms"][0]
     assert alarm["ActionsEnabled"] is False
     cw.delete_alarms(AlarmNames=["heimdall-disable-actions"])
-
