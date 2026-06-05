@@ -1328,3 +1328,50 @@ def test_custom_auth_admin_merged_result_metadata_advances_steps(cognito_idp, la
     )
     assert "AuthenticationResult" in step3
     assert step3["AuthenticationResult"].get("IdToken")
+
+
+def test_update_pending_challenge_result_merge_and_fallback():
+    """Unit-pin _update_pending_challenge_result's full contract: merge the
+    result into the pending round in place (True or False, without growing the
+    history), and fall back to appending only when there is no pending round."""
+    import ministack.services.cognito as cognito_mod
+
+    def _pending(metadata):
+        return {
+            "challengeName": "CUSTOM_CHALLENGE",
+            "challengeResult": None,
+            "challengeMetadata": metadata,
+            "publicChallengeParameters": {},
+            "privateChallengeParameters": {},
+            "timestamp": 0,
+        }
+
+    # Correct answer merges into the pending round — no new entry, metadata kept.
+    session = {"challenges": [_pending("MAGIC_LINK")], "last_challenge_metadata": "MAGIC_LINK"}
+    cognito_mod._update_pending_challenge_result(session, True)
+    assert len(session["challenges"]) == 1
+    assert session["challenges"][0]["challengeResult"] is True
+    assert session["challenges"][0]["challengeMetadata"] == "MAGIC_LINK"
+
+    # Wrong answer is recorded in place as False — not None, not dropped.
+    session = {"challenges": [_pending("SMS_OTP")], "last_challenge_metadata": "SMS_OTP"}
+    cognito_mod._update_pending_challenge_result(session, False)
+    assert len(session["challenges"]) == 1
+    assert session["challenges"][0]["challengeResult"] is False
+
+    # No pending round (empty history) — fall back to appending one entry.
+    session = {"challenges": [], "last_challenge_metadata": None}
+    cognito_mod._update_pending_challenge_result(session, True)
+    assert len(session["challenges"]) == 1
+    assert session["challenges"][0]["challengeName"] == "CUSTOM_CHALLENGE"
+    assert session["challenges"][0]["challengeResult"] is True
+    assert session["challenges"][0]["challengeMetadata"] is None
+
+    # Last round already resolved — append a new entry, leave the prior intact.
+    resolved = dict(_pending("MAGIC_LINK"), challengeResult=True)
+    session = {"challenges": [resolved], "last_challenge_metadata": "MAGIC_LINK"}
+    cognito_mod._update_pending_challenge_result(session, False)
+    assert len(session["challenges"]) == 2
+    assert session["challenges"][0]["challengeResult"] is True
+    assert session["challenges"][0]["challengeMetadata"] == "MAGIC_LINK"
+    assert session["challenges"][1]["challengeResult"] is False
