@@ -689,7 +689,12 @@ def _start_crawler(data):
             }
             logger.info("Glue: Crawler %s finished after %ss", name, CRAWLER_RUN_SECONDS)
 
-    timer = threading.Timer(CRAWLER_RUN_SECONDS, _finish_crawl)
+    # threading.Timer (like threading.Thread) does NOT copy contextvars, so
+    # without this snapshot _finish_crawl runs under the default account and the
+    # account-scoped _crawlers guard never matches — the crawler would hang in
+    # RUNNING forever for non-default accounts. See issue #639 / stepfunctions.
+    ctx = contextvars.copy_context()
+    timer = threading.Timer(CRAWLER_RUN_SECONDS, lambda: ctx.run(_finish_crawl))
     timer.daemon = True
     timer.start()
 
