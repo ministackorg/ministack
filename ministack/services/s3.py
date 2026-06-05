@@ -30,6 +30,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import threading
 import time
 from urllib.parse import parse_qs as _parse_qs
@@ -833,7 +834,10 @@ def _create_bucket(name: str, body: bytes, headers: dict = None):
         _bucket_versioning[name] = "Enabled"
 
     if S3_PERSIST:
-        os.makedirs(os.path.join(DATA_DIR, name), exist_ok=True)
+        # Account-scope the on-disk dir to match where objects are actually
+        # written (_object_disk_path / _persist_object). Omitting the account id
+        # here created a spurious empty folder at DATA_DIR/<bucket> (#824).
+        os.makedirs(os.path.join(DATA_DIR, get_account_id(), name), exist_ok=True)
     logger.info("S3 bucket created: %s%s", name, f" (region={region})" if region else "")
     return 200, {"Location": f"/{name}"}, b""
 
@@ -870,6 +874,8 @@ def _delete_bucket(name: str):
         del _object_retention[k]
     for k in [k for k in _object_legal_hold if k[0] == name]:
         del _object_legal_hold[k]
+    if S3_PERSIST:
+        _delete_persisted_bucket(name)
     return 204, {}, b""
 
 
@@ -3870,6 +3876,41 @@ def _delete_persisted_object(bucket_name: str, key: str):
             os.remove(meta_path)
     except Exception as e:
         logger.warning("Failed to delete persisted S3 object %s/%s: %s", bucket_name, key, e)
+
+
+def _delete_persisted_bucket(name: str):
+    """Remove a bucket's account-scoped on-disk directory when the bucket is deleted.
+
+    Mirrors the account scoping in _object_disk_path so we clean up exactly the
+    directory _create_bucket / _persist_object create. Without this the bucket
+    folder is orphaned on disk after DeleteBucket (#824).
+
+    Only the new account-scoped layout (DATA_DIR/<account>/<bucket>) is removed;
+    legacy unscoped data (DATA_DIR/<bucket>) from pre-account-scoping versions is
+    left in place — same as _delete_persisted_object, which only touches the
+    account-scoped path."""
+    if not S3_PERSIST or not name:
+        return
+    try:
+        account_id = get_account_id()
+        root = os.path.realpath(DATA_DIR)
+        account_root = os.path.realpath(os.path.join(DATA_DIR, account_id))
+        bucket_dir = os.path.realpath(os.path.join(DATA_DIR, account_id, name))
+        # Never remove DATA_DIR, the account directory itself, or anything that
+        # escapes DATA_DIR — only the one bucket's subtree. rmtree is destructive,
+        # so guard the primitive rather than relying solely on the validated caller.
+        if (
+            bucket_dir in (root, account_root)
+            or os.path.commonpath([root, bucket_dir]) != root
+        ):
+            logger.warning("S3 persist: refusing to delete bucket dir %s (outside its bucket scope)", name)
+            return
+        if os.path.isdir(bucket_dir):
+            # No ignore_errors: let a partial-failure OSError reach the except
+            # below so cleanup failures are logged instead of silently leaking.
+            shutil.rmtree(bucket_dir)
+    except (ValueError, OSError) as e:
+        logger.warning("Failed to delete persisted S3 bucket dir %s: %s", name, e)
 
 
 def _load_persisted_data():

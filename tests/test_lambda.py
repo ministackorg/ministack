@@ -1485,6 +1485,90 @@ def test_lambda_function_with_layer(lam):
     assert layer_arn in fn["Configuration"]["Layers"][0]["Arn"]
 
 
+def test_lambda_docker_cp_dir_arcname_creates_subdir_in_existing_parent():
+    """Docker's put_archive requires dest_dir to exist. For /opt/layer_N
+    (which doesn't exist in the base RIE image), the fix is to extract into
+    the existing /opt with the layer dir baked into the arcname so the tar
+    materialises the subdir. Regression for issue #816 docker-executor 404."""
+    import io as _io
+    import tarfile as _tarfile
+    import tempfile
+
+    from ministack.services.lambda_svc import _docker_cp_dir
+
+    captured = {}
+
+    class _FakeContainer:
+        def put_archive(self, path, data):
+            captured["path"] = path
+            captured["data"] = data.read() if hasattr(data, "read") else data
+
+    with tempfile.TemporaryDirectory() as src_dir:
+        os.makedirs(os.path.join(src_dir, "python"))
+        with open(os.path.join(src_dir, "python", "mod.py"), "w") as f:
+            f.write("X = 1\n")
+
+        _docker_cp_dir(_FakeContainer(), src_dir, "/opt", arcname="layer_0")
+
+    assert captured["path"] == "/opt"
+    tar_bytes = captured["data"]
+    with _tarfile.open(fileobj=_io.BytesIO(tar_bytes), mode="r") as tar:
+        names = tar.getnames()
+    # Entries must be rooted at "layer_0/..." so extraction into /opt produces /opt/layer_0/...
+    assert any(n.startswith("layer_0/python") or n == "layer_0/python/mod.py" for n in names), names
+    assert "layer_0" in names or any(n.startswith("layer_0/") for n in names)
+
+
+def test_lambda_pool_kill_function_reaps_all_qualifiers():
+    """_pool_kill_function must remove every pooled docker container for a
+    function across all qualifiers (the pool key includes CodeSha256, so
+    config-only updates leave stale entries unless explicitly reaped). Issue
+    #816 docker-executor follow-up. Wired into _update_config / _delete_function
+    so layer attach via UpdateFunctionConfiguration displaces the pre-attach
+    container before the next invoke."""
+    from ministack.services import lambda_svc as _svc
+
+    class _StubContainer:
+        def __init__(self):
+            self.stopped = False
+            self.removed = False
+        def stop(self, timeout=2):
+            self.stopped = True
+        def remove(self, force=False):
+            self.removed = True
+
+    stubs = [_StubContainer() for _ in range(3)]
+    keys = [
+        "111122223333:fn-A:zip:sha-v1",
+        "111122223333:fn-A:zip:sha-v2",
+        "111122223333:fn-B:zip:sha-v1",   # different function — must NOT be touched
+    ]
+    with _svc._warm_pool_lock:
+        for k, s in zip(keys, stubs):
+            _svc._warm_pool.setdefault(k, []).append(
+                {"container": s, "tmpdir": None, "in_use": False,
+                 "last_used": 0, "created": 0}
+            )
+
+    try:
+        _svc._pool_kill_function("111122223333", "fn-A")
+
+        with _svc._warm_pool_lock:
+            assert _svc._warm_pool.get("111122223333:fn-A:zip:sha-v1", []) == []
+            assert _svc._warm_pool.get("111122223333:fn-A:zip:sha-v2", []) == []
+            # fn-B must be untouched
+            assert len(_svc._warm_pool.get("111122223333:fn-B:zip:sha-v1", [])) == 1
+
+        assert stubs[0].stopped and stubs[0].removed, "fn-A v1 container not killed"
+        assert stubs[1].stopped and stubs[1].removed, "fn-A v2 container not killed"
+        assert not stubs[2].stopped, "fn-B container was killed (should be untouched)"
+    finally:
+        # Clean up any leftover stub entries so this test doesn't pollute siblings.
+        with _svc._warm_pool_lock:
+            for k in keys:
+                _svc._warm_pool.pop(k, None)
+
+
 def test_lambda_function_with_layer_reports_real_code_size(lam):
     """GetFunctionConfiguration.Layers[*].CodeSize must mirror the layer's
     actual zip size, not hardcoded 0 (issue #816)."""
