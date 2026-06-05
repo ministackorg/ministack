@@ -4,7 +4,8 @@ JSON-based API via X-Amz-Target (AmazonSSM).
 Supports: PutParameter, GetParameter, GetParameters, GetParametersByPath,
           DeleteParameter, DeleteParameters, DescribeParameters,
           GetParameterHistory, LabelParameterVersion,
-          AddTagsToResource, RemoveTagsFromResource, ListTagsForResource.
+          AddTagsToResource, RemoveTagsFromResource, ListTagsForResource,
+          DescribePatchBaselines, GetPatchBaseline.
 """
 
 import base64
@@ -34,6 +35,99 @@ from ministack.core.persistence import PERSIST_STATE, load_state
 _parameters = AccountScopedDict()
 _parameter_history = AccountScopedDict()
 _tags = AccountScopedDict()
+
+
+# ── AWS-managed Patch Baselines (global, account-independent) ──────────────
+#
+# Mirrors the canonical baselines AWS publishes per operating system. Real
+# AWS exposes these with deterministic BaselineIds across all accounts; the
+# IDs below are stable so callers caching them keep working across restarts.
+_AWS_MANAGED_PATCH_BASELINES = [
+    {
+        "BaselineId": "pb-0000000000000001",
+        "BaselineName": "AWS-AmazonLinuxDefaultPatchBaseline",
+        "OperatingSystem": "AMAZON_LINUX",
+        "BaselineDescription": "Default Patch Baseline for Amazon Linux Provided by AWS.",
+    },
+    {
+        "BaselineId": "pb-0000000000000002",
+        "BaselineName": "AWS-AmazonLinux2DefaultPatchBaseline",
+        "OperatingSystem": "AMAZON_LINUX_2",
+        "BaselineDescription": "Default Patch Baseline for Amazon Linux 2 Provided by AWS.",
+    },
+    {
+        "BaselineId": "pb-0000000000000003",
+        "BaselineName": "AWS-AmazonLinux2023DefaultPatchBaseline",
+        "OperatingSystem": "AMAZON_LINUX_2023",
+        "BaselineDescription": "Default Patch Baseline for Amazon Linux 2023 Provided by AWS.",
+    },
+    {
+        "BaselineId": "pb-0000000000000010",
+        "BaselineName": "AWS-DefaultPatchBaseline",
+        "OperatingSystem": "WINDOWS",
+        "BaselineDescription": "Default Patch Baseline Provided by AWS.",
+    },
+    {
+        "BaselineId": "pb-0000000000000011",
+        "BaselineName": "AWS-WindowsPredefinedPatchBaseline-OS",
+        "OperatingSystem": "WINDOWS",
+        "BaselineDescription": "Predefined Patch Baseline for Windows operating system.",
+    },
+    {
+        "BaselineId": "pb-0000000000000012",
+        "BaselineName": "AWS-WindowsPredefinedPatchBaseline-OS-Applications",
+        "OperatingSystem": "WINDOWS",
+        "BaselineDescription": "Predefined Patch Baseline for Windows OS and Microsoft applications.",
+    },
+    {
+        "BaselineId": "pb-0000000000000020",
+        "BaselineName": "AWS-RedHatDefaultPatchBaseline",
+        "OperatingSystem": "REDHAT_ENTERPRISE_LINUX",
+        "BaselineDescription": "Default Patch Baseline for Redhat Enterprise Linux Provided by AWS.",
+    },
+    {
+        "BaselineId": "pb-0000000000000021",
+        "BaselineName": "AWS-UbuntuDefaultPatchBaseline",
+        "OperatingSystem": "UBUNTU",
+        "BaselineDescription": "Default Patch Baseline for Ubuntu Provided by AWS.",
+    },
+    {
+        "BaselineId": "pb-0000000000000022",
+        "BaselineName": "AWS-CentOSDefaultPatchBaseline",
+        "OperatingSystem": "CENTOS",
+        "BaselineDescription": "Default Patch Baseline for CentOS Provided by AWS.",
+    },
+    {
+        "BaselineId": "pb-0000000000000023",
+        "BaselineName": "AWS-SuseDefaultPatchBaseline",
+        "OperatingSystem": "SUSE",
+        "BaselineDescription": "Default Patch Baseline for SUSE Provided by AWS.",
+    },
+    {
+        "BaselineId": "pb-0000000000000024",
+        "BaselineName": "AWS-DebianDefaultPatchBaseline",
+        "OperatingSystem": "DEBIAN",
+        "BaselineDescription": "Default Patch Baseline for Debian Provided by AWS.",
+    },
+    {
+        "BaselineId": "pb-0000000000000025",
+        "BaselineName": "AWS-OracleLinuxDefaultPatchBaseline",
+        "OperatingSystem": "ORACLE_LINUX",
+        "BaselineDescription": "Default Patch Baseline for Oracle Linux Provided by AWS.",
+    },
+    {
+        "BaselineId": "pb-0000000000000026",
+        "BaselineName": "AWS-MacOSDefaultPatchBaseline",
+        "OperatingSystem": "MACOS",
+        "BaselineDescription": "Default Patch Baseline for macOS Provided by AWS.",
+    },
+    {
+        "BaselineId": "pb-0000000000000027",
+        "BaselineName": "AWS-RaspbianDefaultPatchBaseline",
+        "OperatingSystem": "RASPBIAN",
+        "BaselineDescription": "Default Patch Baseline for Raspbian Provided by AWS.",
+    },
+]
 
 
 # ── Persistence ────────────────────────────────────────────
@@ -109,6 +203,8 @@ async def handle_request(method, path, headers, body, query_params):
         "AddTagsToResource": _add_tags_to_resource,
         "RemoveTagsFromResource": _remove_tags_from_resource,
         "ListTagsForResource": _list_tags_for_resource,
+        "DescribePatchBaselines": _describe_patch_baselines,
+        "GetPatchBaseline": _get_patch_baseline,
     }
 
     handler = handlers.get(action)
@@ -504,6 +600,105 @@ def _list_tags_for_resource(data):
     tag_list = [{"Key": k, "Value": v} for k, v in tag_dict.items()]
 
     return json_response({"TagList": tag_list})
+
+
+def _describe_patch_baselines(data):
+    """List patch baselines.
+
+    AWS exposes both account-private (customer-created) and AWS-managed
+    baselines through this API. We only ship the AWS-managed ones today;
+    custom baselines are a future addition. Filters: ``NAME_PREFIX``,
+    ``OPERATING_SYSTEM``, ``OWNER`` (``AWS`` / ``Self``).
+    """
+    filters = data.get("Filters") or []
+    max_results = int(data.get("MaxResults") or 100)
+    next_token = data.get("NextToken")
+
+    baselines = list(_AWS_MANAGED_PATCH_BASELINES)
+    owner_filter = None
+    name_prefixes: list[str] = []
+    os_filter: set[str] = set()
+
+    for f in filters:
+        key = f.get("Key", "")
+        values = f.get("Values") or []
+        if key == "OWNER":
+            owner_filter = set(values)
+        elif key == "NAME_PREFIX":
+            name_prefixes.extend(values)
+        elif key == "OPERATING_SYSTEM":
+            os_filter.update(values)
+
+    # Self-owned filter excludes AWS-managed baselines (we don't store user
+    # baselines yet, so this returns an empty list — matches what real AWS
+    # would return for an account with no custom baselines).
+    if owner_filter is not None and owner_filter == {"Self"}:
+        baselines = []
+    elif owner_filter is not None and "AWS" not in owner_filter and "All" not in owner_filter:
+        baselines = []
+
+    if name_prefixes:
+        baselines = [
+            b for b in baselines
+            if any(b["BaselineName"].startswith(p) for p in name_prefixes)
+        ]
+    if os_filter:
+        baselines = [b for b in baselines if b["OperatingSystem"] in os_filter]
+
+    start = _decode_next_token(next_token) if next_token else 0
+    page = baselines[start:start + max_results]
+    identities = [
+        {
+            "BaselineId": b["BaselineId"],
+            "BaselineName": b["BaselineName"],
+            "OperatingSystem": b["OperatingSystem"],
+            "BaselineDescription": b["BaselineDescription"],
+            "DefaultBaseline": True,
+        }
+        for b in page
+    ]
+
+    resp = {"BaselineIdentities": identities}
+    if start + max_results < len(baselines):
+        resp["NextToken"] = _encode_next_token(start + max_results)
+    return json_response(resp)
+
+
+def _get_patch_baseline(data):
+    """Return full configuration for a patch baseline by BaselineId."""
+    baseline_id = data.get("BaselineId", "")
+    if not baseline_id:
+        return error_response_json(
+            "ValidationException", "BaselineId is required", 400
+        )
+    record = next(
+        (b for b in _AWS_MANAGED_PATCH_BASELINES if b["BaselineId"] == baseline_id),
+        None,
+    )
+    if record is None:
+        return error_response_json(
+            "DoesNotExistException",
+            f"Patch baseline {baseline_id} does not exist.",
+            400,
+        )
+    now = _now_epoch()
+    return json_response({
+        "BaselineId": record["BaselineId"],
+        "Name": record["BaselineName"],
+        "OperatingSystem": record["OperatingSystem"],
+        "GlobalFilters": {"PatchFilters": []},
+        "ApprovalRules": {"PatchRules": []},
+        "ApprovedPatches": [],
+        "ApprovedPatchesComplianceLevel": "UNSPECIFIED",
+        "ApprovedPatchesEnableNonSecurity": False,
+        "RejectedPatches": [],
+        "RejectedPatchesAction": "ALLOW_AS_DEPENDENCY",
+        "PatchGroups": [],
+        "CreatedDate": now,
+        "ModifiedDate": now,
+        "Description": record["BaselineDescription"],
+        "Sources": [],
+    })
 
 
 def _param_out(param, with_decryption=False):

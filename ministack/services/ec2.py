@@ -1692,14 +1692,40 @@ def _describe_vpc_endpoint_services(p):
 # Availability Zones
 # ---------------------------------------------------------------------------
 
+_AZ_DIRECTION_ABBR = {
+    "east": "e", "west": "w", "north": "n", "south": "s", "central": "c",
+    "southeast": "se", "northeast": "ne", "southwest": "sw", "northwest": "nw",
+}
+
+
+def _az_id_prefix(region: str) -> str:
+    """Return AWS's short opaque-AZ-ID prefix for ``region``.
+
+    AWS publishes per-account opaque zone IDs of the form
+    ``{continent}{direction-abbr}{n}-az{m}`` (e.g. ``use1-az1`` for
+    ``us-east-1a``). The exact `n→m` mapping is account-random in real AWS;
+    we map deterministically by suffix order so the same caller always sees
+    the same zone-id for the same zone-name."""
+    parts = region.split("-")
+    if len(parts) != 3:
+        return region.replace("-", "") or region
+    continent, direction, num = parts
+    return f"{continent}{_AZ_DIRECTION_ABBR.get(direction, direction[:1])}{num}"
+
+
 def _describe_availability_zones(p):
-    azs = [f"{get_region()}a", f"{get_region()}b", f"{get_region()}c"]
+    region = get_region()
+    prefix = _az_id_prefix(region)
+    azs = [f"{region}a", f"{region}b", f"{region}c"]
     items = "".join(f"""<item>
         <zoneName>{az}</zoneName>
         <zoneState>available</zoneState>
-        <regionName>{get_region()}</regionName>
-        <zoneId>{az}</zoneId>
-    </item>""" for az in azs)
+        <regionName>{region}</regionName>
+        <zoneId>{prefix}-az{idx}</zoneId>
+        <groupName>{region}</groupName>
+        <networkBorderGroup>{region}</networkBorderGroup>
+        <optInStatus>opt-in-not-required</optInStatus>
+    </item>""" for idx, az in enumerate(azs, start=1))
     return _xml(200, "DescribeAvailabilityZonesResponse",
                 f"<availabilityZoneInfo>{items}</availabilityZoneInfo>")
 

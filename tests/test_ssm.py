@@ -253,3 +253,76 @@ def test_ssm_get_parameters_by_path_root_non_recursive(ssm):
     names = [p["Name"] for p in resp["Parameters"]]
     assert "/toplevel" in names
     assert "/nested/deep" not in names
+
+
+# ---------------------------------------------------------------------------
+# Patch Baselines
+# ---------------------------------------------------------------------------
+
+def test_ssm_describe_patch_baselines_returns_aws_managed_defaults(ssm):
+    """At minimum, AWS's per-OS default baselines must appear in the list with
+    DefaultBaseline=True. Terraform's aws_ssm_patch_baseline data source
+    depends on these being discoverable."""
+    resp = ssm.describe_patch_baselines()
+    by_name = {b["BaselineName"]: b for b in resp["BaselineIdentities"]}
+    for name in (
+        "AWS-AmazonLinux2DefaultPatchBaseline",
+        "AWS-AmazonLinux2023DefaultPatchBaseline",
+        "AWS-DefaultPatchBaseline",
+        "AWS-UbuntuDefaultPatchBaseline",
+        "AWS-RedHatDefaultPatchBaseline",
+    ):
+        assert name in by_name, f"missing default baseline: {name}"
+        assert by_name[name]["DefaultBaseline"] is True
+        assert by_name[name]["BaselineId"].startswith("pb-")
+        assert by_name[name]["OperatingSystem"]
+
+
+def test_ssm_describe_patch_baselines_filter_by_operating_system(ssm):
+    resp = ssm.describe_patch_baselines(
+        Filters=[{"Key": "OPERATING_SYSTEM", "Values": ["AMAZON_LINUX_2"]}]
+    )
+    assert resp["BaselineIdentities"]
+    assert all(b["OperatingSystem"] == "AMAZON_LINUX_2" for b in resp["BaselineIdentities"])
+
+
+def test_ssm_describe_patch_baselines_filter_by_name_prefix(ssm):
+    resp = ssm.describe_patch_baselines(
+        Filters=[{"Key": "NAME_PREFIX", "Values": ["AWS-WindowsPredefined"]}]
+    )
+    assert resp["BaselineIdentities"]
+    assert all(b["BaselineName"].startswith("AWS-WindowsPredefined") for b in resp["BaselineIdentities"])
+
+
+def test_ssm_describe_patch_baselines_owner_self_returns_empty(ssm):
+    """Owner=Self filters out AWS-managed baselines; we don't store customer
+    baselines yet so this returns empty — matches real-AWS shape for an
+    account with no custom baselines."""
+    resp = ssm.describe_patch_baselines(
+        Filters=[{"Key": "OWNER", "Values": ["Self"]}]
+    )
+    assert resp["BaselineIdentities"] == []
+
+
+def test_ssm_get_patch_baseline_returns_full_record(ssm):
+    listed = ssm.describe_patch_baselines(
+        Filters=[{"Key": "NAME_PREFIX", "Values": ["AWS-AmazonLinux2DefaultPatchBaseline"]}]
+    )["BaselineIdentities"]
+    baseline_id = listed[0]["BaselineId"]
+    resp = ssm.get_patch_baseline(BaselineId=baseline_id)
+    assert resp["BaselineId"] == baseline_id
+    assert resp["Name"] == "AWS-AmazonLinux2DefaultPatchBaseline"
+    assert resp["OperatingSystem"] == "AMAZON_LINUX_2"
+    # AWS shape: required envelope fields must be present even when empty.
+    assert resp["GlobalFilters"] == {"PatchFilters": []}
+    assert resp["ApprovalRules"] == {"PatchRules": []}
+    assert resp["ApprovedPatchesComplianceLevel"] == "UNSPECIFIED"
+    assert resp["RejectedPatchesAction"] == "ALLOW_AS_DEPENDENCY"
+
+
+def test_ssm_get_patch_baseline_unknown_id_returns_does_not_exist(ssm):
+    from botocore.exceptions import ClientError
+    import pytest
+    with pytest.raises(ClientError) as exc:
+        ssm.get_patch_baseline(BaselineId="pb-deadbeef")
+    assert exc.value.response["Error"]["Code"] == "DoesNotExistException"

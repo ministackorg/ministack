@@ -25,6 +25,22 @@ def test_ec2_describe_availability_zones(ec2):
     assert any("us-east-1" in az for az in azs)
 
 
+def test_ec2_describe_availability_zones_full_shape(ec2):
+    """Each AZ record carries the full AWS shape: opaque ZoneId distinct from
+    ZoneName, GroupName, NetworkBorderGroup, OptInStatus, and a State enum."""
+    resp = ec2.describe_availability_zones()
+    by_name = {az["ZoneName"]: az for az in resp["AvailabilityZones"]}
+    assert "us-east-1a" in by_name
+    az = by_name["us-east-1a"]
+    assert az["ZoneId"] == "use1-az1"
+    assert az["ZoneId"] != az["ZoneName"]
+    assert az["GroupName"] == "us-east-1"
+    assert az["NetworkBorderGroup"] == "us-east-1"
+    assert az["OptInStatus"] == "opt-in-not-required"
+    assert az["State"] == "available"
+    assert az["RegionName"] == "us-east-1"
+
+
 def test_ec2_describe_regions_returns_commercial_regions(ec2):
     """DescribeRegions must list at least the four legacy us-* regions
     with opt-in-not-required, and emit the shape AWS returns."""

@@ -4756,3 +4756,246 @@ def test_sfn_jsonata_format_number(sfn_sync):
         "neg_sub": "(1,234.50)",
         "plain": "1,234",
     }
+
+
+# ---------------------------------------------------------------------------
+# HTTP Task (arn:aws:states:::http:invoke)
+# ---------------------------------------------------------------------------
+
+def _start_local_http_server(handler_cls):
+    """Spawn a stdlib HTTP server in a background thread; return (port, shutdown)."""
+    import http.server
+    import threading as _threading_local
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), handler_cls)
+    port = server.server_address[1]
+    thread = _threading_local.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+
+    def _shutdown():
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    return port, _shutdown
+
+
+def test_sfn_http_task_get_returns_json_response_body(sfn_sync):
+    """HTTP Task GET parses a JSON response body into ResponseBody."""
+    import http.server
+    import uuid as _uuid
+
+    class _OkJson(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            body = json.dumps({"hello": "world", "method": "GET"}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *_):
+            pass
+
+    port, shutdown = _start_local_http_server(_OkJson)
+    sm_name = f"http-task-get-{_uuid.uuid4().hex[:8]}"
+    try:
+        definition = json.dumps({
+            "StartAt": "Call",
+            "States": {
+                "Call": {
+                    "Type": "Task",
+                    "Resource": "arn:aws:states:::http:invoke",
+                    "Parameters": {
+                        "ApiEndpoint": f"http://127.0.0.1:{port}/ping",
+                        "Method": "GET",
+                    },
+                    "End": True,
+                },
+            },
+        })
+        sm_arn = sfn_sync.create_state_machine(
+            name=sm_name,
+            definition=definition,
+            roleArn="arn:aws:iam::000000000000:role/sfn-role",
+        )["stateMachineArn"]
+        try:
+            resp = sfn_sync.start_sync_execution(stateMachineArn=sm_arn, input=json.dumps({}))
+            assert resp["status"] == "SUCCEEDED", f"{resp.get('error')} — {resp.get('cause')}"
+            output = json.loads(resp["output"])
+            assert output["StatusCode"] == 200
+            assert output["ResponseBody"] == {"hello": "world", "method": "GET"}
+            assert "Headers" in output
+        finally:
+            sfn_sync.delete_state_machine(stateMachineArn=sm_arn)
+    finally:
+        shutdown()
+
+
+def test_sfn_http_task_post_with_body_and_query(sfn_sync):
+    """POST with RequestBody (dict → JSON) and QueryParameters echoed."""
+    import http.server
+    import uuid as _uuid
+    from urllib.parse import urlparse, parse_qs
+
+    received = {}
+
+    class _Echo(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length", "0"))
+            body = self.rfile.read(length).decode() if length else ""
+            parsed = urlparse(self.path)
+            received["path"] = parsed.path
+            received["query"] = parse_qs(parsed.query)
+            received["body"] = body
+            received["content_type"] = self.headers.get("Content-Type", "")
+            payload = json.dumps({"received": True}).encode()
+            self.send_response(201)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, *_):
+            pass
+
+    port, shutdown = _start_local_http_server(_Echo)
+    sm_name = f"http-task-post-{_uuid.uuid4().hex[:8]}"
+    try:
+        definition = json.dumps({
+            "StartAt": "Call",
+            "States": {
+                "Call": {
+                    "Type": "Task",
+                    "Resource": "arn:aws:states:::http:invoke",
+                    "Parameters": {
+                        "ApiEndpoint": f"http://127.0.0.1:{port}/create",
+                        "Method": "POST",
+                        "QueryParameters": {"tag": "alpha"},
+                        "RequestBody": {"name": "bob", "n": 7},
+                    },
+                    "End": True,
+                },
+            },
+        })
+        sm_arn = sfn_sync.create_state_machine(
+            name=sm_name,
+            definition=definition,
+            roleArn="arn:aws:iam::000000000000:role/sfn-role",
+        )["stateMachineArn"]
+        try:
+            resp = sfn_sync.start_sync_execution(stateMachineArn=sm_arn, input=json.dumps({}))
+            assert resp["status"] == "SUCCEEDED", f"{resp.get('error')} — {resp.get('cause')}"
+            output = json.loads(resp["output"])
+            assert output["StatusCode"] == 201
+            assert output["ResponseBody"] == {"received": True}
+        finally:
+            sfn_sync.delete_state_machine(stateMachineArn=sm_arn)
+    finally:
+        shutdown()
+
+    assert received["path"] == "/create"
+    assert received["query"] == {"tag": ["alpha"]}
+    assert json.loads(received["body"]) == {"name": "bob", "n": 7}
+    assert received["content_type"] == "application/json"
+
+
+def test_sfn_http_task_non_2xx_raises_states_http_statuscodefailure(sfn_sync):
+    """A 5xx response surfaces as States.Http.StatusCodeFailure with the
+    body available via a Catch."""
+    import http.server
+    import uuid as _uuid
+
+    class _ServerError(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            body = b'{"error":"boom"}'
+            self.send_response(503)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *_):
+            pass
+
+    port, shutdown = _start_local_http_server(_ServerError)
+    sm_name = f"http-task-5xx-{_uuid.uuid4().hex[:8]}"
+    try:
+        definition = json.dumps({
+            "StartAt": "Call",
+            "States": {
+                "Call": {
+                    "Type": "Task",
+                    "Resource": "arn:aws:states:::http:invoke",
+                    "Parameters": {
+                        "ApiEndpoint": f"http://127.0.0.1:{port}/boom",
+                        "Method": "GET",
+                    },
+                    "Catch": [{
+                        "ErrorEquals": ["States.Http.StatusCodeFailure"],
+                        "ResultPath": "$.err",
+                        "Next": "Caught",
+                    }],
+                    "End": True,
+                },
+                "Caught": {"Type": "Pass", "End": True},
+            },
+        })
+        sm_arn = sfn_sync.create_state_machine(
+            name=sm_name,
+            definition=definition,
+            roleArn="arn:aws:iam::000000000000:role/sfn-role",
+        )["stateMachineArn"]
+        try:
+            resp = sfn_sync.start_sync_execution(stateMachineArn=sm_arn, input=json.dumps({}))
+            assert resp["status"] == "SUCCEEDED", f"{resp.get('error')} — {resp.get('cause')}"
+            output = json.loads(resp["output"])
+            assert "err" in output
+            cause = json.loads(output["err"]["Cause"])
+            assert cause["StatusCode"] == 503
+            assert "boom" in cause["ResponseBody"]
+        finally:
+            sfn_sync.delete_state_machine(stateMachineArn=sm_arn)
+    finally:
+        shutdown()
+
+
+def test_sfn_http_task_unreachable_raises_states_http_unknown(sfn_sync):
+    """Network failure surfaces as States.Http.Unknown, catchable via States.ALL."""
+    import uuid as _uuid
+
+    sm_name = f"http-task-unreach-{_uuid.uuid4().hex[:8]}"
+    definition = json.dumps({
+        "StartAt": "Call",
+        "States": {
+            "Call": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::http:invoke",
+                "Parameters": {
+                    # Reserved test IP that nothing listens on — 1ms connect timeout.
+                    "ApiEndpoint": "http://127.0.0.1:1/never",
+                    "Method": "GET",
+                },
+                "Catch": [{
+                    "ErrorEquals": ["States.ALL"],
+                    "ResultPath": "$.err",
+                    "Next": "Caught",
+                }],
+                "End": True,
+            },
+            "Caught": {"Type": "Pass", "End": True},
+        },
+    })
+    sm_arn = sfn_sync.create_state_machine(
+        name=sm_name,
+        definition=definition,
+        roleArn="arn:aws:iam::000000000000:role/sfn-role",
+    )["stateMachineArn"]
+    try:
+        resp = sfn_sync.start_sync_execution(stateMachineArn=sm_arn, input=json.dumps({}))
+        assert resp["status"] == "SUCCEEDED", f"{resp.get('error')} — {resp.get('cause')}"
+        output = json.loads(resp["output"])
+        assert "err" in output
+        assert output["err"]["Error"] == "States.Http.Unknown"
+    finally:
+        sfn_sync.delete_state_machine(stateMachineArn=sm_arn)

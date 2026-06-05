@@ -5058,6 +5058,113 @@ def _invoke_aws_sdk_integration(resource, input_data):
         )
 
 
+def _invoke_http_task(resource, input_data):
+    """Step Functions HTTP Task — ``arn:aws:states:::http:invoke``.
+
+    Maps the SFN HTTP Task input shape to a stdlib HTTP request:
+      - ``ApiEndpoint``     — URL (required)
+      - ``Method``          — GET/POST/PUT/PATCH/DELETE/HEAD/OPTIONS (default GET)
+      - ``Headers``         — dict of request headers
+      - ``QueryParameters`` — dict, encoded as the query string
+      - ``RequestBody``     — dict (JSON-encoded) or string sent as the body
+      - ``Authentication``  — accepted but not consumed (see note below)
+
+    Returns the AWS-documented response shape:
+    ``{StatusCode, StatusText, Headers, ResponseBody}``.
+
+    Error mapping matches AWS HTTP Task documentation: a non-2xx response
+    raises ``States.Http.StatusCodeFailure`` (catchable via that error name
+    or ``States.ALL``); a network/DNS/timeout failure raises
+    ``States.Http.Unknown``.
+
+    Authentication note: real AWS resolves
+    ``Authentication.ConnectionArn`` against an ``AWS::Events::Connection``
+    resource to inject API-key / OAuth / Basic credentials. MiniStack does
+    not yet store EventBridge Connection records, so the ConnectionArn is
+    accepted and ignored — pass any required auth headers via ``Headers``
+    until Connection support lands.
+    """
+    import urllib.error
+    import urllib.parse
+    import urllib.request
+
+    endpoint = input_data.get("ApiEndpoint") or ""
+    if not endpoint:
+        raise _ExecutionError(
+            "States.Runtime", "HTTP Task requires ApiEndpoint."
+        )
+
+    method = (input_data.get("Method") or "GET").upper()
+    headers = {k: str(v) for k, v in (input_data.get("Headers") or {}).items()}
+    query_params = input_data.get("QueryParameters") or {}
+    if query_params:
+        sep = "&" if "?" in endpoint else "?"
+        endpoint = f"{endpoint}{sep}{urllib.parse.urlencode(query_params, doseq=True)}"
+
+    body_obj = input_data.get("RequestBody")
+    body_bytes: bytes | None = None
+    if body_obj is not None:
+        if isinstance(body_obj, (dict, list)):
+            body_bytes = json.dumps(body_obj).encode("utf-8")
+            headers.setdefault("Content-Type", "application/json")
+        elif isinstance(body_obj, (bytes, bytearray)):
+            body_bytes = bytes(body_obj)
+        else:
+            body_bytes = str(body_obj).encode("utf-8")
+
+    req = urllib.request.Request(endpoint, data=body_bytes, method=method, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            status = resp.getcode()
+            response_headers = {k: v for k, v in resp.getheaders()}
+            raw = resp.read()
+    except urllib.error.HTTPError as err:
+        # AWS surfaces non-2xx as States.Http.StatusCodeFailure with the
+        # status code + response body available in Cause.
+        body_str = ""
+        try:
+            body_str = err.read().decode("utf-8", errors="replace")
+        except Exception:
+            pass
+        raise _ExecutionError(
+            "States.Http.StatusCodeFailure",
+            json.dumps({
+                "StatusCode": err.code,
+                "StatusText": err.reason or "",
+                "Headers": dict(err.headers or {}),
+                "ResponseBody": body_str,
+            }),
+        )
+    except (urllib.error.URLError, TimeoutError, OSError) as err:
+        raise _ExecutionError(
+            "States.Http.Unknown",
+            f"HTTP Task failed to call {endpoint}: {err}",
+        )
+
+    # Try to JSON-decode the response body so downstream Path expressions
+    # can address fields directly. Fall back to the raw string on failure
+    # (matches AWS behavior of returning a string ResponseBody for
+    # non-JSON content types).
+    try:
+        decoded = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        decoded = raw.decode("latin-1", errors="replace")
+    response_body: object = decoded
+    content_type = response_headers.get("Content-Type", "").lower()
+    if "json" in content_type or decoded.strip().startswith(("{", "[")):
+        try:
+            response_body = json.loads(decoded)
+        except (ValueError, TypeError):
+            response_body = decoded
+
+    return {
+        "StatusCode": status,
+        "StatusText": "",
+        "Headers": response_headers,
+        "ResponseBody": response_body,
+    }
+
+
 _SERVICE_DISPATCH = {
     "arn:aws:states:::sqs:sendMessage": _invoke_sqs_send_message,
     "arn:aws:states:::sns:publish": _invoke_sns_publish,
@@ -5070,6 +5177,7 @@ _SERVICE_DISPATCH = {
         "updateItem", d
     ),
     "arn:aws:states:::ecs:runTask": _invoke_ecs_run_task,
+    "arn:aws:states:::http:invoke": _invoke_http_task,
 }
 
 
