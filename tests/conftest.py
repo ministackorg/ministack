@@ -79,6 +79,23 @@ _SERIAL_TESTS = {
     "tests/test_apigatewayv2.py::test_apigwv1_path_based_restapi_legacy_user_request",
     "tests/test_apigatewayv2.py::test_apigwv2_named_stage_still_requires_prefix",
     "tests/test_apigatewayv2.py::test_apigwv2_integration_wrapped_function_arn",
+    # AppSync Lambda-resolver event-shape tests cold-start Lambdas under a 10s
+    # urlopen timeout (Test 6 spawns two functions). Same cold-start-under-xdist
+    # flakiness as the apigw Lambda tests above — run them in the serial phase.
+    "tests/test_appsync_lambda_event.py::test_appsync_lambda_event_field_name",
+    "tests/test_appsync_lambda_event.py::test_appsync_lambda_event_arguments",
+    "tests/test_appsync_lambda_event.py::test_appsync_lambda_event_api_key_header",
+    "tests/test_appsync_lambda_event.py::test_appsync_lambda_event_custom_headers_forwarded",
+    "tests/test_appsync_lambda_event.py::test_appsync_lambda_event_no_identity_in_api_key_mode",
+    "tests/test_appsync_lambda_event.py::test_appsync_lambda_event_identity_from_authorizer",
+    "tests/test_appsync_lambda_event.py::test_appsync_lambda_not_found_no_crash",
+    "tests/test_appsync_lambda_event.py::test_appsync_lambda_returns_errors",
+    "tests/test_appsync_lambda_event.py::test_appsync_lambda_event_source_empty_for_root",
+    "tests/test_appsync_lambda_event.py::test_appsync_lambda_event_variables_substituted",
+    "tests/test_appsync_lambda_event.py::test_appsync_lambda_unhandled_exception_becomes_error",
+    "tests/test_appsync_lambda_event.py::test_appsync_lambda_authorizer_rejection_identity_null",
+    "tests/test_appsync_lambda_event.py::test_appsync_lambda_missing_authorizer_degrades",
+    "tests/test_appsync_lambda_event.py::test_appsync_lambda_failing_authorizer_degrades",
 }
 
 
