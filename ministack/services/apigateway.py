@@ -87,8 +87,6 @@ async def _urlopen_async(request_or_url, timeout_seconds: float):
 REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 _PROXY_TIMEOUT_SECONDS = _timeout_from_env("MINISTACK_APIGW_PROXY_TIMEOUT_SECONDS", 30.0)
 _JWKS_TIMEOUT_SECONDS = _timeout_from_env("MINISTACK_APIGW_JWKS_TIMEOUT_SECONDS", 5.0)
-_OIDC_TIMEOUT_SECONDS = _timeout_from_env("MINISTACK_APIGW_OIDC_TIMEOUT_SECONDS", 5.0)
-_OIDC_CACHE_TTL_SECONDS = _timeout_from_env("MINISTACK_APIGW_OIDC_CACHE_TTL_SECONDS", 7200.0)
 
 # ---- Module-level state ----
 _apis = AccountScopedDict()          # api_id -> api object
@@ -514,11 +512,13 @@ async def _fetch_oidc_jwks_uri(issuer: str) -> str | None:
     jwks_uri = None
     try:
         url = f"{issuer}/.well-known/openid-configuration"
-        _, _, body = await _urlopen_async(url, _OIDC_TIMEOUT_SECONDS)
+        _, _, body = await _urlopen_async(url, _JWKS_TIMEOUT_SECONDS)
         jwks_uri = (json.loads(body or b"{}") or {}).get("jwks_uri")
     except (OSError, ValueError, json.JSONDecodeError):
         jwks_uri = None
-    _oidc_config_cache[issuer] = {"jwks_uri": jwks_uri, "expiresAt": now + _OIDC_CACHE_TTL_SECONDS}
+    # Mirror _fetch_jwks (line ~543) which hardcodes `now + 7200`; no separate
+    # env knob for OIDC discovery — it shares the JWT-auth external-fetch path.
+    _oidc_config_cache[issuer] = {"jwks_uri": jwks_uri, "expiresAt": now + 7200}
     return jwks_uri
 
 
