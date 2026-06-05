@@ -654,8 +654,11 @@ def _build_config(name: str, data: dict, code_zip: bytes | None = None) -> dict:
     layers_cfg = []
     for layer in data.get("Layers", []):
         if isinstance(layer, str):
-            layers_cfg.append({"Arn": layer, "CodeSize": 0})
+            layers_cfg.append({"Arn": layer, "CodeSize": _layer_codesize_for_arn(layer)})
         elif isinstance(layer, dict):
+            layer = dict(layer)
+            if "CodeSize" not in layer and "Arn" in layer:
+                layer["CodeSize"] = _layer_codesize_for_arn(layer["Arn"])
             layers_cfg.append(layer)
 
     env = data.get("Environment")
@@ -1396,6 +1399,9 @@ def _delete_function(name: str, query_params: dict):
     else:
         del _functions[name]
         invalidate_worker(name)
+        # Docker pool too — otherwise the function's pooled containers leak
+        # until _WARM_CONTAINER_TTL eviction.
+        _pool_kill_function(get_account_id(), name)
     return 204, {}, b""
 
 
@@ -1448,6 +1454,10 @@ def _update_code(name: str, data: dict):
 
     # Invalidate only the old $LATEST worker — published version workers stay alive
     invalidate_worker(name, qualifier="$LATEST")
+    # Docker pool: the new CodeSha256 changes the pool key so new invokes
+    # spawn fresh containers anyway, but the old containers under the old key
+    # would linger until _WARM_CONTAINER_TTL. Reap them now.
+    _pool_kill_function(get_account_id(), name)
     _schedule_state_transition(name, _LAMBDA_STATE_TRANSITION_DELAY)
 
     if data.get("Publish"):
@@ -1498,8 +1508,11 @@ def _update_config(name: str, data: dict):
                 layers_cfg = []
                 for layer in data["Layers"]:
                     if isinstance(layer, str):
-                        layers_cfg.append({"Arn": layer, "CodeSize": 0})
+                        layers_cfg.append({"Arn": layer, "CodeSize": _layer_codesize_for_arn(layer)})
                     elif isinstance(layer, dict):
+                        layer = dict(layer)
+                        if "CodeSize" not in layer and "Arn" in layer:
+                            layer["CodeSize"] = _layer_codesize_for_arn(layer["Arn"])
                         layers_cfg.append(layer)
                 config["Layers"] = layers_cfg
             else:
@@ -1514,6 +1527,27 @@ def _update_config(name: str, data: dict):
     config["StateReason"] = "The function is being updated."
     config["StateReasonCode"] = "Updating"
     config["RevisionId"] = new_uuid()
+    # AWS-match: UpdateFunctionConfiguration recycles the init container when
+    # spawn-time inputs change (Runtime/Handler/Layers/Env/MemorySize/Arch/
+    # VpcConfig/FileSystemConfigs). The ministack warm-pool key is just
+    # account:func:qualifier, so a stale worker would keep serving with the
+    # pre-update layers/env. Invalidate to force a fresh worker on next invoke,
+    # mirroring what _update_code already does. Otherwise PublishLayerVersion +
+    # UpdateFunctionConfiguration(Layers=[...]) leaves the previously-warm
+    # worker without the new layer extracted on disk (issue #816).
+    _WORKER_AFFECTING = {
+        "Runtime", "Handler", "Layers", "Environment", "MemorySize",
+        "Architectures", "VpcConfig", "FileSystemConfigs",
+    }
+    if any(k in data for k in _WORKER_AFFECTING):
+        invalidate_worker(name, qualifier="$LATEST")
+        # Also invalidate the docker warm-container pool: its key is
+        # account:func:zip:CodeSha256, so config-only changes (Layers,
+        # Environment, MemorySize, etc.) wouldn't otherwise displace a stale
+        # pooled container. Without this, LAMBDA_EXECUTOR=docker users hit the
+        # same "old container, no new layer mounted" failure mode that the
+        # in-process warm worker recycle solved for Python/Node.
+        _pool_kill_function(get_account_id(), name)
     _schedule_state_transition(name, _LAMBDA_STATE_TRANSITION_DELAY)
     return json_response(config)
 
@@ -1917,6 +1951,29 @@ def _pool_clear_all() -> None:
         _kill_pool_entry(e)
 
 
+def _pool_kill_function(account: str, func_name: str) -> None:
+    """Kill every pooled docker container for a function across all qualifiers.
+
+    The pool key is ``{account}:{func_name}:zip:{CodeSha256}`` (or
+    ``:image:{ImageUri}``). UpdateFunctionConfiguration changes attributes that
+    don't show up in the key (Layers / Environment / MemorySize / VpcConfig /
+    Architectures / FileSystemConfigs / Runtime / Handler), so the same key
+    would otherwise hand back a stale container that was spawned before the
+    config change. Issue #816 docker-executor follow-up: a layer attached
+    after the first invoke was never mounted on the reused warm container,
+    so handler imports from the layer kept failing even after the layer's
+    extracted dir was correct.
+    """
+    prefix = f"{account}:{func_name}:"
+    to_kill = []
+    with _warm_pool_lock:
+        for key in list(_warm_pool.keys()):
+            if key.startswith(prefix):
+                to_kill.extend(_warm_pool.pop(key))
+    for e in to_kill:
+        _kill_pool_entry(e)
+
+
 def _ensure_reaper_thread() -> None:
     global _reaper_started
     with _reaper_lock:
@@ -2216,12 +2273,20 @@ def _throttle_response(reason_code: str, msg: str, retry_after: int = 1) -> dict
     }
 
 
-def _docker_cp_dir(container, src_dir: str, dest_dir: str):
-    """Copy a local directory into a Docker container using a tar archive."""
+def _docker_cp_dir(container, src_dir: str, dest_dir: str, arcname: str = "."):
+    """Copy a local directory into a Docker container using a tar archive.
+
+    Docker's ``put_archive`` requires ``dest_dir`` to already exist in the
+    container. For paths the base image owns (``/var/task``, ``/var/runtime``,
+    ``/opt``) this is fine. For paths we want to create (``/opt/layer_N``),
+    extract into the existing parent and pass the new subdir via ``arcname``
+    so the tar carries ``./layer_N/...`` entries — the put_archive call
+    materialises the subdir as part of extraction.
+    """
     import tarfile
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w") as tar:
-        tar.add(src_dir, arcname=".")
+        tar.add(src_dir, arcname=arcname)
     buf.seek(0)
     container.put_archive(dest_dir, buf)
 
@@ -2576,7 +2641,10 @@ def _spawn_lambda_container(config: dict, code_zip: bytes | None):
             if is_provided:
                 _docker_cp_dir(container, code_dir, "/var/runtime")
             for idx, ld in enumerate(layers_dirs):
-                _docker_cp_dir(container, ld, f"/opt/layer_{idx}")
+                # /opt/layer_{idx} doesn't exist in the base RIE image — extract
+                # into /opt with the layer dir baked into the arcname (issue #816
+                # follow-up: docker executor 404 on archive path).
+                _docker_cp_dir(container, ld, "/opt", arcname=f"layer_{idx}")
             container.start()
         else:
             container = client.containers.run(**run_kwargs)
@@ -3428,6 +3496,28 @@ def _resolve_layer_zip(layer_arn_str: str) -> bytes | None:
         if v["Version"] == version:
             return v.get("_zip_data")
     return None
+
+
+def _layer_codesize_for_arn(layer_arn_str: str) -> int:
+    """Look up the stored layer version's CodeSize, or 0 if the layer
+    version can't be resolved. Real AWS surfaces the actual layer code size on
+    `GetFunctionConfiguration.Layers[*].CodeSize` so callers can sanity-check
+    against quotas (250 MB unzipped function + layers)."""
+    segs = layer_arn_str.split(":")
+    if len(segs) < 8:
+        return 0
+    layer_name = segs[6]
+    try:
+        version = int(segs[7])
+    except (ValueError, IndexError):
+        return 0
+    layer = _layers.get(layer_name)
+    if not layer:
+        return 0
+    for v in layer["versions"]:
+        if v["Version"] == version:
+            return v.get("Content", {}).get("CodeSize", 0)
+    return 0
 
 
 # ---------------------------------------------------------------------------

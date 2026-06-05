@@ -839,3 +839,36 @@ def test_idp_tags_returned_by_list_tags_for_resource(eks):
             eks.delete_cluster(name=cn)
         except Exception:
             pass
+
+
+# ---------------------------------------------------------------------------
+# Default node labels (Karpenter / topology-aware controllers)
+# ---------------------------------------------------------------------------
+
+def test_eks_collect_node_labels_emits_aws_topology_defaults():
+    """AWS-default topology labels must be on every cluster, no opt-in needed."""
+    from ministack.services import eks as eks_mod
+
+    cluster = {"tags": {}}
+    args = eks_mod._collect_node_labels(cluster)
+    keyed = dict(arg.removeprefix("--node-label=").split("=", 1) for arg in args)
+
+    assert "topology.kubernetes.io/region" in keyed
+    assert "topology.kubernetes.io/zone" in keyed
+    region = keyed["topology.kubernetes.io/region"]
+    assert keyed["topology.kubernetes.io/zone"] == f"{region}a"
+
+
+def test_eks_k3s_run_kwargs_appends_node_labels():
+    """node_labels list flows into the k3s server command verbatim."""
+    from ministack.services.eks import _k3s_run_kwargs
+
+    run_kwargs = _k3s_run_kwargs(
+        name="t",
+        port=16443,
+        node_labels=["--node-label=topology.kubernetes.io/zone=us-east-1a"],
+    )
+    assert "--node-label=topology.kubernetes.io/zone=us-east-1a" in run_kwargs["command"]
+    # Existing server flags must still be present — refactor must not regress them.
+    assert "server" in run_kwargs["command"]
+    assert "--https-listen-port=6443" in run_kwargs["command"]

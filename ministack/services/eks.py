@@ -41,6 +41,7 @@ EKS_K3S_IMAGE = os.environ.get("EKS_K3S_IMAGE", "rancher/k3s:v1.31.4-k3s1")
 EKS_BASE_PORT = int(os.environ.get("EKS_BASE_PORT", "16443"))
 DOCKER_NETWORK = os.environ.get("DOCKER_NETWORK", "")
 
+
 try:
     docker_lib = importlib.import_module("docker")
     _docker_available = True
@@ -285,7 +286,26 @@ def _collect_oidc_state(cluster_name: str):
     return args, cfg_refs
 
 
-def _k3s_run_kwargs(name: str, port: int, ms_network: str | None = None, oidc_args: list[str] | None = None) -> dict:
+def _collect_node_labels(cluster: dict) -> list[str]:
+    """Return the AWS-default topology `--node-label` k3s args for a cluster.
+
+    Real EKS nodes carry `topology.kubernetes.io/region` and
+    `topology.kubernetes.io/zone` (set by the AWS cloud-controller-manager) so
+    Karpenter / `topologySpreadConstraints` / Cluster Autoscaler can schedule.
+    Per-node-group label overrides belong on `CreateNodegroup.labels`, which is
+    the AWS-shape-correct surface — not a ministack-specific tag convention.
+
+    MUST be called from a request context (uses `get_region()`).
+    """
+    region = get_region()
+    labels = {
+        "topology.kubernetes.io/zone": f"{region}a",
+        "topology.kubernetes.io/region": region,
+    }
+    return [f"--node-label={k}={v}" for k, v in labels.items()]
+
+
+def _k3s_run_kwargs(name: str, port: int, ms_network: str | None = None, oidc_args: list[str] | None = None, node_labels: list[str] | None = None) -> dict:
     """Build the docker run kwargs for a k3s server container.
 
     `privileged=True` is required: k3s server mode remounts `/sys/fs/cgroup`,
@@ -303,6 +323,8 @@ def _k3s_run_kwargs(name: str, port: int, ms_network: str | None = None, oidc_ar
     ]
     if oidc_args:
         command.extend(oidc_args)
+    if node_labels:
+        command.extend(node_labels)
 
     run_kwargs = dict(
         image=apply_image_prefix(EKS_K3S_IMAGE),
@@ -428,6 +450,7 @@ def _create_cluster(body):
         _tags[arn] = dict(cluster["tags"])
 
     oidc_args, _idp_cfg_refs = _collect_oidc_state(name)
+    node_labels = _collect_node_labels(cluster)
 
     def _bg_start():
         client = _get_docker()
@@ -437,7 +460,7 @@ def _create_cluster(body):
             return
         try:
             ms_network = _get_ministack_network(client)
-            run_kwargs = _k3s_run_kwargs(name=name, port=port, ms_network=ms_network, oidc_args=oidc_args)
+            run_kwargs = _k3s_run_kwargs(name=name, port=port, ms_network=ms_network, oidc_args=oidc_args, node_labels=node_labels)
 
 
             container = client.containers.run(**run_kwargs)
@@ -923,6 +946,7 @@ def _restart_k3s(cluster_name, oidc_args=None, idp_cfg_refs=None):
     # only.
     oidc_args = oidc_args or []
     idp_cfg_refs = idp_cfg_refs or []
+    node_labels = _collect_node_labels(cluster)
 
     def _mark_idp_active():
         for cfg in idp_cfg_refs:
@@ -942,7 +966,7 @@ def _restart_k3s(cluster_name, oidc_args=None, idp_cfg_refs=None):
                 cluster["_docker_id"] = None
 
             ms_network = _get_ministack_network(client)
-            run_kwargs = _k3s_run_kwargs(name=cluster_name, port=port, ms_network=ms_network, oidc_args=oidc_args)
+            run_kwargs = _k3s_run_kwargs(name=cluster_name, port=port, ms_network=ms_network, oidc_args=oidc_args, node_labels=node_labels)
 
             container = client.containers.run(**run_kwargs)
             cluster["_docker_id"] = container.id

@@ -554,6 +554,40 @@ def test_iam_get_aws_managed_policy_version_returns_document(iam):
     assert "Allow" in json.dumps(doc)
 
 
+def test_iam_seeded_amazon_eks_cluster_policy(iam):
+    """AmazonEKSClusterPolicy must be seeded with the real AWS document,
+    not the wildcard fallback (issue #1092)."""
+    arn = "arn:aws:iam::aws:policy/AmazonEKSClusterPolicy"
+    pv = iam.get_policy_version(PolicyArn=arn, VersionId="v1")["PolicyVersion"]
+    doc = pv["Document"] if isinstance(pv["Document"], dict) else json.loads(pv["Document"])
+    actions = []
+    for stmt in doc["Statement"]:
+        a = stmt.get("Action", [])
+        actions.extend(a if isinstance(a, list) else [a])
+    # Spot-check that real EKS-cluster actions are present and the wildcard fallback isn't.
+    assert "elasticloadbalancing:CreateLoadBalancer" in actions
+    assert "ec2:CreateSecurityGroup" in actions
+    assert "*" not in actions
+
+
+def test_iam_seeded_amazon_eks_worker_node_policy(iam):
+    arn = "arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy"
+    pv = iam.get_policy_version(PolicyArn=arn, VersionId="v1")["PolicyVersion"]
+    doc = pv["Document"] if isinstance(pv["Document"], dict) else json.loads(pv["Document"])
+    actions = doc["Statement"][0]["Action"]
+    assert "eks:DescribeCluster" in actions
+    assert "eks-auth:AssumeRoleForPodIdentity" in actions
+
+
+def test_iam_seeded_amazon_eks_cni_policy(iam):
+    arn = "arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy"
+    pv = iam.get_policy_version(PolicyArn=arn, VersionId="v1")["PolicyVersion"]
+    doc = pv["Document"] if isinstance(pv["Document"], dict) else json.loads(pv["Document"])
+    first_actions = doc["Statement"][0]["Action"]
+    assert "ec2:AssignPrivateIpAddresses" in first_actions
+    assert "ec2:ModifyNetworkInterfaceAttribute" in first_actions
+
+
 def test_iam_list_policies_scope_all_includes_aws_managed(iam):
     resp = iam.list_policies(Scope="All")
     arns = [p["Arn"] for p in resp["Policies"]]

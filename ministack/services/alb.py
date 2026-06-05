@@ -842,6 +842,68 @@ def _describe_tags(params):
 
 
 # ---------------------------------------------------------------------------
+# SetSubnets / SetIpAddressType / SetSecurityGroups
+# ---------------------------------------------------------------------------
+
+def _set_subnets(params):
+    arn = _p(params, "LoadBalancerArn")
+    lb = _lbs.get(arn)
+    if not lb:
+        return _error("LoadBalancerNotFound", "Load balancer not found", 400)
+    subnets = _parse_member_list(params, "Subnets")
+    if not subnets:
+        # SubnetMappings.member.N.SubnetId form
+        mappings = []
+        idx = 1
+        while True:
+            sid = _p(params, f"SubnetMappings.member.{idx}.SubnetId")
+            if not sid:
+                break
+            mappings.append(sid)
+            idx += 1
+        subnets = mappings
+    if subnets:
+        lb["Subnets"] = subnets
+    ip_type = _p(params, "IpAddressType")
+    if ip_type:
+        lb["IpAddressType"] = ip_type
+    azs = "".join(
+        f"<member><ZoneName>{get_region()}a</ZoneName><SubnetId>{s}</SubnetId>"
+        f"<LoadBalancerAddresses/></member>"
+        for s in lb.get("Subnets", [])
+    )
+    return _xml(200, "SetSubnets",
+                f"<AvailabilityZones>{azs}</AvailabilityZones>"
+                f"<IpAddressType>{lb.get('IpAddressType','ipv4')}</IpAddressType>")
+
+
+def _set_ip_address_type(params):
+    arn = _p(params, "LoadBalancerArn")
+    lb = _lbs.get(arn)
+    if not lb:
+        return _error("LoadBalancerNotFound", "Load balancer not found", 400)
+    ip_type = _p(params, "IpAddressType")
+    if ip_type not in ("ipv4", "dualstack", "dualstack-without-public-ipv4"):
+        return _error("ValidationError",
+                      f"Invalid IpAddressType: {ip_type}", 400)
+    lb["IpAddressType"] = ip_type
+    return _xml(200, "SetIpAddressType",
+                f"<IpAddressType>{ip_type}</IpAddressType>")
+
+
+def _set_security_groups(params):
+    arn = _p(params, "LoadBalancerArn")
+    lb = _lbs.get(arn)
+    if not lb:
+        return _error("LoadBalancerNotFound", "Load balancer not found", 400)
+    sgs = _parse_member_list(params, "SecurityGroups")
+    lb["SecurityGroups"] = sgs
+    members = "".join(f"<member>{s}</member>" for s in sgs)
+    return _xml(200, "SetSecurityGroups",
+                f"<SecurityGroupIds>{members}</SecurityGroupIds>")
+
+
+# ---------------------------------------------------------------------------
 # Action map, request routing, and reset
 # ---------------------------------------------------------------------------
 
@@ -851,6 +913,9 @@ _ACTION_MAP = {
     "DeleteLoadBalancer": _delete_lb,
     "DescribeLoadBalancerAttributes": _describe_lb_attrs,
     "ModifyLoadBalancerAttributes": _modify_lb_attrs,
+    "SetSubnets": _set_subnets,
+    "SetIpAddressType": _set_ip_address_type,
+    "SetSecurityGroups": _set_security_groups,
     "CreateTargetGroup": _create_tg,
     "DescribeTargetGroups": _describe_tgs,
     "ModifyTargetGroup": _modify_tg,

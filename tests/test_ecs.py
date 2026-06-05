@@ -566,6 +566,12 @@ def test_ecs_service_delete_stops_tasks(ecs):
     for t in desc["tasks"]:
         assert t["lastStatus"] == "STOPPED"
 
+    # Real AWS keeps the service record around with status INACTIVE so
+    # DescribeServices keeps working for ~1h after delete.
+    svc_desc = ecs.describe_services(cluster=cluster, services=["del-svc"])
+    assert svc_desc["failures"] == []
+    assert svc_desc["services"][0]["status"] == "INACTIVE"
+
 
 def test_ecs_service_scale_to_zero(ecs):
     """Scaling to zero should stop all tasks without deleting the service."""

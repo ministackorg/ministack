@@ -1563,6 +1563,7 @@ def _attach_network_interface(p):
         "InstanceId": instance_id,
         "DeviceIndex": int(device_index),
         "Status": "attached",
+        "AttachTime": _now_ts(),
     }
     return _xml(200, "AttachNetworkInterfaceResponse",
                 f"<attachmentId>{attachment_id}</attachmentId>")
@@ -2481,6 +2482,7 @@ def _eni_fields_xml(eni, tag="item"):
             <instanceId>{a.get('InstanceId','')}</instanceId>
             <deviceIndex>{a.get('DeviceIndex',0)}</deviceIndex>
             <status>{a.get('Status','attached')}</status>
+            <attachTime>{a.get('AttachTime','')}</attachTime>
         </attachment>"""
     private_ip = eni['PrivateIpAddress']
     return f"""<{tag}>

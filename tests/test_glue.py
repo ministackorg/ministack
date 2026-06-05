@@ -237,6 +237,17 @@ def test_glue_tags_v2(glue):
     resp2 = glue.get_tags(ResourceArn=arn)
     assert resp2["Tags"] == {"env": "test"}
 
+
+def test_glue_create_database_persists_tags(glue):
+    """CreateDatabase top-level Tags must be stored (issue #1130 — real AWS shape)."""
+    glue.create_database(
+        DatabaseInput={"Name": "db_with_tags"},
+        Tags={"env": "prod", "owner": "data-platform"},
+    )
+    arn = "arn:aws:glue:us-east-1:000000000000:database/db_with_tags"
+    tags = glue.get_tags(ResourceArn=arn)["Tags"]
+    assert tags == {"env": "prod", "owner": "data-platform"}
+
 def test_glue_partition_v2(glue):
     glue.create_database(DatabaseInput={"Name": "glue_part_v2db"})
     glue.create_table(
@@ -1008,3 +1019,85 @@ def test_glue_is_spark_job_classifies_by_command_name():
     assert _glue._is_spark_job({"Command": {"Name": "pythonshell"}}) is False
     assert _glue._is_spark_job({"Command": {}}) is False
     assert _glue._is_spark_job({}) is False
+
+
+def test_glue_update_table_version_id_optimistic_concurrency(glue):
+    """UpdateTable with a stale VersionId must fail (#1183 — real AWS shape)."""
+    glue.create_database(DatabaseInput={"Name": "ver_db"})
+    glue.create_table(DatabaseName="ver_db", TableInput={"Name": "t1", "Description": "v1"})
+
+    # Read initial version.
+    t = glue.get_table(DatabaseName="ver_db", Name="t1")["Table"]
+    assert t["VersionId"] == "1"
+
+    # Update with matching VersionId — succeeds and bumps version.
+    glue.update_table(
+        DatabaseName="ver_db",
+        TableInput={"Name": "t1", "Description": "v2"},
+        VersionId="1",
+    )
+    t2 = glue.get_table(DatabaseName="ver_db", Name="t1")["Table"]
+    assert t2["VersionId"] == "2"
+    assert t2["Description"] == "v2"
+
+    # Update with stale VersionId — rejected.
+    with pytest.raises(ClientError) as exc:
+        glue.update_table(
+            DatabaseName="ver_db",
+            TableInput={"Name": "t1", "Description": "v3"},
+            VersionId="1",  # stale
+        )
+    assert exc.value.response["Error"]["Code"] == "ConcurrentModificationException"
+
+    # No VersionId passed — current ministack/AWS shape still allows (back-compat).
+    glue.update_table(DatabaseName="ver_db", TableInput={"Name": "t1", "Description": "v4"})
+    t4 = glue.get_table(DatabaseName="ver_db", Name="t1")["Table"]
+    assert t4["VersionId"] == "3"
+
+
+def test_glue_user_defined_function_crud(glue):
+    """CRUD lifecycle for Glue UserDefinedFunction APIs (#1186)."""
+    glue.create_database(DatabaseInput={"Name": "udf_db"})
+
+    glue.create_user_defined_function(
+        DatabaseName="udf_db",
+        FunctionInput={
+            "FunctionName": "upper_clean",
+            "ClassName": "com.example.UpperClean",
+            "OwnerName": "data-platform",
+            "OwnerType": "USER",
+            "ResourceUris": [{"ResourceType": "JAR", "Uri": "s3://my-bucket/udfs/upper.jar"}],
+        },
+    )
+
+    got = glue.get_user_defined_function(DatabaseName="udf_db", FunctionName="upper_clean")["UserDefinedFunction"]
+    assert got["FunctionName"] == "upper_clean"
+    assert got["ClassName"] == "com.example.UpperClean"
+    assert got["DatabaseName"] == "udf_db"
+    assert got["ResourceUris"][0]["Uri"] == "s3://my-bucket/udfs/upper.jar"
+
+    # Duplicate create rejected.
+    with pytest.raises(ClientError) as exc:
+        glue.create_user_defined_function(
+            DatabaseName="udf_db",
+            FunctionInput={"FunctionName": "upper_clean", "ClassName": "x"},
+        )
+    assert exc.value.response["Error"]["Code"] == "AlreadyExistsException"
+
+    glue.update_user_defined_function(
+        DatabaseName="udf_db",
+        FunctionName="upper_clean",
+        FunctionInput={"FunctionName": "upper_clean", "ClassName": "com.example.UpperClean2"},
+    )
+    got2 = glue.get_user_defined_function(DatabaseName="udf_db", FunctionName="upper_clean")["UserDefinedFunction"]
+    assert got2["ClassName"] == "com.example.UpperClean2"
+
+    # Pattern is a required AWS field (botocore enforces) — "*" matches everything.
+    listed = glue.get_user_defined_functions(DatabaseName="udf_db", Pattern="*")["UserDefinedFunctions"]
+    names = [u["FunctionName"] for u in listed]
+    assert "upper_clean" in names
+
+    glue.delete_user_defined_function(DatabaseName="udf_db", FunctionName="upper_clean")
+    with pytest.raises(ClientError) as exc2:
+        glue.get_user_defined_function(DatabaseName="udf_db", FunctionName="upper_clean")
+    assert exc2.value.response["Error"]["Code"] == "EntityNotFoundException"

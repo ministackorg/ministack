@@ -724,8 +724,15 @@ def _delete_service(data):
         _stop_task({"task": task_arn, "cluster": cluster_name, "reason": "Service deleted"})
 
     svc["runningCount"] = 0
-    _tags.pop(svc["serviceArn"], None)
-    del _services[svc_key]
+    # AWS DeleteService docs: "After all tasks have transitioned to either
+    # STOPPING or STOPPED status, the service status moves from DRAINING to
+    # INACTIVE. Services in the DRAINING or INACTIVE status can still be viewed
+    # with the DescribeServices API operation." Tasks are stopped synchronously
+    # above, so we land in INACTIVE directly. AWS may eventually purge INACTIVE
+    # records (no fixed window) — ministack keeps them for the process lifetime.
+    # Re-creating with the same name is allowed because _create_service only
+    # conflicts on status=ACTIVE.
+    svc["status"] = "INACTIVE"
 
     _recount_cluster(cluster_name)
     return json_response({"service": _sanitize(svc)})

@@ -1484,6 +1484,177 @@ def test_lambda_function_with_layer(lam):
     fn = lam.get_function(FunctionName="fn-with-layer")
     assert layer_arn in fn["Configuration"]["Layers"][0]["Arn"]
 
+
+def test_lambda_docker_cp_dir_arcname_creates_subdir_in_existing_parent():
+    """Docker's put_archive requires dest_dir to exist. For /opt/layer_N
+    (which doesn't exist in the base RIE image), the fix is to extract into
+    the existing /opt with the layer dir baked into the arcname so the tar
+    materialises the subdir. Regression for issue #816 docker-executor 404."""
+    import io as _io
+    import tarfile as _tarfile
+    import tempfile
+
+    from ministack.services.lambda_svc import _docker_cp_dir
+
+    captured = {}
+
+    class _FakeContainer:
+        def put_archive(self, path, data):
+            captured["path"] = path
+            captured["data"] = data.read() if hasattr(data, "read") else data
+
+    with tempfile.TemporaryDirectory() as src_dir:
+        os.makedirs(os.path.join(src_dir, "python"))
+        with open(os.path.join(src_dir, "python", "mod.py"), "w") as f:
+            f.write("X = 1\n")
+
+        _docker_cp_dir(_FakeContainer(), src_dir, "/opt", arcname="layer_0")
+
+    assert captured["path"] == "/opt"
+    tar_bytes = captured["data"]
+    with _tarfile.open(fileobj=_io.BytesIO(tar_bytes), mode="r") as tar:
+        names = tar.getnames()
+    # Entries must be rooted at "layer_0/..." so extraction into /opt produces /opt/layer_0/...
+    assert any(n.startswith("layer_0/python") or n == "layer_0/python/mod.py" for n in names), names
+    assert "layer_0" in names or any(n.startswith("layer_0/") for n in names)
+
+
+def test_lambda_pool_kill_function_reaps_all_qualifiers():
+    """_pool_kill_function must remove every pooled docker container for a
+    function across all qualifiers (the pool key includes CodeSha256, so
+    config-only updates leave stale entries unless explicitly reaped). Issue
+    #816 docker-executor follow-up. Wired into _update_config / _delete_function
+    so layer attach via UpdateFunctionConfiguration displaces the pre-attach
+    container before the next invoke."""
+    from ministack.services import lambda_svc as _svc
+
+    class _StubContainer:
+        def __init__(self):
+            self.stopped = False
+            self.removed = False
+        def stop(self, timeout=2):
+            self.stopped = True
+        def remove(self, force=False):
+            self.removed = True
+
+    stubs = [_StubContainer() for _ in range(3)]
+    keys = [
+        "111122223333:fn-A:zip:sha-v1",
+        "111122223333:fn-A:zip:sha-v2",
+        "111122223333:fn-B:zip:sha-v1",   # different function — must NOT be touched
+    ]
+    with _svc._warm_pool_lock:
+        for k, s in zip(keys, stubs):
+            _svc._warm_pool.setdefault(k, []).append(
+                {"container": s, "tmpdir": None, "in_use": False,
+                 "last_used": 0, "created": 0}
+            )
+
+    try:
+        _svc._pool_kill_function("111122223333", "fn-A")
+
+        with _svc._warm_pool_lock:
+            assert _svc._warm_pool.get("111122223333:fn-A:zip:sha-v1", []) == []
+            assert _svc._warm_pool.get("111122223333:fn-A:zip:sha-v2", []) == []
+            # fn-B must be untouched
+            assert len(_svc._warm_pool.get("111122223333:fn-B:zip:sha-v1", [])) == 1
+
+        assert stubs[0].stopped and stubs[0].removed, "fn-A v1 container not killed"
+        assert stubs[1].stopped and stubs[1].removed, "fn-A v2 container not killed"
+        assert not stubs[2].stopped, "fn-B container was killed (should be untouched)"
+    finally:
+        # Clean up any leftover stub entries so this test doesn't pollute siblings.
+        with _svc._warm_pool_lock:
+            for k in keys:
+                _svc._warm_pool.pop(k, None)
+
+
+def test_lambda_function_with_layer_reports_real_code_size(lam):
+    """GetFunctionConfiguration.Layers[*].CodeSize must mirror the layer's
+    actual zip size, not hardcoded 0 (issue #816)."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        z.writestr("mod.py", "X = 'hello' * 1000")  # non-trivial size
+    layer_zip = buf.getvalue()
+    layer_resp = lam.publish_layer_version(
+        LayerName="codesize-layer",
+        Content={"ZipFile": layer_zip},
+    )
+    layer_arn = layer_resp["LayerVersionArn"]
+    expected_size = layer_resp["Content"]["CodeSize"]
+    assert expected_size > 0
+
+    fn_zip = io.BytesIO()
+    with zipfile.ZipFile(fn_zip, "w") as z:
+        z.writestr("index.py", "def handler(e, c): return {}")
+    lam.create_function(
+        FunctionName="codesize-fn",
+        Runtime="python3.12",
+        Role="arn:aws:iam::000000000000:role/test",
+        Handler="index.handler",
+        Code={"ZipFile": fn_zip.getvalue()},
+        Layers=[layer_arn],
+    )
+    cfg = lam.get_function_configuration(FunctionName="codesize-fn")
+    assert cfg["Layers"][0]["Arn"] == layer_arn
+    assert cfg["Layers"][0]["CodeSize"] == expected_size
+
+
+def test_lambda_update_function_configuration_layer_attachment_invokes_with_layer(lam):
+    """UpdateFunctionConfiguration(Layers=[arn]) must:
+      (a) surface the layer's real CodeSize on the next GetFunctionConfiguration, and
+      (b) recycle the warm worker so the next invoke actually loads the layer.
+    Regression for issue #816 (layer not found after association)."""
+    # Layer publishes a Python module the handler imports.
+    layer_buf = io.BytesIO()
+    with zipfile.ZipFile(layer_buf, "w") as z:
+        z.writestr("python/mylayermod.py", "VALUE = 'from-layer'")
+    layer_arn = lam.publish_layer_version(
+        LayerName="late-attach-layer",
+        Content={"ZipFile": layer_buf.getvalue()},
+        CompatibleRuntimes=["python3.12"],
+    )["LayerVersionArn"]
+
+    # Function created WITHOUT the layer first — handler tolerates the absence
+    # so the initial invoke can warm a worker.
+    fn_src = (
+        "def handler(event, context):\n"
+        "    try:\n"
+        "        import mylayermod\n"
+        "        return {'layer_value': mylayermod.VALUE}\n"
+        "    except ImportError:\n"
+        "        return {'layer_value': None}\n"
+    )
+    fn_buf = io.BytesIO()
+    with zipfile.ZipFile(fn_buf, "w") as z:
+        z.writestr("index.py", fn_src)
+    lam.create_function(
+        FunctionName="late-attach-fn",
+        Runtime="python3.12",
+        Role="arn:aws:iam::000000000000:role/test",
+        Handler="index.handler",
+        Code={"ZipFile": fn_buf.getvalue()},
+    )
+
+    # Pre-attach invoke warms a worker without the layer.
+    pre = lam.invoke(FunctionName="late-attach-fn", Payload=b"{}")
+    pre_body = json.loads(pre["Payload"].read())
+    assert pre_body == {"layer_value": None}
+
+    # Attach the layer via UpdateFunctionConfiguration.
+    lam.update_function_configuration(FunctionName="late-attach-fn", Layers=[layer_arn])
+
+    # (a) CodeSize on GetFunctionConfiguration matches the layer's real size.
+    cfg = lam.get_function_configuration(FunctionName="late-attach-fn")
+    assert cfg["Layers"][0]["Arn"] == layer_arn
+    assert cfg["Layers"][0]["CodeSize"] > 0
+
+    # (b) Next invoke must use a fresh worker that has the layer mounted on
+    #     /opt/python — the import succeeds and the handler returns the layer value.
+    post = lam.invoke(FunctionName="late-attach-fn", Payload=b"{}")
+    post_body = json.loads(post["Payload"].read())
+    assert post_body == {"layer_value": "from-layer"}
+
 def test_lambda_layer_content_location(lam):
     """Content.Location should be a non-empty URL pointing to the layer zip."""
     buf = io.BytesIO()
