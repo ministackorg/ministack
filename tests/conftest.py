@@ -93,6 +93,9 @@ _SERIAL_TESTS = {
     "tests/test_appsync_lambda_event.py::test_appsync_lambda_event_source_empty_for_root",
     "tests/test_appsync_lambda_event.py::test_appsync_lambda_event_variables_substituted",
     "tests/test_appsync_lambda_event.py::test_appsync_lambda_unhandled_exception_becomes_error",
+    "tests/test_appsync_lambda_event.py::test_appsync_lambda_authorizer_rejection_identity_null",
+    "tests/test_appsync_lambda_event.py::test_appsync_lambda_missing_authorizer_degrades",
+    "tests/test_appsync_lambda_event.py::test_appsync_lambda_failing_authorizer_degrades",
 }
 
 

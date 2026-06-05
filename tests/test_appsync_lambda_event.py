@@ -79,6 +79,37 @@ def _setup_api_with_lambda_resolver(appsync, lam, fn_name, handler_code):
     return api_id, api_key, graphql_url
 
 
+# Resolver that simply reports whether event.identity was populated — used by the
+# AWS_LAMBDA authorizer degradation tests below.
+_IDENTITY_PROBE_RESOLVER = (
+    "def handler(event, ctx):\n"
+    "    return {'hasIdentity': event.get('identity') is not None}\n"
+)
+
+
+def _setup_lambda_auth_api(appsync, lam, name, authorizer_arn, resolver_code):
+    """Create an AWS_LAMBDA-auth API with the given authorizer ARN and a Lambda resolver."""
+    resolver_arn = _create_lambda(lam, f"{name}-resolver", resolver_code)
+
+    api = appsync.create_graphql_api(
+        name=name,
+        authenticationType="AWS_LAMBDA",
+        lambdaAuthorizerConfig={"authorizerUri": authorizer_arn},
+    )
+    api_id = api["graphqlApi"]["apiId"]
+    graphql_url = f"{ENDPOINT}/v1/apis/{api_id}/graphql"
+
+    appsync.create_data_source(
+        apiId=api_id, name="LambdaDS", type="AWS_LAMBDA",
+        lambdaConfig={"lambdaFunctionArn": resolver_arn},
+    )
+    appsync.create_resolver(
+        apiId=api_id, typeName="Query", fieldName="testField",
+        dataSourceName="LambdaDS", kind="UNIT",
+    )
+    return api_id, graphql_url
+
+
 # ── Test 1: info.fieldName is present in Lambda event ─────────────────────────
 
 def test_appsync_lambda_event_field_name(appsync, lam):
@@ -338,3 +369,57 @@ def test_appsync_lambda_unhandled_exception_becomes_error(appsync, lam):
     assert field is None or "errorMessage" not in field
     # The failure is surfaced as an errors entry (top-level or under the field).
     assert "errors" in resp or (isinstance(field, dict) and "errors" in field)
+
+
+# ── Test 12: authorizer rejection (isAuthorized:false) → identity null ────────
+
+def test_appsync_lambda_authorizer_rejection_identity_null(appsync, lam):
+    """AWS_LAMBDA auth — an authorizer returning isAuthorized:false must NOT block the
+    request: it proceeds (HTTP 200) with event.identity null, and the rejecting
+    authorizer's resolverContext must NOT leak into the resolver."""
+    authorizer = (
+        "def handler(event, ctx):\n"
+        "    return {'isAuthorized': False, 'resolverContext': {'should': 'not-leak'}}\n"
+    )
+    auth_arn = _create_lambda(lam, "authz-reject-test", authorizer)
+    _, url = _setup_lambda_auth_api(appsync, lam, "authz-reject-api", auth_arn, _IDENTITY_PROBE_RESOLVER)
+
+    resp = _graphql_post(url, "{ testField { hasIdentity } }", headers={"Authorization": "Bearer fake-jwt"})
+
+    assert "errors" not in resp
+    assert resp["data"]["testField"]["hasIdentity"] is False
+
+
+# ── Test 13: missing authorizer Lambda → graceful fallback ────────────────────
+
+def test_appsync_lambda_missing_authorizer_degrades(appsync, lam):
+    """AWS_LAMBDA auth — a lambdaAuthorizerConfig.authorizerUri pointing at a function
+    that does not exist must degrade gracefully (HTTP 200, identity null), not crash."""
+    _, url = _setup_lambda_auth_api(
+        appsync, lam, "authz-missing-api",
+        "arn:aws:lambda:us-east-1:000000000000:function:authorizer-does-not-exist",
+        _IDENTITY_PROBE_RESOLVER,
+    )
+
+    resp = _graphql_post(url, "{ testField { hasIdentity } }", headers={"Authorization": "Bearer fake-jwt"})
+
+    assert "errors" not in resp
+    assert resp["data"]["testField"]["hasIdentity"] is False
+
+
+# ── Test 14: failing (raising) authorizer Lambda → graceful fallback ──────────
+
+def test_appsync_lambda_failing_authorizer_degrades(appsync, lam):
+    """AWS_LAMBDA auth — an authorizer that raises must be caught (HTTP 200, identity
+    null), not surface as an HTTP 500 / GraphQL error."""
+    authorizer = (
+        "def handler(event, ctx):\n"
+        "    raise Exception('authorizer boom')\n"
+    )
+    auth_arn = _create_lambda(lam, "authz-raise-test", authorizer)
+    _, url = _setup_lambda_auth_api(appsync, lam, "authz-raise-api", auth_arn, _IDENTITY_PROBE_RESOLVER)
+
+    resp = _graphql_post(url, "{ testField { hasIdentity } }", headers={"Authorization": "Bearer fake-jwt"})
+
+    assert "errors" not in resp
+    assert resp["data"]["testField"]["hasIdentity"] is False
