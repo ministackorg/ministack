@@ -1192,3 +1192,46 @@ def test_glue_start_job_run_resolves_script_in_worker_thread(tmp_path, monkeypat
         respmod._request_account_id.reset(token)
         gluemod._jobs._data.pop((account, "ctx-job"), None)
         gluemod._job_runs._data.pop((account, "ctx-job"), None)
+
+
+def test_glue_crawler_completes_for_non_default_account(monkeypatch):
+    """StartCrawler's finish timer returns the crawler to READY under the
+    caller's account, not the default (#827, cf. #639).
+
+    Regression: _finish_crawl runs on a bare threading.Timer, which does not
+    copy contextvars, so for a non-default account the `name in _crawlers`
+    guard (evaluated under the default account) was False and the crawler hung
+    in RUNNING forever with LastCrawl never recorded.
+    """
+    from ministack.core import responses as respmod
+    from ministack.services import glue as gluemod
+
+    # Shrink the 5s finish timer so the test is fast.
+    monkeypatch.setattr(gluemod, "CRAWLER_RUN_SECONDS", 0.2)
+
+    account = "555555555555"
+    name = "ctx-crawler"
+    token = respmod._request_account_id.set(account)
+    try:
+        gluemod._crawlers._data.pop((account, name), None)
+        gluemod._create_crawler({
+            "Name": name,
+            "Role": "arn:aws:iam::555555555555:role/GlueRole",
+            "Targets": {"S3Targets": [{"Path": "s3://b/data/"}]},
+        })
+        gluemod._start_crawler({"Name": name})
+        assert gluemod._crawlers[name]["State"] == "RUNNING"
+
+        # Wait for the finish timer (0.2s) to fire.
+        deadline = time.time() + 3
+        while time.time() < deadline and gluemod._crawlers[name]["State"] != "READY":
+            time.sleep(0.05)
+
+        assert gluemod._crawlers[name]["State"] == "READY", (
+            "crawler stuck in RUNNING — finish timer ran under the wrong account"
+        )
+        last_crawl = gluemod._crawlers[name]["LastCrawl"]
+        assert last_crawl is not None and last_crawl["Status"] == "SUCCEEDED"
+    finally:
+        respmod._request_account_id.reset(token)
+        gluemod._crawlers._data.pop((account, name), None)
