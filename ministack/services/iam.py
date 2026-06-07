@@ -34,6 +34,7 @@ import os
 import time
 from urllib.parse import parse_qs
 from urllib.parse import quote as _url_quote
+from xml.sax.saxutils import escape as _xml_escape
 
 from ministack.core.responses import AccountScopedDict, get_account_id, get_region, json_response, new_uuid
 
@@ -55,6 +56,7 @@ _groups = AccountScopedDict()
 _user_inline_policies = AccountScopedDict()
 _oidc_providers = AccountScopedDict()
 _service_linked_role_deletion_tasks = AccountScopedDict()
+_saml_providers = AccountScopedDict()
 
 
 # -- AWS-managed policies ---------------------------------------------------
@@ -281,6 +283,7 @@ def get_state():
         "service_linked_role_deletion_tasks": copy.deepcopy(_service_linked_role_deletion_tasks),
         "user_inline_policies": copy.deepcopy(_user_inline_policies),
         "aws_managed_attachment_counts": copy.deepcopy(_aws_managed_attachment_counts),
+        "saml_providers": copy.deepcopy(_saml_providers),
     }
 
 
@@ -296,6 +299,7 @@ def restore_state(data):
         _service_linked_role_deletion_tasks.update(data.get("service_linked_role_deletion_tasks", {}))
         _user_inline_policies.update(data.get("user_inline_policies", {}))
         _aws_managed_attachment_counts.update(data.get("aws_managed_attachment_counts", {}))
+        _saml_providers.update(data.get("saml_providers", {}))
 
 
 try:
@@ -1602,6 +1606,103 @@ def _delete_oidc_provider(p):
     return _xml(200, "DeleteOpenIDConnectProviderResponse", "", ns="iam")
 
 
+def _list_oidc_providers(p):
+    members = "".join(
+        f"<member><Arn>{arn}</Arn></member>"
+        for arn in _oidc_providers
+    )
+    return _xml(200, "ListOpenIDConnectProvidersResponse",
+                f"<ListOpenIDConnectProvidersResult>"
+                f"<OpenIDConnectProviderList>{members}</OpenIDConnectProviderList>"
+                f"</ListOpenIDConnectProvidersResult>",
+                ns="iam")
+
+
+# -------------------- SAML providers --------------------
+
+
+def _create_saml_provider(p):
+    name = _p(p, "Name")
+    acct = get_account_id()
+    arn = f"arn:aws:iam::{acct}:saml-provider/{name}"
+    if arn in _saml_providers:
+        return _error(409, "EntityAlreadyExists",
+                      f"SAML provider {arn} already exists.", ns="iam")
+    metadata = _p(p, "SAMLMetadataDocument")
+    _saml_providers[arn] = {
+        "Arn": arn,
+        "Name": name,
+        "SAMLMetadataDocument": metadata,
+        "CreateDate": _now(),
+        "ValidUntil": _future(365 * 24 * 3600),
+        "Tags": _extract_tags(p),
+    }
+    return _xml(200, "CreateSAMLProviderResponse",
+                f"<CreateSAMLProviderResult>"
+                f"<SAMLProviderArn>{arn}</SAMLProviderArn>"
+                f"</CreateSAMLProviderResult>",
+                ns="iam")
+
+
+def _get_saml_provider(p):
+    arn = _p(p, "SAMLProviderArn")
+    prov = _saml_providers.get(arn)
+    if not prov:
+        return _error(404, "NoSuchEntity",
+                      f"SAML provider {arn} not found.", ns="iam")
+    tag_members = "".join(
+        f"<member><Key>{t['Key']}</Key><Value>{t['Value']}</Value></member>"
+        for t in prov.get("Tags", [])
+    )
+    return _xml(200, "GetSAMLProviderResponse",
+                f"<GetSAMLProviderResult>"
+                f"<SAMLMetadataDocument>{_xml_escape(prov['SAMLMetadataDocument'])}</SAMLMetadataDocument>"
+                f"<CreateDate>{prov['CreateDate']}</CreateDate>"
+                f"<ValidUntil>{prov['ValidUntil']}</ValidUntil>"
+                f"<Tags>{tag_members}</Tags>"
+                f"</GetSAMLProviderResult>",
+                ns="iam")
+
+
+def _list_saml_providers(p):
+    members = "".join(
+        f"<member>"
+        f"<Arn>{prov['Arn']}</Arn>"
+        f"<ValidUntil>{prov['ValidUntil']}</ValidUntil>"
+        f"<CreateDate>{prov['CreateDate']}</CreateDate>"
+        f"</member>"
+        for prov in _saml_providers.values()
+    )
+    return _xml(200, "ListSAMLProvidersResponse",
+                f"<ListSAMLProvidersResult>"
+                f"<SAMLProviderList>{members}</SAMLProviderList>"
+                f"</ListSAMLProvidersResult>",
+                ns="iam")
+
+
+def _update_saml_provider(p):
+    arn = _p(p, "SAMLProviderArn")
+    prov = _saml_providers.get(arn)
+    if not prov:
+        return _error(404, "NoSuchEntity",
+                      f"SAML provider {arn} not found.", ns="iam")
+    prov["SAMLMetadataDocument"] = _p(p, "SAMLMetadataDocument")
+    return _xml(200, "UpdateSAMLProviderResponse",
+                f"<UpdateSAMLProviderResult>"
+                f"<SAMLProviderArn>{arn}</SAMLProviderArn>"
+                f"</UpdateSAMLProviderResult>",
+                ns="iam")
+
+
+def _delete_saml_provider(p):
+    arn = _p(p, "SAMLProviderArn")
+    if arn not in _saml_providers:
+        return _error(404, "NoSuchEntity",
+                      f"SAML provider {arn} not found.", ns="iam")
+    del _saml_providers[arn]
+    return _xml(200, "DeleteSAMLProviderResponse", "", ns="iam")
+
+
 # -------------------- Tags: policies --------------------
 
 def _tag_policy(p):
@@ -1913,6 +2014,12 @@ _IAM_HANDLERS = {
     "CreateOpenIDConnectProvider": _create_oidc_provider,
     "GetOpenIDConnectProvider": _get_oidc_provider,
     "DeleteOpenIDConnectProvider": _delete_oidc_provider,
+    "CreateSAMLProvider": _create_saml_provider,
+    "GetSAMLProvider": _get_saml_provider,
+    "ListSAMLProviders": _list_saml_providers,
+    "UpdateSAMLProvider": _update_saml_provider,
+    "DeleteSAMLProvider": _delete_saml_provider,
+    "ListOpenIDConnectProviders": _list_oidc_providers,
     "TagPolicy": _tag_policy,
     "UntagPolicy": _untag_policy,
     "ListPolicyTags": _list_policy_tags,
@@ -1929,6 +2036,7 @@ def reset():
     _user_inline_policies.clear()
     _oidc_providers.clear()
     _service_linked_role_deletion_tasks.clear()
+    _saml_providers.clear()
     # Re-seed AWS-managed policies. They're not customer state, so a
     # reset call should restore the canonical set rather than leave the
     # store empty. Per-account attachment counters are session state
