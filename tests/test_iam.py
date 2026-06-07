@@ -735,3 +735,23 @@ def test_iam_aws_managed_attachment_count_persists_through_state_round_trip():
 
     _iam.restore_state(snapshot)
     assert _iam._aws_managed_attachment_counts.get(arn) == 2
+
+
+# ── Service last accessed (Access Advisor) ────────────────────────────
+
+
+def test_iam_service_last_accessed_job(iam):
+    # Use the default account user
+    resp_user = iam.create_user(UserName="sla-test-user")
+    user_arn = resp_user["User"]["Arn"]
+    try:
+        gen_resp = iam.generate_service_last_accessed_details(Arn=user_arn)
+        job_id = gen_resp["JobId"]
+        assert job_id
+
+        get_resp = iam.get_service_last_accessed_details(JobId=job_id)
+        assert get_resp["JobStatus"] == "COMPLETED"
+        assert "ServicesLastAccessed" in get_resp
+        assert isinstance(get_resp["ServicesLastAccessed"], list)
+    finally:
+        iam.delete_user(UserName="sla-test-user")
