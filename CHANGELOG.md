@@ -7,6 +7,13 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [Unreleased]
+
+### Added
+- **IAM — `CreateLoginProfile`, `GetLoginProfile`, `UpdateLoginProfile`, `DeleteLoginProfile`** — models whether an IAM user has a console password (the signal that a user is a human). `CreateLoginProfile` stores `UserName`, `CreateDate`, and `PasswordResetRequired` without persisting the password value (seed-side). `GetLoginProfile` returns `NoSuchEntity` (404) when no profile exists. `UpdateLoginProfile` updates `PasswordResetRequired`. `DeleteLoginProfile` removes the profile. All four operations match the real AWS request/response shapes exactly so identity-discovery agents can distinguish humans from service accounts using `get-login-profile`.
+
+---
+
 ## [1.3.59] — 2026-06-05
 
 ### Added
