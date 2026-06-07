@@ -735,3 +735,52 @@ def test_iam_aws_managed_attachment_count_persists_through_state_round_trip():
 
     _iam.restore_state(snapshot)
     assert _iam._aws_managed_attachment_counts.get(arn) == 2
+
+
+# ── GetAccountAuthorizationDetails ───────────────────────────────────
+
+
+def test_iam_account_authorization_details_all(iam):
+    policy_doc = json.dumps({"Version": "2012-10-17", "Statement": []})
+    assume_doc = json.dumps({"Version": "2012-10-17", "Statement": []})
+
+    pol = iam.create_policy(PolicyName="aad-test-policy", PolicyDocument=policy_doc)
+    pol_arn = pol["Policy"]["Arn"]
+    iam.create_user(UserName="aad-test-user")
+    iam.attach_user_policy(UserName="aad-test-user", PolicyArn=pol_arn)
+    iam.create_group(GroupName="aad-test-group")
+    iam.add_user_to_group(UserName="aad-test-user", GroupName="aad-test-group")
+    iam.create_role(RoleName="aad-test-role", AssumeRolePolicyDocument=assume_doc)
+    try:
+        resp = iam.get_account_authorization_details()
+
+        user_names = [u["UserName"] for u in resp.get("UserDetailList", [])]
+        assert "aad-test-user" in user_names
+
+        role_names = [r["RoleName"] for r in resp.get("RoleDetailList", [])]
+        assert "aad-test-role" in role_names
+
+        policy_arns = [p["Arn"] for p in resp.get("Policies", [])]
+        assert pol_arn in policy_arns
+    finally:
+        iam.detach_user_policy(UserName="aad-test-user", PolicyArn=pol_arn)
+        iam.remove_user_from_group(UserName="aad-test-user", GroupName="aad-test-group")
+        iam.delete_user(UserName="aad-test-user")
+        iam.delete_group(GroupName="aad-test-group")
+        iam.delete_role(RoleName="aad-test-role")
+        iam.delete_policy(PolicyArn=pol_arn)
+
+
+def test_iam_account_authorization_details_filter(iam):
+    assume_doc = json.dumps({"Version": "2012-10-17", "Statement": []})
+    iam.create_user(UserName="aad-filter-user")
+    iam.create_role(RoleName="aad-filter-role", AssumeRolePolicyDocument=assume_doc)
+    try:
+        resp = iam.get_account_authorization_details(Filter=["Role"])
+        # UserDetailList should be empty when filtering for Role only
+        assert resp.get("UserDetailList", []) == []
+        role_names = [r["RoleName"] for r in resp.get("RoleDetailList", [])]
+        assert "aad-filter-role" in role_names
+    finally:
+        iam.delete_user(UserName="aad-filter-user")
+        iam.delete_role(RoleName="aad-filter-role")
