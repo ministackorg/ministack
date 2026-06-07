@@ -7,6 +7,13 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [Unreleased]
+
+### Added
+- **IAM — `CreateVirtualMFADevice`, `EnableMFADevice`, `DeactivateMFADevice`, `ResyncMFADevice`, `ListMFADevices`, `ListVirtualMFADevices`, `DeleteVirtualMFADevice`** — full virtual MFA device lifecycle. `CreateVirtualMFADevice` returns `SerialNumber` (ARN form `arn:aws:iam::<acct>:mfa/<name>`) plus `Base32StringSeed` and `QRCodePNG` blobs (base64-encoded). `EnableMFADevice` accepts any TOTP codes (seed-side lenience). `ListVirtualMFADevices` supports `AssignmentStatus` filter (`Assigned` / `Unassigned` / `Any`; default `Assigned`). `DeleteVirtualMFADevice` returns `DeleteConflict` (409) for assigned devices.
+
+---
+
 ## [1.3.59] — 2026-06-05
 
 ### Added
