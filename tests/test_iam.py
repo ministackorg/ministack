@@ -735,3 +735,58 @@ def test_iam_aws_managed_attachment_count_persists_through_state_round_trip():
 
     _iam.restore_state(snapshot)
     assert _iam._aws_managed_attachment_counts.get(arn) == 2
+
+
+# ── Login profiles ────────────────────────────────────────────────────
+
+
+def test_iam_create_get_login_profile(iam):
+    name = "lp-user-create-get"
+    iam.create_user(UserName=name)
+    try:
+        resp = iam.create_login_profile(UserName=name, Password="Test1234!", PasswordResetRequired=True)
+        profile = resp["LoginProfile"]
+        assert profile["UserName"] == name
+        assert "CreateDate" in profile
+        assert profile["PasswordResetRequired"] is True
+
+        resp2 = iam.get_login_profile(UserName=name)
+        assert resp2["LoginProfile"]["UserName"] == name
+        assert "CreateDate" in resp2["LoginProfile"]
+    finally:
+        try:
+            iam.delete_login_profile(UserName=name)
+        except Exception:
+            pass
+        iam.delete_user(UserName=name)
+
+
+def test_iam_get_login_profile_absent(iam):
+    name = "lp-user-absent"
+    iam.create_user(UserName=name)
+    try:
+        with pytest.raises(iam.exceptions.NoSuchEntityException):
+            iam.get_login_profile(UserName=name)
+    finally:
+        iam.delete_user(UserName=name)
+
+
+def test_iam_create_login_profile_no_user(iam):
+    with pytest.raises(iam.exceptions.NoSuchEntityException):
+        iam.create_login_profile(UserName="lp-ghost-user-xyz", Password="Test1234!")
+
+
+def test_iam_delete_login_profile(iam):
+    name = "lp-user-delete"
+    iam.create_user(UserName=name)
+    try:
+        iam.create_login_profile(UserName=name, Password="Test1234!")
+        iam.delete_login_profile(UserName=name)
+        with pytest.raises(iam.exceptions.NoSuchEntityException):
+            iam.get_login_profile(UserName=name)
+    finally:
+        try:
+            iam.delete_login_profile(UserName=name)
+        except Exception:
+            pass
+        iam.delete_user(UserName=name)
