@@ -735,3 +735,39 @@ def test_iam_aws_managed_attachment_count_persists_through_state_round_trip():
 
     _iam.restore_state(snapshot)
     assert _iam._aws_managed_attachment_counts.get(arn) == 2
+
+
+# ── SAML providers + ListOpenIDConnectProviders ──────────────────────
+
+
+def test_iam_saml_provider_crud(iam):
+    name = "saml-test-provider"
+    # botocore requires ≥ 1000 chars for SAMLMetadataDocument (client-side validation)
+    metadata = "<EntityDescriptor>" + "x" * 990 + "</EntityDescriptor>"
+    resp = iam.create_saml_provider(Name=name, SAMLMetadataDocument=metadata)
+    arn = resp["SAMLProviderArn"]
+    assert f":saml-provider/{name}" in arn
+
+    providers = iam.list_saml_providers()["SAMLProviderList"]
+    assert any(p["Arn"] == arn for p in providers)
+
+    get_resp = iam.get_saml_provider(SAMLProviderArn=arn)
+    assert get_resp["SAMLMetadataDocument"] == metadata
+
+    iam.delete_saml_provider(SAMLProviderArn=arn)
+    with pytest.raises(iam.exceptions.NoSuchEntityException):
+        iam.get_saml_provider(SAMLProviderArn=arn)
+
+
+def test_iam_list_oidc_providers(iam):
+    resp = iam.create_open_id_connect_provider(
+        Url="https://oidc-list-test.example.com",
+        ClientIDList=["aud"],
+        ThumbprintList=["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa00"],
+    )
+    arn = resp["OpenIDConnectProviderArn"]
+    try:
+        providers = iam.list_open_id_connect_providers()["OpenIDConnectProviderList"]
+        assert any(p["Arn"] == arn for p in providers)
+    finally:
+        iam.delete_open_id_connect_provider(OpenIDConnectProviderArn=arn)
