@@ -7,6 +7,12 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [Unreleased]
+
+### Added
+- **IAM — `GenerateServiceLastAccessedDetails`, `GetServiceLastAccessedDetails`** — Access Advisor generate→get job handshake. Returns a UUID `JobId`. `GetServiceLastAccessedDetails` returns `JobStatus=COMPLETED` and an empty `ServicesLastAccessed` list (no CloudTrail data).
+
+---
 ## [1.3.59] — 2026-06-05
 
 ### Added
