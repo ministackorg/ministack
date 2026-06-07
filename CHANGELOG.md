@@ -7,6 +7,13 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [Unreleased]
+
+### Added
+- **IAM — `CreateSAMLProvider`, `GetSAMLProvider`, `ListSAMLProviders`, `UpdateSAMLProvider`, `DeleteSAMLProvider`** — SAML IdP CRUD. Accepts any non-empty `SAMLMetadataDocument` (real AWS requires valid XML ≥1000 chars; that validation is seed-side). `GetSAMLProvider` returns `SAMLMetadataDocument`, `CreateDate`, `ValidUntil`, and `Tags`. Enables agents to enumerate federated IdPs cross-referenced with role trust policies.
+- **IAM — `ListOpenIDConnectProviders`** — returns `{Arn}` entries for all OIDC providers in the account (create/get/delete existed previously). Completes the OIDC provider enumeration surface.
+
+---
 ## [1.3.59] — 2026-06-05
 
 ### Added
