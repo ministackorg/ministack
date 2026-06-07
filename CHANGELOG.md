@@ -7,6 +7,12 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [Unreleased]
+
+### Added
+- **IAM — `GetAccountAuthorizationDetails`** — the one-shot identity graph. Returns `UserDetailList` (inline policies, attached managed policies, group memberships, tags), `GroupDetailList`, `RoleDetailList` (inline policies, attached managed policies, instance profiles, tags, assume-role document url-encoded), and `Policies` (customer-managed, with url-encoded version documents). `Filter.member.N` honored: `User`, `Group`, `Role`, `LocalManagedPolicy`. `IsTruncated=false`; pagination optional.
+
+---
 ## [1.3.59] — 2026-06-05
 
 ### Added
