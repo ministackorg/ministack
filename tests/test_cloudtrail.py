@@ -121,6 +121,14 @@ def test_get_trail_rejects_malformed_arn_identifier(ct):
     assert exc.value.response["Error"]["Code"] == "CloudTrailARNInvalidException"
 
 
+@pytest.mark.parametrize("partition", ["aws-cn", "notaws"])
+def test_get_trail_rejects_non_aws_partition_as_invalid_trail_name(ct, partition):
+    arn = f"arn:{partition}:cloudtrail:{REGION}:000000000000:trail/missing-{_uid()}"
+    with pytest.raises(ClientError) as exc:
+        ct.get_trail(Name=arn)
+    assert exc.value.response["Error"]["Code"] == "InvalidTrailNameException"
+
+
 def test_get_trail_does_not_resolve_foreign_region_arn_by_tail(ct):
     name = f"trail-foreign-region-{_uid()}"
     arn = ct.create_trail(Name=name, S3BucketName="bucket")["TrailARN"]
@@ -149,6 +157,13 @@ def test_get_trail_not_found(ct):
     with pytest.raises(ClientError) as exc:
         ct.get_trail(Name=f"nonexistent-{_uid()}")
     assert "TrailNotFoundException" in str(exc.value)
+
+
+def test_get_trail_missing_aws_partition_arn_returns_not_found(ct):
+    arn = f"arn:aws:cloudtrail:{REGION}:000000000000:trail/missing-{_uid()}"
+    with pytest.raises(ClientError) as exc:
+        ct.get_trail(Name=arn)
+    assert exc.value.response["Error"]["Code"] == "TrailNotFoundException"
 
 
 def test_delete_trail(ct):
@@ -328,6 +343,21 @@ def test_add_tags_rejects_malformed_trail_arn(ct):
     assert exc.value.response["Error"]["Code"] == "CloudTrailARNInvalidException"
 
 
+@pytest.mark.parametrize("partition", ["aws-cn", "notaws"])
+def test_add_tags_rejects_non_aws_partition_trail_arn(ct, partition):
+    arn = f"arn:{partition}:cloudtrail:{REGION}:000000000000:trail/missing-{_uid()}"
+    with pytest.raises(ClientError) as exc:
+        ct.add_tags(ResourceId=arn, TagsList=[{"Key": "env", "Value": "test"}])
+    assert exc.value.response["Error"]["Code"] == "CloudTrailARNInvalidException"
+
+
+def test_add_tags_missing_aws_partition_trail_arn_returns_resource_not_found(ct):
+    arn = f"arn:aws:cloudtrail:{REGION}:000000000000:trail/missing-{_uid()}"
+    with pytest.raises(ClientError) as exc:
+        ct.add_tags(ResourceId=arn, TagsList=[{"Key": "env", "Value": "test"}])
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
 def test_add_tags_rejects_foreign_region_trail_arn(ct):
     name = f"trail-tags-foreign-{_uid()}"
     arn = ct.create_trail(Name=name, S3BucketName="bucket")["TrailARN"]
@@ -342,6 +372,36 @@ def test_list_tags_rejects_wrong_service_trail_arn(ct):
     with pytest.raises(ClientError) as exc:
         ct.list_tags(ResourceIdList=[f"arn:aws:sns:{REGION}:000000000000:trail/not-a-trail"])
     assert exc.value.response["Error"]["Code"] == "CloudTrailARNInvalidException"
+
+
+@pytest.mark.parametrize("partition", ["aws-cn", "notaws"])
+def test_list_tags_rejects_non_aws_partition_trail_arn(ct, partition):
+    arn = f"arn:{partition}:cloudtrail:{REGION}:000000000000:trail/missing-{_uid()}"
+    with pytest.raises(ClientError) as exc:
+        ct.list_tags(ResourceIdList=[arn])
+    assert exc.value.response["Error"]["Code"] == "CloudTrailARNInvalidException"
+
+
+def test_list_tags_missing_aws_partition_trail_arn_returns_resource_not_found(ct):
+    arn = f"arn:aws:cloudtrail:{REGION}:000000000000:trail/missing-{_uid()}"
+    with pytest.raises(ClientError) as exc:
+        ct.list_tags(ResourceIdList=[arn])
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
+@pytest.mark.parametrize("partition", ["aws-cn", "notaws"])
+def test_remove_tags_rejects_non_aws_partition_trail_arn(ct, partition):
+    arn = f"arn:{partition}:cloudtrail:{REGION}:000000000000:trail/missing-{_uid()}"
+    with pytest.raises(ClientError) as exc:
+        ct.remove_tags(ResourceId=arn, TagsList=[{"Key": "env"}])
+    assert exc.value.response["Error"]["Code"] == "CloudTrailARNInvalidException"
+
+
+def test_remove_tags_missing_aws_partition_trail_arn_returns_resource_not_found(ct):
+    arn = f"arn:aws:cloudtrail:{REGION}:000000000000:trail/missing-{_uid()}"
+    with pytest.raises(ClientError) as exc:
+        ct.remove_tags(ResourceId=arn, TagsList=[{"Key": "env"}])
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
 
 
 # ---------------------------------------------------------------------------
