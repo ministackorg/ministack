@@ -11,6 +11,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 - **IAM — `CreateVirtualMFADevice`, `EnableMFADevice`, `DeactivateMFADevice`, `ResyncMFADevice`, `ListMFADevices`, `ListVirtualMFADevices`, `DeleteVirtualMFADevice`** — full virtual MFA device lifecycle. `CreateVirtualMFADevice` returns `SerialNumber` (ARN form `arn:aws:iam::<acct>:mfa/<name>`) plus `Base32StringSeed` and `QRCodePNG` blobs (base64-encoded). `EnableMFADevice` accepts any TOTP codes (seed-side lenience). `ListVirtualMFADevices` supports `AssignmentStatus` filter (`Assigned` / `Unassigned` / `Any`; default `Assigned`). `DeleteVirtualMFADevice` returns `DeleteConflict` (409) for assigned devices.
+- **IAM — `CreateLoginProfile`, `GetLoginProfile`, `UpdateLoginProfile`, `DeleteLoginProfile`** — models whether an IAM user has a console password (the signal that a user is a human). `CreateLoginProfile` stores `UserName`, `CreateDate`, and `PasswordResetRequired` without persisting the password value (seed-side). `GetLoginProfile` returns `NoSuchEntity` (404) when no profile exists. `UpdateLoginProfile` updates `PasswordResetRequired`. `DeleteLoginProfile` removes the profile. All four operations match the real AWS request/response shapes exactly so identity-discovery agents can distinguish humans from service accounts using `get-login-profile`.
 
 ---
 

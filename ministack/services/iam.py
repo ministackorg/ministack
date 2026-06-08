@@ -57,6 +57,7 @@ _user_inline_policies = AccountScopedDict()
 _oidc_providers = AccountScopedDict()
 _service_linked_role_deletion_tasks = AccountScopedDict()
 _mfa_devices = AccountScopedDict()
+_login_profiles = AccountScopedDict()
 
 
 # -- AWS-managed policies ---------------------------------------------------
@@ -284,6 +285,7 @@ def get_state():
         "user_inline_policies": copy.deepcopy(_user_inline_policies),
         "aws_managed_attachment_counts": copy.deepcopy(_aws_managed_attachment_counts),
         "mfa_devices": copy.deepcopy(_mfa_devices),
+        "login_profiles": copy.deepcopy(_login_profiles),
     }
 
 
@@ -300,6 +302,7 @@ def restore_state(data):
         _user_inline_policies.update(data.get("user_inline_policies", {}))
         _aws_managed_attachment_counts.update(data.get("aws_managed_attachment_counts", {}))
         _mfa_devices.update(data.get("mfa_devices", {}))
+        _login_profiles.update(data.get("login_profiles", {}))
 
 
 try:
@@ -1670,6 +1673,67 @@ def _delete_virtual_mfa_device(p):
                       f"MFA device {serial} is still assigned to a user.", ns="iam")
     del _mfa_devices[serial]
     return _xml(200, "DeleteVirtualMFADeviceResponse", "", ns="iam")
+# -------------------- Login profiles --------------------
+
+
+def _login_profile_xml(name):
+    lp = _login_profiles[name]
+    pwr = "true" if lp.get("PasswordResetRequired") else "false"
+    return (f"<UserName>{lp['UserName']}</UserName>"
+            f"<CreateDate>{lp['CreateDate']}</CreateDate>"
+            f"<PasswordResetRequired>{pwr}</PasswordResetRequired>")
+
+
+def _create_login_profile(p):
+    name = _p(p, "UserName")
+    if name not in _users:
+        return _error(404, "NoSuchEntity",
+                      f"The user with name {name} cannot be found.", ns="iam")
+    if name in _login_profiles:
+        return _error(409, "EntityAlreadyExists",
+                      f"Login profile for user {name} already exists.", ns="iam")
+    _login_profiles[name] = {
+        "UserName": name,
+        "CreateDate": _now(),
+        "PasswordResetRequired": _p(p, "PasswordResetRequired", "false").lower() == "true",
+    }
+    return _xml(200, "CreateLoginProfileResponse",
+                f"<CreateLoginProfileResult>"
+                f"<LoginProfile>{_login_profile_xml(name)}</LoginProfile>"
+                f"</CreateLoginProfileResult>",
+                ns="iam")
+
+
+def _get_login_profile(p):
+    name = _p(p, "UserName")
+    if name not in _login_profiles:
+        return _error(404, "NoSuchEntity",
+                      f"Login profile for user {name} cannot be found.", ns="iam")
+    return _xml(200, "GetLoginProfileResponse",
+                f"<GetLoginProfileResult>"
+                f"<LoginProfile>{_login_profile_xml(name)}</LoginProfile>"
+                f"</GetLoginProfileResult>",
+                ns="iam")
+
+
+def _update_login_profile(p):
+    name = _p(p, "UserName")
+    if name not in _login_profiles:
+        return _error(404, "NoSuchEntity",
+                      f"Login profile for user {name} cannot be found.", ns="iam")
+    pwr = _p(p, "PasswordResetRequired", "")
+    if pwr:
+        _login_profiles[name]["PasswordResetRequired"] = pwr.lower() == "true"
+    return _xml(200, "UpdateLoginProfileResponse", "", ns="iam")
+
+
+def _delete_login_profile(p):
+    name = _p(p, "UserName")
+    if name not in _login_profiles:
+        return _error(404, "NoSuchEntity",
+                      f"Login profile for user {name} cannot be found.", ns="iam")
+    del _login_profiles[name]
+    return _xml(200, "DeleteLoginProfileResponse", "", ns="iam")
 
 
 # -------------------- OIDC providers --------------------
@@ -2066,6 +2130,10 @@ _IAM_HANDLERS = {
     "ListMFADevices": _list_mfa_devices,
     "ListVirtualMFADevices": _list_virtual_mfa_devices,
     "DeleteVirtualMFADevice": _delete_virtual_mfa_device,
+    "CreateLoginProfile": _create_login_profile,
+    "GetLoginProfile": _get_login_profile,
+    "UpdateLoginProfile": _update_login_profile,
+    "DeleteLoginProfile": _delete_login_profile,
     "TagPolicy": _tag_policy,
     "UntagPolicy": _untag_policy,
     "ListPolicyTags": _list_policy_tags,
@@ -2083,6 +2151,7 @@ def reset():
     _oidc_providers.clear()
     _service_linked_role_deletion_tasks.clear()
     _mfa_devices.clear()
+    _login_profiles.clear()
     # Re-seed AWS-managed policies. They're not customer state, so a
     # reset call should restore the canonical set rather than leave the
     # store empty. Per-account attachment counters are session state
