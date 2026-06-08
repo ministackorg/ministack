@@ -312,6 +312,7 @@ SERVICE_REGISTRY = {
     "cur": {"module": "cur"},
     "inspector2": {"module": "inspector2"},
     "s3tables": {"module": "s3tables"},
+    "iceberg-rest": {"module": "iceberg_rest"},
 }
 
 SERVICE_HANDLERS = {

@@ -390,7 +390,10 @@ SERVICE_PATTERNS = {
     "s3tables": {
         "host_patterns": [r"s3tables\."],
         "credential_scope": "s3tables",
-        "path_prefixes": ["/buckets", "/iceberg"],
+        "path_prefixes": ["/buckets"],
+    },
+    "iceberg-rest": {
+        "path_prefixes": ["/iceberg/"],
     },
 }
 
@@ -415,6 +418,12 @@ def detect_service(method: str, path: str, headers: dict, query_params: dict) ->
     # win before credential-scope routing.
     if method == "POST" and path == "/event" and re.search(r"\.appsync-api\.", host):
         return "appsync-events"
+
+    # Iceberg REST catalog — DuckDB / pyiceberg / Spark sign these as `glue`
+    # or `s3tables`, but the path is unambiguous: anything under `/iceberg/`
+    # belongs to the Iceberg REST module regardless of credential scope.
+    if path.startswith("/iceberg/"):
+        return "iceberg-rest"
 
     # 2. Check Authorization header for service name in credential scope
     if auth:

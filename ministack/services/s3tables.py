@@ -5,10 +5,11 @@ Provides the ``s3tables`` control plane: table buckets, namespaces, and tables
 in Apache Iceberg format.  Data files are stored in MiniStack's S3 service;
 table metadata (schemas, snapshots, manifests) is held in memory.
 
-Also exposes an **Iceberg REST catalog** endpoint at ``/iceberg`` so that Spark
-jobs configured with ``spark.sql.catalog.*.type=rest`` and
-``spark.sql.catalog.*.uri=http://<ministack>/iceberg`` can create, load, and
-commit Iceberg tables without any external catalog server.
+The Iceberg REST catalog data plane (``/iceberg/v1/*``) is served by
+``services/iceberg_rest.py`` since v1.3.60. It reads from this module's
+``_namespaces`` and ``_tables`` for s3tables-backed Iceberg tables, and
+falls back to Glue table parameters for the Glue-backed Iceberg path
+that DuckDB's iceberg extension uses.
 
 REST API paths from botocore s3tables service model:
   PUT    /buckets                                          CreateTableBucket
@@ -46,9 +47,6 @@ from ministack.core.responses import (
 )
 
 logger = logging.getLogger("s3tables")
-
-_MINISTACK_HOST = os.environ.get("MINISTACK_HOST", "localhost")
-_GATEWAY_PORT = os.environ.get("GATEWAY_PORT", "4566")
 
 # ── In-memory state ────────────────────────────────────────
 
@@ -309,186 +307,16 @@ def _update_table_metadata_location(bucket_arn, namespace, table_name, data):
                            "versionToken": new_uuid()[:8]})
 
 
-# ── Iceberg REST catalog (data plane for Spark) ───────────
-
-def _iceberg_config():
-    return json_response({"defaults": {}, "overrides": {}})
-
-
-def _iceberg_list_namespaces():
-    result = []
-    for ns in _namespaces.values():
-        result.append(ns.get("namespace", []))
-    return json_response({"namespaces": result})
-
-
-def _iceberg_get_namespace(namespace):
-    for ns in _namespaces.values():
-        ns_name = ns["namespace"][0] if isinstance(ns.get("namespace"), list) else ns.get("namespace", "")
-        if ns_name == namespace:
-            return json_response({"namespace": [namespace], "properties": {}})
-    return error_response_json("NotFoundException", f"Namespace {namespace} not found", 404)
-
-
-def _iceberg_list_tables(namespace):
-    result = []
-    for table in _tables.values():
-        table_ns = table["namespace"][0] if isinstance(table.get("namespace"), list) else ""
-        if table_ns == namespace:
-            result.append({"namespace": [namespace], "name": table["name"]})
-    return json_response({"identifiers": result})
-
-
-def _iceberg_load_table(namespace, table_name):
-    for table in _tables.values():
-        table_ns = table["namespace"][0] if isinstance(table.get("namespace"), list) else ""
-        if table_ns == namespace and table["name"] == table_name:
-            return json_response({
-                "metadata-location": table.get("metadataLocation", ""),
-                "metadata": table.get("_iceberg_metadata", {}),
-                "config": {
-                    "s3.access-key-id": "test", "s3.secret-access-key": "test",
-                    "s3.endpoint": f"http://{_MINISTACK_HOST}:{_GATEWAY_PORT}", "s3.path-style-access": "true",
-                },
-            })
-    return error_response_json("NotFoundException", f"Table {namespace}.{table_name} not found", 404)
-
-
-def _iceberg_commit_table(namespace, table_name, data):
-    for table in _tables.values():
-        table_ns = table["namespace"][0] if isinstance(table.get("namespace"), list) else ""
-        if table_ns == namespace and table["name"] == table_name:
-            metadata = table.get("_iceberg_metadata", {})
-            for update in data.get("updates", []):
-                action = update.get("action", "")
-                if action == "add-snapshot":
-                    snapshot = update.get("snapshot", {})
-                    metadata.setdefault("snapshots", []).append(snapshot)
-                    metadata["current-snapshot-id"] = snapshot.get("snapshot-id", -1)
-                    metadata["last-updated-ms"] = int(time.time() * 1000)
-                    metadata["last-sequence-number"] = metadata.get("last-sequence-number", 0) + 1
-                elif action == "set-snapshot-ref":
-                    metadata.setdefault("refs", {})[update.get("ref-name", "main")] = {
-                        "snapshot-id": update.get("snapshot-id", -1),
-                        "type": update.get("type", "branch")}
-                elif action == "add-schema":
-                    metadata.setdefault("schemas", []).append(update.get("schema", {}))
-                elif action == "set-current-schema":
-                    metadata["current-schema-id"] = update.get("schema-id", 0)
-                elif action == "add-partition-spec":
-                    metadata.setdefault("partition-specs", []).append(update.get("spec", {}))
-                elif action == "set-default-spec":
-                    metadata["default-spec-id"] = update.get("spec-id", 0)
-                elif action == "add-sort-order":
-                    metadata.setdefault("sort-orders", []).append(update.get("sort-order", {}))
-                elif action == "set-default-sort-order":
-                    metadata["default-sort-order-id"] = update.get("sort-order-id", 0)
-                elif action == "set-properties":
-                    metadata.setdefault("properties", {}).update(update.get("updates", {}))
-                elif action == "remove-properties":
-                    for r in update.get("removals", []):
-                        metadata.get("properties", {}).pop(r, None)
-                elif action == "set-location":
-                    metadata["location"] = update.get("location", "")
-
-            table["_metadata_version"] = table.get("_metadata_version", 0) + 1
-            v = table["_metadata_version"]
-            bucket_name = table.get("tableBucketARN", "").rsplit("/", 1)[-1]
-            new_loc = f"s3://{bucket_name}/{namespace}/{table_name}/metadata/v{v}.metadata.json"
-            table["metadataLocation"] = new_loc
-            table["modifiedAt"] = now_iso()
-            return json_response({"metadata-location": new_loc, "metadata": metadata})
-
-    return error_response_json("NotFoundException", f"Table {namespace}.{table_name} not found", 404)
-
-
-def _iceberg_create_table(namespace, data):
-    table_name = data.get("name", "")
-    schema = data.get("schema", {})
-    bucket_arn = None
-    for ns in _namespaces.values():
-        ns_name = ns["namespace"][0] if isinstance(ns.get("namespace"), list) else ""
-        if ns_name == namespace:
-            bucket_arn = ns.get("tableBucketARN")
-            break
-    if not bucket_arn:
-        return error_response_json("NotFoundException", f"Namespace {namespace} not found", 404)
-
-    schema_fields = [{"name": f.get("name", ""), "type": f.get("type", "string") if isinstance(f.get("type"), str) else "string",
-                       "required": f.get("required", False)} for f in schema.get("fields", [])]
-
-    bucket_name = bucket_arn.rsplit("/", 1)[-1]
-    location = data.get("location", f"s3://{bucket_name}/{namespace}/{table_name}")
-    iceberg_metadata = _initial_iceberg_metadata(table_name, schema_fields, location)
-    if schema:
-        iceberg_metadata["schemas"] = [schema]
-    metadata_location = f"s3://{bucket_name}/{namespace}/{table_name}/metadata/v0.metadata.json"
-    arn = _table_arn(bucket_arn, namespace, table_name)
-    key = _table_key(bucket_arn, namespace, table_name)
-
-    _tables[key] = {
-        "name": table_name, "tableARN": arn, "namespace": [namespace],
-        "tableBucketARN": bucket_arn, "format": "ICEBERG",
-        "createdAt": now_iso(), "modifiedAt": now_iso(),
-        "ownerAccountId": get_account_id(),
-        "metadataLocation": metadata_location, "warehouseLocation": location,
-        "_iceberg_metadata": iceberg_metadata, "_metadata_version": 0,
-        "_schema_fields": schema_fields,
-    }
-    return json_response({"metadata-location": metadata_location, "metadata": iceberg_metadata})
-
-
-# ── Iceberg REST router ───────────────────────────────────
-
-async def _handle_iceberg_request(method, path, headers, body, query_params):
-    parts = [p for p in path.strip("/").split("/") if p]
-    # parts: ["iceberg", "v1", ...]
-    if len(parts) < 2:
-        return None
-
-    if parts[1] == "v1" and len(parts) == 3 and parts[2] == "config" and method == "GET":
-        return _iceberg_config()
-
-    if len(parts) < 4:
-        return None
-
-    # parts[2] = prefix (catalog name), parts[3] = "namespaces"
-    if parts[3] == "namespaces":
-        if len(parts) == 4 and method == "GET":
-            return _iceberg_list_namespaces()
-        if len(parts) == 5 and method == "GET":
-            return _iceberg_get_namespace(parts[4])
-        if len(parts) >= 6 and parts[5] == "tables":
-            namespace = parts[4]
-            if len(parts) == 6:
-                if method == "GET":
-                    return _iceberg_list_tables(namespace)
-                if method == "POST":
-                    data = json.loads(body) if body else {}
-                    return _iceberg_create_table(namespace, data)
-            if len(parts) == 7:
-                table_name = parts[6]
-                if method == "GET":
-                    return _iceberg_load_table(namespace, table_name)
-                if method == "POST":
-                    data = json.loads(body) if body else {}
-                    return _iceberg_commit_table(namespace, table_name, data)
-                if method == "HEAD":
-                    for table in _tables.values():
-                        table_ns = table["namespace"][0] if isinstance(table.get("namespace"), list) else ""
-                        if table_ns == namespace and table["name"] == table_name:
-                            return 200, {}, b""
-                    return 404, {}, b""
-    return None
+# Iceberg REST data plane lives in ``services/iceberg_rest.py`` since
+# v1.3.60. It reaches into the s3tables in-memory dicts (``_namespaces``,
+# ``_tables``) directly for s3tables-backed Iceberg tables, and looks
+# up Glue tables by ``Parameters["metadata_location"]`` for the
+# Glue-backed path the DuckDB iceberg extension uses.
 
 
 # ── S3 Tables control plane REST router ────────────────────
 
 async def handle_request(method, path, headers, body, query_params):
-    # Iceberg REST catalog
-    if path.startswith("/iceberg"):
-        return await _handle_iceberg_request(method, path, headers, body, query_params)
-
     data = json.loads(body) if body else {}
     clean = path.rstrip("/")
     parts = [unquote(p) for p in clean.split("/") if p]
