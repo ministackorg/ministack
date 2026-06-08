@@ -40,11 +40,17 @@ import logging
 import os
 from urllib.parse import unquote
 
-# Sibling service modules are imported lazily inside the helpers below to
-# match the codebase's lazy-load convention (see appsync / cognito /
-# stepfunctions for the same pattern). Eager top-level imports would force
-# glue / s3 / s3tables to load the moment iceberg_rest is touched by the
-# router — defeating the lazy `_get_module` design in `app.py`.
+# Sibling service modules. We tried function-local imports to preserve
+# `app.py`'s lazy `_get_module` semantics (only load services the router
+# actually touches), but the in-tree linter strips them as "unused" — and
+# letting one slip past CI produces a `NameError` only on the cold-cache
+# path. Eager top-level imports are unambiguous and harmless here: the
+# three modules below have no side-effecting top-level work that costs
+# more than a few microseconds. The cost is paid once when iceberg_rest
+# itself is first imported by the router.
+from ministack.services import glue as _glue
+from ministack.services import s3 as _s3
+from ministack.services import s3tables as _s3tables
 
 logger = logging.getLogger("iceberg_rest")
 
@@ -108,7 +114,6 @@ def _fetch_metadata_json(metadata_location: str) -> dict | None:
     bucket, key = _parse_s3_uri(metadata_location)
     if not bucket or not key:
         return None
-    from ministack.services import s3 as _s3
     data = _s3._get_object_data(bucket, key)
     if data is None:
         return None
@@ -127,12 +132,10 @@ def _fetch_metadata_json(metadata_location: str) -> dict | None:
 # and we hide it from the Iceberg REST surface.
 
 def _glue_namespaces() -> list[str]:
-    from ministack.services import glue as _glue
     return list(_glue._databases.keys())
 
 
 def _glue_iceberg_tables(db_name: str) -> list[str]:
-    from ministack.services import glue as _glue
     out = []
     prefix = f"{db_name}/"
     for key, table in _glue._tables.items():
@@ -145,7 +148,6 @@ def _glue_iceberg_tables(db_name: str) -> list[str]:
 
 
 def _glue_load_table(db_name: str, table_name: str):
-    from ministack.services import glue as _glue
     table = _glue._tables.get(f"{db_name}/{table_name}")
     if table is None:
         return None
