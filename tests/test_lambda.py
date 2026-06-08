@@ -2337,6 +2337,55 @@ def test_lambda_rejects_cross_region_layers_on_create_and_update():
     finally:
         east.delete_function(FunctionName=update_name)
 
+
+def test_lambda_rejects_wrong_account_layers_on_create_and_update(lam):
+    suffix = _uuid_mod.uuid4().hex[:8]
+
+    layer_buf = io.BytesIO()
+    with zipfile.ZipFile(layer_buf, "w") as z:
+        z.writestr("layer.py", "")
+    layer_arn = lam.publish_layer_version(
+        LayerName=f"wrong-account-layer-{suffix}",
+        Content={"ZipFile": layer_buf.getvalue()},
+    )["LayerVersionArn"]
+    arn_parts = layer_arn.split(":")
+    arn_parts[4] = "111111111111" if arn_parts[4] != "111111111111" else "222222222222"
+    wrong_account_arn = ":".join(arn_parts)
+
+    create_name = f"wrong-account-layer-create-{suffix}"
+    update_name = f"wrong-account-layer-update-{suffix}"
+    try:
+        with pytest.raises(ClientError) as create_exc:
+            lam.create_function(
+                FunctionName=create_name,
+                Runtime="python3.12",
+                Role=_LAMBDA_ROLE,
+                Handler="index.handler",
+                Code={"ZipFile": _make_zip(_LAMBDA_CODE)},
+                Layers=[wrong_account_arn],
+            )
+        assert create_exc.value.response["Error"]["Code"] == "AccessDeniedException"
+
+        lam.create_function(
+            FunctionName=update_name,
+            Runtime="python3.12",
+            Role=_LAMBDA_ROLE,
+            Handler="index.handler",
+            Code={"ZipFile": _make_zip(_LAMBDA_CODE)},
+        )
+        with pytest.raises(ClientError) as update_exc:
+            lam.update_function_configuration(FunctionName=update_name, Layers=[wrong_account_arn])
+        assert update_exc.value.response["Error"]["Code"] == "AccessDeniedException"
+        cfg = lam.get_function_configuration(FunctionName=update_name)
+        assert cfg["Layers"] == []
+    finally:
+        for name in (create_name, update_name):
+            try:
+                lam.delete_function(FunctionName=name)
+            except ClientError:
+                pass
+
+
 def test_lambda_docker_cp_dir_arcname_creates_subdir_in_existing_parent():
     """Docker's put_archive requires dest_dir to exist. For /opt/layer_N
     (which doesn't exist in the base RIE image), the fix is to extract into
@@ -2439,7 +2488,7 @@ def test_lambda_function_with_layer_reports_real_code_size(lam):
     fn_zip = io.BytesIO()
     with zipfile.ZipFile(fn_zip, "w") as z:
         z.writestr("index.py", "def handler(e, c): return {}")
-    lam.create_function(
+    created = lam.create_function(
         FunctionName="codesize-fn",
         Runtime="python3.12",
         Role="arn:aws:iam::000000000000:role/test",
@@ -2447,6 +2496,8 @@ def test_lambda_function_with_layer_reports_real_code_size(lam):
         Code={"ZipFile": fn_zip.getvalue()},
         Layers=[layer_arn],
     )
+    assert created["Layers"][0]["Arn"] == layer_arn
+    assert created["Layers"][0]["CodeSize"] == expected_size
     cfg = lam.get_function_configuration(FunctionName="codesize-fn")
     assert cfg["Layers"][0]["Arn"] == layer_arn
     assert cfg["Layers"][0]["CodeSize"] == expected_size
@@ -2461,11 +2512,13 @@ def test_lambda_update_function_configuration_layer_attachment_invokes_with_laye
     layer_buf = io.BytesIO()
     with zipfile.ZipFile(layer_buf, "w") as z:
         z.writestr("python/mylayermod.py", "VALUE = 'from-layer'")
-    layer_arn = lam.publish_layer_version(
+    layer_resp = lam.publish_layer_version(
         LayerName="late-attach-layer",
         Content={"ZipFile": layer_buf.getvalue()},
         CompatibleRuntimes=["python3.12"],
-    )["LayerVersionArn"]
+    )
+    layer_arn = layer_resp["LayerVersionArn"]
+    expected_size = layer_resp["Content"]["CodeSize"]
 
     # Function created WITHOUT the layer first — handler tolerates the absence
     # so the initial invoke can warm a worker.
@@ -2494,12 +2547,14 @@ def test_lambda_update_function_configuration_layer_attachment_invokes_with_laye
     assert pre_body == {"layer_value": None}
 
     # Attach the layer via UpdateFunctionConfiguration.
-    lam.update_function_configuration(FunctionName="late-attach-fn", Layers=[layer_arn])
+    update_resp = lam.update_function_configuration(FunctionName="late-attach-fn", Layers=[layer_arn])
+    assert update_resp["Layers"][0]["Arn"] == layer_arn
+    assert update_resp["Layers"][0]["CodeSize"] == expected_size
 
     # (a) CodeSize on GetFunctionConfiguration matches the layer's real size.
     cfg = lam.get_function_configuration(FunctionName="late-attach-fn")
     assert cfg["Layers"][0]["Arn"] == layer_arn
-    assert cfg["Layers"][0]["CodeSize"] > 0
+    assert cfg["Layers"][0]["CodeSize"] == expected_size
 
     # (b) Next invoke must use a fresh worker that has the layer mounted on
     #     /opt/python — the import succeeds and the handler returns the layer value.

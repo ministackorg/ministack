@@ -29,13 +29,13 @@ import base64
 import contextvars
 import copy
 import hashlib
-import secrets
 import importlib
 import io
 import json
 import logging
 import os
 import re
+import secrets
 import socket
 import subprocess
 import tempfile
@@ -1012,25 +1012,86 @@ def _build_config(name: str, data: dict, code_zip: bytes | None = None) -> dict:
     return config
 
 
-def _validate_layer_regions(layers: list | None):
+def _lambda_layer_version_name_and_number_from_arn_spec(spec) -> tuple[str, int] | None:
+    if spec.service != "lambda":
+        return None
+    parts = spec.resource.split(":", 2)
+    if len(parts) != 3 or parts[0] != "layer" or not parts[1] or not parts[2].isdigit():
+        return None
+    return parts[1], int(parts[2])
+
+
+def _invalid_layer_version_arn(layer_arn: str):
+    return error_response_json(
+        "InvalidParameterValueException",
+        f"Layer version ARN {layer_arn} is invalid.",
+        400,
+    )
+
+
+def _resolve_layer_version_for_attachment(layer_arn: str):
+    try:
+        spec = parse_arn(layer_arn)
+    except ArnParseError:
+        return None, _invalid_layer_version_arn(layer_arn)
+
+    layer_ref = _lambda_layer_version_name_and_number_from_arn_spec(spec)
+    if layer_ref is None:
+        return None, _invalid_layer_version_arn(layer_arn)
+
+    if spec.account_id != get_account_id():
+        return None, error_response_json(
+            "AccessDeniedException",
+            "User is not authorized to access this resource.",
+            403,
+        )
+    if spec.region != get_region():
+        return None, error_response_json(
+            "InvalidParameterValueException",
+            f"Layer version ARN {layer_arn} is in region {spec.region}; "
+            f"function region is {get_region()}",
+            400,
+        )
+
+    layer_name, version = layer_ref
+    layer = _layers.get_scoped(spec.account_id, spec.region, layer_name)
+    if not layer:
+        return None, error_response_json(
+            "InvalidParameterValueException",
+            f"Layer version {layer_arn} does not exist.",
+            400,
+        )
+    for version_config in layer["versions"]:
+        if version_config["Version"] == version:
+            return version_config, None
+    return None, error_response_json(
+        "InvalidParameterValueException",
+        f"Layer version {layer_arn} does not exist.",
+        400,
+    )
+
+
+def _layer_config_from_version(layer_arn: str, version_config: dict) -> dict:
+    return {
+        "Arn": layer_arn,
+        "CodeSize": version_config.get("Content", {}).get("CodeSize", 0),
+    }
+
+
+def _normalize_layer_attachments(layers: list | None):
+    layers_cfg = []
     for layer in layers or []:
         layer_arn = layer if isinstance(layer, str) else (layer or {}).get("Arn")
         if not layer_arn:
-            continue
-        try:
-            spec = parse_arn(layer_arn)
-        except ArnParseError:
-            continue
-        if spec.service != "lambda" or not spec.resource.startswith("layer:"):
-            continue
-        if spec.region != get_region():
-            return error_response_json(
-                "InvalidParameterValueException",
-                f"Layer version ARN {layer_arn} is in region {spec.region}; "
-                f"function region is {get_region()}",
-                400,
-            )
-    return None
+            return None, _invalid_layer_version_arn(str(layer_arn or ""))
+        version_config, err = _resolve_layer_version_for_attachment(layer_arn)
+        if err:
+            return None, err
+        normalized = _layer_config_from_version(layer_arn, version_config)
+        if isinstance(layer, dict):
+            normalized.update({k: v for k, v in layer.items() if k not in normalized})
+        layers_cfg.append(normalized)
+    return layers_cfg, None
 
 
 
@@ -1520,9 +1581,12 @@ def _create_function(data: dict):
     err = _validate_dead_letter_config(data.get("DeadLetterConfig"))
     if err:
         return err
-    err = _validate_layer_regions(data.get("Layers"))
+    layers_cfg, err = _normalize_layer_attachments(data.get("Layers"))
     if err:
         return err
+    if data.get("Layers") is not None:
+        data = dict(data)
+        data["Layers"] = layers_cfg
 
     config = _build_config(name, data, code_zip)
     if image_uri:
@@ -1957,9 +2021,11 @@ def _update_config(name: str, data: dict):
     if err:
         return err
     if "Layers" in data:
-        err = _validate_layer_regions(data.get("Layers"))
+        layers_cfg, err = _normalize_layer_attachments(data.get("Layers"))
         if err:
             return err
+        data = dict(data)
+        data["Layers"] = layers_cfg
     config = _functions[name]["config"]
     for key in (
         "Runtime",
@@ -4011,21 +4077,10 @@ def _layer_codesize_for_arn(layer_arn_str: str) -> int:
     version can't be resolved. Real AWS surfaces the actual layer code size on
     `GetFunctionConfiguration.Layers[*].CodeSize` so callers can sanity-check
     against quotas (250 MB unzipped function + layers)."""
-    segs = layer_arn_str.split(":")
-    if len(segs) < 8:
+    version_config, err = _resolve_layer_version_for_attachment(layer_arn_str)
+    if err:
         return 0
-    layer_name = segs[6]
-    try:
-        version = int(segs[7])
-    except (ValueError, IndexError):
-        return 0
-    layer = _layers.get(layer_name)
-    if not layer:
-        return 0
-    for v in layer["versions"]:
-        if v["Version"] == version:
-            return v.get("Content", {}).get("CodeSize", 0)
-    return 0
+    return version_config.get("Content", {}).get("CodeSize", 0)
 
 
 # ---------------------------------------------------------------------------
