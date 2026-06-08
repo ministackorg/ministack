@@ -893,7 +893,9 @@ async def _get_activity_task(data):
 def _tag_resource(data):
     arn = data.get("resourceArn")
     new_tags = data.get("tags", [])
-    account_id, region = _scope_from_resource_arn(arn)
+    account_id, region, error = _tag_resource_scope_from_arn(arn)
+    if error:
+        return error
     existing = _tags.get_scoped(account_id, region, arn)
     if existing is None:
         existing = []
@@ -912,7 +914,9 @@ def _tag_resource(data):
 def _untag_resource(data):
     arn = data.get("resourceArn")
     keys_to_remove = set(data.get("tagKeys", []))
-    account_id, region = _scope_from_resource_arn(arn)
+    account_id, region, error = _tag_resource_scope_from_arn(arn)
+    if error:
+        return error
     existing = _tags.get_scoped(account_id, region, arn, [])
     _tags.set_scoped(
         account_id,
@@ -925,18 +929,42 @@ def _untag_resource(data):
 
 def _list_tags_for_resource(data):
     arn = data.get("resourceArn")
-    account_id, region = _scope_from_resource_arn(arn)
+    account_id, region, error = _tag_resource_scope_from_arn(arn)
+    if error:
+        return error
     return json_response({"tags": _tags.get_scoped(account_id, region, arn, [])})
 
 
-def _scope_from_resource_arn(arn):
+def _tag_resource_scope_from_arn(arn):
     try:
         spec = parse_arn(arn)
     except ArnParseError:
-        return get_account_id(), get_region()
-    if spec.service != "states":
-        return get_account_id(), get_region()
-    return get_account_id(), spec.region or get_region()
+        return None, None, _invalid_tag_resource_arn(arn)
+    if spec.service != "states" or not _is_stepfunctions_taggable_resource(spec.resource):
+        return None, None, _invalid_tag_resource_arn(arn)
+    if spec.account_id != get_account_id():
+        return None, None, error_response_json(
+            "AccessDeniedException",
+            "User is not authorized to access this resource.",
+            400,
+        )
+    if spec.region != get_region():
+        return None, None, error_response_json(
+            "InvalidArn",
+            f"Invalid ARN: {arn} is expected to be within the request region {get_region()}.",
+            400,
+        )
+    return spec.account_id, spec.region, None
+
+
+def _is_stepfunctions_taggable_resource(resource):
+    return isinstance(resource, str) and (
+        resource.startswith("stateMachine:") or resource.startswith("activity:")
+    )
+
+
+def _invalid_tag_resource_arn(arn):
+    return error_response_json("InvalidArn", f"Invalid resource ARN: {arn}", 400)
 
 
 # ---------------------------------------------------------------------------

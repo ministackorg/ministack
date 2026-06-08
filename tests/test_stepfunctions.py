@@ -414,29 +414,53 @@ def test_sfn_tags_scope_by_resource_arn_region():
     original_account = get_account_id()
     original_region = get_region()
     original_tags = dict(m._tags._data)
-    arn = "arn:aws:states:us-west-2:000000000000:stateMachine:tagged-west"
+    arn = "arn:aws:states:us-east-1:000000000000:stateMachine:tagged-east"
+    foreign_region_arn = "arn:aws:states:us-west-2:000000000000:stateMachine:tagged-west"
+    foreign_account_arn = "arn:aws:states:us-east-1:111111111111:stateMachine:foreign"
+
+    def assert_error(response, code):
+        status, headers, body = response
+        assert status == 400
+        assert headers["x-amzn-errortype"] == code
+        assert json.loads(body)["__type"] == code
 
     try:
         m._tags.clear()
         set_request_account_id("000000000000")
         set_request_region("us-east-1")
 
-        m._tag_resource({"resourceArn": arn, "tags": [{"key": "env", "value": "west"}]})
+        m._tag_resource({"resourceArn": arn, "tags": [{"key": "env", "value": "east"}]})
 
-        assert m._tags.get_scoped("000000000000", "us-west-2", arn) == [
-            {"key": "env", "value": "west"},
+        assert m._tags.get_scoped("000000000000", "us-east-1", arn) == [
+            {"key": "env", "value": "east"},
         ]
-        assert m._tags.get_scoped("000000000000", "us-east-1", arn) is None
+        assert m._tags.get_scoped("000000000000", "us-west-2", arn) is None
 
         _status, _headers, body = m._list_tags_for_resource({"resourceArn": arn})
-        assert json.loads(body)["tags"] == [{"key": "env", "value": "west"}]
+        assert json.loads(body)["tags"] == [{"key": "env", "value": "east"}]
 
-        foreign_arn = "arn:aws:states:us-west-2:111111111111:stateMachine:foreign"
-        m._tag_resource({"resourceArn": foreign_arn, "tags": [{"key": "owner", "value": "other"}]})
-        assert m._tags.get_scoped("111111111111", "us-west-2", foreign_arn) is None
-        assert m._tags.get_scoped("000000000000", "us-west-2", foreign_arn) == [
-            {"key": "owner", "value": "other"},
-        ]
+        assert_error(
+            m._tag_resource({
+                "resourceArn": foreign_region_arn,
+                "tags": [{"key": "env", "value": "west"}],
+            }),
+            "InvalidArn",
+        )
+        assert m._tags.get_scoped("000000000000", "us-west-2", foreign_region_arn) is None
+
+        assert_error(
+            m._tag_resource({
+                "resourceArn": foreign_account_arn,
+                "tags": [{"key": "owner", "value": "other"}],
+            }),
+            "AccessDeniedException",
+        )
+        assert_error(
+            m._list_tags_for_resource({"resourceArn": foreign_account_arn}),
+            "AccessDeniedException",
+        )
+        assert m._tags.get_scoped("111111111111", "us-east-1", foreign_account_arn) is None
+        assert m._tags.get_scoped("000000000000", "us-east-1", foreign_account_arn) is None
     finally:
         m._tags.clear()
         m._tags._data.update(original_tags)
