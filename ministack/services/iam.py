@@ -27,6 +27,7 @@ IAM actions:
   SimulatePrincipalPolicy, SimulateCustomPolicy.
 """
 
+import base64
 import copy
 import json
 import logging
@@ -55,6 +56,8 @@ _groups = AccountScopedDict()
 _user_inline_policies = AccountScopedDict()
 _oidc_providers = AccountScopedDict()
 _service_linked_role_deletion_tasks = AccountScopedDict()
+_mfa_devices = AccountScopedDict()
+_login_profiles = AccountScopedDict()
 
 
 # -- AWS-managed policies ---------------------------------------------------
@@ -281,6 +284,8 @@ def get_state():
         "service_linked_role_deletion_tasks": copy.deepcopy(_service_linked_role_deletion_tasks),
         "user_inline_policies": copy.deepcopy(_user_inline_policies),
         "aws_managed_attachment_counts": copy.deepcopy(_aws_managed_attachment_counts),
+        "mfa_devices": copy.deepcopy(_mfa_devices),
+        "login_profiles": copy.deepcopy(_login_profiles),
     }
 
 
@@ -296,6 +301,8 @@ def restore_state(data):
         _service_linked_role_deletion_tasks.update(data.get("service_linked_role_deletion_tasks", {}))
         _user_inline_policies.update(data.get("user_inline_policies", {}))
         _aws_managed_attachment_counts.update(data.get("aws_managed_attachment_counts", {}))
+        _mfa_devices.update(data.get("mfa_devices", {}))
+        _login_profiles.update(data.get("login_profiles", {}))
 
 
 try:
@@ -1687,6 +1694,209 @@ def _get_account_authorization_details(p):
                 ns="iam")
 
 
+# -------------------- Virtual MFA devices --------------------
+
+
+def _virtual_mfa_xml(serial, include_user=True):
+    dev = _mfa_devices[serial]
+    seed_b64 = base64.b64encode(dev["Base32StringSeed"].encode()).decode()
+    # QRCode: tiny placeholder bytes, base64-encoded (blob field)
+    qr_b64 = base64.b64encode(b"QR").decode()
+    inner = (f"<SerialNumber>{dev['SerialNumber']}</SerialNumber>"
+             f"<Base32StringSeed>{seed_b64}</Base32StringSeed>"
+             f"<QRCodePNG>{qr_b64}</QRCodePNG>")
+    if include_user and dev.get("User"):
+        user_name = dev["User"]
+        if user_name in _users:
+            inner += f"<User>{_user_xml(user_name)}</User>"
+        inner += f"<EnableDate>{dev['EnableDate']}</EnableDate>"
+    return inner
+
+
+def _create_virtual_mfa_device(p):
+    name = _p(p, "VirtualMFADeviceName")
+    path = _p(p, "Path") or "/"
+    acct = get_account_id()
+    if path == "/":
+        serial = f"arn:aws:iam::{acct}:mfa/{name}"
+    else:
+        serial = f"arn:aws:iam::{acct}:mfa{path}{name}"
+    if serial in _mfa_devices:
+        return _error(409, "EntityAlreadyExists",
+                      f"MFA device {serial} already exists.", ns="iam")
+    seed = new_uuid().replace("-", "")[:32].upper()
+    _mfa_devices[serial] = {
+        "SerialNumber": serial,
+        "Path": path,
+        "CreateDate": _now(),
+        "User": None,
+        "EnableDate": None,
+        "Base32StringSeed": seed,
+        "Tags": _extract_tags(p),
+    }
+    return _xml(200, "CreateVirtualMFADeviceResponse",
+                f"<CreateVirtualMFADeviceResult>"
+                f"<VirtualMFADevice>{_virtual_mfa_xml(serial, include_user=False)}</VirtualMFADevice>"
+                f"</CreateVirtualMFADeviceResult>",
+                ns="iam")
+
+
+def _enable_mfa_device(p):
+    user_name = _p(p, "UserName")
+    serial = _p(p, "SerialNumber")
+    if user_name not in _users:
+        return _error(404, "NoSuchEntity",
+                      f"The user with name {user_name} cannot be found.", ns="iam")
+    if serial not in _mfa_devices:
+        return _error(404, "NoSuchEntity",
+                      f"MFA device {serial} not found.", ns="iam")
+    dev = _mfa_devices[serial]
+    if dev["User"] is not None:
+        return _error(409, "EntityAlreadyExists",
+                      f"MFA device {serial} is already assigned.", ns="iam")
+    dev["User"] = user_name
+    dev["EnableDate"] = _now()
+    return _xml(200, "EnableMFADeviceResponse", "", ns="iam")
+
+
+def _deactivate_mfa_device(p):
+    user_name = _p(p, "UserName")
+    serial = _p(p, "SerialNumber")
+    dev = _mfa_devices.get(serial)
+    if dev is None or dev.get("User") != user_name:
+        return _error(404, "NoSuchEntity",
+                      f"MFA device {serial} is not assigned to user {user_name}.", ns="iam")
+    dev["User"] = None
+    dev["EnableDate"] = None
+    return _xml(200, "DeactivateMFADeviceResponse", "", ns="iam")
+
+
+def _resync_mfa_device(p):
+    user_name = _p(p, "UserName")
+    serial = _p(p, "SerialNumber")
+    dev = _mfa_devices.get(serial)
+    if dev is None or dev.get("User") != user_name:
+        return _error(404, "NoSuchEntity",
+                      f"MFA device {serial} not found or not assigned to {user_name}.", ns="iam")
+    return _xml(200, "ResyncMFADeviceResponse", "", ns="iam")
+
+
+def _list_mfa_devices(p):
+    user_name = _p(p, "UserName")
+    members = ""
+    for serial, dev in _mfa_devices.items():
+        if dev.get("User") == user_name:
+            members += (f"<member>"
+                        f"<UserName>{dev['User']}</UserName>"
+                        f"<SerialNumber>{dev['SerialNumber']}</SerialNumber>"
+                        f"<EnableDate>{dev['EnableDate']}</EnableDate>"
+                        f"</member>")
+    return _xml(200, "ListMFADevicesResponse",
+                f"<ListMFADevicesResult>"
+                f"<MFADevices>{members}</MFADevices>"
+                f"<IsTruncated>false</IsTruncated>"
+                f"</ListMFADevicesResult>",
+                ns="iam")
+
+
+def _list_virtual_mfa_devices(p):
+    status = _p(p, "AssignmentStatus") or "Assigned"
+    members = ""
+    for serial, dev in _mfa_devices.items():
+        is_assigned = dev.get("User") is not None
+        if status == "Assigned" and not is_assigned:
+            continue
+        if status == "Unassigned" and is_assigned:
+            continue
+        member_xml = f"<SerialNumber>{dev['SerialNumber']}</SerialNumber>"
+        if is_assigned:
+            user_name = dev["User"]
+            if user_name in _users:
+                member_xml += f"<User>{_user_xml(user_name)}</User>"
+            member_xml += f"<EnableDate>{dev['EnableDate']}</EnableDate>"
+        members += f"<member>{member_xml}</member>"
+    return _xml(200, "ListVirtualMFADevicesResponse",
+                f"<ListVirtualMFADevicesResult>"
+                f"<VirtualMFADevices>{members}</VirtualMFADevices>"
+                f"<IsTruncated>false</IsTruncated>"
+                f"</ListVirtualMFADevicesResult>",
+                ns="iam")
+
+
+def _delete_virtual_mfa_device(p):
+    serial = _p(p, "SerialNumber")
+    dev = _mfa_devices.get(serial)
+    if dev is None:
+        return _error(404, "NoSuchEntity",
+                      f"MFA device {serial} not found.", ns="iam")
+    if dev.get("User") is not None:
+        return _error(409, "DeleteConflict",
+                      f"MFA device {serial} is still assigned to a user.", ns="iam")
+    del _mfa_devices[serial]
+    return _xml(200, "DeleteVirtualMFADeviceResponse", "", ns="iam")
+# -------------------- Login profiles --------------------
+
+
+def _login_profile_xml(name):
+    lp = _login_profiles[name]
+    pwr = "true" if lp.get("PasswordResetRequired") else "false"
+    return (f"<UserName>{lp['UserName']}</UserName>"
+            f"<CreateDate>{lp['CreateDate']}</CreateDate>"
+            f"<PasswordResetRequired>{pwr}</PasswordResetRequired>")
+
+
+def _create_login_profile(p):
+    name = _p(p, "UserName")
+    if name not in _users:
+        return _error(404, "NoSuchEntity",
+                      f"The user with name {name} cannot be found.", ns="iam")
+    if name in _login_profiles:
+        return _error(409, "EntityAlreadyExists",
+                      f"Login profile for user {name} already exists.", ns="iam")
+    _login_profiles[name] = {
+        "UserName": name,
+        "CreateDate": _now(),
+        "PasswordResetRequired": _p(p, "PasswordResetRequired", "false").lower() == "true",
+    }
+    return _xml(200, "CreateLoginProfileResponse",
+                f"<CreateLoginProfileResult>"
+                f"<LoginProfile>{_login_profile_xml(name)}</LoginProfile>"
+                f"</CreateLoginProfileResult>",
+                ns="iam")
+
+
+def _get_login_profile(p):
+    name = _p(p, "UserName")
+    if name not in _login_profiles:
+        return _error(404, "NoSuchEntity",
+                      f"Login profile for user {name} cannot be found.", ns="iam")
+    return _xml(200, "GetLoginProfileResponse",
+                f"<GetLoginProfileResult>"
+                f"<LoginProfile>{_login_profile_xml(name)}</LoginProfile>"
+                f"</GetLoginProfileResult>",
+                ns="iam")
+
+
+def _update_login_profile(p):
+    name = _p(p, "UserName")
+    if name not in _login_profiles:
+        return _error(404, "NoSuchEntity",
+                      f"Login profile for user {name} cannot be found.", ns="iam")
+    pwr = _p(p, "PasswordResetRequired", "")
+    if pwr:
+        _login_profiles[name]["PasswordResetRequired"] = pwr.lower() == "true"
+    return _xml(200, "UpdateLoginProfileResponse", "", ns="iam")
+
+
+def _delete_login_profile(p):
+    name = _p(p, "UserName")
+    if name not in _login_profiles:
+        return _error(404, "NoSuchEntity",
+                      f"Login profile for user {name} cannot be found.", ns="iam")
+    del _login_profiles[name]
+    return _xml(200, "DeleteLoginProfileResponse", "", ns="iam")
+
+
 # -------------------- OIDC providers --------------------
 
 def _create_oidc_provider(p):
@@ -2075,6 +2285,17 @@ _IAM_HANDLERS = {
     "GetOpenIDConnectProvider": _get_oidc_provider,
     "DeleteOpenIDConnectProvider": _delete_oidc_provider,
     "GetAccountAuthorizationDetails": _get_account_authorization_details,
+    "CreateVirtualMFADevice": _create_virtual_mfa_device,
+    "EnableMFADevice": _enable_mfa_device,
+    "DeactivateMFADevice": _deactivate_mfa_device,
+    "ResyncMFADevice": _resync_mfa_device,
+    "ListMFADevices": _list_mfa_devices,
+    "ListVirtualMFADevices": _list_virtual_mfa_devices,
+    "DeleteVirtualMFADevice": _delete_virtual_mfa_device,
+    "CreateLoginProfile": _create_login_profile,
+    "GetLoginProfile": _get_login_profile,
+    "UpdateLoginProfile": _update_login_profile,
+    "DeleteLoginProfile": _delete_login_profile,
     "TagPolicy": _tag_policy,
     "UntagPolicy": _untag_policy,
     "ListPolicyTags": _list_policy_tags,
@@ -2091,6 +2312,8 @@ def reset():
     _user_inline_policies.clear()
     _oidc_providers.clear()
     _service_linked_role_deletion_tasks.clear()
+    _mfa_devices.clear()
+    _login_profiles.clear()
     # Re-seed AWS-managed policies. They're not customer state, so a
     # reset call should restore the canonical set rather than leave the
     # store empty. Per-account attachment counters are session state
