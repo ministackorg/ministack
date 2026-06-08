@@ -94,6 +94,7 @@ _SERIAL_TESTS = {
     "tests/test_appsync.py::test_appsync_lambda_event_variables_substituted",
     "tests/test_appsync.py::test_appsync_lambda_unhandled_exception_becomes_error",
     "tests/test_appsync.py::test_appsync_lambda_authorizer_rejection_returns_unauthorized",
+    "tests/test_appsync.py::test_appsync_lambda_authorizer_wrong_region_arn_does_not_fallback",
     "tests/test_appsync.py::test_appsync_lambda_missing_authorizer_returns_unauthorized",
     "tests/test_appsync.py::test_appsync_lambda_failing_authorizer_returns_unauthorized",
 }
