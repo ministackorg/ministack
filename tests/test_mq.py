@@ -237,3 +237,30 @@ def test_mq_reboot_broker_with_non_existent_id(mq):
         mq.reboot_broker(BrokerId="invalid-id")
     assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 404
     assert exc.value.response["Error"]["Code"] == "NotFoundException"
+
+############################################################################
+# DescribeBrokerEngineTypes
+############################################################################
+
+def test_mq_describe_broker_engine_types_with_no_params(mq):
+    resp = mq.describe_broker_engine_types()
+    assert len(resp["BrokerEngineTypes"]) > 0
+    assert resp["MaxResults"] == 20
+
+def test_mq_describe_broker_engine_types_with_engine_type(mq):
+    resp = mq.describe_broker_engine_types(EngineType="RABBITMQ")
+    assert len(resp["BrokerEngineTypes"]) > 0
+    assert all(e["EngineType"] == "RABBITMQ" for e in resp["BrokerEngineTypes"])
+
+def test_mq_describe_broker_engine_types_with_invalid_engine_type(mq):
+    with pytest.raises(ClientError) as exc:
+        mq.describe_broker_engine_types(EngineType="INVALID_ENGINE")
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+    assert exc.value.response["Error"]["Code"] == "BadRequestException"
+
+@pytest.mark.parametrize("invalid_max", [4, 101])
+def test_mq_describe_broker_engine_types_with_invalid_max_results(mq, invalid_max):
+    with pytest.raises(ClientError) as exc:
+        mq.describe_broker_engine_types(MaxResults=invalid_max)
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+    assert exc.value.response["Error"]["Code"] == "BadRequestException"

@@ -284,12 +284,43 @@ def _reboot_broker(broker_id: str) -> tuple:
         return _err(400, "BrokerState", "You can reboot only a broker with RUNNING status.")
     return _ok({})
 
+def _list_broker_engine_types(query_params: dict) -> tuple:
+    engine_type = query_params.get("engineType")
+    if isinstance(engine_type, list):
+        engine_type = engine_type[-1] if engine_type else None
+    if engine_type is not None:
+        engine_type = str(engine_type).upper()
+        if engine_type not in SUPPORTED_ENGINES:
+            return _err(400, "EngineType", f"Invalid engine type: '{engine_type}'.")
+
+    max_results, max_err = _parse_max_results(query_params, default=20, minimum=5, maximum=100, reject={4})
+    if max_err:
+        return max_err
+    offset, token_err = _parse_next_token(query_params)
+    if token_err:
+        return token_err
+
+    items = []
+    for eng, cfg in SUPPORTED_ENGINES.items():
+        if engine_type and eng != engine_type:
+            continue
+        items.append({"engineType": eng, "engineVersions": [{"name": v} for v in cfg["versions"]]})
+
+    page, next_token = _paginate(items, offset, max_results)
+    out = {"brokerEngineTypes": page, "maxResults": max_results}
+    if next_token is not None:
+        out["nextToken"] = next_token
+    return _ok(out)
+
 _BROKER_ID_RE = re.compile(r"^/v1/brokers/([^/]+)$")
 _BROKER_REBOOT_RE = re.compile(r"^/v1/brokers/([^/]+)/reboot$")
 
 
 async def handle_request(method: str, path: str, headers: dict, body: bytes, query_params: dict) -> tuple:
     method = method.upper()
+
+    if path == "/v1/broker-engine-types" and method == "GET":
+        return _list_broker_engine_types(query_params)
 
     if method == "POST" and path == "/v1/brokers":
         try:
