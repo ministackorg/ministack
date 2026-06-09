@@ -33,6 +33,7 @@ import re
 import time
 import uuid
 
+from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.persistence import PERSIST_STATE, load_state
 from ministack.core.responses import AccountScopedDict, get_account_id, get_region
 
@@ -588,13 +589,77 @@ def _apply_tags(arn, tags_dict):
         _tags[arn].update(tags_dict)
 
 
+def _invalid_tag_resource_arn(resource_arn):
+    return _error(400, "BadRequestException", f"Invalid resource ARN: {resource_arn}")
+
+
+def _missing_tag_resource(resource_arn):
+    return _error(404, "ResourceNotFoundException", f"Resource not found: {resource_arn}")
+
+
+def _resolve_tag_resource_arn(resource_arn):
+    try:
+        spec = parse_arn(resource_arn)
+    except ArnParseError:
+        return None, _invalid_tag_resource_arn(resource_arn)
+
+    if (
+        spec.partition != "aws"
+        or spec.service != "appconfig"
+        or spec.account_id != get_account_id()
+        or spec.region != get_region()
+    ):
+        return None, _invalid_tag_resource_arn(resource_arn)
+
+    parts = spec.resource.split("/")
+    if len(parts) == 2 and parts[0] == "application" and parts[1]:
+        if parts[1] in _applications:
+            return str(spec), None
+        return None, _missing_tag_resource(resource_arn)
+
+    if (
+        len(parts) == 4
+        and parts[0] == "application"
+        and parts[1]
+        and parts[2] == "environment"
+        and parts[3]
+    ):
+        if f"{parts[1]}/{parts[3]}" in _environments:
+            return str(spec), None
+        return None, _missing_tag_resource(resource_arn)
+
+    if (
+        len(parts) == 4
+        and parts[0] == "application"
+        and parts[1]
+        and parts[2] == "configurationprofile"
+        and parts[3]
+    ):
+        if f"{parts[1]}/{parts[3]}" in _config_profiles:
+            return str(spec), None
+        return None, _missing_tag_resource(resource_arn)
+
+    if len(parts) == 2 and parts[0] == "deploymentstrategy" and parts[1]:
+        if parts[1] in _deployment_strategies:
+            return str(spec), None
+        return None, _missing_tag_resource(resource_arn)
+
+    return None, _invalid_tag_resource_arn(resource_arn)
+
+
 def _tag_resource(resource_arn, body):
+    resource_arn, err = _resolve_tag_resource_arn(resource_arn)
+    if err:
+        return err
     tags_dict = body.get("Tags", {})
     _apply_tags(resource_arn, tags_dict)
     return _json(204, {})
 
 
 def _untag_resource(resource_arn, tag_keys):
+    resource_arn, err = _resolve_tag_resource_arn(resource_arn)
+    if err:
+        return err
     if resource_arn in _tags:
         for key in tag_keys:
             _tags[resource_arn].pop(key, None)
@@ -602,6 +667,9 @@ def _untag_resource(resource_arn, tag_keys):
 
 
 def _list_tags_for_resource(resource_arn):
+    resource_arn, err = _resolve_tag_resource_arn(resource_arn)
+    if err:
+        return err
     return _json(200, {"Tags": _tags.get(resource_arn, {})})
 
 

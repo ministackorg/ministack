@@ -3,6 +3,25 @@ import json
 import pytest
 from botocore.exceptions import ClientError
 
+from ministack.services import appconfig as appconfig_service
+
+
+def _status_and_body(response):
+    status, _, body = response
+    return status, json.loads(body) if body else {}
+
+
+def _tag_snapshot():
+    return {arn: dict(tags) for arn, tags in appconfig_service._tags.items()}
+
+
+@pytest.fixture
+def appconfig_service_state():
+    appconfig_service.reset()
+    yield
+    appconfig_service.reset()
+
+
 # ---------------------------------------------------------------------------
 # Applications
 # ---------------------------------------------------------------------------
@@ -475,6 +494,115 @@ def test_appconfig_tag_resource(appconfig_client):
     assert resp["Tags"]["team"] == "platform"
 
 
+def test_appconfig_tag_resource_accepts_supported_local_arn_shapes(appconfig_service_state):
+    status, app = _status_and_body(
+        appconfig_service._create_application({"Name": "arn-tag-app", "Tags": {"seed": "application"}})
+    )
+    assert status == 201
+    status, env = _status_and_body(
+        appconfig_service._create_environment(app["Id"], {"Name": "live", "Tags": {"seed": "environment"}})
+    )
+    assert status == 201
+    status, profile = _status_and_body(
+        appconfig_service._create_configuration_profile(
+            app["Id"],
+            {
+                "Name": "profile",
+                "LocationUri": "hosted",
+                "RetrievalRoleArn": "not-an-arn",
+                "Tags": {"seed": "configurationprofile"},
+            },
+        )
+    )
+    assert status == 201
+    assert profile["RetrievalRoleArn"] == "not-an-arn"
+    status, strategy = _status_and_body(
+        appconfig_service._create_deployment_strategy(
+            {"Name": "strategy", "ReplicateTo": "NONE", "Tags": {"seed": "deploymentstrategy"}}
+        )
+    )
+    assert status == 201
+
+    cases = {
+        appconfig_service._app_arn(app["Id"]): "application",
+        appconfig_service._env_arn(app["Id"], env["Id"]): "environment",
+        appconfig_service._profile_arn(app["Id"], profile["Id"]): "configurationprofile",
+        appconfig_service._strategy_arn(strategy["Id"]): "deploymentstrategy",
+    }
+
+    for resource_arn, seed in cases.items():
+        status, body = _status_and_body(appconfig_service._list_tags_for_resource(resource_arn))
+        assert status == 200
+        assert body["Tags"] == {"seed": seed}
+
+        status, _ = _status_and_body(appconfig_service._tag_resource(resource_arn, {"Tags": {"owner": seed}}))
+        assert status == 204
+        status, body = _status_and_body(appconfig_service._list_tags_for_resource(resource_arn))
+        assert body["Tags"]["owner"] == seed
+
+        status, _ = _status_and_body(appconfig_service._untag_resource(resource_arn, ["owner"]))
+        assert status == 204
+        status, body = _status_and_body(appconfig_service._list_tags_for_resource(resource_arn))
+        assert "owner" not in body["Tags"]
+
+
+def test_appconfig_tag_resource_rejects_invalid_arns_before_mutating_tags(appconfig_service_state):
+    status, app = _status_and_body(
+        appconfig_service._create_application({"Name": "invalid-arn-app", "Tags": {"seed": "application"}})
+    )
+    assert status == 201
+    valid_arn = appconfig_service._app_arn(app["Id"])
+    before = _tag_snapshot()
+
+    invalid_arns = [
+        "not-an-arn",
+        valid_arn.replace("arn:aws:", "arn:aws-cn:", 1),
+        valid_arn.replace(":appconfig:", ":ssm:", 1),
+        valid_arn.replace(":000000000000:", ":111111111111:", 1),
+        valid_arn.replace(":us-east-1:", ":us-west-2:", 1),
+        f"{valid_arn}/environment/env/deployment/1",
+    ]
+
+    for resource_arn in invalid_arns:
+        for response in (
+            appconfig_service._tag_resource(resource_arn, {"Tags": {"bad": "tag"}}),
+            appconfig_service._untag_resource(resource_arn, ["seed"]),
+            appconfig_service._list_tags_for_resource(resource_arn),
+        ):
+            status, body = _status_and_body(response)
+            assert status == 400
+            assert body["Code"] == "BadRequestException"
+            assert _tag_snapshot() == before
+
+
+def test_appconfig_tag_resource_rejects_missing_local_resources_before_touching_tags(appconfig_service_state):
+    status, app = _status_and_body(
+        appconfig_service._create_application({"Name": "missing-resource-app", "Tags": {"seed": "application"}})
+    )
+    assert status == 201
+
+    missing_arns = [
+        "arn:aws:appconfig:us-east-1:000000000000:application/missing-app",
+        f"arn:aws:appconfig:us-east-1:000000000000:application/{app['Id']}/environment/missing-env",
+        f"arn:aws:appconfig:us-east-1:000000000000:application/{app['Id']}/configurationprofile/missing-profile",
+        "arn:aws:appconfig:us-east-1:000000000000:deploymentstrategy/missing-strategy",
+    ]
+    for resource_arn in missing_arns:
+        appconfig_service._tags[resource_arn] = {"legacy": "keep"}
+    before = _tag_snapshot()
+
+    for resource_arn in missing_arns:
+        for response in (
+            appconfig_service._tag_resource(resource_arn, {"Tags": {"bad": "tag"}}),
+            appconfig_service._untag_resource(resource_arn, ["legacy"]),
+            appconfig_service._list_tags_for_resource(resource_arn),
+        ):
+            status, body = _status_and_body(response)
+            assert status == 404
+            assert body["Code"] == "ResourceNotFoundException"
+            assert _tag_snapshot() == before
+
+
 # ---------------------------------------------------------------------------
 # Data Plane — full end-to-end workflow
 # ---------------------------------------------------------------------------
@@ -584,7 +712,9 @@ def test_appconfig_get_nonexistent_application(appconfig_client):
     # Body must also include `__type` (was previously only `Code`/`Message`,
     # which generic JSON-error parsers miss). Verify via raw HTTP since boto3
     # surfaces only Error.Code/Message.
-    import json, urllib.request, urllib.error
+    import json
+    import urllib.error
+    import urllib.request
     req = urllib.request.Request(
         "http://localhost:4566/applications/nonexistent",
         headers={"Authorization": "AWS4-HMAC-SHA256 Credential=test/20260501/us-east-1/appconfig/aws4_request"},
