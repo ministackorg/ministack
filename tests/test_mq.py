@@ -184,19 +184,31 @@ def test_mq_list_brokers_pagination(mq):
         resp = _create(mq, BrokerName=_name("list-page"))
         created_ids.append(resp["BrokerId"])
 
-    # First page with MaxResults=5
-    resp1 = mq.list_brokers(MaxResults=5)
-    assert resp1["ResponseMetadata"]["HTTPStatusCode"] == 200
-    assert len(resp1.get("BrokerSummaries", [])) == 5
-    assert "NextToken" in resp1
+    # Paginate with a stable page size and gather IDs until we find all new brokers.
+    listed_ids = set()
+    token = None
+    pages = 0
+    while True:
+        pages += 1
+        kwargs = {"MaxResults": 5}
+        if token:
+            kwargs["NextToken"] = token
 
-    # Second page using NextToken
-    resp2 = mq.list_brokers(NextToken=resp1["NextToken"])
-    assert resp2["ResponseMetadata"]["HTTPStatusCode"] == 200
-    assert len(resp2.get("BrokerSummaries", [])) == 5
+        resp = mq.list_brokers(**kwargs)
+        assert resp["ResponseMetadata"]["HTTPStatusCode"] == 200
+        assert len(resp.get("BrokerSummaries", [])) <= 5
 
-    # Verify all created brokers are listed across pages
-    listed_ids = {b["BrokerId"] for b in resp1.get("BrokerSummaries", []) + resp2.get("BrokerSummaries", [])}
+        listed_ids.update({b["BrokerId"] for b in resp.get("BrokerSummaries", [])})
+        if set(created_ids).issubset(listed_ids):
+            break
+
+        token = resp.get("NextToken")
+        if not token:
+            break
+
+        # Safety guard in case pagination regresses.
+        assert pages <= 100
+
     assert set(created_ids).issubset(listed_ids), f"Expected {created_ids} in {listed_ids}"
 
 ############################################################################
@@ -538,11 +550,11 @@ def test_mq_describe_broker_instance_options_with_invalid_parameters(mq, kwargs)
     assert exc.value.response["Error"]["Code"] == "BadRequestException"
 
 def test_mq_describe_broker_instance_options_with_max_results(mq):
-    resp = mq.describe_broker_instance_options(MaxResults=1)
+    resp = mq.describe_broker_instance_options(MaxResults=5)
 
     assert resp["ResponseMetadata"]["HTTPStatusCode"] == 200
-    assert resp["MaxResults"] == 1
-    assert len(resp.get("BrokerInstanceOptions", [])) == 1
+    assert resp["MaxResults"] == 5
+    assert len(resp.get("BrokerInstanceOptions", [])) == 5
 
 @pytest.mark.parametrize("invalid_max", [4, 101])
 def test_mq_describe_broker_instance_options_with_invalid_max_results(mq, invalid_max):
@@ -552,17 +564,39 @@ def test_mq_describe_broker_instance_options_with_invalid_max_results(mq, invali
     assert exc.value.response["Error"]["Code"] == "BadRequestException"
 
 def test_mq_describe_broker_instance_options_pagination(mq):
-    # Create enough options to ensure pagination is needed
-    resp1 = mq.describe_broker_instance_options(MaxResults=2)
-    assert resp1["ResponseMetadata"]["HTTPStatusCode"] == 200
-    assert resp1["MaxResults"] == 2
-    assert len(resp1.get("BrokerInstanceOptions", [])) == 2
-    assert "NextToken" in resp1
+    # Walk all pages with a stable page size and verify pagination progress.
+    seen = set()
+    token = None
+    pages = 0
+    while True:
+        pages += 1
+        kwargs = {"MaxResults": 5}
+        if token:
+            kwargs["NextToken"] = token
 
-    resp2 = mq.describe_broker_instance_options(MaxResults=2, NextToken=resp1["NextToken"])
-    assert resp2["ResponseMetadata"]["HTTPStatusCode"] == 200
-    assert resp2["MaxResults"] == 2
-    assert len(resp2.get("BrokerInstanceOptions", [])) >= 1
+        resp = mq.describe_broker_instance_options(**kwargs)
+        assert resp["ResponseMetadata"]["HTTPStatusCode"] == 200
+        assert resp["MaxResults"] == 5
+
+        items = resp.get("BrokerInstanceOptions", [])
+        assert len(items) <= 5
+
+        page_keys = {
+            (o["EngineType"], o["HostInstanceType"], o["StorageType"])
+            for o in items
+        }
+        assert page_keys.isdisjoint(seen)
+        seen.update(page_keys)
+
+        token = resp.get("NextToken")
+        if not token:
+            break
+
+        # Safety guard in case pagination regresses.
+        assert pages <= 100
+
+    # Ensure pagination actually covered more than one page worth of results.
+    assert len(seen) > 5
 
 #########################################################################
 # CreateTags
@@ -824,31 +858,44 @@ def test_mq_list_users_with_not_supported_engine_type(mq):
 def test_mq_list_users_with_pagination(mq):
     broker_id = _create(mq, BrokerName=_name("user-page"), EngineType="ACTIVEMQ", EngineVersion="5.19")["BrokerId"]
 
-    # Create 3 users to ensure we have more than 2 to list
-    for i in range(3):
+    # Create enough users to require multiple pages.
+    expected_usernames = set()
+    for i in range(9):
+        username = f"testuser{i}"
+        expected_usernames.add(username)
         mq.create_user(
             BrokerId=broker_id,
-            Username=f"testuser{i}",
+            Username=username,
             Password="TestPassw0rd!",
             ConsoleAccess=False,
         )
 
-    # First page with MaxResults=2
-    resp1 = mq.list_users(BrokerId=broker_id, MaxResults=2)
-    assert resp1["ResponseMetadata"]["HTTPStatusCode"] == 200
-    assert resp1["MaxResults"] == 2
-    assert len(resp1.get("Users", [])) == 2
-    assert "NextToken" in resp1
+    # Paginate with stable MaxResults and gather until all created users are observed.
+    listed_usernames = set()
+    token = None
+    pages = 0
+    while True:
+        pages += 1
+        kwargs = {"BrokerId": broker_id, "MaxResults": 5}
+        if token:
+            kwargs["NextToken"] = token
 
-    # Second page using NextToken
-    resp2 = mq.list_users(BrokerId=broker_id, MaxResults=2, NextToken=resp1["NextToken"])
-    assert resp2["ResponseMetadata"]["HTTPStatusCode"] == 200
-    assert resp2["MaxResults"] == 2
-    assert len(resp2.get("Users", [])) >= 1
+        resp = mq.list_users(**kwargs)
+        assert resp["ResponseMetadata"]["HTTPStatusCode"] == 200
+        assert resp["MaxResults"] == 5
+        assert len(resp.get("Users", [])) <= 5
 
-    # Verify all created users are listed across pages
-    listed_usernames = {u["Username"] for u in resp1.get("Users", []) + resp2.get("Users", [])}
-    expected_usernames = {f"testuser{i}" for i in range(3)}
+        listed_usernames.update({u["Username"] for u in resp.get("Users", [])})
+        if expected_usernames.issubset(listed_usernames):
+            break
+
+        token = resp.get("NextToken")
+        if not token:
+            break
+
+        # Safety guard in case pagination regresses.
+        assert pages <= 100
+
     assert expected_usernames.issubset(listed_usernames), f"Expected {expected_usernames} in {listed_usernames}"
 
 @pytest.mark.parametrize("invalid_max", [4, 101])

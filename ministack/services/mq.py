@@ -22,6 +22,11 @@ SUPPORTED_ENGINES = {
         "storage_types": ["EBS"],
         "deployment_modes": ["SINGLE_INSTANCE", "CLUSTER_MULTI_AZ"],
         "versions": ["4.2", "3.13"],
+        # output of
+        # aws mq describe-broker-instance-options \
+        #   --engine-type RABBITMQ \
+        #   --query 'BrokerInstanceOptions[].HostInstanceType' \
+        #   --output json
         "host_instance_types": [
             "mq.m5.2xlarge", "mq.m5.4xlarge", "mq.m5.large", "mq.m5.xlarge",
             "mq.m7g.12xlarge", "mq.m7g.16xlarge", "mq.m7g.2xlarge", "mq.m7g.4xlarge",
@@ -32,6 +37,11 @@ SUPPORTED_ENGINES = {
         "storage_types": ["EBS", "EFS"],
         "deployment_modes": ["SINGLE_INSTANCE", "ACTIVE_STANDBY_MULTI_AZ"],
         "versions": ["5.19", "5.18"],
+        # output of
+        # aws mq describe-broker-instance-options \
+        #   --engine-type ACTIVEMQ \
+        #   --query 'BrokerInstanceOptions[].HostInstanceType' \
+        #   --output json
         "host_instance_types": [
             "mq.m5.2xlarge", "mq.m5.4xlarge", "mq.m5.large", "mq.m5.xlarge", "mq.t3.micro"
         ],
@@ -53,20 +63,20 @@ _HTTP_TO_EXCEPTION = {
 
 def get_state() -> dict:
     return {
-        "brokers": copy.deepcopy(_brokers._data),
-        "name_index": copy.deepcopy(_name_index._data),
-        "tags": copy.deepcopy(_tags._data),
-        "users": copy.deepcopy(_users._data),
+        "brokers": copy.deepcopy(_brokers),
+        "name_index": copy.deepcopy(_name_index),
+        "tags": copy.deepcopy(_tags),
+        "users": copy.deepcopy(_users),
     }
 
 
 def restore_state(data: dict) -> None:
     if not data:
         return
-    _brokers._data.update(data.get("brokers", {}))
-    _name_index._data.update(data.get("name_index", {}))
-    _tags._data.update(data.get("tags", {}))
-    _users._data.update(data.get("users", {}))
+    _brokers.update(data.get("brokers", {}))
+    _name_index.update(data.get("name_index", {}))
+    _tags.update(data.get("tags", {}))
+    _users.update(data.get("users", {}))
 
 
 try:
@@ -113,24 +123,24 @@ def _valid_storage_types(engine_type: str | None) -> set[str]:
     return out
 
 
-def _parse_max_results(query_params: dict, *, default: int, minimum: int, maximum: int = 100, reject: set[int] | None = None):
+def _parse_max_results(query_params: dict, *, default: int = 20):
     raw = query_params.get("maxResults")
-    if raw is None:
+    if not raw:
         return default, None
     if isinstance(raw, list):
         raw = raw[-1] if raw else None
     try:
         value = int(raw)
     except (TypeError, ValueError):
-        return None, _err(400, "MaxResults", f"maxResults must be an integer from {minimum} to {maximum}.")
-    if value < minimum or value > maximum or (reject and value in reject):
-        return None, _err(400, "MaxResults", f"maxResults must be an integer from {minimum} to {maximum}.")
+        return None, _err(400, "MaxResults", "maxResults must be an integer from 5 to 100.")
+    if value < 5 or value > 100:
+        return None, _err(400, "MaxResults", "maxResults must be an integer from 5 to 100.")
     return value, None
 
 
 def _parse_next_token(query_params: dict):
     raw = query_params.get("nextToken")
-    if raw is None:
+    if not raw:
         return 0, None
     if isinstance(raw, list):
         raw = raw[-1] if raw else None
@@ -155,7 +165,7 @@ def _resource_exists(resource_arn: str) -> bool:
 
 def _get_broker_or_404(broker_id: str):
     broker = _brokers.get(broker_id)
-    if broker is None:
+    if not broker:
         return None, _err(404, "BrokerId", f"Broker '{broker_id}' does not exist.")
     return broker, None
 
@@ -226,7 +236,7 @@ def _create_broker(body: dict) -> tuple:
 
 
 def _list_brokers(query_params: dict) -> tuple:
-    max_results, max_err = _parse_max_results(query_params, default=5, minimum=5, maximum=100, reject={4})
+    max_results, max_err = _parse_max_results(query_params)
     if max_err:
         return max_err
     offset, token_err = _parse_next_token(query_params)
@@ -257,7 +267,7 @@ def _list_brokers(query_params: dict) -> tuple:
 
     page, next_token = _paginate(brokers_list, offset, max_results)
     out = {"brokerSummaries": page}
-    if next_token is not None:
+    if next_token:
         out["nextToken"] = next_token
     return _ok(out)
 
@@ -333,7 +343,7 @@ def _list_broker_engine_types(query_params: dict) -> tuple:
         if engine_type not in SUPPORTED_ENGINES:
             return _err(400, "EngineType", f"Invalid engine type: '{engine_type}'.")
 
-    max_results, max_err = _parse_max_results(query_params, default=20, minimum=5, maximum=100, reject={4})
+    max_results, max_err = _parse_max_results(query_params)
     if max_err:
         return max_err
     offset, token_err = _parse_next_token(query_params)
@@ -348,12 +358,12 @@ def _list_broker_engine_types(query_params: dict) -> tuple:
 
     page, next_token = _paginate(items, offset, max_results)
     out = {"brokerEngineTypes": page, "maxResults": max_results}
-    if next_token is not None:
+    if next_token:
         out["nextToken"] = next_token
     return _ok(out)
 
 def _list_broker_instance_options(query_params: dict) -> tuple:
-    max_results, max_err = _parse_max_results(query_params, default=20, minimum=1, maximum=100, reject={4})
+    max_results, max_err = _parse_max_results(query_params)
     if max_err:
         return max_err
     offset, token_err = _parse_next_token(query_params)
@@ -403,7 +413,7 @@ def _list_broker_instance_options(query_params: dict) -> tuple:
 
     page, next_token = _paginate(filtered, offset, max_results)
     out = {"brokerInstanceOptions": page, "maxResults": max_results}
-    if next_token is not None:
+    if next_token:
         out["nextToken"] = next_token
     return _ok(out)
 
@@ -488,7 +498,7 @@ def _list_users(broker_id: str, query_params: dict) -> tuple:
     if engine_err:
         return engine_err
 
-    max_results, max_err = _parse_max_results(query_params, default=20, minimum=1, maximum=100, reject={4})
+    max_results, max_err = _parse_max_results(query_params)
     if max_err:
         return max_err
     offset, token_err = _parse_next_token(query_params)
@@ -515,7 +525,7 @@ def _list_users(broker_id: str, query_params: dict) -> tuple:
 
     page, next_token = _paginate(users_list, offset, max_results)
     out = {"brokerId": broker_id, "maxResults": max_results, "users": page}
-    if next_token is not None:
+    if next_token:
         out["nextToken"] = next_token
     return _ok(out)
 
@@ -530,7 +540,7 @@ def _update_user(broker_id: str, username: str, body: dict) -> tuple:
 
     users_map = _users.setdefault(broker_id, {})
     user = users_map.get(username)
-    if user is None:
+    if not user:
         return _err(404, "Username", f"User '{username}' does not exist.")
 
     if "password" in body:
@@ -658,7 +668,7 @@ async def handle_request(method: str, path: str, headers: dict, body: bytes, que
 
 
 def reset() -> None:
-    _brokers._data.clear()
-    _name_index._data.clear()
-    _tags._data.clear()
-    _users._data.clear()
+    _brokers.clear()
+    _name_index.clear()
+    _tags.clear()
+    _users.clear()
