@@ -1680,3 +1680,68 @@ def test_eventbridge_dispatch_to_fifo_sqs_stamps_message_group_id(eb, sqs):
     assert msgs, "FIFO queue received no messages from EventBridge"
     attrs = msgs[0].get("Attributes", {})
     assert attrs.get("MessageGroupId") == "orders"
+
+
+# ── anything-but with nested content filters (#849) ──────────────────
+
+
+def _eb_setup_anybut_rule(eb, sqs, suffix, pattern_value):
+    """Helper: create bus + queue + rule with a given anything-but pattern."""
+    bus = f"qa-eb-anybut-{suffix}-bus"
+    eb.create_event_bus(Name=bus)
+    q_url = sqs.create_queue(QueueName=f"qa-eb-anybut-{suffix}-q")["QueueUrl"]
+    q_arn = sqs.get_queue_attributes(
+        QueueUrl=q_url, AttributeNames=["QueueArn"])["Attributes"]["QueueArn"]
+    eb.put_rule(
+        Name=f"qa-eb-anybut-{suffix}-rule",
+        EventBusName=bus,
+        EventPattern=json.dumps({
+            "source": ["myapp"],
+            "detail": {"id": [{"anything-but": pattern_value}]},
+        }),
+        State="ENABLED",
+    )
+    eb.put_targets(
+        Rule=f"qa-eb-anybut-{suffix}-rule",
+        EventBusName=bus,
+        Targets=[{"Id": "t1", "Arn": q_arn}],
+    )
+    return bus, q_url
+
+
+def _eb_send(eb, bus, id_value):
+    eb.put_events(Entries=[{
+        "Source": "myapp", "DetailType": "t",
+        "Detail": json.dumps({"id": id_value}),
+        "EventBusName": bus,
+    }])
+
+
+def test_eventbridge_anything_but_prefix_excludes_matching(eb, sqs):
+    bus, q_url = _eb_setup_anybut_rule(eb, sqs, "prefix", {"prefix": "TEST-"})
+    _eb_send(eb, bus, "PROD-42")   # does not start with TEST- → should deliver
+    _eb_send(eb, bus, "TEST-99")   # excluded by prefix → should NOT deliver
+    msgs = sqs.receive_message(
+        QueueUrl=q_url, MaxNumberOfMessages=10, WaitTimeSeconds=1)["Messages"]
+    ids = [json.loads(m["Body"])["detail"]["id"] for m in msgs]
+    assert ids == ["PROD-42"]
+
+
+def test_eventbridge_anything_but_suffix_excludes_matching(eb, sqs):
+    bus, q_url = _eb_setup_anybut_rule(eb, sqs, "suffix", {"suffix": "-OLD"})
+    _eb_send(eb, bus, "ITEM-NEW")   # no -OLD suffix → deliver
+    _eb_send(eb, bus, "ITEM-OLD")   # excluded by suffix → skip
+    msgs = sqs.receive_message(
+        QueueUrl=q_url, MaxNumberOfMessages=10, WaitTimeSeconds=1)["Messages"]
+    ids = [json.loads(m["Body"])["detail"]["id"] for m in msgs]
+    assert ids == ["ITEM-NEW"]
+
+
+def test_eventbridge_anything_but_wildcard_excludes_matching(eb, sqs):
+    bus, q_url = _eb_setup_anybut_rule(eb, sqs, "wildcard", {"wildcard": "*-test-*"})
+    _eb_send(eb, bus, "prod-app-1")     # no -test- → deliver
+    _eb_send(eb, bus, "abc-test-xyz")   # matches wildcard → skip
+    msgs = sqs.receive_message(
+        QueueUrl=q_url, MaxNumberOfMessages=10, WaitTimeSeconds=1)["Messages"]
+    ids = [json.loads(m["Body"])["detail"]["id"] for m in msgs]
+    assert ids == ["prod-app-1"]

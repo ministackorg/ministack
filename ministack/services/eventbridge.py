@@ -871,6 +871,13 @@ def _matches_content_filter(value, filter_rule):
         return isinstance(value, str) and value.endswith(filter_rule["suffix"])
     if "anything-but" in filter_rule:
         excluded = filter_rule["anything-but"]
+        # Per AWS EventBridge docs, anything-but supports either a literal
+        # / list-of-literals OR a single nested content matcher (prefix,
+        # suffix, wildcard, equals-ignore-case). Mixing literals and nested
+        # matchers in a list is explicitly rejected by AWS at rule
+        # creation, so we match the strict form only.
+        if isinstance(excluded, dict):
+            return not _matches_content_filter(value, excluded)
         if isinstance(excluded, list):
             return value not in excluded
         return value != excluded
