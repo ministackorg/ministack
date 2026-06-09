@@ -373,3 +373,72 @@ def test_mq_describe_broker_instance_options_pagination(mq):
     assert resp2["ResponseMetadata"]["HTTPStatusCode"] == 200
     assert resp2["MaxResults"] == 2
     assert len(resp2.get("BrokerInstanceOptions", [])) >= 1
+
+#########################################################################
+# CreateTags
+#########################################################################
+
+def test_mq_create_tags(mq):
+    broker = _create(mq, BrokerName=_name("tags"))
+    arn = broker["BrokerArn"]
+
+    create_resp = mq.create_tags(ResourceArn=arn, Tags={"env": "dev", "team": "core"})
+    assert create_resp["ResponseMetadata"]["HTTPStatusCode"] == 204
+
+def test_mq_create_tags_with_non_existent_arn(mq):
+    with pytest.raises(ClientError) as exc:
+        mq.create_tags(ResourceArn="arn:aws:mq:invalid-arn", Tags={"env": "dev"})
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 404
+    assert exc.value.response["Error"]["Code"] == "NotFoundException"
+
+##########################################################################
+# ListTags
+##########################################################################
+
+def test_mq_list_tags(mq):
+    broker = _create(mq, BrokerName=_name("tags"))
+    arn = broker["BrokerArn"]
+
+    mq.create_tags(ResourceArn=arn, Tags={"env": "dev", "team": "core"})
+
+    list_resp = mq.list_tags(ResourceArn=arn)
+    assert list_resp["ResponseMetadata"]["HTTPStatusCode"] == 200
+    assert list_resp["Tags"]["env"] == "dev"
+    assert list_resp["Tags"]["team"] == "core"
+
+def test_mq_list_tags_with_no_tags(mq):
+    broker = _create(mq, BrokerName=_name("tags"))
+    arn = broker["BrokerArn"]
+
+    list_resp = mq.list_tags(ResourceArn=arn)
+    assert list_resp["ResponseMetadata"]["HTTPStatusCode"] == 200
+    assert list_resp["Tags"] == {}
+
+def test_mq_list_tags_with_non_existent_arn(mq):
+    with pytest.raises(ClientError) as exc:
+        mq.list_tags(ResourceArn="arn:aws:mq:invalid-arn")
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 404
+    assert exc.value.response["Error"]["Code"] == "NotFoundException"
+
+###########################################################################
+# DeleteTags
+###########################################################################
+
+def test_mq_delete_tags(mq):
+    broker = _create(mq, BrokerName=_name("tags"))
+    arn = broker["BrokerArn"]
+
+    mq.create_tags(ResourceArn=arn, Tags={"env": "dev", "team": "core"})
+
+    del_resp = mq.delete_tags(ResourceArn=arn, TagKeys=["env"])
+    assert del_resp["ResponseMetadata"]["HTTPStatusCode"] == 204
+
+    list_resp = mq.list_tags(ResourceArn=arn)
+    assert "env" not in list_resp["Tags"]
+    assert list_resp["Tags"]["team"] == "core"
+
+def test_mq_delete_tags_with_non_existent_arn(mq):
+    with pytest.raises(ClientError) as exc:
+        mq.delete_tags(ResourceArn="arn:aws:mq:invalid-arn", TagKeys=["env"])
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 404
+    assert exc.value.response["Error"]["Code"] == "NotFoundException"

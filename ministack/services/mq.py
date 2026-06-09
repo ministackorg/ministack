@@ -5,6 +5,7 @@ import json
 import logging
 import re
 import time
+from urllib.parse import unquote
 
 from ministack.core.persistence import load_state
 from ministack.core.responses import AccountScopedDict, get_account_id, get_region, new_uuid
@@ -13,6 +14,7 @@ logger = logging.getLogger("mq")
 
 _brokers: AccountScopedDict = AccountScopedDict()
 _name_index: AccountScopedDict = AccountScopedDict()
+_tags: AccountScopedDict = AccountScopedDict()
 
 SUPPORTED_ENGINES = {
     "RABBITMQ": {
@@ -72,6 +74,8 @@ except Exception:
 def _ok(data: dict) -> tuple:
     return 200, dict(_JSON_CT), json.dumps(data, ensure_ascii=False).encode("utf-8")
 
+def _no_content() -> tuple:
+    return 204, {}, b""
 
 def _err(http_status: int, error_attribute: str, message: str) -> tuple:
     exc_type = _HTTP_TO_EXCEPTION.get(http_status, "BadRequestException")
@@ -137,6 +141,10 @@ def _paginate(items: list, offset: int, max_results: int):
     page = items[offset : offset + max_results]
     next_token = str(offset + max_results) if (offset + max_results) < len(items) else None
     return page, next_token
+
+
+def _resource_exists(resource_arn: str) -> bool:
+    return any(b.get("brokerArn") == resource_arn for b in _brokers.values())
 
 
 def _get_broker_or_404(broker_id: str):
@@ -379,8 +387,38 @@ def _list_broker_instance_options(query_params: dict) -> tuple:
         out["nextToken"] = next_token
     return _ok(out)
 
+def _list_tags(resource_arn: str) -> tuple:
+    if not _resource_exists(resource_arn):
+        return _err(404, "ResourceArn", f"Resource '{resource_arn}' does not exist.")
+    return _ok({"tags": dict(_tags.get(resource_arn, {}))})
+
+
+def _create_tags(resource_arn: str, body: dict) -> tuple:
+    if not _resource_exists(resource_arn):
+        return _err(404, "ResourceArn", f"Resource '{resource_arn}' does not exist.")
+    tags = body.get("tags") if isinstance(body, dict) else None
+    if not isinstance(tags, dict):
+        return _err(400, "Tags", "tags must be an object.")
+    _tags.setdefault(resource_arn, {}).update({str(k): str(v) for k, v in tags.items()})
+    return _no_content()
+
+
+def _delete_tags(resource_arn: str, query_params: dict) -> tuple:
+    if not _resource_exists(resource_arn):
+        return _err(404, "ResourceArn", f"Resource '{resource_arn}' does not exist.")
+    tag_keys = query_params.get("tagKeys")
+    if tag_keys is None:
+        return _err(400, "TagKeys", "tagKeys is required.")
+    if isinstance(tag_keys, str):
+        tag_keys = [tag_keys]
+    tags = _tags.setdefault(resource_arn, {})
+    for key in tag_keys:
+        tags.pop(str(key), None)
+    return _no_content()
+
 _BROKER_ID_RE = re.compile(r"^/v1/brokers/([^/]+)$")
 _BROKER_REBOOT_RE = re.compile(r"^/v1/brokers/([^/]+)/reboot$")
+_TAGS_RE = re.compile(r"^/v1/tags/(.+)$")
 
 
 async def handle_request(method: str, path: str, headers: dict, body: bytes, query_params: dict) -> tuple:
@@ -391,6 +429,20 @@ async def handle_request(method: str, path: str, headers: dict, body: bytes, que
 
     if path == "/v1/broker-engine-types" and method == "GET":
         return _list_broker_engine_types(query_params)
+
+    m = _TAGS_RE.match(path)
+    if m:
+        resource_arn = unquote(m.group(1))
+        if method == "GET":
+            return _list_tags(resource_arn)
+        if method == "POST":
+            try:
+                payload = json.loads(body) if body else {}
+            except json.JSONDecodeError:
+                return _err(400, "RequestBody", "Invalid JSON in request body.")
+            return _create_tags(resource_arn, payload)
+        if method == "DELETE":
+            return _delete_tags(resource_arn, query_params)
 
     if method == "POST" and path == "/v1/brokers":
         try:
@@ -426,3 +478,4 @@ async def handle_request(method: str, path: str, headers: dict, body: bytes, que
 def reset() -> None:
     _brokers._data.clear()
     _name_index._data.clear()
+    _tags._data.clear()
