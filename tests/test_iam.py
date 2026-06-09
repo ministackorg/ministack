@@ -755,3 +755,264 @@ def test_iam_service_last_accessed_job(iam):
         assert isinstance(get_resp["ServicesLastAccessed"], list)
     finally:
         iam.delete_user(UserName="sla-test-user")
+# ── SAML providers + ListOpenIDConnectProviders ──────────────────────
+
+
+def test_iam_saml_provider_crud(iam):
+    name = "saml-test-provider"
+    # botocore requires ≥ 1000 chars for SAMLMetadataDocument (client-side validation)
+    metadata = "<EntityDescriptor>" + "x" * 990 + "</EntityDescriptor>"
+    resp = iam.create_saml_provider(Name=name, SAMLMetadataDocument=metadata)
+    arn = resp["SAMLProviderArn"]
+    assert f":saml-provider/{name}" in arn
+
+    providers = iam.list_saml_providers()["SAMLProviderList"]
+    assert any(p["Arn"] == arn for p in providers)
+
+    get_resp = iam.get_saml_provider(SAMLProviderArn=arn)
+    assert get_resp["SAMLMetadataDocument"] == metadata
+
+    iam.delete_saml_provider(SAMLProviderArn=arn)
+    with pytest.raises(iam.exceptions.NoSuchEntityException):
+        iam.get_saml_provider(SAMLProviderArn=arn)
+
+
+def test_iam_list_oidc_providers(iam):
+    resp = iam.create_open_id_connect_provider(
+        Url="https://oidc-list-test.example.com",
+        ClientIDList=["aud"],
+        ThumbprintList=["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa00"],
+    )
+    arn = resp["OpenIDConnectProviderArn"]
+    try:
+        providers = iam.list_open_id_connect_providers()["OpenIDConnectProviderList"]
+        assert any(p["Arn"] == arn for p in providers)
+    finally:
+        iam.delete_open_id_connect_provider(OpenIDConnectProviderArn=arn)
+# ── GetAccountAuthorizationDetails ───────────────────────────────────
+
+
+def test_iam_account_authorization_details_all(iam):
+    policy_doc = json.dumps({"Version": "2012-10-17", "Statement": []})
+    assume_doc = json.dumps({"Version": "2012-10-17", "Statement": []})
+
+    pol = iam.create_policy(PolicyName="aad-test-policy", PolicyDocument=policy_doc)
+    pol_arn = pol["Policy"]["Arn"]
+    iam.create_user(UserName="aad-test-user")
+    iam.attach_user_policy(UserName="aad-test-user", PolicyArn=pol_arn)
+    iam.create_group(GroupName="aad-test-group")
+    iam.add_user_to_group(UserName="aad-test-user", GroupName="aad-test-group")
+    iam.create_role(RoleName="aad-test-role", AssumeRolePolicyDocument=assume_doc)
+    try:
+        resp = iam.get_account_authorization_details()
+
+        user_names = [u["UserName"] for u in resp.get("UserDetailList", [])]
+        assert "aad-test-user" in user_names
+
+        role_names = [r["RoleName"] for r in resp.get("RoleDetailList", [])]
+        assert "aad-test-role" in role_names
+
+        policy_arns = [p["Arn"] for p in resp.get("Policies", [])]
+        assert pol_arn in policy_arns
+    finally:
+        iam.detach_user_policy(UserName="aad-test-user", PolicyArn=pol_arn)
+        iam.remove_user_from_group(UserName="aad-test-user", GroupName="aad-test-group")
+        iam.delete_user(UserName="aad-test-user")
+        iam.delete_group(GroupName="aad-test-group")
+        iam.delete_role(RoleName="aad-test-role")
+        iam.delete_policy(PolicyArn=pol_arn)
+
+
+def test_iam_account_authorization_details_filter(iam):
+    assume_doc = json.dumps({"Version": "2012-10-17", "Statement": []})
+    iam.create_user(UserName="aad-filter-user")
+    iam.create_role(RoleName="aad-filter-role", AssumeRolePolicyDocument=assume_doc)
+    try:
+        resp = iam.get_account_authorization_details(Filter=["Role"])
+        # UserDetailList should be empty when filtering for Role only
+        assert resp.get("UserDetailList", []) == []
+        role_names = [r["RoleName"] for r in resp.get("RoleDetailList", [])]
+        assert "aad-filter-role" in role_names
+    finally:
+        iam.delete_user(UserName="aad-filter-user")
+        iam.delete_role(RoleName="aad-filter-role")
+# ── Virtual MFA devices ───────────────────────────────────────────────
+
+
+def test_iam_create_virtual_mfa(iam):
+    device_name = "mfa-device-create-test"
+    resp = iam.create_virtual_mfa_device(VirtualMFADeviceName=device_name)
+    dev = resp["VirtualMFADevice"]
+    assert dev["SerialNumber"].endswith(f":mfa/{device_name}")
+    assert len(dev["Base32StringSeed"]) > 0
+    iam.delete_virtual_mfa_device(SerialNumber=dev["SerialNumber"])
+
+
+def test_iam_enable_and_list_mfa(iam):
+    user_name = "mfa-user-enable-list"
+    device_name = "mfa-device-enable-list"
+    iam.create_user(UserName=user_name)
+    dev_resp = iam.create_virtual_mfa_device(VirtualMFADeviceName=device_name)
+    serial = dev_resp["VirtualMFADevice"]["SerialNumber"]
+    try:
+        iam.enable_mfa_device(
+            UserName=user_name,
+            SerialNumber=serial,
+            AuthenticationCode1="123456",
+            AuthenticationCode2="234567",
+        )
+        resp = iam.list_mfa_devices(UserName=user_name)
+        devices = resp["MFADevices"]
+        assert any(d["SerialNumber"] == serial for d in devices)
+        assert all("EnableDate" in d for d in devices if d["SerialNumber"] == serial)
+    finally:
+        try:
+            iam.deactivate_mfa_device(UserName=user_name, SerialNumber=serial)
+        except Exception:
+            pass
+        try:
+            iam.delete_virtual_mfa_device(SerialNumber=serial)
+        except Exception:
+            pass
+        iam.delete_user(UserName=user_name)
+
+
+def test_iam_list_virtual_mfa_assignment_filter(iam):
+    user_name = "mfa-user-filter"
+    iam.create_user(UserName=user_name)
+    d1 = iam.create_virtual_mfa_device(VirtualMFADeviceName="mfa-filter-assigned")["VirtualMFADevice"]["SerialNumber"]
+    d2 = iam.create_virtual_mfa_device(VirtualMFADeviceName="mfa-filter-unassigned")["VirtualMFADevice"]["SerialNumber"]
+    try:
+        iam.enable_mfa_device(UserName=user_name, SerialNumber=d1,
+                              AuthenticationCode1="111111", AuthenticationCode2="222222")
+
+        # default (Assigned) returns only assigned
+        assigned_serials = {d["SerialNumber"] for d in
+                            iam.list_virtual_mfa_devices()["VirtualMFADevices"]}
+        assert d1 in assigned_serials
+        assert d2 not in assigned_serials
+
+        # Unassigned returns only free device
+        unassigned_serials = {d["SerialNumber"] for d in
+                              iam.list_virtual_mfa_devices(AssignmentStatus="Unassigned")["VirtualMFADevices"]}
+        assert d2 in unassigned_serials
+        assert d1 not in unassigned_serials
+
+        # Any returns both
+        any_serials = {d["SerialNumber"] for d in
+                       iam.list_virtual_mfa_devices(AssignmentStatus="Any")["VirtualMFADevices"]}
+        assert d1 in any_serials
+        assert d2 in any_serials
+    finally:
+        for serial, uname in [(d1, user_name), (d2, None)]:
+            if uname:
+                try:
+                    iam.deactivate_mfa_device(UserName=uname, SerialNumber=serial)
+                except Exception:
+                    pass
+            try:
+                iam.delete_virtual_mfa_device(SerialNumber=serial)
+            except Exception:
+                pass
+        iam.delete_user(UserName=user_name)
+
+
+def test_iam_deactivate_mfa(iam):
+    user_name = "mfa-user-deactivate"
+    device_name = "mfa-device-deactivate"
+    iam.create_user(UserName=user_name)
+    serial = iam.create_virtual_mfa_device(VirtualMFADeviceName=device_name)["VirtualMFADevice"]["SerialNumber"]
+    try:
+        iam.enable_mfa_device(UserName=user_name, SerialNumber=serial,
+                              AuthenticationCode1="111111", AuthenticationCode2="222222")
+        iam.deactivate_mfa_device(UserName=user_name, SerialNumber=serial)
+
+        # no devices for user after deactivate
+        devices = iam.list_mfa_devices(UserName=user_name)["MFADevices"]
+        assert not any(d["SerialNumber"] == serial for d in devices)
+
+        # device should appear in Unassigned list
+        unassigned = {d["SerialNumber"] for d in
+                      iam.list_virtual_mfa_devices(AssignmentStatus="Unassigned")["VirtualMFADevices"]}
+        assert serial in unassigned
+    finally:
+        try:
+            iam.delete_virtual_mfa_device(SerialNumber=serial)
+        except Exception:
+            pass
+        iam.delete_user(UserName=user_name)
+
+
+def test_iam_delete_assigned_mfa_conflict(iam):
+    user_name = "mfa-user-conflict"
+    device_name = "mfa-device-conflict"
+    iam.create_user(UserName=user_name)
+    serial = iam.create_virtual_mfa_device(VirtualMFADeviceName=device_name)["VirtualMFADevice"]["SerialNumber"]
+    try:
+        iam.enable_mfa_device(UserName=user_name, SerialNumber=serial,
+                              AuthenticationCode1="111111", AuthenticationCode2="222222")
+        with pytest.raises(iam.exceptions.DeleteConflictException):
+            iam.delete_virtual_mfa_device(SerialNumber=serial)
+    finally:
+        try:
+            iam.deactivate_mfa_device(UserName=user_name, SerialNumber=serial)
+        except Exception:
+            pass
+        try:
+            iam.delete_virtual_mfa_device(SerialNumber=serial)
+        except Exception:
+            pass
+        iam.delete_user(UserName=user_name)
+# ── Login profiles ────────────────────────────────────────────────────
+
+
+def test_iam_create_get_login_profile(iam):
+    name = "lp-user-create-get"
+    iam.create_user(UserName=name)
+    try:
+        resp = iam.create_login_profile(UserName=name, Password="Test1234!", PasswordResetRequired=True)
+        profile = resp["LoginProfile"]
+        assert profile["UserName"] == name
+        assert "CreateDate" in profile
+        assert profile["PasswordResetRequired"] is True
+
+        resp2 = iam.get_login_profile(UserName=name)
+        assert resp2["LoginProfile"]["UserName"] == name
+        assert "CreateDate" in resp2["LoginProfile"]
+    finally:
+        try:
+            iam.delete_login_profile(UserName=name)
+        except Exception:
+            pass
+        iam.delete_user(UserName=name)
+
+
+def test_iam_get_login_profile_absent(iam):
+    name = "lp-user-absent"
+    iam.create_user(UserName=name)
+    try:
+        with pytest.raises(iam.exceptions.NoSuchEntityException):
+            iam.get_login_profile(UserName=name)
+    finally:
+        iam.delete_user(UserName=name)
+
+
+def test_iam_create_login_profile_no_user(iam):
+    with pytest.raises(iam.exceptions.NoSuchEntityException):
+        iam.create_login_profile(UserName="lp-ghost-user-xyz", Password="Test1234!")
+
+
+def test_iam_delete_login_profile(iam):
+    name = "lp-user-delete"
+    iam.create_user(UserName=name)
+    try:
+        iam.create_login_profile(UserName=name, Password="Test1234!")
+        iam.delete_login_profile(UserName=name)
+        with pytest.raises(iam.exceptions.NoSuchEntityException):
+            iam.get_login_profile(UserName=name)
+    finally:
+        try:
+            iam.delete_login_profile(UserName=name)
+        except Exception:
+            pass
+        iam.delete_user(UserName=name)

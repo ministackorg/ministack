@@ -13,6 +13,18 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 - **IAM — `GenerateServiceLastAccessedDetails`, `GetServiceLastAccessedDetails`** — Access Advisor generate→get job handshake. Returns a UUID `JobId`. `GetServiceLastAccessedDetails` returns `JobStatus=COMPLETED` and an empty `ServicesLastAccessed` list (no CloudTrail data).
 
 ---
+- **IAM — `CreateSAMLProvider`, `GetSAMLProvider`, `ListSAMLProviders`, `UpdateSAMLProvider`, `DeleteSAMLProvider`** — SAML IdP CRUD. Accepts any non-empty `SAMLMetadataDocument` (real AWS requires valid XML ≥1000 chars; that validation is seed-side). `GetSAMLProvider` returns `SAMLMetadataDocument`, `CreateDate`, `ValidUntil`, and `Tags`. Enables agents to enumerate federated IdPs cross-referenced with role trust policies.
+- **IAM — `ListOpenIDConnectProviders`** — returns `{Arn}` entries for all OIDC providers in the account (create/get/delete existed previously). Completes the OIDC provider enumeration surface.
+
+---
+- **IAM — `GetAccountAuthorizationDetails`** — the one-shot identity graph. Returns `UserDetailList` (inline policies, attached managed policies, group memberships, tags), `GroupDetailList`, `RoleDetailList` (inline policies, attached managed policies, instance profiles, tags, assume-role document url-encoded), and `Policies` (customer-managed, with url-encoded version documents). `Filter.member.N` honored: `User`, `Group`, `Role`, `LocalManagedPolicy`. `IsTruncated=false`; pagination optional.
+
+---
+- **IAM — `CreateVirtualMFADevice`, `EnableMFADevice`, `DeactivateMFADevice`, `ResyncMFADevice`, `ListMFADevices`, `ListVirtualMFADevices`, `DeleteVirtualMFADevice`** — full virtual MFA device lifecycle. `CreateVirtualMFADevice` returns `SerialNumber` (ARN form `arn:aws:iam::<acct>:mfa/<name>`) plus `Base32StringSeed` and `QRCodePNG` blobs (base64-encoded). `EnableMFADevice` accepts any TOTP codes (seed-side lenience). `ListVirtualMFADevices` supports `AssignmentStatus` filter (`Assigned` / `Unassigned` / `Any`; default `Assigned`). `DeleteVirtualMFADevice` returns `DeleteConflict` (409) for assigned devices.
+- **IAM — `CreateLoginProfile`, `GetLoginProfile`, `UpdateLoginProfile`, `DeleteLoginProfile`** — models whether an IAM user has a console password (the signal that a user is a human). `CreateLoginProfile` stores `UserName`, `CreateDate`, and `PasswordResetRequired` without persisting the password value (seed-side). `GetLoginProfile` returns `NoSuchEntity` (404) when no profile exists. `UpdateLoginProfile` updates `PasswordResetRequired`. `DeleteLoginProfile` removes the profile. All four operations match the real AWS request/response shapes exactly so identity-discovery agents can distinguish humans from service accounts using `get-login-profile`.
+
+---
+
 ## [1.3.59] — 2026-06-05
 
 ### Added

@@ -27,6 +27,7 @@ IAM actions:
   SimulatePrincipalPolicy, SimulateCustomPolicy.
 """
 
+import base64
 import copy
 import json
 import logging
@@ -34,6 +35,7 @@ import os
 import time
 from urllib.parse import parse_qs
 from urllib.parse import quote as _url_quote
+from xml.sax.saxutils import escape as _xml_escape
 
 from ministack.core.responses import AccountScopedDict, get_account_id, get_region, json_response, new_uuid
 
@@ -56,6 +58,9 @@ _user_inline_policies = AccountScopedDict()
 _oidc_providers = AccountScopedDict()
 _service_linked_role_deletion_tasks = AccountScopedDict()
 _sla_jobs = AccountScopedDict()
+_saml_providers = AccountScopedDict()
+_mfa_devices = AccountScopedDict()
+_login_profiles = AccountScopedDict()
 
 
 # -- AWS-managed policies ---------------------------------------------------
@@ -283,6 +288,9 @@ def get_state():
         "user_inline_policies": copy.deepcopy(_user_inline_policies),
         "aws_managed_attachment_counts": copy.deepcopy(_aws_managed_attachment_counts),
         "sla_jobs": copy.deepcopy(_sla_jobs),
+        "saml_providers": copy.deepcopy(_saml_providers),
+        "mfa_devices": copy.deepcopy(_mfa_devices),
+        "login_profiles": copy.deepcopy(_login_profiles),
     }
 
 
@@ -299,6 +307,9 @@ def restore_state(data):
         _user_inline_policies.update(data.get("user_inline_policies", {}))
         _aws_managed_attachment_counts.update(data.get("aws_managed_attachment_counts", {}))
         _sla_jobs.update(data.get("sla_jobs", {}))
+        _saml_providers.update(data.get("saml_providers", {}))
+        _mfa_devices.update(data.get("mfa_devices", {}))
+        _login_profiles.update(data.get("login_profiles", {}))
 
 
 try:
@@ -1529,6 +1540,370 @@ def _get_service_linked_role_deletion_status(p):
                 ns="iam")
 
 
+# -------------------- GetAccountAuthorizationDetails --------------------
+
+
+def _get_account_authorization_details(p):
+    # Extract Filter.member.N list; empty = all
+    filters = set()
+    idx = 1
+    while True:
+        f = _p(p, f"Filter.member.{idx}")
+        if not f:
+            break
+        filters.add(f)
+        idx += 1
+    include_all = not filters
+
+    # ---- UserDetailList ----
+    user_detail_xml = ""
+    if include_all or "User" in filters:
+        for name, user in _users.items():
+            # Inline user policies
+            upols = _user_inline_policies.get(name) or {}
+            inline_xml = "".join(
+                f"<member>"
+                f"<PolicyName>{pn}</PolicyName>"
+                f"<PolicyDocument>{_url_quote(pd, safe='')}</PolicyDocument>"
+                f"</member>"
+                for pn, pd in upols.items()
+            )
+            # Attached managed policies
+            attached_xml = ""
+            for arn in user.get("AttachedPolicies", []):
+                pol = _lookup_policy(arn)
+                if pol:
+                    attached_xml += (f"<member>"
+                                     f"<PolicyName>{pol['PolicyName']}</PolicyName>"
+                                     f"<PolicyArn>{arn}</PolicyArn>"
+                                     f"</member>")
+            # Groups the user belongs to
+            group_xml = "".join(
+                f"<member>{g['GroupName']}</member>"
+                for g in _groups.values()
+                if name in g.get("Users", [])
+            )
+            # Tags
+            tags_xml = "".join(
+                f"<member><Key>{t['Key']}</Key><Value>{t['Value']}</Value></member>"
+                for t in user.get("Tags", [])
+            )
+            user_detail_xml += (
+                f"<member>"
+                f"<UserName>{user['UserName']}</UserName>"
+                f"<UserId>{user['UserId']}</UserId>"
+                f"<Arn>{user['Arn']}</Arn>"
+                f"<Path>{user['Path']}</Path>"
+                f"<CreateDate>{user['CreateDate']}</CreateDate>"
+                f"<UserPolicyList>{inline_xml}</UserPolicyList>"
+                f"<GroupList>{group_xml}</GroupList>"
+                f"<AttachedManagedPolicies>{attached_xml}</AttachedManagedPolicies>"
+                f"<Tags>{tags_xml}</Tags>"
+                f"</member>"
+            )
+
+    # ---- GroupDetailList ----
+    group_detail_xml = ""
+    if include_all or "Group" in filters:
+        for name, g in _groups.items():
+            group_detail_xml += (
+                f"<member>"
+                f"<GroupName>{g['GroupName']}</GroupName>"
+                f"<GroupId>{g['GroupId']}</GroupId>"
+                f"<Arn>{g['Arn']}</Arn>"
+                f"<Path>{g['Path']}</Path>"
+                f"<CreateDate>{g['CreateDate']}</CreateDate>"
+                f"<GroupPolicyList></GroupPolicyList>"
+                f"<AttachedManagedPolicies></AttachedManagedPolicies>"
+                f"</member>"
+            )
+
+    # ---- RoleDetailList ----
+    role_detail_xml = ""
+    if include_all or "Role" in filters:
+        for name, role in _roles.items():
+            assume_doc = _url_quote(role.get("AssumeRolePolicyDocument") or "{}", safe="")
+            # Inline role policies
+            inline_xml = "".join(
+                f"<member>"
+                f"<PolicyName>{pn}</PolicyName>"
+                f"<PolicyDocument>{_url_quote(pd, safe='')}</PolicyDocument>"
+                f"</member>"
+                for pn, pd in (role.get("InlinePolicies") or {}).items()
+            )
+            # Attached managed policies
+            attached_xml = ""
+            for arn in role.get("AttachedPolicies", []):
+                pol = _lookup_policy(arn)
+                if pol:
+                    attached_xml += (f"<member>"
+                                     f"<PolicyName>{pol['PolicyName']}</PolicyName>"
+                                     f"<PolicyArn>{arn}</PolicyArn>"
+                                     f"</member>")
+            # Instance profiles
+            ip_xml = "".join(
+                f"<member>{_instance_profile_xml(ipn)}</member>"
+                for ipn, ip in _instance_profiles.items()
+                if name in ip.get("Roles", [])
+            )
+            # Tags
+            tags_xml = "".join(
+                f"<member><Key>{t['Key']}</Key><Value>{t['Value']}</Value></member>"
+                for t in role.get("Tags", [])
+            )
+            role_detail_xml += (
+                f"<member>"
+                f"<RoleName>{role['RoleName']}</RoleName>"
+                f"<RoleId>{role['RoleId']}</RoleId>"
+                f"<Arn>{role['Arn']}</Arn>"
+                f"<Path>{role['Path']}</Path>"
+                f"<CreateDate>{role['CreateDate']}</CreateDate>"
+                f"<AssumeRolePolicyDocument>{assume_doc}</AssumeRolePolicyDocument>"
+                f"<RolePolicyList>{inline_xml}</RolePolicyList>"
+                f"<AttachedManagedPolicies>{attached_xml}</AttachedManagedPolicies>"
+                f"<InstanceProfileList>{ip_xml}</InstanceProfileList>"
+                f"<Tags>{tags_xml}</Tags>"
+                f"</member>"
+            )
+
+    # ---- Policies (customer-managed) ----
+    policies_xml = ""
+    if include_all or "LocalManagedPolicy" in filters:
+        for arn, pol in _policies.items():
+            default_vid = pol.get("DefaultVersionId", "v1")
+            versions_xml = "".join(
+                f"<member>"
+                f"<Document>{_url_quote(v.get('Document') or '{}', safe='')}</Document>"
+                f"<VersionId>{v['VersionId']}</VersionId>"
+                f"<IsDefaultVersion>{'true' if v.get('IsDefaultVersion') else 'false'}</IsDefaultVersion>"
+                f"</member>"
+                for v in pol.get("Versions", {}).values()
+            )
+            policies_xml += (
+                f"<member>"
+                f"<PolicyName>{pol['PolicyName']}</PolicyName>"
+                f"<PolicyId>{pol['PolicyId']}</PolicyId>"
+                f"<Arn>{arn}</Arn>"
+                f"<Path>{pol.get('Path', '/')}</Path>"
+                f"<DefaultVersionId>{default_vid}</DefaultVersionId>"
+                f"<PolicyVersionList>{versions_xml}</PolicyVersionList>"
+                f"</member>"
+            )
+
+    return _xml(200, "GetAccountAuthorizationDetailsResponse",
+                f"<GetAccountAuthorizationDetailsResult>"
+                f"<UserDetailList>{user_detail_xml}</UserDetailList>"
+                f"<GroupDetailList>{group_detail_xml}</GroupDetailList>"
+                f"<RoleDetailList>{role_detail_xml}</RoleDetailList>"
+                f"<Policies>{policies_xml}</Policies>"
+                f"<IsTruncated>false</IsTruncated>"
+                f"</GetAccountAuthorizationDetailsResult>",
+                ns="iam")
+
+
+# -------------------- Virtual MFA devices --------------------
+
+
+def _virtual_mfa_xml(serial, include_user=True):
+    dev = _mfa_devices[serial]
+    seed_b64 = base64.b64encode(dev["Base32StringSeed"].encode()).decode()
+    # QRCode: tiny placeholder bytes, base64-encoded (blob field)
+    qr_b64 = base64.b64encode(b"QR").decode()
+    inner = (f"<SerialNumber>{dev['SerialNumber']}</SerialNumber>"
+             f"<Base32StringSeed>{seed_b64}</Base32StringSeed>"
+             f"<QRCodePNG>{qr_b64}</QRCodePNG>")
+    if include_user and dev.get("User"):
+        user_name = dev["User"]
+        if user_name in _users:
+            inner += f"<User>{_user_xml(user_name)}</User>"
+        inner += f"<EnableDate>{dev['EnableDate']}</EnableDate>"
+    return inner
+
+
+def _create_virtual_mfa_device(p):
+    name = _p(p, "VirtualMFADeviceName")
+    path = _p(p, "Path") or "/"
+    acct = get_account_id()
+    if path == "/":
+        serial = f"arn:aws:iam::{acct}:mfa/{name}"
+    else:
+        serial = f"arn:aws:iam::{acct}:mfa{path}{name}"
+    if serial in _mfa_devices:
+        return _error(409, "EntityAlreadyExists",
+                      f"MFA device {serial} already exists.", ns="iam")
+    seed = new_uuid().replace("-", "")[:32].upper()
+    _mfa_devices[serial] = {
+        "SerialNumber": serial,
+        "Path": path,
+        "CreateDate": _now(),
+        "User": None,
+        "EnableDate": None,
+        "Base32StringSeed": seed,
+        "Tags": _extract_tags(p),
+    }
+    return _xml(200, "CreateVirtualMFADeviceResponse",
+                f"<CreateVirtualMFADeviceResult>"
+                f"<VirtualMFADevice>{_virtual_mfa_xml(serial, include_user=False)}</VirtualMFADevice>"
+                f"</CreateVirtualMFADeviceResult>",
+                ns="iam")
+
+
+def _enable_mfa_device(p):
+    user_name = _p(p, "UserName")
+    serial = _p(p, "SerialNumber")
+    if user_name not in _users:
+        return _error(404, "NoSuchEntity",
+                      f"The user with name {user_name} cannot be found.", ns="iam")
+    if serial not in _mfa_devices:
+        return _error(404, "NoSuchEntity",
+                      f"MFA device {serial} not found.", ns="iam")
+    dev = _mfa_devices[serial]
+    if dev["User"] is not None:
+        return _error(409, "EntityAlreadyExists",
+                      f"MFA device {serial} is already assigned.", ns="iam")
+    dev["User"] = user_name
+    dev["EnableDate"] = _now()
+    return _xml(200, "EnableMFADeviceResponse", "", ns="iam")
+
+
+def _deactivate_mfa_device(p):
+    user_name = _p(p, "UserName")
+    serial = _p(p, "SerialNumber")
+    dev = _mfa_devices.get(serial)
+    if dev is None or dev.get("User") != user_name:
+        return _error(404, "NoSuchEntity",
+                      f"MFA device {serial} is not assigned to user {user_name}.", ns="iam")
+    dev["User"] = None
+    dev["EnableDate"] = None
+    return _xml(200, "DeactivateMFADeviceResponse", "", ns="iam")
+
+
+def _resync_mfa_device(p):
+    user_name = _p(p, "UserName")
+    serial = _p(p, "SerialNumber")
+    dev = _mfa_devices.get(serial)
+    if dev is None or dev.get("User") != user_name:
+        return _error(404, "NoSuchEntity",
+                      f"MFA device {serial} not found or not assigned to {user_name}.", ns="iam")
+    return _xml(200, "ResyncMFADeviceResponse", "", ns="iam")
+
+
+def _list_mfa_devices(p):
+    user_name = _p(p, "UserName")
+    members = ""
+    for serial, dev in _mfa_devices.items():
+        if dev.get("User") == user_name:
+            members += (f"<member>"
+                        f"<UserName>{dev['User']}</UserName>"
+                        f"<SerialNumber>{dev['SerialNumber']}</SerialNumber>"
+                        f"<EnableDate>{dev['EnableDate']}</EnableDate>"
+                        f"</member>")
+    return _xml(200, "ListMFADevicesResponse",
+                f"<ListMFADevicesResult>"
+                f"<MFADevices>{members}</MFADevices>"
+                f"<IsTruncated>false</IsTruncated>"
+                f"</ListMFADevicesResult>",
+                ns="iam")
+
+
+def _list_virtual_mfa_devices(p):
+    status = _p(p, "AssignmentStatus") or "Assigned"
+    members = ""
+    for serial, dev in _mfa_devices.items():
+        is_assigned = dev.get("User") is not None
+        if status == "Assigned" and not is_assigned:
+            continue
+        if status == "Unassigned" and is_assigned:
+            continue
+        member_xml = f"<SerialNumber>{dev['SerialNumber']}</SerialNumber>"
+        if is_assigned:
+            user_name = dev["User"]
+            if user_name in _users:
+                member_xml += f"<User>{_user_xml(user_name)}</User>"
+            member_xml += f"<EnableDate>{dev['EnableDate']}</EnableDate>"
+        members += f"<member>{member_xml}</member>"
+    return _xml(200, "ListVirtualMFADevicesResponse",
+                f"<ListVirtualMFADevicesResult>"
+                f"<VirtualMFADevices>{members}</VirtualMFADevices>"
+                f"<IsTruncated>false</IsTruncated>"
+                f"</ListVirtualMFADevicesResult>",
+                ns="iam")
+
+
+def _delete_virtual_mfa_device(p):
+    serial = _p(p, "SerialNumber")
+    dev = _mfa_devices.get(serial)
+    if dev is None:
+        return _error(404, "NoSuchEntity",
+                      f"MFA device {serial} not found.", ns="iam")
+    if dev.get("User") is not None:
+        return _error(409, "DeleteConflict",
+                      f"MFA device {serial} is still assigned to a user.", ns="iam")
+    del _mfa_devices[serial]
+    return _xml(200, "DeleteVirtualMFADeviceResponse", "", ns="iam")
+# -------------------- Login profiles --------------------
+
+
+def _login_profile_xml(name):
+    lp = _login_profiles[name]
+    pwr = "true" if lp.get("PasswordResetRequired") else "false"
+    return (f"<UserName>{lp['UserName']}</UserName>"
+            f"<CreateDate>{lp['CreateDate']}</CreateDate>"
+            f"<PasswordResetRequired>{pwr}</PasswordResetRequired>")
+
+
+def _create_login_profile(p):
+    name = _p(p, "UserName")
+    if name not in _users:
+        return _error(404, "NoSuchEntity",
+                      f"The user with name {name} cannot be found.", ns="iam")
+    if name in _login_profiles:
+        return _error(409, "EntityAlreadyExists",
+                      f"Login profile for user {name} already exists.", ns="iam")
+    _login_profiles[name] = {
+        "UserName": name,
+        "CreateDate": _now(),
+        "PasswordResetRequired": _p(p, "PasswordResetRequired", "false").lower() == "true",
+    }
+    return _xml(200, "CreateLoginProfileResponse",
+                f"<CreateLoginProfileResult>"
+                f"<LoginProfile>{_login_profile_xml(name)}</LoginProfile>"
+                f"</CreateLoginProfileResult>",
+                ns="iam")
+
+
+def _get_login_profile(p):
+    name = _p(p, "UserName")
+    if name not in _login_profiles:
+        return _error(404, "NoSuchEntity",
+                      f"Login profile for user {name} cannot be found.", ns="iam")
+    return _xml(200, "GetLoginProfileResponse",
+                f"<GetLoginProfileResult>"
+                f"<LoginProfile>{_login_profile_xml(name)}</LoginProfile>"
+                f"</GetLoginProfileResult>",
+                ns="iam")
+
+
+def _update_login_profile(p):
+    name = _p(p, "UserName")
+    if name not in _login_profiles:
+        return _error(404, "NoSuchEntity",
+                      f"Login profile for user {name} cannot be found.", ns="iam")
+    pwr = _p(p, "PasswordResetRequired", "")
+    if pwr:
+        _login_profiles[name]["PasswordResetRequired"] = pwr.lower() == "true"
+    return _xml(200, "UpdateLoginProfileResponse", "", ns="iam")
+
+
+def _delete_login_profile(p):
+    name = _p(p, "UserName")
+    if name not in _login_profiles:
+        return _error(404, "NoSuchEntity",
+                      f"Login profile for user {name} cannot be found.", ns="iam")
+    del _login_profiles[name]
+    return _xml(200, "DeleteLoginProfileResponse", "", ns="iam")
+
+
 # -------------------- OIDC providers --------------------
 
 def _create_oidc_provider(p):
@@ -1634,6 +2009,103 @@ def _get_service_last_accessed_details(p):
                 f"<IsTruncated>false</IsTruncated>"
                 f"</GetServiceLastAccessedDetailsResult>",
                 ns="iam")
+
+
+def _list_oidc_providers(p):
+    members = "".join(
+        f"<member><Arn>{arn}</Arn></member>"
+        for arn in _oidc_providers
+    )
+    return _xml(200, "ListOpenIDConnectProvidersResponse",
+                f"<ListOpenIDConnectProvidersResult>"
+                f"<OpenIDConnectProviderList>{members}</OpenIDConnectProviderList>"
+                f"</ListOpenIDConnectProvidersResult>",
+                ns="iam")
+
+
+# -------------------- SAML providers --------------------
+
+
+def _create_saml_provider(p):
+    name = _p(p, "Name")
+    acct = get_account_id()
+    arn = f"arn:aws:iam::{acct}:saml-provider/{name}"
+    if arn in _saml_providers:
+        return _error(409, "EntityAlreadyExists",
+                      f"SAML provider {arn} already exists.", ns="iam")
+    metadata = _p(p, "SAMLMetadataDocument")
+    _saml_providers[arn] = {
+        "Arn": arn,
+        "Name": name,
+        "SAMLMetadataDocument": metadata,
+        "CreateDate": _now(),
+        "ValidUntil": _future(365 * 24 * 3600),
+        "Tags": _extract_tags(p),
+    }
+    return _xml(200, "CreateSAMLProviderResponse",
+                f"<CreateSAMLProviderResult>"
+                f"<SAMLProviderArn>{arn}</SAMLProviderArn>"
+                f"</CreateSAMLProviderResult>",
+                ns="iam")
+
+
+def _get_saml_provider(p):
+    arn = _p(p, "SAMLProviderArn")
+    prov = _saml_providers.get(arn)
+    if not prov:
+        return _error(404, "NoSuchEntity",
+                      f"SAML provider {arn} not found.", ns="iam")
+    tag_members = "".join(
+        f"<member><Key>{t['Key']}</Key><Value>{t['Value']}</Value></member>"
+        for t in prov.get("Tags", [])
+    )
+    return _xml(200, "GetSAMLProviderResponse",
+                f"<GetSAMLProviderResult>"
+                f"<SAMLMetadataDocument>{_xml_escape(prov['SAMLMetadataDocument'])}</SAMLMetadataDocument>"
+                f"<CreateDate>{prov['CreateDate']}</CreateDate>"
+                f"<ValidUntil>{prov['ValidUntil']}</ValidUntil>"
+                f"<Tags>{tag_members}</Tags>"
+                f"</GetSAMLProviderResult>",
+                ns="iam")
+
+
+def _list_saml_providers(p):
+    members = "".join(
+        f"<member>"
+        f"<Arn>{prov['Arn']}</Arn>"
+        f"<ValidUntil>{prov['ValidUntil']}</ValidUntil>"
+        f"<CreateDate>{prov['CreateDate']}</CreateDate>"
+        f"</member>"
+        for prov in _saml_providers.values()
+    )
+    return _xml(200, "ListSAMLProvidersResponse",
+                f"<ListSAMLProvidersResult>"
+                f"<SAMLProviderList>{members}</SAMLProviderList>"
+                f"</ListSAMLProvidersResult>",
+                ns="iam")
+
+
+def _update_saml_provider(p):
+    arn = _p(p, "SAMLProviderArn")
+    prov = _saml_providers.get(arn)
+    if not prov:
+        return _error(404, "NoSuchEntity",
+                      f"SAML provider {arn} not found.", ns="iam")
+    prov["SAMLMetadataDocument"] = _p(p, "SAMLMetadataDocument")
+    return _xml(200, "UpdateSAMLProviderResponse",
+                f"<UpdateSAMLProviderResult>"
+                f"<SAMLProviderArn>{arn}</SAMLProviderArn>"
+                f"</UpdateSAMLProviderResult>",
+                ns="iam")
+
+
+def _delete_saml_provider(p):
+    arn = _p(p, "SAMLProviderArn")
+    if arn not in _saml_providers:
+        return _error(404, "NoSuchEntity",
+                      f"SAML provider {arn} not found.", ns="iam")
+    del _saml_providers[arn]
+    return _xml(200, "DeleteSAMLProviderResponse", "", ns="iam")
 
 
 # -------------------- Tags: policies --------------------
@@ -1949,6 +2421,24 @@ _IAM_HANDLERS = {
     "DeleteOpenIDConnectProvider": _delete_oidc_provider,
     "GenerateServiceLastAccessedDetails": _generate_service_last_accessed_details,
     "GetServiceLastAccessedDetails": _get_service_last_accessed_details,
+    "CreateSAMLProvider": _create_saml_provider,
+    "GetSAMLProvider": _get_saml_provider,
+    "ListSAMLProviders": _list_saml_providers,
+    "UpdateSAMLProvider": _update_saml_provider,
+    "DeleteSAMLProvider": _delete_saml_provider,
+    "ListOpenIDConnectProviders": _list_oidc_providers,
+    "GetAccountAuthorizationDetails": _get_account_authorization_details,
+    "CreateVirtualMFADevice": _create_virtual_mfa_device,
+    "EnableMFADevice": _enable_mfa_device,
+    "DeactivateMFADevice": _deactivate_mfa_device,
+    "ResyncMFADevice": _resync_mfa_device,
+    "ListMFADevices": _list_mfa_devices,
+    "ListVirtualMFADevices": _list_virtual_mfa_devices,
+    "DeleteVirtualMFADevice": _delete_virtual_mfa_device,
+    "CreateLoginProfile": _create_login_profile,
+    "GetLoginProfile": _get_login_profile,
+    "UpdateLoginProfile": _update_login_profile,
+    "DeleteLoginProfile": _delete_login_profile,
     "TagPolicy": _tag_policy,
     "UntagPolicy": _untag_policy,
     "ListPolicyTags": _list_policy_tags,
@@ -1966,6 +2456,9 @@ def reset():
     _oidc_providers.clear()
     _service_linked_role_deletion_tasks.clear()
     _sla_jobs.clear()
+    _saml_providers.clear()
+    _mfa_devices.clear()
+    _login_profiles.clear()
     # Re-seed AWS-managed policies. They're not customer state, so a
     # reset call should restore the canonical set rather than leave the
     # store empty. Per-account attachment counters are session state
