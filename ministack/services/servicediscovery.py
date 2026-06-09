@@ -10,6 +10,7 @@ import os
 import time
 import xml.etree.ElementTree as ET
 
+from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.responses import (
     AccountScopedDict,
     error_response_json,
@@ -135,6 +136,44 @@ def _namespace_arn(ns_id: str) -> str:
 
 def _service_arn(svc_id: str) -> str:
     return f"arn:aws:servicediscovery:{get_region()}:{get_account_id()}:service/{svc_id}"
+
+
+def _invalid_resource_arn(arn):
+    return error_response_json("InvalidInput", f"Invalid ResourceARN: {arn}", 400)
+
+
+def _resolve_taggable_resource_arn(arn):
+    if not arn:
+        return None, error_response_json("InvalidInput", "ResourceARN is required", 400)
+    try:
+        spec = parse_arn(arn)
+    except ArnParseError:
+        return None, _invalid_resource_arn(arn)
+    if (
+        spec.partition != "aws"
+        or spec.service != "servicediscovery"
+        or spec.account_id != get_account_id()
+        or spec.region != get_region()
+    ):
+        return None, _invalid_resource_arn(arn)
+
+    resource_type, separator, resource_id = spec.resource.partition("/")
+    if separator != "/" or not resource_id or "/" in resource_id:
+        return None, _invalid_resource_arn(arn)
+
+    if resource_type == "namespace":
+        namespace = _namespaces.get(resource_id)
+        if not namespace or namespace.get("Arn") != arn:
+            return None, error_response_json("NamespaceNotFound", "Namespace not found", 404)
+        return arn, None
+
+    if resource_type == "service":
+        service = _services.get(resource_id)
+        if not service or service.get("Arn") != arn:
+            return None, error_response_json("ServiceNotFound", "Service not found", 404)
+        return arn, None
+
+    return None, _invalid_resource_arn(arn)
 
 
 def _create_operation(op_type: str, targets=None):
@@ -621,9 +660,9 @@ def _update_service(data):
 
 
 def _tag_resource(data):
-    arn = data.get("ResourceARN")
-    if not arn:
-        return error_response_json("InvalidInput", "ResourceARN is required", 400)
+    arn, err = _resolve_taggable_resource_arn(data.get("ResourceARN"))
+    if err:
+        return err
 
     incoming = data.get("Tags", [])
     existing = {t.get("Key"): t for t in _resource_tags.get(arn, []) if t.get("Key")}
@@ -636,9 +675,9 @@ def _tag_resource(data):
 
 
 def _untag_resource(data):
-    arn = data.get("ResourceARN")
-    if not arn:
-        return error_response_json("InvalidInput", "ResourceARN is required", 400)
+    arn, err = _resolve_taggable_resource_arn(data.get("ResourceARN"))
+    if err:
+        return err
 
     keys = set(data.get("TagKeys", []))
     if arn in _resource_tags:
@@ -647,7 +686,7 @@ def _untag_resource(data):
 
 
 def _list_tags_for_resource(data):
-    arn = data.get("ResourceARN")
-    if not arn:
-        return error_response_json("InvalidInput", "ResourceARN is required", 400)
+    arn, err = _resolve_taggable_resource_arn(data.get("ResourceARN"))
+    if err:
+        return err
     return json_response({"Tags": _resource_tags.get(arn, [])})
