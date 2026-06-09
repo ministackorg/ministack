@@ -219,6 +219,8 @@ def _create_broker(body: dict) -> tuple:
         "brokerInstances": [{"consoleURL": "https://localhost:15671", "endpoints": ["amqps://localhost:5671"], "ipAddress": "127.0.0.1"}],
     }
     _name_index[broker_name] = broker_id
+    _tags[broker_arn] = dict(body.get("tags") or {})
+    _users[broker_id] = {}
 
     return _ok({"brokerId": broker_id, "brokerArn": broker_arn})
 
@@ -266,6 +268,7 @@ def _describe_broker(broker_id: str) -> tuple:
         return err
     out = copy.deepcopy(broker)
     out.pop("_createdAt", None)
+    out["tags"] = dict(_tags.get(broker["brokerArn"], {}))
     return _ok(out)
 
 
@@ -275,6 +278,8 @@ def _delete_broker(broker_id: str) -> tuple:
         return err
     del _brokers[broker_id]
     _name_index.pop(broker["brokerName"], None)
+    _tags.pop(broker["brokerArn"], None)
+    _users.pop(broker_id, None)
     return _ok({"brokerId": broker_id})
 
 
@@ -543,6 +548,30 @@ def _update_user(broker_id: str, username: str, body: dict) -> tuple:
 
     return _ok({})
 
+def _describe_user(broker_id: str, username: str) -> tuple:
+    broker, err = _get_broker_or_404(broker_id)
+    if err:
+        return err
+
+    engine_err = _ensure_activemq_broker(broker)
+    if engine_err:
+        return engine_err
+
+    users_map = _users.setdefault(broker_id, {})
+    user = users_map.get(username)
+    if user is None:
+        return _err(404, "Username", f"User '{username}' does not exist.")
+
+    out = {
+        "brokerId": broker_id,
+        "consoleAccess": bool(user.get("consoleAccess", False)),
+        "groups": list(user.get("groups", [])),
+        "pending": {},
+        "username": user["username"],
+        "replicationUser": bool(user.get("replicationUser", False)),
+    }
+    return _ok(out)
+
 _BROKER_ID_RE = re.compile(r"^/v1/brokers/([^/]+)$")
 _BROKER_REBOOT_RE = re.compile(r"^/v1/brokers/([^/]+)/reboot$")
 _BROKER_USERS_RE = re.compile(r"^/v1/brokers/([^/]+)/users$")
@@ -594,6 +623,8 @@ async def handle_request(method: str, path: str, headers: dict, body: bytes, que
             except json.JSONDecodeError:
                 return _err(400, "RequestBody", "Invalid JSON in request body.")
             return _update_user(broker_id, username, payload)
+        if method == "GET":
+            return _describe_user(broker_id, username)
 
     if method == "POST" and path == "/v1/brokers":
         try:

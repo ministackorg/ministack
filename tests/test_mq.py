@@ -76,6 +76,68 @@ def test_mq_create_broker_with_invalid_parameters(
     assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
     assert exc.value.response["Error"]["Code"] == "BadRequestException"
 
+def test_mq_create_broker_initializes_empty_tags(mq):
+    """Test that _tags[broker_arn] = {} when no tags provided (Line 222)."""
+    name = _name("tags-init-empty")
+    resp = mq.create_broker(
+        BrokerName=name,
+        EngineType="RABBITMQ",
+        EngineVersion="3.13",
+        HostInstanceType="mq.m5.large",
+        PubliclyAccessible=False,
+        DeploymentMode="SINGLE_INSTANCE",
+    )
+    broker_arn = resp["BrokerArn"]
+
+    # Verify tags dict is initialized and empty
+    list_resp = mq.list_tags(ResourceArn=broker_arn)
+    assert list_resp["Tags"] == {}
+
+def test_mq_create_broker_initializes_empty_users(mq):
+    """Test that _users[broker_id] = {} on creation (Line 223)."""
+    broker_id = _create(mq, BrokerName=_name("users-init"), EngineType="ACTIVEMQ", EngineVersion="5.19")["BrokerId"]
+
+    # Verify users dict is initialized and empty
+    list_resp = mq.list_users(BrokerId=broker_id)
+    assert list_resp.get("Users", []) == []
+    assert list_resp["MaxResults"] == 20
+
+def test_mq_create_broker_with_tags_initializes_tags(mq):
+    """Test that _tags[broker_arn] stores provided tags (Line 222)."""
+    name = _name("tags-init-with")
+    resp = mq.create_broker(
+        BrokerName=name,
+        EngineType="RABBITMQ",
+        EngineVersion="3.13",
+        HostInstanceType="mq.m5.large",
+        PubliclyAccessible=False,
+        DeploymentMode="SINGLE_INSTANCE",
+        Tags={"environment": "test", "team": "platform"},
+    )
+    broker_arn = resp["BrokerArn"]
+
+    # Verify tags are persisted
+    list_resp = mq.list_tags(ResourceArn=broker_arn)
+    assert list_resp["Tags"]["environment"] == "test"
+    assert list_resp["Tags"]["team"] == "platform"
+
+def test_mq_create_broker_with_empty_tags_dict(mq):
+    """Test that empty tags dict is handled correctly (Line 222)."""
+    name = _name("tags-init-empty-dict")
+    resp = mq.create_broker(
+        BrokerName=name,
+        EngineType="RABBITMQ",
+        EngineVersion="3.13",
+        HostInstanceType="mq.m5.large",
+        PubliclyAccessible=False,
+        DeploymentMode="SINGLE_INSTANCE",
+        Tags={},
+    )
+    broker_arn = resp["BrokerArn"]
+
+    list_resp = mq.list_tags(ResourceArn=broker_arn)
+    assert list_resp["Tags"] == {}
+
 ############################################################################
 # ListBrokers
 ############################################################################
@@ -160,6 +222,62 @@ def test_mq_describe_broker_with_non_existent_id(mq):
     assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 404
     assert exc.value.response["Error"]["Code"] == "NotFoundException"
 
+def test_mq_describe_broker_includes_tags(mq):
+    """Test that DescribeBroker returns tags from _tags dict (Line 271)."""
+    name = _name("describe-tags")
+    create_resp = mq.create_broker(
+        BrokerName=name,
+        EngineType="RABBITMQ",
+        EngineVersion="3.13",
+        HostInstanceType="mq.m5.large",
+        PubliclyAccessible=False,
+        DeploymentMode="SINGLE_INSTANCE",
+        Tags={"env": "staging", "owner": "devops"},
+    )
+    broker_id = create_resp["BrokerId"]
+
+    desc = mq.describe_broker(BrokerId=broker_id)
+    assert desc["ResponseMetadata"]["HTTPStatusCode"] == 200
+    assert "Tags" in desc
+    assert desc["Tags"]["env"] == "staging"
+    assert desc["Tags"]["owner"] == "devops"
+
+def test_mq_describe_broker_includes_empty_tags(mq):
+    """Test that DescribeBroker returns empty tags object when none exist (Line 271)."""
+    name = _name("describe-tags-empty")
+    create_resp = mq.create_broker(
+        BrokerName=name,
+        EngineType="RABBITMQ",
+        EngineVersion="3.13",
+        HostInstanceType="mq.m5.large",
+        PubliclyAccessible=False,
+        DeploymentMode="SINGLE_INSTANCE",
+    )
+    broker_id = create_resp["BrokerId"]
+
+    desc = mq.describe_broker(BrokerId=broker_id)
+    assert "Tags" in desc
+    assert desc["Tags"] == {}
+    assert isinstance(desc["Tags"], dict)
+
+def test_mq_describe_broker_tags_reflect_create_tags_additions(mq):
+    """Test that DescribeBroker reflects tags added via CreateTags (Line 271)."""
+    name = _name("describe-tags-added")
+    create_resp = _create(mq, BrokerName=name)
+    broker_id = create_resp["BrokerId"]
+    arn = create_resp["BrokerArn"]
+
+    # Initially no tags
+    desc1 = mq.describe_broker(BrokerId=broker_id)
+    assert desc1["Tags"] == {}
+
+    # Add tags
+    mq.create_tags(ResourceArn=arn, Tags={"added": "after"})
+
+    # Verify DescribeBroker now shows the tags
+    desc2 = mq.describe_broker(BrokerId=broker_id)
+    assert desc2["Tags"]["added"] == "after"
+
 ############################################################################
 # DeleteBrokers
 ############################################################################
@@ -177,6 +295,78 @@ def test_mq_delete_broker_with_non_existent_id(mq):
         mq.delete_broker(BrokerId="invalid-id")
     assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 404
     assert exc.value.response["Error"]["Code"] == "NotFoundException"
+
+def test_mq_delete_broker_removes_tags(mq):
+    """Test that DeleteBroker removes entry from _tags dict (Line 281)."""
+    name = _name("delete-tags-cleanup")
+    create_resp = mq.create_broker(
+        BrokerName=name,
+        EngineType="RABBITMQ",
+        EngineVersion="3.13",
+        HostInstanceType="mq.m5.large",
+        PubliclyAccessible=False,
+        DeploymentMode="SINGLE_INSTANCE",
+        Tags={"cleanup": "test"},
+    )
+    broker_id = create_resp["BrokerId"]
+    broker_arn = create_resp["BrokerArn"]
+
+    # Verify tags exist before delete
+    list_resp = mq.list_tags(ResourceArn=broker_arn)
+    assert list_resp["Tags"]["cleanup"] == "test"
+
+    # Delete broker
+    mq.delete_broker(BrokerId=broker_id)
+
+    # Verify tags are cleaned up - ListTags should fail with 404
+    with pytest.raises(ClientError) as exc:
+        mq.list_tags(ResourceArn=broker_arn)
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 404
+
+def test_mq_delete_broker_removes_users(mq):
+    """Test that DeleteBroker removes entry from _users dict (Line 282)."""
+    broker_id = _create(mq, BrokerName=_name("delete-users-cleanup"), EngineType="ACTIVEMQ", EngineVersion="5.19")["BrokerId"]
+
+    # Create a user
+    mq.create_user(
+        BrokerId=broker_id,
+        Username="cleanup_user",
+        Password="CleanupPassw0rd!",
+        ConsoleAccess=False,
+    )
+
+    # Verify user exists
+    list_resp = mq.list_users(BrokerId=broker_id)
+    usernames = {u["Username"] for u in list_resp.get("Users", [])}
+    assert "cleanup_user" in usernames
+
+    # Delete broker
+    mq.delete_broker(BrokerId=broker_id)
+
+    # Verify users are cleaned up - ListUsers should fail with 404
+    with pytest.raises(ClientError) as exc:
+        mq.list_users(BrokerId=broker_id)
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 404
+
+def test_mq_delete_broker_clears_name_index(mq):
+    """Test that DeleteBroker cleans up _name_index secondary index."""
+    name = _name("delete-name-index")
+    broker_id = _create(mq, BrokerName=name)["BrokerId"]
+
+    # Delete broker
+    mq.delete_broker(BrokerId=broker_id)
+
+    # Verify name index is cleared - creating broker with same name should succeed
+    resp = mq.create_broker(
+        BrokerName=name,
+        EngineType="RABBITMQ",
+        EngineVersion="3.13",
+        HostInstanceType="mq.m5.large",
+        PubliclyAccessible=False,
+        DeploymentMode="SINGLE_INSTANCE",
+    )
+    assert resp["ResponseMetadata"]["HTTPStatusCode"] == 200
+    assert resp["BrokerId"] != broker_id
 
 ############################################################################
 # UpdateBroker
@@ -420,6 +610,21 @@ def test_mq_list_tags_with_non_existent_arn(mq):
     assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 404
     assert exc.value.response["Error"]["Code"] == "NotFoundException"
 
+def test_mq_list_tags_multiple_times_consistent(mq):
+    """Test that ListTags returns consistent results across multiple calls."""
+    broker = _create(mq, BrokerName=_name("tags-consistency"))
+    arn = broker["BrokerArn"]
+
+    mq.create_tags(ResourceArn=arn, Tags={"a": "1", "b": "2", "c": "3"})
+
+    # Call ListTags multiple times and verify consistency
+    resp1 = mq.list_tags(ResourceArn=arn)
+    resp2 = mq.list_tags(ResourceArn=arn)
+    resp3 = mq.list_tags(ResourceArn=arn)
+
+    assert resp1["Tags"] == resp2["Tags"] == resp3["Tags"]
+    assert len(resp1["Tags"]) == 3
+
 ###########################################################################
 # DeleteTags
 ###########################################################################
@@ -442,6 +647,21 @@ def test_mq_delete_tags_with_non_existent_arn(mq):
         mq.delete_tags(ResourceArn="arn:aws:mq:invalid-arn", TagKeys=["env"])
     assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 404
     assert exc.value.response["Error"]["Code"] == "NotFoundException"
+
+def test_mq_delete_tags_idempotent(mq):
+    """Test that DeleteTags is idempotent (deleting non-existent key succeeds)."""
+    broker = _create(mq, BrokerName=_name("tags-idempotent"))
+    arn = broker["BrokerArn"]
+
+    mq.create_tags(ResourceArn=arn, Tags={"key1": "value1"})
+
+    # Delete non-existent key - should succeed
+    del_resp = mq.delete_tags(ResourceArn=arn, TagKeys=["nonexistent"])
+    assert del_resp["ResponseMetadata"]["HTTPStatusCode"] == 204
+
+    # Verify original tag still exists
+    list_resp = mq.list_tags(ResourceArn=arn)
+    assert list_resp["Tags"]["key1"] == "value1"
 
 ############################################################################
 # CreateUser
@@ -585,6 +805,7 @@ def test_mq_list_users_with_no_users(mq):
     list_resp = mq.list_users(BrokerId=broker_id)
     assert list_resp["ResponseMetadata"]["HTTPStatusCode"] == 200
     assert list_resp.get("Users", []) == []
+    assert isinstance(list_resp.get("Users", []), list)
 
 def test_mq_list_users_with_non_existent_broker_id(mq):
     with pytest.raises(ClientError) as exc:
@@ -648,18 +869,28 @@ def test_mq_update_user(mq):
 
     mq.create_user(
         BrokerId=broker_id,
-        Username="testuser",
-        Password="TestPassw0rd!",
+        Username="full_update_user",
+        Password="InitialPassw0rd!",
         ConsoleAccess=False,
+        Groups=["users"],
+        ReplicationUser=False,
     )
 
-    update_resp = mq.update_user(
+    # Update all fields
+    mq.update_user(
         BrokerId=broker_id,
-        Username="testuser",
-        Password="NewPassw0rd!",
+        Username="full_update_user",
+        Password="UpdatedPassw0rd!",
         ConsoleAccess=True,
+        Groups=["admins", "ops"],
+        ReplicationUser=True,
     )
-    assert update_resp["ResponseMetadata"]["HTTPStatusCode"] == 200
+
+    # Verify updates
+    user = mq.describe_user(BrokerId=broker_id, Username="full_update_user")
+    assert user["ConsoleAccess"] == True
+    assert set(user["Groups"]) == {"admins", "ops"}
+    assert user["ReplicationUser"] == True
 
 def test_mq_update_user_with_non_existent_username(mq):
     broker_id = _create(mq, BrokerName=_name("user"), EngineType="ACTIVEMQ", EngineVersion="5.19")["BrokerId"]
@@ -722,3 +953,211 @@ def test_mq_update_user_with_invalid_password(mq, invalid_password):
         )
     assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
     assert exc.value.response["Error"]["Code"] == "BadRequestException"
+
+############################################################################
+# DescribeUser
+############################################################################
+
+def test_mq_describe_user(mq):
+    broker_id = _create(mq, BrokerName=_name("user"), EngineType="ACTIVEMQ", EngineVersion="5.19")["BrokerId"]
+
+    mq.create_user(
+        BrokerId=broker_id,
+        Username="testuser",
+        Password="TestPassw0rd!",
+        ConsoleAccess=False,
+        Groups=["group1", "group2"],
+        ReplicationUser = True
+    )
+
+    desc_resp = mq.describe_user(BrokerId=broker_id, Username="testuser")
+    assert desc_resp["ResponseMetadata"]["HTTPStatusCode"] == 200
+    assert desc_resp["Username"] == "testuser"
+    assert desc_resp["ConsoleAccess"] is False
+    assert set(desc_resp["Groups"]) == {"group1", "group2"}
+    assert desc_resp["ReplicationUser"] is True
+
+def test_mq_describe_user_with_non_existent_username(mq):
+    broker_id = _create(mq, BrokerName=_name("user"), EngineType="ACTIVEMQ", EngineVersion="5.19")["BrokerId"]
+
+    with pytest.raises(ClientError) as exc:
+        mq.describe_user(BrokerId=broker_id, Username="nonexistentuser")
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 404
+    assert exc.value.response["Error"]["Code"] == "NotFoundException"
+
+def test_mq_describe_user_with_non_existent_broker_id(mq):
+    with pytest.raises(ClientError) as exc:
+        mq.describe_user(BrokerId="invalid-id", Username="testuser")
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 404
+    assert exc.value.response["Error"]["Code"] == "NotFoundException"
+
+def test_mq_describe_user_with_not_supported_engine_type(mq):
+    broker_id = _create(mq, BrokerName=_name("user-invalid-describe"), EngineType="RABBITMQ")["BrokerId"]
+
+    with pytest.raises(ClientError) as exc:
+        mq.describe_user(BrokerId=broker_id, Username="testuser")
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+    assert exc.value.response["Error"]["Code"] == "BadRequestException"
+
+
+############################################################################
+# Lifecycle tests
+############################################################################
+
+def test_mq_create_describe_delete_broker_tags_lifecycle(mq):
+    """Test full lifecycle: create with tags -> describe shows tags -> delete removes tags."""
+    name = _name("lifecycle-tags")
+
+    # 1. Create broker with tags
+    create_resp = mq.create_broker(
+        BrokerName=name,
+        EngineType="RABBITMQ",
+        EngineVersion="3.13",
+        HostInstanceType="mq.m5.large",
+        PubliclyAccessible=False,
+        DeploymentMode="SINGLE_INSTANCE",
+        Tags={"lifecycle": "test", "phase": "all"},
+    )
+    broker_id = create_resp["BrokerId"]
+    broker_arn = create_resp["BrokerArn"]
+
+    # 2. Describe broker and verify tags included
+    desc = mq.describe_broker(BrokerId=broker_id)
+    assert desc["Tags"]["lifecycle"] == "test"
+    assert desc["Tags"]["phase"] == "all"
+
+    # 3. Add more tags
+    mq.create_tags(ResourceArn=broker_arn, Tags={"added": "later"})
+
+    # 4. Verify describe shows all tags
+    desc2 = mq.describe_broker(BrokerId=broker_id)
+    assert desc2["Tags"]["lifecycle"] == "test"
+    assert desc2["Tags"]["phase"] == "all"
+    assert desc2["Tags"]["added"] == "later"
+
+    # 5. Delete broker
+    mq.delete_broker(BrokerId=broker_id)
+
+    # 6. Verify tags are cleaned up
+    with pytest.raises(ClientError) as exc:
+        mq.list_tags(ResourceArn=broker_arn)
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 404
+
+
+def test_mq_multiple_brokers_isolated_tags(mq):
+    """Test that tags from different brokers don't interfere with each other."""
+    # Create two brokers with different tags
+    name1 = _name("isolated-1")
+    resp1 = mq.create_broker(
+        BrokerName=name1,
+        EngineType="RABBITMQ",
+        EngineVersion="3.13",
+        HostInstanceType="mq.m5.large",
+        PubliclyAccessible=False,
+        DeploymentMode="SINGLE_INSTANCE",
+        Tags={"broker": "first", "env": "prod"},
+    )
+    arn1 = resp1["BrokerArn"]
+
+    name2 = _name("isolated-2")
+    resp2 = mq.create_broker(
+        BrokerName=name2,
+        EngineType="RABBITMQ",
+        EngineVersion="3.13",
+        HostInstanceType="mq.m5.large",
+        PubliclyAccessible=False,
+        DeploymentMode="SINGLE_INSTANCE",
+        Tags={"broker": "second", "env": "dev"},
+    )
+    arn2 = resp2["BrokerArn"]
+
+    # Verify each broker has its own isolated tags
+    tags1 = mq.list_tags(ResourceArn=arn1)["Tags"]
+    tags2 = mq.list_tags(ResourceArn=arn2)["Tags"]
+
+    assert tags1["broker"] == "first"
+    assert tags1["env"] == "prod"
+    assert tags2["broker"] == "second"
+    assert tags2["env"] == "dev"
+
+
+def test_mq_multiple_brokers_isolated_users(mq):
+    """Test that users from different brokers don't interfere with each other."""
+    # Create two ActiveMQ brokers
+    broker_id1 = _create(mq, BrokerName=_name("users-isolated-1"), EngineType="ACTIVEMQ", EngineVersion="5.19")["BrokerId"]
+    broker_id2 = _create(mq, BrokerName=_name("users-isolated-2"), EngineType="ACTIVEMQ", EngineVersion="5.19")["BrokerId"]
+
+    # Create users with same username in different brokers
+    mq.create_user(
+        BrokerId=broker_id1,
+        Username="shared_name",
+        Password="Broker1Passw0rd!",
+        ConsoleAccess=True,
+    )
+
+    mq.create_user(
+        BrokerId=broker_id2,
+        Username="shared_name",
+        Password="Broker2Passw0rd!",
+        ConsoleAccess=False,
+    )
+
+    # Verify users are isolated
+    user1 = mq.describe_user(BrokerId=broker_id1, Username="shared_name")
+    user2 = mq.describe_user(BrokerId=broker_id2, Username="shared_name")
+
+    assert user1 is not None
+    assert user2 is not None
+    assert user1["ConsoleAccess"] == True
+    assert user2["ConsoleAccess"] == False
+
+
+def test_mq_recreate_broker_after_delete_has_fresh_tags_and_users(mq):
+    """Test that recreating a broker after deletion starts with fresh tag/user dicts."""
+    name = _name("recreate-fresh")
+
+    # Create, add tags/users, and delete
+    resp1 = mq.create_broker(
+        BrokerName=name,
+        EngineType="ACTIVEMQ",
+        EngineVersion="5.19",
+        HostInstanceType="mq.m5.large",
+        PubliclyAccessible=False,
+        DeploymentMode="SINGLE_INSTANCE",
+        Tags={"first": "creation"},
+    )
+    broker_id1 = resp1["BrokerId"]
+    broker_arn1 = resp1["BrokerArn"]
+
+    # Add a user
+    mq.create_user(
+        BrokerId=broker_id1,
+        Username="first_user",
+        Password="FirstPassw0rd!",
+        ConsoleAccess=True,
+    )
+
+    # Delete the broker
+    mq.delete_broker(BrokerId=broker_id1)
+
+    # Recreate broker with same name
+    resp2 = mq.create_broker(
+        BrokerName=name,
+        EngineType="ACTIVEMQ",
+        EngineVersion="5.19",
+        HostInstanceType="mq.m5.large",
+        PubliclyAccessible=False,
+        DeploymentMode="SINGLE_INSTANCE",
+    )
+    broker_id2 = resp2["BrokerId"]
+    broker_arn2 = resp2["BrokerArn"]
+
+    # Verify fresh state
+    tags = mq.list_tags(ResourceArn=broker_arn2)["Tags"]
+    users = mq.list_users(BrokerId=broker_id2)["Users"]
+
+    assert tags == {}
+    assert users == []
+
+    # Verify old ARN is different from new ARN
+    assert broker_arn1 != broker_arn2
