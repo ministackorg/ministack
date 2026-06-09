@@ -1533,6 +1533,167 @@ def _get_service_linked_role_deletion_status(p):
                 ns="iam")
 
 
+# -------------------- GetAccountAuthorizationDetails --------------------
+
+
+def _get_account_authorization_details(p):
+    # Extract Filter.member.N list; empty = all
+    filters = set()
+    idx = 1
+    while True:
+        f = _p(p, f"Filter.member.{idx}")
+        if not f:
+            break
+        filters.add(f)
+        idx += 1
+    include_all = not filters
+
+    # ---- UserDetailList ----
+    user_detail_xml = ""
+    if include_all or "User" in filters:
+        for name, user in _users.items():
+            # Inline user policies
+            upols = _user_inline_policies.get(name) or {}
+            inline_xml = "".join(
+                f"<member>"
+                f"<PolicyName>{pn}</PolicyName>"
+                f"<PolicyDocument>{_url_quote(pd, safe='')}</PolicyDocument>"
+                f"</member>"
+                for pn, pd in upols.items()
+            )
+            # Attached managed policies
+            attached_xml = ""
+            for arn in user.get("AttachedPolicies", []):
+                pol = _lookup_policy(arn)
+                if pol:
+                    attached_xml += (f"<member>"
+                                     f"<PolicyName>{pol['PolicyName']}</PolicyName>"
+                                     f"<PolicyArn>{arn}</PolicyArn>"
+                                     f"</member>")
+            # Groups the user belongs to
+            group_xml = "".join(
+                f"<member>{g['GroupName']}</member>"
+                for g in _groups.values()
+                if name in g.get("Users", [])
+            )
+            # Tags
+            tags_xml = "".join(
+                f"<member><Key>{t['Key']}</Key><Value>{t['Value']}</Value></member>"
+                for t in user.get("Tags", [])
+            )
+            user_detail_xml += (
+                f"<member>"
+                f"<UserName>{user['UserName']}</UserName>"
+                f"<UserId>{user['UserId']}</UserId>"
+                f"<Arn>{user['Arn']}</Arn>"
+                f"<Path>{user['Path']}</Path>"
+                f"<CreateDate>{user['CreateDate']}</CreateDate>"
+                f"<UserPolicyList>{inline_xml}</UserPolicyList>"
+                f"<GroupList>{group_xml}</GroupList>"
+                f"<AttachedManagedPolicies>{attached_xml}</AttachedManagedPolicies>"
+                f"<Tags>{tags_xml}</Tags>"
+                f"</member>"
+            )
+
+    # ---- GroupDetailList ----
+    group_detail_xml = ""
+    if include_all or "Group" in filters:
+        for name, g in _groups.items():
+            group_detail_xml += (
+                f"<member>"
+                f"<GroupName>{g['GroupName']}</GroupName>"
+                f"<GroupId>{g['GroupId']}</GroupId>"
+                f"<Arn>{g['Arn']}</Arn>"
+                f"<Path>{g['Path']}</Path>"
+                f"<CreateDate>{g['CreateDate']}</CreateDate>"
+                f"<GroupPolicyList></GroupPolicyList>"
+                f"<AttachedManagedPolicies></AttachedManagedPolicies>"
+                f"</member>"
+            )
+
+    # ---- RoleDetailList ----
+    role_detail_xml = ""
+    if include_all or "Role" in filters:
+        for name, role in _roles.items():
+            assume_doc = _url_quote(role.get("AssumeRolePolicyDocument") or "{}", safe="")
+            # Inline role policies
+            inline_xml = "".join(
+                f"<member>"
+                f"<PolicyName>{pn}</PolicyName>"
+                f"<PolicyDocument>{_url_quote(pd, safe='')}</PolicyDocument>"
+                f"</member>"
+                for pn, pd in (role.get("InlinePolicies") or {}).items()
+            )
+            # Attached managed policies
+            attached_xml = ""
+            for arn in role.get("AttachedPolicies", []):
+                pol = _lookup_policy(arn)
+                if pol:
+                    attached_xml += (f"<member>"
+                                     f"<PolicyName>{pol['PolicyName']}</PolicyName>"
+                                     f"<PolicyArn>{arn}</PolicyArn>"
+                                     f"</member>")
+            # Instance profiles
+            ip_xml = "".join(
+                f"<member>{_instance_profile_xml(ipn)}</member>"
+                for ipn, ip in _instance_profiles.items()
+                if name in ip.get("Roles", [])
+            )
+            # Tags
+            tags_xml = "".join(
+                f"<member><Key>{t['Key']}</Key><Value>{t['Value']}</Value></member>"
+                for t in role.get("Tags", [])
+            )
+            role_detail_xml += (
+                f"<member>"
+                f"<RoleName>{role['RoleName']}</RoleName>"
+                f"<RoleId>{role['RoleId']}</RoleId>"
+                f"<Arn>{role['Arn']}</Arn>"
+                f"<Path>{role['Path']}</Path>"
+                f"<CreateDate>{role['CreateDate']}</CreateDate>"
+                f"<AssumeRolePolicyDocument>{assume_doc}</AssumeRolePolicyDocument>"
+                f"<RolePolicyList>{inline_xml}</RolePolicyList>"
+                f"<AttachedManagedPolicies>{attached_xml}</AttachedManagedPolicies>"
+                f"<InstanceProfileList>{ip_xml}</InstanceProfileList>"
+                f"<Tags>{tags_xml}</Tags>"
+                f"</member>"
+            )
+
+    # ---- Policies (customer-managed) ----
+    policies_xml = ""
+    if include_all or "LocalManagedPolicy" in filters:
+        for arn, pol in _policies.items():
+            default_vid = pol.get("DefaultVersionId", "v1")
+            versions_xml = "".join(
+                f"<member>"
+                f"<Document>{_url_quote(v.get('Document') or '{}', safe='')}</Document>"
+                f"<VersionId>{v['VersionId']}</VersionId>"
+                f"<IsDefaultVersion>{'true' if v.get('IsDefaultVersion') else 'false'}</IsDefaultVersion>"
+                f"</member>"
+                for v in pol.get("Versions", {}).values()
+            )
+            policies_xml += (
+                f"<member>"
+                f"<PolicyName>{pol['PolicyName']}</PolicyName>"
+                f"<PolicyId>{pol['PolicyId']}</PolicyId>"
+                f"<Arn>{arn}</Arn>"
+                f"<Path>{pol.get('Path', '/')}</Path>"
+                f"<DefaultVersionId>{default_vid}</DefaultVersionId>"
+                f"<PolicyVersionList>{versions_xml}</PolicyVersionList>"
+                f"</member>"
+            )
+
+    return _xml(200, "GetAccountAuthorizationDetailsResponse",
+                f"<GetAccountAuthorizationDetailsResult>"
+                f"<UserDetailList>{user_detail_xml}</UserDetailList>"
+                f"<GroupDetailList>{group_detail_xml}</GroupDetailList>"
+                f"<RoleDetailList>{role_detail_xml}</RoleDetailList>"
+                f"<Policies>{policies_xml}</Policies>"
+                f"<IsTruncated>false</IsTruncated>"
+                f"</GetAccountAuthorizationDetailsResult>",
+                ns="iam")
+
+
 # -------------------- Virtual MFA devices --------------------
 
 
@@ -2123,6 +2284,7 @@ _IAM_HANDLERS = {
     "CreateOpenIDConnectProvider": _create_oidc_provider,
     "GetOpenIDConnectProvider": _get_oidc_provider,
     "DeleteOpenIDConnectProvider": _delete_oidc_provider,
+    "GetAccountAuthorizationDetails": _get_account_authorization_details,
     "CreateVirtualMFADevice": _create_virtual_mfa_device,
     "EnableMFADevice": _enable_mfa_device,
     "DeactivateMFADevice": _deactivate_mfa_device,
