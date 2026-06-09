@@ -110,6 +110,10 @@ def get_state():
 # container is healthy by the time the SDK reaches the endpoint.
 _pending_cluster_respawn: set = set()
 _pending_rg_respawn: set = set()
+# Serialize lazy respawn so two concurrent first-requests after restart
+# don't both spawn a container for the same cluster.
+import threading as _threading
+_respawn_lock = _threading.Lock()
 
 
 def restore_state(data):
@@ -144,8 +148,17 @@ def _ensure_live_containers():
     don't retry on every request — the cluster's metadata is still served
     but the endpoint won't be reachable (matches the old behavior, just no
     longer silent)."""
+    # Cheap fast path — no lock needed when nothing's pending.
     if not (_pending_cluster_respawn or _pending_rg_respawn):
         return
+    # Serialize concurrent first-requests so we don't double-spawn.
+    with _respawn_lock:
+        if not (_pending_cluster_respawn or _pending_rg_respawn):
+            return
+        _ensure_live_containers_locked()
+
+
+def _ensure_live_containers_locked():
     import logging
     log = logging.getLogger(__name__)
     for name in list(_pending_cluster_respawn):
