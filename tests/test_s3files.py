@@ -12,7 +12,6 @@ import urllib.parse
 import urllib.request
 import uuid
 
-
 ENDPOINT = "http://localhost:4566"
 BUCKET_ARN = "arn:aws:s3:::test-bucket"
 ROLE_ARN = "arn:aws:iam::000000000000:role/s3files-role"
@@ -53,6 +52,10 @@ def _req(method, path, body=None, query=None, account=None):
 
 def _uid():
     return uuid.uuid4().hex[:6]
+
+
+def _resource_tags_path(resource_id):
+    return "/resource-tags/" + urllib.parse.quote(resource_id, safe="")
 
 
 # ---------------------------------------------------------------------------
@@ -201,7 +204,7 @@ def test_access_point_lifecycle():
         assert s == 200
         assert ap["accessPointId"].startswith("fsap-")
         assert ap["fileSystemId"] == fs_id
-        assert ap["accessPointArn"].startswith(f"arn:aws:s3files:")
+        assert ap["accessPointArn"].startswith("arn:aws:s3files:")
         assert "/access-point/" in ap["accessPointArn"]
         assert ap["name"] == "ap-test"
 
@@ -321,6 +324,82 @@ def test_tag_unknown_resource_returns_404():
     })
     assert s == 404
     assert body.get("__type") == "ResourceNotFoundException"
+
+
+def test_resource_tags_accept_file_system_and_access_point_arns():
+    s, fs = _req("PUT", "/file-systems", {"bucket": BUCKET_ARN, "roleArn": ROLE_ARN})
+    fs_id = fs["fileSystemId"]
+    fs_arn = fs["fileSystemArn"]
+    try:
+        s, _ = _req("POST", _resource_tags_path(fs_arn), {
+            "tags": [{"key": "Scope", "value": "filesystem"}],
+        })
+        assert s == 200
+
+        s, listed = _req("GET", _resource_tags_path(fs_arn))
+        assert s == 200
+        assert {t["key"]: t["value"] for t in listed["tags"]} == {"Scope": "filesystem"}
+
+        s, ap = _req("PUT", "/access-points", {"fileSystemId": fs_id})
+        assert s == 200
+        ap_arn = ap["accessPointArn"]
+
+        s, _ = _req("POST", _resource_tags_path(ap_arn), {
+            "tags": [{"key": "Scope", "value": "accesspoint"}],
+        })
+        assert s == 200
+
+        s, listed = _req("GET", _resource_tags_path(ap_arn))
+        assert s == 200
+        assert {t["key"]: t["value"] for t in listed["tags"]} == {"Scope": "accesspoint"}
+
+        s, _ = _req("DELETE", _resource_tags_path(ap_arn), query={"tagKeys": ["Scope"]})
+        assert s == 200
+        s, listed = _req("GET", _resource_tags_path(ap_arn))
+        assert listed["tags"] == []
+    finally:
+        _req("DELETE", f"/file-systems/{fs_id}")
+
+
+def test_resource_tags_reject_out_of_scope_arns_before_touching_tags():
+    s, fs = _req("PUT", "/file-systems", {"bucket": BUCKET_ARN, "roleArn": ROLE_ARN})
+    fs_id = fs["fileSystemId"]
+    try:
+        s, _ = _req("POST", f"/resource-tags/{fs_id}", {
+            "tags": [{"key": "Keep", "value": "true"}],
+        })
+        assert s == 200
+
+        bad_arns = [
+            "arn:nope",
+            f"arn:aws-cn:s3files:us-east-1:000000000000:file-system/{fs_id}",
+            f"arn:aws:s3:us-east-1:000000000000:file-system/{fs_id}",
+            f"arn:aws:s3files:us-west-2:000000000000:file-system/{fs_id}",
+            f"arn:aws:s3files:us-east-1:111111111111:file-system/{fs_id}",
+            f"arn:aws:s3files:us-east-1:000000000000:mount-target/{fs_id}",
+            "arn:aws:s3files:us-east-1:000000000000:file-system/fs-nothex",
+            f"arn:aws:s3files:us-east-1:000000000000:file-system/{fs_id}/access-point/fs-nothex",
+        ]
+        for arn in bad_arns:
+            for method, body, query in (
+                ("POST", {"tags": [{"key": "Bad", "value": "false"}]}, None),
+                ("DELETE", None, {"tagKeys": ["Keep"]}),
+                ("GET", None, None),
+            ):
+                s, response = _req(method, _resource_tags_path(arn), body=body, query=query)
+                assert s == 400, (method, arn, response)
+                assert response.get("__type") == "ValidationException"
+
+        missing = "arn:aws:s3files:us-east-1:000000000000:file-system/fs-deadbeefdeadbeefdea"
+        s, response = _req("GET", _resource_tags_path(missing))
+        assert s == 404
+        assert response.get("__type") == "ResourceNotFoundException"
+
+        s, listed = _req("GET", f"/resource-tags/{fs_id}")
+        assert s == 200
+        assert {t["key"]: t["value"] for t in listed["tags"]} == {"Keep": "true"}
+    finally:
+        _req("DELETE", f"/file-systems/{fs_id}")
 
 
 # ---------------------------------------------------------------------------
