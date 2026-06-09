@@ -94,6 +94,14 @@ def _valid_host_instance_types(engine_type: str | None) -> set[str]:
         out.update(cfg["host_instance_types"])
     return out
 
+def _valid_storage_types(engine_type: str | None) -> set[str]:
+    if engine_type:
+        return set(SUPPORTED_ENGINES.get(engine_type, {}).get("storage_types", []))
+    out = set()
+    for cfg in SUPPORTED_ENGINES.values():
+        out.update(cfg["storage_types"])
+    return out
+
 
 def _parse_max_results(query_params: dict, *, default: int, minimum: int, maximum: int = 100, reject: set[int] | None = None):
     raw = query_params.get("maxResults")
@@ -312,12 +320,70 @@ def _list_broker_engine_types(query_params: dict) -> tuple:
         out["nextToken"] = next_token
     return _ok(out)
 
+def _list_broker_instance_options(query_params: dict) -> tuple:
+    max_results, max_err = _parse_max_results(query_params, default=20, minimum=1, maximum=100, reject={4})
+    if max_err:
+        return max_err
+    offset, token_err = _parse_next_token(query_params)
+    if token_err:
+        return token_err
+
+    engine_type = query_params.get("engineType")
+    if isinstance(engine_type, list):
+        engine_type = engine_type[-1] if engine_type else None
+    engine_type = str(engine_type).upper() if engine_type else None
+    if engine_type and engine_type not in SUPPORTED_ENGINES:
+        return _err(400, "EngineType", f"Invalid engine type: '{engine_type}'.")
+
+    host_instance_type = query_params.get("hostInstanceType")
+    if isinstance(host_instance_type, list):
+        host_instance_type = host_instance_type[-1] if host_instance_type else None
+    if host_instance_type and host_instance_type not in _valid_host_instance_types(engine_type):
+        return _err(400, "HostInstanceType", f"Invalid host instance type: '{host_instance_type}'.")
+
+    storage_type = query_params.get("storageType")
+    if isinstance(storage_type, list):
+        storage_type = storage_type[-1] if storage_type else None
+    storage_type = str(storage_type).upper() if storage_type else None
+    if storage_type and storage_type not in _valid_storage_types(engine_type):
+        return _err(400, "StorageType", f"Invalid storage type: '{storage_type}'.")
+
+    filtered = []
+    for eng, cfg in SUPPORTED_ENGINES.items():
+        if engine_type and eng != engine_type:
+            continue
+        for host in cfg["host_instance_types"]:
+            if host_instance_type and host != host_instance_type:
+                continue
+            for stor in cfg["storage_types"]:
+                if storage_type and stor != storage_type:
+                    continue
+                filtered.append(
+                    {
+                        "availabilityZones": [{"name": "us-east-1a"}, {"name": "us-east-1b"}],
+                        "engineType": eng,
+                        "hostInstanceType": host,
+                        "storageType": stor,
+                        "supportedEngineVersions": [{"name": v} for v in cfg["versions"]],
+                        "supportedDeploymentModes": list(cfg["deployment_modes"]),
+                    }
+                )
+
+    page, next_token = _paginate(filtered, offset, max_results)
+    out = {"brokerInstanceOptions": page, "maxResults": max_results}
+    if next_token is not None:
+        out["nextToken"] = next_token
+    return _ok(out)
+
 _BROKER_ID_RE = re.compile(r"^/v1/brokers/([^/]+)$")
 _BROKER_REBOOT_RE = re.compile(r"^/v1/brokers/([^/]+)/reboot$")
 
 
 async def handle_request(method: str, path: str, headers: dict, body: bytes, query_params: dict) -> tuple:
     method = method.upper()
+
+    if path == "/v1/broker-instance-options" and method == "GET":
+        return _list_broker_instance_options(query_params)
 
     if path == "/v1/broker-engine-types" and method == "GET":
         return _list_broker_engine_types(query_params)

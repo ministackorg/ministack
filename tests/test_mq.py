@@ -264,3 +264,118 @@ def test_mq_describe_broker_engine_types_with_invalid_max_results(mq, invalid_ma
         mq.describe_broker_engine_types(MaxResults=invalid_max)
     assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
     assert exc.value.response["Error"]["Code"] == "BadRequestException"
+
+########################################################################
+# DescribeBrokerInstanceOptions
+########################################################################
+
+def test_mq_describe_broker_instance_options(mq):
+    resp = mq.describe_broker_instance_options()
+
+    assert resp["ResponseMetadata"]["HTTPStatusCode"] == 200
+    assert len(resp.get("BrokerInstanceOptions", [])) > 0
+    for option in resp["BrokerInstanceOptions"]:
+        assert "AvailabilityZones" in option
+        assert "EngineType" in option
+        assert "HostInstanceType" in option
+        assert "StorageType" in option
+        assert "SupportedEngineVersions" in option
+        assert "SupportedDeploymentModes" in option
+
+@pytest.mark.parametrize(
+    "kwargs,assertions",
+    [
+        (
+            {"EngineType": "RABBITMQ"},
+            lambda o: o["EngineType"] == "RABBITMQ",
+        ),
+        (
+            {"HostInstanceType": "mq.m5.large"},
+            lambda o: o["HostInstanceType"] == "mq.m5.large",
+        ),
+        (
+            {"StorageType": "EBS"},
+            lambda o: o["StorageType"] == "EBS",
+        ),
+        (
+            {"EngineType": "RABBITMQ", "HostInstanceType": "mq.m5.large"},
+            lambda o: (
+                o["EngineType"] == "RABBITMQ"
+                and o["HostInstanceType"] == "mq.m5.large"
+            ),
+        ),
+        (
+            {"EngineType": "RABBITMQ", "StorageType": "EBS"},
+            lambda o: (
+                o["EngineType"] == "RABBITMQ"
+                and o["StorageType"] == "EBS"
+            ),
+        ),
+        (
+            {"HostInstanceType": "mq.m5.large", "StorageType": "EBS"},
+            lambda o: (
+                o["HostInstanceType"] == "mq.m5.large"
+                and o["StorageType"] == "EBS"
+            ),
+        ),
+        (
+            {
+                "EngineType": "RABBITMQ",
+                "HostInstanceType": "mq.m5.large",
+                "StorageType": "EBS",
+            },
+            lambda o: (
+                o["EngineType"] == "RABBITMQ"
+                and o["HostInstanceType"] == "mq.m5.large"
+                and o["StorageType"] == "EBS"
+            ),
+        ),
+    ],
+)
+def test_mq_broker_instance_options_filtered(mq, kwargs, assertions):
+    resp = mq.describe_broker_instance_options(**kwargs)
+
+    assert resp["ResponseMetadata"]["HTTPStatusCode"] == 200
+    assert len(resp.get("BrokerInstanceOptions", [])) > 0
+    assert all(assertions(o) for o in resp["BrokerInstanceOptions"])
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"EngineType": "INVALID_ENGINE"},
+        {"HostInstanceType": "INVALID_INSTANCE"},
+        {"StorageType": "INVALID_STORAGE"},
+    ],
+)
+def test_mq_describe_broker_instance_options_with_invalid_parameters(mq, kwargs):
+    with pytest.raises(ClientError) as exc:
+        mq.describe_broker_instance_options(**kwargs)
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+    assert exc.value.response["Error"]["Code"] == "BadRequestException"
+
+def test_mq_describe_broker_instance_options_with_max_results(mq):
+    resp = mq.describe_broker_instance_options(MaxResults=1)
+
+    assert resp["ResponseMetadata"]["HTTPStatusCode"] == 200
+    assert resp["MaxResults"] == 1
+    assert len(resp.get("BrokerInstanceOptions", [])) == 1
+
+@pytest.mark.parametrize("invalid_max", [4, 101])
+def test_mq_describe_broker_instance_options_with_invalid_max_results(mq, invalid_max):
+    with pytest.raises(ClientError) as exc:
+        mq.describe_broker_instance_options(MaxResults=invalid_max)
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+    assert exc.value.response["Error"]["Code"] == "BadRequestException"
+
+def test_mq_describe_broker_instance_options_pagination(mq):
+    # Create enough options to ensure pagination is needed
+    resp1 = mq.describe_broker_instance_options(MaxResults=2)
+    assert resp1["ResponseMetadata"]["HTTPStatusCode"] == 200
+    assert resp1["MaxResults"] == 2
+    assert len(resp1.get("BrokerInstanceOptions", [])) == 2
+    assert "NextToken" in resp1
+
+    resp2 = mq.describe_broker_instance_options(MaxResults=2, NextToken=resp1["NextToken"])
+    assert resp2["ResponseMetadata"]["HTTPStatusCode"] == 200
+    assert resp2["MaxResults"] == 2
+    assert len(resp2.get("BrokerInstanceOptions", [])) >= 1
