@@ -17,11 +17,13 @@ import fnmatch
 import json
 import logging
 import os
+import re
 import subprocess
 import tempfile
 import threading
 import time
 
+from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.persistence import PERSIST_STATE, load_state
 from ministack.core.responses import (
     AccountScopedDict,
@@ -154,6 +156,83 @@ except Exception:
 
 def _arn(resource_type, name):
     return f"arn:aws:glue:{get_region()}:{get_account_id()}:{resource_type}/{name}"
+
+
+_GLUE_PARTITION_RE = re.compile(r"^aws(?:-(?:cn|us-gov|iso(?:-[bef])?))?$")
+_GLUE_SIMPLE_TAGGABLE_RESOURCE_PREFIXES = (
+    "blueprint/",
+    "crawler/",
+    "connection/",
+    "customEntityType/",
+    "dataQualityRuleset/",
+    "devEndpoint/",
+    "job/",
+    "mlTransform/",
+    "registry/",
+    "security-configuration/",
+    "securityConfiguration/",
+    "session/",
+    "trigger/",
+    "usageProfile/",
+    "workflow/",
+)
+_GLUE_COLON_TAGGABLE_RESOURCE_PREFIXES = (
+    "connectionType:",
+    "integration:",
+)
+_GLUE_PATH_TAGGABLE_RESOURCE_MIN_PARTS = {
+    "catalog/": 1,
+    "database/": 1,
+    "integrationresourceproperty/": 2,
+    "integrationResourceProperty/": 2,
+    "schema/": 2,
+    "table/": 2,
+    "userDefinedFunction/": 2,
+}
+
+
+def _validate_tag_resource_arn(arn):
+    try:
+        spec = parse_arn(arn)
+    except ArnParseError:
+        return _invalid_resource_arn(arn)
+
+    if (
+        not _GLUE_PARTITION_RE.match(spec.partition)
+        or spec.service != "glue"
+        or spec.account_id != get_account_id()
+        or spec.region != get_region()
+    ):
+        return _invalid_resource_arn(arn)
+    if not _is_taggable_glue_resource(spec.resource):
+        return _invalid_resource_arn(arn)
+    return None
+
+
+def _is_taggable_glue_resource(resource):
+    if resource == "catalog":
+        return True
+    return any(
+        resource.startswith(prefix) and resource != prefix
+        for prefix in _GLUE_SIMPLE_TAGGABLE_RESOURCE_PREFIXES
+    ) or any(
+        resource.startswith(prefix) and resource != prefix
+        for prefix in _GLUE_COLON_TAGGABLE_RESOURCE_PREFIXES
+    ) or any(
+        _has_min_path_parts(resource, prefix, min_parts)
+        for prefix, min_parts in _GLUE_PATH_TAGGABLE_RESOURCE_MIN_PARTS.items()
+    )
+
+
+def _has_min_path_parts(resource, prefix, min_parts):
+    if not resource.startswith(prefix):
+        return False
+    parts = resource[len(prefix):].split("/")
+    return len(parts) >= min_parts and all(parts)
+
+
+def _invalid_resource_arn(arn):
+    return error_response_json("InvalidInputException", f"Invalid Glue resource ARN: {arn}", 400)
 
 
 async def handle_request(method, path, headers, body, query_params):
@@ -1541,12 +1620,18 @@ def _get_user_defined_functions(data):
 
 def _tag_resource(data):
     arn = data.get("ResourceArn", "")
+    validation_error = _validate_tag_resource_arn(arn)
+    if validation_error:
+        return validation_error
     _tags[arn] = {**_tags.get(arn, {}), **data.get("TagsToAdd", {})}
     return json_response({})
 
 
 def _untag_resource(data):
     arn = data.get("ResourceArn", "")
+    validation_error = _validate_tag_resource_arn(arn)
+    if validation_error:
+        return validation_error
     for key in data.get("TagsToRemove", []):
         _tags.get(arn, {}).pop(key, None)
     return json_response({})
@@ -1554,6 +1639,9 @@ def _untag_resource(data):
 
 def _get_tags(data):
     arn = data.get("ResourceArn", "")
+    validation_error = _validate_tag_resource_arn(arn)
+    if validation_error:
+        return validation_error
     return json_response({"Tags": _tags.get(arn, {})})
 
 

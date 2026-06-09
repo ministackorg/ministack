@@ -239,6 +239,129 @@ def test_glue_tags_v2(glue):
     assert resp2["Tags"] == {"env": "test"}
 
 
+def _glue_json(response):
+    status, _headers, body = response
+    return status, json.loads(body)
+
+
+@pytest.mark.parametrize(
+    "resource",
+    [
+        "catalog",
+        "catalog/s3tablescatalog",
+        "blueprint/glue-tag-parser-blueprint",
+        "crawler/glue-tag-parser-crawler",
+        "customEntityType/glue-tag-parser-custom-entity",
+        "dataQualityRuleset/glue-tag-parser-ruleset",
+        "database/glue_tag_parser_db",
+        "database/glue_tag_parser_catalog/glue_tag_parser_db",
+        "table/glue_tag_parser_db/glue_tag_parser_table",
+        "table/glue_tag_parser_catalog/glue_tag_parser_db/glue_tag_parser_table",
+        "job/glue-tag-parser-job",
+        "connection/glue-tag-parser-connection",
+        "connectionType:glue-tag-parser-connection-type",
+        "devEndpoint/glue-tag-parser-endpoint",
+        "integration:glue-tag-parser-integration",
+        "integrationresourceproperty/glue_tag_parser_resource_type/glue_tag_parser_resource",
+        "mlTransform/glue-tag-parser-transform",
+        "registry/glue-tag-parser-registry",
+        "schema/glue-tag-parser-registry/glue-tag-parser-schema",
+        "security-configuration/glue-tag-parser-security",
+        "securityConfiguration/glue-tag-parser-security",
+        "session/glue-tag-parser-session",
+        "trigger/glue-tag-parser-trigger",
+        "usageProfile/glue-tag-parser-profile",
+        "userDefinedFunction/glue_tag_parser_db/glue_tag_parser_function",
+        "workflow/glue-tag-parser-workflow",
+    ],
+)
+def test_glue_tag_resource_accepts_supported_arn_shapes(resource):
+    from ministack.core.responses import (
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+    from ministack.services import glue as _glue
+
+    original_account = get_account_id()
+    original_region = get_region()
+    arn = f"arn:aws:glue:us-east-1:000000000000:{resource}"
+
+    try:
+        _glue._tags.clear()
+        set_request_account_id("000000000000")
+        set_request_region("us-east-1")
+
+        status, body = _glue_json(
+            _glue._tag_resource({"ResourceArn": arn, "TagsToAdd": {"env": "test"}})
+        )
+        assert status == 200
+        assert body == {}
+
+        status, body = _glue_json(_glue._get_tags({"ResourceArn": arn}))
+        assert status == 200
+        assert body["Tags"] == {"env": "test"}
+    finally:
+        _glue._tags.clear()
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
+@pytest.mark.parametrize(
+    "arn",
+    [
+        "not-an-arn",
+        "arn:notaws:glue:us-east-1:000000000000:database/glue_tag_parser_db",
+        "arn:aws:sns:us-east-1:000000000000:topic/glue-tag-parser",
+        "arn:aws:glue:us-west-2:000000000000:database/glue_tag_parser_db",
+        "arn:aws:glue:us-east-1:111111111111:database/glue_tag_parser_db",
+        "arn:aws:glue:us-east-1:000000000000:",
+        "arn:aws:glue:us-east-1:000000000000:database/",
+        "arn:aws:glue:us-east-1:000000000000:catalog/",
+        "arn:aws:glue:us-east-1:000000000000:schema/glue_tag_parser_schema",
+        "arn:aws:glue:us-east-1:000000000000:database//glue_tag_parser_db",
+        "arn:aws:glue:us-east-1:000000000000:database:glue_tag_parser_db",
+        "arn:aws:glue:us-east-1:000000000000:notAResource/glue_tag_parser_resource",
+    ],
+)
+def test_glue_tag_apis_reject_invalid_resource_arns_before_touching_tags(arn):
+    from ministack.core.responses import (
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+    from ministack.services import glue as _glue
+
+    original_account = get_account_id()
+    original_region = get_region()
+    valid_arn = "arn:aws:glue:us-east-1:000000000000:database/glue_tag_parser_db"
+
+    try:
+        _glue._tags.clear()
+        set_request_account_id("000000000000")
+        set_request_region("us-east-1")
+        _glue._tag_resource({"ResourceArn": valid_arn, "TagsToAdd": {"env": "test"}})
+        before = dict(_glue._tags.items())
+
+        calls = [
+            _glue._tag_resource({"ResourceArn": arn, "TagsToAdd": {"bad": "tag"}}),
+            _glue._untag_resource({"ResourceArn": arn, "TagsToRemove": ["env"]}),
+            _glue._get_tags({"ResourceArn": arn}),
+        ]
+        for response in calls:
+            status, body = _glue_json(response)
+            assert status == 400
+            assert body["__type"] == "InvalidInputException"
+            assert "Invalid Glue resource ARN" in body["message"]
+            assert dict(_glue._tags.items()) == before
+    finally:
+        _glue._tags.clear()
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
 def test_glue_create_database_persists_tags(glue):
     """CreateDatabase top-level Tags must be stored (issue #1130 — real AWS shape)."""
     glue.create_database(
@@ -1220,8 +1343,8 @@ def test_glue_resolve_script_account_scoped(tmp_path, monkeypatch):
     match an object written by the canonical account-scoped writer.
     """
     from ministack.core import responses as respmod
-    from ministack.services import s3 as s3mod
     from ministack.services import glue as gluemod
+    from ministack.services import s3 as s3mod
 
     monkeypatch.setattr(s3mod, "DATA_DIR", str(tmp_path))
     monkeypatch.setattr(s3mod, "S3_PERSIST", True)
@@ -1252,8 +1375,8 @@ def test_glue_start_job_run_resolves_script_in_worker_thread(tmp_path, monkeypat
     default account and a non-default account's script was never found.
     """
     from ministack.core import responses as respmod
-    from ministack.services import s3 as s3mod
     from ministack.services import glue as gluemod
+    from ministack.services import s3 as s3mod
 
     monkeypatch.setattr(s3mod, "DATA_DIR", str(tmp_path))
     monkeypatch.setattr(s3mod, "S3_PERSIST", True)
@@ -1352,8 +1475,8 @@ def test_glue_resolve_script_isolated_per_account(tmp_path, monkeypatch):
     leak one tenant's on-disk objects to another.
     """
     from ministack.core import responses as respmod
-    from ministack.services import s3 as s3mod
     from ministack.services import glue as gluemod
+    from ministack.services import s3 as s3mod
 
     monkeypatch.setattr(s3mod, "DATA_DIR", str(tmp_path))
     monkeypatch.setattr(s3mod, "S3_PERSIST", True)
