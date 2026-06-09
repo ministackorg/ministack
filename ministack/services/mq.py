@@ -15,6 +15,7 @@ logger = logging.getLogger("mq")
 _brokers: AccountScopedDict = AccountScopedDict()
 _name_index: AccountScopedDict = AccountScopedDict()
 _tags: AccountScopedDict = AccountScopedDict()
+_users: AccountScopedDict = AccountScopedDict()
 
 SUPPORTED_ENGINES = {
     "RABBITMQ": {
@@ -38,6 +39,7 @@ SUPPORTED_ENGINES = {
 }
 
 _BROKER_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,50}$")
+_INVALID_PASSWORD_CHARS_RE = re.compile(r"[,:=]")
 
 _JSON_CT = {"Content-Type": "application/json"}
 _HTTP_TO_EXCEPTION = {
@@ -53,6 +55,8 @@ def get_state() -> dict:
     return {
         "brokers": copy.deepcopy(_brokers._data),
         "name_index": copy.deepcopy(_name_index._data),
+        "tags": copy.deepcopy(_tags._data),
+        "users": copy.deepcopy(_users._data),
     }
 
 
@@ -61,6 +65,8 @@ def restore_state(data: dict) -> None:
         return
     _brokers._data.update(data.get("brokers", {}))
     _name_index._data.update(data.get("name_index", {}))
+    _tags._data.update(data.get("tags", {}))
+    _users._data.update(data.get("users", {}))
 
 
 try:
@@ -153,6 +159,15 @@ def _get_broker_or_404(broker_id: str):
         return None, _err(404, "BrokerId", f"Broker '{broker_id}' does not exist.")
     return broker, None
 
+def _ensure_activemq_broker(broker: dict):
+    if broker.get("engineType") != "ACTIVEMQ":
+        return _err(400, "BrokerId", "This operation is supported only for ActiveMQ brokers.")
+    return None
+
+def _validate_password(password: str):
+    if len(password) < 4 or _INVALID_PASSWORD_CHARS_RE.search(password):
+        return _err(400, "Password", "Password must be at least 4 characters and cannot contain ',', ':' or '='.")
+    return None
 
 def _create_broker(body: dict) -> tuple:
     engine_type = str(body.get("engineType", "")).strip().upper()
@@ -416,8 +431,122 @@ def _delete_tags(resource_arn: str, query_params: dict) -> tuple:
         tags.pop(str(key), None)
     return _no_content()
 
+def _create_user(broker_id: str, username: str, body: dict) -> tuple:
+    broker, err = _get_broker_or_404(broker_id)
+    if err:
+        return err
+    engine_err = _ensure_activemq_broker(broker)
+    if engine_err:
+        return engine_err
+
+    users_map = _users.setdefault(broker_id, {})
+    if username in users_map:
+        return _err(409, "Username", f"User '{username}' already exists.")
+
+    password = str(body.get("password", ""))
+    pw_err = _validate_password(password)
+    if pw_err:
+        return pw_err
+
+    users_map[username] = {
+        "username": username,
+        "password": password,
+        "consoleAccess": bool(body.get("consoleAccess", False)),
+        "groups": list(body.get("groups") or []),
+        "replicationUser": bool(body.get("replicationUser", False)),
+        "_createdAt": time.time_ns(),
+    }
+    return _ok({})
+
+
+def _delete_user(broker_id: str, username: str) -> tuple:
+    broker, err = _get_broker_or_404(broker_id)
+    if err:
+        return err
+    engine_err = _ensure_activemq_broker(broker)
+    if engine_err:
+        return engine_err
+
+    users_map = _users.setdefault(broker_id, {})
+    if username not in users_map:
+        return _err(404, "Username", f"User '{username}' does not exist.")
+
+    del users_map[username]
+    return _ok({})
+
+
+def _list_users(broker_id: str, query_params: dict) -> tuple:
+    broker, err = _get_broker_or_404(broker_id)
+    if err:
+        return err
+    engine_err = _ensure_activemq_broker(broker)
+    if engine_err:
+        return engine_err
+
+    max_results, max_err = _parse_max_results(query_params, default=20, minimum=1, maximum=100, reject={4})
+    if max_err:
+        return max_err
+    offset, token_err = _parse_next_token(query_params)
+    if token_err:
+        return token_err
+
+    users_map = _users.setdefault(broker_id, {})
+    users_list = sorted(
+        [
+            {
+                "username": u["username"],
+                "consoleAccess": bool(u.get("consoleAccess", False)),
+                "groups": list(u.get("groups", [])),
+                "replicationUser": bool(u.get("replicationUser", False)),
+                "_createdAt": u.get("_createdAt", 0),
+            }
+            for u in users_map.values()
+        ],
+        key=lambda x: x["_createdAt"],
+        reverse=True,
+    )
+    for row in users_list:
+        row.pop("_createdAt", None)
+
+    page, next_token = _paginate(users_list, offset, max_results)
+    out = {"brokerId": broker_id, "maxResults": max_results, "users": page}
+    if next_token is not None:
+        out["nextToken"] = next_token
+    return _ok(out)
+
+
+def _update_user(broker_id: str, username: str, body: dict) -> tuple:
+    broker, err = _get_broker_or_404(broker_id)
+    if err:
+        return err
+    engine_err = _ensure_activemq_broker(broker)
+    if engine_err:
+        return engine_err
+
+    users_map = _users.setdefault(broker_id, {})
+    user = users_map.get(username)
+    if user is None:
+        return _err(404, "Username", f"User '{username}' does not exist.")
+
+    if "password" in body:
+        pw_err = _validate_password(str(body.get("password", "")))
+        if pw_err:
+            return pw_err
+        user["password"] = str(body["password"])
+
+    if "consoleAccess" in body:
+        user["consoleAccess"] = bool(body["consoleAccess"])
+    if "groups" in body:
+        user["groups"] = list(body.get("groups") or [])
+    if "replicationUser" in body:
+        user["replicationUser"] = bool(body["replicationUser"])
+
+    return _ok({})
+
 _BROKER_ID_RE = re.compile(r"^/v1/brokers/([^/]+)$")
 _BROKER_REBOOT_RE = re.compile(r"^/v1/brokers/([^/]+)/reboot$")
+_BROKER_USERS_RE = re.compile(r"^/v1/brokers/([^/]+)/users$")
+_BROKER_USER_RE = re.compile(r"^/v1/brokers/([^/]+)/users/([^/]+)$")
 _TAGS_RE = re.compile(r"^/v1/tags/(.+)$")
 
 
@@ -443,6 +572,28 @@ async def handle_request(method: str, path: str, headers: dict, body: bytes, que
             return _create_tags(resource_arn, payload)
         if method == "DELETE":
             return _delete_tags(resource_arn, query_params)
+
+    m = _BROKER_USERS_RE.match(path)
+    if m and method == "GET":
+        return _list_users(m.group(1), query_params)
+
+    m = _BROKER_USER_RE.match(path)
+    if m:
+        broker_id, username = m.group(1), unquote(m.group(2))
+        if method == "POST":
+            try:
+                payload = json.loads(body) if body else {}
+            except json.JSONDecodeError:
+                return _err(400, "RequestBody", "Invalid JSON in request body.")
+            return _create_user(broker_id, username, payload)
+        if method == "DELETE":
+            return _delete_user(broker_id, username)
+        if method == "PUT":
+            try:
+                payload = json.loads(body) if body else {}
+            except json.JSONDecodeError:
+                return _err(400, "RequestBody", "Invalid JSON in request body.")
+            return _update_user(broker_id, username, payload)
 
     if method == "POST" and path == "/v1/brokers":
         try:
@@ -479,3 +630,4 @@ def reset() -> None:
     _brokers._data.clear()
     _name_index._data.clear()
     _tags._data.clear()
+    _users._data.clear()

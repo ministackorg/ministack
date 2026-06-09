@@ -442,3 +442,283 @@ def test_mq_delete_tags_with_non_existent_arn(mq):
         mq.delete_tags(ResourceArn="arn:aws:mq:invalid-arn", TagKeys=["env"])
     assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 404
     assert exc.value.response["Error"]["Code"] == "NotFoundException"
+
+############################################################################
+# CreateUser
+############################################################################
+
+def test_mq_create_user_with_required_options(mq):
+    broker_id = _create(mq, BrokerName=_name("user"), EngineType="ACTIVEMQ", EngineVersion="5.19")["BrokerId"]
+
+    resp = mq.create_user(
+        BrokerId=broker_id,
+        Username="testuser",
+        Password="TestPassw0rd!",
+        ConsoleAccess=False,
+    )
+    assert resp["ResponseMetadata"]["HTTPStatusCode"] == 200
+
+def test_mq_create_user_with_duplicated_username(mq):
+    broker_id = _create(mq, BrokerName=_name("user"), EngineType="ACTIVEMQ", EngineVersion="5.19")["BrokerId"]
+
+    mq.create_user(
+        BrokerId=broker_id,
+        Username="testuser",
+        Password="TestPassw0rd!",
+        ConsoleAccess=False,
+    )
+
+    with pytest.raises(ClientError) as exc:
+        mq.create_user(
+            BrokerId=broker_id,
+            Username="testuser",
+            Password="AnotherPassw0rd!",
+            ConsoleAccess=False,
+        )
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 409
+    assert exc.value.response["Error"]["Code"] == "ConflictException"
+
+@pytest.mark.parametrize("invalid_password", [
+    "pas",            # less than 4 characters
+    "password,",  # with commas
+    "password:",  # with colons
+    "password="  # with equals sign
+])
+def test_mq_create_user_with_invalid_password(mq, invalid_password):
+    broker_id = _create(mq, BrokerName=_name("user"), EngineType="ACTIVEMQ", EngineVersion="5.19")["BrokerId"]
+    with pytest.raises(ClientError) as exc:
+        mq.create_user(
+            BrokerId=broker_id,
+            Username="testuser",
+            Password=invalid_password,
+            ConsoleAccess=False,
+        )
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+    assert exc.value.response["Error"]["Code"] == "BadRequestException"
+
+def test_mq_create_user_with_non_existent_broker_id(mq):
+    with pytest.raises(ClientError) as exc:
+        mq.create_user(
+            BrokerId="invalid-id",
+            Username="testuser",
+            Password="TestPassw0rd!",
+            ConsoleAccess=False,
+        )
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 404
+    assert exc.value.response["Error"]["Code"] == "NotFoundException"
+
+def test_mq_create_user_with_not_supported_engine_type(mq):
+    broker_id = _create(mq, BrokerName=_name("user-invalid"), EngineType="RABBITMQ", EngineVersion="4.2")["BrokerId"]
+
+    with pytest.raises(ClientError) as exc:
+        mq.create_user(
+            BrokerId=broker_id,
+            Username="testuser",
+            Password="TestPassw0rd!",
+            ConsoleAccess=False,
+        )
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+    assert exc.value.response["Error"]["Code"] == "BadRequestException"
+
+##########################################################################
+# DeleteUser
+##########################################################################
+
+def test_mq_delete_user(mq):
+    broker_id = _create(mq, BrokerName=_name("user"), EngineType="ACTIVEMQ", EngineVersion="5.19")["BrokerId"]
+
+    mq.create_user(
+        BrokerId=broker_id,
+        Username="testuser",
+        Password="TestPassw0rd!",
+        ConsoleAccess=False,
+    )
+
+    del_resp = mq.delete_user(BrokerId=broker_id, Username="testuser")
+    assert del_resp["ResponseMetadata"]["HTTPStatusCode"] == 200
+
+def test_mq_delete_user_with_non_existent_username(mq):
+    broker_id = _create(mq, BrokerName=_name("user"), EngineType="ACTIVEMQ", EngineVersion="5.19")["BrokerId"]
+
+    with pytest.raises(ClientError) as exc:
+        mq.delete_user(BrokerId=broker_id, Username="nonexistentuser")
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 404
+    assert exc.value.response["Error"]["Code"] == "NotFoundException"
+
+def test_mq_delete_user_with_non_existent_broker_id(mq):
+    with pytest.raises(ClientError) as exc:
+        mq.delete_user(BrokerId="invalid-id", Username="testuser")
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 404
+    assert exc.value.response["Error"]["Code"] == "NotFoundException"
+
+def test_mq_delete_user_with_not_supported_engine_type(mq):
+    broker_id = _create(mq, BrokerName=_name("user-invalid"), EngineType="RABBITMQ", EngineVersion="4.2")["BrokerId"]
+
+    with pytest.raises(ClientError) as exc:
+        mq.delete_user(BrokerId=broker_id, Username="testuser")
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+    assert exc.value.response["Error"]["Code"] == "BadRequestException"
+
+###########################################################################
+# ListUsers
+###########################################################################
+
+def test_mq_list_users(mq):
+    broker_id = _create(mq, BrokerName=_name("user"), EngineType="ACTIVEMQ", EngineVersion="5.19")["BrokerId"]
+
+    mq.create_user(
+        BrokerId=broker_id,
+        Username="testuser1",
+        Password="TestPassw0rd!",
+        ConsoleAccess=False,
+    )
+
+    list_resp = mq.list_users(BrokerId=broker_id)
+    assert list_resp["ResponseMetadata"]["HTTPStatusCode"] == 200
+    assert list_resp["MaxResults"] == 20
+    usernames = {u["Username"] for u in list_resp.get("Users", [])}
+    assert "testuser1" in usernames
+
+def test_mq_list_users_with_no_users(mq):
+    broker_id = _create(mq, BrokerName=_name("user"), EngineType="ACTIVEMQ", EngineVersion="5.19")["BrokerId"]
+
+    list_resp = mq.list_users(BrokerId=broker_id)
+    assert list_resp["ResponseMetadata"]["HTTPStatusCode"] == 200
+    assert list_resp.get("Users", []) == []
+
+def test_mq_list_users_with_non_existent_broker_id(mq):
+    with pytest.raises(ClientError) as exc:
+        mq.list_users(BrokerId="invalid-id")
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 404
+    assert exc.value.response["Error"]["Code"] == "NotFoundException"
+
+def test_mq_list_users_with_not_supported_engine_type(mq):
+    broker_id = _create(mq, BrokerName=_name("user-invalid"), EngineType="RABBITMQ")["BrokerId"]
+
+    with pytest.raises(ClientError) as exc:
+        mq.list_users(BrokerId=broker_id)
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+    assert exc.value.response["Error"]["Code"] == "BadRequestException"
+
+def test_mq_list_users_with_pagination(mq):
+    broker_id = _create(mq, BrokerName=_name("user-page"), EngineType="ACTIVEMQ", EngineVersion="5.19")["BrokerId"]
+
+    # Create 3 users to ensure we have more than 2 to list
+    for i in range(3):
+        mq.create_user(
+            BrokerId=broker_id,
+            Username=f"testuser{i}",
+            Password="TestPassw0rd!",
+            ConsoleAccess=False,
+        )
+
+    # First page with MaxResults=2
+    resp1 = mq.list_users(BrokerId=broker_id, MaxResults=2)
+    assert resp1["ResponseMetadata"]["HTTPStatusCode"] == 200
+    assert resp1["MaxResults"] == 2
+    assert len(resp1.get("Users", [])) == 2
+    assert "NextToken" in resp1
+
+    # Second page using NextToken
+    resp2 = mq.list_users(BrokerId=broker_id, MaxResults=2, NextToken=resp1["NextToken"])
+    assert resp2["ResponseMetadata"]["HTTPStatusCode"] == 200
+    assert resp2["MaxResults"] == 2
+    assert len(resp2.get("Users", [])) >= 1
+
+    # Verify all created users are listed across pages
+    listed_usernames = {u["Username"] for u in resp1.get("Users", []) + resp2.get("Users", [])}
+    expected_usernames = {f"testuser{i}" for i in range(3)}
+    assert expected_usernames.issubset(listed_usernames), f"Expected {expected_usernames} in {listed_usernames}"
+
+@pytest.mark.parametrize("invalid_max", [4, 101])
+def test_mq_list_users_with_invalid_max_results(mq, invalid_max):
+    broker_id = _create(mq, BrokerName=_name("user-invalid-max"), EngineType="ACTIVEMQ", EngineVersion="5.19")["BrokerId"]
+
+    with pytest.raises(ClientError) as exc:
+        mq.list_users(BrokerId=broker_id, MaxResults=invalid_max)
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+    assert exc.value.response["Error"]["Code"] == "BadRequestException"
+
+############################################################################
+# UpdateUser
+############################################################################
+
+def test_mq_update_user(mq):
+    broker_id = _create(mq, BrokerName=_name("user"), EngineType="ACTIVEMQ", EngineVersion="5.19")["BrokerId"]
+
+    mq.create_user(
+        BrokerId=broker_id,
+        Username="testuser",
+        Password="TestPassw0rd!",
+        ConsoleAccess=False,
+    )
+
+    update_resp = mq.update_user(
+        BrokerId=broker_id,
+        Username="testuser",
+        Password="NewPassw0rd!",
+        ConsoleAccess=True,
+    )
+    assert update_resp["ResponseMetadata"]["HTTPStatusCode"] == 200
+
+def test_mq_update_user_with_non_existent_username(mq):
+    broker_id = _create(mq, BrokerName=_name("user"), EngineType="ACTIVEMQ", EngineVersion="5.19")["BrokerId"]
+
+    with pytest.raises(ClientError) as exc:
+        mq.update_user(
+            BrokerId=broker_id,
+            Username="nonexistentuser",
+            Password="NewPassw0rd!",
+            ConsoleAccess=True,
+        )
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 404
+    assert exc.value.response["Error"]["Code"] == "NotFoundException"
+
+def test_mq_update_user_with_non_existent_broker_id(mq):
+    with pytest.raises(ClientError) as exc:
+        mq.update_user(
+            BrokerId="invalid-id",
+            Username="testuser",
+            Password="NewPassw0rd!",
+            ConsoleAccess=True,
+        )
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 404
+    assert exc.value.response["Error"]["Code"] == "NotFoundException"
+
+def test_mq_update_user_with_not_supported_engine_type(mq):
+    broker_id = _create(mq, BrokerName=_name("user-invalid-update"), EngineType="RABBITMQ")["BrokerId"]
+
+    with pytest.raises(ClientError) as exc:
+        mq.update_user(
+            BrokerId=broker_id,
+            Username="testuser",
+            Password="NewPassw0rd!",
+            ConsoleAccess=True,
+        )
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+    assert exc.value.response["Error"]["Code"] == "BadRequestException"
+
+@pytest.mark.parametrize("invalid_password", [
+    "pas",            # less than 4 characters
+    "password,",  # with commas
+    "password:",  # with colons
+    "password="  # with equals sign
+])
+def test_mq_update_user_with_invalid_password(mq, invalid_password):
+    broker_id = _create(mq, BrokerName=_name("user-invalid-update"), EngineType="ACTIVEMQ", EngineVersion="5.19")["BrokerId"]
+
+    mq.create_user(
+        BrokerId=broker_id,
+        Username="testuser",
+        Password="TestPassw0rd!",
+        ConsoleAccess=False,
+    )
+
+    with pytest.raises(ClientError) as exc:
+        mq.update_user(
+            BrokerId=broker_id,
+            Username="testuser",
+            Password=invalid_password,
+        )
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+    assert exc.value.response["Error"]["Code"] == "BadRequestException"
