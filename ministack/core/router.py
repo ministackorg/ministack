@@ -249,6 +249,10 @@ SERVICE_PATTERNS = {
         "path_prefixes": ["/v1/"],
         "credential_scope": "batch",
     },
+    "mq": {
+        "host_patterns": [r"mq\."],
+        "path_patterns": [r"^/v1/brokers", "^/v1/broker-engine-types", "^/v1/tags"],
+    },
     "cloudformation": {
         "host_patterns": [r"cloudformation\."],
     },

@@ -514,3 +514,8 @@ def cur():
 @pytest.fixture(scope="session")
 def inspector2():
     return make_client("inspector2")
+
+
+@pytest.fixture(scope="session")
+def mq():
+    return make_client("mq")
