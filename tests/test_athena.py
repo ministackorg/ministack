@@ -178,6 +178,101 @@ def test_athena_tags_v2(athena):
     resp2 = athena.list_tags_for_resource(ResourceARN=wg_arn)
     assert not any(t["Key"] == "env" for t in resp2["Tags"])
 
+
+def test_athena_tag_resource_arn_parser_accepts_local_resource_shapes():
+    from ministack.core.responses import (
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+    from ministack.services import athena as m
+
+    original_account = get_account_id()
+    original_region = get_region()
+    original_tags = dict(m._tags._data)
+
+    try:
+        m._tags.clear()
+        set_request_account_id("000000000000")
+        set_request_region("us-east-1")
+
+        workgroup_arn = "arn:aws:athena:us-east-1:000000000000:workgroup/parser-wg"
+        catalog_arn = "arn:aws:athena:us-east-1:000000000000:datacatalog/parser-catalog"
+
+        assert m._tag_resource({
+            "ResourceARN": workgroup_arn,
+            "Tags": [{"Key": "env", "Value": "east"}],
+        })[0] == 200
+        assert m._tag_resource({
+            "ResourceARN": catalog_arn,
+            "Tags": [{"Key": "team", "Value": "data"}],
+        })[0] == 200
+
+        _status, _headers, body = m._list_tags_for_resource({"ResourceARN": workgroup_arn})
+        assert json.loads(body)["Tags"] == [{"Key": "env", "Value": "east"}]
+
+        assert m._untag_resource({"ResourceARN": workgroup_arn, "TagKeys": ["env"]})[0] == 200
+        _status, _headers, body = m._list_tags_for_resource({"ResourceARN": workgroup_arn})
+        assert json.loads(body)["Tags"] == []
+        assert m._tags.get(catalog_arn) == {"team": "data"}
+    finally:
+        m._tags.clear()
+        m._tags._data.update(original_tags)
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
+def test_athena_tag_resource_arn_parser_rejects_invalid_scope_without_mutation():
+    from ministack.core.responses import (
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+    from ministack.services import athena as m
+
+    original_account = get_account_id()
+    original_region = get_region()
+    original_tags = dict(m._tags._data)
+
+    def assert_invalid(response):
+        status, headers, body = response
+        assert status == 400
+        assert headers["x-amzn-errortype"] == "InvalidRequestException"
+        assert json.loads(body)["__type"] == "InvalidRequestException"
+
+    try:
+        m._tags.clear()
+        set_request_account_id("000000000000")
+        set_request_region("us-east-1")
+
+        invalid_arns = [
+            "not-an-arn",
+            "arn:aws:s3:us-east-1:000000000000:workgroup/parser-wg",
+            "arn:aws-cn:athena:us-east-1:000000000000:workgroup/parser-wg",
+            "arn:aws:athena:us-west-2:000000000000:workgroup/parser-wg",
+            "arn:aws:athena:us-east-1:111111111111:workgroup/parser-wg",
+            "arn:aws:athena:us-east-1:000000000000:namedquery/parser-query",
+            "arn:aws:athena:us-east-1:000000000000:workgroup/parser-wg/extra",
+        ]
+
+        for arn in invalid_arns:
+            assert_invalid(m._tag_resource({
+                "ResourceARN": arn,
+                "Tags": [{"Key": "env", "Value": "bad"}],
+            }))
+            assert_invalid(m._untag_resource({"ResourceARN": arn, "TagKeys": ["env"]}))
+            assert_invalid(m._list_tags_for_resource({"ResourceARN": arn}))
+
+        assert m._tags._data == {}
+    finally:
+        m._tags.clear()
+        m._tags._data.update(original_tags)
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
 def test_athena_update_workgroup(athena):
     import uuid as _uuid
 

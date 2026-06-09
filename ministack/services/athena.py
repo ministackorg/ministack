@@ -26,6 +26,7 @@ import xml.etree.ElementTree as ET
 from datetime import date
 from urllib.parse import urlparse
 
+from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.persistence import PERSIST_STATE, load_state
 from ministack.core.responses import (
     AccountScopedDict,
@@ -168,6 +169,38 @@ def _arn_workgroup(name):
 
 def _arn_datacatalog(name):
     return f"arn:aws:athena:{get_region()}:{get_account_id()}:datacatalog/{name}"
+
+
+def _is_taggable_athena_resource(resource):
+    for prefix in ("workgroup/", "datacatalog/"):
+        if resource.startswith(prefix):
+            name = resource[len(prefix):]
+            return bool(name) and "/" not in name
+    return False
+
+
+def _validate_tag_resource_arn(arn):
+    try:
+        spec = parse_arn(arn)
+    except ArnParseError:
+        return error_response_json(
+            "InvalidRequestException",
+            f"Invalid ResourceARN: {arn}",
+            400,
+        )
+    if (
+        spec.partition != "aws"
+        or spec.service != "athena"
+        or spec.region != get_region()
+        or spec.account_id != get_account_id()
+        or not _is_taggable_athena_resource(spec.resource)
+    ):
+        return error_response_json(
+            "InvalidRequestException",
+            f"Invalid ResourceARN: {arn}",
+            400,
+        )
+    return None
 
 
 async def handle_request(method, path, headers, body, query_params):
@@ -1004,6 +1037,9 @@ def _list_table_metadata(data):
 
 def _tag_resource(data):
     arn = data.get("ResourceARN", "")
+    validation_error = _validate_tag_resource_arn(arn)
+    if validation_error:
+        return validation_error
     tags = data.get("Tags", [])
     tag_dict = _tags.setdefault(arn, {})
     for t in tags:
@@ -1013,6 +1049,9 @@ def _tag_resource(data):
 
 def _untag_resource(data):
     arn = data.get("ResourceARN", "")
+    validation_error = _validate_tag_resource_arn(arn)
+    if validation_error:
+        return validation_error
     keys = data.get("TagKeys", [])
     tag_dict = _tags.get(arn, {})
     for k in keys:
@@ -1022,6 +1061,9 @@ def _untag_resource(data):
 
 def _list_tags_for_resource(data):
     arn = data.get("ResourceARN", "")
+    validation_error = _validate_tag_resource_arn(arn)
+    if validation_error:
+        return validation_error
     tag_dict = _tags.get(arn, {})
     tags = [{"Key": k, "Value": v} for k, v in tag_dict.items()]
     return json_response({"Tags": tags})
