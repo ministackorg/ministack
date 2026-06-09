@@ -14,6 +14,7 @@ import json
 import logging
 import os
 
+from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.persistence import PERSIST_STATE, load_state
 from ministack.core.responses import (
     AccountScopedDict,
@@ -34,6 +35,12 @@ _ip_sets = AccountScopedDict()        # id -> ipset
 _rule_groups = AccountScopedDict()    # id -> rulegroup
 _associations = AccountScopedDict()   # resource_arn -> webacl_arn
 _waf_tags = AccountScopedDict()       # resource_arn -> [tags]
+
+_WAF_RESOURCE_SCOPES = {
+    "webacl": {"regional", "cloudfront", "global"},
+    "ipset": {"regional", "global"},
+    "rulegroup": {"regional", "global"},
+}
 
 
 def get_state():
@@ -69,6 +76,14 @@ def _waf_err(code, message):
     return error_response_json(code, message, 400)
 
 
+def _waf_invalid_arn(arn):
+    return _waf_err("WAFInvalidParameterException", f"Invalid WAFv2 resource ARN: {arn}")
+
+
+def _waf_not_found(arn):
+    return _waf_err("WAFNonexistentItemException", f"WAFv2 resource {arn} not found")
+
+
 def _acl_arn(name, uid):
     return f"arn:aws:wafv2:{get_region()}:{get_account_id()}:regional/webacl/{name}/{uid}"
 
@@ -79,6 +94,57 @@ def _ipset_arn(name, uid):
 
 def _rg_arn(name, uid):
     return f"arn:aws:wafv2:{get_region()}:{get_account_id()}:regional/rulegroup/{name}/{uid}"
+
+
+def _parse_local_waf_arn(arn, allowed_types):
+    try:
+        spec = parse_arn(arn)
+    except ArnParseError:
+        return None, None, _waf_invalid_arn(arn)
+
+    if (
+        spec.partition != "aws"
+        or spec.service != "wafv2"
+        or spec.region != get_region()
+        or spec.account_id != get_account_id()
+    ):
+        return None, None, _waf_invalid_arn(arn)
+
+    parts = spec.resource.split("/")
+    if len(parts) != 4:
+        return None, None, _waf_invalid_arn(arn)
+    scope, resource_type, name, uid = parts
+    if resource_type not in allowed_types or not name or not uid:
+        return None, None, _waf_invalid_arn(arn)
+    if scope not in _WAF_RESOURCE_SCOPES.get(resource_type, set()):
+        return None, None, _waf_invalid_arn(arn)
+    return resource_type, uid, None
+
+
+def _resolve_local_waf_resource_arn(arn, allowed_types=("webacl", "ipset", "rulegroup")):
+    resource_type, uid, err = _parse_local_waf_arn(arn, allowed_types)
+    if err:
+        return None, err
+
+    stores = {
+        "webacl": _web_acls,
+        "ipset": _ip_sets,
+        "rulegroup": _rule_groups,
+    }
+    resource = stores[resource_type].get(uid)
+    if not resource or resource.get("ARN") != arn:
+        return None, _waf_not_found(arn)
+    return arn, None
+
+
+def _resolve_local_web_acl(web_acl_arn):
+    arn, err = _resolve_local_waf_resource_arn(web_acl_arn, ("webacl",))
+    if err:
+        return None, err
+    for acl in _web_acls.values():
+        if acl["ARN"] == arn:
+            return acl, None
+    return None, _waf_not_found(web_acl_arn)
 
 
 async def handle_request(method, path, headers, body, query_params):
@@ -211,6 +277,9 @@ def _list_web_acls(data):
 
 def _associate_web_acl(data):
     web_acl_arn = data.get("WebACLArn", "")
+    _, err = _resolve_local_web_acl(web_acl_arn)
+    if err:
+        return err
     resource_arn = data.get("ResourceArn", "")
     _associations[resource_arn] = web_acl_arn
     return json_response({})
@@ -236,6 +305,9 @@ def _get_web_acl_for_resource(data):
 
 def _list_resources_for_web_acl(data):
     web_acl_arn = data.get("WebACLArn", "")
+    _, err = _resolve_local_web_acl(web_acl_arn)
+    if err:
+        return err
     arns = [r for r, a in _associations.items() if a == web_acl_arn]
     return json_response({"ResourceArns": arns})
 
@@ -368,6 +440,9 @@ def _list_rule_groups(data):
 
 def _tag_resource(data):
     arn = data.get("ResourceARN", "")
+    arn, err = _resolve_local_waf_resource_arn(arn)
+    if err:
+        return err
     existing = {t["Key"]: t for t in _waf_tags.get(arn, [])}
     for tag in data.get("Tags", []):
         existing[tag["Key"]] = tag
@@ -377,6 +452,9 @@ def _tag_resource(data):
 
 def _untag_resource(data):
     arn = data.get("ResourceARN", "")
+    arn, err = _resolve_local_waf_resource_arn(arn)
+    if err:
+        return err
     remove_keys = set(data.get("TagKeys", []))
     _waf_tags[arn] = [t for t in _waf_tags.get(arn, []) if t["Key"] not in remove_keys]
     return json_response({})
@@ -384,6 +462,9 @@ def _untag_resource(data):
 
 def _list_tags_for_resource(data):
     arn = data.get("ResourceARN", "")
+    arn, err = _resolve_local_waf_resource_arn(arn)
+    if err:
+        return err
     return json_response({"TagInfoForResource": {"ResourceARN": arn, "TagList": _waf_tags.get(arn, [])}})
 
 
