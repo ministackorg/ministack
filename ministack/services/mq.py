@@ -172,6 +172,10 @@ def _create_broker(body: dict) -> tuple:
     if host_instance_type not in _valid_host_instance_types(engine_type):
         return _err(400, "HostInstanceType", "Host instance type is invalid.")
 
+    storage_type = body.get("storageType", "EBS")
+    if storage_type and storage_type not in _valid_storage_types(engine_type):
+        return _err(400, "StorageType", f"Invalid storage type: '{storage_type}'.")
+
     broker_id = new_uuid()
     broker_arn = _make_broker_arn(broker_id)
     created = time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime())

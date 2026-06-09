@@ -58,27 +58,21 @@ def test_mq_create_broker_with_duplicated_name(mq):
     assert exc.value.response["Error"]["Code"] == "ConflictException"
 
 @pytest.mark.parametrize(
-    "broker_name_suffix,engine_type,engine_version,host_instance_type,deployment_mode",
+    "create_params",
     [
-        ("invalid-engine", "INVALID_ENGINE", "1.0", "mq.m5.large", "SINGLE_INSTANCE"),
-        ("invalid-engine-version", "RABBITMQ", "INVALID_VERSION", "mq.m5.large", "SINGLE_INSTANCE"),
-        ("invalid-deployment-mode", "RABBITMQ", "3.13", "mq.m5.large", "INVALID_MODE"),
-        ("invalid-instance-type", "RABBITMQ", "3.13", "INVALID_INSTANCE", "SINGLE_INSTANCE"),
+        {"BrokerName": _name("invalid-engine"), "EngineType": "INVALID_ENGINE", "EngineVersion": "1.0", "HostInstanceType": "mq.m5.large", "DeploymentMode": "SINGLE_INSTANCE", "PubliclyAccessible": False},
+        {"BrokerName": _name("invalid-engine-version"), "EngineType": "RABBITMQ", "EngineVersion": "INVALID_VERSION", "HostInstanceType": "mq.m5.large", "DeploymentMode": "SINGLE_INSTANCE", "PubliclyAccessible": False},
+        {"BrokerName": _name("invalid-deployment-mode"), "EngineType": "RABBITMQ", "EngineVersion": "3.13", "HostInstanceType": "mq.m5.large", "DeploymentMode": "INVALID_MODE", "PubliclyAccessible": False},
+        {"BrokerName": _name("invalid-instance-type"), "EngineType": "RABBITMQ", "EngineVersion": "3.13", "HostInstanceType": "INVALID_INSTANCE", "DeploymentMode": "SINGLE_INSTANCE", "PubliclyAccessible": False},
+        {"BrokerName": _name("invalid-storage-type"), "EngineType": "RABBITMQ", "EngineVersion": "3.13", "HostInstanceType": "mq.m5.large", "DeploymentMode": "SINGLE_INSTANCE", "StorageType": "INVALID_STORAGE", "PubliclyAccessible": False}
     ],
 )
 def test_mq_create_broker_with_invalid_parameters(
-    mq, broker_name_suffix, engine_type, engine_version, host_instance_type, deployment_mode
+    mq, create_params
 ):
     """Test that invalid parameters return BadRequestException."""
     with pytest.raises(ClientError) as exc:
-        mq.create_broker(
-            BrokerName=_name(broker_name_suffix),
-            EngineType=engine_type,
-            EngineVersion=engine_version,
-            HostInstanceType=host_instance_type,
-            PubliclyAccessible=False,
-            DeploymentMode=deployment_mode,
-        )
+        mq.create_broker(**create_params)
     assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
     assert exc.value.response["Error"]["Code"] == "BadRequestException"
 
