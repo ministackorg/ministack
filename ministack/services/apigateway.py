@@ -51,6 +51,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.responses import AccountScopedDict, error_response_json, get_account_id, get_region, new_uuid
 
 _HOST = os.environ.get("MINISTACK_HOST", "localhost")
@@ -168,7 +169,12 @@ def _apigw_error(code: str, message: str, status: int) -> tuple:
 
 
 def _api_arn(api_id: str) -> str:
-    return f"arn:aws:apigateway:{get_region()}::/apis/{api_id}"
+    return _api_resource_arn(api_id)
+
+
+def _api_resource_arn(api_id: str, *segments: str) -> str:
+    suffix = "".join(f"/{segment}" for segment in segments)
+    return f"arn:aws:apigateway:{get_region()}::/apis/{api_id}{suffix}"
 
 
 def _extract_lambda_ref_from_integration_uri(uri: str) -> str:
@@ -259,7 +265,7 @@ async def handle_request(method, path, headers, body, query_params):
     # /v2/tags/{resourceArn} — tags endpoint
     if resource == "tags":
         # resourceArn may contain slashes; rejoin everything after "tags/"
-        resource_arn = "/".join(parts[2:]) if len(parts) > 2 else ""
+        resource_arn = urllib.parse.unquote("/".join(parts[2:])) if len(parts) > 2 else ""
         if method == "GET":
             return _get_tags(resource_arn)
         if method == "POST":
@@ -1215,13 +1221,13 @@ def _get_apis():
 
 
 def _delete_api(api_id):
+    _delete_api_tag_resources(api_id)
     _apis.pop(api_id, None)
     _api_regions.pop(api_id, None)
     _routes.pop(api_id, None)
     _integrations.pop(api_id, None)
     _stages.pop(api_id, None)
     _deployments.pop(api_id, None)
-    _api_tags.pop(_api_arn(api_id), None)
     return 204, {}, b""
 
 
@@ -1314,6 +1320,7 @@ def _update_route(api_id, route_id, data):
 
 def _delete_route(api_id, route_id):
     _routes.get(api_id, {}).pop(route_id, None)
+    _api_tags.pop(_api_resource_arn(api_id, "routes", route_id), None)
     return 204, {}, b""
 
 
@@ -1387,6 +1394,7 @@ def _update_integration(api_id, int_id, data):
 
 def _delete_integration(api_id, int_id):
     _integrations.get(api_id, {}).pop(int_id, None)
+    _api_tags.pop(_api_resource_arn(api_id, "integrations", int_id), None)
     return 204, {}, b""
 
 
@@ -1408,6 +1416,8 @@ def _create_stage(api_id, data):
         "tags": data.get("tags", {}),
     }
     _stages.setdefault(api_id, {})[stage_name] = stage
+    if data.get("tags"):
+        _api_tags[_api_resource_arn(api_id, "stages", stage_name)] = dict(data.get("tags", {}))
     return _apigw_response(stage, 201)
 
 
@@ -1436,6 +1446,7 @@ def _update_stage(api_id, stage_name, data):
 
 def _delete_stage(api_id, stage_name):
     _stages.get(api_id, {}).pop(stage_name, None)
+    _api_tags.pop(_api_resource_arn(api_id, "stages", stage_name), None)
     return 204, {}, b""
 
 
@@ -1468,24 +1479,98 @@ def _get_deployment(api_id, deployment_id):
 
 def _delete_deployment(api_id, deployment_id):
     _deployments.get(api_id, {}).pop(deployment_id, None)
+    _api_tags.pop(_api_resource_arn(api_id, "deployments", deployment_id), None)
     return 204, {}, b""
 
 
 # ---- Control plane: Tags ----
 
+def _invalid_tag_resource_arn(resource_arn: str):
+    return _apigw_error(
+        "BadRequestException",
+        f"Invalid API Gateway v2 ResourceArn: {resource_arn}",
+        400,
+    )
+
+
+def _tag_resource_not_found(resource_arn: str):
+    return _apigw_error(
+        "NotFoundException",
+        f"API Gateway v2 resource not found: {resource_arn}",
+        404,
+    )
+
+
+def _api_exists_in_request_region(api_id: str) -> bool:
+    return api_id in _apis and _api_regions.get(api_id, get_region()) == get_region()
+
+
+def _validate_tag_resource_arn(resource_arn: str) -> tuple[str | None, tuple | None]:
+    try:
+        spec = parse_arn(resource_arn)
+    except ArnParseError:
+        return None, _invalid_tag_resource_arn(resource_arn)
+
+    if (
+        spec.partition != "aws"
+        or spec.service != "apigateway"
+        or not spec.region
+        or spec.region != get_region()
+        or spec.account_id != ""
+        or not spec.resource.startswith("/")
+    ):
+        return None, _invalid_tag_resource_arn(resource_arn)
+
+    segments = spec.resource[1:].split("/")
+    if not segments or any(segment == "" for segment in segments):
+        return None, _invalid_tag_resource_arn(resource_arn)
+    if len(segments) not in (2, 4) or segments[0] != "apis":
+        return None, _invalid_tag_resource_arn(resource_arn)
+
+    api_id = segments[1]
+    if not _api_exists_in_request_region(api_id):
+        return None, _tag_resource_not_found(resource_arn)
+    if len(segments) == 2:
+        return _api_arn(api_id), None
+
+    resource_type, resource_id = segments[2], segments[3]
+    if resource_type != "stages":
+        return None, _invalid_tag_resource_arn(resource_arn)
+    if resource_id not in _stages.get(api_id, {}):
+        return None, _tag_resource_not_found(resource_arn)
+    return _api_resource_arn(api_id, resource_type, resource_id), None
+
+
+def _delete_api_tag_resources(api_id: str):
+    api_arn = _api_arn(api_id)
+    nested_prefix = f"{api_arn}/"
+    for resource_arn in list(_api_tags):
+        if resource_arn == api_arn or resource_arn.startswith(nested_prefix):
+            _api_tags.pop(resource_arn, None)
+
+
 def _get_tags(resource_arn: str):
-    tags = _api_tags.get(resource_arn, {})
+    canonical_arn, err = _validate_tag_resource_arn(resource_arn)
+    if err:
+        return err
+    tags = _api_tags.get(canonical_arn, {})
     return _apigw_response({"tags": tags})
 
 
 def _tag_resource(resource_arn: str, data: dict):
+    canonical_arn, err = _validate_tag_resource_arn(resource_arn)
+    if err:
+        return err
     tags = data.get("tags", {})
-    _api_tags.setdefault(resource_arn, {}).update(tags)
+    _api_tags.setdefault(canonical_arn, {}).update(tags)
     return 201, {}, b""
 
 
 def _untag_resource(resource_arn: str, tag_keys: list):
-    existing = _api_tags.get(resource_arn, {})
+    canonical_arn, err = _validate_tag_resource_arn(resource_arn)
+    if err:
+        return err
+    existing = _api_tags.get(canonical_arn, {})
     for key in tag_keys:
         existing.pop(key, None)
     return 204, {}, b""
@@ -1538,6 +1623,7 @@ def _update_authorizer(api_id, auth_id, data):
 
 def _delete_authorizer(api_id, auth_id):
     _authorizers.get(api_id, {}).pop(auth_id, None)
+    _api_tags.pop(_api_resource_arn(api_id, "authorizers", auth_id), None)
     return 204, {}, b""
 
 
