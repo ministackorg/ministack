@@ -576,7 +576,6 @@ def test_appconfig_tag_resource_rejects_invalid_arns_before_mutating_tags(appcon
         valid_arn.replace(":appconfig:", ":ssm:", 1),
         valid_arn.replace(":000000000000:", ":111111111111:", 1),
         valid_arn.replace(":us-east-1:", ":us-west-2:", 1),
-        f"{valid_arn}/environment/env/deployment/1",
     ]
 
     for resource_arn in invalid_arns:
@@ -602,6 +601,7 @@ def test_appconfig_tag_resource_rejects_missing_local_resources_before_touching_
         f"arn:aws:appconfig:us-east-1:000000000000:application/{app['Id']}/environment/missing-env",
         f"arn:aws:appconfig:us-east-1:000000000000:application/{app['Id']}/configurationprofile/missing-profile",
         "arn:aws:appconfig:us-east-1:000000000000:deploymentstrategy/missing-strategy",
+        f"arn:aws:appconfig:us-east-1:000000000000:application/{app['Id']}/environment/missing-env/deployment/1",
     ]
     for resource_arn in missing_arns:
         appconfig_service._tags[resource_arn] = {"legacy": "keep"}
