@@ -314,7 +314,6 @@ SERVICE_REGISTRY = {
     "s3tables": {"module": "s3tables"},
     "bedrock": {"module": "bedrock"},
     "bedrock-runtime": {"module": "bedrock_runtime"},
-    "bedrock-mantle": {"module": "bedrock_mantle"},
     "bedrock-agent": {"module": "bedrock_agent"},
     "bedrock-agent-runtime": {"module": "bedrock_agent_runtime"},
     "kafka": {"module": "msk"},

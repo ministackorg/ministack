@@ -405,10 +405,6 @@ SERVICE_PATTERNS = {
         "credential_scope": "bedrock",
         "path_prefixes": ["/foundation-models", "/inference-profiles"],
     },
-    "bedrock-mantle": {
-        "host_patterns": [r"bedrock-mantle\."],
-        "path_prefixes": ["/v1/chat/completions"],
-    },
     "kafka": {
         "host_patterns": [r"^kafka\."],
         "credential_scope": "kafka",
@@ -903,10 +899,10 @@ def detect_service(method: str, path: str, headers: dict, query_params: dict) ->
     if path_lower.startswith("/v2/credentials"):
         return "imds"
     if path_lower.startswith("/v1/chat/completions"):
-        # Bedrock Mantle OpenAI-shape inference. openai-python sends unsigned
-        # POSTs, so we route purely on path before falling into other /v1/...
-        # branches.
-        return "bedrock-mantle"
+        # OpenAI-shape inference, served on the bedrock-runtime surface (folded
+        # in from the former standalone bedrock-mantle service). openai-python
+        # sends unsigned POSTs, so route purely on path.
+        return "bedrock-runtime"
     if path_lower.startswith("/v1/apis") or path_lower.startswith("/v1/tags/arn:aws:appsync"):
         return "appsync"
     if path_lower.startswith("/key-value-stores/"):

@@ -214,7 +214,7 @@ def reset():
                    _model_import_jobs, _model_copy_jobs,
                    _model_invocation_jobs, _evaluation_jobs,
                    _marketplace_endpoints, _prompt_routers,
-                   _invocation_logging_config, _tags):
+                   _invocation_logging_config, _tags, _USE_CASE):
         store.clear()
 
 
@@ -235,6 +235,7 @@ def get_state():
         "prompt_routers": _prompt_routers,
         "invocation_logging_config": _invocation_logging_config,
         "tags": _tags,
+        "use_case": _USE_CASE,
     })
 
 
@@ -256,6 +257,7 @@ def restore_state(data):
     _prompt_routers.update(data.get("prompt_routers", {}))
     _invocation_logging_config.update(data.get("invocation_logging_config", {}))
     _tags.update(data.get("tags", {}))
+    _USE_CASE.update(data.get("use_case", {}))
 
 
 try:

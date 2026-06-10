@@ -31,6 +31,7 @@ approximate. Documented in release notes; users asserting on exact counts
 should not assert against a mock.
 """
 
+import asyncio
 import base64
 import hashlib
 import json
@@ -793,23 +794,179 @@ _APPLY_GUARDRAIL_RE = re.compile(
 _ASYNC_INVOKE_GET_RE = re.compile(r"^/async-invoke/(.+)$")
 
 
+# ---------------------------------------------------------------------------
+# OpenAI-compatible Chat Completions
+# Bedrock's OpenAI-shape inference surface, served on the bedrock-runtime host
+# at /v1/chat/completions (the byte-shape contract is OpenAI's, not AWS's, since
+# the clients are the OpenAI SDKs pointed at Bedrock via base_url). Mock by
+# default; forwards to MINISTACK_BEDROCK_PROXY_URL when set, same as Converse.
+# ---------------------------------------------------------------------------
+
+
+def _openai_flatten_content(content):
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for p in content:
+            if isinstance(p, dict) and p.get("type") == "text":
+                parts.append(p.get("text", ""))
+            elif isinstance(p, str):
+                parts.append(p)
+        return "\n".join(parts)
+    return ""
+
+
+def _openai_messages_text(messages) -> str:
+    return "\n".join(_openai_flatten_content(m.get("content")) for m in (messages or []))
+
+
+def _openai_error(message, code="invalid_request_error", status=400) -> tuple:
+    body = json.dumps({"error": {"message": message, "type": code, "param": None, "code": None}}).encode()
+    return status, {"Content-Type": "application/json"}, body
+
+
+def _chatcmpl_id() -> str:
+    return "chatcmpl-" + uuid.uuid4().hex[:24]
+
+
+def _openai_mock_reply(model_id, messages) -> str:
+    digest = hashlib.sha256(_openai_messages_text(messages).encode()).hexdigest()[:8]
+    return f"[ministack mock {_family(model_id)} {model_id}] reply for prompt#{digest}"
+
+
+def _proxy_openai_passthrough(payload: dict):
+    """Forward a raw OpenAI chat-completions payload to the configured proxy.
+    Returns the assistant text, or None on no-proxy / failure (caller mocks)."""
+    if not _PROXY_URL:
+        return None
+    fwd = dict(payload)
+    fwd["stream"] = False
+    req = urllib.request.Request(
+        f"{_PROXY_URL}/v1/chat/completions",
+        data=json.dumps(fwd).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=_PROXY_TIMEOUT_S) as resp:
+            data = json.load(resp)
+        return data["choices"][0]["message"]["content"]
+    except Exception:
+        logger.debug("openai proxy unreachable/malformed, falling back to mock")
+        return None
+
+
+def _build_chat_completion(model_id, messages, text) -> dict:
+    pt = _estimate_tokens(_openai_messages_text(messages))
+    ct = _estimate_tokens(text)
+    return {
+        "id": _chatcmpl_id(),
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": model_id,
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": text},
+            "finish_reason": "stop",
+            "logprobs": None,
+        }],
+        "usage": {"prompt_tokens": pt, "completion_tokens": ct, "total_tokens": pt + ct},
+        "system_fingerprint": "ministack",
+    }
+
+
+def _validate_openai_chat(body_obj):
+    if not isinstance(body_obj, dict):
+        return _openai_error("Request body must be a JSON object.")
+    if "model" not in body_obj or not isinstance(body_obj["model"], str):
+        return _openai_error("'model' is a required field.")
+    messages = body_obj.get("messages")
+    if not isinstance(messages, list) or not messages:
+        return _openai_error("'messages' must be a non-empty array.")
+    for i, m in enumerate(messages):
+        if not isinstance(m, dict):
+            return _openai_error(f"messages[{i}] must be an object.")
+        if m.get("role") not in ("system", "user", "assistant", "tool", "developer"):
+            return _openai_error(f"messages[{i}].role must be one of system/user/assistant/tool/developer.")
+        if "content" not in m:
+            return _openai_error(f"messages[{i}].content is required.")
+    return None
+
+
+def _openai_sse(data) -> bytes:
+    if data == "[DONE]":
+        return b"data: [DONE]\n\n"
+    return f"data: {json.dumps(data)}\n\n".encode("utf-8")
+
+
+def _build_chat_stream(model_id, messages, text) -> bytes:
+    base = {
+        "id": _chatcmpl_id(),
+        "object": "chat.completion.chunk",
+        "created": int(time.time()),
+        "model": model_id,
+        "system_fingerprint": "ministack",
+    }
+    out = _openai_sse({**base, "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": None, "logprobs": None}]})
+    if text:
+        chunk_size = max(1, len(text) // 5) if len(text) > 20 else len(text)
+        pos = 0
+        while pos < len(text):
+            out += _openai_sse({**base, "choices": [{"index": 0, "delta": {"content": text[pos:pos + chunk_size]}, "finish_reason": None, "logprobs": None}]})
+            pos += chunk_size
+    out += _openai_sse({**base, "choices": [{"index": 0, "delta": {}, "finish_reason": "stop", "logprobs": None}]})
+    out += _openai_sse("[DONE]")
+    return out
+
+
+def _openai_chat_completion(headers, body) -> tuple:
+    try:
+        body_obj = json.loads(body or b"{}")
+    except json.JSONDecodeError:
+        return _openai_error("Body is not valid JSON.")
+    err = _validate_openai_chat(body_obj)
+    if err:
+        return err
+    model_id = body_obj["model"]
+    messages = body_obj["messages"]
+    text = _proxy_openai_passthrough(body_obj)
+    if text is None:
+        text = _openai_mock_reply(model_id, messages)
+    if body_obj.get("stream") is True:
+        return 200, {
+            "Content-Type": "text/event-stream",
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+        }, _build_chat_stream(model_id, messages, text)
+    return 200, {"Content-Type": "application/json"}, json.dumps(_build_chat_completion(model_id, messages, text)).encode()
+
+
 async def handle_request(method, path, headers, body, query_params):
     logger.debug("%s %s", method, path)
 
-    # Streaming operations (POST only)
+    # OpenAI-compatible chat completions (folded in from the former standalone
+    # bedrock-mantle service — AWS serves this on the bedrock-runtime surface).
+    if path == "/v1/chat/completions":
+        if method != "POST":
+            return _openai_error(f"Unsupported method {method}.", status=405)
+        return await asyncio.to_thread(_openai_chat_completion, headers, body)
+
+    # Proxy-capable handlers run in a worker thread: a slow
+    # MINISTACK_BEDROCK_PROXY_URL must never block the single-port event loop.
     if method == "POST":
         m = _CONVERSE_STREAM_RE.match(path)
         if m:
-            return _converse_stream(unquote(m.group(1)), headers, body)
+            return await asyncio.to_thread(_converse_stream, unquote(m.group(1)), headers, body)
         m = _CONVERSE_RE.match(path)
         if m:
-            return _converse(unquote(m.group(1)), headers, body)
+            return await asyncio.to_thread(_converse, unquote(m.group(1)), headers, body)
         m = _INVOKE_STREAM_RE.match(path)
         if m:
-            return _invoke_model_with_response_stream(unquote(m.group(1)), headers, body)
+            return await asyncio.to_thread(_invoke_model_with_response_stream, unquote(m.group(1)), headers, body)
         m = _INVOKE_RE.match(path)
         if m:
-            return _invoke_model(unquote(m.group(1)), headers, body)
+            return await asyncio.to_thread(_invoke_model, unquote(m.group(1)), headers, body)
         m = _APPLY_GUARDRAIL_RE.match(path)
         if m:
             return _apply_guardrail(unquote(m.group(1)), unquote(m.group(2)), body)
