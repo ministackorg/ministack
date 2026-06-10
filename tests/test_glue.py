@@ -1378,3 +1378,174 @@ def test_glue_resolve_script_isolated_per_account(tmp_path, monkeypatch):
         assert gluemod._resolve_script(uri) is None
     finally:
         respmod._request_account_id.reset(tok_other)
+
+
+# ---- Column Statistics ----
+
+def _make_int_column_stats(column_name):
+    return {
+        "ColumnName": column_name,
+        "ColumnType": "int",
+        "AnalyzedTime": 1700000000,
+        "StatisticsData": {
+            "Type": "LONG",
+            "LongColumnStatisticsData": {
+                "MinimumValue": 1,
+                "MaximumValue": 100,
+                "NumberOfNulls": 0,
+                "NumberOfDistinctValues": 50,
+            },
+        },
+    }
+
+
+def _setup_stats_table(glue, db, table, partitioned=False):
+    glue.create_database(DatabaseInput={"Name": db})
+    table_input = {
+        "Name": table,
+        "StorageDescriptor": {
+            "Columns": [
+                {"Name": "id", "Type": "int"},
+                {"Name": "amount", "Type": "int"},
+            ],
+            "Location": f"s3://bucket/{db}/{table}/",
+            "InputFormat": "",
+            "OutputFormat": "",
+            "SerdeInfo": {},
+        },
+    }
+    if partitioned:
+        table_input["PartitionKeys"] = [{"Name": "dt", "Type": "string"}]
+    glue.create_table(DatabaseName=db, TableInput=table_input)
+
+
+def test_glue_column_statistics_for_table_crud(glue):
+    db, table = "qa-glue-colstats-tbl-db", "qa-glue-colstats-tbl"
+    _setup_stats_table(glue, db, table)
+
+    stats_id = _make_int_column_stats("id")
+    stats_amount = _make_int_column_stats("amount")
+    upd = glue.update_column_statistics_for_table(
+        DatabaseName=db, TableName=table,
+        ColumnStatisticsList=[stats_id, stats_amount],
+    )
+    assert upd.get("Errors", []) == []
+
+    got = glue.get_column_statistics_for_table(
+        DatabaseName=db, TableName=table, ColumnNames=["id", "amount"],
+    )
+    assert {s["ColumnName"] for s in got["ColumnStatisticsList"]} == {"id", "amount"}
+    assert got.get("Errors", []) == []
+
+    missing = glue.get_column_statistics_for_table(
+        DatabaseName=db, TableName=table, ColumnNames=["id", "missing"],
+    )
+    assert [s["ColumnName"] for s in missing["ColumnStatisticsList"]] == ["id"]
+    assert missing["Errors"][0]["ColumnName"] == "missing"
+
+    glue.delete_column_statistics_for_table(
+        DatabaseName=db, TableName=table, ColumnName="id",
+    )
+    after = glue.get_column_statistics_for_table(
+        DatabaseName=db, TableName=table, ColumnNames=["id", "amount"],
+    )
+    assert [s["ColumnName"] for s in after["ColumnStatisticsList"]] == ["amount"]
+
+
+def test_glue_column_statistics_for_table_missing_table(glue):
+    with pytest.raises(ClientError) as exc:
+        glue.get_column_statistics_for_table(
+            DatabaseName="nope-db", TableName="nope-tbl", ColumnNames=["id"],
+        )
+    assert exc.value.response["Error"]["Code"] == "EntityNotFoundException"
+
+
+def test_glue_delete_column_statistics_for_table_unknown_column_is_idempotent(glue):
+    db, table = "qa-glue-colstats-tbl-del-db", "qa-glue-colstats-tbl-del"
+    _setup_stats_table(glue, db, table)
+    # Real AWS Glue returns 200 / empty body when deleting stats for a column
+    # that never had any — Delete* operations are idempotent.
+    glue.delete_column_statistics_for_table(
+        DatabaseName=db, TableName=table, ColumnName="never-set",
+    )
+
+
+def test_glue_column_statistics_cleared_on_table_delete(glue):
+    db, table = "qa-glue-colstats-cleanup-db", "qa-glue-colstats-cleanup"
+    _setup_stats_table(glue, db, table)
+    glue.update_column_statistics_for_table(
+        DatabaseName=db, TableName=table,
+        ColumnStatisticsList=[_make_int_column_stats("id")],
+    )
+    glue.delete_table(DatabaseName=db, Name=table)
+    # Re-create the table with the same name; stats from the previous
+    # incarnation must not leak through.
+    glue.create_table(
+        DatabaseName=db,
+        TableInput={
+            "Name": table,
+            "StorageDescriptor": {
+                "Columns": [{"Name": "id", "Type": "int"}],
+                "Location": f"s3://bucket/{db}/{table}/",
+                "InputFormat": "", "OutputFormat": "", "SerdeInfo": {},
+            },
+        },
+    )
+    got = glue.get_column_statistics_for_table(
+        DatabaseName=db, TableName=table, ColumnNames=["id"],
+    )
+    assert got["ColumnStatisticsList"] == []
+    assert got["Errors"][0]["ColumnName"] == "id"
+
+
+def test_glue_column_statistics_for_partition_crud(glue):
+    db, table = "qa-glue-colstats-part-db", "qa-glue-colstats-part"
+    _setup_stats_table(glue, db, table, partitioned=True)
+    glue.create_partition(
+        DatabaseName=db, TableName=table,
+        PartitionInput={
+            "Values": ["2024-01-01"],
+            "StorageDescriptor": {
+                "Columns": [], "Location": f"s3://bucket/{db}/{table}/dt=2024-01-01",
+                "InputFormat": "", "OutputFormat": "", "SerdeInfo": {},
+            },
+        },
+    )
+
+    stats_id = _make_int_column_stats("id")
+    stats_amount = _make_int_column_stats("amount")
+    upd = glue.update_column_statistics_for_partition(
+        DatabaseName=db, TableName=table,
+        PartitionValues=["2024-01-01"],
+        ColumnStatisticsList=[stats_id, stats_amount],
+    )
+    assert upd.get("Errors", []) == []
+
+    got = glue.get_column_statistics_for_partition(
+        DatabaseName=db, TableName=table,
+        PartitionValues=["2024-01-01"], ColumnNames=["id", "amount"],
+    )
+    assert {s["ColumnName"] for s in got["ColumnStatisticsList"]} == {"id", "amount"}
+
+    glue.delete_column_statistics_for_partition(
+        DatabaseName=db, TableName=table,
+        PartitionValues=["2024-01-01"], ColumnName="amount",
+    )
+    after = glue.get_column_statistics_for_partition(
+        DatabaseName=db, TableName=table,
+        PartitionValues=["2024-01-01"], ColumnNames=["id", "amount"],
+    )
+    assert [s["ColumnName"] for s in after["ColumnStatisticsList"]] == ["id"]
+    assert after["Errors"][0]["ColumnName"] == "amount"
+
+
+def test_glue_column_statistics_for_partition_missing_partition(glue):
+    db, table = "qa-glue-colstats-nopart-db", "qa-glue-colstats-nopart"
+    _setup_stats_table(glue, db, table, partitioned=True)
+    with pytest.raises(ClientError) as exc:
+        glue.update_column_statistics_for_partition(
+            DatabaseName=db, TableName=table,
+            PartitionValues=["never"],
+            ColumnStatisticsList=[_make_int_column_stats("id")],
+        )
+    assert exc.value.response["Error"]["Code"] == "EntityNotFoundException"
