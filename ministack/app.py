@@ -311,6 +311,7 @@ SERVICE_REGISTRY = {
     "cloudtrail": {"module": "cloudtrail"},
     "cur": {"module": "cur"},
     "inspector2": {"module": "inspector2"},
+    "mq": {"module": "mq"},
     "s3tables": {"module": "s3tables"},
 }
 
@@ -348,6 +349,7 @@ _state_map = {
     "resource_groups": "resource_groups",
     "cloudtrail": "cloudtrail", "iot": "iot",
     "inspector2": "inspector2",
+    "mq": "mq",
     "s3tables": "s3tables",
     "lambda_durable": "lambda_durable",
 }

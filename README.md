@@ -389,6 +389,8 @@ subnet = ec2.create_subnet(
 | **Resource Groups** | CreateGroup, GetGroup, DeleteGroup, UpdateGroup, ListGroups, GetGroupQuery, UpdateGroupQuery, GetGroupConfiguration, PutGroupConfiguration, GroupResources, UngroupResources, ListGroupResources, ListGroupingStatuses, SearchResources, Tag, Untag, GetTags, GetAccountSettings, UpdateAccountSettings | 19 of 23 spec ops; tag-sync ops omitted (not exposed by AWS CLI / Terraform); `Group` accepts bare name or full ARN |
 | **Cost & Usage Reports** | DeleteReportDefinition, DescribeReportDefinitions, ListTagsForResource, ModifyReportDefinition, PutReportDefinition, TagResource, UntagResource | 7 of 7 spec ops |
 | **Inspector2** | Enable, Disable, ListFindings, BatchGetFindingDetails, ListCoverage, ListCoverageStatistics, ListFindingAggregations, SearchVulnerabilities, TagResource, UntagResource, ListTagsForResource, CreateFilter, ListFilters, DeleteFilter | 14 operations; deterministic stub vulnerability findings for ECR images, Lambda functions, and EC2 instances; filtering, sorting, pagination |
+| **AmazonMQ** | CreateBroker, ListBrokers, DescribeBrokers, DeleteBrokers, UpdateBroker, RebootBroker, DescribeBrokerEngineTypes, DescribeBrokerInstanceOptions, CreateTags, ListTags, DeleteTags, CreateUser, DeleteUser, ListUsers, UpdateUser, DescribeUser | 16 of 24 spec ops; No real container support |
+
 
 
 ### CloudFormation

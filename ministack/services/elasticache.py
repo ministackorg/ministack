@@ -113,6 +113,7 @@ _pending_rg_respawn: set = set()
 # Serialize lazy respawn so two concurrent first-requests after restart
 # don't both spawn a container for the same cluster.
 import threading as _threading
+
 _respawn_lock = _threading.Lock()
 
 
