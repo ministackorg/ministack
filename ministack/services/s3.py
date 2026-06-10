@@ -25,6 +25,7 @@ Storage: In-memory (optionally backed by S3_DATA_DIR).
 import base64
 import copy
 import datetime as _dt
+import contextvars
 import hashlib
 import json
 import logging
@@ -1913,9 +1914,16 @@ def _fire_s3_event_async(
     """Fire S3 event notification in a background thread (non-blocking)."""
     if bucket_name not in _bucket_notifications:
         return
+    # threading.Thread does not copy contextvars, so without this snapshot the
+    # worker runs under the default account (000000000000): the account-scoped
+    # _bucket_notifications lookup comes back empty and the event is silently
+    # dropped for any non-default account, and SQS/SNS/Lambda/EventBridge
+    # targets resolve under the wrong account. Carry the request context in.
+    # See issue #876.
+    ctx = contextvars.copy_context()
     t = threading.Thread(
-        target=_fire_s3_event,
-        args=(bucket_name, key, event_name, size, etag),
+        target=ctx.run,
+        args=(_fire_s3_event, bucket_name, key, event_name, size, etag),
         daemon=True,
     )
     t.start()
@@ -1953,7 +1961,9 @@ def _fire_s3_test_event(bucket_name: str) -> None:
 
 def _fire_s3_test_event_async(bucket_name: str) -> None:
     """Fire s3:TestEvent in a background thread (non-blocking)."""
-    t = threading.Thread(target=_fire_s3_test_event, args=(bucket_name,), daemon=True)
+    # Carry the request's account/region context into the thread (issue #876).
+    ctx = contextvars.copy_context()
+    t = threading.Thread(target=ctx.run, args=(_fire_s3_test_event, bucket_name), daemon=True)
     t.start()
 
 

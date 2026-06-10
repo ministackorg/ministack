@@ -1304,6 +1304,59 @@ def test_s3_put_notification_sends_test_event(s3, sqs):
     assert "Records" not in body
 
 
+def test_s3_event_notification_cross_account():
+    """Regression for #876: S3 event notifications must fire for non-default
+    accounts. The event is delivered from a background thread; if that thread
+    does not inherit the request's account context it falls back to
+    000000000000, the account-scoped bucket-notification lookup comes back
+    empty, and the event is silently dropped. Every other notification test
+    runs under the default account, so none of them exercise this path."""
+    import boto3
+    from botocore.config import Config
+
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+    account = "512354813215"
+
+    def _acct_client(service):
+        return boto3.client(
+            service,
+            endpoint_url=endpoint,
+            aws_access_key_id=account,
+            aws_secret_access_key="test",
+            region_name="us-east-1",
+            config=Config(retries={"max_attempts": 0}),
+        )
+
+    s3c = _acct_client("s3")
+    sqsc = _acct_client("sqs")
+
+    s3c.create_bucket(Bucket="s3-evt-xacct-bkt")
+    queue_url = sqsc.create_queue(QueueName="s3-evt-xacct-q")["QueueUrl"]
+    queue_arn = sqsc.get_queue_attributes(
+        QueueUrl=queue_url, AttributeNames=["QueueArn"]
+    )["Attributes"]["QueueArn"]
+    # Confirm the clients really resolve to the non-default account.
+    assert f":{account}:" in queue_arn
+
+    s3c.put_bucket_notification_configuration(
+        Bucket="s3-evt-xacct-bkt",
+        NotificationConfiguration={
+            "QueueConfigurations": [
+                {"QueueArn": queue_arn, "Events": ["s3:ObjectCreated:*"]}
+            ],
+        },
+    )
+    s3c.put_object(Bucket="s3-evt-xacct-bkt", Key="x.txt", Body=b"hello")
+    time.sleep(0.5)
+    msgs = sqsc.receive_message(
+        QueueUrl=queue_url, MaxNumberOfMessages=10, WaitTimeSeconds=2
+    )
+    s3_msgs = [m for m in msgs.get("Messages", []) if "Records" in json.loads(m["Body"])]
+    assert len(s3_msgs) > 0, "no S3 event delivered to the non-default account queue (#876)"
+    body = json.loads(s3_msgs[0]["Body"])
+    assert body["Records"][0]["s3"]["object"]["key"] == "x.txt"
+
+
 def _wait_lambda_invoked(logs_client, function_name, marker, timeout=5.0):
     """Poll the function's log group for a marker substring. Returns True on
     first match, False after timeout."""
