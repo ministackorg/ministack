@@ -249,7 +249,7 @@ def _validate_attribute_value(attr_name: str, value: dict) -> tuple | None:
     if vtype == "S":
         if not isinstance(vval, str):
             return error_response_json("ValidationException",
-                f"Supplied AttributeValue is empty, must contain exactly one of the supported datatypes", 400)
+                "Supplied AttributeValue is empty, must contain exactly one of the supported datatypes", 400)
     elif vtype == "N":
         canon = _ddb_canonicalize_number(vval)
         if canon is None:
@@ -332,7 +332,7 @@ def _validate_attribute_value(attr_name: str, value: dict) -> tuple | None:
                 return err
     else:
         return error_response_json("ValidationException",
-            f"Supplied AttributeValue is empty, must contain exactly one of the supported datatypes", 400)
+            "Supplied AttributeValue is empty, must contain exactly one of the supported datatypes", 400)
     return None
 
 
@@ -429,7 +429,7 @@ def _validate_item(item: dict, pk_name: str | None = None, sk_name: str | None =
     size = _item_size_bytes(item)
     if size > _DDB_ITEM_MAX_BYTES:
         return error_response_json("ValidationException",
-            f"Item size has exceeded the maximum allowed size", 400)
+            "Item size has exceeded the maximum allowed size", 400)
     return None
 
 # DynamoDB Streams: table_name -> list of stream records
@@ -1701,7 +1701,7 @@ def _query(data):
     # Limit must be >= 1 when supplied.
     if limit is not None and int(limit) <= 0:
         return error_response_json("ValidationException",
-            f"1 validation error detected: Value at 'Limit' failed to satisfy constraint: Member must have value greater than or equal to 1", 400)
+            "1 validation error detected: Value at 'Limit' failed to satisfy constraint: Member must have value greater than or equal to 1", 400)
     # Select validation per AWS: ALL_PROJECTED_ATTRIBUTES is only valid on an
     # index; SPECIFIC_ATTRIBUTES requires a ProjectionExpression / AttributesToGet.
     if select == "ALL_PROJECTED_ATTRIBUTES" and not index_name:
@@ -1715,7 +1715,7 @@ def _query(data):
     # ConsistentRead on a GSI is invalid (only LSIs support strongly-consistent reads).
     if data.get("ConsistentRead") and is_gsi:
         return error_response_json("ValidationException",
-            f"Consistent reads are not supported on global secondary indexes", 400)
+            "Consistent reads are not supported on global secondary indexes", 400)
 
     # ExclusiveStartKey must contain the base table's key attributes; when
     # querying an index, it must also contain the index's key attributes.
@@ -1923,7 +1923,7 @@ def _scan(data):
         seg = int(segment); ts = int(total_segments)
         if ts < 1 or ts > 1_000_000:
             return error_response_json("ValidationException",
-                f"TotalSegments must be between 1 and 1000000", 400)
+                "TotalSegments must be between 1 and 1000000", 400)
         # Negative segment uses the standard "1 validation error detected"
         # envelope with the lowercase 'segment' slot and "greater than or
         # equal to 0" floor — distinct from the segment>=totalSegments error.

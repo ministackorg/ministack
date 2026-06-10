@@ -1312,13 +1312,18 @@ def _cfn_nested_stack_deploy(logical_id, props, parent_stack_name, *,
     sub-attribute form CDK and console-built templates emit.
     """
     import copy
+
     from ministack.core.responses import get_account_id, get_region, new_uuid
     from ministack.services.cloudformation import (
-        _stack_events, _stacks,
+        _stack_events,
+        _stacks,
     )
     from ministack.services.cloudformation.engine import (
-        _evaluate_conditions, _parse_template, _resolve_parameters,
-        _resolve_refs, _topological_sort,
+        _evaluate_conditions,
+        _parse_template,
+        _resolve_parameters,
+        _resolve_refs,
+        _topological_sort,
     )
     from ministack.services.cloudformation.helpers import _resolve_template
     from ministack.services.cloudformation.stacks import _add_event

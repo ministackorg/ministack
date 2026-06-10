@@ -2882,7 +2882,7 @@ def _jsonata_now(*args):
     # With picture: XPath-3.1 date/time picture (subset — see
     # `_format_datetime_picture`). With timezone: "+HH:MM" / "-HH:MM" offset
     # applied before formatting.
-    from datetime import datetime, timezone, timedelta
+    from datetime import datetime, timedelta, timezone
     if len(args) > 2:
         raise ValueError("$now expects 0, 1, or 2 arguments")
     now = datetime.now(timezone.utc)

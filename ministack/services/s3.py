@@ -30,8 +30,8 @@ import json
 import logging
 import os
 import re
-import struct
 import shutil
+import struct
 import threading
 import time
 import zlib
