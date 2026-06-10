@@ -79,6 +79,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.responses import AccountScopedDict, get_account_id, get_region, new_uuid
 from ministack.services.apigateway import _timeout_from_env, _urlopen_async
 
@@ -105,9 +106,12 @@ _deployments_v1 = AccountScopedDict()      # rest_api_id -> {deployment_id -> De
 _authorizers_v1 = AccountScopedDict()      # rest_api_id -> {authorizer_id -> Authorizer}
 _models = AccountScopedDict()              # rest_api_id -> {model_id -> Model}
 _api_keys = AccountScopedDict()            # key_id -> ApiKey
+_api_key_regions = AccountScopedDict()     # key_id -> owning region
 _usage_plans = AccountScopedDict()         # plan_id -> UsagePlan
+_usage_plan_regions = AccountScopedDict()  # plan_id -> owning region
 _usage_plan_keys = AccountScopedDict()     # plan_id -> {key_id -> UsagePlanKey}
 _domain_names = AccountScopedDict()        # domain_name -> DomainName
+_domain_name_regions = AccountScopedDict()  # domain_name -> owning region
 _base_path_mappings = AccountScopedDict()  # domain_name -> {base_path -> BasePathMapping}
 _v1_tags = AccountScopedDict()             # resource_arn -> {key -> value}
 _account_settings = AccountScopedDict()    # singleton per account: stores fields set via UpdateAccount
@@ -567,13 +571,71 @@ def get_state():
         "authorizers_v1": copy.deepcopy(_authorizers_v1),
         "models": copy.deepcopy(_models),
         "api_keys": copy.deepcopy(_api_keys),
+        "api_key_regions": copy.deepcopy(_api_key_regions),
         "usage_plans": copy.deepcopy(_usage_plans),
+        "usage_plan_regions": copy.deepcopy(_usage_plan_regions),
         "usage_plan_keys": copy.deepcopy(_usage_plan_keys),
         "domain_names": copy.deepcopy(_domain_names),
+        "domain_name_regions": copy.deepcopy(_domain_name_regions),
         "base_path_mappings": copy.deepcopy(_base_path_mappings),
         "v1_tags": copy.deepcopy(_v1_tags),
         "account_settings": copy.deepcopy(_account_settings),
     }
+
+
+def _region_from_existing_tag_arn(account_id, target_resource):
+    for (tag_account_id, resource_arn), _tags in _v1_tags._data.items():
+        if tag_account_id != account_id:
+            continue
+        try:
+            spec = parse_arn(resource_arn)
+        except ArnParseError:
+            continue
+        if (
+            spec.partition == "aws"
+            and spec.service == "apigateway"
+            and spec.account_id == ""
+            and spec.resource == target_resource
+        ):
+            return spec.region
+    return None
+
+
+def _region_from_domain_name_record(domain_name, domain_record, account_id):
+    tag_region = _region_from_existing_tag_arn(account_id, f"/domainnames/{domain_name}")
+    if tag_region:
+        return tag_region
+
+    regional_domain = domain_record.get("regionalDomainName", "")
+    if ".execute-api." in regional_domain:
+        region = regional_domain.rsplit(".execute-api.", 1)[1].split(".", 1)[0]
+        if region:
+            return region
+    return get_region()
+
+
+def _region_from_api_key_record(api_key_id, _api_key, account_id):
+    return _region_from_existing_tag_arn(account_id, f"/apikeys/{api_key_id}") or get_region()
+
+
+def _region_from_usage_plan_record(plan_id, _usage_plan, account_id):
+    return _region_from_existing_tag_arn(account_id, f"/usageplans/{plan_id}") or get_region()
+
+
+def _region_from_rest_api_record(api_id, _rest_api, account_id):
+    return _region_from_existing_tag_arn(account_id, f"/restapis/{api_id}") or get_region()
+
+
+def _backfill_tag_region_map(resource_store, region_store, region_for_item):
+    # State files written before these side maps existed still need to resolve
+    # tag-resource ARNs for resources that already exist.
+    if isinstance(resource_store, AccountScopedDict) and isinstance(region_store, AccountScopedDict):
+        for scoped_key, value in resource_store._data.items():
+            account_id, key = scoped_key
+            region_store._data.setdefault(scoped_key, region_for_item(key, value, account_id))
+        return
+    for key, value in resource_store.items():
+        region_store.setdefault(key, region_for_item(key, value, get_account_id()))
 
 
 def load_persisted_state(data):
@@ -586,12 +648,19 @@ def load_persisted_state(data):
     _authorizers_v1.update(data.get("authorizers_v1", {}))
     _models.update(data.get("models", {}))
     _api_keys.update(data.get("api_keys", {}))
+    _api_key_regions.update(data.get("api_key_regions", {}))
     _usage_plans.update(data.get("usage_plans", {}))
+    _usage_plan_regions.update(data.get("usage_plan_regions", {}))
     _usage_plan_keys.update(data.get("usage_plan_keys", {}))
     _domain_names.update(data.get("domain_names", {}))
+    _domain_name_regions.update(data.get("domain_name_regions", {}))
     _base_path_mappings.update(data.get("base_path_mappings", {}))
     _v1_tags.update(data.get("v1_tags", {}))
     _account_settings.update(data.get("account_settings", {}))
+    _backfill_tag_region_map(_rest_apis, _rest_api_regions, _region_from_rest_api_record)
+    _backfill_tag_region_map(_api_keys, _api_key_regions, _region_from_api_key_record)
+    _backfill_tag_region_map(_usage_plans, _usage_plan_regions, _region_from_usage_plan_record)
+    _backfill_tag_region_map(_domain_names, _domain_name_regions, _region_from_domain_name_record)
 
 
 def reset():
@@ -604,9 +673,12 @@ def reset():
     _authorizers_v1.clear()
     _models.clear()
     _api_keys.clear()
+    _api_key_regions.clear()
     _usage_plans.clear()
+    _usage_plan_regions.clear()
     _usage_plan_keys.clear()
     _domain_names.clear()
+    _domain_name_regions.clear()
     _base_path_mappings.clear()
     _v1_tags.clear()
     _account_settings.clear()
@@ -1816,6 +1888,7 @@ def _create_api_key(data):
         "tags": data.get("tags", {}),
     }
     _api_keys[key_id] = api_key
+    _api_key_regions[key_id] = get_region()
     return _v1_response(api_key, 201)
 
 
@@ -1844,6 +1917,7 @@ def _delete_api_key(key_id):
     if key_id not in _api_keys:
         return _v1_error("NotFoundException", "Invalid API Key identifier specified", 404)
     _api_keys.pop(key_id, None)
+    _api_key_regions.pop(key_id, None)
     return 202, {}, b""
 
 
@@ -1861,6 +1935,7 @@ def _create_usage_plan(data):
         "tags": data.get("tags", {}),
     }
     _usage_plans[plan_id] = plan
+    _usage_plan_regions[plan_id] = get_region()
     _usage_plan_keys[plan_id] = {}
     return _v1_response(plan, 201)
 
@@ -1889,6 +1964,7 @@ def _delete_usage_plan(plan_id):
     if plan_id not in _usage_plans:
         return _v1_error("NotFoundException", "Invalid Usage Plan identifier specified", 404)
     _usage_plans.pop(plan_id, None)
+    _usage_plan_regions.pop(plan_id, None)
     _usage_plan_keys.pop(plan_id, None)
     return 202, {}, b""
 
@@ -1951,6 +2027,7 @@ def _create_domain_name(data):
         "tags": data.get("tags", {}),
     }
     _domain_names[domain_name] = dn
+    _domain_name_regions[domain_name] = get_region()
     _base_path_mappings[domain_name] = {}
     return _v1_response(dn, 201)
 
@@ -1970,6 +2047,7 @@ def _delete_domain_name(domain_name):
     if domain_name not in _domain_names:
         return _v1_error("NotFoundException", "Invalid domain name identifier specified", 404)
     _domain_names.pop(domain_name, None)
+    _domain_name_regions.pop(domain_name, None)
     _base_path_mappings.pop(domain_name, None)
     return 202, {}, b""
 
@@ -2007,19 +2085,85 @@ def _delete_base_path_mapping(domain_name, base_path):
 
 # ---- Control plane: Tags ----
 
+def _resolve_v1_tag_resource_arn(resource_arn):
+    try:
+        spec = parse_arn(resource_arn)
+    except ArnParseError:
+        return None, _v1_error("BadRequestException", "Invalid resource ARN specified", 400)
+
+    if (
+        spec.partition != "aws"
+        or spec.service != "apigateway"
+        or spec.region != get_region()
+        or spec.account_id
+    ):
+        return None, _v1_error("BadRequestException", "Invalid resource ARN specified", 400)
+
+    parts = spec.resource.split("/")
+    if len(parts) == 3 and parts[0] == "" and parts[2]:
+        resource_type = parts[1]
+        resource_id = parts[2]
+        if resource_type == "restapis":
+            if resource_id not in _rest_apis or _rest_api_regions.get(resource_id) != spec.region:
+                return None, _v1_error("NotFoundException", "Invalid API identifier specified", 404)
+            return _rest_api_arn(resource_id), None
+        if resource_type == "apikeys":
+            if resource_id not in _api_keys or _api_key_regions.get(resource_id) != spec.region:
+                return None, _v1_error("NotFoundException", "Invalid resource identifier specified", 404)
+            return f"arn:aws:apigateway:{spec.region}::/apikeys/{resource_id}", None
+        if resource_type == "usageplans":
+            if resource_id not in _usage_plans or _usage_plan_regions.get(resource_id) != spec.region:
+                return None, _v1_error("NotFoundException", "Invalid resource identifier specified", 404)
+            return f"arn:aws:apigateway:{spec.region}::/usageplans/{resource_id}", None
+        if resource_type == "domainnames":
+            if resource_id not in _domain_names or _domain_name_regions.get(resource_id) != spec.region:
+                return None, _v1_error("NotFoundException", "Invalid resource identifier specified", 404)
+            return f"arn:aws:apigateway:{spec.region}::/domainnames/{resource_id}", None
+        return None, _v1_error("BadRequestException", "Invalid resource ARN specified", 400)
+
+    if (
+        len(parts) == 5
+        and parts[0] == ""
+        and parts[1] == "restapis"
+        and parts[2]
+        and parts[3] == "stages"
+        and parts[4]
+    ):
+        api_id = parts[2]
+        stage_name = parts[4]
+        if (
+            api_id not in _rest_apis
+            or _rest_api_regions.get(api_id) != spec.region
+            or stage_name not in _stages_v1.get(api_id, {})
+        ):
+            return None, _v1_error("NotFoundException", "Invalid Stage identifier specified", 404)
+        return f"arn:aws:apigateway:{spec.region}::/restapis/{api_id}/stages/{stage_name}", None
+
+    return None, _v1_error("BadRequestException", "Invalid resource ARN specified", 400)
+
+
 def _get_v1_tags(resource_arn):
-    tags = _v1_tags.get(resource_arn, {})
+    tag_key, err = _resolve_v1_tag_resource_arn(resource_arn)
+    if err is not None:
+        return err
+    tags = _v1_tags.get(tag_key, {})
     return _v1_response({"tags": tags})
 
 
 def _tag_v1_resource(resource_arn, data):
+    tag_key, err = _resolve_v1_tag_resource_arn(resource_arn)
+    if err is not None:
+        return err
     tags = data.get("tags", {})
-    _v1_tags.setdefault(resource_arn, {}).update(tags)
+    _v1_tags.setdefault(tag_key, {}).update(tags)
     return 204, {}, b""
 
 
 def _untag_v1_resource(resource_arn, tag_keys):
-    existing = _v1_tags.get(resource_arn, {})
+    tag_key, err = _resolve_v1_tag_resource_arn(resource_arn)
+    if err is not None:
+        return err
+    existing = _v1_tags.get(tag_key, {})
     for key in tag_keys:
         existing.pop(key, None)
     return 204, {}, b""
