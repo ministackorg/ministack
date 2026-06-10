@@ -97,8 +97,12 @@ def test_config_returns_glue_catalogs_prefix_and_s3_overrides():
     overrides = payload["overrides"]
     assert overrides["s3.endpoint"].startswith("http://")
     assert overrides["s3.path-style-access"] == "true"
-    for required in ("s3.access-key-id", "s3.secret-access-key", "s3.region"):
-        assert required in overrides
+    assert "s3.region" in overrides
+    # Fixed creds, never echoed from the host env — emitting ambient
+    # AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY into a response body would
+    # leak real credentials from a developer's shell.
+    assert overrides["s3.access-key-id"] == "test"
+    assert overrides["s3.secret-access-key"] == "test"
 
 
 def test_config_without_warehouse_returns_empty_defaults():
@@ -135,6 +139,16 @@ def test_get_namespace_returns_shape_when_database_exists():
 
 
 # ── ListTables ───────────────────────────────────────────────
+
+
+def test_list_tables_404s_when_namespace_missing():
+    """Real Iceberg REST returns NoSuchNamespaceException for ListTables on
+    an unknown namespace — not an empty 200 list."""
+    status, _, payload = _call(
+        "GET", "/iceberg/v1/catalogs/000000000000/namespaces/nope/tables"
+    )
+    assert status == 404
+    assert payload["error"]["type"] == "NoSuchNamespaceException"
 
 
 def test_list_tables_hides_non_iceberg_glue_tables():

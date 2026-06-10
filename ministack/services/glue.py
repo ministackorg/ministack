@@ -316,13 +316,18 @@ def _iceberg_s3_overrides():
 
     Real AWS Glue returns no overrides (clients use ambient AWS creds);
     MiniStack must return them or the client tries real S3 for the data
-    files referenced by the catalog and fails."""
+    files referenced by the catalog and fails.
+
+    Credentials are the fixed `test`/`test` pair (same as the s3tables
+    Iceberg surface) — MiniStack's S3 doesn't verify signatures, and
+    echoing ambient AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY into an HTTP
+    response would leak real credentials from the host environment."""
     host = os.environ.get("MINISTACK_HOST", "localhost")
     port = os.environ.get("GATEWAY_PORT", "4566")
     return {
         "s3.endpoint": f"http://{host}:{port}",
-        "s3.access-key-id": os.environ.get("AWS_ACCESS_KEY_ID", "test"),
-        "s3.secret-access-key": os.environ.get("AWS_SECRET_ACCESS_KEY", "test"),
+        "s3.access-key-id": "test",
+        "s3.secret-access-key": "test",
         "s3.path-style-access": "true",
         "s3.region": os.environ.get("MINISTACK_REGION", "us-east-1"),
     }
@@ -443,6 +448,9 @@ def _handle_iceberg_rest(method, path, query_params):
     if len(parts) >= 7 and parts[6] == "tables":
         ns = parts[5]
         if len(parts) == 7 and method == "GET":  # ListTables
+            if ns not in _databases:
+                return _iceberg_error(f"Namespace does not exist: {ns}",
+                                      "NoSuchNamespaceException", 404)
             prefix = f"{ns}/"
             names = sorted(
                 t["Name"] for k, t in _tables.items()
