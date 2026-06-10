@@ -251,7 +251,12 @@ SERVICE_PATTERNS = {
     },
     "mq": {
         "host_patterns": [r"mq\."],
-        "path_patterns": [r"^/v1/brokers", "^/v1/broker-engine-types", "^/v1/tags"],
+        "path_patterns": [
+            r"^/v1/brokers",
+            r"^/v1/broker-engine-types",
+            r"^/v1/broker-instance-options",
+            r"^/v1/tags"
+        ],
     },
     "cloudformation": {
         "host_patterns": [r"cloudformation\."],
