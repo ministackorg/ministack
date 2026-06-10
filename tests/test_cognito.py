@@ -5,6 +5,7 @@ import importlib
 import io
 import json
 import os
+import re
 import time
 import urllib.error
 import urllib.request
@@ -3214,3 +3215,113 @@ def test_cognito_email_disabled_env_skips_send(cognito_idp, monkeypatch):
     })
 
     assert len(ses_mod._sent_emails_list()) == before
+
+
+# ========== Caller-pinned ids via ms-custom-id (issue #883) ==========
+
+def test_cognito_pool_custom_id_via_ms_custom_id_tag(cognito_idp):
+    """ms-custom-id in UserPoolTags pins the user pool id; the region prefix
+    of the pinned id (not the request region) feeds the pool ARN."""
+    pinned = f"us-west-2_{_uuid_mod.uuid4().hex[:9]}"
+    pool = cognito_idp.create_user_pool(
+        PoolName="PinnedPool", UserPoolTags={"ms-custom-id": pinned},
+    )["UserPool"]
+    assert pool["Id"] == pinned
+    assert ":cognito-idp:us-west-2:" in pool["Arn"]
+    assert pool["Arn"].endswith(f":userpool/{pinned}")
+
+    desc = cognito_idp.describe_user_pool(UserPoolId=pinned)["UserPool"]
+    assert desc["Name"] == "PinnedPool"
+
+
+def test_cognito_pool_custom_id_rejects_localstack_custom_id_tag(cognito_idp):
+    """LocalStack's _custom_id_ tag is not supported; the error points the
+    caller at the ministack-native ms-custom-id key."""
+    with pytest.raises(ClientError) as exc_info:
+        cognito_idp.create_user_pool(
+            PoolName="LsTagPool", UserPoolTags={"_custom_id_": "us-west-2_lspool11"},
+        )
+    err = exc_info.value.response["Error"]
+    assert err["Code"] == "InvalidParameterException"
+    assert "ms-custom-id" in err["Message"]
+
+
+def test_cognito_pool_custom_id_duplicate_rejected(cognito_idp):
+    """Second CreateUserPool with the same pinned id in the same account fails
+    instead of silently falling back to a random id."""
+    pinned = f"us-east-1_{_uuid_mod.uuid4().hex[:9]}"
+    cognito_idp.create_user_pool(PoolName="DupPool1", UserPoolTags={"ms-custom-id": pinned})
+    with pytest.raises(ClientError) as exc_info:
+        cognito_idp.create_user_pool(PoolName="DupPool2", UserPoolTags={"ms-custom-id": pinned})
+    err = exc_info.value.response["Error"]
+    assert err["Code"] == "InvalidParameterException"
+    assert "already in use" in err["Message"]
+
+
+def test_cognito_pool_custom_id_malformed_rejected(cognito_idp):
+    """Pinned ids must match {region}_{alphanumeric} — _pool_region() parses
+    the region out of the id, so anything else would mis-region the ARN/iss."""
+    for bad in ("mypool", "us-west-2_", "us-west-2_my_pool", "US-WEST-2_pool1"):
+        with pytest.raises(ClientError) as exc_info:
+            cognito_idp.create_user_pool(
+                PoolName="BadPinPool", UserPoolTags={"ms-custom-id": bad},
+            )
+        err = exc_info.value.response["Error"]
+        assert err["Code"] == "InvalidParameterException", bad
+        assert "<region>_<alphanumeric>" in err["Message"], bad
+
+
+def test_cognito_pool_custom_id_absent_uses_random(cognito_idp):
+    """No tag → random {region}_{9 alphanumeric} id, exactly as before."""
+    pid = cognito_idp.create_user_pool(PoolName="RandomIdPool")["UserPool"]["Id"]
+    assert re.fullmatch(r"us-east-1_[0-9a-zA-Z]{9}", pid)
+
+
+def test_cognito_client_custom_id_via_client_name_prefix(cognito_idp):
+    """ms-custom-id: prefix on ClientName pins ClientId; the prefix is
+    stripped from the stored ClientName."""
+    pid = cognito_idp.create_user_pool(PoolName="ClientPinPool")["UserPool"]["Id"]
+    client = cognito_idp.create_user_pool_client(
+        UserPoolId=pid, ClientName="ms-custom-id:myclient123",
+    )["UserPoolClient"]
+    assert client["ClientId"] == "myclient123"
+    assert client["ClientName"] == "myclient123"
+
+    desc = cognito_idp.describe_user_pool_client(
+        UserPoolId=pid, ClientId="myclient123",
+    )["UserPoolClient"]
+    assert desc["ClientName"] == "myclient123"
+
+
+def test_cognito_client_custom_id_rejects_localstack_prefix(cognito_idp):
+    """LocalStack's _custom_id_: ClientName prefix is not supported; the error
+    points the caller at ms-custom-id:."""
+    pid = cognito_idp.create_user_pool(PoolName="LsPrefixPool")["UserPool"]["Id"]
+    with pytest.raises(ClientError) as exc_info:
+        cognito_idp.create_user_pool_client(
+            UserPoolId=pid, ClientName="_custom_id_:shouldfail",
+        )
+    err = exc_info.value.response["Error"]
+    assert err["Code"] == "InvalidParameterException"
+    assert "ms-custom-id" in err["Message"]
+
+
+def test_cognito_client_custom_id_duplicate_rejected(cognito_idp):
+    """Second client pinned to the same id within one pool is rejected."""
+    pid = cognito_idp.create_user_pool(PoolName="DupClientPool")["UserPool"]["Id"]
+    cognito_idp.create_user_pool_client(UserPoolId=pid, ClientName="ms-custom-id:dupclient1")
+    with pytest.raises(ClientError) as exc_info:
+        cognito_idp.create_user_pool_client(UserPoolId=pid, ClientName="ms-custom-id:dupclient1")
+    err = exc_info.value.response["Error"]
+    assert err["Code"] == "InvalidParameterException"
+    assert "already in use" in err["Message"]
+
+
+def test_cognito_client_custom_id_plain_name_uses_random(cognito_idp):
+    """Plain client names keep today's behavior: random 26-char id, name kept."""
+    pid = cognito_idp.create_user_pool(PoolName="PlainClientPool")["UserPool"]["Id"]
+    client = cognito_idp.create_user_pool_client(
+        UserPoolId=pid, ClientName="PlainApp",
+    )["UserPoolClient"]
+    assert client["ClientName"] == "PlainApp"
+    assert re.fullmatch(r"[0-9a-zA-Z]{26}", client["ClientId"])

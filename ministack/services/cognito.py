@@ -354,19 +354,25 @@ def _pool_id() -> str:
     return f"{get_region()}_{suffix[:9]}"
 
 
+# Region prefix as encoded in pool ids. Accepts both 3-segment commercial
+# regions (e.g. ``us-east-1``, ``eu-central-1``) and 4-segment GovCloud / ISO
+# regions (e.g. ``us-gov-east-1``, ``us-iso-west-1``, ``eu-isoe-west-1``) —
+# Cognito is available in GovCloud, so the parser must not silently fall
+# through and reproduce the original `iss` bug there. _pool_region() parses
+# with this and _resolve_custom_pool_id() validates pinned ids against it,
+# so parsing and validation can never drift apart.
+_POOL_REGION_RE = re.compile(r"[a-z]+(-[a-z]+)+-\d+")
+
+
 def _pool_region(pool_id: str) -> str:
     """Return the region encoded in a pool_id (format ``{region}_{suffix}``).
 
     Falls back to get_region() for empty or non-standard IDs so callers
-    never have to special-case the edge cases. The regex accepts both
-    3-segment commercial regions (e.g. ``us-east-1``, ``eu-central-1``) and
-    4-segment GovCloud / ISO regions (e.g. ``us-gov-east-1``, ``us-iso-west-1``,
-    ``eu-isoe-west-1``) — Cognito is available in GovCloud, so the parser must
-    not silently fall through and reproduce the original `iss` bug there.
+    never have to special-case the edge cases.
     """
     if pool_id and "_" in pool_id:
         candidate = pool_id.rsplit("_", 1)[0]
-        if re.match(r"^[a-z]+(-[a-z]+)+-\d+$", candidate):
+        if _POOL_REGION_RE.fullmatch(candidate):
             return candidate
     return get_region()
 
@@ -1419,12 +1425,51 @@ async def _dispatch_identity(action: str, data: dict):
 # USER POOL CRUD
 # ===========================================================================
 
+def _resolve_custom_pool_id(tags) -> str | None:
+    """Return a caller-pinned user pool id from the ``ms-custom-id`` key in
+    ``UserPoolTags``, or None if the tag is not set (issue #883).
+
+    Pinned ids must look like real pool ids (``{region}_{alphanumeric}``)
+    because _pool_region() / _pool_arn() parse the region prefix out of the
+    id — a malformed pin would silently mis-region the pool ARN and the
+    token ``iss``. Raises ``ValueError`` for malformed or already-in-use ids
+    so misconfigs surface immediately instead of falling back to a random id.
+
+    LocalStack's ``_custom_id_`` tag is intentionally NOT supported (same
+    decision as ``ls-custom-id`` for API Gateway, issue #400) — callers
+    hitting it get a clear error pointing them at ``ms-custom-id`` so the
+    ministack-native key stays the only contract."""
+    if not isinstance(tags, dict):
+        return None
+    if "_custom_id_" in tags and "ms-custom-id" not in tags:
+        raise ValueError(
+            "_custom_id_ tag is not supported; use 'ms-custom-id' instead"
+        )
+    custom = tags.get("ms-custom-id")
+    if not custom:
+        return None
+    custom = str(custom)
+    if not re.fullmatch(_POOL_REGION_RE.pattern + r"_[0-9A-Za-z]+", custom):
+        raise ValueError(
+            f"User pool id '{custom}' (from ms-custom-id tag) must match "
+            "'<region>_<alphanumeric>', e.g. 'us-west-2_mypool1'"
+        )
+    if custom in _user_pools:
+        raise ValueError(
+            f"User pool id '{custom}' (from ms-custom-id tag) is already in use"
+        )
+    return custom
+
+
 def _create_user_pool(data):
     name = data.get("PoolName")
     if not name:
         return error_response_json("InvalidParameterException", "PoolName is required.", 400)
 
-    pid = _pool_id()
+    try:
+        pid = _resolve_custom_pool_id(data.get("UserPoolTags")) or _pool_id()
+    except ValueError as exc:
+        return error_response_json("InvalidParameterException", str(exc), 400)
     now = _now_epoch()
     pool = {
         "Id": pid,
@@ -1546,18 +1591,61 @@ def _pool_out(pool: dict) -> dict:
 # USER POOL CLIENT CRUD
 # ===========================================================================
 
+def _resolve_custom_client_id(client_name, pool: dict) -> str | None:
+    """Return a caller-pinned client id from an ``ms-custom-id:`` prefix on
+    ``ClientName``, or None for plain names (issue #883).
+
+    CreateUserPoolClient has no tags parameter, so the pin rides on the name
+    — the prefix convention LocalStack established with ``_custom_id_:``. The
+    prefix is stripped: ``ClientName="ms-custom-id:web1"`` stores ``web1`` as
+    both ClientId and ClientName. LocalStack's ``_custom_id_:`` prefix itself
+    is intentionally NOT supported — callers hitting it get a clear error
+    pointing them at ``ms-custom-id:`` (same decision as issue #400).
+
+    Raises ``ValueError`` for an empty pinned id or one already in use in
+    this user pool, so misconfigs surface immediately."""
+    if not isinstance(client_name, str):
+        return None
+    if client_name.startswith("_custom_id_:"):
+        raise ValueError(
+            "_custom_id_ ClientName prefix is not supported; use 'ms-custom-id:' instead"
+        )
+    if not client_name.startswith("ms-custom-id:"):
+        return None
+    custom = client_name[len("ms-custom-id:"):]
+    if not custom:
+        raise ValueError(
+            "Client id after the 'ms-custom-id:' ClientName prefix must not be empty"
+        )
+    if custom in pool["_clients"]:
+        raise ValueError(
+            f"Client id '{custom}' (from ms-custom-id: ClientName prefix) "
+            "is already in use in this user pool"
+        )
+    return custom
+
+
 def _create_user_pool_client(data):
     pid = data.get("UserPoolId")
     pool, err = _resolve_pool(pid)
     if err:
         return err
 
-    cid = _client_id()
+    client_name = data.get("ClientName", "")
+    try:
+        custom_cid = _resolve_custom_client_id(client_name, pool)
+    except ValueError as exc:
+        return error_response_json("InvalidParameterException", str(exc), 400)
+    if custom_cid:
+        cid = custom_cid
+        client_name = custom_cid
+    else:
+        cid = _client_id()
     now = _now_epoch()
     generate_secret = data.get("GenerateSecret", False)
     client = {
         "UserPoolId": pid,
-        "ClientName": data.get("ClientName", ""),
+        "ClientName": client_name,
         "ClientId": cid,
         "ClientSecret": _client_secret() if generate_secret else None,
         "CreationDate": now,

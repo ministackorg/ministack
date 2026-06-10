@@ -7,6 +7,13 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [Unreleased]
+
+### Added
+- **Cognito — caller-pinned user pool / client ids via `ms-custom-id`** — parity with the API Gateway convention from #400. `CreateUserPool` honours an `ms-custom-id` key in `UserPoolTags` and pins `UserPool.Id` to the tag value; pins are validated against the `{region}_{alphanumeric}` pool-id shape because the region prefix feeds the pool ARN and the token `iss`. `CreateUserPoolClient` has no tags parameter, so an `ms-custom-id:` prefix on `ClientName` pins `ClientId` (the prefix is stripped from the stored name). Lets ephemeral environments put JWKS/issuer URLs and Amplify `userPoolId` / `userPoolClientId` into static env config at deploy time instead of pre-seeding `STATE_DIR/cognito.json`. Malformed or already-in-use pins fail with `InvalidParameterException` instead of silently falling back to a random id; LocalStack's `_custom_id_` tag / name prefix is intentionally rejected with a message pointing at `ms-custom-id`. Contributed by @prandogabriel. Fixes #883.
+
+---
+
 ## [1.3.61] — 2026-06-10
 
 ### Added
