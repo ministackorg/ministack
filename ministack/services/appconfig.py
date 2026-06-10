@@ -35,7 +35,7 @@ import uuid
 
 from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.persistence import PERSIST_STATE, load_state
-from ministack.core.responses import AccountScopedDict, get_account_id, get_region
+from ministack.core.responses import AccountRegionScopedDict, get_account_id, get_region
 
 logger = logging.getLogger("appconfig")
 
@@ -45,14 +45,14 @@ REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 # State
 # ---------------------------------------------------------------------------
 
-_applications = AccountScopedDict()
-_environments = AccountScopedDict()          # "{app_id}/{env_id}" -> record
-_config_profiles = AccountScopedDict()       # "{app_id}/{profile_id}" -> record
-_hosted_versions = AccountScopedDict()       # "{app_id}/{profile_id}/{version}" -> record
-_deployment_strategies = AccountScopedDict()
-_deployments = AccountScopedDict()           # "{app_id}/{env_id}/{deploy_num}" -> record
-_tags = AccountScopedDict()                  # arn -> {key: value}
-_sessions = AccountScopedDict()              # token -> session record
+_applications = AccountRegionScopedDict()
+_environments = AccountRegionScopedDict()          # "{app_id}/{env_id}" -> record
+_config_profiles = AccountRegionScopedDict()       # "{app_id}/{profile_id}" -> record
+_hosted_versions = AccountRegionScopedDict()       # "{app_id}/{profile_id}/{version}" -> record
+_deployment_strategies = AccountRegionScopedDict()
+_deployments = AccountRegionScopedDict()           # "{app_id}/{env_id}/{deploy_num}" -> record
+_tags = AccountRegionScopedDict()                  # arn -> {key: value}
+_sessions = AccountRegionScopedDict()              # token -> session record
 
 # ---------------------------------------------------------------------------
 # Persistence
@@ -641,6 +641,19 @@ def _resolve_tag_resource_arn(resource_arn):
 
     if len(parts) == 2 and parts[0] == "deploymentstrategy" and parts[1]:
         if parts[1] in _deployment_strategies:
+            return str(spec), None
+        return None, _missing_tag_resource(resource_arn)
+
+    if (
+        len(parts) == 6
+        and parts[0] == "application"
+        and parts[1]
+        and parts[2] == "environment"
+        and parts[3]
+        and parts[4] == "deployment"
+        and parts[5]
+    ):
+        if f"{parts[1]}/{parts[3]}/{parts[5]}" in _deployments:
             return str(spec), None
         return None, _missing_tag_resource(resource_arn)
 

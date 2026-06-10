@@ -1,9 +1,25 @@
 import json
+import os
 
+import boto3
 import pytest
+from botocore.config import Config
 from botocore.exceptions import ClientError
 
 from ministack.services import appconfig as appconfig_service
+
+ENDPOINT = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+
+
+def _make_appconfig_client(region_name):
+    return boto3.client(
+        "appconfig",
+        endpoint_url=ENDPOINT,
+        aws_access_key_id="test",
+        aws_secret_access_key="test",
+        region_name=region_name,
+        config=Config(retries={"max_attempts": 0}),
+    )
 
 
 def _status_and_body(response):
@@ -786,3 +802,37 @@ def test_appconfig_start_configuration_session_rejects_missing_configuration_pro
 
     assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
     assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 404
+
+
+# ---------------------------------------------------------------------------
+# Region isolation (multi-region)
+# ---------------------------------------------------------------------------
+
+
+def test_appconfig_applications_are_region_scoped():
+    """AppConfig state is region-scoped: an application created in one region is
+    not visible from another, and a cross-region read is a clean 404. Guards the
+    AccountRegionScopedDict conversion against regressing to account-only."""
+    east = _make_appconfig_client("us-east-1")
+    west = _make_appconfig_client("us-west-2")
+
+    east_id = east.create_application(Name="region-iso-app")["Id"]
+    west_id = west.create_application(Name="region-iso-app")["Id"]
+    try:
+        assert east_id != west_id
+
+        east_ids = {a["Id"] for a in east.list_applications()["Items"]}
+        west_ids = {a["Id"] for a in west.list_applications()["Items"]}
+        assert east_id in east_ids and west_id not in east_ids
+        assert west_id in west_ids and east_id not in west_ids
+
+        # Cross-region read must not resolve.
+        with pytest.raises(ClientError) as exc:
+            east.get_application(ApplicationId=west_id)
+        assert exc.value.response["Error"]["Code"] in ("ResourceNotFoundException", "404")
+    finally:
+        for client, app_id in ((east, east_id), (west, west_id)):
+            try:
+                client.delete_application(ApplicationId=app_id)
+            except Exception:
+                pass
