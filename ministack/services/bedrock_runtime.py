@@ -945,8 +945,8 @@ def _openai_chat_completion(headers, body) -> tuple:
 async def handle_request(method, path, headers, body, query_params):
     logger.debug("%s %s", method, path)
 
-    # OpenAI-compatible chat completions (folded in from the former standalone
-    # bedrock-mantle service — AWS serves this on the bedrock-runtime surface).
+    # OpenAI-compatible chat completions — AWS serves this on the bedrock-runtime
+    # surface, so it's handled here rather than as a separate service.
     if path == "/v1/chat/completions":
         if method != "POST":
             return _openai_error(f"Unsupported method {method}.", status=405)

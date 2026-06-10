@@ -899,9 +899,8 @@ def detect_service(method: str, path: str, headers: dict, query_params: dict) ->
     if path_lower.startswith("/v2/credentials"):
         return "imds"
     if path_lower.startswith("/v1/chat/completions"):
-        # OpenAI-shape inference, served on the bedrock-runtime surface (folded
-        # in from the former standalone bedrock-mantle service). openai-python
-        # sends unsigned POSTs, so route purely on path.
+        # OpenAI-shape inference, served on the bedrock-runtime surface.
+        # openai-python sends unsigned POSTs, so route purely on path.
         return "bedrock-runtime"
     if path_lower.startswith("/v1/apis") or path_lower.startswith("/v1/tags/arn:aws:appsync"):
         return "appsync"
