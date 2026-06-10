@@ -61,6 +61,7 @@ _sla_jobs = AccountScopedDict()
 _saml_providers = AccountScopedDict()
 _mfa_devices = AccountScopedDict()
 _login_profiles = AccountScopedDict()
+_credential_reports = AccountScopedDict()
 _account_password_policy = AccountScopedDict()
 _account_aliases = AccountScopedDict()
 
@@ -293,6 +294,7 @@ def get_state():
         "saml_providers": copy.deepcopy(_saml_providers),
         "mfa_devices": copy.deepcopy(_mfa_devices),
         "login_profiles": copy.deepcopy(_login_profiles),
+        "credential_reports": copy.deepcopy(_credential_reports),
         "account_password_policy": copy.deepcopy(_account_password_policy),
         "account_aliases": copy.deepcopy(_account_aliases),
     }
@@ -314,6 +316,7 @@ def restore_state(data):
         _saml_providers.update(data.get("saml_providers", {}))
         _mfa_devices.update(data.get("mfa_devices", {}))
         _login_profiles.update(data.get("login_profiles", {}))
+        _credential_reports.update(data.get("credential_reports", {}))
         _account_password_policy.update(data.get("account_password_policy", {}))
         _account_aliases.update(data.get("account_aliases", {}))
 
@@ -1910,6 +1913,96 @@ def _delete_login_profile(p):
     return _xml(200, "DeleteLoginProfileResponse", "", ns="iam")
 
 
+# -------------------- Credential report --------------------
+
+_CRED_REPORT_HEADER = (
+    "user,arn,user_creation_time,password_enabled,password_last_used,"
+    "password_last_changed,password_next_rotation,mfa_active,"
+    "access_key_1_active,access_key_1_last_rotated,access_key_1_last_used_date,"
+    "access_key_1_last_used_region,access_key_1_last_used_service,"
+    "access_key_2_active,access_key_2_last_rotated,access_key_2_last_used_date,"
+    "access_key_2_last_used_region,access_key_2_last_used_service,"
+    "cert_1_active,cert_1_last_rotated,cert_2_active,cert_2_last_rotated"
+)
+
+
+def _build_credential_report():
+    acct = get_account_id()
+    rows = [_CRED_REPORT_HEADER]
+
+    # Synthetic root account row
+    rows.append(
+        f"<root_account>,arn:aws:iam::{acct}:root,{_now()},"
+        "not_supported,not_supported,not_supported,not_supported,false,"
+        "false,N/A,N/A,N/A,N/A,"
+        "false,N/A,N/A,N/A,N/A,"
+        "false,N/A,false,N/A"
+    )
+
+    # One row per user
+    for name, user in _users.items():
+        has_password = name in _login_profiles
+        has_mfa = any(
+            dev.get("User") == name for dev in _mfa_devices.values()
+        )
+
+        # Collect up to 2 active access keys (sorted by creation for stable output)
+        user_keys = sorted(
+            [v for v in _access_keys.values() if v["UserName"] == name],
+            key=lambda k: k.get("CreateDate", ""),
+        )
+        key1 = user_keys[0] if len(user_keys) > 0 else None
+        key2 = user_keys[1] if len(user_keys) > 1 else None
+
+        def _key_cols(k):
+            if k is None:
+                return "false,N/A,N/A,N/A,N/A"
+            active = "true" if k.get("Status") == "Active" else "false"
+            rotated = k.get("CreateDate", "N/A")
+            return f"{active},{rotated},N/A,N/A,N/A"
+
+        row = (
+            f"{name},{user['Arn']},{user['CreateDate']},"
+            f"{'true' if has_password else 'false'},"
+            f"N/A,N/A,N/A,"
+            f"{'true' if has_mfa else 'false'},"
+            f"{_key_cols(key1)},"
+            f"{_key_cols(key2)},"
+            "false,N/A,false,N/A"
+        )
+        rows.append(row)
+
+    return "\n".join(rows)
+
+
+def _generate_credential_report(p):
+    _credential_reports["report"] = {
+        "content": _build_credential_report(),
+        "generated_time": _now(),
+    }
+    return _xml(200, "GenerateCredentialReportResponse",
+                "<GenerateCredentialReportResult>"
+                "<State>COMPLETE</State>"
+                "<Description>No report exists. Starting a new report generation task</Description>"
+                "</GenerateCredentialReportResult>",
+                ns="iam")
+
+
+def _get_credential_report(p):
+    report = _credential_reports.get("report")
+    if not report:
+        return _error(410, "ReportNotPresent",
+                      "No credential report exists. Generate one with GenerateCredentialReport.", ns="iam")
+    content_b64 = base64.b64encode(report["content"].encode("utf-8")).decode()
+    return _xml(200, "GetCredentialReportResponse",
+                f"<GetCredentialReportResult>"
+                f"<Content>{content_b64}</Content>"
+                f"<ReportFormat>text/csv</ReportFormat>"
+                f"<GeneratedTime>{report['generated_time']}</GeneratedTime>"
+                f"</GetCredentialReportResult>",
+                ns="iam")
+
+
 # -------------------- OIDC providers --------------------
 
 def _create_oidc_provider(p):
@@ -2573,6 +2666,8 @@ _IAM_HANDLERS = {
     "GetLoginProfile": _get_login_profile,
     "UpdateLoginProfile": _update_login_profile,
     "DeleteLoginProfile": _delete_login_profile,
+    "GenerateCredentialReport": _generate_credential_report,
+    "GetCredentialReport": _get_credential_report,
     "GetAccountSummary": _get_account_summary,
     "GetAccountPasswordPolicy": _get_account_password_policy,
     "UpdateAccountPasswordPolicy": _update_account_password_policy,
@@ -2600,6 +2695,7 @@ def reset():
     _saml_providers.clear()
     _mfa_devices.clear()
     _login_profiles.clear()
+    _credential_reports.clear()
     _account_password_policy.clear()
     _account_aliases.clear()
     # Re-seed AWS-managed policies. They're not customer state, so a

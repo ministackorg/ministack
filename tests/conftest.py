@@ -96,6 +96,10 @@ _SERIAL_TESTS = {
     "tests/test_appsync.py::test_appsync_lambda_authorizer_rejection_returns_unauthorized",
     "tests/test_appsync.py::test_appsync_lambda_missing_authorizer_returns_unauthorized",
     "tests/test_appsync.py::test_appsync_lambda_failing_authorizer_returns_unauthorized",
+    # Credential report reflects all users in the account; run serially to avoid
+    # parallel-test interference on the account-global CSV snapshot.
+    "tests/test_iam.py::test_iam_credential_report_mfa_and_password",
+    "tests/test_iam.py::test_iam_credential_report_header",
     # Account-global mutations (password policy, alias); must run serially.
     "tests/test_iam.py::test_iam_password_policy_absent_then_set",
     "tests/test_iam.py::test_iam_account_alias_crud",

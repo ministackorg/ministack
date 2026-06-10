@@ -899,7 +899,9 @@ def test_elasticache_restore_state_marks_clusters_for_respawn(monkeypatch):
 
 
 def test_elasticache_restore_state_wipes_stale_replication_group_container_ids(monkeypatch):
+    from ministack.core.responses import set_request_account_id
     from ministack.services import elasticache as _ec
+    set_request_account_id("000000000000")
     _ec.reset()
     monkeypatch.setattr(_ec, "_spawn_redis_container",
                           lambda name, engine, engine_version, labels: ("rg-host", 6379, f"cid-{name}"))

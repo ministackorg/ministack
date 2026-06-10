@@ -963,6 +963,7 @@ def test_iam_delete_assigned_mfa_conflict(iam):
         except Exception:
             pass
         iam.delete_user(UserName=user_name)
+
 # ── Login profiles ────────────────────────────────────────────────────
 
 
@@ -1018,6 +1019,76 @@ def test_iam_delete_login_profile(iam):
         iam.delete_user(UserName=name)
 
 
+# ── Credential report ─────────────────────────────────────────────────
+
+_CRED_REPORT_COLUMNS = (
+    "user,arn,user_creation_time,password_enabled,password_last_used,"
+    "password_last_changed,password_next_rotation,mfa_active,"
+    "access_key_1_active,access_key_1_last_rotated,access_key_1_last_used_date,"
+    "access_key_1_last_used_region,access_key_1_last_used_service,"
+    "access_key_2_active,access_key_2_last_rotated,access_key_2_last_used_date,"
+    "access_key_2_last_used_region,access_key_2_last_used_service,"
+    "cert_1_active,cert_1_last_rotated,cert_2_active,cert_2_last_rotated"
+)
+
+
+def test_iam_credential_report_get_before_generate(iam):
+    with pytest.raises(Exception) as exc_info:
+        iam.get_credential_report()
+    assert exc_info.value.response["Error"]["Code"] == "ReportNotPresent"
+
+
+def test_iam_credential_report_mfa_and_password(iam):
+    user_a = "cr-user-a-mfapw"
+    user_b = "cr-user-b-neither"
+    device_name = "cr-mfa-device"
+
+    iam.create_user(UserName=user_a)
+    iam.create_user(UserName=user_b)
+    iam.create_login_profile(UserName=user_a, Password="Test1234!")
+    serial = iam.create_virtual_mfa_device(VirtualMFADeviceName=device_name)["VirtualMFADevice"]["SerialNumber"]
+    iam.enable_mfa_device(UserName=user_a, SerialNumber=serial,
+                          AuthenticationCode1="111111", AuthenticationCode2="222222")
+    try:
+        iam.generate_credential_report()
+        resp = iam.get_credential_report()
+        csv_bytes = resp["Content"]
+        csv_text = csv_bytes.decode("utf-8") if isinstance(csv_bytes, (bytes, bytearray)) else csv_bytes
+        rows = {r.split(",")[0]: r.split(",") for r in csv_text.strip().splitlines()[1:]}
+
+        # user A: password_enabled=true, mfa_active=true
+        assert rows[user_a][3] == "true", f"Expected password_enabled=true for {user_a}"
+        assert rows[user_a][7] == "true", f"Expected mfa_active=true for {user_a}"
+
+        # user B: password_enabled=false, mfa_active=false
+        assert rows[user_b][3] == "false", f"Expected password_enabled=false for {user_b}"
+        assert rows[user_b][7] == "false", f"Expected mfa_active=false for {user_b}"
+    finally:
+        try:
+            iam.deactivate_mfa_device(UserName=user_a, SerialNumber=serial)
+        except Exception:
+            pass
+        try:
+            iam.delete_virtual_mfa_device(SerialNumber=serial)
+        except Exception:
+            pass
+        try:
+            iam.delete_login_profile(UserName=user_a)
+        except Exception:
+            pass
+        iam.delete_user(UserName=user_a)
+        iam.delete_user(UserName=user_b)
+
+
+def test_iam_credential_report_header(iam):
+    iam.generate_credential_report()
+    resp = iam.get_credential_report()
+    csv_bytes = resp["Content"]
+    csv_text = csv_bytes.decode("utf-8") if isinstance(csv_bytes, (bytes, bytearray)) else csv_bytes
+    lines = csv_text.strip().splitlines()
+    assert lines[0] == _CRED_REPORT_COLUMNS
+    user_col = [r.split(",")[0] for r in lines]
+    assert "<root_account>" in user_col
 # ── Account posture (summary / password policy / aliases) ─────────────
 
 
