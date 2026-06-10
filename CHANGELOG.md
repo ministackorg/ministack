@@ -7,6 +7,18 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [1.3.61] — 2026-06-10
+
+### Added
+- **AmazonMQ (`mq`)** — new service emulator for AWS MQ, covering both RabbitMQ and ActiveMQ engines. Broker control plane: `CreateBroker`, `ListBrokers`, `DescribeBroker`, `UpdateBroker`, `DeleteBroker`, `RebootBroker`, plus `DescribeBrokerEngineTypes` and `DescribeBrokerInstanceOptions` (engine / version / instance / storage matrix sourced from real `aws mq describe-broker-instance-options` output). ActiveMQ user management (`CreateUser`, `DescribeUser`, `UpdateUser`, `DeleteUser`, `ListUsers`) and broker tagging (`CreateTags`, `ListTags`, `DeleteTags`). Brokers come up `RUNNING` immediately (metadata only, no container); `CreateBroker` validates engine type, version, deployment mode, host instance type, and storage type against the supported matrix. State is account-scoped and persisted. Contributed by @lucas-giaco.
+- **IAM — `GetAccountSummary`, `GetAccountPasswordPolicy`, `UpdateAccountPasswordPolicy`, `DeleteAccountPasswordPolicy`, `ListAccountAliases`, `CreateAccountAlias`, `DeleteAccountAlias`** — account-level posture reads. `GetAccountSummary` returns computed counts (`Users`, `Groups`, `Roles`, `Policies`, `MFADevices`, `MFADevicesInUse`, `AccountMFAEnabled`) plus static quotas. `GetAccountPasswordPolicy` returns `NoSuchEntity` (404) before any policy is set, matching real AWS. Account aliases stored per-account (replace-on-create semantics). Contributed by @lahmish.
+- **IAM — `GenerateCredentialReport`, `GetCredentialReport`** — generates and returns the account credential report as a CSV (exact AWS column header). One row per user including `password_enabled` (from login profiles), `mfa_active` (from MFA device assignments), and `access_key_1/2_active` (from access-key status). Root account synthetic row included. `GetCredentialReport` returns `ReportNotPresent` (410) when no report has been generated. `Content` is base64-encoded per the AWS blob encoding contract. Contributed by @lahmish.
+
+### Fixed
+- **S3 — event notifications now fire for non-default accounts** — `PutObject` / object-removed notifications are delivered from a background thread that did not inherit the request's account context, so the worker ran under the default account (`000000000000`): the account-scoped bucket-notification config resolved empty and the event was silently dropped for any non-default account, while SQS / SNS / Lambda / EventBridge targets resolved under the wrong account. The thread now copies the request context (account + region); the `s3:TestEvent` path had the same gap and is fixed too. Reported by @rsking.
+
+---
+
 ## [1.3.60] — 2026-06-09
 
 ### Added
@@ -21,9 +33,6 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 - **SQS — out-of-range numeric attributes rejected with `InvalidAttributeValue`** — `CreateQueue` and `SetQueueAttributes` accepted any value and stored it verbatim, so `VisibilityTimeout=99999` (and every other numeric attribute) was silently kept. Now `VisibilityTimeout` (0..43200), `MaximumMessageSize` (1024..262144), `MessageRetentionPeriod` (60..1209600), `DelaySeconds` (0..900), `ReceiveMessageWaitTimeSeconds` (0..20), and `KmsDataKeyReusePeriodSeconds` (60..86400) are validated against the AWS ranges and rejected with `InvalidAttributeValue` (400) when outside the documented bounds or non-numeric. Reported by @dcabib.
 - **EventBridge — `anything-but` honors nested `prefix` / `suffix` / `wildcard` content filters** — `{"anything-but": {"prefix": "TEST-"}}` (and `suffix` / `wildcard` variants) was silently ignored at dispatch and every event matched regardless of the field value, because the handler only recognized literal and list-of-literal forms. The nested-matcher form per AWS docs is now negated correctly: an event whose field matches the nested filter is excluded. Reported by @aldirrix.
 - **ElastiCache — Redis container respawned after restart** — with `PERSIST_STATE=1`, restored cluster metadata reported `CacheClusterStatus=available` but the persisted Docker container id no longer existed, so the endpoint was unreachable even though `DescribeCacheClusters` looked healthy. Restored clusters and replication groups are now marked pending respawn at `restore_state` time and lazily spawned (under a lock to prevent concurrent first-requests from double-spawning) on the first dispatcher call — endpoint metadata is rewritten to the freshly-spawned container before any caller can read it. Failures are logged once and cleared from the pending set (no retry storm). Reported by @ItsSmiffy.
-- **IAM — `GenerateCredentialReport`, `GetCredentialReport`** — generates and returns the account credential report as a CSV (exact AWS column header). One row per user including `password_enabled` (from login profiles), `mfa_active` (from MFA device assignments), and `access_key_1/2_active` (from access-key status). Root account synthetic row included. `GetCredentialReport` returns `ReportNotPresent` (410) when no report has been generated. `Content` is base64-encoded per the AWS blob encoding contract.
-- **IAM — `GetAccountSummary`, `GetAccountPasswordPolicy`, `UpdateAccountPasswordPolicy`, `DeleteAccountPasswordPolicy`, `ListAccountAliases`, `CreateAccountAlias`, `DeleteAccountAlias`** — account-level hygiene reads. `GetAccountSummary` returns computed counts (`Users`, `Groups`, `Roles`, `Policies`, `MFADevices`, `MFADevicesInUse`, `AccountMFAEnabled`) plus static quotas. `GetAccountPasswordPolicy` returns `NoSuchEntity` (404) before any policy is set, matching real AWS. Account aliases stored per-account (replace-on-create semantics).
-
 ---
 
 ## [1.3.59] — 2026-06-05

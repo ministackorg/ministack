@@ -8,7 +8,48 @@ env:
   DOCKERHUB_IMAGE_ORG: ministackorg/ministack-preview-build
 
 jobs:
+  # Path-based guard. pull_request_target runs with repo secrets
+  # (DOCKERHUB_TOKEN) and builds the PR's code, so any PR that touches the
+  # build/CI surface (Dockerfile*, .dockerignore, anything under .github/)
+  # must NOT be auto-built — a maintainer reviews and builds it manually.
+  # The changed-file list is read through the API only; this job never checks
+  # out PR-controlled code.
+  guard:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    outputs:
+      skip: ${{ steps.paths.outputs.skip }}
+    steps:
+      - name: Detect changes to the build/CI surface
+        id: paths
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          files=$(gh pr view "${{ github.event.pull_request.number }}" \
+            --repo "${{ github.repository }}" --json files --jq '.files[].path')
+          echo "Changed files:"; echo "$files"
+          if echo "$files" | grep -qE '^(Dockerfile([.].*)?|\.dockerignore|\.github/)'; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "::warning::PR modifies the build/CI surface; auto-preview skipped pending manual maintainer build."
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Comment that auto-preview was skipped
+        if: steps.paths.outputs.skip == 'true'
+        uses: peter-evans/create-or-update-comment@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          issue-number: ${{ github.event.pull_request.number }}
+          body: |
+            Auto-preview build skipped: this PR modifies the build/CI surface
+            (`Dockerfile`, `.dockerignore`, or files under `.github/`). A maintainer
+            will review and build the preview image manually before it is published.
+
   publish-pr:
+    needs: guard
+    if: needs.guard.outputs.skip != 'true'
     runs-on: ubuntu-latest
 
     permissions:
