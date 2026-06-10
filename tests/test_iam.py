@@ -1016,3 +1016,39 @@ def test_iam_delete_login_profile(iam):
         except Exception:
             pass
         iam.delete_user(UserName=name)
+
+
+# ── Account posture (summary / password policy / aliases) ─────────────
+
+
+def test_iam_password_policy_absent_then_set(iam):
+    # First, delete any existing policy to ensure clean state (serial test)
+    try:
+        iam.delete_account_password_policy()
+    except Exception:
+        pass
+    with pytest.raises(iam.exceptions.NoSuchEntityException):
+        iam.get_account_password_policy()
+    iam.update_account_password_policy(MinimumPasswordLength=14)
+    resp = iam.get_account_password_policy()
+    assert resp["PasswordPolicy"]["MinimumPasswordLength"] == 14
+    iam.delete_account_password_policy()
+
+
+def test_iam_account_summary_counts(iam):
+    resp = iam.get_account_summary()
+    sm = resp["SummaryMap"]
+    assert "Users" in sm
+    assert "MFADevices" in sm
+    assert "AccountMFAEnabled" in sm
+    assert isinstance(sm["Users"], int)
+
+
+def test_iam_account_alias_crud(iam):
+    alias = "my-test-alias-acct"
+    iam.create_account_alias(AccountAlias=alias)
+    aliases = iam.list_account_aliases()["AccountAliases"]
+    assert alias in aliases
+    iam.delete_account_alias(AccountAlias=alias)
+    aliases_after = iam.list_account_aliases()["AccountAliases"]
+    assert alias not in aliases_after
