@@ -10,18 +10,32 @@ running server — the same direct-handler pattern as test_ecs_metadata.py.
 """
 
 import asyncio
+import importlib
 import json
 
 import pytest
 
 import ministack.core.responses as _responses
 from ministack.core.router import detect_service
-from ministack.services import glue, s3
+
+
+def _svc(name):
+    """Resolve a service module through sys.modules at call time.
+
+    NOT a module-level `from ministack.services import glue, s3` — the
+    persistence regression tests cold-reimport service modules
+    (`sys.modules.pop` + fresh import), so an import-time binding here can
+    end up pointing at a stale module object while glue.py's own lazy
+    `from ministack.services import s3` resolves the fresh one. State
+    seeded on the stale object is then invisible to production code (the
+    exact failure mode this replaced: 404 where 200 was expected, only
+    when test_persistence.py ran first in the same worker)."""
+    return importlib.import_module(f"ministack.services.{name}")
 
 
 def _call(method, path, query_params=None):
     status, headers, body = asyncio.run(
-        glue.handle_request(method, path, {}, b"", query_params or {})
+        _svc("glue").handle_request(method, path, {}, b"", query_params or {})
     )
     payload = json.loads(body) if body else None
     return status, headers, payload
@@ -33,11 +47,11 @@ def _reset():
     # same bucket whether the caller is the test or production code.
     _responses._request_account_id.set("000000000000")
     _responses._request_region.set("us-east-1")
-    glue.reset()
-    s3._buckets.clear()
+    _svc("glue").reset()
+    _svc("s3")._buckets.clear()
     yield
-    glue.reset()
-    s3._buckets.clear()
+    _svc("glue").reset()
+    _svc("s3")._buckets.clear()
 
 
 # ── Routing ──────────────────────────────────────────────────
@@ -97,8 +111,8 @@ def test_config_without_warehouse_returns_empty_defaults():
 
 
 def test_list_namespaces_returns_glue_databases():
-    glue._databases["db_a"] = {"Name": "db_a"}
-    glue._databases["db_b"] = {"Name": "db_b"}
+    _svc("glue")._databases["db_a"] = {"Name": "db_a"}
+    _svc("glue")._databases["db_b"] = {"Name": "db_b"}
     _, _, payload = _call("GET", "/iceberg/v1/catalogs/000000000000/namespaces")
     assert payload["namespaces"] == [["db_a"], ["db_b"]]
 
@@ -112,7 +126,7 @@ def test_get_namespace_404s_when_database_missing():
 
 
 def test_get_namespace_returns_shape_when_database_exists():
-    glue._databases["db"] = {"Name": "db"}
+    _svc("glue")._databases["db"] = {"Name": "db"}
     status, _, payload = _call(
         "GET", "/iceberg/v1/catalogs/000000000000/namespaces/db"
     )
@@ -126,13 +140,13 @@ def test_get_namespace_returns_shape_when_database_exists():
 def test_list_tables_hides_non_iceberg_glue_tables():
     """A Glue table without `Parameters['metadata_location']` is a plain
     Hive/CSV/Parquet table and must not appear on the Iceberg surface."""
-    glue._databases["db"] = {"Name": "db"}
-    glue._tables["db/iceberg_table"] = {
+    _svc("glue")._databases["db"] = {"Name": "db"}
+    _svc("glue")._tables["db/iceberg_table"] = {
         "Name": "iceberg_table",
         "DatabaseName": "db",
         "Parameters": {"metadata_location": "s3://lake/t/metadata/v0.metadata.json"},
     }
-    glue._tables["db/csv_table"] = {
+    _svc("glue")._tables["db/csv_table"] = {
         "Name": "csv_table", "DatabaseName": "db", "Parameters": {},
     }
     _, _, payload = _call(
@@ -158,9 +172,9 @@ _META_JSON = {
 
 def _seed_glue_table_with_metadata():
     key = "dim_application/metadata/00003-deadbeef.metadata.json"
-    s3._buckets["lake"] = {"objects": {key: {"body": json.dumps(_META_JSON).encode()}}}
-    glue._databases["db"] = {"Name": "db"}
-    glue._tables["db/dim_application"] = {
+    _svc("s3")._buckets["lake"] = {"objects": {key: {"body": json.dumps(_META_JSON).encode()}}}
+    _svc("glue")._databases["db"] = {"Name": "db"}
+    _svc("glue")._tables["db/dim_application"] = {
         "Name": "dim_application",
         "DatabaseName": "db",
         "Parameters": {"metadata_location": f"s3://lake/{key}"},
@@ -183,8 +197,8 @@ def test_load_table_404s_when_metadata_object_missing():
     """Glue table exists and points at an S3 URI, but the metadata.json
     object isn't there. 200-with-empty-metadata would make DuckDB treat it
     as a real-but-empty table and silently return wrong results."""
-    glue._databases["db"] = {"Name": "db"}
-    glue._tables["db/orphan"] = {
+    _svc("glue")._databases["db"] = {"Name": "db"}
+    _svc("glue")._tables["db/orphan"] = {
         "Name": "orphan",
         "DatabaseName": "db",
         "Parameters": {"metadata_location": "s3://lake/orphan/metadata/v0.metadata.json"},
@@ -199,9 +213,9 @@ def test_load_table_404s_when_metadata_object_missing():
 
 def test_load_table_404s_when_metadata_json_unparseable():
     key = "broken/metadata/v0.metadata.json"
-    s3._buckets["lake"] = {"objects": {key: {"body": b"<<not json>>"}}}
-    glue._databases["db"] = {"Name": "db"}
-    glue._tables["db/broken"] = {
+    _svc("s3")._buckets["lake"] = {"objects": {key: {"body": b"<<not json>>"}}}
+    _svc("glue")._databases["db"] = {"Name": "db"}
+    _svc("glue")._tables["db/broken"] = {
         "Name": "broken",
         "DatabaseName": "db",
         "Parameters": {"metadata_location": f"s3://lake/{key}"},
@@ -222,8 +236,8 @@ def test_load_table_404s_on_unknown_table():
 
 
 def test_load_table_404s_on_non_iceberg_table():
-    glue._databases["db"] = {"Name": "db"}
-    glue._tables["db/csv"] = {"Name": "csv", "DatabaseName": "db", "Parameters": {}}
+    _svc("glue")._databases["db"] = {"Name": "db"}
+    _svc("glue")._tables["db/csv"] = {"Name": "csv", "DatabaseName": "db", "Parameters": {}}
     status, _, payload = _call(
         "GET", "/iceberg/v1/catalogs/000000000000/namespaces/db/tables/csv"
     )
@@ -243,8 +257,8 @@ def test_head_returns_200_for_iceberg_table():
 
 
 def test_head_returns_404_for_non_iceberg_table():
-    glue._databases["db"] = {"Name": "db"}
-    glue._tables["db/csv"] = {"Name": "csv", "DatabaseName": "db", "Parameters": {}}
+    _svc("glue")._databases["db"] = {"Name": "db"}
+    _svc("glue")._tables["db/csv"] = {"Name": "csv", "DatabaseName": "db", "Parameters": {}}
     status, _, _ = _call(
         "HEAD", "/iceberg/v1/catalogs/000000000000/namespaces/db/tables/csv"
     )
@@ -282,7 +296,7 @@ def test_glue_json_rpc_surface_unaffected():
     """The X-Amz-Target JSON RPC surface must keep working alongside the
     Iceberg branch — same module, two protocols."""
     status, _, body = asyncio.run(
-        glue.handle_request(
+        _svc("glue").handle_request(
             "POST", "/",
             {"x-amz-target": "AWSGlue.CreateDatabase"},
             json.dumps({"DatabaseInput": {"Name": "rpc_db"}}).encode(),
@@ -290,4 +304,4 @@ def test_glue_json_rpc_surface_unaffected():
         )
     )
     assert status == 200
-    assert "rpc_db" in glue._databases
+    assert "rpc_db" in _svc("glue")._databases
