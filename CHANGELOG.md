@@ -5,6 +5,14 @@ All notable changes to MiniStack will be documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning follows [Semantic Versioning](https://semver.org/).
 
+Unreleased
+
+- **Glue — Iceberg REST catalog data plane** — read-path subset of the Apache Iceberg REST OpenAPI spec at `/iceberg/v1/...`, mirroring AWS Glue's `glue.<region>.amazonaws.com/iceberg` endpoint (prefix shape `catalogs/{catalog}`). `GET /v1/config`, ListNamespaces, GetNamespace, ListTables, LoadTable, HEAD TableExists; writes return 501. Glue tables participate when `Parameters["metadata_location"]` points at an Iceberg metadata.json on MiniStack S3 (written by an external engine such as Trino/Spark); the metadata.json is passed through verbatim. Routed by the `glue` SigV4 credential scope — distinct from the S3 Tables Iceberg surface, exactly as on real AWS. Lets DuckDB's `iceberg` extension `ATTACH '<account_id>' (TYPE iceberg, ENDPOINT 'localhost:4566/iceberg', AUTHORIZATION_TYPE 'sigv4')` (requires `USE_SSL=1`; DuckDB hardcodes HTTPS).
+
+---
+- **IAM — `GenerateServiceLastAccessedDetails`, `GetServiceLastAccessedDetails`** — Access Advisor generate→get job handshake. Returns a UUID `JobId`. `GetServiceLastAccessedDetails` returns `JobStatus=COMPLETED` and an empty `ServicesLastAccessed` list (no CloudTrail data).
+
+
 ---
 
 ## [1.3.61] — 2026-06-10
