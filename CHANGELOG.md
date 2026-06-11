@@ -7,6 +7,13 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [Unreleased]
+
+### Fixed
+- **CloudFormation — `DescribeStackEvents` returns the initial `REVIEW_IN_PROGRESS` event for change-set-created stacks** — creating a stack via `CreateChangeSet` with `--change-set-type CREATE` left the placeholder stack in `REVIEW_IN_PROGRESS` but seeded an empty event list, so `DescribeStackEvents` returned `[]`. AWS records an initial `REVIEW_IN_PROGRESS` event for the `AWS::CloudFormation::Stack` resource at this point; tools that read `StackEvents[0]`, notably `sam deploy`, crashed with `IndexError: list index out of range`. The placeholder stack now emits the `REVIEW_IN_PROGRESS` event on creation.
+
+---
+
 ## [1.3.61] — 2026-06-10
 
 ### Added
