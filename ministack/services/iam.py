@@ -61,6 +61,9 @@ _sla_jobs = AccountScopedDict()
 _saml_providers = AccountScopedDict()
 _mfa_devices = AccountScopedDict()
 _login_profiles = AccountScopedDict()
+_credential_reports = AccountScopedDict()
+_account_password_policy = AccountScopedDict()
+_account_aliases = AccountScopedDict()
 
 
 # -- AWS-managed policies ---------------------------------------------------
@@ -291,6 +294,9 @@ def get_state():
         "saml_providers": copy.deepcopy(_saml_providers),
         "mfa_devices": copy.deepcopy(_mfa_devices),
         "login_profiles": copy.deepcopy(_login_profiles),
+        "credential_reports": copy.deepcopy(_credential_reports),
+        "account_password_policy": copy.deepcopy(_account_password_policy),
+        "account_aliases": copy.deepcopy(_account_aliases),
     }
 
 
@@ -310,6 +316,9 @@ def restore_state(data):
         _saml_providers.update(data.get("saml_providers", {}))
         _mfa_devices.update(data.get("mfa_devices", {}))
         _login_profiles.update(data.get("login_profiles", {}))
+        _credential_reports.update(data.get("credential_reports", {}))
+        _account_password_policy.update(data.get("account_password_policy", {}))
+        _account_aliases.update(data.get("account_aliases", {}))
 
 
 try:
@@ -1904,6 +1913,96 @@ def _delete_login_profile(p):
     return _xml(200, "DeleteLoginProfileResponse", "", ns="iam")
 
 
+# -------------------- Credential report --------------------
+
+_CRED_REPORT_HEADER = (
+    "user,arn,user_creation_time,password_enabled,password_last_used,"
+    "password_last_changed,password_next_rotation,mfa_active,"
+    "access_key_1_active,access_key_1_last_rotated,access_key_1_last_used_date,"
+    "access_key_1_last_used_region,access_key_1_last_used_service,"
+    "access_key_2_active,access_key_2_last_rotated,access_key_2_last_used_date,"
+    "access_key_2_last_used_region,access_key_2_last_used_service,"
+    "cert_1_active,cert_1_last_rotated,cert_2_active,cert_2_last_rotated"
+)
+
+
+def _build_credential_report():
+    acct = get_account_id()
+    rows = [_CRED_REPORT_HEADER]
+
+    # Synthetic root account row
+    rows.append(
+        f"<root_account>,arn:aws:iam::{acct}:root,{_now()},"
+        "not_supported,not_supported,not_supported,not_supported,false,"
+        "false,N/A,N/A,N/A,N/A,"
+        "false,N/A,N/A,N/A,N/A,"
+        "false,N/A,false,N/A"
+    )
+
+    # One row per user
+    for name, user in _users.items():
+        has_password = name in _login_profiles
+        has_mfa = any(
+            dev.get("User") == name for dev in _mfa_devices.values()
+        )
+
+        # Collect up to 2 active access keys (sorted by creation for stable output)
+        user_keys = sorted(
+            [v for v in _access_keys.values() if v["UserName"] == name],
+            key=lambda k: k.get("CreateDate", ""),
+        )
+        key1 = user_keys[0] if len(user_keys) > 0 else None
+        key2 = user_keys[1] if len(user_keys) > 1 else None
+
+        def _key_cols(k):
+            if k is None:
+                return "false,N/A,N/A,N/A,N/A"
+            active = "true" if k.get("Status") == "Active" else "false"
+            rotated = k.get("CreateDate", "N/A")
+            return f"{active},{rotated},N/A,N/A,N/A"
+
+        row = (
+            f"{name},{user['Arn']},{user['CreateDate']},"
+            f"{'true' if has_password else 'false'},"
+            f"N/A,N/A,N/A,"
+            f"{'true' if has_mfa else 'false'},"
+            f"{_key_cols(key1)},"
+            f"{_key_cols(key2)},"
+            "false,N/A,false,N/A"
+        )
+        rows.append(row)
+
+    return "\n".join(rows)
+
+
+def _generate_credential_report(p):
+    _credential_reports["report"] = {
+        "content": _build_credential_report(),
+        "generated_time": _now(),
+    }
+    return _xml(200, "GenerateCredentialReportResponse",
+                "<GenerateCredentialReportResult>"
+                "<State>COMPLETE</State>"
+                "<Description>No report exists. Starting a new report generation task</Description>"
+                "</GenerateCredentialReportResult>",
+                ns="iam")
+
+
+def _get_credential_report(p):
+    report = _credential_reports.get("report")
+    if not report:
+        return _error(410, "ReportNotPresent",
+                      "No credential report exists. Generate one with GenerateCredentialReport.", ns="iam")
+    content_b64 = base64.b64encode(report["content"].encode("utf-8")).decode()
+    return _xml(200, "GetCredentialReportResponse",
+                f"<GetCredentialReportResult>"
+                f"<Content>{content_b64}</Content>"
+                f"<ReportFormat>text/csv</ReportFormat>"
+                f"<GeneratedTime>{report['generated_time']}</GeneratedTime>"
+                f"</GetCredentialReportResult>",
+                ns="iam")
+
+
 # -------------------- OIDC providers --------------------
 
 def _create_oidc_provider(p):
@@ -2106,6 +2205,134 @@ def _delete_saml_provider(p):
                       f"SAML provider {arn} not found.", ns="iam")
     del _saml_providers[arn]
     return _xml(200, "DeleteSAMLProviderResponse", "", ns="iam")
+
+
+# -------------------- Account summary / password policy / aliases --------------------
+
+
+def _get_account_summary(p):
+    num_users = len(_users)
+    num_groups = len(_groups)
+    num_roles = len(_roles)
+    num_policies = len(_policies)
+    num_mfa = len(_mfa_devices)
+    num_mfa_in_use = sum(1 for d in _mfa_devices.values() if d.get("User") is not None)
+    acct_mfa_enabled = 1 if num_mfa_in_use > 0 else 0
+
+    summary = {
+        "Users": num_users,
+        "UsersQuota": 5000,
+        "Groups": num_groups,
+        "GroupsQuota": 300,
+        "GroupsPerUserQuota": 10,
+        "Roles": num_roles,
+        "RolesQuota": 1000,
+        "Policies": num_policies,
+        "PoliciesQuota": 1500,
+        "PolicySizeQuota": 6144,
+        "PolicyVersionsInUse": num_policies,
+        "PolicyVersionsInUseQuota": 10000,
+        "MFADevices": num_mfa,
+        "MFADevicesInUse": num_mfa_in_use,
+        "AccountMFAEnabled": acct_mfa_enabled,
+        "AccountAccessKeysPresent": 0,
+        "AccountSigningCertificatesPresent": 0,
+        "AccessKeysPerUserQuota": 2,
+        "AssumeRolePolicySizeQuota": 2048,
+        "GroupPolicySizeQuota": 5120,
+        "UserPolicySizeQuota": 2048,
+        "AttachedPoliciesPerGroupQuota": 10,
+        "AttachedPoliciesPerRoleQuota": 10,
+        "AttachedPoliciesPerUserQuota": 10,
+        "VersionsPerPolicyQuota": 5,
+        "ServerCertificates": 0,
+        "ServerCertificatesQuota": 20,
+        "SigningCertificatesPerUserQuota": 2,
+    }
+    entries = "".join(
+        f"<entry><key>{k}</key><value>{v}</value></entry>"
+        for k, v in summary.items()
+    )
+    return _xml(200, "GetAccountSummaryResponse",
+                f"<GetAccountSummaryResult>"
+                f"<SummaryMap>{entries}</SummaryMap>"
+                f"</GetAccountSummaryResult>",
+                ns="iam")
+
+
+def _get_account_password_policy(p):
+    pol = _account_password_policy.get("policy")
+    if not pol:
+        return _error(404, "NoSuchEntity",
+                      "The account password policy does not exist.", ns="iam")
+    fields = (
+        f"<MinimumPasswordLength>{pol.get('MinimumPasswordLength', 8)}</MinimumPasswordLength>"
+        f"<RequireSymbols>{'true' if pol.get('RequireSymbols') else 'false'}</RequireSymbols>"
+        f"<RequireNumbers>{'true' if pol.get('RequireNumbers') else 'false'}</RequireNumbers>"
+        f"<RequireUppercaseCharacters>{'true' if pol.get('RequireUppercaseCharacters') else 'false'}</RequireUppercaseCharacters>"
+        f"<RequireLowercaseCharacters>{'true' if pol.get('RequireLowercaseCharacters') else 'false'}</RequireLowercaseCharacters>"
+        f"<AllowUsersToChangePassword>{'true' if pol.get('AllowUsersToChangePassword') else 'false'}</AllowUsersToChangePassword>"
+        f"<ExpirePasswords>{'true' if pol.get('MaxPasswordAge') else 'false'}</ExpirePasswords>"
+        f"<HardExpiry>{'true' if pol.get('HardExpiry') else 'false'}</HardExpiry>"
+    )
+    if pol.get("MaxPasswordAge"):
+        fields += f"<MaxPasswordAge>{pol['MaxPasswordAge']}</MaxPasswordAge>"
+    if pol.get("PasswordReusePrevention"):
+        fields += f"<PasswordReusePrevention>{pol['PasswordReusePrevention']}</PasswordReusePrevention>"
+    return _xml(200, "GetAccountPasswordPolicyResponse",
+                f"<GetAccountPasswordPolicyResult>"
+                f"<PasswordPolicy>{fields}</PasswordPolicy>"
+                f"</GetAccountPasswordPolicyResult>",
+                ns="iam")
+
+
+def _update_account_password_policy(p):
+    pol = _account_password_policy.get("policy") or {}
+    for field in ("MinimumPasswordLength", "MaxPasswordAge", "PasswordReusePrevention"):
+        val = _p(p, field, "")
+        if val:
+            pol[field] = int(val)
+    for field in ("RequireSymbols", "RequireNumbers", "RequireUppercaseCharacters",
+                  "RequireLowercaseCharacters", "AllowUsersToChangePassword", "HardExpiry"):
+        val = _p(p, field, "")
+        if val:
+            pol[field] = val.lower() == "true"
+    _account_password_policy["policy"] = pol
+    return _xml(200, "UpdateAccountPasswordPolicyResponse", "", ns="iam")
+
+
+def _delete_account_password_policy(p):
+    if "policy" not in _account_password_policy:
+        return _error(404, "NoSuchEntity",
+                      "The account password policy does not exist.", ns="iam")
+    del _account_password_policy["policy"]
+    return _xml(200, "DeleteAccountPasswordPolicyResponse", "", ns="iam")
+
+
+def _list_account_aliases(p):
+    aliases = _account_aliases.get("aliases") or []
+    members = "".join(f"<member>{a}</member>" for a in aliases)
+    return _xml(200, "ListAccountAliasesResponse",
+                f"<ListAccountAliasesResult>"
+                f"<AccountAliases>{members}</AccountAliases>"
+                f"<IsTruncated>false</IsTruncated>"
+                f"</ListAccountAliasesResult>",
+                ns="iam")
+
+
+def _create_account_alias(p):
+    alias = _p(p, "AccountAlias")
+    _account_aliases["aliases"] = [alias]
+    return _xml(200, "CreateAccountAliasResponse", "", ns="iam")
+
+
+def _delete_account_alias(p):
+    alias = _p(p, "AccountAlias")
+    aliases = _account_aliases.get("aliases") or []
+    if alias in aliases:
+        aliases.remove(alias)
+        _account_aliases["aliases"] = aliases
+    return _xml(200, "DeleteAccountAliasResponse", "", ns="iam")
 
 
 # -------------------- Tags: policies --------------------
@@ -2439,6 +2666,15 @@ _IAM_HANDLERS = {
     "GetLoginProfile": _get_login_profile,
     "UpdateLoginProfile": _update_login_profile,
     "DeleteLoginProfile": _delete_login_profile,
+    "GenerateCredentialReport": _generate_credential_report,
+    "GetCredentialReport": _get_credential_report,
+    "GetAccountSummary": _get_account_summary,
+    "GetAccountPasswordPolicy": _get_account_password_policy,
+    "UpdateAccountPasswordPolicy": _update_account_password_policy,
+    "DeleteAccountPasswordPolicy": _delete_account_password_policy,
+    "ListAccountAliases": _list_account_aliases,
+    "CreateAccountAlias": _create_account_alias,
+    "DeleteAccountAlias": _delete_account_alias,
     "TagPolicy": _tag_policy,
     "UntagPolicy": _untag_policy,
     "ListPolicyTags": _list_policy_tags,
@@ -2459,6 +2695,9 @@ def reset():
     _saml_providers.clear()
     _mfa_devices.clear()
     _login_profiles.clear()
+    _credential_reports.clear()
+    _account_password_policy.clear()
+    _account_aliases.clear()
     # Re-seed AWS-managed policies. They're not customer state, so a
     # reset call should restore the canonical set rather than leave the
     # store empty. Per-account attachment counters are session state

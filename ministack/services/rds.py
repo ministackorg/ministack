@@ -30,9 +30,9 @@ clients can call DescribeDBInstances and other operations without ``Action=`` qu
 parameters.
 """
 
+import contextvars
 import copy
 import datetime
-import contextvars
 import json
 import logging
 import os
