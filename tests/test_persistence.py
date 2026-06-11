@@ -355,6 +355,39 @@ def test_pipes_restore_starts_poller_for_running_pipes(monkeypatch):
     mod.reset()
 
 
+def test_lambda_esm_eager_loaded_at_boot_when_persisted(monkeypatch):
+    """#889: persisted SQS event source mappings must resume polling after a
+    warm restart even under pure-SQS traffic. The ESM poller starts from
+    lambda_svc's import-time restore (`_ensure_poller`), and lambda_svc is
+    otherwise imported lazily only on a Lambda request — so `_load_persisted_state`
+    must eager-import it at boot when ESMs are persisted, else the restored
+    mapping sits Enabled-but-unpolled and messages pile up. A restore_state-level
+    test does NOT catch this: the bug is the module never being imported."""
+    import ministack.app as app
+    monkeypatch.setattr(app, "load_state",
+                        lambda key: {"esms": {"uuid-1": {"Enabled": True}}} if key == "lambda" else None)
+    requested = []
+    real = app._get_module
+    monkeypatch.setattr(app, "_get_module", lambda n: (requested.append(n), real(n))[1])
+    app._load_persisted_state()
+    assert "lambda_svc" in requested, (
+        "#889: persisted ESMs present but lambda_svc was not eager-imported at "
+        "boot — the SQS poller never starts under pure-SQS traffic after restart."
+    )
+
+
+def test_lambda_not_eager_loaded_without_persisted_esms(monkeypatch):
+    """Narrow: no persisted ESMs → don't pay the lambda_svc cold-start at boot."""
+    import ministack.app as app
+    monkeypatch.setattr(app, "load_state",
+                        lambda key: {"esms": {}} if key == "lambda" else None)
+    requested = []
+    real = app._get_module
+    monkeypatch.setattr(app, "_get_module", lambda n: (requested.append(n), real(n))[1])
+    app._load_persisted_state()
+    assert "lambda_svc" not in requested
+
+
 # ── PERSIST_STATE gating ──────────────────────────────────────────────
 
 @pytest.mark.parametrize("svc_key", [
