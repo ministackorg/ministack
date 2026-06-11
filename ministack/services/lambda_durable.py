@@ -26,6 +26,7 @@ import time
 import uuid
 from urllib.parse import unquote
 
+from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountScopedDict,
     error_response_json,
@@ -33,8 +34,6 @@ from ministack.core.responses import (
     get_region,
     json_response,
 )
-from ministack.core.persistence import load_state
-
 
 # ---------------------------------------------------------------------------
 # State
@@ -400,6 +399,7 @@ def _fire_chained_invoke(parent_rec: dict, op_id: str, ci_opts: dict,
     its result back onto the parent's ChainedInvoke operation when the child
     completes."""
     import threading
+
     from ministack.services import lambda_svc
 
     target = ci_opts.get("FunctionName")

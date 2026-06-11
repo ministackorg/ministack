@@ -16,23 +16,60 @@ jobs:
       pull-requests: write
 
     steps:
+      # Path-based guard. pull_request_target runs with repo secrets
+      # (DOCKERHUB_TOKEN) and builds the PR's code, so any PR that touches the
+      # build/CI surface (Dockerfile*, .dockerignore, anything under .github/)
+      # must NOT be auto-built — a maintainer reviews and builds it manually.
+      # The changed-file list is read through the API only, and this runs
+      # before checkout, so no PR-controlled code executes when it skips.
+      - name: Detect changes to the build/CI surface
+        id: guard
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          files=$(gh pr view "${{ github.event.pull_request.number }}" \
+            --repo "${{ github.repository }}" --json files --jq '.files[].path')
+          echo "Changed files:"; echo "$files"
+          if echo "$files" | grep -qE '^(Dockerfile([.].*)?|\.dockerignore|\.github/)'; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "::warning::PR modifies the build/CI surface; auto-preview skipped pending manual maintainer build."
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Comment that auto-preview was skipped
+        if: steps.guard.outputs.skip == 'true'
+        uses: peter-evans/create-or-update-comment@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          issue-number: ${{ github.event.pull_request.number }}
+          body: |
+            Auto-preview build skipped: this PR modifies the build/CI surface
+            (`Dockerfile`, `.dockerignore`, or files under `.github/`). A maintainer
+            will review and build the preview image manually before it is published.
+
       - uses: actions/checkout@v6
+        if: steps.guard.outputs.skip != 'true'
         with:
           ref: ${{ github.event.pull_request.head.sha }}
 
       - name: Get short SHA
         id: short_sha
+        if: steps.guard.outputs.skip != 'true'
         run: |
           short_sha=$(echo "${{ github.event.pull_request.head.sha }}" | cut -c1-8)
           echo "short_sha=$short_sha" >> "$GITHUB_OUTPUT"
 
       - name: Set up QEMU (multi-arch)
+        if: steps.guard.outputs.skip != 'true'
         uses: docker/setup-qemu-action@v4
 
       - name: Set up Docker Buildx
+        if: steps.guard.outputs.skip != 'true'
         uses: docker/setup-buildx-action@v4
 
       - name: Log in to Docker Hub
+        if: steps.guard.outputs.skip != 'true'
         uses: docker/login-action@v4
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
@@ -41,6 +78,7 @@ jobs:
       # ── Regular (Alpine) image ──
       - name: Extract metadata (regular)
         id: meta
+        if: steps.guard.outputs.skip != 'true'
         uses: docker/metadata-action@v6
         with:
           images: |
@@ -49,6 +87,7 @@ jobs:
             type=ref,event=pr,suffix=-${{ steps.short_sha.outputs.short_sha }}
 
       - name: Build and push (regular)
+        if: steps.guard.outputs.skip != 'true'
         uses: docker/build-push-action@v7
         with:
           context: .
@@ -68,7 +107,7 @@ jobs:
       # variant or needs DuckDB/Postgres/MySQL paths verified end-to-end.
       - name: Extract metadata (full)
         id: meta_full
-        if: contains(github.event.pull_request.labels.*.name, 'full-preview')
+        if: steps.guard.outputs.skip != 'true' && contains(github.event.pull_request.labels.*.name, 'full-preview')
         uses: docker/metadata-action@v6
         with:
           images: |
@@ -79,7 +118,7 @@ jobs:
             type=ref,event=pr,suffix=-${{ steps.short_sha.outputs.short_sha }}-full
 
       - name: Build and push (full)
-        if: contains(github.event.pull_request.labels.*.name, 'full-preview')
+        if: steps.guard.outputs.skip != 'true' && contains(github.event.pull_request.labels.*.name, 'full-preview')
         uses: docker/build-push-action@v7
         with:
           context: .
@@ -94,6 +133,7 @@ jobs:
           cache-to: type=gha,mode=max,scope=full-pr
 
       - name: Comment on PR with Docker image info
+        if: steps.guard.outputs.skip != 'true'
         uses: peter-evans/create-or-update-comment@v4
         with:
           token: ${{ secrets.GITHUB_TOKEN }}

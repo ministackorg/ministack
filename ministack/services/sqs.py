@@ -200,6 +200,35 @@ def _validate_redrive_policy(rp_str: str) -> None:
         raise _Err("InvalidAttributeValue", err_msg, 400)
 
 
+# Numeric attribute ranges per the SQS botocore service-2.json
+# (sqs-2012-11-05). Real AWS rejects out-of-range values at
+# CreateQueue/SetQueueAttributes time with InvalidAttributeValue (400).
+_NUMERIC_ATTR_RANGES = {
+    "VisibilityTimeout":            (0, 43200),       # 0 .. 12 h
+    "MaximumMessageSize":           (1024, 262144),   # 1 KB .. 256 KB
+    "MessageRetentionPeriod":       (60, 1209600),    # 1 min .. 14 days
+    "DelaySeconds":                 (0, 900),         # 0 .. 15 min
+    "ReceiveMessageWaitTimeSeconds":(0, 20),          # 0 .. 20 s
+    "KmsDataKeyReusePeriodSeconds": (60, 86400),      # 1 min .. 24 h
+}
+
+
+def _validate_numeric_attrs(attrs: dict) -> None:
+    for key, (lo, hi) in _NUMERIC_ATTR_RANGES.items():
+        if key not in attrs:
+            continue
+        raw = attrs[key]
+        try:
+            n = int(str(raw))
+        except (TypeError, ValueError):
+            raise _Err("InvalidAttributeValue",
+                       f"Invalid value for the parameter {key}.", 400)
+        if n < lo or n > hi:
+            raise _Err("InvalidAttributeValue",
+                       f"Invalid value for the parameter {key}. "
+                       f"Value must be between {lo} and {hi}.", 400)
+
+
 def _act_create_queue(data: dict, _u: str) -> dict:
     name = data.get("QueueName", "")
     if not name:
@@ -209,6 +238,7 @@ def _act_create_queue(data: dict, _u: str) -> dict:
     attrs = data.get("Attributes") or {}
     if "RedrivePolicy" in attrs:
         _validate_redrive_policy(str(attrs["RedrivePolicy"]))
+    _validate_numeric_attrs(attrs)
     is_fifo = name.endswith(".fifo") or attrs.get("FifoQueue") == "true"
 
     if is_fifo and not name.endswith(".fifo"):
@@ -547,6 +577,7 @@ def _act_set_queue_attributes(data: dict, qurl: str) -> dict:
     incoming = data.get("Attributes") or {}
     if "RedrivePolicy" in incoming:
         _validate_redrive_policy(str(incoming["RedrivePolicy"]))
+    _validate_numeric_attrs(incoming)
     for k, v in incoming.items():
         q["attributes"][k] = str(v)
     q["attributes"]["LastModifiedTimestamp"] = str(int(time.time()))

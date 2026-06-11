@@ -100,12 +100,32 @@ def get_state():
     return state
 
 
+# Issue #853: after restart the persisted Docker container ids reference
+# containers that no longer exist. Metadata says "available" but no Redis
+# is running, so Terraform / SDKs see a healthy cluster they can't connect
+# to. We can't respawn at restore_state time because that runs during
+# module-import (before _spawn_redis_container is defined). Instead, mark
+# resources as pending and respawn lazily on the first dispatcher call —
+# Terraform's typical flow is DescribeCacheClusters → connect, so the
+# container is healthy by the time the SDK reaches the endpoint.
+_pending_cluster_respawn: set = set()
+_pending_rg_respawn: set = set()
+# Serialize lazy respawn so two concurrent first-requests after restart
+# don't both spawn a container for the same cluster.
+import threading as _threading
+
+_respawn_lock = _threading.Lock()
+
+
 def restore_state(data):
     if not data:
         return
     for name, rg in data.get("replication_groups", {}).items():
-        rg.setdefault("_docker_container_ids", [])
+        # Wipe stale container ids — the old Docker containers are dead.
+        # _ensure_live_containers will refill this list lazily.
+        rg["_docker_container_ids"] = []
         _replication_groups[name] = rg
+        _pending_rg_respawn.add(name)
     _subnet_groups.update(data.get("subnet_groups", {}))
     _param_groups.update(data.get("param_groups", {}))
     _param_group_params.update(data.get("param_group_params", {}))
@@ -119,6 +139,79 @@ def restore_state(data):
         cl["_docker_container_id"] = None
         cl["CacheClusterStatus"] = "available"
         _clusters[name] = cl
+        _pending_cluster_respawn.add(name)
+
+
+def _ensure_live_containers():
+    """Lazy respawn of containers for clusters/replication-groups restored
+    from disk. Called from the top of handle_request, runs once per pending
+    resource. Failures are logged and the pending flag is cleared so we
+    don't retry on every request — the cluster's metadata is still served
+    but the endpoint won't be reachable (matches the old behavior, just no
+    longer silent)."""
+    # Cheap fast path — no lock needed when nothing's pending.
+    if not (_pending_cluster_respawn or _pending_rg_respawn):
+        return
+    # Serialize concurrent first-requests so we don't double-spawn.
+    with _respawn_lock:
+        if not (_pending_cluster_respawn or _pending_rg_respawn):
+            return
+        _ensure_live_containers_locked()
+
+
+def _ensure_live_containers_locked():
+    import logging
+    log = logging.getLogger(__name__)
+    for name in list(_pending_cluster_respawn):
+        _pending_cluster_respawn.discard(name)
+        cl = _clusters.get(name)
+        if cl is None:
+            continue
+        try:
+            engine = cl.get("Engine", "redis")
+            version = cl.get("EngineVersion", "7.1")
+            host, port, cid = _spawn_redis_container(
+                name=f"ministack-elasticache-{name}",
+                engine=engine, engine_version=version,
+                labels={"ministack": "elasticache", "cluster_id": name},
+            )
+            cl["_docker_container_id"] = cid
+            for node in cl.get("CacheNodes") or []:
+                node["Endpoint"] = {"Address": host, "Port": port}
+            if cl.get("ConfigurationEndpoint"):
+                cl["ConfigurationEndpoint"] = {"Address": host, "Port": port}
+            log.info("elasticache: respawned container for cluster %s after restart", name)
+        except Exception:
+            log.warning(
+                "elasticache: failed to respawn container for cluster %s on restart; "
+                "endpoint will be unreachable", name, exc_info=True)
+    for rg_id in list(_pending_rg_respawn):
+        _pending_rg_respawn.discard(rg_id)
+        rg = _replication_groups.get(rg_id)
+        if rg is None:
+            continue
+        try:
+            engine = rg.get("Engine", "redis")
+            engine_version = rg.get("EngineVersion") or rg.get("CacheNodeType") or "7.1"
+            account_id = get_account_id()
+            node_groups = rg.get("NodeGroups") or []
+            for ng in node_groups:
+                ng_id = ng.get("NodeGroupId", "0001")
+                _, _, cid = _spawn_redis_container(
+                    name=f"ministack-elasticache-rg-{account_id}-{rg_id}-{ng_id}",
+                    engine=engine, engine_version=engine_version,
+                    labels={
+                        "ministack": "elasticache", "rg_id": rg_id,
+                        "node_group": ng_id, "account_id": account_id,
+                    },
+                )
+                if cid:
+                    rg["_docker_container_ids"].append(cid)
+            log.info("elasticache: respawned containers for replication group %s after restart", rg_id)
+        except Exception:
+            log.warning(
+                "elasticache: failed to respawn containers for replication group %s "
+                "on restart; endpoint will be unreachable", rg_id, exc_info=True)
 
 
 try:
@@ -476,6 +569,9 @@ def _record_event(source_id, source_type, message):
 
 
 async def handle_request(method, path, headers, body, query_params):
+    # Lazy-respawn any clusters / replication groups that were restored
+    # from disk (issue #853). Cheap fast-path when nothing's pending.
+    _ensure_live_containers()
     params = dict(query_params)
     if method == "POST" and body:
         form_params = parse_qs(body.decode("utf-8", errors="replace"))

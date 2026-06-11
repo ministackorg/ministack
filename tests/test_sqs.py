@@ -993,3 +993,94 @@ def test_sqs_messages_endpoint_invalid_account_rejected(sqs):
         assert e.code == 400
         body = json.loads(e.read())
         assert body["__type"] == "InvalidAccountID"
+
+
+# ── Numeric attribute range validation (#841) ────────────────────────
+
+
+def test_sqs_create_queue_rejects_visibility_timeout_too_high(sqs):
+    import botocore.exceptions
+    try:
+        sqs.create_queue(QueueName="q-vt-high", Attributes={"VisibilityTimeout": "99999"})
+    except botocore.exceptions.ClientError as exc:
+        assert exc.response["Error"]["Code"] == "InvalidAttributeValue"
+    else:
+        sqs.delete_queue(QueueUrl=sqs.get_queue_url(QueueName="q-vt-high")["QueueUrl"])
+        raise AssertionError("expected InvalidAttributeValue for VisibilityTimeout=99999")
+
+
+def test_sqs_create_queue_rejects_visibility_timeout_negative(sqs):
+    import botocore.exceptions
+    try:
+        sqs.create_queue(QueueName="q-vt-neg", Attributes={"VisibilityTimeout": "-1"})
+    except botocore.exceptions.ClientError as exc:
+        assert exc.response["Error"]["Code"] == "InvalidAttributeValue"
+    else:
+        raise AssertionError("expected InvalidAttributeValue for VisibilityTimeout=-1")
+
+
+def test_sqs_create_queue_rejects_delay_seconds_out_of_range(sqs):
+    import botocore.exceptions
+    try:
+        sqs.create_queue(QueueName="q-ds-bad", Attributes={"DelaySeconds": "901"})
+    except botocore.exceptions.ClientError as exc:
+        assert exc.response["Error"]["Code"] == "InvalidAttributeValue"
+    else:
+        raise AssertionError("expected InvalidAttributeValue for DelaySeconds=901")
+
+
+def test_sqs_create_queue_rejects_maximum_message_size_below_min(sqs):
+    import botocore.exceptions
+    try:
+        sqs.create_queue(QueueName="q-mms-low", Attributes={"MaximumMessageSize": "512"})
+    except botocore.exceptions.ClientError as exc:
+        assert exc.response["Error"]["Code"] == "InvalidAttributeValue"
+    else:
+        raise AssertionError("expected InvalidAttributeValue for MaximumMessageSize=512")
+
+
+def test_sqs_create_queue_rejects_receive_wait_too_long(sqs):
+    import botocore.exceptions
+    try:
+        sqs.create_queue(QueueName="q-rwt-bad",
+                          Attributes={"ReceiveMessageWaitTimeSeconds": "21"})
+    except botocore.exceptions.ClientError as exc:
+        assert exc.response["Error"]["Code"] == "InvalidAttributeValue"
+    else:
+        raise AssertionError("expected InvalidAttributeValue for ReceiveMessageWaitTimeSeconds=21")
+
+
+def test_sqs_set_queue_attributes_rejects_visibility_timeout_too_high(sqs):
+    import botocore.exceptions
+    url = sqs.create_queue(QueueName="q-set-vt-bad")["QueueUrl"]
+    try:
+        try:
+            sqs.set_queue_attributes(QueueUrl=url, Attributes={"VisibilityTimeout": "100000"})
+        except botocore.exceptions.ClientError as exc:
+            assert exc.response["Error"]["Code"] == "InvalidAttributeValue"
+        else:
+            raise AssertionError("expected InvalidAttributeValue on SetQueueAttributes")
+    finally:
+        sqs.delete_queue(QueueUrl=url)
+
+
+def test_sqs_set_queue_attributes_accepts_valid_visibility_timeout(sqs):
+    # Regression guard — must NOT reject in-range values.
+    url = sqs.create_queue(QueueName="q-set-vt-ok")["QueueUrl"]
+    try:
+        sqs.set_queue_attributes(QueueUrl=url, Attributes={"VisibilityTimeout": "120"})
+        attrs = sqs.get_queue_attributes(
+            QueueUrl=url, AttributeNames=["VisibilityTimeout"])["Attributes"]
+        assert attrs["VisibilityTimeout"] == "120"
+    finally:
+        sqs.delete_queue(QueueUrl=url)
+
+
+def test_sqs_create_queue_rejects_non_numeric_visibility_timeout(sqs):
+    import botocore.exceptions
+    try:
+        sqs.create_queue(QueueName="q-vt-nan", Attributes={"VisibilityTimeout": "abc"})
+    except botocore.exceptions.ClientError as exc:
+        assert exc.response["Error"]["Code"] == "InvalidAttributeValue"
+    else:
+        raise AssertionError("expected InvalidAttributeValue for non-numeric")
