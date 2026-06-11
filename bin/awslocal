@@ -11,4 +11,17 @@ AWS_DEFAULT_REGION="${AWS_DEFAULT_REGION:-us-east-1}"
 
 export AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_DEFAULT_REGION
 
+# TLS mode (USE_SSL=1): let the AWS CLI verify MiniStack's certificate instead
+# of failing (which otherwise forces --no-verify-ssl). Resolution order:
+#   1. explicit override — MINISTACK_CA_BUNDLE or AWS_CA_BUNDLE
+#   2. BYO server cert — MINISTACK_SSL_CERT
+#   3. the auto-generated self-signed cert at ${TMPDIR}/ministack-tls/server.crt
+#      (it's its own root, so the leaf cert doubles as the CA bundle)
+# Only exported when it resolves to a real file, so plain-HTTP usage is
+# untouched and the CLI is never handed an empty/bogus bundle path.
+CA_BUNDLE="${MINISTACK_CA_BUNDLE:-${AWS_CA_BUNDLE:-${MINISTACK_SSL_CERT:-${TMPDIR:-/tmp}/ministack-tls/server.crt}}}"
+if [ -f "$CA_BUNDLE" ]; then
+    export AWS_CA_BUNDLE="$CA_BUNDLE"
+fi
+
 exec aws --endpoint-url="$ENDPOINT_URL" "$@"

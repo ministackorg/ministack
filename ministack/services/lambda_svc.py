@@ -2273,15 +2273,33 @@ def _throttle_response(reason_code: str, msg: str, retry_after: int = 1) -> dict
     }
 
 
+def _extract_zip_preserving_mode(zf, dest_dir: str):
+    """Extract a ZipFile, restoring the unix permission bits that
+    ``ZipFile.extractall`` silently drops.
+
+    AWS preserves the file modes baked into a layer / function zip — most
+    importantly the ``+x`` on ``/opt/bin`` tools and bundled binaries. zipfile
+    stores the mode in the high 16 bits of ``external_attr``; it's 0 for
+    Windows-created zips (PowerShell ``Compress-Archive``), in which case we
+    leave the platform default untouched.
+    """
+    for info in zf.infolist():
+        target = zf.extract(info, dest_dir)
+        mode = (info.external_attr >> 16) & 0o7777
+        if mode:
+            os.chmod(target, mode)
+
+
 def _docker_cp_dir(container, src_dir: str, dest_dir: str, arcname: str = "."):
     """Copy a local directory into a Docker container using a tar archive.
 
     Docker's ``put_archive`` requires ``dest_dir`` to already exist in the
-    container. For paths the base image owns (``/var/task``, ``/var/runtime``,
-    ``/opt``) this is fine. For paths we want to create (``/opt/layer_N``),
-    extract into the existing parent and pass the new subdir via ``arcname``
-    so the tar carries ``./layer_N/...`` entries — the put_archive call
-    materialises the subdir as part of extraction.
+    container — all the base-image paths we target (``/var/task``,
+    ``/var/runtime``, ``/opt``) do. ``arcname`` controls how the source is laid
+    out inside ``dest_dir``: the default ``"."`` merges ``src_dir``'s contents
+    straight into ``dest_dir`` (e.g. a layer's ``python/`` lands at
+    ``/opt/python``, matching AWS), while a named ``arcname`` would nest it
+    under that subdir.
     """
     import tarfile
     buf = io.BytesIO()
@@ -2480,7 +2498,7 @@ def _spawn_lambda_container(config: dict, code_zip: bytes | None):
         with open(code_zip_path, "wb") as f:
             f.write(code_zip)
         with zipfile.ZipFile(code_zip_path) as zf:
-            zf.extractall(code_dir)
+            _extract_zip_preserving_mode(zf, code_dir)
         if is_provided:
             bootstrap = os.path.join(code_dir, "bootstrap")
             if os.path.exists(bootstrap):
@@ -2497,7 +2515,7 @@ def _spawn_lambda_container(config: dict, code_zip: bytes | None):
             with open(layer_zip_path, "wb") as lf:
                 lf.write(layer_zip)
             with zipfile.ZipFile(layer_zip_path) as lzf:
-                lzf.extractall(layer_dir)
+                _extract_zip_preserving_mode(lzf, layer_dir)
             layers_dirs.append(layer_dir)
 
     # Shared environment
@@ -2517,10 +2535,10 @@ def _spawn_lambda_container(config: dict, code_zip: bytes | None):
     if is_provided:
         container_env["LAMBDA_TASK_ROOT"] = "/var/task"
     container_env["_HANDLER"] = handler
-    if layers_dirs:
-        container_env["_LAMBDA_LAYERS_DIRS"] = ":".join(
-            f"/opt/layer_{i}" for i in range(len(layers_dirs))
-        )
+    # Layers are merged into /opt directly (see the spawn below), so the docker
+    # RIE finds them on the standard /opt search paths (/opt/python, /opt/lib,
+    # /opt/bin) — no _LAMBDA_LAYERS_DIRS shim here (the official RIE bootstrap
+    # ignores it anyway).
     container_env.update(env_vars)
     # Per-invocation durable-execution overlay (no-op when the call isn't
     # inside a durable function).
@@ -2561,8 +2579,14 @@ def _spawn_lambda_container(config: dict, code_zip: bytes | None):
         endpoint = endpoint.replace("://127.0.0.1/", "://host.docker.internal/")
     container_env["AWS_ENDPOINT_URL"] = endpoint
 
-    # Mounts (Zip only — Image bakes code in)
+    # Mounts (Zip only — Image bakes code in). Layers are NEVER bind-mounted:
+    # AWS merges every layer's contents into /opt (so /opt/python, /opt/lib,
+    # /opt/bin land on the runtime's standard search paths). Bind-mounting each
+    # layer to /opt/layer_N puts the code where the RIE bootstrap can't see it
+    # (it searches /opt/python, not /opt/layer_N), which is issue #888. So
+    # layers always go in via docker cp merged into /opt, below.
     _use_docker_cp = False
+    _cp_layers = bool(layers_dirs)
     mounts: list = []
     if package_type == "Zip":
         host_code_dir = LAMBDA_DOCKER_VOLUME_MOUNT or code_dir
@@ -2570,8 +2594,6 @@ def _spawn_lambda_container(config: dict, code_zip: bytes | None):
             mounts.append(docker_lib.types.Mount("/var/task", host_code_dir, type="bind", read_only=True))
             if is_provided:
                 mounts.append(docker_lib.types.Mount("/var/runtime", host_code_dir, type="bind", read_only=True))
-            for idx, ld in enumerate(layers_dirs):
-                mounts.append(docker_lib.types.Mount(f"/opt/layer_{idx}", ld, type="bind", read_only=True))
         elif _running_in_container():
             # DinD: host daemon can't see our tmpfs — populate via docker cp after create
             _use_docker_cp = True
@@ -2579,8 +2601,6 @@ def _spawn_lambda_container(config: dict, code_zip: bytes | None):
             mounts.append(docker_lib.types.Mount("/var/task", host_code_dir, type="bind", read_only=True))
             if is_provided:
                 mounts.append(docker_lib.types.Mount("/var/runtime", host_code_dir, type="bind", read_only=True))
-            for idx, ld in enumerate(layers_dirs):
-                mounts.append(docker_lib.types.Mount(f"/opt/layer_{idx}", ld, type="bind", read_only=True))
 
     # CMD / EntryPoint
     run_kwargs: dict = {
@@ -2633,18 +2653,23 @@ def _spawn_lambda_container(config: dict, code_zip: bytes | None):
             raise RuntimeError(f"Failed to pull image {image}: {exc}")
 
     try:
-        if _use_docker_cp:
+        if _use_docker_cp or _cp_layers:
             create_kwargs = {k: v for k, v in run_kwargs.items()
                              if k not in ("detach", "stdin_open")}
             container = client.containers.create(**create_kwargs)
-            _docker_cp_dir(container, code_dir, "/var/task")
-            if is_provided:
-                _docker_cp_dir(container, code_dir, "/var/runtime")
-            for idx, ld in enumerate(layers_dirs):
-                # /opt/layer_{idx} doesn't exist in the base RIE image — extract
-                # into /opt with the layer dir baked into the arcname (issue #816
-                # follow-up: docker executor 404 on archive path).
-                _docker_cp_dir(container, ld, "/opt", arcname=f"layer_{idx}")
+            # Code: cp'd only in DinD mode (otherwise it's bind-mounted above).
+            if _use_docker_cp:
+                _docker_cp_dir(container, code_dir, "/var/task")
+                if is_provided:
+                    _docker_cp_dir(container, code_dir, "/var/runtime")
+            # Layers: merge each layer's contents directly into /opt, exactly as
+            # AWS does — so /opt/python, /opt/lib, /opt/bin land on the runtime's
+            # standard search paths and the RIE bootstrap finds them with no
+            # shims. arcname="." so the tar carries ./python/... (not
+            # ./layer_N/...); later layers overlay earlier ones, matching AWS
+            # layer ordering. Fixes issue #888.
+            for ld in layers_dirs:
+                _docker_cp_dir(container, ld, "/opt", arcname=".")
             container.start()
         else:
             container = client.containers.run(**run_kwargs)
@@ -3125,7 +3150,7 @@ def _execute_function_provided(func: dict, event: dict) -> dict:
             code_dir = os.path.join(tmpdir, "code")
             os.makedirs(code_dir)
             with zipfile.ZipFile(zip_path) as zf:
-                zf.extractall(code_dir)
+                _extract_zip_preserving_mode(zf, code_dir)
 
             bootstrap_path = os.path.join(code_dir, "bootstrap")
             if not os.path.exists(bootstrap_path):
@@ -3325,7 +3350,7 @@ def _execute_function_local(func: dict, event: dict) -> dict:
             code_dir = os.path.join(tmpdir, "code")
             os.makedirs(code_dir)
             with zipfile.ZipFile(zip_path) as zf:
-                zf.extractall(code_dir)
+                _extract_zip_preserving_mode(zf, code_dir)
 
             layers_dirs: list[str] = []
             for layer_ref in config.get("Layers", []):
@@ -3338,7 +3363,7 @@ def _execute_function_local(func: dict, event: dict) -> dict:
                     with open(lzip_path, "wb") as lf:
                         lf.write(layer_zip)
                     with zipfile.ZipFile(lzip_path) as lzf:
-                        lzf.extractall(layer_dir)
+                        _extract_zip_preserving_mode(lzf, layer_dir)
                     layers_dirs.append(layer_dir)
 
             # Symlink layer node_modules packages into the code directory so that

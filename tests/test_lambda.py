@@ -4993,3 +4993,53 @@ def test_xray_trace_id_helper_unit():
     inbound = "Root=1-12345678-aaaabbbbccccddddeeeeffff;Parent=1111222233334444;Sampled=1"
     assert _xray_trace_id_for_invocation({}, inbound) == inbound
     assert _xray_trace_id_for_invocation({"TracingConfig": {"Mode": "Active"}}, inbound) == inbound
+
+
+# ---------------------------------------------------------------------------
+# Layer / code zip extraction preserves unix mode bits — issue #888. AWS keeps
+# layer file permissions; the +x on /opt/bin tools and bundled binaries must
+# survive extraction (ZipFile.extractall drops them).
+# ---------------------------------------------------------------------------
+
+
+def test_extract_zip_preserves_executable_bit():
+    import tempfile
+    from ministack.services.lambda_svc import _extract_zip_preserving_mode
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        exe = zipfile.ZipInfo("bin/tool")
+        exe.external_attr = 0o755 << 16
+        zf.writestr(exe, "#!/bin/sh\necho hi\n")
+        mod = zipfile.ZipInfo("python/mymod.py")
+        mod.external_attr = 0o644 << 16
+        zf.writestr(mod, "X = 1\n")
+    buf.seek(0)
+
+    dest = tempfile.mkdtemp()
+    with zipfile.ZipFile(buf) as zf:
+        _extract_zip_preserving_mode(zf, dest)
+
+    tool_mode = os.stat(os.path.join(dest, "bin/tool")).st_mode & 0o777
+    assert tool_mode == 0o755, f"executable bit dropped: {oct(tool_mode)}"
+    assert os.stat(os.path.join(dest, "python/mymod.py")).st_mode & 0o777 == 0o644
+
+
+def test_extract_zip_windows_zip_keeps_default_mode():
+    """Windows-created zips (PowerShell Compress-Archive) carry no unix mode
+    (external_attr high bits = 0) — we must NOT chmod them to 0, which would
+    make the extracted files unreadable."""
+    import tempfile
+    from ministack.services.lambda_svc import _extract_zip_preserving_mode
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("python/winmod.py", "Y = 2\n")  # external_attr defaults to 0
+    buf.seek(0)
+
+    dest = tempfile.mkdtemp()
+    with zipfile.ZipFile(buf) as zf:
+        _extract_zip_preserving_mode(zf, dest)
+
+    mode = os.stat(os.path.join(dest, "python/winmod.py")).st_mode & 0o777
+    assert mode != 0, "file left unreadable (chmod 0) on a windows-style zip"
