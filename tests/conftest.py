@@ -476,6 +476,11 @@ def rds():
 
 
 @pytest.fixture(scope="session")
+def docdb():
+    return make_client("docdb")
+
+
+@pytest.fixture(scope="session")
 def ecr():
     return make_client("ecr")
 
