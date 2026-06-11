@@ -3915,13 +3915,15 @@ def _poll_ecs_tasks(cluster, task_arns):
 
 
 def _pascal_to_camel(d):
-    """Convert top-level PascalCase keys to camelCase for ECS internals."""
+    """Recursively convert PascalCase keys to camelCase for ECS internals."""
+    if isinstance(d, list):
+        return [_pascal_to_camel(v) for v in d]
     if not isinstance(d, dict):
         return d
     out = {}
     for k, v in d.items():
         new_key = k[0].lower() + k[1:] if k else k
-        out[new_key] = v
+        out[new_key] = _pascal_to_camel(v)
     return out
 
 

@@ -1799,6 +1799,81 @@ def test_sfn_integration_ecs_run_task_output_contains_status(sfn, ecs):
     assert task_out["lastStatus"] == "RUNNING"
     assert "failures" in output
 
+def test_sfn_integration_ecs_run_task_container_overrides_reach_the_task(sfn, ecs):
+    """PascalCase ContainerOverrides must survive the SFN->ECS hand-off instead of being silently dropped."""
+    ecs.create_cluster(clusterName="sfn-ecs-overrides")
+    ecs.register_task_definition(
+        family="sfn-overrides-task",
+        containerDefinitions=[
+            {
+                "name": "main",
+                "image": "alpine:latest",
+                "command": ["echo", "hi"],
+                "memory": 128,
+                "environment": [{"name": "FROM_TASKDEF", "value": "yes"}],
+            }
+        ],
+    )
+
+    definition = json.dumps(
+        {
+            "StartAt": "Run",
+            "States": {
+                "Run": {
+                    "Type": "Task",
+                    "Resource": "arn:aws:states:::ecs:runTask",
+                    "Parameters": {
+                        "Cluster": "sfn-ecs-overrides",
+                        "TaskDefinition": "sfn-overrides-task",
+                        "LaunchType": "FARGATE",
+                        "Overrides": {
+                            "ContainerOverrides": [
+                                {
+                                    "Name": "main",
+                                    "Environment": [
+                                        {"Name": "FROM_OVERRIDES", "Value": "yes"},
+                                        {"Name": "RUN_ID", "Value.$": "$$.Execution.Name"},
+                                    ],
+                                }
+                            ]
+                        },
+                    },
+                    "End": True,
+                },
+            },
+        }
+    )
+    sm = sfn.create_state_machine(
+        name="sfn-ecs-overrides",
+        definition=definition,
+        roleArn="arn:aws:iam::000000000000:role/R",
+    )
+    ex = sfn.start_execution(
+        stateMachineArn=sm["stateMachineArn"], name="overrides-exec-1", input="{}"
+    )
+
+    desc = _wait_sfn(sfn, ex["executionArn"])
+    assert desc["status"] == "SUCCEEDED"
+    output = json.loads(desc["output"])
+    task_out = output["tasks"][0]
+
+    env = {
+        e["name"]: e["value"]
+        for ov in task_out["overrides"]["containerOverrides"]
+        for e in ov["environment"]
+    }
+    assert env == {"FROM_OVERRIDES": "yes", "RUN_ID": "overrides-exec-1"}
+    assert task_out["overrides"]["containerOverrides"][0]["name"] == "main"
+
+    # boto3 parses DescribeTasks against the real ECS model (camelCase only)
+    described = ecs.describe_tasks(
+        cluster="sfn-ecs-overrides", tasks=[task_out["taskArn"]]
+    )
+    described_overrides = described["tasks"][0]["overrides"]["containerOverrides"]
+    assert described_overrides[0]["name"] == "main"
+    described_env = {e["name"]: e["value"] for e in described_overrides[0]["environment"]}
+    assert described_env == {"FROM_OVERRIDES": "yes", "RUN_ID": "overrides-exec-1"}
+
 def test_sfn_integration_nested_start_execution_sync_returns_string_output(sfn):
     """states:startExecution.sync should return the child Output as a JSON string."""
     unique = str(time.time_ns())

@@ -112,6 +112,8 @@ _triggers = AccountScopedDict()     # trigger_name -> trigger dict
 _workflows = AccountScopedDict()    # workflow_name -> workflow dict
 _workflow_runs = AccountScopedDict() # workflow_name -> [run, ...]
 _user_defined_functions = AccountScopedDict()  # "db_name/function_name" -> udf dict
+_table_column_statistics = AccountScopedDict()      # "db/table" -> {column_name: stats}
+_partition_column_statistics = AccountScopedDict()  # "db/table" -> [{"Values": [...], "Stats": {col: stats}}]
 
 _ALL_STATE = {
     "databases": _databases,
@@ -129,6 +131,8 @@ _ALL_STATE = {
     "workflows": _workflows,
     "workflow_runs": _workflow_runs,
     "user_defined_functions": _user_defined_functions,
+    "table_column_statistics": _table_column_statistics,
+    "partition_column_statistics": _partition_column_statistics,
 }
 
 
@@ -200,6 +204,13 @@ async def handle_request(method, path, headers, body, query_params):
         # Partition Indexes
         "CreatePartitionIndex": _create_partition_index,
         "GetPartitionIndexes": _get_partition_indexes,
+        # Column Statistics
+        "UpdateColumnStatisticsForTable": _update_column_statistics_for_table,
+        "GetColumnStatisticsForTable": _get_column_statistics_for_table,
+        "DeleteColumnStatisticsForTable": _delete_column_statistics_for_table,
+        "UpdateColumnStatisticsForPartition": _update_column_statistics_for_partition,
+        "GetColumnStatisticsForPartition": _get_column_statistics_for_partition,
+        "DeleteColumnStatisticsForPartition": _delete_column_statistics_for_partition,
         # Connections
         "CreateConnection": _create_connection,
         "DeleteConnection": _delete_connection,
@@ -503,6 +514,8 @@ def _delete_database(data):
         del _tables[k]
         _partitions.pop(k, None)
         _partition_indexes.pop(k, None)
+        _table_column_statistics.pop(k, None)
+        _partition_column_statistics.pop(k, None)
     return json_response({})
 
 
@@ -576,6 +589,8 @@ def _delete_table(data):
     _tables.pop(key, None)
     _partitions.pop(key, None)
     _partition_indexes.pop(key, None)
+    _table_column_statistics.pop(key, None)
+    _partition_column_statistics.pop(key, None)
     return json_response({})
 
 
@@ -643,6 +658,8 @@ def _batch_delete_table(data):
             del _tables[key]
             _partitions.pop(key, None)
             _partition_indexes.pop(key, None)
+            _table_column_statistics.pop(key, None)
+            _partition_column_statistics.pop(key, None)
     return json_response({"Errors": errors})
 
 
@@ -680,6 +697,10 @@ def _delete_partition(data):
     key = f"{db_name}/{table_name}"
     if key in _partitions:
         _partitions[key] = [p for p in _partitions[key] if p.get("Values") != values]
+    if key in _partition_column_statistics:
+        _partition_column_statistics[key] = [
+            e for e in _partition_column_statistics[key] if e.get("Values") != values
+        ]
     return json_response({})
 
 
@@ -807,6 +828,134 @@ def _get_partition_indexes(data):
     table_name = data.get("TableName")
     key = f"{db_name}/{table_name}"
     return json_response({"PartitionIndexDescriptorList": _partition_indexes.get(key, [])})
+
+
+# ---- Column Statistics ----
+
+def _partition_stats_entry(key, values):
+    for entry in _partition_column_statistics.get(key, []):
+        if entry.get("Values") == values:
+            return entry
+    return None
+
+
+def _update_column_statistics_for_table(data):
+    db_name = data.get("DatabaseName")
+    table_name = data.get("TableName")
+    key = f"{db_name}/{table_name}"
+    if key not in _tables:
+        return error_response_json("EntityNotFoundException",
+            f"Table {table_name} not found in {db_name}", 400)
+    stats_list = data.get("ColumnStatisticsList", [])
+    bucket = _table_column_statistics.setdefault(key, {})
+    errors = []
+    for cs in stats_list:
+        col = cs.get("ColumnName")
+        if not col:
+            errors.append({"ColumnStatistics": cs, "Error": {
+                "ErrorCode": "InvalidInputException",
+                "ErrorMessage": "ColumnName is required"}})
+            continue
+        bucket[col] = cs
+    return json_response({"Errors": errors})
+
+
+def _get_column_statistics_for_table(data):
+    db_name = data.get("DatabaseName")
+    table_name = data.get("TableName")
+    key = f"{db_name}/{table_name}"
+    if key not in _tables:
+        return error_response_json("EntityNotFoundException",
+            f"Table {table_name} not found in {db_name}", 400)
+    bucket = _table_column_statistics.get(key, {})
+    stats_list = []
+    errors = []
+    for col in data.get("ColumnNames", []):
+        if col in bucket:
+            stats_list.append(bucket[col])
+        else:
+            errors.append({"ColumnName": col, "Error": {
+                "ErrorCode": "EntityNotFoundException",
+                "ErrorMessage": f"Column statistics for {col} not found"}})
+    return json_response({"ColumnStatisticsList": stats_list, "Errors": errors})
+
+
+def _delete_column_statistics_for_table(data):
+    db_name = data.get("DatabaseName")
+    table_name = data.get("TableName")
+    column_name = data.get("ColumnName")
+    key = f"{db_name}/{table_name}"
+    if key not in _tables:
+        return error_response_json("EntityNotFoundException",
+            f"Table {table_name} not found in {db_name}", 400)
+    # Real Glue's Delete* operations are idempotent — deleting stats for a
+    # column that never had any returns 200 with an empty body.
+    _table_column_statistics.get(key, {}).pop(column_name, None)
+    return json_response({})
+
+
+def _update_column_statistics_for_partition(data):
+    db_name = data.get("DatabaseName")
+    table_name = data.get("TableName")
+    values = data.get("PartitionValues", [])
+    key = f"{db_name}/{table_name}"
+    if not any(p.get("Values") == values for p in _partitions.get(key, [])):
+        return error_response_json("EntityNotFoundException",
+            f"Partition with values {values} not found", 400)
+    entry = _partition_stats_entry(key, values)
+    if entry is None:
+        entry = {"Values": values, "Stats": {}}
+        _partition_column_statistics.setdefault(key, []).append(entry)
+    errors = []
+    for cs in data.get("ColumnStatisticsList", []):
+        col = cs.get("ColumnName")
+        if not col:
+            errors.append({"ColumnStatistics": cs, "Error": {
+                "ErrorCode": "InvalidInputException",
+                "ErrorMessage": "ColumnName is required"}})
+            continue
+        entry["Stats"][col] = cs
+    return json_response({"Errors": errors})
+
+
+def _get_column_statistics_for_partition(data):
+    db_name = data.get("DatabaseName")
+    table_name = data.get("TableName")
+    values = data.get("PartitionValues", [])
+    key = f"{db_name}/{table_name}"
+    if key not in _tables:
+        return error_response_json("EntityNotFoundException",
+            f"Table {table_name} not found in {db_name}", 400)
+    if not any(p.get("Values") == values for p in _partitions.get(key, [])):
+        return error_response_json("EntityNotFoundException",
+            f"Partition with values {values} not found", 400)
+    entry = _partition_stats_entry(key, values)
+    bucket = entry["Stats"] if entry else {}
+    stats_list = []
+    errors = []
+    for col in data.get("ColumnNames", []):
+        if col in bucket:
+            stats_list.append(bucket[col])
+        else:
+            errors.append({"ColumnName": col, "Error": {
+                "ErrorCode": "EntityNotFoundException",
+                "ErrorMessage": f"Column statistics for {col} not found"}})
+    return json_response({"ColumnStatisticsList": stats_list, "Errors": errors})
+
+
+def _delete_column_statistics_for_partition(data):
+    db_name = data.get("DatabaseName")
+    table_name = data.get("TableName")
+    values = data.get("PartitionValues", [])
+    column_name = data.get("ColumnName")
+    key = f"{db_name}/{table_name}"
+    if not any(p.get("Values") == values for p in _partitions.get(key, [])):
+        return error_response_json("EntityNotFoundException",
+            f"Partition with values {values} not found", 400)
+    entry = _partition_stats_entry(key, values)
+    if entry is not None:
+        entry.get("Stats", {}).pop(column_name, None)
+    return json_response({})
 
 
 # ---- Connections ----
@@ -1791,3 +1940,5 @@ def reset():
     _triggers.clear()
     _workflows.clear()
     _workflow_runs.clear()
+    _table_column_statistics.clear()
+    _partition_column_statistics.clear()
