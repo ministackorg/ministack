@@ -375,6 +375,34 @@ def test_cfn_change_set_lifecycle(cfn):
     stack = _wait_stack(cfn, "cfn-t08")
     assert stack["StackStatus"] == "CREATE_COMPLETE"
 
+def test_cfn_change_set_create_emits_review_event(cfn):
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "Bucket": {
+                "Type": "AWS::S3::Bucket",
+                "Properties": {"BucketName": "cfn-t08b-cs"},
+            },
+        },
+    }
+    cfn.create_change_set(
+        StackName="cfn-t08b",
+        ChangeSetName="cfn-t08b-cs1",
+        TemplateBody=json.dumps(template),
+        ChangeSetType="CREATE",
+    )
+    time.sleep(1)
+
+    stack = cfn.describe_stacks(StackName="cfn-t08b")["Stacks"][0]
+    assert stack["StackStatus"] == "REVIEW_IN_PROGRESS"
+
+    events = cfn.describe_stack_events(StackName="cfn-t08b")["StackEvents"]
+    assert len(events) > 0
+    review = events[0]
+    assert review["ResourceStatus"] == "REVIEW_IN_PROGRESS"
+    assert review["ResourceType"] == "AWS::CloudFormation::Stack"
+    assert review["LogicalResourceId"] == "cfn-t08b"
+
 def test_cfn_update_stack(cfn, s3):
     template_v1 = {
         "AWSTemplateFormatVersion": "2010-09-09",

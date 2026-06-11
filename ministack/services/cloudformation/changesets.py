@@ -91,6 +91,9 @@ def _create_change_set(params):
         }
         _stacks[stack_name] = stack
         _stack_events[stack_id] = []
+        _add_event(stack_id, stack_name, stack_name,
+                   "AWS::CloudFormation::Stack", "REVIEW_IN_PROGRESS",
+                   physical_id=stack_id)
     else:
         if not stack:
             return _error("ValidationError",

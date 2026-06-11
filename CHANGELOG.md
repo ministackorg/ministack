@@ -18,6 +18,7 @@ Unreleased
 ## [Unreleased]
 
 ### Fixed
+- **CloudFormation — `DescribeStackEvents` returns the initial `REVIEW_IN_PROGRESS` event for change-set-created stacks** — creating a stack via `CreateChangeSet` with `--change-set-type CREATE` left the placeholder stack in `REVIEW_IN_PROGRESS` but seeded an empty event list, so `DescribeStackEvents` returned `[]`. AWS records an initial `REVIEW_IN_PROGRESS` event for the `AWS::CloudFormation::Stack` resource at this point; tools that read `StackEvents[0]`, notably `sam deploy`, crashed with `IndexError: list index out of range`. The placeholder stack now emits the `REVIEW_IN_PROGRESS` event on creation.
 - **Step Functions — `ecs:runTask` / `ecs:runTask.sync` no longer drop `ContainerOverrides`** — the Pascal→camelCase conversion at the SFN→ECS hand-off only covered top-level Parameters keys, so `Overrides.ContainerOverrides` (including resolved `"Value.$"` entries) stayed PascalCase and was silently ignored: the container ran with task-definition env only while the task launched and the `.sync` state succeeded. The conversion is now recursive; nested `NetworkConfiguration` is covered by the same pass. (#886)
 
 ---
