@@ -21,6 +21,7 @@ import subprocess
 import tempfile
 import threading
 import time
+from urllib.parse import unquote
 
 from ministack.core.persistence import PERSIST_STATE, load_state
 from ministack.core.responses import (
@@ -157,6 +158,15 @@ def _arn(resource_type, name):
 
 
 async def handle_request(method, path, headers, body, query_params):
+    # Glue's Iceberg REST catalog data plane. On real AWS this is
+    # `glue.<region>.amazonaws.com/iceberg` — same service, same SigV4
+    # signing name (`glue`), different protocol (Iceberg REST OpenAPI
+    # instead of X-Amz-Target JSON RPC). The router's credential-scope
+    # dispatch already lands `glue`-signed requests here, so a plain
+    # path check is all that's needed to tell the two protocols apart.
+    if path.startswith("/iceberg"):
+        return _handle_iceberg_rest(method, path, query_params)
+
     target = headers.get("x-amz-target", "")
     action = target.split(".")[-1] if "." in target else ""
 
@@ -256,6 +266,208 @@ async def handle_request(method, path, headers, body, query_params):
     if not handler:
         return error_response_json("InvalidAction", f"Unknown Glue action: {action}", 400)
     return handler(data)
+
+
+# ---- Iceberg REST catalog (Glue data plane) ----
+#
+# Read-path subset of the Apache Iceberg REST Catalog OpenAPI spec, mirroring
+# AWS Glue's `glue.<region>.amazonaws.com/iceberg` endpoint so that clients
+# like DuckDB's `iceberg` extension can ATTACH:
+#
+#     ATTACH '000000000000' AS glue_catalog (
+#         TYPE iceberg,
+#         ENDPOINT 'localhost:4566/iceberg',
+#         AUTHORIZATION_TYPE 'sigv4'
+#     );
+#
+# Glue's prefix shape is `/v1/catalogs/{catalog}/...` (returned to the client
+# as `defaults.prefix` from /v1/config). This is distinct from the S3 Tables
+# Iceberg REST endpoint served by `services/s3tables.py`, whose prefix is a
+# URL-encoded table-bucket ARN — on AWS those are two separate services told
+# apart by SigV4 signing name, and MiniStack routes them the same way.
+#
+# A table participates in this surface iff its `Parameters["metadata_location"]`
+# points at an Iceberg metadata.json on MiniStack's S3 (written there by an
+# external engine such as Trino/Spark, then registered in Glue). The
+# metadata.json is passed through verbatim — format versions change and we
+# don't want to be in the parsing business. Write paths return 501.
+#
+# Responses use plain `application/json` and the spec's
+# `{"error": {"message", "type", "code"}}` envelope — NOT the AWS
+# x-amz-json-1.0 flavor the rest of this module speaks.
+
+_iceberg_tls_hint_logged = False
+
+
+def _iceberg_json(data, status=200):
+    body = json.dumps(data, ensure_ascii=False).encode("utf-8")
+    return status, {"Content-Type": "application/json"}, body
+
+
+def _iceberg_error(message, error_type, status):
+    return _iceberg_json(
+        {"error": {"message": message, "type": error_type, "code": status}},
+        status=status,
+    )
+
+
+def _iceberg_s3_overrides():
+    """S3 client config handed to Iceberg REST clients.
+
+    Real AWS Glue returns no overrides (clients use ambient AWS creds);
+    MiniStack must return them or the client tries real S3 for the data
+    files referenced by the catalog and fails.
+
+    Credentials are the fixed `test`/`test` pair (same as the s3tables
+    Iceberg surface) — MiniStack's S3 doesn't verify signatures, and
+    echoing ambient AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY into an HTTP
+    response would leak real credentials from the host environment."""
+    host = os.environ.get("MINISTACK_HOST", "localhost")
+    port = os.environ.get("GATEWAY_PORT", "4566")
+    return {
+        "s3.endpoint": f"http://{host}:{port}",
+        "s3.access-key-id": "test",
+        "s3.secret-access-key": "test",
+        "s3.path-style-access": "true",
+        "s3.region": os.environ.get("MINISTACK_REGION", "us-east-1"),
+    }
+
+
+def _iceberg_fetch_metadata(metadata_location):
+    """Read the metadata.json at an ``s3://bucket/key`` URI from MiniStack's
+    S3 and return it parsed, or None if the URI is malformed, the object is
+    missing, or the body isn't valid JSON."""
+    if not metadata_location or not metadata_location.startswith("s3://"):
+        return None
+    rest = metadata_location[len("s3://"):]
+    if "/" not in rest:
+        return None
+    bucket, key = rest.split("/", 1)
+    if not bucket or not key:
+        return None
+    from ministack.services import s3 as _s3
+    data = _s3._get_object_data(bucket, key)
+    if data is None:
+        return None
+    try:
+        return json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        logger.warning("Iceberg metadata.json at %s did not parse: %s",
+                       metadata_location, exc)
+        return None
+
+
+def _iceberg_table_entry(db_name, table_name):
+    """Return the Glue table dict if it exists AND is an Iceberg table
+    (has a `metadata_location` parameter), else None."""
+    table = _tables.get(f"{db_name}/{table_name}")
+    if table is None:
+        return None
+    if not (table.get("Parameters") or {}).get("metadata_location"):
+        return None
+    return table
+
+
+def _iceberg_load_table(db_name, table_name):
+    table = _iceberg_table_entry(db_name, table_name)
+    if table is None:
+        return _iceberg_error(
+            f"Table does not exist: {db_name}.{table_name}",
+            "NoSuchTableException", 404)
+    metadata_location = table["Parameters"]["metadata_location"]
+    # Missing/unparseable metadata.json is a 404, not a 200 with empty
+    # metadata — DuckDB would treat the latter as a real-but-empty table
+    # and silently return wrong query results.
+    metadata = _iceberg_fetch_metadata(metadata_location)
+    if metadata is None:
+        return _iceberg_error(
+            f"Table metadata not readable: {db_name}.{table_name} "
+            f"(metadata_location={metadata_location})",
+            "NoSuchTableException", 404)
+    return _iceberg_json({
+        "metadata-location": metadata_location,
+        "metadata": metadata,
+        "config": _iceberg_s3_overrides(),
+    })
+
+
+def _iceberg_maybe_log_tls_hint():
+    """Warn once if USE_SSL isn't on — DuckDB hardcodes https:// on the
+    Iceberg endpoint and fails at connect time with no useful message."""
+    global _iceberg_tls_hint_logged
+    if _iceberg_tls_hint_logged:
+        return
+    _iceberg_tls_hint_logged = True
+    if os.environ.get("USE_SSL", "").strip().lower() not in ("1", "true", "yes"):
+        logger.warning(
+            "Glue Iceberg REST endpoint hit while USE_SSL is not enabled. "
+            "DuckDB's iceberg extension hardcodes https:// and will fail to "
+            "connect. Set USE_SSL=1 and trust MiniStack's self-signed cert "
+            "(SSL_CERT_FILE / DuckDB ca_cert_file) for ATTACH to work."
+        )
+
+
+def _handle_iceberg_rest(method, path, query_params):
+    _iceberg_maybe_log_tls_hint()
+    parts = [unquote(p) for p in path.strip("/").split("/") if p]
+    # parts: ["iceberg", "v1", ...]
+    if len(parts) < 3 or parts[0] != "iceberg" or parts[1] != "v1":
+        return _iceberg_error(f"Unknown Iceberg REST path: {path}",
+                              "NotFoundException", 404)
+
+    # GET /iceberg/v1/config?warehouse=<id> — called once on ATTACH. The
+    # prefix tells the client to build subsequent URLs as
+    # /v1/catalogs/{warehouse}/... — Glue's prefix shape.
+    if parts[2] == "config" and len(parts) == 3 and method == "GET":
+        warehouse = query_params.get("warehouse", "")
+        if isinstance(warehouse, list):
+            warehouse = warehouse[0] if warehouse else ""
+        defaults = {"prefix": f"catalogs/{warehouse}"} if warehouse else {}
+        return _iceberg_json({"defaults": defaults,
+                              "overrides": _iceberg_s3_overrides()})
+
+    # Everything else: /v1/catalogs/{catalog}/namespaces[/{ns}[/tables[/{tbl}]]]
+    # The catalog id is accepted but not validated — MiniStack is
+    # single-catalog per account, scoping happens via the SigV4 account id.
+    if len(parts) < 5 or parts[2] != "catalogs" or parts[4] != "namespaces":
+        return _iceberg_error(
+            f"Operation not supported: {method} {path}",
+            "UnsupportedOperationException", 501)
+
+    if len(parts) == 5 and method == "GET":  # ListNamespaces
+        return _iceberg_json(
+            {"namespaces": [[name] for name in sorted(_databases.keys())]})
+
+    if len(parts) == 6 and method == "GET":  # GetNamespace
+        ns = parts[5]
+        if ns not in _databases:
+            return _iceberg_error(f"Namespace does not exist: {ns}",
+                                  "NoSuchNamespaceException", 404)
+        return _iceberg_json({"namespace": [ns], "properties": {}})
+
+    if len(parts) >= 7 and parts[6] == "tables":
+        ns = parts[5]
+        if len(parts) == 7 and method == "GET":  # ListTables
+            if ns not in _databases:
+                return _iceberg_error(f"Namespace does not exist: {ns}",
+                                      "NoSuchNamespaceException", 404)
+            prefix = f"{ns}/"
+            names = sorted(
+                t["Name"] for k, t in _tables.items()
+                if k.startswith(prefix)
+                and (t.get("Parameters") or {}).get("metadata_location"))
+            return _iceberg_json(
+                {"identifiers": [{"namespace": [ns], "name": n} for n in names]})
+        if len(parts) == 8:
+            if method == "GET":  # LoadTable — the hot path
+                return _iceberg_load_table(ns, parts[7])
+            if method == "HEAD":  # TableExists
+                exists = _iceberg_table_entry(ns, parts[7]) is not None
+                return (200 if exists else 404), {}, b""
+
+    return _iceberg_error(
+        f"Operation not supported: {method} {path}",
+        "UnsupportedOperationException", 501)
 
 
 # ---- Databases ----
