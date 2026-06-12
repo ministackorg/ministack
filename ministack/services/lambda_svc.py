@@ -4453,6 +4453,8 @@ def _create_esm(data: dict):
     }
     if ":sqs:" not in event_source_arn:
         esm["StartingPosition"] = data.get("StartingPosition", "LATEST")
+    if data.get("FilterCriteria"):
+        esm["FilterCriteria"] = data.get("FilterCriteria")
     # #442: Tags are accepted on CreateEventSourceMapping. Stored inline on
     # the ESM record; surfaced via _list_tags for the ESM ARN.
     tags = data.get("Tags") or {}
