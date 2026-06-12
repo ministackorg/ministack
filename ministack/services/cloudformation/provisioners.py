@@ -1877,9 +1877,9 @@ def _apigw_account_delete(physical_id, props):
 # --- Lambda EventSourceMapping ---
 
 def _lambda_esm_create(logical_id, props, stack_name):
-    func_name = props.get("FunctionName", "")
-    if func_name.startswith("arn:"):
-        func_name = func_name.rsplit(":", 1)[-1]
+    func_name, qualifier = _lambda_svc._resolve_name_and_qualifier(
+        props.get("FunctionName", "")
+    )
     esm_id = new_uuid()
     func = _lambda_svc._functions.get(func_name)
     func_arn = func["config"]["FunctionArn"] if func else f"arn:aws:lambda:{get_region()}:{get_account_id()}:function:{func_name}"
@@ -1887,8 +1887,9 @@ def _lambda_esm_create(logical_id, props, stack_name):
     esm = {
         "UUID": esm_id,
         "EventSourceArn": props.get("EventSourceArn", ""),
-        "FunctionArn": func_arn,
+        "FunctionArn": func_arn + (f":{qualifier}" if qualifier else ""),
         "FunctionName": func_name,
+        "Qualifier": qualifier,
         "State": "Enabled",
         "StateTransitionReason": "USER_INITIATED",
         "BatchSize": int(props.get("BatchSize", 10)),
