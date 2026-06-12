@@ -2593,6 +2593,73 @@ def test_sfn_mock_config_throw(sfn):
     assert desc["status"] == "FAILED"
     _ministack_config({"stepfunctions._sfn_mock_config": {}})
 
+def test_sfn_mock_config_jsonata_assign_applied(sfn):
+    """SFN_MOCK_CONFIG + JSONata Task with Assign — variable must be visible downstream.
+
+    Regression: the mock execution path called _apply_jsonata_output but never
+    called _apply_state_assign, so any Assign block was silently skipped.
+    A downstream state reading the assigned variable would fail with
+    States.QueryEvaluationError: Undefined variable.
+    """
+    from conftest import _ministack_config
+
+    mock_cfg = {
+        "StateMachines": {
+            "qa-sfn-mock-jsonata-assign": {
+                "TestCases": {
+                    "HappyPath": {
+                        "FetchData": "MockedData",
+                    }
+                }
+            }
+        },
+        "MockedResponses": {
+            "MockedData": {
+                "0": {"Return": {"value": 99}},
+            }
+        },
+    }
+    _ministack_config({"stepfunctions._sfn_mock_config": mock_cfg})
+
+    definition = json.dumps({
+        "QueryLanguage": "JSONata",
+        "StartAt": "FetchData",
+        "States": {
+            "FetchData": {
+                "Type": "Task",
+                "Resource": "arn:aws:lambda:us-east-1:000000000000:function:nonexistent",
+                "Assign": {"fetchedValue": "{% $states.result.value %}"},
+                "Next": "UseValue",
+            },
+            "UseValue": {
+                "Type": "Pass",
+                "Output": {"result": "{% $fetchedValue %}"},
+                "End": True,
+            },
+        },
+    })
+    sm_arn = sfn.create_state_machine(
+        name="qa-sfn-mock-jsonata-assign",
+        definition=definition,
+        roleArn="arn:aws:iam::000000000000:role/r",
+    )["stateMachineArn"]
+
+    exec_arn = sfn.start_execution(
+        stateMachineArn=sm_arn + "#HappyPath", input="{}",
+    )["executionArn"]
+    for _ in range(20):
+        time.sleep(0.3)
+        desc = sfn.describe_execution(executionArn=exec_arn)
+        if desc["status"] != "RUNNING":
+            break
+
+    assert desc["status"] == "SUCCEEDED", (
+        f"Execution failed — Assign likely not applied in mock path: {desc.get('cause')}"
+    )
+    output = json.loads(desc["output"])
+    assert output["result"] == 99, f"Expected 99 from assigned variable, got: {output}"
+    _ministack_config({"stepfunctions._sfn_mock_config": {}})
+
 def test_sfn_test_state_pass(sfn_sync):
     """TestState API — Pass state returns transformed output."""
     resp = sfn_sync.test_state(

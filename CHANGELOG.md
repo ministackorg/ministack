@@ -5,6 +5,13 @@ All notable changes to MiniStack will be documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+- **Step Functions — `Assign` is now applied in the mock execution path for JSONata Task states** — when `SFN_MOCK_CONFIG` was active, `_apply_state_assign` was never called on the mock return branch, so any `Assign` block in a JSONata Task state was silently skipped; downstream states referencing the assigned variables failed with `States.QueryEvaluationError: Undefined variable`. The mock branch now mirrors the real execution path by calling `_apply_state_assign` after `_apply_jsonata_output`.
+
+---
+
 ## [1.3.62] — 2026-06-11
 
 ### Added
