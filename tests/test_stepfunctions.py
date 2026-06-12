@@ -2593,6 +2593,144 @@ def test_sfn_mock_config_throw(sfn):
     assert desc["status"] == "FAILED"
     _ministack_config({"stepfunctions._sfn_mock_config": {}})
 
+def test_sfn_mock_config_throw_with_catch(sfn):
+    """SFN_MOCK_CONFIG Throw routes through Catch when a matching Catch block exists.
+
+    Bug: previously the mock Throw raised _ExecutionError immediately, bypassing
+    Catch processing, so the entire execution failed even when the state had a
+    matching Catch handler. Fixed in fix/sfn-mock-throw-catch-jsonata.
+    """
+    from conftest import _ministack_config
+
+    mock_cfg = {
+        "StateMachines": {
+            "qa-sfn-mock-throw-catch": {
+                "TestCases": {
+                    "ThrowAndCatch": {
+                        "StateA": "StateAThrows",
+                    }
+                }
+            }
+        },
+        "MockedResponses": {
+            "StateAThrows": {
+                "0": {"Throw": {"Error": "MyError", "Cause": "test cause"}},
+            }
+        },
+    }
+    _ministack_config({"stepfunctions._sfn_mock_config": mock_cfg})
+
+    definition = json.dumps({
+        "QueryLanguage": "JSONata",
+        "StartAt": "StateA",
+        "States": {
+            "StateA": {
+                "Type": "Task",
+                "Resource": "arn:aws:lambda:us-east-1:000000000000:function:dummy",
+                "Catch": [
+                    {
+                        "ErrorEquals": ["States.ALL"],
+                        "Assign": {"caught_error": "{% $states.errorOutput %}"},
+                        "Next": "StateB",
+                    }
+                ],
+                "End": True,
+            },
+            "StateB": {
+                "Type": "Pass",
+                "Output": {
+                    "recovered": True,
+                    "error_code": "{% $caught_error.Error %}",
+                },
+                "End": True,
+            },
+        },
+    })
+    sm_arn = sfn.create_state_machine(
+        name="qa-sfn-mock-throw-catch",
+        definition=definition,
+        roleArn="arn:aws:iam::000000000000:role/r",
+    )["stateMachineArn"]
+
+    exec_arn = sfn.start_execution(
+        stateMachineArn=sm_arn + "#ThrowAndCatch", input="{}",
+    )["executionArn"]
+    for _ in range(20):
+        time.sleep(0.3)
+        desc = sfn.describe_execution(executionArn=exec_arn)
+        if desc["status"] != "RUNNING":
+            break
+
+    assert desc["status"] == "SUCCEEDED", f"Expected SUCCEEDED, got {desc['status']}: {desc.get('cause')}"
+    output = json.loads(desc["output"])
+    assert output["recovered"] is True
+    assert output["error_code"] == "MyError"
+
+    _ministack_config({"stepfunctions._sfn_mock_config": {}})
+
+def test_sfn_mock_config_throw_no_matching_catch_still_fails(sfn):
+    """SFN_MOCK_CONFIG Throw with no matching Catch still fails the execution."""
+    from conftest import _ministack_config
+
+    mock_cfg = {
+        "StateMachines": {
+            "qa-sfn-mock-throw-no-catch": {
+                "TestCases": {
+                    "ThrowNoCatch": {
+                        "StateA": "StateAThrowsNoCatch",
+                    }
+                }
+            }
+        },
+        "MockedResponses": {
+            "StateAThrowsNoCatch": {
+                "0": {"Throw": {"Error": "UnhandledError", "Cause": "no catcher"}},
+            }
+        },
+    }
+    _ministack_config({"stepfunctions._sfn_mock_config": mock_cfg})
+
+    definition = json.dumps({
+        "QueryLanguage": "JSONata",
+        "StartAt": "StateA",
+        "States": {
+            "StateA": {
+                "Type": "Task",
+                "Resource": "arn:aws:lambda:us-east-1:000000000000:function:dummy",
+                "Catch": [
+                    {
+                        "ErrorEquals": ["SpecificError"],
+                        "Next": "StateB",
+                    }
+                ],
+                "End": True,
+            },
+            "StateB": {
+                "Type": "Pass",
+                "End": True,
+            },
+        },
+    })
+    sm_arn = sfn.create_state_machine(
+        name="qa-sfn-mock-throw-no-catch",
+        definition=definition,
+        roleArn="arn:aws:iam::000000000000:role/r",
+    )["stateMachineArn"]
+
+    exec_arn = sfn.start_execution(
+        stateMachineArn=sm_arn + "#ThrowNoCatch", input="{}",
+    )["executionArn"]
+    for _ in range(20):
+        time.sleep(0.3)
+        desc = sfn.describe_execution(executionArn=exec_arn)
+        if desc["status"] != "RUNNING":
+            break
+
+    assert desc["status"] == "FAILED"
+    assert desc.get("error") == "UnhandledError"
+
+    _ministack_config({"stepfunctions._sfn_mock_config": {}})
+
 def test_sfn_test_state_pass(sfn_sync):
     """TestState API — Pass state returns transformed output."""
     resp = sfn_sync.test_state(

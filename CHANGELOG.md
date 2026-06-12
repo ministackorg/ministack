@@ -5,6 +5,13 @@ All notable changes to MiniStack will be documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+- **Step Functions — mock `Throw` now routes through `Catch` instead of failing the execution** — when `SFN_MOCK_CONFIG` was active and a mock response contained `"Throw"`, the error was raised immediately inside `_execute_task` before the `Catch`/`Retry` processing loop, so the entire execution was unconditionally marked `FAILED` even when the Task state had a matching `Catch` block. The mock Throw path now mirrors the real execution path: it checks for a matching `Catch` entry (including JSONata `Output`/`Assign` evaluation), routes to the catcher's `Next` state on a match, and only propagates `_ExecutionError` when no catcher matches. `Retry` handling in the mock path is intentionally not replicated (a future enhancement).
+
+---
+
 ## [1.3.62] — 2026-06-11
 
 ### Added

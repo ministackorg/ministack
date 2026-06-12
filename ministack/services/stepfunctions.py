@@ -1357,9 +1357,27 @@ def _execute_task(state_def, raw_input, execution, ctx):
         if mock is not None:
             attempts[state_name] = attempt + 1
             if "Throw" in mock:
-                raise _ExecutionError(
-                    mock["Throw"].get("Error", "MockError"),
-                    mock["Throw"].get("Cause", "Mocked failure"))
+                error_code = mock["Throw"].get("Error", "MockError")
+                cause = mock["Throw"].get("Cause", "Mocked failure")
+                catchers = state_def.get("Catch", [])
+                catcher = _find_matching_catcher(catchers, error_code)
+                if catcher:
+                    error_output = {"Error": error_code, "Cause": cause}
+                    if query_language == "JSONata" and "Output" in catcher:
+                        output = _apply_jsonata_output(
+                            catcher,
+                            raw_input,
+                            ctx,
+                            error_output=error_output,
+                            default=error_output,
+                        )
+                    else:
+                        output = _apply_result_path_raw(
+                            catcher.get("ResultPath", "$"), raw_input, error_output)
+                    if query_language == "JSONata":
+                        _apply_state_assign(catcher, raw_input, ctx, error_output=error_output)
+                    return output, catcher["Next"]
+                raise _ExecutionError(error_code, cause)
             mock_result = mock.get("Return", {})
             if query_language == "JSONata":
                 output = _apply_jsonata_output(
