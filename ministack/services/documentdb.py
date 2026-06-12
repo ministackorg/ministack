@@ -9,6 +9,11 @@ buildInfo, collStats, connectionStatus, dataSize, dbStats, explain, hostInfo, li
 profiler, serverStatus, top, find, insert, update, delete, findAndModify, getMore, ReplaceOne,
 createRole, dropRole, dropAllRolesFromDatabase, grantRolesToRole, revokeRolesFromRole,
 revokePrivilegesFromRole, rolesInfo, updateRole.
+Supports (sessions/user/shard + operators): startSession, abortTransaction, commitTransaction,
+killSessions, killAllSessions, createUser, dropUser, dropAllUsersFromDatabase, grantRolesToUser,
+revokeRolesFromUser, updateUser, usersInfo, enableSharding, shardCollection.
+Array: $all, $elemMatch, $size. Bitwise: $bitsAllSet, $bitsAnySet, $bitsAllClear, $bitsAnyClear.
+Comment: $comment.
 
 Mongo APIs: https://docs.aws.amazon.com/documentdb/latest/developerguide/mongo-apis.html
 https://docs.aws.amazon.com/documentdb/latest/developerguide/connect_programmatically.html
@@ -16,21 +21,30 @@ https://docs.aws.amazon.com/documentdb/latest/developerguide/connect_programmati
 
 import json
 import logging
-from ministack.core.responses import json_response, error_response_json, get_account_id
+
+from ministack.core.responses import error_response_json, get_account_id, json_response, new_uuid
 
 logger = logging.getLogger("documentdb")
 
-_state: dict = {"users": {}, "collections": {}, "roles": {}}
+_state: dict = {"users": {}, "collections": {}, "roles": {}, "sessions": {}, "sharded": {}}
 
 
 def _get_state():
-    """Return account-scoped state dicts (users, collections, roles)."""
+    """Return account-scoped state dicts (users, collections, roles, sessions, sharded)."""
     acct = get_account_id()
     if acct not in _state["users"]:
         _state["users"][acct] = []
         _state["collections"][acct] = {}
         _state["roles"][acct] = {}
-    return _state["users"][acct], _state["collections"][acct], _state["roles"][acct]
+        _state["sessions"][acct] = {}
+        _state["sharded"][acct] = {}
+    return (
+        _state["users"][acct],
+        _state["collections"][acct],
+        _state["roles"][acct],
+        _state["sessions"][acct],
+        _state["sharded"][acct],
+    )
 
 
 async def handle_request(method, path, headers, body, query_params):
@@ -96,8 +110,23 @@ async def handle_request(method, path, headers, body, query_params):
         "revokeprivilegesfromrole": _revoke_privileges_from_role,
         "rolesinfo": _roles_info,
         "updaterole": _update_role,
-        # legacy stubs kept for compatibility
+        # sessions
+        "startsession": _start_session,
+        "aborttransaction": _abort_transaction,
+        "committransaction": _commit_transaction,
+        "killsessions": _kill_sessions,
+        "killallsessions": _kill_all_sessions,
+        # user management
         "createuser": _create_user,
+        "dropuser": _drop_user,
+        "dropallusersfromdatabase": _drop_all_users_from_database,
+        "grantrolestouser": _grant_roles_to_user,
+        "revokerolesfromuser": _revoke_roles_from_user,
+        "updateuser": _update_user,
+        "usersinfo": _users_info,
+        # sharding
+        "enablesharding": _enable_sharding,
+        "shardcollection": _shard_collection,
     }
 
     key = action.lower().replace("_", "")
@@ -115,21 +144,33 @@ def _find(data):
         # legacy fallback
         coll = data.get("collection", "default")
         return json_response({"result": "ok", "documents": [], "collection": coll})
-    _, cols, _ = _get_state()
+    _, cols, _, _, _ = _get_state()
     col = cols.get(db, {}).get(coll) or {"documents": []}
     docs = [d for d in col.get("documents", []) if _doc_matches(d, filt)]
     return json_response({"ok": 1, "cursor": {"firstBatch": docs, "id": 0, "ns": f"{db}.{coll}"}})
 
 
 def _create_user(data):
-    username = data.get("username") or data.get("UserName")
+    username = (
+        data.get("createUser")
+        or data.get("user")
+        or data.get("username")
+        or data.get("UserName")
+    )
     if not username:
-        return error_response_json("InvalidParameter", "username required", 400)
-    users, _, _ = _get_state()
-    if any(u.get("username") == username for u in users):
+        return error_response_json("InvalidParameter", "createUser/user required", 400)
+    users, _, _, _, _ = _get_state()
+    if any(
+        (u.get("user") == username or u.get("username") == username) for u in users
+    ):
         return error_response_json("UserAlreadyExists", f"User {username} exists", 400)
-    users.append({"username": username, "roles": data.get("roles", [])})
-    return json_response({"result": "ok"})
+    uobj = {
+        "user": username,
+        "db": data.get("db") or data.get("database") or "admin",
+        "roles": data.get("roles", []),
+    }
+    users.append(uobj)
+    return json_response({"ok": 1})
 
 
 # --- Administrative commands (from documentdb-apis.md) ---
@@ -139,7 +180,7 @@ def _coll_mod(data):
     coll = data.get("collMod") or data.get("collection")
     if not db or not coll:
         return error_response_json("InvalidParameter", "db and collMod required", 400)
-    _, cols, _ = _get_state()
+    _, cols, _, _, _ = _get_state()
     db_colls = cols.setdefault(db, {})
     if coll not in db_colls:
         return error_response_json("NamespaceNotFound", f"Collection {db}.{coll} does not exist", 404)
@@ -154,7 +195,7 @@ def _create(data):
     coll = data.get("create") or data.get("collection")
     if not db or not coll:
         return error_response_json("InvalidParameter", "db and create required", 400)
-    _, cols, _ = _get_state()
+    _, cols, _, _, _ = _get_state()
     db_colls = cols.setdefault(db, {})
     if coll in db_colls:
         return error_response_json("NamespaceExists", f"Collection {db}.{coll} already exists", 400)
@@ -168,7 +209,7 @@ def _create_indexes(data):
     indexes = data.get("indexes") or []
     if not db or not coll:
         return error_response_json("InvalidParameter", "db and createIndexes required", 400)
-    _, cols, _ = _get_state()
+    _, cols, _, _, _ = _get_state()
     db_colls = cols.setdefault(db, {})
     col = db_colls.setdefault(coll, {"name": coll, "indexes": [], "options": {}, "documents": []})
     for idx in indexes:
@@ -186,7 +227,7 @@ def _drop(data):
     coll = data.get("drop") or data.get("collection")
     if not db or not coll:
         return error_response_json("InvalidParameter", "db and drop required", 400)
-    _, cols, _ = _get_state()
+    _, cols, _, _, _ = _get_state()
     db_colls = cols.get(db, {})
     if coll not in db_colls:
         return error_response_json("NamespaceNotFound", f"Collection {db}.{coll} does not exist", 404)
@@ -198,7 +239,7 @@ def _drop_database(data):
     db = data.get("dropDatabase") or data.get("db")
     if not db:
         return error_response_json("InvalidParameter", "dropDatabase required", 400)
-    _, cols, _ = _get_state()
+    _, cols, _, _, _ = _get_state()
     if db in cols:
         del cols[db]
     return json_response({"ok": 1, "dropped": db})
@@ -210,7 +251,7 @@ def _drop_indexes(data):
     index = data.get("index") or data.get("indexName")
     if not db or not coll or not index:
         return error_response_json("InvalidParameter", "db, dropIndexes and index required", 400)
-    _, cols, _ = _get_state()
+    _, cols, _, _, _ = _get_state()
     db_colls = cols.get(db, {})
     col = db_colls.get(coll)
     if not col:
@@ -236,13 +277,13 @@ def _list_collections(data):
     db = data.get("db") or data.get("database")
     if not db:
         return error_response_json("InvalidParameter", "db required", 400)
-    _, cols, _ = _get_state()
+    _, cols, _, _, _ = _get_state()
     col_list = list(cols.get(db, {}).values())
     return json_response({"ok": 1, "cursor": {"firstBatch": [{"name": c["name"]} for c in col_list], "id": 0, "ns": f"{db}.$cmd.listCollections"}})
 
 
 def _list_databases(data):
-    _, cols, _ = _get_state()
+    _, cols, _, _, _ = _get_state()
     dbs = [{"name": name, "sizeOnDisk": 0, "empty": False} for name in cols.keys()]
     return json_response({"ok": 1, "databases": dbs, "totalSize": 0})
 
@@ -252,7 +293,7 @@ def _list_indexes(data):
     coll = data.get("listIndexes") or data.get("collection")
     if not db or not coll:
         return error_response_json("InvalidParameter", "db and listIndexes required", 400)
-    _, cols, _ = _get_state()
+    _, cols, _, _, _ = _get_state()
     col = cols.get(db, {}).get(coll)
     if not col:
         return error_response_json("NamespaceNotFound", f"Collection {db}.{coll} does not exist", 404)
@@ -264,7 +305,7 @@ def _re_index(data):
     coll = data.get("reIndex") or data.get("collection")
     if not db or not coll:
         return error_response_json("InvalidParameter", "db and reIndex required", 400)
-    _, cols, _ = _get_state()
+    _, cols, _, _, _ = _get_state()
     col = cols.get(db, {}).get(coll)
     if not col:
         return error_response_json("NamespaceNotFound", f"Collection {db}.{coll} does not exist", 404)
@@ -277,7 +318,7 @@ def _rename_collection(data):
     if not from_db or not to_coll or "." not in from_db:
         return error_response_json("InvalidParameter", "from (db.coll) and to required", 400)
     db, coll = from_db.split(".", 1)
-    _, cols, _ = _get_state()
+    _, cols, _, _, _ = _get_state()
     db_colls = cols.get(db, {})
     if coll not in db_colls:
         return error_response_json("NamespaceNotFound", f"Collection {db}.{coll} does not exist", 404)
@@ -291,13 +332,104 @@ def _set_audit_config(data):
 
 # --- helpers for query/agg over in-memory documents ---
 
+def _match_value(doc_val, cond):
+    if isinstance(cond, dict):
+        for op, val in cond.items():
+            if op == "$all":
+                if not isinstance(doc_val, (list, tuple)):
+                    return False
+                for item in val or []:
+                    if item not in doc_val:
+                        return False
+                continue
+            if op == "$elemMatch":
+                if not isinstance(doc_val, (list, tuple)):
+                    return False
+                matched = False
+                em = val or {}
+                for item in doc_val:
+                    if isinstance(item, dict) and _doc_matches(item, em):
+                        matched = True
+                        break
+                    # also allow scalar elemMatch? treat as equality if not dict
+                    if not isinstance(em, dict) and item == em:
+                        matched = True
+                        break
+                if not matched:
+                    return False
+                continue
+            if op == "$size":
+                if not isinstance(doc_val, (list, tuple)):
+                    return False
+                try:
+                    if len(doc_val) != int(val):
+                        return False
+                except (TypeError, ValueError):
+                    return False
+                continue
+            if op in ("$bitsAllSet", "$bitsAnySet", "$bitsAllClear", "$bitsAnyClear"):
+                try:
+                    dv = int(doc_val) if doc_val is not None else 0
+                    mask = int(val)
+                except (TypeError, ValueError):
+                    return False
+                if op == "$bitsAllSet":
+                    if (dv & mask) != mask:
+                        return False
+                elif op == "$bitsAnySet":
+                    if (dv & mask) == 0:
+                        return False
+                elif op == "$bitsAllClear":
+                    if (dv & mask) != 0:
+                        return False
+                elif op == "$bitsAnyClear":
+                    if (dv & mask) == mask:
+                        return False
+                continue
+            # unknown operator in this context: fallthrough to direct compare below
+        # if cond was operator-only dict, consider matched unless a check failed above
+        return True
+    # direct value equality (or regex etc not required here)
+    return doc_val == cond
+
+
 def _doc_matches(doc, filt):
     if not filt:
         return True
     for k, v in filt.items():
         if k.startswith("$"):
+            if k == "$comment":
+                continue
+            if k == "$and":
+                if not isinstance(v, list):
+                    return False
+                for sub in v:
+                    if not _doc_matches(doc, sub):
+                        return False
+                continue
+            if k == "$or":
+                if not isinstance(v, list):
+                    return False
+                if not any(_doc_matches(doc, sub) for sub in v):
+                    return False
+                continue
+            if k == "$nor":
+                if not isinstance(v, list):
+                    return False
+                if any(_doc_matches(doc, sub) for sub in v):
+                    return False
+                continue
+            if k == "$not":
+                if not isinstance(v, dict):
+                    return False
+                if _doc_matches(doc, v):
+                    return False
+                continue
+            # other top-level $ (e.g. $expr) ignored for matching in this emulator
             continue
-        if doc.get(k) != v:
+        # field condition
+        doc_val = doc.get(k)
+        if not _match_value(doc_val, v):
             return False
     return True
 
@@ -330,7 +462,7 @@ def _aggregate(data):
     pipeline = data.get("pipeline", [])
     if not db or not coll:
         return error_response_json("InvalidParameter", "db and aggregate required", 400)
-    _, cols, _ = _get_state()
+    _, cols, _, _, _ = _get_state()
     col = cols.get(db, {}).get(coll) or {"documents": []}
     docs = _run_pipeline(col.get("documents", []), pipeline)
     return json_response({"ok": 1, "cursor": {"firstBatch": docs, "id": 0, "ns": f"{db}.{coll}"}})
@@ -342,7 +474,7 @@ def _count(data):
     query = data.get("query", {})
     if not db or not coll:
         return error_response_json("InvalidParameter", "db and count required", 400)
-    _, cols, _ = _get_state()
+    _, cols, _, _, _ = _get_state()
     col = cols.get(db, {}).get(coll) or {"documents": []}
     n = sum(1 for d in col.get("documents", []) if _doc_matches(d, query))
     return json_response({"ok": 1, "n": n})
@@ -354,7 +486,7 @@ def _distinct(data):
     key = data.get("key")
     if not db or not coll or not key:
         return error_response_json("InvalidParameter", "db, distinct and key required", 400)
-    _, cols, _ = _get_state()
+    _, cols, _, _, _ = _get_state()
     col = cols.get(db, {}).get(coll) or {"documents": []}
     vals = []
     seen = set()
@@ -387,7 +519,7 @@ def _coll_stats(data):
     coll = data.get("collStats") or data.get("collection")
     if not db or not coll:
         return error_response_json("InvalidParameter", "db and collStats required", 400)
-    _, cols, _ = _get_state()
+    _, cols, _, _, _ = _get_state()
     col = cols.get(db, {}).get(coll) or {"documents": [], "indexes": []}
     n = len(col.get("documents", []))
     return json_response({"ok": 1, "ns": f"{db}.{coll}", "count": n, "size": n * 128, "nindexes": len(col.get("indexes", []))})
@@ -402,7 +534,7 @@ def _data_size(data):
     coll = data.get("dataSize") or data.get("collection")
     if not db or not coll:
         return error_response_json("InvalidParameter", "db and dataSize required", 400)
-    _, cols, _ = _get_state()
+    _, cols, _, _, _ = _get_state()
     col = cols.get(db, {}).get(coll) or {"documents": []}
     n = len(col.get("documents", []))
     return json_response({"ok": 1, "size": n * 128, "numObjects": n})
@@ -410,7 +542,7 @@ def _data_size(data):
 
 def _db_stats(data):
     db = data.get("db") or data.get("database") or data.get("dbStats")
-    _, cols, _ = _get_state()
+    _, cols, _, _, _ = _get_state()
     dcols = cols.get(db, {}) if db else {}
     total = 0
     for c in dcols.values():
@@ -450,7 +582,7 @@ def _insert(data):
     docs = data.get("documents") or []
     if not db or not coll:
         return error_response_json("InvalidParameter", "db and insert required", 400)
-    _, cols, _ = _get_state()
+    _, cols, _, _, _ = _get_state()
     db_colls = cols.setdefault(db, {})
     col = db_colls.setdefault(coll, {"name": coll, "indexes": [], "options": {}, "documents": []})
     col["documents"].extend([dict(x) for x in docs])
@@ -465,7 +597,7 @@ def _update(data):
     multi = bool(data.get("multi"))
     if not db or not coll:
         return error_response_json("InvalidParameter", "db and update required", 400)
-    _, cols, _ = _get_state()
+    _, cols, _, _, _ = _get_state()
     col = cols.get(db, {}).get(coll)
     if not col:
         return json_response({"ok": 1, "nModified": 0})
@@ -486,7 +618,7 @@ def _delete(data):
     limit = int(data.get("limit") or 0)
     if not db or not coll:
         return error_response_json("InvalidParameter", "db and delete required", 400)
-    _, cols, _ = _get_state()
+    _, cols, _, _, _ = _get_state()
     col = cols.get(db, {}).get(coll)
     if not col:
         return json_response({"ok": 1, "n": 0})
@@ -509,7 +641,7 @@ def _find_and_modify(data):
     upsert = bool(data.get("upsert"))
     if not db or not coll:
         return error_response_json("InvalidParameter", "db and findAndModify required", 400)
-    _, cols, _ = _get_state()
+    _, cols, _, _, _ = _get_state()
     col = cols.get(db, {}).get(coll)
     if not col:
         col = cols.setdefault(db, {}).setdefault(coll, {"name": coll, "indexes": [], "options": {}, "documents": []})
@@ -537,7 +669,7 @@ def _replace_one(data):
     repl = data.get("replacement") or data.get("u") or {}
     if not db or not coll:
         return error_response_json("InvalidParameter", "db and replaceOne required", 400)
-    _, cols, _ = _get_state()
+    _, cols, _, _, _ = _get_state()
     col = cols.get(db, {}).get(coll)
     if not col:
         col = cols.setdefault(db, {}).setdefault(coll, {"name": coll, "indexes": [], "options": {}, "documents": []})
@@ -556,7 +688,7 @@ def _create_role(data):
     role = data.get("createRole") or data.get("role")
     if not db or not role:
         return error_response_json("InvalidParameter", "db and createRole required", 400)
-    _, _, roles = _get_state()
+    _, _, roles, _, _ = _get_state()
     db_roles = roles.setdefault(db, {})
     if role in db_roles:
         return error_response_json("RoleAlreadyExists", f"Role {role} already exists", 400)
@@ -574,7 +706,7 @@ def _drop_role(data):
     role = data.get("dropRole") or data.get("role")
     if not db or not role:
         return error_response_json("InvalidParameter", "db and dropRole required", 400)
-    _, _, roles = _get_state()
+    _, _, roles, _, _ = _get_state()
     db_roles = roles.get(db, {})
     if role not in db_roles:
         return error_response_json("RoleNotFound", f"Role {role} not found", 404)
@@ -586,7 +718,7 @@ def _drop_all_roles_from_database(data):
     db = data.get("dropAllRolesFromDatabase") or data.get("db")
     if not db:
         return error_response_json("InvalidParameter", "dropAllRolesFromDatabase required", 400)
-    _, _, roles = _get_state()
+    _, _, roles, _, _ = _get_state()
     roles.pop(db, None)
     return json_response({"ok": 1})
 
@@ -597,7 +729,7 @@ def _grant_roles_to_role(data):
     to_grant = data.get("roles", [])
     if not db or not role:
         return error_response_json("InvalidParameter", "db and grantRolesToRole required", 400)
-    _, _, roles = _get_state()
+    _, _, roles, _, _ = _get_state()
     db_roles = roles.setdefault(db, {})
     if role not in db_roles:
         db_roles[role] = {"role": role, "db": db, "privileges": [], "roles": []}
@@ -611,7 +743,7 @@ def _revoke_roles_from_role(data):
     to_revoke = data.get("roles", [])
     if not db or not role:
         return error_response_json("InvalidParameter", "db and revokeRolesFromRole required", 400)
-    _, _, roles = _get_state()
+    _, _, roles, _, _ = _get_state()
     r = roles.get(db, {}).get(role)
     if r and "roles" in r:
         r["roles"] = [x for x in r.get("roles", []) if x not in to_revoke]
@@ -623,7 +755,7 @@ def _revoke_privileges_from_role(data):
     role = data.get("revokePrivilegesFromRole") or data.get("role")
     if not db or not role:
         return error_response_json("InvalidParameter", "db and revokePrivilegesFromRole required", 400)
-    _, _, roles = _get_state()
+    _, _, roles, _, _ = _get_state()
     r = roles.get(db, {}).get(role)
     if r:
         r["privileges"] = []
@@ -633,7 +765,7 @@ def _revoke_privileges_from_role(data):
 def _roles_info(data):
     db = data.get("db") or data.get("database")
     role = data.get("role")
-    _, _, roles = _get_state()
+    _, _, roles, _, _ = _get_state()
     if db:
         if role:
             r = roles.get(db, {}).get(role)
@@ -650,7 +782,7 @@ def _update_role(data):
     role = data.get("updateRole") or data.get("role")
     if not db or not role:
         return error_response_json("InvalidParameter", "db and updateRole required", 400)
-    _, _, roles = _get_state()
+    _, _, roles, _, _ = _get_state()
     db_roles = roles.setdefault(db, {})
     if role not in db_roles:
         db_roles[role] = {"role": role, "db": db, "privileges": [], "roles": []}
@@ -661,7 +793,141 @@ def _update_role(data):
     return json_response({"ok": 1})
 
 
+# --- Sessions commands ---
+
+def _start_session(data):
+    _, _, _, sessions, _ = _get_state()
+    sid = new_uuid()
+    sessions[sid] = {"id": sid, "active": True}
+    return json_response({"ok": 1, "id": {"id": sid, "uid": "0"}})
+
+
+def _abort_transaction(data):
+    return json_response({"ok": 1})
+
+
+def _commit_transaction(data):
+    return json_response({"ok": 1})
+
+
+def _kill_sessions(data):
+    _, _, _, sessions, _ = _get_state()
+    ids = data.get("killSessions") or data.get("sessions") or []
+    for sid in ids:
+        sessions.pop(sid, None)
+    return json_response({"ok": 1})
+
+
+def _kill_all_sessions(data):
+    _, _, _, sessions, _ = _get_state()
+    sessions.clear()
+    return json_response({"ok": 1})
+
+
+# --- User management commands ---
+
+def _drop_user(data):
+    username = data.get("dropUser") or data.get("user")
+    if not username:
+        return error_response_json("InvalidParameter", "dropUser/user required", 400)
+    users, _, _, _, _ = _get_state()
+    before = len(users)
+    users[:] = [u for u in users if not (u.get("user") == username or u.get("username") == username)]
+    if len(users) == before:
+        return error_response_json("UserNotFound", f"User {username} not found", 404)
+    return json_response({"ok": 1})
+
+
+def _drop_all_users_from_database(data):
+    db = data.get("dropAllUsersFromDatabase") or data.get("db")
+    if not db:
+        return error_response_json("InvalidParameter", "dropAllUsersFromDatabase required", 400)
+    users, _, _, _, _ = _get_state()
+    users[:] = [u for u in users if u.get("db") != db]
+    return json_response({"ok": 1})
+
+
+def _grant_roles_to_user(data):
+    username = data.get("grantRolesToUser") or data.get("user")
+    to_grant = data.get("roles", [])
+    if not username:
+        return error_response_json("InvalidParameter", "grantRolesToUser/user required", 400)
+    users, _, _, _, _ = _get_state()
+    for u in users:
+        if u.get("user") == username or u.get("username") == username:
+            u.setdefault("roles", []).extend(to_grant)
+            return json_response({"ok": 1})
+    return error_response_json("UserNotFound", f"User {username} not found", 404)
+
+
+def _revoke_roles_from_user(data):
+    username = data.get("revokeRolesFromUser") or data.get("user")
+    to_revoke = data.get("roles", [])
+    if not username:
+        return error_response_json("InvalidParameter", "revokeRolesFromUser/user required", 400)
+    users, _, _, _, _ = _get_state()
+    for u in users:
+        if u.get("user") == username or u.get("username") == username:
+            if "roles" in u:
+                u["roles"] = [r for r in u.get("roles", []) if r not in to_revoke]
+            return json_response({"ok": 1})
+    return error_response_json("UserNotFound", f"User {username} not found", 404)
+
+
+def _update_user(data):
+    username = data.get("updateUser") or data.get("user")
+    if not username:
+        return error_response_json("InvalidParameter", "updateUser/user required", 400)
+    users, _, _, _, _ = _get_state()
+    for u in users:
+        if u.get("user") == username or u.get("username") == username:
+            if "roles" in data:
+                u["roles"] = data["roles"]
+            if "pwd" in data or "password" in data:
+                u["password"] = data.get("pwd") or data.get("password")
+            return json_response({"ok": 1})
+    return error_response_json("UserNotFound", f"User {username} not found", 404)
+
+
+def _users_info(data):
+    username = data.get("usersInfo") or data.get("user")
+    users, _, _, _, _ = _get_state()
+    if username:
+        matches = [u for u in users if (u.get("user") == username or u.get("username") == username)]
+        return json_response({"ok": 1, "users": matches})
+    return json_response({"ok": 1, "users": list(users)})
+
+
+# --- Sharding commands ---
+
+def _enable_sharding(data):
+    db = data.get("enableSharding") or data.get("db") or data.get("database")
+    if not db:
+        return error_response_json("InvalidParameter", "enableSharding/db required", 400)
+    _, _, _, _, sharded = _get_state()
+    sharded[db] = {"sharded": True, "collections": {}}
+    return json_response({"ok": 1})
+
+
+def _shard_collection(data):
+    coll = data.get("shardCollection") or data.get("collection")
+    key = data.get("key")
+    if not coll:
+        return error_response_json("InvalidParameter", "shardCollection required", 400)
+    _, _, _, _, sharded = _get_state()
+    if "." in coll:
+        db, cname = coll.split(".", 1)
+    else:
+        db = "admin"
+        cname = coll
+    db_shard = sharded.setdefault(db, {"sharded": True, "collections": {}})
+    db_shard.setdefault("collections", {})[cname] = {"key": key or {}, "sharded": True}
+    return json_response({"ok": 1})
+
+
 def reset():
     _state["users"].clear()
     _state["collections"].clear()
     _state["roles"].clear()
+    _state["sessions"].clear()
+    _state["sharded"].clear()

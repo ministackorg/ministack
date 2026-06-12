@@ -1,5 +1,18 @@
 
 
+Prompts
+
+This codebase is Ministack, it mimicks AWS services locally for testing. I want to add the AWS DocumentDB(DocDB) service based on the @CONTRIBUTING.md guide. The file that will contain the implementation is @ministack/services/documentdb.py , I need to implement the available API endpoint that DocDB supports. 
+For the moment, following the contributing guide, implement just the aggregation, authentication, diagnostic, query and write operations and role management comamnds sections in @ministack/services/documentdb-apis.md , we'll the rest later. You can use the @ministack/services/rds.py as an example but careful, the file is very long.
+
+This codebase is Ministack, it mimicks AWS services locally for testing. I want to add the AWS DocumentDB(DocDB) service based on the @CONTRIBUTING.md guide. The file that will contain the implementation is @ministack/services/documentdb.py , I need to implement the available API endpoint that DocDB supports. 
+For the moment, following the contributing guide, implement just the Sessions, User, Sharding, Array, Bitwise and Comment sections in @ministack/services/documentdb-apis.md , we'll the rest later. You can use the @ministack/services/rds.py as an example but careful, the file is very long.
+
+
+Implemented Administrative cmds, aggregation, authentication, diagnostic, query and write operations and role management cmds.
+
+
+
 # Supported MongoDB APIs, operations, and data types in Amazon DocumentDB
 <a name="mongo-apis"></a>
 
