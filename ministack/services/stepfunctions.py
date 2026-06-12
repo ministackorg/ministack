@@ -1369,6 +1369,7 @@ def _execute_task(state_def, raw_input, execution, ctx):
                     result=mock_result,
                     default=mock_result,
                 )
+                _apply_state_assign(state_def, raw_input, ctx, result=mock_result)
             else:
                 result = _apply_result_selector(state_def, mock_result)
                 output = _apply_result_path(state_def, raw_input, result)
