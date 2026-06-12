@@ -5,6 +5,13 @@ All notable changes to MiniStack will be documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+- **Step Functions — Pass state `Parameters` now resolve context object paths** — `$$.*` references resolved to `null` in Pass states because `_execute_pass` applied `Parameters` without forwarding the execution context. It now forwards the context correctly when evaluating `Parameters`, fixing context object resolution for Pass states.
+
+---
+
 ## [1.3.62] — 2026-06-11
 
 ### Added
