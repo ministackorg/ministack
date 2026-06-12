@@ -307,6 +307,7 @@ def _describe_stack_resource(params):
 def _describe_stack_resources(params):
     from ministack.services.cloudformation import _stacks
     stack_name = _p(params, "StackName")
+    logical_resource_id = _p(params, "LogicalResourceId")
 
     stack = _stacks.get(stack_name)
     if not stack:
@@ -314,8 +315,17 @@ def _describe_stack_resources(params):
                       f"Stack [{stack_name}] does not exist")
 
     resources = stack.get("_resources", {})
+
+    if logical_resource_id:
+        if logical_resource_id not in resources:
+            return _error("ValidationError",
+                          f"Resource [{logical_resource_id}] does not exist in stack [{stack_name}]")
+        items = [(logical_resource_id, resources[logical_resource_id])]
+    else:
+        items = list(resources.items())
+
     members = ""
-    for logical_id, res in resources.items():
+    for logical_id, res in items:
         members += (
             "<member>"
             f"<LogicalResourceId>{_esc(logical_id)}</LogicalResourceId>"

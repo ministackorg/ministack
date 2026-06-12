@@ -500,6 +500,37 @@ def test_cfn_stack_events(cfn):
     assert len(events) > 0
     assert all("ResourceStatus" in e for e in events)
 
+def test_cfn_describe_stack_resources_logical_id_filter(cfn, s3, sqs):
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "Bucket": {
+                "Type": "AWS::S3::Bucket",
+                "Properties": {"BucketName": "cfn-t10-bucket"},
+            },
+            "Queue": {
+                "Type": "AWS::SQS::Queue",
+                "Properties": {"QueueName": "cfn-t10-queue"},
+            },
+        },
+    }
+    cfn.create_stack(StackName="cfn-t10", TemplateBody=json.dumps(template))
+    _wait_stack(cfn, "cfn-t10")
+
+    filtered = cfn.describe_stack_resources(
+        StackName="cfn-t10", LogicalResourceId="Bucket"
+    )["StackResources"]
+    assert len(filtered) == 1
+    assert filtered[0]["LogicalResourceId"] == "Bucket"
+    assert filtered[0]["ResourceType"] == "AWS::S3::Bucket"
+
+    with pytest.raises(ClientError) as exc_info:
+        cfn.describe_stack_resources(
+            StackName="cfn-t10", LogicalResourceId="DoesNotExist"
+        )
+    assert exc_info.value.response["Error"]["Code"] == "ValidationError"
+
+
 def test_cfn_yaml_template(cfn, s3):
     yaml_body = """
 AWSTemplateFormatVersion: '2010-09-09'

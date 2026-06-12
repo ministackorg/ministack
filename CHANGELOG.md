@@ -5,6 +5,13 @@ All notable changes to MiniStack will be documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+- **CloudFormation — `DescribeStackResources` now honors the `LogicalResourceId` filter** — The handler now reads the optional `LogicalResourceId` parameter and, when present, returns only the matching resource or a `ValidationError` if it does not exist in the stack.
+
+---
+
 ## [1.3.62] — 2026-06-11
 
 ### Added
