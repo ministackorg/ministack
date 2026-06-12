@@ -1745,3 +1745,236 @@ def test_eventbridge_anything_but_wildcard_excludes_matching(eb, sqs):
         QueueUrl=q_url, MaxNumberOfMessages=10, WaitTimeSeconds=1)["Messages"]
     ids = [json.loads(m["Body"])["detail"]["id"] for m in msgs]
     assert ids == ["prod-app-1"]
+
+
+# ---------------------------------------------------------------------------
+# Reserved input-transformer variables
+# ---------------------------------------------------------------------------
+
+def test_eventbridge_input_transformer_event_json(eb, sqs):
+    """<aws.events.event.json> embeds the full event envelope as a raw JSON object."""
+    bus_name = "qa-eb-reserved-evtjson-bus"
+    eb.create_event_bus(Name=bus_name)
+    q_url = sqs.create_queue(QueueName="qa-eb-reserved-evtjson-q")["QueueUrl"]
+    q_arn = sqs.get_queue_attributes(QueueUrl=q_url, AttributeNames=["QueueArn"])["Attributes"]["QueueArn"]
+    eb.put_rule(
+        Name="qa-eb-reserved-evtjson-rule",
+        EventBusName=bus_name,
+        EventPattern=json.dumps({"source": ["myapp.reserved"]}),
+        State="ENABLED",
+    )
+    eb.put_targets(
+        Rule="qa-eb-reserved-evtjson-rule",
+        EventBusName=bus_name,
+        Targets=[
+            {
+                "Id": "t1",
+                "Arn": q_arn,
+                "InputTransformer": {
+                    "InputPathsMap": {},
+                    "InputTemplate": '{"sourceEvent": <aws.events.event.json>}',
+                },
+            }
+        ],
+    )
+    eb.put_events(
+        Entries=[
+            {
+                "Source": "myapp.reserved",
+                "DetailType": "TestEvent",
+                "Detail": json.dumps({"foo": "bar"}),
+                "EventBusName": bus_name,
+            }
+        ]
+    )
+    msgs = sqs.receive_message(QueueUrl=q_url, MaxNumberOfMessages=1, WaitTimeSeconds=1)
+    assert len(msgs.get("Messages", [])) == 1
+    from datetime import datetime as _dt
+    body = json.loads(msgs["Messages"][0]["Body"])
+    assert body["sourceEvent"]["source"] == "myapp.reserved"
+    assert body["sourceEvent"]["detail-type"] == "TestEvent"
+    assert body["sourceEvent"]["detail"] == {"foo": "bar"}
+    assert body["sourceEvent"]["version"] == "0"
+    assert body["sourceEvent"]["time"].endswith("Z")
+    _dt.strptime(body["sourceEvent"]["time"], "%Y-%m-%dT%H:%M:%SZ")
+
+
+def test_eventbridge_input_transformer_event_escaped(eb, sqs):
+    """<aws.events.event> embeds the event envelope as an escaped JSON string."""
+    bus_name = "qa-eb-reserved-evtesc-bus"
+    eb.create_event_bus(Name=bus_name)
+    q_url = sqs.create_queue(QueueName="qa-eb-reserved-evtesc-q")["QueueUrl"]
+    q_arn = sqs.get_queue_attributes(QueueUrl=q_url, AttributeNames=["QueueArn"])["Attributes"]["QueueArn"]
+    eb.put_rule(
+        Name="qa-eb-reserved-evtesc-rule",
+        EventBusName=bus_name,
+        EventPattern=json.dumps({"source": ["myapp.escaped"]}),
+        State="ENABLED",
+    )
+    eb.put_targets(
+        Rule="qa-eb-reserved-evtesc-rule",
+        EventBusName=bus_name,
+        Targets=[
+            {
+                "Id": "t1",
+                "Arn": q_arn,
+                "InputTransformer": {
+                    "InputPathsMap": {},
+                    "InputTemplate": '{"evt": <aws.events.event>}',
+                },
+            }
+        ],
+    )
+    eb.put_events(
+        Entries=[
+            {
+                "Source": "myapp.escaped",
+                "DetailType": "EscTest",
+                "Detail": json.dumps({"x": 1}),
+                "EventBusName": bus_name,
+            }
+        ]
+    )
+    msgs = sqs.receive_message(QueueUrl=q_url, MaxNumberOfMessages=1, WaitTimeSeconds=1)
+    assert len(msgs.get("Messages", [])) == 1
+    body = json.loads(msgs["Messages"][0]["Body"])
+    assert isinstance(body["evt"], str)
+    inner = json.loads(body["evt"])
+    assert inner["source"] == "myapp.escaped"
+    assert inner["detail-type"] == "EscTest"
+
+
+def test_eventbridge_input_transformer_rule_name_and_arn(eb, sqs):
+    """<aws.events.rule-name> and <aws.events.rule-arn> resolve to the rule's Name and Arn."""
+    bus_name = "qa-eb-reserved-rn-bus"
+    rule_name = "qa-eb-reserved-rn-rule"
+    eb.create_event_bus(Name=bus_name)
+    q_url = sqs.create_queue(QueueName="qa-eb-reserved-rn-q")["QueueUrl"]
+    q_arn = sqs.get_queue_attributes(QueueUrl=q_url, AttributeNames=["QueueArn"])["Attributes"]["QueueArn"]
+    put_rule_resp = eb.put_rule(
+        Name=rule_name,
+        EventBusName=bus_name,
+        EventPattern=json.dumps({"source": ["myapp.rname"]}),
+        State="ENABLED",
+    )
+    expected_rule_arn = put_rule_resp["RuleArn"]
+    eb.put_targets(
+        Rule=rule_name,
+        EventBusName=bus_name,
+        Targets=[
+            {
+                "Id": "t1",
+                "Arn": q_arn,
+                "InputTransformer": {
+                    "InputPathsMap": {},
+                    "InputTemplate": '{"rn": "<aws.events.rule-name>", "ra": "<aws.events.rule-arn>"}',
+                },
+            }
+        ],
+    )
+    eb.put_events(
+        Entries=[
+            {
+                "Source": "myapp.rname",
+                "DetailType": "RnTest",
+                "Detail": "{}",
+                "EventBusName": bus_name,
+            }
+        ]
+    )
+    msgs = sqs.receive_message(QueueUrl=q_url, MaxNumberOfMessages=1, WaitTimeSeconds=1)
+    assert len(msgs.get("Messages", [])) == 1
+    body = json.loads(msgs["Messages"][0]["Body"])
+    assert body["rn"] == rule_name
+    assert body["ra"] == expected_rule_arn
+
+
+def test_eventbridge_input_transformer_setdefault_precedence(eb, sqs):
+    """An explicit InputPathsMap entry named like a reserved var must win over the reserved value."""
+    bus_name = "qa-eb-reserved-prec-bus"
+    rule_name = "qa-eb-reserved-prec-rule"
+    eb.create_event_bus(Name=bus_name)
+    q_url = sqs.create_queue(QueueName="qa-eb-reserved-prec-q")["QueueUrl"]
+    q_arn = sqs.get_queue_attributes(QueueUrl=q_url, AttributeNames=["QueueArn"])["Attributes"]["QueueArn"]
+    eb.put_rule(
+        Name=rule_name,
+        EventBusName=bus_name,
+        EventPattern=json.dumps({"source": ["myapp.prec"]}),
+        State="ENABLED",
+    )
+    eb.put_targets(
+        Rule=rule_name,
+        EventBusName=bus_name,
+        Targets=[
+            {
+                "Id": "t1",
+                "Arn": q_arn,
+                "InputTransformer": {
+                    # explicitly map the reserved key name to $.source — must win
+                    "InputPathsMap": {"aws.events.rule-name": "$.source"},
+                    "InputTemplate": '{"rn": "<aws.events.rule-name>"}',
+                },
+            }
+        ],
+    )
+    eb.put_events(
+        Entries=[
+            {
+                "Source": "myapp.prec",
+                "DetailType": "PrecTest",
+                "Detail": "{}",
+                "EventBusName": bus_name,
+            }
+        ]
+    )
+    msgs = sqs.receive_message(QueueUrl=q_url, MaxNumberOfMessages=1, WaitTimeSeconds=1)
+    assert len(msgs.get("Messages", [])) == 1
+    body = json.loads(msgs["Messages"][0]["Body"])
+    # explicit InputPathsMap maps $.source → "myapp.prec", not the rule name
+    assert body["rn"] == "myapp.prec"
+
+
+def test_eventbridge_input_transformer_ingestion_time(eb, sqs):
+    """<aws.events.event.ingestion-time> is substituted with a non-empty time string."""
+    bus_name = "qa-eb-reserved-itime-bus"
+    eb.create_event_bus(Name=bus_name)
+    q_url = sqs.create_queue(QueueName="qa-eb-reserved-itime-q")["QueueUrl"]
+    q_arn = sqs.get_queue_attributes(QueueUrl=q_url, AttributeNames=["QueueArn"])["Attributes"]["QueueArn"]
+    eb.put_rule(
+        Name="qa-eb-reserved-itime-rule",
+        EventBusName=bus_name,
+        EventPattern=json.dumps({"source": ["myapp.itime"]}),
+        State="ENABLED",
+    )
+    eb.put_targets(
+        Rule="qa-eb-reserved-itime-rule",
+        EventBusName=bus_name,
+        Targets=[
+            {
+                "Id": "t1",
+                "Arn": q_arn,
+                "InputTransformer": {
+                    "InputPathsMap": {},
+                    "InputTemplate": '{"it": "<aws.events.event.ingestion-time>"}',
+                },
+            }
+        ],
+    )
+    eb.put_events(
+        Entries=[
+            {
+                "Source": "myapp.itime",
+                "DetailType": "ItTest",
+                "Detail": "{}",
+                "EventBusName": bus_name,
+            }
+        ]
+    )
+    msgs = sqs.receive_message(QueueUrl=q_url, MaxNumberOfMessages=1, WaitTimeSeconds=1)
+    assert len(msgs.get("Messages", [])) == 1
+    from datetime import datetime as _dt
+    body = json.loads(msgs["Messages"][0]["Body"])
+    assert body["it"] != "<aws.events.event.ingestion-time>"
+    assert body["it"] != ""
+    assert body["it"].endswith("Z")
+    _dt.strptime(body["it"], "%Y-%m-%dT%H:%M:%SZ")

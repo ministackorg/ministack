@@ -5,6 +5,13 @@ All notable changes to MiniStack will be documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+- **EventBridge — input transformer reserved variables** — substitute `<aws.events.event.json>`, `<aws.events.event>`, `<aws.events.rule-name>`, `<aws.events.rule-arn>`, and `<aws.events.event.ingestion-time>` so CDK-style templates that embed the source event deliver valid JSON.
+
+---
+
 ## [1.3.62] — 2026-06-11
 
 ### Added
