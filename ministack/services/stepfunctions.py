@@ -1328,7 +1328,7 @@ def _execute_pass(state_def, raw_input, ctx=None):
         return output, _next_or_end(state_def)
 
     effective = _apply_input_path(state_def, raw_input)
-    effective = _apply_parameters(state_def, effective)
+    effective = _apply_parameters(state_def, effective, ctx)
 
     result = state_def.get("Result", effective)
     result = _apply_result_selector(state_def, result)

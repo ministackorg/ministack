@@ -9,6 +9,8 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 - **Step Functions — mock `Throw` now routes through `Catch` instead of failing the execution** — when `SFN_MOCK_CONFIG` was active and a mock response contained `"Throw"`, the error was raised immediately inside `_execute_task` before the `Catch`/`Retry` processing loop, so the entire execution was unconditionally marked `FAILED` even when the Task state had a matching `Catch` block. The mock Throw path now mirrors the real execution path: it checks for a matching `Catch` entry (including JSONata `Output`/`Assign` evaluation), routes to the catcher's `Next` state on a match, and only propagates `_ExecutionError` when no catcher matches. `Retry` handling in the mock path is intentionally not replicated (a future enhancement).
+- **Step Functions — Pass state `Parameters` now resolve context object paths** — `$$.*` references resolved to `null` in Pass states because `_execute_pass` applied `Parameters` without forwarding the execution context. It now forwards the context correctly when evaluating `Parameters`, fixing context object resolution for Pass states.
+- **CloudFormation — `DescribeStackResources` now honors the `LogicalResourceId` filter** — The handler now reads the optional `LogicalResourceId` parameter and, when present, returns only the matching resource or a `ValidationError` if it does not exist in the stack.
 
 ---
 
