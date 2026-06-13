@@ -5067,19 +5067,27 @@ def test_extract_zip_windows_zip_keeps_default_mode():
 
 
 def test_lambda_local_executor_site_packages_layer(lam):
-    """Local executor adds <layer>/python/lib/python*/site-packages to sys.path,
-    so pip-style (`pip install -t`) dependency layers import (#888)."""
+    """Local executor exposes <layer>/python/lib/python*/site-packages as a
+    *site directory* (AWS's documented semantics), so pip-style (`pip install
+    -t`) dependency layers import — including `.pth`-driven paths, which require
+    `site.addsitedir` rather than a plain `sys.path.insert` (#888)."""
+    sp = "python/lib/python3.12/site-packages"
     lbuf = io.BytesIO()
     with zipfile.ZipFile(lbuf, "w") as z:
-        z.writestr("python/lib/python3.12/site-packages/sitelib888.py",
-                   "def hi():\n    return 'sp-ok'\n")
+        # regular package directly in site-packages
+        z.writestr(f"{sp}/sitelib888.py", "def hi():\n    return 'sp-ok'\n")
+        # a .pth file that adds a sibling dir — only resolves via site.addsitedir
+        z.writestr(f"{sp}/extra888.pth", "vendored888\n")
+        z.writestr(f"{sp}/vendored888/pthmod888.py", "def hi():\n    return 'pth-ok'\n")
     lv = lam.publish_layer_version(
         LayerName="sp-layer-888", Content={"ZipFile": lbuf.getvalue()},
         CompatibleRuntimes=["python3.12"])
     fbuf = io.BytesIO()
     with zipfile.ZipFile(fbuf, "w") as z:
         z.writestr("index.py",
-                   "import sitelib888\ndef handler(e, c):\n    return {'msg': sitelib888.hi()}\n")
+                   "import sitelib888, pthmod888\n"
+                   "def handler(e, c):\n"
+                   "    return {'sp': sitelib888.hi(), 'pth': pthmod888.hi()}\n")
     lam.create_function(
         FunctionName="sp-fn-888", Runtime="python3.12",
         Role="arn:aws:iam::000000000000:role/r", Handler="index.handler",
@@ -5087,4 +5095,5 @@ def test_lambda_local_executor_site_packages_layer(lam):
     resp = lam.invoke(FunctionName="sp-fn-888", Payload=b"{}")
     assert "FunctionError" not in resp, resp
     payload = json.loads(resp["Payload"].read())
-    assert payload["msg"] == "sp-ok"
+    assert payload["sp"] == "sp-ok"
+    assert payload["pth"] == "pth-ok"
