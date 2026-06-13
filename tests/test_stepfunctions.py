@@ -282,6 +282,41 @@ def test_sfn_intrinsic_string_to_json(sfn, sfn_sync):
     output = json.loads(resp["output"])
     assert output["parsed"] == {"a": 1, "b": 2}
 
+def test_sfn_pass_parameters_resolve_context_object(sfn):
+    """Pass state Parameters can resolve Step Functions context object paths."""
+    unique = str(time.time_ns())
+    execution_name = f"pass-context-{unique}"
+    definition = json.dumps({
+        "StartAt": "Build",
+        "States": {
+            "Build": {
+                "Type": "Pass",
+                "Parameters": {
+                    "executionName.$": "$$.Execution.Name",
+                    "inputValue.$": "$.value",
+                },
+                "End": True,
+            }
+        },
+    })
+    sm = sfn.create_state_machine(
+        name=f"sfn-pass-context-{unique}",
+        definition=definition,
+        roleArn="arn:aws:iam::000000000000:role/R",
+    )
+    ex = sfn.start_execution(
+        stateMachineArn=sm["stateMachineArn"],
+        name=execution_name,
+        input=json.dumps({"value": "from-input"}),
+    )
+
+    desc = _wait_sfn(sfn, ex["executionArn"])
+    assert desc["status"] == "SUCCEEDED"
+    assert json.loads(desc["output"]) == {
+        "executionName": execution_name,
+        "inputValue": "from-input",
+    }
+
 def test_sfn_intrinsic_json_merge(sfn, sfn_sync):
     """States.JsonMerge shallow-merges two objects."""
     definition = json.dumps({

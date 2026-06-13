@@ -9,6 +9,8 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 - **Step Functions — `Assign` is now applied in the mock execution path for JSONata Task states** — when `SFN_MOCK_CONFIG` was active, `_apply_state_assign` was never called on the mock return branch, so any `Assign` block in a JSONata Task state was silently skipped; downstream states referencing the assigned variables failed with `States.QueryEvaluationError: Undefined variable`. The mock branch now mirrors the real execution path by calling `_apply_state_assign` after `_apply_jsonata_output`.
+- **Step Functions — Pass state `Parameters` now resolve context object paths** — `$$.*` references resolved to `null` in Pass states because `_execute_pass` applied `Parameters` without forwarding the execution context. It now forwards the context correctly when evaluating `Parameters`, fixing context object resolution for Pass states.
+- **CloudFormation — `DescribeStackResources` now honors the `LogicalResourceId` filter** — The handler now reads the optional `LogicalResourceId` parameter and, when present, returns only the matching resource or a `ValidationError` if it does not exist in the stack.
 
 ---
 
