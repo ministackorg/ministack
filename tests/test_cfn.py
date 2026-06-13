@@ -463,6 +463,67 @@ def test_cfn_validate_template(cfn):
     with pytest.raises(ClientError):
         cfn.validate_template(TemplateBody=json.dumps(invalid_template))
 
+def test_cfn_get_template_summary(cfn):
+    # Basic template: parameters and resource types surfaced, no capabilities
+    basic = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Description": "summary test",
+        "Parameters": {
+            "Env": {"Type": "String", "Default": "dev", "Description": "env"},
+        },
+        "Resources": {
+            "Bucket": {"Type": "AWS::S3::Bucket"},
+        },
+    }
+    result = cfn.get_template_summary(TemplateBody=json.dumps(basic))
+    assert result["Description"] == "summary test"
+    assert "AWS::S3::Bucket" in result["ResourceTypes"]
+    assert any(p["ParameterKey"] == "Env" for p in result["Parameters"])
+    assert result.get("Capabilities", []) == []
+
+    # IAM role with explicit RoleName → CAPABILITY_NAMED_IAM
+    named_iam = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "Role": {
+                "Type": "AWS::IAM::Role",
+                "Properties": {
+                    "RoleName": "my-role",
+                    "AssumeRolePolicyDocument": {"Version": "2012-10-17", "Statement": []},
+                },
+            }
+        },
+    }
+    result = cfn.get_template_summary(TemplateBody=json.dumps(named_iam))
+    assert "CAPABILITY_NAMED_IAM" in result["Capabilities"]
+    assert result.get("CapabilitiesReason") == "The following resource(s) require capabilities: [AWS::IAM::Role]"
+
+    # IAM role without explicit name → CAPABILITY_IAM
+    unnamed_iam = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "Role": {
+                "Type": "AWS::IAM::Role",
+                "Properties": {
+                    "AssumeRolePolicyDocument": {"Version": "2012-10-17", "Statement": []},
+                },
+            }
+        },
+    }
+    result = cfn.get_template_summary(TemplateBody=json.dumps(unnamed_iam))
+    assert result["Capabilities"] == ["CAPABILITY_IAM"]
+
+    # Template with Transform → CAPABILITY_AUTO_EXPAND
+    transform_tpl = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Transform": "AWS::Serverless-2016-10-31",
+        "Resources": {
+            "Fn": {"Type": "AWS::Serverless::Function", "Properties": {}},
+        },
+    }
+    result = cfn.get_template_summary(TemplateBody=json.dumps(transform_tpl))
+    assert "CAPABILITY_AUTO_EXPAND" in result["Capabilities"]
+
 def test_cfn_list_stacks(cfn):
     for name in ("cfn-t12-a", "cfn-t12-b"):
         template = {

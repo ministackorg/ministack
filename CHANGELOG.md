@@ -5,6 +5,11 @@ All notable changes to MiniStack will be documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+- **CloudFormation — `GetTemplateSummary` now returns `Capabilities` and `CapabilitiesReason`** — the handler already accepted `TemplateBody` and returned `Parameters` / `ResourceTypes` correctly, but omitted the `Capabilities` and `CapabilitiesReason` fields. These are now computed from the template: `CAPABILITY_NAMED_IAM` for IAM resources with explicit name properties (`RoleName`, `UserName`, etc.), `CAPABILITY_IAM` for unnamed IAM resources, and `CAPABILITY_AUTO_EXPAND` for templates with a `Transform`. `CapabilitiesReason` uses the format confirmed against the AWS API: `"The following resource(s) require capabilities: [<type>]"`. Contributed by @maximoosemine.
+
 ## [1.3.63] — 2026-06-13
 
 ### Fixed
