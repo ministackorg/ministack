@@ -1010,6 +1010,44 @@ def _cwlogs_delete(physical_id, props):
     _cw_logs._log_groups.pop(physical_id, None)
 
 
+# --- CloudWatch Logs SubscriptionFilter (#896) ---
+
+def _cwlogs_subfilter_create(logical_id, props, stack_name):
+    group = props.get("LogGroupName")
+    if not group:
+        raise ValueError("AWS::Logs::SubscriptionFilter requires LogGroupName")
+    # Ref returns the filter name; CFN auto-generates one when FilterName is omitted.
+    filter_name = props.get("FilterName") or _physical_name(stack_name, logical_id, max_len=512)
+    grp = _cw_logs._log_groups.get(group)
+    if grp is None:
+        # The referenced group should already exist (via Ref/DependsOn); create a
+        # minimal entry if not so the filter is still recorded and queryable.
+        grp = _cw_logs._log_groups[group] = {
+            "arn": f"arn:aws:logs:{get_region()}:{get_account_id()}:log-group:{group}:*",
+            "creationTime": int(time.time() * 1000),
+            "retentionInDays": None,
+            "tags": {},
+            "streams": {},
+            "subscriptionFilters": {},
+        }
+    grp.setdefault("subscriptionFilters", {})[filter_name] = {
+        "filterName": filter_name,
+        "logGroupName": group,
+        "filterPattern": props.get("FilterPattern", ""),
+        "destinationArn": props.get("DestinationArn", ""),
+        "roleArn": props.get("RoleArn", ""),
+        "distribution": props.get("Distribution", "ByLogStream"),
+        "creationTime": int(time.time() * 1000),
+    }
+    return filter_name, {}
+
+
+def _cwlogs_subfilter_delete(physical_id, props):
+    grp = _cw_logs._log_groups.get(props.get("LogGroupName"))
+    if grp:
+        grp.get("subscriptionFilters", {}).pop(physical_id, None)
+
+
 # --- EventBridge Rule ---
 
 def _eb_rule_create(logical_id, props, stack_name):
@@ -4144,6 +4182,7 @@ _RESOURCE_HANDLERS = {
         "delete": _appconfig_deployment_delete,
     },
     "AWS::Logs::LogGroup": {"create": _cwlogs_create, "delete": _cwlogs_delete},
+    "AWS::Logs::SubscriptionFilter": {"create": _cwlogs_subfilter_create, "delete": _cwlogs_subfilter_delete},
     "AWS::Events::Rule": {"create": _eb_rule_create, "delete": _eb_rule_delete},
     "AWS::Events::EventBus": {"create": _eb_event_bus_create, "delete": _eb_event_bus_delete},
     "AWS::Kinesis::Stream": {"create": _kinesis_stream_create, "delete": _kinesis_stream_delete},

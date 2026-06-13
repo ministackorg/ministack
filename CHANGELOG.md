@@ -12,6 +12,19 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [1.3.63] — 2026-06-13
+
+### Fixed
+- **Step Functions — `Assign` is now applied in the mock execution path for JSONata Task states** — when `SFN_MOCK_CONFIG` was active, `_apply_state_assign` was never called on the mock return branch, so any `Assign` block in a JSONata Task state was silently skipped; downstream states referencing the assigned variables failed with `States.QueryEvaluationError: Undefined variable`. The mock branch now mirrors the real execution path by calling `_apply_state_assign` after `_apply_jsonata_output`. Contributed by @amissemer.
+- **Step Functions — Pass state `Parameters` now resolve context object paths** — `$$.*` references resolved to `null` in Pass states because `_execute_pass` applied `Parameters` without forwarding the execution context. It now forwards the context correctly when evaluating `Parameters`, fixing context object resolution for Pass states. Contributed by @noynoy83.
+- **CloudFormation — `DescribeStackResources` now honors the `LogicalResourceId` filter** — The handler now reads the optional `LogicalResourceId` parameter and, when present, returns only the matching resource or a `ValidationError` if it does not exist in the stack. Contributed by @maximoosemine.
+- **Lambda — local executor now exposes dependency layers' `site-packages`** — the in-process Python worker added `<layer>/python` to `sys.path` but not `<layer>/python/lib/python<ver>/site-packages`, so `pip install -t` dependency layers failed to import (the docker executor, which uses the AWS runtime image, was unaffected). Reported by @omargr299.
+- **Lambda — `LoggingConfig.LogGroup` is honored when emitting CloudWatch logs** — handler output was always written to the default `/aws/lambda/<name>` group instead of the configured or shared log group. Reported by @ankitaabad.
+- **CloudFormation — `AWS::Logs::SubscriptionFilter` resource type supported** — templates using it no longer fail with `Unsupported resource type`; the filter provisions against the named log group and is removed on stack delete. Reported by @ankitaabad.
+- **CloudFormation — change sets detect parameter-driven property changes** — `aws cloudformation deploy` silently no-oped when a property such as a Lambda `Code` S3 key was driven by a stack parameter, because the change-set diff compared unresolved templates. It now resolves parameters and intrinsics before diffing, matching `update-stack`. Reported by @ankitaabad.
+
+---
+
 ## [1.3.62] — 2026-06-11
 
 ### Added

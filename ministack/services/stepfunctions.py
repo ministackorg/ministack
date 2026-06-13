@@ -1328,7 +1328,7 @@ def _execute_pass(state_def, raw_input, ctx=None):
         return output, _next_or_end(state_def)
 
     effective = _apply_input_path(state_def, raw_input)
-    effective = _apply_parameters(state_def, effective)
+    effective = _apply_parameters(state_def, effective, ctx)
 
     result = state_def.get("Result", effective)
     result = _apply_result_selector(state_def, result)
@@ -1369,6 +1369,7 @@ def _execute_task(state_def, raw_input, execution, ctx):
                     result=mock_result,
                     default=mock_result,
                 )
+                _apply_state_assign(state_def, raw_input, ctx, result=mock_result)
             else:
                 result = _apply_result_selector(state_def, mock_result)
                 output = _apply_result_path(state_def, raw_input, result)
