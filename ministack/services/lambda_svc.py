@@ -305,6 +305,14 @@ for _ld in filter(None, os.environ.get("_LAMBDA_LAYERS_DIRS", "").split(os.paths
     _py = os.path.join(_ld, "python")
     if os.path.isdir(_py):
         sys.path.insert(0, _py)
+        # AWS also exposes <layer>/python/lib/python<ver>/site-packages, where
+        # `pip install -t` dependency layers land (#888).
+        _lib = os.path.join(_py, "lib")
+        if os.path.isdir(_lib):
+            for _v in os.listdir(_lib):
+                _sp = os.path.join(_lib, _v, "site-packages")
+                if os.path.isdir(_sp):
+                    sys.path.insert(0, _sp)
     sys.path.insert(0, _ld)
 
 _mod_path = os.environ["_LAMBDA_HANDLER_MODULE"]
@@ -348,6 +356,14 @@ for _ld in filter(None, os.environ.get("_LAMBDA_LAYERS_DIRS", "").split(":")):
     _py = os.path.join(_ld, "python")
     if os.path.isdir(_py):
         sys.path.insert(0, _py)
+        # AWS also exposes <layer>/python/lib/python<ver>/site-packages, where
+        # `pip install -t` dependency layers land (#888).
+        _lib = os.path.join(_py, "lib")
+        if os.path.isdir(_lib):
+            for _v in os.listdir(_lib):
+                _sp = os.path.join(_lib, _v, "site-packages")
+                if os.path.isdir(_sp):
+                    sys.path.insert(0, _sp)
     sys.path.insert(0, _ld)
 
 _mod_path = os.environ["_LAMBDA_HANDLER_MODULE"]
@@ -2860,7 +2876,11 @@ def _emit_lambda_logs(func: dict, request_id: str, log_text: str,
         config = func.get("config") or func
         fn_name = config.get("FunctionName", "unknown")
         qualifier = config.get("Version", "$LATEST")
-        group_name = f"/aws/lambda/{fn_name}"
+        # Honor LoggingConfig.LogGroup (advanced logging controls) so logs land
+        # in a caller-specified / shared log group, matching AWS. Falls back to
+        # the default per-function group when unset (#895).
+        logging_cfg = config.get("LoggingConfig") or {}
+        group_name = logging_cfg.get("LogGroup") or f"/aws/lambda/{fn_name}"
         now = datetime.now(timezone.utc)
         stream_name = f"{now.year:04d}/{now.month:02d}/{now.day:02d}/[{qualifier}]{new_uuid().replace('-', '')}"
         now_ms = int(time.time() * 1000)

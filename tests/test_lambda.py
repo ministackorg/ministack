@@ -3016,6 +3016,27 @@ def test_emit_lambda_logs_autocreate_is_per_function():
     assert "/aws/lambda/fn-b" in _cwl._log_groups
 
 
+def test_emit_lambda_logs_honors_logging_config_log_group():
+    """LoggingConfig.LogGroup routes logs to the named (e.g. shared) group, not
+    the default per-function group (#895)."""
+    import ministack.services.cloudwatch_logs as _cwl
+    set_request_account_id("000000000000")
+    _cwl._log_groups.clear()
+
+    func = {"config": {
+        "FunctionName": "log-cfg-fn", "Version": "$LATEST", "MemorySize": 128,
+        "LoggingConfig": {"LogFormat": "Text", "LogGroup": "/aws/lambda/shared-logs"},
+    }}
+    lsvc._emit_lambda_logs(func, "r1", "hello", False, 1)
+
+    # Logs land in the configured group, with events...
+    assert "/aws/lambda/shared-logs" in _cwl._log_groups
+    streams = _cwl._log_groups["/aws/lambda/shared-logs"]["streams"]
+    assert sum(len(s["events"]) for s in streams.values()) > 0
+    # ...and the default per-function group is NOT created.
+    assert "/aws/lambda/log-cfg-fn" not in _cwl._log_groups
+
+
 def test_emit_lambda_logs_failure_is_best_effort(monkeypatch):
     """A broken CW Logs module must not bubble into the Lambda invocation."""
     import ministack.services.cloudwatch_logs as _cwl
@@ -5043,3 +5064,27 @@ def test_extract_zip_windows_zip_keeps_default_mode():
 
     mode = os.stat(os.path.join(dest, "python/winmod.py")).st_mode & 0o777
     assert mode != 0, "file left unreadable (chmod 0) on a windows-style zip"
+
+
+def test_lambda_local_executor_site_packages_layer(lam):
+    """Local executor adds <layer>/python/lib/python*/site-packages to sys.path,
+    so pip-style (`pip install -t`) dependency layers import (#888)."""
+    lbuf = io.BytesIO()
+    with zipfile.ZipFile(lbuf, "w") as z:
+        z.writestr("python/lib/python3.12/site-packages/sitelib888.py",
+                   "def hi():\n    return 'sp-ok'\n")
+    lv = lam.publish_layer_version(
+        LayerName="sp-layer-888", Content={"ZipFile": lbuf.getvalue()},
+        CompatibleRuntimes=["python3.12"])
+    fbuf = io.BytesIO()
+    with zipfile.ZipFile(fbuf, "w") as z:
+        z.writestr("index.py",
+                   "import sitelib888\ndef handler(e, c):\n    return {'msg': sitelib888.hi()}\n")
+    lam.create_function(
+        FunctionName="sp-fn-888", Runtime="python3.12",
+        Role="arn:aws:iam::000000000000:role/r", Handler="index.handler",
+        Code={"ZipFile": fbuf.getvalue()}, Layers=[lv["LayerVersionArn"]])
+    resp = lam.invoke(FunctionName="sp-fn-888", Payload=b"{}")
+    assert "FunctionError" not in resp, resp
+    payload = json.loads(resp["Payload"].read())
+    assert payload["msg"] == "sp-ok"

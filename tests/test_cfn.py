@@ -3396,3 +3396,87 @@ def test_cfn_nested_stack_basic(cfn, s3):
 
     s3.delete_object(Bucket=templates_bucket, Key="child.json")
     s3.delete_bucket(Bucket=templates_bucket)
+
+
+def test_cfn_logs_subscription_filter_provisions(cfn, logs):
+    """AWS::Logs::SubscriptionFilter provisions via CFN and is removed on stack
+    delete (#896). The filter Refs the in-stack log group so it is created
+    after the group."""
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "MyGroup": {
+                "Type": "AWS::Logs::LogGroup",
+                "Properties": {"LogGroupName": "/cfn/subfilter-test"},
+            },
+            "MyFilter": {
+                "Type": "AWS::Logs::SubscriptionFilter",
+                "Properties": {
+                    "LogGroupName": {"Ref": "MyGroup"},
+                    "FilterPattern": "[Producer]",
+                    "DestinationArn":
+                        "arn:aws:lambda:us-east-1:000000000000:function:consumer",
+                },
+            },
+        },
+    }
+    cfn.create_stack(StackName="cfn-subfilter", TemplateBody=json.dumps(template))
+    stack = _wait_stack(cfn, "cfn-subfilter")
+    assert stack["StackStatus"] == "CREATE_COMPLETE"
+
+    filters = logs.describe_subscription_filters(
+        logGroupName="/cfn/subfilter-test")["subscriptionFilters"]
+    assert len(filters) == 1
+    assert filters[0]["filterPattern"] == "[Producer]"
+    assert filters[0]["destinationArn"].endswith(":function:consumer")
+
+    cfn.delete_stack(StackName="cfn-subfilter")
+    _wait_stack(cfn, "cfn-subfilter")
+    # The stack delete removes the LogGroup too, so the subscription filter is
+    # gone with it — describing it now raises ResourceNotFoundException.
+    with pytest.raises(ClientError):
+        logs.describe_subscription_filters(logGroupName="/cfn/subfilter-test")
+
+
+def test_cfn_change_set_detects_parameter_driven_change(cfn, s3):
+    """A change set must detect a parameter-driven property change (e.g. a Lambda
+    Code S3Key behind a Ref) so `aws cloudformation deploy` doesn't silently
+    no-op while `update-stack` works (#897). Also guards against false positives
+    when nothing changed."""
+    s3.create_bucket(Bucket="cfn897-code")
+    for k in ("a.zip", "b.zip"):
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as z:
+            z.writestr("index.py", "def handler(e, c):\n    return 'ok'\n")
+        s3.put_object(Bucket="cfn897-code", Key=k, Body=buf.getvalue())
+
+    tmpl = json.dumps({
+        "Parameters": {"CodeKey": {"Type": "String"}},
+        "Resources": {"Fn": {"Type": "AWS::Lambda::Function", "Properties": {
+            "FunctionName": "cfn897-fn", "Runtime": "python3.12",
+            "Handler": "index.handler", "Role": "arn:aws:iam::000000000000:role/r",
+            "Code": {"S3Bucket": "cfn897-code", "S3Key": {"Ref": "CodeKey"}}}}}})
+    cfn.create_stack(StackName="cfn897", TemplateBody=tmpl,
+                     Parameters=[{"ParameterKey": "CodeKey", "ParameterValue": "a.zip"}])
+    _wait_stack(cfn, "cfn897")
+
+    def _change_set(name, val):
+        cfn.create_change_set(
+            StackName="cfn897", ChangeSetName=name, ChangeSetType="UPDATE",
+            TemplateBody=tmpl,
+            Parameters=[{"ParameterKey": "CodeKey", "ParameterValue": val}])
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            d = cfn.describe_change_set(StackName="cfn897", ChangeSetName=name)
+            if d["Status"] in ("CREATE_COMPLETE", "FAILED"):
+                return d
+            time.sleep(0.5)
+        return d
+
+    changed = _change_set("cs-changed", "b.zip")
+    assert len(changed.get("Changes", [])) == 1
+    assert changed["Changes"][0]["ResourceChange"]["Action"] == "Modify"
+
+    # nothing changed -> empty change set (no false positive)
+    noop = _change_set("cs-noop", "a.zip")
+    assert len(noop.get("Changes", [])) == 0

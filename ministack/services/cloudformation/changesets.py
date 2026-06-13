@@ -37,6 +37,37 @@ def _find_change_set(cs_name, stack_name=""):
 
 # --- CreateChangeSet ---
 
+def _resolve_props_for_diff(template, params, stack_name, stack_id):
+    """Return ``template`` with each resource's Properties intrinsics resolved
+    against ``params``, so change detection compares *effective* values (e.g. a
+    parameter-driven ``Code.S3Key``) instead of identical raw ``Ref`` nodes.
+
+    Without this, ``aws cloudformation deploy`` (which drives updates through
+    ``--parameter-overrides``) produced an empty change set and silently no-oped
+    Lambda code updates, while ``update-stack`` worked (#897). Resolution is
+    best-effort: refs that can't resolve at change-set time (e.g. GetAtt to a
+    not-yet-provisioned resource) fall back to the raw Properties on both sides.
+    """
+    if not template:
+        return {}
+    try:
+        conditions = _evaluate_conditions(template, params)
+    except Exception:
+        conditions = {}
+    mappings = template.get("Mappings", {})
+    resolved = {}
+    for lid, res in template.get("Resources", {}).items():
+        new_res = dict(res)
+        try:
+            new_res["Properties"] = _resolve_refs(
+                copy.deepcopy(res.get("Properties", {})),
+                {}, params, conditions, mappings, stack_name, stack_id)
+        except Exception:
+            new_res["Properties"] = res.get("Properties", {})
+        resolved[lid] = new_res
+    return {"Resources": resolved}
+
+
 def _create_change_set(params):
     from ministack.services.cloudformation import _change_sets, _stack_events, _stacks
     stack_name = _p(params, "StackName")
@@ -112,9 +143,15 @@ def _create_change_set(params):
     except ValueError as exc:
         return _error("ValidationError", str(exc))
 
-    # Compute changes
+    # Compute changes — resolve parameters/intrinsics in BOTH templates first so
+    # parameter-driven changes (the `aws cloudformation deploy
+    # --parameter-overrides` pattern, e.g. a Lambda Code S3Key behind a Ref) are
+    # detected instead of compared as identical raw nodes (#897).
     old_template = stack.get("_template", {}) if cs_type == "UPDATE" else {}
-    changes = _diff_resources(old_template, template)
+    old_params = stack.get("_resolved_params", {}) if cs_type == "UPDATE" else {}
+    old_resolved = _resolve_props_for_diff(old_template, old_params, stack_name, stack_id)
+    new_resolved = _resolve_props_for_diff(template, param_values, stack_name, stack_id)
+    changes = _diff_resources(old_resolved, new_resolved)
 
     cs_id = (
         f"arn:aws:cloudformation:{REGION}:{get_account_id()}:"
