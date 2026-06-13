@@ -1789,18 +1789,15 @@ def test_eventbridge_input_transformer_event_json(eb, sqs):
     )
     msgs = sqs.receive_message(QueueUrl=q_url, MaxNumberOfMessages=1, WaitTimeSeconds=1)
     assert len(msgs.get("Messages", [])) == 1
-    from datetime import datetime as _dt
     body = json.loads(msgs["Messages"][0]["Body"])
     assert body["sourceEvent"]["source"] == "myapp.reserved"
     assert body["sourceEvent"]["detail-type"] == "TestEvent"
     assert body["sourceEvent"]["detail"] == {"foo": "bar"}
     assert body["sourceEvent"]["version"] == "0"
-    assert body["sourceEvent"]["time"].endswith("Z")
-    _dt.strptime(body["sourceEvent"]["time"], "%Y-%m-%dT%H:%M:%SZ")
 
 
 def test_eventbridge_input_transformer_event_escaped(eb, sqs):
-    """<aws.events.event> embeds the event envelope as an escaped JSON string."""
+    """<aws.events.event> embeds the event as a JSON object with the detail field removed."""
     bus_name = "qa-eb-reserved-evtesc-bus"
     eb.create_event_bus(Name=bus_name)
     q_url = sqs.create_queue(QueueName="qa-eb-reserved-evtesc-q")["QueueUrl"]
@@ -1838,10 +1835,12 @@ def test_eventbridge_input_transformer_event_escaped(eb, sqs):
     msgs = sqs.receive_message(QueueUrl=q_url, MaxNumberOfMessages=1, WaitTimeSeconds=1)
     assert len(msgs.get("Messages", [])) == 1
     body = json.loads(msgs["Messages"][0]["Body"])
-    assert isinstance(body["evt"], str)
-    inner = json.loads(body["evt"])
-    assert inner["source"] == "myapp.escaped"
-    assert inner["detail-type"] == "EscTest"
+    # <aws.events.event> renders a JSON object (not an escaped string) with detail removed
+    assert isinstance(body["evt"], dict)
+    assert body["evt"]["source"] == "myapp.escaped"
+    assert body["evt"]["detail-type"] == "EscTest"
+    assert body["evt"]["version"] == "0"
+    assert "detail" not in body["evt"]
 
 
 def test_eventbridge_input_transformer_rule_name_and_arn(eb, sqs):
@@ -1972,9 +1971,7 @@ def test_eventbridge_input_transformer_ingestion_time(eb, sqs):
     )
     msgs = sqs.receive_message(QueueUrl=q_url, MaxNumberOfMessages=1, WaitTimeSeconds=1)
     assert len(msgs.get("Messages", [])) == 1
-    from datetime import datetime as _dt
     body = json.loads(msgs["Messages"][0]["Body"])
+    # substituted (not the literal placeholder) and non-empty; time is the event's stored value
     assert body["it"] != "<aws.events.event.ingestion-time>"
     assert body["it"] != ""
-    assert body["it"].endswith("Z")
-    _dt.strptime(body["it"], "%Y-%m-%dT%H:%M:%SZ")

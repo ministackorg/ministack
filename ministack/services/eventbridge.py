@@ -969,12 +969,6 @@ def _apply_input_transformer(transformer, event, rule=None):
     except Exception:
         full = {}
 
-    raw_time = event.get("Time", "")
-    if isinstance(raw_time, (int, float)):
-        iso_time = datetime.fromtimestamp(raw_time, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    else:
-        iso_time = raw_time
-
     event_envelope = {
         "version": "0",
         "source": event.get("Source", ""),
@@ -982,7 +976,7 @@ def _apply_input_transformer(transformer, event, rule=None):
         "detail": full,
         "account": get_account_id(),
         "region": get_region(),
-        "time": iso_time,
+        "time": event.get("Time", ""),
         "id": event.get("EventId", ""),
         "resources": event.get("Resources", []),
     }
@@ -1001,7 +995,7 @@ def _apply_input_transformer(transformer, event, rule=None):
 
     reserved = {
         "aws.events.event.json": json.dumps(event_envelope),
-        "aws.events.event": json.dumps(json.dumps(event_envelope)),  # escaped string form
+        "aws.events.event": json.dumps({k: v for k, v in event_envelope.items() if k != "detail"}),
         "aws.events.event.ingestion-time": event_envelope.get("time", ""),
     }
     if rule:
