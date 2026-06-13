@@ -5,6 +5,13 @@ All notable changes to MiniStack will be documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+- **ECS — `RunTask` now applies `containerOverrides.command` to the launched Docker container** — Overridden commands (including an explicit empty command) were ignored at runtime because the Docker `containers.run(...)` call still used the task-definition command.  The effective container definition now carries the matched override command into Docker, while non-overridden containers keep their defaults.
+
+---
+
 ## [1.3.63] — 2026-06-13
 
 ### Fixed
