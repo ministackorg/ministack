@@ -305,14 +305,16 @@ for _ld in filter(None, os.environ.get("_LAMBDA_LAYERS_DIRS", "").split(os.paths
     _py = os.path.join(_ld, "python")
     if os.path.isdir(_py):
         sys.path.insert(0, _py)
-        # AWS also exposes <layer>/python/lib/python<ver>/site-packages, where
+        # AWS exposes <layer>/python/lib/python<ver>/site-packages as a site
+        # directory (processes .pth files / namespace packages), where
         # `pip install -t` dependency layers land (#888).
         _lib = os.path.join(_py, "lib")
         if os.path.isdir(_lib):
+            import site as _site
             for _v in os.listdir(_lib):
                 _sp = os.path.join(_lib, _v, "site-packages")
                 if os.path.isdir(_sp):
-                    sys.path.insert(0, _sp)
+                    _site.addsitedir(_sp)
     sys.path.insert(0, _ld)
 
 _mod_path = os.environ["_LAMBDA_HANDLER_MODULE"]
@@ -356,14 +358,16 @@ for _ld in filter(None, os.environ.get("_LAMBDA_LAYERS_DIRS", "").split(":")):
     _py = os.path.join(_ld, "python")
     if os.path.isdir(_py):
         sys.path.insert(0, _py)
-        # AWS also exposes <layer>/python/lib/python<ver>/site-packages, where
+        # AWS exposes <layer>/python/lib/python<ver>/site-packages as a site
+        # directory (processes .pth files / namespace packages), where
         # `pip install -t` dependency layers land (#888).
         _lib = os.path.join(_py, "lib")
         if os.path.isdir(_lib):
+            import site as _site
             for _v in os.listdir(_lib):
                 _sp = os.path.join(_lib, _v, "site-packages")
                 if os.path.isdir(_sp):
-                    sys.path.insert(0, _sp)
+                    _site.addsitedir(_sp)
     sys.path.insert(0, _ld)
 
 _mod_path = os.environ["_LAMBDA_HANDLER_MODULE"]
