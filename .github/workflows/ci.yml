@@ -31,7 +31,7 @@ jobs:
           cache: "pip"
 
       - name: Install dependencies
-        run: pip install -e . && pip install -r requirements.txt boto3 pytest pytest-xdist duckdb docker cbor2 pyyaml cryptography
+        run: pip install -e ".[dev]"
 
       - name: Start MiniStack
         run: |
@@ -40,7 +40,7 @@ jobs:
           curl -sf http://localhost:4566/_ministack/health
 
       - name: Run tests (parallel safe set)
-        run: pytest tests/ -v -n 3 --dist=loadfile -m "not serial"
+        run: pytest tests/ -v -n auto --dist=loadfile -m "not serial" --durations=25
 
       - name: Run tests (serial global-state set)
         run: pytest tests/ -v --tb=short -m "serial"
