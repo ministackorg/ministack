@@ -947,6 +947,13 @@ def _docker_binds_from_taskdef(td, cdef):
     return binds
 
 
+def _container_override_for(container_overrides, container_name):
+    for override in container_overrides:
+        if override.get("name") == container_name:
+            return override
+    return {}
+
+
 def _build_run_kwargs(cdef, td, env, port_bindings, ecs_network,
                       host_mode, task_id, task_arn, ministack_net_ip,
                       cluster_arn):
@@ -1087,14 +1094,18 @@ def _run_task(data):
                 logger.debug("ECS: could not detect Ministack network, using default")
 
             for i, cdef in enumerate(td.get("containerDefinitions", [])):
+                container_override = _container_override_for(
+                    container_overrides, cdef["name"]
+                )
                 env_override = {}
-                for ov in container_overrides:
-                    if ov.get("name") == cdef["name"]:
-                        for e in ov.get("environment", []):
-                            env_override[e["name"]] = e["value"]
+                for e in container_override.get("environment", []):
+                    env_override[e["name"]] = e["value"]
 
                 env = {e["name"]: e["value"] for e in cdef.get("environment", [])}
                 env.update(env_override)
+                effective_cdef = dict(cdef)
+                if "command" in container_override:
+                    effective_cdef["command"] = container_override["command"]
 
                 port_bindings = {}
                 for pm in cdef.get("portMappings", []):
@@ -1107,7 +1118,7 @@ def _run_task(data):
                     td, cdef, launch_type, env, host_mode, ministack_net_ip,
                 )
                 run_kwargs = _build_run_kwargs(
-                    cdef, td, env, port_bindings, ecs_network,
+                    effective_cdef, td, env, port_bindings, ecs_network,
                     host_mode, task_id, task_arn, ministack_net_ip,
                     _clusters[cluster_name]["clusterArn"],
                 )

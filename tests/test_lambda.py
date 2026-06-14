@@ -413,6 +413,39 @@ def test_lambda_esm_sqs_comprehensive(lam, sqs):
 
     lam.delete_event_source_mapping(UUID=esm_uuid)
 
+def test_lambda_esm_filter_criteria_stored_on_create(lam, sqs):
+    """FilterCriteria specified at CreateEventSourceMapping must be echoed
+    back by GetEventSourceMapping — it was silently dropped before this fix."""
+    try:
+        lam.delete_function(FunctionName="esm-fc-func")
+    except ClientError:
+        pass
+    lam.create_function(
+        FunctionName="esm-fc-func",
+        Runtime="python3.12",
+        Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _make_zip(_LAMBDA_CODE)},
+    )
+    q_url = sqs.create_queue(QueueName="esm-fc-queue")["QueueUrl"]
+    q_arn = sqs.get_queue_attributes(
+        QueueUrl=q_url, AttributeNames=["QueueArn"],
+    )["Attributes"]["QueueArn"]
+
+    fc = {"Filters": [{"Pattern": json.dumps({"body": {"type": ["order"]}})}]}
+    resp = lam.create_event_source_mapping(
+        EventSourceArn=q_arn,
+        FunctionName="esm-fc-func",
+        FilterCriteria=fc,
+    )
+    esm_uuid = resp["UUID"]
+    assert resp.get("FilterCriteria") == fc, "FilterCriteria must be in create response"
+
+    got = lam.get_event_source_mapping(UUID=esm_uuid)
+    assert got.get("FilterCriteria") == fc, "FilterCriteria must survive a GetEventSourceMapping round-trip"
+
+    lam.delete_event_source_mapping(UUID=esm_uuid)
+
 def test_lambda_esm_sqs_failure_respects_visibility_timeout(lam, sqs):
     """On Lambda failure, the message should remain in-flight until VisibilityTimeout expires."""
     import io
@@ -3094,6 +3127,37 @@ def test_apply_filter_criteria_no_filters_passes_through():
     records = [{"messageId": "x"}, {"messageId": "y"}]
     assert lsvc._apply_filter_criteria(records, {}) == records
     assert lsvc._apply_filter_criteria(records, {"FilterCriteria": {}}) == records
+
+
+def test_apply_filter_criteria_ddb_eventname_filter():
+    """DynamoDB stream records are filtered by top-level eventName, matching AWS behaviour."""
+    import json as _json
+    esm = {"FilterCriteria": {"Filters": [
+        {"Pattern": _json.dumps({"eventName": ["INSERT"]})},
+    ]}}
+    records = [
+        {"eventName": "INSERT", "dynamodb": {"NewImage": {"pk": {"S": "a"}}}},
+        {"eventName": "MODIFY", "dynamodb": {"NewImage": {"pk": {"S": "b"}}}},
+        {"eventName": "REMOVE", "dynamodb": {"OldImage": {"pk": {"S": "c"}}}},
+    ]
+    filtered = lsvc._apply_filter_criteria(records, esm)
+    assert [r["eventName"] for r in filtered] == ["INSERT"]
+
+
+def test_apply_filter_criteria_ddb_newimage_filter():
+    """DynamoDB stream records are filtered by nested dynamodb.NewImage data."""
+    import json as _json
+    esm = {"FilterCriteria": {"Filters": [
+        {"Pattern": _json.dumps({"dynamodb": {"NewImage": {"status": {"S": ["active"]}}}})},
+    ]}}
+    records = [
+        {"eventName": "INSERT", "dynamodb": {"NewImage": {"pk": {"S": "1"}, "status": {"S": "active"}}}},
+        {"eventName": "INSERT", "dynamodb": {"NewImage": {"pk": {"S": "2"}, "status": {"S": "inactive"}}}},
+        {"eventName": "REMOVE", "dynamodb": {"OldImage": {"pk": {"S": "3"}, "status": {"S": "active"}}}},
+    ]
+    filtered = lsvc._apply_filter_criteria(records, esm)
+    assert len(filtered) == 1
+    assert filtered[0]["dynamodb"]["NewImage"]["pk"]["S"] == "1"
 
 
 def test_event_stream_encode_roundtrip():

@@ -553,6 +553,7 @@ def _lambda_create(logical_id, props, stack_name):
             "Architectures": props.get("Architectures", ["x86_64"]),
             "EphemeralStorage": {"Size": props.get("EphemeralStorage", {}).get("Size", 512)},
             "TracingConfig": props.get("TracingConfig", {"Mode": "PassThrough"}),
+            "LoggingConfig": props.get("LoggingConfig", {"LogFormat": "Text", "LogGroup": f"/aws/lambda/{name}"}),
             "RevisionId": new_uuid(),
         },
         "code_zip": code_zip,
@@ -568,6 +569,11 @@ def _lambda_create(logical_id, props, stack_name):
         "provisioned_concurrency": {},
     }
     _lambda_svc._functions[name] = func
+    # On a stack UPDATE this re-provisions over an existing function; recycle the
+    # warm worker + docker pool so the new code/config load on the next invoke
+    # (#897). No-op on first create (no worker spawned yet).
+    _lambda_svc.invalidate_worker(name)
+    _lambda_svc._pool_kill_function(get_account_id(), name)
     return name, {"Arn": arn}
 
 
