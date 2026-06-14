@@ -7,7 +7,71 @@ on:
     branches: [main, master]
 
 jobs:
-  test:
+  test-parallel:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        shard: [heavy, default]
+
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -e . && pip install -r requirements.txt boto3 pytest pytest-xdist duckdb docker cbor2 pyyaml cryptography
+
+      - name: Start MiniStack
+        run: |
+          REDIS_HOST=localhost python -m hypercorn ministack.app:app --bind 0.0.0.0:4566 --keep-alive 75 > ministack.log 2>&1 &
+          sleep 3
+          curl -sf http://localhost:4566/_ministack/health
+
+      - name: Run tests (heavy shard)
+        if: matrix.shard == 'heavy'
+        run: |
+          pytest \
+            tests/test_cognito_custom_auth.py \
+            tests/test_alb.py \
+            tests/test_ecs.py \
+            tests/test_stepfunctions.py \
+            tests/test_opensearch.py \
+            -v -n auto --dist=loadfile -m "not serial" --durations=25
+
+      - name: Run tests (default shard)
+        if: matrix.shard == 'default'
+        run: |
+          pytest tests/ \
+            --ignore=tests/test_cognito_custom_auth.py \
+            --ignore=tests/test_alb.py \
+            --ignore=tests/test_ecs.py \
+            --ignore=tests/test_stepfunctions.py \
+            --ignore=tests/test_opensearch.py \
+            -v -n auto --dist=loadfile -m "not serial" --durations=25
+
+      - name: Upload MiniStack log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ministack-${{ matrix.shard }}.log
+          path: ministack.log
+
+  test-serial:
     runs-on: ubuntu-latest
 
     services:
@@ -39,15 +103,12 @@ jobs:
           sleep 3
           curl -sf http://localhost:4566/_ministack/health
 
-      - name: Run tests (parallel safe set)
-        run: pytest tests/ -v -n auto --dist=loadfile -m "not serial" --durations=25
-
       - name: Run tests (serial global-state set)
-        run: pytest tests/ -v --tb=short -m "serial"
+        run: pytest tests/ -v --tb=short -m "serial" --durations=10
 
       - name: Upload MiniStack log
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: ministack.log
+          name: ministack-serial.log
           path: ministack.log
