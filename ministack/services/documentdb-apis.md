@@ -68,7 +68,7 @@
 - rolesInfo: v.5.0 - Supported | Mongo v.8.0 - Supported
 - updateRole: v.5.0 - Supported | Mongo v.8.0 - Supported
 
-## Sessions commands
+## Sessions commands - DONE
 
 - abortTransaction: v.5.0 - Supported | Mongo v.8.0 - Supported
 - commitTransaction: v.5.0 - Supported | Mongo v.8.0 - Supported
@@ -76,7 +76,7 @@
 - killSessions: v.5.0 - Supported | Mongo v.8.0 - Supported
 - startSession: v.5.0 - Supported | Mongo v.8.0 - Supported
 
-## User management
+## User management - DONE
 
 - createUser: v.5.0 - Supported | Mongo v.8.0 - Supported
 - dropAllUsersFromDatabase: v.5.0 - Supported | Mongo v.8.0 - Supported
@@ -86,25 +86,25 @@
 - updateUser: v.5.0 - Supported | Mongo v.8.0 - Supported
 - usersInfo: v.5.0 - Supported | Mongo v.8.0 - Supported
 
-## Sharding commands
+## Sharding commands - DONE
 
 - enableSharding: v.5.0 - Supported | Mongo v.8.0 - Supported
 - shardCollection: v.5.0 - Supported | Mongo v.8.0 - Supported
 
-## Array Operators
+## Array Operators - DONE
 
 - $all: v.5.0 - Supported | Mongo v.8.0 - Supported
 - $elemMatch: v.5.0 - Supported | Mongo v.8.0 - Supported
 - $size: v.5.0 - Supported | Mongo v.8.0 - Supported
 
-## Bitwise operators
+## Bitwise operators - DONE
 
 - $bitsAllSet: v.5.0 - Supported | Mongo v.8.0 - Supported
 - $bitsAnySet: v.5.0 - Supported | Mongo v.8.0 - Supported
 - $bitsAllClear: v.5.0 - Supported | Mongo v.8.0 - Supported
 - $bitsAnyClear: v.5.0 - Supported | Mongo v.8.0 - Supported
 
-## Comment operator
+## Comment operator - DONE
 
 - $comment: v.5.0 - Supported | Mongo v.8.0 - Supported
 

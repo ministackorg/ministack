@@ -1,933 +1,1596 @@
 """
-AWS DocumentDB Emulator.
-JSON-based API via X-Amz-Target.
-Supports (admin): collMod, create, createIndexes, currentOp, drop, dropDatabase, dropIndexes,
-getAuditConfig, killCursors, killOp, listCollections, listDatabases, listIndexes, reIndex,
-renameCollection, setAuditConfig.
-Supports (agg/auth/diag/query/role): aggregate, count, distinct, authenticate, logout,
-buildInfo, collStats, connectionStatus, dataSize, dbStats, explain, hostInfo, listCommands,
-profiler, serverStatus, top, find, insert, update, delete, findAndModify, getMore, ReplaceOne,
-createRole, dropRole, dropAllRolesFromDatabase, grantRolesToRole, revokeRolesFromRole,
-revokePrivilegesFromRole, rolesInfo, updateRole.
-Supports (sessions/user/shard + operators): startSession, abortTransaction, commitTransaction,
-killSessions, killAllSessions, createUser, dropUser, dropAllUsersFromDatabase, grantRolesToUser,
-revokeRolesFromUser, updateUser, usersInfo, enableSharding, shardCollection.
-Array: $all, $elemMatch, $size. Bitwise: $bitsAllSet, $bitsAnySet, $bitsAllClear, $bitsAnyClear.
-Comment: $comment.
+DocumentDB Service Emulator (control plane).
 
-Mongo APIs: https://docs.aws.amazon.com/documentdb/latest/developerguide/mongo-apis.html
-https://docs.aws.amazon.com/documentdb/latest/developerguide/connect_programmatically.html
+Query API (Action=...) + JSON bodies for CreateDBInstance etc.
+When Docker is available, spins up real mongo:X containers (mongo:7 by default)
+and returns usable Endpoint.Address/Port for direct wire-protocol connections
+(pymongo, etc.). The data plane is real MongoDB — no in-process emulation of
+Mongo commands.
+
+Supported (core surface for aws docdb / boto3 docdb client + IaC):
+  CreateDBInstance, DeleteDBInstance, DescribeDBInstances, ModifyDBInstance,
+  StartDBInstance, StopDBInstance, RebootDBInstance,
+  CreateDBCluster, DeleteDBCluster, DescribeDBClusters, ModifyDBCluster,
+  StartDBCluster, StopDBCluster,
+  CreateDBSubnetGroup, DeleteDBSubnetGroup, DescribeDBSubnetGroups,
+  CreateDBSnapshot, DeleteDBSnapshot, DescribeDBSnapshots,
+  ListTagsForResource, AddTagsToResource, RemoveTagsFromResource,
+  DescribeDBEngineVersions, DescribeOrderableDBInstanceOptions,
+  DescribePendingMaintenanceActions (noop).
+
+Engine is forced to "docdb". Default container port 27017.
+Env vars: DOCDB_BASE_PORT (default 27117), DOCDB_PERSIST, DOCDB_TMPFS_SIZE,
+DOCKER_NETWORK (shared with RDS).
 """
 
+import copy
+import datetime
 import json
 import logging
+import os
+import socket
+import threading
+import time
+from urllib.parse import parse_qs
+from xml.sax.saxutils import escape as _esc
 
-from ministack.core.responses import error_response_json, get_account_id, json_response, new_uuid
+from ministack.core.persistence import load_state
+from ministack.core.responses import AccountScopedDict, apply_image_prefix, get_account_id, get_region, new_uuid
 
 logger = logging.getLogger("documentdb")
 
-_state: dict = {"users": {}, "collections": {}, "roles": {}, "sessions": {}, "sharded": {}}
+REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
+BASE_PORT = int(os.environ.get("DOCDB_BASE_PORT", "27117"))
+DOCDB_TMPFS_SIZE = os.environ.get("DOCDB_TMPFS_SIZE", "256m")
+DOCDB_PERSIST = os.environ.get("DOCDB_PERSIST", "0").lower() in ("1", "true", "yes")
+DOCKER_NETWORK = os.environ.get("DOCKER_NETWORK", "")
+
+_instances = AccountScopedDict()
+_clusters = AccountScopedDict()
+_subnet_groups = AccountScopedDict()
+_snapshots = AccountScopedDict()
+_tags = AccountScopedDict()
+_port_counter = [BASE_PORT]
+
+_docker = None
+_ministack_network = None
 
 
-def _get_state():
-    """Return account-scoped state dicts (users, collections, roles, sessions, sharded)."""
-    acct = get_account_id()
-    if acct not in _state["users"]:
-        _state["users"][acct] = []
-        _state["collections"][acct] = {}
-        _state["roles"][acct] = {}
-        _state["sessions"][acct] = {}
-        _state["sharded"][acct] = {}
-    return (
-        _state["users"][acct],
-        _state["collections"][acct],
-        _state["roles"][acct],
-        _state["sessions"][acct],
-        _state["sharded"][acct],
+# ── Persistence ────────────────────────────────────────────
+
+def get_state():
+    instances = copy.deepcopy(_instances)
+    for key in list(instances._data):
+        instances._data[key].pop("_docker_container_id", None)
+    state = {
+        "instances": instances,
+        "clusters": copy.deepcopy(_clusters),
+        "subnet_groups": copy.deepcopy(_subnet_groups),
+        "snapshots": copy.deepcopy(_snapshots),
+        "tags": copy.deepcopy(_tags),
+        "port_counter": _port_counter[0],
+    }
+    return state
+
+
+def restore_state(data):
+    if not data:
+        return
+    _clusters.update(data.get("clusters", {}))
+    _subnet_groups.update(data.get("subnet_groups", {}))
+    _snapshots.update(data.get("snapshots", {}))
+    _tags.update(data.get("tags", {}))
+    if "port_counter" in data:
+        _port_counter[0] = data["port_counter"]
+    instances_data = data.get("instances", {})
+    if isinstance(instances_data, AccountScopedDict):
+        for key, inst in list(instances_data._data.items()):
+            inst["_docker_container_id"] = None
+            inst["DBInstanceStatus"] = "available"
+            _instances._data[key] = inst
+    else:
+        for name, inst in instances_data.items():
+            inst["_docker_container_id"] = None
+            inst["DBInstanceStatus"] = "available"
+            _instances[name] = inst
+
+
+try:
+    _restored = load_state("documentdb")
+    if _restored:
+        restore_state(_restored)
+except Exception:
+    import logging
+    logging.getLogger(__name__).exception(
+        "Failed to restore persisted state; continuing with fresh store"
     )
+
+
+def _get_docker():
+    global _docker
+    if _docker is None:
+        try:
+            import docker
+            _docker = docker.from_env()
+        except Exception:
+            pass
+    return _docker
+
+
+def _get_ministack_network(docker_client):
+    """Detect the Docker network MiniStack is running on (if containerised)."""
+    global _ministack_network
+    if _ministack_network is not None:
+        return _ministack_network or None
+    if DOCKER_NETWORK:
+        _ministack_network = DOCKER_NETWORK
+        logger.debug("docdb: using DOCKER_NETWORK=%s", DOCKER_NETWORK)
+        return DOCKER_NETWORK
+    try:
+        self_container = docker_client.containers.get(
+            os.environ.get("HOSTNAME", ""))
+        nets = list(
+            self_container.attrs["NetworkSettings"]["Networks"].keys())
+        if nets:
+            _ministack_network = nets[0]
+            logger.debug("docdb: detected MiniStack network: %s",
+                         _ministack_network)
+            return _ministack_network
+    except Exception:
+        logger.debug("docdb: could not detect MiniStack network, "
+                     "using localhost")
+    _ministack_network = ""
+    return None
+
+
+def _wait_for_port(host, port, timeout=60):
+    """Block until a TCP connection to host:port succeeds."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            with socket.create_connection((host, port), timeout=2):
+                return True
+        except OSError:
+            time.sleep(0.5)
+    return False
+
+
+_port_lock = threading.Lock()
+
+
+def _next_port():
+    with _port_lock:
+        port = _port_counter[0]
+        _port_counter[0] += 1
+        return port
+
+
+# ---------------------------------------------------------------------------
+# Request routing
+# ---------------------------------------------------------------------------
+
+def _json_key_to_query_param_name(key: str) -> str:
+    """Map JSON / Smithy body keys to Query-API parameter names."""
+    lk = key.lower()
+    if lk == "dbinstanceidentifier":
+        return "DBInstanceIdentifier"
+    if lk == "dbclusteridentifier":
+        return "DBClusterIdentifier"
+    if lk == "filters":
+        return "Filters"
+    return key
+
+
+def _flatten_json_request_params(params, data):
+    """Merge SigV4 JSON (``application/x-amz-json-1.*``) bodies into query-style params."""
+    if not isinstance(data, dict):
+        return
+    for key, val in data.items():
+        if val is None:
+            continue
+        qkey = _json_key_to_query_param_name(key)
+        if isinstance(val, bool):
+            params[qkey] = ["true" if val else "false"]
+        elif isinstance(val, (int, float)):
+            params[qkey] = [str(val)]
+        elif isinstance(val, str):
+            params[qkey] = [val]
+        elif isinstance(val, list) and qkey == "Filters":
+            for i, f in enumerate(val, 1):
+                if not isinstance(f, dict):
+                    continue
+                name = f.get("Name") or f.get("name")
+                if not name:
+                    continue
+                params[f"Filters.member.{i}.Name"] = [name]
+                values = f.get("Values") or f.get("values") or []
+                for j, v in enumerate(values, 1):
+                    params[f"Filters.member.{i}.Values.member.{j}"] = [str(v)]
 
 
 async def handle_request(method, path, headers, body, query_params):
-    target = headers.get("x-amz-target", "")
-    action = target.split(".")[-1] if "." in target else ""
-
-    try:
-        data = json.loads(body) if body else {}
-    except json.JSONDecodeError:
-        return error_response_json("SerializationException", "Invalid JSON", 400)
-
-    handlers = {
-        # administrative
-        "collmod": _coll_mod,
-        "create": _create,
-        "createindexes": _create_indexes,
-        "currentop": _current_op,
-        "drop": _drop,
-        "dropdatabase": _drop_database,
-        "dropindexes": _drop_indexes,
-        "getauditconfig": _get_audit_config,
-        "killcursors": _kill_cursors,
-        "killop": _kill_op,
-        "listcollections": _list_collections,
-        "listdatabases": _list_databases,
-        "listindexes": _list_indexes,
-        "reindex": _re_index,
-        "renamecollection": _rename_collection,
-        "setauditconfig": _set_audit_config,
-        # aggregation
-        "aggregate": _aggregate,
-        "count": _count,
-        "distinct": _distinct,
-        # authentication
-        "authenticate": _authenticate,
-        "logout": _logout,
-        # diagnostic
-        "buildinfo": _build_info,
-        "collstats": _coll_stats,
-        "connectionstatus": _connection_status,
-        "datasize": _data_size,
-        "dbstats": _db_stats,
-        "explain": _explain,
-        "hostinfo": _host_info,
-        "listcommands": _list_commands,
-        "profiler": _profiler,
-        "serverstatus": _server_status,
-        "top": _top,
-        # query/write
-        "find": _find,
-        "insert": _insert,
-        "update": _update,
-        "delete": _delete,
-        "findandmodify": _find_and_modify,
-        "getmore": _get_more,
-        "replaceone": _replace_one,
-        # role management
-        "createrole": _create_role,
-        "droprole": _drop_role,
-        "dropallrolesfromdatabase": _drop_all_roles_from_database,
-        "grantrolestorole": _grant_roles_to_role,
-        "revokerolesfromrole": _revoke_roles_from_role,
-        "revokeprivilegesfromrole": _revoke_privileges_from_role,
-        "rolesinfo": _roles_info,
-        "updaterole": _update_role,
-        # sessions
-        "startsession": _start_session,
-        "aborttransaction": _abort_transaction,
-        "committransaction": _commit_transaction,
-        "killsessions": _kill_sessions,
-        "killallsessions": _kill_all_sessions,
-        # user management
-        "createuser": _create_user,
-        "dropuser": _drop_user,
-        "dropallusersfromdatabase": _drop_all_users_from_database,
-        "grantrolestouser": _grant_roles_to_user,
-        "revokerolesfromuser": _revoke_roles_from_user,
-        "updateuser": _update_user,
-        "usersinfo": _users_info,
-        # sharding
-        "enablesharding": _enable_sharding,
-        "shardcollection": _shard_collection,
-    }
-
-    key = action.lower().replace("_", "")
-    handler = handlers.get(key)
-    if not handler:
-        return error_response_json("InvalidAction", f"Unknown action: {action}", 400)
-    return handler(data)
-
-
-def _find(data):
-    db = data.get("db") or data.get("database")
-    coll = data.get("find") or data.get("collection")
-    filt = data.get("filter") or data.get("query") or {}
-    if not db or not coll:
-        # legacy fallback
-        coll = data.get("collection", "default")
-        return json_response({"result": "ok", "documents": [], "collection": coll})
-    _, cols, _, _, _ = _get_state()
-    col = cols.get(db, {}).get(coll) or {"documents": []}
-    docs = [d for d in col.get("documents", []) if _doc_matches(d, filt)]
-    return json_response({"ok": 1, "cursor": {"firstBatch": docs, "id": 0, "ns": f"{db}.{coll}"}})
-
-
-def _create_user(data):
-    username = (
-        data.get("createUser")
-        or data.get("user")
-        or data.get("username")
-        or data.get("UserName")
-    )
-    if not username:
-        return error_response_json("InvalidParameter", "createUser/user required", 400)
-    users, _, _, _, _ = _get_state()
-    if any(
-        (u.get("user") == username or u.get("username") == username) for u in users
-    ):
-        return error_response_json("UserAlreadyExists", f"User {username} exists", 400)
-    uobj = {
-        "user": username,
-        "db": data.get("db") or data.get("database") or "admin",
-        "roles": data.get("roles", []),
-    }
-    users.append(uobj)
-    return json_response({"ok": 1})
-
-
-# --- Administrative commands (from documentdb-apis.md) ---
-
-def _coll_mod(data):
-    db = data.get("db") or data.get("database")
-    coll = data.get("collMod") or data.get("collection")
-    if not db or not coll:
-        return error_response_json("InvalidParameter", "db and collMod required", 400)
-    _, cols, _, _, _ = _get_state()
-    db_colls = cols.setdefault(db, {})
-    if coll not in db_colls:
-        return error_response_json("NamespaceNotFound", f"Collection {db}.{coll} does not exist", 404)
-    expire = data.get("expireAfterSeconds")
-    if expire is not None:
-        db_colls[coll]["expireAfterSeconds"] = expire
-    return json_response({"ok": 1})
-
-
-def _create(data):
-    db = data.get("db") or data.get("database")
-    coll = data.get("create") or data.get("collection")
-    if not db or not coll:
-        return error_response_json("InvalidParameter", "db and create required", 400)
-    _, cols, _, _, _ = _get_state()
-    db_colls = cols.setdefault(db, {})
-    if coll in db_colls:
-        return error_response_json("NamespaceExists", f"Collection {db}.{coll} already exists", 400)
-    db_colls[coll] = {"name": coll, "indexes": [], "options": data.get("options", {}), "documents": []}
-    return json_response({"ok": 1})
-
-
-def _create_indexes(data):
-    db = data.get("db") or data.get("database")
-    coll = data.get("createIndexes") or data.get("collection")
-    indexes = data.get("indexes") or []
-    if not db or not coll:
-        return error_response_json("InvalidParameter", "db and createIndexes required", 400)
-    _, cols, _, _, _ = _get_state()
-    db_colls = cols.setdefault(db, {})
-    col = db_colls.setdefault(coll, {"name": coll, "indexes": [], "options": {}, "documents": []})
-    for idx in indexes:
-        name = idx.get("name") or "_".join(str(k) for k in idx.get("key", {}).keys())
-        col["indexes"].append({"name": name, "key": idx.get("key", {}), "options": idx})
-    return json_response({"ok": 1, "numIndexesBefore": len(col["indexes"]) - len(indexes), "numIndexesAfter": len(col["indexes"])})
-
-
-def _current_op(data):
-    return json_response({"inprog": []})
-
-
-def _drop(data):
-    db = data.get("db") or data.get("database")
-    coll = data.get("drop") or data.get("collection")
-    if not db or not coll:
-        return error_response_json("InvalidParameter", "db and drop required", 400)
-    _, cols, _, _, _ = _get_state()
-    db_colls = cols.get(db, {})
-    if coll not in db_colls:
-        return error_response_json("NamespaceNotFound", f"Collection {db}.{coll} does not exist", 404)
-    del db_colls[coll]
-    return json_response({"ok": 1})
-
-
-def _drop_database(data):
-    db = data.get("dropDatabase") or data.get("db")
-    if not db:
-        return error_response_json("InvalidParameter", "dropDatabase required", 400)
-    _, cols, _, _, _ = _get_state()
-    if db in cols:
-        del cols[db]
-    return json_response({"ok": 1, "dropped": db})
-
-
-def _drop_indexes(data):
-    db = data.get("db") or data.get("database")
-    coll = data.get("dropIndexes") or data.get("collection")
-    index = data.get("index") or data.get("indexName")
-    if not db or not coll or not index:
-        return error_response_json("InvalidParameter", "db, dropIndexes and index required", 400)
-    _, cols, _, _, _ = _get_state()
-    db_colls = cols.get(db, {})
-    col = db_colls.get(coll)
-    if not col:
-        return error_response_json("NamespaceNotFound", f"Collection {db}.{coll} does not exist", 404)
-    before = len(col["indexes"])
-    col["indexes"] = [i for i in col["indexes"] if i.get("name") != index]
-    return json_response({"ok": 1, "nIndexesWas": before, "nIndexes": len(col["indexes"])})
-
-
-def _get_audit_config(data):
-    return json_response({"auditConfig": {}})
-
-
-def _kill_cursors(data):
-    return json_response({"cursorsKilled": []})
-
-
-def _kill_op(data):
-    return json_response({"ok": 1})
-
-
-def _list_collections(data):
-    db = data.get("db") or data.get("database")
-    if not db:
-        return error_response_json("InvalidParameter", "db required", 400)
-    _, cols, _, _, _ = _get_state()
-    col_list = list(cols.get(db, {}).values())
-    return json_response({"ok": 1, "cursor": {"firstBatch": [{"name": c["name"]} for c in col_list], "id": 0, "ns": f"{db}.$cmd.listCollections"}})
-
-
-def _list_databases(data):
-    _, cols, _, _, _ = _get_state()
-    dbs = [{"name": name, "sizeOnDisk": 0, "empty": False} for name in cols.keys()]
-    return json_response({"ok": 1, "databases": dbs, "totalSize": 0})
-
-
-def _list_indexes(data):
-    db = data.get("db") or data.get("database")
-    coll = data.get("listIndexes") or data.get("collection")
-    if not db or not coll:
-        return error_response_json("InvalidParameter", "db and listIndexes required", 400)
-    _, cols, _, _, _ = _get_state()
-    col = cols.get(db, {}).get(coll)
-    if not col:
-        return error_response_json("NamespaceNotFound", f"Collection {db}.{coll} does not exist", 404)
-    return json_response({"ok": 1, "cursor": {"firstBatch": col.get("indexes", []), "id": 0, "ns": f"{db}.{coll}"}})
-
-
-def _re_index(data):
-    db = data.get("db") or data.get("database")
-    coll = data.get("reIndex") or data.get("collection")
-    if not db or not coll:
-        return error_response_json("InvalidParameter", "db and reIndex required", 400)
-    _, cols, _, _, _ = _get_state()
-    col = cols.get(db, {}).get(coll)
-    if not col:
-        return error_response_json("NamespaceNotFound", f"Collection {db}.{coll} does not exist", 404)
-    return json_response({"ok": 1, "nIndexes": len(col.get("indexes", []))})
-
-
-def _rename_collection(data):
-    from_db = data.get("from")
-    to_coll = data.get("to")
-    if not from_db or not to_coll or "." not in from_db:
-        return error_response_json("InvalidParameter", "from (db.coll) and to required", 400)
-    db, coll = from_db.split(".", 1)
-    _, cols, _, _, _ = _get_state()
-    db_colls = cols.get(db, {})
-    if coll not in db_colls:
-        return error_response_json("NamespaceNotFound", f"Collection {db}.{coll} does not exist", 404)
-    del db_colls[coll]
-    return json_response({"ok": 1})
-
-
-def _set_audit_config(data):
-    return json_response({"ok": 1})
-
-
-# --- helpers for query/agg over in-memory documents ---
-
-def _match_value(doc_val, cond):
-    if isinstance(cond, dict):
-        for op, val in cond.items():
-            if op == "$all":
-                if not isinstance(doc_val, (list, tuple)):
-                    return False
-                for item in val or []:
-                    if item not in doc_val:
-                        return False
-                continue
-            if op == "$elemMatch":
-                if not isinstance(doc_val, (list, tuple)):
-                    return False
-                matched = False
-                em = val or {}
-                for item in doc_val:
-                    if isinstance(item, dict) and _doc_matches(item, em):
-                        matched = True
-                        break
-                    # also allow scalar elemMatch? treat as equality if not dict
-                    if not isinstance(em, dict) and item == em:
-                        matched = True
-                        break
-                if not matched:
-                    return False
-                continue
-            if op == "$size":
-                if not isinstance(doc_val, (list, tuple)):
-                    return False
-                try:
-                    if len(doc_val) != int(val):
-                        return False
-                except (TypeError, ValueError):
-                    return False
-                continue
-            if op in ("$bitsAllSet", "$bitsAnySet", "$bitsAllClear", "$bitsAnyClear"):
-                try:
-                    dv = int(doc_val) if doc_val is not None else 0
-                    mask = int(val)
-                except (TypeError, ValueError):
-                    return False
-                if op == "$bitsAllSet":
-                    if (dv & mask) != mask:
-                        return False
-                elif op == "$bitsAnySet":
-                    if (dv & mask) == 0:
-                        return False
-                elif op == "$bitsAllClear":
-                    if (dv & mask) != 0:
-                        return False
-                elif op == "$bitsAnyClear":
-                    if (dv & mask) == mask:
-                        return False
-                continue
-            # unknown operator in this context: fallthrough to direct compare below
-        # if cond was operator-only dict, consider matched unless a check failed above
-        return True
-    # direct value equality (or regex etc not required here)
-    return doc_val == cond
-
-
-def _doc_matches(doc, filt):
-    if not filt:
-        return True
-    for k, v in filt.items():
-        if k.startswith("$"):
-            if k == "$comment":
-                continue
-            if k == "$and":
-                if not isinstance(v, list):
-                    return False
-                for sub in v:
-                    if not _doc_matches(doc, sub):
-                        return False
-                continue
-            if k == "$or":
-                if not isinstance(v, list):
-                    return False
-                if not any(_doc_matches(doc, sub) for sub in v):
-                    return False
-                continue
-            if k == "$nor":
-                if not isinstance(v, list):
-                    return False
-                if any(_doc_matches(doc, sub) for sub in v):
-                    return False
-                continue
-            if k == "$not":
-                if not isinstance(v, dict):
-                    return False
-                if _doc_matches(doc, v):
-                    return False
-                continue
-            # other top-level $ (e.g. $expr) ignored for matching in this emulator
-            continue
-        # field condition
-        doc_val = doc.get(k)
-        if not _match_value(doc_val, v):
-            return False
-    return True
-
-
-def _run_pipeline(docs, pipeline):
-    res = list(docs)
-    for stage in pipeline or []:
-        if "$match" in stage:
-            m = stage["$match"]
-            res = [d for d in res if _doc_matches(d, m)]
-        elif "$project" in stage:
-            p = stage["$project"]
-            res = [{k: d.get(k) for k in p if p.get(k)} for d in res]
-        elif "$limit" in stage:
-            res = res[: int(stage["$limit"])]
-        elif "$skip" in stage:
-            res = res[int(stage["$skip"]):]
-        elif "$sort" in stage:
-            s = stage["$sort"]
-            for k, direc in reversed(list(s.items())):
-                res = sorted(res, key=lambda d: (d.get(k) if d.get(k) is not None else ""), reverse=(direc < 0))
-    return res
-
-
-# --- Aggregation ---
-
-def _aggregate(data):
-    db = data.get("db") or data.get("database")
-    coll = data.get("aggregate") or data.get("collection")
-    pipeline = data.get("pipeline", [])
-    if not db or not coll:
-        return error_response_json("InvalidParameter", "db and aggregate required", 400)
-    _, cols, _, _, _ = _get_state()
-    col = cols.get(db, {}).get(coll) or {"documents": []}
-    docs = _run_pipeline(col.get("documents", []), pipeline)
-    return json_response({"ok": 1, "cursor": {"firstBatch": docs, "id": 0, "ns": f"{db}.{coll}"}})
-
-
-def _count(data):
-    db = data.get("db") or data.get("database")
-    coll = data.get("count") or data.get("collection")
-    query = data.get("query", {})
-    if not db or not coll:
-        return error_response_json("InvalidParameter", "db and count required", 400)
-    _, cols, _, _, _ = _get_state()
-    col = cols.get(db, {}).get(coll) or {"documents": []}
-    n = sum(1 for d in col.get("documents", []) if _doc_matches(d, query))
-    return json_response({"ok": 1, "n": n})
-
-
-def _distinct(data):
-    db = data.get("db") or data.get("database")
-    coll = data.get("distinct") or data.get("collection")
-    key = data.get("key")
-    if not db or not coll or not key:
-        return error_response_json("InvalidParameter", "db, distinct and key required", 400)
-    _, cols, _, _, _ = _get_state()
-    col = cols.get(db, {}).get(coll) or {"documents": []}
-    vals = []
-    seen = set()
-    for d in col.get("documents", []):
-        v = d.get(key)
-        if v not in seen:
-            seen.add(v)
-            vals.append(v)
-    return json_response({"ok": 1, "values": vals})
-
-
-# --- Authentication ---
-
-def _authenticate(data):
-    return json_response({"ok": 1})
-
-
-def _logout(data):
-    return json_response({"ok": 1})
-
-
-# --- Diagnostic commands ---
-
-def _build_info(data):
-    return json_response({"ok": 1, "version": "5.0.0", "versionArray": [5, 0, 0], "storageEngines": ["docdb"]})
-
-
-def _coll_stats(data):
-    db = data.get("db") or data.get("database")
-    coll = data.get("collStats") or data.get("collection")
-    if not db or not coll:
-        return error_response_json("InvalidParameter", "db and collStats required", 400)
-    _, cols, _, _, _ = _get_state()
-    col = cols.get(db, {}).get(coll) or {"documents": [], "indexes": []}
-    n = len(col.get("documents", []))
-    return json_response({"ok": 1, "ns": f"{db}.{coll}", "count": n, "size": n * 128, "nindexes": len(col.get("indexes", []))})
-
-
-def _connection_status(data):
-    return json_response({"ok": 1, "authInfo": {"authenticatedUsers": [], "authenticatedUserRoles": []}})
-
-
-def _data_size(data):
-    db = data.get("db") or data.get("database")
-    coll = data.get("dataSize") or data.get("collection")
-    if not db or not coll:
-        return error_response_json("InvalidParameter", "db and dataSize required", 400)
-    _, cols, _, _, _ = _get_state()
-    col = cols.get(db, {}).get(coll) or {"documents": []}
-    n = len(col.get("documents", []))
-    return json_response({"ok": 1, "size": n * 128, "numObjects": n})
-
-
-def _db_stats(data):
-    db = data.get("db") or data.get("database") or data.get("dbStats")
-    _, cols, _, _, _ = _get_state()
-    dcols = cols.get(db, {}) if db else {}
-    total = 0
-    for c in dcols.values():
-        total += len(c.get("documents", []))
-    return json_response({"ok": 1, "db": db or "admin", "collections": len(dcols), "objects": total, "dataSize": total * 128})
-
-
-def _explain(data):
-    return json_response({"ok": 1, "queryPlanner": {"plannerVersion": 1, "winningPlan": {"stage": "COLLSCAN"}}})
-
-
-def _host_info(data):
-    return json_response({"ok": 1, "system": {"currentTime": "2026-01-01T00:00:00.000Z"}, "os": {}, "extra": {}})
-
-
-def _list_commands(data):
-    return json_response({"ok": 1, "commands": {}})
-
-
-def _profiler(data):
-    return json_response({"ok": 1, "was": 0, "slowms": 100})
-
-
-def _server_status(data):
-    return json_response({"ok": 1, "version": "5.0.0", "process": "docdb", "connections": {"current": 1}})
-
-
-def _top(data):
-    return json_response({"ok": 1, "totals": {}})
-
-
-# --- Query and write operations ---
-
-def _insert(data):
-    db = data.get("db") or data.get("database")
-    coll = data.get("insert") or data.get("collection")
-    docs = data.get("documents") or []
-    if not db or not coll:
-        return error_response_json("InvalidParameter", "db and insert required", 400)
-    _, cols, _, _, _ = _get_state()
-    db_colls = cols.setdefault(db, {})
-    col = db_colls.setdefault(coll, {"name": coll, "indexes": [], "options": {}, "documents": []})
-    col["documents"].extend([dict(x) for x in docs])
-    return json_response({"ok": 1, "n": len(docs)})
-
-
-def _update(data):
-    db = data.get("db") or data.get("database")
-    coll = data.get("update") or data.get("collection")
-    q = data.get("q") or data.get("filter") or {}
-    u = data.get("u") or data.get("update") or {}
-    multi = bool(data.get("multi"))
-    if not db or not coll:
-        return error_response_json("InvalidParameter", "db and update required", 400)
-    _, cols, _, _, _ = _get_state()
-    col = cols.get(db, {}).get(coll)
-    if not col:
-        return json_response({"ok": 1, "nModified": 0})
-    n = 0
-    for d in col.get("documents", []):
-        if _doc_matches(d, q):
-            d.update(u)
-            n += 1
-            if not multi:
-                break
-    return json_response({"ok": 1, "nModified": n})
-
-
-def _delete(data):
-    db = data.get("db") or data.get("database")
-    coll = data.get("delete") or data.get("collection")
-    q = data.get("q") or data.get("filter") or {}
-    limit = int(data.get("limit") or 0)
-    if not db or not coll:
-        return error_response_json("InvalidParameter", "db and delete required", 400)
-    _, cols, _, _, _ = _get_state()
-    col = cols.get(db, {}).get(coll)
-    if not col:
-        return json_response({"ok": 1, "n": 0})
-    kept = []
-    removed = 0
-    for d in col.get("documents", []):
-        if _doc_matches(d, q) and (limit == 0 or removed < limit):
-            removed += 1
-            continue
-        kept.append(d)
-    col["documents"] = kept
-    return json_response({"ok": 1, "n": removed})
-
-
-def _find_and_modify(data):
-    db = data.get("db") or data.get("database")
-    coll = data.get("findAndModify") or data.get("collection")
-    q = data.get("query") or data.get("filter") or {}
-    u = data.get("update") or {}
-    upsert = bool(data.get("upsert"))
-    if not db or not coll:
-        return error_response_json("InvalidParameter", "db and findAndModify required", 400)
-    _, cols, _, _, _ = _get_state()
-    col = cols.get(db, {}).get(coll)
-    if not col:
-        col = cols.setdefault(db, {}).setdefault(coll, {"name": coll, "indexes": [], "options": {}, "documents": []})
-    for d in col.get("documents", []):
-        if _doc_matches(d, q):
-            old = dict(d)
-            d.update(u)
-            return json_response({"ok": 1, "value": old})
-    if upsert:
-        newd = dict(q)
-        newd.update(u)
-        col.setdefault("documents", []).append(newd)
-        return json_response({"ok": 1, "value": None, "lastErrorObject": {"updatedExisting": False}})
-    return json_response({"ok": 1, "value": None})
-
-
-def _get_more(data):
-    return json_response({"ok": 1, "cursor": {"id": 0, "nextBatch": []}})
-
-
-def _replace_one(data):
-    db = data.get("db") or data.get("database")
-    coll = data.get("replaceOne") or data.get("collection") or data.get("replace")
-    q = data.get("filter") or data.get("q") or {}
-    repl = data.get("replacement") or data.get("u") or {}
-    if not db or not coll:
-        return error_response_json("InvalidParameter", "db and replaceOne required", 400)
-    _, cols, _, _, _ = _get_state()
-    col = cols.get(db, {}).get(coll)
-    if not col:
-        col = cols.setdefault(db, {}).setdefault(coll, {"name": coll, "indexes": [], "options": {}, "documents": []})
-    for i, d in enumerate(col.get("documents", [])):
-        if _doc_matches(d, q):
-            col["documents"][i] = dict(repl)
-            return json_response({"ok": 1, "nModified": 1})
-    col.setdefault("documents", []).append(dict(repl))
-    return json_response({"ok": 1, "nModified": 0, "nUpserted": 1})
-
-
-# --- Role management commands ---
-
-def _create_role(data):
-    db = data.get("db") or data.get("database")
-    role = data.get("createRole") or data.get("role")
-    if not db or not role:
-        return error_response_json("InvalidParameter", "db and createRole required", 400)
-    _, _, roles, _, _ = _get_state()
-    db_roles = roles.setdefault(db, {})
-    if role in db_roles:
-        return error_response_json("RoleAlreadyExists", f"Role {role} already exists", 400)
-    db_roles[role] = {
-        "role": role,
-        "db": db,
-        "privileges": data.get("privileges", []),
-        "roles": data.get("roles", []),
-    }
-    return json_response({"ok": 1})
-
-
-def _drop_role(data):
-    db = data.get("db") or data.get("database")
-    role = data.get("dropRole") or data.get("role")
-    if not db or not role:
-        return error_response_json("InvalidParameter", "db and dropRole required", 400)
-    _, _, roles, _, _ = _get_state()
-    db_roles = roles.get(db, {})
-    if role not in db_roles:
-        return error_response_json("RoleNotFound", f"Role {role} not found", 404)
-    del db_roles[role]
-    return json_response({"ok": 1})
-
-
-def _drop_all_roles_from_database(data):
-    db = data.get("dropAllRolesFromDatabase") or data.get("db")
-    if not db:
-        return error_response_json("InvalidParameter", "dropAllRolesFromDatabase required", 400)
-    _, _, roles, _, _ = _get_state()
-    roles.pop(db, None)
-    return json_response({"ok": 1})
-
-
-def _grant_roles_to_role(data):
-    db = data.get("db") or data.get("database")
-    role = data.get("grantRolesToRole") or data.get("role")
-    to_grant = data.get("roles", [])
-    if not db or not role:
-        return error_response_json("InvalidParameter", "db and grantRolesToRole required", 400)
-    _, _, roles, _, _ = _get_state()
-    db_roles = roles.setdefault(db, {})
-    if role not in db_roles:
-        db_roles[role] = {"role": role, "db": db, "privileges": [], "roles": []}
-    db_roles[role].setdefault("roles", []).extend(to_grant)
-    return json_response({"ok": 1})
-
-
-def _revoke_roles_from_role(data):
-    db = data.get("db") or data.get("database")
-    role = data.get("revokeRolesFromRole") or data.get("role")
-    to_revoke = data.get("roles", [])
-    if not db or not role:
-        return error_response_json("InvalidParameter", "db and revokeRolesFromRole required", 400)
-    _, _, roles, _, _ = _get_state()
-    r = roles.get(db, {}).get(role)
-    if r and "roles" in r:
-        r["roles"] = [x for x in r.get("roles", []) if x not in to_revoke]
-    return json_response({"ok": 1})
-
-
-def _revoke_privileges_from_role(data):
-    db = data.get("db") or data.get("database")
-    role = data.get("revokePrivilegesFromRole") or data.get("role")
-    if not db or not role:
-        return error_response_json("InvalidParameter", "db and revokePrivilegesFromRole required", 400)
-    _, _, roles, _, _ = _get_state()
-    r = roles.get(db, {}).get(role)
-    if r:
-        r["privileges"] = []
-    return json_response({"ok": 1})
-
-
-def _roles_info(data):
-    db = data.get("db") or data.get("database")
-    role = data.get("role")
-    _, _, roles, _, _ = _get_state()
-    if db:
-        if role:
-            r = roles.get(db, {}).get(role)
-            return json_response({"ok": 1, "roles": [r] if r else []})
-        return json_response({"ok": 1, "roles": list(roles.get(db, {}).values())})
-    allr = []
-    for dbr in roles.values():
-        allr.extend(dbr.values())
-    return json_response({"ok": 1, "roles": allr})
-
-
-def _update_role(data):
-    db = data.get("db") or data.get("database")
-    role = data.get("updateRole") or data.get("role")
-    if not db or not role:
-        return error_response_json("InvalidParameter", "db and updateRole required", 400)
-    _, _, roles, _, _ = _get_state()
-    db_roles = roles.setdefault(db, {})
-    if role not in db_roles:
-        db_roles[role] = {"role": role, "db": db, "privileges": [], "roles": []}
-    if "privileges" in data:
-        db_roles[role]["privileges"] = data["privileges"]
-    if "roles" in data:
-        db_roles[role]["roles"] = data["roles"]
-    return json_response({"ok": 1})
-
-
-# --- Sessions commands ---
-
-def _start_session(data):
-    _, _, _, sessions, _ = _get_state()
-    sid = new_uuid()
-    sessions[sid] = {"id": sid, "active": True}
-    return json_response({"ok": 1, "id": {"id": sid, "uid": "0"}})
-
-
-def _abort_transaction(data):
-    return json_response({"ok": 1})
-
-
-def _commit_transaction(data):
-    return json_response({"ok": 1})
-
-
-def _kill_sessions(data):
-    _, _, _, sessions, _ = _get_state()
-    ids = data.get("killSessions") or data.get("sessions") or []
-    for sid in ids:
-        sessions.pop(sid, None)
-    return json_response({"ok": 1})
-
-
-def _kill_all_sessions(data):
-    _, _, _, sessions, _ = _get_state()
-    sessions.clear()
-    return json_response({"ok": 1})
-
-
-# --- User management commands ---
-
-def _drop_user(data):
-    username = data.get("dropUser") or data.get("user")
-    if not username:
-        return error_response_json("InvalidParameter", "dropUser/user required", 400)
-    users, _, _, _, _ = _get_state()
-    before = len(users)
-    users[:] = [u for u in users if not (u.get("user") == username or u.get("username") == username)]
-    if len(users) == before:
-        return error_response_json("UserNotFound", f"User {username} not found", 404)
-    return json_response({"ok": 1})
-
-
-def _drop_all_users_from_database(data):
-    db = data.get("dropAllUsersFromDatabase") or data.get("db")
-    if not db:
-        return error_response_json("InvalidParameter", "dropAllUsersFromDatabase required", 400)
-    users, _, _, _, _ = _get_state()
-    users[:] = [u for u in users if u.get("db") != db]
-    return json_response({"ok": 1})
-
-
-def _grant_roles_to_user(data):
-    username = data.get("grantRolesToUser") or data.get("user")
-    to_grant = data.get("roles", [])
-    if not username:
-        return error_response_json("InvalidParameter", "grantRolesToUser/user required", 400)
-    users, _, _, _, _ = _get_state()
-    for u in users:
-        if u.get("user") == username or u.get("username") == username:
-            u.setdefault("roles", []).extend(to_grant)
-            return json_response({"ok": 1})
-    return error_response_json("UserNotFound", f"User {username} not found", 404)
-
-
-def _revoke_roles_from_user(data):
-    username = data.get("revokeRolesFromUser") or data.get("user")
-    to_revoke = data.get("roles", [])
-    if not username:
-        return error_response_json("InvalidParameter", "revokeRolesFromUser/user required", 400)
-    users, _, _, _, _ = _get_state()
-    for u in users:
-        if u.get("user") == username or u.get("username") == username:
-            if "roles" in u:
-                u["roles"] = [r for r in u.get("roles", []) if r not in to_revoke]
-            return json_response({"ok": 1})
-    return error_response_json("UserNotFound", f"User {username} not found", 404)
-
-
-def _update_user(data):
-    username = data.get("updateUser") or data.get("user")
-    if not username:
-        return error_response_json("InvalidParameter", "updateUser/user required", 400)
-    users, _, _, _, _ = _get_state()
-    for u in users:
-        if u.get("user") == username or u.get("username") == username:
-            if "roles" in data:
-                u["roles"] = data["roles"]
-            if "pwd" in data or "password" in data:
-                u["password"] = data.get("pwd") or data.get("password")
-            return json_response({"ok": 1})
-    return error_response_json("UserNotFound", f"User {username} not found", 404)
-
-
-def _users_info(data):
-    username = data.get("usersInfo") or data.get("user")
-    users, _, _, _, _ = _get_state()
-    if username:
-        matches = [u for u in users if (u.get("user") == username or u.get("username") == username)]
-        return json_response({"ok": 1, "users": matches})
-    return json_response({"ok": 1, "users": list(users)})
-
-
-# --- Sharding commands ---
-
-def _enable_sharding(data):
-    db = data.get("enableSharding") or data.get("db") or data.get("database")
-    if not db:
-        return error_response_json("InvalidParameter", "enableSharding/db required", 400)
-    _, _, _, _, sharded = _get_state()
-    sharded[db] = {"sharded": True, "collections": {}}
-    return json_response({"ok": 1})
-
-
-def _shard_collection(data):
-    coll = data.get("shardCollection") or data.get("collection")
-    key = data.get("key")
-    if not coll:
-        return error_response_json("InvalidParameter", "shardCollection required", 400)
-    _, _, _, _, sharded = _get_state()
-    if "." in coll:
-        db, cname = coll.split(".", 1)
+    params = dict(query_params)
+    if method == "POST" and body:
+        raw = body if isinstance(body, str) else body.decode("utf-8-sig", errors="replace")
+        stripped = raw.lstrip()
+        ct = (headers.get("content-type") or headers.get("Content-Type") or "").lower()
+        merged_json = False
+        if stripped.startswith("{") or ("json" in ct and stripped):
+            try:
+                payload = json.loads(stripped)
+                if isinstance(payload, dict):
+                    _flatten_json_request_params(params, payload)
+                    merged_json = True
+            except json.JSONDecodeError:
+                pass
+        if not merged_json:
+            form_params = parse_qs(raw)
+            for k, v in form_params.items():
+                params[k] = v
+
+    target = headers.get("x-amz-target", "") or headers.get("X-Amz-Target", "")
+    if target:
+        action = target.split(".")[-1]
     else:
-        db = "admin"
-        cname = coll
-    db_shard = sharded.setdefault(db, {"sharded": True, "collections": {}})
-    db_shard.setdefault("collections", {})[cname] = {"key": key or {}, "sharded": True}
-    return json_response({"ok": 1})
+        action = _p(params, "Action")
+
+    handler = _ACTION_MAP.get(action)
+    if not handler:
+        return _error("InvalidAction", f"Unknown DocumentDB action: {action}", 400)
+    return handler(params)
+
+
+# ---------------------------------------------------------------------------
+# Instance resolution helpers
+# ---------------------------------------------------------------------------
+
+def _resolve_instance(db_id):
+    """Look up an instance by DBInstanceIdentifier or DbiResourceId."""
+    inst = _instances.get(db_id)
+    if inst:
+        return inst
+    if db_id.startswith("db-"):
+        for inst in _instances.values():
+            if inst.get("DbiResourceId") == db_id:
+                return inst
+    return None
+
+
+def _register_instance_in_cluster(instance):
+    """Append instance to parent cluster ``DBClusterMembers``."""
+    cid = instance.get("DBClusterIdentifier")
+    if not cid:
+        return
+    cluster = _clusters.get(cid)
+    if not cluster:
+        return
+    members = cluster.setdefault("DBClusterMembers", [])
+    db_id = instance["DBInstanceIdentifier"]
+    members[:] = [m for m in members if m.get("DBInstanceIdentifier") != db_id]
+    any_writer = any(m.get("IsClusterWriter") for m in members)
+    is_writer = not any_writer
+    members.append({
+        "DBInstanceIdentifier": db_id,
+        "IsClusterWriter": is_writer,
+        "PromotionTier": int(instance.get("PromotionTier", 1)),
+    })
+
+
+def _unregister_instance_from_clusters(db_id):
+    """Remove instance from any cluster member list."""
+    for cl in _clusters.values():
+        mem = cl.get("DBClusterMembers") or []
+        cl["DBClusterMembers"] = [m for m in mem if m.get("DBInstanceIdentifier") != db_id]
+
+
+# ---------------------------------------------------------------------------
+# DB Instances
+# ---------------------------------------------------------------------------
+
+def _create_db_instance(p):
+    db_id = _p(p, "DBInstanceIdentifier")
+    if not db_id:
+        return _error("MissingParameter", "DBInstanceIdentifier is required", 400)
+    if db_id in _instances:
+        return _error("DBInstanceAlreadyExistsFault", f"DB instance {db_id} already exists", 400)
+
+    engine = "docdb"
+    engine_version = _p(p, "EngineVersion") or _default_engine_version(engine)
+    db_class = _p(p, "DBInstanceClass") or "db.t3.medium"
+    master_user = _p(p, "MasterUsername") or "root"
+    master_pass = _p(p, "MasterUserPassword") or "password"
+    db_name = _p(p, "DBName") or "admin"
+    port = int(_p(p, "Port") or "27017")
+
+    cluster_id_param = _p(p, "DBClusterIdentifier")
+    if cluster_id_param and cluster_id_param in _clusters:
+        parent = _clusters[cluster_id_param]
+        if not _p(p, "MasterUsername"):
+            master_user = parent.get("MasterUsername", master_user)
+        if not _p(p, "MasterUserPassword"):
+            master_pass = parent.get("_MasterUserPassword", master_pass)
+
+    allocated_storage = int(_p(p, "AllocatedStorage") or "20")
+    storage_type = _p(p, "StorageType") or "gp2"
+    subnet_group_name = _p(p, "DBSubnetGroupName") or "default"
+
+    arn = f"arn:aws:rds:{get_region()}:{get_account_id()}:db:{db_id}"
+    dbi_resource_id = f"db-{new_uuid().replace('-', '')[:20].upper()}"
+    endpoint_host = "localhost"
+    endpoint_port = port
+    docker_container_id = None
+    internal_host = None
+    internal_port = None
+
+    docker_client = _get_docker()
+    if docker_client:
+        host_port = _next_port()
+        endpoint_port = host_port
+        ms_network = _get_ministack_network(docker_client)
+        image, env, container_port, data_path = _docker_image_for_docdb(
+            engine_version, master_user, master_pass, db_name
+        )
+        if image:
+            try:
+                container_kwargs = dict(
+                    image=image, detach=True,
+                    environment=env,
+                    ports={f"{container_port}/tcp": host_port},
+                    name=f"ministack-docdb-{db_id}",
+                    labels={"ministack": "documentdb", "db_id": db_id},
+                )
+                if ms_network:
+                    container_kwargs["network"] = ms_network
+                if DOCDB_PERSIST:
+                    container_kwargs["volumes"] = {
+                        f"ministack-docdb-{db_id}-data": {"bind": data_path, "mode": "rw"},
+                    }
+                else:
+                    container_kwargs["tmpfs"] = {
+                        data_path: f"rw,noexec,nosuid,size={DOCDB_TMPFS_SIZE}",
+                    }
+                container = docker_client.containers.run(**container_kwargs)
+                docker_container_id = container.id
+                if ms_network:
+                    container.reload()
+                    networks = container.attrs.get(
+                        "NetworkSettings", {}).get("Networks", {})
+                    container_ip = networks.get(
+                        ms_network, {}).get("IPAddress", "")
+                    if container_ip:
+                        internal_host = container_ip
+                        internal_port = container_port
+                        endpoint_host = container_ip
+                        endpoint_port = container_port
+                        def _bg_wait(cip=container_ip, cport=container_port,
+                                     did=db_id, net=ms_network):
+                            if _wait_for_port(cip, cport):
+                                logger.info(
+                                    "docdb: mongo container for %s ready at "
+                                    "%s:%s (network %s)", did, cip, cport, net)
+                            else:
+                                logger.warning(
+                                    "docdb: mongo container for %s at %s:%s "
+                                    "not ready after timeout", did, cip, cport)
+                        threading.Thread(target=_bg_wait, daemon=True).start()
+                    else:
+                        logger.info(
+                            "docdb: started mongo container for %s on port %s",
+                            db_id, host_port)
+                else:
+                    def _bg_wait_port(hp=host_port, did=db_id):
+                        if _wait_for_port("127.0.0.1", hp):
+                            logger.info("docdb: mongo container for %s ready on port %s", did, hp)
+                        else:
+                            logger.warning("docdb: mongo container for %s on port %s not ready after timeout", did, hp)
+                    threading.Thread(target=_bg_wait_port, daemon=True).start()
+            except Exception as e:
+                logger.warning("docdb: Docker failed for %s: %s", db_id, e)
+
+    cluster_id = _p(p, "DBClusterIdentifier")
+    now_ts = time.time()
+
+    vpc_sgs = _parse_member_list(p, "VpcSecurityGroupIds")
+    vpc_sg_list = [{"VpcSecurityGroupId": sg, "Status": "active"} for sg in vpc_sgs] if vpc_sgs else []
+
+    subnet_group = _subnet_groups.get(subnet_group_name, {
+        "DBSubnetGroupName": subnet_group_name,
+        "DBSubnetGroupDescription": "default",
+        "SubnetGroupStatus": "Complete",
+        "Subnets": [],
+        "VpcId": "vpc-00000000",
+        "DBSubnetGroupArn": f"arn:aws:rds:{get_region()}:{get_account_id()}:subgrp:{subnet_group_name}",
+    })
+
+    instance = {
+        "DBInstanceIdentifier": db_id,
+        "DBInstanceClass": db_class,
+        "Engine": engine,
+        "EngineVersion": engine_version,
+        "DBInstanceStatus": "available",
+        "MasterUsername": master_user,
+        "DBName": db_name,
+        "Endpoint": {
+            "Address": endpoint_host,
+            "Port": endpoint_port,
+            "HostedZoneId": "Z2R2ITUGPM61AM",
+        },
+        "AllocatedStorage": allocated_storage,
+        "InstanceCreateTime": _format_time(now_ts),
+        "PreferredBackupWindow": "03:00-04:00",
+        "BackupRetentionPeriod": int(_p(p, "BackupRetentionPeriod") or "1"),
+        "DBSecurityGroups": [],
+        "VpcSecurityGroups": vpc_sg_list,
+        "DBParameterGroups": [{
+            "DBParameterGroupName": f"default.docdb{engine_version.split('.')[0]}",
+            "ParameterApplyStatus": "in-sync",
+        }],
+        "AvailabilityZone": _p(p, "AvailabilityZone") or f"{get_region()}a",
+        "DBSubnetGroup": subnet_group,
+        "PreferredMaintenanceWindow": _p(p, "PreferredMaintenanceWindow") or "sun:05:00-sun:06:00",
+        "PendingModifiedValues": {},
+        "LatestRestorableTime": _format_time(now_ts),
+        "MultiAZ": _p(p, "MultiAZ") == "true",
+        "AutoMinorVersionUpgrade": _p(p, "AutoMinorVersionUpgrade") != "false",
+        "ReadReplicaDBInstanceIdentifiers": [],
+        "ReadReplicaSourceDBInstanceIdentifier": "",
+        "ReadReplicaDBClusterIdentifiers": [],
+        "ReplicaMode": "",
+        "LicenseModel": "docdb",
+        "Iops": int(_p(p, "Iops") or "0") if _p(p, "Iops") else None,
+        "OptionGroupMemberships": [],
+        "CharacterSetName": "",
+        "NcharCharacterSetName": "",
+        "SecondaryAvailabilityZone": "",
+        "PubliclyAccessible": _p(p, "PubliclyAccessible") == "true",
+        "StatusInfos": [],
+        "StorageType": storage_type,
+        "TdeCredentialArn": "",
+        "DbInstancePort": 0,
+        "DBClusterIdentifier": cluster_id,
+        "StorageEncrypted": _p(p, "StorageEncrypted") == "true",
+        "KmsKeyId": _p(p, "KmsKeyId") or "",
+        "DbiResourceId": dbi_resource_id,
+        "CACertificateIdentifier": "rds-ca-rsa2048-g1",
+        "DomainMemberships": [],
+        "CopyTagsToSnapshot": _p(p, "CopyTagsToSnapshot") == "true",
+        "MonitoringInterval": int(_p(p, "MonitoringInterval") or "0"),
+        "EnhancedMonitoringResourceArn": "",
+        "MonitoringRoleArn": _p(p, "MonitoringRoleArn") or "",
+        "PromotionTier": int(_p(p, "PromotionTier") or "1"),
+        "DBInstanceArn": arn,
+        "Timezone": "",
+        "IAMDatabaseAuthenticationEnabled": _p(p, "EnableIAMDatabaseAuthentication") == "true",
+        "PerformanceInsightsEnabled": False,
+        "PerformanceInsightsKMSKeyId": "",
+        "PerformanceInsightsRetentionPeriod": 7,
+        "EnabledCloudwatchLogsExports": [],
+        "ProcessorFeatures": [],
+        "DeletionProtection": _p(p, "DeletionProtection") == "true",
+        "AssociatedRoles": [],
+        "MaxAllocatedStorage": int(_p(p, "MaxAllocatedStorage") or str(allocated_storage)),
+        "TagList": [],
+        "CustomerOwnedIpEnabled": False,
+        "ActivityStreamStatus": "stopped",
+        "BackupTarget": "region",
+        "NetworkType": "IPV4",
+        "StorageThroughput": 0,
+        "CertificateDetails": {
+            "CAIdentifier": "rds-ca-rsa2048-g1",
+            "ValidTill": "2061-01-01T00:00:00Z",
+        },
+        "IsStorageConfigUpgradeAvailable": False,
+        "MultiTenant": False,
+        "_docker_container_id": docker_container_id,
+        "_internal_address": internal_host,
+        "_internal_port": internal_port,
+        "_MasterUserPassword": master_pass,
+    }
+    _instances[db_id] = instance
+    _register_instance_in_cluster(instance)
+
+    req_tags = _parse_tags(p)
+    if req_tags:
+        _tags[arn] = req_tags
+        instance["TagList"] = req_tags
+
+    return _single_instance_response("CreateDBInstanceResponse", "CreateDBInstanceResult", instance)
+
+
+def _delete_db_instance(p):
+    db_id = _p(p, "DBInstanceIdentifier")
+    instance = _resolve_instance(db_id)
+    if not instance:
+        return _error("DBInstanceNotFound", f"DBInstance {db_id} not found.", 404)
+
+    _unregister_instance_from_clusters(db_id)
+
+    if instance.get("DeletionProtection"):
+        return _error("InvalidParameterCombination",
+            "Cannot delete a DB instance when DeletionProtection is enabled.", 400)
+
+    docker_client = _get_docker()
+    if docker_client and instance.get("_docker_container_id"):
+        try:
+            c = docker_client.containers.get(instance["_docker_container_id"])
+            c.stop(timeout=5)
+            c.remove(v=True)
+            logger.info("docdb: removed container for %s", db_id)
+        except Exception as e:
+            logger.warning("docdb: failed to remove container for %s: %s", db_id, e)
+
+    skip_snapshot = _p(p, "SkipFinalSnapshot") == "true"
+    final_snap_id = _p(p, "FinalDBSnapshotIdentifier")
+    if not skip_snapshot and final_snap_id:
+        _create_snapshot_internal(final_snap_id, instance)
+
+    instance["DBInstanceStatus"] = "deleting"
+    arn = instance["DBInstanceArn"]
+    _tags.pop(arn, None)
+    del _instances[db_id]
+    return _single_instance_response("DeleteDBInstanceResponse", "DeleteDBInstanceResult", instance)
+
+
+def _describe_db_instances(p):
+    db_id = _p(p, "DBInstanceIdentifier")
+    if db_id:
+        instance = _resolve_instance(db_id)
+        if not instance:
+            return _error("DBInstanceNotFound", f"DBInstance {db_id} not found.", 404)
+        instances = [instance]
+    else:
+        instances = list(_instances.values())
+        filters = _parse_filters(p)
+        if filters:
+            instances = _apply_instance_filters(instances, filters)
+
+    members = "".join(f"<DBInstance>{_instance_xml(i)}</DBInstance>" for i in instances)
+    return _xml(200, "DescribeDBInstancesResponse",
+        f"<DescribeDBInstancesResult><DBInstances>{members}</DBInstances></DescribeDBInstancesResult>")
+
+
+def _modify_db_instance(p):
+    db_id = _p(p, "DBInstanceIdentifier")
+    instance = _resolve_instance(db_id)
+    if not instance:
+        return _error("DBInstanceNotFound", f"DBInstance {db_id} not found.", 404)
+
+    apply_immediately = _p(p, "ApplyImmediately") == "true"
+
+    field_map = {
+        "DBInstanceClass": "DBInstanceClass",
+        "AllocatedStorage": "AllocatedStorage",
+        "MasterUserPassword": None,
+        "MultiAZ": "MultiAZ",
+        "EngineVersion": "EngineVersion",
+        "StorageType": "StorageType",
+        "Iops": "Iops",
+        "BackupRetentionPeriod": "BackupRetentionPeriod",
+        "PreferredBackupWindow": "PreferredBackupWindow",
+        "PreferredMaintenanceWindow": "PreferredMaintenanceWindow",
+        "PubliclyAccessible": "PubliclyAccessible",
+        "DeletionProtection": "DeletionProtection",
+        "MaxAllocatedStorage": "MaxAllocatedStorage",
+    }
+
+    pending = {}
+    for param_key, instance_key in field_map.items():
+        val = _p(p, param_key)
+        if not val:
+            continue
+        if instance_key is None:
+            continue
+        if param_key in ("AllocatedStorage", "BackupRetentionPeriod",
+                         "Iops", "MaxAllocatedStorage"):
+            val = int(val)
+        elif param_key in ("MultiAZ", "PubliclyAccessible", "DeletionProtection"):
+            val = val == "true"
+
+        if apply_immediately:
+            instance[instance_key] = val
+        else:
+            pending[instance_key] = val
+
+    new_pass = _p(p, "MasterUserPassword")
+    if new_pass:
+        old_pass = instance.get("_MasterUserPassword", "password")
+        instance["_MasterUserPassword"] = new_pass
+        # Password rotation against real mongo container is a future enhancement.
+        # For now we only update the recorded secret used at container creation time.
+
+    vpc_sgs = _parse_member_list(p, "VpcSecurityGroupIds")
+    if vpc_sgs:
+        instance["VpcSecurityGroups"] = [
+            {"VpcSecurityGroupId": sg, "Status": "active"} for sg in vpc_sgs
+        ]
+
+    if pending:
+        instance["PendingModifiedValues"] = pending
+
+    return _single_instance_response("ModifyDBInstanceResponse", "ModifyDBInstanceResult", instance)
+
+
+def _start_db_instance(p):
+    db_id = _p(p, "DBInstanceIdentifier")
+    instance = _resolve_instance(db_id)
+    if not instance:
+        return _error("DBInstanceNotFound", f"DBInstance {db_id} not found.", 404)
+    instance["DBInstanceStatus"] = "available"
+    return _single_instance_response("StartDBInstanceResponse", "StartDBInstanceResult", instance)
+
+
+def _stop_db_instance(p):
+    db_id = _p(p, "DBInstanceIdentifier")
+    instance = _resolve_instance(db_id)
+    if not instance:
+        return _error("DBInstanceNotFound", f"DBInstance {db_id} not found.", 404)
+    instance["DBInstanceStatus"] = "stopped"
+    return _single_instance_response("StopDBInstanceResponse", "StopDBInstanceResult", instance)
+
+
+def _reboot_db_instance(p):
+    db_id = _p(p, "DBInstanceIdentifier")
+    instance = _resolve_instance(db_id)
+    if not instance:
+        return _error("DBInstanceNotFound", f"DBInstance {db_id} not found.", 404)
+    instance["DBInstanceStatus"] = "available"
+    return _single_instance_response("RebootDBInstanceResponse", "RebootDBInstanceResult", instance)
+
+
+# ---------------------------------------------------------------------------
+# DB Clusters
+# ---------------------------------------------------------------------------
+
+def _create_db_cluster(p):
+    cluster_id = _p(p, "DBClusterIdentifier")
+    if not cluster_id:
+        return _error("MissingParameter", "DBClusterIdentifier is required", 400)
+    if cluster_id in _clusters:
+        return _error("DBClusterAlreadyExistsFault",
+            f"DB cluster {cluster_id} already exists.", 400)
+
+    engine = "docdb"
+    engine_version = _p(p, "EngineVersion") or _default_engine_version(engine)
+    port = int(_p(p, "Port") or "27017")
+    master_user = _p(p, "MasterUsername") or "root"
+    master_pass = _p(p, "MasterUserPassword") or "password"
+    arn = f"arn:aws:rds:{get_region()}:{get_account_id()}:cluster:{cluster_id}"
+    unique_suffix = new_uuid()[:8]
+    now_ts = time.time()
+
+    vpc_sgs = _parse_member_list(p, "VpcSecurityGroupIds")
+    vpc_sg_list = [{"VpcSecurityGroupId": sg, "Status": "active"} for sg in vpc_sgs] if vpc_sgs else []
+    az_list = _parse_member_list(p, "AvailabilityZones")
+    if not az_list:
+        az_list = [f"{get_region()}a", f"{get_region()}b", f"{get_region()}c"]
+
+    cluster = {
+        "DBClusterIdentifier": cluster_id,
+        "DBClusterArn": arn,
+        "Engine": engine,
+        "EngineVersion": engine_version,
+        "EngineMode": _p(p, "EngineMode") or "provisioned",
+        "Status": "available",
+        "MasterUsername": master_user,
+        "_MasterUserPassword": master_pass,
+        "DatabaseName": _p(p, "DatabaseName") or None,
+        "NetworkType": _p(p, "NetworkType") or "IPV4",
+        "EngineLifecycleSupport": _p(p, "EngineLifecycleSupport") or "open-source-rds-extended-support",
+        "Endpoint": f"{cluster_id}.cluster-{unique_suffix}.{get_region()}.docdb.amazonaws.com",
+        "ReaderEndpoint": f"{cluster_id}.cluster-ro-{unique_suffix}.{get_region()}.docdb.amazonaws.com",
+        "Port": port,
+        "MultiAZ": _p(p, "MultiAZ") == "true",
+        "AvailabilityZones": az_list,
+        "DBClusterMembers": [],
+        "VpcSecurityGroups": vpc_sg_list,
+        "DBSubnetGroup": _p(p, "DBSubnetGroupName") or "default",
+        "DBClusterParameterGroup": _p(p, "DBClusterParameterGroupName") or "default.docdb",
+        "BackupRetentionPeriod": int(_p(p, "BackupRetentionPeriod") or "1"),
+        "PreferredBackupWindow": _p(p, "PreferredBackupWindow") or "03:00-04:00",
+        "PreferredMaintenanceWindow": _p(p, "PreferredMaintenanceWindow") or "sun:05:00-sun:06:00",
+        "ClusterCreateTime": _format_time(now_ts),
+        "EarliestRestorableTime": _format_time(now_ts),
+        "LatestRestorableTime": _format_time(now_ts),
+        "StorageEncrypted": _p(p, "StorageEncrypted") == "true",
+        "KmsKeyId": _p(p, "KmsKeyId") or "",
+        "DeletionProtection": _p(p, "DeletionProtection") == "true",
+        "IAMDatabaseAuthenticationEnabled": _p(p, "EnableIAMDatabaseAuthentication") == "true",
+        "EnabledCloudwatchLogsExports": [],
+        "HttpEndpointEnabled": _p(p, "EnableHttpEndpoint") == "true",
+        "CopyTagsToSnapshot": _p(p, "CopyTagsToSnapshot") == "true",
+        "CrossAccountClone": False,
+        "DbClusterResourceId": f"cluster-{new_uuid().replace('-', '')[:20].upper()}",
+        "TagList": [],
+        "HostedZoneId": "Z2R2ITUGPM61AM",
+        "AssociatedRoles": [],
+        "ActivityStreamStatus": "stopped",
+        "AllocatedStorage": 1,
+        "Capacity": 0,
+        "ClusterScalabilityType": "standard",
+    }
+    _clusters[cluster_id] = cluster
+
+    req_tags = _parse_tags(p)
+    if req_tags:
+        _tags[arn] = req_tags
+        cluster["TagList"] = req_tags
+
+    return _xml(200, "CreateDBClusterResponse",
+        f"<CreateDBClusterResult><DBCluster>{_cluster_xml(cluster)}</DBCluster></CreateDBClusterResult>")
+
+
+def _delete_db_cluster(p):
+    cluster_id = _p(p, "DBClusterIdentifier")
+    cluster = _clusters.get(cluster_id)
+    if not cluster:
+        return _error("DBClusterNotFoundFault", f"DBCluster {cluster_id} not found.", 404)
+
+    if cluster.get("DeletionProtection"):
+        return _error("InvalidParameterCombination",
+            "Cannot delete a DB cluster when DeletionProtection is enabled.", 400)
+
+    cluster["Status"] = "deleting"
+    _tags.pop(cluster["DBClusterArn"], None)
+    del _clusters[cluster_id]
+    return _xml(200, "DeleteDBClusterResponse",
+        f"<DeleteDBClusterResult><DBCluster>{_cluster_xml(cluster)}</DBCluster></DeleteDBClusterResult>")
+
+
+def _describe_db_clusters(p):
+    cluster_id = _p(p, "DBClusterIdentifier")
+    if cluster_id:
+        cluster = _clusters.get(cluster_id)
+        if not cluster:
+            return _error("DBClusterNotFoundFault", f"DBCluster {cluster_id} not found.", 404)
+        clusters = [cluster]
+    else:
+        clusters = list(_clusters.values())
+        filters = _parse_filters(p)
+        if filters:
+            clusters = _apply_cluster_filters(clusters, filters)
+
+    members = "".join(f"<DBCluster>{_cluster_xml(c)}</DBCluster>" for c in clusters)
+    return _xml(200, "DescribeDBClustersResponse",
+        f"<DescribeDBClustersResult><DBClusters>{members}</DBClusters></DescribeDBClustersResult>")
+
+
+def _modify_db_cluster(p):
+    cluster_id = _p(p, "DBClusterIdentifier")
+    cluster = _clusters.get(cluster_id)
+    if not cluster:
+        return _error("DBClusterNotFoundFault", f"DBCluster {cluster_id} not found.", 404)
+
+    if _p(p, "EngineVersion"):
+        cluster["EngineVersion"] = _p(p, "EngineVersion")
+    if _p(p, "MasterUserPassword"):
+        new_pass = _p(p, "MasterUserPassword")
+        old_pass = cluster.get("_MasterUserPassword", "password")
+        cluster["_MasterUserPassword"] = new_pass
+    if _p(p, "Port"):
+        cluster["Port"] = int(_p(p, "Port"))
+    if _p(p, "BackupRetentionPeriod"):
+        cluster["BackupRetentionPeriod"] = int(_p(p, "BackupRetentionPeriod"))
+    if _p(p, "PreferredBackupWindow"):
+        cluster["PreferredBackupWindow"] = _p(p, "PreferredBackupWindow")
+    if _p(p, "PreferredMaintenanceWindow"):
+        cluster["PreferredMaintenanceWindow"] = _p(p, "PreferredMaintenanceWindow")
+    if _p(p, "DeletionProtection"):
+        cluster["DeletionProtection"] = _p(p, "DeletionProtection") == "true"
+    if _p(p, "EnableIAMDatabaseAuthentication"):
+        cluster["IAMDatabaseAuthenticationEnabled"] = _p(p, "EnableIAMDatabaseAuthentication") == "true"
+    if _p(p, "EnableHttpEndpoint"):
+        cluster["HttpEndpointEnabled"] = _p(p, "EnableHttpEndpoint") == "true"
+    if _p(p, "CopyTagsToSnapshot"):
+        cluster["CopyTagsToSnapshot"] = _p(p, "CopyTagsToSnapshot") == "true"
+
+    vpc_sgs = _parse_member_list(p, "VpcSecurityGroupIds")
+    if vpc_sgs:
+        cluster["VpcSecurityGroups"] = [
+            {"VpcSecurityGroupId": sg, "Status": "active"} for sg in vpc_sgs
+        ]
+
+    return _xml(200, "ModifyDBClusterResponse",
+        f"<ModifyDBClusterResult><DBCluster>{_cluster_xml(cluster)}</DBCluster></ModifyDBClusterResult>")
+
+
+def _start_db_cluster(p):
+    cluster_id = _p(p, "DBClusterIdentifier")
+    cluster = _clusters.get(cluster_id)
+    if not cluster:
+        return _error("DBClusterNotFoundFault", f"DBCluster {cluster_id} not found.", 404)
+    cluster["Status"] = "available"
+    return _xml(200, "StartDBClusterResponse",
+        f"<StartDBClusterResult><DBCluster>{_cluster_xml(cluster)}</DBCluster></StartDBClusterResult>")
+
+
+def _stop_db_cluster(p):
+    cluster_id = _p(p, "DBClusterIdentifier")
+    cluster = _clusters.get(cluster_id)
+    if not cluster:
+        return _error("DBClusterNotFoundFault", f"DBCluster {cluster_id} not found.", 404)
+    cluster["Status"] = "stopped"
+    return _xml(200, "StopDBClusterResponse",
+        f"<StopDBClusterResult><DBCluster>{_cluster_xml(cluster)}</DBCluster></StopDBClusterResult>")
+
+
+# ---------------------------------------------------------------------------
+# Snapshots (instance)
+# ---------------------------------------------------------------------------
+
+def _create_snapshot_internal(snap_id, instance):
+    arn = f"arn:aws:rds:{get_region()}:{get_account_id()}:snapshot:{snap_id}"
+    now_ts = time.time()
+    snap = {
+        "DBSnapshotIdentifier": snap_id,
+        "DBInstanceIdentifier": instance["DBInstanceIdentifier"],
+        "DBSnapshotArn": arn,
+        "Engine": instance["Engine"],
+        "EngineVersion": instance["EngineVersion"],
+        "SnapshotCreateTime": _format_time(now_ts),
+        "InstanceCreateTime": instance.get("InstanceCreateTime", _format_time(now_ts)),
+        "Status": "available",
+        "AllocatedStorage": instance.get("AllocatedStorage", 20),
+        "AvailabilityZone": instance.get("AvailabilityZone", f"{get_region()}a"),
+        "VpcId": "vpc-00000000",
+        "Port": instance.get("Endpoint", {}).get("Port", 27017),
+        "MasterUsername": instance.get("MasterUsername", "root"),
+        "DBName": instance.get("DBName", ""),
+        "SnapshotType": "manual",
+        "LicenseModel": instance.get("LicenseModel", "docdb"),
+        "StorageType": instance.get("StorageType", "gp2"),
+        "DBInstanceClass": instance.get("DBInstanceClass", "db.t3.medium"),
+        "StorageEncrypted": instance.get("StorageEncrypted", False),
+        "KmsKeyId": instance.get("KmsKeyId", ""),
+        "Encrypted": instance.get("StorageEncrypted", False),
+        "IAMDatabaseAuthenticationEnabled": instance.get("IAMDatabaseAuthenticationEnabled", False),
+        "PercentProgress": 100,
+        "DbiResourceId": instance.get("DbiResourceId", ""),
+        "TagList": list(_tags.get(instance.get("DBInstanceArn", ""), [])),
+        "OriginalSnapshotCreateTime": _format_time(now_ts),
+        "SnapshotDatabaseTime": _format_time(now_ts),
+        "SnapshotTarget": "region",
+    }
+    _snapshots[snap_id] = snap
+    return snap
+
+
+def _create_db_snapshot(p):
+    snap_id = _p(p, "DBSnapshotIdentifier")
+    db_id = _p(p, "DBInstanceIdentifier")
+    if not snap_id:
+        return _error("MissingParameter", "DBSnapshotIdentifier is required", 400)
+    if snap_id in _snapshots:
+        return _error("DBSnapshotAlreadyExists", f"Snapshot {snap_id} already exists.", 400)
+
+    instance = _resolve_instance(db_id)
+    if not instance:
+        return _error("DBInstanceNotFound", f"DBInstance {db_id} not found.", 404)
+
+    snap = _create_snapshot_internal(snap_id, instance)
+
+    req_tags = _parse_tags(p)
+    if req_tags:
+        _tags[snap["DBSnapshotArn"]] = req_tags
+        snap["TagList"] = req_tags
+
+    return _xml(200, "CreateDBSnapshotResponse",
+        f"<CreateDBSnapshotResult><DBSnapshot>{_snapshot_xml(snap)}</DBSnapshot></CreateDBSnapshotResult>")
+
+
+def _delete_db_snapshot(p):
+    snap_id = _p(p, "DBSnapshotIdentifier")
+    snap = _snapshots.pop(snap_id, None)
+    if not snap:
+        return _error("DBSnapshotNotFound", f"Snapshot {snap_id} not found.", 404)
+    _tags.pop(snap.get("DBSnapshotArn", ""), None)
+    snap["Status"] = "deleted"
+    return _xml(200, "DeleteDBSnapshotResponse",
+        f"<DeleteDBSnapshotResult><DBSnapshot>{_snapshot_xml(snap)}</DBSnapshot></DeleteDBSnapshotResult>")
+
+
+def _describe_db_snapshots(p):
+    snap_id = _p(p, "DBSnapshotIdentifier")
+    db_id = _p(p, "DBInstanceIdentifier")
+    snap_type = _p(p, "SnapshotType")
+
+    if snap_id:
+        snap = _snapshots.get(snap_id)
+        if not snap:
+            return _error("DBSnapshotNotFound", f"Snapshot {snap_id} not found.", 404)
+        snaps = [snap]
+    else:
+        snaps = list(_snapshots.values())
+        if db_id:
+            snaps = [s for s in snaps if s["DBInstanceIdentifier"] == db_id]
+        if snap_type:
+            snaps = [s for s in snaps if s["SnapshotType"] == snap_type]
+
+    members = "".join(f"<DBSnapshot>{_snapshot_xml(s)}</DBSnapshot>" for s in snaps)
+    return _xml(200, "DescribeDBSnapshotsResponse",
+        f"<DescribeDBSnapshotsResult><DBSnapshots>{members}</DBSnapshots></DescribeDBSnapshotsResult>")
+
+
+# ---------------------------------------------------------------------------
+# Subnet Groups (minimal)
+# ---------------------------------------------------------------------------
+
+def _create_subnet_group(p):
+    name = _p(p, "DBSubnetGroupName")
+    if not name:
+        return _error("MissingParameter", "DBSubnetGroupName is required", 400)
+    desc = _p(p, "DBSubnetGroupDescription") or name
+    subnet_ids = _parse_member_list(p, "SubnetIds")
+    arn = f"arn:aws:rds:{get_region()}:{get_account_id()}:subgrp:{name}"
+
+    subnets = [{"SubnetIdentifier": sid, "SubnetAvailabilityZone": {"Name": f"{get_region()}a"},
+                "SubnetOutpost": {}, "SubnetStatus": "Active"} for sid in subnet_ids]
+
+    _subnet_groups[name] = {
+        "DBSubnetGroupName": name,
+        "DBSubnetGroupDescription": desc,
+        "VpcId": "vpc-00000000",
+        "SubnetGroupStatus": "Complete",
+        "Subnets": subnets,
+        "DBSubnetGroupArn": arn,
+        "SupportedNetworkTypes": ["IPV4"],
+    }
+
+    req_tags = _parse_tags(p)
+    if req_tags:
+        _tags[arn] = req_tags
+
+    sg = _subnet_groups[name]
+    return _xml(200, "CreateDBSubnetGroupResponse",
+        f"<CreateDBSubnetGroupResult><DBSubnetGroup>{_subnet_group_xml(sg)}</DBSubnetGroup></CreateDBSubnetGroupResult>")
+
+
+def _delete_subnet_group(p):
+    name = _p(p, "DBSubnetGroupName")
+    sg = _subnet_groups.pop(name, None)
+    if not sg:
+        return _error("DBSubnetGroupNotFoundFault", f"Subnet group {name} not found.", 404)
+    _tags.pop(sg.get("DBSubnetGroupArn", ""), None)
+    return _xml(200, "DeleteDBSubnetGroupResponse", "")
+
+
+def _describe_subnet_groups(p):
+    name = _p(p, "DBSubnetGroupName")
+    if name:
+        sg = _subnet_groups.get(name)
+        if not sg:
+            return _error("DBSubnetGroupNotFoundFault", f"Subnet group {name} not found.", 404)
+        groups = [sg]
+    else:
+        groups = list(_subnet_groups.values())
+
+    members = "".join(
+        f"<DBSubnetGroup>{_subnet_group_xml(g)}</DBSubnetGroup>" for g in groups
+    )
+    return _xml(200, "DescribeDBSubnetGroupsResponse",
+        f"<DescribeDBSubnetGroupsResult><DBSubnetGroups>{members}</DBSubnetGroups></DescribeDBSubnetGroupsResult>")
+
+
+# ---------------------------------------------------------------------------
+# Tags
+# ---------------------------------------------------------------------------
+
+def _add_tags(p):
+    arn = _p(p, "ResourceName")
+    new_tags = _parse_tags(p)
+    if not arn:
+        return _error("MissingParameter", "ResourceName is required", 400)
+
+    existing = _tags.get(arn, [])
+    existing_keys = {t["Key"]: i for i, t in enumerate(existing)}
+    for tag in new_tags:
+        k = tag["Key"]
+        if k in existing_keys:
+            existing[existing_keys[k]] = tag
+        else:
+            existing.append(tag)
+            existing_keys[k] = len(existing) - 1
+    _tags[arn] = existing
+
+    _sync_tag_list_to_resource(arn)
+    return _xml(200, "AddTagsToResourceResponse", "")
+
+
+def _remove_tags(p):
+    arn = _p(p, "ResourceName")
+    keys_to_remove = set(_parse_member_list(p, "TagKeys"))
+    if not arn:
+        return _error("MissingParameter", "ResourceName is required", 400)
+
+    existing = _tags.get(arn, [])
+    _tags[arn] = [t for t in existing if t["Key"] not in keys_to_remove]
+
+    _sync_tag_list_to_resource(arn)
+    return _xml(200, "RemoveTagsFromResourceResponse", "")
+
+
+def _list_tags(p):
+    arn = _p(p, "ResourceName")
+    if not arn:
+        return _xml(200, "ListTagsForResourceResponse",
+            "<ListTagsForResourceResult><TagList/></ListTagsForResourceResult>")
+
+    tag_list = _tags.get(arn, [])
+    members = "".join(f"<Tag><Key>{_esc(t['Key'])}</Key><Value>{_esc(t['Value'])}</Value></Tag>" for t in tag_list)
+    return _xml(200, "ListTagsForResourceResponse",
+        f"<ListTagsForResourceResult><TagList>{members}</TagList></ListTagsForResourceResult>")
+
+
+def _sync_tag_list_to_resource(arn):
+    """Keep the embedded TagList on instances/clusters in sync with _tags."""
+    tag_list = _tags.get(arn, [])
+    for inst in _instances.values():
+        if inst.get("DBInstanceArn") == arn:
+            inst["TagList"] = list(tag_list)
+            return
+    for cl in _clusters.values():
+        if cl.get("DBClusterArn") == arn:
+            cl["TagList"] = list(tag_list)
+            return
+    for snap in _snapshots.values():
+        if snap.get("DBSnapshotArn") == arn:
+            snap["TagList"] = list(tag_list)
+            return
+
+
+# ---------------------------------------------------------------------------
+# Engine Versions & Orderable Options (docdb)
+# ---------------------------------------------------------------------------
+
+def _describe_db_engine_versions(p):
+    engine = _p(p, "Engine") or "docdb"
+    version_filter = _p(p, "EngineVersion")
+    # DocDB-focused versions (wire compatible with mongo 5.x/6.x/7.x)
+    versions = [
+        ("5.0.0", "docdb5.0"),
+        ("4.0.0", "docdb4.0"),
+    ]
+    members = ""
+    for ver, family in versions:
+        if version_filter and ver != version_filter:
+            continue
+        members += f"""<DBEngineVersion>
+            <Engine>docdb</Engine>
+            <EngineVersion>{ver}</EngineVersion>
+            <DBParameterGroupFamily>{family}</DBParameterGroupFamily>
+            <DBEngineDescription>Amazon DocumentDB (with MongoDB compatibility)</DBEngineDescription>
+            <DBEngineVersionDescription>DocumentDB {ver}</DBEngineVersionDescription>
+            <ValidUpgradeTarget/>
+            <ExportableLogTypes/>
+            <SupportsLogExportsToCloudwatchLogs>false</SupportsLogExportsToCloudwatchLogs>
+            <SupportsReadReplica>true</SupportsReadReplica>
+            <SupportedFeatureNames/>
+            <Status>available</Status>
+            <SupportsParallelQuery>false</SupportsParallelQuery>
+            <SupportsGlobalDatabases>false</SupportsGlobalDatabases>
+            <SupportsBabelfish>false</SupportsBabelfish>
+            <SupportsCertificateRotationWithoutRestart>true</SupportsCertificateRotationWithoutRestart>
+        </DBEngineVersion>"""
+    return _xml(200, "DescribeDBEngineVersionsResponse",
+        f"<DescribeDBEngineVersionsResult><DBEngineVersions>{members}</DBEngineVersions></DescribeDBEngineVersionsResult>")
+
+
+def _describe_orderable_options(p):
+    engine = "docdb"
+    engine_version = _p(p, "EngineVersion") or "5.0.0"
+    db_class = _p(p, "DBInstanceClass")
+
+    instance_classes = [
+        "db.t3.medium", "db.t3.large", "db.r5.large", "db.r5.xlarge",
+        "db.m5.large", "db.m5.xlarge",
+    ]
+
+    members = ""
+    for cls in instance_classes:
+        if db_class and cls != db_class:
+            continue
+        members += f"""<OrderableDBInstanceOption>
+            <Engine>docdb</Engine>
+            <EngineVersion>{engine_version}</EngineVersion>
+            <DBInstanceClass>{cls}</DBInstanceClass>
+            <LicenseModel>docdb</LicenseModel>
+            <AvailabilityZones>
+                <AvailabilityZone><Name>{get_region()}a</Name></AvailabilityZone>
+                <AvailabilityZone><Name>{get_region()}b</Name></AvailabilityZone>
+            </AvailabilityZones>
+            <MultiAZCapable>true</MultiAZCapable>
+            <ReadReplicaCapable>true</ReadReplicaCapable>
+            <Vpc>true</Vpc>
+            <SupportsStorageEncryption>true</SupportsStorageEncryption>
+            <StorageType>gp2</StorageType>
+            <SupportsIops>false</SupportsIops>
+            <SupportsEnhancedMonitoring>true</SupportsEnhancedMonitoring>
+            <SupportsIAMDatabaseAuthentication>true</SupportsIAMDatabaseAuthentication>
+            <SupportsPerformanceInsights>false</SupportsPerformanceInsights>
+            <AvailableProcessorFeatures/>
+            <SupportedEngineModes><member>provisioned</member></SupportedEngineModes>
+            <SupportsStorageAutoscaling>true</SupportsStorageAutoscaling>
+            <SupportsKerberosAuthentication>false</SupportsKerberosAuthentication>
+            <OutpostCapable>false</OutpostCapable>
+            <SupportedNetworkTypes><member>IPV4</member></SupportedNetworkTypes>
+            <SupportsGlobalDatabases>false</SupportsGlobalDatabases>
+            <SupportsClusters>true</SupportsClusters>
+            <SupportedActivityStreamModes/>
+        </OrderableDBInstanceOption>"""
+    return _xml(200, "DescribeOrderableDBInstanceOptionsResponse",
+        f"<DescribeOrderableDBInstanceOptionsResult><OrderableDBInstanceOptions>{members}</OrderableDBInstanceOptions></DescribeOrderableDBInstanceOptionsResult>")
+
+
+def _describe_pending_maintenance_actions(p):
+    return _xml(200, "DescribePendingMaintenanceActionsResponse",
+        "<DescribePendingMaintenanceActionsResult><PendingMaintenanceActions/></DescribePendingMaintenanceActionsResult>")
+
+
+# ---------------------------------------------------------------------------
+# XML helpers (RDS 2014-10-31 shapes reused for docdb client compatibility)
+# ---------------------------------------------------------------------------
+
+def _instance_xml(i):
+    ep = i.get("Endpoint", {})
+    subnet = i.get("DBSubnetGroup", {})
+
+    vpc_sg_xml = ""
+    for sg in i.get("VpcSecurityGroups", []):
+        vpc_sg_xml += f"""<VpcSecurityGroupMembership>
+            <VpcSecurityGroupId>{sg.get('VpcSecurityGroupId','')}</VpcSecurityGroupId>
+            <Status>{sg.get('Status','active')}</Status>
+        </VpcSecurityGroupMembership>"""
+
+    db_sg_xml = ""
+    for sg in i.get("DBSecurityGroups", []):
+        db_sg_xml += f"""<DBSecurityGroup>
+            <DBSecurityGroupName>{sg}</DBSecurityGroupName>
+            <Status>active</Status>
+        </DBSecurityGroup>"""
+
+    param_xml = ""
+    for pg in i.get("DBParameterGroups", []):
+        param_xml += f"""<DBParameterGroup>
+            <DBParameterGroupName>{pg.get('DBParameterGroupName','')}</DBParameterGroupName>
+            <ParameterApplyStatus>{pg.get('ParameterApplyStatus','in-sync')}</ParameterApplyStatus>
+        </DBParameterGroup>"""
+
+    option_xml = ""
+    for og in i.get("OptionGroupMemberships", []):
+        option_xml += f"""<OptionGroupMembership>
+            <OptionGroupName>{og.get('OptionGroupName','')}</OptionGroupName>
+            <Status>{og.get('Status','in-sync')}</Status>
+        </OptionGroupMembership>"""
+
+    tag_xml = ""
+    for t in i.get("TagList", []):
+        tag_xml += f"<Tag><Key>{_esc(t['Key'])}</Key><Value>{_esc(t['Value'])}</Value></Tag>"
+
+    read_replica_xml = ""
+    for rr in i.get("ReadReplicaDBInstanceIdentifiers", []):
+        read_replica_xml += f"<ReadReplicaDBInstanceIdentifier>{rr}</ReadReplicaDBInstanceIdentifier>"
+
+    subnet_xml = ""
+    for s in subnet.get("Subnets", []):
+        az = s.get("SubnetAvailabilityZone", {}).get("Name", f"{get_region()}a") if isinstance(s.get("SubnetAvailabilityZone"), dict) else f"{get_region()}a"
+        subnet_xml += f"""<Subnet>
+            <SubnetIdentifier>{s.get('SubnetIdentifier','')}</SubnetIdentifier>
+            <SubnetAvailabilityZone><Name>{az}</Name></SubnetAvailabilityZone>
+            <SubnetOutpost/>
+            <SubnetStatus>Active</SubnetStatus>
+        </Subnet>"""
+
+    pending_xml = ""
+    for pk, pv in i.get("PendingModifiedValues", {}).items():
+        pending_xml += f"<{pk}>{pv}</{pk}>"
+
+    iops_xml = ""
+    if i.get("Iops") is not None:
+        iops_xml = f"<Iops>{i['Iops']}</Iops>"
+
+    cert_xml = ""
+    cert = i.get("CertificateDetails")
+    if cert:
+        cert_xml = f"""<CertificateDetails>
+            <CAIdentifier>{cert.get('CAIdentifier','')}</CAIdentifier>
+            <ValidTill>{cert.get('ValidTill','')}</ValidTill>
+        </CertificateDetails>"""
+
+    return f"""<DBInstanceIdentifier>{i['DBInstanceIdentifier']}</DBInstanceIdentifier>
+        <DBInstanceClass>{i['DBInstanceClass']}</DBInstanceClass>
+        <Engine>{i['Engine']}</Engine>
+        <EngineVersion>{i['EngineVersion']}</EngineVersion>
+        <DBInstanceStatus>{i['DBInstanceStatus']}</DBInstanceStatus>
+        <MasterUsername>{i['MasterUsername']}</MasterUsername>
+        <DBName>{i.get('DBName','')}</DBName>
+        <Endpoint>
+            <Address>{ep.get('Address','localhost')}</Address>
+            <Port>{ep.get('Port',27017)}</Port>
+            <HostedZoneId>{ep.get('HostedZoneId','Z2R2ITUGPM61AM')}</HostedZoneId>
+        </Endpoint>
+        <AllocatedStorage>{i['AllocatedStorage']}</AllocatedStorage>
+        <InstanceCreateTime>{i.get('InstanceCreateTime','')}</InstanceCreateTime>
+        <PreferredBackupWindow>{i.get('PreferredBackupWindow','03:00-04:00')}</PreferredBackupWindow>
+        <BackupRetentionPeriod>{i.get('BackupRetentionPeriod',1)}</BackupRetentionPeriod>
+        <DBSecurityGroups>{db_sg_xml}</DBSecurityGroups>
+        <VpcSecurityGroups>{vpc_sg_xml}</VpcSecurityGroups>
+        <DBParameterGroups>{param_xml}</DBParameterGroups>
+        <AvailabilityZone>{i.get('AvailabilityZone',f'{get_region()}a')}</AvailabilityZone>
+        <DBSubnetGroup>
+            <DBSubnetGroupName>{subnet.get('DBSubnetGroupName','default')}</DBSubnetGroupName>
+            <DBSubnetGroupDescription>{subnet.get('DBSubnetGroupDescription','')}</DBSubnetGroupDescription>
+            <VpcId>{subnet.get('VpcId','vpc-00000000')}</VpcId>
+            <SubnetGroupStatus>{subnet.get('SubnetGroupStatus','Complete')}</SubnetGroupStatus>
+            <Subnets>{subnet_xml}</Subnets>
+            <DBSubnetGroupArn>{subnet.get('DBSubnetGroupArn','')}</DBSubnetGroupArn>
+        </DBSubnetGroup>
+        <PreferredMaintenanceWindow>{i.get('PreferredMaintenanceWindow','sun:05:00-sun:06:00')}</PreferredMaintenanceWindow>
+        <PendingModifiedValues>{pending_xml}</PendingModifiedValues>
+        <LatestRestorableTime>{i.get('LatestRestorableTime') or _format_time(time.time())}</LatestRestorableTime>
+        <MultiAZ>{str(i.get('MultiAZ',False)).lower()}</MultiAZ>
+        <AutoMinorVersionUpgrade>{str(i.get('AutoMinorVersionUpgrade',True)).lower()}</AutoMinorVersionUpgrade>
+        <ReadReplicaDBInstanceIdentifiers>{read_replica_xml}</ReadReplicaDBInstanceIdentifiers>
+        <ReadReplicaSourceDBInstanceIdentifier>{i.get('ReadReplicaSourceDBInstanceIdentifier','')}</ReadReplicaSourceDBInstanceIdentifier>
+        <ReadReplicaDBClusterIdentifiers/>
+        <ReplicaMode>{i.get('ReplicaMode','')}</ReplicaMode>
+        <LicenseModel>{i.get('LicenseModel','docdb')}</LicenseModel>
+        {iops_xml}
+        <OptionGroupMemberships>{option_xml}</OptionGroupMemberships>
+        <PubliclyAccessible>{str(i.get('PubliclyAccessible',False)).lower()}</PubliclyAccessible>
+        <StatusInfos/>
+        <StorageType>{i.get('StorageType','gp2')}</StorageType>
+        <DbInstancePort>{i.get('DbInstancePort',0)}</DbInstancePort>
+        <DBClusterIdentifier>{i.get('DBClusterIdentifier','')}</DBClusterIdentifier>
+        <StorageEncrypted>{str(i.get('StorageEncrypted',False)).lower()}</StorageEncrypted>
+        <KmsKeyId>{i.get('KmsKeyId','')}</KmsKeyId>
+        <DbiResourceId>{i.get('DbiResourceId','')}</DbiResourceId>
+        <CACertificateIdentifier>{i.get('CACertificateIdentifier','rds-ca-rsa2048-g1')}</CACertificateIdentifier>
+        <DomainMemberships/>
+        <CopyTagsToSnapshot>{str(i.get('CopyTagsToSnapshot',False)).lower()}</CopyTagsToSnapshot>
+        <MonitoringInterval>{i.get('MonitoringInterval',0)}</MonitoringInterval>
+        <EnhancedMonitoringResourceArn>{i.get('EnhancedMonitoringResourceArn','')}</EnhancedMonitoringResourceArn>
+        <MonitoringRoleArn>{i.get('MonitoringRoleArn','')}</MonitoringRoleArn>
+        <PromotionTier>{i.get('PromotionTier',1)}</PromotionTier>
+        <DBInstanceArn>{i['DBInstanceArn']}</DBInstanceArn>
+        <IAMDatabaseAuthenticationEnabled>{str(i.get('IAMDatabaseAuthenticationEnabled',False)).lower()}</IAMDatabaseAuthenticationEnabled>
+        <PerformanceInsightsEnabled>{str(i.get('PerformanceInsightsEnabled',False)).lower()}</PerformanceInsightsEnabled>
+        <EnabledCloudwatchLogsExports/>
+        <ProcessorFeatures/>
+        <DeletionProtection>{str(i.get('DeletionProtection',False)).lower()}</DeletionProtection>
+        <AssociatedRoles/>
+        <MaxAllocatedStorage>{i.get('MaxAllocatedStorage',i.get('AllocatedStorage',20))}</MaxAllocatedStorage>
+        <TagList>{tag_xml}</TagList>
+        {cert_xml}
+        <CustomerOwnedIpEnabled>{str(i.get('CustomerOwnedIpEnabled',False)).lower()}</CustomerOwnedIpEnabled>
+        <BackupTarget>{i.get('BackupTarget','region')}</BackupTarget>
+        <NetworkType>{i.get('NetworkType','IPV4')}</NetworkType>
+        <StorageThroughput>{i.get('StorageThroughput',0)}</StorageThroughput>
+        <IsStorageConfigUpgradeAvailable>{str(i.get('IsStorageConfigUpgradeAvailable',False)).lower()}</IsStorageConfigUpgradeAvailable>"""
+
+
+def _cluster_xml(c):
+    vpc_sg_xml = ""
+    for sg in c.get("VpcSecurityGroups", []):
+        vpc_sg_xml += f"""<VpcSecurityGroupMembership>
+            <VpcSecurityGroupId>{sg.get('VpcSecurityGroupId','')}</VpcSecurityGroupId>
+            <Status>{sg.get('Status','active')}</Status>
+        </VpcSecurityGroupMembership>"""
+
+    member_xml = ""
+    for m in c.get("DBClusterMembers", []):
+        member_xml += f"""<DBClusterMember>
+            <DBInstanceIdentifier>{m.get('DBInstanceIdentifier','')}</DBInstanceIdentifier>
+            <IsClusterWriter>{str(m.get('IsClusterWriter',True)).lower()}</IsClusterWriter>
+            <DBClusterParameterGroupStatus>in-sync</DBClusterParameterGroupStatus>
+            <PromotionTier>{m.get('PromotionTier',1)}</PromotionTier>
+        </DBClusterMember>"""
+
+    az_xml = ""
+    for az in c.get("AvailabilityZones", []):
+        az_xml += f"<AvailabilityZone>{az}</AvailabilityZone>"
+
+    tag_xml = ""
+    for t in c.get("TagList", []):
+        tag_xml += f"<Tag><Key>{_esc(t['Key'])}</Key><Value>{_esc(t['Value'])}</Value></Tag>"
+
+    db_name = c.get("DatabaseName")
+    db_name_xml = f"<DatabaseName>{db_name}</DatabaseName>" if db_name else ""
+
+    return f"""<DBClusterIdentifier>{c['DBClusterIdentifier']}</DBClusterIdentifier>
+        <DBClusterArn>{c['DBClusterArn']}</DBClusterArn>
+        <Engine>{c['Engine']}</Engine>
+        <EngineVersion>{c['EngineVersion']}</EngineVersion>
+        <EngineMode>{c.get('EngineMode','provisioned')}</EngineMode>
+        <Status>{c['Status']}</Status>
+        <MasterUsername>{c.get('MasterUsername','root')}</MasterUsername>
+        {db_name_xml}
+        <Endpoint>{c.get('Endpoint','')}</Endpoint>
+        <ReaderEndpoint>{c.get('ReaderEndpoint','')}</ReaderEndpoint>
+        <Port>{c['Port']}</Port>
+        <MultiAZ>{str(c.get('MultiAZ',False)).lower()}</MultiAZ>
+        <AvailabilityZones>{az_xml}</AvailabilityZones>
+        <DBClusterMembers>{member_xml}</DBClusterMembers>
+        <VpcSecurityGroups>{vpc_sg_xml}</VpcSecurityGroups>
+        <DBSubnetGroup>{c.get('DBSubnetGroup','default')}</DBSubnetGroup>
+        <DBClusterParameterGroup>{c.get('DBClusterParameterGroup','')}</DBClusterParameterGroup>
+        <BackupRetentionPeriod>{c.get('BackupRetentionPeriod',1)}</BackupRetentionPeriod>
+        <PreferredBackupWindow>{c.get('PreferredBackupWindow','03:00-04:00')}</PreferredBackupWindow>
+        <PreferredMaintenanceWindow>{c.get('PreferredMaintenanceWindow','sun:05:00-sun:06:00')}</PreferredMaintenanceWindow>
+        <ClusterCreateTime>{c.get('ClusterCreateTime','')}</ClusterCreateTime>
+        <EarliestRestorableTime>{c.get('EarliestRestorableTime','')}</EarliestRestorableTime>
+        <LatestRestorableTime>{c.get('LatestRestorableTime','')}</LatestRestorableTime>
+        <StorageEncrypted>{str(c.get('StorageEncrypted',False)).lower()}</StorageEncrypted>
+        <KmsKeyId>{c.get('KmsKeyId','')}</KmsKeyId>
+        <DeletionProtection>{str(c.get('DeletionProtection',False)).lower()}</DeletionProtection>
+        <IAMDatabaseAuthenticationEnabled>{str(c.get('IAMDatabaseAuthenticationEnabled',False)).lower()}</IAMDatabaseAuthenticationEnabled>
+        <HttpEndpointEnabled>{str(c.get('HttpEndpointEnabled',False)).lower()}</HttpEndpointEnabled>
+        <CopyTagsToSnapshot>{str(c.get('CopyTagsToSnapshot',False)).lower()}</CopyTagsToSnapshot>
+        <CrossAccountClone>{str(c.get('CrossAccountClone',False)).lower()}</CrossAccountClone>
+        <DbClusterResourceId>{c.get('DbClusterResourceId','')}</DbClusterResourceId>
+        <HostedZoneId>{c.get('HostedZoneId','Z2R2ITUGPM61AM')}</HostedZoneId>
+        <AssociatedRoles/>
+        <TagList>{tag_xml}</TagList>
+        <AllocatedStorage>{c.get('AllocatedStorage',1)}</AllocatedStorage>
+        <ActivityStreamStatus>{c.get('ActivityStreamStatus','stopped')}</ActivityStreamStatus>
+        <NetworkType>{c.get('NetworkType','IPV4')}</NetworkType>
+        <EngineLifecycleSupport>{c.get('EngineLifecycleSupport','open-source-rds-extended-support')}</EngineLifecycleSupport>"""
+
+
+def _snapshot_xml(s):
+    tag_xml = ""
+    for t in s.get("TagList", []):
+        tag_xml += f"<Tag><Key>{_esc(t['Key'])}</Key><Value>{_esc(t['Value'])}</Value></Tag>"
+    return f"""<DBSnapshotIdentifier>{s['DBSnapshotIdentifier']}</DBSnapshotIdentifier>
+        <DBInstanceIdentifier>{s['DBInstanceIdentifier']}</DBInstanceIdentifier>
+        <DBSnapshotArn>{s.get('DBSnapshotArn','')}</DBSnapshotArn>
+        <Engine>{s['Engine']}</Engine>
+        <EngineVersion>{s['EngineVersion']}</EngineVersion>
+        <SnapshotCreateTime>{s.get('SnapshotCreateTime','')}</SnapshotCreateTime>
+        <InstanceCreateTime>{s.get('InstanceCreateTime','')}</InstanceCreateTime>
+        <Status>{s['Status']}</Status>
+        <AllocatedStorage>{s.get('AllocatedStorage',20)}</AllocatedStorage>
+        <AvailabilityZone>{s.get('AvailabilityZone',f'{get_region()}a')}</AvailabilityZone>
+        <VpcId>{s.get('VpcId','vpc-00000000')}</VpcId>
+        <Port>{s.get('Port',27017)}</Port>
+        <MasterUsername>{s.get('MasterUsername','root')}</MasterUsername>
+        <DBName>{s.get('DBName','')}</DBName>
+        <SnapshotType>{s.get('SnapshotType','manual')}</SnapshotType>
+        <LicenseModel>{s.get('LicenseModel','docdb')}</LicenseModel>
+        <StorageType>{s.get('StorageType','gp2')}</StorageType>
+        <DBInstanceClass>{s.get('DBInstanceClass','db.t3.medium')}</DBInstanceClass>
+        <StorageEncrypted>{str(s.get('StorageEncrypted',False)).lower()}</StorageEncrypted>
+        <KmsKeyId>{s.get('KmsKeyId','')}</KmsKeyId>
+        <Encrypted>{str(s.get('Encrypted',False)).lower()}</Encrypted>
+        <IAMDatabaseAuthenticationEnabled>{str(s.get('IAMDatabaseAuthenticationEnabled',False)).lower()}</IAMDatabaseAuthenticationEnabled>
+        <PercentProgress>{s.get('PercentProgress',100)}</PercentProgress>
+        <DbiResourceId>{s.get('DbiResourceId','')}</DbiResourceId>
+        <TagList>{tag_xml}</TagList>
+        <OriginalSnapshotCreateTime>{s.get('OriginalSnapshotCreateTime','')}</OriginalSnapshotCreateTime>
+        <SnapshotDatabaseTime>{s.get('SnapshotDatabaseTime','')}</SnapshotDatabaseTime>
+        <SnapshotTarget>{s.get('SnapshotTarget','region')}</SnapshotTarget>"""
+
+
+def _subnet_group_xml(sg):
+    subnets_xml = ""
+    for s in sg.get("Subnets", []):
+        az = s.get("SubnetAvailabilityZone", {}).get("Name", f"{get_region()}a") if isinstance(s.get("SubnetAvailabilityZone"), dict) else f"{get_region()}a"
+        subnets_xml += f"""<Subnet>
+            <SubnetIdentifier>{s.get('SubnetIdentifier','')}</SubnetIdentifier>
+            <SubnetAvailabilityZone><Name>{az}</Name></SubnetAvailabilityZone>
+            <SubnetOutpost/>
+            <SubnetStatus>Active</SubnetStatus>
+        </Subnet>"""
+    return f"""<DBSubnetGroupName>{sg['DBSubnetGroupName']}</DBSubnetGroupName>
+        <DBSubnetGroupDescription>{sg.get('DBSubnetGroupDescription','')}</DBSubnetGroupDescription>
+        <VpcId>{sg.get('VpcId','vpc-00000000')}</VpcId>
+        <SubnetGroupStatus>{sg.get('SubnetGroupStatus','Complete')}</SubnetGroupStatus>
+        <Subnets>{subnets_xml}</Subnets>
+        <DBSubnetGroupArn>{sg.get('DBSubnetGroupArn','')}</DBSubnetGroupArn>
+        <SupportedNetworkTypes><member>IPV4</member></SupportedNetworkTypes>"""
+
+
+def _single_instance_response(root_tag, result_tag, instance):
+    return _xml(200, root_tag,
+        f"<{result_tag}><DBInstance>{_instance_xml(instance)}</DBInstance></{result_tag}>")
+
+
+# ---------------------------------------------------------------------------
+# Generic helpers
+# ---------------------------------------------------------------------------
+
+def _p(params, key, default=""):
+    val = params.get(key, [default])
+    if isinstance(val, list):
+        return val[0] if val else default
+    return val
+
+
+def _parse_tags(params):
+    """Parse Tags.member.N.Key / Tags.member.N.Value or Tags.Tag.N.Key / Tags.Tag.N.Value."""
+    tags = []
+    prefix = "Tags.member"
+    if not _p(params, "Tags.member.1.Key"):
+        prefix = "Tags.Tag"
+    i = 1
+    while True:
+        key = _p(params, f"{prefix}.{i}.Key")
+        if not key:
+            break
+        value = _p(params, f"{prefix}.{i}.Value", "")
+        tags.append({"Key": key, "Value": value})
+        i += 1
+    return tags
+
+
+def _parse_member_list(params, prefix):
+    items = []
+    i = 1
+    while True:
+        val = _p(params, f"{prefix}.member.{i}")
+        if not val:
+            break
+        items.append(val)
+        i += 1
+    if items:
+        return items
+    import re
+    pattern = re.compile(rf"^{re.escape(prefix)}\.([^.]+)\.(\d+)$")
+    numbered = {}
+    for key in params:
+        m = pattern.match(key)
+        if m:
+            idx = int(m.group(2))
+            numbered[idx] = _p(params, key)
+    return [numbered[k] for k in sorted(numbered)] if numbered else []
+
+
+def _parse_filters(params):
+    filters = {}
+    i = 1
+    while True:
+        name = _p(params, f"Filters.member.{i}.Name")
+        if not name:
+            break
+        values = []
+        j = 1
+        while True:
+            v = _p(params, f"Filters.member.{i}.Values.member.{j}")
+            if not v:
+                break
+            values.append(v)
+            j += 1
+        filters[name] = values
+        i += 1
+    return filters
+
+
+def _apply_instance_filters(instances, filters):
+    result = []
+    for inst in instances:
+        match = True
+        for fname, fvals in filters.items():
+            if fname == "db-instance-id":
+                if inst["DBInstanceIdentifier"] not in fvals:
+                    match = False
+            elif fname == "engine":
+                if inst["Engine"] not in fvals:
+                    match = False
+            elif fname == "db-cluster-id":
+                if inst.get("DBClusterIdentifier", "") not in fvals:
+                    match = False
+        if match:
+            result.append(inst)
+    return result
+
+
+def _apply_cluster_filters(clusters, filters):
+    result = []
+    for cl in clusters:
+        match = True
+        for fname, fvals in filters.items():
+            if fname == "db-cluster-id":
+                if cl["DBClusterIdentifier"] not in fvals:
+                    match = False
+            elif fname == "engine":
+                if cl["Engine"] not in fvals:
+                    match = False
+        if match:
+            result.append(cl)
+    return result
+
+
+def _format_time(ts):
+    dt = datetime.datetime.fromtimestamp(ts, tz=datetime.timezone.utc)
+    return dt.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+
+
+def _default_engine_version(engine):
+    if engine == "docdb":
+        return "5.0.0"
+    return "5.0.0"
+
+
+def _docker_image_for_docdb(engine_version, user, password, db_name=""):
+    """Return (image, env_dict, container_port, data_path) for Mongo."""
+    # Recent mongo:7 provides good DocDB 5.0 wire/protocol compatibility.
+    # Users can override via MINISTACK_IMAGE_PREFIX or future DOCDB_IMAGE env.
+    image = apply_image_prefix("mongo:7")
+    env = {
+        "MONGO_INITDB_ROOT_USERNAME": user,
+        "MONGO_INITDB_ROOT_PASSWORD": password,
+    }
+    # db_name is not auto-created by the official image init for root; clients
+    # can `use <db>` after connecting with the returned endpoint + credentials.
+    return image, env, 27017, "/data/db"
+
+
+def _xml(status, root_tag, inner):
+    body = f"""<?xml version="1.0" encoding="UTF-8"?>
+<{root_tag} xmlns="http://rds.amazonaws.com/doc/2014-10-31/">
+    {inner}
+    <ResponseMetadata><RequestId>{new_uuid()}</RequestId></ResponseMetadata>
+</{root_tag}>""".encode("utf-8")
+    return status, {"Content-Type": "application/xml"}, body
+
+
+def _error(code, message, status):
+    fault_type = "Sender" if 400 <= status < 500 else "Receiver"
+    body = f"""<?xml version="1.0" encoding="UTF-8"?>
+<ErrorResponse xmlns="http://rds.amazonaws.com/doc/2014-10-31/">
+    <Error><Type>{fault_type}</Type><Code>{code}</Code><Message>{message}</Message></Error>
+    <RequestId>{new_uuid()}</RequestId>
+</ErrorResponse>""".encode("utf-8")
+    return status, {"Content-Type": "application/xml"}, body
+
+
+# ---------------------------------------------------------------------------
+# Action map
+# ---------------------------------------------------------------------------
+
+_ACTION_MAP = {
+    "CreateDBInstance": _create_db_instance,
+    "DeleteDBInstance": _delete_db_instance,
+    "DescribeDBInstances": _describe_db_instances,
+    "ModifyDBInstance": _modify_db_instance,
+    "StartDBInstance": _start_db_instance,
+    "StopDBInstance": _stop_db_instance,
+    "RebootDBInstance": _reboot_db_instance,
+    "CreateDBCluster": _create_db_cluster,
+    "DeleteDBCluster": _delete_db_cluster,
+    "DescribeDBClusters": _describe_db_clusters,
+    "ModifyDBCluster": _modify_db_cluster,
+    "StartDBCluster": _start_db_cluster,
+    "StopDBCluster": _stop_db_cluster,
+    "CreateDBSnapshot": _create_db_snapshot,
+    "DeleteDBSnapshot": _delete_db_snapshot,
+    "DescribeDBSnapshots": _describe_db_snapshots,
+    "CreateDBSubnetGroup": _create_subnet_group,
+    "DeleteDBSubnetGroup": _delete_subnet_group,
+    "DescribeDBSubnetGroups": _describe_subnet_groups,
+    "ListTagsForResource": _list_tags,
+    "AddTagsToResource": _add_tags,
+    "RemoveTagsFromResource": _remove_tags,
+    "DescribeDBEngineVersions": _describe_db_engine_versions,
+    "DescribeOrderableDBInstanceOptions": _describe_orderable_options,
+    "DescribePendingMaintenanceActions": _describe_pending_maintenance_actions,
+}
 
 
 def reset():
-    _state["users"].clear()
-    _state["collections"].clear()
-    _state["roles"].clear()
-    _state["sessions"].clear()
-    _state["sharded"].clear()
+    """Stop/remove any running docdb containers, then clear all state."""
+    docker_client = _get_docker()
+    if docker_client:
+        for instance in _instances.values():
+            cid = instance.get("_docker_container_id")
+            if cid:
+                try:
+                    c = docker_client.containers.get(cid)
+                    c.stop(timeout=2)
+                    c.remove(v=True)
+                except Exception as e:
+                    logger.warning("reset: failed to stop/remove docdb container %s: %s", cid, e)
+    _instances.clear()
+    _clusters.clear()
+    _subnet_groups.clear()
+    _snapshots.clear()
+    _tags.clear()
+    _port_counter[0] = BASE_PORT
