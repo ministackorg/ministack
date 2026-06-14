@@ -2926,6 +2926,11 @@ def _emit_lambda_logs(func: dict, request_id: str, log_text: str,
             stream["firstEventTimestamp"] = now_ms
         stream["lastEventTimestamp"] = now_ms
         stream["lastIngestionTime"] = now_ms
+        # Forward to any subscription filters on this group (e.g. Lambda log
+        # processor pattern), matching AWS (#896).
+        _cwl._fanout_to_subscription_filters(
+            group_name, stream_name,
+            [{"timestamp": now_ms, "message": line} for line in lines])
     except Exception as exc:
         logger.debug("CW Logs emit failed for %s: %s", func.get("config", {}).get("FunctionName"), exc)
 
