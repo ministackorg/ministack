@@ -484,6 +484,50 @@ def test_iam_instance_profile_crud(iam):
     iam.remove_role_from_instance_profile(InstanceProfileName="qa-iam-ip", RoleName="qa-iam-ip-role")
     iam.delete_instance_profile(InstanceProfileName="qa-iam-ip")
 
+
+def test_iam_instance_profile_tags(iam):
+    """TagInstanceProfile, ListInstanceProfileTags, UntagInstanceProfile round-trip."""
+    iam.create_instance_profile(InstanceProfileName="qa-iam-ip-tags")
+    iam.tag_instance_profile(
+        InstanceProfileName="qa-iam-ip-tags",
+        Tags=[{"Key": "k", "Value": "v"}],
+    )
+    tags = iam.list_instance_profile_tags(InstanceProfileName="qa-iam-ip-tags")["Tags"]
+    assert any(t["Key"] == "k" and t["Value"] == "v" for t in tags)
+    iam.untag_instance_profile(InstanceProfileName="qa-iam-ip-tags", TagKeys=["k"])
+    tags2 = iam.list_instance_profile_tags(InstanceProfileName="qa-iam-ip-tags")["Tags"]
+    assert not any(t["Key"] == "k" for t in tags2)
+    iam.delete_instance_profile(InstanceProfileName="qa-iam-ip-tags")
+
+
+def test_iam_instance_profile_tags_serialized_in_get(iam):
+    """Tags set via TagInstanceProfile (and at create time) must read back from
+    GetInstanceProfile / ListInstanceProfiles so Terraform's
+    aws_iam_instance_profile does not detect tag drift on re-apply. Same bug
+    class as #441 (user tags) / #445 (policy tags)."""
+    import uuid as _u
+    name = f"qa-iam-ip-ser-{_u.uuid4().hex[:8]}"
+    # Tags supplied at create time must round-trip.
+    iam.create_instance_profile(
+        InstanceProfileName=name,
+        Tags=[{"Key": "Team", "Value": "platform"}],
+    )
+    got = iam.get_instance_profile(InstanceProfileName=name)["InstanceProfile"]
+    got_tags = {t["Key"]: t["Value"] for t in got.get("Tags") or []}
+    assert got_tags.get("Team") == "platform", f"GetInstanceProfile dropped Tags: {got}"
+    # TagInstanceProfile after-the-fact must also round-trip via GetInstanceProfile.
+    iam.tag_instance_profile(InstanceProfileName=name, Tags=[{"Key": "Env", "Value": "dev"}])
+    got2 = iam.get_instance_profile(InstanceProfileName=name)["InstanceProfile"]
+    got2_tags = {t["Key"]: t["Value"] for t in got2.get("Tags") or []}
+    assert got2_tags == {"Team": "platform", "Env": "dev"}
+    # ListInstanceProfiles (separate code path) must surface them too.
+    listed = iam.list_instance_profiles()["InstanceProfiles"]
+    match = next(p for p in listed if p["InstanceProfileName"] == name)
+    listed_tags = {t["Key"]: t["Value"] for t in match.get("Tags") or []}
+    assert listed_tags == {"Team": "platform", "Env": "dev"}
+    iam.delete_instance_profile(InstanceProfileName=name)
+
+
 def test_iam_attach_detach_user_policy(iam):
     """AttachUserPolicy / DetachUserPolicy / ListAttachedUserPolicies."""
     iam.create_user(UserName="qa-iam-attach-user")
