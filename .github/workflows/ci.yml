@@ -14,13 +14,16 @@ jobs:
         include:
           - mode: parallel
             shard_index: 0
-            shard_count: 3
+            shard_count: 4
           - mode: parallel
             shard_index: 1
-            shard_count: 3
+            shard_count: 4
           - mode: parallel
             shard_index: 2
-            shard_count: 3
+            shard_count: 4
+          - mode: parallel
+            shard_index: 3
+            shard_count: 4
           - mode: serial
             shard_index: 0
             shard_count: 1
@@ -75,7 +78,7 @@ jobs:
 
       - name: Upload MiniStack log
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ministack-${{ matrix.mode }}-shard-${{ matrix.shard_index }}.log
           path: ministack.log
