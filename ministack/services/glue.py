@@ -17,6 +17,7 @@ import fnmatch
 import json
 import logging
 import os
+import re
 import subprocess
 import tempfile
 import threading
@@ -1894,7 +1895,19 @@ def _get_user_defined_functions(data):
     else:
         items = list(_user_defined_functions.values())
     if pattern:
-        items = [u for u in items if _simple_glob_match(pattern, u.get("FunctionName", ""))]
+        # Real AWS Glue treats Pattern as a regular expression matched against the
+        # function name (not a glob). e.g. Trino's Glue connector resolves a UDF
+        # with a regex like `trino__<name>__.*`. An invalid regex (e.g. a bare
+        # `*`) raises InvalidInputException, mirroring Glue's RE2 parse error.
+        try:
+            compiled = re.compile(pattern)
+        except re.error as exc:
+            return error_response_json(
+                "InvalidInputException",
+                f"Invalid pattern syntax: error parsing regexp: {exc}",
+                400,
+            )
+        items = [u for u in items if compiled.search(u.get("FunctionName", ""))]
     return json_response({"UserDefinedFunctions": items})
 
 
@@ -1940,5 +1953,6 @@ def reset():
     _triggers.clear()
     _workflows.clear()
     _workflow_runs.clear()
+    _user_defined_functions.clear()
     _table_column_statistics.clear()
     _partition_column_statistics.clear()
