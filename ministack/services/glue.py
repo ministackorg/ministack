@@ -1885,6 +1885,36 @@ def _get_user_defined_function(data):
     return json_response({"UserDefinedFunction": udf})
 
 
+def _translate_java_regex_quote(pattern):
+    r"""Translate java.util.regex `\Q...\E` literal-quote spans into their
+    RE2/Python-`re` equivalent.
+
+    Real AWS Glue compiles `Pattern` with java.util.regex, which supports `\Q`
+    (begin literal quote) and `\E` (end literal quote): everything between them
+    is matched literally regardless of regex metacharacters. Trino's Hive/Glue
+    connector relies on this — it resolves a UDF with a pattern like
+    `trino__\Qdw_clean_text\E__.*`. Python's `re` (like Go's RE2) does not
+    understand `\Q...\E` and raises `bad escape \Q`, so we rewrite each span by
+    `re.escape()`-ing the literal between `\Q` and `\E` before compiling. Per
+    Java semantics a trailing `\Q` with no closing `\E` quotes to end-of-string.
+    """
+    out = []
+    i = 0
+    while True:
+        start = pattern.find(r"\Q", i)
+        if start == -1:
+            out.append(pattern[i:])
+            break
+        out.append(pattern[i:start])
+        end = pattern.find(r"\E", start + 2)
+        if end == -1:
+            out.append(re.escape(pattern[start + 2:]))
+            break
+        out.append(re.escape(pattern[start + 2:end]))
+        i = end + 2
+    return "".join(out)
+
+
 def _get_user_defined_functions(data):
     db_name = data.get("DatabaseName")
     pattern = data.get("Pattern") or ""
@@ -1897,10 +1927,12 @@ def _get_user_defined_functions(data):
     if pattern:
         # Real AWS Glue treats Pattern as a regular expression matched against the
         # function name (not a glob). e.g. Trino's Glue connector resolves a UDF
-        # with a regex like `trino__<name>__.*`. An invalid regex (e.g. a bare
+        # with a regex like `trino__<name>__.*`. Glue compiles it with
+        # java.util.regex, so translate `\Q...\E` literal-quote spans (which RE2
+        # / Python `re` reject) before compiling. An invalid regex (e.g. a bare
         # `*`) raises InvalidInputException, mirroring Glue's RE2 parse error.
         try:
-            compiled = re.compile(pattern)
+            compiled = re.compile(_translate_java_regex_quote(pattern))
         except re.error as exc:
             return error_response_json(
                 "InvalidInputException",

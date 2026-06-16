@@ -1244,6 +1244,39 @@ def test_glue_get_user_defined_functions_pattern_is_regex(glue):
     assert func_name in names(Pattern="trino__.*")
 
 
+def test_glue_get_user_defined_functions_pattern_java_quote(glue):
+    r"""GetUserDefinedFunctions accepts java.util.regex `\Q...\E` literal-quote
+    spans, matching real AWS Glue (which compiles Pattern with java.util.regex).
+    Trino's Hive/Glue connector resolves a UDF with a pattern like
+    `trino__\Qdw_clean_text\E__.*`; Python `re` / Go RE2 reject `\Q` outright, so
+    ministack must translate the span before compiling."""
+    glue.create_database(DatabaseInput={"Name": "pq"})
+    func_name = "trino__dw_clean_text__abc"
+    glue.create_user_defined_function(
+        DatabaseName="pq",
+        FunctionInput={"FunctionName": func_name, "ClassName": "TrinoFunction"},
+    )
+
+    def names(**kwargs):
+        return [u["FunctionName"] for u in glue.get_user_defined_functions(**kwargs)["UserDefinedFunctions"]]
+
+    # The exact pattern Trino's Glue connector emits — must resolve the function,
+    # not raise `bad escape \Q`.
+    assert func_name in names(DatabaseName="pq", Pattern=r"trino__\Qdw_clean_text\E__.*")
+    # `.*` still matches everything (regex semantics unaffected).
+    assert func_name in names(DatabaseName="pq", Pattern=".*")
+    # The literal between \Q...\E is matched literally: regex metachars inside it
+    # do not apply, so a `.` in the quoted span only matches a literal dot.
+    glue.create_user_defined_function(
+        DatabaseName="pq",
+        FunctionInput={"FunctionName": "a.b", "ClassName": "TrinoFunction"},
+    )
+    assert names(DatabaseName="pq", Pattern=r"^\Qa.b\E$") == ["a.b"]
+    assert names(DatabaseName="pq", Pattern=r"^\Qaxb\E$") == []
+    # A trailing \Q with no closing \E quotes to end-of-string (Java semantics).
+    assert func_name in names(DatabaseName="pq", Pattern=r"trino__\Qdw_clean_text__abc")
+
+
 def test_glue_resolve_script_account_scoped(tmp_path, monkeypatch):
     """_resolve_script finds an s3:// script persisted under the account-scoped
     on-disk layout DATA_DIR/<account>/<bucket>/<key> (#827).
