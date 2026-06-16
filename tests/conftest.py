@@ -58,6 +58,7 @@ _SERIAL_TESTS = {
     "tests/test_eks.py::test_eks_cfn_cluster",
     "tests/test_eks.py::test_eks_create_describe_delete_cluster",
     "tests/test_lambda.py::test_lambda_reset_terminates_workers",
+    "tests/test_lambda.py::test_lambda_dynamodb_stream_esm_latest_processes_first_record",
     "tests/test_ministack.py::test_ministack_config_invalid_key_ignored",
     "tests/test_ses.py::test_ses_messages_endpoint_reset",
     "tests/test_ses.py::test_ses_messages_endpoint_account_filter",

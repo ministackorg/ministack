@@ -306,6 +306,17 @@ def test_s3_head_object(s3):
     assert resp["ContentType"] == "application/octet-stream"
     assert "ETag" in resp
 
+def test_s3_head_object_website_redirection(s3):
+    s3.create_bucket(Bucket="intg-s3-website-redirection")
+    s3.put_object(
+        Bucket="intg-s3-website-redirection",
+        Key="redirect",
+        WebsiteRedirectLocation='http://my-redirect-website',
+    )
+    resp = s3.head_object(Bucket="intg-s3-website-redirection", Key="redirect")
+    assert resp["ContentLength"] == 0
+    assert resp["WebsiteRedirectLocation"] == "http://my-redirect-website"
+
 def test_s3_head_object_not_found(s3):
     s3.create_bucket(Bucket="intg-s3-headobj404")
     with pytest.raises(ClientError) as exc:
@@ -871,6 +882,11 @@ def test_s3_public_access_block(s3):
     assert cfg["BlockPublicAcls"] is True
     assert cfg["BlockPublicPolicy"] is False
     s3.delete_public_access_block(Bucket=bkt)
+    # After delete the config is gone: GetPublicAccessBlock must 404 instead of
+    # returning a default block (otherwise Terraform's delete waiter times out).
+    with pytest.raises(ClientError) as exc:
+        s3.get_public_access_block(Bucket=bkt)
+    assert exc.value.response["Error"]["Code"] == "NoSuchPublicAccessBlockConfiguration"
 
 def test_s3_ownership_controls(s3):
     bkt = "intg-s3-ownership"
