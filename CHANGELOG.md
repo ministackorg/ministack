@@ -14,6 +14,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 - **CloudFormation — `GetTemplateSummary` now returns `Capabilities` and `CapabilitiesReason`** — the handler already accepted `TemplateBody` and returned `Parameters` / `ResourceTypes` correctly, but omitted the `Capabilities` and `CapabilitiesReason` fields. These are now computed from the template: `CAPABILITY_NAMED_IAM` for IAM resources with explicit name properties (`RoleName`, `UserName`, etc.), `CAPABILITY_IAM` for unnamed IAM resources, and `CAPABILITY_AUTO_EXPAND` for templates with a `Transform`. `CapabilitiesReason` uses the format confirmed against the AWS API: `"The following resource(s) require capabilities: [<type>]"`. Contributed by @maximoosemine.
 - **Lambda - CreateEventSourceMapping persists FilterCriteria** — CreateEventSourceMapping was silently dropping the FilterCriteria parameter, so any filter specified at creation time was never applied.
 - **ECS — `RunTask` now applies `containerOverrides.command` to the launched Docker container** — Overridden commands (including an explicit empty command) were ignored at runtime because the Docker `containers.run(...)` call still used the task-definition command.  The effective container definition now carries the matched override command into Docker, while non-overridden containers keep their defaults.
+- **Lambda - CloudFormation-created ESMs now poll DynamoDB Streams** — Before, these streams were not getting polled.
 
 ---
 
