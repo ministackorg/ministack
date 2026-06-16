@@ -1051,6 +1051,56 @@ def test_lambda_dynamodb_stream_esm(lam, ddb):
     assert "k2" in pks
     assert "k1" not in pks
 
+
+def test_lambda_dynamodb_stream_esm_latest_processes_first_record(lam, ddb):
+    table_name = "ddb-latest-race-test"
+    fn_name = "ddb-latest-race-fn"
+
+    ddb.create_table(
+        TableName=table_name,
+        KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+        AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "S"}],
+        BillingMode="PAY_PER_REQUEST",
+        StreamSpecification={"StreamEnabled": True, "StreamViewType": "NEW_AND_OLD_IMAGES"},
+    )
+    stream_arn = ddb.describe_table(TableName=table_name)["Table"]["LatestStreamArn"]
+
+    code = "def handler(event, context):\n    return {'count': len(event['Records'])}\n"
+    lam.create_function(
+        FunctionName=fn_name,
+        Runtime="python3.12",
+        Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _make_zip(code)},
+    )
+
+    esm = lam.create_event_source_mapping(
+        FunctionName=fn_name,
+        EventSourceArn=stream_arn,
+        StartingPosition="LATEST",
+        BatchSize=10,
+    )
+    esm_uuid = esm["UUID"]
+
+    # Let the poller tick at least once with an empty stream so position is
+    # eagerly initialised to 0.
+    time.sleep(2)
+    ddb.put_item(TableName=table_name, Item={"pk": {"S": "first"}, "val": {"S": "x"}})
+
+    for _ in range(10):
+        time.sleep(0.5)
+        resp = lam.get_event_source_mapping(UUID=esm_uuid)
+        if resp.get("LastProcessingResult") != "No records processed":
+            break
+
+    result = lam.get_event_source_mapping(UUID=esm_uuid)
+    assert result.get("LastProcessingResult") != "No records processed", (
+        "LATEST ESM skipped the first record on an initially-empty table"
+    )
+
+    lam.delete_event_source_mapping(UUID=esm_uuid)
+
+
 def test_lambda_function_url_config(lam):
     """CreateFunctionUrlConfig / Get / Update / Delete / List lifecycle."""
     import uuid as _uuid_mod
