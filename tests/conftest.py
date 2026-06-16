@@ -65,6 +65,7 @@ _SERIAL_TESTS = {
     "tests/test_stepfunctions.py::test_sfn_mock_config_return",
     "tests/test_stepfunctions.py::test_sfn_mock_config_throw",
     "tests/test_stepfunctions.py::test_sfn_mock_config_jsonata_assign_applied",
+    "tests/test_stepfunctions.py::test_sfn_mock_config_throw_routes_to_catch",
     "tests/test_stepfunctions.py::test_sfn_wait_scale_zero_does_not_timeout_lambda_tasks",
     "tests/test_stepfunctions.py::test_sfn_wait_scale_zero_skips_wait",
     "tests/test_rds.py::test_rds_lambda_network_connectivity",
