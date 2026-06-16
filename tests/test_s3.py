@@ -882,6 +882,11 @@ def test_s3_public_access_block(s3):
     assert cfg["BlockPublicAcls"] is True
     assert cfg["BlockPublicPolicy"] is False
     s3.delete_public_access_block(Bucket=bkt)
+    # After delete the config is gone: GetPublicAccessBlock must 404 instead of
+    # returning a default block (otherwise Terraform's delete waiter times out).
+    with pytest.raises(ClientError) as exc:
+        s3.get_public_access_block(Bucket=bkt)
+    assert exc.value.response["Error"]["Code"] == "NoSuchPublicAccessBlockConfiguration"
 
 def test_s3_ownership_controls(s3):
     bkt = "intg-s3-ownership"

@@ -1420,13 +1420,15 @@ def _get_public_access_block(name: str):
     stored = _buckets[name].get("_public_access_block")
     if stored:
         return 200, {"Content-Type": "application/xml"}, stored
-    # Default: all public access blocked
-    root = Element("PublicAccessBlockConfiguration", xmlns=S3_NS)
-    SubElement(root, "BlockPublicAcls").text = "true"
-    SubElement(root, "IgnorePublicAcls").text = "true"
-    SubElement(root, "BlockPublicPolicy").text = "true"
-    SubElement(root, "RestrictPublicBuckets").text = "true"
-    return 200, {"Content-Type": "application/xml"}, _xml_body(root)
+    # No configuration set (never put, or deleted): real S3 returns 404 rather
+    # than a default block, so DeletePublicAccessBlock is observable and the
+    # Terraform delete waiter can complete.
+    return _error(
+        "NoSuchPublicAccessBlockConfiguration",
+        "The public access block configuration was not found",
+        404,
+        f"/{name}",
+    )
 
 
 def _delete_public_access_block(name: str):
