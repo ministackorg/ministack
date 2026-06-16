@@ -1201,8 +1201,8 @@ def test_glue_user_defined_function_crud(glue):
     got2 = glue.get_user_defined_function(DatabaseName="udf_db", FunctionName="upper_clean")["UserDefinedFunction"]
     assert got2["ClassName"] == "com.example.UpperClean2"
 
-    # Pattern is a required AWS field (botocore enforces) — "*" matches everything.
-    listed = glue.get_user_defined_functions(DatabaseName="udf_db", Pattern="*")["UserDefinedFunctions"]
+    # Pattern is a regex (RE2) over the function name in real Glue — ".*" matches all.
+    listed = glue.get_user_defined_functions(DatabaseName="udf_db", Pattern=".*")["UserDefinedFunctions"]
     names = [u["FunctionName"] for u in listed]
     assert "upper_clean" in names
 
@@ -1210,6 +1210,38 @@ def test_glue_user_defined_function_crud(glue):
     with pytest.raises(ClientError) as exc2:
         glue.get_user_defined_function(DatabaseName="udf_db", FunctionName="upper_clean")
     assert exc2.value.response["Error"]["Code"] == "EntityNotFoundException"
+
+
+def test_glue_get_user_defined_functions_pattern_is_regex(glue):
+    """GetUserDefinedFunctions treats Pattern as an RE2 regex over the function
+    name, not a glob — matches real AWS Glue (the semantics Trino's Glue connector
+    relies on when resolving a UDF via `trino__<name>__.*`)."""
+    glue.create_database(DatabaseInput={"Name": "regex_db"})
+    func_name = "trino__dw_clean_text__abc123"
+    glue.create_user_defined_function(
+        DatabaseName="regex_db",
+        FunctionInput={"FunctionName": func_name, "ClassName": "com.example.Clean"},
+    )
+
+    def names(**kwargs):
+        return [u["FunctionName"] for u in glue.get_user_defined_functions(**kwargs)["UserDefinedFunctions"]]
+
+    # `.*` matches everything (real Glue: 1; old glob behaviour: 0).
+    assert func_name in names(DatabaseName="regex_db", Pattern=".*")
+    # A Trino-style anchored regex matches the function (real Glue: 1; old glob: 0).
+    assert func_name in names(DatabaseName="regex_db", Pattern="trino__dw_clean_text__.*")
+    # A regex that cannot match returns nothing.
+    assert names(DatabaseName="regex_db", Pattern="nope__.*") == []
+
+    # A bare `*` is an INVALID regex and must raise InvalidInputException
+    # (real Glue: matched 1 under the old glob behaviour — now an error).
+    with pytest.raises(ClientError) as exc:
+        glue.get_user_defined_functions(DatabaseName="regex_db", Pattern="*")
+    assert exc.value.response["Error"]["Code"] == "InvalidInputException"
+    assert "Invalid pattern syntax" in exc.value.response["Error"]["Message"]
+
+    # DatabaseName omitted searches across all databases in the catalog.
+    assert func_name in names(Pattern="trino__.*")
 
 
 def test_glue_resolve_script_account_scoped(tmp_path, monkeypatch):

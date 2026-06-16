@@ -168,6 +168,7 @@ _PRESERVED_HEADERS = (
     "content-disposition",
     "content-language",
     "expires",
+    "x-amz-website-redirect-location",
 )
 
 # Per botocore/data/s3/2006-03-01/service-2.json (StorageClass enum).

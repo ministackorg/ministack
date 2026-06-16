@@ -7,12 +7,15 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+- **S3 — preserve WebSiteRedirectLocation ** — x-amz-website-redirect-location is now preserved
+
 ### Fixed
 - **EventBridge — input transformer reserved variables** — substitute `<aws.events.event.json>`, `<aws.events.event>`, `<aws.events.rule-name>`, `<aws.events.rule-arn>`, and `<aws.events.event.ingestion-time>` so CDK-style templates that embed the source event deliver valid JSON.
 - **CloudFormation — `GetTemplateSummary` now returns `Capabilities` and `CapabilitiesReason`** — the handler already accepted `TemplateBody` and returned `Parameters` / `ResourceTypes` correctly, but omitted the `Capabilities` and `CapabilitiesReason` fields. These are now computed from the template: `CAPABILITY_NAMED_IAM` for IAM resources with explicit name properties (`RoleName`, `UserName`, etc.), `CAPABILITY_IAM` for unnamed IAM resources, and `CAPABILITY_AUTO_EXPAND` for templates with a `Transform`. `CapabilitiesReason` uses the format confirmed against the AWS API: `"The following resource(s) require capabilities: [<type>]"`. Contributed by @maximoosemine.
 - **Lambda - CreateEventSourceMapping persists FilterCriteria** — CreateEventSourceMapping was silently dropping the FilterCriteria parameter, so any filter specified at creation time was never applied.
 - **ECS — `RunTask` now applies `containerOverrides.command` to the launched Docker container** — Overridden commands (including an explicit empty command) were ignored at runtime because the Docker `containers.run(...)` call still used the task-definition command.  The effective container definition now carries the matched override command into Docker, while non-overridden containers keep their defaults.
 - **ECS — `RunTask` now injects `containerDefinitions[].secrets` from Secrets Manager** — secret `valueFrom` references (including the `:json-key:` form that selects one field from a JSON secret) were silently dropped, so containers started without those environment variables. They are now resolved in-process and merged into the container environment before container overrides are applied; SSM Parameter Store references are not yet resolved. Reported by @kamegoro.
+- **Lambda - CloudFormation-created ESMs now poll DynamoDB Streams** — Before, these streams were not getting polled.
 
 ---
 
