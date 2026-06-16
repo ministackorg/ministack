@@ -7,6 +7,8 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+- **S3 — preserve WebSiteRedirectLocation ** — x-amz-website-redirect-location is now preserved
+
 ### Fixed
 - **EventBridge — input transformer reserved variables** — substitute `<aws.events.event.json>`, `<aws.events.event>`, `<aws.events.rule-name>`, `<aws.events.rule-arn>`, and `<aws.events.event.ingestion-time>` so CDK-style templates that embed the source event deliver valid JSON.
 - **CloudFormation — `GetTemplateSummary` now returns `Capabilities` and `CapabilitiesReason`** — the handler already accepted `TemplateBody` and returned `Parameters` / `ResourceTypes` correctly, but omitted the `Capabilities` and `CapabilitiesReason` fields. These are now computed from the template: `CAPABILITY_NAMED_IAM` for IAM resources with explicit name properties (`RoleName`, `UserName`, etc.), `CAPABILITY_IAM` for unnamed IAM resources, and `CAPABILITY_AUTO_EXPAND` for templates with a `Transform`. `CapabilitiesReason` uses the format confirmed against the AWS API: `"The following resource(s) require capabilities: [<type>]"`. Contributed by @maximoosemine.

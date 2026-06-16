@@ -306,6 +306,17 @@ def test_s3_head_object(s3):
     assert resp["ContentType"] == "application/octet-stream"
     assert "ETag" in resp
 
+def test_s3_head_object_website_redirection(s3):
+    s3.create_bucket(Bucket="intg-s3-website-redirection")
+    s3.put_object(
+        Bucket="intg-s3-website-redirection",
+        Key="redirect",
+        WebsiteRedirectLocation='http://my-redirect-website',
+    )
+    resp = s3.head_object(Bucket="intg-s3-website-redirection", Key="redirect")
+    assert resp["ContentLength"] == 0
+    assert resp["WebsiteRedirectLocation"] == "http://my-redirect-website"
+
 def test_s3_head_object_not_found(s3):
     s3.create_bucket(Bucket="intg-s3-headobj404")
     with pytest.raises(ClientError) as exc:
