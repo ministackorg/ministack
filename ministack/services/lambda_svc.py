@@ -4813,7 +4813,7 @@ def _poll_dynamodb_streams():
     from ministack.services import dynamodb as _ddb
 
     stream_records = getattr(_ddb, "_stream_records", None)
-    if not stream_records:
+    if stream_records is None:
         return
 
     for (acct_id, _esm_key), esm in list(_esms._data.items()):
@@ -4833,8 +4833,6 @@ def _poll_dynamodb_streams():
         table_arn = source_arn.split("/stream/")[0]
         table_name = table_arn.split("/")[-1]
         table_records = stream_records.get(table_name, [])
-        if not table_records:
-            continue
 
         esm_id = esm["UUID"]
         with _dynamodb_stream_positions_lock:
@@ -4845,6 +4843,9 @@ def _poll_dynamodb_streams():
                 else:
                     _dynamodb_stream_positions[esm_id] = len(table_records)
             pos = _dynamodb_stream_positions[esm_id]
+
+        if not table_records:
+            continue
 
         batch_size = esm.get("BatchSize", 100)
         batch = table_records[pos:pos + batch_size]
