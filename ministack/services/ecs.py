@@ -41,7 +41,7 @@ from ministack.core.responses import (
     new_uuid,
     now_iso,
 )
-from ministack.services import ecs_metadata
+from ministack.services import ecs_metadata, secretsmanager
 
 logger = logging.getLogger("ecs")
 
@@ -999,6 +999,41 @@ def _build_run_kwargs(cdef, td, env, port_bindings, ecs_network,
     return kwargs
 
 
+def _resolve_container_secrets(cdef):
+    """Resolve a container definition's ``secrets`` into a {name: value} mapping.
+
+    Each entry's ``valueFrom`` is a Secrets Manager secret ARN, optionally with
+    a ``:json-key:version-stage:version-id`` suffix (the json-key selects one
+    field from a JSON SecretString). SSM Parameter Store references are not
+    resolved; unresolvable entries are skipped with a warning.
+    """
+    resolved = {}
+    for secret in cdef.get("secrets", []):
+        name = secret.get("name")
+        value_from = secret.get("valueFrom", "")
+        if not name or "secretsmanager" not in value_from:
+            continue
+        # A Secrets Manager ARN has 7 colon-separated fields; ECS may append
+        # :json-key:version-stage:version-id after it.
+        parts = value_from.split(":")
+        secret_arn = ":".join(parts[:7])
+        json_key = parts[7] if len(parts) > 7 and parts[7] else None
+        value = secretsmanager.resolve_secret_string(secret_arn)
+        if value is None:
+            logger.warning("ECS: could not resolve secret %s for env var %s",
+                           value_from, name)
+            continue
+        if json_key:
+            try:
+                value = json.loads(value)[json_key]
+            except (ValueError, KeyError, TypeError):
+                logger.warning("ECS: secret %s has no JSON key %s",
+                               secret_arn, json_key)
+                continue
+        resolved[name] = str(value)
+    return resolved
+
+
 def _run_task(data):
     cluster_name = _resolve_cluster_name(data.get("cluster", "default"))
     if cluster_name not in _clusters:
@@ -1102,6 +1137,7 @@ def _run_task(data):
                     env_override[e["name"]] = e["value"]
 
                 env = {e["name"]: e["value"] for e in cdef.get("environment", [])}
+                env.update(_resolve_container_secrets(cdef))
                 env.update(env_override)
                 effective_cdef = dict(cdef)
                 if "command" in container_override:
