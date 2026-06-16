@@ -317,6 +317,59 @@ def test_ecs_run_task_command_override_allows_empty_command(monkeypatch):
 
     assert fake_containers.calls[0][1]["command"] == []
 
+def test_ecs_run_task_injects_secrets_manager_secrets(monkeypatch):
+    """RunTask must resolve containerDefinitions[].secrets (Secrets Manager
+    valueFrom) and inject them into the container environment, including the
+    json-key form."""
+    from ministack.services import ecs as _ecs
+    from ministack.services import secretsmanager as _sm
+
+    _sm._create_secret({"Name": "ecs-secret-plain", "SecretString": "s3cr3t"})
+    _sm._create_secret({"Name": "ecs-secret-json",
+                        "SecretString": json.dumps({"password": "pa55"})})
+    plain_arn = _sm._resolve("ecs-secret-plain")[1]["ARN"]
+    json_arn = _sm._resolve("ecs-secret-json")[1]["ARN"]
+
+    class FakeContainers:
+        def __init__(self):
+            self.calls = []
+
+        def get(self, _name):
+            raise Exception("not found")
+
+        def list(self, *args, **kwargs):
+            return []
+
+        def run(self, image, **kwargs):
+            self.calls.append((image, kwargs))
+            return SimpleNamespace(id=f"container-{len(self.calls):012d}")
+
+    fake_containers = FakeContainers()
+    monkeypatch.setattr(_ecs, "_get_docker",
+                        lambda: SimpleNamespace(containers=fake_containers))
+
+    _ecs._register_task_definition({
+        "family": "secrets-td",
+        "containerDefinitions": [
+            {
+                "name": "app",
+                "image": "busybox",
+                "environment": [{"name": "FOO", "value": "bar"}],
+                "secrets": [
+                    {"name": "SECRET_VAL", "valueFrom": plain_arn},
+                    {"name": "DB_PASS", "valueFrom": f"{json_arn}:password::"},
+                ],
+            },
+        ],
+    })
+
+    _ecs._run_task({"cluster": "secrets-c", "taskDefinition": "secrets-td"})
+
+    env = fake_containers.calls[0][1]["environment"]
+    assert env["FOO"] == "bar"
+    assert env["SECRET_VAL"] == "s3cr3t"
+    assert env["DB_PASS"] == "pa55"
+
 def test_ecs_service(ecs):
     ecs.create_service(
         cluster="test-cluster",

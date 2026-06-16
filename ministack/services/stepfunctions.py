@@ -1347,6 +1347,7 @@ def _execute_task(state_def, raw_input, execution, ctx):
     query_language = _state_query_language(state_def, ctx)
 
     # SFN mock config — return canned response if configured (AWS SFN Local format)
+    _mock_throw = None
     if _sfn_mock_config and execution:
         test_case = execution.get("testCase", "")
         sm_name = ctx.get("StateMachine", {}).get("Name", "")
@@ -1357,24 +1358,27 @@ def _execute_task(state_def, raw_input, execution, ctx):
         if mock is not None:
             attempts[state_name] = attempt + 1
             if "Throw" in mock:
-                raise _ExecutionError(
+                # Feed the mocked error into the same Retry/Catch machinery a real
+                # task failure uses (#903). Raising here bypassed Catch entirely.
+                _mock_throw = _ExecutionError(
                     mock["Throw"].get("Error", "MockError"),
                     mock["Throw"].get("Cause", "Mocked failure"))
-            mock_result = mock.get("Return", {})
-            if query_language == "JSONata":
-                output = _apply_jsonata_output(
-                    state_def,
-                    raw_input,
-                    ctx,
-                    result=mock_result,
-                    default=mock_result,
-                )
-                _apply_state_assign(state_def, raw_input, ctx, result=mock_result)
             else:
-                result = _apply_result_selector(state_def, mock_result)
-                output = _apply_result_path(state_def, raw_input, result)
-                output = _apply_output_path(state_def, output)
-            return output, _next_or_end(state_def)
+                mock_result = mock.get("Return", {})
+                if query_language == "JSONata":
+                    output = _apply_jsonata_output(
+                        state_def,
+                        raw_input,
+                        ctx,
+                        result=mock_result,
+                        default=mock_result,
+                    )
+                    _apply_state_assign(state_def, raw_input, ctx, result=mock_result)
+                else:
+                    result = _apply_result_selector(state_def, mock_result)
+                    output = _apply_result_path(state_def, raw_input, result)
+                    output = _apply_output_path(state_def, output)
+                return output, _next_or_end(state_def)
 
     if is_callback:
         ctx["Task"] = {"Token": new_uuid()}
@@ -1400,6 +1404,9 @@ def _execute_task(state_def, raw_input, execution, ctx):
                     "resource": resource,
                 },
             })
+
+            if _mock_throw is not None:
+                raise _mock_throw
 
             if is_callback:
                 task_result = _invoke_with_callback(
