@@ -993,16 +993,22 @@ def _apply_input_transformer(transformer, event, rule=None):
         except (KeyError, TypeError, IndexError):
             replacements[var_name] = ""
 
+    # AWS generates ingestion-time when the event is received by EventBridge
+    # (always present, ISO-8601) — it is NOT the event's own `time` field and
+    # cannot be overwritten by an InputPathsMap entry.
+    ingestion_time = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     reserved = {
         "aws.events.event.json": json.dumps(event_envelope),
         "aws.events.event": json.dumps({k: v for k, v in event_envelope.items() if k != "detail"}),
-        "aws.events.event.ingestion-time": event_envelope.get("time", ""),
+        "aws.events.event.ingestion-time": ingestion_time,
     }
     if rule:
         reserved["aws.events.rule-name"] = rule.get("Name", "")
         reserved["aws.events.rule-arn"] = rule.get("Arn", "")
     for k, v in reserved.items():
         replacements.setdefault(k, v)
+    # ingestion-time is reserved and uneditable, even if InputPathsMap declares it.
+    replacements["aws.events.event.ingestion-time"] = ingestion_time
 
     result = template
     for var_name, val in replacements.items():

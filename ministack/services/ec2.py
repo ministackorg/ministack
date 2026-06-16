@@ -2355,13 +2355,25 @@ def _perm_xml(r):
         f"<item><cidrIp>{ip['CidrIp']}</cidrIp></item>"
         for ip in r.get("IpRanges", [])
     )
+    groups = ""
+    for pair in r.get("UserIdGroupPairs", []):
+        if isinstance(pair, dict):
+            gid = pair.get("GroupId", "")
+            uid = pair.get("UserId") or get_account_id()
+            gname = f"<groupName>{_esc(pair['GroupName'])}</groupName>" if pair.get("GroupName") else ""
+            vpc = f"<vpcId>{_esc(pair['VpcId'])}</vpcId>" if pair.get("VpcId") else ""
+            desc = f"<description>{_esc(pair['Description'])}</description>" if pair.get("Description") else ""
+        else:
+            gid, uid, gname, vpc, desc = str(pair), get_account_id(), "", "", ""
+        groups += (f"<item><userId>{uid}</userId><groupId>{gid}</groupId>"
+                   f"{gname}{vpc}{desc}</item>")
     from_port = f"<fromPort>{r['FromPort']}</fromPort>" if "FromPort" in r else ""
     to_port = f"<toPort>{r['ToPort']}</toPort>" if "ToPort" in r else ""
     return f"""<item>
         <ipProtocol>{r.get('IpProtocol','-1')}</ipProtocol>
         {from_port}{to_port}
         <ipRanges>{ranges}</ipRanges>
-        <ipv6Ranges/><prefixListIds/><groups/>
+        <ipv6Ranges/><prefixListIds/><groups>{groups}</groups>
     </item>"""
 
 
@@ -2693,6 +2705,28 @@ def _parse_ip_permissions(params, prefix):
             if desc:
                 entry["Description"] = desc
             rule["Ipv6Ranges"].append(entry)
+            j += 1
+        j = 1
+        while True:
+            gid = _p(params, f"{prefix}.{i}.Groups.{j}.GroupId")
+            gname = _p(params, f"{prefix}.{i}.Groups.{j}.GroupName")
+            if not gid and not gname:
+                break
+            pair = {}
+            if gid:
+                pair["GroupId"] = gid
+            if gname:
+                pair["GroupName"] = gname
+            uid = _p(params, f"{prefix}.{i}.Groups.{j}.UserId")
+            if uid:
+                pair["UserId"] = uid
+            vpc = _p(params, f"{prefix}.{i}.Groups.{j}.VpcId")
+            if vpc:
+                pair["VpcId"] = vpc
+            desc = _p(params, f"{prefix}.{i}.Groups.{j}.Description")
+            if desc:
+                pair["Description"] = desc
+            rule["UserIdGroupPairs"].append(pair)
             j += 1
         rules.append(rule)
         i += 1
@@ -4163,6 +4197,21 @@ def _describe_security_group_rules(p):
                     <toPort>{rule.get('ToPort', -1)}</toPort>
                     <cidrIpv4>{cidr.get('CidrIp', '')}</cidrIpv4>
                 </item>"""
+            for pair in rule.get("UserIdGroupPairs", []):
+                gid = pair.get("GroupId", "") if isinstance(pair, dict) else str(pair)
+                items += f"""<item>
+                    <securityGroupRuleId>{rule_id}</securityGroupRuleId>
+                    <groupId>{sg_id}</groupId>
+                    <groupOwnerId>{get_account_id()}</groupOwnerId>
+                    <isEgress>false</isEgress>
+                    <ipProtocol>{rule.get('IpProtocol', '-1')}</ipProtocol>
+                    <fromPort>{rule.get('FromPort', -1)}</fromPort>
+                    <toPort>{rule.get('ToPort', -1)}</toPort>
+                    <referencedGroupInfo>
+                        <groupId>{gid}</groupId>
+                        <userId>{get_account_id()}</userId>
+                    </referencedGroupInfo>
+                </item>"""
         for i, rule in enumerate(sg.get("IpPermissionsEgress", [])):
             rule_id = f"sgr-{sg_id[3:]}-egress-{i}"
             for cidr in rule.get("IpRanges", []):
@@ -4175,6 +4224,21 @@ def _describe_security_group_rules(p):
                     <fromPort>{rule.get('FromPort', -1)}</fromPort>
                     <toPort>{rule.get('ToPort', -1)}</toPort>
                     <cidrIpv4>{cidr.get('CidrIp', '')}</cidrIpv4>
+                </item>"""
+            for pair in rule.get("UserIdGroupPairs", []):
+                gid = pair.get("GroupId", "") if isinstance(pair, dict) else str(pair)
+                items += f"""<item>
+                    <securityGroupRuleId>{rule_id}</securityGroupRuleId>
+                    <groupId>{sg_id}</groupId>
+                    <groupOwnerId>{get_account_id()}</groupOwnerId>
+                    <isEgress>true</isEgress>
+                    <ipProtocol>{rule.get('IpProtocol', '-1')}</ipProtocol>
+                    <fromPort>{rule.get('FromPort', -1)}</fromPort>
+                    <toPort>{rule.get('ToPort', -1)}</toPort>
+                    <referencedGroupInfo>
+                        <groupId>{gid}</groupId>
+                        <userId>{get_account_id()}</userId>
+                    </referencedGroupInfo>
                 </item>"""
     return _xml(200, "DescribeSecurityGroupRulesResponse", f"<securityGroupRuleSet>{items}</securityGroupRuleSet>")
 

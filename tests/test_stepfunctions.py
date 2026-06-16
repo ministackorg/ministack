@@ -2628,6 +2628,59 @@ def test_sfn_mock_config_throw(sfn):
     assert desc["status"] == "FAILED"
     _ministack_config({"stepfunctions._sfn_mock_config": {}})
 
+
+def test_sfn_mock_config_throw_routes_to_catch(sfn):
+    """SFN_MOCK_CONFIG Throw must route to a matching Catch (not bypass it). #903."""
+    from conftest import _ministack_config
+
+    mock_cfg = {
+        "StateMachines": {
+            "qa-sfn-mock-throw-catch": {
+                "TestCases": {"FailPath": {"CallService": "MockedFailure"}}
+            }
+        },
+        "MockedResponses": {
+            "MockedFailure": {
+                "0": {"Throw": {"Error": "ServiceDown", "Cause": "mocked failure"}},
+            }
+        },
+    }
+    _ministack_config({"stepfunctions._sfn_mock_config": mock_cfg})
+
+    definition = json.dumps({
+        "StartAt": "CallService",
+        "States": {
+            "CallService": {
+                "Type": "Task",
+                "Resource": "arn:aws:lambda:us-east-1:000000000000:function:nonexistent",
+                "Catch": [{"ErrorEquals": ["ServiceDown"], "Next": "Recovered"}],
+                "End": True,
+            },
+            "Recovered": {"Type": "Pass", "Result": {"recovered": True}, "End": True},
+        },
+    })
+    sm_arn = sfn.create_state_machine(
+        name="qa-sfn-mock-throw-catch",
+        definition=definition,
+        roleArn="arn:aws:iam::000000000000:role/r",
+    )["stateMachineArn"]
+
+    exec_arn = sfn.start_execution(
+        stateMachineArn=sm_arn + "#FailPath", input="{}",
+    )["executionArn"]
+    for _ in range(20):
+        time.sleep(0.3)
+        desc = sfn.describe_execution(executionArn=exec_arn)
+        if desc["status"] != "RUNNING":
+            break
+
+    assert desc["status"] == "SUCCEEDED", f"Throw bypassed Catch: {desc.get('status')}"
+    # Reached the Catch's Next state ("Recovered"), proving the throw routed
+    # through Catch rather than failing the execution.
+    assert json.loads(desc["output"]) == {"recovered": True}
+    _ministack_config({"stepfunctions._sfn_mock_config": {}})
+
+
 def test_sfn_mock_config_jsonata_assign_applied(sfn):
     """SFN_MOCK_CONFIG + JSONata Task with Assign — variable must be visible downstream.
 
