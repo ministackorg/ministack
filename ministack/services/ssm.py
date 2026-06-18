@@ -191,6 +191,25 @@ def _put_parameter(data):
     return json_response({"Version": version, "Tier": record["Tier"]})
 
 
+def resolve_parameter_value(name_or_arn):
+    """Return an SSM parameter's value by name or ARN, or None.
+
+    Used by other services (e.g. ECS `secrets[].valueFrom`) that need to read a
+    parameter value in-process without going through the HTTP API. Accepts a
+    bare name (``/path/name`` or ``name``) or a full ARN
+    (``arn:aws:ssm:region:acct:parameter/path/name``).
+    """
+    if not name_or_arn:
+        return None
+    name = name_or_arn
+    if name_or_arn.startswith("arn:") and ":parameter" in name_or_arn:
+        name = name_or_arn.split(":parameter", 1)[1]   # -> "/path/name"
+    param = (_parameters.get(name)
+             or _parameters.get("/" + name.lstrip("/"))
+             or _parameters.get(name.lstrip("/")))
+    return param.get("Value") if param else None
+
+
 def _get_parameter(data):
     name = data.get("Name")
     param = _parameters.get(name)
