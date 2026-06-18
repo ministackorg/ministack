@@ -2707,6 +2707,38 @@ def test_cfn_apigwv2_integration_basic(cfn, apigw):
     assert apigw.get_integrations(ApiId=api_id)["Items"] == []
 
 
+def test_cfn_apigwv2_ms_custom_id(cfn, apigw):
+    """CloudFormation ms-custom-id tag pins the ApiGatewayV2 API id (issue #400)."""
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "HttpApi": {
+                "Type": "AWS::ApiGatewayV2::Api",
+                "Properties": {
+                    "Name": "cfn-apigwv2-custom-id-t01",
+                    "ProtocolType": "HTTP",
+                    "Tags": {"ms-custom-id": "cfn-pinned-api"},
+                },
+            },
+        },
+    }
+    stack_name = "cfn-apigwv2-custom-id-t01"
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(template))
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "CREATE_COMPLETE"
+
+    resources = cfn.describe_stack_resources(StackName=stack_name)["StackResources"]
+    api_res = [r for r in resources if r["ResourceType"] == "AWS::ApiGatewayV2::Api"][0]
+    assert api_res["PhysicalResourceId"] == "cfn-pinned-api"
+
+    api = apigw.get_api(ApiId="cfn-pinned-api")
+    assert api["ApiId"] == "cfn-pinned-api"
+    assert api["Name"] == "cfn-apigwv2-custom-id-t01"
+
+    cfn.delete_stack(StackName=stack_name)
+    _wait_stack(cfn, stack_name)
+
+
 def test_cfn_apigwv2_route_basic(cfn, apigw):
     """CFN stack with ApiGatewayV2 Api + Integration + Route deploys successfully."""
     template = {
