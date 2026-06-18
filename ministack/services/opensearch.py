@@ -26,6 +26,7 @@ import re
 import threading
 import time
 
+from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.responses import (
     AccountScopedDict,
     apply_image_prefix,
@@ -147,6 +148,31 @@ def _error(status, code, message):
 
 def _arn(name):
     return f"arn:aws:es:{get_region()}:{get_account_id()}:domain/{name}"
+
+
+def _resolve_taggable_opensearch_arn(arn):
+    try:
+        spec = parse_arn(arn)
+    except ArnParseError:
+        return None, _error(400, "ValidationException", f"Invalid ARN: {arn}")
+
+    if (
+        spec.partition != "aws"
+        or spec.service != "es"
+        or spec.region != get_region()
+        or spec.account_id != get_account_id()
+    ):
+        return None, _error(400, "ValidationException", f"Invalid ARN: {arn}")
+
+    prefix = "domain/"
+    if not spec.resource.startswith(prefix):
+        return None, _error(400, "ValidationException", f"Invalid ARN: {arn}")
+
+    name = spec.resource[len(prefix):]
+    rec = _domains.get(name)
+    if not rec or rec.get("ARN") != arn:
+        return None, _error(404, "ResourceNotFoundException", f"Domain not found: {name}")
+    return arn, None
 
 
 def _engine_type(version: str) -> str:
@@ -651,6 +677,9 @@ def _add_tags(payload):
     tag_list = payload.get("TagList") or []
     if not arn:
         return _error(400, "ValidationException", "ARN is required")
+    arn, err = _resolve_taggable_opensearch_arn(arn)
+    if err:
+        return err
     existing = _tags.get(arn) or []
     by_key = {t["Key"]: t for t in existing}
     for t in tag_list:
@@ -663,6 +692,9 @@ def _list_tags(query_params):
     arn = _qp(query_params, "arn")
     if not arn:
         return _error(400, "ValidationException", "arn query parameter is required")
+    arn, err = _resolve_taggable_opensearch_arn(arn)
+    if err:
+        return err
     return _json(200, {"TagList": list(_tags.get(arn) or [])})
 
 
@@ -671,6 +703,9 @@ def _remove_tags(payload):
     keys = set(payload.get("TagKeys") or [])
     if not arn:
         return _error(400, "ValidationException", "ARN is required")
+    arn, err = _resolve_taggable_opensearch_arn(arn)
+    if err:
+        return err
     existing = _tags.get(arn) or []
     _tags[arn] = [t for t in existing if t["Key"] not in keys]
     return _json(200, {})

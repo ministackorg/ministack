@@ -325,6 +325,22 @@ def test_opensearch_tag_lifecycle(os_client):
         os_client.delete_domain(DomainName=name)
 
 
+@pytest.mark.parametrize(
+    ("arn", "code"),
+    [
+        ("arn:aws:es:us-east-1:000000000000", "ValidationException"),
+        ("arn:aws:sqs:us-east-1:000000000000:domain/missing", "ValidationException"),
+        ("arn:aws:es:us-west-2:000000000000:domain/missing", "ValidationException"),
+        ("arn:aws:es:us-east-1:000000000000:domain/missing", "ResourceNotFoundException"),
+    ],
+)
+def test_opensearch_tags_require_local_domain_arn(os_client, arn, code):
+    with pytest.raises(ClientError) as exc:
+        os_client.add_tags(ARN=arn, TagList=[{"Key": "Env", "Value": "Test"}])
+
+    assert exc.value.response["Error"]["Code"] == code
+
+
 def test_opensearch_create_with_tag_list(os_client):
     name = f"ctag-{_uid()}"
     rec = os_client.create_domain(
