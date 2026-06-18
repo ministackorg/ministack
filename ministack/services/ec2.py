@@ -755,6 +755,21 @@ def _sg_rule_xml(sg_id, rule, idx, is_egress=False):
                   f"<toPort>{rule.get('ToPort', -1)}</toPort>"
                   f"<cidrIpv6>{cidr6.get('CidrIpv6', '')}</cidrIpv6>"
                   f"</item>")
+    for pair in rule.get("UserIdGroupPairs", []):
+        ref_gid = pair.get("GroupId", "") if isinstance(pair, dict) else str(pair)
+        items += (f"<item>"
+                  f"<securityGroupRuleId>{rule_id}</securityGroupRuleId>"
+                  f"<groupId>{sg_id}</groupId>"
+                  f"<groupOwnerId>{get_account_id()}</groupOwnerId>"
+                  f"<isEgress>{'true' if is_egress else 'false'}</isEgress>"
+                  f"<ipProtocol>{rule.get('IpProtocol', '-1')}</ipProtocol>"
+                  f"<fromPort>{rule.get('FromPort', -1)}</fromPort>"
+                  f"<toPort>{rule.get('ToPort', -1)}</toPort>"
+                  f"<referencedGroupInfo>"
+                  f"<groupId>{ref_gid}</groupId>"
+                  f"<userId>{get_account_id()}</userId>"
+                  f"</referencedGroupInfo>"
+                  f"</item>")
     if not items:
         # No CIDR ranges — still return the rule (e.g. referenced group)
         items = (f"<item>"
@@ -2669,6 +2684,48 @@ def _matches_filters(inst, filters):
     return True
 
 
+def _parse_legacy_ip_permission(params):
+    """Parse the legacy single-rule top-level parameter form of
+    Authorize/RevokeSecurityGroupIngress/Egress.
+
+    The AWS CLI (`--protocol/--port/--cidr/--source-group`), older SDKs, and
+    direct API callers send a single permission as flat top-level params
+    (IpProtocol, FromPort, ToPort, CidrIp, SourceSecurityGroupId/Name/OwnerId)
+    rather than the nested IpPermissions.N.* structure. Real EC2 accepts both;
+    MiniStack previously dropped the legacy form (issue #916).
+    """
+    proto = _p(params, "IpProtocol")
+    if not proto:
+        return []
+    rule = {"IpProtocol": proto, "IpRanges": [], "Ipv6Ranges": [],
+            "PrefixListIds": [], "UserIdGroupPairs": []}
+    from_port = _p(params, "FromPort")
+    to_port = _p(params, "ToPort")
+    if from_port:
+        rule["FromPort"] = int(from_port)
+    if to_port:
+        rule["ToPort"] = int(to_port)
+    cidr = _p(params, "CidrIp")
+    if cidr:
+        rule["IpRanges"].append({"CidrIp": cidr})
+    cidr6 = _p(params, "CidrIpv6")
+    if cidr6:
+        rule["Ipv6Ranges"].append({"CidrIpv6": cidr6})
+    src_gid = _p(params, "SourceSecurityGroupId")
+    src_gname = _p(params, "SourceSecurityGroupName")
+    if src_gid or src_gname:
+        pair = {}
+        if src_gid:
+            pair["GroupId"] = src_gid
+        if src_gname:
+            pair["GroupName"] = src_gname
+        owner = _p(params, "SourceSecurityGroupOwnerId")
+        if owner:
+            pair["UserId"] = owner
+        rule["UserIdGroupPairs"].append(pair)
+    return [rule]
+
+
 def _parse_ip_permissions(params, prefix):
     rules = []
     i = 1
@@ -2730,6 +2787,9 @@ def _parse_ip_permissions(params, prefix):
             j += 1
         rules.append(rule)
         i += 1
+    if not rules:
+        # Fall back to the legacy flat single-rule form (CLI --source-group/--cidr).
+        return _parse_legacy_ip_permission(params)
     return rules
 
 
