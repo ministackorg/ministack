@@ -364,23 +364,35 @@ def test_ministack_persist_s3_logging_accelerate_request_payment_roundtrip():
     _s3._bucket_request_payment_config.pop("persist-log-bkt")
 
 def test_ministack_persist_lambda_roundtrip():
+    import hashlib
+    import os
     from ministack.services import lambda_svc as _lam
+    code = b"fake-zip-bytes"
+    sha = hashlib.sha256(code).hexdigest()
     _lam._functions["persist-fn"] = {
         "config": {"FunctionName": "persist-fn", "Runtime": "python3.11"},
-        "code_zip": b"fake-zip-bytes",
+        "code_zip": code,
         "versions": {},
         "next_version": 1,
     }
-    state = _lam.get_state()
-    assert "functions" in state
-    # code_zip should be base64-encoded in state
-    assert isinstance(state["functions"]["persist-fn"]["code_zip"], str)
-    _lam._functions.pop("persist-fn")
-    _lam.restore_state(state)
-    assert "persist-fn" in _lam._functions
-    # code_zip should be decoded back to bytes
-    assert _lam._functions["persist-fn"]["code_zip"] == b"fake-zip-bytes"
-    _lam._functions.pop("persist-fn")
+    try:
+        state = _lam.get_state()
+        assert "functions" in state
+        # code_zip is replaced with a content-addressed blob reference in state;
+        # the bytes themselves live under ${STATE_DIR}/lambda-blobs/{sha}.zip.
+        assert state["functions"]["persist-fn"]["code_zip"] == {"code_blob_ref": sha}
+        _lam._functions.pop("persist-fn")
+        _lam.restore_state(state)
+        assert "persist-fn" in _lam._functions
+        # code_zip is restored back to bytes.
+        assert _lam._functions["persist-fn"]["code_zip"] == code
+    finally:
+        _lam._functions.pop("persist-fn", None)
+        # Clean up the blob file written as a side effect of get_state.
+        try:
+            os.remove(os.path.join(_lam.CODE_BLOB_DIR, f"{sha}.zip"))
+        except OSError:
+            pass
 
 def test_ministack_persist_rds_roundtrip():
     from ministack.services import rds as _rds
