@@ -333,6 +333,52 @@ def test_elbv2_tags(elbv2):
 
     elbv2.delete_load_balancer(LoadBalancerArn=lb_arn)
 
+
+@pytest.mark.parametrize(
+    ("arn", "code"),
+    [
+        ("not-an-arn", "ValidationError"),
+        (
+            "arn:aws:sqs:us-east-1:000000000000:loadbalancer/app/qa-alb-tags/missing",
+            "ValidationError",
+        ),
+        (
+            "arn:aws:elasticloadbalancing:us-west-2:000000000000:loadbalancer/app/qa-alb-tags/missing",
+            "ValidationError",
+        ),
+        (
+            "arn:aws:elasticloadbalancing:us-east-1:000000000000:loadbalancer/app/qa-alb-tags/missing",
+            "LoadBalancerNotFound",
+        ),
+    ],
+)
+def test_elbv2_tag_arns_must_parse_to_local_resources(elbv2, arn, code):
+    with pytest.raises(ClientError) as exc:
+        elbv2.add_tags(ResourceArns=[arn], Tags=[{"Key": "env", "Value": "test"}])
+
+    assert exc.value.response["Error"]["Code"] == code
+
+
+def test_elbv2_add_tags_validates_all_arns_before_mutating(elbv2):
+    lb_arn = elbv2.create_load_balancer(Name="qa-alb-tags-atomic")["LoadBalancers"][0]["LoadBalancerArn"]
+    missing_arn = (
+        "arn:aws:elasticloadbalancing:us-east-1:000000000000:"
+        "loadbalancer/app/qa-alb-tags-atomic/missing"
+    )
+
+    with pytest.raises(ClientError) as exc:
+        elbv2.add_tags(
+            ResourceArns=[lb_arn, missing_arn],
+            Tags=[{"Key": "team", "Value": "infra"}],
+        )
+
+    assert exc.value.response["Error"]["Code"] == "LoadBalancerNotFound"
+    desc = elbv2.describe_tags(ResourceArns=[lb_arn])
+    assert desc["TagDescriptions"][0]["Tags"] == []
+
+    elbv2.delete_load_balancer(LoadBalancerArn=lb_arn)
+
+
 # Migrated from test_alb.py
 def _alb_zip(code: str) -> bytes:
     buf = io.BytesIO()

@@ -143,6 +143,45 @@ def _target_group_full_name_from_arn(arn: str) -> str:
     return _elbv2_resource_tail(arn, "targetgroup/")
 
 
+def _resolve_taggable_elbv2_arn(arn: str):
+    try:
+        spec = parse_arn(arn)
+    except ArnParseError:
+        return None, _error("ValidationError", f"Invalid resource ARN: {arn}")
+
+    if (
+        spec.partition != "aws"
+        or spec.service != "elasticloadbalancing"
+        or spec.region != get_region()
+        or spec.account_id != get_account_id()
+    ):
+        return None, _error("ValidationError", f"Invalid resource ARN: {arn}")
+
+    resources = (
+        ("loadbalancer/", _lbs, "LoadBalancerNotFound", "Load balancer"),
+        ("targetgroup/", _tgs, "TargetGroupNotFound", "Target group"),
+        ("listener/", _listeners, "ListenerNotFound", "Listener"),
+        ("listener-rule/", _rules, "RuleNotFound", "Rule"),
+    )
+    for prefix, store, code, label in resources:
+        if spec.resource.startswith(prefix):
+            if arn not in store:
+                return None, _error(code, f"{label} '{arn}' not found.")
+            return arn, None
+
+    return None, _error("ValidationError", f"Invalid resource ARN: {arn}")
+
+
+def _resolve_taggable_elbv2_arns(arns):
+    resolved = []
+    for arn in arns:
+        arn, err = _resolve_taggable_elbv2_arn(arn)
+        if err:
+            return [], err
+        resolved.append(arn)
+    return resolved, None
+
+
 def _parse_actions(params, prefix="DefaultActions"):
     actions, i = [], 1
     while True:
@@ -833,7 +872,9 @@ def _describe_target_health(params):
 # ---------------------------------------------------------------------------
 
 def _add_tags(params):
-    arns = _parse_member_list(params, "ResourceArns")
+    arns, err = _resolve_taggable_elbv2_arns(_parse_member_list(params, "ResourceArns"))
+    if err:
+        return err
     new_tags = _parse_tags(params)
     for arn in arns:
         existing = _tags.setdefault(arn, [])
@@ -848,7 +889,9 @@ def _add_tags(params):
 
 
 def _remove_tags(params):
-    arns = _parse_member_list(params, "ResourceArns")
+    arns, err = _resolve_taggable_elbv2_arns(_parse_member_list(params, "ResourceArns"))
+    if err:
+        return err
     key_set = set(_parse_member_list(params, "TagKeys"))
     for arn in arns:
         if arn in _tags:
@@ -860,6 +903,9 @@ def _describe_tags(params):
     arns = _parse_member_list(params, "ResourceArns")
     descs = ""
     for arn in arns:
+        arn, err = _resolve_taggable_elbv2_arn(arn)
+        if err:
+            return err
         tags_xml = "".join(
             f"<member><Key>{t['Key']}</Key><Value>{t['Value']}</Value></member>"
             for t in _tags.get(arn, [])
