@@ -30,6 +30,7 @@ from xml.etree.ElementTree import Element, SubElement, tostring
 
 from defusedxml.ElementTree import fromstring
 
+from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.persistence import PERSIST_STATE, load_state
 from ministack.core.responses import AccountScopedDict, get_account_id, new_uuid
 
@@ -373,6 +374,40 @@ def _func_arn(name: str) -> str:
 
 def _kvs_arn(name: str) -> str:
     return f"arn:aws:cloudfront::{get_account_id()}:key-value-store/{name}"
+
+
+def _resolve_taggable_cloudfront_arn(arn: str):
+    try:
+        spec = parse_arn(arn)
+    except ArnParseError:
+        return None, _error("InvalidArgument", f"Invalid resource ARN: {arn}", 400)
+
+    if (
+        spec.partition != "aws"
+        or spec.service != "cloudfront"
+        or spec.region
+        or spec.account_id != get_account_id()
+    ):
+        return None, _error("InvalidArgument", f"Invalid resource ARN: {arn}", 400)
+
+    resource_type, sep, name = spec.resource.partition("/")
+    if not sep or not name:
+        return None, _error("InvalidArgument", f"Invalid resource ARN: {arn}", 400)
+
+    resources = {
+        "distribution": (_distributions, "NoSuchDistribution", "The specified distribution does not exist.", "ARN"),
+        "function": (_functions, "NoSuchFunctionExists", "The specified function does not exist.", "arn"),
+        "key-value-store": (_kvstores, "EntityNotFound", f"The key value store {name} was not found.", "ARN"),
+    }
+    entry = resources.get(resource_type)
+    if not entry:
+        return None, _error("InvalidArgument", f"Invalid resource ARN: {arn}", 400)
+
+    store, code, message, arn_key = entry
+    record = store.get(name)
+    if not record or record.get(arn_key) != arn:
+        return None, _error(code, message, 404)
+    return arn, None
 
 
 def _function_summary_builder(fn: dict, stage: str, status: str, last_modified: str):
@@ -1078,6 +1113,9 @@ def _get_invalidation(dist_id, inv_id):
 
 
 def _list_tags(resource_arn):
+    resource_arn, err = _resolve_taggable_cloudfront_arn(resource_arn)
+    if err:
+        return err
     tags = _tags.get(resource_arn, [])
     root = Element("Tags", xmlns=NS)
     items = SubElement(root, "Items")
@@ -1090,6 +1128,9 @@ def _list_tags(resource_arn):
 
 
 def _tag_resource(resource_arn, body):
+    resource_arn, err = _resolve_taggable_cloudfront_arn(resource_arn)
+    if err:
+        return err
     el = _parse_body(body)
     items_el = _find(el, "Items") or _find(el, "Tags")
     if items_el is None:
@@ -1107,6 +1148,9 @@ def _tag_resource(resource_arn, body):
 
 
 def _untag_resource(resource_arn, body):
+    resource_arn, err = _resolve_taggable_cloudfront_arn(resource_arn)
+    if err:
+        return err
     el = _parse_body(body)
     items_el = _find(el, "Items") or _find(el, "Keys")
     if items_el is None:
