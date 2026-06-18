@@ -178,6 +178,53 @@ def test_elasticache_tags(ec):
     assert "env" in tag_keys
     assert "team" not in tag_keys
 
+
+def test_elasticache_tag_arns_must_parse_to_local_resources(ec):
+    name = f"tag-pg-{_uuid_mod.uuid4().hex[:8]}"
+    ec.create_cache_parameter_group(
+        CacheParameterGroupName=name,
+        CacheParameterGroupFamily="redis7.0",
+        Description="tag parser test",
+    )
+    arn = f"arn:aws:elasticache:us-east-1:000000000000:parametergroup:{name}"
+
+    ec.add_tags_to_resource(ResourceName=arn, Tags=[{"Key": "env", "Value": "test"}])
+    tags = ec.list_tags_for_resource(ResourceName=arn)["TagList"]
+    assert {t["Key"]: t["Value"] for t in tags} == {"env": "test"}
+
+    with pytest.raises(ClientError) as exc:
+        ec.add_tags_to_resource(
+            ResourceName=f"arn:aws:elasticache:us-west-2:000000000000:parametergroup:{name}",
+            Tags=[{"Key": "env", "Value": "test"}],
+        )
+    assert exc.value.response["Error"]["Code"] == "InvalidParameterValue"
+
+    with pytest.raises(ClientError) as exc:
+        ec.list_tags_for_resource(
+            ResourceName="arn:aws:elasticache:us-east-1:000000000000:parametergroup:missing"
+        )
+    assert exc.value.response["Error"]["Code"] == "CacheParameterGroupNotFound"
+
+    ec.delete_cache_parameter_group(CacheParameterGroupName=name)
+
+
+def test_elasticache_cluster_tag_arn_uses_cache_cluster_arn_field(ec):
+    cluster_id = f"tag-cluster-{_uuid_mod.uuid4().hex[:8]}"
+    ec.create_cache_cluster(
+        CacheClusterId=cluster_id,
+        Engine="redis",
+        CacheNodeType="cache.t3.micro",
+        NumCacheNodes=1,
+    )
+    arn = ec.describe_cache_clusters(CacheClusterId=cluster_id)["CacheClusters"][0]["ARN"]
+
+    ec.add_tags_to_resource(ResourceName=arn, Tags=[{"Key": "env", "Value": "test"}])
+    tags = ec.list_tags_for_resource(ResourceName=arn)["TagList"]
+    assert {t["Key"]: t["Value"] for t in tags} == {"env": "test"}
+
+    ec.delete_cache_cluster(CacheClusterId=cluster_id)
+
+
 # Migrated from test_ec.py
 @requires_docker
 def test_elasticache_create_cluster_v2(ec):
