@@ -779,6 +779,83 @@ def _archive_name_from_ref(source_arn):
     return _events_resource_name_from_ref(source_arn, "archive/", "EventSourceArn")
 
 
+def _resolve_taggable_events_arn(arn):
+    try:
+        spec = parse_arn(arn)
+    except ArnParseError:
+        return None, error_response_json(
+            "ValidationException",
+            "Parameter ResourceARN is not valid. Reason: Provided Arn is not in correct format.",
+            400,
+        )
+
+    if spec.partition != "aws" or spec.service != "events":
+        return None, error_response_json(
+            "ValidationException",
+            "Parameter ResourceARN is not valid. Reason: Provided Arn is not an EventBridge ResourceARN.",
+            400,
+        )
+    if spec.region != get_region() or spec.account_id != get_account_id():
+        return None, error_response_json(
+            "ResourceNotFoundException",
+            f"EventBridge resource {arn} does not exist.",
+            400,
+        )
+
+    resource = spec.resource
+    if resource.startswith("event-bus/"):
+        name = resource.split("/", 1)[1]
+        if name == "default":
+            exists = arn == f"arn:aws:events:{get_region()}:{get_account_id()}:event-bus/default"
+        else:
+            record = _event_buses.get(name)
+            exists = bool(record) and record.get("Arn") == arn
+    elif resource.startswith("rule/"):
+        parts = resource.split("/")
+        if len(parts) == 2:
+            bus, rule = "default", parts[1]
+        elif len(parts) == 3:
+            _, bus, rule = parts
+        else:
+            bus, rule = "", ""
+        record = _rules.get(_rule_key(rule, bus)) if rule else None
+        exists = bool(record) and record.get("Arn") == arn
+    elif resource.startswith("archive/"):
+        name = resource.split("/", 1)[1]
+        record = _archives.get(name)
+        exists = bool(record) and record.get("ArchiveArn") == arn
+    elif resource.startswith("replay/"):
+        name = resource.split("/", 1)[1]
+        record = _replays.get(name)
+        exists = bool(record) and record.get("ReplayArn") == arn
+    elif resource.startswith("endpoint/"):
+        name = resource.split("/", 1)[1]
+        record = _endpoints.get(name)
+        exists = bool(record) and record.get("Arn") == arn
+    elif resource.startswith("connection/"):
+        name = resource.split("/", 1)[1]
+        record = _connections.get(name)
+        exists = bool(record) and record.get("ConnectionArn") == arn
+    elif resource.startswith("api-destination/"):
+        name = resource.split("/", 1)[1]
+        record = _api_destinations.get(name)
+        exists = bool(record) and record.get("ApiDestinationArn") == arn
+    else:
+        return None, error_response_json(
+            "ValidationException",
+            "Parameter ResourceARN is not valid. Reason: Provided Arn is not a taggable EventBridge resource.",
+            400,
+        )
+
+    if not exists:
+        return None, error_response_json(
+            "ResourceNotFoundException",
+            f"EventBridge resource {arn} does not exist.",
+            400,
+        )
+    return arn, None
+
+
 def _put_events(data):
     entries = data.get("Entries", [])
     # AWS spec: PutEvents.Entries list min=1 max=10. Real AWS rejects with
@@ -1272,6 +1349,9 @@ def _dispatch_to_stepfunctions(arn, payload):
 
 def _tag_resource(data):
     arn = data.get("ResourceARN", "")
+    arn, err = _resolve_taggable_events_arn(arn)
+    if err:
+        return err
     tags = data.get("Tags", [])
     if arn not in _tags:
         _tags[arn] = {}
@@ -1282,6 +1362,9 @@ def _tag_resource(data):
 
 def _untag_resource(data):
     arn = data.get("ResourceARN", "")
+    arn, err = _resolve_taggable_events_arn(arn)
+    if err:
+        return err
     keys = data.get("TagKeys", [])
     if arn in _tags:
         for k in keys:
@@ -1291,6 +1374,9 @@ def _untag_resource(data):
 
 def _list_tags_for_resource(data):
     arn = data.get("ResourceARN", "")
+    arn, err = _resolve_taggable_events_arn(arn)
+    if err:
+        return err
     tag_dict = _tags.get(arn, {})
     tag_list = [{"Key": k, "Value": v} for k, v in tag_dict.items()]
     return json_response({"Tags": tag_list})

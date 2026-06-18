@@ -6,6 +6,7 @@ import uuid as _uuid_mod
 import zipfile
 from urllib.parse import urlparse
 
+import boto3
 import pytest
 from botocore.exceptions import ClientError
 
@@ -850,6 +851,60 @@ def test_eventbridge_tags_v2(eb):
     tags2 = eb.list_tags_for_resource(ResourceARN=arn)["Tags"]
     assert not any(t["Key"] == "stage" for t in tags2)
     assert any(t["Key"] == "team" for t in tags2)
+
+
+@pytest.mark.parametrize(
+    ("arn", "code"),
+    [
+        ("not-an-arn", "ValidationException"),
+        ("arn:aws:sqs:us-east-1:000000000000:rule/missing", "ValidationException"),
+        ("arn:aws:events:us-west-2:000000000000:rule/missing", "ResourceNotFoundException"),
+        ("arn:aws:events:us-east-1:000000000000:rule/missing", "ResourceNotFoundException"),
+    ],
+)
+def test_eventbridge_tag_resource_requires_local_eventbridge_arn(eb, arn, code):
+    with pytest.raises(ClientError) as exc:
+        eb.tag_resource(ResourceARN=arn, Tags=[{"Key": "env", "Value": "test"}])
+
+    assert exc.value.response["Error"]["Code"] == code
+
+
+def test_eventbridge_tag_resource_rejects_same_name_other_region_bus(eb):
+    name = f"eb-tag-region-{_uuid_mod.uuid4().hex[:8]}"
+    eb.create_event_bus(Name=name)
+    west = boto3.client(
+        "events",
+        endpoint_url=os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566"),
+        aws_access_key_id="test",
+        aws_secret_access_key="test",
+        region_name="us-west-2",
+    )
+    west_arn = f"arn:aws:events:us-west-2:000000000000:event-bus/{name}"
+
+    with pytest.raises(ClientError) as exc:
+        west.tag_resource(ResourceARN=west_arn, Tags=[{"Key": "env", "Value": "test"}])
+
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
+def test_eventbridge_tag_resource_accepts_default_bus_in_secondary_region(eb):
+    eb.list_tags_for_resource(
+        ResourceARN="arn:aws:events:us-east-1:000000000000:event-bus/default",
+    )
+    west = boto3.client(
+        "events",
+        endpoint_url=os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566"),
+        aws_access_key_id="test",
+        aws_secret_access_key="test",
+        region_name="us-west-2",
+    )
+    west_arn = "arn:aws:events:us-west-2:000000000000:event-bus/default"
+
+    west.tag_resource(ResourceARN=west_arn, Tags=[{"Key": "env", "Value": "west"}])
+    tags = west.list_tags_for_resource(ResourceARN=west_arn)["Tags"]
+
+    assert {t["Key"]: t["Value"] for t in tags} == {"env": "west"}
+
 
 def test_eventbridge_archive(eb):
     import uuid as _uuid
