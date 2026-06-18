@@ -326,6 +326,105 @@ def test_ec2_sg_authorize_ingress_idempotent_duplicate(ec2):
     ec2.delete_security_group(GroupId=sg_id)
 
 
+def test_ec2_sg_authorize_ingress_legacy_source_group(ec2):
+    """Legacy top-level --source-group params (CLI/Terraform) must create a real
+    referenced-group rule visible in DescribeSecurityGroups AND
+    DescribeSecurityGroupRules, with a SecurityGroupRuleId matching the Authorize
+    response. Regression for issue #916."""
+    vpc = ec2.create_vpc(CidrBlock="10.111.0.0/16")["Vpc"]
+    sg_a = ec2.create_security_group(
+        GroupName="sg-a-916", Description="a", VpcId=vpc["VpcId"])["GroupId"]
+    sg_b = ec2.create_security_group(
+        GroupName="sg-b-916", Description="b", VpcId=vpc["VpcId"])["GroupId"]
+
+    # The AWS CLI `authorize-security-group-ingress --protocol tcp --port 8080
+    # --source-group <id>` (and older SDKs) serialize to legacy top-level
+    # parameters rather than the nested IpPermissions.N.Groups.M form. Inject
+    # exactly that wire shape so the test exercises the same code path.
+    def _inject_legacy(request, **kwargs):
+        request.data = (
+            f"Action=AuthorizeSecurityGroupIngress&Version=2016-11-15"
+            f"&GroupId={sg_b}&IpProtocol=tcp&FromPort=8080&ToPort=8080"
+            f"&SourceSecurityGroupId={sg_a}"
+        )
+
+    ec2.meta.events.register(
+        "before-sign.ec2.AuthorizeSecurityGroupIngress", _inject_legacy)
+    try:
+        resp = ec2.authorize_security_group_ingress(GroupId=sg_b)
+    finally:
+        ec2.meta.events.unregister(
+            "before-sign.ec2.AuthorizeSecurityGroupIngress", _inject_legacy)
+
+    assert resp.get("Return") is True
+    auth_rules = resp.get("SecurityGroupRules", [])
+    assert len(auth_rules) == 1, f"expected 1 rule from Authorize, got {auth_rules}"
+    auth_rule_id = auth_rules[0]["SecurityGroupRuleId"]
+    assert auth_rules[0].get("ReferencedGroupInfo", {}).get("GroupId") == sg_a
+
+    # DescribeSecurityGroups must show the UserIdGroupPairs reference.
+    perms = ec2.describe_security_groups(
+        GroupIds=[sg_b])["SecurityGroups"][0]["IpPermissions"]
+    pairs = [pair for p in perms for pair in p.get("UserIdGroupPairs", [])]
+    assert any(pair.get("GroupId") == sg_a for pair in pairs), \
+        f"UserIdGroupPairs missing reference to {sg_a}: {perms}"
+
+    # DescribeSecurityGroupRules must return the rule with ReferencedGroupInfo
+    # and a SecurityGroupRuleId matching the Authorize response.
+    sgr = ec2.describe_security_group_rules(
+        Filters=[{"Name": "group-id", "Values": [sg_b]}])["SecurityGroupRules"]
+    ref_rules = [r for r in sgr if r.get("ReferencedGroupInfo", {}).get("GroupId") == sg_a]
+    assert len(ref_rules) == 1, \
+        f"DescribeSecurityGroupRules missing referenced-group rule: {sgr}"
+    assert ref_rules[0]["SecurityGroupRuleId"] == auth_rule_id
+    assert ref_rules[0]["IsEgress"] is False
+    assert ref_rules[0]["IpProtocol"] == "tcp"
+    assert ref_rules[0]["FromPort"] == 8080
+    assert ref_rules[0]["ToPort"] == 8080
+
+    ec2.delete_security_group(GroupId=sg_b)
+    ec2.delete_security_group(GroupId=sg_a)
+
+
+def test_ec2_sg_authorize_ingress_referenced_group_nested(ec2):
+    """The nested IpPermissions form (what boto3 and the Terraform AWS provider
+    send for a source-security-group rule) must return ReferencedGroupInfo in the
+    AuthorizeSecurityGroupIngress response, with a SecurityGroupRuleId consistent
+    with DescribeSecurityGroupRules. Regression for issue #916: previously the
+    Authorize response omitted ReferencedGroupInfo for group-pair rules."""
+    vpc = ec2.create_vpc(CidrBlock="10.112.0.0/16")["Vpc"]
+    sg_a = ec2.create_security_group(
+        GroupName="sg-a-916n", Description="a", VpcId=vpc["VpcId"])["GroupId"]
+    sg_b = ec2.create_security_group(
+        GroupName="sg-b-916n", Description="b", VpcId=vpc["VpcId"])["GroupId"]
+
+    resp = ec2.authorize_security_group_ingress(
+        GroupId=sg_b,
+        IpPermissions=[{
+            "IpProtocol": "tcp", "FromPort": 8080, "ToPort": 8080,
+            "UserIdGroupPairs": [{"GroupId": sg_a}],
+        }],
+    )
+    auth_rules = resp.get("SecurityGroupRules", [])
+    assert len(auth_rules) == 1, f"expected 1 rule from Authorize, got {auth_rules}"
+    assert auth_rules[0].get("ReferencedGroupInfo", {}).get("GroupId") == sg_a, \
+        f"Authorize response missing ReferencedGroupInfo: {auth_rules}"
+    auth_rule_id = auth_rules[0]["SecurityGroupRuleId"]
+
+    # The same referenced-group rule must be discoverable (and ID-consistent) via
+    # DescribeSecurityGroupRules — this is what Terraform's create waiter polls.
+    sgr = ec2.describe_security_group_rules(
+        Filters=[{"Name": "group-id", "Values": [sg_b]}])["SecurityGroupRules"]
+    ref_rules = [r for r in sgr if r.get("ReferencedGroupInfo", {}).get("GroupId") == sg_a]
+    assert len(ref_rules) == 1, \
+        f"DescribeSecurityGroupRules missing referenced-group rule: {sgr}"
+    assert ref_rules[0]["SecurityGroupRuleId"] == auth_rule_id
+    assert ref_rules[0]["IsEgress"] is False
+
+    ec2.delete_security_group(GroupId=sg_b)
+    ec2.delete_security_group(GroupId=sg_a)
+
+
 def test_ec2_key_pair_crud(ec2):
     resp = ec2.create_key_pair(KeyName="qa-ec2-key")
     assert resp["KeyName"] == "qa-ec2-key"
