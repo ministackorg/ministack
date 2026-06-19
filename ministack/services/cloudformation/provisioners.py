@@ -3524,7 +3524,7 @@ def _cw_metric_alarm_delete(physical_id, props):
 # ---------------------------------------------------------------------------
 
 def _apigw_v2_api_create(logical_id, props, stack_name):
-    api_id = new_uuid()[:8]
+    api_id = _apigw_v2._resolve_custom_api_id(props.get("Tags", {}), _apigw_v2._apis) or new_uuid()[:8]
     name = props.get("Name") or _physical_name(stack_name, logical_id, max_len=128)
     protocol = props.get("ProtocolType", "HTTP")
     api = {

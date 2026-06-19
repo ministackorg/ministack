@@ -4571,6 +4571,7 @@ def _create_esm(data: dict):
     }
     if ":sqs:" not in event_source_arn:
         esm["StartingPosition"] = data.get("StartingPosition", "LATEST")
+        _init_stream_position(esm_id, event_source_arn, esm["StartingPosition"])
     if data.get("FilterCriteria"):
         esm["FilterCriteria"] = data.get("FilterCriteria")
     # #442: Tags are accepted on CreateEventSourceMapping. Stored inline on
@@ -4673,6 +4674,27 @@ _kinesis_positions = AccountScopedDict()
 # Per-ESM DynamoDB stream tracking: esm_uuid -> {shard_id: position}
 _dynamodb_stream_positions = AccountScopedDict()
 _dynamodb_stream_positions_lock = threading.Lock()
+
+
+def _init_stream_position(esm_id, source_arn, starting):
+    """Anchor a DynamoDB-stream ESM's read position at subscription time so
+    LATEST does not depend on when the poller thread first ticks. No-op if the
+    position was already set."""
+    if ":dynamodb:" not in source_arn or "/stream/" not in source_arn:
+        return
+    from ministack.services import dynamodb as _ddb
+
+    stream_records = getattr(_ddb, "_stream_records", None)
+    if stream_records is None:
+        return
+    table_name = source_arn.split("/stream/")[0].split("/")[-1]
+    with _dynamodb_stream_positions_lock:
+        if esm_id in _dynamodb_stream_positions:
+            return
+        if starting == "TRIM_HORIZON":
+            _dynamodb_stream_positions[esm_id] = 0
+        else:
+            _dynamodb_stream_positions[esm_id] = len(stream_records.get(table_name, []))
 
 
 def _ensure_poller():
