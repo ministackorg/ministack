@@ -16,6 +16,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.plan.outputs.matrix }}
+      files: ${{ steps.plan.outputs.files }}
     steps:
       - uses: actions/checkout@v6
 
@@ -69,16 +70,28 @@ jobs:
           done
           curl -sf http://localhost:4566/_ministack/health
 
-      - name: Run tests (${{ matrix.mode }} shard ${{ matrix.shard_index }}, ${{ matrix.test_count }} tests)
+      - name: Resolve shard files
+        id: shard
+        env:
+          FILES_MAP: ${{ needs.setup.outputs.files }}
         run: |
-          if [ -z "${{ matrix.files }}" ]; then
+          FILES=$(python3 -c "
+          import json, os
+          m = json.loads(os.environ['FILES_MAP'])
+          print(m.get('${{ matrix.mode }}_${{ matrix.shard_index }}', ''))
+          ")
+          echo "files=$FILES" >> $GITHUB_OUTPUT
+
+      - name: Run tests (${{ matrix.mode }} shard ${{ matrix.shard_index }})
+        run: |
+          if [ -z "${{ steps.shard.outputs.files }}" ]; then
             echo "No tests for this shard"
             exit 0
           fi
           if [ "${{ matrix.mode }}" = "serial" ]; then
-            pytest ${{ matrix.files }} -v --tb=short -m "serial" --durations=10
+            pytest ${{ steps.shard.outputs.files }} -v --tb=short -m "serial" --durations=10
           else
-            pytest ${{ matrix.files }} -v -n 3 --dist=loadfile -m "not serial" --durations=25
+            pytest ${{ steps.shard.outputs.files }} -v -n 3 --dist=loadfile -m "not serial" --durations=25
           fi
 
       - name: Upload MiniStack log

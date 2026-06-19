@@ -80,6 +80,11 @@ def main() -> None:
             "test_count": sum(serial_files[f] for f in shard_files),
         })
 
+    # files map: "parallel_0" -> "tests/a.py tests/b.py", used by test jobs
+    files_map = {f"{e['mode']}_{e['shard_index']}": e.pop("files") for e in includes}
+    for e in includes:
+        e.pop("test_count", None)  # not needed in matrix, already printed above
+
     matrix = {"include": includes}
 
     # ── emit ──────────────────────────────────────────────────────────────────
@@ -88,10 +93,13 @@ def main() -> None:
     if github_output:
         with open(github_output, "a") as fh:
             fh.write(f"matrix={json.dumps(matrix)}\n")
-        print("Matrix written to $GITHUB_OUTPUT")
+            fh.write(f"files={json.dumps(files_map)}\n")
+        print("matrix + files written to $GITHUB_OUTPUT")
     else:
         print("Matrix JSON (GITHUB_OUTPUT not set, dry run):")
         print(json.dumps(matrix, indent=2))
+        print("\nFiles map:")
+        print(json.dumps(files_map, indent=2))
 
 
 if __name__ == "__main__":
