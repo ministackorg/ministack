@@ -10,6 +10,7 @@ jobs:
   test:
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         include:
           - mode: parallel
@@ -79,3 +80,11 @@ jobs:
         with:
           name: ministack-${{ matrix.mode }}-shard-${{ matrix.shard_index }}.log
           path: ministack.log
+
+  test-result:
+    name: test
+    needs: test
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - run: '[ "${{ needs.test.result }}" = "success" ]'
