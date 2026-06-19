@@ -66,8 +66,6 @@ _DEFAULT_PARAM_GROUP_FAMILIES = [
     ("default.valkey7.cluster.on", "valkey7", "Customized default parameter group for valkey7 with cluster mode on"),
     ("default.valkey8", "valkey8", "Default parameter group for valkey8"),
     ("default.valkey8.cluster.on", "valkey8", "Customized default parameter group for valkey8 with cluster mode on"),
-    ("default.valkey9", "valkey9", "Default parameter group for valkey9"),
-    ("default.valkey9.cluster.on", "valkey9", "Customized default parameter group for valkey9 with cluster mode on"),
 ]
 _DEFAULT_PARAM_GROUP_NAMES = {name for name, _family, _desc in _DEFAULT_PARAM_GROUP_FAMILIES}
 
