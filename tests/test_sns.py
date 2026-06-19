@@ -248,6 +248,48 @@ def test_sns_tags(sns):
     assert "team" not in tags
     assert tags["env"] == "staging"
 
+
+def test_sns_tag_resource_accepts_empty_account_topic_arn(sns):
+    arn = sns.create_topic(Name=f"intg-sns-empty-account-{_uuid_mod.uuid4().hex[:8]}")["TopicArn"]
+    empty_account_arn = arn.replace(":000000000000:", "::")
+
+    sns.tag_resource(ResourceArn=empty_account_arn, Tags=[{"Key": "env", "Value": "test"}])
+
+    resp = sns.list_tags_for_resource(ResourceArn=arn)
+    tags = {t["Key"]: t["Value"] for t in resp["Tags"]}
+    assert tags["env"] == "test"
+
+
+def test_sns_topic_tag_apis_reject_invalid_arns(sns):
+    arn = sns.create_topic(Name=f"intg-sns-invalid-tags-{_uuid_mod.uuid4().hex[:8]}")["TopicArn"]
+    invalid_cases = [
+        ("not-an-arn", "InvalidParameterException"),
+        ("arn:aws:sns:us-east-1", "InvalidParameterException"),
+        (arn.replace(":sns:", ":sqs:"), "InvalidParameterException"),
+        (arn.replace(":000000000000:", ":111111111111:"), "ResourceNotFoundException"),
+        (arn.replace(":us-east-1:", ":us-west-2:"), "ResourceNotFoundException"),
+        ("arn:aws:sns:us-east-1:000000000000:app/APNS/example", "InvalidParameterException"),
+    ]
+
+    for bad_arn, expected_code in invalid_cases:
+        with pytest.raises(ClientError) as exc:
+            sns.tag_resource(ResourceArn=bad_arn, Tags=[{"Key": "bad", "Value": "value"}])
+        assert exc.value.response["Error"]["Code"] == expected_code
+
+    resp = sns.list_tags_for_resource(ResourceArn=arn)
+    assert resp["Tags"] == []
+
+
+def test_sns_topic_list_and_untag_reject_invalid_arns(sns):
+    for operation, kwargs in [
+        (sns.list_tags_for_resource, {}),
+        (sns.untag_resource, {"TagKeys": ["missing"]}),
+    ]:
+        with pytest.raises(ClientError) as exc:
+            operation(ResourceArn="arn:aws:sqs:us-east-1:000000000000:not-a-topic", **kwargs)
+        assert exc.value.response["Error"]["Code"] == "InvalidParameterException"
+
+
 def test_sns_subscription_attributes(sns):
     arn = sns.create_topic(Name="intg-sns-subattr")["TopicArn"]
     sub = sns.subscribe(

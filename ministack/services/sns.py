@@ -88,6 +88,33 @@ def _validate_subscription_endpoint(protocol: str, endpoint: str):
         return _invalid_subscription_endpoint(protocol, endpoint)
     return None
 
+
+def _resolve_topic_tag_arn(arn: str):
+    arn = _normalize_arn(arn)
+    try:
+        spec = parse_arn(arn)
+    except ArnParseError:
+        return arn, None, _error("InvalidParameterException", f"Invalid SNS topic ARN: {arn}", 400)
+
+    if (
+        spec.partition != "aws"
+        or spec.service != "sns"
+        or not spec.region
+        or not spec.account_id
+        or not spec.resource
+        or ":" in spec.resource
+        or "/" in spec.resource
+    ):
+        return arn, None, _error("InvalidParameterException", f"Invalid SNS topic ARN: {arn}", 400)
+
+    if spec.region != get_region() or spec.account_id != get_account_id():
+        return arn, None, _error("ResourceNotFoundException", "Resource not found", 404)
+
+    topic = _topics.get(arn)
+    if not topic:
+        return arn, None, _error("ResourceNotFoundException", "Resource not found", 404)
+    return arn, topic, None
+
 from ministack.core.persistence import PERSIST_STATE, load_state
 
 _topics = AccountScopedDict()
@@ -1051,21 +1078,20 @@ async def _send_subscription_confirmation(topic_arn: str, sub: dict):
 # ---------------------------------------------------------------------------
 
 def _list_tags_for_resource(params):
-    arn = _normalize_arn(_p(params, "ResourceArn"))
-    topic = _topics.get(arn)
+    arn, topic, err = _resolve_topic_tag_arn(_p(params, "ResourceArn"))
+    if err:
+        return err
     tags_xml = ""
-    if topic:
-        for k, v in topic.get("tags", {}).items():
-            tags_xml += f"<member><Key>{k}</Key><Value>{v}</Value></member>"
+    for k, v in topic.get("tags", {}).items():
+        tags_xml += f"<member><Key>{k}</Key><Value>{v}</Value></member>"
     return _xml(200, "ListTagsForResourceResponse",
                 f"<ListTagsForResourceResult><Tags>{tags_xml}</Tags></ListTagsForResourceResult>")
 
 
 def _tag_resource(params):
-    arn = _normalize_arn(_p(params, "ResourceArn"))
-    topic = _topics.get(arn)
-    if not topic:
-        return _error("ResourceNotFoundException", "Resource not found", 404)
+    _arn, topic, err = _resolve_topic_tag_arn(_p(params, "ResourceArn"))
+    if err:
+        return err
     i = 1
     while _p(params, f"Tags.member.{i}.Key"):
         key = _p(params, f"Tags.member.{i}.Key")
@@ -1076,13 +1102,13 @@ def _tag_resource(params):
 
 
 def _untag_resource(params):
-    arn = _normalize_arn(_p(params, "ResourceArn"))
-    topic = _topics.get(arn)
-    if topic:
-        i = 1
-        while _p(params, f"TagKeys.member.{i}"):
-            topic.get("tags", {}).pop(_p(params, f"TagKeys.member.{i}"), None)
-            i += 1
+    _arn, topic, err = _resolve_topic_tag_arn(_p(params, "ResourceArn"))
+    if err:
+        return err
+    i = 1
+    while _p(params, f"TagKeys.member.{i}"):
+        topic.get("tags", {}).pop(_p(params, f"TagKeys.member.{i}"), None)
+        i += 1
     return _xml(200, "UntagResourceResponse", "<UntagResourceResult/>")
 
 
