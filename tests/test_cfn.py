@@ -3573,3 +3573,70 @@ def test_cfn_change_set_detects_parameter_driven_change(cfn, s3):
     # nothing changed -> empty change set (no false positive)
     noop = _change_set("cs-noop", "a.zip")
     assert len(noop.get("Changes", [])) == 0
+
+
+def test_cfn_lambda_layer_packages_importable(cfn, s3, lam):
+    """A Lambda layer deployed via CloudFormation (CDK pattern: Content from S3)
+    must make its packages importable at invoke time.
+
+    Regression: the CFN LayerVersion provisioner fetched the layer zip but never
+    stored it as ``_zip_data``, so ``_resolve_layer_zip`` returned None and the
+    layer was silently skipped at worker spawn — ``No module named ...`` even
+    though ``list-layers`` showed the layer. Reported by @ocr-lasagna."""
+    stack_name = "cfn-layer-import"
+    bucket_name = "cfn-layer-assets"
+    fn_name = "cfn-layer-fn"
+
+    s3.create_bucket(Bucket=bucket_name)
+
+    # Layer zip with a Python module under python/ (the AWS layer convention).
+    layer_buf = io.BytesIO()
+    with zipfile.ZipFile(layer_buf, "w") as z:
+        z.writestr("python/cfn_layer_helper.py", "LAYER_VALUE = 'from-cfn-layer'\n")
+    s3.put_object(Bucket=bucket_name, Key="layer.zip", Body=layer_buf.getvalue())
+
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "MyLayer": {
+                "Type": "AWS::Lambda::LayerVersion",
+                "Properties": {
+                    "LayerName": "cfn-import-layer",
+                    "CompatibleRuntimes": ["python3.12"],
+                    "Content": {"S3Bucket": bucket_name, "S3Key": "layer.zip"},
+                },
+            },
+            "MyFunction": {
+                "Type": "AWS::Lambda::Function",
+                "Properties": {
+                    "FunctionName": fn_name,
+                    "Runtime": "python3.12",
+                    "Handler": "index.handler",
+                    "Role": "arn:aws:iam::000000000000:role/cfn-role",
+                    "Layers": [{"Ref": "MyLayer"}],
+                    "Code": {
+                        "ZipFile": (
+                            "import cfn_layer_helper\n"
+                            "def handler(event, context):\n"
+                            "    return {'value': cfn_layer_helper.LAYER_VALUE}\n"
+                        ),
+                    },
+                },
+            },
+        },
+    }
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(template))
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "CREATE_COMPLETE"
+
+    try:
+        resp = lam.invoke(FunctionName=fn_name, Payload=b"{}")
+        assert resp["StatusCode"] == 200
+        assert "FunctionError" not in resp, (
+            f"Lambda error: {resp['Payload'].read().decode()}"
+        )
+        payload = json.loads(resp["Payload"].read())
+        assert payload["value"] == "from-cfn-layer"
+    finally:
+        cfn.delete_stack(StackName=stack_name)
