@@ -11,6 +11,15 @@ def collect_by_file(mode: str) -> dict[str, int]:
          "-m", marker, "tests/"],
         capture_output=True, text=True,
     )
+    # 0 = ok, 5 = no tests collected (valid for a mode with no matching tests)
+    if result.returncode not in (0, 5):
+        print(result.stdout[-2000:] if result.stdout else "", file=sys.stderr)
+        print(result.stderr[-2000:] if result.stderr else "", file=sys.stderr)
+        raise SystemExit(
+            f"pytest --collect-only failed (exit {result.returncode}) "
+            f"for mode '{mode}' — aborting to avoid silently skipping tests"
+        )
+
     counts: dict[str, int] = defaultdict(int)
     for line in result.stdout.splitlines():
         line = line.strip()
