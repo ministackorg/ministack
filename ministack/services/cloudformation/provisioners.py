@@ -2390,12 +2390,14 @@ def _kms_key_delete(physical_id, props):
 def _kms_alias_create(logical_id, props, stack_name):
     alias_name = props.get("AliasName", f"alias/{stack_name}-{logical_id}")
     target_key = props.get("TargetKeyId", "")
-    _kms._aliases[alias_name] = target_key
+    rec = _kms._resolve_key(target_key)
+    alias_arn = _kms._alias_arn(alias_name)
+    _kms._aliases[alias_arn] = rec["KeyId"] if rec else target_key
     return alias_name, {}
 
 
 def _kms_alias_delete(physical_id, props):
-    _kms._aliases.pop(physical_id, None)
+    _kms._aliases.pop(_kms._alias_arn(physical_id), None)
 
 
 # --- EC2 resource provisioners ---
