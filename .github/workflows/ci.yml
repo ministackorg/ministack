@@ -50,7 +50,11 @@ jobs:
       - name: Start MiniStack
         run: |
           REDIS_HOST=localhost python -m hypercorn ministack.app:app --bind 0.0.0.0:4566 --keep-alive 75 > ministack.log 2>&1 &
-          sleep 3
+          for i in $(seq 1 15); do
+            curl -sf http://localhost:4566/_ministack/health && break
+            echo "Waiting for MiniStack... ($i/15)"
+            sleep 2
+          done
           curl -sf http://localhost:4566/_ministack/health
 
       - name: Select tests for shard
