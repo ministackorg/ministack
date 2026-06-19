@@ -6,25 +6,38 @@ on:
   pull_request:
     branches: [main, master]
 
+env:
+  PARALLEL_SHARDS: 3
+  SERIAL_SHARDS: 1
+
 jobs:
+  setup:
+    name: plan shards
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -e . && pip install -r requirements.txt boto3 pytest pytest-xdist duckdb docker cbor2 pyyaml cryptography
+
+      - name: Plan test shards
+        id: plan
+        run: python scripts/plan_test_shards.py
+
   test:
+    needs: setup
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - mode: parallel
-            shard_index: 0
-            shard_count: 3
-          - mode: parallel
-            shard_index: 1
-            shard_count: 3
-          - mode: parallel
-            shard_index: 2
-            shard_count: 3
-          - mode: serial
-            shard_index: 0
-            shard_count: 1
+      matrix: ${{ fromJson(needs.setup.outputs.matrix) }}
 
     services:
       redis:
@@ -33,7 +46,6 @@ jobs:
           - 6379:6379
         options: >-
           --health-cmd "redis-cli ping" --health-interval 5s --health-timeout 3s --health-retries 5
-
 
     steps:
       - uses: actions/checkout@v6
@@ -57,25 +69,16 @@ jobs:
           done
           curl -sf http://localhost:4566/_ministack/health
 
-      - name: Select tests for shard
-        id: select
+      - name: Run tests (${{ matrix.mode }} shard ${{ matrix.shard_index }}, ${{ matrix.test_count }} tests)
         run: |
-          FILES=$(python3 scripts/select_test_shard.py \
-            --shard-index ${{ matrix.shard_index }} \
-            --shard-count ${{ matrix.shard_count }} \
-            --mode ${{ matrix.mode }})
-          echo "files=$FILES" >> "$GITHUB_OUTPUT"
-
-      - name: Run tests for shard
-        run: |
-          if [ -z "${{ steps.select.outputs.files }}" ]; then
-            echo "No tests selected for this shard"
+          if [ -z "${{ matrix.files }}" ]; then
+            echo "No tests for this shard"
             exit 0
           fi
           if [ "${{ matrix.mode }}" = "serial" ]; then
-            pytest ${{ steps.select.outputs.files }} -v --tb=short -m "serial" --durations=10
+            pytest ${{ matrix.files }} -v --tb=short -m "serial" --durations=10
           else
-            pytest ${{ steps.select.outputs.files }} -v -n 3 --dist=loadfile -m "not serial" --durations=25
+            pytest ${{ matrix.files }} -v -n 3 --dist=loadfile -m "not serial" --durations=25
           fi
 
       - name: Upload MiniStack log
