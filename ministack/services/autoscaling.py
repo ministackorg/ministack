@@ -6,6 +6,7 @@ All in-memory, no actual instance scaling.
 Supports:
   ASG:       CreateAutoScalingGroup, DescribeAutoScalingGroups, UpdateAutoScalingGroup,
              DeleteAutoScalingGroup, DescribeAutoScalingInstances, DescribeScalingActivities
+  Refresh:   StartInstanceRefresh, DescribeInstanceRefreshes, CancelInstanceRefresh
   LC:        CreateLaunchConfiguration, DescribeLaunchConfigurations, DeleteLaunchConfiguration
   Policies:  PutScalingPolicy, DescribePolicies, DeletePolicy
   Hooks:     PutLifecycleHook, DescribeLifecycleHooks, DeleteLifecycleHook,
@@ -251,6 +252,84 @@ def _describe_asg_instances(p):
 def _describe_scaling_activities(p):
     return _xml(200, "DescribeScalingActivitiesResponse",
                 "<DescribeScalingActivitiesResult><Activities/></DescribeScalingActivitiesResult>")
+
+
+# ---------------------------------------------------------------------------
+# Instance Refresh
+#
+# No real instances run, so a refresh has nothing to roll. We record it and
+# report it as immediately Successful (100% complete) to satisfy the
+# terraform-provider-aws contract, which polls DescribeInstanceRefreshes until
+# the refresh reaches a terminal state.
+# ---------------------------------------------------------------------------
+
+def _start_instance_refresh(p):
+    name = _p(p, "AutoScalingGroupName")
+    asg = _asgs.get(name)
+    if not asg:
+        return _error("ValidationError", f"AutoScalingGroup {name} not found")
+    refresh_id = new_uuid()
+    ts = now_iso()
+    refresh = {
+        "InstanceRefreshId": refresh_id,
+        "AutoScalingGroupName": name,
+        "Status": "Successful",
+        "StatusReason": "Refresh completed",
+        "StartTime": ts,
+        "EndTime": ts,
+        "PercentageComplete": 100,
+        "InstancesToUpdate": 0,
+        "Preferences": {
+            "MinHealthyPercentage": _p(p, "Preferences.MinHealthyPercentage"),
+            "InstanceWarmup": _p(p, "Preferences.InstanceWarmup"),
+        },
+    }
+    # Most-recent-first, matching AWS describe ordering.
+    asg.setdefault("InstanceRefreshes", []).insert(0, refresh)
+    return _xml(200, "StartInstanceRefreshResponse",
+                f"<StartInstanceRefreshResult><InstanceRefreshId>{refresh_id}</InstanceRefreshId></StartInstanceRefreshResult>")
+
+
+def _describe_instance_refreshes(p):
+    name = _p(p, "AutoScalingGroupName")
+    asg = _asgs.get(name)
+    if not asg:
+        return _error("ValidationError", f"AutoScalingGroup {name} not found")
+    wanted = _parse_member_list(p, "InstanceRefreshIds")
+    members = ""
+    for r in asg.get("InstanceRefreshes", []):
+        if wanted and r["InstanceRefreshId"] not in wanted:
+            continue
+        members += (f"<member>"
+                    f"<InstanceRefreshId>{r['InstanceRefreshId']}</InstanceRefreshId>"
+                    f"<AutoScalingGroupName>{r['AutoScalingGroupName']}</AutoScalingGroupName>"
+                    f"<Status>{r['Status']}</Status>"
+                    f"<StatusReason>{r['StatusReason']}</StatusReason>"
+                    f"<StartTime>{r['StartTime']}</StartTime>"
+                    f"<EndTime>{r['EndTime']}</EndTime>"
+                    f"<PercentageComplete>{r['PercentageComplete']}</PercentageComplete>"
+                    f"<InstancesToUpdate>{r['InstancesToUpdate']}</InstancesToUpdate>"
+                    f"</member>")
+    return _xml(200, "DescribeInstanceRefreshesResponse",
+                f"<DescribeInstanceRefreshesResult><InstanceRefreshes>{members}</InstanceRefreshes></DescribeInstanceRefreshesResult>")
+
+
+def _cancel_instance_refresh(p):
+    name = _p(p, "AutoScalingGroupName")
+    asg = _asgs.get(name)
+    if not asg:
+        return _error("ValidationError", f"AutoScalingGroup {name} not found")
+    refreshes = asg.get("InstanceRefreshes", [])
+    active = next((r for r in refreshes if r["Status"] not in
+                   ("Successful", "Failed", "Cancelled")), None)
+    if not active:
+        return _error("ActiveInstanceRefreshNotFound",
+                      f"No active Instance Refresh for Auto Scaling group {name}")
+    active["Status"] = "Cancelled"
+    active["StatusReason"] = "Cancelled by user"
+    active["EndTime"] = now_iso()
+    return _xml(200, "CancelInstanceRefreshResponse",
+                f"<CancelInstanceRefreshResult><InstanceRefreshId>{active['InstanceRefreshId']}</InstanceRefreshId></CancelInstanceRefreshResult>")
 
 
 # ---------------------------------------------------------------------------
@@ -511,6 +590,9 @@ _ACTION_MAP = {
     "DeleteAutoScalingGroup": _delete_asg,
     "DescribeAutoScalingInstances": _describe_asg_instances,
     "DescribeScalingActivities": _describe_scaling_activities,
+    "StartInstanceRefresh": _start_instance_refresh,
+    "DescribeInstanceRefreshes": _describe_instance_refreshes,
+    "CancelInstanceRefresh": _cancel_instance_refresh,
     "CreateLaunchConfiguration": _create_lc,
     "DescribeLaunchConfigurations": _describe_lcs,
     "DeleteLaunchConfiguration": _delete_lc,

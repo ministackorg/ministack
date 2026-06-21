@@ -233,6 +233,7 @@ _pool_domain_map = AccountScopedDict()   # domain -> pool_id
 
 _authorization_codes: dict[str, dict] = {}   # code -> {client_id, pool_id, redirect_uri, scope, username, nonce, expires_at, code_challenge, code_challenge_method}
 _refresh_tokens: dict[str, dict] = {}        # refresh_token_value -> {pool_id, client_id, username, scope}
+_revoked_tokens: set = set()                 # refresh-token values invalidated by RevokeToken
 
 # ---------------------------------------------------------------------------
 # In-memory state — Identity Pools (cognito-identity)
@@ -309,6 +310,7 @@ def get_state():
         "identity_tags": copy.deepcopy(_identity_tags),
         "authorization_codes": copy.deepcopy(_authorization_codes),
         "refresh_tokens": copy.deepcopy(_refresh_tokens),
+        "revoked_tokens": list(_revoked_tokens),
         "auth_codes": copy.deepcopy(_auth_codes),
         "challenge_sessions": copy.deepcopy(_challenge_sessions),
     }
@@ -322,6 +324,7 @@ def restore_state(data):
         _identity_tags.update(data.get("identity_tags", {}))
         _authorization_codes.update(data.get("authorization_codes", {}))
         _refresh_tokens.update(data.get("refresh_tokens", {}))
+        _revoked_tokens.update(data.get("revoked_tokens", []))
         _auth_codes.update(data.get("auth_codes", {}))
         _challenge_sessions.update(data.get("challenge_sessions", {}))
 
@@ -2114,7 +2117,13 @@ def _admin_user_global_sign_out(data):
     user, err = _resolve_user(pool, username)
     if err:
         return err
-    user["_tokens"] = []
+    # Invalidate every token issued before now (checked by REFRESH_TOKEN_AUTH)
+    # and drop the user's OAuth-flow refresh tokens.
+    user["_signout_at"] = _now_epoch()
+    uname = user.get("Username", username)
+    for tok in [t for t, e in _refresh_tokens.items()
+                if e.get("username") == uname and e.get("pool_id") == pid]:
+        del _refresh_tokens[tok]
     return json_response({})
 
 
@@ -2277,6 +2286,9 @@ def _admin_initiate_auth(data):
             if not users:
                 return error_response_json("NotAuthorizedException", "No users in pool.", 400)
             user = users[0]
+        if _refresh_token_revoked(refresh_token, user):
+            return error_response_json("NotAuthorizedException",
+                                       "Refresh Token has been revoked", 400)
         result = _build_auth_result(pid, cid, user)
         result.pop("RefreshToken", None)  # AWS doesn't return a new refresh token here
         return json_response({"AuthenticationResult": result})
@@ -2605,6 +2617,9 @@ def _initiate_auth(data):
             if not users:
                 return error_response_json("NotAuthorizedException", "No users in pool.", 400)
             user = users[0]
+        if _refresh_token_revoked(refresh_token, user):
+            return error_response_json("NotAuthorizedException",
+                                       "Refresh Token has been revoked", 400)
         result = _build_auth_result(pid, cid, user)
         result.pop("RefreshToken", None)  # AWS doesn't return a new refresh token here
         return json_response({"AuthenticationResult": result})
@@ -2883,12 +2898,55 @@ def _respond_to_auth_challenge(data):
     return error_response_json("InvalidParameterException", f"Unsupported challenge: {challenge_name}", 400)
 
 
+def _refresh_token_revoked(refresh_token: str, user: dict | None) -> bool:
+    """True if a refresh token has been revoked (RevokeToken) or invalidated by a
+    GlobalSignOut that happened after the token was issued."""
+    if refresh_token in _revoked_tokens:
+        return True
+    signout_at = (user or {}).get("_signout_at", 0)
+    if signout_at:
+        try:
+            payload = json.loads(
+                base64.urlsafe_b64decode(refresh_token.split(".")[1] + "=="))
+            if int(payload.get("iat", 0)) < int(signout_at):
+                return True
+        except Exception:
+            pass
+    return False
+
+
 def _global_sign_out(data):
-    # Access token is opaque to us — accept and succeed
+    # AWS invalidates every token issued to the user before the sign-out. Mark
+    # the user with a sign-out timestamp (checked by REFRESH_TOKEN_AUTH) and drop
+    # any OAuth-flow refresh tokens so /oauth2/token can't mint new ones either.
+    access_token = data.get("AccessToken", "")
+    try:
+        payload = json.loads(
+            base64.urlsafe_b64decode(access_token.split(".")[1] + "=="))
+    except Exception:
+        return json_response({})
+    username = payload.get("username", "")
+    iss = payload.get("iss", "")
+    pool_id = iss.rsplit("/", 1)[-1] if iss else ""
+    pool = _user_pools.get(pool_id)
+    if pool and username:
+        user = pool["_users"].get(username)
+        if user:
+            user["_signout_at"] = _now_epoch()
+    if username and pool_id:
+        for tok in [t for t, e in _refresh_tokens.items()
+                    if e.get("username") == username and e.get("pool_id") == pool_id]:
+            del _refresh_tokens[tok]
     return json_response({})
 
 
 def _revoke_token(data):
+    # AWS revokes the supplied refresh token (and tokens derived from it). Record
+    # it as revoked (checked by REFRESH_TOKEN_AUTH) and drop the OAuth-flow entry.
+    token = data.get("Token", "")
+    if token:
+        _revoked_tokens.add(token)
+        _refresh_tokens.pop(token, None)
     return json_response({})
 
 

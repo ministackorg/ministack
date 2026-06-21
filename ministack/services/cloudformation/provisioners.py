@@ -1901,6 +1901,9 @@ def _lambda_esm_create(logical_id, props, stack_name):
         "FunctionResponseTypes": props.get("FunctionResponseTypes", []),
     }
     _lambda_svc._esms[esm_id] = esm
+    # Anchor a DynamoDB-stream ESM's LATEST position at create time, matching the
+    # API CreateEventSourceMapping path; no-op for SQS/Kinesis sources (#936).
+    _lambda_svc._init_stream_position(esm_id, esm["EventSourceArn"], esm["StartingPosition"])
     _lambda_svc._ensure_poller()
     return esm_id, {"UUID": esm_id}
 
@@ -3015,9 +3018,15 @@ def _lambda_layer_create(logical_id, props, stack_name):
         "LicenseInfo": props.get("LicenseInfo", ""),
         "CreatedDate": now_iso(),
         "Content": {
+            "Location": _lambda_svc._layer_content_url(layer_name, ver),
             "CodeSha256": (base64.b64encode(hashlib.sha256(zip_data).digest()).decode() if zip_data else ""),
             "CodeSize": len(zip_data) if zip_data else 0,
         },
+        # Without _zip_data the layer is silently skipped at worker spawn
+        # (_resolve_layer_zip returns None), so functions deployed via CDK/CFN
+        # can't import their layer packages even though list-layers shows them.
+        "_zip_data": zip_data,
+        "_policy": {"Version": "2012-10-17", "Id": "default", "Statement": []},
     }
     layer["versions"].append(ver_config)
     return version_arn, {"LayerVersionArn": version_arn, "Arn": version_arn}
@@ -3524,7 +3533,7 @@ def _cw_metric_alarm_delete(physical_id, props):
 # ---------------------------------------------------------------------------
 
 def _apigw_v2_api_create(logical_id, props, stack_name):
-    api_id = new_uuid()[:8]
+    api_id = _apigw_v2._resolve_custom_api_id(props.get("Tags", {}), _apigw_v2._apis) or new_uuid()[:8]
     name = props.get("Name") or _physical_name(stack_name, logical_id, max_len=128)
     protocol = props.get("ProtocolType", "HTTP")
     api = {

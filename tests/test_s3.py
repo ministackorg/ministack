@@ -891,6 +891,9 @@ def test_s3_public_access_block(s3):
 def test_s3_ownership_controls(s3):
     bkt = "intg-s3-ownership"
     s3.create_bucket(Bucket=bkt)
+    # Never configured: real S3 reports the default Object Ownership, not a 404.
+    resp = s3.get_bucket_ownership_controls(Bucket=bkt)
+    assert resp["OwnershipControls"]["Rules"][0]["ObjectOwnership"] == "BucketOwnerEnforced"
     s3.put_bucket_ownership_controls(
         Bucket=bkt,
         OwnershipControls={"Rules": [{"ObjectOwnership": "BucketOwnerPreferred"}]},
@@ -898,6 +901,11 @@ def test_s3_ownership_controls(s3):
     resp = s3.get_bucket_ownership_controls(Bucket=bkt)
     assert resp["OwnershipControls"]["Rules"][0]["ObjectOwnership"] == "BucketOwnerPreferred"
     s3.delete_bucket_ownership_controls(Bucket=bkt)
+    # After delete the config is gone: GetBucketOwnershipControls must 404 instead
+    # of returning a default block (otherwise Terraform's delete waiter times out).
+    with pytest.raises(ClientError) as exc:
+        s3.get_bucket_ownership_controls(Bucket=bkt)
+    assert exc.value.response["Error"]["Code"] == "OwnershipControlsNotFoundError"
 
 def test_s3_object_lock_configuration(s3):
     bkt = "intg-s3-objlock-cfg"
