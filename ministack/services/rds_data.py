@@ -324,16 +324,28 @@ def _connect(instance, engine, database=None, password=None,
     else:
         try:
             import psycopg2
+            import psycopg2.extras
         except ImportError:
             raise ImportError(
                 "psycopg2 is required for PostgreSQL/Aurora PostgreSQL rds-data support. "
                 "Install with: pip install psycopg2-binary"
             )
         pg_user = username or instance.get("MasterUsername", "admin")
-        return psycopg2.connect(
+        conn = psycopg2.connect(
             host=host, port=int(port), user=pg_user,
             password=pw, dbname=db or "postgres",
         )
+        # Parity with the pymysql branch: a non-transactional ExecuteStatement
+        # must commit, otherwise psycopg2's implicit transaction is rolled back
+        # when the connection closes and the write is lost.
+        conn.autocommit = True
+        # Aurora Data API returns json/jsonb as its stored JSON *text*. Stop
+        # psycopg2 from auto-parsing it into a dict/list (which _field_value
+        # would then emit as an invalid single-quoted Python repr). Scoped to
+        # this connection so other psycopg2 users are unaffected.
+        psycopg2.extras.register_default_json(conn_or_curs=conn, loads=lambda x: x)
+        psycopg2.extras.register_default_jsonb(conn_or_curs=conn, loads=lambda x: x)
+        return conn
 
 
 def _field_value(val, type_name=None):
@@ -462,7 +474,8 @@ def _execute_statement(data):
     params = _convert_parameters(parameters)
     exec_sql = sql
     if params:
-        for name in params:
+        # Replace longest names first so ":1" doesn't clobber ":10"/":18" etc.
+        for name in sorted(params, key=len, reverse=True):
             exec_sql = exec_sql.replace(f":{name}", f"%({name})s")
 
     own_conn = False
@@ -642,7 +655,8 @@ def _batch_execute_statement(data):
             exec_sql = sql
             if parameter_sets:
                 sample = _convert_parameters(parameter_sets[0])
-                for name in sample:
+                # Longest names first so ":1" doesn't clobber ":10"/":18" etc.
+                for name in sorted(sample, key=len, reverse=True):
                     exec_sql = exec_sql.replace(f":{name}", f"%({name})s")
 
             for param_set in parameter_sets:

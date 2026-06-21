@@ -1570,6 +1570,24 @@ def _invoke_with_callback(resource, input_data, token, state_def):
             _call_lambda(func_name, input_data)
         except _ExecutionError:
             pass
+    else:
+        # Non-Lambda service integrations (sqs:sendMessage, sns:publish, …) must
+        # actually perform the call — delivering the payload that carries the
+        # task token — before we block for the callback. Without this the task is
+        # scheduled but nothing is ever sent and the execution hangs forever
+        # (#959). A failed integration fails the task (propagates) rather than
+        # hanging.
+        try:
+            for prefix, handler in _SERVICE_DISPATCH.items():
+                if clean_resource.startswith(prefix):
+                    handler(clean_resource, input_data)
+                    break
+            else:
+                if "aws-sdk:" in clean_resource:
+                    _invoke_aws_sdk_integration(clean_resource, input_data)
+        except _ExecutionError:
+            _task_tokens.pop(token, None)
+            raise
 
     timeout = state_def.get("TimeoutSeconds", 99999)
     if not evt.wait(timeout=timeout):
@@ -3831,7 +3849,13 @@ def _invoke_sqs_send_message(resource, input_data):
         return input_data
     try:
         url = input_data.get("QueueUrl", "")
-        result = sqs._act_send_message(input_data, url)
+        payload = dict(input_data)
+        body = payload.get("MessageBody")
+        if isinstance(body, (dict, list)):
+            # SFN serialises an object MessageBody to JSON text before calling
+            # SQS (which requires a string body).
+            payload["MessageBody"] = json.dumps(body)
+        result = sqs._act_send_message(payload, url)
         return result
     except sqs._Err as e:
         raise _ExecutionError(f"SQS.{e.code}", e.message)

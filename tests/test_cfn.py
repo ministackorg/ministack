@@ -170,6 +170,40 @@ def test_cfn_stack_with_parameters(cfn, sqs):
     urls = sqs.list_queues(QueueNamePrefix="cfn-t02-custom").get("QueueUrls", [])
     assert any("cfn-t02-custom" in u for u in urls)
 
+def test_cfn_change_set_use_previous_value_updates_resource(cfn, ssm):
+    """A change set created with UsePreviousValue (the `aws cloudformation deploy`
+    no-`--parameter-overrides` path) must resolve the parameter to its stored
+    value, so a parameter-driven resource still updates rather than resolving to
+    an empty value and missing the real resource (#897)."""
+    def template(value):
+        return json.dumps({
+            "AWSTemplateFormatVersion": "2010-09-09",
+            "Parameters": {"Prefix": {"Type": "String", "Default": "demo"}},
+            "Resources": {"P": {
+                "Type": "AWS::SSM::Parameter",
+                "Properties": {
+                    "Name": {"Fn::Sub": "/${Prefix}/config"},
+                    "Type": "String",
+                    "Value": value,
+                },
+            }},
+        })
+
+    cfn.create_stack(StackName="cfn-upv", TemplateBody=template("v1"))
+    _wait_stack(cfn, "cfn-upv")
+    assert ssm.get_parameter(Name="/demo/config")["Parameter"]["Value"] == "v1"
+
+    # Change set re-sends Prefix as UsePreviousValue (what `deploy` does without
+    # --parameter-overrides). Prefix must resolve to "demo", not "".
+    cfn.create_change_set(
+        StackName="cfn-upv", ChangeSetName="cs2", TemplateBody=template("v2"),
+        Parameters=[{"ParameterKey": "Prefix", "UsePreviousValue": True}],
+    )
+    cfn.execute_change_set(StackName="cfn-upv", ChangeSetName="cs2")
+    _wait_stack(cfn, "cfn-upv")
+
+    assert ssm.get_parameter(Name="/demo/config")["Parameter"]["Value"] == "v2"
+
 def test_cfn_intrinsic_ref_getatt(cfn, ssm):
     template = {
         "AWSTemplateFormatVersion": "2010-09-09",
@@ -3573,3 +3607,70 @@ def test_cfn_change_set_detects_parameter_driven_change(cfn, s3):
     # nothing changed -> empty change set (no false positive)
     noop = _change_set("cs-noop", "a.zip")
     assert len(noop.get("Changes", [])) == 0
+
+
+def test_cfn_lambda_layer_packages_importable(cfn, s3, lam):
+    """A Lambda layer deployed via CloudFormation (CDK pattern: Content from S3)
+    must make its packages importable at invoke time.
+
+    Regression: the CFN LayerVersion provisioner fetched the layer zip but never
+    stored it as ``_zip_data``, so ``_resolve_layer_zip`` returned None and the
+    layer was silently skipped at worker spawn — ``No module named ...`` even
+    though ``list-layers`` showed the layer. Reported by @ocr-lasagna."""
+    stack_name = "cfn-layer-import"
+    bucket_name = "cfn-layer-assets"
+    fn_name = "cfn-layer-fn"
+
+    s3.create_bucket(Bucket=bucket_name)
+
+    # Layer zip with a Python module under python/ (the AWS layer convention).
+    layer_buf = io.BytesIO()
+    with zipfile.ZipFile(layer_buf, "w") as z:
+        z.writestr("python/cfn_layer_helper.py", "LAYER_VALUE = 'from-cfn-layer'\n")
+    s3.put_object(Bucket=bucket_name, Key="layer.zip", Body=layer_buf.getvalue())
+
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "MyLayer": {
+                "Type": "AWS::Lambda::LayerVersion",
+                "Properties": {
+                    "LayerName": "cfn-import-layer",
+                    "CompatibleRuntimes": ["python3.12"],
+                    "Content": {"S3Bucket": bucket_name, "S3Key": "layer.zip"},
+                },
+            },
+            "MyFunction": {
+                "Type": "AWS::Lambda::Function",
+                "Properties": {
+                    "FunctionName": fn_name,
+                    "Runtime": "python3.12",
+                    "Handler": "index.handler",
+                    "Role": "arn:aws:iam::000000000000:role/cfn-role",
+                    "Layers": [{"Ref": "MyLayer"}],
+                    "Code": {
+                        "ZipFile": (
+                            "import cfn_layer_helper\n"
+                            "def handler(event, context):\n"
+                            "    return {'value': cfn_layer_helper.LAYER_VALUE}\n"
+                        ),
+                    },
+                },
+            },
+        },
+    }
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(template))
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "CREATE_COMPLETE"
+
+    try:
+        resp = lam.invoke(FunctionName=fn_name, Payload=b"{}")
+        assert resp["StatusCode"] == 200
+        assert "FunctionError" not in resp, (
+            f"Lambda error: {resp['Payload'].read().decode()}"
+        )
+        payload = json.loads(resp["Payload"].read())
+        assert payload["value"] == "from-cfn-layer"
+    finally:
+        cfn.delete_stack(StackName=stack_name)

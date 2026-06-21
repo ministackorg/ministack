@@ -366,7 +366,15 @@ def test_cognito_global_sign_out(cognito_idp):
         AuthParameters={"USERNAME": "noah", "PASSWORD": "NoahPass1!"},
     )
     access_token = auth["AuthenticationResult"]["AccessToken"]
-    cognito_idp.global_sign_out(AccessToken=access_token)  # must not raise
+    refresh_token = auth["AuthenticationResult"]["RefreshToken"]
+    time.sleep(1.1)  # sign-out invalidates tokens issued before now (1s granularity)
+    cognito_idp.global_sign_out(AccessToken=access_token)
+    # every refresh token issued before the sign-out must be invalidated (#1395)
+    with pytest.raises(cognito_idp.exceptions.NotAuthorizedException):
+        cognito_idp.admin_initiate_auth(
+            UserPoolId=pid, ClientId=cid, AuthFlow="REFRESH_TOKEN_AUTH",
+            AuthParameters={"REFRESH_TOKEN": refresh_token},
+        )
 
 def test_cognito_admin_confirm_signup(cognito_idp):
     pid = cognito_idp.create_user_pool(PoolName="AdminConfirmPool")["UserPool"]["Id"]
@@ -717,8 +725,26 @@ def test_cognito_admin_reset_user_password(cognito_idp):
 
 def test_cognito_admin_user_global_sign_out(cognito_idp):
     pid = cognito_idp.create_user_pool(PoolName="GlobalSignOutAdminPool")["UserPool"]["Id"]
+    cid = cognito_idp.create_user_pool_client(
+        UserPoolId=pid, ClientName="AdminSignOutApp",
+        ExplicitAuthFlows=["ALLOW_USER_PASSWORD_AUTH", "ALLOW_REFRESH_TOKEN_AUTH"],
+    )["UserPoolClient"]["ClientId"]
     cognito_idp.admin_create_user(UserPoolId=pid, Username="signoutuser")
+    cognito_idp.admin_set_user_password(
+        UserPoolId=pid, Username="signoutuser", Password="SignOut1!", Permanent=True)
+    auth = cognito_idp.admin_initiate_auth(
+        UserPoolId=pid, ClientId=cid, AuthFlow="ADMIN_USER_PASSWORD_AUTH",
+        AuthParameters={"USERNAME": "signoutuser", "PASSWORD": "SignOut1!"},
+    )
+    refresh_token = auth["AuthenticationResult"]["RefreshToken"]
+    time.sleep(1.1)  # sign-out invalidates tokens issued before now (1s granularity)
     cognito_idp.admin_user_global_sign_out(UserPoolId=pid, Username="signoutuser")
+    # the user's refresh tokens must be invalidated (#1395)
+    with pytest.raises(cognito_idp.exceptions.NotAuthorizedException):
+        cognito_idp.admin_initiate_auth(
+            UserPoolId=pid, ClientId=cid, AuthFlow="REFRESH_TOKEN_AUTH",
+            AuthParameters={"REFRESH_TOKEN": refresh_token},
+        )
 
 def test_cognito_revoke_token(cognito_idp):
     pid = cognito_idp.create_user_pool(PoolName="RevokePool")["UserPool"]["Id"]
@@ -736,7 +762,18 @@ def test_cognito_revoke_token(cognito_idp):
         AuthParameters={"USERNAME": "revokeuser", "PASSWORD": "RevokePass1!"},
     )
     refresh_token = auth["AuthenticationResult"]["RefreshToken"]
+    # baseline: the refresh token authenticates before revocation
+    cognito_idp.admin_initiate_auth(
+        UserPoolId=pid, ClientId=cid, AuthFlow="REFRESH_TOKEN_AUTH",
+        AuthParameters={"REFRESH_TOKEN": refresh_token},
+    )
     cognito_idp.revoke_token(Token=refresh_token, ClientId=cid)
+    # after RevokeToken it must no longer mint new tokens (#1395)
+    with pytest.raises(cognito_idp.exceptions.NotAuthorizedException):
+        cognito_idp.admin_initiate_auth(
+            UserPoolId=pid, ClientId=cid, AuthFlow="REFRESH_TOKEN_AUTH",
+            AuthParameters={"REFRESH_TOKEN": refresh_token},
+        )
 
 def test_cognito_describe_identity(cognito_identity):
     resp = cognito_identity.create_identity_pool(

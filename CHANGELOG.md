@@ -5,10 +5,24 @@ All notable changes to MiniStack will be documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning follows [Semantic Versioning](https://semver.org/).
 
-## [1.3.64] — 2026-06-15
+## [1.3.65] — 2026-06-19
 
 ### Fixed
 - **EC2 — source security groups (`UserIdGroupPairs`) now returned by `DescribeSecurityGroupRules` / `DescribeSecurityGroups`** — `AuthorizeSecurityGroupIngress`/`Egress` rules that reference another security group were dropped at ingestion and never surfaced: `DescribeSecurityGroupRules` omitted `ReferencedGroupInfo` and `DescribeSecurityGroups` returned an empty `<groups>`. Source-group pairs are now parsed and emitted by both. Reported by @kamegoro. Contributed by @kurok.
+- **Auto Scaling — instance refresh actions implemented** — `StartInstanceRefresh`, `DescribeInstanceRefreshes`, and `CancelInstanceRefresh` previously failed with `InvalidAction: Unknown AutoScaling action`. They are now handled and recorded on the Auto Scaling group, so a refresh can be started, polled, and cancelled. Contributed by @c-julin.
+- **S3 — `GetBucketOwnershipControls` now 404s after delete** — it always returned a default ownership block (HTTP 200), so `DeleteBucketOwnershipControls` was not observable and Terraform's delete waiter looped (`found resource`), blocking `terraform destroy`. It now returns `OwnershipControlsNotFoundError` (404) once controls have been deleted, while still reporting the default Object Ownership for a never-configured bucket. Contributed by @c-julin.
+- **Glue — `GetUserDefinedFunctions` accepts `java.util.regex` `\Q…\E` patterns** — real AWS compiles `Pattern` with `java.util.regex`, so clients like Trino's Glue connector send literal-quoted patterns (e.g. `trino__\Qname\E__.*`); Python's `re` rejected `\Q…\E` with `InvalidInputException: Invalid pattern syntax`. The literal-quote sequences are now translated before matching. Contributed by @yonatoasis.
+- **API Gateway v2 — CloudFormation provisioner honours the `ms-custom-id` tag** — `AWS::ApiGatewayV2::Api` resources always got a random API id, ignoring an `ms-custom-id` tag in the template even though the direct `CreateApi` path and the v1 REST provisioner already honoured it. The v2 provisioner now resolves the custom id before falling back to a generated one. Contributed by @hiddengearz.
+- **Lambda — function code stored as content-addressed blob files** — `get_state` base64-encoded every `code_zip` inline into `lambda.json`, so a deployment with many large zips (e.g. 26 functions × ~30 MB) produced a ~1 GB state file that OOM'd on warm boot while decoding. Code bytes are now written as content-addressed blobs alongside the state and loaded lazily. Contributed by @mattwang44.
+- **Lambda — CloudFormation/CDK-provisioned layers now carry their content** — layers created via CloudFormation stored no `_zip_data`, so `_resolve_layer_zip` returned `None` at worker spawn and functions could not import their layer packages even though `ListLayers` showed them. The provisioner now stores the layer bytes.
+- **Lambda — CloudFormation-created DynamoDB-stream ESMs anchor `LATEST` at create time** — matching the `CreateEventSourceMapping` API path, so a `LATEST` mapping skips records that already existed when the stack was deployed instead of replaying them; no-op for SQS/Kinesis sources.
+- **ECS — `RunTask` secrets now resolve SSM Parameter Store references** — `containerDefinitions[].secrets` `valueFrom` entries pointing at SSM parameters were previously left unresolved; they are now fetched in-process and injected into the container environment alongside Secrets Manager references.
+
+---
+
+## [1.3.64] — 2026-06-15
+
+### Fixed
 - **Step Functions — mocked `Throw` responses now route to `Catch`** — a `SFN_MOCK_CONFIG` `Throw` was raised above the state's Retry/Catch handling, so the execution always failed instead of routing to a matching `Catch` handler. The mocked error now flows through the same Retry/Catch machinery as a real task failure. Reported by @amissemer.
 - **Glue — `GetUserDefinedFunctions` treats `Pattern` as a regular expression** — the pattern was matched as a glob, so regex patterns (such as the Trino Glue connector's `trino__<name>__.*`) never matched; an invalid pattern now returns `InvalidInputException`. Contributed by @yonatoasis.
 - **S3 — `WebsiteRedirectLocation` is now preserved** — `x-amz-website-redirect-location` set on `PutObject` is now stored and returned by `GetObject` / `HeadObject`. Contributed by @murlock.

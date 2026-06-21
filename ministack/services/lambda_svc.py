@@ -48,7 +48,7 @@ from typing import Any
 from urllib.parse import unquote
 
 from ministack.core.lambda_runtime import get_or_create_worker, invalidate_worker
-from ministack.core.persistence import PERSIST_STATE, load_state
+from ministack.core.persistence import PERSIST_STATE, STATE_DIR, load_state
 from ministack.core.responses import (
     _12_DIGIT_RE,
     AccountScopedDict,
@@ -223,19 +223,136 @@ _poller_lock = threading.Lock()
 
 # ── Persistence ────────────────────────────────────────────
 
+# Lambda code zips are stored on disk as content-addressed blob files under
+# ${STATE_DIR}/lambda-blobs/{sha256}.zip; ``lambda.json`` only carries the
+# sha256 reference. Inline base64 in the state file (the previous shape)
+# scales poorly: a single ~30 MB zip multiplied by N functions encodes ~1.3×
+# larger as base64 and forces a single-shot JSON parse on every restart,
+# which pushes memory to ~2× the encoded size during decode.
+#
+# Content-addressing means two functions with identical bytes share one
+# blob file. The orphan sweep at the end of ``get_state()`` removes blob
+# files no longer referenced by any function or version (e.g. previous
+# ``UpdateFunctionCode`` generations).
+#
+# Backward compatibility: ``restore_state`` accepts the legacy inline
+# base64 shape (``"code_zip": "<b64>"``) so an upgrade in place works
+# without a one-shot migration step.
+
+CODE_BLOB_DIR = os.path.join(STATE_DIR, "lambda-blobs")
+_BLOB_REF_KEY = "code_blob_ref"
+
+
+def _write_code_blob(code_zip: bytes) -> str:
+    """Write ``code_zip`` to a content-addressed file. Returns the sha256
+    hex digest used as the file name. Idempotent: an existing file with
+    matching content (same sha) is left in place."""
+    sha = hashlib.sha256(code_zip).hexdigest()
+    os.makedirs(CODE_BLOB_DIR, exist_ok=True)
+    path = os.path.join(CODE_BLOB_DIR, f"{sha}.zip")
+    if os.path.exists(path):
+        return sha
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "wb") as f:
+            f.write(code_zip)
+        os.replace(tmp, path)
+    except BaseException:
+        # Avoid leaving partial writes that would later be picked up as if
+        # they were valid blobs.
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+    return sha
+
+
+def _read_code_blob(sha: str) -> bytes | None:
+    """Read a blob by sha256. Returns ``None`` and logs an error when the
+    file is missing or unreadable — restore should degrade the affected
+    function rather than abort the whole load."""
+    path = os.path.join(CODE_BLOB_DIR, f"{sha}.zip")
+    try:
+        with open(path, "rb") as f:
+            return f.read()
+    except FileNotFoundError:
+        logger.error("Lambda persistence: code blob %s missing at %s", sha, path)
+        return None
+    except OSError as e:
+        logger.error("Lambda persistence: failed to read code blob %s: %s", sha, e)
+        return None
+
+
+def _prune_orphan_code_blobs(referenced: set[str]) -> None:
+    """Remove blob files whose sha is not in the ``referenced`` set. Called
+    at the tail of ``get_state()`` so the on-disk set always reflects the
+    current ``_functions`` graph. Logs each removal at debug level; failures
+    are non-fatal (best-effort hygiene)."""
+    if not os.path.isdir(CODE_BLOB_DIR):
+        return
+    for entry in os.listdir(CODE_BLOB_DIR):
+        if not entry.endswith(".zip"):
+            continue
+        sha = entry[: -len(".zip")]
+        if sha in referenced:
+            continue
+        try:
+            os.remove(os.path.join(CODE_BLOB_DIR, entry))
+            logger.debug("Lambda persistence: pruned orphan blob %s", sha)
+        except OSError as e:
+            logger.warning("Lambda persistence: failed to prune blob %s: %s", sha, e)
+
+
+def _externalize_code_zip(func: dict, referenced: set[str]) -> None:
+    """Replace ``func['code_zip']`` (bytes) with a blob ref in place, and
+    record the sha in ``referenced`` so the orphan sweep keeps the file."""
+    code = func.get("code_zip")
+    if not code:
+        return
+    if isinstance(code, bytes):
+        sha = _write_code_blob(code)
+        func["code_zip"] = {_BLOB_REF_KEY: sha}
+        referenced.add(sha)
+    elif isinstance(code, dict) and _BLOB_REF_KEY in code:
+        # Already a ref (e.g. ``get_state`` called twice without a restore
+        # in between). Keep the file referenced.
+        referenced.add(code[_BLOB_REF_KEY])
+    # Legacy inline base64 strings are not re-serialized here — they reach
+    # ``get_state`` only if a caller copied them directly into _functions
+    # without going through CreateFunction (no real code path does this).
+
+
+def _internalize_code_zip(func: dict) -> None:
+    """Replace a blob ref or legacy base64 string with bytes, in place."""
+    code = func.get("code_zip")
+    if not code:
+        return
+    if isinstance(code, dict) and _BLOB_REF_KEY in code:
+        func["code_zip"] = _read_code_blob(code[_BLOB_REF_KEY])
+    elif isinstance(code, str):
+        # Legacy persistence shape (inline base64).
+        func["code_zip"] = base64.b64decode(code)
+
+
 def get_state():
-    """Return JSON-serializable state. code_zip bytes are base64-encoded."""
+    """Return JSON-serializable Lambda state.
+
+    Function code (``code_zip``) is written to disk as content-addressed
+    blobs under ``${STATE_DIR}/lambda-blobs/`` and replaced in the returned
+    state with ``{"code_blob_ref": "<sha256>"}`` markers. Unreferenced blobs
+    from prior generations are pruned."""
     from ministack.core.responses import AccountScopedDict
     funcs = AccountScopedDict()
+    referenced: set[str] = set()
     # Iterate _data directly to capture ALL accounts, not just current request context
     for scoped_key, func in _functions._data.items():
         f = copy.deepcopy(func)
-        if f.get("code_zip") and isinstance(f["code_zip"], bytes):
-            f["code_zip"] = base64.b64encode(f["code_zip"]).decode()
+        _externalize_code_zip(f, referenced)
         for ver in f.get("versions", {}).values():
-            if ver.get("code_zip") and isinstance(ver["code_zip"], bytes):
-                ver["code_zip"] = base64.b64encode(ver["code_zip"]).decode()
+            _externalize_code_zip(ver, referenced)
         funcs._data[scoped_key] = f
+    _prune_orphan_code_blobs(referenced)
     return {
         "functions": funcs,
         "layers": copy.deepcopy(_layers),
@@ -256,19 +373,15 @@ def restore_state(data):
         funcs = data.get("functions", {})
         if isinstance(funcs, AccountScopedDict):
             for scoped_key, func in funcs._data.items():
-                if func.get("code_zip") and isinstance(func["code_zip"], str):
-                    func["code_zip"] = base64.b64decode(func["code_zip"])
+                _internalize_code_zip(func)
                 for ver in func.get("versions", {}).values():
-                    if ver.get("code_zip") and isinstance(ver["code_zip"], str):
-                        ver["code_zip"] = base64.b64decode(ver["code_zip"])
+                    _internalize_code_zip(ver)
                 _functions._data[scoped_key] = func
         else:
             for name, func in funcs.items():
-                if func.get("code_zip") and isinstance(func["code_zip"], str):
-                    func["code_zip"] = base64.b64decode(func["code_zip"])
+                _internalize_code_zip(func)
                 for ver in func.get("versions", {}).values():
-                    if ver.get("code_zip") and isinstance(ver["code_zip"], str):
-                        ver["code_zip"] = base64.b64decode(ver["code_zip"])
+                    _internalize_code_zip(ver)
                 _functions[name] = func
         _layers.update(data.get("layers", {}))
         _esms.update(data.get("esms", {}))

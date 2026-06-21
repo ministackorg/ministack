@@ -4510,6 +4510,194 @@ def test_lambda_durable_persistence_round_trip():
         lambda_durable.restore_state(original)
 
 
+# ---------------------------------------------------------------------------
+# Lambda code_zip persistence — content-addressed blob storage.
+# code_zip bytes are written to ${STATE_DIR}/lambda-blobs/{sha256}.zip; the
+# returned state holds only the sha reference. The in-memory _functions
+# shape is unchanged (still bytes after restore) so invoke / update / delete
+# paths see no difference.
+# ---------------------------------------------------------------------------
+
+
+def _make_lambda_record(name: str, code_zip: bytes, versions: dict | None = None) -> dict:
+    """Build a _functions entry matching what CreateFunction stores."""
+    return {
+        "config": {
+            "FunctionName": name,
+            "FunctionArn": f"arn:aws:lambda:us-east-1:000000000000:function:{name}",
+            "Runtime": "python3.12",
+            "Handler": "index.handler",
+        },
+        "code_zip": code_zip,
+        "versions": versions or {},
+        "next_version": 1,
+        "tags": {},
+        "policy": {"Version": "2012-10-17", "Id": "default", "Statement": []},
+    }
+
+
+@pytest.fixture
+def lambda_svc_isolated(tmp_path, monkeypatch):
+    """Snapshot lambda_svc state and redirect its blob storage to tmp_path.
+    Restores the original state at teardown so tests don't pollute the
+    shared in-process module that serves the running ministack."""
+    from ministack.services import lambda_svc
+
+    monkeypatch.setattr(lambda_svc, "CODE_BLOB_DIR", str(tmp_path / "lambda-blobs"))
+    original = lambda_svc.get_state()
+    try:
+        lambda_svc._functions._data.clear()
+        yield lambda_svc, tmp_path / "lambda-blobs"
+    finally:
+        lambda_svc._functions._data.clear()
+        lambda_svc.restore_state(original)
+
+
+def test_lambda_code_zip_round_trip_through_blob_storage(lambda_svc_isolated):
+    """Bytes survive an exact get_state → clear → restore_state round-trip."""
+    svc, _ = lambda_svc_isolated
+    code = b"\x89PNG\r\n\x1a\n" + b"\x00" * 1000  # non-UTF8 bytes
+    svc._functions["fn"] = _make_lambda_record("fn", code)
+
+    state = svc.get_state()
+    svc._functions._data.clear()
+    svc.restore_state(state)
+
+    restored = svc._functions._data[("000000000000", "fn")]
+    assert restored["code_zip"] == code
+    assert isinstance(restored["code_zip"], bytes)
+
+
+def test_lambda_get_state_replaces_code_zip_with_blob_ref(lambda_svc_isolated):
+    """The returned state must not inline bytes or base64 — only a sha ref."""
+    import hashlib
+    svc, blob_dir = lambda_svc_isolated
+    code = b"def handler(event, ctx): return 'ok'\n" * 256
+    svc._functions["fn"] = _make_lambda_record("fn", code)
+
+    state = svc.get_state()
+    fn_state = state["functions"]._data[("000000000000", "fn")]
+
+    assert fn_state["code_zip"] == {"code_blob_ref": hashlib.sha256(code).hexdigest()}
+    blob_path = blob_dir / f"{hashlib.sha256(code).hexdigest()}.zip"
+    assert blob_path.exists()
+    assert blob_path.read_bytes() == code
+
+
+def test_lambda_per_version_code_zip_also_externalized(lambda_svc_isolated):
+    """PublishVersion-created versions also store code_zip externally."""
+    import hashlib
+    svc, _ = lambda_svc_isolated
+    v1, v2 = b"v1 body", b"v2 body"
+    svc._functions["fn"] = _make_lambda_record(
+        "fn", v2, versions={"1": {"code_zip": v1, "config": {"Version": "1"}}}
+    )
+
+    state = svc.get_state()
+    fn_state = state["functions"]._data[("000000000000", "fn")]
+    assert fn_state["versions"]["1"]["code_zip"] == {
+        "code_blob_ref": hashlib.sha256(v1).hexdigest()
+    }
+
+    svc._functions._data.clear()
+    svc.restore_state(state)
+    restored = svc._functions._data[("000000000000", "fn")]
+    assert restored["code_zip"] == v2
+    assert restored["versions"]["1"]["code_zip"] == v1
+
+
+def test_lambda_identical_code_dedups_to_single_blob(lambda_svc_isolated):
+    """Content-addressing means two functions with identical bytes share one
+    file. Important when the deps-bundled-into-every-zip pattern produces
+    many functions with byte-identical layer payloads."""
+    svc, blob_dir = lambda_svc_isolated
+    code = b"shared body across two functions"
+    svc._functions["fn-a"] = _make_lambda_record("fn-a", code)
+    svc._functions["fn-b"] = _make_lambda_record("fn-b", code)
+
+    svc.get_state()
+
+    files = sorted(blob_dir.iterdir())
+    assert len(files) == 1, [f.name for f in files]
+
+
+def test_lambda_legacy_inline_base64_persistence_still_loads(lambda_svc_isolated):
+    """Pre-existing lambda.json files (written before content-addressed
+    storage) stored code_zip as inline base64. restore_state must accept
+    that shape so an in-place upgrade requires no migration step."""
+    import base64 as _b64
+    from ministack.core.responses import AccountScopedDict
+    svc, _ = lambda_svc_isolated
+
+    code = b"legacy persisted bytes"
+    legacy = {
+        "functions": AccountScopedDict(),
+        "layers": AccountScopedDict(),
+        "esms": AccountScopedDict(),
+        "function_urls": AccountScopedDict(),
+        "kinesis_positions": {},
+        "dynamodb_stream_positions": {},
+    }
+    legacy["functions"]._data[("000000000000", "old-fn")] = {
+        "config": {"FunctionName": "old-fn"},
+        "code_zip": _b64.b64encode(code).decode(),
+        "versions": {},
+    }
+
+    svc.restore_state(legacy)
+
+    restored = svc._functions._data[("000000000000", "old-fn")]
+    assert restored["code_zip"] == code
+
+
+def test_lambda_missing_blob_degrades_without_aborting_restore(lambda_svc_isolated):
+    """If a blob file is missing (corrupted volume / partial mount), restore
+    must downgrade the affected function (code_zip=None) and continue,
+    rather than raise and prevent the whole server from starting."""
+    from ministack.core.responses import AccountScopedDict
+    svc, _ = lambda_svc_isolated
+
+    state = {
+        "functions": AccountScopedDict(),
+        "layers": AccountScopedDict(),
+        "esms": AccountScopedDict(),
+        "function_urls": AccountScopedDict(),
+        "kinesis_positions": {},
+        "dynamodb_stream_positions": {},
+    }
+    state["functions"]._data[("000000000000", "orphan")] = {
+        "config": {"FunctionName": "orphan"},
+        "code_zip": {"code_blob_ref": "0" * 64},  # sha pointing at nothing
+        "versions": {},
+    }
+
+    svc.restore_state(state)
+
+    assert svc._functions._data[("000000000000", "orphan")]["code_zip"] is None
+
+
+def test_lambda_get_state_prunes_orphan_blobs(lambda_svc_isolated):
+    """When a function's code is updated, the previous generation's blob
+    becomes orphan. The next get_state sweeps it. Without this, repeated
+    UpdateFunctionCode (e.g. iterative sandbox redeploys) leaks blob files
+    across restarts."""
+    import hashlib
+    svc, blob_dir = lambda_svc_isolated
+
+    old_code = b"old code"
+    new_code = b"new code"
+    svc._functions["fn"] = _make_lambda_record("fn", old_code)
+    svc.get_state()  # writes blob(old_code)
+    assert (blob_dir / f"{hashlib.sha256(old_code).hexdigest()}.zip").exists()
+
+    # Simulate UpdateFunctionCode.
+    svc._functions["fn"]["code_zip"] = new_code
+    svc.get_state()  # writes blob(new_code), should remove blob(old_code)
+
+    assert (blob_dir / f"{hashlib.sha256(new_code).hexdigest()}.zip").exists()
+    assert not (blob_dir / f"{hashlib.sha256(old_code).hexdigest()}.zip").exists()
+
+
 def test_lambda_durable_event_wrapped_with_sdk_fields(lam):
     """A durable invocation's event payload is wrapped with the fields the
     aws-durable-execution-sdk-python SDK reads from the Lambda event:

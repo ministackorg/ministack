@@ -481,7 +481,8 @@ def _update_stack(params):
     disable_rollback = _p(params, "DisableRollback", "false").lower() == "true"
 
     try:
-        param_values = _resolve_parameters(template, provided_params)
+        param_values = _resolve_parameters(
+            template, provided_params, stack.get("_resolved_params", {}))
     except ValueError as exc:
         return _error("ValidationError", str(exc))
 
