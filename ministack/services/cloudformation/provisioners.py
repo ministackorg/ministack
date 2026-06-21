@@ -553,6 +553,7 @@ def _lambda_create(logical_id, props, stack_name):
             "Architectures": props.get("Architectures", ["x86_64"]),
             "EphemeralStorage": {"Size": props.get("EphemeralStorage", {}).get("Size", 512)},
             "TracingConfig": props.get("TracingConfig", {"Mode": "PassThrough"}),
+            "LoggingConfig": props.get("LoggingConfig", {"LogFormat": "Text", "LogGroup": f"/aws/lambda/{name}"}),
             "RevisionId": new_uuid(),
         },
         "code_zip": code_zip,
@@ -568,6 +569,11 @@ def _lambda_create(logical_id, props, stack_name):
         "provisioned_concurrency": {},
     }
     _lambda_svc._functions[name] = func
+    # On a stack UPDATE this re-provisions over an existing function; recycle the
+    # warm worker + docker pool so the new code/config load on the next invoke
+    # (#897). No-op on first create (no worker spawned yet).
+    _lambda_svc.invalidate_worker(name)
+    _lambda_svc._pool_kill_function(get_account_id(), name)
     return name, {"Arn": arn}
 
 
@@ -1008,6 +1014,44 @@ def _cwlogs_create(logical_id, props, stack_name):
 
 def _cwlogs_delete(physical_id, props):
     _cw_logs._log_groups.pop(physical_id, None)
+
+
+# --- CloudWatch Logs SubscriptionFilter (#896) ---
+
+def _cwlogs_subfilter_create(logical_id, props, stack_name):
+    group = props.get("LogGroupName")
+    if not group:
+        raise ValueError("AWS::Logs::SubscriptionFilter requires LogGroupName")
+    # Ref returns the filter name; CFN auto-generates one when FilterName is omitted.
+    filter_name = props.get("FilterName") or _physical_name(stack_name, logical_id, max_len=512)
+    grp = _cw_logs._log_groups.get(group)
+    if grp is None:
+        # The referenced group should already exist (via Ref/DependsOn); create a
+        # minimal entry if not so the filter is still recorded and queryable.
+        grp = _cw_logs._log_groups[group] = {
+            "arn": f"arn:aws:logs:{get_region()}:{get_account_id()}:log-group:{group}:*",
+            "creationTime": int(time.time() * 1000),
+            "retentionInDays": None,
+            "tags": {},
+            "streams": {},
+            "subscriptionFilters": {},
+        }
+    grp.setdefault("subscriptionFilters", {})[filter_name] = {
+        "filterName": filter_name,
+        "logGroupName": group,
+        "filterPattern": props.get("FilterPattern", ""),
+        "destinationArn": props.get("DestinationArn", ""),
+        "roleArn": props.get("RoleArn", ""),
+        "distribution": props.get("Distribution", "ByLogStream"),
+        "creationTime": int(time.time() * 1000),
+    }
+    return filter_name, {}
+
+
+def _cwlogs_subfilter_delete(physical_id, props):
+    grp = _cw_logs._log_groups.get(props.get("LogGroupName"))
+    if grp:
+        grp.get("subscriptionFilters", {}).pop(physical_id, None)
 
 
 # --- EventBridge Rule ---
@@ -1853,6 +1897,8 @@ def _lambda_esm_create(logical_id, props, stack_name):
     esm = {
         "UUID": esm_id,
         "EventSourceArn": props.get("EventSourceArn", ""),
+        # resource_arn from _lambda_function_for_cfn_ref already carries the
+        # qualifier — do not re-append it (that double-suffixed ":live:live").
         "FunctionArn": func_arn,
         "FunctionName": func_name,
         "Qualifier": qualifier,
@@ -1867,6 +1913,9 @@ def _lambda_esm_create(logical_id, props, stack_name):
         "FunctionResponseTypes": props.get("FunctionResponseTypes", []),
     }
     _lambda_svc._esms[esm_id] = esm
+    # Anchor a DynamoDB-stream ESM's LATEST position at create time, matching the
+    # API CreateEventSourceMapping path; no-op for SQS/Kinesis sources (#936).
+    _lambda_svc._init_stream_position(esm_id, esm["EventSourceArn"], esm["StartingPosition"])
     _lambda_svc._ensure_poller()
     return esm_id, {"UUID": esm_id}
 
@@ -2975,9 +3024,15 @@ def _lambda_layer_create(logical_id, props, stack_name):
         "LicenseInfo": props.get("LicenseInfo", ""),
         "CreatedDate": now_iso(),
         "Content": {
+            "Location": _lambda_svc._layer_content_url(layer_name, ver),
             "CodeSha256": (base64.b64encode(hashlib.sha256(zip_data).digest()).decode() if zip_data else ""),
             "CodeSize": len(zip_data) if zip_data else 0,
         },
+        # Without _zip_data the layer is silently skipped at worker spawn
+        # (_resolve_layer_zip returns None), so functions deployed via CDK/CFN
+        # can't import their layer packages even though list-layers shows them.
+        "_zip_data": zip_data,
+        "_policy": {"Version": "2012-10-17", "Id": "default", "Statement": []},
     }
     layer["versions"].append(ver_config)
     return version_arn, {"LayerVersionArn": version_arn, "Arn": version_arn}
@@ -3488,7 +3543,7 @@ def _cw_metric_alarm_delete(physical_id, props):
 # ---------------------------------------------------------------------------
 
 def _apigw_v2_api_create(logical_id, props, stack_name):
-    api_id = new_uuid()[:8]
+    api_id = _apigw_v2._resolve_custom_api_id(props.get("Tags", {}), _apigw_v2._apis) or new_uuid()[:8]
     name = props.get("Name") or _physical_name(stack_name, logical_id, max_len=128)
     protocol = props.get("ProtocolType", "HTTP")
     api = {
@@ -4155,6 +4210,7 @@ _RESOURCE_HANDLERS = {
         "delete": _appconfig_deployment_delete,
     },
     "AWS::Logs::LogGroup": {"create": _cwlogs_create, "delete": _cwlogs_delete},
+    "AWS::Logs::SubscriptionFilter": {"create": _cwlogs_subfilter_create, "delete": _cwlogs_subfilter_delete},
     "AWS::Events::Rule": {"create": _eb_rule_create, "delete": _eb_rule_delete},
     "AWS::Events::EventBus": {"create": _eb_event_bus_create, "delete": _eb_event_bus_delete},
     "AWS::Kinesis::Stream": {"create": _kinesis_stream_create, "delete": _kinesis_stream_delete},

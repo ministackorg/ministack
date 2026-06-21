@@ -22,6 +22,7 @@ import subprocess
 import tempfile
 import threading
 import time
+from urllib.parse import unquote
 
 from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.persistence import PERSIST_STATE, load_state
@@ -113,6 +114,8 @@ _triggers = AccountScopedDict()     # trigger_name -> trigger dict
 _workflows = AccountScopedDict()    # workflow_name -> workflow dict
 _workflow_runs = AccountScopedDict() # workflow_name -> [run, ...]
 _user_defined_functions = AccountScopedDict()  # "db_name/function_name" -> udf dict
+_table_column_statistics = AccountScopedDict()      # "db/table" -> {column_name: stats}
+_partition_column_statistics = AccountScopedDict()  # "db/table" -> [{"Values": [...], "Stats": {col: stats}}]
 
 _ALL_STATE = {
     "databases": _databases,
@@ -130,6 +133,8 @@ _ALL_STATE = {
     "workflows": _workflows,
     "workflow_runs": _workflow_runs,
     "user_defined_functions": _user_defined_functions,
+    "table_column_statistics": _table_column_statistics,
+    "partition_column_statistics": _partition_column_statistics,
 }
 
 
@@ -236,6 +241,15 @@ def _invalid_resource_arn(arn):
 
 
 async def handle_request(method, path, headers, body, query_params):
+    # Glue's Iceberg REST catalog data plane. On real AWS this is
+    # `glue.<region>.amazonaws.com/iceberg` — same service, same SigV4
+    # signing name (`glue`), different protocol (Iceberg REST OpenAPI
+    # instead of X-Amz-Target JSON RPC). The router's credential-scope
+    # dispatch already lands `glue`-signed requests here, so a plain
+    # path check is all that's needed to tell the two protocols apart.
+    if path.startswith("/iceberg"):
+        return _handle_iceberg_rest(method, path, query_params)
+
     target = headers.get("x-amz-target", "")
     action = target.split(".")[-1] if "." in target else ""
 
@@ -269,6 +283,13 @@ async def handle_request(method, path, headers, body, query_params):
         # Partition Indexes
         "CreatePartitionIndex": _create_partition_index,
         "GetPartitionIndexes": _get_partition_indexes,
+        # Column Statistics
+        "UpdateColumnStatisticsForTable": _update_column_statistics_for_table,
+        "GetColumnStatisticsForTable": _get_column_statistics_for_table,
+        "DeleteColumnStatisticsForTable": _delete_column_statistics_for_table,
+        "UpdateColumnStatisticsForPartition": _update_column_statistics_for_partition,
+        "GetColumnStatisticsForPartition": _get_column_statistics_for_partition,
+        "DeleteColumnStatisticsForPartition": _delete_column_statistics_for_partition,
         # Connections
         "CreateConnection": _create_connection,
         "DeleteConnection": _delete_connection,
@@ -337,6 +358,208 @@ async def handle_request(method, path, headers, body, query_params):
     return handler(data)
 
 
+# ---- Iceberg REST catalog (Glue data plane) ----
+#
+# Read-path subset of the Apache Iceberg REST Catalog OpenAPI spec, mirroring
+# AWS Glue's `glue.<region>.amazonaws.com/iceberg` endpoint so that clients
+# like DuckDB's `iceberg` extension can ATTACH:
+#
+#     ATTACH '000000000000' AS glue_catalog (
+#         TYPE iceberg,
+#         ENDPOINT 'localhost:4566/iceberg',
+#         AUTHORIZATION_TYPE 'sigv4'
+#     );
+#
+# Glue's prefix shape is `/v1/catalogs/{catalog}/...` (returned to the client
+# as `defaults.prefix` from /v1/config). This is distinct from the S3 Tables
+# Iceberg REST endpoint served by `services/s3tables.py`, whose prefix is a
+# URL-encoded table-bucket ARN — on AWS those are two separate services told
+# apart by SigV4 signing name, and MiniStack routes them the same way.
+#
+# A table participates in this surface iff its `Parameters["metadata_location"]`
+# points at an Iceberg metadata.json on MiniStack's S3 (written there by an
+# external engine such as Trino/Spark, then registered in Glue). The
+# metadata.json is passed through verbatim — format versions change and we
+# don't want to be in the parsing business. Write paths return 501.
+#
+# Responses use plain `application/json` and the spec's
+# `{"error": {"message", "type", "code"}}` envelope — NOT the AWS
+# x-amz-json-1.0 flavor the rest of this module speaks.
+
+_iceberg_tls_hint_logged = False
+
+
+def _iceberg_json(data, status=200):
+    body = json.dumps(data, ensure_ascii=False).encode("utf-8")
+    return status, {"Content-Type": "application/json"}, body
+
+
+def _iceberg_error(message, error_type, status):
+    return _iceberg_json(
+        {"error": {"message": message, "type": error_type, "code": status}},
+        status=status,
+    )
+
+
+def _iceberg_s3_overrides():
+    """S3 client config handed to Iceberg REST clients.
+
+    Real AWS Glue returns no overrides (clients use ambient AWS creds);
+    MiniStack must return them or the client tries real S3 for the data
+    files referenced by the catalog and fails.
+
+    Credentials are the fixed `test`/`test` pair (same as the s3tables
+    Iceberg surface) — MiniStack's S3 doesn't verify signatures, and
+    echoing ambient AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY into an HTTP
+    response would leak real credentials from the host environment."""
+    host = os.environ.get("MINISTACK_HOST", "localhost")
+    port = os.environ.get("GATEWAY_PORT", "4566")
+    return {
+        "s3.endpoint": f"http://{host}:{port}",
+        "s3.access-key-id": "test",
+        "s3.secret-access-key": "test",
+        "s3.path-style-access": "true",
+        "s3.region": os.environ.get("MINISTACK_REGION", "us-east-1"),
+    }
+
+
+def _iceberg_fetch_metadata(metadata_location):
+    """Read the metadata.json at an ``s3://bucket/key`` URI from MiniStack's
+    S3 and return it parsed, or None if the URI is malformed, the object is
+    missing, or the body isn't valid JSON."""
+    if not metadata_location or not metadata_location.startswith("s3://"):
+        return None
+    rest = metadata_location[len("s3://"):]
+    if "/" not in rest:
+        return None
+    bucket, key = rest.split("/", 1)
+    if not bucket or not key:
+        return None
+    from ministack.services import s3 as _s3
+    data = _s3._get_object_data(bucket, key)
+    if data is None:
+        return None
+    try:
+        return json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        logger.warning("Iceberg metadata.json at %s did not parse: %s",
+                       metadata_location, exc)
+        return None
+
+
+def _iceberg_table_entry(db_name, table_name):
+    """Return the Glue table dict if it exists AND is an Iceberg table
+    (has a `metadata_location` parameter), else None."""
+    table = _tables.get(f"{db_name}/{table_name}")
+    if table is None:
+        return None
+    if not (table.get("Parameters") or {}).get("metadata_location"):
+        return None
+    return table
+
+
+def _iceberg_load_table(db_name, table_name):
+    table = _iceberg_table_entry(db_name, table_name)
+    if table is None:
+        return _iceberg_error(
+            f"Table does not exist: {db_name}.{table_name}",
+            "NoSuchTableException", 404)
+    metadata_location = table["Parameters"]["metadata_location"]
+    # Missing/unparseable metadata.json is a 404, not a 200 with empty
+    # metadata — DuckDB would treat the latter as a real-but-empty table
+    # and silently return wrong query results.
+    metadata = _iceberg_fetch_metadata(metadata_location)
+    if metadata is None:
+        return _iceberg_error(
+            f"Table metadata not readable: {db_name}.{table_name} "
+            f"(metadata_location={metadata_location})",
+            "NoSuchTableException", 404)
+    return _iceberg_json({
+        "metadata-location": metadata_location,
+        "metadata": metadata,
+        "config": _iceberg_s3_overrides(),
+    })
+
+
+def _iceberg_maybe_log_tls_hint():
+    """Warn once if USE_SSL isn't on — DuckDB hardcodes https:// on the
+    Iceberg endpoint and fails at connect time with no useful message."""
+    global _iceberg_tls_hint_logged
+    if _iceberg_tls_hint_logged:
+        return
+    _iceberg_tls_hint_logged = True
+    if os.environ.get("USE_SSL", "").strip().lower() not in ("1", "true", "yes"):
+        logger.warning(
+            "Glue Iceberg REST endpoint hit while USE_SSL is not enabled. "
+            "DuckDB's iceberg extension hardcodes https:// and will fail to "
+            "connect. Set USE_SSL=1 and trust MiniStack's self-signed cert "
+            "(SSL_CERT_FILE / DuckDB ca_cert_file) for ATTACH to work."
+        )
+
+
+def _handle_iceberg_rest(method, path, query_params):
+    _iceberg_maybe_log_tls_hint()
+    parts = [unquote(p) for p in path.strip("/").split("/") if p]
+    # parts: ["iceberg", "v1", ...]
+    if len(parts) < 3 or parts[0] != "iceberg" or parts[1] != "v1":
+        return _iceberg_error(f"Unknown Iceberg REST path: {path}",
+                              "NotFoundException", 404)
+
+    # GET /iceberg/v1/config?warehouse=<id> — called once on ATTACH. The
+    # prefix tells the client to build subsequent URLs as
+    # /v1/catalogs/{warehouse}/... — Glue's prefix shape.
+    if parts[2] == "config" and len(parts) == 3 and method == "GET":
+        warehouse = query_params.get("warehouse", "")
+        if isinstance(warehouse, list):
+            warehouse = warehouse[0] if warehouse else ""
+        defaults = {"prefix": f"catalogs/{warehouse}"} if warehouse else {}
+        return _iceberg_json({"defaults": defaults,
+                              "overrides": _iceberg_s3_overrides()})
+
+    # Everything else: /v1/catalogs/{catalog}/namespaces[/{ns}[/tables[/{tbl}]]]
+    # The catalog id is accepted but not validated — MiniStack is
+    # single-catalog per account, scoping happens via the SigV4 account id.
+    if len(parts) < 5 or parts[2] != "catalogs" or parts[4] != "namespaces":
+        return _iceberg_error(
+            f"Operation not supported: {method} {path}",
+            "UnsupportedOperationException", 501)
+
+    if len(parts) == 5 and method == "GET":  # ListNamespaces
+        return _iceberg_json(
+            {"namespaces": [[name] for name in sorted(_databases.keys())]})
+
+    if len(parts) == 6 and method == "GET":  # GetNamespace
+        ns = parts[5]
+        if ns not in _databases:
+            return _iceberg_error(f"Namespace does not exist: {ns}",
+                                  "NoSuchNamespaceException", 404)
+        return _iceberg_json({"namespace": [ns], "properties": {}})
+
+    if len(parts) >= 7 and parts[6] == "tables":
+        ns = parts[5]
+        if len(parts) == 7 and method == "GET":  # ListTables
+            if ns not in _databases:
+                return _iceberg_error(f"Namespace does not exist: {ns}",
+                                      "NoSuchNamespaceException", 404)
+            prefix = f"{ns}/"
+            names = sorted(
+                t["Name"] for k, t in _tables.items()
+                if k.startswith(prefix)
+                and (t.get("Parameters") or {}).get("metadata_location"))
+            return _iceberg_json(
+                {"identifiers": [{"namespace": [ns], "name": n} for n in names]})
+        if len(parts) == 8:
+            if method == "GET":  # LoadTable — the hot path
+                return _iceberg_load_table(ns, parts[7])
+            if method == "HEAD":  # TableExists
+                exists = _iceberg_table_entry(ns, parts[7]) is not None
+                return (200 if exists else 404), {}, b""
+
+    return _iceberg_error(
+        f"Operation not supported: {method} {path}",
+        "UnsupportedOperationException", 501)
+
+
 # ---- Databases ----
 
 def _create_database(data):
@@ -370,6 +593,8 @@ def _delete_database(data):
         del _tables[k]
         _partitions.pop(k, None)
         _partition_indexes.pop(k, None)
+        _table_column_statistics.pop(k, None)
+        _partition_column_statistics.pop(k, None)
     return json_response({})
 
 
@@ -443,6 +668,8 @@ def _delete_table(data):
     _tables.pop(key, None)
     _partitions.pop(key, None)
     _partition_indexes.pop(key, None)
+    _table_column_statistics.pop(key, None)
+    _partition_column_statistics.pop(key, None)
     return json_response({})
 
 
@@ -510,6 +737,8 @@ def _batch_delete_table(data):
             del _tables[key]
             _partitions.pop(key, None)
             _partition_indexes.pop(key, None)
+            _table_column_statistics.pop(key, None)
+            _partition_column_statistics.pop(key, None)
     return json_response({"Errors": errors})
 
 
@@ -547,6 +776,10 @@ def _delete_partition(data):
     key = f"{db_name}/{table_name}"
     if key in _partitions:
         _partitions[key] = [p for p in _partitions[key] if p.get("Values") != values]
+    if key in _partition_column_statistics:
+        _partition_column_statistics[key] = [
+            e for e in _partition_column_statistics[key] if e.get("Values") != values
+        ]
     return json_response({})
 
 
@@ -674,6 +907,134 @@ def _get_partition_indexes(data):
     table_name = data.get("TableName")
     key = f"{db_name}/{table_name}"
     return json_response({"PartitionIndexDescriptorList": _partition_indexes.get(key, [])})
+
+
+# ---- Column Statistics ----
+
+def _partition_stats_entry(key, values):
+    for entry in _partition_column_statistics.get(key, []):
+        if entry.get("Values") == values:
+            return entry
+    return None
+
+
+def _update_column_statistics_for_table(data):
+    db_name = data.get("DatabaseName")
+    table_name = data.get("TableName")
+    key = f"{db_name}/{table_name}"
+    if key not in _tables:
+        return error_response_json("EntityNotFoundException",
+            f"Table {table_name} not found in {db_name}", 400)
+    stats_list = data.get("ColumnStatisticsList", [])
+    bucket = _table_column_statistics.setdefault(key, {})
+    errors = []
+    for cs in stats_list:
+        col = cs.get("ColumnName")
+        if not col:
+            errors.append({"ColumnStatistics": cs, "Error": {
+                "ErrorCode": "InvalidInputException",
+                "ErrorMessage": "ColumnName is required"}})
+            continue
+        bucket[col] = cs
+    return json_response({"Errors": errors})
+
+
+def _get_column_statistics_for_table(data):
+    db_name = data.get("DatabaseName")
+    table_name = data.get("TableName")
+    key = f"{db_name}/{table_name}"
+    if key not in _tables:
+        return error_response_json("EntityNotFoundException",
+            f"Table {table_name} not found in {db_name}", 400)
+    bucket = _table_column_statistics.get(key, {})
+    stats_list = []
+    errors = []
+    for col in data.get("ColumnNames", []):
+        if col in bucket:
+            stats_list.append(bucket[col])
+        else:
+            errors.append({"ColumnName": col, "Error": {
+                "ErrorCode": "EntityNotFoundException",
+                "ErrorMessage": f"Column statistics for {col} not found"}})
+    return json_response({"ColumnStatisticsList": stats_list, "Errors": errors})
+
+
+def _delete_column_statistics_for_table(data):
+    db_name = data.get("DatabaseName")
+    table_name = data.get("TableName")
+    column_name = data.get("ColumnName")
+    key = f"{db_name}/{table_name}"
+    if key not in _tables:
+        return error_response_json("EntityNotFoundException",
+            f"Table {table_name} not found in {db_name}", 400)
+    # Real Glue's Delete* operations are idempotent — deleting stats for a
+    # column that never had any returns 200 with an empty body.
+    _table_column_statistics.get(key, {}).pop(column_name, None)
+    return json_response({})
+
+
+def _update_column_statistics_for_partition(data):
+    db_name = data.get("DatabaseName")
+    table_name = data.get("TableName")
+    values = data.get("PartitionValues", [])
+    key = f"{db_name}/{table_name}"
+    if not any(p.get("Values") == values for p in _partitions.get(key, [])):
+        return error_response_json("EntityNotFoundException",
+            f"Partition with values {values} not found", 400)
+    entry = _partition_stats_entry(key, values)
+    if entry is None:
+        entry = {"Values": values, "Stats": {}}
+        _partition_column_statistics.setdefault(key, []).append(entry)
+    errors = []
+    for cs in data.get("ColumnStatisticsList", []):
+        col = cs.get("ColumnName")
+        if not col:
+            errors.append({"ColumnStatistics": cs, "Error": {
+                "ErrorCode": "InvalidInputException",
+                "ErrorMessage": "ColumnName is required"}})
+            continue
+        entry["Stats"][col] = cs
+    return json_response({"Errors": errors})
+
+
+def _get_column_statistics_for_partition(data):
+    db_name = data.get("DatabaseName")
+    table_name = data.get("TableName")
+    values = data.get("PartitionValues", [])
+    key = f"{db_name}/{table_name}"
+    if key not in _tables:
+        return error_response_json("EntityNotFoundException",
+            f"Table {table_name} not found in {db_name}", 400)
+    if not any(p.get("Values") == values for p in _partitions.get(key, [])):
+        return error_response_json("EntityNotFoundException",
+            f"Partition with values {values} not found", 400)
+    entry = _partition_stats_entry(key, values)
+    bucket = entry["Stats"] if entry else {}
+    stats_list = []
+    errors = []
+    for col in data.get("ColumnNames", []):
+        if col in bucket:
+            stats_list.append(bucket[col])
+        else:
+            errors.append({"ColumnName": col, "Error": {
+                "ErrorCode": "EntityNotFoundException",
+                "ErrorMessage": f"Column statistics for {col} not found"}})
+    return json_response({"ColumnStatisticsList": stats_list, "Errors": errors})
+
+
+def _delete_column_statistics_for_partition(data):
+    db_name = data.get("DatabaseName")
+    table_name = data.get("TableName")
+    values = data.get("PartitionValues", [])
+    column_name = data.get("ColumnName")
+    key = f"{db_name}/{table_name}"
+    if not any(p.get("Values") == values for p in _partitions.get(key, [])):
+        return error_response_json("EntityNotFoundException",
+            f"Partition with values {values} not found", 400)
+    entry = _partition_stats_entry(key, values)
+    if entry is not None:
+        entry.get("Stats", {}).pop(column_name, None)
+    return json_response({})
 
 
 # ---- Connections ----
@@ -1602,6 +1963,36 @@ def _get_user_defined_function(data):
     return json_response({"UserDefinedFunction": udf})
 
 
+def _translate_java_regex_quote(pattern):
+    r"""Translate java.util.regex `\Q...\E` literal-quote spans into their
+    RE2/Python-`re` equivalent.
+
+    Real AWS Glue compiles `Pattern` with java.util.regex, which supports `\Q`
+    (begin literal quote) and `\E` (end literal quote): everything between them
+    is matched literally regardless of regex metacharacters. Trino's Hive/Glue
+    connector relies on this — it resolves a UDF with a pattern like
+    `trino__\Qdw_clean_text\E__.*`. Python's `re` (like Go's RE2) does not
+    understand `\Q...\E` and raises `bad escape \Q`, so we rewrite each span by
+    `re.escape()`-ing the literal between `\Q` and `\E` before compiling. Per
+    Java semantics a trailing `\Q` with no closing `\E` quotes to end-of-string.
+    """
+    out = []
+    i = 0
+    while True:
+        start = pattern.find(r"\Q", i)
+        if start == -1:
+            out.append(pattern[i:])
+            break
+        out.append(pattern[i:start])
+        end = pattern.find(r"\E", start + 2)
+        if end == -1:
+            out.append(re.escape(pattern[start + 2:]))
+            break
+        out.append(re.escape(pattern[start + 2:end]))
+        i = end + 2
+    return "".join(out)
+
+
 def _get_user_defined_functions(data):
     db_name = data.get("DatabaseName")
     pattern = data.get("Pattern") or ""
@@ -1612,7 +2003,21 @@ def _get_user_defined_functions(data):
     else:
         items = list(_user_defined_functions.values())
     if pattern:
-        items = [u for u in items if _simple_glob_match(pattern, u.get("FunctionName", ""))]
+        # Real AWS Glue treats Pattern as a regular expression matched against the
+        # function name (not a glob). e.g. Trino's Glue connector resolves a UDF
+        # with a regex like `trino__<name>__.*`. Glue compiles it with
+        # java.util.regex, so translate `\Q...\E` literal-quote spans (which RE2
+        # / Python `re` reject) before compiling. An invalid regex (e.g. a bare
+        # `*`) raises InvalidInputException, mirroring Glue's RE2 parse error.
+        try:
+            compiled = re.compile(_translate_java_regex_quote(pattern))
+        except re.error as exc:
+            return error_response_json(
+                "InvalidInputException",
+                f"Invalid pattern syntax: error parsing regexp: {exc}",
+                400,
+            )
+        items = [u for u in items if compiled.search(u.get("FunctionName", ""))]
     return json_response({"UserDefinedFunctions": items})
 
 
@@ -1667,3 +2072,6 @@ def reset():
     _triggers.clear()
     _workflows.clear()
     _workflow_runs.clear()
+    _user_defined_functions.clear()
+    _table_column_statistics.clear()
+    _partition_column_statistics.clear()

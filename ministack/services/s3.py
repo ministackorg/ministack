@@ -169,6 +169,7 @@ _PRESERVED_HEADERS = (
     "content-disposition",
     "content-language",
     "expires",
+    "x-amz-website-redirect-location",
 )
 
 # Per botocore/data/s3/2006-03-01/service-2.json (StorageClass enum).
@@ -1385,6 +1386,7 @@ def _put_bucket_ownership_controls(name: str, body: bytes):
     if name not in _buckets:
         return _no_such_bucket(name)
     _buckets[name]["_ownership_controls"] = body.decode("utf-8", errors="replace")
+    _buckets[name].pop("_ownership_controls_deleted", None)
     return 200, {}, b""
 
 
@@ -1394,6 +1396,16 @@ def _get_bucket_ownership_controls(name: str):
     stored = _buckets[name].get("_ownership_controls")
     if stored:
         return 200, {"Content-Type": "application/xml"}, stored
+    if _buckets[name].get("_ownership_controls_deleted"):
+        # Explicitly deleted: real S3 returns 404 (not a default block) so the
+        # Terraform delete waiter can complete.
+        return _error(
+            "OwnershipControlsNotFoundError",
+            "The bucket ownership controls were not found",
+            404,
+            f"/{name}",
+        )
+    # Never configured: real S3 reports the default Object Ownership.
     root = Element("OwnershipControls", xmlns=S3_NS)
     rule = SubElement(root, "Rule")
     SubElement(rule, "ObjectOwnership").text = "BucketOwnerEnforced"
@@ -1404,6 +1416,7 @@ def _delete_bucket_ownership_controls(name: str):
     if name not in _buckets:
         return _no_such_bucket(name)
     _buckets[name].pop("_ownership_controls", None)
+    _buckets[name]["_ownership_controls_deleted"] = True
     return 204, {}, b""
 
 
@@ -1420,13 +1433,15 @@ def _get_public_access_block(name: str):
     stored = _buckets[name].get("_public_access_block")
     if stored:
         return 200, {"Content-Type": "application/xml"}, stored
-    # Default: all public access blocked
-    root = Element("PublicAccessBlockConfiguration", xmlns=S3_NS)
-    SubElement(root, "BlockPublicAcls").text = "true"
-    SubElement(root, "IgnorePublicAcls").text = "true"
-    SubElement(root, "BlockPublicPolicy").text = "true"
-    SubElement(root, "RestrictPublicBuckets").text = "true"
-    return 200, {"Content-Type": "application/xml"}, _xml_body(root)
+    # No configuration set (never put, or deleted): real S3 returns 404 rather
+    # than a default block, so DeletePublicAccessBlock is observable and the
+    # Terraform delete waiter can complete.
+    return _error(
+        "NoSuchPublicAccessBlockConfiguration",
+        "The public access block configuration was not found",
+        404,
+        f"/{name}",
+    )
 
 
 def _delete_public_access_block(name: str):

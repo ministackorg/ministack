@@ -1957,6 +1957,23 @@ def _load_persisted_state():
         _get_module("lambda_durable")
         logger.info("Lambda Durable: eager-loaded module to restore persisted executions")
 
+    # Lambda event source mappings (SQS / Kinesis / DynamoDB Streams) are
+    # polled by a background thread that lambda_svc starts from its
+    # import-time restore (`_ensure_poller`). lambda_svc is otherwise imported
+    # lazily on the first Lambda request — so after a persisted restart a
+    # workload that is pure SQS (just sending to a mapped queue) never imports
+    # the module, the poller never starts, and the restored ESM sits
+    # Enabled-but-unpolled while messages pile up (#889). Eager-import at boot
+    # when persisted ESMs exist so polling resumes exactly like a fresh
+    # CreateEventSourceMapping. Narrow: only pay the cold-start when there are
+    # mappings to poll. The `_data` reach gets all accounts' ESMs (the bool of
+    # an AccountScopedDict is account-scoped and would be 0 with no request
+    # context at boot).
+    _lam = load_state("lambda")
+    if _lam and getattr(_lam.get("esms"), "_data", _lam.get("esms")):
+        _get_module("lambda_svc")  # module file is lambda_svc.py (lambda is a keyword)
+        logger.info("Lambda: eager-loaded module to resume event-source-mapping pollers at boot")
+
 
 async def _wait_for_port(port, timeout=30):
     """Wait until the server is accepting TCP connections."""

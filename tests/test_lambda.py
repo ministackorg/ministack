@@ -1141,6 +1141,7 @@ def test_lambda_esm_sqs_comprehensive(lam, sqs):
     lam.delete_event_source_mapping(UUID=esm_uuid)
 
 
+
 @pytest.mark.parametrize("event_source_arn", [
     "arn:aws:sns:us-east-1:000000000000:esm-wrong-service",
     "arn:aws:sqs:us-west-2:000000000000:esm-foreign-region",
@@ -1169,6 +1170,40 @@ def test_lambda_create_event_source_mapping_rejects_invalid_event_source_arns(la
         assert all(e["EventSourceArn"] != event_source_arn for e in listed)
     finally:
         lam.delete_function(FunctionName=fn_name)
+
+
+def test_lambda_esm_filter_criteria_stored_on_create(lam, sqs):
+    """FilterCriteria specified at CreateEventSourceMapping must be echoed
+    back by GetEventSourceMapping — it was silently dropped before this fix."""
+    try:
+        lam.delete_function(FunctionName="esm-fc-func")
+    except ClientError:
+        pass
+    lam.create_function(
+        FunctionName="esm-fc-func",
+        Runtime="python3.12",
+        Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _make_zip(_LAMBDA_CODE)},
+    )
+    q_url = sqs.create_queue(QueueName="esm-fc-queue")["QueueUrl"]
+    q_arn = sqs.get_queue_attributes(
+        QueueUrl=q_url, AttributeNames=["QueueArn"],
+    )["Attributes"]["QueueArn"]
+
+    fc = {"Filters": [{"Pattern": json.dumps({"body": {"type": ["order"]}})}]}
+    resp = lam.create_event_source_mapping(
+        EventSourceArn=q_arn,
+        FunctionName="esm-fc-func",
+        FilterCriteria=fc,
+    )
+    esm_uuid = resp["UUID"]
+    assert resp.get("FilterCriteria") == fc, "FilterCriteria must be in create response"
+
+    got = lam.get_event_source_mapping(UUID=esm_uuid)
+    assert got.get("FilterCriteria") == fc, "FilterCriteria must survive a GetEventSourceMapping round-trip"
+
+    lam.delete_event_source_mapping(UUID=esm_uuid)
 
 
 def test_lambda_event_source_mapping_rejects_missing_function_qualifier(lam, sqs):
@@ -1820,6 +1855,56 @@ def test_lambda_dynamodb_stream_esm(lam, ddb):
     pks = [item["pk"]["S"] for item in scan["Items"]]
     assert "k2" in pks
     assert "k1" not in pks
+
+
+def test_lambda_dynamodb_stream_esm_latest_processes_first_record(lam, ddb):
+    table_name = "ddb-latest-race-test"
+    fn_name = "ddb-latest-race-fn"
+
+    ddb.create_table(
+        TableName=table_name,
+        KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+        AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "S"}],
+        BillingMode="PAY_PER_REQUEST",
+        StreamSpecification={"StreamEnabled": True, "StreamViewType": "NEW_AND_OLD_IMAGES"},
+    )
+    stream_arn = ddb.describe_table(TableName=table_name)["Table"]["LatestStreamArn"]
+
+    code = "def handler(event, context):\n    return {'count': len(event['Records'])}\n"
+    lam.create_function(
+        FunctionName=fn_name,
+        Runtime="python3.12",
+        Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _make_zip(code)},
+    )
+
+    esm = lam.create_event_source_mapping(
+        FunctionName=fn_name,
+        EventSourceArn=stream_arn,
+        StartingPosition="LATEST",
+        BatchSize=10,
+    )
+    esm_uuid = esm["UUID"]
+
+    # Let the poller tick at least once with an empty stream so position is
+    # eagerly initialised to 0.
+    time.sleep(2)
+    ddb.put_item(TableName=table_name, Item={"pk": {"S": "first"}, "val": {"S": "x"}})
+
+    for _ in range(10):
+        time.sleep(0.5)
+        resp = lam.get_event_source_mapping(UUID=esm_uuid)
+        if resp.get("LastProcessingResult") != "No records processed":
+            break
+
+    result = lam.get_event_source_mapping(UUID=esm_uuid)
+    assert result.get("LastProcessingResult") != "No records processed", (
+        "LATEST ESM skipped the first record on an initially-empty table"
+    )
+
+    lam.delete_event_source_mapping(UUID=esm_uuid)
+
 
 def test_lambda_function_url_config(lam):
     """CreateFunctionUrlConfig / Get / Update / Delete / List lifecycle."""
@@ -4710,6 +4795,27 @@ def test_emit_lambda_logs_autocreate_is_per_function():
     assert "/aws/lambda/fn-b" in _cwl._log_groups
 
 
+def test_emit_lambda_logs_honors_logging_config_log_group():
+    """LoggingConfig.LogGroup routes logs to the named (e.g. shared) group, not
+    the default per-function group (#895)."""
+    import ministack.services.cloudwatch_logs as _cwl
+    set_request_account_id("000000000000")
+    _cwl._log_groups.clear()
+
+    func = {"config": {
+        "FunctionName": "log-cfg-fn", "Version": "$LATEST", "MemorySize": 128,
+        "LoggingConfig": {"LogFormat": "Text", "LogGroup": "/aws/lambda/shared-logs"},
+    }}
+    lsvc._emit_lambda_logs(func, "r1", "hello", False, 1)
+
+    # Logs land in the configured group, with events...
+    assert "/aws/lambda/shared-logs" in _cwl._log_groups
+    streams = _cwl._log_groups["/aws/lambda/shared-logs"]["streams"]
+    assert sum(len(s["events"]) for s in streams.values()) > 0
+    # ...and the default per-function group is NOT created.
+    assert "/aws/lambda/log-cfg-fn" not in _cwl._log_groups
+
+
 def test_emit_lambda_logs_failure_is_best_effort(monkeypatch):
     """A broken CW Logs module must not bubble into the Lambda invocation."""
     import ministack.services.cloudwatch_logs as _cwl
@@ -4767,6 +4873,37 @@ def test_apply_filter_criteria_no_filters_passes_through():
     records = [{"messageId": "x"}, {"messageId": "y"}]
     assert lsvc._apply_filter_criteria(records, {}) == records
     assert lsvc._apply_filter_criteria(records, {"FilterCriteria": {}}) == records
+
+
+def test_apply_filter_criteria_ddb_eventname_filter():
+    """DynamoDB stream records are filtered by top-level eventName, matching AWS behaviour."""
+    import json as _json
+    esm = {"FilterCriteria": {"Filters": [
+        {"Pattern": _json.dumps({"eventName": ["INSERT"]})},
+    ]}}
+    records = [
+        {"eventName": "INSERT", "dynamodb": {"NewImage": {"pk": {"S": "a"}}}},
+        {"eventName": "MODIFY", "dynamodb": {"NewImage": {"pk": {"S": "b"}}}},
+        {"eventName": "REMOVE", "dynamodb": {"OldImage": {"pk": {"S": "c"}}}},
+    ]
+    filtered = lsvc._apply_filter_criteria(records, esm)
+    assert [r["eventName"] for r in filtered] == ["INSERT"]
+
+
+def test_apply_filter_criteria_ddb_newimage_filter():
+    """DynamoDB stream records are filtered by nested dynamodb.NewImage data."""
+    import json as _json
+    esm = {"FilterCriteria": {"Filters": [
+        {"Pattern": _json.dumps({"dynamodb": {"NewImage": {"status": {"S": ["active"]}}}})},
+    ]}}
+    records = [
+        {"eventName": "INSERT", "dynamodb": {"NewImage": {"pk": {"S": "1"}, "status": {"S": "active"}}}},
+        {"eventName": "INSERT", "dynamodb": {"NewImage": {"pk": {"S": "2"}, "status": {"S": "inactive"}}}},
+        {"eventName": "REMOVE", "dynamodb": {"OldImage": {"pk": {"S": "3"}, "status": {"S": "active"}}}},
+    ]
+    filtered = lsvc._apply_filter_criteria(records, esm)
+    assert len(filtered) == 1
+    assert filtered[0]["dynamodb"]["NewImage"]["pk"]["S"] == "1"
 
 
 def test_event_stream_encode_roundtrip():
@@ -6085,6 +6222,194 @@ def test_lambda_durable_persistence_round_trip():
         lambda_durable.restore_state(original)
 
 
+# ---------------------------------------------------------------------------
+# Lambda code_zip persistence — content-addressed blob storage.
+# code_zip bytes are written to ${STATE_DIR}/lambda-blobs/{sha256}.zip; the
+# returned state holds only the sha reference. The in-memory _functions
+# shape is unchanged (still bytes after restore) so invoke / update / delete
+# paths see no difference.
+# ---------------------------------------------------------------------------
+
+
+def _make_lambda_record(name: str, code_zip: bytes, versions: dict | None = None) -> dict:
+    """Build a _functions entry matching what CreateFunction stores."""
+    return {
+        "config": {
+            "FunctionName": name,
+            "FunctionArn": f"arn:aws:lambda:us-east-1:000000000000:function:{name}",
+            "Runtime": "python3.12",
+            "Handler": "index.handler",
+        },
+        "code_zip": code_zip,
+        "versions": versions or {},
+        "next_version": 1,
+        "tags": {},
+        "policy": {"Version": "2012-10-17", "Id": "default", "Statement": []},
+    }
+
+
+@pytest.fixture
+def lambda_svc_isolated(tmp_path, monkeypatch):
+    """Snapshot lambda_svc state and redirect its blob storage to tmp_path.
+    Restores the original state at teardown so tests don't pollute the
+    shared in-process module that serves the running ministack."""
+    from ministack.services import lambda_svc
+
+    monkeypatch.setattr(lambda_svc, "CODE_BLOB_DIR", str(tmp_path / "lambda-blobs"))
+    original = lambda_svc.get_state()
+    try:
+        lambda_svc._functions._data.clear()
+        yield lambda_svc, tmp_path / "lambda-blobs"
+    finally:
+        lambda_svc._functions._data.clear()
+        lambda_svc.restore_state(original)
+
+
+def test_lambda_code_zip_round_trip_through_blob_storage(lambda_svc_isolated):
+    """Bytes survive an exact get_state → clear → restore_state round-trip."""
+    svc, _ = lambda_svc_isolated
+    code = b"\x89PNG\r\n\x1a\n" + b"\x00" * 1000  # non-UTF8 bytes
+    svc._functions["fn"] = _make_lambda_record("fn", code)
+
+    state = svc.get_state()
+    svc._functions._data.clear()
+    svc.restore_state(state)
+
+    restored = svc._functions._data[("000000000000", svc.get_region(), "fn")]
+    assert restored["code_zip"] == code
+    assert isinstance(restored["code_zip"], bytes)
+
+
+def test_lambda_get_state_replaces_code_zip_with_blob_ref(lambda_svc_isolated):
+    """The returned state must not inline bytes or base64 — only a sha ref."""
+    import hashlib
+    svc, blob_dir = lambda_svc_isolated
+    code = b"def handler(event, ctx): return 'ok'\n" * 256
+    svc._functions["fn"] = _make_lambda_record("fn", code)
+
+    state = svc.get_state()
+    fn_state = state["functions"]._data[("000000000000", svc.get_region(), "fn")]
+
+    assert fn_state["code_zip"] == {"code_blob_ref": hashlib.sha256(code).hexdigest()}
+    blob_path = blob_dir / f"{hashlib.sha256(code).hexdigest()}.zip"
+    assert blob_path.exists()
+    assert blob_path.read_bytes() == code
+
+
+def test_lambda_per_version_code_zip_also_externalized(lambda_svc_isolated):
+    """PublishVersion-created versions also store code_zip externally."""
+    import hashlib
+    svc, _ = lambda_svc_isolated
+    v1, v2 = b"v1 body", b"v2 body"
+    svc._functions["fn"] = _make_lambda_record(
+        "fn", v2, versions={"1": {"code_zip": v1, "config": {"Version": "1"}}}
+    )
+
+    state = svc.get_state()
+    fn_state = state["functions"]._data[("000000000000", svc.get_region(), "fn")]
+    assert fn_state["versions"]["1"]["code_zip"] == {
+        "code_blob_ref": hashlib.sha256(v1).hexdigest()
+    }
+
+    svc._functions._data.clear()
+    svc.restore_state(state)
+    restored = svc._functions._data[("000000000000", svc.get_region(), "fn")]
+    assert restored["code_zip"] == v2
+    assert restored["versions"]["1"]["code_zip"] == v1
+
+
+def test_lambda_identical_code_dedups_to_single_blob(lambda_svc_isolated):
+    """Content-addressing means two functions with identical bytes share one
+    file. Important when the deps-bundled-into-every-zip pattern produces
+    many functions with byte-identical layer payloads."""
+    svc, blob_dir = lambda_svc_isolated
+    code = b"shared body across two functions"
+    svc._functions["fn-a"] = _make_lambda_record("fn-a", code)
+    svc._functions["fn-b"] = _make_lambda_record("fn-b", code)
+
+    svc.get_state()
+
+    files = sorted(blob_dir.iterdir())
+    assert len(files) == 1, [f.name for f in files]
+
+
+def test_lambda_legacy_inline_base64_persistence_still_loads(lambda_svc_isolated):
+    """Pre-existing lambda.json files (written before content-addressed
+    storage) stored code_zip as inline base64. restore_state must accept
+    that shape so an in-place upgrade requires no migration step."""
+    import base64 as _b64
+    from ministack.core.responses import AccountScopedDict
+    svc, _ = lambda_svc_isolated
+
+    code = b"legacy persisted bytes"
+    legacy = {
+        "functions": AccountScopedDict(),
+        "layers": AccountScopedDict(),
+        "esms": AccountScopedDict(),
+        "function_urls": AccountScopedDict(),
+        "kinesis_positions": {},
+        "dynamodb_stream_positions": {},
+    }
+    legacy["functions"]._data[("000000000000", "old-fn")] = {
+        "config": {"FunctionName": "old-fn"},
+        "code_zip": _b64.b64encode(code).decode(),
+        "versions": {},
+    }
+
+    svc.restore_state(legacy)
+
+    restored = svc._functions._data[("000000000000", svc.get_region(), "old-fn")]
+    assert restored["code_zip"] == code
+
+
+def test_lambda_missing_blob_degrades_without_aborting_restore(lambda_svc_isolated):
+    """If a blob file is missing (corrupted volume / partial mount), restore
+    must downgrade the affected function (code_zip=None) and continue,
+    rather than raise and prevent the whole server from starting."""
+    from ministack.core.responses import AccountScopedDict
+    svc, _ = lambda_svc_isolated
+
+    state = {
+        "functions": AccountScopedDict(),
+        "layers": AccountScopedDict(),
+        "esms": AccountScopedDict(),
+        "function_urls": AccountScopedDict(),
+        "kinesis_positions": {},
+        "dynamodb_stream_positions": {},
+    }
+    state["functions"]._data[("000000000000", "orphan")] = {
+        "config": {"FunctionName": "orphan"},
+        "code_zip": {"code_blob_ref": "0" * 64},  # sha pointing at nothing
+        "versions": {},
+    }
+
+    svc.restore_state(state)
+
+    assert svc._functions._data[("000000000000", svc.get_region(), "orphan")]["code_zip"] is None
+
+
+def test_lambda_get_state_prunes_orphan_blobs(lambda_svc_isolated):
+    """When a function's code is updated, the previous generation's blob
+    becomes orphan. The next get_state sweeps it. Without this, repeated
+    UpdateFunctionCode (e.g. iterative sandbox redeploys) leaks blob files
+    across restarts."""
+    import hashlib
+    svc, blob_dir = lambda_svc_isolated
+
+    old_code = b"old code"
+    new_code = b"new code"
+    svc._functions["fn"] = _make_lambda_record("fn", old_code)
+    svc.get_state()  # writes blob(old_code)
+    assert (blob_dir / f"{hashlib.sha256(old_code).hexdigest()}.zip").exists()
+
+    # Simulate UpdateFunctionCode.
+    svc._functions["fn"]["code_zip"] = new_code
+    svc.get_state()  # writes blob(new_code), should remove blob(old_code)
+
+    assert (blob_dir / f"{hashlib.sha256(new_code).hexdigest()}.zip").exists()
+    assert not (blob_dir / f"{hashlib.sha256(old_code).hexdigest()}.zip").exists()
+
+
 def test_lambda_durable_event_wrapped_with_sdk_fields(lam):
     """A durable invocation's event payload is wrapped with the fields the
     aws-durable-execution-sdk-python SDK reads from the Lambda event:
@@ -6713,3 +7038,86 @@ def test_xray_trace_id_helper_unit():
     inbound = "Root=1-12345678-aaaabbbbccccddddeeeeffff;Parent=1111222233334444;Sampled=1"
     assert _xray_trace_id_for_invocation({}, inbound) == inbound
     assert _xray_trace_id_for_invocation({"TracingConfig": {"Mode": "Active"}}, inbound) == inbound
+
+
+# ---------------------------------------------------------------------------
+# Layer / code zip extraction preserves unix mode bits — issue #888. AWS keeps
+# layer file permissions; the +x on /opt/bin tools and bundled binaries must
+# survive extraction (ZipFile.extractall drops them).
+# ---------------------------------------------------------------------------
+
+
+def test_extract_zip_preserves_executable_bit():
+    import tempfile
+    from ministack.services.lambda_svc import _extract_zip_preserving_mode
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        exe = zipfile.ZipInfo("bin/tool")
+        exe.external_attr = 0o755 << 16
+        zf.writestr(exe, "#!/bin/sh\necho hi\n")
+        mod = zipfile.ZipInfo("python/mymod.py")
+        mod.external_attr = 0o644 << 16
+        zf.writestr(mod, "X = 1\n")
+    buf.seek(0)
+
+    dest = tempfile.mkdtemp()
+    with zipfile.ZipFile(buf) as zf:
+        _extract_zip_preserving_mode(zf, dest)
+
+    tool_mode = os.stat(os.path.join(dest, "bin/tool")).st_mode & 0o777
+    assert tool_mode == 0o755, f"executable bit dropped: {oct(tool_mode)}"
+    assert os.stat(os.path.join(dest, "python/mymod.py")).st_mode & 0o777 == 0o644
+
+
+def test_extract_zip_windows_zip_keeps_default_mode():
+    """Windows-created zips (PowerShell Compress-Archive) carry no unix mode
+    (external_attr high bits = 0) — we must NOT chmod them to 0, which would
+    make the extracted files unreadable."""
+    import tempfile
+    from ministack.services.lambda_svc import _extract_zip_preserving_mode
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("python/winmod.py", "Y = 2\n")  # external_attr defaults to 0
+    buf.seek(0)
+
+    dest = tempfile.mkdtemp()
+    with zipfile.ZipFile(buf) as zf:
+        _extract_zip_preserving_mode(zf, dest)
+
+    mode = os.stat(os.path.join(dest, "python/winmod.py")).st_mode & 0o777
+    assert mode != 0, "file left unreadable (chmod 0) on a windows-style zip"
+
+
+def test_lambda_local_executor_site_packages_layer(lam):
+    """Local executor exposes <layer>/python/lib/python*/site-packages as a
+    *site directory* (AWS's documented semantics), so pip-style (`pip install
+    -t`) dependency layers import — including `.pth`-driven paths, which require
+    `site.addsitedir` rather than a plain `sys.path.insert` (#888)."""
+    sp = "python/lib/python3.12/site-packages"
+    lbuf = io.BytesIO()
+    with zipfile.ZipFile(lbuf, "w") as z:
+        # regular package directly in site-packages
+        z.writestr(f"{sp}/sitelib888.py", "def hi():\n    return 'sp-ok'\n")
+        # a .pth file that adds a sibling dir — only resolves via site.addsitedir
+        z.writestr(f"{sp}/extra888.pth", "vendored888\n")
+        z.writestr(f"{sp}/vendored888/pthmod888.py", "def hi():\n    return 'pth-ok'\n")
+    lv = lam.publish_layer_version(
+        LayerName="sp-layer-888", Content={"ZipFile": lbuf.getvalue()},
+        CompatibleRuntimes=["python3.12"])
+    fbuf = io.BytesIO()
+    with zipfile.ZipFile(fbuf, "w") as z:
+        z.writestr("index.py",
+                   "import sitelib888, pthmod888\n"
+                   "def handler(e, c):\n"
+                   "    return {'sp': sitelib888.hi(), 'pth': pthmod888.hi()}\n")
+    lam.create_function(
+        FunctionName="sp-fn-888", Runtime="python3.12",
+        Role="arn:aws:iam::000000000000:role/r", Handler="index.handler",
+        Code={"ZipFile": fbuf.getvalue()}, Layers=[lv["LayerVersionArn"]])
+    resp = lam.invoke(FunctionName="sp-fn-888", Payload=b"{}")
+    assert "FunctionError" not in resp, resp
+    payload = json.loads(resp["Payload"].read())
+    assert payload["sp"] == "sp-ok"
+    assert payload["pth"] == "pth-ok"

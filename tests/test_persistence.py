@@ -580,6 +580,39 @@ def test_pipes_restore_starts_poller_for_running_pipes(monkeypatch):
     mod.reset()
 
 
+def test_lambda_esm_eager_loaded_at_boot_when_persisted(monkeypatch):
+    """#889: persisted SQS event source mappings must resume polling after a
+    warm restart even under pure-SQS traffic. The ESM poller starts from
+    lambda_svc's import-time restore (`_ensure_poller`), and lambda_svc is
+    otherwise imported lazily only on a Lambda request — so `_load_persisted_state`
+    must eager-import it at boot when ESMs are persisted, else the restored
+    mapping sits Enabled-but-unpolled and messages pile up. A restore_state-level
+    test does NOT catch this: the bug is the module never being imported."""
+    import ministack.app as app
+    monkeypatch.setattr(app, "load_state",
+                        lambda key: {"esms": {"uuid-1": {"Enabled": True}}} if key == "lambda" else None)
+    requested = []
+    real = app._get_module
+    monkeypatch.setattr(app, "_get_module", lambda n: (requested.append(n), real(n))[1])
+    app._load_persisted_state()
+    assert "lambda_svc" in requested, (
+        "#889: persisted ESMs present but lambda_svc was not eager-imported at "
+        "boot — the SQS poller never starts under pure-SQS traffic after restart."
+    )
+
+
+def test_lambda_not_eager_loaded_without_persisted_esms(monkeypatch):
+    """Narrow: no persisted ESMs → don't pay the lambda_svc cold-start at boot."""
+    import ministack.app as app
+    monkeypatch.setattr(app, "load_state",
+                        lambda key: {"esms": {}} if key == "lambda" else None)
+    requested = []
+    real = app._get_module
+    monkeypatch.setattr(app, "_get_module", lambda n: (requested.append(n), real(n))[1])
+    app._load_persisted_state()
+    assert "lambda_svc" not in requested
+
+
 # ── PERSIST_STATE gating ──────────────────────────────────────────────
 
 @pytest.mark.parametrize("svc_key", [
@@ -866,22 +899,43 @@ def test_module_cold_import_with_typical_snapshot_does_not_log_restore_failure(
     # importlib.reload() won't work because it merges into the
     # existing namespace; the late-declared symbol stays bound from
     # the prior import.
+    import ministack.services as _services_pkg
+
     full_name = f"ministack.services.{mod_name}"
+    # The cold-import swaps a brand-new module object into BOTH sys.modules and
+    # the `ministack.services` package attribute. Other already-imported modules
+    # that did `from ministack.services import <mod>` keep a reference to the
+    # ORIGINAL object, so we must restore it afterwards. Otherwise the fresh
+    # module (with empty, reset state) leaks into later tests on the same xdist
+    # worker and desyncs cross-module references — e.g. cold-importing `ecs`
+    # then `secretsmanager` leaves the fresh `ecs` pointing at a stale
+    # `secretsmanager`, so ECS RunTask can no longer resolve Secrets Manager
+    # secrets created via the live module. Both the sys.modules entry and the
+    # package attribute must be restored: `from ministack.services import <mod>`
+    # reads the package attribute, not sys.modules directly.
+    original_mod = sys.modules.get(full_name)
     sys.modules.pop(full_name, None)
 
-    caplog.clear()
-    with caplog.at_level("WARNING"):
-        mod = importlib.import_module(full_name)
+    try:
+        caplog.clear()
+        with caplog.at_level("WARNING"):
+            mod = importlib.import_module(full_name)
 
-    bad = [
-        r for r in caplog.records
-        if r.levelno >= 30  # WARNING+
-        and any(needle in r.getMessage().lower()
-                for needle in ("failed to restore", "restore failed",
-                               "continuing fresh", "continuing with fresh"))
-    ]
-    if hasattr(mod, "reset"):
-        mod.reset()
+        bad = [
+            r for r in caplog.records
+            if r.levelno >= 30  # WARNING+
+            and any(needle in r.getMessage().lower()
+                    for needle in ("failed to restore", "restore failed",
+                                   "continuing fresh", "continuing with fresh"))
+        ]
+        if hasattr(mod, "reset"):
+            mod.reset()
+    finally:
+        # Re-register the original module so references bound before this test
+        # (e.g. `ecs.secretsmanager`) stay valid for subsequent tests.
+        if original_mod is not None:
+            sys.modules[full_name] = original_mod
+            setattr(_services_pkg, mod_name, original_mod)
 
     assert not bad, (
         f"Cold import of `{mod_name}` (state-key `{svc_key}`) emitted "
