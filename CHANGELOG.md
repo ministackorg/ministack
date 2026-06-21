@@ -5,6 +5,13 @@ All notable changes to MiniStack will be documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+- **SNS — `Publish` now accepts non-string `Message` values** — Step Functions' `arn:aws:states:::sns:publish` integration does not always pass `Parameters.Message` as a plain string; inline object values (e.g. in YAML or ASL) arrive as structured data. MiniStack previously treated only strings as valid and publish failed on dict values. Non-string messages are now JSON-serialized before delivery.
+
+---
+
 ## [1.3.65] — 2026-06-19
 
 ### Fixed

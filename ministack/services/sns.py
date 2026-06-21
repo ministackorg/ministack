@@ -538,6 +538,9 @@ def _publish(params):
     subject = _p(params, "Subject")
     message_structure = _p(params, "MessageStructure")
 
+    if isinstance(message, dict):
+        message = json.dumps(message)
+
     if phone_number and not topic_arn:
         msg_id = new_uuid()
         logger.info("SNS SMS stub to %s: %s", phone_number, message[:80])
