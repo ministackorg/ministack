@@ -632,6 +632,38 @@ def test_iam_seeded_amazon_eks_cni_policy(iam):
     assert "ec2:ModifyNetworkInterfaceAttribute" in first_actions
 
 
+def test_iam_seeded_aws_xray_daemon_write_access(iam):
+    """AWSXRayDaemonWriteAccess is heavily referenced by
+    terraform-aws-modules/lambda's `attach_tracing_policy = true` path
+    via `data "aws_iam_policy" "tracing" { arn = ... }`."""
+    arn = "arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess"
+    resp = iam.get_policy(PolicyArn=arn)
+    assert resp["Policy"]["PolicyName"] == "AWSXRayDaemonWriteAccess"
+    pv = iam.get_policy_version(PolicyArn=arn, VersionId="v1")["PolicyVersion"]
+    doc = pv["Document"] if isinstance(pv["Document"], dict) else json.loads(pv["Document"])
+    actions = doc["Statement"][0]["Action"]
+    assert "xray:PutTraceSegments" in actions
+    assert "xray:PutTelemetryRecords" in actions
+    assert "*" not in actions
+
+
+def test_iam_seeded_aws_xray_readonly(iam):
+    arn = "arn:aws:iam::aws:policy/AWSXrayReadOnlyAccess"
+    pv = iam.get_policy_version(PolicyArn=arn, VersionId="v1")["PolicyVersion"]
+    doc = pv["Document"] if isinstance(pv["Document"], dict) else json.loads(pv["Document"])
+    actions = doc["Statement"][0]["Action"]
+    assert "xray:BatchGetTraces" in actions
+    assert "xray:GetServiceGraph" in actions
+
+
+def test_iam_seeded_aws_lambda_role(iam):
+    arn = "arn:aws:iam::aws:policy/AWSLambdaRole"
+    pv = iam.get_policy_version(PolicyArn=arn, VersionId="v1")["PolicyVersion"]
+    doc = pv["Document"] if isinstance(pv["Document"], dict) else json.loads(pv["Document"])
+    actions = doc["Statement"][0]["Action"]
+    assert "lambda:InvokeFunction" in actions
+
+
 def test_iam_list_policies_scope_all_includes_aws_managed(iam):
     resp = iam.list_policies(Scope="All")
     arns = [p["Arn"] for p in resp["Policies"]]
