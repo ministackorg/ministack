@@ -278,7 +278,7 @@ def _seed_aws_managed_policies() -> None:
          '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["xray:PutTraceSegments","xray:PutTelemetryRecords","xray:GetSamplingRules","xray:GetSamplingTargets","xray:GetSamplingStatisticSummaries"],"Resource":["*"]}]}',
          "AWS X-Ray Daemon write access — permissions required by the X-Ray daemon to upload telemetry segments to X-Ray and fetch sampling rules."),
         ('AWSXrayReadOnlyAccess',
-         '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["xray:GetSamplingRules","xray:GetSamplingTargets","xray:GetSamplingStatisticSummaries","xray:BatchGetTraces","xray:GetServiceGraph","xray:GetTraceGraph","xray:GetTraceSummaries","xray:GetGroups","xray:GetGroup","xray:ListTagsForResource","xray:GetTimeSeriesServiceStatistics","xray:GetInsightSummaries","xray:GetInsight","xray:GetInsightEvents","xray:GetInsightImpactGraph"],"Resource":["*"]}]}',
+         '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["xray:GetSamplingRules","xray:GetSamplingTargets","xray:GetSamplingStatisticSummaries","xray:BatchGetTraces","xray:BatchGetTraceSummaryById","xray:GetDistinctTraceGraphs","xray:GetServiceGraph","xray:GetTraceGraph","xray:GetTraceSummaries","xray:GetGroups","xray:GetGroup","xray:ListTagsForResource","xray:ListResourcePolicies","xray:GetTimeSeriesServiceStatistics","xray:GetInsightSummaries","xray:GetInsight","xray:GetInsightEvents","xray:GetInsightImpactGraph"],"Resource":["*"]}]}',
          "AWS X-Ray read-only access. Grants permission to retrieve trace data, service graphs, and sampling rules."),
         ('AWSLambdaRole',
          '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["lambda:InvokeFunction"],"Resource":["*"]}]}',

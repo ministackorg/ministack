@@ -901,7 +901,7 @@ def _create_replication_group(p):
     arn = _arn_replication_group(rg_id)
 
     if rg_id in _replication_groups:
-        return _error("ReplicationGroupAlreadyExistsFault",
+        return _error("ReplicationGroupAlreadyExists",
                        f"Replication group {rg_id} already exists", 400)
 
     validation_error = _validate_create_replication_group_request(p)

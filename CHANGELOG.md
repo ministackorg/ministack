@@ -5,10 +5,20 @@ All notable changes to MiniStack will be documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning follows [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [1.3.66] — 2026-06-22
+
+### Added
+- **ElastiCache — broad parity improvements** — built-in `default.*` parameter groups for the Redis, Memcached, and Valkey families (including `.cluster.on` variants) with AWS-style engine-version→family mapping; seeded defaults are immutable (create/modify/delete/reset rejected with AWS-shaped errors); replication-group creation materializes member cache clusters with metadata, tags, and member IDs and removes them on deletion; create/modify validate user groups with `UserGroupNotFound`; tag updates fan out to member cluster ARNs; and ElastiCache is now covered by the Resource Groups Tagging API. User and user-group error codes now use AWS's wire forms (`UserNotFound`, `UserGroupNotFound`, …). Contributed by @ZiningYin.
+- **IAM — additional AWS-managed policies seeded** — `AWSXRayDaemonWriteAccess`, `AWSXrayReadOnlyAccess`, and `AWSLambdaRole` are now pre-seeded with their canonical documents, so Terraform's tracing lookup (`data "aws_iam_policy" { arn = ".../AWSXRayDaemonWriteAccess" }`, used by every `attach_tracing_policy = true` module) resolves. Contributed by @mattwang44.
 
 ### Fixed
-- **SNS — `Publish` now accepts non-string `Message` values** — Step Functions' `arn:aws:states:::sns:publish` integration does not always pass `Parameters.Message` as a plain string; inline object values (e.g. in YAML or ASL) arrive as structured data. MiniStack previously treated only strings as valid and publish failed on dict values. Non-string messages are now JSON-serialized before delivery.
+- **CloudFormation — `aws cloudformation deploy` without `--parameter-overrides` now updates resources** — a change set created with `UsePreviousValue=true` (what `deploy` sends for existing parameters when no overrides are given) resolved the parameter to an empty value instead of its stored value, so a parameter-driven resource name (e.g. `!Sub ${StackName}-handler`) resolved wrong and the stack update silently missed the real resource — its code/properties never changed. `UsePreviousValue` is now resolved against the stack's stored parameters on both the change-set and `UpdateStack` paths. Reported by @ankitaabad.
+- **Step Functions — `.waitForTaskToken` now invokes non-Lambda service integrations** — `arn:aws:states:::sqs:sendMessage.waitForTaskToken` (and `sns:publish`, `dynamodb:*`, `aws-sdk:*`, …) scheduled the task but never performed the integration, so the payload carrying the task token was never sent and the execution hung. The callback path now dispatches the integration before blocking, and an object `MessageBody` is JSON-serialized for SQS. Reported by @taylor1791.
+- **RDS Data API — PostgreSQL correctness fixes** — psycopg2 connections now autocommit (matching the MySQL path), so a non-transactional `ExecuteStatement` is no longer rolled back on connection close; named parameters are substituted longest-first so `:1` no longer corrupts `:10` / `:18`; and `jsonb` values are returned as their stored JSON text instead of an invalid single-quoted Python repr. Reported by @awilson9.
+- **Cognito — token/session invalidation now takes effect** — `RevokeToken`, `GlobalSignOut`, and `AdminUserGlobalSignOut` were no-ops, so a revoked refresh token still minted new access tokens. They now invalidate the affected refresh tokens, and the `REFRESH_TOKEN_AUTH` flow honours the revocation.
+- **RDS — `CreateDBInstance` / `CreateDBCluster` validate parameter-group existence** — referencing a non-existent custom parameter group now returns `DBParameterGroupNotFound` / `DBClusterParameterGroupNotFound` instead of silently succeeding.
+- **Athena — `GetTableMetadata` / `ListTableMetadata` return real columns and partition keys** — the responses were empty stubs; they now surface the backing Glue table's columns and partition keys.
+- **SNS — `Publish` now accepts non-string `Message` values** — Step Functions' `arn:aws:states:::sns:publish` integration can pass `Message` as structured data rather than a plain string; it is now JSON-serialized before delivery instead of failing. Contributed by @noynoy83.
 
 ---
 

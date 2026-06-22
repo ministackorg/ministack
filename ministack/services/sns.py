@@ -538,7 +538,7 @@ def _publish(params):
     subject = _p(params, "Subject")
     message_structure = _p(params, "MessageStructure")
 
-    if isinstance(message, dict):
+    if isinstance(message, (dict, list)):
         message = json.dumps(message)
 
     if phone_number and not topic_arn:
