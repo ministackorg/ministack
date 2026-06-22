@@ -515,6 +515,8 @@ If translation output contains raw AWS resource types that MiniStack does not su
 For repeatable tests, keep the generated CloudFormation template as a build artifact or regenerate it in CI before calling `cloudformation deploy`.
 For small examples, you can also hand-convert SAM resources into their equivalent CloudFormation resources.
 When reporting SAM issues, include both the original SAM template and the translated CloudFormation template so maintainers can tell whether the failure is in transformation or resource support.
+Also include the exact `sam` and `aws` commands used, because endpoint and packaging options affect where Lambda artifacts are uploaded.
+If you only need Lambda plus API Gateway for a test, prefer the translated CloudFormation template in source control so teammates do not need to debug SAM transform behavior first.
 
 ### Infrastructure Services
 
