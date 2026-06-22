@@ -1247,6 +1247,66 @@ def _delete_rest_api(api_id):
     return 202, {}, b""
 
 
+# ---- OpenAPI parsing ----
+
+_OPENAPI_HTTP_METHODS = {
+    "get", "post", "put", "delete", "patch", "head", "options",
+}
+
+
+def _import_rest_api(spec, base_data=None):
+    data = dict(base_data or {})
+    info = spec.get("info") or {}
+    if info.get("title") and not data.get("name"):
+        data["name"] = str(info["title"])
+    if info.get("version") and not data.get("version"):
+        data["version"] = str(info["version"])
+
+    _status, _headers, body = _create_rest_api(data)
+    api_id = json.loads(body)["id"]
+    for path, path_item in (spec.get("paths") or {}).items():
+        _import_path_item(api_id, path, path_item)
+    return api_id
+
+
+def _import_path_item(api_id, path, path_item):
+    resource_id = next(
+        rid for rid, res in _resources.get(api_id, {}).items()
+        if res.get("path") == "/"
+    )
+    if path != "/":
+        for segment in path.strip("/").split("/"):
+            child = next(
+                (rid for rid, res in _resources.get(api_id, {}).items()
+                 if res.get("parentId") == resource_id
+                 and res.get("pathPart") == segment),
+                None,
+            )
+            if child is None:
+                _status, _headers, body = _create_resource(
+                    api_id, resource_id, {"pathPart": segment}
+                )
+                child = json.loads(body)["id"]
+            resource_id = child
+
+    for method, operation in path_item.items():
+        if method.lower() in _OPENAPI_HTTP_METHODS:
+            _import_operation(api_id, resource_id, method.upper(), operation)
+
+
+def _import_operation(api_id, resource_id, http_method, operation):
+    _put_method(api_id, resource_id, http_method, {"authorizationType": "NONE"})
+
+    integration = (operation or {}).get("x-amazon-apigateway-integration")
+    if integration:
+        int_type = integration.get("type")
+        _put_integration(api_id, resource_id, http_method, {
+            "type": int_type.upper() if int_type else None,
+            "httpMethod": integration.get("httpMethod"),
+            "uri": integration.get("uri"),
+        })
+
+
 # ---- Control plane: Resources ----
 
 def _get_resources(api_id, query_params):
