@@ -1617,6 +1617,68 @@ def test_sfn_integration_sns_publish(sfn, sns):
     output = json.loads(desc["output"])
     assert "MessageId" in output
 
+
+def test_sfn_integration_sns_publish_structured_payload(sfn, sns, sqs):
+    """Task state publishes a structured Message object via arn:aws:states:::sns:publish."""
+    topic = sns.create_topic(Name="sfn-integ-sns-json-payload")
+    topic_arn = topic["TopicArn"]
+    str1 = "string1"
+    str2 = "string2"
+
+    q_url = sqs.create_queue(QueueName="sfn-integ-sns-json-payload-q")["QueueUrl"]
+    q_arn = sqs.get_queue_attributes(
+        QueueUrl=q_url,
+        AttributeNames=["QueueArn"],
+    )["Attributes"]["QueueArn"]
+    sns.subscribe(TopicArn=topic_arn, Protocol="sqs", Endpoint=q_arn)
+
+    definition = json.dumps(
+        {
+            "StartAt": "Publish",
+            "States": {
+                "Publish": {
+                    "Type": "Task",
+                    "Resource": "arn:aws:states:::sns:publish",
+                    "Parameters": {
+                        "TopicArn": topic_arn,
+                        "Message": {
+                            "str1.$": "$.str1",
+                            "str2.$": "$.str2",
+                        },
+                    },
+                    "End": True,
+                },
+            },
+        }
+    )
+    sm = sfn.create_state_machine(
+        name="sfn-sns-json-payload",
+        definition=definition,
+        roleArn="arn:aws:iam::000000000000:role/R",
+    )
+    ex = sfn.start_execution(
+        stateMachineArn=sm["stateMachineArn"],
+        input=json.dumps({"str1": str1, "str2": str2}),
+    )
+
+    desc = _wait_sfn(sfn, ex["executionArn"])
+    assert desc["status"] == "SUCCEEDED"
+    output = json.loads(desc["output"])
+    assert "MessageId" in output
+
+    msgs = sqs.receive_message(
+        QueueUrl=q_url,
+        MaxNumberOfMessages=1,
+        WaitTimeSeconds=1,
+    )
+    assert len(msgs.get("Messages", [])) == 1
+    envelope = json.loads(msgs["Messages"][0]["Body"])
+    assert json.loads(envelope["Message"]) == {
+        "str1": str1,
+        "str2": str2,
+    }
+
+
 def test_sfn_integration_dynamodb_put_get(sfn, ddb):
     """Task states write and read from DynamoDB."""
     table_name = "sfn-integ-ddb-test"
