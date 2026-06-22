@@ -6,9 +6,39 @@ on:
   pull_request:
     branches: [main, master]
 
+env:
+  PARALLEL_SHARDS: 3
+  SERIAL_SHARDS: 1
+
 jobs:
-  test:
+  setup:
+    name: plan shards
     runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      files: ${{ steps.plan.outputs.files }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -e . && pip install -r requirements.txt boto3 pytest pytest-xdist duckdb docker cbor2 pyyaml cryptography
+
+      - name: Plan test shards
+        id: plan
+        run: python scripts/plan_test_shards.py
+
+  test:
+    needs: setup
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.setup.outputs.matrix) }}
 
     services:
       redis:
@@ -16,16 +46,13 @@ jobs:
         ports:
           - 6379:6379
         options: >-
-          --health-cmd "redis-cli ping"
-          --health-interval 5s
-          --health-timeout 3s
-          --health-retries 5
+          --health-cmd "redis-cli ping" --health-interval 5s --health-timeout 3s --health-retries 5
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.12"
           cache: "pip"
@@ -36,18 +63,48 @@ jobs:
       - name: Start MiniStack
         run: |
           REDIS_HOST=localhost python -m hypercorn ministack.app:app --bind 0.0.0.0:4566 --keep-alive 75 > ministack.log 2>&1 &
-          sleep 3
+          for i in $(seq 1 15); do
+            curl -sf http://localhost:4566/_ministack/health && break
+            echo "Waiting for MiniStack... ($i/15)"
+            sleep 2
+          done
           curl -sf http://localhost:4566/_ministack/health
 
-      - name: Run tests (parallel safe set)
-        run: pytest tests/ -v -n 3 --dist=loadfile -m "not serial"
+      - name: Resolve shard files
+        id: shard
+        env:
+          FILES_MAP: ${{ needs.setup.outputs.files }}
+        run: |
+          FILES=$(python3 -c "
+          import json, os
+          m = json.loads(os.environ['FILES_MAP'])
+          print(m.get('${{ matrix.mode }}_${{ matrix.shard_index }}', ''))
+          ")
+          echo "files=$FILES" >> $GITHUB_OUTPUT
 
-      - name: Run tests (serial global-state set)
-        run: pytest tests/ -v --tb=short -m "serial"
+      - name: Run tests (${{ matrix.mode }} shard ${{ matrix.shard_index }})
+        run: |
+          if [ -z "${{ steps.shard.outputs.files }}" ]; then
+            echo "No tests for this shard"
+            exit 0
+          fi
+          if [ "${{ matrix.mode }}" = "serial" ]; then
+            pytest ${{ steps.shard.outputs.files }} -v --tb=short -m "serial" --durations=10
+          else
+            pytest ${{ steps.shard.outputs.files }} -v -n 3 --dist=loadfile -m "not serial" --durations=25
+          fi
 
       - name: Upload MiniStack log
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
-          name: ministack.log
+          name: ministack-${{ matrix.mode }}-shard-${{ matrix.shard_index }}.log
           path: ministack.log
+
+  test-result:
+    name: test
+    needs: test
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - run: '[ "${{ needs.test.result }}" = "success" ]'

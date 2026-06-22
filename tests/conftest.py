@@ -64,6 +64,7 @@ _SERIAL_TESTS = {
     "tests/test_ses.py::test_ses_messages_endpoint_account_filter",
     "tests/test_stepfunctions.py::test_sfn_mock_config_return",
     "tests/test_stepfunctions.py::test_sfn_mock_config_throw",
+    "tests/test_stepfunctions.py::test_sfn_mock_config_jsonata_assign_applied",
     "tests/test_stepfunctions.py::test_sfn_mock_config_throw_routes_to_catch",
     "tests/test_stepfunctions.py::test_sfn_mock_config_jsonata_assign_applied",
     "tests/test_stepfunctions.py::test_sfn_wait_scale_zero_does_not_timeout_lambda_tasks",
@@ -99,6 +100,8 @@ _SERIAL_TESTS = {
     "tests/test_appsync.py::test_appsync_lambda_authorizer_rejection_returns_unauthorized",
     "tests/test_appsync.py::test_appsync_lambda_missing_authorizer_returns_unauthorized",
     "tests/test_appsync.py::test_appsync_lambda_failing_authorizer_returns_unauthorized",
+    # AppSync Events service mutations; shared state racing under xdist.
+    "tests/test_appsync_events.py::test_publish_with_appsync_sigv4_scope_on_events_vhost",
     # Credential report reflects all users in the account; run serially to avoid
     # parallel-test interference on the account-global CSV snapshot.
     "tests/test_iam.py::test_iam_credential_report_mfa_and_password",

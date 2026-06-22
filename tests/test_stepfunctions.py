@@ -1531,6 +1531,56 @@ def test_sfn_integration_sqs_send_message(sfn, sqs):
     assert len(msgs.get("Messages", [])) == 1
     assert msgs["Messages"][0]["Body"] == "hello from sfn"
 
+def test_sfn_integration_sqs_send_message_wait_for_task_token(sfn, sqs):
+    """sqs:sendMessage.waitForTaskToken must actually deliver the message
+    (carrying the task token, serialised to JSON) and resume on
+    SendTaskSuccess. Previously the task was scheduled but nothing was sent and
+    the execution hung forever (#959)."""
+    import time
+
+    queue_url = sqs.create_queue(QueueName="sfn-sqs-wfett")["QueueUrl"]
+
+    definition = json.dumps(
+        {
+            "StartAt": "Send",
+            "States": {
+                "Send": {
+                    "Type": "Task",
+                    "Resource": "arn:aws:states:::sqs:sendMessage.waitForTaskToken",
+                    "Parameters": {
+                        "QueueUrl": queue_url,
+                        "MessageBody": {"task_token.$": "$$.Task.Token"},
+                    },
+                    "End": True,
+                },
+            },
+        }
+    )
+    sm = sfn.create_state_machine(
+        name="sfn-sqs-wfett",
+        definition=definition,
+        roleArn="arn:aws:iam::000000000000:role/R",
+    )
+    ex = sfn.start_execution(stateMachineArn=sm["stateMachineArn"], input="{}")
+
+    # The integration must fire so a worker can read the token off the queue.
+    body = None
+    for _ in range(40):
+        msgs = sqs.receive_message(QueueUrl=queue_url, MaxNumberOfMessages=1)
+        if msgs.get("Messages"):
+            body = msgs["Messages"][0]["Body"]
+            break
+        time.sleep(0.25)
+    assert body is not None, "no SQS message delivered — task hung (#959)"
+    parsed = json.loads(body)  # object MessageBody must be valid JSON, not a repr
+    assert parsed["task_token"]
+
+    # The execution is paused at the task; SendTaskSuccess resumes it.
+    sfn.send_task_success(
+        taskToken=parsed["task_token"], output=json.dumps({"ok": True}))
+    desc = _wait_sfn(sfn, ex["executionArn"])
+    assert desc["status"] == "SUCCEEDED"
+
 def test_sfn_integration_sns_publish(sfn, sns):
     """Task state publishes to SNS via arn:aws:states:::sns:publish."""
     topic = sns.create_topic(Name="sfn-integ-sns-test")
