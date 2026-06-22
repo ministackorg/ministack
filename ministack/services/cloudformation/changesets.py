@@ -139,7 +139,8 @@ def _create_change_set(params):
         return _error("ValidationError", f"Template format error: {e}")
 
     try:
-        param_values = _resolve_parameters(template, provided_params)
+        param_values = _resolve_parameters(
+            template, provided_params, stack.get("_resolved_params", {}))
     except ValueError as exc:
         return _error("ValidationError", str(exc))
 

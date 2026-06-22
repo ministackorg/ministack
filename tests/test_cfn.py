@@ -170,6 +170,40 @@ def test_cfn_stack_with_parameters(cfn, sqs):
     urls = sqs.list_queues(QueueNamePrefix="cfn-t02-custom").get("QueueUrls", [])
     assert any("cfn-t02-custom" in u for u in urls)
 
+def test_cfn_change_set_use_previous_value_updates_resource(cfn, ssm):
+    """A change set created with UsePreviousValue (the `aws cloudformation deploy`
+    no-`--parameter-overrides` path) must resolve the parameter to its stored
+    value, so a parameter-driven resource still updates rather than resolving to
+    an empty value and missing the real resource (#897)."""
+    def template(value):
+        return json.dumps({
+            "AWSTemplateFormatVersion": "2010-09-09",
+            "Parameters": {"Prefix": {"Type": "String", "Default": "demo"}},
+            "Resources": {"P": {
+                "Type": "AWS::SSM::Parameter",
+                "Properties": {
+                    "Name": {"Fn::Sub": "/${Prefix}/config"},
+                    "Type": "String",
+                    "Value": value,
+                },
+            }},
+        })
+
+    cfn.create_stack(StackName="cfn-upv", TemplateBody=template("v1"))
+    _wait_stack(cfn, "cfn-upv")
+    assert ssm.get_parameter(Name="/demo/config")["Parameter"]["Value"] == "v1"
+
+    # Change set re-sends Prefix as UsePreviousValue (what `deploy` does without
+    # --parameter-overrides). Prefix must resolve to "demo", not "".
+    cfn.create_change_set(
+        StackName="cfn-upv", ChangeSetName="cs2", TemplateBody=template("v2"),
+        Parameters=[{"ParameterKey": "Prefix", "UsePreviousValue": True}],
+    )
+    cfn.execute_change_set(StackName="cfn-upv", ChangeSetName="cs2")
+    _wait_stack(cfn, "cfn-upv")
+
+    assert ssm.get_parameter(Name="/demo/config")["Parameter"]["Value"] == "v2"
+
 def test_cfn_intrinsic_ref_getatt(cfn, ssm):
     template = {
         "AWSTemplateFormatVersion": "2010-09-09",
