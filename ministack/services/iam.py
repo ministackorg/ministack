@@ -16,6 +16,7 @@ IAM actions:
   CreateInstanceProfile, DeleteInstanceProfile, GetInstanceProfile,
   AddRoleToInstanceProfile, RemoveRoleFromInstanceProfile,
   ListInstanceProfiles, ListInstanceProfilesForRole,
+  TagInstanceProfile, UntagInstanceProfile, ListInstanceProfileTags,
   UpdateAssumeRolePolicy,
   CreateGroup, GetGroup, DeleteGroup, ListGroups,
   AddUserToGroup, RemoveUserFromGroup, ListGroupsForUser,
@@ -1062,6 +1063,7 @@ def _create_instance_profile(p):
         "Path": path,
         "CreateDate": _now(),
         "Roles": [],
+        "Tags": _extract_tags(p),
     }
     return _xml(200, "CreateInstanceProfileResponse",
                 f"<CreateInstanceProfileResult>"
@@ -1155,6 +1157,49 @@ def _list_instance_profiles_for_role(p):
     return _xml(200, "ListInstanceProfilesForRoleResponse",
                 f"<ListInstanceProfilesForRoleResult><InstanceProfiles>{members}</InstanceProfiles>"
                 "<IsTruncated>false</IsTruncated></ListInstanceProfilesForRoleResult>",
+                ns="iam")
+
+
+# -------------------- Tags: instance profiles --------------------
+
+def _tag_instance_profile(p):
+    ip_name = _p(p, "InstanceProfileName")
+    ip = _instance_profiles.get(ip_name)
+    if not ip:
+        return _error(404, "NoSuchEntity",
+                      f"Instance profile {ip_name} not found.", ns="iam")
+    new_tags = _extract_tags(p)
+    existing = {t["Key"]: t for t in ip.get("Tags", [])}
+    for t in new_tags:
+        existing[t["Key"]] = t
+    ip["Tags"] = list(existing.values())
+    return _xml(200, "TagInstanceProfileResponse", "", ns="iam")
+
+
+def _untag_instance_profile(p):
+    ip_name = _p(p, "InstanceProfileName")
+    ip = _instance_profiles.get(ip_name)
+    if not ip:
+        return _error(404, "NoSuchEntity",
+                      f"Instance profile {ip_name} not found.", ns="iam")
+    keys_to_remove = _extract_tag_keys(p)
+    ip["Tags"] = [t for t in ip.get("Tags", []) if t["Key"] not in keys_to_remove]
+    return _xml(200, "UntagInstanceProfileResponse", "", ns="iam")
+
+
+def _list_instance_profile_tags(p):
+    ip_name = _p(p, "InstanceProfileName")
+    ip = _instance_profiles.get(ip_name)
+    if not ip:
+        return _error(404, "NoSuchEntity",
+                      f"Instance profile {ip_name} not found.", ns="iam")
+    members = "".join(
+        f"<member><Key>{t['Key']}</Key><Value>{t['Value']}</Value></member>"
+        for t in ip.get("Tags", [])
+    )
+    return _xml(200, "ListInstanceProfileTagsResponse",
+                f"<ListInstanceProfileTagsResult><Tags>{members}</Tags>"
+                "<IsTruncated>false</IsTruncated></ListInstanceProfileTagsResult>",
                 ns="iam")
 
 
@@ -2543,12 +2588,22 @@ def _instance_profile_xml(name):
     for rname in ip["Roles"]:
         if rname in _roles:
             roles_xml += f"<member>{_role_xml(rname)}</member>"
+    # Tags are emitted when present so GetInstanceProfile / ListInstanceProfiles
+    # read them back. _user_xml / _role_xml follow the same pattern.
+    tags_xml = ""
+    if ip.get("Tags"):
+        tag_members = "".join(
+            f"<member><Key>{t['Key']}</Key><Value>{t['Value']}</Value></member>"
+            for t in ip["Tags"]
+        )
+        tags_xml = f"<Tags>{tag_members}</Tags>"
     return (f"<InstanceProfileName>{ip['InstanceProfileName']}</InstanceProfileName>"
             f"<InstanceProfileId>{ip['InstanceProfileId']}</InstanceProfileId>"
             f"<Arn>{ip['Arn']}</Arn>"
             f"<Path>{ip['Path']}</Path>"
             f"<CreateDate>{ip['CreateDate']}</CreateDate>"
-            f"<Roles>{roles_xml}</Roles>")
+            f"<Roles>{roles_xml}</Roles>"
+            f"{tags_xml}")
 
 
 def _xml(status, root_tag, inner, ns="iam"):
@@ -2620,6 +2675,9 @@ _IAM_HANDLERS = {
     "RemoveRoleFromInstanceProfile": _remove_role_from_instance_profile,
     "ListInstanceProfiles": _list_instance_profiles,
     "ListInstanceProfilesForRole": _list_instance_profiles_for_role,
+    "TagInstanceProfile": _tag_instance_profile,
+    "UntagInstanceProfile": _untag_instance_profile,
+    "ListInstanceProfileTags": _list_instance_profile_tags,
     "UpdateAssumeRolePolicy": _update_assume_role_policy,
     "TagRole": _tag_role,
     "UntagRole": _untag_role,

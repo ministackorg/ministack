@@ -1109,7 +1109,7 @@ def _invoke_target(target, event, rule):
     target_input_payload = None
     input_transformer = target.get("InputTransformer")
     if input_transformer:
-        event_payload = _apply_input_transformer(input_transformer, event)
+        event_payload = _apply_input_transformer(input_transformer, event, rule)
         target_input_payload = event_payload
     elif target.get("Input"):
         event_payload = target["Input"]
@@ -1186,7 +1186,7 @@ def _dispatch_to_event_bus(spec, event, rule, event_path, target_input_payload=N
     logger.info("EventBridge -> Event bus %s: dispatched", spec)
 
 
-def _apply_input_transformer(transformer, event):
+def _apply_input_transformer(transformer, event, rule=None):
     input_paths = transformer.get("InputPathsMap", {})
     template = transformer.get("InputTemplate", "")
 
@@ -1196,6 +1196,7 @@ def _apply_input_transformer(transformer, event):
         full = {}
 
     event_envelope = {
+        "version": "0",
         "source": event.get("Source", ""),
         "detail-type": event.get("DetailType", ""),
         "detail": full,
@@ -1217,6 +1218,23 @@ def _apply_input_transformer(transformer, event):
             replacements[var_name] = val if isinstance(val, str) else json.dumps(val)
         except (KeyError, TypeError, IndexError):
             replacements[var_name] = ""
+
+    # AWS generates ingestion-time when the event is received by EventBridge
+    # (always present, ISO-8601) — it is NOT the event's own `time` field and
+    # cannot be overwritten by an InputPathsMap entry.
+    ingestion_time = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    reserved = {
+        "aws.events.event.json": json.dumps(event_envelope),
+        "aws.events.event": json.dumps({k: v for k, v in event_envelope.items() if k != "detail"}),
+        "aws.events.event.ingestion-time": ingestion_time,
+    }
+    if rule:
+        reserved["aws.events.rule-name"] = rule.get("Name", "")
+        reserved["aws.events.rule-arn"] = rule.get("Arn", "")
+    for k, v in reserved.items():
+        replacements.setdefault(k, v)
+    # ingestion-time is reserved and uneditable, even if InputPathsMap declares it.
+    replacements["aws.events.event.ingestion-time"] = ingestion_time
 
     result = template
     for var_name, val in replacements.items():

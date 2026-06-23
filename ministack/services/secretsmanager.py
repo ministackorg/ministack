@@ -132,6 +132,22 @@ def _find_stage_version(secret, stage):
     return None, None
 
 
+def resolve_secret_string(secret_id, version_stage="AWSCURRENT"):
+    """Return the SecretString for *secret_id* at *version_stage*, or None.
+
+    Used by other services (e.g. ECS) that need to read a secret value
+    in-process without going through the HTTP API. Returns None if the secret
+    does not exist, is scheduled for deletion, or has no value for the stage.
+    """
+    _, secret = _resolve(secret_id)
+    if not secret or secret.get("DeletedDate"):
+        return None
+    _, ver = _find_stage_version(secret, version_stage)
+    if not ver:
+        return None
+    return ver.get("SecretString")
+
+
 def _apply_current_promotion(secret, new_vid):
     """
     Promote *new_vid* to AWSCURRENT.

@@ -99,6 +99,16 @@ def run():
         _py = os.path.join(_ld, "python")
         if os.path.isdir(_py):
             sys.path.insert(0, _py)
+            # AWS exposes <layer>/python/lib/python<ver>/site-packages as a
+            # site directory (processes .pth files / namespace packages), where
+            # `pip install -t` dependency layers land (#888).
+            _lib = os.path.join(_py, "lib")
+            if os.path.isdir(_lib):
+                import site as _site
+                for _v in os.listdir(_lib):
+                    _sp = os.path.join(_lib, _v, "site-packages")
+                    if os.path.isdir(_sp):
+                        _site.addsitedir(_sp)
         sys.path.insert(0, _ld)
     try:
         mod = importlib.import_module(module_name)

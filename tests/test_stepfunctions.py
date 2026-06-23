@@ -495,6 +495,41 @@ def test_sfn_intrinsic_string_to_json(sfn, sfn_sync):
     output = json.loads(resp["output"])
     assert output["parsed"] == {"a": 1, "b": 2}
 
+def test_sfn_pass_parameters_resolve_context_object(sfn):
+    """Pass state Parameters can resolve Step Functions context object paths."""
+    unique = str(time.time_ns())
+    execution_name = f"pass-context-{unique}"
+    definition = json.dumps({
+        "StartAt": "Build",
+        "States": {
+            "Build": {
+                "Type": "Pass",
+                "Parameters": {
+                    "executionName.$": "$$.Execution.Name",
+                    "inputValue.$": "$.value",
+                },
+                "End": True,
+            }
+        },
+    })
+    sm = sfn.create_state_machine(
+        name=f"sfn-pass-context-{unique}",
+        definition=definition,
+        roleArn="arn:aws:iam::000000000000:role/R",
+    )
+    ex = sfn.start_execution(
+        stateMachineArn=sm["stateMachineArn"],
+        name=execution_name,
+        input=json.dumps({"value": "from-input"}),
+    )
+
+    desc = _wait_sfn(sfn, ex["executionArn"])
+    assert desc["status"] == "SUCCEEDED"
+    assert json.loads(desc["output"]) == {
+        "executionName": execution_name,
+        "inputValue": "from-input",
+    }
+
 def test_sfn_intrinsic_json_merge(sfn, sfn_sync):
     """States.JsonMerge shallow-merges two objects."""
     definition = json.dumps({
@@ -2405,6 +2440,81 @@ def test_sfn_integration_ecs_run_task_output_contains_status(sfn, ecs):
     assert task_out["lastStatus"] == "RUNNING"
     assert "failures" in output
 
+def test_sfn_integration_ecs_run_task_container_overrides_reach_the_task(sfn, ecs):
+    """PascalCase ContainerOverrides must survive the SFN->ECS hand-off instead of being silently dropped."""
+    ecs.create_cluster(clusterName="sfn-ecs-overrides")
+    ecs.register_task_definition(
+        family="sfn-overrides-task",
+        containerDefinitions=[
+            {
+                "name": "main",
+                "image": "alpine:latest",
+                "command": ["echo", "hi"],
+                "memory": 128,
+                "environment": [{"name": "FROM_TASKDEF", "value": "yes"}],
+            }
+        ],
+    )
+
+    definition = json.dumps(
+        {
+            "StartAt": "Run",
+            "States": {
+                "Run": {
+                    "Type": "Task",
+                    "Resource": "arn:aws:states:::ecs:runTask",
+                    "Parameters": {
+                        "Cluster": "sfn-ecs-overrides",
+                        "TaskDefinition": "sfn-overrides-task",
+                        "LaunchType": "FARGATE",
+                        "Overrides": {
+                            "ContainerOverrides": [
+                                {
+                                    "Name": "main",
+                                    "Environment": [
+                                        {"Name": "FROM_OVERRIDES", "Value": "yes"},
+                                        {"Name": "RUN_ID", "Value.$": "$$.Execution.Name"},
+                                    ],
+                                }
+                            ]
+                        },
+                    },
+                    "End": True,
+                },
+            },
+        }
+    )
+    sm = sfn.create_state_machine(
+        name="sfn-ecs-overrides",
+        definition=definition,
+        roleArn="arn:aws:iam::000000000000:role/R",
+    )
+    ex = sfn.start_execution(
+        stateMachineArn=sm["stateMachineArn"], name="overrides-exec-1", input="{}"
+    )
+
+    desc = _wait_sfn(sfn, ex["executionArn"])
+    assert desc["status"] == "SUCCEEDED"
+    output = json.loads(desc["output"])
+    task_out = output["tasks"][0]
+
+    env = {
+        e["name"]: e["value"]
+        for ov in task_out["overrides"]["containerOverrides"]
+        for e in ov["environment"]
+    }
+    assert env == {"FROM_OVERRIDES": "yes", "RUN_ID": "overrides-exec-1"}
+    assert task_out["overrides"]["containerOverrides"][0]["name"] == "main"
+
+    # boto3 parses DescribeTasks against the real ECS model (camelCase only)
+    described = ecs.describe_tasks(
+        cluster="sfn-ecs-overrides", tasks=[task_out["taskArn"]]
+    )
+    described_overrides = described["tasks"][0]["overrides"]["containerOverrides"]
+    assert described_overrides[0]["name"] == "main"
+    described_env = {e["name"]: e["value"] for e in described_overrides[0]["environment"]}
+    assert described_env == {"FROM_OVERRIDES": "yes", "RUN_ID": "overrides-exec-1"}
+
 def test_sfn_integration_nested_start_execution_sync_returns_string_output(sfn):
     """states:startExecution.sync should return the child Output as a JSON string."""
     unique = str(time.time_ns())
@@ -3165,6 +3275,126 @@ def test_sfn_mock_config_throw(sfn):
             break
 
     assert desc["status"] == "FAILED"
+    _ministack_config({"stepfunctions._sfn_mock_config": {}})
+
+
+def test_sfn_mock_config_throw_routes_to_catch(sfn):
+    """SFN_MOCK_CONFIG Throw must route to a matching Catch (not bypass it). #903."""
+    from conftest import _ministack_config
+
+    mock_cfg = {
+        "StateMachines": {
+            "qa-sfn-mock-throw-catch": {
+                "TestCases": {"FailPath": {"CallService": "MockedFailure"}}
+            }
+        },
+        "MockedResponses": {
+            "MockedFailure": {
+                "0": {"Throw": {"Error": "ServiceDown", "Cause": "mocked failure"}},
+            }
+        },
+    }
+    _ministack_config({"stepfunctions._sfn_mock_config": mock_cfg})
+
+    definition = json.dumps({
+        "StartAt": "CallService",
+        "States": {
+            "CallService": {
+                "Type": "Task",
+                "Resource": "arn:aws:lambda:us-east-1:000000000000:function:nonexistent",
+                "Catch": [{"ErrorEquals": ["ServiceDown"], "Next": "Recovered"}],
+                "End": True,
+            },
+            "Recovered": {"Type": "Pass", "Result": {"recovered": True}, "End": True},
+        },
+    })
+    sm_arn = sfn.create_state_machine(
+        name="qa-sfn-mock-throw-catch",
+        definition=definition,
+        roleArn="arn:aws:iam::000000000000:role/r",
+    )["stateMachineArn"]
+
+    exec_arn = sfn.start_execution(
+        stateMachineArn=sm_arn + "#FailPath", input="{}",
+    )["executionArn"]
+    for _ in range(20):
+        time.sleep(0.3)
+        desc = sfn.describe_execution(executionArn=exec_arn)
+        if desc["status"] != "RUNNING":
+            break
+
+    assert desc["status"] == "SUCCEEDED", f"Throw bypassed Catch: {desc.get('status')}"
+    # Reached the Catch's Next state ("Recovered"), proving the throw routed
+    # through Catch rather than failing the execution.
+    assert json.loads(desc["output"]) == {"recovered": True}
+    _ministack_config({"stepfunctions._sfn_mock_config": {}})
+
+
+def test_sfn_mock_config_jsonata_assign_applied(sfn):
+    """SFN_MOCK_CONFIG + JSONata Task with Assign — variable must be visible downstream.
+
+    Regression: the mock execution path called _apply_jsonata_output but never
+    called _apply_state_assign, so any Assign block was silently skipped.
+    A downstream state reading the assigned variable would fail with
+    States.QueryEvaluationError: Undefined variable.
+    """
+    from conftest import _ministack_config
+
+    mock_cfg = {
+        "StateMachines": {
+            "qa-sfn-mock-jsonata-assign": {
+                "TestCases": {
+                    "HappyPath": {
+                        "FetchData": "MockedData",
+                    }
+                }
+            }
+        },
+        "MockedResponses": {
+            "MockedData": {
+                "0": {"Return": {"value": 99}},
+            }
+        },
+    }
+    _ministack_config({"stepfunctions._sfn_mock_config": mock_cfg})
+
+    definition = json.dumps({
+        "QueryLanguage": "JSONata",
+        "StartAt": "FetchData",
+        "States": {
+            "FetchData": {
+                "Type": "Task",
+                "Resource": "arn:aws:lambda:us-east-1:000000000000:function:nonexistent",
+                "Assign": {"fetchedValue": "{% $states.result.value %}"},
+                "Next": "UseValue",
+            },
+            "UseValue": {
+                "Type": "Pass",
+                "Output": {"result": "{% $fetchedValue %}"},
+                "End": True,
+            },
+        },
+    })
+    sm_arn = sfn.create_state_machine(
+        name="qa-sfn-mock-jsonata-assign",
+        definition=definition,
+        roleArn="arn:aws:iam::000000000000:role/r",
+    )["stateMachineArn"]
+
+    exec_arn = sfn.start_execution(
+        stateMachineArn=sm_arn + "#HappyPath", input="{}",
+    )["executionArn"]
+    for _ in range(20):
+        time.sleep(0.3)
+        desc = sfn.describe_execution(executionArn=exec_arn)
+        if desc["status"] != "RUNNING":
+            break
+
+    assert desc["status"] == "SUCCEEDED", (
+        f"Execution failed — Assign likely not applied in mock path: {desc.get('cause')}"
+    )
+    output = json.loads(desc["output"])
+    assert output["result"] == 99, f"Expected 99 from assigned variable, got: {output}"
     _ministack_config({"stepfunctions._sfn_mock_config": {}})
 
 def test_sfn_test_state_pass(sfn_sync):

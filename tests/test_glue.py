@@ -1324,8 +1324,8 @@ def test_glue_user_defined_function_crud(glue):
     got2 = glue.get_user_defined_function(DatabaseName="udf_db", FunctionName="upper_clean")["UserDefinedFunction"]
     assert got2["ClassName"] == "com.example.UpperClean2"
 
-    # Pattern is a required AWS field (botocore enforces) — "*" matches everything.
-    listed = glue.get_user_defined_functions(DatabaseName="udf_db", Pattern="*")["UserDefinedFunctions"]
+    # Pattern is a regex (RE2) over the function name in real Glue — ".*" matches all.
+    listed = glue.get_user_defined_functions(DatabaseName="udf_db", Pattern=".*")["UserDefinedFunctions"]
     names = [u["FunctionName"] for u in listed]
     assert "upper_clean" in names
 
@@ -1333,6 +1333,71 @@ def test_glue_user_defined_function_crud(glue):
     with pytest.raises(ClientError) as exc2:
         glue.get_user_defined_function(DatabaseName="udf_db", FunctionName="upper_clean")
     assert exc2.value.response["Error"]["Code"] == "EntityNotFoundException"
+
+
+def test_glue_get_user_defined_functions_pattern_is_regex(glue):
+    """GetUserDefinedFunctions treats Pattern as an RE2 regex over the function
+    name, not a glob — matches real AWS Glue (the semantics Trino's Glue connector
+    relies on when resolving a UDF via `trino__<name>__.*`)."""
+    glue.create_database(DatabaseInput={"Name": "regex_db"})
+    func_name = "trino__dw_clean_text__abc123"
+    glue.create_user_defined_function(
+        DatabaseName="regex_db",
+        FunctionInput={"FunctionName": func_name, "ClassName": "com.example.Clean"},
+    )
+
+    def names(**kwargs):
+        return [u["FunctionName"] for u in glue.get_user_defined_functions(**kwargs)["UserDefinedFunctions"]]
+
+    # `.*` matches everything (real Glue: 1; old glob behaviour: 0).
+    assert func_name in names(DatabaseName="regex_db", Pattern=".*")
+    # A Trino-style anchored regex matches the function (real Glue: 1; old glob: 0).
+    assert func_name in names(DatabaseName="regex_db", Pattern="trino__dw_clean_text__.*")
+    # A regex that cannot match returns nothing.
+    assert names(DatabaseName="regex_db", Pattern="nope__.*") == []
+
+    # A bare `*` is an INVALID regex and must raise InvalidInputException
+    # (real Glue: matched 1 under the old glob behaviour — now an error).
+    with pytest.raises(ClientError) as exc:
+        glue.get_user_defined_functions(DatabaseName="regex_db", Pattern="*")
+    assert exc.value.response["Error"]["Code"] == "InvalidInputException"
+    assert "Invalid pattern syntax" in exc.value.response["Error"]["Message"]
+
+    # DatabaseName omitted searches across all databases in the catalog.
+    assert func_name in names(Pattern="trino__.*")
+
+
+def test_glue_get_user_defined_functions_pattern_java_quote(glue):
+    r"""GetUserDefinedFunctions accepts java.util.regex `\Q...\E` literal-quote
+    spans, matching real AWS Glue (which compiles Pattern with java.util.regex).
+    Trino's Hive/Glue connector resolves a UDF with a pattern like
+    `trino__\Qdw_clean_text\E__.*`; Python `re` / Go RE2 reject `\Q` outright, so
+    ministack must translate the span before compiling."""
+    glue.create_database(DatabaseInput={"Name": "pq"})
+    func_name = "trino__dw_clean_text__abc"
+    glue.create_user_defined_function(
+        DatabaseName="pq",
+        FunctionInput={"FunctionName": func_name, "ClassName": "TrinoFunction"},
+    )
+
+    def names(**kwargs):
+        return [u["FunctionName"] for u in glue.get_user_defined_functions(**kwargs)["UserDefinedFunctions"]]
+
+    # The exact pattern Trino's Glue connector emits — must resolve the function,
+    # not raise `bad escape \Q`.
+    assert func_name in names(DatabaseName="pq", Pattern=r"trino__\Qdw_clean_text\E__.*")
+    # `.*` still matches everything (regex semantics unaffected).
+    assert func_name in names(DatabaseName="pq", Pattern=".*")
+    # The literal between \Q...\E is matched literally: regex metachars inside it
+    # do not apply, so a `.` in the quoted span only matches a literal dot.
+    glue.create_user_defined_function(
+        DatabaseName="pq",
+        FunctionInput={"FunctionName": "a.b", "ClassName": "TrinoFunction"},
+    )
+    assert names(DatabaseName="pq", Pattern=r"^\Qa.b\E$") == ["a.b"]
+    assert names(DatabaseName="pq", Pattern=r"^\Qaxb\E$") == []
+    # A trailing \Q with no closing \E quotes to end-of-string (Java semantics).
+    assert func_name in names(DatabaseName="pq", Pattern=r"trino__\Qdw_clean_text__abc")
 
 
 def test_glue_resolve_script_account_scoped(tmp_path, monkeypatch):
@@ -1501,3 +1566,174 @@ def test_glue_resolve_script_isolated_per_account(tmp_path, monkeypatch):
         assert gluemod._resolve_script(uri) is None
     finally:
         respmod._request_account_id.reset(tok_other)
+
+
+# ---- Column Statistics ----
+
+def _make_int_column_stats(column_name):
+    return {
+        "ColumnName": column_name,
+        "ColumnType": "int",
+        "AnalyzedTime": 1700000000,
+        "StatisticsData": {
+            "Type": "LONG",
+            "LongColumnStatisticsData": {
+                "MinimumValue": 1,
+                "MaximumValue": 100,
+                "NumberOfNulls": 0,
+                "NumberOfDistinctValues": 50,
+            },
+        },
+    }
+
+
+def _setup_stats_table(glue, db, table, partitioned=False):
+    glue.create_database(DatabaseInput={"Name": db})
+    table_input = {
+        "Name": table,
+        "StorageDescriptor": {
+            "Columns": [
+                {"Name": "id", "Type": "int"},
+                {"Name": "amount", "Type": "int"},
+            ],
+            "Location": f"s3://bucket/{db}/{table}/",
+            "InputFormat": "",
+            "OutputFormat": "",
+            "SerdeInfo": {},
+        },
+    }
+    if partitioned:
+        table_input["PartitionKeys"] = [{"Name": "dt", "Type": "string"}]
+    glue.create_table(DatabaseName=db, TableInput=table_input)
+
+
+def test_glue_column_statistics_for_table_crud(glue):
+    db, table = "qa-glue-colstats-tbl-db", "qa-glue-colstats-tbl"
+    _setup_stats_table(glue, db, table)
+
+    stats_id = _make_int_column_stats("id")
+    stats_amount = _make_int_column_stats("amount")
+    upd = glue.update_column_statistics_for_table(
+        DatabaseName=db, TableName=table,
+        ColumnStatisticsList=[stats_id, stats_amount],
+    )
+    assert upd.get("Errors", []) == []
+
+    got = glue.get_column_statistics_for_table(
+        DatabaseName=db, TableName=table, ColumnNames=["id", "amount"],
+    )
+    assert {s["ColumnName"] for s in got["ColumnStatisticsList"]} == {"id", "amount"}
+    assert got.get("Errors", []) == []
+
+    missing = glue.get_column_statistics_for_table(
+        DatabaseName=db, TableName=table, ColumnNames=["id", "missing"],
+    )
+    assert [s["ColumnName"] for s in missing["ColumnStatisticsList"]] == ["id"]
+    assert missing["Errors"][0]["ColumnName"] == "missing"
+
+    glue.delete_column_statistics_for_table(
+        DatabaseName=db, TableName=table, ColumnName="id",
+    )
+    after = glue.get_column_statistics_for_table(
+        DatabaseName=db, TableName=table, ColumnNames=["id", "amount"],
+    )
+    assert [s["ColumnName"] for s in after["ColumnStatisticsList"]] == ["amount"]
+
+
+def test_glue_column_statistics_for_table_missing_table(glue):
+    with pytest.raises(ClientError) as exc:
+        glue.get_column_statistics_for_table(
+            DatabaseName="nope-db", TableName="nope-tbl", ColumnNames=["id"],
+        )
+    assert exc.value.response["Error"]["Code"] == "EntityNotFoundException"
+
+
+def test_glue_delete_column_statistics_for_table_unknown_column_is_idempotent(glue):
+    db, table = "qa-glue-colstats-tbl-del-db", "qa-glue-colstats-tbl-del"
+    _setup_stats_table(glue, db, table)
+    # Real AWS Glue returns 200 / empty body when deleting stats for a column
+    # that never had any — Delete* operations are idempotent.
+    glue.delete_column_statistics_for_table(
+        DatabaseName=db, TableName=table, ColumnName="never-set",
+    )
+
+
+def test_glue_column_statistics_cleared_on_table_delete(glue):
+    db, table = "qa-glue-colstats-cleanup-db", "qa-glue-colstats-cleanup"
+    _setup_stats_table(glue, db, table)
+    glue.update_column_statistics_for_table(
+        DatabaseName=db, TableName=table,
+        ColumnStatisticsList=[_make_int_column_stats("id")],
+    )
+    glue.delete_table(DatabaseName=db, Name=table)
+    # Re-create the table with the same name; stats from the previous
+    # incarnation must not leak through.
+    glue.create_table(
+        DatabaseName=db,
+        TableInput={
+            "Name": table,
+            "StorageDescriptor": {
+                "Columns": [{"Name": "id", "Type": "int"}],
+                "Location": f"s3://bucket/{db}/{table}/",
+                "InputFormat": "", "OutputFormat": "", "SerdeInfo": {},
+            },
+        },
+    )
+    got = glue.get_column_statistics_for_table(
+        DatabaseName=db, TableName=table, ColumnNames=["id"],
+    )
+    assert got["ColumnStatisticsList"] == []
+    assert got["Errors"][0]["ColumnName"] == "id"
+
+
+def test_glue_column_statistics_for_partition_crud(glue):
+    db, table = "qa-glue-colstats-part-db", "qa-glue-colstats-part"
+    _setup_stats_table(glue, db, table, partitioned=True)
+    glue.create_partition(
+        DatabaseName=db, TableName=table,
+        PartitionInput={
+            "Values": ["2024-01-01"],
+            "StorageDescriptor": {
+                "Columns": [], "Location": f"s3://bucket/{db}/{table}/dt=2024-01-01",
+                "InputFormat": "", "OutputFormat": "", "SerdeInfo": {},
+            },
+        },
+    )
+
+    stats_id = _make_int_column_stats("id")
+    stats_amount = _make_int_column_stats("amount")
+    upd = glue.update_column_statistics_for_partition(
+        DatabaseName=db, TableName=table,
+        PartitionValues=["2024-01-01"],
+        ColumnStatisticsList=[stats_id, stats_amount],
+    )
+    assert upd.get("Errors", []) == []
+
+    got = glue.get_column_statistics_for_partition(
+        DatabaseName=db, TableName=table,
+        PartitionValues=["2024-01-01"], ColumnNames=["id", "amount"],
+    )
+    assert {s["ColumnName"] for s in got["ColumnStatisticsList"]} == {"id", "amount"}
+
+    glue.delete_column_statistics_for_partition(
+        DatabaseName=db, TableName=table,
+        PartitionValues=["2024-01-01"], ColumnName="amount",
+    )
+    after = glue.get_column_statistics_for_partition(
+        DatabaseName=db, TableName=table,
+        PartitionValues=["2024-01-01"], ColumnNames=["id", "amount"],
+    )
+    assert [s["ColumnName"] for s in after["ColumnStatisticsList"]] == ["id"]
+    assert after["Errors"][0]["ColumnName"] == "amount"
+
+
+def test_glue_column_statistics_for_partition_missing_partition(glue):
+    db, table = "qa-glue-colstats-nopart-db", "qa-glue-colstats-nopart"
+    _setup_stats_table(glue, db, table, partitioned=True)
+    with pytest.raises(ClientError) as exc:
+        glue.update_column_statistics_for_partition(
+            DatabaseName=db, TableName=table,
+            PartitionValues=["never"],
+            ColumnStatisticsList=[_make_int_column_stats("id")],
+        )
+    assert exc.value.response["Error"]["Code"] == "EntityNotFoundException"

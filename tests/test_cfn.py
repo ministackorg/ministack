@@ -375,6 +375,34 @@ def test_cfn_change_set_lifecycle(cfn):
     stack = _wait_stack(cfn, "cfn-t08")
     assert stack["StackStatus"] == "CREATE_COMPLETE"
 
+def test_cfn_change_set_create_emits_review_event(cfn):
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "Bucket": {
+                "Type": "AWS::S3::Bucket",
+                "Properties": {"BucketName": "cfn-t08b-cs"},
+            },
+        },
+    }
+    cfn.create_change_set(
+        StackName="cfn-t08b",
+        ChangeSetName="cfn-t08b-cs1",
+        TemplateBody=json.dumps(template),
+        ChangeSetType="CREATE",
+    )
+    time.sleep(1)
+
+    stack = cfn.describe_stacks(StackName="cfn-t08b")["Stacks"][0]
+    assert stack["StackStatus"] == "REVIEW_IN_PROGRESS"
+
+    events = cfn.describe_stack_events(StackName="cfn-t08b")["StackEvents"]
+    assert len(events) > 0
+    review = events[0]
+    assert review["ResourceStatus"] == "REVIEW_IN_PROGRESS"
+    assert review["ResourceType"] == "AWS::CloudFormation::Stack"
+    assert review["LogicalResourceId"] == "cfn-t08b"
+
 def test_cfn_update_stack(cfn, s3):
     template_v1 = {
         "AWSTemplateFormatVersion": "2010-09-09",
@@ -435,6 +463,67 @@ def test_cfn_validate_template(cfn):
     with pytest.raises(ClientError):
         cfn.validate_template(TemplateBody=json.dumps(invalid_template))
 
+def test_cfn_get_template_summary(cfn):
+    # Basic template: parameters and resource types surfaced, no capabilities
+    basic = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Description": "summary test",
+        "Parameters": {
+            "Env": {"Type": "String", "Default": "dev", "Description": "env"},
+        },
+        "Resources": {
+            "Bucket": {"Type": "AWS::S3::Bucket"},
+        },
+    }
+    result = cfn.get_template_summary(TemplateBody=json.dumps(basic))
+    assert result["Description"] == "summary test"
+    assert "AWS::S3::Bucket" in result["ResourceTypes"]
+    assert any(p["ParameterKey"] == "Env" for p in result["Parameters"])
+    assert result.get("Capabilities", []) == []
+
+    # IAM role with explicit RoleName → CAPABILITY_NAMED_IAM
+    named_iam = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "Role": {
+                "Type": "AWS::IAM::Role",
+                "Properties": {
+                    "RoleName": "my-role",
+                    "AssumeRolePolicyDocument": {"Version": "2012-10-17", "Statement": []},
+                },
+            }
+        },
+    }
+    result = cfn.get_template_summary(TemplateBody=json.dumps(named_iam))
+    assert "CAPABILITY_NAMED_IAM" in result["Capabilities"]
+    assert result.get("CapabilitiesReason") == "The following resource(s) require capabilities: [AWS::IAM::Role]"
+
+    # IAM role without explicit name → CAPABILITY_IAM
+    unnamed_iam = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "Role": {
+                "Type": "AWS::IAM::Role",
+                "Properties": {
+                    "AssumeRolePolicyDocument": {"Version": "2012-10-17", "Statement": []},
+                },
+            }
+        },
+    }
+    result = cfn.get_template_summary(TemplateBody=json.dumps(unnamed_iam))
+    assert result["Capabilities"] == ["CAPABILITY_IAM"]
+
+    # Template with Transform → CAPABILITY_AUTO_EXPAND
+    transform_tpl = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Transform": "AWS::Serverless-2016-10-31",
+        "Resources": {
+            "Fn": {"Type": "AWS::Serverless::Function", "Properties": {}},
+        },
+    }
+    result = cfn.get_template_summary(TemplateBody=json.dumps(transform_tpl))
+    assert "CAPABILITY_AUTO_EXPAND" in result["Capabilities"]
+
 def test_cfn_list_stacks(cfn):
     for name in ("cfn-t12-a", "cfn-t12-b"):
         template = {
@@ -471,6 +560,37 @@ def test_cfn_stack_events(cfn):
     events = cfn.describe_stack_events(StackName="cfn-t13")["StackEvents"]
     assert len(events) > 0
     assert all("ResourceStatus" in e for e in events)
+
+def test_cfn_describe_stack_resources_logical_id_filter(cfn, s3, sqs):
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "Bucket": {
+                "Type": "AWS::S3::Bucket",
+                "Properties": {"BucketName": "cfn-t10-bucket"},
+            },
+            "Queue": {
+                "Type": "AWS::SQS::Queue",
+                "Properties": {"QueueName": "cfn-t10-queue"},
+            },
+        },
+    }
+    cfn.create_stack(StackName="cfn-t10", TemplateBody=json.dumps(template))
+    _wait_stack(cfn, "cfn-t10")
+
+    filtered = cfn.describe_stack_resources(
+        StackName="cfn-t10", LogicalResourceId="Bucket"
+    )["StackResources"]
+    assert len(filtered) == 1
+    assert filtered[0]["LogicalResourceId"] == "Bucket"
+    assert filtered[0]["ResourceType"] == "AWS::S3::Bucket"
+
+    with pytest.raises(ClientError) as exc_info:
+        cfn.describe_stack_resources(
+            StackName="cfn-t10", LogicalResourceId="DoesNotExist"
+        )
+    assert exc_info.value.response["Error"]["Code"] == "ValidationError"
+
 
 def test_cfn_yaml_template(cfn, s3):
     yaml_body = """
@@ -2874,6 +2994,38 @@ def test_cfn_apigwv2_integration_basic(cfn, apigw):
     assert apigw.get_integrations(ApiId=api_id)["Items"] == []
 
 
+def test_cfn_apigwv2_ms_custom_id(cfn, apigw):
+    """CloudFormation ms-custom-id tag pins the ApiGatewayV2 API id (issue #400)."""
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "HttpApi": {
+                "Type": "AWS::ApiGatewayV2::Api",
+                "Properties": {
+                    "Name": "cfn-apigwv2-custom-id-t01",
+                    "ProtocolType": "HTTP",
+                    "Tags": {"ms-custom-id": "cfn-pinned-api"},
+                },
+            },
+        },
+    }
+    stack_name = "cfn-apigwv2-custom-id-t01"
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(template))
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "CREATE_COMPLETE"
+
+    resources = cfn.describe_stack_resources(StackName=stack_name)["StackResources"]
+    api_res = [r for r in resources if r["ResourceType"] == "AWS::ApiGatewayV2::Api"][0]
+    assert api_res["PhysicalResourceId"] == "cfn-pinned-api"
+
+    api = apigw.get_api(ApiId="cfn-pinned-api")
+    assert api["ApiId"] == "cfn-pinned-api"
+    assert api["Name"] == "cfn-apigwv2-custom-id-t01"
+
+    cfn.delete_stack(StackName=stack_name)
+    _wait_stack(cfn, stack_name)
+
+
 def test_cfn_apigwv2_route_basic(cfn, apigw):
     """CFN stack with ApiGatewayV2 Api + Integration + Route deploys successfully."""
     template = {
@@ -3624,3 +3776,154 @@ def test_cfn_nested_stack_basic(cfn, s3):
 
     s3.delete_object(Bucket=templates_bucket, Key="child.json")
     s3.delete_bucket(Bucket=templates_bucket)
+
+
+def test_cfn_logs_subscription_filter_provisions(cfn, logs):
+    """AWS::Logs::SubscriptionFilter provisions via CFN and is removed on stack
+    delete (#896). The filter Refs the in-stack log group so it is created
+    after the group."""
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "MyGroup": {
+                "Type": "AWS::Logs::LogGroup",
+                "Properties": {"LogGroupName": "/cfn/subfilter-test"},
+            },
+            "MyFilter": {
+                "Type": "AWS::Logs::SubscriptionFilter",
+                "Properties": {
+                    "LogGroupName": {"Ref": "MyGroup"},
+                    "FilterPattern": "[Producer]",
+                    "DestinationArn":
+                        "arn:aws:lambda:us-east-1:000000000000:function:consumer",
+                },
+            },
+        },
+    }
+    cfn.create_stack(StackName="cfn-subfilter", TemplateBody=json.dumps(template))
+    stack = _wait_stack(cfn, "cfn-subfilter")
+    assert stack["StackStatus"] == "CREATE_COMPLETE"
+
+    filters = logs.describe_subscription_filters(
+        logGroupName="/cfn/subfilter-test")["subscriptionFilters"]
+    assert len(filters) == 1
+    assert filters[0]["filterPattern"] == "[Producer]"
+    assert filters[0]["destinationArn"].endswith(":function:consumer")
+
+    cfn.delete_stack(StackName="cfn-subfilter")
+    _wait_stack(cfn, "cfn-subfilter")
+    # The stack delete removes the LogGroup too, so the subscription filter is
+    # gone with it — describing it now raises ResourceNotFoundException.
+    with pytest.raises(ClientError):
+        logs.describe_subscription_filters(logGroupName="/cfn/subfilter-test")
+
+
+def test_cfn_change_set_detects_parameter_driven_change(cfn, s3):
+    """A change set must detect a parameter-driven property change (e.g. a Lambda
+    Code S3Key behind a Ref) so `aws cloudformation deploy` doesn't silently
+    no-op while `update-stack` works (#897). Also guards against false positives
+    when nothing changed."""
+    s3.create_bucket(Bucket="cfn897-code")
+    for k in ("a.zip", "b.zip"):
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as z:
+            z.writestr("index.py", "def handler(e, c):\n    return 'ok'\n")
+        s3.put_object(Bucket="cfn897-code", Key=k, Body=buf.getvalue())
+
+    tmpl = json.dumps({
+        "Parameters": {"CodeKey": {"Type": "String"}},
+        "Resources": {"Fn": {"Type": "AWS::Lambda::Function", "Properties": {
+            "FunctionName": "cfn897-fn", "Runtime": "python3.12",
+            "Handler": "index.handler", "Role": "arn:aws:iam::000000000000:role/r",
+            "Code": {"S3Bucket": "cfn897-code", "S3Key": {"Ref": "CodeKey"}}}}}})
+    cfn.create_stack(StackName="cfn897", TemplateBody=tmpl,
+                     Parameters=[{"ParameterKey": "CodeKey", "ParameterValue": "a.zip"}])
+    _wait_stack(cfn, "cfn897")
+
+    def _change_set(name, val):
+        cfn.create_change_set(
+            StackName="cfn897", ChangeSetName=name, ChangeSetType="UPDATE",
+            TemplateBody=tmpl,
+            Parameters=[{"ParameterKey": "CodeKey", "ParameterValue": val}])
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            d = cfn.describe_change_set(StackName="cfn897", ChangeSetName=name)
+            if d["Status"] in ("CREATE_COMPLETE", "FAILED"):
+                return d
+            time.sleep(0.5)
+        return d
+
+    changed = _change_set("cs-changed", "b.zip")
+    assert len(changed.get("Changes", [])) == 1
+    assert changed["Changes"][0]["ResourceChange"]["Action"] == "Modify"
+
+    # nothing changed -> empty change set (no false positive)
+    noop = _change_set("cs-noop", "a.zip")
+    assert len(noop.get("Changes", [])) == 0
+
+
+def test_cfn_lambda_layer_packages_importable(cfn, s3, lam):
+    """A Lambda layer deployed via CloudFormation (CDK pattern: Content from S3)
+    must make its packages importable at invoke time.
+
+    Regression: the CFN LayerVersion provisioner fetched the layer zip but never
+    stored it as ``_zip_data``, so ``_resolve_layer_zip`` returned None and the
+    layer was silently skipped at worker spawn — ``No module named ...`` even
+    though ``list-layers`` showed the layer. Reported by @ocr-lasagna."""
+    stack_name = "cfn-layer-import"
+    bucket_name = "cfn-layer-assets"
+    fn_name = "cfn-layer-fn"
+
+    s3.create_bucket(Bucket=bucket_name)
+
+    # Layer zip with a Python module under python/ (the AWS layer convention).
+    layer_buf = io.BytesIO()
+    with zipfile.ZipFile(layer_buf, "w") as z:
+        z.writestr("python/cfn_layer_helper.py", "LAYER_VALUE = 'from-cfn-layer'\n")
+    s3.put_object(Bucket=bucket_name, Key="layer.zip", Body=layer_buf.getvalue())
+
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "MyLayer": {
+                "Type": "AWS::Lambda::LayerVersion",
+                "Properties": {
+                    "LayerName": "cfn-import-layer",
+                    "CompatibleRuntimes": ["python3.12"],
+                    "Content": {"S3Bucket": bucket_name, "S3Key": "layer.zip"},
+                },
+            },
+            "MyFunction": {
+                "Type": "AWS::Lambda::Function",
+                "Properties": {
+                    "FunctionName": fn_name,
+                    "Runtime": "python3.12",
+                    "Handler": "index.handler",
+                    "Role": "arn:aws:iam::000000000000:role/cfn-role",
+                    "Layers": [{"Ref": "MyLayer"}],
+                    "Code": {
+                        "ZipFile": (
+                            "import cfn_layer_helper\n"
+                            "def handler(event, context):\n"
+                            "    return {'value': cfn_layer_helper.LAYER_VALUE}\n"
+                        ),
+                    },
+                },
+            },
+        },
+    }
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(template))
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "CREATE_COMPLETE"
+
+    try:
+        resp = lam.invoke(FunctionName=fn_name, Payload=b"{}")
+        assert resp["StatusCode"] == 200
+        assert "FunctionError" not in resp, (
+            f"Lambda error: {resp['Payload'].read().decode()}"
+        )
+        payload = json.loads(resp["Payload"].read())
+        assert payload["value"] == "from-cfn-layer"
+    finally:
+        cfn.delete_stack(StackName=stack_name)

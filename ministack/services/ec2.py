@@ -755,6 +755,21 @@ def _sg_rule_xml(sg_id, rule, idx, is_egress=False):
                   f"<toPort>{rule.get('ToPort', -1)}</toPort>"
                   f"<cidrIpv6>{cidr6.get('CidrIpv6', '')}</cidrIpv6>"
                   f"</item>")
+    for pair in rule.get("UserIdGroupPairs", []):
+        ref_gid = pair.get("GroupId", "") if isinstance(pair, dict) else str(pair)
+        items += (f"<item>"
+                  f"<securityGroupRuleId>{rule_id}</securityGroupRuleId>"
+                  f"<groupId>{sg_id}</groupId>"
+                  f"<groupOwnerId>{get_account_id()}</groupOwnerId>"
+                  f"<isEgress>{'true' if is_egress else 'false'}</isEgress>"
+                  f"<ipProtocol>{rule.get('IpProtocol', '-1')}</ipProtocol>"
+                  f"<fromPort>{rule.get('FromPort', -1)}</fromPort>"
+                  f"<toPort>{rule.get('ToPort', -1)}</toPort>"
+                  f"<referencedGroupInfo>"
+                  f"<groupId>{ref_gid}</groupId>"
+                  f"<userId>{get_account_id()}</userId>"
+                  f"</referencedGroupInfo>"
+                  f"</item>")
     if not items:
         # No CIDR ranges — still return the rule (e.g. referenced group)
         items = (f"<item>"
@@ -2355,13 +2370,25 @@ def _perm_xml(r):
         f"<item><cidrIp>{ip['CidrIp']}</cidrIp></item>"
         for ip in r.get("IpRanges", [])
     )
+    groups = ""
+    for pair in r.get("UserIdGroupPairs", []):
+        if isinstance(pair, dict):
+            gid = pair.get("GroupId", "")
+            uid = pair.get("UserId") or get_account_id()
+            gname = f"<groupName>{_esc(pair['GroupName'])}</groupName>" if pair.get("GroupName") else ""
+            vpc = f"<vpcId>{_esc(pair['VpcId'])}</vpcId>" if pair.get("VpcId") else ""
+            desc = f"<description>{_esc(pair['Description'])}</description>" if pair.get("Description") else ""
+        else:
+            gid, uid, gname, vpc, desc = str(pair), get_account_id(), "", "", ""
+        groups += (f"<item><userId>{uid}</userId><groupId>{gid}</groupId>"
+                   f"{gname}{vpc}{desc}</item>")
     from_port = f"<fromPort>{r['FromPort']}</fromPort>" if "FromPort" in r else ""
     to_port = f"<toPort>{r['ToPort']}</toPort>" if "ToPort" in r else ""
     return f"""<item>
         <ipProtocol>{r.get('IpProtocol','-1')}</ipProtocol>
         {from_port}{to_port}
         <ipRanges>{ranges}</ipRanges>
-        <ipv6Ranges/><prefixListIds/><groups/>
+        <ipv6Ranges/><prefixListIds/><groups>{groups}</groups>
     </item>"""
 
 
@@ -2657,6 +2684,48 @@ def _matches_filters(inst, filters):
     return True
 
 
+def _parse_legacy_ip_permission(params):
+    """Parse the legacy single-rule top-level parameter form of
+    Authorize/RevokeSecurityGroupIngress/Egress.
+
+    The AWS CLI (`--protocol/--port/--cidr/--source-group`), older SDKs, and
+    direct API callers send a single permission as flat top-level params
+    (IpProtocol, FromPort, ToPort, CidrIp, SourceSecurityGroupId/Name/OwnerId)
+    rather than the nested IpPermissions.N.* structure. Real EC2 accepts both;
+    MiniStack previously dropped the legacy form (issue #916).
+    """
+    proto = _p(params, "IpProtocol")
+    if not proto:
+        return []
+    rule = {"IpProtocol": proto, "IpRanges": [], "Ipv6Ranges": [],
+            "PrefixListIds": [], "UserIdGroupPairs": []}
+    from_port = _p(params, "FromPort")
+    to_port = _p(params, "ToPort")
+    if from_port:
+        rule["FromPort"] = int(from_port)
+    if to_port:
+        rule["ToPort"] = int(to_port)
+    cidr = _p(params, "CidrIp")
+    if cidr:
+        rule["IpRanges"].append({"CidrIp": cidr})
+    cidr6 = _p(params, "CidrIpv6")
+    if cidr6:
+        rule["Ipv6Ranges"].append({"CidrIpv6": cidr6})
+    src_gid = _p(params, "SourceSecurityGroupId")
+    src_gname = _p(params, "SourceSecurityGroupName")
+    if src_gid or src_gname:
+        pair = {}
+        if src_gid:
+            pair["GroupId"] = src_gid
+        if src_gname:
+            pair["GroupName"] = src_gname
+        owner = _p(params, "SourceSecurityGroupOwnerId")
+        if owner:
+            pair["UserId"] = owner
+        rule["UserIdGroupPairs"].append(pair)
+    return [rule]
+
+
 def _parse_ip_permissions(params, prefix):
     rules = []
     i = 1
@@ -2694,8 +2763,33 @@ def _parse_ip_permissions(params, prefix):
                 entry["Description"] = desc
             rule["Ipv6Ranges"].append(entry)
             j += 1
+        j = 1
+        while True:
+            gid = _p(params, f"{prefix}.{i}.Groups.{j}.GroupId")
+            gname = _p(params, f"{prefix}.{i}.Groups.{j}.GroupName")
+            if not gid and not gname:
+                break
+            pair = {}
+            if gid:
+                pair["GroupId"] = gid
+            if gname:
+                pair["GroupName"] = gname
+            uid = _p(params, f"{prefix}.{i}.Groups.{j}.UserId")
+            if uid:
+                pair["UserId"] = uid
+            vpc = _p(params, f"{prefix}.{i}.Groups.{j}.VpcId")
+            if vpc:
+                pair["VpcId"] = vpc
+            desc = _p(params, f"{prefix}.{i}.Groups.{j}.Description")
+            if desc:
+                pair["Description"] = desc
+            rule["UserIdGroupPairs"].append(pair)
+            j += 1
         rules.append(rule)
         i += 1
+    if not rules:
+        # Fall back to the legacy flat single-rule form (CLI --source-group/--cidr).
+        return _parse_legacy_ip_permission(params)
     return rules
 
 
@@ -4163,6 +4257,21 @@ def _describe_security_group_rules(p):
                     <toPort>{rule.get('ToPort', -1)}</toPort>
                     <cidrIpv4>{cidr.get('CidrIp', '')}</cidrIpv4>
                 </item>"""
+            for pair in rule.get("UserIdGroupPairs", []):
+                gid = pair.get("GroupId", "") if isinstance(pair, dict) else str(pair)
+                items += f"""<item>
+                    <securityGroupRuleId>{rule_id}</securityGroupRuleId>
+                    <groupId>{sg_id}</groupId>
+                    <groupOwnerId>{get_account_id()}</groupOwnerId>
+                    <isEgress>false</isEgress>
+                    <ipProtocol>{rule.get('IpProtocol', '-1')}</ipProtocol>
+                    <fromPort>{rule.get('FromPort', -1)}</fromPort>
+                    <toPort>{rule.get('ToPort', -1)}</toPort>
+                    <referencedGroupInfo>
+                        <groupId>{gid}</groupId>
+                        <userId>{get_account_id()}</userId>
+                    </referencedGroupInfo>
+                </item>"""
         for i, rule in enumerate(sg.get("IpPermissionsEgress", [])):
             rule_id = f"sgr-{sg_id[3:]}-egress-{i}"
             for cidr in rule.get("IpRanges", []):
@@ -4175,6 +4284,21 @@ def _describe_security_group_rules(p):
                     <fromPort>{rule.get('FromPort', -1)}</fromPort>
                     <toPort>{rule.get('ToPort', -1)}</toPort>
                     <cidrIpv4>{cidr.get('CidrIp', '')}</cidrIpv4>
+                </item>"""
+            for pair in rule.get("UserIdGroupPairs", []):
+                gid = pair.get("GroupId", "") if isinstance(pair, dict) else str(pair)
+                items += f"""<item>
+                    <securityGroupRuleId>{rule_id}</securityGroupRuleId>
+                    <groupId>{sg_id}</groupId>
+                    <groupOwnerId>{get_account_id()}</groupOwnerId>
+                    <isEgress>true</isEgress>
+                    <ipProtocol>{rule.get('IpProtocol', '-1')}</ipProtocol>
+                    <fromPort>{rule.get('FromPort', -1)}</fromPort>
+                    <toPort>{rule.get('ToPort', -1)}</toPort>
+                    <referencedGroupInfo>
+                        <groupId>{gid}</groupId>
+                        <userId>{get_account_id()}</userId>
+                    </referencedGroupInfo>
                 </item>"""
     return _xml(200, "DescribeSecurityGroupRulesResponse", f"<securityGroupRuleSet>{items}</securityGroupRuleSet>")
 
