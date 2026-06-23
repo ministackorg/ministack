@@ -4,6 +4,7 @@
        MongoDB-compatible  databases in the cloud. With Amazon DocumentDB, you
        can run the same application code and use the same  drivers  and  tools
        that you use with MongoDB.
+       See AWS DocDB API descriptions [Amazon DocumentDB (with MongoDB compatibility)](https://docs.aws.amazon.com/documentdb/latest/APIReference/API_Operations_Amazon_DocumentDB_with_MongoDB_compatibility.html)
 
 # AVAILABLE COMMANDS
 - add-source-identifier-to-subscription

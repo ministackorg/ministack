@@ -1,9 +1,13 @@
 """
+
+THIS IS STILL A WORK IN PROGRESS.
+
+
 DocumentDB Service Emulator (control plane).
 
 Query API (Action=...) + JSON bodies for CreateDBInstance etc.
-When Docker is available, spins up real mongo:X containers (mongo:7 by default)
-and returns usable Endpoint.Address/Port for direct wire-protocol connections
+When Docker is available, spins up real mongo:X containers (mongo:5 by default)
+and returns usable Endpoint. Address/Port for direct wire-protocol connections
 (pymongo, etc.). The data plane is real MongoDB — no in-process emulation of
 Mongo commands.
 
@@ -16,11 +20,14 @@ Supported (core surface for aws docdb / boto3 docdb client + IaC):
   CreateDBSnapshot, DeleteDBSnapshot, DescribeDBSnapshots,
   ListTagsForResource, AddTagsToResource, RemoveTagsFromResource,
   DescribeDBEngineVersions, DescribeOrderableDBInstanceOptions,
-  DescribePendingMaintenanceActions (noop).
+  DescribePendingMaintenanceActions.
 
 Engine is forced to "docdb". Default container port 27017.
 Env vars: DOCDB_BASE_PORT (default 27117), DOCDB_PERSIST, DOCDB_TMPFS_SIZE,
-DOCKER_NETWORK (shared with RDS).
+DOCKER_NETWORK.
+
+Resources:
+- AWS Mongo API: https://docs.aws.amazon.com/documentdb/latest/APIReference/API_Operations_Amazon_DocumentDB_with_MongoDB_compatibility.html
 """
 
 import copy
@@ -39,6 +46,7 @@ from ministack.core.responses import AccountScopedDict, apply_image_prefix, get_
 
 logger = logging.getLogger("documentdb")
 
+ACCOUNT_ID = "000000000000"
 REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 BASE_PORT = int(os.environ.get("DOCDB_BASE_PORT", "27117"))
 DOCDB_TMPFS_SIZE = os.environ.get("DOCDB_TMPFS_SIZE", "256m")
@@ -54,6 +62,7 @@ _port_counter = [BASE_PORT]
 
 _docker = None
 _ministack_network = None
+_state: dict = {}  # in-memory storage
 
 
 # ── Persistence ────────────────────────────────────────────
@@ -124,7 +133,7 @@ def _get_ministack_network(docker_client):
         return _ministack_network or None
     if DOCKER_NETWORK:
         _ministack_network = DOCKER_NETWORK
-        logger.debug("docdb: using DOCKER_NETWORK=%s", DOCKER_NETWORK)
+        logger.debug("DocDB: using DOCKER_NETWORK=%s", DOCKER_NETWORK)
         return DOCKER_NETWORK
     try:
         self_container = docker_client.containers.get(
@@ -133,11 +142,11 @@ def _get_ministack_network(docker_client):
             self_container.attrs["NetworkSettings"]["Networks"].keys())
         if nets:
             _ministack_network = nets[0]
-            logger.debug("docdb: detected MiniStack network: %s",
+            logger.debug("DocDB: detected MiniStack network: %s",
                          _ministack_network)
             return _ministack_network
     except Exception:
-        logger.debug("docdb: could not detect MiniStack network, "
+        logger.debug("DocDB: could not detect MiniStack network, "
                      "using localhost")
     _ministack_network = ""
     return None
@@ -232,7 +241,7 @@ async def handle_request(method, path, headers, body, query_params):
     if target:
         action = target.split(".")[-1]
     else:
-        action = _p(params, "Action")
+        action = _evaluate_params(params, "Action")
 
     handler = _ACTION_MAP.get(action)
     if not handler:
@@ -241,78 +250,62 @@ async def handle_request(method, path, headers, body, query_params):
 
 
 # ---------------------------------------------------------------------------
-# Instance resolution helpers
-# ---------------------------------------------------------------------------
-
-def _resolve_instance(db_id):
-    """Look up an instance by DBInstanceIdentifier or DbiResourceId."""
-    inst = _instances.get(db_id)
-    if inst:
-        return inst
-    if db_id.startswith("db-"):
-        for inst in _instances.values():
-            if inst.get("DbiResourceId") == db_id:
-                return inst
-    return None
-
-
-def _register_instance_in_cluster(instance):
-    """Append instance to parent cluster ``DBClusterMembers``."""
-    cid = instance.get("DBClusterIdentifier")
-    if not cid:
-        return
-    cluster = _clusters.get(cid)
-    if not cluster:
-        return
-    members = cluster.setdefault("DBClusterMembers", [])
-    db_id = instance["DBInstanceIdentifier"]
-    members[:] = [m for m in members if m.get("DBInstanceIdentifier") != db_id]
-    any_writer = any(m.get("IsClusterWriter") for m in members)
-    is_writer = not any_writer
-    members.append({
-        "DBInstanceIdentifier": db_id,
-        "IsClusterWriter": is_writer,
-        "PromotionTier": int(instance.get("PromotionTier", 1)),
-    })
-
-
-def _unregister_instance_from_clusters(db_id):
-    """Remove instance from any cluster member list."""
-    for cl in _clusters.values():
-        mem = cl.get("DBClusterMembers") or []
-        cl["DBClusterMembers"] = [m for m in mem if m.get("DBInstanceIdentifier") != db_id]
-
-
-# ---------------------------------------------------------------------------
 # DB Instances
 # ---------------------------------------------------------------------------
 
-def _create_db_instance(p):
-    db_id = _p(p, "DBInstanceIdentifier")
+def _create_db_instance(params):
+    """
+    Parameters and syntax (<Required or not> | <Type of var> | <Options>):
+    - DBClusterIdentifier: (Required | str)
+    - DBInstanceClass: (Required | str | See note 1 below)
+    - DBInstanceIdentifier: (Required | str | See note 2 below)
+    - Engine: (Required | str)
+    - AutoMinorVersionUpgrade: (Not Required | bool | Default=False)
+    - AvailabilityZone: (Not Required | str | Default:Randomly selected from AZ URL)
+    - CACertificateIdentifier: (Not Required | str)
+    - CopyTagsToSnapshot: (Not Required | bool | Default=False)
+    - EnablePerformanceInsights: (Not Required | bool)
+    - PerformanceInsightsKMSKeyId: (Not Required | str)
+    - PreferredMaintenanceWindow: (Not Required | str)
+    - PromotionTier: (Not Required | int | 0-15 | Default=1)
+    - Tags_Tag_N: (Not Required | Array of Tags)
+
+    Instance note
+    1) This value "DBInstanceClass" can be anything from the table here
+       https://docs.aws.amazon.com/documentdb/latest/devguide/db-instance-classes.html#db-instance-class-specs.
+       Honestly, since this will be running locally, the code will not do any resource management
+       in this regard. The limit you will have will be the PC running Ministack.
+    2) Needs from 1-63 letters, numbers, or hyphens. The first character must be a letter.
+       Cannot end with a hyphen or contain two consecutive hyphens.
+       https://docs.aws.amazon.com/documentdb/latest/APIReference/API_CreateDBInstance.html#:~:text=DBInstanceIdentifier
+
+    Returns: DBInstance
+    """
+    db_id = _evaluate_params(params, "DBInstanceIdentifier")
     if not db_id:
         return _error("MissingParameter", "DBInstanceIdentifier is required", 400)
     if db_id in _instances:
         return _error("DBInstanceAlreadyExistsFault", f"DB instance {db_id} already exists", 400)
 
     engine = "docdb"
-    engine_version = _p(p, "EngineVersion") or _default_engine_version(engine)
-    db_class = _p(p, "DBInstanceClass") or "db.t3.medium"
-    master_user = _p(p, "MasterUsername") or "root"
-    master_pass = _p(p, "MasterUserPassword") or "password"
-    db_name = _p(p, "DBName") or "admin"
-    port = int(_p(p, "Port") or "27017")
+    engine_version = _evaluate_params(params, "EngineVersion") or _default_engine_version(engine)
+    db_class = _evaluate_params(params, "DBInstanceClass") or "db.t3.medium"
+    master_user = _evaluate_params(params, "MasterUsername") or "root"
+    master_pass = _evaluate_params(params, "MasterUserPassword") or "password"
+    db_name = _evaluate_params(params, "DBName") or "admin"
+    port = int(_evaluate_params(params, "Port") or "27017")
 
-    cluster_id_param = _p(p, "DBClusterIdentifier")
+    cluster_id_param = _evaluate_params(params, "DBClusterIdentifier")
     if cluster_id_param and cluster_id_param in _clusters:
         parent = _clusters[cluster_id_param]
-        if not _p(p, "MasterUsername"):
+        if not _evaluate_params(params, "MasterUsername"):
             master_user = parent.get("MasterUsername", master_user)
-        if not _p(p, "MasterUserPassword"):
+        if not _evaluate_params(params, "MasterUserPassword"):
             master_pass = parent.get("_MasterUserPassword", master_pass)
 
-    allocated_storage = int(_p(p, "AllocatedStorage") or "20")
-    storage_type = _p(p, "StorageType") or "gp2"
-    subnet_group_name = _p(p, "DBSubnetGroupName") or "default"
+    allocated_storage = int(_evaluate_params(params, "AllocatedStorage") or "20")
+    storage_type = _evaluate_params(params, "StorageType") or "gp2"
+    subnet_group_name = _evaluate_params(params, "DBSubnetGroupName") or "default"
 
     arn = f"arn:aws:rds:{get_region()}:{get_account_id()}:db:{db_id}"
     dbi_resource_id = f"db-{new_uuid().replace('-', '')[:20].upper()}"
@@ -387,10 +380,10 @@ def _create_db_instance(p):
             except Exception as e:
                 logger.warning("docdb: Docker failed for %s: %s", db_id, e)
 
-    cluster_id = _p(p, "DBClusterIdentifier")
+    cluster_id = _evaluate_params(params, "DBClusterIdentifier")
     now_ts = time.time()
 
-    vpc_sgs = _parse_member_list(p, "VpcSecurityGroupIds")
+    vpc_sgs = _parse_member_list(params, "VpcSecurityGroupIds")
     vpc_sg_list = [{"VpcSecurityGroupId": sg, "Status": "active"} for sg in vpc_sgs] if vpc_sgs else []
 
     subnet_group = _subnet_groups.get(subnet_group_name, {
@@ -418,57 +411,57 @@ def _create_db_instance(p):
         "AllocatedStorage": allocated_storage,
         "InstanceCreateTime": _format_time(now_ts),
         "PreferredBackupWindow": "03:00-04:00",
-        "BackupRetentionPeriod": int(_p(p, "BackupRetentionPeriod") or "1"),
+        "BackupRetentionPeriod": int(_evaluate_params(params, "BackupRetentionPeriod") or "1"),
         "DBSecurityGroups": [],
         "VpcSecurityGroups": vpc_sg_list,
         "DBParameterGroups": [{
             "DBParameterGroupName": f"default.docdb{engine_version.split('.')[0]}",
             "ParameterApplyStatus": "in-sync",
         }],
-        "AvailabilityZone": _p(p, "AvailabilityZone") or f"{get_region()}a",
+        "AvailabilityZone": _evaluate_params(params, "AvailabilityZone") or f"{get_region()}a",
         "DBSubnetGroup": subnet_group,
-        "PreferredMaintenanceWindow": _p(p, "PreferredMaintenanceWindow") or "sun:05:00-sun:06:00",
+        "PreferredMaintenanceWindow": _evaluate_params(params, "PreferredMaintenanceWindow") or "sun:05:00-sun:06:00",
         "PendingModifiedValues": {},
         "LatestRestorableTime": _format_time(now_ts),
-        "MultiAZ": _p(p, "MultiAZ") == "true",
-        "AutoMinorVersionUpgrade": _p(p, "AutoMinorVersionUpgrade") != "false",
+        "MultiAZ": _evaluate_params(params, "MultiAZ") == "true",
+        "AutoMinorVersionUpgrade": _evaluate_params(params, "AutoMinorVersionUpgrade") != "false",
         "ReadReplicaDBInstanceIdentifiers": [],
         "ReadReplicaSourceDBInstanceIdentifier": "",
         "ReadReplicaDBClusterIdentifiers": [],
         "ReplicaMode": "",
         "LicenseModel": "docdb",
-        "Iops": int(_p(p, "Iops") or "0") if _p(p, "Iops") else None,
+        "Iops": int(_evaluate_params(params, "Iops") or "0") if _evaluate_params(params, "Iops") else None,
         "OptionGroupMemberships": [],
         "CharacterSetName": "",
         "NcharCharacterSetName": "",
         "SecondaryAvailabilityZone": "",
-        "PubliclyAccessible": _p(p, "PubliclyAccessible") == "true",
+        "PubliclyAccessible": _evaluate_params(params, "PubliclyAccessible") == "true",
         "StatusInfos": [],
         "StorageType": storage_type,
         "TdeCredentialArn": "",
         "DbInstancePort": 0,
         "DBClusterIdentifier": cluster_id,
-        "StorageEncrypted": _p(p, "StorageEncrypted") == "true",
-        "KmsKeyId": _p(p, "KmsKeyId") or "",
+        "StorageEncrypted": _evaluate_params(params, "StorageEncrypted") == "true",
+        "KmsKeyId": _evaluate_params(params, "KmsKeyId") or "",
         "DbiResourceId": dbi_resource_id,
         "CACertificateIdentifier": "rds-ca-rsa2048-g1",
         "DomainMemberships": [],
-        "CopyTagsToSnapshot": _p(p, "CopyTagsToSnapshot") == "true",
-        "MonitoringInterval": int(_p(p, "MonitoringInterval") or "0"),
+        "CopyTagsToSnapshot": _evaluate_params(params, "CopyTagsToSnapshot") == "true",
+        "MonitoringInterval": int(_evaluate_params(params, "MonitoringInterval") or "0"),
         "EnhancedMonitoringResourceArn": "",
-        "MonitoringRoleArn": _p(p, "MonitoringRoleArn") or "",
-        "PromotionTier": int(_p(p, "PromotionTier") or "1"),
+        "MonitoringRoleArn": _evaluate_params(params, "MonitoringRoleArn") or "",
+        "PromotionTier": int(_evaluate_params(params, "PromotionTier") or "1"),
         "DBInstanceArn": arn,
         "Timezone": "",
-        "IAMDatabaseAuthenticationEnabled": _p(p, "EnableIAMDatabaseAuthentication") == "true",
+        "IAMDatabaseAuthenticationEnabled": _evaluate_params(params, "EnableIAMDatabaseAuthentication") == "true",
         "PerformanceInsightsEnabled": False,
         "PerformanceInsightsKMSKeyId": "",
         "PerformanceInsightsRetentionPeriod": 7,
         "EnabledCloudwatchLogsExports": [],
         "ProcessorFeatures": [],
-        "DeletionProtection": _p(p, "DeletionProtection") == "true",
+        "DeletionProtection": _evaluate_params(params, "DeletionProtection") == "true",
         "AssociatedRoles": [],
-        "MaxAllocatedStorage": int(_p(p, "MaxAllocatedStorage") or str(allocated_storage)),
+        "MaxAllocatedStorage": int(_evaluate_params(params, "MaxAllocatedStorage") or str(allocated_storage)),
         "TagList": [],
         "CustomerOwnedIpEnabled": False,
         "ActivityStreamStatus": "stopped",
@@ -489,7 +482,7 @@ def _create_db_instance(p):
     _instances[db_id] = instance
     _register_instance_in_cluster(instance)
 
-    req_tags = _parse_tags(p)
+    req_tags = _parse_tags(params)
     if req_tags:
         _tags[arn] = req_tags
         instance["TagList"] = req_tags
@@ -498,7 +491,7 @@ def _create_db_instance(p):
 
 
 def _delete_db_instance(p):
-    db_id = _p(p, "DBInstanceIdentifier")
+    db_id = _evaluate_params(p, "DBInstanceIdentifier")
     instance = _resolve_instance(db_id)
     if not instance:
         return _error("DBInstanceNotFound", f"DBInstance {db_id} not found.", 404)
@@ -519,8 +512,8 @@ def _delete_db_instance(p):
         except Exception as e:
             logger.warning("docdb: failed to remove container for %s: %s", db_id, e)
 
-    skip_snapshot = _p(p, "SkipFinalSnapshot") == "true"
-    final_snap_id = _p(p, "FinalDBSnapshotIdentifier")
+    skip_snapshot = _evaluate_params(p, "SkipFinalSnapshot") == "true"
+    final_snap_id = _evaluate_params(p, "FinalDBSnapshotIdentifier")
     if not skip_snapshot and final_snap_id:
         _create_snapshot_internal(final_snap_id, instance)
 
@@ -532,7 +525,7 @@ def _delete_db_instance(p):
 
 
 def _describe_db_instances(p):
-    db_id = _p(p, "DBInstanceIdentifier")
+    db_id = _evaluate_params(p, "DBInstanceIdentifier")
     if db_id:
         instance = _resolve_instance(db_id)
         if not instance:
@@ -549,69 +542,8 @@ def _describe_db_instances(p):
         f"<DescribeDBInstancesResult><DBInstances>{members}</DBInstances></DescribeDBInstancesResult>")
 
 
-def _modify_db_instance(p):
-    db_id = _p(p, "DBInstanceIdentifier")
-    instance = _resolve_instance(db_id)
-    if not instance:
-        return _error("DBInstanceNotFound", f"DBInstance {db_id} not found.", 404)
-
-    apply_immediately = _p(p, "ApplyImmediately") == "true"
-
-    field_map = {
-        "DBInstanceClass": "DBInstanceClass",
-        "AllocatedStorage": "AllocatedStorage",
-        "MasterUserPassword": None,
-        "MultiAZ": "MultiAZ",
-        "EngineVersion": "EngineVersion",
-        "StorageType": "StorageType",
-        "Iops": "Iops",
-        "BackupRetentionPeriod": "BackupRetentionPeriod",
-        "PreferredBackupWindow": "PreferredBackupWindow",
-        "PreferredMaintenanceWindow": "PreferredMaintenanceWindow",
-        "PubliclyAccessible": "PubliclyAccessible",
-        "DeletionProtection": "DeletionProtection",
-        "MaxAllocatedStorage": "MaxAllocatedStorage",
-    }
-
-    pending = {}
-    for param_key, instance_key in field_map.items():
-        val = _p(p, param_key)
-        if not val:
-            continue
-        if instance_key is None:
-            continue
-        if param_key in ("AllocatedStorage", "BackupRetentionPeriod",
-                         "Iops", "MaxAllocatedStorage"):
-            val = int(val)
-        elif param_key in ("MultiAZ", "PubliclyAccessible", "DeletionProtection"):
-            val = val == "true"
-
-        if apply_immediately:
-            instance[instance_key] = val
-        else:
-            pending[instance_key] = val
-
-    new_pass = _p(p, "MasterUserPassword")
-    if new_pass:
-        old_pass = instance.get("_MasterUserPassword", "password")
-        instance["_MasterUserPassword"] = new_pass
-        # Password rotation against real mongo container is a future enhancement.
-        # For now we only update the recorded secret used at container creation time.
-
-    vpc_sgs = _parse_member_list(p, "VpcSecurityGroupIds")
-    if vpc_sgs:
-        instance["VpcSecurityGroups"] = [
-            {"VpcSecurityGroupId": sg, "Status": "active"} for sg in vpc_sgs
-        ]
-
-    if pending:
-        instance["PendingModifiedValues"] = pending
-
-    return _single_instance_response("ModifyDBInstanceResponse", "ModifyDBInstanceResult", instance)
-
-
 def _start_db_instance(p):
-    db_id = _p(p, "DBInstanceIdentifier")
+    db_id = _evaluate_params(p, "DBInstanceIdentifier")
     instance = _resolve_instance(db_id)
     if not instance:
         return _error("DBInstanceNotFound", f"DBInstance {db_id} not found.", 404)
@@ -620,7 +552,7 @@ def _start_db_instance(p):
 
 
 def _stop_db_instance(p):
-    db_id = _p(p, "DBInstanceIdentifier")
+    db_id = _evaluate_params(p, "DBInstanceIdentifier")
     instance = _resolve_instance(db_id)
     if not instance:
         return _error("DBInstanceNotFound", f"DBInstance {db_id} not found.", 404)
@@ -629,7 +561,7 @@ def _stop_db_instance(p):
 
 
 def _reboot_db_instance(p):
-    db_id = _p(p, "DBInstanceIdentifier")
+    db_id = _evaluate_params(p, "DBInstanceIdentifier")
     instance = _resolve_instance(db_id)
     if not instance:
         return _error("DBInstanceNotFound", f"DBInstance {db_id} not found.", 404)
@@ -642,7 +574,20 @@ def _reboot_db_instance(p):
 # ---------------------------------------------------------------------------
 
 def _create_db_cluster(p):
-    cluster_id = _p(p, "DBClusterIdentifier")
+    """
+    IMPORTANT!!!
+    This function might need to be rethought because there is a a difference
+    between a DocDB cluster and a DocDB instance. Clusters hosts multiple
+    instances, so how can Docker replicate this?
+    My current idea is to handle this with container naming.
+    For example:
+        - cluster-1-instance_name
+        - cluster-2-instance_name
+    The only thing with the cluster is that it won't have any data. Maybe I'll
+    use an Alpine image not to take too much resource.
+
+    """
+    cluster_id = _evaluate_params(p, "DBClusterIdentifier")
     if not cluster_id:
         return _error("MissingParameter", "DBClusterIdentifier is required", 400)
     if cluster_id in _clusters:
@@ -650,10 +595,10 @@ def _create_db_cluster(p):
             f"DB cluster {cluster_id} already exists.", 400)
 
     engine = "docdb"
-    engine_version = _p(p, "EngineVersion") or _default_engine_version(engine)
-    port = int(_p(p, "Port") or "27017")
-    master_user = _p(p, "MasterUsername") or "root"
-    master_pass = _p(p, "MasterUserPassword") or "password"
+    engine_version = _evaluate_params(p, "EngineVersion") or _default_engine_version(engine)
+    port = int(_evaluate_params(p, "Port") or "27017")
+    master_user = _evaluate_params(p, "MasterUsername") or "root"
+    master_pass = _evaluate_params(p, "MasterUserPassword") or "password"
     arn = f"arn:aws:rds:{get_region()}:{get_account_id()}:cluster:{cluster_id}"
     unique_suffix = new_uuid()[:8]
     now_ts = time.time()
@@ -669,35 +614,35 @@ def _create_db_cluster(p):
         "DBClusterArn": arn,
         "Engine": engine,
         "EngineVersion": engine_version,
-        "EngineMode": _p(p, "EngineMode") or "provisioned",
+        "EngineMode": _evaluate_params(p, "EngineMode") or "provisioned",
         "Status": "available",
         "MasterUsername": master_user,
         "_MasterUserPassword": master_pass,
-        "DatabaseName": _p(p, "DatabaseName") or None,
-        "NetworkType": _p(p, "NetworkType") or "IPV4",
-        "EngineLifecycleSupport": _p(p, "EngineLifecycleSupport") or "open-source-rds-extended-support",
+        "DatabaseName": _evaluate_params(p, "DatabaseName") or None,
+        "NetworkType": _evaluate_params(p, "NetworkType") or "IPV4",
+        "EngineLifecycleSupport": _evaluate_params(p, "EngineLifecycleSupport") or "open-source-rds-extended-support",
         "Endpoint": f"{cluster_id}.cluster-{unique_suffix}.{get_region()}.docdb.amazonaws.com",
         "ReaderEndpoint": f"{cluster_id}.cluster-ro-{unique_suffix}.{get_region()}.docdb.amazonaws.com",
         "Port": port,
-        "MultiAZ": _p(p, "MultiAZ") == "true",
+        "MultiAZ": _evaluate_params(p, "MultiAZ") == "true",
         "AvailabilityZones": az_list,
         "DBClusterMembers": [],
         "VpcSecurityGroups": vpc_sg_list,
-        "DBSubnetGroup": _p(p, "DBSubnetGroupName") or "default",
-        "DBClusterParameterGroup": _p(p, "DBClusterParameterGroupName") or "default.docdb",
-        "BackupRetentionPeriod": int(_p(p, "BackupRetentionPeriod") or "1"),
-        "PreferredBackupWindow": _p(p, "PreferredBackupWindow") or "03:00-04:00",
-        "PreferredMaintenanceWindow": _p(p, "PreferredMaintenanceWindow") or "sun:05:00-sun:06:00",
+        "DBSubnetGroup": _evaluate_params(p, "DBSubnetGroupName") or "default",
+        "DBClusterParameterGroup": _evaluate_params(p, "DBClusterParameterGroupName") or "default.docdb",
+        "BackupRetentionPeriod": int(_evaluate_params(p, "BackupRetentionPeriod") or "1"),
+        "PreferredBackupWindow": _evaluate_params(p, "PreferredBackupWindow") or "03:00-04:00",
+        "PreferredMaintenanceWindow": _evaluate_params(p, "PreferredMaintenanceWindow") or "sun:05:00-sun:06:00",
         "ClusterCreateTime": _format_time(now_ts),
         "EarliestRestorableTime": _format_time(now_ts),
         "LatestRestorableTime": _format_time(now_ts),
-        "StorageEncrypted": _p(p, "StorageEncrypted") == "true",
-        "KmsKeyId": _p(p, "KmsKeyId") or "",
-        "DeletionProtection": _p(p, "DeletionProtection") == "true",
-        "IAMDatabaseAuthenticationEnabled": _p(p, "EnableIAMDatabaseAuthentication") == "true",
+        "StorageEncrypted": _evaluate_params(p, "StorageEncrypted") == "true",
+        "KmsKeyId": _evaluate_params(p, "KmsKeyId") or "",
+        "DeletionProtection": _evaluate_params(p, "DeletionProtection") == "true",
+        "IAMDatabaseAuthenticationEnabled": _evaluate_params(p, "EnableIAMDatabaseAuthentication") == "true",
         "EnabledCloudwatchLogsExports": [],
-        "HttpEndpointEnabled": _p(p, "EnableHttpEndpoint") == "true",
-        "CopyTagsToSnapshot": _p(p, "CopyTagsToSnapshot") == "true",
+        "HttpEndpointEnabled": _evaluate_params(p, "EnableHttpEndpoint") == "true",
+        "CopyTagsToSnapshot": _evaluate_params(p, "CopyTagsToSnapshot") == "true",
         "CrossAccountClone": False,
         "DbClusterResourceId": f"cluster-{new_uuid().replace('-', '')[:20].upper()}",
         "TagList": [],
@@ -720,7 +665,7 @@ def _create_db_cluster(p):
 
 
 def _delete_db_cluster(p):
-    cluster_id = _p(p, "DBClusterIdentifier")
+    cluster_id = _evaluate_params(p, "DBClusterIdentifier")
     cluster = _clusters.get(cluster_id)
     if not cluster:
         return _error("DBClusterNotFoundFault", f"DBCluster {cluster_id} not found.", 404)
@@ -737,7 +682,7 @@ def _delete_db_cluster(p):
 
 
 def _describe_db_clusters(p):
-    cluster_id = _p(p, "DBClusterIdentifier")
+    cluster_id = _evaluate_params(p, "DBClusterIdentifier")
     if cluster_id:
         cluster = _clusters.get(cluster_id)
         if not cluster:
@@ -755,33 +700,33 @@ def _describe_db_clusters(p):
 
 
 def _modify_db_cluster(p):
-    cluster_id = _p(p, "DBClusterIdentifier")
+    cluster_id = _evaluate_params(p, "DBClusterIdentifier")
     cluster = _clusters.get(cluster_id)
     if not cluster:
         return _error("DBClusterNotFoundFault", f"DBCluster {cluster_id} not found.", 404)
 
-    if _p(p, "EngineVersion"):
-        cluster["EngineVersion"] = _p(p, "EngineVersion")
-    if _p(p, "MasterUserPassword"):
-        new_pass = _p(p, "MasterUserPassword")
+    if _evaluate_params(p, "EngineVersion"):
+        cluster["EngineVersion"] = _evaluate_params(p, "EngineVersion")
+    if _evaluate_params(p, "MasterUserPassword"):
+        new_pass = _evaluate_params(p, "MasterUserPassword")
         old_pass = cluster.get("_MasterUserPassword", "password")
         cluster["_MasterUserPassword"] = new_pass
-    if _p(p, "Port"):
-        cluster["Port"] = int(_p(p, "Port"))
-    if _p(p, "BackupRetentionPeriod"):
-        cluster["BackupRetentionPeriod"] = int(_p(p, "BackupRetentionPeriod"))
-    if _p(p, "PreferredBackupWindow"):
-        cluster["PreferredBackupWindow"] = _p(p, "PreferredBackupWindow")
-    if _p(p, "PreferredMaintenanceWindow"):
-        cluster["PreferredMaintenanceWindow"] = _p(p, "PreferredMaintenanceWindow")
-    if _p(p, "DeletionProtection"):
-        cluster["DeletionProtection"] = _p(p, "DeletionProtection") == "true"
-    if _p(p, "EnableIAMDatabaseAuthentication"):
-        cluster["IAMDatabaseAuthenticationEnabled"] = _p(p, "EnableIAMDatabaseAuthentication") == "true"
-    if _p(p, "EnableHttpEndpoint"):
-        cluster["HttpEndpointEnabled"] = _p(p, "EnableHttpEndpoint") == "true"
-    if _p(p, "CopyTagsToSnapshot"):
-        cluster["CopyTagsToSnapshot"] = _p(p, "CopyTagsToSnapshot") == "true"
+    if _evaluate_params(p, "Port"):
+        cluster["Port"] = int(_evaluate_params(p, "Port"))
+    if _evaluate_params(p, "BackupRetentionPeriod"):
+        cluster["BackupRetentionPeriod"] = int(_evaluate_params(p, "BackupRetentionPeriod"))
+    if _evaluate_params(p, "PreferredBackupWindow"):
+        cluster["PreferredBackupWindow"] = _evaluate_params(p, "PreferredBackupWindow")
+    if _evaluate_params(p, "PreferredMaintenanceWindow"):
+        cluster["PreferredMaintenanceWindow"] = _evaluate_params(p, "PreferredMaintenanceWindow")
+    if _evaluate_params(p, "DeletionProtection"):
+        cluster["DeletionProtection"] = _evaluate_params(p, "DeletionProtection") == "true"
+    if _evaluate_params(p, "EnableIAMDatabaseAuthentication"):
+        cluster["IAMDatabaseAuthenticationEnabled"] = _evaluate_params(p, "EnableIAMDatabaseAuthentication") == "true"
+    if _evaluate_params(p, "EnableHttpEndpoint"):
+        cluster["HttpEndpointEnabled"] = _evaluate_params(p, "EnableHttpEndpoint") == "true"
+    if _evaluate_params(p, "CopyTagsToSnapshot"):
+        cluster["CopyTagsToSnapshot"] = _evaluate_params(p, "CopyTagsToSnapshot") == "true"
 
     vpc_sgs = _parse_member_list(p, "VpcSecurityGroupIds")
     if vpc_sgs:
@@ -794,7 +739,7 @@ def _modify_db_cluster(p):
 
 
 def _start_db_cluster(p):
-    cluster_id = _p(p, "DBClusterIdentifier")
+    cluster_id = _evaluate_params(p, "DBClusterIdentifier")
     cluster = _clusters.get(cluster_id)
     if not cluster:
         return _error("DBClusterNotFoundFault", f"DBCluster {cluster_id} not found.", 404)
@@ -804,7 +749,7 @@ def _start_db_cluster(p):
 
 
 def _stop_db_cluster(p):
-    cluster_id = _p(p, "DBClusterIdentifier")
+    cluster_id = _evaluate_params(p, "DBClusterIdentifier")
     cluster = _clusters.get(cluster_id)
     if not cluster:
         return _error("DBClusterNotFoundFault", f"DBCluster {cluster_id} not found.", 404)
@@ -812,113 +757,15 @@ def _stop_db_cluster(p):
     return _xml(200, "StopDBClusterResponse",
         f"<StopDBClusterResult><DBCluster>{_cluster_xml(cluster)}</DBCluster></StopDBClusterResult>")
 
-
-# ---------------------------------------------------------------------------
-# Snapshots (instance)
-# ---------------------------------------------------------------------------
-
-def _create_snapshot_internal(snap_id, instance):
-    arn = f"arn:aws:rds:{get_region()}:{get_account_id()}:snapshot:{snap_id}"
-    now_ts = time.time()
-    snap = {
-        "DBSnapshotIdentifier": snap_id,
-        "DBInstanceIdentifier": instance["DBInstanceIdentifier"],
-        "DBSnapshotArn": arn,
-        "Engine": instance["Engine"],
-        "EngineVersion": instance["EngineVersion"],
-        "SnapshotCreateTime": _format_time(now_ts),
-        "InstanceCreateTime": instance.get("InstanceCreateTime", _format_time(now_ts)),
-        "Status": "available",
-        "AllocatedStorage": instance.get("AllocatedStorage", 20),
-        "AvailabilityZone": instance.get("AvailabilityZone", f"{get_region()}a"),
-        "VpcId": "vpc-00000000",
-        "Port": instance.get("Endpoint", {}).get("Port", 27017),
-        "MasterUsername": instance.get("MasterUsername", "root"),
-        "DBName": instance.get("DBName", ""),
-        "SnapshotType": "manual",
-        "LicenseModel": instance.get("LicenseModel", "docdb"),
-        "StorageType": instance.get("StorageType", "gp2"),
-        "DBInstanceClass": instance.get("DBInstanceClass", "db.t3.medium"),
-        "StorageEncrypted": instance.get("StorageEncrypted", False),
-        "KmsKeyId": instance.get("KmsKeyId", ""),
-        "Encrypted": instance.get("StorageEncrypted", False),
-        "IAMDatabaseAuthenticationEnabled": instance.get("IAMDatabaseAuthenticationEnabled", False),
-        "PercentProgress": 100,
-        "DbiResourceId": instance.get("DbiResourceId", ""),
-        "TagList": list(_tags.get(instance.get("DBInstanceArn", ""), [])),
-        "OriginalSnapshotCreateTime": _format_time(now_ts),
-        "SnapshotDatabaseTime": _format_time(now_ts),
-        "SnapshotTarget": "region",
-    }
-    _snapshots[snap_id] = snap
-    return snap
-
-
-def _create_db_snapshot(p):
-    snap_id = _p(p, "DBSnapshotIdentifier")
-    db_id = _p(p, "DBInstanceIdentifier")
-    if not snap_id:
-        return _error("MissingParameter", "DBSnapshotIdentifier is required", 400)
-    if snap_id in _snapshots:
-        return _error("DBSnapshotAlreadyExists", f"Snapshot {snap_id} already exists.", 400)
-
-    instance = _resolve_instance(db_id)
-    if not instance:
-        return _error("DBInstanceNotFound", f"DBInstance {db_id} not found.", 404)
-
-    snap = _create_snapshot_internal(snap_id, instance)
-
-    req_tags = _parse_tags(p)
-    if req_tags:
-        _tags[snap["DBSnapshotArn"]] = req_tags
-        snap["TagList"] = req_tags
-
-    return _xml(200, "CreateDBSnapshotResponse",
-        f"<CreateDBSnapshotResult><DBSnapshot>{_snapshot_xml(snap)}</DBSnapshot></CreateDBSnapshotResult>")
-
-
-def _delete_db_snapshot(p):
-    snap_id = _p(p, "DBSnapshotIdentifier")
-    snap = _snapshots.pop(snap_id, None)
-    if not snap:
-        return _error("DBSnapshotNotFound", f"Snapshot {snap_id} not found.", 404)
-    _tags.pop(snap.get("DBSnapshotArn", ""), None)
-    snap["Status"] = "deleted"
-    return _xml(200, "DeleteDBSnapshotResponse",
-        f"<DeleteDBSnapshotResult><DBSnapshot>{_snapshot_xml(snap)}</DBSnapshot></DeleteDBSnapshotResult>")
-
-
-def _describe_db_snapshots(p):
-    snap_id = _p(p, "DBSnapshotIdentifier")
-    db_id = _p(p, "DBInstanceIdentifier")
-    snap_type = _p(p, "SnapshotType")
-
-    if snap_id:
-        snap = _snapshots.get(snap_id)
-        if not snap:
-            return _error("DBSnapshotNotFound", f"Snapshot {snap_id} not found.", 404)
-        snaps = [snap]
-    else:
-        snaps = list(_snapshots.values())
-        if db_id:
-            snaps = [s for s in snaps if s["DBInstanceIdentifier"] == db_id]
-        if snap_type:
-            snaps = [s for s in snaps if s["SnapshotType"] == snap_type]
-
-    members = "".join(f"<DBSnapshot>{_snapshot_xml(s)}</DBSnapshot>" for s in snaps)
-    return _xml(200, "DescribeDBSnapshotsResponse",
-        f"<DescribeDBSnapshotsResult><DBSnapshots>{members}</DBSnapshots></DescribeDBSnapshotsResult>")
-
-
 # ---------------------------------------------------------------------------
 # Subnet Groups (minimal)
 # ---------------------------------------------------------------------------
 
 def _create_subnet_group(p):
-    name = _p(p, "DBSubnetGroupName")
+    name = _evaluate_params(p, "DBSubnetGroupName")
     if not name:
         return _error("MissingParameter", "DBSubnetGroupName is required", 400)
-    desc = _p(p, "DBSubnetGroupDescription") or name
+    desc = _evaluate_params(p, "DBSubnetGroupDescription") or name
     subnet_ids = _parse_member_list(p, "SubnetIds")
     arn = f"arn:aws:rds:{get_region()}:{get_account_id()}:subgrp:{name}"
 
@@ -945,7 +792,7 @@ def _create_subnet_group(p):
 
 
 def _delete_subnet_group(p):
-    name = _p(p, "DBSubnetGroupName")
+    name = _evaluate_params(p, "DBSubnetGroupName")
     sg = _subnet_groups.pop(name, None)
     if not sg:
         return _error("DBSubnetGroupNotFoundFault", f"Subnet group {name} not found.", 404)
@@ -954,7 +801,7 @@ def _delete_subnet_group(p):
 
 
 def _describe_subnet_groups(p):
-    name = _p(p, "DBSubnetGroupName")
+    name = _evaluate_params(p, "DBSubnetGroupName")
     if name:
         sg = _subnet_groups.get(name)
         if not sg:
@@ -975,7 +822,7 @@ def _describe_subnet_groups(p):
 # ---------------------------------------------------------------------------
 
 def _add_tags(p):
-    arn = _p(p, "ResourceName")
+    arn = _evaluate_params(p, "ResourceName")
     new_tags = _parse_tags(p)
     if not arn:
         return _error("MissingParameter", "ResourceName is required", 400)
@@ -996,7 +843,7 @@ def _add_tags(p):
 
 
 def _remove_tags(p):
-    arn = _p(p, "ResourceName")
+    arn = _evaluate_params(p, "ResourceName")
     keys_to_remove = set(_parse_member_list(p, "TagKeys"))
     if not arn:
         return _error("MissingParameter", "ResourceName is required", 400)
@@ -1009,7 +856,7 @@ def _remove_tags(p):
 
 
 def _list_tags(p):
-    arn = _p(p, "ResourceName")
+    arn = _evaluate_params(p, "ResourceName")
     if not arn:
         return _xml(200, "ListTagsForResourceResponse",
             "<ListTagsForResourceResult><TagList/></ListTagsForResourceResult>")
@@ -1042,8 +889,8 @@ def _sync_tag_list_to_resource(arn):
 # ---------------------------------------------------------------------------
 
 def _describe_db_engine_versions(p):
-    engine = _p(p, "Engine") or "docdb"
-    version_filter = _p(p, "EngineVersion")
+    engine = _evaluate_params(p, "Engine") or "docdb"
+    version_filter = _evaluate_params(p, "EngineVersion")
     # DocDB-focused versions (wire compatible with mongo 5.x/6.x/7.x)
     versions = [
         ("5.0.0", "docdb5.0"),
@@ -1076,8 +923,8 @@ def _describe_db_engine_versions(p):
 
 def _describe_orderable_options(p):
     engine = "docdb"
-    engine_version = _p(p, "EngineVersion") or "5.0.0"
-    db_class = _p(p, "DBInstanceClass")
+    engine_version = _evaluate_params(p, "EngineVersion") or "5.0.0"
+    db_class = _evaluate_params(p, "DBInstanceClass")
 
     instance_classes = [
         "db.t3.medium", "db.t3.large", "db.r5.large", "db.r5.xlarge",
@@ -1123,149 +970,6 @@ def _describe_orderable_options(p):
 def _describe_pending_maintenance_actions(p):
     return _xml(200, "DescribePendingMaintenanceActionsResponse",
         "<DescribePendingMaintenanceActionsResult><PendingMaintenanceActions/></DescribePendingMaintenanceActionsResult>")
-
-
-# ---------------------------------------------------------------------------
-# XML helpers (RDS 2014-10-31 shapes reused for docdb client compatibility)
-# ---------------------------------------------------------------------------
-
-def _instance_xml(i):
-    ep = i.get("Endpoint", {})
-    subnet = i.get("DBSubnetGroup", {})
-
-    vpc_sg_xml = ""
-    for sg in i.get("VpcSecurityGroups", []):
-        vpc_sg_xml += f"""<VpcSecurityGroupMembership>
-            <VpcSecurityGroupId>{sg.get('VpcSecurityGroupId','')}</VpcSecurityGroupId>
-            <Status>{sg.get('Status','active')}</Status>
-        </VpcSecurityGroupMembership>"""
-
-    db_sg_xml = ""
-    for sg in i.get("DBSecurityGroups", []):
-        db_sg_xml += f"""<DBSecurityGroup>
-            <DBSecurityGroupName>{sg}</DBSecurityGroupName>
-            <Status>active</Status>
-        </DBSecurityGroup>"""
-
-    param_xml = ""
-    for pg in i.get("DBParameterGroups", []):
-        param_xml += f"""<DBParameterGroup>
-            <DBParameterGroupName>{pg.get('DBParameterGroupName','')}</DBParameterGroupName>
-            <ParameterApplyStatus>{pg.get('ParameterApplyStatus','in-sync')}</ParameterApplyStatus>
-        </DBParameterGroup>"""
-
-    option_xml = ""
-    for og in i.get("OptionGroupMemberships", []):
-        option_xml += f"""<OptionGroupMembership>
-            <OptionGroupName>{og.get('OptionGroupName','')}</OptionGroupName>
-            <Status>{og.get('Status','in-sync')}</Status>
-        </OptionGroupMembership>"""
-
-    tag_xml = ""
-    for t in i.get("TagList", []):
-        tag_xml += f"<Tag><Key>{_esc(t['Key'])}</Key><Value>{_esc(t['Value'])}</Value></Tag>"
-
-    read_replica_xml = ""
-    for rr in i.get("ReadReplicaDBInstanceIdentifiers", []):
-        read_replica_xml += f"<ReadReplicaDBInstanceIdentifier>{rr}</ReadReplicaDBInstanceIdentifier>"
-
-    subnet_xml = ""
-    for s in subnet.get("Subnets", []):
-        az = s.get("SubnetAvailabilityZone", {}).get("Name", f"{get_region()}a") if isinstance(s.get("SubnetAvailabilityZone"), dict) else f"{get_region()}a"
-        subnet_xml += f"""<Subnet>
-            <SubnetIdentifier>{s.get('SubnetIdentifier','')}</SubnetIdentifier>
-            <SubnetAvailabilityZone><Name>{az}</Name></SubnetAvailabilityZone>
-            <SubnetOutpost/>
-            <SubnetStatus>Active</SubnetStatus>
-        </Subnet>"""
-
-    pending_xml = ""
-    for pk, pv in i.get("PendingModifiedValues", {}).items():
-        pending_xml += f"<{pk}>{pv}</{pk}>"
-
-    iops_xml = ""
-    if i.get("Iops") is not None:
-        iops_xml = f"<Iops>{i['Iops']}</Iops>"
-
-    cert_xml = ""
-    cert = i.get("CertificateDetails")
-    if cert:
-        cert_xml = f"""<CertificateDetails>
-            <CAIdentifier>{cert.get('CAIdentifier','')}</CAIdentifier>
-            <ValidTill>{cert.get('ValidTill','')}</ValidTill>
-        </CertificateDetails>"""
-
-    return f"""<DBInstanceIdentifier>{i['DBInstanceIdentifier']}</DBInstanceIdentifier>
-        <DBInstanceClass>{i['DBInstanceClass']}</DBInstanceClass>
-        <Engine>{i['Engine']}</Engine>
-        <EngineVersion>{i['EngineVersion']}</EngineVersion>
-        <DBInstanceStatus>{i['DBInstanceStatus']}</DBInstanceStatus>
-        <MasterUsername>{i['MasterUsername']}</MasterUsername>
-        <DBName>{i.get('DBName','')}</DBName>
-        <Endpoint>
-            <Address>{ep.get('Address','localhost')}</Address>
-            <Port>{ep.get('Port',27017)}</Port>
-            <HostedZoneId>{ep.get('HostedZoneId','Z2R2ITUGPM61AM')}</HostedZoneId>
-        </Endpoint>
-        <AllocatedStorage>{i['AllocatedStorage']}</AllocatedStorage>
-        <InstanceCreateTime>{i.get('InstanceCreateTime','')}</InstanceCreateTime>
-        <PreferredBackupWindow>{i.get('PreferredBackupWindow','03:00-04:00')}</PreferredBackupWindow>
-        <BackupRetentionPeriod>{i.get('BackupRetentionPeriod',1)}</BackupRetentionPeriod>
-        <DBSecurityGroups>{db_sg_xml}</DBSecurityGroups>
-        <VpcSecurityGroups>{vpc_sg_xml}</VpcSecurityGroups>
-        <DBParameterGroups>{param_xml}</DBParameterGroups>
-        <AvailabilityZone>{i.get('AvailabilityZone',f'{get_region()}a')}</AvailabilityZone>
-        <DBSubnetGroup>
-            <DBSubnetGroupName>{subnet.get('DBSubnetGroupName','default')}</DBSubnetGroupName>
-            <DBSubnetGroupDescription>{subnet.get('DBSubnetGroupDescription','')}</DBSubnetGroupDescription>
-            <VpcId>{subnet.get('VpcId','vpc-00000000')}</VpcId>
-            <SubnetGroupStatus>{subnet.get('SubnetGroupStatus','Complete')}</SubnetGroupStatus>
-            <Subnets>{subnet_xml}</Subnets>
-            <DBSubnetGroupArn>{subnet.get('DBSubnetGroupArn','')}</DBSubnetGroupArn>
-        </DBSubnetGroup>
-        <PreferredMaintenanceWindow>{i.get('PreferredMaintenanceWindow','sun:05:00-sun:06:00')}</PreferredMaintenanceWindow>
-        <PendingModifiedValues>{pending_xml}</PendingModifiedValues>
-        <LatestRestorableTime>{i.get('LatestRestorableTime') or _format_time(time.time())}</LatestRestorableTime>
-        <MultiAZ>{str(i.get('MultiAZ',False)).lower()}</MultiAZ>
-        <AutoMinorVersionUpgrade>{str(i.get('AutoMinorVersionUpgrade',True)).lower()}</AutoMinorVersionUpgrade>
-        <ReadReplicaDBInstanceIdentifiers>{read_replica_xml}</ReadReplicaDBInstanceIdentifiers>
-        <ReadReplicaSourceDBInstanceIdentifier>{i.get('ReadReplicaSourceDBInstanceIdentifier','')}</ReadReplicaSourceDBInstanceIdentifier>
-        <ReadReplicaDBClusterIdentifiers/>
-        <ReplicaMode>{i.get('ReplicaMode','')}</ReplicaMode>
-        <LicenseModel>{i.get('LicenseModel','docdb')}</LicenseModel>
-        {iops_xml}
-        <OptionGroupMemberships>{option_xml}</OptionGroupMemberships>
-        <PubliclyAccessible>{str(i.get('PubliclyAccessible',False)).lower()}</PubliclyAccessible>
-        <StatusInfos/>
-        <StorageType>{i.get('StorageType','gp2')}</StorageType>
-        <DbInstancePort>{i.get('DbInstancePort',0)}</DbInstancePort>
-        <DBClusterIdentifier>{i.get('DBClusterIdentifier','')}</DBClusterIdentifier>
-        <StorageEncrypted>{str(i.get('StorageEncrypted',False)).lower()}</StorageEncrypted>
-        <KmsKeyId>{i.get('KmsKeyId','')}</KmsKeyId>
-        <DbiResourceId>{i.get('DbiResourceId','')}</DbiResourceId>
-        <CACertificateIdentifier>{i.get('CACertificateIdentifier','rds-ca-rsa2048-g1')}</CACertificateIdentifier>
-        <DomainMemberships/>
-        <CopyTagsToSnapshot>{str(i.get('CopyTagsToSnapshot',False)).lower()}</CopyTagsToSnapshot>
-        <MonitoringInterval>{i.get('MonitoringInterval',0)}</MonitoringInterval>
-        <EnhancedMonitoringResourceArn>{i.get('EnhancedMonitoringResourceArn','')}</EnhancedMonitoringResourceArn>
-        <MonitoringRoleArn>{i.get('MonitoringRoleArn','')}</MonitoringRoleArn>
-        <PromotionTier>{i.get('PromotionTier',1)}</PromotionTier>
-        <DBInstanceArn>{i['DBInstanceArn']}</DBInstanceArn>
-        <IAMDatabaseAuthenticationEnabled>{str(i.get('IAMDatabaseAuthenticationEnabled',False)).lower()}</IAMDatabaseAuthenticationEnabled>
-        <PerformanceInsightsEnabled>{str(i.get('PerformanceInsightsEnabled',False)).lower()}</PerformanceInsightsEnabled>
-        <EnabledCloudwatchLogsExports/>
-        <ProcessorFeatures/>
-        <DeletionProtection>{str(i.get('DeletionProtection',False)).lower()}</DeletionProtection>
-        <AssociatedRoles/>
-        <MaxAllocatedStorage>{i.get('MaxAllocatedStorage',i.get('AllocatedStorage',20))}</MaxAllocatedStorage>
-        <TagList>{tag_xml}</TagList>
-        {cert_xml}
-        <CustomerOwnedIpEnabled>{str(i.get('CustomerOwnedIpEnabled',False)).lower()}</CustomerOwnedIpEnabled>
-        <BackupTarget>{i.get('BackupTarget','region')}</BackupTarget>
-        <NetworkType>{i.get('NetworkType','IPV4')}</NetworkType>
-        <StorageThroughput>{i.get('StorageThroughput',0)}</StorageThroughput>
-        <IsStorageConfigUpgradeAvailable>{str(i.get('IsStorageConfigUpgradeAvailable',False)).lower()}</IsStorageConfigUpgradeAvailable>"""
-
 
 def _cluster_xml(c):
     vpc_sg_xml = ""
@@ -1397,7 +1101,7 @@ def _single_instance_response(root_tag, result_tag, instance):
 # Generic helpers
 # ---------------------------------------------------------------------------
 
-def _p(params, key, default=""):
+def _evaluate_params(params, key, default=""):
     val = params.get(key, [default])
     if isinstance(val, list):
         return val[0] if val else default
@@ -1408,14 +1112,14 @@ def _parse_tags(params):
     """Parse Tags.member.N.Key / Tags.member.N.Value or Tags.Tag.N.Key / Tags.Tag.N.Value."""
     tags = []
     prefix = "Tags.member"
-    if not _p(params, "Tags.member.1.Key"):
+    if not _evaluate_params(params, "Tags.member.1.Key"):
         prefix = "Tags.Tag"
     i = 1
     while True:
-        key = _p(params, f"{prefix}.{i}.Key")
+        key = _evaluate_params(params, f"{prefix}.{i}.Key")
         if not key:
             break
-        value = _p(params, f"{prefix}.{i}.Value", "")
+        value = _evaluate_params(params, f"{prefix}.{i}.Value", "")
         tags.append({"Key": key, "Value": value})
         i += 1
     return tags
@@ -1425,7 +1129,7 @@ def _parse_member_list(params, prefix):
     items = []
     i = 1
     while True:
-        val = _p(params, f"{prefix}.member.{i}")
+        val = _evaluate_params(params, f"{prefix}.member.{i}")
         if not val:
             break
         items.append(val)
@@ -1439,7 +1143,7 @@ def _parse_member_list(params, prefix):
         m = pattern.match(key)
         if m:
             idx = int(m.group(2))
-            numbered[idx] = _p(params, key)
+            numbered[idx] = _evaluate_params(params, key)
     return [numbered[k] for k in sorted(numbered)] if numbered else []
 
 
@@ -1447,13 +1151,13 @@ def _parse_filters(params):
     filters = {}
     i = 1
     while True:
-        name = _p(params, f"Filters.member.{i}.Name")
+        name = _evaluate_params(params, f"Filters.member.{i}.Name")
         if not name:
             break
         values = []
         j = 1
         while True:
-            v = _p(params, f"Filters.member.{i}.Values.member.{j}")
+            v = _evaluate_params(params, f"Filters.member.{i}.Values.member.{j}")
             if not v:
                 break
             values.append(v)
@@ -1462,6 +1166,25 @@ def _parse_filters(params):
         i += 1
     return filters
 
+
+# ---------------------------------------------------------------------------
+# Instance resolution helpers
+# ---------------------------------------------------------------------------
+
+def _resolve_instance(db_id):
+    """Look up an instance by DBInstanceIdentifier or DbiResourceId.
+
+    AWS accepts either value for the DBInstanceIdentifier parameter in
+    DescribeDBInstances and related APIs.
+    """
+    inst = _instances.get(db_id)
+    if inst:
+        return inst
+    if db_id.startswith("db-"):
+        for inst in _instances.values():
+            if inst.get("DbiResourceId") == db_id:
+                return inst
+    return None
 
 def _apply_instance_filters(instances, filters):
     result = []
@@ -1496,6 +1219,148 @@ def _apply_cluster_filters(clusters, filters):
         if match:
             result.append(cl)
     return result
+
+# ---------------------------------------------------------------------------
+# XML helpers
+# ---------------------------------------------------------------------------
+
+def _instance_xml(i):
+    """Render an instance dict to XML fields — no wrapping element."""
+    ep = i.get("Endpoint", {})
+    subnet = i.get("DBSubnetGroup", {})
+
+    vpc_sg_xml = ""
+    for sg in i.get("VpcSecurityGroups", []):
+        vpc_sg_xml += f"""<VpcSecurityGroupMembership>
+            <VpcSecurityGroupId>{sg.get('VpcSecurityGroupId','')}</VpcSecurityGroupId>
+            <Status>{sg.get('Status','active')}</Status>
+        </VpcSecurityGroupMembership>"""
+
+    db_sg_xml = ""
+    for sg in i.get("DBSecurityGroups", []):
+        db_sg_xml += f"""<DBSecurityGroup>
+            <DBSecurityGroupName>{sg}</DBSecurityGroupName>
+            <Status>active</Status>
+        </DBSecurityGroup>"""
+
+    param_xml = ""
+    for pg in i.get("DBParameterGroups", []):
+        param_xml += f"""<DBParameterGroup>
+            <DBParameterGroupName>{pg.get('DBParameterGroupName','')}</DBParameterGroupName>
+            <ParameterApplyStatus>{pg.get('ParameterApplyStatus','in-sync')}</ParameterApplyStatus>
+        </DBParameterGroup>"""
+
+    option_xml = ""
+    for og in i.get("OptionGroupMemberships", []):
+        option_xml += f"""<OptionGroupMembership>
+            <OptionGroupName>{og.get('OptionGroupName','')}</OptionGroupName>
+            <Status>{og.get('Status','in-sync')}</Status>
+        </OptionGroupMembership>"""
+
+    tag_xml = ""
+    for t in i.get("TagList", []):
+        tag_xml += f"<Tag><Key>{_esc(t['Key'])}</Key><Value>{_esc(t['Value'])}</Value></Tag>"
+
+    read_replica_xml = ""
+    for rr in i.get("ReadReplicaDBInstanceIdentifiers", []):
+        read_replica_xml += f"<ReadReplicaDBInstanceIdentifier>{rr}</ReadReplicaDBInstanceIdentifier>"
+
+    subnet_xml = ""
+    for s in subnet.get("Subnets", []):
+        az = s.get("SubnetAvailabilityZone", {}).get("Name", f"{get_region()}a") if isinstance(s.get("SubnetAvailabilityZone"), dict) else f"{get_region()}a"
+        subnet_xml += f"""<Subnet>
+            <SubnetIdentifier>{s.get('SubnetIdentifier','')}</SubnetIdentifier>
+            <SubnetAvailabilityZone><Name>{az}</Name></SubnetAvailabilityZone>
+            <SubnetOutpost/>
+            <SubnetStatus>Active</SubnetStatus>
+        </Subnet>"""
+
+    pending_xml = ""
+    for pk, pv in i.get("PendingModifiedValues", {}).items():
+        pending_xml += f"<{pk}>{pv}</{pk}>"
+
+    iops_xml = ""
+    if i.get("Iops") is not None:
+        iops_xml = f"<Iops>{i['Iops']}</Iops>"
+
+    cert_xml = ""
+    cert = i.get("CertificateDetails")
+    if cert:
+        cert_xml = f"""<CertificateDetails>
+            <CAIdentifier>{cert.get('CAIdentifier','')}</CAIdentifier>
+            <ValidTill>{cert.get('ValidTill','')}</ValidTill>
+        </CertificateDetails>"""
+
+    return f"""<DBInstanceIdentifier>{i['DBInstanceIdentifier']}</DBInstanceIdentifier>
+        <DBInstanceClass>{i['DBInstanceClass']}</DBInstanceClass>
+        <Engine>{i['Engine']}</Engine>
+        <EngineVersion>{i['EngineVersion']}</EngineVersion>
+        <DBInstanceStatus>{i['DBInstanceStatus']}</DBInstanceStatus>
+        <MasterUsername>{i['MasterUsername']}</MasterUsername>
+        <DBName>{i.get('DBName','')}</DBName>
+        <Endpoint>
+            <Address>{ep.get('Address','localhost')}</Address>
+            <Port>{ep.get('Port',5432)}</Port>
+            <HostedZoneId>{ep.get('HostedZoneId','Z2R2ITUGPM61AM')}</HostedZoneId>
+        </Endpoint>
+        <AllocatedStorage>{i['AllocatedStorage']}</AllocatedStorage>
+        <InstanceCreateTime>{i.get('InstanceCreateTime','')}</InstanceCreateTime>
+        <PreferredBackupWindow>{i.get('PreferredBackupWindow','03:00-04:00')}</PreferredBackupWindow>
+        <BackupRetentionPeriod>{i.get('BackupRetentionPeriod',1)}</BackupRetentionPeriod>
+        <DBSecurityGroups>{db_sg_xml}</DBSecurityGroups>
+        <VpcSecurityGroups>{vpc_sg_xml}</VpcSecurityGroups>
+        <DBParameterGroups>{param_xml}</DBParameterGroups>
+        <AvailabilityZone>{i.get('AvailabilityZone',f'{get_region()}a')}</AvailabilityZone>
+        <DBSubnetGroup>
+            <DBSubnetGroupName>{subnet.get('DBSubnetGroupName','default')}</DBSubnetGroupName>
+            <DBSubnetGroupDescription>{subnet.get('DBSubnetGroupDescription','')}</DBSubnetGroupDescription>
+            <VpcId>{subnet.get('VpcId','vpc-00000000')}</VpcId>
+            <SubnetGroupStatus>{subnet.get('SubnetGroupStatus','Complete')}</SubnetGroupStatus>
+            <Subnets>{subnet_xml}</Subnets>
+            <DBSubnetGroupArn>{subnet.get('DBSubnetGroupArn','')}</DBSubnetGroupArn>
+        </DBSubnetGroup>
+        <PreferredMaintenanceWindow>{i.get('PreferredMaintenanceWindow','sun:05:00-sun:06:00')}</PreferredMaintenanceWindow>
+        <PendingModifiedValues>{pending_xml}</PendingModifiedValues>
+        <LatestRestorableTime>{i.get('LatestRestorableTime') or _format_time(time.time())}</LatestRestorableTime>
+        <MultiAZ>{str(i.get('MultiAZ',False)).lower()}</MultiAZ>
+        <AutoMinorVersionUpgrade>{str(i.get('AutoMinorVersionUpgrade',True)).lower()}</AutoMinorVersionUpgrade>
+        <ReadReplicaDBInstanceIdentifiers>{read_replica_xml}</ReadReplicaDBInstanceIdentifiers>
+        <ReadReplicaSourceDBInstanceIdentifier>{i.get('ReadReplicaSourceDBInstanceIdentifier','')}</ReadReplicaSourceDBInstanceIdentifier>
+        <ReadReplicaDBClusterIdentifiers/>
+        <ReplicaMode>{i.get('ReplicaMode','')}</ReplicaMode>
+        <LicenseModel>{i.get('LicenseModel','general-public-license')}</LicenseModel>
+        {iops_xml}
+        <OptionGroupMemberships>{option_xml}</OptionGroupMemberships>
+        <PubliclyAccessible>{str(i.get('PubliclyAccessible',False)).lower()}</PubliclyAccessible>
+        <StatusInfos/>
+        <StorageType>{i.get('StorageType','gp2')}</StorageType>
+        <DbInstancePort>{i.get('DbInstancePort',0)}</DbInstancePort>
+        <DBClusterIdentifier>{i.get('DBClusterIdentifier','')}</DBClusterIdentifier>
+        <StorageEncrypted>{str(i.get('StorageEncrypted',False)).lower()}</StorageEncrypted>
+        <KmsKeyId>{i.get('KmsKeyId','')}</KmsKeyId>
+        <DbiResourceId>{i.get('DbiResourceId','')}</DbiResourceId>
+        <CACertificateIdentifier>{i.get('CACertificateIdentifier','rds-ca-rsa2048-g1')}</CACertificateIdentifier>
+        <DomainMemberships/>
+        <CopyTagsToSnapshot>{str(i.get('CopyTagsToSnapshot',False)).lower()}</CopyTagsToSnapshot>
+        <MonitoringInterval>{i.get('MonitoringInterval',0)}</MonitoringInterval>
+        <EnhancedMonitoringResourceArn>{i.get('EnhancedMonitoringResourceArn','')}</EnhancedMonitoringResourceArn>
+        <MonitoringRoleArn>{i.get('MonitoringRoleArn','')}</MonitoringRoleArn>
+        <PromotionTier>{i.get('PromotionTier',1)}</PromotionTier>
+        <DBInstanceArn>{i['DBInstanceArn']}</DBInstanceArn>
+        <IAMDatabaseAuthenticationEnabled>{str(i.get('IAMDatabaseAuthenticationEnabled',False)).lower()}</IAMDatabaseAuthenticationEnabled>
+        <PerformanceInsightsEnabled>{str(i.get('PerformanceInsightsEnabled',False)).lower()}</PerformanceInsightsEnabled>
+        <EnabledCloudwatchLogsExports/>
+        <ProcessorFeatures/>
+        <DeletionProtection>{str(i.get('DeletionProtection',False)).lower()}</DeletionProtection>
+        <AssociatedRoles/>
+        <MaxAllocatedStorage>{i.get('MaxAllocatedStorage',i.get('AllocatedStorage',20))}</MaxAllocatedStorage>
+        <TagList>{tag_xml}</TagList>
+        {cert_xml}
+        <CustomerOwnedIpEnabled>{str(i.get('CustomerOwnedIpEnabled',False)).lower()}</CustomerOwnedIpEnabled>
+        <BackupTarget>{i.get('BackupTarget','region')}</BackupTarget>
+        <NetworkType>{i.get('NetworkType','IPV4')}</NetworkType>
+        <StorageThroughput>{i.get('StorageThroughput',0)}</StorageThroughput>
+        <IsStorageConfigUpgradeAvailable>{str(i.get('IsStorageConfigUpgradeAvailable',False)).lower()}</IsStorageConfigUpgradeAvailable>"""
 
 
 def _format_time(ts):
