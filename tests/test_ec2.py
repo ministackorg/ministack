@@ -1093,11 +1093,13 @@ def test_ec2_describe_capacity_reservations(ec2):
     assert "CapacityReservations" in resp
 
 def test_ec2_describe_instance_types_defaults(ec2):
+    # No filter → the curated catalog of common current-generation families.
     resp = ec2.describe_instance_types()
     types = [t["InstanceType"] for t in resp["InstanceTypes"]]
-    assert "t2.micro" in types
     assert "t3.micro" in types
-    assert len(resp["InstanceTypes"]) >= 4
+    assert "m5.large" in types
+    assert "r6g.large" in types  # a Graviton/arm64 family must be present
+    assert len(resp["InstanceTypes"]) >= 50
     # Spot-check shape
     sample = resp["InstanceTypes"][0]
     assert "VCpuInfo" in sample
@@ -1106,9 +1108,117 @@ def test_ec2_describe_instance_types_defaults(ec2):
     assert sample["MemoryInfo"]["SizeInMiB"] >= 512
 
 def test_ec2_describe_instance_types_filter(ec2):
+    # m5.large is curated; t2.micro is uncurated → lenient fallback still returns it.
     resp = ec2.describe_instance_types(InstanceTypes=["t2.micro", "m5.large"])
     types = {t["InstanceType"] for t in resp["InstanceTypes"]}
     assert types == {"t2.micro", "m5.large"}
+
+
+def test_ec2_describe_instance_types_accurate_specs(ec2):
+    """Real AWS vCPU / memory / architecture — the values consumers score capacity
+    against. The previous heuristic reported e.g. m5.large as 8 vCPU / 4096 MiB."""
+    resp = ec2.describe_instance_types(
+        InstanceTypes=["m5.large", "c6i.xlarge", "t3.medium", "r6g.large"])
+    by_type = {t["InstanceType"]: t for t in resp["InstanceTypes"]}
+
+    assert by_type["m5.large"]["VCpuInfo"]["DefaultVCpus"] == 2
+    assert by_type["m5.large"]["MemoryInfo"]["SizeInMiB"] == 8192
+    assert by_type["m5.large"]["ProcessorInfo"]["SupportedArchitectures"] == ["x86_64"]
+
+    assert by_type["c6i.xlarge"]["VCpuInfo"]["DefaultVCpus"] == 4
+    assert by_type["c6i.xlarge"]["MemoryInfo"]["SizeInMiB"] == 8192
+
+    assert by_type["t3.medium"]["VCpuInfo"]["DefaultVCpus"] == 2
+    assert by_type["t3.medium"]["MemoryInfo"]["SizeInMiB"] == 4096
+
+    # Graviton must report arm64 — else an arm64-filtered consumer rejects it.
+    assert by_type["r6g.large"]["VCpuInfo"]["DefaultVCpus"] == 2
+    assert by_type["r6g.large"]["MemoryInfo"]["SizeInMiB"] == 16384
+    assert by_type["r6g.large"]["ProcessorInfo"]["SupportedArchitectures"] == ["arm64"]
+
+
+def test_ec2_describe_instance_types_arch_filter(ec2):
+    """processor-info.supported-architecture filter returns only matching types."""
+    resp = ec2.describe_instance_types(
+        Filters=[{"Name": "processor-info.supported-architecture", "Values": ["arm64"]}])
+    archs = {a for t in resp["InstanceTypes"]
+             for a in t["ProcessorInfo"]["SupportedArchitectures"]}
+    assert archs == {"arm64"}
+    fams = {t["InstanceType"].split(".")[0] for t in resp["InstanceTypes"]}
+    assert fams <= {"m6g", "c6g", "r6g"}
+
+
+def test_ec2_describe_instance_type_offerings_matches_azs(ec2):
+    """Offerings = instance types x AZs; locations line up with DescribeAvailabilityZones."""
+    azs = [z["ZoneName"] for z in ec2.describe_availability_zones()["AvailabilityZones"]]
+    resp = ec2.describe_instance_type_offerings(
+        Filters=[{"Name": "instance-type", "Values": ["m5.large"]}])
+    offerings = resp["InstanceTypeOfferings"]
+    assert {o["Location"] for o in offerings} == set(azs)
+    assert all(o["InstanceType"] == "m5.large" for o in offerings)
+    assert len(offerings) == len(azs)
+
+
+def test_ec2_describe_instance_type_offerings_region(ec2):
+    """LocationType=region collapses each type to a single region offering."""
+    resp = ec2.describe_instance_type_offerings(
+        LocationType="region",
+        Filters=[{"Name": "instance-type", "Values": ["c6g.large"]}])
+    offerings = resp["InstanceTypeOfferings"]
+    assert len(offerings) == 1
+    assert offerings[0]["LocationType"] == "region"
+    assert offerings[0]["InstanceType"] == "c6g.large"
+
+
+# ── Instance-type catalogue (direct, in-process unit tests of the data module) ──
+
+def test_ec2_instance_type_table_is_self_consistent():
+    """Every curated entry has a sane shape and matches its family's AWS memory
+    ratio — guards against a typo when a family is added or edited."""
+    from ministack.services._ec2_instance_types import INSTANCE_TYPES
+
+    ratio_mib_per_vcpu = {  # GiB/vCPU expressed in MiB
+        "m5": 4096, "m6i": 4096, "m6a": 4096, "m5n": 4096, "m6g": 4096,
+        "c6i": 2048, "c6a": 2048, "c6g": 2048, "c5": 2048,
+        "r5": 8192, "r6i": 8192, "r6g": 8192,
+    }
+    arm_families = {"m6g", "c6g", "r6g"}
+
+    assert len(INSTANCE_TYPES) >= 50
+    for itype, fact in INSTANCE_TYPES.items():
+        family = itype.split(".")[0]
+        assert fact["vcpus"] >= 1, itype
+        assert fact["mem_mib"] >= 512, itype
+        assert fact["net"], itype
+        # Graviton families are arm64; everything else is x86_64.
+        assert fact["arch"] == ("arm64" if family in arm_families else "x86_64"), itype
+        # Regular-ratio families: memory == vCPUs x family ratio. (t3/t3a are
+        # burstable and c5n carries extra memory — both curated, so excluded.)
+        if family in ratio_mib_per_vcpu:
+            assert fact["mem_mib"] == fact["vcpus"] * ratio_mib_per_vcpu[family], itype
+
+
+def test_ec2_instance_type_cores_and_threads():
+    from ministack.services._ec2_instance_types import cores_and_threads
+
+    # x86_64 = SMT-2 → cores = vCPUs / 2, 2 threads/core.
+    assert cores_and_threads(2, "x86_64") == (1, 2)
+    assert cores_and_threads(64, "x86_64") == (32, 2)
+    # Graviton = 1 thread/core → cores = vCPUs.
+    assert cores_and_threads(2, "arm64") == (2, 1)
+    assert cores_and_threads(64, "arm64") == (64, 1)
+
+
+def test_ec2_instance_type_known_specs():
+    """Lock representative published AWS specs (the values the heuristic got wrong)."""
+    from ministack.services._ec2_instance_types import INSTANCE_TYPES as it
+
+    assert (it["m5.large"]["vcpus"], it["m5.large"]["mem_mib"], it["m5.large"]["arch"]) == (2, 8192, "x86_64")
+    assert (it["c6i.xlarge"]["vcpus"], it["c6i.xlarge"]["mem_mib"]) == (4, 8192)
+    assert (it["r6g.large"]["vcpus"], it["r6g.large"]["mem_mib"], it["r6g.large"]["arch"]) == (2, 16384, "arm64")
+    assert it["t3.medium"]["mem_mib"] == 4096
+    assert it["c5n.large"]["mem_mib"] == 5376  # c5n's irregular per-vCPU memory
+    assert it["t3.micro"].get("burstable") is True
 
 def test_ec2_describe_vpc_attribute(ec2):
     vpc = ec2.create_vpc(CidrBlock="10.99.0.0/16")

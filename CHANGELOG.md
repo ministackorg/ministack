@@ -5,6 +5,13 @@ All notable changes to MiniStack will be documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+- **EC2 — `DescribeInstanceTypes` now returns real vCPU / memory / architecture, and `DescribeInstanceTypeOfferings` is implemented** — `DescribeInstanceTypes` previously synthesized values from a name heuristic (`vcpus = 2/4/8` by substring, `mem = 1024/2048/4096`), so it reported, e.g., `m5.large` as 8 vCPU / 4096 MiB (real: 2 vCPU / 8192 MiB), always advertised `x86_64` (so Graviton `m6g`/`c6g`/`r6g` came back as the wrong architecture), and covered only ~12 types. Karpenter queries these on every reconcile and silently scores a wrong-shaped instance as zero-capacity (or the wrong architecture) and drops it from the candidate set with no log line — so a wrong value is worse than a missing one. Both calls are now backed by a curated table of real AWS specs for the families Karpenter's defaults select (m5, m5n, m6i, m6a, c5, c5n, c6i, c6a, r5, r6i, plus Graviton m6g/c6g/r6g and burstable t3/t3a); `DescribeInstanceTypeOfferings` (previously unimplemented) returns the instance-type × availability-zone cross product so Karpenter can validate `EC2NodeClass` subnet AZs. Uncurated types fall back to a generic shape rather than erroring, so callers that probe arbitrary types are unaffected. Contributed by @b-rajesh.
+
+---
+
 ## [1.3.66] — 2026-06-22
 
 ### Added

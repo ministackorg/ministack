@@ -70,6 +70,7 @@ from xml.sax.saxutils import escape as _esc
 
 from ministack.core.persistence import PERSIST_STATE, load_state
 from ministack.core.responses import AccountScopedDict, get_account_id, get_region, new_uuid
+from ministack.services._ec2_instance_types import INSTANCE_TYPES, cores_and_threads
 
 logger = logging.getLogger("ec2")
 
@@ -4095,82 +4096,142 @@ def _describe_instance_attribute(p):
                 f"<instanceId>{instance_id}</instanceId>{value_xml}")
 
 
-def _describe_instance_types(p):
-    # Collect requested types
-    requested = _parse_member_list(p, "InstanceType")
-    # Common types Terraform provider v6+ queries
-    all_types = requested or [
-        "t2.micro", "t2.small", "t2.medium", "t2.large",
-        "t3.micro", "t3.small", "t3.medium", "t3.large",
-        "m5.large", "m5.xlarge", "c5.large", "c5.xlarge",
-    ]
-    items = ""
-    for itype in all_types:
-        family = itype.split(".")[0]
-        vcpus = 2 if "micro" in itype else 4 if "small" in itype else 8
-        mem_mib = 1024 if "micro" in itype else 2048 if "small" in itype else 4096
-        items += f"""<item>
-            <instanceType>{itype}</instanceType>
-            <currentGeneration>true</currentGeneration>
-            <freeTierEligible>{'true' if itype == 't2.micro' else 'false'}</freeTierEligible>
-            <supportedUsageClasses><item>on-demand</item><item>spot</item></supportedUsageClasses>
-            <supportedRootDeviceTypes><item>ebs</item></supportedRootDeviceTypes>
-            <supportedVirtualizationTypes><item>hvm</item></supportedVirtualizationTypes>
-            <bareMetal>false</bareMetal>
-            <hypervisor>xen</hypervisor>
-            <processorInfo>
-                <supportedArchitectures><item>x86_64</item></supportedArchitectures>
-                <sustainedClockSpeedInGhz>2.5</sustainedClockSpeedInGhz>
-            </processorInfo>
-            <vCpuInfo>
-                <defaultVCpus>{vcpus}</defaultVCpus>
-                <defaultCores>{vcpus}</defaultCores>
-                <defaultThreadsPerCore>1</defaultThreadsPerCore>
-            </vCpuInfo>
-            <memoryInfo><sizeInMiB>{mem_mib}</sizeInMiB></memoryInfo>
-            <instanceStorageSupported>false</instanceStorageSupported>
-            <ebsInfo>
-                <ebsOptimizedSupport>unsupported</ebsOptimizedSupport>
-                <encryptionSupport>supported</encryptionSupport>
-                <ebsOptimizedInfo>
-                    <baselineBandwidthInMbps>256</baselineBandwidthInMbps>
-                    <baselineThroughputInMBps>32.0</baselineThroughputInMBps>
-                    <baselineIops>2000</baselineIops>
-                    <maximumBandwidthInMbps>256</maximumBandwidthInMbps>
-                    <maximumThroughputInMBps>32.0</maximumThroughputInMBps>
-                    <maximumIops>2000</maximumIops>
-                </ebsOptimizedInfo>
-                <nvmeSupport>unsupported</nvmeSupport>
-            </ebsInfo>
-            <networkInfo>
-                <networkPerformance>Low to Moderate</networkPerformance>
-                <maximumNetworkInterfaces>2</maximumNetworkInterfaces>
-                <maximumNetworkCards>1</maximumNetworkCards>
-                <defaultNetworkCardIndex>0</defaultNetworkCardIndex>
-                <networkCards><item>
-                    <networkCardIndex>0</networkCardIndex>
-                    <networkPerformance>Low to Moderate</networkPerformance>
-                    <maximumNetworkInterfaces>2</maximumNetworkInterfaces>
-                    <baselineBandwidthInGbps>0.1</baselineBandwidthInGbps>
-                    <peakBandwidthInGbps>0.5</peakBandwidthInGbps>
-                </item></networkCards>
-                <ipv4AddressesPerInterface>2</ipv4AddressesPerInterface>
-                <ipv6AddressesPerInterface>2</ipv6AddressesPerInterface>
-                <ipv6Supported>true</ipv6Supported>
-                <enaSupport>required</enaSupport>
-                <efaSupported>false</efaSupported>
-            </networkInfo>
-            <placementGroupInfo>
-                <supportedStrategies><item>partition</item><item>spread</item></supportedStrategies>
-            </placementGroupInfo>
-            <hibernationSupported>false</hibernationSupported>
-            <burstablePerformanceSupported>{'true' if family in ('t2','t3','t4g') else 'false'}</burstablePerformanceSupported>
-            <dedicatedHostsSupported>false</dedicatedHostsSupported>
-            <autoRecoverySupported>true</autoRecoverySupported>
-        </item>"""
+def _eni_count(vcpus):
+    """Approximate maximum ENIs by size (AWS scales this per type; the exact
+    value matters only for max-pods density, not for capacity scoring)."""
+    if vcpus <= 2:
+        return 3
+    if vcpus <= 8:
+        return 4
+    if vcpus <= 16:
+        return 8
+    return 15
 
+
+def _instance_type_fact(itype):
+    """Curated facts for an instance type, or a best-effort generic for an
+    uncurated one.
+
+    Lenient by design: real AWS returns ``InvalidInstanceType`` for an unknown
+    type, but consumers (Terraform, ad-hoc probes) query arbitrary types and a
+    false negative in a describe path breaks more callers than a generic shape
+    does. The curated table covers the common current-generation families; the
+    generic fallback only keeps uncurated types from disappearing.
+    """
+    fact = INSTANCE_TYPES.get(itype)
+    if fact:
+        return fact
+    family = itype.split(".")[0]
+    arch = "arm64" if family.endswith("g") else "x86_64"
+    return {"vcpus": 2, "mem_mib": 4096, "arch": arch, "net": "Up to 10 Gigabit"}
+
+
+def _instance_type_item_xml(itype, fact):
+    arch = fact["arch"]
+    vcpus = fact["vcpus"]
+    cores, threads_per_core = cores_and_threads(vcpus, arch)
+    enis = _eni_count(vcpus)
+    burstable = "true" if fact.get("burstable") else "false"
+    return f"""<item>
+        <instanceType>{_esc(itype)}</instanceType>
+        <currentGeneration>true</currentGeneration>
+        <freeTierEligible>false</freeTierEligible>
+        <supportedUsageClasses><item>on-demand</item><item>spot</item></supportedUsageClasses>
+        <supportedRootDeviceTypes><item>ebs</item></supportedRootDeviceTypes>
+        <supportedVirtualizationTypes><item>hvm</item></supportedVirtualizationTypes>
+        <bareMetal>false</bareMetal>
+        <hypervisor>nitro</hypervisor>
+        <processorInfo>
+            <supportedArchitectures><item>{_esc(arch)}</item></supportedArchitectures>
+            <sustainedClockSpeedInGhz>2.5</sustainedClockSpeedInGhz>
+        </processorInfo>
+        <vCpuInfo>
+            <defaultVCpus>{vcpus}</defaultVCpus>
+            <defaultCores>{cores}</defaultCores>
+            <defaultThreadsPerCore>{threads_per_core}</defaultThreadsPerCore>
+        </vCpuInfo>
+        <memoryInfo><sizeInMiB>{fact["mem_mib"]}</sizeInMiB></memoryInfo>
+        <instanceStorageSupported>false</instanceStorageSupported>
+        <ebsInfo>
+            <ebsOptimizedSupport>default</ebsOptimizedSupport>
+            <encryptionSupport>supported</encryptionSupport>
+            <nvmeSupport>required</nvmeSupport>
+        </ebsInfo>
+        <networkInfo>
+            <networkPerformance>{_esc(fact["net"])}</networkPerformance>
+            <maximumNetworkInterfaces>{enis}</maximumNetworkInterfaces>
+            <maximumNetworkCards>1</maximumNetworkCards>
+            <defaultNetworkCardIndex>0</defaultNetworkCardIndex>
+            <ipv4AddressesPerInterface>{min(50, max(2, vcpus * 2))}</ipv4AddressesPerInterface>
+            <ipv6AddressesPerInterface>{min(50, max(2, vcpus * 2))}</ipv6AddressesPerInterface>
+            <ipv6Supported>true</ipv6Supported>
+            <enaSupport>required</enaSupport>
+            <efaSupported>false</efaSupported>
+        </networkInfo>
+        <placementGroupInfo>
+            <supportedStrategies><item>cluster</item><item>partition</item><item>spread</item></supportedStrategies>
+        </placementGroupInfo>
+        <hibernationSupported>false</hibernationSupported>
+        <burstablePerformanceSupported>{burstable}</burstablePerformanceSupported>
+        <dedicatedHostsSupported>true</dedicatedHostsSupported>
+        <autoRecoverySupported>true</autoRecoverySupported>
+    </item>"""
+
+
+def _describe_instance_types(p):
+    requested = _parse_member_list(p, "InstanceType")
+    filters = _parse_filters(p)
+    if requested:
+        types = requested
+    elif "instance-type" in filters:
+        types = filters["instance-type"]
+    else:
+        # No filter → return the full curated catalog (real AWS paginates ~700
+        # types; we return the common current-generation families).
+        types = sorted(INSTANCE_TYPES)
+    arch_filter = filters.get("processor-info.supported-architecture")
+    items = []
+    for itype in types:
+        fact = _instance_type_fact(itype)
+        if arch_filter and fact["arch"] not in arch_filter:
+            continue
+        items.append(_instance_type_item_xml(itype, fact))
     return _xml(200, "DescribeInstanceTypesResponse",
-                f"<instanceTypeSet>{items}</instanceTypeSet>")
+                f"<instanceTypeSet>{''.join(items)}</instanceTypeSet>")
+
+
+def _describe_instance_type_offerings(p):
+    """Cross product of instance types and locations (AZs by default).
+
+    Consumers check that an instance type is offered in a given AZ, so the
+    locations must line up with DescribeAvailabilityZones.
+    """
+    location_type = _p(p, "LocationType") or "availability-zone"
+    region = get_region()
+    if location_type == "region":
+        locations = [region]
+    elif location_type == "availability-zone-id":
+        locations = [f"{region[:3]}1-az{i}" for i in (1, 2, 3)]
+    else:
+        location_type = "availability-zone"
+        locations = [f"{region}{suffix}" for suffix in ("a", "b", "c")]
+
+    filters = _parse_filters(p)
+    if "location" in filters:
+        locations = [loc for loc in locations if loc in filters["location"]]
+    if "instance-type" in filters:
+        types = filters["instance-type"]
+    else:
+        types = sorted(INSTANCE_TYPES)
+
+    items = "".join(
+        f"<item><instanceType>{_esc(itype)}</instanceType>"
+        f"<locationType>{_esc(location_type)}</locationType>"
+        f"<location>{_esc(loc)}</location></item>"
+        for itype in types for loc in locations
+    )
+    return _xml(200, "DescribeInstanceTypeOfferingsResponse",
+                f"<instanceTypeOfferingSet>{items}</instanceTypeOfferingSet>")
 
 
 def _describe_instance_credit_specifications(p):
@@ -5130,6 +5191,7 @@ _ACTION_MAP = {
     "DescribeSpotInstanceRequests": _describe_spot_instance_requests,
     "DescribeCapacityReservations": _describe_capacity_reservations,
     "DescribeInstanceTypes": _describe_instance_types,
+    "DescribeInstanceTypeOfferings": _describe_instance_type_offerings,
     "TerminateInstances": _terminate_instances,
     "StopInstances": _stop_instances,
     "StartInstances": _start_instances,
