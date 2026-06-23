@@ -4,7 +4,9 @@ Query API (Action=...) — instances exist in memory only, no real VMs launched.
 
 Supports:
   Instances:       RunInstances, TerminateInstances, DescribeInstances,
-                   DescribeInstanceStatus, StartInstances, StopInstances, RebootInstances
+                   DescribeInstanceStatus, StartInstances, StopInstances, RebootInstances,
+                   AssociateIamInstanceProfile, DescribeIamInstanceProfileAssociations,
+                   DisassociateIamInstanceProfile, ReplaceIamInstanceProfileAssociation
   Images:          DescribeImages (stub — returns common AMI IDs)
   Security Groups: CreateSecurityGroup, DeleteSecurityGroup, DescribeSecurityGroups,
                    AuthorizeSecurityGroupIngress, RevokeSecurityGroupIngress,
@@ -104,6 +106,7 @@ _customer_gateways = AccountScopedDict()  # cgw_id -> customer gateway record
 _vpn_connections = AccountScopedDict()    # vpn_id -> VPN connection record
 _launch_templates = AccountScopedDict()   # lt_id -> launch template record (includes versions list)
 _fleets = AccountScopedDict()             # fleet_id -> fleet record
+_iam_instance_profile_associations = AccountScopedDict()  # assoc_id -> association record
 
 
 
@@ -136,6 +139,7 @@ def get_state():
         "vpn_connections": copy.deepcopy(_vpn_connections),
         "launch_templates": copy.deepcopy(_launch_templates),
         "fleets": copy.deepcopy(_fleets),
+        "iam_instance_profile_associations": copy.deepcopy(_iam_instance_profile_associations),
     }
 
 
@@ -166,6 +170,9 @@ def restore_state(data):
         _vpn_connections.update(data.get("vpn_connections", {}))
         _launch_templates.update(data.get("launch_templates", {}))
         _fleets.update(data.get("fleets", {}))
+        _iam_instance_profile_associations.update(
+            data.get("iam_instance_profile_associations", {})
+        )
 
 
 try:
@@ -299,6 +306,145 @@ async def handle_request(method, path, headers, body, query_params):
 # Instances
 # ---------------------------------------------------------------------------
 
+def _synthetic_iam_instance_profile_id(seed: str) -> str:
+    digest = hashlib.sha1(seed.encode("utf-8")).hexdigest().upper()[:17]
+    return "AIPA" + digest
+
+
+def _resolve_iam_instance_profile(iam_arn="", iam_name="", allow_missing=False):
+    if not iam_arn and not iam_name:
+        return None, None
+
+    profile = None
+    try:
+        from ministack.services import iam as iam_svc
+
+        profile = iam_svc._lookup_instance_profile(name=iam_name, arn=iam_arn)
+    except Exception:
+        logger.debug("IAM instance profile lookup failed", exc_info=True)
+
+    if profile:
+        return {
+            "Arn": profile["Arn"],
+            "Id": profile["InstanceProfileId"],
+        }, None
+
+    if not allow_missing:
+        if iam_name and not iam_arn:
+            msg = (
+                f"Value ({iam_name}) for parameter iamInstanceProfile.name is invalid. "
+                "Invalid IAM Instance Profile name"
+            )
+        elif iam_arn and not iam_name:
+            msg = (
+                f"Value ({iam_arn}) for parameter iamInstanceProfile.arn is invalid. "
+                "Invalid IAM Instance Profile ARN"
+            )
+        else:
+            msg = f"The IAM instance profile '{iam_name or iam_arn}' does not exist"
+        return None, _error("InvalidParameterValue", msg, 400)
+
+    if not iam_arn and iam_name:
+        iam_arn = f"arn:aws:iam::{get_account_id()}:instance-profile/{iam_name}"
+    seed = iam_arn or iam_name
+    return {
+        "Arn": iam_arn,
+        "Id": _synthetic_iam_instance_profile_id(seed),
+    }, None
+
+
+def _iam_instance_profile_association_id(instance_id, iam_profile):
+    seed = f"{instance_id}:{iam_profile.get('Arn', '')}:{iam_profile.get('Id', '')}"
+    return "iip-assoc-" + hashlib.sha1(seed.encode("utf-8")).hexdigest()[:17]
+
+
+def _find_active_iam_instance_profile_association(instance_id):
+    for assoc in _iam_instance_profile_associations.values():
+        if assoc.get("InstanceId") != instance_id:
+            continue
+        if assoc.get("State") == "associated":
+            return assoc
+    return None
+
+
+def _upsert_iam_instance_profile_association(
+    instance_id, iam_profile, association_id=None, state="associated"
+):
+    inst = _instances.get(instance_id)
+    if not inst:
+        return None
+
+    assoc_id = association_id or _iam_instance_profile_association_id(
+        instance_id, iam_profile
+    )
+    assoc = {
+        "AssociationId": assoc_id,
+        "InstanceId": instance_id,
+        "IamInstanceProfile": dict(iam_profile),
+        "State": state,
+        "Timestamp": _now_ts(),
+    }
+    _iam_instance_profile_associations[assoc_id] = assoc
+    inst["IamInstanceProfile"] = dict(iam_profile)
+    inst["IamInstanceProfileAssociationId"] = assoc_id
+    return assoc
+
+
+def _mark_iam_instance_profile_association_disassociated(assoc):
+    assoc["State"] = "disassociated"
+    assoc["Timestamp"] = _now_ts()
+    inst = _instances.get(assoc["InstanceId"])
+    if not inst:
+        return
+    if inst.get("IamInstanceProfileAssociationId") == assoc["AssociationId"]:
+        inst["IamInstanceProfile"] = None
+        inst.pop("IamInstanceProfileAssociationId", None)
+
+
+def _sync_iam_instance_profile_associations():
+    active_by_instance = {}
+    for assoc in _iam_instance_profile_associations.values():
+        inst = _instances.get(assoc["InstanceId"])
+        if assoc.get("State") != "associated":
+            continue
+        if not inst or inst["State"]["Name"] == "terminated":
+            _mark_iam_instance_profile_association_disassociated(assoc)
+            continue
+        if assoc["InstanceId"] in active_by_instance:
+            _mark_iam_instance_profile_association_disassociated(assoc)
+            continue
+        active_by_instance[assoc["InstanceId"]] = assoc
+        inst["IamInstanceProfile"] = dict(assoc["IamInstanceProfile"])
+        inst["IamInstanceProfileAssociationId"] = assoc["AssociationId"]
+
+    for inst in _instances.values():
+        if inst["State"]["Name"] == "terminated":
+            continue
+        iam_profile = inst.get("IamInstanceProfile")
+        if not iam_profile:
+            continue
+        if inst["InstanceId"] in active_by_instance:
+            continue
+        assoc = _upsert_iam_instance_profile_association(
+            inst["InstanceId"], iam_profile
+        )
+        active_by_instance[inst["InstanceId"]] = assoc
+
+
+def _matches_iam_instance_profile_association_filters(assoc, filters):
+    for name, vals in filters.items():
+        if name == "association-id":
+            if assoc["AssociationId"] not in vals:
+                return False
+        elif name == "instance-id":
+            if assoc["InstanceId"] not in vals:
+                return False
+        elif name == "state":
+            if assoc["State"] not in vals:
+                return False
+    return True
+
+
 def _launch_instances_internal(image_id, instance_type, subnet_id, count, key_name="", user_data="", sg_ids=None, requested_private_ip=None, iam_profile=None):
     now = _now_ts()
     if not sg_ids:
@@ -359,6 +505,7 @@ def _launch_instances_internal(image_id, instance_type, subnet_id, count, key_na
             "PublicIpAddress": _random_ip("54."),
             "PrivateDnsName": f"ip-{private_ip.replace('.', '-')}.ec2.internal",
             "PublicDnsName": f"ec2-{private_ip.replace('.', '-')}.compute-1.amazonaws.com",
+            "SourceDestCheck": True,
             "SecurityGroups": [
                 {"GroupId": sg, "GroupName": _security_groups.get(sg, {}).get("GroupName", sg)}
                 for sg in sg_ids
@@ -377,6 +524,8 @@ def _launch_instances_internal(image_id, instance_type, subnet_id, count, key_na
             "IamInstanceProfile": iam_profile,
         }
         _instances[instance_id] = inst
+        if iam_profile:
+            _upsert_iam_instance_profile_association(instance_id, iam_profile)
         created.append(inst)
     return created
 
@@ -404,12 +553,13 @@ def _run_instances(p):
     iam_name = _p(p, "IamInstanceProfile.Name")
     iam_profile = None
     if iam_arn or iam_name:
-        # Real AWS returns both Arn and Id. We synthesize a stable Id from the
-        # name/arn so DescribeInstances reads back as it does on AWS.
-        if not iam_arn and iam_name:
-            iam_arn = f"arn:aws:iam::{get_account_id()}:instance-profile/{iam_name}"
-        iam_id = "AIPA" + new_uuid().replace("-", "").upper()[:17]
-        iam_profile = {"Arn": iam_arn, "Id": iam_id}
+        iam_profile, err = _resolve_iam_instance_profile(
+            iam_arn=iam_arn,
+            iam_name=iam_name,
+            allow_missing=True,
+        )
+        if err:
+            return err
 
     created = _launch_instances_internal(
         image_id=image_id,
@@ -532,8 +682,143 @@ def _describe_instance_status(p):
                 f"<instanceStatusSet>{items}</instanceStatusSet>")
 
 
+def _associate_iam_instance_profile(p):
+    instance_id = _p(p, "InstanceId")
+    if instance_id not in _instances:
+        return _error(
+            "InvalidInstanceID.NotFound",
+            f"The instance ID '{instance_id}' does not exist",
+            400,
+        )
+
+    iam_profile, err = _resolve_iam_instance_profile(
+        iam_arn=_p(p, "IamInstanceProfile.Arn"),
+        iam_name=_p(p, "IamInstanceProfile.Name"),
+        allow_missing=False,
+    )
+    if err:
+        return err
+    if not iam_profile:
+        return _error("MissingParameter", "IamInstanceProfile is required", 400)
+
+    _sync_iam_instance_profile_associations()
+    assoc = _find_active_iam_instance_profile_association(instance_id)
+    if assoc:
+        if assoc.get("IamInstanceProfile") == iam_profile:
+            return _xml(
+                200,
+                "AssociateIamInstanceProfileResponse",
+                _iam_instance_profile_association_xml(
+                    assoc, tag="iamInstanceProfileAssociation"
+                ),
+            )
+        return _error(
+            "IncorrectState",
+            f"Instance '{instance_id}' already has an IAM instance profile association",
+            400,
+        )
+
+    assoc = _upsert_iam_instance_profile_association(instance_id, iam_profile)
+    return _xml(
+        200,
+        "AssociateIamInstanceProfileResponse",
+        _iam_instance_profile_association_xml(
+            assoc, tag="iamInstanceProfileAssociation"
+        ),
+    )
+
+
+def _describe_iam_instance_profile_associations(p):
+    _cleanup_terminated()
+    _sync_iam_instance_profile_associations()
+
+    association_ids = _parse_member_list(p, "AssociationId")
+    filters = _parse_filters(p)
+
+    items = []
+    for assoc in _iam_instance_profile_associations.values():
+        if association_ids and assoc["AssociationId"] not in association_ids:
+            continue
+        if not _matches_iam_instance_profile_association_filters(assoc, filters):
+            continue
+        items.append(_iam_instance_profile_association_xml(assoc))
+
+    return _xml(
+        200,
+        "DescribeIamInstanceProfileAssociationsResponse",
+        f"<iamInstanceProfileAssociationSet>{''.join(items)}</iamInstanceProfileAssociationSet>",
+    )
+
+
+def _disassociate_iam_instance_profile(p):
+    assoc_id = _p(p, "AssociationId")
+    _sync_iam_instance_profile_associations()
+    assoc = _iam_instance_profile_associations.get(assoc_id)
+    if not assoc:
+        return _error(
+            "InvalidAssociationID.NotFound",
+            f"Association '{assoc_id}' not found",
+            400,
+        )
+
+    _mark_iam_instance_profile_association_disassociated(assoc)
+    return _xml(
+        200,
+        "DisassociateIamInstanceProfileResponse",
+        _iam_instance_profile_association_xml(
+            assoc, tag="iamInstanceProfileAssociation"
+        ),
+    )
+
+
+def _replace_iam_instance_profile_association(p):
+    assoc_id = _p(p, "AssociationId")
+    _sync_iam_instance_profile_associations()
+    assoc = _iam_instance_profile_associations.get(assoc_id)
+    if not assoc:
+        return _error(
+            "InvalidAssociationID.NotFound",
+            f"Association '{assoc_id}' not found",
+            400,
+        )
+
+    instance_id = assoc["InstanceId"]
+    inst = _instances.get(instance_id)
+    if not inst or inst["State"]["Name"] == "terminated":
+        return _error(
+            "InvalidInstanceID.NotFound",
+            f"The instance ID '{instance_id}' does not exist",
+            400,
+        )
+
+    iam_profile, err = _resolve_iam_instance_profile(
+        iam_arn=_p(p, "IamInstanceProfile.Arn"),
+        iam_name=_p(p, "IamInstanceProfile.Name"),
+        allow_missing=False,
+    )
+    if err:
+        return err
+    if not iam_profile:
+        return _error("MissingParameter", "IamInstanceProfile is required", 400)
+
+    assoc = _upsert_iam_instance_profile_association(
+        instance_id,
+        iam_profile,
+        association_id=assoc_id,
+        state="associated",
+    )
+    return _xml(
+        200,
+        "ReplaceIamInstanceProfileAssociationResponse",
+        _iam_instance_profile_association_xml(
+            assoc, tag="iamInstanceProfileAssociation"
+        ),
+    )
+
+
 def _terminate_instances(p):
     ids = _parse_member_list(p, "InstanceId")
+    _sync_iam_instance_profile_associations()
     for iid in ids:
         if iid not in _instances:
             return _error("InvalidInstanceID.NotFound", f"The instance ID '{iid}' does not exist", 400)
@@ -544,6 +829,9 @@ def _terminate_instances(p):
             prev = inst["State"].copy()
             inst["State"] = {"Code": 48, "Name": "terminated"}
             inst["_terminated_at"] = time.time()
+            assoc = _find_active_iam_instance_profile_association(iid)
+            if assoc:
+                _mark_iam_instance_profile_association_disassociated(assoc)
             items += f"""<item>
                 <instanceId>{iid}</instanceId>
                 <previousState><code>{prev['Code']}</code><name>{prev['Name']}</name></previousState>
@@ -2301,6 +2589,7 @@ def _instance_xml(inst):
         <privateIpAddress>{inst['PrivateIpAddress']}</privateIpAddress>
         <publicDnsName>{inst['PublicDnsName']}</publicDnsName>
         <publicIpAddress>{inst['PublicIpAddress']}</publicIpAddress>
+        <sourceDestCheck>{'true' if inst.get('SourceDestCheck', True) else 'false'}</sourceDestCheck>
         <subnetId>{inst['SubnetId']}</subnetId>
         <vpcId>{inst['VpcId']}</vpcId>
         <architecture>{inst['Architecture']}</architecture>
@@ -2316,17 +2605,33 @@ def _instance_xml(inst):
     </item>"""
 
 
-def _inst_iam_xml(inst):
-    """Emit <iamInstanceProfile> block when an IAM profile is attached."""
-    iip = inst.get("IamInstanceProfile")
+def _iam_instance_profile_xml(iip, tag="iamInstanceProfile"):
     if not iip or not (iip.get("Arn") or iip.get("Id")):
         return ""
+    out = [f"<{tag}>"]
+    if iip.get("Arn"):
+        out.append(f"<arn>{_esc(iip['Arn'])}</arn>")
+    if iip.get("Id"):
+        out.append(f"<id>{_esc(iip['Id'])}</id>")
+    out.append(f"</{tag}>")
+    return "".join(out)
+
+
+def _iam_instance_profile_association_xml(assoc, tag="item"):
     return (
-        "<iamInstanceProfile>"
-        f"<arn>{_esc(iip.get('Arn', ''))}</arn>"
-        f"<id>{_esc(iip.get('Id', ''))}</id>"
-        "</iamInstanceProfile>"
+        f"<{tag}>"
+        f"<associationId>{_esc(assoc['AssociationId'])}</associationId>"
+        f"<instanceId>{_esc(assoc['InstanceId'])}</instanceId>"
+        f"{_iam_instance_profile_xml(assoc.get('IamInstanceProfile'), tag='iamInstanceProfile')}"
+        f"<state>{_esc(assoc['State'])}</state>"
+        f"<timestamp>{_esc(assoc['Timestamp'])}</timestamp>"
+        f"</{tag}>"
     )
+
+
+def _inst_iam_xml(inst):
+    """Emit <iamInstanceProfile> block when an IAM profile is attached."""
+    return _iam_instance_profile_xml(inst.get("IamInstanceProfile"))
 
 
 def _inst_bdm_xml(inst):
@@ -4047,6 +4352,7 @@ def reset():
     _vpn_connections.clear()
     _launch_templates.clear()
     _fleets.clear()
+    _iam_instance_profile_associations.clear()
     _init_defaults()
 
 
@@ -5058,10 +5364,11 @@ def _slot_from_lt_data(spec, lt_data):
     iam_arn = lt_iam.get("Arn")
     iam_name = lt_iam.get("Name")
     if iam_arn or iam_name:
-        if not iam_arn and iam_name:
-            iam_arn = f"arn:aws:iam::{get_account_id()}:instance-profile/{iam_name}"
-        iam_id = "AIPA" + new_uuid().replace("-", "").upper()[:17]
-        iam_profile = {"Arn": iam_arn, "Id": iam_id}
+        iam_profile, _ = _resolve_iam_instance_profile(
+            iam_arn=iam_arn,
+            iam_name=iam_name,
+            allow_missing=True,
+        )
     return {
         "spec": spec or {},
         "image_id": (lt_data or {}).get("ImageId") or "ami-00000000",
@@ -5134,6 +5441,10 @@ _ACTION_MAP = {
     "StopInstances": _stop_instances,
     "StartInstances": _start_instances,
     "RebootInstances": _reboot_instances,
+    "AssociateIamInstanceProfile": _associate_iam_instance_profile,
+    "DescribeIamInstanceProfileAssociations": _describe_iam_instance_profile_associations,
+    "DisassociateIamInstanceProfile": _disassociate_iam_instance_profile,
+    "ReplaceIamInstanceProfileAssociation": _replace_iam_instance_profile_association,
     "DescribeImages": _describe_images,
     "CreateSecurityGroup": _create_security_group,
     "DeleteSecurityGroup": _delete_security_group,
