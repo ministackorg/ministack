@@ -492,31 +492,7 @@ subnet = ec2.create_subnet(
 
 Unsupported resource types fail with `CREATE_FAILED` (or `ROLLBACK_COMPLETE` if rollback is enabled), so templates with unsupported types won't silently succeed.
 
-#### AWS SAM and CloudFormation transforms
-
-MiniStack accepts standard CloudFormation templates, but it does not run the AWS SAM transform service.
-That means templates that declare `Transform: AWS::Serverless-2016-10-31` are not expanded automatically.
-Resources such as `AWS::Serverless::Function`, `AWS::Serverless::Api`, and `AWS::Serverless::SimpleTable` are therefore treated as unsupported resource types.
-On deploy, those resources fail the stack instead of being converted into `AWS::Lambda::Function`, `AWS::ApiGateway::*`, `AWS::DynamoDB::Table`, and related resources.
-This differs from AWS, where CloudFormation invokes the SAM transform before resource creation.
-The limitation is only in the transform step; many of the raw resources that SAM generates are supported by MiniStack.
-Use SAM as a local build and packaging tool, then deploy the translated CloudFormation output to MiniStack.
-Run `sam build` first so function dependencies and artifacts are prepared under `.aws-sam/build/`.
-If your functions use local `CodeUri` paths, run `sam package` against `.aws-sam/build/template.yaml` so artifacts are uploaded to MiniStack S3.
-Point SAM packaging at MiniStack with the same endpoint and credentials you use for other AWS CLI commands.
-For example, create an artifacts bucket locally, then package with `--s3-bucket <bucket>` and `--endpoint-url http://localhost:4566` when your SAM CLI version supports it.
-After packaging, translate the packaged SAM template into plain CloudFormation before deploying.
-One practical workflow is to run `sam validate --debug --template-file .aws-sam/build/packaged.yaml` and capture the translated template emitted in the debug output.
-Deploy that translated template with `aws --endpoint-url=http://localhost:4566 cloudformation deploy`.
-Use the packaged template as the input to translation, not the build template, because the packaged template contains S3 object references that CloudFormation can read.
-Avoid deploying `.aws-sam/build/template.yaml` directly when it still points at local paths on your workstation.
-If translation output still contains any `AWS::Serverless::*` resources, MiniStack will reject them because the transform has not been fully applied.
-If translation output contains raw AWS resource types that MiniStack does not support yet, those resources will fail in the normal unsupported-resource path.
-For repeatable tests, keep the generated CloudFormation template as a build artifact or regenerate it in CI before calling `cloudformation deploy`.
-For small examples, you can also hand-convert SAM resources into their equivalent CloudFormation resources.
-When reporting SAM issues, include both the original SAM template and the translated CloudFormation template so maintainers can tell whether the failure is in transformation or resource support.
-Also include the exact `sam` and `aws` commands used, because endpoint and packaging options affect where Lambda artifacts are uploaded.
-If you only need Lambda plus API Gateway for a test, prefer the translated CloudFormation template in source control so teammates do not need to debug SAM transform behavior first.
+MiniStack does not currently support AWS SAM transforms; see the [IaC docs](https://ministack.org/docs/iac#sam) and [MiniStack MCP](https://github.com/ministackorg/ministack-mcp) for current guidance.
 
 ### Infrastructure Services
 
