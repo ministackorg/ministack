@@ -492,6 +492,8 @@ subnet = ec2.create_subnet(
 
 Unsupported resource types fail with `CREATE_FAILED` (or `ROLLBACK_COMPLETE` if rollback is enabled), so templates with unsupported types won't silently succeed.
 
+MiniStack does not currently support AWS SAM transforms; see the [IaC docs](https://ministack.org/docs/iac#sam) and [MiniStack MCP](https://github.com/ministackorg/ministack-mcp) for current guidance.
+
 ### Infrastructure Services
 
 | Service | Operations | Notes |
