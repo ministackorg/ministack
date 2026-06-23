@@ -1060,6 +1060,21 @@ def _get_access_key_last_used(p):
 
 # -------------------- Instance profiles --------------------
 
+def _lookup_instance_profile(name="", arn=""):
+    if name:
+        profile = _instance_profiles.get(name)
+        if not profile:
+            return None
+        if arn and profile.get("Arn") != arn:
+            return None
+        return profile
+    if arn:
+        for profile in _instance_profiles.values():
+            if profile.get("Arn") == arn:
+                return profile
+    return None
+
+
 def _create_instance_profile(p):
     name = _p(p, "InstanceProfileName")
     if name in _instance_profiles:
