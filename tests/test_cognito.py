@@ -26,6 +26,10 @@ def _identity_pool_arn(identity_pool_id, region="us-east-1", account="0000000000
     return f"arn:aws:cognito-identity:{region}:{account}:identitypool/{identity_pool_id}"
 
 
+def _user_pool_arn(user_pool_id, region="us-east-1", account="000000000000"):
+    return f"arn:aws:cognito-idp:{region}:{account}:userpool/{user_pool_id}"
+
+
 def test_cognito_create_and_describe_user_pool(cognito_idp):
     resp = cognito_idp.create_user_pool(PoolName="TestPool")
     pool = resp["UserPool"]
@@ -331,6 +335,37 @@ def test_cognito_tags(cognito_idp):
     cognito_idp.untag_resource(ResourceArn=arn, TagKeys=["project"])
     tags = cognito_idp.list_tags_for_resource(ResourceArn=arn)["Tags"]
     assert "project" not in tags
+
+
+def test_cognito_user_pool_tag_apis_reject_invalid_arns(cognito_idp):
+    pid = cognito_idp.create_user_pool(PoolName="InvalidIdpArnTagPool")["UserPool"]["Id"]
+    valid_arn = _user_pool_arn(pid)
+    invalid_cases = [
+        ("not-an-arn-but-long-enough", "InvalidParameterException"),
+        ("arn:aws:cognito-idp:us-east-1", "InvalidParameterException"),
+        (f"arn:aws:cognito-identity:us-east-1:000000000000:userpool/{pid}", "InvalidParameterException"),
+        (f"arn:aws:cognito-idp:us-east-1:000000000000:identitypool/{pid}", "InvalidParameterException"),
+        (_user_pool_arn(pid, region="us-west-2"), "ResourceNotFoundException"),
+        (_user_pool_arn(pid, account="111111111111"), "ResourceNotFoundException"),
+    ]
+
+    for bad_arn, expected_code in invalid_cases:
+        with pytest.raises(ClientError) as exc:
+            cognito_idp.tag_resource(ResourceArn=bad_arn, Tags={"bad": "value"})
+        assert exc.value.response["Error"]["Code"] == expected_code
+
+    assert cognito_idp.list_tags_for_resource(ResourceArn=valid_arn)["Tags"] == {}
+
+
+def test_cognito_user_pool_list_and_untag_reject_invalid_arns(cognito_idp):
+    for operation, kwargs in [
+        (cognito_idp.list_tags_for_resource, {}),
+        (cognito_idp.untag_resource, {"TagKeys": ["missing"]}),
+    ]:
+        with pytest.raises(ClientError) as exc:
+            operation(ResourceArn="arn:aws:sqs:us-east-1:000000000000:userpool/not-a-pool", **kwargs)
+        assert exc.value.response["Error"]["Code"] == "InvalidParameterException"
+
 
 def test_cognito_get_user_from_token(cognito_idp):
     pid = cognito_idp.create_user_pool(PoolName="GetUserPool")["UserPool"]["Id"]

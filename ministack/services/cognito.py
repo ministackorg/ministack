@@ -392,6 +392,28 @@ class _InvalidCognitoIdentityArn(ValueError):
     pass
 
 
+class _InvalidCognitoIdpArn(ValueError):
+    pass
+
+
+def _user_pool_id_from_arn(resource_arn: str) -> str | None:
+    try:
+        spec = parse_arn(resource_arn)
+    except ArnParseError as exc:
+        raise _InvalidCognitoIdpArn("Invalid Cognito IDP resource ARN.") from exc
+    if spec.service != "cognito-idp":
+        raise _InvalidCognitoIdpArn("Invalid Cognito IDP resource ARN.")
+    if spec.region != get_region() or spec.account_id != get_account_id():
+        return None
+    prefix = "userpool/"
+    if not spec.resource.startswith(prefix):
+        raise _InvalidCognitoIdpArn("Invalid Cognito IDP resource ARN.")
+    pool_id = spec.resource[len(prefix):]
+    if not pool_id:
+        raise _InvalidCognitoIdpArn("Invalid Cognito IDP resource ARN.")
+    return pool_id
+
+
 def _identity_pool_id_from_arn(resource_arn: str) -> str | None:
     try:
         spec = parse_arn(resource_arn)
@@ -3547,30 +3569,41 @@ def _verify_software_token(data):
 def _idp_tag_resource(data):
     arn = data.get("ResourceArn", "")
     tags = data.get("Tags", {})
-    # Find pool by ARN
-    for pool in _user_pools.values():
-        if pool["Arn"] == arn:
-            pool["UserPoolTags"].update(tags)
-            return json_response({})
+    try:
+        pid = _user_pool_id_from_arn(arn)
+    except _InvalidCognitoIdpArn as exc:
+        return error_response_json("InvalidParameterException", str(exc), 400)
+    pool = _user_pools.get(pid) if pid else None
+    if pool and pool.get("Arn") == arn:
+        pool["UserPoolTags"].update(tags)
+        return json_response({})
     return error_response_json("ResourceNotFoundException", f"Resource {arn} not found.", 400)
 
 
 def _idp_untag_resource(data):
     arn = data.get("ResourceArn", "")
     tag_keys = data.get("TagKeys", [])
-    for pool in _user_pools.values():
-        if pool["Arn"] == arn:
-            for k in tag_keys:
-                pool["UserPoolTags"].pop(k, None)
-            return json_response({})
+    try:
+        pid = _user_pool_id_from_arn(arn)
+    except _InvalidCognitoIdpArn as exc:
+        return error_response_json("InvalidParameterException", str(exc), 400)
+    pool = _user_pools.get(pid) if pid else None
+    if pool and pool.get("Arn") == arn:
+        for k in tag_keys:
+            pool["UserPoolTags"].pop(k, None)
+        return json_response({})
     return error_response_json("ResourceNotFoundException", f"Resource {arn} not found.", 400)
 
 
 def _idp_list_tags_for_resource(data):
     arn = data.get("ResourceArn", "")
-    for pool in _user_pools.values():
-        if pool["Arn"] == arn:
-            return json_response({"Tags": pool.get("UserPoolTags", {})})
+    try:
+        pid = _user_pool_id_from_arn(arn)
+    except _InvalidCognitoIdpArn as exc:
+        return error_response_json("InvalidParameterException", str(exc), 400)
+    pool = _user_pools.get(pid) if pid else None
+    if pool and pool.get("Arn") == arn:
+        return json_response({"Tags": pool.get("UserPoolTags", {})})
     return error_response_json("ResourceNotFoundException", f"Resource {arn} not found.", 400)
 
 
