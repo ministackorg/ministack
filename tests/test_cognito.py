@@ -2157,6 +2157,43 @@ def test_oauth2_token_authorization_code():
     assert resp['expires_in'] == 3600
 
 
+def test_oauth2_token_failed_client_auth_does_not_consume_code():
+    """A token request that fails client authentication must NOT consume the
+    single-use authorization code (#932). AWS rejects bad client auth without
+    invalidating the code, so a client that retries — HTTP Basic first, then
+    client_secret_post, as Vault/Go's oauth2 does — succeeds on the retry.
+    Consuming the code on the failed first attempt turned the retry into
+    invalid_grant 'Invalid or expired authorization code'."""
+    cognito_idp = make_client('cognito-idp')
+    pool_id, client = _setup_pool_with_user(cognito_idp)
+    client_id = client['ClientId']
+    client_secret = client['ClientSecret']
+    code = _do_login_and_get_code(cognito_idp, client_id)
+
+    # First exchange fails client auth (wrong secret) -> invalid_client.
+    status, _, body = _post_form(f'{ENDPOINT}/oauth2/token', {
+        'grant_type': 'authorization_code',
+        'code': code,
+        'redirect_uri': 'http://localhost:3000/callback',
+        'client_id': client_id,
+        'client_secret': 'wrong-secret',
+    })
+    assert status == 400, body
+    assert json.loads(body)['error'] == 'invalid_client'
+
+    # The code must survive the failed attempt: retry with the correct secret
+    # on the SAME code succeeds (would be invalid_grant before the fix).
+    status, _, body = _post_form(f'{ENDPOINT}/oauth2/token', {
+        'grant_type': 'authorization_code',
+        'code': code,
+        'redirect_uri': 'http://localhost:3000/callback',
+        'client_id': client_id,
+        'client_secret': client_secret,
+    })
+    assert status == 200, body
+    assert 'access_token' in json.loads(body)
+
+
 def test_oauth2_id_token_echoes_nonce():
     """OIDC requires the id_token to echo the nonce from the authorize request
     so clients can mitigate replay. Strict OIDC clients (oidc-client-ts,
