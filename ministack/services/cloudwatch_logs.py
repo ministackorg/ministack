@@ -52,7 +52,10 @@ _log_groups = AccountRegionScopedDict()
 #             firstEventTimestamp, lastEventTimestamp, lastIngestionTime}},
 # }
 
-_destinations = AccountScopedDict()
+# Region-scoped: CW Logs destinations and the vended-logs delivery resources
+# are region-specific in AWS (were account-only → leaked across regions). Each
+# carries an ARN, so legacy account-scoped state migrates to its ARN's region.
+_destinations = AccountRegionScopedDict()
 # dest_name -> {destinationName, targetArn, roleArn, accessPolicy, arn, creationTime}
 
 _metric_filters = AccountRegionScopedDict()
@@ -61,14 +64,14 @@ _metric_filters = AccountRegionScopedDict()
 _queries = AccountScopedDict()
 # query_id -> {queryId, logGroupName, startTime, endTime, queryString, status}
 
-_delivery_sources = AccountScopedDict()
+_delivery_sources = AccountRegionScopedDict()
 # source_name -> {name, arn, resourceArns: [str], logType, service, tags}
 
-_delivery_destinations = AccountScopedDict()
+_delivery_destinations = AccountRegionScopedDict()
 # dest_name -> {name, arn, deliveryDestinationType, outputFormat,
 #               deliveryDestinationConfiguration: {destinationResourceArn}, tags}
 
-_deliveries = AccountScopedDict()
+_deliveries = AccountRegionScopedDict()
 # delivery_id -> {id, arn, deliverySourceName, deliveryDestinationArn,
 #                 deliveryDestinationType, recordFields, fieldDelimiter,
 #                 s3DeliveryConfiguration, tags}

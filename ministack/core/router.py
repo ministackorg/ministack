@@ -965,22 +965,45 @@ def detect_service(method: str, path: str, headers: dict, query_params: dict) ->
     return "s3"
 
 
-def extract_region(headers: dict) -> str:
-    """Extract AWS region from the request."""
+def _credential_from_query(query_params) -> str:
+    """SigV4 query (presigned) auth carries the credential in the
+    ``X-Amz-Credential`` query param (``AKID/date/region/service/aws4_request``)
+    instead of the Authorization header. Return that value, or ''. ``query_params``
+    is a parse_qs-style dict ({name: [values]})."""
+    if not query_params:
+        return ""
+    cred = query_params.get("X-Amz-Credential") or query_params.get("x-amz-credential")
+    if isinstance(cred, (list, tuple)):
+        cred = cred[0] if cred else ""
+    return cred or ""
+
+
+def extract_region(headers: dict, query_params=None) -> str:
+    """Extract AWS region from the request (Authorization header, then SigV4
+    presigned ``X-Amz-Credential`` query param)."""
     auth = headers.get("authorization", "")
     match = re.search(r"Credential=[^/]+/[^/]+/([^/]+)/", auth)
     if match:
         return match.group(1)
+    cred = _credential_from_query(query_params)
+    if cred:
+        parts = cred.split("/")
+        if len(parts) >= 3 and parts[2]:
+            return parts[2]
     return os.environ.get("MINISTACK_REGION", "us-east-1")
 
 
-def extract_access_key_id(headers: dict) -> str:
-    """Extract the AWS access key ID from the Authorization header."""
+def extract_access_key_id(headers: dict, query_params=None) -> str:
+    """Extract the AWS access key ID from the Authorization header, then from
+    the SigV4 presigned ``X-Amz-Credential`` query param."""
     auth = headers.get("authorization", "")
     if auth:
         match = re.search(r"Credential=([^/]+)/", auth)
         if match:
             return match.group(1)
+    cred = _credential_from_query(query_params)
+    if cred:
+        return cred.split("/")[0]
     return ""
 
 

@@ -424,7 +424,7 @@ def restore_state(data):
                 region = _region_from_function_record(func)
                 _functions._data[(get_account_id(), region, name)] = func
         _layers.update(data.get("layers", {}))
-        _esms.update(data.get("esms", {}))
+        _restore_esms(data.get("esms", {}))
         _function_urls.update(data.get("function_urls", {}))
         _restore_esm_positions(_kinesis_positions, data.get("kinesis_positions", {}))
         _restore_esm_positions(_dynamodb_stream_positions, data.get("dynamodb_stream_positions", {}))
@@ -441,6 +441,39 @@ def _region_from_function_record(func: dict) -> str:
         except ArnParseError:
             pass
     return get_region()
+
+
+def _esm_region_from_record(rec: dict) -> str:
+    """An ESM belongs to its function's region. Derive region from FunctionArn,
+    NOT from the generic first-ARN field — the latter is the EventSourceArn (the
+    source ARN), so legacy migration would file the ESM (and, via esm_scopes,
+    its stream offsets) under the source's region. With region-scoped DynamoDB
+    (B7) that misfiling makes the stream poller miss the table and replay the
+    backlog (U3)."""
+    arn = rec.get("FunctionArn") or ""
+    if arn:
+        try:
+            _account_id, region = _lambda_function_account_region_from_arn(arn)
+            return region
+        except ArnParseError:
+            pass
+    return get_region()
+
+
+def _restore_esms(esms) -> None:
+    """Restore event-source mappings, deriving each record's region from its
+    function (see _esm_region_from_record). New-format state already carries the
+    region; only legacy account-scoped / plain-dict state needs derivation."""
+    if isinstance(esms, AccountRegionScopedDict):
+        _esms._data.update(esms._data)
+        return
+    if isinstance(esms, AccountScopedDict):
+        for (account_id, esm_id), rec in esms._data.items():
+            _esms._data[(account_id, _esm_region_from_record(rec), esm_id)] = rec
+        return
+    if isinstance(esms, dict):
+        for esm_id, rec in esms.items():
+            _esms._data[(get_account_id(), _esm_region_from_record(rec), esm_id)] = rec
 
 
 def _restore_esm_positions(store: AccountRegionScopedDict, positions) -> None:

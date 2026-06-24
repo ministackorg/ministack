@@ -98,6 +98,30 @@ def test_apigw_get_apis(apigw):
     assert "list-api-a" in names
     assert "list-api-b" in names
 
+
+def test_apigw_apis_are_region_isolated():
+    """apigw-v2 APIs are region-specific: GetApi/GetApis must not surface an API
+    owned by another region (the execute path already enforces this)."""
+    import boto3
+    from botocore.config import Config
+
+    def cli(r):
+        return boto3.client(
+            "apigatewayv2", endpoint_url=_endpoint,
+            aws_access_key_id="test", aws_secret_access_key="test",
+            region_name=r, config=Config(region_name=r),
+        )
+
+    east, west = cli("us-east-1"), cli("us-west-2")
+    name = f"region-iso-{_uuid_mod.uuid4().hex[:8]}"
+    api_id = east.create_api(Name=name, ProtocolType="HTTP")["ApiId"]
+    assert any(a["ApiId"] == api_id for a in east.get_apis()["Items"])
+    assert all(a["ApiId"] != api_id for a in west.get_apis()["Items"])
+    with pytest.raises(ClientError) as e:
+        west.get_api(ApiId=api_id)
+    assert e.value.response["Error"]["Code"] == "NotFoundException"
+
+
 def test_apigw_update_api(apigw):
     api_id = apigw.create_api(Name="update-api-before", ProtocolType="HTTP")["ApiId"]
     apigw.update_api(ApiId=api_id, Name="update-api-after")

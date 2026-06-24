@@ -6702,7 +6702,7 @@ def test_lambda_durable_restore_rebuilds_callback_index_and_rearms_timers():
         # Heap must have at least one entry for this arn at or before the
         # earliest deadline (the WAIT at now+60).
         with _ld._resume_lock:
-            entries = [(t, a) for (t, a, _acct) in _ld._resume_queue if a == arn]
+            entries = [(t, a) for (t, a, _acct, _region) in _ld._resume_queue if a == arn]
         assert entries, "no resume entry queued after restore"
         assert min(t for t, _ in entries) <= now + 60 + 1
         # And Send*Callback resolves the restored callback (no 404).
@@ -7121,3 +7121,43 @@ def test_lambda_local_executor_site_packages_layer(lam):
     payload = json.loads(resp["Payload"].read())
     assert payload["sp"] == "sp-ok"
     assert payload["pth"] == "pth-ok"
+
+
+def test_lambda_durable_resume_captures_region_and_account():
+    """B1: schedule_resume must capture the caller's account+region into the
+    resume queue so the background resume thread (which has no request
+    contextvars) re-establishes the right tenant scope. Without it, durable
+    executions in a non-default region/account never resume. In-process."""
+    from ministack.services import lambda_durable as d
+    from ministack.core.responses import _request_account_id, _request_region
+
+    tok_a = _request_account_id.set("111111111111")
+    tok_r = _request_region.set("eu-west-1")
+    saved = list(d._resume_queue)
+    arn = "arn:aws:lambda:eu-west-1:111111111111:function:durfn/exec/abc123"
+    try:
+        d._resume_queue.clear()
+        d._executions[arn] = {
+            "DurableExecutionArn": arn,
+            "FunctionArn": "arn:aws:lambda:eu-west-1:111111111111:function:durfn",
+            "Status": "RUNNING",
+            "InputPayload": "{}",
+            "CheckpointToken": "tok",
+            "Operations": [{
+                "Type": "WAIT", "Status": "STARTED",
+                "WaitDetails": {"ScheduledEndTimestamp": d._now() + 3600},
+            }],
+            "History": [],
+            "NextEventId": 1,
+        }
+        assert d.schedule_resume(arn) is True
+        when, q_arn, acct, region = d._resume_queue[0]
+        assert q_arn == arn
+        assert acct == "111111111111"
+        assert region == "eu-west-1"
+    finally:
+        d._resume_queue.clear()
+        d._resume_queue.extend(saved)
+        d._executions._data.pop(("111111111111", arn), None)
+        _request_account_id.reset(tok_a)
+        _request_region.reset(tok_r)

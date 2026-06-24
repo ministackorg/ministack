@@ -949,3 +949,57 @@ def test_module_cold_import_with_typical_snapshot_does_not_log_restore_failure(
         "the import-time `load_state` block (see ECS `_attributes` "
         "or ACM `_synthetic_pem` for the canonical fix)."
     )
+
+
+def test_legacy_unwrapped_state_file_loads_and_migrates_region(monkeypatch, tmp_path):
+    """U4: a pre-version-stamp on-disk file (no wrapper, account-scoped) must
+    load through the real load_state() disk path and migrate into a region-
+    scoped store, recovering region from a value ARN. Prior tests only seeded
+    dicts in memory, so this disk->migrate path was never exercised."""
+    import json as _json
+
+    from ministack.core.responses import (
+        AccountRegionScopedDict,
+        AccountScopedDict,
+        set_request_region,
+    )
+
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+
+    legacy = AccountScopedDict()
+    legacy._data[("000000000000", "res-1")] = {
+        "Arn": "arn:aws:appconfig:eu-west-1:000000000000:application/res-1",
+    }
+    # Write a legacy (unwrapped, implicit-v1) file exactly as old MiniStack did.
+    with open(tmp_path / "demo.json", "w") as f:
+        _json.dump({"store": legacy}, f, default=persistence._json_default)
+
+    loaded = persistence.load_state("demo")
+    assert isinstance(loaded["store"], AccountScopedDict)
+
+    region_store = AccountRegionScopedDict()
+    region_store.update(loaded["store"])
+    set_request_region("eu-west-1")
+    assert region_store["res-1"]["Arn"].startswith("arn:aws:appconfig:eu-west-1")
+
+
+def test_state_format_version_stamp_round_trips_and_refuses_newer(monkeypatch, tmp_path):
+    """U4: save_state stamps the on-disk format version and load_state unwraps
+    it; a file written by a NEWER binary is refused rather than mis-parsed."""
+    import json as _json
+
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+
+    persistence.save_state("ver", {"k": "v"})
+    raw = _json.loads((tmp_path / "ver.json").read_text())
+    assert raw["__ministack_format__"] == persistence.STATE_FORMAT_VERSION
+    assert raw["payload"] == {"k": "v"}
+    assert persistence.load_state("ver") == {"k": "v"}
+
+    (tmp_path / "future.json").write_text(_json.dumps({
+        "__ministack_format__": persistence.STATE_FORMAT_VERSION + 1,
+        "payload": {"k": "v"},
+    }))
+    assert persistence.load_state("future") is None

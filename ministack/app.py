@@ -1676,6 +1676,18 @@ async def app(scope, receive, send):
                 ws_headers[name.decode("latin-1").lower()] = value.decode("utf-8")
             except UnicodeDecodeError:
                 ws_headers[name.decode("latin-1").lower()] = value.decode("latin-1")
+        # WebSocket connect URLs are SigV4-presigned (credentials in query
+        # params, not the header). Set the request's tenant scope so
+        # account/region-scoped lookups resolve under the caller rather than the
+        # default — the WS entry path never did this before.
+        ws_query = parse_qs(
+            scope.get("query_string", b"").decode("utf-8", errors="replace"),
+            keep_blank_values=True,
+        )
+        _ws_key = extract_access_key_id(ws_headers, ws_query)
+        if _ws_key:
+            set_request_account_id(_ws_key)
+        set_request_region(extract_region(ws_headers, ws_query))
         ws_host = ws_headers.get("host", "")
         ws_path = scope.get("path", "")
         parsed = _parse_execute_api_url(ws_host, ws_path)
@@ -1738,14 +1750,15 @@ async def app(scope, receive, send):
 
     # Set per-request account ID from credentials (multi-tenancy support).
     # If the access key is a 12-digit number, it becomes the account ID.
-    _access_key = extract_access_key_id(headers)
+    _access_key = extract_access_key_id(headers, query_params)
     if _access_key:
         set_request_account_id(_access_key)
 
     # Set per-request region from SigV4 Credential scope so CFN's AWS::Region
     # pseudo-param and ARN-building use the caller's region, not MINISTACK_REGION
-    # (issue #398). Falls back to MINISTACK_REGION env.
-    set_request_region(extract_region(headers))
+    # (issue #398). Falls back to MINISTACK_REGION env. Presigned (SigV4 query)
+    # requests carry the credential in query params, not the header.
+    set_request_region(extract_region(headers, query_params))
 
     if await _send_if_handled(send, await _handle_pre_body_request(method, path, headers, query_params, request_id)):
         return

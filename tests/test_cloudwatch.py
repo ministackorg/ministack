@@ -251,6 +251,30 @@ def test_cloudwatch_tags_v2(cw):
     assert any(t["Key"] == "team" for t in resp2["Tags"])
 
 
+def test_cloudwatch_alarms_are_region_isolated(cw):
+    """Alarms are region-specific: DescribeAlarms in another region must not
+    list an alarm created here (was account-scoped, so it leaked across regions)."""
+    import uuid as _uuid
+
+    import boto3
+    from conftest import ENDPOINT
+
+    name = f"region-iso-alarm-{_uuid.uuid4().hex[:8]}"
+    cw.put_metric_alarm(
+        AlarmName=name, MetricName="M", Namespace="N", Statistic="Sum",
+        Period=60, EvaluationPeriods=1, Threshold=1.0,
+        ComparisonOperator="GreaterThanThreshold",
+    )
+    west = boto3.client(
+        "cloudwatch", endpoint_url=ENDPOINT, region_name="us-west-2",
+        aws_access_key_id="test", aws_secret_access_key="test",
+    )
+    east_names = [a["AlarmName"] for a in cw.describe_alarms(AlarmNames=[name])["MetricAlarms"]]
+    west_names = [a["AlarmName"] for a in west.describe_alarms()["MetricAlarms"]]
+    assert name in east_names
+    assert name not in west_names
+
+
 def test_cloudwatch_tags_reject_wrong_region_alarm_arn(cw):
     import boto3
     from conftest import ENDPOINT

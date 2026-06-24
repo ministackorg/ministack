@@ -1211,13 +1211,20 @@ def _create_api(data):
 
 def _get_api(api_id):
     api = _apis.get(api_id)
-    if not api:
+    # APIs are region-specific; an API owned by another region must not be
+    # visible from this one (the execute path already enforces this — keep the
+    # control plane consistent).
+    if not api or _api_regions.get(api_id, get_region()) != get_region():
         return _apigw_error("NotFoundException", f"API {api_id} not found", 404)
     return _apigw_response(api)
 
 
 def _get_apis():
-    return _apigw_response({"items": list(_apis.values())})
+    items = [
+        api for api_id, api in _apis.items()
+        if _api_regions.get(api_id, get_region()) == get_region()
+    ]
+    return _apigw_response({"items": items})
 
 
 def _delete_api(api_id):

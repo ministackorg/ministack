@@ -33,14 +33,17 @@ TWO_WEEKS_SECONDS = 14 * 24 * 3600
 # dims_key) via AccountRegionScopedDict so regional CloudWatch clients do not
 # see metrics emitted in another AWS region.
 _metrics = AccountRegionScopedDict()
-_alarms = AccountScopedDict()
-_composite_alarms = AccountScopedDict()
-# Alarm state-change history, per-account. Stored as AccountScopedDict under
-# a single key "entries" so the standard list manipulation still applies to
-# the caller's tenant only.
-_alarm_history = AccountScopedDict()
-_resource_tags = AccountScopedDict()
-_dashboards = AccountScopedDict()  # dashboard_name -> {DashboardName, DashboardBody, LastModified}
+# Alarms and dashboards are region-specific in AWS — region-scope them so a
+# client in one region can't see/collide with another region's resources.
+# Alarms/composite alarms migrate region from their AlarmArn on legacy load;
+# dashboards/history have no ARN so legacy data lands in the default region.
+_alarms = AccountRegionScopedDict()
+_composite_alarms = AccountRegionScopedDict()
+# Alarm state-change history, per-account+region. Stored under a single key
+# "entries" so the standard list manipulation still applies to the caller's scope.
+_alarm_history = AccountRegionScopedDict()
+_resource_tags = AccountScopedDict()  # ARN-keyed; region is in the ARN
+_dashboards = AccountRegionScopedDict()  # dashboard_name -> {DashboardName, DashboardBody, LastModified}
 
 
 def _metric_bucket(key: tuple) -> list:

@@ -52,6 +52,34 @@ def test_dynamodb_basic(ddb):
     resp = ddb.get_item(TableName="TestTable1", Key={"pk": {"S": "key1"}})
     assert "Item" not in resp
 
+
+def test_dynamodb_tables_are_region_isolated_by_name(ddb):
+    """A table created in one region must not be visible by name from another
+    region (B7): tables are region-specific in AWS. Reconciles the old
+    contradiction where name lookups were region-agnostic while ARN ops
+    enforced the request region."""
+    east = _ddb_client("us-east-1")
+    west = _ddb_client("us-west-2")
+    name = f"region-iso-{_uuid_mod.uuid4().hex[:8]}"
+    east.create_table(
+        TableName=name,
+        KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+        AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "S"}],
+        BillingMode="PAY_PER_REQUEST",
+    )
+    try:
+        assert ":us-east-1:" in east.describe_table(TableName=name)["Table"]["TableArn"]
+        assert name not in west.list_tables()["TableNames"]
+        assert name in east.list_tables()["TableNames"]
+        with pytest.raises(ClientError) as e:
+            west.describe_table(TableName=name)
+        assert e.value.response["Error"]["Code"] == "ResourceNotFoundException"
+    finally:
+        try:
+            east.delete_table(TableName=name)
+        except ClientError:
+            pass
+
 def test_dynamodb_scan(ddb):
     try:
         ddb.delete_table(TableName="ScanTable")

@@ -26,9 +26,13 @@ import time
 import uuid
 from urllib.parse import unquote
 
+import contextvars
+
 from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountScopedDict,
+    _request_account_id,
+    _request_region,
     error_response_json,
     get_account_id,
     get_region,
@@ -406,6 +410,11 @@ def _fire_chained_invoke(parent_rec: dict, op_id: str, ci_opts: dict,
     tenant_id = ci_opts.get("TenantId")
 
     def _run():
+        # A ChainedInvoke may target a specific tenant; ministack scopes tenants
+        # by account id, so honour TenantId by switching the account for this
+        # child invocation (region stays the parent's, from the copied context).
+        if tenant_id:
+            _request_account_id.set(tenant_id)
         try:
             event_str = payload or "{}"
             try:
@@ -439,7 +448,12 @@ def _fire_chained_invoke(parent_rec: dict, op_id: str, ci_opts: dict,
                                         "ErrorMessage": str(exc),
                                         "StackTrace": []})
 
-    threading.Thread(target=_run, daemon=True, name=f"chained-invoke-{op_id}").start()
+    # Capture the caller's tenant scope (account + region); contextvars are not
+    # inherited by a bare Thread, so the child's _functions lookup would
+    # otherwise resolve in the default scope (B1).
+    ctx = contextvars.copy_context()
+    threading.Thread(target=lambda: ctx.run(_run), daemon=True,
+                     name=f"chained-invoke-{op_id}").start()
 
 
 def _append_chained_result(parent_rec: dict, op_id: str, success: bool,
@@ -1114,7 +1128,8 @@ def _next_expiry(rec: dict) -> float | None:
     return soonest
 
 
-def schedule_resume(arn: str, account_id: str | None = None) -> bool:
+def schedule_resume(arn: str, account_id: str | None = None,
+                    region: str | None = None) -> bool:
     """Inspect the execution's operations log; if any WAIT or CALLBACK op
     has a pending expiry, enqueue a re-invocation at the earliest one. Also
     fires immediately when a callback has already been resolved externally
@@ -1135,8 +1150,14 @@ def schedule_resume(arn: str, account_id: str | None = None) -> bool:
     when = _now() if expiry is None else expiry
     if has_resolved_callback:
         when = min(when, _now())
+    # Capture the caller's tenant scope. The resume thread has no request
+    # contextvars, and both _executions (account-scoped) and _functions
+    # (account+region-scoped) lookups would otherwise fall back to the default
+    # scope — durable functions in a non-default region/account never resume (B1).
+    account_id = account_id or get_account_id()
+    region = region or get_region()
     with _resume_lock:
-        heapq.heappush(_resume_queue, (when, arn, account_id or "000000000000"))
+        heapq.heappush(_resume_queue, (when, arn, account_id, region))
     _resume_event.set()
     _ensure_resume_thread()
     return True
@@ -1171,17 +1192,25 @@ def _resume_loop() -> None:
         with _resume_lock:
             if not _resume_queue or _resume_queue[0] != head:
                 continue
-            _, arn, account_id = heapq.heappop(_resume_queue)
+            _, arn, account_id, region = heapq.heappop(_resume_queue)
+        # Re-establish the execution's tenant scope before touching account- or
+        # region-scoped state (contextvars don't cross the thread boundary).
+        tok_a = _request_account_id.set(account_id)
+        tok_r = _request_region.set(region)
         try:
-            _resume_execution(arn)
+            _resume_execution(arn, account_id, region)
         except Exception:
             import logging
             logging.getLogger(__name__).exception(
                 "Failed to resume durable execution %s", arn,
             )
+        finally:
+            _request_account_id.reset(tok_a)
+            _request_region.reset(tok_r)
 
 
-def _resume_execution(arn: str) -> None:
+def _resume_execution(arn: str, account_id: str = "000000000000",
+                      region: str | None = None) -> None:
     """Settle elapsed timers (WAIT expiries, CALLBACK heartbeat/timeout
     deadlines) then re-invoke the function so the SDK picks up where it
     left off. When called with a stale heap entry (heartbeat pushed the
@@ -1253,7 +1282,10 @@ def _resume_execution(arn: str) -> None:
         expiry = _next_expiry(rec)
         if expiry is not None:
             with _resume_lock:
-                heapq.heappush(_resume_queue, (expiry, arn, "000000000000"))
+                heapq.heappush(
+                    _resume_queue,
+                    (expiry, arn, account_id, region or get_region()),
+                )
             _resume_event.set()
         return
     # Mark externally-resolved callbacks as replayed so the next schedule_resume

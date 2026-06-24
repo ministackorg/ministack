@@ -26,6 +26,7 @@ from decimal import Decimal, InvalidOperation
 
 from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.responses import (
+    AccountRegionScopedDict,
     AccountScopedDict,
     error_response_json,
     get_account_id,
@@ -68,7 +69,11 @@ _IMPORT_COMPLETE_AFTER_SEC = float(os.environ.get("MINISTACK_DDB_IMPORT_COMPLETE
 
 from ministack.core.persistence import PERSIST_STATE, load_state
 
-_tables = AccountScopedDict()
+# Region-scoped: DynamoDB tables are region-specific in AWS. Account-only
+# keying made name lookups find cross-region tables while ARN ops (which
+# validate spec.region == request region) rejected them — a self-contradiction
+# (B7). Legacy account-scoped persistence migrates via the table's TableArn.
+_tables = AccountRegionScopedDict()
 _tags = AccountScopedDict()
 _ttl_settings = AccountScopedDict()
 _pitr_settings = AccountScopedDict()

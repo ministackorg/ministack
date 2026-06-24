@@ -423,6 +423,36 @@ def test_logs_put_destination(logs):
     logs.delete_destination(destinationName=dest_name)
 
 
+def test_logs_destinations_are_region_isolated():
+    """CW Logs destinations are region-specific: DescribeDestinations in another
+    region must not list one created here (was account-scoped, so it leaked)."""
+    import boto3
+    from botocore.config import Config
+
+    def cli(r):
+        return boto3.client(
+            "logs", endpoint_url=_endpoint,
+            aws_access_key_id="test", aws_secret_access_key="test",
+            region_name=r, config=Config(region_name=r),
+        )
+
+    east, west = cli("us-east-1"), cli("us-west-2")
+    uid = _uuid_mod.uuid4().hex[:8]
+    name = f"region-iso-dest-{uid}"
+    east.put_destination(
+        destinationName=name,
+        targetArn=f"arn:aws:kinesis:us-east-1:000000000000:stream/s-{uid}",
+        roleArn=f"arn:aws:iam::000000000000:role/r-{uid}",
+    )
+    try:
+        east_names = [d["destinationName"] for d in east.describe_destinations()["destinations"]]
+        west_names = [d["destinationName"] for d in west.describe_destinations()["destinations"]]
+        assert name in east_names
+        assert name not in west_names
+    finally:
+        east.delete_destination(destinationName=name)
+
+
 def test_logs_delete_destination(logs):
     """DeleteDestination removes a destination; deleting again raises ResourceNotFoundException."""
     uid = _uuid_mod.uuid4().hex[:8]
