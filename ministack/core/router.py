@@ -10,6 +10,9 @@ Routes incoming requests to the correct service handler based on:
 import logging
 import os
 import re
+from urllib.parse import unquote
+
+from ministack.core.arn import ArnParseError, parse_arn
 
 logger = logging.getLogger("ministack")
 
@@ -477,13 +480,33 @@ def detect_service(method: str, path: str, headers: dict, query_params: dict) ->
                     or (method == "POST" and re.match(r"^/flows/[^/]+/aliases/[^/]+$", path))
                     or re.match(r"^/knowledgebases/[^/]+/retrieve$", path)):
                     return "bedrock-agent-runtime"
+                if path.startswith("/tags/"):
+                    decoded_path = unquote(path)
+                    tag_arn = decoded_path.removeprefix("/tags/")
+                    try:
+                        tag_spec = parse_arn(tag_arn)
+                    except ArnParseError:
+                        return "bedrock-agent-runtime"
+                    if tag_spec.service != "bedrock":
+                        return "bedrock-agent-runtime"
+                    if (":session/" in decoded_path
+                        or tag_spec.resource == "session"
+                        or tag_spec.resource.startswith("session/")
+                        or tag_spec.resource.startswith("session:")
+                        or (":flow/" in decoded_path
+                            and "/aliases/" in decoded_path
+                            and "/executions/" in decoded_path)
+                        or (tag_spec.resource.startswith("flow/")
+                            and "/aliases/" in tag_spec.resource
+                            and "/executions/" in tag_spec.resource)):
+                        return "bedrock-agent-runtime"
+                    return "bedrock-agent"
                 # bedrock-agent control-plane paths
                 if (path.startswith("/agents/")
                     or path.startswith("/agents")
                     or path.startswith("/knowledgebases")
                     or path.startswith("/flows")
-                    or path.startswith("/prompts")
-                    or path.startswith("/tags/")):
+                    or path.startswith("/prompts")):
                     return "bedrock-agent"
                 # bedrock-runtime data plane paths
                 if (path.startswith("/model/")

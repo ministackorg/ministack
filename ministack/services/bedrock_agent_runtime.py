@@ -33,6 +33,7 @@ import zlib
 from datetime import datetime, timezone
 from urllib.parse import unquote
 
+from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountRegionScopedDict,
@@ -104,6 +105,29 @@ def _now_iso() -> str:
 
 def _arn(rt: str, path: str) -> str:
     return f"arn:aws:bedrock:{get_region()}:{get_account_id()}:{rt}/{path}"
+
+
+def _validate_tag_resource_arn(arn: str) -> tuple | None:
+    try:
+        spec = parse_arn(arn)
+    except ArnParseError:
+        return _validation(f"Invalid resourceArn: {arn}")
+    if spec.service != "bedrock":
+        return _validation(f"Invalid resourceArn: {arn}")
+    if spec.account_id != get_account_id() or spec.region != get_region():
+        return _not_found(f"Resource {arn} not found.")
+
+    resource = spec.resource
+    parts = resource.split("/")
+    if len(parts) == 2 and parts[0] == "session" and parts[1]:
+        session_id = parts[1]
+        rec = _sessions.get(session_id)
+        if rec and rec.get("SessionArn") == arn:
+            return None
+    else:
+        return _validation(f"Invalid resourceArn: {arn}")
+
+    return _not_found(f"Resource {arn} not found.")
 
 
 def _parse_body(body) -> tuple:
@@ -608,6 +632,9 @@ def _stop_flow_execution(flow_id: str, alias_id: str, exec_id: str) -> tuple:
 
 
 def _tag_resource(arn: str, body) -> tuple:
+    validation_error = _validate_tag_resource_arn(arn)
+    if validation_error:
+        return validation_error
     body_obj, err = _parse_body(body)
     if err:
         return err
@@ -619,6 +646,9 @@ def _tag_resource(arn: str, body) -> tuple:
 
 
 def _untag_resource(arn: str, query_params) -> tuple:
+    validation_error = _validate_tag_resource_arn(arn)
+    if validation_error:
+        return validation_error
     keys = query_params.get("tagKeys", []) if isinstance(query_params, dict) else []
     if isinstance(keys, str):
         keys = [keys]
@@ -630,6 +660,9 @@ def _untag_resource(arn: str, query_params) -> tuple:
 
 
 def _list_tags(arn: str) -> tuple:
+    validation_error = _validate_tag_resource_arn(arn)
+    if validation_error:
+        return validation_error
     return 200, {"Content-Type": "application/json"}, json.dumps({
         "tags": dict(_tags.get(arn, {})),
     }).encode()
