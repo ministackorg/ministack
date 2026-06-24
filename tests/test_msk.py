@@ -13,7 +13,6 @@ import botocore.exceptions
 import pytest
 from conftest import make_client
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -330,6 +329,47 @@ def test_msk_tag_then_untag_resource():
     _kafka().untag_resource(ResourceArn=arn, TagKeys=["a"])
     listed = _kafka().list_tags_for_resource(ResourceArn=arn)
     assert listed["Tags"] == {"b": "2"}
+
+
+def test_msk_describe_cluster_rejects_malformed_arn():
+    try:
+        _kafka().describe_cluster(ClusterArn="not-an-arn-but-long-enough")
+    except botocore.exceptions.ClientError as exc:
+        assert exc.response["Error"]["Code"] == "BadRequestException"
+    else:
+        raise AssertionError("expected BadRequestException")
+
+
+def test_msk_describe_cluster_rejects_wrong_scope_arn():
+    create = _create_basic_cluster("cluster-scope")
+    wrong_region = create["ClusterArn"].replace(":us-east-1:", ":us-west-2:")
+    try:
+        _kafka().describe_cluster(ClusterArn=wrong_region)
+    except botocore.exceptions.ClientError as exc:
+        assert exc.response["Error"]["Code"] == "NotFoundException"
+    else:
+        raise AssertionError("expected NotFoundException")
+
+
+def test_msk_tag_resource_rejects_wrong_service_arn():
+    create = _create_basic_cluster("cluster-wrong-service")
+    wrong_service = create["ClusterArn"].replace(":kafka:", ":lambda:")
+    try:
+        _kafka().tag_resource(ResourceArn=wrong_service, Tags={"a": "1"})
+    except botocore.exceptions.ClientError as exc:
+        assert exc.response["Error"]["Code"] == "BadRequestException"
+    else:
+        raise AssertionError("expected BadRequestException")
+
+
+def test_msk_list_tags_rejects_unknown_resource_arn():
+    arn = "arn:aws:kafka:us-east-1:000000000000:cluster/missing/00000000"
+    try:
+        _kafka().list_tags_for_resource(ResourceArn=arn)
+    except botocore.exceptions.ClientError as exc:
+        assert exc.response["Error"]["Code"] == "NotFoundException"
+    else:
+        raise AssertionError("expected NotFoundException")
 
 
 # ---------------------------------------------------------------------------

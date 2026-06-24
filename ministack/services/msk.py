@@ -41,6 +41,7 @@ import uuid
 from datetime import datetime, timezone
 from urllib.parse import unquote
 
+from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountRegionScopedDict,
@@ -164,6 +165,63 @@ def _config_arn(config_id: str) -> str:
     return f"arn:aws:kafka:{get_region()}:{get_account_id()}:configuration/{config_id}"
 
 
+def _validate_kafka_arn(arn: str, resource_type: str) -> tuple | None:
+    try:
+        spec = parse_arn(arn)
+    except ArnParseError:
+        return _bad_request(f"Invalid ARN: {arn}")
+    if spec.service != "kafka":
+        return _bad_request(f"Invalid ARN: {arn}")
+    if spec.account_id != get_account_id() or spec.region != get_region():
+        return _not_found(f"Resource {arn} not found.")
+
+    if resource_type == "cluster":
+        parts = spec.resource.split("/")
+        if len(parts) != 3 or parts[0] != "cluster" or not parts[1] or not parts[2]:
+            return _bad_request(f"Invalid cluster ARN: {arn}")
+    elif resource_type == "configuration":
+        parts = spec.resource.split("/")
+        if len(parts) != 2 or parts[0] != "configuration" or not parts[1]:
+            return _bad_request(f"Invalid configuration ARN: {arn}")
+    else:
+        return _bad_request(f"Invalid ARN: {arn}")
+
+    return None
+
+
+def _validate_existing_cluster_arn(arn: str) -> tuple | None:
+    validation_error = _validate_kafka_arn(arn, "cluster")
+    if validation_error:
+        return validation_error
+    if arn not in _clusters:
+        return _not_found(f"Cluster {arn} not found.")
+    return None
+
+
+def _validate_existing_configuration_arn(arn: str) -> tuple | None:
+    validation_error = _validate_kafka_arn(arn, "configuration")
+    if validation_error:
+        return validation_error
+    if arn not in _configurations:
+        return _not_found(f"Configuration {arn} not found.")
+    return None
+
+
+def _validate_existing_taggable_arn(arn: str) -> tuple | None:
+    try:
+        spec = parse_arn(arn)
+    except ArnParseError:
+        return _bad_request(f"Invalid ARN: {arn}")
+    if spec.service != "kafka":
+        return _bad_request(f"Invalid ARN: {arn}")
+
+    if spec.resource.startswith("cluster/"):
+        return _validate_existing_cluster_arn(arn)
+    if spec.resource.startswith("configuration/"):
+        return _validate_existing_configuration_arn(arn)
+    return _bad_request(f"Invalid ARN: {arn}")
+
+
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -260,16 +318,18 @@ def _list_clusters(query_params) -> tuple:
 
 
 def _describe_cluster(arn: str) -> tuple:
+    validation_error = _validate_existing_cluster_arn(arn)
+    if validation_error:
+        return validation_error
     info = _clusters.get(arn)
-    if info is None:
-        return _not_found(f"Cluster {arn} not found.")
     return _json({"ClusterInfo": info})
 
 
 def _delete_cluster(arn: str) -> tuple:
+    validation_error = _validate_existing_cluster_arn(arn)
+    if validation_error:
+        return validation_error
     info = _clusters.get(arn)
-    if info is None:
-        return _not_found(f"Cluster {arn} not found.")
     _clusters.pop(arn, None)
     _scram_secrets.pop(arn, None)
     _tags.pop(arn, None)
@@ -277,16 +337,18 @@ def _delete_cluster(arn: str) -> tuple:
 
 
 def _get_bootstrap_brokers(arn: str) -> tuple:
+    validation_error = _validate_existing_cluster_arn(arn)
+    if validation_error:
+        return validation_error
     info = _clusters.get(arn)
-    if info is None:
-        return _not_found(f"Cluster {arn} not found.")
     return _json(_bootstrap_strings(info["ClusterName"]))
 
 
 def _list_nodes(arn: str) -> tuple:
+    validation_error = _validate_existing_cluster_arn(arn)
+    if validation_error:
+        return validation_error
     info = _clusters.get(arn)
-    if info is None:
-        return _not_found(f"Cluster {arn} not found.")
     n = info.get("NumberOfBrokerNodes", 3)
     bootstrap = _bootstrap_strings(info["ClusterName"])
     nodes = []
@@ -367,15 +429,17 @@ def _list_configurations(query_params) -> tuple:
 
 
 def _describe_configuration(arn: str) -> tuple:
+    validation_error = _validate_existing_configuration_arn(arn)
+    if validation_error:
+        return validation_error
     cfg = _configurations.get(arn)
-    if cfg is None:
-        return _not_found(f"Configuration {arn} not found.")
     return _json(cfg)
 
 
 def _list_configuration_revisions(arn: str) -> tuple:
-    if arn not in _configurations:
-        return _not_found(f"Configuration {arn} not found.")
+    validation_error = _validate_existing_configuration_arn(arn)
+    if validation_error:
+        return validation_error
     revs = _config_revisions.get(arn, [])
     summaries = [{
         "CreationTime": r["CreationTime"],
@@ -386,8 +450,9 @@ def _list_configuration_revisions(arn: str) -> tuple:
 
 
 def _describe_configuration_revision(arn: str, revision: str) -> tuple:
-    if arn not in _configurations:
-        return _not_found(f"Configuration {arn} not found.")
+    validation_error = _validate_existing_configuration_arn(arn)
+    if validation_error:
+        return validation_error
     try:
         rev_n = int(revision)
     except ValueError:
@@ -414,8 +479,9 @@ def _describe_configuration_revision(arn: str, revision: str) -> tuple:
 
 
 def _batch_associate_scram(arn: str, body) -> tuple:
-    if arn not in _clusters:
-        return _not_found(f"Cluster {arn} not found.")
+    validation_error = _validate_existing_cluster_arn(arn)
+    if validation_error:
+        return validation_error
     try:
         req = json.loads(body or b"{}")
     except json.JSONDecodeError:
@@ -437,8 +503,9 @@ def _batch_associate_scram(arn: str, body) -> tuple:
 
 
 def _batch_disassociate_scram(arn: str, body) -> tuple:
-    if arn not in _clusters:
-        return _not_found(f"Cluster {arn} not found.")
+    validation_error = _validate_existing_cluster_arn(arn)
+    if validation_error:
+        return validation_error
     try:
         req = json.loads(body or b"{}")
     except json.JSONDecodeError:
@@ -458,8 +525,9 @@ def _batch_disassociate_scram(arn: str, body) -> tuple:
 
 
 def _list_scram_secrets(arn: str) -> tuple:
-    if arn not in _clusters:
-        return _not_found(f"Cluster {arn} not found.")
+    validation_error = _validate_existing_cluster_arn(arn)
+    if validation_error:
+        return validation_error
     return _json({
         "SecretArnList": list(_scram_secrets.get(arn, [])),
         "NextToken": None,
@@ -472,6 +540,9 @@ def _list_scram_secrets(arn: str) -> tuple:
 
 
 def _tag_resource(arn: str, body) -> tuple:
+    validation_error = _validate_existing_taggable_arn(arn)
+    if validation_error:
+        return validation_error
     try:
         req = json.loads(body or b"{}")
     except json.JSONDecodeError:
@@ -486,6 +557,9 @@ def _tag_resource(arn: str, body) -> tuple:
 
 
 def _untag_resource(arn: str, query_params) -> tuple:
+    validation_error = _validate_existing_taggable_arn(arn)
+    if validation_error:
+        return validation_error
     keys = query_params.get("tagKeys", []) if isinstance(query_params, dict) else []
     if isinstance(keys, str):
         keys = [keys]
@@ -497,6 +571,9 @@ def _untag_resource(arn: str, query_params) -> tuple:
 
 
 def _list_tags_for_resource(arn: str) -> tuple:
+    validation_error = _validate_existing_taggable_arn(arn)
+    if validation_error:
+        return validation_error
     # Tag keys/values are user data — pass through without camelization.
     return 200, {"Content-Type": "application/json"}, json.dumps({
         "tags": dict(_tags.get(arn, {})),
