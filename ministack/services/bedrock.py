@@ -35,6 +35,7 @@ import uuid
 from datetime import datetime, timezone
 from urllib.parse import unquote
 
+from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountRegionScopedDict,
@@ -171,6 +172,71 @@ def _now_iso() -> str:
 def _arn(resource_type: str, resource_path: str) -> str:
     return (f"arn:aws:bedrock:{get_region()}:{get_account_id()}:"
             f"{resource_type}/{resource_path}")
+
+
+def _validate_resource_arn_for_tags(arn: str) -> tuple | None:
+    try:
+        spec = parse_arn(arn)
+    except ArnParseError:
+        return _validation(f"Invalid resourceARN: {arn}")
+    if spec.service != "bedrock":
+        return _validation(f"Invalid resourceARN: {arn}")
+    if spec.account_id != get_account_id():
+        return _not_found(f"Resource {arn} not found.")
+    if spec.region != get_region():
+        return _not_found(f"Resource {arn} not found.")
+
+    parts = spec.resource.split("/")
+    if len(parts) != 2 or not parts[0] or not parts[1]:
+        return _validation(f"Invalid resourceARN: {arn}")
+
+    resource_type, resource_id = parts
+    if resource_type == "application-inference-profile":
+        profile_id = resource_id
+        rec = _inference_profiles_apps.get(profile_id)
+        if rec and rec.get("InferenceProfileArn") == arn:
+            return None
+    elif resource_type == "guardrail":
+        guardrail_id = resource_id
+        rec = _guardrails.get(guardrail_id)
+        if rec and rec.get("GuardrailArn") == arn:
+            return None
+    elif resource_type == "custom-model":
+        if arn in _custom_models:
+            return None
+    elif resource_type == "imported-model":
+        if arn in _imported_models:
+            return None
+    elif resource_type == "provisioned-model":
+        provisioned_id = resource_id
+        rec = _provisioned_throughputs.get(provisioned_id)
+        if rec and rec.get("ProvisionedModelArn") == arn:
+            return None
+    elif resource_type == "model-customization-job":
+        if arn in _model_customization_jobs:
+            return None
+    elif resource_type == "model-import-job":
+        if arn in _model_import_jobs:
+            return None
+    elif resource_type == "model-copy-job":
+        if arn in _model_copy_jobs:
+            return None
+    elif resource_type == "model-invocation-job":
+        if arn in _model_invocation_jobs:
+            return None
+    elif resource_type == "evaluation-job":
+        if arn in _evaluation_jobs:
+            return None
+    elif resource_type == "marketplace-model-endpoint":
+        if arn in _marketplace_endpoints:
+            return None
+    elif resource_type == "prompt-router":
+        if arn in _prompt_routers:
+            return None
+    else:
+        return _validation(f"Invalid resourceARN: {arn}")
+
+    return _not_found(f"Resource {arn} not found.")
 
 
 def _parse_body(body) -> tuple:
@@ -374,8 +440,9 @@ def _delete_foundation_model_agreement(body) -> tuple:
 # ===========================================================================
 
 
-def _inference_profile_arn(profile_id: str) -> str:
-    return _arn("inference-profile", profile_id)
+def _inference_profile_arn(profile_id: str, *, application: bool = False) -> str:
+    resource_type = "application-inference-profile" if application else "inference-profile"
+    return _arn(resource_type, profile_id)
 
 
 def _list_inference_profiles(query_params) -> tuple:
@@ -439,7 +506,7 @@ def _create_inference_profile(body) -> tuple:
     rec = {
         "InferenceProfileName": name,
         "InferenceProfileId": pid,
-        "InferenceProfileArn": _inference_profile_arn(pid),
+        "InferenceProfileArn": _inference_profile_arn(pid, application=True),
         "Models": [{"ModelArn": models}],
         "Status": "ACTIVE",
         "Type": "APPLICATION",
@@ -1264,6 +1331,9 @@ def _tag_resource(body) -> tuple:
     tags = body_obj.get("tags", [])
     if not arn:
         return _validation("resourceARN is required.")
+    validation_error = _validate_resource_arn_for_tags(arn)
+    if validation_error:
+        return validation_error
     if not isinstance(tags, list):
         return _validation("tags must be an array.")
     current = dict(_tags.get(arn, {}))
@@ -1284,6 +1354,9 @@ def _untag_resource(body) -> tuple:
     keys = body_obj.get("tagKeys", [])
     if not arn:
         return _validation("resourceARN is required.")
+    validation_error = _validate_resource_arn_for_tags(arn)
+    if validation_error:
+        return validation_error
     current = dict(_tags.get(arn, {}))
     for k in keys:
         current.pop(k, None)
@@ -1298,6 +1371,9 @@ def _list_tags_for_resource(body) -> tuple:
     arn = body_obj.get("resourceARN")
     if not arn:
         return _validation("resourceARN is required.")
+    validation_error = _validate_resource_arn_for_tags(arn)
+    if validation_error:
+        return validation_error
     tags = [{"Key": k, "Value": v} for k, v in _tags.get(arn, {}).items()]
     return _json({"Tags": tags})
 
