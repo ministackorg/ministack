@@ -487,3 +487,91 @@ def test_bedrock_tag_list_untag_resource():
     keys2 = {t["key"] for t in resp2["tags"]}
     assert "env" not in keys2
     assert "team" in keys2
+
+
+def test_bedrock_tag_resource_rejects_malformed_arn():
+    try:
+        _bedrock().tag_resource(
+            resourceARN="not-an-arn-but-long-enough",
+            tags=[{"key": "team", "value": "ml"}],
+        )
+    except botocore.exceptions.ClientError as exc:
+        assert exc.response["Error"]["Code"] == "ValidationException"
+    else:
+        raise AssertionError("expected ValidationException")
+
+
+def test_bedrock_tag_resource_rejects_wrong_scope_arn():
+    gr = _bedrock().create_guardrail(
+        name="gr-tag-scope", blockedInputMessaging="x", blockedOutputsMessaging="y",
+    )
+    wrong_region = gr["guardrailArn"].replace(":us-east-1:", ":us-west-2:")
+    try:
+        _bedrock().tag_resource(
+            resourceARN=wrong_region,
+            tags=[{"key": "team", "value": "ml"}],
+        )
+    except botocore.exceptions.ClientError as exc:
+        assert exc.response["Error"]["Code"] == "ResourceNotFoundException"
+    else:
+        raise AssertionError("expected ResourceNotFoundException")
+
+
+def test_bedrock_tag_resource_rejects_noncanonical_partition_arn():
+    gr = _bedrock().create_guardrail(
+        name="gr-tag-partition", blockedInputMessaging="x", blockedOutputsMessaging="y",
+    )
+    wrong_partition = gr["guardrailArn"].replace("arn:aws:", "arn:aws-cn:", 1)
+    try:
+        _bedrock().tag_resource(
+            resourceARN=wrong_partition,
+            tags=[{"key": "team", "value": "ml"}],
+        )
+    except botocore.exceptions.ClientError as exc:
+        assert exc.response["Error"]["Code"] == "ResourceNotFoundException"
+    else:
+        raise AssertionError("expected ResourceNotFoundException")
+
+
+def test_bedrock_tag_resource_rejects_wrong_service_arn():
+    gr = _bedrock().create_guardrail(
+        name="gr-tag-service", blockedInputMessaging="x", blockedOutputsMessaging="y",
+    )
+    wrong_service = gr["guardrailArn"].replace(":bedrock:", ":lambda:")
+    try:
+        _bedrock().tag_resource(
+            resourceARN=wrong_service,
+            tags=[{"key": "team", "value": "ml"}],
+        )
+    except botocore.exceptions.ClientError as exc:
+        assert exc.response["Error"]["Code"] == "ValidationException"
+    else:
+        raise AssertionError("expected ValidationException")
+
+
+def test_bedrock_tag_resource_accepts_application_inference_profile_arn():
+    create = _bedrock().create_inference_profile(
+        inferenceProfileName="aip-tag",
+        modelSource={
+            "copyFrom": "arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-3-haiku-20240307-v1:0"
+        },
+    )
+    arn = create["inferenceProfileArn"]
+    assert ":application-inference-profile/" in arn
+
+    _bedrock().tag_resource(
+        resourceARN=arn,
+        tags=[{"key": "team", "value": "ml"}],
+    )
+    resp = _bedrock().list_tags_for_resource(resourceARN=arn)
+    assert {"key": "team", "value": "ml"} in resp["tags"]
+
+
+def test_bedrock_list_tags_rejects_unknown_resource_arn():
+    arn = "arn:aws:bedrock:us-east-1:000000000000:guardrail/gr-missing"
+    try:
+        _bedrock().list_tags_for_resource(resourceARN=arn)
+    except botocore.exceptions.ClientError as exc:
+        assert exc.response["Error"]["Code"] == "ResourceNotFoundException"
+    else:
+        raise AssertionError("expected ResourceNotFoundException")
