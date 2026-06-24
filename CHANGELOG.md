@@ -19,9 +19,6 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 - **API Gateway v1 — literal path segments resolve ahead of a `{param}` sibling regardless of creation order** — a literal path (e.g. `/users/verifyUserEmail`) returned 405 when a `{id}` sibling under the same parent was registered first, because resolution followed resource-creation order instead of AWS specificity. Resolution now orders literal > `{param}` > `{proxy+}`. Reported by @ethan-dyas438.
 - **RDS Data API — `:name` placeholders are substituted by whole token** — the earlier substring replacement could corrupt an unrelated longer token (a `:id` parameter ate into a literal `:identity`) and was fragile around `::type` casts. Substitution is now a single token-aware pass, keeping `:1`/`:10` distinct, leaving `::jsonb` casts intact, and passing through any `:word` that is not a supplied parameter. Reported by @awilson9.
 
-### Fixed
-- **Step Functions — `lambda:invoke.waitForTaskToken` now delivers the unwrapped `Payload` to the handler** — the callback path forwarded the whole service-integration envelope (`{"FunctionName": ..., "Payload": {...}}`) to the Lambda instead of just the `Payload`, mirroring the synchronous `lambda:invoke` path. Handlers reading their task token / input from the top level (the standard `.waitForTaskToken` pattern) saw them nested under `Payload`, never resumed the task, and the execution hung until timeout.
-
 ---
 
 ## [1.3.66] — 2026-06-22
