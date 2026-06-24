@@ -1634,9 +1634,15 @@ def _call_lambda(func_name, event):
     if result.get("error"):
         body = result.get("body", {})
         if isinstance(body, dict):
+            # AWS reports a failed Lambda task with Error set to the function's
+            # errorType and Cause set to a JSON-encoded string of the error
+            # payload ({"errorType": ..., "errorMessage": ..., "trace": [...]}),
+            # NOT the bare errorMessage. Consumers (Catch handlers, downstream
+            # tasks) routinely json.loads(Cause) to read errorType/errorMessage,
+            # so emit the JSON form to match.
             raise _ExecutionError(
                 body.get("errorType", "Lambda.Unknown"),
-                body.get("errorMessage", str(body)))
+                json.dumps(body))
         raise _ExecutionError("Lambda.Unknown", str(body))
 
     body = result.get("body")
