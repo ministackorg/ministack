@@ -233,6 +233,14 @@ def _get_docker():
         return None
 
 
+def _instance_labels():
+    """Per-instance label for spawned containers so concurrent MiniStack
+    instances don't reap each other's containers at boot (see
+    MINISTACK_INSTANCE_ID and _stop_all_k3s). Empty when the env is unset."""
+    iid = os.environ.get("MINISTACK_INSTANCE_ID")
+    return {"ministack_instance": iid} if iid else {}
+
+
 def _get_ministack_network(client):
     """Detect the Docker network MiniStack is running on."""
     if DOCKER_NETWORK:
@@ -343,7 +351,7 @@ def _k3s_run_kwargs(name: str, port: int, ms_network: str | None = None, oidc_ar
         devices=["/dev/fuse"],
         ports={"6443/tcp": port},
         name=f"ministack-eks-{name}",
-        labels={"ministack": "eks", "cluster_name": name},
+        labels={"ministack": "eks", "cluster_name": name, **_instance_labels()},
         environment={"K3S_KUBECONFIG_MODE": "644"},
         volumes={"/lib/modules": {"bind": "/lib/modules", "mode": "ro"}},
         tmpfs={"/run": "", "/var/run": "", "/tmp": ""},
@@ -360,7 +368,10 @@ def _stop_all_k3s():
     if not client:
         return
     try:
-        for c in client.containers.list(filters={"label": "ministack=eks"}):
+        # Instance-scoped: only this instance's k3s (see MINISTACK_INSTANCE_ID).
+        _inst = os.environ.get("MINISTACK_INSTANCE_ID")
+        _flt = ["ministack=eks"] + ([f"ministack_instance={_inst}"] if _inst else [])
+        for c in client.containers.list(filters={"label": _flt}):
             try:
                 c.stop(timeout=5)
                 c.remove(v=True, force=True)

@@ -213,6 +213,15 @@ def _get_docker_client():
     except Exception:
         return None
 
+
+def _instance_labels():
+    """Per-instance label for spawned containers so concurrent MiniStack
+    instances don't reap each other's containers at boot (see
+    MINISTACK_INSTANCE_ID). Empty when the env is unset."""
+    iid = os.environ.get("MINISTACK_INSTANCE_ID")
+    return {"ministack_instance": iid} if iid else {}
+
+
 _functions = AccountScopedDict()  # function_name -> FunctionRecord
 _layers = AccountScopedDict()  # layer_name -> {"versions": [...], "next_version": int}
 _esms = AccountScopedDict()  # uuid -> esm dict
@@ -2742,7 +2751,7 @@ def _spawn_lambda_container(config: dict, code_zip: bytes | None):
         "ports": {"8080/tcp": None},
         "detach": True,
         "stdin_open": False,
-        "labels": {"ministack": "lambda"},
+        "labels": {"ministack": "lambda", **_instance_labels()},
     }
     if package_type == "Image":
         # User image brings its own entrypoint. ImageConfig can override.

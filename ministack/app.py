@@ -1844,10 +1844,16 @@ def _stop_docker_containers():
         client = docker.from_env()
     except Exception:
         return
+    # Instance-scoped cleanup: when MINISTACK_INSTANCE_ID is set, only reap
+    # containers spawned by THIS instance (tagged ministack_instance=<id>), so
+    # multiple MiniStack instances can share one Docker host without evicting
+    # each other's k3s/RDS/etc. at boot. Unset → original global behaviour.
+    _instance = os.environ.get("MINISTACK_INSTANCE_ID")
     for label in ("ministack=rds", "ministack=ecs", "ministack=elasticache", "ministack=eks", "ministack=lambda"):
         try:
+            _flt = [label] + ([f"ministack_instance={_instance}"] if _instance else [])
             # all=True so exited-but-not-removed orphans get cleaned at boot.
-            for c in client.containers.list(all=True, filters={"label": label}):
+            for c in client.containers.list(all=True, filters={"label": _flt}):
                 try:
                     c.stop(timeout=5)
                     c.remove(v=True)
