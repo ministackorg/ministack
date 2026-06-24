@@ -5,6 +5,13 @@ All notable changes to MiniStack will be documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+- **CloudFormation / API Gateway — `AWS::ApiGateway::RestApi` partially supports the OpenAPI `Body` property** — This implementation is very incomplete. See #928.
+
+---
+
 ## [1.3.66] — 2026-06-22
 
 ### Added
