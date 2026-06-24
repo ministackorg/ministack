@@ -5,8 +5,13 @@ boto3 round-trip on every resource family. Shapes verified against botocore
 bedrock-agent-2023-06-05.
 """
 
+import asyncio
+import json
+
 import botocore.exceptions
 from conftest import make_client
+
+from ministack.services import bedrock_agent as bedrock_agent_service
 
 
 def _agent():
@@ -339,3 +344,154 @@ def test_bedrock_agent_tag_resource():
     _agent().untag_resource(resourceArn=arn, tagKeys=["env"])
     lst2 = _agent().list_tags_for_resource(resourceArn=arn)
     assert "env" not in lst2["tags"]
+
+
+def test_bedrock_agent_tag_resource_accepts_flow_alias_arn():
+    flow = _agent().create_flow(
+        name="flow-alias-tag",
+        executionRoleArn="arn:aws:iam::000000000000:role/flow-role",
+    )
+    _agent().create_flow_version(flowIdentifier=flow["id"])
+    alias = _agent().create_flow_alias(
+        flowIdentifier=flow["id"], name="prod-tag",
+        routingConfiguration=[{"flowVersion": "1"}],
+    )
+    arn = alias["arn"]
+    assert f":flow/{flow['id']}/alias/" in arn
+
+    _agent().tag_resource(resourceArn=arn, tags={"env": "prod"})
+    lst = _agent().list_tags_for_resource(resourceArn=arn)
+    assert lst["tags"]["env"] == "prod"
+
+
+def test_bedrock_agent_tag_resource_accepts_restored_legacy_flow_alias_arn():
+    bedrock_agent_service.reset()
+    try:
+        flow_id = "FLRESTORE"
+        alias_id = "FARESTORE"
+        arn = f"arn:aws:bedrock:us-east-1:000000000000:flow-alias/{flow_id}/{alias_id}"
+        canonical_arn = f"arn:aws:bedrock:us-east-1:000000000000:flow/{flow_id}/alias/{alias_id}"
+        bedrock_agent_service._flow_aliases[f"{flow_id}/{alias_id}"] = {
+            "Arn": arn,
+            "FlowId": flow_id,
+            "Id": alias_id,
+        }
+        status, _, _ = asyncio.run(bedrock_agent_service.handle_request(
+            "POST",
+            f"/tags/{arn}",
+            {},
+            b'{"tags":{"env":"prod"}}',
+            {},
+        ))
+        assert status == 200
+        status, _, _ = asyncio.run(bedrock_agent_service.handle_request(
+            "POST",
+            f"/tags/{canonical_arn}",
+            {},
+            b'{"tags":{"stage":"prod"}}',
+            {},
+        ))
+        assert status == 200
+        status, _, body = asyncio.run(bedrock_agent_service.handle_request(
+            "GET",
+            f"/tags/{canonical_arn}",
+            {},
+            b"",
+            {},
+        ))
+        assert status == 200
+        assert json.loads(body)["tags"] == {"env": "prod", "stage": "prod"}
+    finally:
+        bedrock_agent_service.reset()
+
+
+def test_bedrock_agent_tag_resource_accepts_prompt_version_arn():
+    prompt = _agent().create_prompt(
+        name="prompt-tag",
+        variants=[{"name": "v1", "templateType": "TEXT",
+                    "templateConfiguration": {"text": {"text": "{{x}}"}}}],
+        defaultVariant="v1",
+    )
+    version = _agent().create_prompt_version(promptIdentifier=prompt["id"])
+    arn = version["arn"]
+    assert arn.endswith(":1")
+
+    _agent().tag_resource(resourceArn=arn, tags={"env": "prod"})
+    lst = _agent().list_tags_for_resource(resourceArn=arn)
+    assert lst["tags"]["env"] == "prod"
+
+
+def test_bedrock_agent_tag_resource_accepts_restored_prompt_version_arn():
+    bedrock_agent_service.reset()
+    try:
+        prompt_id = "PRRESTORE"
+        version = "1"
+        draft_arn = f"arn:aws:bedrock:us-east-1:000000000000:prompt/{prompt_id}"
+        version_arn = f"{draft_arn}:{version}"
+        bedrock_agent_service._prompt_versions[f"{prompt_id}/{version}"] = {
+            "Arn": draft_arn,
+            "Id": prompt_id,
+            "Version": version,
+        }
+        status, _, _ = asyncio.run(bedrock_agent_service.handle_request(
+            "POST",
+            f"/tags/{version_arn}",
+            {},
+            b'{"tags":{"env":"prod"}}',
+            {},
+        ))
+        assert status == 200
+    finally:
+        bedrock_agent_service.reset()
+
+
+def test_bedrock_agent_tag_resource_rejects_malformed_arn():
+    try:
+        _agent().tag_resource(resourceArn="not-an-arn-but-long-enough", tags={"env": "prod"})
+    except botocore.exceptions.ClientError as exc:
+        assert exc.response["Error"]["Code"] == "ValidationException"
+    else:
+        raise AssertionError("expected ValidationException")
+
+
+def test_bedrock_agent_tag_resource_rejects_wrong_scope_arn():
+    agent = _make_agent("ag-tag-scope")
+    wrong_region = agent["agentArn"].replace(":us-east-1:", ":us-west-2:")
+    try:
+        _agent().tag_resource(resourceArn=wrong_region, tags={"env": "prod"})
+    except botocore.exceptions.ClientError as exc:
+        assert exc.response["Error"]["Code"] == "ResourceNotFoundException"
+    else:
+        raise AssertionError("expected ResourceNotFoundException")
+
+
+def test_bedrock_agent_tag_resource_rejects_noncanonical_partition_arn():
+    agent = _make_agent("ag-tag-partition")
+    wrong_partition = agent["agentArn"].replace("arn:aws:", "arn:aws-cn:", 1)
+    try:
+        _agent().tag_resource(resourceArn=wrong_partition, tags={"env": "prod"})
+    except botocore.exceptions.ClientError as exc:
+        assert exc.response["Error"]["Code"] == "ResourceNotFoundException"
+    else:
+        raise AssertionError("expected ResourceNotFoundException")
+
+
+def test_bedrock_agent_tag_resource_rejects_wrong_service_arn():
+    agent = _make_agent("ag-tag-service")
+    wrong_service = agent["agentArn"].replace(":bedrock:", ":lambda:")
+    try:
+        _agent().tag_resource(resourceArn=wrong_service, tags={"env": "prod"})
+    except botocore.exceptions.ClientError as exc:
+        assert exc.response["Error"]["Code"] == "ValidationException"
+    else:
+        raise AssertionError("expected ValidationException")
+
+
+def test_bedrock_agent_list_tags_rejects_unknown_resource_arn():
+    arn = "arn:aws:bedrock:us-east-1:000000000000:agent/AGMISSING"
+    try:
+        _agent().list_tags_for_resource(resourceArn=arn)
+    except botocore.exceptions.ClientError as exc:
+        assert exc.response["Error"]["Code"] == "ResourceNotFoundException"
+    else:
+        raise AssertionError("expected ResourceNotFoundException")

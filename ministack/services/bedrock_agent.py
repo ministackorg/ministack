@@ -23,6 +23,7 @@ import uuid
 from datetime import datetime, timezone
 from urllib.parse import unquote
 
+from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountRegionScopedDict,
@@ -91,6 +92,68 @@ def _now_iso() -> str:
 def _arn(resource_type: str, resource_path: str) -> str:
     return (f"arn:aws:bedrock:{get_region()}:{get_account_id()}:"
             f"{resource_type}/{resource_path}")
+
+
+def _resolve_tag_resource_arn(arn: str) -> tuple[str | None, tuple | None]:
+    try:
+        spec = parse_arn(arn)
+    except ArnParseError:
+        return None, _validation(f"Invalid resourceArn: {arn}")
+    if spec.service != "bedrock":
+        return None, _validation(f"Invalid resourceArn: {arn}")
+    if spec.account_id != get_account_id() or spec.region != get_region():
+        return None, _not_found(f"Resource {arn} not found.")
+
+    parts = spec.resource.split("/")
+    if len(parts) == 2 and parts[0] == "agent" and parts[1]:
+        agent_id = parts[1]
+        rec = _agents.get(agent_id)
+        if rec and rec.get("AgentArn") == arn:
+            return arn, None
+    elif len(parts) == 3 and parts[0] == "agent-alias" and parts[1] and parts[2]:
+        key = f"{parts[1]}/{parts[2]}"
+        rec = _agent_aliases.get(key)
+        if rec and rec.get("AgentAliasArn") == arn:
+            return arn, None
+    elif len(parts) == 2 and parts[0] == "knowledge-base" and parts[1]:
+        kb_id = parts[1]
+        rec = _knowledge_bases.get(kb_id)
+        if rec and rec.get("KnowledgeBaseArn") == arn:
+            return arn, None
+    elif len(parts) == 2 and parts[0] == "flow" and parts[1]:
+        flow_id = parts[1]
+        rec = _flows.get(flow_id)
+        if rec and rec.get("Arn") == arn:
+            return arn, None
+    elif (len(parts) == 4 and parts[0] == "flow" and parts[1]
+          and parts[2] == "alias" and parts[3]):
+        key = f"{parts[1]}/{parts[3]}"
+        rec = _flow_aliases.get(key)
+        if rec and rec.get("Arn") == arn:
+            return arn, None
+        if rec and _flow_alias_arn(parts[1], parts[3]) == arn:
+            return rec.get("Arn") or arn, None
+    elif len(parts) == 3 and parts[0] == "flow-alias" and parts[1] and parts[2]:
+        key = f"{parts[1]}/{parts[2]}"
+        rec = _flow_aliases.get(key)
+        if rec and rec.get("Arn") == arn:
+            return arn, None
+    elif len(parts) == 2 and parts[0] == "prompt" and parts[1]:
+        prompt_id, sep, version = parts[1].partition(":")
+        if not prompt_id or (sep and not version):
+            return None, _validation(f"Invalid resourceArn: {arn}")
+        if sep:
+            rec = _prompt_versions.get(f"{prompt_id}/{version}")
+            if rec and (rec.get("Arn") == arn or _prompt_version_arn(prompt_id, version) == arn):
+                return arn, None
+        else:
+            rec = _prompts.get(prompt_id)
+            if rec and rec.get("Arn") == arn:
+                return arn, None
+    else:
+        return None, _validation(f"Invalid resourceArn: {arn}")
+
+    return None, _not_found(f"Resource {arn} not found.")
 
 
 def _id(prefix: str = "") -> str:
@@ -1053,7 +1116,7 @@ def _delete_flow_version(flow_id: str, version: str, query_params) -> tuple:
 
 
 def _flow_alias_arn(flow_id: str, alias_id: str) -> str:
-    return _arn("flow-alias", f"{flow_id}/{alias_id}")
+    return _arn("flow", f"{flow_id}/alias/{alias_id}")
 
 
 def _create_flow_alias(flow_id: str, body) -> tuple:
@@ -1125,6 +1188,10 @@ def _delete_flow_alias(flow_id: str, alias_id: str) -> tuple:
 
 def _prompt_arn(prompt_id: str) -> str:
     return _arn("prompt", prompt_id)
+
+
+def _prompt_version_arn(prompt_id: str, version: str) -> str:
+    return _arn("prompt", f"{prompt_id}:{version}")
 
 
 def _create_prompt(body) -> tuple:
@@ -1208,8 +1275,11 @@ def _create_prompt_version(prompt_id: str, body) -> tuple:
     next_ver = str(max(existing) + 1 if existing else 1)
     rec = dict(_prompts[prompt_id])
     rec["Version"] = next_ver
+    rec["Arn"] = _prompt_version_arn(prompt_id, next_ver)
     rec["CreatedAt"] = _now_iso()
     _prompt_versions[f"{prompt_id}/{next_ver}"] = rec
+    if body_obj.get("tags"):
+        _tags[rec["Arn"]] = dict(body_obj["tags"])
     return _json(rec, status=201)
 
 
@@ -1219,32 +1289,41 @@ def _create_prompt_version(prompt_id: str, body) -> tuple:
 
 
 def _tag_resource(arn: str, body) -> tuple:
+    tag_arn, validation_error = _resolve_tag_resource_arn(arn)
+    if validation_error:
+        return validation_error
     body_obj, err = _parse_body(body)
     if err:
         return err
     tags = body_obj.get("tags", {})
     if not isinstance(tags, dict):
         return _validation("tags must be an object.")
-    current = dict(_tags.get(arn, {}))
+    current = dict(_tags.get(tag_arn, {}))
     current.update(tags)
-    _tags[arn] = current
+    _tags[tag_arn] = current
     return _empty()
 
 
 def _untag_resource(arn: str, query_params) -> tuple:
+    tag_arn, validation_error = _resolve_tag_resource_arn(arn)
+    if validation_error:
+        return validation_error
     keys = query_params.get("tagKeys", []) if isinstance(query_params, dict) else []
     if isinstance(keys, str):
         keys = [keys]
-    current = dict(_tags.get(arn, {}))
+    current = dict(_tags.get(tag_arn, {}))
     for k in keys:
         current.pop(k, None)
-    _tags[arn] = current
+    _tags[tag_arn] = current
     return _empty()
 
 
 def _list_tags(arn: str) -> tuple:
+    tag_arn, validation_error = _resolve_tag_resource_arn(arn)
+    if validation_error:
+        return validation_error
     return 200, {"Content-Type": "application/json"}, json.dumps({
-        "tags": dict(_tags.get(arn, {})),
+        "tags": dict(_tags.get(tag_arn, {})),
     }).encode()
 
 
