@@ -4263,6 +4263,16 @@ def _oauth2_token(data, query_params, raw_body: bytes = b"", headers: dict | Non
                 if not _verify_pkce(code_verifier, entry["code_challenge"], method):
                     return _oauth2_error("invalid_grant", "PKCE verification failed.")
 
+            # Validate client secret BEFORE consuming the code. AWS rejects bad
+            # client authentication without invalidating the single-use code, so
+            # a client that authenticates in two steps (HTTP Basic, then
+            # client_secret_post fallback — as Go/Vault does) can still succeed
+            # on the retry. Consuming the code first turned that retry into
+            # invalid_grant "Invalid or expired authorization code" (#932).
+            _, _, client = _find_pool_by_client_id(cid)
+            if client and client.get("ClientSecret") and csec != client["ClientSecret"]:
+                return _oauth2_error("invalid_client", "Invalid client credentials.")
+
             # Consume code (one-time use)
             del _authorization_codes[code]
 
@@ -4274,11 +4284,6 @@ def _oauth2_token(data, query_params, raw_body: bytes = b"", headers: dict | Non
             user = pool["_users"].get(entry["username"])
             if not user:
                 return _oauth2_error("server_error", "User not found.")
-
-            # Validate client secret if client has one
-            _, _, client = _find_pool_by_client_id(cid)
-            if client and client.get("ClientSecret") and csec != client["ClientSecret"]:
-                return _oauth2_error("invalid_client", "Invalid client credentials.")
 
             result = _build_auth_result(pool_id, cid, user, nonce=entry.get("nonce", ""))
             refresh_val = result["RefreshToken"]

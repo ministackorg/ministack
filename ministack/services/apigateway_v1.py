@@ -475,7 +475,20 @@ def _match_recursive(resources, parent_id, segments, params):
     segment = segments[0]
     remaining = segments[1:]
     children = [r for r in resources.values() if r.get("parentId") == parent_id]
-    for child in children:
+
+    # AWS resolves by specificity, not resource-creation order: a literal
+    # segment wins over a {param} sibling, which wins over a greedy {proxy+}.
+    # Without this, a {id} resource registered before a literal sibling would
+    # match first and shadow it (405 on the literal path).
+    def _precedence(res):
+        pp = res.get("pathPart", "")
+        if pp.startswith("{") and pp.endswith("+}"):
+            return 2  # greedy {proxy+} — lowest priority
+        if pp.startswith("{") and pp.endswith("}"):
+            return 1  # path parameter
+        return 0      # literal segment — highest priority
+
+    for child in sorted(children, key=_precedence):
         pp = child.get("pathPart", "")
         if pp.endswith("+}") and pp.startswith("{"):
             # greedy {proxy+}
