@@ -13,6 +13,7 @@ import json
 import time
 from urllib.parse import parse_qs
 
+from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.responses import get_account_id, json_response, new_uuid
 
 # Shared helpers — IAM and STS are a natural pair; STS is stateless
@@ -24,6 +25,33 @@ _sessions: dict[str, dict] = {}
 
 def reset():
     _sessions.clear()
+
+
+def _assumed_role_arn(role_arn: str, session_name: str):
+    try:
+        spec = parse_arn(role_arn)
+    except ArnParseError:
+        return None, _invalid_role_arn(role_arn)
+
+    if (
+        spec.service != "iam"
+        or spec.region
+        or len(spec.account_id) != 12
+        or not spec.account_id.isdigit()
+        or not spec.resource.startswith("role/")
+    ):
+        return None, _invalid_role_arn(role_arn)
+
+    role_resource = spec.resource[len("role/"):]
+    role_name = role_resource.rsplit("/", 1)[-1]
+    if not role_resource or not role_name or ":" in role_name:
+        return None, _invalid_role_arn(role_arn)
+
+    return f"arn:{spec.partition}:sts::{spec.account_id}:assumed-role/{role_name}/{session_name}", None
+
+
+def _invalid_role_arn(role_arn: str):
+    return _error(400, "ValidationError", f"Invalid RoleArn: {role_arn}", ns="sts")
 
 
 async def handle_request(method, path, headers, body, query_params):
@@ -74,17 +102,15 @@ async def handle_request(method, path, headers, body, query_params):
     if action == "AssumeRole":
         role_arn = _p(params, "RoleArn")
         session_name = _p(params, "RoleSessionName")
+        assumed_arn, validation_error = _assumed_role_arn(role_arn, session_name)
+        if validation_error:
+            return validation_error
         duration = int(_p(params, "DurationSeconds") or 3600)
         expiration = _future(duration)
         access_key = _gen_session_access_key()
         secret_key = _gen_secret()
         session_token = _gen_session_token()
         role_id = "AROA" + new_uuid().replace("-", "")[:17].upper()
-        # Real AWS returns the assumed-role ARN under the `sts` service,
-        # not `iam` — e.g. arn:aws:sts::123456789012:assumed-role/demo/TestAR.
-        assumed_arn = role_arn.replace(":iam:", ":sts:", 1).replace(":role/", ":assumed-role/", 1)
-        if not assumed_arn.endswith(f"/{session_name}"):
-            assumed_arn = f"{assumed_arn}/{session_name}"
         _sessions[access_key] = {"Arn": assumed_arn, "UserId": f"{role_id}:{session_name}"}
         if use_json:
             return json_response({
@@ -111,13 +137,13 @@ async def handle_request(method, path, headers, body, query_params):
     if action == "AssumeRoleWithWebIdentity":
         role_arn = _p(params, "RoleArn")
         session = _p(params, "RoleSessionName", "session")
+        assumed_arn, validation_error = _assumed_role_arn(role_arn, session)
+        if validation_error:
+            return validation_error
         duration = int(_p(params, "DurationSeconds") or 3600)
         access_key = _gen_session_access_key()
         secret_key = _gen_secret()
         session_token = _gen_session_token()
-        assumed_arn = role_arn.replace(":iam:", ":sts:", 1).replace(":role/", ":assumed-role/", 1)
-        if not assumed_arn.endswith(f"/{session}"):
-            assumed_arn = f"{assumed_arn}/{session}"
         role_id = "AROA" + new_uuid().replace("-", "")[:17].upper()
         _sessions[access_key] = {"Arn": assumed_arn, "UserId": f"{role_id}:{session}"}
         provider = _p(params, "ProviderId") or "sts.amazonaws.com"
