@@ -10,6 +10,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 ### Added
 - **CloudFormation / API Gateway — `AWS::ApiGateway::RestApi` partially supports the OpenAPI `Body` property** — This implementation is very incomplete. See #928.
 
+### Fixed
+- **Step Functions — `lambda:invoke.waitForTaskToken` now delivers the unwrapped `Payload` to the handler** — the callback path forwarded the whole service-integration envelope (`{"FunctionName": ..., "Payload": {...}}`) to the Lambda instead of just the `Payload`, mirroring the synchronous `lambda:invoke` path. Handlers reading their task token / input from the top level (the standard `.waitForTaskToken` pattern) saw them nested under `Payload`, never resumed the task, and the execution hung until timeout.
+
 ---
 
 ## [1.3.66] — 2026-06-22

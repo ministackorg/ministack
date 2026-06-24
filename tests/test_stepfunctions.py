@@ -1581,6 +1581,82 @@ def test_sfn_integration_sqs_send_message_wait_for_task_token(sfn, sqs):
     desc = _wait_sfn(sfn, ex["executionArn"])
     assert desc["status"] == "SUCCEEDED"
 
+def test_sfn_integration_lambda_invoke_wait_for_task_token(sfn, lam):
+    """lambda:invoke.waitForTaskToken must deliver the *unwrapped* Payload to
+    the handler, exactly like the synchronous lambda:invoke path.
+
+    Regression: the callback path forwarded the whole service-integration
+    envelope ({"FunctionName": ..., "Payload": {...}}) to the Lambda, so a
+    handler reading top-level keys (e.g. ``event["taskToken"]`` /
+    ``event["input"]``) saw them nested under ``Payload`` and could neither
+    find its task token nor its arguments, hanging the execution forever.
+    """
+    import uuid as _uuid
+
+    fn = f"intg-sfn-wfett-{_uuid.uuid4().hex[:8]}"
+    # The handler reads the token + input from the TOP LEVEL (as AWS delivers
+    # them) and completes the task itself, echoing back what it received.
+    code = (
+        "import json, os, boto3\n"
+        "def handler(event, context):\n"
+        "    token = event['taskToken']\n"
+        "    sfn = boto3.client('stepfunctions', endpoint_url=os.environ['AWS_ENDPOINT_URL'])\n"
+        "    sfn.send_task_success(\n"
+        "        taskToken=token,\n"
+        "        output=json.dumps({'top_keys': sorted(event.keys()), 'echo_input': event['input']}),\n"
+        "    )\n"
+        "    return {}\n"
+    )
+    lam.create_function(
+        FunctionName=fn,
+        Runtime="python3.12",
+        Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _make_zip(code)},
+    )
+    func_arn = f"arn:aws:lambda:us-east-1:000000000000:function:{fn}"
+
+    definition = json.dumps(
+        {
+            "StartAt": "CallbackTask",
+            "States": {
+                "CallbackTask": {
+                    "Type": "Task",
+                    "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
+                    "Parameters": {
+                        "FunctionName": func_arn,
+                        "Payload": {
+                            "taskToken.$": "$$.Task.Token",
+                            "id.$": "$$.Execution.Name",
+                            "input.$": "$",
+                        },
+                    },
+                    "TimeoutSeconds": 30,
+                    "End": True,
+                },
+            },
+        }
+    )
+    sm = sfn.create_state_machine(
+        name=f"sfn-wfett-{_uuid.uuid4().hex[:8]}",
+        definition=definition,
+        roleArn="arn:aws:iam::000000000000:role/R",
+    )
+    ex = sfn.start_execution(
+        stateMachineArn=sm["stateMachineArn"],
+        input=json.dumps({"hello": "world"}),
+    )
+    desc = _wait_sfn(sfn, ex["executionArn"], timeout=30)
+    assert desc["status"] == "SUCCEEDED", (
+        f"execution did not succeed ({desc['status']}); the handler could not "
+        f"read its top-level taskToken/input — Payload was not unwrapped"
+    )
+    output = json.loads(desc["output"])
+    # The handler must have seen the unwrapped Payload: top-level taskToken/id/
+    # input, and NOT the service-integration wrapper keys.
+    assert output["top_keys"] == ["id", "input", "taskToken"], output["top_keys"]
+    assert output["echo_input"] == {"hello": "world"}
+
 def test_sfn_integration_sns_publish(sfn, sns):
     """Task state publishes to SNS via arn:aws:states:::sns:publish."""
     topic = sns.create_topic(Name="sfn-integ-sns-test")

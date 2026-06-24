@@ -1566,8 +1566,16 @@ def _invoke_with_callback(resource, input_data, token, state_def):
             func_name = func_name.split(":function:")[-1].split(":")[0]
 
     if func_name:
+        # For lambda:invoke[.waitForTaskToken] the resolved Parameters wrap the
+        # Lambda event under "Payload" (alongside "FunctionName"). Deliver only
+        # the Payload, mirroring the synchronous lambda:invoke path
+        # (_invoke_resource). Otherwise the handler receives the integration
+        # envelope ({"FunctionName": ..., "Payload": {...}}) instead of its
+        # input and fails to find the task token / its arguments.
+        lambda_payload = input_data.get("Payload", input_data) \
+            if isinstance(input_data, dict) else input_data
         try:
-            _call_lambda(func_name, input_data)
+            _call_lambda(func_name, lambda_payload)
         except _ExecutionError:
             pass
     else:
