@@ -1781,6 +1781,78 @@ def test_sfn_integration_dynamodb_error_catch(sfn, ddb):
     assert output["recovered"] == "caught"
     assert "Error" in output["error"]
 
+def test_sfn_integration_lambda_invoke_failure_cause_is_json(sfn, lam):
+    """A failed lambda:invoke task must set Cause to a JSON-encoded error
+    payload, exactly like AWS.
+
+    Regression: Cause was set to the bare ``errorMessage`` string instead of
+    the JSON object ``{"errorType": ..., "errorMessage": ..., "trace": [...]}``.
+    Catch handlers and downstream tasks routinely ``json.loads(Cause)`` to read
+    ``errorType`` / ``errorMessage``; the bare string made that parse blow up.
+    """
+    import uuid as _uuid
+
+    fn = f"intg-sfn-failcause-{_uuid.uuid4().hex[:8]}"
+    code = (
+        "class WidgetError(Exception):\n"
+        "    pass\n"
+        "def handler(event, context):\n"
+        "    raise WidgetError('widget exploded')\n"
+    )
+    lam.create_function(
+        FunctionName=fn,
+        Runtime="python3.12",
+        Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _make_zip(code)},
+    )
+    func_arn = f"arn:aws:lambda:us-east-1:000000000000:function:{fn}"
+
+    definition = json.dumps(
+        {
+            "StartAt": "Boom",
+            "States": {
+                "Boom": {
+                    "Type": "Task",
+                    "Resource": "arn:aws:states:::lambda:invoke",
+                    "Parameters": {"FunctionName": func_arn, "Payload": {}},
+                    "Catch": [
+                        {
+                            "ErrorEquals": ["States.ALL"],
+                            "Next": "Fallback",
+                            "ResultPath": "$.error",
+                        }
+                    ],
+                    "End": True,
+                },
+                "Fallback": {
+                    "Type": "Pass",
+                    "Result": "caught",
+                    "ResultPath": "$.recovered",
+                    "End": True,
+                },
+            },
+        }
+    )
+    sm = sfn.create_state_machine(
+        name=f"sfn-failcause-{_uuid.uuid4().hex[:8]}",
+        definition=definition,
+        roleArn="arn:aws:iam::000000000000:role/R",
+    )
+    ex = sfn.start_execution(stateMachineArn=sm["stateMachineArn"], input="{}")
+
+    desc = _wait_sfn(sfn, ex["executionArn"], timeout=30)
+    assert desc["status"] == "SUCCEEDED", desc.get("status")
+    output = json.loads(desc["output"])
+
+    # Cause must be a JSON-encoded string, parseable into the AWS error shape.
+    cause_raw = output["error"]["Cause"]
+    assert isinstance(cause_raw, str)
+    cause = json.loads(cause_raw)
+    assert cause.get("errorType"), cause
+    assert cause["errorMessage"] == "widget exploded", cause
+
+
 def test_sfn_integration_ecs_run_task(sfn, ecs):
     """Task state triggers ecs:runTask (fire-and-forget, no Docker needed)."""
     ecs.create_cluster(clusterName="sfn-ecs-test")
