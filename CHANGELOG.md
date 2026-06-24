@@ -5,10 +5,19 @@ All notable changes to MiniStack will be documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning follows [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [1.3.67] — 2026-06-24
 
 ### Added
-- **CloudFormation / API Gateway — `AWS::ApiGateway::RestApi` partially supports the OpenAPI `Body` property** — This implementation is very incomplete. See #928.
+- **CloudFormation / API Gateway — `AWS::ApiGateway::RestApi` imports an OpenAPI `Body`** — a REST API defined inline through the `Body` property now materializes its paths, methods, and `x-amazon-apigateway-integration` blocks as real resources, methods, and integrations, covering the basic SAM-transform Swagger 2.0 + Lambda-proxy shape. Partial support; authorization, request/response validation, and most extensions are not yet handled. Contributed by @maximoosemine.
+- **EC2 — IAM instance profile association APIs** — `AssociateIamInstanceProfile`, `DescribeIamInstanceProfileAssociations`, `ReplaceIamInstanceProfileAssociation`, and `DisassociateIamInstanceProfile` are now implemented; launch-time associations are backfilled and cleared on termination, so Terraform's `aws_instance` `iam_instance_profile` round-trips without drift. Contributed by @D-artisan.
+
+### Changed
+- **Docs — clarified that the AWS SAM transform macro is not supported** — `Transform: AWS::Serverless-2016-10-31` is not expanded, so a SAM template still needs the CDK/CloudFormation-synthesized form; the README now points to the IaC docs and MiniStack MCP for current guidance. Contributed by @dashitongzhi.
+
+### Fixed
+- **Cognito — OAuth2 token endpoint no longer consumes the authorization code on a failed client-secret check** — a bad or absent client secret consumed the one-time code before failing, so a client that authenticates in two steps (HTTP Basic, then a `client_secret_post` fallback, as Go/Vault does) got `invalid_grant` on the retry. The client credentials are now validated before the code is consumed, so HTTP Basic client authentication succeeds. Reported by @pny-nc.
+- **API Gateway v1 — literal path segments resolve ahead of a `{param}` sibling regardless of creation order** — a literal path (e.g. `/users/verifyUserEmail`) returned 405 when a `{id}` sibling under the same parent was registered first, because resolution followed resource-creation order instead of AWS specificity. Resolution now orders literal > `{param}` > `{proxy+}`. Reported by @ethan-dyas438.
+- **RDS Data API — `:name` placeholders are substituted by whole token** — the earlier substring replacement could corrupt an unrelated longer token (a `:id` parameter ate into a literal `:identity`) and was fragile around `::type` casts. Substitution is now a single token-aware pass, keeping `:1`/`:10` distinct, leaving `::jsonb` casts intact, and passing through any `:word` that is not a supplied parameter. Reported by @awilson9.
 
 ---
 
