@@ -21,7 +21,7 @@ def _ar():
 
 def test_bedrock_ar_retrieve_returns_results_envelope():
     resp = _ar().retrieve(
-        knowledgeBaseId="kb-test",
+        knowledgeBaseId="KBTEST1234",
         retrievalQuery={"text": "what is AWS?"},
     )
     assert "retrievalResults" in resp
@@ -288,3 +288,79 @@ def test_bedrock_ar_tag_resource():
     _ar().untag_resource(resourceArn=arn, tagKeys=["env"])
     lst2 = _ar().list_tags_for_resource(resourceArn=arn)
     assert "env" not in lst2["tags"]
+
+
+def test_bedrock_ar_tag_resource_rejects_malformed_arn():
+    try:
+        _ar().tag_resource(resourceArn="not-an-arn-but-long-enough", tags={"env": "prod"})
+    except botocore.exceptions.ClientError as exc:
+        assert exc.response["Error"]["Code"] == "ValidationException"
+    else:
+        raise AssertionError("expected ValidationException")
+
+
+def test_bedrock_ar_tag_resource_rejects_malformed_session_arn():
+    arn = "arn:aws:bedrock:us-east-1:000000000000:session"
+    try:
+        _ar().tag_resource(resourceArn=arn, tags={"env": "prod"})
+    except botocore.exceptions.ClientError as exc:
+        assert exc.response["Error"]["Code"] == "ValidationException"
+    else:
+        raise AssertionError("expected ValidationException")
+
+
+def test_bedrock_ar_tag_resource_rejects_wrong_scope_arn():
+    session = _ar().create_session()
+    wrong_region = session["sessionArn"].replace(":us-east-1:", ":us-west-2:")
+    try:
+        _ar().tag_resource(resourceArn=wrong_region, tags={"env": "prod"})
+    except botocore.exceptions.ClientError as exc:
+        assert exc.response["Error"]["Code"] == "ResourceNotFoundException"
+    else:
+        raise AssertionError("expected ResourceNotFoundException")
+
+
+def test_bedrock_ar_tag_resource_rejects_noncanonical_partition_arn():
+    session = _ar().create_session()
+    wrong_partition = session["sessionArn"].replace("arn:aws:", "arn:aws-cn:", 1)
+    try:
+        _ar().tag_resource(resourceArn=wrong_partition, tags={"env": "prod"})
+    except botocore.exceptions.ClientError as exc:
+        assert exc.response["Error"]["Code"] == "ResourceNotFoundException"
+    else:
+        raise AssertionError("expected ResourceNotFoundException")
+
+
+def test_bedrock_ar_tag_resource_rejects_wrong_service_arn():
+    session = _ar().create_session()
+    wrong_service = session["sessionArn"].replace(":bedrock:", ":lambda:")
+    try:
+        _ar().tag_resource(resourceArn=wrong_service, tags={"env": "prod"})
+    except botocore.exceptions.ClientError as exc:
+        assert exc.response["Error"]["Code"] == "ValidationException"
+    else:
+        raise AssertionError("expected ValidationException")
+
+
+def test_bedrock_ar_tag_resource_rejects_flow_execution_arn():
+    execution = _ar().start_flow_execution(
+        flowIdentifier="FLTAG",
+        flowAliasIdentifier="FATAG",
+        inputs=[{"content": {"document": "input"}, "nodeName": "InputNode", "nodeOutputName": "document"}],
+    )
+    try:
+        _ar().tag_resource(resourceArn=execution["executionArn"], tags={"env": "prod"})
+    except botocore.exceptions.ClientError as exc:
+        assert exc.response["Error"]["Code"] == "ValidationException"
+    else:
+        raise AssertionError("expected ValidationException")
+
+
+def test_bedrock_ar_list_tags_rejects_unknown_resource_arn():
+    arn = "arn:aws:bedrock:us-east-1:000000000000:session/SESSIONMISSING"
+    try:
+        _ar().list_tags_for_resource(resourceArn=arn)
+    except botocore.exceptions.ClientError as exc:
+        assert exc.response["Error"]["Code"] == "ResourceNotFoundException"
+    else:
+        raise AssertionError("expected ResourceNotFoundException")
