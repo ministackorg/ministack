@@ -848,7 +848,16 @@ def _fanout(topic_arn: str, msg_id: str, message: str, subject: str,
                 daemon=True,
             ).start()
         elif protocol == "lambda":
-            _deliver_to_lambda(endpoint, envelope, topic_arn, sub["arn"], msg_id, effective_message, message_attributes or {})
+            # SNS delivers to Lambda asynchronously: Publish returns as soon as
+            # the notification is accepted and must not block on the
+            # subscriber's execution. Deliver on a background thread, mirroring
+            # the http(s) path above; a slow or failing subscriber Lambda no
+            # longer stalls the Publish call (or its upstream caller).
+            _threading.Thread(
+                target=_deliver_to_lambda,
+                args=(endpoint, envelope, topic_arn, sub["arn"], msg_id, effective_message, message_attributes or {}),
+                daemon=True,
+            ).start()
         elif protocol == "email" or protocol == "email-json":
             logger.info("SNS fanout → email %s (stub)", endpoint)
         elif protocol == "sms":
