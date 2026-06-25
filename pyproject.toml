@@ -35,6 +35,7 @@ full = [
     "psycopg2-binary>=2.9",
     "pymysql>=1.1",
     "asyncssh>=2.14",
+    "aws-sam-translator>=1.90",
 ]
 dev = [
     "boto3>=1.34",
@@ -50,6 +51,7 @@ dev = [
     "mypy-boto3-lambda (>=1.42.85,<2.0.0)",
     "asyncssh>=2.14",
     "websockets>=12.0",
+    "aws-sam-translator>=1.90",
 ]
 
 [project.urls]
