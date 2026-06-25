@@ -2194,6 +2194,25 @@ def test_oauth2_token_failed_client_auth_does_not_consume_code():
     assert 'access_token' in json.loads(body)
 
 
+def test_oauth2_basic_auth_url_decodes_client_secret():
+    """HTTP Basic client auth carries client_id/client_secret form-urlencoded
+    before base64 (RFC 6749 §2.3.1), so a secret containing '/' or '+' arrives
+    as %2F/%2B. _authenticate_client must decode it to match the stored secret,
+    otherwise client_secret_basic fails for any secret with special characters
+    (#932). The client_secret_post path already decodes via parse_qs."""
+    import base64 as _b64
+    from urllib.parse import quote_plus
+
+    from ministack.services.cognito import _authenticate_client
+
+    cid = "VxSsBWVIKMZK29W0IN6TKJN8EF"
+    for secret in ("ab/cd+ef/gh", "no-specials-here"):
+        basic = _b64.b64encode(f"{cid}:{quote_plus(secret)}".encode()).decode()
+        got_cid, got_secret = _authenticate_client({"authorization": f"Basic {basic}"}, {})
+        assert got_cid == cid
+        assert got_secret == secret, f"Basic auth must decode to {secret!r}, got {got_secret!r}"
+
+
 def test_oauth2_id_token_echoes_nonce():
     """OIDC requires the id_token to echo the nonce from the authorize request
     so clients can mitigate replay. Strict OIDC clients (oidc-client-ts,

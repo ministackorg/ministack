@@ -5,6 +5,16 @@ All notable changes to MiniStack will be documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning follows [Semantic Versioning](https://semver.org/).
 
+## [1.3.68] — 2026-06-25
+
+### Fixed
+- **Cognito — OAuth2 token endpoint URL-decodes HTTP Basic client credentials** — a `client_secret` containing `/` or `+` arrives in the `Authorization: Basic` header as `%2F`/`%2B` (RFC 6749 §2.3.1 form-urlencodes the client id and secret before base64). MiniStack did not decode them, so `client_secret_basic` failed with `invalid_client` for any secret with special characters. The credentials are now decoded, matching the `client_secret_post` path. Reported by @pny-nc.
+- **Step Functions — `lambda:invoke.waitForTaskToken` delivers the unwrapped `Payload`** — the callback path forwarded the whole service-integration envelope (`{"FunctionName": ..., "Payload": {...}}`) to the Lambda instead of just the `Payload`, unlike the synchronous `lambda:invoke` path. A handler reading its task token / input from the top level saw them nested under `Payload`, never resumed the task, and the execution hung until timeout. Contributed by @ryan-bennett.
+- **Step Functions — a failed `lambda:invoke` task sets `Cause` to a JSON-encoded error payload** — `Cause` was the bare `errorMessage` string instead of AWS's JSON object (`{"errorType": ..., "errorMessage": ..., "trace": [...]}`), so `Catch` handlers and downstream tasks that `json.loads(Cause)` to read `errorType`/`errorMessage` failed to parse it. `Cause` now matches the AWS wire form. Contributed by @ryan-bennett.
+- **SNS — `lambda` subscribers are delivered to asynchronously** — fanout invoked a `lambda`-protocol subscriber synchronously inside `Publish`, so a slow or hung subscriber Lambda blocked the `Publish` call and its upstream caller (e.g. a Step Functions task publishing a notification). Delivery now runs on a background thread, matching AWS's asynchronous SNS→Lambda delivery, so `Publish` returns immediately. Contributed by @ryan-bennett.
+
+---
+
 ## [1.3.67] — 2026-06-24
 
 ### Added
