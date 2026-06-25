@@ -28,6 +28,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import struct
 import threading
 import time
@@ -38,6 +39,9 @@ from ministack.core.persistence import PERSIST_STATE, load_state
 from ministack.core.responses import AccountScopedDict, get_account_id, get_region, md5_hash, new_uuid, now_iso
 
 logger = logging.getLogger("sqs")
+
+# XML 1.0 forbidden characters: everything below #x20 except #x9/#xA/#xD, plus #xFFFE and #xFFFF
+_INVALID_SQS_CHARS_RE = re.compile("[\x00-\x08\x0b\x0c\x0e-\x1f\ufffe\uffff]")
 
 # ── Module-level state ──────────────────────────────────────
 
@@ -331,6 +335,11 @@ def _act_send_message(data: dict, qurl: str) -> dict:
     if not body_text:
         raise _Err("MissingParameter",
                     "The request must contain the parameter MessageBody.")
+    if _INVALID_SQS_CHARS_RE.search(body_text):
+        raise _Err(
+            "InvalidMessageContents",
+            "The message contains characters outside the allowed set.",
+        )
 
     # AWS SQS rejects messages exceeding the queue's MaximumMessageSize attribute
     # (default 262144 bytes; configurable up to 1 MiB / 1048576). Real AWS error

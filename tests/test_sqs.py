@@ -1084,3 +1084,53 @@ def test_sqs_create_queue_rejects_non_numeric_visibility_timeout(sqs):
         assert exc.response["Error"]["Code"] == "InvalidAttributeValue"
     else:
         raise AssertionError("expected InvalidAttributeValue for non-numeric")
+
+
+def test_sqs_send_message_rejects_control_chars(sqs):
+    """SendMessage must reject message bodies containing XML 1.0 forbidden characters.
+
+    AWS SQS only allows: #x9 | #xA | #xD | [#x20-#xD7FF] | [#xE000-#xFFFD] | [#x10000-#x10FFFF]
+    Control characters like NULL, BEL, VT, etc. must result in InvalidMessageContents (400).
+    See: https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/quotas-messages.html
+    """
+    url = sqs.create_queue(QueueName="intg-sqs-invalid-chars")["QueueUrl"]
+
+    forbidden = [
+        "\x00",        # NULL
+        "\x01",        # SOH
+        "\x08",        # BS (last before tab)
+        "\x0b",        # VT (vertical tab)
+        "\x0c",        # FF (form feed)
+        "\x0e",        # SO (first after CR)
+        "\x1f",        # US (last C0 control char)
+        "hello\x00world",  # control char embedded in normal text
+        "\ufffe",      # non-character
+        "\uffff",      # non-character
+    ]
+    for body in forbidden:
+        with pytest.raises(ClientError) as exc:
+            sqs.send_message(QueueUrl=url, MessageBody=body)
+        code = exc.value.response["Error"]["Code"]
+        assert code == "InvalidMessageContents", (
+            f"expected InvalidMessageContents for {repr(body)}, got {code}"
+        )
+        assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+
+
+def test_sqs_send_message_allows_valid_chars(sqs):
+    """SendMessage must allow all XML 1.0 valid characters including tab, LF, CR, and Unicode."""
+    url = sqs.create_queue(QueueName="intg-sqs-valid-chars")["QueueUrl"]
+
+    allowed = [
+        "hello world",
+        "tab\there",
+        "newline\nhere",
+        "cr\rhere",
+        "こんにちは世界",
+        "héllo wörld",
+        "emoji \U0001f600",
+        "!@#$%^&*()",
+    ]
+    for body in allowed:
+        resp = sqs.send_message(QueueUrl=url, MessageBody=body)
+        assert "MessageId" in resp, f"send failed for {repr(body)}"
