@@ -11,6 +11,7 @@ from ministack.core.responses import get_account_id, new_uuid, now_iso
 
 from .engine import (
     _NO_VALUE,
+    _apply_sam_transform_if_applicable,
     _evaluate_conditions,
     _parse_template,
     _resolve_parameters,
@@ -135,6 +136,7 @@ def _create_change_set(params):
 
     try:
         template = _parse_template(template_body)
+        template = _apply_sam_transform_if_applicable(template)
     except Exception as e:
         return _error("ValidationError", f"Template format error: {e}")
 

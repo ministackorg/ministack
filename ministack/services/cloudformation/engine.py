@@ -4,11 +4,14 @@ condition evaluation, intrinsic function resolution, and topological sorting.
 """
 
 import base64
+import copy
 import heapq
 import json
+import logging
 import os
 import re
 from collections import defaultdict
+from types import SimpleNamespace
 
 import yaml
 
@@ -560,3 +563,43 @@ def _topological_sort(resources: dict, conditions: dict) -> list:
         )
 
     return result
+
+
+# ===========================================================================
+# SAM Transform
+# ===========================================================================
+
+_SAM_TRANSFORM = "AWS::Serverless-2016-10-31"
+
+# Supress benign errors from samtranslator
+logging.getLogger("samtranslator.feature_toggle.feature_toggle").setLevel(logging.ERROR)
+
+_NO_IAM_POLICY_LOADER = SimpleNamespace(load=lambda: {})
+
+def _apply_sam_transform_if_applicable(template: dict) -> dict:
+    declared = template.get("Transform")
+    transforms = declared if isinstance(declared, list) else [declared]
+    if _SAM_TRANSFORM not in transforms:
+        return template
+
+    try:
+        from samtranslator.translator.transform import transform as _sam_transform
+    except ImportError as e:
+        raise ValueError(
+            "Template uses the AWS::Serverless-2016-10-31 transform, but the SAM "
+            "transform was not applied because the optional 'aws-sam-translator' "
+            "package is not installed. Either run ministack's 'full' image (or "
+            "`pip install ministack[full]`) to enable SAM support, or expand the "
+            "template to native CloudFormation first (e.g. `sam build` / "
+            "`aws cloudformation package`). See https://ministack.org/docs/iac#sam"
+        ) from e
+
+    prev_region = os.environ.get("AWS_DEFAULT_REGION")
+    os.environ["AWS_DEFAULT_REGION"] = get_region()
+    try:
+        return _sam_transform(copy.deepcopy(template), {}, _NO_IAM_POLICY_LOADER)
+    finally:
+        if prev_region is None:
+            os.environ.pop("AWS_DEFAULT_REGION", None)
+        else:
+            os.environ["AWS_DEFAULT_REGION"] = prev_region
