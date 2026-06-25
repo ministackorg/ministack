@@ -47,6 +47,7 @@ import zlib
 from datetime import datetime, timezone
 from urllib.parse import unquote
 
+from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountRegionScopedDict,
@@ -89,12 +90,67 @@ _FAMILY_PATTERNS = [
     ("deepseek", re.compile(r"(^|[./])deepseek\.", re.I)),
 ]
 
+_BEDROCK_RUNTIME_MODEL_RESOURCE_TYPES = {
+    "application-inference-profile",
+    "custom-model",
+    "custom-model-deployment",
+    "default-prompt-router",
+    "imported-model",
+    "inference-profile",
+    "prompt",
+    "prompt-router",
+    "provisioned-model",
+}
+
 
 def _family(model_id: str) -> str:
     for name, pat in _FAMILY_PATTERNS:
         if pat.search(model_id):
             return name
     return "generic"
+
+
+def _foundation_model_arn(model_id: str) -> str:
+    return f"arn:aws:bedrock:{get_region()}::foundation-model/{model_id}"
+
+
+def _normalize_model_id(model_id: str) -> tuple[str, str, tuple | None]:
+    if not isinstance(model_id, str) or not model_id:
+        return "", "", _error("ValidationException", "modelId is required.", 400)
+    if not model_id.startswith("arn:"):
+        return model_id, _foundation_model_arn(model_id), None
+
+    try:
+        spec = parse_arn(model_id)
+    except ArnParseError:
+        return "", "", _error("ValidationException", f"Invalid modelId ARN: {model_id}", 400)
+    if spec.partition != "aws" or spec.region != get_region():
+        return "", "", _error("ValidationException", f"Invalid modelId ARN: {model_id}", 400)
+    if spec.service == "sagemaker":
+        endpoint_prefix = "endpoint/"
+        if (
+            spec.account_id != get_account_id()
+            or not spec.resource.startswith(endpoint_prefix)
+            or not spec.resource[len(endpoint_prefix):]
+            or "/" in spec.resource[len(endpoint_prefix):]
+        ):
+            return "", "", _error("ValidationException", f"Invalid modelId ARN: {model_id}", 400)
+        return model_id, model_id, None
+    if spec.service != "bedrock":
+        return "", "", _error("ValidationException", f"Invalid modelId ARN: {model_id}", 400)
+
+    resource_type, sep, resource_id = spec.resource.partition("/")
+    if not sep or not resource_id:
+        return "", "", _error("ValidationException", f"Invalid modelId ARN: {model_id}", 400)
+    if resource_type == "foundation-model":
+        if spec.account_id != "" or "/" in resource_id:
+            return "", "", _error("ValidationException", f"Invalid modelId ARN: {model_id}", 400)
+        return model_id, model_id, None
+    if resource_type in _BEDROCK_RUNTIME_MODEL_RESOURCE_TYPES:
+        if spec.account_id != get_account_id():
+            return "", "", _error("ValidationException", f"Invalid modelId ARN: {model_id}", 400)
+        return model_id, model_id, None
+    return "", "", _error("ValidationException", f"Invalid modelId ARN: {model_id}", 400)
 
 
 # ---------------------------------------------------------------------------
@@ -260,6 +316,9 @@ def _validate_converse_request(body_obj) -> tuple | None:
 
 
 def _converse(model_id: str, headers, body) -> tuple:
+    model_id, _model_arn, err = _normalize_model_id(model_id)
+    if err:
+        return err
     try:
         body_obj = json.loads(body or b"{}")
     except json.JSONDecodeError:
@@ -357,6 +416,9 @@ def _build_converse_stream(model_id: str, messages, system, started_at_ms: int, 
 
 
 def _converse_stream(model_id: str, headers, body) -> tuple:
+    model_id, _model_arn, err = _normalize_model_id(model_id)
+    if err:
+        return err
     try:
         body_obj = json.loads(body or b"{}")
     except json.JSONDecodeError:
@@ -497,6 +559,9 @@ def _build_invoke_response_body(family: str, model_id: str, prompt: str, reply: 
 
 def _invoke_model(model_id: str, headers, body) -> tuple:
     """POST /model/{modelId}/invoke — body is raw JSON in model-family shape."""
+    model_id, _model_arn, err = _normalize_model_id(model_id)
+    if err:
+        return err
     if not body:
         return _error("ValidationException", "Request body is required.", 400)
     try:
@@ -629,6 +694,9 @@ def _es_event_chunk(inner: dict) -> bytes:
 
 
 def _invoke_model_with_response_stream(model_id: str, headers, body) -> tuple:
+    model_id, _model_arn, err = _normalize_model_id(model_id)
+    if err:
+        return err
     if not body:
         return _error("ValidationException", "Request body is required.", 400)
     try:
@@ -737,6 +805,9 @@ def _start_async_invoke(body) -> tuple:
         return _error("ValidationException", "Body must be a JSON object.", 400)
     if not body_obj.get("modelId"):
         return _error("ValidationException", "modelId is required.", 400)
+    _model_id, model_arn, err = _normalize_model_id(body_obj["modelId"])
+    if err:
+        return err
     if "modelInput" not in body_obj:
         return _error("ValidationException", "modelInput is required.", 400)
     if "outputDataConfig" not in body_obj:
@@ -746,7 +817,7 @@ def _start_async_invoke(body) -> tuple:
     now = datetime.now(timezone.utc).isoformat()
     record = {
         "invocationArn": arn,
-        "modelArn": f"arn:aws:bedrock:{get_region()}::foundation-model/{body_obj['modelId']}",
+        "modelArn": model_arn,
         "clientRequestToken": body_obj.get("clientRequestToken", uuid.uuid4().hex),
         "status": "Completed",
         "submitTime": now,
