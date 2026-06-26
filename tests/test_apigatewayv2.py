@@ -1305,6 +1305,79 @@ def test_apigw_request_mapping_claims_to_headers(apigw, cognito_idp):
         cognito_idp.delete_user_pool(UserPoolId=pool_id)
 
 
+def test_apigw_resolve_jwks_url_uses_oidc_discovery(monkeypatch):
+    """Non-Cognito issuers: jwks_uri is read from OIDC discovery, not hardcoded.
+
+    Regression test for issuers like Salesforce that publish their keys at a path
+    other than {issuer}/.well-known/jwks.json (e.g. /id/keys).
+    """
+    import asyncio
+
+    from ministack.services import apigateway as apigw_mod
+
+    issuer = "https://example-idp.test"
+    discovery_url = f"{issuer}/.well-known/openid-configuration"
+    real_jwks_uri = f"{issuer}/id/keys"
+    calls = {"urls": []}
+
+    async def _fake_urlopen(request_or_url, _timeout_seconds):
+        calls["urls"].append(request_or_url)
+        body = json.dumps({"jwks_uri": real_jwks_uri}).encode("utf-8")
+        return 200, {"Content-Type": "application/json"}, body
+
+    monkeypatch.setattr(apigw_mod, "_urlopen_async", _fake_urlopen)
+    monkeypatch.setattr(apigw_mod, "_oidc_config_cache", apigw_mod.AccountScopedDict())
+
+    authorizer = {"jwtConfiguration": {"Issuer": issuer, "Audience": ["ms-client"]}}
+    resolved = asyncio.run(apigw_mod._resolve_jwks_url(authorizer))
+
+    assert resolved == real_jwks_uri
+    assert calls["urls"] == [discovery_url]
+
+
+def test_apigw_resolve_jwks_url_falls_back_when_discovery_unavailable(monkeypatch):
+    """If OIDC discovery fails, fall back to the conventional jwks.json path."""
+    import asyncio
+
+    from ministack.services import apigateway as apigw_mod
+
+    issuer = "https://unreachable-idp.test"
+
+    async def _failing_urlopen(_request_or_url, _timeout_seconds):
+        raise OSError("connection refused")
+
+    monkeypatch.setattr(apigw_mod, "_urlopen_async", _failing_urlopen)
+    monkeypatch.setattr(apigw_mod, "_oidc_config_cache", apigw_mod.AccountScopedDict())
+
+    authorizer = {"jwtConfiguration": {"Issuer": issuer, "Audience": ["ms-client"]}}
+    resolved = asyncio.run(apigw_mod._resolve_jwks_url(authorizer))
+
+    assert resolved == f"{issuer}/.well-known/jwks.json"
+
+
+def test_apigw_resolve_jwks_url_cognito_skips_discovery(monkeypatch):
+    """Cognito issuers keep using the local pool JWKS — no discovery call."""
+    import asyncio
+
+    from ministack.services import apigateway as apigw_mod
+
+    issuer = "https://cognito-idp.us-east-1.amazonaws.com/us-east-1_pool123"
+    called = {"hit": False}
+
+    async def _should_not_be_called(_request_or_url, _timeout_seconds):
+        called["hit"] = True
+        return 200, {}, b"{}"
+
+    monkeypatch.setattr(apigw_mod, "_urlopen_async", _should_not_be_called)
+    monkeypatch.setattr(apigw_mod, "_oidc_config_cache", apigw_mod.AccountScopedDict())
+
+    authorizer = {"jwtConfiguration": {"Issuer": issuer, "Audience": ["ms-client"]}}
+    resolved = asyncio.run(apigw_mod._resolve_jwks_url(authorizer))
+
+    assert resolved.endswith("/us-east-1_pool123/.well-known/jwks.json")
+    assert called["hit"] is False
+
+
 def test_apigw_http_proxy_does_not_block_parallel_ddb(monkeypatch):
     import asyncio
 

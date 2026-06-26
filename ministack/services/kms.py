@@ -27,7 +27,7 @@ logger = logging.getLogger("kms")
 try:
     from cryptography.exceptions import InvalidSignature
     from cryptography.hazmat.primitives import hashes, serialization
-    from cryptography.hazmat.primitives.asymmetric import ec, padding, rsa, utils
+    from cryptography.hazmat.primitives.asymmetric import ec, ed25519, padding, rsa, utils
     HAS_CRYPTO = True
 except ImportError:
     InvalidSignature = Exception
@@ -280,6 +280,22 @@ def _create_key(data):
         }
         rec["SigningAlgorithms"] = signing_algo_map[key_spec]
         rec["EncryptionAlgorithms"] = []
+    elif key_spec == "ECC_NIST_EDWARDS25519":
+        err = _require_crypto("CreateKey")
+        if err:
+            return err
+        private_key = ed25519.Ed25519PrivateKey.generate()
+        rec["_private_key"] = private_key
+        rec["_public_key_der"] = private_key.public_key().public_bytes(
+            serialization.Encoding.DER,
+            serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+        # Real AWS exposes both for ECC_NIST_EDWARDS25519 — verified against the
+        # KMS Developer Guide "Supported signing algorithms for ECC key specs"
+        # table. PH variant is listed in metadata even though Sign/Verify return
+        # UnsupportedOperationException below until Ed25519ph lands.
+        rec["SigningAlgorithms"] = ["ED25519_SHA_512", "ED25519_PH_SHA_512"]
+        rec["EncryptionAlgorithms"] = []
     else:
         return error_response_json(
             "UnsupportedOperationException",
@@ -358,6 +374,41 @@ def _sign(data):
     else:
         message = message_b64
 
+    if algorithm in ("ED25519_SHA_512", "ED25519_PH_SHA_512"):
+        if rec["KeySpec"] != "ECC_NIST_EDWARDS25519":
+            return error_response_json(
+                "UnsupportedOperationException",
+                f"Signing algorithm {algorithm} is not supported for this key",
+                400,
+            )
+        # AWS KMS: "ED25519_SHA_512 signing algorithm requires MessageType:RAW,
+        # while ED25519_PH_SHA_512 requires MessageType:DIGEST. These message
+        # types cannot be used interchangeably." (Developer Guide).
+        if algorithm == "ED25519_SHA_512" and message_type != "RAW":
+            return error_response_json(
+                "UnsupportedOperationException",
+                "ED25519_SHA_512 signing algorithm requires MessageType=RAW",
+                400,
+            )
+        if algorithm == "ED25519_PH_SHA_512":
+            # HashEdDSA (Ed25519ph) — RFC 8032 §5.1 / FIPS 186-5 §7.8. The
+            # cryptography library does not expose the dom2 prefix needed for a
+            # spec-correct implementation, so we surface the gap honestly
+            # instead of routing through pure Ed25519 (which would produce
+            # signatures incompatible with real AWS KMS).
+            return error_response_json(
+                "UnsupportedOperationException",
+                "ED25519_PH_SHA_512 (Ed25519ph) signing is not yet implemented in this emulator",
+                400,
+            )
+        signature = rec["_private_key"].sign(message)
+        logger.debug("Signed %d bytes with key %s (%s)", len(message), key_id, algorithm)
+        return json_response({
+            "KeyId": rec["Arn"],
+            "Signature": base64.b64encode(signature).decode(),
+            "SigningAlgorithm": algorithm,
+        })
+
     pad, hash_algo = _signing_params(algorithm)
     if hash_algo is None:
         return error_response_json(
@@ -418,6 +469,40 @@ def _verify(data):
     message = base64.b64decode(message_b64) if isinstance(message_b64, str) else message_b64
     signature = base64.b64decode(signature_b64) if isinstance(signature_b64, str) else signature_b64
 
+    public_key = rec["_private_key"].public_key()
+    if algorithm in ("ED25519_SHA_512", "ED25519_PH_SHA_512"):
+        if rec["KeySpec"] != "ECC_NIST_EDWARDS25519":
+            return error_response_json(
+                "UnsupportedOperationException",
+                f"Signing algorithm {algorithm} is not supported for this key",
+                400,
+            )
+        if algorithm == "ED25519_SHA_512" and message_type != "RAW":
+            return error_response_json(
+                "UnsupportedOperationException",
+                "ED25519_SHA_512 signing algorithm requires MessageType=RAW",
+                400,
+            )
+        if algorithm == "ED25519_PH_SHA_512":
+            return error_response_json(
+                "UnsupportedOperationException",
+                "ED25519_PH_SHA_512 (Ed25519ph) verification is not yet implemented in this emulator",
+                400,
+            )
+        try:
+            public_key.verify(signature, message)
+        except InvalidSignature:
+            return error_response_json(
+                "KMSInvalidSignatureException",
+                "Signature verification failed",
+                400,
+            )
+        return json_response({
+            "KeyId": rec["Arn"],
+            "SignatureValid": True,
+            "SigningAlgorithm": algorithm,
+        })
+
     pad, hash_algo = _signing_params(algorithm, for_verify=True)
     if hash_algo is None:
         return error_response_json(
@@ -426,7 +511,6 @@ def _verify(data):
             400,
         )
 
-    public_key = rec["_private_key"].public_key()
     try:
         if pad is None:
             # ECDSA

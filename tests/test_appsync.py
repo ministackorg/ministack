@@ -2,12 +2,15 @@ import io
 import json
 import os
 import time
+import urllib.request
 import uuid as _uuid_mod
 import zipfile
 from urllib.parse import urlparse
 
 import pytest
 from botocore.exceptions import ClientError
+
+_ENDPOINT = "http://localhost:4566"
 
 
 def test_appsync_create_and_list_api():
@@ -305,3 +308,366 @@ def test_appsync_graphql_empty_query():
         assert False, "Should have failed"
     except urllib.error.HTTPError as e:
         assert e.code == 400
+
+
+# ---------------------------------------------------------------------------
+# AppSync Lambda resolver event shape — verifies full AppSyncResolverEvent is built.
+# ---------------------------------------------------------------------------
+
+def _appsync_lambda_zip(handler_code: str) -> bytes:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("index.py", handler_code)
+    return buf.getvalue()
+
+
+def _appsync_create_lambda(lam, fn_name, handler_code):
+    try:
+        lam.delete_function(FunctionName=fn_name)
+    except Exception:
+        pass
+    lam.create_function(
+        FunctionName=fn_name,
+        Runtime="python3.12",
+        Role="arn:aws:iam::000000000000:role/test-role",
+        Handler="index.handler",
+        Code={"ZipFile": _appsync_lambda_zip(handler_code)},
+    )
+    return lam.get_function(FunctionName=fn_name)["Configuration"]["FunctionArn"]
+
+
+def _appsync_graphql_post(api_url, query, variables=None, headers=None):
+    """Send a GraphQL POST request to the AppSync endpoint."""
+    payload = {"query": query}
+    if variables:
+        payload["variables"] = variables
+    req = urllib.request.Request(
+        api_url,
+        data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json", **(headers or {})},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=10) as r:
+        return json.loads(r.read())
+
+
+def _appsync_setup_api_with_lambda_resolver(appsync, lam, fn_name, handler_code):
+    """Create an AppSync API with API_KEY auth and a Lambda resolver for 'testField'."""
+    fn_arn = _appsync_create_lambda(lam, fn_name, handler_code)
+
+    api = appsync.create_graphql_api(
+        name=f"test-api-{fn_name}",
+        authenticationType="API_KEY",
+    )
+    api_id = api["graphqlApi"]["apiId"]
+    api_key = appsync.create_api_key(apiId=api_id)["apiKey"]["id"]
+    graphql_url = f"{_ENDPOINT}/v1/apis/{api_id}/graphql"
+
+    appsync.create_data_source(
+        apiId=api_id,
+        name="LambdaDS",
+        type="AWS_LAMBDA",
+        lambdaConfig={"lambdaFunctionArn": fn_arn},
+    )
+    appsync.create_resolver(
+        apiId=api_id,
+        typeName="Query",
+        fieldName="testField",
+        dataSourceName="LambdaDS",
+        kind="UNIT",
+    )
+    return api_id, api_key, graphql_url
+
+
+_APPSYNC_IDENTITY_PROBE_RESOLVER = (
+    "def handler(event, ctx):\n"
+    "    return {'hasIdentity': event.get('identity') is not None}\n"
+)
+
+
+def _appsync_setup_lambda_auth_api(appsync, lam, name, authorizer_arn, resolver_code):
+    """Create an AWS_LAMBDA-auth API with the given authorizer ARN and a Lambda resolver."""
+    resolver_arn = _appsync_create_lambda(lam, f"{name}-resolver", resolver_code)
+
+    api = appsync.create_graphql_api(
+        name=name,
+        authenticationType="AWS_LAMBDA",
+        lambdaAuthorizerConfig={"authorizerUri": authorizer_arn},
+    )
+    api_id = api["graphqlApi"]["apiId"]
+    graphql_url = f"{_ENDPOINT}/v1/apis/{api_id}/graphql"
+
+    appsync.create_data_source(
+        apiId=api_id, name="LambdaDS", type="AWS_LAMBDA",
+        lambdaConfig={"lambdaFunctionArn": resolver_arn},
+    )
+    appsync.create_resolver(
+        apiId=api_id, typeName="Query", fieldName="testField",
+        dataSourceName="LambdaDS", kind="UNIT",
+    )
+    return api_id, graphql_url
+
+
+def _appsync_expect_unauthorized(url, query, headers):
+    """A rejected AWS_LAMBDA authorizer must surface as HTTP 401 with an
+    `UnauthorizedException` errors envelope, per the AppSync Developer Guide."""
+    import urllib.error
+
+    req = urllib.request.Request(
+        url,
+        data=json.dumps({"query": query}).encode(),
+        headers={"Content-Type": "application/json", **(headers or {})},
+        method="POST",
+    )
+    try:
+        urllib.request.urlopen(req, timeout=10)
+    except urllib.error.HTTPError as exc:
+        assert exc.code == 401, f"expected 401, got {exc.code}"
+        body = json.loads(exc.read())
+        assert "errors" in body and body["errors"]
+        assert body["errors"][0]["errorType"] == "UnauthorizedException"
+        return body
+    raise AssertionError("expected HTTP 401 but request succeeded")
+
+
+def test_appsync_lambda_event_field_name(appsync, lam):
+    """Lambda event must contain info.fieldName matching the queried GraphQL field."""
+    handler = (
+        "def handler(event, ctx):\n"
+        "    return {'fieldName': event.get('info', {}).get('fieldName')}\n"
+    )
+    _, api_key, url = _appsync_setup_api_with_lambda_resolver(appsync, lam, "field-name-test", handler)
+    resp = _appsync_graphql_post(url, "{ testField { fieldName } }", headers={"x-api-key": api_key})
+    assert "errors" not in resp
+    assert resp["data"]["testField"]["fieldName"] == "testField"
+
+
+def test_appsync_lambda_event_arguments(appsync, lam):
+    """Lambda event must contain parsed arguments from the GraphQL query."""
+    handler = (
+        "def handler(event, ctx):\n"
+        "    args = event.get('arguments', {})\n"
+        "    return {'receivedId': args.get('params', {}).get('id', 'missing')}\n"
+    )
+    _, api_key, url = _appsync_setup_api_with_lambda_resolver(appsync, lam, "args-test", handler)
+    resp = _appsync_graphql_post(
+        url, 'query { testField(params: {id: "issuer-abc"}) { receivedId } }',
+        headers={"x-api-key": api_key},
+    )
+    assert "errors" not in resp
+    assert resp["data"]["testField"]["receivedId"] == "issuer-abc"
+
+
+def test_appsync_lambda_event_api_key_header(appsync, lam):
+    """The x-api-key header must be in event.request.headers so isApiKeyAuthenticated() works."""
+    handler = (
+        "def handler(event, ctx):\n"
+        "    headers = event.get('request', {}).get('headers', {})\n"
+        "    return {'hasApiKey': 'x-api-key' in headers}\n"
+    )
+    _, api_key, url = _appsync_setup_api_with_lambda_resolver(appsync, lam, "api-key-header-test", handler)
+    resp = _appsync_graphql_post(url, "{ testField { hasApiKey } }", headers={"x-api-key": api_key})
+    assert "errors" not in resp
+    assert resp["data"]["testField"]["hasApiKey"] is True
+
+
+def test_appsync_lambda_event_custom_headers_forwarded(appsync, lam):
+    """x-request-id, x-session-id, x-user-id, x-workflow, x-process must be in event.request.headers."""
+    handler = (
+        "def handler(event, ctx):\n"
+        "    h = event.get('request', {}).get('headers', {})\n"
+        "    return {\n"
+        "        'requestId': h.get('x-request-id', ''),\n"
+        "        'sessionId': h.get('x-session-id', ''),\n"
+        "        'userId': h.get('x-user-id', ''),\n"
+        "        'workflow': h.get('x-workflow', ''),\n"
+        "        'process': h.get('x-process', ''),\n"
+        "    }\n"
+    )
+    _, api_key, url = _appsync_setup_api_with_lambda_resolver(appsync, lam, "custom-headers-test", handler)
+    resp = _appsync_graphql_post(
+        url, "{ testField { requestId sessionId userId workflow process } }",
+        headers={
+            "x-api-key": api_key,
+            "x-request-id": "req-abc-123",
+            "x-session-id": "sess-xyz-456",
+            "x-user-id": "user-789",
+            "x-workflow": "LOGIN",
+            "x-process": "OTP_VERIFY",
+        },
+    )
+    assert "errors" not in resp
+    data = resp["data"]["testField"]
+    assert data["requestId"] == "req-abc-123"
+    assert data["sessionId"] == "sess-xyz-456"
+    assert data["userId"] == "user-789"
+    assert data["workflow"] == "LOGIN"
+    assert data["process"] == "OTP_VERIFY"
+
+
+def test_appsync_lambda_event_no_identity_in_api_key_mode(appsync, lam):
+    """In API_KEY auth mode, event.identity must be absent or null."""
+    handler = (
+        "def handler(event, ctx):\n"
+        "    return {'hasIdentity': event.get('identity') is not None}\n"
+    )
+    _, api_key, url = _appsync_setup_api_with_lambda_resolver(appsync, lam, "no-identity-test", handler)
+    resp = _appsync_graphql_post(url, "{ testField { hasIdentity } }", headers={"x-api-key": api_key})
+    assert "errors" not in resp
+    assert resp["data"]["testField"]["hasIdentity"] is False
+
+
+def test_appsync_lambda_event_identity_from_authorizer(appsync, lam):
+    """AWS_LAMBDA auth mode — identity.resolverContext from authorizer is in Lambda event."""
+    authorizer_code = (
+        "def handler(event, ctx):\n"
+        "    return {\n"
+        "        'isAuthorized': True,\n"
+        "        'resolverContext': {\n"
+        "            'customId': 'test-user-id',\n"
+        "            'email': 'user@example.com',\n"
+        "            'cognitoGroups': 'admin',\n"
+        "        }\n"
+        "    }\n"
+    )
+    resolver_code = (
+        "def handler(event, ctx):\n"
+        "    identity = event.get('identity') or {}\n"
+        "    rc = identity.get('resolverContext') or {}\n"
+        "    return {\n"
+        "        'customId': rc.get('customId', ''),\n"
+        "        'email': rc.get('email', ''),\n"
+        "    }\n"
+    )
+    auth_arn = _appsync_create_lambda(lam, "lambda-authorizer-test", authorizer_code)
+    resolver_arn = _appsync_create_lambda(lam, "lambda-resolver-test", resolver_code)
+
+    api = appsync.create_graphql_api(
+        name="lambda-auth-api",
+        authenticationType="AWS_LAMBDA",
+        lambdaAuthorizerConfig={"authorizerUri": auth_arn},
+    )
+    api_id = api["graphqlApi"]["apiId"]
+    url = f"{_ENDPOINT}/v1/apis/{api_id}/graphql"
+    appsync.create_data_source(
+        apiId=api_id, name="LambdaDS", type="AWS_LAMBDA",
+        lambdaConfig={"lambdaFunctionArn": resolver_arn},
+    )
+    appsync.create_resolver(
+        apiId=api_id, typeName="Query", fieldName="testField",
+        dataSourceName="LambdaDS", kind="UNIT",
+    )
+    resp = _appsync_graphql_post(url, "{ testField { customId email } }",
+                                 headers={"Authorization": "Bearer fake-jwt-token"})
+    assert "errors" not in resp
+    assert resp["data"]["testField"]["customId"] == "test-user-id"
+    assert resp["data"]["testField"]["email"] == "user@example.com"
+
+
+def test_appsync_lambda_not_found_no_crash(appsync):
+    """If Lambda function doesn't exist in ministack, AppSync returns a response (no crash)."""
+    api = appsync.create_graphql_api(name="lambda-missing-api", authenticationType="API_KEY")
+    api_id = api["graphqlApi"]["apiId"]
+    api_key = appsync.create_api_key(apiId=api_id)["apiKey"]["id"]
+    appsync.create_data_source(
+        apiId=api_id, name="MissingLambdaDS", type="AWS_LAMBDA",
+        lambdaConfig={"lambdaFunctionArn": "arn:aws:lambda:us-east-1:000000000000:function:does-not-exist"},
+    )
+    appsync.create_resolver(
+        apiId=api_id, typeName="Query", fieldName="testField",
+        dataSourceName="MissingLambdaDS", kind="UNIT",
+    )
+    resp = _appsync_graphql_post(f"{_ENDPOINT}/v1/apis/{api_id}/graphql", "{ testField }",
+                                 headers={"x-api-key": api_key})
+    assert "data" in resp or "errors" in resp
+
+
+def test_appsync_lambda_returns_errors(appsync, lam):
+    """Lambda returning {errors: ['INTERNAL_SERVER_ERROR']} is passed through correctly."""
+    handler = (
+        "def handler(event, ctx):\n"
+        "    return {'errors': ['INTERNAL_SERVER_ERROR'], 'data': None}\n"
+    )
+    _, api_key, url = _appsync_setup_api_with_lambda_resolver(appsync, lam, "error-response-test", handler)
+    resp = _appsync_graphql_post(url, "{ testField { id } }", headers={"x-api-key": api_key})
+    assert resp["data"]["testField"]["errors"] == ["INTERNAL_SERVER_ERROR"]
+
+
+def test_appsync_lambda_event_source_empty_for_root(appsync, lam):
+    """event.source must be {} (empty) for top-level Query fields."""
+    handler = (
+        "def handler(event, ctx):\n"
+        "    s = event.get('source')\n"
+        "    return {'sourceIsEmpty': s == {} or s is None}\n"
+    )
+    _, api_key, url = _appsync_setup_api_with_lambda_resolver(appsync, lam, "source-test", handler)
+    resp = _appsync_graphql_post(url, "{ testField { sourceIsEmpty } }", headers={"x-api-key": api_key})
+    assert "errors" not in resp
+    assert resp["data"]["testField"]["sourceIsEmpty"] is True
+
+
+def test_appsync_lambda_event_variables_substituted(appsync, lam):
+    """Variables in the query must be resolved to values before the event is built."""
+    handler = (
+        "def handler(event, ctx):\n"
+        "    args = event.get('arguments', {})\n"
+        "    return {'id': args.get('params', {}).get('id', 'missing')}\n"
+    )
+    _, api_key, url = _appsync_setup_api_with_lambda_resolver(appsync, lam, "variables-test", handler)
+    resp = _appsync_graphql_post(
+        url, "query GetTest($id: ID!) { testField(params: {id: $id}) { id } }",
+        variables={"id": "issuer-from-var"},
+        headers={"x-api-key": api_key},
+    )
+    assert "errors" not in resp
+    assert resp["data"]["testField"]["id"] == "issuer-from-var"
+
+
+def test_appsync_lambda_unhandled_exception_becomes_error(appsync, lam):
+    """A Lambda that raises must yield a GraphQL `errors` entry, not fake `data`."""
+    handler = (
+        "def handler(event, ctx):\n"
+        "    raise Exception('boom')\n"
+    )
+    _, api_key, url = _appsync_setup_api_with_lambda_resolver(appsync, lam, "raise-test", handler)
+    resp = _appsync_graphql_post(url, "{ testField { id } }", headers={"x-api-key": api_key})
+    field = resp.get("data", {}).get("testField")
+    assert field is None or "errorMessage" not in field
+    assert "errors" in resp or (isinstance(field, dict) and "errors" in field)
+
+
+def test_appsync_lambda_authorizer_rejection_returns_unauthorized(appsync, lam):
+    """AWS_LAMBDA auth — `isAuthorized:false` must reject with `UnauthorizedException` (HTTP 401)."""
+    authorizer = (
+        "def handler(event, ctx):\n"
+        "    return {'isAuthorized': False, 'resolverContext': {'should': 'not-leak'}}\n"
+    )
+    auth_arn = _appsync_create_lambda(lam, "authz-reject-test", authorizer)
+    _, url = _appsync_setup_lambda_auth_api(appsync, lam, "authz-reject-api", auth_arn,
+                                            _APPSYNC_IDENTITY_PROBE_RESOLVER)
+    _appsync_expect_unauthorized(url, "{ testField { hasIdentity } }",
+                                 headers={"Authorization": "Bearer fake-jwt"})
+
+
+def test_appsync_lambda_missing_authorizer_returns_unauthorized(appsync, lam):
+    """AWS_LAMBDA auth — missing authorizer Lambda must reject with `UnauthorizedException` (HTTP 401)."""
+    _, url = _appsync_setup_lambda_auth_api(
+        appsync, lam, "authz-missing-api",
+        "arn:aws:lambda:us-east-1:000000000000:function:authorizer-does-not-exist",
+        _APPSYNC_IDENTITY_PROBE_RESOLVER,
+    )
+    _appsync_expect_unauthorized(url, "{ testField { hasIdentity } }",
+                                 headers={"Authorization": "Bearer fake-jwt"})
+
+
+def test_appsync_lambda_failing_authorizer_returns_unauthorized(appsync, lam):
+    """AWS_LAMBDA auth — raising authorizer must reject with `UnauthorizedException` (HTTP 401)."""
+    authorizer = (
+        "def handler(event, ctx):\n"
+        "    raise Exception('authorizer boom')\n"
+    )
+    auth_arn = _appsync_create_lambda(lam, "authz-raise-test", authorizer)
+    _, url = _appsync_setup_lambda_auth_api(appsync, lam, "authz-raise-api", auth_arn,
+                                            _APPSYNC_IDENTITY_PROBE_RESOLVER)
+    _appsync_expect_unauthorized(url, "{ testField { hasIdentity } }",
+                                 headers={"Authorization": "Bearer fake-jwt"})

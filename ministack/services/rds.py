@@ -30,9 +30,9 @@ clients can call DescribeDBInstances and other operations without ``Action=`` qu
 parameters.
 """
 
+import contextvars
 import copy
 import datetime
-import contextvars
 import json
 import logging
 import os
@@ -48,10 +48,17 @@ from ministack.core.responses import AccountScopedDict, apply_image_prefix, get_
 logger = logging.getLogger("rds")
 
 REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
+_MINISTACK_HOST = os.environ.get("MINISTACK_HOST", "localhost")
 BASE_PORT = int(os.environ.get("RDS_BASE_PORT", "15432"))
 RDS_TMPFS_SIZE = os.environ.get("RDS_TMPFS_SIZE", "256m")
 RDS_PERSIST = os.environ.get("RDS_PERSIST", "0").lower() in ("1", "true", "yes")
 DOCKER_NETWORK = os.environ.get("DOCKER_NETWORK", "")
+# When set, skip ministack's own Docker network auto-detect so DescribeDBInstances
+# returns {MINISTACK_HOST, host_port} — the address that's actually reachable
+# from outside the Docker network (remote ministack deployments, host-side
+# clients of a containerised ministack). Off by default: existing in-network
+# behavior unchanged.
+RDS_PUBLIC_ENDPOINT = os.environ.get("MINISTACK_RDS_PUBLIC_ENDPOINT", "0").lower() in ("1", "true", "yes")
 
 _instances = AccountScopedDict()
 _clusters = AccountScopedDict()
@@ -277,8 +284,16 @@ def _get_docker():
 
 
 def _get_ministack_network(docker_client):
-    """Detect the Docker network MiniStack is running on (if containerised)."""
+    """Detect the Docker network MiniStack is running on (if containerised).
+
+    Honors MINISTACK_RDS_PUBLIC_ENDPOINT — when set, returns None so the
+    DescribeDBInstances endpoint resolves to {MINISTACK_HOST, host_port}
+    instead of the container-internal address (useful for remote-ministack
+    deployments where external clients can't reach the Docker network).
+    """
     global _ministack_network
+    if RDS_PUBLIC_ENDPOINT:
+        return None
     if _ministack_network is not None:
         return _ministack_network or None
     if DOCKER_NETWORK:
@@ -680,7 +695,7 @@ def _create_db_instance(p):
 
     arn = f"arn:aws:rds:{get_region()}:{get_account_id()}:db:{db_id}"
     dbi_resource_id = f"db-{new_uuid().replace('-', '')[:20].upper()}"
-    endpoint_host = "localhost"
+    endpoint_host = _MINISTACK_HOST
     endpoint_port = port
     host_port = None
     docker_container_id = None
@@ -752,7 +767,14 @@ def _create_db_instance(p):
                 logger.warning("RDS: Docker failed for %s: %s", db_id, e)
 
     cluster_id = _p(p, "DBClusterIdentifier")
-    param_group_name = _p(p, "DBParameterGroupName") or f"default.{engine}{engine_version.split('.')[0]}"
+    explicit_pg = _p(p, "DBParameterGroupName")
+    # AWS rejects a reference to a parameter group that doesn't exist. Validate
+    # custom names against the store; AWS-managed `default.*` groups are implicit
+    # and not tracked here, so they're accepted as-is.
+    if explicit_pg and not explicit_pg.startswith("default.") and explicit_pg not in _param_groups:
+        return _error("DBParameterGroupNotFound",
+                      f"DBParameterGroup {explicit_pg} not found.", 404)
+    param_group_name = explicit_pg or f"default.{engine}{engine_version.split('.')[0]}"
     now_ts = time.time()
 
     vpc_sgs = _parse_member_list(p, "VpcSecurityGroupIds")
@@ -1178,7 +1200,7 @@ def _create_read_replica(p):
         "InstanceCreateTime": _format_time(time.time()),
         "ReadReplicaDBInstanceIdentifiers": [],
         "Endpoint": {
-            "Address": "localhost",
+            "Address": _MINISTACK_HOST,
             "Port": _next_port(),
             "HostedZoneId": "Z2R2ITUGPM61AM",
         },
@@ -1222,7 +1244,7 @@ def _restore_from_snapshot(p):
         "MasterUsername": snap.get("MasterUsername", "admin"),
         "DBName": snap.get("DBName", ""),
         "Endpoint": {
-            "Address": "localhost",
+            "Address": _MINISTACK_HOST,
             "Port": _next_port(),
             "HostedZoneId": "Z2R2ITUGPM61AM",
         },
@@ -1280,6 +1302,12 @@ def _create_db_cluster(p):
     if cluster_id in _clusters:
         return _error("DBClusterAlreadyExistsFault",
             f"DB cluster {cluster_id} already exists.", 400)
+
+    explicit_cpg = _p(p, "DBClusterParameterGroupName")
+    if (explicit_cpg and not explicit_cpg.startswith("default.")
+            and explicit_cpg not in _db_cluster_param_groups):
+        return _error("DBClusterParameterGroupNotFound",
+                      f"DBClusterParameterGroup {explicit_cpg} not found.", 404)
 
     engine = _p(p, "Engine") or "aurora-postgresql"
     engine_version = _p(p, "EngineVersion") or _default_engine_version(engine)

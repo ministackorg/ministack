@@ -307,6 +307,7 @@ def _describe_stack_resource(params):
 def _describe_stack_resources(params):
     from ministack.services.cloudformation import _stacks
     stack_name = _p(params, "StackName")
+    logical_resource_id = _p(params, "LogicalResourceId")
 
     stack = _stacks.get(stack_name)
     if not stack:
@@ -314,8 +315,17 @@ def _describe_stack_resources(params):
                       f"Stack [{stack_name}] does not exist")
 
     resources = stack.get("_resources", {})
+
+    if logical_resource_id:
+        if logical_resource_id not in resources:
+            return _error("ValidationError",
+                          f"Resource [{logical_resource_id}] does not exist in stack [{stack_name}]")
+        items = [(logical_resource_id, resources[logical_resource_id])]
+    else:
+        items = list(resources.items())
+
     members = ""
-    for logical_id, res in resources.items():
+    for logical_id, res in items:
         members += (
             "<member>"
             f"<LogicalResourceId>{_esc(logical_id)}</LogicalResourceId>"
@@ -471,7 +481,8 @@ def _update_stack(params):
     disable_rollback = _p(params, "DisableRollback", "false").lower() == "true"
 
     try:
-        param_values = _resolve_parameters(template, provided_params)
+        param_values = _resolve_parameters(
+            template, provided_params, stack.get("_resolved_params", {}))
     except ValueError as exc:
         return _error("ValidationError", str(exc))
 
@@ -617,11 +628,61 @@ def _get_template_summary(params):
             "</member>"
         )
 
+    _NAMED_IAM_PROPS = {
+        "AWS::IAM::Role": "RoleName",
+        "AWS::IAM::User": "UserName",
+        "AWS::IAM::Group": "GroupName",
+        "AWS::IAM::Policy": "PolicyName",
+        "AWS::IAM::ManagedPolicy": "ManagedPolicyName",
+        "AWS::IAM::InstanceProfile": "InstanceProfileName",
+    }
+    named_iam_ids = []
+    unnamed_iam_ids = []
+    for logical_id, res in resources.items():
+        rtype = res.get("Type", "")
+        if not rtype.startswith("AWS::IAM::"):
+            continue
+        name_prop = _NAMED_IAM_PROPS.get(rtype)
+        if name_prop and res.get("Properties", {}).get(name_prop):
+            named_iam_ids.append(logical_id)
+        else:
+            unnamed_iam_ids.append(logical_id)
+
+    capabilities = []
+    caps_reason_types = []
+    if named_iam_ids:
+        capabilities.append("CAPABILITY_NAMED_IAM")
+        caps_reason_types.extend(
+            sorted(set(resources[lid].get("Type", "") for lid in named_iam_ids))
+        )
+    elif unnamed_iam_ids:
+        capabilities.append("CAPABILITY_IAM")
+        caps_reason_types.extend(
+            sorted(set(resources[lid].get("Type", "") for lid in unnamed_iam_ids))
+        )
+    if template.get("Transform"):
+        capabilities.append("CAPABILITY_AUTO_EXPAND")
+
+    caps_xml = "".join(f"<member>{c}</member>" for c in capabilities)
+    # AWS'es behavior here is very inconsistent with their docs. AWS doesn't necessarily return
+    # all of the types it should every time. We're doing the best we can here.
+    caps_reason = (
+        "The following resource(s) require capabilities: [" + ", ".join(caps_reason_types) + "]"
+        if caps_reason_types else ""
+    )
+
+    caps_block = (
+        f"<Capabilities>{caps_xml}</Capabilities>"
+        f"<CapabilitiesReason>{_esc(caps_reason)}</CapabilitiesReason>"
+        if capabilities else ""
+    )
+
     return _xml(200, "GetTemplateSummaryResponse",
                 f"<GetTemplateSummaryResult>"
                 f"<Description>{_esc(description)}</Description>"
                 f"<ResourceTypes>{types_xml}</ResourceTypes>"
                 f"<Parameters>{params_xml}</Parameters>"
+                f"{caps_block}"
                 f"</GetTemplateSummaryResult>")
 
 

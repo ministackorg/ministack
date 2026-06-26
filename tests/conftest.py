@@ -58,11 +58,14 @@ _SERIAL_TESTS = {
     "tests/test_eks.py::test_eks_cfn_cluster",
     "tests/test_eks.py::test_eks_create_describe_delete_cluster",
     "tests/test_lambda.py::test_lambda_reset_terminates_workers",
+    "tests/test_lambda.py::test_lambda_dynamodb_stream_esm_latest_processes_first_record",
     "tests/test_ministack.py::test_ministack_config_invalid_key_ignored",
     "tests/test_ses.py::test_ses_messages_endpoint_reset",
     "tests/test_ses.py::test_ses_messages_endpoint_account_filter",
     "tests/test_stepfunctions.py::test_sfn_mock_config_return",
     "tests/test_stepfunctions.py::test_sfn_mock_config_throw",
+    "tests/test_stepfunctions.py::test_sfn_mock_config_jsonata_assign_applied",
+    "tests/test_stepfunctions.py::test_sfn_mock_config_throw_routes_to_catch",
     "tests/test_stepfunctions.py::test_sfn_wait_scale_zero_does_not_timeout_lambda_tasks",
     "tests/test_stepfunctions.py::test_sfn_wait_scale_zero_skips_wait",
     "tests/test_rds.py::test_rds_lambda_network_connectivity",
@@ -79,6 +82,32 @@ _SERIAL_TESTS = {
     "tests/test_apigatewayv2.py::test_apigwv1_path_based_restapi_legacy_user_request",
     "tests/test_apigatewayv2.py::test_apigwv2_named_stage_still_requires_prefix",
     "tests/test_apigatewayv2.py::test_apigwv2_integration_wrapped_function_arn",
+    # AppSync Lambda-resolver event-shape tests cold-start Lambdas under a 10s
+    # urlopen timeout (Test 6 spawns two functions). Same cold-start-under-xdist
+    # flakiness as the apigw Lambda tests above — run them in the serial phase.
+    "tests/test_appsync.py::test_appsync_lambda_event_field_name",
+    "tests/test_appsync.py::test_appsync_lambda_event_arguments",
+    "tests/test_appsync.py::test_appsync_lambda_event_api_key_header",
+    "tests/test_appsync.py::test_appsync_lambda_event_custom_headers_forwarded",
+    "tests/test_appsync.py::test_appsync_lambda_event_no_identity_in_api_key_mode",
+    "tests/test_appsync.py::test_appsync_lambda_event_identity_from_authorizer",
+    "tests/test_appsync.py::test_appsync_lambda_not_found_no_crash",
+    "tests/test_appsync.py::test_appsync_lambda_returns_errors",
+    "tests/test_appsync.py::test_appsync_lambda_event_source_empty_for_root",
+    "tests/test_appsync.py::test_appsync_lambda_event_variables_substituted",
+    "tests/test_appsync.py::test_appsync_lambda_unhandled_exception_becomes_error",
+    "tests/test_appsync.py::test_appsync_lambda_authorizer_rejection_returns_unauthorized",
+    "tests/test_appsync.py::test_appsync_lambda_missing_authorizer_returns_unauthorized",
+    "tests/test_appsync.py::test_appsync_lambda_failing_authorizer_returns_unauthorized",
+    # AppSync Events service mutations; shared state racing under xdist.
+    "tests/test_appsync_events.py::test_publish_with_appsync_sigv4_scope_on_events_vhost",
+    # Credential report reflects all users in the account; run serially to avoid
+    # parallel-test interference on the account-global CSV snapshot.
+    "tests/test_iam.py::test_iam_credential_report_mfa_and_password",
+    "tests/test_iam.py::test_iam_credential_report_header",
+    # Account-global mutations (password policy, alias); must run serially.
+    "tests/test_iam.py::test_iam_password_policy_absent_then_set",
+    "tests/test_iam.py::test_iam_account_alias_crud",
 }
 
 
@@ -497,3 +526,8 @@ def cur():
 @pytest.fixture(scope="session")
 def inspector2():
     return make_client("inspector2")
+
+
+@pytest.fixture(scope="session")
+def mq():
+    return make_client("mq")

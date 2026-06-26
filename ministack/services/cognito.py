@@ -49,6 +49,7 @@ Wire protocol:
   Routing is handled in app.py via two separate SERVICE_HANDLERS entries.
 """
 
+import asyncio
 import base64
 import copy
 import hashlib
@@ -62,7 +63,7 @@ import string
 import time
 import zlib
 from datetime import datetime, timezone
-from urllib.parse import parse_qs, quote, urlencode
+from urllib.parse import parse_qs, quote, unquote_plus, urlencode
 from xml.etree.ElementTree import Element, SubElement
 from xml.etree.ElementTree import tostring as xml_tostring
 
@@ -232,6 +233,7 @@ _pool_domain_map = AccountScopedDict()   # domain -> pool_id
 
 _authorization_codes: dict[str, dict] = {}   # code -> {client_id, pool_id, redirect_uri, scope, username, nonce, expires_at, code_challenge, code_challenge_method}
 _refresh_tokens: dict[str, dict] = {}        # refresh_token_value -> {pool_id, client_id, username, scope}
+_revoked_tokens: set = set()                 # refresh-token values invalidated by RevokeToken
 
 # ---------------------------------------------------------------------------
 # In-memory state — Identity Pools (cognito-identity)
@@ -308,6 +310,7 @@ def get_state():
         "identity_tags": copy.deepcopy(_identity_tags),
         "authorization_codes": copy.deepcopy(_authorization_codes),
         "refresh_tokens": copy.deepcopy(_refresh_tokens),
+        "revoked_tokens": list(_revoked_tokens),
         "auth_codes": copy.deepcopy(_auth_codes),
         "challenge_sessions": copy.deepcopy(_challenge_sessions),
     }
@@ -321,6 +324,7 @@ def restore_state(data):
         _identity_tags.update(data.get("identity_tags", {}))
         _authorization_codes.update(data.get("authorization_codes", {}))
         _refresh_tokens.update(data.get("refresh_tokens", {}))
+        _revoked_tokens.update(data.get("revoked_tokens", []))
         _auth_codes.update(data.get("auth_codes", {}))
         _challenge_sessions.update(data.get("challenge_sessions", {}))
 
@@ -817,6 +821,27 @@ def _append_challenge_to_session(session: dict, challenge_name: str,
     session["last_challenge_metadata"] = challenge_metadata
 
 
+def _update_pending_challenge_result(session: dict, challenge_result: bool | None) -> None:
+    """Record a VerifyAuthChallenge result on the round it belongs to.
+
+    AWS records ONE ChallengeResult per CUSTOM_AUTH round, carrying BOTH the
+    metadata (set by CreateAuthChallenge) and the result (from
+    VerifyAuthChallengeResponse). Update the pending round's result in place
+    rather than appending a second, metadata-less entry that would split the
+    round across two session records — a consumer reading challengeMetadata and
+    challengeResult from the same element could then never identify the step.
+
+    Falls back to appending only when there is no pending round (empty or
+    malformed history), preserving the prior behaviour for that edge case.
+    """
+    challenges = session["challenges"]
+    if challenges and challenges[-1].get("challengeResult") is None:
+        challenges[-1]["challengeResult"] = challenge_result
+    else:
+        _append_challenge_to_session(session, "CUSTOM_CHALLENGE", challenge_result,
+                                     None, {}, {})
+
+
 def _build_session_list(session: dict) -> list:
     """Build the session list for Lambda events (challenge history).
     
@@ -1206,7 +1231,12 @@ def _authenticate_client(headers: dict, form: dict):
         try:
             decoded = base64.b64decode(auth.split(" ", 1)[1]).decode("utf-8")
             cid, csec = decoded.split(":", 1)
-            return cid, csec
+            # RFC 6749 §2.3.1: the client id and secret are
+            # application/x-www-form-urlencoded before base64, so a secret
+            # containing "/" or "+" arrives as %2F/%2B and must be decoded to
+            # match the stored value. The client_secret_post path already gets
+            # this via parse_qs.
+            return unquote_plus(cid), unquote_plus(csec)
         except Exception:
             pass
     return form.get("client_id", ""), form.get("client_secret", "")
@@ -1263,11 +1293,11 @@ async def handle_request(method, path, headers, body, query_params):
 
     if target.startswith("AWSCognitoIdentityService."):
         action = target.split(".")[-1]
-        return _dispatch_identity(action, data)
+        return await _dispatch_identity(action, data)
 
     if target.startswith("AWSCognitoIdentityProviderService."):
         action = target.split(".")[-1]
-        return _dispatch_idp(action, data)
+        return await _dispatch_idp(action, data)
 
     return error_response_json("InvalidAction", f"Unknown Cognito target: {target}", 400)
 
@@ -1276,7 +1306,7 @@ async def handle_request(method, path, headers, body, query_params):
 # IDP dispatcher
 # ---------------------------------------------------------------------------
 
-def _dispatch_idp(action: str, data: dict):
+async def _dispatch_idp(action: str, data: dict):
     handlers = {
         # User Pool CRUD
         "CreateUserPool": _create_user_pool,
@@ -1355,14 +1385,18 @@ def _dispatch_idp(action: str, data: dict):
     handler = handlers.get(action)
     if not handler:
         return error_response_json("InvalidAction", f"Unknown Cognito IDP action: {action}", 400)
-    return handler(data)
+    # Run the sync handler in a worker thread so trigger Lambdas (which call
+    # back into ministack over HTTP) don't deadlock against a blocked event
+    # loop. The Lambda response path needs the loop free to accept new
+    # requests while _execute_function is running.
+    return await asyncio.to_thread(handler, data)
 
 
 # ---------------------------------------------------------------------------
 # Identity Pool dispatcher
 # ---------------------------------------------------------------------------
 
-def _dispatch_identity(action: str, data: dict):
+async def _dispatch_identity(action: str, data: dict):
     handlers = {
         "CreateIdentityPool": _create_identity_pool,
         "DeleteIdentityPool": _delete_identity_pool,
@@ -1386,7 +1420,7 @@ def _dispatch_identity(action: str, data: dict):
     handler = handlers.get(action)
     if not handler:
         return error_response_json("InvalidAction", f"Unknown Cognito Identity action: {action}", 400)
-    return handler(data)
+    return await asyncio.to_thread(handler, data)
 
 
 # ===========================================================================
@@ -2088,7 +2122,13 @@ def _admin_user_global_sign_out(data):
     user, err = _resolve_user(pool, username)
     if err:
         return err
-    user["_tokens"] = []
+    # Invalidate every token issued before now (checked by REFRESH_TOKEN_AUTH)
+    # and drop the user's OAuth-flow refresh tokens.
+    user["_signout_at"] = _now_epoch()
+    uname = user.get("Username", username)
+    for tok in [t for t, e in _refresh_tokens.items()
+                if e.get("username") == uname and e.get("pool_id") == pid]:
+        del _refresh_tokens[tok]
     return json_response({})
 
 
@@ -2251,6 +2291,9 @@ def _admin_initiate_auth(data):
             if not users:
                 return error_response_json("NotAuthorizedException", "No users in pool.", 400)
             user = users[0]
+        if _refresh_token_revoked(refresh_token, user):
+            return error_response_json("NotAuthorizedException",
+                                       "Refresh Token has been revoked", 400)
         result = _build_auth_result(pid, cid, user)
         result.pop("RefreshToken", None)  # AWS doesn't return a new refresh token here
         return json_response({"AuthenticationResult": result})
@@ -2308,10 +2351,10 @@ def _admin_initiate_auth(data):
                     "DefineAuthChallenge returned unexpected response — not issuing tokens, "
                     "not failing auth, and no challengeName set", 400)
 
-        # Add a pending challenge to session before checking if define/create need to happen
-        _append_challenge_to_session(session, "CUSTOM_CHALLENGE", None, None, {}, {})
-
-        # Invoke CreateAuthChallenge
+        # Invoke CreateAuthChallenge. AWS passes an EMPTY session array to the
+        # first CreateAuthChallenge (the round being created is not itself a
+        # session entry), so append the pending round AFTER Create runs —
+        # mirroring the round-2+ path in RespondToAuthChallenge.
         create_result, err = _invoke_create_auth_challenge_trigger(
             pid, cid, username, user_attrs, session, client_metadata
         )
@@ -2331,14 +2374,9 @@ def _admin_initiate_auth(data):
             private_params = {"challenge": "PROVIDE_AUTH_PARAMETERS"}
             challenge_metadata = None
 
-        # Update session with challenge parameters
-        if session["challenges"]:
-            session["challenges"][-1].update({
-                "publicChallengeParameters": public_params,
-                "privateChallengeParameters": private_params,
-                "challengeMetadata": challenge_metadata or session["challenges"][-1].get("challengeMetadata"),
-            })
-            session["last_challenge_metadata"] = challenge_metadata
+        # Append the pending round with the parameters from CreateAuthChallenge.
+        _append_challenge_to_session(session, "CUSTOM_CHALLENGE", None, challenge_metadata,
+                                    public_params, private_params)
 
         # Return challenge to client
         return json_response({
@@ -2406,8 +2444,9 @@ def _admin_respond_to_auth_challenge(data):
             # No Lambda configured — auto-fail (caller must provide answer)
             answer_correct = False
 
-        # Append verify result to session
-        _append_challenge_to_session(session, "CUSTOM_CHALLENGE", answer_correct, None, {}, {})
+        # Record the verify result on the pending round — AWS keeps ONE merged
+        # ChallengeResult per round (metadata + result), not two split entries.
+        _update_pending_challenge_result(session, answer_correct)
 
         # Invoke DefineAuthChallenge (evaluates full session history)
         define_result, err = _invoke_define_auth_challenge_trigger(
@@ -2583,6 +2622,9 @@ def _initiate_auth(data):
             if not users:
                 return error_response_json("NotAuthorizedException", "No users in pool.", 400)
             user = users[0]
+        if _refresh_token_revoked(refresh_token, user):
+            return error_response_json("NotAuthorizedException",
+                                       "Refresh Token has been revoked", 400)
         result = _build_auth_result(pid, cid, user)
         result.pop("RefreshToken", None)  # AWS doesn't return a new refresh token here
         return json_response({"AuthenticationResult": result})
@@ -2654,10 +2696,10 @@ def _initiate_auth(data):
                     "DefineAuthChallenge returned unexpected response — not issuing tokens, "
                     "not failing auth, and no challengeName set", 400)
 
-        # Add a pending challenge to session before checking if define/create need to happen
-        _append_challenge_to_session(session, "CUSTOM_CHALLENGE", None, None, {}, {})
-
-        # Invoke CreateAuthChallenge
+        # Invoke CreateAuthChallenge. AWS passes an EMPTY session array to the
+        # first CreateAuthChallenge (the round being created is not itself a
+        # session entry), so append the pending round AFTER Create runs —
+        # mirroring the round-2+ path in RespondToAuthChallenge.
         create_result, err = _invoke_create_auth_challenge_trigger(
             pid, cid, username, user_attrs, session, client_metadata
         )
@@ -2677,14 +2719,9 @@ def _initiate_auth(data):
             private_params = {"challenge": "PROVIDE_AUTH_PARAMETERS"}
             challenge_metadata = None
 
-        # Update session with challenge parameters
-        if session["challenges"]:
-            session["challenges"][-1].update({
-                "publicChallengeParameters": public_params,
-                "privateChallengeParameters": private_params,
-                "challengeMetadata": challenge_metadata or session["challenges"][-1].get("challengeMetadata"),
-            })
-            session["last_challenge_metadata"] = challenge_metadata
+        # Append the pending round with the parameters from CreateAuthChallenge.
+        _append_challenge_to_session(session, "CUSTOM_CHALLENGE", None, challenge_metadata,
+                                    public_params, private_params)
 
         # Return challenge to client
         return json_response({
@@ -2757,8 +2794,9 @@ def _respond_to_auth_challenge(data):
             # No Lambda configured — auto-fail (caller must provide answer)
             answer_correct = False
 
-        # Append verify result to session
-        _append_challenge_to_session(session, "CUSTOM_CHALLENGE", answer_correct, None, {}, {})
+        # Record the verify result on the pending round — AWS keeps ONE merged
+        # ChallengeResult per round (metadata + result), not two split entries.
+        _update_pending_challenge_result(session, answer_correct)
 
         # Invoke DefineAuthChallenge (evaluates full session history)
         define_result, err = _invoke_define_auth_challenge_trigger(
@@ -2865,12 +2903,55 @@ def _respond_to_auth_challenge(data):
     return error_response_json("InvalidParameterException", f"Unsupported challenge: {challenge_name}", 400)
 
 
+def _refresh_token_revoked(refresh_token: str, user: dict | None) -> bool:
+    """True if a refresh token has been revoked (RevokeToken) or invalidated by a
+    GlobalSignOut that happened after the token was issued."""
+    if refresh_token in _revoked_tokens:
+        return True
+    signout_at = (user or {}).get("_signout_at", 0)
+    if signout_at:
+        try:
+            payload = json.loads(
+                base64.urlsafe_b64decode(refresh_token.split(".")[1] + "=="))
+            if int(payload.get("iat", 0)) < int(signout_at):
+                return True
+        except Exception:
+            pass
+    return False
+
+
 def _global_sign_out(data):
-    # Access token is opaque to us — accept and succeed
+    # AWS invalidates every token issued to the user before the sign-out. Mark
+    # the user with a sign-out timestamp (checked by REFRESH_TOKEN_AUTH) and drop
+    # any OAuth-flow refresh tokens so /oauth2/token can't mint new ones either.
+    access_token = data.get("AccessToken", "")
+    try:
+        payload = json.loads(
+            base64.urlsafe_b64decode(access_token.split(".")[1] + "=="))
+    except Exception:
+        return json_response({})
+    username = payload.get("username", "")
+    iss = payload.get("iss", "")
+    pool_id = iss.rsplit("/", 1)[-1] if iss else ""
+    pool = _user_pools.get(pool_id)
+    if pool and username:
+        user = pool["_users"].get(username)
+        if user:
+            user["_signout_at"] = _now_epoch()
+    if username and pool_id:
+        for tok in [t for t, e in _refresh_tokens.items()
+                    if e.get("username") == username and e.get("pool_id") == pool_id]:
+            del _refresh_tokens[tok]
     return json_response({})
 
 
 def _revoke_token(data):
+    # AWS revokes the supplied refresh token (and tokens derived from it). Record
+    # it as revoked (checked by REFRESH_TOKEN_AUTH) and drop the OAuth-flow entry.
+    token = data.get("Token", "")
+    if token:
+        _revoked_tokens.add(token)
+        _refresh_tokens.pop(token, None)
     return json_response({})
 
 
@@ -4187,6 +4268,16 @@ def _oauth2_token(data, query_params, raw_body: bytes = b"", headers: dict | Non
                 if not _verify_pkce(code_verifier, entry["code_challenge"], method):
                     return _oauth2_error("invalid_grant", "PKCE verification failed.")
 
+            # Validate client secret BEFORE consuming the code. AWS rejects bad
+            # client authentication without invalidating the single-use code, so
+            # a client that authenticates in two steps (HTTP Basic, then
+            # client_secret_post fallback — as Go/Vault does) can still succeed
+            # on the retry. Consuming the code first turned that retry into
+            # invalid_grant "Invalid or expired authorization code" (#932).
+            _, _, client = _find_pool_by_client_id(cid)
+            if client and client.get("ClientSecret") and csec != client["ClientSecret"]:
+                return _oauth2_error("invalid_client", "Invalid client credentials.")
+
             # Consume code (one-time use)
             del _authorization_codes[code]
 
@@ -4198,11 +4289,6 @@ def _oauth2_token(data, query_params, raw_body: bytes = b"", headers: dict | Non
             user = pool["_users"].get(entry["username"])
             if not user:
                 return _oauth2_error("server_error", "User not found.")
-
-            # Validate client secret if client has one
-            _, _, client = _find_pool_by_client_id(cid)
-            if client and client.get("ClientSecret") and csec != client["ClientSecret"]:
-                return _oauth2_error("invalid_client", "Invalid client credentials.")
 
             result = _build_auth_result(pool_id, cid, user, nonce=entry.get("nonce", ""))
             refresh_val = result["RefreshToken"]

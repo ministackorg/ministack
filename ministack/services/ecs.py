@@ -41,11 +41,13 @@ from ministack.core.responses import (
     new_uuid,
     now_iso,
 )
-from ministack.services import ecs_metadata
+from ministack.services import ecs_metadata, secretsmanager
 
 logger = logging.getLogger("ecs")
 
 REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
+_MINISTACK_HOST = os.environ.get("MINISTACK_HOST", "localhost")
+_GATEWAY_PORT = os.environ.get("GATEWAY_PORT", "4566")
 
 _clusters = AccountScopedDict()
 _task_defs = AccountScopedDict()
@@ -722,8 +724,15 @@ def _delete_service(data):
         _stop_task({"task": task_arn, "cluster": cluster_name, "reason": "Service deleted"})
 
     svc["runningCount"] = 0
-    _tags.pop(svc["serviceArn"], None)
-    del _services[svc_key]
+    # AWS DeleteService docs: "After all tasks have transitioned to either
+    # STOPPING or STOPPED status, the service status moves from DRAINING to
+    # INACTIVE. Services in the DRAINING or INACTIVE status can still be viewed
+    # with the DescribeServices API operation." Tasks are stopped synchronously
+    # above, so we land in INACTIVE directly. AWS may eventually purge INACTIVE
+    # records (no fixed window) — ministack keeps them for the process lifetime.
+    # Re-creating with the same name is allowed because _create_service only
+    # conflicts on status=ACTIVE.
+    svc["status"] = "INACTIVE"
 
     _recount_cluster(cluster_name)
     return json_response({"service": _sanitize(svc)})
@@ -938,6 +947,13 @@ def _docker_binds_from_taskdef(td, cdef):
     return binds
 
 
+def _container_override_for(container_overrides, container_name):
+    for override in container_overrides:
+        if override.get("name") == container_name:
+            return override
+    return {}
+
+
 def _build_run_kwargs(cdef, td, env, port_bindings, ecs_network,
                       host_mode, task_id, task_arn, ministack_net_ip,
                       cluster_arn):
@@ -981,6 +997,57 @@ def _build_run_kwargs(cdef, td, env, port_bindings, ecs_network,
             # IP on the shared network, route via host.docker.internal.
             kwargs["extra_hosts"] = {"host.docker.internal": "host-gateway"}
     return kwargs
+
+
+class _SecretResolutionError(Exception):
+    """A container secret's ``valueFrom`` could not be resolved.
+
+    AWS fails the whole task to start with a ``ResourceInitializationError``
+    rather than launching the container without the variable, so ``_run_task``
+    translates this into a STOPPED task.
+    """
+
+
+def _resolve_container_secrets(cdef):
+    """Resolve a container definition's ``secrets`` into a {name: value} mapping.
+
+    Each entry's ``valueFrom`` is either a Secrets Manager secret ARN (optionally
+    with a ``:json-key`` suffix selecting one field from a JSON ``SecretString``)
+    or an SSM Parameter Store name/ARN. A reference that cannot be resolved
+    raises ``_SecretResolutionError`` — matching AWS, which fails the task launch
+    instead of starting the container without the variable.
+    """
+    resolved = {}
+    for secret in cdef.get("secrets", []):
+        name = secret.get("name")
+        value_from = secret.get("valueFrom", "")
+        if not name or not value_from:
+            continue
+        json_key = None
+        if "secretsmanager" in value_from:
+            # A Secrets Manager ARN has 7 colon-separated fields; ECS may append
+            # :json-key:version-stage:version-id after it.
+            parts = value_from.split(":")
+            secret_arn = ":".join(parts[:7])
+            json_key = parts[7] if len(parts) > 7 and parts[7] else None
+            value = secretsmanager.resolve_secret_string(secret_arn)
+        else:
+            # SSM Parameter Store reference (ARN or bare name).
+            from ministack.services import ssm
+            value = ssm.resolve_parameter_value(value_from)
+        if value is None:
+            raise _SecretResolutionError(
+                f"unable to retrieve secret {value_from} for environment "
+                f"variable {name}")
+        if json_key:
+            try:
+                value = json.loads(value)[json_key]
+            except (ValueError, KeyError, TypeError):
+                raise _SecretResolutionError(
+                    f"unable to retrieve json key '{json_key}' from secret "
+                    f"{value_from} for environment variable {name}")
+        resolved[name] = str(value)
+    return resolved
 
 
 def _run_task(data):
@@ -1078,14 +1145,36 @@ def _run_task(data):
                 logger.debug("ECS: could not detect Ministack network, using default")
 
             for i, cdef in enumerate(td.get("containerDefinitions", [])):
+                container_override = _container_override_for(
+                    container_overrides, cdef["name"]
+                )
                 env_override = {}
-                for ov in container_overrides:
-                    if ov.get("name") == cdef["name"]:
-                        for e in ov.get("environment", []):
-                            env_override[e["name"]] = e["value"]
+                for e in container_override.get("environment", []):
+                    env_override[e["name"]] = e["value"]
 
                 env = {e["name"]: e["value"] for e in cdef.get("environment", [])}
+                try:
+                    env.update(_resolve_container_secrets(cdef))
+                except _SecretResolutionError as exc:
+                    # AWS fails the whole task to start (ResourceInitializationError)
+                    # when a secret can't be retrieved — don't launch any container.
+                    now = _iso()
+                    task["lastStatus"] = "STOPPED"
+                    task["desiredStatus"] = "STOPPED"
+                    task["stoppingAt"] = now
+                    task["stoppedAt"] = now
+                    task["stopCode"] = "TaskFailedToStart"
+                    task["stoppedReason"] = (
+                        "ResourceInitializationError: unable to pull secrets or "
+                        "registry auth: execution resource retrieval failed: "
+                        + str(exc))
+                    for c in task.get("containers", []):
+                        c["lastStatus"] = "STOPPED"
+                    break
                 env.update(env_override)
+                effective_cdef = dict(cdef)
+                if "command" in container_override:
+                    effective_cdef["command"] = container_override["command"]
 
                 port_bindings = {}
                 for pm in cdef.get("portMappings", []):
@@ -1098,7 +1187,7 @@ def _run_task(data):
                     td, cdef, launch_type, env, host_mode, ministack_net_ip,
                 )
                 run_kwargs = _build_run_kwargs(
-                    cdef, td, env, port_bindings, ecs_network,
+                    effective_cdef, td, env, port_bindings, ecs_network,
                     host_mode, task_id, task_arn, ministack_net_ip,
                     _clusters[cluster_name]["clusterArn"],
                 )
@@ -1737,7 +1826,8 @@ def _submit_attachment_state_changes(data):
 
 
 def _discover_poll_endpoint(data):
-    return json_response({"endpoint": "http://localhost:4566", "telemetryEndpoint": "http://localhost:4566"})
+    endpoint = f"http://{_MINISTACK_HOST}:{_GATEWAY_PORT}"
+    return json_response({"endpoint": endpoint, "telemetryEndpoint": endpoint})
 
 
 # ---------------------------------------------------------------------------

@@ -871,6 +871,13 @@ def _matches_content_filter(value, filter_rule):
         return isinstance(value, str) and value.endswith(filter_rule["suffix"])
     if "anything-but" in filter_rule:
         excluded = filter_rule["anything-but"]
+        # Per AWS EventBridge docs, anything-but supports either a literal
+        # / list-of-literals OR a single nested content matcher (prefix,
+        # suffix, wildcard, equals-ignore-case). Mixing literals and nested
+        # matchers in a list is explicitly rejected by AWS at rule
+        # creation, so we match the strict form only.
+        if isinstance(excluded, dict):
+            return not _matches_content_filter(value, excluded)
         if isinstance(excluded, list):
             return value not in excluded
         return value != excluded
@@ -923,7 +930,7 @@ def _invoke_target(target, event, rule):
 
     input_transformer = target.get("InputTransformer")
     if input_transformer:
-        event_payload = _apply_input_transformer(input_transformer, event)
+        event_payload = _apply_input_transformer(input_transformer, event, rule)
     elif target.get("Input"):
         event_payload = target["Input"]
     elif target.get("InputPath"):
@@ -953,7 +960,7 @@ def _invoke_target(target, event, rule):
         logger.error("EventBridge target dispatch error for %s: %s", arn, e)
 
 
-def _apply_input_transformer(transformer, event):
+def _apply_input_transformer(transformer, event, rule=None):
     input_paths = transformer.get("InputPathsMap", {})
     template = transformer.get("InputTemplate", "")
 
@@ -963,6 +970,7 @@ def _apply_input_transformer(transformer, event):
         full = {}
 
     event_envelope = {
+        "version": "0",
         "source": event.get("Source", ""),
         "detail-type": event.get("DetailType", ""),
         "detail": full,
@@ -984,6 +992,23 @@ def _apply_input_transformer(transformer, event):
             replacements[var_name] = val if isinstance(val, str) else json.dumps(val)
         except (KeyError, TypeError, IndexError):
             replacements[var_name] = ""
+
+    # AWS generates ingestion-time when the event is received by EventBridge
+    # (always present, ISO-8601) — it is NOT the event's own `time` field and
+    # cannot be overwritten by an InputPathsMap entry.
+    ingestion_time = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    reserved = {
+        "aws.events.event.json": json.dumps(event_envelope),
+        "aws.events.event": json.dumps({k: v for k, v in event_envelope.items() if k != "detail"}),
+        "aws.events.event.ingestion-time": ingestion_time,
+    }
+    if rule:
+        reserved["aws.events.rule-name"] = rule.get("Name", "")
+        reserved["aws.events.rule-arn"] = rule.get("Arn", "")
+    for k, v in reserved.items():
+        replacements.setdefault(k, v)
+    # ingestion-time is reserved and uneditable, even if InputPathsMap declares it.
+    replacements["aws.events.event.ingestion-time"] = ingestion_time
 
     result = template
     for var_name, val in replacements.items():

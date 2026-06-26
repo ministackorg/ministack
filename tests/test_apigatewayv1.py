@@ -926,6 +926,74 @@ def test_apigwv1_execute_path_params(apigw_v1, lam):
     apigw_v1.delete_rest_api(restApiId=api_id)
     lam.delete_function(FunctionName=fname)
 
+def test_apigwv1_literal_sibling_wins_over_param_registered_first(apigw_v1, lam):
+    """A literal segment must resolve to its own method even when a {param}
+    sibling under the same parent was created first (#970). AWS routes by
+    specificity (literal > {param}), not by resource-creation order, so the
+    literal path must not be shadowed into a 405."""
+    import urllib.request as _urlreq
+    import uuid as _uuid
+
+    def _make_fn(label):
+        fname = f"intg-v1-{label}-{_uuid.uuid4().hex[:8]}"
+        code = (
+            b"def handler(event, context):\n"
+            b"    return {'statusCode': 200, 'body': '" + label.encode() + b"'}\n"
+        )
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as zf:
+            zf.writestr("index.py", code)
+        lam.create_function(
+            FunctionName=fname,
+            Runtime="python3.12",
+            Role="arn:aws:iam::000000000000:role/test-role",
+            Handler="index.handler",
+            Code={"ZipFile": buf.getvalue()},
+        )
+        return fname
+
+    get_fn = _make_fn("getuser")
+    verify_fn = _make_fn("verify")
+
+    api_id = apigw_v1.create_rest_api(name=f"v1-precedence-{_uuid.uuid4().hex[:8]}")["id"]
+    root = next(r for r in apigw_v1.get_resources(restApiId=api_id)["items"] if r["path"] == "/")
+    users_id = apigw_v1.create_resource(restApiId=api_id, parentId=root["id"], pathPart="users")["id"]
+
+    def _wire(parent, path_part, http_method, fname):
+        rid = apigw_v1.create_resource(restApiId=api_id, parentId=parent, pathPart=path_part)["id"]
+        apigw_v1.put_method(restApiId=api_id, resourceId=rid, httpMethod=http_method, authorizationType="NONE")
+        apigw_v1.put_integration(
+            restApiId=api_id, resourceId=rid, httpMethod=http_method,
+            type="AWS_PROXY", integrationHttpMethod="POST",
+            uri=f"arn:aws:apigateway:us-east-1:lambda:path/2015-03-31/functions/arn:aws:lambda:us-east-1:000000000000:function:{fname}/invocations",
+        )
+
+    # {id} registered BEFORE the literal sibling — the order that triggered #970.
+    _wire(users_id, "{id}", "GET", get_fn)
+    _wire(users_id, "verifyUserEmail", "POST", verify_fn)
+
+    dep_id = apigw_v1.create_deployment(restApiId=api_id)["id"]
+    apigw_v1.create_stage(restApiId=api_id, stageName="v1", deploymentId=dep_id)
+
+    url = f"http://{api_id}.execute-api.localhost:{_EXECUTE_PORT}/v1/users/verifyUserEmail"
+    req = _urlreq.Request(url, method="POST", data=b"{}")
+    req.add_header("Host", f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}")
+    resp = _urlreq.urlopen(req)
+    assert resp.status == 200
+    assert resp.read() == b"verify"
+
+    # The {param} sibling still resolves for its own path.
+    url2 = f"http://{api_id}.execute-api.localhost:{_EXECUTE_PORT}/v1/users/alice123"
+    req2 = _urlreq.Request(url2, method="GET")
+    req2.add_header("Host", f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}")
+    resp2 = _urlreq.urlopen(req2)
+    assert resp2.status == 200
+    assert resp2.read() == b"getuser"
+
+    apigw_v1.delete_rest_api(restApiId=api_id)
+    lam.delete_function(FunctionName=get_fn)
+    lam.delete_function(FunctionName=verify_fn)
+
 def test_apigwv1_execute_mock_integration(apigw_v1):
     """MOCK integration returns fixed JSON from integration response template."""
     import urllib.request as _urlreq

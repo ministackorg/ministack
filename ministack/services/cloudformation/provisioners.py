@@ -54,6 +54,7 @@ logger = logging.getLogger("cloudformation")
 # Module-level REGION kept for legacy imports; new code must use get_region()
 # so AWS::Region / ARNs reflect the caller's request region (#398).
 REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
+_MINISTACK_HOST = os.environ.get("MINISTACK_HOST", "localhost")
 
 
 def _physical_name(stack_name: str, logical_id: str, *,
@@ -552,6 +553,7 @@ def _lambda_create(logical_id, props, stack_name):
             "Architectures": props.get("Architectures", ["x86_64"]),
             "EphemeralStorage": {"Size": props.get("EphemeralStorage", {}).get("Size", 512)},
             "TracingConfig": props.get("TracingConfig", {"Mode": "PassThrough"}),
+            "LoggingConfig": props.get("LoggingConfig", {"LogFormat": "Text", "LogGroup": f"/aws/lambda/{name}"}),
             "RevisionId": new_uuid(),
         },
         "code_zip": code_zip,
@@ -567,6 +569,11 @@ def _lambda_create(logical_id, props, stack_name):
         "provisioned_concurrency": {},
     }
     _lambda_svc._functions[name] = func
+    # On a stack UPDATE this re-provisions over an existing function; recycle the
+    # warm worker + docker pool so the new code/config load on the next invoke
+    # (#897). No-op on first create (no worker spawned yet).
+    _lambda_svc.invalidate_worker(name)
+    _lambda_svc._pool_kill_function(get_account_id(), name)
     return name, {"Arn": arn}
 
 
@@ -766,6 +773,227 @@ def _appconfig_application_delete(physical_id, props):
     _appconfig._tags.pop(_appconfig._app_arn(physical_id), None)
 
 
+# --- AppConfig Environment ---
+
+def _appconfig_environment_create(logical_id, props, stack_name):
+    app_id = props.get("ApplicationId")
+    if not app_id:
+        raise ValueError("AWS::AppConfig::Environment requires ApplicationId")
+    name = props.get("Name") or _physical_name(stack_name, logical_id, max_len=64)
+    env_id = _appconfig._gen_id()
+    _appconfig._environments[f"{app_id}/{env_id}"] = {
+        "ApplicationId": app_id,
+        "Id": env_id,
+        "Name": name,
+        "Description": props.get("Description", ""),
+        "State": "READY_FOR_DEPLOYMENT",
+        "Monitors": props.get("Monitors", []),
+        "DeletionProtectionCheck": props.get("DeletionProtectionCheck", "ACCOUNT_DEFAULT"),
+    }
+    cfn_tags = props.get("Tags") or []
+    if cfn_tags:
+        _appconfig._apply_tags(
+            _appconfig._env_arn(app_id, env_id),
+            {t["Key"]: t["Value"] for t in cfn_tags if "Key" in t},
+        )
+    # Ref → environment ID; GetAtt EnvironmentId per AWS CFN reference.
+    return env_id, {"EnvironmentId": env_id}
+
+
+def _appconfig_environment_delete(physical_id, props):
+    app_id = props.get("ApplicationId", "")
+    _appconfig._environments.pop(f"{app_id}/{physical_id}", None)
+    _appconfig._tags.pop(_appconfig._env_arn(app_id, physical_id), None)
+
+
+# --- AppConfig ConfigurationProfile ---
+
+def _appconfig_configuration_profile_create(logical_id, props, stack_name):
+    app_id = props.get("ApplicationId")
+    if not app_id:
+        raise ValueError("AWS::AppConfig::ConfigurationProfile requires ApplicationId")
+    name = props.get("Name") or _physical_name(stack_name, logical_id, max_len=128)
+    profile_id = _appconfig._gen_id()
+    _appconfig._config_profiles[f"{app_id}/{profile_id}"] = {
+        "ApplicationId": app_id,
+        "Id": profile_id,
+        "Name": name,
+        "Description": props.get("Description", ""),
+        "LocationUri": props.get("LocationUri", "hosted"),
+        "RetrievalRoleArn": props.get("RetrievalRoleArn", ""),
+        "Validators": props.get("Validators", []),
+        "Type": props.get("Type", "AWS.Freeform"),
+        "KmsKeyIdentifier": props.get("KmsKeyIdentifier", ""),
+        "DeletionProtectionCheck": props.get("DeletionProtectionCheck", "ACCOUNT_DEFAULT"),
+    }
+    cfn_tags = props.get("Tags") or []
+    if cfn_tags:
+        _appconfig._apply_tags(
+            _appconfig._profile_arn(app_id, profile_id),
+            {t["Key"]: t["Value"] for t in cfn_tags if "Key" in t},
+        )
+    # Ref → configuration profile ID; GetAtt ConfigurationProfileId, KmsKeyArn.
+    # KmsKeyArn is only populated when a KMS key was supplied; CDK reads it as
+    # an empty string in that case.
+    return profile_id, {
+        "ConfigurationProfileId": profile_id,
+        "KmsKeyArn": props.get("KmsKeyIdentifier", ""),
+    }
+
+
+def _appconfig_configuration_profile_delete(physical_id, props):
+    app_id = props.get("ApplicationId", "")
+    _appconfig._config_profiles.pop(f"{app_id}/{physical_id}", None)
+    _appconfig._tags.pop(_appconfig._profile_arn(app_id, physical_id), None)
+
+
+# --- AppConfig HostedConfigurationVersion ---
+
+def _appconfig_hosted_version_create(logical_id, props, stack_name):
+    app_id = props.get("ApplicationId")
+    profile_id = props.get("ConfigurationProfileId")
+    if not app_id or not profile_id:
+        raise ValueError(
+            "AWS::AppConfig::HostedConfigurationVersion requires "
+            "ApplicationId and ConfigurationProfileId"
+        )
+    content = props.get("Content", "")
+    # CDK / Fn::ToJsonString may pass parsed JSON; AWS wire shape is a string.
+    if isinstance(content, (dict, list)):
+        content = json.dumps(content)
+    existing = [
+        v for k, v in _appconfig._hosted_versions.items()
+        if k.startswith(f"{app_id}/{profile_id}/")
+    ]
+    version_number = len(existing) + 1
+    # AWS optimistic-concurrency: if LatestVersionNumber is supplied, it must
+    # match the most-recent version_number — otherwise reject with a
+    # ConflictException-shape error (mirrors real AppConfig's lock check).
+    latest_lock = props.get("LatestVersionNumber")
+    if latest_lock is not None and int(latest_lock) != version_number - 1:
+        raise ValueError(
+            f"AWS::AppConfig::HostedConfigurationVersion LatestVersionNumber "
+            f"mismatch: supplied {latest_lock}, current latest is {version_number - 1}"
+        )
+    _appconfig._hosted_versions[f"{app_id}/{profile_id}/{version_number}"] = {
+        "ApplicationId": app_id,
+        "ConfigurationProfileId": profile_id,
+        "VersionNumber": version_number,
+        "ContentType": props.get("ContentType", "application/json"),
+        "Content": content,
+        "Description": props.get("Description", ""),
+        "VersionLabel": props.get("VersionLabel", ""),
+    }
+    # Ref → version number; GetAtt VersionNumber.
+    return str(version_number), {"VersionNumber": version_number}
+
+
+def _appconfig_hosted_version_delete(physical_id, props):
+    app_id = props.get("ApplicationId", "")
+    profile_id = props.get("ConfigurationProfileId", "")
+    _appconfig._hosted_versions.pop(
+        f"{app_id}/{profile_id}/{physical_id}", None
+    )
+
+
+# --- AppConfig DeploymentStrategy ---
+
+def _appconfig_deployment_strategy_create(logical_id, props, stack_name):
+    name = props.get("Name") or _physical_name(stack_name, logical_id, max_len=64)
+    strategy_id = _appconfig._gen_id()
+    _appconfig._deployment_strategies[strategy_id] = {
+        "Id": strategy_id,
+        "Name": name,
+        "Description": props.get("Description", ""),
+        "DeploymentDurationInMinutes": props.get("DeploymentDurationInMinutes", 0),
+        "GrowthType": props.get("GrowthType", "LINEAR"),
+        "GrowthFactor": props.get("GrowthFactor", 100.0),
+        "FinalBakeTimeInMinutes": props.get("FinalBakeTimeInMinutes", 0),
+        "ReplicateTo": props.get("ReplicateTo", "NONE"),
+    }
+    cfn_tags = props.get("Tags") or []
+    if cfn_tags:
+        _appconfig._apply_tags(
+            _appconfig._strategy_arn(strategy_id),
+            {t["Key"]: t["Value"] for t in cfn_tags if "Key" in t},
+        )
+    # Ref → deployment strategy ID; GetAtt is `Id` (singular) per AWS reference.
+    return strategy_id, {"Id": strategy_id}
+
+
+def _appconfig_deployment_strategy_delete(physical_id, props):
+    _appconfig._deployment_strategies.pop(physical_id, None)
+    _appconfig._tags.pop(_appconfig._strategy_arn(physical_id), None)
+
+
+# --- AppConfig Deployment ---
+
+def _appconfig_deployment_create(logical_id, props, stack_name):
+    app_id = props.get("ApplicationId")
+    env_id = props.get("EnvironmentId")
+    strategy_id = props.get("DeploymentStrategyId")
+    profile_id = props.get("ConfigurationProfileId")
+    if not all([app_id, env_id, strategy_id, profile_id]):
+        raise ValueError(
+            "AWS::AppConfig::Deployment requires ApplicationId, EnvironmentId, "
+            "DeploymentStrategyId, and ConfigurationProfileId"
+        )
+    existing = [
+        v for k, v in _appconfig._deployments.items()
+        if k.startswith(f"{app_id}/{env_id}/")
+    ]
+    deploy_num = len(existing) + 1
+    now = _appconfig._now_iso()
+    _appconfig._deployments[f"{app_id}/{env_id}/{deploy_num}"] = {
+        "ApplicationId": app_id,
+        "EnvironmentId": env_id,
+        "DeploymentStrategyId": strategy_id,
+        "ConfigurationProfileId": profile_id,
+        "DeploymentNumber": deploy_num,
+        "ConfigurationName": _appconfig._config_profiles.get(
+            f"{app_id}/{profile_id}", {}
+        ).get("Name", ""),
+        "ConfigurationLocationUri": "hosted",
+        "ConfigurationVersion": props.get("ConfigurationVersion", ""),
+        "Description": props.get("Description", ""),
+        "State": "COMPLETE",
+        "PercentageComplete": 100.0,
+        "StartedAt": now,
+        "CompletedAt": now,
+        "KmsKeyIdentifier": props.get("KmsKeyIdentifier", ""),
+        "DynamicExtensionParameters": props.get("DynamicExtensionParameters", []),
+    }
+    cfn_tags = props.get("Tags") or []
+    if cfn_tags:
+        # Deployment doesn't have its own ARN helper; use the standard AppConfig
+        # ARN shape so ListTagsForResource keeps working post-create.
+        deploy_arn = (
+            f"arn:aws:appconfig:{_appconfig.get_region()}:"
+            f"{_appconfig.get_account_id()}:application/{app_id}/"
+            f"environment/{env_id}/deployment/{deploy_num}"
+        )
+        _appconfig._apply_tags(
+            deploy_arn,
+            {t["Key"]: t["Value"] for t in cfn_tags if "Key" in t},
+        )
+    # GetAtt DeploymentNumber, State. Ref is documented as having no return
+    # value on the AWS CFN page; we return the deploy_num as the physical id
+    # so CDK templates that Ref a Deployment still resolve.
+    return str(deploy_num), {"DeploymentNumber": deploy_num, "State": "COMPLETE"}
+
+
+def _appconfig_deployment_delete(physical_id, props):
+    app_id = props.get("ApplicationId", "")
+    env_id = props.get("EnvironmentId", "")
+    _appconfig._deployments.pop(f"{app_id}/{env_id}/{physical_id}", None)
+    deploy_arn = (
+        f"arn:aws:appconfig:{_appconfig.get_region()}:"
+        f"{_appconfig.get_account_id()}:application/{app_id}/"
+        f"environment/{env_id}/deployment/{physical_id}"
+    )
+    _appconfig._tags.pop(deploy_arn, None)
+
+
 # --- CloudWatch Logs LogGroup ---
 
 def _cwlogs_create(logical_id, props, stack_name):
@@ -786,6 +1014,44 @@ def _cwlogs_create(logical_id, props, stack_name):
 
 def _cwlogs_delete(physical_id, props):
     _cw_logs._log_groups.pop(physical_id, None)
+
+
+# --- CloudWatch Logs SubscriptionFilter (#896) ---
+
+def _cwlogs_subfilter_create(logical_id, props, stack_name):
+    group = props.get("LogGroupName")
+    if not group:
+        raise ValueError("AWS::Logs::SubscriptionFilter requires LogGroupName")
+    # Ref returns the filter name; CFN auto-generates one when FilterName is omitted.
+    filter_name = props.get("FilterName") or _physical_name(stack_name, logical_id, max_len=512)
+    grp = _cw_logs._log_groups.get(group)
+    if grp is None:
+        # The referenced group should already exist (via Ref/DependsOn); create a
+        # minimal entry if not so the filter is still recorded and queryable.
+        grp = _cw_logs._log_groups[group] = {
+            "arn": f"arn:aws:logs:{get_region()}:{get_account_id()}:log-group:{group}:*",
+            "creationTime": int(time.time() * 1000),
+            "retentionInDays": None,
+            "tags": {},
+            "streams": {},
+            "subscriptionFilters": {},
+        }
+    grp.setdefault("subscriptionFilters", {})[filter_name] = {
+        "filterName": filter_name,
+        "logGroupName": group,
+        "filterPattern": props.get("FilterPattern", ""),
+        "destinationArn": props.get("DestinationArn", ""),
+        "roleArn": props.get("RoleArn", ""),
+        "distribution": props.get("Distribution", "ByLogStream"),
+        "creationTime": int(time.time() * 1000),
+    }
+    return filter_name, {}
+
+
+def _cwlogs_subfilter_delete(physical_id, props):
+    grp = _cw_logs._log_groups.get(props.get("LogGroupName"))
+    if grp:
+        grp.get("subscriptionFilters", {}).pop(physical_id, None)
 
 
 # --- EventBridge Rule ---
@@ -1090,13 +1356,18 @@ def _cfn_nested_stack_deploy(logical_id, props, parent_stack_name, *,
     sub-attribute form CDK and console-built templates emit.
     """
     import copy
+
     from ministack.core.responses import get_account_id, get_region, new_uuid
     from ministack.services.cloudformation import (
-        _stack_events, _stacks,
+        _stack_events,
+        _stacks,
     )
     from ministack.services.cloudformation.engine import (
-        _evaluate_conditions, _parse_template, _resolve_parameters,
-        _resolve_refs, _topological_sort,
+        _evaluate_conditions,
+        _parse_template,
+        _resolve_parameters,
+        _resolve_refs,
+        _topological_sort,
     )
     from ministack.services.cloudformation.helpers import _resolve_template
     from ministack.services.cloudformation.stacks import _add_event
@@ -1406,9 +1677,7 @@ def _custom_resource_delete(physical_id, props, stack_name=None, logical_id=None
 # --- API Gateway REST API ---
 
 def _apigw_rest_api_create(logical_id, props, stack_name):
-    name = props.get("Name") or _physical_name(stack_name, logical_id, max_len=64)
     data = {
-        "name": name,
         "description": props.get("Description", ""),
         "endpointConfiguration": props.get("EndpointConfiguration", {"types": ["REGIONAL"]}),
         "binaryMediaTypes": props.get("BinaryMediaTypes", []),
@@ -1416,9 +1685,18 @@ def _apigw_rest_api_create(logical_id, props, stack_name):
         "policy": props.get("Policy"),
         "tags": {t["Key"]: t["Value"] for t in props.get("Tags", [])},
     }
-    status, headers, body = _apigw_v1._create_rest_api(data)
-    api = json.loads(body) if isinstance(body, bytes) else json.loads(body)
-    api_id = api.get("id", "")
+    if props.get("Name"):
+        data["name"] = props["Name"]
+
+    body_spec = props.get("Body")
+    if isinstance(body_spec, dict):
+        api_id = _apigw_v1._import_rest_api(body_spec, data)
+    else:
+        data.setdefault("name", _physical_name(stack_name, logical_id, max_len=64))
+        status, headers, body = _apigw_v1._create_rest_api(data)
+        api = json.loads(body) if isinstance(body, bytes) else json.loads(body)
+        api_id = api.get("id", "")
+
     # Find root resource id
     root_id = ""
     for rid, res in _apigw_v1._resources.get(api_id, {}).items():
@@ -1606,9 +1884,9 @@ def _apigw_account_delete(physical_id, props):
 # --- Lambda EventSourceMapping ---
 
 def _lambda_esm_create(logical_id, props, stack_name):
-    func_name = props.get("FunctionName", "")
-    if func_name.startswith("arn:"):
-        func_name = func_name.rsplit(":", 1)[-1]
+    func_name, qualifier = _lambda_svc._resolve_name_and_qualifier(
+        props.get("FunctionName", "")
+    )
     esm_id = new_uuid()
     func = _lambda_svc._functions.get(func_name)
     func_arn = func["config"]["FunctionArn"] if func else f"arn:aws:lambda:{get_region()}:{get_account_id()}:function:{func_name}"
@@ -1616,8 +1894,9 @@ def _lambda_esm_create(logical_id, props, stack_name):
     esm = {
         "UUID": esm_id,
         "EventSourceArn": props.get("EventSourceArn", ""),
-        "FunctionArn": func_arn,
+        "FunctionArn": func_arn + (f":{qualifier}" if qualifier else ""),
         "FunctionName": func_name,
+        "Qualifier": qualifier,
         "State": "Enabled",
         "StateTransitionReason": "USER_INITIATED",
         "BatchSize": int(props.get("BatchSize", 10)),
@@ -1629,6 +1908,9 @@ def _lambda_esm_create(logical_id, props, stack_name):
         "FunctionResponseTypes": props.get("FunctionResponseTypes", []),
     }
     _lambda_svc._esms[esm_id] = esm
+    # Anchor a DynamoDB-stream ESM's LATEST position at create time, matching the
+    # API CreateEventSourceMapping path; no-op for SQS/Kinesis sources (#936).
+    _lambda_svc._init_stream_position(esm_id, esm["EventSourceArn"], esm["StartingPosition"])
     _lambda_svc._ensure_poller()
     return esm_id, {"UUID": esm_id}
 
@@ -2743,9 +3025,15 @@ def _lambda_layer_create(logical_id, props, stack_name):
         "LicenseInfo": props.get("LicenseInfo", ""),
         "CreatedDate": now_iso(),
         "Content": {
+            "Location": _lambda_svc._layer_content_url(layer_name, ver),
             "CodeSha256": (base64.b64encode(hashlib.sha256(zip_data).digest()).decode() if zip_data else ""),
             "CodeSize": len(zip_data) if zip_data else 0,
         },
+        # Without _zip_data the layer is silently skipped at worker spawn
+        # (_resolve_layer_zip returns None), so functions deployed via CDK/CFN
+        # can't import their layer packages even though list-layers shows them.
+        "_zip_data": zip_data,
+        "_policy": {"Version": "2012-10-17", "Id": "default", "Statement": []},
     }
     layer["versions"].append(ver_config)
     return version_arn, {"LayerVersionArn": version_arn, "Arn": version_arn}
@@ -3252,14 +3540,14 @@ def _cw_metric_alarm_delete(physical_id, props):
 # ---------------------------------------------------------------------------
 
 def _apigw_v2_api_create(logical_id, props, stack_name):
-    api_id = new_uuid()[:8]
+    api_id = _apigw_v2._resolve_custom_api_id(props.get("Tags", {}), _apigw_v2._apis) or new_uuid()[:8]
     name = props.get("Name") or _physical_name(stack_name, logical_id, max_len=128)
     protocol = props.get("ProtocolType", "HTTP")
     api = {
         "apiId": api_id,
         "name": name,
         "protocolType": protocol,
-        "apiEndpoint": f"http://{api_id}.execute-api.{os.environ.get('MINISTACK_HOST', 'localhost')}:{os.environ.get('GATEWAY_PORT', '4566')}",
+        "apiEndpoint": f"http://{api_id}.execute-api.{_MINISTACK_HOST}:{os.environ.get('GATEWAY_PORT', '4566')}",
         "createdDate": now_iso(),
         "routeSelectionExpression": props.get("RouteSelectionExpression", "$request.method $request.path"),
         "apiKeySelectionExpression": props.get("ApiKeySelectionExpression", "$request.header.x-api-key"),
@@ -3896,7 +4184,28 @@ _RESOURCE_HANDLERS = {
         "create": _appconfig_application_create,
         "delete": _appconfig_application_delete,
     },
+    "AWS::AppConfig::Environment": {
+        "create": _appconfig_environment_create,
+        "delete": _appconfig_environment_delete,
+    },
+    "AWS::AppConfig::ConfigurationProfile": {
+        "create": _appconfig_configuration_profile_create,
+        "delete": _appconfig_configuration_profile_delete,
+    },
+    "AWS::AppConfig::HostedConfigurationVersion": {
+        "create": _appconfig_hosted_version_create,
+        "delete": _appconfig_hosted_version_delete,
+    },
+    "AWS::AppConfig::DeploymentStrategy": {
+        "create": _appconfig_deployment_strategy_create,
+        "delete": _appconfig_deployment_strategy_delete,
+    },
+    "AWS::AppConfig::Deployment": {
+        "create": _appconfig_deployment_create,
+        "delete": _appconfig_deployment_delete,
+    },
     "AWS::Logs::LogGroup": {"create": _cwlogs_create, "delete": _cwlogs_delete},
+    "AWS::Logs::SubscriptionFilter": {"create": _cwlogs_subfilter_create, "delete": _cwlogs_subfilter_delete},
     "AWS::Events::Rule": {"create": _eb_rule_create, "delete": _eb_rule_delete},
     "AWS::Events::EventBus": {"create": _eb_event_bus_create, "delete": _eb_event_bus_delete},
     "AWS::Kinesis::Stream": {"create": _kinesis_stream_create, "delete": _kinesis_stream_delete},

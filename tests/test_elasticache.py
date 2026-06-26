@@ -11,7 +11,16 @@ from botocore.exceptions import ClientError
 
 ENDPOINT = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
 
+# Most ElastiCache tests need a live Docker network because CreateCacheCluster
+# spawns a real Redis container. Mark them with @requires_docker so they skip
+# cleanly in CI without docker, while unit-style tests (e.g. the #853 respawn
+# tests at the bottom of this file) still run.
+requires_docker = pytest.mark.skipif(
+    not os.environ.get("DOCKER_NETWORK"),
+    reason="DOCKER_NETWORK not set - skipping network connectivity test",
+)
 
+@requires_docker
 def test_elasticache_create(ec):
     ec.create_cache_cluster(
         CacheClusterId="test-redis",
@@ -25,6 +34,7 @@ def test_elasticache_create(ec):
     assert clusters[0]["CacheClusterId"] == "test-redis"
     assert clusters[0]["Engine"] == "redis"
 
+@requires_docker
 def test_elasticache_cache_node_full_fields(ec):
     """terraform-provider-aws v6 derefs CacheNodeCreateTime / ParameterGroupStatus /
     CustomerAvailabilityZone without nil checks. Issue #675."""
@@ -43,6 +53,7 @@ def test_elasticache_cache_node_full_fields(ec):
     assert node["CacheNodeStatus"] == "available"
 
 
+@requires_docker
 def test_elasticache_replication_group(ec):
     ec.create_replication_group(
         ReplicationGroupId="test-rg",
@@ -52,10 +63,12 @@ def test_elasticache_replication_group(ec):
     resp = ec.describe_replication_groups(ReplicationGroupId="test-rg")
     assert resp["ReplicationGroups"][0]["ReplicationGroupId"] == "test-rg"
 
+@requires_docker
 def test_elasticache_engines(ec):
     resp = ec.describe_cache_engine_versions(Engine="redis")
     assert len(resp["CacheEngineVersions"]) > 0
 
+@requires_docker
 def test_elasticache_modify_subnet_group(ec):
     ec.create_cache_subnet_group(
         CacheSubnetGroupName="test-mod-ecsg",
@@ -70,6 +83,7 @@ def test_elasticache_modify_subnet_group(ec):
     resp = ec.describe_cache_subnet_groups(CacheSubnetGroupName="test-mod-ecsg")
     assert resp["CacheSubnetGroups"][0]["CacheSubnetGroupDescription"] == "Updated EC SG"
 
+@requires_docker
 def test_elasticache_user_crud(ec):
     ec.create_user(
         UserId="test-user-1",
@@ -84,6 +98,7 @@ def test_elasticache_user_crud(ec):
     ec.modify_user(UserId="test-user-1", AccessString="on ~keys:* +get")
     ec.delete_user(UserId="test-user-1")
 
+@requires_docker
 def test_elasticache_user_group_crud(ec):
     ec.create_user(
         UserId="ug-usr-1",
@@ -99,15 +114,18 @@ def test_elasticache_user_group_crud(ec):
     ec.delete_user_group(UserGroupId="test-ug-1")
     ec.delete_user(UserId="ug-usr-1")
 
+@requires_docker
 def test_elasticache_reset_clears_param_groups():
-    """ElastiCache reset clears _param_group_params and resets port counter."""
+    """ElastiCache reset restores built-in parameter groups and resets port counter."""
     from ministack.services import elasticache as _ec
     _ec._param_group_params["test-group"] = {"param1": "val1"}
     _ec._port_counter[0] = 99999
     _ec.reset()
-    assert not _ec._param_group_params
+    assert "test-group" not in _ec._param_group_params
+    assert "default.redis7" in _ec._param_group_params
     assert _ec._port_counter[0] == _ec.BASE_PORT
 
+@requires_docker
 def test_elasticache_parameter_group_crud(ec):
     """CreateCacheParameterGroup / DescribeCacheParameterGroups / DeleteCacheParameterGroup."""
     ec.create_cache_parameter_group(
@@ -122,6 +140,7 @@ def test_elasticache_parameter_group_crud(ec):
     assert groups[0]["CacheParameterGroupFamily"] == "redis7"
     ec.delete_cache_parameter_group(CacheParameterGroupName="test-pg-v39")
 
+@requires_docker
 def test_elasticache_snapshot_crud(ec):
     """CreateSnapshot / DescribeSnapshots / DeleteSnapshot."""
     ec.create_cache_cluster(
@@ -136,6 +155,7 @@ def test_elasticache_snapshot_crud(ec):
     assert desc["Snapshots"][0]["SnapshotName"] == "test-snap-v39"
     ec.delete_snapshot(SnapshotName="test-snap-v39")
 
+@requires_docker
 def test_elasticache_tags(ec):
     """AddTagsToResource / ListTagsForResource / RemoveTagsFromResource."""
     ec.create_cache_cluster(
@@ -160,6 +180,7 @@ def test_elasticache_tags(ec):
     assert "team" not in tag_keys
 
 # Migrated from test_ec.py
+@requires_docker
 def test_elasticache_create_cluster_v2(ec):
     resp = ec.create_cache_cluster(
         CacheClusterId="ec-cc-v2",
@@ -173,6 +194,7 @@ def test_elasticache_create_cluster_v2(ec):
     assert c["CacheClusterStatus"] == "available"
     assert len(c["CacheNodes"]) == 1
 
+@requires_docker
 def test_elasticache_describe_clusters_v2(ec):
     ec.create_cache_cluster(
         CacheClusterId="ec-dc-v2a",
@@ -194,6 +216,7 @@ def test_elasticache_describe_clusters_v2(ec):
     resp2 = ec.describe_cache_clusters(CacheClusterId="ec-dc-v2b")
     assert resp2["CacheClusters"][0]["Engine"] == "memcached"
 
+@requires_docker
 def test_elasticache_replication_group_v2(ec):
     resp = ec.create_replication_group(
         ReplicationGroupId="ec-rg-v2",
@@ -211,6 +234,7 @@ def test_elasticache_replication_group_v2(ec):
     desc = ec.describe_replication_groups(ReplicationGroupId="ec-rg-v2")
     assert desc["ReplicationGroups"][0]["ReplicationGroupId"] == "ec-rg-v2"
 
+@requires_docker
 def test_elasticache_engine_versions_v2(ec):
     redis = ec.describe_cache_engine_versions(Engine="redis")
     assert len(redis["CacheEngineVersions"]) > 0
@@ -219,6 +243,7 @@ def test_elasticache_engine_versions_v2(ec):
     mc = ec.describe_cache_engine_versions(Engine="memcached")
     assert len(mc["CacheEngineVersions"]) > 0
 
+@requires_docker
 def test_elasticache_tags_v2(ec):
     ec.create_cache_cluster(
         CacheClusterId="ec-tag-v2",
@@ -245,6 +270,7 @@ def test_elasticache_tags_v2(ec):
     assert not any(t["Key"] == "env" for t in tags2)
     assert any(t["Key"] == "tier" for t in tags2)
 
+@requires_docker
 def test_elasticache_snapshot_v2(ec):
     ec.create_cache_cluster(
         CacheClusterId="ec-snap-v2",
@@ -260,6 +286,7 @@ def test_elasticache_snapshot_v2(ec):
     assert len(desc["Snapshots"]) == 1
     assert desc["Snapshots"][0]["SnapshotName"] == "ec-snap-v2-s1"
 
+@requires_docker
 def test_elasticache_describe_cache_parameters(ec):
     """DescribeCacheParameters returns parameters for a parameter group."""
     ec.create_cache_parameter_group(
@@ -271,6 +298,7 @@ def test_elasticache_describe_cache_parameters(ec):
     assert "Parameters" in resp
     assert len(resp["Parameters"]) > 0
 
+@requires_docker
 def test_elasticache_modify_cache_parameter_group(ec):
     """ModifyCacheParameterGroup updates parameter values."""
     ec.create_cache_parameter_group(
@@ -288,6 +316,59 @@ def test_elasticache_modify_cache_parameter_group(ec):
     assert maxmem["ParameterValue"] == "allkeys-lru"
 
 
+def test_elasticache_default_parameter_groups_are_immutable(ec):
+    """Built-in default parameter groups cannot be overwritten, deleted, or modified."""
+    resp = ec.describe_cache_parameter_groups(CacheParameterGroupName="default.redis7")
+    assert resp["CacheParameterGroups"][0]["CacheParameterGroupFamily"] == "redis7"
+
+    with pytest.raises(ClientError) as exc:
+        ec.create_cache_parameter_group(
+            CacheParameterGroupName="default.redis7",
+            CacheParameterGroupFamily="redis7",
+            Description="duplicate default",
+        )
+    assert exc.value.response["Error"]["Code"] == "CacheParameterGroupAlreadyExists"
+
+    with pytest.raises(ClientError) as exc:
+        ec.delete_cache_parameter_group(CacheParameterGroupName="default.redis7")
+    assert exc.value.response["Error"]["Code"] == "InvalidCacheParameterGroupState"
+
+    with pytest.raises(ClientError) as exc:
+        ec.modify_cache_parameter_group(
+            CacheParameterGroupName="default.redis7",
+            ParameterNameValues=[{"ParameterName": "maxmemory-policy", "ParameterValue": "allkeys-lru"}],
+        )
+    assert exc.value.response["Error"]["Code"] == "InvalidCacheParameterGroupState"
+
+    with pytest.raises(ClientError) as exc:
+        ec.reset_cache_parameter_group(
+            CacheParameterGroupName="default.redis7",
+            ResetAllParameters=True,
+        )
+    assert exc.value.response["Error"]["Code"] == "InvalidCacheParameterGroupState"
+
+
+def test_elasticache_default_parameter_group_family_mapping(ec):
+    """Default parameter group names use AWS-style engine family names."""
+    cid = f"pg-map-mc-{_uid()}"
+    resp = ec.create_cache_cluster(
+        CacheClusterId=cid,
+        Engine="memcached",
+        EngineVersion="1.6.17",
+        CacheNodeType="cache.t3.micro",
+        NumCacheNodes=1,
+    )
+    group = resp["CacheCluster"]["CacheParameterGroup"]
+    assert group["CacheParameterGroupName"] == "default.memcached1.6"
+    ec.delete_cache_cluster(CacheClusterId=cid)
+
+    redis_versions = ec.describe_cache_engine_versions(Engine="redis")["CacheEngineVersions"]
+    families = {v["EngineVersion"]: v["CacheParameterGroupFamily"] for v in redis_versions}
+    assert families["7.0.12"] == "redis7"
+    assert families["6.2.14"] == "redis6.x"
+    assert families["5.0.6"] == "redis5.0"
+
+
 def _uid():
     return _uuid_mod.uuid4().hex[:8]
 
@@ -296,6 +377,7 @@ def _uid():
 # 1. ModifyCacheCluster
 # ---------------------------------------------------------------------------
 
+@requires_docker
 def test_modify_cache_cluster_num_nodes(ec):
     """ModifyCacheCluster: scale NumCacheNodes up and down."""
     cid = f"mod-cc-{_uid()}"
@@ -320,6 +402,7 @@ def test_modify_cache_cluster_num_nodes(ec):
     ec.delete_cache_cluster(CacheClusterId=cid)
 
 
+@requires_docker
 def test_modify_cache_cluster_node_type_and_engine(ec):
     """ModifyCacheCluster: update CacheNodeType and EngineVersion."""
     cid = f"mod-nt-{_uid()}"
@@ -345,6 +428,7 @@ def test_modify_cache_cluster_node_type_and_engine(ec):
 # 2. RebootCacheCluster
 # ---------------------------------------------------------------------------
 
+@requires_docker
 def test_reboot_cache_cluster(ec):
     """RebootCacheCluster: reboot and verify cluster stays available."""
     cid = f"reboot-{_uid()}"
@@ -369,6 +453,7 @@ def test_reboot_cache_cluster(ec):
 # 3. DeleteReplicationGroup
 # ---------------------------------------------------------------------------
 
+@requires_docker
 def test_delete_replication_group(ec):
     """DeleteReplicationGroup: create then delete, verify gone."""
     rg_id = f"del-rg-{_uid()}"
@@ -394,6 +479,7 @@ def test_delete_replication_group(ec):
 # 4. ModifyReplicationGroup
 # ---------------------------------------------------------------------------
 
+@requires_docker
 def test_modify_replication_group(ec):
     """ModifyReplicationGroup: update description and CacheNodeType."""
     rg_id = f"mod-rg-{_uid()}"
@@ -414,10 +500,56 @@ def test_modify_replication_group(ec):
     ec.delete_replication_group(ReplicationGroupId=rg_id)
 
 
+def test_create_replication_group_missing_user_group_fails(ec):
+    """CreateReplicationGroup returns UserGroupNotFound for unknown UserGroupIds."""
+    rg_id = f"rg-missing-ug-{_uid()}"
+    with pytest.raises(ClientError) as exc:
+        ec.create_replication_group(
+            ReplicationGroupId=rg_id,
+            ReplicationGroupDescription="Missing user group",
+            CacheNodeType="cache.t3.micro",
+            UserGroupIds=["missing-user-group"],
+        )
+    err = exc.value.response["Error"]
+    assert err["Code"] == "UserGroupNotFound"
+    assert err["Message"] == "The user group was not found or does not exist"
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 404
+
+    with pytest.raises(ClientError) as exc:
+        ec.describe_replication_groups(ReplicationGroupId=rg_id)
+    assert exc.value.response["Error"]["Code"] == "ReplicationGroupNotFoundFault"
+
+
+def test_modify_replication_group_missing_user_group_fails_before_mutation(ec):
+    """ModifyReplicationGroup validates user groups before applying other changes."""
+    rg_id = f"mod-rg-missing-ug-{_uid()}"
+    ec.create_replication_group(
+        ReplicationGroupId=rg_id,
+        ReplicationGroupDescription="Original desc",
+        CacheNodeType="cache.t3.micro",
+    )
+
+    with pytest.raises(ClientError) as exc:
+        ec.modify_replication_group(
+            ReplicationGroupId=rg_id,
+            ReplicationGroupDescription="Updated desc",
+            UserGroupIdsToAdd=["missing-user-group"],
+        )
+    err = exc.value.response["Error"]
+    assert err["Code"] == "UserGroupNotFound"
+    assert err["Message"] == "The user group was not found or does not exist"
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 404
+
+    rg = ec.describe_replication_groups(ReplicationGroupId=rg_id)["ReplicationGroups"][0]
+    assert rg["Description"] == "Original desc"
+    ec.delete_replication_group(ReplicationGroupId=rg_id)
+
+
 # ---------------------------------------------------------------------------
 # 5. IncreaseReplicaCount
 # ---------------------------------------------------------------------------
 
+@requires_docker
 def test_increase_replica_count(ec):
     """IncreaseReplicaCount: scale replicas up from 1 to 3."""
     rg_id = f"inc-rep-{_uid()}"
@@ -449,6 +581,7 @@ def test_increase_replica_count(ec):
 # 6. DecreaseReplicaCount
 # ---------------------------------------------------------------------------
 
+@requires_docker
 def test_decrease_replica_count(ec):
     """DecreaseReplicaCount: scale replicas down from 3 to 1."""
     rg_id = f"dec-rep-{_uid()}"
@@ -479,6 +612,7 @@ def test_decrease_replica_count(ec):
 # 7. DeleteCacheSubnetGroup
 # ---------------------------------------------------------------------------
 
+@requires_docker
 def test_delete_cache_subnet_group(ec):
     """DeleteCacheSubnetGroup: create then delete, verify gone."""
     name = f"del-sg-{_uid()}"
@@ -504,6 +638,7 @@ def test_delete_cache_subnet_group(ec):
 # 8. ResetCacheParameterGroup
 # ---------------------------------------------------------------------------
 
+@requires_docker
 def test_reset_cache_parameter_group_full(ec):
     """ResetCacheParameterGroup: full reset restores defaults."""
     pg = f"reset-full-{_uid()}"
@@ -533,6 +668,7 @@ def test_reset_cache_parameter_group_full(ec):
     ec.delete_cache_parameter_group(CacheParameterGroupName=pg)
 
 
+@requires_docker
 def test_reset_cache_parameter_group_selective(ec):
     """ResetCacheParameterGroup: selective reset of specific parameter."""
     pg = f"reset-sel-{_uid()}"
@@ -570,6 +706,7 @@ def test_reset_cache_parameter_group_selective(ec):
 # 9. DeleteSnapshot (explicit)
 # ---------------------------------------------------------------------------
 
+@requires_docker
 def test_delete_snapshot_explicit(ec):
     """DeleteSnapshot: create snapshot, delete it, verify gone."""
     cid = f"snap-del-{_uid()}"
@@ -601,6 +738,7 @@ def test_delete_snapshot_explicit(ec):
 # 10. DescribeEvents
 # ---------------------------------------------------------------------------
 
+@requires_docker
 def test_describe_events_all(ec):
     """DescribeEvents: listing all events returns results."""
     # create a cluster to generate at least one event
@@ -618,6 +756,7 @@ def test_describe_events_all(ec):
     ec.delete_cache_cluster(CacheClusterId=cid)
 
 
+@requires_docker
 def test_describe_events_filter_source_type(ec):
     """DescribeEvents: filter by SourceType."""
     rg_id = f"evt-rg-{_uid()}"
@@ -635,6 +774,7 @@ def test_describe_events_filter_source_type(ec):
     ec.delete_replication_group(ReplicationGroupId=rg_id)
 
 
+@requires_docker
 def test_describe_events_filter_source_id(ec):
     """DescribeEvents: filter by SourceIdentifier."""
     cid = f"evt-src-{_uid()}"
@@ -653,9 +793,120 @@ def test_describe_events_filter_source_id(ec):
 
 
 # ---------------------------------------------------------------------------
-# 11. Serverless cache operations — not implemented in MiniStack
+# 11. Replication group member cluster lifecycle
 # ---------------------------------------------------------------------------
 
+def test_replication_group_creates_member_clusters(ec):
+    """CreateReplicationGroup should register member clusters visible via DescribeCacheClusters."""
+    rg_id = f"rg-members-{_uid()}"
+    ec.create_replication_group(
+        ReplicationGroupId=rg_id,
+        ReplicationGroupDescription="Member cluster test",
+        CacheNodeType="cache.t3.micro",
+        NumCacheClusters=2,
+    )
+    rg = ec.describe_replication_groups(ReplicationGroupId=rg_id)["ReplicationGroups"][0]
+    member_ids = rg["MemberClusters"]
+    assert len(member_ids) == 2
+
+    for cid in member_ids:
+        resp = ec.describe_cache_clusters(CacheClusterId=cid)
+        cluster = resp["CacheClusters"][0]
+        assert cluster["CacheClusterId"] == cid
+        assert cluster["ReplicationGroupId"] == rg_id
+
+    ec.delete_replication_group(ReplicationGroupId=rg_id)
+
+
+def test_delete_replication_group_removes_member_clusters(ec):
+    """DeleteReplicationGroup should also remove its member clusters."""
+    rg_id = f"rg-del-mem-{_uid()}"
+    ec.create_replication_group(
+        ReplicationGroupId=rg_id,
+        ReplicationGroupDescription="Delete members test",
+        CacheNodeType="cache.t3.micro",
+        NumCacheClusters=2,
+    )
+    member_ids = ec.describe_replication_groups(
+        ReplicationGroupId=rg_id
+    )["ReplicationGroups"][0]["MemberClusters"]
+
+    ec.delete_replication_group(ReplicationGroupId=rg_id)
+
+    for cid in member_ids:
+        with pytest.raises(ClientError) as exc:
+            ec.describe_cache_clusters(CacheClusterId=cid)
+        assert "CacheClusterNotFound" in str(exc.value)
+
+
+def test_replication_group_tags_on_create(ec):
+    """Tags passed at CreateReplicationGroup should be retrievable via ListTagsForResource."""
+    rg_id = f"rg-tags-{_uid()}"
+    ec.create_replication_group(
+        ReplicationGroupId=rg_id,
+        ReplicationGroupDescription="Tag on create",
+        CacheNodeType="cache.t3.micro",
+        Tags=[{"Key": "env", "Value": "test"}, {"Key": "team", "Value": "infra"}],
+    )
+    arn = ec.describe_replication_groups(
+        ReplicationGroupId=rg_id
+    )["ReplicationGroups"][0]["ARN"]
+
+    tags = ec.list_tags_for_resource(ResourceName=arn)
+    tag_map = {t["Key"]: t["Value"] for t in tags["TagList"]}
+    assert tag_map["env"] == "test"
+    assert tag_map["team"] == "infra"
+
+    ec.delete_replication_group(ReplicationGroupId=rg_id)
+
+
+def test_replication_group_cluster_mode_uses_cluster_on_default_group(ec):
+    """Cluster-mode-enabled replication groups use the .cluster.on default group."""
+    rg_id = f"rg-cluster-pg-{_uid()}"
+    ec.create_replication_group(
+        ReplicationGroupId=rg_id,
+        ReplicationGroupDescription="Cluster default parameter group",
+        CacheNodeType="cache.t3.micro",
+        NumNodeGroups=3,
+        ReplicasPerNodeGroup=0,
+    )
+    rg = ec.describe_replication_groups(ReplicationGroupId=rg_id)["ReplicationGroups"][0]
+    member_id = rg["MemberClusters"][0]
+    cluster = ec.describe_cache_clusters(CacheClusterId=member_id)["CacheClusters"][0]
+    assert cluster["CacheParameterGroup"]["CacheParameterGroupName"] == "default.redis7.cluster.on"
+    ec.delete_replication_group(ReplicationGroupId=rg_id)
+
+
+def test_replication_group_tag_updates_propagate_to_member_clusters(ec):
+    """AddTagsToResource/RemoveTagsFromResource on a replication group fan out to members."""
+    rg_id = f"rg-tag-fanout-{_uid()}"
+    ec.create_replication_group(
+        ReplicationGroupId=rg_id,
+        ReplicationGroupDescription="Tag fanout",
+        CacheNodeType="cache.t3.micro",
+        NumCacheClusters=2,
+    )
+    rg = ec.describe_replication_groups(ReplicationGroupId=rg_id)["ReplicationGroups"][0]
+    rg_arn = rg["ARN"]
+    member_id = rg["MemberClusters"][0]
+    member = ec.describe_cache_clusters(CacheClusterId=member_id)["CacheClusters"][0]
+    member_arn = member["ARN"]
+
+    ec.add_tags_to_resource(ResourceName=rg_arn, Tags=[{"Key": "env", "Value": "test"}])
+    member_tags = ec.list_tags_for_resource(ResourceName=member_arn)["TagList"]
+    assert {t["Key"]: t["Value"] for t in member_tags}["env"] == "test"
+
+    ec.remove_tags_from_resource(ResourceName=rg_arn, TagKeys=["env"])
+    member_tags = ec.list_tags_for_resource(ResourceName=member_arn)["TagList"]
+    assert not any(t["Key"] == "env" for t in member_tags)
+    ec.delete_replication_group(ReplicationGroupId=rg_id)
+
+
+# ---------------------------------------------------------------------------
+# 12. Serverless cache operations — not implemented in MiniStack
+# ---------------------------------------------------------------------------
+
+@requires_docker
 def test_serverless_cache_not_implemented(ec):
     """Serverless cache operations are not yet implemented; verify graceful error."""
     with pytest.raises(ClientError):
@@ -676,10 +927,6 @@ import zipfile
 
 import pytest
 
-pytestmark = pytest.mark.skipif(
-    not os.environ.get("DOCKER_NETWORK"),
-    reason="DOCKER_NETWORK not set — skipping network connectivity test",
-)
 
 _LAMBDA_ROLE = "arn:aws:iam::000000000000:role/lambda-role"
 
@@ -698,6 +945,7 @@ def _make_zip_js(code: str) -> bytes:
     return buf.getvalue()
 
 
+@requires_docker
 def test_elasticache_lambda_network_connectivity(ec, lam):
     """Prove that Lambda containers can TCP-connect to an ElastiCache container."""
     cluster_id = "net-test-redis"
@@ -806,3 +1054,106 @@ exports.handler = async (event) => {{
             ec.delete_cache_cluster(CacheClusterId=cluster_id)
         except Exception:
             pass
+
+
+
+
+# ── Container respawn on restore (#853) — unit-style, no Docker ──────
+
+
+def test_elasticache_restore_state_marks_clusters_for_respawn(monkeypatch):
+    """Issue #853: restoring persisted cluster state must re-spawn the
+    Redis Docker container — the persisted container id is dead after
+    restart. Verifies the lazy-respawn path is triggered."""
+    from ministack.services import elasticache as _ec
+    _ec.reset()
+
+    spawned = []
+
+    def fake_spawn(name, engine, engine_version, labels):
+        spawned.append({"name": name, "engine": engine,
+                         "engine_version": engine_version, "labels": labels})
+        return ("ministack-elasticache", 6379, f"cid-{name}")
+
+    monkeypatch.setattr(_ec, "_spawn_redis_container", fake_spawn)
+
+    _ec.restore_state({
+        "clusters": {
+            "clustertest": {
+                "CacheClusterId": "clustertest",
+                "Engine": "redis", "EngineVersion": "7.1",
+                "CacheNodes": [{"CacheNodeId": "0001",
+                                "Endpoint": {"Address": "stale", "Port": 1}}],
+                "_docker_container_id": "old-dead-cid",
+                "CacheClusterStatus": "available",
+            },
+        },
+    })
+
+    assert spawned == []  # respawn deferred — _spawn_redis_container not yet bound at import time
+    assert "clustertest" in _ec._pending_cluster_respawn
+
+    _ec._ensure_live_containers()
+
+    assert any(s["name"] == "ministack-elasticache-clustertest" for s in spawned)
+    cl = _ec._clusters["clustertest"]
+    assert cl["_docker_container_id"] == "cid-ministack-elasticache-clustertest"
+    assert cl["CacheNodes"][0]["Endpoint"]["Address"] == "ministack-elasticache"
+    assert cl["CacheNodes"][0]["Endpoint"]["Port"] == 6379
+    assert "clustertest" not in _ec._pending_cluster_respawn
+
+    spawned.clear()
+    _ec._ensure_live_containers()
+    assert spawned == []  # idempotent — no second respawn
+
+
+def test_elasticache_restore_state_wipes_stale_replication_group_container_ids(monkeypatch):
+    from ministack.core.responses import set_request_account_id
+    from ministack.services import elasticache as _ec
+    set_request_account_id("000000000000")
+    _ec.reset()
+    monkeypatch.setattr(_ec, "_spawn_redis_container",
+                          lambda name, engine, engine_version, labels: ("rg-host", 6379, f"cid-{name}"))
+
+    _ec.restore_state({
+        "replication_groups": {
+            "rg-1": {
+                "ReplicationGroupId": "rg-1",
+                "Engine": "redis", "EngineVersion": "7.1",
+                "NodeGroups": [{"NodeGroupId": "0001"}],
+                "_docker_container_ids": ["dead-cid-1", "dead-cid-2"],
+            },
+        },
+    })
+    assert _ec._replication_groups["rg-1"]["_docker_container_ids"] == []
+    assert "rg-1" in _ec._pending_rg_respawn
+
+    _ec._ensure_live_containers()
+    cids = _ec._replication_groups["rg-1"]["_docker_container_ids"]
+    assert cids == ["cid-ministack-elasticache-rg-000000000000-rg-1-0001"]
+    assert "rg-1" not in _ec._pending_rg_respawn
+
+
+def test_elasticache_respawn_failure_is_logged_and_does_not_block_requests(monkeypatch, caplog):
+    import logging
+    from ministack.services import elasticache as _ec
+    _ec.reset()
+
+    def boom(*a, **kw):
+        raise RuntimeError("docker daemon unreachable")
+
+    monkeypatch.setattr(_ec, "_spawn_redis_container", boom)
+
+    _ec.restore_state({
+        "clusters": {
+            "c1": {
+                "CacheClusterId": "c1", "Engine": "redis", "EngineVersion": "7.1",
+                "CacheNodes": [], "_docker_container_id": "old",
+                "CacheClusterStatus": "available",
+            },
+        },
+    })
+    with caplog.at_level(logging.WARNING):
+        _ec._ensure_live_containers()
+    assert "c1" not in _ec._pending_cluster_respawn  # cleared even on failure (no retry storm)
+    assert any("failed to respawn" in r.message for r in caplog.records)

@@ -424,7 +424,78 @@ def _put_log_events(data):
 
     token = str(int(s["uploadSequenceToken"]) + 1)
     s["uploadSequenceToken"] = token
+
+    _fanout_to_subscription_filters(group, stream, events)
     return json_response({"nextSequenceToken": token})
+
+
+def _subscription_pattern_matches(pattern, message):
+    """Minimal CloudWatch Logs filter-pattern match: an empty pattern matches
+    every event; otherwise every bare term in the pattern must appear in the
+    message. The full filter-pattern grammar is intentionally not implemented."""
+    if not pattern or not pattern.strip():
+        return True
+    import re
+    terms = re.findall(r"[A-Za-z0-9_./:-]+", pattern)
+    return all(t in (message or "") for t in terms) if terms else True
+
+
+def _fanout_to_subscription_filters(group_name, stream_name, events):
+    """Forward matching log events to each subscription filter's destination
+    Lambda, in AWS's `awslogs` gzip+base64 envelope (#896). Best-effort — a
+    delivery failure must never break log ingestion. Only Lambda destinations
+    are delivered; Kinesis/Firehose destinations are stored but not delivered."""
+    grp = _log_groups.get(group_name)
+    if not grp or not events:
+        return
+    filters = grp.get("subscriptionFilters") or {}
+    if not filters:
+        return
+    import gzip
+    import threading
+    now_ms = int(time.time() * 1000)
+    for f in filters.values():
+        # Best-effort per filter: a delivery error must NEVER break log
+        # ingestion (PutLogEvents / Lambda log emit both call this).
+        try:
+            dest = f.get("destinationArn", "")
+            if ":function:" not in dest:
+                continue  # only Lambda destinations are delivered
+            fn = dest.split(":function:")[-1].split(":")[0]
+            # Guard the self-feeding loop: a filter on /aws/lambda/<fn> pointing
+            # back at <fn> would invoke→log→invoke forever.
+            if group_name == f"/aws/lambda/{fn}":
+                continue
+            matched = [e for e in events
+                       if _subscription_pattern_matches(f.get("filterPattern", ""), e.get("message", ""))]
+            if not matched:
+                continue
+            payload = {
+                "messageType": "DATA_MESSAGE",
+                "owner": get_account_id(),
+                "logGroup": group_name,
+                "logStream": stream_name,
+                "subscriptionFilters": [f.get("filterName", "")],
+                "logEvents": [
+                    {"id": new_uuid().replace("-", ""),
+                     "timestamp": e.get("timestamp", now_ms),
+                     "message": e.get("message", "")}
+                    for e in matched
+                ],
+            }
+            awslogs_event = {"awslogs": {
+                "data": base64.b64encode(gzip.compress(json.dumps(payload).encode())).decode()
+            }}
+            from ministack.services import lambda_svc
+            rec = lambda_svc._functions.get(fn)
+            if rec:
+                threading.Thread(target=lambda_svc._execute_function,
+                                 args=(rec, awslogs_event), daemon=True).start()
+            else:
+                logger.warning("subscription filter %s: destination Lambda %s not found",
+                               f.get("filterName"), fn)
+        except Exception as exc:
+            logger.debug("subscription filter delivery failed: %s", exc)
 
 
 def _resolve_log_group_name(data):

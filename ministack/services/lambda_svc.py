@@ -28,13 +28,13 @@ import asyncio
 import base64
 import copy
 import hashlib
-import secrets
 import importlib
 import io
 import json
 import logging
 import os
 import re
+import secrets
 import socket
 import subprocess
 import tempfile
@@ -48,7 +48,7 @@ from typing import Any
 from urllib.parse import unquote
 
 from ministack.core.lambda_runtime import get_or_create_worker, invalidate_worker
-from ministack.core.persistence import PERSIST_STATE, load_state
+from ministack.core.persistence import PERSIST_STATE, STATE_DIR, load_state
 from ministack.core.responses import (
     _12_DIGIT_RE,
     AccountScopedDict,
@@ -62,6 +62,8 @@ from ministack.core.responses import (
 )
 
 logger = logging.getLogger("lambda")
+
+_MINISTACK_HOST = os.environ.get("MINISTACK_HOST", "localhost")
 
 
 def _emit_lambda_metrics(function_name: str, duration_ms: float,
@@ -221,19 +223,136 @@ _poller_lock = threading.Lock()
 
 # ── Persistence ────────────────────────────────────────────
 
+# Lambda code zips are stored on disk as content-addressed blob files under
+# ${STATE_DIR}/lambda-blobs/{sha256}.zip; ``lambda.json`` only carries the
+# sha256 reference. Inline base64 in the state file (the previous shape)
+# scales poorly: a single ~30 MB zip multiplied by N functions encodes ~1.3×
+# larger as base64 and forces a single-shot JSON parse on every restart,
+# which pushes memory to ~2× the encoded size during decode.
+#
+# Content-addressing means two functions with identical bytes share one
+# blob file. The orphan sweep at the end of ``get_state()`` removes blob
+# files no longer referenced by any function or version (e.g. previous
+# ``UpdateFunctionCode`` generations).
+#
+# Backward compatibility: ``restore_state`` accepts the legacy inline
+# base64 shape (``"code_zip": "<b64>"``) so an upgrade in place works
+# without a one-shot migration step.
+
+CODE_BLOB_DIR = os.path.join(STATE_DIR, "lambda-blobs")
+_BLOB_REF_KEY = "code_blob_ref"
+
+
+def _write_code_blob(code_zip: bytes) -> str:
+    """Write ``code_zip`` to a content-addressed file. Returns the sha256
+    hex digest used as the file name. Idempotent: an existing file with
+    matching content (same sha) is left in place."""
+    sha = hashlib.sha256(code_zip).hexdigest()
+    os.makedirs(CODE_BLOB_DIR, exist_ok=True)
+    path = os.path.join(CODE_BLOB_DIR, f"{sha}.zip")
+    if os.path.exists(path):
+        return sha
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "wb") as f:
+            f.write(code_zip)
+        os.replace(tmp, path)
+    except BaseException:
+        # Avoid leaving partial writes that would later be picked up as if
+        # they were valid blobs.
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+    return sha
+
+
+def _read_code_blob(sha: str) -> bytes | None:
+    """Read a blob by sha256. Returns ``None`` and logs an error when the
+    file is missing or unreadable — restore should degrade the affected
+    function rather than abort the whole load."""
+    path = os.path.join(CODE_BLOB_DIR, f"{sha}.zip")
+    try:
+        with open(path, "rb") as f:
+            return f.read()
+    except FileNotFoundError:
+        logger.error("Lambda persistence: code blob %s missing at %s", sha, path)
+        return None
+    except OSError as e:
+        logger.error("Lambda persistence: failed to read code blob %s: %s", sha, e)
+        return None
+
+
+def _prune_orphan_code_blobs(referenced: set[str]) -> None:
+    """Remove blob files whose sha is not in the ``referenced`` set. Called
+    at the tail of ``get_state()`` so the on-disk set always reflects the
+    current ``_functions`` graph. Logs each removal at debug level; failures
+    are non-fatal (best-effort hygiene)."""
+    if not os.path.isdir(CODE_BLOB_DIR):
+        return
+    for entry in os.listdir(CODE_BLOB_DIR):
+        if not entry.endswith(".zip"):
+            continue
+        sha = entry[: -len(".zip")]
+        if sha in referenced:
+            continue
+        try:
+            os.remove(os.path.join(CODE_BLOB_DIR, entry))
+            logger.debug("Lambda persistence: pruned orphan blob %s", sha)
+        except OSError as e:
+            logger.warning("Lambda persistence: failed to prune blob %s: %s", sha, e)
+
+
+def _externalize_code_zip(func: dict, referenced: set[str]) -> None:
+    """Replace ``func['code_zip']`` (bytes) with a blob ref in place, and
+    record the sha in ``referenced`` so the orphan sweep keeps the file."""
+    code = func.get("code_zip")
+    if not code:
+        return
+    if isinstance(code, bytes):
+        sha = _write_code_blob(code)
+        func["code_zip"] = {_BLOB_REF_KEY: sha}
+        referenced.add(sha)
+    elif isinstance(code, dict) and _BLOB_REF_KEY in code:
+        # Already a ref (e.g. ``get_state`` called twice without a restore
+        # in between). Keep the file referenced.
+        referenced.add(code[_BLOB_REF_KEY])
+    # Legacy inline base64 strings are not re-serialized here — they reach
+    # ``get_state`` only if a caller copied them directly into _functions
+    # without going through CreateFunction (no real code path does this).
+
+
+def _internalize_code_zip(func: dict) -> None:
+    """Replace a blob ref or legacy base64 string with bytes, in place."""
+    code = func.get("code_zip")
+    if not code:
+        return
+    if isinstance(code, dict) and _BLOB_REF_KEY in code:
+        func["code_zip"] = _read_code_blob(code[_BLOB_REF_KEY])
+    elif isinstance(code, str):
+        # Legacy persistence shape (inline base64).
+        func["code_zip"] = base64.b64decode(code)
+
+
 def get_state():
-    """Return JSON-serializable state. code_zip bytes are base64-encoded."""
+    """Return JSON-serializable Lambda state.
+
+    Function code (``code_zip``) is written to disk as content-addressed
+    blobs under ``${STATE_DIR}/lambda-blobs/`` and replaced in the returned
+    state with ``{"code_blob_ref": "<sha256>"}`` markers. Unreferenced blobs
+    from prior generations are pruned."""
     from ministack.core.responses import AccountScopedDict
     funcs = AccountScopedDict()
+    referenced: set[str] = set()
     # Iterate _data directly to capture ALL accounts, not just current request context
     for scoped_key, func in _functions._data.items():
         f = copy.deepcopy(func)
-        if f.get("code_zip") and isinstance(f["code_zip"], bytes):
-            f["code_zip"] = base64.b64encode(f["code_zip"]).decode()
+        _externalize_code_zip(f, referenced)
         for ver in f.get("versions", {}).values():
-            if ver.get("code_zip") and isinstance(ver["code_zip"], bytes):
-                ver["code_zip"] = base64.b64encode(ver["code_zip"]).decode()
+            _externalize_code_zip(ver, referenced)
         funcs._data[scoped_key] = f
+    _prune_orphan_code_blobs(referenced)
     return {
         "functions": funcs,
         "layers": copy.deepcopy(_layers),
@@ -254,19 +373,15 @@ def restore_state(data):
         funcs = data.get("functions", {})
         if isinstance(funcs, AccountScopedDict):
             for scoped_key, func in funcs._data.items():
-                if func.get("code_zip") and isinstance(func["code_zip"], str):
-                    func["code_zip"] = base64.b64decode(func["code_zip"])
+                _internalize_code_zip(func)
                 for ver in func.get("versions", {}).values():
-                    if ver.get("code_zip") and isinstance(ver["code_zip"], str):
-                        ver["code_zip"] = base64.b64decode(ver["code_zip"])
+                    _internalize_code_zip(ver)
                 _functions._data[scoped_key] = func
         else:
             for name, func in funcs.items():
-                if func.get("code_zip") and isinstance(func["code_zip"], str):
-                    func["code_zip"] = base64.b64decode(func["code_zip"])
+                _internalize_code_zip(func)
                 for ver in func.get("versions", {}).values():
-                    if ver.get("code_zip") and isinstance(ver["code_zip"], str):
-                        ver["code_zip"] = base64.b64decode(ver["code_zip"])
+                    _internalize_code_zip(ver)
                 _functions[name] = func
         _layers.update(data.get("layers", {}))
         _esms.update(data.get("esms", {}))
@@ -303,6 +418,16 @@ for _ld in filter(None, os.environ.get("_LAMBDA_LAYERS_DIRS", "").split(os.paths
     _py = os.path.join(_ld, "python")
     if os.path.isdir(_py):
         sys.path.insert(0, _py)
+        # AWS exposes <layer>/python/lib/python<ver>/site-packages as a site
+        # directory (processes .pth files / namespace packages), where
+        # `pip install -t` dependency layers land (#888).
+        _lib = os.path.join(_py, "lib")
+        if os.path.isdir(_lib):
+            import site as _site
+            for _v in os.listdir(_lib):
+                _sp = os.path.join(_lib, _v, "site-packages")
+                if os.path.isdir(_sp):
+                    _site.addsitedir(_sp)
     sys.path.insert(0, _ld)
 
 _mod_path = os.environ["_LAMBDA_HANDLER_MODULE"]
@@ -346,6 +471,16 @@ for _ld in filter(None, os.environ.get("_LAMBDA_LAYERS_DIRS", "").split(":")):
     _py = os.path.join(_ld, "python")
     if os.path.isdir(_py):
         sys.path.insert(0, _py)
+        # AWS exposes <layer>/python/lib/python<ver>/site-packages as a site
+        # directory (processes .pth files / namespace packages), where
+        # `pip install -t` dependency layers land (#888).
+        _lib = os.path.join(_py, "lib")
+        if os.path.isdir(_lib):
+            import site as _site
+            for _v in os.listdir(_lib):
+                _sp = os.path.join(_lib, _v, "site-packages")
+                if os.path.isdir(_sp):
+                    _site.addsitedir(_sp)
     sys.path.insert(0, _ld)
 
 _mod_path = os.environ["_LAMBDA_HANDLER_MODULE"]
@@ -652,8 +787,11 @@ def _build_config(name: str, data: dict, code_zip: bytes | None = None) -> dict:
     layers_cfg = []
     for layer in data.get("Layers", []):
         if isinstance(layer, str):
-            layers_cfg.append({"Arn": layer, "CodeSize": 0})
+            layers_cfg.append({"Arn": layer, "CodeSize": _layer_codesize_for_arn(layer)})
         elif isinstance(layer, dict):
+            layer = dict(layer)
+            if "CodeSize" not in layer and "Arn" in layer:
+                layer["CodeSize"] = _layer_codesize_for_arn(layer["Arn"])
             layers_cfg.append(layer)
 
     env = data.get("Environment")
@@ -1196,7 +1334,7 @@ def _presigned_code_url(func_name: str) -> str:
     ministack endpoint and dress the URL up with the query params SDKs and
     scripts expect, so `pip-style` pull-and-extract code works unchanged.
     """
-    host = os.environ.get("MINISTACK_HOST", "localhost")
+    host = _MINISTACK_HOST
     port = os.environ.get("GATEWAY_PORT", os.environ.get("EDGE_PORT", "4566"))
     qs = (
         f"?X-Amz-Algorithm=AWS4-HMAC-SHA256"
@@ -1394,6 +1532,9 @@ def _delete_function(name: str, query_params: dict):
     else:
         del _functions[name]
         invalidate_worker(name)
+        # Docker pool too — otherwise the function's pooled containers leak
+        # until _WARM_CONTAINER_TTL eviction.
+        _pool_kill_function(get_account_id(), name)
     return 204, {}, b""
 
 
@@ -1446,6 +1587,10 @@ def _update_code(name: str, data: dict):
 
     # Invalidate only the old $LATEST worker — published version workers stay alive
     invalidate_worker(name, qualifier="$LATEST")
+    # Docker pool: the new CodeSha256 changes the pool key so new invokes
+    # spawn fresh containers anyway, but the old containers under the old key
+    # would linger until _WARM_CONTAINER_TTL. Reap them now.
+    _pool_kill_function(get_account_id(), name)
     _schedule_state_transition(name, _LAMBDA_STATE_TRANSITION_DELAY)
 
     if data.get("Publish"):
@@ -1496,8 +1641,11 @@ def _update_config(name: str, data: dict):
                 layers_cfg = []
                 for layer in data["Layers"]:
                     if isinstance(layer, str):
-                        layers_cfg.append({"Arn": layer, "CodeSize": 0})
+                        layers_cfg.append({"Arn": layer, "CodeSize": _layer_codesize_for_arn(layer)})
                     elif isinstance(layer, dict):
+                        layer = dict(layer)
+                        if "CodeSize" not in layer and "Arn" in layer:
+                            layer["CodeSize"] = _layer_codesize_for_arn(layer["Arn"])
                         layers_cfg.append(layer)
                 config["Layers"] = layers_cfg
             else:
@@ -1512,6 +1660,27 @@ def _update_config(name: str, data: dict):
     config["StateReason"] = "The function is being updated."
     config["StateReasonCode"] = "Updating"
     config["RevisionId"] = new_uuid()
+    # AWS-match: UpdateFunctionConfiguration recycles the init container when
+    # spawn-time inputs change (Runtime/Handler/Layers/Env/MemorySize/Arch/
+    # VpcConfig/FileSystemConfigs). The ministack warm-pool key is just
+    # account:func:qualifier, so a stale worker would keep serving with the
+    # pre-update layers/env. Invalidate to force a fresh worker on next invoke,
+    # mirroring what _update_code already does. Otherwise PublishLayerVersion +
+    # UpdateFunctionConfiguration(Layers=[...]) leaves the previously-warm
+    # worker without the new layer extracted on disk (issue #816).
+    _WORKER_AFFECTING = {
+        "Runtime", "Handler", "Layers", "Environment", "MemorySize",
+        "Architectures", "VpcConfig", "FileSystemConfigs",
+    }
+    if any(k in data for k in _WORKER_AFFECTING):
+        invalidate_worker(name, qualifier="$LATEST")
+        # Also invalidate the docker warm-container pool: its key is
+        # account:func:zip:CodeSha256, so config-only changes (Layers,
+        # Environment, MemorySize, etc.) wouldn't otherwise displace a stale
+        # pooled container. Without this, LAMBDA_EXECUTOR=docker users hit the
+        # same "old container, no new layer mounted" failure mode that the
+        # in-process warm worker recycle solved for Python/Node.
+        _pool_kill_function(get_account_id(), name)
     _schedule_state_transition(name, _LAMBDA_STATE_TRANSITION_DELAY)
     return json_response(config)
 
@@ -1915,6 +2084,29 @@ def _pool_clear_all() -> None:
         _kill_pool_entry(e)
 
 
+def _pool_kill_function(account: str, func_name: str) -> None:
+    """Kill every pooled docker container for a function across all qualifiers.
+
+    The pool key is ``{account}:{func_name}:zip:{CodeSha256}`` (or
+    ``:image:{ImageUri}``). UpdateFunctionConfiguration changes attributes that
+    don't show up in the key (Layers / Environment / MemorySize / VpcConfig /
+    Architectures / FileSystemConfigs / Runtime / Handler), so the same key
+    would otherwise hand back a stale container that was spawned before the
+    config change. Issue #816 docker-executor follow-up: a layer attached
+    after the first invoke was never mounted on the reused warm container,
+    so handler imports from the layer kept failing even after the layer's
+    extracted dir was correct.
+    """
+    prefix = f"{account}:{func_name}:"
+    to_kill = []
+    with _warm_pool_lock:
+        for key in list(_warm_pool.keys()):
+            if key.startswith(prefix):
+                to_kill.extend(_warm_pool.pop(key))
+    for e in to_kill:
+        _kill_pool_entry(e)
+
+
 def _ensure_reaper_thread() -> None:
     global _reaper_started
     with _reaper_lock:
@@ -2214,12 +2406,38 @@ def _throttle_response(reason_code: str, msg: str, retry_after: int = 1) -> dict
     }
 
 
-def _docker_cp_dir(container, src_dir: str, dest_dir: str):
-    """Copy a local directory into a Docker container using a tar archive."""
+def _extract_zip_preserving_mode(zf, dest_dir: str):
+    """Extract a ZipFile, restoring the unix permission bits that
+    ``ZipFile.extractall`` silently drops.
+
+    AWS preserves the file modes baked into a layer / function zip — most
+    importantly the ``+x`` on ``/opt/bin`` tools and bundled binaries. zipfile
+    stores the mode in the high 16 bits of ``external_attr``; it's 0 for
+    Windows-created zips (PowerShell ``Compress-Archive``), in which case we
+    leave the platform default untouched.
+    """
+    for info in zf.infolist():
+        target = zf.extract(info, dest_dir)
+        mode = (info.external_attr >> 16) & 0o7777
+        if mode:
+            os.chmod(target, mode)
+
+
+def _docker_cp_dir(container, src_dir: str, dest_dir: str, arcname: str = "."):
+    """Copy a local directory into a Docker container using a tar archive.
+
+    Docker's ``put_archive`` requires ``dest_dir`` to already exist in the
+    container — all the base-image paths we target (``/var/task``,
+    ``/var/runtime``, ``/opt``) do. ``arcname`` controls how the source is laid
+    out inside ``dest_dir``: the default ``"."`` merges ``src_dir``'s contents
+    straight into ``dest_dir`` (e.g. a layer's ``python/`` lands at
+    ``/opt/python``, matching AWS), while a named ``arcname`` would nest it
+    under that subdir.
+    """
     import tarfile
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w") as tar:
-        tar.add(src_dir, arcname=".")
+        tar.add(src_dir, arcname=arcname)
     buf.seek(0)
     container.put_archive(dest_dir, buf)
 
@@ -2413,7 +2631,7 @@ def _spawn_lambda_container(config: dict, code_zip: bytes | None):
         with open(code_zip_path, "wb") as f:
             f.write(code_zip)
         with zipfile.ZipFile(code_zip_path) as zf:
-            zf.extractall(code_dir)
+            _extract_zip_preserving_mode(zf, code_dir)
         if is_provided:
             bootstrap = os.path.join(code_dir, "bootstrap")
             if os.path.exists(bootstrap):
@@ -2430,7 +2648,7 @@ def _spawn_lambda_container(config: dict, code_zip: bytes | None):
             with open(layer_zip_path, "wb") as lf:
                 lf.write(layer_zip)
             with zipfile.ZipFile(layer_zip_path) as lzf:
-                lzf.extractall(layer_dir)
+                _extract_zip_preserving_mode(lzf, layer_dir)
             layers_dirs.append(layer_dir)
 
     # Shared environment
@@ -2450,10 +2668,10 @@ def _spawn_lambda_container(config: dict, code_zip: bytes | None):
     if is_provided:
         container_env["LAMBDA_TASK_ROOT"] = "/var/task"
     container_env["_HANDLER"] = handler
-    if layers_dirs:
-        container_env["_LAMBDA_LAYERS_DIRS"] = ":".join(
-            f"/opt/layer_{i}" for i in range(len(layers_dirs))
-        )
+    # Layers are merged into /opt directly (see the spawn below), so the docker
+    # RIE finds them on the standard /opt search paths (/opt/python, /opt/lib,
+    # /opt/bin) — no _LAMBDA_LAYERS_DIRS shim here (the official RIE bootstrap
+    # ignores it anyway).
     container_env.update(env_vars)
     # Per-invocation durable-execution overlay (no-op when the call isn't
     # inside a durable function).
@@ -2494,8 +2712,14 @@ def _spawn_lambda_container(config: dict, code_zip: bytes | None):
         endpoint = endpoint.replace("://127.0.0.1/", "://host.docker.internal/")
     container_env["AWS_ENDPOINT_URL"] = endpoint
 
-    # Mounts (Zip only — Image bakes code in)
+    # Mounts (Zip only — Image bakes code in). Layers are NEVER bind-mounted:
+    # AWS merges every layer's contents into /opt (so /opt/python, /opt/lib,
+    # /opt/bin land on the runtime's standard search paths). Bind-mounting each
+    # layer to /opt/layer_N puts the code where the RIE bootstrap can't see it
+    # (it searches /opt/python, not /opt/layer_N), which is issue #888. So
+    # layers always go in via docker cp merged into /opt, below.
     _use_docker_cp = False
+    _cp_layers = bool(layers_dirs)
     mounts: list = []
     if package_type == "Zip":
         host_code_dir = LAMBDA_DOCKER_VOLUME_MOUNT or code_dir
@@ -2503,8 +2727,6 @@ def _spawn_lambda_container(config: dict, code_zip: bytes | None):
             mounts.append(docker_lib.types.Mount("/var/task", host_code_dir, type="bind", read_only=True))
             if is_provided:
                 mounts.append(docker_lib.types.Mount("/var/runtime", host_code_dir, type="bind", read_only=True))
-            for idx, ld in enumerate(layers_dirs):
-                mounts.append(docker_lib.types.Mount(f"/opt/layer_{idx}", ld, type="bind", read_only=True))
         elif _running_in_container():
             # DinD: host daemon can't see our tmpfs — populate via docker cp after create
             _use_docker_cp = True
@@ -2512,8 +2734,6 @@ def _spawn_lambda_container(config: dict, code_zip: bytes | None):
             mounts.append(docker_lib.types.Mount("/var/task", host_code_dir, type="bind", read_only=True))
             if is_provided:
                 mounts.append(docker_lib.types.Mount("/var/runtime", host_code_dir, type="bind", read_only=True))
-            for idx, ld in enumerate(layers_dirs):
-                mounts.append(docker_lib.types.Mount(f"/opt/layer_{idx}", ld, type="bind", read_only=True))
 
     # CMD / EntryPoint
     run_kwargs: dict = {
@@ -2566,15 +2786,23 @@ def _spawn_lambda_container(config: dict, code_zip: bytes | None):
             raise RuntimeError(f"Failed to pull image {image}: {exc}")
 
     try:
-        if _use_docker_cp:
+        if _use_docker_cp or _cp_layers:
             create_kwargs = {k: v for k, v in run_kwargs.items()
                              if k not in ("detach", "stdin_open")}
             container = client.containers.create(**create_kwargs)
-            _docker_cp_dir(container, code_dir, "/var/task")
-            if is_provided:
-                _docker_cp_dir(container, code_dir, "/var/runtime")
-            for idx, ld in enumerate(layers_dirs):
-                _docker_cp_dir(container, ld, f"/opt/layer_{idx}")
+            # Code: cp'd only in DinD mode (otherwise it's bind-mounted above).
+            if _use_docker_cp:
+                _docker_cp_dir(container, code_dir, "/var/task")
+                if is_provided:
+                    _docker_cp_dir(container, code_dir, "/var/runtime")
+            # Layers: merge each layer's contents directly into /opt, exactly as
+            # AWS does — so /opt/python, /opt/lib, /opt/bin land on the runtime's
+            # standard search paths and the RIE bootstrap finds them with no
+            # shims. arcname="." so the tar carries ./python/... (not
+            # ./layer_N/...); later layers overlay earlier ones, matching AWS
+            # layer ordering. Fixes issue #888.
+            for ld in layers_dirs:
+                _docker_cp_dir(container, ld, "/opt", arcname=".")
             container.start()
         else:
             container = client.containers.run(**run_kwargs)
@@ -2765,7 +2993,11 @@ def _emit_lambda_logs(func: dict, request_id: str, log_text: str,
         config = func.get("config") or func
         fn_name = config.get("FunctionName", "unknown")
         qualifier = config.get("Version", "$LATEST")
-        group_name = f"/aws/lambda/{fn_name}"
+        # Honor LoggingConfig.LogGroup (advanced logging controls) so logs land
+        # in a caller-specified / shared log group, matching AWS. Falls back to
+        # the default per-function group when unset (#895).
+        logging_cfg = config.get("LoggingConfig") or {}
+        group_name = logging_cfg.get("LogGroup") or f"/aws/lambda/{fn_name}"
         now = datetime.now(timezone.utc)
         stream_name = f"{now.year:04d}/{now.month:02d}/{now.day:02d}/[{qualifier}]{new_uuid().replace('-', '')}"
         now_ms = int(time.time() * 1000)
@@ -2807,6 +3039,11 @@ def _emit_lambda_logs(func: dict, request_id: str, log_text: str,
             stream["firstEventTimestamp"] = now_ms
         stream["lastEventTimestamp"] = now_ms
         stream["lastIngestionTime"] = now_ms
+        # Forward to any subscription filters on this group (e.g. Lambda log
+        # processor pattern), matching AWS (#896).
+        _cwl._fanout_to_subscription_filters(
+            group_name, stream_name,
+            [{"timestamp": now_ms, "message": line} for line in lines])
     except Exception as exc:
         logger.debug("CW Logs emit failed for %s: %s", func.get("config", {}).get("FunctionName"), exc)
 
@@ -3055,7 +3292,7 @@ def _execute_function_provided(func: dict, event: dict) -> dict:
             code_dir = os.path.join(tmpdir, "code")
             os.makedirs(code_dir)
             with zipfile.ZipFile(zip_path) as zf:
-                zf.extractall(code_dir)
+                _extract_zip_preserving_mode(zf, code_dir)
 
             bootstrap_path = os.path.join(code_dir, "bootstrap")
             if not os.path.exists(bootstrap_path):
@@ -3255,7 +3492,7 @@ def _execute_function_local(func: dict, event: dict) -> dict:
             code_dir = os.path.join(tmpdir, "code")
             os.makedirs(code_dir)
             with zipfile.ZipFile(zip_path) as zf:
-                zf.extractall(code_dir)
+                _extract_zip_preserving_mode(zf, code_dir)
 
             layers_dirs: list[str] = []
             for layer_ref in config.get("Layers", []):
@@ -3268,7 +3505,7 @@ def _execute_function_local(func: dict, event: dict) -> dict:
                     with open(lzip_path, "wb") as lf:
                         lf.write(layer_zip)
                     with zipfile.ZipFile(lzip_path) as lzf:
-                        lzf.extractall(layer_dir)
+                        _extract_zip_preserving_mode(lzf, layer_dir)
                     layers_dirs.append(layer_dir)
 
             # Symlink layer node_modules packages into the code directory so that
@@ -3333,7 +3570,7 @@ def _execute_function_local(func: dict, event: dict) -> dict:
                 # Subprocess runs on the same host as ministack — point it at
                 # ourselves so boto3 calls land back here, not at real AWS.
                 gateway_port = os.environ.get("GATEWAY_PORT", "4566")
-                endpoint = f"http://localhost:{gateway_port}"
+                endpoint = f"http://{_MINISTACK_HOST}:{gateway_port}"
             if endpoint:
                 env["AWS_ENDPOINT_URL"] = endpoint
             env.update(env_vars)
@@ -3426,6 +3663,28 @@ def _resolve_layer_zip(layer_arn_str: str) -> bytes | None:
         if v["Version"] == version:
             return v.get("_zip_data")
     return None
+
+
+def _layer_codesize_for_arn(layer_arn_str: str) -> int:
+    """Look up the stored layer version's CodeSize, or 0 if the layer
+    version can't be resolved. Real AWS surfaces the actual layer code size on
+    `GetFunctionConfiguration.Layers[*].CodeSize` so callers can sanity-check
+    against quotas (250 MB unzipped function + layers)."""
+    segs = layer_arn_str.split(":")
+    if len(segs) < 8:
+        return 0
+    layer_name = segs[6]
+    try:
+        version = int(segs[7])
+    except (ValueError, IndexError):
+        return 0
+    layer = _layers.get(layer_name)
+    if not layer:
+        return 0
+    for v in layer["versions"]:
+        if v["Version"] == version:
+            return v.get("Content", {}).get("CodeSize", 0)
+    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -3814,9 +4073,8 @@ def _untag_resource(resource_arn: str, query_params: dict):
 
 
 def _layer_content_url(layer_name: str, version: int) -> str:
-    host = os.environ.get("MINISTACK_HOST", "localhost")
     port = os.environ.get("GATEWAY_PORT", "4566")
-    return f"http://{host}:{port}/_ministack/lambda-layers/{layer_name}/{version}/content"
+    return f"http://{_MINISTACK_HOST}:{port}/_ministack/lambda-layers/{layer_name}/{version}/content"
 
 
 def _publish_layer_version(layer_name: str, data: dict):
@@ -4313,6 +4571,9 @@ def _create_esm(data: dict):
     }
     if ":sqs:" not in event_source_arn:
         esm["StartingPosition"] = data.get("StartingPosition", "LATEST")
+        _init_stream_position(esm_id, event_source_arn, esm["StartingPosition"])
+    if data.get("FilterCriteria"):
+        esm["FilterCriteria"] = data.get("FilterCriteria")
     # #442: Tags are accepted on CreateEventSourceMapping. Stored inline on
     # the ESM record; surfaced via _list_tags for the ESM ARN.
     tags = data.get("Tags") or {}
@@ -4413,6 +4674,27 @@ _kinesis_positions = AccountScopedDict()
 # Per-ESM DynamoDB stream tracking: esm_uuid -> {shard_id: position}
 _dynamodb_stream_positions = AccountScopedDict()
 _dynamodb_stream_positions_lock = threading.Lock()
+
+
+def _init_stream_position(esm_id, source_arn, starting):
+    """Anchor a DynamoDB-stream ESM's read position at subscription time so
+    LATEST does not depend on when the poller thread first ticks. No-op if the
+    position was already set."""
+    if ":dynamodb:" not in source_arn or "/stream/" not in source_arn:
+        return
+    from ministack.services import dynamodb as _ddb
+
+    stream_records = getattr(_ddb, "_stream_records", None)
+    if stream_records is None:
+        return
+    table_name = source_arn.split("/stream/")[0].split("/")[-1]
+    with _dynamodb_stream_positions_lock:
+        if esm_id in _dynamodb_stream_positions:
+            return
+        if starting == "TRIM_HORIZON":
+            _dynamodb_stream_positions[esm_id] = 0
+        else:
+            _dynamodb_stream_positions[esm_id] = len(stream_records.get(table_name, []))
 
 
 def _ensure_poller():
@@ -4666,7 +4948,7 @@ def _poll_dynamodb_streams():
     from ministack.services import dynamodb as _ddb
 
     stream_records = getattr(_ddb, "_stream_records", None)
-    if not stream_records:
+    if stream_records is None:
         return
 
     for (acct_id, _esm_key), esm in list(_esms._data.items()):
@@ -4686,8 +4968,6 @@ def _poll_dynamodb_streams():
         table_arn = source_arn.split("/stream/")[0]
         table_name = table_arn.split("/")[-1]
         table_records = stream_records.get(table_name, [])
-        if not table_records:
-            continue
 
         esm_id = esm["UUID"]
         with _dynamodb_stream_positions_lock:
@@ -4698,6 +4978,9 @@ def _poll_dynamodb_streams():
                 else:
                     _dynamodb_stream_positions[esm_id] = len(table_records)
             pos = _dynamodb_stream_positions[esm_id]
+
+        if not table_records:
+            continue
 
         batch_size = esm.get("BatchSize", 100)
         batch = table_records[pos:pos + batch_size]

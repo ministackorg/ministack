@@ -37,6 +37,8 @@ from ministack.services._dynamodb_keywords import AWS_KEYWORDS
 
 logger = logging.getLogger("dynamodb")
 
+_MINISTACK_HOST = os.environ.get("MINISTACK_HOST", "localhost")
+
 
 def _conditional_check_failed(data, old_item, message="The conditional request failed"):
     """Standard ConditionalCheckFailedException response, with `Item` populated
@@ -53,6 +55,12 @@ def _conditional_check_failed(data, old_item, message="The conditional request f
     }, json.dumps(body, ensure_ascii=False).encode("utf-8")
 
 REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
+
+# Real AWS reports Export/Import as IN_PROGRESS at submit time; the flip to
+# COMPLETED happens asynchronously. We simulate that by holding IN_PROGRESS
+# on the first DescribeExport/DescribeImport calls within this grace window.
+_EXPORT_COMPLETE_AFTER_SEC = float(os.environ.get("MINISTACK_DDB_EXPORT_COMPLETE_AFTER_SEC", "1"))
+_IMPORT_COMPLETE_AFTER_SEC = float(os.environ.get("MINISTACK_DDB_IMPORT_COMPLETE_AFTER_SEC", "1"))
 
 from ministack.core.persistence import PERSIST_STATE, load_state
 
@@ -241,7 +249,7 @@ def _validate_attribute_value(attr_name: str, value: dict) -> tuple | None:
     if vtype == "S":
         if not isinstance(vval, str):
             return error_response_json("ValidationException",
-                f"Supplied AttributeValue is empty, must contain exactly one of the supported datatypes", 400)
+                "Supplied AttributeValue is empty, must contain exactly one of the supported datatypes", 400)
     elif vtype == "N":
         canon = _ddb_canonicalize_number(vval)
         if canon is None:
@@ -324,7 +332,7 @@ def _validate_attribute_value(attr_name: str, value: dict) -> tuple | None:
                 return err
     else:
         return error_response_json("ValidationException",
-            f"Supplied AttributeValue is empty, must contain exactly one of the supported datatypes", 400)
+            "Supplied AttributeValue is empty, must contain exactly one of the supported datatypes", 400)
     return None
 
 
@@ -421,7 +429,7 @@ def _validate_item(item: dict, pk_name: str | None = None, sk_name: str | None =
     size = _item_size_bytes(item)
     if size > _DDB_ITEM_MAX_BYTES:
         return error_response_json("ValidationException",
-            f"Item size has exceeded the maximum allowed size", 400)
+            "Item size has exceeded the maximum allowed size", 400)
     return None
 
 # DynamoDB Streams: table_name -> list of stream records
@@ -1693,7 +1701,7 @@ def _query(data):
     # Limit must be >= 1 when supplied.
     if limit is not None and int(limit) <= 0:
         return error_response_json("ValidationException",
-            f"1 validation error detected: Value at 'Limit' failed to satisfy constraint: Member must have value greater than or equal to 1", 400)
+            "1 validation error detected: Value at 'Limit' failed to satisfy constraint: Member must have value greater than or equal to 1", 400)
     # Select validation per AWS: ALL_PROJECTED_ATTRIBUTES is only valid on an
     # index; SPECIFIC_ATTRIBUTES requires a ProjectionExpression / AttributesToGet.
     if select == "ALL_PROJECTED_ATTRIBUTES" and not index_name:
@@ -1707,7 +1715,7 @@ def _query(data):
     # ConsistentRead on a GSI is invalid (only LSIs support strongly-consistent reads).
     if data.get("ConsistentRead") and is_gsi:
         return error_response_json("ValidationException",
-            f"Consistent reads are not supported on global secondary indexes", 400)
+            "Consistent reads are not supported on global secondary indexes", 400)
 
     # ExclusiveStartKey must contain the base table's key attributes; when
     # querying an index, it must also contain the index's key attributes.
@@ -1915,7 +1923,7 @@ def _scan(data):
         seg = int(segment); ts = int(total_segments)
         if ts < 1 or ts > 1_000_000:
             return error_response_json("ValidationException",
-                f"TotalSegments must be between 1 and 1000000", 400)
+                "TotalSegments must be between 1 and 1000000", 400)
         # Negative segment uses the standard "1 validation error detected"
         # envelope with the lowercase 'segment' slot and "greater than or
         # equal to 0" floor — distinct from the segment>=totalSegments error.
@@ -2120,36 +2128,81 @@ def _partiql_insert(table, parsed):
     return json_response({})
 
 
+def _partiql_key_target(table, parsed):
+    """Return (pk_key, sk_key, non_key_fn, error_resp).
+
+    AWS PartiQL UPDATE/DELETE require equality conditions on every primary key
+    attribute. Non-key clauses act as a conditional check on the targeted item
+    — failure → ConditionalCheckFailedException, not a silent no-op.
+    """
+    conditions = parsed.get("conditions") or []
+    pk_attr = table.get("pk_name")
+    sk_attr = table.get("sk_name")
+
+    pk_typed = None
+    sk_typed = None
+    rest = []
+    for attr, op, val in conditions:
+        if attr == pk_attr and op == "=":
+            pk_typed = val
+        elif sk_attr and attr == sk_attr and op == "=":
+            sk_typed = val
+        else:
+            rest.append((attr, op, val))
+
+    if pk_typed is None or (sk_attr and sk_typed is None):
+        return None, None, None, error_response_json(
+            "ValidationException",
+            "WHERE clause must specify every primary key attribute with equality.",
+            400,
+        )
+
+    def non_key_fn(item):
+        for attr, op, val in rest:
+            if not _compare_ddb(item.get(attr), op, val):
+                return False
+        return True
+
+    pk_key = _extract_key_val(pk_typed)
+    sk_key = _extract_key_val(sk_typed) if sk_attr else "__no_sort__"
+    return pk_key, sk_key, non_key_fn, None
+
+
 def _partiql_update(table, parsed):
-    where_fn = parsed.get("where_fn")
     set_attrs = parsed.get("set_attrs", {})
-    if not where_fn or not set_attrs:
+    if not parsed.get("where_fn") or not set_attrs:
         return error_response_json("ValidationException",
                                    "UPDATE requires SET and WHERE clauses", 400)
-    for pk in list(table["items"].keys()):
-        for sk in list(table["items"][pk].keys()):
-            it = table["items"][pk][sk]
-            if where_fn(it):
-                for attr, val in set_attrs.items():
-                    it[attr] = val
+
+    pk_key, sk_key, non_key_fn, err = _partiql_key_target(table, parsed)
+    if err:
+        return err
+
+    item = table["items"].get(pk_key, {}).get(sk_key)
+    if item is None or not non_key_fn(item):
+        return _conditional_check_failed({}, item)
+
+    for attr, val in set_attrs.items():
+        item[attr] = val
     return json_response({})
 
 
 def _partiql_delete(table, parsed):
-    where_fn = parsed.get("where_fn")
-    if not where_fn:
+    if not parsed.get("where_fn"):
         return error_response_json("ValidationException",
                                    "DELETE requires a WHERE clause", 400)
-    to_delete = []
-    for pk in list(table["items"].keys()):
-        for sk in list(table["items"][pk].keys()):
-            it = table["items"][pk][sk]
-            if where_fn(it):
-                to_delete.append((pk, sk))
-    for pk, sk in to_delete:
-        del table["items"][pk][sk]
-        if not table["items"][pk]:
-            del table["items"][pk]
+
+    pk_key, sk_key, non_key_fn, err = _partiql_key_target(table, parsed)
+    if err:
+        return err
+
+    item = table["items"].get(pk_key, {}).get(sk_key)
+    if item is None or not non_key_fn(item):
+        return _conditional_check_failed({}, item)
+
+    del table["items"][pk_key][sk_key]
+    if not table["items"][pk_key]:
+        del table["items"][pk_key]
     _update_counts(table)
     return json_response({})
 
@@ -2358,9 +2411,11 @@ def _parse_partiql_select(s, parameters):
     if proj_str != "*":
         projections = [p.strip().strip('"') for p in proj_str.split(",")]
 
-    where_fn = _build_partiql_where(where_str, parameters) if where_str else None
+    where_fn, conditions = (_build_partiql_where(where_str, parameters)
+                            if where_str else (None, []))
 
-    return {"op": "SELECT", "table": table_name, "projections": projections, "where_fn": where_fn}
+    return {"op": "SELECT", "table": table_name, "projections": projections,
+            "where_fn": where_fn, "conditions": conditions}
 
 
 def _parse_partiql_insert(s, parameters):
@@ -2406,8 +2461,9 @@ def _parse_partiql_update(s, parameters):
         val_str = parts[1].strip()
         set_attrs[attr] = _parse_partiql_literal(val_str, parameters, param_idx)
 
-    where_fn = _build_partiql_where(where_str, parameters, param_idx)
-    return {"op": "UPDATE", "table": table_name, "set_attrs": set_attrs, "where_fn": where_fn}
+    where_fn, conditions = _build_partiql_where(where_str, parameters, param_idx)
+    return {"op": "UPDATE", "table": table_name, "set_attrs": set_attrs,
+            "where_fn": where_fn, "conditions": conditions}
 
 
 def _parse_partiql_delete(s, parameters):
@@ -2422,18 +2478,18 @@ def _parse_partiql_delete(s, parameters):
 
     table_name = m.group(1).strip()
     where_str = m.group(2).strip()
-    where_fn = _build_partiql_where(where_str, parameters)
-    return {"op": "DELETE", "table": table_name, "where_fn": where_fn}
+    where_fn, conditions = _build_partiql_where(where_str, parameters)
+    return {"op": "DELETE", "table": table_name, "where_fn": where_fn,
+            "conditions": conditions}
 
 
 def _build_partiql_where(where_str, parameters, param_idx=None):
-    """Build a predicate function from a PartiQL WHERE clause."""
+    """Build a predicate function + structural conditions list for a PartiQL WHERE."""
     if not where_str or not where_str.strip():
-        return None
+        return None, []
     if param_idx is None:
         param_idx = [0]
 
-    # Parse simple conditions: attr op value [AND attr op value ...]
     conditions = _parse_partiql_conditions(where_str, parameters, param_idx)
 
     def where_fn(item):
@@ -2443,7 +2499,7 @@ def _build_partiql_where(where_str, parameters, param_idx=None):
                 return False
         return True
 
-    return where_fn
+    return where_fn, conditions
 
 
 def _parse_partiql_conditions(where_str, parameters, param_idx):
@@ -3089,10 +3145,9 @@ def _describe_endpoints(data):
     # Address for follow-up calls. Returning real-AWS hostname would redirect
     # SDKs AWAY from MiniStack on cache miss. Return MiniStack's own host so
     # endpoint-discovery-aware SDKs keep talking to us.
-    host = os.environ.get("MINISTACK_HOST", "localhost")
     port = os.environ.get("GATEWAY_PORT", "4566")
     return json_response({
-        "Endpoints": [{"Address": f"{host}:{port}", "CachePeriodInMinutes": 1440}]
+        "Endpoints": [{"Address": f"{_MINISTACK_HOST}:{port}", "CachePeriodInMinutes": 1440}]
     })
 
 
@@ -3651,13 +3706,6 @@ def _export_table_to_point_in_time(data):
         desc["S3SseKmsKeyId"] = data["S3SseKmsKeyId"]
     if client_token:
         desc["ClientToken"] = client_token
-    # Immediate completion — local emulator has no async snapshot work.
-    table = _tables[table_name]
-    desc["ItemCount"] = len(table.get("items", {}))
-    desc["BilledSizeBytes"] = table.get("TableSizeBytes", 0)
-    desc["ExportStatus"] = "COMPLETED"
-    desc["EndTime"] = time.time()
-    desc["ExportManifest"] = f"AWSDynamoDB/{arn.split('/')[-1]}/manifest-summary.json"
     _exports[arn] = desc
     return json_response({"ExportDescription": desc})
 
@@ -3671,6 +3719,15 @@ def _describe_export(data):
     if not desc:
         return error_response_json("ExportNotFoundException",
             f"Export not found: {arn}", 400)
+    if desc.get("ExportStatus") == "IN_PROGRESS" and (time.time() - desc.get("StartTime", 0)) >= _EXPORT_COMPLETE_AFTER_SEC:
+        table_name = _table_name_from_arn(desc["TableArn"])
+        table = _tables.get(table_name)
+        if table:
+            desc["ItemCount"] = len(table.get("items", {}))
+            desc["BilledSizeBytes"] = table.get("TableSizeBytes", 0)
+        desc["ExportStatus"] = "COMPLETED"
+        desc["EndTime"] = time.time()
+        desc["ExportManifest"] = f"AWSDynamoDB/{arn.split('/')[-1]}/manifest-summary.json"
     return json_response({"ExportDescription": desc})
 
 
@@ -3735,13 +3792,12 @@ def _import_table(data):
     now = time.time()
     desc = {
         "ImportArn": arn,
-        "ImportStatus": "COMPLETED",
+        "ImportStatus": "IN_PROGRESS",
         "TableArn": table_arn,
         "TableId": table_id,
         "S3BucketSource": s3_source,
         "InputFormat": fmt,
         "StartTime": now,
-        "EndTime": now,
         "ProcessedSizeBytes": 0,
         "ProcessedItemCount": 0,
         "ImportedItemCount": 0,
@@ -3767,6 +3823,9 @@ def _describe_import(data):
     if not desc:
         return error_response_json("ImportNotFoundException",
             f"Import not found: {arn}", 400)
+    if desc.get("ImportStatus") == "IN_PROGRESS" and (time.time() - desc.get("StartTime", 0)) >= _IMPORT_COMPLETE_AFTER_SEC:
+        desc["ImportStatus"] = "COMPLETED"
+        desc["EndTime"] = time.time()
     return json_response({"ImportTableDescription": desc})
 
 

@@ -4,6 +4,7 @@ import os
 import time
 import uuid as _uuid_mod
 import zipfile
+from types import SimpleNamespace
 from urllib.parse import urlparse
 
 import pytest
@@ -209,6 +210,165 @@ def test_ecs_run_task_metadata_v4(ecs):
             success = True
             break
     assert success, "Task should transition to STOPPED"
+
+
+def test_ecs_run_task_applies_container_command_overrides(monkeypatch):
+    """RunTask containerOverrides.command should reach Docker run kwargs."""
+    from ministack.services import ecs as _ecs
+
+    class FakeContainers:
+        def __init__(self):
+            self.calls = []
+
+        def get(self, _name):
+            raise Exception("not found")
+
+        def list(self, *args, **kwargs):
+            return []
+
+        def run(self, image, **kwargs):
+            self.calls.append((image, kwargs))
+            return SimpleNamespace(id=f"container-{len(self.calls):012d}")
+
+    fake_containers = FakeContainers()
+    fake_docker = SimpleNamespace(containers=fake_containers)
+
+    monkeypatch.setattr(_ecs, "_get_docker", lambda: fake_docker)
+
+    _ecs._register_task_definition({
+        "family": "cmd-override-td",
+        "containerDefinitions": [
+            {
+                "name": "web",
+                "image": "busybox",
+                "command": ["echo", "default-web"],
+            },
+            {
+                "name": "worker",
+                "image": "busybox",
+                "command": ["echo", "default-worker"],
+            },
+        ],
+    })
+
+    _ecs._run_task({
+        "cluster": "cmd-override-c",
+        "taskDefinition": "cmd-override-td",
+        "overrides": {
+            "containerOverrides": [
+                {"name": "web", "command": ["echo", "override-web"]},
+            ],
+        },
+    })
+
+    calls_by_name = {
+        kwargs["labels"]["com.amazonaws.ecs.container-name"]: kwargs
+        for _image, kwargs in fake_containers.calls
+    }
+    assert calls_by_name["web"]["command"] == ["echo", "override-web"]
+    assert calls_by_name["worker"]["command"] == ["echo", "default-worker"]
+
+    td = _ecs._task_defs["cmd-override-td:1"]
+    assert td["containerDefinitions"][0]["command"] == ["echo", "default-web"]
+
+def test_ecs_run_task_command_override_allows_empty_command(monkeypatch):
+    """An explicit empty command override must replace the task definition command."""
+    from ministack.services import ecs as _ecs
+
+    class FakeContainers:
+        def __init__(self):
+            self.calls = []
+
+        def get(self, _name):
+            raise Exception("not found")
+
+        def list(self, *args, **kwargs):
+            return []
+
+        def run(self, image, **kwargs):
+            self.calls.append((image, kwargs))
+            return SimpleNamespace(id="container-empty-command")
+
+    fake_containers = FakeContainers()
+    fake_docker = SimpleNamespace(containers=fake_containers)
+
+    monkeypatch.setattr(_ecs, "_get_docker", lambda: fake_docker)
+
+    _ecs._register_task_definition({
+        "family": "empty-cmd-override-td",
+        "containerDefinitions": [
+            {
+                "name": "web",
+                "image": "busybox",
+                "command": ["echo", "default"],
+            },
+        ],
+    })
+
+    _ecs._run_task({
+        "cluster": "empty-cmd-override-c",
+        "taskDefinition": "empty-cmd-override-td",
+        "overrides": {
+            "containerOverrides": [
+                {"name": "web", "command": []},
+            ],
+        },
+    })
+
+    assert fake_containers.calls[0][1]["command"] == []
+
+def test_ecs_run_task_injects_secrets_manager_secrets(monkeypatch):
+    """RunTask must resolve containerDefinitions[].secrets (Secrets Manager
+    valueFrom) and inject them into the container environment, including the
+    json-key form."""
+    from ministack.services import ecs as _ecs
+    from ministack.services import secretsmanager as _sm
+
+    _sm._create_secret({"Name": "ecs-secret-plain", "SecretString": "s3cr3t"})
+    _sm._create_secret({"Name": "ecs-secret-json",
+                        "SecretString": json.dumps({"password": "pa55"})})
+    plain_arn = _sm._resolve("ecs-secret-plain")[1]["ARN"]
+    json_arn = _sm._resolve("ecs-secret-json")[1]["ARN"]
+
+    class FakeContainers:
+        def __init__(self):
+            self.calls = []
+
+        def get(self, _name):
+            raise Exception("not found")
+
+        def list(self, *args, **kwargs):
+            return []
+
+        def run(self, image, **kwargs):
+            self.calls.append((image, kwargs))
+            return SimpleNamespace(id=f"container-{len(self.calls):012d}")
+
+    fake_containers = FakeContainers()
+    monkeypatch.setattr(_ecs, "_get_docker",
+                        lambda: SimpleNamespace(containers=fake_containers))
+
+    _ecs._register_task_definition({
+        "family": "secrets-td",
+        "containerDefinitions": [
+            {
+                "name": "app",
+                "image": "busybox",
+                "environment": [{"name": "FOO", "value": "bar"}],
+                "secrets": [
+                    {"name": "SECRET_VAL", "valueFrom": plain_arn},
+                    {"name": "DB_PASS", "valueFrom": f"{json_arn}:password::"},
+                ],
+            },
+        ],
+    })
+
+    _ecs._run_task({"cluster": "secrets-c", "taskDefinition": "secrets-td"})
+
+    env = fake_containers.calls[0][1]["environment"]
+    assert env["FOO"] == "bar"
+    assert env["SECRET_VAL"] == "s3cr3t"
+    assert env["DB_PASS"] == "pa55"
 
 def test_ecs_service(ecs):
     ecs.create_service(
@@ -565,6 +725,12 @@ def test_ecs_service_delete_stops_tasks(ecs):
     desc = ecs.describe_tasks(cluster=cluster, tasks=tasks["taskArns"])
     for t in desc["tasks"]:
         assert t["lastStatus"] == "STOPPED"
+
+    # Real AWS keeps the service record around with status INACTIVE so
+    # DescribeServices keeps working for ~1h after delete.
+    svc_desc = ecs.describe_services(cluster=cluster, services=["del-svc"])
+    assert svc_desc["failures"] == []
+    assert svc_desc["services"][0]["status"] == "INACTIVE"
 
 
 def test_ecs_service_scale_to_zero(ecs):

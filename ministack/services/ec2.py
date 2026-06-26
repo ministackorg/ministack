@@ -4,7 +4,9 @@ Query API (Action=...) — instances exist in memory only, no real VMs launched.
 
 Supports:
   Instances:       RunInstances, TerminateInstances, DescribeInstances,
-                   DescribeInstanceStatus, StartInstances, StopInstances, RebootInstances
+                   DescribeInstanceStatus, StartInstances, StopInstances, RebootInstances,
+                   AssociateIamInstanceProfile, DescribeIamInstanceProfileAssociations,
+                   DisassociateIamInstanceProfile, ReplaceIamInstanceProfileAssociation
   Images:          DescribeImages (stub — returns common AMI IDs)
   Security Groups: CreateSecurityGroup, DeleteSecurityGroup, DescribeSecurityGroups,
                    AuthorizeSecurityGroupIngress, RevokeSecurityGroupIngress,
@@ -103,6 +105,9 @@ _vpn_gateways = AccountScopedDict()    # vgw_id -> VPN gateway record
 _customer_gateways = AccountScopedDict()  # cgw_id -> customer gateway record
 _vpn_connections = AccountScopedDict()    # vpn_id -> VPN connection record
 _launch_templates = AccountScopedDict()   # lt_id -> launch template record (includes versions list)
+_fleets = AccountScopedDict()             # fleet_id -> fleet record
+_iam_instance_profile_associations = AccountScopedDict()  # assoc_id -> association record
+
 
 
 # ── Persistence ────────────────────────────────────────────
@@ -133,6 +138,8 @@ def get_state():
         "customer_gateways": copy.deepcopy(_customer_gateways),
         "vpn_connections": copy.deepcopy(_vpn_connections),
         "launch_templates": copy.deepcopy(_launch_templates),
+        "fleets": copy.deepcopy(_fleets),
+        "iam_instance_profile_associations": copy.deepcopy(_iam_instance_profile_associations),
     }
 
 
@@ -162,6 +169,10 @@ def restore_state(data):
         _customer_gateways.update(data.get("customer_gateways", {}))
         _vpn_connections.update(data.get("vpn_connections", {}))
         _launch_templates.update(data.get("launch_templates", {}))
+        _fleets.update(data.get("fleets", {}))
+        _iam_instance_profile_associations.update(
+            data.get("iam_instance_profile_associations", {})
+        )
 
 
 try:
@@ -295,38 +306,151 @@ async def handle_request(method, path, headers, body, query_params):
 # Instances
 # ---------------------------------------------------------------------------
 
-def _run_instances(p):
-    image_id = _p(p, "ImageId") or "ami-00000000"
-    instance_type = _p(p, "InstanceType") or "t2.micro"
-    min_count = int(_p(p, "MinCount") or "1")
-    max_count = int(_p(p, "MaxCount") or "1")
-    if min_count > max_count:
-        return _error("InvalidParameterCombination",
-                      f"Value ({min_count}) for parameter MinCount is not valid. "
-                      f"MinCount must not exceed MaxCount.", 400)
-    key_name = _p(p, "KeyName") or ""
-    subnet_id = _p(p, "SubnetId") or _DEFAULT_SUBNET_ID
-    user_data = _p(p, "UserData") or ""
+def _synthetic_iam_instance_profile_id(seed: str) -> str:
+    digest = hashlib.sha1(seed.encode("utf-8")).hexdigest().upper()[:17]
+    return "AIPA" + digest
 
-    sg_ids = _parse_member_list(p, "SecurityGroupId")
+
+def _resolve_iam_instance_profile(iam_arn="", iam_name="", allow_missing=False):
+    if not iam_arn and not iam_name:
+        return None, None
+
+    profile = None
+    try:
+        from ministack.services import iam as iam_svc
+
+        profile = iam_svc._lookup_instance_profile(name=iam_name, arn=iam_arn)
+    except Exception:
+        logger.debug("IAM instance profile lookup failed", exc_info=True)
+
+    if profile:
+        return {
+            "Arn": profile["Arn"],
+            "Id": profile["InstanceProfileId"],
+        }, None
+
+    if not allow_missing:
+        if iam_name and not iam_arn:
+            msg = (
+                f"Value ({iam_name}) for parameter iamInstanceProfile.name is invalid. "
+                "Invalid IAM Instance Profile name"
+            )
+        elif iam_arn and not iam_name:
+            msg = (
+                f"Value ({iam_arn}) for parameter iamInstanceProfile.arn is invalid. "
+                "Invalid IAM Instance Profile ARN"
+            )
+        else:
+            msg = f"The IAM instance profile '{iam_name or iam_arn}' does not exist"
+        return None, _error("InvalidParameterValue", msg, 400)
+
+    if not iam_arn and iam_name:
+        iam_arn = f"arn:aws:iam::{get_account_id()}:instance-profile/{iam_name}"
+    seed = iam_arn or iam_name
+    return {
+        "Arn": iam_arn,
+        "Id": _synthetic_iam_instance_profile_id(seed),
+    }, None
+
+
+def _iam_instance_profile_association_id(instance_id, iam_profile):
+    seed = f"{instance_id}:{iam_profile.get('Arn', '')}:{iam_profile.get('Id', '')}"
+    return "iip-assoc-" + hashlib.sha1(seed.encode("utf-8")).hexdigest()[:17]
+
+
+def _find_active_iam_instance_profile_association(instance_id):
+    for assoc in _iam_instance_profile_associations.values():
+        if assoc.get("InstanceId") != instance_id:
+            continue
+        if assoc.get("State") == "associated":
+            return assoc
+    return None
+
+
+def _upsert_iam_instance_profile_association(
+    instance_id, iam_profile, association_id=None, state="associated"
+):
+    inst = _instances.get(instance_id)
+    if not inst:
+        return None
+
+    assoc_id = association_id or _iam_instance_profile_association_id(
+        instance_id, iam_profile
+    )
+    assoc = {
+        "AssociationId": assoc_id,
+        "InstanceId": instance_id,
+        "IamInstanceProfile": dict(iam_profile),
+        "State": state,
+        "Timestamp": _now_ts(),
+    }
+    _iam_instance_profile_associations[assoc_id] = assoc
+    inst["IamInstanceProfile"] = dict(iam_profile)
+    inst["IamInstanceProfileAssociationId"] = assoc_id
+    return assoc
+
+
+def _mark_iam_instance_profile_association_disassociated(assoc):
+    assoc["State"] = "disassociated"
+    assoc["Timestamp"] = _now_ts()
+    inst = _instances.get(assoc["InstanceId"])
+    if not inst:
+        return
+    if inst.get("IamInstanceProfileAssociationId") == assoc["AssociationId"]:
+        inst["IamInstanceProfile"] = None
+        inst.pop("IamInstanceProfileAssociationId", None)
+
+
+def _sync_iam_instance_profile_associations():
+    active_by_instance = {}
+    for assoc in _iam_instance_profile_associations.values():
+        inst = _instances.get(assoc["InstanceId"])
+        if assoc.get("State") != "associated":
+            continue
+        if not inst or inst["State"]["Name"] == "terminated":
+            _mark_iam_instance_profile_association_disassociated(assoc)
+            continue
+        if assoc["InstanceId"] in active_by_instance:
+            _mark_iam_instance_profile_association_disassociated(assoc)
+            continue
+        active_by_instance[assoc["InstanceId"]] = assoc
+        inst["IamInstanceProfile"] = dict(assoc["IamInstanceProfile"])
+        inst["IamInstanceProfileAssociationId"] = assoc["AssociationId"]
+
+    for inst in _instances.values():
+        if inst["State"]["Name"] == "terminated":
+            continue
+        iam_profile = inst.get("IamInstanceProfile")
+        if not iam_profile:
+            continue
+        if inst["InstanceId"] in active_by_instance:
+            continue
+        assoc = _upsert_iam_instance_profile_association(
+            inst["InstanceId"], iam_profile
+        )
+        active_by_instance[inst["InstanceId"]] = assoc
+
+
+def _matches_iam_instance_profile_association_filters(assoc, filters):
+    for name, vals in filters.items():
+        if name == "association-id":
+            if assoc["AssociationId"] not in vals:
+                return False
+        elif name == "instance-id":
+            if assoc["InstanceId"] not in vals:
+                return False
+        elif name == "state":
+            if assoc["State"] not in vals:
+                return False
+    return True
+
+
+def _launch_instances_internal(image_id, instance_type, subnet_id, count, key_name="", user_data="", sg_ids=None, requested_private_ip=None, iam_profile=None):
+    now = _now_ts()
     if not sg_ids:
         sg_ids = [_DEFAULT_SG_ID]
-
-    now = _now_ts()
-    # Optional caller-provided values: respect them if set; fall back to defaults otherwise.
-    requested_private_ip = _p(p, "PrivateIpAddress")
-    iam_arn = _p(p, "IamInstanceProfile.Arn")
-    iam_name = _p(p, "IamInstanceProfile.Name")
-    iam_profile = None
-    if iam_arn or iam_name:
-        # Real AWS returns both Arn and Id. We synthesize a stable Id from the
-        # name/arn so DescribeInstances reads back as it does on AWS.
-        if not iam_arn and iam_name:
-            iam_arn = f"arn:aws:iam::{get_account_id()}:instance-profile/{iam_name}"
-        iam_id = "AIPA" + new_uuid().replace("-", "").upper()[:17]
-        iam_profile = {"Arn": iam_arn, "Id": iam_id}
     created = []
-    for _ in range(max(1, min(min_count, max_count))):
+    for _ in range(count):
         instance_id = _new_instance_id()
         private_ip = requested_private_ip or _random_ip("10.0.")
         # Synthesize a real root EBS volume so DescribeVolumes / DescribeInstances
@@ -366,7 +490,7 @@ def _run_instances(p):
                 "DeleteOnTermination": True,
             },
         }]
-        _instances[instance_id] = {
+        inst = {
             "InstanceId": instance_id,
             "ImageId": image_id,
             "InstanceType": instance_type,
@@ -381,6 +505,7 @@ def _run_instances(p):
             "PublicIpAddress": _random_ip("54."),
             "PrivateDnsName": f"ip-{private_ip.replace('.', '-')}.ec2.internal",
             "PublicDnsName": f"ec2-{private_ip.replace('.', '-')}.compute-1.amazonaws.com",
+            "SourceDestCheck": True,
             "SecurityGroups": [
                 {"GroupId": sg, "GroupName": _security_groups.get(sg, {}).get("GroupName", sg)}
                 for sg in sg_ids
@@ -398,7 +523,55 @@ def _run_instances(p):
             "BlockDeviceMappings": block_device_mappings,
             "IamInstanceProfile": iam_profile,
         }
-        created.append(_instances[instance_id])
+        _instances[instance_id] = inst
+        if iam_profile:
+            _upsert_iam_instance_profile_association(instance_id, iam_profile)
+        created.append(inst)
+    return created
+
+
+def _run_instances(p):
+    image_id = _p(p, "ImageId") or "ami-00000000"
+    instance_type = _p(p, "InstanceType") or "t2.micro"
+    min_count = int(_p(p, "MinCount") or "1")
+    max_count = int(_p(p, "MaxCount") or "1")
+    if min_count > max_count:
+        return _error("InvalidParameterCombination",
+                      f"Value ({min_count}) for parameter MinCount is not valid. "
+                      f"MinCount must not exceed MaxCount.", 400)
+    key_name = _p(p, "KeyName") or ""
+    subnet_id = _p(p, "SubnetId") or _DEFAULT_SUBNET_ID
+    user_data = _p(p, "UserData") or ""
+
+    sg_ids = _parse_member_list(p, "SecurityGroupId")
+    if not sg_ids:
+        sg_ids = [_DEFAULT_SG_ID]
+
+    # Optional caller-provided values: respect them if set; fall back to defaults otherwise.
+    requested_private_ip = _p(p, "PrivateIpAddress")
+    iam_arn = _p(p, "IamInstanceProfile.Arn")
+    iam_name = _p(p, "IamInstanceProfile.Name")
+    iam_profile = None
+    if iam_arn or iam_name:
+        iam_profile, err = _resolve_iam_instance_profile(
+            iam_arn=iam_arn,
+            iam_name=iam_name,
+            allow_missing=True,
+        )
+        if err:
+            return err
+
+    created = _launch_instances_internal(
+        image_id=image_id,
+        instance_type=instance_type,
+        subnet_id=subnet_id,
+        count=max(1, min(min_count, max_count)),
+        key_name=key_name,
+        user_data=user_data,
+        sg_ids=sg_ids,
+        requested_private_ip=requested_private_ip,
+        iam_profile=iam_profile
+    )
 
     # Process TagSpecifications
     i = 1
@@ -423,6 +596,7 @@ def _run_instances(p):
     <ownerId>{get_account_id()}</ownerId>
     <groupSet/>"""
     return _xml(200, "RunInstancesResponse", inner)
+
 
 
 _last_cleanup = [0.0]
@@ -508,8 +682,143 @@ def _describe_instance_status(p):
                 f"<instanceStatusSet>{items}</instanceStatusSet>")
 
 
+def _associate_iam_instance_profile(p):
+    instance_id = _p(p, "InstanceId")
+    if instance_id not in _instances:
+        return _error(
+            "InvalidInstanceID.NotFound",
+            f"The instance ID '{instance_id}' does not exist",
+            400,
+        )
+
+    iam_profile, err = _resolve_iam_instance_profile(
+        iam_arn=_p(p, "IamInstanceProfile.Arn"),
+        iam_name=_p(p, "IamInstanceProfile.Name"),
+        allow_missing=False,
+    )
+    if err:
+        return err
+    if not iam_profile:
+        return _error("MissingParameter", "IamInstanceProfile is required", 400)
+
+    _sync_iam_instance_profile_associations()
+    assoc = _find_active_iam_instance_profile_association(instance_id)
+    if assoc:
+        if assoc.get("IamInstanceProfile") == iam_profile:
+            return _xml(
+                200,
+                "AssociateIamInstanceProfileResponse",
+                _iam_instance_profile_association_xml(
+                    assoc, tag="iamInstanceProfileAssociation"
+                ),
+            )
+        return _error(
+            "IncorrectState",
+            f"Instance '{instance_id}' already has an IAM instance profile association",
+            400,
+        )
+
+    assoc = _upsert_iam_instance_profile_association(instance_id, iam_profile)
+    return _xml(
+        200,
+        "AssociateIamInstanceProfileResponse",
+        _iam_instance_profile_association_xml(
+            assoc, tag="iamInstanceProfileAssociation"
+        ),
+    )
+
+
+def _describe_iam_instance_profile_associations(p):
+    _cleanup_terminated()
+    _sync_iam_instance_profile_associations()
+
+    association_ids = _parse_member_list(p, "AssociationId")
+    filters = _parse_filters(p)
+
+    items = []
+    for assoc in _iam_instance_profile_associations.values():
+        if association_ids and assoc["AssociationId"] not in association_ids:
+            continue
+        if not _matches_iam_instance_profile_association_filters(assoc, filters):
+            continue
+        items.append(_iam_instance_profile_association_xml(assoc))
+
+    return _xml(
+        200,
+        "DescribeIamInstanceProfileAssociationsResponse",
+        f"<iamInstanceProfileAssociationSet>{''.join(items)}</iamInstanceProfileAssociationSet>",
+    )
+
+
+def _disassociate_iam_instance_profile(p):
+    assoc_id = _p(p, "AssociationId")
+    _sync_iam_instance_profile_associations()
+    assoc = _iam_instance_profile_associations.get(assoc_id)
+    if not assoc:
+        return _error(
+            "InvalidAssociationID.NotFound",
+            f"Association '{assoc_id}' not found",
+            400,
+        )
+
+    _mark_iam_instance_profile_association_disassociated(assoc)
+    return _xml(
+        200,
+        "DisassociateIamInstanceProfileResponse",
+        _iam_instance_profile_association_xml(
+            assoc, tag="iamInstanceProfileAssociation"
+        ),
+    )
+
+
+def _replace_iam_instance_profile_association(p):
+    assoc_id = _p(p, "AssociationId")
+    _sync_iam_instance_profile_associations()
+    assoc = _iam_instance_profile_associations.get(assoc_id)
+    if not assoc:
+        return _error(
+            "InvalidAssociationID.NotFound",
+            f"Association '{assoc_id}' not found",
+            400,
+        )
+
+    instance_id = assoc["InstanceId"]
+    inst = _instances.get(instance_id)
+    if not inst or inst["State"]["Name"] == "terminated":
+        return _error(
+            "InvalidInstanceID.NotFound",
+            f"The instance ID '{instance_id}' does not exist",
+            400,
+        )
+
+    iam_profile, err = _resolve_iam_instance_profile(
+        iam_arn=_p(p, "IamInstanceProfile.Arn"),
+        iam_name=_p(p, "IamInstanceProfile.Name"),
+        allow_missing=False,
+    )
+    if err:
+        return err
+    if not iam_profile:
+        return _error("MissingParameter", "IamInstanceProfile is required", 400)
+
+    assoc = _upsert_iam_instance_profile_association(
+        instance_id,
+        iam_profile,
+        association_id=assoc_id,
+        state="associated",
+    )
+    return _xml(
+        200,
+        "ReplaceIamInstanceProfileAssociationResponse",
+        _iam_instance_profile_association_xml(
+            assoc, tag="iamInstanceProfileAssociation"
+        ),
+    )
+
+
 def _terminate_instances(p):
     ids = _parse_member_list(p, "InstanceId")
+    _sync_iam_instance_profile_associations()
     for iid in ids:
         if iid not in _instances:
             return _error("InvalidInstanceID.NotFound", f"The instance ID '{iid}' does not exist", 400)
@@ -520,6 +829,9 @@ def _terminate_instances(p):
             prev = inst["State"].copy()
             inst["State"] = {"Code": 48, "Name": "terminated"}
             inst["_terminated_at"] = time.time()
+            assoc = _find_active_iam_instance_profile_association(iid)
+            if assoc:
+                _mark_iam_instance_profile_association_disassociated(assoc)
             items += f"""<item>
                 <instanceId>{iid}</instanceId>
                 <previousState><code>{prev['Code']}</code><name>{prev['Name']}</name></previousState>
@@ -730,6 +1042,21 @@ def _sg_rule_xml(sg_id, rule, idx, is_egress=False):
                   f"<fromPort>{rule.get('FromPort', -1)}</fromPort>"
                   f"<toPort>{rule.get('ToPort', -1)}</toPort>"
                   f"<cidrIpv6>{cidr6.get('CidrIpv6', '')}</cidrIpv6>"
+                  f"</item>")
+    for pair in rule.get("UserIdGroupPairs", []):
+        ref_gid = pair.get("GroupId", "") if isinstance(pair, dict) else str(pair)
+        items += (f"<item>"
+                  f"<securityGroupRuleId>{rule_id}</securityGroupRuleId>"
+                  f"<groupId>{sg_id}</groupId>"
+                  f"<groupOwnerId>{get_account_id()}</groupOwnerId>"
+                  f"<isEgress>{'true' if is_egress else 'false'}</isEgress>"
+                  f"<ipProtocol>{rule.get('IpProtocol', '-1')}</ipProtocol>"
+                  f"<fromPort>{rule.get('FromPort', -1)}</fromPort>"
+                  f"<toPort>{rule.get('ToPort', -1)}</toPort>"
+                  f"<referencedGroupInfo>"
+                  f"<groupId>{ref_gid}</groupId>"
+                  f"<userId>{get_account_id()}</userId>"
+                  f"</referencedGroupInfo>"
                   f"</item>")
     if not items:
         # No CIDR ranges — still return the rule (e.g. referenced group)
@@ -1539,6 +1866,7 @@ def _attach_network_interface(p):
         "InstanceId": instance_id,
         "DeviceIndex": int(device_index),
         "Status": "attached",
+        "AttachTime": _now_ts(),
     }
     return _xml(200, "AttachNetworkInterfaceResponse",
                 f"<attachmentId>{attachment_id}</attachmentId>")
@@ -2261,6 +2589,7 @@ def _instance_xml(inst):
         <privateIpAddress>{inst['PrivateIpAddress']}</privateIpAddress>
         <publicDnsName>{inst['PublicDnsName']}</publicDnsName>
         <publicIpAddress>{inst['PublicIpAddress']}</publicIpAddress>
+        <sourceDestCheck>{'true' if inst.get('SourceDestCheck', True) else 'false'}</sourceDestCheck>
         <subnetId>{inst['SubnetId']}</subnetId>
         <vpcId>{inst['VpcId']}</vpcId>
         <architecture>{inst['Architecture']}</architecture>
@@ -2276,17 +2605,33 @@ def _instance_xml(inst):
     </item>"""
 
 
-def _inst_iam_xml(inst):
-    """Emit <iamInstanceProfile> block when an IAM profile is attached."""
-    iip = inst.get("IamInstanceProfile")
+def _iam_instance_profile_xml(iip, tag="iamInstanceProfile"):
     if not iip or not (iip.get("Arn") or iip.get("Id")):
         return ""
+    out = [f"<{tag}>"]
+    if iip.get("Arn"):
+        out.append(f"<arn>{_esc(iip['Arn'])}</arn>")
+    if iip.get("Id"):
+        out.append(f"<id>{_esc(iip['Id'])}</id>")
+    out.append(f"</{tag}>")
+    return "".join(out)
+
+
+def _iam_instance_profile_association_xml(assoc, tag="item"):
     return (
-        "<iamInstanceProfile>"
-        f"<arn>{_esc(iip.get('Arn', ''))}</arn>"
-        f"<id>{_esc(iip.get('Id', ''))}</id>"
-        "</iamInstanceProfile>"
+        f"<{tag}>"
+        f"<associationId>{_esc(assoc['AssociationId'])}</associationId>"
+        f"<instanceId>{_esc(assoc['InstanceId'])}</instanceId>"
+        f"{_iam_instance_profile_xml(assoc.get('IamInstanceProfile'), tag='iamInstanceProfile')}"
+        f"<state>{_esc(assoc['State'])}</state>"
+        f"<timestamp>{_esc(assoc['Timestamp'])}</timestamp>"
+        f"</{tag}>"
     )
+
+
+def _inst_iam_xml(inst):
+    """Emit <iamInstanceProfile> block when an IAM profile is attached."""
+    return _iam_instance_profile_xml(inst.get("IamInstanceProfile"))
 
 
 def _inst_bdm_xml(inst):
@@ -2330,13 +2675,25 @@ def _perm_xml(r):
         f"<item><cidrIp>{ip['CidrIp']}</cidrIp></item>"
         for ip in r.get("IpRanges", [])
     )
+    groups = ""
+    for pair in r.get("UserIdGroupPairs", []):
+        if isinstance(pair, dict):
+            gid = pair.get("GroupId", "")
+            uid = pair.get("UserId") or get_account_id()
+            gname = f"<groupName>{_esc(pair['GroupName'])}</groupName>" if pair.get("GroupName") else ""
+            vpc = f"<vpcId>{_esc(pair['VpcId'])}</vpcId>" if pair.get("VpcId") else ""
+            desc = f"<description>{_esc(pair['Description'])}</description>" if pair.get("Description") else ""
+        else:
+            gid, uid, gname, vpc, desc = str(pair), get_account_id(), "", "", ""
+        groups += (f"<item><userId>{uid}</userId><groupId>{gid}</groupId>"
+                   f"{gname}{vpc}{desc}</item>")
     from_port = f"<fromPort>{r['FromPort']}</fromPort>" if "FromPort" in r else ""
     to_port = f"<toPort>{r['ToPort']}</toPort>" if "ToPort" in r else ""
     return f"""<item>
         <ipProtocol>{r.get('IpProtocol','-1')}</ipProtocol>
         {from_port}{to_port}
         <ipRanges>{ranges}</ipRanges>
-        <ipv6Ranges/><prefixListIds/><groups/>
+        <ipv6Ranges/><prefixListIds/><groups>{groups}</groups>
     </item>"""
 
 
@@ -2457,6 +2814,7 @@ def _eni_fields_xml(eni, tag="item"):
             <instanceId>{a.get('InstanceId','')}</instanceId>
             <deviceIndex>{a.get('DeviceIndex',0)}</deviceIndex>
             <status>{a.get('Status','attached')}</status>
+            <attachTime>{a.get('AttachTime','')}</attachTime>
         </attachment>"""
     private_ip = eni['PrivateIpAddress']
     return f"""<{tag}>
@@ -2631,6 +2989,48 @@ def _matches_filters(inst, filters):
     return True
 
 
+def _parse_legacy_ip_permission(params):
+    """Parse the legacy single-rule top-level parameter form of
+    Authorize/RevokeSecurityGroupIngress/Egress.
+
+    The AWS CLI (`--protocol/--port/--cidr/--source-group`), older SDKs, and
+    direct API callers send a single permission as flat top-level params
+    (IpProtocol, FromPort, ToPort, CidrIp, SourceSecurityGroupId/Name/OwnerId)
+    rather than the nested IpPermissions.N.* structure. Real EC2 accepts both;
+    MiniStack previously dropped the legacy form (issue #916).
+    """
+    proto = _p(params, "IpProtocol")
+    if not proto:
+        return []
+    rule = {"IpProtocol": proto, "IpRanges": [], "Ipv6Ranges": [],
+            "PrefixListIds": [], "UserIdGroupPairs": []}
+    from_port = _p(params, "FromPort")
+    to_port = _p(params, "ToPort")
+    if from_port:
+        rule["FromPort"] = int(from_port)
+    if to_port:
+        rule["ToPort"] = int(to_port)
+    cidr = _p(params, "CidrIp")
+    if cidr:
+        rule["IpRanges"].append({"CidrIp": cidr})
+    cidr6 = _p(params, "CidrIpv6")
+    if cidr6:
+        rule["Ipv6Ranges"].append({"CidrIpv6": cidr6})
+    src_gid = _p(params, "SourceSecurityGroupId")
+    src_gname = _p(params, "SourceSecurityGroupName")
+    if src_gid or src_gname:
+        pair = {}
+        if src_gid:
+            pair["GroupId"] = src_gid
+        if src_gname:
+            pair["GroupName"] = src_gname
+        owner = _p(params, "SourceSecurityGroupOwnerId")
+        if owner:
+            pair["UserId"] = owner
+        rule["UserIdGroupPairs"].append(pair)
+    return [rule]
+
+
 def _parse_ip_permissions(params, prefix):
     rules = []
     i = 1
@@ -2668,8 +3068,33 @@ def _parse_ip_permissions(params, prefix):
                 entry["Description"] = desc
             rule["Ipv6Ranges"].append(entry)
             j += 1
+        j = 1
+        while True:
+            gid = _p(params, f"{prefix}.{i}.Groups.{j}.GroupId")
+            gname = _p(params, f"{prefix}.{i}.Groups.{j}.GroupName")
+            if not gid and not gname:
+                break
+            pair = {}
+            if gid:
+                pair["GroupId"] = gid
+            if gname:
+                pair["GroupName"] = gname
+            uid = _p(params, f"{prefix}.{i}.Groups.{j}.UserId")
+            if uid:
+                pair["UserId"] = uid
+            vpc = _p(params, f"{prefix}.{i}.Groups.{j}.VpcId")
+            if vpc:
+                pair["VpcId"] = vpc
+            desc = _p(params, f"{prefix}.{i}.Groups.{j}.Description")
+            if desc:
+                pair["Description"] = desc
+            rule["UserIdGroupPairs"].append(pair)
+            j += 1
         rules.append(rule)
         i += 1
+    if not rules:
+        # Fall back to the legacy flat single-rule form (CLI --source-group/--cidr).
+        return _parse_legacy_ip_permission(params)
     return rules
 
 
@@ -3926,6 +4351,8 @@ def reset():
     _customer_gateways.clear()
     _vpn_connections.clear()
     _launch_templates.clear()
+    _fleets.clear()
+    _iam_instance_profile_associations.clear()
     _init_defaults()
 
 
@@ -4136,6 +4563,21 @@ def _describe_security_group_rules(p):
                     <toPort>{rule.get('ToPort', -1)}</toPort>
                     <cidrIpv4>{cidr.get('CidrIp', '')}</cidrIpv4>
                 </item>"""
+            for pair in rule.get("UserIdGroupPairs", []):
+                gid = pair.get("GroupId", "") if isinstance(pair, dict) else str(pair)
+                items += f"""<item>
+                    <securityGroupRuleId>{rule_id}</securityGroupRuleId>
+                    <groupId>{sg_id}</groupId>
+                    <groupOwnerId>{get_account_id()}</groupOwnerId>
+                    <isEgress>false</isEgress>
+                    <ipProtocol>{rule.get('IpProtocol', '-1')}</ipProtocol>
+                    <fromPort>{rule.get('FromPort', -1)}</fromPort>
+                    <toPort>{rule.get('ToPort', -1)}</toPort>
+                    <referencedGroupInfo>
+                        <groupId>{gid}</groupId>
+                        <userId>{get_account_id()}</userId>
+                    </referencedGroupInfo>
+                </item>"""
         for i, rule in enumerate(sg.get("IpPermissionsEgress", [])):
             rule_id = f"sgr-{sg_id[3:]}-egress-{i}"
             for cidr in rule.get("IpRanges", []):
@@ -4148,6 +4590,21 @@ def _describe_security_group_rules(p):
                     <fromPort>{rule.get('FromPort', -1)}</fromPort>
                     <toPort>{rule.get('ToPort', -1)}</toPort>
                     <cidrIpv4>{cidr.get('CidrIp', '')}</cidrIpv4>
+                </item>"""
+            for pair in rule.get("UserIdGroupPairs", []):
+                gid = pair.get("GroupId", "") if isinstance(pair, dict) else str(pair)
+                items += f"""<item>
+                    <securityGroupRuleId>{rule_id}</securityGroupRuleId>
+                    <groupId>{sg_id}</groupId>
+                    <groupOwnerId>{get_account_id()}</groupOwnerId>
+                    <isEgress>true</isEgress>
+                    <ipProtocol>{rule.get('IpProtocol', '-1')}</ipProtocol>
+                    <fromPort>{rule.get('FromPort', -1)}</fromPort>
+                    <toPort>{rule.get('ToPort', -1)}</toPort>
+                    <referencedGroupInfo>
+                        <groupId>{gid}</groupId>
+                        <userId>{get_account_id()}</userId>
+                    </referencedGroupInfo>
                 </item>"""
     return _xml(200, "DescribeSecurityGroupRulesResponse", f"<securityGroupRuleSet>{items}</securityGroupRuleSet>")
 
@@ -4658,8 +5115,317 @@ def _delete_launch_template(p):
     </launchTemplate>""")
 
 
+def _fleet_instances_xml(instances_list):
+    instances_xml = []
+    for item in instances_list:
+        inst_ids_xml = "".join(f"<item>{_esc(iid)}</item>" for iid in item["InstanceIds"])
+        spec = item.get("LaunchTemplateSpec") or {}
+        lt_id_val = spec.get("LaunchTemplateId") or ""
+        lt_name_val = spec.get("LaunchTemplateName") or ""
+        version_val = spec.get("Version") or "$Default"
+        lt_and_overrides_xml = f"""
+            <launchTemplateAndOverrides>
+                <launchTemplateSpecification>
+                    <launchTemplateId>{_esc(lt_id_val)}</launchTemplateId>
+                    <launchTemplateName>{_esc(lt_name_val)}</launchTemplateName>
+                    <version>{_esc(version_val)}</version>
+                </launchTemplateSpecification>
+            </launchTemplateAndOverrides>
+            """ if (lt_id_val or lt_name_val) else ""
+        instances_xml.append(f"""<item>
+            {lt_and_overrides_xml}
+            <lifecycle>{_esc(item["Lifecycle"])}</lifecycle>
+            <instanceIds>{inst_ids_xml}</instanceIds>
+            <instanceType>{_esc(item["InstanceType"])}</instanceType>
+        </item>""")
+    return "".join(instances_xml)
+
+
+def _resolve_launch_template_data(spec):
+    """Resolve a LaunchTemplateSpecification dict to (lt_data, lt_record, error)."""
+    lt_id = spec.get("LaunchTemplateId")
+    lt_name = spec.get("LaunchTemplateName")
+    version_str = spec.get("Version") or "$Default"
+
+    lt = None
+    if lt_id:
+        lt = _launch_templates.get(lt_id)
+    elif lt_name:
+        for t in _launch_templates.values():
+            if t["LaunchTemplateName"] == lt_name:
+                lt = t
+                break
+
+    if (lt_id or lt_name) and not lt:
+        return None, None, _error(
+            "InvalidLaunchTemplateId.NotFoundException",
+            f"The launch template '{lt_id or lt_name}' does not exist",
+            400,
+        )
+
+    if not lt:
+        return {}, None, None
+
+    versions = lt.get("Versions", [])
+    target_ver = 1
+    if version_str == "$Default":
+        target_ver = lt.get("DefaultVersionNumber", 1)
+    elif version_str == "$Latest":
+        target_ver = lt.get("LatestVersionNumber", 1)
+    else:
+        try:
+            target_ver = int(version_str)
+        except ValueError:
+            target_ver = 1
+
+    version = None
+    for v in versions:
+        if v["VersionNumber"] == target_ver:
+            version = v
+            break
+    if not version and versions:
+        version = versions[0]
+
+    return (version or {}).get("LaunchTemplateData", {}) or {}, lt, None
+
+
+def _create_fleet(p):
+    fleet_type = _p(p, "Type") or "maintain"
+    total_capacity = int(
+        _p(p, "TargetCapacitySpecification.TotalTargetCapacity")
+        or _p(p, "TargetCapacitySpecification.OnDemandTargetCapacity")
+        or _p(p, "TargetCapacitySpecification.SpotTargetCapacity")
+        or "1"
+    )
+    # AWS derives Spot vs On-Demand from DefaultTargetCapacityType, not from
+    # FleetType (which is {request, maintain, instant}).
+    default_capacity_type = (
+        _p(p, "TargetCapacitySpecification.DefaultTargetCapacityType") or "on-demand"
+    ).lower()
+    is_spot = default_capacity_type == "spot"
+    lifecycle = "spot" if is_spot else "on-demand"
+
+    # Parse LaunchTemplateConfigs
+    configs = []
+    i = 1
+    while True:
+        lt_id = _p(p, f"LaunchTemplateConfigs.{i}.LaunchTemplateSpecification.LaunchTemplateId")
+        lt_name = _p(p, f"LaunchTemplateConfigs.{i}.LaunchTemplateSpecification.LaunchTemplateName")
+        version = _p(p, f"LaunchTemplateConfigs.{i}.LaunchTemplateSpecification.Version")
+
+        # Overrides
+        overrides = []
+        j = 1
+        while True:
+            itype = _p(p, f"LaunchTemplateConfigs.{i}.Overrides.{j}.InstanceType")
+            sub_id = _p(p, f"LaunchTemplateConfigs.{i}.Overrides.{j}.SubnetId")
+            if not itype and not sub_id:
+                break
+            overrides.append({
+                "InstanceType": itype,
+                "SubnetId": sub_id
+            })
+            j += 1
+
+        if not lt_id and not lt_name and not overrides:
+            break
+
+        configs.append({
+            "LaunchTemplateSpecification": {
+                "LaunchTemplateId": lt_id,
+                "LaunchTemplateName": lt_name,
+                "Version": version or "$Default",
+            },
+            "Overrides": overrides,
+        })
+        i += 1
+
+    # Resolve LT data per config (so multi-config fleets work).
+    resolved_configs = []  # list of (spec, lt_data) per config
+    for cfg in configs:
+        spec = cfg["LaunchTemplateSpecification"]
+        lt_data, _lt, err = _resolve_launch_template_data(spec)
+        if err:
+            return err
+        resolved_configs.append((spec, lt_data, cfg.get("Overrides") or []))
+
+    # Build the (config, override) slot list — one slot per override per config,
+    # or a single slot per config when no overrides were specified.
+    slots = []  # list of dicts: {spec, image_id, instance_type, subnet_id, key_name, user_data, sg_ids, iam_profile}
+    for spec, lt_data, overrides in resolved_configs:
+        base = _slot_from_lt_data(spec, lt_data)
+        if overrides:
+            for ov in overrides:
+                slot = dict(base)
+                if ov.get("InstanceType"):
+                    slot["instance_type"] = ov["InstanceType"]
+                if ov.get("SubnetId"):
+                    slot["subnet_id"] = ov["SubnetId"]
+                slots.append(slot)
+        else:
+            slots.append(base)
+
+    if not slots:
+        slots.append(_slot_from_lt_data({}, {}))
+
+    # Process tag specifications (AWS uses TagSpecifications, not TagSpecification)
+    fleet_tags = []
+    instance_tags = []
+    for tag_prefix in ("TagSpecification", "TagSpecifications"):
+        i = 1
+        while _p(p, f"{tag_prefix}.{i}.ResourceType"):
+            rtype = _p(p, f"{tag_prefix}.{i}.ResourceType")
+            spec_tags = []
+            for tag_key in ("Tag", "Tags"):
+                j = 1
+                while _p(p, f"{tag_prefix}.{i}.{tag_key}.{j}.Key"):
+                    spec_tags.append({
+                        "Key": _p(p, f"{tag_prefix}.{i}.{tag_key}.{j}.Key"),
+                        "Value": _p(p, f"{tag_prefix}.{i}.{tag_key}.{j}.Value", ""),
+                    })
+                    j += 1
+            if rtype == "fleet":
+                fleet_tags.extend(spec_tags)
+            elif rtype == "instance":
+                instance_tags.extend(spec_tags)
+            i += 1
+
+    fleet_id = "fleet-" + new_uuid()
+
+    # AWS launches synchronously and returns Instances only when Type=instant.
+    # For maintain/request, fleets fulfil asynchronously — return FleetId alone.
+    instance_items = []
+    if fleet_type == "instant":
+        # Round-robin distribute total_capacity across slots.
+        slot_buckets = [[] for _ in slots]
+        for k in range(total_capacity):
+            slot_idx = k % len(slots)
+            slot = slots[slot_idx]
+            launched = _launch_instances_internal(
+                image_id=slot["image_id"],
+                instance_type=slot["instance_type"],
+                subnet_id=slot["subnet_id"],
+                count=1,
+                key_name=slot["key_name"],
+                user_data=slot["user_data"],
+                sg_ids=slot["sg_ids"],
+                iam_profile=slot["iam_profile"],
+            )
+            slot_buckets[slot_idx].extend(launched)
+        for slot, launched in zip(slots, slot_buckets):
+            if not launched:
+                continue
+            if instance_tags:
+                for inst in launched:
+                    _tags[inst["InstanceId"]] = instance_tags[:]
+            instance_items.append({
+                "InstanceIds": [inst["InstanceId"] for inst in launched],
+                "InstanceType": slot["instance_type"],
+                "Lifecycle": lifecycle,
+                "LaunchTemplateSpec": slot["spec"],
+            })
+
+    if fleet_tags:
+        _tags[fleet_id] = fleet_tags
+
+    now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    fulfilled_total = float(total_capacity) if fleet_type == "instant" else 0.0
+    fleet_record = {
+        "FleetId": fleet_id,
+        "FleetState": "active",
+        "ActivityStatus": "fulfilled" if fleet_type == "instant" else "pending_fulfillment",
+        "CreateTime": now_iso,
+        "Type": fleet_type,
+        "FulfilledCapacity": fulfilled_total,
+        "FulfilledOnDemandCapacity": fulfilled_total if not is_spot else 0.0,
+        "TargetCapacitySpecification": {
+            "TotalTargetCapacity": total_capacity,
+            "OnDemandTargetCapacity": total_capacity if not is_spot else 0,
+            "SpotTargetCapacity": total_capacity if is_spot else 0,
+            "DefaultTargetCapacityType": default_capacity_type,
+        },
+        "LaunchTemplateConfigs": configs,
+        "Instances": instance_items,
+        "Tags": fleet_tags,
+    }
+    _fleets[fleet_id] = fleet_record
+
+    inner_parts = [f"<fleetId>{_esc(fleet_id)}</fleetId>"]
+    if fleet_type == "instant":
+        inner_parts.append(f"<fleetInstanceSet>{_fleet_instances_xml(instance_items)}</fleetInstanceSet>")
+        inner_parts.append("<errorSet/>")
+    return _xml(200, "CreateFleetResponse", "\n    ".join(inner_parts))
+
+
+def _slot_from_lt_data(spec, lt_data):
+    """Build a launch slot from a resolved LaunchTemplateData dict + spec."""
+    iam_profile = None
+    lt_iam = (lt_data or {}).get("IamInstanceProfile", {}) or {}
+    iam_arn = lt_iam.get("Arn")
+    iam_name = lt_iam.get("Name")
+    if iam_arn or iam_name:
+        iam_profile, _ = _resolve_iam_instance_profile(
+            iam_arn=iam_arn,
+            iam_name=iam_name,
+            allow_missing=True,
+        )
+    return {
+        "spec": spec or {},
+        "image_id": (lt_data or {}).get("ImageId") or "ami-00000000",
+        "instance_type": (lt_data or {}).get("InstanceType") or "t2.micro",
+        "subnet_id": (lt_data or {}).get("SubnetId") or _DEFAULT_SUBNET_ID,
+        "key_name": (lt_data or {}).get("KeyName") or "",
+        "user_data": (lt_data or {}).get("UserData") or "",
+        "sg_ids": (lt_data or {}).get("SecurityGroupIds") or None,
+        "iam_profile": iam_profile,
+    }
+
+
+def _describe_fleets(p):
+    fleet_ids = _parse_member_list(p, "FleetId")
+    if fleet_ids:
+        missing = [fid for fid in fleet_ids if fid not in _fleets]
+        if missing:
+            return _error(
+                "InvalidFleetId.NotFound",
+                f"The fleet ID '{missing[0]}' does not exist",
+                400,
+            )
+        results = [_fleets[fid] for fid in fleet_ids]
+    else:
+        results = list(_fleets.values())
+
+    items = []
+    for f in results:
+        instances_xml_str = _fleet_instances_xml(f["Instances"])
+        tag_set_xml = _tag_set_xml(f["FleetId"])
+        tcs = f["TargetCapacitySpecification"]
+        items.append(f"""<item>
+            <activityStatus>{_esc(f['ActivityStatus'])}</activityStatus>
+            <createTime>{_esc(f['CreateTime'])}</createTime>
+            <fleetId>{_esc(f['FleetId'])}</fleetId>
+            <fleetState>{_esc(f['FleetState'])}</fleetState>
+            <fulfilledCapacity>{f['FulfilledCapacity']}</fulfilledCapacity>
+            <fulfilledOnDemandCapacity>{f['FulfilledOnDemandCapacity']}</fulfilledOnDemandCapacity>
+            <targetCapacitySpecification>
+                <totalTargetCapacity>{int(tcs['TotalTargetCapacity'])}</totalTargetCapacity>
+                <onDemandTargetCapacity>{int(tcs['OnDemandTargetCapacity'])}</onDemandTargetCapacity>
+                <spotTargetCapacity>{int(tcs['SpotTargetCapacity'])}</spotTargetCapacity>
+                <defaultTargetCapacityType>{_esc(tcs['DefaultTargetCapacityType'])}</defaultTargetCapacityType>
+            </targetCapacitySpecification>
+            <type>{_esc(f['Type'])}</type>
+            <fleetInstanceSet>{instances_xml_str}</fleetInstanceSet>
+            <errorSet/>
+            {tag_set_xml}
+        </item>""")
+
+    fleet_set_xml = "".join(items)
+    return _xml(200, "DescribeFleetsResponse", f"<fleetSet>{fleet_set_xml}</fleetSet>")
+
+
 _ACTION_MAP = {
     "RunInstances": _run_instances,
+
     "DescribeInstances": _describe_instances,
     "DescribeInstanceStatus": _describe_instance_status,
     "DescribeInstanceAttribute": _describe_instance_attribute,
@@ -4675,6 +5441,10 @@ _ACTION_MAP = {
     "StopInstances": _stop_instances,
     "StartInstances": _start_instances,
     "RebootInstances": _reboot_instances,
+    "AssociateIamInstanceProfile": _associate_iam_instance_profile,
+    "DescribeIamInstanceProfileAssociations": _describe_iam_instance_profile_associations,
+    "DisassociateIamInstanceProfile": _disassociate_iam_instance_profile,
+    "ReplaceIamInstanceProfileAssociation": _replace_iam_instance_profile_association,
     "DescribeImages": _describe_images,
     "CreateSecurityGroup": _create_security_group,
     "DeleteSecurityGroup": _delete_security_group,
@@ -4813,4 +5583,6 @@ _ACTION_MAP = {
     "DescribeLaunchTemplateVersions": _describe_launch_template_versions,
     "ModifyLaunchTemplate": _modify_launch_template,
     "DeleteLaunchTemplate": _delete_launch_template,
+    "CreateFleet": _create_fleet,
+    "DescribeFleets": _describe_fleets,
 }

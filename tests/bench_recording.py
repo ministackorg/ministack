@@ -20,6 +20,7 @@ Options:
 """
 
 import argparse
+import os
 import statistics
 import time
 import uuid
@@ -27,7 +28,7 @@ import uuid
 import boto3
 import requests
 
-ENDPOINT = "http://localhost:4566"
+ENDPOINT = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
 REGION = "us-east-1"
 
 

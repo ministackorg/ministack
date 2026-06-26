@@ -249,6 +249,15 @@ SERVICE_PATTERNS = {
         "path_prefixes": ["/v1/"],
         "credential_scope": "batch",
     },
+    "mq": {
+        "host_patterns": [r"mq\."],
+        "path_patterns": [
+            r"^/v1/brokers",
+            r"^/v1/broker-engine-types",
+            r"^/v1/broker-instance-options",
+            r"^/v1/tags"
+        ],
+    },
     "cloudformation": {
         "host_patterns": [r"cloudformation\."],
     },
@@ -690,6 +699,10 @@ def detect_service(method: str, path: str, headers: dict, query_params: dict) ->
             "StopInstances": "ec2",
             "StartInstances": "ec2",
             "RebootInstances": "ec2",
+            "AssociateIamInstanceProfile": "ec2",
+            "DescribeIamInstanceProfileAssociations": "ec2",
+            "DisassociateIamInstanceProfile": "ec2",
+            "ReplaceIamInstanceProfileAssociation": "ec2",
             "DescribeImages": "ec2",
             "CreateSecurityGroup": "ec2",
             "DeleteSecurityGroup": "ec2",

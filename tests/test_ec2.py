@@ -10,6 +10,50 @@ import pytest
 from botocore.exceptions import ClientError
 
 
+def _create_ec2_iam_instance_profile(iam, suffix):
+    assume = json.dumps(
+        {
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Effect": "Allow",
+                    "Principal": {"Service": "ec2.amazonaws.com"},
+                    "Action": "sts:AssumeRole",
+                }
+            ],
+        }
+    )
+    role_name = f"ec2-ip-role-{suffix}"
+    profile_name = f"ec2-ip-{suffix}"
+    iam.create_role(RoleName=role_name, AssumeRolePolicyDocument=assume)
+    profile = iam.create_instance_profile(
+        InstanceProfileName=profile_name
+    )["InstanceProfile"]
+    iam.add_role_to_instance_profile(
+        InstanceProfileName=profile_name,
+        RoleName=role_name,
+    )
+    return role_name, profile_name, profile
+
+
+def _delete_ec2_iam_instance_profile(iam, role_name, profile_name):
+    try:
+        iam.remove_role_from_instance_profile(
+            InstanceProfileName=profile_name,
+            RoleName=role_name,
+        )
+    except ClientError:
+        pass
+    try:
+        iam.delete_instance_profile(InstanceProfileName=profile_name)
+    except ClientError:
+        pass
+    try:
+        iam.delete_role(RoleName=role_name)
+    except ClientError:
+        pass
+
+
 def test_ec2_describe_vpcs_default(ec2):
     resp = ec2.describe_vpcs()
     vpcs = resp["Vpcs"]
@@ -98,6 +142,134 @@ def test_ec2_run_instances_honors_private_ip_and_iam_profile(ec2):
         ec2.terminate_instances(InstanceIds=[iid])
 
 
+def test_ec2_run_instances_with_real_iam_profile_creates_association(iam, ec2):
+    suffix = f"launch-{_uuid_mod.uuid4().hex[:8]}"
+    role_name, profile_name, profile = _create_ec2_iam_instance_profile(iam, suffix)
+    resp = ec2.run_instances(
+        ImageId="ami-12345678",
+        MinCount=1,
+        MaxCount=1,
+        InstanceType="t3.micro",
+        IamInstanceProfile={"Name": profile_name},
+    )
+    inst = resp["Instances"][0]
+    iid = inst["InstanceId"]
+
+    try:
+        assert inst["IamInstanceProfile"]["Arn"] == profile["Arn"]
+        assert inst["IamInstanceProfile"]["Id"] == profile["InstanceProfileId"]
+
+        described = ec2.describe_iam_instance_profile_associations(
+            Filters=[{"Name": "instance-id", "Values": [iid]}]
+        )["IamInstanceProfileAssociations"]
+        assert len(described) == 1
+        assoc = described[0]
+        assert assoc["AssociationId"].startswith("iip-assoc-")
+        assert assoc["InstanceId"] == iid
+        assert assoc["State"] == "associated"
+        assert assoc["IamInstanceProfile"]["Arn"] == profile["Arn"]
+        assert assoc["IamInstanceProfile"]["Id"] == profile["InstanceProfileId"]
+
+        ec2.terminate_instances(InstanceIds=[iid])
+
+        active = ec2.describe_iam_instance_profile_associations(
+            Filters=[
+                {"Name": "instance-id", "Values": [iid]},
+                {"Name": "state", "Values": ["associated"]},
+            ]
+        )["IamInstanceProfileAssociations"]
+        assert active == []
+
+        all_states = ec2.describe_iam_instance_profile_associations(
+            AssociationIds=[assoc["AssociationId"]]
+        )["IamInstanceProfileAssociations"]
+        assert len(all_states) == 1
+        assert all_states[0]["State"] == "disassociated"
+    finally:
+        try:
+            ec2.terminate_instances(InstanceIds=[iid])
+        except ClientError:
+            pass
+        _delete_ec2_iam_instance_profile(iam, role_name, profile_name)
+
+
+def test_ec2_iam_instance_profile_association_lifecycle(iam, ec2):
+    suffix = _uuid_mod.uuid4().hex[:8]
+    role_a, profile_a_name, profile_a = _create_ec2_iam_instance_profile(
+        iam, f"a-{suffix}"
+    )
+    role_b, profile_b_name, profile_b = _create_ec2_iam_instance_profile(
+        iam, f"b-{suffix}"
+    )
+    resp = ec2.run_instances(ImageId="ami-12345678", MinCount=1, MaxCount=1)
+    iid = resp["Instances"][0]["InstanceId"]
+
+    try:
+        assoc = ec2.associate_iam_instance_profile(
+            InstanceId=iid,
+            IamInstanceProfile={"Name": profile_a_name},
+        )["IamInstanceProfileAssociation"]
+        assert assoc["State"] == "associated"
+        assert assoc["IamInstanceProfile"]["Arn"] == profile_a["Arn"]
+        assert assoc["IamInstanceProfile"]["Id"] == profile_a["InstanceProfileId"]
+
+        all_assocs = ec2.describe_iam_instance_profile_associations()[
+            "IamInstanceProfileAssociations"
+        ]
+        assert any(
+            item["AssociationId"] == assoc["AssociationId"] for item in all_assocs
+        )
+
+        by_instance = ec2.describe_iam_instance_profile_associations(
+            Filters=[{"Name": "instance-id", "Values": [iid]}]
+        )["IamInstanceProfileAssociations"]
+        assert len(by_instance) == 1
+        assert by_instance[0]["AssociationId"] == assoc["AssociationId"]
+
+        replaced = ec2.replace_iam_instance_profile_association(
+            AssociationId=assoc["AssociationId"],
+            IamInstanceProfile={"Arn": profile_b["Arn"]},
+        )["IamInstanceProfileAssociation"]
+        assert replaced["AssociationId"] == assoc["AssociationId"]
+        assert replaced["State"] == "associated"
+        assert replaced["IamInstanceProfile"]["Arn"] == profile_b["Arn"]
+        assert replaced["IamInstanceProfile"]["Id"] == profile_b["InstanceProfileId"]
+
+        inst = ec2.describe_instances(InstanceIds=[iid])["Reservations"][0]["Instances"][0]
+        assert inst["IamInstanceProfile"]["Arn"] == profile_b["Arn"]
+        assert inst["IamInstanceProfile"]["Id"] == profile_b["InstanceProfileId"]
+
+        disassoc = ec2.disassociate_iam_instance_profile(
+            AssociationId=assoc["AssociationId"]
+        )["IamInstanceProfileAssociation"]
+        assert disassoc["AssociationId"] == assoc["AssociationId"]
+        assert disassoc["State"] == "disassociated"
+
+        active = ec2.describe_iam_instance_profile_associations(
+            Filters=[
+                {"Name": "association-id", "Values": [assoc["AssociationId"]]},
+                {"Name": "state", "Values": ["associated"]},
+            ]
+        )["IamInstanceProfileAssociations"]
+        assert active == []
+
+        described = ec2.describe_iam_instance_profile_associations(
+            AssociationIds=[assoc["AssociationId"]]
+        )["IamInstanceProfileAssociations"]
+        assert len(described) == 1
+        assert described[0]["State"] == "disassociated"
+
+        inst = ec2.describe_instances(InstanceIds=[iid])["Reservations"][0]["Instances"][0]
+        assert "IamInstanceProfile" not in inst or not inst["IamInstanceProfile"]
+    finally:
+        try:
+            ec2.terminate_instances(InstanceIds=[iid])
+        except ClientError:
+            pass
+        _delete_ec2_iam_instance_profile(iam, role_a, profile_a_name)
+        _delete_ec2_iam_instance_profile(iam, role_b, profile_b_name)
+
+
 def test_ec2_run_instances_default_private_ip_is_well_formed(ec2):
     """When the caller does not pass --private-ip-address, the auto-generated
     address must still be a valid IPv4. Regression for the 10.0193.216 bug
@@ -110,6 +282,18 @@ def test_ec2_run_instances_default_private_ip_is_well_formed(ec2):
         assert all(0 <= int(o) <= 255 for o in octets)
     finally:
         ec2.terminate_instances(InstanceIds=[inst["InstanceId"]])
+
+
+def test_ec2_run_instances_source_dest_check_defaults_true(ec2):
+    resp = ec2.run_instances(ImageId="ami-12345678", MinCount=1, MaxCount=1)
+    inst = resp["Instances"][0]
+    iid = inst["InstanceId"]
+    try:
+        assert inst["SourceDestCheck"] is True
+        described = ec2.describe_instances(InstanceIds=[iid])["Reservations"][0]["Instances"][0]
+        assert described["SourceDestCheck"] is True
+    finally:
+        ec2.terminate_instances(InstanceIds=[iid])
 
 
 def test_ec2_run_instances_emits_default_root_block_device_mapping(ec2):
@@ -324,6 +508,105 @@ def test_ec2_sg_authorize_ingress_idempotent_duplicate(ec2):
     matching = [p for p in ingress if p.get("FromPort") == 5432 and p.get("ToPort") == 5432]
     assert len(matching) == 1
     ec2.delete_security_group(GroupId=sg_id)
+
+
+def test_ec2_sg_authorize_ingress_legacy_source_group(ec2):
+    """Legacy top-level --source-group params (CLI/Terraform) must create a real
+    referenced-group rule visible in DescribeSecurityGroups AND
+    DescribeSecurityGroupRules, with a SecurityGroupRuleId matching the Authorize
+    response. Regression for issue #916."""
+    vpc = ec2.create_vpc(CidrBlock="10.111.0.0/16")["Vpc"]
+    sg_a = ec2.create_security_group(
+        GroupName="sg-a-916", Description="a", VpcId=vpc["VpcId"])["GroupId"]
+    sg_b = ec2.create_security_group(
+        GroupName="sg-b-916", Description="b", VpcId=vpc["VpcId"])["GroupId"]
+
+    # The AWS CLI `authorize-security-group-ingress --protocol tcp --port 8080
+    # --source-group <id>` (and older SDKs) serialize to legacy top-level
+    # parameters rather than the nested IpPermissions.N.Groups.M form. Inject
+    # exactly that wire shape so the test exercises the same code path.
+    def _inject_legacy(request, **kwargs):
+        request.data = (
+            f"Action=AuthorizeSecurityGroupIngress&Version=2016-11-15"
+            f"&GroupId={sg_b}&IpProtocol=tcp&FromPort=8080&ToPort=8080"
+            f"&SourceSecurityGroupId={sg_a}"
+        )
+
+    ec2.meta.events.register(
+        "before-sign.ec2.AuthorizeSecurityGroupIngress", _inject_legacy)
+    try:
+        resp = ec2.authorize_security_group_ingress(GroupId=sg_b)
+    finally:
+        ec2.meta.events.unregister(
+            "before-sign.ec2.AuthorizeSecurityGroupIngress", _inject_legacy)
+
+    assert resp.get("Return") is True
+    auth_rules = resp.get("SecurityGroupRules", [])
+    assert len(auth_rules) == 1, f"expected 1 rule from Authorize, got {auth_rules}"
+    auth_rule_id = auth_rules[0]["SecurityGroupRuleId"]
+    assert auth_rules[0].get("ReferencedGroupInfo", {}).get("GroupId") == sg_a
+
+    # DescribeSecurityGroups must show the UserIdGroupPairs reference.
+    perms = ec2.describe_security_groups(
+        GroupIds=[sg_b])["SecurityGroups"][0]["IpPermissions"]
+    pairs = [pair for p in perms for pair in p.get("UserIdGroupPairs", [])]
+    assert any(pair.get("GroupId") == sg_a for pair in pairs), \
+        f"UserIdGroupPairs missing reference to {sg_a}: {perms}"
+
+    # DescribeSecurityGroupRules must return the rule with ReferencedGroupInfo
+    # and a SecurityGroupRuleId matching the Authorize response.
+    sgr = ec2.describe_security_group_rules(
+        Filters=[{"Name": "group-id", "Values": [sg_b]}])["SecurityGroupRules"]
+    ref_rules = [r for r in sgr if r.get("ReferencedGroupInfo", {}).get("GroupId") == sg_a]
+    assert len(ref_rules) == 1, \
+        f"DescribeSecurityGroupRules missing referenced-group rule: {sgr}"
+    assert ref_rules[0]["SecurityGroupRuleId"] == auth_rule_id
+    assert ref_rules[0]["IsEgress"] is False
+    assert ref_rules[0]["IpProtocol"] == "tcp"
+    assert ref_rules[0]["FromPort"] == 8080
+    assert ref_rules[0]["ToPort"] == 8080
+
+    ec2.delete_security_group(GroupId=sg_b)
+    ec2.delete_security_group(GroupId=sg_a)
+
+
+def test_ec2_sg_authorize_ingress_referenced_group_nested(ec2):
+    """The nested IpPermissions form (what boto3 and the Terraform AWS provider
+    send for a source-security-group rule) must return ReferencedGroupInfo in the
+    AuthorizeSecurityGroupIngress response, with a SecurityGroupRuleId consistent
+    with DescribeSecurityGroupRules. Regression for issue #916: previously the
+    Authorize response omitted ReferencedGroupInfo for group-pair rules."""
+    vpc = ec2.create_vpc(CidrBlock="10.112.0.0/16")["Vpc"]
+    sg_a = ec2.create_security_group(
+        GroupName="sg-a-916n", Description="a", VpcId=vpc["VpcId"])["GroupId"]
+    sg_b = ec2.create_security_group(
+        GroupName="sg-b-916n", Description="b", VpcId=vpc["VpcId"])["GroupId"]
+
+    resp = ec2.authorize_security_group_ingress(
+        GroupId=sg_b,
+        IpPermissions=[{
+            "IpProtocol": "tcp", "FromPort": 8080, "ToPort": 8080,
+            "UserIdGroupPairs": [{"GroupId": sg_a}],
+        }],
+    )
+    auth_rules = resp.get("SecurityGroupRules", [])
+    assert len(auth_rules) == 1, f"expected 1 rule from Authorize, got {auth_rules}"
+    assert auth_rules[0].get("ReferencedGroupInfo", {}).get("GroupId") == sg_a, \
+        f"Authorize response missing ReferencedGroupInfo: {auth_rules}"
+    auth_rule_id = auth_rules[0]["SecurityGroupRuleId"]
+
+    # The same referenced-group rule must be discoverable (and ID-consistent) via
+    # DescribeSecurityGroupRules — this is what Terraform's create waiter polls.
+    sgr = ec2.describe_security_group_rules(
+        Filters=[{"Name": "group-id", "Values": [sg_b]}])["SecurityGroupRules"]
+    ref_rules = [r for r in sgr if r.get("ReferencedGroupInfo", {}).get("GroupId") == sg_a]
+    assert len(ref_rules) == 1, \
+        f"DescribeSecurityGroupRules missing referenced-group rule: {sgr}"
+    assert ref_rules[0]["SecurityGroupRuleId"] == auth_rule_id
+    assert ref_rules[0]["IsEgress"] is False
+
+    ec2.delete_security_group(GroupId=sg_b)
+    ec2.delete_security_group(GroupId=sg_a)
 
 
 def test_ec2_key_pair_crud(ec2):
@@ -637,7 +920,11 @@ def test_ec2_network_interface_attach_detach(ec2):
     assert attachment_id.startswith("eni-attach-")
 
     desc = ec2.describe_network_interfaces(NetworkInterfaceIds=[eni_id])
-    assert desc["NetworkInterfaces"][0]["Status"] == "in-use"
+    eni = desc["NetworkInterfaces"][0]
+    assert eni["Status"] == "in-use"
+    # Real EC2 surfaces Attachment.AttachTime on every attached ENI. Issue #1178.
+    assert "AttachTime" in eni["Attachment"]
+    assert eni["Attachment"]["AttachTime"] is not None
 
     ec2.detach_network_interface(AttachmentId=attachment_id)
     desc2 = ec2.describe_network_interfaces(NetworkInterfaceIds=[eni_id])
@@ -2117,3 +2404,165 @@ def test_ebs_modify_volume_attribute(ec2):
     # Stub — just verify it doesn't error
     resp = ec2.describe_volume_attribute(VolumeId=vol_id, Attribute="autoEnableIO")
     assert resp["VolumeId"] == vol_id
+
+
+def test_ec2_create_describe_fleet(ec2):
+    lt = ec2.create_launch_template(
+        LaunchTemplateName="test-fleet-lt",
+        LaunchTemplateData={"ImageId": "ami-12345678", "InstanceType": "t2.small"}
+    )
+    lt_id = lt["LaunchTemplate"]["LaunchTemplateId"]
+
+    # Create fleet with overrides and tag specifications
+    fleet = ec2.create_fleet(
+        LaunchTemplateConfigs=[
+            {
+                "LaunchTemplateSpecification": {
+                    "LaunchTemplateId": lt_id,
+                    "Version": "1"
+                },
+                "Overrides": [
+                    {
+                        "InstanceType": "t2.medium"
+                    }
+                ]
+            }
+        ],
+        TargetCapacitySpecification={
+            "TotalTargetCapacity": 2,
+            "OnDemandTargetCapacity": 2,
+        },
+        Type="instant",
+        TagSpecifications=[
+            {
+                "ResourceType": "fleet",
+                "Tags": [
+                    {"Key": "Environment", "Value": "Production"}
+                ]
+            }
+        ]
+    )
+
+    fleet_id = fleet["FleetId"]
+    assert fleet_id.startswith("fleet-")
+    assert len(fleet["Instances"]) == 1
+    assert fleet["Instances"][0]["InstanceType"] == "t2.medium"
+    assert fleet["Instances"][0]["Lifecycle"] == "on-demand"
+    assert len(fleet["Instances"][0]["InstanceIds"]) == 2
+
+    # Verify instances are running
+    inst_ids = fleet["Instances"][0]["InstanceIds"]
+    desc_inst = ec2.describe_instances(InstanceIds=inst_ids)
+    reservations = desc_inst["Reservations"]
+    assert len(reservations) >= 1
+    launched_instances = [inst for r in reservations for inst in r["Instances"]]
+    assert len(launched_instances) == 2
+    for inst in launched_instances:
+        assert inst["InstanceType"] == "t2.medium"
+        assert inst["ImageId"] == "ami-12345678"
+
+    # Describe fleet and verify details and tags
+    resp = ec2.describe_fleets(FleetIds=[fleet_id])
+    assert len(resp["Fleets"]) == 1
+    f = resp["Fleets"][0]
+    assert f["FleetId"] == fleet_id
+    assert f["FulfilledCapacity"] == 2.0
+    assert f["FulfilledOnDemandCapacity"] == 2.0
+    assert f["TargetCapacitySpecification"]["TotalTargetCapacity"] == 2
+    assert any(t["Key"] == "Environment" and t["Value"] == "Production" for t in f.get("Tags", []))
+
+
+def test_create_fleet_default_capacity_type_spot(ec2):
+    """DefaultTargetCapacityType=spot drives lifecycle + capacity-slot accounting,
+    not the top-level Type (which is {request, maintain, instant})."""
+    lt = ec2.create_launch_template(
+        LaunchTemplateName=f"spot-lt-{_uuid_mod.uuid4().hex[:8]}",
+        LaunchTemplateData={"ImageId": "ami-deadbeef", "InstanceType": "t3.small"},
+    )
+    lt_id = lt["LaunchTemplate"]["LaunchTemplateId"]
+    resp = ec2.create_fleet(
+        LaunchTemplateConfigs=[{
+            "LaunchTemplateSpecification": {"LaunchTemplateId": lt_id, "Version": "1"},
+        }],
+        TargetCapacitySpecification={
+            "TotalTargetCapacity": 2,
+            "SpotTargetCapacity": 2,
+            "DefaultTargetCapacityType": "spot",
+        },
+        Type="instant",
+    )
+    desc = ec2.describe_fleets(FleetIds=[resp["FleetId"]])["Fleets"][0]
+    tcs = desc["TargetCapacitySpecification"]
+    assert tcs["DefaultTargetCapacityType"] == "spot"
+    assert tcs["SpotTargetCapacity"] == 2
+    assert tcs["OnDemandTargetCapacity"] == 0
+    assert desc["Instances"][0]["Lifecycle"] == "spot"
+
+
+def test_create_fleet_distributes_across_configs_and_overrides(ec2):
+    """Multi-config × multi-override should produce one Instances[*] item
+    per (config, override) bucket, with capacity round-robin'd across them."""
+    lt1 = ec2.create_launch_template(
+        LaunchTemplateName=f"multi-lt1-{_uuid_mod.uuid4().hex[:8]}",
+        LaunchTemplateData={"ImageId": "ami-aaaaaaaa", "InstanceType": "t3.micro"},
+    )["LaunchTemplate"]["LaunchTemplateId"]
+    lt2 = ec2.create_launch_template(
+        LaunchTemplateName=f"multi-lt2-{_uuid_mod.uuid4().hex[:8]}",
+        LaunchTemplateData={"ImageId": "ami-bbbbbbbb", "InstanceType": "t3.micro"},
+    )["LaunchTemplate"]["LaunchTemplateId"]
+    resp = ec2.create_fleet(
+        LaunchTemplateConfigs=[
+            {
+                "LaunchTemplateSpecification": {"LaunchTemplateId": lt1, "Version": "1"},
+                "Overrides": [
+                    {"InstanceType": "t3.small"},
+                    {"InstanceType": "t3.medium"},
+                ],
+            },
+            {
+                "LaunchTemplateSpecification": {"LaunchTemplateId": lt2, "Version": "1"},
+                "Overrides": [
+                    {"InstanceType": "t3.large"},
+                    {"InstanceType": "t3.xlarge"},
+                ],
+            },
+        ],
+        TargetCapacitySpecification={"TotalTargetCapacity": 4, "OnDemandTargetCapacity": 4},
+        Type="instant",
+    )
+    instance_types = sorted(i["InstanceType"] for i in resp["Instances"])
+    assert instance_types == ["t3.large", "t3.medium", "t3.small", "t3.xlarge"]
+    total_ids = [iid for item in resp["Instances"] for iid in item["InstanceIds"]]
+    assert len(total_ids) == 4
+
+
+def test_create_fleet_maintain_returns_fleetid_only(ec2):
+    """For Type=maintain (and request), AWS does not launch synchronously —
+    response carries FleetId only; no Instances / no Errors."""
+    lt = ec2.create_launch_template(
+        LaunchTemplateName=f"maintain-lt-{_uuid_mod.uuid4().hex[:8]}",
+        LaunchTemplateData={"ImageId": "ami-11111111", "InstanceType": "t2.micro"},
+    )["LaunchTemplate"]["LaunchTemplateId"]
+    resp = ec2.create_fleet(
+        LaunchTemplateConfigs=[{
+            "LaunchTemplateSpecification": {"LaunchTemplateId": lt, "Version": "1"},
+        }],
+        TargetCapacitySpecification={"TotalTargetCapacity": 3, "OnDemandTargetCapacity": 3},
+        Type="maintain",
+    )
+    assert resp["FleetId"].startswith("fleet-")
+    assert not resp.get("Instances")
+    assert not resp.get("Errors")
+    desc = ec2.describe_fleets(FleetIds=[resp["FleetId"]])["Fleets"][0]
+    assert desc["Type"] == "maintain"
+    assert desc["FulfilledCapacity"] == 0.0
+    assert desc["ActivityStatus"] == "pending_fulfillment"
+    assert desc.get("Instances", []) == []
+
+
+def test_describe_fleets_unknown_id_returns_invalid_fleet_id(ec2):
+    bogus = f"fleet-{_uuid_mod.uuid4().hex}"
+    with pytest.raises(ClientError) as exc:
+        ec2.describe_fleets(FleetIds=[bogus])
+    assert exc.value.response["Error"]["Code"] == "InvalidFleetId.NotFound"
+

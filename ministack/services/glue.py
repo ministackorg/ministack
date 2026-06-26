@@ -3,7 +3,7 @@ Glue Service Emulator.
 JSON-based API via X-Amz-Target (AWSGlue).
 Supports full Data Catalog: Databases, Tables, Partitions, Connections, Crawlers, Jobs, JobRuns.
 Also: SecurityConfigurations, Classifiers, PartitionIndexes, CrawlerMetrics, Tags,
-      Triggers, Workflows, Schema Registry (registries, schemas, schema versions).
+      Triggers, Workflows.
 Job execution: when Docker is available and the job command is ``glueetl`` or
 ``gluestreaming``, runs the script inside an ``amazon/aws-glue-libs`` container
 with Spark + awsglue.  Falls back to plain ``python3`` subprocess for non-Spark
@@ -11,15 +11,18 @@ scripts or when Docker is unavailable.
 Crawlers transition through RUNNING state with a configurable timer.
 """
 
+import contextvars
 import copy
 import fnmatch
 import json
 import logging
 import os
+import re
 import subprocess
 import tempfile
 import threading
 import time
+from urllib.parse import unquote
 
 from ministack.core.persistence import PERSIST_STATE, load_state
 from ministack.core.responses import (
@@ -109,15 +112,9 @@ _classifiers = AccountScopedDict()
 _triggers = AccountScopedDict()     # trigger_name -> trigger dict
 _workflows = AccountScopedDict()    # workflow_name -> workflow dict
 _workflow_runs = AccountScopedDict() # workflow_name -> [run, ...]
-_registries = AccountScopedDict()   # registry_name -> registry dict
-_schemas = AccountScopedDict()      # "registry/schema" -> schema set dict
-
-DEFAULT_SCHEMA_REGISTRY = "default-registry"
-_VALID_COMPATIBILITY = {
-    "NONE", "DISABLED", "BACKWARD", "BACKWARD_ALL", "FORWARD",
-    "FORWARD_ALL", "FULL", "FULL_ALL",
-}
-_VALID_DATA_FORMATS = {"AVRO", "JSON", "PROTOBUF"}
+_user_defined_functions = AccountScopedDict()  # "db_name/function_name" -> udf dict
+_table_column_statistics = AccountScopedDict()      # "db/table" -> {column_name: stats}
+_partition_column_statistics = AccountScopedDict()  # "db/table" -> [{"Values": [...], "Stats": {col: stats}}]
 
 _ALL_STATE = {
     "databases": _databases,
@@ -134,8 +131,9 @@ _ALL_STATE = {
     "triggers": _triggers,
     "workflows": _workflows,
     "workflow_runs": _workflow_runs,
-    "registries": _registries,
-    "schemas": _schemas,
+    "user_defined_functions": _user_defined_functions,
+    "table_column_statistics": _table_column_statistics,
+    "partition_column_statistics": _partition_column_statistics,
 }
 
 
@@ -164,128 +162,16 @@ def _arn(resource_type, name):
     return f"arn:aws:glue:{get_region()}:{get_account_id()}:{resource_type}/{name}"
 
 
-def _registry_arn(registry_name):
-    return _arn("registry", registry_name)
-
-
-def _schema_arn(registry_name, schema_name):
-    return f"arn:aws:glue:{get_region()}:{get_account_id()}:schema/{registry_name}/{schema_name}"
-
-
-def _iso_timestamp(ts=None):
-    if ts is None:
-        ts = time.time()
-    return time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(ts))
-
-
-def _parse_registry_arn(arn):
-    prefix = f"arn:aws:glue:{get_region()}:{get_account_id()}:registry/"
-    if not arn or not arn.startswith(prefix):
-        return None
-    return arn[len(prefix):]
-
-
-def _parse_schema_arn(arn):
-    prefix = f"arn:aws:glue:{get_region()}:{get_account_id()}:schema/"
-    if not arn or not arn.startswith(prefix):
-        return None, None
-    tail = arn[len(prefix):]
-    if "/" not in tail:
-        return None, None
-    registry_name, schema_name = tail.split("/", 1)
-    return registry_name, schema_name
-
-
-def _ensure_default_registry():
-    if DEFAULT_SCHEMA_REGISTRY not in _registries:
-        now = _iso_timestamp()
-        _registries[DEFAULT_SCHEMA_REGISTRY] = {
-            "RegistryName": DEFAULT_SCHEMA_REGISTRY,
-            "RegistryArn": _registry_arn(DEFAULT_SCHEMA_REGISTRY),
-            "Description": "",
-            "Status": "AVAILABLE",
-            "CreatedTime": now,
-            "UpdatedTime": now,
-        }
-
-
-def _resolve_registry_name(registry_id=None):
-    registry_id = registry_id or {}
-    if registry_id.get("RegistryArn"):
-        name = _parse_registry_arn(registry_id["RegistryArn"])
-        if not name:
-            return None
-        return name
-    if registry_id.get("RegistryName"):
-        return registry_id["RegistryName"]
-    return DEFAULT_SCHEMA_REGISTRY
-
-
-def _resolve_schema_key(schema_id=None):
-    schema_id = schema_id or {}
-    if schema_id.get("SchemaArn"):
-        registry_name, schema_name = _parse_schema_arn(schema_id["SchemaArn"])
-        if not registry_name or not schema_name:
-            return None, None
-        return registry_name, schema_name
-    registry_name = _resolve_registry_name(schema_id)
-    schema_name = schema_id.get("SchemaName")
-    if not schema_name:
-        return None, None
-    return registry_name, schema_name
-
-
-def _schema_key(registry_name, schema_name):
-    return f"{registry_name}/{schema_name}"
-
-
-def _get_schema_record(registry_name, schema_name):
-    return _schemas.get(_schema_key(registry_name, schema_name))
-
-
-def _active_schema_versions(schema_rec):
-    return [
-        v for v in schema_rec.get("versions", [])
-        if v.get("Status") != "DELETING"
-    ]
-
-
-def _latest_schema_version(schema_rec):
-    versions = _active_schema_versions(schema_rec)
-    if not versions:
-        return None
-    return max(versions, key=lambda v: v["VersionNumber"])
-
-
-def _find_version_by_id(schema_rec, schema_version_id):
-    for v in schema_rec.get("versions", []):
-        if v.get("SchemaVersionId") == schema_version_id and v.get("Status") != "DELETING":
-            return v
-    return None
-
-
-def _find_version_by_definition(schema_rec, schema_definition):
-    for v in _active_schema_versions(schema_rec):
-        if v.get("SchemaDefinition") == schema_definition:
-            return v
-    return None
-
-
-def _schema_summary(schema_rec):
-    latest = _latest_schema_version(schema_rec)
-    latest_num = latest["VersionNumber"] if latest else 0
-    return {
-        "RegistryName": schema_rec["RegistryName"],
-        "SchemaName": schema_rec["SchemaName"],
-        "SchemaArn": schema_rec["SchemaArn"],
-        "SchemaStatus": schema_rec.get("SchemaStatus", "AVAILABLE"),
-        "CreatedTime": schema_rec.get("CreatedTime"),
-        "UpdatedTime": schema_rec.get("UpdatedTime"),
-        "LatestSchemaVersion": latest_num,
-    }
-
-
 async def handle_request(method, path, headers, body, query_params):
+    # Glue's Iceberg REST catalog data plane. On real AWS this is
+    # `glue.<region>.amazonaws.com/iceberg` — same service, same SigV4
+    # signing name (`glue`), different protocol (Iceberg REST OpenAPI
+    # instead of X-Amz-Target JSON RPC). The router's credential-scope
+    # dispatch already lands `glue`-signed requests here, so a plain
+    # path check is all that's needed to tell the two protocols apart.
+    if path.startswith("/iceberg"):
+        return _handle_iceberg_rest(method, path, query_params)
+
     target = headers.get("x-amz-target", "")
     action = target.split(".")[-1] if "." in target else ""
 
@@ -315,9 +201,17 @@ async def handle_request(method, path, headers, body, query_params):
         "GetPartitions": _get_partitions,
         "BatchCreatePartition": _batch_create_partition,
         "BatchGetPartition": _batch_get_partition,
+        "BatchUpdatePartition": _batch_update_partition,
         # Partition Indexes
         "CreatePartitionIndex": _create_partition_index,
         "GetPartitionIndexes": _get_partition_indexes,
+        # Column Statistics
+        "UpdateColumnStatisticsForTable": _update_column_statistics_for_table,
+        "GetColumnStatisticsForTable": _get_column_statistics_for_table,
+        "DeleteColumnStatisticsForTable": _delete_column_statistics_for_table,
+        "UpdateColumnStatisticsForPartition": _update_column_statistics_for_partition,
+        "GetColumnStatisticsForPartition": _get_column_statistics_for_partition,
+        "DeleteColumnStatisticsForPartition": _delete_column_statistics_for_partition,
         # Connections
         "CreateConnection": _create_connection,
         "DeleteConnection": _delete_connection,
@@ -368,33 +262,224 @@ async def handle_request(method, path, headers, body, query_params):
         "DeleteWorkflow": _delete_workflow,
         "UpdateWorkflow": _update_workflow,
         "StartWorkflowRun": _start_workflow_run,
+        # User Defined Functions
+        "CreateUserDefinedFunction": _create_user_defined_function,
+        "UpdateUserDefinedFunction": _update_user_defined_function,
+        "DeleteUserDefinedFunction": _delete_user_defined_function,
+        "GetUserDefinedFunction": _get_user_defined_function,
+        "GetUserDefinedFunctions": _get_user_defined_functions,
         # Tags
         "TagResource": _tag_resource,
         "UntagResource": _untag_resource,
         "GetTags": _get_tags,
-        # Schema Registry
-        "CreateRegistry": _create_registry,
-        "GetRegistry": _get_registry,
-        "ListRegistries": _list_registries,
-        "UpdateRegistry": _update_registry,
-        "DeleteRegistry": _delete_registry,
-        "CreateSchema": _create_schema,
-        "GetSchema": _get_schema,
-        "ListSchemas": _list_schemas,
-        "UpdateSchema": _update_schema,
-        "DeleteSchema": _delete_schema,
-        "RegisterSchemaVersion": _register_schema_version,
-        "GetSchemaVersion": _get_schema_version,
-        "ListSchemaVersions": _list_schema_versions,
-        "DeleteSchemaVersions": _delete_schema_versions,
-        "GetSchemaByDefinition": _get_schema_by_definition,
-        "CheckSchemaVersionValidity": _check_schema_version_validity,
     }
 
     handler = handlers.get(action)
     if not handler:
         return error_response_json("InvalidAction", f"Unknown Glue action: {action}", 400)
     return handler(data)
+
+
+# ---- Iceberg REST catalog (Glue data plane) ----
+#
+# Read-path subset of the Apache Iceberg REST Catalog OpenAPI spec, mirroring
+# AWS Glue's `glue.<region>.amazonaws.com/iceberg` endpoint so that clients
+# like DuckDB's `iceberg` extension can ATTACH:
+#
+#     ATTACH '000000000000' AS glue_catalog (
+#         TYPE iceberg,
+#         ENDPOINT 'localhost:4566/iceberg',
+#         AUTHORIZATION_TYPE 'sigv4'
+#     );
+#
+# Glue's prefix shape is `/v1/catalogs/{catalog}/...` (returned to the client
+# as `defaults.prefix` from /v1/config). This is distinct from the S3 Tables
+# Iceberg REST endpoint served by `services/s3tables.py`, whose prefix is a
+# URL-encoded table-bucket ARN — on AWS those are two separate services told
+# apart by SigV4 signing name, and MiniStack routes them the same way.
+#
+# A table participates in this surface iff its `Parameters["metadata_location"]`
+# points at an Iceberg metadata.json on MiniStack's S3 (written there by an
+# external engine such as Trino/Spark, then registered in Glue). The
+# metadata.json is passed through verbatim — format versions change and we
+# don't want to be in the parsing business. Write paths return 501.
+#
+# Responses use plain `application/json` and the spec's
+# `{"error": {"message", "type", "code"}}` envelope — NOT the AWS
+# x-amz-json-1.0 flavor the rest of this module speaks.
+
+_iceberg_tls_hint_logged = False
+
+
+def _iceberg_json(data, status=200):
+    body = json.dumps(data, ensure_ascii=False).encode("utf-8")
+    return status, {"Content-Type": "application/json"}, body
+
+
+def _iceberg_error(message, error_type, status):
+    return _iceberg_json(
+        {"error": {"message": message, "type": error_type, "code": status}},
+        status=status,
+    )
+
+
+def _iceberg_s3_overrides():
+    """S3 client config handed to Iceberg REST clients.
+
+    Real AWS Glue returns no overrides (clients use ambient AWS creds);
+    MiniStack must return them or the client tries real S3 for the data
+    files referenced by the catalog and fails.
+
+    Credentials are the fixed `test`/`test` pair (same as the s3tables
+    Iceberg surface) — MiniStack's S3 doesn't verify signatures, and
+    echoing ambient AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY into an HTTP
+    response would leak real credentials from the host environment."""
+    host = os.environ.get("MINISTACK_HOST", "localhost")
+    port = os.environ.get("GATEWAY_PORT", "4566")
+    return {
+        "s3.endpoint": f"http://{host}:{port}",
+        "s3.access-key-id": "test",
+        "s3.secret-access-key": "test",
+        "s3.path-style-access": "true",
+        "s3.region": os.environ.get("MINISTACK_REGION", "us-east-1"),
+    }
+
+
+def _iceberg_fetch_metadata(metadata_location):
+    """Read the metadata.json at an ``s3://bucket/key`` URI from MiniStack's
+    S3 and return it parsed, or None if the URI is malformed, the object is
+    missing, or the body isn't valid JSON."""
+    if not metadata_location or not metadata_location.startswith("s3://"):
+        return None
+    rest = metadata_location[len("s3://"):]
+    if "/" not in rest:
+        return None
+    bucket, key = rest.split("/", 1)
+    if not bucket or not key:
+        return None
+    from ministack.services import s3 as _s3
+    data = _s3._get_object_data(bucket, key)
+    if data is None:
+        return None
+    try:
+        return json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        logger.warning("Iceberg metadata.json at %s did not parse: %s",
+                       metadata_location, exc)
+        return None
+
+
+def _iceberg_table_entry(db_name, table_name):
+    """Return the Glue table dict if it exists AND is an Iceberg table
+    (has a `metadata_location` parameter), else None."""
+    table = _tables.get(f"{db_name}/{table_name}")
+    if table is None:
+        return None
+    if not (table.get("Parameters") or {}).get("metadata_location"):
+        return None
+    return table
+
+
+def _iceberg_load_table(db_name, table_name):
+    table = _iceberg_table_entry(db_name, table_name)
+    if table is None:
+        return _iceberg_error(
+            f"Table does not exist: {db_name}.{table_name}",
+            "NoSuchTableException", 404)
+    metadata_location = table["Parameters"]["metadata_location"]
+    # Missing/unparseable metadata.json is a 404, not a 200 with empty
+    # metadata — DuckDB would treat the latter as a real-but-empty table
+    # and silently return wrong query results.
+    metadata = _iceberg_fetch_metadata(metadata_location)
+    if metadata is None:
+        return _iceberg_error(
+            f"Table metadata not readable: {db_name}.{table_name} "
+            f"(metadata_location={metadata_location})",
+            "NoSuchTableException", 404)
+    return _iceberg_json({
+        "metadata-location": metadata_location,
+        "metadata": metadata,
+        "config": _iceberg_s3_overrides(),
+    })
+
+
+def _iceberg_maybe_log_tls_hint():
+    """Warn once if USE_SSL isn't on — DuckDB hardcodes https:// on the
+    Iceberg endpoint and fails at connect time with no useful message."""
+    global _iceberg_tls_hint_logged
+    if _iceberg_tls_hint_logged:
+        return
+    _iceberg_tls_hint_logged = True
+    if os.environ.get("USE_SSL", "").strip().lower() not in ("1", "true", "yes"):
+        logger.warning(
+            "Glue Iceberg REST endpoint hit while USE_SSL is not enabled. "
+            "DuckDB's iceberg extension hardcodes https:// and will fail to "
+            "connect. Set USE_SSL=1 and trust MiniStack's self-signed cert "
+            "(SSL_CERT_FILE / DuckDB ca_cert_file) for ATTACH to work."
+        )
+
+
+def _handle_iceberg_rest(method, path, query_params):
+    _iceberg_maybe_log_tls_hint()
+    parts = [unquote(p) for p in path.strip("/").split("/") if p]
+    # parts: ["iceberg", "v1", ...]
+    if len(parts) < 3 or parts[0] != "iceberg" or parts[1] != "v1":
+        return _iceberg_error(f"Unknown Iceberg REST path: {path}",
+                              "NotFoundException", 404)
+
+    # GET /iceberg/v1/config?warehouse=<id> — called once on ATTACH. The
+    # prefix tells the client to build subsequent URLs as
+    # /v1/catalogs/{warehouse}/... — Glue's prefix shape.
+    if parts[2] == "config" and len(parts) == 3 and method == "GET":
+        warehouse = query_params.get("warehouse", "")
+        if isinstance(warehouse, list):
+            warehouse = warehouse[0] if warehouse else ""
+        defaults = {"prefix": f"catalogs/{warehouse}"} if warehouse else {}
+        return _iceberg_json({"defaults": defaults,
+                              "overrides": _iceberg_s3_overrides()})
+
+    # Everything else: /v1/catalogs/{catalog}/namespaces[/{ns}[/tables[/{tbl}]]]
+    # The catalog id is accepted but not validated — MiniStack is
+    # single-catalog per account, scoping happens via the SigV4 account id.
+    if len(parts) < 5 or parts[2] != "catalogs" or parts[4] != "namespaces":
+        return _iceberg_error(
+            f"Operation not supported: {method} {path}",
+            "UnsupportedOperationException", 501)
+
+    if len(parts) == 5 and method == "GET":  # ListNamespaces
+        return _iceberg_json(
+            {"namespaces": [[name] for name in sorted(_databases.keys())]})
+
+    if len(parts) == 6 and method == "GET":  # GetNamespace
+        ns = parts[5]
+        if ns not in _databases:
+            return _iceberg_error(f"Namespace does not exist: {ns}",
+                                  "NoSuchNamespaceException", 404)
+        return _iceberg_json({"namespace": [ns], "properties": {}})
+
+    if len(parts) >= 7 and parts[6] == "tables":
+        ns = parts[5]
+        if len(parts) == 7 and method == "GET":  # ListTables
+            if ns not in _databases:
+                return _iceberg_error(f"Namespace does not exist: {ns}",
+                                      "NoSuchNamespaceException", 404)
+            prefix = f"{ns}/"
+            names = sorted(
+                t["Name"] for k, t in _tables.items()
+                if k.startswith(prefix)
+                and (t.get("Parameters") or {}).get("metadata_location"))
+            return _iceberg_json(
+                {"identifiers": [{"namespace": [ns], "name": n} for n in names]})
+        if len(parts) == 8:
+            if method == "GET":  # LoadTable — the hot path
+                return _iceberg_load_table(ns, parts[7])
+            if method == "HEAD":  # TableExists
+                exists = _iceberg_table_entry(ns, parts[7]) is not None
+                return (200 if exists else 404), {}, b""
+
+    return _iceberg_error(
+        f"Operation not supported: {method} {path}",
+        "UnsupportedOperationException", 501)
 
 
 # ---- Databases ----
@@ -414,6 +499,8 @@ def _create_database(data):
         "CreateTime": int(time.time()),
         "CatalogId": get_account_id(),
     }
+    if data.get("Tags"):
+        _tags[_arn("database", name)] = dict(data["Tags"])
     return json_response({})
 
 
@@ -422,11 +509,14 @@ def _delete_database(data):
     if name not in _databases:
         return error_response_json("EntityNotFoundException", f"Database {name} not found", 400)
     del _databases[name]
+    _tags.pop(_arn("database", name), None)
     keys_to_del = [k for k in _tables if k.startswith(f"{name}/")]
     for k in keys_to_del:
         del _tables[k]
         _partitions.pop(k, None)
         _partition_indexes.pop(k, None)
+        _table_column_statistics.pop(k, None)
+        _partition_column_statistics.pop(k, None)
     return json_response({})
 
 
@@ -483,6 +573,10 @@ def _create_table(data):
         "IsMultiDialectView": table_input.get("IsMultiDialectView"),
         "IsRegisteredWithLakeFormation": False,
         "CatalogId": get_account_id(),
+        # AWS Glue exposes a monotonically-increasing VersionId per table for
+        # optimistic concurrency on UpdateTable. Stored as a string per the
+        # botocore Table output shape.
+        "VersionId": "1",
     }
     return json_response({})
 
@@ -496,6 +590,8 @@ def _delete_table(data):
     _tables.pop(key, None)
     _partitions.pop(key, None)
     _partition_indexes.pop(key, None)
+    _table_column_statistics.pop(key, None)
+    _partition_column_statistics.pop(key, None)
     return json_response({})
 
 
@@ -525,6 +621,17 @@ def _update_table(data):
     key = f"{db_name}/{name}"
     if key not in _tables:
         return error_response_json("EntityNotFoundException", f"Table {name} not found", 400)
+    # Optimistic-concurrency check: if the caller passes VersionId, it must
+    # match the table's current VersionId. Real AWS Glue rejects stale writes
+    # with ConcurrentModificationException. Issue #1183.
+    requested_version = data.get("VersionId")
+    current_version = _tables[key].get("VersionId", "1")
+    if requested_version is not None and str(requested_version) != current_version:
+        return error_response_json(
+            "ConcurrentModificationException",
+            f"Table {name} was modified by another process. Expected VersionId={current_version}, got {requested_version}.",
+            400,
+        )
     safe_keys = {"Description", "Owner", "StorageDescriptor", "PartitionKeys",
                  "TableType", "Parameters", "ViewOriginalText", "ViewExpandedText",
                  "ViewDefinition", "IsMultiDialectView"}
@@ -532,6 +639,10 @@ def _update_table(data):
         if k in table_input:
             _tables[key][k] = table_input[k]
     _tables[key]["UpdateTime"] = int(time.time())
+    try:
+        _tables[key]["VersionId"] = str(int(current_version) + 1)
+    except (TypeError, ValueError):
+        _tables[key]["VersionId"] = "1"
     return json_response({})
 
 
@@ -548,6 +659,8 @@ def _batch_delete_table(data):
             del _tables[key]
             _partitions.pop(key, None)
             _partition_indexes.pop(key, None)
+            _table_column_statistics.pop(key, None)
+            _partition_column_statistics.pop(key, None)
     return json_response({"Errors": errors})
 
 
@@ -585,6 +698,10 @@ def _delete_partition(data):
     key = f"{db_name}/{table_name}"
     if key in _partitions:
         _partitions[key] = [p for p in _partitions[key] if p.get("Values") != values]
+    if key in _partition_column_statistics:
+        _partition_column_statistics[key] = [
+            e for e in _partition_column_statistics[key] if e.get("Values") != values
+        ]
     return json_response({})
 
 
@@ -653,6 +770,41 @@ def _batch_get_partition(data):
     return json_response({"Partitions": partitions, "UnprocessedKeys": unprocessed})
 
 
+def _batch_update_partition(data):
+    db_name = data.get("DatabaseName")
+    table_name = data.get("TableName")
+    key = f"{db_name}/{table_name}"
+    if key not in _tables:
+        return error_response_json("EntityNotFoundException",
+            f"Table {table_name} not found in {db_name}", 400)
+    parts = _partitions.get(key, [])
+    errors = []
+    for entry in data.get("Entries", []):
+        values = entry.get("PartitionValueList", [])
+        partition_input = entry.get("PartitionInput", {})
+        target = None
+        for p in parts:
+            if p.get("Values") == values:
+                target = p
+                break
+        if target is None:
+            errors.append({"PartitionValueList": values, "ErrorDetail": {
+                "ErrorCode": "EntityNotFoundException",
+                "ErrorMessage": "Partition not found"}})
+            continue
+        creation_time = target.get("CreationTime")
+        target.clear()
+        target.update({
+            **partition_input,
+            "DatabaseName": db_name,
+            "TableName": table_name,
+            "CreationTime": creation_time,
+            "LastAccessTime": int(time.time()),
+            "CatalogId": get_account_id(),
+        })
+    return json_response({"Errors": errors})
+
+
 # ---- Partition Indexes ----
 
 def _create_partition_index(data):
@@ -677,6 +829,134 @@ def _get_partition_indexes(data):
     table_name = data.get("TableName")
     key = f"{db_name}/{table_name}"
     return json_response({"PartitionIndexDescriptorList": _partition_indexes.get(key, [])})
+
+
+# ---- Column Statistics ----
+
+def _partition_stats_entry(key, values):
+    for entry in _partition_column_statistics.get(key, []):
+        if entry.get("Values") == values:
+            return entry
+    return None
+
+
+def _update_column_statistics_for_table(data):
+    db_name = data.get("DatabaseName")
+    table_name = data.get("TableName")
+    key = f"{db_name}/{table_name}"
+    if key not in _tables:
+        return error_response_json("EntityNotFoundException",
+            f"Table {table_name} not found in {db_name}", 400)
+    stats_list = data.get("ColumnStatisticsList", [])
+    bucket = _table_column_statistics.setdefault(key, {})
+    errors = []
+    for cs in stats_list:
+        col = cs.get("ColumnName")
+        if not col:
+            errors.append({"ColumnStatistics": cs, "Error": {
+                "ErrorCode": "InvalidInputException",
+                "ErrorMessage": "ColumnName is required"}})
+            continue
+        bucket[col] = cs
+    return json_response({"Errors": errors})
+
+
+def _get_column_statistics_for_table(data):
+    db_name = data.get("DatabaseName")
+    table_name = data.get("TableName")
+    key = f"{db_name}/{table_name}"
+    if key not in _tables:
+        return error_response_json("EntityNotFoundException",
+            f"Table {table_name} not found in {db_name}", 400)
+    bucket = _table_column_statistics.get(key, {})
+    stats_list = []
+    errors = []
+    for col in data.get("ColumnNames", []):
+        if col in bucket:
+            stats_list.append(bucket[col])
+        else:
+            errors.append({"ColumnName": col, "Error": {
+                "ErrorCode": "EntityNotFoundException",
+                "ErrorMessage": f"Column statistics for {col} not found"}})
+    return json_response({"ColumnStatisticsList": stats_list, "Errors": errors})
+
+
+def _delete_column_statistics_for_table(data):
+    db_name = data.get("DatabaseName")
+    table_name = data.get("TableName")
+    column_name = data.get("ColumnName")
+    key = f"{db_name}/{table_name}"
+    if key not in _tables:
+        return error_response_json("EntityNotFoundException",
+            f"Table {table_name} not found in {db_name}", 400)
+    # Real Glue's Delete* operations are idempotent — deleting stats for a
+    # column that never had any returns 200 with an empty body.
+    _table_column_statistics.get(key, {}).pop(column_name, None)
+    return json_response({})
+
+
+def _update_column_statistics_for_partition(data):
+    db_name = data.get("DatabaseName")
+    table_name = data.get("TableName")
+    values = data.get("PartitionValues", [])
+    key = f"{db_name}/{table_name}"
+    if not any(p.get("Values") == values for p in _partitions.get(key, [])):
+        return error_response_json("EntityNotFoundException",
+            f"Partition with values {values} not found", 400)
+    entry = _partition_stats_entry(key, values)
+    if entry is None:
+        entry = {"Values": values, "Stats": {}}
+        _partition_column_statistics.setdefault(key, []).append(entry)
+    errors = []
+    for cs in data.get("ColumnStatisticsList", []):
+        col = cs.get("ColumnName")
+        if not col:
+            errors.append({"ColumnStatistics": cs, "Error": {
+                "ErrorCode": "InvalidInputException",
+                "ErrorMessage": "ColumnName is required"}})
+            continue
+        entry["Stats"][col] = cs
+    return json_response({"Errors": errors})
+
+
+def _get_column_statistics_for_partition(data):
+    db_name = data.get("DatabaseName")
+    table_name = data.get("TableName")
+    values = data.get("PartitionValues", [])
+    key = f"{db_name}/{table_name}"
+    if key not in _tables:
+        return error_response_json("EntityNotFoundException",
+            f"Table {table_name} not found in {db_name}", 400)
+    if not any(p.get("Values") == values for p in _partitions.get(key, [])):
+        return error_response_json("EntityNotFoundException",
+            f"Partition with values {values} not found", 400)
+    entry = _partition_stats_entry(key, values)
+    bucket = entry["Stats"] if entry else {}
+    stats_list = []
+    errors = []
+    for col in data.get("ColumnNames", []):
+        if col in bucket:
+            stats_list.append(bucket[col])
+        else:
+            errors.append({"ColumnName": col, "Error": {
+                "ErrorCode": "EntityNotFoundException",
+                "ErrorMessage": f"Column statistics for {col} not found"}})
+    return json_response({"ColumnStatisticsList": stats_list, "Errors": errors})
+
+
+def _delete_column_statistics_for_partition(data):
+    db_name = data.get("DatabaseName")
+    table_name = data.get("TableName")
+    values = data.get("PartitionValues", [])
+    column_name = data.get("ColumnName")
+    key = f"{db_name}/{table_name}"
+    if not any(p.get("Values") == values for p in _partitions.get(key, [])):
+        return error_response_json("EntityNotFoundException",
+            f"Partition with values {values} not found", 400)
+    entry = _partition_stats_entry(key, values)
+    if entry is not None:
+        entry.get("Stats", {}).pop(column_name, None)
+    return json_response({})
 
 
 # ---- Connections ----
@@ -807,7 +1087,12 @@ def _start_crawler(data):
             }
             logger.info("Glue: Crawler %s finished after %ss", name, CRAWLER_RUN_SECONDS)
 
-    timer = threading.Timer(CRAWLER_RUN_SECONDS, _finish_crawl)
+    # threading.Timer (like threading.Thread) does NOT copy contextvars, so
+    # without this snapshot _finish_crawl runs under the default account and the
+    # account-scoped _crawlers guard never matches — the crawler would hang in
+    # RUNNING forever for non-default accounts. See issue #639 / stepfunctions.
+    ctx = contextvars.copy_context()
+    timer = threading.Timer(CRAWLER_RUN_SECONDS, lambda: ctx.run(_finish_crawl))
     timer.daemon = True
     timer.start()
 
@@ -927,8 +1212,10 @@ def _resolve_script(script_location):
         parts = stripped.split("/", 1)
         bucket = parts[0]
         key = parts[1] if len(parts) > 1 else ""
-        # Check on-disk first
-        local_path = os.path.join(S3_DATA_DIR, bucket, key)
+        # Check on-disk first. Objects are persisted account-scoped at
+        # DATA_DIR/<account>/<bucket>/<key> (see s3._object_disk_path), so the
+        # account id MUST be part of the lookup path or it never matches.
+        local_path = os.path.join(S3_DATA_DIR, get_account_id(), bucket, key)
         if os.path.exists(local_path):
             return local_path
         # Fetch from in-memory S3
@@ -1017,7 +1304,12 @@ def _start_job_run(data):
         run["ExecutionTime"] = int(run["CompletedOn"] - run["StartedOn"])
         run["LastModifiedOn"] = int(time.time())
 
-    thread = threading.Thread(target=_execute, daemon=True)
+    # threading.Thread does NOT copy contextvars, so without this snapshot the
+    # worker would run under the default account and fail to resolve the
+    # account-scoped on-disk script (and AccountScopedDict lookups). Carry the
+    # request's account/region into the thread. See issue #639 / stepfunctions.
+    ctx = contextvars.copy_context()
+    thread = threading.Thread(target=ctx.run, args=(_execute,), daemon=True)
     thread.start()
 
     return json_response({"JobRunId": run_id})
@@ -1514,545 +1806,141 @@ def _start_workflow_run(data):
     return json_response({"RunId": run_id})
 
 
-# ---- Schema Registry ----
+# ---- User Defined Functions ----
 
-def _create_registry(data):
-    name = data.get("RegistryName")
-    if not name:
-        return error_response_json("InvalidInputException", "RegistryName is required", 400)
-    if name in _registries:
-        return error_response_json(
-            "AlreadyExistsException", f"Registry {name} already exists.", 400)
-    now = _iso_timestamp()
-    reg = {
-        "RegistryName": name,
-        "RegistryArn": _registry_arn(name),
-        "Description": data.get("Description", ""),
-        "Status": "AVAILABLE",
-        "CreatedTime": now,
-        "UpdatedTime": now,
+def _udf_key(db_name: str, func_name: str) -> str:
+    return f"{db_name}/{func_name}"
+
+
+def _udf_record(db_name: str, fn_input: dict) -> dict:
+    """Build a UserDefinedFunction record matching the botocore output shape:
+    UserDefinedFunction { FunctionName, DatabaseName, ClassName, OwnerName,
+    OwnerType, CreateTime, ResourceUris, CatalogId }."""
+    return {
+        "FunctionName": fn_input.get("FunctionName"),
+        "DatabaseName": db_name,
+        "ClassName": fn_input.get("ClassName"),
+        "OwnerName": fn_input.get("OwnerName"),
+        "OwnerType": fn_input.get("OwnerType"),
+        "CreateTime": int(time.time()),
+        "ResourceUris": fn_input.get("ResourceUris", []),
+        "CatalogId": get_account_id(),
     }
-    _registries[name] = reg
-    if data.get("Tags"):
-        _tags[_registry_arn(name)] = dict(data["Tags"])
-    return json_response({
-        "RegistryName": name,
-        "RegistryArn": reg["RegistryArn"],
-        "Description": reg["Description"],
-        "Tags": data.get("Tags") or {},
-    })
 
 
-def _registry_name_from_request(data):
-    registry_id = data.get("RegistryId") or {}
-    if not registry_id.get("RegistryName") and not registry_id.get("RegistryArn"):
-        return None
-    return _resolve_registry_name(registry_id)
+def _create_user_defined_function(data):
+    db_name = data.get("DatabaseName")
+    if db_name not in _databases:
+        return error_response_json("EntityNotFoundException", f"Database {db_name} not found.", 400)
+    fn_input = data.get("FunctionInput") or {}
+    func_name = fn_input.get("FunctionName")
+    if not func_name:
+        return error_response_json("InvalidInputException", "FunctionInput.FunctionName is required", 400)
+    if not fn_input.get("ClassName"):
+        return error_response_json("InvalidInputException", "FunctionInput.ClassName is required", 400)
+    key = _udf_key(db_name, func_name)
+    if key in _user_defined_functions:
+        return error_response_json("AlreadyExistsException", f"User-defined function {func_name} already exists", 400)
+    _user_defined_functions[key] = _udf_record(db_name, fn_input)
+    return json_response({})
 
 
-def _get_registry(data):
-    name = _registry_name_from_request(data)
-    if not name:
-        return error_response_json("InvalidInputException", "RegistryId is required", 400)
-    reg = _registries.get(name)
-    if not reg or reg.get("Status") == "DELETING":
-        return error_response_json(
-            "EntityNotFoundException", f"Registry {name} not found.", 400)
-    return json_response({
-        "RegistryName": reg["RegistryName"],
-        "RegistryArn": reg["RegistryArn"],
-        "Description": reg.get("Description", ""),
-        "Status": reg.get("Status", "AVAILABLE"),
-        "CreatedTime": reg.get("CreatedTime"),
-        "UpdatedTime": reg.get("UpdatedTime"),
-    })
+def _update_user_defined_function(data):
+    db_name = data.get("DatabaseName")
+    func_name = data.get("FunctionName")
+    key = _udf_key(db_name, func_name)
+    if key not in _user_defined_functions:
+        return error_response_json("EntityNotFoundException", f"User-defined function {func_name} not found in {db_name}", 400)
+    fn_input = data.get("FunctionInput") or {}
+    existing = _user_defined_functions[key]
+    for field in ("ClassName", "OwnerName", "OwnerType", "ResourceUris"):
+        if field in fn_input:
+            existing[field] = fn_input[field]
+    # AWS allows renaming the function via FunctionInput.FunctionName.
+    new_name = fn_input.get("FunctionName")
+    if new_name and new_name != func_name:
+        existing["FunctionName"] = new_name
+        _user_defined_functions[_udf_key(db_name, new_name)] = existing
+        del _user_defined_functions[key]
+    return json_response({})
 
 
-def _list_registries(data):
-    max_results = data.get("MaxResults") or 25
-    start = 0
-    token = data.get("NextToken")
-    if token:
-        try:
-            start = int(token)
-        except ValueError:
-            start = 0
-    items = [
-        {
-            "RegistryName": r["RegistryName"],
-            "RegistryArn": r["RegistryArn"],
-            "Description": r.get("Description", ""),
-            "Status": r.get("Status", "AVAILABLE"),
-            "CreatedTime": r.get("CreatedTime"),
-            "UpdatedTime": r.get("UpdatedTime"),
-        }
-        for r in _registries.values()
-        if r.get("Status") != "DELETING"
-    ]
-    page = items[start:start + max_results]
-    resp = {"Registries": page}
-    nxt = start + max_results
-    if nxt < len(items):
-        resp["NextToken"] = str(nxt)
-    return json_response(resp)
+def _delete_user_defined_function(data):
+    db_name = data.get("DatabaseName")
+    func_name = data.get("FunctionName")
+    key = _udf_key(db_name, func_name)
+    if key not in _user_defined_functions:
+        return error_response_json("EntityNotFoundException", f"User-defined function {func_name} not found in {db_name}", 400)
+    del _user_defined_functions[key]
+    return json_response({})
 
 
-def _update_registry(data):
-    name = _registry_name_from_request(data)
-    if not name:
-        return error_response_json("InvalidInputException", "RegistryId is required", 400)
-    reg = _registries.get(name)
-    if not reg or reg.get("Status") == "DELETING":
-        return error_response_json(
-            "EntityNotFoundException", f"Registry {name} not found.", 400)
-    if "Description" in data:
-        reg["Description"] = data["Description"]
-    reg["UpdatedTime"] = _iso_timestamp()
-    return json_response({
-        "RegistryName": reg["RegistryName"],
-        "RegistryArn": reg["RegistryArn"],
-        "Description": reg.get("Description", ""),
-    })
+def _get_user_defined_function(data):
+    db_name = data.get("DatabaseName")
+    func_name = data.get("FunctionName")
+    key = _udf_key(db_name, func_name)
+    udf = _user_defined_functions.get(key)
+    if not udf:
+        return error_response_json("EntityNotFoundException", f"User-defined function {func_name} not found in {db_name}", 400)
+    return json_response({"UserDefinedFunction": udf})
 
 
-def _delete_registry(data):
-    name = _registry_name_from_request(data)
-    if not name:
-        return error_response_json("InvalidInputException", "RegistryId is required", 400)
-    if name not in _registries:
-        return error_response_json(
-            "EntityNotFoundException", f"Registry {name} not found.", 400)
-    del _registries[name]
-    _tags.pop(_registry_arn(name), None)
-    keys = [k for k in _schemas if k.startswith(f"{name}/")]
-    for k in keys:
-        del _schemas[k]
-    return json_response({
-        "RegistryName": name,
-        "RegistryArn": _registry_arn(name),
-    })
+def _translate_java_regex_quote(pattern):
+    r"""Translate java.util.regex `\Q...\E` literal-quote spans into their
+    RE2/Python-`re` equivalent.
+
+    Real AWS Glue compiles `Pattern` with java.util.regex, which supports `\Q`
+    (begin literal quote) and `\E` (end literal quote): everything between them
+    is matched literally regardless of regex metacharacters. Trino's Hive/Glue
+    connector relies on this — it resolves a UDF with a pattern like
+    `trino__\Qdw_clean_text\E__.*`. Python's `re` (like Go's RE2) does not
+    understand `\Q...\E` and raises `bad escape \Q`, so we rewrite each span by
+    `re.escape()`-ing the literal between `\Q` and `\E` before compiling. Per
+    Java semantics a trailing `\Q` with no closing `\E` quotes to end-of-string.
+    """
+    out = []
+    i = 0
+    while True:
+        start = pattern.find(r"\Q", i)
+        if start == -1:
+            out.append(pattern[i:])
+            break
+        out.append(pattern[i:start])
+        end = pattern.find(r"\E", start + 2)
+        if end == -1:
+            out.append(re.escape(pattern[start + 2:]))
+            break
+        out.append(re.escape(pattern[start + 2:end]))
+        i = end + 2
+    return "".join(out)
 
 
-def _create_schema(data):
-    schema_name = data.get("SchemaName")
-    if not schema_name:
-        return error_response_json("InvalidInputException", "SchemaName is required", 400)
-    data_format = data.get("DataFormat")
-    if not data_format:
-        return error_response_json("InvalidInputException", "DataFormat is required", 400)
-    if data_format not in _VALID_DATA_FORMATS:
-        return error_response_json(
-            "InvalidInputException", f"Invalid DataFormat: {data_format}", 400)
-    compatibility = data.get("Compatibility", "NONE")
-    if compatibility not in _VALID_COMPATIBILITY:
-        return error_response_json(
-            "InvalidInputException", f"Invalid Compatibility: {compatibility}", 400)
-
-    registry_name = _resolve_registry_name(data.get("RegistryId"))
-    if registry_name not in _registries:
-        if registry_name == DEFAULT_SCHEMA_REGISTRY:
-            _ensure_default_registry()
-        else:
-            return error_response_json(
-                "EntityNotFoundException",
-                f"Registry {registry_name} not found.",
-                400,
-            )
-
-    key = _schema_key(registry_name, schema_name)
-    if key in _schemas:
-        return error_response_json(
-            "AlreadyExistsException",
-            f"Schema {schema_name} already exists in registry {registry_name}.",
-            400,
-        )
-
-    now = _iso_timestamp()
-    schema_rec = {
-        "RegistryName": registry_name,
-        "RegistryArn": _registry_arn(registry_name),
-        "SchemaName": schema_name,
-        "SchemaArn": _schema_arn(registry_name, schema_name),
-        "DataFormat": data_format,
-        "Compatibility": compatibility,
-        "Description": data.get("Description", ""),
-        "SchemaStatus": "AVAILABLE",
-        "SchemaCheckpoint": 1,
-        "LatestSchemaVersion": 0,
-        "NextSchemaVersion": 1,
-        "CreatedTime": now,
-        "UpdatedTime": now,
-        "versions": [],
-    }
-    resp = {
-        "RegistryName": registry_name,
-        "RegistryArn": schema_rec["RegistryArn"],
-        "SchemaName": schema_name,
-        "SchemaArn": schema_rec["SchemaArn"],
-        "DataFormat": data_format,
-        "Compatibility": compatibility,
-        "Description": schema_rec["Description"],
-        "SchemaStatus": "AVAILABLE",
-        "SchemaCheckpoint": 1,
-        "Tags": data.get("Tags") or {},
-    }
-    definition = data.get("SchemaDefinition")
-    if definition:
-        version_id = new_uuid()
-        version = {
-            "SchemaVersionId": version_id,
-            "VersionNumber": 1,
-            "SchemaDefinition": definition,
-            "Status": "AVAILABLE",
-            "CreatedTime": now,
-        }
-        schema_rec["versions"].append(version)
-        schema_rec["LatestSchemaVersion"] = 1
-        schema_rec["NextSchemaVersion"] = 2
-        resp.update({
-            "LatestSchemaVersion": 1,
-            "NextSchemaVersion": 2,
-            "SchemaVersionId": version_id,
-            "SchemaVersionStatus": "AVAILABLE",
-        })
-    _schemas[key] = schema_rec
-    if data.get("Tags"):
-        _tags[schema_rec["SchemaArn"]] = dict(data["Tags"])
-    return json_response(resp)
-
-
-def _get_schema(data):
-    registry_name, schema_name = _resolve_schema_key(data.get("SchemaId"))
-    if not registry_name or not schema_name:
-        return error_response_json("InvalidInputException", "SchemaId is required", 400)
-    schema_rec = _get_schema_record(registry_name, schema_name)
-    if not schema_rec or schema_rec.get("SchemaStatus") == "DELETING":
-        return error_response_json(
-            "EntityNotFoundException",
-            f"Schema {schema_name} not found in registry {registry_name}.",
-            400,
-        )
-    latest = _latest_schema_version(schema_rec)
-    latest_num = latest["VersionNumber"] if latest else 0
-    return json_response({
-        "RegistryName": schema_rec["RegistryName"],
-        "RegistryArn": schema_rec["RegistryArn"],
-        "SchemaName": schema_rec["SchemaName"],
-        "SchemaArn": schema_rec["SchemaArn"],
-        "DataFormat": schema_rec["DataFormat"],
-        "Compatibility": schema_rec["Compatibility"],
-        "Description": schema_rec.get("Description", ""),
-        "SchemaStatus": schema_rec.get("SchemaStatus", "AVAILABLE"),
-        "SchemaCheckpoint": schema_rec.get("SchemaCheckpoint", 1),
-        "LatestSchemaVersion": latest_num,
-        "NextSchemaVersion": schema_rec.get("NextSchemaVersion", latest_num + 1),
-        "CreatedTime": schema_rec.get("CreatedTime"),
-        "UpdatedTime": schema_rec.get("UpdatedTime"),
-    })
-
-
-def _list_schemas(data):
-    registry_name = _resolve_registry_name(data.get("RegistryId"))
-    if registry_name not in _registries:
-        return error_response_json(
-            "EntityNotFoundException",
-            f"Registry {registry_name} not found.",
-            400,
-        )
-    max_results = data.get("MaxResults") or 25
-    start = 0
-    token = data.get("NextToken")
-    if token:
-        try:
-            start = int(token)
-        except ValueError:
-            start = 0
-    prefix = f"{registry_name}/"
-    items = [
-        _schema_summary(v)
-        for k, v in _schemas.items()
-        if k.startswith(prefix) and v.get("SchemaStatus") != "DELETING"
-    ]
-    page = items[start:start + max_results]
-    resp = {"Schemas": page}
-    nxt = start + max_results
-    if nxt < len(items):
-        resp["NextToken"] = str(nxt)
-    return json_response(resp)
-
-
-def _update_schema(data):
-    registry_name, schema_name = _resolve_schema_key(data.get("SchemaId"))
-    if not registry_name or not schema_name:
-        return error_response_json("InvalidInputException", "SchemaId is required", 400)
-    schema_rec = _get_schema_record(registry_name, schema_name)
-    if not schema_rec or schema_rec.get("SchemaStatus") == "DELETING":
-        return error_response_json(
-            "EntityNotFoundException",
-            f"Schema {schema_name} not found in registry {registry_name}.",
-            400,
-        )
-    if "Description" in data:
-        schema_rec["Description"] = data["Description"]
-    if "Compatibility" in data:
-        compat = data["Compatibility"]
-        if compat not in _VALID_COMPATIBILITY:
-            return error_response_json(
-                "InvalidInputException", f"Invalid Compatibility: {compat}", 400)
-        schema_rec["Compatibility"] = compat
-        schema_rec["SchemaCheckpoint"] = schema_rec.get("SchemaCheckpoint", 1) + 1
-    schema_rec["UpdatedTime"] = _iso_timestamp()
-    return json_response({
-        "SchemaName": schema_name,
-        "SchemaArn": schema_rec["SchemaArn"],
-        "Compatibility": schema_rec["Compatibility"],
-        "Description": schema_rec.get("Description", ""),
-    })
-
-
-def _delete_schema(data):
-    registry_name, schema_name = _resolve_schema_key(data.get("SchemaId"))
-    if not registry_name or not schema_name:
-        return error_response_json("InvalidInputException", "SchemaId is required", 400)
-    key = _schema_key(registry_name, schema_name)
-    if key not in _schemas:
-        return error_response_json(
-            "EntityNotFoundException",
-            f"Schema {schema_name} not found in registry {registry_name}.",
-            400,
-        )
-    schema_arn = _schemas[key]["SchemaArn"]
-    del _schemas[key]
-    _tags.pop(schema_arn, None)
-    return json_response({
-        "SchemaName": schema_name,
-        "SchemaArn": schema_arn,
-    })
-
-
-def _register_schema_version(data):
-    definition = data.get("SchemaDefinition")
-    if not definition:
-        return error_response_json(
-            "InvalidInputException", "SchemaDefinition is required", 400)
-    registry_name, schema_name = _resolve_schema_key(data.get("SchemaId"))
-    if not registry_name or not schema_name:
-        return error_response_json("InvalidInputException", "SchemaId is required", 400)
-    schema_rec = _get_schema_record(registry_name, schema_name)
-    if not schema_rec or schema_rec.get("SchemaStatus") == "DELETING":
-        return error_response_json(
-            "EntityNotFoundException",
-            f"Schema {schema_name} not found in registry {registry_name}.",
-            400,
-        )
-
-    existing = _find_version_by_definition(schema_rec, definition)
-    if existing:
-        return json_response({
-            "SchemaVersionId": existing["SchemaVersionId"],
-            "VersionNumber": existing["VersionNumber"],
-            "Status": existing.get("Status", "AVAILABLE"),
-        })
-
-    compatibility = schema_rec.get("Compatibility", "NONE")
-    active = _active_schema_versions(schema_rec)
-    if compatibility == "DISABLED" and active:
-        return error_response_json(
-            "InvalidInputException",
-            "Schema version registration is disabled for this schema.",
-            400,
-        )
-
-    version_number = schema_rec.get("NextSchemaVersion", len(active) + 1)
-    version_id = new_uuid()
-    now = _iso_timestamp()
-    version = {
-        "SchemaVersionId": version_id,
-        "VersionNumber": version_number,
-        "SchemaDefinition": definition,
-        "Status": "AVAILABLE",
-        "CreatedTime": now,
-    }
-    schema_rec.setdefault("versions", []).append(version)
-    schema_rec["LatestSchemaVersion"] = version_number
-    schema_rec["NextSchemaVersion"] = version_number + 1
-    schema_rec["UpdatedTime"] = now
-    return json_response({
-        "SchemaVersionId": version_id,
-        "VersionNumber": version_number,
-        "Status": "AVAILABLE",
-    })
-
-
-def _get_schema_version(data):
-    schema_version_id = data.get("SchemaVersionId")
-    schema_rec = None
-    version = None
-
-    if schema_version_id:
-        for rec in _schemas.values():
-            version = _find_version_by_id(rec, schema_version_id)
-            if version:
-                schema_rec = rec
-                break
-        if not version:
-            return error_response_json(
-                "EntityNotFoundException",
-                f"Schema version {schema_version_id} not found.",
-                400,
-            )
+def _get_user_defined_functions(data):
+    db_name = data.get("DatabaseName")
+    pattern = data.get("Pattern") or ""
+    # Real AWS accepts DatabaseName="*" or omitted to span all databases in the
+    # catalog. Botocore marks DatabaseName as optional.
+    if db_name and db_name != "*":
+        items = [u for k, u in _user_defined_functions.items() if k.startswith(f"{db_name}/")]
     else:
-        registry_name, schema_name = _resolve_schema_key(data.get("SchemaId"))
-        if not registry_name or not schema_name:
+        items = list(_user_defined_functions.values())
+    if pattern:
+        # Real AWS Glue treats Pattern as a regular expression matched against the
+        # function name (not a glob). e.g. Trino's Glue connector resolves a UDF
+        # with a regex like `trino__<name>__.*`. Glue compiles it with
+        # java.util.regex, so translate `\Q...\E` literal-quote spans (which RE2
+        # / Python `re` reject) before compiling. An invalid regex (e.g. a bare
+        # `*`) raises InvalidInputException, mirroring Glue's RE2 parse error.
+        try:
+            compiled = re.compile(_translate_java_regex_quote(pattern))
+        except re.error as exc:
             return error_response_json(
                 "InvalidInputException",
-                "SchemaId or SchemaVersionId is required",
+                f"Invalid pattern syntax: error parsing regexp: {exc}",
                 400,
             )
-        schema_rec = _get_schema_record(registry_name, schema_name)
-        if not schema_rec or schema_rec.get("SchemaStatus") == "DELETING":
-            return error_response_json(
-                "EntityNotFoundException",
-                f"Schema {schema_name} not found in registry {registry_name}.",
-                400,
-            )
-        version_number = data.get("SchemaVersionNumber") or {}
-        if version_number.get("LatestVersion"):
-            version = _latest_schema_version(schema_rec)
-        elif version_number.get("VersionNumber") is not None:
-            vn = version_number["VersionNumber"]
-            version = next(
-                (v for v in _active_schema_versions(schema_rec)
-                 if v["VersionNumber"] == vn),
-                None,
-            )
-        else:
-            version = _latest_schema_version(schema_rec)
-        if not version:
-            return error_response_json(
-                "EntityNotFoundException", "Schema version not found.", 400)
-
-    return json_response({
-        "SchemaArn": schema_rec["SchemaArn"],
-        "SchemaDefinition": version["SchemaDefinition"],
-        "DataFormat": schema_rec["DataFormat"],
-        "SchemaVersionId": version["SchemaVersionId"],
-        "VersionNumber": version["VersionNumber"],
-        "Status": version.get("Status", "AVAILABLE"),
-        "CreatedTime": version.get("CreatedTime"),
-    })
-
-
-def _list_schema_versions(data):
-    registry_name, schema_name = _resolve_schema_key(data.get("SchemaId"))
-    if not registry_name or not schema_name:
-        return error_response_json("InvalidInputException", "SchemaId is required", 400)
-    schema_rec = _get_schema_record(registry_name, schema_name)
-    if not schema_rec or schema_rec.get("SchemaStatus") == "DELETING":
-        return error_response_json(
-            "EntityNotFoundException",
-            f"Schema {schema_name} not found in registry {registry_name}.",
-            400,
-        )
-    max_results = data.get("MaxResults") or 25
-    start = 0
-    token = data.get("NextToken")
-    if token:
-        try:
-            start = int(token)
-        except ValueError:
-            start = 0
-    items = [
-        {
-            "SchemaVersionId": v["SchemaVersionId"],
-            "VersionNumber": v["VersionNumber"],
-            "Status": v.get("Status", "AVAILABLE"),
-            "CreatedTime": v.get("CreatedTime"),
-        }
-        for v in sorted(_active_schema_versions(schema_rec),
-                        key=lambda x: x["VersionNumber"])
-    ]
-    page = items[start:start + max_results]
-    resp = {"Schemas": page}
-    nxt = start + max_results
-    if nxt < len(items):
-        resp["NextToken"] = str(nxt)
-    return json_response(resp)
-
-
-def _delete_schema_versions(data):
-    registry_name, schema_name = _resolve_schema_key(data.get("SchemaId"))
-    if not registry_name or not schema_name:
-        return error_response_json("InvalidInputException", "SchemaId is required", 400)
-    schema_rec = _get_schema_record(registry_name, schema_name)
-    if not schema_rec:
-        return error_response_json(
-            "EntityNotFoundException",
-            f"Schema {schema_name} not found in registry {registry_name}.",
-            400,
-        )
-    ids = set(data.get("SchemaVersionIds") or [])
-    deleted = []
-    for v in schema_rec.get("versions", []):
-        if v.get("SchemaVersionId") in ids:
-            v["Status"] = "DELETING"
-            deleted.append(v["SchemaVersionId"])
-    return json_response({
-        "SchemaVersionIds": deleted,
-        "Errors": [],
-    })
-
-
-def _get_schema_by_definition(data):
-    registry_name = _resolve_registry_name(data.get("SchemaId"))
-    definition = data.get("SchemaDefinition")
-    if not definition:
-        return error_response_json(
-            "InvalidInputException", "SchemaDefinition is required", 400)
-    for schema_rec in _schemas.values():
-        if schema_rec.get("RegistryName") != registry_name:
-            continue
-        if schema_rec.get("SchemaStatus") == "DELETING":
-            continue
-        version = _find_version_by_definition(schema_rec, definition)
-        if version:
-            return json_response({
-                "SchemaArn": schema_rec["SchemaArn"],
-                "SchemaName": schema_rec["SchemaName"],
-                "RegistryName": schema_rec["RegistryName"],
-                "SchemaVersionId": version["SchemaVersionId"],
-                "VersionNumber": version["VersionNumber"],
-                "Status": version.get("Status", "AVAILABLE"),
-            })
-    return error_response_json(
-        "EntityNotFoundException", "Schema version not found.", 400)
-
-
-def _check_schema_version_validity(data):
-    definition = data.get("SchemaDefinition")
-    if not definition:
-        return error_response_json(
-            "InvalidInputException", "SchemaDefinition is required", 400)
-    data_format = data.get("DataFormat")
-    if not data_format:
-        return error_response_json("InvalidInputException", "DataFormat is required", 400)
-    if data_format not in _VALID_DATA_FORMATS:
-        return error_response_json(
-            "InvalidInputException", f"Invalid DataFormat: {data_format}", 400)
-    # Lightweight syntax check (no deep Avro/Protobuf validation in emulator).
-    valid = bool(definition.strip())
-    if data_format in ("AVRO", "JSON") and valid:
-        try:
-            json.loads(definition)
-            valid = True
-        except json.JSONDecodeError:
-            valid = False
-    if not valid:
-        return json_response({
-            "Valid": False,
-            "Error": "Schema definition is not valid for the requested data format.",
-        })
-    return json_response({"Valid": True})
+        items = [u for u in items if compiled.search(u.get("FunctionName", ""))]
+    return json_response({"UserDefinedFunctions": items})
 
 
 # ---- Tags ----
@@ -2097,5 +1985,6 @@ def reset():
     _triggers.clear()
     _workflows.clear()
     _workflow_runs.clear()
-    _registries.clear()
-    _schemas.clear()
+    _user_defined_functions.clear()
+    _table_column_statistics.clear()
+    _partition_column_statistics.clear()

@@ -1328,7 +1328,7 @@ def _execute_pass(state_def, raw_input, ctx=None):
         return output, _next_or_end(state_def)
 
     effective = _apply_input_path(state_def, raw_input)
-    effective = _apply_parameters(state_def, effective)
+    effective = _apply_parameters(state_def, effective, ctx)
 
     result = state_def.get("Result", effective)
     result = _apply_result_selector(state_def, result)
@@ -1347,6 +1347,7 @@ def _execute_task(state_def, raw_input, execution, ctx):
     query_language = _state_query_language(state_def, ctx)
 
     # SFN mock config — return canned response if configured (AWS SFN Local format)
+    _mock_throw = None
     if _sfn_mock_config and execution:
         test_case = execution.get("testCase", "")
         sm_name = ctx.get("StateMachine", {}).get("Name", "")
@@ -1357,23 +1358,27 @@ def _execute_task(state_def, raw_input, execution, ctx):
         if mock is not None:
             attempts[state_name] = attempt + 1
             if "Throw" in mock:
-                raise _ExecutionError(
+                # Feed the mocked error into the same Retry/Catch machinery a real
+                # task failure uses (#903). Raising here bypassed Catch entirely.
+                _mock_throw = _ExecutionError(
                     mock["Throw"].get("Error", "MockError"),
                     mock["Throw"].get("Cause", "Mocked failure"))
-            mock_result = mock.get("Return", {})
-            if query_language == "JSONata":
-                output = _apply_jsonata_output(
-                    state_def,
-                    raw_input,
-                    ctx,
-                    result=mock_result,
-                    default=mock_result,
-                )
             else:
-                result = _apply_result_selector(state_def, mock_result)
-                output = _apply_result_path(state_def, raw_input, result)
-                output = _apply_output_path(state_def, output)
-            return output, _next_or_end(state_def)
+                mock_result = mock.get("Return", {})
+                if query_language == "JSONata":
+                    output = _apply_jsonata_output(
+                        state_def,
+                        raw_input,
+                        ctx,
+                        result=mock_result,
+                        default=mock_result,
+                    )
+                    _apply_state_assign(state_def, raw_input, ctx, result=mock_result)
+                else:
+                    result = _apply_result_selector(state_def, mock_result)
+                    output = _apply_result_path(state_def, raw_input, result)
+                    output = _apply_output_path(state_def, output)
+                return output, _next_or_end(state_def)
 
     if is_callback:
         ctx["Task"] = {"Token": new_uuid()}
@@ -1399,6 +1404,9 @@ def _execute_task(state_def, raw_input, execution, ctx):
                     "resource": resource,
                 },
             })
+
+            if _mock_throw is not None:
+                raise _mock_throw
 
             if is_callback:
                 task_result = _invoke_with_callback(
@@ -1558,10 +1566,36 @@ def _invoke_with_callback(resource, input_data, token, state_def):
             func_name = func_name.split(":function:")[-1].split(":")[0]
 
     if func_name:
+        # For lambda:invoke[.waitForTaskToken] the resolved Parameters wrap the
+        # Lambda event under "Payload" (alongside "FunctionName"). Deliver only
+        # the Payload, mirroring the synchronous lambda:invoke path
+        # (_invoke_resource). Otherwise the handler receives the integration
+        # envelope ({"FunctionName": ..., "Payload": {...}}) instead of its
+        # input and fails to find the task token / its arguments.
+        lambda_payload = input_data.get("Payload", input_data) \
+            if isinstance(input_data, dict) else input_data
         try:
-            _call_lambda(func_name, input_data)
+            _call_lambda(func_name, lambda_payload)
         except _ExecutionError:
             pass
+    else:
+        # Non-Lambda service integrations (sqs:sendMessage, sns:publish, …) must
+        # actually perform the call — delivering the payload that carries the
+        # task token — before we block for the callback. Without this the task is
+        # scheduled but nothing is ever sent and the execution hangs forever
+        # (#959). A failed integration fails the task (propagates) rather than
+        # hanging.
+        try:
+            for prefix, handler in _SERVICE_DISPATCH.items():
+                if clean_resource.startswith(prefix):
+                    handler(clean_resource, input_data)
+                    break
+            else:
+                if "aws-sdk:" in clean_resource:
+                    _invoke_aws_sdk_integration(clean_resource, input_data)
+        except _ExecutionError:
+            _task_tokens.pop(token, None)
+            raise
 
     timeout = state_def.get("TimeoutSeconds", 99999)
     if not evt.wait(timeout=timeout):
@@ -1600,9 +1634,15 @@ def _call_lambda(func_name, event):
     if result.get("error"):
         body = result.get("body", {})
         if isinstance(body, dict):
+            # AWS reports a failed Lambda task with Error set to the function's
+            # errorType and Cause set to a JSON-encoded string of the error
+            # payload ({"errorType": ..., "errorMessage": ..., "trace": [...]}),
+            # NOT the bare errorMessage. Consumers (Catch handlers, downstream
+            # tasks) routinely json.loads(Cause) to read errorType/errorMessage,
+            # so emit the JSON form to match.
             raise _ExecutionError(
                 body.get("errorType", "Lambda.Unknown"),
-                body.get("errorMessage", str(body)))
+                json.dumps(body))
         raise _ExecutionError("Lambda.Unknown", str(body))
 
     body = result.get("body")
@@ -2882,7 +2922,7 @@ def _jsonata_now(*args):
     # With picture: XPath-3.1 date/time picture (subset — see
     # `_format_datetime_picture`). With timezone: "+HH:MM" / "-HH:MM" offset
     # applied before formatting.
-    from datetime import datetime, timezone, timedelta
+    from datetime import datetime, timedelta, timezone
     if len(args) > 2:
         raise ValueError("$now expects 0, 1, or 2 arguments")
     now = datetime.now(timezone.utc)
@@ -3823,7 +3863,13 @@ def _invoke_sqs_send_message(resource, input_data):
         return input_data
     try:
         url = input_data.get("QueueUrl", "")
-        result = sqs._act_send_message(input_data, url)
+        payload = dict(input_data)
+        body = payload.get("MessageBody")
+        if isinstance(body, (dict, list)):
+            # SFN serialises an object MessageBody to JSON text before calling
+            # SQS (which requires a string body).
+            payload["MessageBody"] = json.dumps(body)
+        result = sqs._act_send_message(payload, url)
         return result
     except sqs._Err as e:
         raise _ExecutionError(f"SQS.{e.code}", e.message)
@@ -3915,13 +3961,15 @@ def _poll_ecs_tasks(cluster, task_arns):
 
 
 def _pascal_to_camel(d):
-    """Convert top-level PascalCase keys to camelCase for ECS internals."""
+    """Recursively convert PascalCase keys to camelCase for ECS internals."""
+    if isinstance(d, list):
+        return [_pascal_to_camel(v) for v in d]
     if not isinstance(d, dict):
         return d
     out = {}
     for k, v in d.items():
         new_key = k[0].lower() + k[1:] if k else k
-        out[new_key] = v
+        out[new_key] = _pascal_to_camel(v)
     return out
 
 
