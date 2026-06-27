@@ -170,6 +170,40 @@ def test_cfn_stack_with_parameters(cfn, sqs):
     urls = sqs.list_queues(QueueNamePrefix="cfn-t02-custom").get("QueueUrls", [])
     assert any("cfn-t02-custom" in u for u in urls)
 
+def test_cfn_change_set_use_previous_value_updates_resource(cfn, ssm):
+    """A change set created with UsePreviousValue (the `aws cloudformation deploy`
+    no-`--parameter-overrides` path) must resolve the parameter to its stored
+    value, so a parameter-driven resource still updates rather than resolving to
+    an empty value and missing the real resource (#897)."""
+    def template(value):
+        return json.dumps({
+            "AWSTemplateFormatVersion": "2010-09-09",
+            "Parameters": {"Prefix": {"Type": "String", "Default": "demo"}},
+            "Resources": {"P": {
+                "Type": "AWS::SSM::Parameter",
+                "Properties": {
+                    "Name": {"Fn::Sub": "/${Prefix}/config"},
+                    "Type": "String",
+                    "Value": value,
+                },
+            }},
+        })
+
+    cfn.create_stack(StackName="cfn-upv", TemplateBody=template("v1"))
+    _wait_stack(cfn, "cfn-upv")
+    assert ssm.get_parameter(Name="/demo/config")["Parameter"]["Value"] == "v1"
+
+    # Change set re-sends Prefix as UsePreviousValue (what `deploy` does without
+    # --parameter-overrides). Prefix must resolve to "demo", not "".
+    cfn.create_change_set(
+        StackName="cfn-upv", ChangeSetName="cs2", TemplateBody=template("v2"),
+        Parameters=[{"ParameterKey": "Prefix", "UsePreviousValue": True}],
+    )
+    cfn.execute_change_set(StackName="cfn-upv", ChangeSetName="cs2")
+    _wait_stack(cfn, "cfn-upv")
+
+    assert ssm.get_parameter(Name="/demo/config")["Parameter"]["Value"] == "v2"
+
 def test_cfn_intrinsic_ref_getatt(cfn, ssm):
     template = {
         "AWSTemplateFormatVersion": "2010-09-09",
@@ -3693,6 +3727,88 @@ def test_cfn_apigateway_account_provisions(cfn, apigw_v1):
 
     cfn.delete_stack(StackName=stack_name)
     _wait_stack(cfn, stack_name)
+
+
+# ---------------------------------------------------------------------------
+# ApiGatewayV1 Integration with OpenAPI spec parsing
+# ---------------------------------------------------------------------------
+
+def test_cfn_restapi_openapi_body_petstore(cfn, apigw_v1):
+    stack = "cfn-restapi-body"
+    op = {
+        "x-amazon-apigateway-integration": {
+            "httpMethod": "POST",
+            "type": "aws_proxy",
+            "uri": {
+                "Fn::Sub": "arn:aws:apigateway:${AWS::Region}:lambda:path/"
+                           "2015-03-31/functions/${PetStoreFunction.Arn}/invocations"
+            },
+        },
+        "responses": {},
+    }
+    body = {
+        "swagger": "2.0",
+        "info": {"version": "1.0", "title": {"Ref": "AWS::StackName"}},
+        "paths": {
+            "/pets": {"get": dict(op), "post": dict(op)},
+            "/pets/featured": {"get": dict(op)},
+            "/pets/{petId}": {"get": dict(op), "delete": dict(op)},
+        },
+    }
+    template = json.dumps({
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "PetStoreFunction": {
+                "Type": "AWS::Lambda::Function",
+                "Properties": {
+                    "FunctionName": f"{stack}-fn",
+                    "Runtime": "python3.12",
+                    "Handler": "index.handler",
+                    "Role": "arn:aws:iam::000000000000:role/r",
+                    "Code": {"ZipFile": "def handler(e, c):\n    return {}\n"},
+                },
+            },
+            "ServerlessRestApi": {
+                "Type": "AWS::ApiGateway::RestApi",
+                "Properties": {"Body": body},
+            },
+        },
+        "Outputs": {"ApiId": {"Value": {"Ref": "ServerlessRestApi"}}},
+    })
+
+    cfn.create_stack(StackName=stack, TemplateBody=template)
+    s = _wait_stack(cfn, stack)
+    assert s["StackStatus"] == "CREATE_COMPLETE"
+    api_id = {o["OutputKey"]: o["OutputValue"] for o in s["Outputs"]}["ApiId"]
+
+    api = apigw_v1.get_rest_api(restApiId=api_id)
+    assert api["name"] == stack
+    assert api["version"] == "1.0"
+
+    rmap = {}
+    for r in apigw_v1.get_resources(restApiId=api_id, limit=500)["items"]:
+        rmap[r["path"]] = {
+            m: apigw_v1.get_integration(restApiId=api_id, resourceId=r["id"],
+                                        httpMethod=m)
+            for m in (r.get("resourceMethods") or {})
+        }
+
+    assert set(rmap) == {"/", "/pets", "/pets/featured", "/pets/{petId}"}
+    assert set(rmap["/pets"]) == {"GET", "POST"}
+    assert set(rmap["/pets/featured"]) == {"GET"}
+    assert set(rmap["/pets/{petId}"]) == {"GET", "DELETE"}
+
+    integ = rmap["/pets"]["GET"]
+    assert integ["type"] == "AWS_PROXY"
+    assert integ["httpMethod"] == "POST"
+    assert integ["uri"].startswith("arn:aws:apigateway:")
+    assert "${" not in integ["uri"]
+    assert f":function:{stack}-fn/invocations" in integ["uri"]
+
+    cfn.delete_stack(StackName=stack)
+    _wait_stack(cfn, stack)
+    ids = [a["id"] for a in apigw_v1.get_rest_apis(limit=500)["items"]]
+    assert api_id not in ids
 
 
 # ============================================================================

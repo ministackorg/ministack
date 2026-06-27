@@ -443,6 +443,35 @@ def test_convert_parameters_empty_value():
     assert result["x"] is None
 
 
+def test_substitute_named_params_distinct_numeric_tokens():
+    """:1 and :10 are distinct placeholders, not substring shadows (#957 bug 2).
+
+    A naive substring replace of ":1" first corrupts ":10" into "<val>0". Token
+    matching keeps them distinct regardless of supply order."""
+    from ministack.services.rds_data import _substitute_named_params
+
+    params = {"1": "ONE", "10": "TEN"}
+    assert _substitute_named_params("SELECT :1 AS one, :10 AS ten", params) == \
+        "SELECT %(1)s AS one, %(10)s AS ten"
+    # Order of the names in the dict must not change the result.
+    assert _substitute_named_params("SELECT :10 AS ten, :1 AS one", {"10": "TEN", "1": "ONE"}) == \
+        "SELECT %(10)s AS ten, %(1)s AS one"
+
+
+def test_substitute_named_params_preserves_cast_and_unknowns():
+    """A ::type cast is left intact and a :word that is not a supplied parameter
+    passes through unchanged instead of becoming a bad placeholder."""
+    from ministack.services.rds_data import _substitute_named_params
+
+    assert _substitute_named_params("SELECT :val::jsonb", {"val": "{}"}) == "SELECT %(val)s::jsonb"
+    assert _substitute_named_params("SELECT :foo", {"bar": 1}) == "SELECT :foo"
+    assert _substitute_named_params("SELECT 1", {}) == "SELECT 1"
+    # A longer unrelated :token must not be partially eaten by a shorter param
+    # name. Substring replace of ":id" would corrupt ":identity"; token matching
+    # leaves it whole because it is not a supplied parameter.
+    assert _substitute_named_params("SELECT :id, :identity", {"id": 1}) == "SELECT %(id)s, :identity"
+
+
 # ── Stub mode tests ────────────────────────────────────────
 
 def _setup_stub_cluster(rds, sm):

@@ -406,7 +406,15 @@ def test_cognito_global_sign_out(cognito_idp):
         AuthParameters={"USERNAME": "noah", "PASSWORD": "NoahPass1!"},
     )
     access_token = auth["AuthenticationResult"]["AccessToken"]
-    cognito_idp.global_sign_out(AccessToken=access_token)  # must not raise
+    refresh_token = auth["AuthenticationResult"]["RefreshToken"]
+    time.sleep(1.1)  # sign-out invalidates tokens issued before now (1s granularity)
+    cognito_idp.global_sign_out(AccessToken=access_token)
+    # every refresh token issued before the sign-out must be invalidated (#1395)
+    with pytest.raises(cognito_idp.exceptions.NotAuthorizedException):
+        cognito_idp.admin_initiate_auth(
+            UserPoolId=pid, ClientId=cid, AuthFlow="REFRESH_TOKEN_AUTH",
+            AuthParameters={"REFRESH_TOKEN": refresh_token},
+        )
 
 def test_cognito_admin_confirm_signup(cognito_idp):
     pid = cognito_idp.create_user_pool(PoolName="AdminConfirmPool")["UserPool"]["Id"]
@@ -807,8 +815,26 @@ def test_cognito_admin_reset_user_password(cognito_idp):
 
 def test_cognito_admin_user_global_sign_out(cognito_idp):
     pid = cognito_idp.create_user_pool(PoolName="GlobalSignOutAdminPool")["UserPool"]["Id"]
+    cid = cognito_idp.create_user_pool_client(
+        UserPoolId=pid, ClientName="AdminSignOutApp",
+        ExplicitAuthFlows=["ALLOW_USER_PASSWORD_AUTH", "ALLOW_REFRESH_TOKEN_AUTH"],
+    )["UserPoolClient"]["ClientId"]
     cognito_idp.admin_create_user(UserPoolId=pid, Username="signoutuser")
+    cognito_idp.admin_set_user_password(
+        UserPoolId=pid, Username="signoutuser", Password="SignOut1!", Permanent=True)
+    auth = cognito_idp.admin_initiate_auth(
+        UserPoolId=pid, ClientId=cid, AuthFlow="ADMIN_USER_PASSWORD_AUTH",
+        AuthParameters={"USERNAME": "signoutuser", "PASSWORD": "SignOut1!"},
+    )
+    refresh_token = auth["AuthenticationResult"]["RefreshToken"]
+    time.sleep(1.1)  # sign-out invalidates tokens issued before now (1s granularity)
     cognito_idp.admin_user_global_sign_out(UserPoolId=pid, Username="signoutuser")
+    # the user's refresh tokens must be invalidated (#1395)
+    with pytest.raises(cognito_idp.exceptions.NotAuthorizedException):
+        cognito_idp.admin_initiate_auth(
+            UserPoolId=pid, ClientId=cid, AuthFlow="REFRESH_TOKEN_AUTH",
+            AuthParameters={"REFRESH_TOKEN": refresh_token},
+        )
 
 def test_cognito_revoke_token(cognito_idp):
     pid = cognito_idp.create_user_pool(PoolName="RevokePool")["UserPool"]["Id"]
@@ -826,7 +852,18 @@ def test_cognito_revoke_token(cognito_idp):
         AuthParameters={"USERNAME": "revokeuser", "PASSWORD": "RevokePass1!"},
     )
     refresh_token = auth["AuthenticationResult"]["RefreshToken"]
+    # baseline: the refresh token authenticates before revocation
+    cognito_idp.admin_initiate_auth(
+        UserPoolId=pid, ClientId=cid, AuthFlow="REFRESH_TOKEN_AUTH",
+        AuthParameters={"REFRESH_TOKEN": refresh_token},
+    )
     cognito_idp.revoke_token(Token=refresh_token, ClientId=cid)
+    # after RevokeToken it must no longer mint new tokens (#1395)
+    with pytest.raises(cognito_idp.exceptions.NotAuthorizedException):
+        cognito_idp.admin_initiate_auth(
+            UserPoolId=pid, ClientId=cid, AuthFlow="REFRESH_TOKEN_AUTH",
+            AuthParameters={"REFRESH_TOKEN": refresh_token},
+        )
 
 def test_cognito_describe_identity(cognito_identity):
     resp = cognito_identity.create_identity_pool(
@@ -2208,6 +2245,61 @@ def test_oauth2_token_authorization_code():
     assert 'refresh_token' in resp
     assert resp['token_type'] == 'Bearer'
     assert resp['expires_in'] == 3600
+
+
+def test_oauth2_token_failed_client_auth_does_not_consume_code():
+    """A token request that fails client authentication must NOT consume the
+    single-use authorization code (#932). AWS rejects bad client auth without
+    invalidating the code, so a client that retries — HTTP Basic first, then
+    client_secret_post, as Vault/Go's oauth2 does — succeeds on the retry.
+    Consuming the code on the failed first attempt turned the retry into
+    invalid_grant 'Invalid or expired authorization code'."""
+    cognito_idp = make_client('cognito-idp')
+    pool_id, client = _setup_pool_with_user(cognito_idp)
+    client_id = client['ClientId']
+    client_secret = client['ClientSecret']
+    code = _do_login_and_get_code(cognito_idp, client_id)
+
+    # First exchange fails client auth (wrong secret) -> invalid_client.
+    status, _, body = _post_form(f'{ENDPOINT}/oauth2/token', {
+        'grant_type': 'authorization_code',
+        'code': code,
+        'redirect_uri': 'http://localhost:3000/callback',
+        'client_id': client_id,
+        'client_secret': 'wrong-secret',
+    })
+    assert status == 400, body
+    assert json.loads(body)['error'] == 'invalid_client'
+
+    # The code must survive the failed attempt: retry with the correct secret
+    # on the SAME code succeeds (would be invalid_grant before the fix).
+    status, _, body = _post_form(f'{ENDPOINT}/oauth2/token', {
+        'grant_type': 'authorization_code',
+        'code': code,
+        'redirect_uri': 'http://localhost:3000/callback',
+        'client_id': client_id,
+        'client_secret': client_secret,
+    })
+    assert status == 200, body
+    assert 'access_token' in json.loads(body)
+
+
+def test_oauth2_basic_auth_does_not_url_decode_client_secret():
+    """AWS Cognito compares the HTTP Basic client_id/client_secret EXACTLY as
+    sent — it does NOT url-decode them. Real clients (incl. Go/Vault) base64 the
+    raw "id:secret" without form-urlencoding, so a secret containing '+' or '/'
+    must be matched verbatim. Decoding here would corrupt any secret containing
+    '+' (→ space) and break valid client_secret_basic auth (#932)."""
+    import base64 as _b64
+
+    from ministack.services.cognito import _authenticate_client
+
+    cid = "VxSsBWVIKMZK29W0IN6TKJN8EF"
+    for secret in ("ab/cd+ef/gh", "no-specials-here"):
+        basic = _b64.b64encode(f"{cid}:{secret}".encode()).decode()
+        got_cid, got_secret = _authenticate_client({"authorization": f"Basic {basic}"}, {})
+        assert got_cid == cid
+        assert got_secret == secret, f"Basic auth must NOT decode; expected {secret!r}, got {got_secret!r}"
 
 
 def test_oauth2_id_token_echoes_nonce():

@@ -5,6 +5,53 @@ All notable changes to MiniStack will be documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning follows [Semantic Versioning](https://semver.org/).
 
+## [1.3.68] — 2026-06-25
+
+### Fixed
+- **Cognito — OAuth2 token endpoint URL-decodes HTTP Basic client credentials** — a `client_secret` containing `/` or `+` arrives in the `Authorization: Basic` header as `%2F`/`%2B` (RFC 6749 §2.3.1 form-urlencodes the client id and secret before base64). MiniStack did not decode them, so `client_secret_basic` failed with `invalid_client` for any secret with special characters. The credentials are now decoded, matching the `client_secret_post` path. Reported by @pny-nc.
+- **Step Functions — `lambda:invoke.waitForTaskToken` delivers the unwrapped `Payload`** — the callback path forwarded the whole service-integration envelope (`{"FunctionName": ..., "Payload": {...}}`) to the Lambda instead of just the `Payload`, unlike the synchronous `lambda:invoke` path. A handler reading its task token / input from the top level saw them nested under `Payload`, never resumed the task, and the execution hung until timeout. Contributed by @ryan-bennett.
+- **Step Functions — a failed `lambda:invoke` task sets `Cause` to a JSON-encoded error payload** — `Cause` was the bare `errorMessage` string instead of AWS's JSON object (`{"errorType": ..., "errorMessage": ..., "trace": [...]}`), so `Catch` handlers and downstream tasks that `json.loads(Cause)` to read `errorType`/`errorMessage` failed to parse it. `Cause` now matches the AWS wire form. Contributed by @ryan-bennett.
+- **SNS — `lambda` subscribers are delivered to asynchronously** — fanout invoked a `lambda`-protocol subscriber synchronously inside `Publish`, so a slow or hung subscriber Lambda blocked the `Publish` call and its upstream caller (e.g. a Step Functions task publishing a notification). Delivery now runs on a background thread, matching AWS's asynchronous SNS→Lambda delivery, so `Publish` returns immediately. Contributed by @ryan-bennett.
+
+---
+
+## [1.3.67] — 2026-06-24
+
+### Added
+- **CloudFormation / API Gateway — `AWS::ApiGateway::RestApi` imports an OpenAPI `Body`** — a REST API defined inline through the `Body` property now materializes its paths, methods, and `x-amazon-apigateway-integration` blocks as real resources, methods, and integrations, covering the basic SAM-transform Swagger 2.0 + Lambda-proxy shape. Partial support; authorization, request/response validation, and most extensions are not yet handled. Contributed by @maximoosemine.
+- **EC2 — IAM instance profile association APIs** — `AssociateIamInstanceProfile`, `DescribeIamInstanceProfileAssociations`, `ReplaceIamInstanceProfileAssociation`, and `DisassociateIamInstanceProfile` are now implemented; launch-time associations are backfilled and cleared on termination, so Terraform's `aws_instance` `iam_instance_profile` round-trips without drift. Contributed by @D-artisan.
+
+### Changed
+- **Docs — clarified that the AWS SAM transform macro is not supported** — `Transform: AWS::Serverless-2016-10-31` is not expanded, so a SAM template still needs the CDK/CloudFormation-synthesized form; the README now points to the IaC docs and MiniStack MCP for current guidance. Contributed by @dashitongzhi.
+
+### Fixed
+- **Cognito — OAuth2 token endpoint no longer consumes the authorization code on a failed client-secret check** — a bad or absent client secret consumed the one-time code before failing, so a client that authenticates in two steps (HTTP Basic, then a `client_secret_post` fallback, as Go/Vault does) got `invalid_grant` on the retry. The client credentials are now validated before the code is consumed, so HTTP Basic client authentication succeeds. Reported by @pny-nc.
+- **API Gateway v1 — literal path segments resolve ahead of a `{param}` sibling regardless of creation order** — a literal path (e.g. `/users/verifyUserEmail`) returned 405 when a `{id}` sibling under the same parent was registered first, because resolution followed resource-creation order instead of AWS specificity. Resolution now orders literal > `{param}` > `{proxy+}`. Reported by @ethan-dyas438.
+- **RDS Data API — `:name` placeholders are substituted by whole token** — the earlier substring replacement could corrupt an unrelated longer token (a `:id` parameter ate into a literal `:identity`) and was fragile around `::type` casts. Substitution is now a single token-aware pass, keeping `:1`/`:10` distinct, leaving `::jsonb` casts intact, and passing through any `:word` that is not a supplied parameter. Reported by @awilson9.
+
+---
+
+## [1.3.66] — 2026-06-22
+
+### Added
+- **ElastiCache — broad parity improvements** — built-in `default.*` parameter groups for the Redis, Memcached, and Valkey families (including `.cluster.on` variants) with AWS-style engine-version→family mapping; seeded defaults are immutable (create/modify/delete/reset rejected with AWS-shaped errors); replication-group creation materializes member cache clusters with metadata, tags, and member IDs and removes them on deletion; create/modify validate user groups with `UserGroupNotFound`; tag updates fan out to member cluster ARNs; and ElastiCache is now covered by the Resource Groups Tagging API. User and user-group error codes now use AWS's wire forms (`UserNotFound`, `UserGroupNotFound`, …). Contributed by @ZiningYin.
+- **IAM — additional AWS-managed policies seeded** — `AWSXRayDaemonWriteAccess`, `AWSXrayReadOnlyAccess`, and `AWSLambdaRole` are now pre-seeded with their canonical documents, so Terraform's tracing lookup (`data "aws_iam_policy" { arn = ".../AWSXRayDaemonWriteAccess" }`, used by every `attach_tracing_policy = true` module) resolves. Contributed by @mattwang44.
+
+### Changed
+- **CI — test suite now runs as balanced parallel shards** — the workflow plans shards from a per-file test-count map and runs them across separate runners, with a dedicated serial phase for global-state tests, cutting CI wall-clock time. Contributed by @jgrumboe.
+- **Build — bumped `github.com/containerd/containerd` 1.7.32 → 1.7.33** in the Go Testcontainers helper module.
+
+### Fixed
+- **CloudFormation — `aws cloudformation deploy` without `--parameter-overrides` now updates resources** — a change set created with `UsePreviousValue=true` (what `deploy` sends for existing parameters when no overrides are given) resolved the parameter to an empty value instead of its stored value, so a parameter-driven resource name (e.g. `!Sub ${StackName}-handler`) resolved wrong and the stack update silently missed the real resource — its code/properties never changed. `UsePreviousValue` is now resolved against the stack's stored parameters on both the change-set and `UpdateStack` paths. Reported by @ankitaabad.
+- **Step Functions — `.waitForTaskToken` now invokes non-Lambda service integrations** — `arn:aws:states:::sqs:sendMessage.waitForTaskToken` (and `sns:publish`, `dynamodb:*`, `aws-sdk:*`, …) scheduled the task but never performed the integration, so the payload carrying the task token was never sent and the execution hung. The callback path now dispatches the integration before blocking, and an object `MessageBody` is JSON-serialized for SQS. Reported by @taylor1791.
+- **RDS Data API — PostgreSQL correctness fixes** — psycopg2 connections now autocommit (matching the MySQL path), so a non-transactional `ExecuteStatement` is no longer rolled back on connection close; named parameters are substituted longest-first so `:1` no longer corrupts `:10` / `:18`; and `jsonb` values are returned as their stored JSON text instead of an invalid single-quoted Python repr. Reported by @awilson9.
+- **Cognito — token/session invalidation now takes effect** — `RevokeToken`, `GlobalSignOut`, and `AdminUserGlobalSignOut` were no-ops, so a revoked refresh token still minted new access tokens. They now invalidate the affected refresh tokens, and the `REFRESH_TOKEN_AUTH` flow honours the revocation.
+- **RDS — `CreateDBInstance` / `CreateDBCluster` validate parameter-group existence** — referencing a non-existent custom parameter group now returns `DBParameterGroupNotFound` / `DBClusterParameterGroupNotFound` instead of silently succeeding.
+- **Athena — `GetTableMetadata` / `ListTableMetadata` return real columns and partition keys** — the responses were empty stubs; they now surface the backing Glue table's columns and partition keys.
+- **SNS — `Publish` now accepts non-string `Message` values** — Step Functions' `arn:aws:states:::sns:publish` integration can pass `Message` as structured data rather than a plain string; it is now JSON-serialized before delivery instead of failing. Contributed by @noynoy83.
+
+---
+
 ## [1.3.65] — 2026-06-19
 
 ### Fixed

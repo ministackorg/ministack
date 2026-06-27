@@ -1009,27 +1009,49 @@ def _list_prepared_statements(data):
 # ---- Table Metadata (stubs) ----
 
 
+def _glue_col(c):
+    col = {"Name": c.get("Name", ""), "Type": c.get("Type", "string")}
+    if c.get("Comment"):
+        col["Comment"] = c["Comment"]
+    return col
+
+
+def _glue_table_to_metadata(t):
+    # Athena tables are Glue Data Catalog tables; surface the real columns and
+    # partition keys rather than empty lists.
+    sd = t.get("StorageDescriptor", {}) or {}
+    return {
+        "Name": t.get("Name", ""),
+        "CreateTime": int(time.time()),
+        "LastAccessTime": int(time.time()),
+        "TableType": t.get("TableType", "EXTERNAL_TABLE"),
+        "Columns": [_glue_col(c) for c in sd.get("Columns", [])],
+        "PartitionKeys": [_glue_col(c) for c in t.get("PartitionKeys", [])],
+        "Parameters": t.get("Parameters", {}) or {"classification": "csv"},
+    }
+
+
 def _get_table_metadata(data):
-    catalog = data.get("CatalogName", "AwsDataCatalog")
+    from ministack.services import glue as glue_svc
     db = data.get("DatabaseName", "default")
     table = data.get("TableName", "")
-    return json_response(
-        {
-            "TableMetadata": {
-                "Name": table,
-                "CreateTime": int(time.time()),
-                "LastAccessTime": int(time.time()),
-                "TableType": "EXTERNAL_TABLE",
-                "Columns": [],
-                "PartitionKeys": [],
-                "Parameters": {"classification": "csv"},
-            }
-        }
-    )
+    t = glue_svc._tables.get(f"{db}/{table}")
+    if t:
+        return json_response({"TableMetadata": _glue_table_to_metadata(t)})
+    # Unknown table — keep the prior lenient empty shape.
+    return json_response({"TableMetadata": {
+        "Name": table, "CreateTime": int(time.time()),
+        "LastAccessTime": int(time.time()), "TableType": "EXTERNAL_TABLE",
+        "Columns": [], "PartitionKeys": [], "Parameters": {"classification": "csv"},
+    }})
 
 
 def _list_table_metadata(data):
-    return json_response({"TableMetadataList": []})
+    from ministack.services import glue as glue_svc
+    db = data.get("DatabaseName", "default")
+    tables = [_glue_table_to_metadata(t) for k, t in glue_svc._tables.items()
+              if k.startswith(f"{db}/")]
+    return json_response({"TableMetadataList": tables})
 
 
 # ---- Tags ----

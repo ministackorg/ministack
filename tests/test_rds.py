@@ -28,6 +28,31 @@ def test_rds_create(rds):
     assert instances[0]["Engine"] == "postgres"
     assert "Address" in instances[0]["Endpoint"]
 
+def test_rds_create_rejects_unknown_parameter_group(rds):
+    """CreateDBInstance / CreateDBCluster reject a reference to a parameter group
+    that doesn't exist; a created group (or a default.* group) is accepted (#1278)."""
+    import botocore
+    with pytest.raises(botocore.exceptions.ClientError) as ei:
+        rds.create_db_instance(
+            DBInstanceIdentifier="pg-missing-db", DBInstanceClass="db.t3.micro",
+            Engine="postgres", DBParameterGroupName="nope-not-here",
+            MasterUsername="u", MasterUserPassword="Passw0rd!23", AllocatedStorage=20)
+    assert ei.value.response["Error"]["Code"] == "DBParameterGroupNotFound"
+
+    rds.create_db_parameter_group(
+        DBParameterGroupName="pg-real", DBParameterGroupFamily="postgres15", Description="x")
+    rds.create_db_instance(
+        DBInstanceIdentifier="pg-real-db", DBInstanceClass="db.t3.micro",
+        Engine="postgres", DBParameterGroupName="pg-real",
+        MasterUsername="u", MasterUserPassword="Passw0rd!23", AllocatedStorage=20)
+
+    with pytest.raises(botocore.exceptions.ClientError) as ec:
+        rds.create_db_cluster(
+            DBClusterIdentifier="pg-missing-cl", Engine="aurora-postgresql",
+            DBClusterParameterGroupName="nope-cluster",
+            MasterUsername="u", MasterUserPassword="Passw0rd!23")
+    assert ec.value.response["Error"]["Code"] == "DBClusterParameterGroupNotFound"
+
 def test_rds_engines(rds):
     resp = rds.describe_db_engine_versions(Engine="postgres")
     assert len(resp["DBEngineVersions"]) > 0

@@ -385,7 +385,7 @@ def test_sns_publish_batch(sns):
     assert len(resp.get("Failed", [])) == 0
 
 def test_sns_to_lambda_fanout(lam, sns):
-    """SNS publish with lambda protocol invokes the function synchronously."""
+    """SNS publish with lambda protocol delivers to the function."""
     import uuid as _uuid_mod
 
     fn = f"intg-sns-lam-{_uuid_mod.uuid4().hex[:8]}"
@@ -406,6 +406,68 @@ def test_sns_to_lambda_fanout(lam, sns):
     # Publish — should not raise; Lambda invoked synchronously
     resp = sns.publish(TopicArn=topic_arn, Message="hello-lambda")
     assert "MessageId" in resp
+
+def test_sns_to_lambda_delivery_is_async(lam, sns, sqs):
+    """SNS→Lambda delivery must not block Publish on the subscriber.
+
+    Regression: lambda fanout invoked the subscriber synchronously inside
+    Publish, so a slow (or hung) subscriber Lambda stalled the Publish call and
+    its upstream caller (e.g. a Step Functions task that publishes a
+    notification). AWS delivers SNS→Lambda asynchronously: Publish returns
+    immediately and the subscriber runs in the background.
+    """
+    import time
+    import uuid as _uuid
+
+    qname = f"sns-async-signal-{_uuid.uuid4().hex[:8]}"
+    q_url = sqs.create_queue(QueueName=qname)["QueueUrl"]
+
+    fn = f"intg-sns-async-{_uuid.uuid4().hex[:8]}"
+    # The subscriber simulates a slow handler (sleep) and then signals receipt
+    # out-of-band via SQS so the test can confirm eventual delivery.
+    code = (
+        "import os, time, boto3\n"
+        f"QNAME = {qname!r}\n"
+        "def handler(event, context):\n"
+        "    time.sleep(5)\n"
+        "    sqs = boto3.client('sqs', endpoint_url=os.environ['AWS_ENDPOINT_URL'])\n"
+        "    url = sqs.get_queue_url(QueueName=QNAME)['QueueUrl']\n"
+        "    sqs.send_message(QueueUrl=url, MessageBody='delivered')\n"
+        "    return {'ok': True}\n"
+    )
+    lam.create_function(
+        FunctionName=fn,
+        Runtime="python3.12",
+        Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Timeout=30,
+        Code={"ZipFile": _make_zip(code)},
+    )
+    func_arn = f"arn:aws:lambda:us-east-1:000000000000:function:{fn}"
+    topic_arn = sns.create_topic(
+        Name=f"intg-sns-async-topic-{_uuid.uuid4().hex[:8]}"
+    )["TopicArn"]
+    sns.subscribe(TopicArn=topic_arn, Protocol="lambda", Endpoint=func_arn)
+
+    start = time.time()
+    resp = sns.publish(TopicArn=topic_arn, Message="async-check")
+    elapsed = time.time() - start
+    assert "MessageId" in resp
+    # Publish must return well before the subscriber's 5s sleep completes; a
+    # synchronous fanout would block here for the cold start plus the sleep.
+    assert elapsed < 3.0, f"Publish blocked on the subscriber ({elapsed:.1f}s)"
+
+    # The subscriber still runs in the background and eventually signals.
+    deadline = time.time() + 30
+    received = False
+    while time.time() < deadline:
+        msgs = sqs.receive_message(
+            QueueUrl=q_url, WaitTimeSeconds=1, MaxNumberOfMessages=1
+        ).get("Messages", [])
+        if msgs:
+            received = True
+            break
+    assert received, "subscriber Lambda was never delivered the SNS message"
 
 def test_sns_to_lambda_event_subscription_arn(lam, sns):
     """SNS→Lambda fanout must set EventSubscriptionArn to the real subscription ARN."""

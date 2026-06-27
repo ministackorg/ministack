@@ -2137,6 +2137,132 @@ def test_sfn_integration_sqs_send_message(sfn, sqs):
     assert len(msgs.get("Messages", [])) == 1
     assert msgs["Messages"][0]["Body"] == "hello from sfn"
 
+def test_sfn_integration_sqs_send_message_wait_for_task_token(sfn, sqs):
+    """sqs:sendMessage.waitForTaskToken must actually deliver the message
+    (carrying the task token, serialised to JSON) and resume on
+    SendTaskSuccess. Previously the task was scheduled but nothing was sent and
+    the execution hung forever (#959)."""
+    import time
+
+    queue_url = sqs.create_queue(QueueName="sfn-sqs-wfett")["QueueUrl"]
+
+    definition = json.dumps(
+        {
+            "StartAt": "Send",
+            "States": {
+                "Send": {
+                    "Type": "Task",
+                    "Resource": "arn:aws:states:::sqs:sendMessage.waitForTaskToken",
+                    "Parameters": {
+                        "QueueUrl": queue_url,
+                        "MessageBody": {"task_token.$": "$$.Task.Token"},
+                    },
+                    "End": True,
+                },
+            },
+        }
+    )
+    sm = sfn.create_state_machine(
+        name="sfn-sqs-wfett",
+        definition=definition,
+        roleArn="arn:aws:iam::000000000000:role/R",
+    )
+    ex = sfn.start_execution(stateMachineArn=sm["stateMachineArn"], input="{}")
+
+    # The integration must fire so a worker can read the token off the queue.
+    body = None
+    for _ in range(40):
+        msgs = sqs.receive_message(QueueUrl=queue_url, MaxNumberOfMessages=1)
+        if msgs.get("Messages"):
+            body = msgs["Messages"][0]["Body"]
+            break
+        time.sleep(0.25)
+    assert body is not None, "no SQS message delivered — task hung (#959)"
+    parsed = json.loads(body)  # object MessageBody must be valid JSON, not a repr
+    assert parsed["task_token"]
+
+    # The execution is paused at the task; SendTaskSuccess resumes it.
+    sfn.send_task_success(
+        taskToken=parsed["task_token"], output=json.dumps({"ok": True}))
+    desc = _wait_sfn(sfn, ex["executionArn"])
+    assert desc["status"] == "SUCCEEDED"
+
+def test_sfn_integration_lambda_invoke_wait_for_task_token(sfn, lam):
+    """lambda:invoke.waitForTaskToken must deliver the *unwrapped* Payload to
+    the handler, exactly like the synchronous lambda:invoke path.
+
+    Regression: the callback path forwarded the whole service-integration
+    envelope ({"FunctionName": ..., "Payload": {...}}) to the Lambda, so a
+    handler reading top-level keys (e.g. ``event["taskToken"]`` /
+    ``event["input"]``) saw them nested under ``Payload`` and could neither
+    find its task token nor its arguments, hanging the execution forever.
+    """
+    import uuid as _uuid
+
+    fn = f"intg-sfn-wfett-{_uuid.uuid4().hex[:8]}"
+    # The handler reads the token + input from the TOP LEVEL (as AWS delivers
+    # them) and completes the task itself, echoing back what it received.
+    code = (
+        "import json, os, boto3\n"
+        "def handler(event, context):\n"
+        "    token = event['taskToken']\n"
+        "    sfn = boto3.client('stepfunctions', endpoint_url=os.environ['AWS_ENDPOINT_URL'])\n"
+        "    sfn.send_task_success(\n"
+        "        taskToken=token,\n"
+        "        output=json.dumps({'top_keys': sorted(event.keys()), 'echo_input': event['input']}),\n"
+        "    )\n"
+        "    return {}\n"
+    )
+    lam.create_function(
+        FunctionName=fn,
+        Runtime="python3.12",
+        Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _make_zip(code)},
+    )
+    func_arn = f"arn:aws:lambda:us-east-1:000000000000:function:{fn}"
+
+    definition = json.dumps(
+        {
+            "StartAt": "CallbackTask",
+            "States": {
+                "CallbackTask": {
+                    "Type": "Task",
+                    "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
+                    "Parameters": {
+                        "FunctionName": func_arn,
+                        "Payload": {
+                            "taskToken.$": "$$.Task.Token",
+                            "id.$": "$$.Execution.Name",
+                            "input.$": "$",
+                        },
+                    },
+                    "TimeoutSeconds": 30,
+                    "End": True,
+                },
+            },
+        }
+    )
+    sm = sfn.create_state_machine(
+        name=f"sfn-wfett-{_uuid.uuid4().hex[:8]}",
+        definition=definition,
+        roleArn="arn:aws:iam::000000000000:role/R",
+    )
+    ex = sfn.start_execution(
+        stateMachineArn=sm["stateMachineArn"],
+        input=json.dumps({"hello": "world"}),
+    )
+    desc = _wait_sfn(sfn, ex["executionArn"], timeout=30)
+    assert desc["status"] == "SUCCEEDED", (
+        f"execution did not succeed ({desc['status']}); the handler could not "
+        f"read its top-level taskToken/input — Payload was not unwrapped"
+    )
+    output = json.loads(desc["output"])
+    # The handler must have seen the unwrapped Payload: top-level taskToken/id/
+    # input, and NOT the service-integration wrapper keys.
+    assert output["top_keys"] == ["id", "input", "taskToken"], output["top_keys"]
+    assert output["echo_input"] == {"hello": "world"}
+
 def test_sfn_integration_sns_publish(sfn, sns):
     """Task state publishes to SNS via arn:aws:states:::sns:publish."""
     topic = sns.create_topic(Name="sfn-integ-sns-test")
@@ -2172,6 +2298,68 @@ def test_sfn_integration_sns_publish(sfn, sns):
     assert desc["status"] == "SUCCEEDED"
     output = json.loads(desc["output"])
     assert "MessageId" in output
+
+
+def test_sfn_integration_sns_publish_structured_payload(sfn, sns, sqs):
+    """Task state publishes a structured Message object via arn:aws:states:::sns:publish."""
+    topic = sns.create_topic(Name="sfn-integ-sns-json-payload")
+    topic_arn = topic["TopicArn"]
+    str1 = "string1"
+    str2 = "string2"
+
+    q_url = sqs.create_queue(QueueName="sfn-integ-sns-json-payload-q")["QueueUrl"]
+    q_arn = sqs.get_queue_attributes(
+        QueueUrl=q_url,
+        AttributeNames=["QueueArn"],
+    )["Attributes"]["QueueArn"]
+    sns.subscribe(TopicArn=topic_arn, Protocol="sqs", Endpoint=q_arn)
+
+    definition = json.dumps(
+        {
+            "StartAt": "Publish",
+            "States": {
+                "Publish": {
+                    "Type": "Task",
+                    "Resource": "arn:aws:states:::sns:publish",
+                    "Parameters": {
+                        "TopicArn": topic_arn,
+                        "Message": {
+                            "str1.$": "$.str1",
+                            "str2.$": "$.str2",
+                        },
+                    },
+                    "End": True,
+                },
+            },
+        }
+    )
+    sm = sfn.create_state_machine(
+        name="sfn-sns-json-payload",
+        definition=definition,
+        roleArn="arn:aws:iam::000000000000:role/R",
+    )
+    ex = sfn.start_execution(
+        stateMachineArn=sm["stateMachineArn"],
+        input=json.dumps({"str1": str1, "str2": str2}),
+    )
+
+    desc = _wait_sfn(sfn, ex["executionArn"])
+    assert desc["status"] == "SUCCEEDED"
+    output = json.loads(desc["output"])
+    assert "MessageId" in output
+
+    msgs = sqs.receive_message(
+        QueueUrl=q_url,
+        MaxNumberOfMessages=1,
+        WaitTimeSeconds=1,
+    )
+    assert len(msgs.get("Messages", [])) == 1
+    envelope = json.loads(msgs["Messages"][0]["Body"])
+    assert json.loads(envelope["Message"]) == {
+        "str1": str1,
+        "str2": str2,
+    }
+
 
 def test_sfn_integration_dynamodb_put_get(sfn, ddb):
     """Task states write and read from DynamoDB."""
@@ -2274,6 +2462,78 @@ def test_sfn_integration_dynamodb_error_catch(sfn, ddb):
     output = json.loads(desc["output"])
     assert output["recovered"] == "caught"
     assert "Error" in output["error"]
+
+def test_sfn_integration_lambda_invoke_failure_cause_is_json(sfn, lam):
+    """A failed lambda:invoke task must set Cause to a JSON-encoded error
+    payload, exactly like AWS.
+
+    Regression: Cause was set to the bare ``errorMessage`` string instead of
+    the JSON object ``{"errorType": ..., "errorMessage": ..., "trace": [...]}``.
+    Catch handlers and downstream tasks routinely ``json.loads(Cause)`` to read
+    ``errorType`` / ``errorMessage``; the bare string made that parse blow up.
+    """
+    import uuid as _uuid
+
+    fn = f"intg-sfn-failcause-{_uuid.uuid4().hex[:8]}"
+    code = (
+        "class WidgetError(Exception):\n"
+        "    pass\n"
+        "def handler(event, context):\n"
+        "    raise WidgetError('widget exploded')\n"
+    )
+    lam.create_function(
+        FunctionName=fn,
+        Runtime="python3.12",
+        Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _make_zip(code)},
+    )
+    func_arn = f"arn:aws:lambda:us-east-1:000000000000:function:{fn}"
+
+    definition = json.dumps(
+        {
+            "StartAt": "Boom",
+            "States": {
+                "Boom": {
+                    "Type": "Task",
+                    "Resource": "arn:aws:states:::lambda:invoke",
+                    "Parameters": {"FunctionName": func_arn, "Payload": {}},
+                    "Catch": [
+                        {
+                            "ErrorEquals": ["States.ALL"],
+                            "Next": "Fallback",
+                            "ResultPath": "$.error",
+                        }
+                    ],
+                    "End": True,
+                },
+                "Fallback": {
+                    "Type": "Pass",
+                    "Result": "caught",
+                    "ResultPath": "$.recovered",
+                    "End": True,
+                },
+            },
+        }
+    )
+    sm = sfn.create_state_machine(
+        name=f"sfn-failcause-{_uuid.uuid4().hex[:8]}",
+        definition=definition,
+        roleArn="arn:aws:iam::000000000000:role/R",
+    )
+    ex = sfn.start_execution(stateMachineArn=sm["stateMachineArn"], input="{}")
+
+    desc = _wait_sfn(sfn, ex["executionArn"], timeout=30)
+    assert desc["status"] == "SUCCEEDED", desc.get("status")
+    output = json.loads(desc["output"])
+
+    # Cause must be a JSON-encoded string, parseable into the AWS error shape.
+    cause_raw = output["error"]["Cause"]
+    assert isinstance(cause_raw, str)
+    cause = json.loads(cause_raw)
+    assert cause.get("errorType"), cause
+    assert cause["errorMessage"] == "widget exploded", cause
+
 
 def test_sfn_integration_ecs_run_task(sfn, ecs):
     """Task state triggers ecs:runTask (fire-and-forget, no Docker needed)."""

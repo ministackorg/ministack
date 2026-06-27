@@ -46,6 +46,30 @@ DOCKER_NETWORK = os.environ.get("DOCKER_NETWORK", "")
 # CI/dev deterministic; flip to "1" to exercise sharded discovery.
 ELASTICACHE_CLUSTER_MODE_REAL = os.environ.get("ELASTICACHE_CLUSTER_MODE_REAL", "") == "1"
 
+# All default parameter group names verified against the AWS ElastiCache console.
+_DEFAULT_PARAM_GROUP_FAMILIES = [
+    ("default.memcached1.4", "memcached1.4", "Default parameter group for memcached1.4"),
+    ("default.memcached1.5", "memcached1.5", "Default parameter group for memcached1.5"),
+    ("default.memcached1.6", "memcached1.6", "Default parameter group for memcached1.6"),
+    ("default.redis2.6", "redis2.6", "Default parameter group for redis2.6"),
+    ("default.redis2.8", "redis2.8", "Default parameter group for redis2.8"),
+    ("default.redis3.2", "redis3.2", "Default parameter group for redis3.2"),
+    ("default.redis3.2.cluster.on", "redis3.2", "Customized default parameter group for redis3.2 with cluster mode on"),
+    ("default.redis4.0", "redis4.0", "Default parameter group for redis4.0"),
+    ("default.redis4.0.cluster.on", "redis4.0", "Customized default parameter group for redis4.0 with cluster mode on"),
+    ("default.redis5.0", "redis5.0", "Default parameter group for redis5.0"),
+    ("default.redis5.0.cluster.on", "redis5.0", "Customized default parameter group for redis5.0 with cluster mode on"),
+    ("default.redis6.x", "redis6.x", "Default parameter group for redis6.x"),
+    ("default.redis6.x.cluster.on", "redis6.x", "Customized default parameter group for redis6.x with cluster mode on"),
+    ("default.redis7", "redis7", "Default parameter group for redis7"),
+    ("default.redis7.cluster.on", "redis7", "Customized default parameter group for redis7 with cluster mode on"),
+    ("default.valkey7", "valkey7", "Default parameter group for valkey7"),
+    ("default.valkey7.cluster.on", "valkey7", "Customized default parameter group for valkey7 with cluster mode on"),
+    ("default.valkey8", "valkey8", "Default parameter group for valkey8"),
+    ("default.valkey8.cluster.on", "valkey8", "Customized default parameter group for valkey8 with cluster mode on"),
+]
+_DEFAULT_PARAM_GROUP_NAMES = {name for name, _family, _desc in _DEFAULT_PARAM_GROUP_FAMILIES}
+
 _clusters = AccountScopedDict()
 _replication_groups = AccountScopedDict()
 _subnet_groups = AccountScopedDict()
@@ -120,6 +144,7 @@ _respawn_lock = _threading.Lock()
 
 def restore_state(data):
     if not data:
+        default_state()
         return
     for name, rg in data.get("replication_groups", {}).items():
         # Wipe stale container ids — the old Docker containers are dead.
@@ -141,6 +166,7 @@ def restore_state(data):
         cl["CacheClusterStatus"] = "available"
         _clusters[name] = cl
         _pending_cluster_respawn.add(name)
+    default_state()
 
 
 def _ensure_live_containers():
@@ -215,15 +241,100 @@ def _ensure_live_containers_locked():
                 "on restart; endpoint will be unreachable", rg_id, exc_info=True)
 
 
-try:
-    _restored = load_state("elasticache")
-    if _restored:
-        restore_state(_restored)
-except Exception:
-    import logging
-    logging.getLogger(__name__).exception(
-        "Failed to restore persisted state; continuing with fresh store"
+# ── Seed default ElastiCache parameter groups ─────────────────
+# AWS always provides built-in "default.*" parameter groups.  Seed any that
+# are not already present (e.g. from restored state or user creation).
+def _seed_default_param_groups():
+    for _name, _family, _desc in _DEFAULT_PARAM_GROUP_FAMILIES:
+        if _name not in _param_groups:
+            _param_groups[_name] = {
+                "CacheParameterGroupName": _name,
+                "CacheParameterGroupFamily": _family,
+                "Description": _desc,
+                "IsGlobal": False,
+                "ARN": _arn_param_group(_name),
+            }
+            _param_group_params[_name] = _default_params_for_family(_family)
+
+
+def _stamp_replication_group_on_user_groups(rg_id, user_group_ids):
+    for group_id in user_group_ids:
+        group = _user_groups.get(group_id)
+        if not group:
+            continue
+        replication_groups = group.setdefault("ReplicationGroups", [])
+        if rg_id not in replication_groups:
+            replication_groups.append(rg_id)
+
+
+def _unstamp_replication_group_from_user_groups(rg_id, user_group_ids):
+    for group_id in user_group_ids:
+        group = _user_groups.get(group_id)
+        if not group:
+            continue
+        replication_groups = group.get("ReplicationGroups", [])
+        if rg_id in replication_groups:
+            replication_groups.remove(rg_id)
+
+
+def default_state():
+    _seed_default_param_groups()
+
+
+def _param_group_family_for_engine(engine, version):
+    engine = (engine or "redis").lower()
+    version = version or ""
+    parts = version.split(".")
+    major = parts[0] if parts and parts[0] else ""
+    minor = parts[1] if len(parts) > 1 else ""
+
+    if engine == "redis":
+        if major in {"2", "3", "4", "5"} and minor:
+            return f"redis{major}.{minor}"
+        if major == "6":
+            return "redis6.x"
+        if major == "7":
+            return "redis7"
+    elif engine == "memcached":
+        if major and minor:
+            return f"memcached{major}.{minor}"
+    elif engine == "valkey" and major:
+        return f"valkey{major}"
+
+    return f"{engine}{major}" if major else engine
+
+
+def _default_param_group_for_engine(engine, version, cluster_enabled=False):
+    family = _param_group_family_for_engine(engine, version)
+    name = f"default.{family}"
+    cluster_name = f"{name}.cluster.on"
+    if cluster_enabled and (cluster_name in _DEFAULT_PARAM_GROUP_NAMES or cluster_name in _param_groups):
+        return cluster_name
+    return name
+
+
+def _is_default_param_group(name):
+    return name in _DEFAULT_PARAM_GROUP_NAMES
+
+
+def _validate_create_replication_group_request(p):
+    for user_group_id in _extract_configs(p, "UserGroupIds", ("member", "UserGroupId")):
+        if user_group_id not in _user_groups:
+            return _error("UserGroupNotFound",
+                          "The user group was not found or does not exist", 404)
+    return None
+
+
+def _validate_modify_replication_group_request(p):
+    user_group_ids = (
+        _extract_configs(p, "UserGroupIdsToAdd", ("member",)) +
+        _extract_configs(p, "UserGroupIdsToRemove", ("member",))
     )
+    for user_group_id in user_group_ids:
+        if user_group_id not in _user_groups:
+            return _error("UserGroupNotFound",
+                          "The user group was not found or does not exist", 404)
+    return None
 
 
 def _get_docker():
@@ -701,7 +812,7 @@ def _create_cache_cluster(p):
     )
 
     subnet_group = _p(p, "CacheSubnetGroupName") or "default"
-    param_group_name = _p(p, "CacheParameterGroupName") or f"default.{engine}{engine_version[:3]}"
+    param_group_name = _p(p, "CacheParameterGroupName") or _default_param_group_for_engine(engine, engine_version)
 
     _clusters[cluster_id] = {
         "CacheClusterId": cluster_id,
@@ -739,9 +850,7 @@ def _create_cache_cluster(p):
         "_endpoint": {"Address": endpoint_host, "Port": endpoint_port},
     }
 
-    tags = _extract_tags(p)
-    if tags:
-        _tags[arn] = tags
+    _tags[arn] = _extract_tags(p)
 
     _record_event(cluster_id, "cache-cluster", "Cache cluster created")
     return _xml_cluster_response("CreateCacheClusterResponse", "CreateCacheClusterResult", _clusters[cluster_id])
@@ -841,12 +950,17 @@ def _create_replication_group(p):
     engine = _p(p, "Engine") or "redis"
     engine_version = _p(p, "EngineVersion") or "7.0.12"
     num_node_groups = int(_p(p, "NumNodeGroups") or "1")
-    replicas_per_node_group = int(_p(p, "ReplicasPerNodeGroup") or "1")
+    num_cache_clusters = int(_p(p, "NumCacheClusters") or "1")
+    replicas_per_node_group = int(_p(p, "ReplicasPerNodeGroup") or max(num_cache_clusters - 1, 0))
     arn = _arn_replication_group(rg_id)
 
     if rg_id in _replication_groups:
-        return _error("ReplicationGroupAlreadyExistsFault",
+        return _error("ReplicationGroupAlreadyExists",
                        f"Replication group {rg_id} already exists", 400)
+
+    validation_error = _validate_create_replication_group_request(p)
+    if validation_error:
+        return validation_error
 
     # AWS rejects NumNodeGroups=2: cluster-mode-enabled requires the redis-
     # cluster minimum of 3 masters; cluster-mode-disabled requires 1.
@@ -941,22 +1055,50 @@ def _create_replication_group(p):
     if num_node_groups > 1 and node_groups:
         config_ep = node_groups[0]["PrimaryEndpoint"]
 
+    user_group_ids = _extract_configs(p, "UserGroupIds", ("member", "UserGroupId"))
+    subnet_group = _p(p, "CacheSubnetGroupName") or "default"
+    cluster_mode = _p(p, "ClusterMode") or ("enabled" if num_node_groups > 1 else "disabled")
+    cluster_enabled = cluster_mode == "enabled"
+    param_group_name = _p(p, "CacheParameterGroupName") or _default_param_group_for_engine(
+        engine, engine_version, cluster_enabled=cluster_enabled)
+    maintenance_window = _p(p, "PreferredMaintenanceWindow") or "sun:05:00-sun:06:00"
+    snapshot_retention_limit = int(_p(p, "SnapshotRetentionLimit") or "0")
+    snapshot_window = _p(p, "SnapshotWindow") or "05:00-06:00"
+    security_groups = []
+    for sg_id in _extract_configs(p, "SecurityGroupIds", ("SecurityGroupId", "member")):
+        security_groups.append({"SecurityGroupId": sg_id, "Status": "active"})
+    log_delivery_configs = _extract_log_delivery_configs(p)
+    member_cluster_ids = []
+    for ng in node_groups:
+        for m in ng.get("NodeGroupMembers", []):
+            member_cluster_ids.append(m["CacheClusterId"])
+
     _replication_groups[rg_id] = {
         "ReplicationGroupId": rg_id,
         "Description": desc,
         "Status": "available",
-        "MemberClusters": [],
+        "MemberClusters": member_cluster_ids,
         "NodeGroups": node_groups,
         "SnapshottingClusterId": "",
-        "SnapshotRetentionLimit": int(_p(p, "SnapshotRetentionLimit") or "0"),
-        "SnapshotWindow": _p(p, "SnapshotWindow") or "05:00-06:00",
+        "SnapshotRetentionLimit": snapshot_retention_limit,
+        "SnapshotWindow": snapshot_window,
+        "Engine": engine,
+        "EngineVersion": engine_version,
         "ClusterEnabled": num_node_groups > 1,
+        "ClusterMode": cluster_mode,
         "CacheNodeType": node_type,
+        "CacheParameterGroupName": param_group_name,
+        "CacheSubnetGroupName": subnet_group,
+        "PreferredMaintenanceWindow": maintenance_window,
+        "SecurityGroups": security_groups,
         "AuthTokenEnabled": _p(p, "AuthToken") != "",
         "TransitEncryptionEnabled": _p(p, "TransitEncryptionEnabled", "false").lower() == "true",
         "AtRestEncryptionEnabled": _p(p, "AtRestEncryptionEnabled", "false").lower() == "true",
+        "AutoMinorVersionUpgrade": _p(p, "AutoMinorVersionUpgrade", "true").lower() == "true",
         "AutomaticFailover": "enabled" if _p(p, "AutomaticFailoverEnabled", "false").lower() == "true" else "disabled",
         "MultiAZ": "enabled" if _p(p, "MultiAZEnabled", "false").lower() == "true" else "disabled",
+        "LogDeliveryConfigurations": log_delivery_configs,
+        "UserGroupIds": user_group_ids,
         "ConfigurationEndpoint": config_ep,
         "ARN": arn,
         "_num_node_groups": num_node_groups,
@@ -964,11 +1106,55 @@ def _create_replication_group(p):
         "_docker_container_ids": container_ids,
     }
 
-    tags = _extract_tags(p)
-    if tags:
-        _tags[arn] = tags
+    _tags[arn] = _extract_tags(p)
+
+    for ng in node_groups:
+        for m in ng.get("NodeGroupMembers", []):
+            cluster_id = m["CacheClusterId"]
+            cluster_arn = _arn_cluster(cluster_id)
+            endpoint = m.get("ReadEndpoint", {}) or ng.get("PrimaryEndpoint", {})
+            _clusters[cluster_id] = {
+                "CacheClusterId": cluster_id,
+                "CacheClusterArn": cluster_arn,
+                "CacheClusterStatus": "available",
+                "Engine": engine,
+                "EngineVersion": engine_version,
+                "CacheNodeType": node_type,
+                "NumCacheNodes": 1,
+                "CacheClusterCreateTime": time.time(),
+                "PreferredAvailabilityZone": m.get("PreferredAvailabilityZone", f"{get_region()}a"),
+                "CacheParameterGroup": {
+                    "CacheParameterGroupName": param_group_name,
+                    "ParameterApplyStatus": "in-sync",
+                },
+                "CacheSubnetGroupName": subnet_group,
+                "AutoMinorVersionUpgrade": _p(p, "AutoMinorVersionUpgrade", "true").lower() == "true",
+                "SecurityGroups": security_groups,
+                "ReplicationGroupId": rg_id,
+                "SnapshotRetentionLimit": snapshot_retention_limit,
+                "SnapshotWindow": snapshot_window,
+                "PreferredMaintenanceWindow": maintenance_window,
+                "LogDeliveryConfigurations": log_delivery_configs,
+                "AtRestEncryptionEnabled": _p(p, "AtRestEncryptionEnabled", "false").lower() == "true",
+                "AuthTokenEnabled": _p(p, "AuthToken") != "",
+                "TransitEncryptionEnabled": _p(p, "TransitEncryptionEnabled", "false").lower() == "true",
+                "CacheNodes": [
+                    {
+                        "CacheNodeId": m.get("CacheNodeId", "0001"),
+                        "CacheNodeStatus": "available",
+                        "CacheNodeCreateTime": time.time(),
+                        "Endpoint": endpoint,
+                        "ParameterGroupStatus": "in-sync",
+                        "SourceCacheNodeId": "",
+                    }
+                ],
+                "_docker_container_id": None,
+                "_endpoint": endpoint,
+            }
+            _tags[cluster_arn] = _copy_tag_list(_tags[arn])
 
     _record_event(rg_id, "replication-group", "Replication group created")
+    _stamp_replication_group_on_user_groups(rg_id, user_group_ids)
     return _xml(200, "CreateReplicationGroupResponse",
         f"<CreateReplicationGroupResult><ReplicationGroup>{_rg_xml(_replication_groups[rg_id])}</ReplicationGroup></CreateReplicationGroupResult>")
 
@@ -990,7 +1176,12 @@ def _delete_replication_group(p):
                 logger.warning("ElastiCache: failed to remove RG container %s for %s: %s", cid, rg_id, e)
 
     _tags.pop(rg.get("ARN", ""), None)
+    for cluster_id in rg.get("MemberClusters") or []:
+        cluster = _clusters.pop(cluster_id, None)
+        if cluster:
+            _tags.pop(cluster.get("CacheClusterArn", ""), None)
     _record_event(rg_id, "replication-group", "Replication group deleted")
+    _unstamp_replication_group_from_user_groups(rg_id, rg.get("UserGroupIds", []))
     return _xml(200, "DeleteReplicationGroupResponse",
         f"<DeleteReplicationGroupResult><ReplicationGroup>{_rg_xml(rg)}</ReplicationGroup></DeleteReplicationGroupResult>")
 
@@ -1017,6 +1208,10 @@ def _modify_replication_group(p):
     if not rg:
         return _error("ReplicationGroupNotFoundFault", f"Replication group {rg_id} not found", 404)
 
+    validation_error = _validate_modify_replication_group_request(p)
+    if validation_error:
+        return validation_error
+
     if _p(p, "ReplicationGroupDescription"):
         rg["Description"] = _p(p, "ReplicationGroupDescription")
     if _p(p, "CacheNodeType"):
@@ -1033,6 +1228,20 @@ def _modify_replication_group(p):
         rg["EngineVersion"] = _p(p, "EngineVersion")
     if _p(p, "CacheParameterGroupName"):
         rg["CacheParameterGroupName"] = _p(p, "CacheParameterGroupName")
+
+    user_group_ids_to_add = _extract_configs(p, "UserGroupIdsToAdd", ("member",))
+    user_group_ids_to_remove = _extract_configs(p, "UserGroupIdsToRemove", ("member",))
+
+    rg_user_group_ids = rg.setdefault("UserGroupIds", [])
+    for group_id in user_group_ids_to_add:
+        if group_id not in rg_user_group_ids:
+            rg_user_group_ids.append(group_id)
+        _stamp_replication_group_on_user_groups(rg_id, [group_id])
+
+    for group_id in user_group_ids_to_remove:
+        if group_id in rg_user_group_ids:
+            rg_user_group_ids.remove(group_id)
+        _unstamp_replication_group_from_user_groups(rg_id, [group_id])
 
     _record_event(rg_id, "replication-group", "Replication group modified")
     return _xml(200, "ModifyReplicationGroupResponse",
@@ -1115,6 +1324,7 @@ def _create_subnet_group(p):
         "Subnets": subnets,
         "ARN": arn,
     }
+    _tags[arn] = []
     subnets_xml = "".join(
         f"<Subnet><SubnetIdentifier>{s['SubnetIdentifier']}</SubnetIdentifier>"
         f"<SubnetAvailabilityZone><Name>{s['SubnetAvailabilityZone']['Name']}</Name></SubnetAvailabilityZone>"
@@ -1197,8 +1407,11 @@ def _modify_subnet_group(p):
 
 def _create_param_group(p):
     name = _p(p, "CacheParameterGroupName")
-    family = _p(p, "CacheParameterGroupFamily") or "redis7.0"
+    family = _p(p, "CacheParameterGroupFamily") or _param_group_family_for_engine("redis", "7.0")
     desc = _p(p, "Description") or ""
+    if name in _param_groups:
+        return _error("CacheParameterGroupAlreadyExists",
+                      f"Cache parameter group {name} already exists.", 400)
     arn = _arn_param_group(name)
     _param_groups[name] = {
         "CacheParameterGroupName": name,
@@ -1208,6 +1421,9 @@ def _create_param_group(p):
         "ARN": arn,
     }
     _param_group_params[name] = _default_params_for_family(family)
+
+    _tags[arn] = _extract_tags(p)
+
     return _xml(200, "CreateCacheParameterGroupResponse",
         f"<CreateCacheParameterGroupResult><CacheParameterGroup>"
         f"<CacheParameterGroupName>{name}</CacheParameterGroupName>"
@@ -1238,6 +1454,9 @@ def _delete_param_group(p):
     name = _p(p, "CacheParameterGroupName")
     if name not in _param_groups:
         return _error("CacheParameterGroupNotFound", f"Cache parameter group {name} not found.", 404)
+    if _is_default_param_group(name):
+        return _error("InvalidCacheParameterGroupState",
+                      "Default cache parameter groups cannot be deleted.", 400)
     pg = _param_groups.pop(name, None)
     _param_group_params.pop(name, None)
     if pg:
@@ -1275,6 +1494,9 @@ def _modify_cache_parameter_group(p):
     if name not in _param_groups:
         return _error("CacheParameterGroupNotFound",
                        f"Parameter group {name} not found", 404)
+    if _is_default_param_group(name):
+        return _error("InvalidCacheParameterGroupState",
+                      "Default cache parameter groups cannot be modified.", 400)
     params = _param_group_params.setdefault(name, {})
 
     idx = 1
@@ -1300,9 +1522,12 @@ def _reset_cache_parameter_group(p):
     if name not in _param_groups:
         return _error("CacheParameterGroupNotFound",
                        f"Parameter group {name} not found", 404)
+    if _is_default_param_group(name):
+        return _error("InvalidCacheParameterGroupState",
+                      "Default cache parameter groups cannot be modified.", 400)
 
     reset_all = _p(p, "ResetAllParameters", "false").lower() == "true"
-    family = _param_groups[name].get("CacheParameterGroupFamily", "redis7.0")
+    family = _param_groups[name].get("CacheParameterGroupFamily", _param_group_family_for_engine("redis", "7.0"))
 
     if reset_all:
         _param_group_params[name] = _default_params_for_family(family)
@@ -1324,7 +1549,7 @@ def _reset_cache_parameter_group(p):
 
 def _default_params_for_family(family):
     """Seed with commonly queried Redis/Memcached default parameters."""
-    if family.startswith("redis"):
+    if family.startswith(("redis", "valkey")):
         return {
             "maxmemory-policy": {"Value": "volatile-lru", "Description": "Eviction policy",
                                  "Source": "system", "DataType": "string",
@@ -1349,6 +1574,16 @@ def _default_params_for_family(family):
     }
 
 
+try:
+    _restored = load_state("elasticache")
+    restore_state(_restored)
+except Exception:
+    import logging
+    logging.getLogger(__name__).exception(
+        "Failed to restore persisted state; continuing with fresh store"
+    )
+
+
 # ---- Engine Versions ----
 
 def _describe_engine_versions(p):
@@ -1357,7 +1592,7 @@ def _describe_engine_versions(p):
     # CacheEngineVersionList.member.locationName = "CacheEngineVersion"
     members = "".join(
         f"<CacheEngineVersion><Engine>{engine}</Engine><EngineVersion>{v}</EngineVersion>"
-        f"<CacheParameterGroupFamily>{engine}{v[:3]}</CacheParameterGroupFamily></CacheEngineVersion>"
+        f"<CacheParameterGroupFamily>{_param_group_family_for_engine(engine, v)}</CacheParameterGroupFamily></CacheEngineVersion>"
         for v in versions.get(engine, ["7.0.12"])
     )
     return _xml(200, "DescribeCacheEngineVersionsResponse",
@@ -1382,6 +1617,101 @@ def _extract_tags(p):
     return tags
 
 
+def _extract_configs(p, container, item_names):
+    values = []
+    for item_name in item_names:
+        idx = 1
+        while _p(p, f"{container}.{item_name}.{idx}"):
+            values.append(_p(p, f"{container}.{item_name}.{idx}"))
+            idx += 1
+        if values:
+            break
+    return values
+
+
+def _extract_log_delivery_configs(p):
+    configs = []
+    for prefix in (
+        "LogDeliveryConfigurations.LogDeliveryConfigurationRequest",
+        "LogDeliveryConfigurations.member",
+    ):
+        idx = 1
+        while (
+            _p(p, f"{prefix}.{idx}.LogType")
+            or _p(p, f"{prefix}.{idx}.Enabled")
+            or _p(p, f"{prefix}.{idx}.DestinationType")
+        ):
+            enabled = _p(p, f"{prefix}.{idx}.Enabled", "true").lower() == "true"
+            if enabled:
+                log_type = _p(p, f"{prefix}.{idx}.LogType")
+                log_group = _p(
+                    p,
+                    f"{prefix}.{idx}.DestinationDetails.CloudWatchLogsDetails.LogGroup",
+                )
+                configs.append({
+                    "DestinationDetails": {
+                        "CloudWatchLogsDetails": {"LogGroup": log_group},
+                    },
+                    "DestinationType": _p(p, f"{prefix}.{idx}.DestinationType") or "cloudwatch-logs",
+                    "LogFormat": _p(p, f"{prefix}.{idx}.LogFormat") or "text",
+                    "LogType": log_type,
+                    "Status": "active",
+                    "Message": "",
+                })
+            idx += 1
+        if configs:
+            break
+    return configs
+
+
+def _tag_list_to_map(tags):
+    return {t["Key"]: t.get("Value", "") for t in (tags or [])}
+
+
+def _tag_map_to_list(tag_map):
+    return [{"Key": k, "Value": v} for k, v in tag_map.items()]
+
+
+def _copy_tag_list(tags):
+    return [{"Key": t["Key"], "Value": t.get("Value", "")} for t in (tags or [])]
+
+
+def _replication_group_for_arn(arn):
+    parts = arn.split(":", 5)
+    if len(parts) < 6:
+        return None
+    resource_type, sep, resource_id = parts[5].partition(":")
+    if sep and resource_type == "replicationgroup":
+        return _replication_groups.get(resource_id)
+    return None
+
+
+def _propagate_replication_group_tags(arn):
+    rg = _replication_group_for_arn(arn)
+    if not rg:
+        return
+    tags = _copy_tag_list(_tags.get(arn, []))
+    for cluster_id in rg.get("MemberClusters") or []:
+        cluster = _clusters.get(cluster_id)
+        cluster_arn = cluster.get("CacheClusterArn") if cluster else _arn_cluster(cluster_id)
+        _tags[cluster_arn] = _copy_tag_list(tags)
+
+
+def _merge_tags_for_arn(arn, tags):
+    existing = _tag_list_to_map(_tags.get(arn, []))
+    existing.update(_tag_list_to_map(tags))
+    _tags[arn] = _tag_map_to_list(existing)
+    _propagate_replication_group_tags(arn)
+    return _tags[arn]
+
+
+def _remove_tag_keys_for_arn(arn, keys):
+    keys = set(keys or [])
+    _tags[arn] = [t for t in _tags.get(arn, []) if t["Key"] not in keys]
+    _propagate_replication_group_tags(arn)
+    return _tags[arn]
+
+
 def _list_tags(p):
     arn = _p(p, "ResourceName")
     arn, err = _resolve_taggable_elasticache_arn(arn)
@@ -1400,19 +1730,9 @@ def _add_tags(p):
     if err:
         return err
     new_tags = _extract_tags(p)
-    existing = _tags.setdefault(arn, [])
-    existing_keys = {t["Key"] for t in existing}
-    for t in new_tags:
-        if t["Key"] in existing_keys:
-            for e in existing:
-                if e["Key"] == t["Key"]:
-                    e["Value"] = t["Value"]
-                    break
-        else:
-            existing.append(t)
-            existing_keys.add(t["Key"])
+    tags = _merge_tags_for_arn(arn, new_tags)
 
-    tag_xml = "".join(f"<Tag><Key>{t['Key']}</Key><Value>{t['Value']}</Value></Tag>" for t in existing)
+    tag_xml = "".join(f"<Tag><Key>{t['Key']}</Key><Value>{t['Value']}</Value></Tag>" for t in tags)
     return _xml(200, "AddTagsToResourceResponse",
         f"<AddTagsToResourceResult><TagList>{tag_xml}</TagList></AddTagsToResourceResult>")
 
@@ -1427,10 +1747,7 @@ def _remove_tags(p):
     while _p(p, f"TagKeys.member.{idx}"):
         keys_to_remove.add(_p(p, f"TagKeys.member.{idx}"))
         idx += 1
-    if arn in _tags:
-        _tags[arn] = [t for t in _tags[arn] if t["Key"] not in keys_to_remove]
-
-    tags = _tags.get(arn, [])
+    tags = _remove_tag_keys_for_arn(arn, keys_to_remove)
     tag_xml = "".join(f"<Tag><Key>{t['Key']}</Key><Value>{t['Value']}</Value></Tag>" for t in tags)
     return _xml(200, "RemoveTagsFromResourceResponse",
         f"<RemoveTagsFromResourceResult><TagList>{tag_xml}</TagList></RemoveTagsFromResourceResult>")
@@ -1474,6 +1791,7 @@ def _create_snapshot(p):
             _snapshots[snapshot_name]["Engine"] = src.get("Engine", "redis")
             _snapshots[snapshot_name]["EngineVersion"] = src.get("EngineVersion", "7.0.12")
 
+    _tags[arn] = []
     _record_event(snapshot_name, "snapshot", "Snapshot created")
     return _xml(200, "CreateSnapshotResponse",
         f"<CreateSnapshotResult><Snapshot>{_snapshot_xml(_snapshots[snapshot_name])}</Snapshot></CreateSnapshotResult>")
@@ -1553,7 +1871,7 @@ def _create_user(p):
     if not user_id:
         return _error("InvalidParameterValue", "UserId is required", 400)
     if user_id in _users:
-        return _error("UserAlreadyExistsFault", f"User {user_id} already exists", 400)
+        return _error("UserAlreadyExists", f"User {user_id} already exists", 400)
 
     arn = _arn_user(user_id)
     user = {
@@ -1568,9 +1886,7 @@ def _create_user(p):
     }
     _users[user_id] = user
 
-    tags = _extract_tags(p)
-    if tags:
-        _tags[arn] = tags
+    _tags[arn] = _extract_tags(p)
 
     return _xml(200, "CreateUserResponse", f"<CreateUserResult>{_user_xml(user)}</CreateUserResult>")
 
@@ -1582,7 +1898,7 @@ def _describe_users(p):
     if user_id:
         user = _users.get(user_id)
         if not user:
-            return _error("UserNotFoundFault", f"User {user_id} not found", 404)
+            return _error("UserNotFound", f"User {user_id} not found", 404)
         users = [user]
     else:
         users = list(_users.values())
@@ -1598,7 +1914,7 @@ def _delete_user(p):
     user_id = _p(p, "UserId")
     user = _users.pop(user_id, None)
     if not user:
-        return _error("UserNotFoundFault", f"User {user_id} not found", 404)
+        return _error("UserNotFound", f"User {user_id} not found", 404)
     _tags.pop(user.get("ARN", ""), None)
     user["Status"] = "deleting"
     return _xml(200, "DeleteUserResponse", f"<DeleteUserResult>{_user_xml(user)}</DeleteUserResult>")
@@ -1608,7 +1924,7 @@ def _modify_user(p):
     user_id = _p(p, "UserId")
     user = _users.get(user_id)
     if not user:
-        return _error("UserNotFoundFault", f"User {user_id} not found", 404)
+        return _error("UserNotFound", f"User {user_id} not found", 404)
 
     if _p(p, "AccessString"):
         user["AccessString"] = _p(p, "AccessString")
@@ -1623,7 +1939,7 @@ def _create_user_group(p):
     if not group_id:
         return _error("InvalidParameterValue", "UserGroupId is required", 400)
     if group_id in _user_groups:
-        return _error("UserGroupAlreadyExistsFault", f"User group {group_id} already exists", 400)
+        return _error("UserGroupAlreadyExists", f"User group {group_id} already exists", 400)
 
     arn = _arn_user_group(group_id)
     user_ids = []
@@ -1647,9 +1963,7 @@ def _create_user_group(p):
         if uid in _users:
             _users[uid].setdefault("UserGroupIds", []).append(group_id)
 
-    tags = _extract_tags(p)
-    if tags:
-        _tags[arn] = tags
+    _tags[arn] = _extract_tags(p)
 
     return _xml(200, "CreateUserGroupResponse", f"<CreateUserGroupResult>{_user_group_xml(group)}</CreateUserGroupResult>")
 
@@ -1660,7 +1974,7 @@ def _describe_user_groups(p):
     if group_id:
         group = _user_groups.get(group_id)
         if not group:
-            return _error("UserGroupNotFoundFault", f"User group {group_id} not found", 404)
+            return _error("UserGroupNotFound", f"User group {group_id} not found", 404)
         groups = [group]
     else:
         groups = list(_user_groups.values())
@@ -1674,7 +1988,7 @@ def _delete_user_group(p):
     group_id = _p(p, "UserGroupId")
     group = _user_groups.pop(group_id, None)
     if not group:
-        return _error("UserGroupNotFoundFault", f"User group {group_id} not found", 404)
+        return _error("UserGroupNotFound", f"User group {group_id} not found", 404)
     _tags.pop(group.get("ARN", ""), None)
 
     for uid in group.get("UserIds", []):
@@ -1691,7 +2005,7 @@ def _modify_user_group(p):
     group_id = _p(p, "UserGroupId")
     group = _user_groups.get(group_id)
     if not group:
-        return _error("UserGroupNotFoundFault", f"User group {group_id} not found", 404)
+        return _error("UserGroupNotFound", f"User group {group_id} not found", 404)
 
     to_add = []
     idx = 1
@@ -1753,6 +2067,42 @@ def _user_group_xml(g):
 
 # ---- XML helpers ----
 
+def _security_groups_xml(groups):
+    xml = ""
+    for g in groups or []:
+        xml += (
+            f"<member><SecurityGroupId>{g.get('SecurityGroupId', '')}</SecurityGroupId>"
+            f"<Status>{g.get('Status', 'active')}</Status></member>"
+        )
+    return xml
+
+
+def _log_delivery_configs_xml(configs):
+    items = []
+    for config in configs or []:
+        destination = config.get("DestinationDetails", {})
+        cloudwatch = destination.get("CloudWatchLogsDetails", {})
+        log_group = cloudwatch.get("LogGroup", "")
+        destination_xml = ""
+        if log_group:
+            destination_xml = (
+                f"<DestinationDetails><CloudWatchLogsDetails>"
+                f"<LogGroup>{log_group}</LogGroup>"
+                f"</CloudWatchLogsDetails></DestinationDetails>"
+            )
+        items.append(
+            f"<LogDeliveryConfiguration>"
+            f"{destination_xml}"
+            f"<DestinationType>{config.get('DestinationType', 'cloudwatch-logs')}</DestinationType>"
+            f"<LogFormat>{config.get('LogFormat', 'text')}</LogFormat>"
+            f"<LogType>{config.get('LogType', '')}</LogType>"
+            f"<Status>{config.get('Status', 'active')}</Status>"
+            f"<Message>{config.get('Message', '')}</Message>"
+            f"</LogDeliveryConfiguration>"
+        )
+    return "".join(items)
+
+
 def _cluster_xml_inner(c):
     """Render cluster fields — no wrapping element."""
     ep = c.get("_endpoint", {})
@@ -1783,6 +2133,9 @@ def _cluster_xml_inner(c):
             f"{src_xml}"
             f"</CacheNode>"
         )
+    parameter_group = c.get("CacheParameterGroup", {})
+    security_groups_xml = _security_groups_xml(c.get("SecurityGroups", []))
+    log_delivery_configs_xml = _log_delivery_configs_xml(c.get("LogDeliveryConfigurations", []))
     return (
         f"<CacheClusterId>{c['CacheClusterId']}</CacheClusterId>"
         f"<CacheClusterStatus>{c['CacheClusterStatus']}</CacheClusterStatus>"
@@ -1793,10 +2146,15 @@ def _cluster_xml_inner(c):
         f"<CacheClusterArn>{c['CacheClusterArn']}</CacheClusterArn>"
         f"<ARN>{c.get('CacheClusterArn', '')}</ARN>"
         f"<PreferredAvailabilityZone>{c.get('PreferredAvailabilityZone', '')}</PreferredAvailabilityZone>"
+        f"<PreferredMaintenanceWindow>{c.get('PreferredMaintenanceWindow', '')}</PreferredMaintenanceWindow>"
+        f"<CacheParameterGroup><CacheParameterGroupName>{parameter_group.get('CacheParameterGroupName', '')}</CacheParameterGroupName>"
+        f"<ParameterApplyStatus>{parameter_group.get('ParameterApplyStatus', 'in-sync')}</ParameterApplyStatus></CacheParameterGroup>"
         f"<CacheSubnetGroupName>{c.get('CacheSubnetGroupName', '')}</CacheSubnetGroupName>"
+        f"<SecurityGroups>{security_groups_xml}</SecurityGroups>"
         f"<ReplicationGroupId>{c.get('ReplicationGroupId', '')}</ReplicationGroupId>"
         f"<SnapshotRetentionLimit>{c.get('SnapshotRetentionLimit', 0)}</SnapshotRetentionLimit>"
         f"<SnapshotWindow>{c.get('SnapshotWindow', '')}</SnapshotWindow>"
+        f"<LogDeliveryConfigurations>{log_delivery_configs_xml}</LogDeliveryConfigurations>"
         f"<CacheNodes>{nodes_xml}</CacheNodes>"
     )
 
@@ -1849,21 +2207,34 @@ def _rg_xml(rg):
             f"<Port>{cep['Port']}</Port></ConfigurationEndpoint>"
         )
 
+    member_clusters_xml = ""
+    for cluster_id in rg.get("MemberClusters", []):
+        member_clusters_xml += f"<ClusterId>{cluster_id}</ClusterId>"
+    user_group_ids_xml = ""
+    for user_group_id in rg.get("UserGroupIds", []):
+        user_group_ids_xml += f"<member>{user_group_id}</member>"
+    log_delivery_configs_xml = _log_delivery_configs_xml(rg.get("LogDeliveryConfigurations", []))
     return (
         f"<ReplicationGroupId>{rg['ReplicationGroupId']}</ReplicationGroupId>"
         f"<Description>{rg.get('Description', '')}</Description>"
         f"<Status>{rg['Status']}</Status>"
+        f"<Engine>{rg.get('Engine', 'redis')}</Engine>"
         f"<CacheNodeType>{rg.get('CacheNodeType', 'cache.t3.micro')}</CacheNodeType>"
         f"<AutomaticFailover>{rg.get('AutomaticFailover', 'disabled')}</AutomaticFailover>"
+        f"<AutoMinorVersionUpgrade>{str(rg.get('AutoMinorVersionUpgrade', False)).lower()}</AutoMinorVersionUpgrade>"
         f"<MultiAZ>{rg.get('MultiAZ', 'disabled')}</MultiAZ>"
         f"<ClusterEnabled>{str(rg.get('ClusterEnabled', False)).lower()}</ClusterEnabled>"
+        f"<ClusterMode>{rg.get('ClusterMode', 'enabled' if rg.get('ClusterEnabled', False) else 'disabled')}</ClusterMode>"
         f"<AuthTokenEnabled>{str(rg.get('AuthTokenEnabled', False)).lower()}</AuthTokenEnabled>"
         f"<TransitEncryptionEnabled>{str(rg.get('TransitEncryptionEnabled', False)).lower()}</TransitEncryptionEnabled>"
         f"<AtRestEncryptionEnabled>{str(rg.get('AtRestEncryptionEnabled', False)).lower()}</AtRestEncryptionEnabled>"
         f"<SnapshotRetentionLimit>{rg.get('SnapshotRetentionLimit', 0)}</SnapshotRetentionLimit>"
         f"<SnapshotWindow>{rg.get('SnapshotWindow', '')}</SnapshotWindow>"
         f"{config_ep_xml}"
+        f"<MemberClusters>{member_clusters_xml}</MemberClusters>"
         f"<NodeGroups>{node_groups_xml}</NodeGroups>"
+        f"<LogDeliveryConfigurations>{log_delivery_configs_xml}</LogDeliveryConfigurations>"
+        f"<UserGroupIds>{user_group_ids_xml}</UserGroupIds>"
         f"<ARN>{rg['ARN']}</ARN>"
     )
 
@@ -1951,3 +2322,4 @@ def reset():
     _events.clear()
     _tags.clear()   # was missing from reset() — HIGH-severity gap from audit
     _port_counter[0] = BASE_PORT
+    default_state()

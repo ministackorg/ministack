@@ -1082,7 +1082,14 @@ def _create_db_instance(p):
                 logger.warning("RDS: Docker failed for %s: %s", db_id, e)
 
     cluster_id = cluster_id_param
-    param_group_name = _p(p, "DBParameterGroupName") or f"default.{engine}{engine_version.split('.')[0]}"
+    explicit_pg = _p(p, "DBParameterGroupName")
+    # AWS rejects a reference to a parameter group that doesn't exist. Validate
+    # custom names against the store; AWS-managed `default.*` groups are implicit
+    # and not tracked here, so they're accepted as-is.
+    if explicit_pg and not explicit_pg.startswith("default.") and explicit_pg not in _param_groups:
+        return _error("DBParameterGroupNotFound",
+                      f"DBParameterGroup {explicit_pg} not found.", 404)
+    param_group_name = explicit_pg or f"default.{engine}{engine_version.split('.')[0]}"
     now_ts = time.time()
 
     vpc_sgs = _parse_member_list(p, "VpcSecurityGroupIds")
@@ -1649,6 +1656,12 @@ def _create_db_cluster(p):
             f"Global cluster {global_cluster_id} already has a member in {get_region()}.",
             400,
         )
+
+    explicit_cpg = _p(p, "DBClusterParameterGroupName")
+    if (explicit_cpg and not explicit_cpg.startswith("default.")
+            and explicit_cpg not in _db_cluster_param_groups):
+        return _error("DBClusterParameterGroupNotFound",
+                      f"DBClusterParameterGroup {explicit_cpg} not found.", 404)
 
     engine = _p(p, "Engine") or "aurora-postgresql"
     if global_cluster:

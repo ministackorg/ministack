@@ -1615,10 +1615,36 @@ def _invoke_with_callback(resource, input_data, token, state_def):
         func_ref = _resolve_lambda_function_ref(func_ref, optimized=True)
 
     if func_ref:
+        # For lambda:invoke[.waitForTaskToken] the resolved Parameters wrap the
+        # Lambda event under "Payload" (alongside "FunctionName"). Deliver only
+        # the Payload, mirroring the synchronous lambda:invoke path
+        # (_invoke_resource). Otherwise the handler receives the integration
+        # envelope ({"FunctionName": ..., "Payload": {...}}) instead of its
+        # input and fails to find the task token / its arguments.
+        lambda_payload = input_data.get("Payload", input_data) \
+            if isinstance(input_data, dict) else input_data
         try:
-            _call_lambda(func_ref, input_data)
+            _call_lambda(func_ref, lambda_payload)
         except _ExecutionError:
             pass
+    else:
+        # Non-Lambda service integrations (sqs:sendMessage, sns:publish, …) must
+        # actually perform the call — delivering the payload that carries the
+        # task token — before we block for the callback. Without this the task is
+        # scheduled but nothing is ever sent and the execution hangs forever
+        # (#959). A failed integration fails the task (propagates) rather than
+        # hanging.
+        try:
+            for prefix, handler in _SERVICE_DISPATCH.items():
+                if clean_resource.startswith(prefix):
+                    handler(clean_resource, input_data)
+                    break
+            else:
+                if "aws-sdk:" in clean_resource:
+                    _invoke_aws_sdk_integration(clean_resource, input_data)
+        except _ExecutionError:
+            _task_tokens.pop(token, None)
+            raise
 
     timeout = state_def.get("TimeoutSeconds", 99999)
     if not evt.wait(timeout=timeout):
@@ -1658,9 +1684,15 @@ def _call_lambda(func_ref, event):
     if result.get("error"):
         body = result.get("body", {})
         if isinstance(body, dict):
+            # AWS reports a failed Lambda task with Error set to the function's
+            # errorType and Cause set to a JSON-encoded string of the error
+            # payload ({"errorType": ..., "errorMessage": ..., "trace": [...]}),
+            # NOT the bare errorMessage. Consumers (Catch handlers, downstream
+            # tasks) routinely json.loads(Cause) to read errorType/errorMessage,
+            # so emit the JSON form to match.
             raise _ExecutionError(
                 body.get("errorType", "Lambda.Unknown"),
-                body.get("errorMessage", str(body)))
+                json.dumps(body))
         raise _ExecutionError("Lambda.Unknown", str(body))
 
     body = result.get("body")
@@ -3976,7 +4008,13 @@ def _invoke_sqs_send_message(resource, input_data):
         return input_data
     try:
         url = input_data.get("QueueUrl", "")
-        result = sqs._act_send_message(input_data, url)
+        payload = dict(input_data)
+        body = payload.get("MessageBody")
+        if isinstance(body, (dict, list)):
+            # SFN serialises an object MessageBody to JSON text before calling
+            # SQS (which requires a string body).
+            payload["MessageBody"] = json.dumps(body)
+        result = sqs._act_send_message(payload, url)
         return result
     except sqs._Err as e:
         raise _ExecutionError(f"SQS.{e.code}", e.message)

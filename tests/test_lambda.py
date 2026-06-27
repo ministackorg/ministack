@@ -1206,6 +1206,7 @@ def test_lambda_esm_filter_criteria_stored_on_create(lam, sqs):
     lam.delete_event_source_mapping(UUID=esm_uuid)
 
 
+
 def test_lambda_event_source_mapping_rejects_missing_function_qualifier(lam, sqs):
     fn_name = f"esm-missing-qualifier-{_uuid_mod.uuid4().hex[:8]}"
     created = lam.create_function(

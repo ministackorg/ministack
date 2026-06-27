@@ -128,21 +128,38 @@ _AWS_SPECIFIC_TYPES = {
 }
 
 
-def _resolve_parameters(template: dict, provided_params: list[dict]) -> dict:
+def _resolve_parameters(template: dict, provided_params: list[dict],
+                        previous_params: dict | None = None) -> dict:
     """Resolve template parameters with provided values and defaults.
+
+    ``previous_params`` (a prior {name: {Value, NoEcho}} map) is consulted for
+    parameters sent with ``UsePreviousValue=true`` — which is how
+    ``aws cloudformation deploy`` re-sends existing parameters when no
+    ``--parameter-overrides`` are given.
 
     Returns dict of param_name -> {Value, NoEcho}.
     """
     param_defs = template.get("Parameters", {})
-    provided_map = {p["Key"]: p["Value"] for p in provided_params if "Key" in p}
+    provided_map = {p["Key"]: p for p in provided_params if "Key" in p}
+    previous_params = previous_params or {}
     resolved = {}
 
     for name, defn in param_defs.items():
         ptype = defn.get("Type", "String")
         no_echo = str(defn.get("NoEcho", "false")).lower() == "true"
 
-        if name in provided_map:
-            value = provided_map[name]
+        entry = provided_map.get(name)
+        if entry is not None and entry.get("UsePreviousValue"):
+            prev = previous_params.get(name)
+            if prev is not None:
+                value = prev["Value"] if isinstance(prev, dict) else prev
+            elif "Default" in defn:
+                value = defn["Default"]
+            else:
+                raise ValueError(
+                    f"Parameter '{name}' has no previous value and no Default")
+        elif entry is not None:
+            value = entry.get("Value", "")
         elif "Default" in defn:
             value = defn["Default"]
         else:

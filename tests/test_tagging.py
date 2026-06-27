@@ -1,6 +1,7 @@
 import io
 import os
 import uuid
+import uuid as _uuid_mod
 import zipfile
 
 import boto3
@@ -41,6 +42,10 @@ def _lambda_zip():
     with zipfile.ZipFile(buf, "w") as zf:
         zf.writestr("index.py", "def handler(event, context):\n    return 'ok'\n")
     return buf.getvalue()
+
+
+def _uid():
+    return _uuid_mod.uuid4().hex[:8]
 
 
 # ========== S3 ==========
@@ -764,8 +769,8 @@ def test_tagging_tag_resources_kms_forged_region_arn_does_not_mutate_key(kms_cli
     )
 
     entry = resp["FailedResourcesMap"][forged_region_arn]
-    assert entry["ErrorCode"] == "ResourceNotFound"
-    assert entry["StatusCode"] == 404
+    assert entry["ErrorCode"] == "InvalidParameterException"
+    assert entry["StatusCode"] == 400
     assert _TAG_KEY not in {t["TagKey"] for t in kms_client.list_resource_tags(KeyId=key_id)["Tags"]}
 
 
@@ -866,13 +871,13 @@ def test_tagging_tag_resources_missing_account_arn_fails_request_before_mutation
 
 def test_tagging_tag_resources_missing_lambda_surfaces_in_failed_map(tagging):
     """Tagging a Lambda that does not exist in the caller's account surfaces
-    ResourceNotFound in FailedResourcesMap instead of silently no-op'ing."""
+    a failure in FailedResourcesMap instead of silently no-op'ing."""
     arn = "arn:aws:lambda:us-east-1:000000000000:function:no-such-fn-tag-missing"
     resp = tagging.tag_resources(ResourceARNList=[arn], Tags={"k": "v"})
     assert arn in resp["FailedResourcesMap"]
     entry = resp["FailedResourcesMap"][arn]
-    assert entry["ErrorCode"] == "ResourceNotFound"
-    assert entry["StatusCode"] == 404
+    assert entry["ErrorCode"] == "InvalidParameterException"
+    assert entry["StatusCode"] == 400
 
 
 def test_tagging_tag_resources_foreign_region_lambda_arn_fails_request_without_mutating_functions(lam, tagging):
@@ -1000,8 +1005,8 @@ def test_tagging_untag_missing_sns_surfaces_in_failed_map(tagging):
     resp = tagging.untag_resources(ResourceARNList=[arn], TagKeys=["k"])
     assert arn in resp["FailedResourcesMap"]
     entry = resp["FailedResourcesMap"][arn]
-    assert entry["ErrorCode"] == "ResourceNotFound"
-    assert entry["StatusCode"] == 404
+    assert entry["ErrorCode"] == "InvalidParameterException"
+    assert entry["StatusCode"] == 400
 
 
 def test_tagging_untag_missing_backup_resources_surface_in_failed_map(tagging):
@@ -1014,8 +1019,8 @@ def test_tagging_untag_missing_backup_resources_surface_in_failed_map(tagging):
 
     for arn in arns:
         entry = resp["FailedResourcesMap"][arn]
-        assert entry["ErrorCode"] == "ResourceNotFound"
-        assert entry["StatusCode"] == 404
+        assert entry["ErrorCode"] == "InvalidParameterException"
+        assert entry["StatusCode"] == 400
 
 
 def test_tagging_tag_resources_cross_account_isolation(s3):
@@ -1052,6 +1057,152 @@ def test_tagging_tag_resources_cross_account_isolation(s3):
     arns_a = [r["ResourceARN"] for r in resp_a["ResourceTagMappingList"]]
     assert arn_a in arns_a
 
+
+# ========== ElastiCache ==========
+
+def test_tagging_get_resources_elasticache_tagged(tagging, ec):
+    """GetResources returns ElastiCache resources that have been tagged."""
+    ec.create_cache_cluster(
+        CacheClusterId="tg-ec-tagged",
+        Engine="redis",
+        CacheNodeType="cache.t3.micro",
+        NumCacheNodes=1,
+    )
+    arn = "arn:aws:elasticache:us-east-1:000000000000:cluster:tg-ec-tagged"
+    ec.add_tags_to_resource(
+        ResourceName=arn,
+        Tags=[{"Key": _TAG_KEY, "Value": "ec-tagged"}],
+    )
+
+    resp = tagging.get_resources(TagFilters=[{"Key": _TAG_KEY, "Values": ["ec-tagged"]}])
+    arns = [r["ResourceARN"] for r in resp["ResourceTagMappingList"]]
+    assert arn in arns
+
+
+def test_tagging_get_resources_elasticache_untagged(tagging, ec):
+    """GetResources with ResourceTypeFilters returns untagged ElastiCache resources."""
+    ec.create_cache_cluster(
+        CacheClusterId="tg-ec-untagged",
+        Engine="redis",
+        CacheNodeType="cache.t3.micro",
+        NumCacheNodes=1,
+    )
+    arn = "arn:aws:elasticache:us-east-1:000000000000:cluster:tg-ec-untagged"
+
+    resp = tagging.get_resources(ResourceTypeFilters=["elasticache"])
+    arns = [r["ResourceARN"] for r in resp["ResourceTagMappingList"]]
+    assert arn in arns
+
+
+def test_tagging_get_resources_elasticache_type_filter(tagging, ec, s3):
+    """ResourceTypeFilters=["elasticache"] excludes non-elasticache resources."""
+    ec.create_cache_cluster(
+        CacheClusterId="tg-ec-filter",
+        Engine="redis",
+        CacheNodeType="cache.t3.micro",
+        NumCacheNodes=1,
+    )
+    ec_arn = "arn:aws:elasticache:us-east-1:000000000000:cluster:tg-ec-filter"
+    ec.add_tags_to_resource(
+        ResourceName=ec_arn,
+        Tags=[{"Key": _TAG_KEY, "Value": "ec-filter"}],
+    )
+    s3.create_bucket(Bucket="tg-ec-filter-s3")
+    s3.put_bucket_tagging(Bucket="tg-ec-filter-s3", Tagging={
+        "TagSet": [{"Key": _TAG_KEY, "Value": "ec-filter"}]
+    })
+
+    resp = tagging.get_resources(
+        TagFilters=[{"Key": _TAG_KEY, "Values": ["ec-filter"]}],
+        ResourceTypeFilters=["elasticache"],
+    )
+    arns = [r["ResourceARN"] for r in resp["ResourceTagMappingList"]]
+    assert ec_arn in arns
+    assert "arn:aws:s3:::tg-ec-filter-s3" not in arns
+
+
+def test_tagging_tag_resources_elasticache(tagging, ec):
+    """TagResources on a valid ElastiCache ARN succeeds."""
+    ec.create_cache_cluster(
+        CacheClusterId="tg-ec-tr",
+        Engine="redis",
+        CacheNodeType="cache.t3.micro",
+        NumCacheNodes=1,
+    )
+    arn = "arn:aws:elasticache:us-east-1:000000000000:cluster:tg-ec-tr"
+    resp = tagging.tag_resources(ResourceARNList=[arn], Tags={_TAG_KEY: "ec-tr"})
+    assert resp["FailedResourcesMap"] == {}
+
+    check = tagging.get_resources(TagFilters=[{"Key": _TAG_KEY, "Values": ["ec-tr"]}])
+    assert any(r["ResourceARN"] == arn for r in check["ResourceTagMappingList"])
+
+
+def test_tagging_tag_resources_elasticache_replication_group_propagates_to_members(tagging, ec):
+    """TagResources/UntagResources on a replication group fan out to member clusters."""
+    rg_id = f"tg-ec-rg-{_uid()}"
+    ec.create_replication_group(
+        ReplicationGroupId=rg_id,
+        ReplicationGroupDescription="Tagging API fanout",
+        CacheNodeType="cache.t3.micro",
+        NumCacheClusters=2,
+    )
+    rg = ec.describe_replication_groups(ReplicationGroupId=rg_id)["ReplicationGroups"][0]
+    rg_arn = rg["ARN"]
+    member_id = rg["MemberClusters"][0]
+    member = ec.describe_cache_clusters(CacheClusterId=member_id)["CacheClusters"][0]
+    member_arn = member["ARN"]
+
+    resp = tagging.tag_resources(ResourceARNList=[rg_arn], Tags={_TAG_KEY: "ec-rg-tr"})
+    assert resp["FailedResourcesMap"] == {}
+    member_tags = ec.list_tags_for_resource(ResourceName=member_arn)["TagList"]
+    assert {t["Key"]: t["Value"] for t in member_tags}[_TAG_KEY] == "ec-rg-tr"
+
+    resp = tagging.untag_resources(ResourceARNList=[rg_arn], TagKeys=[_TAG_KEY])
+    assert resp["FailedResourcesMap"] == {}
+    member_tags = ec.list_tags_for_resource(ResourceName=member_arn)["TagList"]
+    assert not any(t["Key"] == _TAG_KEY for t in member_tags)
+
+    ec.delete_replication_group(ReplicationGroupId=rg_id)
+
+
+def test_tagging_tag_resources_elasticache_nonexistent(tagging):
+    """TagResources on a non-existent ElastiCache ARN returns InvalidParameterException."""
+    arn = "arn:aws:elasticache:us-east-1:000000000000:cluster:no-such-cluster"
+    resp = tagging.tag_resources(ResourceARNList=[arn], Tags={_TAG_KEY: "fail"})
+    assert arn in resp["FailedResourcesMap"]
+    entry = resp["FailedResourcesMap"][arn]
+    assert entry["ErrorCode"] == "InvalidParameterException"
+    assert entry["StatusCode"] == 400
+
+
+def test_tagging_untag_resources_elasticache_nonexistent(tagging):
+    """UntagResources on a non-existent ElastiCache ARN returns InvalidParameterException."""
+    arn = "arn:aws:elasticache:us-east-1:000000000000:replicationgroup:no-such-rg"
+    resp = tagging.untag_resources(ResourceARNList=[arn], TagKeys=[_TAG_KEY])
+    assert arn in resp["FailedResourcesMap"]
+    entry = resp["FailedResourcesMap"][arn]
+    assert entry["ErrorCode"] == "InvalidParameterException"
+    assert entry["StatusCode"] == 400
+
+
+def test_tagging_untag_resources_elasticache(tagging, ec):
+    """UntagResources removes tags from a valid ElastiCache resource."""
+    ec.create_cache_cluster(
+        CacheClusterId="tg-ec-utr",
+        Engine="redis",
+        CacheNodeType="cache.t3.micro",
+        NumCacheNodes=1,
+    )
+    arn = "arn:aws:elasticache:us-east-1:000000000000:cluster:tg-ec-utr"
+    tagging.tag_resources(ResourceARNList=[arn], Tags={_TAG_KEY: "ec-utr"})
+    resp = tagging.untag_resources(ResourceARNList=[arn], TagKeys=[_TAG_KEY])
+    assert resp["FailedResourcesMap"] == {}
+
+    check = tagging.get_resources(TagFilters=[{"Key": _TAG_KEY, "Values": ["ec-utr"]}])
+    assert not any(r["ResourceARN"] == arn for r in check["ResourceTagMappingList"])
+
+
+# ========== Module reset ==========
 
 def test_tagging_module_exposes_no_op_reset():
     """Tag dispatcher is stateless (delegates to per-service tag stores), but

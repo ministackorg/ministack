@@ -398,6 +398,27 @@ def test_athena_engine_mock_via_config(athena):
     urllib.request.urlopen(req2, timeout=5)
 
 
+def test_athena_table_metadata_includes_partition_keys(athena, glue):
+    """GetTableMetadata / ListTableMetadata surface the Glue table's real columns
+    and partition keys rather than empty stubs (#1423)."""
+    glue.create_database(DatabaseInput={"Name": "md_db"})
+    glue.create_table(DatabaseName="md_db", TableInput={
+        "Name": "events",
+        "StorageDescriptor": {"Columns": [{"Name": "id", "Type": "bigint"}]},
+        "PartitionKeys": [{"Name": "dt", "Type": "string"}],
+    })
+    md = athena.get_table_metadata(
+        CatalogName="AwsDataCatalog", DatabaseName="md_db",
+        TableName="events")["TableMetadata"]
+    assert [c["Name"] for c in md["Columns"]] == ["id"]
+    assert [p["Name"] for p in md["PartitionKeys"]] == ["dt"]
+    lst = athena.list_table_metadata(
+        CatalogName="AwsDataCatalog", DatabaseName="md_db")["TableMetadataList"]
+    assert any(
+        t["Name"] == "events" and [p["Name"] for p in t["PartitionKeys"]] == ["dt"]
+        for t in lst)
+
+
 def test_athena_mixed_glue_and_s3_uri(athena, glue, monkeypatch, tmp_path):
     bucket_name = "athena-results"
     db_name = "test_db_athena_glue_s3"

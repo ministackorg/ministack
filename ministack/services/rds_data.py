@@ -328,16 +328,28 @@ def _connect(instance, engine, database=None, password=None,
     else:
         try:
             import psycopg2
+            import psycopg2.extras
         except ImportError:
             raise ImportError(
                 "psycopg2 is required for PostgreSQL/Aurora PostgreSQL rds-data support. "
                 "Install with: pip install psycopg2-binary"
             )
         pg_user = username or instance.get("MasterUsername", "admin")
-        return psycopg2.connect(
+        conn = psycopg2.connect(
             host=host, port=int(port), user=pg_user,
             password=pw, dbname=db or "postgres",
         )
+        # Parity with the pymysql branch: a non-transactional ExecuteStatement
+        # must commit, otherwise psycopg2's implicit transaction is rolled back
+        # when the connection closes and the write is lost.
+        conn.autocommit = True
+        # Aurora Data API returns json/jsonb as its stored JSON *text*. Stop
+        # psycopg2 from auto-parsing it into a dict/list (which _field_value
+        # would then emit as an invalid single-quoted Python repr). Scoped to
+        # this connection so other psycopg2 users are unaffected.
+        psycopg2.extras.register_default_json(conn_or_curs=conn, loads=lambda x: x)
+        psycopg2.extras.register_default_jsonb(conn_or_curs=conn, loads=lambda x: x)
+        return conn
 
 
 def _field_value(val, type_name=None):
@@ -381,6 +393,32 @@ def _column_metadata(description, engine):
             "typeName": "VARCHAR",
         })
     return metadata
+
+
+# A :name placeholder: a colon (not part of a "::" cast) followed by a word
+# token. Greedy \w+ consumes the whole name in one match, so ":1" and ":10"
+# are distinct tokens rather than one being a substring shadow of the other.
+_RE_NAMED_PARAM = re.compile(r"(?<!:):(\w+)")
+
+
+def _substitute_named_params(sql, param_names):
+    """Rewrite :name placeholders to DB-API %(name)s in a single pass.
+
+    AWS treats each :name as a distinct token, so a naive substring replace of
+    ":1" corrupts ":10" (the repro in #957). Matching whole tokens once, left to
+    right, makes them distinct regardless of length or order, leaves a "::type"
+    cast intact, and passes through any ":word" that is not a supplied parameter
+    (so it reaches the engine unchanged instead of becoming a bad placeholder).
+    """
+    if not param_names:
+        return sql
+    names = set(param_names)
+
+    def _repl(match):
+        name = match.group(1)
+        return f"%({name})s" if name in names else match.group(0)
+
+    return _RE_NAMED_PARAM.sub(_repl, sql)
 
 
 def _convert_parameters(parameters):
@@ -464,10 +502,7 @@ def _execute_statement(data):
 
     # Convert :name placeholders to %(name)s for DB-API
     params = _convert_parameters(parameters)
-    exec_sql = sql
-    if params:
-        for name in params:
-            exec_sql = exec_sql.replace(f":{name}", f"%({name})s")
+    exec_sql = _substitute_named_params(sql, params)
 
     own_conn = False
     conn = None
@@ -643,11 +678,8 @@ def _batch_execute_statement(data):
             update_results.append({"generatedFields": []})
         else:
             # Convert :name placeholders to %(name)s for DB-API
-            exec_sql = sql
-            if parameter_sets:
-                sample = _convert_parameters(parameter_sets[0])
-                for name in sample:
-                    exec_sql = exec_sql.replace(f":{name}", f"%({name})s")
+            sample = _convert_parameters(parameter_sets[0])
+            exec_sql = _substitute_named_params(sql, sample)
 
             for param_set in parameter_sets:
                 params = _convert_parameters(param_set)

@@ -1690,9 +1690,7 @@ def _custom_resource_delete(physical_id, props, stack_name=None, logical_id=None
 # --- API Gateway REST API ---
 
 def _apigw_rest_api_create(logical_id, props, stack_name):
-    name = props.get("Name") or _physical_name(stack_name, logical_id, max_len=64)
     data = {
-        "name": name,
         "description": props.get("Description", ""),
         "endpointConfiguration": props.get("EndpointConfiguration", {"types": ["REGIONAL"]}),
         "binaryMediaTypes": props.get("BinaryMediaTypes", []),
@@ -1700,9 +1698,18 @@ def _apigw_rest_api_create(logical_id, props, stack_name):
         "policy": props.get("Policy"),
         "tags": {t["Key"]: t["Value"] for t in props.get("Tags", [])},
     }
-    status, headers, body = _apigw_v1._create_rest_api(data)
-    api = json.loads(body) if isinstance(body, bytes) else json.loads(body)
-    api_id = api.get("id", "")
+    if props.get("Name"):
+        data["name"] = props["Name"]
+
+    body_spec = props.get("Body")
+    if isinstance(body_spec, dict):
+        api_id = _apigw_v1._import_rest_api(body_spec, data)
+    else:
+        data.setdefault("name", _physical_name(stack_name, logical_id, max_len=64))
+        status, headers, body = _apigw_v1._create_rest_api(data)
+        api = json.loads(body) if isinstance(body, bytes) else json.loads(body)
+        api_id = api.get("id", "")
+
     # Find root resource id
     root_id = ""
     for rid, res in _apigw_v1._resources.get(api_id, {}).items():

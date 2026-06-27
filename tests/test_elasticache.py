@@ -116,12 +116,13 @@ def test_elasticache_user_group_crud(ec):
 
 @requires_docker
 def test_elasticache_reset_clears_param_groups():
-    """ElastiCache reset clears _param_group_params and resets port counter."""
+    """ElastiCache reset restores built-in parameter groups and resets port counter."""
     from ministack.services import elasticache as _ec
     _ec._param_group_params["test-group"] = {"param1": "val1"}
     _ec._port_counter[0] = 99999
     _ec.reset()
-    assert not _ec._param_group_params
+    assert "test-group" not in _ec._param_group_params
+    assert "default.redis7" in _ec._param_group_params
     assert _ec._port_counter[0] == _ec.BASE_PORT
 
 @requires_docker
@@ -362,6 +363,59 @@ def test_elasticache_modify_cache_parameter_group(ec):
     assert maxmem["ParameterValue"] == "allkeys-lru"
 
 
+def test_elasticache_default_parameter_groups_are_immutable(ec):
+    """Built-in default parameter groups cannot be overwritten, deleted, or modified."""
+    resp = ec.describe_cache_parameter_groups(CacheParameterGroupName="default.redis7")
+    assert resp["CacheParameterGroups"][0]["CacheParameterGroupFamily"] == "redis7"
+
+    with pytest.raises(ClientError) as exc:
+        ec.create_cache_parameter_group(
+            CacheParameterGroupName="default.redis7",
+            CacheParameterGroupFamily="redis7",
+            Description="duplicate default",
+        )
+    assert exc.value.response["Error"]["Code"] == "CacheParameterGroupAlreadyExists"
+
+    with pytest.raises(ClientError) as exc:
+        ec.delete_cache_parameter_group(CacheParameterGroupName="default.redis7")
+    assert exc.value.response["Error"]["Code"] == "InvalidCacheParameterGroupState"
+
+    with pytest.raises(ClientError) as exc:
+        ec.modify_cache_parameter_group(
+            CacheParameterGroupName="default.redis7",
+            ParameterNameValues=[{"ParameterName": "maxmemory-policy", "ParameterValue": "allkeys-lru"}],
+        )
+    assert exc.value.response["Error"]["Code"] == "InvalidCacheParameterGroupState"
+
+    with pytest.raises(ClientError) as exc:
+        ec.reset_cache_parameter_group(
+            CacheParameterGroupName="default.redis7",
+            ResetAllParameters=True,
+        )
+    assert exc.value.response["Error"]["Code"] == "InvalidCacheParameterGroupState"
+
+
+def test_elasticache_default_parameter_group_family_mapping(ec):
+    """Default parameter group names use AWS-style engine family names."""
+    cid = f"pg-map-mc-{_uid()}"
+    resp = ec.create_cache_cluster(
+        CacheClusterId=cid,
+        Engine="memcached",
+        EngineVersion="1.6.17",
+        CacheNodeType="cache.t3.micro",
+        NumCacheNodes=1,
+    )
+    group = resp["CacheCluster"]["CacheParameterGroup"]
+    assert group["CacheParameterGroupName"] == "default.memcached1.6"
+    ec.delete_cache_cluster(CacheClusterId=cid)
+
+    redis_versions = ec.describe_cache_engine_versions(Engine="redis")["CacheEngineVersions"]
+    families = {v["EngineVersion"]: v["CacheParameterGroupFamily"] for v in redis_versions}
+    assert families["7.0.12"] == "redis7"
+    assert families["6.2.14"] == "redis6.x"
+    assert families["5.0.6"] == "redis5.0"
+
+
 def _uid():
     return _uuid_mod.uuid4().hex[:8]
 
@@ -490,6 +544,51 @@ def test_modify_replication_group(ec):
     assert rg["Description"] == "Updated desc"
     assert rg["CacheNodeType"] == "cache.m5.large"
 
+    ec.delete_replication_group(ReplicationGroupId=rg_id)
+
+
+def test_create_replication_group_missing_user_group_fails(ec):
+    """CreateReplicationGroup returns UserGroupNotFound for unknown UserGroupIds."""
+    rg_id = f"rg-missing-ug-{_uid()}"
+    with pytest.raises(ClientError) as exc:
+        ec.create_replication_group(
+            ReplicationGroupId=rg_id,
+            ReplicationGroupDescription="Missing user group",
+            CacheNodeType="cache.t3.micro",
+            UserGroupIds=["missing-user-group"],
+        )
+    err = exc.value.response["Error"]
+    assert err["Code"] == "UserGroupNotFound"
+    assert err["Message"] == "The user group was not found or does not exist"
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 404
+
+    with pytest.raises(ClientError) as exc:
+        ec.describe_replication_groups(ReplicationGroupId=rg_id)
+    assert exc.value.response["Error"]["Code"] == "ReplicationGroupNotFoundFault"
+
+
+def test_modify_replication_group_missing_user_group_fails_before_mutation(ec):
+    """ModifyReplicationGroup validates user groups before applying other changes."""
+    rg_id = f"mod-rg-missing-ug-{_uid()}"
+    ec.create_replication_group(
+        ReplicationGroupId=rg_id,
+        ReplicationGroupDescription="Original desc",
+        CacheNodeType="cache.t3.micro",
+    )
+
+    with pytest.raises(ClientError) as exc:
+        ec.modify_replication_group(
+            ReplicationGroupId=rg_id,
+            ReplicationGroupDescription="Updated desc",
+            UserGroupIdsToAdd=["missing-user-group"],
+        )
+    err = exc.value.response["Error"]
+    assert err["Code"] == "UserGroupNotFound"
+    assert err["Message"] == "The user group was not found or does not exist"
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 404
+
+    rg = ec.describe_replication_groups(ReplicationGroupId=rg_id)["ReplicationGroups"][0]
+    assert rg["Description"] == "Original desc"
     ec.delete_replication_group(ReplicationGroupId=rg_id)
 
 
@@ -741,7 +840,117 @@ def test_describe_events_filter_source_id(ec):
 
 
 # ---------------------------------------------------------------------------
-# 11. Serverless cache operations — not implemented in MiniStack
+# 11. Replication group member cluster lifecycle
+# ---------------------------------------------------------------------------
+
+def test_replication_group_creates_member_clusters(ec):
+    """CreateReplicationGroup should register member clusters visible via DescribeCacheClusters."""
+    rg_id = f"rg-members-{_uid()}"
+    ec.create_replication_group(
+        ReplicationGroupId=rg_id,
+        ReplicationGroupDescription="Member cluster test",
+        CacheNodeType="cache.t3.micro",
+        NumCacheClusters=2,
+    )
+    rg = ec.describe_replication_groups(ReplicationGroupId=rg_id)["ReplicationGroups"][0]
+    member_ids = rg["MemberClusters"]
+    assert len(member_ids) == 2
+
+    for cid in member_ids:
+        resp = ec.describe_cache_clusters(CacheClusterId=cid)
+        cluster = resp["CacheClusters"][0]
+        assert cluster["CacheClusterId"] == cid
+        assert cluster["ReplicationGroupId"] == rg_id
+
+    ec.delete_replication_group(ReplicationGroupId=rg_id)
+
+
+def test_delete_replication_group_removes_member_clusters(ec):
+    """DeleteReplicationGroup should also remove its member clusters."""
+    rg_id = f"rg-del-mem-{_uid()}"
+    ec.create_replication_group(
+        ReplicationGroupId=rg_id,
+        ReplicationGroupDescription="Delete members test",
+        CacheNodeType="cache.t3.micro",
+        NumCacheClusters=2,
+    )
+    member_ids = ec.describe_replication_groups(
+        ReplicationGroupId=rg_id
+    )["ReplicationGroups"][0]["MemberClusters"]
+
+    ec.delete_replication_group(ReplicationGroupId=rg_id)
+
+    for cid in member_ids:
+        with pytest.raises(ClientError) as exc:
+            ec.describe_cache_clusters(CacheClusterId=cid)
+        assert "CacheClusterNotFound" in str(exc.value)
+
+
+def test_replication_group_tags_on_create(ec):
+    """Tags passed at CreateReplicationGroup should be retrievable via ListTagsForResource."""
+    rg_id = f"rg-tags-{_uid()}"
+    ec.create_replication_group(
+        ReplicationGroupId=rg_id,
+        ReplicationGroupDescription="Tag on create",
+        CacheNodeType="cache.t3.micro",
+        Tags=[{"Key": "env", "Value": "test"}, {"Key": "team", "Value": "infra"}],
+    )
+    arn = ec.describe_replication_groups(
+        ReplicationGroupId=rg_id
+    )["ReplicationGroups"][0]["ARN"]
+
+    tags = ec.list_tags_for_resource(ResourceName=arn)
+    tag_map = {t["Key"]: t["Value"] for t in tags["TagList"]}
+    assert tag_map["env"] == "test"
+    assert tag_map["team"] == "infra"
+
+    ec.delete_replication_group(ReplicationGroupId=rg_id)
+
+
+def test_replication_group_cluster_mode_uses_cluster_on_default_group(ec):
+    """Cluster-mode-enabled replication groups use the .cluster.on default group."""
+    rg_id = f"rg-cluster-pg-{_uid()}"
+    ec.create_replication_group(
+        ReplicationGroupId=rg_id,
+        ReplicationGroupDescription="Cluster default parameter group",
+        CacheNodeType="cache.t3.micro",
+        NumNodeGroups=3,
+        ReplicasPerNodeGroup=0,
+    )
+    rg = ec.describe_replication_groups(ReplicationGroupId=rg_id)["ReplicationGroups"][0]
+    member_id = rg["MemberClusters"][0]
+    cluster = ec.describe_cache_clusters(CacheClusterId=member_id)["CacheClusters"][0]
+    assert cluster["CacheParameterGroup"]["CacheParameterGroupName"] == "default.redis7.cluster.on"
+    ec.delete_replication_group(ReplicationGroupId=rg_id)
+
+
+def test_replication_group_tag_updates_propagate_to_member_clusters(ec):
+    """AddTagsToResource/RemoveTagsFromResource on a replication group fan out to members."""
+    rg_id = f"rg-tag-fanout-{_uid()}"
+    ec.create_replication_group(
+        ReplicationGroupId=rg_id,
+        ReplicationGroupDescription="Tag fanout",
+        CacheNodeType="cache.t3.micro",
+        NumCacheClusters=2,
+    )
+    rg = ec.describe_replication_groups(ReplicationGroupId=rg_id)["ReplicationGroups"][0]
+    rg_arn = rg["ARN"]
+    member_id = rg["MemberClusters"][0]
+    member = ec.describe_cache_clusters(CacheClusterId=member_id)["CacheClusters"][0]
+    member_arn = member["ARN"]
+
+    ec.add_tags_to_resource(ResourceName=rg_arn, Tags=[{"Key": "env", "Value": "test"}])
+    member_tags = ec.list_tags_for_resource(ResourceName=member_arn)["TagList"]
+    assert {t["Key"]: t["Value"] for t in member_tags}["env"] == "test"
+
+    ec.remove_tags_from_resource(ResourceName=rg_arn, TagKeys=["env"])
+    member_tags = ec.list_tags_for_resource(ResourceName=member_arn)["TagList"]
+    assert not any(t["Key"] == "env" for t in member_tags)
+    ec.delete_replication_group(ReplicationGroupId=rg_id)
+
+
+# ---------------------------------------------------------------------------
+# 12. Serverless cache operations — not implemented in MiniStack
 # ---------------------------------------------------------------------------
 
 @requires_docker

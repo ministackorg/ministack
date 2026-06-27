@@ -269,6 +269,20 @@ def _seed_aws_managed_policies() -> None:
         ('AmazonEKSServicePolicy',
          '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["ec2:CreateNetworkInterface","ec2:CreateNetworkInterfacePermission","ec2:DeleteNetworkInterface","ec2:DescribeInstances","ec2:DescribeNetworkInterfaces","ec2:DetachNetworkInterface","ec2:DescribeSecurityGroups","ec2:DescribeSubnets","ec2:DescribeVpcs","ec2:ModifyNetworkInterfaceAttribute","iam:ListAttachedRolePolicies","eks:UpdateClusterVersion","ec2:GetSecurityGroupsForVpc"],"Resource":"*"},{"Effect":"Allow","Action":["ec2:CreateTags","ec2:DeleteTags"],"Resource":["arn:aws:ec2:*:*:vpc/*","arn:aws:ec2:*:*:subnet/*"]},{"Effect":"Allow","Action":["ec2:CreateTags"],"Resource":["arn:aws:ec2:*:*:network-interface/*"],"Condition":{"StringLike":{"aws:RequestTag/Name":"eks-cluster-*"}}},{"Effect":"Allow","Action":"route53:AssociateVPCWithHostedZone","Resource":"*"},{"Effect":"Allow","Action":"logs:CreateLogGroup","Resource":"*"},{"Effect":"Allow","Action":["logs:CreateLogStream","logs:DescribeLogStreams"],"Resource":"arn:aws:logs:*:*:log-group:/aws/eks/*:*"},{"Effect":"Allow","Action":"logs:PutLogEvents","Resource":"arn:aws:logs:*:*:log-group:/aws/eks/*:*:*"},{"Effect":"Allow","Action":"iam:CreateServiceLinkedRole","Resource":"arn:aws:iam::*:role/aws-service-role/eks.amazonaws.com/AWSServiceRoleForAmazonEKS","Condition":{"StringLike":{"iam:AWSServiceName":"eks.amazonaws.com"}}}]}',
          "This policy allows Amazon Elastic Container Service for Kubernetes to create and manage the necessary resources to operate EKS Clusters."),
+        # X-Ray daemon-side write + reader access. Heavily referenced by
+        # the upstream terraform-aws-modules/lambda module: every Lambda
+        # function module that sets `attach_tracing_policy = true` does
+        # `data "aws_iam_policy" "tracing" { arn = "arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess" }`,
+        # so any Terraform stack that wires Lambdas with tracing on hits this.
+        ('AWSXRayDaemonWriteAccess',
+         '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["xray:PutTraceSegments","xray:PutTelemetryRecords","xray:GetSamplingRules","xray:GetSamplingTargets","xray:GetSamplingStatisticSummaries"],"Resource":["*"]}]}',
+         "AWS X-Ray Daemon write access — permissions required by the X-Ray daemon to upload telemetry segments to X-Ray and fetch sampling rules."),
+        ('AWSXrayReadOnlyAccess',
+         '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["xray:GetSamplingRules","xray:GetSamplingTargets","xray:GetSamplingStatisticSummaries","xray:BatchGetTraces","xray:BatchGetTraceSummaryById","xray:GetDistinctTraceGraphs","xray:GetServiceGraph","xray:GetTraceGraph","xray:GetTraceSummaries","xray:GetGroups","xray:GetGroup","xray:ListTagsForResource","xray:ListResourcePolicies","xray:GetTimeSeriesServiceStatistics","xray:GetInsightSummaries","xray:GetInsight","xray:GetInsightEvents","xray:GetInsightImpactGraph"],"Resource":["*"]}]}',
+         "AWS X-Ray read-only access. Grants permission to retrieve trace data, service graphs, and sampling rules."),
+        ('AWSLambdaRole',
+         '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["lambda:InvokeFunction"],"Resource":["*"]}]}',
+         "Default policy for AWS Lambda service role — permits Lambda to invoke other Lambda functions."),
     ]
 
     for name, document, description in seeds:
@@ -1045,6 +1059,21 @@ def _get_access_key_last_used(p):
 
 
 # -------------------- Instance profiles --------------------
+
+def _lookup_instance_profile(name="", arn=""):
+    if name:
+        profile = _instance_profiles.get(name)
+        if not profile:
+            return None
+        if arn and profile.get("Arn") != arn:
+            return None
+        return profile
+    if arn:
+        for profile in _instance_profiles.values():
+            if profile.get("Arn") == arn:
+                return profile
+    return None
+
 
 def _create_instance_profile(p):
     name = _p(p, "InstanceProfileName")

@@ -54,7 +54,9 @@ def _extract_members(params, prefix):
             break
         value = (_p(params, f"{prefix}.member.{i}.ParameterValue")
                  or _p(params, f"{prefix}.member.{i}.Value"))
-        result.append({"Key": key, "Value": value or ""})
+        use_prev = _p(params, f"{prefix}.member.{i}.UsePreviousValue")
+        result.append({"Key": key, "Value": value or "",
+                       "UsePreviousValue": str(use_prev).lower() == "true"})
         i += 1
     return result
 

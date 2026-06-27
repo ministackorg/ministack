@@ -201,6 +201,12 @@ def _collect_backup():
         yield arn, _normalise_flat(p.get("Tags", {}))
 
 
+def _collect_elasticache():
+    import ministack.services.elasticache as svc
+    for arn, tags in svc._tags.items():
+        yield arn, _normalise_list(tags)
+
+
 # ResourceTypeFilter prefix -> collector
 _COLLECTORS = {
     # Phase 1
@@ -222,6 +228,7 @@ _COLLECTORS = {
     "cloudfront":        _collect_cloudfront,
     "elasticfilesystem": _collect_efs,
     "backup":            _collect_backup,
+    "elasticache":       _collect_elasticache,
 }
 
 
@@ -235,13 +242,20 @@ def _account():
 def _matches_type_filters(arn, type_filters):
     if not type_filters:
         return True
-    try:
-        spec = parse_arn(arn)
-    except ArnParseError:
-        return False
+    parts = arn.split(":", 5)
+    arn_service = parts[2] if len(parts) > 2 else ""
+    resource = parts[5] if len(parts) > 5 else ""
+    if "/" in resource:
+        arn_resource_type = resource.split("/", 1)[0]
+    else:
+        arn_resource_type = resource.split(":", 1)[0]
+
     for tf in type_filters:
-        svc_prefix = tf.split(":")[0]
-        if spec.service == svc_prefix:
+        tf_parts = tf.split(":", 1)
+        svc_prefix = tf_parts[0]
+        if svc_prefix != arn_service:
+            continue
+        if len(tf_parts) == 1 or not tf_parts[1] or tf_parts[1] == arn_resource_type:
             return True
     return False
 
@@ -610,6 +624,39 @@ def _write_backup(spec, arn, tags):
         raise _ResourceNotFound(arn)
 
 
+def _resolve_elasticache_resource(svc, arn):
+    """Check that an ElastiCache ARN refers to an existing resource."""
+    resource_part = arn.split(":", 5)[-1] if arn.count(":") >= 5 else ""
+    if ":" not in resource_part:
+        raise _ResourceNotFound(arn)
+    resource_type, resource_id = resource_part.split(":", 1)
+    match resource_type:
+        case "cluster":
+            store = svc._clusters
+        case "replicationgroup":
+            store = svc._replication_groups
+        case "subnetgroup":
+            store = svc._subnet_groups
+        case "parametergroup":
+            store = svc._param_groups
+        case "snapshot":
+            store = svc._snapshots
+        case "user":
+            store = svc._users
+        case "usergroup":
+            store = svc._user_groups
+        case _:
+            raise _ResourceNotFound(arn)
+    if resource_id not in store:
+        raise _ResourceNotFound(arn)
+
+
+def _write_elasticache(_spec, arn, tags):
+    import ministack.services.elasticache as svc
+    _resolve_elasticache_resource(svc, arn)
+    svc._merge_tags_for_arn(arn, [{"Key": k, "Value": v} for k, v in tags.items()])
+
+
 _WRITERS = {
     "s3": _write_s3, "lambda": _write_lambda, "sqs": _write_sqs,
     "sns": _write_sns, "dynamodb": _write_dynamodb, "events": _write_eventbridge,
@@ -618,6 +665,7 @@ _WRITERS = {
     "cognito-identity": _write_cognito_identity, "appsync": _write_appsync,
     "scheduler": _write_scheduler, "cloudfront": _write_cloudfront,
     "elasticfilesystem": _write_efs, "backup": _write_backup,
+    "elasticache": _write_elasticache,
 }
 
 
@@ -797,6 +845,12 @@ def _remove_backup(spec, arn, keys):
         tags.pop(k, None)
 
 
+def _remove_elasticache(_spec, arn, keys):
+    import ministack.services.elasticache as svc
+    _resolve_elasticache_resource(svc, arn)
+    svc._remove_tag_keys_for_arn(arn, keys)
+
+
 _REMOVERS = {
     "s3": _remove_s3, "lambda": _remove_lambda, "sqs": _remove_sqs,
     "sns": _remove_sns, "dynamodb": _remove_dynamodb, "events": _remove_eventbridge,
@@ -805,6 +859,7 @@ _REMOVERS = {
     "cognito-identity": _remove_cognito_identity, "appsync": _remove_appsync,
     "scheduler": _remove_scheduler, "cloudfront": _remove_cloudfront,
     "elasticfilesystem": _remove_efs, "backup": _remove_backup,
+    "elasticache": _remove_elasticache,
 }
 
 
@@ -937,9 +992,11 @@ def _tag_resources(data):
         except _WrongRegionArn as exc:
             return _invalid_parameter(str(exc))
         except _ResourceNotFound:
-            # AWS RGTA returns this literal failed-resource shape for well-formed
-            # same-service ARNs whose target resource does not exist.
-            failed[arn] = _failed_resource("ResourceNotFound", "Resource does not exist", 404)
+            # A well-formed, same-service ARN whose target resource does not exist.
+            # AWS RGTA reports this in FailedResourcesMap as InvalidParameterException
+            # (the ErrorCode enum is limited to InternalServiceException /
+            # InvalidParameterException — there is no ResourceNotFound code here).
+            failed[arn] = _failed_resource("InvalidParameterException", "Resource does not exist", 400)
         except Exception as exc:
             failed[arn] = _failed_resource("InternalServiceException", str(exc), 500)
 
@@ -986,9 +1043,11 @@ def _untag_resources(data):
         except _WrongRegionArn as exc:
             return _invalid_parameter(str(exc))
         except _ResourceNotFound:
-            # AWS RGTA returns this literal failed-resource shape for well-formed
-            # same-service ARNs whose target resource does not exist.
-            failed[arn] = _failed_resource("ResourceNotFound", "Resource does not exist", 404)
+            # A well-formed, same-service ARN whose target resource does not exist.
+            # AWS RGTA reports this in FailedResourcesMap as InvalidParameterException
+            # (the ErrorCode enum is limited to InternalServiceException /
+            # InvalidParameterException — there is no ResourceNotFound code here).
+            failed[arn] = _failed_resource("InvalidParameterException", "Resource does not exist", 400)
         except Exception as exc:
             failed[arn] = _failed_resource("InternalServiceException", str(exc), 500)
 
