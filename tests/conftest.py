@@ -57,6 +57,7 @@ _SERIAL_TESTS = {
     "tests/test_ec2.py::test_ec2_create_default_vpc",
     "tests/test_eks.py::test_eks_cfn_cluster",
     "tests/test_eks.py::test_eks_create_describe_delete_cluster",
+    "tests/test_eks.py::test_eks_restore_state_normalizes_endpoint_to_localhost",
     "tests/test_lambda.py::test_lambda_reset_terminates_workers",
     "tests/test_lambda.py::test_lambda_dynamodb_stream_esm_latest_processes_first_record",
     "tests/test_ministack.py::test_ministack_config_invalid_key_ignored",

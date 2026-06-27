@@ -872,3 +872,51 @@ def test_eks_k3s_run_kwargs_appends_node_labels():
     # Existing server flags must still be present — refactor must not regress them.
     assert "server" in run_kwargs["command"]
     assert "--https-listen-port=6443" in run_kwargs["command"]
+
+
+# ---------------------------------------------------------------------------
+# DescribeCluster endpoint (host-published port)
+# ---------------------------------------------------------------------------
+
+def test_eks_cluster_endpoint_defaults_to_host_form():
+    """Advertises the host-published port — reachable from the host
+    (aws eks update-kubeconfig + kubectl), not a docker-internal IP."""
+    from ministack.services import eks as eks_mod
+
+    assert eks_mod._cluster_endpoint(16443) == "https://localhost:16443"
+
+
+def test_eks_cluster_endpoint_honours_ministack_host(monkeypatch):
+    """Host form uses MINISTACK_HOST so a remote-host deployment is reachable."""
+    from ministack.services import eks as eks_mod
+
+    monkeypatch.setattr(eks_mod, "_MINISTACK_HOST", "10.0.0.5")
+    assert eks_mod._cluster_endpoint(16443) == "https://10.0.0.5:16443"
+
+
+def test_eks_restore_state_normalizes_endpoint_to_localhost():
+    """A persisted cluster restores with no running container, so its endpoint is
+    normalized to the stable https://localhost:{port} form (not a dead container
+    IP, and never empty — it is still reported ACTIVE)."""
+    from ministack.services import eks as eks_mod
+
+    eks_mod.reset()
+    try:
+        eks_mod._clusters["c-restore"] = {
+            "name": "c-restore",
+            "status": "ACTIVE",
+            "_port": 16443,
+            "endpoint": "https://172.18.0.9:6443",  # stale container IP from prev run
+            "_docker_id": "deadbeef",
+        }
+        state = eks_mod.get_state()
+        eks_mod.reset()
+
+        eks_mod.restore_state(state)
+
+        restored = eks_mod._clusters.get("c-restore")
+        assert restored["endpoint"] == "https://localhost:16443"
+        assert restored["_docker_id"] is None
+        assert restored["status"] == "ACTIVE"  # endpoint stays non-empty for ACTIVE
+    finally:
+        eks_mod.reset()
