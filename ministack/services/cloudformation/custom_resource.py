@@ -42,15 +42,6 @@ def _response_url(token: str) -> str:
     return f"http://{_HOST}:{_PORT}/_ministack/cfn-response/{token}"
 
 
-def _func_name_from_arn(service_token: str) -> str:
-    """Extract function name from a Lambda ARN, or return as-is."""
-    if service_token.startswith("arn:"):
-        parts = service_token.split(":")
-        # arn:aws:lambda:region:account:function:<name>[:<qualifier>]
-        return parts[6] if len(parts) >= 7 else parts[-1]
-    return service_token
-
-
 def invoke_custom_resource(
     request_type: str,
     logical_id: str,
@@ -73,18 +64,29 @@ def invoke_custom_resource(
     Raises RuntimeError if the Lambda responds with Status=FAILED.
     """
     import ministack.services.lambda_svc as _lambda_svc
-    from ministack.core.responses import new_uuid
+    from ministack.core.arn import ArnParseError, parse_arn
+    from ministack.core.responses import get_region, new_uuid
 
     service_token = props.get("ServiceToken", "")
-    func_name = _func_name_from_arn(service_token)
+    if isinstance(service_token, str) and service_token.startswith("arn:"):
+        try:
+            token_arn = parse_arn(service_token)
+        except ArnParseError:
+            token_arn = None
+        if token_arn and token_arn.service == "lambda" and token_arn.region != get_region():
+            raise ValueError(
+                f"Custom resource ServiceToken {service_token!r} must be in "
+                f"the stack region {get_region()}."
+            )
 
-    if func_name not in _lambda_svc._functions:
+    func_record, func_config, func_name = _lambda_svc._get_func_record_for_ref(service_token)
+
+    if func_record is None or func_config is None:
         raise ValueError(
             f"Custom resource ServiceToken {service_token!r} not found. "
             "Ensure the Lambda function is provisioned before the custom resource."
         )
 
-    func_record = _lambda_svc._functions[func_name]
     try:
         service_timeout = int(props.get("ServiceTimeout", 3600))
     except (ValueError, TypeError):
@@ -110,7 +112,8 @@ def invoke_custom_resource(
     event_obj = register_token(token)
 
     try:
-        _lambda_svc._execute_function(func_record, cfn_event)
+        exec_record = _lambda_svc._execution_record_for_config(func_record, func_config)
+        _lambda_svc._execute_function_with_config_scope(exec_record, cfn_event)
     except Exception as exc:
         logger.warning("Custom resource Lambda raised synchronously: %s", exc)
 

@@ -16,6 +16,7 @@ Supports:
   Tags:                 AddTags, RemoveTags, DescribeTags
 """
 
+import asyncio
 import base64
 import copy
 import fnmatch
@@ -27,6 +28,7 @@ import string
 import time
 from urllib.parse import parse_qs
 
+from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.persistence import PERSIST_STATE, load_state
 from ministack.core.responses import AccountScopedDict, get_account_id, get_region, new_uuid
 
@@ -114,6 +116,70 @@ def _parse_tags(params):
         tags.append({"Key": k, "Value": _p(params, f"Tags.member.{i}.Value")})
         i += 1
     return tags
+
+
+def _elbv2_resource_tail(arn: str, prefix: str) -> str:
+    """Return a stored ELBv2 ARN tail for ID generation, or empty string."""
+    try:
+        spec = parse_arn(arn)
+    except ArnParseError:
+        return ""
+    if spec.service != "elasticloadbalancing" or not spec.resource.startswith(prefix):
+        return ""
+    return spec.resource[len(prefix):]
+
+
+def _load_balancer_id_from_arn(arn: str) -> str:
+    tail = _elbv2_resource_tail(arn, "loadbalancer/")
+    return tail.rpartition("/")[2] if tail else ""
+
+
+def _listener_id_from_arn(arn: str) -> str:
+    tail = _elbv2_resource_tail(arn, "listener/")
+    return tail.rpartition("/")[2] if tail else ""
+
+
+def _target_group_full_name_from_arn(arn: str) -> str:
+    return _elbv2_resource_tail(arn, "targetgroup/")
+
+
+def _resolve_taggable_elbv2_arn(arn: str):
+    try:
+        spec = parse_arn(arn)
+    except ArnParseError:
+        return None, _error("ValidationError", f"Invalid resource ARN: {arn}")
+
+    if (
+        spec.partition != "aws"
+        or spec.service != "elasticloadbalancing"
+        or spec.region != get_region()
+        or spec.account_id != get_account_id()
+    ):
+        return None, _error("ValidationError", f"Invalid resource ARN: {arn}")
+
+    resources = (
+        ("loadbalancer/", _lbs, "LoadBalancerNotFound", "Load balancer"),
+        ("targetgroup/", _tgs, "TargetGroupNotFound", "Target group"),
+        ("listener/", _listeners, "ListenerNotFound", "Listener"),
+        ("listener-rule/", _rules, "RuleNotFound", "Rule"),
+    )
+    for prefix, store, code, label in resources:
+        if spec.resource.startswith(prefix):
+            if arn not in store:
+                return None, _error(code, f"{label} '{arn}' not found.")
+            return arn, None
+
+    return None, _error("ValidationError", f"Invalid resource ARN: {arn}")
+
+
+def _resolve_taggable_elbv2_arns(arns):
+    resolved = []
+    for arn in arns:
+        arn, err = _resolve_taggable_elbv2_arn(arn)
+        if err:
+            return [], err
+        resolved.append(arn)
+    return resolved, None
 
 
 def _parse_actions(params, prefix="DefaultActions"):
@@ -572,7 +638,7 @@ def _create_listener(params):
     lid = _short_id()
     lb = _lbs[lb_arn]
     lb_name = lb["LoadBalancerName"]
-    lb_id = lb_arn.split("/")[-1]
+    lb_id = _load_balancer_id_from_arn(lb_arn)
     l_arn = (f"arn:aws:elasticloadbalancing:{get_region()}:{get_account_id()}"
              f":listener/app/{lb_name}/{lb_id}/{lid}")
     actions = _parse_actions(params, "DefaultActions")
@@ -687,8 +753,8 @@ def _create_rule(params):
     listener = _listeners[l_arn]
     lb_arn = listener["LoadBalancerArn"]
     lb_name = _lbs[lb_arn]["LoadBalancerName"]
-    lb_id = lb_arn.split("/")[-1]
-    l_id = l_arn.split("/")[-1]
+    lb_id = _load_balancer_id_from_arn(lb_arn)
+    l_id = _listener_id_from_arn(l_arn)
     rule_id = _short_id()
     rule_arn = (f"arn:aws:elasticloadbalancing:{get_region()}:{get_account_id()}"
                 f":listener-rule/app/{lb_name}/{lb_id}/{l_id}/{rule_id}")
@@ -806,7 +872,9 @@ def _describe_target_health(params):
 # ---------------------------------------------------------------------------
 
 def _add_tags(params):
-    arns = _parse_member_list(params, "ResourceArns")
+    arns, err = _resolve_taggable_elbv2_arns(_parse_member_list(params, "ResourceArns"))
+    if err:
+        return err
     new_tags = _parse_tags(params)
     for arn in arns:
         existing = _tags.setdefault(arn, [])
@@ -821,7 +889,9 @@ def _add_tags(params):
 
 
 def _remove_tags(params):
-    arns = _parse_member_list(params, "ResourceArns")
+    arns, err = _resolve_taggable_elbv2_arns(_parse_member_list(params, "ResourceArns"))
+    if err:
+        return err
     key_set = set(_parse_member_list(params, "TagKeys"))
     for arn in arns:
         if arn in _tags:
@@ -833,6 +903,9 @@ def _describe_tags(params):
     arns = _parse_member_list(params, "ResourceArns")
     descs = ""
     for arn in arns:
+        arn, err = _resolve_taggable_elbv2_arn(arn)
+        if err:
+            return err
         tags_xml = "".join(
             f"<member><Key>{t['Key']}</Key><Value>{t['Value']}</Value></member>"
             for t in _tags.get(arn, [])
@@ -1081,22 +1154,33 @@ async def _forward_to_tg(tg_arn, method, path, headers, body, query_params):
 
     if target_type == "lambda":
         func_id = registered[0]["Id"]
-        func_name = func_id.split(":function:")[-1].split(":")[0] if ":function:" in func_id else func_id
-        return await _invoke_lambda_target(func_name, tg_arn, method, path,
+        return await _invoke_lambda_target(func_id, tg_arn, method, path,
                                            headers, body, query_params)
 
     return (502, {"Content-Type": "application/json"},
             json.dumps({"message": f"Target type '{target_type}' not supported."}).encode())
 
 
-async def _invoke_lambda_target(func_name, tg_arn, method, path, headers, body, query_params):
+async def _invoke_lambda_target(function_ref, tg_arn, method, path, headers, body, query_params):
     try:
         from ministack.services import lambda_svc
     except ImportError:
         return (502, {"Content-Type": "application/json"},
                 json.dumps({"message": "Lambda service unavailable"}).encode())
 
-    if func_name not in lambda_svc._functions:
+    try:
+        tg_spec = parse_arn(tg_arn)
+    except ArnParseError:
+        tg_spec = None
+    owner_account_id = tg_spec.account_id if tg_spec else get_account_id()
+    owner_region = tg_spec.region if tg_spec else get_region()
+
+    func, config, func_name = lambda_svc._get_func_record_for_ref_in_scope(
+        function_ref,
+        account_id=owner_account_id,
+        region=owner_region,
+    )
+    if not func or not config:
         return (502, {"Content-Type": "application/json"},
                 json.dumps({"message": f"Lambda function '{func_name}' not found"}).encode())
 
@@ -1124,15 +1208,33 @@ async def _invoke_lambda_target(func_name, tg_arn, method, path, headers, body, 
         "isBase64Encoded": is_b64,
     }
 
-    _, resp_headers, resp_body = await lambda_svc._invoke(func_name, event, {})
+    exec_record = lambda_svc._execution_record_for_config(func, config)
 
-    if resp_headers.get("X-Amz-Function-Error"):
-        raw = resp_body.decode("utf-8", errors="replace") if isinstance(resp_body, bytes) else str(resp_body)
+    def _invoke_and_record_metrics():
+        started = time.time()
+        invocation_result = lambda_svc._execute_function_with_config_scope(exec_record, event)
+        duration_ms = (time.time() - started) * 1000.0
+        lambda_svc._run_with_function_config_scope(
+            config,
+            lambda_svc._emit_lambda_metrics,
+            func_name,
+            duration_ms=duration_ms,
+            error=bool(invocation_result.get("error")),
+            throttle=bool(invocation_result.get("throttle")),
+        )
+        return invocation_result
+
+    exec_result = await asyncio.to_thread(_invoke_and_record_metrics)
+    lambda_response, _err = lambda_svc.lambda_execute_result_to_api_proxy_response(exec_result)
+
+    if exec_result.get("error"):
+        raw = lambda_response.get("body", "") if lambda_response else exec_result.get("body", "")
+        raw = raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else str(raw)
         return (502, {"Content-Type": "application/json"},
                 json.dumps({"message": f"Lambda error: {raw}"}).encode())
 
     try:
-        result = json.loads(resp_body) if isinstance(resp_body, bytes) else resp_body
+        result = lambda_response or {}
         if not isinstance(result, dict):
             return (200, {"Content-Type": "text/plain"},
                     str(result).encode("utf-8"))
@@ -1153,7 +1255,7 @@ async def _invoke_lambda_target(func_name, tg_arn, method, path, headers, body, 
         return resp_code, out_headers, out_body
 
     except Exception:
-        raw = resp_body if isinstance(resp_body, bytes) else str(resp_body).encode()
+        raw = json.dumps(lambda_response).encode()
         return 200, {"Content-Type": "text/plain"}, raw
 
 

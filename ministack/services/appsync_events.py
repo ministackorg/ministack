@@ -450,16 +450,16 @@ def _events_authorizer_invoke(
     }
     try:
         from ministack.services import lambda_svc
-        name, q = lambda_svc._resolve_name_and_qualifier(arn)  # noqa: SLF001
-        fn, _cfg = lambda_svc._get_func_record_for_qualifier(name, q)  # noqa: SLF001
+        fn, cfg, _name = lambda_svc._get_func_record_for_ref(arn)  # noqa: SLF001
     except Exception as e:
         logger.error("AppSync Events authorizer resolve %s: %s", arn, e)
         return False, None
-    if not fn:
+    if not fn or not cfg:
         logger.error("AppSync Events authorizer Lambda not registered: %s", arn)
         return False, None
     try:
-        res = lambda_svc._execute_function(fn, payload)  # noqa: SLF001
+        exec_record = lambda_svc._execution_record_for_config(fn, cfg)  # noqa: SLF001
+        res = lambda_svc._execute_function_with_config_scope(exec_record, payload)  # noqa: SLF001
     except Exception as e:
         logger.error("AppSync Events authorizer invoke: %s", e)
         return False, None

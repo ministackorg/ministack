@@ -96,6 +96,17 @@ def test_describe_stream_unknown_arn_raises(ddb_streams):
     assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
 
 
+@pytest.mark.parametrize("stream_arn", [
+    "arn:aws:dynamodb:us-east-1:000000000000",
+    "arn:aws:sns:us-east-1:000000000000:table/StreamsDescribe/stream/1970-01-01T00:00:00.000",
+    "arn:aws:dynamodb:us-east-1:000000000000:table/StreamsDescribe",
+])
+def test_describe_stream_rejects_invalid_or_wrong_service_arn(ddb_streams, stream_arn):
+    with pytest.raises(ClientError) as exc:
+        ddb_streams.describe_stream(StreamArn=stream_arn)
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
 # ---------------------------------------------------------------------------
 # GetShardIterator / GetRecords
 # ---------------------------------------------------------------------------
@@ -265,6 +276,21 @@ def test_get_shard_iterator_missing_sequence_number(ddb, ddb_streams):
             ShardIteratorType="AT_SEQUENCE_NUMBER",
         )
     assert exc.value.response["Error"]["Code"] == "ValidationException"
+
+
+@pytest.mark.parametrize("stream_arn", [
+    "arn:aws:dynamodb:us-east-1:000000000000",
+    "arn:aws:sns:us-east-1:000000000000:table/StreamsValidateSeq/stream/1970-01-01T00:00:00.000",
+    "arn:aws:dynamodb:us-east-1:000000000000:table/StreamsValidateSeq",
+])
+def test_get_shard_iterator_rejects_invalid_or_wrong_service_arn(ddb_streams, stream_arn):
+    with pytest.raises(ClientError) as exc:
+        ddb_streams.get_shard_iterator(
+            StreamArn=stream_arn,
+            ShardId=_DEFAULT_SHARD_ID,
+            ShardIteratorType="TRIM_HORIZON",
+        )
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
 
 
 def test_get_records_rejects_garbage_iterator(ddb_streams):

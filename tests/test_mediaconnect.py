@@ -140,8 +140,31 @@ def test_mediaconnect_update_unknown_flow_404(mc):
 # ListTagsForResource
 # ---------------------------------------------------------------------------
 
-def test_mediaconnect_list_tags_unknown_resource_returns_empty(mc):
-    bogus = f"arn:aws:mediaconnect:{REGION}:000000000000:flow:{uuid.uuid4()}:nope"
-    resp = mc.list_tags_for_resource(ResourceArn=bogus)
+def test_mediaconnect_list_tags_for_created_flow_returns_empty_map(mc):
+    name = f"flow-tags-{_uid()}"
+    flow = mc.create_flow(Name=name, Source=_basic_source())["Flow"]
+
+    resp = mc.list_tags_for_resource(ResourceArn=flow["FlowArn"])
     # AWS returns no Tags key when the map is empty; boto3 may include {} or omit.
     assert resp.get("Tags", {}) == {}
+
+
+def test_mediaconnect_list_tags_unknown_resource_404(mc):
+    bogus = f"arn:aws:mediaconnect:{REGION}:000000000000:flow:{uuid.uuid4()}:nope"
+    with pytest.raises(ClientError) as e:
+        mc.list_tags_for_resource(ResourceArn=bogus)
+    assert e.value.response["Error"]["Code"] == "NotFoundException"
+
+
+@pytest.mark.parametrize(
+    ("arn", "code"),
+    [
+        ("not-an-arn", "BadRequestException"),
+        ("arn:aws:sqs:us-east-1:000000000000:flow:abc:nope", "BadRequestException"),
+        ("arn:aws:mediaconnect:us-west-2:000000000000:flow:abc:nope", "BadRequestException"),
+    ],
+)
+def test_mediaconnect_list_tags_requires_local_flow_arn(mc, arn, code):
+    with pytest.raises(ClientError) as e:
+        mc.list_tags_for_resource(ResourceArn=arn)
+    assert e.value.response["Error"]["Code"] == code

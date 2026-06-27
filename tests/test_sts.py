@@ -27,7 +27,7 @@ def test_sts_assume_role_returns_credentials(sts):
     assert resp["AssumedRoleUser"]["Arn"]
 
 def test_sts_get_access_key_info(sts):
-    resp = sts.get_access_key_info(AccessKeyId="AKIAIOSFODNN7EXAMPLE")
+    resp = sts.get_access_key_info(AccessKeyId="test-key-do-not-use")
     assert "Account" in resp
     assert resp["Account"] == "000000000000"
 
@@ -72,6 +72,58 @@ def test_sts_assumed_role_arn_uses_sts_service(sts):
     )
     arn_wi = resp_wi["AssumedRoleUser"]["Arn"]
     assert arn_wi == "arn:aws:sts::000000000000:assumed-role/demo/WebSess", arn_wi
+
+
+def test_sts_assume_role_allows_colon_in_role_path(sts):
+    resp = sts.assume_role(
+        RoleArn="arn:aws:iam::000000000000:role/team:dev/demo",
+        RoleSessionName="PathSess",
+    )
+
+    assert resp["AssumedRoleUser"]["Arn"] == (
+        "arn:aws:sts::000000000000:assumed-role/demo/PathSess"
+    )
+
+
+@pytest.mark.parametrize(
+    "role_arn",
+    [
+        "not-an-arn-but-long-enough",
+        "arn:aws:lambda:us-east-1:000000000000:function:demo",
+        "arn:aws:iam::000000000000:user/demo",
+        "arn:aws:iam:us-east-1:000000000000:role/demo",
+        "arn:aws:iam::not-an-account:role/demo",
+        "arn:aws:iam::000000000000:role/demo:bad",
+        "arn:aws:iam::000000000000:role/",
+    ],
+)
+def test_sts_assume_role_rejects_invalid_role_arns(sts, role_arn):
+    with pytest.raises(ClientError) as exc:
+        sts.assume_role(RoleArn=role_arn, RoleSessionName="BadRoleArn")
+
+    assert exc.value.response["Error"]["Code"] == "ValidationError"
+
+
+@pytest.mark.parametrize(
+    "role_arn",
+    [
+        "not-an-arn-but-long-enough",
+        "arn:aws:sts::000000000000:assumed-role/demo/session",
+        "arn:aws:iam::not-an-account:role/demo",
+        "arn:aws:iam::000000000000:role/demo:bad",
+        "arn:aws:iam::000000000000:policy/demo",
+    ],
+)
+def test_sts_assume_role_with_web_identity_rejects_invalid_role_arns(sts, role_arn):
+    with pytest.raises(ClientError) as exc:
+        sts.assume_role_with_web_identity(
+            RoleArn=role_arn,
+            RoleSessionName="BadRoleArnWebIdentity",
+            WebIdentityToken="dummy.jwt.token",
+        )
+
+    assert exc.value.response["Error"]["Code"] == "ValidationError"
+
 
 def test_sts_get_session_token(sts):
     resp = sts.get_session_token(DurationSeconds=900)

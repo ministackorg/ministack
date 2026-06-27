@@ -63,12 +63,13 @@ import string
 import time
 import zlib
 from datetime import datetime, timezone
-from urllib.parse import parse_qs, quote, unquote_plus, urlencode
+from urllib.parse import parse_qs, quote, urlencode
 from xml.etree.ElementTree import Element, SubElement
 from xml.etree.ElementTree import tostring as xml_tostring
 
 from defusedxml.ElementTree import fromstring as safe_xml_parse
 
+from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.persistence import PERSIST_STATE, load_state
 from ministack.core.responses import (
     AccountScopedDict,
@@ -390,6 +391,50 @@ def _identity_id(pool_id: str) -> str:
     return f"{get_region()}:{new_uuid()}"
 
 
+class _InvalidCognitoIdentityArn(ValueError):
+    pass
+
+
+class _InvalidCognitoIdpArn(ValueError):
+    pass
+
+
+def _user_pool_id_from_arn(resource_arn: str) -> str | None:
+    try:
+        spec = parse_arn(resource_arn)
+    except ArnParseError as exc:
+        raise _InvalidCognitoIdpArn("Invalid Cognito IDP resource ARN.") from exc
+    if spec.service != "cognito-idp":
+        raise _InvalidCognitoIdpArn("Invalid Cognito IDP resource ARN.")
+    if spec.region != get_region() or spec.account_id != get_account_id():
+        return None
+    prefix = "userpool/"
+    if not spec.resource.startswith(prefix):
+        raise _InvalidCognitoIdpArn("Invalid Cognito IDP resource ARN.")
+    pool_id = spec.resource[len(prefix):]
+    if not pool_id:
+        raise _InvalidCognitoIdpArn("Invalid Cognito IDP resource ARN.")
+    return pool_id
+
+
+def _identity_pool_id_from_arn(resource_arn: str) -> str | None:
+    try:
+        spec = parse_arn(resource_arn)
+    except ArnParseError as exc:
+        raise _InvalidCognitoIdentityArn("Invalid Cognito Identity resource ARN.") from exc
+    if spec.service != "cognito-identity":
+        raise _InvalidCognitoIdentityArn("Invalid Cognito Identity resource ARN.")
+    if spec.region != get_region() or spec.account_id != get_account_id():
+        return None
+    prefix = "identitypool/"
+    if not spec.resource.startswith(prefix):
+        raise _InvalidCognitoIdentityArn("Invalid Cognito Identity resource ARN.")
+    pool_id = spec.resource[len(prefix):]
+    if not pool_id:
+        raise _InvalidCognitoIdentityArn("Invalid Cognito Identity resource ARN.")
+    return pool_id
+
+
 def _fake_token(sub: str, pool_id: str, client_id: str, token_type: str = "access",
                  username: str = "", user_attrs: dict | None = None,
                  groups: list[str] | None = None,
@@ -523,11 +568,11 @@ def _apply_pretoken_trigger(pool_id: str, claims: dict, token_type: str,
     try:
         # Lazy import to avoid a circular dependency between cognito and lambda_svc.
         from ministack.services import lambda_svc
-        name, qualifier = lambda_svc._resolve_name_and_qualifier(arn)
-        record, alias = lambda_svc._get_func_record_for_qualifier(name, qualifier)
-        if record is None:
+        record, config, _name = lambda_svc._get_func_record_for_ref(arn)
+        if record is None or config is None:
             raise RuntimeError(f"PreTokenGeneration Lambda not found: {arn}")
-        result = lambda_svc._execute_function(record, event)
+        exec_record = lambda_svc._execution_record_for_config(record, config)
+        result = lambda_svc._execute_function_with_config_scope(exec_record, event)
     except Exception as e:
         logger.warning("PreTokenGeneration Lambda invocation failed for pool %s: %s",
                        pool_id, e)
@@ -1231,12 +1276,12 @@ def _authenticate_client(headers: dict, form: dict):
         try:
             decoded = base64.b64decode(auth.split(" ", 1)[1]).decode("utf-8")
             cid, csec = decoded.split(":", 1)
-            # RFC 6749 §2.3.1: the client id and secret are
-            # application/x-www-form-urlencoded before base64, so a secret
-            # containing "/" or "+" arrives as %2F/%2B and must be decoded to
-            # match the stored value. The client_secret_post path already gets
-            # this via parse_qs.
-            return unquote_plus(cid), unquote_plus(csec)
+            # AWS Cognito compares the HTTP Basic client_id/client_secret exactly
+            # as sent — it does NOT url-decode them. Real clients (incl. Go/Vault)
+            # base64 the raw "id:secret" without form-urlencoding, so a secret
+            # containing "+" or "/" must be matched verbatim. Decoding here would
+            # corrupt any secret containing "+" (→ space) and break valid auth (#932).
+            return cid, csec
         except Exception:
             pass
     return form.get("client_id", ""), form.get("client_secret", "")
@@ -3587,30 +3632,41 @@ def _verify_software_token(data):
 def _idp_tag_resource(data):
     arn = data.get("ResourceArn", "")
     tags = data.get("Tags", {})
-    # Find pool by ARN
-    for pool in _user_pools.values():
-        if pool["Arn"] == arn:
-            pool["UserPoolTags"].update(tags)
-            return json_response({})
+    try:
+        pid = _user_pool_id_from_arn(arn)
+    except _InvalidCognitoIdpArn as exc:
+        return error_response_json("InvalidParameterException", str(exc), 400)
+    pool = _user_pools.get(pid) if pid else None
+    if pool and pool.get("Arn") == arn:
+        pool["UserPoolTags"].update(tags)
+        return json_response({})
     return error_response_json("ResourceNotFoundException", f"Resource {arn} not found.", 400)
 
 
 def _idp_untag_resource(data):
     arn = data.get("ResourceArn", "")
     tag_keys = data.get("TagKeys", [])
-    for pool in _user_pools.values():
-        if pool["Arn"] == arn:
-            for k in tag_keys:
-                pool["UserPoolTags"].pop(k, None)
-            return json_response({})
+    try:
+        pid = _user_pool_id_from_arn(arn)
+    except _InvalidCognitoIdpArn as exc:
+        return error_response_json("InvalidParameterException", str(exc), 400)
+    pool = _user_pools.get(pid) if pid else None
+    if pool and pool.get("Arn") == arn:
+        for k in tag_keys:
+            pool["UserPoolTags"].pop(k, None)
+        return json_response({})
     return error_response_json("ResourceNotFoundException", f"Resource {arn} not found.", 400)
 
 
 def _idp_list_tags_for_resource(data):
     arn = data.get("ResourceArn", "")
-    for pool in _user_pools.values():
-        if pool["Arn"] == arn:
-            return json_response({"Tags": pool.get("UserPoolTags", {})})
+    try:
+        pid = _user_pool_id_from_arn(arn)
+    except _InvalidCognitoIdpArn as exc:
+        return error_response_json("InvalidParameterException", str(exc), 400)
+    pool = _user_pools.get(pid) if pid else None
+    if pool and pool.get("Arn") == arn:
+        return json_response({"Tags": pool.get("UserPoolTags", {})})
     return error_response_json("ResourceNotFoundException", f"Resource {arn} not found.", 400)
 
 
@@ -4694,8 +4750,12 @@ def _unlink_identity(data):
 def _identity_tag_resource(data):
     arn = data.get("ResourceArn", "")
     tags = data.get("Tags", {})
-    # ARN format: arn:aws:cognito-identity:region:account:identitypool/id
-    iid = arn.split("/")[-1] if "/" in arn else arn
+    try:
+        iid = _identity_pool_id_from_arn(arn)
+    except _InvalidCognitoIdentityArn as exc:
+        return error_response_json("InvalidParameterException", str(exc), 400)
+    if not iid or iid not in _identity_pools:
+        return error_response_json("ResourceNotFoundException", f"Resource {arn} not found.", 400)
     _identity_tags.setdefault(iid, {}).update(tags)
     return json_response({})
 
@@ -4703,7 +4763,12 @@ def _identity_tag_resource(data):
 def _identity_untag_resource(data):
     arn = data.get("ResourceArn", "")
     tag_keys = data.get("TagKeys", [])
-    iid = arn.split("/")[-1] if "/" in arn else arn
+    try:
+        iid = _identity_pool_id_from_arn(arn)
+    except _InvalidCognitoIdentityArn as exc:
+        return error_response_json("InvalidParameterException", str(exc), 400)
+    if not iid or iid not in _identity_pools:
+        return error_response_json("ResourceNotFoundException", f"Resource {arn} not found.", 400)
     for k in tag_keys:
         _identity_tags.get(iid, {}).pop(k, None)
     return json_response({})
@@ -4711,7 +4776,12 @@ def _identity_untag_resource(data):
 
 def _identity_list_tags_for_resource(data):
     arn = data.get("ResourceArn", "")
-    iid = arn.split("/")[-1] if "/" in arn else arn
+    try:
+        iid = _identity_pool_id_from_arn(arn)
+    except _InvalidCognitoIdentityArn as exc:
+        return error_response_json("InvalidParameterException", str(exc), 400)
+    if not iid or iid not in _identity_pools:
+        return error_response_json("ResourceNotFoundException", f"Resource {arn} not found.", 400)
     return json_response({"Tags": _identity_tags.get(iid, {})})
 
 

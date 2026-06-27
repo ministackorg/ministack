@@ -19,6 +19,7 @@ import secrets as stdlib_secrets
 import string
 import time
 
+from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.responses import (
     AccountScopedDict,
     error_response_json,
@@ -76,6 +77,25 @@ except Exception:
 # Helpers
 # ---------------------------------------------------------------------------
 
+def _secret_name_from_arn(secret_id):
+    try:
+        spec = parse_arn(secret_id)
+    except ArnParseError:
+        return None
+    if (
+        spec.partition != "aws"
+        or spec.service != "secretsmanager"
+        or spec.region != get_region()
+        or spec.account_id != get_account_id()
+    ):
+        return None
+    prefix = "secret:"
+    if not spec.resource.startswith(prefix):
+        return None
+    name = spec.resource[len(prefix):]
+    return name or None
+
+
 def _resolve(secret_id):
     """Look up a secret by name or ARN.  Returns (storage_key, record) or (None, None).
 
@@ -86,16 +106,21 @@ def _resolve(secret_id):
     """
     if not secret_id:
         return None, None
+    if secret_id.startswith("arn:"):
+        if not _secret_name_from_arn(secret_id):
+            return None, None
+        for key, s in _secrets.items():
+            if s["ARN"] == secret_id:
+                return key, s
+        for key, s in _secrets.items():
+            if s["ARN"].startswith(secret_id):
+                return key, s
+        return None, None
     if secret_id in _secrets:
         return secret_id, _secrets[secret_id]
     for key, s in _secrets.items():
         if s["ARN"] == secret_id:
             return key, s
-    # Partial ARN: prefix match against stored ARNs (AWS behaviour)
-    if secret_id.startswith("arn:"):
-        for key, s in _secrets.items():
-            if s["ARN"].startswith(secret_id):
-                return key, s
     return None, None
 
 

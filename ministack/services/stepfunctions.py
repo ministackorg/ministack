@@ -38,8 +38,10 @@ from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import wait as futures_wait
 from datetime import datetime, timezone
 
+from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.persistence import PERSIST_STATE, load_state
 from ministack.core.responses import (
+    AccountRegionScopedDict,
     AccountScopedDict,
     error_response_json,
     get_account_id,
@@ -119,24 +121,24 @@ def _get_mock_response(sm_name: str, test_case: str, state_name: str, attempt: i
                 continue
     return None
 
-_state_machines = AccountScopedDict()
-_executions = AccountScopedDict()
-_task_tokens = AccountScopedDict()
-_tags = AccountScopedDict()
-_activities = AccountScopedDict()
-_activity_tasks = AccountScopedDict()
+_state_machines = AccountRegionScopedDict()
+_executions = AccountRegionScopedDict()
+_task_tokens = AccountRegionScopedDict()
+_tags = AccountRegionScopedDict()
+_activities = AccountRegionScopedDict()
+_activity_tasks = AccountRegionScopedDict()
 
 # version_arn -> {stateMachineVersionArn, stateMachineRevisionId,
 #                 description, creationDate, definition, roleArn, type,
 #                 loggingConfiguration}
 # Version ARN shape: arn:aws:states:<region>:<acct>:stateMachine:<name>:<N>
-_state_machine_versions = AccountScopedDict()
+_state_machine_versions = AccountRegionScopedDict()
 
 # alias_arn -> {stateMachineAliasArn, name, description,
 #               routingConfiguration: [{stateMachineVersionArn, weight}],
 #               creationDate, updateDate}
 # Alias ARN shape: arn:aws:states:<region>:<acct>:stateMachine:<name>:<aliasName>
-_state_machine_aliases = AccountScopedDict()
+_state_machine_aliases = AccountRegionScopedDict()
 
 # ── Persistence ────────────────────────────────────────────
 
@@ -162,7 +164,7 @@ def restore_state(data):
     _state_machine_aliases.update(data.get("state_machine_aliases", {}))
     # Executions that were RUNNING when the process died cannot resume —
     # mark them FAILED, following the ECS precedent (tasks → STOPPED).
-    for exc in _executions.values():
+    for exc in _executions.all_values():
         if exc.get("status") == "RUNNING":
             exc["status"] = "FAILED"
             exc["stopDate"] = now_iso()
@@ -570,12 +572,12 @@ def _start_execution(data):
         ],
     }
 
-    # Propagate the request's contextvars (notably the account ID set by
+    # Propagate the request's contextvars (notably the account ID and region set by
     # set_request_account_id) into the background execution thread. Python's
     # threading.Thread does NOT automatically copy contextvars, so without
-    # this snapshot the worker runs under the default account and silently
-    # fails to find the execution stored in AccountScopedDict under the
-    # caller's account. See issue #639.
+    # this snapshot the worker runs under the default scope and silently
+    # fails to find the execution stored under the caller's account and
+    # region. See issue #639.
     ctx_snapshot = contextvars.copy_context()
     threading.Thread(
         target=ctx_snapshot.run,
@@ -891,7 +893,13 @@ async def _get_activity_task(data):
 def _tag_resource(data):
     arn = data.get("resourceArn")
     new_tags = data.get("tags", [])
-    existing = _tags.setdefault(arn, [])
+    account_id, region, error = _tag_resource_scope_from_arn(arn)
+    if error:
+        return error
+    existing = _tags.get_scoped(account_id, region, arn)
+    if existing is None:
+        existing = []
+        _tags.set_scoped(account_id, region, arn, existing)
     existing_map = {t["key"]: i for i, t in enumerate(existing)}
     for tag in new_tags:
         idx = existing_map.get(tag["key"])
@@ -906,14 +914,57 @@ def _tag_resource(data):
 def _untag_resource(data):
     arn = data.get("resourceArn")
     keys_to_remove = set(data.get("tagKeys", []))
-    existing = _tags.get(arn, [])
-    _tags[arn] = [t for t in existing if t["key"] not in keys_to_remove]
+    account_id, region, error = _tag_resource_scope_from_arn(arn)
+    if error:
+        return error
+    existing = _tags.get_scoped(account_id, region, arn, [])
+    _tags.set_scoped(
+        account_id,
+        region,
+        arn,
+        [t for t in existing if t["key"] not in keys_to_remove],
+    )
     return json_response({})
 
 
 def _list_tags_for_resource(data):
     arn = data.get("resourceArn")
-    return json_response({"tags": _tags.get(arn, [])})
+    account_id, region, error = _tag_resource_scope_from_arn(arn)
+    if error:
+        return error
+    return json_response({"tags": _tags.get_scoped(account_id, region, arn, [])})
+
+
+def _tag_resource_scope_from_arn(arn):
+    try:
+        spec = parse_arn(arn)
+    except ArnParseError:
+        return None, None, _invalid_tag_resource_arn(arn)
+    if spec.service != "states" or not _is_stepfunctions_taggable_resource(spec.resource):
+        return None, None, _invalid_tag_resource_arn(arn)
+    if spec.account_id != get_account_id():
+        return None, None, error_response_json(
+            "AccessDeniedException",
+            "User is not authorized to access this resource.",
+            400,
+        )
+    if spec.region != get_region():
+        return None, None, error_response_json(
+            "InvalidArn",
+            f"Invalid ARN: {arn} is expected to be within the request region {get_region()}.",
+            400,
+        )
+    return spec.account_id, spec.region, None
+
+
+def _is_stepfunctions_taggable_resource(resource):
+    return isinstance(resource, str) and (
+        resource.startswith("stateMachine:") or resource.startswith("activity:")
+    )
+
+
+def _invalid_tag_resource_arn(arn):
+    return error_response_json("InvalidArn", f"Invalid resource ARN: {arn}", 400)
 
 
 # ---------------------------------------------------------------------------
@@ -1487,16 +1538,15 @@ def _execute_task(state_def, raw_input, execution, ctx):
 def _invoke_resource(resource, input_data):
     """Dispatch to Lambda or return a mock/passthrough."""
     if "states:::lambda:invoke" in resource:
-        func_name = input_data.get("FunctionName", "")
+        func_ref = input_data.get("FunctionName", "")
         payload = input_data.get("Payload", input_data)
-        if ":function:" in func_name:
-            func_name = func_name.split(":function:")[-1].split(":")[0]
-        result = _call_lambda(func_name, payload)
+        func_ref = _resolve_lambda_function_ref(func_ref, optimized=True)
+        result = _call_lambda(func_ref, payload)
         return {"StatusCode": 200, "Payload": result}
 
-    func_name = _extract_lambda_name(resource)
-    if func_name:
-        return _call_lambda(func_name, input_data)
+    func_ref = _extract_lambda_ref(resource)
+    if func_ref:
+        return _call_lambda(func_ref, input_data)
 
     # Activity resource — enqueue task and wait for worker to call GetActivityTask + SendTask*
     if ":activity:" in resource:
@@ -1559,13 +1609,12 @@ def _invoke_with_callback(resource, input_data, token, state_def):
         "event": evt, "result": None, "error": None, "heartbeat": None}
 
     clean_resource = resource.replace(".waitForTaskToken", "")
-    func_name = _extract_lambda_name(clean_resource)
-    if not func_name and "states:::lambda:invoke" in clean_resource:
-        func_name = input_data.get("FunctionName", "")
-        if ":function:" in func_name:
-            func_name = func_name.split(":function:")[-1].split(":")[0]
+    func_ref = _extract_lambda_ref(clean_resource)
+    if not func_ref and "states:::lambda:invoke" in clean_resource:
+        func_ref = input_data.get("FunctionName", "")
+        func_ref = _resolve_lambda_function_ref(func_ref, optimized=True)
 
-    if func_name:
+    if func_ref:
         # For lambda:invoke[.waitForTaskToken] the resolved Parameters wrap the
         # Lambda event under "Payload" (alongside "FunctionName"). Deliver only
         # the Payload, mirroring the synchronous lambda:invoke path
@@ -1575,7 +1624,7 @@ def _invoke_with_callback(resource, input_data, token, state_def):
         lambda_payload = input_data.get("Payload", input_data) \
             if isinstance(input_data, dict) else input_data
         try:
-            _call_lambda(func_name, lambda_payload)
+            _call_lambda(func_ref, lambda_payload)
         except _ExecutionError:
             pass
     else:
@@ -1615,21 +1664,22 @@ def _invoke_with_callback(resource, input_data, token, state_def):
         return result_raw
 
 
-def _call_lambda(func_name, event):
+def _call_lambda(func_ref, event):
     """Invoke a Lambda via the co-located lambda_svc module (synchronous)."""
     try:
         from ministack.services import lambda_svc
     except ImportError:
-        logger.warning("lambda_svc unavailable; returning passthrough for %s", func_name)
+        logger.warning("lambda_svc unavailable; returning passthrough for %s", func_ref)
         return event
 
-    func = lambda_svc._functions.get(func_name)
-    if not func:
+    func, config, func_name = lambda_svc._get_func_record_for_ref(func_ref)
+    if not func or not config:
         raise _ExecutionError(
             "Lambda.ResourceNotFoundException",
             f"Function not found: {func_name}")
 
-    result = lambda_svc._execute_function(func, event)
+    exec_record = lambda_svc._execution_record_for_config(func, config)
+    result = lambda_svc._execute_function_with_config_scope(exec_record, event)
 
     if result.get("error"):
         body = result.get("body", {})
@@ -1847,7 +1897,7 @@ def _execute_parallel(state_def, raw_input, execution, ctx):
             errors[idx] = exc
 
     # Each branch runs in its own thread; propagate the parent's contextvars
-    # so AccountScopedDict lookups (account ID, region) keep resolving to the
+    # so scoped store lookups (account ID, region) keep resolving to the
     # current execution's tenant. Take a fresh copy_context() per branch —
     # a single Context cannot be entered by two threads concurrently. See
     # issue #639.
@@ -1913,7 +1963,7 @@ def _execute_map(state_def, raw_input, execution, ctx):
     workers = max_conc if max_conc > 0 else (len(items) or 1)
     # ThreadPoolExecutor workers do not inherit the submitting thread's
     # contextvars, so wrap each submitted callable with copy_context().run
-    # to keep AccountScopedDict lookups bound to the current tenant. Take
+    # to keep scoped store lookups bound to the current tenant. Take
     # a fresh copy_context() per item — a single Context cannot be entered
     # by two threads concurrently. See issue #639.
     with ThreadPoolExecutor(max_workers=workers) as pool:
@@ -3722,11 +3772,106 @@ def _find_matching_catcher(catchers, error):
 # ===================================================================
 
 def _extract_lambda_name(resource):
+    func_ref = _extract_lambda_ref(resource)
+    if not func_ref:
+        return None
+    if isinstance(func_ref, str) and func_ref.startswith("arn:"):
+        try:
+            spec = parse_arn(func_ref)
+        except ArnParseError:
+            return None
+        parts = spec.resource.split(":", 2)
+        if len(parts) >= 2 and parts[0] == "function":
+            return parts[1]
+    if isinstance(func_ref, str) and ":" in func_ref:
+        return func_ref.split(":", 1)[0]
+    return func_ref
+
+
+def _extract_lambda_ref(resource):
     if not resource:
         return None
     if ":function:" in resource:
-        return resource.split(":function:")[-1].split(":")[0]
+        return _resolve_lambda_function_ref(resource, optimized=False)
     return None
+
+
+def _resolve_lambda_function_name(value, optimized):
+    func_ref = _resolve_lambda_function_ref(value, optimized)
+    if not isinstance(func_ref, str):
+        return func_ref
+    if func_ref.startswith("arn:"):
+        try:
+            spec = parse_arn(func_ref)
+        except ArnParseError:
+            return func_ref
+        parts = spec.resource.split(":", 2)
+        if len(parts) >= 2 and parts[0] == "function":
+            return parts[1]
+    if ":" in func_ref:
+        return func_ref.split(":", 1)[0]
+    return func_ref
+
+
+def _lambda_ref_error(value, optimized, message):
+    if optimized:
+        raise _ExecutionError(
+            "Lambda.ResourceNotFoundException",
+            f"Function not found: {value}. {message}",
+        )
+    raise _ExecutionError(
+        "States.Runtime",
+        f"Invalid Lambda resource '{value}': {message}",
+    )
+
+
+def _resolve_lambda_function_ref(value, optimized):
+    if not value:
+        return value
+    if not isinstance(value, str):
+        return value
+    if ":function:" not in value:
+        return value
+
+    if not value.startswith("arn:"):
+        return value.split(":function:")[-1]
+
+    try:
+        spec = parse_arn(value)
+    except ArnParseError as exc:
+        _lambda_ref_error(value, optimized, str(exc))
+    if spec.service != "lambda":
+        _lambda_ref_error(value, optimized, f"expected Lambda ARN, got {spec.service!r}")
+
+    parts = spec.resource.split(":", 2)
+    if len(parts) < 2 or parts[0] != "function":
+        _lambda_ref_error(value, optimized, "expected resource shape function:<name>[:qualifier]")
+
+    if spec.account_id != get_account_id():
+        if optimized:
+            raise _ExecutionError(
+                "Lambda.AWSLambdaException",
+                f"User is not authorized to access function {value}",
+            )
+        raise _ExecutionError(
+            "States.Runtime",
+            f"The resource '{value}' belongs to a different account. "
+            f"Expected '{get_account_id()}', was '{spec.account_id}'.",
+        )
+
+    if spec.region != get_region():
+        if optimized:
+            raise _ExecutionError(
+                "Lambda.ResourceNotFoundException",
+                f"Functions from '{spec.region}' are not reachable in this region ('{get_region()}')",
+            )
+        raise _ExecutionError(
+            "States.Runtime",
+            f"The resource '{value}' belongs to a different region. "
+            f"Expected '{get_region()}', was '{spec.region}'.",
+        )
+
+    return value
 
 
 def _next_or_end(state_def):
@@ -4044,6 +4189,18 @@ _AWS_SDK_ERROR_PREFIX = {
     "lambda": "Lambda",
 }
 
+_AWS_SDK_ERROR_CODE_OVERRIDES = {
+    "rds": {
+        "GlobalClusterNotFoundFault": "GlobalClusterNotFoundException",
+        "DBClusterNotFoundFault": "DbClusterNotFoundException",
+        "GlobalClusterAlreadyExistsFault": "GlobalClusterAlreadyExistsException",
+        "InvalidGlobalClusterStateFault": "InvalidGlobalClusterStateException",
+        "InvalidDBClusterStateFault": "InvalidDbClusterStateException",
+        "InvalidParameterCombination": "RdsException",
+        "InvalidParameterValue": "RdsException",
+    },
+}
+
 
 def _prefix_sdk_error(service_name: str, error_code: str) -> str:
     """Prefix an SDK error code with the service name, matching real AWS SFN behavior.
@@ -4054,6 +4211,7 @@ def _prefix_sdk_error(service_name: str, error_code: str) -> str:
     """
     if error_code.startswith("States."):
         return error_code
+    error_code = _AWS_SDK_ERROR_CODE_OVERRIDES.get(service_name, {}).get(error_code, error_code)
     prefix = _AWS_SDK_ERROR_PREFIX.get(service_name, service_name.capitalize())
     if error_code.startswith(f"{prefix}."):
         return error_code
@@ -4222,7 +4380,7 @@ _XML_LIST_WRAPPER_TAGS = frozenset({
     "OptionGroupMemberships", "StatusInfos", "DomainMemberships",
     "AssociatedRoles", "TagList", "ProcessorFeatures",
     "EnabledCloudwatchLogsExports", "GlobalClusterMembers",
-    "DBParameterGroups", "DBInstances", "DBClusters",
+    "DBParameterGroups", "DBInstances", "DBClusters", "Readers",
     "SupportedNetworkTypes",
 })
 _XML_BOOLEAN_FIELDS = frozenset({
@@ -4231,7 +4389,7 @@ _XML_BOOLEAN_FIELDS = frozenset({
     "CopyTagsToSnapshot", "IamDatabaseAuthenticationEnabled",
     "PerformanceInsightsEnabled", "HttpEndpointEnabled",
     "CrossAccountClone", "CustomerOwnedIpEnabled",
-    "IsStorageConfigUpgradeAvailable", "IsWriter",
+    "IsStorageConfigUpgradeAvailable", "IsWriter", "IsDataLossAllowed",
 })
 
 
@@ -4324,11 +4482,17 @@ _AWS_ACRONYMS = frozenset({
 })
 
 # Most query-protocol RDS params expand SDK-style "Db" to wire-format "DB".
-# RemoveFromGlobalCluster is the AWS-shape exception: its member is
+# Some global-cluster operations are AWS-shape exceptions: their members use
 # "DbClusterIdentifier", and sending "DBClusterIdentifier" is ignored.
 _QUERY_PARAM_NAME_OVERRIDES = {
     ("rds", "RemoveFromGlobalCluster"): {
         "DbClusterIdentifier": "DbClusterIdentifier",
+    },
+    ("rds", "SwitchoverGlobalCluster"): {
+        "TargetDbClusterIdentifier": "TargetDbClusterIdentifier",
+    },
+    ("rds", "FailoverGlobalCluster"): {
+        "TargetDbClusterIdentifier": "TargetDbClusterIdentifier",
     },
     ("ec2", "CreateSecurityGroup"): {
         "Description": "GroupDescription",

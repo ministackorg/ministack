@@ -31,12 +31,14 @@ import copy
 import json
 import logging
 import os
+import re
 import time
 from urllib.parse import unquote
 
+from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.persistence import PERSIST_STATE, load_state
 from ministack.core.responses import (
-    AccountScopedDict,
+    AccountRegionScopedDict,
     error_response_json,
     get_account_id,
     get_region,
@@ -49,12 +51,13 @@ logger = logging.getLogger("s3tables")
 
 _MINISTACK_HOST = os.environ.get("MINISTACK_HOST", "localhost")
 _GATEWAY_PORT = os.environ.get("GATEWAY_PORT", "4566")
+_SIGV4_CREDENTIAL_REGION_RE = re.compile(r"Credential=[^/]+/[^/]+/([^/]+)/")
 
 # ── In-memory state ────────────────────────────────────────
 
-_table_buckets = AccountScopedDict()
-_namespaces = AccountScopedDict()        # "bucket_arn\x00namespace" -> ns dict
-_tables = AccountScopedDict()            # "bucket_arn\x00namespace\x00table" -> table dict
+_table_buckets = AccountRegionScopedDict()
+_namespaces = AccountRegionScopedDict()        # "bucket_arn\x00namespace" -> ns dict
+_tables = AccountRegionScopedDict()            # "bucket_arn\x00namespace\x00table" -> table dict
 
 
 # ── Persistence ────────────────────────────────────────────
@@ -95,6 +98,36 @@ def _table_arn(bucket_arn, namespace, table_name):
     return f"{bucket_arn}/table/{namespace}/{table_name}"
 
 
+def _bucket_name_from_arn(bucket_arn):
+    try:
+        spec = parse_arn(bucket_arn)
+    except ArnParseError:
+        return None
+    if (
+        spec.partition != "aws"
+        or spec.service != "s3tables"
+        or spec.region != get_region()
+        or spec.account_id != get_account_id()
+    ):
+        return None
+    prefix = "bucket/"
+    if not spec.resource.startswith(prefix):
+        return None
+    name = spec.resource[len(prefix):]
+    if not name or "/" in name:
+        return None
+    return name
+
+
+def _canonical_bucket_arn(bucket_ref):
+    if not isinstance(bucket_ref, str) or not bucket_ref:
+        return None
+    if not bucket_ref.startswith("arn:"):
+        return _bucket_arn(bucket_ref)
+    name = _bucket_name_from_arn(bucket_ref)
+    return _bucket_arn(name) if name else None
+
+
 def _ns_key(bucket_arn, namespace):
     return f"{bucket_arn}\x00{namespace}"
 
@@ -104,10 +137,42 @@ def _table_key(bucket_arn, namespace, table_name):
 
 
 def _find_bucket_by_arn(arn):
+    arn = _canonical_bucket_arn(arn)
+    if not arn:
+        return None
     for b in _table_buckets.values():
         if b["arn"] == arn:
             return b
     return None
+
+
+def _existing_bucket_arn(bucket_ref):
+    arn = _canonical_bucket_arn(bucket_ref)
+    if not arn or not _find_bucket_by_arn(arn):
+        return None
+    return arn
+
+
+def _bucket_not_found(bucket_ref):
+    return error_response_json("NotFoundException", f"Table bucket not found: {bucket_ref}", 404)
+
+
+def _account_values(store):
+    return [value for key, value in store.all_items() if key[0] == get_account_id()]
+
+
+def _iceberg_values(store, predicate, allow_cross_region):
+    values = _account_values(store) if allow_cross_region else store.values()
+    return [value for value in values if predicate(value)]
+
+
+def _namespace_name(value):
+    return value["namespace"][0] if isinstance(value.get("namespace"), list) else value.get("namespace", "")
+
+
+def _set_bucket_region_value(store, bucket_arn, key, value):
+    spec = parse_arn(bucket_arn)
+    store.set_scoped(spec.account_id, spec.region, key, value)
 
 
 def _to_iceberg_type(kind):
@@ -158,18 +223,22 @@ def _list_table_buckets():
 def _get_table_bucket(arn):
     bucket = _find_bucket_by_arn(arn)
     if not bucket:
-        return error_response_json("NotFoundException", f"Table bucket not found: {arn}", 404)
+        return _bucket_not_found(arn)
     return json_response(bucket)
 
 
 def _delete_table_bucket(arn):
+    raw_arn = arn
+    arn = _canonical_bucket_arn(arn)
+    if not arn:
+        return _bucket_not_found(raw_arn)
     name = None
     for n, b in _table_buckets.items():
         if b["arn"] == arn:
             name = n
             break
     if not name:
-        return error_response_json("NotFoundException", f"Table bucket not found: {arn}", 404)
+        return _bucket_not_found(arn)
     for key in list(_tables.keys()):
         if key.startswith(arn + "\x00"):
             del _tables[key]
@@ -181,6 +250,10 @@ def _delete_table_bucket(arn):
 
 
 def _create_namespace(bucket_arn, data):
+    raw_bucket_arn = bucket_arn
+    bucket_arn = _existing_bucket_arn(bucket_arn)
+    if not bucket_arn:
+        return _bucket_not_found(raw_bucket_arn)
     ns_list = data.get("namespace", [])
     namespace = ns_list[0] if isinstance(ns_list, list) and ns_list else ns_list
     if not namespace:
@@ -196,11 +269,19 @@ def _create_namespace(bucket_arn, data):
 
 
 def _list_namespaces(bucket_arn):
+    raw_bucket_arn = bucket_arn
+    bucket_arn = _existing_bucket_arn(bucket_arn)
+    if not bucket_arn:
+        return _bucket_not_found(raw_bucket_arn)
     result = [ns for ns in _namespaces.values() if ns.get("tableBucketARN") == bucket_arn]
     return json_response({"namespaces": result})
 
 
 def _get_namespace(bucket_arn, namespace):
+    raw_bucket_arn = bucket_arn
+    bucket_arn = _existing_bucket_arn(bucket_arn)
+    if not bucket_arn:
+        return _bucket_not_found(raw_bucket_arn)
     key = _ns_key(bucket_arn, namespace)
     ns = _namespaces.get(key)
     if not ns:
@@ -209,6 +290,10 @@ def _get_namespace(bucket_arn, namespace):
 
 
 def _delete_namespace(bucket_arn, namespace):
+    raw_bucket_arn = bucket_arn
+    bucket_arn = _existing_bucket_arn(bucket_arn)
+    if not bucket_arn:
+        return _bucket_not_found(raw_bucket_arn)
     key = _ns_key(bucket_arn, namespace)
     if key not in _namespaces:
         return error_response_json("NotFoundException", f"Namespace {namespace} not found", 404)
@@ -217,6 +302,10 @@ def _delete_namespace(bucket_arn, namespace):
 
 
 def _create_table(bucket_arn, namespace, data):
+    raw_bucket_arn = bucket_arn
+    bucket_arn = _existing_bucket_arn(bucket_arn)
+    if not bucket_arn:
+        return _bucket_not_found(raw_bucket_arn)
     table_name = data.get("name", "")
     fmt = data.get("format", "ICEBERG")
     if not table_name:
@@ -259,6 +348,10 @@ def _create_table(bucket_arn, namespace, data):
 
 
 def _list_tables(bucket_arn, namespace=None):
+    raw_bucket_arn = bucket_arn
+    bucket_arn = _existing_bucket_arn(bucket_arn)
+    if not bucket_arn:
+        return _bucket_not_found(raw_bucket_arn)
     result = []
     for key, table in _tables.items():
         if not key.startswith(bucket_arn + "\x00"):
@@ -273,6 +366,10 @@ def _list_tables(bucket_arn, namespace=None):
 
 
 def _get_table(bucket_arn, namespace, table_name):
+    raw_bucket_arn = bucket_arn
+    bucket_arn = _existing_bucket_arn(bucket_arn)
+    if not bucket_arn:
+        return _bucket_not_found(raw_bucket_arn)
     key = _table_key(bucket_arn, namespace, table_name)
     table = _tables.get(key)
     if not table:
@@ -281,6 +378,10 @@ def _get_table(bucket_arn, namespace, table_name):
 
 
 def _delete_table(bucket_arn, namespace, table_name):
+    raw_bucket_arn = bucket_arn
+    bucket_arn = _existing_bucket_arn(bucket_arn)
+    if not bucket_arn:
+        return _bucket_not_found(raw_bucket_arn)
     key = _table_key(bucket_arn, namespace, table_name)
     if key not in _tables:
         return error_response_json("NotFoundException", f"Table {table_name} not found", 404)
@@ -289,6 +390,10 @@ def _delete_table(bucket_arn, namespace, table_name):
 
 
 def _get_table_metadata_location(bucket_arn, namespace, table_name):
+    raw_bucket_arn = bucket_arn
+    bucket_arn = _existing_bucket_arn(bucket_arn)
+    if not bucket_arn:
+        return _bucket_not_found(raw_bucket_arn)
     key = _table_key(bucket_arn, namespace, table_name)
     table = _tables.get(key)
     if not table:
@@ -298,6 +403,10 @@ def _get_table_metadata_location(bucket_arn, namespace, table_name):
 
 
 def _update_table_metadata_location(bucket_arn, namespace, table_name, data):
+    raw_bucket_arn = bucket_arn
+    bucket_arn = _existing_bucket_arn(bucket_arn)
+    if not bucket_arn:
+        return _bucket_not_found(raw_bucket_arn)
     key = _table_key(bucket_arn, namespace, table_name)
     table = _tables.get(key)
     if not table:
@@ -315,102 +424,108 @@ def _iceberg_config():
     return json_response({"defaults": {}, "overrides": {}})
 
 
-def _iceberg_list_namespaces():
+def _iceberg_allows_cross_region(headers):
+    return _SIGV4_CREDENTIAL_REGION_RE.search(headers.get("authorization", "")) is None
+
+
+def _iceberg_list_namespaces(allow_cross_region):
     result = []
-    for ns in _namespaces.values():
+    for ns in _iceberg_values(_namespaces, lambda _ns: True, allow_cross_region):
         result.append(ns.get("namespace", []))
     return json_response({"namespaces": result})
 
 
-def _iceberg_get_namespace(namespace):
-    for ns in _namespaces.values():
-        ns_name = ns["namespace"][0] if isinstance(ns.get("namespace"), list) else ns.get("namespace", "")
-        if ns_name == namespace:
-            return json_response({"namespace": [namespace], "properties": {}})
+def _iceberg_get_namespace(namespace, allow_cross_region):
+    if _iceberg_values(_namespaces, lambda ns: _namespace_name(ns) == namespace, allow_cross_region):
+        return json_response({"namespace": [namespace], "properties": {}})
     return error_response_json("NotFoundException", f"Namespace {namespace} not found", 404)
 
 
-def _iceberg_list_tables(namespace):
+def _iceberg_list_tables(namespace, allow_cross_region):
     result = []
-    for table in _tables.values():
-        table_ns = table["namespace"][0] if isinstance(table.get("namespace"), list) else ""
-        if table_ns == namespace:
-            result.append({"namespace": [namespace], "name": table["name"]})
+    for table in _iceberg_values(_tables, lambda table: _namespace_name(table) == namespace, allow_cross_region):
+        result.append({"namespace": [namespace], "name": table["name"]})
     return json_response({"identifiers": result})
 
 
-def _iceberg_load_table(namespace, table_name):
-    for table in _tables.values():
-        table_ns = table["namespace"][0] if isinstance(table.get("namespace"), list) else ""
-        if table_ns == namespace and table["name"] == table_name:
-            return json_response({
-                "metadata-location": table.get("metadataLocation", ""),
-                "metadata": table.get("_iceberg_metadata", {}),
-                "config": {
-                    "s3.access-key-id": "test", "s3.secret-access-key": "test",
-                    "s3.endpoint": f"http://{_MINISTACK_HOST}:{_GATEWAY_PORT}", "s3.path-style-access": "true",
-                },
-            })
+def _iceberg_load_table(namespace, table_name, allow_cross_region):
+    matches = _iceberg_values(
+        _tables,
+        lambda table: _namespace_name(table) == namespace and table["name"] == table_name,
+        allow_cross_region,
+    )
+    if matches:
+        table = matches[0]
+        return json_response({
+            "metadata-location": table.get("metadataLocation", ""),
+            "metadata": table.get("_iceberg_metadata", {}),
+            "config": {
+                "s3.access-key-id": "test", "s3.secret-access-key": "test",
+                "s3.endpoint": f"http://{_MINISTACK_HOST}:{_GATEWAY_PORT}", "s3.path-style-access": "true",
+            },
+        })
     return error_response_json("NotFoundException", f"Table {namespace}.{table_name} not found", 404)
 
 
-def _iceberg_commit_table(namespace, table_name, data):
-    for table in _tables.values():
-        table_ns = table["namespace"][0] if isinstance(table.get("namespace"), list) else ""
-        if table_ns == namespace and table["name"] == table_name:
-            metadata = table.get("_iceberg_metadata", {})
-            for update in data.get("updates", []):
-                action = update.get("action", "")
-                if action == "add-snapshot":
-                    snapshot = update.get("snapshot", {})
-                    metadata.setdefault("snapshots", []).append(snapshot)
-                    metadata["current-snapshot-id"] = snapshot.get("snapshot-id", -1)
-                    metadata["last-updated-ms"] = int(time.time() * 1000)
-                    metadata["last-sequence-number"] = metadata.get("last-sequence-number", 0) + 1
-                elif action == "set-snapshot-ref":
-                    metadata.setdefault("refs", {})[update.get("ref-name", "main")] = {
-                        "snapshot-id": update.get("snapshot-id", -1),
-                        "type": update.get("type", "branch")}
-                elif action == "add-schema":
-                    metadata.setdefault("schemas", []).append(update.get("schema", {}))
-                elif action == "set-current-schema":
-                    metadata["current-schema-id"] = update.get("schema-id", 0)
-                elif action == "add-partition-spec":
-                    metadata.setdefault("partition-specs", []).append(update.get("spec", {}))
-                elif action == "set-default-spec":
-                    metadata["default-spec-id"] = update.get("spec-id", 0)
-                elif action == "add-sort-order":
-                    metadata.setdefault("sort-orders", []).append(update.get("sort-order", {}))
-                elif action == "set-default-sort-order":
-                    metadata["default-sort-order-id"] = update.get("sort-order-id", 0)
-                elif action == "set-properties":
-                    metadata.setdefault("properties", {}).update(update.get("updates", {}))
-                elif action == "remove-properties":
-                    for r in update.get("removals", []):
-                        metadata.get("properties", {}).pop(r, None)
-                elif action == "set-location":
-                    metadata["location"] = update.get("location", "")
+def _iceberg_commit_table(namespace, table_name, data, allow_cross_region):
+    matches = _iceberg_values(
+        _tables,
+        lambda table: _namespace_name(table) == namespace and table["name"] == table_name,
+        allow_cross_region,
+    )
+    if matches:
+        table = matches[0]
+        metadata = table.get("_iceberg_metadata", {})
+        for update in data.get("updates", []):
+            action = update.get("action", "")
+            if action == "add-snapshot":
+                snapshot = update.get("snapshot", {})
+                metadata.setdefault("snapshots", []).append(snapshot)
+                metadata["current-snapshot-id"] = snapshot.get("snapshot-id", -1)
+                metadata["last-updated-ms"] = int(time.time() * 1000)
+                metadata["last-sequence-number"] = metadata.get("last-sequence-number", 0) + 1
+            elif action == "set-snapshot-ref":
+                metadata.setdefault("refs", {})[update.get("ref-name", "main")] = {
+                    "snapshot-id": update.get("snapshot-id", -1),
+                    "type": update.get("type", "branch")}
+            elif action == "add-schema":
+                metadata.setdefault("schemas", []).append(update.get("schema", {}))
+            elif action == "set-current-schema":
+                metadata["current-schema-id"] = update.get("schema-id", 0)
+            elif action == "add-partition-spec":
+                metadata.setdefault("partition-specs", []).append(update.get("spec", {}))
+            elif action == "set-default-spec":
+                metadata["default-spec-id"] = update.get("spec-id", 0)
+            elif action == "add-sort-order":
+                metadata.setdefault("sort-orders", []).append(update.get("sort-order", {}))
+            elif action == "set-default-sort-order":
+                metadata["default-sort-order-id"] = update.get("sort-order-id", 0)
+            elif action == "set-properties":
+                metadata.setdefault("properties", {}).update(update.get("updates", {}))
+            elif action == "remove-properties":
+                for r in update.get("removals", []):
+                    metadata.get("properties", {}).pop(r, None)
+            elif action == "set-location":
+                metadata["location"] = update.get("location", "")
 
-            table["_metadata_version"] = table.get("_metadata_version", 0) + 1
-            v = table["_metadata_version"]
-            bucket_name = table.get("tableBucketARN", "").rsplit("/", 1)[-1]
-            new_loc = f"s3://{bucket_name}/{namespace}/{table_name}/metadata/v{v}.metadata.json"
-            table["metadataLocation"] = new_loc
-            table["modifiedAt"] = now_iso()
-            return json_response({"metadata-location": new_loc, "metadata": metadata})
+        table["_metadata_version"] = table.get("_metadata_version", 0) + 1
+        v = table["_metadata_version"]
+        bucket_name = table.get("tableBucketARN", "").rsplit("/", 1)[-1]
+        new_loc = f"s3://{bucket_name}/{namespace}/{table_name}/metadata/v{v}.metadata.json"
+        table["metadataLocation"] = new_loc
+        table["modifiedAt"] = now_iso()
+        return json_response({"metadata-location": new_loc, "metadata": metadata})
 
     return error_response_json("NotFoundException", f"Table {namespace}.{table_name} not found", 404)
 
 
-def _iceberg_create_table(namespace, data):
+def _iceberg_create_table(namespace, data, allow_cross_region):
     table_name = data.get("name", "")
     schema = data.get("schema", {})
     bucket_arn = None
-    for ns in _namespaces.values():
-        ns_name = ns["namespace"][0] if isinstance(ns.get("namespace"), list) else ""
-        if ns_name == namespace:
-            bucket_arn = ns.get("tableBucketARN")
-            break
+    matches = _iceberg_values(_namespaces, lambda ns: _namespace_name(ns) == namespace, allow_cross_region)
+    if matches:
+        bucket_arn = matches[0].get("tableBucketARN")
     if not bucket_arn:
         return error_response_json("NotFoundException", f"Namespace {namespace} not found", 404)
 
@@ -426,7 +541,7 @@ def _iceberg_create_table(namespace, data):
     arn = _table_arn(bucket_arn, namespace, table_name)
     key = _table_key(bucket_arn, namespace, table_name)
 
-    _tables[key] = {
+    table = {
         "name": table_name, "tableARN": arn, "namespace": [namespace],
         "tableBucketARN": bucket_arn, "format": "ICEBERG",
         "createdAt": now_iso(), "modifiedAt": now_iso(),
@@ -435,6 +550,7 @@ def _iceberg_create_table(namespace, data):
         "_iceberg_metadata": iceberg_metadata, "_metadata_version": 0,
         "_schema_fields": schema_fields,
     }
+    _set_bucket_region_value(_tables, bucket_arn, key, table)
     return json_response({"metadata-location": metadata_location, "metadata": iceberg_metadata})
 
 
@@ -442,6 +558,7 @@ def _iceberg_create_table(namespace, data):
 
 async def _handle_iceberg_request(method, path, headers, body, query_params):
     parts = [p for p in path.strip("/").split("/") if p]
+    allow_cross_region = _iceberg_allows_cross_region(headers)
     # parts: ["iceberg", "v1", ...]
     if len(parts) < 2:
         return None
@@ -455,29 +572,31 @@ async def _handle_iceberg_request(method, path, headers, body, query_params):
     # parts[2] = prefix (catalog name), parts[3] = "namespaces"
     if parts[3] == "namespaces":
         if len(parts) == 4 and method == "GET":
-            return _iceberg_list_namespaces()
+            return _iceberg_list_namespaces(allow_cross_region)
         if len(parts) == 5 and method == "GET":
-            return _iceberg_get_namespace(parts[4])
+            return _iceberg_get_namespace(parts[4], allow_cross_region)
         if len(parts) >= 6 and parts[5] == "tables":
             namespace = parts[4]
             if len(parts) == 6:
                 if method == "GET":
-                    return _iceberg_list_tables(namespace)
+                    return _iceberg_list_tables(namespace, allow_cross_region)
                 if method == "POST":
                     data = json.loads(body) if body else {}
-                    return _iceberg_create_table(namespace, data)
+                    return _iceberg_create_table(namespace, data, allow_cross_region)
             if len(parts) == 7:
                 table_name = parts[6]
                 if method == "GET":
-                    return _iceberg_load_table(namespace, table_name)
+                    return _iceberg_load_table(namespace, table_name, allow_cross_region)
                 if method == "POST":
                     data = json.loads(body) if body else {}
-                    return _iceberg_commit_table(namespace, table_name, data)
+                    return _iceberg_commit_table(namespace, table_name, data, allow_cross_region)
                 if method == "HEAD":
-                    for table in _tables.values():
-                        table_ns = table["namespace"][0] if isinstance(table.get("namespace"), list) else ""
-                        if table_ns == namespace and table["name"] == table_name:
-                            return 200, {}, b""
+                    if _iceberg_values(
+                        _tables,
+                        lambda table: _namespace_name(table) == namespace and table["name"] == table_name,
+                        allow_cross_region,
+                    ):
+                        return 200, {}, b""
                     return 404, {}, b""
     return None
 

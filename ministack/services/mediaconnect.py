@@ -22,6 +22,7 @@ import re
 import time
 import urllib.parse
 
+from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountScopedDict,
@@ -84,6 +85,26 @@ def _flow_arn(name):
 
 def _error(status, code, message):
     return error_response_json(code, message, status)
+
+
+def _resolve_flow_arn(arn):
+    try:
+        spec = parse_arn(arn)
+    except ArnParseError:
+        return None, _error(400, "BadRequestException", f"Invalid flow ARN: {arn}")
+
+    if (
+        spec.partition != "aws"
+        or spec.service != "mediaconnect"
+        or spec.region != get_region()
+        or spec.account_id != get_account_id()
+        or not spec.resource.startswith("flow:")
+    ):
+        return None, _error(400, "BadRequestException", f"Invalid flow ARN: {arn}")
+
+    if arn not in _flows:
+        return None, _error(404, "NotFoundException", f"Flow {arn} not found.")
+    return arn, None
 
 
 # Real AWS ListFlows returns a slimmer ``ListedFlow`` projection — not the
@@ -188,6 +209,9 @@ def _update_flow(arn, body):
 
 
 def _list_tags(arn):
+    arn, err = _resolve_flow_arn(arn)
+    if err:
+        return err
     return json_response({"tags": _tags.get(arn, {})})
 
 

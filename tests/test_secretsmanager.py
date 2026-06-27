@@ -6,8 +6,22 @@ import uuid as _uuid_mod
 import zipfile
 from urllib.parse import urlparse
 
+import boto3
 import pytest
+from botocore.config import Config
 from botocore.exceptions import ClientError
+
+
+def _regional_sm(region_name):
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+    return boto3.client(
+        "secretsmanager",
+        endpoint_url=endpoint,
+        aws_access_key_id="test",
+        aws_secret_access_key="test",
+        region_name=region_name,
+        config=Config(region_name=region_name, retries={"mode": "standard"}),
+    )
 
 
 def test_secretsmanager_resource_policy(sm):
@@ -342,6 +356,40 @@ def test_secretsmanager_get_by_partial_arn(sm):
     assert sm.get_secret_value(SecretId=partial_arn)["SecretString"] == "partial-arn-value"
 
 
+def test_secretsmanager_arn_lookup_rejects_foreign_scope_without_name_fallback(sm):
+    """SecretId ARNs must be parsed before matching same-named local secrets."""
+    name = f"sm-arn-scope-{_uuid_mod.uuid4().hex[:8]}"
+    arn = sm.create_secret(Name=name, SecretString="scoped-value")["ARN"]
+    partial_arn = arn.rsplit("-", 1)[0]
+
+    assert sm.get_secret_value(SecretId=arn)["SecretString"] == "scoped-value"
+    assert sm.get_secret_value(SecretId=partial_arn)["SecretString"] == "scoped-value"
+
+    wrong_region_arn = arn.replace(":us-east-1:", ":us-west-2:")
+    wrong_account_arn = arn.replace(":000000000000:", ":111111111111:")
+    wrong_service_arn = arn.replace(":secretsmanager:", ":sqs:")
+    wrong_region_partial = partial_arn.replace(":us-east-1:", ":us-west-2:")
+
+    for bad_arn in (
+        wrong_region_arn,
+        wrong_account_arn,
+        wrong_service_arn,
+        wrong_region_partial,
+    ):
+        with pytest.raises(ClientError) as exc:
+            sm.get_secret_value(SecretId=bad_arn)
+        assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+    west = _regional_sm("us-west-2")
+    west_arn = west.create_secret(
+        Name=f"{name}-west",
+        SecretString="west-scoped-value",
+    )["ARN"]
+    with pytest.raises(ClientError) as exc:
+        sm.get_secret_value(SecretId=west_arn)
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
 def test_secretsmanager_list_include_planned_deletion(sm):
     """ListSecrets honors IncludePlannedDeletion per the AWS SecretListEntry spec.
 
@@ -413,4 +461,31 @@ def test_secretsmanager_force_delete_removes_resource_policy():
         "keyed by the now-deleted ARN. The delete path must pop both "
         "_secrets[name] AND _resource_policies[arn]."
     )
+    sm.reset()
+
+
+def test_secretsmanager_arn_shaped_secret_name_does_not_bypass_scope_guard():
+    sm = _sm_importlib.import_module("ministack.services.secretsmanager")
+    sm.reset()
+    arn_shaped_names = (
+        "arn:aws:secretsmanager:us-west-2:000000000000:secret:foreign-shaped",
+        "arn:aws:secretsmanager:us-east-1:000000000000:secret:local-shaped",
+    )
+
+    for arn_shaped_name in arn_shaped_names:
+        _sm_invoke_action(
+            sm,
+            "CreateSecret",
+            {"Name": arn_shaped_name, "SecretString": "x"},
+        )
+
+        headers = {"x-amz-target": "secretsmanager.GetSecretValue"}
+        body = _sm_json.dumps({"SecretId": arn_shaped_name}).encode()
+        status, _resp_headers, resp_body = _sm_asyncio.run(
+            sm.handle_request("POST", "/", headers, body, {})
+        )
+        parsed = _sm_json.loads(resp_body.decode() if isinstance(resp_body, bytes) else resp_body)
+
+        assert status == 400
+        assert parsed["__type"] == "ResourceNotFoundException"
     sm.reset()

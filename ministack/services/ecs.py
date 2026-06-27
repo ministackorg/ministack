@@ -31,6 +31,7 @@ import secrets
 import threading
 import time
 
+from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountScopedDict,
@@ -627,6 +628,8 @@ def _reconcile_service_tasks(cluster_name, svc_key):
 
 def _create_service(data):
     cluster_name = _resolve_cluster_name(data.get("cluster", "default"))
+    if cluster_name is None:
+        return error_response_json("ClusterNotFoundException", "Cluster not found.", 400)
     if cluster_name not in _clusters:
         _create_cluster({"clusterName": cluster_name})
 
@@ -643,6 +646,9 @@ def _create_service(data):
 
     td_ref = data.get("taskDefinition", "")
     td_key = _resolve_td_key(td_ref)
+    if td_ref.startswith("arn:") and td_key is None:
+        return error_response_json("ClientException",
+            f"Unable to find task definition: {td_ref}", 400)
     td_arn = _task_defs[td_key]["taskDefinitionArn"] if td_key in _task_defs else td_ref
 
     desired = data.get("desiredCount", 1)
@@ -697,8 +703,17 @@ def _create_service(data):
 
 def _delete_service(data):
     cluster_name = _resolve_cluster_name(data.get("cluster", "default"))
+    if cluster_name is None:
+        return error_response_json("ClusterNotFoundException", "Cluster not found.", 400)
     service_ref = data.get("service", "")
-    svc_name = _resolve_service_name(service_ref)
+    svc_ref = _resolve_service_ref(service_ref)
+    if svc_ref is None:
+        return error_response_json("ServiceNotFoundException",
+            "Service not found.", 400)
+    svc_name, svc_cluster_name = svc_ref
+    if svc_cluster_name is not None and svc_cluster_name != cluster_name:
+        return error_response_json("ServiceNotFoundException",
+            "Service not found.", 400)
     svc_key = f"{cluster_name}/{svc_name}"
     svc = _services.get(svc_key)
     if not svc:
@@ -740,12 +755,21 @@ def _delete_service(data):
 
 def _describe_services(data):
     cluster_name = _resolve_cluster_name(data.get("cluster", "default"))
+    if cluster_name is None:
+        return error_response_json("ClusterNotFoundException", "Cluster not found.", 400)
     refs = data.get("services", [])
     include = set(data.get("include", []))
     result = []
     failures = []
     for ref in refs:
-        svc_name = _resolve_service_name(ref)
+        svc_ref = _resolve_service_ref(ref)
+        if svc_ref is None:
+            failures.append({"arn": ref, "reason": "MISSING"})
+            continue
+        svc_name, svc_cluster_name = svc_ref
+        if svc_cluster_name is not None and svc_cluster_name != cluster_name:
+            failures.append({"arn": ref, "reason": "MISSING"})
+            continue
         svc_key = f"{cluster_name}/{svc_name}"
         if svc_key in _services:
             s = dict(_services[svc_key])
@@ -761,8 +785,15 @@ def _describe_services(data):
 
 def _update_service(data):
     cluster_name = _resolve_cluster_name(data.get("cluster", "default"))
+    if cluster_name is None:
+        return error_response_json("ClusterNotFoundException", "Cluster not found.", 400)
     service_ref = data.get("service", "")
-    svc_name = _resolve_service_name(service_ref)
+    svc_ref = _resolve_service_ref(service_ref)
+    if svc_ref is None:
+        return error_response_json("ServiceNotFoundException", "Service not found.", 400)
+    svc_name, svc_cluster_name = svc_ref
+    if svc_cluster_name is not None and svc_cluster_name != cluster_name:
+        return error_response_json("ServiceNotFoundException", "Service not found.", 400)
     svc_key = f"{cluster_name}/{svc_name}"
     svc = _services.get(svc_key)
     if not svc:
@@ -774,6 +805,9 @@ def _update_service(data):
 
     if new_td is not None:
         td_key = _resolve_td_key(new_td)
+        if new_td.startswith("arn:") and td_key is None:
+            return error_response_json("ClientException",
+                f"Unable to find task definition: {new_td}", 400)
         td_arn = _task_defs[td_key]["taskDefinitionArn"] if td_key in _task_defs else new_td
         if td_arn != svc["taskDefinition"]:
             for dep in svc["deployments"]:
@@ -819,6 +853,8 @@ def _update_service(data):
 
 def _list_services(data):
     cluster_name = _resolve_cluster_name(data.get("cluster", "default"))
+    if cluster_name is None:
+        return error_response_json("ClusterNotFoundException", "Cluster not found.", 400)
     launch_type = data.get("launchType")
     scheduling = data.get("schedulingStrategy")
     arns = []
@@ -1052,6 +1088,8 @@ def _resolve_container_secrets(cdef):
 
 def _run_task(data):
     cluster_name = _resolve_cluster_name(data.get("cluster", "default"))
+    if cluster_name is None:
+        return error_response_json("ClusterNotFoundException", "Cluster not found.", 400)
     if cluster_name not in _clusters:
         _create_cluster({"clusterName": cluster_name})
 
@@ -1216,6 +1254,8 @@ def _run_task(data):
 def _stop_task(data):
     task_ref = data.get("task", "")
     cluster_name = _resolve_cluster_name(data.get("cluster", "default"))
+    if cluster_name is None:
+        return error_response_json("ClusterNotFoundException", "Cluster not found.", 400)
     reason = data.get("reason", "Task stopped by user")
 
     task = _resolve_task(task_ref, cluster_name)
@@ -1259,6 +1299,8 @@ def _stop_task(data):
 
 def _describe_tasks(data):
     cluster_name = _resolve_cluster_name(data.get("cluster", "default"))
+    if cluster_name is None:
+        return error_response_json("ClusterNotFoundException", "Cluster not found.", 400)
     task_refs = data.get("tasks", [])
     include = set(data.get("include", []))
     result = []
@@ -1327,6 +1369,8 @@ def _maybe_mark_stopped(task):
 
 def _list_tasks(data):
     cluster_name = _resolve_cluster_name(data.get("cluster", "default"))
+    if cluster_name is None:
+        return error_response_json("ClusterNotFoundException", "Cluster not found.", 400)
     cluster_arn = f"arn:aws:ecs:{get_region()}:{get_account_id()}:cluster/{cluster_name}"
     status_filter = data.get("desiredStatus", "RUNNING")
     family = data.get("family", "")
@@ -1421,6 +1465,8 @@ def _list_tags_for_resource(data):
 
 def _execute_command(data):
     cluster_name = _resolve_cluster_name(data.get("cluster", "default"))
+    if cluster_name is None:
+        return error_response_json("ClusterNotFoundException", "Cluster not found.", 400)
     task_ref = data.get("task", "")
     task = _resolve_task(task_ref, cluster_name)
     if not task:
@@ -1485,6 +1531,7 @@ def _put_account_setting(data):
 
 def _describe_capacity_providers(data):
     names = data.get("capacityProviders", [])
+    resolved_names = [_resolve_capacity_provider_name(name) for name in names]
     include = data.get("include", [])
     providers = []
     defaults = [
@@ -1492,7 +1539,7 @@ def _describe_capacity_providers(data):
         {"name": "FARGATE_SPOT", "status": "ACTIVE", "autoScalingGroupProvider": {}},
     ]
     for p in defaults:
-        if not names or p["name"] in names:
+        if not names or p["name"] in resolved_names:
             cp = {
                 "capacityProviderArn": f"arn:aws:ecs:{get_region()}:{get_account_id()}:capacity-provider/{p['name']}",
                 "name": p["name"],
@@ -1505,7 +1552,7 @@ def _describe_capacity_providers(data):
             providers.append(cp)
 
     for cp_name, cp in _capacity_providers.items():
-        if not names or cp_name in names:
+        if not names or cp_name in resolved_names:
             entry = dict(cp)
             if "TAGS" in include:
                 entry["tags"] = _tags.get(cp["capacityProviderArn"], [])
@@ -1552,9 +1599,7 @@ def _create_capacity_provider(data):
 
 
 def _delete_capacity_provider(data):
-    name = data.get("capacityProvider", "")
-    if name.startswith("arn:"):
-        name = name.split("/")[-1]
+    name = _resolve_capacity_provider_name(data.get("capacityProvider", ""))
 
     cp = _capacity_providers.pop(name, None)
     if not cp:
@@ -1615,24 +1660,45 @@ def _resolve_cluster_name(ref):
     if not ref:
         return "default"
     if ref.startswith("arn:"):
-        return ref.split("/")[-1]
+        return _ecs_single_resource_tail(ref, "cluster")
     if "/" in ref:
         return ref.split("/")[-1]
     return ref
 
 
-def _resolve_service_name(ref):
+def _resolve_service_ref(ref):
+    if not ref:
+        return "", None
     if ref.startswith("arn:"):
-        return ref.split("/")[-1]
+        service_tail = _ecs_resource_tail(ref, "service")
+        if service_tail is None:
+            return None
+        parts = service_tail.split("/")
+        if len(parts) == 1:
+            service_name = parts[0]
+            service_cluster_name = None
+        elif len(parts) == 2:
+            service_cluster_name, service_name = parts
+            if not service_cluster_name:
+                return None
+        else:
+            return None
+        if not service_name:
+            return None
+        return service_name, service_cluster_name
     if "/" in ref:
-        return ref.split("/")[-1]
-    return ref
+        return None
+    return ref, None
 
 
 def _resolve_td_key(ref):
     if not ref:
         return ""
-    if "task-definition/" in ref:
+    if ref.startswith("arn:"):
+        ref = _ecs_single_resource_tail(ref, "task-definition")
+        if ref is None:
+            return None
+    elif "task-definition/" in ref:
         ref = ref.split("task-definition/")[-1]
     if ":" not in ref:
         rev = _task_def_latest.get(ref)
@@ -1642,19 +1708,44 @@ def _resolve_td_key(ref):
     return ref
 
 
+def _resolve_td_delete_key(ref):
+    if not ref:
+        return ""
+    if ref.startswith("arn:"):
+        ref = _ecs_single_resource_tail(ref, "task-definition")
+        if ref is None:
+            return None
+    elif "task-definition/" in ref:
+        ref = ref.split("task-definition/")[-1]
+    if ":" not in ref:
+        return None
+    return ref
+
+
 def _resolve_task(ref, cluster_name="default"):
     """Look up a task by full ARN or short ID, optionally scoped to a cluster."""
-    task = _tasks.get(ref)
-    if task:
-        return task
+    if cluster_name is None:
+        return None
+    is_arn = ref.startswith("arn:")
+    task_ref = _resolve_task_ref(ref)
+    if task_ref is None:
+        return None
+    task_id, arn_cluster_name = task_ref
+    if arn_cluster_name is not None and arn_cluster_name != cluster_name:
+        return None
     cluster_arn = f"arn:aws:ecs:{get_region()}:{get_account_id()}:cluster/{cluster_name}"
+    task = _tasks.get(ref)
+    if task and task.get("clusterArn") == cluster_arn:
+        return task
     for arn, t in _tasks.items():
         if t.get("clusterArn") != cluster_arn:
             continue
-        if arn.endswith(f"/{ref}") or arn.endswith(ref):
+        if arn.endswith(f"/{task_id}") or arn.endswith(task_id):
             return t
+    if is_arn:
+        return None
     for arn, t in _tasks.items():
-        if arn.endswith(f"/{ref}") or arn.endswith(ref):
+        if arn.endswith(f"/{task_id}") or arn.endswith(task_id):
             return t
     return None
 
@@ -1662,7 +1753,70 @@ def _resolve_task(ref, cluster_name="default"):
 def _cluster_name_from_arn(arn):
     if not arn:
         return ""
+    if arn.startswith("arn:"):
+        return _ecs_single_resource_tail(arn, "cluster") or ""
     return arn.split("/")[-1] if "/" in arn else arn
+
+
+def _resolve_task_ref(ref):
+    if not ref:
+        return "", None
+    if ref.startswith("arn:"):
+        task_tail = _ecs_resource_tail(ref, "task")
+        if task_tail is None:
+            return None
+        parts = task_tail.split("/")
+        if len(parts) == 1:
+            task_id = parts[0]
+            task_cluster_name = None
+        elif len(parts) == 2:
+            task_cluster_name, task_id = parts
+            if not task_cluster_name:
+                return None
+        else:
+            return None
+        if not task_id:
+            return None
+        return task_id, task_cluster_name
+    if "/" in ref:
+        return None
+    return ref, None
+
+
+def _resolve_capacity_provider_name(ref):
+    if not ref:
+        return ""
+    if ref.startswith("arn:"):
+        return _ecs_single_resource_tail(ref, "capacity-provider")
+    if "/" in ref:
+        return None
+    return ref
+
+
+def _ecs_resource_tail(ref, resource_type):
+    try:
+        spec = parse_arn(ref)
+    except ArnParseError:
+        return None
+    if (
+        spec.partition != "aws"
+        or spec.service != "ecs"
+        or spec.region != get_region()
+        or spec.account_id != get_account_id()
+    ):
+        return None
+    prefix = f"{resource_type}/"
+    if not spec.resource.startswith(prefix):
+        return None
+    tail = spec.resource[len(prefix):]
+    return tail or None
+
+
+def _ecs_single_resource_tail(ref, resource_type):
+    tail = _ecs_resource_tail(ref, resource_type)
+    if tail is None or "/" in tail:
+        return None
+    return tail
 
 
 def _sanitize(obj):
@@ -1695,13 +1849,15 @@ def _list_task_definition_families(data):
 def _delete_task_definitions(data):
     arns = data.get("taskDefinitions", [])
     failures = []
+    task_definitions = []
     for arn in arns:
-        key = arn.split("/")[-1] if "/" in arn else arn
+        key = _resolve_td_delete_key(arn)
         if key in _task_defs:
             _task_defs[key]["status"] = "DELETE_IN_PROGRESS"
+            task_definitions.append(_task_defs[key])
         else:
             failures.append({"arn": arn, "reason": "TASK_DEFINITION_NOT_FOUND"})
-    return json_response({"taskDefinitions": [_task_defs.get(a.split("/")[-1], {}) for a in arns if a.split("/")[-1] in _task_defs], "failures": failures})
+    return json_response({"taskDefinitions": task_definitions, "failures": failures})
 
 
 # ---------------------------------------------------------------------------
@@ -1782,7 +1938,7 @@ def _list_attributes(data):
 # ---------------------------------------------------------------------------
 
 def _update_capacity_provider(data):
-    name = data.get("name", "")
+    name = _resolve_capacity_provider_name(data.get("name", ""))
     cp = _capacity_providers.get(name)
     if not cp:
         return error_response_json("ClientException", f"Capacity provider {name} not found", 400)

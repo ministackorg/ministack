@@ -1,9 +1,6 @@
 """Tests for MWAA (Managed Workflows for Apache Airflow) service."""
 
-import time
-
 import pytest
-
 from conftest import make_client
 
 mwaa_client = make_client("mwaa")
@@ -35,6 +32,22 @@ class TestCreateEnvironment:
                 NetworkConfiguration={"SubnetIds": ["subnet-1", "subnet-2"], "SecurityGroupIds": ["sg-1"]},
             )
         assert "already exists" in str(exc_info.value).lower() or "ResourceAlreadyExists" in str(exc_info.value)
+
+    @pytest.mark.parametrize("source_bucket_arn", [
+        "not-an-arn",
+        "arn:aws:sns:us-east-1:000000000000:topic-name",
+        "arn:aws:s3:::test-bucket/dags",
+    ])
+    def test_create_rejects_invalid_source_bucket_arn(self, source_bucket_arn):
+        with pytest.raises(mwaa_client.exceptions.ClientError) as exc_info:
+            mwaa_client.create_environment(
+                Name="bad-source-bucket-arn",
+                DagS3Path="dags/",
+                ExecutionRoleArn="arn:aws:iam::000000000000:role/test-role",
+                SourceBucketArn=source_bucket_arn,
+                NetworkConfiguration={"SubnetIds": ["subnet-1", "subnet-2"], "SecurityGroupIds": ["sg-1"]},
+            )
+        assert exc_info.value.response["Error"]["Code"] == "ValidationException"
 
 
 class TestGetEnvironment:
@@ -68,6 +81,14 @@ class TestUpdateEnvironment:
 
         updated = mwaa_client.get_environment(Name=ENV_NAME)["Environment"]
         assert updated["MaxWorkers"] == 10
+
+    def test_update_rejects_invalid_source_bucket_arn(self):
+        with pytest.raises(mwaa_client.exceptions.ClientError) as exc_info:
+            mwaa_client.update_environment(
+                Name=ENV_NAME,
+                SourceBucketArn="arn:aws:s3:us-east-1:000000000000:test-bucket",
+            )
+        assert exc_info.value.response["Error"]["Code"] == "ValidationException"
 
 
 class TestCreateWebLoginToken:

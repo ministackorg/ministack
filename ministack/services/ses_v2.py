@@ -15,6 +15,7 @@ import os
 import re
 import time
 
+from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.persistence import PERSIST_STATE, load_state
 from ministack.core.responses import AccountScopedDict, get_account_id, get_region, json_response, new_uuid, now_iso
 from ministack.services.ses import _build_mime_message, _parse_raw_mime, _sent_emails_list, _smtp_relay
@@ -56,6 +57,66 @@ except Exception:
 def _json_err(code, message, status=400):
     body = json.dumps({"message": message, "name": code}).encode("utf-8")
     return status, {"Content-Type": "application/json"}, body
+
+
+def _resource_arn(kind, name):
+    return f"arn:aws:ses:{get_region()}:{get_account_id()}:{kind}/{name}"
+
+
+def _invalid_resource_arn(arn):
+    return _json_err("BadRequestException", f"Invalid ResourceArn: {arn}")
+
+
+def _not_found_resource_arn(arn):
+    return _json_err("NotFoundException", f"Resource {arn} not found", 404)
+
+
+def _first_query_value(query_params, key, default=""):
+    value = query_params.get(key, default)
+    if isinstance(value, list):
+        return value[0] if value else default
+    return value
+
+
+def _query_values(query_params, key):
+    value = query_params.get(key, [])
+    if isinstance(value, list):
+        return value
+    if value:
+        return [value]
+    return []
+
+
+def _local_ses_v2_resource_arn(arn):
+    if not arn:
+        return None, _json_err("BadRequestException", "ResourceArn is required")
+    try:
+        spec = parse_arn(arn)
+    except ArnParseError:
+        return None, _invalid_resource_arn(arn)
+
+    if (
+        spec.partition != "aws"
+        or spec.service != "ses"
+        or spec.account_id != get_account_id()
+        or spec.region != get_region()
+    ):
+        return None, _invalid_resource_arn(arn)
+
+    kind, sep, name = spec.resource.partition("/")
+    if sep != "/" or not name or "/" in name:
+        return None, _invalid_resource_arn(arn)
+
+    if kind == "identity":
+        if name not in _identities:
+            return None, _not_found_resource_arn(arn)
+    elif kind == "configuration-set":
+        if name not in _config_sets:
+            return None, _not_found_resource_arn(arn)
+    else:
+        return None, _invalid_resource_arn(arn)
+
+    return str(spec), None
 
 
 async def handle_request(method, path, headers, body, query_params):
@@ -164,6 +225,7 @@ async def handle_request(method, path, headers, body, query_params):
             "Tags": data.get("Tags", []),
             "CreatedTimestamp": now_iso(),
         }
+        _ses_tags[_resource_arn("identity", identity)] = list(data.get("Tags", []))
         return json_response({
             "IdentityType": identity_type,
             "VerifiedForSendingStatus": True,
@@ -198,6 +260,7 @@ async def handle_request(method, path, headers, body, query_params):
         if not name:
             return _json_err("BadRequestException", "ConfigurationSetName is required")
         _config_sets[name] = {"ConfigurationSetName": name, "Tags": data.get("Tags", [])}
+        _ses_tags[_resource_arn("configuration-set", name)] = list(data.get("Tags", []))
         return json_response({})
 
     # GET /v2/email/configuration-sets  (ListConfigurationSets)
@@ -219,22 +282,31 @@ async def handle_request(method, path, headers, body, query_params):
 
     # GET/POST/DELETE /v2/email/tags  (ListTagsForResource / TagResource / UntagResource)
     if sub == "/tags" and method == "GET":
-        arn = query_params.get("ResourceArn", [""])[0] if isinstance(query_params.get("ResourceArn"), list) else query_params.get("ResourceArn", "")
-        return json_response({"Tags": _ses_tags.get(arn, [])})
+        arn = _first_query_value(query_params, "ResourceArn")
+        canonical_arn, err = _local_ses_v2_resource_arn(arn)
+        if err:
+            return err
+        return json_response({"Tags": _ses_tags.get(canonical_arn, [])})
 
     m = re.match(r"^/tags$", sub)
     if m and method == "POST":
         arn = data.get("ResourceArn", "")
-        existing = {t["Key"]: t for t in _ses_tags.get(arn, [])}
+        canonical_arn, err = _local_ses_v2_resource_arn(arn)
+        if err:
+            return err
+        existing = {t["Key"]: t for t in _ses_tags.get(canonical_arn, [])}
         for tag in data.get("Tags", []):
             existing[tag["Key"]] = tag
-        _ses_tags[arn] = list(existing.values())
+        _ses_tags[canonical_arn] = list(existing.values())
         return json_response({})
 
     if sub == "/tags" and method == "DELETE":
-        arn = query_params.get("ResourceArn", [""])[0] if isinstance(query_params.get("ResourceArn"), list) else query_params.get("ResourceArn", "")
-        remove_keys = set(query_params.get("TagKeys", []))
-        _ses_tags[arn] = [t for t in _ses_tags.get(arn, []) if t["Key"] not in remove_keys]
+        arn = _first_query_value(query_params, "ResourceArn")
+        canonical_arn, err = _local_ses_v2_resource_arn(arn)
+        if err:
+            return err
+        remove_keys = set(_query_values(query_params, "TagKeys"))
+        _ses_tags[canonical_arn] = [t for t in _ses_tags.get(canonical_arn, []) if t["Key"] not in remove_keys]
         return json_response({})
 
     return _json_err("NotFoundException", f"Unknown SES v2 path: {method} {path}", 404)
