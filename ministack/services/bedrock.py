@@ -358,13 +358,39 @@ def _model_summary(model_id, model_name, provider, inputs, outputs, streaming) -
     }
 
 
-def _find_model(identifier: str):
+def _foundation_model_id_from_identifier(identifier: str) -> str | None:
+    if not isinstance(identifier, str):
+        return None
+    model_id = identifier
     if identifier.startswith("arn:"):
-        identifier = identifier.rsplit("/", 1)[-1]
+        try:
+            spec = parse_arn(identifier)
+        except ArnParseError:
+            return None
+        if (
+            spec.partition != "aws"
+            or spec.service != "bedrock"
+            or spec.region != get_region()
+            or spec.account_id != ""
+        ):
+            return None
+        prefix = "foundation-model/"
+        if not spec.resource.startswith(prefix):
+            return None
+        model_id = spec.resource[len(prefix):]
+        if not model_id or "/" in model_id:
+            return None
     for prefix in _INFERENCE_PROFILE_PREFIXES:
-        if identifier.startswith(f"{prefix}."):
-            identifier = identifier[len(prefix) + 1:]
+        if model_id.startswith(f"{prefix}."):
+            model_id = model_id[len(prefix) + 1:]
             break
+    return model_id
+
+
+def _find_model(identifier: str):
+    identifier = _foundation_model_id_from_identifier(identifier)
+    if not identifier:
+        return None
     for entry in _CATALOG:
         if entry[0] == identifier:
             return entry

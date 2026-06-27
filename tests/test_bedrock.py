@@ -8,10 +8,10 @@ on presence and ordering, not absolute values.
 
 import json
 import urllib.error
+import urllib.parse
 import urllib.request
 
 from conftest import ENDPOINT, make_client
-
 
 # ---------------------------------------------------------------------------
 # Control plane
@@ -215,6 +215,27 @@ def test_bedrock_get_foundation_model_by_arn():
     assert resp["modelDetails"]["modelId"] == "anthropic.claude-3-haiku-20240307-v1:0"
 
 
+def test_bedrock_get_foundation_model_arn_parser_does_not_tail_match_invalid_arns():
+    import botocore.exceptions
+
+    client = make_client("bedrock")
+    valid_tail = "foundation-model/anthropic.claude-3-haiku-20240307-v1:0"
+    bad_refs = [
+        f"arn:aws:lambda:us-east-1::{valid_tail}",
+        f"arn:aws:bedrock:us-west-2::{valid_tail}",
+        f"arn:aws:bedrock:us-east-1:000000000000:{valid_tail}",
+        "arn:aws:bedrock:us-east-1::custom-model/anthropic.claude-3-haiku-20240307-v1:0",
+        "arn:aws:bedrock:us-east-1",
+    ]
+    for model_identifier in bad_refs:
+        try:
+            client.get_foundation_model(modelIdentifier=model_identifier)
+        except botocore.exceptions.ClientError as exc:
+            assert exc.response["Error"]["Code"] == "ResourceNotFoundException"
+        else:
+            raise AssertionError(f"expected ResourceNotFoundException for {model_identifier}")
+
+
 def test_bedrock_model_arn_reflects_request_region():
     import boto3
     from botocore.config import Config
@@ -302,6 +323,7 @@ def test_bedrock_converse_multiple_content_blocks_in_message():
 
 def test_bedrock_converse_token_count_headers_present_in_http_response():
     import urllib.request
+
     from conftest import ENDPOINT
 
     body = json.dumps({
@@ -420,8 +442,9 @@ def test_bedrock_converse_inference_config_stop_sequences_accepted():
 
 def _raw_converse(body: dict) -> tuple:
     """Return (status, body_dict) from a raw POST to /model/.../converse."""
-    import urllib.request
     import urllib.error
+    import urllib.request
+
     from conftest import ENDPOINT
 
     req = urllib.request.Request(
@@ -465,8 +488,9 @@ def test_bedrock_converse_validation_empty_content():
 
 
 def test_bedrock_converse_validation_malformed_body():
-    import urllib.request
     import urllib.error
+    import urllib.request
+
     from conftest import ENDPOINT
 
     req = urllib.request.Request(
@@ -523,6 +547,66 @@ def test_bedrock_converse_stream_via_inference_profile_id():
     names = [list(e.keys())[0] for e in resp["stream"]]
     assert names[0] == "messageStart"
     assert names[-1] == "metadata"
+
+
+def test_bedrock_runtime_accepts_foundation_model_arn_model_id():
+    client = make_client("bedrock-runtime")
+    arn = "arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-3-haiku-20240307-v1:0"
+    resp = client.converse(
+        modelId=arn,
+        messages=[{"role": "user", "content": [{"text": "hello via arn"}]}],
+    )
+    assert resp["output"]["message"]["role"] == "assistant"
+
+
+def test_bedrock_runtime_accepts_custom_model_arn_with_path_segments():
+    client = make_client("bedrock-runtime")
+    arn = "arn:aws:bedrock:us-east-1:000000000000:custom-model/my-model/123456789012"
+    resp = client.converse(
+        modelId=arn,
+        messages=[{"role": "user", "content": [{"text": "hello via custom arn"}]}],
+    )
+    assert resp["output"]["message"]["role"] == "assistant"
+
+
+def test_bedrock_runtime_accepts_additional_model_arn_shapes():
+    client = make_client("bedrock-runtime")
+    arns = [
+        "arn:aws:bedrock:us-east-1:000000000000:custom-model-deployment/my-deployment",
+        "arn:aws:bedrock:us-east-1:000000000000:prompt-router/my-router",
+        "arn:aws:sagemaker:us-east-1:000000000000:endpoint/my-bedrock-endpoint",
+    ]
+    for arn in arns:
+        resp = client.converse(
+            modelId=arn,
+            messages=[{"role": "user", "content": [{"text": "hello via arn"}]}],
+        )
+        assert resp["output"]["message"]["role"] == "assistant"
+
+
+def test_bedrock_runtime_model_id_arn_parser_does_not_tail_match_invalid_arns():
+    model_id = "arn:aws:lambda:us-east-1::foundation-model/anthropic.claude-3-haiku-20240307-v1:0"
+    encoded_model_id = urllib.parse.quote(model_id, safe="")
+    req = urllib.request.Request(
+        f"{ENDPOINT}/model/{encoded_model_id}/converse",
+        data=json.dumps({
+            "messages": [{"role": "user", "content": [{"text": "x"}]}],
+        }).encode(),
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": ("AWS4-HMAC-SHA256 "
+                              "Credential=test/20260605/us-east-1/bedrock/aws4_request, "
+                              "SignedHeaders=host;x-amz-date, Signature=x"),
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req):
+            raise AssertionError("expected ValidationException")
+    except urllib.error.HTTPError as exc:
+        assert exc.code == 400
+        body = json.loads(exc.read())
+        assert body["__type"] == "ValidationException"
 
 
 # ---------------------------------------------------------------------------
@@ -604,6 +688,7 @@ def test_bedrock_invoke_model_cohere_shape():
 
 def test_bedrock_invoke_model_returns_token_count_headers():
     import urllib.request
+
     from conftest import ENDPOINT
 
     req = urllib.request.Request(
@@ -748,6 +833,34 @@ def test_bedrock_start_async_invoke_then_get():
     assert get_resp["status"] == "Completed"
     assert "modelArn" in get_resp
     assert "submitTime" in get_resp
+
+
+def test_bedrock_start_async_invoke_accepts_foundation_model_arn_model_id():
+    client = make_client("bedrock-runtime")
+    arn = "arn:aws:bedrock:us-east-1::foundation-model/amazon.nova-pro-v1:0"
+    start = client.start_async_invoke(
+        modelId=arn,
+        modelInput={"messages": [{"role": "user", "content": [{"text": "x"}]}]},
+        outputDataConfig={"s3OutputDataConfig": {"s3Uri": "s3://bucket/prefix/"}},
+    )
+    get_resp = client.get_async_invoke(invocationArn=start["invocationArn"])
+    assert get_resp["modelArn"] == arn
+
+
+def test_bedrock_start_async_invoke_rejects_invalid_model_id_arn():
+    import botocore.exceptions
+
+    client = make_client("bedrock-runtime")
+    try:
+        client.start_async_invoke(
+            modelId="arn:aws:sqs:us-east-1::foundation-model/amazon.nova-pro-v1:0",
+            modelInput={"messages": [{"role": "user", "content": [{"text": "x"}]}]},
+            outputDataConfig={"s3OutputDataConfig": {"s3Uri": "s3://bucket/prefix/"}},
+        )
+    except botocore.exceptions.ClientError as exc:
+        assert exc.response["Error"]["Code"] == "ValidationException"
+    else:
+        raise AssertionError("expected ValidationException")
 
 
 def test_bedrock_list_async_invokes_includes_started_ones():
