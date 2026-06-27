@@ -40,8 +40,10 @@ from ministack.core.responses import AccountScopedDict, get_account_id, get_regi
 
 logger = logging.getLogger("sqs")
 
-# XML 1.0 forbidden characters: everything below #x20 except #x9/#xA/#xD, plus #xFFFE and #xFFFF
-_INVALID_SQS_CHARS_RE = re.compile("[\x00-\x08\x0b\x0c\x0e-\x1f\ufffe\uffff]")
+# XML 1.0 forbidden characters (the complement of the allowed set AWS SQS documents:
+# #x9 | #xA | #xD | #x20-#xD7FF | #xE000-#xFFFD | #x10000-#x10FFFF):
+# everything below #x20 except #x9/#xA/#xD, the surrogate block #xD800-#xDFFF, and #xFFFE/#xFFFF.
+_INVALID_SQS_CHARS_RE = re.compile("[\x00-\x08\x0b\x0c\x0e-\x1f\ud800-\udfff\ufffe\uffff]")
 
 # ── Module-level state ──────────────────────────────────────
 
