@@ -1134,3 +1134,21 @@ def test_sqs_send_message_allows_valid_chars(sqs):
     for body in allowed:
         resp = sqs.send_message(QueueUrl=url, MessageBody=body)
         assert "MessageId" in resp, f"send failed for {repr(body)}"
+
+
+def test_sqs_invalid_chars_regex_matches_xml10_complement():
+    """The forbidden-char regex must be the exact complement of AWS SQS's allowed
+    set (#x9 | #xA | #xD | #x20-#xD7FF | #xE000-#xFFFD | #x10000-#x10FFFF), which
+    excludes the surrogate block #xD800-#xDFFF. Lone surrogates can't be sent
+    through boto3 (client-side UnicodeEncodeError), so this guards the regex
+    directly rather than via the wire."""
+    from ministack.services.sqs import _INVALID_SQS_CHARS_RE as rx
+
+    # Forbidden: C0 controls (except tab/LF/CR), surrogates, #xFFFE/#xFFFF.
+    for c in ("\x00", "\x08", "\x0b", "\x0c", "\x0e", "\x1f",
+              "\ud800", "\udfff", "￾", "￿"):
+        assert rx.search(c), f"must reject {c!r}"
+    # Allowed: tab/LF/CR, the range boundaries, BMP, supplementary.
+    for c in ("\t", "\n", "\r", "퟿", "", "�",
+              "a", "こ", "\U0001f600"):
+        assert not rx.search(c), f"must allow {c!r}"

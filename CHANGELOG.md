@@ -5,10 +5,11 @@ All notable changes to MiniStack will be documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning follows [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [1.3.69] — 2026-06-27
 
 ### Fixed
 - **EKS — `DescribeCluster` returns a host-reachable endpoint on every path** — `DescribeCluster` now advertises the host-published port, `https://{MINISTACK_HOST}:{port}` (`MINISTACK_HOST` defaults to `localhost`), uniformly on cluster create, OIDC-config restart, and persistence restore. Previously the failure-fallback and restore paths could leave a stale value, so `aws eks update-kubeconfig` + kubectl from the host got an unreachable endpoint. The k3s container publishes 6443 to that host port (`ports={"6443/tcp": port}`), so the endpoint works from the host and from containers that can route to `MINISTACK_HOST`, keeping the `ACTIVE`-cluster shape consistent for `aws eks update-kubeconfig` and Terraform. Contributed by @b-rajesh.
+- **SQS — `SendMessage` rejects message bodies with XML 1.0 forbidden characters** — AWS SQS only accepts characters valid in XML 1.0 and returns `InvalidMessageContents` for anything else; MiniStack silently accepted them, so a payload that fails against real AWS passed locally. `SendMessage` (and every `SendMessageBatch` entry) now rejects bodies containing C0 control characters other than tab/LF/CR, the surrogate block `#xD800`–`#xDFFF`, and `#xFFFE`/`#xFFFF` with `InvalidMessageContents`. Contributed by @yamachu.
 
 ---
 
