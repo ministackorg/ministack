@@ -643,7 +643,10 @@ def test_persistence_s3_writes_state_after_ownership_and_public_access_block(tmp
     saved = tmp_path / "s3.json"
     assert saved.exists(), "s3.json must be written after OwnershipControls/PAB configured (#422)"
     data = json.loads(saved.read_text())
-    assert "buckets_meta" in data
+    # State is wrapped in a versioned envelope ({"__ministack_format__": N,
+    # "payload": {...}}); the service state lives under "payload".
+    payload = data.get("payload", data)
+    assert "buckets_meta" in payload
 
     # Bytes-safe fallback: even if a raw-bytes value sneaks back in, it round-trips.
     state_with_bytes = {"blob": b"\x00\x01\xff\xfe"}
