@@ -1758,8 +1758,7 @@ def _key_matches_filter(key: str, prefix: str | None, suffix: str | None) -> boo
     return True
 
 
-# Amazon S3 → EventBridge uses a fixed set of detail-types (per event family) and a
-# per-API `reason`. 
+# Amazon S3 → EventBridge uses a fixed set of detail-types (per event family) and a per-API `reason`. 
 # See https://docs.aws.amazon.com/AmazonS3/latest/userguide/EventBridge.html
 _S3_EVENTBRIDGE_DETAIL_TYPE = {
     "ObjectCreated": "Object Created",
