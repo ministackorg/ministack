@@ -516,6 +516,8 @@ async def _fetch_oidc_jwks_uri(issuer: str) -> str | None:
         jwks_uri = (json.loads(body or b"{}") or {}).get("jwks_uri")
     except (OSError, ValueError, json.JSONDecodeError):
         jwks_uri = None
+    if not isinstance(jwks_uri, str) or not jwks_uri.strip():
+        jwks_uri = None
     if jwks_uri is not None:
         # Mirror _fetch_jwks (line ~543) which hardcodes `now + 7200`; no
         # separate env knob for OIDC discovery — it shares the JWT-auth

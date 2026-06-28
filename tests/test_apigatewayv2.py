@@ -1355,7 +1355,7 @@ def test_apigw_resolve_jwks_url_falls_back_when_discovery_unavailable(monkeypatc
     assert resolved == f"{issuer}/.well-known/jwks.json"
 
 
-def test_apigw_oidc_discovery_failure_is_not_cached(monkeypatch):
+def test_apigw_oidc_discovery_failure_is_negative_cached(monkeypatch):
     """A failed discovery must not poison the cache for the full 7200s TTL.
 
     Regression test: a transient discovery failure used to be cached for
