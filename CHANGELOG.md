@@ -5,6 +5,11 @@ All notable changes to MiniStack will be documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+- **S3 — S3 → EventBridge events use AWS-conformant `detail-type`, `reason`, and `deletion-type`** — S3 → EventBridge delivery built the `detail-type` by string-mangling the granular notification event name (`Object ObjectCreated Put` instead of AWS's fixed `Object Created`), hardcoded `detail.reason` to `PutObject` for every event, and omitted `detail.deletion-type` on deletes. Because EventBridge rules match on `detail-type`, any rule written to the AWS-documented type (e.g. `["Object Created"]`) silently never matched. Each S3 event family now maps to its fixed EventBridge `detail-type`, with the per-API `reason` (`PutObject`/`POST Object`/`CopyObject`/`CompleteMultipartUpload`/`DeleteObject`) and a `deletion-type` on `Object Deleted`. Fixes #1005.
+
 ## [1.3.69] — 2026-06-27
 
 ### Fixed
