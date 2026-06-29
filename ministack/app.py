@@ -1715,7 +1715,7 @@ async def app(scope, receive, send):
 
     # Set per-request account ID from credentials (multi-tenancy support).
     # If the access key is a 12-digit number, it becomes the account ID.
-    _access_key = extract_access_key_id(headers)
+    _access_key = extract_access_key_id(headers, query_params)
     if _access_key:
         set_request_account_id(_access_key)
 

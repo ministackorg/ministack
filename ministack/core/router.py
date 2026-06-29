@@ -912,13 +912,28 @@ def extract_region(headers: dict) -> str:
     return os.environ.get("MINISTACK_REGION", "us-east-1")
 
 
-def extract_access_key_id(headers: dict) -> str:
-    """Extract the AWS access key ID from the Authorization header."""
+def extract_access_key_id(headers: dict, query_params: dict) -> str:
+    """Extract the AWS access key ID from the Authorization header or query parameters."""
+
+    if "X-Amz-Credential" in query_params:
+        credential = query_params["X-Amz-Credential"][0]
+        access_key_id = credential.split("/")[0]
+        return access_key_id
+
     auth = headers.get("authorization", "")
-    if auth:
+    if auth.startswith("AWS4-HMAC"):
         match = re.search(r"Credential=([^/]+)/", auth)
         if match:
             return match.group(1)
+
+    if "AWSAccessKeyId" in query_params:
+        return query_params["AWSAccessKeyId"][0]
+
+    if auth.startswith("AWS "):
+        match = re.search(r"AWS ([^:]+):", auth)
+        if match:
+            return match.group(1)
+
     return ""
 
 
