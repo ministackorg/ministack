@@ -170,6 +170,40 @@ def test_cfn_stack_with_parameters(cfn, sqs):
     urls = sqs.list_queues(QueueNamePrefix="cfn-t02-custom").get("QueueUrls", [])
     assert any("cfn-t02-custom" in u for u in urls)
 
+def test_cfn_change_set_use_previous_value_updates_resource(cfn, ssm):
+    """A change set created with UsePreviousValue (the `aws cloudformation deploy`
+    no-`--parameter-overrides` path) must resolve the parameter to its stored
+    value, so a parameter-driven resource still updates rather than resolving to
+    an empty value and missing the real resource (#897)."""
+    def template(value):
+        return json.dumps({
+            "AWSTemplateFormatVersion": "2010-09-09",
+            "Parameters": {"Prefix": {"Type": "String", "Default": "demo"}},
+            "Resources": {"P": {
+                "Type": "AWS::SSM::Parameter",
+                "Properties": {
+                    "Name": {"Fn::Sub": "/${Prefix}/config"},
+                    "Type": "String",
+                    "Value": value,
+                },
+            }},
+        })
+
+    cfn.create_stack(StackName="cfn-upv", TemplateBody=template("v1"))
+    _wait_stack(cfn, "cfn-upv")
+    assert ssm.get_parameter(Name="/demo/config")["Parameter"]["Value"] == "v1"
+
+    # Change set re-sends Prefix as UsePreviousValue (what `deploy` does without
+    # --parameter-overrides). Prefix must resolve to "demo", not "".
+    cfn.create_change_set(
+        StackName="cfn-upv", ChangeSetName="cs2", TemplateBody=template("v2"),
+        Parameters=[{"ParameterKey": "Prefix", "UsePreviousValue": True}],
+    )
+    cfn.execute_change_set(StackName="cfn-upv", ChangeSetName="cs2")
+    _wait_stack(cfn, "cfn-upv")
+
+    assert ssm.get_parameter(Name="/demo/config")["Parameter"]["Value"] == "v2"
+
 def test_cfn_intrinsic_ref_getatt(cfn, ssm):
     template = {
         "AWSTemplateFormatVersion": "2010-09-09",
@@ -2707,6 +2741,38 @@ def test_cfn_apigwv2_integration_basic(cfn, apigw):
     assert apigw.get_integrations(ApiId=api_id)["Items"] == []
 
 
+def test_cfn_apigwv2_ms_custom_id(cfn, apigw):
+    """CloudFormation ms-custom-id tag pins the ApiGatewayV2 API id (issue #400)."""
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "HttpApi": {
+                "Type": "AWS::ApiGatewayV2::Api",
+                "Properties": {
+                    "Name": "cfn-apigwv2-custom-id-t01",
+                    "ProtocolType": "HTTP",
+                    "Tags": {"ms-custom-id": "cfn-pinned-api"},
+                },
+            },
+        },
+    }
+    stack_name = "cfn-apigwv2-custom-id-t01"
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(template))
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "CREATE_COMPLETE"
+
+    resources = cfn.describe_stack_resources(StackName=stack_name)["StackResources"]
+    api_res = [r for r in resources if r["ResourceType"] == "AWS::ApiGatewayV2::Api"][0]
+    assert api_res["PhysicalResourceId"] == "cfn-pinned-api"
+
+    api = apigw.get_api(ApiId="cfn-pinned-api")
+    assert api["ApiId"] == "cfn-pinned-api"
+    assert api["Name"] == "cfn-apigwv2-custom-id-t01"
+
+    cfn.delete_stack(StackName=stack_name)
+    _wait_stack(cfn, stack_name)
+
+
 def test_cfn_apigwv2_route_basic(cfn, apigw):
     """CFN stack with ApiGatewayV2 Api + Integration + Route deploys successfully."""
     template = {
@@ -3376,6 +3442,88 @@ def test_cfn_apigateway_account_provisions(cfn, apigw_v1):
     _wait_stack(cfn, stack_name)
 
 
+# ---------------------------------------------------------------------------
+# ApiGatewayV1 Integration with OpenAPI spec parsing
+# ---------------------------------------------------------------------------
+
+def test_cfn_restapi_openapi_body_petstore(cfn, apigw_v1):
+    stack = "cfn-restapi-body"
+    op = {
+        "x-amazon-apigateway-integration": {
+            "httpMethod": "POST",
+            "type": "aws_proxy",
+            "uri": {
+                "Fn::Sub": "arn:aws:apigateway:${AWS::Region}:lambda:path/"
+                           "2015-03-31/functions/${PetStoreFunction.Arn}/invocations"
+            },
+        },
+        "responses": {},
+    }
+    body = {
+        "swagger": "2.0",
+        "info": {"version": "1.0", "title": {"Ref": "AWS::StackName"}},
+        "paths": {
+            "/pets": {"get": dict(op), "post": dict(op)},
+            "/pets/featured": {"get": dict(op)},
+            "/pets/{petId}": {"get": dict(op), "delete": dict(op)},
+        },
+    }
+    template = json.dumps({
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "PetStoreFunction": {
+                "Type": "AWS::Lambda::Function",
+                "Properties": {
+                    "FunctionName": f"{stack}-fn",
+                    "Runtime": "python3.12",
+                    "Handler": "index.handler",
+                    "Role": "arn:aws:iam::000000000000:role/r",
+                    "Code": {"ZipFile": "def handler(e, c):\n    return {}\n"},
+                },
+            },
+            "ServerlessRestApi": {
+                "Type": "AWS::ApiGateway::RestApi",
+                "Properties": {"Body": body},
+            },
+        },
+        "Outputs": {"ApiId": {"Value": {"Ref": "ServerlessRestApi"}}},
+    })
+
+    cfn.create_stack(StackName=stack, TemplateBody=template)
+    s = _wait_stack(cfn, stack)
+    assert s["StackStatus"] == "CREATE_COMPLETE"
+    api_id = {o["OutputKey"]: o["OutputValue"] for o in s["Outputs"]}["ApiId"]
+
+    api = apigw_v1.get_rest_api(restApiId=api_id)
+    assert api["name"] == stack
+    assert api["version"] == "1.0"
+
+    rmap = {}
+    for r in apigw_v1.get_resources(restApiId=api_id, limit=500)["items"]:
+        rmap[r["path"]] = {
+            m: apigw_v1.get_integration(restApiId=api_id, resourceId=r["id"],
+                                        httpMethod=m)
+            for m in (r.get("resourceMethods") or {})
+        }
+
+    assert set(rmap) == {"/", "/pets", "/pets/featured", "/pets/{petId}"}
+    assert set(rmap["/pets"]) == {"GET", "POST"}
+    assert set(rmap["/pets/featured"]) == {"GET"}
+    assert set(rmap["/pets/{petId}"]) == {"GET", "DELETE"}
+
+    integ = rmap["/pets"]["GET"]
+    assert integ["type"] == "AWS_PROXY"
+    assert integ["httpMethod"] == "POST"
+    assert integ["uri"].startswith("arn:aws:apigateway:")
+    assert "${" not in integ["uri"]
+    assert f":function:{stack}-fn/invocations" in integ["uri"]
+
+    cfn.delete_stack(StackName=stack)
+    _wait_stack(cfn, stack)
+    ids = [a["id"] for a in apigw_v1.get_rest_apis(limit=500)["items"]]
+    assert api_id not in ids
+
+
 # ============================================================================
 # Nested Stacks (AWS::CloudFormation::Stack)
 # ============================================================================
@@ -3541,3 +3689,70 @@ def test_cfn_change_set_detects_parameter_driven_change(cfn, s3):
     # nothing changed -> empty change set (no false positive)
     noop = _change_set("cs-noop", "a.zip")
     assert len(noop.get("Changes", [])) == 0
+
+
+def test_cfn_lambda_layer_packages_importable(cfn, s3, lam):
+    """A Lambda layer deployed via CloudFormation (CDK pattern: Content from S3)
+    must make its packages importable at invoke time.
+
+    Regression: the CFN LayerVersion provisioner fetched the layer zip but never
+    stored it as ``_zip_data``, so ``_resolve_layer_zip`` returned None and the
+    layer was silently skipped at worker spawn — ``No module named ...`` even
+    though ``list-layers`` showed the layer. Reported by @ocr-lasagna."""
+    stack_name = "cfn-layer-import"
+    bucket_name = "cfn-layer-assets"
+    fn_name = "cfn-layer-fn"
+
+    s3.create_bucket(Bucket=bucket_name)
+
+    # Layer zip with a Python module under python/ (the AWS layer convention).
+    layer_buf = io.BytesIO()
+    with zipfile.ZipFile(layer_buf, "w") as z:
+        z.writestr("python/cfn_layer_helper.py", "LAYER_VALUE = 'from-cfn-layer'\n")
+    s3.put_object(Bucket=bucket_name, Key="layer.zip", Body=layer_buf.getvalue())
+
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "MyLayer": {
+                "Type": "AWS::Lambda::LayerVersion",
+                "Properties": {
+                    "LayerName": "cfn-import-layer",
+                    "CompatibleRuntimes": ["python3.12"],
+                    "Content": {"S3Bucket": bucket_name, "S3Key": "layer.zip"},
+                },
+            },
+            "MyFunction": {
+                "Type": "AWS::Lambda::Function",
+                "Properties": {
+                    "FunctionName": fn_name,
+                    "Runtime": "python3.12",
+                    "Handler": "index.handler",
+                    "Role": "arn:aws:iam::000000000000:role/cfn-role",
+                    "Layers": [{"Ref": "MyLayer"}],
+                    "Code": {
+                        "ZipFile": (
+                            "import cfn_layer_helper\n"
+                            "def handler(event, context):\n"
+                            "    return {'value': cfn_layer_helper.LAYER_VALUE}\n"
+                        ),
+                    },
+                },
+            },
+        },
+    }
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(template))
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "CREATE_COMPLETE"
+
+    try:
+        resp = lam.invoke(FunctionName=fn_name, Payload=b"{}")
+        assert resp["StatusCode"] == 200
+        assert "FunctionError" not in resp, (
+            f"Lambda error: {resp['Payload'].read().decode()}"
+        )
+        payload = json.loads(resp["Payload"].read())
+        assert payload["value"] == "from-cfn-layer"
+    finally:
+        cfn.delete_stack(StackName=stack_name)

@@ -999,37 +999,53 @@ def _build_run_kwargs(cdef, td, env, port_bindings, ecs_network,
     return kwargs
 
 
+class _SecretResolutionError(Exception):
+    """A container secret's ``valueFrom`` could not be resolved.
+
+    AWS fails the whole task to start with a ``ResourceInitializationError``
+    rather than launching the container without the variable, so ``_run_task``
+    translates this into a STOPPED task.
+    """
+
+
 def _resolve_container_secrets(cdef):
     """Resolve a container definition's ``secrets`` into a {name: value} mapping.
 
-    Each entry's ``valueFrom`` is a Secrets Manager secret ARN, optionally with
-    a ``:json-key:version-stage:version-id`` suffix (the json-key selects one
-    field from a JSON SecretString). SSM Parameter Store references are not
-    resolved; unresolvable entries are skipped with a warning.
+    Each entry's ``valueFrom`` is either a Secrets Manager secret ARN (optionally
+    with a ``:json-key`` suffix selecting one field from a JSON ``SecretString``)
+    or an SSM Parameter Store name/ARN. A reference that cannot be resolved
+    raises ``_SecretResolutionError`` — matching AWS, which fails the task launch
+    instead of starting the container without the variable.
     """
     resolved = {}
     for secret in cdef.get("secrets", []):
         name = secret.get("name")
         value_from = secret.get("valueFrom", "")
-        if not name or "secretsmanager" not in value_from:
+        if not name or not value_from:
             continue
-        # A Secrets Manager ARN has 7 colon-separated fields; ECS may append
-        # :json-key:version-stage:version-id after it.
-        parts = value_from.split(":")
-        secret_arn = ":".join(parts[:7])
-        json_key = parts[7] if len(parts) > 7 and parts[7] else None
-        value = secretsmanager.resolve_secret_string(secret_arn)
+        json_key = None
+        if "secretsmanager" in value_from:
+            # A Secrets Manager ARN has 7 colon-separated fields; ECS may append
+            # :json-key:version-stage:version-id after it.
+            parts = value_from.split(":")
+            secret_arn = ":".join(parts[:7])
+            json_key = parts[7] if len(parts) > 7 and parts[7] else None
+            value = secretsmanager.resolve_secret_string(secret_arn)
+        else:
+            # SSM Parameter Store reference (ARN or bare name).
+            from ministack.services import ssm
+            value = ssm.resolve_parameter_value(value_from)
         if value is None:
-            logger.warning("ECS: could not resolve secret %s for env var %s",
-                           value_from, name)
-            continue
+            raise _SecretResolutionError(
+                f"unable to retrieve secret {value_from} for environment "
+                f"variable {name}")
         if json_key:
             try:
                 value = json.loads(value)[json_key]
             except (ValueError, KeyError, TypeError):
-                logger.warning("ECS: secret %s has no JSON key %s",
-                               secret_arn, json_key)
-                continue
+                raise _SecretResolutionError(
+                    f"unable to retrieve json key '{json_key}' from secret "
+                    f"{value_from} for environment variable {name}")
         resolved[name] = str(value)
     return resolved
 
@@ -1137,7 +1153,24 @@ def _run_task(data):
                     env_override[e["name"]] = e["value"]
 
                 env = {e["name"]: e["value"] for e in cdef.get("environment", [])}
-                env.update(_resolve_container_secrets(cdef))
+                try:
+                    env.update(_resolve_container_secrets(cdef))
+                except _SecretResolutionError as exc:
+                    # AWS fails the whole task to start (ResourceInitializationError)
+                    # when a secret can't be retrieved — don't launch any container.
+                    now = _iso()
+                    task["lastStatus"] = "STOPPED"
+                    task["desiredStatus"] = "STOPPED"
+                    task["stoppingAt"] = now
+                    task["stoppedAt"] = now
+                    task["stopCode"] = "TaskFailedToStart"
+                    task["stoppedReason"] = (
+                        "ResourceInitializationError: unable to pull secrets or "
+                        "registry auth: execution resource retrieval failed: "
+                        + str(exc))
+                    for c in task.get("containers", []):
+                        c["lastStatus"] = "STOPPED"
+                    break
                 env.update(env_override)
                 effective_cdef = dict(cdef)
                 if "command" in container_override:

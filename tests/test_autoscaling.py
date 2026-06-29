@@ -898,3 +898,68 @@ def test_create_asg_with_launch_template(autoscaling):
         assert lt.get("Version") == "$Latest"
     finally:
         autoscaling.delete_auto_scaling_group(AutoScalingGroupName=asg)
+
+
+# ---------------------------------------------------------------------------
+# Instance Refresh
+# ---------------------------------------------------------------------------
+
+
+def test_start_and_describe_instance_refresh(autoscaling):
+    asg = _uid("asg-refresh")
+    autoscaling.create_auto_scaling_group(
+        AutoScalingGroupName=asg,
+        MinSize=0,
+        MaxSize=1,
+        AvailabilityZones=["us-east-1a"],
+        LaunchTemplate={"LaunchTemplateName": "my-template", "Version": "$Latest"},
+    )
+    try:
+        start = autoscaling.start_instance_refresh(
+            AutoScalingGroupName=asg,
+            Preferences={"MinHealthyPercentage": 90, "InstanceWarmup": 0},
+        )
+        refresh_id = start["InstanceRefreshId"]
+        assert refresh_id
+
+        resp = autoscaling.describe_instance_refreshes(AutoScalingGroupName=asg)
+        refreshes = resp["InstanceRefreshes"]
+        assert len(refreshes) == 1
+        r = refreshes[0]
+        assert r["InstanceRefreshId"] == refresh_id
+        assert r["AutoScalingGroupName"] == asg
+        assert r["Status"] == "Successful"
+        assert r["PercentageComplete"] == 100
+
+        # Filter by id round-trips.
+        filtered = autoscaling.describe_instance_refreshes(
+            AutoScalingGroupName=asg, InstanceRefreshIds=[refresh_id]
+        )
+        assert filtered["InstanceRefreshes"][0]["InstanceRefreshId"] == refresh_id
+    finally:
+        autoscaling.delete_auto_scaling_group(AutoScalingGroupName=asg)
+
+
+def test_start_instance_refresh_unknown_asg_fails(autoscaling):
+    with pytest.raises(ClientError) as exc:
+        autoscaling.start_instance_refresh(AutoScalingGroupName=_uid("missing"))
+    assert "ValidationError" in str(exc.value)
+
+
+def test_cancel_instance_refresh_when_none_active(autoscaling):
+    asg = _uid("asg-cancel")
+    autoscaling.create_auto_scaling_group(
+        AutoScalingGroupName=asg,
+        MinSize=0,
+        MaxSize=1,
+        AvailabilityZones=["us-east-1a"],
+        LaunchTemplate={"LaunchTemplateName": "my-template", "Version": "$Latest"},
+    )
+    try:
+        # Refresh completes immediately, so there is nothing active to cancel.
+        autoscaling.start_instance_refresh(AutoScalingGroupName=asg)
+        with pytest.raises(ClientError) as exc:
+            autoscaling.cancel_instance_refresh(AutoScalingGroupName=asg)
+        assert "ActiveInstanceRefreshNotFound" in str(exc.value)
+    finally:
+        autoscaling.delete_auto_scaling_group(AutoScalingGroupName=asg)

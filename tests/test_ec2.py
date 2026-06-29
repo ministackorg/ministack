@@ -10,6 +10,50 @@ import pytest
 from botocore.exceptions import ClientError
 
 
+def _create_ec2_iam_instance_profile(iam, suffix):
+    assume = json.dumps(
+        {
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Effect": "Allow",
+                    "Principal": {"Service": "ec2.amazonaws.com"},
+                    "Action": "sts:AssumeRole",
+                }
+            ],
+        }
+    )
+    role_name = f"ec2-ip-role-{suffix}"
+    profile_name = f"ec2-ip-{suffix}"
+    iam.create_role(RoleName=role_name, AssumeRolePolicyDocument=assume)
+    profile = iam.create_instance_profile(
+        InstanceProfileName=profile_name
+    )["InstanceProfile"]
+    iam.add_role_to_instance_profile(
+        InstanceProfileName=profile_name,
+        RoleName=role_name,
+    )
+    return role_name, profile_name, profile
+
+
+def _delete_ec2_iam_instance_profile(iam, role_name, profile_name):
+    try:
+        iam.remove_role_from_instance_profile(
+            InstanceProfileName=profile_name,
+            RoleName=role_name,
+        )
+    except ClientError:
+        pass
+    try:
+        iam.delete_instance_profile(InstanceProfileName=profile_name)
+    except ClientError:
+        pass
+    try:
+        iam.delete_role(RoleName=role_name)
+    except ClientError:
+        pass
+
+
 def test_ec2_describe_vpcs_default(ec2):
     resp = ec2.describe_vpcs()
     vpcs = resp["Vpcs"]
@@ -98,6 +142,134 @@ def test_ec2_run_instances_honors_private_ip_and_iam_profile(ec2):
         ec2.terminate_instances(InstanceIds=[iid])
 
 
+def test_ec2_run_instances_with_real_iam_profile_creates_association(iam, ec2):
+    suffix = f"launch-{_uuid_mod.uuid4().hex[:8]}"
+    role_name, profile_name, profile = _create_ec2_iam_instance_profile(iam, suffix)
+    resp = ec2.run_instances(
+        ImageId="ami-12345678",
+        MinCount=1,
+        MaxCount=1,
+        InstanceType="t3.micro",
+        IamInstanceProfile={"Name": profile_name},
+    )
+    inst = resp["Instances"][0]
+    iid = inst["InstanceId"]
+
+    try:
+        assert inst["IamInstanceProfile"]["Arn"] == profile["Arn"]
+        assert inst["IamInstanceProfile"]["Id"] == profile["InstanceProfileId"]
+
+        described = ec2.describe_iam_instance_profile_associations(
+            Filters=[{"Name": "instance-id", "Values": [iid]}]
+        )["IamInstanceProfileAssociations"]
+        assert len(described) == 1
+        assoc = described[0]
+        assert assoc["AssociationId"].startswith("iip-assoc-")
+        assert assoc["InstanceId"] == iid
+        assert assoc["State"] == "associated"
+        assert assoc["IamInstanceProfile"]["Arn"] == profile["Arn"]
+        assert assoc["IamInstanceProfile"]["Id"] == profile["InstanceProfileId"]
+
+        ec2.terminate_instances(InstanceIds=[iid])
+
+        active = ec2.describe_iam_instance_profile_associations(
+            Filters=[
+                {"Name": "instance-id", "Values": [iid]},
+                {"Name": "state", "Values": ["associated"]},
+            ]
+        )["IamInstanceProfileAssociations"]
+        assert active == []
+
+        all_states = ec2.describe_iam_instance_profile_associations(
+            AssociationIds=[assoc["AssociationId"]]
+        )["IamInstanceProfileAssociations"]
+        assert len(all_states) == 1
+        assert all_states[0]["State"] == "disassociated"
+    finally:
+        try:
+            ec2.terminate_instances(InstanceIds=[iid])
+        except ClientError:
+            pass
+        _delete_ec2_iam_instance_profile(iam, role_name, profile_name)
+
+
+def test_ec2_iam_instance_profile_association_lifecycle(iam, ec2):
+    suffix = _uuid_mod.uuid4().hex[:8]
+    role_a, profile_a_name, profile_a = _create_ec2_iam_instance_profile(
+        iam, f"a-{suffix}"
+    )
+    role_b, profile_b_name, profile_b = _create_ec2_iam_instance_profile(
+        iam, f"b-{suffix}"
+    )
+    resp = ec2.run_instances(ImageId="ami-12345678", MinCount=1, MaxCount=1)
+    iid = resp["Instances"][0]["InstanceId"]
+
+    try:
+        assoc = ec2.associate_iam_instance_profile(
+            InstanceId=iid,
+            IamInstanceProfile={"Name": profile_a_name},
+        )["IamInstanceProfileAssociation"]
+        assert assoc["State"] == "associated"
+        assert assoc["IamInstanceProfile"]["Arn"] == profile_a["Arn"]
+        assert assoc["IamInstanceProfile"]["Id"] == profile_a["InstanceProfileId"]
+
+        all_assocs = ec2.describe_iam_instance_profile_associations()[
+            "IamInstanceProfileAssociations"
+        ]
+        assert any(
+            item["AssociationId"] == assoc["AssociationId"] for item in all_assocs
+        )
+
+        by_instance = ec2.describe_iam_instance_profile_associations(
+            Filters=[{"Name": "instance-id", "Values": [iid]}]
+        )["IamInstanceProfileAssociations"]
+        assert len(by_instance) == 1
+        assert by_instance[0]["AssociationId"] == assoc["AssociationId"]
+
+        replaced = ec2.replace_iam_instance_profile_association(
+            AssociationId=assoc["AssociationId"],
+            IamInstanceProfile={"Arn": profile_b["Arn"]},
+        )["IamInstanceProfileAssociation"]
+        assert replaced["AssociationId"] == assoc["AssociationId"]
+        assert replaced["State"] == "associated"
+        assert replaced["IamInstanceProfile"]["Arn"] == profile_b["Arn"]
+        assert replaced["IamInstanceProfile"]["Id"] == profile_b["InstanceProfileId"]
+
+        inst = ec2.describe_instances(InstanceIds=[iid])["Reservations"][0]["Instances"][0]
+        assert inst["IamInstanceProfile"]["Arn"] == profile_b["Arn"]
+        assert inst["IamInstanceProfile"]["Id"] == profile_b["InstanceProfileId"]
+
+        disassoc = ec2.disassociate_iam_instance_profile(
+            AssociationId=assoc["AssociationId"]
+        )["IamInstanceProfileAssociation"]
+        assert disassoc["AssociationId"] == assoc["AssociationId"]
+        assert disassoc["State"] == "disassociated"
+
+        active = ec2.describe_iam_instance_profile_associations(
+            Filters=[
+                {"Name": "association-id", "Values": [assoc["AssociationId"]]},
+                {"Name": "state", "Values": ["associated"]},
+            ]
+        )["IamInstanceProfileAssociations"]
+        assert active == []
+
+        described = ec2.describe_iam_instance_profile_associations(
+            AssociationIds=[assoc["AssociationId"]]
+        )["IamInstanceProfileAssociations"]
+        assert len(described) == 1
+        assert described[0]["State"] == "disassociated"
+
+        inst = ec2.describe_instances(InstanceIds=[iid])["Reservations"][0]["Instances"][0]
+        assert "IamInstanceProfile" not in inst or not inst["IamInstanceProfile"]
+    finally:
+        try:
+            ec2.terminate_instances(InstanceIds=[iid])
+        except ClientError:
+            pass
+        _delete_ec2_iam_instance_profile(iam, role_a, profile_a_name)
+        _delete_ec2_iam_instance_profile(iam, role_b, profile_b_name)
+
+
 def test_ec2_run_instances_default_private_ip_is_well_formed(ec2):
     """When the caller does not pass --private-ip-address, the auto-generated
     address must still be a valid IPv4. Regression for the 10.0193.216 bug
@@ -110,6 +282,18 @@ def test_ec2_run_instances_default_private_ip_is_well_formed(ec2):
         assert all(0 <= int(o) <= 255 for o in octets)
     finally:
         ec2.terminate_instances(InstanceIds=[inst["InstanceId"]])
+
+
+def test_ec2_run_instances_source_dest_check_defaults_true(ec2):
+    resp = ec2.run_instances(ImageId="ami-12345678", MinCount=1, MaxCount=1)
+    inst = resp["Instances"][0]
+    iid = inst["InstanceId"]
+    try:
+        assert inst["SourceDestCheck"] is True
+        described = ec2.describe_instances(InstanceIds=[iid])["Reservations"][0]["Instances"][0]
+        assert described["SourceDestCheck"] is True
+    finally:
+        ec2.terminate_instances(InstanceIds=[iid])
 
 
 def test_ec2_run_instances_emits_default_root_block_device_mapping(ec2):
@@ -324,6 +508,105 @@ def test_ec2_sg_authorize_ingress_idempotent_duplicate(ec2):
     matching = [p for p in ingress if p.get("FromPort") == 5432 and p.get("ToPort") == 5432]
     assert len(matching) == 1
     ec2.delete_security_group(GroupId=sg_id)
+
+
+def test_ec2_sg_authorize_ingress_legacy_source_group(ec2):
+    """Legacy top-level --source-group params (CLI/Terraform) must create a real
+    referenced-group rule visible in DescribeSecurityGroups AND
+    DescribeSecurityGroupRules, with a SecurityGroupRuleId matching the Authorize
+    response. Regression for issue #916."""
+    vpc = ec2.create_vpc(CidrBlock="10.111.0.0/16")["Vpc"]
+    sg_a = ec2.create_security_group(
+        GroupName="sg-a-916", Description="a", VpcId=vpc["VpcId"])["GroupId"]
+    sg_b = ec2.create_security_group(
+        GroupName="sg-b-916", Description="b", VpcId=vpc["VpcId"])["GroupId"]
+
+    # The AWS CLI `authorize-security-group-ingress --protocol tcp --port 8080
+    # --source-group <id>` (and older SDKs) serialize to legacy top-level
+    # parameters rather than the nested IpPermissions.N.Groups.M form. Inject
+    # exactly that wire shape so the test exercises the same code path.
+    def _inject_legacy(request, **kwargs):
+        request.data = (
+            f"Action=AuthorizeSecurityGroupIngress&Version=2016-11-15"
+            f"&GroupId={sg_b}&IpProtocol=tcp&FromPort=8080&ToPort=8080"
+            f"&SourceSecurityGroupId={sg_a}"
+        )
+
+    ec2.meta.events.register(
+        "before-sign.ec2.AuthorizeSecurityGroupIngress", _inject_legacy)
+    try:
+        resp = ec2.authorize_security_group_ingress(GroupId=sg_b)
+    finally:
+        ec2.meta.events.unregister(
+            "before-sign.ec2.AuthorizeSecurityGroupIngress", _inject_legacy)
+
+    assert resp.get("Return") is True
+    auth_rules = resp.get("SecurityGroupRules", [])
+    assert len(auth_rules) == 1, f"expected 1 rule from Authorize, got {auth_rules}"
+    auth_rule_id = auth_rules[0]["SecurityGroupRuleId"]
+    assert auth_rules[0].get("ReferencedGroupInfo", {}).get("GroupId") == sg_a
+
+    # DescribeSecurityGroups must show the UserIdGroupPairs reference.
+    perms = ec2.describe_security_groups(
+        GroupIds=[sg_b])["SecurityGroups"][0]["IpPermissions"]
+    pairs = [pair for p in perms for pair in p.get("UserIdGroupPairs", [])]
+    assert any(pair.get("GroupId") == sg_a for pair in pairs), \
+        f"UserIdGroupPairs missing reference to {sg_a}: {perms}"
+
+    # DescribeSecurityGroupRules must return the rule with ReferencedGroupInfo
+    # and a SecurityGroupRuleId matching the Authorize response.
+    sgr = ec2.describe_security_group_rules(
+        Filters=[{"Name": "group-id", "Values": [sg_b]}])["SecurityGroupRules"]
+    ref_rules = [r for r in sgr if r.get("ReferencedGroupInfo", {}).get("GroupId") == sg_a]
+    assert len(ref_rules) == 1, \
+        f"DescribeSecurityGroupRules missing referenced-group rule: {sgr}"
+    assert ref_rules[0]["SecurityGroupRuleId"] == auth_rule_id
+    assert ref_rules[0]["IsEgress"] is False
+    assert ref_rules[0]["IpProtocol"] == "tcp"
+    assert ref_rules[0]["FromPort"] == 8080
+    assert ref_rules[0]["ToPort"] == 8080
+
+    ec2.delete_security_group(GroupId=sg_b)
+    ec2.delete_security_group(GroupId=sg_a)
+
+
+def test_ec2_sg_authorize_ingress_referenced_group_nested(ec2):
+    """The nested IpPermissions form (what boto3 and the Terraform AWS provider
+    send for a source-security-group rule) must return ReferencedGroupInfo in the
+    AuthorizeSecurityGroupIngress response, with a SecurityGroupRuleId consistent
+    with DescribeSecurityGroupRules. Regression for issue #916: previously the
+    Authorize response omitted ReferencedGroupInfo for group-pair rules."""
+    vpc = ec2.create_vpc(CidrBlock="10.112.0.0/16")["Vpc"]
+    sg_a = ec2.create_security_group(
+        GroupName="sg-a-916n", Description="a", VpcId=vpc["VpcId"])["GroupId"]
+    sg_b = ec2.create_security_group(
+        GroupName="sg-b-916n", Description="b", VpcId=vpc["VpcId"])["GroupId"]
+
+    resp = ec2.authorize_security_group_ingress(
+        GroupId=sg_b,
+        IpPermissions=[{
+            "IpProtocol": "tcp", "FromPort": 8080, "ToPort": 8080,
+            "UserIdGroupPairs": [{"GroupId": sg_a}],
+        }],
+    )
+    auth_rules = resp.get("SecurityGroupRules", [])
+    assert len(auth_rules) == 1, f"expected 1 rule from Authorize, got {auth_rules}"
+    assert auth_rules[0].get("ReferencedGroupInfo", {}).get("GroupId") == sg_a, \
+        f"Authorize response missing ReferencedGroupInfo: {auth_rules}"
+    auth_rule_id = auth_rules[0]["SecurityGroupRuleId"]
+
+    # The same referenced-group rule must be discoverable (and ID-consistent) via
+    # DescribeSecurityGroupRules — this is what Terraform's create waiter polls.
+    sgr = ec2.describe_security_group_rules(
+        Filters=[{"Name": "group-id", "Values": [sg_b]}])["SecurityGroupRules"]
+    ref_rules = [r for r in sgr if r.get("ReferencedGroupInfo", {}).get("GroupId") == sg_a]
+    assert len(ref_rules) == 1, \
+        f"DescribeSecurityGroupRules missing referenced-group rule: {sgr}"
+    assert ref_rules[0]["SecurityGroupRuleId"] == auth_rule_id
+    assert ref_rules[0]["IsEgress"] is False
+
+    ec2.delete_security_group(GroupId=sg_b)
+    ec2.delete_security_group(GroupId=sg_a)
 
 
 def test_ec2_key_pair_crud(ec2):
