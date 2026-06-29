@@ -1539,7 +1539,13 @@ def test_s3_put_notification_no_test_event_for_missing_bucket(s3, sqs):
 
 
 def test_s3_eventbridge_notification(s3, sqs, eb):
-    """S3 EventBridgeConfiguration sends events to EventBridge, routed to SQS via rule."""
+    """S3 EventBridgeConfiguration sends AWS-conformant events to EventBridge, routed to SQS.
+
+    The emitted ``detail-type`` must be the fixed value Amazon S3 uses (``Object Created``),
+    not the granular ``s3:ObjectCreated:Put`` event name — so the rule below matches on the
+    documented detail-type, not on ``source`` alone, and would fail to route a non-conformant
+    event.
+    """
     s3.create_bucket(Bucket="s3-eb-bkt")
     queue_url = sqs.create_queue(QueueName="s3-eb-target-q")["QueueUrl"]
     queue_arn = sqs.get_queue_attributes(
@@ -1552,10 +1558,10 @@ def test_s3_eventbridge_notification(s3, sqs, eb):
         NotificationConfiguration={"EventBridgeConfiguration": {}},
     )
 
-    # Create EventBridge rule matching S3 events → SQS target
+    # Rule matches the AWS-documented detail-type, not source alone.
     eb.put_rule(
         Name="s3-to-sqs-rule",
-        EventPattern=json.dumps({"source": ["aws.s3"]}),
+        EventPattern=json.dumps({"source": ["aws.s3"], "detail-type": ["Object Created"]}),
         State="ENABLED",
     )
     eb.put_targets(
@@ -1571,8 +1577,78 @@ def test_s3_eventbridge_notification(s3, sqs, eb):
     assert "Messages" in msgs and len(msgs["Messages"]) > 0
     body = json.loads(msgs["Messages"][0]["Body"])
     assert body["source"] == "aws.s3"
+    assert body["detail-type"] == "Object Created"
     assert body["detail"]["bucket"]["name"] == "s3-eb-bkt"
     assert body["detail"]["object"]["key"] == "hello.txt"
+    assert body["detail"]["reason"] == "PutObject"
+
+
+def test_s3_eventbridge_notification_copy_reason(s3, sqs, eb):
+    """A CopyObject create carries reason ``CopyObject`` (not a hardcoded ``PutObject``)."""
+    s3.create_bucket(Bucket="s3-eb-copy-bkt")
+    queue_url = sqs.create_queue(QueueName="s3-eb-copy-q")["QueueUrl"]
+    queue_arn = sqs.get_queue_attributes(
+        QueueUrl=queue_url, AttributeNames=["QueueArn"],
+    )["Attributes"]["QueueArn"]
+    s3.put_bucket_notification_configuration(
+        Bucket="s3-eb-copy-bkt",
+        NotificationConfiguration={"EventBridgeConfiguration": {}},
+    )
+    eb.put_rule(
+        Name="s3-copy-rule",
+        EventPattern=json.dumps(
+            {
+                "source": ["aws.s3"],
+                "detail-type": ["Object Created"],
+                "detail": {"reason": ["CopyObject"]},
+            }
+        ),
+        State="ENABLED",
+    )
+    eb.put_targets(Rule="s3-copy-rule", Targets=[{"Id": "t", "Arn": queue_arn}])
+
+    s3.put_object(Bucket="s3-eb-copy-bkt", Key="src.txt", Body=b"x")
+    s3.copy_object(
+        Bucket="s3-eb-copy-bkt", Key="dst.txt", CopySource="s3-eb-copy-bkt/src.txt"
+    )
+    time.sleep(0.5)
+
+    msgs = sqs.receive_message(QueueUrl=queue_url, MaxNumberOfMessages=10, WaitTimeSeconds=2)
+    assert "Messages" in msgs and len(msgs["Messages"]) > 0
+    body = json.loads(msgs["Messages"][0]["Body"])
+    assert body["detail-type"] == "Object Created"
+    assert body["detail"]["object"]["key"] == "dst.txt"
+    assert body["detail"]["reason"] == "CopyObject"
+
+
+def test_s3_eventbridge_notification_object_deleted(s3, sqs, eb):
+    """A delete emits ``Object Deleted`` with reason ``DeleteObject`` and a deletion-type."""
+    s3.create_bucket(Bucket="s3-eb-del-bkt")
+    queue_url = sqs.create_queue(QueueName="s3-eb-del-q")["QueueUrl"]
+    queue_arn = sqs.get_queue_attributes(
+        QueueUrl=queue_url, AttributeNames=["QueueArn"],
+    )["Attributes"]["QueueArn"]
+    s3.put_bucket_notification_configuration(
+        Bucket="s3-eb-del-bkt",
+        NotificationConfiguration={"EventBridgeConfiguration": {}},
+    )
+    eb.put_rule(
+        Name="s3-del-rule",
+        EventPattern=json.dumps({"source": ["aws.s3"], "detail-type": ["Object Deleted"]}),
+        State="ENABLED",
+    )
+    eb.put_targets(Rule="s3-del-rule", Targets=[{"Id": "t", "Arn": queue_arn}])
+
+    s3.put_object(Bucket="s3-eb-del-bkt", Key="gone.txt", Body=b"x")
+    s3.delete_object(Bucket="s3-eb-del-bkt", Key="gone.txt")
+    time.sleep(0.5)
+
+    msgs = sqs.receive_message(QueueUrl=queue_url, MaxNumberOfMessages=10, WaitTimeSeconds=2)
+    assert "Messages" in msgs and len(msgs["Messages"]) > 0
+    body = json.loads(msgs["Messages"][0]["Body"])
+    assert body["detail-type"] == "Object Deleted"
+    assert body["detail"]["reason"] == "DeleteObject"
+    assert body["detail"]["deletion-type"] == "Permanently Deleted"
 
 def test_s3_list_object_versions(s3):
     s3.create_bucket(Bucket="s3-ver-bkt")
