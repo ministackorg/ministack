@@ -72,6 +72,416 @@ def test_secretsmanager_create_get(sm):
     resp = sm.get_secret_value(SecretId="test-secret-1")
     assert json.loads(resp["SecretString"])["user"] == "admin"
 
+
+def test_secretsmanager_secrets_are_region_scoped_by_name(sm):
+    name = f"sm-region-scope-{_uuid_mod.uuid4().hex[:8]}"
+    west = _regional_sm("us-west-2")
+
+    east_arn = sm.create_secret(Name=name, SecretString="east")["ARN"]
+    west_arn = west.create_secret(Name=name, SecretString="west")["ARN"]
+
+    assert east_arn.startswith("arn:aws:secretsmanager:us-east-1:000000000000:secret:")
+    assert west_arn.startswith("arn:aws:secretsmanager:us-west-2:000000000000:secret:")
+    assert sm.get_secret_value(SecretId=name)["SecretString"] == "east"
+    assert west.get_secret_value(SecretId=name)["SecretString"] == "west"
+
+    east_names = {entry["Name"] for entry in sm.list_secrets()["SecretList"]}
+    west_names = {entry["Name"] for entry in west.list_secrets()["SecretList"]}
+    assert name in east_names
+    assert name in west_names
+
+    with pytest.raises(ClientError) as exc:
+        sm.get_secret_value(SecretId=west_arn)
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
+def test_secretsmanager_resource_policies_are_region_scoped(sm):
+    name = f"sm-region-policy-{_uuid_mod.uuid4().hex[:8]}"
+    west = _regional_sm("us-west-2")
+    sm.create_secret(Name=name, SecretString="east")
+    west.create_secret(Name=name, SecretString="west")
+
+    east_policy = json.dumps({"Version": "2012-10-17", "Statement": [{"Sid": "east"}]})
+    west_policy = json.dumps({"Version": "2012-10-17", "Statement": [{"Sid": "west"}]})
+    sm.put_resource_policy(SecretId=name, ResourcePolicy=east_policy)
+    west.put_resource_policy(SecretId=name, ResourcePolicy=west_policy)
+
+    assert sm.get_resource_policy(SecretId=name)["ResourcePolicy"] == east_policy
+    assert west.get_resource_policy(SecretId=name)["ResourcePolicy"] == west_policy
+
+
+def test_secretsmanager_replicate_secret_to_regions_creates_target_region_secret(sm):
+    name = f"sm-region-replica-{_uuid_mod.uuid4().hex[:8]}"
+    west = _regional_sm("us-west-2")
+
+    east_arn = sm.create_secret(Name=name, SecretString="primary")["ARN"]
+    resp = sm.replicate_secret_to_regions(
+        SecretId=name,
+        AddReplicaRegions=[{"Region": "us-west-2", "KmsKeyId": "alias/west-key"}],
+    )
+    assert resp["ARN"] == east_arn
+    assert resp["ReplicationStatus"] == [{
+        "Region": "us-west-2",
+        "Status": "InSync",
+        "StatusMessage": "Replication succeeded (stub).",
+        "KmsKeyId": "alias/west-key",
+    }]
+
+    replica_value = west.get_secret_value(SecretId=name)
+    assert replica_value["SecretString"] == "primary"
+    assert replica_value["ARN"].startswith(
+        "arn:aws:secretsmanager:us-west-2:000000000000:secret:"
+    )
+    assert west.describe_secret(SecretId=name)["KmsKeyId"] == "alias/west-key"
+    replica_description = west.describe_secret(SecretId=name)
+    assert replica_description["PrimaryRegion"] == "us-east-1"
+    replica_entries = {
+        entry["Name"]: entry
+        for entry in west.list_secrets()["SecretList"]
+    }
+    assert replica_entries[name]["PrimaryRegion"] == "us-east-1"
+
+
+def test_secretsmanager_replicate_secret_to_regions_requires_force_for_existing_target(sm):
+    name = f"sm-region-replica-conflict-{_uuid_mod.uuid4().hex[:8]}"
+    west = _regional_sm("us-west-2")
+    sm.create_secret(Name=name, SecretString="primary")
+    west.create_secret(Name=name, SecretString="independent")
+
+    with pytest.raises(ClientError) as exc:
+        sm.replicate_secret_to_regions(
+            SecretId=name,
+            AddReplicaRegions=[{"Region": "us-west-2"}],
+        )
+    assert exc.value.response["Error"]["Code"] == "ResourceExistsException"
+    assert west.get_secret_value(SecretId=name)["SecretString"] == "independent"
+
+    sm.replicate_secret_to_regions(
+        SecretId=name,
+        AddReplicaRegions=[{"Region": "us-west-2"}],
+        ForceOverwriteReplicaSecret=True,
+    )
+    assert west.get_secret_value(SecretId=name)["SecretString"] == "primary"
+
+
+def test_secretsmanager_replicate_secret_to_regions_rejects_source_region(sm):
+    name = f"sm-region-replica-source-{_uuid_mod.uuid4().hex[:8]}"
+    sm.create_secret(Name=name, SecretString="primary")
+
+    with pytest.raises(ClientError) as exc:
+        sm.replicate_secret_to_regions(
+            SecretId=name,
+            AddReplicaRegions=[{"Region": "us-east-1"}],
+        )
+    assert exc.value.response["Error"]["Code"] == "InvalidParameterException"
+    assert "ReplicationStatus" not in sm.describe_secret(SecretId=name)
+
+
+def test_secretsmanager_replicate_secret_to_regions_does_not_partially_write(sm):
+    name = f"sm-region-replica-partial-{_uuid_mod.uuid4().hex[:8]}"
+    west = _regional_sm("us-west-2")
+    sm.create_secret(Name=name, SecretString="primary")
+
+    with pytest.raises(ClientError) as exc:
+        sm.replicate_secret_to_regions(
+            SecretId=name,
+            AddReplicaRegions=[
+                {"Region": "us-west-2"},
+                {"Region": "us-east-1"},
+            ],
+        )
+    assert exc.value.response["Error"]["Code"] == "InvalidParameterException"
+    assert "ReplicationStatus" not in sm.describe_secret(SecretId=name)
+    with pytest.raises(ClientError) as missing:
+        west.get_secret_value(SecretId=name)
+    assert missing.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
+def test_secretsmanager_replicate_secret_to_regions_does_not_copy_primary_kms(sm):
+    name = f"sm-region-replica-kms-{_uuid_mod.uuid4().hex[:8]}"
+    west = _regional_sm("us-west-2")
+    sm.create_secret(Name=name, SecretString="primary", KmsKeyId="alias/source-key")
+
+    sm.replicate_secret_to_regions(
+        SecretId=name,
+        AddReplicaRegions=[{"Region": "us-west-2"}],
+    )
+
+    assert "KmsKeyId" not in west.describe_secret(SecretId=name)
+
+
+def test_secretsmanager_replicated_secret_versions_stay_in_sync(sm):
+    name = f"sm-region-replica-sync-{_uuid_mod.uuid4().hex[:8]}"
+    west = _regional_sm("us-west-2")
+    sm.create_secret(Name=name, SecretString="primary")
+    sm.replicate_secret_to_regions(
+        SecretId=name,
+        AddReplicaRegions=[{"Region": "us-west-2"}],
+    )
+
+    sm.update_secret(SecretId=name, SecretString="updated")
+    assert west.get_secret_value(SecretId=name)["SecretString"] == "updated"
+
+    sm.put_secret_value(SecretId=name, SecretString="put-value")
+    assert west.get_secret_value(SecretId=name)["SecretString"] == "put-value"
+
+    token = _uuid_mod.uuid4().hex
+    sm.rotate_secret(SecretId=name, ClientRequestToken=token)
+    replica_stages = west.describe_secret(SecretId=name)["VersionIdsToStages"]
+    assert replica_stages[token] == ["AWSCURRENT"]
+
+
+def test_secretsmanager_replica_rejects_direct_mutation(sm):
+    name = f"sm-region-replica-readonly-{_uuid_mod.uuid4().hex[:8]}"
+    west = _regional_sm("us-west-2")
+    sm.create_secret(Name=name, SecretString="primary")
+    sm.replicate_secret_to_regions(
+        SecretId=name,
+        AddReplicaRegions=[{"Region": "us-west-2"}],
+    )
+
+    with pytest.raises(ClientError) as exc:
+        west.put_secret_value(SecretId=name, SecretString="west-only")
+    assert exc.value.response["Error"]["Code"] == "InvalidRequestException"
+    assert west.get_secret_value(SecretId=name)["SecretString"] == "primary"
+
+
+def test_secretsmanager_primary_force_delete_removes_replicas(sm):
+    name = f"sm-region-replica-delete-{_uuid_mod.uuid4().hex[:8]}"
+    west = _regional_sm("us-west-2")
+    sm.create_secret(Name=name, SecretString="primary")
+    sm.replicate_secret_to_regions(
+        SecretId=name,
+        AddReplicaRegions=[{"Region": "us-west-2"}],
+    )
+
+    sm.delete_secret(SecretId=name, ForceDeleteWithoutRecovery=True)
+
+    with pytest.raises(ClientError) as exc:
+        west.get_secret_value(SecretId=name)
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
+def test_secretsmanager_primary_force_delete_removes_replica_policy(sm):
+    from ministack.services import secretsmanager as _sm
+
+    name = f"sm-region-replica-policy-delete-{_uuid_mod.uuid4().hex[:8]}"
+    west = _regional_sm("us-west-2")
+    sm.create_secret(Name=name, SecretString="primary")
+    sm.replicate_secret_to_regions(
+        SecretId=name,
+        AddReplicaRegions=[{"Region": "us-west-2"}],
+    )
+    west_arn = west.describe_secret(SecretId=name)["ARN"]
+    west.put_resource_policy(
+        SecretId=name,
+        ResourcePolicy=json.dumps({"Version": "2012-10-17", "Statement": []}),
+    )
+
+    sm.delete_secret(SecretId=name, ForceDeleteWithoutRecovery=True)
+
+    assert _sm._resource_policies.get_scoped("000000000000", "us-west-2", west_arn) is None
+
+
+def test_secretsmanager_replica_cannot_be_replicated(sm):
+    name = f"sm-region-replica-chain-{_uuid_mod.uuid4().hex[:8]}"
+    west = _regional_sm("us-west-2")
+    east_2 = _regional_sm("us-east-2")
+    sm.create_secret(Name=name, SecretString="primary")
+    sm.replicate_secret_to_regions(
+        SecretId=name,
+        AddReplicaRegions=[{"Region": "us-west-2"}],
+    )
+
+    with pytest.raises(ClientError) as exc:
+        west.replicate_secret_to_regions(
+            SecretId=name,
+            AddReplicaRegions=[{"Region": "us-east-2"}],
+        )
+    assert exc.value.response["Error"]["Code"] == "InvalidRequestException"
+    with pytest.raises(ClientError) as missing:
+        east_2.get_secret_value(SecretId=name)
+    assert missing.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
+def test_secretsmanager_deleted_secret_cannot_be_replicated(sm):
+    name = f"sm-region-replica-deleted-{_uuid_mod.uuid4().hex[:8]}"
+    west = _regional_sm("us-west-2")
+    sm.create_secret(Name=name, SecretString="primary")
+    sm.delete_secret(SecretId=name, RecoveryWindowInDays=7)
+
+    with pytest.raises(ClientError) as exc:
+        sm.replicate_secret_to_regions(
+            SecretId=name,
+            AddReplicaRegions=[{"Region": "us-west-2"}],
+        )
+    assert exc.value.response["Error"]["Code"] == "InvalidRequestException"
+    with pytest.raises(ClientError) as missing:
+        west.get_secret_value(SecretId=name)
+    assert missing.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
+def test_secretsmanager_force_overwrite_removes_target_policy(sm):
+    from ministack.services import secretsmanager as _sm
+
+    name = f"sm-region-replica-overwrite-policy-{_uuid_mod.uuid4().hex[:8]}"
+    west = _regional_sm("us-west-2")
+    sm.create_secret(Name=name, SecretString="primary")
+    old_west_arn = west.create_secret(Name=name, SecretString="independent")["ARN"]
+    west.put_resource_policy(
+        SecretId=name,
+        ResourcePolicy=json.dumps({"Version": "2012-10-17", "Statement": []}),
+    )
+
+    sm.replicate_secret_to_regions(
+        SecretId=name,
+        AddReplicaRegions=[{"Region": "us-west-2"}],
+        ForceOverwriteReplicaSecret=True,
+    )
+
+    assert _sm._resource_policies.get_scoped("000000000000", "us-west-2", old_west_arn) is None
+
+
+def test_secretsmanager_replicate_secret_to_regions_copies_resource_policy(sm):
+    name = f"sm-region-replica-policy-{_uuid_mod.uuid4().hex[:8]}"
+    west = _regional_sm("us-west-2")
+    policy = json.dumps({"Version": "2012-10-17", "Statement": [{"Sid": "source"}]})
+    sm.create_secret(Name=name, SecretString="primary")
+    sm.put_resource_policy(SecretId=name, ResourcePolicy=policy)
+
+    sm.replicate_secret_to_regions(
+        SecretId=name,
+        AddReplicaRegions=[{"Region": "us-west-2"}],
+    )
+
+    assert west.get_resource_policy(SecretId=name)["ResourcePolicy"] == policy
+
+
+def test_secretsmanager_replica_resource_policy_stays_in_sync(sm):
+    name = f"sm-region-replica-policy-sync-{_uuid_mod.uuid4().hex[:8]}"
+    west = _regional_sm("us-west-2")
+    sm.create_secret(Name=name, SecretString="primary")
+    sm.replicate_secret_to_regions(
+        SecretId=name,
+        AddReplicaRegions=[{"Region": "us-west-2"}],
+    )
+
+    first_policy = json.dumps({"Version": "2012-10-17", "Statement": [{"Sid": "first"}]})
+    second_policy = json.dumps({"Version": "2012-10-17", "Statement": [{"Sid": "second"}]})
+    sm.put_resource_policy(SecretId=name, ResourcePolicy=first_policy)
+    assert west.get_resource_policy(SecretId=name)["ResourcePolicy"] == first_policy
+
+    sm.put_resource_policy(SecretId=name, ResourcePolicy=second_policy)
+    assert west.get_resource_policy(SecretId=name)["ResourcePolicy"] == second_policy
+
+    sm.delete_resource_policy(SecretId=name)
+    assert "ResourcePolicy" not in west.get_resource_policy(SecretId=name)
+
+
+def test_secretsmanager_replicate_secret_to_regions_preserves_replica_kms(sm):
+    name = f"sm-region-replica-kms-repeat-{_uuid_mod.uuid4().hex[:8]}"
+    west = _regional_sm("us-west-2")
+    sm.create_secret(Name=name, SecretString="primary")
+    sm.replicate_secret_to_regions(
+        SecretId=name,
+        AddReplicaRegions=[{"Region": "us-west-2", "KmsKeyId": "alias/west-key"}],
+    )
+
+    resp = sm.replicate_secret_to_regions(
+        SecretId=name,
+        AddReplicaRegions=[{"Region": "us-west-2"}],
+    )
+
+    assert west.describe_secret(SecretId=name)["KmsKeyId"] == "alias/west-key"
+    assert resp["ReplicationStatus"] == [{
+        "Region": "us-west-2",
+        "Status": "InSync",
+        "StatusMessage": "Replication succeeded (stub).",
+        "KmsKeyId": "alias/west-key",
+    }]
+
+
+def test_secretsmanager_force_overwrite_transfers_replica_ownership(sm):
+    name = f"sm-region-replica-owner-{_uuid_mod.uuid4().hex[:8]}"
+    east_2 = _regional_sm("us-east-2")
+    west = _regional_sm("us-west-2")
+    sm.create_secret(Name=name, SecretString="east-primary")
+    east_2.create_secret(Name=name, SecretString="east2-primary")
+    sm.replicate_secret_to_regions(
+        SecretId=name,
+        AddReplicaRegions=[{"Region": "us-west-2"}],
+    )
+    east_2.replicate_secret_to_regions(
+        SecretId=name,
+        AddReplicaRegions=[{"Region": "us-west-2"}],
+        ForceOverwriteReplicaSecret=True,
+    )
+    assert not sm.describe_secret(SecretId=name).get("ReplicationStatus")
+
+    sm.update_secret(SecretId=name, SecretString="old-primary-update")
+    assert west.get_secret_value(SecretId=name)["SecretString"] == "east2-primary"
+
+    sm.delete_secret(SecretId=name, ForceDeleteWithoutRecovery=True)
+    assert west.get_secret_value(SecretId=name)["SecretString"] == "east2-primary"
+
+    east_2.update_secret(SecretId=name, SecretString="new-primary-update")
+    assert west.get_secret_value(SecretId=name)["SecretString"] == "new-primary-update"
+
+
+def test_secretsmanager_force_overwrite_cleans_up_overwritten_primary_replicas(sm):
+    name = f"sm-region-replica-overwrite-primary-{_uuid_mod.uuid4().hex[:8]}"
+    west = _regional_sm("us-west-2")
+    eu_west_1 = _regional_sm("eu-west-1")
+    sm.create_secret(Name=name, SecretString="east-primary")
+    west.create_secret(Name=name, SecretString="west-primary")
+    west.replicate_secret_to_regions(
+        SecretId=name,
+        AddReplicaRegions=[{"Region": "eu-west-1"}],
+    )
+
+    sm.replicate_secret_to_regions(
+        SecretId=name,
+        AddReplicaRegions=[{"Region": "us-west-2"}],
+        ForceOverwriteReplicaSecret=True,
+    )
+
+    with pytest.raises(ClientError) as missing:
+        eu_west_1.get_secret_value(SecretId=name)
+    assert missing.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
+def test_secretsmanager_self_region_replication_status_does_not_mark_primary_replica():
+    from ministack.core.responses import get_region, set_request_region
+    from ministack.services import secretsmanager as _sm
+
+    original_region = get_region()
+    name = f"sm-region-replica-self-status-{_uuid_mod.uuid4().hex[:8]}"
+    _sm.reset()
+    set_request_region("us-east-1")
+    try:
+        _sm._create_secret({"Name": name, "SecretString": "primary"})
+        secret = _sm._secrets.get(name)
+        secret["ReplicationStatus"] = [{
+            "Region": "us-east-1",
+            "Status": "InSync",
+            "StatusMessage": "legacy self-region status",
+        }]
+
+        _sm._update_secret({"SecretId": name, "SecretString": "updated"})
+
+        secret = _sm._secrets.get(name)
+        assert "_PrimarySecretArn" not in secret
+        status, _, body = _sm._describe_secret({"SecretId": name})
+        assert status == 200
+        assert "PrimaryRegion" not in json.loads(body)
+        status, _, body = _sm._get_secret_value({"SecretId": name})
+        assert status == 200
+        assert json.loads(body)["SecretString"] == "updated"
+    finally:
+        _sm.reset()
+        set_request_region(original_region)
+
+
 def test_secretsmanager_update_list(sm):
     sm.create_secret(Name="test-secret-2", SecretString="original")
     sm.update_secret(SecretId="test-secret-2", SecretString="updated")

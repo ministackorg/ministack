@@ -266,29 +266,31 @@ def _get_secret_credentials(secret_arn):
     """
     from ministack.services import secretsmanager
 
-    for _name, secret in secretsmanager._secrets.items():
-        if secret.get("ARN") == secret_arn or _name == secret_arn:
-            # Find the AWSCURRENT version
-            for _vid, ver in secret.get("Versions", {}).items():
-                if "AWSCURRENT" in ver.get("Stages", []):
-                    secret_string = ver.get("SecretString")
-                    if secret_string:
-                        try:
-                            parsed = json.loads(secret_string)
-                            return (parsed.get("username"),
-                                    parsed.get("password", secret_string))
-                        except (json.JSONDecodeError, TypeError):
-                            return None, secret_string
-            # Fallback to any version
-            for _vid, ver in secret.get("Versions", {}).items():
-                secret_string = ver.get("SecretString")
-                if secret_string:
-                    try:
-                        parsed = json.loads(secret_string)
-                        return (parsed.get("username"),
-                                parsed.get("password", secret_string))
-                    except (json.JSONDecodeError, TypeError):
-                        return None, secret_string
+    _name, secret = secretsmanager._resolve(secret_arn, use_arn_scope=True)
+    if not secret:
+        return None, None
+
+    # Find the AWSCURRENT version
+    for _vid, ver in secret.get("Versions", {}).items():
+        if "AWSCURRENT" in ver.get("Stages", []):
+            secret_string = ver.get("SecretString")
+            if secret_string:
+                try:
+                    parsed = json.loads(secret_string)
+                    return (parsed.get("username"),
+                            parsed.get("password", secret_string))
+                except (json.JSONDecodeError, TypeError):
+                    return None, secret_string
+    # Fallback to any version
+    for _vid, ver in secret.get("Versions", {}).items():
+        secret_string = ver.get("SecretString")
+        if secret_string:
+            try:
+                parsed = json.loads(secret_string)
+                return (parsed.get("username"),
+                        parsed.get("password", secret_string))
+            except (json.JSONDecodeError, TypeError):
+                return None, secret_string
     return None, None
 
 

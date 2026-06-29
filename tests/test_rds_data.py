@@ -765,3 +765,67 @@ def test_rds_data_secret_credentials_no_username():
     assert user is None
     assert pw == "just-a-password"
     del secretsmanager._secrets["pw-only-secret"]
+
+
+def test_rds_data_secret_credentials_use_secret_arn_region():
+    """_get_secret_credentials resolves ARN-scoped secrets outside the request region."""
+    from ministack.core.responses import get_region, set_request_account_id, set_request_region
+    from ministack.services import rds_data, secretsmanager
+
+    original_region = get_region()
+    set_request_account_id("test")
+    set_request_region("us-east-1")
+    secretsmanager._secrets["cross-region-cred"] = {
+        "ARN": "arn:aws:secretsmanager:us-east-1:000000000000:secret:cross-region-cred",
+        "Name": "cross-region-cred",
+        "Versions": {
+            "v1": {
+                "Stages": ["AWSCURRENT"],
+                "SecretString": '{"username":"app_rw","password":"p@ss123"}',
+            }
+        },
+    }
+    try:
+        set_request_region("us-west-2")
+        user, pw = rds_data._get_secret_credentials(
+            "arn:aws:secretsmanager:us-east-1:000000000000:secret:cross-region-cred"
+        )
+        assert user == "app_rw"
+        assert pw == "p@ss123"
+    finally:
+        set_request_region("us-east-1")
+        secretsmanager._secrets.pop("cross-region-cred", None)
+        set_request_region(original_region)
+
+
+def test_rds_data_secret_credentials_reject_cross_account_secret_arn():
+    from ministack.core.responses import (
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+    from ministack.services import rds_data, secretsmanager
+
+    original_account = get_account_id()
+    original_region = get_region()
+    set_request_account_id("000000000000")
+    set_request_region("us-east-1")
+    secretsmanager._secrets.set_scoped("111111111111", "us-east-1", "cross-account-cred", {
+        "ARN": "arn:aws:secretsmanager:us-east-1:111111111111:secret:cross-account-cred",
+        "Name": "cross-account-cred",
+        "Versions": {
+            "v1": {
+                "Stages": ["AWSCURRENT"],
+                "SecretString": '{"username":"app_rw","password":"p@ss123"}',
+            }
+        },
+    })
+    try:
+        assert rds_data._get_secret_credentials(
+            "arn:aws:secretsmanager:us-east-1:111111111111:secret:cross-account-cred"
+        ) == (None, None)
+    finally:
+        secretsmanager._secrets.pop_scoped("111111111111", "us-east-1", "cross-account-cred", None)
+        set_request_account_id(original_account)
+        set_request_region(original_region)
