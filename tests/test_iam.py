@@ -322,6 +322,57 @@ def test_iam_groups(iam):
     iam.remove_user_from_group(GroupName="test-grp", UserName="grp-usr")
     iam.delete_group(GroupName="test-grp")
 
+def test_iam_group_managed_policy(iam):
+    iam.create_group(GroupName="grp-managed")
+    pol = iam.create_policy(
+        PolicyName="grp-managed-pol",
+        PolicyDocument=json.dumps(
+            {
+                "Version": "2012-10-17",
+                "Statement": [{"Effect": "Allow", "Action": "s3:GetObject", "Resource": "*"}],
+            }
+        ),
+    )
+    arn = pol["Policy"]["Arn"]
+
+    iam.attach_group_policy(GroupName="grp-managed", PolicyArn=arn)
+    listed = iam.list_attached_group_policies(GroupName="grp-managed")
+    assert any(p["PolicyArn"] == arn for p in listed["AttachedPolicies"])
+
+    iam.detach_group_policy(GroupName="grp-managed", PolicyArn=arn)
+    listed = iam.list_attached_group_policies(GroupName="grp-managed")
+    assert not any(p["PolicyArn"] == arn for p in listed["AttachedPolicies"])
+
+
+def test_iam_group_managed_policy_unknown_group(iam):
+    with pytest.raises(ClientError) as exc:
+        iam.attach_group_policy(
+            GroupName="no-such-grp",
+            PolicyArn="arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess",
+        )
+    assert exc.value.response["Error"]["Code"] == "NoSuchEntity"
+
+
+def test_iam_group_inline_policy(iam):
+    iam.create_group(GroupName="grp-inline")
+    doc = json.dumps(
+        {
+            "Version": "2012-10-17",
+            "Statement": [{"Effect": "Allow", "Action": "s3:*", "Resource": "*"}],
+        }
+    )
+    iam.put_group_policy(GroupName="grp-inline", PolicyName="s3-acc", PolicyDocument=doc)
+    resp = iam.get_group_policy(GroupName="grp-inline", PolicyName="s3-acc")
+    assert resp["PolicyName"] == "s3-acc"
+    # botocore URL-decodes and parses the policy document into a dict.
+    assert resp["PolicyDocument"] == json.loads(doc)
+    listed = iam.list_group_policies(GroupName="grp-inline")
+    assert "s3-acc" in listed["PolicyNames"]
+    iam.delete_group_policy(GroupName="grp-inline", PolicyName="s3-acc")
+    listed = iam.list_group_policies(GroupName="grp-inline")
+    assert "s3-acc" not in listed["PolicyNames"]
+
+
 def test_iam_user_inline_policy(iam):
     iam.create_user(UserName="inl-pol-usr")
     doc = json.dumps(

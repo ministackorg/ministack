@@ -5,7 +5,13 @@ All notable changes to MiniStack will be documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+- **S3 — S3 → EventBridge events use AWS-conformant `detail-type`, `reason`, and `deletion-type`** — S3 → EventBridge delivery built the `detail-type` by string-mangling the granular notification event name (`Object ObjectCreated Put` instead of AWS's fixed `Object Created`), hardcoded `detail.reason` to `PutObject` for every event, and omitted `detail.deletion-type` on deletes. Because EventBridge rules match on `detail-type`, any rule written to the AWS-documented type (e.g. `["Object Created"]`) silently never matched. Each S3 event family now maps to its fixed EventBridge `detail-type`, with the per-API `reason` (`PutObject`/`POST Object`/`CopyObject`/`CompleteMultipartUpload`/`DeleteObject`) and a `deletion-type` on `Object Deleted`. Fixes #1005.
+
 ## [1.3.69] — 2026-06-27
+
 
 ### Fixed
 - **EKS — `DescribeCluster` returns a host-reachable endpoint on every path** — `DescribeCluster` now advertises the host-published port, `https://{MINISTACK_HOST}:{port}` (`MINISTACK_HOST` defaults to `localhost`), uniformly on cluster create, OIDC-config restart, and persistence restore. Previously the failure-fallback and restore paths could leave a stale value, so `aws eks update-kubeconfig` + kubectl from the host got an unreachable endpoint. The k3s container publishes 6443 to that host port (`ports={"6443/tcp": port}`), so the endpoint works from the host and from containers that can route to `MINISTACK_HOST`, keeping the `ACTIVE`-cluster shape consistent for `aws eks update-kubeconfig` and Terraform. Contributed by @b-rajesh.

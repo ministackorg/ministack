@@ -3756,3 +3756,181 @@ def test_cfn_lambda_layer_packages_importable(cfn, s3, lam):
         assert payload["value"] == "from-cfn-layer"
     finally:
         cfn.delete_stack(StackName=stack_name)
+
+
+def test_cfn_sam_transform_function_and_simple_table(cfn, lam, s3, ddb):
+    pytest.importorskip("samtranslator")
+    suffix = _uuid_mod.uuid4().hex[:8]
+    bucket = f"cfn-sam-code-{suffix}"
+    key = "handler.zip"
+    s3.create_bucket(Bucket=bucket)
+
+    code = b"def handler(event, context):\n    return {'ok': True}\n"
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("index.py", code)
+    s3.put_object(Bucket=bucket, Key=key, Body=buf.getvalue())
+
+    stack_name = f"cfn-sam-basic-{suffix}"
+    fn_name = f"sam-fn-{suffix}"
+    table_name = f"sam-table-{suffix}"
+
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Transform": "AWS::Serverless-2016-10-31",
+        "Resources": {
+            "MyFunction": {
+                "Type": "AWS::Serverless::Function",
+                "Properties": {
+                    "FunctionName": fn_name,
+                    "Handler": "index.handler",
+                    "Runtime": "python3.12",
+                    "CodeUri": {"Bucket": bucket, "Key": key},
+                    "MemorySize": 256,
+                    "Timeout": 10,
+                    "Environment": {"Variables": {"TABLE": table_name}},
+                },
+            },
+            "MyTable": {
+                "Type": "AWS::Serverless::SimpleTable",
+                "Properties": {
+                    "TableName": table_name,
+                    "PrimaryKey": {"Name": "pk", "Type": "String"},
+                },
+            },
+        },
+        "Outputs": {
+            "FunctionName": {"Value": {"Ref": "MyFunction"}},
+        },
+    }
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(template))
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+
+    outputs = {o["OutputKey"]: o["OutputValue"] for o in stack.get("Outputs", [])}
+    assert outputs["FunctionName"] == fn_name
+
+    resp = lam.invoke(FunctionName=fn_name, Payload=b"{}")
+    assert resp["StatusCode"] == 200
+    payload = json.loads(resp["Payload"].read())
+    assert payload.get("ok") is True
+
+    resources = cfn.describe_stack_resources(StackName=stack_name)["StackResources"]
+    rtypes = {r["ResourceType"] for r in resources}
+    assert "AWS::IAM::Role" in rtypes, f"Expected auto-generated IAM role, got {rtypes}"
+    assert "AWS::Lambda::Function" in rtypes
+    assert "AWS::DynamoDB::Table" in rtypes
+
+    table_desc = ddb.describe_table(TableName=table_name)["Table"]
+    ks = {k["AttributeName"]: k["KeyType"] for k in table_desc["KeySchema"]}
+    assert ks.get("pk") == "HASH"
+
+    cfn.delete_stack(StackName=stack_name)
+    _wait_stack(cfn, stack_name)
+    s3.delete_object(Bucket=bucket, Key=key)
+    s3.delete_bucket(Bucket=bucket)
+
+
+def test_cfn_sam_transform_serverless_api(cfn, s3, lam):
+    pytest.importorskip("samtranslator")
+    suffix = _uuid_mod.uuid4().hex[:8]
+    bucket = f"cfn-sam-api-code-{suffix}"
+    key = "handler.zip"
+    s3.create_bucket(Bucket=bucket)
+
+    code = b"def handler(event, context):\n    return {'statusCode': 200, 'body': 'ok'}\n"
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("index.py", code)
+    s3.put_object(Bucket=bucket, Key=key, Body=buf.getvalue())
+
+    stack_name = f"cfn-sam-api-{suffix}"
+    fn_name = f"sam-api-fn-{suffix}"
+
+    openapi_body = {
+        "openapi": "3.0.1",
+        "info": {"title": "test", "version": "1.0"},
+        "paths": {
+            "/hello": {
+                "get": {
+                    "x-amazon-apigateway-integration": {
+                        "type": "aws_proxy",
+                        "httpMethod": "POST",
+                        "uri": {"Fn::Sub": "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${MyFunction.Arn}/invocations"},
+                        "passthroughBehavior": "WHEN_NO_MATCH",
+                    }
+                }
+            }
+        },
+    }
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Transform": "AWS::Serverless-2016-10-31",
+        "Resources": {
+            "MyApi": {
+                "Type": "AWS::Serverless::Api",
+                "Properties": {
+                    "Name": f"sam-api-{suffix}",
+                    "StageName": "v1",
+                    "DefinitionBody": openapi_body,
+                },
+            },
+            "MyFunction": {
+                "Type": "AWS::Serverless::Function",
+                "Properties": {
+                    "FunctionName": fn_name,
+                    "Handler": "index.handler",
+                    "Runtime": "python3.12",
+                    "CodeUri": {"Bucket": bucket, "Key": key},
+                },
+            },
+        },
+    }
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(template))
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+
+    resources = cfn.describe_stack_resources(StackName=stack_name)["StackResources"]
+    rtypes = {r["ResourceType"] for r in resources}
+    assert "AWS::ApiGateway::RestApi" in rtypes, f"Missing RestApi in {rtypes}"
+    assert "AWS::ApiGateway::Deployment" in rtypes, f"Missing Deployment in {rtypes}"
+    assert "AWS::ApiGateway::Stage" in rtypes, f"Missing Stage in {rtypes}"
+    assert "AWS::Lambda::Function" in rtypes
+    assert "AWS::IAM::Role" in rtypes
+
+    cfn.delete_stack(StackName=stack_name)
+    _wait_stack(cfn, stack_name)
+    s3.delete_object(Bucket=bucket, Key=key)
+    s3.delete_bucket(Bucket=bucket)
+
+
+def test_cfn_sam_transform_missing_translator_falls_back(monkeypatch):
+    import sys
+
+    from ministack.services.cloudformation.engine import (
+        _apply_sam_transform_if_applicable,
+    )
+
+    # Simulate the package being absent: a None entry makes `from ... import`
+    # raise ImportError even if samtranslator is installed in the test env.
+    monkeypatch.setitem(sys.modules, "samtranslator.translator.transform", None)
+
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Transform": "AWS::Serverless-2016-10-31",
+        "Resources": {
+            "MyFunction": {
+                "Type": "AWS::Serverless::Function",
+                "Properties": {"Handler": "index.handler", "Runtime": "python3.12"},
+            },
+        },
+    }
+    with pytest.raises(ValueError) as exc:
+        _apply_sam_transform_if_applicable(template)
+    msg = str(exc.value)
+    assert "AWS::Serverless-2016-10-31" in msg
+    assert "docs/iac#sam" in msg
+
+    # Templates that don't use the SAM transform are unaffected.
+    plain = {"Resources": {"B": {"Type": "AWS::S3::Bucket", "Properties": {}}}}
+    assert _apply_sam_transform_if_applicable(plain) is plain

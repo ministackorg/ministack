@@ -1355,6 +1355,55 @@ def test_apigw_resolve_jwks_url_falls_back_when_discovery_unavailable(monkeypatc
     assert resolved == f"{issuer}/.well-known/jwks.json"
 
 
+def test_apigw_oidc_discovery_failure_is_negative_cached(monkeypatch):
+    """A failed discovery must not poison the cache for the full 7200s TTL.
+
+    Regression test: a transient discovery failure used to be cached for
+    7200s, making every JWT validation for that issuer fail closed for up to
+    2 hours even after the underlying network issue cleared. It should
+    instead be negative-cached briefly (60s) so a flood of requests during
+    the outage doesn't each trigger their own discovery call, but recovery
+    happens quickly once the issuer is reachable again.
+    """
+    import asyncio
+
+    from ministack.services import apigateway as apigw_mod
+
+    issuer = "https://flaky-idp.test"
+    real_jwks_uri = f"{issuer}/id/keys"
+    calls = {"count": 0}
+
+    async def _flaky_then_ok_urlopen(_request_or_url, _timeout_seconds):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            raise OSError("connection refused")
+        body = json.dumps({"jwks_uri": real_jwks_uri}).encode("utf-8")
+        return 200, {"Content-Type": "application/json"}, body
+
+    fake_now = {"value": 1_000_000.0}
+    monkeypatch.setattr(apigw_mod, "_urlopen_async", _flaky_then_ok_urlopen)
+    monkeypatch.setattr(apigw_mod, "_oidc_config_cache", apigw_mod.AccountScopedDict())
+    monkeypatch.setattr(apigw_mod.time, "time", lambda: fake_now["value"])
+
+    authorizer = {"jwtConfiguration": {"Issuer": issuer, "Audience": ["ms-client"]}}
+
+    first = asyncio.run(apigw_mod._resolve_jwks_url(authorizer))
+    assert first == f"{issuer}/.well-known/jwks.json"
+
+    # Within the 60s negative-cache window, a retry must not re-trigger
+    # discovery — it should reuse the cached failure.
+    second = asyncio.run(apigw_mod._resolve_jwks_url(authorizer))
+    assert second == f"{issuer}/.well-known/jwks.json"
+    assert calls["count"] == 1
+
+    # Once the negative-cache TTL has elapsed, discovery is retried and
+    # the now-healthy issuer resolves successfully.
+    fake_now["value"] += 61
+    third = asyncio.run(apigw_mod._resolve_jwks_url(authorizer))
+    assert third == real_jwks_uri
+    assert calls["count"] == 2
+
+
 def test_apigw_resolve_jwks_url_cognito_skips_discovery(monkeypatch):
     """Cognito issuers keep using the local pool JWKS — no discovery call."""
     import asyncio
