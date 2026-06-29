@@ -15,6 +15,7 @@ Includes the ``Path`` field on Account and OrganizationalUnit per the
 import copy
 import json
 import logging
+import re
 import time
 
 from ministack.core.responses import (
@@ -22,9 +23,12 @@ from ministack.core.responses import (
     error_response_json,
     get_account_id,
     new_uuid,
+    set_request_account_id,
 )
 
 logger = logging.getLogger("organizations")
+
+_12_DIGITS = re.compile(r"^\d{12}$")
 
 
 # Per-master-account state. Each account that calls Organizations gets its
@@ -33,6 +37,13 @@ _orgs = AccountScopedDict()       # singleton "self" -> Organization dict
 _accounts = AccountScopedDict()   # account_id -> Account dict
 _ous = AccountScopedDict()        # ou_id -> OU dict (with ParentId)
 _roots = AccountScopedDict()      # root_id -> Root dict (single root)
+_create_status = AccountScopedDict()  # car-id -> CreateAccountStatus dict
+
+# Handshakes are intentionally NOT account-scoped: an invite flow spans two
+# accounts (the master creates it, the invited account accepts it), so both
+# callers must be able to look up the same record by id. Visibility is enforced
+# per-caller in ListHandshakesForAccount / AcceptHandshake instead.
+_handshakes: dict = {}            # h-id -> handshake dict (global)
 
 
 def reset():
@@ -40,6 +51,8 @@ def reset():
     _accounts.clear()
     _ous.clear()
     _roots.clear()
+    _create_status.clear()
+    _handshakes.clear()
 
 
 def get_state():
@@ -48,6 +61,8 @@ def get_state():
         "accounts": copy.deepcopy(_accounts),
         "ous": copy.deepcopy(_ous),
         "roots": copy.deepcopy(_roots),
+        "create_status": copy.deepcopy(_create_status),
+        "handshakes": copy.deepcopy(_handshakes),
     }
 
 
@@ -56,11 +71,14 @@ def restore_state(data):
         return
     for store, key in (
         (_orgs, "orgs"), (_accounts, "accounts"),
-        (_ous, "ous"), (_roots, "roots")
+        (_ous, "ous"), (_roots, "roots"),
+        (_create_status, "create_status"),
     ):
         store.clear()
         for k, v in (data.get(key) or {}).items():
             store[k] = v
+    _handshakes.clear()
+    _handshakes.update(data.get("handshakes") or {})
 
 
 def _json(status, body):
@@ -111,6 +129,45 @@ def _public_account(a: dict) -> dict:
 
 def _public_ou(o: dict) -> dict:
     return {k: v for k, v in o.items() if not k.startswith("_")}
+
+
+def _public_create_status(s: dict) -> dict:
+    return {k: v for k, v in s.items() if not k.startswith("_")}
+
+
+def _public_handshake(h: dict) -> dict:
+    return {k: v for k, v in h.items() if not k.startswith("_")}
+
+
+def _new_account_id() -> str:
+    """Generate an unused 12-digit account id (service-assigned, like real AWS)."""
+    aid = str(int(new_uuid().replace("-", ""), 16))[-12:].zfill(12)
+    while aid in _accounts:
+        aid = str(int(new_uuid().replace("-", ""), 16))[-12:].zfill(12)
+    return aid
+
+
+def _root_id() -> str:
+    """Return the single root id for the current org (org is already ensured)."""
+    return next(iter(_roots))
+
+
+def _account_record(aid: str, *, email: str, name: str, joined_method: str,
+                    parent_id: str) -> dict:
+    """Build an Account record matching the master-account shape in _ensure_org."""
+    org_id = _orgs["self"]["Id"]
+    master = get_account_id()
+    return {
+        "Id": aid,
+        "Arn": f"arn:aws:organizations::{master}:account/{org_id}/{aid}",
+        "Email": email,
+        "Name": name,
+        "Status": "ACTIVE",
+        "JoinedMethod": joined_method,
+        "JoinedTimestamp": int(time.time()),
+        "Path": "/",
+        "_ParentId": parent_id,
+    }
 
 
 def _describe_organization(_payload):
@@ -201,6 +258,181 @@ def _delete_organizational_unit(payload):
     return _json(200, {})
 
 
+def _create_account(payload):
+    _ensure_org()
+    email = payload.get("Email")
+    name = payload.get("AccountName")
+    if not email or not name:
+        return error_response_json("InvalidInputException",
+                                   "Email and AccountName are required", 400)
+    aid = _new_account_id()
+    car_id = ("car-" + new_uuid().replace("-", ""))[:36]
+    rec = {
+        "Id": car_id,
+        "AccountName": name,
+        "State": "IN_PROGRESS",
+        "RequestedTimestamp": int(time.time()),
+        "_Email": email,
+        "_AccountId": aid,
+    }
+    _create_status[car_id] = rec
+    return _json(200, {"CreateAccountStatus": _public_create_status(rec)})
+
+
+def _describe_create_account_status(payload):
+    _ensure_org()
+    car_id = payload.get("CreateAccountRequestId")
+    rec = _create_status.get(car_id) if car_id else None
+    if not rec:
+        return error_response_json("CreateAccountStatusNotFoundException",
+                                   f"CreateAccountStatus {car_id} not found", 400)
+    # Async create completes on first describe: place the account at the root.
+    if rec["State"] == "IN_PROGRESS":
+        aid = rec["_AccountId"]
+        _accounts[aid] = _account_record(
+            aid, email=rec["_Email"], name=rec["AccountName"],
+            joined_method="CREATED", parent_id=_root_id())
+        rec["State"] = "SUCCEEDED"
+        rec["AccountId"] = aid
+        rec["CompletedTimestamp"] = int(time.time())
+    return _json(200, {"CreateAccountStatus": _public_create_status(rec)})
+
+
+def _move_account(payload):
+    _ensure_org()
+    aid = payload.get("AccountId")
+    source = payload.get("SourceParentId")
+    dest = payload.get("DestinationParentId")
+    if not aid or not source or not dest:
+        return error_response_json(
+            "InvalidInputException",
+            "AccountId, SourceParentId and DestinationParentId are required", 400)
+    account = _accounts.get(aid)
+    if not account:
+        return error_response_json("AccountNotFoundException",
+                                   f"Account {aid} not found", 400)
+    if (source not in _roots and source not in _ous) or account.get("_ParentId") != source:
+        return error_response_json("SourceParentNotFoundException",
+                                   f"Account {aid} is not in source parent {source}", 400)
+    if dest not in _roots and dest not in _ous:
+        return error_response_json("DestinationParentNotFoundException",
+                                   f"Destination parent {dest} not found", 400)
+    account["_ParentId"] = dest
+    return _json(200, {})
+
+
+def _list_parents(payload):
+    _ensure_org()
+    child_id = payload.get("ChildId")
+    rec = (_accounts.get(child_id) or _ous.get(child_id)) if child_id else None
+    if not rec:
+        return error_response_json("ChildNotFoundException",
+                                   f"Child {child_id} not found", 400)
+    parent_id = rec.get("_ParentId")
+    ptype = "ROOT" if parent_id in _roots else "ORGANIZATIONAL_UNIT"
+    return _json(200, {"Parents": [{"Id": parent_id, "Type": ptype}], "NextToken": None})
+
+
+def _list_children(payload):
+    _ensure_org()
+    parent_id = payload.get("ParentId")
+    child_type = payload.get("ChildType")
+    if not parent_id or (parent_id not in _roots and parent_id not in _ous):
+        return error_response_json("ParentNotFoundException",
+                                   f"Parent {parent_id} not found", 400)
+    if child_type == "ACCOUNT":
+        children = [{"Id": a["Id"], "Type": "ACCOUNT"}
+                    for a in _accounts.values() if a.get("_ParentId") == parent_id]
+    elif child_type == "ORGANIZATIONAL_UNIT":
+        children = [{"Id": o["Id"], "Type": "ORGANIZATIONAL_UNIT"}
+                    for o in _ous.values() if o.get("_ParentId") == parent_id]
+    else:
+        return error_response_json("InvalidInputException",
+                                   "ChildType must be ACCOUNT or ORGANIZATIONAL_UNIT", 400)
+    return _json(200, {"Children": children, "NextToken": None})
+
+
+def _invite_account_to_organization(payload):
+    _ensure_org()
+    target = payload.get("Target") or {}
+    target_id = target.get("Id")
+    if not target_id:
+        return error_response_json("InvalidInputException",
+                                   "Target.Id is required", 400)
+    if target.get("Type") == "ACCOUNT":
+        if not _12_DIGITS.match(target_id):
+            return error_response_json("InvalidInputException",
+                                       "Target.Id must be a 12-digit account id", 400)
+        invited = target_id
+    else:
+        invited = _new_account_id()
+    if invited in _accounts:
+        return error_response_json("DuplicateAccountException",
+                                   f"Account {invited} is already a member", 400)
+    master = get_account_id()
+    if any(h["State"] == "OPEN" and h["_InvitedAccountId"] == invited
+           and h["_MasterAccountId"] == master for h in _handshakes.values()):
+        return error_response_json("DuplicateHandshakeException",
+                                   f"An open handshake for {invited} already exists", 400)
+    org_id = _orgs["self"]["Id"]
+    h_id = "h-" + new_uuid().replace("-", "")[:10]
+    now = int(time.time())
+    rec = {
+        "Id": h_id,
+        "Arn": f"arn:aws:organizations::{master}:handshake/{org_id}/invite/{h_id}",
+        "State": "OPEN",
+        "Action": "INVITE",
+        "RequestedTimestamp": now,
+        "ExpirationTimestamp": now + 15 * 24 * 3600,
+        "Parties": [
+            {"Id": org_id, "Type": "ORGANIZATION"},
+            {"Id": invited, "Type": "ACCOUNT"},
+        ],
+        "_MasterAccountId": master,
+        "_InvitedAccountId": invited,
+    }
+    _handshakes[h_id] = rec
+    return _json(200, {"Handshake": _public_handshake(rec)})
+
+
+def _accept_handshake(payload):
+    _ensure_org()
+    h_id = payload.get("HandshakeId")
+    rec = _handshakes.get(h_id) if h_id else None
+    if not rec:
+        return error_response_json("HandshakeNotFoundException",
+                                   f"Handshake {h_id} not found", 400)
+    caller = get_account_id()
+    if caller != rec["_InvitedAccountId"]:
+        return error_response_json("AccountOwnerNotVerifiedException",
+                                   "Only the invited account may accept this handshake", 400)
+    if rec["State"] != "OPEN":
+        return error_response_json("InvalidHandshakeTransitionException",
+                                   f"Handshake {h_id} is not OPEN", 400)
+    rec["State"] = "ACCEPTED"
+    # Materialise the member into the MASTER's org graph. _accounts is scoped to
+    # the current caller, so impersonate the master for the write, then restore.
+    master = rec["_MasterAccountId"]
+    invited = rec["_InvitedAccountId"]
+    try:
+        set_request_account_id(master)
+        _ensure_org()
+        _accounts[invited] = _account_record(
+            invited, email=f"member+{invited}@ministack.local", name=f"Account {invited}",
+            joined_method="INVITED", parent_id=_root_id())
+    finally:
+        set_request_account_id(caller)
+    return _json(200, {"Handshake": _public_handshake(rec)})
+
+
+def _list_handshakes_for_account(_payload):
+    _ensure_org()
+    caller = get_account_id()
+    out = [_public_handshake(h) for h in _handshakes.values()
+           if caller in (h["_MasterAccountId"], h["_InvitedAccountId"])]
+    return _json(200, {"Handshakes": out, "NextToken": None})
+
+
 _DISPATCH = {
     "DescribeOrganization": _describe_organization,
     "ListRoots": _list_roots,
@@ -211,6 +443,14 @@ _DISPATCH = {
     "CreateOrganizationalUnit": _create_organizational_unit,
     "DescribeOrganizationalUnit": _describe_organizational_unit,
     "DeleteOrganizationalUnit": _delete_organizational_unit,
+    "CreateAccount": _create_account,
+    "DescribeCreateAccountStatus": _describe_create_account_status,
+    "MoveAccount": _move_account,
+    "ListParents": _list_parents,
+    "ListChildren": _list_children,
+    "InviteAccountToOrganization": _invite_account_to_organization,
+    "AcceptHandshake": _accept_handshake,
+    "ListHandshakesForAccount": _list_handshakes_for_account,
 }
 
 

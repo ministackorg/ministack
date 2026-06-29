@@ -5,6 +5,13 @@ All notable changes to MiniStack will be documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+- **Organizations — account membership & OU placement** — the service modelled the OU tree and read paths but had no write path for member accounts, so `ListAccountsForParent` only ever returned the management account. Adds `CreateAccount` (async: returns `IN_PROGRESS`, then materialises the account and flips to `SUCCEEDED` on the first `DescribeCreateAccountStatus`), `DescribeCreateAccountStatus`, `MoveAccount`, `ListParents`, and `ListChildren`, plus the invite path (`InviteAccountToOrganization`, `AcceptHandshake`, `ListHandshakesForAccount`) so a caller-chosen 12-digit account id can be pinned onto a member account. `AcceptHandshake` may be called only by the invited account (derived from the signing access key).
+
+---
+
 ## [1.3.69] — 2026-06-27
 
 ### Fixed
