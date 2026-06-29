@@ -760,8 +760,9 @@ async def _handle_sqs_messages_request(method: str, path: str, headers: dict, qu
 
     Filters:
       ?account=<12-digit-id>   restrict to one account
+      ?region=<aws-region>     restrict to one region
       ?QueueUrl=<url>          restrict to one queue (within whatever
-                               accounts pass the account filter)
+                               accounts/regions pass the filters)
     """
     if path != "/_ministack/sqs/messages" or method != "GET":
         return None
@@ -786,20 +787,34 @@ async def _handle_sqs_messages_request(method: str, path: str, headers: dict, qu
     if "QueueUrl" in query_params:
         raw_qurl = query_params["QueueUrl"]
         queue_url_filter = raw_qurl[0] if isinstance(raw_qurl, (list, tuple)) else raw_qurl
+    region_filter = None
+    if "region" in query_params:
+        raw_region = query_params["region"]
+        region_filter = raw_region[0] if isinstance(raw_region, (list, tuple)) else raw_region
 
     try:
         mod = _get_module("sqs")
         now = time.time()
 
-        # AccountScopedDict._data is keyed by (account_id, queue_url).
-        per_account: dict[str, dict[str, list]] = {}
+        # Legacy AccountScopedDict state is keyed by (account_id, queue_url);
+        # AccountRegionScopedDict state is keyed by (account_id, region, queue_url).
+        per_account: dict[str, dict[str, dict[str, list]]] = {}
         try:
             all_data = mod._queues.to_dict()
         except Exception:
             all_data = {}
 
-        for (acct, qurl), queue in all_data.items():
+        for scoped_key, queue in all_data.items():
+            if len(scoped_key) == 3:
+                acct, region, qurl = scoped_key
+            elif len(scoped_key) == 2:
+                acct, qurl = scoped_key
+                region = os.environ.get("MINISTACK_REGION", "us-east-1")
+            else:
+                continue
             if account_id is not None and acct != account_id:
+                continue
+            if region_filter is not None and region != region_filter:
                 continue
             if queue_url_filter is not None and qurl != queue_url_filter:
                 continue
@@ -826,7 +841,7 @@ async def _handle_sqs_messages_request(method: str, path: str, headers: dict, qu
                     "MessageDeduplicationId": m.get("dedup_id"),
                     "SequenceNumber": m.get("seq"),
                 })
-            per_account.setdefault(acct, {})[qurl] = rendered
+            per_account.setdefault(acct, {}).setdefault(region, {})[qurl] = rendered
 
         response = {"messages": per_account}
     except Exception as e:

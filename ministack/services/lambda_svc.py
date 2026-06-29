@@ -2934,11 +2934,7 @@ def _route_async_failure(target_arn: str, func_name: str, event: dict, result: d
             if not qname:
                 logger.warning("Lambda %s DLQ target is not a valid SQS ARN: %s", func_name, target_arn)
                 return
-            target_q = None
-            for url, q in _sqs._queues.items():
-                if q.get("attributes", {}).get("QueueArn") == target_arn:
-                    target_q = q
-                    break
+            target_q = _sqs._queue_by_arn(target_arn)
             if target_q is not None:
                 now = time.time()
                 target_q["messages"].append({
