@@ -7,8 +7,6 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [1.3.69] — 2026-06-27
 
-### Added
-- **IAM — group policy attachment and inline group policies** — `AttachGroupPolicy`, `DetachGroupPolicy`, and `ListAttachedGroupPolicies` (managed policies) plus `PutGroupPolicy`, `GetGroupPolicy`, `DeleteGroupPolicy`, and `ListGroupPolicies` (inline) were missing and returned `InvalidAction: Unknown IAM action`, while the User and Role variants were already supported. This broke the standard "create a group, attach a managed policy, add users so the group inherits permissions" pattern on the second call. The new handlers mirror the existing User/Role implementations: managed attachments track `AttachmentCount` (and the per-account counter for `arn:aws:iam::aws:policy/*` AWS-managed ARNs), unknown groups return `NoSuchEntity`, and inline documents round-trip through `GetGroupPolicy` and `GetAccountAuthorizationDetails`. Group attachments and inline policies are included in state persistence.
 
 ### Fixed
 - **EKS — `DescribeCluster` returns a host-reachable endpoint on every path** — `DescribeCluster` now advertises the host-published port, `https://{MINISTACK_HOST}:{port}` (`MINISTACK_HOST` defaults to `localhost`), uniformly on cluster create, OIDC-config restart, and persistence restore. Previously the failure-fallback and restore paths could leave a stale value, so `aws eks update-kubeconfig` + kubectl from the host got an unreachable endpoint. The k3s container publishes 6443 to that host port (`ports={"6443/tcp": port}`), so the endpoint works from the host and from containers that can route to `MINISTACK_HOST`, keeping the `ACTIVE`-cluster shape consistent for `aws eks update-kubeconfig` and Terraform. Contributed by @b-rajesh.
