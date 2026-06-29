@@ -952,14 +952,7 @@ def _deliver_to_sqs(endpoint: str, envelope: str, raw: bool, raw_message: str,
     if spec.account_id != get_account_id():
         logger.warning("SNS fanout: SQS queue %s is outside the current account scope", queue_name)
         return
-    queue = next(
-        (
-            q
-            for q in _sqs._queues.values()
-            if q.get("attributes", {}).get("QueueArn") == str(spec)
-        ),
-        None,
-    )
+    queue = _sqs._queue_by_arn(str(spec))
     if not queue:
         logger.warning("SNS fanout: SQS queue %s not found", queue_name)
         return
@@ -1024,7 +1017,7 @@ def _http_post_sync(endpoint: str, payload: str, sns_message_type: str) -> int:
     which silently skipped every HTTP subscription confirmation (#460).
 
     Handles `http://user:pass@host/path` userinfo by stripping it from the URL
-    and promoting to an Authorization: Basic header, matching real AWS SNS
+    and promoting it to the HTTP auth header, matching real AWS SNS
     behaviour for HTTP(S) endpoints with embedded credentials. urllib leaves
     userinfo in the URL by default, which would break the Host header."""
     import base64 as _b64

@@ -23,9 +23,9 @@ Storage: In-memory (optionally backed by S3_DATA_DIR).
 """
 
 import base64
+import contextvars
 import copy
 import datetime as _dt
-import contextvars
 import hashlib
 import json
 import logging
@@ -1988,8 +1988,7 @@ def _deliver_event_to_sqs(arn: str, event_payload: dict, bucket_region: str) -> 
     if not queue_name:
         logger.warning("S3 notification: invalid SQS queue ARN %s", arn)
         return
-    queue_url = _sqs._queue_url(queue_name)
-    queue = _sqs._queues.get(queue_url)
+    queue = _sqs._queue_by_arn(str(spec))
     if not queue:
         logger.warning("S3 notification: SQS queue %s not found", queue_name)
         return

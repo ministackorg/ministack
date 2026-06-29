@@ -1275,8 +1275,7 @@ def _dispatch_to_sqs(spec, payload, sqs_parameters=None):
     from ministack.services import sqs as _sqs
 
     queue_name = spec.resource
-    queue_url = _sqs._queue_url(queue_name)
-    queue = _sqs._queues.get(queue_url)
+    queue = _sqs._queue_by_arn(str(spec))
     if not queue:
         logger.warning("EventBridge → SQS: queue %s not found", queue_name)
         return
