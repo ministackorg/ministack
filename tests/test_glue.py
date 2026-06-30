@@ -1119,6 +1119,101 @@ def test_glue_spark_image_env_override(monkeypatch):
     assert _glue._glue_image_for_version("3.0") == "my-org/custom-glue:latest"
 
 
+def test_glue_schema_registry_lifecycle(glue):
+    reg = glue.create_registry(RegistryName="qa-schema-reg", Description="test registry")
+    assert reg["RegistryName"] == "qa-schema-reg"
+    assert "RegistryArn" in reg
+
+    got = glue.get_registry(RegistryId={"RegistryName": "qa-schema-reg"})
+    assert got["RegistryName"] == "qa-schema-reg"
+    assert got["Status"] == "AVAILABLE"
+
+    listed = glue.list_registries()
+    assert any(r["RegistryName"] == "qa-schema-reg" for r in listed["Registries"])
+
+    avro_def_v1 = json.dumps({
+        "type": "record",
+        "name": "Event",
+        "fields": [{"name": "id", "type": "string"}],
+    })
+    schema = glue.create_schema(
+        RegistryId={"RegistryName": "qa-schema-reg"},
+        SchemaName="qa-event",
+        DataFormat="AVRO",
+        Compatibility="BACKWARD",
+        SchemaDefinition=avro_def_v1,
+    )
+    assert schema["SchemaName"] == "qa-event"
+    assert schema["LatestSchemaVersion"] == 1
+    version_id = schema["SchemaVersionId"]
+
+    ver = glue.get_schema_version(SchemaVersionId=version_id)
+    assert ver["SchemaDefinition"] == avro_def_v1
+    assert ver["DataFormat"] == "AVRO"
+
+    ver2 = glue.get_schema_version(
+        SchemaId={"RegistryName": "qa-schema-reg", "SchemaName": "qa-event"},
+        SchemaVersionNumber={"LatestVersion": True},
+    )
+    assert ver2["SchemaVersionId"] == version_id
+
+    avro_def_v2 = json.dumps({
+        "type": "record",
+        "name": "Event",
+        "fields": [
+            {"name": "id", "type": "string"},
+            {"name": "extra", "type": "string", "default": ""},
+        ],
+    })
+    reg_ver = glue.register_schema_version(
+        SchemaId={"RegistryName": "qa-schema-reg", "SchemaName": "qa-event"},
+        SchemaDefinition=avro_def_v2,
+    )
+    assert reg_ver["VersionNumber"] == 2
+
+    dup = glue.register_schema_version(
+        SchemaId={"RegistryName": "qa-schema-reg", "SchemaName": "qa-event"},
+        SchemaDefinition=avro_def_v1,
+    )
+    assert dup["SchemaVersionId"] == version_id
+
+    by_def = glue.get_schema_by_definition(
+        SchemaId={"RegistryName": "qa-schema-reg"},
+        SchemaDefinition=avro_def_v2,
+    )
+    assert by_def["SchemaVersionId"] == reg_ver["SchemaVersionId"]
+    assert by_def["Status"] == "AVAILABLE"
+
+    validity = glue.check_schema_version_validity(
+        DataFormat="AVRO",
+        SchemaDefinition=avro_def_v2,
+    )
+    assert validity["Valid"] is True
+
+    versions = glue.list_schema_versions(
+        SchemaId={"RegistryName": "qa-schema-reg", "SchemaName": "qa-event"},
+    )
+    assert len(versions["Schemas"]) == 2
+
+    glue.delete_schema(
+        SchemaId={"RegistryName": "qa-schema-reg", "SchemaName": "qa-event"},
+    )
+    glue.delete_registry(RegistryId={"RegistryName": "qa-schema-reg"})
+
+
+def test_glue_schema_registry_default_registry(glue):
+    avro_def = json.dumps({"type": "record", "name": "X", "fields": []})
+    schema = glue.create_schema(
+        SchemaName="qa-default-schema",
+        DataFormat="JSON",
+        SchemaDefinition=avro_def,
+    )
+    assert schema["RegistryName"] == "default-registry"
+
+    listed = glue.list_schemas(RegistryId={"RegistryName": "default-registry"})
+    assert any(s["SchemaName"] == "qa-default-schema" for s in listed["Schemas"])
+
+
 def test_glue_is_spark_job_classifies_by_command_name():
     """`glueetl` and `gluestreaming` are Spark; `pythonshell` is not."""
     from ministack.services import glue as _glue
