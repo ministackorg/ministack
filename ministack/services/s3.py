@@ -1758,8 +1758,43 @@ def _key_matches_filter(key: str, prefix: str | None, suffix: str | None) -> boo
     return True
 
 
+# Amazon S3 → EventBridge uses a fixed set of detail-types (per event family) and a per-API `reason`. 
+# See https://docs.aws.amazon.com/AmazonS3/latest/userguide/EventBridge.html
+_S3_EVENTBRIDGE_DETAIL_TYPE = {
+    "ObjectCreated": "Object Created",
+    "ObjectRemoved": "Object Deleted",
+}
+# `reason` reflects the S3 API that produced the event.
+_S3_EVENTBRIDGE_REASON = {
+    "Put": "PutObject",
+    "Post": "POST Object",
+    "Copy": "CopyObject",
+    "CompleteMultipartUpload": "CompleteMultipartUpload",
+    "Delete": "DeleteObject",
+}
+
+
+def _s3_event_to_eventbridge(event_name: str) -> tuple[str, str]:
+    """Map an S3 notification event name (e.g. ``s3:ObjectCreated:Put``) to the EventBridge
+    ``detail-type`` and ``reason`` Amazon S3 emits. The detail-type is per-family, so any
+    sub-action of a family collapses to the same type, exactly as real S3 does."""
+    parts = event_name.split(":")
+    family = parts[1] if len(parts) > 1 else ""
+    action = parts[2] if len(parts) > 2 else ""
+    detail_type = _S3_EVENTBRIDGE_DETAIL_TYPE.get(family, "Object Created")
+    reason = _S3_EVENTBRIDGE_REASON.get(
+        action, "DeleteObject" if family == "ObjectRemoved" else "PutObject"
+    )
+    return detail_type, reason
+
+
 def _fire_s3_event(
-    bucket_name: str, key: str, event_name: str, size: int = 0, etag: str = ""
+    bucket_name: str,
+    key: str,
+    event_name: str,
+    size: int = 0,
+    etag: str = "",
+    deletion_type: str | None = None,
 ) -> None:
     """Build and deliver an S3 event notification. Best-effort — errors are logged."""
     try:
@@ -1836,19 +1871,26 @@ def _fire_s3_event(
         try:
             if has_eventbridge:
                 from ministack.services import eventbridge as _eb
+                detail_type, reason = _s3_event_to_eventbridge(event_name)
+                detail = {
+                    "version": "0",
+                    "event-version": "1.0",
+                    "bucket": {"name": bucket_name},
+                    "object": {"key": key, "size": size, "etag": clean_etag, "sequencer": "0"},
+                    "request-id": request_id,
+                    "requester": get_account_id(),
+                    "source-ip-address": "127.0.0.1",
+                    "reason": reason,
+                }
+                if detail_type == "Object Deleted":
+                    # AWS always carries a deletion-type on Object Deleted; default to the
+                    # unversioned/permanent case unless the caller created a delete marker.
+                    detail["deletion-type"] = deletion_type or "Permanently Deleted"
                 eb_event = {
                     "EventId": request_id,
                     "Source": "aws.s3",
-                    "DetailType": event_name.replace("s3:", "Object ").replace(":", " ").replace("*", ""),
-                    "Detail": json.dumps({
-                        "version": "0",
-                        "bucket": {"name": bucket_name},
-                        "object": {"key": key, "size": size, "etag": clean_etag, "sequencer": "0"},
-                        "request-id": request_id,
-                        "requester": get_account_id(),
-                        "source-ip-address": "127.0.0.1",
-                        "reason": "PutObject",
-                    }),
+                    "DetailType": detail_type,
+                    "Detail": json.dumps(detail),
                     "EventBusName": "default",
                     "Time": event_time,
                     "Resources": [f"arn:aws:s3:::{bucket_name}"],
@@ -1856,7 +1898,7 @@ def _fire_s3_event(
                     "Region": os.environ.get("MINISTACK_REGION", "us-east-1"),
                 }
                 _eb._dispatch_event(eb_event)
-                logger.debug("S3→EventBridge: %s for %s/%s", event_name, bucket_name, key)
+                logger.debug("S3→EventBridge: %s (%s) for %s/%s", detail_type, event_name, bucket_name, key)
         except Exception:
             logger.exception("S3→EventBridge delivery failed for %s/%s", bucket_name, key)
 
@@ -1924,7 +1966,12 @@ def _deliver_event_to_lambda(arn: str, event_payload: dict) -> None:
 
 
 def _fire_s3_event_async(
-    bucket_name: str, key: str, event_name: str, size: int = 0, etag: str = ""
+    bucket_name: str,
+    key: str,
+    event_name: str,
+    size: int = 0,
+    etag: str = "",
+    deletion_type: str | None = None,
 ) -> None:
     """Fire S3 event notification in a background thread (non-blocking)."""
     if bucket_name not in _bucket_notifications:
@@ -1938,7 +1985,7 @@ def _fire_s3_event_async(
     ctx = contextvars.copy_context()
     t = threading.Thread(
         target=ctx.run,
-        args=(_fire_s3_event, bucket_name, key, event_name, size, etag),
+        args=(_fire_s3_event, bucket_name, key, event_name, size, etag, deletion_type),
         daemon=True,
     )
     t.start()
@@ -2456,7 +2503,9 @@ def _delete_object(bucket_name: str, key: str, headers: dict | None = None):
         existed = key in bucket["objects"]
         bucket["objects"].pop(key, None)
         if existed:
-            _fire_s3_event_async(bucket_name, key, "s3:ObjectRemoved:Delete")
+            _fire_s3_event_async(
+                bucket_name, key, "s3:ObjectRemoved:Delete", deletion_type="Delete Marker Created"
+            )
         return 204, {"x-amz-delete-marker": "true", "x-amz-version-id": delete_marker_id}, b""
 
     existed = key in bucket["objects"]

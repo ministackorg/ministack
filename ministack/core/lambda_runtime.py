@@ -609,6 +609,9 @@ class Worker:
 
     def _spawn(self):
         """Extract zip and start worker process."""
+        # Clean up any previous tmpdir before creating a new one (respawn scenario)
+        if self._tmpdir and os.path.exists(self._tmpdir):
+            shutil.rmtree(self._tmpdir, ignore_errors=True)
         self._tmpdir = tempfile.mkdtemp(prefix=f"ministack-lambda-{self.func_name}-")
         runtime = self.config.get("Runtime", "python3.12")
         binary, worker_script = _detect_runtime_binary(runtime)
@@ -909,6 +912,8 @@ class Worker:
 
             response = result_box[0]
             if response.get("status") == "error":
+                if self._proc and self._proc.poll() is None:
+                    self._proc.terminate()
                 self._proc = None
             response["cold_start"] = cold
             # Bounded drain — replaces the fixed 50ms sleep that was paid
