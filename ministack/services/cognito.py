@@ -63,7 +63,7 @@ import string
 import time
 import zlib
 from datetime import datetime, timezone
-from urllib.parse import parse_qs, quote, unquote_plus, urlencode
+from urllib.parse import parse_qs, quote, unquote, urlencode
 from xml.etree.ElementTree import Element, SubElement
 from xml.etree.ElementTree import tostring as xml_tostring
 
@@ -1236,7 +1236,7 @@ def _authenticate_client(headers: dict, form: dict):
             # containing "/" or "+" arrives as %2F/%2B and must be decoded to
             # match the stored value. The client_secret_post path already gets
             # this via parse_qs.
-            return unquote_plus(cid), unquote_plus(csec)
+            return unquote(cid), unquote(csec)
         except Exception:
             pass
     return form.get("client_id", ""), form.get("client_secret", "")
