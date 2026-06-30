@@ -6,8 +6,21 @@ import uuid as _uuid_mod
 import zipfile
 from urllib.parse import urlparse
 
+import boto3
 import pytest
+from botocore.config import Config
 from botocore.exceptions import ClientError
+
+
+def _regional_ssm(region_name):
+    return boto3.client(
+        "ssm",
+        endpoint_url=os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566"),
+        aws_access_key_id="test",
+        aws_secret_access_key="test",
+        region_name=region_name,
+        config=Config(region_name=region_name, retries={"mode": "standard"}),
+    )
 
 
 def test_ssm_put_get(ssm):
@@ -253,3 +266,485 @@ def test_ssm_get_parameters_by_path_root_non_recursive(ssm):
     names = [p["Name"] for p in resp["Parameters"]]
     assert "/toplevel" in names
     assert "/nested/deep" not in names
+
+
+def test_ssm_restore_legacy_parameter_history_uses_parameter_arn_region():
+    from ministack.core.responses import AccountScopedDict, set_request_account_id, set_request_region
+    from ministack.services import ssm as ssm_service
+
+    account_id = "000000000000"
+    name = f"/legacy/history/{_uuid_mod.uuid4().hex[:8]}"
+
+    set_request_account_id(account_id)
+    set_request_region("us-east-1")
+    ssm_service.reset()
+    parameters = AccountScopedDict()
+    parameters[name] = {
+        "Name": name,
+        "Type": "String",
+        "Value": "v2",
+        "Version": 2,
+        "ARN": f"arn:aws:ssm:us-west-2:{account_id}:parameter/{name.lstrip('/')}",
+    }
+    parameter_history = AccountScopedDict()
+    parameter_history[name] = [
+        {"Name": name, "Type": "String", "Value": "v1", "Version": 1},
+        {"Name": name, "Type": "String", "Value": "v2", "Version": 2},
+    ]
+
+    try:
+        ssm_service.restore_state({
+            "parameters": parameters,
+            "parameter_history": parameter_history,
+        })
+
+        assert len(ssm_service._parameter_history.get_scoped(account_id, "us-west-2", name)) == 2
+        assert ssm_service._parameter_history.get_scoped(account_id, "us-east-1", name) is None
+    finally:
+        ssm_service.reset()
+
+
+def test_ssm_restore_legacy_history_prefers_exact_parameter_name_region():
+    from ministack.core.responses import AccountScopedDict, set_request_account_id, set_request_region
+    from ministack.services import ssm as ssm_service
+
+    account_id = "000000000000"
+    suffix = _uuid_mod.uuid4().hex[:8]
+    bare_name = f"legacy-history-exact-{suffix}"
+    path_name = f"/{bare_name}"
+
+    set_request_account_id(account_id)
+    set_request_region("us-east-1")
+    ssm_service.reset()
+    parameters = AccountScopedDict()
+    parameters[bare_name] = {
+        "Name": bare_name,
+        "Type": "String",
+        "Value": "bare",
+        "Version": 1,
+        "ARN": f"arn:aws:ssm:us-west-2:{account_id}:parameter{bare_name}",
+    }
+    parameters[path_name] = {
+        "Name": path_name,
+        "Type": "String",
+        "Value": "path",
+        "Version": 1,
+        "ARN": f"arn:aws:ssm:us-east-1:{account_id}:parameter/{bare_name}",
+    }
+    parameter_history = AccountScopedDict()
+    parameter_history[bare_name] = [
+        {"Name": bare_name, "Type": "String", "Value": "bare", "Version": 1},
+    ]
+
+    try:
+        ssm_service.restore_state({
+            "parameters": parameters,
+            "parameter_history": parameter_history,
+        })
+
+        assert len(ssm_service._parameter_history.get_scoped(account_id, "us-west-2", bare_name)) == 1
+        assert ssm_service._parameter_history.get_scoped(account_id, "us-east-1", bare_name) is None
+    finally:
+        ssm_service.reset()
+
+
+def test_ssm_restore_legacy_bare_name_tags_uses_stored_parameter_arn():
+    from ministack.core.responses import AccountScopedDict, set_request_account_id, set_request_region
+    from ministack.services import ssm as ssm_service
+
+    account_id = "000000000000"
+    name = f"legacy-tag-{_uuid_mod.uuid4().hex[:8]}"
+    legacy_arn = f"arn:aws:ssm:us-west-2:{account_id}:parameter{name}"
+
+    set_request_account_id(account_id)
+    set_request_region("us-east-1")
+    ssm_service.reset()
+    parameters = AccountScopedDict()
+    parameters[name] = {
+        "Name": name,
+        "Type": "String",
+        "Value": "legacy",
+        "Version": 1,
+        "ARN": legacy_arn,
+    }
+    tags = AccountScopedDict()
+    tags[legacy_arn] = {"env": "legacy"}
+
+    try:
+        ssm_service.restore_state({
+            "parameters": parameters,
+            "tags": tags,
+        })
+        set_request_region("us-west-2")
+        assert ssm_service.resolve_parameter_value(legacy_arn) == "legacy"
+        status, _headers, body = ssm_service._list_tags_for_resource({
+            "ResourceType": "Parameter",
+            "ResourceId": name,
+        })
+        assert status == 200
+        assert json.loads(body)["TagList"] == [{"Key": "env", "Value": "legacy"}]
+
+        status, _headers, _body = ssm_service._put_parameter({
+            "Name": name,
+            "Type": "String",
+            "Value": "updated",
+            "Overwrite": True,
+        })
+        assert status == 200
+        assert ssm_service._parameters[name]["ARN"] == legacy_arn
+        status, _headers, body = ssm_service._list_tags_for_resource({
+            "ResourceType": "Parameter",
+            "ResourceId": name,
+        })
+        assert status == 200
+        assert json.loads(body)["TagList"] == [{"Key": "env", "Value": "legacy"}]
+    finally:
+        ssm_service.reset()
+
+
+def test_ssm_arn_lookup_prefers_exact_stored_arn_match():
+    from ministack.core.responses import AccountScopedDict, set_request_account_id, set_request_region
+    from ministack.services import ssm as ssm_service
+
+    account_id = "000000000000"
+    suffix = _uuid_mod.uuid4().hex[:8]
+    bare_name = f"legacy-exact-{suffix}"
+    path_name = f"/{bare_name}"
+    bare_arn = f"arn:aws:ssm:us-west-2:{account_id}:parameter{bare_name}"
+    path_arn = f"arn:aws:ssm:us-west-2:{account_id}:parameter/{bare_name}"
+
+    set_request_account_id(account_id)
+    set_request_region("us-east-1")
+    ssm_service.reset()
+    parameters = AccountScopedDict()
+    parameters[bare_name] = {
+        "Name": bare_name,
+        "Type": "String",
+        "Value": "bare",
+        "Version": 1,
+        "ARN": bare_arn,
+    }
+    parameters[path_name] = {
+        "Name": path_name,
+        "Type": "String",
+        "Value": "path",
+        "Version": 1,
+        "ARN": path_arn,
+    }
+
+    try:
+        ssm_service.restore_state({"parameters": parameters})
+        set_request_region("us-west-2")
+        assert ssm_service.resolve_parameter_value(bare_arn) == "bare"
+        assert ssm_service.resolve_parameter_value(path_arn) == "path"
+    finally:
+        ssm_service.reset()
+
+
+def test_ssm_exact_legacy_slash_twin_can_be_overwritten():
+    from ministack.core.responses import AccountScopedDict, set_request_account_id, set_request_region
+    from ministack.services import ssm as ssm_service
+
+    account_id = "000000000000"
+    suffix = _uuid_mod.uuid4().hex[:8]
+    bare_name = f"legacy-overwrite-{suffix}"
+    path_name = f"/{bare_name}"
+
+    set_request_account_id(account_id)
+    set_request_region("us-east-1")
+    ssm_service.reset()
+    parameters = AccountScopedDict()
+    parameters[bare_name] = {
+        "Name": bare_name,
+        "Type": "String",
+        "Value": "bare",
+        "Version": 1,
+        "ARN": f"arn:aws:ssm:us-west-2:{account_id}:parameter{bare_name}",
+    }
+    parameters[path_name] = {
+        "Name": path_name,
+        "Type": "String",
+        "Value": "path",
+        "Version": 1,
+        "ARN": f"arn:aws:ssm:us-west-2:{account_id}:parameter/{bare_name}",
+    }
+
+    try:
+        ssm_service.restore_state({"parameters": parameters})
+        set_request_region("us-west-2")
+        status, _headers, _body = ssm_service._put_parameter({
+            "Name": bare_name,
+            "Type": "String",
+            "Value": "updated-bare",
+            "Overwrite": True,
+        })
+        assert status == 200
+        assert ssm_service._parameters[bare_name]["Value"] == "updated-bare"
+        assert ssm_service._parameters[path_name]["Value"] == "path"
+    finally:
+        ssm_service.reset()
+
+
+def test_ssm_legacy_no_slash_arn_does_not_fallback_to_path_parameter():
+    from ministack.core.responses import AccountScopedDict, set_request_account_id, set_request_region
+    from ministack.services import ssm as ssm_service
+
+    account_id = "000000000000"
+    suffix = _uuid_mod.uuid4().hex[:8]
+    path_name = f"/legacy-stale-{suffix}"
+    path_arn = f"arn:aws:ssm:us-west-2:{account_id}:parameter/{path_name.lstrip('/')}"
+    stale_legacy_arn = f"arn:aws:ssm:us-west-2:{account_id}:parameter{path_name.lstrip('/')}"
+
+    set_request_account_id(account_id)
+    set_request_region("us-east-1")
+    ssm_service.reset()
+    parameters = AccountScopedDict()
+    parameters[path_name] = {
+        "Name": path_name,
+        "Type": "String",
+        "Value": "path",
+        "Version": 1,
+        "ARN": path_arn,
+    }
+
+    try:
+        ssm_service.restore_state({"parameters": parameters})
+        set_request_region("us-west-2")
+        assert ssm_service.resolve_parameter_value(path_arn) == "path"
+        assert ssm_service.resolve_parameter_value(stale_legacy_arn) is None
+    finally:
+        ssm_service.reset()
+
+
+def test_ssm_malformed_or_foreign_partition_arn_does_not_fallback_to_name():
+    from ministack.core.responses import AccountScopedDict, set_request_account_id, set_request_region
+    from ministack.services import ssm as ssm_service
+
+    account_id = "000000000000"
+    name = f"/invalid-arn/{_uuid_mod.uuid4().hex[:8]}"
+    canonical_arn = f"arn:aws:ssm:us-east-1:{account_id}:parameter/{name.lstrip('/')}"
+    missing_region_arn = f"arn:aws:ssm::{account_id}:parameter/{name.lstrip('/')}"
+    foreign_partition_arn = f"arn:aws-cn:ssm:us-east-1:{account_id}:parameter/{name.lstrip('/')}"
+
+    set_request_account_id(account_id)
+    set_request_region("us-east-1")
+    ssm_service.reset()
+    parameters = AccountScopedDict()
+    parameters[name] = {
+        "Name": name,
+        "Type": "String",
+        "Value": "value",
+        "Version": 1,
+        "ARN": canonical_arn,
+    }
+
+    try:
+        ssm_service.restore_state({"parameters": parameters})
+        assert ssm_service.resolve_parameter_value(canonical_arn) == "value"
+        assert ssm_service.resolve_parameter_value(missing_region_arn) is None
+        assert ssm_service.resolve_parameter_value(foreign_partition_arn) is None
+    finally:
+        ssm_service.reset()
+
+
+def test_ssm_restore_legacy_add_tags_key_for_bare_name_parameter():
+    from ministack.core.responses import AccountScopedDict, set_request_account_id, set_request_region
+    from ministack.services import ssm as ssm_service
+
+    account_id = "000000000000"
+    name = f"legacy-add-tags-{_uuid_mod.uuid4().hex[:8]}"
+    legacy_arn = f"arn:aws:ssm:us-west-2:{account_id}:parameter{name}"
+    legacy_add_tags_arn = f"arn:aws:ssm:us-west-2:{account_id}:parameter/{name}"
+
+    set_request_account_id(account_id)
+    set_request_region("us-east-1")
+    ssm_service.reset()
+    parameters = AccountScopedDict()
+    parameters[name] = {
+        "Name": name,
+        "Type": "String",
+        "Value": "legacy",
+        "Version": 1,
+        "ARN": legacy_arn,
+    }
+    tags = AccountScopedDict()
+    tags[legacy_add_tags_arn] = {"env": "legacy-add-tags"}
+
+    try:
+        ssm_service.restore_state({
+            "parameters": parameters,
+            "tags": tags,
+        })
+        set_request_region("us-west-2")
+        status, _headers, body = ssm_service._list_tags_for_resource({
+            "ResourceType": "Parameter",
+            "ResourceId": name,
+        })
+        assert status == 200
+        assert json.loads(body)["TagList"] == [{"Key": "env", "Value": "legacy-add-tags"}]
+
+        status, _headers, body = ssm_service._list_tags_for_resource({
+            "ResourceType": "Parameter",
+            "ResourceId": legacy_add_tags_arn,
+        })
+        assert status == 200
+        assert json.loads(body)["TagList"] == [{"Key": "env", "Value": "legacy-add-tags"}]
+
+        status, _headers, _body = ssm_service._delete_parameter({"Name": name})
+        assert status == 200
+        assert ssm_service._tags.get_scoped(account_id, "us-west-2", legacy_arn) is None
+        assert ssm_service._tags.get_scoped(account_id, "us-west-2", legacy_add_tags_arn) is None
+    finally:
+        ssm_service.reset()
+
+
+def test_cloudformation_ssm_parameter_uses_canonical_arn_builder():
+    from ministack.core.responses import set_request_account_id, set_request_region
+    from ministack.services import ssm as ssm_service
+    from ministack.services.cloudformation import provisioners
+
+    account_id = "000000000000"
+    name = f"cfn-param-{_uuid_mod.uuid4().hex[:8]}"
+
+    set_request_account_id(account_id)
+    set_request_region("us-west-2")
+    ssm_service.reset()
+    try:
+        provisioners._ssm_create("Param", {"Name": name, "Value": "value"}, "stack")
+        assert ssm_service._parameters[name]["ARN"] == (
+            f"arn:aws:ssm:us-west-2:{account_id}:parameter/{name}"
+        )
+    finally:
+        ssm_service.reset()
+
+
+def test_ssm_parameters_are_region_scoped_by_name(ssm):
+    west = _regional_ssm("us-west-2")
+    name = f"/mr/ssm/{_uuid_mod.uuid4().hex[:8]}"
+
+    ssm.put_parameter(Name=name, Value="east", Type="String")
+    west.put_parameter(Name=name, Value="west", Type="String")
+
+    east_param = ssm.get_parameter(Name=name)["Parameter"]
+    west_param = west.get_parameter(Name=name)["Parameter"]
+
+    assert east_param["Value"] == "east"
+    assert west_param["Value"] == "west"
+    assert ":us-east-1:" in east_param["ARN"]
+    assert ":us-west-2:" in west_param["ARN"]
+
+    ssm.delete_parameter(Name=name)
+    with pytest.raises(ClientError) as exc:
+        ssm.get_parameter(Name=name)
+    assert exc.value.response["Error"]["Code"] == "ParameterNotFound"
+    assert west.get_parameter(Name=name)["Parameter"]["Value"] == "west"
+
+
+def test_ssm_delete_rejects_parameter_arn(ssm):
+    name = f"/mr/ssm/delete-arn/{_uuid_mod.uuid4().hex[:8]}"
+    ssm.put_parameter(Name=name, Value="value", Type="String")
+    arn = ssm.get_parameter(Name=name)["Parameter"]["ARN"]
+
+    with pytest.raises(ClientError) as exc:
+        ssm.delete_parameter(Name=arn)
+    assert exc.value.response["Error"]["Code"] == "ValidationException"
+    assert ssm.get_parameter(Name=name)["Parameter"]["Value"] == "value"
+
+    resp = ssm.delete_parameters(Names=[arn])
+    assert arn in resp["InvalidParameters"]
+    assert ssm.get_parameter(Name=name)["Parameter"]["Value"] == "value"
+
+    ssm.delete_parameter(Name=name)
+
+
+def test_ssm_put_rejects_slash_variant_duplicate(ssm):
+    name = f"mr-ssm-duplicate-{_uuid_mod.uuid4().hex[:8]}"
+    ssm.put_parameter(Name=name, Value="bare", Type="String")
+
+    with pytest.raises(ClientError) as exc:
+        ssm.put_parameter(Name=f"/{name}", Value="path", Type="String")
+    assert exc.value.response["Error"]["Code"] == "ParameterAlreadyExists"
+
+    with pytest.raises(ClientError) as exc:
+        ssm.put_parameter(Name=f"/{name}", Value="path", Type="String", Overwrite=True)
+    assert exc.value.response["Error"]["Code"] == "ParameterAlreadyExists"
+
+    assert ssm.get_parameter(Name=name)["Parameter"]["Value"] == "bare"
+    ssm.delete_parameter(Name=name)
+
+
+def test_ssm_parameter_arn_lookup_is_request_region_scoped(ssm):
+    west = _regional_ssm("us-west-2")
+    name = f"/mr/ssm/arn/{_uuid_mod.uuid4().hex[:8]}"
+
+    ssm.put_parameter(Name=name, Value="east", Type="String")
+    west.put_parameter(Name=name, Value="west", Type="String")
+
+    east_arn = ssm.get_parameter(Name=name)["Parameter"]["ARN"]
+    west_arn = west.get_parameter(Name=name)["Parameter"]["ARN"]
+
+    assert ssm.get_parameter(Name=east_arn)["Parameter"]["Value"] == "east"
+    with pytest.raises(ClientError) as exc:
+        ssm.get_parameter(Name=west_arn)
+    assert exc.value.response["Error"]["Code"] == "ParameterNotFound"
+
+
+def test_ssm_tags_accept_current_region_parameter_arn(ssm):
+    west = _regional_ssm("us-west-2")
+    name = f"/mr/ssm/tag/{_uuid_mod.uuid4().hex[:8]}"
+
+    ssm.put_parameter(Name=name, Value="east", Type="String")
+    west.put_parameter(Name=name, Value="west", Type="String")
+
+    east_arn = ssm.get_parameter(Name=name)["Parameter"]["ARN"]
+    ssm.add_tags_to_resource(
+        ResourceType="Parameter",
+        ResourceId=east_arn,
+        Tags=[{"Key": "scope", "Value": "east"}],
+    )
+
+    east_tags = ssm.list_tags_for_resource(ResourceType="Parameter", ResourceId=east_arn)["TagList"]
+    west_tags = west.list_tags_for_resource(ResourceType="Parameter", ResourceId=name)["TagList"]
+
+    assert {tag["Key"]: tag["Value"] for tag in east_tags} == {"scope": "east"}
+    assert west_tags == []
+
+
+def test_ssm_resolve_parameter_value_uses_arn_region_without_tail_fallback():
+    from ministack.core.responses import (
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+    from ministack.services import ssm as ssm_service
+
+    original_account = get_account_id()
+    original_region = get_region()
+    name = f"/mr/ssm/resolve/{_uuid_mod.uuid4().hex[:8]}"
+
+    try:
+        ssm_service.reset()
+        set_request_account_id("000000000000")
+        set_request_region("us-east-1")
+        ssm_service._put_parameter({"Name": name, "Value": "east", "Type": "String"})
+
+        west_arn = f"arn:aws:ssm:us-west-2:000000000000:parameter/{name.lstrip('/')}"
+        assert ssm_service.resolve_parameter_value(west_arn) is None
+
+        set_request_region("us-west-2")
+        ssm_service._put_parameter({"Name": name, "Value": "west", "Type": "String"})
+
+        set_request_region("us-east-1")
+        assert ssm_service.resolve_parameter_value(name) == "east"
+        assert ssm_service.resolve_parameter_value(west_arn) == "west"
+        assert ssm_service.resolve_parameter_value(
+            west_arn.replace(":ssm:", ":secretsmanager:", 1)
+        ) is None
+        assert ssm_service.resolve_parameter_value(
+            west_arn.replace(":000000000000:", ":111111111111:", 1)
+        ) is None
+    finally:
+        ssm_service.reset()
+        set_request_account_id(original_account)
+        set_request_region(original_region)

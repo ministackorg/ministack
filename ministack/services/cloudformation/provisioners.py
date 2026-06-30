@@ -726,8 +726,7 @@ def _ssm_create(logical_id, props, stack_name):
     ptype = props.get("Type", "String")
     value = props.get("Value", "")
     description = props.get("Description", "")
-    # ARN: no extra slash if name starts with /
-    param_arn = f"arn:aws:ssm:{get_region()}:{get_account_id()}:parameter{name}"
+    param_arn = _ssm._param_arn(name)
 
     _ssm._parameters[name] = {
         "Name": name,
