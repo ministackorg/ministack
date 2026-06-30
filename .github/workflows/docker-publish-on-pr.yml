@@ -99,7 +99,7 @@ jobs:
           build-args: |
             MINISTACK_VERSION=pr-${{ github.event.pull_request.number }}-${{ steps.short_sha.outputs.short_sha }}
           cache-from: type=gha,scope=regular-pr
-          cache-to: type=gha,mode=max,scope=regular-pr
+          cache-to: type=gha,mode=min,scope=regular-pr
 
       # ── Full (Debian/glibc) image — DuckDB-backed Athena, psycopg2, pymysql.
       # Only built when the PR carries the `full-preview` label (opt-in to keep
@@ -130,7 +130,7 @@ jobs:
           build-args: |
             MINISTACK_VERSION=pr-${{ github.event.pull_request.number }}-${{ steps.short_sha.outputs.short_sha }}
           cache-from: type=gha,scope=full-pr
-          cache-to: type=gha,mode=max,scope=full-pr
+          cache-to: type=gha,mode=min,scope=full-pr
 
       - name: Comment on PR with Docker image info
         if: steps.guard.outputs.skip != 'true'
