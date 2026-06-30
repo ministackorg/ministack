@@ -18,6 +18,7 @@ from .changesets import (
 )
 from .engine import (
     _NO_VALUE,
+    _apply_sam_transform_if_applicable,
     _evaluate_conditions,
     _parse_template,
     _resolve_parameters,
@@ -54,6 +55,7 @@ def _create_stack(params):
 
     try:
         template = _parse_template(template_body)
+        template = _apply_sam_transform_if_applicable(template)
     except Exception as e:
         return _error("ValidationError", f"Template format error: {e}")
     provided_params = _extract_members(params, "Parameters")
@@ -474,6 +476,7 @@ def _update_stack(params):
 
     try:
         template = _parse_template(template_body)
+        template = _apply_sam_transform_if_applicable(template)
     except Exception as e:
         return _error("ValidationError", f"Template format error: {e}")
     provided_params = _extract_members(params, "Parameters")
