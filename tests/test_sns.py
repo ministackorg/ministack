@@ -1351,3 +1351,132 @@ def test_sns_publish_batch_rejects_oversized_entry_per_entry(sns):
     assert "too-big" in failed_ids
     failed = next(r for r in resp["Failed"] if r["Id"] == "too-big")
     assert failed["Code"] == "InvalidParameter"
+
+
+def _create_gcm_app(sns, name):
+    return sns.create_platform_application(
+        Name=name, Platform="GCM", Attributes={"PlatformCredential": ""},
+    )["PlatformApplicationArn"]
+
+
+def test_sns_create_platform_application(sns):
+    app_arn = _create_gcm_app(sns, "intg-sns-pe-create-app")
+    assert ":app/GCM/intg-sns-pe-create-app" in app_arn
+
+
+def test_sns_create_platform_endpoint_stores_token_and_enabled(sns):
+    app_arn = _create_gcm_app(sns, "intg-sns-pe-token")
+    token = _uuid_mod.uuid4().hex
+    arn = sns.create_platform_endpoint(
+        PlatformApplicationArn=app_arn, Token=token,
+    )["EndpointArn"]
+    attrs = sns.get_endpoint_attributes(EndpointArn=arn)["Attributes"]
+    assert attrs["Token"] == token
+    assert attrs["Enabled"] == "true"  # AWS default when unspecified
+
+
+def test_sns_create_platform_endpoint_stores_custom_user_data(sns):
+    app_arn = _create_gcm_app(sns, "intg-sns-pe-cud")
+    arn = sns.create_platform_endpoint(
+        PlatformApplicationArn=app_arn, Token=_uuid_mod.uuid4().hex,
+        CustomUserData="u-42",
+    )["EndpointArn"]
+    attrs = sns.get_endpoint_attributes(EndpointArn=arn)["Attributes"]
+    assert attrs["CustomUserData"] == "u-42"
+
+
+def test_sns_create_platform_endpoint_idempotent_when_attributes_match(sns):
+    app_arn = _create_gcm_app(sns, "intg-sns-pe-idem")
+    token = _uuid_mod.uuid4().hex
+    a1 = sns.create_platform_endpoint(
+        PlatformApplicationArn=app_arn, Token=token, CustomUserData="same",
+    )["EndpointArn"]
+    a2 = sns.create_platform_endpoint(
+        PlatformApplicationArn=app_arn, Token=token, CustomUserData="same",
+    )["EndpointArn"]
+    assert a1 == a2
+
+
+def test_sns_create_platform_endpoint_duplicate_token_different_attrs_raises(sns):
+    app_arn = _create_gcm_app(sns, "intg-sns-pe-dup")
+    token = _uuid_mod.uuid4().hex
+    existing = sns.create_platform_endpoint(
+        PlatformApplicationArn=app_arn, Token=token, CustomUserData="first",
+    )["EndpointArn"]
+    with pytest.raises(ClientError) as exc:
+        sns.create_platform_endpoint(
+            PlatformApplicationArn=app_arn, Token=token, CustomUserData="second",
+        )
+    msg = exc.value.response["Error"]["Message"]
+    # AWS-style message; consumers parse the existing endpoint ARN out of it.
+    assert "already exists with the same Token" in msg
+    assert existing in msg
+
+
+def test_sns_get_endpoint_attributes_not_found(sns):
+    app_arn = _create_gcm_app(sns, "intg-sns-pe-getmiss")
+    with pytest.raises(ClientError) as exc:
+        sns.get_endpoint_attributes(EndpointArn=f"{app_arn}/does-not-exist")
+    assert exc.value.response["Error"]["Code"] == "NotFound"
+
+
+def test_sns_set_endpoint_attributes_merges(sns):
+    app_arn = _create_gcm_app(sns, "intg-sns-pe-set")
+    arn = sns.create_platform_endpoint(
+        PlatformApplicationArn=app_arn, Token=_uuid_mod.uuid4().hex,
+    )["EndpointArn"]
+    new_token = _uuid_mod.uuid4().hex
+    sns.set_endpoint_attributes(
+        EndpointArn=arn,
+        Attributes={"Token": new_token, "Enabled": "false", "CustomUserData": "x"},
+    )
+    attrs = sns.get_endpoint_attributes(EndpointArn=arn)["Attributes"]
+    assert attrs["Token"] == new_token
+    assert attrs["Enabled"] == "false"
+    assert attrs["CustomUserData"] == "x"
+
+
+def test_sns_set_endpoint_attributes_not_found(sns):
+    app_arn = _create_gcm_app(sns, "intg-sns-pe-setmiss")
+    with pytest.raises(ClientError) as exc:
+        sns.set_endpoint_attributes(
+            EndpointArn=f"{app_arn}/nope", Attributes={"Enabled": "false"},
+        )
+    assert exc.value.response["Error"]["Code"] == "NotFound"
+
+
+def test_sns_delete_endpoint_then_get_not_found(sns):
+    app_arn = _create_gcm_app(sns, "intg-sns-pe-del")
+    arn = sns.create_platform_endpoint(
+        PlatformApplicationArn=app_arn, Token=_uuid_mod.uuid4().hex,
+    )["EndpointArn"]
+    sns.delete_endpoint(EndpointArn=arn)
+    with pytest.raises(ClientError) as exc:
+        sns.get_endpoint_attributes(EndpointArn=arn)
+    assert exc.value.response["Error"]["Code"] == "NotFound"
+
+
+def test_sns_delete_endpoint_is_idempotent(sns):
+    app_arn = _create_gcm_app(sns, "intg-sns-pe-delidem")
+    # Deleting a non-existent endpoint succeeds in AWS (no error).
+    sns.delete_endpoint(EndpointArn=f"{app_arn}/never-existed")
+
+
+def test_sns_delete_platform_application_removes_endpoints(sns):
+    app_arn = _create_gcm_app(sns, "intg-sns-pe-delapp")
+    arn = sns.create_platform_endpoint(
+        PlatformApplicationArn=app_arn, Token=_uuid_mod.uuid4().hex,
+    )["EndpointArn"]
+    sns.delete_platform_application(PlatformApplicationArn=app_arn)
+    with pytest.raises(ClientError) as exc:
+        sns.get_endpoint_attributes(EndpointArn=arn)
+    assert exc.value.response["Error"]["Code"] == "NotFound"
+
+
+def test_sns_publish_to_platform_endpoint(sns):
+    app_arn = _create_gcm_app(sns, "intg-sns-pe-publish")
+    arn = sns.create_platform_endpoint(
+        PlatformApplicationArn=app_arn, Token=_uuid_mod.uuid4().hex,
+    )["EndpointArn"]
+    resp = sns.publish(TargetArn=arn, Message="hi")
+    assert resp["MessageId"]

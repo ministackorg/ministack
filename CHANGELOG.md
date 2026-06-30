@@ -7,8 +7,13 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **SNS — mobile-push endpoint lifecycle: `GetEndpointAttributes`, `SetEndpointAttributes`, `DeleteEndpoint`, `DeletePlatformApplication`** — completes the platform-endpoint flow on top of the existing `CreatePlatformApplication`/`CreatePlatformEndpoint`. `CreatePlatformEndpoint` now dedups by device token within a platform application (AWS behavior): re-requesting the same `Token` returns the existing endpoint ARN when `CustomUserData` matches, and raises `InvalidParameter` `"Endpoint <arn> already exists with the same Token, but different attributes."` when it differs — so callers can parse the ARN and reconcile. `Publish` to a platform-endpoint `TargetArn` now succeeds (stub delivery) instead of returning `Topic does not exist`, and `DeletePlatformApplication` is idempotent and drops the application's endpoints. This lets app push-token registration flows (register → read/update attributes → delete) run end-to-end against MiniStack. Contributed by @sjincho.
+
 ### Fixed
 - **S3 — S3 → EventBridge events use AWS-conformant `detail-type`, `reason`, and `deletion-type`** — S3 → EventBridge delivery built the `detail-type` by string-mangling the granular notification event name (`Object ObjectCreated Put` instead of AWS's fixed `Object Created`), hardcoded `detail.reason` to `PutObject` for every event, and omitted `detail.deletion-type` on deletes. Because EventBridge rules match on `detail-type`, any rule written to the AWS-documented type (e.g. `["Object Created"]`) silently never matched. Each S3 event family now maps to its fixed EventBridge `detail-type`, with the per-API `reason` (`PutObject`/`POST Object`/`CopyObject`/`CompleteMultipartUpload`/`DeleteObject`) and a `deletion-type` on `Object Deleted`. Fixes #1005.
+
+---
 
 ## [1.3.69] — 2026-06-27
 
