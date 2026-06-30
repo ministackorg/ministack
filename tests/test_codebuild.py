@@ -3,6 +3,22 @@ from botocore.exceptions import ClientError
 
 # ========== CodeBuild ==========
 
+def _ensure_codebuild_project(codebuild, name):
+    if codebuild.batch_get_projects(names=[name])["projects"]:
+        return
+    codebuild.create_project(
+        name=name,
+        source={"type": "NO_SOURCE"},
+        artifacts={"type": "NO_ARTIFACTS"},
+        environment={
+            "type": "LINUX_CONTAINER",
+            "image": "aws/codebuild/standard:7.0",
+            "computeType": "BUILD_GENERAL1_SMALL",
+        },
+        serviceRole="arn:aws:iam::000000000000:role/codebuild-role",
+    )
+
+
 def test_codebuild_create_project(codebuild):
     resp = codebuild.create_project(
         name="test-project",
@@ -46,6 +62,30 @@ def test_codebuild_batch_get_projects_by_arn(codebuild):
     assert len(resp["projects"]) == 1
     assert resp["projects"][0]["name"] == "test-project"
     assert resp["projectsNotFound"] == []
+
+
+@pytest.mark.parametrize(
+    "identifier_template",
+    [
+        "arn:aws:codebuild:us-east-1:000000000000:build/{name}",
+        "arn:aws:codebuild:project/{name}",
+        "arn:aws-us-gov:codebuild:us-east-1:000000000000:project/{name}",
+        "arn:aws:lambda:us-east-1:000000000000:project/{name}",
+        "arn:aws:codebuild:us-west-2:000000000000:project/{name}",
+        "arn:aws:codebuild:us-east-1:111111111111:project/{name}",
+    ],
+)
+def test_codebuild_batch_get_projects_does_not_tail_resolve_out_of_scope_arns(
+    codebuild,
+    identifier_template,
+):
+    name = "arn-parser-project"
+    _ensure_codebuild_project(codebuild, name)
+
+    identifier = identifier_template.format(name=name)
+    resp = codebuild.batch_get_projects(names=[identifier])
+    assert resp["projects"] == []
+    assert resp["projectsNotFound"] == [identifier]
 
 
 def test_codebuild_list_projects(codebuild):

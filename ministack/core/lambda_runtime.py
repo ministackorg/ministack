@@ -17,9 +17,26 @@ import threading
 import time
 import zipfile
 
+from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.responses import _12_DIGIT_RE
 
 logger = logging.getLogger("lambda_runtime")
+
+_RESERVED_RUNTIME_ENV_VARS = {
+    "AWS_REGION",
+    "AWS_DEFAULT_REGION",
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "AWS_LAMBDA_FUNCTION_NAME",
+    "AWS_LAMBDA_FUNCTION_MEMORY_SIZE",
+    "AWS_LAMBDA_FUNCTION_VERSION",
+    "AWS_LAMBDA_LOG_STREAM_NAME",
+    "_LAMBDA_FUNCTION_ARN",
+    "_LAMBDA_TIMEOUT",
+    "LAMBDA_TASK_ROOT",
+}
+
 
 def _account_from_arn(arn: str) -> str:
     """Extract the 12-digit account ID from a Lambda function ARN.
@@ -33,6 +50,27 @@ def _account_from_arn(arn: str) -> str:
     except (AttributeError, TypeError):
         pass
     return os.environ.get("AWS_ACCESS_KEY_ID", "test")
+
+
+def _lambda_function_account_region_from_arn(arn: str) -> tuple[str, str]:
+    spec = parse_arn(arn)
+    if spec.service != "lambda":
+        raise ArnParseError("arn: expected lambda service")
+    if not _12_DIGIT_RE.match(spec.account_id):
+        raise ArnParseError("arn: expected 12-digit account id")
+    if not spec.region:
+        raise ArnParseError("arn: expected region")
+    parts = spec.resource.split(":", 2)
+    if len(parts) < 2 or parts[0] != "function" or not parts[1]:
+        raise ArnParseError("arn: expected lambda function resource")
+    return spec.account_id, spec.region
+
+
+def _account_region_from_function_config(config: dict) -> tuple[str, str]:
+    arn = config.get("FunctionArn", "")
+    if not arn:
+        raise ArnParseError("arn: missing lambda function arn")
+    return _lambda_function_account_region_from_arn(arn)
 
 
 _workers: dict = {}
@@ -690,17 +728,22 @@ class Worker:
         # because they don't use Python module resolution.
         if runtime.startswith("python"):
             module_name = module_name.replace("/", ".")
-        env_vars = self.config.get("Environment", {}).get("Variables", {})
+        env_vars = {
+            key: value
+            for key, value in self.config.get("Environment", {}).get("Variables", {}).items()
+            if key not in _RESERVED_RUNTIME_ENV_VARS
+        }
         spawn_env = {**os.environ, **env_vars}
         # Inject standard Lambda runtime env vars to match the Docker and
         # provided-runtime execution paths in lambda_svc.py.  Real AWS
         # Lambda always injects these; the warm-worker path was missing them.
         # Per AWS docs:
         #   https://docs.aws.amazon.com/lambda/latest/dg/configuration-envvars.html
-        from ministack.core.responses import get_region, new_uuid
-        spawn_env.setdefault("AWS_REGION", get_region())
-        spawn_env.setdefault("AWS_DEFAULT_REGION", get_region())
-        spawn_env.setdefault("AWS_ACCESS_KEY_ID", _account_from_arn(self.config.get("FunctionArn", "")))
+        from ministack.core.responses import new_uuid
+        account_id, region = _account_region_from_function_config(self.config)
+        spawn_env["AWS_REGION"] = region
+        spawn_env["AWS_DEFAULT_REGION"] = region
+        spawn_env["AWS_ACCESS_KEY_ID"] = account_id
         spawn_env.setdefault("AWS_SECRET_ACCESS_KEY", os.environ.get("AWS_SECRET_ACCESS_KEY", "test"))
         spawn_env.setdefault("AWS_SESSION_TOKEN", os.environ.get("AWS_SESSION_TOKEN", ""))
         # AWS_ENDPOINT_URL precedence matches real AWS: function
@@ -931,10 +974,11 @@ class Worker:
 
 def get_or_create_worker(func_name: str, config: dict, code_zip: bytes,
                          qualifier: str = "$LATEST") -> Worker:
-    # Include account ID in the key to isolate workers across accounts.
-    # Two accounts deploying the same function name must not share a worker.
-    account = _account_from_arn(config.get("FunctionArn", ""))
-    key = f"{account}:{func_name}:{qualifier}"
+    # Include account ID and region in the key to isolate workers across
+    # accounts and regions. Two regions deploying the same function name must
+    # not share a worker.
+    account, region = _account_region_from_function_config(config)
+    key = f"{account}:{region}:{func_name}:{qualifier}"
     with _lock:
         worker = _workers.get(key)
         if worker is not None:
@@ -944,23 +988,32 @@ def get_or_create_worker(func_name: str, config: dict, code_zip: bytes,
         return worker
 
 
-def invalidate_worker(func_name: str, qualifier: str = None, account: str = None):
+def invalidate_worker(func_name: str, qualifier: str = None,
+                      account: str = None, region: str = None):
     """Kill and remove workers for a function.
 
     If qualifier is provided, only kill that specific version/alias worker.
     Otherwise kill all workers for the function (used on delete).
-    If account is provided, scope the invalidation to that account.
+    If account or region is provided, scope the invalidation to that account
+    and/or region.
     """
-    # Worker keys are "{account}:{func_name}:{qualifier}". Lambda function names
-    # cannot contain ':' (AWS naming rule), so splitting on ':' is unambiguous.
+    # Worker keys are "{account}:{region}:{func_name}:{qualifier}". Older
+    # in-process keys may be "{account}:{func_name}:{qualifier}" during local
+    # development, so tolerate both shapes.
     def _matches(k: str) -> bool:
         parts = k.split(":")
-        if len(parts) != 3:
+        if len(parts) == 4:
+            k_account, k_region, k_func, k_qualifier = parts
+        elif len(parts) == 3:
+            k_account, k_func, k_qualifier = parts
+            k_region = None
+        else:
             return False
-        k_account, k_func, k_qualifier = parts
         if k_func != func_name:
             return False
         if account is not None and k_account != account:
+            return False
+        if region is not None and k_region is not None and k_region != region:
             return False
         if qualifier is not None and k_qualifier != qualifier:
             return False

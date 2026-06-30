@@ -6,10 +6,25 @@ import uuid as _uuid_mod
 import zipfile
 from urllib.parse import urlparse
 
+import boto3
 import pytest
+from botocore.config import Config
 from botocore.exceptions import ClientError
 
 _LAMBDA_ROLE = "arn:aws:iam::000000000000:role/lambda-role"
+
+
+def _regional_kin(region_name):
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+    return boto3.client(
+        "kinesis",
+        endpoint_url=endpoint,
+        aws_access_key_id="test",
+        aws_secret_access_key="test",
+        region_name=region_name,
+        config=Config(region_name=region_name, retries={"mode": "standard"}),
+    )
+
 
 def test_kinesis_put_get(kin):
     kin.create_stream(StreamName="test-stream", ShardCount=1)
@@ -97,6 +112,23 @@ def test_kinesis_describe_stream_v2(kin):
 
     summary = kin.describe_stream_summary(StreamName="kin-desc-v2")
     assert summary["StreamDescriptionSummary"]["StreamName"] == "kin-desc-v2"
+
+
+def test_kinesis_stream_arn_rejects_foreign_region_without_name_fallback(kin):
+    """StreamARN inputs must be parsed before matching account-scoped state."""
+    west = _regional_kin("us-west-2")
+    stream_name = f"kin-arn-scope-{_uuid_mod.uuid4().hex[:8]}"
+    west.create_stream(StreamName=stream_name, ShardCount=1)
+    west_arn = west.describe_stream(StreamName=stream_name)["StreamDescription"]["StreamARN"]
+
+    with pytest.raises(ClientError) as exc:
+        kin.describe_stream(StreamARN=west_arn)
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+    with pytest.raises(ClientError) as exc:
+        kin.put_record(StreamARN=west_arn, Data=b"no-fallback", PartitionKey="pk")
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
 
 def test_kinesis_tags_v2(kin):
     kin.create_stream(StreamName="kin-tag-v2", ShardCount=1)
@@ -215,6 +247,38 @@ def test_kinesis_register_deregister_consumer(kin):
     consumers2 = kin.list_stream_consumers(StreamARN=stream_arn)
     assert not any(c["ConsumerName"] == "my-consumer" for c in consumers2["Consumers"])
     kin.delete_stream(StreamName=sname)
+
+
+def test_kinesis_consumer_arns_reject_foreign_region_without_exact_key_fallback(kin):
+    """ConsumerARN paths must not resolve a consumer owned by another request region."""
+    west = _regional_kin("us-west-2")
+    stream_name = f"kin-consumer-arn-scope-{_uuid_mod.uuid4().hex[:8]}"
+    consumer_name = "west-consumer"
+    west.create_stream(StreamName=stream_name, ShardCount=1)
+    west_arn = west.describe_stream(StreamName=stream_name)["StreamDescription"]["StreamARN"]
+    consumer_arn = west.register_stream_consumer(
+        StreamARN=west_arn,
+        ConsumerName=consumer_name,
+    )["Consumer"]["ConsumerARN"]
+
+    with pytest.raises(ClientError) as exc:
+        kin.list_stream_consumers(StreamARN=west_arn)
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+    for kwargs in (
+        {"ConsumerARN": consumer_arn},
+        {"StreamARN": west_arn, "ConsumerName": consumer_name},
+    ):
+        with pytest.raises(ClientError) as exc:
+            kin.describe_stream_consumer(**kwargs)
+        assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+    with pytest.raises(ClientError) as exc:
+        kin.deregister_stream_consumer(ConsumerARN=consumer_arn)
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+    assert west.describe_stream_consumer(ConsumerARN=consumer_arn)["ConsumerDescription"]["ConsumerName"] == consumer_name
+
 
 def test_kinesis_at_timestamp_iterator(kin):
     """AT_TIMESTAMP shard iterator returns records after the given timestamp."""

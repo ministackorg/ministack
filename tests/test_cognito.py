@@ -21,6 +21,15 @@ from ministack.core import persistence
 
 # ========== from test_cognito.py ==========
 
+
+def _identity_pool_arn(identity_pool_id, region="us-east-1", account="000000000000"):
+    return f"arn:aws:cognito-identity:{region}:{account}:identitypool/{identity_pool_id}"
+
+
+def _user_pool_arn(user_pool_id, region="us-east-1", account="000000000000"):
+    return f"arn:aws:cognito-idp:{region}:{account}:userpool/{user_pool_id}"
+
+
 def test_cognito_create_and_describe_user_pool(cognito_idp):
     resp = cognito_idp.create_user_pool(PoolName="TestPool")
     pool = resp["UserPool"]
@@ -327,6 +336,37 @@ def test_cognito_tags(cognito_idp):
     tags = cognito_idp.list_tags_for_resource(ResourceArn=arn)["Tags"]
     assert "project" not in tags
 
+
+def test_cognito_user_pool_tag_apis_reject_invalid_arns(cognito_idp):
+    pid = cognito_idp.create_user_pool(PoolName="InvalidIdpArnTagPool")["UserPool"]["Id"]
+    valid_arn = _user_pool_arn(pid)
+    invalid_cases = [
+        ("not-an-arn-but-long-enough", "InvalidParameterException"),
+        ("arn:aws:cognito-idp:us-east-1", "InvalidParameterException"),
+        (f"arn:aws:cognito-identity:us-east-1:000000000000:userpool/{pid}", "InvalidParameterException"),
+        (f"arn:aws:cognito-idp:us-east-1:000000000000:identitypool/{pid}", "InvalidParameterException"),
+        (_user_pool_arn(pid, region="us-west-2"), "ResourceNotFoundException"),
+        (_user_pool_arn(pid, account="111111111111"), "ResourceNotFoundException"),
+    ]
+
+    for bad_arn, expected_code in invalid_cases:
+        with pytest.raises(ClientError) as exc:
+            cognito_idp.tag_resource(ResourceArn=bad_arn, Tags={"bad": "value"})
+        assert exc.value.response["Error"]["Code"] == expected_code
+
+    assert cognito_idp.list_tags_for_resource(ResourceArn=valid_arn)["Tags"] == {}
+
+
+def test_cognito_user_pool_list_and_untag_reject_invalid_arns(cognito_idp):
+    for operation, kwargs in [
+        (cognito_idp.list_tags_for_resource, {}),
+        (cognito_idp.untag_resource, {"TagKeys": ["missing"]}),
+    ]:
+        with pytest.raises(ClientError) as exc:
+            operation(ResourceArn="arn:aws:sqs:us-east-1:000000000000:userpool/not-a-pool", **kwargs)
+        assert exc.value.response["Error"]["Code"] == "InvalidParameterException"
+
+
 def test_cognito_get_user_from_token(cognito_idp):
     pid = cognito_idp.create_user_pool(PoolName="GetUserPool")["UserPool"]["Id"]
     cid = cognito_idp.create_user_pool_client(
@@ -417,6 +457,56 @@ def test_cognito_identity_pool_crud(cognito_identity):
     cognito_identity.delete_identity_pool(IdentityPoolId=iid)
     pools2 = cognito_identity.list_identity_pools(MaxResults=60)["IdentityPools"]
     assert not any(p["IdentityPoolId"] == iid for p in pools2)
+
+
+def test_cognito_identity_pool_tags(cognito_identity):
+    resp = cognito_identity.create_identity_pool(
+        IdentityPoolName="IdentityTagPool",
+        AllowUnauthenticatedIdentities=True,
+    )
+    arn = _identity_pool_arn(resp["IdentityPoolId"])
+
+    cognito_identity.tag_resource(ResourceArn=arn, Tags={"project": "ministack"})
+    tags = cognito_identity.list_tags_for_resource(ResourceArn=arn)["Tags"]
+    assert tags["project"] == "ministack"
+
+    cognito_identity.untag_resource(ResourceArn=arn, TagKeys=["project"])
+    tags = cognito_identity.list_tags_for_resource(ResourceArn=arn)["Tags"]
+    assert "project" not in tags
+
+
+def test_cognito_identity_pool_tag_apis_reject_invalid_arns(cognito_identity):
+    iid = cognito_identity.create_identity_pool(
+        IdentityPoolName="IdentityInvalidArnTagPool",
+        AllowUnauthenticatedIdentities=True,
+    )["IdentityPoolId"]
+    valid_arn = _identity_pool_arn(iid)
+    invalid_cases = [
+        ("not-an-arn-but-long-enough", "InvalidParameterException"),
+        ("arn:aws:cognito-identity:us-east-1", "InvalidParameterException"),
+        (f"arn:aws:cognito-idp:us-east-1:000000000000:identitypool/{iid}", "InvalidParameterException"),
+        (f"arn:aws:cognito-identity:us-east-1:000000000000:identity/{iid}", "InvalidParameterException"),
+        (_identity_pool_arn(iid, region="us-west-2"), "ResourceNotFoundException"),
+        (_identity_pool_arn(iid, account="111111111111"), "ResourceNotFoundException"),
+    ]
+
+    for bad_arn, expected_code in invalid_cases:
+        with pytest.raises(ClientError) as exc:
+            cognito_identity.tag_resource(ResourceArn=bad_arn, Tags={"bad": "value"})
+        assert exc.value.response["Error"]["Code"] == expected_code
+
+    assert cognito_identity.list_tags_for_resource(ResourceArn=valid_arn)["Tags"] == {}
+
+
+def test_cognito_identity_pool_list_and_untag_reject_invalid_arns(cognito_identity):
+    for operation, kwargs in [
+        (cognito_identity.list_tags_for_resource, {}),
+        (cognito_identity.untag_resource, {"TagKeys": ["missing"]}),
+    ]:
+        with pytest.raises(ClientError) as exc:
+            operation(ResourceArn="arn:aws:sqs:us-east-1:000000000000:identitypool/not-a-pool", **kwargs)
+        assert exc.value.response["Error"]["Code"] == "InvalidParameterException"
+
 
 def test_cognito_get_id_and_credentials(cognito_identity):
     resp = cognito_identity.create_identity_pool(
@@ -2194,23 +2284,22 @@ def test_oauth2_token_failed_client_auth_does_not_consume_code():
     assert 'access_token' in json.loads(body)
 
 
-def test_oauth2_basic_auth_url_decodes_client_secret():
-    """HTTP Basic client auth carries client_id/client_secret form-urlencoded
-    before base64 (RFC 6749 §2.3.1), so a secret containing '/' or '+' arrives
-    as %2F/%2B. _authenticate_client must decode it to match the stored secret,
-    otherwise client_secret_basic fails for any secret with special characters
-    (#932). The client_secret_post path already decodes via parse_qs."""
+def test_oauth2_basic_auth_does_not_url_decode_client_secret():
+    """AWS Cognito compares the HTTP Basic client_id/client_secret EXACTLY as
+    sent — it does NOT url-decode them. Real clients (incl. Go/Vault) base64 the
+    raw "id:secret" without form-urlencoding, so a secret containing '+' or '/'
+    must be matched verbatim. Decoding here would corrupt any secret containing
+    '+' (→ space) and break valid client_secret_basic auth (#932)."""
     import base64 as _b64
-    from urllib.parse import quote_plus
 
     from ministack.services.cognito import _authenticate_client
 
     cid = "VxSsBWVIKMZK29W0IN6TKJN8EF"
     for secret in ("ab/cd+ef/gh", "no-specials-here"):
-        basic = _b64.b64encode(f"{cid}:{quote_plus(secret)}".encode()).decode()
+        basic = _b64.b64encode(f"{cid}:{secret}".encode()).decode()
         got_cid, got_secret = _authenticate_client({"authorization": f"Basic {basic}"}, {})
         assert got_cid == cid
-        assert got_secret == secret, f"Basic auth must decode to {secret!r}, got {got_secret!r}"
+        assert got_secret == secret, f"Basic auth must NOT decode; expected {secret!r}, got {got_secret!r}"
 
 
 def test_oauth2_id_token_echoes_nonce():

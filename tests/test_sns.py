@@ -7,10 +7,24 @@ import uuid as _uuid_mod
 import zipfile
 from urllib.parse import urlencode, urlparse
 
+import boto3
 import pytest
+from botocore.config import Config
 from botocore.exceptions import ClientError
 
 ENDPOINT = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+
+
+def _regional_client(service: str, region: str):
+    return boto3.client(
+        service,
+        endpoint_url=ENDPOINT,
+        aws_access_key_id="test",
+        aws_secret_access_key="test",
+        region_name=region,
+        config=Config(region_name=region, retries={"mode": "standard"}),
+    )
+
 
 def _make_zip(code: str) -> bytes:
     buf = io.BytesIO()
@@ -145,6 +159,75 @@ def test_sns_sqs_fanout(sns, sqs):
     assert body["Message"] == "fanout msg"
     assert body["TopicArn"] == topic_arn
 
+
+@pytest.mark.parametrize("protocol, endpoint", [
+    ("sqs", "not-an-arn"),
+    ("sqs", "arn:aws:rds:us-east-1:000000000000:db:wrong-service"),
+    ("lambda", "arn:aws:sqs:us-east-1:000000000000:wrong-service-q"),
+    ("lambda", "arn:aws:lambda:us-east-1:000000000000:not-function-resource"),
+])
+def test_sns_subscribe_rejects_invalid_sqs_and_lambda_endpoint_arns(sns, protocol, endpoint):
+    topic_arn = sns.create_topic(Name=f"intg-sns-invalid-endpoint-{_uuid_mod.uuid4().hex[:8]}")["TopicArn"]
+
+    with pytest.raises(ClientError) as exc:
+        sns.subscribe(TopicArn=topic_arn, Protocol=protocol, Endpoint=endpoint)
+    assert exc.value.response["Error"]["Code"] == "InvalidParameterException"
+
+
+def test_sns_sqs_fanout_does_not_tail_match_foreign_account_endpoint(sns, sqs):
+    queue_name = f"intg-sns-foreign-tail-{_uuid_mod.uuid4().hex[:8]}"
+    q_url = sqs.create_queue(QueueName=queue_name)["QueueUrl"]
+    topic_arn = sns.create_topic(Name=f"intg-sns-foreign-tail-{_uuid_mod.uuid4().hex[:8]}")["TopicArn"]
+
+    sns.subscribe(
+        TopicArn=topic_arn,
+        Protocol="sqs",
+        Endpoint=f"arn:aws:sqs:us-east-1:111111111111:{queue_name}",
+    )
+    sns.publish(TopicArn=topic_arn, Message="must-not-tail-match")
+
+    msgs = sqs.receive_message(QueueUrl=q_url, MaxNumberOfMessages=1, WaitTimeSeconds=1)
+    assert "Messages" not in msgs
+
+
+def test_sns_sqs_fanout_delivers_to_matching_cross_region_queue_arn(sns):
+    west_sqs = _regional_client("sqs", "us-west-2")
+    queue_name = f"intg-sns-cross-region-ok-{_uuid_mod.uuid4().hex[:8]}"
+    q_url = west_sqs.create_queue(QueueName=queue_name)["QueueUrl"]
+    q_arn = west_sqs.get_queue_attributes(
+        QueueUrl=q_url,
+        AttributeNames=["QueueArn"],
+    )["Attributes"]["QueueArn"]
+    assert ":us-west-2:" in q_arn
+    topic_arn = sns.create_topic(Name=f"intg-sns-cross-region-ok-{_uuid_mod.uuid4().hex[:8]}")["TopicArn"]
+
+    sns.subscribe(TopicArn=topic_arn, Protocol="sqs", Endpoint=q_arn)
+    sns.publish(TopicArn=topic_arn, Message="cross-region-delivery")
+
+    msgs = west_sqs.receive_message(QueueUrl=q_url, MaxNumberOfMessages=1, WaitTimeSeconds=1)
+    assert len(msgs.get("Messages", [])) == 1
+    body = json.loads(msgs["Messages"][0]["Body"])
+    assert body["Message"] == "cross-region-delivery"
+    assert body["TopicArn"] == topic_arn
+
+
+def test_sns_sqs_fanout_does_not_tail_match_foreign_region_endpoint(sns, sqs):
+    queue_name = f"intg-sns-cross-region-{_uuid_mod.uuid4().hex[:8]}"
+    q_url = sqs.create_queue(QueueName=queue_name)["QueueUrl"]
+    q_arn = sqs.get_queue_attributes(
+        QueueUrl=q_url,
+        AttributeNames=["QueueArn"],
+    )["Attributes"]["QueueArn"]
+    west_q_arn = q_arn.replace(":us-east-1:", ":us-west-2:")
+    topic_arn = sns.create_topic(Name=f"intg-sns-cross-region-{_uuid_mod.uuid4().hex[:8]}")["TopicArn"]
+
+    sns.subscribe(TopicArn=topic_arn, Protocol="sqs", Endpoint=west_q_arn)
+    sns.publish(TopicArn=topic_arn, Message="must-not-tail-match-region")
+
+    msgs = sqs.receive_message(QueueUrl=q_url, MaxNumberOfMessages=1, WaitTimeSeconds=1)
+    assert "Messages" not in msgs
+
+
 def test_sns_tags(sns):
     arn = sns.create_topic(Name="intg-sns-tags")["TopicArn"]
     sns.tag_resource(
@@ -164,6 +247,48 @@ def test_sns_tags(sns):
     tags = {t["Key"]: t["Value"] for t in resp["Tags"]}
     assert "team" not in tags
     assert tags["env"] == "staging"
+
+
+def test_sns_tag_resource_accepts_empty_account_topic_arn(sns):
+    arn = sns.create_topic(Name=f"intg-sns-empty-account-{_uuid_mod.uuid4().hex[:8]}")["TopicArn"]
+    empty_account_arn = arn.replace(":000000000000:", "::")
+
+    sns.tag_resource(ResourceArn=empty_account_arn, Tags=[{"Key": "env", "Value": "test"}])
+
+    resp = sns.list_tags_for_resource(ResourceArn=arn)
+    tags = {t["Key"]: t["Value"] for t in resp["Tags"]}
+    assert tags["env"] == "test"
+
+
+def test_sns_topic_tag_apis_reject_invalid_arns(sns):
+    arn = sns.create_topic(Name=f"intg-sns-invalid-tags-{_uuid_mod.uuid4().hex[:8]}")["TopicArn"]
+    invalid_cases = [
+        ("not-an-arn", "InvalidParameterException"),
+        ("arn:aws:sns:us-east-1", "InvalidParameterException"),
+        (arn.replace(":sns:", ":sqs:"), "InvalidParameterException"),
+        (arn.replace(":000000000000:", ":111111111111:"), "ResourceNotFoundException"),
+        (arn.replace(":us-east-1:", ":us-west-2:"), "ResourceNotFoundException"),
+        ("arn:aws:sns:us-east-1:000000000000:app/APNS/example", "InvalidParameterException"),
+    ]
+
+    for bad_arn, expected_code in invalid_cases:
+        with pytest.raises(ClientError) as exc:
+            sns.tag_resource(ResourceArn=bad_arn, Tags=[{"Key": "bad", "Value": "value"}])
+        assert exc.value.response["Error"]["Code"] == expected_code
+
+    resp = sns.list_tags_for_resource(ResourceArn=arn)
+    assert resp["Tags"] == []
+
+
+def test_sns_topic_list_and_untag_reject_invalid_arns(sns):
+    for operation, kwargs in [
+        (sns.list_tags_for_resource, {}),
+        (sns.untag_resource, {"TagKeys": ["missing"]}),
+    ]:
+        with pytest.raises(ClientError) as exc:
+            operation(ResourceArn="arn:aws:sqs:us-east-1:000000000000:not-a-topic", **kwargs)
+        assert exc.value.response["Error"]["Code"] == "InvalidParameterException"
+
 
 def test_sns_subscription_attributes(sns):
     arn = sns.create_topic(Name="intg-sns-subattr")["TopicArn"]

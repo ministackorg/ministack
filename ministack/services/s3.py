@@ -23,9 +23,9 @@ Storage: In-memory (optionally backed by S3_DATA_DIR).
 """
 
 import base64
+import contextvars
 import copy
 import datetime as _dt
-import contextvars
 import hashlib
 import json
 import logging
@@ -45,6 +45,7 @@ from xml.sax.saxutils import escape as _esc
 
 from defusedxml.ElementTree import fromstring
 
+from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.persistence import PERSIST_STATE, load_state
 from ministack.core.responses import (
     AccountScopedDict,
@@ -1463,7 +1464,13 @@ def _get_bucket_notification(name: str):
 def _put_bucket_notification(name: str, body: bytes):
     if name not in _buckets:
         return _no_such_bucket(name)
-    _bucket_notifications[name] = body.decode("utf-8", errors="replace")
+    raw = body.decode("utf-8", errors="replace")
+    configs = _parse_notification_config_raw(raw)
+    bucket_region = _notification_bucket_region(name)
+    validation_error = _validate_notification_configs(configs, bucket_region)
+    if validation_error:
+        return validation_error
+    _bucket_notifications[name] = raw
     # Fire the s3:TestEvent synchronously so it's delivered before PutBucketNotification
     # returns — matches AWS's effective behaviour and avoids a race where the
     # client polls the destination queue/topic before the background thread has
@@ -1649,8 +1656,12 @@ def _list_object_versions(bucket_name: str, query_params: dict):
 
 
 def _parse_notification_config(bucket_name: str) -> list[dict]:
-    """Parse the raw notification XML into structured config dicts."""
-    raw = _bucket_notifications.get(bucket_name)
+    """Parse the stored notification XML into structured config dicts."""
+    return _parse_notification_config_raw(_bucket_notifications.get(bucket_name))
+
+
+def _parse_notification_config_raw(raw: str | None) -> list[dict]:
+    """Parse raw notification XML into structured config dicts."""
     if not raw:
         return []
 
@@ -1733,6 +1744,93 @@ def _parse_notification_config(bucket_name: str) -> list[dict]:
     return configs
 
 
+def _invalid_notification_config(message: str) -> tuple:
+    return _error("InvalidArgument", message, 400)
+
+
+def _notification_bucket_region(bucket_name: str) -> str:
+    bucket = _buckets.get(bucket_name, {})
+    return bucket.get("region") or os.environ.get("MINISTACK_REGION", "us-east-1")
+
+
+_NOTIFICATION_TARGET_SERVICES = {
+    "sqs": "sqs",
+    "sns": "sns",
+    "lambda": "lambda",
+}
+
+
+def _queue_name_from_sqs_arn_spec(spec) -> str | None:
+    if spec.service != "sqs" or not spec.resource or ":" in spec.resource or "/" in spec.resource:
+        return None
+    return spec.resource
+
+
+def _topic_name_from_sns_arn_spec(spec) -> str | None:
+    if spec.service != "sns" or not spec.resource or ":" in spec.resource or "/" in spec.resource:
+        return None
+    return spec.resource
+
+
+def _lambda_name_from_arn_spec(spec) -> str | None:
+    if spec.service != "lambda":
+        return None
+    parts = spec.resource.split(":", 2)
+    if len(parts) < 2 or parts[0] != "function" or not parts[1]:
+        return None
+    return parts[1]
+
+
+def _parse_notification_target_arn(target_type: str, arn: str, bucket_region: str):
+    expected_service = _NOTIFICATION_TARGET_SERVICES.get(target_type)
+    try:
+        spec = parse_arn(arn)
+    except ArnParseError:
+        return None, "destination ARN is not in the correct format"
+
+    if spec.service != expected_service:
+        return spec, f"expected {expected_service} ARN, got {spec.service}"
+    if not spec.account_id:
+        return spec, "destination ARN must include an account ID"
+    if spec.account_id != get_account_id():
+        return spec, "destination account must match bucket owner account"
+    if not spec.region:
+        return spec, "destination ARN must include a region"
+    if spec.region != bucket_region:
+        return spec, "destination region must match bucket region"
+    return spec, None
+
+
+def _validate_notification_target_arn(target_type: str, arn: str, bucket_region: str) -> tuple | None:
+    spec, error = _parse_notification_target_arn(target_type, arn, bucket_region)
+    if error:
+        return _invalid_notification_config(
+            f"Unable to validate destination configuration: {error}"
+        )
+
+    if target_type == "sqs" and not _queue_name_from_sqs_arn_spec(spec):
+        return _invalid_notification_config(
+            "Unable to validate destination configuration: invalid SQS queue ARN"
+        )
+    if target_type == "sns" and not _topic_name_from_sns_arn_spec(spec):
+        return _invalid_notification_config(
+            "Unable to validate destination configuration: invalid SNS topic ARN"
+        )
+    if target_type == "lambda" and not _lambda_name_from_arn_spec(spec):
+        return _invalid_notification_config(
+            "Unable to validate destination configuration: invalid Lambda function ARN"
+        )
+    return None
+
+
+def _validate_notification_configs(configs: list[dict], bucket_region: str) -> tuple | None:
+    for cfg in configs:
+        error = _validate_notification_target_arn(cfg["type"], cfg["arn"], bucket_region)
+        if error:
+            return error
+    return None
+
+
 def _event_matches(event_name: str, patterns: list[str]) -> bool:
     """Check if event_name matches any of the configured event patterns.
 
@@ -1803,6 +1901,7 @@ def _fire_s3_event(
         has_eventbridge = "EventBridgeConfiguration" in raw_xml
         if not configs and not has_eventbridge:
             return
+        bucket_region = _notification_bucket_region(bucket_name)
 
         short_event = event_name.replace("s3:", "", 1)
         event_time = now_iso()
@@ -1857,11 +1956,11 @@ def _fire_s3_event(
                 payload["Records"][0]["s3"]["configurationId"] = cfg["id"]
 
                 if cfg["type"] == "sqs":
-                    _deliver_event_to_sqs(cfg["arn"], payload)
+                    _deliver_event_to_sqs(cfg["arn"], payload, bucket_region)
                 elif cfg["type"] == "sns":
-                    _deliver_event_to_sns(cfg["arn"], payload)
+                    _deliver_event_to_sns(cfg["arn"], payload, bucket_region)
                 elif cfg["type"] == "lambda":
-                    _deliver_event_to_lambda(cfg["arn"], payload)
+                    _deliver_event_to_lambda(cfg["arn"], payload, bucket_region)
             except Exception:
                 logger.exception(
                     "S3 notification delivery failed for config %s", cfg.get("id")
@@ -1908,12 +2007,30 @@ def _fire_s3_event(
         )
 
 
-def _deliver_event_to_sqs(arn: str, event_payload: dict) -> None:
+def _parse_delivery_notification_target(target_type: str, arn: str, bucket_region: str):
+    spec, error = _parse_notification_target_arn(target_type, arn, bucket_region)
+    if error:
+        logger.warning(
+            "S3 notification: invalid %s target ARN %s: %s",
+            target_type.upper(),
+            arn,
+            error,
+        )
+        return None
+    return spec
+
+
+def _deliver_event_to_sqs(arn: str, event_payload: dict, bucket_region: str) -> None:
     from ministack.services import sqs as _sqs
 
-    queue_name = arn.rsplit(":", 1)[-1]
-    queue_url = _sqs._queue_url(queue_name)
-    queue = _sqs._queues.get(queue_url)
+    spec = _parse_delivery_notification_target("sqs", arn, bucket_region)
+    if not spec:
+        return
+    queue_name = _queue_name_from_sqs_arn_spec(spec)
+    if not queue_name:
+        logger.warning("S3 notification: invalid SQS queue ARN %s", arn)
+        return
+    queue = _sqs._queue_by_arn(str(spec))
     if not queue:
         logger.warning("S3 notification: SQS queue %s not found", queue_name)
         return
@@ -1934,9 +2051,15 @@ def _deliver_event_to_sqs(arn: str, event_payload: dict) -> None:
     logger.info("S3 notification → SQS %s", queue_name)
 
 
-def _deliver_event_to_sns(arn: str, event_payload: dict) -> None:
+def _deliver_event_to_sns(arn: str, event_payload: dict, bucket_region: str) -> None:
     from ministack.services import sns as _sns
 
+    spec = _parse_delivery_notification_target("sns", arn, bucket_region)
+    if not spec:
+        return
+    if not _topic_name_from_sns_arn_spec(spec):
+        logger.warning("S3 notification: invalid SNS topic ARN %s", arn)
+        return
     topic = _sns._topics.get(arn)
     if not topic:
         logger.warning("S3 notification: SNS topic %s not found", arn)
@@ -1948,12 +2071,17 @@ def _deliver_event_to_sns(arn: str, event_payload: dict) -> None:
     logger.info("S3 notification → SNS %s", arn)
 
 
-def _deliver_event_to_lambda(arn: str, event_payload: dict) -> None:
+def _deliver_event_to_lambda(arn: str, event_payload: dict, bucket_region: str) -> None:
     from ministack.services import lambda_svc as _lambda
 
-    func_name = arn.rsplit(":", 1)[-1]
-    func = _lambda._functions.get(func_name)
-    if not func:
+    spec = _parse_delivery_notification_target("lambda", arn, bucket_region)
+    if not spec:
+        return
+    if not _lambda_name_from_arn_spec(spec):
+        logger.warning("S3 notification: invalid Lambda function ARN %s", arn)
+        return
+    func, config, func_name = _lambda._get_func_record_for_ref(arn)
+    if not func or not config:
         logger.warning("S3 notification: Lambda function %s not found", func_name)
         return
 
@@ -1961,7 +2089,7 @@ def _deliver_event_to_lambda(arn: str, event_payload: dict) -> None:
     # (MaximumRetryAttempts, default 2) and routing to the function's DLQ /
     # DestinationConfig.OnFailure on final failure. Shared helper keeps the
     # semantics identical to direct Invoke(InvocationType=Event).
-    _lambda.invoke_async_with_retry(func, event_payload)
+    _lambda.invoke_async_with_retry(_lambda._execution_record_for_config(func, config), event_payload)
     logger.info("S3 notification → Lambda %s (async with retry+DLQ)", func_name)
 
 
@@ -1997,6 +2125,7 @@ def _fire_s3_test_event(bucket_name: str) -> None:
         configs = _parse_notification_config(bucket_name)
         if not configs:
             return
+        bucket_region = _notification_bucket_region(bucket_name)
         payload = {
             "Service": "Amazon S3",
             "Event": "s3:TestEvent",
@@ -2008,11 +2137,11 @@ def _fire_s3_test_event(bucket_name: str) -> None:
         for cfg in configs:
             try:
                 if cfg["type"] == "sqs":
-                    _deliver_event_to_sqs(cfg["arn"], payload)
+                    _deliver_event_to_sqs(cfg["arn"], payload, bucket_region)
                 elif cfg["type"] == "sns":
-                    _deliver_event_to_sns(cfg["arn"], payload)
+                    _deliver_event_to_sns(cfg["arn"], payload, bucket_region)
                 elif cfg["type"] == "lambda":
-                    _deliver_event_to_lambda(cfg["arn"], payload)
+                    _deliver_event_to_lambda(cfg["arn"], payload, bucket_region)
             except Exception:
                 logger.exception(
                     "S3 test-event delivery failed for config %s", cfg.get("id")

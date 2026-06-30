@@ -13,6 +13,8 @@ import uuid
 from datetime import datetime, timezone
 from xml.etree.ElementTree import Element, SubElement, tostring
 
+from ministack.core.arn import ArnParseError, parse_arn
+
 # Request-scoped account ID for multi-tenancy.
 # Set per-request in app.py from the Authorization header.
 _request_account_id: contextvars.ContextVar[str] = contextvars.ContextVar(
@@ -122,6 +124,18 @@ class AccountScopedDict:
     def get(self, key, default=None):
         return self._data.get(self._scoped(key), default)
 
+    def get_scoped(self, account_id, region, key, default=None):
+        return self._data.get((account_id, key), default)
+
+    def set_scoped(self, account_id, region, key, value):
+        self._data[(account_id, key)] = value
+
+    def contains_scoped(self, account_id, region, key):
+        return (account_id, key) in self._data
+
+    def pop_scoped(self, account_id, region, key, *args):
+        return self._data.pop((account_id, key), *args)
+
     def pop(self, key, *args):
         return self._data.pop(self._scoped(key), *args)
 
@@ -162,6 +176,173 @@ class AccountScopedDict:
 
     def __repr__(self):
         return f"AccountScopedDict({dict(self.items())})"
+
+
+class AccountRegionScopedDict:
+    """A dict-like container that namespaces keys by account ID and region.
+
+    This mirrors ``AccountScopedDict`` while adding the current request region
+    to the internal key. It lets regional services keep their existing module
+    stores and dict operations while preventing same-name regional resources
+    from colliding or leaking across requests.
+    """
+
+    __slots__ = ("_data",)
+
+    def __init__(self):
+        self._data: dict = {}
+
+    # -- internal helpers --------------------------------------------------
+
+    def _scoped(self, key):
+        return (get_account_id(), get_region(), key)
+
+    def _unscope(self, scoped_key):
+        return scoped_key[2]
+
+    def _prefix(self):
+        return (get_account_id(), get_region())
+
+    def _is_mine(self, scoped_key):
+        return scoped_key[:2] == self._prefix()
+
+    # -- dict interface ----------------------------------------------------
+
+    def __setitem__(self, key, value):
+        self._data[self._scoped(key)] = value
+
+    def __getitem__(self, key):
+        return self._data[self._scoped(key)]
+
+    def __delitem__(self, key):
+        del self._data[self._scoped(key)]
+
+    def __contains__(self, key):
+        return self._scoped(key) in self._data
+
+    def __len__(self):
+        return sum(1 for k in self._data if self._is_mine(k))
+
+    def __bool__(self):
+        return any(self._is_mine(k) for k in self._data)
+
+    def __iter__(self):
+        for k in self._data:
+            if self._is_mine(k):
+                yield self._unscope(k)
+
+    def get(self, key, default=None):
+        return self._data.get(self._scoped(key), default)
+
+    def get_scoped(self, account_id, region, key, default=None):
+        return self._data.get((account_id, region, key), default)
+
+    def set_scoped(self, account_id, region, key, value):
+        self._data[(account_id, region, key)] = value
+
+    def contains_scoped(self, account_id, region, key):
+        return (account_id, region, key) in self._data
+
+    def pop_scoped(self, account_id, region, key, *args):
+        return self._data.pop((account_id, region, key), *args)
+
+    def pop(self, key, *args):
+        return self._data.pop(self._scoped(key), *args)
+
+    def setdefault(self, key, default=None):
+        return self._data.setdefault(self._scoped(key), default)
+
+    def keys(self):
+        return [self._unscope(k) for k in self._data if self._is_mine(k)]
+
+    def values(self):
+        return [v for k, v in self._data.items() if self._is_mine(k)]
+
+    def items(self):
+        return [(self._unscope(k), v) for k, v in self._data.items() if self._is_mine(k)]
+
+    def values_scoped(self, account_id, region):
+        return [v for k, v in self._data.items() if k[:2] == (account_id, region)]
+
+    def items_scoped(self, account_id, region):
+        return [(self._unscope(k), v) for k, v in self._data.items() if k[:2] == (account_id, region)]
+
+    def all_values(self):
+        return list(self._data.values())
+
+    def all_items(self):
+        return list(self._data.items())
+
+    def has_any(self):
+        return bool(self._data)
+
+    def _region_for_legacy_value(self, key, value):
+        return (
+            _best_effort_region_from_arnish(key)
+            or _best_effort_region_from_arnish(value)
+            or get_region()
+        )
+
+    def update(self, other):
+        if isinstance(other, AccountRegionScopedDict):
+            self._data.update(other._data)
+        elif isinstance(other, AccountScopedDict):
+            for (account_id, key), value in other._data.items():
+                region = self._region_for_legacy_value(key, value)
+                self._data[(account_id, region, key)] = value
+        elif isinstance(other, dict):
+            for k, v in other.items():
+                region = self._region_for_legacy_value(k, v)
+                self._data[(get_account_id(), region, k)] = v
+
+    def clear(self):
+        """Clear ALL accounts' and regions' data (used by reset)."""
+        self._data.clear()
+
+    def to_dict(self):
+        """Convert ALL accounts' and regions' data to a plain dict."""
+        return dict(self._data)
+
+    @classmethod
+    def from_dict(cls, data):
+        """Restore from a plain dict produced by to_dict()."""
+        obj = cls()
+        obj._data = dict(data)
+        return obj
+
+    def __repr__(self):
+        return f"AccountRegionScopedDict({dict(self.items())})"
+
+
+def _best_effort_region_from_arnish(value):
+    """Find a region in legacy persisted data without validating request input."""
+    if isinstance(value, str):
+        if not value.startswith("arn:"):
+            return None
+        try:
+            region = parse_arn(value).region
+        except ArnParseError:
+            return None
+        return region or None
+
+    if isinstance(value, dict):
+        for key, candidate in value.items():
+            if isinstance(key, str) and key.lower().endswith("arn"):
+                region = _best_effort_region_from_arnish(candidate)
+                if region:
+                    return region
+        for candidate in value.values():
+            region = _best_effort_region_from_arnish(candidate)
+            if region:
+                return region
+        return None
+
+    if isinstance(value, (list, tuple, set)):
+        for candidate in value:
+            region = _best_effort_region_from_arnish(candidate)
+            if region:
+                return region
+    return None
 
 
 def xml_response(root_tag: str, namespace: str, children: dict, status: int = 200) -> tuple:

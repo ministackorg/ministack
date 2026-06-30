@@ -65,8 +65,8 @@ _SERIAL_TESTS = {
     "tests/test_ses.py::test_ses_messages_endpoint_account_filter",
     "tests/test_stepfunctions.py::test_sfn_mock_config_return",
     "tests/test_stepfunctions.py::test_sfn_mock_config_throw",
-    "tests/test_stepfunctions.py::test_sfn_mock_config_jsonata_assign_applied",
     "tests/test_stepfunctions.py::test_sfn_mock_config_throw_routes_to_catch",
+    "tests/test_stepfunctions.py::test_sfn_mock_config_jsonata_assign_applied",
     "tests/test_stepfunctions.py::test_sfn_wait_scale_zero_does_not_timeout_lambda_tasks",
     "tests/test_stepfunctions.py::test_sfn_wait_scale_zero_skips_wait",
     "tests/test_rds.py::test_rds_lambda_network_connectivity",
@@ -98,6 +98,7 @@ _SERIAL_TESTS = {
     "tests/test_appsync.py::test_appsync_lambda_event_variables_substituted",
     "tests/test_appsync.py::test_appsync_lambda_unhandled_exception_becomes_error",
     "tests/test_appsync.py::test_appsync_lambda_authorizer_rejection_returns_unauthorized",
+    "tests/test_appsync.py::test_appsync_lambda_authorizer_wrong_region_arn_does_not_fallback",
     "tests/test_appsync.py::test_appsync_lambda_missing_authorizer_returns_unauthorized",
     "tests/test_appsync.py::test_appsync_lambda_failing_authorizer_returns_unauthorized",
     # AppSync Events service mutations; shared state racing under xdist.

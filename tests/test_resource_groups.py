@@ -13,7 +13,6 @@ import pytest
 from botocore.config import Config
 from botocore.exceptions import ClientError
 
-
 ENDPOINT = "http://localhost:4566"
 REGION = "us-east-1"
 
@@ -86,6 +85,41 @@ def test_get_group_by_name_and_by_arn(rg):
         by_arn = rg.get_group(Group=arn)
         assert by_name["Group"]["Name"] == name
         assert by_arn["Group"]["Name"] == name
+    finally:
+        rg.delete_group(Group=name)
+
+
+def test_group_arn_region_and_account_must_match_request(rg):
+    name = f"g-{_uid()}"
+    arn = rg.create_group(Name=name, ResourceQuery=_tag_query())["Group"]["GroupArn"]
+    foreign_region = arn.replace(":us-east-1:", ":us-west-2:")
+    foreign_account = arn.replace(":000000000000:", ":111111111111:")
+    try:
+        for group_arn in (foreign_region, foreign_account):
+            with pytest.raises(ClientError) as exc:
+                rg.get_group(Group=group_arn)
+            assert exc.value.response["Error"]["Code"] == "NotFoundException"
+
+            with pytest.raises(ClientError) as exc:
+                rg.tag(Arn=group_arn, Tags={"env": "foreign"})
+            assert exc.value.response["Error"]["Code"] == "NotFoundException"
+
+        assert rg.get_group(Group=arn)["Group"]["Name"] == name
+    finally:
+        rg.delete_group(Group=name)
+
+
+def test_malformed_group_arn_does_not_resolve_as_group_name(rg):
+    name = f"g-{_uid()}"
+    rg.create_group(Name=name, ResourceQuery=_tag_query())
+    try:
+        malformed = f"arn:aws:resource-groups:us-east-1:000000000000:group/{name}:extra"
+        invalid_partition = f"arn:notaws:resource-groups:us-east-1:000000000000:group/{name}"
+        wrong_service = f"arn:aws:sns:us-east-1:000000000000:group/{name}"
+        for group_arn in (malformed, invalid_partition, wrong_service):
+            with pytest.raises(ClientError) as exc:
+                rg.get_group(Group=group_arn)
+            assert exc.value.response["Error"]["Code"] == "BadRequestException"
     finally:
         rg.delete_group(Group=name)
 
@@ -211,6 +245,60 @@ def test_group_and_ungroup_and_list_resources(rg):
         after_arns = {r["ResourceArn"] for r in after["ResourceIdentifiers"]}
         assert arns[0] not in after_arns
         assert arns[1] in after_arns
+    finally:
+        rg.delete_group(Group=name)
+
+
+def test_group_resources_rejects_malformed_resource_arn(rg):
+    name = f"g-{_uid()}"
+    rg.create_group(Name=name, ResourceQuery=_tag_query())
+    try:
+        valid = "arn:aws:ec2:us-east-1:000000000000:instance/i-aaa"
+        malformed = "arn:aws:ec2:us-east-1:000000000000"
+        invalid_partition = "arn:notaws:ec2:us-east-1:000000000000:instance/i-aaa"
+        for resource_arn in (malformed, invalid_partition):
+            with pytest.raises(ClientError) as exc:
+                rg.group_resources(Group=name, ResourceArns=[valid, resource_arn])
+            assert exc.value.response["Error"]["Code"] == "BadRequestException"
+            assert rg.list_group_resources(GroupName=name)["ResourceIdentifiers"] == []
+    finally:
+        rg.delete_group(Group=name)
+
+
+def test_group_resources_failed_request_does_not_partially_mutate_existing_members(rg):
+    name = f"g-{_uid()}"
+    rg.create_group(Name=name, ResourceQuery=_tag_query())
+    try:
+        existing = "arn:aws:ec2:us-east-1:000000000000:instance/i-existing"
+        valid = "arn:aws:ec2:us-east-1:000000000000:instance/i-new"
+        malformed = "arn:aws:ec2:us-east-1:000000000000"
+        rg.group_resources(Group=name, ResourceArns=[existing])
+
+        with pytest.raises(ClientError) as exc:
+            rg.group_resources(Group=name, ResourceArns=[valid, malformed])
+
+        assert exc.value.response["Error"]["Code"] == "BadRequestException"
+        listed = rg.list_group_resources(GroupName=name)["ResourceIdentifiers"]
+        assert [resource["ResourceArn"] for resource in listed] == [existing]
+    finally:
+        rg.delete_group(Group=name)
+
+
+def test_ungroup_resources_failed_request_does_not_partially_mutate_existing_members(rg):
+    name = f"g-{_uid()}"
+    rg.create_group(Name=name, ResourceQuery=_tag_query())
+    try:
+        keep = "arn:aws:ec2:us-east-1:000000000000:instance/i-keep"
+        remove = "arn:aws:ec2:us-east-1:000000000000:instance/i-remove"
+        malformed = "arn:aws:ec2:us-east-1:000000000000"
+        rg.group_resources(Group=name, ResourceArns=[keep, remove])
+
+        with pytest.raises(ClientError) as exc:
+            rg.ungroup_resources(Group=name, ResourceArns=[remove, malformed])
+
+        assert exc.value.response["Error"]["Code"] == "BadRequestException"
+        listed = rg.list_group_resources(GroupName=name)["ResourceIdentifiers"]
+        assert [resource["ResourceArn"] for resource in listed] == [keep, remove]
     finally:
         rg.delete_group(Group=name)
 

@@ -31,6 +31,38 @@ def test_firehose_create_and_describe(fh):
     assert "ExtendedS3DestinationDescription" in desc["Destinations"][0]
     assert desc["VersionId"] == "1"
 
+
+@pytest.mark.parametrize(
+    "config_key",
+    ("ExtendedS3DestinationConfiguration", "S3DestinationConfiguration"),
+)
+@pytest.mark.parametrize(
+    "bucket_arn",
+    (
+        "not-an-arn",
+        "arn:aws:sns:us-east-1:000000000000:topic-name",
+        "arn:aws:s3:us-east-1::my-bucket",
+        "arn:aws:s3::000000000000:my-bucket",
+        "arn:aws:s3:::my-bucket/path/to/object",
+        "arn:aws:s3:::my-bucket:extra",
+        "arn:aws:s3:::bad*bucket",
+    ),
+)
+def test_firehose_rejects_invalid_s3_bucket_arns(fh, config_key, bucket_arn):
+    with pytest.raises(ClientError) as exc:
+        fh.create_delivery_stream(
+            DeliveryStreamName=f"intg-fh-bad-bucket-arn-{_uuid_mod.uuid4().hex[:8]}",
+            DeliveryStreamType="DirectPut",
+            **{
+                config_key: {
+                    "BucketARN": bucket_arn,
+                    "RoleARN": "arn:aws:iam::000000000000:role/firehose-role",
+                },
+            },
+        )
+    assert exc.value.response["Error"]["Code"] == "InvalidArgumentException"
+
+
 def test_firehose_list_streams(fh):
     fh.create_delivery_stream(DeliveryStreamName="intg-fh-list-a", DeliveryStreamType="DirectPut")
     fh.create_delivery_stream(DeliveryStreamName="intg-fh-list-b", DeliveryStreamType="DirectPut")
@@ -300,6 +332,37 @@ def test_firehose_update_destination_version_mismatch(fh):
         )
     assert exc.value.response["Error"]["Code"] == "ConcurrentModificationException"
 
+
+def test_firehose_update_destination_rejects_invalid_s3_bucket_arn(fh):
+    name = f"qa-fh-update-bad-bucket-arn-{_uuid_mod.uuid4().hex[:8]}"
+    fh.create_delivery_stream(
+        DeliveryStreamName=name,
+        ExtendedS3DestinationConfiguration={
+            "BucketARN": "arn:aws:s3:::qa-fh-bucket3",
+            "RoleARN": "arn:aws:iam::000000000000:role/r",
+        },
+    )
+    desc = fh.describe_delivery_stream(DeliveryStreamName=name)["DeliveryStreamDescription"]
+    dest_id = desc["Destinations"][0]["DestinationId"]
+    version_id = desc["VersionId"]
+
+    with pytest.raises(ClientError) as exc:
+        fh.update_destination(
+            DeliveryStreamName=name,
+            CurrentDeliveryStreamVersionId=version_id,
+            DestinationId=dest_id,
+            ExtendedS3DestinationUpdate={
+                "BucketARN": "arn:aws:s3:::qa-fh-bucket3/object",
+            },
+        )
+
+    assert exc.value.response["Error"]["Code"] == "InvalidArgumentException"
+    after = fh.describe_delivery_stream(DeliveryStreamName=name)["DeliveryStreamDescription"]
+    s3 = after["Destinations"][0]["ExtendedS3DestinationDescription"]
+    assert after["VersionId"] == version_id
+    assert s3["BucketARN"] == "arn:aws:s3:::qa-fh-bucket3"
+
+
 def test_firehose_s3_destination_writes(s3, fh):
     """PutRecord with S3 destination actually writes data to the S3 bucket."""
     import base64
@@ -337,7 +400,9 @@ def test_firehose_describe_nonexistent_carries_errortype(fh):
 def test_firehose_kinesis_stream_as_source_fans_out_to_s3(fh, kin, s3):
     """KinesisStreamAsSource: records put into the source Kinesis stream
     must reach the configured S3 destination. Issue #744."""
-    import base64 as _b64, time as _time, uuid as _uuid
+    import time as _time
+    import uuid as _uuid
+
     stream_name = f"src-stream-{_uuid.uuid4().hex[:8]}"
     delivery_name = f"fh-{_uuid.uuid4().hex[:8]}"
     bucket = f"fh-src-bucket-{_uuid.uuid4().hex[:8]}"
@@ -381,10 +446,14 @@ def test_firehose_kinesis_stream_as_source_fans_out_to_s3(fh, kin, s3):
         )
         assert bodies == [b'{"a":1}', b'{"a":2}', b'{"a":3}']
     finally:
-        try: fh.delete_delivery_stream(DeliveryStreamName=delivery_name)
-        except Exception: pass
-        try: kin.delete_stream(StreamName=stream_name)
-        except Exception: pass
+        try:
+            fh.delete_delivery_stream(DeliveryStreamName=delivery_name)
+        except Exception:
+            pass
+        try:
+            kin.delete_stream(StreamName=stream_name)
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------

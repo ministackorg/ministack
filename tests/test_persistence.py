@@ -34,6 +34,231 @@ def _module(mod_name):
     return importlib.import_module(f"ministack.services.{mod_name}")
 
 
+def test_account_region_scoped_dict_isolates_account_and_region():
+    """Account+region scoped stores keep same-name resources independent."""
+    from ministack.core.responses import (
+        AccountRegionScopedDict,
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+
+    original_account = get_account_id()
+    original_region = get_region()
+
+    try:
+        store = AccountRegionScopedDict()
+        set_request_account_id("111111111111")
+        set_request_region("us-east-1")
+        store["same-name"] = {"scope": "111/east"}
+
+        set_request_region("us-west-2")
+        store["same-name"] = {"scope": "111/west"}
+
+        set_request_account_id("222222222222")
+        set_request_region("us-east-1")
+        store["same-name"] = {"scope": "222/east"}
+
+        assert len(store) == 1
+        assert store["same-name"] == {"scope": "222/east"}
+
+        set_request_account_id("111111111111")
+        assert store["same-name"] == {"scope": "111/east"}
+        set_request_region("us-west-2")
+        assert store["same-name"] == {"scope": "111/west"}
+    finally:
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
+def test_account_region_scoped_dict_persistence_round_trip(monkeypatch, tmp_path):
+    """Account+region scoped stores must survive the JSON persistence path."""
+    from ministack.core.responses import (
+        AccountRegionScopedDict,
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+
+    original_account = get_account_id()
+    original_region = get_region()
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+
+    try:
+        store = AccountRegionScopedDict()
+        set_request_account_id("111111111111")
+        set_request_region("us-east-1")
+        store["same-name"] = {"region": "us-east-1"}
+        store[("compound", "key")] = {"region": "us-east-1"}
+        set_request_region("us-west-2")
+        store["same-name"] = {"region": "us-west-2"}
+
+        persistence.save_state("account-region-scoped", {"store": store})
+        loaded = persistence.load_state("account-region-scoped")
+        assert loaded is not None
+
+        restored = loaded["store"]
+        set_request_region("us-east-1")
+        assert restored["same-name"] == {"region": "us-east-1"}
+        assert restored[("compound", "key")] == {"region": "us-east-1"}
+        set_request_region("us-west-2")
+        assert restored["same-name"] == {"region": "us-west-2"}
+    finally:
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
+def test_account_region_scoped_dict_adopts_legacy_values_to_arn_region():
+    """Legacy account-scoped stores should migrate into the region in the value ARN."""
+    from ministack.core.responses import (
+        AccountRegionScopedDict,
+        AccountScopedDict,
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+
+    original_account = get_account_id()
+    original_region = get_region()
+
+    try:
+        legacy = AccountScopedDict()
+        legacy._data[("111111111111", "west-sm")] = {
+            "stateMachineArn": "arn:aws:states:us-west-2:111111111111:stateMachine:west-sm",
+        }
+        legacy._data[("111111111111", "no-arn")] = {"name": "no-arn"}
+
+        restored = AccountRegionScopedDict()
+        set_request_account_id("111111111111")
+        set_request_region("us-east-1")
+        restored.update(legacy)
+
+        assert restored.get_scoped("111111111111", "us-west-2", "west-sm") == {
+            "stateMachineArn": "arn:aws:states:us-west-2:111111111111:stateMachine:west-sm",
+        }
+        assert restored.get_scoped("111111111111", "us-east-1", "west-sm") is None
+        assert restored.get_scoped("111111111111", "us-east-1", "no-arn") == {"name": "no-arn"}
+    finally:
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
+def test_account_region_scoped_dict_update_preserves_tuple_resource_keys():
+    """Plain dict updates should treat tuple keys as normal resource keys."""
+    from ministack.core.responses import (
+        AccountRegionScopedDict,
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+
+    original_account = get_account_id()
+    original_region = get_region()
+
+    try:
+        store = AccountRegionScopedDict()
+        set_request_account_id("111111111111")
+        set_request_region("us-east-1")
+        store.update({("bucket", "object-key"): {"value": "east"}})
+
+        assert store[("bucket", "object-key")] == {"value": "east"}
+        assert store.get_scoped("111111111111", "us-east-1", ("bucket", "object-key")) == {"value": "east"}
+        assert store.get_scoped("bucket", "us-east-1", "object-key") is None
+    finally:
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
+def test_account_region_scoped_dict_update_adopts_plain_values_to_arn_region():
+    """Plain legacy dict restores should use the resource ARN region when present."""
+    from ministack.core.responses import (
+        AccountRegionScopedDict,
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+
+    original_account = get_account_id()
+    original_region = get_region()
+
+    try:
+        store = AccountRegionScopedDict()
+        set_request_account_id("111111111111")
+        set_request_region("us-east-1")
+        store.update({
+            "west-sm": {
+                "stateMachineArn": "arn:aws:states:us-west-2:111111111111:stateMachine:west-sm",
+            },
+        })
+
+        assert store.get_scoped("111111111111", "us-west-2", "west-sm") == {
+            "stateMachineArn": "arn:aws:states:us-west-2:111111111111:stateMachine:west-sm",
+        }
+        assert store.get_scoped("111111111111", "us-east-1", "west-sm") is None
+    finally:
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
+def test_account_region_scoped_dict_update_prefers_key_arn_region():
+    """Legacy ARN-keyed stores should not be scoped by unrelated value ARNs."""
+    from ministack.core.responses import (
+        AccountRegionScopedDict,
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+
+    original_account = get_account_id()
+    original_region = get_region()
+    east_arn = "arn:aws:states:us-east-1:111111111111:stateMachine:east-sm"
+    west_role_arn = "arn:aws:iam:us-west-2:111111111111:role/west-role"
+
+    try:
+        store = AccountRegionScopedDict()
+        set_request_account_id("111111111111")
+        set_request_region("us-west-2")
+        store.update({east_arn: {"RoleArn": west_role_arn}})
+
+        assert store.get_scoped("111111111111", "us-east-1", east_arn) == {"RoleArn": west_role_arn}
+        assert store.get_scoped("111111111111", "us-west-2", east_arn) is None
+    finally:
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
+def test_account_scoped_dict_helpers_remain_account_only():
+    """Scoped helper methods on AccountScopedDict continue to ignore region."""
+    from ministack.core.responses import (
+        AccountScopedDict,
+        get_account_id,
+        set_request_account_id,
+    )
+
+    original_account = get_account_id()
+
+    try:
+        store = AccountScopedDict()
+        store.set_scoped("111111111111", "us-west-2", "same-name", {"value": "helper"})
+        set_request_account_id("111111111111")
+
+        assert store["same-name"] == {"value": "helper"}
+        store["normal"] = {"value": "normal"}
+        assert store.get_scoped("111111111111", "us-east-1", "normal") == {"value": "normal"}
+        assert store.contains_scoped("111111111111", "us-west-2", "normal")
+        assert store.pop_scoped("111111111111", "us-west-2", "normal") == {"value": "normal"}
+        assert "normal" not in store
+    finally:
+        set_request_account_id(original_account)
+
+
 @pytest.mark.parametrize("svc_key,mod_name", ALL_PERSISTED_SERVICES)
 def test_service_has_restore_path(svc_key, mod_name):
     """Every service in `_state_map` must expose a way to restore its own state.
@@ -724,3 +949,57 @@ def test_module_cold_import_with_typical_snapshot_does_not_log_restore_failure(
         "the import-time `load_state` block (see ECS `_attributes` "
         "or ACM `_synthetic_pem` for the canonical fix)."
     )
+
+
+def test_legacy_unwrapped_state_file_loads_and_migrates_region(monkeypatch, tmp_path):
+    """U4: a pre-version-stamp on-disk file (no wrapper, account-scoped) must
+    load through the real load_state() disk path and migrate into a region-
+    scoped store, recovering region from a value ARN. Prior tests only seeded
+    dicts in memory, so this disk->migrate path was never exercised."""
+    import json as _json
+
+    from ministack.core.responses import (
+        AccountRegionScopedDict,
+        AccountScopedDict,
+        set_request_region,
+    )
+
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+
+    legacy = AccountScopedDict()
+    legacy._data[("000000000000", "res-1")] = {
+        "Arn": "arn:aws:appconfig:eu-west-1:000000000000:application/res-1",
+    }
+    # Write a legacy (unwrapped, implicit-v1) file exactly as old MiniStack did.
+    with open(tmp_path / "demo.json", "w") as f:
+        _json.dump({"store": legacy}, f, default=persistence._json_default)
+
+    loaded = persistence.load_state("demo")
+    assert isinstance(loaded["store"], AccountScopedDict)
+
+    region_store = AccountRegionScopedDict()
+    region_store.update(loaded["store"])
+    set_request_region("eu-west-1")
+    assert region_store["res-1"]["Arn"].startswith("arn:aws:appconfig:eu-west-1")
+
+
+def test_state_format_version_stamp_round_trips_and_refuses_newer(monkeypatch, tmp_path):
+    """U4: save_state stamps the on-disk format version and load_state unwraps
+    it; a file written by a NEWER binary is refused rather than mis-parsed."""
+    import json as _json
+
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+
+    persistence.save_state("ver", {"k": "v"})
+    raw = _json.loads((tmp_path / "ver.json").read_text())
+    assert raw["__ministack_format__"] == persistence.STATE_FORMAT_VERSION
+    assert raw["payload"] == {"k": "v"}
+    assert persistence.load_state("ver") == {"k": "v"}
+
+    (tmp_path / "future.json").write_text(_json.dumps({
+        "__ministack_format__": persistence.STATE_FORMAT_VERSION + 1,
+        "payload": {"k": "v"},
+    }))
+    assert persistence.load_state("future") is None

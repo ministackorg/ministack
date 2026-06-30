@@ -32,6 +32,7 @@ import threading
 import time
 from datetime import datetime, timedelta, timezone
 
+from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.responses import (
     AccountScopedDict,
     error_response_json,
@@ -40,11 +41,36 @@ from ministack.core.responses import (
     json_response,
     new_uuid,
     set_request_account_id,
+    set_request_region,
 )
 
 logger = logging.getLogger("events")
 
 REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
+_SUPPORTED_TARGET_SERVICES = {
+    "appsync",
+    "batch",
+    "codebuild",
+    "codepipeline",
+    "ecs",
+    "events",
+    "execute-api",
+    "firehose",
+    "glue",
+    "imagebuilder",
+    "inspector",
+    "kinesis",
+    "lambda",
+    "logs",
+    "redshift",
+    "redshift-serverless",
+    "sagemaker",
+    "sns",
+    "sqs",
+    "ssm",
+    "ssm-incidents",
+    "states",
+}
 
 
 def _now_ts() -> float:
@@ -582,6 +608,11 @@ def _put_targets(data):
     if key not in _rules:
         return error_response_json("ResourceNotFoundException", f"Rule {rule_name} does not exist.", 400)
 
+    for target in targets:
+        error = _validate_target_arn(target)
+        if error:
+            return error
+
     if key not in _targets:
         _targets[key] = []
     existing_ids = {t["Id"] for t in _targets[key]}
@@ -590,6 +621,35 @@ def _put_targets(data):
             _targets[key] = [x for x in _targets[key] if x["Id"] != t["Id"]]
         _targets[key].append(t)
     return json_response({"FailedEntryCount": 0, "FailedEntries": []})
+
+
+def _validate_target_arn(target):
+    arn = target.get("Arn", "")
+    try:
+        spec = parse_arn(arn)
+    except ArnParseError:
+        return error_response_json(
+            "ValidationException",
+            f"Parameter {arn} is not valid. Reason: Provided Arn is not in correct format.",
+            400,
+        )
+
+    if spec.service not in _SUPPORTED_TARGET_SERVICES:
+        return error_response_json(
+            "ValidationException",
+            f"{spec.service} is not a supported service for a target.",
+            400,
+        )
+
+    if (
+        spec.service == "events"
+        and spec.resource.startswith("event-bus/")
+        and (spec.account_id != get_account_id() or spec.region != get_region())
+        and not target.get("RoleArn")
+    ):
+        return error_response_json("ValidationException", "RoleArn is required", 400)
+
+    return None
 
 
 def _remove_targets(data):
@@ -683,10 +743,117 @@ def _test_event_pattern(data):
 # PutEvents + event pattern matching + target dispatch
 # ---------------------------------------------------------------------------
 
-def _normalize_bus_name(name):
-    if name and name.startswith("arn:"):
-        return name.split("/")[-1]
-    return name
+def _events_resource_name_from_ref(value, prefix, label):
+    if not value or not value.startswith("arn:"):
+        return value, None
+    try:
+        spec = parse_arn(value)
+    except ArnParseError:
+        return "", (
+            "ValidationException",
+            f"Parameter {label} is not valid. Reason: Provided Arn is not in correct format.",
+        )
+    if spec.service != "events" or not spec.resource.startswith(prefix):
+        return "", (
+            "ValidationException",
+            f"Parameter {label} is not valid. Reason: Provided Arn is not an EventBridge {label}.",
+        )
+    if spec.account_id != get_account_id() or spec.region != get_region():
+        return "", (
+            "ResourceNotFoundException",
+            f"EventBridge {label} {value} does not exist.",
+        )
+    return spec.resource.split("/", 1)[1], None
+
+
+def _event_bus_name_from_ref(name):
+    return _events_resource_name_from_ref(name, "event-bus/", "EventBusName")
+
+
+def _archive_name_from_ref(source_arn):
+    if not source_arn or not source_arn.startswith("arn:"):
+        return "", (
+            "ValidationException",
+            "Parameter EventSourceArn is not valid. Reason: Provided Arn is not in correct format.",
+        )
+    return _events_resource_name_from_ref(source_arn, "archive/", "EventSourceArn")
+
+
+def _resolve_taggable_events_arn(arn):
+    try:
+        spec = parse_arn(arn)
+    except ArnParseError:
+        return None, error_response_json(
+            "ValidationException",
+            "Parameter ResourceARN is not valid. Reason: Provided Arn is not in correct format.",
+            400,
+        )
+
+    if spec.partition != "aws" or spec.service != "events":
+        return None, error_response_json(
+            "ValidationException",
+            "Parameter ResourceARN is not valid. Reason: Provided Arn is not an EventBridge ResourceARN.",
+            400,
+        )
+    if spec.region != get_region() or spec.account_id != get_account_id():
+        return None, error_response_json(
+            "ResourceNotFoundException",
+            f"EventBridge resource {arn} does not exist.",
+            400,
+        )
+
+    resource = spec.resource
+    if resource.startswith("event-bus/"):
+        name = resource.split("/", 1)[1]
+        if name == "default":
+            exists = arn == f"arn:aws:events:{get_region()}:{get_account_id()}:event-bus/default"
+        else:
+            record = _event_buses.get(name)
+            exists = bool(record) and record.get("Arn") == arn
+    elif resource.startswith("rule/"):
+        parts = resource.split("/")
+        if len(parts) == 2:
+            bus, rule = "default", parts[1]
+        elif len(parts) == 3:
+            _, bus, rule = parts
+        else:
+            bus, rule = "", ""
+        record = _rules.get(_rule_key(rule, bus)) if rule else None
+        exists = bool(record) and record.get("Arn") == arn
+    elif resource.startswith("archive/"):
+        name = resource.split("/", 1)[1]
+        record = _archives.get(name)
+        exists = bool(record) and record.get("ArchiveArn") == arn
+    elif resource.startswith("replay/"):
+        name = resource.split("/", 1)[1]
+        record = _replays.get(name)
+        exists = bool(record) and record.get("ReplayArn") == arn
+    elif resource.startswith("endpoint/"):
+        name = resource.split("/", 1)[1]
+        record = _endpoints.get(name)
+        exists = bool(record) and record.get("Arn") == arn
+    elif resource.startswith("connection/"):
+        name = resource.split("/", 1)[1]
+        record = _connections.get(name)
+        exists = bool(record) and record.get("ConnectionArn") == arn
+    elif resource.startswith("api-destination/"):
+        name = resource.split("/", 1)[1]
+        record = _api_destinations.get(name)
+        exists = bool(record) and record.get("ApiDestinationArn") == arn
+    else:
+        return None, error_response_json(
+            "ValidationException",
+            "Parameter ResourceARN is not valid. Reason: Provided Arn is not a taggable EventBridge resource.",
+            400,
+        )
+
+    if not exists:
+        return None, error_response_json(
+            "ResourceNotFoundException",
+            f"EventBridge resource {arn} does not exist.",
+            400,
+        )
+    return arn, None
 
 
 def _put_events(data):
@@ -701,9 +868,15 @@ def _put_events(data):
             400,
         )
     results = []
+    failed = 0
     for entry in entries:
         event_id = new_uuid()
-        bus_name = _normalize_bus_name(entry.get("EventBusName", "default"))
+        bus_name, bus_error = _event_bus_name_from_ref(entry.get("EventBusName", "default"))
+        if bus_error:
+            code, message = bus_error
+            results.append({"ErrorCode": code, "ErrorMessage": message})
+            failed += 1
+            continue
         # AWS Time is a timestamp shape; ministack convention is int epoch seconds
         # (Java SDK v2 chokes on floats). Persisted in the event_record so
         # archive replay also dispatches the int form.
@@ -727,7 +900,7 @@ def _put_events(data):
         _dispatch_event(event_record)
         _archive_event(event_record)
 
-    return json_response({"FailedEntryCount": 0, "Entries": results})
+    return json_response({"FailedEntryCount": failed, "Entries": results})
 
 
 def _archive_event(event):
@@ -745,9 +918,13 @@ def _archive_event(event):
 
 def _dispatch_event(event):
     bus_name = event.get("EventBusName", "default")
+    event_path = set(event.get("_DispatchPath") or [])
 
     for key, rule in _rules.items():
         if rule.get("EventBusName", "default") != bus_name:
+            continue
+        if key in event_path:
+            logger.warning("EventBridge: recursive rule dispatch skipped for %s", key)
             continue
         if rule.get("State") != "ENABLED":
             continue
@@ -909,6 +1086,7 @@ def _matches_content_filter(value, filter_rule):
 
 def _invoke_target(target, event, rule):
     arn = target.get("Arn", "")
+    event_path = set(event.get("_DispatchPath") or [])
 
     raw_time = event["Time"]
     if isinstance(raw_time, (int, float)):
@@ -928,11 +1106,14 @@ def _invoke_target(target, event, rule):
         "detail": json.loads(event["Detail"]) if isinstance(event["Detail"], str) else event["Detail"],
     })
 
+    target_input_payload = None
     input_transformer = target.get("InputTransformer")
     if input_transformer:
         event_payload = _apply_input_transformer(input_transformer, event, rule)
+        target_input_payload = event_payload
     elif target.get("Input"):
         event_payload = target["Input"]
+        target_input_payload = event_payload
     elif target.get("InputPath"):
         try:
             full = json.loads(event_payload)
@@ -942,22 +1123,67 @@ def _invoke_target(target, event, rule):
                 if p:
                     val = val[p]
             event_payload = json.dumps(val)
+            target_input_payload = event_payload
         except Exception:
             pass
 
     try:
-        if ":lambda:" in arn or ":function:" in arn:
-            _dispatch_to_lambda(arn, event_payload)
-        elif ":sqs:" in arn:
-            _dispatch_to_sqs(arn, event_payload, target.get("SqsParameters") or {})
-        elif ":sns:" in arn:
-            _dispatch_to_sns(arn, event_payload)
-        elif ":states:" in arn:
+        try:
+            spec = parse_arn(arn)
+        except ArnParseError:
+            logger.warning("EventBridge: invalid target ARN %s", arn)
+            return
+
+        if spec.service == "events":
+            _dispatch_to_event_bus(spec, event, rule, event_path, target_input_payload)
+        elif spec.service == "states":
             _dispatch_to_stepfunctions(arn, event_payload)
+        elif not _target_matches_request_scope(spec):
+            logger.warning("EventBridge: target %s is outside the current account/region scope", arn)
+        elif spec.service == "lambda":
+            _dispatch_to_lambda(arn, event_payload)
+        elif spec.service == "sqs":
+            _dispatch_to_sqs(spec, event_payload, target.get("SqsParameters") or {})
+        elif spec.service == "sns":
+            _dispatch_to_sns(arn, event_payload)
         else:
             logger.warning("EventBridge: unsupported target type for ARN %s", arn)
     except Exception as e:
         logger.error("EventBridge target dispatch error for %s: %s", arn, e)
+
+
+def _target_matches_request_scope(spec) -> bool:
+    return spec.account_id == get_account_id() and spec.region == get_region()
+
+
+def _dispatch_to_event_bus(spec, event, rule, event_path, target_input_payload=None):
+    if spec.service != "events" or not spec.resource.startswith("event-bus/"):
+        logger.warning("EventBridge -> Event bus: unsupported event target ARN %s", spec)
+        return
+
+    if spec.account_id != get_account_id() or spec.region != get_region():
+        logger.warning("EventBridge -> Event bus: event bus %s not found", spec)
+        return
+
+    bus_name = spec.resource.split("/", 1)[1]
+    if bus_name not in _event_buses:
+        logger.warning("EventBridge -> Event bus: event bus %s not found", spec)
+        return
+    source_rule_key = _rule_key(rule.get("Name"), rule.get("EventBusName", "default"))
+    if source_rule_key in event_path:
+        logger.warning("EventBridge -> Event bus: recursive target dispatch skipped for %s", spec)
+        return
+    forwarded = dict(event)
+    forwarded["EventBusName"] = bus_name
+    forwarded["Region"] = spec.region
+    forwarded["_DispatchPath"] = [*event_path, source_rule_key]
+    if target_input_payload is not None:
+        forwarded["Detail"] = target_input_payload
+    _dispatch_event(forwarded)
+    archived = dict(forwarded)
+    archived.pop("_DispatchPath", None)
+    _archive_event(archived)
+    logger.info("EventBridge -> Event bus %s: dispatched", spec)
 
 
 def _apply_input_transformer(transformer, event, rule=None):
@@ -1020,27 +1246,23 @@ def _apply_input_transformer(transformer, event, rule=None):
 def _dispatch_to_lambda(arn, payload):
     from ministack.services import lambda_svc
 
-    parts = arn.split(":")
-    func_name = parts[-1].split("/")[-1] if "/" in parts[-1] else parts[-1]
-    if func_name.startswith("function:"):
-        func_name = func_name[len("function:"):]
-
     try:
         event = json.loads(payload)
     except (json.JSONDecodeError, TypeError):
         event = {"body": payload}
 
-    func = lambda_svc._functions.get(func_name)
-    if not func:
+    func, config, func_name = lambda_svc._get_func_record_for_ref(arn)
+    if not func or not config:
         logger.warning("EventBridge → Lambda: function %s not found", func_name)
         return
+    exec_record = lambda_svc._execution_record_for_config(func, config)
     threading.Thread(
-        target=lambda_svc._execute_function, args=(func, event), daemon=True
+        target=lambda_svc._execute_function_with_config_scope, args=(exec_record, event), daemon=True
     ).start()
     logger.info("EventBridge → Lambda %s: dispatched", func_name)
 
 
-def _dispatch_to_sqs(arn, payload, sqs_parameters=None):
+def _dispatch_to_sqs(spec, payload, sqs_parameters=None):
     """Dispatch an EventBridge event to an SQS queue.
 
     ``sqs_parameters`` carries the target's ``SqsParameters`` block from the
@@ -1052,9 +1274,8 @@ def _dispatch_to_sqs(arn, payload, sqs_parameters=None):
     """
     from ministack.services import sqs as _sqs
 
-    queue_name = arn.split(":")[-1]
-    queue_url = _sqs._queue_url(queue_name)
-    queue = _sqs._queues.get(queue_url)
+    queue_name = spec.resource
+    queue = _sqs._queue_by_arn(str(spec))
     if not queue:
         logger.warning("EventBridge → SQS: queue %s not found", queue_name)
         return
@@ -1145,6 +1366,9 @@ def _dispatch_to_stepfunctions(arn, payload):
 
 def _tag_resource(data):
     arn = data.get("ResourceARN", "")
+    arn, err = _resolve_taggable_events_arn(arn)
+    if err:
+        return err
     tags = data.get("Tags", [])
     if arn not in _tags:
         _tags[arn] = {}
@@ -1155,6 +1379,9 @@ def _tag_resource(data):
 
 def _untag_resource(data):
     arn = data.get("ResourceARN", "")
+    arn, err = _resolve_taggable_events_arn(arn)
+    if err:
+        return err
     keys = data.get("TagKeys", [])
     if arn in _tags:
         for k in keys:
@@ -1164,6 +1391,9 @@ def _untag_resource(data):
 
 def _list_tags_for_resource(data):
     arn = data.get("ResourceARN", "")
+    arn, err = _resolve_taggable_events_arn(arn)
+    if err:
+        return err
     tag_dict = _tags.get(arn, {})
     tag_list = [{"Key": k, "Value": v} for k, v in tag_dict.items()]
     return json_response({"Tags": tag_list})
@@ -1285,13 +1515,25 @@ def _start_replay(data):
         )
 
     source_arn = data.get("EventSourceArn", "")
-    # source_arn format: arn:aws:events:{region}:{account}:archive/{name}
-    archive_name = source_arn.split("/")[-1] if "/" in source_arn else ""
+    archive_name, source_error = _archive_name_from_ref(source_arn)
+    if source_error:
+        code, message = source_error
+        return error_response_json(code, message, 400)
     archive = _archives.get(archive_name)
     if not archive:
         return error_response_json(
             "ResourceNotFoundException",
             f"Archive {archive_name} does not exist.",
+            400,
+        )
+    dest_bus_name, dest_error = _event_bus_name_from_ref(dest.get("Arn", ""))
+    if dest_error:
+        code, message = dest_error
+        return error_response_json(code, message, 400)
+    if dest.get("Arn") != archive.get("EventSourceArn"):
+        return error_response_json(
+            "ValidationException",
+            "Destination.Arn must match the archive event source.",
             400,
         )
 
@@ -1311,8 +1553,6 @@ def _start_replay(data):
         "ReplayStartTime": now,
     }
     _replays[name] = replay
-
-    dest_bus_name = _normalize_bus_name(dest.get("Arn", ""))
 
     def _run():
         replay["State"] = "RUNNING"
@@ -2179,28 +2419,54 @@ def _tick_scheduled_rules():
         targets = _targets._data.get((account_id, rule_key), [])
         if not targets:
             continue
-        # Set the account context so ARN-building and Lambda dispatch use the
-        # correct account for this rule's tenant.
+        try:
+            rule_arn = parse_arn(rule.get("Arn", ""))
+        except ArnParseError:
+            logger.warning(
+                "EventBridge scheduler: skipping rule %s with malformed ARN %s",
+                rule_key,
+                rule.get("Arn", ""),
+            )
+            continue
+        if (
+            rule_arn.service != "events"
+            or not rule_arn.region
+            or rule_arn.account_id != account_id
+            or not rule_arn.resource.startswith("rule/")
+        ):
+            logger.warning(
+                "EventBridge scheduler: skipping rule %s with out-of-scope ARN %s",
+                rule_key,
+                rule.get("Arn", ""),
+            )
+            continue
+        previous_account = get_account_id()
+        previous_region = get_region()
         set_request_account_id(account_id)
-        event = {
-            "EventId": new_uuid(),
-            "Source": "aws.events",
-            "DetailType": "Scheduled Event",
-            "Detail": "{}",
-            "EventBusName": rule.get("EventBusName", "default"),
-            "Time": now,
-            "Resources": [rule.get("Arn", "")],
-            "Account": account_id,
-            "Region": get_region(),
-        }
-        for target in targets:
-            try:
-                _invoke_target(target, event, rule)
-            except Exception:
-                logger.exception(
-                    "EventBridge scheduler: dispatch error for rule %s account %s",
-                    rule_key, account_id,
-                )
+        set_request_region(rule_arn.region)
+        try:
+            event = {
+                "EventId": new_uuid(),
+                "Source": "aws.events",
+                "DetailType": "Scheduled Event",
+                "Detail": "{}",
+                "EventBusName": rule.get("EventBusName", "default"),
+                "Time": now,
+                "Resources": [rule.get("Arn", "")],
+                "Account": account_id,
+                "Region": get_region(),
+            }
+            for target in targets:
+                try:
+                    _invoke_target(target, event, rule)
+                except Exception:
+                    logger.exception(
+                        "EventBridge scheduler: dispatch error for rule %s account %s",
+                        rule_key, account_id,
+                    )
+        finally:
+            set_request_account_id(previous_account)
+            set_request_region(previous_region)
 
 
 def _scheduler_loop():

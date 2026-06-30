@@ -253,6 +253,153 @@ def test_re_import_preserves_arn_and_replaces_body(acm_client):
     assert got["Certificate"] == new_cert.decode()
 
 
+@pytest.fixture
+def acm_service_module():
+    import importlib
+
+    from ministack.core.responses import _request_account_id, _request_region
+
+    mod = importlib.import_module("ministack.services.acm")
+    mod._certificates._data.clear()
+    account_token = _request_account_id.set("000000000000")
+    region_token = _request_region.set("us-east-1")
+    try:
+        yield mod
+    finally:
+        mod._certificates._data.clear()
+        _request_region.reset(region_token)
+        _request_account_id.reset(account_token)
+
+
+def _json_body(response):
+    return json.loads(response[2].decode())
+
+
+def _error_code(response):
+    return _json_body(response)["__type"]
+
+
+@pytest.mark.parametrize(
+    "bad_arn",
+    [
+        "arn:nope",
+        "arn:aws-cn:acm:us-east-1:000000000000:certificate/wrong-partition",
+        "arn:aws:sns:us-east-1:000000000000:certificate/not-acm",
+        "arn:aws:acm:us-east-1:111111111111:certificate/wrong-account",
+        "arn:aws:acm:us-west-2:000000000000:certificate/wrong-region",
+        "arn:aws:acm:us-east-1:000000000000:not-a-certificate/not-acm-resource",
+    ],
+)
+def test_acm_certificate_arn_operations_reject_out_of_scope_arns(acm_service_module, bad_arn):
+    mod = acm_service_module
+    created = _json_body(mod._request_certificate({"DomainName": "parser-scope.example.com"}))
+    good_arn = created["CertificateArn"]
+
+    for handler in (
+        mod._describe_certificate,
+        mod._get_certificate,
+        mod._list_tags,
+        mod._renew_certificate,
+        mod._resend_validation_email,
+    ):
+        resp = handler({"CertificateArn": bad_arn})
+        assert resp[0] == 400
+        assert _error_code(resp) == "ResourceNotFoundException"
+
+    for handler, payload in (
+        (mod._add_tags, {"CertificateArn": bad_arn, "Tags": [{"Key": "bad", "Value": "tag"}]}),
+        (mod._remove_tags, {"CertificateArn": bad_arn, "Tags": [{"Key": "keep"}]}),
+        (
+            mod._update_options,
+            {
+                "CertificateArn": bad_arn,
+                "Options": {"CertificateTransparencyLoggingPreference": "DISABLED"},
+            },
+        ),
+        (mod._delete_certificate, {"CertificateArn": bad_arn}),
+    ):
+        resp = handler(payload)
+        assert resp[0] == 400
+        assert _error_code(resp) == "ResourceNotFoundException"
+
+    cert = _json_body(mod._describe_certificate({"CertificateArn": good_arn}))["Certificate"]
+    assert cert["CertificateArn"] == good_arn
+    assert cert["Options"] == {}
+    assert cert["Tags"] == []
+
+
+@pytest.mark.parametrize(
+    "bad_arn",
+    [
+        "arn:nope",
+        "arn:aws-cn:acm:us-east-1:000000000000:certificate/wrong-partition",
+        "arn:aws:sns:us-east-1:000000000000:certificate/not-acm",
+        "arn:aws:acm:us-east-1:111111111111:certificate/wrong-account",
+        "arn:aws:acm:us-west-2:000000000000:certificate/wrong-region",
+    ],
+)
+def test_acm_import_certificate_rejects_out_of_scope_certificate_arn(acm_service_module, bad_arn):
+    mod = acm_service_module
+
+    resp = mod._import_certificate(
+        {
+            "CertificateArn": bad_arn,
+            "Certificate": TEST_CERT_PEM,
+            "PrivateKey": TEST_PRIVATE_KEY_PEM,
+            "Tags": [{"Key": "bad", "Value": "import"}],
+        }
+    )
+
+    assert resp[0] == 400
+    assert _error_code(resp) == "ResourceNotFoundException"
+    assert mod._certificates._data == {}
+
+
+def test_acm_valid_reimport_preserves_existing_certificate_arn(acm_service_module):
+    mod = acm_service_module
+    created = _json_body(
+        mod._import_certificate(
+            {
+                "Certificate": TEST_CERT_PEM,
+                "PrivateKey": TEST_PRIVATE_KEY_PEM,
+            }
+        )
+    )
+    arn = created["CertificateArn"]
+
+    new_cert = TEST_CERT_PEM.replace(b"RoundTripTestCert", b"ParserAdoptedCert")
+    resp = mod._import_certificate(
+        {
+            "CertificateArn": arn,
+            "Certificate": new_cert,
+            "PrivateKey": TEST_PRIVATE_KEY_PEM,
+        }
+    )
+
+    assert resp[0] == 200
+    assert _json_body(resp)["CertificateArn"] == arn
+    assert _json_body(mod._get_certificate({"CertificateArn": arn}))["Certificate"] == new_cert.decode()
+
+
+def test_acm_list_certificates_filters_to_request_region(acm_service_module):
+    from ministack.core.responses import _request_region
+
+    mod = acm_service_module
+    east_arn = _json_body(mod._request_certificate({"DomainName": "east-list.example.com"}))["CertificateArn"]
+
+    west_token = _request_region.set("us-west-2")
+    try:
+        west_arn = _json_body(mod._request_certificate({"DomainName": "west-list.example.com"}))["CertificateArn"]
+        west_list = _json_body(mod._list_certificates({}))["CertificateSummaryList"]
+    finally:
+        _request_region.reset(west_token)
+
+    east_list = _json_body(mod._list_certificates({}))["CertificateSummaryList"]
+
+    assert [cert["CertificateArn"] for cert in west_list] == [west_arn]
+    assert [cert["CertificateArn"] for cert in east_list] == [east_arn]
+
+
 # ── PrivateKey persistence leak (in-process, not through the live server) ─
 
 def test_get_state_strips_private_key_from_persisted_snapshot():

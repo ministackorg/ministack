@@ -10,6 +10,22 @@ from urllib.parse import urlparse
 import pytest
 from botocore.exceptions import ClientError
 
+from ministack.services import ecs as ecs_service
+
+
+def _replace_arn_section(arn, index, value):
+    parts = arn.split(":", 5)
+    parts[index] = value
+    return ":".join(parts)
+
+
+def _different_region(region):
+    return "us-west-2" if region != "us-west-2" else "us-east-1"
+
+
+def _replace_arn_region(arn):
+    return _replace_arn_section(arn, 3, _different_region(arn.split(":", 5)[3]))
+
 
 def test_ecs_cluster(ecs):
     ecs.create_cluster(clusterName="test-cluster")
@@ -523,6 +539,277 @@ def test_ecs_capacity_provider(ecs):
     desc = ecs.describe_capacity_providers(capacityProviders=["test-cp"])
     assert any(cp["name"] == "test-cp" for cp in desc["capacityProviders"])
     ecs.delete_capacity_provider(capacityProvider="test-cp")
+
+
+def test_ecs_cluster_arn_parser_does_not_tail_resolve_invalid_arns(ecs):
+    resp = ecs.create_cluster(clusterName="ecs-arn-cluster")
+    cluster_arn = resp["cluster"]["clusterArn"]
+    valid = ecs.describe_clusters(clusters=[cluster_arn])
+    assert valid["clusters"][0]["clusterName"] == "ecs-arn-cluster"
+
+    wrong_service = _replace_arn_section(cluster_arn, 2, "lambda")
+    wrong_partition = _replace_arn_section(cluster_arn, 1, "aws-cn")
+    wrong_region = _replace_arn_region(cluster_arn)
+    wrong_account = _replace_arn_section(cluster_arn, 4, "111111111111")
+    wrong_resource = cluster_arn.replace(":cluster/", ":service/")
+    malformed_resource = f"{cluster_arn}/extra"
+    malformed = "arn:aws:ecs:us-east-1"
+
+    for ref in [wrong_service, wrong_partition, wrong_region, wrong_account, wrong_resource, malformed_resource, malformed]:
+        resp = ecs.describe_clusters(clusters=[ref])
+        assert resp["clusters"] == []
+        assert resp["failures"] == [{"arn": ref, "reason": "MISSING"}]
+
+
+def test_ecs_service_arn_parser_does_not_tail_resolve_invalid_arns(ecs):
+    cluster = "ecs-arn-service-cluster"
+    cluster_arn = ecs.create_cluster(clusterName=cluster)["cluster"]["clusterArn"]
+    ecs.register_task_definition(
+        family="ecs-arn-service-td",
+        containerDefinitions=[{"name": "app", "image": "nginx", "cpu": 64, "memory": 128}],
+    )
+    created = ecs.create_service(
+        cluster=cluster,
+        serviceName="ecs-arn-service",
+        taskDefinition="ecs-arn-service-td",
+        desiredCount=0,
+    )
+    service_arn = created["service"]["serviceArn"]
+    valid = ecs.describe_services(cluster=cluster, services=[service_arn])
+    assert valid["services"][0]["serviceName"] == "ecs-arn-service"
+    ecs.create_service(
+        cluster=cluster,
+        serviceName="None",
+        taskDefinition="ecs-arn-service-td",
+        desiredCount=0,
+    )
+    ecs.create_cluster(clusterName="None")
+    ecs.create_service(
+        cluster="None",
+        serviceName="ecs-arn-service",
+        taskDefinition="ecs-arn-service-td",
+        desiredCount=0,
+    )
+    other_cluster = "ecs-arn-other-service-cluster"
+    ecs.create_cluster(clusterName=other_cluster)
+    other_service = ecs.create_service(
+        cluster=other_cluster,
+        serviceName="ecs-arn-service",
+        taskDefinition="ecs-arn-service-td",
+        desiredCount=0,
+    )["service"]
+
+    wrong_service = _replace_arn_section(service_arn, 2, "lambda")
+    wrong_partition = _replace_arn_section(service_arn, 1, "aws-cn")
+    wrong_region = _replace_arn_region(service_arn)
+    wrong_account = _replace_arn_section(service_arn, 4, "111111111111")
+    wrong_resource = service_arn.replace(":service/", ":cluster/")
+    wrong_cluster_service = other_service["serviceArn"]
+    malformed_resource = service_arn.replace(f":service/{cluster}/", f":service/extra/{cluster}/")
+    malformed = "arn:aws:ecs:us-east-1"
+
+    for ref in [
+        wrong_service,
+        wrong_partition,
+        wrong_region,
+        wrong_account,
+        wrong_resource,
+        wrong_cluster_service,
+        malformed_resource,
+        malformed,
+    ]:
+        resp = ecs.describe_services(cluster=cluster, services=[ref])
+        assert resp["services"] == []
+        assert resp["failures"] == [{"arn": ref, "reason": "MISSING"}]
+
+    wrong_cluster = _replace_arn_region(cluster_arn)
+    with pytest.raises(ClientError) as exc:
+        ecs.describe_services(cluster=wrong_cluster, services=["ecs-arn-service"])
+    assert exc.value.response["Error"]["Code"] == "ClusterNotFoundException"
+
+    with pytest.raises(ClientError) as exc:
+        ecs.update_service(cluster=cluster, service=wrong_service, desiredCount=1)
+    assert exc.value.response["Error"]["Code"] == "ServiceNotFoundException"
+    none_service = ecs.describe_services(cluster=cluster, services=["None"])
+    assert none_service["services"][0]["desiredCount"] == 0
+
+    with pytest.raises(ClientError) as exc:
+        ecs.delete_service(cluster=cluster, service=wrong_service, force=True)
+    assert exc.value.response["Error"]["Code"] == "ServiceNotFoundException"
+    none_service = ecs.describe_services(cluster=cluster, services=["None"])
+    assert none_service["services"][0]["status"] == "ACTIVE"
+
+    with pytest.raises(ClientError) as exc:
+        ecs.update_service(cluster=cluster, service=wrong_cluster_service, desiredCount=1)
+    assert exc.value.response["Error"]["Code"] == "ServiceNotFoundException"
+    service = ecs.describe_services(cluster=cluster, services=["ecs-arn-service"])
+    assert service["services"][0]["desiredCount"] == 0
+
+    with pytest.raises(ClientError) as exc:
+        ecs.delete_service(cluster=cluster, service=wrong_cluster_service, force=True)
+    assert exc.value.response["Error"]["Code"] == "ServiceNotFoundException"
+    service = ecs.describe_services(cluster=cluster, services=["ecs-arn-service"])
+    assert service["services"][0]["status"] == "ACTIVE"
+
+
+def test_ecs_task_definition_arn_parser_does_not_tail_resolve_invalid_arns(ecs):
+    resp = ecs.register_task_definition(
+        family="ecs-arn-td",
+        containerDefinitions=[{"name": "app", "image": "nginx", "cpu": 64, "memory": 128}],
+    )
+    task_definition_arn = resp["taskDefinition"]["taskDefinitionArn"]
+    valid = ecs.describe_task_definition(taskDefinition=task_definition_arn)
+    assert valid["taskDefinition"]["family"] == "ecs-arn-td"
+
+    wrong_service = _replace_arn_section(task_definition_arn, 2, "lambda")
+    wrong_partition = _replace_arn_section(task_definition_arn, 1, "aws-cn")
+    wrong_region = _replace_arn_region(task_definition_arn)
+    wrong_account = _replace_arn_section(task_definition_arn, 4, "111111111111")
+    wrong_resource = task_definition_arn.replace(":task-definition/", ":cluster/")
+    malformed_resource = f"{task_definition_arn}/extra"
+    malformed = "arn:aws:ecs:us-east-1"
+
+    for ref in [wrong_service, wrong_partition, wrong_region, wrong_account, wrong_resource, malformed_resource, malformed]:
+        with pytest.raises(ClientError) as exc:
+            ecs.describe_task_definition(taskDefinition=ref)
+        assert exc.value.response["Error"]["Code"] == "ClientException"
+
+    delete_resp = ecs.delete_task_definitions(taskDefinitions=[wrong_service])
+    assert delete_resp["taskDefinitions"] == []
+    assert delete_resp["failures"] == [
+        {"arn": wrong_service, "reason": "TASK_DEFINITION_NOT_FOUND"},
+    ]
+    delete_resp = ecs.delete_task_definitions(taskDefinitions=["ecs-arn-td"])
+    assert delete_resp["taskDefinitions"] == []
+    assert delete_resp["failures"] == [
+        {"arn": "ecs-arn-td", "reason": "TASK_DEFINITION_NOT_FOUND"},
+    ]
+    valid = ecs.describe_task_definition(taskDefinition=task_definition_arn)
+    assert valid["taskDefinition"]["status"] == "ACTIVE"
+
+    cluster = "ecs-arn-td-service-cluster"
+    ecs.create_cluster(clusterName=cluster)
+    with pytest.raises(ClientError) as exc:
+        ecs.create_service(
+            cluster=cluster,
+            serviceName="ecs-arn-invalid-td-service",
+            taskDefinition=wrong_region,
+            desiredCount=0,
+        )
+    assert exc.value.response["Error"]["Code"] == "ClientException"
+
+    created = ecs.create_service(
+        cluster=cluster,
+        serviceName="ecs-arn-valid-td-service",
+        taskDefinition=task_definition_arn,
+        desiredCount=0,
+    )
+    assert created["service"]["taskDefinition"] == task_definition_arn
+    with pytest.raises(ClientError) as exc:
+        ecs.update_service(
+            cluster=cluster,
+            service="ecs-arn-valid-td-service",
+            taskDefinition=wrong_region,
+        )
+    assert exc.value.response["Error"]["Code"] == "ClientException"
+    described = ecs.describe_services(cluster=cluster, services=["ecs-arn-valid-td-service"])
+    assert described["services"][0]["taskDefinition"] == task_definition_arn
+
+
+def test_ecs_task_arn_parser_does_not_tail_resolve_invalid_arns():
+    cluster_name = "ecs-arn-task-cluster"
+    region = ecs_service.get_region()
+    account_id = ecs_service.get_account_id()
+    task_id = str(_uuid_mod.uuid4())
+    cluster_arn = f"arn:aws:ecs:{region}:{account_id}:cluster/{cluster_name}"
+    task_arn = f"arn:aws:ecs:{region}:{account_id}:task/{cluster_name}/{task_id}"
+    task = {"taskArn": task_arn, "clusterArn": cluster_arn}
+    foreign_region = _different_region(region)
+    foreign_region_task_arn = f"arn:aws:ecs:{foreign_region}:{account_id}:task/{cluster_name}/{task_id}"
+    foreign_region_task = {
+        "taskArn": foreign_region_task_arn,
+        "clusterArn": f"arn:aws:ecs:{foreign_region}:{account_id}:cluster/{cluster_name}",
+    }
+
+    ecs_service._clusters[cluster_name] = {"clusterArn": cluster_arn, "status": "ACTIVE"}
+    ecs_service._tasks[task_arn] = task
+    ecs_service._tasks[foreign_region_task_arn] = foreign_region_task
+    try:
+        assert ecs_service._resolve_task(task_arn, cluster_name) == task
+        assert ecs_service._resolve_task(task_id, cluster_name) == task
+
+        wrong_service = _replace_arn_section(task_arn, 2, "lambda")
+        wrong_partition = _replace_arn_section(task_arn, 1, "aws-cn")
+        wrong_region = _replace_arn_region(task_arn)
+        wrong_account = _replace_arn_section(task_arn, 4, "111111111111")
+        wrong_resource = task_arn.replace(":task/", ":service/")
+        wrong_cluster = f"arn:aws:ecs:{region}:{account_id}:task/other-cluster/{task_id}"
+        slash_ref = f"other-cluster/{task_id}"
+        empty_task_id = f"arn:aws:ecs:{region}:{account_id}:task/{cluster_name}/"
+        malformed = "arn:aws:ecs:us-east-1"
+
+        for ref in [
+            wrong_service,
+            wrong_partition,
+            wrong_region,
+            wrong_account,
+            wrong_resource,
+            wrong_cluster,
+            slash_ref,
+            empty_task_id,
+            malformed,
+            foreign_region_task_arn,
+        ]:
+            assert ecs_service._resolve_task(ref, cluster_name) is None
+    finally:
+        ecs_service._tasks.pop(task_arn, None)
+        ecs_service._tasks.pop(foreign_region_task_arn, None)
+        ecs_service._clusters.pop(cluster_name, None)
+
+
+def test_ecs_capacity_provider_arn_parser_does_not_tail_resolve_invalid_arns(ecs):
+    resp = ecs.create_capacity_provider(
+        name="ecs-arn-cp",
+        autoScalingGroupProvider={
+            "autoScalingGroupArn": "arn:aws:autoscaling:us-east-1:000000000000:autoScalingGroup:xxx:autoScalingGroupName/asg-1",
+        },
+    )
+    capacity_provider_arn = resp["capacityProvider"]["capacityProviderArn"]
+    valid = ecs.describe_capacity_providers(capacityProviders=[capacity_provider_arn])
+    assert valid["capacityProviders"][0]["name"] == "ecs-arn-cp"
+
+    wrong_service = _replace_arn_section(capacity_provider_arn, 2, "lambda")
+    wrong_partition = _replace_arn_section(capacity_provider_arn, 1, "aws-cn")
+    wrong_region = _replace_arn_region(capacity_provider_arn)
+    wrong_account = _replace_arn_section(capacity_provider_arn, 4, "111111111111")
+    wrong_resource = capacity_provider_arn.replace(":capacity-provider/", ":cluster/")
+    malformed_resource = f"{capacity_provider_arn}/extra"
+    slash_ref = "bogus/ecs-arn-cp"
+    malformed = "arn:aws:ecs:us-east-1"
+
+    for ref in [
+        wrong_service,
+        wrong_partition,
+        wrong_region,
+        wrong_account,
+        wrong_resource,
+        malformed_resource,
+        slash_ref,
+        malformed,
+    ]:
+        resp = ecs.describe_capacity_providers(capacityProviders=[ref])
+        assert resp["capacityProviders"] == []
+
+    with pytest.raises(ClientError) as exc:
+        ecs.delete_capacity_provider(capacityProvider=wrong_service)
+    assert exc.value.response["Error"]["Code"] == "InvalidParameterException"
+    with pytest.raises(ClientError) as exc:
+        ecs.delete_capacity_provider(capacityProvider=slash_ref)
+    assert exc.value.response["Error"]["Code"] == "InvalidParameterException"
+    valid = ecs.describe_capacity_providers(capacityProviders=["ecs-arn-cp"])
+    assert valid["capacityProviders"][0]["name"] == "ecs-arn-cp"
+    ecs.delete_capacity_provider(capacityProvider="ecs-arn-cp")
+
 
 def test_ecs_update_cluster(ecs):
     ecs.create_cluster(clusterName="upd-cl")

@@ -1,13 +1,47 @@
+import io
 import os
+import uuid
 import uuid as _uuid_mod
+import zipfile
 
+import boto3
 import pytest
+from botocore.config import Config
 from botocore.exceptions import ClientError
 
 # ========== Resource Groups Tagging API ==========
 
 # Unique tag key scopes all resources to this test file — avoids collisions with other tests
 _TAG_KEY = "tagging-test"
+
+
+def _regional_client(service, region):
+    return boto3.client(
+        service,
+        endpoint_url=os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566"),
+        region_name=region,
+        aws_access_key_id="test",
+        aws_secret_access_key="test",
+        config=Config(region_name=region, retries={"mode": "standard"}),
+    )
+
+
+def _account_client(service, account, region="us-east-1"):
+    return boto3.client(
+        service,
+        endpoint_url=os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566"),
+        region_name=region,
+        aws_access_key_id=account,
+        aws_secret_access_key="test",
+        config=Config(region_name=region, retries={"mode": "standard"}),
+    )
+
+
+def _lambda_zip():
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("index.py", "def handler(event, context):\n    return 'ok'\n")
+    return buf.getvalue()
 
 
 def _uid():
@@ -176,6 +210,53 @@ def test_tagging_get_resources_no_match(tagging):
 def test_tagging_get_resources_pagination_token_empty(tagging):
     resp = tagging.get_resources()
     assert resp.get("PaginationToken", "") == ""
+
+
+def test_tagging_get_resources_resource_arn_list_filters_to_requested_resources(tagging, s3):
+    s3.create_bucket(Bucket="tg-get-arn-list-a")
+    s3.create_bucket(Bucket="tg-get-arn-list-b")
+    s3.put_bucket_tagging(Bucket="tg-get-arn-list-a", Tagging={
+        "TagSet": [{"Key": _TAG_KEY, "Value": "arn-list"}]
+    })
+    s3.put_bucket_tagging(Bucket="tg-get-arn-list-b", Tagging={
+        "TagSet": [{"Key": _TAG_KEY, "Value": "arn-list"}]
+    })
+
+    arn = "arn:aws:s3:::tg-get-arn-list-a"
+    resp = tagging.get_resources(ResourceARNList=[arn])
+
+    assert [r["ResourceARN"] for r in resp["ResourceTagMappingList"]] == [arn]
+
+
+def test_tagging_get_resources_resource_arn_list_malformed_arn_fails_request(tagging):
+    with pytest.raises(ClientError) as exc:
+        tagging.get_resources(ResourceARNList=["not-an-arn"])
+
+    assert exc.value.response["Error"]["Code"] == "InvalidParameterException"
+
+
+def test_tagging_get_resources_resource_arn_list_rejects_filters(tagging, s3):
+    s3.create_bucket(Bucket="tg-get-arn-list-filter")
+    arn = "arn:aws:s3:::tg-get-arn-list-filter"
+
+    with pytest.raises(ClientError) as exc:
+        tagging.get_resources(
+            ResourceARNList=[arn],
+            TagFilters=[{"Key": _TAG_KEY, "Values": ["invalid-combination"]}],
+        )
+
+    assert exc.value.response["Error"]["Code"] == "InvalidParameterException"
+
+
+def test_tagging_get_resources_resource_arn_list_omits_unresolved_well_formed_arns(tagging):
+    resp = tagging.get_resources(ResourceARNList=[
+        "arn:aws:sns:us-west-2:000000000000:foreign-region-topic",
+        "arn:aws:sns:us-east-1:999999999999:bogus-account-topic",
+        "arn:aws:notaservice:us-east-1:000000000000:thing/missing",
+        "arn:aws:sns:us-east-1:000000000000:missing-topic",
+    ])
+
+    assert resp["ResourceTagMappingList"] == []
 
 
 # ========== Phase 2: New service collectors ==========
@@ -546,10 +627,10 @@ def test_tagging_tag_resources_multiple_arns(tagging, s3):
 def test_tagging_tag_resources_unknown_service(tagging):
     """Unknown service segment appears in FailedResourcesMap, not an exception."""
     resp = tagging.tag_resources(
-        ResourceARNList=["arn:aws:unknownsvc:::no-such-resource"],
+        ResourceARNList=["arn:aws:unknownsvc:us-east-1:000000000000:no-such-resource"],
         Tags={_TAG_KEY: "fail"},
     )
-    assert "arn:aws:unknownsvc:::no-such-resource" in resp["FailedResourcesMap"]
+    assert "arn:aws:unknownsvc:us-east-1:000000000000:no-such-resource" in resp["FailedResourcesMap"]
 
 
 # ========== UntagResources ==========
@@ -602,10 +683,10 @@ def test_tagging_untag_resources_nonexistent_key_is_noop(tagging, s3):
 def test_tagging_untag_resources_unknown_service(tagging):
     """Unknown service segment appears in FailedResourcesMap."""
     resp = tagging.untag_resources(
-        ResourceARNList=["arn:aws:unknownsvc:::no-such-resource"],
+        ResourceARNList=["arn:aws:unknownsvc:us-east-1:000000000000:no-such-resource"],
         TagKeys=[_TAG_KEY],
     )
-    assert "arn:aws:unknownsvc:::no-such-resource" in resp["FailedResourcesMap"]
+    assert "arn:aws:unknownsvc:us-east-1:000000000000:no-such-resource" in resp["FailedResourcesMap"]
 
 
 # ========== Cross-operation roundtrips ==========
@@ -644,17 +725,153 @@ def test_tagging_tag_resources_unknown_service_returns_invalid_parameter(tagging
     """Unknown ARN service segment returns InvalidParameterException/400, not
     InternalServiceException/501 — matches real AWS."""
     resp = tagging.tag_resources(
-        ResourceARNList=["arn:aws:unknownsvc:::no-such"],
+        ResourceARNList=["arn:aws:unknownsvc:us-east-1:000000000000:no-such"],
         Tags={"k": "v"},
     )
-    entry = resp["FailedResourcesMap"]["arn:aws:unknownsvc:::no-such"]
+    entry = resp["FailedResourcesMap"]["arn:aws:unknownsvc:us-east-1:000000000000:no-such"]
     assert entry["ErrorCode"] == "InvalidParameterException"
     assert entry["StatusCode"] == 400
 
 
+def test_tagging_tag_resources_malformed_arn_returns_invalid_parameter(tagging):
+    with pytest.raises(ClientError) as exc:
+        tagging.tag_resources(
+            ResourceARNList=["arn:nope"],
+            Tags={"k": "v"},
+        )
+
+    assert exc.value.response["Error"]["Code"] == "InvalidParameterException"
+
+
+def test_tagging_tag_resources_foreign_region_arn_fails_request_without_mutating_local_resource(tagging, kms_client):
+    key_id = kms_client.create_key(Description="tg-tr-kms-foreign-region")["KeyMetadata"]["KeyId"]
+    foreign_region_arn = f"arn:aws:kms:us-west-2:000000000000:key/{key_id}"
+
+    with pytest.raises(ClientError) as exc:
+        tagging.tag_resources(
+            ResourceARNList=[foreign_region_arn],
+            Tags={_TAG_KEY: "wrong-region"},
+        )
+
+    assert exc.value.response["Error"]["Code"] == "InvalidParameterException"
+    check = tagging.get_resources(TagFilters=[{"Key": _TAG_KEY, "Values": ["wrong-region"]}])
+    assert not any(key_id in r["ResourceARN"] for r in check["ResourceTagMappingList"])
+
+
+def test_tagging_tag_resources_kms_forged_region_arn_does_not_mutate_key(kms_client):
+    key_id = kms_client.create_key(Description="tg-tr-kms-forged-region")["KeyMetadata"]["KeyId"]
+    forged_region_arn = f"arn:aws:kms:us-west-2:000000000000:key/{key_id}"
+    west_tagging = _regional_client("resourcegroupstaggingapi", "us-west-2")
+
+    resp = west_tagging.tag_resources(
+        ResourceARNList=[forged_region_arn],
+        Tags={_TAG_KEY: "forged-region"},
+    )
+
+    entry = resp["FailedResourcesMap"][forged_region_arn]
+    assert entry["ErrorCode"] == "InvalidParameterException"
+    assert entry["StatusCode"] == 400
+    assert _TAG_KEY not in {t["TagKey"] for t in kms_client.list_resource_tags(KeyId=key_id)["Tags"]}
+
+
+def test_tagging_tag_resources_malformed_arn_in_mixed_list_fails_request_before_mutation(tagging, s3):
+    s3.create_bucket(Bucket="tg-tr-mixed-malformed")
+    arn = "arn:aws:s3:::tg-tr-mixed-malformed"
+
+    with pytest.raises(ClientError) as exc:
+        tagging.tag_resources(
+            ResourceARNList=[arn, "not-an-arn"],
+            Tags={_TAG_KEY: "should-not-apply"},
+        )
+
+    assert exc.value.response["Error"]["Code"] == "InvalidParameterException"
+    check = tagging.get_resources(ResourceARNList=[arn])
+    assert check["ResourceTagMappingList"] == []
+
+
+def test_tagging_tag_resources_unsupported_global_arn_does_not_block_valid_resources(tagging, s3):
+    s3.create_bucket(Bucket="tg-tr-mixed-unsupported-global")
+    s3_arn = "arn:aws:s3:::tg-tr-mixed-unsupported-global"
+    iam_arn = "arn:aws:iam::000000000000:role/tg-unsupported-role"
+
+    resp = tagging.tag_resources(ResourceARNList=[iam_arn, s3_arn], Tags={_TAG_KEY: "mixed-global"})
+
+    entry = resp["FailedResourcesMap"][iam_arn]
+    assert entry["ErrorCode"] == "InvalidParameterException"
+    assert entry["StatusCode"] == 400
+    check = tagging.get_resources(ResourceARNList=[s3_arn])
+    matched = next(r for r in check["ResourceTagMappingList"] if r["ResourceARN"] == s3_arn)
+    assert {t["Key"]: t["Value"] for t in matched["Tags"]}[_TAG_KEY] == "mixed-global"
+
+
+def test_tagging_tag_resources_unsupported_foreign_region_arn_does_not_block_valid_resources(tagging, s3):
+    s3.create_bucket(Bucket="tg-tr-mixed-unsupported-foreign")
+    s3_arn = "arn:aws:s3:::tg-tr-mixed-unsupported-foreign"
+    unknown_arn = "arn:aws:unknownsvc:us-west-2:000000000000:no-such-resource"
+
+    resp = tagging.tag_resources(ResourceARNList=[unknown_arn, s3_arn], Tags={_TAG_KEY: "mixed-foreign"})
+
+    entry = resp["FailedResourcesMap"][unknown_arn]
+    assert entry["ErrorCode"] == "InvalidParameterException"
+    assert entry["StatusCode"] == 400
+    check = tagging.get_resources(ResourceARNList=[s3_arn])
+    matched = next(r for r in check["ResourceTagMappingList"] if r["ResourceARN"] == s3_arn)
+    assert {t["Key"]: t["Value"] for t in matched["Tags"]}[_TAG_KEY] == "mixed-foreign"
+
+
+def test_tagging_tag_resources_missing_region_arn_fails_request_before_mutation(lam, tagging):
+    fname = f"tg-lambda-missing-region-{uuid.uuid4().hex[:8]}"
+    base_arn = None
+    try:
+        base_arn = lam.create_function(
+            FunctionName=fname,
+            Runtime="python3.12",
+            Role="arn:aws:iam::000000000000:role/test-role",
+            Handler="index.handler",
+            Code={"ZipFile": _lambda_zip()},
+        )["FunctionArn"]
+        malformed_arn = base_arn.replace(":us-east-1:", "::")
+
+        with pytest.raises(ClientError) as exc:
+            tagging.tag_resources(ResourceARNList=[malformed_arn], Tags={"missing-region": "bad"})
+
+        assert exc.value.response["Error"]["Code"] == "InvalidParameterException"
+        assert "missing-region" not in lam.list_tags(Resource=base_arn)["Tags"]
+    finally:
+        if base_arn:
+            lam.delete_function(FunctionName=fname)
+
+
+def test_tagging_tag_resources_missing_account_arn_fails_request_before_mutation(lam, tagging, s3):
+    fname = f"tg-lambda-missing-account-{uuid.uuid4().hex[:8]}"
+    bucket = "tg-tr-missing-account"
+    base_arn = None
+    try:
+        s3.create_bucket(Bucket=bucket)
+        base_arn = lam.create_function(
+            FunctionName=fname,
+            Runtime="python3.12",
+            Role="arn:aws:iam::000000000000:role/test-role",
+            Handler="index.handler",
+            Code={"ZipFile": _lambda_zip()},
+        )["FunctionArn"]
+        malformed_arn = base_arn.replace(":000000000000:", "::")
+        s3_arn = f"arn:aws:s3:::{bucket}"
+
+        with pytest.raises(ClientError) as exc:
+            tagging.tag_resources(ResourceARNList=[s3_arn, malformed_arn], Tags={"missing-account": "bad"})
+
+        assert exc.value.response["Error"]["Code"] == "InvalidParameterException"
+        assert tagging.get_resources(ResourceARNList=[s3_arn])["ResourceTagMappingList"] == []
+        assert "missing-account" not in lam.list_tags(Resource=base_arn)["Tags"]
+    finally:
+        if base_arn:
+            lam.delete_function(FunctionName=fname)
+
+
 def test_tagging_tag_resources_missing_lambda_surfaces_in_failed_map(tagging):
     """Tagging a Lambda that does not exist in the caller's account surfaces
-    InvalidParameterException in FailedResourcesMap instead of silently no-op'ing."""
+    a failure in FailedResourcesMap instead of silently no-op'ing."""
     arn = "arn:aws:lambda:us-east-1:000000000000:function:no-such-fn-tag-missing"
     resp = tagging.tag_resources(ResourceARNList=[arn], Tags={"k": "v"})
     assert arn in resp["FailedResourcesMap"]
@@ -663,12 +880,147 @@ def test_tagging_tag_resources_missing_lambda_surfaces_in_failed_map(tagging):
     assert entry["StatusCode"] == 400
 
 
+def test_tagging_tag_resources_foreign_region_lambda_arn_fails_request_without_mutating_functions(lam, tagging):
+    west_lam = _regional_client("lambda", "us-west-2")
+    fname = f"tg-lambda-region-{uuid.uuid4().hex[:8]}"
+    code = _lambda_zip()
+
+    east_arn = None
+    west_arn = None
+    try:
+        east_arn = lam.create_function(
+            FunctionName=fname,
+            Runtime="python3.12",
+            Role="arn:aws:iam::000000000000:role/test-role",
+            Handler="index.handler",
+            Code={"ZipFile": code},
+        )["FunctionArn"]
+        west_arn = west_lam.create_function(
+            FunctionName=fname,
+            Runtime="python3.12",
+            Role="arn:aws:iam::000000000000:role/test-role",
+            Handler="index.handler",
+            Code={"ZipFile": code},
+        )["FunctionArn"]
+
+        lam.tag_resource(Resource=east_arn, Tags={"region": "east"})
+
+        with pytest.raises(ClientError) as exc:
+            tagging.tag_resources(ResourceARNList=[west_arn], Tags={"region": "west"})
+
+        assert exc.value.response["Error"]["Code"] == "InvalidParameterException"
+        assert lam.list_tags(Resource=east_arn)["Tags"]["region"] == "east"
+        assert "region" not in west_lam.list_tags(Resource=west_arn)["Tags"]
+    finally:
+        if east_arn:
+            lam.delete_function(FunctionName=fname)
+        if west_arn:
+            west_lam.delete_function(FunctionName=fname)
+
+
+def test_tagging_tag_resources_qualified_lambda_arn_tags_base_function(lam, tagging):
+    fname = f"tg-lambda-qualified-{uuid.uuid4().hex[:8]}"
+    base_arn = None
+    try:
+        base_arn = lam.create_function(
+            FunctionName=fname,
+            Runtime="python3.12",
+            Role="arn:aws:iam::000000000000:role/test-role",
+            Handler="index.handler",
+            Code={"ZipFile": _lambda_zip()},
+        )["FunctionArn"]
+        version_arn = lam.publish_version(FunctionName=fname)["FunctionArn"]
+
+        tagging.tag_resources(ResourceARNList=[version_arn], Tags={"qualified": "yes"})
+        assert lam.list_tags(Resource=base_arn)["Tags"]["qualified"] == "yes"
+
+        tagging.untag_resources(ResourceARNList=[version_arn], TagKeys=["qualified"])
+        assert "qualified" not in lam.list_tags(Resource=base_arn)["Tags"]
+    finally:
+        if base_arn:
+            lam.delete_function(FunctionName=fname)
+
+
+def test_tagging_tag_resources_glue_connection_roundtrip(tagging, glue):
+    name = f"tg-glue-conn-{uuid.uuid4().hex[:8]}"
+    arn = f"arn:aws:glue:us-east-1:000000000000:connection/{name}"
+    glue.create_connection(
+        ConnectionInput={
+            "Name": name,
+            "ConnectionType": "JDBC",
+            "ConnectionProperties": {
+                "JDBC_CONNECTION_URL": "jdbc:postgresql://host/db",
+                "USERNAME": "user",
+                "PASSWORD": "pass",
+            },
+        }
+    )
+
+    resp = tagging.tag_resources(ResourceARNList=[arn], Tags={_TAG_KEY: "glue-conn"})
+    assert resp["FailedResourcesMap"] == {}
+    check = tagging.get_resources(TagFilters=[{"Key": _TAG_KEY, "Values": ["glue-conn"]}])
+    assert any(r["ResourceARN"] == arn for r in check["ResourceTagMappingList"])
+
+    resp = tagging.untag_resources(ResourceARNList=[arn], TagKeys=[_TAG_KEY])
+    assert resp["FailedResourcesMap"] == {}
+    check = tagging.get_resources(ResourceARNList=[arn])
+    matched = [r for r in check["ResourceTagMappingList"] if r["ResourceARN"] == arn]
+    assert matched
+    assert _TAG_KEY not in {t["Key"] for t in matched[0]["Tags"]}
+
+
+def test_tagging_tag_resources_default_eventbridge_and_scheduler_resources_exist_before_service_touch():
+    account = "111122223333"
+    scoped_tagging = _account_client("resourcegroupstaggingapi", account)
+    arns = [
+        f"arn:aws:events:us-east-1:{account}:event-bus/default",
+        f"arn:aws:scheduler:us-east-1:{account}:schedule-group/default",
+    ]
+
+    resp = scoped_tagging.tag_resources(ResourceARNList=arns, Tags={_TAG_KEY: "default-resource"})
+    assert resp["FailedResourcesMap"] == {}
+    check = scoped_tagging.get_resources(ResourceARNList=arns)
+    result_arns = [r["ResourceARN"] for r in check["ResourceTagMappingList"]]
+    assert result_arns == arns
+
+
+def test_tagging_tag_resources_eventbridge_rule_arn_with_slash_bus_name(tagging, eb):
+    bus_name = f"aws.partner/example.com/tg-{uuid.uuid4().hex[:8]}"
+    eb.create_event_bus(Name=bus_name)
+    rule_arn = eb.put_rule(
+        Name=f"tg-rule-{uuid.uuid4().hex[:8]}",
+        EventBusName=bus_name,
+        EventPattern='{"source":["unit"]}',
+    )["RuleArn"]
+
+    resp = tagging.tag_resources(ResourceARNList=[rule_arn], Tags={_TAG_KEY: "event-rule"})
+    assert resp["FailedResourcesMap"] == {}
+    check = tagging.get_resources(ResourceARNList=[rule_arn])
+    matched = next(r for r in check["ResourceTagMappingList"] if r["ResourceARN"] == rule_arn)
+    assert {t["Key"]: t["Value"] for t in matched["Tags"]}[_TAG_KEY] == "event-rule"
+
+
 def test_tagging_untag_missing_sns_surfaces_in_failed_map(tagging):
     arn = "arn:aws:sns:us-east-1:000000000000:no-such-topic-untag-missing"
     resp = tagging.untag_resources(ResourceARNList=[arn], TagKeys=["k"])
     assert arn in resp["FailedResourcesMap"]
     entry = resp["FailedResourcesMap"][arn]
     assert entry["ErrorCode"] == "InvalidParameterException"
+    assert entry["StatusCode"] == 400
+
+
+def test_tagging_untag_missing_backup_resources_surface_in_failed_map(tagging):
+    arns = [
+        "arn:aws:backup:us-east-1:000000000000:backup-vault:no-such-vault",
+        "arn:aws:backup:us-east-1:000000000000:backup-plan:no-such-plan",
+    ]
+
+    resp = tagging.untag_resources(ResourceARNList=arns, TagKeys=["k"])
+
+    for arn in arns:
+        entry = resp["FailedResourcesMap"][arn]
+        assert entry["ErrorCode"] == "InvalidParameterException"
+        assert entry["StatusCode"] == 400
 
 
 def test_tagging_tag_resources_cross_account_isolation(s3):

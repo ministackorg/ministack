@@ -20,6 +20,7 @@ import re
 import time
 from urllib.parse import unquote
 
+from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountScopedDict,
@@ -94,6 +95,8 @@ def reset():
 # ---------------------------------------------------------------------------
 
 _FS_ARN_RE = re.compile(r"^arn:aws[-a-z]*:s3files:[^:]*:[^:]*:file-system/(fs-[0-9a-f]{17,40})(?:/access-point/(fsap-[0-9a-f]{17,40}))?$")
+_FS_ID_RE = re.compile(r"^fs-[0-9a-f]{17,40}$")
+_AP_ID_RE = re.compile(r"^fsap-[0-9a-f]{17,40}$")
 
 
 def _hex_id(prefix):
@@ -116,6 +119,39 @@ def _resolve_id(value, prefer="fs"):
     if prefer == "ap":
         return m.group(2) or m.group(1)
     return m.group(2) or m.group(1)
+
+
+def _resolve_tag_resource_id(value):
+    if not value:
+        return "", _VALIDATION("resourceId is required")
+    if not value.startswith("arn:"):
+        return _resolve_id(value, prefer="any"), None
+
+    try:
+        spec = parse_arn(value)
+    except ArnParseError:
+        return "", _VALIDATION(f"Invalid resource ARN: {value}")
+
+    if (
+        spec.partition != "aws"
+        or spec.service != "s3files"
+        or spec.region != get_region()
+        or spec.account_id != get_account_id()
+    ):
+        return "", _VALIDATION(f"Invalid resource ARN: {value}")
+
+    parts = spec.resource.split("/")
+    if len(parts) == 2 and parts[0] == "file-system" and _FS_ID_RE.fullmatch(parts[1]):
+        return parts[1], None
+    if (
+        len(parts) == 4
+        and parts[0] == "file-system"
+        and _FS_ID_RE.fullmatch(parts[1])
+        and parts[2] == "access-point"
+        and _AP_ID_RE.fullmatch(parts[3])
+    ):
+        return parts[3], None
+    return "", _VALIDATION(f"Invalid resource ARN: {value}")
 
 
 def _fs_arn(fs_id):
@@ -275,7 +311,9 @@ async def handle_request(method, path, headers, body, query_params):
 
     # /resource-tags/{resourceId}
     if parts and parts[0] == "resource-tags" and len(parts) >= 2:
-        resource_id = _resolve_id("/".join(parts[1:]), prefer="any")
+        resource_id, err = _resolve_tag_resource_id("/".join(parts[1:]))
+        if err:
+            return err
         if method == "POST":
             return _tag_resource(resource_id, data)
         if method == "DELETE":

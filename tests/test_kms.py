@@ -6,8 +6,23 @@ import uuid as _uuid_mod
 import zipfile
 from urllib.parse import urlparse
 
+import boto3
 import pytest
+from botocore.config import Config
 from botocore.exceptions import ClientError
+
+ENDPOINT = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+
+
+def _regional_kms(region):
+    return boto3.client(
+        "kms",
+        endpoint_url=ENDPOINT,
+        aws_access_key_id="test",
+        aws_secret_access_key="test",
+        region_name=region,
+        config=Config(region_name=region, retries={"mode": "standard"}),
+    )
 
 
 def test_kms_create_symmetric_key(kms_client):
@@ -74,6 +89,34 @@ def test_kms_describe_key_by_arn(kms_client):
     arn = created["KeyMetadata"]["Arn"]
     resp = kms_client.describe_key(KeyId=arn)
     assert resp["KeyMetadata"]["Arn"] == arn
+
+
+def test_kms_key_arn_resolution_rejects_wrong_scope(kms_client):
+    created = kms_client.create_key(KeySpec="SYMMETRIC_DEFAULT")
+    arn = created["KeyMetadata"]["Arn"]
+    invalid_cases = [
+        arn.replace(":000000000000:", ":111111111111:"),
+        arn.replace(":us-east-1:", ":us-west-2:"),
+        arn.replace(":kms:", ":sqs:"),
+        arn.replace(":key/", ":alias/"),
+    ]
+
+    for key_id in invalid_cases:
+        with pytest.raises(ClientError) as exc:
+            kms_client.describe_key(KeyId=key_id)
+        assert exc.value.response["Error"]["Code"] == "NotFoundException"
+
+
+def test_kms_key_arn_resolution_rejects_forged_request_region(kms_client):
+    created = kms_client.create_key(KeySpec="SYMMETRIC_DEFAULT")
+    arn = created["KeyMetadata"]["Arn"]
+    west_arn = arn.replace(":us-east-1:", ":us-west-2:")
+    west_kms = _regional_kms("us-west-2")
+
+    with pytest.raises(ClientError) as exc:
+        west_kms.describe_key(KeyId=west_arn)
+    assert exc.value.response["Error"]["Code"] == "NotFoundException"
+
 
 def test_kms_describe_nonexistent_key(kms_client):
     with pytest.raises(ClientError) as exc_info:
@@ -321,6 +364,64 @@ def test_kms_describe_key_by_alias(kms_client):
     resp = kms_client.describe_key(KeyId="alias/desc-alias")
     assert resp["KeyMetadata"]["KeyId"] == key_id
 
+
+def test_kms_describe_key_by_alias_arn(kms_client):
+    key = kms_client.create_key(KeySpec="SYMMETRIC_DEFAULT")
+    key_id = key["KeyMetadata"]["KeyId"]
+    kms_client.create_alias(AliasName="alias/desc-alias-arn", TargetKeyId=key_id)
+
+    resp = kms_client.describe_key(
+        KeyId="arn:aws:kms:us-east-1:000000000000:alias/desc-alias-arn",
+    )
+
+    assert resp["KeyMetadata"]["KeyId"] == key_id
+
+
+def test_kms_alias_arn_resolution_rejects_forged_request_region(kms_client):
+    key = kms_client.create_key(KeySpec="SYMMETRIC_DEFAULT")
+    key_id = key["KeyMetadata"]["KeyId"]
+    kms_client.create_alias(AliasName="alias/forged-region-alias", TargetKeyId=key_id)
+    west_kms = _regional_kms("us-west-2")
+
+    with pytest.raises(ClientError) as exc:
+        west_kms.describe_key(
+            KeyId="arn:aws:kms:us-west-2:000000000000:alias/forged-region-alias",
+        )
+    assert exc.value.response["Error"]["Code"] == "NotFoundException"
+
+
+def test_kms_cloudformation_alias_resolves_by_name_and_arn(cfn, kms_client):
+    alias_name = f"alias/cfn-kms-alias-{_uuid_mod.uuid4().hex[:8]}"
+    template = {
+        "Resources": {
+            "Key": {"Type": "AWS::KMS::Key", "Properties": {"Description": "cfn alias key"}},
+            "Alias": {
+                "Type": "AWS::KMS::Alias",
+                "Properties": {"AliasName": alias_name, "TargetKeyId": {"Ref": "Key"}},
+            },
+        },
+    }
+    stack_name = f"kms-cfn-alias-{_uuid_mod.uuid4().hex[:8]}"
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(template))
+
+    by_name = kms_client.describe_key(KeyId=alias_name)["KeyMetadata"]
+    alias_arn = f"arn:aws:kms:us-east-1:000000000000:{alias_name}"
+    by_arn = kms_client.describe_key(KeyId=alias_arn)["KeyMetadata"]
+    assert by_arn["KeyId"] == by_name["KeyId"]
+
+
+def test_kms_wrong_service_alias_arn_does_not_tail_match(kms_client):
+    key = kms_client.create_key(KeySpec="SYMMETRIC_DEFAULT")
+    kms_client.create_alias(AliasName="alias/wrong-service-tail", TargetKeyId=key["KeyMetadata"]["KeyId"])
+
+    with pytest.raises(ClientError) as exc:
+        kms_client.describe_key(
+            KeyId="arn:aws:sqs:us-east-1:000000000000:alias/wrong-service-tail",
+        )
+
+    assert exc.value.response["Error"]["Code"] == "NotFoundException"
+
+
 def test_kms_update_alias(kms_client):
     key1 = kms_client.create_key(KeySpec="SYMMETRIC_DEFAULT")
     key2 = kms_client.create_key(KeySpec="SYMMETRIC_DEFAULT")
@@ -380,6 +481,18 @@ def test_kms_tag_untag_list_v2(kms_client):
     assert len(tags["Tags"]) == 1
     assert tags["Tags"][0]["TagKey"] == "env"
     kms_client.schedule_key_deletion(KeyId=key_id, PendingWindowInDays=7)
+
+
+def test_kms_tag_resource_accepts_key_arn(kms_client):
+    key = kms_client.create_key()
+    arn = key["KeyMetadata"]["Arn"]
+
+    kms_client.tag_resource(KeyId=arn, Tags=[{"TagKey": "env", "TagValue": "test"}])
+
+    tags = kms_client.list_resource_tags(KeyId=arn)
+    tag_map = {t["TagKey"]: t["TagValue"] for t in tags["Tags"]}
+    assert tag_map["env"] == "test"
+    kms_client.schedule_key_deletion(KeyId=arn, PendingWindowInDays=7)
 
 def test_kms_enable_disable_key(kms_client):
     """EnableKey / DisableKey."""

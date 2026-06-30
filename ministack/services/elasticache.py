@@ -26,6 +26,7 @@ import os
 import time
 from urllib.parse import parse_qs
 
+from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.persistence import load_state
 from ministack.core.responses import AccountScopedDict, apply_image_prefix, get_account_id, get_region, new_uuid
 
@@ -665,6 +666,59 @@ def _arn_param_group(name):
 
 def _arn_snapshot(name):
     return f"arn:aws:elasticache:{get_region()}:{get_account_id()}:snapshot:{name}"
+
+
+def _resolve_taggable_elasticache_arn(arn):
+    try:
+        spec = parse_arn(arn)
+    except ArnParseError:
+        return None, _error("InvalidParameterValue", f"Invalid resource ARN: {arn}", 400)
+
+    if (
+        spec.partition != "aws"
+        or spec.service != "elasticache"
+        or spec.region != get_region()
+        or spec.account_id != get_account_id()
+    ):
+        return None, _error("InvalidParameterValue", f"Invalid resource ARN: {arn}", 400)
+
+    resource_type, sep, name = spec.resource.partition(":")
+    if not sep or not name:
+        return None, _error("InvalidParameterValue", f"Invalid resource ARN: {arn}", 400)
+
+    resources = {
+        "cluster": (_clusters, "CacheClusterNotFound", f"Cluster {name} not found", "CacheClusterArn"),
+        "replicationgroup": (
+            _replication_groups,
+            "ReplicationGroupNotFoundFault",
+            f"Replication group {name} not found",
+            "ARN",
+        ),
+        "subnetgroup": (
+            _subnet_groups,
+            "CacheSubnetGroupNotFoundFault",
+            f"Cache subnet group {name} not found.",
+            "ARN",
+        ),
+        "parametergroup": (
+            _param_groups,
+            "CacheParameterGroupNotFound",
+            f"Cache parameter group {name} not found.",
+            "ARN",
+        ),
+        "snapshot": (_snapshots, "SnapshotNotFoundFault", f"Snapshot {name} not found", "ARN"),
+        "user": (_users, "UserNotFoundFault", f"User {name} not found", "ARN"),
+        "usergroup": (_user_groups, "UserGroupNotFoundFault", f"User group {name} not found", "ARN"),
+    }
+    entry = resources.get(resource_type)
+    if not entry:
+        return None, _error("InvalidParameterValue", f"Invalid resource ARN: {arn}", 400)
+
+    store, code, message, arn_key = entry
+    record = store.get(name)
+    if not record or record.get(arn_key) != arn:
+        return None, _error(code, message, 404)
+    return arn, None
 
 
 def _record_event(source_id, source_type, message):
@@ -1660,6 +1714,9 @@ def _remove_tag_keys_for_arn(arn, keys):
 
 def _list_tags(p):
     arn = _p(p, "ResourceName")
+    arn, err = _resolve_taggable_elasticache_arn(arn)
+    if err:
+        return err
     tags = _tags.get(arn, [])
     # TagList.member.locationName = "Tag"
     tag_xml = "".join(f"<Tag><Key>{t['Key']}</Key><Value>{t['Value']}</Value></Tag>" for t in tags)
@@ -1669,6 +1726,9 @@ def _list_tags(p):
 
 def _add_tags(p):
     arn = _p(p, "ResourceName")
+    arn, err = _resolve_taggable_elasticache_arn(arn)
+    if err:
+        return err
     new_tags = _extract_tags(p)
     tags = _merge_tags_for_arn(arn, new_tags)
 
@@ -1679,6 +1739,9 @@ def _add_tags(p):
 
 def _remove_tags(p):
     arn = _p(p, "ResourceName")
+    arn, err = _resolve_taggable_elasticache_arn(arn)
+    if err:
+        return err
     keys_to_remove = set()
     idx = 1
     while _p(p, f"TagKeys.member.{idx}"):

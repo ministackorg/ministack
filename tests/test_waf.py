@@ -9,6 +9,72 @@ from urllib.parse import urlparse
 import pytest
 from botocore.exceptions import ClientError
 
+from ministack.core.responses import (
+    get_account_id,
+    get_region,
+    set_request_account_id,
+    set_request_region,
+)
+from ministack.services import waf as waf_service
+
+
+def _waf_payload(response):
+    status, _headers, body = response
+    return status, json.loads(body)
+
+
+@pytest.fixture
+def direct_waf_scope():
+    original_account = get_account_id()
+    original_region = get_region()
+    set_request_account_id("000000000000")
+    set_request_region("us-east-1")
+    waf_service.reset()
+    yield
+    waf_service.reset()
+    set_request_account_id(original_account)
+    set_request_region(original_region)
+
+
+def _direct_web_acl_arn(name="direct-acl"):
+    status, payload = _waf_payload(waf_service._create_web_acl({
+        "Name": name,
+        "Scope": "REGIONAL",
+        "DefaultAction": {"Allow": {}},
+        "VisibilityConfig": {
+            "SampledRequestsEnabled": False,
+            "CloudWatchMetricsEnabled": False,
+            "MetricName": name,
+        },
+    }))
+    assert status == 200
+    return payload["Summary"]["ARN"]
+
+
+def _direct_cloudfront_web_acl_arn(name="direct-cloudfront-acl", arn_scope="cloudfront"):
+    uid = _uuid_mod.uuid4().hex
+    arn = f"arn:aws:wafv2:{get_region()}:{get_account_id()}:{arn_scope}/webacl/{name}/{uid}"
+    waf_service._web_acls[uid] = {
+        "ARN": arn,
+        "Id": uid,
+        "Name": name,
+        "Description": "",
+        "DefaultAction": {"Allow": {}},
+        "Rules": [],
+        "VisibilityConfig": {},
+        "Capacity": 0,
+        "LockToken": _uuid_mod.uuid4().hex,
+        "Scope": "CLOUDFRONT",
+    }
+    waf_service._waf_tags[arn] = []
+    return arn
+
+
+def _assert_waf_error(response, code):
+    status, payload = _waf_payload(response)
+    assert status == 400
+    assert payload["__type"] == code
+
 
 def test_waf_web_acl_crud(wafv2):
     resp = wafv2.create_web_acl(
@@ -150,6 +216,160 @@ def test_waf_tags(wafv2):
     wafv2.untag_resource(ResourceARN=arn, TagKeys=["env"])
     tags_resp3 = wafv2.list_tags_for_resource(ResourceARN=arn)
     assert not any(t["Key"] == "env" for t in tags_resp3["TagInfoForResource"]["TagList"])
+
+
+def test_waf_tag_apis_accept_local_waf_resource_arns_direct(direct_waf_scope):
+    web_acl_arn = _direct_web_acl_arn("direct-tag-acl")
+    cloudfront_web_acl_arn = _direct_cloudfront_web_acl_arn("direct-tag-cf-acl")
+    global_web_acl_arn = _direct_cloudfront_web_acl_arn(
+        "direct-tag-global-acl",
+        arn_scope="global",
+    )
+    ip_set_arn = _waf_payload(waf_service._create_ip_set({
+        "Name": "direct-tag-ipset",
+        "Scope": "REGIONAL",
+        "IPAddressVersion": "IPV4",
+        "Addresses": ["192.0.2.0/24"],
+    }))[1]["Summary"]["ARN"]
+    rule_group_arn = _waf_payload(waf_service._create_rule_group({
+        "Name": "direct-tag-rg",
+        "Scope": "REGIONAL",
+        "Capacity": 10,
+        "VisibilityConfig": {
+            "SampledRequestsEnabled": False,
+            "CloudWatchMetricsEnabled": False,
+            "MetricName": "direct-tag-rg",
+        },
+    }))[1]["Summary"]["ARN"]
+
+    for arn in (
+        web_acl_arn,
+        cloudfront_web_acl_arn,
+        global_web_acl_arn,
+        ip_set_arn,
+        rule_group_arn,
+    ):
+        status, _payload = _waf_payload(waf_service._tag_resource({
+            "ResourceARN": arn,
+            "Tags": [{"Key": "team", "Value": "security"}],
+        }))
+        assert status == 200
+        status, payload = _waf_payload(waf_service._list_tags_for_resource({
+            "ResourceARN": arn,
+        }))
+        assert status == 200
+        assert payload["TagInfoForResource"]["TagList"] == [
+            {"Key": "team", "Value": "security"}
+        ]
+        status, _payload = _waf_payload(waf_service._untag_resource({
+            "ResourceARN": arn,
+            "TagKeys": ["team"],
+        }))
+        assert status == 200
+
+
+@pytest.mark.parametrize("resource_arn", [
+    "not-an-arn",
+    "arn:aws-cn:wafv2:us-east-1:000000000000:regional/webacl/name/id",
+    "arn:aws:s3:us-east-1:000000000000:regional/webacl/name/id",
+    "arn:aws:wafv2:us-west-2:000000000000:regional/webacl/name/id",
+    "arn:aws:wafv2:us-east-1:111111111111:regional/webacl/name/id",
+    "arn:aws:wafv2:us-east-1:000000000000:cloudfront/ipset/name/id",
+    "arn:aws:wafv2:us-east-1:000000000000:regional/regexset/name/id",
+    "arn:aws:wafv2:us-east-1:000000000000:regional/webacl/name/id/extra",
+])
+def test_waf_tag_apis_reject_invalid_resource_arns_direct(direct_waf_scope, resource_arn):
+    _assert_waf_error(
+        waf_service._tag_resource({
+            "ResourceARN": resource_arn,
+            "Tags": [{"Key": "team", "Value": "security"}],
+        }),
+        "WAFInvalidParameterException",
+    )
+    _assert_waf_error(
+        waf_service._untag_resource({
+            "ResourceARN": resource_arn,
+            "TagKeys": ["team"],
+        }),
+        "WAFInvalidParameterException",
+    )
+    _assert_waf_error(
+        waf_service._list_tags_for_resource({"ResourceARN": resource_arn}),
+        "WAFInvalidParameterException",
+    )
+    assert resource_arn not in waf_service._waf_tags
+
+
+def test_waf_tag_apis_reject_missing_local_resource_arn_direct(direct_waf_scope):
+    missing_arn = "arn:aws:wafv2:us-east-1:000000000000:regional/webacl/missing/id"
+
+    _assert_waf_error(
+        waf_service._tag_resource({
+            "ResourceARN": missing_arn,
+            "Tags": [{"Key": "team", "Value": "security"}],
+        }),
+        "WAFNonexistentItemException",
+    )
+    assert missing_arn not in waf_service._waf_tags
+
+
+def test_waf_association_validates_web_acl_arn_but_not_resource_arn_direct(direct_waf_scope):
+    web_acl_arn = _direct_web_acl_arn("direct-assoc-acl")
+    opaque_resource_arn = "not-a-waf-resource-arn"
+
+    status, _payload = _waf_payload(waf_service._associate_web_acl({
+        "WebACLArn": web_acl_arn,
+        "ResourceArn": opaque_resource_arn,
+    }))
+    assert status == 200
+
+    status, payload = _waf_payload(waf_service._list_resources_for_web_acl({
+        "WebACLArn": web_acl_arn,
+    }))
+    assert status == 200
+    assert payload["ResourceArns"] == [opaque_resource_arn]
+
+    cloudfront_web_acl_arn = _direct_cloudfront_web_acl_arn("direct-assoc-cf-acl")
+    cloudfront_resource_arn = "arn:aws:cloudfront::000000000000:distribution/dist"
+    status, _payload = _waf_payload(waf_service._associate_web_acl({
+        "WebACLArn": cloudfront_web_acl_arn,
+        "ResourceArn": cloudfront_resource_arn,
+    }))
+    assert status == 200
+    status, payload = _waf_payload(waf_service._list_resources_for_web_acl({
+        "WebACLArn": cloudfront_web_acl_arn,
+    }))
+    assert status == 200
+    assert payload["ResourceArns"] == [cloudfront_resource_arn]
+
+    global_web_acl_arn = _direct_cloudfront_web_acl_arn(
+        "direct-assoc-global-acl",
+        arn_scope="global",
+    )
+    global_resource_arn = "arn:aws:cloudfront::000000000000:distribution/global-dist"
+    status, _payload = _waf_payload(waf_service._associate_web_acl({
+        "WebACLArn": global_web_acl_arn,
+        "ResourceArn": global_resource_arn,
+    }))
+    assert status == 200
+    status, payload = _waf_payload(waf_service._list_resources_for_web_acl({
+        "WebACLArn": global_web_acl_arn,
+    }))
+    assert status == 200
+    assert payload["ResourceArns"] == [global_resource_arn]
+
+    wrong_service_arn = web_acl_arn.replace(":wafv2:", ":s3:")
+    _assert_waf_error(
+        waf_service._associate_web_acl({
+            "WebACLArn": wrong_service_arn,
+            "ResourceArn": "arn:aws:elasticloadbalancing:us-east-1:000000000000:loadbalancer/app/app/id",
+        }),
+        "WAFInvalidParameterException",
+    )
+    _assert_waf_error(
+        waf_service._list_resources_for_web_acl({"WebACLArn": wrong_service_arn}),
+        "WAFInvalidParameterException",
+    )
 
 def test_waf_check_capacity(wafv2):
     resp = wafv2.check_capacity(

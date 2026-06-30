@@ -644,6 +644,26 @@ def test_mq_list_tags_with_non_existent_arn(mq):
     assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 404
     assert exc.value.response["Error"]["Code"] == "NotFoundException"
 
+
+@pytest.mark.parametrize(
+    "arn_template",
+    [
+        "arn:aws:sqs:us-east-1:000000000000:broker:{broker_id}",
+        "arn:aws:mq:us-west-2:000000000000:broker:{broker_id}",
+        "arn:aws:mq:us-east-1:111111111111:broker:{broker_id}",
+    ],
+)
+def test_mq_tag_arns_must_parse_to_local_broker(mq, arn_template):
+    broker = _create(mq, BrokerName=_name("tag-arn"))
+    arn = arn_template.format(broker_id=broker["BrokerId"])
+
+    with pytest.raises(ClientError) as exc:
+        mq.create_tags(ResourceArn=arn, Tags={"env": "dev"})
+
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 404
+    assert exc.value.response["Error"]["Code"] == "NotFoundException"
+
+
 def test_mq_list_tags_multiple_times_consistent(mq):
     """Test that ListTags returns consistent results across multiple calls."""
     broker = _create(mq, BrokerName=_name("tags-consistency"))
