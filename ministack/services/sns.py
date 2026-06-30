@@ -6,7 +6,9 @@ Supports: CreateTopic, DeleteTopic, ListTopics, GetTopicAttributes, SetTopicAttr
           GetSubscriptionAttributes, SetSubscriptionAttributes,
           Publish, PublishBatch,
           ListTagsForResource, TagResource, UntagResource,
-          CreatePlatformApplication, CreatePlatformEndpoint.
+          CreatePlatformApplication, DeletePlatformApplication,
+          CreatePlatformEndpoint, GetEndpointAttributes, SetEndpointAttributes,
+          DeleteEndpoint.
 SNS → Lambda fanout dispatches via _execute_function (synchronous).
 FIFO topics: .fifo naming validation, MessageGroupId/MessageDeduplicationId enforcement,
              5-minute deduplication window, sequence numbers, content-based deduplication,
@@ -181,6 +183,10 @@ async def handle_request(method: str, path: str, headers: dict, body: bytes, que
         "UntagResource": _untag_resource,
         "CreatePlatformApplication": _create_platform_application,
         "CreatePlatformEndpoint": _create_platform_endpoint,
+        "DeletePlatformApplication": _delete_platform_application,
+        "GetEndpointAttributes": _get_endpoint_attributes,
+        "SetEndpointAttributes": _set_endpoint_attributes,
+        "DeleteEndpoint": _delete_endpoint,
     }
 
     handler = handlers.get(action)
@@ -623,6 +629,14 @@ def _publish(params):
                       "TopicArn, TargetArn, or PhoneNumber is required", 400)
 
     if topic_arn not in _topics:
+        # Publishing directly to a mobile-push platform endpoint (TargetArn) is
+        # valid in AWS — https://docs.aws.amazon.com/sns/latest/api/API_Publish.html
+        # We don't deliver anything, but the call must succeed.
+        if topic_arn in _platform_endpoints:
+            msg_id = new_uuid()
+            logger.info("SNS platform-endpoint publish stub to %s", topic_arn)
+            return _xml(200, "PublishResponse",
+                        f"<PublishResult><MessageId>{msg_id}</MessageId></PublishResult>")
         return _error("NotFound", f"Topic does not exist: {topic_arn}", 404)
 
     topic = _topics[topic_arn]
@@ -1157,7 +1171,8 @@ def _create_platform_endpoint(params):
     if not token:
         return _error("InvalidParameterException", "Token is required", 400)
 
-    endpoint_arn = f"{app_arn}/{new_uuid()}"
+    # CustomUserData is a top-level request param (not an Attributes entry).
+    custom_user_data = _p(params, "CustomUserData")
 
     attrs = {"Enabled": "true", "Token": token}
     i = 1
@@ -1166,7 +1181,34 @@ def _create_platform_endpoint(params):
         val = _p(params, f"Attributes.entry.{i}.value")
         attrs[key] = val
         i += 1
+    if custom_user_data:
+        attrs["CustomUserData"] = custom_user_data
 
+    # AWS dedups by Token within a platform application: re-requesting the same
+    # Token returns the existing endpoint when CustomUserData matches, but
+    # raises if it differs — so callers know to Get/Set the existing endpoint.
+    # Idempotency per https://docs.aws.amazon.com/sns/latest/api/API_CreatePlatformEndpoint.html
+    # ("if the requester already owns an endpoint with the same device token and
+    # attributes, that endpoint's ARN is returned"); duplicate-token error string
+    # + parse-the-ARN guidance per
+    # https://aws.amazon.com/blogs/mobile/mobile-token-management-with-amazon-sns
+    for existing in _platform_endpoints.values():
+        if (existing["application_arn"] == app_arn
+                and existing["attributes"].get("Token") == token):
+            if (existing["attributes"].get("CustomUserData", "")
+                    == attrs.get("CustomUserData", "")):
+                return _xml(200, "CreatePlatformEndpointResponse",
+                            f"<CreatePlatformEndpointResult>"
+                            f"<EndpointArn>{existing['arn']}</EndpointArn>"
+                            f"</CreatePlatformEndpointResult>")
+            return _error(
+                "InvalidParameter",
+                f"Endpoint {existing['arn']} already exists with the same Token, "
+                f"but different attributes.",
+                400,
+            )
+
+    endpoint_arn = f"{app_arn}/{new_uuid()}"
     _platform_endpoints[endpoint_arn] = {
         "arn": endpoint_arn,
         "application_arn": app_arn,
@@ -1176,6 +1218,56 @@ def _create_platform_endpoint(params):
                 f"<CreatePlatformEndpointResult>"
                 f"<EndpointArn>{endpoint_arn}</EndpointArn>"
                 f"</CreatePlatformEndpointResult>")
+
+
+def _delete_platform_application(params):
+    # Idempotent in AWS. Also drop the application's endpoints.
+    # https://docs.aws.amazon.com/sns/latest/api/API_DeletePlatformApplication.html
+    arn = _p(params, "PlatformApplicationArn")
+    _platform_applications.pop(arn, None)
+    stale = [e["arn"] for e in _platform_endpoints.values()
+             if e["application_arn"] == arn]
+    for ep_arn in stale:
+        _platform_endpoints.pop(ep_arn, None)
+    return _xml(200, "DeletePlatformApplicationResponse", "")
+
+
+def _get_endpoint_attributes(params):
+    # https://docs.aws.amazon.com/sns/latest/api/API_GetEndpointAttributes.html
+    arn = _p(params, "EndpointArn")
+    endpoint = _platform_endpoints.get(arn)
+    if endpoint is None:
+        return _error("NotFound", f"Endpoint does not exist: {arn}", 404)
+    entries = "".join(
+        f"<entry><key>{_xml_escape(k)}</key><value>{_xml_escape(v)}</value></entry>"
+        for k, v in endpoint["attributes"].items()
+    )
+    return _xml(200, "GetEndpointAttributesResponse",
+                f"<GetEndpointAttributesResult><Attributes>{entries}</Attributes>"
+                f"</GetEndpointAttributesResult>")
+
+
+def _set_endpoint_attributes(params):
+    # https://docs.aws.amazon.com/sns/latest/api/API_SetEndpointAttributes.html
+    arn = _p(params, "EndpointArn")
+    endpoint = _platform_endpoints.get(arn)
+    if endpoint is None:
+        return _error("NotFound", f"Endpoint does not exist: {arn}", 404)
+    i = 1
+    while _p(params, f"Attributes.entry.{i}.key"):
+        key = _p(params, f"Attributes.entry.{i}.key")
+        val = _p(params, f"Attributes.entry.{i}.value")
+        endpoint["attributes"][key] = val
+        i += 1
+    return _xml(200, "SetEndpointAttributesResponse", "")
+
+
+def _delete_endpoint(params):
+    # AWS DeleteEndpoint is idempotent — succeeds even if already gone.
+    # https://docs.aws.amazon.com/sns/latest/api/API_DeleteEndpoint.html
+    arn = _p(params, "EndpointArn")
+    _platform_endpoints.pop(arn, None)
+    return _xml(200, "DeleteEndpointResponse", "")
 
 
 # ---------------------------------------------------------------------------

@@ -63,7 +63,7 @@ import string
 import time
 import zlib
 from datetime import datetime, timezone
-from urllib.parse import parse_qs, quote, urlencode
+from urllib.parse import parse_qs, quote, unquote, urlencode
 from xml.etree.ElementTree import Element, SubElement
 from xml.etree.ElementTree import tostring as xml_tostring
 
@@ -1276,12 +1276,12 @@ def _authenticate_client(headers: dict, form: dict):
         try:
             decoded = base64.b64decode(auth.split(" ", 1)[1]).decode("utf-8")
             cid, csec = decoded.split(":", 1)
-            # AWS Cognito compares the HTTP Basic client_id/client_secret exactly
-            # as sent — it does NOT url-decode them. Real clients (incl. Go/Vault)
-            # base64 the raw "id:secret" without form-urlencoding, so a secret
-            # containing "+" or "/" must be matched verbatim. Decoding here would
-            # corrupt any secret containing "+" (→ space) and break valid auth (#932).
-            return cid, csec
+            # RFC 6749 §2.3.1: the client id and secret are
+            # application/x-www-form-urlencoded before base64, so a secret
+            # containing "/" or "+" arrives as %2F/%2B and must be decoded to
+            # match the stored value. The client_secret_post path already gets
+            # this via parse_qs.
+            return unquote(cid), unquote(csec)
         except Exception:
             pass
     return form.get("client_id", ""), form.get("client_secret", "")
