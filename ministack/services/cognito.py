@@ -1138,14 +1138,42 @@ def _invoke_verify_auth_challenge_trigger(pool_id: str, client_id: str, username
 # SAML / OAuth2 helpers
 # ---------------------------------------------------------------------------
 
+def _external_base_url() -> str:
+    """
+    Public base URL the OUTSIDE world uses to reach this MiniStack.
+
+    The SAML ACS URL and the OIDC federation callback are handed to an *external* IdP
+    (Google, Okta, a SAML provider, ...) which validates them as an exact string and then
+    redirects the user's browser back to them. When MiniStack runs behind a reverse proxy
+    that terminates TLS on a different host/port (e.g. nginx on :443), the internal
+    ``http://{host}:{port}`` form never round-trips:
+
+      * public IdPs reject ``http://`` (and non-standard ports) for non-localhost hosts, and
+      * the browser cannot reach ``:4566`` from outside.
+
+    Set ``MINISTACK_COGNITO_HOSTED_UI_URL`` to the externally reachable base (e.g.
+    ``https://account.example.com``) to override. When unset, falls back to
+    ``http(s)://{MINISTACK_HOST}:{GATEWAY_PORT}``, where the scheme honors ``USE_SSL`` so it
+    stays consistent with the listener.
+
+    With no env set and ``USE_SSL`` unset this returns ``http://localhost:4566`` - identical
+    to the previous hardcoded behaviour, so existing setups are unaffected.
+    """
+    base = os.environ.get("MINISTACK_COGNITO_HOSTED_UI_URL")
+    if base:
+        return base.rstrip("/")
+    scheme = "https" if os.environ.get("USE_SSL", "").strip().lower() in ("1", "true", "yes") else "http"
+    return f"{scheme}://{_MINISTACK_HOST}:{_MINISTACK_PORT}"
+
+
 def _acs_url() -> str:
     """Assertion Consumer Service URL for SAML responses."""
-    return f"http://{_MINISTACK_HOST}:{_MINISTACK_PORT}/saml2/idpresponse"
+    return f"{_external_base_url()}/saml2/idpresponse"
 
 
 def _oidc_callback_url() -> str:
     """OIDC callback URL — external OIDC IdPs redirect back here with `code`+`state`."""
-    return f"http://{_MINISTACK_HOST}:{_MINISTACK_PORT}/oauth2/idpresponse"
+    return f"{_external_base_url()}/oauth2/idpresponse"
 
 
 def _build_saml_authn_request(pool_id: str, destination: str) -> str:
