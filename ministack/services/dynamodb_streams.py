@@ -12,7 +12,7 @@ import json
 import logging
 
 from ministack.core.arn import ArnParseError, parse_arn
-from ministack.core.responses import error_response_json, json_response
+from ministack.core.responses import error_response_json, get_account_id, get_region, json_response
 from ministack.services import dynamodb as _ddb
 
 logger = logging.getLogger("dynamodb_streams")
@@ -54,14 +54,29 @@ async def handle_request(method, path, headers, body, query_params):
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _encode_iterator(table_name: str, shard_id: str, position: int) -> str:
+def _encode_iterator(
+    table_name: str,
+    shard_id: str,
+    position: int,
+    *,
+    account_id: str | None = None,
+    region: str | None = None,
+    stream_arn: str | None = None,
+) -> str:
     """Encode an opaque shard iterator.
 
     The token is intentionally opaque: callers must treat it as bytes and pass
     it back unmodified. We base64-url-encode a small JSON payload so it stays
     short enough to fit in AWS's 2 KB iterator limit.
     """
-    payload = json.dumps({"t": table_name, "s": shard_id, "p": position}, separators=(",", ":"))
+    payload_data = {"t": table_name, "s": shard_id, "p": position}
+    if account_id:
+        payload_data["a"] = account_id
+    if region:
+        payload_data["r"] = region
+    if stream_arn:
+        payload_data["arn"] = stream_arn
+    payload = json.dumps(payload_data, separators=(",", ":"))
     return base64.urlsafe_b64encode(payload.encode("utf-8")).decode("ascii")
 
 
@@ -76,8 +91,8 @@ def _decode_iterator(token: str) -> dict | None:
         return None
 
 
-def _table_from_stream_arn(stream_arn: str) -> str | None:
-    """Extract the table name from a stream ARN of the form
+def _stream_source(stream_arn: str):
+    """Extract the parsed spec and table name from a stream ARN of the form
     ``arn:aws:dynamodb:{region}:{account}:table/{name}/stream/{label}``.
 
     Invalid or out-of-shape stream ARNs map to ``None`` so describe/list paths
@@ -87,7 +102,7 @@ def _table_from_stream_arn(stream_arn: str) -> str | None:
         spec = parse_arn(stream_arn)
     except ArnParseError:
         return None
-    if spec.service != "dynamodb":
+    if spec.service != "dynamodb" or not spec.region or not spec.account_id:
         return None
     parts = spec.resource.split("/")
     if (
@@ -98,22 +113,47 @@ def _table_from_stream_arn(stream_arn: str) -> str | None:
         or not parts[3]
     ):
         return None
-    return parts[1]
+    return spec, parts[1]
 
 
-def _records_for(table_name: str) -> list:
+def _table_from_stream_arn(stream_arn: str) -> str | None:
+    source = _stream_source(stream_arn)
+    if source is None:
+        return None
+    return source[1]
+
+
+def _request_stream_source(stream_arn: str):
+    source = _stream_source(stream_arn)
+    if source is None:
+        return None
+    spec, table_name = source
+    if spec.account_id != get_account_id() or spec.region != get_region():
+        return None
+    return spec, table_name
+
+
+def _records_for(account_id: str, region: str, table_name: str) -> list:
     """Return the raw list of stream records for a table, or an empty list.
 
     Reads directly from the dynamodb module so TransactWriteItems,
     BatchWriteItem, and the single-item ops all stay in sync automatically.
     """
-    return _ddb._stream_records.get(table_name, [])
+    return _ddb._stream_records.get_scoped(account_id, region, table_name, [])
 
 
-def _enabled_stream_info(table_name: str) -> dict | None:
+def _enabled_stream_info(
+    table_name: str,
+    *,
+    account_id: str | None = None,
+    region: str | None = None,
+) -> dict | None:
     """Return a dict describing a table's current stream, or ``None`` when
     the table does not have an enabled stream."""
-    table = _ddb._tables.get(table_name)
+    if account_id is None or region is None:
+        table = _ddb._tables.get(table_name)
+    else:
+        table = _ddb._tables.get_scoped(account_id, region, table_name)
     if not table:
         return None
     spec = table.get("StreamSpecification")
@@ -178,19 +218,20 @@ def _describe_stream(data):
     if not stream_arn:
         return error_response_json("ValidationException", "StreamArn is required", 400)
 
-    table_name = _table_from_stream_arn(stream_arn)
-    if not table_name:
+    source = _request_stream_source(stream_arn)
+    if source is None:
         return error_response_json(
             "ResourceNotFoundException", f"Stream not found: {stream_arn}", 400
         )
+    spec, table_name = source
 
-    info = _enabled_stream_info(table_name)
+    info = _enabled_stream_info(table_name, account_id=spec.account_id, region=spec.region)
     if info is None or info["StreamArn"] != stream_arn:
         return error_response_json(
             "ResourceNotFoundException", f"Stream not found: {stream_arn}", 400
         )
 
-    records = _records_for(table_name)
+    records = _records_for(spec.account_id, spec.region, table_name)
     starting_seq = records[0]["dynamodb"]["SequenceNumber"] if records else None
 
     shard: dict = {
@@ -200,7 +241,7 @@ def _describe_stream(data):
     if starting_seq:
         shard["SequenceNumberRange"]["StartingSequenceNumber"] = starting_seq
 
-    table = _ddb._tables.get(table_name, {})
+    table = _ddb._tables.get_scoped(spec.account_id, spec.region, table_name, {})
     key_schema = table.get("KeySchema", [])
 
     # AWS shard pagination: Limit caps the number of Shards returned (max 100),
@@ -245,19 +286,20 @@ def _get_shard_iterator(data):
             400,
         )
 
-    table_name = _table_from_stream_arn(stream_arn)
-    if not table_name:
+    source = _request_stream_source(stream_arn)
+    if source is None:
         return error_response_json(
             "ResourceNotFoundException", f"Stream not found: {stream_arn}", 400
         )
+    spec, table_name = source
 
-    info = _enabled_stream_info(table_name)
+    info = _enabled_stream_info(table_name, account_id=spec.account_id, region=spec.region)
     if info is None or info["StreamArn"] != stream_arn:
         return error_response_json(
             "ResourceNotFoundException", f"Stream not found: {stream_arn}", 400
         )
 
-    records = _records_for(table_name)
+    records = _records_for(spec.account_id, spec.region, table_name)
     position = 0
     if iterator_type == "TRIM_HORIZON":
         position = 0
@@ -283,7 +325,14 @@ def _get_shard_iterator(data):
             )
         position = idx if iterator_type == "AT_SEQUENCE_NUMBER" else idx + 1
 
-    iterator = _encode_iterator(table_name, shard_id, position)
+    iterator = _encode_iterator(
+        table_name,
+        shard_id,
+        position,
+        account_id=spec.account_id,
+        region=spec.region,
+        stream_arn=stream_arn,
+    )
     return json_response({"ShardIterator": iterator})
 
 
@@ -306,18 +355,34 @@ def _get_records(data):
     table_name = decoded["t"]
     shard_id = decoded.get("s", _DEFAULT_SHARD_ID)
     position = int(decoded.get("p", 0))
+    account_id = decoded.get("a", get_account_id())
+    region = decoded.get("r", get_region())
+    stream_arn = decoded.get("arn")
 
-    if _enabled_stream_info(table_name) is None:
+    if account_id != get_account_id() or region != get_region():
+        return error_response_json(
+            "ValidationException", "ShardIterator is not valid", 400
+        )
+
+    info = _enabled_stream_info(table_name, account_id=account_id, region=region)
+    if info is None or (stream_arn and info["StreamArn"] != stream_arn):
         return error_response_json(
             "ExpiredIteratorException",
             "Iterator references a stream that is no longer enabled",
             400,
         )
 
-    records = _records_for(table_name)
+    records = _records_for(account_id, region, table_name)
     page = records[position:position + limit]
     next_position = position + len(page)
-    next_iterator = _encode_iterator(table_name, shard_id, next_position)
+    next_iterator = _encode_iterator(
+        table_name,
+        shard_id,
+        next_position,
+        account_id=account_id,
+        region=region,
+        stream_arn=stream_arn,
+    )
 
     return json_response({
         "Records": page,

@@ -134,11 +134,17 @@ def _poll_once():
         if _arn_service(source_arn) != "dynamodb" or _arn_service(target_arn) != "sns":
             continue
 
-        table_name = _table_name_from_stream_arn(source_arn)
-        if not table_name:
+        source = _dynamodb_stream_source(source_arn)
+        if source is None:
+            continue
+        source_spec, table_name = source
+        pipe_account_id = _pipe_account_id(pipe)
+        if source_spec.account_id != pipe_account_id:
             continue
 
-        records = stream_records.get(table_name, [])
+        records = stream_records.get_scoped(
+            pipe_account_id, source_spec.region, table_name, []
+        )
         pos = int(_positions.get(pipe["Arn"], 0))
         if pos < 0:
             pos = 0
@@ -184,12 +190,18 @@ def _arn_service(arn: str) -> str:
 
 def _table_name_from_stream_arn(stream_arn: str) -> str:
     """Return a DynamoDB table name for Pipes runtime dispatch, or empty string."""
+    source = _dynamodb_stream_source(stream_arn)
+    return "" if source is None else source[1]
+
+
+def _dynamodb_stream_source(stream_arn: str):
+    """Return the parsed source ARN and table name for a DynamoDB stream."""
     try:
         spec = parse_arn(stream_arn)
     except ArnParseError:
-        return ""
+        return None
     if spec.service != "dynamodb":
-        return ""
+        return None
     parts = spec.resource.split("/")
     if (
         len(parts) < 4
@@ -198,18 +210,37 @@ def _table_name_from_stream_arn(stream_arn: str) -> str:
         or not parts[1]
         or not parts[3]
     ):
-        return ""
-    return parts[1]
+        return None
+    return spec, parts[1]
+
+
+def _pipe_account_id(pipe: dict) -> str:
+    try:
+        spec = parse_arn(pipe.get("Arn", ""))
+    except ArnParseError:
+        return get_account_id()
+    if spec.service != "pipes" or not spec.account_id:
+        return get_account_id()
+    return spec.account_id
 
 
 def _initial_position(pipe: dict) -> int:
     from ministack.services import dynamodb as _ddb
 
-    table_name = _table_name_from_stream_arn(pipe.get("Source", ""))
-    if not table_name:
+    source = _dynamodb_stream_source(pipe.get("Source", ""))
+    if source is None:
+        return 0
+    source_spec, table_name = source
+    pipe_account_id = _pipe_account_id(pipe)
+    if source_spec.account_id != pipe_account_id:
         return 0
 
-    records = getattr(_ddb, "_stream_records", {}).get(table_name, [])
+    stream_records = getattr(_ddb, "_stream_records", None)
+    if stream_records is None:
+        return 0
+    records = stream_records.get_scoped(
+        pipe_account_id, source_spec.region, table_name, []
+    )
     if pipe.get("StartingPosition") == "TRIM_HORIZON":
         return 0
     return len(records)

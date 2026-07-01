@@ -74,27 +74,27 @@ from ministack.core.persistence import PERSIST_STATE, load_state
 # validate spec.region == request region) rejected them — a self-contradiction
 # (B7). Legacy account-scoped persistence migrates via the table's TableArn.
 _tables = AccountRegionScopedDict()
-_tags = AccountScopedDict()
-_ttl_settings = AccountScopedDict()
-_pitr_settings = AccountScopedDict()
+_tags = AccountRegionScopedDict()
+_ttl_settings = AccountRegionScopedDict()
+_pitr_settings = AccountRegionScopedDict()
 # Kinesis streaming destinations — TableName -> list of
 # {"StreamArn": str, "DestinationStatus": "ACTIVE"|"DISABLED",
 #  "ApproximateCreationDateTimePrecision": "MILLISECOND"|"MICROSECOND"}.
 # ACTIVE entries get each _emit_stream_event record fanned out via
 # kinesis.put_record_internal; DISABLED entries stay on the describe
 # response (matching the ~24 h AWS retention window for readability).
-_kinesis_destinations = AccountScopedDict()
+_kinesis_destinations = AccountRegionScopedDict()
 # Contributor Insights — key is "TableName" or "TableName/index/IndexName".
 # Value: {"ContributorInsightsStatus": "ENABLED"|"DISABLED",
 #         "LastUpdateDateTime": float epoch, "ContributorInsightsRuleList": [str, ...]}.
-_backups = AccountScopedDict()  # BackupArn -> BackupDescription dict
-_contributor_insights = AccountScopedDict()
+_backups = AccountRegionScopedDict()  # BackupArn -> BackupDescription dict
+_contributor_insights = AccountRegionScopedDict()
 # Resource-based policies — ResourceArn -> {"Policy": str, "RevisionId": str}.
-_resource_policies = AccountScopedDict()
+_resource_policies = AccountRegionScopedDict()
 # Export tasks — ExportArn -> ExportDescription dict.
-_exports = AccountScopedDict()
+_exports = AccountRegionScopedDict()
 # Import tasks — ImportArn -> ImportTableDescription dict.
-_imports = AccountScopedDict()
+_imports = AccountRegionScopedDict()
 _lock = threading.Lock()
 
 
@@ -115,6 +115,74 @@ def get_state():
     }
 
 
+def _table_name_from_metadata_key(key) -> str:
+    if not isinstance(key, str):
+        return str(key)
+    return key.split("/index/", 1)[0]
+
+
+def _metadata_value_region(value) -> str | None:
+    if isinstance(value, str) and value.startswith("arn:"):
+        try:
+            spec = parse_arn(value)
+        except ArnParseError:
+            return None
+        return spec.region or None
+    if isinstance(value, dict):
+        for nested in value.values():
+            region = _metadata_value_region(nested)
+            if region:
+                return region
+    if isinstance(value, (list, tuple, set)):
+        for nested in value:
+            region = _metadata_value_region(nested)
+            if region:
+                return region
+    return None
+
+
+def _legacy_regions_for_table_metadata(account_id: str, key, value=None) -> list[str]:
+    table_name = _table_name_from_metadata_key(key)
+    regions = sorted({
+        region
+        for (stored_account_id, region, stored_table_name), _table in _tables.all_items()
+        if stored_account_id == account_id and stored_table_name == table_name
+    })
+    value_region = _metadata_value_region(value)
+    if value_region and (not regions or value_region in regions):
+        return [value_region]
+    if len(regions) == 1:
+        return regions
+    if regions:
+        return regions
+    return [get_region()]
+
+
+def _restore_table_name_metadata(store: AccountRegionScopedDict, data) -> None:
+    if isinstance(data, AccountRegionScopedDict):
+        store.update(data)
+        return
+    if isinstance(data, AccountScopedDict):
+        for (account_id, key), value in data._data.items():
+            for region in _legacy_regions_for_table_metadata(account_id, key, value):
+                store.set_scoped(account_id, region, key, copy.deepcopy(value))
+        return
+    if isinstance(data, dict):
+        for key, value in data.items():
+            if isinstance(key, tuple) and len(key) == 3:
+                account_id, _region, original_key = key
+                regions = [_region]
+            elif isinstance(key, tuple) and len(key) == 2:
+                account_id, original_key = key
+                regions = _legacy_regions_for_table_metadata(account_id, original_key, value)
+            else:
+                account_id = get_account_id()
+                original_key = key
+                regions = _legacy_regions_for_table_metadata(account_id, original_key, value)
+            for region in regions:
+                store.set_scoped(account_id, region, original_key, copy.deepcopy(value))
+
+
 def restore_state(data):
     if data:
         _tables.update(data.get("tables", {}))
@@ -128,10 +196,10 @@ def restore_state(data):
             if sse and "Status" not in sse and ("Enabled" in sse or "KMSMasterKeyId" in sse):
                 tbl["SSEDescription"] = _sse_description_from_spec(sse)
         _tags.update(data.get("tags", {}))
-        _ttl_settings.update(data.get("ttl_settings", {}))
-        _pitr_settings.update(data.get("pitr_settings", {}))
-        _kinesis_destinations.update(data.get("kinesis_destinations", {}))
-        _contributor_insights.update(data.get("contributor_insights", {}))
+        _restore_table_name_metadata(_ttl_settings, data.get("ttl_settings", {}))
+        _restore_table_name_metadata(_pitr_settings, data.get("pitr_settings", {}))
+        _restore_table_name_metadata(_kinesis_destinations, data.get("kinesis_destinations", {}))
+        _restore_table_name_metadata(_contributor_insights, data.get("contributor_insights", {}))
         _backups.update(data.get("backups", {}))
         _resource_policies.update(data.get("resource_policies", {}))
         _exports.update(data.get("exports", {}))
@@ -443,7 +511,7 @@ def _validate_item(item: dict, pk_name: str | None = None, sk_name: str | None =
 
 # DynamoDB Streams: table_name -> list of stream records
 # Each record follows the DynamoDB Streams event format consumed by Lambda ESMs.
-_stream_records = AccountScopedDict()
+_stream_records = AccountRegionScopedDict()
 _stream_seq_counter = 0
 _stream_seq_lock = threading.Lock()
 
@@ -560,13 +628,13 @@ def _ttl_reaper():
         now = time.time()
         try:
             with _lock:
-                for table_name, setting in list(_ttl_settings.items()):
+                for (account_id, region, table_name), setting in list(_ttl_settings.all_items()):
                     if setting.get("TimeToLiveStatus") != "ENABLED":
                         continue
                     attr = setting.get("AttributeName", "")
                     if not attr:
                         continue
-                    table = _tables.get(table_name)
+                    table = _tables.get_scoped(account_id, region, table_name)
                     if not table:
                         continue
                     for pk_val, sk_map in list(table["items"].items()):
@@ -2924,7 +2992,7 @@ def _transact_write_items(data):
     return json_response(result)
 
 
-_txn_idempotency = AccountScopedDict()
+_txn_idempotency = AccountRegionScopedDict()
 
 
 def _transact_get_items(data):
@@ -5653,3 +5721,9 @@ def reset():
         _pitr_settings.clear()
         _stream_records.clear()
         _kinesis_destinations.clear()
+        _backups.clear()
+        _contributor_insights.clear()
+        _resource_policies.clear()
+        _exports.clear()
+        _imports.clear()
+        _txn_idempotency.clear()

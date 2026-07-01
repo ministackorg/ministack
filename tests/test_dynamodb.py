@@ -26,6 +26,36 @@ def _ddb_client(region_name: str):
     )
 
 
+def _ddb_streams_client(region_name: str):
+    return boto3.client(
+        "dynamodbstreams",
+        endpoint_url=_ENDPOINT,
+        aws_access_key_id="test",
+        aws_secret_access_key="test",
+        region_name=region_name,
+        config=Config(region_name=region_name, retries={"mode": "standard"}),
+    )
+
+
+def _create_table(client, name: str, *, stream_enabled: bool = False):
+    try:
+        client.delete_table(TableName=name)
+    except Exception:
+        pass
+    kwargs = {
+        "TableName": name,
+        "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+        "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+        "BillingMode": "PAY_PER_REQUEST",
+    }
+    if stream_enabled:
+        kwargs["StreamSpecification"] = {
+            "StreamEnabled": True,
+            "StreamViewType": "NEW_AND_OLD_IMAGES",
+        }
+    return client.create_table(**kwargs)
+
+
 def _make_zip(code: str) -> bytes:
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w") as zf:
@@ -79,6 +109,284 @@ def test_dynamodb_tables_are_region_isolated_by_name(ddb):
             east.delete_table(TableName=name)
         except ClientError:
             pass
+
+
+def test_dynamodb_same_name_table_metadata_is_region_scoped(ddb):
+    east = _ddb_client("us-east-1")
+    west = _ddb_client("us-west-2")
+    name = f"region-meta-{_uuid_mod.uuid4().hex[:8]}"
+
+    east_arn = _create_table(east, name)["TableDescription"]["TableArn"]
+    west_arn = _create_table(west, name)["TableDescription"]["TableArn"]
+    try:
+        east.tag_resource(ResourceArn=east_arn, Tags=[{"Key": "region", "Value": "east"}])
+        west.tag_resource(ResourceArn=west_arn, Tags=[{"Key": "region", "Value": "west"}])
+        assert east.list_tags_of_resource(ResourceArn=east_arn)["Tags"] == [
+            {"Key": "region", "Value": "east"}
+        ]
+        assert west.list_tags_of_resource(ResourceArn=west_arn)["Tags"] == [
+            {"Key": "region", "Value": "west"}
+        ]
+
+        east.update_time_to_live(
+            TableName=name,
+            TimeToLiveSpecification={"Enabled": True, "AttributeName": "east_expires_at"},
+        )
+        west_ttl = west.describe_time_to_live(TableName=name)["TimeToLiveDescription"]
+        assert west_ttl["TimeToLiveStatus"] == "DISABLED"
+
+        west.update_time_to_live(
+            TableName=name,
+            TimeToLiveSpecification={"Enabled": True, "AttributeName": "west_expires_at"},
+        )
+        assert east.describe_time_to_live(TableName=name)["TimeToLiveDescription"]["AttributeName"] == "east_expires_at"
+        assert west.describe_time_to_live(TableName=name)["TimeToLiveDescription"]["AttributeName"] == "west_expires_at"
+
+        east.update_continuous_backups(
+            TableName=name,
+            PointInTimeRecoverySpecification={"PointInTimeRecoveryEnabled": True},
+        )
+        east_pitr = east.describe_continuous_backups(TableName=name)[
+            "ContinuousBackupsDescription"
+        ]["PointInTimeRecoveryDescription"]
+        west_pitr = west.describe_continuous_backups(TableName=name)[
+            "ContinuousBackupsDescription"
+        ]["PointInTimeRecoveryDescription"]
+        assert east_pitr["PointInTimeRecoveryStatus"] == "ENABLED"
+        assert west_pitr["PointInTimeRecoveryStatus"] == "DISABLED"
+
+        east.update_contributor_insights(TableName=name, ContributorInsightsAction="ENABLE")
+        assert east.describe_contributor_insights(TableName=name)["ContributorInsightsStatus"] == "ENABLED"
+        assert west.describe_contributor_insights(TableName=name)["ContributorInsightsStatus"] == "DISABLED"
+
+        stream_arn = f"arn:aws:kinesis:us-east-1:000000000000:stream/{name}"
+        east.enable_kinesis_streaming_destination(TableName=name, StreamArn=stream_arn)
+        assert west.describe_kinesis_streaming_destination(TableName=name)[
+            "KinesisDataStreamDestinations"
+        ] == []
+    finally:
+        for client in (east, west):
+            try:
+                client.delete_table(TableName=name)
+            except ClientError:
+                pass
+
+
+def test_dynamodb_stream_records_are_region_scoped_for_same_name_tables(ddb):
+    east = _ddb_client("us-east-1")
+    west = _ddb_client("us-west-2")
+    east_streams = _ddb_streams_client("us-east-1")
+    west_streams = _ddb_streams_client("us-west-2")
+    name = f"region-stream-{_uuid_mod.uuid4().hex[:8]}"
+
+    east_arn = _create_table(east, name, stream_enabled=True)["TableDescription"]["LatestStreamArn"]
+    west_arn = _create_table(west, name, stream_enabled=True)["TableDescription"]["LatestStreamArn"]
+    try:
+        east.put_item(TableName=name, Item={"pk": {"S": "east-only"}})
+
+        east_shard = east_streams.describe_stream(StreamArn=east_arn)["StreamDescription"]["Shards"][0]["ShardId"]
+        west_shard = west_streams.describe_stream(StreamArn=west_arn)["StreamDescription"]["Shards"][0]["ShardId"]
+        east_iter = east_streams.get_shard_iterator(
+            StreamArn=east_arn,
+            ShardId=east_shard,
+            ShardIteratorType="TRIM_HORIZON",
+        )["ShardIterator"]
+        west_iter = west_streams.get_shard_iterator(
+            StreamArn=west_arn,
+            ShardId=west_shard,
+            ShardIteratorType="TRIM_HORIZON",
+        )["ShardIterator"]
+
+        assert len(east_streams.get_records(ShardIterator=east_iter)["Records"]) == 1
+        assert west_streams.get_records(ShardIterator=west_iter)["Records"] == []
+
+        with pytest.raises(ClientError) as exc:
+            west_streams.get_records(ShardIterator=east_iter)
+        assert exc.value.response["Error"]["Code"] == "ValidationException"
+    finally:
+        for client in (east, west):
+            try:
+                client.delete_table(TableName=name)
+            except ClientError:
+                pass
+
+
+def test_dynamodb_regional_listing_metadata_does_not_cross_regions(ddb):
+    east = _ddb_client("us-east-1")
+    west = _ddb_client("us-west-2")
+    name = f"region-list-{_uuid_mod.uuid4().hex[:8]}"
+    import_name = f"region-import-{_uuid_mod.uuid4().hex[:8]}"
+
+    east_arn = _create_table(east, name)["TableDescription"]["TableArn"]
+    _create_table(west, name)
+    backup_arn = None
+    try:
+        backup_arn = east.create_backup(TableName=name, BackupName="snapshot")["BackupDetails"]["BackupArn"]
+        west_backups = west.list_backups(TableName=name).get("BackupSummaries", [])
+        assert backup_arn not in {summary["BackupArn"] for summary in west_backups}
+
+        export_arn = east.export_table_to_point_in_time(
+            TableArn=east_arn,
+            S3Bucket="region-state-export",
+        )["ExportDescription"]["ExportArn"]
+        west_exports = west.list_exports().get("ExportSummaries", [])
+        assert export_arn not in {summary["ExportArn"] for summary in west_exports}
+
+        import_arn = east.import_table(
+            S3BucketSource={"S3Bucket": "region-state-import"},
+            InputFormat="DYNAMODB_JSON",
+            TableCreationParameters={
+                "TableName": import_name,
+                "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+                "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+                "BillingMode": "PAY_PER_REQUEST",
+            },
+        )["ImportTableDescription"]["ImportArn"]
+        west_imports = west.list_imports().get("ImportSummaryList", [])
+        assert import_arn not in {summary["ImportArn"] for summary in west_imports}
+    finally:
+        if backup_arn:
+            try:
+                east.delete_backup(BackupArn=backup_arn)
+            except ClientError:
+                pass
+        for client, table_name in ((east, name), (west, name), (east, import_name)):
+            try:
+                client.delete_table(TableName=table_name)
+            except ClientError:
+                pass
+
+
+def test_dynamodb_restore_legacy_table_name_metadata_uses_table_arn_region():
+    from ministack.core.responses import AccountScopedDict, set_request_account_id, set_request_region
+    from ministack.services import dynamodb as ddb_service
+
+    account_id = "000000000000"
+    table_name = f"legacy-meta-{_uuid_mod.uuid4().hex[:8]}"
+    table_arn = f"arn:aws:dynamodb:us-west-2:{account_id}:table/{table_name}"
+
+    set_request_account_id(account_id)
+    set_request_region("us-east-1")
+    ddb_service.reset()
+    tables = AccountScopedDict()
+    tables[table_name] = {
+        "TableName": table_name,
+        "TableArn": table_arn,
+        "items": {},
+    }
+    ttl_settings = AccountScopedDict()
+    ttl_settings[table_name] = {
+        "TimeToLiveStatus": "ENABLED",
+        "AttributeName": "expires_at",
+    }
+    pitr_settings = AccountScopedDict()
+    pitr_settings[table_name] = True
+    kinesis_destinations = AccountScopedDict()
+    kinesis_destinations[table_name] = [
+        {"StreamArn": f"arn:aws:kinesis:us-west-2:{account_id}:stream/{table_name}"}
+    ]
+    contributor_insights = AccountScopedDict()
+    contributor_insights[f"{table_name}/index/GSI"] = {
+        "ContributorInsightsStatus": "ENABLED",
+    }
+
+    try:
+        ddb_service.restore_state({
+            "tables": tables,
+            "ttl_settings": ttl_settings,
+            "pitr_settings": pitr_settings,
+            "kinesis_destinations": kinesis_destinations,
+            "contributor_insights": contributor_insights,
+        })
+
+        assert ddb_service._ttl_settings.get_scoped(account_id, "us-west-2", table_name)[
+            "AttributeName"
+        ] == "expires_at"
+        assert ddb_service._ttl_settings.get_scoped(account_id, "us-east-1", table_name) is None
+        assert ddb_service._pitr_settings.get_scoped(account_id, "us-west-2", table_name) is True
+        assert ddb_service._kinesis_destinations.get_scoped(account_id, "us-west-2", table_name)
+        assert ddb_service._contributor_insights.get_scoped(
+            account_id,
+            "us-west-2",
+            f"{table_name}/index/GSI",
+        )
+    finally:
+        ddb_service.reset()
+
+
+def test_dynamodb_restore_ambiguous_legacy_metadata_uses_value_arn_region():
+    from ministack.core.responses import (
+        AccountRegionScopedDict,
+        AccountScopedDict,
+        set_request_account_id,
+        set_request_region,
+    )
+    from ministack.services import dynamodb as ddb_service
+
+    account_id = "000000000000"
+    table_name = f"legacy-ambiguous-{_uuid_mod.uuid4().hex[:8]}"
+
+    set_request_account_id(account_id)
+    set_request_region("us-east-1")
+    ddb_service.reset()
+    tables = AccountRegionScopedDict()
+    tables.set_scoped(
+        account_id,
+        "us-east-1",
+        table_name,
+        {
+            "TableName": table_name,
+            "TableArn": f"arn:aws:dynamodb:us-east-1:{account_id}:table/{table_name}",
+            "items": {},
+        },
+    )
+    tables.set_scoped(
+        account_id,
+        "us-west-2",
+        table_name,
+        {
+            "TableName": table_name,
+            "TableArn": f"arn:aws:dynamodb:us-west-2:{account_id}:table/{table_name}",
+            "items": {},
+        },
+    )
+    ttl_settings = AccountScopedDict()
+    ttl_settings[table_name] = {
+        "TimeToLiveStatus": "ENABLED",
+        "AttributeName": "expires_at",
+    }
+    kinesis_destinations = AccountScopedDict()
+    kinesis_destinations[table_name] = [
+        {"StreamArn": f"arn:aws:kinesis:us-west-2:{account_id}:stream/{table_name}"}
+    ]
+
+    try:
+        ddb_service.restore_state({
+            "tables": tables,
+            "ttl_settings": ttl_settings,
+            "kinesis_destinations": kinesis_destinations,
+        })
+
+        assert ddb_service._kinesis_destinations.get_scoped(
+            account_id, "us-east-1", table_name
+        ) is None
+        assert ddb_service._kinesis_destinations.get_scoped(
+            account_id, "us-west-2", table_name
+        ) == [{"StreamArn": f"arn:aws:kinesis:us-west-2:{account_id}:stream/{table_name}"}]
+        assert ddb_service._ttl_settings.get_scoped(account_id, "us-east-1", table_name)[
+            "AttributeName"
+        ] == "expires_at"
+        assert ddb_service._ttl_settings.get_scoped(account_id, "us-west-2", table_name)[
+            "AttributeName"
+        ] == "expires_at"
+
+        east_ttl = ddb_service._ttl_settings.get_scoped(account_id, "us-east-1", table_name)
+        west_ttl = ddb_service._ttl_settings.get_scoped(account_id, "us-west-2", table_name)
+        east_ttl["AttributeName"] = "changed"
+        assert west_ttl["AttributeName"] == "expires_at"
+    finally:
+        ddb_service.reset()
+
 
 def test_dynamodb_scan(ddb):
     try:
