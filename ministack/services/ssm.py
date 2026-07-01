@@ -15,7 +15,9 @@ import os
 import time
 from datetime import datetime, timezone
 
+from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.responses import (
+    AccountRegionScopedDict,
     AccountScopedDict,
     error_response_json,
     get_account_id,
@@ -31,9 +33,9 @@ DEFAULT_PAGE_SIZE = 10
 
 from ministack.core.persistence import PERSIST_STATE, load_state
 
-_parameters = AccountScopedDict()
-_parameter_history = AccountScopedDict()
-_tags = AccountScopedDict()
+_parameters = AccountRegionScopedDict()
+_parameter_history = AccountRegionScopedDict()
+_tags = AccountRegionScopedDict()
 
 
 # ── Persistence ────────────────────────────────────────────
@@ -46,11 +48,155 @@ def get_state():
     }
 
 
+def _legacy_region_for_parameter_history(account_id: str, name: str) -> str:
+    exact_regions = {
+        region
+        for (stored_account_id, region, stored_name), _param in _parameters.all_items()
+        if stored_account_id == account_id and stored_name == name
+    }
+    if len(exact_regions) == 1:
+        return next(iter(exact_regions))
+
+    candidates = set(_parameter_name_candidates(name))
+    regions = {
+        region
+        for (stored_account_id, region, stored_name), _param in _parameters.all_items()
+        if stored_account_id == account_id and stored_name in candidates
+    }
+    if len(regions) == 1:
+        return next(iter(regions))
+    return get_region()
+
+
+def _restore_parameter_history(data) -> None:
+    if isinstance(data, AccountRegionScopedDict):
+        _parameter_history.update(data)
+        return
+    if isinstance(data, AccountScopedDict):
+        for (account_id, name), history in data._data.items():
+            region = _legacy_region_for_parameter_history(account_id, name)
+            _parameter_history.set_scoped(account_id, region, name, history)
+        return
+    if isinstance(data, dict):
+        for key, history in data.items():
+            if isinstance(key, tuple) and len(key) == 3:
+                account_id, region, name = key
+            elif isinstance(key, tuple) and len(key) == 2:
+                account_id, name = key
+                region = _legacy_region_for_parameter_history(account_id, name)
+            else:
+                account_id = get_account_id()
+                name = key
+                region = _legacy_region_for_parameter_history(account_id, name)
+            _parameter_history.set_scoped(account_id, region, name, history)
+
+
 def restore_state(data):
     if data:
         _parameters.update(data.get("parameters", {}))
-        _parameter_history.update(data.get("parameter_history", {}))
+        _restore_parameter_history(data.get("parameter_history", {}))
         _tags.update(data.get("tags", {}))
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+
+
+def _now_epoch() -> float:
+    return datetime.now(timezone.utc).timestamp()
+
+
+def _parameter_resource(name: str) -> str:
+    return f"parameter/{name.lstrip('/')}"
+
+
+def _param_arn(name: str) -> str:
+    return f"arn:aws:ssm:{get_region()}:{get_account_id()}:{_parameter_resource(name)}"
+
+
+def _parameter_name_candidates(name: str) -> list[str]:
+    if not name:
+        return []
+    candidates = [name]
+    alternate = name.lstrip("/") if name.startswith("/") else f"/{name}"
+    if alternate and alternate not in candidates:
+        candidates.append(alternate)
+    return candidates
+
+
+def _parameter_name_from_arn(value: str) -> tuple[str, str, str, bool] | None:
+    try:
+        spec = parse_arn(value)
+    except ArnParseError:
+        return None
+    if spec.partition != "aws" or spec.service != "ssm" or not spec.region:
+        return None
+    if spec.resource.startswith("parameter/"):
+        name = spec.resource[len("parameter/"):]
+        legacy_no_slash = False
+    elif spec.resource.startswith("parameter"):
+        name = spec.resource[len("parameter"):]
+        legacy_no_slash = True
+    else:
+        return None
+    if not name:
+        return None
+    return spec.account_id, spec.region or get_region(), name, legacy_no_slash
+
+
+def _lookup_parameter(name_or_arn: str, *, allow_arn_region: bool = False, flexible_name: bool = False):
+    if not name_or_arn:
+        return None, None
+    if name_or_arn.startswith("arn:"):
+        parsed = _parameter_name_from_arn(name_or_arn)
+        if not parsed:
+            return None, None
+        account_id, region, arn_name, legacy_no_slash = parsed
+        if account_id != get_account_id() or (not allow_arn_region and region != get_region()):
+            return None, None
+        matches = []
+        candidates = [arn_name] if legacy_no_slash else _parameter_name_candidates(arn_name)
+        for candidate in candidates:
+            param = _parameters.get_scoped(account_id, region, candidate)
+            if param:
+                matches.append((candidate, param))
+        for candidate, param in matches:
+            if param.get("ARN") == name_or_arn:
+                return candidate, param
+        if legacy_no_slash:
+            return None, None
+        if matches:
+            return matches[0]
+        return None, None
+
+    candidates = _parameter_name_candidates(name_or_arn) if flexible_name else [name_or_arn]
+    for candidate in candidates:
+        param = _parameters.get(candidate)
+        if param:
+            return candidate, param
+    return None, None
+
+
+def _parameter_tag_arn(resource_type: str, resource_id: str) -> str | None:
+    if resource_type != "Parameter":
+        return resource_id
+    if resource_id.startswith("arn:"):
+        _, param = _lookup_parameter(resource_id)
+        if not param:
+            return None
+        if resource_id in _tags:
+            return resource_id
+        return param["ARN"]
+    _, param = _lookup_parameter(resource_id, flexible_name=True)
+    if param:
+        normalized_id = resource_id if resource_id.startswith("/") else f"/{resource_id}"
+        slash_normalized_arn = _param_arn(normalized_id)
+        if slash_normalized_arn in _tags:
+            return slash_normalized_arn
+        return param["ARN"]
+    if not resource_id.startswith("/"):
+        resource_id = "/" + resource_id
+    return _param_arn(resource_id)
 
 
 try:
@@ -62,18 +208,6 @@ except Exception:
     logging.getLogger(__name__).exception(
         "Failed to restore persisted state; continuing with fresh store"
     )
-
-
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
-
-
-def _now_epoch() -> float:
-    return datetime.now(timezone.utc).timestamp()
-
-
-def _param_arn(name: str) -> str:
-    return f"arn:aws:ssm:{get_region()}:{get_account_id()}:parameter{name}"
 
 
 def _encode_next_token(index: int) -> str:
@@ -126,15 +260,27 @@ def _put_parameter(data):
     value = data.get("Value", "")
     overwrite = data.get("Overwrite", False)
 
-    if name in _parameters and not overwrite:
+    existing = _parameters.get(name)
+    alternate_existing = [
+        candidate
+        for candidate in _parameter_name_candidates(name)
+        if candidate != name and candidate in _parameters
+    ]
+    if alternate_existing and not existing:
+        return error_response_json(
+            "ParameterAlreadyExists",
+            "The parameter already exists. To overwrite this value, set the overwrite option in the request to true.",
+            400,
+        )
+    if existing and not overwrite:
         return error_response_json(
             "ParameterAlreadyExists",
             "The parameter already exists. To overwrite this value, set the overwrite option in the request to true.",
             400,
         )
 
-    version = (_parameters[name]["Version"] + 1) if name in _parameters else 1
-    arn = _param_arn(name)
+    version = (existing["Version"] + 1) if existing else 1
+    arn = existing.get("ARN") if existing else _param_arn(name)
     now = _now_epoch()
 
     stored_value = value
@@ -154,7 +300,7 @@ def _put_parameter(data):
         "ARN": arn,
         "LastModifiedDate": now,
         "DataType": data.get("DataType", "text"),
-        "Description": data.get("Description", _parameters.get(name, {}).get("Description", "")),
+        "Description": data.get("Description", existing.get("Description", "") if existing else ""),
         "Tier": data.get("Tier", "Standard"),
         "AllowedPattern": data.get("AllowedPattern", ""),
         "Policies": data.get("Policies", []),
@@ -201,18 +347,13 @@ def resolve_parameter_value(name_or_arn):
     """
     if not name_or_arn:
         return None
-    name = name_or_arn
-    if name_or_arn.startswith("arn:") and ":parameter" in name_or_arn:
-        name = name_or_arn.split(":parameter", 1)[1]   # -> "/path/name"
-    param = (_parameters.get(name)
-             or _parameters.get("/" + name.lstrip("/"))
-             or _parameters.get(name.lstrip("/")))
+    _, param = _lookup_parameter(name_or_arn, allow_arn_region=True, flexible_name=True)
     return param.get("Value") if param else None
 
 
 def _get_parameter(data):
     name = data.get("Name")
-    param = _parameters.get(name)
+    _, param = _lookup_parameter(name)
     if not param:
         return error_response_json("ParameterNotFound", f"Parameter {name} not found", 400)
     with_decryption = data.get("WithDecryption", False)
@@ -225,7 +366,7 @@ def _get_parameters(data):
     params = []
     invalid = []
     for name in names:
-        p = _parameters.get(name)
+        _, p = _lookup_parameter(name)
         if p:
             params.append(_param_out(p, with_decryption))
         else:
@@ -274,12 +415,17 @@ def _get_parameters_by_path(data):
 
 def _delete_parameter(data):
     name = data.get("Name")
-    if name not in _parameters:
+    if isinstance(name, str) and name.startswith("arn:"):
+        return error_response_json("ValidationException", "Parameter name must not be an ARN", 400)
+    key, param = _lookup_parameter(name)
+    if not param:
         return error_response_json("ParameterNotFound", f"Parameter {name} not found", 400)
-    del _parameters[name]
-    _parameter_history.pop(name, None)
-    arn = _param_arn(name)
-    _tags.pop(arn, None)
+    tag_arn = _parameter_tag_arn("Parameter", key)
+    del _parameters[key]
+    _parameter_history.pop(key, None)
+    for arn in {param["ARN"], tag_arn}:
+        if arn:
+            _tags.pop(arn, None)
     return json_response({})
 
 
@@ -288,10 +434,17 @@ def _delete_parameters(data):
     deleted = []
     invalid = []
     for name in names:
-        if name in _parameters:
-            del _parameters[name]
-            _parameter_history.pop(name, None)
-            _tags.pop(_param_arn(name), None)
+        if isinstance(name, str) and name.startswith("arn:"):
+            invalid.append(name)
+            continue
+        key, param = _lookup_parameter(name)
+        if param:
+            tag_arn = _parameter_tag_arn("Parameter", key)
+            del _parameters[key]
+            _parameter_history.pop(key, None)
+            for arn in {param["ARN"], tag_arn}:
+                if arn:
+                    _tags.pop(arn, None)
             deleted.append(name)
         else:
             invalid.append(name)
@@ -474,12 +627,9 @@ def _add_tags_to_resource(data):
     resource_id = data.get("ResourceId", "")
     new_tags = data.get("Tags", [])
 
-    if resource_type == "Parameter":
-        if not resource_id.startswith("/"):
-            resource_id = "/" + resource_id
-        arn = _param_arn(resource_id)
-    else:
-        arn = resource_id
+    arn = _parameter_tag_arn(resource_type, resource_id)
+    if arn is None:
+        return error_response_json("ParameterNotFound", f"Parameter {resource_id} not found", 400)
 
     if arn not in _tags:
         _tags[arn] = {}
@@ -494,12 +644,9 @@ def _remove_tags_from_resource(data):
     resource_id = data.get("ResourceId", "")
     tag_keys = data.get("TagKeys", [])
 
-    if resource_type == "Parameter":
-        if not resource_id.startswith("/"):
-            resource_id = "/" + resource_id
-        arn = _param_arn(resource_id)
-    else:
-        arn = resource_id
+    arn = _parameter_tag_arn(resource_type, resource_id)
+    if arn is None:
+        return error_response_json("ParameterNotFound", f"Parameter {resource_id} not found", 400)
 
     if arn in _tags:
         for key in tag_keys:
@@ -512,12 +659,9 @@ def _list_tags_for_resource(data):
     resource_type = data.get("ResourceType", "Parameter")
     resource_id = data.get("ResourceId", "")
 
-    if resource_type == "Parameter":
-        if not resource_id.startswith("/"):
-            resource_id = "/" + resource_id
-        arn = _param_arn(resource_id)
-    else:
-        arn = resource_id
+    arn = _parameter_tag_arn(resource_type, resource_id)
+    if arn is None:
+        return error_response_json("ParameterNotFound", f"Parameter {resource_id} not found", 400)
 
     tag_dict = _tags.get(arn, {})
     tag_list = [{"Key": k, "Value": v} for k, v in tag_dict.items()]
