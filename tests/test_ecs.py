@@ -1138,3 +1138,53 @@ def test_ecs_cfn_taskdef_populates_registered_fields(ecs, cfn):
             f"compatibilities missing/empty: {td.get('compatibilities')!r}"
     finally:
         cfn.delete_stack(StackName=stack_name)
+
+def test_ecs_container_secret_ssm_valuefrom_is_region_scoped():
+    """ECS ``secrets[].valueFrom`` SSM references honor the parameter's region.
+
+    A bare parameter name resolves only in the task's request region — a
+    same-name parameter in another region is not visible, and a missing one
+    fails the launch. A full ARN resolves by the ARN's embedded region
+    regardless of the request region."""
+    from ministack.core.responses import (
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+    from ministack.services import ssm as ssm_service
+
+    original_account = get_account_id()
+    original_region = get_region()
+    account_id = "000000000000"
+    name = f"/ecs/secret/{_uuid_mod.uuid4().hex[:8]}"
+    name_cdef = {"secrets": [{"name": "DB_PASS", "valueFrom": name}]}
+
+    try:
+        set_request_account_id(account_id)
+        ssm_service.reset()
+
+        # Parameter created in us-east-1 only.
+        set_request_region("us-east-1")
+        ssm_service._put_parameter({"Name": name, "Type": "String", "Value": "east-secret"})
+        east_arn = ssm_service._parameters.get_scoped(account_id, "us-east-1", name)["ARN"]
+
+        # Same request region → bare-name valueFrom resolves.
+        assert ecs_service._resolve_container_secrets(name_cdef) == {"DB_PASS": "east-secret"}
+
+        # Different request region, no same-name parameter → launch fails.
+        set_request_region("us-west-2")
+        with pytest.raises(ecs_service._SecretResolutionError):
+            ecs_service._resolve_container_secrets(name_cdef)
+
+        # A same-name parameter in the other region is isolated (west, not east).
+        ssm_service._put_parameter({"Name": name, "Type": "String", "Value": "west-secret"})
+        assert ecs_service._resolve_container_secrets(name_cdef) == {"DB_PASS": "west-secret"}
+
+        # Full ARN resolves by the ARN's region regardless of request region.
+        arn_cdef = {"secrets": [{"name": "DB_PASS", "valueFrom": east_arn}]}
+        assert ecs_service._resolve_container_secrets(arn_cdef) == {"DB_PASS": "east-secret"}
+    finally:
+        ssm_service.reset()
+        set_request_account_id(original_account)
+        set_request_region(original_region)
