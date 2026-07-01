@@ -5,6 +5,13 @@ All notable changes to MiniStack will be documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+- **CloudTrail — `CreateTrail` persists `KmsKeyId`** — `CreateTrail` accepted `KmsKeyId` but dropped it (only `UpdateTrail` stored it), so `DescribeTrails`/`GetTrail` read it back empty and Terraform's `aws_cloudtrail` did not converge in a single apply: the first `plan` after `apply` showed a `kms_key_id` diff that only cleared on a second apply (via `UpdateTrail`). `CreateTrail` now stores and returns `KmsKeyId`, normalized to a full key ARN as real AWS echoes it (a bare key id is expanded; an ARN or `alias/...` is kept), and omits the field when no CMK is set so an unset trail shows no diff. `UpdateTrail` normalizes it the same way and likewise omits it from its response when unset. Contributed by @b-rajesh.
+
+---
+
 ## [1.3.70] — 2026-06-30
 
 ### Added

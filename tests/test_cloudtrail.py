@@ -201,6 +201,84 @@ def test_update_trail_persists_fields(ct):
     assert desc["IsMultiRegionTrail"] is True
 
 
+def test_create_trail_persists_kms_key_id(ct):
+    """CreateTrail persists KmsKeyId so DescribeTrails/GetTrail echo it. Without this a
+    CMK-encrypted trail reads back with no KmsKeyId, so Terraform's aws_cloudtrail does
+    not converge in one apply (the value only lands via a later UpdateTrail)."""
+    name = f"trail-kms-{_uid()}"
+    kms_arn = f"arn:aws:kms:{REGION}:000000000000:key/{_uid()}"
+    resp = ct.create_trail(Name=name, S3BucketName="bucket", KmsKeyId=kms_arn)
+    assert resp["KmsKeyId"] == kms_arn
+
+    desc = ct.describe_trails(trailNameList=[name])["trailList"][0]
+    assert desc["KmsKeyId"] == kms_arn
+
+    got = ct.get_trail(Name=name)["Trail"]
+    assert got["KmsKeyId"] == kms_arn
+
+
+def test_create_trail_normalizes_bare_kms_key_id(ct):
+    """A bare KMS key id is returned as a full key ARN, matching real AWS, which
+    always echoes the CMK as an ARN — so a trail created with a key id shows no diff."""
+    name = f"trail-kmsid-{_uid()}"
+    key_id = f"{_uid()}-{_uid()}"
+    resp = ct.create_trail(Name=name, S3BucketName="bucket", KmsKeyId=key_id)
+    assert resp["KmsKeyId"] == f"arn:aws:kms:{REGION}:000000000000:key/{key_id}"
+    desc = ct.describe_trails(trailNameList=[name])["trailList"][0]
+    assert desc["KmsKeyId"] == resp["KmsKeyId"]
+
+
+def test_create_trail_without_cmk_omits_kms_key_id(ct):
+    """A trail created without a CMK omits KmsKeyId entirely rather than returning "".
+    Real AWS omits unset optional fields; emitting an empty string for an ARN-typed
+    field makes the Terraform aws provider fail (`parsing ... ARN (): arn: invalid
+    prefix`), so guard that neither the create response nor the read-back carries one."""
+    name = f"trail-nocmk-{_uid()}"
+    resp = ct.create_trail(Name=name, S3BucketName="bucket")
+    assert "KmsKeyId" not in resp
+    assert "SnsTopicARN" not in resp
+
+    desc = ct.describe_trails(trailNameList=[name])["trailList"][0]
+    assert "KmsKeyId" not in desc
+    assert "SnsTopicARN" not in desc
+
+
+def test_create_trail_keeps_kms_alias(ct):
+    """An ``alias/...`` reference is echoed verbatim — real AWS resolves it to the
+    target key ARN, but the emulator keeps the caller's value rather than fabricate a
+    wrong ARN (resolving the alias would need a KMS lookup it does not do)."""
+    name = f"trail-alias-{_uid()}"
+    alias = f"alias/ct-{_uid()}"
+    resp = ct.create_trail(Name=name, S3BucketName="bucket", KmsKeyId=alias)
+    assert resp["KmsKeyId"] == alias
+    assert ct.describe_trails(trailNameList=[name])["trailList"][0]["KmsKeyId"] == alias
+
+
+def test_update_trail_normalizes_kms_key_id(ct):
+    """UpdateTrail normalizes KmsKeyId the same way CreateTrail does: a bare key id
+    becomes a full key ARN; an already-full ARN is left as-is."""
+    name = f"trail-upkms-{_uid()}"
+    ct.create_trail(Name=name, S3BucketName="bucket")
+    key_id = f"{_uid()}-{_uid()}"
+    out = ct.update_trail(Name=name, KmsKeyId=key_id)
+    assert out["KmsKeyId"] == f"arn:aws:kms:{REGION}:000000000000:key/{key_id}"
+    assert ct.describe_trails(trailNameList=[name])["trailList"][0]["KmsKeyId"] == out["KmsKeyId"]
+    full = f"arn:aws:kms:{REGION}:000000000000:key/{_uid()}"
+    assert ct.update_trail(Name=name, KmsKeyId=full)["KmsKeyId"] == full
+
+
+def test_update_trail_without_cmk_omits_kms_key_id(ct):
+    """UpdateTrail on a trail with no CMK omits KmsKeyId rather than returning "".
+    AWS omits unset optional fields; an empty ARN makes the Terraform aws provider fail
+    (`parsing ... ARN (): arn: invalid prefix`), so neither the UpdateTrail response nor
+    the read-back may carry one — matching CreateTrail and DescribeTrails/GetTrail."""
+    name = f"trail-upnocmk-{_uid()}"
+    ct.create_trail(Name=name, S3BucketName="bucket")
+    out = ct.update_trail(Name=name, S3KeyPrefix="logs/")
+    assert "KmsKeyId" not in out
+    assert "KmsKeyId" not in ct.describe_trails(trailNameList=[name])["trailList"][0]
+
+
 def test_start_logging_not_found(ct):
     with pytest.raises(ClientError) as exc:
         ct.start_logging(Name=f"nonexistent-{_uid()}")
