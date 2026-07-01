@@ -113,3 +113,139 @@ def test_pipes_dynamodb_stream_read_rejects_cross_account_source(monkeypatch):
     finally:
         _pipes.reset()
         _ddb._stream_records.clear()
+
+
+def test_pipes_poller_processes_same_name_pipes_in_each_region(monkeypatch):
+    from ministack.core.responses import (
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+
+    original_account = get_account_id()
+    original_region = get_region()
+    account_id = "000000000000"
+    table_name = "SamePipeTable"
+
+    _pipes.reset()
+    _ddb._stream_records.clear()
+    try:
+        set_request_account_id(account_id)
+        for region, label in (("us-east-1", "east"), ("us-west-2", "west")):
+            source_arn = (
+                f"arn:aws:dynamodb:{region}:{account_id}:"
+                f"table/{table_name}/stream/2026-05-22T00:00:00.000"
+            )
+            target_arn = f"arn:aws:sns:{region}:{account_id}:PipeTopic"
+            pipe_arn = f"arn:aws:pipes:{region}:{account_id}:pipe/SamePipe"
+            record = {
+                "eventID": f"evt-{label}",
+                "eventSource": "aws:dynamodb",
+            }
+
+            _ddb._stream_records.set_scoped(account_id, region, table_name, [record])
+            _pipes._pipes.set_scoped(
+                account_id,
+                region,
+                "SamePipe",
+                {
+                    "Name": "SamePipe",
+                    "Arn": pipe_arn,
+                    "Source": source_arn,
+                    "Target": target_arn,
+                    "CurrentState": "RUNNING",
+                    "StartingPosition": "TRIM_HORIZON",
+                },
+            )
+            _pipes._positions.set_scoped(account_id, region, pipe_arn, 0)
+
+        set_request_region("eu-central-1")
+        delivered = []
+        monkeypatch.setattr(
+            _pipes,
+            "_publish_record_to_sns",
+            lambda topic_arn, pipe, record: delivered.append(
+                (topic_arn, pipe["Arn"], record["eventID"])
+            ),
+        )
+
+        _pipes._poll_once()
+
+        assert sorted(delivered) == [
+            (
+                f"arn:aws:sns:us-east-1:{account_id}:PipeTopic",
+                f"arn:aws:pipes:us-east-1:{account_id}:pipe/SamePipe",
+                "evt-east",
+            ),
+            (
+                f"arn:aws:sns:us-west-2:{account_id}:PipeTopic",
+                f"arn:aws:pipes:us-west-2:{account_id}:pipe/SamePipe",
+                "evt-west",
+            ),
+        ]
+        assert _pipes._positions.get_scoped(
+            account_id,
+            "us-east-1",
+            f"arn:aws:pipes:us-east-1:{account_id}:pipe/SamePipe",
+        ) == 1
+        assert _pipes._positions.get_scoped(
+            account_id,
+            "us-west-2",
+            f"arn:aws:pipes:us-west-2:{account_id}:pipe/SamePipe",
+        ) == 1
+    finally:
+        _pipes.reset()
+        _ddb._stream_records.clear()
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
+def test_pipes_restore_legacy_account_scoped_state_uses_pipe_arn_region():
+    from ministack.core.responses import (
+        AccountScopedDict,
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+
+    original_account = get_account_id()
+    original_region = get_region()
+    account_id = "000000000000"
+    pipe_arn = f"arn:aws:pipes:us-west-2:{account_id}:pipe/LegacyPipe"
+
+    legacy_pipes = AccountScopedDict()
+    legacy_pipes._data[(account_id, "LegacyPipe")] = {
+        "Name": "LegacyPipe",
+        "Arn": pipe_arn,
+        "Source": (
+            f"arn:aws:dynamodb:us-west-2:{account_id}:"
+            "table/LegacyPipeTable/stream/2026-05-22T00:00:00.000"
+        ),
+        "Target": f"arn:aws:sns:us-west-2:{account_id}:PipeTopic",
+        "CurrentState": "STOPPED",
+        "StartingPosition": "LATEST",
+    }
+    legacy_positions = AccountScopedDict()
+    legacy_positions._data[(account_id, pipe_arn)] = 7
+
+    _pipes.reset()
+    try:
+        set_request_account_id(account_id)
+        set_request_region("us-east-1")
+
+        _pipes.restore_state({
+            "pipes": legacy_pipes,
+            "positions": legacy_positions,
+        })
+
+        assert _pipes._pipes.get_scoped(account_id, "us-east-1", "LegacyPipe") is None
+        assert _pipes._pipes.get_scoped(account_id, "us-west-2", "LegacyPipe")[
+            "Arn"
+        ] == pipe_arn
+        assert _pipes._positions.get_scoped(account_id, "us-west-2", pipe_arn) == 7
+    finally:
+        _pipes.reset()
+        set_request_account_id(original_account)
+        set_request_region(original_region)
