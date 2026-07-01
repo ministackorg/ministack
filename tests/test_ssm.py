@@ -748,3 +748,46 @@ def test_ssm_resolve_parameter_value_uses_arn_region_without_tail_fallback():
         ssm_service.reset()
         set_request_account_id(original_account)
         set_request_region(original_region)
+
+
+def test_cloudformation_ssm_parameter_is_region_scoped():
+    """A CloudFormation-created ``AWS::SSM::Parameter`` is stored under the
+    deploy request's region, so a client in another region cannot read it."""
+    from ministack.core.responses import (
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+    from ministack.services import ssm as ssm_service
+    from ministack.services.cloudformation import provisioners
+
+    original_account = get_account_id()
+    original_region = get_region()
+    account_id = "000000000000"
+    name = f"cfn-region-{_uuid_mod.uuid4().hex[:8]}"
+
+    try:
+        set_request_account_id(account_id)
+        set_request_region("us-west-2")
+        ssm_service.reset()
+        provisioners._ssm_create("Param", {"Name": name, "Value": "west"}, "stack")
+
+        # Stored only under the deploy region.
+        assert ssm_service._parameters.get_scoped(account_id, "us-west-2", name) is not None
+        assert ssm_service._parameters.get_scoped(account_id, "us-east-1", name) is None
+
+        # Readable in the deploy region.
+        status, _headers, body = ssm_service._get_parameter({"Name": name})
+        assert status == 200
+        assert json.loads(body)["Parameter"]["Value"] == "west"
+
+        # Absent from another region.
+        set_request_region("us-east-1")
+        status, _headers, body = ssm_service._get_parameter({"Name": name})
+        assert status == 400
+        assert json.loads(body)["__type"] == "ParameterNotFound"
+    finally:
+        ssm_service.reset()
+        set_request_account_id(original_account)
+        set_request_region(original_region)
