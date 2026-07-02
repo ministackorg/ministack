@@ -413,6 +413,119 @@ def test_lambda_esm_sqs_comprehensive(lam, sqs):
 
     lam.delete_event_source_mapping(UUID=esm_uuid)
 
+def test_lambda_esm_scaling_config_round_trip(lam, sqs):
+    try:
+        lam.delete_function(FunctionName="esm-scaling-func")
+    except ClientError:
+        pass
+
+    lam.create_function(
+        FunctionName="esm-scaling-func",
+        Runtime="python3.12",
+        Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _make_zip("def handler(event, context):\n    return {}\n")},
+    )
+    q_url = sqs.create_queue(QueueName="esm-scaling-queue")["QueueUrl"]
+    q_arn = sqs.get_queue_attributes(
+        QueueUrl=q_url, AttributeNames=["QueueArn"],
+    )["Attributes"]["QueueArn"]
+
+    resp = lam.create_event_source_mapping(
+        EventSourceArn=q_arn,
+        FunctionName="esm-scaling-func",
+        BatchSize=5,
+        MaximumBatchingWindowInSeconds=20,
+        ScalingConfig={"MaximumConcurrency": 7},
+        Enabled=True,
+    )
+    esm_uuid = resp["UUID"]
+    assert resp["ScalingConfig"] == {"MaximumConcurrency": 7}
+    assert resp["MaximumBatchingWindowInSeconds"] == 20
+
+    got = lam.get_event_source_mapping(UUID=esm_uuid)
+    assert got["ScalingConfig"] == {"MaximumConcurrency": 7}
+
+    listed = lam.list_event_source_mappings(FunctionName="esm-scaling-func")
+    entry = next(e for e in listed["EventSourceMappings"] if e["UUID"] == esm_uuid)
+    assert entry["ScalingConfig"] == {"MaximumConcurrency": 7}
+
+    updated = lam.update_event_source_mapping(
+        UUID=esm_uuid, ScalingConfig={"MaximumConcurrency": 50},
+    )
+    assert updated["ScalingConfig"] == {"MaximumConcurrency": 50}
+
+    lam.delete_event_source_mapping(UUID=esm_uuid)
+
+def test_lambda_esm_no_scaling_config_omits_field(lam, sqs):
+    try:
+        lam.delete_function(FunctionName="esm-noscaling-func")
+    except ClientError:
+        pass
+
+    lam.create_function(
+        FunctionName="esm-noscaling-func",
+        Runtime="python3.12",
+        Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _make_zip("def handler(event, context):\n    return {}\n")},
+    )
+    q_url = sqs.create_queue(QueueName="esm-noscaling-queue")["QueueUrl"]
+    q_arn = sqs.get_queue_attributes(
+        QueueUrl=q_url, AttributeNames=["QueueArn"],
+    )["Attributes"]["QueueArn"]
+
+    resp = lam.create_event_source_mapping(
+        EventSourceArn=q_arn, FunctionName="esm-noscaling-func", BatchSize=5,
+    )
+    assert "ScalingConfig" not in resp
+
+    lam.delete_event_source_mapping(UUID=resp["UUID"])
+
+@pytest.mark.parametrize("bad_value", [1, 1001])
+def test_lambda_esm_scaling_config_out_of_range_rejected(lam, sqs, bad_value):
+    import urllib.error
+    import urllib.request
+
+    try:
+        lam.delete_function(FunctionName="esm-badscaling-func")
+    except ClientError:
+        pass
+
+    lam.create_function(
+        FunctionName="esm-badscaling-func",
+        Runtime="python3.12",
+        Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _make_zip("def handler(event, context):\n    return {}\n")},
+    )
+    q_url = sqs.create_queue(QueueName="esm-badscaling-queue")["QueueUrl"]
+    q_arn = sqs.get_queue_attributes(
+        QueueUrl=q_url, AttributeNames=["QueueArn"],
+    )["Attributes"]["QueueArn"]
+
+    payload = json.dumps({
+        "EventSourceArn": q_arn,
+        "FunctionName": "esm-badscaling-func",
+        "ScalingConfig": {"MaximumConcurrency": bad_value},
+    }).encode()
+    req = urllib.request.Request(
+        f"{_endpoint}/2015-03-31/event-source-mappings",
+        data=payload,
+        headers={
+            "Authorization": "AWS4-HMAC-SHA256 Credential=test/20260101/us-east-1/lambda/aws4_request",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        urllib.request.urlopen(req)
+        assert False, "Expected a ValidationException error response"
+    except urllib.error.HTTPError as e:
+        assert e.code == 400
+        body = json.loads(e.read())
+        assert body.get("__type") == "ValidationException", body
+
 def test_lambda_esm_filter_criteria_stored_on_create(lam, sqs):
     """FilterCriteria specified at CreateEventSourceMapping must be echoed
     back by GetEventSourceMapping — it was silently dropped before this fix."""

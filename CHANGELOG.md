@@ -5,6 +5,13 @@ All notable changes to MiniStack will be documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+- **Lambda — event source mappings accept and persist `ScalingConfig` (`MaximumConcurrency`)** — `CreateEventSourceMapping` and `UpdateEventSourceMapping` now accept a `ScalingConfig` block and echo it back on create, `GetEventSourceMapping`, and `ListEventSourceMappings`, so the SQS-trigger `scaling_config { maximum_concurrency = N }` on the Terraform `aws_lambda_event_source_mapping` resource round-trips instead of being silently dropped (which surfaced as a perpetual plan diff). `MaximumConcurrency` outside the AWS-valid 2–1000 range is rejected with `ValidationException`. `BatchSize` and `MaximumBatchingWindowInSeconds` were already supported. Contributed by @liammizrahi.
+
+---
+
 ## [1.3.70] — 2026-06-30
 
 ### Added
