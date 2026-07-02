@@ -5,6 +5,13 @@ All notable changes to MiniStack will be documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+- **Organizations — `ListParents` + tag ops for the OU Terraform round-trip** — adds `ListParents(ChildId)` (returns the single parent AWS reports — `{"Parents": [{"Id", "Type"}]}`, `Type=ROOT` for the org root else `ORGANIZATIONAL_UNIT` — from the `_ParentId` already stored on every OU and account; unknown `ChildId` → `ChildNotFoundException`) **and** `TagResource` / `UntagResource` / `ListTagsForResource` for taggable org resources. The Terraform/OpenTofu `aws_organizations_organizational_unit` Read calls **both** `ListParents` (to populate `parent_id`, which `DescribeOrganizationalUnit` omits) and `ListTagsForResource` on every create + refresh — even for an untagged OU. With either missing, `apply` hard-stops on the read-back (`InvalidAction: Operation '<op>' not implemented`), so a multi-OU hierarchy never finished creating and was never idempotent; with both, it applies cleanly and re-applies as a no-op. No new state. Closes #990.
+
+---
+
 ## [1.3.70] — 2026-06-30
 
 ### Added
@@ -26,8 +33,6 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 ### Fixed
 - **EKS — `DescribeCluster` returns a host-reachable endpoint on every path** — `DescribeCluster` now advertises the host-published port, `https://{MINISTACK_HOST}:{port}` (`MINISTACK_HOST` defaults to `localhost`), uniformly on cluster create, OIDC-config restart, and persistence restore. Previously the failure-fallback and restore paths could leave a stale value, so `aws eks update-kubeconfig` + kubectl from the host got an unreachable endpoint. The k3s container publishes 6443 to that host port (`ports={"6443/tcp": port}`), so the endpoint works from the host and from containers that can route to `MINISTACK_HOST`, keeping the `ACTIVE`-cluster shape consistent for `aws eks update-kubeconfig` and Terraform. Contributed by @b-rajesh.
 - **SQS — `SendMessage` rejects message bodies with XML 1.0 forbidden characters** — AWS SQS only accepts characters valid in XML 1.0 and returns `InvalidMessageContents` for anything else; MiniStack silently accepted them, so a payload that fails against real AWS passed locally. `SendMessage` (and every `SendMessageBatch` entry) now rejects bodies containing C0 control characters other than tab/LF/CR, the surrogate block `#xD800`–`#xDFFF`, and `#xFFFE`/`#xFFFF` with `InvalidMessageContents`. Contributed by @yamachu.
-
----
 
 ## [1.3.68] — 2026-06-25
 
