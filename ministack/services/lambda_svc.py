@@ -4987,11 +4987,12 @@ def _poll_dynamodb_streams():
         if not batch:
             continue
 
+        raw_len = len(batch)
         batch = _apply_filter_criteria(batch, esm)
         if not batch:
             # All records filtered — advance position so we don't re-evaluate.
             with _dynamodb_stream_positions_lock:
-                _dynamodb_stream_positions[esm_id] = pos + batch_size
+                _dynamodb_stream_positions[esm_id] = pos + raw_len
             continue
 
         event = {"Records": batch}
@@ -5008,7 +5009,7 @@ def _poll_dynamodb_streams():
             )
         else:
             with _dynamodb_stream_positions_lock:
-                _dynamodb_stream_positions[esm_id] = pos + len(batch)
+                _dynamodb_stream_positions[esm_id] = pos + raw_len
             esm["LastProcessingResult"] = f"OK - {len(batch)} records"
             log_output = result.get("log", "")
             if log_output:
