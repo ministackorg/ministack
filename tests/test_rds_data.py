@@ -725,7 +725,7 @@ def test_rds_data_secret_credentials_parsing():
     """_get_secret_credentials extracts username and password from secret."""
     from ministack.core.responses import set_request_account_id
     from ministack.services import rds_data, secretsmanager
-    set_request_account_id("test")
+    set_request_account_id("000000000000")
     # Create a secret with JSON credentials
     secretsmanager._secrets["test-cred-secret"] = {
         "ARN": "arn:aws:secretsmanager:us-east-1:000000000000:secret:test-cred",
@@ -749,7 +749,7 @@ def test_rds_data_secret_credentials_no_username():
     """_get_secret_credentials returns None username for password-only secret."""
     from ministack.core.responses import set_request_account_id
     from ministack.services import rds_data, secretsmanager
-    set_request_account_id("test")
+    set_request_account_id("000000000000")
     secretsmanager._secrets["pw-only-secret"] = {
         "ARN": "arn:aws:secretsmanager:us-east-1:000000000000:secret:pw-only",
         "Name": "pw-only-secret",
