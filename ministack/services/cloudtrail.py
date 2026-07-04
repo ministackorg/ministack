@@ -92,6 +92,15 @@ def _trail_arn(name: str) -> str:
     return f"arn:aws:cloudtrail:{get_region()}:{get_account_id()}:trail/{name}"
 
 
+def _normalize_kms_key_id(value: str) -> str:
+    """Echo the CMK as real AWS does — a full key ARN. A bare key id is expanded to
+    its ARN; an ARN or an ``alias/...`` reference is kept as sent (resolving an alias
+    to its target key ARN would need a KMS lookup we don't do). Returns "" when unset."""
+    if not value or value.startswith("arn:") or value.startswith("alias/"):
+        return value
+    return f"arn:aws:kms:{get_region()}:{get_account_id()}:key/{value}"
+
+
 def _get_event_queue() -> collections.deque:
     q = _events.get("events")
     if q is None:
@@ -255,19 +264,27 @@ def _create_trail(body: dict):
         "IsOrganizationTrail": body.get("IsOrganizationTrail", False),
         "IsLogging": True,
     }
+    # CreateTrail must persist KmsKeyId so DescribeTrails/GetTrail echo it; otherwise a
+    # CMK set at create is dropped and Terraform's aws_cloudtrail needs a second apply to
+    # converge (only UpdateTrail stored it). Stored normalized to a key ARN, and only when
+    # set — AWS omits the field when there is no CMK, and emitting "" yields a spurious diff.
+    kms = _normalize_kms_key_id(body.get("KmsKeyId", ""))
+    if kms:
+        trail["KmsKeyId"] = kms
     _trails[name] = trail
-    return _ok(
-        {
-            "Name": name,
-            "S3BucketName": trail["S3BucketName"],
-            "S3KeyPrefix": trail["S3KeyPrefix"],
-            "IncludeGlobalServiceEvents": trail["IncludeGlobalServiceEvents"],
-            "IsMultiRegionTrail": trail["IsMultiRegionTrail"],
-            "TrailARN": arn,
-            "LogFileValidationEnabled": trail["LogFileValidationEnabled"],
-            "IsOrganizationTrail": trail["IsOrganizationTrail"],
-        }
-    )
+    resp = {
+        "Name": name,
+        "S3BucketName": trail["S3BucketName"],
+        "S3KeyPrefix": trail["S3KeyPrefix"],
+        "IncludeGlobalServiceEvents": trail["IncludeGlobalServiceEvents"],
+        "IsMultiRegionTrail": trail["IsMultiRegionTrail"],
+        "TrailARN": arn,
+        "LogFileValidationEnabled": trail["LogFileValidationEnabled"],
+        "IsOrganizationTrail": trail["IsOrganizationTrail"],
+    }
+    if kms:
+        resp["KmsKeyId"] = kms
+    return _ok(resp)
 
 
 def _delete_trail(body: dict):
@@ -382,28 +399,38 @@ def _update_trail(body: dict):
         ("EnableLogFileValidation", "LogFileValidationEnabled"),
         ("CloudWatchLogsLogGroupArn", "CloudWatchLogsLogGroupArn"),
         ("CloudWatchLogsRoleArn", "CloudWatchLogsRoleArn"),
-        ("KmsKeyId", "KmsKeyId"),
         ("IsOrganizationTrail", "IsOrganizationTrail"),
     ):
         if src in body:
             trail[dst] = body[src]
-    return _ok(
-        {
-            "Name": name,
-            "S3BucketName": trail.get("S3BucketName", ""),
-            "S3KeyPrefix": trail.get("S3KeyPrefix", ""),
-            "SnsTopicName": trail.get("SnsTopicName", ""),
-            "SnsTopicARN": trail.get("SnsTopicARN", ""),
-            "IncludeGlobalServiceEvents": trail.get("IncludeGlobalServiceEvents", True),
-            "IsMultiRegionTrail": trail.get("IsMultiRegionTrail", False),
-            "TrailARN": trail["TrailARN"],
-            "LogFileValidationEnabled": trail.get("LogFileValidationEnabled", False),
-            "CloudWatchLogsLogGroupArn": trail.get("CloudWatchLogsLogGroupArn", ""),
-            "CloudWatchLogsRoleArn": trail.get("CloudWatchLogsRoleArn", ""),
-            "KmsKeyId": trail.get("KmsKeyId", ""),
-            "IsOrganizationTrail": trail.get("IsOrganizationTrail", False),
-        }
-    )
+    # KmsKeyId normalized like CreateTrail; cleared (not stored as "") when unset so the
+    # read-back stays AWS-shaped and Terraform sees no spurious diff.
+    if "KmsKeyId" in body:
+        kms = _normalize_kms_key_id(body["KmsKeyId"])
+        if kms:
+            trail["KmsKeyId"] = kms
+        else:
+            trail.pop("KmsKeyId", None)
+    resp = {
+        "Name": name,
+        "S3BucketName": trail.get("S3BucketName", ""),
+        "S3KeyPrefix": trail.get("S3KeyPrefix", ""),
+        "SnsTopicName": trail.get("SnsTopicName", ""),
+        "SnsTopicARN": trail.get("SnsTopicARN", ""),
+        "IncludeGlobalServiceEvents": trail.get("IncludeGlobalServiceEvents", True),
+        "IsMultiRegionTrail": trail.get("IsMultiRegionTrail", False),
+        "TrailARN": trail["TrailARN"],
+        "LogFileValidationEnabled": trail.get("LogFileValidationEnabled", False),
+        "CloudWatchLogsLogGroupArn": trail.get("CloudWatchLogsLogGroupArn", ""),
+        "CloudWatchLogsRoleArn": trail.get("CloudWatchLogsRoleArn", ""),
+        "IsOrganizationTrail": trail.get("IsOrganizationTrail", False),
+    }
+    # Omit KmsKeyId when unset, matching CreateTrail and the DescribeTrails/GetTrail
+    # read-back: AWS omits the field when there is no CMK, and an empty "" is not a
+    # valid ARN (the Terraform aws provider fails parsing it).
+    if trail.get("KmsKeyId"):
+        resp["KmsKeyId"] = trail["KmsKeyId"]
+    return _ok(resp)
 
 
 def _put_event_selectors(body: dict):

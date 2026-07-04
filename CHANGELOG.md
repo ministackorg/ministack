@@ -9,6 +9,8 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 - **Organizations — `ListParents` + tag ops for the OU Terraform round-trip** — adds `ListParents(ChildId)` (returns the single parent AWS reports — `{"Parents": [{"Id", "Type"}]}`, `Type=ROOT` for the org root else `ORGANIZATIONAL_UNIT` — from the `_ParentId` already stored on every OU and account; unknown `ChildId` → `ChildNotFoundException`) **and** `TagResource` / `UntagResource` / `ListTagsForResource` for taggable org resources. The Terraform/OpenTofu `aws_organizations_organizational_unit` Read calls **both** `ListParents` (to populate `parent_id`, which `DescribeOrganizationalUnit` omits) and `ListTagsForResource` on every create + refresh — even for an untagged OU. With either missing, `apply` hard-stops on the read-back (`InvalidAction: Operation '<op>' not implemented`), so a multi-OU hierarchy never finished creating and was never idempotent; with both, it applies cleanly and re-applies as a no-op. No new state. Closes #990.
+### Fixed
+- **CloudTrail — `CreateTrail` persists `KmsKeyId`** — `CreateTrail` accepted `KmsKeyId` but dropped it (only `UpdateTrail` stored it), so `DescribeTrails`/`GetTrail` read it back empty and Terraform's `aws_cloudtrail` did not converge in a single apply: the first `plan` after `apply` showed a `kms_key_id` diff that only cleared on a second apply (via `UpdateTrail`). `CreateTrail` now stores and returns `KmsKeyId`, normalized to a full key ARN as real AWS echoes it (a bare key id is expanded; an ARN or `alias/...` is kept), and omits the field when no CMK is set so an unset trail shows no diff. `UpdateTrail` normalizes it the same way and likewise omits it from its response when unset. Contributed by @b-rajesh.
 
 ---
 
