@@ -81,3 +81,125 @@ def test_organizations_list_ous_for_parent():
         assert any(x["Id"] == ou["Id"] for x in listed)
     finally:
         o.delete_organizational_unit(OrganizationalUnitId=ou["Id"])
+
+
+def test_organizations_list_parents_ou_under_root():
+    """Terraform Read path: ListParents on a top-level OU returns the ROOT parent."""
+    o = _client_for("555555555555")
+    root_id = o.list_roots()["Roots"][0]["Id"]
+    ou = o.create_organizational_unit(ParentId=root_id, Name="Platform")["OrganizationalUnit"]
+    try:
+        parents = o.list_parents(ChildId=ou["Id"])["Parents"]
+        assert len(parents) == 1
+        assert parents[0]["Id"] == root_id
+        assert parents[0]["Type"] == "ROOT"
+    finally:
+        o.delete_organizational_unit(OrganizationalUnitId=ou["Id"])
+
+
+def test_organizations_list_parents_nested_ou():
+    """A nested OU reports its parent OU with Type ORGANIZATIONAL_UNIT."""
+    o = _client_for("666666666666")
+    root_id = o.list_roots()["Roots"][0]["Id"]
+    parent = o.create_organizational_unit(ParentId=root_id, Name="Workloads")["OrganizationalUnit"]
+    child = o.create_organizational_unit(ParentId=parent["Id"], Name="Prod")["OrganizationalUnit"]
+    try:
+        parents = o.list_parents(ChildId=child["Id"])["Parents"]
+        assert len(parents) == 1
+        assert parents[0]["Id"] == parent["Id"]
+        assert parents[0]["Type"] == "ORGANIZATIONAL_UNIT"
+    finally:
+        o.delete_organizational_unit(OrganizationalUnitId=child["Id"])
+        o.delete_organizational_unit(OrganizationalUnitId=parent["Id"])
+
+
+def test_organizations_list_parents_account():
+    """ListParents resolves an account's parent (master account sits under root)."""
+    o = _client_for("777777777777")
+    root_id = o.list_roots()["Roots"][0]["Id"]
+    parents = o.list_parents(ChildId="777777777777")["Parents"]
+    assert len(parents) == 1
+    assert parents[0]["Id"] == root_id
+    assert parents[0]["Type"] == "ROOT"
+
+
+def test_organizations_list_parents_unknown_child():
+    o = _client_for("888888888888")
+    with pytest.raises(ClientError) as exc:
+        o.list_parents(ChildId="ou-xxxx-doesnotexist")
+    assert exc.value.response["Error"]["Code"] == "ChildNotFoundException"
+
+
+def test_organizations_tag_untag_list_resource():
+    """TagResource / UntagResource / ListTagsForResource round-trip on an OU — the tag
+    read-back the Terraform aws_organizations_organizational_unit Read requires."""
+    o = _client_for("999999999999")
+    root_id = o.list_roots()["Roots"][0]["Id"]
+    ou = o.create_organizational_unit(ParentId=root_id, Name="Tagged")["OrganizationalUnit"]
+    try:
+        o.tag_resource(
+            ResourceId=ou["Id"],
+            Tags=[{"Key": "team", "Value": "platform"}, {"Key": "env", "Value": "prod"}],
+        )
+        tags = {t["Key"]: t["Value"] for t in o.list_tags_for_resource(ResourceId=ou["Id"])["Tags"]}
+        assert tags == {"team": "platform", "env": "prod"}
+        o.untag_resource(ResourceId=ou["Id"], TagKeys=["env"])
+        tags = {t["Key"]: t["Value"] for t in o.list_tags_for_resource(ResourceId=ou["Id"])["Tags"]}
+        assert tags == {"team": "platform"}
+    finally:
+        o.delete_organizational_unit(OrganizationalUnitId=ou["Id"])
+
+
+def test_organizations_create_ou_with_inline_tags():
+    """CreateOrganizationalUnit captures inline Tags so the Terraform Read sees them."""
+    o = _client_for("112233445566")
+    root_id = o.list_roots()["Roots"][0]["Id"]
+    ou = o.create_organizational_unit(
+        ParentId=root_id, Name="InlineTagged",
+        Tags=[{"Key": "owner", "Value": "secops"}],
+    )["OrganizationalUnit"]
+    try:
+        tags = {t["Key"]: t["Value"] for t in o.list_tags_for_resource(ResourceId=ou["Id"])["Tags"]}
+        assert tags == {"owner": "secops"}
+    finally:
+        o.delete_organizational_unit(OrganizationalUnitId=ou["Id"])
+
+
+def test_organizations_list_tags_untagged_ou_empty():
+    """An untagged OU returns an empty tag set (not an error) — the provider Read calls
+    ListTagsForResource on every OU whether or not tags are set, so it must not fail."""
+    o = _client_for("223344556677")
+    root_id = o.list_roots()["Roots"][0]["Id"]
+    ou = o.create_organizational_unit(ParentId=root_id, Name="Untagged")["OrganizationalUnit"]
+    try:
+        assert o.list_tags_for_resource(ResourceId=ou["Id"])["Tags"] == []
+    finally:
+        o.delete_organizational_unit(OrganizationalUnitId=ou["Id"])
+
+
+def test_organizations_list_tags_unknown_resource():
+    """ListTagsForResource on a resource that doesn't exist → TargetNotFoundException,
+    matching real AWS (not an empty set)."""
+    o = _client_for("334455667788")
+    o.list_roots()  # ensure org
+    with pytest.raises(ClientError) as exc:
+        o.list_tags_for_resource(ResourceId="ou-9999-doesnotexist")
+    assert exc.value.response["Error"]["Code"] == "TargetNotFoundException"
+
+
+def test_organizations_tags_are_account_scoped():
+    """Tags are account-scoped: one tenant's OU + tags are invisible to another
+    (a different account can't even resolve the OU → TargetNotFoundException)."""
+    a = _client_for("445566778899")
+    b = _client_for("556677889900")
+    root_a = a.list_roots()["Roots"][0]["Id"]
+    ou_a = a.create_organizational_unit(ParentId=root_a, Name="ScopedA")["OrganizationalUnit"]
+    try:
+        a.tag_resource(ResourceId=ou_a["Id"], Tags=[{"Key": "owner", "Value": "a"}])
+        with pytest.raises(ClientError) as exc:
+            b.list_tags_for_resource(ResourceId=ou_a["Id"])
+        assert exc.value.response["Error"]["Code"] == "TargetNotFoundException"
+        tags = {t["Key"]: t["Value"] for t in a.list_tags_for_resource(ResourceId=ou_a["Id"])["Tags"]}
+        assert tags == {"owner": "a"}
+    finally:
+        a.delete_organizational_unit(OrganizationalUnitId=ou_a["Id"])
