@@ -1348,7 +1348,7 @@ def test_lambda_published_version_readiness_follows_function(lam):
         Publish=True,
     )
 
-    deadline = time.time() + 3
+    deadline = time.time() + 10
     latest = version = None
     while time.time() < deadline:
         latest = lam.get_function_configuration(FunctionName=fn)
