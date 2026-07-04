@@ -33,6 +33,7 @@ _orgs = AccountScopedDict()       # singleton "self" -> Organization dict
 _accounts = AccountScopedDict()   # account_id -> Account dict
 _ous = AccountScopedDict()        # ou_id -> OU dict (with ParentId)
 _roots = AccountScopedDict()      # root_id -> Root dict (single root)
+_tags = AccountScopedDict()       # resource_id (ou-/account/r-/policy) -> {tag_key: tag_value}
 
 
 def reset():
@@ -40,6 +41,7 @@ def reset():
     _accounts.clear()
     _ous.clear()
     _roots.clear()
+    _tags.clear()
 
 
 def get_state():
@@ -48,6 +50,7 @@ def get_state():
         "accounts": copy.deepcopy(_accounts),
         "ous": copy.deepcopy(_ous),
         "roots": copy.deepcopy(_roots),
+        "tags": copy.deepcopy(_tags),
     }
 
 
@@ -56,7 +59,7 @@ def restore_state(data):
         return
     for store, key in (
         (_orgs, "orgs"), (_accounts, "accounts"),
-        (_ous, "ous"), (_roots, "roots")
+        (_ous, "ous"), (_roots, "roots"), (_tags, "tags")
     ):
         store.clear()
         for k, v in (data.get(key) or {}).items():
@@ -158,6 +161,26 @@ def _list_accounts_for_parent(payload):
     return _json(200, {"Accounts": out, "NextToken": None})
 
 
+def _list_parents(payload):
+    _ensure_org()
+    child_id = payload.get("ChildId")
+    if not child_id:
+        return error_response_json("InvalidInputException", "ChildId is required", 400)
+    # A child is either an OU (ou-*) or an account; both store ``_ParentId``.
+    # AWS returns exactly one parent and does not surface it on Describe*, so the
+    # provider must ListParents the child to learn it (fires on create + refresh).
+    rec = _ous.get(child_id) or _accounts.get(child_id)
+    if rec is None:
+        return error_response_json(
+            "ChildNotFoundException",
+            f"We can't find an organizational unit (OU) or account with the ChildId {child_id}",
+            400,
+        )
+    parent_id = rec.get("_ParentId")
+    parent_type = "ROOT" if str(parent_id).startswith("r-") else "ORGANIZATIONAL_UNIT"
+    return _json(200, {"Parents": [{"Id": parent_id, "Type": parent_type}], "NextToken": None})
+
+
 def _create_organizational_unit(payload):
     _ensure_org()
     parent_id = payload.get("ParentId")
@@ -178,6 +201,9 @@ def _create_organizational_unit(payload):
         "_ParentId": parent_id,
     }
     _ous[ou_id] = rec
+    inline_tags = payload.get("Tags") or []
+    if inline_tags:
+        _tags[ou_id] = {t["Key"]: t.get("Value", "") for t in inline_tags if "Key" in t}
     return _json(200, {"OrganizationalUnit": _public_ou(rec)})
 
 
@@ -198,7 +224,73 @@ def _delete_organizational_unit(payload):
         return error_response_json("OrganizationalUnitNotFoundException",
                                    f"OU {ou_id} not found", 400)
     del _ous[ou_id]
+    _tags.pop(ou_id, None)
     return _json(200, {})
+
+
+def _tag_list(resource_id):
+    return [{"Key": k, "Value": v} for k, v in (_tags.get(resource_id) or {}).items()]
+
+
+def _resource_exists(rid):
+    # Taggable org resources tracked today: OUs, accounts, and the root.
+    return (
+        _ous.get(rid) is not None
+        or _accounts.get(rid) is not None
+        or _roots.get(rid) is not None
+    )
+
+
+def _require_resource(rid):
+    """Shared validation for the tag ops. Returns an error 3-tuple, or None when the
+    ResourceId is present and known. AWS errors on an unknown target, so we match it
+    rather than return an empty/spurious result."""
+    if not rid:
+        return error_response_json("InvalidInputException", "ResourceId is required", 400)
+    if not _resource_exists(rid):
+        return error_response_json(
+            "TargetNotFoundException",
+            f"We can't find a resource with the ResourceId {rid}", 400,
+        )
+    return None
+
+
+def _tag_resource(payload):
+    _ensure_org()
+    rid = payload.get("ResourceId")
+    err = _require_resource(rid)
+    if err:
+        return err
+    current = dict(_tags.get(rid) or {})
+    for t in payload.get("Tags") or []:
+        if "Key" in t:
+            current[t["Key"]] = t.get("Value", "")
+    _tags[rid] = current
+    return _json(200, {})
+
+
+def _untag_resource(payload):
+    _ensure_org()
+    rid = payload.get("ResourceId")
+    err = _require_resource(rid)
+    if err:
+        return err
+    current = dict(_tags.get(rid) or {})
+    for k in payload.get("TagKeys") or []:
+        current.pop(k, None)
+    _tags[rid] = current
+    return _json(200, {})
+
+
+def _list_tags_for_resource(payload):
+    _ensure_org()
+    rid = payload.get("ResourceId")
+    err = _require_resource(rid)
+    if err:
+        return err
+    # A consumer's Read of any taggable org resource calls ListTagsForResource on
+    # create + refresh; without it the read-back fails and apply can't converge.
+    return _json(200, {"Tags": _tag_list(rid), "NextToken": None})
 
 
 _DISPATCH = {
@@ -208,9 +300,13 @@ _DISPATCH = {
     "DescribeAccount": _describe_account,
     "ListOrganizationalUnitsForParent": _list_organizational_units_for_parent,
     "ListAccountsForParent": _list_accounts_for_parent,
+    "ListParents": _list_parents,
     "CreateOrganizationalUnit": _create_organizational_unit,
     "DescribeOrganizationalUnit": _describe_organizational_unit,
     "DeleteOrganizationalUnit": _delete_organizational_unit,
+    "TagResource": _tag_resource,
+    "UntagResource": _untag_resource,
+    "ListTagsForResource": _list_tags_for_resource,
 }
 
 
