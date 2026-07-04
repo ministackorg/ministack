@@ -98,8 +98,11 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
             MINISTACK_VERSION=pr-${{ github.event.pull_request.number }}-${{ steps.short_sha.outputs.short_sha }}
+          # pull_request_target receives a read-only Actions cache as of GitHub's
+          # 2026-06-26 change (read-only cache for untrusted triggers), so a cache-to
+          # write fails the build with "failed to reserve cache". Restore only here;
+          # the cache is populated by a trusted (push) workflow.
           cache-from: type=gha,scope=regular-pr
-          cache-to: type=gha,mode=max,scope=regular-pr
 
       # ── Full (Debian/glibc) image — DuckDB-backed Athena, psycopg2, pymysql.
       # Only built when the PR carries the `full-preview` label (opt-in to keep
@@ -129,8 +132,8 @@ jobs:
           labels: ${{ steps.meta_full.outputs.labels }}
           build-args: |
             MINISTACK_VERSION=pr-${{ github.event.pull_request.number }}-${{ steps.short_sha.outputs.short_sha }}
+          # Read-only cache on pull_request_target (see note on the regular build above).
           cache-from: type=gha,scope=full-pr
-          cache-to: type=gha,mode=max,scope=full-pr
 
       - name: Comment on PR with Docker image info
         if: steps.guard.outputs.skip != 'true'

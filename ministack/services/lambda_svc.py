@@ -4544,7 +4544,34 @@ def _esm_response(esm: dict) -> dict:
     return {k: v for k, v in esm.items() if k not in ("FunctionName", "Enabled")}
 
 
+def _validate_scaling_config(data: dict):
+    scaling = data.get("ScalingConfig")
+    if not scaling:
+        return None
+    max_conc = scaling.get("MaximumConcurrency")
+    if max_conc is None:
+        return None
+    if max_conc < 2:
+        return error_response_json(
+            "ValidationException",
+            f"1 validation error detected: Value '{max_conc}' at 'scalingConfig.maximumConcurrency' "
+            "failed to satisfy constraint: Member must have value greater than or equal to 2",
+            400,
+        )
+    if max_conc > 1000:
+        return error_response_json(
+            "ValidationException",
+            f"1 validation error detected: Value '{max_conc}' at 'scalingConfig.maximumConcurrency' "
+            "failed to satisfy constraint: Member must have value less than or equal to 1000",
+            400,
+        )
+    return None
+
+
 def _create_esm(data: dict):
+    err = _validate_scaling_config(data)
+    if err:
+        return err
     esm_id = new_uuid()
     # Preserve the alias/version qualifier if the caller supplied one so
     # poller invocations route to the correct target (#407).
@@ -4574,6 +4601,8 @@ def _create_esm(data: dict):
         _init_stream_position(esm_id, event_source_arn, esm["StartingPosition"])
     if data.get("FilterCriteria"):
         esm["FilterCriteria"] = data.get("FilterCriteria")
+    if data.get("ScalingConfig"):
+        esm["ScalingConfig"] = data["ScalingConfig"]
     # #442: Tags are accepted on CreateEventSourceMapping. Stored inline on
     # the ESM record; surfaced via _list_tags for the ESM ARN.
     tags = data.get("Tags") or {}
@@ -4629,6 +4658,9 @@ def _update_esm(esm_id: str, data: dict):
             f"Event source mapping not found: {esm_id}",
             404,
         )
+    err = _validate_scaling_config(data)
+    if err:
+        return err
     for key in (
         "BatchSize",
         "MaximumBatchingWindowInSeconds",
@@ -4639,6 +4671,7 @@ def _update_esm(esm_id: str, data: dict):
         "ParallelizationFactor",
         "DestinationConfig",
         "FilterCriteria",
+        "ScalingConfig",
     ):
         if key in data:
             esm[key] = data[key]
@@ -4987,11 +5020,12 @@ def _poll_dynamodb_streams():
         if not batch:
             continue
 
+        raw_len = len(batch)
         batch = _apply_filter_criteria(batch, esm)
         if not batch:
             # All records filtered — advance position so we don't re-evaluate.
             with _dynamodb_stream_positions_lock:
-                _dynamodb_stream_positions[esm_id] = pos + batch_size
+                _dynamodb_stream_positions[esm_id] = pos + raw_len
             continue
 
         event = {"Records": batch}
@@ -5008,7 +5042,7 @@ def _poll_dynamodb_streams():
             )
         else:
             with _dynamodb_stream_positions_lock:
-                _dynamodb_stream_positions[esm_id] = pos + len(batch)
+                _dynamodb_stream_positions[esm_id] = pos + raw_len
             esm["LastProcessingResult"] = f"OK - {len(batch)} records"
             log_output = result.get("log", "")
             if log_output:

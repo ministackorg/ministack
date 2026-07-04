@@ -1129,6 +1129,54 @@ def test_cfn_lambda_version(cfn, lam):
     _wait_stack(cfn, "cfn-lambda-ver")
     lam.delete_function(FunctionName="cfn-ver-fn")
 
+def test_cfn_esm_filter_criteria_round_trips(cfn, lam, ddb):
+    code = "def handler(e,c): return {'ok': True}"
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("index.py", code)
+    lam.create_function(
+        FunctionName="cfn-esm-fc-fn", Runtime="python3.11",
+        Role="arn:aws:iam::000000000000:role/r", Handler="index.handler",
+        Code={"ZipFile": buf.getvalue()},
+    )
+    table = ddb.create_table(
+        TableName="cfn-esm-fc-table",
+        KeySchema=[{"AttributeName": "id", "KeyType": "HASH"}],
+        AttributeDefinitions=[{"AttributeName": "id", "AttributeType": "S"}],
+        BillingMode="PAY_PER_REQUEST",
+        StreamSpecification={"StreamEnabled": True, "StreamViewType": "NEW_IMAGE"},
+    )
+    stream_arn = table["TableDescription"]["LatestStreamArn"]
+    fc = {"Filters": [{"Pattern": '{"eventName":["INSERT"]}'}]}
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "Mapping": {
+                "Type": "AWS::Lambda::EventSourceMapping",
+                "Properties": {
+                    "FunctionName": "cfn-esm-fc-fn",
+                    "EventSourceArn": stream_arn,
+                    "StartingPosition": "LATEST",
+                    "FilterCriteria": fc,
+                },
+            },
+        },
+    }
+    cfn.create_stack(StackName="cfn-esm-fc", TemplateBody=json.dumps(template))
+    stack = _wait_stack(cfn, "cfn-esm-fc")
+    assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+
+    mappings = lam.list_event_source_mappings(FunctionName="cfn-esm-fc-fn")[
+        "EventSourceMappings"
+    ]
+    assert len(mappings) == 1
+    assert mappings[0].get("FilterCriteria") == fc, "FilterCriteria must round-trip"
+
+    cfn.delete_stack(StackName="cfn-esm-fc")
+    _wait_stack(cfn, "cfn-esm-fc")
+    ddb.delete_table(TableName="cfn-esm-fc-table")
+    lam.delete_function(FunctionName="cfn-esm-fc-fn")
+
 def test_cfn_wait_condition(cfn):
     """AWS::CloudFormation::WaitCondition and WaitConditionHandle are no-ops."""
     template = {
