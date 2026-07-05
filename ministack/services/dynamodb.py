@@ -1594,6 +1594,11 @@ def _update_item(data):
                 return error_response_json("ValidationException",
                     f"One or more parameter values were invalid: Cannot update attribute {key_name}. This attribute is part of the key", 400)
 
+    # AWS rejects updates with invalid values
+    err = _validate_item(item, table.get("pk_name"), table.get("sk_name"))
+    if err:
+        return err
+
     table["items"][pk_val][sk_val] = item
     _update_counts(table)
 
