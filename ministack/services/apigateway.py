@@ -1008,7 +1008,14 @@ async def _invoke_lambda_proxy(
     # Build API Gateway v2 proxy event (payload format 2.0)
     # AWS API Gateway v2 joins multi-value query params with commas
     qs = {k: ",".join(v) for k, v in query_params.items()} if query_params else None
-    raw_qs = "&".join(f"{k}={val}" for k, vals in query_params.items() for val in vals)
+    # rawQueryString must stay percent-encoded like real AWS. query_params here are
+    # already URL-decoded, so re-encode each key/value: a raw space breaks lambda_http
+    # (http::Uri rejects it -> 502), and a decoded '='/'&' inside a value would corrupt
+    # the query structure. safe="" encodes everything except RFC-3986 unreserved (#1035).
+    raw_qs = "&".join(
+        f"{urllib.parse.quote(k, safe='')}={urllib.parse.quote(val, safe='')}"
+        for k, vals in query_params.items() for val in vals
+    )
     # Binary request bodies are base64-encoded with isBase64Encoded=true; only
     # the text content types AWS recognizes are passed through as UTF-8 strings.
     if body:

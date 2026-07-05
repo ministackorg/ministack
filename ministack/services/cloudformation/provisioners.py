@@ -1907,8 +1907,23 @@ def _lambda_esm_create(logical_id, props, stack_name):
         "Enabled": props.get("Enabled", True),
         "FunctionResponseTypes": props.get("FunctionResponseTypes", []),
     }
-    if props.get("FilterCriteria"):
-        esm["FilterCriteria"] = props["FilterCriteria"]
+    # Preserve every optional ESM property the API create/update path round-trips,
+    # so a CloudFormation-created mapping reads back without drift. Previously only
+    # FilterCriteria was kept; DestinationConfig, ParallelizationFactor, the retry/age
+    # knobs, and ScalingConfig were silently dropped -> perpetual Terraform/CDK diffs.
+    # `is not None` (not truthiness) so explicit falsy values round-trip: 0 retries,
+    # BisectBatchOnFunctionError=false; absent props stay absent (no spurious attrs).
+    for _opt in (
+        "FilterCriteria",
+        "DestinationConfig",
+        "ParallelizationFactor",
+        "MaximumRetryAttempts",
+        "MaximumRecordAgeInSeconds",
+        "BisectBatchOnFunctionError",
+        "ScalingConfig",
+    ):
+        if props.get(_opt) is not None:
+            esm[_opt] = props[_opt]
     _lambda_svc._esms[esm_id] = esm
     # Anchor a DynamoDB-stream ESM's LATEST position at create time, matching the
     # API CreateEventSourceMapping path; no-op for SQS/Kinesis sources (#936).
@@ -1919,6 +1934,46 @@ def _lambda_esm_create(logical_id, props, stack_name):
 
 def _lambda_esm_delete(physical_id, props):
     _lambda_svc._esms.pop(physical_id, None)
+
+
+def _lambda_esm_update(physical_id, old_props, new_props, stack_name):
+    # Mutate the existing mapping in place, same as the API UpdateEventSourceMapping
+    # path (_update_esm): keep the same UUID and copy the changed mutable props.
+    # An immutable prop (EventSourceArn / StartingPosition[Timestamp]) forces a
+    # CloudFormation replacement: create the new mapping, delete the old one.
+    esm = _lambda_svc._esms.get(physical_id)
+    if esm is None:
+        return _lambda_esm_create(physical_id, new_props, stack_name)
+    for immutable in ("EventSourceArn", "StartingPosition", "StartingPositionTimestamp"):
+        if new_props.get(immutable) != old_props.get(immutable):
+            new_id, attrs = _lambda_esm_create(physical_id, new_props, stack_name)
+            _lambda_svc._esms.pop(physical_id, None)
+            return new_id, attrs
+    for key in (
+        "BatchSize",
+        "MaximumBatchingWindowInSeconds",
+        "FunctionResponseTypes",
+        "MaximumRetryAttempts",
+        "MaximumRecordAgeInSeconds",
+        "BisectBatchOnFunctionError",
+        "ParallelizationFactor",
+        "DestinationConfig",
+        "FilterCriteria",
+        "ScalingConfig",
+    ):
+        if key in new_props:
+            esm[key] = new_props[key]
+    if "Enabled" in new_props:
+        esm["Enabled"] = new_props["Enabled"]
+        esm["State"] = "Enabled" if new_props["Enabled"] else "Disabled"
+    if "FunctionName" in new_props:
+        func_name, qualifier = _lambda_svc._resolve_name_and_qualifier(new_props["FunctionName"])
+        func = _lambda_svc._functions.get(func_name)
+        func_arn = func["config"]["FunctionArn"] if func else f"arn:aws:lambda:{get_region()}:{get_account_id()}:function:{func_name}"
+        esm["FunctionName"] = func_name
+        esm["FunctionArn"] = func_arn + (f":{qualifier}" if qualifier else "")
+    esm["LastModified"] = int(time.time())
+    return physical_id, {"UUID": physical_id}
 
 
 # --- EventBridge Pipes (minimal: DynamoDB Streams -> SNS) ---
@@ -4232,7 +4287,7 @@ _RESOURCE_HANDLERS = {
     "AWS::ApiGateway::Deployment": {"create": _apigw_deployment_create, "delete": _apigw_deployment_delete},
     "AWS::ApiGateway::Stage": {"create": _apigw_stage_create, "delete": _apigw_stage_delete},
     "AWS::ApiGateway::Account": {"create": _apigw_account_create, "delete": _apigw_account_delete},
-    "AWS::Lambda::EventSourceMapping": {"create": _lambda_esm_create, "delete": _lambda_esm_delete},
+    "AWS::Lambda::EventSourceMapping": {"create": _lambda_esm_create, "update": _lambda_esm_update, "delete": _lambda_esm_delete},
     "AWS::Pipes::Pipe": {"create": _pipes_pipe_create, "delete": _pipes_pipe_delete},
     "AWS::Lambda::Alias": {"create": _lambda_alias_create, "delete": _lambda_alias_delete},
     "AWS::SQS::QueuePolicy": {"create": _sqs_queue_policy_create, "delete": _sqs_queue_policy_delete},

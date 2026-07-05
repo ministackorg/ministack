@@ -4544,13 +4544,29 @@ def _esm_response(esm: dict) -> dict:
     return {k: v for k, v in esm.items() if k not in ("FunctionName", "Enabled")}
 
 
-def _validate_scaling_config(data: dict):
+def _validate_scaling_config(data: dict, source_arn: str = ""):
     scaling = data.get("ScalingConfig")
     if not scaling:
         return None
     max_conc = scaling.get("MaximumConcurrency")
     if max_conc is None:
         return None
+    # ScalingConfig (MaximumConcurrency) is Amazon SQS-only per the AWS API.
+    if ":sqs:" not in source_arn:
+        return error_response_json(
+            "InvalidParameterValueException",
+            "ScalingConfig is only supported for Amazon SQS event sources.",
+            400,
+        )
+    # MaximumConcurrency is an integer; a non-int would otherwise raise on the
+    # comparisons below and surface as a 500 instead of a validation error.
+    if isinstance(max_conc, bool) or not isinstance(max_conc, int):
+        return error_response_json(
+            "ValidationException",
+            f"1 validation error detected: Value '{max_conc}' at 'scalingConfig.maximumConcurrency' "
+            "failed to satisfy constraint: Member must be an integer",
+            400,
+        )
     if max_conc < 2:
         return error_response_json(
             "ValidationException",
@@ -4569,7 +4585,7 @@ def _validate_scaling_config(data: dict):
 
 
 def _create_esm(data: dict):
-    err = _validate_scaling_config(data)
+    err = _validate_scaling_config(data, data.get("EventSourceArn", ""))
     if err:
         return err
     esm_id = new_uuid()
@@ -4658,7 +4674,7 @@ def _update_esm(esm_id: str, data: dict):
             f"Event source mapping not found: {esm_id}",
             404,
         )
-    err = _validate_scaling_config(data)
+    err = _validate_scaling_config(data, esm.get("EventSourceArn", ""))
     if err:
         return err
     for key in (
