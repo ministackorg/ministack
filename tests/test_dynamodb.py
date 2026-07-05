@@ -1237,6 +1237,150 @@ def test_dynamodb_update_item_updated_old(ddb):
     )
     assert resp["Attributes"]["score"]["N"] == "10"
 
+
+def test_dynamodb_update_set_same_value_returned(ddb):
+    """SET that assigns the same value is still reported in UPDATED_NEW/OLD."""
+    name = "u-set-same-rv"
+    _basic_table(ddb, name)
+    try:
+        ddb.put_item(TableName=name, Item={"pk": {"S": "k"}, "a": {"S": "old"}})
+        r_new = ddb.update_item(
+            TableName=name,
+            Key={"pk": {"S": "k"}},
+            UpdateExpression="SET a = :v",
+            ExpressionAttributeValues={":v": {"S": "old"}},
+            ReturnValues="UPDATED_NEW",
+        )
+        assert r_new["Attributes"] == {"a": {"S": "old"}}
+
+        r_old = ddb.update_item(
+            TableName=name,
+            Key={"pk": {"S": "k"}},
+            UpdateExpression="SET a = :v",
+            ExpressionAttributeValues={":v": {"S": "old"}},
+            ReturnValues="UPDATED_OLD",
+        )
+        assert r_old["Attributes"] == {"a": {"S": "old"}}
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_update_remove_return_values(ddb):
+    """REMOVE omits the attribute in UPDATED_NEW and returns the old value in UPDATED_OLD."""
+    name = "u-remove-rv"
+    _basic_table(ddb, name)
+    try:
+        ddb.put_item(TableName=name, Item={"pk": {"S": "k"}, "x": {"S": "X"}})
+        r_new = ddb.update_item(
+            TableName=name,
+            Key={"pk": {"S": "k"}},
+            UpdateExpression="REMOVE x",
+            ReturnValues="UPDATED_NEW",
+        )
+        assert "Attributes" not in r_new
+
+        ddb.put_item(TableName=name, Item={"pk": {"S": "k"}, "x": {"S": "X"}})
+        r_old = ddb.update_item(
+            TableName=name,
+            Key={"pk": {"S": "k"}},
+            UpdateExpression="REMOVE x",
+            ReturnValues="UPDATED_OLD",
+        )
+        assert r_old["Attributes"] == {"x": {"S": "X"}}
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_update_add_number_return_values(ddb):
+    """ADD on a number returns new and old values for the updated attribute."""
+    name = "u-add-num-rv"
+    _basic_table(ddb, name)
+    try:
+        ddb.put_item(TableName=name, Item={"pk": {"S": "k"}, "n": {"N": "5"}})
+        r_new = ddb.update_item(
+            TableName=name,
+            Key={"pk": {"S": "k"}},
+            UpdateExpression="ADD n :v",
+            ExpressionAttributeValues={":v": {"N": "3"}},
+            ReturnValues="UPDATED_NEW",
+        )
+        assert r_new["Attributes"] == {"n": {"N": "8"}}
+
+        ddb.put_item(TableName=name, Item={"pk": {"S": "k"}, "n": {"N": "5"}})
+        r_old = ddb.update_item(
+            TableName=name,
+            Key={"pk": {"S": "k"}},
+            UpdateExpression="ADD n :v",
+            ExpressionAttributeValues={":v": {"N": "3"}},
+            ReturnValues="UPDATED_OLD",
+        )
+        assert r_old["Attributes"] == {"n": {"N": "5"}}
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_update_add_set_return_values(ddb):
+    """ADD on a string set returns the updated set in UPDATED_NEW/OLD."""
+    name = "u-add-ss-rv"
+    _basic_table(ddb, name)
+    try:
+        ddb.put_item(TableName=name, Item={"pk": {"S": "k"}, "tags": {"SS": ["a"]}})
+        r_new = ddb.update_item(
+            TableName=name,
+            Key={"pk": {"S": "k"}},
+            UpdateExpression="ADD tags :v",
+            ExpressionAttributeValues={":v": {"SS": ["b"]}},
+            ReturnValues="UPDATED_NEW",
+        )
+        assert sorted(r_new["Attributes"]["tags"]["SS"]) == ["a", "b"]
+
+        ddb.put_item(TableName=name, Item={"pk": {"S": "k"}, "tags": {"SS": ["a"]}})
+        r_old = ddb.update_item(
+            TableName=name,
+            Key={"pk": {"S": "k"}},
+            UpdateExpression="ADD tags :v",
+            ExpressionAttributeValues={":v": {"SS": ["b"]}},
+            ReturnValues="UPDATED_OLD",
+        )
+        assert r_old["Attributes"] == {"tags": {"SS": ["a"]}}
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_update_combined_return_values_only_touched(ddb):
+    """Combined SET/REMOVE only returns touched attributes; untouched attrs are excluded."""
+    name = "u-combo-rv"
+    _basic_table(ddb, name)
+    try:
+        ddb.put_item(
+            TableName=name,
+            Item={"pk": {"S": "k"}, "a": {"S": "old"}, "b": {"S": "keep"}, "x": {"S": "gone"}},
+        )
+        r_new = ddb.update_item(
+            TableName=name,
+            Key={"pk": {"S": "k"}},
+            UpdateExpression="SET a = :v REMOVE x",
+            ExpressionAttributeValues={":v": {"S": "new"}},
+            ReturnValues="UPDATED_NEW",
+        )
+        assert r_new["Attributes"] == {"a": {"S": "new"}}
+
+        ddb.put_item(
+            TableName=name,
+            Item={"pk": {"S": "k"}, "a": {"S": "old"}, "b": {"S": "keep"}, "x": {"S": "gone"}},
+        )
+        r_old = ddb.update_item(
+            TableName=name,
+            Key={"pk": {"S": "k"}},
+            UpdateExpression="SET a = :v REMOVE x",
+            ExpressionAttributeValues={":v": {"S": "new"}},
+            ReturnValues="UPDATED_OLD",
+        )
+        assert r_old["Attributes"] == {"a": {"S": "old"}, "x": {"S": "gone"}}
+    finally:
+        ddb.delete_table(TableName=name)
+
+
 def test_dynamodb_conditional_put_fails(ddb):
     """PutItem with attribute_not_exists condition fails if item already exists."""
     ddb.create_table(
