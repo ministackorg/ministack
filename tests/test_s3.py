@@ -820,6 +820,24 @@ def test_s3_object_tagging(s3):
     assert tags["priority"] == "high"
 
 
+def test_s3_get_object_returns_tag_count(s3):
+    """GetObject must surface x-amz-tagging-count as TagCount when the object has
+    tags, and omit it when it has none (matches AWS / boto3 behavior) — #1026."""
+    bkt = "intg-s3-tagcount"
+    s3.create_bucket(Bucket=bkt)
+    s3.put_object(
+        Bucket=bkt, Key="tagged.txt", Body=b"hi",
+        Tagging="environment=dev&owner=test&project=p&version=1.0&region=eu",
+    )
+    resp = s3.get_object(Bucket=bkt, Key="tagged.txt")
+    assert resp["TagCount"] == 5
+
+    # An object with no tags: AWS omits the header, so boto3 has no TagCount key.
+    s3.put_object(Bucket=bkt, Key="untagged.txt", Body=b"hi")
+    resp2 = s3.get_object(Bucket=bkt, Key="untagged.txt")
+    assert "TagCount" not in resp2
+
+
 def test_s3_object_tagging_per_version(s3):
     """Tags must be stored per object version, not collapsed onto the key.
 
