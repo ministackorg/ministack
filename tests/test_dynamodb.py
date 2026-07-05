@@ -3106,6 +3106,29 @@ def test_dynamodb_duplicate_ss_values_rejected(ddb):
         ddb.delete_table(TableName=name)
 
 
+def test_dynamodb_string_set_with_empty_string_accepted(ddb):
+    """A string set containing an empty string must be valid (regression)."""
+    name = "ss-empty-str"
+    _basic_table(ddb, name)
+    try:
+        ddb.put_item(TableName=name, Item={"pk": {"S": "k"}, "tags": {"SS": [""]}})
+        item = ddb.get_item(TableName=name, Key={"pk": {"S": "k"}})["Item"]
+        assert item["tags"]["SS"] == [""]
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_string_set_with_empty_string_and_values_accepted(ddb):
+    """A string set containing an empty string alongside other values must be valid."""
+    name = "ss-empty-str-mix"
+    _basic_table(ddb, name)
+    try:
+        ddb.put_item(TableName=name, Item={"pk": {"S": "k"}, "tags": {"SS": ["", "a"]}})
+        item = ddb.get_item(TableName=name, Key={"pk": {"S": "k"}})["Item"]
+        assert sorted(item["tags"]["SS"]) == ["", "a"]
+    finally:
+        ddb.delete_table(TableName=name)
+
 def test_dynamodb_empty_string_hash_key_rejected(ddb):
     name = "empty-pk"
     _basic_table(ddb, name)
@@ -5396,6 +5419,43 @@ def test_dynamodb_update_item_rejects_duplicate_set_elements(ddb):
         assert "tags" not in item
     finally:
         ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_update_item_accepts_string_set_with_empty_string(ddb):
+    """SET with a string set containing an empty string must succeed (regression)."""
+    name = "upd-ss-empty-str"
+    _create_update_item_table(ddb, name)
+    try:
+        ddb.put_item(TableName=name, Item={"pk": {"S": "k"}})
+        ddb.update_item(
+            TableName=name,
+            Key={"pk": {"S": "k"}},
+            UpdateExpression="SET tags = :v",
+            ExpressionAttributeValues={":v": {"SS": [""]}},
+        )
+        item = ddb.get_item(TableName=name, Key={"pk": {"S": "k"}})["Item"]
+        assert item["tags"]["SS"] == [""]
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_update_item_adds_empty_string_to_string_set(ddb):
+    """ADD of an empty string to an existing string set must succeed."""
+    name = "upd-add-ss-empty-str"
+    _create_update_item_table(ddb, name)
+    try:
+        ddb.put_item(TableName=name, Item={"pk": {"S": "k"}, "tags": {"SS": ["a"]}})
+        ddb.update_item(
+            TableName=name,
+            Key={"pk": {"S": "k"}},
+            UpdateExpression="ADD tags :v",
+            ExpressionAttributeValues={":v": {"SS": [""]}},
+        )
+        item = ddb.get_item(TableName=name, Key={"pk": {"S": "k"}})["Item"]
+        assert sorted(item["tags"]["SS"]) == ["", "a"]
+    finally:
+        ddb.delete_table(TableName=name)
+
 
 
 def test_dynamodb_update_item_rejects_multi_datatype_attr_value(ddb):

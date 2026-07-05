@@ -280,7 +280,7 @@ def _validate_attribute_value(attr_name: str, value: dict) -> tuple | None:
             return error_response_json("ValidationException",
                 f"One or more parameter values were invalid: Input collection [{', '.join(str(v) for v in vval)}] contains duplicates.", 400)
         for s in vval:
-            if not isinstance(s, str) or s == "":
+            if not isinstance(s, str):
                 return error_response_json("ValidationException",
                     "One or more parameter values were invalid: An string set may not be empty", 400)
     elif vtype == "NS":
