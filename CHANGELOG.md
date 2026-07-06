@@ -5,6 +5,17 @@ All notable changes to MiniStack will be documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning follows [Semantic Versioning](https://semver.org/).
 
+## [1.3.72] — 2026-07-06
+
+### Added
+- **EC2 — placement group actions** — `CreatePlacementGroup`, `DeletePlacementGroup`, and `DescribePlacementGroups` are implemented (they previously failed with `InvalidAction: Unknown EC2 action`), so `aws_placement_group` in Terraform/CDK creates, reads, and deletes against MiniStack. Groups are account-scoped and tagged like every other EC2 resource (`pg-` ids, `CreateTags`/`DescribeTags`, and `tag:` / `group-name` / `state` / `strategy` filters), duplicate names return `InvalidPlacementGroup.Duplicate` and unknown names return `InvalidPlacementGroup.Unknown`, and `partitionCount` is emitted only for the `partition` strategy — matching real EC2. Contributed by @c-julin.
+- **Auto Scaling — groups report in-service instances so capacity waiters converge** — `CreateAutoScalingGroup`, `UpdateAutoScalingGroup`, and a newly handled `SetDesiredCapacity` now materialize `DesiredCapacity` mock instances (`InService` / `Healthy`, round-robined across the group's Availability Zones), and `DescribeAutoScalingGroups` / `DescribeAutoScalingInstances` report them. Previously a group reported zero instances forever, so Terraform's `aws_autoscaling_group` capacity waiter blocked for the full `wait_for_capacity_timeout` and then failed on every apply; it now converges. Contributed by @c-julin.
+
+### Fixed
+- **Router — access key extraction from presigned-URL query parameters** — the per-request account (multi-tenancy) and CloudTrail attribution were read only from the `Authorization` header, so a presigned S3 URL created under a non-default account resolved to the default account and returned 404 on the bucket lookup. The access key is now also extracted from the SigV4 `X-Amz-Credential` and SigV2 `AWSAccessKeyId` query parameters, matching how AWS honors query-string credentials as a general signing mechanism. Contributed by @neriyaco.
+- **EKS — OIDC issuer scheme follows the gateway protocol** — the cluster OIDC issuer advertised by `DescribeCluster` and the discovery document was hardcoded to `http`, so Terraform's `aws_iam_openid_connect_provider`, which client-side rejects non-https urls, failed at plan time. The scheme now derives from `USE_SSL`: `https` when the gateway serves TLS, `http` otherwise, so the advertised issuer matches what MiniStack actually serves and IRSA Terraform applies against a TLS gateway.
+- **DynamoDB — `UpdateItem` validates values, and `UPDATED_NEW` / `UPDATED_OLD` match AWS** — `UpdateItem` now runs the same attribute and item-size validation as `PutItem` (it skipped it before), and `UPDATED_NEW` / `UPDATED_OLD` report every attribute the update expression touched — including a `SET` that assigns the same value, which was previously omitted as a no-op and diverged from AWS. String-set validation no longer rejects empty-string members. Contributed by @chincharjuin.
+
 ## [1.3.71] — 2026-07-06
 
 ### Added
