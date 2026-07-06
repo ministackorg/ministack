@@ -696,6 +696,7 @@ end-to-end without any client config.
 | `OPENSEARCH_DASHBOARDS_BASE_PORT` | `15601` | Starting host port for per-domain Dashboards containers |
 | `OPENSEARCH_DASHBOARDS_IMAGE` | `opensearchproject/opensearch-dashboards:2.15.0` | Image used when spawning per-domain Dashboards containers |
 | `MINISTACK_OPENSEARCH_ENDPOINT` | _(unset)_ | If set (e.g. `localhost:9200`), every domain returns this endpoint instead of spawning a per-domain container — useful when you bring your own cluster |
+| `EKS_ISSUER_SCHEME` | `http` | URL scheme for the EKS cluster OIDC issuer advertised by `DescribeCluster` and the OIDC discovery document. Set `https` for IRSA terraform: `aws_iam_openid_connect_provider` client-side-validates that `url` is https (real EKS issuers always are). Discovery/JWKS are still served over the plain-http gateway |
 | `PERSIST_STATE` | `0` | Set `1` to persist service state across restarts |
 | `STATE_DIR` | `/tmp/ministack-state` | Directory for persisted state files |
 | `LAMBDA_EXECUTOR` | `local` | Lambda execution mode: `local` (subprocess) or `docker` (container). `provided` runtimes and `PackageType: Image` always use Docker |

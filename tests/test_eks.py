@@ -487,6 +487,38 @@ def test_eks_oidc_discovery_document(eks):
             pass
 
 
+def test_eks_issuer_scheme_https_is_self_consistent(monkeypatch):
+    """EKS_ISSUER_SCHEME=https makes the advertised issuer https so terraform's
+    aws_iam_openid_connect_provider (which rejects non-https urls) applies.
+
+    Called in-process — the live gateway under test starts with the default
+    http scheme, so this exercises the override directly and confirms the
+    DescribeCluster issuer and the discovery document echo the same https URL
+    (a mismatch would make oidc clients that DO fetch the document reject it).
+    """
+    from ministack.services import eks as eks_svc
+
+    monkeypatch.setenv("EKS_ISSUER_SCHEME", "https")
+    oidc_id = eks_svc._new_oidc_id()
+    issuer = eks_svc._issuer_url(oidc_id)
+    assert issuer.startswith("https://"), issuer
+    assert "/oidc/id/" in issuer, issuer
+
+    status, _headers, body = eks_svc._oidc_discovery(oidc_id)
+    assert status == 200
+    doc = json.loads(body)
+    assert doc["issuer"] == issuer
+    assert doc["jwks_uri"] == f"{issuer}/keys"
+
+
+def test_eks_issuer_scheme_defaults_to_http(monkeypatch):
+    """Default (no override) keeps http for backward compatibility."""
+    from ministack.services import eks as eks_svc
+
+    monkeypatch.delenv("EKS_ISSUER_SCHEME", raising=False)
+    assert eks_svc._ministack_issuer_base().startswith("http://")
+
+
 # ---------------------------------------------------------------------------
 # Access Entries — modern EKS IAM bindings (replace aws-auth ConfigMap).
 # Crossplane / Terraform `aws_eks_access_entry` + `aws_eks_access_policy_association`
