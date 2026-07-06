@@ -127,6 +127,25 @@ def pytest_collection_modifyitems(config, items):
             item.add_marker("serial")
 
 
+@pytest.fixture(autouse=True)
+def _reset_request_context():
+    """Reset the request-scoped account/region contextvars to their defaults
+    before every test.
+
+    Multi-tenancy tests set these in-process via ``set_request_account_id`` /
+    ``set_request_region``. Without a per-test reset, a test that sets a
+    non-default account (e.g. ``111111111111``) and doesn't restore it leaks
+    that account to later tests on the same xdist worker — so an
+    account-sensitive assertion (e.g. an ARN's "wrong account" that happens to
+    equal the leaked real account) fails intermittently. ``reset_server`` only
+    clears server state over HTTP; it never touches these contextvars.
+    """
+    from ministack.core.responses import set_request_account_id, set_request_region
+    set_request_account_id("")   # non-12-digit -> MINISTACK_ACCOUNT_ID / 000000000000
+    set_request_region(None)     # -> MINISTACK_REGION / us-east-1
+    yield
+
+
 @pytest.fixture(scope="session", autouse=True)
 def reset_server(tmp_path_factory, worker_id):
     """Reset all server state once before the test session starts.
