@@ -67,8 +67,20 @@ _oidc_keypair = None                  # (private_key, jwk_dict, kid)
 
 
 def _ministack_issuer_base():
+    """Base URL ministack advertises as the cluster's OIDC issuer.
+
+    The scheme tracks the gateway's actual protocol: the discovery/JWKS
+    documents are served by ministack's own gateway, so the issuer must say
+    https only when the gateway is serving TLS (``USE_SSL=1``) and http
+    otherwise. Advertising https on a plain-http gateway would make any client
+    that fetches the discovery document fail. Real EKS issuers are always
+    https, so run with ``USE_SSL=1`` for IRSA terraform, whose
+    ``aws_iam_openid_connect_provider`` client-side rejects non-https urls.
+    """
+    from ministack.core import tls as _tls
+    scheme = "https" if _tls.use_ssl_enabled() else "http"
     port = os.environ.get("GATEWAY_PORT", "4566")
-    return f"http://{_MINISTACK_HOST}:{port}/oidc"
+    return f"{scheme}://{_MINISTACK_HOST}:{port}/oidc"
 
 
 def _new_oidc_id():

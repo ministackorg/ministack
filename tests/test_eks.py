@@ -487,6 +487,33 @@ def test_eks_oidc_discovery_document(eks):
             pass
 
 
+def test_eks_oidc_issuer_scheme_https_when_tls(monkeypatch):
+    """With USE_SSL=1 the gateway serves TLS, so the advertised OIDC issuer and
+    the discovery document both report https (terraform's
+    aws_iam_openid_connect_provider rejects non-https urls). Called in-process."""
+    from ministack.services import eks as eks_svc
+
+    monkeypatch.setenv("USE_SSL", "1")
+    oidc_id = eks_svc._new_oidc_id()
+    issuer = eks_svc._issuer_url(oidc_id)
+    assert issuer.startswith("https://"), issuer
+    assert "/oidc/id/" in issuer, issuer
+
+    status, _headers, body = eks_svc._oidc_discovery(oidc_id)
+    assert status == 200
+    doc = json.loads(body)
+    assert doc["issuer"] == issuer
+    assert doc["jwks_uri"] == f"{issuer}/keys"
+
+
+def test_eks_oidc_issuer_scheme_http_without_tls(monkeypatch):
+    """Default (no TLS) keeps http, matching what the plain-http gateway serves."""
+    from ministack.services import eks as eks_svc
+
+    monkeypatch.delenv("USE_SSL", raising=False)
+    assert eks_svc._ministack_issuer_base().startswith("http://")
+
+
 # ---------------------------------------------------------------------------
 # Access Entries — modern EKS IAM bindings (replace aws-auth ConfigMap).
 # Crossplane / Terraform `aws_eks_access_entry` + `aws_eks_access_policy_association`
