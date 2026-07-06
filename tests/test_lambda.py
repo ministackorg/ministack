@@ -526,6 +526,33 @@ def test_lambda_esm_scaling_config_out_of_range_rejected(lam, sqs, bad_value):
         body = json.loads(e.read())
         assert body.get("__type") == "ValidationException", body
 
+def test_lambda_esm_scaling_config_rejected_on_non_sqs(lam, kin):
+    """ScalingConfig is Amazon SQS-only; setting it on a Kinesis (or any non-SQS)
+    event source must be rejected, not silently accepted — #1029."""
+    fname = "esm-scaling-nonsqs-func"
+    stream = "esm-scaling-nonsqs-stream"
+    try:
+        lam.delete_function(FunctionName=fname)
+    except ClientError:
+        pass
+    try:
+        kin.delete_stream(StreamName=stream, EnforceConsumerDeletion=True)
+    except ClientError:
+        pass
+    lam.create_function(
+        FunctionName=fname, Runtime="python3.12", Role=_LAMBDA_ROLE,
+        Handler="index.handler", Code={"ZipFile": _make_zip(_LAMBDA_CODE)},
+    )
+    kin.create_stream(StreamName=stream, ShardCount=1)
+    stream_arn = kin.describe_stream(StreamName=stream)["StreamDescription"]["StreamARN"]
+    with pytest.raises(ClientError) as exc:
+        lam.create_event_source_mapping(
+            EventSourceArn=stream_arn, FunctionName=fname,
+            StartingPosition="LATEST",
+            ScalingConfig={"MaximumConcurrency": 10},
+        )
+    assert exc.value.response["Error"]["Code"] == "InvalidParameterValueException"
+
 def test_lambda_esm_filter_criteria_stored_on_create(lam, sqs):
     """FilterCriteria specified at CreateEventSourceMapping must be echoed
     back by GetEventSourceMapping — it was silently dropped before this fix."""

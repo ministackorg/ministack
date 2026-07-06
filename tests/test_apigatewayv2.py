@@ -922,6 +922,43 @@ def test_apigw_query_params_and_headers_in_event(apigw, lam):
         lam.delete_function(FunctionName=fname)
 
 
+def test_apigw_raw_query_string_percent_encoded(apigw, lam):
+    """rawQueryString must stay percent-encoded like AWS: a space in a value comes
+    back as %20, not a literal space (which breaks lambda_http / http::Uri) — #1035."""
+    import urllib.request as _urlreq
+    import uuid as _uuid
+
+    fname = f"intg-rawqs-{_uuid.uuid4().hex[:8]}"
+    code = (
+        "import json\n"
+        "def handler(event, context):\n"
+        "    return {'statusCode': 200, 'body': json.dumps({'rawQs': event.get('rawQueryString')})}\n"
+    )
+    lam.create_function(
+        FunctionName=fname, Runtime="python3.12", Role=_LAMBDA_ROLE,
+        Handler="index.handler", Code={"ZipFile": _make_zip(code)},
+    )
+    api_id = apigw.create_api(Name=f"rawqs-api-{fname}", ProtocolType="HTTP")["ApiId"]
+    int_id = apigw.create_integration(
+        ApiId=api_id, IntegrationType="AWS_PROXY",
+        IntegrationUri=f"arn:aws:lambda:us-east-1:000000000000:function:{fname}",
+        PayloadFormatVersion="2.0",
+    )["IntegrationId"]
+    apigw.create_route(ApiId=api_id, RouteKey="GET /authorize", Target=f"integrations/{int_id}")
+    apigw.create_stage(ApiId=api_id, StageName="$default")
+    try:
+        url = f"http://{api_id}.execute-api.localhost:{_EXECUTE_PORT}/$default/authorize?scope=openid%20profile"
+        req = _urlreq.Request(url, method="GET")
+        req.add_header("Host", f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}")
+        resp = _urlreq.urlopen(req)
+        body = json.loads(resp.read())
+        assert "openid%20profile" in body["rawQs"]
+        assert "openid profile" not in body["rawQs"]  # no literal space
+    finally:
+        apigw.delete_api(ApiId=api_id)
+        lam.delete_function(FunctionName=fname)
+
+
 def test_apigw_multiple_path_parameters(apigw, lam):
     """Multiple path parameters in one route should all be extracted."""
     import urllib.request as _urlreq

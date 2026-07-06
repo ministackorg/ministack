@@ -456,3 +456,41 @@ def test_scheduler_cfn_creates_schedule(cfn, scheduler):
     # Delete stack
     cfn.delete_stack(StackName=stack_name)
     time.sleep(1)
+
+
+def test_scheduler_fires_at_expression_to_sqs(scheduler):
+    """A standalone schedule must actually fire: an at() schedule in the near past
+    delivers to its SQS target within one tick of the daemon — #958."""
+    import datetime as _dt
+
+    sqs = boto3.client("sqs", endpoint_url=ENDPOINT, aws_access_key_id="test",
+                       aws_secret_access_key="test", region_name=REGION)
+    name = f"fire-{_uid()}"
+    q_url = sqs.create_queue(QueueName=f"sched-target-{_uid()}")["QueueUrl"]
+    q_arn = sqs.get_queue_attributes(
+        QueueUrl=q_url, AttributeNames=["QueueArn"])["Attributes"]["QueueArn"]
+    past = (_dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(seconds=2)).strftime("%Y-%m-%dT%H:%M:%S")
+    scheduler.create_schedule(
+        Name=name,
+        ScheduleExpression=f"at({past})",
+        FlexibleTimeWindow={"Mode": "OFF"},
+        Target={"Arn": q_arn, "RoleArn": "arn:aws:iam::000000000000:role/r",
+                "Input": "hello-from-schedule"},
+    )
+    try:
+        deadline = time.time() + 20
+        body = None
+        while time.time() < deadline:
+            msgs = sqs.receive_message(
+                QueueUrl=q_url, WaitTimeSeconds=1, MaxNumberOfMessages=1
+            ).get("Messages", [])
+            if msgs:
+                body = msgs[0]["Body"]
+                break
+        assert body == "hello-from-schedule", f"schedule did not fire (body={body!r})"
+    finally:
+        try:
+            scheduler.delete_schedule(Name=name)
+        except ClientError:
+            pass
+        sqs.delete_queue(QueueUrl=q_url)

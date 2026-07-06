@@ -1802,6 +1802,12 @@ async def _handle_lifespan(scope, receive, send):
                 _eb_mod.start_scheduler()
             except Exception as e:
                 logger.warning("EventBridge scheduler startup failed: %s", e)
+            # EventBridge Scheduler standalone schedules also need a firing loop (#958).
+            try:
+                from ministack.services import scheduler as _sched_mod
+                _sched_mod.start_scheduler()
+            except Exception as e:
+                logger.warning("Scheduler startup failed: %s", e)
             await send({"type": "lifespan.startup.complete"})
             logger.info("Ready — %d services available on port %s.", len(SERVICE_HANDLERS), port)
             # Per-service "init completed" lines are logged at DEBUG only — at
