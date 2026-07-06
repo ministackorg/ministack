@@ -627,6 +627,82 @@ def test_ec2_key_pair_duplicate(ec2):
         ec2.create_key_pair(KeyName="qa-ec2-key-dup")
     assert exc.value.response["Error"]["Code"] == "InvalidKeyPair.Duplicate"
 
+
+def test_ec2_placement_group_crud(ec2):
+    created = ec2.create_placement_group(
+        GroupName="qa-ec2-pg", Strategy="cluster"
+    )["PlacementGroup"]
+    assert created["GroupName"] == "qa-ec2-pg"
+    assert created["State"] == "available"
+    assert created["Strategy"] == "cluster"
+    assert created["GroupId"].startswith("pg-")
+    assert created["GroupArn"] == (
+        f"arn:aws:ec2:us-east-1:000000000000:placement-group/qa-ec2-pg"
+    )
+
+    desc = ec2.describe_placement_groups(GroupNames=["qa-ec2-pg"])
+    assert len(desc["PlacementGroups"]) == 1
+    assert desc["PlacementGroups"][0]["GroupId"] == created["GroupId"]
+
+    ec2.delete_placement_group(GroupName="qa-ec2-pg")
+    # After delete a named lookup reports the group as unknown, which lets
+    # terraform detect the resource is gone on the next read.
+    with pytest.raises(ClientError) as exc:
+        ec2.describe_placement_groups(GroupNames=["qa-ec2-pg"])
+    assert exc.value.response["Error"]["Code"] == "InvalidPlacementGroup.Unknown"
+
+
+def test_ec2_placement_group_partition_reports_count(ec2):
+    created = ec2.create_placement_group(
+        GroupName="qa-ec2-pg-part", Strategy="partition", PartitionCount=3
+    )["PlacementGroup"]
+    assert created["Strategy"] == "partition"
+    assert created["PartitionCount"] == 3
+
+    desc = ec2.describe_placement_groups(GroupNames=["qa-ec2-pg-part"])
+    assert desc["PlacementGroups"][0]["PartitionCount"] == 3
+    ec2.delete_placement_group(GroupName="qa-ec2-pg-part")
+
+
+def test_ec2_placement_group_duplicate(ec2):
+    ec2.create_placement_group(GroupName="qa-ec2-pg-dup", Strategy="spread")
+    with pytest.raises(ClientError) as exc:
+        ec2.create_placement_group(GroupName="qa-ec2-pg-dup", Strategy="spread")
+    assert exc.value.response["Error"]["Code"] == "InvalidPlacementGroup.Duplicate"
+    ec2.delete_placement_group(GroupName="qa-ec2-pg-dup")
+
+
+def test_ec2_placement_group_delete_unknown(ec2):
+    with pytest.raises(ClientError) as exc:
+        ec2.delete_placement_group(GroupName="qa-ec2-pg-nope")
+    assert exc.value.response["Error"]["Code"] == "InvalidPlacementGroup.Unknown"
+
+
+def test_ec2_placement_group_tag_round_trip(ec2):
+    suffix = _uuid_mod.uuid4().hex[:8]
+    name = f"qa-ec2-pg-tagged-{suffix}"
+    ec2.create_placement_group(
+        GroupName=name,
+        Strategy="cluster",
+        TagSpecifications=[{
+            "ResourceType": "placement-group",
+            "Tags": [{"Key": "Env", "Value": f"prod-{suffix}"}],
+        }],
+    )
+    try:
+        desc = ec2.describe_placement_groups(GroupNames=[name])
+        tags = desc["PlacementGroups"][0].get("Tags", [])
+        assert any(t["Key"] == "Env" and t["Value"] == f"prod-{suffix}" for t in tags)
+
+        # tag: filter selects the tagged group.
+        filtered = ec2.describe_placement_groups(
+            Filters=[{"Name": "tag:Env", "Values": [f"prod-{suffix}"]}]
+        )
+        assert any(pg["GroupName"] == name for pg in filtered["PlacementGroups"])
+    finally:
+        ec2.delete_placement_group(GroupName=name)
+
+
 def test_ec2_vpc_create_delete(ec2):
     vpc_id = ec2.create_vpc(CidrBlock="10.1.0.0/16")["Vpc"]["VpcId"]
     assert vpc_id.startswith("vpc-")

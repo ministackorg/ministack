@@ -12,6 +12,7 @@ Supports:
                    AuthorizeSecurityGroupIngress, RevokeSecurityGroupIngress,
                    AuthorizeSecurityGroupEgress, RevokeSecurityGroupEgress
   Key Pairs:       CreateKeyPair, DeleteKeyPair, DescribeKeyPairs, ImportKeyPair
+  Placement Grps:  CreatePlacementGroup, DeletePlacementGroup, DescribePlacementGroups
   VPC / Subnets:   DescribeVpcs, DescribeSubnets, DescribeAvailabilityZones
                    CreateVpc, CreateDefaultVpc, DeleteVpc, CreateSubnet, DeleteSubnet
                    CreateInternetGateway, DeleteInternetGateway, DescribeInternetGateways,
@@ -84,6 +85,7 @@ REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 _instances = AccountScopedDict()
 _security_groups = AccountScopedDict()
 _key_pairs = AccountScopedDict()
+_placement_groups = AccountScopedDict()  # group_name -> placement group record
 _vpcs = AccountScopedDict()
 _subnets = AccountScopedDict()
 _internet_gateways = AccountScopedDict()
@@ -117,6 +119,7 @@ def get_state():
         "instances": copy.deepcopy(_instances),
         "security_groups": copy.deepcopy(_security_groups),
         "key_pairs": copy.deepcopy(_key_pairs),
+        "placement_groups": copy.deepcopy(_placement_groups),
         "vpcs": copy.deepcopy(_vpcs),
         "subnets": copy.deepcopy(_subnets),
         "internet_gateways": copy.deepcopy(_internet_gateways),
@@ -148,6 +151,7 @@ def restore_state(data):
         _instances.update(data.get("instances", {}))
         _security_groups.update(data.get("security_groups", {}))
         _key_pairs.update(data.get("key_pairs", {}))
+        _placement_groups.update(data.get("placement_groups", {}))
         _vpcs.update(data.get("vpcs", {}))
         _subnets.update(data.get("subnets", {}))
         _internet_gateways.update(data.get("internet_gateways", {}))
@@ -1258,6 +1262,98 @@ def _import_key_pair(p):
         <keyName>{name}</keyName>
         <keyFingerprint>{fingerprint}</keyFingerprint>
         <keyPairId>{_key_pairs[name]['KeyPairId']}</keyPairId>""")
+
+
+# ---------------------------------------------------------------------------
+# Placement Groups
+# ---------------------------------------------------------------------------
+
+def _new_placement_group_id():
+    return "pg-" + "".join(random.choices(string.hexdigits[:16], k=17))
+
+
+def _placement_group_arn(name):
+    return f"arn:aws:ec2:{get_region()}:{get_account_id()}:placement-group/{name}"
+
+
+def _placement_group_inner_xml(pg, tag="placementGroup"):
+    # partitionCount is only meaningful for the "partition" strategy — real EC2
+    # omits it otherwise, so mirror that shape.
+    partition_xml = ""
+    if pg["Strategy"] == "partition" and pg.get("PartitionCount"):
+        partition_xml = f"<partitionCount>{pg['PartitionCount']}</partitionCount>"
+    return f"""<{tag}>
+        <groupName>{_esc(pg['GroupName'])}</groupName>
+        <state>{pg['State']}</state>
+        <strategy>{pg['Strategy']}</strategy>
+        <groupId>{pg['GroupId']}</groupId>
+        <groupArn>{pg['GroupArn']}</groupArn>
+        {partition_xml}
+        {_tag_set_xml(pg['GroupId'])}
+    </{tag}>"""
+
+
+def _create_placement_group(p):
+    name = _p(p, "GroupName")
+    if not name:
+        return _error("MissingParameter", "GroupName is required", 400)
+    if name in _placement_groups:
+        return _error("InvalidPlacementGroup.Duplicate",
+                      f"The placement group '{name}' already exists.", 400)
+    strategy = _p(p, "Strategy") or "cluster"
+    partition_count = _p(p, "PartitionCount")
+    pg_id = _new_placement_group_id()
+    record = {
+        "GroupName": name,
+        "GroupId": pg_id,
+        "State": "available",
+        "Strategy": strategy,
+        "GroupArn": _placement_group_arn(name),
+        "PartitionCount": int(partition_count) if partition_count else 0,
+    }
+    _placement_groups[name] = record
+    # Tags key off the group id so DescribeTags / tag: filters treat placement
+    # groups like every other tagged EC2 resource.
+    _parse_tag_specs(p, "placement-group", pg_id)
+    return _xml(200, "CreatePlacementGroupResponse",
+                _placement_group_inner_xml(record))
+
+
+def _delete_placement_group(p):
+    name = _p(p, "GroupName")
+    if name not in _placement_groups:
+        return _error("InvalidPlacementGroup.Unknown",
+                      f"The placement group '{name}' is unknown.", 400)
+    pg = _placement_groups.pop(name)
+    _tags.pop(pg["GroupId"], None)
+    return _xml(200, "DeletePlacementGroupResponse", "<return>true</return>")
+
+
+def _describe_placement_groups(p):
+    names = _parse_member_list(p, "GroupName")
+    for gn in names:
+        if gn not in _placement_groups:
+            return _error("InvalidPlacementGroup.Unknown",
+                          f"The placement group '{gn}' is unknown.", 400)
+    group_ids = _parse_member_list(p, "GroupId")
+    filters = _parse_filters(p)
+    items = ""
+    for pg in _placement_groups.values():
+        if names and pg["GroupName"] not in names:
+            continue
+        if group_ids and pg["GroupId"] not in group_ids:
+            continue
+        if not _resource_matches_tag_filters(pg["GroupId"], filters):
+            continue
+        if filters.get("group-name") and pg["GroupName"] not in filters["group-name"]:
+            continue
+        if filters.get("state") and pg["State"] not in filters["state"]:
+            continue
+        if filters.get("strategy") and pg["Strategy"] not in filters["strategy"]:
+            continue
+        items += _placement_group_inner_xml(pg, tag="item")
+    return _xml(200, "DescribePlacementGroupsResponse",
+                f"<placementGroupSet>{items}</placementGroupSet>")
 
 
 # ---------------------------------------------------------------------------
@@ -3153,6 +3249,7 @@ def _guess_resource_type(resource_id):
         "pl-": "managed-prefix-list",
         "vgw-": "vpn-gateway",
         "cgw-": "customer-gateway",
+        "pg-": "placement-group",
         "ami-": "image",
         "tgw-": "transit-gateway",
     }
@@ -4330,6 +4427,7 @@ def reset():
     _instances.clear()
     _security_groups.clear()
     _key_pairs.clear()
+    _placement_groups.clear()
     _vpcs.clear()
     _subnets.clear()
     _internet_gateways.clear()
@@ -5457,6 +5555,9 @@ _ACTION_MAP = {
     "DeleteKeyPair": _delete_key_pair,
     "DescribeKeyPairs": _describe_key_pairs,
     "ImportKeyPair": _import_key_pair,
+    "CreatePlacementGroup": _create_placement_group,
+    "DeletePlacementGroup": _delete_placement_group,
+    "DescribePlacementGroups": _describe_placement_groups,
     "DescribeVpcs": _describe_vpcs,
     "CreateVpc": _create_vpc,
     "CreateDefaultVpc": _create_default_vpc,
