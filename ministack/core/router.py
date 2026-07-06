@@ -1021,16 +1021,27 @@ def extract_region(headers: dict, query_params=None) -> str:
 
 
 def extract_access_key_id(headers: dict, query_params=None) -> str:
-    """Extract the AWS access key ID from the Authorization header, then from
-    the SigV4 presigned ``X-Amz-Credential`` query param."""
+    """Extract the AWS access key ID from the Authorization header, or from the
+    query-string credentials of a presigned URL — SigV4 ``X-Amz-Credential`` or
+    SigV2 ``AWSAccessKeyId``."""
     auth = headers.get("authorization", "")
-    if auth:
+    if auth.startswith("AWS4-HMAC"):
         match = re.search(r"Credential=([^/]+)/", auth)
         if match:
             return match.group(1)
+
     cred = _credential_from_query(query_params)
     if cred:
         return cred.split("/")[0]
+
+    if query_params and "AWSAccessKeyId" in query_params:
+        return query_params["AWSAccessKeyId"][0]
+
+    if auth.startswith("AWS "):
+        match = re.search(r"AWS ([^:]+):", auth)
+        if match:
+            return match.group(1)
+
     return ""
 
 

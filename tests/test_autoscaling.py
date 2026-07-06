@@ -963,3 +963,108 @@ def test_cancel_instance_refresh_when_none_active(autoscaling):
         assert "ActiveInstanceRefreshNotFound" in str(exc.value)
     finally:
         autoscaling.delete_auto_scaling_group(AutoScalingGroupName=asg)
+
+
+# ---------------------------------------------------------------------------
+# Mock in-service instances (capacity waiters)
+# ---------------------------------------------------------------------------
+
+
+def test_asg_reports_desired_capacity_instances(autoscaling):
+    name = _uid("asg-cap")
+    autoscaling.create_auto_scaling_group(
+        AutoScalingGroupName=name,
+        MinSize=1,
+        MaxSize=5,
+        DesiredCapacity=3,
+        AvailabilityZones=["us-east-1a"],
+        LaunchConfigurationName="dummy-lc",
+    )
+    try:
+        g = autoscaling.describe_auto_scaling_groups(
+            AutoScalingGroupNames=[name]
+        )["AutoScalingGroups"][0]
+        instances = g["Instances"]
+        assert len(instances) == 3
+        for inst in instances:
+            assert inst["InstanceId"].startswith("i-")
+            assert inst["LifecycleState"] == "InService"
+            assert inst["HealthStatus"] == "Healthy"
+            assert inst["AvailabilityZone"] == "us-east-1a"
+
+        described = autoscaling.describe_auto_scaling_instances()["AutoScalingInstances"]
+        for_group = [i for i in described if i["AutoScalingGroupName"] == name]
+        assert len(for_group) == 3
+        assert {i["InstanceId"] for i in for_group} == {i["InstanceId"] for i in instances}
+    finally:
+        autoscaling.delete_auto_scaling_group(AutoScalingGroupName=name)
+
+
+def test_set_desired_capacity_reconciles_instances(autoscaling):
+    name = _uid("asg-set")
+    autoscaling.create_auto_scaling_group(
+        AutoScalingGroupName=name,
+        MinSize=0,
+        MaxSize=5,
+        DesiredCapacity=1,
+        AvailabilityZones=["us-east-1a"],
+        LaunchConfigurationName="dummy-lc",
+    )
+    try:
+        autoscaling.set_desired_capacity(AutoScalingGroupName=name, DesiredCapacity=4)
+        g = autoscaling.describe_auto_scaling_groups(
+            AutoScalingGroupNames=[name]
+        )["AutoScalingGroups"][0]
+        assert len(g["Instances"]) == 4
+        assert all(i["LifecycleState"] == "InService" for i in g["Instances"])
+
+        autoscaling.set_desired_capacity(AutoScalingGroupName=name, DesiredCapacity=2)
+        g = autoscaling.describe_auto_scaling_groups(
+            AutoScalingGroupNames=[name]
+        )["AutoScalingGroups"][0]
+        assert len(g["Instances"]) == 2
+    finally:
+        autoscaling.delete_auto_scaling_group(AutoScalingGroupName=name)
+
+
+def test_update_asg_reconciles_instances(autoscaling):
+    name = _uid("asg-upd-cap")
+    autoscaling.create_auto_scaling_group(
+        AutoScalingGroupName=name,
+        MinSize=0,
+        MaxSize=5,
+        DesiredCapacity=0,
+        AvailabilityZones=["us-east-1a"],
+        LaunchConfigurationName="dummy-lc",
+    )
+    try:
+        assert autoscaling.describe_auto_scaling_groups(
+            AutoScalingGroupNames=[name]
+        )["AutoScalingGroups"][0]["Instances"] == []
+        autoscaling.update_auto_scaling_group(AutoScalingGroupName=name, DesiredCapacity=2)
+        g = autoscaling.describe_auto_scaling_groups(
+            AutoScalingGroupNames=[name]
+        )["AutoScalingGroups"][0]
+        assert len(g["Instances"]) == 2
+    finally:
+        autoscaling.delete_auto_scaling_group(AutoScalingGroupName=name)
+
+
+def test_asg_instances_round_robin_azs(autoscaling):
+    name = _uid("asg-az")
+    autoscaling.create_auto_scaling_group(
+        AutoScalingGroupName=name,
+        MinSize=0,
+        MaxSize=5,
+        DesiredCapacity=4,
+        AvailabilityZones=["us-east-1a", "us-east-1b"],
+        LaunchConfigurationName="dummy-lc",
+    )
+    try:
+        instances = autoscaling.describe_auto_scaling_groups(
+            AutoScalingGroupNames=[name]
+        )["AutoScalingGroups"][0]["Instances"]
+        azs = [i["AvailabilityZone"] for i in instances]
+        assert azs == ["us-east-1a", "us-east-1b", "us-east-1a", "us-east-1b"]
+    finally:
+        autoscaling.delete_auto_scaling_group(AutoScalingGroupName=name)

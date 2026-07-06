@@ -5,7 +5,8 @@ All in-memory, no actual instance scaling.
 
 Supports:
   ASG:       CreateAutoScalingGroup, DescribeAutoScalingGroups, UpdateAutoScalingGroup,
-             DeleteAutoScalingGroup, DescribeAutoScalingInstances, DescribeScalingActivities
+             DeleteAutoScalingGroup, SetDesiredCapacity, DescribeAutoScalingInstances,
+             DescribeScalingActivities
   Refresh:   StartInstanceRefresh, DescribeInstanceRefreshes, CancelInstanceRefresh
   LC:        CreateLaunchConfiguration, DescribeLaunchConfigurations, DeleteLaunchConfiguration
   Policies:  PutScalingPolicy, DescribePolicies, DeletePolicy
@@ -111,7 +112,73 @@ def _asg_arn(name):
 
 # ---------------------------------------------------------------------------
 # AutoScalingGroup
+#
+# No real instances run, but terraform-provider-aws's aws_autoscaling_group
+# capacity waiter polls DescribeAutoScalingGroups until DesiredCapacity
+# instances report InService/Healthy. A group that reports zero forever blocks
+# every apply for the full wait_for_capacity_timeout (10m) and then fails, so we
+# materialize DesiredCapacity mock instances the same way a real ASG launches
+# them. They ride the group record, inheriting the existing persistence / reset
+# plumbing (like InstanceRefreshes).
 # ---------------------------------------------------------------------------
+
+def _reconcile_instances(asg):
+    """Resize the group's Instances list to exactly DesiredCapacity entries.
+
+    Scale-up appends InService/Healthy instances round-robined across the
+    group's AZs; scale-down removes from the end, matching a Default
+    termination policy.
+    """
+    desired = asg["DesiredCapacity"]
+    instances = asg["Instances"]
+    if len(instances) > desired:
+        del instances[desired:]
+        return
+    azs = asg["AvailabilityZones"] or [f"{get_region()}a"]
+    launch_template = asg.get("LaunchTemplate") or {}
+    launch_config = asg.get("LaunchConfigurationName", "")
+    while len(instances) < desired:
+        instances.append({
+            "InstanceId": "i-" + new_uuid().replace("-", "")[:17],
+            "LifecycleState": "InService",
+            "HealthStatus": "Healthy",
+            "AvailabilityZone": azs[len(instances) % len(azs)],
+            # Real ASGs stamp new instances with the group's scale-in setting.
+            "ProtectedFromScaleIn": asg["NewInstancesProtectedFromScaleIn"],
+            "LaunchTemplate": launch_template,
+            "LaunchConfigurationName": launch_config,
+        })
+
+
+def _instance_member_xml(inst, include_group_name=""):
+    """Render one instance. DescribeAutoScalingInstances also carries the
+    owning AutoScalingGroupName, so callers pass it when needed."""
+    launch_template = inst.get("LaunchTemplate") or {}
+    lt_xml = ""
+    if launch_template:
+        lt_xml = (f"<LaunchTemplate>"
+                  f"<LaunchTemplateId>{launch_template.get('LaunchTemplateId', '')}</LaunchTemplateId>"
+                  f"<LaunchTemplateName>{launch_template.get('LaunchTemplateName', '')}</LaunchTemplateName>"
+                  f"<Version>{launch_template.get('Version', '')}</Version></LaunchTemplate>")
+    launch_config = inst.get("LaunchConfigurationName", "")
+    lc_xml = f"<LaunchConfigurationName>{launch_config}</LaunchConfigurationName>" if launch_config else ""
+    group_xml = f"<AutoScalingGroupName>{include_group_name}</AutoScalingGroupName>" if include_group_name else ""
+    return (f"<member>"
+            f"<InstanceId>{inst['InstanceId']}</InstanceId>"
+            f"{group_xml}"
+            f"<AvailabilityZone>{inst['AvailabilityZone']}</AvailabilityZone>"
+            f"<LifecycleState>{inst['LifecycleState']}</LifecycleState>"
+            f"<HealthStatus>{inst['HealthStatus']}</HealthStatus>"
+            f"<ProtectedFromScaleIn>{'true' if inst['ProtectedFromScaleIn'] else 'false'}</ProtectedFromScaleIn>"
+            f"{lt_xml}{lc_xml}"
+            f"</member>")
+
+
+def _instances_xml(asg):
+    if not asg["Instances"]:
+        return "<Instances/>"
+    return "<Instances>" + "".join(_instance_member_xml(i) for i in asg["Instances"]) + "</Instances>"
+
 
 def _create_asg(p):
     name = _p(p, "AutoScalingGroupName")
@@ -168,6 +235,8 @@ def _create_asg(p):
     _asgs[name]["Tags"] = tags
     _tags[name] = tags
 
+    _reconcile_instances(_asgs[name])
+
     logger.info("CreateAutoScalingGroup: %s", name)
     return _xml(200, "CreateAutoScalingGroupResponse", "<CreateAutoScalingGroupResult/>")
 
@@ -208,7 +277,7 @@ def _describe_asgs(p):
                     f"<TerminationPolicies>{tp}</TerminationPolicies>"
                     f"<NewInstancesProtectedFromScaleIn>{'true' if asg['NewInstancesProtectedFromScaleIn'] else 'false'}</NewInstancesProtectedFromScaleIn>"
                     f"<Tags>{tags_xml}</Tags>"
-                    f"<Instances/>"
+                    f"{_instances_xml(asg)}"
                     f"{lt_xml}"
                     f"<LaunchConfigurationName>{asg.get('LaunchConfigurationName', '')}</LaunchConfigurationName>"
                     f"</member>")
@@ -230,7 +299,21 @@ def _update_asg(p):
         asg["HealthCheckType"] = _p(p, "HealthCheckType")
     if _p(p, "VPCZoneIdentifier"):
         asg["VPCZoneIdentifier"] = _p(p, "VPCZoneIdentifier")
+    _reconcile_instances(asg)
     return _xml(200, "UpdateAutoScalingGroupResponse", "<UpdateAutoScalingGroupResult/>")
+
+
+def _set_desired_capacity(p):
+    name = _p(p, "AutoScalingGroupName")
+    asg = _asgs.get(name)
+    if not asg:
+        return _error("ValidationError", f"AutoScalingGroup {name} not found")
+    desired = _p(p, "DesiredCapacity")
+    if desired == "":
+        return _error("ValidationError", "DesiredCapacity is required")
+    asg["DesiredCapacity"] = int(desired)
+    _reconcile_instances(asg)
+    return _xml(200, "SetDesiredCapacityResponse", "")
 
 
 def _delete_asg(p):
@@ -245,8 +328,15 @@ def _delete_asg(p):
 
 
 def _describe_asg_instances(p):
+    wanted = _parse_member_list(p, "InstanceIds")
+    members = ""
+    for name, asg in _asgs.items():
+        for inst in asg["Instances"]:
+            if wanted and inst["InstanceId"] not in wanted:
+                continue
+            members += _instance_member_xml(inst, include_group_name=name)
     return _xml(200, "DescribeAutoScalingInstancesResponse",
-                "<DescribeAutoScalingInstancesResult><AutoScalingInstances/></DescribeAutoScalingInstancesResult>")
+                f"<DescribeAutoScalingInstancesResult><AutoScalingInstances>{members}</AutoScalingInstances></DescribeAutoScalingInstancesResult>")
 
 
 def _describe_scaling_activities(p):
@@ -588,6 +678,7 @@ _ACTION_MAP = {
     "DescribeAutoScalingGroups": _describe_asgs,
     "UpdateAutoScalingGroup": _update_asg,
     "DeleteAutoScalingGroup": _delete_asg,
+    "SetDesiredCapacity": _set_desired_capacity,
     "DescribeAutoScalingInstances": _describe_asg_instances,
     "DescribeScalingActivities": _describe_scaling_activities,
     "StartInstanceRefresh": _start_instance_refresh,
