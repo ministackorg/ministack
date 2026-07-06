@@ -1907,6 +1907,8 @@ def _lambda_esm_create(logical_id, props, stack_name):
         "Enabled": props.get("Enabled", True),
         "FunctionResponseTypes": props.get("FunctionResponseTypes", []),
     }
+    if props.get("FilterCriteria"):
+        esm["FilterCriteria"] = props["FilterCriteria"]
     _lambda_svc._esms[esm_id] = esm
     # Anchor a DynamoDB-stream ESM's LATEST position at create time, matching the
     # API CreateEventSourceMapping path; no-op for SQS/Kinesis sources (#936).

@@ -20,6 +20,8 @@ IAM actions:
   UpdateAssumeRolePolicy,
   CreateGroup, GetGroup, DeleteGroup, ListGroups,
   AddUserToGroup, RemoveUserFromGroup, ListGroupsForUser,
+  AttachGroupPolicy, DetachGroupPolicy, ListAttachedGroupPolicies,
+  PutGroupPolicy, GetGroupPolicy, DeleteGroupPolicy, ListGroupPolicies,
   CreateServiceLinkedRole, DeleteServiceLinkedRole, GetServiceLinkedRoleDeletionStatus,
   CreateOpenIDConnectProvider, GetOpenIDConnectProvider, DeleteOpenIDConnectProvider,
   TagRole, UntagRole, ListRoleTags,
@@ -56,6 +58,7 @@ _access_keys = AccountScopedDict()
 _instance_profiles = AccountScopedDict()
 _groups = AccountScopedDict()
 _user_inline_policies = AccountScopedDict()
+_group_inline_policies = AccountScopedDict()
 _oidc_providers = AccountScopedDict()
 _service_linked_role_deletion_tasks = AccountScopedDict()
 _sla_jobs = AccountScopedDict()
@@ -304,6 +307,7 @@ def get_state():
         "oidc_providers": copy.deepcopy(_oidc_providers),
         "service_linked_role_deletion_tasks": copy.deepcopy(_service_linked_role_deletion_tasks),
         "user_inline_policies": copy.deepcopy(_user_inline_policies),
+        "group_inline_policies": copy.deepcopy(_group_inline_policies),
         "aws_managed_attachment_counts": copy.deepcopy(_aws_managed_attachment_counts),
         "sla_jobs": copy.deepcopy(_sla_jobs),
         "saml_providers": copy.deepcopy(_saml_providers),
@@ -326,6 +330,7 @@ def restore_state(data):
         _oidc_providers.update(data.get("oidc_providers", {}))
         _service_linked_role_deletion_tasks.update(data.get("service_linked_role_deletion_tasks", {}))
         _user_inline_policies.update(data.get("user_inline_policies", {}))
+        _group_inline_policies.update(data.get("group_inline_policies", {}))
         _aws_managed_attachment_counts.update(data.get("aws_managed_attachment_counts", {}))
         _sla_jobs.update(data.get("sla_jobs", {}))
         _saml_providers.update(data.get("saml_providers", {}))
@@ -1379,6 +1384,7 @@ def _create_group(p):
         "Path": path,
         "CreateDate": _now(),
         "Users": [],
+        "AttachedPolicies": [],
     }
     return _xml(200, "CreateGroupResponse",
                 f"<CreateGroupResult><Group>{_group_xml(name)}</Group></CreateGroupResult>",
@@ -1410,6 +1416,7 @@ def _delete_group(p):
         return _error(404, "NoSuchEntity",
                       f"The group with name {name} cannot be found.", ns="iam")
     _groups.pop(name, None)
+    _group_inline_policies.pop(name, None)
     return _xml(200, "DeleteGroupResponse", "", ns="iam")
 
 
@@ -1468,6 +1475,138 @@ def _list_groups_for_user(p):
     return _xml(200, "ListGroupsForUserResponse",
                 f"<ListGroupsForUserResult><Groups>{members}</Groups>"
                 "<IsTruncated>false</IsTruncated></ListGroupsForUserResult>",
+                ns="iam")
+
+
+# -------------------- Managed group policies --------------------
+
+def _attach_group_policy(p):
+    group_name = _p(p, "GroupName")
+    policy_arn = _p(p, "PolicyArn")
+    group = _groups.get(group_name)
+    if not group:
+        return _error(404, "NoSuchEntity",
+                      f"The group with name {group_name} cannot be found.", ns="iam")
+    attached = group.setdefault("AttachedPolicies", [])
+    if policy_arn not in attached:
+        attached.append(policy_arn)
+        if _is_aws_managed_arn(policy_arn):
+            _bump_aws_managed_attachment(policy_arn, +1)
+        else:
+            pol = _policies.get(policy_arn)
+            if pol:
+                pol["AttachmentCount"] = pol.get("AttachmentCount", 0) + 1
+    return _xml(200, "AttachGroupPolicyResponse", "", ns="iam")
+
+
+def _detach_group_policy(p):
+    group_name = _p(p, "GroupName")
+    policy_arn = _p(p, "PolicyArn")
+    group = _groups.get(group_name)
+    if not group:
+        return _error(404, "NoSuchEntity",
+                      f"The group with name {group_name} cannot be found.", ns="iam")
+    attached = group.setdefault("AttachedPolicies", [])
+    if policy_arn not in attached:
+        return _error(404, "NoSuchEntity",
+                      f"Policy {policy_arn} is not attached to group {group_name}.", ns="iam")
+    attached.remove(policy_arn)
+    if _is_aws_managed_arn(policy_arn):
+        _bump_aws_managed_attachment(policy_arn, -1)
+    else:
+        pol = _policies.get(policy_arn)
+        if pol:
+            pol["AttachmentCount"] = max(pol.get("AttachmentCount", 1) - 1, 0)
+    return _xml(200, "DetachGroupPolicyResponse", "", ns="iam")
+
+
+def _list_attached_group_policies(p):
+    group_name = _p(p, "GroupName")
+    group = _groups.get(group_name)
+    if not group:
+        return _error(404, "NoSuchEntity",
+                      f"The group with name {group_name} cannot be found.", ns="iam")
+    members = ""
+    for arn in group.get("AttachedPolicies", []):
+        pol = _lookup_policy(arn)
+        pname = pol["PolicyName"] if pol else arn.rsplit("/", 1)[-1]
+        members += (f"<member><PolicyName>{pname}</PolicyName>"
+                    f"<PolicyArn>{arn}</PolicyArn></member>")
+    return _xml(200, "ListAttachedGroupPoliciesResponse",
+                f"<ListAttachedGroupPoliciesResult><AttachedPolicies>{members}</AttachedPolicies>"
+                "<IsTruncated>false</IsTruncated></ListAttachedGroupPoliciesResult>",
+                ns="iam")
+
+
+# -------------------- Inline group policies --------------------
+
+def _put_group_policy(p):
+    group_name = _p(p, "GroupName")
+    policy_name = _p(p, "PolicyName")
+    policy_doc = _p(p, "PolicyDocument")
+    if group_name not in _groups:
+        return _error(404, "NoSuchEntity",
+                      f"The group with name {group_name} cannot be found.", ns="iam")
+    group_policies = _group_inline_policies.get(group_name)
+    if group_policies is None:
+        group_policies = {}
+        _group_inline_policies[group_name] = group_policies
+    group_policies[policy_name] = policy_doc
+    return _xml(200, "PutGroupPolicyResponse", "", ns="iam")
+
+
+def _get_group_policy(p):
+    group_name = _p(p, "GroupName")
+    policy_name = _p(p, "PolicyName")
+    if group_name not in _groups:
+        return _error(404, "NoSuchEntity",
+                      f"The group with name {group_name} cannot be found.", ns="iam")
+    doc = (_group_inline_policies.get(group_name) or {}).get(policy_name)
+    if doc is None:
+        return _error(404, "NoSuchEntity",
+                      f"The group policy with name {policy_name} cannot be found.", ns="iam")
+    if isinstance(doc, (dict, list)):
+        doc_str = json.dumps(doc)
+    elif isinstance(doc, (bytes, bytearray)):
+        doc_str = doc.decode("utf-8")
+    else:
+        doc_str = doc
+    encoded_doc = _url_quote(doc_str, safe="")
+    return _xml(200, "GetGroupPolicyResponse",
+                f"<GetGroupPolicyResult>"
+                f"<GroupName>{group_name}</GroupName>"
+                f"<PolicyName>{policy_name}</PolicyName>"
+                f"<PolicyDocument>{encoded_doc}</PolicyDocument>"
+                f"</GetGroupPolicyResult>",
+                ns="iam")
+
+
+def _delete_group_policy(p):
+    group_name = _p(p, "GroupName")
+    policy_name = _p(p, "PolicyName")
+    if group_name not in _groups:
+        return _error(404, "NoSuchEntity",
+                      f"The group with name {group_name} cannot be found.", ns="iam")
+    group_policies = _group_inline_policies.get(group_name) or {}
+    if policy_name not in group_policies:
+        return _error(404, "NoSuchEntity",
+                      f"The group policy with name {policy_name} cannot be found.", ns="iam")
+    del group_policies[policy_name]
+    return _xml(200, "DeleteGroupPolicyResponse", "", ns="iam")
+
+
+def _list_group_policies(p):
+    group_name = _p(p, "GroupName")
+    if group_name not in _groups:
+        return _error(404, "NoSuchEntity",
+                      f"The group with name {group_name} cannot be found.", ns="iam")
+    members = "".join(
+        f"<member>{pname}</member>"
+        for pname in (_group_inline_policies.get(group_name) or {})
+    )
+    return _xml(200, "ListGroupPoliciesResponse",
+                f"<ListGroupPoliciesResult><PolicyNames>{members}</PolicyNames>"
+                "<IsTruncated>false</IsTruncated></ListGroupPoliciesResult>",
                 ns="iam")
 
 
@@ -1689,6 +1828,24 @@ def _get_account_authorization_details(p):
     group_detail_xml = ""
     if include_all or "Group" in filters:
         for name, g in _groups.items():
+            # Inline group policies
+            gpols = _group_inline_policies.get(name) or {}
+            inline_xml = "".join(
+                f"<member>"
+                f"<PolicyName>{pn}</PolicyName>"
+                f"<PolicyDocument>{_url_quote(pd, safe='')}</PolicyDocument>"
+                f"</member>"
+                for pn, pd in gpols.items()
+            )
+            # Attached managed policies
+            attached_xml = ""
+            for arn in g.get("AttachedPolicies", []):
+                pol = _lookup_policy(arn)
+                if pol:
+                    attached_xml += (f"<member>"
+                                     f"<PolicyName>{pol['PolicyName']}</PolicyName>"
+                                     f"<PolicyArn>{arn}</PolicyArn>"
+                                     f"</member>")
             group_detail_xml += (
                 f"<member>"
                 f"<GroupName>{g['GroupName']}</GroupName>"
@@ -1696,8 +1853,8 @@ def _get_account_authorization_details(p):
                 f"<Arn>{g['Arn']}</Arn>"
                 f"<Path>{g['Path']}</Path>"
                 f"<CreateDate>{g['CreateDate']}</CreateDate>"
-                f"<GroupPolicyList></GroupPolicyList>"
-                f"<AttachedManagedPolicies></AttachedManagedPolicies>"
+                f"<GroupPolicyList>{inline_xml}</GroupPolicyList>"
+                f"<AttachedManagedPolicies>{attached_xml}</AttachedManagedPolicies>"
                 f"</member>"
             )
 
@@ -2723,6 +2880,13 @@ _IAM_HANDLERS = {
     "AddUserToGroup": _add_user_to_group,
     "RemoveUserFromGroup": _remove_user_from_group,
     "ListGroupsForUser": _list_groups_for_user,
+    "AttachGroupPolicy": _attach_group_policy,
+    "DetachGroupPolicy": _detach_group_policy,
+    "ListAttachedGroupPolicies": _list_attached_group_policies,
+    "PutGroupPolicy": _put_group_policy,
+    "GetGroupPolicy": _get_group_policy,
+    "DeleteGroupPolicy": _delete_group_policy,
+    "ListGroupPolicies": _list_group_policies,
     "PutUserPolicy": _put_user_policy,
     "GetUserPolicy": _get_user_policy,
     "DeleteUserPolicy": _delete_user_policy,
@@ -2776,6 +2940,7 @@ def reset():
     _instance_profiles.clear()
     _groups.clear()
     _user_inline_policies.clear()
+    _group_inline_policies.clear()
     _oidc_providers.clear()
     _service_linked_role_deletion_tasks.clear()
     _sla_jobs.clear()
