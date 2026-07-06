@@ -289,7 +289,7 @@ def _validate_attribute_value(attr_name: str, value: dict) -> tuple | None:
             return error_response_json("ValidationException",
                 f"One or more parameter values were invalid: Input collection [{', '.join(str(v) for v in vval)}] contains duplicates.", 400)
         for s in vval:
-            if not isinstance(s, str) or s == "":
+            if not isinstance(s, str):
                 return error_response_json("ValidationException",
                     "One or more parameter values were invalid: An string set may not be empty", 400)
     elif vtype == "NS":
@@ -1586,9 +1586,10 @@ def _update_item(data):
                     return error_response_json("ValidationException",
                         f"One or more parameter values were invalid: Cannot update attribute {_kn}. This attribute is part of the key", 400)
 
+    updated_attrs = set()
     if update_expr:
         try:
-            item = _apply_update_expression(item, update_expr, eav, ean)
+            item, updated_attrs = _apply_update_expression(item, update_expr, eav, ean)
         except ValueError as exc:
             return error_response_json("ValidationException", str(exc), 400)
     elif attribute_updates:
@@ -1596,12 +1597,18 @@ def _update_item(data):
             item = _apply_attribute_updates(item, attribute_updates)
         except _AttributeUpdatesValidationError as exc:
             return error_response_json("ValidationException", str(exc), 400)
+        updated_attrs = set(attribute_updates.keys())
     # AWS rejects any update that would mutate a hash or range key value.
     for key_name in (table.get("pk_name"), table.get("sk_name")):
         if key_name and key_name in item and existing is not None:
             if item.get(key_name) != existing.get(key_name):
                 return error_response_json("ValidationException",
                     f"One or more parameter values were invalid: Cannot update attribute {key_name}. This attribute is part of the key", 400)
+
+    # AWS rejects updates with invalid values
+    err = _validate_item(item, table.get("pk_name"), table.get("sk_name"))
+    if err:
+        return err
 
     table["items"][pk_val][sk_val] = item
     _update_counts(table)
@@ -1616,11 +1623,11 @@ def _update_item(data):
     elif rv == "ALL_OLD" and old_item:
         result["Attributes"] = old_item
     elif rv == "UPDATED_OLD" and old_item:
-        result["Attributes"] = _diff_attributes(old_item, item, return_old=True)
+        result["Attributes"] = _diff_attributes(old_item, item, updated_attrs, return_old=True)
     elif rv == "UPDATED_NEW":
         # AWS omits Attributes from the response when the only operation was
         # REMOVE — there are no "new" values to return.
-        new_attrs = _diff_attributes(old_item or {}, item, return_old=False)
+        new_attrs = _diff_attributes(old_item or {}, item, updated_attrs, return_old=False)
         if new_attrs:
             result["Attributes"] = new_attrs
     _add_consumed_capacity(result, data, name, write=True)
@@ -2893,7 +2900,7 @@ def _transact_write_items(data):
             item = copy.deepcopy(old_item) if old_item else dict(key)
             ue = op.get("UpdateExpression", "")
             if ue:
-                item = _apply_update_expression(item, ue, op.get("ExpressionAttributeValues", {}), op.get("ExpressionAttributeNames", {}))
+                item, _ = _apply_update_expression(item, ue, op.get("ExpressionAttributeValues", {}), op.get("ExpressionAttributeNames", {}))
             tbl["items"][pk_val][sk_val] = item
             _emit_stream_event(table_name, "MODIFY" if old_item else "INSERT", old_item, item)
         _update_counts(tbl)
@@ -4531,18 +4538,20 @@ def _apply_update_expression(item, expr, attr_values, attr_names):
     if current_clause is not None:
         clauses[current_clause] = current_tokens
 
+    updated_attrs = set()
+
     if 'SET' in clauses:
-        _apply_set(item, clauses['SET'], attr_values, attr_names)
+        _apply_set(item, clauses['SET'], attr_values, attr_names, updated_attrs)
     if 'REMOVE' in clauses:
-        _apply_remove(item, clauses['REMOVE'], attr_names)
+        _apply_remove(item, clauses['REMOVE'], attr_names, updated_attrs)
     if 'ADD' in clauses:
-        _apply_add(item, clauses['ADD'], attr_values, attr_names)
+        _apply_add(item, clauses['ADD'], attr_values, attr_names, updated_attrs)
     if 'DELETE' in clauses:
-        _apply_delete(item, clauses['DELETE'], attr_values, attr_names)
-    return item
+        _apply_delete(item, clauses['DELETE'], attr_values, attr_names, updated_attrs)
+    return item, updated_attrs
 
 
-def _apply_set(item, tokens, attr_values, attr_names):
+def _apply_set(item, tokens, attr_values, attr_names, updated_attrs):
     # AWS semantics: all RHS references resolve against the pre-update snapshot
     # of the item. Resolve every value first, then apply assignments — so
     # `SET a = b, b = :v` sets `a` to the OLD value of `b`.
@@ -4567,6 +4576,7 @@ def _apply_set(item, tokens, attr_values, attr_names):
                         f"The document path provided in the update expression is invalid for update: {'.'.join(str(p) for p in path_parts[:-1])}"
                     )
             pending.append((path_parts, value))
+            updated_attrs.add(path_parts[0])
     for path_parts, value in pending:
         _set_at_path(item, path_parts, value)
 
@@ -4648,14 +4658,15 @@ def _eval_set_value(tokens, item, attr_values, attr_names):
     return None
 
 
-def _apply_remove(item, tokens, attr_names):
+def _apply_remove(item, tokens, attr_names, updated_attrs):
     for path_tokens in _split_by_comma(tokens):
         path = _parse_path_from_tokens(path_tokens, attr_names)
         if path:
+            updated_attrs.add(path[0])
             _remove_at_path(item, path)
 
 
-def _apply_add(item, tokens, attr_values, attr_names):
+def _apply_add(item, tokens, attr_values, attr_names, updated_attrs):
     for part in _split_by_comma(tokens):
         val_idx = None
         for i in range(len(part) - 1, -1, -1):
@@ -4668,6 +4679,8 @@ def _apply_add(item, tokens, attr_values, attr_names):
         add_val = attr_values.get(part[val_idx][1])
         if not path or add_val is None:
             continue
+
+        updated_attrs.add(path[0])
 
         existing = _get_at_path(item, path)
 
@@ -4686,7 +4699,7 @@ def _apply_add(item, tokens, attr_values, attr_names):
             _set_at_path(item, path, {"BS": sorted(cur | set(add_val["BS"]))})
 
 
-def _apply_delete(item, tokens, attr_values, attr_names):
+def _apply_delete(item, tokens, attr_values, attr_names, updated_attrs):
     for part in _split_by_comma(tokens):
         val_idx = None
         for i in range(len(part) - 1, -1, -1):
@@ -4699,6 +4712,8 @@ def _apply_delete(item, tokens, attr_values, attr_names):
         del_val = attr_values.get(part[val_idx][1])
         if not path or del_val is None:
             continue
+
+        updated_attrs.add(path[0])
 
         existing = _get_at_path(item, path)
         if existing is None:
@@ -5620,28 +5635,25 @@ def _extract_key_from_item(table, item):
     return key
 
 
-def _diff_attributes(old_item, new_item, return_old=True):
-    """Return only the attributes that changed.
+def _diff_attributes(old_item, new_item, updated_attrs, return_old=True):
+    """Return the old or new version of attributes that were updated.
 
-    - UPDATED_OLD: report the prior value of each attribute that was modified
-      or removed (omit additions, since there is no prior value).
-    - UPDATED_NEW: report the new value of each attribute that was created or
-      modified (omit removals, since there is no new value to report — per
-      AWS, REMOVE-only updates with UPDATED_NEW omit Attributes entirely).
+    - UPDATED_OLD: report the prior value of each updated attribute, omitting
+      additions where there was no prior value.
+    - UPDATED_NEW: report the new value of each updated attribute, omitting
+      removals where there is no new value (per AWS, REMOVE-only updates with
+      UPDATED_NEW omit Attributes entirely).
     """
     result = {}
-    all_keys = set(list(old_item.keys()) + list(new_item.keys()))
-    for k in all_keys:
-        ov = old_item.get(k)
-        nv = new_item.get(k)
-        if ov == nv:
-            continue
+    for k in updated_attrs:
         if return_old:
-            if ov is not None:
-                result[k] = ov
+            v = old_item.get(k)
+            if v is not None:
+                result[k] = v
         else:
-            if nv is not None:
-                result[k] = nv
+            v = new_item.get(k)
+            if v is not None:
+                result[k] = v
     return result
 
 
