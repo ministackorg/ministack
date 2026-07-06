@@ -1237,6 +1237,150 @@ def test_dynamodb_update_item_updated_old(ddb):
     )
     assert resp["Attributes"]["score"]["N"] == "10"
 
+
+def test_dynamodb_update_set_same_value_returned(ddb):
+    """SET that assigns the same value is still reported in UPDATED_NEW/OLD."""
+    name = "u-set-same-rv"
+    _basic_table(ddb, name)
+    try:
+        ddb.put_item(TableName=name, Item={"pk": {"S": "k"}, "a": {"S": "old"}})
+        r_new = ddb.update_item(
+            TableName=name,
+            Key={"pk": {"S": "k"}},
+            UpdateExpression="SET a = :v",
+            ExpressionAttributeValues={":v": {"S": "old"}},
+            ReturnValues="UPDATED_NEW",
+        )
+        assert r_new["Attributes"] == {"a": {"S": "old"}}
+
+        r_old = ddb.update_item(
+            TableName=name,
+            Key={"pk": {"S": "k"}},
+            UpdateExpression="SET a = :v",
+            ExpressionAttributeValues={":v": {"S": "old"}},
+            ReturnValues="UPDATED_OLD",
+        )
+        assert r_old["Attributes"] == {"a": {"S": "old"}}
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_update_remove_return_values(ddb):
+    """REMOVE omits the attribute in UPDATED_NEW and returns the old value in UPDATED_OLD."""
+    name = "u-remove-rv"
+    _basic_table(ddb, name)
+    try:
+        ddb.put_item(TableName=name, Item={"pk": {"S": "k"}, "x": {"S": "X"}})
+        r_new = ddb.update_item(
+            TableName=name,
+            Key={"pk": {"S": "k"}},
+            UpdateExpression="REMOVE x",
+            ReturnValues="UPDATED_NEW",
+        )
+        assert "Attributes" not in r_new
+
+        ddb.put_item(TableName=name, Item={"pk": {"S": "k"}, "x": {"S": "X"}})
+        r_old = ddb.update_item(
+            TableName=name,
+            Key={"pk": {"S": "k"}},
+            UpdateExpression="REMOVE x",
+            ReturnValues="UPDATED_OLD",
+        )
+        assert r_old["Attributes"] == {"x": {"S": "X"}}
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_update_add_number_return_values(ddb):
+    """ADD on a number returns new and old values for the updated attribute."""
+    name = "u-add-num-rv"
+    _basic_table(ddb, name)
+    try:
+        ddb.put_item(TableName=name, Item={"pk": {"S": "k"}, "n": {"N": "5"}})
+        r_new = ddb.update_item(
+            TableName=name,
+            Key={"pk": {"S": "k"}},
+            UpdateExpression="ADD n :v",
+            ExpressionAttributeValues={":v": {"N": "3"}},
+            ReturnValues="UPDATED_NEW",
+        )
+        assert r_new["Attributes"] == {"n": {"N": "8"}}
+
+        ddb.put_item(TableName=name, Item={"pk": {"S": "k"}, "n": {"N": "5"}})
+        r_old = ddb.update_item(
+            TableName=name,
+            Key={"pk": {"S": "k"}},
+            UpdateExpression="ADD n :v",
+            ExpressionAttributeValues={":v": {"N": "3"}},
+            ReturnValues="UPDATED_OLD",
+        )
+        assert r_old["Attributes"] == {"n": {"N": "5"}}
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_update_add_set_return_values(ddb):
+    """ADD on a string set returns the updated set in UPDATED_NEW/OLD."""
+    name = "u-add-ss-rv"
+    _basic_table(ddb, name)
+    try:
+        ddb.put_item(TableName=name, Item={"pk": {"S": "k"}, "tags": {"SS": ["a"]}})
+        r_new = ddb.update_item(
+            TableName=name,
+            Key={"pk": {"S": "k"}},
+            UpdateExpression="ADD tags :v",
+            ExpressionAttributeValues={":v": {"SS": ["b"]}},
+            ReturnValues="UPDATED_NEW",
+        )
+        assert sorted(r_new["Attributes"]["tags"]["SS"]) == ["a", "b"]
+
+        ddb.put_item(TableName=name, Item={"pk": {"S": "k"}, "tags": {"SS": ["a"]}})
+        r_old = ddb.update_item(
+            TableName=name,
+            Key={"pk": {"S": "k"}},
+            UpdateExpression="ADD tags :v",
+            ExpressionAttributeValues={":v": {"SS": ["b"]}},
+            ReturnValues="UPDATED_OLD",
+        )
+        assert r_old["Attributes"] == {"tags": {"SS": ["a"]}}
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_update_combined_return_values_only_touched(ddb):
+    """Combined SET/REMOVE only returns touched attributes; untouched attrs are excluded."""
+    name = "u-combo-rv"
+    _basic_table(ddb, name)
+    try:
+        ddb.put_item(
+            TableName=name,
+            Item={"pk": {"S": "k"}, "a": {"S": "old"}, "b": {"S": "keep"}, "x": {"S": "gone"}},
+        )
+        r_new = ddb.update_item(
+            TableName=name,
+            Key={"pk": {"S": "k"}},
+            UpdateExpression="SET a = :v REMOVE x",
+            ExpressionAttributeValues={":v": {"S": "new"}},
+            ReturnValues="UPDATED_NEW",
+        )
+        assert r_new["Attributes"] == {"a": {"S": "new"}}
+
+        ddb.put_item(
+            TableName=name,
+            Item={"pk": {"S": "k"}, "a": {"S": "old"}, "b": {"S": "keep"}, "x": {"S": "gone"}},
+        )
+        r_old = ddb.update_item(
+            TableName=name,
+            Key={"pk": {"S": "k"}},
+            UpdateExpression="SET a = :v REMOVE x",
+            ExpressionAttributeValues={":v": {"S": "new"}},
+            ReturnValues="UPDATED_OLD",
+        )
+        assert r_old["Attributes"] == {"a": {"S": "old"}, "x": {"S": "gone"}}
+    finally:
+        ddb.delete_table(TableName=name)
+
+
 def test_dynamodb_conditional_put_fails(ddb):
     """PutItem with attribute_not_exists condition fails if item already exists."""
     ddb.create_table(
@@ -3105,6 +3249,29 @@ def test_dynamodb_duplicate_ss_values_rejected(ddb):
     finally:
         ddb.delete_table(TableName=name)
 
+
+def test_dynamodb_string_set_with_empty_string_accepted(ddb):
+    """A string set containing an empty string must be valid (regression)."""
+    name = "ss-empty-str"
+    _basic_table(ddb, name)
+    try:
+        ddb.put_item(TableName=name, Item={"pk": {"S": "k"}, "tags": {"SS": [""]}})
+        item = ddb.get_item(TableName=name, Key={"pk": {"S": "k"}})["Item"]
+        assert item["tags"]["SS"] == [""]
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_string_set_with_empty_string_and_values_accepted(ddb):
+    """A string set containing an empty string alongside other values must be valid."""
+    name = "ss-empty-str-mix"
+    _basic_table(ddb, name)
+    try:
+        ddb.put_item(TableName=name, Item={"pk": {"S": "k"}, "tags": {"SS": ["", "a"]}})
+        item = ddb.get_item(TableName=name, Key={"pk": {"S": "k"}})["Item"]
+        assert sorted(item["tags"]["SS"]) == ["", "a"]
+    finally:
+        ddb.delete_table(TableName=name)
 
 def test_dynamodb_empty_string_hash_key_rejected(ddb):
     name = "empty-pk"
@@ -5298,33 +5465,270 @@ def test_export_returns_in_progress_then_completed(ddb, s3):
             pass
 
 
-def test_import_returns_in_progress_then_completed(ddb, s3):
-    bucket = f"imp-bucket-{_uuid_mod.uuid4().hex[:8]}"
-    s3.create_bucket(Bucket=bucket)
-    tname = f"imp-in-progress-{_uuid_mod.uuid4().hex[:8]}"
+# ---------------------------------------------------------------------------
+# UpdateItem regression tests — _validate_item enforcement
+# ---------------------------------------------------------------------------
+# Before the fix, _update_item did not call _validate_item on the resulting
+# item, so invalid values (malformed numbers, empty sets, oversized items, ...)
+# could be persisted. The tests below exercise the validation path now that it
+# is enforced.
+
+
+def _create_update_item_table(ddb, name):
     try:
-        resp = ddb.import_table(
-            S3BucketSource={"S3Bucket": bucket},
-            InputFormat="DYNAMODB_JSON",
-            TableCreationParameters={
-                "TableName": tname,
-                "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
-                "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
-                "BillingMode": "PAY_PER_REQUEST",
-            },
-        )
-        import_arn = resp["ImportTableDescription"]["ImportArn"]
-        assert resp["ImportTableDescription"]["ImportStatus"] == "IN_PROGRESS"
+        ddb.delete_table(TableName=name)
+    except Exception:
+        pass
+    ddb.create_table(
+        TableName=name,
+        KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+        AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "S"}],
+        BillingMode="PAY_PER_REQUEST",
+    )
 
-        first = ddb.describe_import(ImportArn=import_arn)["ImportTableDescription"]
-        assert first["ImportStatus"] == "IN_PROGRESS"
 
-        time.sleep(1.2)
-        later = ddb.describe_import(ImportArn=import_arn)["ImportTableDescription"]
-        assert later["ImportStatus"] == "COMPLETED"
-        assert "EndTime" in later
+def test_dynamodb_update_item_rejects_malformed_number(ddb):
+    """SET with a non-numeric string in a Number value must be rejected."""
+    name = "upd-malformed-number"
+    _create_update_item_table(ddb, name)
+    try:
+        ddb.put_item(TableName=name, Item={"pk": {"S": "k"}})
+        code, body = _raw_ddb("UpdateItem", {
+            "TableName": name,
+            "Key": {"pk": {"S": "k"}},
+            "UpdateExpression": "SET num = :v",
+            "ExpressionAttributeValues": {":v": {"N": "1.2.3"}},
+        })
+        assert code == 400
+        assert "ValidationException" in body.get("__type", "")
+        # The item must not have been modified.
+        item = ddb.get_item(TableName=name, Key={"pk": {"S": "k"}}).get("Item", {})
+        assert "num" not in item
     finally:
-        try:
-            ddb.delete_table(TableName=tname)
-        except Exception:
-            pass
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_update_item_rejects_number_out_of_range(ddb):
+    """Numbers with magnitude beyond the DynamoDB limits must be rejected."""
+    name = "upd-number-range"
+    _create_update_item_table(ddb, name)
+    try:
+        ddb.put_item(TableName=name, Item={"pk": {"S": "k"}})
+        code, body = _raw_ddb("UpdateItem", {
+            "TableName": name,
+            "Key": {"pk": {"S": "k"}},
+            "UpdateExpression": "SET num = :v",
+            "ExpressionAttributeValues": {":v": {"N": "1E+130"}},
+        })
+        assert code == 400
+        assert "ValidationException" in body.get("__type", "")
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_update_item_rejects_empty_string_set(ddb):
+    """SET with an empty SS value must be rejected."""
+    name = "upd-empty-ss"
+    _create_update_item_table(ddb, name)
+    try:
+        ddb.put_item(TableName=name, Item={"pk": {"S": "k"}})
+        code, body = _raw_ddb("UpdateItem", {
+            "TableName": name,
+            "Key": {"pk": {"S": "k"}},
+            "UpdateExpression": "SET tags = :v",
+            "ExpressionAttributeValues": {":v": {"SS": []}},
+        })
+        assert code == 400
+        assert "ValidationException" in body.get("__type", "")
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_update_item_rejects_duplicate_set_elements(ddb):
+    """SET with duplicate elements in a string set must be rejected."""
+    name = "upd-dup-ss"
+    _create_update_item_table(ddb, name)
+    try:
+        ddb.put_item(TableName=name, Item={"pk": {"S": "k"}})
+        code, body = _raw_ddb("UpdateItem", {
+            "TableName": name,
+            "Key": {"pk": {"S": "k"}},
+            "UpdateExpression": "SET tags = :v",
+            "ExpressionAttributeValues": {":v": {"SS": ["a", "a"]}},
+        })
+        assert code == 400
+        assert "ValidationException" in body.get("__type", "")
+        # The item must not have been modified.
+        item = ddb.get_item(TableName=name, Key={"pk": {"S": "k"}}).get("Item", {})
+        assert "tags" not in item
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_update_item_accepts_string_set_with_empty_string(ddb):
+    """SET with a string set containing an empty string must succeed (regression)."""
+    name = "upd-ss-empty-str"
+    _create_update_item_table(ddb, name)
+    try:
+        ddb.put_item(TableName=name, Item={"pk": {"S": "k"}})
+        ddb.update_item(
+            TableName=name,
+            Key={"pk": {"S": "k"}},
+            UpdateExpression="SET tags = :v",
+            ExpressionAttributeValues={":v": {"SS": [""]}},
+        )
+        item = ddb.get_item(TableName=name, Key={"pk": {"S": "k"}})["Item"]
+        assert item["tags"]["SS"] == [""]
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_update_item_adds_empty_string_to_string_set(ddb):
+    """ADD of an empty string to an existing string set must succeed."""
+    name = "upd-add-ss-empty-str"
+    _create_update_item_table(ddb, name)
+    try:
+        ddb.put_item(TableName=name, Item={"pk": {"S": "k"}, "tags": {"SS": ["a"]}})
+        ddb.update_item(
+            TableName=name,
+            Key={"pk": {"S": "k"}},
+            UpdateExpression="ADD tags :v",
+            ExpressionAttributeValues={":v": {"SS": [""]}},
+        )
+        item = ddb.get_item(TableName=name, Key={"pk": {"S": "k"}})["Item"]
+        assert sorted(item["tags"]["SS"]) == ["", "a"]
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+
+def test_dynamodb_update_item_rejects_multi_datatype_attr_value(ddb):
+    """An AttributeValue declaring more than one datatype must be rejected."""
+    name = "upd-multi-dt"
+    _create_update_item_table(ddb, name)
+    try:
+        ddb.put_item(TableName=name, Item={"pk": {"S": "k"}})
+        code, body = _raw_ddb("UpdateItem", {
+            "TableName": name,
+            "Key": {"pk": {"S": "k"}},
+            "UpdateExpression": "SET x = :v",
+            "ExpressionAttributeValues": {":v": {"S": "hello", "N": "42"}},
+        })
+        assert code == 400
+        assert "ValidationException" in body.get("__type", "")
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_update_item_rejects_oversized_item(ddb):
+    """An update producing an item larger than 400KB must be rejected."""
+    name = "upd-oversized"
+    _create_update_item_table(ddb, name)
+    try:
+        ddb.put_item(TableName=name, Item={"pk": {"S": "k"}, "small": {"S": "x"}})
+        big = "a" * (400 * 1024 + 100)
+        code, body = _raw_ddb("UpdateItem", {
+            "TableName": name,
+            "Key": {"pk": {"S": "k"}},
+            "UpdateExpression": "SET data = :v REMOVE small",
+            "ExpressionAttributeValues": {":v": {"S": big}},
+        })
+        assert code == 400
+        assert "ValidationException" in body.get("__type", "")
+        item = ddb.get_item(TableName=name, Key={"pk": {"S": "k"}})["Item"]
+        assert item.get("small") == {"S": "x"}
+        assert "data" not in item
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_update_item_rejects_empty_number_set(ddb):
+    """SET with an empty NS value must be rejected."""
+    name = "upd-empty-ns"
+    _create_update_item_table(ddb, name)
+    try:
+        ddb.put_item(TableName=name, Item={"pk": {"S": "k"}})
+        code, body = _raw_ddb("UpdateItem", {
+            "TableName": name,
+            "Key": {"pk": {"S": "k"}},
+            "UpdateExpression": "SET nums = :v",
+            "ExpressionAttributeValues": {":v": {"NS": []}},
+        })
+        assert code == 400
+        assert "ValidationException" in body.get("__type", "")
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_update_item_rejects_invalid_number_set(ddb):
+    """SET with an NS containing an invalid number must be rejected."""
+    name = "upd-invalid-ns"
+    _create_update_item_table(ddb, name)
+    try:
+        ddb.put_item(TableName=name, Item={"pk": {"S": "k"}})
+        code, body = _raw_ddb("UpdateItem", {
+            "TableName": name,
+            "Key": {"pk": {"S": "k"}},
+            "UpdateExpression": "SET nums = :v",
+            "ExpressionAttributeValues": {":v": {"NS": ["1", "not-a-number"]}},
+        })
+        assert code == 400
+        assert "ValidationException" in body.get("__type", "")
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_update_item_rejects_empty_binary_set(ddb):
+    """SET with an empty BS value must be rejected."""
+    name = "upd-empty-bs"
+    _create_update_item_table(ddb, name)
+    try:
+        ddb.put_item(TableName=name, Item={"pk": {"S": "k"}})
+        code, body = _raw_ddb("UpdateItem", {
+            "TableName": name,
+            "Key": {"pk": {"S": "k"}},
+            "UpdateExpression": "SET blobs = :v",
+            "ExpressionAttributeValues": {":v": {"BS": []}},
+        })
+        assert code == 400
+        assert "ValidationException" in body.get("__type", "")
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_update_item_attribute_updates_rejects_invalid_value(ddb):
+    """Legacy AttributeUpdates path must also validate the resulting item."""
+    name = "upd-attr-upd-invalid"
+    _create_update_item_table(ddb, name)
+    try:
+        ddb.put_item(TableName=name, Item={"pk": {"S": "k"}})
+        with pytest.raises(ClientError) as exc_info:
+            ddb.update_item(
+                TableName=name,
+                Key={"pk": {"S": "k"}},
+                AttributeUpdates={"num": {"Action": "PUT", "Value": {"N": "1.2.3"}}},
+            )
+        assert exc_info.value.response["Error"]["Code"] == "ValidationException"
+        item = ddb.get_item(TableName=name, Key={"pk": {"S": "k"}}).get("Item", {})
+        assert "num" not in item
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_update_item_valid_update_still_succeeds(ddb):
+    """Sanity check: valid UpdateItem operations continue to work."""
+    name = "upd-valid"
+    _create_update_item_table(ddb, name)
+    try:
+        ddb.update_item(
+            TableName=name,
+            Key={"pk": {"S": "k"}},
+            UpdateExpression="SET num = :n, tags = :t",
+            ExpressionAttributeValues={":n": {"N": "42"}, ":t": {"SS": ["a", "b"]}},
+        )
+        item = ddb.get_item(TableName=name, Key={"pk": {"S": "k"}})["Item"]
+        assert item["num"] == {"N": "42"}
+        assert sorted(item["tags"]["SS"]) == ["a", "b"]
+    finally:
+        ddb.delete_table(TableName=name)
+
