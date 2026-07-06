@@ -1552,7 +1552,7 @@ def _maybe_record_cloudtrail(
     try:
         event_name = _ct_event_name(service, method, path, headers, query_params)
         resources = _ct_resources(service, method, path, body)
-        access_key_id = extract_access_key_id(headers) or "test"
+        access_key_id = extract_access_key_id(headers, query_params) or "test"
         user_agent = headers.get("user-agent", "")
         request_params = _ct_request_params(headers, body, query_params)
         ct_mod.record_event(
