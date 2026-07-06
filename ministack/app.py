@@ -1552,7 +1552,7 @@ def _maybe_record_cloudtrail(
     try:
         event_name = _ct_event_name(service, method, path, headers, query_params)
         resources = _ct_resources(service, method, path, body)
-        access_key_id = extract_access_key_id(headers) or "test"
+        access_key_id = extract_access_key_id(headers, query_params) or "test"
         user_agent = headers.get("user-agent", "")
         request_params = _ct_request_params(headers, body, query_params)
         ct_mod.record_event(
@@ -1715,7 +1715,7 @@ async def app(scope, receive, send):
 
     # Set per-request account ID from credentials (multi-tenancy support).
     # If the access key is a 12-digit number, it becomes the account ID.
-    _access_key = extract_access_key_id(headers)
+    _access_key = extract_access_key_id(headers, query_params)
     if _access_key:
         set_request_account_id(_access_key)
 
