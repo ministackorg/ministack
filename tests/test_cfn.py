@@ -1177,6 +1177,75 @@ def test_cfn_esm_filter_criteria_round_trips(cfn, lam, ddb):
     ddb.delete_table(TableName="cfn-esm-fc-table")
     lam.delete_function(FunctionName="cfn-esm-fc-fn")
 
+
+def test_cfn_esm_extra_props_round_trip_and_in_place_update(cfn, lam, ddb):
+    """CFN-created EventSourceMappings must round-trip every optional prop (not just
+    FilterCriteria), and a stack update must mutate the mapping in place (same UUID),
+    never duplicate it — #1034 follow-up."""
+    code = "def handler(e,c): return {'ok': True}"
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("index.py", code)
+    lam.create_function(
+        FunctionName="cfn-esm-xp-fn", Runtime="python3.11",
+        Role="arn:aws:iam::000000000000:role/r", Handler="index.handler",
+        Code={"ZipFile": buf.getvalue()},
+    )
+    table = ddb.create_table(
+        TableName="cfn-esm-xp-table",
+        KeySchema=[{"AttributeName": "id", "KeyType": "HASH"}],
+        AttributeDefinitions=[{"AttributeName": "id", "AttributeType": "S"}],
+        BillingMode="PAY_PER_REQUEST",
+        StreamSpecification={"StreamEnabled": True, "StreamViewType": "NEW_IMAGE"},
+    )
+    stream_arn = table["TableDescription"]["LatestStreamArn"]
+    dlq = "arn:aws:sqs:us-east-1:000000000000:cfn-esm-xp-dlq"
+
+    def template(batch):
+        return {
+            "AWSTemplateFormatVersion": "2010-09-09",
+            "Resources": {"Mapping": {
+                "Type": "AWS::Lambda::EventSourceMapping",
+                "Properties": {
+                    "FunctionName": "cfn-esm-xp-fn",
+                    "EventSourceArn": stream_arn,
+                    "StartingPosition": "LATEST",
+                    "BatchSize": batch,
+                    "MaximumRetryAttempts": 3,
+                    "BisectBatchOnFunctionError": True,
+                    "ParallelizationFactor": 4,
+                    "DestinationConfig": {"OnFailure": {"Destination": dlq}},
+                },
+            }},
+        }
+
+    cfn.create_stack(StackName="cfn-esm-xp", TemplateBody=json.dumps(template(5)))
+    stack = _wait_stack(cfn, "cfn-esm-xp")
+    assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+
+    maps = lam.list_event_source_mappings(FunctionName="cfn-esm-xp-fn")["EventSourceMappings"]
+    assert len(maps) == 1
+    m = maps[0]
+    uuid_before = m["UUID"]
+    assert m["BatchSize"] == 5
+    assert m["MaximumRetryAttempts"] == 3
+    assert m["BisectBatchOnFunctionError"] is True
+    assert m["ParallelizationFactor"] == 4
+    assert m["DestinationConfig"]["OnFailure"]["Destination"] == dlq
+
+    # Stack update changing BatchSize must update in place: same UUID, still one mapping.
+    cfn.update_stack(StackName="cfn-esm-xp", TemplateBody=json.dumps(template(9)))
+    _wait_stack(cfn, "cfn-esm-xp")
+    maps2 = lam.list_event_source_mappings(FunctionName="cfn-esm-xp-fn")["EventSourceMappings"]
+    assert len(maps2) == 1, "stack update must not duplicate the mapping"
+    assert maps2[0]["UUID"] == uuid_before, "update must mutate in place (same UUID)"
+    assert maps2[0]["BatchSize"] == 9
+
+    cfn.delete_stack(StackName="cfn-esm-xp")
+    _wait_stack(cfn, "cfn-esm-xp")
+    ddb.delete_table(TableName="cfn-esm-xp-table")
+    lam.delete_function(FunctionName="cfn-esm-xp-fn")
+
 def test_cfn_wait_condition(cfn):
     """AWS::CloudFormation::WaitCondition and WaitConditionHandle are no-ops."""
     template = {

@@ -2362,6 +2362,13 @@ def _apply_object_lock_from_headers(bucket_name: str, key: str, headers: dict):
         _object_legal_hold[(bucket_name, key)] = lock_legal
 
 
+def _object_tagging_count_header(bucket_name: str, key: str, version_id) -> dict:
+    """GetObject returns ``x-amz-tagging-count`` (boto3 surfaces it as ``TagCount``)
+    only when the object carries at least one tag; AWS omits the header at zero (#1026)."""
+    n = len(_object_tags.get((bucket_name, key, version_id), {}))
+    return {"x-amz-tagging-count": str(n)} if n else {}
+
+
 def _get_object(bucket_name: str, key: str, headers: dict, query_params: dict = None):
     query_params = query_params or {}
     bucket = _ensure_bucket(bucket_name)
@@ -2398,6 +2405,7 @@ def _get_object(bucket_name: str, key: str, headers: dict, query_params: dict = 
                         resp_headers[f"x-amz-checksum-{alg.lower()}"] = val
                     if stored:
                         resp_headers["x-amz-checksum-type"] = "FULL_OBJECT"
+                resp_headers.update(_object_tagging_count_header(bucket_name, key, version_id))
                 return 200, resp_headers, v["data"]
         return _error("NoSuchVersion", "The specified version does not exist.", 404, f"/{bucket_name}/{key}")
 
@@ -2419,6 +2427,7 @@ def _get_object(bucket_name: str, key: str, headers: dict, query_params: dict = 
     include_checksums = checksum_mode_on and not range_header
     resp_headers = _object_response_headers(obj, bucket_name, key,
                                             include_checksums=include_checksums)
+    resp_headers.update(_object_tagging_count_header(bucket_name, key, obj.get("version_id")))
 
     body = _read_body(bucket_name, key, obj)
     if range_header:
