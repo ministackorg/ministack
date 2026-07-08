@@ -38,8 +38,14 @@ def _req(method, path, body=None, query=None, account=None):
         data = json.dumps(body).encode()
         headers["Content-Type"] = "application/json"
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    # 30s instead of 10s: under CI xdist contention the first request into the
+    # s3files handler can trigger lazy imports of large service modules whose
+    # import-time work exceeds 10s on the shared 2-core Linux runner (same
+    # failure class documented in tests/test_rds_data.py). The handler itself
+    # is sub-ms once loaded, so 30s leaves a wide margin without slowing real
+    # failures meaningfully.
     try:
-        resp = urllib.request.urlopen(req, timeout=10)
+        resp = urllib.request.urlopen(req, timeout=30)
         raw = resp.read()
         return resp.status, json.loads(raw) if raw else {}
     except urllib.error.HTTPError as e:
