@@ -85,11 +85,48 @@ _port_counter = [BASE_PORT]
 _docker = None
 _ministack_network = None
 
+# Aurora MySQL versions are the creatable set returned by AWS RDS as of
+# 2026-07-09. Refresh with:
+#   aws rds describe-db-engine-versions --engine aurora-mysql \
+#     --query 'DBEngineVersions[].[EngineVersion,DBParameterGroupFamily]' \
+#     --output text | sort -V
+# Keep the Docker image mapping below aligned to the community MySQL major.minor:
+# 5.7 -> mysql:5.7, 8.0 -> mysql:8.0, 8.4 -> mysql:8.4. AWS's default can trail
+# the latest advertised version, so update _default_engine_version deliberately.
 AURORA_MYSQL_ENGINE_VERSIONS = [
+    ("5.7.mysql_aurora.2.11.1", "aurora-mysql5.7"),
+    ("5.7.mysql_aurora.2.11.2", "aurora-mysql5.7"),
+    ("5.7.mysql_aurora.2.11.3", "aurora-mysql5.7"),
+    ("5.7.mysql_aurora.2.11.4", "aurora-mysql5.7"),
+    ("5.7.mysql_aurora.2.11.5", "aurora-mysql5.7"),
+    ("5.7.mysql_aurora.2.11.6", "aurora-mysql5.7"),
+    ("5.7.mysql_aurora.2.12.0", "aurora-mysql5.7"),
+    ("5.7.mysql_aurora.2.12.1", "aurora-mysql5.7"),
+    ("5.7.mysql_aurora.2.12.2", "aurora-mysql5.7"),
+    ("5.7.mysql_aurora.2.12.3", "aurora-mysql5.7"),
+    ("5.7.mysql_aurora.2.12.4", "aurora-mysql5.7"),
+    ("5.7.mysql_aurora.2.12.5", "aurora-mysql5.7"),
     ("5.7.mysql_aurora.2.12.6", "aurora-mysql5.7"),
+    ("8.0.mysql_aurora.3.04.0", "aurora-mysql8.0"),
+    ("8.0.mysql_aurora.3.04.1", "aurora-mysql8.0"),
+    ("8.0.mysql_aurora.3.04.2", "aurora-mysql8.0"),
+    ("8.0.mysql_aurora.3.04.3", "aurora-mysql8.0"),
+    ("8.0.mysql_aurora.3.04.4", "aurora-mysql8.0"),
+    ("8.0.mysql_aurora.3.04.6", "aurora-mysql8.0"),
+    ("8.0.mysql_aurora.3.08.0", "aurora-mysql8.0"),
+    ("8.0.mysql_aurora.3.08.1", "aurora-mysql8.0"),
+    ("8.0.mysql_aurora.3.08.2", "aurora-mysql8.0"),
+    ("8.0.mysql_aurora.3.09.0", "aurora-mysql8.0"),
+    ("8.0.mysql_aurora.3.10.0", "aurora-mysql8.0"),
+    ("8.0.mysql_aurora.3.10.1", "aurora-mysql8.0"),
+    ("8.0.mysql_aurora.3.10.2", "aurora-mysql8.0"),
+    ("8.0.mysql_aurora.3.10.3", "aurora-mysql8.0"),
+    ("8.0.mysql_aurora.3.10.4", "aurora-mysql8.0"),
+    ("8.0.mysql_aurora.3.11.1", "aurora-mysql8.0"),
     ("8.0.mysql_aurora.3.12.0", "aurora-mysql8.0"),
     ("8.4.mysql_aurora.8.4.7", "aurora-mysql8.4"),
 ]
+AURORA_MYSQL_ENGINE_VERSION_SET = {version for version, _ in AURORA_MYSQL_ENGINE_VERSIONS}
 
 AURORA_MYSQL_IMAGE_MAP = {
     "5.6": "mysql:5.6",
@@ -986,7 +1023,11 @@ def _create_db_instance(p):
         return _error("DBInstanceAlreadyExistsFault", f"DB instance {db_id} already exists", 400)
 
     engine = _p(p, "Engine") or "postgres"
-    engine_version = _p(p, "EngineVersion") or _default_engine_version(engine)
+    explicit_engine_version = _p(p, "EngineVersion")
+    engine_version_error = _unsupported_aurora_mysql_engine_version_error(engine, explicit_engine_version)
+    if engine_version_error:
+        return engine_version_error
+    engine_version = explicit_engine_version or _default_engine_version(engine)
     db_class = _p(p, "DBInstanceClass") or "db.t3.micro"
     master_user = _p(p, "MasterUsername") or "admin"
     master_pass = _p(p, "MasterUserPassword") or "password"
@@ -1688,11 +1729,15 @@ def _create_db_cluster(p):
                 400,
             )
         engine = expected_engine or engine
-    engine_version = _p(p, "EngineVersion") or _default_engine_version(engine)
+    explicit_engine_version = _p(p, "EngineVersion")
+    engine_version_error = _unsupported_aurora_mysql_engine_version_error(engine, explicit_engine_version)
+    if engine_version_error:
+        return engine_version_error
+    engine_version = explicit_engine_version or _default_engine_version(engine)
     if global_cluster:
         expected_engine_version = global_cluster.get("EngineVersion")
         if (
-            _p(p, "EngineVersion")
+            explicit_engine_version
             and expected_engine_version
             and engine_version != expected_engine_version
         ):
@@ -3041,9 +3086,6 @@ def _describe_engine_versions(p):
         "aurora-mysql": AURORA_MYSQL_ENGINE_VERSIONS,
     }
     versions = versions_map.get(engine, [("15.3", "15")])
-    if engine == "aurora-mysql" and version_filter and not any(ver == version_filter for ver, _ in versions):
-        family = _aurora_mysql_parameter_group_family(version_filter)
-        versions = [(version_filter, family)] if family else []
     members = ""
     supports_global = engine in ("aurora-mysql", "aurora-postgresql")
     for ver, family in versions:
@@ -3074,6 +3116,9 @@ def _describe_orderable_options(p):
     engine = _p(p, "Engine") or "postgres"
     engine_version = _p(p, "EngineVersion")
     db_class = _p(p, "DBInstanceClass")
+    engine_version_error = _unsupported_aurora_mysql_engine_version_error(engine, engine_version)
+    if engine_version_error:
+        return engine_version_error
 
     instance_classes = [
         "db.t3.micro", "db.t3.small", "db.t3.medium", "db.t3.large",
@@ -3643,9 +3688,23 @@ def _format_time(ts):
 def _default_engine_version(engine):
     defaults = {
         "postgres": "15.3", "mysql": "8.0.33", "mariadb": "10.6.14",
-        "aurora-postgresql": "15.3", "aurora-mysql": "8.0.mysql_aurora.3.03.0",
+        "aurora-postgresql": "15.3", "aurora-mysql": "8.0.mysql_aurora.3.10.3",
     }
     return defaults.get(engine, "15.3")
+
+
+def _unsupported_aurora_mysql_engine_version_error(engine, engine_version):
+    if (
+        engine == "aurora-mysql"
+        and engine_version
+        and engine_version not in AURORA_MYSQL_ENGINE_VERSION_SET
+    ):
+        return _error(
+            "InvalidParameterCombination",
+            f"Cannot find version {engine_version} for aurora-mysql",
+            400,
+        )
+    return None
 
 
 def _mysql_community_major_minor(engine_version):
@@ -3653,18 +3712,6 @@ def _mysql_community_major_minor(engine_version):
     head = version.split(".mysql_aurora.")[0] if ".mysql_aurora." in version else version
     parts = head.split(".")
     return ".".join(parts[:2]) if len(parts) >= 2 else head
-
-
-def _is_mysql_major_minor(value):
-    parts = value.split(".")
-    return len(parts) == 2 and all(part.isdigit() for part in parts)
-
-
-def _aurora_mysql_parameter_group_family(engine_version):
-    major_minor = _mysql_community_major_minor(engine_version)
-    if not _is_mysql_major_minor(major_minor):
-        return ""
-    return f"aurora-mysql{major_minor}"
 
 
 def _mysql_image_for_version(engine_version):
