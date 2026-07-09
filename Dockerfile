@@ -1,4 +1,4 @@
-FROM python:3.12-alpine AS builder
+FROM python:3.13-alpine AS builder
 
 RUN pip install --no-cache-dir --no-compile \
         hypercorn==0.18.0 \
@@ -13,25 +13,25 @@ RUN pip install --no-cache-dir --no-compile \
         "awscli"
 
 # Strip awscli help examples (~25 MB) and Python cache files (~15 MB).
-RUN rm -rf /usr/local/lib/python3.12/site-packages/awscli/examples \
-    && find /usr/local/lib/python3.12/site-packages -type d -name '__pycache__' -exec rm -rf {} + 2>/dev/null \
-    && rm -rf /usr/local/lib/python3.12/site-packages/pip*.dist-info \
-    && rm -rf /usr/local/lib/python3.12/site-packages/pip*
+RUN rm -rf /usr/local/lib/python3.13/site-packages/awscli/examples \
+    && find /usr/local/lib/python3.13/site-packages -type d -name '__pycache__' -exec rm -rf {} + 2>/dev/null \
+    && rm -rf /usr/local/lib/python3.13/site-packages/pip*.dist-info \
+    && rm -rf /usr/local/lib/python3.13/site-packages/pip*
 
-FROM python:3.12-alpine
+FROM python:3.13-alpine
 
 LABEL maintainer="MiniStack" \
       description="Local AWS Service Emulator — drop-in LocalStack replacement"
 
 # Upgrade base packages to pick up latest security patches.
 RUN apk upgrade --no-cache && apk add --no-cache nodejs bash openssl && rm -f /usr/bin/wget /bin/wget \
-    && rm -rf /usr/local/lib/python3.12/site-packages/pip* \
+    && rm -rf /usr/local/lib/python3.13/site-packages/pip* \
               /usr/local/bin/pip*
 
 WORKDIR /opt/ministack
 
 # Copy cleaned Python packages and CLI entrypoints from builder.
-COPY --from=builder /usr/local/lib/python3.12/site-packages /usr/local/lib/python3.12/site-packages
+COPY --from=builder /usr/local/lib/python3.13/site-packages /usr/local/lib/python3.13/site-packages
 COPY --from=builder /usr/local/bin/aws /usr/local/bin/aws
 COPY --from=builder /usr/local/bin/aws_completer /usr/local/bin/aws_completer
 COPY --from=builder /usr/local/bin/hypercorn /usr/local/bin/hypercorn

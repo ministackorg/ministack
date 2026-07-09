@@ -1,4 +1,4 @@
-FROM python:3.12-slim AS builder
+FROM python:3.13-slim AS builder
 
 # Full variant — Debian/glibc base so DuckDB and psycopg2 install from
 # published manylinux wheels instead of building from source against musl.
@@ -21,14 +21,14 @@ RUN pip install --no-cache-dir --no-compile \
 
 # Strip awscli help examples (~25 MB), Python cache files (~15 MB),
 # pip metadata, and DuckDB stub / ADBC artefacts that aren't used at runtime.
-RUN rm -rf /usr/local/lib/python3.12/site-packages/awscli/examples \
-    && find /usr/local/lib/python3.12/site-packages -type d -name '__pycache__' -exec rm -rf {} + 2>/dev/null \
-    && rm -rf /usr/local/lib/python3.12/site-packages/pip*.dist-info \
-    && rm -rf /usr/local/lib/python3.12/site-packages/pip* \
-    && rm -rf /usr/local/lib/python3.12/site-packages/_duckdb-stubs \
-    && rm -rf /usr/local/lib/python3.12/site-packages/adbc_driver_duckdb
+RUN rm -rf /usr/local/lib/python3.13/site-packages/awscli/examples \
+    && find /usr/local/lib/python3.13/site-packages -type d -name '__pycache__' -exec rm -rf {} + 2>/dev/null \
+    && rm -rf /usr/local/lib/python3.13/site-packages/pip*.dist-info \
+    && rm -rf /usr/local/lib/python3.13/site-packages/pip* \
+    && rm -rf /usr/local/lib/python3.13/site-packages/_duckdb-stubs \
+    && rm -rf /usr/local/lib/python3.13/site-packages/adbc_driver_duckdb
 
-FROM python:3.12-slim
+FROM python:3.13-slim
 
 LABEL maintainer="MiniStack" \
       description="Local AWS Service Emulator — full variant with DuckDB (Athena), PostgreSQL, MySQL drivers, and SFTP"
@@ -40,13 +40,13 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends nodejs bash \
     && apt-get purge -y --auto-remove -o APT::AutoRemove::RecommendsImportant=false \
     && rm -rf /var/lib/apt/lists/* /var/cache/apt/* /tmp/* \
-    && rm -rf /usr/local/lib/python3.12/site-packages/pip* /usr/local/bin/pip* \
+    && rm -rf /usr/local/lib/python3.13/site-packages/pip* /usr/local/bin/pip* \
     && rm -rf /usr/share/doc /usr/share/man /usr/share/info /usr/share/locale
 
 WORKDIR /opt/ministack
 
 # Copy cleaned Python packages and CLI entrypoints from builder.
-COPY --from=builder /usr/local/lib/python3.12/site-packages /usr/local/lib/python3.12/site-packages
+COPY --from=builder /usr/local/lib/python3.13/site-packages /usr/local/lib/python3.13/site-packages
 COPY --from=builder /usr/local/bin/aws /usr/local/bin/aws
 COPY --from=builder /usr/local/bin/aws_completer /usr/local/bin/aws_completer
 COPY --from=builder /usr/local/bin/hypercorn /usr/local/bin/hypercorn

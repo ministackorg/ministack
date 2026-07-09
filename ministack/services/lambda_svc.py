@@ -251,6 +251,44 @@ def _runtime_env_vars(config: dict) -> dict:
     return {key: value for key, value in env.items() if key not in _RESERVED_RUNTIME_ENV_VARS}
 
 
+# ── provided.* runtime code cache (#1051) ──────────────────
+# Concurrent provided.* invocations used to extract the code zip into a
+# fresh TemporaryDirectory per invocation and exec the bootstrap from it.
+# While one thread still holds the extraction's write fd on ``bootstrap``,
+# another thread's ``Popen`` fork lets the child inherit that fd, and the
+# child's ``execve`` then fails with ETXTBSY (CPython bpo-2320). Extraction
+# is therefore content-addressed — one shared read-only directory per code
+# sha256, matching real Lambda's read-only /var/task — and both extraction
+# and every spawn take ``_provided_code_lock`` so no fork can overlap an
+# extraction write. Directories accumulate per distinct code sha within
+# ``tempfile.gettempdir()``; ``reset()`` removes them.
+_PROVIDED_CODE_CACHE = os.path.join(tempfile.gettempdir(), "ministack-provided-code")
+_provided_code_lock = threading.Lock()
+_provided_code_dirs: dict[str, str] = {}
+
+
+def _provided_runtime_code_dir(code_zip: bytes) -> str:
+    """Extract ``code_zip`` once into a shared per-sha directory and return it."""
+    sha = hashlib.sha256(code_zip).hexdigest()
+    with _provided_code_lock:
+        cached = _provided_code_dirs.get(sha)
+        if cached and os.path.isdir(cached):
+            return cached
+        code_dir = os.path.join(_PROVIDED_CODE_CACHE, sha)
+        if os.path.isdir(code_dir):
+            # Leftover from a previous process — contents may be partial.
+            import shutil
+            shutil.rmtree(code_dir, ignore_errors=True)
+        os.makedirs(code_dir, exist_ok=True)
+        with zipfile.ZipFile(io.BytesIO(code_zip)) as zf:
+            _extract_zip_preserving_mode(zf, code_dir)
+        bootstrap_path = os.path.join(code_dir, "bootstrap")
+        if os.path.exists(bootstrap_path):
+            os.chmod(bootstrap_path, 0o755)
+        _provided_code_dirs[sha] = code_dir
+        return code_dir
+
+
 # ── Persistence ────────────────────────────────────────────
 
 # Lambda code zips are stored on disk as content-addressed blob files under
@@ -3878,150 +3916,147 @@ def _execute_function_provided(func: dict, event: dict) -> dict:
     try:
         import http.server
         import socketserver
-        with tempfile.TemporaryDirectory() as tmpdir:
-            # Extract bootstrap binary
-            zip_path = os.path.join(tmpdir, "code.zip")
-            with open(zip_path, "wb") as f:
-                f.write(code_zip)
-            code_dir = os.path.join(tmpdir, "code")
-            os.makedirs(code_dir)
-            with zipfile.ZipFile(zip_path) as zf:
-                _extract_zip_preserving_mode(zf, code_dir)
+        code_dir = _provided_runtime_code_dir(code_zip)
+        bootstrap_path = os.path.join(code_dir, "bootstrap")
+        if not os.path.exists(bootstrap_path):
+            return {"body": {"statusCode": 200, "body": "Mock response - no bootstrap binary found"}}
 
-            bootstrap_path = os.path.join(code_dir, "bootstrap")
-            if not os.path.exists(bootstrap_path):
-                return {"body": {"statusCode": 200, "body": "Mock response - no bootstrap binary found"}}
-            os.chmod(bootstrap_path, 0o755)
+        # Shared state for the Runtime API
+        result_holder = {"response": None, "error": None}
+        event_json = json.dumps(event)
+        request_id = new_uuid()
+        event_served = threading.Event()
+        response_received = threading.Event()
+        server_ready = threading.Event()
 
-            # Shared state for the Runtime API
-            result_holder = {"response": None, "error": None}
-            event_json = json.dumps(event)
-            request_id = new_uuid()
-            event_served = threading.Event()
-            response_received = threading.Event()
-            server_ready = threading.Event()
+        class RuntimeAPIHandler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, format, *args):
+                pass  # Suppress logs
 
-            class RuntimeAPIHandler(http.server.BaseHTTPRequestHandler):
-                def log_message(self, format, *args):
-                    pass  # Suppress logs
-
-                def _read_body(self):
-                    """Read request body, handling both Content-Length and chunked transfer encoding."""
-                    transfer_encoding = self.headers.get("Transfer-Encoding", "")
-                    if "chunked" in transfer_encoding.lower():
-                        chunks = []
-                        while True:
-                            line = self.rfile.readline().strip()
-                            chunk_size = int(line, 16)
-                            if chunk_size == 0:
-                                self.rfile.readline()  # trailing CRLF
-                                break
-                            chunks.append(self.rfile.read(chunk_size))
+            def _read_body(self):
+                """Read request body, handling both Content-Length and chunked transfer encoding."""
+                transfer_encoding = self.headers.get("Transfer-Encoding", "")
+                if "chunked" in transfer_encoding.lower():
+                    chunks = []
+                    while True:
+                        line = self.rfile.readline().strip()
+                        chunk_size = int(line, 16)
+                        if chunk_size == 0:
                             self.rfile.readline()  # trailing CRLF
-                        return b"".join(chunks)
-                    content_length = int(self.headers.get("Content-Length", 0))
-                    return self.rfile.read(content_length) if content_length else b""
+                            break
+                        chunks.append(self.rfile.read(chunk_size))
+                        self.rfile.readline()  # trailing CRLF
+                    return b"".join(chunks)
+                content_length = int(self.headers.get("Content-Length", 0))
+                return self.rfile.read(content_length) if content_length else b""
 
-                def do_GET(self):
-                    # GET /2018-06-01/runtime/invocation/next
-                    if "/runtime/invocation/next" in self.path:
-                        self.send_response(200)
-                        self.send_header("Lambda-Runtime-Aws-Request-Id", request_id)
-                        self.send_header("Lambda-Runtime-Deadline-Ms",
-                                         str(int((time.time() + timeout) * 1000)))
-                        self.send_header("Content-Type", "application/json")
-                        self.end_headers()
-                        self.wfile.write(event_json.encode())
-                        event_served.set()
-                    else:
-                        self.send_response(404)
-                        self.end_headers()
+            def do_GET(self):
+                # GET /2018-06-01/runtime/invocation/next
+                if "/runtime/invocation/next" in self.path:
+                    self.send_response(200)
+                    self.send_header("Lambda-Runtime-Aws-Request-Id", request_id)
+                    self.send_header("Lambda-Runtime-Deadline-Ms",
+                                     str(int((time.time() + timeout) * 1000)))
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(event_json.encode())
+                    event_served.set()
+                else:
+                    self.send_response(404)
+                    self.end_headers()
 
-                def do_POST(self):
-                    body = self._read_body()
-                    if f"/runtime/invocation/{request_id}/response" in self.path:
-                        try:
-                            result_holder["response"] = json.loads(body)
-                        except json.JSONDecodeError:
-                            result_holder["response"] = body.decode("utf-8", errors="replace")
-                        self.send_response(202)
-                        self.end_headers()
-                        response_received.set()
-                    elif f"/runtime/invocation/{request_id}/error" in self.path:
-                        try:
-                            result_holder["error"] = json.loads(body)
-                        except json.JSONDecodeError:
-                            result_holder["error"] = body.decode("utf-8", errors="replace")
-                        self.send_response(202)
-                        self.end_headers()
-                        response_received.set()
-                    elif "/runtime/init/error" in self.path:
-                        try:
-                            result_holder["error"] = json.loads(body)
-                        except json.JSONDecodeError:
-                            result_holder["error"] = body.decode("utf-8", errors="replace")
-                        self.send_response(202)
-                        self.end_headers()
-                        response_received.set()
-                    else:
-                        self.send_response(404)
-                        self.end_headers()
+            def do_POST(self):
+                body = self._read_body()
+                if f"/runtime/invocation/{request_id}/response" in self.path:
+                    try:
+                        result_holder["response"] = json.loads(body)
+                    except json.JSONDecodeError:
+                        result_holder["response"] = body.decode("utf-8", errors="replace")
+                    self.send_response(202)
+                    self.end_headers()
+                    response_received.set()
+                elif f"/runtime/invocation/{request_id}/error" in self.path:
+                    try:
+                        result_holder["error"] = json.loads(body)
+                    except json.JSONDecodeError:
+                        result_holder["error"] = body.decode("utf-8", errors="replace")
+                    self.send_response(202)
+                    self.end_headers()
+                    response_received.set()
+                elif "/runtime/init/error" in self.path:
+                    try:
+                        result_holder["error"] = json.loads(body)
+                    except json.JSONDecodeError:
+                        result_holder["error"] = body.decode("utf-8", errors="replace")
+                    self.send_response(202)
+                    self.end_headers()
+                    response_received.set()
+                else:
+                    self.send_response(404)
+                    self.end_headers()
 
-            # Bind to port 0 — OS assigns a free port atomically, no race window
-            class _QuietTCPServer(socketserver.TCPServer):
-                def handle_error(self, request, client_address):
-                    import sys
-                    _, exc, _ = sys.exc_info()
-                    if isinstance(exc, (BrokenPipeError, ConnectionResetError, ConnectionAbortedError)):
-                        return
-                    super().handle_error(request, client_address)
+        # Bind to port 0 — OS assigns a free port atomically, no race window
+        class _QuietTCPServer(socketserver.TCPServer):
+            def handle_error(self, request, client_address):
+                import sys
+                _, exc, _ = sys.exc_info()
+                if isinstance(exc, (BrokenPipeError, ConnectionResetError, ConnectionAbortedError)):
+                    return
+                super().handle_error(request, client_address)
 
-            server = _QuietTCPServer(("127.0.0.1", 0), RuntimeAPIHandler)
-            port = server.server_address[1]
+        server = _QuietTCPServer(("127.0.0.1", 0), RuntimeAPIHandler)
+        port = server.server_address[1]
 
-            def _serve():
-                server_ready.set()
-                server.serve_forever()
+        def _serve():
+            server_ready.set()
+            server.serve_forever()
 
-            server_thread = threading.Thread(target=_serve, daemon=True)
-            server_thread.start()
-            server_ready.wait(timeout=5)
+        server_thread = threading.Thread(target=_serve, daemon=True)
+        server_thread.start()
+        server_ready.wait(timeout=5)
 
-            try:
-                # Build environment for the Lambda binary
-                proc_env = dict(os.environ)
-                proc_env.update({
-                    "AWS_LAMBDA_RUNTIME_API": f"127.0.0.1:{port}",
-                    "AWS_DEFAULT_REGION": get_region(),
-                    "AWS_REGION": get_region(),
-                    "AWS_ACCESS_KEY_ID": _account_region_from_function_config(config)[0],
-                    "AWS_SECRET_ACCESS_KEY": os.environ.get("AWS_SECRET_ACCESS_KEY", "test"),
-                    "AWS_LAMBDA_FUNCTION_NAME": config.get("FunctionName", "unknown"),
-                    "LAMBDA_TASK_ROOT": code_dir,
-                    "_HANDLER": config.get("Handler", "bootstrap"),
-                })
-                proc_env.update(env_vars)
-                proc_env.update(_durable_env_overlay())
-                # X-Ray active tracing. ``_execute_function_provided`` builds
-                # ``proc_env`` per-invocation, so a per-call trace ID is safe
-                # here (unlike the RIE pool). aws-xray-sdk reads this env var
-                # per-segment via ``os.getenv``, so the runtime sees it.
-                _xray_trace_id = _xray_trace_id_for_invocation(config)
-                if _xray_trace_id:
-                    proc_env["_X_AMZN_TRACE_ID"] = _xray_trace_id
-                # Override AWS_ENDPOINT_URL *after* function env vars so
-                # Lambda binaries always call back to this MiniStack
-                # instance.  Function-level env vars may carry the
-                # host-mapped URL which is unreachable from inside the
-                # container.
-                endpoint = os.environ.get("AWS_ENDPOINT_URL", "")
-                if not endpoint:
-                    hostname = os.environ.get("LOCALSTACK_HOSTNAME", "")
-                    if hostname:
-                        endpoint = _normalize_endpoint_url(hostname)
-                if endpoint:
-                    proc_env["AWS_ENDPOINT_URL"] = endpoint
+        try:
+            # Build environment for the Lambda binary
+            proc_env = dict(os.environ)
+            proc_env.update({
+                "AWS_LAMBDA_RUNTIME_API": f"127.0.0.1:{port}",
+                "AWS_DEFAULT_REGION": get_region(),
+                "AWS_REGION": get_region(),
+                "AWS_ACCESS_KEY_ID": _account_region_from_function_config(config)[0],
+                "AWS_SECRET_ACCESS_KEY": os.environ.get("AWS_SECRET_ACCESS_KEY", "test"),
+                "AWS_LAMBDA_FUNCTION_NAME": config.get("FunctionName", "unknown"),
+                "AWS_LAMBDA_FUNCTION_MEMORY_SIZE": str(config.get("MemorySize", 128)),
+                "AWS_LAMBDA_FUNCTION_VERSION": config.get("Version", "$LATEST"),
+                "AWS_LAMBDA_LOG_STREAM_NAME": new_uuid(),
+                "LAMBDA_TASK_ROOT": code_dir,
+                "_HANDLER": config.get("Handler", "bootstrap"),
+            })
+            proc_env.update(env_vars)
+            proc_env.update(_durable_env_overlay())
+            # X-Ray active tracing. ``_execute_function_provided`` builds
+            # ``proc_env`` per-invocation, so a per-call trace ID is safe
+            # here (unlike the RIE pool). aws-xray-sdk reads this env var
+            # per-segment via ``os.getenv``, so the runtime sees it.
+            _xray_trace_id = _xray_trace_id_for_invocation(config)
+            if _xray_trace_id:
+                proc_env["_X_AMZN_TRACE_ID"] = _xray_trace_id
+            # Override AWS_ENDPOINT_URL *after* function env vars so
+            # Lambda binaries always call back to this MiniStack
+            # instance.  Function-level env vars may carry the
+            # host-mapped URL which is unreachable from inside the
+            # container.
+            endpoint = os.environ.get("AWS_ENDPOINT_URL", "")
+            if not endpoint:
+                hostname = os.environ.get("LOCALSTACK_HOSTNAME", "")
+                if hostname:
+                    endpoint = _normalize_endpoint_url(hostname)
+            if endpoint:
+                proc_env["AWS_ENDPOINT_URL"] = endpoint
 
+            # Spawn under the code lock: no fork may overlap an extraction
+            # write elsewhere, or the child inherits the open write fd and
+            # execve fails with ETXTBSY (#1051).
+            with _provided_code_lock:
                 proc = subprocess.Popen(
                     [bootstrap_path],
                     cwd=code_dir,
@@ -4030,27 +4065,27 @@ def _execute_function_provided(func: dict, event: dict) -> dict:
                     stderr=subprocess.PIPE,
                 )
 
-                if response_received.wait(timeout=timeout):
-                    proc.terminate()
-                    try:
-                        _, stderr_out = proc.communicate(timeout=5)
-                        if stderr_out:
-                            logger.info("Lambda %s stderr: %s", config.get("FunctionName", "?"), stderr_out.decode("utf-8", errors="replace")[:500])
-                    except Exception:
-                        pass
-                    if result_holder["error"]:
-                        err = result_holder["error"]
-                        if isinstance(err, dict):
-                            return {"body": err, "error": True}
-                        return {"body": {"errorMessage": str(err), "errorType": "Runtime.HandlerError"}, "error": True}
-                    return {"body": result_holder["response"]}
-                else:
-                    proc.kill()
-                    stdout, stderr = proc.communicate(timeout=5)
-                    logs = (stdout.decode("utf-8", errors="replace") + stderr.decode("utf-8", errors="replace")).strip()
-                    return {"body": {"errorMessage": f"Lambda timed out after {timeout}s: {logs[:500]}", "errorType": "Runtime.ExitError"}, "error": True}
-            finally:
-                server.shutdown()
+            if response_received.wait(timeout=timeout):
+                proc.terminate()
+                try:
+                    _, stderr_out = proc.communicate(timeout=5)
+                    if stderr_out:
+                        logger.info("Lambda %s stderr: %s", config.get("FunctionName", "?"), stderr_out.decode("utf-8", errors="replace")[:500])
+                except Exception:
+                    pass
+                if result_holder["error"]:
+                    err = result_holder["error"]
+                    if isinstance(err, dict):
+                        return {"body": err, "error": True}
+                    return {"body": {"errorMessage": str(err), "errorType": "Runtime.HandlerError"}, "error": True}
+                return {"body": result_holder["response"]}
+            else:
+                proc.kill()
+                stdout, stderr = proc.communicate(timeout=5)
+                logs = (stdout.decode("utf-8", errors="replace") + stderr.decode("utf-8", errors="replace")).strip()
+                return {"body": {"errorMessage": f"Lambda timed out after {timeout}s: {logs[:500]}", "errorType": "Runtime.ExitError"}, "error": True}
+        finally:
+            server.shutdown()
 
     except Exception as e:
         logger.error("provided runtime execution error: %s", e)
@@ -5501,6 +5536,19 @@ def _iter_all_esms():
         yield acct_id, region, esm
 
 
+def _sqs_message_attributes_to_camel_case(attrs: dict) -> dict:
+    """SQS stores attributes with the PascalCase inner keys its API uses on
+    the wire (StringValue/DataType/BinaryValue/...). The Lambda ESM
+    re-serializes them to camelCase before invoking the function; typed
+    handler bindings (e.g. Java's SQSEvent.MessageAttribute) reject the
+    PascalCase form. First-char lowercasing also covers StringListValues/
+    BinaryListValues without an allowlist."""
+    return {
+        name: {(k[0].lower() + k[1:] if k else k): v for k, v in inner.items()}
+        for name, inner in (attrs or {}).items()
+    }
+
+
 def _poll_sqs():
     from ministack.services import sqs as _sqs
 
@@ -5556,7 +5604,9 @@ def _poll_sqs():
                         "SenderId": get_account_id(),
                         "ApproximateFirstReceiveTimestamp": str(int(first_recv * 1000)),
                     },
-                    "messageAttributes": msg.get("message_attributes", {}),
+                    "messageAttributes": _sqs_message_attributes_to_camel_case(
+                        msg.get("message_attributes", {})
+                    ),
                     "md5OfBody": msg.get("md5_body") or msg.get("md5") or "",
                     "eventSource": "aws:sqs",
                     "eventSourceARN": source_arn,
@@ -5935,6 +5985,8 @@ def _list_function_url_configs(func_name: str, query_params: dict):
 
 
 def reset():
+    import shutil
+
     from ministack.core import lambda_runtime
 
     _functions.clear()
@@ -5945,6 +5997,9 @@ def reset():
     _dynamodb_stream_positions.clear()
     _pool_clear_all()
     lambda_runtime.reset()
+    with _provided_code_lock:
+        _provided_code_dirs.clear()
+    shutil.rmtree(_PROVIDED_CODE_CACHE, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------

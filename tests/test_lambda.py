@@ -893,6 +893,93 @@ def test_lambda_esm_sqs(lam, sqs):
     # Cleanup
     lam.delete_event_source_mapping(UUID=esm_uuid)
 
+
+def test_sqs_esm_message_attributes_to_camel_case_helper():
+    """SQS PascalCase inner keys become Lambda-event camelCase (#1059)."""
+    from ministack.services.lambda_svc import _sqs_message_attributes_to_camel_case as conv
+
+    attrs = {
+        "version": {"DataType": "String", "StringValue": "1.0"},
+        "blob": {"DataType": "Binary", "BinaryValue": "aGk="},
+        "lists": {"DataType": "String", "StringListValues": ["a"], "BinaryListValues": []},
+    }
+    out = conv(attrs)
+    assert out["version"] == {"dataType": "String", "stringValue": "1.0"}
+    assert out["blob"] == {"dataType": "Binary", "binaryValue": "aGk="}
+    assert out["lists"] == {"dataType": "String", "stringListValues": ["a"], "binaryListValues": []}
+    assert conv({}) == {}
+    assert conv(None) == {}
+
+
+def test_lambda_esm_sqs_message_attributes_camel_case(lam, sqs):
+    """SQS → Lambda ESM delivers messageAttributes with camelCase inner keys (#1059).
+
+    The handler raises on PascalCase input, so the message is only consumed
+    (deleted from the queue) when the transformation happened."""
+    try:
+        lam.delete_function(FunctionName="esm-attr-func")
+    except ClientError:
+        pass
+
+    code = (
+        "def handler(event, context):\n"
+        "    for r in event['Records']:\n"
+        "        attr = r['messageAttributes']['version']\n"
+        "        assert attr['stringValue'] == '1.0', attr\n"
+        "        assert attr['dataType'] == 'String', attr\n"
+        "        assert 'StringValue' not in attr, attr\n"
+        "    return 'ok'\n"
+    )
+    lam.create_function(
+        FunctionName="esm-attr-func",
+        Runtime="python3.12",
+        Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _make_zip(code)},
+    )
+    q_url = sqs.create_queue(QueueName="esm-attr-queue")["QueueUrl"]
+    q_arn = sqs.get_queue_attributes(
+        QueueUrl=q_url, AttributeNames=["QueueArn"]
+    )["Attributes"]["QueueArn"]
+    resp = lam.create_event_source_mapping(
+        EventSourceArn=q_arn,
+        FunctionName="esm-attr-func",
+        BatchSize=1,
+        Enabled=True,
+    )
+    esm_uuid = resp["UUID"]
+    try:
+        sqs.send_message(
+            QueueUrl=q_url,
+            MessageBody="attr-check",
+            MessageAttributes={"version": {"DataType": "String", "StringValue": "1.0"}},
+        )
+        # Poll queue counters (not receive_message — that would race the poller).
+        deadline = time.time() + 15
+        remaining = None
+        while time.time() < deadline:
+            attrs = sqs.get_queue_attributes(
+                QueueUrl=q_url,
+                AttributeNames=[
+                    "ApproximateNumberOfMessages",
+                    "ApproximateNumberOfMessagesNotVisible",
+                ],
+            )["Attributes"]
+            remaining = (int(attrs["ApproximateNumberOfMessages"])
+                         + int(attrs["ApproximateNumberOfMessagesNotVisible"]))
+            if remaining == 0:
+                break
+            time.sleep(0.5)
+        assert remaining == 0, (
+            "message not consumed — handler rejected messageAttributes "
+            "(inner keys not camelCase?)"
+        )
+    finally:
+        lam.delete_event_source_mapping(UUID=esm_uuid)
+        lam.delete_function(FunctionName="esm-attr-func")
+        sqs.delete_queue(QueueUrl=q_url)
+
+
 def test_lambda_create_function(lam):
     resp = lam.create_function(
         FunctionName="lam-create-test",
@@ -3241,6 +3328,113 @@ def test_lambda_provided_runtime_docker_invoke(lam):
         assert payload["body"] == "hello from provided"
     finally:
         lam.delete_function(FunctionName=func_name)
+
+
+def test_lambda_provided_runtime_env_has_function_vars():
+    """_execute_function_provided re-injects AWS_LAMBDA_FUNCTION_MEMORY_SIZE /
+    _VERSION / LOG_STREAM_NAME from the function config (#1060).
+
+    _runtime_env_vars() strips these reserved names from the user env, so the
+    executor must set them itself — the Rust lambda_runtime crate panics when
+    AWS_LAMBDA_FUNCTION_MEMORY_SIZE is absent. The bootstrap here echoes the
+    env back through the Runtime API."""
+    from ministack.services import lambda_svc as lmod
+
+    bootstrap_script = (
+        "#!/usr/bin/env python3\n"
+        "import json, os, urllib.request\n"
+        "api = os.environ['AWS_LAMBDA_RUNTIME_API']\n"
+        "nxt = urllib.request.urlopen(f'http://{api}/2018-06-01/runtime/invocation/next')\n"
+        "rid = nxt.headers['Lambda-Runtime-Aws-Request-Id']\n"
+        "body = json.dumps({\n"
+        "    'memory': os.environ.get('AWS_LAMBDA_FUNCTION_MEMORY_SIZE'),\n"
+        "    'version': os.environ.get('AWS_LAMBDA_FUNCTION_VERSION'),\n"
+        "    'log_stream': os.environ.get('AWS_LAMBDA_LOG_STREAM_NAME'),\n"
+        "}).encode()\n"
+        "urllib.request.urlopen(urllib.request.Request(\n"
+        "    f'http://{api}/2018-06-01/runtime/invocation/{rid}/response',\n"
+        "    data=body, method='POST'))\n"
+    )
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        info = zipfile.ZipInfo("bootstrap")
+        info.external_attr = 0o755 << 16
+        zf.writestr(info, bootstrap_script)
+
+    func = {
+        "config": {
+            "FunctionName": "provided-env-1060",
+            "FunctionArn": "arn:aws:lambda:us-east-1:000000000000:function:provided-env-1060",
+            "MemorySize": 512,
+            "Version": "$LATEST",
+            "Timeout": 20,
+            "Handler": "bootstrap",
+            # Reserved names are stripped from the user env — the runtime
+            # values must come from the function config, not from here.
+            "Environment": {"Variables": {"AWS_LAMBDA_FUNCTION_MEMORY_SIZE": "9999"}},
+        },
+        "code_zip": buf.getvalue(),
+    }
+    result = lmod._execute_function_provided(func, {"ping": "pong"})
+    assert not result.get("error"), result
+    body = result["body"]
+    assert body["memory"] == "512"
+    assert body["version"] == "$LATEST"
+    assert body["log_stream"]
+
+
+def test_lambda_provided_runtime_parallel_invocations():
+    """Concurrent provided.* invocations must not fail with ETXTBSY (#1051).
+
+    Pre-fix, every invocation extracted the code zip into its own tempdir;
+    while one thread still held the extraction's write fd on ``bootstrap``,
+    another thread's Popen fork let the child inherit it and execve failed
+    with 'Text file busy'. Post-fix all invocations share one read-only
+    per-sha extraction and spawns are serialized against extraction."""
+    import concurrent.futures
+    import hashlib
+    from ministack.services import lambda_svc as lmod
+
+    bootstrap_script = (
+        "#!/usr/bin/env python3\n"
+        "import json, os, urllib.request\n"
+        "api = os.environ['AWS_LAMBDA_RUNTIME_API']\n"
+        "nxt = urllib.request.urlopen(f'http://{api}/2018-06-01/runtime/invocation/next')\n"
+        "rid = nxt.headers['Lambda-Runtime-Aws-Request-Id']\n"
+        "event = json.loads(nxt.read())\n"
+        "urllib.request.urlopen(urllib.request.Request(\n"
+        "    f'http://{api}/2018-06-01/runtime/invocation/{rid}/response',\n"
+        "    data=json.dumps({'echo': event.get('n')}).encode(), method='POST'))\n"
+    )
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        info = zipfile.ZipInfo("bootstrap")
+        info.external_attr = 0o755 << 16
+        zf.writestr(info, bootstrap_script)
+
+    func = {
+        "config": {
+            "FunctionName": "provided-parallel-1051",
+            "FunctionArn": "arn:aws:lambda:us-east-1:000000000000:function:provided-parallel-1051",
+            "MemorySize": 128,
+            "Timeout": 20,
+            "Handler": "bootstrap",
+        },
+        "code_zip": buf.getvalue(),
+    }
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
+        results = list(ex.map(
+            lambda i: lmod._execute_function_provided(func, {"n": i}), range(8)))
+
+    for i, r in enumerate(results):
+        assert not r.get("error"), f"invocation {i} failed: {r}"
+        assert r["body"]["echo"] == i
+
+    # All invocations shared a single per-sha extraction directory.
+    sha = hashlib.sha256(func["code_zip"]).hexdigest()
+    code_dir = lmod._provided_code_dirs.get(sha)
+    assert code_dir and os.path.isdir(code_dir)
 
 
 def test_apigwv2_nodejs_lambda_proxy(lam, apigw):

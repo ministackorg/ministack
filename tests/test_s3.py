@@ -2363,6 +2363,67 @@ def test_s3_storage_class_persisted_to_disk(tmp_path, monkeypatch):
     assert restored["storage_class"] == "GLACIER"
 
 
+def test_s3_version_id_persisted_to_disk(tmp_path, monkeypatch):
+    """version_id survives _persist_object → _load_persisted_bucket round-trip (#1058)."""
+    from ministack.services import s3 as s3mod
+    monkeypatch.setattr(s3mod, "DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(s3mod, "S3_PERSIST", True)
+    monkeypatch.setattr(s3mod, "get_account_id", lambda: "000000000000")
+
+    obj = {
+        "body": b"hello",
+        "content_type": "application/octet-stream",
+        "content_encoding": None,
+        "etag": '"abc"',
+        "last_modified": s3mod.now_iso(),
+        "size": 5,
+        "metadata": {},
+        "preserved_headers": {},
+        "storage_class": "STANDARD",
+        "version_id": "test-version-1058",
+    }
+    s3mod._persist_object("ver-bucket", "k", obj)
+
+    meta_path = os.path.join(str(tmp_path), "000000000000", "ver-bucket", "k.meta.json")
+    with open(meta_path) as mf:
+        assert json.load(mf)["version_id"] == "test-version-1058"
+
+    s3mod._buckets._data.pop(("000000000000", "ver-bucket"), None)
+    try:
+        s3mod._load_persisted_bucket(
+            "000000000000", "ver-bucket",
+            os.path.join(str(tmp_path), "000000000000", "ver-bucket"))
+        restored = s3mod._buckets._data[("000000000000", "ver-bucket")]["objects"]["k"]
+        assert restored["version_id"] == "test-version-1058"
+    finally:
+        s3mod._buckets._data.pop(("000000000000", "ver-bucket"), None)
+
+
+def test_s3_put_object_sidecar_carries_version_id(tmp_path, monkeypatch):
+    """PutObject on a versioned bucket must persist AFTER version_id assignment,
+    so the on-disk .meta.json carries the id returned in x-amz-version-id (#1058)."""
+    from ministack.core import responses as respmod
+    from ministack.services import s3 as s3mod
+    monkeypatch.setattr(s3mod, "DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(s3mod, "S3_PERSIST", True)
+    monkeypatch.setattr(s3mod, "get_account_id", lambda: "000000000000")
+    monkeypatch.setattr(respmod, "get_account_id", lambda: "000000000000")
+    try:
+        s3mod._create_bucket("ver-put-bucket", b"")
+        s3mod._bucket_versioning["ver-put-bucket"] = "Enabled"
+        status, resp_headers, _ = s3mod._put_object("ver-put-bucket", "k", b"hello", {})
+        assert status == 200
+        version_id = resp_headers["x-amz-version-id"]
+        meta_path = os.path.join(
+            str(tmp_path), "000000000000", "ver-put-bucket", "k.meta.json")
+        with open(meta_path) as mf:
+            assert json.load(mf)["version_id"] == version_id
+    finally:
+        s3mod._buckets._data.pop(("000000000000", "ver-put-bucket"), None)
+        s3mod._bucket_versioning.pop("ver-put-bucket", None)
+        s3mod._object_versions.pop(("ver-put-bucket", "k"), None)
+
+
 def test_s3_create_bucket_persists_account_scoped(tmp_path, monkeypatch):
     """CreateBucket persists under DATA_DIR/<account>/<bucket>, never DATA_DIR/<bucket> (#824)."""
     from ministack.core import responses as respmod

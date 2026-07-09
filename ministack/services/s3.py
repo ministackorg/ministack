@@ -2201,9 +2201,6 @@ def _put_object(bucket_name: str, key: str, body: bytes, headers: dict):
         if len(pending_tags) > 10:
             return _error("BadRequest", "Object tags cannot be greater than 10", 400)
 
-    if S3_PERSIST:
-        _persist_object(bucket_name, key, obj)
-
     _fire_s3_event_async(
         bucket_name, key, "s3:ObjectCreated:Put", size=obj["size"], etag=obj["etag"]
     )
@@ -2229,6 +2226,11 @@ def _put_object(bucket_name: str, key: str, body: bytes, headers: dict):
         # Mark all previous versions as not latest
         for v in _object_versions[vkey][:-1]:
             v["is_latest"] = False
+
+    # Persist only after the versioning block: the .meta.json sidecar must
+    # carry the version_id assigned above (#1058).
+    if S3_PERSIST:
+        _persist_object(bucket_name, key, obj)
 
     if pending_tags is not None:
         _object_tags[(bucket_name, key, obj.get("version_id"))] = pending_tags
@@ -2397,9 +2399,6 @@ def _post_object(bucket_name: str, body: bytes, headers: dict):
         if len(parsed) <= 10:
             pending_tags = parsed
 
-    if S3_PERSIST:
-        _persist_object(bucket_name, key, obj)
-
     _fire_s3_event_async(
         bucket_name, key, "s3:ObjectCreated:Post", size=obj["size"], etag=etag
     )
@@ -2422,6 +2421,11 @@ def _post_object(bucket_name: str, body: bytes, headers: dict):
         })
         for v in _object_versions[vkey][:-1]:
             v["is_latest"] = False
+
+    # Persist only after the versioning block: the .meta.json sidecar must
+    # carry the version_id assigned above (#1058).
+    if S3_PERSIST:
+        _persist_object(bucket_name, key, obj)
 
     if pending_tags is not None:
         _object_tags[(bucket_name, key, version_id)] = pending_tags
@@ -2819,9 +2823,6 @@ def _copy_object(bucket_name: str, dest_key: str, headers: dict):
     else:
         _object_legal_hold.pop((bucket_name, dest_key), None)
 
-    if S3_PERSIST:
-        _persist_object(bucket_name, dest_key, dest_obj)
-
     _fire_s3_event_async(
         bucket_name,
         dest_key,
@@ -2851,6 +2852,11 @@ def _copy_object(bucket_name: str, dest_key: str, headers: dict):
         })
         for v in _object_versions[vkey][:-1]:
             v["is_latest"] = False
+
+    # Persist only after the versioning block: the .meta.json sidecar must
+    # carry the version_id assigned above (#1058).
+    if S3_PERSIST:
+        _persist_object(bucket_name, dest_key, dest_obj)
 
     dest_version_id = dest_obj.get("version_id")
     if pending_dest_tags is not None:
@@ -3942,9 +3948,6 @@ def _complete_multipart_upload(
     }
     bucket["objects"][key] = obj
 
-    if S3_PERSIST:
-        _persist_object(bucket_name, key, obj)
-
     del _multipart_uploads[upload_id]
 
     _fire_s3_event_async(
@@ -3973,6 +3976,11 @@ def _complete_multipart_upload(
         })
         for v in _object_versions[vkey][:-1]:
             v["is_latest"] = False
+
+    # Persist only after the versioning block: the .meta.json sidecar must
+    # carry the version_id assigned above (#1058).
+    if S3_PERSIST:
+        _persist_object(bucket_name, key, obj)
 
     root = Element("CompleteMultipartUploadResult", xmlns=S3_NS)
     s3_host = os.environ.get("MINISTACK_HOST", os.environ.get("AWS_ENDPOINT_URL", "http://localhost:4566"))
@@ -4195,6 +4203,7 @@ def _persist_object(bucket: str, key: str, obj):
                 "preserved_headers": obj.get("preserved_headers", {}),
                 "storage_class": obj.get("storage_class", "STANDARD"),
                 "checksums": obj.get("checksums", {}),
+                "version_id": obj.get("version_id"),
             }
             _atomic_write(fpath + ".meta.json", json.dumps(meta), text=True)
         # Drop body from in-memory record to save RAM
@@ -4357,6 +4366,8 @@ def _load_persisted_bucket(account_id, bucket_name, bucket_path):
                 "storage_class": meta.get("storage_class", "STANDARD"),
                 "checksums": meta.get("checksums", {}),
             }
+            if meta.get("version_id"):
+                bucket["objects"][key]["version_id"] = meta["version_id"]
 
 
 _load_persisted_data()

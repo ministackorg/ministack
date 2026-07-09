@@ -370,8 +370,94 @@ def _k3s_run_kwargs(name: str, port: int, ms_network: str | None = None, oidc_ar
     )
     if ms_network:
         run_kwargs["network"] = ms_network
+    # host-gateway lets the k3s node reach a host-run MiniStack (the ECR
+    # registry mirror, #1054) even on Linux Docker where the name doesn't
+    # resolve natively. Harmless when a shared network is used instead.
+    run_kwargs["extra_hosts"] = {"host.docker.internal": "host-gateway"}
 
     return run_kwargs
+
+
+def _ecr_registry_hosts(cluster: dict) -> list[str]:
+    """The local ECR registry hostnames this cluster's nodes should resolve
+    to MiniStack — derived from the cluster ARN (not contextvars) so the
+    restore/restart paths, which run outside a request context, get the
+    same answer as create."""
+    try:
+        spec = parse_arn(cluster.get("arn", ""))
+        return [f"{spec.account_id}.dkr.ecr.{spec.region}.amazonaws.com"]
+    except ArnParseError:
+        return []
+
+
+def _k3s_registries_yaml(client, ms_network: str | None, ecr_hosts: list[str]) -> bytes | None:
+    """Build /etc/rancher/k3s/registries.yaml mapping this cluster's local
+    ECR registry hostnames to the MiniStack gateway, so pods with images
+    like ``<account>.dkr.ecr.<region>.amazonaws.com/repo:tag`` pull from
+    local ECR (#1054). ECR's Docker Registry V2 endpoints serve anonymously,
+    so no auth config is needed.
+
+    The mirror endpoint must be reachable from INSIDE the k3s container:
+    - shared user-defined network: MiniStack's own IP on that network
+      (``host-gateway`` resolves to docker0, which iptables typically
+      blocks from a sibling bridge — same reasoning as the ECS metadata
+      server wiring)
+    - otherwise: ``host.docker.internal``, resolvable through the
+      host-gateway extra_host added in ``_k3s_run_kwargs``
+    """
+    if not ecr_hosts:
+        return None
+    port = os.environ.get("GATEWAY_PORT") or os.environ.get("EDGE_PORT") or "4566"
+    host = None
+    if ms_network and client is not None:
+        try:
+            self_container = client.containers.get(os.environ.get("HOSTNAME", ""))
+            nets = self_container.attrs["NetworkSettings"]["Networks"]
+            host = (nets.get(ms_network) or {}).get("IPAddress") or None
+        except Exception:
+            host = None
+    if not host:
+        host = "host.docker.internal"
+    endpoint = f"http://{host}:{port}"
+    lines = ["mirrors:"]
+    for reg in ecr_hosts:
+        lines.append(f'  "{reg}":')
+        lines.append("    endpoint:")
+        lines.append(f'      - "{endpoint}"')
+    return ("\n".join(lines) + "\n").encode()
+
+
+def _start_k3s_container(client, run_kwargs: dict, registries_yaml: bytes | None):
+    """Start the k3s container, injecting registries.yaml before boot.
+
+    k3s reads /etc/rancher/k3s/registries.yaml once at startup, so the file
+    must exist before the entrypoint runs: create the container stopped,
+    upload the file with put_archive, then start it."""
+    if not registries_yaml:
+        return client.containers.run(**run_kwargs)
+    import io
+    import tarfile
+
+    create_kwargs = dict(run_kwargs)
+    create_kwargs.pop("detach", None)  # run()-only kwarg
+    try:
+        container = client.containers.create(**create_kwargs)
+    except Exception:
+        # create() does not auto-pull missing images the way run() does.
+        client.images.pull(create_kwargs["image"])
+        container = client.containers.create(**create_kwargs)
+    try:
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w") as tar:
+            info = tarfile.TarInfo("etc/rancher/k3s/registries.yaml")
+            info.size = len(registries_yaml)
+            info.mode = 0o644
+            tar.addfile(info, io.BytesIO(registries_yaml))
+        container.put_archive("/", buf.getvalue())
+    except Exception as e:
+        logger.warning("EKS: could not inject ECR registries.yaml: %s", e)
+    container.start()
+    return container
 
 
 def _stop_all_k3s():
@@ -483,7 +569,8 @@ def _create_cluster(body):
             ms_network = _get_ministack_network(client)
             run_kwargs = _k3s_run_kwargs(name=name, port=port, ms_network=ms_network, oidc_args=oidc_args, node_labels=node_labels)
 
-            container = client.containers.run(**run_kwargs)
+            registries_yaml = _k3s_registries_yaml(client, ms_network, _ecr_registry_hosts(cluster))
+            container = _start_k3s_container(client, run_kwargs, registries_yaml)
             cluster["_docker_id"] = container.id
 
             cluster["endpoint"] = _cluster_endpoint(port)
@@ -973,7 +1060,8 @@ def _restart_k3s(cluster_name, oidc_args=None, idp_cfg_refs=None):
             ms_network = _get_ministack_network(client)
             run_kwargs = _k3s_run_kwargs(name=cluster_name, port=cluster["_port"], ms_network=ms_network, oidc_args=oidc_args, node_labels=node_labels)
 
-            container = client.containers.run(**run_kwargs)
+            registries_yaml = _k3s_registries_yaml(client, ms_network, _ecr_registry_hosts(cluster))
+            container = _start_k3s_container(client, run_kwargs, registries_yaml)
             cluster["_docker_id"] = container.id
 
             cluster["endpoint"] = _cluster_endpoint(cluster["_port"])

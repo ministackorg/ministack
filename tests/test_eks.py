@@ -478,6 +478,45 @@ def test_eks_k3s_run_kwargs_container_name_and_labels():
     assert kwargs["labels"] == {"ministack": "eks", "cluster_name": "my-cluster"}
 
 
+def test_eks_k3s_run_kwargs_host_gateway_extra_host():
+    """The k3s node must be able to reach a host-run MiniStack for ECR
+    registry mirroring (#1054) — host.docker.internal via host-gateway."""
+    from ministack.services.eks import _k3s_run_kwargs
+
+    kwargs = _k3s_run_kwargs(name="c1", port=16443)
+    assert kwargs["extra_hosts"] == {"host.docker.internal": "host-gateway"}
+
+
+def test_eks_ecr_registry_hosts_from_cluster_arn():
+    """ECR mirror hostnames derive from the cluster ARN, not contextvars,
+    so restore/restart paths (no request context) behave like create (#1054)."""
+    from ministack.services.eks import _ecr_registry_hosts
+
+    cluster = {"arn": "arn:aws:eks:eu-west-1:123456789012:cluster/my-cluster"}
+    assert _ecr_registry_hosts(cluster) == ["123456789012.dkr.ecr.eu-west-1.amazonaws.com"]
+    assert _ecr_registry_hosts({"arn": "not-an-arn"}) == []
+    assert _ecr_registry_hosts({}) == []
+
+
+def test_eks_k3s_registries_yaml_shape(monkeypatch):
+    """registries.yaml maps the cluster's ECR hostname to the gateway; with
+    no shared network the endpoint goes through host.docker.internal (#1054)."""
+    from ministack.services.eks import _k3s_registries_yaml
+
+    monkeypatch.delenv("GATEWAY_PORT", raising=False)
+    monkeypatch.delenv("EDGE_PORT", raising=False)
+    yaml_bytes = _k3s_registries_yaml(
+        None, None, ["123456789012.dkr.ecr.eu-west-1.amazonaws.com"])
+    text = yaml_bytes.decode()
+    assert text == (
+        "mirrors:\n"
+        '  "123456789012.dkr.ecr.eu-west-1.amazonaws.com":\n'
+        "    endpoint:\n"
+        '      - "http://host.docker.internal:4566"\n'
+    )
+    assert _k3s_registries_yaml(None, None, []) is None
+
+
 def test_eks_addon_lifecycle(eks):
     """CreateAddon / DescribeAddon / ListAddons / UpdateAddon / DeleteAddon.
     Issue #752: terraform aws_eks_addon fails on missing POST /clusters/{name}/addons."""
