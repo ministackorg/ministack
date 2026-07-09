@@ -688,11 +688,12 @@ def test_rds_modify_and_describe_cluster_parameters(rds):
     p = next(p for p in params if p["ParameterName"] == "innodb_lock_wait_timeout")
     assert p["ParameterValue"] == "60"
     assert p["ApplyMethod"] == "immediate"
-    # engine-default filter should return empty when no defaults are tracked
     resp2 = rds.describe_db_cluster_parameters(
         DBClusterParameterGroupName="test-cparam-persist", Source="engine-default"
     )
-    assert len(resp2["Parameters"]) == 0
+    default_names = [p["ParameterName"] for p in resp2["Parameters"]]
+    assert "max_connections" in default_names
+    assert "innodb_lock_wait_timeout" not in default_names
 
 
 def test_rds_describe_cluster_parameters_emits_source(rds):
@@ -783,6 +784,81 @@ def test_rds_describe_engine_versions_family(rds):
         family = v["DBParameterGroupFamily"]
         # Should be e.g. "aurora-mysql8.0", not "aurora-mysqlaurora-mysql8.0"
         assert not family.startswith("aurora-mysqlaurora-"), f"Double-prefixed family: {family}"
+
+
+def test_rds_describe_aurora_mysql_engine_versions_by_family(rds):
+    resp = rds.describe_db_engine_versions(Engine="aurora-mysql")
+    families = {
+        v["EngineVersion"]: v["DBParameterGroupFamily"]
+        for v in resp["DBEngineVersions"]
+    }
+    assert families["5.7.mysql_aurora.2.12.6"] == "aurora-mysql5.7"
+    assert families["8.0.mysql_aurora.3.12.0"] == "aurora-mysql8.0"
+    assert families["8.4.mysql_aurora.8.4.7"] == "aurora-mysql8.4"
+
+    filtered = rds.describe_db_engine_versions(
+        Engine="aurora-mysql",
+        EngineVersion="8.4.mysql_aurora.8.4.9",
+    )["DBEngineVersions"]
+    assert len(filtered) == 1
+    assert filtered[0]["EngineVersion"] == "8.4.mysql_aurora.8.4.9"
+    assert filtered[0]["DBParameterGroupFamily"] == "aurora-mysql8.4"
+
+
+def test_rds_aurora_mysql_parameter_defaults_are_family_aware(rds):
+    rds.create_db_parameter_group(
+        DBParameterGroupName="test-mysql80-defaults",
+        DBParameterGroupFamily="aurora-mysql8.0",
+        Description="aurora mysql 8.0 defaults",
+    )
+    rds.create_db_parameter_group(
+        DBParameterGroupName="test-mysql84-defaults",
+        DBParameterGroupFamily="aurora-mysql8.4",
+        Description="aurora mysql 8.4 defaults",
+    )
+    mysql80 = rds.describe_db_parameters(
+        DBParameterGroupName="test-mysql80-defaults",
+        Source="engine-default",
+    )["Parameters"]
+    mysql84 = rds.describe_db_parameters(
+        DBParameterGroupName="test-mysql84-defaults",
+        Source="engine-default",
+    )["Parameters"]
+
+    mysql80_names = {p["ParameterName"] for p in mysql80}
+    mysql84_names = {p["ParameterName"] for p in mysql84}
+    assert "max_connections" in mysql80_names
+    assert "max_connections" in mysql84_names
+    assert "skip-character-set-client-handshake" in mysql80_names
+    assert "skip-character-set-client-handshake" not in mysql84_names
+
+
+def test_rds_cluster_parameter_defaults_are_family_aware(rds):
+    rds.create_db_cluster_parameter_group(
+        DBClusterParameterGroupName="test-cmysql80-defaults",
+        DBParameterGroupFamily="aurora-mysql8.0",
+        Description="aurora mysql 8.0 cluster defaults",
+    )
+    rds.create_db_cluster_parameter_group(
+        DBClusterParameterGroupName="test-cmysql84-defaults",
+        DBParameterGroupFamily="aurora-mysql8.4",
+        Description="aurora mysql 8.4 cluster defaults",
+    )
+    mysql80 = rds.describe_db_cluster_parameters(
+        DBClusterParameterGroupName="test-cmysql80-defaults",
+        Source="engine-default",
+    )["Parameters"]
+    mysql84 = rds.describe_db_cluster_parameters(
+        DBClusterParameterGroupName="test-cmysql84-defaults",
+        Source="engine-default",
+    )["Parameters"]
+
+    mysql80_names = {p["ParameterName"] for p in mysql80}
+    mysql84_names = {p["ParameterName"] for p in mysql84}
+    assert "max_connections" in mysql80_names
+    assert "max_connections" in mysql84_names
+    assert "skip-character-set-client-handshake" in mysql80_names
+    assert "skip-character-set-client-handshake" not in mysql84_names
 
 
 def test_rds_parse_member_list_both_formats():
@@ -1425,19 +1501,35 @@ def test_docker_image_for_engine_aurora_postgres_18_uses_new_layout():
     assert data_path_18 == "/var/lib/postgresql"
 
 
-def test_docker_image_for_engine_mysql_unchanged():
-    """MySQL / MariaDB / Aurora MySQL keep /var/lib/mysql — the Postgres 18
-    layout change does not touch them."""
+def test_mysql_image_for_version_maps_aurora_tracks():
+    from ministack.services.rds import _mysql_image_for_version
+
+    assert _mysql_image_for_version("8.4.mysql_aurora.8.4.7") == "mysql:8.4"
+    assert _mysql_image_for_version("8.0.mysql_aurora.3.12.0") == "mysql:8.0"
+    assert _mysql_image_for_version("5.7.mysql_aurora.2.12.6") == "mysql:5.7"
+    assert _mysql_image_for_version("5.6.mysql_aurora.1.23.4") == "mysql:5.6"
+    assert _mysql_image_for_version("8.4.7") == "mysql:8.4"
+    assert _mysql_image_for_version("9.0.mysql_aurora.9.0.1") == "mysql:8.4"
+    assert _mysql_image_for_version("not-a-version") == "mysql:8.4"
+
+
+def test_docker_image_for_engine_mysql_uses_versioned_images():
+    """MySQL / MariaDB / Aurora MySQL keep /var/lib/mysql, but MySQL-compatible
+    engines use explicit versioned MySQL images instead of the floating mysql:8 tag."""
     from ministack.services.rds import _docker_image_for_engine
 
-    for engine, version in [
-        ("mysql", "8.0.33"),
-        ("aurora-mysql", "8.0.mysql_aurora.3.03.0"),
-        ("mariadb", "10.6.14"),
+    for engine, version, expected_image in [
+        ("mysql", "8.0.33", "mysql:8.0"),
+        ("mysql", "5.7.43", "mysql:5.7"),
+        ("aurora-mysql", "5.7.mysql_aurora.2.12.6", "mysql:5.7"),
+        ("aurora-mysql", "8.0.mysql_aurora.3.12.0", "mysql:8.0"),
+        ("aurora-mysql", "8.4.mysql_aurora.8.4.7", "mysql:8.4"),
+        ("mariadb", "10.6.14", "mariadb:latest"),
     ]:
-        _, _, port, data_path = _docker_image_for_engine(
+        image, _, port, data_path = _docker_image_for_engine(
             engine, version, "admin", "pw", "mydb"
         )
+        assert image == expected_image
         assert port == 3306
         assert data_path == "/var/lib/mysql"
 
