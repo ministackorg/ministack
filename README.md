@@ -4,7 +4,7 @@
 
 <h1 align="center">MiniStack</h1>
 <p align="center"><strong>Free, open-source local AWS emulator. Free forever.</strong></p>
-<p align="center">60+ AWS services on a single port · Terraform compatible · Real databases · MIT licensed</p>
+<p align="center">60+ AWS services on a single port · Multi-account & multi-region · Terraform compatible · Real databases · MIT licensed</p>
 
 <p align="center">
   <a href="https://github.com/ministackorg/ministack/releases"><img src="https://img.shields.io/github/v/release/ministackorg/ministack" alt="GitHub release"></a>
@@ -27,6 +27,8 @@ LocalStack recently moved its core services behind a paid plan. If you relied on
 
 - **60+ AWS services** emulated on a single port (4566)
 - **Drop-in compatible** — works with `boto3`, AWS CLI, Terraform, CDK, Pulumi, any SDK
+- **Multi-account & multi-region** — a 12-digit access key becomes the account, the SigV4 region scopes the state; isolated tenants and regions on one endpoint, like real AWS
+- **Amazon Bedrock locally** — Converse / InvokeModel with AWS-exact wire shapes; point `MINISTACK_BEDROCK_PROXY_URL` at Ollama, llama.cpp, or vLLM and get real completions through the Bedrock API
 - **Real infrastructure** — RDS spins up actual Postgres/MySQL containers, ElastiCache spins up real Redis, Athena runs real SQL via DuckDB (full image only), ECS runs real Docker containers
 - **Tiny footprint** — ~270MB image, ~30MB RAM at idle vs LocalStack's ~1GB image and ~500MB RAM
 - **Fast startup** — under 2 seconds, HTTP/2 (h2c) supported
@@ -151,6 +153,8 @@ aws --endpoint-url=http://localhost:4566 sts get-caller-identity
 
 All ARNs and resource state (SQS queues, Lambda functions, IAM roles, S3 buckets, DynamoDB tables, etc.) are fully isolated per account. Resources with the same name in different accounts never collide. This allows multiple developers or CI pipelines to share a single MiniStack endpoint with complete tenant isolation — no extra setup needed.
 
+Since 1.4.0 state is additionally isolated per **region** — see [Multi-Region](#multi-region) below.
+
 | Access Key | Account ID Used |
 |---|---|
 | `111111111111` | `111111111111` |
@@ -176,6 +180,48 @@ boto3.client("s3",
     aws_secret_access_key="test",
 )
 ```
+
+---
+
+## Multi-Region
+
+Since **1.4.0**, state is isolated per **region** as well as per account — no configuration needed. The region comes from the SigV4 credential scope (the `region_name` your SDK or `--region` your CLI is configured with), so two clients pointed at different regions see fully independent resources, exactly like real AWS:
+
+```bash
+# Same queue name, two regions — two independent queues
+aws --endpoint-url=http://localhost:4566 --region us-east-1 sqs create-queue --queue-name jobs
+aws --endpoint-url=http://localhost:4566 --region eu-west-1 sqs create-queue --queue-name jobs
+
+aws --endpoint-url=http://localhost:4566 --region us-east-1 sqs list-queues
+# → .../000000000000/jobs   (the us-east-1 queue)
+aws --endpoint-url=http://localhost:4566 --region eu-west-1 sqs list-queues
+# → .../000000000000/jobs   (a different queue — eu-west-1's)
+```
+
+```python
+use1 = boto3.client("dynamodb", endpoint_url="http://localhost:4566",
+                    aws_access_key_id="test", aws_secret_access_key="test",
+                    region_name="us-east-1")
+euw1 = boto3.client("dynamodb", endpoint_url="http://localhost:4566",
+                    aws_access_key_id="test", aws_secret_access_key="test",
+                    region_name="eu-west-1")
+
+use1.create_table(TableName="users",
+    KeySchema=[{"AttributeName": "id", "KeyType": "HASH"}],
+    AttributeDefinitions=[{"AttributeName": "id", "AttributeType": "S"}],
+    BillingMode="PAY_PER_REQUEST")
+
+use1.list_tables()["TableNames"]   # → ["users"]
+euw1.list_tables()["TableNames"]   # → [] — eu-west-1 is independent
+```
+
+**Region-isolated services (1.4.0):** AppConfig, Bedrock (all four services), CloudWatch, CloudWatch Logs, DynamoDB (tables, metadata, Streams), Lambda (functions, event source mappings, durable executions), MSK, RDS, S3 Tables, Secrets Manager, SQS, SSM Parameter Store, and Step Functions.
+
+Cross-resource references resolve in the referenced ARN's own account and region (SNS→SQS fanout, EventBridge targets, event source mappings), and cross-region references that real AWS rejects return the same errors AWS returns — e.g. invoking a `eu-west-1` Lambda from a `us-east-1` Step Functions task fails with `Functions from 'eu-west-1' are not reachable in this region`, exactly as on AWS.
+
+**Not yet region-isolated:** S3, SNS, IAM/STS, EC2, Kinesis, EventBridge, ECS, ECR, EKS, EFS, KMS, Glue, Athena, API Gateway v1/v2, Cognito, CloudFormation, CloudFront, Route 53, ElastiCache, EMR, Firehose, SES, CodeBuild, AutoScaling, WAF, ACM, Backup, Organizations, EventBridge Scheduler, Transfer Family, AppSync, CloudTrail, and the remaining control-plane services — these share state across regions within an account (as all services did before 1.4.0); use unique resource names there if your tests exercise two regions. Region isolation for them lands in subsequent releases.
+
+**Upgrading with `PERSIST_STATE=1`:** existing state files load and migrate automatically (on-disk format v2 with a version stamp — a newer-format file is refused instead of mis-parsed on downgrade). Each record's region is recovered from its stored ARNs; legacy records that carry no ARN migrate to the default region (`MINISTACK_REGION`).
 
 ---
 
@@ -352,7 +398,7 @@ subnet = ec2.create_subnet(
 |---------|-----------|-------|
 | **S3** | CreateBucket, DeleteBucket, ListBuckets, HeadBucket, PutObject, GetObject, DeleteObject, HeadObject, CopyObject, ListObjects v1/v2, DeleteObjects, GetBucketVersioning, PutBucketVersioning, GetBucketEncryption, PutBucketEncryption, DeleteBucketEncryption, GetBucketLifecycleConfiguration, PutBucketLifecycleConfiguration, DeleteBucketLifecycle, GetBucketCors, PutBucketCors, DeleteBucketCors, GetBucketAcl, PutBucketAcl, GetBucketTagging, PutBucketTagging, DeleteBucketTagging, GetBucketPolicy, PutBucketPolicy, DeleteBucketPolicy, GetBucketNotificationConfiguration, PutBucketNotificationConfiguration, GetBucketLogging, PutBucketLogging, ListObjectVersions, CreateMultipartUpload, UploadPart, CompleteMultipartUpload, AbortMultipartUpload, PutObjectLockConfiguration, GetObjectLockConfiguration, PutObjectRetention, GetObjectRetention, PutObjectLegalHold, GetObjectLegalHold, PutBucketReplication, GetBucketReplication, DeleteBucketReplication, GetObjectTagging, PutObjectTagging, DeleteObjectTagging | Optional disk persistence via `S3_PERSIST=1`; Object Lock with retention & legal hold enforcement on delete; object tags are versioned (`?tagging&versionId=…` reads, writes, and deletes the per-version tag set) |
 | **SQS** | CreateQueue, DeleteQueue, ListQueues, GetQueueUrl, GetQueueAttributes, SetQueueAttributes, PurgeQueue, SendMessage, ReceiveMessage, DeleteMessage, ChangeMessageVisibility, ChangeMessageVisibilityBatch, SendMessageBatch, DeleteMessageBatch, TagQueue, UntagQueue, ListQueueTags | Both Query API and JSON protocol; FIFO queues with deduplication; DLQ support |
-| **SNS** | CreateTopic, DeleteTopic, ListTopics, GetTopicAttributes, SetTopicAttributes, Subscribe, Unsubscribe, ListSubscriptions, ListSubscriptionsByTopic, GetSubscriptionAttributes, SetSubscriptionAttributes, ConfirmSubscription, Publish, PublishBatch, TagResource, UntagResource, ListTagsForResource, CreatePlatformApplication, CreatePlatformEndpoint | SNS→SQS fanout delivery; SNS→Lambda fanout (synchronous invocation); FIFO topics with 5-minute deduplication, sequence numbers, content-based deduplication, and subscription validation |
+| **SNS** | CreateTopic, DeleteTopic, ListTopics, GetTopicAttributes, SetTopicAttributes, Subscribe, Unsubscribe, ListSubscriptions, ListSubscriptionsByTopic, GetSubscriptionAttributes, SetSubscriptionAttributes, ConfirmSubscription, Publish, PublishBatch, TagResource, UntagResource, ListTagsForResource, CreatePlatformApplication, CreatePlatformEndpoint, GetEndpointAttributes, SetEndpointAttributes, DeleteEndpoint, DeletePlatformApplication | SNS→SQS fanout delivery; SNS→Lambda fanout (asynchronous delivery); FIFO topics with 5-minute deduplication, sequence numbers, content-based deduplication, and subscription validation; mobile-push endpoint lifecycle with device-token dedup and `Publish` to platform-endpoint `TargetArn` |
 | **DynamoDB** | CreateTable, UpdateTable, DeleteTable, DescribeTable, ListTables, PutItem, GetItem, DeleteItem, UpdateItem, Query, Scan, BatchWriteItem, BatchGetItem, TransactWriteItems, TransactGetItems, DescribeTimeToLive, UpdateTimeToLive, DescribeContinuousBackups, UpdateContinuousBackups, DescribeEndpoints, TagResource, UntagResource, ListTagsOfResource, EnableKinesisStreamingDestination, DisableKinesisStreamingDestination, DescribeKinesisStreamingDestination, UpdateKinesisStreamingDestination | TTL enforced via thread-safe background reaper (60s cadence); DynamoDB Streams — `StreamSpecification` emits INSERT/MODIFY/REMOVE records on all write operations, respects `StreamViewType`; Kinesis streaming destinations (`aws_dynamodb_kinesis_streaming_destination`) fan item mutations out into any Kinesis stream by ARN while the destination is ACTIVE |
 | **DynamoDB Streams** | ListStreams, DescribeStream, GetShardIterator, GetRecords | Reads records emitted by the main DynamoDB service via `boto3.client("dynamodbstreams")` — single synthetic shard per stream; `TRIM_HORIZON`/`LATEST`/`AT_SEQUENCE_NUMBER`/`AFTER_SEQUENCE_NUMBER` iterator types; `NEW_AND_OLD_IMAGES`, `NEW_IMAGE`, `OLD_IMAGE`, `KEYS_ONLY` view types; opaque base64 iterator tokens |
 | **Lambda** | CreateFunction, DeleteFunction, GetFunction, GetFunctionConfiguration, ListFunctions, Invoke, UpdateFunctionCode, UpdateFunctionConfiguration, AddPermission, RemovePermission, GetPolicy, ListVersionsByFunction, PublishVersion, CreateAlias, GetAlias, UpdateAlias, DeleteAlias, ListAliases, TagResource, UntagResource, ListTags, CreateEventSourceMapping, DeleteEventSourceMapping, GetEventSourceMapping, ListEventSourceMappings, UpdateEventSourceMapping, CreateFunctionUrlConfig, GetFunctionUrlConfig, UpdateFunctionUrlConfig, DeleteFunctionUrlConfig, ListFunctionUrlConfigs, PutFunctionConcurrency, GetFunctionConcurrency, DeleteFunctionConcurrency, PutFunctionEventInvokeConfig, GetFunctionEventInvokeConfig, DeleteFunctionEventInvokeConfig, PublishLayerVersion, GetLayerVersion, GetLayerVersionByArn, ListLayerVersions, DeleteLayerVersion, ListLayers, AddLayerVersionPermission, RemoveLayerVersionPermission, GetLayerVersionPolicy, CheckpointDurableExecution, GetDurableExecution, GetDurableExecutionState, GetDurableExecutionHistory, ListDurableExecutionsByFunction, StopDurableExecution, SendDurableExecutionCallbackSuccess, SendDurableExecutionCallbackFailure, SendDurableExecutionCallbackHeartbeat | Python and Node.js runtimes execute with warm worker pool; `provided.al2023`/`provided.al2` runtimes execute via Docker RIE (Go, Rust, C++ support); `Publish=True` creates immutable numbered versions; Code via `ZipFile`, `S3Bucket`/`S3Key` (with optional `S3ObjectVersion`), or `ImageUri` (Docker image); `PackageType: Image` pulls and invokes user-provided Docker images via Lambda RIE; SQS, Kinesis, and DynamoDB Streams event source mappings; Function URL CRUD; Lambda Layers CRUD; Aliases; Concurrency; EventInvokeConfig; **Durable Functions** — `CreateFunction` accepts `DurableConfig`; checkpoint/state/history/list/stop ops at the preview API (`2025-12-01`); external `SendCallback{Success,Failure,Heartbeat}` resume the SDK across invocations; resume scheduler fires WAIT expiries, callback timeouts, and step-retry backoffs; verified against the official `aws-durable-execution-sdk-python` and `aws-durable-execution-sdk-java`; **X-Ray active tracing** — `TracingConfig.Mode=Active` injects `_X_AMZN_TRACE_ID` (`Root=1-<hex>-<hex>;Parent=<hex>;Sampled=1`) into the runtime per invocation so the AWS X-Ray SDK runs without `Missing AWS Lambda trace data`; supported on the warm Python / Node executor, provided runtimes, and the local subprocess fallback (docker RIE upstream does not implement X-Ray and is logged but unsupported) |
@@ -376,6 +422,11 @@ subnet = ec2.create_subnet(
 | **SES v2** | SendEmail, CreateEmailIdentity, GetEmailIdentity, DeleteEmailIdentity, ListEmailIdentities, CreateConfigurationSet, GetConfigurationSet, DeleteConfigurationSet, ListConfigurationSets, GetAccount, PutAccountSuppressionAttributes, ListSuppressedDestinations | REST API (`/v2/email/`); identities auto-verified; emails stored in-memory, not sent |
 | **ACM** | RequestCertificate, DescribeCertificate, ListCertificates, DeleteCertificate, GetCertificate, ImportCertificate, AddTagsToCertificate, RemoveTagsFromCertificate, ListTagsForCertificate, UpdateCertificateOptions, RenewCertificate, ResendValidationEmail | Certificates auto-issued; DNS validation records generated; supports SANs |
 | **Backup** | CreateBackupVault, DescribeBackupVault, DeleteBackupVault, ListBackupVaults, CreateBackupPlan, GetBackupPlan, UpdateBackupPlan, DeleteBackupPlan, ListBackupPlans, ListBackupPlanVersions, CreateBackupSelection, GetBackupSelection, DeleteBackupSelection, ListBackupSelections, StartBackupJob, StopBackupJob, DescribeBackupJob, ListBackupJobs, TagResource, UntagResource, ListTags | In-memory; jobs complete immediately; vaults and plans participate in Resource Groups Tagging API |
+| **Bedrock** | 66 operations — foundation-model catalog (real model IDs), inference profiles (system + application-managed), guardrails with versioning, custom models, imported models, provisioned model throughput, model customization / import / copy / batch-invocation job families, tagging | All 66 operations verified against botocore `bedrock-2023-04-20`; camelCase wire format per `locationName`; account- and region-scoped state |
+| **Bedrock Runtime** | Converse, ConverseStream, InvokeModel, InvokeModelWithResponseStream, ApplyGuardrail, StartAsyncInvoke, GetAsyncInvoke, ListAsyncInvokes | Real eventstream wire format on streaming operations; deterministic family-aware mock responses selected by model ID prefix (`anthropic.*`, `amazon.titan*`, `amazon.nova*`, `meta.llama*`, `mistral.*`, `cohere.*`, `ai21.*`); verified against botocore `bedrock-runtime-2023-09-30` |
+| **Bedrock Agent** | 72 operations — agents (versions, aliases, action groups, collaborators, agent knowledge bases, PrepareAgent), knowledge bases (data sources, ingestion jobs, documents), flows (aliases, versions, ValidateFlowDefinition, PrepareFlow), prompts with versions, tagging | All 72 operations verified against botocore `bedrock-agent-2023-06-05` |
+| **Bedrock Agent Runtime** | InvokeAgent, InvokeInlineAgent, GetAgentMemory, DeleteAgentMemory, Retrieve, RetrieveAndGenerate, RetrieveAndGenerateStream, Rerank, CreateSession, GetSession, UpdateSession, DeleteSession, EndSession, ListSessions, CreateInvocation, ListInvocations, PutInvocationStep, GetInvocationStep, ListInvocationSteps, InvokeFlow, StartFlowExecution, StopFlowExecution, GetFlowExecution, ListFlowExecutions, ListFlowExecutionEvents, GetExecutionFlowSnapshot, OptimizePrompt | All 31 operations verified against botocore `bedrock-agent-runtime-2023-07-26`; eventstream responses on streaming operations |
+| **MSK** | CreateCluster, ListClusters, DescribeCluster, DeleteCluster, GetBootstrapBrokers, ListNodes, CreateConfiguration, ListConfigurations, DescribeConfiguration, ListConfigurationRevisions, DescribeConfigurationRevision, BatchAssociateScramSecret, BatchDisassociateScramSecret, ListScramSecrets, TagResource, UntagResource, ListTagsForResource | Kafka control plane; `GetBootstrapBrokers` honors `MINISTACK_MSK_BOOTSTRAP` so clients route to a real broker you bring (Redpanda, Kafka, KRaft) — the Kafka wire protocol itself is not emulated |
 | **WAF v2** | CreateWebACL, GetWebACL, UpdateWebACL, DeleteWebACL, ListWebACLs, AssociateWebACL, DisassociateWebACL, GetWebACLForResource, ListResourcesForWebACL, CreateIPSet, GetIPSet, UpdateIPSet, DeleteIPSet, ListIPSets, CreateRuleGroup, GetRuleGroup, UpdateRuleGroup, DeleteRuleGroup, ListRuleGroups, TagResource, UntagResource, ListTagsForResource, CheckCapacity, DescribeManagedRuleGroup | LockToken enforced on Update/Delete; resource associations tracked |
 | **Step Functions** | CreateStateMachine, DeleteStateMachine, DescribeStateMachine, UpdateStateMachine, ListStateMachines, StartExecution, StartSyncExecution, StopExecution, DescribeExecution, DescribeStateMachineForExecution, ListExecutions, GetExecutionHistory, SendTaskSuccess, SendTaskFailure, SendTaskHeartbeat, CreateActivity, DeleteActivity, DescribeActivity, ListActivities, GetActivityTask, TestState, TagResource, UntagResource, ListTagsForResource | Full ASL interpreter; Retry/Catch; waitForTaskToken; Activities (worker pattern); Pass/Task/Choice/Wait/Succeed/Fail/Map/Parallel; TestState API with mock and inspectionLevel support; SFN_MOCK_CONFIG for AWS SFN Local compatible mock testing; intrinsic functions (States.StringToJson, States.JsonToString, States.JsonMerge, States.Format); nested startExecution.sync |
 | **API Gateway v2** | CreateApi, GetApi, GetApis, UpdateApi, DeleteApi, CreateRoute, GetRoute, GetRoutes, UpdateRoute, DeleteRoute, CreateIntegration, GetIntegration, GetIntegrations, UpdateIntegration, DeleteIntegration, CreateRouteResponse, GetRouteResponse, GetRouteResponses, UpdateRouteResponse, DeleteRouteResponse, CreateIntegrationResponse, GetIntegrationResponse, GetIntegrationResponses, UpdateIntegrationResponse, DeleteIntegrationResponse, CreateStage, GetStage, GetStages, UpdateStage, DeleteStage, CreateDeployment, GetDeployment, GetDeployments, DeleteDeployment, CreateAuthorizer, GetAuthorizer, GetAuthorizers, UpdateAuthorizer, DeleteAuthorizer, TagResource, UntagResource, GetTags, PostToConnection, GetConnection, DeleteConnection | **HTTP API** and **WebSocket API** (`protocolType=WEBSOCKET`); Lambda proxy (`AWS_PROXY`), HTTP proxy (`HTTP_PROXY`), and MOCK integrations; HTTP data plane via `{apiId}.execute-api.localhost` Host header or path-based `/_aws/execute-api/{apiId}/{stage}/{path}` (no DNS/Host override needed — works from browsers on macOS and strict clients); `$default` stage served from the URL root (no stage segment in the path); per-API `corsConfiguration` applied to preflights + dispatched responses; request parameter mapping for HTTP_PROXY (`append/overwrite/remove` for headers/querystring plus `overwrite:path`) with context variables including `$context.authorizer.jwt.claims`; JWT data-plane authorization for HTTP routes (issuer/audience/time/scope checks) and claim propagation to integrations; qualified-alias integration URIs (`arn:...:function:<name>:<alias>`) resolve to the alias's target version; WebSocket data plane on the same two URL forms, with `$connect` / `$disconnect` / `$default` / custom-action routing, `$request.body.*` RouteSelectionExpression, `@connections` management API (PostToConnection / GetConnection / DeleteConnection), per-connection outbox for server-side push; `{param}` / `{proxy+}` matching; JWT/Lambda authorizer CRUD; pin `apiId` across runs with the `ms-custom-id` tag |
@@ -627,6 +678,32 @@ for row in results["ResultSet"]["Rows"][1:]:  # skip header
 
 ---
 
+## Bedrock with Real LLMs
+
+Bedrock works out of the box with deterministic, family-aware mock responses — every field wire-shape-correct per model family (Anthropic, Titan, Nova, Llama, Mistral, Cohere, AI21), so SDK parsing and streaming code paths run unchanged.
+
+Point `MINISTACK_BEDROCK_PROXY_URL` at any OpenAI-compatible `/chat/completions` endpoint (Ollama, llama.cpp, vLLM) and `Converse` / `InvokeModel` return **real completions** through the Bedrock API — prompts are translated to OpenAI shape, forwarded, and translated back to Bedrock shape. On connection error it falls back to the mock silently.
+
+```bash
+# Ollama on the host
+docker run -p 4566:4566 \
+  -e MINISTACK_BEDROCK_PROXY_URL=http://host.docker.internal:11434/v1 \
+  ministackorg/ministack
+```
+
+```python
+bedrock = client("bedrock-runtime")
+resp = bedrock.converse(
+    modelId="anthropic.claude-3-5-sonnet-20240620-v1:0",
+    messages=[{"role": "user", "content": [{"text": "Hello from MiniStack!"}]}],
+)
+print(resp["output"]["message"]["content"][0]["text"])
+```
+
+Note: token counts are a chars/4 heuristic — shape-correct, but don't assert on exact counts against the mock.
+
+---
+
 ## ECS with Real Containers
 
 ```python
@@ -714,6 +791,12 @@ end-to-end without any client config.
 | `MINISTACK_SSL_CERT` | _(unset)_ | Optional PEM-encoded server certificate path; required together with `MINISTACK_SSL_KEY`. When unset, MiniStack auto-generates a self-signed cert under `${TMPDIR}/ministack-tls/` (cached across restarts) |
 | `MINISTACK_SSL_KEY` | _(unset)_ | Optional PEM-encoded private key path; required together with `MINISTACK_SSL_CERT` |
 | `MINISTACK_IMDS_V2_REQUIRED` | `0` | Reject token-less GETs on `/latest/meta-data/...`. When set, callers must first `PUT /latest/api/token` and pass the token as `X-aws-ec2-metadata-token`, matching real-AWS hop-limit-1 IMDSv2-only instances |
+| `MINISTACK_BEDROCK_PROXY_URL` | _(unset)_ | OpenAI-compatible `/chat/completions` endpoint (Ollama, llama.cpp, vLLM). When set, Bedrock `Converse`/`InvokeModel` prompts are translated to OpenAI shape, forwarded, and translated back to Bedrock shape — real completions through the Bedrock API. Falls back to the deterministic mock on connection error |
+| `MINISTACK_BEDROCK_PROXY_TIMEOUT_SECONDS` | `30` | Upstream request timeout for the Bedrock proxy |
+| `MINISTACK_MSK_BOOTSTRAP` | _(unset)_ | Plaintext bootstrap broker string returned by MSK `GetBootstrapBrokers` — point it at a real broker you bring (Redpanda, Kafka, KRaft). Unset → placeholder endpoint (control-plane only) |
+| `MINISTACK_MSK_BOOTSTRAP_TLS` | _(unset)_ | TLS bootstrap string (`BootstrapBrokerStringTls`) |
+| `MINISTACK_MSK_BOOTSTRAP_SASL_SCRAM` | _(unset)_ | SASL/SCRAM bootstrap string (`BootstrapBrokerStringSaslScram`) |
+| `MINISTACK_MSK_BOOTSTRAP_SASL_IAM` | _(unset)_ | SASL/IAM bootstrap string (`BootstrapBrokerStringSaslIam`) |
 
 ### API Gateway HTTP proxy execution model
 
@@ -785,7 +868,7 @@ Install DuckDB for full Athena SQL compatibility: `pip install ministack[full]`.
 
 When `PERSIST_STATE=1`, MiniStack saves service state to `STATE_DIR` on shutdown and reloads it on startup. Writes are atomic (write-to-tmp then rename) to prevent corruption on crash.
 
-Services currently supporting persistence: **All services** — API Gateway v1/v2, ALB, ACM, AppConfig, AppSync, Athena, Cloud Map, CloudFront, CloudWatch, CloudWatch Logs, CodeBuild, Cognito, DynamoDB, EC2, ECR, ECS, EFS, EKS, ElastiCache, EMR, EventBridge, EventBridge Scheduler, Firehose, Glue, IAM/STS, Kinesis, KMS, Lambda, RDS, Route 53, S3, Secrets Manager, SES, SES v2, SNS, SQS, SSM, Step Functions, Transfer Family, WAF v2
+Services currently supporting persistence: **All services** — API Gateway v1/v2, ALB, ACM, AppConfig, AppSync, Athena, Bedrock, Cloud Map, CloudFront, CloudWatch, CloudWatch Logs, CodeBuild, Cognito, DynamoDB, EC2, ECR, ECS, EFS, EKS, ElastiCache, EMR, EventBridge, EventBridge Scheduler, Firehose, Glue, IAM/STS, Kinesis, KMS, Lambda, MSK, RDS, Route 53, S3, Secrets Manager, SES, SES v2, SNS, SQS, SSM, Step Functions, Transfer Family, WAF v2
 
 ```bash
 docker run -p 4566:4566 \
@@ -999,6 +1082,7 @@ Errors map to Lambda's standard error shape so async-invoke retry, DLQ, destinat
                     │  │  AutoScaling  AppConfig     EKS    │  │
                     │  │  RDS Data  S3 Files  Scheduler     │  │
                     │  │  Transfer Family   IoT Core        │  │
+                    │  │  Bedrock (x4)   MSK                │  │
                     │  └────────────────────────────────────┘  │
                     │                                          │
                     │  In-Memory Storage + Optional Docker     │
@@ -1021,7 +1105,7 @@ pip install boto3 pytest duckdb docker cbor2
 # Start MiniStack
 docker compose up -d
 
-# Run the full test suite (2,500+ tests across all services)
+# Run the full test suite (1,400+ tests across all services)
 pytest tests/ -v
 ```
 
@@ -1032,7 +1116,7 @@ tests/test_s3.py::test_s3_create_bucket PASSED
 ...
 tests/test_lambda.py::test_lambda_invoke PASSED
 
-2100+ passed in ~120s
+1400+ passed in ~2 minutes
 ```
 
 ---
@@ -1058,6 +1142,8 @@ provider "aws" {
     apigateway      = "http://localhost:4566"
     appsync         = "http://localhost:4566"
     athena          = "http://localhost:4566"
+    bedrock         = "http://localhost:4566"
+    bedrockagent    = "http://localhost:4566"
     cloudformation  = "http://localhost:4566"
     cloudfront      = "http://localhost:4566"
     cloudwatch      = "http://localhost:4566"
@@ -1076,6 +1162,7 @@ provider "aws" {
     firehose        = "http://localhost:4566"
     glue            = "http://localhost:4566"
     iam             = "http://localhost:4566"
+    kafka           = "http://localhost:4566"
     kinesis         = "http://localhost:4566"
     kms             = "http://localhost:4566"
     lambda          = "http://localhost:4566"
@@ -1217,6 +1304,9 @@ See [`Testcontainers/java-testcontainers`](Testcontainers/java-testcontainers), 
 | **API Gateway v2 (WebSocket API)** | ✅ | ❌ | ✅ |
 | **API Gateway v1 (REST API)** | ✅ | ✅ | ✅ |
 | **Firehose** | ✅ | ✅ | ✅ |
+| **Bedrock (Converse / InvokeModel / Agents)** | ✅ | ❌ | ✅ |
+| **MSK (Kafka control plane)** | ✅ | ❌ | ✅ |
+| **Multi-region state isolation** | ✅ | ✅ | ✅ |
 | **Route53** | ✅ | ✅ | ✅ |
 | **Cognito** | ✅ | ✅ | ✅ |
 | **EC2** | ✅ | ✅ | ✅ |
@@ -1227,11 +1317,11 @@ See [`Testcontainers/java-testcontainers`](Testcontainers/java-testcontainers), 
 | **ACM** | ✅ | ✅ | ✅ |
 | **SES v2** | ✅ | ✅ | ✅ |
 | **WAF v2** | ✅ | Paid | ✅ |
-| **CloudFormation** | **partial** | partial | ✅ Free |
-| **KMS** | ✅ | Paid | ✅ Free |
+| **CloudFormation** | **partial** | partial | ✅ |
+| **KMS** | ✅ | Paid | ✅ |
 | **ECR** | ✅ | ✅ | ✅ |
 | **CloudFront** | ✅ | Paid | ✅ |
-| **AppSync** | ✅ | NO | ✅ |
+| **AppSync** | ✅ | ❌ | ✅ |
 | **Cloud Map** | ✅ | ❌ | ✅ |
 | **CodeBuild** | ✅ | ✅ | ✅ |
 | **Transfer Family** | ✅ | ❌ | ❌ |
@@ -1239,9 +1329,9 @@ See [`Testcontainers/java-testcontainers`](Testcontainers/java-testcontainers), 
 | **IoT Core** | ✅ (control + WS data plane) | ❌ | ✅ (paid tier) |
 | **S3 Files** | ✅ | ❌ | ❌ |
 | Cost | **Free forever** | Was free, now paid | $35+/mo |
-| Docker image size | ~250MB | ~1GB | ~1GB |
-| Memory at idle | ~40MB | ~500MB | ~500MB |
-| Startup time | <1s | ~15-30s | ~15-30s |
+| Docker image size | ~270MB | ~1GB | ~1GB |
+| Memory at idle | ~30MB | ~500MB | ~500MB |
+| Startup time | <2s | ~15-30s | ~15-30s |
 | License | MIT | BSL (restricted) | Proprietary |
 
 ---

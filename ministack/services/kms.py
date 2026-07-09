@@ -13,6 +13,7 @@ import logging
 import os
 import time
 
+from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.responses import (
     AccountScopedDict,
     error_response_json,
@@ -50,7 +51,22 @@ _keys = AccountScopedDict()
 #     _public_key_der (bytes, RSA/ECC only),
 #     _symmetric_key (bytes, SYMMETRIC_DEFAULT only),
 # }
-_aliases = AccountScopedDict()  # alias_name -> key_id (e.g. "alias/my-key" -> "uuid")
+_aliases = AccountScopedDict()  # alias ARN -> key_id
+
+
+def _alias_arn(alias_name):
+    return f"arn:aws:kms:{get_region()}:{get_account_id()}:{alias_name}"
+
+
+def _alias_arn_from_key_record(alias_name, rec, account_id=None):
+    if rec and rec.get("Arn"):
+        try:
+            spec = parse_arn(rec["Arn"])
+            if spec.service == "kms" and spec.region and spec.account_id:
+                return f"arn:{spec.partition}:kms:{spec.region}:{spec.account_id}:{alias_name}"
+        except ArnParseError:
+            pass
+    return f"arn:aws:kms:{get_region()}:{account_id or get_account_id()}:{alias_name}"
 
 
 # ── Persistence ────────────────────────────────────────────
@@ -105,7 +121,21 @@ def restore_state(data):
             for kid, entry in keys_data.items():
                 _restore_key_entry(entry)
                 _keys[kid] = entry
-        _aliases.update(data.get("aliases", {}))
+        aliases_data = data.get("aliases", {})
+        if isinstance(aliases_data, AccountScopedDict):
+            for scoped_key, target_id in aliases_data._data.items():
+                account_id, alias_key = scoped_key
+                storage_key = alias_key
+                if not str(alias_key).startswith("arn:"):
+                    rec = _keys._data.get((account_id, target_id))
+                    storage_key = _alias_arn_from_key_record(alias_key, rec, account_id)
+                _aliases._data[(account_id, storage_key)] = target_id
+        else:
+            for alias_key, target_id in aliases_data.items():
+                storage_key = alias_key
+                if not str(alias_key).startswith("arn:"):
+                    storage_key = _alias_arn_from_key_record(alias_key, _keys.get(target_id))
+                _aliases[storage_key] = target_id
 
 
 try:
@@ -141,22 +171,46 @@ def _key_metadata(rec):
     }
 
 
+def _key_ref_from_arn(key_id_or_arn):
+    try:
+        spec = parse_arn(key_id_or_arn)
+    except ArnParseError:
+        return None
+    if (
+        spec.partition != "aws"
+        or spec.service != "kms"
+        or spec.region != get_region()
+        or spec.account_id != get_account_id()
+    ):
+        return None
+    if spec.resource.startswith("key/"):
+        key_id = spec.resource[len("key/"):]
+        return ("key", key_id) if key_id else None
+    if spec.resource.startswith("alias/"):
+        alias_name = spec.resource
+        return ("alias", key_id_or_arn) if alias_name != "alias/" else None
+    return None
+
+
 def _resolve_key(key_id_or_arn):
     if not key_id_or_arn:
         return None
+    if key_id_or_arn.startswith("arn:"):
+        key_ref = _key_ref_from_arn(key_id_or_arn)
+        if not key_ref:
+            return None
+        ref_type, key_ref_value = key_ref
+        if ref_type == "key":
+            rec = _keys.get(key_ref_value)
+            return rec if rec and rec.get("Arn") == key_id_or_arn else None
+        key_id_or_arn = key_ref_value
     # Direct key ID lookup
     if key_id_or_arn in _keys:
         return _keys[key_id_or_arn]
-    # ARN lookup
-    for rec in _keys.values():
-        if rec["Arn"] == key_id_or_arn:
-            return rec
-    # Alias lookup: "alias/my-key" or "arn:aws:kms:...:alias/my-key"
-    alias_name = key_id_or_arn
-    if ":alias/" in alias_name:
-        alias_name = "alias/" + alias_name.split(":alias/")[-1]
-    if alias_name in _aliases:
-        return _keys.get(_aliases[alias_name])
+    # Alias lookup: "alias/my-key"
+    alias_arn = key_id_or_arn if key_id_or_arn.startswith("arn:") else _alias_arn(key_id_or_arn)
+    if alias_arn in _aliases:
+        return _keys.get(_aliases[alias_arn])
     return None
 
 
@@ -833,32 +887,40 @@ def _create_alias(data):
     rec = _resolve_key(target_key_id)
     if not rec:
         return error_response_json("NotFoundException", f"Key {target_key_id} not found", 400)
-    if alias_name in _aliases:
+    alias_arn = _alias_arn(alias_name)
+    if alias_arn in _aliases:
         return error_response_json("AlreadyExistsException", f"Alias {alias_name} already exists", 400)
-    _aliases[alias_name] = rec["KeyId"]
+    _aliases[alias_arn] = rec["KeyId"]
     logger.info("Created alias %s -> %s", alias_name, rec["KeyId"])
     return json_response({})
 
 
 def _delete_alias(data):
     alias_name = data.get("AliasName", "")
-    if alias_name not in _aliases:
+    alias_arn = _alias_arn(alias_name)
+    if alias_arn not in _aliases:
         return error_response_json("NotFoundException", f"Alias {alias_name} not found", 400)
-    del _aliases[alias_name]
+    del _aliases[alias_arn]
     return json_response({})
 
 
 def _list_aliases(data):
     key_id = data.get("KeyId")
     items = []
-    for alias_name, target_id in _aliases.items():
+    for alias_arn, target_id in _aliases.items():
+        try:
+            spec = parse_arn(alias_arn)
+        except ArnParseError:
+            continue
+        if spec.service != "kms" or spec.region != get_region() or spec.account_id != get_account_id():
+            continue
         if key_id and target_id != key_id:
             rec = _resolve_key(key_id)
             if not rec or rec["KeyId"] != target_id:
                 continue
         items.append({
-            "AliasName": alias_name,
-            "AliasArn": f"arn:aws:kms:{get_region()}:{get_account_id()}:{alias_name}",
+            "AliasName": spec.resource,
+            "AliasArn": alias_arn,
             "TargetKeyId": target_id,
         })
     return json_response({"Aliases": items, "Truncated": False})
@@ -867,12 +929,13 @@ def _list_aliases(data):
 def _update_alias(data):
     alias_name = data.get("AliasName", "")
     target_key_id = data.get("TargetKeyId", "")
-    if alias_name not in _aliases:
+    alias_arn = _alias_arn(alias_name)
+    if alias_arn not in _aliases:
         return error_response_json("NotFoundException", f"Alias {alias_name} not found", 400)
     rec = _resolve_key(target_key_id)
     if not rec:
         return error_response_json("NotFoundException", f"Key {target_key_id} not found", 400)
-    _aliases[alias_name] = rec["KeyId"]
+    _aliases[alias_arn] = rec["KeyId"]
     return json_response({})
 
 

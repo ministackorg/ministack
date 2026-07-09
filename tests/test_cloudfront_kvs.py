@@ -1,8 +1,20 @@
 import json
+import os
+import urllib.error
+import urllib.parse
+import urllib.request
 import uuid as _uuid_mod
 
 import pytest
 from botocore.exceptions import ClientError
+
+ENDPOINT = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+
+
+def _describe_store_raw(kvs_arn):
+    url = f"{ENDPOINT}/key-value-stores/{urllib.parse.quote(kvs_arn, safe='')}"
+    req = urllib.request.Request(url, method="GET")
+    return urllib.request.urlopen(req, timeout=10)
 
 
 def test_kvs_dataplane_describe(cloudfront, cloudfront_kvs):
@@ -153,6 +165,26 @@ def test_kvs_dataplane_not_found(cloudfront_kvs):
         cloudfront_kvs.describe_key_value_store(KvsARN=fake_arn)
     assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
     assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 404
+
+
+def test_kvs_dataplane_rejects_invalid_kvs_arns(cloudfront):
+    name = f"dp-invalid-arn-{_uuid_mod.uuid4().hex[:8]}"
+    create_resp = cloudfront.create_key_value_store(Name=name, Comment="invalid arn test")
+    arn = create_resp["KeyValueStore"]["ARN"]
+    invalid_cases = [
+        "arn:aws:cloudfront::000000000000:distribution/example",
+        arn.replace(":cloudfront:", ":sqs:"),
+        arn.replace(":000000000000:", ":111111111111:"),
+        arn.replace("cloudfront::", "cloudfront:us-east-1:"),
+        f"{arn}/extra",
+    ]
+
+    for bad_arn in invalid_cases:
+        with pytest.raises(urllib.error.HTTPError) as exc:
+            _describe_store_raw(bad_arn)
+        assert exc.value.code == 400
+        body = json.loads(exc.value.read().decode("utf-8"))
+        assert body["__type"] == "ValidationException"
 
 
 def test_kvs_dataplane_list_keys_pagination(cloudfront, cloudfront_kvs):

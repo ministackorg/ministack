@@ -6,8 +6,11 @@ import uuid as _uuid_mod
 import zipfile
 from urllib.parse import urlparse
 
+import boto3
 import pytest
+from botocore.config import Config
 from botocore.exceptions import ClientError
+from conftest import ENDPOINT
 
 
 def _make_zip(code: str) -> bytes:
@@ -26,6 +29,149 @@ def _wait_sfn(sfn, exec_arn, timeout=10):
         if desc["status"] != "RUNNING":
             return desc
     return desc
+
+
+def _regional_sfn(region):
+    return boto3.client(
+        "stepfunctions",
+        endpoint_url=ENDPOINT,
+        aws_access_key_id="test",
+        aws_secret_access_key="test",
+        region_name=region,
+        config=Config(
+            region_name=region,
+            retries={"mode": "standard"},
+            max_pool_connections=50,
+        ),
+    )
+
+
+def _regional_rds(region):
+    return boto3.client(
+        "rds",
+        endpoint_url=ENDPOINT,
+        aws_access_key_id="test",
+        aws_secret_access_key="test",
+        region_name=region,
+        config=Config(
+            region_name=region,
+            retries={"mode": "standard"},
+            max_pool_connections=50,
+        ),
+    )
+
+
+def _pass_definition(result="ok"):
+    return json.dumps(
+        {
+            "StartAt": "P",
+            "States": {"P": {"Type": "Pass", "Result": result, "End": True}},
+        }
+    )
+
+
+def test_sfn_state_machines_are_region_scoped():
+    east = _regional_sfn("us-east-1")
+    west = _regional_sfn("us-west-2")
+    name = f"sfn-region-scope-{_uuid_mod.uuid4().hex}"
+
+    east_sm = east.create_state_machine(
+        name=name,
+        definition=_pass_definition("east"),
+        roleArn="arn:aws:iam::000000000000:role/R",
+    )
+    west_sm = west.create_state_machine(
+        name=name,
+        definition=_pass_definition("west"),
+        roleArn="arn:aws:iam::000000000000:role/R",
+    )
+
+    assert ":us-east-1:" in east_sm["stateMachineArn"]
+    assert ":us-west-2:" in west_sm["stateMachineArn"]
+    assert east_sm["stateMachineArn"] != west_sm["stateMachineArn"]
+
+    east_arns = {sm["stateMachineArn"] for sm in east.list_state_machines()["stateMachines"]}
+    west_arns = {sm["stateMachineArn"] for sm in west.list_state_machines()["stateMachines"]}
+    assert east_sm["stateMachineArn"] in east_arns
+    assert east_sm["stateMachineArn"] not in west_arns
+    assert west_sm["stateMachineArn"] in west_arns
+    assert west_sm["stateMachineArn"] not in east_arns
+
+    with pytest.raises(ClientError) as exc:
+        west.describe_state_machine(stateMachineArn=east_sm["stateMachineArn"])
+    assert exc.value.response["Error"]["Code"] == "StateMachineDoesNotExist"
+
+
+def test_sfn_executions_are_region_scoped():
+    east = _regional_sfn("us-east-1")
+    west = _regional_sfn("us-west-2")
+    name = f"sfn-exec-region-scope-{_uuid_mod.uuid4().hex}"
+    execution_name = "same-execution-name"
+
+    east_sm = east.create_state_machine(
+        name=name,
+        definition=_pass_definition("east"),
+        roleArn="arn:aws:iam::000000000000:role/R",
+    )
+    west_sm = west.create_state_machine(
+        name=name,
+        definition=_pass_definition("west"),
+        roleArn="arn:aws:iam::000000000000:role/R",
+    )
+
+    east_ex = east.start_execution(
+        stateMachineArn=east_sm["stateMachineArn"],
+        name=execution_name,
+        input="{}",
+    )
+    west_ex = west.start_execution(
+        stateMachineArn=west_sm["stateMachineArn"],
+        name=execution_name,
+        input="{}",
+    )
+
+    assert ":us-east-1:" in east_ex["executionArn"]
+    assert ":us-west-2:" in west_ex["executionArn"]
+    assert east_ex["executionArn"] != west_ex["executionArn"]
+
+    east_desc = _wait_sfn(east, east_ex["executionArn"])
+    west_desc = _wait_sfn(west, west_ex["executionArn"])
+    assert east_desc["status"] == "SUCCEEDED"
+    assert west_desc["status"] == "SUCCEEDED"
+    assert json.loads(east_desc["output"]) == "east"
+    assert json.loads(west_desc["output"]) == "west"
+
+    east_exec_arns = {
+        ex["executionArn"]
+        for ex in east.list_executions(stateMachineArn=east_sm["stateMachineArn"])["executions"]
+    }
+    west_exec_arns = {
+        ex["executionArn"]
+        for ex in west.list_executions(stateMachineArn=west_sm["stateMachineArn"])["executions"]
+    }
+    assert east_ex["executionArn"] in east_exec_arns
+    assert east_ex["executionArn"] not in west_exec_arns
+    assert west_ex["executionArn"] in west_exec_arns
+    assert west_ex["executionArn"] not in east_exec_arns
+
+    with pytest.raises(ClientError) as exc:
+        west.describe_execution(executionArn=east_ex["executionArn"])
+    assert exc.value.response["Error"]["Code"] == "ExecutionDoesNotExist"
+
+
+def test_sfn_start_execution_rejects_cross_region_state_machine_arn():
+    east = _regional_sfn("us-east-1")
+    west = _regional_sfn("us-west-2")
+    name = f"sfn-cross-region-start-{_uuid_mod.uuid4().hex}"
+    east_sm = east.create_state_machine(
+        name=name,
+        definition=_pass_definition("east"),
+        roleArn="arn:aws:iam::000000000000:role/R",
+    )
+
+    with pytest.raises(ClientError) as exc:
+        west.start_execution(stateMachineArn=east_sm["stateMachineArn"], input="{}")
+    assert exc.value.response["Error"]["Code"] == "StateMachineDoesNotExist"
 
 def test_sfn_create_execute(sfn):
     definition = json.dumps(
@@ -254,6 +400,73 @@ def test_sfn_tags_v2(sfn):
     tags3 = sfn.list_tags_for_resource(resourceArn=arn)["tags"]
     assert not any(t["key"] == "init" for t in tags3)
     assert any(t["key"] == "env" for t in tags3)
+
+
+def test_sfn_tags_scope_by_resource_arn_region():
+    from ministack.core.responses import (
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+    from ministack.services import stepfunctions as m
+
+    original_account = get_account_id()
+    original_region = get_region()
+    original_tags = dict(m._tags._data)
+    arn = "arn:aws:states:us-east-1:000000000000:stateMachine:tagged-east"
+    foreign_region_arn = "arn:aws:states:us-west-2:000000000000:stateMachine:tagged-west"
+    foreign_account_arn = "arn:aws:states:us-east-1:111111111111:stateMachine:foreign"
+
+    def assert_error(response, code):
+        status, headers, body = response
+        assert status == 400
+        assert headers["x-amzn-errortype"] == code
+        assert json.loads(body)["__type"] == code
+
+    try:
+        m._tags.clear()
+        set_request_account_id("000000000000")
+        set_request_region("us-east-1")
+
+        m._tag_resource({"resourceArn": arn, "tags": [{"key": "env", "value": "east"}]})
+
+        assert m._tags.get_scoped("000000000000", "us-east-1", arn) == [
+            {"key": "env", "value": "east"},
+        ]
+        assert m._tags.get_scoped("000000000000", "us-west-2", arn) is None
+
+        _status, _headers, body = m._list_tags_for_resource({"resourceArn": arn})
+        assert json.loads(body)["tags"] == [{"key": "env", "value": "east"}]
+
+        assert_error(
+            m._tag_resource({
+                "resourceArn": foreign_region_arn,
+                "tags": [{"key": "env", "value": "west"}],
+            }),
+            "InvalidArn",
+        )
+        assert m._tags.get_scoped("000000000000", "us-west-2", foreign_region_arn) is None
+
+        assert_error(
+            m._tag_resource({
+                "resourceArn": foreign_account_arn,
+                "tags": [{"key": "owner", "value": "other"}],
+            }),
+            "AccessDeniedException",
+        )
+        assert_error(
+            m._list_tags_for_resource({"resourceArn": foreign_account_arn}),
+            "AccessDeniedException",
+        )
+        assert m._tags.get_scoped("111111111111", "us-east-1", foreign_account_arn) is None
+        assert m._tags.get_scoped("000000000000", "us-east-1", foreign_account_arn) is None
+    finally:
+        m._tags.clear()
+        m._tags._data.update(original_tags)
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
 
 def test_sfn_intrinsic_string_to_json(sfn, sfn_sync):
     """States.StringToJson parses a JSON string into structured data."""
@@ -1364,6 +1577,288 @@ def test_sfn_aws_sdk_rds_remove_from_global_cluster(sfn, sfn_sync, rds):
             pass
         rds.delete_db_cluster(DBClusterIdentifier=cluster_id, SkipFinalSnapshot=True)
 
+
+def test_sfn_aws_sdk_rds_create_global_cluster_from_described_cluster_arn(sfn_sync, rds):
+    """aws-sdk:rds CreateGlobalCluster accepts a described DBClusterArn via JSONPath."""
+    primary_id = f"sfn-r2g-primary-{_uuid_mod.uuid4().hex[:8]}"
+    global_id = f"sfn-r2g-global-{_uuid_mod.uuid4().hex[:8]}"
+    sm_name = f"sdk-rds-r2g-{_uuid_mod.uuid4().hex[:8]}"
+    sm_arn = None
+
+    rds.create_db_cluster(
+        DBClusterIdentifier=primary_id,
+        Engine="aurora-postgresql",
+        MasterUsername="admin",
+        MasterUserPassword="testpass123",
+    )
+
+    definition = json.dumps({
+        "StartAt": "DescribePrimary",
+        "States": {
+            "DescribePrimary": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::aws-sdk:rds:describeDBClusters",
+                "Parameters": {
+                    "DbClusterIdentifier": primary_id,
+                },
+                "ResultPath": "$.primary",
+                "Next": "AttachGlobal",
+            },
+            "AttachGlobal": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::aws-sdk:rds:createGlobalCluster",
+                "Parameters": {
+                    "GlobalClusterIdentifier": global_id,
+                    "SourceDBClusterIdentifier.$": "$.primary.DbClusters[0].DbClusterArn",
+                },
+                "ResultPath": "$.attach",
+                "Next": "DescribeGlobal",
+            },
+            "DescribeGlobal": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::aws-sdk:rds:describeGlobalClusters",
+                "Parameters": {
+                    "GlobalClusterIdentifier": global_id,
+                },
+                "ResultPath": "$.global",
+                "End": True,
+            },
+        },
+    })
+
+    try:
+        sm_arn = sfn_sync.create_state_machine(
+            name=sm_name,
+            definition=definition,
+            roleArn="arn:aws:iam::000000000000:role/sfn-role",
+        )["stateMachineArn"]
+
+        resp = sfn_sync.start_sync_execution(stateMachineArn=sm_arn, input=json.dumps({}))
+        assert resp["status"] == "SUCCEEDED", f"Execution failed: {resp.get('error')} — {resp.get('cause')}"
+        output = json.loads(resp["output"])
+        global_cluster = output["global"]["GlobalClusters"][0]
+        members = global_cluster["GlobalClusterMembers"]
+        assert len(members) == 1
+        assert members[0]["IsWriter"] is True
+        assert members[0]["DbClusterArn"] == output["primary"]["DbClusters"][0]["DbClusterArn"]
+        attached = rds.describe_db_clusters(
+            DBClusterIdentifier=primary_id,
+        )["DBClusters"][0]
+        assert attached["GlobalClusterIdentifier"] == global_id
+    finally:
+        if sm_arn:
+            sfn_sync.delete_state_machine(stateMachineArn=sm_arn)
+        try:
+            rds.remove_from_global_cluster(
+                GlobalClusterIdentifier=global_id,
+                DbClusterIdentifier=primary_id,
+            )
+        except ClientError:
+            pass
+        try:
+            rds.delete_global_cluster(GlobalClusterIdentifier=global_id)
+        except ClientError:
+            pass
+        try:
+            rds.delete_db_cluster(DBClusterIdentifier=primary_id, SkipFinalSnapshot=True)
+        except ClientError:
+            pass
+
+
+def test_sfn_aws_sdk_rds_switchover_global_cluster(sfn_sync):
+    """aws-sdk:rds SwitchoverGlobalCluster accepts a foreign-Region member ARN."""
+    east = _regional_rds("us-east-1")
+    west = _regional_rds("us-west-2")
+    suffix = _uuid_mod.uuid4().hex[:8]
+    primary_id = f"sfn-switch-primary-{suffix}"
+    secondary_id = f"sfn-switch-secondary-{suffix}"
+    global_id = f"sfn-switch-global-{suffix}"
+    sm_name = f"sdk-rds-switch-{suffix}"
+    sm_arn = None
+    primary_arn = None
+    secondary_arn = None
+
+    try:
+        primary = east.create_db_cluster(
+            DBClusterIdentifier=primary_id,
+            Engine="aurora-postgresql",
+            MasterUsername="admin",
+            MasterUserPassword="testpass123",
+        )["DBCluster"]
+        primary_arn = primary["DBClusterArn"]
+        east.create_global_cluster(
+            GlobalClusterIdentifier=global_id,
+            SourceDBClusterIdentifier=primary_arn,
+        )
+        secondary = west.create_db_cluster(
+            DBClusterIdentifier=secondary_id,
+            Engine="aurora-postgresql",
+            GlobalClusterIdentifier=global_id,
+            MasterUsername="admin",
+            MasterUserPassword="testpass123",
+        )["DBCluster"]
+        secondary_arn = secondary["DBClusterArn"]
+
+        definition = json.dumps({
+            "StartAt": "SwitchGlobal",
+            "States": {
+                "SwitchGlobal": {
+                    "Type": "Task",
+                    "Resource": "arn:aws:states:::aws-sdk:rds:switchoverGlobalCluster",
+                    "Parameters": {
+                        "GlobalClusterIdentifier": global_id,
+                        "TargetDbClusterIdentifier": secondary_arn,
+                    },
+                    "End": True,
+                },
+            },
+        })
+        sm_arn = sfn_sync.create_state_machine(
+            name=sm_name,
+            definition=definition,
+            roleArn="arn:aws:iam::000000000000:role/sfn-role",
+        )["stateMachineArn"]
+
+        resp = sfn_sync.start_sync_execution(stateMachineArn=sm_arn, input=json.dumps({}))
+        assert resp["status"] == "SUCCEEDED", f"Execution failed: {resp.get('error')} — {resp.get('cause')}"
+        output = json.loads(resp["output"])
+        assert output["GlobalCluster"]["Status"] == "switching-over"
+        assert output["GlobalCluster"]["FailoverState"]["Status"] == "pending"
+        assert output["GlobalCluster"]["FailoverState"]["IsDataLossAllowed"] is False
+        members = {
+            member["DbClusterArn"]: member
+            for member in output["GlobalCluster"]["GlobalClusterMembers"]
+        }
+        assert members[primary_arn]["IsWriter"] is False
+        assert members[secondary_arn]["IsWriter"] is True
+
+        final = east.describe_global_clusters(
+            GlobalClusterIdentifier=global_id,
+        )["GlobalClusters"][0]
+        final_members = {m["DBClusterArn"]: m for m in final["GlobalClusterMembers"]}
+        assert final["Status"] == "available"
+        assert final_members[primary_arn]["IsWriter"] is False
+        assert final_members[secondary_arn]["IsWriter"] is True
+    finally:
+        if sm_arn:
+            sfn_sync.delete_state_machine(stateMachineArn=sm_arn)
+        if primary_arn:
+            try:
+                east.switchover_global_cluster(
+                    GlobalClusterIdentifier=global_id,
+                    TargetDbClusterIdentifier=primary_arn,
+                )
+            except ClientError:
+                pass
+        for cluster_arn in (secondary_arn, primary_arn):
+            if cluster_arn:
+                try:
+                    east.remove_from_global_cluster(
+                        GlobalClusterIdentifier=global_id,
+                        DbClusterIdentifier=cluster_arn,
+                    )
+                except ClientError:
+                    pass
+        try:
+            east.delete_global_cluster(GlobalClusterIdentifier=global_id)
+        except ClientError:
+            pass
+        try:
+            west.delete_db_cluster(DBClusterIdentifier=secondary_id, SkipFinalSnapshot=True)
+        except ClientError:
+            pass
+        try:
+            east.delete_db_cluster(DBClusterIdentifier=primary_id, SkipFinalSnapshot=True)
+        except ClientError:
+            pass
+
+
+def test_sfn_aws_sdk_rds_global_cluster_readers_are_lists(sfn_sync, rds):
+    primary_id = f"sfn-global-primary-{_uuid_mod.uuid4().hex[:8]}"
+    secondary_id = f"sfn-global-secondary-{_uuid_mod.uuid4().hex[:8]}"
+    global_id = f"sfn-global-readers-{_uuid_mod.uuid4().hex[:8]}"
+    sm_name = f"sdk-rds-global-readers-{_uuid_mod.uuid4().hex[:8]}"
+    west_rds = _regional_rds("us-west-2")
+    sm_arn = None
+
+    try:
+        primary = rds.create_db_cluster(
+            DBClusterIdentifier=primary_id,
+            Engine="aurora-postgresql",
+            MasterUsername="admin",
+            MasterUserPassword="testpass123",
+        )["DBCluster"]
+        rds.create_global_cluster(
+            GlobalClusterIdentifier=global_id,
+            SourceDBClusterIdentifier=primary["DBClusterArn"],
+        )
+        secondary = west_rds.create_db_cluster(
+            DBClusterIdentifier=secondary_id,
+            Engine="aurora-postgresql",
+            GlobalClusterIdentifier=global_id,
+            MasterUsername="admin",
+            MasterUserPassword="testpass123",
+        )["DBCluster"]
+
+        definition = json.dumps({
+            "StartAt": "DescribeGlobal",
+            "States": {
+                "DescribeGlobal": {
+                    "Type": "Task",
+                    "Resource": "arn:aws:states:::aws-sdk:rds:DescribeGlobalClusters",
+                    "Parameters": {
+                        "GlobalClusterIdentifier": global_id,
+                    },
+                    "ResultPath": "$.describeResult",
+                    "End": True,
+                },
+            },
+        })
+        sm_arn = sfn_sync.create_state_machine(
+            name=sm_name,
+            definition=definition,
+            roleArn="arn:aws:iam::000000000000:role/sfn-role",
+        )["stateMachineArn"]
+
+        resp = sfn_sync.start_sync_execution(stateMachineArn=sm_arn, input=json.dumps({}))
+        assert resp["status"] == "SUCCEEDED", f"Execution failed: {resp.get('error')} — {resp.get('cause')}"
+        output = json.loads(resp["output"])
+        members = output["describeResult"]["GlobalClusters"][0]["GlobalClusterMembers"]
+        by_arn = {member["DbClusterArn"]: member for member in members}
+
+        assert by_arn[primary["DBClusterArn"]]["Readers"] == [secondary["DBClusterArn"]]
+        assert by_arn[secondary["DBClusterArn"]]["Readers"] == []
+    finally:
+        if sm_arn:
+            sfn_sync.delete_state_machine(stateMachineArn=sm_arn)
+        try:
+            west_rds.remove_from_global_cluster(
+                GlobalClusterIdentifier=global_id,
+                DbClusterIdentifier=secondary_id,
+            )
+        except ClientError:
+            pass
+        try:
+            rds.remove_from_global_cluster(
+                GlobalClusterIdentifier=global_id,
+                DbClusterIdentifier=primary_id,
+            )
+        except ClientError:
+            pass
+        try:
+            rds.delete_global_cluster(GlobalClusterIdentifier=global_id)
+        except ClientError:
+            pass
+        try:
+            west_rds.delete_db_cluster(DBClusterIdentifier=secondary_id, SkipFinalSnapshot=True)
+        except ClientError:
+            pass
+        try:
+            rds.delete_db_cluster(DBClusterIdentifier=primary_id, SkipFinalSnapshot=True)
+        except ClientError:
+            pass
+
+
 def test_sfn_xml_list_wrapper_single_element(sfn, sfn_sync):
     """DescribeDBClusters returns a JSON list even when only one cluster exists."""
     import uuid as _uuid
@@ -1445,9 +1940,120 @@ def test_sfn_aws_sdk_rds_not_found_error(sfn, sfn_sync):
 
     resp = sfn_sync.start_sync_execution(stateMachineArn=sm_arn, input=json.dumps({}))
     assert resp["status"] == "FAILED"
-    assert "DBClusterNotFoundFault" in (resp.get("error", "") + resp.get("cause", ""))
+    assert resp.get("error") == "Rds.DbClusterNotFoundException"
 
     sfn_sync.delete_state_machine(stateMachineArn=sm_arn)
+
+
+def test_sfn_aws_sdk_rds_foreign_region_arn_mismatch_is_generic_rds_exception(sfn_sync):
+    west_rds = _regional_rds("us-west-2")
+    cluster_id = f"sdk-rds-region-mismatch-{_uuid_mod.uuid4().hex[:8]}"
+    sm_name = f"sdk-rds-region-mismatch-{_uuid_mod.uuid4().hex[:8]}"
+    sm_arn = None
+
+    try:
+        cluster = west_rds.create_db_cluster(
+            DBClusterIdentifier=cluster_id,
+            Engine="aurora-mysql",
+            MasterUsername="admin",
+            MasterUserPassword="password123",
+        )["DBCluster"]
+
+        definition = json.dumps({
+            "StartAt": "DescribeForeignRegionArn",
+            "States": {
+                "DescribeForeignRegionArn": {
+                    "Type": "Task",
+                    "Resource": "arn:aws:states:::aws-sdk:rds:DescribeDBClusters",
+                    "Parameters": {
+                        "DBClusterIdentifier": cluster["DBClusterArn"],
+                    },
+                    "End": True,
+                },
+            },
+        })
+        sm_arn = sfn_sync.create_state_machine(
+            name=sm_name,
+            definition=definition,
+            roleArn="arn:aws:iam::000000000000:role/sfn-role",
+        )["stateMachineArn"]
+
+        resp = sfn_sync.start_sync_execution(
+            stateMachineArn=sm_arn,
+            input=json.dumps({}),
+        )
+        assert resp["status"] == "FAILED"
+        assert resp.get("error") == "Rds.RdsException"
+    finally:
+        if sm_arn:
+            sfn_sync.delete_state_machine(stateMachineArn=sm_arn)
+        try:
+            west_rds.delete_db_cluster(
+                DBClusterIdentifier=cluster_id,
+                SkipFinalSnapshot=True,
+            )
+        except ClientError:
+            pass
+
+
+def test_sfn_aws_sdk_rds_global_not_found_error_uses_aws_name(sfn, sfn_sync):
+    sm_name = f"sdk-rds-global-notfound-{_uuid_mod.uuid4().hex[:8]}"
+
+    definition = json.dumps({
+        "StartAt": "DescribeMissing",
+        "States": {
+            "DescribeMissing": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::aws-sdk:rds:DescribeGlobalClusters",
+                "Parameters": {
+                    "GlobalClusterIdentifier": "this-global-cluster-does-not-exist",
+                },
+                "End": True,
+            },
+        },
+    })
+    sm_arn = sfn_sync.create_state_machine(
+        name=sm_name,
+        definition=definition,
+        roleArn="arn:aws:iam::000000000000:role/sfn-role",
+    )["stateMachineArn"]
+
+    resp = sfn_sync.start_sync_execution(stateMachineArn=sm_arn, input=json.dumps({}))
+    assert resp["status"] == "FAILED"
+    assert resp.get("error") == "Rds.GlobalClusterNotFoundException"
+
+    sfn_sync.delete_state_machine(stateMachineArn=sm_arn)
+
+
+def test_sfn_aws_sdk_rds_switchover_missing_global_uses_aws_name(sfn_sync):
+    sm_name = f"sdk-rds-switch-notfound-{_uuid_mod.uuid4().hex[:8]}"
+
+    definition = json.dumps({
+        "StartAt": "SwitchMissing",
+        "States": {
+            "SwitchMissing": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::aws-sdk:rds:switchoverGlobalCluster",
+                "Parameters": {
+                    "GlobalClusterIdentifier": "this-global-cluster-does-not-exist",
+                    "TargetDbClusterIdentifier": "arn:aws:rds:us-east-1:000000000000:cluster:missing-secondary",
+                },
+                "End": True,
+            },
+        },
+    })
+    sm_arn = sfn_sync.create_state_machine(
+        name=sm_name,
+        definition=definition,
+        roleArn="arn:aws:iam::000000000000:role/sfn-role",
+    )["stateMachineArn"]
+
+    resp = sfn_sync.start_sync_execution(stateMachineArn=sm_arn, input=json.dumps({}))
+    assert resp["status"] == "FAILED"
+    assert resp.get("error") == "Rds.GlobalClusterNotFoundException"
+
+    sfn_sync.delete_state_machine(stateMachineArn=sm_arn)
+
 
 def test_sfn_start_sync_execution(sfn_sync):
     import uuid as _uuid
@@ -2437,6 +3043,49 @@ def test_sfn_integration_lambda_invoke(sfn, lam):
     assert desc["status"] == "SUCCEEDED"
     output = json.loads(desc["output"])
     assert output["result"]["doubled"] == 42
+
+
+def test_sfn_lambda_invoke_missing_non_arn_qualifier_fails(sfn, lam):
+    import uuid as _uuid
+
+    fn = f"sfn-lam-missing-alias-{_uuid.uuid4().hex[:8]}"
+    code = "def handler(event, context):\n    return {'called': True}\n"
+    lam.create_function(
+        FunctionName=fn,
+        Runtime="python3.12",
+        Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _make_zip(code)},
+    )
+
+    definition = json.dumps(
+        {
+            "StartAt": "InvokeLambda",
+            "States": {
+                "InvokeLambda": {
+                    "Type": "Task",
+                    "Resource": "arn:aws:states:::lambda:invoke",
+                    "Parameters": {
+                        "FunctionName": f"{fn}:missingAlias",
+                        "Payload": {},
+                    },
+                    "End": True,
+                }
+            },
+        }
+    )
+    sm = sfn.create_state_machine(
+        name=f"sfn-lam-missing-alias-{_uuid.uuid4().hex[:8]}",
+        definition=definition,
+        roleArn="arn:aws:iam::000000000000:role/R",
+    )
+    ex = sfn.start_execution(stateMachineArn=sm["stateMachineArn"], input="{}")
+
+    desc = _wait_sfn(sfn, ex["executionArn"], timeout=10)
+    assert desc["status"] == "FAILED"
+    assert desc["error"] == "Lambda.ResourceNotFoundException"
+    assert fn in desc["cause"]
+
 
 def test_sfn_choice_state(sfn):
     """Choice state routes to correct branch based on input."""
@@ -4602,10 +5251,10 @@ def test_sfn_execution_proceeds_under_non_default_account_id():
 
     When a caller uses a 12-digit access-key as their account ID (the
     documented per-account-isolation pattern), the execution record is stored
-    in AccountScopedDict under that account. Without contextvars propagation
-    into the threading.Thread that runs _run_execution, the worker thread
-    looks up the execution under the default account and silently returns,
-    leaving the execution stuck at ExecutionStarted forever.
+    under that account and region. Without contextvars propagation into the
+    threading.Thread that runs _run_execution, the worker thread looks up the
+    execution under the default scope and silently returns, leaving the
+    execution stuck at ExecutionStarted forever.
 
     Regression for #639. The fix wraps the background thread target with
     contextvars.copy_context().run so the request's account/region context

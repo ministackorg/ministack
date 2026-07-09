@@ -21,6 +21,7 @@ import os
 import threading
 import time
 
+from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.responses import (
     AccountScopedDict,
     error_response_json,
@@ -116,6 +117,64 @@ def _route_to_shard(hash_key_int: int, stream: dict) -> str:
     return next(iter(stream["shards"]))
 
 
+def _kinesis_resource_tail(value, resource_type):
+    try:
+        spec = parse_arn(value)
+    except ArnParseError:
+        return None
+    if (
+        spec.partition != "aws"
+        or spec.service != "kinesis"
+        or spec.region != get_region()
+        or spec.account_id != get_account_id()
+    ):
+        return None
+    prefix = f"{resource_type}/"
+    if not spec.resource.startswith(prefix):
+        return None
+    tail = spec.resource[len(prefix):]
+    return tail or None
+
+
+def _stream_name_from_arn(stream_arn):
+    tail = _kinesis_resource_tail(stream_arn, "stream")
+    if not tail or "/" in tail:
+        return None
+    return tail
+
+
+def _resolve_stream_by_arn(stream_arn):
+    name = _stream_name_from_arn(stream_arn)
+    if not name:
+        return None
+    stream = _streams.get(name)
+    if stream and stream.get("StreamARN") == stream_arn:
+        return stream
+    return None
+
+
+def _consumer_from_arn(consumer_arn):
+    tail = _kinesis_resource_tail(consumer_arn, "stream")
+    if not tail:
+        return None
+    parts = tail.split("/")
+    if len(parts) != 3 or parts[1] != "consumer" or not parts[0] or not parts[2]:
+        return None
+    return _consumers.get(consumer_arn)
+
+
+def _consumer_by_stream_and_name(stream_arn, consumer_name):
+    if not _resolve_stream_by_arn(stream_arn):
+        return None
+    return next(
+        (
+            c for c in _consumers.values()
+            if c["StreamARN"] == stream_arn and c["ConsumerName"] == consumer_name
+        ),
+        None,
+    )
+
+
 def _expire_records(stream):
     cutoff = time.time() - stream["RetentionPeriodHours"] * 3600
     for shard in stream["shards"].values():
@@ -141,9 +200,9 @@ def _resolve_stream(data):
     if name and name in _streams:
         return name, _streams[name]
     if arn:
-        for n, s in _streams.items():
-            if s["StreamARN"] == arn:
-                return n, s
+        stream = _resolve_stream_by_arn(arn)
+        if stream:
+            return stream["StreamName"], stream
     return name or arn, None
 
 
@@ -159,7 +218,7 @@ def put_record_internal(stream_arn: str, partition_key: str, data: bytes) -> boo
     or not ACTIVE (matches AWS behaviour where delivery to a disabled
     destination is dropped without surfacing an error on the writer).
     """
-    stream = next((s for s in _streams.values() if s.get("StreamARN") == stream_arn), None)
+    stream = _resolve_stream_by_arn(stream_arn)
     if not stream or stream.get("StreamStatus") != "ACTIVE":
         return False
     _expire_records(stream)
@@ -859,7 +918,7 @@ def _register_consumer(data):
     if not stream_arn or not consumer_name:
         return error_response_json("ValidationException",
                                    "StreamARN and ConsumerName are required", 400)
-    stream = next((s for s in _streams.values() if s["StreamARN"] == stream_arn), None)
+    stream = _resolve_stream_by_arn(stream_arn)
     if not stream:
         return error_response_json("ResourceNotFoundException",
                                    f"Stream with ARN {stream_arn} not found", 400)
@@ -890,15 +949,15 @@ def _deregister_consumer(data):
     stream_arn = data.get("StreamARN")
     consumer_name = data.get("ConsumerName")
     if consumer_arn:
-        if consumer_arn not in _consumers:
+        consumer = _consumer_from_arn(consumer_arn)
+        if not consumer:
             return error_response_json("ResourceNotFoundException", "Consumer not found", 400)
-        del _consumers[consumer_arn]
+        del _consumers[consumer["ConsumerARN"]]
     elif stream_arn and consumer_name:
-        found = next((a for a, c in _consumers.items()
-                       if c["StreamARN"] == stream_arn and c["ConsumerName"] == consumer_name), None)
-        if not found:
+        consumer = _consumer_by_stream_and_name(stream_arn, consumer_name)
+        if not consumer:
             return error_response_json("ResourceNotFoundException", "Consumer not found", 400)
-        del _consumers[found]
+        del _consumers[consumer["ConsumerARN"]]
     else:
         return error_response_json("ValidationException",
                                    "ConsumerARN or StreamARN+ConsumerName required", 400)
@@ -909,6 +968,8 @@ def _list_consumers(data):
     stream_arn = data.get("StreamARN")
     if not stream_arn:
         return error_response_json("ValidationException", "StreamARN is required", 400)
+    if not _resolve_stream_by_arn(stream_arn):
+        return error_response_json("ResourceNotFoundException", f"Stream with ARN {stream_arn} not found", 400)
     max_results = data.get("MaxResults", 100)
     next_token = data.get("NextToken")
 
@@ -939,13 +1000,9 @@ def _describe_stream_consumer(data):
 
     consumer = None
     if consumer_arn:
-        consumer = _consumers.get(consumer_arn)
+        consumer = _consumer_from_arn(consumer_arn)
     elif stream_arn and consumer_name:
-        consumer = next(
-            (c for c in _consumers.values()
-             if c["StreamARN"] == stream_arn and c["ConsumerName"] == consumer_name),
-            None,
-        )
+        consumer = _consumer_by_stream_and_name(stream_arn, consumer_name)
 
     if not consumer:
         return error_response_json("ResourceNotFoundException", "Consumer not found", 400)

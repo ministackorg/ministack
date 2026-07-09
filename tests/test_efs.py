@@ -99,6 +99,53 @@ def test_efs_tags(efs):
     assert "env" not in keys
     assert "team" in keys
 
+
+def test_efs_access_point_tags_accept_arn(efs):
+    fs = efs.create_file_system(CreationToken=f"ap-tags-{_uuid_mod.uuid4().hex[:8]}")
+    ap = efs.create_access_point(FileSystemId=fs["FileSystemId"])
+    ap_arn = ap["AccessPointArn"]
+
+    efs.tag_resource(ResourceId=ap_arn, Tags=[{"Key": "team", "Value": "data"}])
+
+    tags_resp = efs.list_tags_for_resource(ResourceId=ap_arn)
+    tag_map = {t["Key"]: t["Value"] for t in tags_resp["Tags"]}
+    assert tag_map["team"] == "data"
+
+
+def test_efs_tag_resource_rejects_invalid_arns(efs):
+    fs = efs.create_file_system(CreationToken=f"invalid-tags-{_uuid_mod.uuid4().hex[:8]}")
+    fs_arn = fs["FileSystemArn"]
+    ap = efs.create_access_point(FileSystemId=fs["FileSystemId"])
+    invalid_cases = [
+        ("not-an-arn", "BadRequest"),
+        (fs_arn.replace(":elasticfilesystem:", ":s3:"), "BadRequest"),
+        (fs_arn.replace(":000000000000:", ":111111111111:"), "FileSystemNotFound"),
+        (fs_arn.replace(":us-east-1:", ":us-west-2:"), "FileSystemNotFound"),
+        (f"arn:aws:elasticfilesystem:us-east-1:000000000000:mount-target/{fs['FileSystemId']}", "BadRequest"),
+        (f"arn:aws:elasticfilesystem:us-east-1:000000000000:file-system/{ap['AccessPointId']}", "BadRequest"),
+        (f"arn:aws:elasticfilesystem:us-east-1:000000000000:access-point/{fs['FileSystemId']}", "BadRequest"),
+    ]
+
+    for bad_resource_id, expected_code in invalid_cases:
+        with pytest.raises(ClientError) as exc:
+            efs.tag_resource(ResourceId=bad_resource_id, Tags=[{"Key": "bad", "Value": "value"}])
+        assert exc.value.response["Error"]["Code"] == expected_code
+
+    tags_resp = efs.list_tags_for_resource(ResourceId=fs_arn)
+    tag_map = {t["Key"]: t["Value"] for t in tags_resp["Tags"]}
+    assert "bad" not in tag_map
+
+
+def test_efs_list_and_untag_reject_invalid_arns(efs):
+    for operation, kwargs in [
+        (efs.list_tags_for_resource, {}),
+        (efs.untag_resource, {"TagKeys": ["missing"]}),
+    ]:
+        with pytest.raises(ClientError) as exc:
+            operation(ResourceId="arn:aws:s3:us-east-1:000000000000:file-system/fs-1234567890abcdef0", **kwargs)
+        assert exc.value.response["Error"]["Code"] == "BadRequest"
+
+
 def test_efs_lifecycle_configuration(efs):
     fs = efs.create_file_system()
     fs_id = fs["FileSystemId"]

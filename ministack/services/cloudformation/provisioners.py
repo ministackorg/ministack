@@ -726,8 +726,7 @@ def _ssm_create(logical_id, props, stack_name):
     ptype = props.get("Type", "String")
     value = props.get("Value", "")
     description = props.get("Description", "")
-    # ARN: no extra slash if name starts with /
-    param_arn = f"arn:aws:ssm:{get_region()}:{get_account_id()}:parameter{name}"
+    param_arn = _ssm._param_arn(name)
 
     _ssm._parameters[name] = {
         "Name": name,
@@ -1267,19 +1266,38 @@ def _kinesis_stream_delete(physical_id, props):
 
 # --- Lambda Permission ---
 
+def _lambda_function_for_cfn_ref(function_ref: str) -> tuple[dict | None, str, str, str | None]:
+    if isinstance(function_ref, str) and function_ref.startswith("arn:"):
+        name, qualifier = _lambda_svc._resolve_request_scoped_name_and_qualifier(function_ref)
+        if name == function_ref:
+            return None, function_ref, function_ref, None
+        func = _lambda_svc._functions.get(name)
+        if not _lambda_svc._function_qualifier_exists(func, qualifier):
+            return None, function_ref, function_ref, qualifier
+    else:
+        name, qualifier = _lambda_svc._resolve_name_and_qualifier(function_ref)
+        func = _lambda_svc._functions.get(name)
+        if func is not None and not _lambda_svc._function_qualifier_exists(func, qualifier):
+            return None, function_ref, function_ref, qualifier
+
+    if func is None:
+        return None, function_ref, function_ref, qualifier
+
+    resource_arn = func["config"]["FunctionArn"]
+    if qualifier:
+        resource_arn = f"{resource_arn}:{qualifier}"
+    return func, name, resource_arn, qualifier
+
+
 def _lambda_permission_create(logical_id, props, stack_name):
-    func_name = props.get("FunctionName", "")
-    # Resolve ARN to function name
-    if func_name.startswith("arn:"):
-        func_name = func_name.rsplit(":", 1)[-1]
-    func = _lambda_svc._functions.get(func_name)
+    func, _func_name, resource_arn, _qualifier = _lambda_function_for_cfn_ref(props.get("FunctionName", ""))
     if func:
         stmt = {
             "Sid": props.get("Id") or logical_id,
             "Effect": "Allow",
             "Principal": props.get("Principal", "*"),
             "Action": props.get("Action", "lambda:InvokeFunction"),
-            "Resource": func["config"]["FunctionArn"],
+            "Resource": resource_arn,
         }
         source_arn = props.get("SourceArn")
         if source_arn:
@@ -1290,10 +1308,7 @@ def _lambda_permission_create(logical_id, props, stack_name):
 
 
 def _lambda_permission_delete(physical_id, props):
-    func_name = props.get("FunctionName", "")
-    if func_name.startswith("arn:"):
-        func_name = func_name.rsplit(":", 1)[-1]
-    func = _lambda_svc._functions.get(func_name)
+    func, _func_name, _resource_arn, _qualifier = _lambda_function_for_cfn_ref(props.get("FunctionName", ""))
     if func:
         sid = props.get("Id") or ""
         func["policy"]["Statement"] = [
@@ -1304,10 +1319,7 @@ def _lambda_permission_delete(physical_id, props):
 # --- Lambda Version ---
 
 def _lambda_version_create(logical_id, props, stack_name):
-    func_name = props.get("FunctionName", "")
-    if func_name.startswith("arn:"):
-        func_name = func_name.rsplit(":", 1)[-1]
-    func = _lambda_svc._functions.get(func_name)
+    func, func_name, _resource_arn, _qualifier = _lambda_function_for_cfn_ref(props.get("FunctionName", ""))
     if func:
         import copy
         ver_num = func["next_version"]
@@ -1884,17 +1896,16 @@ def _apigw_account_delete(physical_id, props):
 # --- Lambda EventSourceMapping ---
 
 def _lambda_esm_create(logical_id, props, stack_name):
-    func_name, qualifier = _lambda_svc._resolve_name_and_qualifier(
-        props.get("FunctionName", "")
-    )
+    func, func_name, resource_arn, qualifier = _lambda_function_for_cfn_ref(props.get("FunctionName", ""))
     esm_id = new_uuid()
-    func = _lambda_svc._functions.get(func_name)
-    func_arn = func["config"]["FunctionArn"] if func else f"arn:aws:lambda:{get_region()}:{get_account_id()}:function:{func_name}"
+    func_arn = resource_arn if func else f"arn:aws:lambda:{get_region()}:{get_account_id()}:function:{func_name}"
 
     esm = {
         "UUID": esm_id,
         "EventSourceArn": props.get("EventSourceArn", ""),
-        "FunctionArn": func_arn + (f":{qualifier}" if qualifier else ""),
+        # resource_arn from _lambda_function_for_cfn_ref already carries the
+        # qualifier — do not re-append it (that double-suffixed ":live:live").
+        "FunctionArn": func_arn,
         "FunctionName": func_name,
         "Qualifier": qualifier,
         "State": "Enabled",
@@ -2007,13 +2018,10 @@ def _pipes_pipe_delete(physical_id, props):
 # --- Lambda Alias ---
 
 def _lambda_alias_create(logical_id, props, stack_name):
-    func_name = props.get("FunctionName", "")
-    if func_name.startswith("arn:"):
-        func_name = func_name.rsplit(":", 1)[-1]
+    func, func_name, _resource_arn, _qualifier = _lambda_function_for_cfn_ref(props.get("FunctionName", ""))
     alias_name = props.get("Name", "")
     func_version = props.get("FunctionVersion", "$LATEST")
 
-    func = _lambda_svc._functions.get(func_name)
     if func:
         alias = {
             "AliasArn": f"arn:aws:lambda:{get_region()}:{get_account_id()}:function:{func_name}:{alias_name}",
@@ -2033,11 +2041,8 @@ def _lambda_alias_create(logical_id, props, stack_name):
 
 
 def _lambda_alias_delete(physical_id, props):
-    func_name = props.get("FunctionName", "")
-    if func_name.startswith("arn:"):
-        func_name = func_name.rsplit(":", 1)[-1]
+    func, _func_name, _resource_arn, _qualifier = _lambda_function_for_cfn_ref(props.get("FunctionName", ""))
     alias_name = props.get("Name", "")
-    func = _lambda_svc._functions.get(func_name)
     if func:
         func["aliases"].pop(alias_name, None)
 
@@ -2497,12 +2502,14 @@ def _kms_key_delete(physical_id, props):
 def _kms_alias_create(logical_id, props, stack_name):
     alias_name = props.get("AliasName", f"alias/{stack_name}-{logical_id}")
     target_key = props.get("TargetKeyId", "")
-    _kms._aliases[alias_name] = target_key
+    rec = _kms._resolve_key(target_key)
+    alias_arn = _kms._alias_arn(alias_name)
+    _kms._aliases[alias_arn] = rec["KeyId"] if rec else target_key
     return alias_name, {}
 
 
 def _kms_alias_delete(physical_id, props):
-    _kms._aliases.pop(physical_id, None)
+    _kms._aliases.pop(_kms._alias_arn(physical_id), None)
 
 
 # --- EC2 resource provisioners ---
@@ -2978,7 +2985,7 @@ def _elbv2_listener_create(logical_id, props, stack_name):
 
     listener_id = _alb._short_id()
     lb_name = lb["LoadBalancerName"]
-    lb_id = lb_arn.split("/")[-1]
+    lb_id = _alb._load_balancer_id_from_arn(lb_arn)
     listener_arn = (
         f"arn:aws:elasticloadbalancing:{get_region()}:{get_account_id()}:"
         f"listener/app/{lb_name}/{lb_id}/{listener_id}"
@@ -3278,7 +3285,11 @@ def _elbv2_target_group_create(logical_id, props, stack_name):
         {"Key": "stickiness.enabled", "Value": "false"},
         {"Key": "stickiness.type", "Value": "lb_cookie"},
     ]
-    return arn, {"TargetGroupArn": arn, "TargetGroupName": name, "TargetGroupFullName": arn.split(":targetgroup/", 1)[-1]}
+    return arn, {
+        "TargetGroupArn": arn,
+        "TargetGroupName": name,
+        "TargetGroupFullName": _alb._target_group_full_name_from_arn(arn),
+    }
 
 
 def _elbv2_target_group_delete(physical_id, props):
@@ -3329,8 +3340,8 @@ def _elbv2_listener_rule_create(logical_id, props, stack_name):
     listener = _alb._listeners[l_arn]
     lb_arn = listener["LoadBalancerArn"]
     lb_name = _alb._lbs[lb_arn]["LoadBalancerName"]
-    lb_id = lb_arn.split("/")[-1]
-    l_id = l_arn.split("/")[-1]
+    lb_id = _alb._load_balancer_id_from_arn(lb_arn)
+    l_id = _alb._listener_id_from_arn(l_arn)
     import random as _random
     import string as _string
     rule_id = "".join(_random.choices(_string.ascii_lowercase + _string.digits, k=16))
@@ -3616,6 +3627,7 @@ def _apigw_v2_api_create(logical_id, props, stack_name):
     if props.get("CorsConfiguration"):
         api["corsConfiguration"] = props["CorsConfiguration"]
     _apigw_v2._apis[api_id] = api
+    _apigw_v2._api_regions[api_id] = get_region()
     _apigw_v2._routes[api_id] = {}
     _apigw_v2._integrations[api_id] = {}
     _apigw_v2._stages[api_id] = {}
@@ -3625,6 +3637,7 @@ def _apigw_v2_api_create(logical_id, props, stack_name):
 
 def _apigw_v2_api_delete(physical_id, props):
     _apigw_v2._apis.pop(physical_id, None)
+    _apigw_v2._api_regions.pop(physical_id, None)
     _apigw_v2._routes.pop(physical_id, None)
     _apigw_v2._integrations.pop(physical_id, None)
     _apigw_v2._stages.pop(physical_id, None)

@@ -15,6 +15,7 @@ import logging
 import os
 import time
 
+from ministack.core.arn import ArnParseError, is_arn, parse_arn
 from ministack.core.persistence import PERSIST_STATE, load_state
 from ministack.core.responses import (
     AccountScopedDict,
@@ -74,6 +75,30 @@ def _project_arn(name):
 
 def _build_arn(build_id):
     return f"arn:aws:codebuild:{get_region()}:{get_account_id()}:build/{build_id}"
+
+
+def _project_name_from_identifier(value):
+    """Resolve a project name for BatchGetProjects-style not-found semantics."""
+    if not is_arn(value):
+        return value
+    try:
+        spec = parse_arn(value)
+    except ArnParseError:
+        return None
+
+    if (
+        spec.partition != "aws"
+        or spec.service != "codebuild"
+        or spec.region != get_region()
+        or spec.account_id != get_account_id()
+    ):
+        return None
+
+    prefix = "project/"
+    if not spec.resource.startswith(prefix):
+        return None
+    project_name = spec.resource[len(prefix):]
+    return project_name or None
 
 
 def _build_id(project_name):
@@ -217,8 +242,8 @@ def _batch_get_projects(data):
     found = []
     not_found = []
     for name in names:
-        lookup = name.rsplit("/", 1)[-1] if name.startswith("arn:aws:codebuild:") else name
-        project = _projects.get(lookup)
+        lookup = _project_name_from_identifier(name)
+        project = _projects.get(lookup) if lookup else None
         if project:
             found.append(_project_shape(project))
         else:

@@ -21,6 +21,7 @@ import socket
 import threading
 import time
 
+from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountScopedDict,
@@ -86,6 +87,34 @@ try:
         restore_state(_restored)
 except Exception:
     logger.exception("Failed to restore persisted state; continuing with fresh store")
+
+
+def _s3_bucket_from_arn(bucket_arn: str) -> str:
+    try:
+        spec = parse_arn(bucket_arn)
+    except ArnParseError as exc:
+        raise ValueError("SourceBucketArn must be an S3 bucket ARN.") from exc
+
+    if (
+        spec.service != "s3"
+        or spec.region
+        or spec.account_id
+        or not spec.resource
+        or "/" in spec.resource
+        or ":" in spec.resource
+    ):
+        raise ValueError("SourceBucketArn must be an S3 bucket ARN.")
+    return spec.resource
+
+
+def _validate_source_bucket_arn(bucket_arn: str):
+    if not bucket_arn:
+        return None
+    try:
+        _s3_bucket_from_arn(bucket_arn)
+    except ValueError as exc:
+        return error_response_json("ValidationException", str(exc), 400)
+    return None
 
 
 def _get_docker():
@@ -180,7 +209,7 @@ def _sync_dags_from_s3(env, docker_client, container):
     try:
         from ministack.services import s3 as s3_svc
         bucket_arn = env.get("SourceBucketArn", "")
-        bucket_name = bucket_arn.split(":")[-1] if bucket_arn else ""
+        bucket_name = _s3_bucket_from_arn(bucket_arn) if bucket_arn else ""
         dag_path = env.get("DagS3Path", "dags/")
 
         if not bucket_name:
@@ -381,6 +410,10 @@ def _create_environment(method, path, headers, body, query_params):
 
     account_id = get_account_id()
     region = get_region()
+    source_bucket_arn = data.get("SourceBucketArn", "")
+    validation_error = _validate_source_bucket_arn(source_bucket_arn)
+    if validation_error:
+        return validation_error
 
     env = {
         "Name": name,
@@ -389,7 +422,7 @@ def _create_environment(method, path, headers, body, query_params):
         "AirflowVersion": data.get("AirflowVersion", "3.0.6"),
         "EnvironmentClass": data.get("EnvironmentClass", "mw1.small"),
         "WebserverAccessMode": data.get("WebserverAccessMode", "PUBLIC_ONLY"),
-        "SourceBucketArn": data.get("SourceBucketArn", ""),
+        "SourceBucketArn": source_bucket_arn,
         "DagS3Path": data.get("DagS3Path", "dags/"),
         "ExecutionRoleArn": data.get("ExecutionRoleArn", ""),
         "NetworkConfiguration": data.get("NetworkConfiguration", {}),
@@ -455,6 +488,11 @@ def _update_environment(method, path, headers, body, query_params):
     if not env:
         return error_response_json("ResourceNotFoundException",
                                    f"Environment {name} not found", 404)
+
+    if "SourceBucketArn" in data:
+        validation_error = _validate_source_bucket_arn(data["SourceBucketArn"])
+        if validation_error:
+            return validation_error
 
     for field in ("AirflowConfigurationOptions", "LoggingConfiguration",
                   "MaxWorkers", "MinWorkers", "Schedulers",

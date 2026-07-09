@@ -20,26 +20,30 @@ from collections import defaultdict
 from datetime import datetime, timezone
 from urllib.parse import parse_qs
 
+from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.persistence import PERSIST_STATE, load_state
-from ministack.core.responses import AccountScopedDict, get_account_id, get_region, new_uuid
+from ministack.core.responses import AccountRegionScopedDict, AccountScopedDict, get_account_id, get_region, new_uuid
 
 logger = logging.getLogger("cloudwatch")
 
 REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 TWO_WEEKS_SECONDS = 14 * 24 * 3600
 
-# Per-tenant metric store — keyed by (namespace, metric_name, dims_key) per
-# account via AccountScopedDict so GetMetricStatistics / ListMetrics from one
-# account cannot see another account's data points.
-_metrics = AccountScopedDict()
-_alarms = AccountScopedDict()
-_composite_alarms = AccountScopedDict()
-# Alarm state-change history, per-account. Stored as AccountScopedDict under
-# a single key "entries" so the standard list manipulation still applies to
-# the caller's tenant only.
-_alarm_history = AccountScopedDict()
-_resource_tags = AccountScopedDict()
-_dashboards = AccountScopedDict()  # dashboard_name -> {DashboardName, DashboardBody, LastModified}
+# Per-tenant, per-region metric store — keyed by (namespace, metric_name,
+# dims_key) via AccountRegionScopedDict so regional CloudWatch clients do not
+# see metrics emitted in another AWS region.
+_metrics = AccountRegionScopedDict()
+# Alarms and dashboards are region-specific in AWS — region-scope them so a
+# client in one region can't see/collide with another region's resources.
+# Alarms/composite alarms migrate region from their AlarmArn on legacy load;
+# dashboards/history have no ARN so legacy data lands in the default region.
+_alarms = AccountRegionScopedDict()
+_composite_alarms = AccountRegionScopedDict()
+# Alarm state-change history, per-account+region. Stored under a single key
+# "entries" so the standard list manipulation still applies to the caller's scope.
+_alarm_history = AccountRegionScopedDict()
+_resource_tags = AccountScopedDict()  # ARN-keyed; region is in the ARN
+_dashboards = AccountRegionScopedDict()  # dashboard_name -> {DashboardName, DashboardBody, LastModified}
 
 
 def _metric_bucket(key: tuple) -> list:
@@ -57,6 +61,46 @@ def _history_entries() -> list:
         entries = []
         _alarm_history["entries"] = entries
     return entries
+
+
+def _alarm_name_from_local_arn(arn):
+    try:
+        spec = parse_arn(arn)
+    except ArnParseError:
+        return None
+    if spec.service != "cloudwatch" or spec.account_id != get_account_id() or spec.region != get_region():
+        return None
+    prefix = "alarm:"
+    if not spec.resource.startswith(prefix):
+        return None
+    name = spec.resource[len(prefix):]
+    return name or None
+
+
+def _validate_alarm_tag_arn(arn, is_json=False, is_cbor=False):
+    alarm_name = _alarm_name_from_local_arn(arn)
+    alarm = _alarms.get(alarm_name) if alarm_name else None
+    if not alarm:
+        alarm = _composite_alarms.get(alarm_name) if alarm_name else None
+    if not alarm or alarm.get("AlarmArn") != arn:
+        return _error(
+            "ResourceNotFound",
+            f"Alarm resource {arn} not found",
+            404,
+            use_json=is_json,
+            use_cbor=is_cbor,
+        )
+    return None
+
+
+def _is_sns_action_arn(action):
+    if not isinstance(action, str):
+        return False
+    try:
+        spec = parse_arn(action)
+    except ArnParseError:
+        return False
+    return spec.service == "sns" and spec.account_id == get_account_id() and spec.region == get_region()
 
 
 # ── Persistence ────────────────────────────────────────────
@@ -296,7 +340,7 @@ def _dispatch_alarm_actions(alarm, old_state, new_state, reason):
     if not action_field:
         return
     actions = alarm.get(action_field) or []
-    sns_arns = [a for a in actions if isinstance(a, str) and a.startswith("arn:aws:sns:")]
+    sns_arns = [a for a in actions if _is_sns_action_arn(a)]
     if not sns_arns:
         return
     try:
@@ -573,12 +617,20 @@ def _get_metric_statistics(params, cbor_data, is_cbor, is_json=False):
         start_time = _parse_ts(cbor_data.get("StartTime"))
         end_time = _parse_ts(cbor_data.get("EndTime"))
         req_stats = cbor_data.get("Statistics", [])
+        req_dims = _dims_from_list(cbor_data.get("Dimensions") or [])
     else:
         namespace = _p(params, "Namespace")
         metric_name = _p(params, "MetricName")
         period = int(_p(params, "Period") or 60)
         start_time = _parse_ts(_p(params, "StartTime"))
         end_time = _parse_ts(_p(params, "EndTime"))
+        req_dims = {}
+        di = 1
+        while _p(params, f"Dimensions.member.{di}.Name"):
+            req_dims[_p(params, f"Dimensions.member.{di}.Name")] = _p(
+                params, f"Dimensions.member.{di}.Value"
+            )
+            di += 1
         req_stats = []
         si = 1
         while _p(params, f"Statistics.member.{si}"):
@@ -589,8 +641,11 @@ def _get_metric_statistics(params, cbor_data, is_cbor, is_json=False):
         req_stats = ["SampleCount", "Sum", "Average", "Minimum", "Maximum"]
 
     all_points = []
-    for (ns, mn, _), pts in _metrics.items():
+    req_dims_key = _dims_key(req_dims) if req_dims else None
+    for (ns, mn, dk), pts in _metrics.items():
         if ns == namespace and mn == metric_name:
+            if req_dims_key is not None and dk != req_dims_key:
+                continue
             all_points.extend(pts)
 
     if start_time is not None:
@@ -1254,6 +1309,10 @@ def _tag_resource(params, cbor_data, is_cbor, is_json=False):
             )
             i += 1
 
+    validation_error = _validate_alarm_tag_arn(arn, is_json=is_json, is_cbor=is_cbor)
+    if validation_error:
+        return validation_error
+
     if arn not in _resource_tags:
         _resource_tags[arn] = {}
     for t in tags:
@@ -1278,6 +1337,10 @@ def _untag_resource(params, cbor_data, is_cbor, is_json=False):
             keys.append(_p(params, f"TagKeys.member.{i}"))
             i += 1
 
+    validation_error = _validate_alarm_tag_arn(arn, is_json=is_json, is_cbor=is_cbor)
+    if validation_error:
+        return validation_error
+
     tag_map = _resource_tags.get(arn, {})
     for k in keys:
         tag_map.pop(k, None)
@@ -1294,6 +1357,10 @@ def _list_tags_for_resource(params, cbor_data, is_cbor, is_json=False):
         arn = cbor_data.get("ResourceARN", "")
     else:
         arn = _p(params, "ResourceARN")
+
+    validation_error = _validate_alarm_tag_arn(arn, is_json=is_json, is_cbor=is_cbor)
+    if validation_error:
+        return validation_error
 
     tags = [{"Key": k, "Value": v} for k, v in _resource_tags.get(arn, {}).items()]
 
@@ -1470,6 +1537,14 @@ def _list_dashboards(params, cbor_data, is_cbor, is_json=False):
 
 def _dims_key(dims: dict) -> str:
     return "|".join(f"{k}={v}" for k, v in sorted(dims.items()))
+
+
+def _dims_from_list(dimensions: list[dict]) -> dict:
+    return {
+        d["Name"]: d.get("Value", "")
+        for d in dimensions
+        if isinstance(d, dict) and d.get("Name")
+    }
 
 
 def _p(params, key, default=""):

@@ -449,6 +449,22 @@ def test_cloudfront_tags(cloudfront):
     assert "team" not in tag_keys
 
 
+@pytest.mark.parametrize(
+    ("arn", "code"),
+    [
+        ("not-an-arn", "InvalidArgument"),
+        ("arn:aws:sqs::000000000000:distribution/missing", "InvalidArgument"),
+        ("arn:aws:cloudfront:us-east-1:000000000000:distribution/missing", "InvalidArgument"),
+        ("arn:aws:cloudfront::000000000000:distribution/missing", "NoSuchDistribution"),
+    ],
+)
+def test_cloudfront_tag_resource_requires_local_cloudfront_arn(cloudfront, arn, code):
+    with pytest.raises(ClientError) as exc:
+        cloudfront.tag_resource(Resource=arn, Tags={"Items": [{"Key": "env", "Value": "test"}]})
+
+    assert exc.value.response["Error"]["Code"] == code
+
+
 # ---------------------------------------------------------------------------
 # OAC happy-path integration tests
 # ---------------------------------------------------------------------------

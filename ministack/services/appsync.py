@@ -24,6 +24,7 @@ import os
 import re
 import time
 
+from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.persistence import PERSIST_STATE, load_state
 from ministack.core.responses import (
     AccountScopedDict,
@@ -72,6 +73,29 @@ def _now():
 
 def _api_arn(api_id):
     return f"arn:aws:appsync:{get_region()}:{get_account_id()}:apis/{api_id}"
+
+
+def _api_id_from_local_arn(arn):
+    try:
+        spec = parse_arn(arn)
+    except ArnParseError:
+        return None
+    if spec.service != "appsync" or spec.account_id != get_account_id() or spec.region != get_region():
+        return None
+
+    prefix = "apis/"
+    if not spec.resource.startswith(prefix):
+        return None
+    api_id = spec.resource[len(prefix):]
+    return api_id if api_id and "/" not in api_id else None
+
+
+def _validate_tag_resource_arn(arn):
+    api_id = _api_id_from_local_arn(arn)
+    api = _apis.get(api_id) if api_id else None
+    if not api or api.get("arn") != arn:
+        return error_response_json("NotFoundException", f"GraphQL API {api_id or arn} not found", 404)
+    return None
 
 
 def _json(status, body):
@@ -442,11 +466,17 @@ def _list_types(api_id, query_params):
 def _tag_resource(body):
     arn = body.get("resourceArn", "")
     tags = body.get("tags", {})
+    validation_error = _validate_tag_resource_arn(arn)
+    if validation_error:
+        return validation_error
     _tags.setdefault(arn, {}).update(tags)
     return _json(200, {})
 
 
 def _untag_resource(arn, query_params):
+    validation_error = _validate_tag_resource_arn(arn)
+    if validation_error:
+        return validation_error
     tag_keys = query_params.get("tagKeys", [])
     if isinstance(tag_keys, str):
         tag_keys = [tag_keys]
@@ -457,6 +487,9 @@ def _untag_resource(arn, query_params):
 
 
 def _list_tags_for_resource(arn):
+    validation_error = _validate_tag_resource_arn(arn)
+    if validation_error:
+        return validation_error
     tags = _tags.get(arn, {})
     return _json(200, {"tags": tags})
 
@@ -714,10 +747,9 @@ def _invoke_lambda_authorizer(
 
     import ministack.services.lambda_svc as _lambda_svc
 
-    func_name = func_arn.rsplit(":", 1)[-1]
-    func = _lambda_svc._functions.get(func_name)
-    if not func:
-        logger.warning("Lambda authorizer %s not found in ministack", func_name)
+    func, func_config, func_name = _lambda_svc._get_func_record_for_ref(func_arn)
+    if not func or not func_config:
+        logger.warning("Lambda authorizer %s not found in ministack", func_arn)
         raise _AuthorizerRejected("authorizer Lambda not found")
 
     # AWS-verified authorizer event shape — apiId / accountId / requestId /
@@ -737,7 +769,8 @@ def _invoke_lambda_authorizer(
     }
 
     try:
-        result = _lambda_svc._execute_function(func, authorizer_event)
+        exec_record = _lambda_svc._execution_record_for_config(func, func_config)
+        result = _lambda_svc._execute_function_with_config_scope(exec_record, authorizer_event)
     except Exception as e:
         logger.warning("Lambda authorizer invocation failed: %s", e)
         raise _AuthorizerRejected("authorizer invocation failed") from e
@@ -1138,10 +1171,9 @@ def _resolve_lambda(api_id, resolver, data_source, args,
         return args or {}
 
     import ministack.services.lambda_svc as _lambda_svc
-    func_name = func_arn.rsplit(":", 1)[-1]
-    func = _lambda_svc._functions.get(func_name)
-    if not func:
-        logger.warning("Lambda function %s not found", func_name)
+    func, func_config, func_name = _lambda_svc._get_func_record_for_ref(func_arn)
+    if not func or not func_config:
+        logger.warning("Lambda function %s not found", func_arn)
         return args or {}
 
     # AWS-standard AppSync resolver event — fieldName lives only under info.
@@ -1163,7 +1195,8 @@ def _resolve_lambda(api_id, resolver, data_source, args,
         event["identity"] = identity
 
     try:
-        result = _lambda_svc._execute_function(func, event)
+        exec_record = _lambda_svc._execution_record_for_config(func, func_config)
+        result = _lambda_svc._execute_function_with_config_scope(exec_record, event)
     except Exception as e:
         logger.error("Lambda %s invocation failed: %s", func_name, e)
         return {"errors": [f"Lambda invocation error: {str(e)}"]}

@@ -29,6 +29,7 @@ _HOST = os.environ.get("MINISTACK_HOST", "localhost")
 _PORT = os.environ.get("GATEWAY_PORT", "4566")
 
 import ministack.services.lambda_svc as _lambda_svc
+from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.responses import AccountScopedDict, get_account_id, get_region, new_uuid
 from ministack.services import sqs as _sqs
 
@@ -48,6 +49,73 @@ def _normalize_arn(arn: str) -> str:
     if arn and _re.match(r"arn:aws:sns:[^:]+::[^:]+", arn):
         return _re.sub(r"(arn:aws:sns:[^:]+)::", rf"\1:{get_account_id()}:", arn)
     return arn
+
+
+def _sqs_queue_name_from_arn_spec(spec) -> str | None:
+    if spec.service != "sqs" or not spec.resource or ":" in spec.resource or "/" in spec.resource:
+        return None
+    return spec.resource
+
+
+def _lambda_function_name_from_arn_spec(spec) -> str | None:
+    if spec.service != "lambda":
+        return None
+    parts = spec.resource.split(":", 2)
+    if len(parts) < 2 or parts[0] != "function" or not parts[1]:
+        return None
+    return parts[1]
+
+
+def _invalid_subscription_endpoint(protocol: str, endpoint: str):
+    return _error(
+        "InvalidParameterException",
+        f"Invalid parameter: Endpoint {endpoint} is not a valid {protocol.upper()} ARN",
+        400,
+    )
+
+
+def _validate_subscription_endpoint(protocol: str, endpoint: str):
+    if protocol not in {"sqs", "lambda"}:
+        return None
+    try:
+        spec = parse_arn(endpoint)
+    except ArnParseError:
+        return _invalid_subscription_endpoint(protocol, endpoint)
+
+    if not spec.region or not spec.account_id:
+        return _invalid_subscription_endpoint(protocol, endpoint)
+    if protocol == "sqs" and not _sqs_queue_name_from_arn_spec(spec):
+        return _invalid_subscription_endpoint(protocol, endpoint)
+    if protocol == "lambda" and not _lambda_function_name_from_arn_spec(spec):
+        return _invalid_subscription_endpoint(protocol, endpoint)
+    return None
+
+
+def _resolve_topic_tag_arn(arn: str):
+    arn = _normalize_arn(arn)
+    try:
+        spec = parse_arn(arn)
+    except ArnParseError:
+        return arn, None, _error("InvalidParameterException", f"Invalid SNS topic ARN: {arn}", 400)
+
+    if (
+        spec.partition != "aws"
+        or spec.service != "sns"
+        or not spec.region
+        or not spec.account_id
+        or not spec.resource
+        or ":" in spec.resource
+        or "/" in spec.resource
+    ):
+        return arn, None, _error("InvalidParameterException", f"Invalid SNS topic ARN: {arn}", 400)
+
+    if spec.region != get_region() or spec.account_id != get_account_id():
+        return arn, None, _error("ResourceNotFoundException", "Resource not found", 404)
+
+    topic = _topics.get(arn)
+    if not topic:
+        return arn, None, _error("ResourceNotFoundException", "Resource not found", 404)
+    return arn, topic, None
 
 from ministack.core.persistence import PERSIST_STATE, load_state
 
@@ -299,6 +367,9 @@ def _subscribe(params):
 
     if not protocol:
         return _error("InvalidParameterException", "Protocol is required", 400)
+    endpoint_error = _validate_subscription_endpoint(protocol, endpoint)
+    if endpoint_error:
+        return endpoint_error
 
     for existing in topic["subscriptions"]:
         if existing["protocol"] == protocol and existing["endpoint"] == endpoint:
@@ -883,9 +954,19 @@ def _fanout(topic_arn: str, msg_id: str, message: str, subject: str,
 def _deliver_to_sqs(endpoint: str, envelope: str, raw: bool, raw_message: str,
                     message_group_id: str = "", message_dedup_id: str = "",
                     message_attributes: dict | None = None):
-    queue_name = endpoint.split(":")[-1]
-    queue_url = _sqs._queue_url(queue_name)
-    queue = _sqs._queues.get(queue_url)
+    try:
+        spec = parse_arn(endpoint)
+    except ArnParseError:
+        logger.warning("SNS fanout: invalid SQS endpoint ARN %s", endpoint)
+        return
+    queue_name = _sqs_queue_name_from_arn_spec(spec)
+    if not queue_name:
+        logger.warning("SNS fanout: invalid SQS endpoint ARN %s", endpoint)
+        return
+    if spec.account_id != get_account_id():
+        logger.warning("SNS fanout: SQS queue %s is outside the current account scope", queue_name)
+        return
+    queue = _sqs._queue_by_arn(str(spec))
     if not queue:
         logger.warning("SNS fanout: SQS queue %s not found", queue_name)
         return
@@ -921,9 +1002,8 @@ def _deliver_to_lambda(endpoint: str, envelope: str, topic_arn: str, sub_arn: st
                        msg_id: str, raw_message: str, message_attributes: dict):
     """Invoke a Lambda function with the SNS Records envelope (AWS format)."""
     # endpoint is a Lambda ARN: arn:aws:lambda:region:account:function:name
-    func_name = endpoint.split(":")[-1]
-    func = _lambda_svc._functions.get(func_name)
-    if not func:
+    func, config, func_name = _lambda_svc._get_func_record_for_ref(endpoint)
+    if not func or not config:
         logger.warning("SNS fanout: Lambda function %s not found", func_name)
         return
     event = {
@@ -937,7 +1017,8 @@ def _deliver_to_lambda(endpoint: str, envelope: str, topic_arn: str, sub_arn: st
         ]
     }
     try:
-        _lambda_svc._execute_function(func, event)
+        exec_record = _lambda_svc._execution_record_for_config(func, config)
+        _lambda_svc._execute_function_with_config_scope(exec_record, event)
         logger.info("SNS fanout → Lambda %s", func_name)
     except Exception as exc:
         logger.error("SNS fanout → Lambda %s failed: %s", func_name, exc)
@@ -950,7 +1031,7 @@ def _http_post_sync(endpoint: str, payload: str, sns_message_type: str) -> int:
     which silently skipped every HTTP subscription confirmation (#460).
 
     Handles `http://user:pass@host/path` userinfo by stripping it from the URL
-    and promoting to an Authorization: Basic header, matching real AWS SNS
+    and promoting it to the HTTP auth header, matching real AWS SNS
     behaviour for HTTP(S) endpoints with embedded credentials. urllib leaves
     userinfo in the URL by default, which would break the Host header."""
     import base64 as _b64
@@ -1016,21 +1097,20 @@ async def _send_subscription_confirmation(topic_arn: str, sub: dict):
 # ---------------------------------------------------------------------------
 
 def _list_tags_for_resource(params):
-    arn = _normalize_arn(_p(params, "ResourceArn"))
-    topic = _topics.get(arn)
+    arn, topic, err = _resolve_topic_tag_arn(_p(params, "ResourceArn"))
+    if err:
+        return err
     tags_xml = ""
-    if topic:
-        for k, v in topic.get("tags", {}).items():
-            tags_xml += f"<member><Key>{k}</Key><Value>{v}</Value></member>"
+    for k, v in topic.get("tags", {}).items():
+        tags_xml += f"<member><Key>{k}</Key><Value>{v}</Value></member>"
     return _xml(200, "ListTagsForResourceResponse",
                 f"<ListTagsForResourceResult><Tags>{tags_xml}</Tags></ListTagsForResourceResult>")
 
 
 def _tag_resource(params):
-    arn = _normalize_arn(_p(params, "ResourceArn"))
-    topic = _topics.get(arn)
-    if not topic:
-        return _error("ResourceNotFoundException", "Resource not found", 404)
+    _arn, topic, err = _resolve_topic_tag_arn(_p(params, "ResourceArn"))
+    if err:
+        return err
     i = 1
     while _p(params, f"Tags.member.{i}.Key"):
         key = _p(params, f"Tags.member.{i}.Key")
@@ -1041,13 +1121,13 @@ def _tag_resource(params):
 
 
 def _untag_resource(params):
-    arn = _normalize_arn(_p(params, "ResourceArn"))
-    topic = _topics.get(arn)
-    if topic:
-        i = 1
-        while _p(params, f"TagKeys.member.{i}"):
-            topic.get("tags", {}).pop(_p(params, f"TagKeys.member.{i}"), None)
-            i += 1
+    _arn, topic, err = _resolve_topic_tag_arn(_p(params, "ResourceArn"))
+    if err:
+        return err
+    i = 1
+    while _p(params, f"TagKeys.member.{i}"):
+        topic.get("tags", {}).pop(_p(params, f"TagKeys.member.{i}"), None)
+        i += 1
     return _xml(200, "UntagResourceResponse", "<UntagResourceResult/>")
 
 

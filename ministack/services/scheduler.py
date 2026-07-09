@@ -18,7 +18,9 @@ import re
 import threading
 import time
 from datetime import datetime, timezone
+from urllib.parse import unquote
 
+from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountScopedDict,
@@ -108,6 +110,39 @@ def _ensure_default_group():
             "CreationDate": _now(),
             "LastModificationDate": _now(),
         }
+
+
+def _tag_resource_arn(arn):
+    try:
+        spec = parse_arn(arn)
+    except ArnParseError:
+        return None, _error(400, "ValidationException", f"Invalid ResourceArn: {arn}")
+
+    if (
+        spec.partition != "aws"
+        or spec.service != "scheduler"
+        or spec.region != get_region()
+        or spec.account_id != get_account_id()
+    ):
+        return None, _error(404, "ResourceNotFoundException", f"Resource {arn} does not exist.")
+
+    parts = spec.resource.split("/")
+    if len(parts) == 3 and parts[0] == "schedule":
+        key = f"{parts[1]}/{parts[2]}"
+        schedule = _schedules.get(key)
+        if schedule and schedule.get("Arn") == arn:
+            return schedule["Arn"], None
+        return None, _error(404, "ResourceNotFoundException", f"Resource {arn} does not exist.")
+
+    if len(parts) == 2 and parts[0] == "schedule-group":
+        if parts[1] == "default":
+            _ensure_default_group()
+        group = _schedule_groups.get(parts[1])
+        if group and group.get("Arn") == arn:
+            return group["Arn"], None
+        return None, _error(404, "ResourceNotFoundException", f"Resource {arn} does not exist.")
+
+    return None, _error(404, "ResourceNotFoundException", f"Resource {arn} does not exist.")
 
 
 # ---------------------------------------------------------------------------
@@ -355,6 +390,9 @@ def _delete_schedule_group(name, query):
 # ---------------------------------------------------------------------------
 
 def _tag_resource(arn, body):
+    arn, err = _tag_resource_arn(arn)
+    if err:
+        return err
     tags = body.get("Tags", [])
     existing = _tags.get(arn, {})
     existing.update({t["Key"]: t["Value"] for t in tags})
@@ -363,6 +401,9 @@ def _tag_resource(arn, body):
 
 
 def _untag_resource(arn, query):
+    arn, err = _tag_resource_arn(arn)
+    if err:
+        return err
     keys = query.get("TagKeys", [])
     if isinstance(keys, str):
         keys = [keys]
@@ -377,6 +418,9 @@ def _untag_resource(arn, query):
 
 
 def _list_tags(arn):
+    arn, err = _tag_resource_arn(arn)
+    if err:
+        return err
     existing = _tags.get(arn, {})
     tags = [{"Key": k, "Value": v} for k, v in existing.items()]
     return _json_resp(200, {"Tags": tags})
@@ -426,7 +470,7 @@ async def handle_request(method, path, headers, body_bytes, query_params):
 
     # Tags routes: /tags/{arn+}
     if path.startswith("/tags/"):
-        arn = path[6:]  # Everything after /tags/
+        arn = unquote(path[6:])  # Everything after /tags/
         if method == "GET":
             return _list_tags(arn)
         if method == "POST":

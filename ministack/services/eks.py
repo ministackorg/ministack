@@ -22,6 +22,7 @@ import threading
 import time
 import urllib.parse
 
+from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountScopedDict,
@@ -1150,7 +1151,78 @@ def _oidc_jwks():
 # Tags
 # ---------------------------------------------------------------------------
 
+def _invalid_tag_resource_arn(arn):
+    return _error(400, "InvalidParameterException", f"Invalid resourceArn: {arn}")
+
+
+def _tag_resource_not_found(arn):
+    return _error(404, "ResourceNotFoundException", f"No resource found for ARN: {arn}.")
+
+
+def _resolve_tag_resource_arn(arn):
+    try:
+        spec = parse_arn(arn)
+    except ArnParseError:
+        return None, _invalid_tag_resource_arn(arn)
+
+    if (
+        spec.partition != "aws"
+        or spec.service != "eks"
+        or spec.account_id != get_account_id()
+        or spec.region != get_region()
+    ):
+        return None, _invalid_tag_resource_arn(arn)
+
+    parts = spec.resource.split("/")
+    resource_type = parts[0] if parts else ""
+
+    if resource_type == "cluster":
+        if len(parts) != 2 or not parts[1]:
+            return None, _invalid_tag_resource_arn(arn)
+        cluster = _clusters.get(parts[1])
+        if not cluster or cluster.get("arn") != arn:
+            return None, _tag_resource_not_found(arn)
+        return cluster["arn"], None
+
+    if resource_type == "nodegroup":
+        if len(parts) != 4 or not all(parts[1:]):
+            return None, _invalid_tag_resource_arn(arn)
+        nodegroup = _nodegroups.get(f"{parts[1]}/{parts[2]}")
+        if not nodegroup or nodegroup.get("nodegroupArn") != arn:
+            return None, _tag_resource_not_found(arn)
+        return nodegroup["nodegroupArn"], None
+
+    if resource_type == "addon":
+        if len(parts) != 4 or not all(parts[1:]):
+            return None, _invalid_tag_resource_arn(arn)
+        addon = _addons.get(f"{parts[1]}/{parts[2]}")
+        if not addon or addon.get("addonArn") != arn:
+            return None, _tag_resource_not_found(arn)
+        return addon["addonArn"], None
+
+    if resource_type == "access-entry":
+        if len(parts) != 3 or not all(parts[1:]):
+            return None, _invalid_tag_resource_arn(arn)
+        for entry in _access_entries.values():
+            if entry.get("clusterName") == parts[1] and entry.get("accessEntryArn") == arn:
+                return entry["accessEntryArn"], None
+        return None, _tag_resource_not_found(arn)
+
+    if resource_type == "identityproviderconfig":
+        if len(parts) != 5 or parts[2] != "oidc" or not all(parts[1:]):
+            return None, _invalid_tag_resource_arn(arn)
+        cfg = _idp_configs.get(f"{parts[1]}\x00{parts[3]}")
+        if not cfg or cfg.get("arn") != arn:
+            return None, _tag_resource_not_found(arn)
+        return cfg["arn"], None
+
+    return None, _invalid_tag_resource_arn(arn)
+
+
 def _tag_resource(arn, body):
+    arn, err = _resolve_tag_resource_arn(arn)
+    if err:
+        return err
     tags = body.get("tags", {})
     existing = _tags.get(arn, {})
     existing.update(tags)
@@ -1159,6 +1231,9 @@ def _tag_resource(arn, body):
 
 
 def _untag_resource(arn, query):
+    arn, err = _resolve_tag_resource_arn(arn)
+    if err:
+        return err
     keys = query.get("tagKeys", [])
     if isinstance(keys, str):
         keys = [keys]
@@ -1173,6 +1248,9 @@ def _untag_resource(arn, query):
 
 
 def _list_tags(arn):
+    arn, err = _resolve_tag_resource_arn(arn)
+    if err:
+        return err
     return _json_resp(200, {"tags": _tags.get(arn, {})})
 
 
@@ -1347,7 +1425,7 @@ async def handle_request(method, path, headers, body_bytes, query_params):
 
     # Tags: /tags/{arn+}
     if path.startswith("/tags/"):
-        arn = path[6:]
+        arn = urllib.parse.unquote(path[6:])
         if method == "GET":
             return _list_tags(arn)
         if method == "POST":

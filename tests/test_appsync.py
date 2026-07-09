@@ -48,6 +48,29 @@ def test_appsync_api_key_crud():
     assert len(keys) >= 1
     appsync.delete_api_key(apiId=api["apiId"], id=key["id"])
 
+
+def test_appsync_tags_reject_wrong_region_api_arn(appsync):
+    import boto3
+
+    api = appsync.create_graphql_api(name="tag-region-api", authenticationType="API_KEY")["graphqlApi"]
+    arn_parts = api["arn"].split(":")
+    wrong_region = "us-west-2" if arn_parts[3] != "us-west-2" else "us-east-2"
+    arn_parts[3] = wrong_region
+    wrong_region_arn = ":".join(arn_parts)
+    regional_appsync = boto3.client(
+        "appsync",
+        endpoint_url=_ENDPOINT,
+        region_name=wrong_region,
+        aws_access_key_id="test",
+        aws_secret_access_key="test",
+    )
+
+    with pytest.raises(ClientError) as exc:
+        regional_appsync.tag_resource(resourceArn=wrong_region_arn, tags={"env": "test"})
+
+    assert exc.value.response["Error"]["Code"] == "NotFoundException"
+
+
 def test_appsync_data_source_crud():
     from conftest import make_client
     appsync = make_client("appsync")
@@ -645,6 +668,25 @@ def test_appsync_lambda_authorizer_rejection_returns_unauthorized(appsync, lam):
     auth_arn = _appsync_create_lambda(lam, "authz-reject-test", authorizer)
     _, url = _appsync_setup_lambda_auth_api(appsync, lam, "authz-reject-api", auth_arn,
                                             _APPSYNC_IDENTITY_PROBE_RESOLVER)
+    _appsync_expect_unauthorized(url, "{ testField { hasIdentity } }",
+                                 headers={"Authorization": "Bearer fake-jwt"})
+
+
+def test_appsync_lambda_authorizer_wrong_region_arn_does_not_fallback(appsync, lam):
+    """A wrong-region authorizer ARN must not invoke a same-named local Lambda."""
+    authorizer = (
+        "def handler(event, ctx):\n"
+        "    return {'isAuthorized': True, 'resolverContext': {'region': 'current'}}\n"
+    )
+    auth_arn = _appsync_create_lambda(lam, "authz-wrong-region-test", authorizer)
+    arn_parts = auth_arn.split(":")
+    arn_parts[3] = "us-west-2" if arn_parts[3] != "us-west-2" else "us-east-2"
+    wrong_region_arn = ":".join(arn_parts)
+
+    _, url = _appsync_setup_lambda_auth_api(
+        appsync, lam, "authz-wrong-region-api", wrong_region_arn,
+        _APPSYNC_IDENTITY_PROBE_RESOLVER,
+    )
     _appsync_expect_unauthorized(url, "{ testField { hasIdentity } }",
                                  headers={"Authorization": "Bearer fake-jwt"})
 

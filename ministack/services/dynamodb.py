@@ -24,7 +24,9 @@ import time
 from collections import defaultdict
 from decimal import Decimal, InvalidOperation
 
+from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.responses import (
+    AccountRegionScopedDict,
     AccountScopedDict,
     error_response_json,
     get_account_id,
@@ -55,6 +57,9 @@ def _conditional_check_failed(data, old_item, message="The conditional request f
     }, json.dumps(body, ensure_ascii=False).encode("utf-8")
 
 REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
+_DDB_PARTITION_RE = re.compile(r"^aws(?:-[a-z]+)*$")
+_DDB_REGION_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)+-[0-9]+$")
+_DDB_ACCOUNT_RE = re.compile(r"^[0-9]{12}$")
 
 # Real AWS reports Export/Import as IN_PROGRESS at submit time; the flip to
 # COMPLETED happens asynchronously. We simulate that by holding IN_PROGRESS
@@ -64,28 +69,32 @@ _IMPORT_COMPLETE_AFTER_SEC = float(os.environ.get("MINISTACK_DDB_IMPORT_COMPLETE
 
 from ministack.core.persistence import PERSIST_STATE, load_state
 
-_tables = AccountScopedDict()
-_tags = AccountScopedDict()
-_ttl_settings = AccountScopedDict()
-_pitr_settings = AccountScopedDict()
+# Region-scoped: DynamoDB tables are region-specific in AWS. Account-only
+# keying made name lookups find cross-region tables while ARN ops (which
+# validate spec.region == request region) rejected them — a self-contradiction
+# (B7). Legacy account-scoped persistence migrates via the table's TableArn.
+_tables = AccountRegionScopedDict()
+_tags = AccountRegionScopedDict()
+_ttl_settings = AccountRegionScopedDict()
+_pitr_settings = AccountRegionScopedDict()
 # Kinesis streaming destinations — TableName -> list of
 # {"StreamArn": str, "DestinationStatus": "ACTIVE"|"DISABLED",
 #  "ApproximateCreationDateTimePrecision": "MILLISECOND"|"MICROSECOND"}.
 # ACTIVE entries get each _emit_stream_event record fanned out via
 # kinesis.put_record_internal; DISABLED entries stay on the describe
 # response (matching the ~24 h AWS retention window for readability).
-_kinesis_destinations = AccountScopedDict()
+_kinesis_destinations = AccountRegionScopedDict()
 # Contributor Insights — key is "TableName" or "TableName/index/IndexName".
 # Value: {"ContributorInsightsStatus": "ENABLED"|"DISABLED",
 #         "LastUpdateDateTime": float epoch, "ContributorInsightsRuleList": [str, ...]}.
-_backups = AccountScopedDict()  # BackupArn -> BackupDescription dict
-_contributor_insights = AccountScopedDict()
+_backups = AccountRegionScopedDict()  # BackupArn -> BackupDescription dict
+_contributor_insights = AccountRegionScopedDict()
 # Resource-based policies — ResourceArn -> {"Policy": str, "RevisionId": str}.
-_resource_policies = AccountScopedDict()
+_resource_policies = AccountRegionScopedDict()
 # Export tasks — ExportArn -> ExportDescription dict.
-_exports = AccountScopedDict()
+_exports = AccountRegionScopedDict()
 # Import tasks — ImportArn -> ImportTableDescription dict.
-_imports = AccountScopedDict()
+_imports = AccountRegionScopedDict()
 _lock = threading.Lock()
 
 
@@ -106,6 +115,74 @@ def get_state():
     }
 
 
+def _table_name_from_metadata_key(key) -> str:
+    if not isinstance(key, str):
+        return str(key)
+    return key.split("/index/", 1)[0]
+
+
+def _metadata_value_region(value) -> str | None:
+    if isinstance(value, str) and value.startswith("arn:"):
+        try:
+            spec = parse_arn(value)
+        except ArnParseError:
+            return None
+        return spec.region or None
+    if isinstance(value, dict):
+        for nested in value.values():
+            region = _metadata_value_region(nested)
+            if region:
+                return region
+    if isinstance(value, (list, tuple, set)):
+        for nested in value:
+            region = _metadata_value_region(nested)
+            if region:
+                return region
+    return None
+
+
+def _legacy_regions_for_table_metadata(account_id: str, key, value=None) -> list[str]:
+    table_name = _table_name_from_metadata_key(key)
+    regions = sorted({
+        region
+        for (stored_account_id, region, stored_table_name), _table in _tables.all_items()
+        if stored_account_id == account_id and stored_table_name == table_name
+    })
+    value_region = _metadata_value_region(value)
+    if value_region and (not regions or value_region in regions):
+        return [value_region]
+    if len(regions) == 1:
+        return regions
+    if regions:
+        return regions
+    return [get_region()]
+
+
+def _restore_table_name_metadata(store: AccountRegionScopedDict, data) -> None:
+    if isinstance(data, AccountRegionScopedDict):
+        store.update(data)
+        return
+    if isinstance(data, AccountScopedDict):
+        for (account_id, key), value in data._data.items():
+            for region in _legacy_regions_for_table_metadata(account_id, key, value):
+                store.set_scoped(account_id, region, key, copy.deepcopy(value))
+        return
+    if isinstance(data, dict):
+        for key, value in data.items():
+            if isinstance(key, tuple) and len(key) == 3:
+                account_id, _region, original_key = key
+                regions = [_region]
+            elif isinstance(key, tuple) and len(key) == 2:
+                account_id, original_key = key
+                regions = _legacy_regions_for_table_metadata(account_id, original_key, value)
+            else:
+                account_id = get_account_id()
+                original_key = key
+                regions = _legacy_regions_for_table_metadata(account_id, original_key, value)
+            for region in regions:
+                store.set_scoped(account_id, region, original_key, copy.deepcopy(value))
+
+
 def restore_state(data):
     if data:
         _tables.update(data.get("tables", {}))
@@ -119,10 +196,10 @@ def restore_state(data):
             if sse and "Status" not in sse and ("Enabled" in sse or "KMSMasterKeyId" in sse):
                 tbl["SSEDescription"] = _sse_description_from_spec(sse)
         _tags.update(data.get("tags", {}))
-        _ttl_settings.update(data.get("ttl_settings", {}))
-        _pitr_settings.update(data.get("pitr_settings", {}))
-        _kinesis_destinations.update(data.get("kinesis_destinations", {}))
-        _contributor_insights.update(data.get("contributor_insights", {}))
+        _restore_table_name_metadata(_ttl_settings, data.get("ttl_settings", {}))
+        _restore_table_name_metadata(_pitr_settings, data.get("pitr_settings", {}))
+        _restore_table_name_metadata(_kinesis_destinations, data.get("kinesis_destinations", {}))
+        _restore_table_name_metadata(_contributor_insights, data.get("contributor_insights", {}))
         _backups.update(data.get("backups", {}))
         _resource_policies.update(data.get("resource_policies", {}))
         _exports.update(data.get("exports", {}))
@@ -434,7 +511,7 @@ def _validate_item(item: dict, pk_name: str | None = None, sk_name: str | None =
 
 # DynamoDB Streams: table_name -> list of stream records
 # Each record follows the DynamoDB Streams event format consumed by Lambda ESMs.
-_stream_records = AccountScopedDict()
+_stream_records = AccountRegionScopedDict()
 _stream_seq_counter = 0
 _stream_seq_lock = threading.Lock()
 
@@ -551,13 +628,13 @@ def _ttl_reaper():
         now = time.time()
         try:
             with _lock:
-                for table_name, setting in list(_ttl_settings.items()):
+                for (account_id, region, table_name), setting in list(_ttl_settings.all_items()):
                     if setting.get("TimeToLiveStatus") != "ENABLED":
                         continue
                     attr = setting.get("AttributeName", "")
                     if not attr:
                         continue
-                    table = _tables.get(table_name)
+                    table = _tables.get_scoped(account_id, region, table_name)
                     if not table:
                         continue
                     for pk_val, sk_map in list(table["items"].items()):
@@ -2922,7 +2999,7 @@ def _transact_write_items(data):
     return json_response(result)
 
 
-_txn_idempotency = AccountScopedDict()
+_txn_idempotency = AccountRegionScopedDict()
 
 
 def _transact_get_items(data):
@@ -3162,9 +3239,24 @@ def _describe_endpoints(data):
 # Tag operations
 # ---------------------------------------------------------------------------
 
+def _dynamodb_arn_spec(arn: str):
+    try:
+        spec = parse_arn(arn)
+    except ArnParseError:
+        return None
+    if (
+        not _DDB_PARTITION_RE.match(spec.partition)
+        or spec.service != "dynamodb"
+        or not _DDB_REGION_RE.match(spec.region)
+        or not _DDB_ACCOUNT_RE.match(spec.account_id)
+    ):
+        return None
+    return spec
+
+
 def _validate_tag_arn(arn: str) -> tuple | None:
     """ARN must (a) look like a DynamoDB ARN, (b) reference an existing table."""
-    if not isinstance(arn, str) or not arn.startswith("arn:aws:dynamodb:"):
+    if not isinstance(arn, str) or _dynamodb_arn_spec(arn) is None:
         return error_response_json("ValidationException",
             f"1 validation error detected: Value '{arn}' at 'resourceArn' failed to satisfy constraint: Member must satisfy regular expression pattern: arn:[a-z\\-]+:dynamodb:[a-z]{{2}}-[a-z]+-[0-9]:[0-9]{{12}}:.*", 400)
     tname = _table_name_from_arn(arn)
@@ -3206,7 +3298,7 @@ def _list_tags(data):
     # ListTagsOfResource on a non-existent (but syntactically valid) ARN
     # returns AccessDeniedException on AWS — the API does not reveal whether
     # the resource exists. Syntactic validation still uses ValidationException.
-    if not isinstance(arn, str) or not arn.startswith("arn:aws:dynamodb:"):
+    if not isinstance(arn, str) or _dynamodb_arn_spec(arn) is None:
         return error_response_json("ValidationException",
             f"1 validation error detected: Value '{arn}' at 'resourceArn' failed to satisfy constraint: Member must satisfy regular expression pattern: arn:[a-z\\-]+:dynamodb:[a-z]{{2}}-[a-z]+-[0-9]:[0-9]{{12}}:.*", 400)
     tname = _table_name_from_arn(arn)
@@ -3418,13 +3510,8 @@ def _update_kinesis_streaming_destination(data):
 def _normalize_table_name(value: str) -> str:
     if not isinstance(value, str):
         return value
-    if value.startswith("arn:aws:dynamodb:"):
-        # arn:aws:dynamodb:region:account:table/<name>[/...]
-        try:
-            _, _, after = value.partition(":table/")
-            return after.split("/")[0] if after else value
-        except Exception:
-            return value
+    if value.startswith("arn:"):
+        return _table_name_from_arn(value) or value
     return value
 
 
@@ -3563,9 +3650,19 @@ def _list_contributor_insights(data):
 # Per botocore: ResourceArn must be a table or stream ARN. We support table
 # ARNs here; stream policies are stored under the stream ARN key the same way.
 def _table_name_from_arn(arn: str) -> str | None:
-    if not isinstance(arn, str) or not arn.startswith("arn:aws:dynamodb:"):
+    if not isinstance(arn, str):
         return None
-    _, _, after = arn.partition(":table/")
+    spec = _dynamodb_arn_spec(arn)
+    if (
+        spec is None
+        or spec.region != get_region()
+        or spec.account_id != get_account_id()
+    ):
+        return None
+    prefix = "table/"
+    if not spec.resource.startswith(prefix):
+        return None
+    after = spec.resource[len(prefix):]
     if not after:
         return None
     # Strip /stream/... or /index/... suffixes.
@@ -5636,3 +5733,9 @@ def reset():
         _pitr_settings.clear()
         _stream_records.clear()
         _kinesis_destinations.clear()
+        _backups.clear()
+        _contributor_insights.clear()
+        _resource_policies.clear()
+        _exports.clear()
+        _imports.clear()
+        _txn_idempotency.clear()

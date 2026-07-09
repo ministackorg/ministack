@@ -11,6 +11,7 @@ import logging
 import os
 import time
 
+from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.persistence import PERSIST_STATE, load_state
 from ministack.core.responses import (
     AccountScopedDict,
@@ -603,10 +604,32 @@ def _find_image(repo_name, image_id):
 
 
 def _find_repo_by_arn(arn):
-    for repo in _repositories.values():
-        if repo["repositoryArn"] == arn:
-            return repo
-    return None
+    name = _repo_name_from_arn(arn)
+    if not name:
+        return None
+    repo = _repositories.get(name)
+    if not repo or repo.get("repositoryArn") != arn:
+        return None
+    return repo
+
+
+def _repo_name_from_arn(arn):
+    try:
+        spec = parse_arn(arn)
+    except ArnParseError:
+        return None
+    if (
+        spec.partition != "aws"
+        or spec.service != "ecr"
+        or spec.account_id != get_account_id()
+        or spec.region != get_region()
+    ):
+        return None
+    prefix = "repository/"
+    if not spec.resource.startswith(prefix):
+        return None
+    name = spec.resource[len(prefix):]
+    return name or None
 
 
 def _repo_shape(repo):

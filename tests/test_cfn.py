@@ -1098,6 +1098,60 @@ def test_cfn_lambda_permission(cfn, lam):
     _wait_stack(cfn, "cfn-lambda-perm")
     lam.delete_function(FunctionName="cfn-perm-fn")
 
+
+def test_cfn_lambda_permission_qualified_arn_uses_base_function_policy(cfn, lam):
+    """Qualified FunctionName refs should add permission to the base function policy."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    fn = f"cfn-perm-qualified-{suffix}"
+    stack_name = f"cfn-lambda-perm-qualified-{suffix}"
+    code = "def handler(e,c): return {}"
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("index.py", code)
+    lam.create_function(
+        FunctionName=fn,
+        Runtime="python3.11",
+        Role="arn:aws:iam::000000000000:role/r",
+        Handler="index.handler",
+        Code={"ZipFile": buf.getvalue()},
+    )
+    version = lam.publish_version(FunctionName=fn)["Version"]
+    alias_arn = lam.create_alias(FunctionName=fn, Name="live", FunctionVersion=version)["AliasArn"]
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "Perm": {
+                "Type": "AWS::Lambda::Permission",
+                "Properties": {
+                    "FunctionName": alias_arn,
+                    "Action": "lambda:InvokeFunction",
+                    "Principal": "s3.amazonaws.com",
+                    "SourceArn": "arn:aws:s3:::my-bucket",
+                },
+            },
+        },
+    }
+    try:
+        cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(template))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE"
+
+        policy = json.loads(lam.get_policy(FunctionName=fn)["Policy"])
+        statements = policy["Statement"]
+        assert len(statements) == 1
+        assert statements[0]["Resource"] == alias_arn
+    finally:
+        try:
+            cfn.delete_stack(StackName=stack_name)
+            _wait_stack(cfn, stack_name)
+        except Exception:
+            pass
+        try:
+            lam.delete_function(FunctionName=fn)
+        except Exception:
+            pass
+
+
 def test_cfn_lambda_version(cfn, lam):
     """AWS::Lambda::Version creates a published version."""
     code = "def handler(e,c): return {'v': 1}"
@@ -1128,6 +1182,7 @@ def test_cfn_lambda_version(cfn, lam):
     cfn.delete_stack(StackName="cfn-lambda-ver")
     _wait_stack(cfn, "cfn-lambda-ver")
     lam.delete_function(FunctionName="cfn-ver-fn")
+
 
 def test_cfn_esm_filter_criteria_round_trips(cfn, lam, ddb):
     code = "def handler(e,c): return {'ok': True}"
@@ -1245,6 +1300,239 @@ def test_cfn_esm_extra_props_round_trip_and_in_place_update(cfn, lam, ddb):
     _wait_stack(cfn, "cfn-esm-xp")
     ddb.delete_table(TableName="cfn-esm-xp-table")
     lam.delete_function(FunctionName="cfn-esm-xp-fn")
+
+
+def test_cfn_lambda_alias_and_esm_keep_function_name(cfn, lam):
+    """Lambda Alias and ESM provisioners need function names, not permission resource ARNs."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    fn = f"cfn-alias-esm-{suffix}"
+    stack_name = f"cfn-alias-esm-{suffix}"
+    code = "def handler(e,c): return {}"
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("index.py", code)
+    lam.create_function(
+        FunctionName=fn,
+        Runtime="python3.11",
+        Role="arn:aws:iam::000000000000:role/r",
+        Handler="index.handler",
+        Code={"ZipFile": buf.getvalue()},
+    )
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "Alias": {
+                "Type": "AWS::Lambda::Alias",
+                "Properties": {"FunctionName": fn, "Name": "live", "FunctionVersion": "$LATEST"},
+            },
+            "Esm": {
+                "Type": "AWS::Lambda::EventSourceMapping",
+                "Properties": {
+                    "FunctionName": fn,
+                    "EventSourceArn": f"arn:aws:sqs:us-east-1:000000000000:source-{suffix}",
+                },
+            },
+        },
+    }
+    try:
+        cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(template))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+
+        aliases = lam.list_aliases(FunctionName=fn)["Aliases"]
+        assert aliases[0]["AliasArn"].endswith(f":function:{fn}:live")
+
+        mappings = lam.list_event_source_mappings(FunctionName=fn)["EventSourceMappings"]
+        assert len(mappings) == 1
+        assert mappings[0]["FunctionArn"].endswith(f":function:{fn}")
+    finally:
+        try:
+            cfn.delete_stack(StackName=stack_name)
+            _wait_stack(cfn, stack_name)
+        except Exception:
+            pass
+        try:
+            lam.delete_function(FunctionName=fn)
+        except Exception:
+            pass
+
+
+def test_cfn_lambda_esm_preserves_qualified_function_ref(cfn, lam):
+    suffix = _uuid_mod.uuid4().hex[:8]
+    fn = f"cfn-esm-qualified-{suffix}"
+    stack_name = f"cfn-esm-qualified-{suffix}"
+    code = "def handler(e,c): return {}"
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("index.py", code)
+    lam.create_function(
+        FunctionName=fn,
+        Runtime="python3.11",
+        Role="arn:aws:iam::000000000000:role/r",
+        Handler="index.handler",
+        Code={"ZipFile": buf.getvalue()},
+    )
+    version = lam.publish_version(FunctionName=fn)["Version"]
+    lam.create_alias(FunctionName=fn, Name="live", FunctionVersion=version)
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "Esm": {
+                "Type": "AWS::Lambda::EventSourceMapping",
+                "Properties": {
+                    "FunctionName": f"{fn}:live",
+                    "EventSourceArn": f"arn:aws:sqs:us-east-1:000000000000:source-{suffix}",
+                    "BatchSize": 1,
+                },
+            },
+        },
+    }
+    try:
+        cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(template))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+
+        mappings = lam.list_event_source_mappings(FunctionName=fn)["EventSourceMappings"]
+        assert len(mappings) == 1
+        assert mappings[0]["FunctionArn"].endswith(f":function:{fn}:live")
+    finally:
+        try:
+            cfn.delete_stack(StackName=stack_name)
+            _wait_stack(cfn, stack_name)
+        except Exception:
+            pass
+        try:
+            lam.delete_function(FunctionName=fn)
+        except Exception:
+            pass
+
+
+def test_cfn_lambda_provisioners_do_not_tail_resolve_wrong_service_arns(cfn, lam):
+    """Lambda CFN provisioners must not map a non-Lambda ARN tail to a local function."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    fn = f"cfn-lambda-arn-guard-{suffix}"
+    code = "def handler(e,c): return {}"
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("index.py", code)
+    lam.create_function(
+        FunctionName=fn,
+        Runtime="python3.11",
+        Role="arn:aws:iam::000000000000:role/r",
+        Handler="index.handler",
+        Code={"ZipFile": buf.getvalue()},
+    )
+    wrong_ref = f"arn:aws:sqs:us-east-1:000000000000:function:{fn}"
+    stack_name = f"cfn-lambda-arn-guard-{suffix}"
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "Perm": {
+                "Type": "AWS::Lambda::Permission",
+                "Properties": {
+                    "FunctionName": wrong_ref,
+                    "Action": "lambda:InvokeFunction",
+                    "Principal": "s3.amazonaws.com",
+                    "SourceArn": "arn:aws:s3:::my-bucket",
+                },
+            },
+            "Ver": {
+                "Type": "AWS::Lambda::Version",
+                "Properties": {"FunctionName": wrong_ref},
+            },
+            "Alias": {
+                "Type": "AWS::Lambda::Alias",
+                "Properties": {"FunctionName": wrong_ref, "Name": "live", "FunctionVersion": "1"},
+            },
+            "Esm": {
+                "Type": "AWS::Lambda::EventSourceMapping",
+                "Properties": {
+                    "FunctionName": wrong_ref,
+                    "EventSourceArn": f"arn:aws:sqs:us-east-1:000000000000:source-{suffix}",
+                },
+            },
+        },
+    }
+    try:
+        cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(template))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+
+        policy = json.loads(lam.get_policy(FunctionName=fn)["Policy"])
+        assert policy["Statement"] == []
+
+        versions = lam.list_versions_by_function(FunctionName=fn)["Versions"]
+        assert [v["Version"] for v in versions] == ["$LATEST"]
+
+        assert lam.list_aliases(FunctionName=fn)["Aliases"] == []
+        assert lam.list_event_source_mappings(FunctionName=fn)["EventSourceMappings"] == []
+    finally:
+        try:
+            cfn.delete_stack(StackName=stack_name)
+            _wait_stack(cfn, stack_name)
+        except Exception:
+            pass
+        lam.delete_function(FunctionName=fn)
+
+
+def test_cfn_lambda_provisioners_reject_missing_bare_qualifier(cfn, lam):
+    suffix = _uuid_mod.uuid4().hex[:8]
+    fn = f"cfn-lambda-missing-qual-{suffix}"
+    code = "def handler(e,c): return {}"
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("index.py", code)
+    lam.create_function(
+        FunctionName=fn,
+        Runtime="python3.11",
+        Role="arn:aws:iam::000000000000:role/r",
+        Handler="index.handler",
+        Code={"ZipFile": buf.getvalue()},
+    )
+    missing_ref = f"{fn}:missing"
+    stack_name = f"cfn-lambda-missing-qual-{suffix}"
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "Perm": {
+                "Type": "AWS::Lambda::Permission",
+                "Properties": {
+                    "FunctionName": missing_ref,
+                    "Action": "lambda:InvokeFunction",
+                    "Principal": "s3.amazonaws.com",
+                    "SourceArn": "arn:aws:s3:::my-bucket",
+                },
+            },
+            "Alias": {
+                "Type": "AWS::Lambda::Alias",
+                "Properties": {"FunctionName": missing_ref, "Name": "live", "FunctionVersion": "1"},
+            },
+            "Esm": {
+                "Type": "AWS::Lambda::EventSourceMapping",
+                "Properties": {
+                    "FunctionName": missing_ref,
+                    "EventSourceArn": f"arn:aws:sqs:us-east-1:000000000000:source-{suffix}",
+                },
+            },
+        },
+    }
+    try:
+        cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(template))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+
+        policy = json.loads(lam.get_policy(FunctionName=fn)["Policy"])
+        assert policy["Statement"] == []
+        assert lam.list_aliases(FunctionName=fn)["Aliases"] == []
+        assert lam.list_event_source_mappings(FunctionName=fn)["EventSourceMappings"] == []
+    finally:
+        try:
+            cfn.delete_stack(StackName=stack_name)
+            _wait_stack(cfn, stack_name)
+        except Exception:
+            pass
+        lam.delete_function(FunctionName=fn)
+
 
 def test_cfn_wait_condition(cfn):
     """AWS::CloudFormation::WaitCondition and WaitConditionHandle are no-ops."""

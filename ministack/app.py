@@ -313,6 +313,11 @@ SERVICE_REGISTRY = {
     "inspector2": {"module": "inspector2"},
     "mq": {"module": "mq"},
     "s3tables": {"module": "s3tables"},
+    "bedrock": {"module": "bedrock"},
+    "bedrock-runtime": {"module": "bedrock_runtime"},
+    "bedrock-agent": {"module": "bedrock_agent"},
+    "bedrock-agent-runtime": {"module": "bedrock_agent_runtime"},
+    "kafka": {"module": "msk"},
 }
 
 SERVICE_HANDLERS = {
@@ -352,6 +357,11 @@ _state_map = {
     "mq": "mq",
     "s3tables": "s3tables",
     "lambda_durable": "lambda_durable",
+    "bedrock": "bedrock",
+    "bedrock_runtime": "bedrock_runtime",
+    "bedrock_agent": "bedrock_agent",
+    "bedrock_agent_runtime": "bedrock_agent_runtime",
+    "msk": "msk",
 }
 
 SERVICE_NAME_ALIASES = {
@@ -605,11 +615,24 @@ def _handle_lambda_download_request(path: str, method: str):
     """Serve MiniStack's Lambda layer and function-code download endpoints."""
     if path.startswith("/_ministack/lambda-layers/") and method == "GET":
         path_parts = path.split("/")
+        if len(path_parts) >= 8 and path_parts[7] == "content" and path_parts[6].isdigit():
+            return _get_module("lambda_svc").serve_layer_content(
+                path_parts[5],
+                int(path_parts[6]),
+                account_id=path_parts[3],
+                region=path_parts[4],
+            )
         if len(path_parts) >= 6 and path_parts[5] == "content" and path_parts[4].isdigit():
             return _get_module("lambda_svc").serve_layer_content(path_parts[3], int(path_parts[4]))
 
     if path.startswith("/_ministack/lambda-code/") and method == "GET":
         path_parts = path.split("/")
+        if len(path_parts) >= 6:
+            return _get_module("lambda_svc").serve_function_code(
+                path_parts[5],
+                account_id=path_parts[3],
+                region=path_parts[4],
+            )
         if len(path_parts) >= 4:
             return _get_module("lambda_svc").serve_function_code(path_parts[3])
     return None
@@ -737,8 +760,9 @@ async def _handle_sqs_messages_request(method: str, path: str, headers: dict, qu
 
     Filters:
       ?account=<12-digit-id>   restrict to one account
+      ?region=<aws-region>     restrict to one region
       ?QueueUrl=<url>          restrict to one queue (within whatever
-                               accounts pass the account filter)
+                               accounts/regions pass the filters)
     """
     if path != "/_ministack/sqs/messages" or method != "GET":
         return None
@@ -763,20 +787,34 @@ async def _handle_sqs_messages_request(method: str, path: str, headers: dict, qu
     if "QueueUrl" in query_params:
         raw_qurl = query_params["QueueUrl"]
         queue_url_filter = raw_qurl[0] if isinstance(raw_qurl, (list, tuple)) else raw_qurl
+    region_filter = None
+    if "region" in query_params:
+        raw_region = query_params["region"]
+        region_filter = raw_region[0] if isinstance(raw_region, (list, tuple)) else raw_region
 
     try:
         mod = _get_module("sqs")
         now = time.time()
 
-        # AccountScopedDict._data is keyed by (account_id, queue_url).
-        per_account: dict[str, dict[str, list]] = {}
+        # Legacy AccountScopedDict state is keyed by (account_id, queue_url);
+        # AccountRegionScopedDict state is keyed by (account_id, region, queue_url).
+        per_account: dict[str, dict[str, dict[str, list]]] = {}
         try:
             all_data = mod._queues.to_dict()
         except Exception:
             all_data = {}
 
-        for (acct, qurl), queue in all_data.items():
+        for scoped_key, queue in all_data.items():
+            if len(scoped_key) == 3:
+                acct, region, qurl = scoped_key
+            elif len(scoped_key) == 2:
+                acct, qurl = scoped_key
+                region = os.environ.get("MINISTACK_REGION", "us-east-1")
+            else:
+                continue
             if account_id is not None and acct != account_id:
+                continue
+            if region_filter is not None and region != region_filter:
                 continue
             if queue_url_filter is not None and qurl != queue_url_filter:
                 continue
@@ -803,7 +841,7 @@ async def _handle_sqs_messages_request(method: str, path: str, headers: dict, qu
                     "MessageDeduplicationId": m.get("dedup_id"),
                     "SequenceNumber": m.get("seq"),
                 })
-            per_account.setdefault(acct, {})[qurl] = rendered
+            per_account.setdefault(acct, {}).setdefault(region, {})[qurl] = rendered
 
         response = {"messages": per_account}
     except Exception as e:
@@ -1653,6 +1691,18 @@ async def app(scope, receive, send):
                 ws_headers[name.decode("latin-1").lower()] = value.decode("utf-8")
             except UnicodeDecodeError:
                 ws_headers[name.decode("latin-1").lower()] = value.decode("latin-1")
+        # WebSocket connect URLs are SigV4-presigned (credentials in query
+        # params, not the header). Set the request's tenant scope so
+        # account/region-scoped lookups resolve under the caller rather than the
+        # default — the WS entry path never did this before.
+        ws_query = parse_qs(
+            scope.get("query_string", b"").decode("utf-8", errors="replace"),
+            keep_blank_values=True,
+        )
+        _ws_key = extract_access_key_id(ws_headers, ws_query)
+        if _ws_key:
+            set_request_account_id(_ws_key)
+        set_request_region(extract_region(ws_headers, ws_query))
         ws_host = ws_headers.get("host", "")
         ws_path = scope.get("path", "")
         parsed = _parse_execute_api_url(ws_host, ws_path)
@@ -1721,8 +1771,9 @@ async def app(scope, receive, send):
 
     # Set per-request region from SigV4 Credential scope so CFN's AWS::Region
     # pseudo-param and ARN-building use the caller's region, not MINISTACK_REGION
-    # (issue #398). Falls back to MINISTACK_REGION env.
-    set_request_region(extract_region(headers))
+    # (issue #398). Falls back to MINISTACK_REGION env. Presigned (SigV4 query)
+    # requests carry the credential in query params, not the header.
+    set_request_region(extract_region(headers, query_params))
 
     if await _send_if_handled(send, await _handle_pre_body_request(method, path, headers, query_params, request_id)):
         return

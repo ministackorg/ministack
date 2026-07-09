@@ -13,6 +13,7 @@ import logging
 import os
 import time
 
+from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.persistence import PERSIST_STATE, load_state
 from ministack.core.responses import (
     AccountScopedDict,
@@ -29,6 +30,7 @@ logger = logging.getLogger("acm")
 REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 
 _certificates = AccountScopedDict()  # arn -> certificate dict
+_CERTIFICATE_RESOURCE_PREFIX = "certificate/"
 
 
 def get_state():
@@ -115,6 +117,34 @@ def _epoch(iso_or_epoch):
 
 def _cert_arn():
     return f"arn:aws:acm:{get_region()}:{get_account_id()}:certificate/{new_uuid()}"
+
+
+def _is_local_certificate_arn(arn):
+    try:
+        spec = parse_arn(arn)
+    except ArnParseError:
+        return False
+    if (
+        spec.partition != "aws"
+        or spec.service != "acm"
+        or spec.account_id != get_account_id()
+        or spec.region != get_region()
+    ):
+        return False
+    if not spec.resource.startswith(_CERTIFICATE_RESOURCE_PREFIX):
+        return False
+    certificate_id = spec.resource[len(_CERTIFICATE_RESOURCE_PREFIX):]
+    return bool(certificate_id) and "/" not in certificate_id
+
+
+def _get_local_certificate(arn):
+    if not _is_local_certificate_arn(arn):
+        return None
+    return _certificates.get(arn)
+
+
+def _certificate_not_found(arn):
+    return error_response_json("ResourceNotFoundException", f"Certificate {arn} not found", 400)
 
 
 def _validation_options(domain, method):
@@ -218,9 +248,9 @@ def _request_certificate(data):
 
 def _describe_certificate(data):
     arn = data.get("CertificateArn", "")
-    cert = _certificates.get(arn)
+    cert = _get_local_certificate(arn)
     if not cert:
-        return error_response_json("ResourceNotFoundException", f"Certificate {arn} not found", 400)
+        return _certificate_not_found(arn)
     return json_response({"Certificate": _cert_shape(cert)})
 
 
@@ -228,6 +258,8 @@ def _list_certificates(data):
     statuses = data.get("CertificateStatuses", [])
     summaries = []
     for arn, cert in _certificates.items():
+        if not _is_local_certificate_arn(arn):
+            continue
         if statuses and cert["Status"] not in statuses:
             continue
         summaries.append({
@@ -246,8 +278,8 @@ def _list_certificates(data):
 
 def _delete_certificate(data):
     arn = data.get("CertificateArn", "")
-    if arn not in _certificates:
-        return error_response_json("ResourceNotFoundException", f"Certificate {arn} not found", 400)
+    if _get_local_certificate(arn) is None:
+        return _certificate_not_found(arn)
     del _certificates[arn]
     return json_response({})
 
@@ -277,9 +309,9 @@ def _decode_pem_field(value):
 
 def _get_certificate(data):
     arn = data.get("CertificateArn", "")
-    cert = _certificates.get(arn)
+    cert = _get_local_certificate(arn)
     if cert is None:
-        return error_response_json("ResourceNotFoundException", f"Certificate {arn} not found", 400)
+        return _certificate_not_found(arn)
     # PrivateKey is intentionally never returned — real AWS only exposes
     # it via ExportCertificate (passphrase-protected).
     return json_response({
@@ -290,6 +322,8 @@ def _get_certificate(data):
 
 def _import_certificate(data):
     arn = data.get("CertificateArn") or _cert_arn()
+    if data.get("CertificateArn") and not _is_local_certificate_arn(arn):
+        return _certificate_not_found(arn)
     now = now_iso()
     cert_body = _decode_pem_field(data.get("Certificate"))
     cert_chain = _decode_pem_field(data.get("CertificateChain"))
@@ -323,9 +357,9 @@ def _import_certificate(data):
 
 def _add_tags(data):
     arn = data.get("CertificateArn", "")
-    cert = _certificates.get(arn)
+    cert = _get_local_certificate(arn)
     if not cert:
-        return error_response_json("ResourceNotFoundException", f"Certificate {arn} not found", 400)
+        return _certificate_not_found(arn)
     existing = {t["Key"]: t for t in cert.get("Tags", [])}
     for tag in data.get("Tags", []):
         existing[tag["Key"]] = tag
@@ -335,9 +369,9 @@ def _add_tags(data):
 
 def _remove_tags(data):
     arn = data.get("CertificateArn", "")
-    cert = _certificates.get(arn)
+    cert = _get_local_certificate(arn)
     if not cert:
-        return error_response_json("ResourceNotFoundException", f"Certificate {arn} not found", 400)
+        return _certificate_not_found(arn)
     remove_keys = {t["Key"] for t in data.get("Tags", [])}
     cert["Tags"] = [t for t in cert.get("Tags", []) if t["Key"] not in remove_keys]
     return json_response({})
@@ -345,32 +379,32 @@ def _remove_tags(data):
 
 def _list_tags(data):
     arn = data.get("CertificateArn", "")
-    cert = _certificates.get(arn)
+    cert = _get_local_certificate(arn)
     if not cert:
-        return error_response_json("ResourceNotFoundException", f"Certificate {arn} not found", 400)
+        return _certificate_not_found(arn)
     return json_response({"Tags": cert.get("Tags", [])})
 
 
 def _update_options(data):
     arn = data.get("CertificateArn", "")
-    cert = _certificates.get(arn)
+    cert = _get_local_certificate(arn)
     if not cert:
-        return error_response_json("ResourceNotFoundException", f"Certificate {arn} not found", 400)
+        return _certificate_not_found(arn)
     cert["Options"] = data.get("Options", {})
     return json_response({})
 
 
 def _renew_certificate(data):
     arn = data.get("CertificateArn", "")
-    if arn not in _certificates:
-        return error_response_json("ResourceNotFoundException", f"Certificate {arn} not found", 400)
+    if _get_local_certificate(arn) is None:
+        return _certificate_not_found(arn)
     return json_response({})
 
 
 def _resend_validation_email(data):
     arn = data.get("CertificateArn", "")
-    if arn not in _certificates:
-        return error_response_json("ResourceNotFoundException", f"Certificate {arn} not found", 400)
+    if _get_local_certificate(arn) is None:
+        return _certificate_not_found(arn)
     return json_response({})
 
 

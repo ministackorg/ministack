@@ -6,16 +6,14 @@ Routes SQL to real database containers managed by the RDS service emulator.
 
 import json
 import logging
-import os
 import re
 import threading
 import uuid
 
-from ministack.core.responses import AccountScopedDict, error_response_json, get_account_id, get_region, json_response
+from ministack.core.arn import ArnParseError, parse_arn
+from ministack.core.responses import AccountScopedDict, error_response_json, get_account_id, json_response
 
 logger = logging.getLogger("rds-data")
-
-REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 
 # Active transactions: txn_id -> {conn, engine, resourceArn, database}
 _transactions: dict = {}
@@ -71,10 +69,13 @@ def _stub_success():
 
 
 def _cluster_id_from_arn(resource_arn):
-    """Extract cluster identifier from an ARN."""
-    parts = resource_arn.split(":")
-    if len(parts) >= 7:
-        return parts[6]
+    """Return a stable, region-qualified key for per-cluster stub state."""
+    try:
+        spec = parse_arn(resource_arn)
+    except ArnParseError:
+        return resource_arn
+    if spec.service == "rds":
+        return f"{spec.account_id}:{spec.region}:{spec.resource}"
     return resource_arn
 
 
@@ -225,28 +226,31 @@ def _resolve_cluster(resource_arn):
     """Find RDS cluster and a member instance from a resourceArn."""
     from ministack.services import rds
 
-    # Parse ARN: arn:aws:rds:REGION:ACCOUNT:cluster:IDENTIFIER
-    parts = resource_arn.split(":")
-    if len(parts) >= 7 and parts[5] == "cluster":
-        cluster_id = parts[6]
-    elif len(parts) >= 7 and parts[5] == "db":
-        # Instance ARN: arn:aws:rds:REGION:ACCOUNT:db:IDENTIFIER
-        instance_id = parts[6]
-        instance = rds._instances.get(instance_id)
+    parsed = rds._parse_rds_arn(resource_arn)
+    if not parsed:
+        return None, None
+
+    spec, resource_type, resource_id = parsed
+    if resource_type == "db":
+        if spec.account_id != get_account_id():
+            return None, None
+        instance = rds._instances.get_scoped(spec.account_id, spec.region, resource_id)
         if instance:
             return instance, instance.get("Engine", "postgres")
         return None, None
-    else:
+
+    if resource_type != "cluster":
         return None, None
 
-    cluster = rds._clusters.get(cluster_id)
+    cluster = rds._resolve_cluster(resource_arn)
     if not cluster:
         return None, None
 
     engine = cluster.get("Engine", "postgres")
+    cluster_id = cluster["DBClusterIdentifier"]
 
     # Find an instance belonging to this cluster
-    for inst in rds._instances.values():
+    for inst in rds._instances.values_scoped(spec.account_id, spec.region):
         if inst.get("DBClusterIdentifier") == cluster_id:
             return inst, engine
 
@@ -262,29 +266,31 @@ def _get_secret_credentials(secret_arn):
     """
     from ministack.services import secretsmanager
 
-    for _name, secret in secretsmanager._secrets.items():
-        if secret.get("ARN") == secret_arn or _name == secret_arn:
-            # Find the AWSCURRENT version
-            for _vid, ver in secret.get("Versions", {}).items():
-                if "AWSCURRENT" in ver.get("Stages", []):
-                    secret_string = ver.get("SecretString")
-                    if secret_string:
-                        try:
-                            parsed = json.loads(secret_string)
-                            return (parsed.get("username"),
-                                    parsed.get("password", secret_string))
-                        except (json.JSONDecodeError, TypeError):
-                            return None, secret_string
-            # Fallback to any version
-            for _vid, ver in secret.get("Versions", {}).items():
-                secret_string = ver.get("SecretString")
-                if secret_string:
-                    try:
-                        parsed = json.loads(secret_string)
-                        return (parsed.get("username"),
-                                parsed.get("password", secret_string))
-                    except (json.JSONDecodeError, TypeError):
-                        return None, secret_string
+    _name, secret = secretsmanager._resolve(secret_arn, use_arn_scope=True)
+    if not secret:
+        return None, None
+
+    # Find the AWSCURRENT version
+    for _vid, ver in secret.get("Versions", {}).items():
+        if "AWSCURRENT" in ver.get("Stages", []):
+            secret_string = ver.get("SecretString")
+            if secret_string:
+                try:
+                    parsed = json.loads(secret_string)
+                    return (parsed.get("username"),
+                            parsed.get("password", secret_string))
+                except (json.JSONDecodeError, TypeError):
+                    return None, secret_string
+    # Fallback to any version
+    for _vid, ver in secret.get("Versions", {}).items():
+        secret_string = ver.get("SecretString")
+        if secret_string:
+            try:
+                parsed = json.loads(secret_string)
+                return (parsed.get("username"),
+                        parsed.get("password", secret_string))
+            except (json.JSONDecodeError, TypeError):
+                return None, secret_string
     return None, None
 
 

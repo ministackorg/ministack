@@ -2,6 +2,7 @@ import json
 import os
 import re
 import time
+import uuid as _uuid_mod
 from datetime import datetime
 from urllib.parse import urlparse
 
@@ -1346,6 +1347,159 @@ def test_s3_put_notification_sends_test_event(s3, sqs):
     assert "Records" not in body
 
 
+@pytest.mark.parametrize(
+    ("config_key", "arn_key", "target_arn"),
+    [
+        ("QueueConfigurations", "QueueArn", "not-an-arn"),
+        ("QueueConfigurations", "QueueArn", "arn:aws:rds:us-east-1:000000000000:db:wrong-service"),
+        ("TopicConfigurations", "TopicArn", "arn:aws:sqs:us-east-1:000000000000:wrong-service"),
+        (
+            "LambdaFunctionConfigurations",
+            "LambdaFunctionArn",
+            "arn:aws:sns:us-east-1:000000000000:wrong-service",
+        ),
+        ("QueueConfigurations", "QueueArn", "arn:aws:sqs:us-east-1:000000000001:s3-foreign-account-q"),
+        ("TopicConfigurations", "TopicArn", "arn:aws:sns:us-east-1:000000000001:s3-foreign-account-topic"),
+        (
+            "LambdaFunctionConfigurations",
+            "LambdaFunctionArn",
+            "arn:aws:lambda:us-east-1:000000000001:function:s3-foreign-account-fn",
+        ),
+        ("QueueConfigurations", "QueueArn", "arn:aws:sqs:us-west-2:000000000000:s3-foreign-region-q"),
+        ("TopicConfigurations", "TopicArn", "arn:aws:sns:us-west-2:000000000000:s3-foreign-region-topic"),
+        (
+            "LambdaFunctionConfigurations",
+            "LambdaFunctionArn",
+            "arn:aws:lambda:us-west-2:000000000000:function:s3-foreign-region-fn",
+        ),
+    ],
+)
+def test_s3_notification_rejects_invalid_or_out_of_scope_target_arns(
+    s3, config_key, arn_key, target_arn,
+):
+    bkt = f"s3-evt-invalid-arn-{_uuid_mod.uuid4().hex[:8]}"
+    s3.create_bucket(Bucket=bkt)
+
+    with pytest.raises(ClientError) as exc:
+        s3.put_bucket_notification_configuration(
+            Bucket=bkt,
+            NotificationConfiguration={
+                config_key: [
+                    {
+                        arn_key: target_arn,
+                        "Events": ["s3:ObjectCreated:*"],
+                    }
+                ],
+            },
+        )
+    assert exc.value.response["Error"]["Code"] == "InvalidArgument"
+
+
+def test_s3_notification_validates_target_region_against_bucket_region(s3):
+    bkt = f"s3-evt-bucket-region-{_uuid_mod.uuid4().hex[:8]}"
+    s3.create_bucket(
+        Bucket=bkt,
+        CreateBucketConfiguration={"LocationConstraint": "us-west-2"},
+    )
+
+    s3.put_bucket_notification_configuration(
+        Bucket=bkt,
+        NotificationConfiguration={
+            "QueueConfigurations": [
+                {
+                    "QueueArn": "arn:aws:sqs:us-west-2:000000000000:s3-west-region-q",
+                    "Events": ["s3:ObjectCreated:*"],
+                }
+            ],
+        },
+    )
+
+    with pytest.raises(ClientError) as exc:
+        s3.put_bucket_notification_configuration(
+            Bucket=bkt,
+            NotificationConfiguration={
+                "QueueConfigurations": [
+                    {
+                        "QueueArn": "arn:aws:sqs:us-east-1:000000000000:s3-east-region-q",
+                        "Events": ["s3:ObjectCreated:*"],
+                    }
+                ],
+            },
+        )
+    assert exc.value.response["Error"]["Code"] == "InvalidArgument"
+
+
+@pytest.mark.parametrize(
+    "target_arn",
+    [
+        "arn:aws:sqs:us-east-1:000000000001:shared-q",
+        "arn:aws:sqs:us-west-2:000000000000:shared-q",
+    ],
+)
+def test_s3_notification_sqs_delivery_rejects_out_of_scope_arns_without_name_fallback(
+    monkeypatch, target_arn,
+):
+    from ministack.services import s3 as s3mod
+    from ministack.services import sqs as sqsmod
+
+    messages = []
+    monkeypatch.setattr(s3mod, "get_account_id", lambda: "000000000000")
+    monkeypatch.setattr(sqsmod, "_queue_url", lambda name: f"url/{name}")
+    monkeypatch.setattr(sqsmod, "_queues", {"url/shared-q": {"messages": messages}})
+    monkeypatch.setattr(sqsmod, "_ensure_msg_fields", lambda msg: None)
+
+    s3mod._deliver_event_to_sqs(target_arn, {"Records": []}, "us-east-1")
+
+    assert messages == []
+
+
+@pytest.mark.parametrize(
+    "target_arn",
+    [
+        "arn:aws:sns:us-east-1:000000000001:shared-topic",
+        "arn:aws:sns:us-west-2:000000000000:shared-topic",
+    ],
+)
+def test_s3_notification_sns_delivery_rejects_out_of_scope_arns_before_fanout(
+    monkeypatch, target_arn,
+):
+    from ministack.services import s3 as s3mod
+    from ministack.services import sns as snsmod
+
+    fanouts = []
+    monkeypatch.setattr(s3mod, "get_account_id", lambda: "000000000000")
+    monkeypatch.setattr(snsmod, "_topics", {target_arn: {"subscriptions": []}})
+    monkeypatch.setattr(snsmod, "_fanout", lambda *args, **kwargs: fanouts.append(args))
+
+    s3mod._deliver_event_to_sns(target_arn, {"Records": []}, "us-east-1")
+
+    assert fanouts == []
+
+
+@pytest.mark.parametrize(
+    "target_arn",
+    [
+        "arn:aws:lambda:us-east-1:000000000001:function:shared-fn",
+        "arn:aws:lambda:us-west-2:000000000000:function:shared-fn",
+    ],
+)
+def test_s3_notification_lambda_delivery_rejects_out_of_scope_arns_before_lookup(
+    monkeypatch, target_arn,
+):
+    from ministack.services import lambda_svc as lambdamod
+    from ministack.services import s3 as s3mod
+
+    lookups = []
+    monkeypatch.setattr(s3mod, "get_account_id", lambda: "000000000000")
+    monkeypatch.setattr(
+        lambdamod,
+        "_get_func_record_for_ref",
+        lambda ref: lookups.append(ref) or ({}, {}, "shared-fn"),
+    )
+
+    s3mod._deliver_event_to_lambda(target_arn, {"Records": []}, "us-east-1")
+
+    assert lookups == []
 def test_s3_event_notification_cross_account():
     """Regression for #876: S3 event notifications must fire for non-default
     accounts. The event is delivered from a background thread; if that thread
@@ -1423,13 +1577,27 @@ def _wait_lambda_invoked(logs_client, function_name, marker, timeout=5.0):
     return False
 
 
-def _create_event_lambda(lam, name):
+def _regional_client(service: str, region: str):
+    import boto3
+    from botocore.config import Config
+
+    return boto3.client(
+        service,
+        endpoint_url=os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566"),
+        aws_access_key_id="test",
+        aws_secret_access_key="test",
+        region_name=region,
+        config=Config(region_name=region, retries={"mode": "standard"}, max_pool_connections=50),
+    )
+
+
+def _create_event_lambda(lam, name, marker="S3EVT"):
     import io as _io
     import zipfile as _zip
     code = (
         "def handler(event, context):\n"
         "    import json\n"
-        "    print('S3EVT', json.dumps(event))\n"
+        f"    print('{marker}', context.invoked_function_arn, json.dumps(event))\n"
         "    return {'ok': True}\n"
     )
     buf = _io.BytesIO()
@@ -1466,6 +1634,43 @@ def test_s3_event_notification_to_lambda_boto3_default(s3, lam, logs):
         "Lambda was not invoked for boto3-shaped notification config"
 
 
+def test_s3_event_notification_to_lambda_validates_bucket_region(s3, lam):
+    fname = "s3-evt-lam-region"
+    _create_event_lambda(lam, fname, marker="east")
+    west_lam = _regional_client("lambda", "us-west-2")
+    west_logs = _regional_client("logs", "us-west-2")
+    west_arn = _create_event_lambda(west_lam, fname, marker="west")
+
+    s3.create_bucket(Bucket="s3-evt-lam-region-bkt")
+    with pytest.raises(ClientError) as exc:
+        s3.put_bucket_notification_configuration(
+            Bucket="s3-evt-lam-region-bkt",
+            NotificationConfiguration={
+                "LambdaFunctionConfigurations": [
+                    {"LambdaFunctionArn": west_arn, "Events": ["s3:ObjectCreated:*"]},
+                ],
+            },
+        )
+    assert exc.value.response["Error"]["Code"] == "InvalidArgument"
+
+    s3.create_bucket(
+        Bucket="s3-evt-lam-west-bkt",
+        CreateBucketConfiguration={"LocationConstraint": "us-west-2"},
+    )
+    s3.put_bucket_notification_configuration(
+        Bucket="s3-evt-lam-west-bkt",
+        NotificationConfiguration={
+            "LambdaFunctionConfigurations": [
+                {"LambdaFunctionArn": west_arn, "Events": ["s3:ObjectCreated:*"]},
+            ],
+        },
+    )
+    s3.put_object(Bucket="s3-evt-lam-west-bkt", Key="regional.txt", Body=b"hi")
+
+    assert _wait_lambda_invoked(west_logs, fname, "regional.txt"), \
+        "S3 notification did not invoke the Lambda from the ARN's region"
+
+
 def test_s3_event_notification_to_lambda_modern_xml(s3, lam, logs):
     """Issue #649: AWS SDK for Java v2, Go SDK, Terraform, and hand-crafted XML
     all send <LambdaFunctionArn> instead of the legacy <CloudFunction> tag.
@@ -1488,7 +1693,7 @@ def test_s3_event_notification_to_lambda_modern_xml(s3, lam, logs):
         '</NotificationConfiguration>'
     )
     req = _urlreq.Request(
-        "http://localhost:4566/s3-evt-lam-modern-bkt?notification",
+        f"{os.environ.get('MINISTACK_ENDPOINT', 'http://localhost:4566')}/s3-evt-lam-modern-bkt?notification",
         data=modern_xml.encode(),
         method="PUT",
         headers={"Content-Type": "application/xml", "Authorization": "AWS test:test"},
@@ -1519,7 +1724,7 @@ def test_s3_event_notification_to_lambda_with_filter(s3, lam, logs):
         '</NotificationConfiguration>'
     )
     req = _urlreq.Request(
-        "http://localhost:4566/s3-evt-lam-filter-bkt?notification",
+        f"{os.environ.get('MINISTACK_ENDPOINT', 'http://localhost:4566')}/s3-evt-lam-filter-bkt?notification",
         data=modern_xml.encode(), method="PUT",
         headers={"Content-Type": "application/xml", "Authorization": "AWS test:test"},
     )
@@ -2091,7 +2296,7 @@ def test_s3_post_object_unquoted_field_names(s3):
         f"--{boundary}--\r\n"
     ).encode()
     r = requests.post(
-        f"http://localhost:4566/qa-s3-post-tok",
+        "http://localhost:4566/qa-s3-post-tok",
         data=body,
         headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
     )
@@ -2729,7 +2934,9 @@ def test_s3_put_object_acl_canned(s3):
 def test_s3_put_object_acl_invalid_canned(s3):
     """Invalid x-amz-acl values are rejected with InvalidArgument (400)."""
     import uuid as _u
+
     from botocore.exceptions import ClientError
+
     bucket = f"acl-bad-{_u.uuid4().hex[:8]}"
     s3.create_bucket(Bucket=bucket)
     s3.put_object(Bucket=bucket, Key="k", Body=b"x")
@@ -2743,7 +2950,9 @@ def test_s3_put_object_acl_invalid_canned(s3):
 def test_s3_get_object_acl_no_such_key(s3):
     """GetObjectAcl on a missing key returns NoSuchKey (404)."""
     import uuid as _u
+
     from botocore.exceptions import ClientError
+
     bucket = f"acl-missing-{_u.uuid4().hex[:8]}"
     s3.create_bucket(Bucket=bucket)
     with pytest.raises(ClientError) as exc:

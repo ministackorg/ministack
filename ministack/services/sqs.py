@@ -32,11 +32,12 @@ import re
 import struct
 import threading
 import time
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, urlparse
 from xml.sax.saxutils import escape as _esc
 
+from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.persistence import PERSIST_STATE, load_state
-from ministack.core.responses import AccountScopedDict, get_account_id, get_region, md5_hash, new_uuid, now_iso
+from ministack.core.responses import AccountRegionScopedDict, get_account_id, get_region, md5_hash, new_uuid, now_iso
 
 logger = logging.getLogger("sqs")
 
@@ -44,11 +45,12 @@ logger = logging.getLogger("sqs")
 # #x9 | #xA | #xD | #x20-#xD7FF | #xE000-#xFFFD | #x10000-#x10FFFF):
 # everything below #x20 except #x9/#xA/#xD, the surrogate block #xD800-#xDFFF, and #xFFFE/#xFFFF.
 _INVALID_SQS_CHARS_RE = re.compile("[\x00-\x08\x0b\x0c\x0e-\x1f\ud800-\udfff\ufffe\uffff]")
+_ACCOUNT_ID_RE = re.compile(r"^\d{12}$")
 
 # ── Module-level state ──────────────────────────────────────
 
-_queues = AccountScopedDict()
-_queue_name_to_url = AccountScopedDict()
+_queues = AccountRegionScopedDict()
+_queue_name_to_url = AccountRegionScopedDict()
 _queues_lock = threading.Lock()
 
 
@@ -56,8 +58,8 @@ _queues_lock = threading.Lock()
 
 def get_state():
     # Both must be deepcopy(asd): dict(asd) iterates only the current
-    # request's tenant via AccountScopedDict.__iter__, so other tenants'
-    # name→url mappings would silently disappear at shutdown
+    # request's account/region via AccountRegionScopedDict.__iter__, so other
+    # tenants' name→url mappings would silently disappear at shutdown
     # serialisation. Same bug family as #492.
     return {
         "queues": copy.deepcopy(_queues),
@@ -68,18 +70,8 @@ def get_state():
 def restore_state(data):
     if data:
         _queues.update(data.get("queues", {}))
-        _queue_name_to_url.update(data.get("queue_name_to_url", {}))
-
-
-try:
-    _restored = load_state("sqs")
-    if _restored:
-        restore_state(_restored)
-except Exception:
-    import logging
-    logging.getLogger(__name__).exception(
-        "Failed to restore persisted state; continuing with fresh store"
-    )
+        _queue_name_to_url.clear()
+        _rebuild_queue_name_index()
 
 REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 DEFAULT_HOST = os.environ.get("MINISTACK_HOST", "localhost")
@@ -100,7 +92,106 @@ class _Err(Exception):
 # ── Queue URL ───────────────────────────────────────────────
 
 def _queue_url(name: str) -> str:
-    return f"http://{DEFAULT_HOST}:{DEFAULT_PORT}/{get_account_id()}/{name}"
+    return _queue_url_for_account(get_account_id(), name)
+
+
+def _queue_url_for_account(account_id: str, name: str) -> str:
+    return f"http://{DEFAULT_HOST}:{DEFAULT_PORT}/{account_id}/{name}"
+
+
+def _queue_name_from_arn_spec(spec) -> str | None:
+    if (
+        spec.partition != "aws"
+        or spec.service != "sqs"
+        or not spec.region
+        or not spec.account_id
+        or not spec.resource
+        or ":" in spec.resource
+        or "/" in spec.resource
+    ):
+        return None
+    return spec.resource
+
+
+def _queue_by_arn(arn: str) -> dict | None:
+    try:
+        spec = parse_arn(arn)
+    except ArnParseError:
+        return None
+    name = _queue_name_from_arn_spec(spec)
+    if not name:
+        return None
+    canonical_url = _queue_name_to_url.get_scoped(spec.account_id, spec.region, name)
+    if not canonical_url:
+        canonical_url = _queue_url_for_account(spec.account_id, name)
+    q = _queues.get_scoped(spec.account_id, spec.region, canonical_url)
+    if q and q.get("attributes", {}).get("QueueArn") == arn:
+        return q
+    return None
+
+
+def _queue_ref_from_urlish(url: str) -> tuple[str | None, str]:
+    if not url:
+        return None, ""
+    if "://" in url:
+        parts = urlparse(url).path.strip("/").split("/")
+    else:
+        parts = url.strip("/").split("/")
+    if len(parts) >= 2:
+        return parts[-2], parts[-1]
+    return None, parts[-1] if parts else url
+
+
+def _queue_scope_from_record(scoped_key, queue: dict) -> tuple[str, str, str, str] | None:
+    if len(scoped_key) == 3:
+        account_id, region, url = scoped_key
+    elif len(scoped_key) == 2:
+        account_id, url = scoped_key
+        region = get_region()
+    else:
+        return None
+
+    name = queue.get("name") if isinstance(queue, dict) else None
+    arn = queue.get("attributes", {}).get("QueueArn", "") if isinstance(queue, dict) else ""
+    try:
+        spec = parse_arn(arn)
+    except ArnParseError:
+        spec = None
+    if spec:
+        parsed_name = _queue_name_from_arn_spec(spec)
+        if parsed_name:
+            account_id = spec.account_id
+            region = spec.region
+            name = parsed_name
+    if not name:
+        _account_from_url, name = _queue_ref_from_urlish(url)
+    if not name:
+        return None
+    return account_id, region, name, url
+
+
+def _rebuild_queue_name_index() -> None:
+    for scoped_key, queue in _queues.all_items():
+        scope = _queue_scope_from_record(scoped_key, queue)
+        if not scope:
+            continue
+        account_id, region, name, url = scope
+        _queue_name_to_url.set_scoped(account_id, region, name, url)
+
+
+# Import-time state restore. MUST run after restore_state AND every symbol it
+# references (here _rebuild_queue_name_index, defined just above) are bound —
+# otherwise the import-time call NameErrors, the bare except swallows it, and all
+# persisted SQS state is silently dropped on restart (the #492/#494 pattern).
+try:
+    _restored = load_state("sqs")
+    if _restored:
+        restore_state(_restored)
+except Exception:
+    import logging
+    logging.getLogger(__name__).exception(
+        "Failed to restore persisted state; continuing with fresh store"
+    )
 
 
 # ────────────────────────────────────────────────────────────
@@ -203,6 +294,18 @@ def _validate_redrive_policy(rp_str: str) -> None:
     except (TypeError, ValueError):
         raise _Err("InvalidAttributeValue", err_msg, 400)
     if mrc_int < 1 or mrc_int > 1000:
+        raise _Err("InvalidAttributeValue", err_msg, 400)
+    try:
+        dlq_spec = parse_arn(dlta)
+    except ArnParseError:
+        raise _Err("InvalidAttributeValue", err_msg, 400)
+    if (
+        _queue_name_from_arn_spec(dlq_spec) is None
+        or dlq_spec.account_id != get_account_id()
+        or dlq_spec.region != get_region()
+    ):
+        raise _Err("InvalidAttributeValue", err_msg, 400)
+    if _queue_by_arn(dlta) is None:
         raise _Err("InvalidAttributeValue", err_msg, 400)
 
 
@@ -854,8 +957,10 @@ def _get_q(url: str) -> dict:
         # This handles cases where the hostname differs (e.g. docker-compose
         # service name "ministack" vs "localhost"), or when a bare queue name
         # is passed instead of a full URL (supported by AWS and some SDKs).
-        parts = url.rstrip("/").split("/")
-        name = parts[-1] if len(parts) >= 2 else url
+        account_id, name = _queue_ref_from_urlish(url)
+        if account_id and _ACCOUNT_ID_RE.match(account_id) and account_id != get_account_id():
+            raise _Err("QueueDoesNotExist",
+                        "The specified queue does not exist for this wsdl version.")
         canonical_url = _queue_name_to_url.get(name)
         if canonical_url:
             q = _queues.get(canonical_url)
@@ -986,8 +1091,7 @@ def _dlq_sweep(q: dict) -> None:
     if not max_rc or not arn:
         return
 
-    dlq = next((qq for qq in _queues.values()
-                if qq["attributes"].get("QueueArn") == arn), None)
+    dlq = _queue_by_arn(arn)
     if dlq is None:
         return
 

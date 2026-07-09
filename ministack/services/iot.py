@@ -40,6 +40,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Awaitable, Callable
 
+from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountScopedDict,
@@ -217,6 +218,25 @@ def _now_epoch() -> float:
 
 def _thing_arn(name: str) -> str:
     return f"arn:aws:iot:{get_region()}:{get_account_id()}:thing/{name}"
+
+
+def _thing_name_from_arn(arn: str) -> str:
+    try:
+        spec = parse_arn(arn)
+    except ArnParseError:
+        return ""
+    prefix = "thing/"
+    if (
+        spec.service != "iot"
+        or spec.account_id != get_account_id()
+        or spec.region != get_region()
+        or not spec.resource.startswith(prefix)
+    ):
+        return ""
+    name = spec.resource[len(prefix):]
+    if not name or "/" in name:
+        return ""
+    return name
 
 
 def _thing_type_arn(name: str) -> str:
@@ -1024,7 +1044,7 @@ def _list_principal_things(headers: dict, qp: dict) -> tuple:
         return _error_not_found("Principal", principal)
     things = []
     for arn in cert.get("attachedThings", []):
-        tname = arn.rsplit("/", 1)[-1]
+        tname = _thing_name_from_arn(arn)
         if tname in _things:
             things.append(tname)
     return json_response({"things": things})

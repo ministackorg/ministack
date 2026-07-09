@@ -27,6 +27,7 @@ import re
 import time
 from urllib.parse import unquote
 
+from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.persistence import load_state
 from ministack.core.responses import AccountScopedDict, get_account_id, get_region, new_uuid
 
@@ -402,6 +403,30 @@ def _resource_exists(resource_arn: str) -> bool:
     return any(b.get("brokerArn") == resource_arn for b in _brokers.values())
 
 
+def _resolve_broker_arn(resource_arn: str):
+    try:
+        spec = parse_arn(resource_arn)
+    except ArnParseError:
+        return None, _err(404, "ResourceArn", ERROR_MESSAGES["RESOURCE_NOT_FOUND"].format(resource_arn))
+
+    if (
+        spec.partition != "aws"
+        or spec.service != "mq"
+        or spec.region != get_region()
+        or spec.account_id != get_account_id()
+    ):
+        return None, _err(404, "ResourceArn", ERROR_MESSAGES["RESOURCE_NOT_FOUND"].format(resource_arn))
+
+    resource_type, sep, broker_id = spec.resource.partition(":")
+    if resource_type != "broker" or not sep or not broker_id:
+        return None, _err(404, "ResourceArn", ERROR_MESSAGES["RESOURCE_NOT_FOUND"].format(resource_arn))
+
+    broker = _brokers.get(broker_id)
+    if not broker or broker.get("brokerArn") != resource_arn:
+        return None, _err(404, "ResourceArn", ERROR_MESSAGES["RESOURCE_NOT_FOUND"].format(resource_arn))
+    return resource_arn, None
+
+
 def _get_broker_or_404(broker_id: str):
     """Retrieve broker or return 404 error tuple."""
     broker = _brokers.get(broker_id)
@@ -682,15 +707,17 @@ def _list_broker_instance_options(query_params: dict) -> tuple:
 
 def _list_tags(resource_arn: str) -> tuple:
     """List all tags for a broker resource."""
-    if not _resource_exists(resource_arn):
-        return _err(404, "ResourceArn", ERROR_MESSAGES["RESOURCE_NOT_FOUND"].format(resource_arn))
+    resource_arn, err = _resolve_broker_arn(resource_arn)
+    if err:
+        return err
     return _ok({"tags": dict(_tags.get(resource_arn, {}))})
 
 
 def _create_tags(resource_arn: str, body: dict) -> tuple:
     """Add or update tags on a broker resource."""
-    if not _resource_exists(resource_arn):
-        return _err(404, "ResourceArn", ERROR_MESSAGES["RESOURCE_NOT_FOUND"].format(resource_arn))
+    resource_arn, err = _resolve_broker_arn(resource_arn)
+    if err:
+        return err
     tags = body.get("tags") if isinstance(body, dict) else None
     if not isinstance(tags, dict):
         return _err(400, "Tags", ERROR_MESSAGES["TAGS_INVALID"])
@@ -700,8 +727,9 @@ def _create_tags(resource_arn: str, body: dict) -> tuple:
 
 def _delete_tags(resource_arn: str, query_params: dict) -> tuple:
     """Delete specific tags from a broker resource."""
-    if not _resource_exists(resource_arn):
-        return _err(404, "ResourceArn", ERROR_MESSAGES["RESOURCE_NOT_FOUND"].format(resource_arn))
+    resource_arn, err = _resolve_broker_arn(resource_arn)
+    if err:
+        return err
     tag_keys = query_params.get("tagKeys")
     if not tag_keys:
         return _err(400, "TagKeys", ERROR_MESSAGES["TAG_KEYS_REQUIRED"])

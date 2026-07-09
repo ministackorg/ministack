@@ -10,8 +10,10 @@ here, not a real container runner.
 import copy
 import json
 import logging
+import re
 import time
 
+from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.responses import (
     AccountScopedDict,
     error_response_json,
@@ -26,6 +28,8 @@ _compute_envs = AccountScopedDict()   # name -> dict
 _job_queues = AccountScopedDict()     # name -> dict
 _job_definitions = AccountScopedDict()  # name -> [revisions]
 _jobs = AccountScopedDict()           # job_id -> dict
+
+_JOB_QUEUE_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 
 
 def reset():
@@ -76,6 +80,39 @@ def _jd_arn(name, revision):
 
 def _job_arn(job_id):
     return f"arn:aws:batch:{get_region()}:{get_account_id()}:job/{job_id}"
+
+
+def _job_queue_name_from_ref(ref):
+    if not ref or not ref.startswith("arn:"):
+        return ref, None
+    try:
+        spec = parse_arn(ref)
+    except ArnParseError:
+        return "", _batch_client_exception(ref)
+    if spec.service != "batch" or spec.account_id != get_account_id():
+        return "", _batch_client_exception(ref)
+    if spec.region != get_region():
+        return None, None
+    if not spec.resource.startswith("job-queue/"):
+        return "", _batch_client_exception(ref)
+    name = spec.resource.split("/", 1)[1]
+    if not _JOB_QUEUE_NAME_RE.fullmatch(name):
+        return "", _batch_client_exception(ref)
+    return name, None
+
+
+def _batch_client_exception(identifier):
+    return error_response_json(
+        "ClientException",
+        f"Invalid job queue identifier: {identifier}",
+        400,
+    )
+
+
+def _job_queue_matches(stored_ref, query_ref, queue_name):
+    if not queue_name:
+        return False
+    return stored_ref in {query_ref, queue_name, _jq_arn(queue_name)}
 
 
 def _now_ms():
@@ -144,7 +181,9 @@ def _describe_job_queues(p):
         out = []
         for n in names:
             # Accept both name and ARN per AWS behaviour.
-            short = n.split("/")[-1]
+            short, error = _job_queue_name_from_ref(n)
+            if error:
+                return error
             if short in _job_queues:
                 out.append(_job_queues[short])
     else:
@@ -217,10 +256,13 @@ def _describe_jobs(p):
 
 def _list_jobs(p):
     queue = p.get("jobQueue", "")
+    queue_name, queue_error = _job_queue_name_from_ref(queue) if queue else ("", None)
+    if queue_error:
+        return queue_error
     status_filter = p.get("jobStatus")
     out = []
     for j in _jobs.values():
-        if queue and j.get("jobQueue") not in (queue, _jq_arn(queue.split("/")[-1])):
+        if queue and not _job_queue_matches(j.get("jobQueue"), queue, queue_name):
             continue
         if status_filter and j.get("status") != status_filter:
             continue

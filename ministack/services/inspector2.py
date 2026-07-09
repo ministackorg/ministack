@@ -9,6 +9,7 @@ import logging
 import time
 import uuid
 
+from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountScopedDict,
@@ -34,6 +35,29 @@ def _now_iso():
 
 def _finding_arn(acct_id, finding_id):
     return f"arn:aws:inspector2:{get_region()}:{acct_id}:finding/{finding_id}"
+
+
+def _parse_local_resource_arn(arn, account_id, resource_prefixes):
+    try:
+        spec = parse_arn(arn)
+    except ArnParseError:
+        return None
+
+    if spec.service != "inspector2" or spec.account_id != account_id or spec.region != get_region():
+        return None
+
+    for prefix in resource_prefixes:
+        if spec.resource.startswith(prefix) and spec.resource[len(prefix):]:
+            return spec
+    return None
+
+
+def _resource_not_found(arn):
+    return error_response_json(
+        "ResourceNotFoundException",
+        f"The resource with arn '{arn}' does not exist",
+        400,
+    )
 
 
 _STUB_PACKAGES = [
@@ -836,6 +860,8 @@ def _tag_resource(data, account_id):
     tags = data.get("tags", {})
     if not arn:
         return error_response_json("ValidationException", "resourceArn is required", 400)
+    if not _parse_local_resource_arn(arn, account_id, ("finding/", "filter/")):
+        return _resource_not_found(arn)
 
     existing = _tags.get(account_id, {}).get(arn, {})
     existing.update(tags)
@@ -850,6 +876,8 @@ def _untag_resource(data, account_id):
     tag_keys = data.get("tagKeys", [])
     if not arn:
         return error_response_json("ValidationException", "resourceArn is required", 400)
+    if not _parse_local_resource_arn(arn, account_id, ("finding/", "filter/")):
+        return _resource_not_found(arn)
 
     existing = _tags.get(account_id, {}).get(arn, {})
     for key in tag_keys:
@@ -864,6 +892,8 @@ def _list_tags_for_resource(data, account_id):
     arn = data.get("resourceArn", "")
     if not arn:
         return error_response_json("ValidationException", "resourceArn is required", 400)
+    if not _parse_local_resource_arn(arn, account_id, ("finding/", "filter/")):
+        return _resource_not_found(arn)
 
     tags = _tags.get(account_id, {}).get(arn, {})
     return json_response({"tags": tags})
@@ -914,8 +944,8 @@ def _delete_filter(data, account_id):
     if not arn:
         return error_response_json("ValidationException", "arn is required", 400)
 
-    # Extract filter name from ARN: arn:aws:inspector2:...:filter/<name>
-    name = arn.split("/")[-1] if "/" in arn else ""
+    spec = _parse_local_resource_arn(arn, account_id, ("filter/",))
+    name = spec.resource[len("filter/"):] if spec else ""
     account_filters = _filters.get(account_id, {})
 
     if name not in account_filters:

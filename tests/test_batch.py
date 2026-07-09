@@ -1,5 +1,6 @@
 import boto3
 import pytest
+from botocore.exceptions import ClientError
 
 ENDPOINT = "http://localhost:4566"
 REGION = "us-east-1"
@@ -87,6 +88,66 @@ def test_batch_describe_job_queue_by_name_or_arn(batch):
     arn = by_name[0]["jobQueueArn"]
     by_arn = batch.describe_job_queues(jobQueues=[arn])["jobQueues"]
     assert any(q["jobQueueName"] == name for q in by_arn)
+
+
+def test_batch_list_jobs_by_job_queue_arn(batch):
+    jq_name = f"jq-arn-{_uid()}"
+    jd_name = f"jd-arn-{_uid()}"
+    job_name = f"j-arn-{_uid()}"
+    jq = batch.create_job_queue(jobQueueName=jq_name, priority=1, computeEnvironmentOrder=[])
+    jd = batch.register_job_definition(
+        jobDefinitionName=jd_name,
+        type="container",
+        containerProperties={"image": "busybox", "memory": 128, "vcpus": 1},
+    )
+    submitted = batch.submit_job(
+        jobName=job_name,
+        jobQueue=jq["jobQueueArn"],
+        jobDefinition=jd["jobDefinitionArn"],
+    )
+
+    listed = batch.list_jobs(jobQueue=jq["jobQueueArn"])["jobSummaryList"]
+
+    assert any(j["jobId"] == submitted["jobId"] for j in listed)
+
+
+def test_batch_job_queue_arn_inputs_do_not_tail_match(batch):
+    jq_name = f"jq-bad-arn-{_uid()}"
+    jd_name = f"jd-bad-arn-{_uid()}"
+    job_name = f"j-bad-arn-{_uid()}"
+    jq = batch.create_job_queue(jobQueueName=jq_name, priority=1, computeEnvironmentOrder=[])
+    jd = batch.register_job_definition(
+        jobDefinitionName=jd_name,
+        type="container",
+        containerProperties={"image": "busybox", "memory": 128, "vcpus": 1},
+    )
+    submitted = batch.submit_job(
+        jobName=job_name,
+        jobQueue=jq["jobQueueArn"],
+        jobDefinition=jd["jobDefinitionArn"],
+    )
+
+    wrong_service = f"arn:aws:sqs:us-east-1:000000000000:job-queue/{jq_name}"
+    wrong_account = f"arn:aws:batch:us-east-1:111111111111:job-queue/{jq_name}"
+    wrong_resource = f"arn:aws:batch:us-east-1:000000000000:compute-environment/{jq_name}"
+    malformed = f"arn:aws:batch:us-east-1:000000000000:job-queue/{jq_name}/extra"
+    foreign_region = f"arn:aws:batch:us-west-2:000000000000:job-queue/{jq_name}"
+
+    def _assert_client_exception(call):
+        with pytest.raises(ClientError) as exc:
+            call()
+        assert exc.value.response["Error"]["Code"] == "ClientException"
+
+    for bad_ref in [wrong_service, wrong_account, wrong_resource, malformed]:
+        _assert_client_exception(
+            lambda bad_ref=bad_ref: batch.describe_job_queues(jobQueues=[bad_ref])
+        )
+        _assert_client_exception(lambda bad_ref=bad_ref: batch.list_jobs(jobQueue=bad_ref))
+
+    assert batch.describe_job_queues(jobQueues=[foreign_region])["jobQueues"] == []
+    assert batch.list_jobs(jobQueue=foreign_region)["jobSummaryList"] == []
+    listed_by_name = batch.list_jobs(jobQueue=jq_name)["jobSummaryList"]
+    assert any(j["jobId"] == submitted["jobId"] for j in listed_by_name)
 
 
 def test_batch_account_isolation():

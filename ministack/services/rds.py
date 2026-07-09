@@ -19,7 +19,8 @@ Supports: CreateDBInstance, DeleteDBInstance, DescribeDBInstances, ModifyDBInsta
           DescribeDBEngineVersions, DescribeOrderableDBInstanceOptions,
           DescribePendingMaintenanceActions,
           CreateGlobalCluster, DescribeGlobalClusters, DeleteGlobalCluster,
-          RemoveFromGlobalCluster, ModifyGlobalCluster.
+          RemoveFromGlobalCluster, ModifyGlobalCluster,
+          SwitchoverGlobalCluster, FailoverGlobalCluster.
 
 When Docker is available, CreateDBInstance spins up a real Postgres/MySQL container
 and returns the actual host:port as the endpoint.
@@ -33,6 +34,7 @@ parameters.
 import contextvars
 import copy
 import datetime
+import hashlib
 import json
 import logging
 import os
@@ -42,8 +44,16 @@ import time
 from urllib.parse import parse_qs
 from xml.sax.saxutils import escape as _esc
 
+from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.persistence import load_state
-from ministack.core.responses import AccountScopedDict, apply_image_prefix, get_account_id, get_region, new_uuid
+from ministack.core.responses import (
+    AccountRegionScopedDict,
+    AccountScopedDict,
+    apply_image_prefix,
+    get_account_id,
+    get_region,
+    new_uuid,
+)
 
 logger = logging.getLogger("rds")
 
@@ -60,14 +70,14 @@ DOCKER_NETWORK = os.environ.get("DOCKER_NETWORK", "")
 # behavior unchanged.
 RDS_PUBLIC_ENDPOINT = os.environ.get("MINISTACK_RDS_PUBLIC_ENDPOINT", "0").lower() in ("1", "true", "yes")
 
-_instances = AccountScopedDict()
-_clusters = AccountScopedDict()
-_subnet_groups = AccountScopedDict()
-_param_groups = AccountScopedDict()
-_snapshots = AccountScopedDict()
-_db_cluster_param_groups = AccountScopedDict()
-_db_cluster_snapshots = AccountScopedDict()
-_option_groups = AccountScopedDict()
+_instances = AccountRegionScopedDict()
+_clusters = AccountRegionScopedDict()
+_subnet_groups = AccountRegionScopedDict()
+_param_groups = AccountRegionScopedDict()
+_snapshots = AccountRegionScopedDict()
+_db_cluster_param_groups = AccountRegionScopedDict()
+_db_cluster_snapshots = AccountRegionScopedDict()
+_option_groups = AccountRegionScopedDict()
 _global_clusters = AccountScopedDict()
 _tags = AccountScopedDict()
 _port_counter = [BASE_PORT]
@@ -115,20 +125,38 @@ def restore_state(data):
         _port_counter[0] = data["port_counter"]
     instances_data = data.get("instances", {})
     to_respawn = []
-    if isinstance(instances_data, AccountScopedDict):
-        # New format: AccountScopedDict with full multi-account data
+    if isinstance(instances_data, AccountRegionScopedDict):
         for key, inst in list(instances_data._data.items()):
+            account_id, region, instance_id = key
             inst["_docker_container_id"] = None
             inst["DBInstanceStatus"] = "creating"
+            if RDS_PERSIST:
+                inst.setdefault("_docker_volume_name", _rds_docker_volume_name(instance_id, account_id, region))
             _instances._data[key] = inst
-            to_respawn.append((key[0], inst.get("DBInstanceIdentifier") or key[1], inst))
+            to_respawn.append((account_id, region, instance_id, inst))
+    elif isinstance(instances_data, AccountScopedDict):
+        # Legacy account-scoped format: preserve the instance ARN region when available.
+        for key, inst in list(instances_data._data.items()):
+            account_id, instance_id = key
+            inst["_docker_container_id"] = None
+            inst["DBInstanceStatus"] = "creating"
+            region = _best_effort_region_from_record_arn(inst, "DBInstanceArn")
+            if RDS_PERSIST:
+                inst.setdefault("_docker_volume_name", _legacy_rds_docker_volume_name(instance_id))
+                inst["_legacy_docker_container_name"] = _legacy_rds_docker_name(instance_id)
+            _instances._data[(account_id, region, instance_id)] = inst
+            to_respawn.append((account_id, region, inst.get("DBInstanceIdentifier") or instance_id, inst))
     else:
         # Legacy format: plain dict keyed by instance name
         for name, inst in instances_data.items():
             inst["_docker_container_id"] = None
             inst["DBInstanceStatus"] = "creating"
-            _instances[name] = inst
-            to_respawn.append((None, name, inst))
+            region = _best_effort_region_from_record_arn(inst, "DBInstanceArn")
+            if RDS_PERSIST:
+                inst.setdefault("_docker_volume_name", _legacy_rds_docker_volume_name(name))
+                inst["_legacy_docker_container_name"] = _legacy_rds_docker_name(name)
+            _instances.set_scoped(get_account_id(), region, name, inst)
+            to_respawn.append((None, region, name, inst))
 
     # Re-spin backing containers for persisted instances. Mirrors the MWAA
     # restore pattern: persistence saves the instance metadata but the Docker
@@ -136,16 +164,54 @@ def restore_state(data):
     # to bring it back. Without this, restored instances stay marked
     # "available" with no running container, and StartDBInstance is
     # metadata-only so it can't recover them either.
-    from ministack.core.responses import _request_account_id
-    for account_id, db_id, inst in to_respawn:
+    from ministack.core.responses import _request_account_id, _request_region
+    for account_id, region, db_id, inst in to_respawn:
         ctx = contextvars.copy_context()
 
-        def _runner(account_id=account_id, db_id=db_id, inst=inst):
+        def _runner(account_id=account_id, region=region, db_id=db_id, inst=inst):
             if account_id is not None:
                 _request_account_id.set(account_id)
+            if region is not None:
+                _request_region.set(region)
             _start_rds_container_for_instance(db_id, inst)
 
         threading.Thread(target=ctx.run, args=(_runner,), daemon=True).start()
+
+
+def _best_effort_region_from_record_arn(record, field):
+    """Return a region while restoring legacy RDS state.
+
+    This is intentionally best-effort persistence migration logic, not request
+    validation.
+    """
+    arn = record.get(field, "") if isinstance(record, dict) else ""
+    try:
+        region = parse_arn(arn).region
+    except ArnParseError:
+        return get_region()
+    return region or get_region()
+
+
+def _rds_docker_scope(account_id=None, region=None):
+    account_id = account_id or get_account_id()
+    region = region or get_region()
+    return hashlib.sha1(f"{account_id}:{region}".encode()).hexdigest()[:12]
+
+
+def _rds_docker_name(db_id, account_id=None, region=None):
+    return f"ministack-rds-{_rds_docker_scope(account_id, region)}-{db_id}"
+
+
+def _rds_docker_volume_name(db_id, account_id=None, region=None):
+    return f"ministack-rds-{_rds_docker_scope(account_id, region)}-{db_id}-data"
+
+
+def _legacy_rds_docker_name(db_id):
+    return f"ministack-rds-{db_id}"
+
+
+def _legacy_rds_docker_volume_name(db_id):
+    return f"ministack-rds-{db_id}-data"
 
 
 def _start_rds_container_for_instance(db_id, instance):
@@ -153,9 +219,9 @@ def _start_rds_container_for_instance(db_id, instance):
 
     Reads engine, credentials, and endpoint info from the persisted instance
     dict instead of CreateDBInstance request params. If a container with the
-    deterministic name ``ministack-rds-{db_id}`` already exists (e.g. host
-    rebooted but Docker preserved stopped containers), it is removed first so
-    a clean run can attach to the persistent named volume. Sets
+    deterministic account+Region scoped name already exists (e.g. host rebooted
+    but Docker preserved stopped containers), it is removed first so a clean run
+    can attach to the persistent named volume. Sets
     ``DBInstanceStatus`` to ``available`` on success, ``failed`` on Docker
     error.
     """
@@ -195,32 +261,37 @@ def _start_rds_container_for_instance(db_id, instance):
         instance["DBInstanceStatus"] = "available"
         return
 
-    container_name = f"ministack-rds-{db_id}"
-    try:
-        existing = docker_client.containers.get(container_name)
-        # `force=True` stops AND removes in one shot, including
-        # half-spawned "Created" containers that didn't fully start
-        # — those still hold port mappings and would collide with
-        # the next `containers.run` (#692 follow-up: doodaz saw
-        # a `Created` container blocking the bind).
+    container_name = _rds_docker_name(db_id)
+    stale_names = [container_name]
+    legacy_container_name = instance.pop("_legacy_docker_container_name", None)
+    if legacy_container_name and legacy_container_name != container_name:
+        stale_names.append(legacy_container_name)
+    for stale_name in stale_names:
         try:
-            existing.remove(force=True, v=False)
-        except Exception as e:
-            logger.warning("RDS: failed to remove stale container %s: %s",
-                           container_name, e)
-        # Verify the name is actually free now; if removal silently
-        # failed, abort respawn rather than crash inside `containers.run`
-        # with a confusing name-conflict error.
-        try:
-            docker_client.containers.get(container_name)
-            logger.warning("RDS: stale container %s still present after "
-                           "force-remove — aborting respawn", container_name)
-            instance["DBInstanceStatus"] = "failed"
-            return
+            existing = docker_client.containers.get(stale_name)
+            # `force=True` stops AND removes in one shot, including
+            # half-spawned "Created" containers that didn't fully start
+            # — those still hold port mappings and would collide with
+            # the next `containers.run` (#692 follow-up: doodaz saw
+            # a `Created` container blocking the bind).
+            try:
+                existing.remove(force=True, v=False)
+            except Exception as e:
+                logger.warning("RDS: failed to remove stale container %s: %s",
+                               stale_name, e)
+            # Verify the name is actually free now; if removal silently
+            # failed, abort respawn rather than crash inside `containers.run`
+            # with a confusing name-conflict error.
+            try:
+                docker_client.containers.get(stale_name)
+                logger.warning("RDS: stale container %s still present after "
+                               "force-remove — aborting respawn", stale_name)
+                instance["DBInstanceStatus"] = "failed"
+                return
+            except Exception:
+                pass  # Good — name is gone.
         except Exception:
-            pass  # Good — name is gone.
-    except Exception:
-        pass  # No existing container with that name — fine
+            pass  # No existing container with that name — fine
 
     ms_network = _get_ministack_network(docker_client)
     container_kwargs = dict(
@@ -228,13 +299,20 @@ def _start_rds_container_for_instance(db_id, instance):
         environment=env_vars,
         ports={f"{container_port}/tcp": host_port},
         name=container_name,
-        labels={"ministack": "rds", "db_id": db_id},
+        labels={
+            "ministack": "rds",
+            "db_id": db_id,
+            "account_id": get_account_id(),
+            "region": get_region(),
+        },
     )
     if ms_network:
         container_kwargs["network"] = ms_network
     if RDS_PERSIST:
+        volume_name = instance.get("_docker_volume_name") or _rds_docker_volume_name(db_id)
+        instance["_docker_volume_name"] = volume_name
         container_kwargs["volumes"] = {
-            f"ministack-rds-{db_id}-data": {"bind": data_path, "mode": "rw"},
+            volume_name: {"bind": data_path, "mode": "rw"},
         }
     else:
         container_kwargs["tmpfs"] = {
@@ -371,12 +449,19 @@ def _grant_mysql_master_user_privileges(host, port, master_user, master_pass, db
 
 
 def _try_database_connect(host, port, engine, user, password, db_name):
-    """Single auth-probe attempt. Returns True on success, False on a
-    transient failure. TCP readiness alone is not enough for MySQL/Postgres
-    images — they accept sockets before bootstrap creates users/databases —
-    so we open and close an authenticated connection. When the DB driver
-    isn't installed (lightweight image) we fall back to a one-shot TCP check.
+    """Single auth + query probe attempt.
+
+    TCP readiness alone is not enough for MySQL/Postgres images, and MySQL can
+    accept authenticated connections before it can reliably execute setup SQL.
+    When the DB driver isn't installed (lightweight image), fall back to TCP.
     """
+    def _execute_probe(conn):
+        cur = conn.cursor()
+        try:
+            cur.execute("SELECT 1")
+        finally:
+            cur.close()
+
     try:
         if _is_mysql_engine(engine):
             try:
@@ -388,6 +473,10 @@ def _try_database_connect(host, port, engine, user, password, db_name):
                 password=password, database=db_name or None,
                 connect_timeout=2, read_timeout=2, write_timeout=2,
                 autocommit=True)
+            try:
+                _execute_probe(conn)
+            finally:
+                conn.close()
         elif _is_postgres_engine(engine):
             try:
                 import psycopg2
@@ -397,9 +486,12 @@ def _try_database_connect(host, port, engine, user, password, db_name):
                 host=host, port=int(port), user=user,
                 password=password, dbname=db_name or "postgres",
                 connect_timeout=2)
+            try:
+                _execute_probe(conn)
+            finally:
+                conn.close()
         else:
             return _wait_for_port(host, port, timeout=1)
-        conn.close()
         return True
     except Exception as e:
         # Distinguish *permanent* auth failures from transient boot-time errors.
@@ -591,16 +683,226 @@ async def handle_request(method, path, headers, body, query_params):
 # Instance resolution helpers
 # ---------------------------------------------------------------------------
 
+def _parse_rds_arn(value):
+    try:
+        spec = parse_arn(value)
+    except ArnParseError:
+        return None
+    if spec.service != "rds":
+        return None
+    resource_type, sep, resource_id = spec.resource.partition(":")
+    if not sep or not resource_type or not resource_id:
+        return None
+    return spec, resource_type, resource_id
+
+
+def _regional_get(store, identifier, resource_type):
+    parsed = _parse_rds_arn(identifier)
+    if parsed:
+        spec, parsed_type, resource_id = parsed
+        if parsed_type != resource_type:
+            return None
+        if spec.account_id != get_account_id():
+            return None
+        return store.get_scoped(spec.account_id, spec.region, resource_id)
+    return store.get(identifier)
+
+
+def _request_region_get(store, identifier, resource_type):
+    parsed = _parse_rds_arn(identifier)
+    if parsed:
+        spec, parsed_type, resource_id = parsed
+        if parsed_type != resource_type:
+            return None
+        if spec.account_id != get_account_id():
+            return None
+        if spec.region != get_region():
+            return None
+        return store.get(resource_id)
+    return store.get(identifier)
+
+
+def _request_region_identifier(identifier, resource_type, store=None, arn_key=None):
+    resource_id = _request_region_resource_identifier(identifier, resource_type)
+    if resource_id is None:
+        return None
+    if store is not None and arn_key is not None and _parse_rds_arn(identifier):
+        resource = store.get(resource_id)
+        if not resource or resource.get(arn_key) != identifier:
+            return None
+    return resource_id
+
+
+def _request_region_resource_identifier(identifier, resource_type):
+    parsed = _parse_rds_arn(identifier)
+    if not parsed:
+        return identifier
+    spec, parsed_type, resource_id = parsed
+    if (
+        parsed_type == resource_type
+        and spec.account_id == get_account_id()
+        and spec.region == get_region()
+    ):
+        return resource_id
+    return None
+
+
+def _record_arn_in_request_scope(record, arn_key):
+    parsed = _parse_rds_arn(record.get(arn_key, ""))
+    if not parsed:
+        return False
+    spec, _resource_type, _resource_id = parsed
+    return spec.account_id == get_account_id() and spec.region == get_region()
+
+
+def _same_account_foreign_region_arn(identifier, resource_type):
+    parsed = _parse_rds_arn(identifier)
+    if not parsed:
+        return None
+    spec, parsed_type, _ = parsed
+    if parsed_type != resource_type:
+        return None
+    if spec.account_id != get_account_id():
+        return None
+    if spec.region == get_region():
+        return None
+    return spec
+
+
+def _request_scope_mismatch_arn(identifier, resource_type):
+    parsed = _parse_rds_arn(identifier)
+    if not parsed:
+        return None
+    spec, parsed_type, _ = parsed
+    if parsed_type != resource_type:
+        return None
+    if spec.account_id != get_account_id() or spec.region != get_region():
+        return spec
+    return None
+
+
+def _invalid_region_arn_error(identifier, parameter_name):
+    spec = _same_account_foreign_region_arn(identifier, "cluster")
+    if not spec:
+        return None
+    return _error(
+        "InvalidParameterValue",
+        f"The provided ARN ({identifier}) is invalid for this parameter "
+        f"({parameter_name}). Expected region = {get_region()}, "
+        f"actual region = {spec.region}",
+        400,
+    )
+
+
+def _invalid_db_instance_identifier_error(identifier, parameter_name="DBInstanceIdentifier"):
+    if not _request_scope_mismatch_arn(identifier, "db"):
+        return None
+    return _error(
+        "InvalidParameterValue",
+        f"The parameter {parameter_name} is not a valid identifier because it is longer than 63 characters.",
+        400,
+    )
+
+
+def _invalid_cluster_identifier_error(identifier):
+    if not _same_account_foreign_region_arn(identifier, "cluster"):
+        return None
+    return _error(
+        "InvalidParameterValue",
+        f"Invalid database cluster identifier:  {identifier}",
+        400,
+    )
+
+
+def _resource_not_found_error_for_arn(identifier):
+    if not _same_account_foreign_region_arn(identifier, "cluster"):
+        return None
+    return _error("ResourceNotFoundFault", f"DB cluster ARN {identifier} wasn't found.", 404)
+
+
+def _resolve_cluster(cluster_id):
+    """Look up a DB cluster by identifier in the request Region or by ARN Region.
+
+    Use this only for data-plane or global-topology operations whose AWS
+    semantics intentionally follow same-account member ARNs across Regions.
+    Normal regional control-plane APIs should use
+    ``_resolve_cluster_in_request_region``.
+    """
+    return _regional_get(_clusters, cluster_id, "cluster")
+
+
+def _resolve_cluster_in_request_region(cluster_id):
+    """Look up a DB cluster only in the request Region."""
+    return _request_region_get(_clusters, cluster_id, "cluster")
+
+
+def _resolve_global_cluster(global_id):
+    """Look up a global cluster by identifier."""
+    if _parse_rds_arn(global_id):
+        return None
+    return _global_clusters.get(global_id)
+
+
+def _global_cluster_member(cluster, is_writer):
+    return {
+        "DBClusterArn": cluster["DBClusterArn"],
+        "Readers": [],
+        "IsWriter": is_writer,
+        "GlobalWriteForwardingStatus": cluster.get("GlobalWriteForwardingStatus", "disabled"),
+        "SynchronizationStatus": "connected",
+    }
+
+
+def _global_cluster_member_in_request_region(global_cluster):
+    for member in global_cluster.get("GlobalClusterMembers", []):
+        parsed = _parse_rds_arn(member.get("DBClusterArn", ""))
+        if not parsed:
+            continue
+        spec, resource_type, _resource_id = parsed
+        if (
+            resource_type == "cluster"
+            and spec.account_id == get_account_id()
+            and spec.region == get_region()
+        ):
+            return member
+    return None
+
+
+def _refresh_global_cluster_readers(global_cluster):
+    members = global_cluster.get("GlobalClusterMembers", [])
+    reader_arns = [m["DBClusterArn"] for m in members if not m.get("IsWriter")]
+    for member in members:
+        member["Readers"] = reader_arns if member.get("IsWriter") else []
+
+
+def _set_global_cluster_writer(global_cluster, target_member):
+    for member in global_cluster.get("GlobalClusterMembers", []):
+        member["IsWriter"] = member["DBClusterArn"] == target_member["DBClusterArn"]
+    _refresh_global_cluster_readers(global_cluster)
+
+
+def _attach_cluster_to_global(global_cluster, cluster, is_writer):
+    members = [
+        m for m in global_cluster.setdefault("GlobalClusterMembers", [])
+        if m.get("DBClusterArn") != cluster["DBClusterArn"]
+    ]
+    members.append(_global_cluster_member(cluster, is_writer))
+    global_cluster["GlobalClusterMembers"] = members
+    _refresh_global_cluster_readers(global_cluster)
+    cluster["GlobalClusterIdentifier"] = global_cluster["GlobalClusterIdentifier"]
+    cluster["GlobalWriteForwardingStatus"] = "disabled"
+
+
 def _resolve_instance(db_id):
     """Look up an instance by DBInstanceIdentifier or DbiResourceId.
 
     AWS accepts either value for the DBInstanceIdentifier parameter in
     DescribeDBInstances and related APIs.
     """
-    inst = _instances.get(db_id)
+    inst = _request_region_get(_instances, db_id, "db")
     if inst:
         return inst
-    if db_id.startswith("db-"):
+    if isinstance(db_id, str) and db_id.startswith("db-"):
         for inst in _instances.values():
             if inst.get("DbiResourceId") == db_id:
                 return inst
@@ -632,7 +934,7 @@ def _register_instance_in_cluster(instance):
     cid = instance.get("DBClusterIdentifier")
     if not cid:
         return
-    cluster = _clusters.get(cid)
+    cluster = _resolve_cluster_in_request_region(cid)
     if not cluster:
         return
     members = cluster.setdefault("DBClusterMembers", [])
@@ -679,14 +981,20 @@ def _create_db_instance(p):
 
     # Inherit credentials from cluster when instance is a cluster member.
     cluster_id_param = _p(p, "DBClusterIdentifier")
-    if cluster_id_param and cluster_id_param in _clusters:
-        parent = _clusters[cluster_id_param]
+    parent = _resolve_cluster_in_request_region(cluster_id_param) if cluster_id_param else None
+    if parent:
+        cluster_id_param = parent["DBClusterIdentifier"]
         if not _p(p, "MasterUsername"):
             master_user = parent.get("MasterUsername", master_user)
         if not _p(p, "MasterUserPassword"):
             master_pass = parent.get("_MasterUserPassword", master_pass)
         if not db_name:
             db_name = parent.get("DatabaseName", "")
+    elif _parse_rds_arn(cluster_id_param):
+        wrong_region = _invalid_cluster_identifier_error(cluster_id_param)
+        if wrong_region:
+            return wrong_region
+        return _error("DBClusterNotFoundFault", f"DBCluster {cluster_id_param} not found.", 404)
     if not db_name:
         db_name = "mydb"
     allocated_storage = int(_p(p, "AllocatedStorage") or "20")
@@ -699,6 +1007,7 @@ def _create_db_instance(p):
     endpoint_port = port
     host_port = None
     docker_container_id = None
+    docker_volume_name = None
     internal_host = None
     internal_port = None
     real_container_started = False
@@ -723,8 +1032,13 @@ def _create_db_instance(p):
                     image=image, detach=True,
                     environment=env,
                     ports={f"{container_port}/tcp": host_port},
-                    name=f"ministack-rds-{db_id}",
-                    labels={"ministack": "rds", "db_id": db_id},
+                    name=_rds_docker_name(db_id),
+                    labels={
+                        "ministack": "rds",
+                        "db_id": db_id,
+                        "account_id": get_account_id(),
+                        "region": get_region(),
+                    },
                 )
                 if ms_network:
                     container_kwargs["network"] = ms_network
@@ -733,8 +1047,9 @@ def _create_db_instance(p):
                 # is harmless but wasteful and complicates the Postgres 18+
                 # layout change (where the path differs from earlier majors).
                 if RDS_PERSIST:
+                    docker_volume_name = _rds_docker_volume_name(db_id)
                     container_kwargs["volumes"] = {
-                        f"ministack-rds-{db_id}-data": {"bind": data_path, "mode": "rw"},
+                        docker_volume_name: {"bind": data_path, "mode": "rw"},
                     }
                 else:
                     container_kwargs["tmpfs"] = {
@@ -766,7 +1081,7 @@ def _create_db_instance(p):
             except Exception as e:
                 logger.warning("RDS: Docker failed for %s: %s", db_id, e)
 
-    cluster_id = _p(p, "DBClusterIdentifier")
+    cluster_id = cluster_id_param
     explicit_pg = _p(p, "DBParameterGroupName")
     # AWS rejects a reference to a parameter group that doesn't exist. Validate
     # custom names against the store; AWS-managed `default.*` groups are implicit
@@ -877,6 +1192,7 @@ def _create_db_instance(p):
         "IsStorageConfigUpgradeAvailable": False,
         "MultiTenant": False,
         "_docker_container_id": docker_container_id,
+        "_docker_volume_name": docker_volume_name,
         "_internal_address": internal_host,
         "_internal_port": internal_port,
         "_MasterUserPassword": master_pass,
@@ -974,13 +1290,17 @@ def _delete_db_instance(p):
     db_id = _p(p, "DBInstanceIdentifier")
     instance = _resolve_instance(db_id)
     if not instance:
+        invalid_arn = _invalid_db_instance_identifier_error(db_id)
+        if invalid_arn:
+            return invalid_arn
         return _error("DBInstanceNotFound", f"DBInstance {db_id} not found.", 404)
-
-    _unregister_instance_from_clusters(db_id)
+    instance_id = instance["DBInstanceIdentifier"]
 
     if instance.get("DeletionProtection"):
         return _error("InvalidParameterCombination",
             "Cannot delete a DB instance when DeletionProtection is enabled.", 400)
+
+    _unregister_instance_from_clusters(instance_id)
 
     docker_client = _get_docker()
     if docker_client and instance.get("_docker_container_id"):
@@ -988,9 +1308,9 @@ def _delete_db_instance(p):
             c = docker_client.containers.get(instance["_docker_container_id"])
             c.stop(timeout=5)
             c.remove(v=True)
-            logger.info("RDS: removed container for %s", db_id)
+            logger.info("RDS: removed container for %s", instance_id)
         except Exception as e:
-            logger.warning("RDS: failed to remove container for %s: %s", db_id, e)
+            logger.warning("RDS: failed to remove container for %s: %s", instance_id, e)
 
     skip_snapshot = _p(p, "SkipFinalSnapshot") == "true"
     final_snap_id = _p(p, "FinalDBSnapshotIdentifier")
@@ -1000,7 +1320,7 @@ def _delete_db_instance(p):
     instance["DBInstanceStatus"] = "deleting"
     arn = instance["DBInstanceArn"]
     _tags.pop(arn, None)
-    del _instances[db_id]
+    del _instances[instance_id]
     return _single_instance_response("DeleteDBInstanceResponse", "DeleteDBInstanceResult", instance)
 
 
@@ -1009,6 +1329,9 @@ def _describe_db_instances(p):
     if db_id:
         instance = _resolve_instance(db_id)
         if not instance:
+            invalid_arn = _invalid_db_instance_identifier_error(db_id, "Filter: db-instance-id")
+            if invalid_arn:
+                return invalid_arn
             return _error("DBInstanceNotFound", f"DBInstance {db_id} not found.", 404)
         instances = [instance]
     else:
@@ -1080,6 +1403,9 @@ def _modify_db_instance(p):
     db_id = _p(p, "DBInstanceIdentifier")
     instance = _resolve_instance(db_id)
     if not instance:
+        invalid_arn = _invalid_db_instance_identifier_error(db_id)
+        if invalid_arn:
+            return invalid_arn
         return _error("DBInstanceNotFound", f"DBInstance {db_id} not found.", 404)
 
     apply_immediately = _p(p, "ApplyImmediately") == "true"
@@ -1152,6 +1478,9 @@ def _start_db_instance(p):
     db_id = _p(p, "DBInstanceIdentifier")
     instance = _resolve_instance(db_id)
     if not instance:
+        invalid_arn = _invalid_db_instance_identifier_error(db_id)
+        if invalid_arn:
+            return invalid_arn
         return _error("DBInstanceNotFound", f"DBInstance {db_id} not found.", 404)
     instance["DBInstanceStatus"] = "available"
     return _single_instance_response("StartDBInstanceResponse", "StartDBInstanceResult", instance)
@@ -1161,6 +1490,9 @@ def _stop_db_instance(p):
     db_id = _p(p, "DBInstanceIdentifier")
     instance = _resolve_instance(db_id)
     if not instance:
+        invalid_arn = _invalid_db_instance_identifier_error(db_id)
+        if invalid_arn:
+            return invalid_arn
         return _error("DBInstanceNotFound", f"DBInstance {db_id} not found.", 404)
     instance["DBInstanceStatus"] = "stopped"
     return _single_instance_response("StopDBInstanceResponse", "StopDBInstanceResult", instance)
@@ -1170,6 +1502,9 @@ def _reboot_db_instance(p):
     db_id = _p(p, "DBInstanceIdentifier")
     instance = _resolve_instance(db_id)
     if not instance:
+        invalid_arn = _invalid_db_instance_identifier_error(db_id)
+        if invalid_arn:
+            return invalid_arn
         return _error("DBInstanceNotFound", f"DBInstance {db_id} not found.", 404)
     instance["DBInstanceStatus"] = "available"
     return _single_instance_response("RebootDBInstanceResponse", "RebootDBInstanceResult", instance)
@@ -1185,7 +1520,11 @@ def _create_read_replica(p):
 
     source = _resolve_instance(source_id)
     if not source:
+        invalid_arn = _invalid_db_instance_identifier_error(source_id, "SourceDBInstanceIdentifier")
+        if invalid_arn:
+            return invalid_arn
         return _error("DBInstanceNotFound", f"DBInstance {source_id} not found.", 404)
+    source_id = source["DBInstanceIdentifier"]
     if replica_id in _instances:
         return _error("DBInstanceAlreadyExistsFault", f"DBInstance {replica_id} already exists.", 400)
 
@@ -1303,6 +1642,21 @@ def _create_db_cluster(p):
         return _error("DBClusterAlreadyExistsFault",
             f"DB cluster {cluster_id} already exists.", 400)
 
+    global_cluster_id = _p(p, "GlobalClusterIdentifier")
+    invalid_global_id = _invalid_global_cluster_identifier_error(global_cluster_id)
+    if invalid_global_id:
+        return invalid_global_id
+    global_cluster = _resolve_global_cluster(global_cluster_id) if global_cluster_id else None
+    if global_cluster_id and not global_cluster:
+        return _error("GlobalClusterNotFoundFault",
+            f"Global cluster {global_cluster_id} not found.", 404)
+    if global_cluster and _global_cluster_member_in_request_region(global_cluster):
+        return _error(
+            "InvalidParameterValue",
+            f"Global cluster {global_cluster_id} already has a member in {get_region()}.",
+            400,
+        )
+
     explicit_cpg = _p(p, "DBClusterParameterGroupName")
     if (explicit_cpg and not explicit_cpg.startswith("default.")
             and explicit_cpg not in _db_cluster_param_groups):
@@ -1310,7 +1664,31 @@ def _create_db_cluster(p):
                       f"DBClusterParameterGroup {explicit_cpg} not found.", 404)
 
     engine = _p(p, "Engine") or "aurora-postgresql"
+    if global_cluster:
+        expected_engine = global_cluster.get("Engine")
+        if _p(p, "Engine") and expected_engine and engine != expected_engine:
+            return _error(
+                "InvalidParameterValue",
+                f"Engine {engine} is incompatible with global cluster "
+                f"{global_cluster_id} engine {expected_engine}.",
+                400,
+            )
+        engine = expected_engine or engine
     engine_version = _p(p, "EngineVersion") or _default_engine_version(engine)
+    if global_cluster:
+        expected_engine_version = global_cluster.get("EngineVersion")
+        if (
+            _p(p, "EngineVersion")
+            and expected_engine_version
+            and engine_version != expected_engine_version
+        ):
+            return _error(
+                "InvalidParameterValue",
+                f"EngineVersion {engine_version} is incompatible with global "
+                f"cluster {global_cluster_id} engine version {expected_engine_version}.",
+                400,
+            )
+        engine_version = expected_engine_version or engine_version
     port = int(_p(p, "Port") or _default_port(engine))
     master_user = _p(p, "MasterUsername") or "admin"
     arn = f"arn:aws:rds:{get_region()}:{get_account_id()}:cluster:{cluster_id}"
@@ -1370,6 +1748,9 @@ def _create_db_cluster(p):
         "ClusterScalabilityType": "standard",
     }
     _clusters[cluster_id] = cluster
+    if global_cluster:
+        is_first_member = not global_cluster.get("GlobalClusterMembers")
+        _attach_cluster_to_global(global_cluster, cluster, is_writer=is_first_member)
 
     req_tags = _parse_tags(p)
     if req_tags:
@@ -1382,13 +1763,20 @@ def _create_db_cluster(p):
 
 def _delete_db_cluster(p):
     cluster_id = _p(p, "DBClusterIdentifier")
-    cluster = _clusters.get(cluster_id)
+    cluster = _resolve_cluster_in_request_region(cluster_id)
     if not cluster:
+        wrong_region = _invalid_cluster_identifier_error(cluster_id)
+        if wrong_region:
+            return wrong_region
         return _error("DBClusterNotFoundFault", f"DBCluster {cluster_id} not found.", 404)
 
     if cluster.get("DeletionProtection"):
         return _error("InvalidParameterCombination",
             "Cannot delete a DB cluster when DeletionProtection is enabled.", 400)
+
+    if cluster.get("GlobalClusterIdentifier"):
+        return _error("InvalidDBClusterStateFault",
+            "Cannot delete a DB cluster while it is a member of a global cluster.", 400)
 
     skip_snapshot = _p(p, "SkipFinalSnapshot") == "true"
     final_snap_id = _p(p, "FinalDBSnapshotIdentifier")
@@ -1397,7 +1785,7 @@ def _delete_db_cluster(p):
 
     cluster["Status"] = "deleting"
     _tags.pop(cluster["DBClusterArn"], None)
-    del _clusters[cluster_id]
+    del _clusters[cluster["DBClusterIdentifier"]]
     return _xml(200, "DeleteDBClusterResponse",
         f"<DeleteDBClusterResult><DBCluster>{_cluster_xml(cluster)}</DBCluster></DeleteDBClusterResult>")
 
@@ -1405,8 +1793,11 @@ def _delete_db_cluster(p):
 def _describe_db_clusters(p):
     cluster_id = _p(p, "DBClusterIdentifier")
     if cluster_id:
-        cluster = _clusters.get(cluster_id)
+        cluster = _resolve_cluster_in_request_region(cluster_id)
         if not cluster:
+            wrong_region = _invalid_region_arn_error(cluster_id, "DBClusterIdentifier")
+            if wrong_region:
+                return wrong_region
             return _error("DBClusterNotFoundFault", f"DBCluster {cluster_id} not found.", 404)
         clusters = [cluster]
     else:
@@ -1439,6 +1830,13 @@ def _rotate_real_password(cluster, old_pass, new_pass):
             port = int(endpoint.get("Port", 3306))
         try:
             import pymysql
+        except Exception as e:
+            logger.warning("RDS: password rotation failed on %s: %s",
+                           cluster_id, e)
+            return False
+        conn = None
+        cur = None
+        try:
             conn = pymysql.connect(
                 host=host, port=port, user="root",
                 password=old_pass, autocommit=True)
@@ -1446,18 +1844,35 @@ def _rotate_real_password(cluster, old_pass, new_pass):
             cur.execute(
                 "ALTER USER 'root'@'%%' IDENTIFIED BY %s", (new_pass,))
             cur.close()
+            cur = None
             conn.close()
+            conn = None
             logger.info("RDS: rotated root password on %s", cluster_id)
+            return True
         except Exception as e:
+            if cur:
+                try:
+                    cur.close()
+                except Exception:
+                    pass
+            if conn:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
             logger.warning("RDS: password rotation failed on %s: %s",
                            cluster_id, e)
-        break
+            return False
+    return True
 
 
 def _modify_db_cluster(p):
     cluster_id = _p(p, "DBClusterIdentifier")
-    cluster = _clusters.get(cluster_id)
+    cluster = _resolve_cluster_in_request_region(cluster_id)
     if not cluster:
+        wrong_region = _invalid_cluster_identifier_error(cluster_id)
+        if wrong_region:
+            return wrong_region
         return _error("DBClusterNotFoundFault", f"DBCluster {cluster_id} not found.", 404)
 
     if _p(p, "EngineVersion"):
@@ -1548,6 +1963,9 @@ def _create_db_snapshot(p):
 
     instance = _resolve_instance(db_id)
     if not instance:
+        invalid_arn = _invalid_db_instance_identifier_error(db_id)
+        if invalid_arn:
+            return invalid_arn
         return _error("DBInstanceNotFound", f"DBInstance {db_id} not found.", 404)
 
     snap = _create_snapshot_internal(snap_id, instance)
@@ -1585,7 +2003,14 @@ def _describe_db_snapshots(p):
     else:
         snaps = list(_snapshots.values())
         if db_id:
+            invalid_arn = _invalid_db_instance_identifier_error(db_id)
+            if invalid_arn:
+                return invalid_arn
+            filter_by_arn = _parse_rds_arn(db_id) is not None
+            db_id = _request_region_resource_identifier(db_id, "db")
             snaps = [s for s in snaps if s["DBInstanceIdentifier"] == db_id]
+            if filter_by_arn:
+                snaps = [s for s in snaps if _record_arn_in_request_scope(s, "DBSnapshotArn")]
         if snap_type:
             snaps = [s for s in snaps if s["SnapshotType"] == snap_type]
 
@@ -1993,9 +2418,13 @@ def _create_db_cluster_snapshot(p):
         return _error("DBClusterSnapshotAlreadyExistsFault",
             f"DB cluster snapshot {snap_id} already exists.", 400)
 
-    cluster = _clusters.get(cluster_id)
+    cluster = _resolve_cluster_in_request_region(cluster_id)
     if not cluster:
+        wrong_region = _invalid_region_arn_error(cluster_id, "DBClusterIdentifier")
+        if wrong_region:
+            return wrong_region
         return _error("DBClusterNotFoundFault", f"DBCluster {cluster_id} not found.", 404)
+    cluster_id = cluster["DBClusterIdentifier"]
 
     arn = f"arn:aws:rds:{get_region()}:{get_account_id()}:cluster-snapshot:{snap_id}"
     now_ts = time.time()
@@ -2047,7 +2476,17 @@ def _describe_db_cluster_snapshots(p):
     else:
         snaps = list(_db_cluster_snapshots.values())
         if cluster_id:
+            wrong_region = _invalid_region_arn_error(cluster_id, "DBClusterIdentifier")
+            if wrong_region:
+                return wrong_region
+            filter_by_arn = _parse_rds_arn(cluster_id) is not None
+            cluster_id = _request_region_resource_identifier(cluster_id, "cluster")
             snaps = [s for s in snaps if s["DBClusterIdentifier"] == cluster_id]
+            if filter_by_arn:
+                snaps = [
+                    s for s in snaps
+                    if _record_arn_in_request_scope(s, "DBClusterSnapshotArn")
+                ]
         if snap_type:
             snaps = [s for s in snaps if s["SnapshotType"] == snap_type]
 
@@ -2099,8 +2538,11 @@ def _modify_subnet_group(p):
 
 def _start_db_cluster(p):
     cluster_id = _p(p, "DBClusterIdentifier")
-    cluster = _clusters.get(cluster_id)
+    cluster = _resolve_cluster_in_request_region(cluster_id)
     if not cluster:
+        wrong_region = _invalid_cluster_identifier_error(cluster_id)
+        if wrong_region:
+            return wrong_region
         return _error("DBClusterNotFoundFault", f"DBCluster {cluster_id} not found.", 404)
     cluster["Status"] = "available"
     return _xml(200, "StartDBClusterResponse",
@@ -2109,8 +2551,11 @@ def _start_db_cluster(p):
 
 def _stop_db_cluster(p):
     cluster_id = _p(p, "DBClusterIdentifier")
-    cluster = _clusters.get(cluster_id)
+    cluster = _resolve_cluster_in_request_region(cluster_id)
     if not cluster:
+        wrong_region = _invalid_cluster_identifier_error(cluster_id)
+        if wrong_region:
+            return wrong_region
         return _error("DBClusterNotFoundFault", f"DBCluster {cluster_id} not found.", 404)
     cluster["Status"] = "stopped"
     return _xml(200, "StopDBClusterResponse",
@@ -2206,11 +2651,34 @@ def _describe_pending_maintenance_actions(p):
 # Tags
 # ---------------------------------------------------------------------------
 
+def _tag_resource_scope_error(arn):
+    parsed = _parse_rds_arn(arn)
+    if not parsed:
+        return None
+    spec, resource_type, _ = parsed
+    if spec.account_id != get_account_id():
+        return _error(
+            "InvalidParameterValue",
+            "The specified resource name does not match an RDS resource in this region.",
+            400,
+        )
+    if resource_type != "global-cluster" and spec.region and spec.region != get_region():
+        return _error(
+            "InvalidParameterValue",
+            "The specified resource name does not match an RDS resource in this region.",
+            400,
+        )
+    return None
+
+
 def _add_tags(p):
     arn = _p(p, "ResourceName")
     new_tags = _parse_tags(p)
     if not arn:
         return _error("MissingParameter", "ResourceName is required", 400)
+    scope_error = _tag_resource_scope_error(arn)
+    if scope_error:
+        return scope_error
 
     existing = _tags.get(arn, [])
     existing_keys = {t["Key"]: i for i, t in enumerate(existing)}
@@ -2232,6 +2700,9 @@ def _remove_tags(p):
     keys_to_remove = set(_parse_member_list(p, "TagKeys"))
     if not arn:
         return _error("MissingParameter", "ResourceName is required", 400)
+    scope_error = _tag_resource_scope_error(arn)
+    if scope_error:
+        return scope_error
 
     existing = _tags.get(arn, [])
     _tags[arn] = [t for t in existing if t["Key"] not in keys_to_remove]
@@ -2245,6 +2716,9 @@ def _list_tags(p):
     if not arn:
         return _xml(200, "ListTagsForResourceResponse",
             "<ListTagsForResourceResult><TagList/></ListTagsForResourceResult>")
+    scope_error = _tag_resource_scope_error(arn)
+    if scope_error:
+        return scope_error
 
     tag_list = _tags.get(arn, [])
     members = "".join(f"<Tag><Key>{_esc(t['Key'])}</Key><Value>{_esc(t['Value'])}</Value></Tag>" for t in tag_list)
@@ -2269,20 +2743,32 @@ def _sync_tag_list_to_resource(arn):
             return
 
 
+def _invalid_global_cluster_identifier_error(global_id):
+    parsed = _parse_rds_arn(global_id)
+    if not parsed:
+        return None
+    _, resource_type, _ = parsed
+    if resource_type != "global-cluster":
+        return None
+    return _error("InvalidParameterValue", f"Invalid global cluster identifier:  {global_id}", 400)
+
+
 # ---------------------------------------------------------------------------
 # Global Clusters
 #
-# Emulation scope: single-member global clusters only.  A global cluster can
-# be created standalone or attached to one existing DB cluster via
-# SourceDBClusterIdentifier.  Multi-member membership (secondary clusters
-# in other regions), FailoverGlobalCluster, and SwitchoverGlobalCluster are
-# not supported — MiniStack is a single-region emulator.
+# Emulation scope: metadata-level Aurora Global Database membership.  This
+# supports the create/read/update/delete control-plane path needed by local
+# acceptance tests, without simulating storage replication, failover, or
+# switchover.
 # ---------------------------------------------------------------------------
 
 def _create_global_cluster(p):
     gc_id = _p(p, "GlobalClusterIdentifier")
     if not gc_id:
         return _error("MissingParameter", "GlobalClusterIdentifier is required", 400)
+    invalid_id = _invalid_global_cluster_identifier_error(gc_id)
+    if invalid_id:
+        return invalid_id
     if gc_id in _global_clusters:
         return _error("GlobalClusterAlreadyExistsFault",
             f"Global cluster {gc_id} already exists.", 400)
@@ -2296,20 +2782,28 @@ def _create_global_cluster(p):
     arn = f"arn:aws:rds::{get_account_id()}:global-cluster:{gc_id}"
     resource_id = f"cluster-{new_uuid().replace('-', '')[:20].lower()}"
 
-    members = []
+    source_cluster = None
     if source_cluster_id:
-        source_arn = source_cluster_id
-        for cl in _clusters.values():
-            if cl["DBClusterIdentifier"] == source_cluster_id or cl["DBClusterArn"] == source_cluster_id:
-                source_arn = cl["DBClusterArn"]
-                engine = cl["Engine"]
-                engine_version = cl["EngineVersion"]
-                break
-        members.append({
-            "DBClusterArn": source_arn,
-            "IsWriter": True,
-            "GlobalWriteForwardingStatus": "disabled",
-        })
+        source_cluster = _resolve_cluster_in_request_region(source_cluster_id)
+        if not source_cluster:
+            wrong_region = _invalid_region_arn_error(
+                source_cluster_id,
+                "SourceDBClusterIdentifier",
+            )
+            if wrong_region:
+                return wrong_region
+            return _error("DBClusterNotFoundFault",
+                f"DBCluster {source_cluster_id} not found.", 404)
+        existing_global_id = source_cluster.get("GlobalClusterIdentifier")
+        if existing_global_id:
+            return _error(
+                "InvalidDBClusterStateFault",
+                f"DBCluster {source_cluster_id} is already a member of "
+                f"global cluster {existing_global_id}.",
+                400,
+            )
+        engine = source_cluster["Engine"]
+        engine_version = source_cluster["EngineVersion"]
 
     gc = {
         "GlobalClusterIdentifier": gc_id,
@@ -2320,9 +2814,11 @@ def _create_global_cluster(p):
         "Status": "available",
         "StorageEncrypted": storage_encrypted,
         "DeletionProtection": deletion_protection,
-        "GlobalClusterMembers": members,
+        "GlobalClusterMembers": [],
         "DatabaseName": _p(p, "DatabaseName") or "",
     }
+    if source_cluster:
+        _attach_cluster_to_global(gc, source_cluster, is_writer=True)
     _global_clusters[gc_id] = gc
     return _xml(200, "CreateGlobalClusterResponse",
         f"<CreateGlobalClusterResult><GlobalCluster>{_global_cluster_xml(gc)}</GlobalCluster></CreateGlobalClusterResult>")
@@ -2331,7 +2827,10 @@ def _create_global_cluster(p):
 def _describe_global_clusters(p):
     gc_id = _p(p, "GlobalClusterIdentifier")
     if gc_id:
-        gc = _global_clusters.get(gc_id)
+        invalid_id = _invalid_global_cluster_identifier_error(gc_id)
+        if invalid_id:
+            return invalid_id
+        gc = _resolve_global_cluster(gc_id)
         if not gc:
             return _error("GlobalClusterNotFoundFault",
                 f"Global cluster {gc_id} not found.", 404)
@@ -2348,7 +2847,10 @@ def _describe_global_clusters(p):
 
 def _delete_global_cluster(p):
     gc_id = _p(p, "GlobalClusterIdentifier")
-    gc = _global_clusters.get(gc_id)
+    invalid_id = _invalid_global_cluster_identifier_error(gc_id)
+    if invalid_id:
+        return invalid_id
+    gc = _resolve_global_cluster(gc_id)
     if not gc:
         return _error("GlobalClusterNotFoundFault",
             f"Global cluster {gc_id} not found.", 404)
@@ -2357,13 +2859,12 @@ def _delete_global_cluster(p):
         return _error("InvalidParameterCombination",
             "Cannot delete a global cluster when DeletionProtection is enabled.", 400)
 
-    writer_members = [m for m in gc.get("GlobalClusterMembers", []) if m.get("IsWriter")]
-    if writer_members:
+    if gc.get("GlobalClusterMembers"):
         return _error("InvalidGlobalClusterStateFault",
             "Global cluster still has member clusters. Remove them before deleting.", 400)
 
     gc["Status"] = "deleting"
-    del _global_clusters[gc_id]
+    del _global_clusters[gc["GlobalClusterIdentifier"]]
     return _xml(200, "DeleteGlobalClusterResponse",
         f"<DeleteGlobalClusterResult><GlobalCluster>{_global_cluster_xml(gc)}</GlobalCluster></DeleteGlobalClusterResult>")
 
@@ -2371,41 +2872,64 @@ def _delete_global_cluster(p):
 def _remove_from_global_cluster(p):
     gc_id = _p(p, "GlobalClusterIdentifier")
     db_cluster_id = _p(p, "DbClusterIdentifier")
-    gc = _global_clusters.get(gc_id)
+    invalid_id = _invalid_global_cluster_identifier_error(gc_id)
+    if invalid_id:
+        return invalid_id
+    gc = _resolve_global_cluster(gc_id)
     if not gc:
         return _error("GlobalClusterNotFoundFault",
             f"Global cluster {gc_id} not found.", 404)
 
     members = gc.get("GlobalClusterMembers", [])
-    new_members = [m for m in members if m["DBClusterArn"] != db_cluster_id]
-    if len(new_members) == len(members):
-        for cl in _clusters.values():
-            if cl["DBClusterIdentifier"] == db_cluster_id:
-                db_cluster_id = cl["DBClusterArn"]
-                break
-        new_members = [m for m in members if m["DBClusterArn"] != db_cluster_id]
+    cluster = _resolve_cluster(db_cluster_id)
+    db_cluster_arn = cluster["DBClusterArn"] if cluster else db_cluster_id
+    member = next((m for m in members if m["DBClusterArn"] == db_cluster_arn), None)
+    if not member:
+        return _error("DBClusterNotFoundFault",
+            f"DBCluster {db_cluster_id} is not a member of global cluster {gc_id}.", 404)
+    if member.get("IsWriter") and len(members) > 1:
+        return _error("InvalidGlobalClusterStateFault",
+            "Cannot remove the writer DB cluster while reader members remain.", 400)
 
+    new_members = [m for m in members if m["DBClusterArn"] != db_cluster_arn]
     gc["GlobalClusterMembers"] = new_members
+    _refresh_global_cluster_readers(gc)
+    if not cluster:
+        cluster = _resolve_cluster(db_cluster_arn)
+    if cluster:
+        cluster.pop("GlobalClusterIdentifier", None)
+        cluster.pop("GlobalWriteForwardingStatus", None)
     return _xml(200, "RemoveFromGlobalClusterResponse",
         f"<RemoveFromGlobalClusterResult><GlobalCluster>{_global_cluster_xml(gc)}</GlobalCluster></RemoveFromGlobalClusterResult>")
 
 
 def _modify_global_cluster(p):
     gc_id = _p(p, "GlobalClusterIdentifier")
-    gc = _global_clusters.get(gc_id)
+    invalid_id = _invalid_global_cluster_identifier_error(gc_id)
+    if invalid_id:
+        return invalid_id
+    gc = _resolve_global_cluster(gc_id)
     if not gc:
         return _error("GlobalClusterNotFoundFault",
             f"Global cluster {gc_id} not found.", 404)
 
     new_id = _p(p, "NewGlobalClusterIdentifier")
     if new_id and new_id != gc_id:
+        invalid_new_id = _invalid_global_cluster_identifier_error(new_id)
+        if invalid_new_id:
+            return invalid_new_id
         if new_id in _global_clusters:
             return _error("GlobalClusterAlreadyExistsFault",
                 f"Global cluster {new_id} already exists.", 400)
+        old_id = gc["GlobalClusterIdentifier"]
         gc["GlobalClusterIdentifier"] = new_id
         gc["GlobalClusterArn"] = f"arn:aws:rds::{get_account_id()}:global-cluster:{new_id}"
         _global_clusters[new_id] = gc
-        del _global_clusters[gc_id]
+        del _global_clusters[old_id]
+        for member in gc.get("GlobalClusterMembers", []):
+            cluster = _resolve_cluster(member["DBClusterArn"])
+            if cluster:
+                cluster["GlobalClusterIdentifier"] = new_id
 
     if _p(p, "DeletionProtection"):
         gc["DeletionProtection"] = _p(p, "DeletionProtection") == "true"
@@ -2416,8 +2940,93 @@ def _modify_global_cluster(p):
         f"<ModifyGlobalClusterResult><GlobalCluster>{_global_cluster_xml(gc)}</GlobalCluster></ModifyGlobalClusterResult>")
 
 
+def _find_global_cluster_target_member(gc, target_cluster_id):
+    cluster = _resolve_cluster(target_cluster_id)
+    db_cluster_arn = cluster["DBClusterArn"] if cluster else target_cluster_id
+    members = gc.get("GlobalClusterMembers", [])
+    member = next((m for m in members if m["DBClusterArn"] == db_cluster_arn), None)
+    return cluster, member
+
+
+def _switch_global_cluster_writer(p, *, allow_data_loss=False):
+    gc_id = _p(p, "GlobalClusterIdentifier")
+    target_cluster_id = _p(p, "TargetDbClusterIdentifier")
+    invalid_id = _invalid_global_cluster_identifier_error(gc_id)
+    if invalid_id:
+        return invalid_id
+    gc = _resolve_global_cluster(gc_id)
+    if not gc:
+        return _error("GlobalClusterNotFoundFault",
+            f"Global cluster {gc_id} not found.", 404)
+    if not target_cluster_id:
+        return _error("MissingParameter", "TargetDbClusterIdentifier is required", 400)
+
+    _target_cluster, target_member = _find_global_cluster_target_member(gc, target_cluster_id)
+    if not target_member:
+        cluster = _resolve_cluster(target_cluster_id)
+        if not cluster:
+            return _error("DBClusterNotFoundFault",
+                f"DBCluster {target_cluster_id} not found.", 404)
+        return _error("InvalidGlobalClusterStateFault",
+            f"DBCluster {target_cluster_id} is not a secondary member of global cluster {gc_id}.", 400)
+
+    members = gc.get("GlobalClusterMembers", [])
+    current_writer = next((m for m in members if m.get("IsWriter")), None)
+    if not current_writer or target_member.get("IsWriter") or len(members) < 2:
+        return _error("InvalidGlobalClusterStateFault",
+            f"Global cluster {gc_id} does not have a secondary target to promote.", 400)
+
+    _set_global_cluster_writer(gc, target_member)
+    gc["Status"] = "available"
+
+    response_gc = copy.deepcopy(gc)
+    response_gc["Status"] = "switching-over" if not allow_data_loss else "failing-over"
+    response_gc["FailoverState"] = {
+        "Status": "pending",
+        "FromDbClusterArn": current_writer["DBClusterArn"],
+        "ToDbClusterArn": target_member["DBClusterArn"],
+        "IsDataLossAllowed": bool(allow_data_loss),
+    }
+    return response_gc
+
+
+def _switchover_global_cluster(p):
+    result = _switch_global_cluster_writer(p, allow_data_loss=False)
+    if isinstance(result, tuple):
+        return result
+    return _xml(200, "SwitchoverGlobalClusterResponse",
+        f"<SwitchoverGlobalClusterResult><GlobalCluster>{_global_cluster_xml(result)}</GlobalCluster></SwitchoverGlobalClusterResult>")
+
+
+def _failover_global_cluster(p):
+    gc_id = _p(p, "GlobalClusterIdentifier")
+    invalid_id = _invalid_global_cluster_identifier_error(gc_id)
+    if invalid_id:
+        return invalid_id
+    if not _resolve_global_cluster(gc_id):
+        return _error("GlobalClusterNotFoundFault",
+            f"Global cluster {gc_id} not found.", 404)
+
+    both_failover_modes_specified = "AllowDataLoss" in p and "Switchover" in p
+    allow_data_loss = str(_p(p, "AllowDataLoss")).lower() == "true"
+    if both_failover_modes_specified:
+        return _error(
+            "InvalidParameterCombination",
+            "AllowDataLoss and Switchover cannot both be specified.",
+            400,
+        )
+    result = _switch_global_cluster_writer(p, allow_data_loss=allow_data_loss)
+    if isinstance(result, tuple):
+        return result
+    return _xml(200, "FailoverGlobalClusterResponse",
+        f"<FailoverGlobalClusterResult><GlobalCluster>{_global_cluster_xml(result)}</GlobalCluster></FailoverGlobalClusterResult>")
+
+
 def _enable_http_endpoint(p):
     arn = _p(p, "ResourceArn")
+    wrong_region = _resource_not_found_error_for_arn(arn)
+    if wrong_region:
+        return wrong_region
     for cluster in _clusters.values():
         if cluster.get("DBClusterArn") == arn:
             cluster["HttpEndpointEnabled"] = True
@@ -2430,13 +3039,26 @@ def _enable_http_endpoint(p):
 
 
 def _global_cluster_xml(gc):
+    _refresh_global_cluster_readers(gc)
     member_xml = ""
     for m in gc.get("GlobalClusterMembers", []):
+        readers_xml = "".join(f"<member>{_esc(reader)}</member>" for reader in m.get("Readers", []))
         member_xml += f"""<GlobalClusterMember>
             <DBClusterArn>{m['DBClusterArn']}</DBClusterArn>
+            <Readers>{readers_xml}</Readers>
             <IsWriter>{str(m.get('IsWriter', False)).lower()}</IsWriter>
             <GlobalWriteForwardingStatus>{m.get('GlobalWriteForwardingStatus', 'disabled')}</GlobalWriteForwardingStatus>
+            <SynchronizationStatus>{m.get('SynchronizationStatus', 'connected')}</SynchronizationStatus>
         </GlobalClusterMember>"""
+    failover_state = gc.get("FailoverState") or {}
+    failover_state_xml = ""
+    if failover_state:
+        failover_state_xml = f"""<FailoverState>
+            <Status>{failover_state.get('Status', '')}</Status>
+            <FromDbClusterArn>{_esc(failover_state.get('FromDbClusterArn', ''))}</FromDbClusterArn>
+            <ToDbClusterArn>{_esc(failover_state.get('ToDbClusterArn', ''))}</ToDbClusterArn>
+            <IsDataLossAllowed>{str(failover_state.get('IsDataLossAllowed', False)).lower()}</IsDataLossAllowed>
+        </FailoverState>"""
     return f"""<GlobalClusterIdentifier>{gc['GlobalClusterIdentifier']}</GlobalClusterIdentifier>
         <GlobalClusterArn>{gc['GlobalClusterArn']}</GlobalClusterArn>
         <GlobalClusterResourceId>{gc['GlobalClusterResourceId']}</GlobalClusterResourceId>
@@ -2446,6 +3068,7 @@ def _global_cluster_xml(gc):
         <DatabaseName>{gc.get('DatabaseName', '')}</DatabaseName>
         <StorageEncrypted>{str(gc.get('StorageEncrypted', False)).lower()}</StorageEncrypted>
         <DeletionProtection>{str(gc.get('DeletionProtection', False)).lower()}</DeletionProtection>
+        {failover_state_xml}
         <GlobalClusterMembers>{member_xml}</GlobalClusterMembers>"""
 
 
@@ -2478,6 +3101,7 @@ def _describe_engine_versions(p):
     }
     versions = versions_map.get(engine, [("15.3", "15")])
     members = ""
+    supports_global = engine in ("aurora-mysql", "aurora-postgresql")
     for ver, family in versions:
         if version_filter and ver != version_filter:
             continue
@@ -2494,7 +3118,7 @@ def _describe_engine_versions(p):
             <SupportedFeatureNames/>
             <Status>available</Status>
             <SupportsParallelQuery>false</SupportsParallelQuery>
-            <SupportsGlobalDatabases>false</SupportsGlobalDatabases>
+            <SupportsGlobalDatabases>{str(supports_global).lower()}</SupportsGlobalDatabases>
             <SupportsBabelfish>false</SupportsBabelfish>
             <SupportsCertificateRotationWithoutRestart>true</SupportsCertificateRotationWithoutRestart>
         </DBEngineVersion>"""
@@ -2723,6 +3347,16 @@ def _cluster_xml(c):
     # emitting an empty element would surface as "" instead of None to clients.
     db_name = c.get("DatabaseName")
     db_name_xml = f"<DatabaseName>{db_name}</DatabaseName>" if db_name else ""
+    global_cluster_id = c.get("GlobalClusterIdentifier")
+    global_cluster_xml = (
+        f"<GlobalClusterIdentifier>{global_cluster_id}</GlobalClusterIdentifier>"
+        if global_cluster_id else ""
+    )
+    global_write_forwarding = c.get("GlobalWriteForwardingStatus")
+    global_write_forwarding_xml = (
+        f"<GlobalWriteForwardingStatus>{global_write_forwarding}</GlobalWriteForwardingStatus>"
+        if global_write_forwarding else ""
+    )
 
     return f"""<DBClusterIdentifier>{c['DBClusterIdentifier']}</DBClusterIdentifier>
         <DBClusterArn>{c['DBClusterArn']}</DBClusterArn>
@@ -2761,6 +3395,8 @@ def _cluster_xml(c):
         <AllocatedStorage>{c.get('AllocatedStorage',1)}</AllocatedStorage>
         <ActivityStreamStatus>{c.get('ActivityStreamStatus','stopped')}</ActivityStreamStatus>
         <NetworkType>{c.get('NetworkType','IPV4')}</NetworkType>
+        {global_cluster_xml}
+        {global_write_forwarding_xml}
         <EngineLifecycleSupport>{c.get('EngineLifecycleSupport','open-source-rds-extended-support')}</EngineLifecycleSupport>"""
 
 
@@ -3171,6 +3807,8 @@ _ACTION_MAP = {
     "DeleteGlobalCluster": _delete_global_cluster,
     "RemoveFromGlobalCluster": _remove_from_global_cluster,
     "ModifyGlobalCluster": _modify_global_cluster,
+    "SwitchoverGlobalCluster": _switchover_global_cluster,
+    "FailoverGlobalCluster": _failover_global_cluster,
     "EnableHttpEndpoint": _enable_http_endpoint,
 }
 
@@ -3178,7 +3816,7 @@ _ACTION_MAP = {
 def reset():
     docker_client = _get_docker()
     if docker_client:
-        for instance in _instances.values():
+        for instance in _instances.all_values():
             cid = instance.get("_docker_container_id")
             if cid:
                 try:

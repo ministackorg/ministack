@@ -6,8 +6,27 @@ import uuid as _uuid_mod
 import zipfile
 from urllib.parse import urlparse
 
+import boto3
 import pytest
+from botocore.config import Config
 from botocore.exceptions import ClientError
+
+_endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+
+
+def _regional_client(service: str, region: str):
+    return boto3.client(
+        service,
+        endpoint_url=_endpoint,
+        aws_access_key_id="test",
+        aws_secret_access_key="test",
+        region_name=region,
+        config=Config(
+            region_name=region,
+            retries={"mode": "standard"},
+            max_pool_connections=50,
+        ),
+    )
 
 
 def test_logs_put_get(logs):
@@ -43,6 +62,27 @@ def test_logs_get_log_events_by_identifier_arn(logs):
     # Bare name accepted as identifier too.
     resp2 = logs.get_log_events(logGroupIdentifier="/cwl/ident-arn", logStreamName="s1")
     assert len(resp2["events"]) == 1
+
+
+def test_logs_identifier_arn_scope_does_not_fallback_to_local_group(logs):
+    group = f"/cwl/ident-arn-scope-{_uuid_mod.uuid4().hex[:8]}"
+    logs.create_log_group(logGroupName=group)
+    logs.create_log_stream(logGroupName=group, logStreamName="s1")
+    logs.put_log_events(
+        logGroupName=group,
+        logStreamName="s1",
+        logEvents=[{"timestamp": int(time.time() * 1000), "message": "hi"}],
+    )
+
+    arn = f"arn:aws:logs:us-east-1:000000000000:log-group:{group}:*"
+    wrong_region = arn.replace(":us-east-1:", ":us-west-2:")
+    wrong_account = arn.replace(":000000000000:", ":111111111111:")
+    wrong_service = arn.replace(":logs:", ":lambda:")
+    wrong_resource = arn.replace(":log-group:", ":delivery:")
+    for bad_ref in (wrong_region, wrong_account, wrong_service, wrong_resource):
+        with pytest.raises(ClientError) as exc:
+            logs.get_log_events(logGroupIdentifier=bad_ref, logStreamName="s1")
+        assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
 
 
 def test_logs_filter_log_events_by_identifier_arn(logs):
@@ -216,6 +256,44 @@ def test_logs_metric_filter(logs):
     resp2 = logs.describe_metric_filters(logGroupName=group)
     assert not any(f["filterName"] == "error-count" for f in resp2.get("metricFilters", []))
 
+
+def test_logs_metric_filters_are_region_scoped():
+    group = f"/intg/metricfilter-region/{_uuid_mod.uuid4().hex[:8]}"
+    east = _regional_client("logs", "us-east-1")
+    west = _regional_client("logs", "us-west-2")
+
+    east.create_log_group(logGroupName=group)
+    west.create_log_group(logGroupName=group)
+    east.put_metric_filter(
+        logGroupName=group,
+        filterName="error-count",
+        filterPattern="ERROR",
+        metricTransformations=[{
+            "metricName": "EastErrors",
+            "metricNamespace": "MyApp",
+            "metricValue": "1",
+        }],
+    )
+    west.put_metric_filter(
+        logGroupName=group,
+        filterName="error-count",
+        filterPattern="WARN",
+        metricTransformations=[{
+            "metricName": "WestWarnings",
+            "metricNamespace": "MyApp",
+            "metricValue": "1",
+        }],
+    )
+
+    east_filters = east.describe_metric_filters(logGroupName=group)["metricFilters"]
+    west_filters = west.describe_metric_filters(logGroupName=group)["metricFilters"]
+
+    assert [f["filterPattern"] for f in east_filters] == ["ERROR"]
+    assert [f["filterPattern"] for f in west_filters] == ["WARN"]
+    assert east.describe_log_groups(logGroupNamePrefix=group)["logGroups"][0]["metricFilterCount"] == 1
+    assert west.describe_log_groups(logGroupNamePrefix=group)["logGroups"][0]["metricFilterCount"] == 1
+
+
 def test_logs_tag_log_group(logs):
     import uuid as _uuid
 
@@ -343,6 +421,36 @@ def test_logs_put_destination(logs):
 
     # cleanup
     logs.delete_destination(destinationName=dest_name)
+
+
+def test_logs_destinations_are_region_isolated():
+    """CW Logs destinations are region-specific: DescribeDestinations in another
+    region must not list one created here (was account-scoped, so it leaked)."""
+    import boto3
+    from botocore.config import Config
+
+    def cli(r):
+        return boto3.client(
+            "logs", endpoint_url=_endpoint,
+            aws_access_key_id="test", aws_secret_access_key="test",
+            region_name=r, config=Config(region_name=r),
+        )
+
+    east, west = cli("us-east-1"), cli("us-west-2")
+    uid = _uuid_mod.uuid4().hex[:8]
+    name = f"region-iso-dest-{uid}"
+    east.put_destination(
+        destinationName=name,
+        targetArn=f"arn:aws:kinesis:us-east-1:000000000000:stream/s-{uid}",
+        roleArn=f"arn:aws:iam::000000000000:role/r-{uid}",
+    )
+    try:
+        east_names = [d["destinationName"] for d in east.describe_destinations()["destinations"]]
+        west_names = [d["destinationName"] for d in west.describe_destinations()["destinations"]]
+        assert name in east_names
+        assert name not in west_names
+    finally:
+        east.delete_destination(destinationName=name)
 
 
 def test_logs_delete_destination(logs):
@@ -601,6 +709,37 @@ def test_logs_delivery_source_service_derived_from_resource_arn(logs):
     logs.delete_delivery_source(name=src_name)
 
 
+def test_logs_delivery_source_rejects_malformed_resource_arn(logs):
+    """Malformed delivery source ARNs fail before any source is stored."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    with pytest.raises(ClientError) as exc:
+        logs.put_delivery_source(
+            name=f"intg-svc-malformed-{uid}",
+            resourceArn="not-an-arn",
+            logType="APPLICATION_LOGS",
+        )
+    assert exc.value.response["Error"]["Code"] == "ValidationException"
+
+
+@pytest.mark.parametrize(
+    ("resource_arn", "expected_code"),
+    [
+        ("arn:aws:bedrock:us-west-2:000000000000:knowledge-base/test", "ValidationException"),
+        ("arn:aws:bedrock:us-east-1:111111111111:knowledge-base/test", "ValidationException"),
+        ("arn:aws:sns:us-east-1:000000000000:test", "ResourceNotFoundException"),
+    ],
+)
+def test_logs_delivery_source_rejects_wrong_scope_resource_arns(logs, resource_arn, expected_code):
+    uid = _uuid_mod.uuid4().hex[:8]
+    with pytest.raises(ClientError) as exc:
+        logs.put_delivery_source(
+            name=f"intg-svc-scope-{uid}",
+            resourceArn=resource_arn,
+            logType="APPLICATION_LOGS",
+        )
+    assert exc.value.response["Error"]["Code"] == expected_code
+
+
 def test_logs_delivery_destination_type_derived_from_arn(logs):
     """PutDeliveryDestination must compute ``deliveryDestinationType`` from
     the destinationResourceArn (S3 / CWL / FH)."""
@@ -620,6 +759,26 @@ def test_logs_delivery_destination_type_derived_from_arn(logs):
         logs.delete_delivery_destination(name=dest_name)
 
 
+@pytest.mark.parametrize(
+    "destination_resource_arn",
+    [
+        "arn:aws:logs:us-west-2:000000000000:log-group:/intg/foreign:*",
+        "arn:aws:logs:us-east-1:111111111111:log-group:/intg/bogus:*",
+        "arn:aws:firehose:us-west-2:000000000000:deliverystream/foreign",
+        "arn:aws:firehose:us-east-1:111111111111:deliverystream/bogus",
+        "arn:aws:s3:us-east-1:000000000000:bucket-with-region",
+    ],
+)
+def test_logs_delivery_destination_rejects_wrong_scope_target_arns(logs, destination_resource_arn):
+    uid = _uuid_mod.uuid4().hex[:8]
+    with pytest.raises(ClientError) as exc:
+        logs.put_delivery_destination(
+            name=f"intg-dest-scope-{uid}",
+            deliveryDestinationConfiguration={"destinationResourceArn": destination_resource_arn},
+        )
+    assert exc.value.response["Error"]["Code"] == "ValidationException"
+
+
 def test_logs_delivery_destination_rejects_unknown_output_format(logs):
     """outputFormat outside the AWS-allowed set is rejected."""
     uid = _uuid_mod.uuid4().hex[:8]
@@ -637,14 +796,19 @@ def test_logs_delivery_destination_rejects_unknown_output_format(logs):
 def test_logs_delivery_destination_rejects_unsupported_target(logs):
     """destinationResourceArn that isn't S3/CWL/FH is rejected upfront."""
     uid = _uuid_mod.uuid4().hex[:8]
-    with pytest.raises(ClientError) as exc:
-        logs.put_delivery_destination(
-            name=f"intg-bad-target-{uid}",
-            deliveryDestinationConfiguration={
-                "destinationResourceArn": f"arn:aws:lambda:us-east-1:000000000000:function:anything-{uid}",
-            },
-        )
-    assert exc.value.response["Error"]["Code"] == "ValidationException"
+    cases = [
+        "not-an-arn",
+        f"arn:aws:lambda:us-east-1:000000000000:function:anything-{uid}",
+    ]
+    for i, arn in enumerate(cases):
+        with pytest.raises(ClientError) as exc:
+            logs.put_delivery_destination(
+                name=f"intg-bad-target-{uid}-{i}",
+                deliveryDestinationConfiguration={
+                    "destinationResourceArn": arn,
+                },
+            )
+        assert exc.value.response["Error"]["Code"] == "ValidationException"
 
 
 def test_logs_create_delivery_requires_destination_to_exist(logs):
@@ -666,6 +830,25 @@ def test_logs_create_delivery_requires_destination_to_exist(logs):
         assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
     finally:
         logs.delete_delivery_source(name=src_name)
+
+
+@pytest.mark.parametrize(
+    ("delivery_destination_arn", "expected_code"),
+    [
+        ("arn:aws:logs:us-west-2:000000000000:delivery-destination:foreign", "ValidationException"),
+        ("arn:aws:logs:us-east-1:111111111111:delivery-destination:bogus", "AccessDeniedException"),
+        ("not-an-arn", "ValidationException"),
+        ("arn:aws:sns:us-east-1:000000000000:not-a-delivery-destination", "ValidationException"),
+    ],
+)
+def test_logs_create_delivery_rejects_invalid_destination_arn_before_source(logs, delivery_destination_arn, expected_code):
+    uid = _uuid_mod.uuid4().hex[:8]
+    with pytest.raises(ClientError) as exc:
+        logs.create_delivery(
+            deliverySourceName=f"missing-src-{uid}",
+            deliveryDestinationArn=delivery_destination_arn,
+        )
+    assert exc.value.response["Error"]["Code"] == expected_code
 
 
 def test_logs_create_delivery_rejects_duplicate_pair(logs):
@@ -799,9 +982,55 @@ def test_metric_filters_survive_warm_boot():
     assert ("/aws/lambda/foo", "ErrorCount") in mod._metric_filters, (
         "Metric filter lost across get_state → restore_state — "
         "_metric_filters must be in both. Tuple keys are round-tripped "
-        "by AccountScopedDict's JSON encoder hook."
+        "by AccountRegionScopedDict's JSON encoder hook."
     )
     mod.reset()
+
+
+def test_legacy_metric_filters_restore_to_log_group_region():
+    from ministack.core.responses import AccountScopedDict, get_region, set_request_region
+
+    mod = _module()
+    mod.reset()
+    group = f"/aws/lambda/legacy-filter-{_uuid_mod.uuid4().hex[:8]}"
+    original_region = get_region()
+
+    legacy_metric_filters = AccountScopedDict()
+    legacy_metric_filters[(group, "ErrorCount")] = {
+        "filterName": "ErrorCount",
+        "logGroupName": group,
+        "filterPattern": "ERROR",
+        "metricTransformations": [{
+            "metricName": "Errors",
+            "metricNamespace": "Lambda",
+            "metricValue": "1",
+        }],
+        "creationTime": 1700000000000,
+    }
+
+    try:
+        set_request_region("us-east-1")
+        mod.restore_state({
+            "log_groups": {
+                group: {
+                    "arn": f"arn:aws:logs:us-west-2:000000000000:log-group:{group}:*",
+                    "creationTime": 1700000000000,
+                    "retentionInDays": None,
+                    "tags": {},
+                    "subscriptionFilters": {},
+                    "streams": {},
+                },
+            },
+            "metric_filters": legacy_metric_filters,
+        })
+
+        set_request_region("us-west-2")
+        assert (group, "ErrorCount") in mod._metric_filters
+        set_request_region("us-east-1")
+        assert (group, "ErrorCount") not in mod._metric_filters
+    finally:
+        set_request_region(original_region)
+        mod.reset()
 
 
 # ── _queries ───────────────────────────────────────────────────────────

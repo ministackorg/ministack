@@ -79,6 +79,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.responses import AccountScopedDict, get_account_id, get_region, new_uuid
 from ministack.services.apigateway import _timeout_from_env, _urlopen_async
 
@@ -98,15 +99,19 @@ REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 # All per-tenant state uses AccountScopedDict so the same REST API id in two
 # different accounts never collides and list operations don't leak cross-account.
 _rest_apis = AccountScopedDict()           # rest_api_id -> RestApi
+_rest_api_regions = AccountScopedDict()    # rest_api_id -> owning region
 _resources = AccountScopedDict()           # rest_api_id -> {resource_id -> Resource}
 _stages_v1 = AccountScopedDict()           # rest_api_id -> {stage_name -> Stage}
 _deployments_v1 = AccountScopedDict()      # rest_api_id -> {deployment_id -> Deployment}
 _authorizers_v1 = AccountScopedDict()      # rest_api_id -> {authorizer_id -> Authorizer}
 _models = AccountScopedDict()              # rest_api_id -> {model_id -> Model}
 _api_keys = AccountScopedDict()            # key_id -> ApiKey
+_api_key_regions = AccountScopedDict()     # key_id -> owning region
 _usage_plans = AccountScopedDict()         # plan_id -> UsagePlan
+_usage_plan_regions = AccountScopedDict()  # plan_id -> owning region
 _usage_plan_keys = AccountScopedDict()     # plan_id -> {key_id -> UsagePlanKey}
 _domain_names = AccountScopedDict()        # domain_name -> DomainName
+_domain_name_regions = AccountScopedDict()  # domain_name -> owning region
 _base_path_mappings = AccountScopedDict()  # domain_name -> {base_path -> BasePathMapping}
 _v1_tags = AccountScopedDict()             # resource_arn -> {key -> value}
 _account_settings = AccountScopedDict()    # singleton per account: stores fields set via UpdateAccount
@@ -514,25 +519,42 @@ def _match_recursive(resources, parent_id, segments, params):
     return None, params
 
 
-async def _call_lambda(func_name, event, qualifier=None):
+def _extract_lambda_ref_from_integration_uri(uri: str) -> str:
+    if not uri:
+        return ""
+    if "/functions/" in uri:
+        inner = uri.split("/functions/", 1)[1]
+        if "/invocations" in inner:
+            inner = inner.split("/invocations", 1)[0]
+        return inner
+    if uri.endswith("/invocations"):
+        return uri[: -len("/invocations")]
+    return uri
+
+
+async def _call_lambda(function_ref, event, *, account_id=None, region=None):
     """Invoke a Lambda function and return the parsed response dict.
 
-    ``qualifier`` may be a version number or alias name; aliases resolve to
-    their target version via ``_get_func_record_for_qualifier`` so aliased
-    integration URIs (arn:...:function:<name>:<alias>) invoke correctly (#407)."""
+    ``function_ref`` may be a name, partial ARN, or full ARN. Full ARNs are
+    resolved through Lambda's scoped lookup so region-qualified integration URIs
+    invoke the function named in the ARN instead of the request/default region."""
     from ministack.services import lambda_svc
 
-    func_data, func_config = lambda_svc._get_func_record_for_qualifier(func_name, qualifier)
-    if func_data is None:
-        label = f"{func_name}:{qualifier}" if qualifier else func_name
+    func_data, func_config, func_name = lambda_svc._get_func_record_for_ref_in_scope(
+        function_ref,
+        account_id=account_id,
+        region=region,
+    )
+    if func_data is None or func_config is None:
+        label = function_ref or func_name
         return None, f"Lambda function '{label}' not found"
 
     # Route through the central _execute_function dispatcher so CloudWatch
     # Logs emission and Docker log output work for API Gateway invocations.
     # Response shaping (throttle→429, error→502, body→envelope) goes through
     # the shared helper so v1/v2 stay consistent.
-    exec_record = {"config": func_config, "code_zip": func_data.get("code_zip")}
-    result = await asyncio.to_thread(lambda_svc._execute_function, exec_record, event)
+    exec_record = lambda_svc._execution_record_for_config(func_data, func_config)
+    result = await asyncio.to_thread(lambda_svc._execute_function_with_config_scope, exec_record, event)
     lambda_response, _ = lambda_svc.lambda_execute_result_to_api_proxy_response(result)
     # On error the helper returns {statusCode: 502, body: <msg>}; preserve
     # the _call_lambda contract of (None, error_msg) so callers that check
@@ -555,50 +577,121 @@ def get_state():
     import copy
     return {
         "rest_apis": copy.deepcopy(_rest_apis),
+        "rest_api_regions": copy.deepcopy(_rest_api_regions),
         "resources": copy.deepcopy(_resources),
         "stages_v1": copy.deepcopy(_stages_v1),
         "deployments_v1": copy.deepcopy(_deployments_v1),
         "authorizers_v1": copy.deepcopy(_authorizers_v1),
         "models": copy.deepcopy(_models),
         "api_keys": copy.deepcopy(_api_keys),
+        "api_key_regions": copy.deepcopy(_api_key_regions),
         "usage_plans": copy.deepcopy(_usage_plans),
+        "usage_plan_regions": copy.deepcopy(_usage_plan_regions),
         "usage_plan_keys": copy.deepcopy(_usage_plan_keys),
         "domain_names": copy.deepcopy(_domain_names),
+        "domain_name_regions": copy.deepcopy(_domain_name_regions),
         "base_path_mappings": copy.deepcopy(_base_path_mappings),
         "v1_tags": copy.deepcopy(_v1_tags),
         "account_settings": copy.deepcopy(_account_settings),
     }
 
 
+def _region_from_existing_tag_arn(account_id, target_resource):
+    for (tag_account_id, resource_arn), _tags in _v1_tags._data.items():
+        if tag_account_id != account_id:
+            continue
+        try:
+            spec = parse_arn(resource_arn)
+        except ArnParseError:
+            continue
+        if (
+            spec.partition == "aws"
+            and spec.service == "apigateway"
+            and spec.account_id == ""
+            and spec.resource == target_resource
+        ):
+            return spec.region
+    return None
+
+
+def _region_from_domain_name_record(domain_name, domain_record, account_id):
+    tag_region = _region_from_existing_tag_arn(account_id, f"/domainnames/{domain_name}")
+    if tag_region:
+        return tag_region
+
+    regional_domain = domain_record.get("regionalDomainName", "")
+    if ".execute-api." in regional_domain:
+        region = regional_domain.rsplit(".execute-api.", 1)[1].split(".", 1)[0]
+        if region:
+            return region
+    return get_region()
+
+
+def _region_from_api_key_record(api_key_id, _api_key, account_id):
+    return _region_from_existing_tag_arn(account_id, f"/apikeys/{api_key_id}") or get_region()
+
+
+def _region_from_usage_plan_record(plan_id, _usage_plan, account_id):
+    return _region_from_existing_tag_arn(account_id, f"/usageplans/{plan_id}") or get_region()
+
+
+def _region_from_rest_api_record(api_id, _rest_api, account_id):
+    return _region_from_existing_tag_arn(account_id, f"/restapis/{api_id}") or get_region()
+
+
+def _backfill_tag_region_map(resource_store, region_store, region_for_item):
+    # State files written before these side maps existed still need to resolve
+    # tag-resource ARNs for resources that already exist.
+    if isinstance(resource_store, AccountScopedDict) and isinstance(region_store, AccountScopedDict):
+        for scoped_key, value in resource_store._data.items():
+            account_id, key = scoped_key
+            region_store._data.setdefault(scoped_key, region_for_item(key, value, account_id))
+        return
+    for key, value in resource_store.items():
+        region_store.setdefault(key, region_for_item(key, value, get_account_id()))
+
+
 def load_persisted_state(data):
     """Restore module state from a previously persisted snapshot."""
     _rest_apis.update(data.get("rest_apis", {}))
+    _rest_api_regions.update(data.get("rest_api_regions", {}))
     _resources.update(data.get("resources", {}))
     _stages_v1.update(data.get("stages_v1", {}))
     _deployments_v1.update(data.get("deployments_v1", {}))
     _authorizers_v1.update(data.get("authorizers_v1", {}))
     _models.update(data.get("models", {}))
     _api_keys.update(data.get("api_keys", {}))
+    _api_key_regions.update(data.get("api_key_regions", {}))
     _usage_plans.update(data.get("usage_plans", {}))
+    _usage_plan_regions.update(data.get("usage_plan_regions", {}))
     _usage_plan_keys.update(data.get("usage_plan_keys", {}))
     _domain_names.update(data.get("domain_names", {}))
+    _domain_name_regions.update(data.get("domain_name_regions", {}))
     _base_path_mappings.update(data.get("base_path_mappings", {}))
     _v1_tags.update(data.get("v1_tags", {}))
     _account_settings.update(data.get("account_settings", {}))
+    _backfill_tag_region_map(_rest_apis, _rest_api_regions, _region_from_rest_api_record)
+    _backfill_tag_region_map(_api_keys, _api_key_regions, _region_from_api_key_record)
+    _backfill_tag_region_map(_usage_plans, _usage_plan_regions, _region_from_usage_plan_record)
+    _backfill_tag_region_map(_domain_names, _domain_name_regions, _region_from_domain_name_record)
 
 
 def reset():
     """Clear all module state."""
     _rest_apis.clear()
+    _rest_api_regions.clear()
     _resources.clear()
     _stages_v1.clear()
     _deployments_v1.clear()
     _authorizers_v1.clear()
     _models.clear()
     _api_keys.clear()
+    _api_key_regions.clear()
     _usage_plans.clear()
+    _usage_plan_regions.clear()
     _usage_plan_keys.clear()
     _domain_names.clear()
+    _domain_name_regions.clear()
     _base_path_mappings.clear()
     _v1_tags.clear()
     _account_settings.clear()
@@ -910,6 +1003,8 @@ async def handle_execute(api_id, stage_name, method, path, headers, body, query_
         return await _invoke_lambda_proxy_v1(
             integration, api_id, stage_name, stage, resource, path, method,
             headers, body, query_params, path_params,
+            owner_account_id=get_account_id(),
+            owner_region=_rest_api_regions.get(api_id, get_region()),
             binary_media_types=api.get("binaryMediaTypes") or [],
         )
     elif int_type in ("HTTP_PROXY", "HTTP"):
@@ -941,21 +1036,30 @@ def _media_type_matches(media_type, binary_media_types):
     return False
 
 
-async def _invoke_lambda_proxy_v1(integration, api_id, stage_name, stage, resource, request_path, method, headers, body, query_params, path_params, binary_media_types=None):
+async def _invoke_lambda_proxy_v1(
+    integration,
+    api_id,
+    stage_name,
+    stage,
+    resource,
+    request_path,
+    method,
+    headers,
+    body,
+    query_params,
+    path_params,
+    *,
+    owner_account_id=None,
+    owner_region=None,
+    binary_media_types=None,
+):
     """Invoke Lambda with API Gateway v1 payload format 1.0."""
     uri = integration.get("uri", "")
     # Supported URI formats:
     #   1. arn:aws:apigateway:{region}:lambda:path/2015-03-31/functions/arn:aws:lambda:{region}:{acct}:function:{name}[:{qualifier}]/invocations
     #   2. arn:aws:lambda:{region}:{acct}:function:{name}[:{qualifier}]
     #   3. plain function name: MyFunction[:{qualifier}]
-    from ministack.services import lambda_svc as _lambda_svc
-    if "function:" in uri:
-        # Strip wrapper up through 'function:' and any trailing /invocations.
-        tail = uri.split("function:")[-1].split("/")[0]
-        # tail is now "<name>" or "<name>:<qualifier>".
-        func_name, qualifier = _lambda_svc._resolve_name_and_qualifier(tail)
-    else:
-        func_name, qualifier = _lambda_svc._resolve_name_and_qualifier(uri)
+    lambda_ref = _extract_lambda_ref_from_integration_uri(uri)
 
     qs_params = {k: v[0] for k, v in query_params.items()} if query_params else None
     mv_qs_params = {k: list(v) for k, v in query_params.items()} if query_params else None
@@ -1014,7 +1118,12 @@ async def _invoke_lambda_proxy_v1(integration, api_id, stage_name, stage, resour
         "isBase64Encoded": req_is_base64,
     }
 
-    lambda_response, err = await _call_lambda(func_name, event, qualifier=qualifier)
+    lambda_response, err = await _call_lambda(
+        lambda_ref,
+        event,
+        account_id=owner_account_id,
+        region=owner_region,
+    )
     if err:
         return 502, {"Content-Type": "application/json"}, json.dumps({"message": err}).encode()
 
@@ -1206,6 +1315,7 @@ def _create_rest_api(data):
         "disableExecuteApiEndpoint": data.get("disableExecuteApiEndpoint", False),
     }
     _rest_apis[api_id] = api
+    _rest_api_regions[api_id] = get_region()
     _resources[api_id] = {}
     _stages_v1[api_id] = {}
     _deployments_v1[api_id] = {}
@@ -1251,6 +1361,7 @@ def _delete_rest_api(api_id):
     if api_id not in _rest_apis:
         return _v1_error("NotFoundException", "Invalid API identifier specified", 404)
     _rest_apis.pop(api_id, None)
+    _rest_api_regions.pop(api_id, None)
     _resources.pop(api_id, None)
     _stages_v1.pop(api_id, None)
     _deployments_v1.pop(api_id, None)
@@ -1850,6 +1961,7 @@ def _create_api_key(data):
         "tags": data.get("tags", {}),
     }
     _api_keys[key_id] = api_key
+    _api_key_regions[key_id] = get_region()
     return _v1_response(api_key, 201)
 
 
@@ -1878,6 +1990,7 @@ def _delete_api_key(key_id):
     if key_id not in _api_keys:
         return _v1_error("NotFoundException", "Invalid API Key identifier specified", 404)
     _api_keys.pop(key_id, None)
+    _api_key_regions.pop(key_id, None)
     return 202, {}, b""
 
 
@@ -1895,6 +2008,7 @@ def _create_usage_plan(data):
         "tags": data.get("tags", {}),
     }
     _usage_plans[plan_id] = plan
+    _usage_plan_regions[plan_id] = get_region()
     _usage_plan_keys[plan_id] = {}
     return _v1_response(plan, 201)
 
@@ -1923,6 +2037,7 @@ def _delete_usage_plan(plan_id):
     if plan_id not in _usage_plans:
         return _v1_error("NotFoundException", "Invalid Usage Plan identifier specified", 404)
     _usage_plans.pop(plan_id, None)
+    _usage_plan_regions.pop(plan_id, None)
     _usage_plan_keys.pop(plan_id, None)
     return 202, {}, b""
 
@@ -1985,6 +2100,7 @@ def _create_domain_name(data):
         "tags": data.get("tags", {}),
     }
     _domain_names[domain_name] = dn
+    _domain_name_regions[domain_name] = get_region()
     _base_path_mappings[domain_name] = {}
     return _v1_response(dn, 201)
 
@@ -2004,6 +2120,7 @@ def _delete_domain_name(domain_name):
     if domain_name not in _domain_names:
         return _v1_error("NotFoundException", "Invalid domain name identifier specified", 404)
     _domain_names.pop(domain_name, None)
+    _domain_name_regions.pop(domain_name, None)
     _base_path_mappings.pop(domain_name, None)
     return 202, {}, b""
 
@@ -2041,19 +2158,85 @@ def _delete_base_path_mapping(domain_name, base_path):
 
 # ---- Control plane: Tags ----
 
+def _resolve_v1_tag_resource_arn(resource_arn):
+    try:
+        spec = parse_arn(resource_arn)
+    except ArnParseError:
+        return None, _v1_error("BadRequestException", "Invalid resource ARN specified", 400)
+
+    if (
+        spec.partition != "aws"
+        or spec.service != "apigateway"
+        or spec.region != get_region()
+        or spec.account_id
+    ):
+        return None, _v1_error("BadRequestException", "Invalid resource ARN specified", 400)
+
+    parts = spec.resource.split("/")
+    if len(parts) == 3 and parts[0] == "" and parts[2]:
+        resource_type = parts[1]
+        resource_id = parts[2]
+        if resource_type == "restapis":
+            if resource_id not in _rest_apis or _rest_api_regions.get(resource_id) != spec.region:
+                return None, _v1_error("NotFoundException", "Invalid API identifier specified", 404)
+            return _rest_api_arn(resource_id), None
+        if resource_type == "apikeys":
+            if resource_id not in _api_keys or _api_key_regions.get(resource_id) != spec.region:
+                return None, _v1_error("NotFoundException", "Invalid resource identifier specified", 404)
+            return f"arn:aws:apigateway:{spec.region}::/apikeys/{resource_id}", None
+        if resource_type == "usageplans":
+            if resource_id not in _usage_plans or _usage_plan_regions.get(resource_id) != spec.region:
+                return None, _v1_error("NotFoundException", "Invalid resource identifier specified", 404)
+            return f"arn:aws:apigateway:{spec.region}::/usageplans/{resource_id}", None
+        if resource_type == "domainnames":
+            if resource_id not in _domain_names or _domain_name_regions.get(resource_id) != spec.region:
+                return None, _v1_error("NotFoundException", "Invalid resource identifier specified", 404)
+            return f"arn:aws:apigateway:{spec.region}::/domainnames/{resource_id}", None
+        return None, _v1_error("BadRequestException", "Invalid resource ARN specified", 400)
+
+    if (
+        len(parts) == 5
+        and parts[0] == ""
+        and parts[1] == "restapis"
+        and parts[2]
+        and parts[3] == "stages"
+        and parts[4]
+    ):
+        api_id = parts[2]
+        stage_name = parts[4]
+        if (
+            api_id not in _rest_apis
+            or _rest_api_regions.get(api_id) != spec.region
+            or stage_name not in _stages_v1.get(api_id, {})
+        ):
+            return None, _v1_error("NotFoundException", "Invalid Stage identifier specified", 404)
+        return f"arn:aws:apigateway:{spec.region}::/restapis/{api_id}/stages/{stage_name}", None
+
+    return None, _v1_error("BadRequestException", "Invalid resource ARN specified", 400)
+
+
 def _get_v1_tags(resource_arn):
-    tags = _v1_tags.get(resource_arn, {})
+    tag_key, err = _resolve_v1_tag_resource_arn(resource_arn)
+    if err is not None:
+        return err
+    tags = _v1_tags.get(tag_key, {})
     return _v1_response({"tags": tags})
 
 
 def _tag_v1_resource(resource_arn, data):
+    tag_key, err = _resolve_v1_tag_resource_arn(resource_arn)
+    if err is not None:
+        return err
     tags = data.get("tags", {})
-    _v1_tags.setdefault(resource_arn, {}).update(tags)
+    _v1_tags.setdefault(tag_key, {}).update(tags)
     return 204, {}, b""
 
 
 def _untag_v1_resource(resource_arn, tag_keys):
-    existing = _v1_tags.get(resource_arn, {})
+    tag_key, err = _resolve_v1_tag_resource_arn(resource_arn)
+    if err is not None:
+        return err
+    existing = _v1_tags.get(tag_key, {})
     for key in tag_keys:
         existing.pop(key, None)
     return 204, {}, b""

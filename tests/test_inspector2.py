@@ -469,6 +469,22 @@ class TestMultitenancy:
         assert filters_a[0]["name"] == "acct-a-filter"
         assert filters_b[0]["name"] == "acct-b-filter"
 
+    def test_delete_filter_rejects_wrong_account_arn(self):
+        from ministack.services import inspector2 as _inspector2
+
+        _inspector2.reset()
+        client_a = self._client("111111111111")
+
+        created = client_a.create_filter(name="scoped-filter", action="NONE", filterCriteria={})
+        wrong_account_arn = created["arn"].replace(":111111111111:", ":222222222222:")
+
+        with pytest.raises(ClientError) as exc:
+            client_a.delete_filter(arn=wrong_account_arn)
+
+        assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+        filters = client_a.list_filters()["filters"]
+        assert any(f["name"] == "scoped-filter" for f in filters)
+
     def test_tags_isolated_by_account(self):
         from ministack.services import inspector2 as _inspector2
 
@@ -476,15 +492,28 @@ class TestMultitenancy:
         client_a = self._client("111111111111")
         client_b = self._client("222222222222")
 
-        arn = "arn:aws:inspector2:us-east-1:000000000000:finding/shared-arn"
-        client_a.tag_resource(resourceArn=arn, tags={"owner": "a"})
-        client_b.tag_resource(resourceArn=arn, tags={"owner": "b"})
+        arn_a = "arn:aws:inspector2:us-east-1:111111111111:finding/shared-arn"
+        arn_b = "arn:aws:inspector2:us-east-1:222222222222:finding/shared-arn"
+        client_a.tag_resource(resourceArn=arn_a, tags={"owner": "a"})
+        client_b.tag_resource(resourceArn=arn_b, tags={"owner": "b"})
 
-        tags_a = client_a.list_tags_for_resource(resourceArn=arn)["tags"]
-        tags_b = client_b.list_tags_for_resource(resourceArn=arn)["tags"]
+        tags_a = client_a.list_tags_for_resource(resourceArn=arn_a)["tags"]
+        tags_b = client_b.list_tags_for_resource(resourceArn=arn_b)["tags"]
 
         assert tags_a["owner"] == "a"
         assert tags_b["owner"] == "b"
+
+    def test_tags_reject_wrong_account_arn(self):
+        from ministack.services import inspector2 as _inspector2
+
+        _inspector2.reset()
+        client_a = self._client("111111111111")
+        wrong_account_arn = "arn:aws:inspector2:us-east-1:222222222222:finding/shared-arn"
+
+        with pytest.raises(ClientError) as exc:
+            client_a.tag_resource(resourceArn=wrong_account_arn, tags={"owner": "a"})
+
+        assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
 
 
 class TestAdvancedFiltering:
