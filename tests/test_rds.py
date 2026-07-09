@@ -10,6 +10,42 @@ from urllib.parse import urlparse
 import pytest
 from botocore.exceptions import ClientError
 
+DEFAULT_AURORA_MYSQL_ENGINE_VERSION = "8.0.mysql_aurora.3.10.3"
+UNSUPPORTED_AURORA_MYSQL_ENGINE_VERSION = "9.0.mysql_aurora.9.0.1"
+EXPECTED_AURORA_MYSQL_ENGINE_VERSIONS = {
+    "5.7.mysql_aurora.2.11.1": "aurora-mysql5.7",
+    "5.7.mysql_aurora.2.11.2": "aurora-mysql5.7",
+    "5.7.mysql_aurora.2.11.3": "aurora-mysql5.7",
+    "5.7.mysql_aurora.2.11.4": "aurora-mysql5.7",
+    "5.7.mysql_aurora.2.11.5": "aurora-mysql5.7",
+    "5.7.mysql_aurora.2.11.6": "aurora-mysql5.7",
+    "5.7.mysql_aurora.2.12.0": "aurora-mysql5.7",
+    "5.7.mysql_aurora.2.12.1": "aurora-mysql5.7",
+    "5.7.mysql_aurora.2.12.2": "aurora-mysql5.7",
+    "5.7.mysql_aurora.2.12.3": "aurora-mysql5.7",
+    "5.7.mysql_aurora.2.12.4": "aurora-mysql5.7",
+    "5.7.mysql_aurora.2.12.5": "aurora-mysql5.7",
+    "5.7.mysql_aurora.2.12.6": "aurora-mysql5.7",
+    "8.0.mysql_aurora.3.04.0": "aurora-mysql8.0",
+    "8.0.mysql_aurora.3.04.1": "aurora-mysql8.0",
+    "8.0.mysql_aurora.3.04.2": "aurora-mysql8.0",
+    "8.0.mysql_aurora.3.04.3": "aurora-mysql8.0",
+    "8.0.mysql_aurora.3.04.4": "aurora-mysql8.0",
+    "8.0.mysql_aurora.3.04.6": "aurora-mysql8.0",
+    "8.0.mysql_aurora.3.08.0": "aurora-mysql8.0",
+    "8.0.mysql_aurora.3.08.1": "aurora-mysql8.0",
+    "8.0.mysql_aurora.3.08.2": "aurora-mysql8.0",
+    "8.0.mysql_aurora.3.09.0": "aurora-mysql8.0",
+    "8.0.mysql_aurora.3.10.0": "aurora-mysql8.0",
+    "8.0.mysql_aurora.3.10.1": "aurora-mysql8.0",
+    "8.0.mysql_aurora.3.10.2": "aurora-mysql8.0",
+    "8.0.mysql_aurora.3.10.3": "aurora-mysql8.0",
+    "8.0.mysql_aurora.3.10.4": "aurora-mysql8.0",
+    "8.0.mysql_aurora.3.11.1": "aurora-mysql8.0",
+    "8.0.mysql_aurora.3.12.0": "aurora-mysql8.0",
+    "8.4.mysql_aurora.8.4.7": "aurora-mysql8.4",
+}
+
 
 def test_rds_create(rds):
     rds.create_db_instance(
@@ -82,6 +118,7 @@ def test_rds_cluster_default_field_serialization(rds):
     assert cluster.get("DatabaseName") is None
     assert cluster.get("NetworkType") == "IPV4"
     assert cluster.get("EngineLifecycleSupport") == "open-source-rds-extended-support"
+    assert cluster["EngineVersion"] == DEFAULT_AURORA_MYSQL_ENGINE_VERSION
 
 def test_rds_cluster_explicit_field_round_trip(rds):
     """Explicit DatabaseName / NetworkType / EngineLifecycleSupport round-trip
@@ -688,11 +725,12 @@ def test_rds_modify_and_describe_cluster_parameters(rds):
     p = next(p for p in params if p["ParameterName"] == "innodb_lock_wait_timeout")
     assert p["ParameterValue"] == "60"
     assert p["ApplyMethod"] == "immediate"
-    # engine-default filter should return empty when no defaults are tracked
     resp2 = rds.describe_db_cluster_parameters(
         DBClusterParameterGroupName="test-cparam-persist", Source="engine-default"
     )
-    assert len(resp2["Parameters"]) == 0
+    default_names = [p["ParameterName"] for p in resp2["Parameters"]]
+    assert "max_connections" in default_names
+    assert "innodb_lock_wait_timeout" not in default_names
 
 
 def test_rds_describe_cluster_parameters_emits_source(rds):
@@ -783,6 +821,130 @@ def test_rds_describe_engine_versions_family(rds):
         family = v["DBParameterGroupFamily"]
         # Should be e.g. "aurora-mysql8.0", not "aurora-mysqlaurora-mysql8.0"
         assert not family.startswith("aurora-mysqlaurora-"), f"Double-prefixed family: {family}"
+
+
+def test_rds_describe_aurora_mysql_engine_versions_by_family(rds):
+    resp = rds.describe_db_engine_versions(Engine="aurora-mysql")
+    families = {
+        v["EngineVersion"]: v["DBParameterGroupFamily"]
+        for v in resp["DBEngineVersions"]
+    }
+    assert families == EXPECTED_AURORA_MYSQL_ENGINE_VERSIONS
+    assert DEFAULT_AURORA_MYSQL_ENGINE_VERSION in families
+
+    filtered = rds.describe_db_engine_versions(
+        Engine="aurora-mysql",
+        EngineVersion=UNSUPPORTED_AURORA_MYSQL_ENGINE_VERSION,
+    )["DBEngineVersions"]
+    assert filtered == []
+
+
+def test_rds_aurora_mysql_create_rejects_unsupported_explicit_engine_version(rds):
+    with pytest.raises(ClientError) as cluster_exc:
+        rds.create_db_cluster(
+            DBClusterIdentifier="unsupported-aurora-version-cluster",
+            Engine="aurora-mysql",
+            EngineVersion=UNSUPPORTED_AURORA_MYSQL_ENGINE_VERSION,
+            MasterUsername="admin",
+            MasterUserPassword="password123",
+        )
+    assert cluster_exc.value.response["Error"]["Code"] == "InvalidParameterCombination"
+    assert (
+        cluster_exc.value.response["Error"]["Message"]
+        == f"Cannot find version {UNSUPPORTED_AURORA_MYSQL_ENGINE_VERSION} for aurora-mysql"
+    )
+
+    with pytest.raises(ClientError) as instance_exc:
+        rds.create_db_instance(
+            DBInstanceIdentifier="unsupported-aurora-version-instance",
+            DBInstanceClass="db.t3.micro",
+            Engine="aurora-mysql",
+            EngineVersion=UNSUPPORTED_AURORA_MYSQL_ENGINE_VERSION,
+            MasterUsername="admin",
+            MasterUserPassword="password123",
+            AllocatedStorage=20,
+        )
+    assert instance_exc.value.response["Error"]["Code"] == "InvalidParameterCombination"
+    assert (
+        instance_exc.value.response["Error"]["Message"]
+        == f"Cannot find version {UNSUPPORTED_AURORA_MYSQL_ENGINE_VERSION} for aurora-mysql"
+    )
+
+
+def test_rds_aurora_mysql_create_accepts_cataloged_84_engine_version(rds):
+    rds.create_db_cluster(
+        DBClusterIdentifier="supported-aurora-84-cluster",
+        Engine="aurora-mysql",
+        EngineVersion="8.4.mysql_aurora.8.4.7",
+        MasterUsername="admin",
+        MasterUserPassword="password123",
+    )
+    try:
+        cluster = rds.describe_db_clusters(
+            DBClusterIdentifier="supported-aurora-84-cluster"
+        )["DBClusters"][0]
+        assert cluster["EngineVersion"] == "8.4.mysql_aurora.8.4.7"
+    finally:
+        rds.delete_db_cluster(
+            DBClusterIdentifier="supported-aurora-84-cluster",
+            SkipFinalSnapshot=True,
+        )
+
+
+def test_rds_aurora_mysql_parameter_defaults_are_family_aware(rds):
+    rds.create_db_parameter_group(
+        DBParameterGroupName="test-mysql80-defaults",
+        DBParameterGroupFamily="aurora-mysql8.0",
+        Description="aurora mysql 8.0 defaults",
+    )
+    rds.create_db_parameter_group(
+        DBParameterGroupName="test-mysql84-defaults",
+        DBParameterGroupFamily="aurora-mysql8.4",
+        Description="aurora mysql 8.4 defaults",
+    )
+    mysql80 = rds.describe_db_parameters(
+        DBParameterGroupName="test-mysql80-defaults",
+        Source="engine-default",
+    )["Parameters"]
+    mysql84 = rds.describe_db_parameters(
+        DBParameterGroupName="test-mysql84-defaults",
+        Source="engine-default",
+    )["Parameters"]
+
+    mysql80_names = {p["ParameterName"] for p in mysql80}
+    mysql84_names = {p["ParameterName"] for p in mysql84}
+    assert "max_connections" in mysql80_names
+    assert "max_connections" in mysql84_names
+    assert "skip-character-set-client-handshake" in mysql80_names
+    assert "skip-character-set-client-handshake" not in mysql84_names
+
+
+def test_rds_cluster_parameter_defaults_are_family_aware(rds):
+    rds.create_db_cluster_parameter_group(
+        DBClusterParameterGroupName="test-cmysql80-defaults",
+        DBParameterGroupFamily="aurora-mysql8.0",
+        Description="aurora mysql 8.0 cluster defaults",
+    )
+    rds.create_db_cluster_parameter_group(
+        DBClusterParameterGroupName="test-cmysql84-defaults",
+        DBParameterGroupFamily="aurora-mysql8.4",
+        Description="aurora mysql 8.4 cluster defaults",
+    )
+    mysql80 = rds.describe_db_cluster_parameters(
+        DBClusterParameterGroupName="test-cmysql80-defaults",
+        Source="engine-default",
+    )["Parameters"]
+    mysql84 = rds.describe_db_cluster_parameters(
+        DBClusterParameterGroupName="test-cmysql84-defaults",
+        Source="engine-default",
+    )["Parameters"]
+
+    mysql80_names = {p["ParameterName"] for p in mysql80}
+    mysql84_names = {p["ParameterName"] for p in mysql84}
+    assert "max_connections" in mysql80_names
+    assert "max_connections" in mysql84_names
+    assert "skip-character-set-client-handshake" in mysql80_names
+    assert "skip-character-set-client-handshake" not in mysql84_names
 
 
 def test_rds_parse_member_list_both_formats():
@@ -1335,6 +1497,36 @@ def test_rds_describe_orderable_db_instance_options(rds):
     assert options2[0]["DBInstanceClass"] == "db.t3.micro"
     assert options2[0]["Engine"] == "mysql"
 
+    aurora_default = rds.describe_orderable_db_instance_options(
+        Engine="aurora-mysql",
+        DBInstanceClass="db.t3.micro",
+    )["OrderableDBInstanceOptions"]
+    assert len(aurora_default) == 1
+    assert aurora_default[0]["DBInstanceClass"] == "db.t3.micro"
+    assert aurora_default[0]["Engine"] == "aurora-mysql"
+    assert aurora_default[0]["EngineVersion"] == DEFAULT_AURORA_MYSQL_ENGINE_VERSION
+
+    aurora_supported = rds.describe_orderable_db_instance_options(
+        Engine="aurora-mysql",
+        EngineVersion="8.4.mysql_aurora.8.4.7",
+        DBInstanceClass="db.t3.micro",
+    )["OrderableDBInstanceOptions"]
+    assert len(aurora_supported) == 1
+    assert aurora_supported[0]["DBInstanceClass"] == "db.t3.micro"
+    assert aurora_supported[0]["Engine"] == "aurora-mysql"
+    assert aurora_supported[0]["EngineVersion"] == "8.4.mysql_aurora.8.4.7"
+
+    with pytest.raises(ClientError) as exc:
+        rds.describe_orderable_db_instance_options(
+            Engine="aurora-mysql",
+            EngineVersion=UNSUPPORTED_AURORA_MYSQL_ENGINE_VERSION,
+        )
+    assert exc.value.response["Error"]["Code"] == "InvalidParameterCombination"
+    assert (
+        exc.value.response["Error"]["Message"]
+        == f"Cannot find version {UNSUPPORTED_AURORA_MYSQL_ENGINE_VERSION} for aurora-mysql"
+    )
+
 
 def test_rds_enable_http_endpoint(rds):
     """EnableHttpEndpoint enables Data API on an Aurora cluster."""
@@ -1425,19 +1617,35 @@ def test_docker_image_for_engine_aurora_postgres_18_uses_new_layout():
     assert data_path_18 == "/var/lib/postgresql"
 
 
-def test_docker_image_for_engine_mysql_unchanged():
-    """MySQL / MariaDB / Aurora MySQL keep /var/lib/mysql — the Postgres 18
-    layout change does not touch them."""
+def test_mysql_image_for_version_maps_aurora_tracks():
+    from ministack.services.rds import _mysql_image_for_version
+
+    assert _mysql_image_for_version("8.4.mysql_aurora.8.4.7") == "mysql:8.4"
+    assert _mysql_image_for_version("8.0.mysql_aurora.3.12.0") == "mysql:8.0"
+    assert _mysql_image_for_version("5.7.mysql_aurora.2.12.6") == "mysql:5.7"
+    assert _mysql_image_for_version("5.6.mysql_aurora.1.23.4") == "mysql:5.6"
+    assert _mysql_image_for_version("8.4.7") == "mysql:8.4"
+    assert _mysql_image_for_version("9.0.mysql_aurora.9.0.1") == "mysql:8.4"
+    assert _mysql_image_for_version("not-a-version") == "mysql:8.4"
+
+
+def test_docker_image_for_engine_mysql_uses_versioned_images():
+    """MySQL / MariaDB / Aurora MySQL keep /var/lib/mysql, but MySQL-compatible
+    engines use explicit versioned MySQL images instead of the floating mysql:8 tag."""
     from ministack.services.rds import _docker_image_for_engine
 
-    for engine, version in [
-        ("mysql", "8.0.33"),
-        ("aurora-mysql", "8.0.mysql_aurora.3.03.0"),
-        ("mariadb", "10.6.14"),
+    for engine, version, expected_image in [
+        ("mysql", "8.0.33", "mysql:8.0"),
+        ("mysql", "5.7.43", "mysql:5.7"),
+        ("aurora-mysql", "5.7.mysql_aurora.2.12.6", "mysql:5.7"),
+        ("aurora-mysql", "8.0.mysql_aurora.3.12.0", "mysql:8.0"),
+        ("aurora-mysql", "8.4.mysql_aurora.8.4.7", "mysql:8.4"),
+        ("mariadb", "10.6.14", "mariadb:latest"),
     ]:
-        _, _, port, data_path = _docker_image_for_engine(
+        image, _, port, data_path = _docker_image_for_engine(
             engine, version, "admin", "pw", "mydb"
         )
+        assert image == expected_image
         assert port == 3306
         assert data_path == "/var/lib/mysql"
 

@@ -37,6 +37,7 @@ LABEL maintainer="MiniStack" \
 # Lambda Node.js + init scripts), then strip pip and locale/doc payload
 # we never use at runtime.
 RUN apt-get update \
+    && apt-get upgrade -y \
     && apt-get install -y --no-install-recommends nodejs bash \
     && apt-get purge -y --auto-remove -o APT::AutoRemove::RecommendsImportant=false \
     && rm -rf /var/lib/apt/lists/* /var/cache/apt/* /tmp/* \

@@ -126,6 +126,26 @@ def test_cognito_list_users_filter(cognito_idp):
     assert len(users) == 1
     assert users[0]["Username"] == "bob"
 
+def test_cognito_list_users_filter_quoted_attribute_name(cognito_idp):
+    pid = cognito_idp.create_user_pool(PoolName="QuotedFilterUsersPool")["UserPool"]["Id"]
+    cognito_idp.admin_create_user(
+        UserPoolId=pid,
+        Username="bob",
+        UserAttributes=[{"Name": "email", "Value": "bob@example.com"}],
+    )
+    cognito_idp.admin_create_user(
+        UserPoolId=pid,
+        Username="charlie",
+        UserAttributes=[{"Name": "email", "Value": "charlie@example.com"}],
+    )
+    resp = cognito_idp.list_users(UserPoolId=pid, Filter='"email" = "bob@example.com"')
+    users = resp["Users"]
+    assert len(users) == 1
+    assert users[0]["Username"] == "bob"
+
+    resp = cognito_idp.list_users(UserPoolId=pid, Filter='"email" = "nonexistent@example.com"')
+    assert resp["Users"] == []
+
 def test_cognito_admin_set_user_password(cognito_idp):
     pid = cognito_idp.create_user_pool(PoolName="PwdPool")["UserPool"]["Id"]
     cid = cognito_idp.create_user_pool_client(

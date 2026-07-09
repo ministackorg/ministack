@@ -85,6 +85,57 @@ _port_counter = [BASE_PORT]
 _docker = None
 _ministack_network = None
 
+# Aurora MySQL versions are the creatable set returned by AWS RDS as of
+# 2026-07-09. Refresh with:
+#   aws rds describe-db-engine-versions --engine aurora-mysql \
+#     --query 'DBEngineVersions[].[EngineVersion,DBParameterGroupFamily]' \
+#     --output text | sort -V
+# Keep the Docker image mapping below aligned to the community MySQL major.minor:
+# 5.7 -> mysql:5.7, 8.0 -> mysql:8.0, 8.4 -> mysql:8.4. AWS's default can trail
+# the latest advertised version, so update _default_engine_version deliberately.
+AURORA_MYSQL_ENGINE_VERSIONS = [
+    ("5.7.mysql_aurora.2.11.1", "aurora-mysql5.7"),
+    ("5.7.mysql_aurora.2.11.2", "aurora-mysql5.7"),
+    ("5.7.mysql_aurora.2.11.3", "aurora-mysql5.7"),
+    ("5.7.mysql_aurora.2.11.4", "aurora-mysql5.7"),
+    ("5.7.mysql_aurora.2.11.5", "aurora-mysql5.7"),
+    ("5.7.mysql_aurora.2.11.6", "aurora-mysql5.7"),
+    ("5.7.mysql_aurora.2.12.0", "aurora-mysql5.7"),
+    ("5.7.mysql_aurora.2.12.1", "aurora-mysql5.7"),
+    ("5.7.mysql_aurora.2.12.2", "aurora-mysql5.7"),
+    ("5.7.mysql_aurora.2.12.3", "aurora-mysql5.7"),
+    ("5.7.mysql_aurora.2.12.4", "aurora-mysql5.7"),
+    ("5.7.mysql_aurora.2.12.5", "aurora-mysql5.7"),
+    ("5.7.mysql_aurora.2.12.6", "aurora-mysql5.7"),
+    ("8.0.mysql_aurora.3.04.0", "aurora-mysql8.0"),
+    ("8.0.mysql_aurora.3.04.1", "aurora-mysql8.0"),
+    ("8.0.mysql_aurora.3.04.2", "aurora-mysql8.0"),
+    ("8.0.mysql_aurora.3.04.3", "aurora-mysql8.0"),
+    ("8.0.mysql_aurora.3.04.4", "aurora-mysql8.0"),
+    ("8.0.mysql_aurora.3.04.6", "aurora-mysql8.0"),
+    ("8.0.mysql_aurora.3.08.0", "aurora-mysql8.0"),
+    ("8.0.mysql_aurora.3.08.1", "aurora-mysql8.0"),
+    ("8.0.mysql_aurora.3.08.2", "aurora-mysql8.0"),
+    ("8.0.mysql_aurora.3.09.0", "aurora-mysql8.0"),
+    ("8.0.mysql_aurora.3.10.0", "aurora-mysql8.0"),
+    ("8.0.mysql_aurora.3.10.1", "aurora-mysql8.0"),
+    ("8.0.mysql_aurora.3.10.2", "aurora-mysql8.0"),
+    ("8.0.mysql_aurora.3.10.3", "aurora-mysql8.0"),
+    ("8.0.mysql_aurora.3.10.4", "aurora-mysql8.0"),
+    ("8.0.mysql_aurora.3.11.1", "aurora-mysql8.0"),
+    ("8.0.mysql_aurora.3.12.0", "aurora-mysql8.0"),
+    ("8.4.mysql_aurora.8.4.7", "aurora-mysql8.4"),
+]
+AURORA_MYSQL_ENGINE_VERSION_SET = {version for version, _ in AURORA_MYSQL_ENGINE_VERSIONS}
+
+AURORA_MYSQL_IMAGE_MAP = {
+    "5.6": "mysql:5.6",
+    "5.7": "mysql:5.7",
+    "8.0": "mysql:8.0",
+    "8.4": "mysql:8.4",
+}
+DEFAULT_AURORA_MYSQL_IMAGE = "mysql:8.4"
+
 
 # ── Persistence ────────────────────────────────────────────
 
@@ -972,7 +1023,11 @@ def _create_db_instance(p):
         return _error("DBInstanceAlreadyExistsFault", f"DB instance {db_id} already exists", 400)
 
     engine = _p(p, "Engine") or "postgres"
-    engine_version = _p(p, "EngineVersion") or _default_engine_version(engine)
+    explicit_engine_version = _p(p, "EngineVersion")
+    engine_version_error = _unsupported_aurora_mysql_engine_version_error(engine, explicit_engine_version)
+    if engine_version_error:
+        return engine_version_error
+    engine_version = explicit_engine_version or _default_engine_version(engine)
     db_class = _p(p, "DBInstanceClass") or "db.t3.micro"
     master_user = _p(p, "MasterUsername") or "admin"
     master_pass = _p(p, "MasterUserPassword") or "password"
@@ -1674,11 +1729,15 @@ def _create_db_cluster(p):
                 400,
             )
         engine = expected_engine or engine
-    engine_version = _p(p, "EngineVersion") or _default_engine_version(engine)
+    explicit_engine_version = _p(p, "EngineVersion")
+    engine_version_error = _unsupported_aurora_mysql_engine_version_error(engine, explicit_engine_version)
+    if engine_version_error:
+        return engine_version_error
+    engine_version = explicit_engine_version or _default_engine_version(engine)
     if global_cluster:
         expected_engine_version = global_cluster.get("EngineVersion")
         if (
-            _p(p, "EngineVersion")
+            explicit_engine_version
             and expected_engine_version
             and engine_version != expected_engine_version
         ):
@@ -2148,57 +2207,7 @@ def _describe_db_parameters(p):
         return _error("DBParameterGroupNotFound", f"Parameter group {name} not found.", 404)
 
     source_filter = _p(p, "Source")  # "user", "engine-default", or None (all)
-
-    family = pg.get("DBParameterGroupFamily", "")
-    default_params = _default_parameters_for_family(family)
-
-    custom = pg.get("Parameters", {})
-    default_names = {p["name"] for p in default_params}
-    params_xml = ""
-    for param in default_params:
-        pname = param["name"]
-        cval = custom.get(pname)
-        if isinstance(cval, dict):
-            value = cval.get("ParameterValue", param.get("default", ""))
-            apply_method = cval.get("ApplyMethod", "pending-reboot")
-        else:
-            value = cval if cval is not None else param.get("default", "")
-            apply_method = "pending-reboot"
-        source = "user" if pname in custom else "engine-default"
-        if source_filter and source != source_filter:
-            continue
-        params_xml += f"""<Parameter>
-            <ParameterName>{pname}</ParameterName>
-            <ParameterValue>{value}</ParameterValue>
-            <Description>{_esc(param.get('description', ''))}</Description>
-            <Source>{source}</Source>
-            <ApplyType>{param.get('apply_type', 'dynamic')}</ApplyType>
-            <DataType>{param.get('data_type', 'string')}</DataType>
-            <IsModifiable>{str(param.get('modifiable', True)).lower()}</IsModifiable>
-            <ApplyMethod>{apply_method}</ApplyMethod>
-        </Parameter>"""
-    # Include custom parameters not in the defaults
-    for pname, cval in custom.items():
-        if pname in default_names:
-            continue
-        if source_filter and source_filter != "user":
-            continue
-        if isinstance(cval, dict):
-            value = cval.get("ParameterValue", "")
-            apply_method = cval.get("ApplyMethod", "immediate")
-        else:
-            value = cval if cval is not None else ""
-            apply_method = "immediate"
-        params_xml += f"""<Parameter>
-            <ParameterName>{pname}</ParameterName>
-            <ParameterValue>{value}</ParameterValue>
-            <Description></Description>
-            <Source>user</Source>
-            <ApplyType>dynamic</ApplyType>
-            <DataType>string</DataType>
-            <IsModifiable>true</IsModifiable>
-            <ApplyMethod>{apply_method}</ApplyMethod>
-        </Parameter>"""
+    params_xml = _parameter_group_parameters_xml(pg, source_filter)
 
     return _xml(200, "DescribeDBParametersResponse",
         f"<DescribeDBParametersResult><Parameters>{params_xml}</Parameters></DescribeDBParametersResult>")
@@ -2328,30 +2337,9 @@ def _describe_db_cluster_parameters(p):
     if not pg:
         return _error("DBParameterGroupNotFound",
             f"DB cluster parameter group {name} not found.", 404)
-    params = pg.get("Parameters", {})
-    # When filtering by source, treat all stored params as "user" source.
-    # If filter is "engine-default" and we have no defaults list, return empty.
-    if source_filter and source_filter != "user":
-        params = {}
-    if not params:
-        return _xml(200, "DescribeDBClusterParametersResponse",
-            "<DescribeDBClusterParametersResult><Parameters/></DescribeDBClusterParametersResult>")
-    members = []
-    for pname, pinfo in params.items():
-        pvalue = pinfo.get("ParameterValue", "")
-        apply_method = pinfo.get("ApplyMethod", "immediate")
-        members.append(
-            f"<Parameter>"
-            f"<ParameterName>{pname}</ParameterName>"
-            f"<ParameterValue>{pvalue}</ParameterValue>"
-            f"<Source>user</Source>"
-            f"<ApplyMethod>{apply_method}</ApplyMethod>"
-            f"<IsModifiable>true</IsModifiable>"
-            f"<ApplyType>dynamic</ApplyType>"
-            f"</Parameter>"
-        )
+    members = _parameter_group_parameters_xml(pg, source_filter)
     return _xml(200, "DescribeDBClusterParametersResponse",
-        f"<DescribeDBClusterParametersResult><Parameters>{''.join(members)}</Parameters></DescribeDBClusterParametersResult>")
+        f"<DescribeDBClusterParametersResult><Parameters>{members}</Parameters></DescribeDBClusterParametersResult>")
 
 
 def _modify_db_cluster_param_group(p):
@@ -3095,9 +3083,7 @@ def _describe_engine_versions(p):
             ("16.4", "aurora-postgresql16"),
             ("15.3", "aurora-postgresql15"), ("14.8", "aurora-postgresql14"),
         ],
-        "aurora-mysql": [
-            ("8.0.mysql_aurora.3.03.0", "aurora-mysql8.0"),
-        ],
+        "aurora-mysql": AURORA_MYSQL_ENGINE_VERSIONS,
     }
     versions = versions_map.get(engine, [("15.3", "15")])
     members = ""
@@ -3130,6 +3116,9 @@ def _describe_orderable_options(p):
     engine = _p(p, "Engine") or "postgres"
     engine_version = _p(p, "EngineVersion")
     db_class = _p(p, "DBInstanceClass")
+    engine_version_error = _unsupported_aurora_mysql_engine_version_error(engine, engine_version)
+    if engine_version_error:
+        return engine_version_error
 
     instance_classes = [
         "db.t3.micro", "db.t3.small", "db.t3.medium", "db.t3.large",
@@ -3567,6 +3556,74 @@ def _parameter_member_prefix(params, prefix="Parameters"):
     return f"{prefix}.Parameter"
 
 
+def _parameter_xml(
+    name,
+    value,
+    source,
+    apply_method,
+    description="",
+    apply_type="dynamic",
+    data_type="string",
+    modifiable=True,
+):
+    return f"""<Parameter>
+            <ParameterName>{name}</ParameterName>
+            <ParameterValue>{value}</ParameterValue>
+            <Description>{_esc(description)}</Description>
+            <Source>{source}</Source>
+            <ApplyType>{apply_type}</ApplyType>
+            <DataType>{data_type}</DataType>
+            <IsModifiable>{str(modifiable).lower()}</IsModifiable>
+            <ApplyMethod>{apply_method}</ApplyMethod>
+        </Parameter>"""
+
+
+def _parameter_group_parameters_xml(pg, source_filter):
+    family = pg.get("DBParameterGroupFamily", "")
+    default_params = _default_parameters_for_family(family)
+    custom = pg.get("Parameters", {})
+    default_names = {p["name"] for p in default_params}
+    params_xml = ""
+
+    for param in default_params:
+        pname = param["name"]
+        cval = custom.get(pname)
+        if isinstance(cval, dict):
+            value = cval.get("ParameterValue", param.get("default", ""))
+            apply_method = cval.get("ApplyMethod", "pending-reboot")
+        else:
+            value = cval if cval is not None else param.get("default", "")
+            apply_method = "pending-reboot"
+        source = "user" if pname in custom else "engine-default"
+        if source_filter and source != source_filter:
+            continue
+        params_xml += _parameter_xml(
+            pname,
+            value,
+            source,
+            apply_method,
+            param.get("description", ""),
+            param.get("apply_type", "dynamic"),
+            param.get("data_type", "string"),
+            param.get("modifiable", True),
+        )
+
+    for pname, cval in custom.items():
+        if pname in default_names:
+            continue
+        if source_filter and source_filter != "user":
+            continue
+        if isinstance(cval, dict):
+            value = cval.get("ParameterValue", "")
+            apply_method = cval.get("ApplyMethod", "immediate")
+        else:
+            value = cval if cval is not None else ""
+            apply_method = "immediate"
+        params_xml += _parameter_xml(pname, value, "user", apply_method)
+
+    return params_xml
+
+
 def _parse_filters(params):
     """Parse Filters.member.N.Name / Filters.member.N.Values.member.M."""
     filters = {}
@@ -3631,9 +3688,35 @@ def _format_time(ts):
 def _default_engine_version(engine):
     defaults = {
         "postgres": "15.3", "mysql": "8.0.33", "mariadb": "10.6.14",
-        "aurora-postgresql": "15.3", "aurora-mysql": "8.0.mysql_aurora.3.03.0",
+        "aurora-postgresql": "15.3", "aurora-mysql": "8.0.mysql_aurora.3.10.3",
     }
     return defaults.get(engine, "15.3")
+
+
+def _unsupported_aurora_mysql_engine_version_error(engine, engine_version):
+    if (
+        engine == "aurora-mysql"
+        and engine_version
+        and engine_version not in AURORA_MYSQL_ENGINE_VERSION_SET
+    ):
+        return _error(
+            "InvalidParameterCombination",
+            f"Cannot find version {engine_version} for aurora-mysql",
+            400,
+        )
+    return None
+
+
+def _mysql_community_major_minor(engine_version):
+    version = engine_version or ""
+    head = version.split(".mysql_aurora.")[0] if ".mysql_aurora." in version else version
+    parts = head.split(".")
+    return ".".join(parts[:2]) if len(parts) >= 2 else head
+
+
+def _mysql_image_for_version(engine_version):
+    major_minor = _mysql_community_major_minor(engine_version)
+    return AURORA_MYSQL_IMAGE_MAP.get(major_minor, DEFAULT_AURORA_MYSQL_IMAGE)
 
 
 def _default_port(engine):
@@ -3675,7 +3758,7 @@ def _docker_image_for_engine(engine, engine_version, user, password, db_name):
         )
     if "mysql" in engine or "aurora-mysql" in engine:
         return (
-            apply_image_prefix("mysql:8"),
+            apply_image_prefix(_mysql_image_for_version(engine_version)),
             {"MYSQL_ROOT_PASSWORD": password, "MYSQL_ROOT_HOST": "%",
              "MYSQL_DATABASE": db_name,
              "MYSQL_USER": user, "MYSQL_PASSWORD": password},
@@ -3725,6 +3808,12 @@ def _default_parameters_for_family(family):
             {"name": "long_query_time", "default": "10", "description": "Slow query threshold",
              "apply_type": "dynamic", "data_type": "float", "modifiable": True},
         ]
+        if not family.lower().endswith("8.4"):
+            base.append(
+                {"name": "skip-character-set-client-handshake", "default": "1",
+                 "description": "Skip character set client handshake",
+                 "apply_type": "static", "data_type": "boolean", "modifiable": True}
+            )
     return base
 
 

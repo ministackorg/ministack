@@ -4810,13 +4810,15 @@ def _generate_temp_password() -> str:
 
 def _apply_user_filter(users: list, filter_str: str) -> list:
     """
-    Supports simple Cognito filter syntax:
-      attribute_name = "value"
-      attribute_name ^= "value"   (starts with)
+    Supports Cognito filter syntax:
+      "attribute_name" = "value"   (AWS official syntax; attribute name quoted)
+      attribute_name = "value"     (unquoted, kept for backward compatibility)
+      attribute_name ^= "value"    (starts with)
       attribute_name != "value"
     """
-    m = re.match(r'(\w+)\s*(=|\^=|!=)\s*"([^"]*)"', filter_str.strip())
+    m = re.match(r'"?(\w+)"?\s*(=|\^=|!=)\s*"([^"]*)"', filter_str.strip())
     if not m:
+        logger.warning("Cognito: ListUsers Filter could not be parsed, ignoring: %r", filter_str)
         return users
     attr_name, op, value = m.group(1), m.group(2), m.group(3)
     result = []
