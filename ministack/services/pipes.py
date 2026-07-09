@@ -16,14 +16,22 @@ import time
 
 from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.persistence import load_state
-from ministack.core.responses import AccountScopedDict, get_account_id, get_region, new_uuid
+from ministack.core.responses import (
+    AccountRegionScopedDict,
+    AccountScopedDict,
+    _request_account_id,
+    _request_region,
+    get_account_id,
+    get_region,
+    new_uuid,
+)
 
 logger = logging.getLogger("pipes")
 
 REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 
-_pipes = AccountScopedDict()       # pipe_name -> pipe record
-_positions = AccountScopedDict()   # pipe_arn -> next stream record index
+_pipes = AccountRegionScopedDict()       # pipe_name -> pipe record
+_positions = AccountRegionScopedDict()   # pipe_arn -> next stream record index
 _poller_started = False
 _poller_lock = threading.Lock()
 
@@ -37,14 +45,78 @@ def get_state():
 
 def restore_state(data):
     if data:
-        _pipes.update(data.get("pipes", {}))
-        _positions.update(data.get("positions", {}))
+        _restore_pipe_store(data.get("pipes", {}))
+        _restore_position_store(data.get("positions", {}))
         # Restored RUNNING pipes need the background poller — register_pipe
         # is the only other place that starts it, and it isn't called on
         # warm-boot. Without this, persisted pipes would silently stop
         # forwarding events until a new pipe is registered.
-        if any(p.get("CurrentState") == "RUNNING" for p in _pipes.values()):
+        if any(p.get("CurrentState") == "RUNNING" for p in _pipes.all_values()):
             _ensure_poller()
+
+
+def _pipe_arn_scope(pipe_arn: str, default_account_id: str | None = None) -> tuple[str, str]:
+    try:
+        spec = parse_arn(pipe_arn)
+    except ArnParseError:
+        return default_account_id or get_account_id(), get_region()
+    if spec.service != "pipes":
+        return default_account_id or get_account_id(), get_region()
+    return spec.account_id or default_account_id or get_account_id(), spec.region or get_region()
+
+
+def _pipe_record_scope(pipe: dict, default_account_id: str | None = None) -> tuple[str, str]:
+    return _pipe_arn_scope(pipe.get("Arn", ""), default_account_id)
+
+
+def _restore_pipe_store(data) -> None:
+    if isinstance(data, AccountRegionScopedDict):
+        _pipes.update(data)
+        return
+    if isinstance(data, AccountScopedDict):
+        for (account_id, name), pipe in data._data.items():
+            restored_account_id, region = _pipe_record_scope(pipe, account_id)
+            _pipes.set_scoped(restored_account_id, region, name, copy.deepcopy(pipe))
+        return
+    if isinstance(data, dict):
+        for key, pipe in data.items():
+            if isinstance(key, tuple) and len(key) == 3:
+                account_id, region, name = key
+            elif isinstance(key, tuple) and len(key) == 2:
+                account_id, name = key
+                account_id, region = _pipe_record_scope(pipe, account_id)
+            else:
+                name = key
+                account_id, region = _pipe_record_scope(pipe)
+            _pipes.set_scoped(account_id, region, name, copy.deepcopy(pipe))
+
+
+def _restore_position_store(data) -> None:
+    if isinstance(data, AccountRegionScopedDict):
+        _positions.update(data)
+        return
+    if isinstance(data, AccountScopedDict):
+        for (account_id, pipe_arn), position in data._data.items():
+            restored_account_id, region = _pipe_arn_scope(pipe_arn, account_id)
+            _positions.set_scoped(restored_account_id, region, pipe_arn, position)
+        return
+    if isinstance(data, dict):
+        for key, position in data.items():
+            if isinstance(key, tuple) and len(key) == 3:
+                account_id, region, pipe_arn = key
+            elif isinstance(key, tuple) and len(key) == 2:
+                account_id, pipe_arn = key
+                account_id, region = _pipe_arn_scope(pipe_arn, account_id)
+            else:
+                pipe_arn = key
+                account_id, region = _pipe_arn_scope(pipe_arn)
+            _positions.set_scoped(account_id, region, pipe_arn, position)
+
+
+def _iter_all_pipes():
+    for scoped_key, pipe in list(_pipes.all_items()):
+        account_id, region, _name = scoped_key
+        yield account_id, region, pipe
 
 
 try:
@@ -115,7 +187,7 @@ def _poll_loop():
             _poll_once()
         except Exception as e:
             logger.error("Pipes poller error: %s", e)
-        time.sleep(1 if _pipes else 5)
+        time.sleep(1 if _pipes.has_any() else 5)
 
 
 def _poll_once():
@@ -125,36 +197,41 @@ def _poll_once():
     if stream_records is None:
         return
 
-    for pipe in list(_pipes.values()):
-        if pipe.get("CurrentState") != "RUNNING":
-            continue
+    for pipe_account_id, pipe_region, pipe in _iter_all_pipes():
+        account_token = _request_account_id.set(pipe_account_id)
+        region_token = _request_region.set(pipe_region)
+        try:
+            if pipe.get("CurrentState") != "RUNNING":
+                continue
 
-        source_arn = pipe.get("Source", "")
-        target_arn = pipe.get("Target", "")
-        if _arn_service(source_arn) != "dynamodb" or _arn_service(target_arn) != "sns":
-            continue
+            source_arn = pipe.get("Source", "")
+            target_arn = pipe.get("Target", "")
+            if _arn_service(source_arn) != "dynamodb" or _arn_service(target_arn) != "sns":
+                continue
 
-        source = _dynamodb_stream_source(source_arn)
-        if source is None:
-            continue
-        source_spec, table_name = source
-        pipe_account_id = _pipe_account_id(pipe)
-        if source_spec.account_id != pipe_account_id:
-            continue
+            source = _dynamodb_stream_source(source_arn)
+            if source is None:
+                continue
+            source_spec, table_name = source
+            if source_spec.account_id != pipe_account_id:
+                continue
 
-        records = stream_records.get_scoped(
-            pipe_account_id, source_spec.region, table_name, []
-        )
-        pos = int(_positions.get(pipe["Arn"], 0))
-        if pos < 0:
-            pos = 0
-        if pos >= len(records):
-            continue
+            records = stream_records.get_scoped(
+                pipe_account_id, source_spec.region, table_name, []
+            )
+            pos = int(_positions.get(pipe["Arn"], 0))
+            if pos < 0:
+                pos = 0
+            if pos >= len(records):
+                continue
 
-        batch = records[pos:]
-        for rec in batch:
-            _publish_record_to_sns(target_arn, pipe, rec)
-        _positions[pipe["Arn"]] = pos + len(batch)
+            batch = records[pos:]
+            for rec in batch:
+                _publish_record_to_sns(target_arn, pipe, rec)
+            _positions[pipe["Arn"]] = pos + len(batch)
+        finally:
+            _request_region.reset(region_token)
+            _request_account_id.reset(account_token)
 
 
 def _publish_record_to_sns(topic_arn: str, pipe: dict, record: dict):
