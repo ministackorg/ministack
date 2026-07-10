@@ -6,7 +6,9 @@ import uuid as _uuid_mod
 import zipfile
 from urllib.parse import urlparse
 
+import boto3
 import pytest
+from botocore.config import Config
 from botocore.exceptions import ClientError
 
 ENDPOINT = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
@@ -19,6 +21,17 @@ requires_docker = pytest.mark.skipif(
     not os.environ.get("DOCKER_NETWORK"),
     reason="DOCKER_NETWORK not set - skipping network connectivity test",
 )
+
+
+def _ec_client(region):
+    return boto3.client(
+        "elasticache",
+        endpoint_url=ENDPOINT,
+        aws_access_key_id="test",
+        aws_secret_access_key="test",
+        region_name=region,
+        config=Config(region_name=region, retries={"mode": "standard"}),
+    )
 
 @requires_docker
 def test_elasticache_create(ec):
@@ -418,6 +431,372 @@ def test_elasticache_default_parameter_group_family_mapping(ec):
 
 def _uid():
     return _uuid_mod.uuid4().hex[:8]
+
+
+def test_elasticache_clusters_are_region_scoped_by_name():
+    east = _ec_client("us-east-1")
+    west = _ec_client("us-west-2")
+    cid = f"scope-cluster-{_uid()}"
+
+    east.create_cache_cluster(
+        CacheClusterId=cid,
+        Engine="redis",
+        CacheNodeType="cache.t3.micro",
+        NumCacheNodes=1,
+    )
+    west.create_cache_cluster(
+        CacheClusterId=cid,
+        Engine="redis",
+        CacheNodeType="cache.t3.micro",
+        NumCacheNodes=1,
+    )
+
+    try:
+        east_cluster = east.describe_cache_clusters(CacheClusterId=cid)["CacheClusters"][0]
+        west_cluster = west.describe_cache_clusters(CacheClusterId=cid)["CacheClusters"][0]
+
+        assert east_cluster["ARN"] == f"arn:aws:elasticache:us-east-1:000000000000:cluster:{cid}"
+        assert west_cluster["ARN"] == f"arn:aws:elasticache:us-west-2:000000000000:cluster:{cid}"
+        assert east_cluster["PreferredAvailabilityZone"].startswith("us-east-1")
+        assert west_cluster["PreferredAvailabilityZone"].startswith("us-west-2")
+
+        west.delete_cache_cluster(CacheClusterId=cid)
+        with pytest.raises(ClientError) as exc:
+            west.describe_cache_clusters(CacheClusterId=cid)
+        assert exc.value.response["Error"]["Code"] == "CacheClusterNotFound"
+        assert east.describe_cache_clusters(CacheClusterId=cid)["CacheClusters"][0]["ARN"] == east_cluster["ARN"]
+    finally:
+        for client in (east, west):
+            try:
+                client.delete_cache_cluster(CacheClusterId=cid)
+            except ClientError:
+                pass
+
+
+def test_elasticache_replication_groups_are_region_scoped():
+    east = _ec_client("us-east-1")
+    west = _ec_client("us-west-2")
+    rg_id = f"scope-rg-{_uid()}"
+
+    east.create_replication_group(
+        ReplicationGroupId=rg_id,
+        ReplicationGroupDescription="east rg",
+        Engine="redis",
+        CacheNodeType="cache.t3.micro",
+    )
+    west.create_replication_group(
+        ReplicationGroupId=rg_id,
+        ReplicationGroupDescription="west rg",
+        Engine="redis",
+        CacheNodeType="cache.t3.micro",
+    )
+
+    try:
+        east_rg = east.describe_replication_groups(ReplicationGroupId=rg_id)["ReplicationGroups"][0]
+        west_rg = west.describe_replication_groups(ReplicationGroupId=rg_id)["ReplicationGroups"][0]
+
+        assert east_rg["ARN"] == f"arn:aws:elasticache:us-east-1:000000000000:replicationgroup:{rg_id}"
+        assert west_rg["ARN"] == f"arn:aws:elasticache:us-west-2:000000000000:replicationgroup:{rg_id}"
+        assert east_rg["Description"] == "east rg"
+        assert west_rg["Description"] == "west rg"
+
+        east.delete_replication_group(ReplicationGroupId=rg_id)
+        with pytest.raises(ClientError) as exc:
+            east.describe_replication_groups(ReplicationGroupId=rg_id)
+        assert exc.value.response["Error"]["Code"] == "ReplicationGroupNotFoundFault"
+        assert west.describe_replication_groups(ReplicationGroupId=rg_id)["ReplicationGroups"][0]["ARN"] == west_rg["ARN"]
+    finally:
+        for client in (east, west):
+            try:
+                client.delete_replication_group(ReplicationGroupId=rg_id)
+            except ClientError:
+                pass
+
+
+def test_elasticache_users_and_user_groups_are_region_scoped():
+    east = _ec_client("us-east-1")
+    west = _ec_client("us-west-2")
+    user_id = f"scope-user-{_uid()}"
+    group_id = f"scope-group-{_uid()}"
+
+    for client in (east, west):
+        client.create_user(
+            UserId=user_id,
+            UserName=user_id,
+            Engine="redis",
+            AccessString="on ~* +@all",
+            NoPasswordRequired=True,
+        )
+        client.create_user_group(UserGroupId=group_id, Engine="redis", UserIds=[user_id])
+
+    try:
+        east_user = east.describe_users(UserId=user_id)["Users"][0]
+        west_user = west.describe_users(UserId=user_id)["Users"][0]
+        east_group = east.describe_user_groups(UserGroupId=group_id)["UserGroups"][0]
+        west_group = west.describe_user_groups(UserGroupId=group_id)["UserGroups"][0]
+
+        assert east_user["ARN"] == f"arn:aws:elasticache:us-east-1:000000000000:user:{user_id}"
+        assert west_user["ARN"] == f"arn:aws:elasticache:us-west-2:000000000000:user:{user_id}"
+        assert east_group["ARN"] == f"arn:aws:elasticache:us-east-1:000000000000:usergroup:{group_id}"
+        assert west_group["ARN"] == f"arn:aws:elasticache:us-west-2:000000000000:usergroup:{group_id}"
+
+        east.delete_user_group(UserGroupId=group_id)
+        east.delete_user(UserId=user_id)
+        with pytest.raises(ClientError) as exc:
+            east.describe_users(UserId=user_id)
+        assert exc.value.response["Error"]["Code"] == "UserNotFound"
+        assert west.describe_users(UserId=user_id)["Users"][0]["ARN"] == west_user["ARN"]
+    finally:
+        for client in (east, west):
+            try:
+                client.delete_user_group(UserGroupId=group_id)
+            except ClientError:
+                pass
+            try:
+                client.delete_user(UserId=user_id)
+            except ClientError:
+                pass
+
+
+def test_elasticache_subnet_and_param_groups_are_region_scoped():
+    east = _ec_client("us-east-1")
+    west = _ec_client("us-west-2")
+    subnet_name = f"scope-subnet-{_uid()}"
+    param_name = f"scope-param-{_uid()}"
+
+    east.create_cache_subnet_group(
+        CacheSubnetGroupName=subnet_name,
+        CacheSubnetGroupDescription="east subnet",
+        SubnetIds=["subnet-east"],
+    )
+    west.create_cache_subnet_group(
+        CacheSubnetGroupName=subnet_name,
+        CacheSubnetGroupDescription="west subnet",
+        SubnetIds=["subnet-west"],
+    )
+    east.create_cache_parameter_group(
+        CacheParameterGroupName=param_name,
+        CacheParameterGroupFamily="redis7",
+        Description="east param",
+    )
+    west.create_cache_parameter_group(
+        CacheParameterGroupName=param_name,
+        CacheParameterGroupFamily="redis7",
+        Description="west param",
+    )
+
+    try:
+        east_subnet = east.describe_cache_subnet_groups(CacheSubnetGroupName=subnet_name)["CacheSubnetGroups"][0]
+        west_subnet = west.describe_cache_subnet_groups(CacheSubnetGroupName=subnet_name)["CacheSubnetGroups"][0]
+        east_param = east.describe_cache_parameter_groups(CacheParameterGroupName=param_name)["CacheParameterGroups"][0]
+        west_param = west.describe_cache_parameter_groups(CacheParameterGroupName=param_name)["CacheParameterGroups"][0]
+
+        assert east_subnet["ARN"] == f"arn:aws:elasticache:us-east-1:000000000000:subnetgroup:{subnet_name}"
+        assert west_subnet["ARN"] == f"arn:aws:elasticache:us-west-2:000000000000:subnetgroup:{subnet_name}"
+        assert east_param["ARN"] == f"arn:aws:elasticache:us-east-1:000000000000:parametergroup:{param_name}"
+        assert west_param["ARN"] == f"arn:aws:elasticache:us-west-2:000000000000:parametergroup:{param_name}"
+
+        west.delete_cache_subnet_group(CacheSubnetGroupName=subnet_name)
+        west.delete_cache_parameter_group(CacheParameterGroupName=param_name)
+        with pytest.raises(ClientError) as exc:
+            west.describe_cache_subnet_groups(CacheSubnetGroupName=subnet_name)
+        assert exc.value.response["Error"]["Code"] == "CacheSubnetGroupNotFoundFault"
+        with pytest.raises(ClientError) as exc:
+            west.describe_cache_parameter_groups(CacheParameterGroupName=param_name)
+        assert exc.value.response["Error"]["Code"] == "CacheParameterGroupNotFound"
+        assert east.describe_cache_subnet_groups(CacheSubnetGroupName=subnet_name)["CacheSubnetGroups"][0]["ARN"] == east_subnet["ARN"]
+        assert east.describe_cache_parameter_groups(CacheParameterGroupName=param_name)["CacheParameterGroups"][0]["ARN"] == east_param["ARN"]
+    finally:
+        for client in (east, west):
+            try:
+                client.delete_cache_subnet_group(CacheSubnetGroupName=subnet_name)
+            except ClientError:
+                pass
+            try:
+                client.delete_cache_parameter_group(CacheParameterGroupName=param_name)
+            except ClientError:
+                pass
+
+
+def test_elasticache_default_param_groups_seed_per_region():
+    east = _ec_client("us-east-1")
+    west = _ec_client("us-west-2")
+
+    east_group = east.describe_cache_parameter_groups(
+        CacheParameterGroupName="default.redis7",
+    )["CacheParameterGroups"][0]
+    west_group = west.describe_cache_parameter_groups(
+        CacheParameterGroupName="default.redis7",
+    )["CacheParameterGroups"][0]
+
+    assert east_group["ARN"] == "arn:aws:elasticache:us-east-1:000000000000:parametergroup:default.redis7"
+    assert west_group["ARN"] == "arn:aws:elasticache:us-west-2:000000000000:parametergroup:default.redis7"
+
+
+def test_elasticache_tags_stay_arn_keyed_and_request_region_validated():
+    east = _ec_client("us-east-1")
+    west = _ec_client("us-west-2")
+    name = f"tag-scope-{_uid()}"
+
+    east.create_cache_parameter_group(
+        CacheParameterGroupName=name,
+        CacheParameterGroupFamily="redis7",
+        Description="tag scope",
+    )
+    arn = f"arn:aws:elasticache:us-east-1:000000000000:parametergroup:{name}"
+    try:
+        east.add_tags_to_resource(ResourceName=arn, Tags=[{"Key": "env", "Value": "east"}])
+        assert east.list_tags_for_resource(ResourceName=arn)["TagList"] == [
+            {"Key": "env", "Value": "east"},
+        ]
+
+        with pytest.raises(ClientError) as exc:
+            west.list_tags_for_resource(ResourceName=arn)
+        assert exc.value.response["Error"]["Code"] == "InvalidParameterValue"
+    finally:
+        try:
+            east.delete_cache_parameter_group(CacheParameterGroupName=name)
+        except ClientError:
+            pass
+
+
+def test_elasticache_events_are_region_scoped():
+    east = _ec_client("us-east-1")
+    west = _ec_client("us-west-2")
+    cid = f"event-scope-{_uid()}"
+
+    east.create_cache_cluster(
+        CacheClusterId=cid,
+        Engine="redis",
+        CacheNodeType="cache.t3.micro",
+        NumCacheNodes=1,
+    )
+    west.create_cache_cluster(
+        CacheClusterId=cid,
+        Engine="redis",
+        CacheNodeType="cache.t3.micro",
+        NumCacheNodes=1,
+    )
+
+    try:
+        east_events = east.describe_events(SourceIdentifier=cid)["Events"]
+        west_events = west.describe_events(SourceIdentifier=cid)["Events"]
+
+        assert len(east_events) == 1
+        assert len(west_events) == 1
+        assert east_events[0]["Message"] == "Cache cluster created"
+        assert west_events[0]["Message"] == "Cache cluster created"
+
+        east.delete_cache_cluster(CacheClusterId=cid)
+        east_events = east.describe_events(SourceIdentifier=cid)["Events"]
+        west_events = west.describe_events(SourceIdentifier=cid)["Events"]
+        assert [e["Message"] for e in east_events] == [
+            "Cache cluster created",
+            "Cache cluster deleted",
+        ]
+        assert [e["Message"] for e in west_events] == ["Cache cluster created"]
+    finally:
+        for client in (east, west):
+            try:
+                client.delete_cache_cluster(CacheClusterId=cid)
+            except ClientError:
+                pass
+
+
+def test_elasticache_restore_legacy_account_scoped_state_adopts_record_arn_region():
+    from ministack.core.responses import (
+        AccountScopedDict,
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+    from ministack.services import elasticache as _ec
+
+    original_account = get_account_id()
+    original_region = get_region()
+    account_id = "000000000000"
+    region = "us-west-2"
+    name = f"legacy-{_uid()}"
+
+    legacy_clusters = AccountScopedDict()
+    legacy_clusters._data[(account_id, name)] = {
+        "CacheClusterId": name,
+        "CacheClusterArn": f"arn:aws:elasticache:{region}:{account_id}:cluster:{name}",
+        "CacheClusterStatus": "available",
+        "Engine": "redis",
+        "EngineVersion": "7.1",
+        "CacheNodes": [],
+    }
+    legacy_rgs = AccountScopedDict()
+    legacy_rgs._data[(account_id, name)] = {
+        "ReplicationGroupId": name,
+        "ARN": f"arn:aws:elasticache:{region}:{account_id}:replicationgroup:{name}",
+        "Status": "available",
+        "Engine": "redis",
+        "NodeGroups": [],
+    }
+    legacy_subnets = AccountScopedDict()
+    legacy_subnets._data[(account_id, name)] = {
+        "CacheSubnetGroupName": name,
+        "ARN": f"arn:aws:elasticache:{region}:{account_id}:subnetgroup:{name}",
+    }
+    legacy_params = AccountScopedDict()
+    legacy_params._data[(account_id, name)] = {
+        "CacheParameterGroupName": name,
+        "CacheParameterGroupFamily": "redis7",
+        "ARN": f"arn:aws:elasticache:{region}:{account_id}:parametergroup:{name}",
+    }
+    legacy_param_values = AccountScopedDict()
+    legacy_param_values._data[(account_id, name)] = {
+        "maxmemory-policy": {"Value": "allkeys-lru"},
+    }
+    legacy_snapshots = AccountScopedDict()
+    legacy_snapshots._data[(account_id, name)] = {
+        "SnapshotName": name,
+        "SnapshotStatus": "available",
+        "ARN": f"arn:aws:elasticache:{region}:{account_id}:snapshot:{name}",
+    }
+    legacy_users = AccountScopedDict()
+    legacy_users._data[(account_id, name)] = {
+        "UserId": name,
+        "ARN": f"arn:aws:elasticache:{region}:{account_id}:user:{name}",
+    }
+    legacy_groups = AccountScopedDict()
+    legacy_groups._data[(account_id, name)] = {
+        "UserGroupId": name,
+        "ARN": f"arn:aws:elasticache:{region}:{account_id}:usergroup:{name}",
+    }
+
+    _ec.reset()
+    try:
+        set_request_account_id(account_id)
+        set_request_region("us-east-1")
+        _ec.restore_state({
+            "clusters": legacy_clusters,
+            "replication_groups": legacy_rgs,
+            "subnet_groups": legacy_subnets,
+            "param_groups": legacy_params,
+            "param_group_params": legacy_param_values,
+            "snapshots": legacy_snapshots,
+            "users": legacy_users,
+            "user_groups": legacy_groups,
+        })
+
+        assert _ec._clusters.get_scoped(account_id, region, name)["CacheClusterArn"].endswith(f":cluster:{name}")
+        assert _ec._clusters.get_scoped(account_id, "us-east-1", name) is None
+        assert _ec._replication_groups.get_scoped(account_id, region, name)["ARN"].endswith(f":replicationgroup:{name}")
+        assert _ec._subnet_groups.get_scoped(account_id, region, name)["ARN"].endswith(f":subnetgroup:{name}")
+        assert _ec._param_groups.get_scoped(account_id, region, name)["ARN"].endswith(f":parametergroup:{name}")
+        assert _ec._param_group_params.get_scoped(account_id, region, name)["maxmemory-policy"]["Value"] == "allkeys-lru"
+        assert _ec._param_group_params.get_scoped(account_id, "us-east-1", name) is None
+        assert _ec._snapshots.get_scoped(account_id, region, name)["ARN"].endswith(f":snapshot:{name}")
+        assert _ec._users.get_scoped(account_id, region, name)["ARN"].endswith(f":user:{name}")
+        assert _ec._user_groups.get_scoped(account_id, region, name)["ARN"].endswith(f":usergroup:{name}")
+    finally:
+        _ec.reset()
+        set_request_account_id(original_account)
+        set_request_region(original_region)
 
 
 # ---------------------------------------------------------------------------
@@ -966,14 +1345,6 @@ def test_serverless_cache_not_implemented(ec):
 
 # ========== from test_elasticache_lambda_network.py ==========
 # ElastiCache+Lambda network reachability via DOCKER_NETWORK auto-detect.
-import io
-import json
-import os
-import time
-import zipfile
-
-import pytest
-
 
 _LAMBDA_ROLE = "arn:aws:iam::000000000000:role/lambda-role"
 
@@ -1138,16 +1509,16 @@ def test_elasticache_restore_state_marks_clusters_for_respawn(monkeypatch):
     })
 
     assert spawned == []  # respawn deferred — _spawn_redis_container not yet bound at import time
-    assert "clustertest" in _ec._pending_cluster_respawn
+    assert ("000000000000", "us-east-1", "clustertest") in _ec._pending_cluster_respawn
 
     _ec._ensure_live_containers()
 
-    assert any(s["name"] == "ministack-elasticache-clustertest" for s in spawned)
+    assert any(s["name"] == "ministack-elasticache-000000000000-us-east-1-clustertest" for s in spawned)
     cl = _ec._clusters["clustertest"]
-    assert cl["_docker_container_id"] == "cid-ministack-elasticache-clustertest"
+    assert cl["_docker_container_id"] == "cid-ministack-elasticache-000000000000-us-east-1-clustertest"
     assert cl["CacheNodes"][0]["Endpoint"]["Address"] == "ministack-elasticache"
     assert cl["CacheNodes"][0]["Endpoint"]["Port"] == 6379
-    assert "clustertest" not in _ec._pending_cluster_respawn
+    assert ("000000000000", "us-east-1", "clustertest") not in _ec._pending_cluster_respawn
 
     spawned.clear()
     _ec._ensure_live_containers()
@@ -1173,17 +1544,92 @@ def test_elasticache_restore_state_wipes_stale_replication_group_container_ids(m
         },
     })
     assert _ec._replication_groups["rg-1"]["_docker_container_ids"] == []
-    assert "rg-1" in _ec._pending_rg_respawn
+    assert ("000000000000", "us-east-1", "rg-1") in _ec._pending_rg_respawn
 
     _ec._ensure_live_containers()
     cids = _ec._replication_groups["rg-1"]["_docker_container_ids"]
-    assert cids == ["cid-ministack-elasticache-rg-000000000000-rg-1-0001"]
-    assert "rg-1" not in _ec._pending_rg_respawn
+    assert cids == ["cid-ministack-elasticache-rg-000000000000-us-east-1-rg-1-0001"]
+    assert ("000000000000", "us-east-1", "rg-1") not in _ec._pending_rg_respawn
+
+
+def test_elasticache_restore_state_respawns_same_names_per_region(monkeypatch):
+    from ministack.core.responses import AccountRegionScopedDict
+    from ministack.services import elasticache as _ec
+
+    _ec.reset()
+    spawned = []
+
+    def fake_spawn(name, engine, engine_version, labels):
+        spawned.append({"name": name, "labels": labels})
+        return (f"{labels['region']}-host", 6379, f"cid-{name}")
+
+    monkeypatch.setattr(_ec, "_spawn_redis_container", fake_spawn)
+
+    clusters = AccountRegionScopedDict()
+    replication_groups = AccountRegionScopedDict()
+    account_id = "000000000000"
+    for region in ("us-east-1", "us-west-2"):
+        clusters.set_scoped(account_id, region, "same-cache", {
+            "CacheClusterId": "same-cache",
+            "CacheClusterStatus": "available",
+            "Engine": "redis",
+            "EngineVersion": "7.1",
+            "CacheNodes": [{"CacheNodeId": "0001", "Endpoint": {"Address": "stale", "Port": 1}}],
+            "_docker_container_id": f"dead-{region}",
+        })
+        replication_groups.set_scoped(account_id, region, "same-rg", {
+            "ReplicationGroupId": "same-rg",
+            "Engine": "redis",
+            "EngineVersion": "7.1",
+            "NodeGroups": [{"NodeGroupId": "0001"}],
+            "_docker_container_ids": [f"dead-rg-{region}"],
+        })
+
+    _ec.restore_state({
+        "clusters": clusters,
+        "replication_groups": replication_groups,
+    })
+
+    assert _ec._pending_cluster_respawn == {
+        (account_id, "us-east-1", "same-cache"),
+        (account_id, "us-west-2", "same-cache"),
+    }
+    assert _ec._pending_rg_respawn == {
+        (account_id, "us-east-1", "same-rg"),
+        (account_id, "us-west-2", "same-rg"),
+    }
+
+    _ec._ensure_live_containers()
+
+    names = {entry["name"] for entry in spawned}
+    assert names == {
+        "ministack-elasticache-000000000000-us-east-1-same-cache",
+        "ministack-elasticache-000000000000-us-west-2-same-cache",
+        "ministack-elasticache-rg-000000000000-us-east-1-same-rg-0001",
+        "ministack-elasticache-rg-000000000000-us-west-2-same-rg-0001",
+    }
+    assert {entry["labels"]["region"] for entry in spawned} == {"us-east-1", "us-west-2"}
+    assert _ec._clusters.get_scoped(account_id, "us-east-1", "same-cache")["_docker_container_id"] == (
+        "cid-ministack-elasticache-000000000000-us-east-1-same-cache"
+    )
+    assert _ec._clusters.get_scoped(account_id, "us-west-2", "same-cache")["_docker_container_id"] == (
+        "cid-ministack-elasticache-000000000000-us-west-2-same-cache"
+    )
+    assert _ec._replication_groups.get_scoped(account_id, "us-east-1", "same-rg")["_docker_container_ids"] == [
+        "cid-ministack-elasticache-rg-000000000000-us-east-1-same-rg-0001",
+    ]
+    assert _ec._replication_groups.get_scoped(account_id, "us-west-2", "same-rg")["_docker_container_ids"] == [
+        "cid-ministack-elasticache-rg-000000000000-us-west-2-same-rg-0001",
+    ]
+    assert _ec._pending_cluster_respawn == set()
+    assert _ec._pending_rg_respawn == set()
 
 
 def test_elasticache_respawn_failure_is_logged_and_does_not_block_requests(monkeypatch, caplog):
     import logging
+
     from ministack.services import elasticache as _ec
+
     _ec.reset()
 
     def boom(*a, **kw):
@@ -1202,5 +1648,5 @@ def test_elasticache_respawn_failure_is_logged_and_does_not_block_requests(monke
     })
     with caplog.at_level(logging.WARNING):
         _ec._ensure_live_containers()
-    assert "c1" not in _ec._pending_cluster_respawn  # cleared even on failure (no retry storm)
+    assert ("000000000000", "us-east-1", "c1") not in _ec._pending_cluster_respawn  # cleared even on failure (no retry storm)
     assert any("failed to respawn" in r.message for r in caplog.records)
