@@ -728,6 +728,91 @@ def test_kinesis_consumers_survive_warm_boot():
     mod.reset()
 
 
+def test_kinesis_shard_iterators_survive_warm_boot_in_original_scope():
+    """Live shard iterators must round-trip through JSON persistence without
+    becoming visible to other accounts or regions."""
+    import json
+    import time
+
+    from ministack.core.responses import (
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+
+    mod = _get_module("kinesis")
+    original_account = get_account_id()
+    original_region = get_region()
+    account_id = "111111111111"
+    region = "us-west-2"
+    stream_name = "warm-boot-stream"
+    stream_arn = f"arn:aws:kinesis:{region}:{account_id}:stream/{stream_name}"
+    shard_id = "shardId-000000000000"
+    token = "live-iterator-token"
+    now = time.time()
+
+    mod.reset()
+    try:
+        set_request_account_id(account_id)
+        set_request_region(region)
+        mod._streams[stream_name] = {
+            "StreamName": stream_name,
+            "StreamARN": stream_arn,
+            "StreamStatus": "ACTIVE",
+            "StreamModeDetails": {"StreamMode": "PROVISIONED"},
+            "RetentionPeriodHours": 24,
+            "shards": {
+                shard_id: {
+                    "records": [{
+                        "SequenceNumber": "1",
+                        "ApproximateArrivalTimestamp": now,
+                        "Data": b"warm-boot-record",
+                        "PartitionKey": "pk1",
+                    }],
+                    "starting_hash_key": "0",
+                    "ending_hash_key": str(2**128 - 1),
+                    "starting_sequence_number": "1",
+                    "parent_shard_id": None,
+                    "adjacent_parent_shard_id": None,
+                },
+            },
+            "tags": {},
+            "CreationTimestamp": now,
+            "EncryptionType": "NONE",
+        }
+        mod._shard_iterators[token] = {
+            "stream": stream_name,
+            "stream_arn": stream_arn,
+            "shard_id": shard_id,
+            "position": 0,
+            "created_at": now,
+        }
+
+        _round_trip_dict(mod, "kinesis")
+
+        assert token in mod._shard_iterators
+        status, _, body = mod._get_records({"ShardIterator": token, "Limit": 1})
+        assert status == 200
+        payload = json.loads(body)
+        assert payload["Records"][0]["PartitionKey"] == "pk1"
+        assert payload["NextShardIterator"] in mod._shard_iterators
+
+        set_request_region("us-east-1")
+        assert token not in mod._shard_iterators
+        status, _, body = mod._get_records({"ShardIterator": token})
+        assert status == 400
+        assert json.loads(body)["__type"] == "ExpiredIteratorException"
+
+        set_request_account_id("222222222222")
+        set_request_region(region)
+        assert token not in mod._shard_iterators
+    finally:
+        mod.reset()
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
 # ── ecs._attributes ────────────────────────────────────────────────────
 
 def test_ecs_attributes_survive_warm_boot():
