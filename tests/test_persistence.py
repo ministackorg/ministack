@@ -793,6 +793,83 @@ def test_sns_platform_endpoints_survive_warm_boot():
     mod.reset()
 
 
+def test_sns_region_scoped_stores_survive_warm_boot_in_original_scope():
+    """SNS topic, subscription, application, and endpoint stores stay scoped
+    after the real JSON persistence path."""
+    from ministack.core.responses import (
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+
+    mod = _get_module("sns")
+    mod.reset()
+    original_account = get_account_id()
+    original_region = get_region()
+    try:
+        set_request_account_id("111111111111")
+        set_request_region("us-west-2")
+
+        topic_arn = "arn:aws:sns:us-west-2:111111111111:persisted-topic"
+        sub_arn = f"{topic_arn}:sub-1"
+        app_arn = "arn:aws:sns:us-west-2:111111111111:app/GCM/PersistedApp"
+        endpoint_arn = f"{app_arn}/endpoint-1"
+        subscription = {
+            "arn": sub_arn,
+            "protocol": "email",
+            "endpoint": "persisted@example.com",
+            "confirmed": True,
+            "topic_arn": topic_arn,
+            "owner": "111111111111",
+            "attributes": {"SubscriptionArn": sub_arn, "TopicArn": topic_arn},
+        }
+        mod._topics[topic_arn] = {
+            "name": "persisted-topic",
+            "arn": topic_arn,
+            "attributes": {"TopicArn": topic_arn, "Owner": "111111111111"},
+            "subscriptions": [subscription],
+            "messages": [],
+            "tags": {},
+        }
+        mod._sub_arn_to_topic[sub_arn] = topic_arn
+        mod._platform_applications[app_arn] = {
+            "arn": app_arn,
+            "name": "PersistedApp",
+            "platform": "GCM",
+            "attributes": {},
+        }
+        mod._platform_endpoints[endpoint_arn] = {
+            "arn": endpoint_arn,
+            "application_arn": app_arn,
+            "attributes": {"Token": "persisted-token", "Enabled": "true"},
+        }
+
+        _round_trip_dict(mod, "sns")
+
+        assert mod._topics[topic_arn]["subscriptions"][0]["arn"] == sub_arn
+        assert mod._sub_arn_to_topic[sub_arn] == topic_arn
+        assert mod._platform_applications[app_arn]["arn"] == app_arn
+        assert mod._platform_endpoints[endpoint_arn]["attributes"]["Token"] == "persisted-token"
+
+        set_request_region("us-east-1")
+        assert mod._topics.get(topic_arn) is None
+        assert mod._sub_arn_to_topic.get(sub_arn) is None
+        assert mod._platform_applications.get(app_arn) is None
+        assert mod._platform_endpoints.get(endpoint_arn) is None
+
+        set_request_account_id("222222222222")
+        set_request_region("us-west-2")
+        assert mod._topics.get(topic_arn) is None
+        assert mod._sub_arn_to_topic.get(sub_arn) is None
+        assert mod._platform_applications.get(app_arn) is None
+        assert mod._platform_endpoints.get(endpoint_arn) is None
+    finally:
+        mod.reset()
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
 # ── Import-order regression for the ECS NameError trap ───────────────
 
 def test_ecs_module_reload_with_persisted_attributes_does_not_namerror():

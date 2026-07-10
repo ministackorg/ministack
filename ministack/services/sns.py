@@ -30,7 +30,7 @@ _PORT = os.environ.get("GATEWAY_PORT", "4566")
 
 import ministack.services.lambda_svc as _lambda_svc
 from ministack.core.arn import ArnParseError, parse_arn
-from ministack.core.responses import AccountScopedDict, get_account_id, get_region, new_uuid
+from ministack.core.responses import AccountRegionScopedDict, get_account_id, get_region, new_uuid
 from ministack.services import sqs as _sqs
 
 logger = logging.getLogger("sns")
@@ -119,10 +119,10 @@ def _resolve_topic_tag_arn(arn: str):
 
 from ministack.core.persistence import PERSIST_STATE, load_state
 
-_topics = AccountScopedDict()
-_sub_arn_to_topic = AccountScopedDict()
-_platform_applications = AccountScopedDict()
-_platform_endpoints = AccountScopedDict()
+_topics = AccountRegionScopedDict()
+_sub_arn_to_topic = AccountRegionScopedDict()
+_platform_applications = AccountRegionScopedDict()
+_platform_endpoints = AccountRegionScopedDict()
 
 
 # ── Persistence ────────────────────────────────────────────
