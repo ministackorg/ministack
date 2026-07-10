@@ -5,6 +5,11 @@ All notable changes to MiniStack will be documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+- **DynamoDB — validation parity with real AWS on reads, deletes, batches, and transactions** — five validation gaps that let malformed requests succeed silently (all verified against DynamoDB Local): (1) `GetItem`, `DeleteItem`, and `BatchGetItem` now reject key attributes carrying an empty string/binary value, as `PutItem` already did; (2) `BatchWriteItem` validates every member *before* applying any — previously a bad member returned the correct `ValidationException` but earlier members were already written; (3) `TransactWriteItems` validates member items and keys up front (empty key parts, malformed items, update-expression type errors) and applies nothing on failure — previously an invalid member was silently committed with no error at all; (4) `Query` rejects a `KeyConditionExpression` `BETWEEN` with inverted bounds at parse time with the AWS error message, instead of returning an empty result; (5) `UpdateItem` `ADD`/`DELETE` reject non-Number/Set operands (`Incorrect operand type for operator or function`) and operands whose type doesn't match the existing attribute (`An operand in the update expression has an incorrect data type`) — previously `ADD` could silently *replace* a set attribute with a number, and `DELETE` silently no-opped. Contributed by @ifutivic.
+
 ## [1.4.1] — 2026-07-09
 
 ### Added

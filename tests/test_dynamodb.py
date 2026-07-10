@@ -6139,3 +6139,289 @@ def test_dynamodb_update_item_valid_update_still_succeeds(ddb):
     finally:
         ddb.delete_table(TableName=name)
 
+
+
+# ---------------------------------------------------------------------------
+# Validation parity: empty key parts on reads/deletes, batch/transact
+# atomicity, BETWEEN bounds, ADD/DELETE operand types.
+# ---------------------------------------------------------------------------
+
+def _create_composite_table(ddb, name):
+    try:
+        ddb.delete_table(TableName=name)
+    except Exception:
+        pass
+    ddb.create_table(
+        TableName=name,
+        KeySchema=[
+            {"AttributeName": "pk", "KeyType": "HASH"},
+            {"AttributeName": "sk", "KeyType": "RANGE"},
+        ],
+        AttributeDefinitions=[
+            {"AttributeName": "pk", "AttributeType": "S"},
+            {"AttributeName": "sk", "AttributeType": "S"},
+        ],
+        BillingMode="PAY_PER_REQUEST",
+    )
+
+
+def _assert_empty_key_rejected(exc, key_name):
+    err = exc.value.response["Error"]
+    assert err["Code"] == "ValidationException"
+    assert "cannot contain an empty string value" in err["Message"]
+    assert f"Key: {key_name}" in err["Message"]
+
+
+def test_dynamodb_get_item_rejects_empty_key_part(ddb):
+    name = "val-get-empty-key"
+    _create_composite_table(ddb, name)
+    try:
+        with pytest.raises(ClientError) as exc:
+            ddb.get_item(TableName=name, Key={"pk": {"S": "a"}, "sk": {"S": ""}})
+        _assert_empty_key_rejected(exc, "sk")
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_delete_item_rejects_empty_key_part(ddb):
+    name = "val-del-empty-key"
+    _create_composite_table(ddb, name)
+    try:
+        with pytest.raises(ClientError) as exc:
+            ddb.delete_item(TableName=name, Key={"pk": {"S": ""}, "sk": {"S": "1"}})
+        _assert_empty_key_rejected(exc, "pk")
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_batch_get_item_rejects_empty_key_part(ddb):
+    name = "val-bget-empty-key"
+    _create_composite_table(ddb, name)
+    try:
+        with pytest.raises(ClientError) as exc:
+            ddb.batch_get_item(RequestItems={name: {"Keys": [
+                {"pk": {"S": "a"}, "sk": {"S": "1"}},
+                {"pk": {"S": "a"}, "sk": {"S": ""}},
+            ]}})
+        _assert_empty_key_rejected(exc, "sk")
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_batch_write_item_invalid_member_writes_nothing(ddb):
+    """AWS validates the whole BatchWriteItem request before applying anything:
+    a bad member must not leave earlier members written."""
+    name = "val-bwrite-atomic"
+    _create_composite_table(ddb, name)
+    try:
+        with pytest.raises(ClientError) as exc:
+            ddb.batch_write_item(RequestItems={name: [
+                {"PutRequest": {"Item": {"pk": {"S": "b"}, "sk": {"S": "1"}}}},
+                {"PutRequest": {"Item": {"pk": {"S": "b"}, "sk": {"S": ""}}}},
+            ]})
+        _assert_empty_key_rejected(exc, "sk")
+        resp = ddb.get_item(TableName=name, Key={"pk": {"S": "b"}, "sk": {"S": "1"}})
+        assert "Item" not in resp, "valid member must not be applied when the batch fails validation"
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_batch_write_item_invalid_delete_key_rejected(ddb):
+    name = "val-bwrite-delkey"
+    _create_composite_table(ddb, name)
+    try:
+        with pytest.raises(ClientError) as exc:
+            ddb.batch_write_item(RequestItems={name: [
+                {"DeleteRequest": {"Key": {"pk": {"S": "b"}, "sk": {"S": ""}}}},
+            ]})
+        _assert_empty_key_rejected(exc, "sk")
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_transact_write_invalid_member_writes_nothing(ddb):
+    """AWS rejects the whole transaction with a plain ValidationException when
+    a member carries an empty key part; nothing is applied."""
+    name = "val-txn-atomic"
+    _create_composite_table(ddb, name)
+    try:
+        with pytest.raises(ClientError) as exc:
+            ddb.transact_write_items(TransactItems=[
+                {"Put": {"TableName": name, "Item": {"pk": {"S": "tx"}, "sk": {"S": "1"}}}},
+                {"Put": {"TableName": name, "Item": {"pk": {"S": "tx"}, "sk": {"S": ""}}}},
+            ])
+        _assert_empty_key_rejected(exc, "sk")
+        resp = ddb.get_item(TableName=name, Key={"pk": {"S": "tx"}, "sk": {"S": "1"}})
+        assert "Item" not in resp, "valid member must not be applied when the transaction fails validation"
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_transact_write_invalid_delete_key_rejected(ddb):
+    name = "val-txn-delkey"
+    _create_composite_table(ddb, name)
+    try:
+        with pytest.raises(ClientError) as exc:
+            ddb.transact_write_items(TransactItems=[
+                {"Delete": {"TableName": name, "Key": {"pk": {"S": ""}, "sk": {"S": "1"}}}},
+            ])
+        _assert_empty_key_rejected(exc, "pk")
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_query_between_inverted_bounds_rejected(ddb):
+    """AWS validates BETWEEN bounds at parse time, even for an empty partition."""
+    name = "val-between"
+    _create_composite_table(ddb, name)
+    try:
+        with pytest.raises(ClientError) as exc:
+            ddb.query(
+                TableName=name,
+                KeyConditionExpression="pk = :p AND sk BETWEEN :hi AND :lo",
+                ExpressionAttributeValues={
+                    ":p": {"S": "a"}, ":hi": {"S": "z"}, ":lo": {"S": "a"},
+                },
+            )
+        err = exc.value.response["Error"]
+        assert err["Code"] == "ValidationException"
+        assert "BETWEEN operator requires upper bound to be greater than or equal to lower bound" in err["Message"]
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_query_between_valid_and_numeric_bounds(ddb):
+    """Valid BETWEEN still works; numeric bounds compare numerically (9 < 10)."""
+    name = "val-between-ok"
+    try:
+        ddb.delete_table(TableName=name)
+    except Exception:
+        pass
+    ddb.create_table(
+        TableName=name,
+        KeySchema=[
+            {"AttributeName": "pk", "KeyType": "HASH"},
+            {"AttributeName": "sk", "KeyType": "RANGE"},
+        ],
+        AttributeDefinitions=[
+            {"AttributeName": "pk", "AttributeType": "S"},
+            {"AttributeName": "sk", "AttributeType": "N"},
+        ],
+        BillingMode="PAY_PER_REQUEST",
+    )
+    try:
+        ddb.put_item(TableName=name, Item={"pk": {"S": "a"}, "sk": {"N": "9"}})
+        resp = ddb.query(
+            TableName=name,
+            KeyConditionExpression="pk = :p AND sk BETWEEN :lo AND :hi",
+            ExpressionAttributeValues={
+                ":p": {"S": "a"}, ":lo": {"N": "9"}, ":hi": {"N": "10"},
+            },
+        )
+        assert resp["Count"] == 1
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_update_add_operand_type_must_be_number_or_set(ddb):
+    name = "val-add-operand"
+    _create_update_item_table(ddb, name)
+    try:
+        ddb.put_item(TableName=name, Item={"pk": {"S": "k"}})
+        with pytest.raises(ClientError) as exc:
+            ddb.update_item(
+                TableName=name,
+                Key={"pk": {"S": "k"}},
+                UpdateExpression="ADD tags :v",
+                ExpressionAttributeValues={":v": {"S": "y"}},
+            )
+        err = exc.value.response["Error"]
+        assert err["Code"] == "ValidationException"
+        assert "operator: ADD, operand type: STRING" in err["Message"]
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_update_add_type_mismatch_with_existing_attr(ddb):
+    name = "val-add-mismatch"
+    _create_update_item_table(ddb, name)
+    try:
+        ddb.put_item(TableName=name, Item={"pk": {"S": "k"}, "tags": {"SS": ["x"]}})
+        with pytest.raises(ClientError) as exc:
+            ddb.update_item(
+                TableName=name,
+                Key={"pk": {"S": "k"}},
+                UpdateExpression="ADD tags :v",
+                ExpressionAttributeValues={":v": {"N": "5"}},
+            )
+        err = exc.value.response["Error"]
+        assert err["Code"] == "ValidationException"
+        assert err["Message"] == "An operand in the update expression has an incorrect data type"
+        # attribute untouched
+        item = ddb.get_item(TableName=name, Key={"pk": {"S": "k"}})["Item"]
+        assert item["tags"] == {"SS": ["x"]}
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_update_delete_operand_type_must_be_set(ddb):
+    name = "val-delete-operand"
+    _create_update_item_table(ddb, name)
+    try:
+        ddb.put_item(TableName=name, Item={"pk": {"S": "k"}, "tags": {"SS": ["x"]}})
+        with pytest.raises(ClientError) as exc:
+            ddb.update_item(
+                TableName=name,
+                Key={"pk": {"S": "k"}},
+                UpdateExpression="DELETE tags :v",
+                ExpressionAttributeValues={":v": {"N": "1"}},
+            )
+        err = exc.value.response["Error"]
+        assert err["Code"] == "ValidationException"
+        assert "operator: DELETE, operand type: NUMBER" in err["Message"]
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_update_delete_type_mismatch_with_existing_attr(ddb):
+    name = "val-delete-mismatch"
+    _create_update_item_table(ddb, name)
+    try:
+        ddb.put_item(TableName=name, Item={"pk": {"S": "k"}, "tags": {"SS": ["x"]}})
+        with pytest.raises(ClientError) as exc:
+            ddb.update_item(
+                TableName=name,
+                Key={"pk": {"S": "k"}},
+                UpdateExpression="DELETE tags :v",
+                ExpressionAttributeValues={":v": {"NS": ["1"]}},
+            )
+        err = exc.value.response["Error"]
+        assert err["Code"] == "ValidationException"
+        assert err["Message"] == "An operand in the update expression has an incorrect data type"
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_update_add_and_delete_still_work_on_matching_types(ddb):
+    """Sanity: valid ADD/DELETE on matching types keep working."""
+    name = "val-add-del-ok"
+    _create_update_item_table(ddb, name)
+    try:
+        ddb.put_item(TableName=name, Item={"pk": {"S": "k"}, "tags": {"SS": ["x"]}, "num": {"N": "1"}})
+        ddb.update_item(
+            TableName=name,
+            Key={"pk": {"S": "k"}},
+            UpdateExpression="ADD tags :t, num :n",
+            ExpressionAttributeValues={":t": {"SS": ["y"]}, ":n": {"N": "2"}},
+        )
+        ddb.update_item(
+            TableName=name,
+            Key={"pk": {"S": "k"}},
+            UpdateExpression="DELETE tags :d",
+            ExpressionAttributeValues={":d": {"SS": ["x"]}},
+        )
+        item = ddb.get_item(TableName=name, Key={"pk": {"S": "k"}})["Item"]
+        assert item["tags"] == {"SS": ["y"]}
+        assert item["num"] == {"N": "3"}
+    finally:
+        ddb.delete_table(TableName=name)
