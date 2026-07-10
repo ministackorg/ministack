@@ -6425,3 +6425,88 @@ def test_dynamodb_update_add_and_delete_still_work_on_matching_types(ddb):
         assert item["num"] == {"N": "3"}
     finally:
         ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_query_empty_string_operand_on_key_attr_rejected(ddb):
+    """Key-condition operands are validated like key values: empty strings
+    are rejected with the same error AWS raises for empty key attributes."""
+    name = "val-kce-empty-operand"
+    _create_composite_table(ddb, name)
+    try:
+        with pytest.raises(ClientError) as exc:
+            ddb.query(
+                TableName=name,
+                KeyConditionExpression="pk = :p AND sk BETWEEN :lo AND :hi",
+                ExpressionAttributeValues={
+                    ":p": {"S": "a"}, ":lo": {"S": ""}, ":hi": {"S": "z"},
+                },
+            )
+        _assert_empty_key_rejected(exc, "sk")
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_query_esk_outside_range_predicate_rejected(ddb):
+    """An ExclusiveStartKey whose sort value violates the key condition could
+    never have been issued by a previous page; AWS rejects it."""
+    name = "val-esk-predicate"
+    _create_composite_table(ddb, name)
+    try:
+        ddb.put_item(TableName=name, Item={"pk": {"S": "a"}, "sk": {"S": "sibling-1"}})
+        with pytest.raises(ClientError) as exc:
+            ddb.query(
+                TableName=name,
+                KeyConditionExpression="pk = :p AND begins_with(sk, :pre)",
+                ExpressionAttributeValues={":p": {"S": "a"}, ":pre": {"S": "sibling"}},
+                ExclusiveStartKey={"pk": {"S": "a"}, "sk": {"S": "x"}},
+            )
+        err = exc.value.response["Error"]
+        assert err["Code"] == "ValidationException"
+        assert "does not match the range key predicate" in err["Message"]
+
+        # A cursor inside the predicate stays valid even when no item matches it.
+        resp = ddb.query(
+            TableName=name,
+            KeyConditionExpression="pk = :p AND begins_with(sk, :pre)",
+            ExpressionAttributeValues={":p": {"S": "a"}, ":pre": {"S": "sibling"}},
+            ExclusiveStartKey={"pk": {"S": "a"}, "sk": {"S": "sibling-0"}},
+        )
+        assert resp["Count"] == 1
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_update_list_append_missing_attr_rejected(ddb):
+    name = "val-list-append-missing"
+    _create_update_item_table(ddb, name)
+    try:
+        ddb.put_item(TableName=name, Item={"pk": {"S": "k"}})
+        with pytest.raises(ClientError) as exc:
+            ddb.update_item(
+                TableName=name,
+                Key={"pk": {"S": "k"}},
+                UpdateExpression="SET lst = list_append(lst, :v)",
+                ExpressionAttributeValues={":v": {"L": [{"S": "x"}]}},
+            )
+        err = exc.value.response["Error"]
+        assert err["Code"] == "ValidationException"
+        assert err["Message"] == "The provided expression refers to an attribute that does not exist in the item"
+
+        # list_append on an existing (even empty) list keeps working, and
+        # if_not_exists remains the sanctioned way to handle absence.
+        ddb.update_item(
+            TableName=name,
+            Key={"pk": {"S": "k"}},
+            UpdateExpression="SET lst = if_not_exists(lst, :empty)",
+            ExpressionAttributeValues={":empty": {"L": []}},
+        )
+        ddb.update_item(
+            TableName=name,
+            Key={"pk": {"S": "k"}},
+            UpdateExpression="SET lst = list_append(lst, :v)",
+            ExpressionAttributeValues={":v": {"L": [{"S": "x"}]}},
+        )
+        item = ddb.get_item(TableName=name, Key={"pk": {"S": "k"}})["Item"]
+        assert item["lst"] == {"L": [{"S": "x"}]}
+    finally:
+        ddb.delete_table(TableName=name)

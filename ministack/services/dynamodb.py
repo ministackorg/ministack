@@ -1847,6 +1847,19 @@ def _query(data):
                 if resolved and resolved not in allowed:
                     return error_response_json("ValidationException",
                         f"Query condition missed key schema element: {resolved}", 400)
+        # Key-condition operands are validated like key values themselves:
+        # an empty string/binary operand is rejected with the same error AWS
+        # raises for empty key attribute values.
+        cur_attr = pk_name
+        for tok in kce_tokens:
+            if tok[0] == "IDENT" and tok[1] in allowed:
+                cur_attr = tok[1]
+            elif tok[0] == "NAME_REF" and ean.get(tok[1]) in allowed:
+                cur_attr = ean[tok[1]]
+            elif tok[0] == "VALUE_REF":
+                err = _empty_key_value_error(cur_attr, eav.get(tok[1]))
+                if err:
+                    return err
         # AWS validates BETWEEN bounds at parse time: lower must be <= upper,
         # even when the partition holds no items.
         for i, tok in enumerate(kce_tokens):
@@ -1858,6 +1871,17 @@ def _query(data):
                 err = _between_bounds_error(eav.get(kce_tokens[i + 1][1]), eav.get(kce_tokens[i + 3][1]))
                 if err:
                     return err
+        # An ExclusiveStartKey must itself satisfy the key condition — AWS
+        # rejects a cursor whose sort value falls outside the range predicate
+        # (it could never have been issued by a previous page of this query).
+        if esk and sk_name:
+            try:
+                esk_matches = _evaluate_condition(key_cond, esk, eav, ean, slot="KeyConditionExpression")
+            except ValueError:
+                esk_matches = True
+            if not esk_matches:
+                return error_response_json("ValidationException",
+                    "The provided starting key does not match the range key predicate", 400)
 
     if is_gsi or index_name:
         candidates = []
@@ -4767,6 +4791,10 @@ def _eval_set_value(tokens, item, attr_values, attr_names):
         val = _get_at_path(item, path)
         if val is not None:
             return val
+        # A document path in a SET value must resolve — AWS rejects e.g.
+        # `SET a = list_append(a, :v)` when `a` doesn't exist on the item
+        # (if_not_exists is the sanctioned way to handle absence).
+        raise ValueError("The provided expression refers to an attribute that does not exist in the item")
 
     if len(tokens) == 1 and tokens[0][0] == 'VALUE_REF':
         return attr_values.get(tokens[0][1])
