@@ -728,6 +728,70 @@ def test_kinesis_consumers_survive_warm_boot():
     mod.reset()
 
 
+# ── kms._keys / kms._aliases ───────────────────────────────────────────
+
+def test_kms_region_scoped_stores_survive_warm_boot_in_original_scope():
+    import base64
+    import json
+
+    from ministack.core.responses import (
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+
+    mod = _get_module("kms")
+    original_account = get_account_id()
+    original_region = get_region()
+    account_id = "111111111111"
+    alias_name = "alias/warm-kms-region"
+
+    def _body(response):
+        return json.loads(response[2])
+
+    mod.reset()
+    try:
+        set_request_account_id(account_id)
+        set_request_region("us-west-2")
+
+        created = _body(mod._create_key({
+            "KeySpec": "SYMMETRIC_DEFAULT",
+            "KeyUsage": "ENCRYPT_DECRYPT",
+            "Description": "warm boot KMS key",
+        }))
+        key_id = created["KeyMetadata"]["KeyId"]
+        key_arn = created["KeyMetadata"]["Arn"]
+        mod._create_alias({"AliasName": alias_name, "TargetKeyId": key_id})
+        encrypted = _body(mod._encrypt({
+            "KeyId": key_id,
+            "Plaintext": b"warm-kms-region",
+        }))
+
+        _round_trip_dict(mod, "kms")
+
+        assert mod._resolve_key(key_id)["Arn"] == key_arn
+        assert mod._resolve_key(alias_name)["KeyId"] == key_id
+        decrypted = _body(mod._decrypt({
+            "CiphertextBlob": encrypted["CiphertextBlob"],
+            "KeyId": key_id,
+        }))
+        assert base64.b64decode(decrypted["Plaintext"]) == b"warm-kms-region"
+
+        set_request_region("us-east-1")
+        assert mod._resolve_key(key_id) is None
+        assert mod._resolve_key(alias_name) is None
+
+        set_request_account_id("222222222222")
+        set_request_region("us-west-2")
+        assert mod._resolve_key(key_id) is None
+        assert mod._resolve_key(alias_name) is None
+    finally:
+        mod.reset()
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
 # ── ecs._attributes ────────────────────────────────────────────────────
 
 def test_ecs_attributes_survive_warm_boot():
