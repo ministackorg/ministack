@@ -1884,9 +1884,12 @@ def _query(data):
     if esk:
         candidates = _apply_exclusive_start_key(candidates, esk, pk_name, sk_name, scan_forward, table=table)
 
+    # AWS returns a LastEvaluatedKey whenever it stopped *because of* the
+    # limit — including when the results end exactly at the limit, since it
+    # doesn't look ahead. The follow-up page then returns 0 items and no key.
     has_more = False
-    if limit is not None and len(candidates) > limit:
-        has_more = True
+    if limit is not None and len(candidates) >= limit:
+        has_more = len(candidates) > 0
         candidates = candidates[:limit]
 
     scanned_count = len(candidates)
@@ -2080,9 +2083,11 @@ def _scan(data):
                 "The provided starting key is invalid: The provided key element does not match the schema", 400)
         all_items = _apply_exclusive_start_key_scan(all_items, esk, table)
 
+    # Same LastEvaluatedKey semantics as Query: stopping exactly at the limit
+    # still yields a key, because AWS doesn't look ahead.
     has_more = False
-    if limit is not None and len(all_items) > limit:
-        has_more = True
+    if limit is not None and len(all_items) >= limit:
+        has_more = len(all_items) > 0
         all_items = all_items[:limit]
 
     scanned_count = len(all_items)

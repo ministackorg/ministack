@@ -6139,3 +6139,116 @@ def test_dynamodb_update_item_valid_update_still_succeeds(ddb):
     finally:
         ddb.delete_table(TableName=name)
 
+
+
+# ---------------------------------------------------------------------------
+# LastEvaluatedKey when the results end exactly at Limit (AWS doesn't look
+# ahead: stopping at the limit always yields a key; the next page is empty).
+# ---------------------------------------------------------------------------
+
+def _create_paging_table(ddb, name):
+    try:
+        ddb.delete_table(TableName=name)
+    except Exception:
+        pass
+    ddb.create_table(
+        TableName=name,
+        KeySchema=[
+            {"AttributeName": "pk", "KeyType": "HASH"},
+            {"AttributeName": "sk", "KeyType": "RANGE"},
+        ],
+        AttributeDefinitions=[
+            {"AttributeName": "pk", "AttributeType": "S"},
+            {"AttributeName": "sk", "AttributeType": "S"},
+        ],
+        BillingMode="PAY_PER_REQUEST",
+    )
+    for i in range(1, 4):
+        ddb.put_item(TableName=name, Item={"pk": {"S": "a"}, "sk": {"S": str(i)}})
+
+
+def test_dynamodb_query_lek_present_when_limit_equals_count(ddb):
+    name = "lek-query-exact"
+    _create_paging_table(ddb, name)
+    try:
+        page1 = ddb.query(
+            TableName=name,
+            KeyConditionExpression="pk = :p",
+            ExpressionAttributeValues={":p": {"S": "a"}},
+            Limit=3,
+        )
+        assert page1["Count"] == 3
+        assert "LastEvaluatedKey" in page1, "stopping exactly at Limit must yield a LastEvaluatedKey"
+
+        page2 = ddb.query(
+            TableName=name,
+            KeyConditionExpression="pk = :p",
+            ExpressionAttributeValues={":p": {"S": "a"}},
+            Limit=3,
+            ExclusiveStartKey=page1["LastEvaluatedKey"],
+        )
+        assert page2["Count"] == 0
+        assert "LastEvaluatedKey" not in page2
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_query_no_lek_when_limit_exceeds_count(ddb):
+    name = "lek-query-over"
+    _create_paging_table(ddb, name)
+    try:
+        resp = ddb.query(
+            TableName=name,
+            KeyConditionExpression="pk = :p",
+            ExpressionAttributeValues={":p": {"S": "a"}},
+            Limit=4,
+        )
+        assert resp["Count"] == 3
+        assert "LastEvaluatedKey" not in resp
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_scan_lek_present_when_limit_equals_count(ddb):
+    name = "lek-scan-exact"
+    _create_paging_table(ddb, name)
+    try:
+        page1 = ddb.scan(TableName=name, Limit=3)
+        assert page1["Count"] == 3
+        assert "LastEvaluatedKey" in page1, "stopping exactly at Limit must yield a LastEvaluatedKey"
+
+        page2 = ddb.scan(TableName=name, Limit=3, ExclusiveStartKey=page1["LastEvaluatedKey"])
+        assert page2["Count"] == 0
+        assert "LastEvaluatedKey" not in page2
+
+        over = ddb.scan(TableName=name, Limit=4)
+        assert over["Count"] == 3
+        assert "LastEvaluatedKey" not in over
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_query_lek_full_pagination_still_terminates(ddb):
+    """Paging with Limit=1 visits every item exactly once and terminates."""
+    name = "lek-query-walk"
+    _create_paging_table(ddb, name)
+    try:
+        seen = []
+        esk = None
+        for _ in range(10):
+            kwargs = {
+                "TableName": name,
+                "KeyConditionExpression": "pk = :p",
+                "ExpressionAttributeValues": {":p": {"S": "a"}},
+                "Limit": 1,
+            }
+            if esk:
+                kwargs["ExclusiveStartKey"] = esk
+            page = ddb.query(**kwargs)
+            seen.extend(it["sk"]["S"] for it in page["Items"])
+            esk = page.get("LastEvaluatedKey")
+            if not esk:
+                break
+        assert seen == ["1", "2", "3"]
+    finally:
+        ddb.delete_table(TableName=name)
