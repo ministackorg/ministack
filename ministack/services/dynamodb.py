@@ -2938,10 +2938,16 @@ def _transact_write_items(data):
                 return json_response(prior.get("response", {}))
             return error_response_json("IdempotentParameterMismatchException",
                 "Request token already in use for another request with a different payload", 400)
-    # Duplicate-key rejection and member validation across the transaction.
-    # AWS validates every member before applying anything: a malformed item or
-    # key fails the whole transaction with a plain ValidationException and no
-    # partial writes.
+    # Member validation across the transaction. AWS validates every member
+    # before applying anything, but splits the failure into two shapes
+    # (verified against real DynamoDB):
+    #   * up-front input errors -> top-level ValidationException (Phase 0):
+    #     empty-string/binary key values, malformed item attrs, item size,
+    #     and duplicate target keys.
+    #   * per-item semantic errors -> TransactionCanceledException with a
+    #     positional ValidationError reason (Phase 1): wrong-typed keys and
+    #     update-expression type errors.
+    # Nothing is applied in either case.
     seen_targets = set()
     for transact in items_list:
         op_type, op = _extract_transact_op(transact)
@@ -2951,23 +2957,42 @@ def _transact_write_items(data):
         tbl = _tables.get(tn)
         if not tbl:
             continue
+        key_src = op.get("Item", {}) if op_type == "Put" else op.get("Key", {})
+        # Empty-string/binary key value -> top-level ValidationException.
+        for kn in (tbl.get("pk_name"), tbl.get("sk_name")):
+            if kn and kn in key_src:
+                err = _empty_key_value_error(kn, key_src[kn])
+                if err:
+                    return err
+        # Non-key attribute value / item-size validation is also up-front.
         if op_type == "Put":
-            key_src = op.get("Item", {})
-            err = _validate_item(key_src, tbl.get("pk_name"), tbl.get("sk_name"))
-            if err:
-                return err
-            _, _, key_err = _resolve_table_key_values(tbl, key_src, allow_extra=True)
-            if key_err:
-                return key_err
-        else:
-            key_src = op.get("Key", {})
-            _, _, key_err = _resolve_table_key_values(tbl, key_src, allow_extra=False)
-            if key_err:
-                return key_err
+            item_err = _validate_item(key_src, tbl.get("pk_name"), tbl.get("sk_name"))
+            if item_err:
+                return item_err
+        target = (tn,
+                  _extract_key_val(key_src.get(tbl.get("pk_name") or "")),
+                  _extract_key_val(key_src.get(tbl.get("sk_name") or "")) if tbl.get("sk_name") else None)
+        if target in seen_targets:
+            return error_response_json("ValidationException",
+                "Transaction request cannot include multiple operations on one item", 400)
+        seen_targets.add(target)
+
+    # Phase 1: wrong-typed keys and update-expression type errors surface as a
+    # per-item ValidationError cancellation reason, not a top-level exception.
+    val_reasons = {}
+    for idx, transact in enumerate(items_list):
+        op_type, op = _extract_transact_op(transact)
+        if op is None:
+            continue
+        tbl = _tables.get(op.get("TableName", ""))
+        if not tbl:
+            continue
+        key_src = op.get("Item", {}) if op_type == "Put" else op.get("Key", {})
+        type_msg = _key_type_mismatch_reason(tbl, key_src)
+        if type_msg:
+            val_reasons[idx] = type_msg
+            continue
         if op_type == "Update":
-            # Dry-run the update expression against a copy so type errors
-            # (e.g. ADD with a mismatched operand) surface up front instead
-            # of mid-apply.
             ue = op.get("UpdateExpression", "")
             if ue:
                 pk_val = _extract_key_val(key_src.get(tbl["pk_name"]))
@@ -2977,14 +3002,9 @@ def _transact_write_items(data):
                 try:
                     _apply_update_expression(probe, ue, op.get("ExpressionAttributeValues", {}), op.get("ExpressionAttributeNames", {}))
                 except ValueError as exc:
-                    return error_response_json("ValidationException", str(exc), 400)
-        target = (tn,
-                  _extract_key_val(key_src.get(tbl.get("pk_name") or "")),
-                  _extract_key_val(key_src.get(tbl.get("sk_name") or "")) if tbl.get("sk_name") else None)
-        if target in seen_targets:
-            return error_response_json("ValidationException",
-                "Transaction request cannot include multiple operations on one item", 400)
-        seen_targets.add(target)
+                    val_reasons[idx] = str(exc)
+    if val_reasons:
+        return _transact_validation_cancel_response(len(items_list), val_reasons)
 
     # Phase 1: evaluate ALL conditions and collect failures (AWS returns all,
     # not just the first).
@@ -4883,9 +4903,11 @@ def _apply_delete(item, tokens, attr_values, attr_names, updated_attrs):
         # existing attribute must be a set of the same type (runtime in AWS).
         op_type = _operand_type(del_val)
         if op_type not in ("SS", "NS", "BS"):
+            # NOTE: real DynamoDB reports typeSet ALLOWED_FOR_ADD_OPERAND even for
+            # the DELETE operator (verified against real AWS), so we match that.
             raise ValueError(
                 "Invalid UpdateExpression: Incorrect operand type for operator or function; "
-                f"operator: DELETE, operand type: {_AV_TYPE_NAMES.get(op_type, op_type)}, typeSet: ALLOWED_FOR_DELETE_OPERAND")
+                f"operator: DELETE, operand type: {_AV_TYPE_NAMES.get(op_type, op_type)}, typeSet: ALLOWED_FOR_ADD_OPERAND")
 
         updated_attrs.add(path[0])
 
@@ -5201,6 +5223,50 @@ def _resolve_table_key_values(table, attrs, allow_extra):
 
 def _key_schema_validation_error():
     return error_response_json("ValidationException", "The provided key element does not match the schema", 400)
+
+
+def _key_type_mismatch_reason(table, attrs):
+    """Return the AWS message for a key attribute present with the wrong type,
+    else None. Unlike an empty key value (which real AWS rejects up front with a
+    ValidationException), a wrong-typed key inside a transaction is surfaced as a
+    per-item ValidationError cancellation reason."""
+    if not isinstance(attrs, dict):
+        return None
+    for key_name in (table.get("pk_name"), table.get("sk_name")):
+        if not key_name or key_name not in attrs:
+            continue
+        expected = _get_attr_type(table, key_name)
+        raw = attrs.get(key_name)
+        if isinstance(raw, dict) and len(raw) == 1:
+            actual = next(iter(raw))
+            if actual != expected:
+                return (f"One or more parameter values were invalid: "
+                        f"Type mismatch for key {key_name} expected: {expected} actual: {actual}")
+    return None
+
+
+def _transact_validation_cancel_response(total, val_reasons):
+    """Build a TransactionCanceledException whose CancellationReasons carry a
+    positional ValidationError for each failing member (Code "None" otherwise),
+    matching how real DynamoDB reports per-item validation failures in a
+    transaction (wrong-typed keys, update-expression type errors)."""
+    reasons = []
+    for i in range(total):
+        if i in val_reasons:
+            reasons.append({"Code": "ValidationError", "Message": val_reasons[i]})
+        else:
+            reasons.append({"Code": "None"})
+    msg = ("Transaction cancelled, please refer cancellation reasons for specific reasons ["
+           + ", ".join(r["Code"] for r in reasons) + "]")
+    body = json.dumps({
+        "__type": "TransactionCanceledException",
+        "message": msg,
+        "CancellationReasons": reasons,
+    }, ensure_ascii=False).encode("utf-8")
+    return 400, {
+        "Content-Type": "application/x-amz-json-1.0",
+        "x-amzn-errortype": "TransactionCanceledException",
+    }, body
 
 
 def _between_bounds_error(lo_av, hi_av):

@@ -6270,6 +6270,59 @@ def test_dynamodb_transact_write_invalid_delete_key_rejected(ddb):
         ddb.delete_table(TableName=name)
 
 
+def test_dynamodb_transact_write_wrong_type_key_is_cancelled(ddb):
+    """A wrong-typed key inside a transaction is a per-item ValidationError
+    cancellation reason (TransactionCanceledException), NOT a top-level
+    ValidationException (which is reserved for empty key values). Verified
+    against real AWS DynamoDB."""
+    name = "val-txn-wrongtype"
+    _create_composite_table(ddb, name)
+    try:
+        with pytest.raises(ClientError) as exc:
+            ddb.transact_write_items(TransactItems=[
+                {"Put": {"TableName": name, "Item": {"pk": {"S": "ok"}, "sk": {"S": "1"}}}},
+                {"Put": {"TableName": name, "Item": {"pk": {"N": "5"}, "sk": {"S": "1"}}}},
+            ])
+        assert exc.value.response["Error"]["Code"] == "TransactionCanceledException"
+        reasons = exc.value.response.get("CancellationReasons", [])
+        assert [r.get("Code") for r in reasons] == ["None", "ValidationError"]
+        assert "Type mismatch for key pk" in reasons[1].get("Message", "")
+        # nothing applied
+        resp = ddb.get_item(TableName=name, Key={"pk": {"S": "ok"}, "sk": {"S": "1"}})
+        assert "Item" not in resp
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_transact_write_update_type_mismatch_is_cancelled(ddb):
+    """An update-expression type error inside a transaction surfaces as a
+    ValidationError cancellation reason, not a top-level ValidationException."""
+    name = "val-txn-updtype"
+    _create_composite_table(ddb, name)
+    try:
+        ddb.put_item(
+            TableName=name,
+            Item={"pk": {"S": "a"}, "sk": {"S": "1"}, "tags": {"SS": ["x"]}},
+        )
+        with pytest.raises(ClientError) as exc:
+            ddb.transact_write_items(TransactItems=[
+                {"Update": {
+                    "TableName": name,
+                    "Key": {"pk": {"S": "a"}, "sk": {"S": "1"}},
+                    "UpdateExpression": "ADD tags :n",
+                    "ExpressionAttributeValues": {":n": {"N": "5"}},
+                }},
+            ])
+        assert exc.value.response["Error"]["Code"] == "TransactionCanceledException"
+        reasons = exc.value.response.get("CancellationReasons", [])
+        assert reasons and reasons[0].get("Code") == "ValidationError"
+        # existing attribute untouched
+        item = ddb.get_item(TableName=name, Key={"pk": {"S": "a"}, "sk": {"S": "1"}})["Item"]
+        assert item["tags"] == {"SS": ["x"]}
+    finally:
+        ddb.delete_table(TableName=name)
+
+
 def test_dynamodb_query_between_inverted_bounds_rejected(ddb):
     """AWS validates BETWEEN bounds at parse time, even for an empty partition."""
     name = "val-between"
