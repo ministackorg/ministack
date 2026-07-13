@@ -5,6 +5,11 @@ All notable changes to MiniStack will be documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+- **IoT — device shadow operations** — `GetThingShadow`, `UpdateThingShadow`, and `DeleteThingShadow` on the `iot-data` endpoint (classic and named shadows via `?name=`) previously returned `InvalidRequestException: Unsupported iot-data path: .../shadow`. Shadows now store `desired`/`reported` state: updates deep-merge into the stored document (a `null` value removes the field), bump the version, and stamp per-field `metadata` timestamps; the `/accepted` response echoes only the sections sent, while `GetThingShadow` returns the full document including the computed `state.delta` (desired fields that differ from reported). A stale `version` in an update is rejected with a `409`, and reading or deleting a nonexistent shadow returns `ResourceNotFoundException`. Shadows are account-scoped and persisted with the rest of the IoT state.
+
 ## [1.4.2] — 2026-07-13
 
 ### Added
