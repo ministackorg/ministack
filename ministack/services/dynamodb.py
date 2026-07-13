@@ -14,6 +14,8 @@ Legacy conditional parameters: Expected (PutItem/UpdateItem/DeleteItem),
 Uses X-Amz-Target header for action routing (JSON API).
 """
 
+import base64
+import binascii
 import copy
 import json
 import logging
@@ -492,14 +494,9 @@ def _validate_item(item: dict, pk_name: str | None = None, sk_name: str | None =
     for name, value in item.items():
         # Empty string/binary not allowed for hash/sort key attributes
         if name in (pk_name, sk_name):
-            if isinstance(value, dict):
-                (vtype, vval), = value.items()
-                if vtype == "S" and vval == "":
-                    return error_response_json("ValidationException",
-                        f"One or more parameter values are not valid. The AttributeValue for a key attribute cannot contain an empty string value. Key: {name}", 400)
-                if vtype == "B" and (vval == "" or vval == b""):
-                    return error_response_json("ValidationException",
-                        f"One or more parameter values are not valid. The AttributeValue for a key attribute cannot contain an empty binary value. Key: {name}", 400)
+            err = _empty_key_value_error(name, value)
+            if err:
+                return err
         err = _validate_attribute_value(name, value)
         if err:
             return err
@@ -1850,6 +1847,41 @@ def _query(data):
                 if resolved and resolved not in allowed:
                     return error_response_json("ValidationException",
                         f"Query condition missed key schema element: {resolved}", 400)
+        # Key-condition operands are validated like key values themselves:
+        # an empty string/binary operand is rejected with the same error AWS
+        # raises for empty key attribute values.
+        cur_attr = pk_name
+        for tok in kce_tokens:
+            if tok[0] == "IDENT" and tok[1] in allowed:
+                cur_attr = tok[1]
+            elif tok[0] == "NAME_REF" and ean.get(tok[1]) in allowed:
+                cur_attr = ean[tok[1]]
+            elif tok[0] == "VALUE_REF":
+                err = _empty_key_value_error(cur_attr, eav.get(tok[1]))
+                if err:
+                    return err
+        # AWS validates BETWEEN bounds at parse time: lower must be <= upper,
+        # even when the partition holds no items.
+        for i, tok in enumerate(kce_tokens):
+            if (tok[0] == "IDENT" and tok[1].upper() == "BETWEEN"
+                    and i + 3 < len(kce_tokens)
+                    and kce_tokens[i + 1][0] == "VALUE_REF"
+                    and kce_tokens[i + 2][0] == "IDENT" and kce_tokens[i + 2][1].upper() == "AND"
+                    and kce_tokens[i + 3][0] == "VALUE_REF"):
+                err = _between_bounds_error(eav.get(kce_tokens[i + 1][1]), eav.get(kce_tokens[i + 3][1]))
+                if err:
+                    return err
+        # An ExclusiveStartKey must itself satisfy the key condition — AWS
+        # rejects a cursor whose sort value falls outside the range predicate
+        # (it could never have been issued by a previous page of this query).
+        if esk and sk_name:
+            try:
+                esk_matches = _evaluate_condition(key_cond, esk, eav, ean, slot="KeyConditionExpression")
+            except ValueError:
+                esk_matches = True
+            if not esk_matches:
+                return error_response_json("ValidationException",
+                    "The provided starting key does not match the range key predicate", 400)
 
     if is_gsi or index_name:
         candidates = []
@@ -1884,9 +1916,12 @@ def _query(data):
     if esk:
         candidates = _apply_exclusive_start_key(candidates, esk, pk_name, sk_name, scan_forward, table=table)
 
+    # AWS returns a LastEvaluatedKey whenever it stopped *because of* the
+    # limit — including when the results end exactly at the limit, since it
+    # doesn't look ahead. The follow-up page then returns 0 items and no key.
     has_more = False
-    if limit is not None and len(candidates) > limit:
-        has_more = True
+    if limit is not None and len(candidates) >= limit:
+        has_more = len(candidates) > 0
         candidates = candidates[:limit]
 
     scanned_count = len(candidates)
@@ -2080,9 +2115,11 @@ def _scan(data):
                 "The provided starting key is invalid: The provided key element does not match the schema", 400)
         all_items = _apply_exclusive_start_key_scan(all_items, esk, table)
 
+    # Same LastEvaluatedKey semantics as Query: stopping exactly at the limit
+    # still yields a key, because AWS doesn't look ahead.
     has_more = False
-    if limit is not None and len(all_items) > limit:
-        has_more = True
+    if limit is not None and len(all_items) >= limit:
+        has_more = len(all_items) > 0
         all_items = all_items[:limit]
 
     scanned_count = len(all_items)
@@ -2737,14 +2774,28 @@ def _batch_write_item(data):
                 400,
             )
         for req in requests:
+            # Validate every member up front: AWS rejects the whole
+            # BatchWriteItem call before applying anything, so a bad member
+            # must not leave earlier members written.
             if "PutRequest" in req:
+                item = req["PutRequest"].get("Item", {})
+                err = _validate_item(item, table.get("pk_name"), table.get("sk_name"))
+                if err:
+                    return err
+                _, _, key_err = _resolve_table_key_values(table, item, allow_extra=True)
+                if key_err:
+                    return key_err
                 key_repr = (table_name,
-                            _extract_key_val(req["PutRequest"]["Item"].get(table.get("pk_name") or "")),
-                            _extract_key_val(req["PutRequest"]["Item"].get(table.get("sk_name") or "")) if table.get("sk_name") else None)
+                            _extract_key_val(item.get(table.get("pk_name") or "")),
+                            _extract_key_val(item.get(table.get("sk_name") or "")) if table.get("sk_name") else None)
             elif "DeleteRequest" in req:
+                key = req["DeleteRequest"].get("Key", {})
+                _, _, key_err = _resolve_table_key_values(table, key, allow_extra=False)
+                if key_err:
+                    return key_err
                 key_repr = (table_name,
-                            _extract_key_val(req["DeleteRequest"]["Key"].get(table.get("pk_name") or "")),
-                            _extract_key_val(req["DeleteRequest"]["Key"].get(table.get("sk_name") or "")) if table.get("sk_name") else None)
+                            _extract_key_val(key.get(table.get("pk_name") or "")),
+                            _extract_key_val(key.get(table.get("sk_name") or "")) if table.get("sk_name") else None)
             else:
                 continue
             if key_repr in seen_keys:
@@ -2892,7 +2943,16 @@ def _transact_write_items(data):
                 return json_response(prior.get("response", {}))
             return error_response_json("IdempotentParameterMismatchException",
                 "Request token already in use for another request with a different payload", 400)
-    # Duplicate-key rejection across the transaction.
+    # Member validation across the transaction. AWS validates every member
+    # before applying anything, but splits the failure into two shapes
+    # (verified against real DynamoDB):
+    #   * up-front input errors -> top-level ValidationException (Phase 0):
+    #     empty-string/binary key values, malformed item attrs, item size,
+    #     and duplicate target keys.
+    #   * per-item semantic errors -> TransactionCanceledException with a
+    #     positional ValidationError reason (Phase 1): wrong-typed keys and
+    #     update-expression type errors.
+    # Nothing is applied in either case.
     seen_targets = set()
     for transact in items_list:
         op_type, op = _extract_transact_op(transact)
@@ -2902,10 +2962,18 @@ def _transact_write_items(data):
         tbl = _tables.get(tn)
         if not tbl:
             continue
+        key_src = op.get("Item", {}) if op_type == "Put" else op.get("Key", {})
+        # Empty-string/binary key value -> top-level ValidationException.
+        for kn in (tbl.get("pk_name"), tbl.get("sk_name")):
+            if kn and kn in key_src:
+                err = _empty_key_value_error(kn, key_src[kn])
+                if err:
+                    return err
+        # Non-key attribute value / item-size validation is also up-front.
         if op_type == "Put":
-            key_src = op.get("Item", {})
-        else:
-            key_src = op.get("Key", {})
+            item_err = _validate_item(key_src, tbl.get("pk_name"), tbl.get("sk_name"))
+            if item_err:
+                return item_err
         target = (tn,
                   _extract_key_val(key_src.get(tbl.get("pk_name") or "")),
                   _extract_key_val(key_src.get(tbl.get("sk_name") or "")) if tbl.get("sk_name") else None)
@@ -2913,6 +2981,35 @@ def _transact_write_items(data):
             return error_response_json("ValidationException",
                 "Transaction request cannot include multiple operations on one item", 400)
         seen_targets.add(target)
+
+    # Phase 1: wrong-typed keys and update-expression type errors surface as a
+    # per-item ValidationError cancellation reason, not a top-level exception.
+    val_reasons = {}
+    for idx, transact in enumerate(items_list):
+        op_type, op = _extract_transact_op(transact)
+        if op is None:
+            continue
+        tbl = _tables.get(op.get("TableName", ""))
+        if not tbl:
+            continue
+        key_src = op.get("Item", {}) if op_type == "Put" else op.get("Key", {})
+        type_msg = _key_type_mismatch_reason(tbl, key_src)
+        if type_msg:
+            val_reasons[idx] = type_msg
+            continue
+        if op_type == "Update":
+            ue = op.get("UpdateExpression", "")
+            if ue:
+                pk_val = _extract_key_val(key_src.get(tbl["pk_name"]))
+                sk_val = _extract_key_val(key_src.get(tbl["sk_name"])) if tbl["sk_name"] else "__no_sort__"
+                existing = tbl["items"].get(pk_val, {}).get(sk_val)
+                probe = copy.deepcopy(existing) if existing else dict(key_src)
+                try:
+                    _apply_update_expression(probe, ue, op.get("ExpressionAttributeValues", {}), op.get("ExpressionAttributeNames", {}))
+                except ValueError as exc:
+                    val_reasons[idx] = str(exc)
+    if val_reasons:
+        return _transact_validation_cancel_response(len(items_list), val_reasons)
 
     # Phase 1: evaluate ALL conditions and collect failures (AWS returns all,
     # not just the first).
@@ -4719,6 +4816,10 @@ def _eval_set_value(tokens, item, attr_values, attr_names):
         val = _get_at_path(item, path)
         if val is not None:
             return val
+        # A document path in a SET value must resolve — AWS rejects e.g.
+        # `SET a = list_append(a, :v)` when `a` doesn't exist on the item
+        # (if_not_exists is the sanctioned way to handle absence).
+        raise ValueError("The provided expression refers to an attribute that does not exist in the item")
 
     if len(tokens) == 1 and tokens[0][0] == 'VALUE_REF':
         return attr_values.get(tokens[0][1])
@@ -4732,6 +4833,19 @@ def _apply_remove(item, tokens, attr_names, updated_attrs):
         if path:
             updated_attrs.add(path[0])
             _remove_at_path(item, path)
+
+
+_AV_TYPE_NAMES = {
+    "S": "STRING", "N": "NUMBER", "B": "BINARY",
+    "SS": "STRING SET", "NS": "NUMBER SET", "BS": "BINARY SET",
+    "M": "MAP", "L": "LIST", "BOOL": "BOOLEAN", "NULL": "NULL",
+}
+
+
+def _operand_type(av):
+    if isinstance(av, dict) and len(av) == 1:
+        return next(iter(av))
+    return None
 
 
 def _apply_add(item, tokens, attr_values, attr_names, updated_attrs):
@@ -4748,9 +4862,18 @@ def _apply_add(item, tokens, attr_values, attr_names, updated_attrs):
         if not path or add_val is None:
             continue
 
-        updated_attrs.add(path[0])
-
+        # ADD only accepts Number and set operands (parse-time in AWS), and the
+        # existing attribute must carry the same type (runtime in AWS).
+        op_type = _operand_type(add_val)
+        if op_type not in ("N", "SS", "NS", "BS"):
+            raise ValueError(
+                "Invalid UpdateExpression: Incorrect operand type for operator or function; "
+                f"operator: ADD, operand type: {_AV_TYPE_NAMES.get(op_type, op_type)}, typeSet: ALLOWED_FOR_ADD_OPERAND")
         existing = _get_at_path(item, path)
+        if existing is not None and _operand_type(existing) != op_type:
+            raise ValueError("An operand in the update expression has an incorrect data type")
+
+        updated_attrs.add(path[0])
 
         if "N" in add_val:
             inc = Decimal(add_val["N"])
@@ -4781,20 +4904,29 @@ def _apply_delete(item, tokens, attr_values, attr_names, updated_attrs):
         if not path or del_val is None:
             continue
 
+        # DELETE only accepts set operands (parse-time in AWS), and the
+        # existing attribute must be a set of the same type (runtime in AWS).
+        op_type = _operand_type(del_val)
+        if op_type not in ("SS", "NS", "BS"):
+            # NOTE: real DynamoDB reports typeSet ALLOWED_FOR_ADD_OPERAND even for
+            # the DELETE operator (verified against real AWS), so we match that.
+            raise ValueError(
+                "Invalid UpdateExpression: Incorrect operand type for operator or function; "
+                f"operator: DELETE, operand type: {_AV_TYPE_NAMES.get(op_type, op_type)}, typeSet: ALLOWED_FOR_ADD_OPERAND")
+
         updated_attrs.add(path[0])
 
         existing = _get_at_path(item, path)
         if existing is None:
             continue
+        if _operand_type(existing) != op_type:
+            raise ValueError("An operand in the update expression has an incorrect data type")
 
-        for set_type in ("SS", "NS", "BS"):
-            if set_type in del_val and set_type in existing:
-                remaining = [s for s in existing[set_type] if s not in del_val[set_type]]
-                if remaining:
-                    _set_at_path(item, path, {set_type: remaining})
-                else:
-                    _remove_at_path(item, path)
-                break
+        remaining = [s for s in existing[op_type] if s not in del_val[op_type]]
+        if remaining:
+            _set_at_path(item, path, {op_type: remaining})
+        else:
+            _remove_at_path(item, path)
 
 
 # ---------------------------------------------------------------------------
@@ -5086,6 +5218,9 @@ def _resolve_table_key_values(table, attrs, allow_extra):
         raw_value = attrs.get(key_name)
         if not isinstance(raw_value, dict) or set(raw_value.keys()) != {expected_type}:
             return "", "", _key_schema_validation_error()
+        err = _empty_key_value_error(key_name, raw_value)
+        if err:
+            return "", "", err
     pk_val = _extract_key_val(attrs.get(table["pk_name"]))
     sk_val = _extract_key_val(attrs.get(table["sk_name"])) if table["sk_name"] else "__no_sort__"
     return pk_val, sk_val, None
@@ -5093,6 +5228,92 @@ def _resolve_table_key_values(table, attrs, allow_extra):
 
 def _key_schema_validation_error():
     return error_response_json("ValidationException", "The provided key element does not match the schema", 400)
+
+
+def _key_type_mismatch_reason(table, attrs):
+    """Return the AWS message for a key attribute present with the wrong type,
+    else None. Unlike an empty key value (which real AWS rejects up front with a
+    ValidationException), a wrong-typed key inside a transaction is surfaced as a
+    per-item ValidationError cancellation reason."""
+    if not isinstance(attrs, dict):
+        return None
+    for key_name in (table.get("pk_name"), table.get("sk_name")):
+        if not key_name or key_name not in attrs:
+            continue
+        expected = _get_attr_type(table, key_name)
+        raw = attrs.get(key_name)
+        if isinstance(raw, dict) and len(raw) == 1:
+            actual = next(iter(raw))
+            if actual != expected:
+                return (f"One or more parameter values were invalid: "
+                        f"Type mismatch for key {key_name} expected: {expected} actual: {actual}")
+    return None
+
+
+def _transact_validation_cancel_response(total, val_reasons):
+    """Build a TransactionCanceledException whose CancellationReasons carry a
+    positional ValidationError for each failing member (Code "None" otherwise),
+    matching how real DynamoDB reports per-item validation failures in a
+    transaction (wrong-typed keys, update-expression type errors)."""
+    reasons = []
+    for i in range(total):
+        if i in val_reasons:
+            reasons.append({"Code": "ValidationError", "Message": val_reasons[i]})
+        else:
+            reasons.append({"Code": "None"})
+    msg = ("Transaction cancelled, please refer cancellation reasons for specific reasons ["
+           + ", ".join(r["Code"] for r in reasons) + "]")
+    body = json.dumps({
+        "__type": "TransactionCanceledException",
+        "message": msg,
+        "CancellationReasons": reasons,
+    }, ensure_ascii=False).encode("utf-8")
+    return 400, {
+        "Content-Type": "application/x-amz-json-1.0",
+        "x-amzn-errortype": "TransactionCanceledException",
+    }, body
+
+
+def _between_bounds_error(lo_av, hi_av):
+    """Static BETWEEN bounds check for KeyConditionExpression. AWS rejects an
+    inverted range (lower > upper) with a ValidationException at parse time."""
+    if not isinstance(lo_av, dict) or not isinstance(hi_av, dict):
+        return None
+    if len(lo_av) != 1 or len(hi_av) != 1:
+        return None
+    (lt, lv), = lo_av.items()
+    (ht, hv), = hi_av.items()
+    if lt != ht:
+        return None
+    try:
+        if lt == "N":
+            inverted = Decimal(lv) > Decimal(hv)
+        elif lt == "B":
+            inverted = base64.b64decode(lv) > base64.b64decode(hv)
+        else:
+            inverted = str(lv) > str(hv)
+    except (InvalidOperation, TypeError, ValueError, binascii.Error):
+        return None
+    if not inverted:
+        return None
+    return error_response_json("ValidationException",
+        "Invalid KeyConditionExpression: The BETWEEN operator requires upper bound to be greater than or equal to lower bound; "
+        f"lower bound operand: AttributeValue: {{{lt}:{lv}}}, upper bound operand: AttributeValue: {{{ht}:{hv}}}", 400)
+
+
+def _empty_key_value_error(key_name, raw_value):
+    """AWS rejects empty string/binary values for key attributes on every data
+    plane operation (reads and deletes included), not just writes."""
+    if not isinstance(raw_value, dict) or len(raw_value) != 1:
+        return None
+    (vtype, vval), = raw_value.items()
+    if vtype == "S" and vval == "":
+        return error_response_json("ValidationException",
+            f"One or more parameter values are not valid. The AttributeValue for a key attribute cannot contain an empty string value. Key: {key_name}", 400)
+    if vtype == "B" and vval in ("", b""):
+        return error_response_json("ValidationException",
+            f"One or more parameter values are not valid. The AttributeValue for a key attribute cannot contain an empty binary value. Key: {key_name}", 400)
+    return None
 
 
 def _resolve_index_keys(table, index_name):
