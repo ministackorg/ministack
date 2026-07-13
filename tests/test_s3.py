@@ -1806,6 +1806,51 @@ def test_s3_eventbridge_notification(s3, sqs, eb):
     assert body["detail"]["reason"] == "PutObject"
 
 
+def test_s3_eventbridge_notification_dispatches_in_bucket_region(s3):
+    """S3 EventBridge delivery should use the bucket region, not the request region."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    bucket_name = f"s3-eb-west-bkt-{uid}"
+    queue_name = f"s3-eb-west-q-{uid}"
+    rule_name = f"s3-eb-west-rule-{uid}"
+    west_eb = _regional_client("events", "us-west-2")
+    west_sqs = _regional_client("sqs", "us-west-2")
+
+    s3.create_bucket(
+        Bucket=bucket_name,
+        CreateBucketConfiguration={"LocationConstraint": "us-west-2"},
+    )
+    queue_url = west_sqs.create_queue(QueueName=queue_name)["QueueUrl"]
+    queue_arn = west_sqs.get_queue_attributes(
+        QueueUrl=queue_url, AttributeNames=["QueueArn"],
+    )["Attributes"]["QueueArn"]
+    assert ":us-west-2:" in queue_arn
+
+    s3.put_bucket_notification_configuration(
+        Bucket=bucket_name,
+        NotificationConfiguration={"EventBridgeConfiguration": {}},
+    )
+    west_eb.put_rule(
+        Name=rule_name,
+        EventPattern=json.dumps({"source": ["aws.s3"], "detail-type": ["Object Created"]}),
+        State="ENABLED",
+    )
+    west_eb.put_targets(
+        Rule=rule_name,
+        Targets=[{"Id": "west-sqs-target", "Arn": queue_arn}],
+    )
+
+    # The S3 client fixture is signed for us-east-1; the bucket itself is us-west-2.
+    s3.put_object(Bucket=bucket_name, Key="west-region.txt", Body=b"world")
+    time.sleep(0.5)
+
+    msgs = west_sqs.receive_message(QueueUrl=queue_url, MaxNumberOfMessages=10, WaitTimeSeconds=2)
+    assert "Messages" in msgs and len(msgs["Messages"]) > 0
+    body = json.loads(msgs["Messages"][0]["Body"])
+    assert body["region"] == "us-west-2"
+    assert body["detail"]["bucket"]["name"] == bucket_name
+    assert body["detail"]["object"]["key"] == "west-region.txt"
+
+
 def test_s3_eventbridge_notification_copy_reason(s3, sqs, eb):
     """A CopyObject create carries reason ``CopyObject`` (not a hardcoded ``PutObject``)."""
     s3.create_bucket(Bucket="s3-eb-copy-bkt")
