@@ -59,6 +59,29 @@ def test_sns_get_topic_attributes(sns):
     assert resp["Attributes"]["TopicArn"] == arn
     assert resp["Attributes"]["DisplayName"] == ""  # AWS default is empty, not topic name
 
+
+def test_sns_topics_are_region_scoped_by_name(sns):
+    name = f"mr-sns-same-name-{_uuid_mod.uuid4().hex[:8]}"
+    west = _regional_client("sns", "us-west-2")
+
+    east_arn = sns.create_topic(Name=name)["TopicArn"]
+    west_arn = west.create_topic(Name=name)["TopicArn"]
+
+    assert east_arn == f"arn:aws:sns:us-east-1:000000000000:{name}"
+    assert west_arn == f"arn:aws:sns:us-west-2:000000000000:{name}"
+
+    east_arns = [t["TopicArn"] for t in sns.list_topics()["Topics"]]
+    west_arns = [t["TopicArn"] for t in west.list_topics()["Topics"]]
+    assert east_arn in east_arns
+    assert west_arn not in east_arns
+    assert west_arn in west_arns
+    assert east_arn not in west_arns
+
+    with pytest.raises(ClientError) as exc:
+        sns.get_topic_attributes(TopicArn=west_arn)
+    assert exc.value.response["Error"]["Code"] == "NotFound"
+
+
 def test_sns_set_topic_attributes(sns):
     arn = sns.create_topic(Name="intg-sns-setattr")["TopicArn"]
     sns.set_topic_attributes(
@@ -122,6 +145,31 @@ def test_sns_list_subscriptions_by_topic(sns):
     subs = sns.list_subscriptions_by_topic(TopicArn=arn)["Subscriptions"]
     assert len(subs) >= 1
     assert all(s["TopicArn"] == arn for s in subs)
+
+
+def test_sns_subscription_attributes_are_region_scoped(sns):
+    west = _regional_client("sns", "us-west-2")
+    name = f"mr-sns-sub-region-{_uuid_mod.uuid4().hex[:8]}"
+    east_arn = sns.create_topic(Name=name)["TopicArn"]
+    west_arn = west.create_topic(Name=name)["TopicArn"]
+    east_sub = sns.subscribe(
+        TopicArn=east_arn, Protocol="email", Endpoint=f"{name}-east@example.com",
+    )["SubscriptionArn"]
+    west_sub = west.subscribe(
+        TopicArn=west_arn, Protocol="email", Endpoint=f"{name}-west@example.com",
+    )["SubscriptionArn"]
+
+    assert sns.get_subscription_attributes(
+        SubscriptionArn=east_sub,
+    )["Attributes"]["TopicArn"] == east_arn
+    assert west.get_subscription_attributes(
+        SubscriptionArn=west_sub,
+    )["Attributes"]["TopicArn"] == west_arn
+
+    with pytest.raises(ClientError) as exc:
+        sns.get_subscription_attributes(SubscriptionArn=west_sub)
+    assert exc.value.response["Error"]["Code"] == "NotFound"
+
 
 def test_sns_publish(sns):
     arn = sns.create_topic(Name="intg-sns-publish")["TopicArn"]
@@ -1489,6 +1537,31 @@ def test_sns_create_platform_application(sns):
     assert ":app/GCM/intg-sns-pe-create-app" in app_arn
 
 
+def test_sns_platform_applications_and_endpoints_are_region_scoped(sns):
+    west = _regional_client("sns", "us-west-2")
+    name = f"mr-sns-platform-region-{_uuid_mod.uuid4().hex[:8]}"
+    token = _uuid_mod.uuid4().hex
+
+    east_app = _create_gcm_app(sns, name)
+    west_app = _create_gcm_app(west, name)
+    east_endpoint = sns.create_platform_endpoint(
+        PlatformApplicationArn=east_app, Token=token,
+    )["EndpointArn"]
+    west_endpoint = west.create_platform_endpoint(
+        PlatformApplicationArn=west_app, Token=token,
+    )["EndpointArn"]
+
+    assert east_app == f"arn:aws:sns:us-east-1:000000000000:app/GCM/{name}"
+    assert west_app == f"arn:aws:sns:us-west-2:000000000000:app/GCM/{name}"
+    assert east_endpoint != west_endpoint
+    assert sns.get_endpoint_attributes(EndpointArn=east_endpoint)["Attributes"]["Token"] == token
+    assert west.get_endpoint_attributes(EndpointArn=west_endpoint)["Attributes"]["Token"] == token
+
+    with pytest.raises(ClientError) as exc:
+        sns.get_endpoint_attributes(EndpointArn=west_endpoint)
+    assert exc.value.response["Error"]["Code"] == "NotFound"
+
+
 def test_sns_create_platform_endpoint_stores_token_and_enabled(sns):
     app_arn = _create_gcm_app(sns, "intg-sns-pe-token")
     token = _uuid_mod.uuid4().hex
@@ -1605,3 +1678,98 @@ def test_sns_publish_to_platform_endpoint(sns):
     )["EndpointArn"]
     resp = sns.publish(TargetArn=arn, Message="hi")
     assert resp["MessageId"]
+
+
+def test_sns_restore_legacy_account_scoped_state_adopts_arn_regions():
+    import ministack.services.sns as _sns
+    from ministack.core.responses import (
+        AccountScopedDict,
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+
+    original_account = get_account_id()
+    original_region = get_region()
+    original_topics = dict(_sns._topics._data)
+    original_subs = dict(_sns._sub_arn_to_topic._data)
+    original_apps = dict(_sns._platform_applications._data)
+    original_endpoints = dict(_sns._platform_endpoints._data)
+    try:
+        _sns.reset()
+        set_request_account_id("000000000000")
+        set_request_region("us-east-1")
+
+        suffix = _uuid_mod.uuid4().hex[:8]
+        topic_arn = f"arn:aws:sns:us-west-2:000000000000:legacy-sns-{suffix}"
+        sub_arn = f"{topic_arn}:{_uuid_mod.uuid4()}"
+        app_arn = f"arn:aws:sns:us-west-2:000000000000:app/GCM/LegacyApp-{suffix}"
+        endpoint_arn = f"{app_arn}/{_uuid_mod.uuid4()}"
+
+        legacy_topics = AccountScopedDict()
+        legacy_topics[topic_arn] = {
+            "name": f"legacy-sns-{suffix}",
+            "arn": topic_arn,
+            "attributes": {
+                "TopicArn": topic_arn,
+                "SubscriptionsConfirmed": "1",
+                "SubscriptionsPending": "0",
+            },
+            "subscriptions": [{
+                "arn": sub_arn,
+                "protocol": "email",
+                "endpoint": "legacy@example.com",
+                "confirmed": True,
+                "topic_arn": topic_arn,
+                "owner": "000000000000",
+                "attributes": {"SubscriptionArn": sub_arn, "TopicArn": topic_arn},
+            }],
+            "messages": [],
+            "tags": {},
+        }
+
+        legacy_subs = AccountScopedDict()
+        legacy_subs[sub_arn] = topic_arn
+        legacy_apps = AccountScopedDict()
+        legacy_apps[app_arn] = {
+            "arn": app_arn,
+            "name": f"LegacyApp-{suffix}",
+            "platform": "GCM",
+            "attributes": {},
+        }
+        legacy_endpoints = AccountScopedDict()
+        legacy_endpoints[endpoint_arn] = {
+            "arn": endpoint_arn,
+            "application_arn": app_arn,
+            "attributes": {"Token": "legacy-token", "Enabled": "true"},
+        }
+
+        _sns.restore_state({
+            "topics": legacy_topics,
+            "sub_arn_to_topic": legacy_subs,
+            "platform_applications": legacy_apps,
+            "platform_endpoints": legacy_endpoints,
+        })
+
+        assert _sns._topics.get(topic_arn) is None
+        assert _sns._sub_arn_to_topic.get(sub_arn) is None
+        assert _sns._platform_applications.get(app_arn) is None
+        assert _sns._platform_endpoints.get(endpoint_arn) is None
+
+        set_request_region("us-west-2")
+        assert _sns._topics[topic_arn]["arn"] == topic_arn
+        assert _sns._sub_arn_to_topic[sub_arn] == topic_arn
+        assert _sns._platform_applications[app_arn]["arn"] == app_arn
+        assert _sns._platform_endpoints[endpoint_arn]["application_arn"] == app_arn
+    finally:
+        _sns._topics.clear()
+        _sns._topics._data.update(original_topics)
+        _sns._sub_arn_to_topic.clear()
+        _sns._sub_arn_to_topic._data.update(original_subs)
+        _sns._platform_applications.clear()
+        _sns._platform_applications._data.update(original_apps)
+        _sns._platform_endpoints.clear()
+        _sns._platform_endpoints._data.update(original_endpoints)
+        set_request_account_id(original_account)
+        set_request_region(original_region)

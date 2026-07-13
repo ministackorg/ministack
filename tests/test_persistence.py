@@ -728,6 +728,91 @@ def test_kinesis_consumers_survive_warm_boot():
     mod.reset()
 
 
+def test_kinesis_shard_iterators_survive_warm_boot_in_original_scope():
+    """Live shard iterators must round-trip through JSON persistence without
+    becoming visible to other accounts or regions."""
+    import json
+    import time
+
+    from ministack.core.responses import (
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+
+    mod = _get_module("kinesis")
+    original_account = get_account_id()
+    original_region = get_region()
+    account_id = "111111111111"
+    region = "us-west-2"
+    stream_name = "warm-boot-stream"
+    stream_arn = f"arn:aws:kinesis:{region}:{account_id}:stream/{stream_name}"
+    shard_id = "shardId-000000000000"
+    token = "live-iterator-token"
+    now = time.time()
+
+    mod.reset()
+    try:
+        set_request_account_id(account_id)
+        set_request_region(region)
+        mod._streams[stream_name] = {
+            "StreamName": stream_name,
+            "StreamARN": stream_arn,
+            "StreamStatus": "ACTIVE",
+            "StreamModeDetails": {"StreamMode": "PROVISIONED"},
+            "RetentionPeriodHours": 24,
+            "shards": {
+                shard_id: {
+                    "records": [{
+                        "SequenceNumber": "1",
+                        "ApproximateArrivalTimestamp": now,
+                        "Data": b"warm-boot-record",
+                        "PartitionKey": "pk1",
+                    }],
+                    "starting_hash_key": "0",
+                    "ending_hash_key": str(2**128 - 1),
+                    "starting_sequence_number": "1",
+                    "parent_shard_id": None,
+                    "adjacent_parent_shard_id": None,
+                },
+            },
+            "tags": {},
+            "CreationTimestamp": now,
+            "EncryptionType": "NONE",
+        }
+        mod._shard_iterators[token] = {
+            "stream": stream_name,
+            "stream_arn": stream_arn,
+            "shard_id": shard_id,
+            "position": 0,
+            "created_at": now,
+        }
+
+        _round_trip_dict(mod, "kinesis")
+
+        assert token in mod._shard_iterators
+        status, _, body = mod._get_records({"ShardIterator": token, "Limit": 1})
+        assert status == 200
+        payload = json.loads(body)
+        assert payload["Records"][0]["PartitionKey"] == "pk1"
+        assert payload["NextShardIterator"] in mod._shard_iterators
+
+        set_request_region("us-east-1")
+        assert token not in mod._shard_iterators
+        status, _, body = mod._get_records({"ShardIterator": token})
+        assert status == 400
+        assert json.loads(body)["__type"] == "ExpiredIteratorException"
+
+        set_request_account_id("222222222222")
+        set_request_region(region)
+        assert token not in mod._shard_iterators
+    finally:
+        mod.reset()
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
 # ── ecs._attributes ────────────────────────────────────────────────────
 
 def test_ecs_attributes_survive_warm_boot():
@@ -791,6 +876,83 @@ def test_sns_platform_endpoints_survive_warm_boot():
         "_platform_endpoints must be in both."
     )
     mod.reset()
+
+
+def test_sns_region_scoped_stores_survive_warm_boot_in_original_scope():
+    """SNS topic, subscription, application, and endpoint stores stay scoped
+    after the real JSON persistence path."""
+    from ministack.core.responses import (
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+
+    mod = _get_module("sns")
+    mod.reset()
+    original_account = get_account_id()
+    original_region = get_region()
+    try:
+        set_request_account_id("111111111111")
+        set_request_region("us-west-2")
+
+        topic_arn = "arn:aws:sns:us-west-2:111111111111:persisted-topic"
+        sub_arn = f"{topic_arn}:sub-1"
+        app_arn = "arn:aws:sns:us-west-2:111111111111:app/GCM/PersistedApp"
+        endpoint_arn = f"{app_arn}/endpoint-1"
+        subscription = {
+            "arn": sub_arn,
+            "protocol": "email",
+            "endpoint": "persisted@example.com",
+            "confirmed": True,
+            "topic_arn": topic_arn,
+            "owner": "111111111111",
+            "attributes": {"SubscriptionArn": sub_arn, "TopicArn": topic_arn},
+        }
+        mod._topics[topic_arn] = {
+            "name": "persisted-topic",
+            "arn": topic_arn,
+            "attributes": {"TopicArn": topic_arn, "Owner": "111111111111"},
+            "subscriptions": [subscription],
+            "messages": [],
+            "tags": {},
+        }
+        mod._sub_arn_to_topic[sub_arn] = topic_arn
+        mod._platform_applications[app_arn] = {
+            "arn": app_arn,
+            "name": "PersistedApp",
+            "platform": "GCM",
+            "attributes": {},
+        }
+        mod._platform_endpoints[endpoint_arn] = {
+            "arn": endpoint_arn,
+            "application_arn": app_arn,
+            "attributes": {"Token": "persisted-token", "Enabled": "true"},
+        }
+
+        _round_trip_dict(mod, "sns")
+
+        assert mod._topics[topic_arn]["subscriptions"][0]["arn"] == sub_arn
+        assert mod._sub_arn_to_topic[sub_arn] == topic_arn
+        assert mod._platform_applications[app_arn]["arn"] == app_arn
+        assert mod._platform_endpoints[endpoint_arn]["attributes"]["Token"] == "persisted-token"
+
+        set_request_region("us-east-1")
+        assert mod._topics.get(topic_arn) is None
+        assert mod._sub_arn_to_topic.get(sub_arn) is None
+        assert mod._platform_applications.get(app_arn) is None
+        assert mod._platform_endpoints.get(endpoint_arn) is None
+
+        set_request_account_id("222222222222")
+        set_request_region("us-west-2")
+        assert mod._topics.get(topic_arn) is None
+        assert mod._sub_arn_to_topic.get(sub_arn) is None
+        assert mod._platform_applications.get(app_arn) is None
+        assert mod._platform_endpoints.get(endpoint_arn) is None
+    finally:
+        mod.reset()
+        set_request_account_id(original_account)
+        set_request_region(original_region)
 
 
 # ── Import-order regression for the ECS NameError trap ───────────────

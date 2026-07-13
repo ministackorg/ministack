@@ -15,6 +15,7 @@ import time
 
 from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.responses import (
+    AccountRegionScopedDict,
     AccountScopedDict,
     error_response_json,
     get_account_id,
@@ -43,7 +44,7 @@ REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 
 from ministack.core.persistence import PERSIST_STATE, load_state
 
-_keys = AccountScopedDict()
+_keys = AccountRegionScopedDict()
 # key_id -> {
 #     KeyId, Arn, KeyState, KeyUsage, KeySpec, Description,
 #     CreationDate, Enabled, Origin,
@@ -51,7 +52,7 @@ _keys = AccountScopedDict()
 #     _public_key_der (bytes, RSA/ECC only),
 #     _symmetric_key (bytes, SYMMETRIC_DEFAULT only),
 # }
-_aliases = AccountScopedDict()  # alias ARN -> key_id
+_aliases = AccountRegionScopedDict()  # alias ARN -> key_id
 
 
 def _alias_arn(alias_name):
@@ -74,8 +75,7 @@ def _alias_arn_from_key_record(alias_name, rec, account_id=None):
 def get_state():
     """Return JSON-serializable state. Symmetric keys are base64-encoded;
     RSA private keys are PEM-encoded if cryptography is available."""
-    from ministack.core.responses import AccountScopedDict
-    serializable_keys = AccountScopedDict()
+    serializable_keys = AccountRegionScopedDict()
     # Iterate _data directly to capture ALL accounts
     for scoped_key, rec in _keys._data.items():
         entry = {k: v for k, v in rec.items()
@@ -100,8 +100,17 @@ def get_state():
 
 def restore_state(data):
     if data:
-        from ministack.core.responses import AccountScopedDict
         keys_data = data.get("keys", {})
+
+        def _region_from_key_entry(entry):
+            try:
+                spec = parse_arn(entry.get("Arn", ""))
+            except (ArnParseError, AttributeError):
+                return get_region()
+            if spec.service != "kms":
+                return get_region()
+            return spec.region or get_region()
+
         def _restore_key_entry(entry):
             if "_symmetric_key_b64" in entry:
                 entry["_symmetric_key"] = base64.b64decode(entry.pop("_symmetric_key_b64"))
@@ -113,29 +122,50 @@ def restore_state(data):
                     entry["_private_key"] = serialization.load_pem_private_key(pem_bytes, password=None)
                 except Exception:
                     pass
-        if isinstance(keys_data, AccountScopedDict):
+
+        if isinstance(keys_data, AccountRegionScopedDict):
             for scoped_key, entry in keys_data._data.items():
                 _restore_key_entry(entry)
                 _keys._data[scoped_key] = entry
+        elif isinstance(keys_data, AccountScopedDict):
+            for (account_id, kid), entry in keys_data._data.items():
+                _restore_key_entry(entry)
+                _keys.set_scoped(account_id, _region_from_key_entry(entry), kid, entry)
         else:
             for kid, entry in keys_data.items():
                 _restore_key_entry(entry)
-                _keys[kid] = entry
+                _keys.set_scoped(get_account_id(), _region_from_key_entry(entry), kid, entry)
+
+        def _key_record_for_alias_target(account_id, target_id):
+            for (stored_account, _region, key_id), rec in _keys._data.items():
+                if stored_account == account_id and key_id == target_id:
+                    return rec
+            return None
+
+        def _store_alias(account_id, alias_key, target_id):
+            storage_key = alias_key
+            if not str(alias_key).startswith("arn:"):
+                storage_key = _alias_arn_from_key_record(
+                    alias_key,
+                    _key_record_for_alias_target(account_id, target_id),
+                    account_id,
+                )
+            try:
+                spec = parse_arn(storage_key)
+                region = spec.region if spec.service == "kms" and spec.region else get_region()
+            except ArnParseError:
+                region = get_region()
+            _aliases.set_scoped(account_id, region, storage_key, target_id)
+
         aliases_data = data.get("aliases", {})
-        if isinstance(aliases_data, AccountScopedDict):
-            for scoped_key, target_id in aliases_data._data.items():
-                account_id, alias_key = scoped_key
-                storage_key = alias_key
-                if not str(alias_key).startswith("arn:"):
-                    rec = _keys._data.get((account_id, target_id))
-                    storage_key = _alias_arn_from_key_record(alias_key, rec, account_id)
-                _aliases._data[(account_id, storage_key)] = target_id
+        if isinstance(aliases_data, AccountRegionScopedDict):
+            _aliases.update(aliases_data)
+        elif isinstance(aliases_data, AccountScopedDict):
+            for (account_id, alias_key), target_id in aliases_data._data.items():
+                _store_alias(account_id, alias_key, target_id)
         else:
             for alias_key, target_id in aliases_data.items():
-                storage_key = alias_key
-                if not str(alias_key).startswith("arn:"):
-                    storage_key = _alias_arn_from_key_record(alias_key, _keys.get(target_id))
-                _aliases[storage_key] = target_id
+                _store_alias(get_account_id(), alias_key, target_id)
 
 
 try:
