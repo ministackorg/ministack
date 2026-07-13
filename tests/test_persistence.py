@@ -728,8 +728,12 @@ def test_kinesis_consumers_survive_warm_boot():
     mod.reset()
 
 
-def test_elasticache_region_scoped_stores_survive_warm_boot_in_original_scope():
-    """ElastiCache region-scoped stores must serialize every account+region."""
+# ── kms._keys / kms._aliases ───────────────────────────────────────────
+
+def test_kms_region_scoped_stores_survive_warm_boot_in_original_scope():
+    import base64
+    import json
+
     from ministack.core.responses import (
         get_account_id,
         get_region,
@@ -737,150 +741,51 @@ def test_elasticache_region_scoped_stores_survive_warm_boot_in_original_scope():
         set_request_region,
     )
 
-    mod = _get_module("elasticache")
+    mod = _get_module("kms")
     original_account = get_account_id()
     original_region = get_region()
-    account_id = "000000000000"
+    account_id = "111111111111"
+    alias_name = "alias/warm-kms-region"
+
+    def _body(response):
+        return json.loads(response[2])
 
     mod.reset()
     try:
         set_request_account_id(account_id)
-        set_request_region("us-east-1")
-        mod._clusters["same-cache"] = {
-            "CacheClusterId": "same-cache",
-            "CacheClusterArn": f"arn:aws:elasticache:us-east-1:{account_id}:cluster:same-cache",
-            "CacheClusterStatus": "available",
-            "Engine": "redis",
-            "EngineVersion": "7.1",
-            "CacheNodes": [],
-            "_docker_container_id": "stale-east",
-        }
-        mod._replication_groups["same-rg"] = {
-            "ReplicationGroupId": "same-rg",
-            "ARN": f"arn:aws:elasticache:us-east-1:{account_id}:replicationgroup:same-rg",
-            "Status": "available",
-            "Engine": "redis",
-            "NodeGroups": [],
-            "_docker_container_ids": ["stale-east-rg"],
-        }
-        mod._subnet_groups["same-subnet"] = {
-            "CacheSubnetGroupName": "same-subnet",
-            "ARN": f"arn:aws:elasticache:us-east-1:{account_id}:subnetgroup:same-subnet",
-        }
-        mod._param_groups["same-param"] = {
-            "CacheParameterGroupName": "same-param",
-            "CacheParameterGroupFamily": "redis7",
-            "ARN": f"arn:aws:elasticache:us-east-1:{account_id}:parametergroup:same-param",
-        }
-        mod._param_group_params["same-param"] = {"timeout": {"Value": "1"}}
-        mod._snapshots["same-snap"] = {
-            "SnapshotName": "same-snap",
-            "SnapshotStatus": "available",
-            "ARN": f"arn:aws:elasticache:us-east-1:{account_id}:snapshot:same-snap",
-        }
-        mod._users["same-user"] = {
-            "UserId": "same-user",
-            "ARN": f"arn:aws:elasticache:us-east-1:{account_id}:user:same-user",
-        }
-        mod._user_groups["same-group"] = {
-            "UserGroupId": "same-group",
-            "ARN": f"arn:aws:elasticache:us-east-1:{account_id}:usergroup:same-group",
-        }
-        mod._events["entries"] = [{"SourceIdentifier": "same-cache", "Message": "east"}]
-        mod._tags[f"arn:aws:elasticache:us-east-1:{account_id}:cluster:same-cache"] = [
-            {"Key": "region", "Value": "east"},
-        ]
-
         set_request_region("us-west-2")
-        mod._clusters["same-cache"] = {
-            "CacheClusterId": "same-cache",
-            "CacheClusterArn": f"arn:aws:elasticache:us-west-2:{account_id}:cluster:same-cache",
-            "CacheClusterStatus": "available",
-            "Engine": "redis",
-            "EngineVersion": "7.1",
-            "CacheNodes": [],
-            "_docker_container_id": "stale-west",
-        }
-        mod._replication_groups["same-rg"] = {
-            "ReplicationGroupId": "same-rg",
-            "ARN": f"arn:aws:elasticache:us-west-2:{account_id}:replicationgroup:same-rg",
-            "Status": "available",
-            "Engine": "redis",
-            "NodeGroups": [],
-            "_docker_container_ids": ["stale-west-rg"],
-        }
-        mod._subnet_groups["same-subnet"] = {
-            "CacheSubnetGroupName": "same-subnet",
-            "ARN": f"arn:aws:elasticache:us-west-2:{account_id}:subnetgroup:same-subnet",
-        }
-        mod._param_groups["same-param"] = {
-            "CacheParameterGroupName": "same-param",
-            "CacheParameterGroupFamily": "redis7",
-            "ARN": f"arn:aws:elasticache:us-west-2:{account_id}:parametergroup:same-param",
-        }
-        mod._param_group_params["same-param"] = {"timeout": {"Value": "2"}}
-        mod._snapshots["same-snap"] = {
-            "SnapshotName": "same-snap",
-            "SnapshotStatus": "available",
-            "ARN": f"arn:aws:elasticache:us-west-2:{account_id}:snapshot:same-snap",
-        }
-        mod._users["same-user"] = {
-            "UserId": "same-user",
-            "ARN": f"arn:aws:elasticache:us-west-2:{account_id}:user:same-user",
-        }
-        mod._user_groups["same-group"] = {
-            "UserGroupId": "same-group",
-            "ARN": f"arn:aws:elasticache:us-west-2:{account_id}:usergroup:same-group",
-        }
-        mod._events["entries"] = [{"SourceIdentifier": "same-cache", "Message": "west"}]
-        mod._tags[f"arn:aws:elasticache:us-west-2:{account_id}:cluster:same-cache"] = [
-            {"Key": "region", "Value": "west"},
-        ]
 
-        _round_trip_dict(mod, "elasticache")
+        created = _body(mod._create_key({
+            "KeySpec": "SYMMETRIC_DEFAULT",
+            "KeyUsage": "ENCRYPT_DECRYPT",
+            "Description": "warm boot KMS key",
+        }))
+        key_id = created["KeyMetadata"]["KeyId"]
+        key_arn = created["KeyMetadata"]["Arn"]
+        mod._create_alias({"AliasName": alias_name, "TargetKeyId": key_id})
+        encrypted = _body(mod._encrypt({
+            "KeyId": key_id,
+            "Plaintext": b"warm-kms-region",
+        }))
+
+        _round_trip_dict(mod, "kms")
+
+        assert mod._resolve_key(key_id)["Arn"] == key_arn
+        assert mod._resolve_key(alias_name)["KeyId"] == key_id
+        decrypted = _body(mod._decrypt({
+            "CiphertextBlob": encrypted["CiphertextBlob"],
+            "KeyId": key_id,
+        }))
+        assert base64.b64decode(decrypted["Plaintext"]) == b"warm-kms-region"
 
         set_request_region("us-east-1")
-        assert mod._clusters["same-cache"]["CacheClusterArn"].startswith(
-            "arn:aws:elasticache:us-east-1:"
-        )
-        assert mod._clusters["same-cache"]["_docker_container_id"] is None
-        assert mod._replication_groups["same-rg"]["ARN"].startswith(
-            "arn:aws:elasticache:us-east-1:"
-        )
-        assert mod._replication_groups["same-rg"]["_docker_container_ids"] == []
-        assert mod._subnet_groups["same-subnet"]["ARN"].startswith(
-            "arn:aws:elasticache:us-east-1:"
-        )
-        assert mod._param_groups["same-param"]["ARN"].startswith(
-            "arn:aws:elasticache:us-east-1:"
-        )
-        assert mod._param_group_params["same-param"]["timeout"]["Value"] == "1"
-        assert mod._snapshots["same-snap"]["ARN"].startswith(
-            "arn:aws:elasticache:us-east-1:"
-        )
-        assert mod._users["same-user"]["ARN"].startswith(
-            "arn:aws:elasticache:us-east-1:"
-        )
-        assert mod._user_groups["same-group"]["ARN"].startswith(
-            "arn:aws:elasticache:us-east-1:"
-        )
-        assert mod._events["entries"] == [{"SourceIdentifier": "same-cache", "Message": "east"}]
+        assert mod._resolve_key(key_id) is None
+        assert mod._resolve_key(alias_name) is None
 
+        set_request_account_id("222222222222")
         set_request_region("us-west-2")
-        assert mod._clusters["same-cache"]["CacheClusterArn"].startswith(
-            "arn:aws:elasticache:us-west-2:"
-        )
-        assert mod._replication_groups["same-rg"]["ARN"].startswith(
-            "arn:aws:elasticache:us-west-2:"
-        )
-        assert mod._param_group_params["same-param"]["timeout"]["Value"] == "2"
-        assert mod._events["entries"] == [{"SourceIdentifier": "same-cache", "Message": "west"}]
-        assert mod._tags[
-            f"arn:aws:elasticache:us-east-1:{account_id}:cluster:same-cache"
-        ] == [{"Key": "region", "Value": "east"}]
-        assert mod._tags[
-            f"arn:aws:elasticache:us-west-2:{account_id}:cluster:same-cache"
-        ] == [{"Key": "region", "Value": "west"}]
+        assert mod._resolve_key(key_id) is None
+        assert mod._resolve_key(alias_name) is None
     finally:
         mod.reset()
         set_request_account_id(original_account)
