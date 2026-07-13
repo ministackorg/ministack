@@ -1195,7 +1195,16 @@ def _invoke_target(target, event, rule):
         elif spec.service == "states":
             _dispatch_to_stepfunctions(arn, event_payload)
         elif not _target_matches_request_scope(spec):
-            logger.warning("EventBridge: target %s is outside the current account/region scope", arn)
+            # AWS parity: EventBridge accepts cross-region SNS/SQS targets at PutTargets, then records a
+            # FailedInvocations delivery failure without cross-region delivery. MiniStack does not model
+            # that metric or DLQs, so the faithful observable outcome is to accept the target and drop
+            # the invocation here. Confirmed against AWS on 2026-07-13; see
+            # RESEARCH/MINISTACK_CROSSREGION_SNS_TARGET_POLICY.md.
+            logger.warning(
+                "EventBridge: target %s not delivered: cross-region invocation failed "
+                "(FailedInvocation-equivalent)",
+                arn,
+            )
         elif spec.service == "lambda":
             _dispatch_to_lambda(arn, event_payload)
         elif spec.service == "sqs":
@@ -1209,6 +1218,7 @@ def _invoke_target(target, event, rule):
 
 
 def _target_matches_request_scope(spec) -> bool:
+    # Cross-region targets are accepted at PutTargets but fail delivery here for AWS parity.
     return spec.account_id == get_account_id() and spec.region == get_region()
 
 
