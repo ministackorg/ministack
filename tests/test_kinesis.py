@@ -14,12 +14,12 @@ from botocore.exceptions import ClientError
 _LAMBDA_ROLE = "arn:aws:iam::000000000000:role/lambda-role"
 
 
-def _regional_kin(region_name):
+def _regional_kin(region_name, account_id="test"):
     endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
     return boto3.client(
         "kinesis",
         endpoint_url=endpoint,
-        aws_access_key_id="test",
+        aws_access_key_id=account_id,
         aws_secret_access_key="test",
         region_name=region_name,
         config=Config(region_name=region_name, retries={"mode": "standard"}),
@@ -127,6 +127,45 @@ def test_kinesis_stream_arn_rejects_foreign_region_without_name_fallback(kin):
 
     with pytest.raises(ClientError) as exc:
         kin.put_record(StreamARN=west_arn, Data=b"no-fallback", PartitionKey="pk")
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
+def test_kinesis_same_name_streams_are_region_scoped(kin):
+    west = _regional_kin("us-west-2")
+    stream_name = f"kin-region-scope-{_uuid_mod.uuid4().hex[:8]}"
+
+    kin.create_stream(StreamName=stream_name, ShardCount=1)
+    west.create_stream(StreamName=stream_name, ShardCount=1)
+
+    east_desc = kin.describe_stream(StreamName=stream_name)["StreamDescription"]
+    west_desc = west.describe_stream(StreamName=stream_name)["StreamDescription"]
+
+    assert east_desc["StreamARN"] == f"arn:aws:kinesis:us-east-1:000000000000:stream/{stream_name}"
+    assert west_desc["StreamARN"] == f"arn:aws:kinesis:us-west-2:000000000000:stream/{stream_name}"
+    assert stream_name in kin.list_streams()["StreamNames"]
+    assert stream_name in west.list_streams()["StreamNames"]
+
+
+def test_kinesis_stream_names_do_not_fallback_across_region_or_account(kin):
+    owner_account = "111111111111"
+    west_owner = _regional_kin("us-west-2", account_id=owner_account)
+    east_owner = _regional_kin("us-east-1", account_id=owner_account)
+    west_default = _regional_kin("us-west-2")
+    stream_name = f"kin-no-fallback-{_uuid_mod.uuid4().hex[:8]}"
+
+    west_owner.create_stream(StreamName=stream_name, ShardCount=1)
+    west_arn = west_owner.describe_stream(StreamName=stream_name)["StreamDescription"]["StreamARN"]
+
+    with pytest.raises(ClientError) as exc:
+        east_owner.describe_stream(StreamName=stream_name)
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+    with pytest.raises(ClientError) as exc:
+        west_default.describe_stream(StreamName=stream_name)
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+    with pytest.raises(ClientError) as exc:
+        kin.describe_stream(StreamARN=west_arn)
     assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
 
 
@@ -278,6 +317,86 @@ def test_kinesis_consumer_arns_reject_foreign_region_without_exact_key_fallback(
     assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
 
     assert west.describe_stream_consumer(ConsumerARN=consumer_arn)["ConsumerDescription"]["ConsumerName"] == consumer_name
+
+
+def test_kinesis_restore_legacy_account_scoped_state_uses_arn_region():
+    from ministack.core.responses import (
+        AccountScopedDict,
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+    from ministack.services import kinesis as _kin
+
+    original_account = get_account_id()
+    original_region = get_region()
+    account_id = "000000000000"
+    stream_name = "LegacyKinesisStream"
+    stream_arn = f"arn:aws:kinesis:us-west-2:{account_id}:stream/{stream_name}"
+    consumer_arn = f"{stream_arn}/consumer/legacy-consumer:1700000000"
+
+    legacy_streams = AccountScopedDict()
+    legacy_streams._data[(account_id, stream_name)] = {
+        "StreamName": stream_name,
+        "StreamARN": stream_arn,
+        "StreamStatus": "ACTIVE",
+        "StreamModeDetails": {"StreamMode": "PROVISIONED"},
+        "RetentionPeriodHours": 24,
+        "shards": {},
+        "tags": {},
+        "CreationTimestamp": 1700000000,
+        "EncryptionType": "NONE",
+    }
+    legacy_iterators = AccountScopedDict()
+    legacy_iterators._data[(account_id, "legacy-iterator-with-arn")] = {
+        "stream": stream_name,
+        "stream_arn": stream_arn,
+        "shard_id": "shardId-000000000000",
+        "position": 0,
+        "created_at": 1700000000,
+    }
+    legacy_iterators._data[(account_id, "legacy-iterator-with-stream-name")] = {
+        "stream": stream_name,
+        "shard_id": "shardId-000000000000",
+        "position": 0,
+        "created_at": 1700000000,
+    }
+    legacy_consumers = AccountScopedDict()
+    legacy_consumers._data[(account_id, consumer_arn)] = {
+        "ConsumerARN": consumer_arn,
+        "ConsumerName": "legacy-consumer",
+        "ConsumerStatus": "ACTIVE",
+        "ConsumerCreationTimestamp": 1700000000,
+        "StreamARN": stream_arn,
+    }
+
+    _kin.reset()
+    try:
+        set_request_account_id(account_id)
+        set_request_region("us-east-1")
+
+        _kin.restore_state({
+            "streams": legacy_streams,
+            "shard_iterators": legacy_iterators,
+            "consumers": legacy_consumers,
+        })
+
+        assert _kin._streams.get_scoped(account_id, "us-east-1", stream_name) is None
+        assert _kin._streams.get_scoped(account_id, "us-west-2", stream_name)["StreamARN"] == stream_arn
+        assert _kin._shard_iterators.get_scoped(
+            account_id, "us-west-2", "legacy-iterator-with-arn"
+        )["stream_arn"] == stream_arn
+        stream_name_iterator = _kin._shard_iterators.get_scoped(
+            account_id, "us-west-2", "legacy-iterator-with-stream-name"
+        )
+        assert stream_name_iterator["stream"] == stream_name
+        assert "stream_arn" not in stream_name_iterator
+        assert _kin._consumers.get_scoped(account_id, "us-west-2", consumer_arn)["ConsumerARN"] == consumer_arn
+    finally:
+        _kin.reset()
+        set_request_account_id(original_account)
+        set_request_region(original_region)
 
 
 def test_kinesis_at_timestamp_iterator(kin):

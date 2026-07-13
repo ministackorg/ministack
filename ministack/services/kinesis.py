@@ -23,6 +23,7 @@ import time
 
 from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.responses import (
+    AccountRegionScopedDict,
     AccountScopedDict,
     error_response_json,
     get_account_id,
@@ -39,9 +40,9 @@ ITERATOR_EXPIRY_SECONDS = 300
 
 from ministack.core.persistence import PERSIST_STATE, load_state
 
-_streams = AccountScopedDict()
-_shard_iterators = AccountScopedDict()
-_consumers = AccountScopedDict()
+_streams = AccountRegionScopedDict()
+_shard_iterators = AccountRegionScopedDict()
+_consumers = AccountRegionScopedDict()
 _sequence_counter = 0
 _sequence_lock = threading.Lock()
 
@@ -51,14 +52,117 @@ _sequence_lock = threading.Lock()
 def get_state():
     return {
         "streams": copy.deepcopy(_streams),
+        "shard_iterators": copy.deepcopy(_shard_iterators),
         "consumers": copy.deepcopy(_consumers),
     }
 
 
 def restore_state(data):
     if data:
-        _streams.update(data.get("streams", {}))
-        _consumers.update(data.get("consumers", {}))
+        _restore_stream_store(data.get("streams", {}))
+        _restore_shard_iterator_store(data.get("shard_iterators", {}))
+        _restore_consumer_store(data.get("consumers", {}))
+
+
+def _kinesis_arn_scope(value, default_account_id: str | None = None) -> tuple[str, str]:
+    try:
+        spec = parse_arn(value)
+    except ArnParseError:
+        return default_account_id or get_account_id(), get_region()
+    if spec.service != "kinesis":
+        return default_account_id or get_account_id(), get_region()
+    return spec.account_id or default_account_id or get_account_id(), spec.region or get_region()
+
+
+def _stream_record_scope(stream: dict, default_account_id: str | None = None) -> tuple[str, str]:
+    return _kinesis_arn_scope(stream.get("StreamARN", ""), default_account_id)
+
+
+def _consumer_record_scope(consumer: dict, default_account_id: str | None = None) -> tuple[str, str]:
+    return _kinesis_arn_scope(
+        consumer.get("ConsumerARN") or consumer.get("StreamARN", ""),
+        default_account_id,
+    )
+
+
+def _shard_iterator_record_scope(state: dict, default_account_id: str | None = None) -> tuple[str, str]:
+    stream_arn = state.get("stream_arn")
+    if stream_arn:
+        return _kinesis_arn_scope(stream_arn, default_account_id)
+
+    stream_name = state.get("stream")
+    if stream_name:
+        expected_account_id = default_account_id or get_account_id()
+        for (account_id, region, name), _stream in _streams.all_items():
+            if account_id == expected_account_id and name == stream_name:
+                return account_id, region
+    return default_account_id or get_account_id(), get_region()
+
+
+def _restore_stream_store(data) -> None:
+    if isinstance(data, AccountRegionScopedDict):
+        _streams.update(data)
+        return
+    if isinstance(data, AccountScopedDict):
+        for (account_id, name), stream in data._data.items():
+            restored_account_id, region = _stream_record_scope(stream, account_id)
+            _streams.set_scoped(restored_account_id, region, name, copy.deepcopy(stream))
+        return
+    if isinstance(data, dict):
+        for key, stream in data.items():
+            if isinstance(key, tuple) and len(key) == 3:
+                account_id, region, name = key
+            elif isinstance(key, tuple) and len(key) == 2:
+                account_id, name = key
+                account_id, region = _stream_record_scope(stream, account_id)
+            else:
+                name = key
+                account_id, region = _stream_record_scope(stream)
+            _streams.set_scoped(account_id, region, name, copy.deepcopy(stream))
+
+
+def _restore_shard_iterator_store(data) -> None:
+    if isinstance(data, AccountRegionScopedDict):
+        _shard_iterators.update(data)
+        return
+    if isinstance(data, AccountScopedDict):
+        for (account_id, token), state in data._data.items():
+            restored_account_id, region = _shard_iterator_record_scope(state, account_id)
+            _shard_iterators.set_scoped(restored_account_id, region, token, copy.deepcopy(state))
+        return
+    if isinstance(data, dict):
+        for key, state in data.items():
+            if isinstance(key, tuple) and len(key) == 3:
+                account_id, region, token = key
+            elif isinstance(key, tuple) and len(key) == 2:
+                account_id, token = key
+                account_id, region = _shard_iterator_record_scope(state, account_id)
+            else:
+                token = key
+                account_id, region = _shard_iterator_record_scope(state)
+            _shard_iterators.set_scoped(account_id, region, token, copy.deepcopy(state))
+
+
+def _restore_consumer_store(data) -> None:
+    if isinstance(data, AccountRegionScopedDict):
+        _consumers.update(data)
+        return
+    if isinstance(data, AccountScopedDict):
+        for (account_id, consumer_arn), consumer in data._data.items():
+            restored_account_id, region = _consumer_record_scope(consumer, account_id)
+            _consumers.set_scoped(restored_account_id, region, consumer_arn, copy.deepcopy(consumer))
+        return
+    if isinstance(data, dict):
+        for key, consumer in data.items():
+            if isinstance(key, tuple) and len(key) == 3:
+                account_id, region, consumer_arn = key
+            elif isinstance(key, tuple) and len(key) == 2:
+                account_id, consumer_arn = key
+                account_id, region = _consumer_record_scope(consumer, account_id)
+            else:
+                consumer_arn = key
+                account_id, region = _consumer_record_scope(consumer)
+            _consumers.set_scoped(account_id, region, consumer_arn, copy.deepcopy(consumer))
 
 
 try:
@@ -659,6 +763,7 @@ def _get_shard_iterator(data):
     token = new_uuid()
     _shard_iterators[token] = {
         "stream": resolved_name,
+        "stream_arn": stream["StreamARN"],
         "shard_id": shard_id,
         "position": position,
         "created_at": time.time(),
@@ -722,6 +827,7 @@ def _get_records(data):
     next_token = new_uuid()
     _shard_iterators[next_token] = {
         "stream": state["stream"],
+        "stream_arn": state.get("stream_arn") or stream.get("StreamARN"),
         "shard_id": state["shard_id"],
         "position": new_pos,
         "created_at": time.time(),
