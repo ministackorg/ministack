@@ -2368,6 +2368,54 @@ def test_apigwv2_path_based_websocket(apigw, lam):
         ws.close()
 
 
+def test_ws_connect_jwt_authorizer_rejects_missing_token(apigw, lam, cognito_idp):
+    """$connect with a JWT authorizer rejects connections that lack a valid token (#1074)."""
+    from ministack.services import cognito as _cognito
+
+    pool_id = cognito_idp.create_user_pool(PoolName=f"ws-jwt-{_uuid_mod.uuid4().hex[:8]}")["UserPool"]["Id"]
+    issuer = f"https://cognito-idp.us-east-1.amazonaws.com/{pool_id}"
+    api = apigw.create_api(Name=f"ws-jwt-deny-{_uuid_mod.uuid4().hex[:8]}", ProtocolType="WEBSOCKET")
+    api_id = api["ApiId"]
+
+    fn_name = f"ws-jwt-con-{_uuid_mod.uuid4().hex[:6]}"
+    arn = _make_fn(lam, fn_name, _ECHO_CODE)
+    integ = apigw.create_integration(
+        ApiId=api_id, IntegrationType="AWS_PROXY",
+        IntegrationUri=arn, IntegrationMethod="POST",
+    )
+    auth_id = apigw.create_authorizer(
+        ApiId=api_id, AuthorizerType="JWT", Name="ws-jwt",
+        IdentitySource=["$request.querystring.token"],
+        JwtConfiguration={"Audience": ["ws-client"], "Issuer": issuer},
+    )["AuthorizerId"]
+    apigw.create_route(
+        ApiId=api_id, RouteKey="$connect",
+        Target=f"integrations/{integ['IntegrationId']}",
+        AuthorizationType="JWT", AuthorizerId=auth_id,
+    )
+    apigw.create_route(
+        ApiId=api_id, RouteKey="$default",
+        Target=f"integrations/{integ['IntegrationId']}",
+    )
+    apigw.create_stage(ApiId=api_id, StageName="prod")
+
+    # Without a token → connection must be rejected (close code 1008).
+    with pytest.raises(Exception):
+        _WSClient("localhost", _EXECUTE_PORT, "/prod",
+                  headers={"Host": f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}"})
+
+    # With a valid token → connection must be accepted.
+    now = int(time.time())
+    token = _make_signed_token({
+        "sub": "ws-user", "iss": issuer, "aud": "ws-client",
+        "iat": now, "nbf": now - 1, "exp": now + 3600,
+    })
+    ws = _WSClient("localhost", _EXECUTE_PORT, f"/prod?token={token}",
+                   headers={"Host": f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}"})
+    ws.close()
+    cognito_idp.delete_user_pool(UserPoolId=pool_id)
+
+
 def test_apigwv1_path_based_restapi_legacy_user_request(apigw_v1, lam):
     """REST API v1 reachable via /restapis/{apiId}/{stage}/_user_request_/{path} (LocalStack legacy)."""
     import urllib.request

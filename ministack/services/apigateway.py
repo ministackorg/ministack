@@ -1943,6 +1943,14 @@ async def _invoke_ws_lambda(api_id: str, account_id: str, region: str, route: di
         else:
             event["queryStringParameters"] = None
             event["multiValueQueryStringParameters"] = None
+        authorizer_claims = kwargs.get("authorizer_claims")
+        if authorizer_claims is not None:
+            request_context["authorizer"] = {
+                "jwt": {
+                    "claims": authorizer_claims,
+                    "scopes": kwargs.get("authorizer_scopes") or [],
+                }
+            }
 
     runtime = func_config.get("Runtime", "")
     code_zip = func_data.get("code_zip")
@@ -2043,10 +2051,31 @@ async def handle_websocket(scope, receive, send, api_id: str, path_override: str
         # $connect hook
         connect_route = _match_ws_route(api_id, "$connect")
         if connect_route is not None:
+            # JWT authorizer validation (mirrors the HTTP API path).
+            auth_type = (connect_route.get("authorizationType") or "NONE").upper()
+            ws_authorizer_claims = None
+            ws_authorizer_scopes = []
+            if auth_type == "JWT":
+                authorizer_id = connect_route.get("authorizerId")
+                authorizer = _authorizers.get(api_id, {}).get(authorizer_id) if authorizer_id else None
+                if not authorizer:
+                    await send({"type": "websocket.close", "code": 1008})
+                    return
+                claims, scopes, auth_error = await _validate_jwt_authorizer(
+                    connect_route, authorizer, headers, query_params or {},
+                )
+                if auth_error:
+                    await send({"type": "websocket.close", "code": 1008})
+                    return
+                ws_authorizer_claims = claims or {}
+                ws_authorizer_scopes = scopes or []
+
             resp = await _invoke_ws_lambda(
                 api_id, account_id, owner_region, connect_route, stage, connection_id,
                 "CONNECT", new_uuid(), "", source_ip, headers,
                 query_params=query_params,
+                authorizer_claims=ws_authorizer_claims,
+                authorizer_scopes=ws_authorizer_scopes,
             )
             status = int((resp or {}).get("statusCode", 200))
             if status < 200 or status >= 300:
