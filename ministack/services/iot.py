@@ -75,6 +75,7 @@ _thing_types: AccountScopedDict = AccountScopedDict()
 _thing_groups: AccountScopedDict = AccountScopedDict()
 _certificates: AccountScopedDict = AccountScopedDict()  # certificateId -> Certificate dict
 _policies: AccountScopedDict = AccountScopedDict()  # policyName -> Policy dict
+_topic_rules: AccountScopedDict = AccountScopedDict()  # ruleName -> TopicRule dict
 
 # Local CA state — lazily generated on first use, persisted across restarts.
 import threading
@@ -155,6 +156,7 @@ def get_state() -> dict:
         "thing_groups": copy.deepcopy(_thing_groups),
         "certificates": copy.deepcopy(_certificates),
         "policies": copy.deepcopy(_policies),
+        "topic_rules": copy.deepcopy(_topic_rules),
         "ca": {"ca_cert_pem": _ca_cert_pem, "ca_key_pem": _ca_key_pem}
         if _ca_cert_pem and _ca_key_pem
         else {},
@@ -171,6 +173,7 @@ def restore_state(data: dict | None) -> None:
     _thing_groups.update(data.get("thing_groups", {}))
     _certificates.update(data.get("certificates", {}))
     _policies.update(data.get("policies", {}))
+    _topic_rules.update(data.get("topic_rules", {}))
     ca_data = data.get("ca")
     if ca_data:
         cert = ca_data.get("ca_cert_pem")
@@ -190,6 +193,7 @@ def reset() -> None:
     _thing_groups.clear()
     _certificates.clear()
     _policies.clear()
+    _topic_rules.clear()
     with _CA_LOCK:
         _ca_cert_pem = None
         _ca_key_pem = None
@@ -253,6 +257,14 @@ def _cert_arn(certificate_id: str) -> str:
 
 def _policy_arn(name: str) -> str:
     return f"arn:aws:iot:{get_region()}:{get_account_id()}:policy/{name}"
+
+
+def _topic_rule_arn(name: str) -> str:
+    return f"arn:aws:iot:{get_region()}:{get_account_id()}:rule/{name}"
+
+
+# Rule names are stricter than other IoT resources: [a-zA-Z0-9_] only.
+_RULE_NAME_RE = re.compile(r"^[a-zA-Z0-9_]{1,128}$")
 
 
 def _validate_name(name: str | None, field: str) -> tuple | None:
@@ -362,6 +374,12 @@ async def handle_request(
         return _list_attached_policies(path, qp)
     if path.startswith("/policies/"):
         return _handle_policy(method, path, body, qp)
+
+    # Topic rules
+    if path == "/rules" and method == "GET":
+        return _list_topic_rules(qp)
+    if path.startswith("/rules/"):
+        return _handle_topic_rule(method, path, body)
 
     return error_response_json(
         "InvalidRequestException", f"Unsupported IoT path: {method} {path}", 400
@@ -1329,6 +1347,101 @@ def _list_attached_policies(path: str, qp: dict) -> tuple:
         if target in p.get("targets", []):
             out.append({"policyName": p["policyName"], "policyArn": p["policyArn"]})
     return json_response({"policies": out})
+
+
+# ---------------------------------------------------------------------------
+# Topic rules
+# ---------------------------------------------------------------------------
+
+
+def _rule_topic_filter(sql: str) -> str:
+    """Extract the topic filter from a rule SQL ``FROM '<topic>'`` clause."""
+    m = re.search(r"\bFROM\s+'([^']*)'", sql or "", re.IGNORECASE)
+    return m.group(1) if m else ""
+
+
+def put_topic_rule(name: str, payload: dict, *, created_at: float | None = None) -> dict:
+    """Store a topic rule from an API-shape (camelCase) ``TopicRulePayload``."""
+    rule = {
+        "ruleName": name,
+        "sql": payload.get("sql", ""),
+        "actions": payload.get("actions", []) or [],
+        "ruleDisabled": bool(payload.get("ruleDisabled", False)),
+        "awsIotSqlVersion": payload.get("awsIotSqlVersion", "2016-03-23"),
+        "description": payload.get("description", ""),
+        "errorAction": payload.get("errorAction"),
+        "createdAt": created_at if created_at is not None else _now_epoch(),
+    }
+    _topic_rules[name] = rule
+    return rule
+
+
+def delete_topic_rule(name: str) -> None:
+    _topic_rules.pop(name, None)
+
+
+def _handle_topic_rule(method: str, path: str, body: bytes) -> tuple:
+    name = path[len("/rules/"):]
+    if method == "POST":
+        return _create_topic_rule(name, _parse_body(body))
+    if method == "GET":
+        return _get_topic_rule(name)
+    if method == "PATCH":
+        return _replace_topic_rule(name, _parse_body(body))
+    if method == "DELETE":
+        return _delete_topic_rule(name)
+    return error_response_json(
+        "InvalidRequestException", f"Unsupported IoT path: {method} {path}", 400
+    )
+
+
+def _create_topic_rule(name: str, payload: dict) -> tuple:
+    if not _RULE_NAME_RE.match(name or ""):
+        return error_response_json(
+            "InvalidRequestException",
+            "Invalid ruleName: must match [a-zA-Z0-9_]{1,128}",
+            400,
+        )
+    if name in _topic_rules:
+        return error_response_json(
+            "ResourceAlreadyExistsException", f"Rule {name!r} already exists", 409
+        )
+    if not payload.get("sql"):
+        return error_response_json("SqlParseException", "sql is required", 400)
+    put_topic_rule(name, payload)
+    return json_response({})
+
+
+def _replace_topic_rule(name: str, payload: dict) -> tuple:
+    if name not in _topic_rules:
+        return _error_not_found("Rule", name)
+    put_topic_rule(name, payload)
+    return json_response({})
+
+
+def _get_topic_rule(name: str) -> tuple:
+    rule = _topic_rules.get(name)
+    if rule is None:
+        return _error_not_found("Rule", name)
+    return json_response({"ruleArn": _topic_rule_arn(name), "rule": rule})
+
+
+def _delete_topic_rule(name: str) -> tuple:
+    _topic_rules.pop(name, None)
+    return json_response({})
+
+
+def _list_topic_rules(qp: dict) -> tuple:
+    rules = []
+    for r in _topic_rules.values():
+        rules.append({
+            "ruleName": r["ruleName"],
+            "ruleArn": _topic_rule_arn(r["ruleName"]),
+            "topicPattern": _rule_topic_filter(r["sql"]),
+            "createdAt": r["createdAt"],
+            "ruleDisabled": r["ruleDisabled"],
+        })
+    return json_response({"rules": rules})
 
 
 # ---------------------------------------------------------------------------

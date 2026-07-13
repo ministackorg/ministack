@@ -33,6 +33,7 @@ import ministack.services.ecr as _ecr
 import ministack.services.ecs as _ecs
 import ministack.services.eventbridge as _eb
 import ministack.services.iam as _iam
+import ministack.services.iot as _iot
 import ministack.services.kinesis as _kinesis
 import ministack.services.kms as _kms
 import ministack.services.lambda_svc as _lambda_svc
@@ -1085,6 +1086,34 @@ def _eb_rule_delete(physical_id, props):
     key = _eb._rule_key(physical_id, bus)
     _eb._rules.pop(key, None)
     _eb._targets.pop(key, None)
+
+
+# --- IoT Topic Rule (AWS::IoT::TopicRule) ---
+
+
+def _pascal_to_camel(obj):
+    """Recursively lower-case the first letter of every dict key.
+
+    CloudFormation PascalCases the IoT API's camelCase TopicRulePayload fields
+    (Sql, Actions, Lambda, FunctionArn, ...); this reverses that so the stored
+    rule matches the control-plane / routing shape.
+    """
+    if isinstance(obj, dict):
+        return {(k[:1].lower() + k[1:] if k else k): _pascal_to_camel(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_pascal_to_camel(v) for v in obj]
+    return obj
+
+
+def _iot_topic_rule_create(logical_id, props, stack_name):
+    name = props.get("RuleName") or _physical_name(stack_name, logical_id).replace("-", "_")
+    payload = _pascal_to_camel(props.get("TopicRulePayload", {}))
+    _iot.put_topic_rule(name, payload)
+    return name, {"Arn": _iot._topic_rule_arn(name)}
+
+
+def _iot_topic_rule_delete(physical_id, props):
+    _iot.delete_topic_rule(physical_id)
 
 
 # --- EventBridge Scheduler (AWS::Scheduler::Schedule) ---
@@ -4352,6 +4381,7 @@ _RESOURCE_HANDLERS = {
     "AWS::CloudWatch::Alarm": {"create": _cw_metric_alarm_create, "delete": _cw_metric_alarm_delete},
     "AWS::RDS::DBCluster": {"create": _rds_db_cluster_create, "delete": _rds_db_cluster_delete},
     "AWS::RDS::DBInstance": {"create": _rds_db_instance_create, "delete": _rds_db_instance_delete},
+    "AWS::IoT::TopicRule": {"create": _iot_topic_rule_create, "delete": _iot_topic_rule_delete},
     # EventBridge Scheduler
     "AWS::Scheduler::Schedule": {"create": _scheduler_schedule_create, "delete": _scheduler_schedule_delete},
     "AWS::Scheduler::ScheduleGroup": {"create": _scheduler_group_create, "delete": _scheduler_group_delete},

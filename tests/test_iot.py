@@ -6,6 +6,7 @@ iot-data Publish) is covered separately in ``test_iot_data.py``.
 """
 
 import json
+import time
 import uuid
 
 import pytest
@@ -405,6 +406,139 @@ def test_iot_attach_detach_policy(iot_client):
 
     iot_client.delete_policy(policyName=name)
     iot_client.delete_certificate(certificateId=cert["certificateId"])
+
+
+# ---------------------------------------------------------------------------
+# Topic rules
+# ---------------------------------------------------------------------------
+
+
+def _rule_name(prefix: str = "rule") -> str:
+    return f"{prefix}_{uuid.uuid4().hex[:8]}"
+
+
+def test_iot_topic_rule_lifecycle(iot_client):
+    name = _rule_name()
+    payload = {
+        "sql": "SELECT * FROM 'devices/+/data'",
+        "ruleDisabled": False,
+        "awsIotSqlVersion": "2016-03-23",
+        "actions": [
+            {"lambda": {"functionArn": "arn:aws:lambda:us-east-1:000000000000:function:foo"}}
+        ],
+    }
+    iot_client.create_topic_rule(ruleName=name, topicRulePayload=payload)
+
+    got = iot_client.get_topic_rule(ruleName=name)
+    assert got["ruleArn"] == f"arn:aws:iot:us-east-1:000000000000:rule/{name}"
+    assert got["rule"]["sql"] == payload["sql"]
+    assert got["rule"]["actions"] == payload["actions"]
+    assert got["rule"]["ruleDisabled"] is False
+
+    listing = iot_client.list_topic_rules()["rules"]
+    entry = next(r for r in listing if r["ruleName"] == name)
+    assert entry["topicPattern"] == "devices/+/data"
+
+    iot_client.delete_topic_rule(ruleName=name)
+    with pytest.raises(ClientError) as ei:
+        iot_client.get_topic_rule(ruleName=name)
+    assert ei.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
+def test_iot_topic_rule_duplicate_rejected(iot_client):
+    name = _rule_name()
+    payload = {"sql": "SELECT * FROM 'a'", "actions": []}
+    iot_client.create_topic_rule(ruleName=name, topicRulePayload=payload)
+    with pytest.raises(ClientError) as ei:
+        iot_client.create_topic_rule(ruleName=name, topicRulePayload=payload)
+    assert ei.value.response["Error"]["Code"] == "ResourceAlreadyExistsException"
+    iot_client.delete_topic_rule(ruleName=name)
+
+
+def test_iot_replace_topic_rule(iot_client):
+    name = _rule_name()
+    iot_client.create_topic_rule(
+        ruleName=name, topicRulePayload={"sql": "SELECT * FROM 'a'", "actions": []}
+    )
+    iot_client.replace_topic_rule(
+        ruleName=name, topicRulePayload={"sql": "SELECT * FROM 'b'", "actions": []}
+    )
+    assert iot_client.get_topic_rule(ruleName=name)["rule"]["sql"] == "SELECT * FROM 'b'"
+    iot_client.delete_topic_rule(ruleName=name)
+
+
+def test_iot_replace_missing_topic_rule_404(iot_client):
+    with pytest.raises(ClientError) as ei:
+        iot_client.replace_topic_rule(
+            ruleName=_rule_name(), topicRulePayload={"sql": "SELECT * FROM 'a'", "actions": []}
+        )
+    assert ei.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
+def test_iot_topic_rule_cfn_deploy(cfn, iot_client):
+    stack = "iot-topicrule-" + uuid.uuid4().hex[:8]
+    rule = _rule_name("ingest")
+    template = {
+        "Resources": {
+            "IngestRule": {
+                "Type": "AWS::IoT::TopicRule",
+                "Properties": {
+                    "RuleName": rule,
+                    "TopicRulePayload": {
+                        "Sql": "SELECT * FROM 'sensors/+/telemetry'",
+                        "RuleDisabled": False,
+                        "AwsIotSqlVersion": "2016-03-23",
+                        "Actions": [
+                            {"Lambda": {"FunctionArn": "arn:aws:lambda:us-east-1:000000000000:function:ingest"}}
+                        ],
+                    },
+                },
+            }
+        },
+        "Outputs": {
+            "RuleArn": {"Value": {"Fn::GetAtt": ["IngestRule", "Arn"]}},
+            "RuleRef": {"Value": {"Ref": "IngestRule"}},
+        },
+    }
+    cfn.create_stack(StackName=stack, TemplateBody=json.dumps(template))
+    st = _wait_stack_iot(cfn, stack)
+    assert st["StackStatus"] == "CREATE_COMPLETE"
+    outputs = {o["OutputKey"]: o["OutputValue"] for o in st["Outputs"]}
+    assert outputs["RuleRef"] == rule
+    assert outputs["RuleArn"] == f"arn:aws:iot:us-east-1:000000000000:rule/{rule}"
+
+    # PascalCase TopicRulePayload is normalized to the API camelCase shape.
+    stored = iot_client.get_topic_rule(ruleName=rule)["rule"]
+    assert stored["actions"] == [
+        {"lambda": {"functionArn": "arn:aws:lambda:us-east-1:000000000000:function:ingest"}}
+    ]
+
+    cfn.delete_stack(StackName=stack)
+    _wait_stack_gone_iot(cfn, stack)
+    with pytest.raises(ClientError):
+        iot_client.get_topic_rule(ruleName=rule)
+
+
+def _wait_stack_iot(cfn, name, timeout=30):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        st = cfn.describe_stacks(StackName=name)["Stacks"][0]
+        if not st["StackStatus"].endswith("_IN_PROGRESS"):
+            return st
+        time.sleep(0.5)
+    raise TimeoutError(f"Stack {name} did not settle")
+
+
+def _wait_stack_gone_iot(cfn, name, timeout=30):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            st = cfn.describe_stacks(StackName=name)["Stacks"][0]
+        except ClientError:
+            return
+        if st["StackStatus"] == "DELETE_COMPLETE":
+            return
+        time.sleep(0.5)
 
 
 # ---------------------------------------------------------------------------
