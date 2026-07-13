@@ -118,6 +118,35 @@ def test_kms_key_arn_resolution_rejects_forged_request_region(kms_client):
     assert exc.value.response["Error"]["Code"] == "NotFoundException"
 
 
+def test_kms_keys_are_region_scoped(kms_client):
+    created = kms_client.create_key(KeySpec="SYMMETRIC_DEFAULT")
+    key_id = created["KeyMetadata"]["KeyId"]
+    west_kms = _regional_kms("us-west-2")
+
+    west_key_ids = {k["KeyId"] for k in west_kms.list_keys()["Keys"]}
+    assert key_id not in west_key_ids
+
+    with pytest.raises(ClientError) as exc:
+        west_kms.describe_key(KeyId=key_id)
+    assert exc.value.response["Error"]["Code"] == "NotFoundException"
+
+    assert kms_client.describe_key(KeyId=key_id)["KeyMetadata"]["KeyId"] == key_id
+
+
+def test_kms_cross_region_key_id_resolves_notfound(kms_client):
+    created = kms_client.create_key(KeySpec="SYMMETRIC_DEFAULT")
+    key_id = created["KeyMetadata"]["KeyId"]
+    west_kms = _regional_kms("us-west-2")
+
+    for call in (
+        lambda: west_kms.describe_key(KeyId=key_id),
+        lambda: west_kms.encrypt(KeyId=key_id, Plaintext=b"cross-region"),
+    ):
+        with pytest.raises(ClientError) as exc:
+            call()
+        assert exc.value.response["Error"]["Code"] == "NotFoundException"
+
+
 def test_kms_describe_nonexistent_key(kms_client):
     with pytest.raises(ClientError) as exc_info:
         kms_client.describe_key(KeyId="nonexistent-key-id")
@@ -388,6 +417,145 @@ def test_kms_alias_arn_resolution_rejects_forged_request_region(kms_client):
             KeyId="arn:aws:kms:us-west-2:000000000000:alias/forged-region-alias",
         )
     assert exc.value.response["Error"]["Code"] == "NotFoundException"
+
+
+def test_kms_aliases_are_region_scoped(kms_client):
+    alias_name = f"alias/region-scope-{_uuid_mod.uuid4().hex[:8]}"
+    east_key_id = kms_client.create_key(KeySpec="SYMMETRIC_DEFAULT")["KeyMetadata"]["KeyId"]
+    kms_client.create_alias(AliasName=alias_name, TargetKeyId=east_key_id)
+
+    west_kms = _regional_kms("us-west-2")
+    west_key_id = west_kms.create_key(KeySpec="SYMMETRIC_DEFAULT")["KeyMetadata"]["KeyId"]
+    west_kms.create_alias(AliasName=alias_name, TargetKeyId=west_key_id)
+
+    east_aliases = {
+        alias["AliasArn"]: alias["TargetKeyId"]
+        for alias in kms_client.list_aliases()["Aliases"]
+        if alias["AliasName"] == alias_name
+    }
+    west_aliases = {
+        alias["AliasArn"]: alias["TargetKeyId"]
+        for alias in west_kms.list_aliases()["Aliases"]
+        if alias["AliasName"] == alias_name
+    }
+
+    assert east_aliases == {
+        f"arn:aws:kms:us-east-1:000000000000:{alias_name}": east_key_id,
+    }
+    assert west_aliases == {
+        f"arn:aws:kms:us-west-2:000000000000:{alias_name}": west_key_id,
+    }
+    assert kms_client.describe_key(KeyId=alias_name)["KeyMetadata"]["KeyId"] == east_key_id
+    assert west_kms.describe_key(KeyId=alias_name)["KeyMetadata"]["KeyId"] == west_key_id
+
+
+def test_kms_restore_legacy_account_scoped_state_adopts_key_arn_region():
+    from ministack.core.responses import (
+        AccountScopedDict,
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+    from ministack.services import kms as _kms
+
+    original_account = get_account_id()
+    original_region = get_region()
+    account_id = "000000000000"
+    key_id = str(_uuid_mod.uuid4())
+    alias_name = "alias/legacy-west"
+    alias_arn = f"arn:aws:kms:us-west-2:{account_id}:{alias_name}"
+    key_arn = f"arn:aws:kms:us-west-2:{account_id}:key/{key_id}"
+
+    legacy_keys = AccountScopedDict()
+    legacy_keys._data[(account_id, key_id)] = {
+        "KeyId": key_id,
+        "Arn": key_arn,
+        "KeyState": "Enabled",
+        "Enabled": True,
+        "KeySpec": "SYMMETRIC_DEFAULT",
+        "KeyUsage": "ENCRYPT_DECRYPT",
+        "Description": "legacy west key",
+        "CreationDate": 1700000000,
+        "Origin": "AWS_KMS",
+        "EncryptionAlgorithms": ["SYMMETRIC_DEFAULT"],
+        "SigningAlgorithms": [],
+        "_symmetric_key_b64": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+    }
+    legacy_aliases = AccountScopedDict()
+    legacy_aliases._data[(account_id, alias_arn)] = key_id
+
+    _kms.reset()
+    try:
+        set_request_account_id(account_id)
+        set_request_region("us-east-1")
+        _kms.restore_state({"keys": legacy_keys, "aliases": legacy_aliases})
+
+        assert _kms._keys.get_scoped(account_id, "us-east-1", key_id) is None
+        assert _kms._keys.get_scoped(account_id, "us-west-2", key_id)["Arn"] == key_arn
+        assert _kms._aliases.get_scoped(account_id, "us-west-2", alias_arn) == key_id
+
+        assert _kms._resolve_key(alias_name) is None
+        set_request_region("us-west-2")
+        assert _kms._resolve_key(alias_name)["KeyId"] == key_id
+    finally:
+        _kms.reset()
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
+def test_kms_restore_legacy_bare_alias_name_adopts_target_key_region():
+    from ministack.core.responses import (
+        AccountScopedDict,
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+    from ministack.services import kms as _kms
+
+    original_account = get_account_id()
+    original_region = get_region()
+    account_id = "000000000000"
+    key_id = str(_uuid_mod.uuid4())
+    alias_name = "alias/legacy-bare-west"
+    alias_arn = f"arn:aws:kms:us-west-2:{account_id}:{alias_name}"
+    key_arn = f"arn:aws:kms:us-west-2:{account_id}:key/{key_id}"
+
+    legacy_keys = AccountScopedDict()
+    legacy_keys._data[(account_id, key_id)] = {
+        "KeyId": key_id,
+        "Arn": key_arn,
+        "KeyState": "Enabled",
+        "Enabled": True,
+        "KeySpec": "SYMMETRIC_DEFAULT",
+        "KeyUsage": "ENCRYPT_DECRYPT",
+        "Description": "legacy west key",
+        "CreationDate": 1700000000,
+        "Origin": "AWS_KMS",
+        "EncryptionAlgorithms": ["SYMMETRIC_DEFAULT"],
+        "SigningAlgorithms": [],
+        "_symmetric_key_b64": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+    }
+    legacy_aliases = AccountScopedDict()
+    legacy_aliases._data[(account_id, alias_name)] = key_id
+
+    _kms.reset()
+    try:
+        set_request_account_id(account_id)
+        set_request_region("us-east-1")
+        _kms.restore_state({"keys": legacy_keys, "aliases": legacy_aliases})
+
+        assert _kms._aliases.get_scoped(account_id, "us-east-1", alias_arn) is None
+        assert _kms._aliases.get_scoped(account_id, "us-west-2", alias_arn) == key_id
+        assert _kms._resolve_key(alias_name) is None
+
+        set_request_region("us-west-2")
+        assert _kms._resolve_key(alias_name)["KeyId"] == key_id
+    finally:
+        _kms.reset()
+        set_request_account_id(original_account)
+        set_request_region(original_region)
 
 
 def test_kms_cloudformation_alias_resolves_by_name_and_arn(cfn, kms_client):
