@@ -232,7 +232,11 @@ def _get_object_data(bucket_name: str, key: str, version_id: str | None = None) 
     if version_id:
         for v in _object_versions.get((bucket_name, key), []):
             if v["version_id"] == version_id:
-                return v.get("data")
+                data = v.get("data")
+                if data is not None:
+                    return data
+                obj = bucket["objects"].get(key)
+                return _read_body(bucket_name, key, obj) if obj else None
         return None
     obj = bucket["objects"].get(key)
     if obj is None:
@@ -2539,7 +2543,8 @@ def _get_object(bucket_name: str, key: str, headers: dict, query_params: dict = 
                     if stored:
                         resp_headers["x-amz-checksum-type"] = "FULL_OBJECT"
                 resp_headers.update(_object_tagging_count_header(bucket_name, key, version_id))
-                return 200, resp_headers, v["data"]
+                body = v["data"] if v["data"] is not None else _read_body(bucket_name, key, bucket["objects"].get(key, {}))
+                return 200, resp_headers, body
         return _error("NoSuchVersion", "The specified version does not exist.", 404, f"/{bucket_name}/{key}")
 
     if key not in bucket["objects"]:
@@ -4368,6 +4373,20 @@ def _load_persisted_bucket(account_id, bucket_name, bucket_path):
             }
             if meta.get("version_id"):
                 bucket["objects"][key]["version_id"] = meta["version_id"]
+                vkey = (bucket_name, key)
+                scoped_vkey = (account_id, vkey)
+                if scoped_vkey not in _object_versions._data:
+                    _object_versions._data[scoped_vkey] = []
+                _object_versions._data[scoped_vkey].append({
+                    "version_id": meta["version_id"],
+                    "last_modified": meta.get("last_modified") or now_iso(),
+                    "etag": etag,
+                    "size": size,
+                    "is_latest": True,
+                    "data": None,
+                    "storage_class": meta.get("storage_class", "STANDARD"),
+                    "checksums": meta.get("checksums", {}),
+                })
 
 
 _load_persisted_data()
