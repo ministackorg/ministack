@@ -4500,6 +4500,14 @@ _QUERY_PARAM_NAME_OVERRIDES = {
     },
 }
 
+# Lambda's REST/JSON wire format is mixed-case, so most SFN SDK-convention keys
+# already match the wire form (VpcConfig, TracingConfig, S3Bucket, ...). The
+# divergent all-caps acronym field below would otherwise be silently ignored by
+# the Lambda handler, which reads the wire name.
+_LAMBDA_SFN_TO_WIRE_KEYS = {
+    "KmsKeyArn": "KMSKeyArn",
+}
+
 
 def _sfn_key_to_api_name(name):
     """Convert SFN SDK key name to AWS wire-format name.
@@ -4529,6 +4537,17 @@ def _convert_params_to_api_names(data, name_overrides=None):
     if isinstance(data, list):
         return [_convert_params_to_api_names(item, name_overrides) for item in data]
     return data
+
+
+def _normalize_lambda_rest_input(input_data):
+    """Rename top-level Lambda REST keys whose SFN and wire names differ."""
+    if not isinstance(input_data, dict):
+        return input_data
+    out = dict(input_data)
+    for sfn_key, wire_key in _LAMBDA_SFN_TO_WIRE_KEYS.items():
+        if sfn_key in out and wire_key not in out:
+            out[wire_key] = out.pop(sfn_key)
+    return out
 
 
 def _api_name_to_sfn_key(name):
@@ -4826,8 +4845,10 @@ def _dispatch_aws_sdk_lambda_rest(service_info, service_name, action, input_data
         )
 
     pascal_action = action[0].upper() + action[1:] if action else action
-    input_data = input_data or {}
+    input_data = _normalize_lambda_rest_input(input_data or {})
     query_params = {}
+    method = "GET"
+    body = b""
 
     if pascal_action == "GetAlias":
         function_name = input_data.get("FunctionName", "")
@@ -4842,11 +4863,52 @@ def _dispatch_aws_sdk_lambda_rest(service_info, service_name, action, input_data
         qualifier = input_data.get("Qualifier")
         if qualifier is not None:
             query_params["Qualifier"] = str(qualifier)
+    elif pascal_action == "CreateFunction":
+        method = "POST"
+        path = "/2015-03-31/functions"
+        body = json.dumps(input_data).encode("utf-8")
+    elif pascal_action == "UpdateFunctionConfiguration":
+        method = "PUT"
+        function_name = input_data.get("FunctionName", "")
+        path = f"/2015-03-31/functions/{quote(str(function_name), safe=':')}/configuration"
+        body = json.dumps(
+            {key: value for key, value in input_data.items() if key != "FunctionName"}
+        ).encode("utf-8")
+    elif pascal_action == "UpdateFunctionCode":
+        method = "PUT"
+        function_name = input_data.get("FunctionName", "")
+        path = f"/2015-03-31/functions/{quote(str(function_name), safe=':')}/code"
+        body = json.dumps(
+            {key: value for key, value in input_data.items() if key != "FunctionName"}
+        ).encode("utf-8")
+    elif pascal_action == "CreateAlias":
+        method = "POST"
+        function_name = input_data.get("FunctionName", "")
+        path = f"/2015-03-31/functions/{quote(str(function_name), safe=':')}/aliases"
+        body = json.dumps(
+            {key: value for key, value in input_data.items() if key != "FunctionName"}
+        ).encode("utf-8")
+    elif pascal_action == "UpdateAlias":
+        method = "PUT"
+        function_name = input_data.get("FunctionName", "")
+        alias_name = input_data.get("Name", "")
+        path = (
+            "/2015-03-31/functions/"
+            f"{quote(str(function_name), safe=':')}/aliases/{quote(str(alias_name), safe='')}"
+        )
+        body = json.dumps(
+            {
+                key: value
+                for key, value in input_data.items()
+                if key not in ("FunctionName", "Name")
+            }
+        ).encode("utf-8")
     else:
         raise _ExecutionError(
             "States.Runtime",
             f"aws-sdk:{service_name}:{action} is not yet implemented in MiniStack "
-            "(lambda REST dispatcher covers getAlias and getFunctionConfiguration)",
+            "(lambda REST dispatcher covers createFunction, updateFunctionConfiguration, "
+            "updateFunctionCode, createAlias, updateAlias, getAlias, and getFunctionConfiguration)",
         )
 
     # Embed the current SFN execution's account ID as the access-key segment
@@ -4869,10 +4931,10 @@ def _dispatch_aws_sdk_lambda_rest(service_info, service_name, action, input_data
     # Drive the async handler synchronously. SFN state execution runs inside
     # the request's event loop, so spawning a fresh loop here would raise
     # "Cannot run the event loop while another loop is running". The Lambda
-    # REST handlers we dispatch to (GetAlias, GetFunctionConfiguration) only
-    # touch in-memory dicts and never await, so a single ``coro.send(None)``
-    # completes via ``StopIteration`` with the response tuple.
-    coro = handler("GET", path, headers, b"", query_params)
+    # REST handlers we dispatch to here only touch in-memory dicts and never
+    # await, so a single ``coro.send(None)`` completes via ``StopIteration``
+    # with the response tuple.
+    coro = handler(method, path, headers, body, query_params)
     try:
         coro.send(None)
     except StopIteration as stop:
