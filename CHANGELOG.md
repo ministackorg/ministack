@@ -5,6 +5,11 @@ All notable changes to MiniStack will be documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+- **DynamoDB — `Query`/`Scan` return `LastEvaluatedKey` when results end exactly at `Limit`** — real DynamoDB doesn't look ahead: whenever it stops because of the limit it returns a `LastEvaluatedKey`, even if nothing remains, and the follow-up page comes back empty with no key. MiniStack only returned the key when strictly more items remained, so SDK pagination helpers that rely on the exact-limit page (e.g. "has more pages" checks) diverged from AWS. Verified against DynamoDB Local. Contributed by @ifutivic.
+
 ## [1.4.1] — 2026-07-09
 
 ### Added
