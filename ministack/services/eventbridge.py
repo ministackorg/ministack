@@ -1609,18 +1609,28 @@ def _start_replay(data):
         "ReplayStartTime": now,
     }
     _replays[name] = replay
+    replay_account_id = get_account_id()
+    replay_region = get_region()
 
     def _run():
-        replay["State"] = "RUNNING"
-        for event in list(archive.get("Events", [])):
-            ts = event.get("Time", 0)
-            if not (event_start <= ts <= event_end):
-                continue
-            replayed = dict(event)
-            replayed["EventBusName"] = dest_bus_name
-            _dispatch_event(replayed)
-        replay["State"] = "COMPLETED"
-        replay["ReplayEndTime"] = _now_ts()
+        previous_account = get_account_id()
+        previous_region = get_region()
+        set_request_account_id(replay_account_id)
+        set_request_region(replay_region)
+        try:
+            replay["State"] = "RUNNING"
+            for event in list(archive.get("Events", [])):
+                ts = event.get("Time", 0)
+                if not (event_start <= ts <= event_end):
+                    continue
+                replayed = dict(event)
+                replayed["EventBusName"] = dest_bus_name
+                _dispatch_event(replayed)
+            replay["State"] = "COMPLETED"
+            replay["ReplayEndTime"] = _now_ts()
+        finally:
+            set_request_account_id(previous_account)
+            set_request_region(previous_region)
 
     t = threading.Thread(target=_run, daemon=True)
     t.start()

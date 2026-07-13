@@ -21,6 +21,16 @@ def _events_client(region_name):
     )
 
 
+def _sqs_client(region_name):
+    return boto3.client(
+        "sqs",
+        endpoint_url=os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566"),
+        aws_access_key_id="test",
+        aws_secret_access_key="test",
+        region_name=region_name,
+    )
+
+
 def test_eventbridge_bus_rule(eb):
     eb.create_event_bus(Name="test-bus")
     eb.put_rule(
@@ -1990,6 +2000,84 @@ def test_eventbridge_replay_destination_receives_events(eb, sqs):
         "Replayed events should be dispatched to the destination bus and arrive in SQS"
     )
     eb.delete_archive(ArchiveName=arch_name)
+
+
+def test_eventbridge_replay_dispatch_uses_replay_region(eb, sqs):
+    """Replay worker dispatches under the Region where StartReplay was called."""
+    west = _events_client("us-west-2")
+    west_sqs = _sqs_client("us-west-2")
+    suffix = _uuid_mod.uuid4().hex[:8]
+    bus_name = f"rp-region-bus-{suffix}"
+    rule_name = f"rp-region-rule-{suffix}"
+    source = f"region.replay.{suffix}"
+
+    east_bus_arn = eb.create_event_bus(Name=bus_name)["EventBusArn"]
+    west_bus_arn = west.create_event_bus(Name=bus_name)["EventBusArn"]
+    assert east_bus_arn.endswith(f":event-bus/{bus_name}")
+    assert west_bus_arn == f"arn:aws:events:us-west-2:000000000000:event-bus/{bus_name}"
+
+    east_q_url = sqs.create_queue(QueueName=f"rp-region-east-{suffix}")["QueueUrl"]
+    east_q_arn = sqs.get_queue_attributes(
+        QueueUrl=east_q_url,
+        AttributeNames=["QueueArn"],
+    )["Attributes"]["QueueArn"]
+    west_q_url = west_sqs.create_queue(QueueName=f"rp-region-west-{suffix}")["QueueUrl"]
+    west_q_arn = west_sqs.get_queue_attributes(
+        QueueUrl=west_q_url,
+        AttributeNames=["QueueArn"],
+    )["Attributes"]["QueueArn"]
+
+    for client, target_arn in ((eb, east_q_arn), (west, west_q_arn)):
+        client.put_rule(
+            Name=rule_name,
+            EventBusName=bus_name,
+            EventPattern=json.dumps({"source": [source]}),
+            State="ENABLED",
+        )
+        client.put_targets(
+            Rule=rule_name,
+            EventBusName=bus_name,
+            Targets=[{"Id": "target", "Arn": target_arn}],
+        )
+
+    arch_name = f"rp-region-arch-{suffix}"
+    west.create_archive(ArchiveName=arch_name, EventSourceArn=west_bus_arn)
+    west.put_events(
+        Entries=[
+            {
+                "Source": source,
+                "DetailType": "ReplayRegion",
+                "Detail": json.dumps({"region": "us-west-2"}),
+                "EventBusName": bus_name,
+            }
+        ]
+    )
+    archive_arn = west.describe_archive(ArchiveName=arch_name)["ArchiveArn"]
+    # Drain live delivery from the seed PutEvents call; the final assertion
+    # should only observe the replay delivery.
+    west_sqs.receive_message(QueueUrl=west_q_url, MaxNumberOfMessages=10, WaitTimeSeconds=1)
+
+    west.start_replay(
+        ReplayName=f"rp-region-{suffix}",
+        EventSourceArn=archive_arn,
+        EventStartTime=0,
+        EventEndTime=time.time() + 3600,
+        Destination={"Arn": west_bus_arn},
+    )
+    time.sleep(0.5)
+
+    west_msgs = west_sqs.receive_message(
+        QueueUrl=west_q_url,
+        MaxNumberOfMessages=10,
+        WaitTimeSeconds=2,
+    )
+    east_msgs = sqs.receive_message(
+        QueueUrl=east_q_url,
+        MaxNumberOfMessages=10,
+        WaitTimeSeconds=1,
+    )
+    assert len(west_msgs.get("Messages", [])) >= 1
+    assert east_msgs.get("Messages", []) == []
 
 
 def test_eventbridge_archive_event_count_unchanged_after_replay(eb):
