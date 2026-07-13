@@ -2,12 +2,12 @@ import io
 import json
 import os
 import time
+import urllib.request
 import uuid as _uuid_mod
 import zipfile
 from urllib.parse import urlparse
 
 import pytest
-import urllib.request
 from botocore.exceptions import ClientError
 
 from ministack.services import pipes as _pipes
@@ -1702,7 +1702,9 @@ def test_cfn_cdk_bootstrap_resources(cfn, s3, ecr):
         },
     }
     cfn.create_stack(StackName="CDKToolkit-v44", TemplateBody=json.dumps(template))
-    import time as _t; _t.sleep(2)
+    import time as _t
+
+    _t.sleep(2)
     stack = cfn.describe_stacks(StackName="CDKToolkit-v44")["Stacks"][0]
     assert stack["StackStatus"] == "CREATE_COMPLETE"
 
