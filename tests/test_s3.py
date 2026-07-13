@@ -2399,6 +2399,53 @@ def test_s3_version_id_persisted_to_disk(tmp_path, monkeypatch):
         s3mod._buckets._data.pop(("000000000000", "ver-bucket"), None)
 
 
+def test_s3_version_id_get_object_after_restore(tmp_path, monkeypatch):
+    """GetObject(VersionId=...) must work after _load_persisted_bucket restores
+    from disk. The version index (_object_versions) must be rebuilt so lookups
+    by VersionId succeed (#1065)."""
+    from ministack.services import s3 as s3mod
+    monkeypatch.setattr(s3mod, "DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(s3mod, "S3_PERSIST", True)
+    monkeypatch.setattr(s3mod, "get_account_id", lambda: "000000000000")
+
+    version_id = "test-version-1065"
+    obj = {
+        "body": b"version-data",
+        "content_type": "application/octet-stream",
+        "content_encoding": None,
+        "etag": '"abc"',
+        "last_modified": s3mod.now_iso(),
+        "size": 12,
+        "metadata": {},
+        "preserved_headers": {},
+        "storage_class": "STANDARD",
+        "version_id": version_id,
+    }
+    s3mod._persist_object("ver-get-bucket", "k", obj)
+
+    # Clear in-memory state to simulate restart
+    s3mod._buckets._data.pop(("000000000000", "ver-get-bucket"), None)
+    s3mod._object_versions._data.pop(("000000000000", ("ver-get-bucket", "k")), None)
+
+    try:
+        s3mod._load_persisted_bucket(
+            "000000000000", "ver-get-bucket",
+            os.path.join(str(tmp_path), "000000000000", "ver-get-bucket"))
+
+        # Verify _object_versions was rebuilt
+        versions = s3mod._object_versions._data.get(("000000000000", ("ver-get-bucket", "k")), [])
+        assert len(versions) == 1
+        assert versions[0]["version_id"] == version_id
+        assert versions[0]["data"] is None  # body stays on disk
+
+        # Verify GetObject by VersionId returns the body from disk
+        data = s3mod._get_object_data("ver-get-bucket", "k", version_id=version_id)
+        assert data == b"version-data"
+    finally:
+        s3mod._buckets._data.pop(("000000000000", "ver-get-bucket"), None)
+        s3mod._object_versions._data.pop(("000000000000", ("ver-get-bucket", "k")), None)
+
+
 def test_s3_put_object_sidecar_carries_version_id(tmp_path, monkeypatch):
     """PutObject on a versioned bucket must persist AFTER version_id assignment,
     so the on-disk .meta.json carries the id returned in x-amz-version-id (#1058)."""

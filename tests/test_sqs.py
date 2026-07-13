@@ -1292,6 +1292,29 @@ def test_sqs_send_message_allows_valid_chars(sqs):
         assert "MessageId" in resp, f"send failed for {repr(body)}"
 
 
+def test_sqs_xml_query_error_code_uses_legacy_namespace():
+    """XML Query API error responses must use legacy namespaced codes
+    (e.g. AWS.SimpleQueueService.NonExistentQueue) not the short JSON codes
+    (e.g. QueueDoesNotExist). .NET SDK and other XML-protocol callers match
+    on the namespaced string (#1066)."""
+    import urllib.error
+    import urllib.request
+    import xml.etree.ElementTree as ET
+
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+    try:
+        urllib.request.urlopen(f"{endpoint}/?Action=GetQueueUrl&QueueName=nonexistent-xml-test-queue")
+        raise AssertionError("expected HTTP error")
+    except urllib.error.HTTPError as e:
+        body = e.read()
+        root = ET.fromstring(body)
+        ns = {"ns": "http://queue.amazonaws.com/doc/2012-11-05/"}
+        code = root.find(".//ns:Code", ns).text
+        assert code == "AWS.SimpleQueueService.NonExistentQueue", (
+            f"XML error code must be legacy namespaced, got '{code}'"
+        )
+
+
 def test_sqs_invalid_chars_regex_matches_xml10_complement():
     """The forbidden-char regex must be the exact complement of AWS SQS's allowed
     set (#x9 | #xA | #xD | #x20-#xD7FF | #xE000-#xFFFD | #x10000-#x10FFFF), which
