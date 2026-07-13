@@ -1,3 +1,4 @@
+import base64
 import io
 import json
 import os
@@ -19,7 +20,13 @@ def _make_zip(code: str) -> bytes:
         zf.writestr("index.py", code)
     return buf.getvalue()
 
+
+def _make_zip_b64(code: str) -> str:
+    return base64.b64encode(_make_zip(code)).decode("ascii")
+
+
 _LAMBDA_ROLE = "arn:aws:iam::000000000000:role/lambda-role"
+
 
 def _wait_sfn(sfn, exec_arn, timeout=10):
     """Poll DescribeExecution until terminal state."""
@@ -1048,6 +1055,242 @@ def test_sfn_aws_sdk_lambda_get_alias_and_configuration(sfn_sync, lam):
     assert output["alias"]["FunctionVersion"] == version
     assert output["config"]["FunctionName"] == fn
     assert output["config"]["Version"] == version
+
+
+def test_sfn_aws_sdk_lambda_write_actions_and_pascal_outputs(sfn_sync, lam):
+    """aws-sdk:lambda write actions route through Lambda REST and return PascalCase output."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    fn = f"sfn-sdk-lambda-write-{suffix}"
+    sm_name = f"sfn-sdk-lambda-write-{suffix}"
+    function_arn = f"arn:aws:lambda:us-east-1:000000000000:function:{fn}"
+    kms_key_arn = f"arn:aws:kms:us-east-1:000000000000:key/{suffix}"
+    vpc_config = {
+        "SubnetIds": [f"subnet-{suffix}"],
+        "SecurityGroupIds": [f"sg-{suffix}"],
+    }
+    create_zip = _make_zip_b64("def handler(e, c): return {'version': 1}")
+    update_zip = _make_zip_b64("def handler(e, c): return {'version': 2}")
+    sm_arn = None
+
+    definition = json.dumps({
+        "StartAt": "CreateFunction",
+        "States": {
+            "CreateFunction": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::aws-sdk:lambda:createFunction",
+                "Parameters": {
+                    "FunctionName": fn,
+                    "Runtime": "python3.12",
+                    "Role": _LAMBDA_ROLE,
+                    "Handler": "index.handler",
+                    "Code": {"ZipFile": create_zip},
+                    "Timeout": 10,
+                    "Architectures": ["x86_64"],
+                    "KmsKeyArn": kms_key_arn,
+                    "VpcConfig": vpc_config,
+                    "Publish": True,
+                    "Tags": {"source": "sfn-test"},
+                },
+                "ResultPath": "$.createResult",
+                "Next": "UpdateFunctionConfiguration",
+            },
+            "UpdateFunctionConfiguration": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::aws-sdk:lambda:updateFunctionConfiguration",
+                "Parameters": {
+                    "FunctionName.$": "$.createResult.FunctionArn",
+                    "Runtime": "python3.12",
+                    "Role": _LAMBDA_ROLE,
+                    "Handler": "index.handler",
+                    "Timeout": 30,
+                },
+                "ResultPath": "$.updateConfigurationResult",
+                "Next": "UpdateFunctionCode",
+            },
+            "UpdateFunctionCode": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::aws-sdk:lambda:updateFunctionCode",
+                "Parameters": {
+                    "FunctionName.$": "$.createResult.FunctionArn",
+                    "ZipFile": update_zip,
+                    "Publish": True,
+                },
+                "ResultPath": "$.publishedFunction",
+                "Next": "CreateAlias",
+            },
+            "CreateAlias": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::aws-sdk:lambda:createAlias",
+                "Parameters": {
+                    "FunctionName.$": "$.createResult.FunctionArn",
+                    "Name": "live",
+                    "FunctionVersion.$": "$.createResult.Version",
+                },
+                "ResultPath": "$.aliasResult",
+                "Next": "UpdateAlias",
+            },
+            "UpdateAlias": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::aws-sdk:lambda:updateAlias",
+                "Parameters": {
+                    "FunctionName.$": "$.createResult.FunctionArn",
+                    "Name": "live",
+                    "FunctionVersion.$": "$.publishedFunction.Version",
+                },
+                "ResultPath": "$.aliasResult",
+                "Next": "WaitForReady",
+            },
+            "WaitForReady": {
+                "Type": "Wait",
+                "Seconds": 1,
+                "Next": "ReadConfig",
+            },
+            "ReadConfig": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::aws-sdk:lambda:getFunctionConfiguration",
+                "Parameters": {
+                    "FunctionName.$": "$.createResult.FunctionArn",
+                    "Qualifier.$": "$.aliasResult.FunctionVersion",
+                },
+                "ResultPath": "$.config",
+                "Next": "ReadAlias",
+            },
+            "ReadAlias": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::aws-sdk:lambda:getAlias",
+                "Parameters": {
+                    "FunctionName.$": "$.createResult.FunctionArn",
+                    "Name": "live",
+                },
+                "ResultPath": "$.alias",
+                "End": True,
+            },
+        },
+    })
+
+    try:
+        sm_arn = sfn_sync.create_state_machine(
+            name=sm_name,
+            definition=definition,
+            roleArn="arn:aws:iam::000000000000:role/sfn-role",
+        )["stateMachineArn"]
+
+        resp = sfn_sync.start_sync_execution(stateMachineArn=sm_arn, input=json.dumps({}))
+        assert resp["status"] == "SUCCEEDED", f"Execution failed: {resp.get('error')} — {resp.get('cause')}"
+        output = json.loads(resp["output"])
+        assert output["createResult"]["FunctionArn"] == function_arn
+        assert output["createResult"]["Version"] == "1"
+        assert output["createResult"]["KmsKeyArn"] == kms_key_arn
+        assert output["createResult"]["VpcConfig"] == vpc_config
+        assert output["updateConfigurationResult"]["Timeout"] == 30
+        assert output["publishedFunction"]["FunctionArn"] == function_arn
+        assert output["publishedFunction"]["Version"] == "2"
+        assert output["aliasResult"]["FunctionVersion"] == "2"
+        assert output["alias"]["Name"] == "live"
+        assert output["alias"]["FunctionVersion"] == "2"
+        assert output["config"]["FunctionArn"] == function_arn
+        assert output["config"]["Version"] == "2"
+        assert output["config"]["Timeout"] == 30
+        assert output["config"]["State"] == "Active"
+        assert output["config"]["LastUpdateStatus"] == "Successful"
+        assert output["config"]["KmsKeyArn"] == kms_key_arn
+        assert output["config"]["VpcConfig"] == vpc_config
+    finally:
+        if sm_arn:
+            sfn_sync.delete_state_machine(stateMachineArn=sm_arn)
+        try:
+            lam.delete_function(FunctionName=fn)
+        except ClientError:
+            pass
+
+
+def test_sfn_aws_sdk_lambda_write_errors_are_prefixed_for_catch(sfn_sync, lam):
+    """Lambda write dispatcher keeps SDK error prefixes for Retry/Catch matching."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    fn = f"sfn-sdk-lambda-errors-{suffix}"
+    sm_name = f"sfn-sdk-lambda-errors-{suffix}"
+    zip_file = _make_zip_b64("def handler(e, c): return {'ok': True}")
+    sm_arn = None
+
+    definition = json.dumps({
+        "StartAt": "CreateFunction",
+        "States": {
+            "CreateFunction": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::aws-sdk:lambda:createFunction",
+                "Parameters": {
+                    "FunctionName": fn,
+                    "Runtime": "python3.12",
+                    "Role": _LAMBDA_ROLE,
+                    "Handler": "index.handler",
+                    "Code": {"ZipFile": zip_file},
+                    "Publish": True,
+                },
+                "ResultPath": "$.createResult",
+                "Next": "CreateDuplicate",
+            },
+            "CreateDuplicate": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::aws-sdk:lambda:createFunction",
+                "Parameters": {
+                    "FunctionName": fn,
+                    "Runtime": "python3.12",
+                    "Role": _LAMBDA_ROLE,
+                    "Handler": "index.handler",
+                    "Code": {"ZipFile": zip_file},
+                    "Publish": True,
+                },
+                "Catch": [
+                    {
+                        "ErrorEquals": ["Lambda.ResourceConflictException"],
+                        "ResultPath": "$.duplicateError",
+                        "Next": "UpdateMissingAlias",
+                    }
+                ],
+                "End": True,
+            },
+            "UpdateMissingAlias": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::aws-sdk:lambda:updateAlias",
+                "Parameters": {
+                    "FunctionName.$": "$.createResult.FunctionArn",
+                    "Name": "missing",
+                    "FunctionVersion.$": "$.createResult.Version",
+                },
+                "Catch": [
+                    {
+                        "ErrorEquals": ["Lambda.ResourceNotFoundException"],
+                        "ResultPath": "$.missingAliasError",
+                        "Next": "Done",
+                    }
+                ],
+                "End": True,
+            },
+            "Done": {"Type": "Succeed"},
+        },
+    })
+
+    try:
+        sm_arn = sfn_sync.create_state_machine(
+            name=sm_name,
+            definition=definition,
+            roleArn="arn:aws:iam::000000000000:role/sfn-role",
+        )["stateMachineArn"]
+
+        resp = sfn_sync.start_sync_execution(stateMachineArn=sm_arn, input=json.dumps({}))
+        assert resp["status"] == "SUCCEEDED", f"Execution failed: {resp.get('error')} — {resp.get('cause')}"
+        output = json.loads(resp["output"])
+        assert output["duplicateError"]["Error"] == "Lambda.ResourceConflictException"
+        assert "Function already exist" in output["duplicateError"]["Cause"]
+        assert output["missingAliasError"]["Error"] == "Lambda.ResourceNotFoundException"
+        assert "Alias not found" in output["missingAliasError"]["Cause"]
+    finally:
+        if sm_arn:
+            sfn_sync.delete_state_machine(stateMachineArn=sm_arn)
+        try:
+            lam.delete_function(FunctionName=fn)
+        except ClientError:
+            pass
 
 
 def test_sfn_aws_sdk_lambda_respects_caller_account():
@@ -4065,6 +4308,37 @@ def test_sfn_key_to_api_name_round_trip():
         sfn = _api_name_to_sfn_key(wire)
         back = _sfn_key_to_api_name(sfn)
         assert back == wire, f"Round-trip failed: {wire} → {sfn} → {back}"
+
+
+def test_lambda_rest_input_normalization_is_top_level_and_wire_wins():
+    """Lambda REST input normalization avoids the query-protocol acronym map."""
+    from ministack.services.stepfunctions import _normalize_lambda_rest_input
+
+    normalized = _normalize_lambda_rest_input({
+        "KmsKeyArn": "sfn-key",
+        "VpcConfig": {
+            "SubnetIds": ["subnet-123"],
+            "SecurityGroupIds": ["sg-123"],
+        },
+        "Environment": {"Variables": {"KmsKeyArn": "nested-key"}},
+    })
+    assert normalized == {
+        "KMSKeyArn": "sfn-key",
+        "VpcConfig": {
+            "SubnetIds": ["subnet-123"],
+            "SecurityGroupIds": ["sg-123"],
+        },
+        "Environment": {"Variables": {"KmsKeyArn": "nested-key"}},
+    }
+
+    explicit_wire = _normalize_lambda_rest_input({
+        "KmsKeyArn": "sfn-key",
+        "KMSKeyArn": "wire-key",
+    })
+    assert explicit_wire == {
+        "KmsKeyArn": "sfn-key",
+        "KMSKeyArn": "wire-key",
+    }
 
 
 def test_convert_params_to_api_names_nested():

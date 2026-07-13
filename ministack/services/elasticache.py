@@ -28,7 +28,14 @@ from urllib.parse import parse_qs
 
 from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.persistence import load_state
-from ministack.core.responses import AccountScopedDict, apply_image_prefix, get_account_id, get_region, new_uuid
+from ministack.core.responses import (
+    AccountRegionScopedDict,
+    AccountScopedDict,
+    apply_image_prefix,
+    get_account_id,
+    get_region,
+    new_uuid,
+)
 
 logger = logging.getLogger("elasticache")
 
@@ -70,18 +77,18 @@ _DEFAULT_PARAM_GROUP_FAMILIES = [
 ]
 _DEFAULT_PARAM_GROUP_NAMES = {name for name, _family, _desc in _DEFAULT_PARAM_GROUP_FAMILIES}
 
-_clusters = AccountScopedDict()
-_replication_groups = AccountScopedDict()
-_subnet_groups = AccountScopedDict()
-_param_groups = AccountScopedDict()
-_param_group_params = AccountScopedDict()  # group_name -> {param_name -> param_dict}
+_clusters = AccountRegionScopedDict()
+_replication_groups = AccountRegionScopedDict()
+_subnet_groups = AccountRegionScopedDict()
+_param_groups = AccountRegionScopedDict()
+_param_group_params = AccountRegionScopedDict()  # group_name -> {param_name -> param_dict}
 _tags = AccountScopedDict()  # arn -> [{"Key": ..., "Value": ...}, ...]
-_snapshots = AccountScopedDict()
-_users = AccountScopedDict()
-_user_groups = AccountScopedDict()
-# Per-account event log. AccountScopedDict under key "entries" so the list
-# manipulation stays simple and DescribeEvents never leaks cross-tenant rows.
-_events = AccountScopedDict()
+_snapshots = AccountRegionScopedDict()
+_users = AccountRegionScopedDict()
+_user_groups = AccountRegionScopedDict()
+# Per-account+region event log under key "entries" so the list manipulation
+# stays simple and DescribeEvents never leaks cross-tenant or cross-region rows.
+_events = AccountRegionScopedDict()
 
 
 def _events_list() -> list:
@@ -100,11 +107,11 @@ _docker = None
 # ── Persistence ────────────────────────────────────────────
 
 def get_state():
-    rgs = {}
-    for name, rg in _replication_groups.items():
+    rgs = AccountRegionScopedDict()
+    for (account_id, region, name), rg in _replication_groups.all_items():
         r = copy.deepcopy(rg)
         r.pop("_docker_container_ids", None)
-        rgs[name] = r
+        rgs.set_scoped(account_id, region, name, r)
     state = {
         "replication_groups": rgs,
         "subnet_groups": copy.deepcopy(_subnet_groups),
@@ -114,13 +121,14 @@ def get_state():
         "snapshots": copy.deepcopy(_snapshots),
         "users": copy.deepcopy(_users),
         "user_groups": copy.deepcopy(_user_groups),
+        "events": copy.deepcopy(_events),
         "port_counter": _port_counter[0],
     }
-    clusters = {}
-    for name, cl in _clusters.items():
+    clusters = AccountRegionScopedDict()
+    for (account_id, region, name), cl in _clusters.all_items():
         c = copy.deepcopy(cl)
         c.pop("_docker_container_id", None)
-        clusters[name] = c
+        clusters.set_scoped(account_id, region, name, c)
     state["clusters"] = clusters
     return state
 
@@ -142,30 +150,77 @@ import threading as _threading
 _respawn_lock = _threading.Lock()
 
 
+def _as_region_scoped(incoming):
+    scoped = AccountRegionScopedDict()
+    scoped.update({} if incoming is None else incoming)
+    return scoped
+
+
+def _restore_replication_groups(incoming):
+    restored = _as_region_scoped(incoming)
+    for (account_id, region, name), rg in restored.all_items():
+        # Wipe stale container ids — the old Docker containers are dead.
+        # _ensure_live_containers will refill this list lazily.
+        record = copy.deepcopy(rg)
+        record["_docker_container_ids"] = []
+        _replication_groups.set_scoped(account_id, region, name, record)
+        _pending_rg_respawn.add((account_id, region, name))
+
+
+def _param_group_region(account_id, group_name):
+    for (pg_account_id, pg_region, pg_name), _pg in _param_groups.all_items():
+        if pg_account_id == account_id and pg_name == group_name:
+            return pg_region
+    return get_region()
+
+
+def _restore_param_group_params(incoming):
+    if isinstance(incoming, AccountRegionScopedDict):
+        _param_group_params.update(incoming)
+        return
+
+    if isinstance(incoming, AccountScopedDict):
+        items = [
+            (account_id, group_name, params)
+            for (account_id, group_name), params in incoming._data.items()
+        ]
+    else:
+        items = [
+            (get_account_id(), group_name, params)
+            for group_name, params in (incoming or {}).items()
+        ]
+
+    for account_id, group_name, params in items:
+        region = _param_group_region(account_id, group_name)
+        _param_group_params.set_scoped(account_id, region, group_name, params)
+
+
+def _restore_clusters(incoming):
+    restored = _as_region_scoped(incoming)
+    for (account_id, region, name), cl in restored.all_items():
+        record = copy.deepcopy(cl)
+        record["_docker_container_id"] = None
+        record["CacheClusterStatus"] = "available"
+        _clusters.set_scoped(account_id, region, name, record)
+        _pending_cluster_respawn.add((account_id, region, name))
+
+
 def restore_state(data):
     if not data:
         default_state()
         return
-    for name, rg in data.get("replication_groups", {}).items():
-        # Wipe stale container ids — the old Docker containers are dead.
-        # _ensure_live_containers will refill this list lazily.
-        rg["_docker_container_ids"] = []
-        _replication_groups[name] = rg
-        _pending_rg_respawn.add(name)
+    _restore_replication_groups(data.get("replication_groups", {}))
     _subnet_groups.update(data.get("subnet_groups", {}))
     _param_groups.update(data.get("param_groups", {}))
-    _param_group_params.update(data.get("param_group_params", {}))
+    _restore_param_group_params(data.get("param_group_params", {}))
     _tags.update(data.get("tags", {}))
     _snapshots.update(data.get("snapshots", {}))
     _users.update(data.get("users", {}))
     _user_groups.update(data.get("user_groups", {}))
+    _events.update(data.get("events", {}))
     if "port_counter" in data:
         _port_counter[0] = data["port_counter"]
-    for name, cl in data.get("clusters", {}).items():
-        cl["_docker_container_id"] = None
-        cl["CacheClusterStatus"] = "available"
-        _clusters[name] = cl
-        _pending_cluster_respawn.add(name)
+    _restore_clusters(data.get("clusters", {}))
     default_state()
 
 
@@ -189,18 +244,24 @@ def _ensure_live_containers():
 def _ensure_live_containers_locked():
     import logging
     log = logging.getLogger(__name__)
-    for name in list(_pending_cluster_respawn):
-        _pending_cluster_respawn.discard(name)
-        cl = _clusters.get(name)
+    for pending in list(_pending_cluster_respawn):
+        account_id, region, name = pending
+        _pending_cluster_respawn.discard(pending)
+        cl = _clusters.get_scoped(account_id, region, name)
         if cl is None:
             continue
         try:
             engine = cl.get("Engine", "redis")
             version = cl.get("EngineVersion", "7.1")
             host, port, cid = _spawn_redis_container(
-                name=f"ministack-elasticache-{name}",
+                name=f"ministack-elasticache-{account_id}-{region}-{name}",
                 engine=engine, engine_version=version,
-                labels={"ministack": "elasticache", "cluster_id": name},
+                labels={
+                    "ministack": "elasticache",
+                    "cluster_id": name,
+                    "account_id": account_id,
+                    "region": region,
+                },
             )
             cl["_docker_container_id"] = cid
             for node in cl.get("CacheNodes") or []:
@@ -212,24 +273,25 @@ def _ensure_live_containers_locked():
             log.warning(
                 "elasticache: failed to respawn container for cluster %s on restart; "
                 "endpoint will be unreachable", name, exc_info=True)
-    for rg_id in list(_pending_rg_respawn):
-        _pending_rg_respawn.discard(rg_id)
-        rg = _replication_groups.get(rg_id)
+    for pending in list(_pending_rg_respawn):
+        account_id, region, rg_id = pending
+        _pending_rg_respawn.discard(pending)
+        rg = _replication_groups.get_scoped(account_id, region, rg_id)
         if rg is None:
             continue
         try:
             engine = rg.get("Engine", "redis")
             engine_version = rg.get("EngineVersion") or rg.get("CacheNodeType") or "7.1"
-            account_id = get_account_id()
             node_groups = rg.get("NodeGroups") or []
             for ng in node_groups:
                 ng_id = ng.get("NodeGroupId", "0001")
                 _, _, cid = _spawn_redis_container(
-                    name=f"ministack-elasticache-rg-{account_id}-{rg_id}-{ng_id}",
+                    name=f"ministack-elasticache-rg-{account_id}-{region}-{rg_id}-{ng_id}",
                     engine=engine, engine_version=engine_version,
                     labels={
                         "ministack": "elasticache", "rg_id": rg_id,
                         "node_group": ng_id, "account_id": account_id,
+                        "region": region,
                     },
                 )
                 if cid:
@@ -542,6 +604,7 @@ def _build_real_cluster_rg(rg_id, engine_version, num_node_groups, replicas_per_
     """
     docker_client = _get_docker()
     account_id = get_account_id()
+    region = get_region()
     primaries = []        # list of {ng_id, ip, port, cid}
     replicas = []         # list of {ng_id, replica_idx, ip, port, cid}
     container_ids = []
@@ -550,12 +613,13 @@ def _build_real_cluster_rg(rg_id, engine_version, num_node_groups, replicas_per_
         "ministack": "elasticache",
         "rg_id": rg_id,
         "account_id": account_id,
+        "region": region,
     }
 
     # Primary nodes first
     for ng_idx in range(1, num_node_groups + 1):
         ng_id = f"{ng_idx:04d}"
-        name = f"ministack-elasticache-rg-{account_id}-{rg_id}-{ng_id}-p"
+        name = f"ministack-elasticache-rg-{account_id}-{region}-{rg_id}-{ng_id}-p"
         ip, port, cid = _spawn_redis_cluster_node(
             name=name,
             engine_version=engine_version,
@@ -570,7 +634,7 @@ def _build_real_cluster_rg(rg_id, engine_version, num_node_groups, replicas_per_
     for ng_idx in range(1, num_node_groups + 1):
         ng_id = f"{ng_idx:04d}"
         for r in range(1, replicas_per_shard + 1):
-            name = f"ministack-elasticache-rg-{account_id}-{rg_id}-{ng_id}-r{r}"
+            name = f"ministack-elasticache-rg-{account_id}-{region}-{rg_id}-{ng_id}-r{r}"
             ip, port, cid = _spawn_redis_cluster_node(
                 name=name,
                 engine_version=engine_version,
@@ -737,6 +801,7 @@ async def handle_request(method, path, headers, body, query_params):
     # Lazy-respawn any clusters / replication groups that were restored
     # from disk (issue #853). Cheap fast-path when nothing's pending.
     _ensure_live_containers()
+    _seed_default_param_groups()
     params = dict(query_params)
     if method == "POST" and body:
         form_params = parse_qs(body.decode("utf-8", errors="replace"))
@@ -804,11 +869,18 @@ def _create_cache_cluster(p):
         return _error("CacheClusterAlreadyExists", f"Cluster {cluster_id} already exists", 400)
 
     arn = _arn_cluster(cluster_id)
+    account_id = get_account_id()
+    region = get_region()
     endpoint_host, endpoint_port, docker_container_id = _spawn_redis_container(
-        name=f"ministack-elasticache-{cluster_id}",
+        name=f"ministack-elasticache-{account_id}-{region}-{cluster_id}",
         engine=engine,
         engine_version=engine_version,
-        labels={"ministack": "elasticache", "cluster_id": cluster_id},
+        labels={
+            "ministack": "elasticache",
+            "cluster_id": cluster_id,
+            "account_id": account_id,
+            "region": region,
+        },
     )
 
     subnet_group = _p(p, "CacheSubnetGroupName") or "default"
@@ -1015,10 +1087,11 @@ def _create_replication_group(p):
     if not node_groups:
         # Path (b) or (c): per-shard fan-out / fallback.
         account_id = get_account_id()
+        region = get_region()
         for ng_idx in range(1, num_node_groups + 1):
             ng_id = f"{ng_idx:04d}"
             shard_host, shard_port, cid = _spawn_redis_container(
-                name=f"ministack-elasticache-rg-{account_id}-{rg_id}-{ng_id}",
+                name=f"ministack-elasticache-rg-{account_id}-{region}-{rg_id}-{ng_id}",
                 engine=engine,
                 engine_version=engine_version,
                 labels={
@@ -1026,6 +1099,7 @@ def _create_replication_group(p):
                     "rg_id": rg_id,
                     "node_group": ng_id,
                     "account_id": account_id,
+                    "region": region,
                 },
             )
             if cid:
@@ -2294,7 +2368,7 @@ def _error(code, message, status):
 def reset():
     docker_client = _get_docker()
     if docker_client:
-        for cluster in _clusters.values():
+        for cluster in _clusters.all_values():
             cid = cluster.get("_docker_container_id")
             if cid:
                 try:
@@ -2303,7 +2377,7 @@ def reset():
                     c.remove(v=True)
                 except Exception as e:
                     logger.warning("reset: failed to stop/remove container %s: %s", cid, e)
-        for rg in _replication_groups.values():
+        for rg in _replication_groups.all_values():
             for cid in rg.get("_docker_container_ids") or []:
                 try:
                     c = docker_client.containers.get(cid)
@@ -2321,5 +2395,7 @@ def reset():
     _user_groups.clear()
     _events.clear()
     _tags.clear()   # was missing from reset() — HIGH-severity gap from audit
+    _pending_cluster_respawn.clear()
+    _pending_rg_respawn.clear()
     _port_counter[0] = BASE_PORT
     default_state()
