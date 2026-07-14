@@ -5,6 +5,11 @@ All notable changes to MiniStack will be documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+- **Cognito — `ListUsers` `status` filter matched against the wrong field** — `Filter='status = "Enabled"'`/`"Disabled"` was compared against `UserStatus` (the confirmation-state enum: `CONFIRMED`, `FORCE_CHANGE_PASSWORD`, `UNCONFIRMED`, etc.), which never equals the literal string `"Enabled"`/`"Disabled"`. As a result, filtering by `status` always returned an empty list, regardless of how many users existed or their actual enabled/disabled state. `status` now correctly reflects the account's `Enabled` boolean toggled by `AdminEnableUser`/`AdminDisableUser`, matching real AWS Cognito's `ListUsers` Filter semantics. Contributed by @jey-mfv.
+
 ## [1.4.2] — 2026-07-13
 
 ### Added
