@@ -8,6 +8,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- **Batch — `UpdateComputeEnvironment`** — Terraform `aws_batch_compute_environment` with an `update_policy` block calls `UpdateComputeEnvironment`, which previously failed with `InvalidAction: Unsupported batch path: /v1/updatecomputeenvironment`. The endpoint now resolves compute environments by name or ARN, applies present fields (`state`, `serviceRole`, shallow-merged `computeResources`, `updatePolicy`, `unmanagedvCpus`, `context`), and returns them from `DescribeComputeEnvironments`. `CreateComputeEnvironment` also persists `updatePolicy` when sent. Reported by @smoores-dev (#1088).
 - **IoT — MQTT publishes are routed through topic rules to Lambda** — an MQTT/`iot-data` publish is now matched against each account's topic rules by the rule's `FROM '<topic filter>'` clause (with `+`/`#` wildcards), and every matching enabled rule's `lambda` actions are invoked asynchronously with the message payload as the event (`SELECT *`). Basic Ingest is supported: a publish to `$aws/rules/<ruleName>` is delivered straight to that rule's actions and bypasses pub/sub. Disabled rules are skipped.
 
 ## [1.4.2] — 2026-07-13
