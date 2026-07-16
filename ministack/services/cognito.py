@@ -2270,16 +2270,19 @@ def _mfa_challenge_for_user(pool: dict, user: dict, pid: str, username: str) -> 
     }
 
 
-def _build_auth_result(pool_id: str, client_id: str, user: dict, nonce: str = "") -> dict:
+def _build_auth_result(pool_id: str, client_id: str, user: dict, nonce: str = "",
+                        trigger_source: str = "TokenGeneration_Authentication") -> dict:
     attrs = _attr_list_to_dict(user.get("Attributes", []))
     sub = attrs.get("sub", user["Username"])
     username = user.get("Username", "")
     groups = user.get("_groups", [])
     return {
         "AccessToken": _fake_token(sub, pool_id, client_id, "access", username=username,
-                                    user_attrs=attrs, groups=groups),
+                                    user_attrs=attrs, groups=groups,
+                                    trigger_source=trigger_source),
         "IdToken": _fake_token(sub, pool_id, client_id, "id", username=username,
-                               user_attrs=attrs, groups=groups, nonce=nonce),
+                               user_attrs=attrs, groups=groups, nonce=nonce,
+                               trigger_source=trigger_source),
         "RefreshToken": _fake_token(sub, pool_id, client_id, "refresh"),
         "TokenType": "Bearer",
         "ExpiresIn": 3600,
@@ -2339,7 +2342,8 @@ def _admin_initiate_auth(data):
         if _refresh_token_revoked(refresh_token, user):
             return error_response_json("NotAuthorizedException",
                                        "Refresh Token has been revoked", 400)
-        result = _build_auth_result(pid, cid, user)
+        result = _build_auth_result(pid, cid, user,
+                                     trigger_source="TokenGeneration_RefreshTokens")
         result.pop("RefreshToken", None)  # AWS doesn't return a new refresh token here
         return json_response({"AuthenticationResult": result})
 
@@ -2670,7 +2674,8 @@ def _initiate_auth(data):
         if _refresh_token_revoked(refresh_token, user):
             return error_response_json("NotAuthorizedException",
                                        "Refresh Token has been revoked", 400)
-        result = _build_auth_result(pid, cid, user)
+        result = _build_auth_result(pid, cid, user,
+                                     trigger_source="TokenGeneration_RefreshTokens")
         result.pop("RefreshToken", None)  # AWS doesn't return a new refresh token here
         return json_response({"AuthenticationResult": result})
 
@@ -4346,7 +4351,8 @@ def _oauth2_token(data, query_params, raw_body: bytes = b"", headers: dict | Non
             if not user:
                 return _oauth2_error("server_error", "User not found.")
 
-            result = _build_auth_result(pool_id, cid, user, nonce=entry.get("nonce", ""))
+            result = _build_auth_result(pool_id, cid, user, nonce=entry.get("nonce", ""),
+                                         trigger_source="TokenGeneration_HostedAuth")
             refresh_val = result["RefreshToken"]
             _refresh_tokens[refresh_val] = {
                 "pool_id": pool_id,
@@ -4385,8 +4391,10 @@ def _oauth2_token(data, query_params, raw_body: bytes = b"", headers: dict | Non
                 if user:
                     user_attrs = _attr_list_to_dict(user.get("Attributes", []))
 
-            access_token = _fake_token(sub, pool_id, effective_client_id, "access", username)
-            id_token = _fake_token(sub, pool_id, effective_client_id, "id", username, user_attrs=user_attrs)
+            access_token = _fake_token(sub, pool_id, effective_client_id, "access", username,
+                                        trigger_source="TokenGeneration_HostedAuth")
+            id_token = _fake_token(sub, pool_id, effective_client_id, "id", username, user_attrs=user_attrs,
+                                    trigger_source="TokenGeneration_HostedAuth")
             refresh_token = secrets.token_urlsafe(48)
 
             return json_response({
@@ -4424,8 +4432,10 @@ def _oauth2_token(data, query_params, raw_body: bytes = b"", headers: dict | Non
         sub = attrs.get("sub", user["Username"])
         username = user.get("Username", "")
         resp = {
-            "access_token": _fake_token(sub, pool_id, client_id, "access", username=username),
-            "id_token": _fake_token(sub, pool_id, client_id, "id", username=username, user_attrs=attrs),
+            "access_token": _fake_token(sub, pool_id, client_id, "access", username=username,
+                                         trigger_source="TokenGeneration_RefreshTokens"),
+            "id_token": _fake_token(sub, pool_id, client_id, "id", username=username, user_attrs=attrs,
+                                     trigger_source="TokenGeneration_RefreshTokens"),
             "token_type": "Bearer",
             "expires_in": 3600,
         }
