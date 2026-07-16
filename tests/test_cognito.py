@@ -2873,6 +2873,79 @@ def test_cognito_pretoken_lambda_failure_fail_open(cognito_idp, lam):
     assert access["client_id"] == cid  # token still issued
 
 
+def test_cognito_pretoken_trigger_source_by_auth_flow(cognito_idp, lam):
+    """PreTokenGeneration's triggerSource should differ by call path, matching
+    real AWS: InitiateAuth(USER_PASSWORD_AUTH) -> TokenGeneration_Authentication,
+    REFRESH_TOKEN_AUTH/refresh_token grant -> TokenGeneration_RefreshTokens,
+    Hosted UI authorization_code grant -> TokenGeneration_HostedAuth. Before the
+    fix, every path fell through to _fake_token()'s default
+    TokenGeneration_Authentication (#003)."""
+    handler = (
+        "def handler(event, ctx):\n"
+        "    src = event['triggerSource']\n"
+        "    event['response']['claimsAndScopeOverrideDetails'] = {\n"
+        "        'accessTokenGeneration': {'claimsToAddOrOverride': {'seen_trigger_source': src}},\n"
+        "    }\n"
+        "    return event\n"
+    )
+    fn_name = "ministack-pretoken-trigger-source"
+    lam.create_function(
+        FunctionName=fn_name, Runtime="python3.12",
+        Role="arn:aws:iam::000000000000:role/test-role",
+        Handler="index.handler",
+        Code={"ZipFile": _make_pretoken_lambda_zip(handler)},
+    )
+    fn_arn = lam.get_function(FunctionName=fn_name)["Configuration"]["FunctionArn"]
+
+    pool_id, client = _setup_pool_with_user(cognito_idp)
+    cognito_idp.update_user_pool(
+        UserPoolId=pool_id,
+        LambdaConfig={"PreTokenGenerationConfig": {
+            "LambdaArn": fn_arn, "LambdaVersion": "V2_0",
+        }},
+    )
+    client_id = client["ClientId"]
+    client_secret = client.get("ClientSecret", "")
+
+    # InitiateAuth (USER_PASSWORD_AUTH) -> TokenGeneration_Authentication
+    auth = cognito_idp.initiate_auth(
+        ClientId=client_id, AuthFlow="USER_PASSWORD_AUTH",
+        AuthParameters={"USERNAME": "testuser", "PASSWORD": "TestPass1!"},
+    )["AuthenticationResult"]
+    assert _decode_jwt_claims(auth["AccessToken"])["seen_trigger_source"] == "TokenGeneration_Authentication"
+
+    # REFRESH_TOKEN_AUTH (InitiateAuth) -> TokenGeneration_RefreshTokens
+    refreshed = cognito_idp.initiate_auth(
+        ClientId=client_id, AuthFlow="REFRESH_TOKEN_AUTH",
+        AuthParameters={"REFRESH_TOKEN": auth["RefreshToken"]},
+    )["AuthenticationResult"]
+    assert _decode_jwt_claims(refreshed["AccessToken"])["seen_trigger_source"] == "TokenGeneration_RefreshTokens"
+
+    # Hosted UI (/login -> /oauth2/token authorization_code grant) -> TokenGeneration_HostedAuth
+    code = _do_login_and_get_code(cognito_idp, client_id)
+    status, _, body = _post_form(f"{ENDPOINT}/oauth2/token", {
+        "grant_type": "authorization_code",
+        "code": code,
+        "redirect_uri": "http://localhost:3000/callback",
+        "client_id": client_id,
+        "client_secret": client_secret,
+    })
+    assert status == 200, body
+    tokens = json.loads(body)
+    assert _decode_jwt_claims(tokens["access_token"])["seen_trigger_source"] == "TokenGeneration_HostedAuth"
+
+    # /oauth2/token refresh_token grant -> TokenGeneration_RefreshTokens
+    status2, _, body2 = _post_form(f"{ENDPOINT}/oauth2/token", {
+        "grant_type": "refresh_token",
+        "refresh_token": tokens["refresh_token"],
+        "client_id": client_id,
+        "client_secret": client_secret,
+    })
+    assert status2 == 200, body2
+    resp2 = json.loads(body2)
+    assert _decode_jwt_claims(resp2["access_token"])["seen_trigger_source"] == "TokenGeneration_RefreshTokens"
+
+
 @pytest.fixture
 def _enable_persistence(monkeypatch, tmp_path):
     """Force PERSIST_STATE on and point STATE_DIR at a tmp dir so
