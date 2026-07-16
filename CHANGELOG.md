@@ -10,6 +10,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 ### Added
 - **IoT — MQTT publishes are routed through topic rules to Lambda** — an MQTT/`iot-data` publish is now matched against each account's topic rules by the rule's `FROM '<topic filter>'` clause (with `+`/`#` wildcards), and every matching enabled rule's `lambda` actions are invoked asynchronously with the message payload as the event (`SELECT *`). Basic Ingest is supported: a publish to `$aws/rules/<ruleName>` is delivered straight to that rule's actions and bypasses pub/sub. Disabled rules are skipped.
 
+### Fixed
+- **S3 — versioned object reads preserve `Content-Type`** — `GetObject` with a `VersionId` always returned `application/octet-stream`, even when that version was written with an explicit content type. PutObject version records now retain their own content type, and versioned reads return it while preserving the existing fallback for older records. Reported by @aaronsteed (#1083).
+
 ## [1.4.2] — 2026-07-13
 
 ### Added
