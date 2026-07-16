@@ -5,6 +5,11 @@ All notable changes to MiniStack will be documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+- **Lambda — Node warm-worker invoke no longer fails on fd 1 writes** — `fs.writeSync` / `fs.write` on stdout bypassed the existing `process.stdout.write` redirect to stderr (#373), so sync loggers (e.g. pino with `{ sync: true }`) could emit on the JSON-line protocol channel and surface false `Runtime.HandlerError` / `Unknown error` responses even when the handler succeeded. The Node worker bootstrap now redirects fd 1 through `fs.writeSync` / `fs.write`, and the warm-worker stdout reader accepts only protocol lines whose `status` is `ok` or `error`. Reported by @kofuk (#1093).
+
 ## [1.4.2] — 2026-07-13
 
 ### Added

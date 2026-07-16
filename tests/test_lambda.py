@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import io
 import json
 import os
@@ -28,6 +29,33 @@ def _make_zip_js(code: str, filename: str = "index.js") -> bytes:
     with zipfile.ZipFile(buf, "w") as zf:
         zf.writestr(filename, code)
     return buf.getvalue()
+
+
+@contextlib.contextmanager
+def _nodejs_lambda(lam, code, *, prefix="lam-node", runtime="nodejs20.x"):
+    """Create a Node.js zip Lambda for the test, delete it on exit."""
+    fname = f"{prefix}-{_uuid_mod.uuid4().hex[:8]}"
+    lam.create_function(
+        FunctionName=fname,
+        Runtime=runtime,
+        Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _make_zip_js(code, "index.js")},
+    )
+    try:
+        yield fname
+    finally:
+        lam.delete_function(FunctionName=fname)
+
+
+def _invoke_lambda_payload(lam, fname, payload=None, **invoke_kw):
+    """Invoke a function and return (response, parsed payload)."""
+    resp = lam.invoke(
+        FunctionName=fname,
+        Payload=json.dumps(payload if payload is not None else {}),
+        **invoke_kw,
+    )
+    return resp, json.loads(resp["Payload"].read())
 
 _LAMBDA_CODE = 'def handler(event, context):\n    return {"statusCode": 200, "body": "ok"}\n'
 
@@ -1892,6 +1920,99 @@ def test_lambda_nodejs_callback_handler(lam):
     payload = json.loads(resp["Payload"].read())
     assert payload["cb"] is True
     assert payload["val"] == 7
+
+
+def test_lambda_nodejs_fd_write_sync_invoke_succeeds(lam):
+    """fs.writeSync(1) logging must not fail the invocation (issue #1093)."""
+    code = (
+        "exports.handler = async () => {\n"
+        "  require('fs').writeSync(1, 'hi\\n');\n"
+        "  return { ok: true };\n"
+        "};\n"
+    )
+    with _nodejs_lambda(lam, code, prefix="lam-node-fdsync") as fname:
+        resp, payload = _invoke_lambda_payload(lam, fname)
+        assert resp["StatusCode"] == 200
+        assert "FunctionError" not in resp
+        assert payload == {"ok": True}
+
+
+def test_lambda_nodejs_fd_write_sync_warm_reinvoke(lam):
+    """Warm re-invoke after fd-1 logging must keep returning the handler result."""
+    code = (
+        "let n = 0;\n"
+        "exports.handler = async () => {\n"
+        "  require('fs').writeSync(1, 'tick\\n');\n"
+        "  return { count: ++n };\n"
+        "};\n"
+    )
+    with _nodejs_lambda(lam, code, prefix="lam-node-fdsync-warm") as fname:
+        first, body1 = _invoke_lambda_payload(lam, fname)
+        second, body2 = _invoke_lambda_payload(lam, fname)
+        assert "FunctionError" not in first
+        assert "FunctionError" not in second
+        assert body1 == {"count": 1}
+        assert body2 == {"count": 2}
+
+
+def test_lambda_nodejs_pino_style_json_log_invoke_succeeds(lam):
+    """Structured JSON logs on fd 1 (pino sync) must not break invoke."""
+    import base64
+
+    marker = f"PINO-{_uuid_mod.uuid4().hex[:8]}"
+    code = (
+        "exports.handler = async () => {\n"
+        f"  require('fs').writeSync(1, JSON.stringify({{level:30,msg:'{marker}'}}) + '\\n');\n"
+        "  return { ok: true };\n"
+        "};\n"
+    )
+    with _nodejs_lambda(lam, code, prefix="lam-node-pino") as fname:
+        resp, payload = _invoke_lambda_payload(lam, fname, LogType="Tail")
+        assert resp["StatusCode"] == 200
+        assert "FunctionError" not in resp
+        assert payload == {"ok": True}
+
+        log_result = resp.get("LogResult", "")
+        assert log_result, "stdout logging should appear in execution logs"
+        decoded = base64.b64decode(log_result).decode("utf-8")
+        assert marker in decoded
+
+
+def test_lambda_nodejs_fd_write_sync_no_log_type(lam):
+    """Default invoke must return the handler payload even when fd 1 is written."""
+    code = (
+        "exports.handler = async () => {\n"
+        "  require('fs').writeSync(1, 'noise\\n');\n"
+        "  return { ok: true };\n"
+        "};\n"
+    )
+    with _nodejs_lambda(lam, code, prefix="lam-node-fdsync-notail") as fname:
+        resp, payload = _invoke_lambda_payload(lam, fname)
+        assert resp["StatusCode"] == 200
+        assert "FunctionError" not in resp
+        assert payload == {"ok": True}
+
+
+def test_lambda_nodejs_fd_write_and_console_log_invoke_succeeds(lam):
+    """console.log and fd-1 writes in one handler must both work."""
+    import base64
+
+    marker = f"MIXED-{_uuid_mod.uuid4().hex[:8]}"
+    code = (
+        "exports.handler = async () => {\n"
+        f"  console.log('{marker}-console');\n"
+        "  require('fs').writeSync(1, 'sync-line\\n');\n"
+        "  return { mixed: true };\n"
+        "};\n"
+    )
+    with _nodejs_lambda(lam, code, prefix="lam-node-mixed-log") as fname:
+        resp, payload = _invoke_lambda_payload(lam, fname, LogType="Tail")
+        assert "FunctionError" not in resp
+        assert payload == {"mixed": True}
+        decoded = base64.b64decode(resp["LogResult"]).decode("utf-8")
+        assert marker in decoded
+        assert "sync-line" in decoded
+
 
 def test_lambda_nodejs_env_vars_at_spawn(lam):
     """Lambda env vars are available at process startup (NODE_OPTIONS, etc.)."""
@@ -5914,6 +6035,89 @@ def _run_nodejs_worker(handler_js, event_payload=None, env_extra=None):
         return invoke_resp
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_nodejs_worker_fd_write_sync_succeeds():
+    """fs.writeSync(1) must not break the worker protocol (issue #1093)."""
+    handler_js = """\
+exports.handler = async () => {
+  require('fs').writeSync(1, 'hi\\n');
+  return { ok: true };
+};
+"""
+    result = _run_nodejs_worker(handler_js)
+    assert result.get("status") == "ok", result
+    assert result["result"] == {"ok": True}
+
+
+def test_nodejs_worker_fs_write_async_succeeds():
+    """fs.write(1, ...) must be redirected like fs.writeSync."""
+    handler_js = """\
+const fs = require('fs');
+exports.handler = async () => {
+  await new Promise((resolve, reject) => {
+    fs.write(1, 'async\\n', (err) => (err ? reject(err) : resolve()));
+  });
+  return { async: true };
+};
+"""
+    result = _run_nodejs_worker(handler_js)
+    assert result.get("status") == "ok", result
+    assert result["result"] == {"async": True}
+
+
+def test_nodejs_worker_fd_write_stdout_fd_succeeds():
+    """Writes via process.stdout.fd must be treated as stdout."""
+    handler_js = """\
+exports.handler = async () => {
+  require('fs').writeSync(process.stdout.fd, 'via-fd\\n');
+  return { viaFd: true };
+};
+"""
+    result = _run_nodejs_worker(handler_js)
+    assert result.get("status") == "ok", result
+    assert result["result"] == {"viaFd": True}
+
+
+def test_nodejs_worker_fd_write_many_lines_succeeds():
+    """Many fd-1 writes in one invocation must not break the worker."""
+    handler_js = """\
+exports.handler = async () => {
+  const fs = require('fs');
+  for (let i = 0; i < 20; i++) fs.writeSync(1, `line-${i}\\n`);
+  return { lines: 20 };
+};
+"""
+    result = _run_nodejs_worker(handler_js)
+    assert result.get("status") == "ok", result
+    assert result["result"] == {"lines": 20}
+
+
+def test_nodejs_worker_json_log_with_status_field_succeeds():
+    """JSON logs with an unrelated status field must not break invoke."""
+    handler_js = """\
+exports.handler = async () => {
+  const entry = JSON.stringify({ status: 200, message: 'logged' });
+  require('fs').writeSync(1, entry + '\\n');
+  return { ok: true };
+};
+"""
+    result = _run_nodejs_worker(handler_js)
+    assert result.get("status") == "ok", result
+    assert result["result"] == {"ok": True}
+
+
+def test_nodejs_worker_fd_write_then_handler_error():
+    """Logging to fd 1 must not mask a real handler failure."""
+    handler_js = """\
+exports.handler = async () => {
+  require('fs').writeSync(1, 'before-throw\\n');
+  throw new Error('on purpose');
+};
+"""
+    result = _run_nodejs_worker(handler_js)
+    assert result.get("status") == "error", result
+    assert "on purpose" in result.get("error", "")
 
 
 def test_nodejs_worker_aws_sdk_v3_stub_resolves():
