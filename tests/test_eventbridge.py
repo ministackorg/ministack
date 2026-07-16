@@ -11,6 +11,26 @@ import pytest
 from botocore.exceptions import ClientError
 
 
+def _events_client(region_name):
+    return boto3.client(
+        "events",
+        endpoint_url=os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566"),
+        aws_access_key_id="test",
+        aws_secret_access_key="test",
+        region_name=region_name,
+    )
+
+
+def _sqs_client(region_name):
+    return boto3.client(
+        "sqs",
+        endpoint_url=os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566"),
+        aws_access_key_id="test",
+        aws_secret_access_key="test",
+        region_name=region_name,
+    )
+
+
 def test_eventbridge_bus_rule(eb):
     eb.create_event_bus(Name="test-bus")
     eb.put_rule(
@@ -55,6 +75,98 @@ def test_eventbridge_targets(eb):
     )
     resp = eb.list_targets_by_rule(Rule="target-rule")
     assert len(resp["Targets"]) == 1
+
+
+def test_eventbridge_buses_rules_and_targets_are_region_scoped(eb):
+    west = _events_client("us-west-2")
+    bus_name = f"region-bus-{_uuid_mod.uuid4().hex[:8]}"
+    rule_name = f"region-rule-{_uuid_mod.uuid4().hex[:8]}"
+
+    east_bus_arn = eb.create_event_bus(Name=bus_name)["EventBusArn"]
+    west_bus_arn = west.create_event_bus(Name=bus_name)["EventBusArn"]
+    assert east_bus_arn == f"arn:aws:events:us-east-1:000000000000:event-bus/{bus_name}"
+    assert west_bus_arn == f"arn:aws:events:us-west-2:000000000000:event-bus/{bus_name}"
+
+    eb.put_rule(
+        Name=rule_name,
+        EventBusName=bus_name,
+        ScheduleExpression="rate(5 minutes)",
+        State="ENABLED",
+    )
+    west.put_rule(
+        Name=rule_name,
+        EventBusName=bus_name,
+        ScheduleExpression="rate(10 minutes)",
+        State="ENABLED",
+    )
+    eb.put_targets(
+        Rule=rule_name,
+        EventBusName=bus_name,
+        Targets=[
+            {
+                "Id": "east",
+                "Arn": "arn:aws:lambda:us-east-1:000000000000:function:east-fn",
+            }
+        ],
+    )
+    west.put_targets(
+        Rule=rule_name,
+        EventBusName=bus_name,
+        Targets=[
+            {
+                "Id": "west",
+                "Arn": "arn:aws:lambda:us-west-2:000000000000:function:west-fn",
+            }
+        ],
+    )
+
+    assert eb.describe_event_bus(Name=bus_name)["Arn"] == east_bus_arn
+    assert west.describe_event_bus(Name=bus_name)["Arn"] == west_bus_arn
+    assert eb.describe_rule(Name=rule_name, EventBusName=bus_name)["Arn"] == (
+        f"arn:aws:events:us-east-1:000000000000:rule/{bus_name}/{rule_name}"
+    )
+    assert west.describe_rule(Name=rule_name, EventBusName=bus_name)["Arn"] == (
+        f"arn:aws:events:us-west-2:000000000000:rule/{bus_name}/{rule_name}"
+    )
+    assert [t["Id"] for t in eb.list_targets_by_rule(Rule=rule_name, EventBusName=bus_name)["Targets"]] == ["east"]
+    assert [t["Id"] for t in west.list_targets_by_rule(Rule=rule_name, EventBusName=bus_name)["Targets"]] == ["west"]
+
+    eb.delete_rule(Name=rule_name, EventBusName=bus_name)
+    eb.delete_event_bus(Name=bus_name)
+
+    assert west.describe_event_bus(Name=bus_name)["Arn"] == west_bus_arn
+    assert [t["Id"] for t in west.list_targets_by_rule(Rule=rule_name, EventBusName=bus_name)["Targets"]] == ["west"]
+
+
+def test_eventbridge_rule_names_by_target_and_remove_targets_are_region_scoped(eb):
+    west = _events_client("us-west-2")
+    rule_name = f"region-target-index-{_uuid_mod.uuid4().hex[:8]}"
+    east_target_arn = "arn:aws:lambda:us-east-1:000000000000:function:index-east"
+    west_target_arn = "arn:aws:lambda:us-west-2:000000000000:function:index-west"
+
+    eb.put_rule(
+        Name=rule_name,
+        ScheduleExpression="rate(5 minutes)",
+        State="ENABLED",
+    )
+    west.put_rule(
+        Name=rule_name,
+        ScheduleExpression="rate(5 minutes)",
+        State="ENABLED",
+    )
+    eb.put_targets(Rule=rule_name, Targets=[{"Id": "east", "Arn": east_target_arn}])
+    west.put_targets(Rule=rule_name, Targets=[{"Id": "west", "Arn": west_target_arn}])
+
+    assert eb.list_rule_names_by_target(TargetArn=east_target_arn)["RuleNames"] == [rule_name]
+    assert eb.list_rule_names_by_target(TargetArn=west_target_arn)["RuleNames"] == []
+    assert west.list_rule_names_by_target(TargetArn=west_target_arn)["RuleNames"] == [rule_name]
+    assert west.list_rule_names_by_target(TargetArn=east_target_arn)["RuleNames"] == []
+
+    eb.remove_targets(Rule=rule_name, Ids=["east"])
+
+    assert eb.list_targets_by_rule(Rule=rule_name)["Targets"] == []
+    assert [t["Id"] for t in west.list_targets_by_rule(Rule=rule_name)["Targets"]] == ["west"]
+    assert west.list_rule_names_by_target(TargetArn=west_target_arn)["RuleNames"] == [rule_name]
 
 
 def test_eventbridge_put_targets_rejects_malformed_target_arn(eb):
@@ -215,6 +327,85 @@ def test_eventbridge_foreign_region_sqs_target_does_not_deliver_to_same_name_que
         ]
     )
 
+    msgs = sqs.receive_message(QueueUrl=q_url, MaxNumberOfMessages=1, WaitTimeSeconds=1)
+    assert msgs.get("Messages", []) == []
+
+
+def test_eventbridge_same_region_sns_target_dispatches_to_topic(eb, sns, sqs):
+    topic_name = f"target-sns-{_uuid_mod.uuid4().hex[:8]}"
+    queue_name = f"target-sns-{_uuid_mod.uuid4().hex[:8]}"
+    rule_name = f"target-sns-{_uuid_mod.uuid4().hex[:8]}"
+    topic_arn = sns.create_topic(Name=topic_name)["TopicArn"]
+    q_url = sqs.create_queue(QueueName=queue_name)["QueueUrl"]
+    q_arn = sqs.get_queue_attributes(
+        QueueUrl=q_url,
+        AttributeNames=["QueueArn"],
+    )["Attributes"]["QueueArn"]
+    sns.subscribe(TopicArn=topic_arn, Protocol="sqs", Endpoint=q_arn)
+    eb.put_rule(
+        Name=rule_name,
+        EventPattern=json.dumps({"source": ["same.region.sns"]}),
+        State="ENABLED",
+    )
+    eb.put_targets(
+        Rule=rule_name,
+        Targets=[{"Id": "local-sns", "Arn": topic_arn}],
+    )
+
+    resp = eb.put_events(
+        Entries=[
+            {
+                "Source": "same.region.sns",
+                "DetailType": "SameRegionSns",
+                "Detail": json.dumps({"delivered": True}),
+                "EventBusName": "default",
+            }
+        ]
+    )
+
+    assert resp["FailedEntryCount"] == 0
+    msgs = sqs.receive_message(QueueUrl=q_url, MaxNumberOfMessages=1, WaitTimeSeconds=1)
+    assert len(msgs.get("Messages", [])) == 1
+    body = json.loads(msgs["Messages"][0]["Body"])
+    payload = json.loads(body["Message"])
+    assert payload["source"] == "same.region.sns"
+    assert payload["detail"] == {"delivered": True}
+
+
+def test_eventbridge_foreign_region_sns_target_does_not_deliver_to_same_name_topic(eb, sns, sqs):
+    topic_name = f"target-foreign-sns-{_uuid_mod.uuid4().hex[:8]}"
+    queue_name = f"target-foreign-sns-{_uuid_mod.uuid4().hex[:8]}"
+    rule_name = f"target-foreign-sns-{_uuid_mod.uuid4().hex[:8]}"
+    topic_arn = sns.create_topic(Name=topic_name)["TopicArn"]
+    q_url = sqs.create_queue(QueueName=queue_name)["QueueUrl"]
+    q_arn = sqs.get_queue_attributes(
+        QueueUrl=q_url,
+        AttributeNames=["QueueArn"],
+    )["Attributes"]["QueueArn"]
+    sns.subscribe(TopicArn=topic_arn, Protocol="sqs", Endpoint=q_arn)
+    west_arn = f"arn:aws:sns:us-west-2:000000000000:{topic_name}"
+    eb.put_rule(
+        Name=rule_name,
+        EventPattern=json.dumps({"source": ["foreign.sns"]}),
+        State="ENABLED",
+    )
+    eb.put_targets(
+        Rule=rule_name,
+        Targets=[{"Id": "foreign-sns", "Arn": west_arn}],
+    )
+
+    resp = eb.put_events(
+        Entries=[
+            {
+                "Source": "foreign.sns",
+                "DetailType": "ForeignRegionSns",
+                "Detail": json.dumps({"should": "not-deliver"}),
+                "EventBusName": "default",
+            }
+        ]
+    )
+
+    assert resp["FailedEntryCount"] == 0
     msgs = sqs.receive_message(QueueUrl=q_url, MaxNumberOfMessages=1, WaitTimeSeconds=1)
     assert msgs.get("Messages", []) == []
 
@@ -1811,6 +2002,84 @@ def test_eventbridge_replay_destination_receives_events(eb, sqs):
     eb.delete_archive(ArchiveName=arch_name)
 
 
+def test_eventbridge_replay_dispatch_uses_replay_region(eb, sqs):
+    """Replay worker dispatches under the Region where StartReplay was called."""
+    west = _events_client("us-west-2")
+    west_sqs = _sqs_client("us-west-2")
+    suffix = _uuid_mod.uuid4().hex[:8]
+    bus_name = f"rp-region-bus-{suffix}"
+    rule_name = f"rp-region-rule-{suffix}"
+    source = f"region.replay.{suffix}"
+
+    east_bus_arn = eb.create_event_bus(Name=bus_name)["EventBusArn"]
+    west_bus_arn = west.create_event_bus(Name=bus_name)["EventBusArn"]
+    assert east_bus_arn.endswith(f":event-bus/{bus_name}")
+    assert west_bus_arn == f"arn:aws:events:us-west-2:000000000000:event-bus/{bus_name}"
+
+    east_q_url = sqs.create_queue(QueueName=f"rp-region-east-{suffix}")["QueueUrl"]
+    east_q_arn = sqs.get_queue_attributes(
+        QueueUrl=east_q_url,
+        AttributeNames=["QueueArn"],
+    )["Attributes"]["QueueArn"]
+    west_q_url = west_sqs.create_queue(QueueName=f"rp-region-west-{suffix}")["QueueUrl"]
+    west_q_arn = west_sqs.get_queue_attributes(
+        QueueUrl=west_q_url,
+        AttributeNames=["QueueArn"],
+    )["Attributes"]["QueueArn"]
+
+    for client, target_arn in ((eb, east_q_arn), (west, west_q_arn)):
+        client.put_rule(
+            Name=rule_name,
+            EventBusName=bus_name,
+            EventPattern=json.dumps({"source": [source]}),
+            State="ENABLED",
+        )
+        client.put_targets(
+            Rule=rule_name,
+            EventBusName=bus_name,
+            Targets=[{"Id": "target", "Arn": target_arn}],
+        )
+
+    arch_name = f"rp-region-arch-{suffix}"
+    west.create_archive(ArchiveName=arch_name, EventSourceArn=west_bus_arn)
+    west.put_events(
+        Entries=[
+            {
+                "Source": source,
+                "DetailType": "ReplayRegion",
+                "Detail": json.dumps({"region": "us-west-2"}),
+                "EventBusName": bus_name,
+            }
+        ]
+    )
+    archive_arn = west.describe_archive(ArchiveName=arch_name)["ArchiveArn"]
+    # Drain live delivery from the seed PutEvents call; the final assertion
+    # should only observe the replay delivery.
+    west_sqs.receive_message(QueueUrl=west_q_url, MaxNumberOfMessages=10, WaitTimeSeconds=1)
+
+    west.start_replay(
+        ReplayName=f"rp-region-{suffix}",
+        EventSourceArn=archive_arn,
+        EventStartTime=0,
+        EventEndTime=time.time() + 3600,
+        Destination={"Arn": west_bus_arn},
+    )
+    time.sleep(0.5)
+
+    west_msgs = west_sqs.receive_message(
+        QueueUrl=west_q_url,
+        MaxNumberOfMessages=10,
+        WaitTimeSeconds=2,
+    )
+    east_msgs = sqs.receive_message(
+        QueueUrl=east_q_url,
+        MaxNumberOfMessages=10,
+        WaitTimeSeconds=1,
+    )
+    assert len(west_msgs.get("Messages", [])) >= 1
+    assert east_msgs.get("Messages", []) == []
+
+
 def test_eventbridge_archive_event_count_unchanged_after_replay(eb):
     """Replay reads archived events non-destructively; EventCount stays the same."""
     arch_name = f"postcnt-arch-{_uuid_mod.uuid4().hex[:8]}"
@@ -1966,19 +2235,22 @@ def isolated_scheduler():
 
 
 _ACCOUNT = "000000000000"
+_REGION = "us-east-1"
 _RULE_KEY = "default|unit-test-rule"
-_STATE_KEY = (_ACCOUNT, _RULE_KEY)
+_STATE_KEY = (_ACCOUNT, _REGION, _RULE_KEY)
 _DUMMY_TARGET = [{"Id": "t1", "Arn": "arn:aws:lambda:us-east-1:000000000000:function:dummy"}]
 
-def _seed_rule(schedule="rate(1 minute)", state="ENABLED"):
-    _eb._rules._data[_STATE_KEY] = {
+def _seed_rule(schedule="rate(1 minute)", state="ENABLED", region=_REGION):
+    state_key = (_ACCOUNT, region, _RULE_KEY)
+    _eb._rules._data[state_key] = {
         "Name": "unit-test-rule",
         "ScheduleExpression": schedule,
         "State": state,
         "EventBusName": "default",
-        "Arn": "arn:aws:events:us-east-1:000000000000:rule/unit-test-rule",
+        "Arn": f"arn:aws:events:{region}:000000000000:rule/unit-test-rule",
     }
-    _eb._targets._data[_STATE_KEY] = list(_DUMMY_TARGET)
+    _eb._targets._data[state_key] = list(_DUMMY_TARGET)
+    return state_key
 
 
 from unittest.mock import patch as _patch
@@ -2009,17 +2281,14 @@ def test_scheduler_restores_rule_region_while_dispatching(isolated_scheduler):
     observed = []
     try:
         set_request_region("us-east-1")
-        _seed_rule()
-        _eb._rules._data[_STATE_KEY]["Arn"] = (
-            "arn:aws:events:us-west-2:000000000000:rule/unit-test-rule"
-        )
-        _eb._targets._data[_STATE_KEY] = [
+        west_state_key = _seed_rule(region="us-west-2")
+        _eb._targets._data[west_state_key] = [
             {
                 "Id": "sfn",
                 "Arn": "arn:aws:states:us-west-2:000000000000:stateMachine:scheduled",
             }
         ]
-        _eb._rule_last_fired[_STATE_KEY] = _eb._now_ts() - 65
+        _eb._rule_last_fired[west_state_key] = _eb._now_ts() - 65
         isolated_scheduler.side_effect = (
             lambda _target, event, _rule: observed.append((_eb.get_region(), event["Region"]))
         )
