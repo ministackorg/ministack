@@ -160,7 +160,7 @@ Since 1.4.0 state is additionally isolated per **region** — see [Multi-Region]
 | `111111111111` | `111111111111` |
 | `048408301323` | `048408301323` |
 | `test` | `000000000000` (default) |
-| `AKIAIOSFODNN7EXAMPLE` | `000000000000` (default) |
+| `test-key-do-not-use` | `000000000000` (default) |
 
 **Terraform** — set `access_key` in your provider block:
 ```hcl
@@ -615,6 +615,17 @@ conn = psycopg2.connect(
 ```
 
 Supported engines: `postgres`, `mysql`, `mariadb`, `aurora-postgresql`, `aurora-mysql`
+
+Aurora cluster members share one cluster-owned database container, so SQL,
+users, and grants created through one member are visible through every member
+and through both cluster endpoints. The local reader endpoint intentionally
+resolves to the same read/write database process as the writer; writes sent to
+the reader are therefore accepted. Emulating an engine-enforced read-only
+reader would require a separate replicating database process. Deleting the
+final provisioned member leaves the cluster `available` but stops its shared
+container, so direct SQL and the Data API remain unavailable until a new member
+is created. That first new member restarts the preserved container and data;
+only `DeleteDBCluster` removes the container and its storage.
 
 ---
 
