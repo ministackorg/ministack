@@ -9,6 +9,8 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 - **Lambda — Node warm-worker invoke no longer fails on fd 1 writes** — `fs.writeSync` / `fs.write` on stdout bypassed the existing `process.stdout.write` redirect to stderr (#373), so sync loggers (e.g. pino with `{ sync: true }`) could emit on the JSON-line protocol channel and surface false `Runtime.HandlerError` / `Unknown error` responses even when the handler succeeded. The Node worker bootstrap now redirects fd 1 through `fs.writeSync` / `fs.write`, and the warm-worker stdout reader accepts only protocol lines whose `status` is `ok` or `error`. Reported by @kofuk (#1093).
+### Added
+- **IoT — MQTT publishes are routed through topic rules to Lambda** — an MQTT/`iot-data` publish is now matched against each account's topic rules by the rule's `FROM '<topic filter>'` clause (with `+`/`#` wildcards), and every matching enabled rule's `lambda` actions are invoked asynchronously with the message payload as the event (`SELECT *`). Basic Ingest is supported: a publish to `$aws/rules/<ruleName>` is delivered straight to that rule's actions and bypasses pub/sub. Disabled rules are skipped.
 
 ## [1.4.2] — 2026-07-13
 

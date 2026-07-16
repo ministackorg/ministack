@@ -1606,6 +1606,55 @@ async def broker_stop() -> None:
         _persistent_sessions.clear()
 
 
+_BASIC_INGEST_PREFIX = "$aws/rules/"
+
+
+def _rules_for_account(account_id: str) -> list[dict]:
+    return [v for (acct, _key), v in _topic_rules._data.items() if acct == account_id]
+
+
+def _rule_event(payload: bytes):
+    """Decode a publish payload into a rule event (JSON, else raw text)."""
+    try:
+        return json.loads(payload.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return (payload or b"").decode("utf-8", "replace")
+
+
+def _dispatch_rule_to_lambda(account_id: str, function_arn: str, event) -> None:
+    from ministack.services import lambda_svc
+
+    func, config, name = lambda_svc._get_func_record_for_ref_in_scope(
+        function_arn, account_id=account_id
+    )
+    if not func or not config:
+        _broker_logger.warning("IoT rule → Lambda: function %s not found", function_arn)
+        return
+    exec_record = lambda_svc._execution_record_for_config(func, config)
+    threading.Thread(
+        target=lambda_svc._execute_function_with_config_scope,
+        args=(exec_record, event),
+        daemon=True,
+    ).start()
+
+
+def _run_rule_actions(account_id: str, rule: dict, payload: bytes) -> None:
+    if not rule or rule.get("ruleDisabled"):
+        return
+    event = _rule_event(payload)
+    for action in rule.get("actions", []) or []:
+        lam = action.get("lambda")
+        if lam and lam.get("functionArn"):
+            _dispatch_rule_to_lambda(account_id, lam["functionArn"], event)
+
+
+def _evaluate_topic_rules(account_id: str, topic: str, payload: bytes) -> None:
+    for rule in _rules_for_account(account_id):
+        filter_ = _rule_topic_filter(rule.get("sql", ""))
+        if filter_ and _topic_matches(filter_, topic):
+            _run_rule_actions(account_id, rule, payload)
+
+
 async def broker_publish(
     account_id: str,
     topic: str,
@@ -1613,6 +1662,13 @@ async def broker_publish(
     qos: int = 0,
     retain: bool = False,
 ) -> None:
+    # Basic Ingest: a publish to `$aws/rules/<ruleName>` is delivered straight
+    # to that rule's actions and bypasses pub/sub delivery entirely.
+    if topic.startswith(_BASIC_INGEST_PREFIX):
+        rule_name = topic[len(_BASIC_INGEST_PREFIX):].split("/", 1)[0]
+        _run_rule_actions(account_id, _topic_rules.get_scoped(account_id, None, rule_name), payload)
+        return
+
     scoped = _scoped_topic(account_id, topic)
 
     if retain:
@@ -1648,6 +1704,8 @@ async def broker_publish(
                     if len(ps.queued_messages) > _MAX_QUEUED_MESSAGES:
                         ps.queued_messages = ps.queued_messages[-_MAX_QUEUED_MESSAGES:]
                     break
+
+    _evaluate_topic_rules(account_id, topic, payload)
 
 
 async def broker_subscribe(
