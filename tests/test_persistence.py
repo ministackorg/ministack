@@ -955,6 +955,208 @@ def test_sns_region_scoped_stores_survive_warm_boot_in_original_scope():
         set_request_region(original_region)
 
 
+def test_eventbridge_region_scoped_stores_survive_warm_boot_in_original_scope():
+    """EventBridge regional stores remain in their original account/region
+    after the real JSON persistence path."""
+    from ministack.core.responses import (
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+
+    mod = _get_module("eventbridge")
+    mod.reset()
+    original_account = get_account_id()
+    original_region = get_region()
+    try:
+        set_request_account_id("111111111111")
+        set_request_region("us-west-2")
+
+        now = mod._now_ts()
+        bus_name = "persisted-bus"
+        rule_name = "persisted-rule"
+        archive_name = "persisted-archive"
+        replay_name = "persisted-replay"
+        endpoint_name = "persisted-endpoint"
+        connection_name = "persisted-connection"
+        api_destination_name = "persisted-api"
+        partner_name = "persisted-partner"
+        bus_arn = f"arn:aws:events:us-west-2:111111111111:event-bus/{bus_name}"
+        rule_key = mod._rule_key(rule_name, bus_name)
+        rule_arn = f"arn:aws:events:us-west-2:111111111111:rule/{bus_name}/{rule_name}"
+        archive_arn = f"arn:aws:events:us-west-2:111111111111:archive/{archive_name}"
+        replay_arn = f"arn:aws:events:us-west-2:111111111111:replay/{replay_name}"
+        endpoint_arn = f"arn:aws:events:us-west-2:111111111111:endpoint/{endpoint_name}"
+        connection_arn = f"arn:aws:events:us-west-2:111111111111:connection/{connection_name}"
+        api_destination_arn = (
+            f"arn:aws:events:us-west-2:111111111111:api-destination/{api_destination_name}"
+        )
+        partner_arn = f"arn:aws:events:us-west-2:222222222222:event-source/{partner_name}"
+
+        mod._event_buses[bus_name] = {
+            "Name": bus_name,
+            "Arn": bus_arn,
+            "CreationTime": now,
+            "LastModifiedTime": now,
+        }
+        mod._rules[rule_key] = {
+            "Name": rule_name,
+            "Arn": rule_arn,
+            "EventBusName": bus_name,
+            "ScheduleExpression": "rate(5 minutes)",
+            "State": "ENABLED",
+            "CreationTime": now,
+        }
+        mod._targets[rule_key] = [
+            {
+                "Id": "persisted-target",
+                "Arn": "arn:aws:sqs:us-west-2:111111111111:persisted-queue",
+            }
+        ]
+        mod._tags[rule_arn] = {"env": "test"}
+        mod._archives[archive_name] = {
+            "ArchiveName": archive_name,
+            "ArchiveArn": archive_arn,
+            "EventSourceArn": bus_arn,
+            "State": "ENABLED",
+            "CreationTime": now,
+            "EventCount": 0,
+            "Events": [],
+        }
+        mod._replays[replay_name] = {
+            "ReplayName": replay_name,
+            "ReplayArn": replay_arn,
+            "EventSourceArn": archive_arn,
+            "Destination": {"Arn": bus_arn},
+            "State": "COMPLETED",
+            "ReplayStartTime": now,
+            "ReplayEndTime": now,
+        }
+        mod._endpoints[endpoint_name] = {
+            "Name": endpoint_name,
+            "Arn": endpoint_arn,
+            "EndpointUrl": f"https://{endpoint_name}.global-events.us-west-2.amazonaws.com",
+            "State": "ACTIVE",
+            "CreationTime": now,
+            "LastModifiedTime": now,
+        }
+        mod._event_bus_policies[bus_name] = {
+            "Version": "2012-10-17",
+            "Statement": [{"Sid": "Allow", "Resource": bus_arn}],
+        }
+        mod._connections[connection_name] = {
+            "Name": connection_name,
+            "ConnectionArn": connection_arn,
+            "ConnectionState": "AUTHORIZED",
+            "AuthorizationType": "API_KEY",
+            "CreationTime": now,
+            "LastModifiedTime": now,
+        }
+        mod._api_destinations[api_destination_name] = {
+            "Name": api_destination_name,
+            "ApiDestinationArn": api_destination_arn,
+            "ApiDestinationState": "ACTIVE",
+            "ConnectionArn": connection_arn,
+            "InvocationEndpoint": "https://example.com",
+            "HttpMethod": "POST",
+            "CreationTime": now,
+            "LastModifiedTime": now,
+        }
+        mod._partner_event_sources[mod._partner_key("222222222222", partner_name)] = {
+            "Name": partner_name,
+            "Account": "222222222222",
+            "EventSourceArn": partner_arn,
+        }
+
+        _round_trip_dict(mod, "eventbridge")
+
+        assert mod._event_buses[bus_name]["Arn"] == bus_arn
+        assert mod._rules[rule_key]["Arn"] == rule_arn
+        assert mod._targets[rule_key][0]["Id"] == "persisted-target"
+        assert mod._tags[rule_arn]["env"] == "test"
+        assert mod._archives[archive_name]["ArchiveArn"] == archive_arn
+        assert mod._replays[replay_name]["ReplayArn"] == replay_arn
+        assert mod._endpoints[endpoint_name]["Arn"] == endpoint_arn
+        assert mod._event_bus_policies[bus_name]["Statement"][0]["Resource"] == bus_arn
+        assert mod._connections[connection_name]["ConnectionArn"] == connection_arn
+        assert mod._api_destinations[api_destination_name]["ApiDestinationArn"] == api_destination_arn
+        partner_key = mod._partner_key("222222222222", partner_name)
+        assert mod._partner_event_sources[partner_key]["EventSourceArn"] == partner_arn
+
+        set_request_region("us-east-1")
+        assert mod._event_buses.get(bus_name) is None
+        assert mod._rules.get(rule_key) is None
+        assert mod._targets.get(rule_key) is None
+        assert mod._tags.get(rule_arn) is None
+        assert mod._archives.get(archive_name) is None
+        assert mod._replays.get(replay_name) is None
+        assert mod._endpoints.get(endpoint_name) is None
+        assert mod._event_bus_policies.get(bus_name) is None
+        assert mod._connections.get(connection_name) is None
+        assert mod._api_destinations.get(api_destination_name) is None
+        assert mod._partner_event_sources.get(partner_key) is None
+
+        set_request_account_id("222222222222")
+        set_request_region("us-west-2")
+        assert mod._event_buses.get(bus_name) is None
+        assert mod._rules.get(rule_key) is None
+        assert mod._targets.get(rule_key) is None
+    finally:
+        mod.reset()
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
+def test_eventbridge_legacy_account_scoped_targets_restore_to_rule_region():
+    """Legacy target stores are scoped to the EventBridge rule region, not the
+    target ARN region, when migrating from account-only persistence."""
+    from ministack.core.responses import (
+        AccountScopedDict,
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+
+    mod = _get_module("eventbridge")
+    mod.reset()
+    original_account = get_account_id()
+    original_region = get_region()
+    try:
+        set_request_account_id("111111111111")
+        set_request_region("us-east-1")
+        rule_key = mod._rule_key("legacy-rule", "default")
+        legacy_rules = AccountScopedDict()
+        legacy_targets = AccountScopedDict()
+        legacy_rules[rule_key] = {
+            "Name": "legacy-rule",
+            "Arn": "arn:aws:events:us-west-2:111111111111:rule/legacy-rule",
+            "EventBusName": "default",
+            "ScheduleExpression": "rate(5 minutes)",
+            "State": "ENABLED",
+        }
+        legacy_targets[rule_key] = [
+            {
+                "Id": "foreign-sns",
+                "Arn": "arn:aws:sns:eu-central-1:111111111111:legacy-topic",
+            }
+        ]
+
+        mod.restore_state({"rules": legacy_rules, "targets": legacy_targets})
+
+        set_request_region("us-west-2")
+        assert mod._rules[rule_key]["Name"] == "legacy-rule"
+        assert mod._targets[rule_key][0]["Id"] == "foreign-sns"
+
+        set_request_region("eu-central-1")
+        assert mod._targets.get(rule_key) is None
+    finally:
+        mod.reset()
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
 # ── Import-order regression for the ECS NameError trap ───────────────
 
 def test_ecs_module_reload_with_persisted_attributes_does_not_namerror():
