@@ -5402,6 +5402,46 @@ def test_invoke_rie_classifies_unhandled_vs_handled():
     assert classification == "Handled"
 
 
+def _invoke_with_log_output(monkeypatch, headers, log_output):
+    from ministack.services import lambda_svc as lsvc
+
+    name = f"lam-log-result-{_uuid_mod.uuid4().hex}"
+    monkeypatch.setitem(lsvc._functions, name, {"config": {}, "versions": {}})
+    monkeypatch.setattr(
+        lsvc,
+        "_execute_function_with_config_scope",
+        lambda *_: {"body": {"ok": True}, "log": log_output},
+    )
+    monkeypatch.setattr(lsvc, "_emit_lambda_metrics", lambda *args, **kwargs: None)
+    return asyncio.run(lsvc._invoke(name, {}, headers))
+
+
+def test_lambda_invoke_log_result_requires_tail(monkeypatch):
+    import base64
+
+    _, default_headers, _ = _invoke_with_log_output(monkeypatch, {}, "function output")
+    _, tail_headers, _ = _invoke_with_log_output(
+        monkeypatch,
+        {"X-Amz-Log-Type": "Tail"},
+        "function output",
+    )
+
+    assert "X-Amz-Log-Result" not in default_headers
+    assert base64.b64decode(tail_headers["X-Amz-Log-Result"]) == b"function output"
+
+
+def test_lambda_invoke_log_result_is_limited_to_last_4kb(monkeypatch):
+    import base64
+
+    _, headers, _ = _invoke_with_log_output(
+        monkeypatch,
+        {"x-amz-log-type": "tail"},
+        "discarded" + "x" * 4096,
+    )
+
+    assert base64.b64decode(headers["X-Amz-Log-Result"]) == b"x" * 4096
+
+
 def test_lambda_invoke_stderr_captured_in_log_result(lam):
     """Direct Lambda.Invoke captures print() output in X-Amz-Log-Result header."""
     import base64
