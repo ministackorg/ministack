@@ -771,7 +771,7 @@ def _dispatch(
                 return _abort_multipart_upload(bucket, key, query_params)
             if "tagging" in query_params:
                 return _delete_object_tagging(bucket, key, query_params)
-            return _delete_object(bucket, key, headers)
+            return _delete_object(bucket, key, headers, query_params)
 
         return _error(
             "MethodNotAllowed",
@@ -2626,8 +2626,96 @@ def _head_object(bucket_name: str, key: str, headers: dict | None = None):
                                          include_checksums=include_checksums), b""
 
 
-def _delete_object(bucket_name: str, key: str, headers: dict | None = None):
+def _purge_current_object(bucket_name: str, key: str, bucket: dict):
+    """Remove the current object plus its key-level metadata and on-disk copy."""
+    bucket["objects"].pop(key, None)
+    _object_tags.pop((bucket_name, key, None), None)
+    _object_retention.pop((bucket_name, key), None)
+    _object_legal_hold.pop((bucket_name, key), None)
+    _object_acl.pop((bucket_name, key), None)
+    _delete_persisted_object(bucket_name, key)
+
+
+def _object_record_from_version(v: dict) -> dict:
+    """Rebuild a current-object record from a stored version entry.
+
+    Used when a version delete removes the current version/marker and an older
+    real version becomes current again — the version index keeps the body plus
+    the wire-relevant metadata (etag/size/checksums/storage class), which is
+    enough to serve Head/GetObject without a VersionId."""
+    return {
+        "body": v.get("data"),
+        "content_type": v.get("content_type", "application/octet-stream"),
+        "content_encoding": v.get("content_encoding"),
+        "etag": v["etag"],
+        "last_modified": v["last_modified"],
+        "size": v["size"],
+        "metadata": v.get("metadata", {}),
+        "preserved_headers": v.get("preserved_headers", {}),
+        "storage_class": v.get("storage_class") or "STANDARD",
+        "checksums": v.get("checksums") or {},
+        "version_id": v["version_id"],
+    }
+
+
+def _delete_object_version(bucket: dict, bucket_name: str, key: str,
+                           version_id: str) -> tuple[bool, bool]:
+    """Physically remove the exact version (or delete marker) addressed by
+    `version_id`, then reconcile the current-object pointer and is_latest flags.
+
+    Returns (found, was_delete_marker). `found` is False when no version matched
+    — S3 reports that as an error in the batch API but 204s the single delete.
+    """
+    vkey = (bucket_name, key)
+    versions = _object_versions.get(vkey)
+
+    # No tracked history: the only addressable version is the current object,
+    # exposed under the "null" id (objects put before versioning was enabled).
+    if not versions:
+        if version_id == "null" and key in bucket["objects"]:
+            _purge_current_object(bucket_name, key, bucket)
+            return True, False
+        return False, False
+
+    idx = next(
+        (i for i, v in enumerate(versions) if v["version_id"] == version_id), None
+    )
+    if idx is None:
+        if version_id == "null" and key in bucket["objects"]:
+            _purge_current_object(bucket_name, key, bucket)
+            return True, False
+        return False, False
+
+    removed = versions.pop(idx)
+    was_delete_marker = bool(removed.get("is_delete_marker"))
+    # Per-version tags travel with the version being removed.
+    _object_tags.pop((bucket_name, key, version_id), None)
+
+    if not versions:
+        # History is now empty — drop the index entry and the current object.
+        _object_versions.pop(vkey, None)
+        _purge_current_object(bucket_name, key, bucket)
+        return True, was_delete_marker
+
+    # The newest surviving entry becomes latest (list is append-ordered).
+    for v in versions:
+        v["is_latest"] = False
+    latest = versions[-1]
+    latest["is_latest"] = True
+
+    # Reconcile the current-object pointer (used by Head/GetObject without a
+    # VersionId): a delete marker hides the object; a real version exposes it.
+    if latest.get("is_delete_marker"):
+        bucket["objects"].pop(key, None)
+    else:
+        bucket["objects"][key] = _object_record_from_version(latest)
+    return True, was_delete_marker
+
+
+def _delete_object(bucket_name: str, key: str, headers: dict | None = None,
+                   query_params: dict | None = None):
     headers = headers or {}
+    query_params = query_params or {}
     bucket = _ensure_bucket(bucket_name)
     if bucket is None:
         return _no_such_bucket(bucket_name)
@@ -2636,6 +2724,23 @@ def _delete_object(bucket_name: str, key: str, headers: dict | None = None):
         lock_err = _check_object_lock(bucket_name, key, headers)
         if lock_err:
             return lock_err
+
+    # An explicit VersionId permanently removes exactly that version (or that
+    # specific delete marker) — it never creates a new marker. Only a delete
+    # WITHOUT a VersionId falls through to the delete-marker path below.
+    version_id = _qp(query_params, "versionId", "")
+    if version_id:
+        _found, was_delete_marker = _delete_object_version(
+            bucket, bucket_name, key, version_id
+        )
+        # S3 returns 204 whether or not the version existed, echoing the
+        # addressed VersionId (and delete-marker flag when one was removed).
+        resp_headers = {"x-amz-version-id": version_id}
+        if was_delete_marker:
+            resp_headers["x-amz-delete-marker"] = "true"
+        if _found:
+            _fire_s3_event_async(bucket_name, key, "s3:ObjectRemoved:Delete")
+        return 204, resp_headers, b""
 
     versioning = _bucket_versioning.get(bucket_name, "")
     if versioning in ("Enabled", "Suspended"):
@@ -3673,43 +3778,64 @@ def _delete_objects(bucket_name: str, body: bytes, headers: dict = None):
     if quiet_el is not None and quiet_el.text and quiet_el.text.lower() == "true":
         quiet = True
 
-    deleted_keys: list[str] = []
-    errors: list[tuple] = []
+    deleted: list[dict] = []
+    errors: list[dict] = []
     for obj_el in list(xml_root.findall("{%s}Object" % S3_NS)) or list(
         xml_root.findall("Object")
     ):
         key_el = _find_xml_tag(obj_el, "Key")
-        if key_el is not None and key_el.text:
-            k = key_el.text
-            if k in bucket["objects"]:
-                lock_err = _check_object_lock(bucket_name, k, headers)
-                if lock_err:
-                    errors.append(
-                        (
-                            k,
-                            "AccessDenied",
-                            "Access Denied because object protected by object lock.",
-                        )
-                    )
-                    continue
+        if key_el is None or not key_el.text:
+            continue
+        k = key_el.text
+        vid_el = _find_xml_tag(obj_el, "VersionId")
+        version_id = vid_el.text if (vid_el is not None and vid_el.text) else ""
+
+        if k in bucket["objects"]:
+            lock_err = _check_object_lock(bucket_name, k, headers)
+            if lock_err:
+                errors.append({
+                    "key": k,
+                    "version_id": version_id,
+                    "code": "AccessDenied",
+                    "msg": "Access Denied because object protected by object lock.",
+                })
+                continue
+
+        if version_id:
+            # Explicit VersionId → permanently purge that exact version/marker.
+            # S3 reports the delete as successful even if the version was absent.
+            _found, was_marker = _delete_object_version(
+                bucket, bucket_name, k, version_id
+            )
+            deleted.append({"key": k, "version_id": version_id, "was_marker": was_marker})
+        else:
+            # No VersionId → plain delete of the current object.
             bucket["objects"].pop(k, None)
             _object_tags.pop((bucket_name, k, None), None)
             _object_retention.pop((bucket_name, k), None)
             _object_legal_hold.pop((bucket_name, k), None)
             _object_acl.pop((bucket_name, k), None)
             _delete_persisted_object(bucket_name, k)
-            deleted_keys.append(k)
+            deleted.append({"key": k, "version_id": "", "was_marker": False})
 
     resp = Element("DeleteResult", xmlns=S3_NS)
     if not quiet:
-        for k in deleted_keys:
-            d = SubElement(resp, "Deleted")
-            SubElement(d, "Key").text = k
-    for k, code, msg in errors:
-        e = SubElement(resp, "Error")
-        SubElement(e, "Key").text = k
-        SubElement(e, "Code").text = code
-        SubElement(e, "Message").text = msg
+        for d in deleted:
+            el = SubElement(resp, "Deleted")
+            SubElement(el, "Key").text = d["key"]
+            if d["version_id"]:
+                SubElement(el, "VersionId").text = d["version_id"]
+                # AWS echoes the delete-marker flag when the purged entry was one.
+                if d["was_marker"]:
+                    SubElement(el, "DeleteMarker").text = "true"
+                    SubElement(el, "DeleteMarkerVersionId").text = d["version_id"]
+    for e in errors:
+        el = SubElement(resp, "Error")
+        SubElement(el, "Key").text = e["key"]
+        if e["version_id"]:
+            SubElement(el, "VersionId").text = e["version_id"]
+        SubElement(el, "Code").text = e["code"]
+        SubElement(el, "Message").text = e["msg"]
 
     return 200, {"Content-Type": "application/xml"}, _xml_body(resp)
 
