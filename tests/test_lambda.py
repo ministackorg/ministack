@@ -4559,6 +4559,551 @@ def test_lambda_kinesis_poller_does_not_tail_match_invalid_event_source_arn(
         set_request_region(original_region)
 
 
+@pytest.fixture
+def esm_poll_state(tmp_path, monkeypatch):
+    """Snapshot Lambda/SQS/Kinesis/DynamoDB state via each module's own
+    get_state()/restore_state() (the same pair ``lambda_svc_isolated`` and
+    the real persistence path use), hand back the emptied modules for a
+    test to populate, then restore on teardown.
+
+    Like ``lambda_svc_isolated``, redirects ``CODE_BLOB_DIR`` to ``tmp_path``
+    before calling ``lsvc.get_state()`` — otherwise get_state()'s blob
+    externalization/orphan-pruning would touch the real on-disk
+    CODE_BLOB_DIR/STATE_DIR as a side effect of an unrelated ESM-poller test.
+
+    dynamodb's ``_stream_records`` isn't part of its get_state()/
+    restore_state() contract (stream backlogs aren't persisted), so it's
+    snapshotted/restored by hand alongside the rest.
+    """
+    from ministack.services import dynamodb as _ddb
+    from ministack.services import kinesis as _kin
+    from ministack.services import sqs as _sqs
+
+    monkeypatch.setattr(lsvc, "CODE_BLOB_DIR", str(tmp_path / "lambda-blobs"))
+    lambda_state = lsvc.get_state()
+    sqs_state = _sqs.get_state()
+    kinesis_state = _kin.get_state()
+    dynamodb_state = _ddb.get_state()
+    stream_records = dict(_ddb._stream_records._data)
+
+    def _clear_all():
+        lsvc._functions._data.clear()
+        lsvc._esms._data.clear()
+        lsvc._kinesis_positions._data.clear()
+        lsvc._dynamodb_stream_positions._data.clear()
+        lsvc._esm_backoff_until._data.clear()
+        _sqs._queues._data.clear()
+        _kin._streams._data.clear()
+        _ddb._tables._data.clear()
+        _ddb._stream_records._data.clear()
+
+    _clear_all()
+    try:
+        yield lsvc, _sqs, _kin, _ddb
+    finally:
+        _clear_all()
+        lsvc.restore_state(lambda_state)
+        _sqs.restore_state(sqs_state)
+        _kin.restore_state(kinesis_state)
+        _ddb.restore_state(dynamodb_state)
+        _ddb._stream_records._data.update(stream_records)
+
+
+def test_poll_sqs_returns_true_when_batch_processed(esm_poll_state, monkeypatch):
+    """_poll_loop uses this return value to skip its idle sleep and keep
+    draining a burst immediately instead of throttling to one batch/tick."""
+    _lsvc, _sqs, _kin, _ddb = esm_poll_state
+
+    queue_name = "esm-drain-signal"
+    queue_url = f"http://localhost:4566/000000000000/{queue_name}"
+    _sqs._queues[queue_url] = {
+        "name": queue_name,
+        "messages": [{
+            "id": "msg-1",
+            "body": "payload",
+            "md5_body": "",
+            "receipt_handle": "rh-1",
+            "sent_at": time.time(),
+            "visible_at": 0,
+            "receive_count": 0,
+            "first_receive_at": None,
+            "message_attributes": {},
+        }],
+        "attributes": {"QueueArn": f"arn:aws:sqs:us-east-1:000000000000:{queue_name}"},
+        "is_fifo": False,
+        "dedup_cache": {},
+        "fifo_seq": 0,
+    }
+    _lsvc._functions["esm-drain-signal-fn"] = {
+        "config": {
+            "FunctionName": "esm-drain-signal-fn",
+            "FunctionArn": "arn:aws:lambda:us-east-1:000000000000:function:esm-drain-signal-fn",
+        },
+        "versions": {},
+        "aliases": {},
+    }
+    _lsvc._esms["esm-drain-signal"] = {
+        "UUID": "esm-drain-signal",
+        "EventSourceArn": f"arn:aws:sqs:us-east-1:000000000000:{queue_name}",
+        "FunctionName": "esm-drain-signal-fn",
+        "State": "Enabled",
+        "Enabled": True,
+        "BatchSize": 10,
+    }
+    monkeypatch.setattr(_lsvc, "_execute_function", lambda _func, _event: {"error": False, "body": {}})
+
+    assert _lsvc._poll_sqs() is True
+
+
+def test_poll_kinesis_returns_true_when_batch_processed(esm_poll_state, monkeypatch):
+    """_poll_loop uses this return value to skip its idle sleep and keep
+    draining a burst immediately instead of throttling to one batch/tick."""
+    _lsvc, _sqs, _kin, _ddb = esm_poll_state
+
+    stream_name = "esm-kinesis-drain-signal"
+    stream_arn = f"arn:aws:kinesis:us-east-1:000000000000:stream/{stream_name}"
+    function_name = "esm-kinesis-drain-signal-fn"
+
+    _lsvc._functions[function_name] = {
+        "config": {
+            "FunctionName": function_name,
+            "FunctionArn": f"arn:aws:lambda:us-east-1:000000000000:function:{function_name}",
+        },
+        "versions": {},
+        "aliases": {},
+    }
+    _kin._streams[stream_name] = _kinesis_stream_record(stream_name, stream_arn)
+    _lsvc._esms["esm-kinesis-drain-signal"] = {
+        "UUID": "esm-kinesis-drain-signal",
+        "EventSourceArn": stream_arn,
+        "FunctionName": function_name,
+        "State": "Enabled",
+        "Enabled": True,
+        "BatchSize": 10,
+        "StartingPosition": "TRIM_HORIZON",
+    }
+    monkeypatch.setattr(_lsvc, "_execute_function", lambda _func, _event: {"error": False, "body": {}})
+
+    assert _lsvc._poll_kinesis() is True
+
+
+def test_poll_dynamodb_streams_returns_true_when_batch_processed(esm_poll_state, monkeypatch):
+    """_poll_loop uses this return value to skip its idle sleep and keep
+    draining a burst immediately instead of throttling to one batch/tick."""
+    _lsvc, _sqs, _kin, _ddb = esm_poll_state
+
+    table_name = "esm-ddb-drain-signal"
+    stream_arn = f"arn:aws:dynamodb:us-east-1:000000000000:table/{table_name}/stream/2024-01-01T00:00:00.000"
+    function_name = "esm-ddb-drain-signal-fn"
+
+    _lsvc._functions[function_name] = {
+        "config": {
+            "FunctionName": function_name,
+            "FunctionArn": f"arn:aws:lambda:us-east-1:000000000000:function:{function_name}",
+        },
+        "versions": {},
+        "aliases": {},
+    }
+    _ddb._tables[table_name] = {"LatestStreamArn": stream_arn}
+    _ddb._stream_records[table_name] = [{
+        "eventID": "1",
+        "eventName": "INSERT",
+        "eventSource": "aws:dynamodb",
+        "dynamodb": {
+            "Keys": {},
+            "SequenceNumber": "1",
+            "SizeBytes": 1,
+            "StreamViewType": "NEW_AND_OLD_IMAGES",
+        },
+        "eventSourceARN": stream_arn,
+    }]
+    _lsvc._esms["esm-ddb-drain-signal"] = {
+        "UUID": "esm-ddb-drain-signal",
+        "EventSourceArn": stream_arn,
+        "FunctionName": function_name,
+        "State": "Enabled",
+        "Enabled": True,
+        "BatchSize": 10,
+        "StartingPosition": "TRIM_HORIZON",
+    }
+    monkeypatch.setattr(_lsvc, "_execute_function", lambda _func, _event: {"error": False, "body": {}})
+
+    assert _lsvc._poll_dynamodb_streams() is True
+
+
+def test_poll_sqs_returns_false_when_invoke_fails(esm_poll_state, monkeypatch):
+    """A failed invoke leaves the message undeleted (just invisible for its
+    visibility timeout) rather than advancing — _poll_loop must not skip its
+    idle sleep for a pass that made no real progress."""
+    _lsvc, _sqs, _kin, _ddb = esm_poll_state
+
+    queue_name = "esm-drain-signal-failure"
+    queue_url = f"http://localhost:4566/000000000000/{queue_name}"
+    _sqs._queues[queue_url] = {
+        "name": queue_name,
+        "messages": [{
+            "id": "msg-1",
+            "body": "payload",
+            "md5_body": "",
+            "receipt_handle": "rh-1",
+            "sent_at": time.time(),
+            "visible_at": 0,
+            "receive_count": 0,
+            "first_receive_at": None,
+            "message_attributes": {},
+        }],
+        "attributes": {"QueueArn": f"arn:aws:sqs:us-east-1:000000000000:{queue_name}"},
+        "is_fifo": False,
+        "dedup_cache": {},
+        "fifo_seq": 0,
+    }
+    _lsvc._functions["esm-drain-signal-failure-fn"] = {
+        "config": {
+            "FunctionName": "esm-drain-signal-failure-fn",
+            "FunctionArn": "arn:aws:lambda:us-east-1:000000000000:function:esm-drain-signal-failure-fn",
+        },
+        "versions": {},
+        "aliases": {},
+    }
+    _lsvc._esms["esm-drain-signal-failure"] = {
+        "UUID": "esm-drain-signal-failure",
+        "EventSourceArn": f"arn:aws:sqs:us-east-1:000000000000:{queue_name}",
+        "FunctionName": "esm-drain-signal-failure-fn",
+        "State": "Enabled",
+        "Enabled": True,
+        "BatchSize": 10,
+    }
+    monkeypatch.setattr(
+        _lsvc, "_execute_function",
+        lambda _func, _event: {"error": True, "body": {"errorType": "Error", "errorMessage": "boom"}},
+    )
+
+    assert _lsvc._poll_sqs() is False
+    assert len(_sqs._queues[queue_url]["messages"]) == 1
+
+
+def test_poll_sqs_backs_off_failing_esm_without_starving_other_esms(esm_poll_state, monkeypatch):
+    """A broken ESM must not be retried at full loop speed just because some
+    other healthy ESM keeps _poll_loop from sleeping — each ESM paces its own
+    retries independently via a per-ESM backoff, not a single loop-wide flag."""
+    _lsvc, _sqs, _kin, _ddb = esm_poll_state
+
+    def make_queue(name):
+        queue_url = f"http://localhost:4566/000000000000/{name}"
+        _sqs._queues[queue_url] = {
+            "name": name,
+            "messages": [{
+                "id": "msg-1",
+                "body": "payload",
+                "md5_body": "",
+                "receipt_handle": "rh-1",
+                "sent_at": time.time(),
+                "visible_at": 0,
+                "receive_count": 0,
+                "first_receive_at": None,
+                "message_attributes": {},
+            }],
+            "attributes": {"QueueArn": f"arn:aws:sqs:us-east-1:000000000000:{name}"},
+            "is_fifo": False,
+            "dedup_cache": {},
+            "fifo_seq": 0,
+        }
+        return queue_url
+
+    healthy_queue_url = make_queue("esm-healthy")
+    broken_queue_url = make_queue("esm-broken")
+
+    _lsvc._functions["esm-healthy-fn"] = {
+        "config": {
+            "FunctionName": "esm-healthy-fn",
+            "FunctionArn": "arn:aws:lambda:us-east-1:000000000000:function:esm-healthy-fn",
+        },
+        "versions": {}, "aliases": {},
+    }
+    _lsvc._functions["esm-broken-fn"] = {
+        "config": {
+            "FunctionName": "esm-broken-fn",
+            "FunctionArn": "arn:aws:lambda:us-east-1:000000000000:function:esm-broken-fn",
+        },
+        "versions": {}, "aliases": {},
+    }
+    _lsvc._esms["esm-healthy"] = {
+        "UUID": "esm-healthy",
+        "EventSourceArn": "arn:aws:sqs:us-east-1:000000000000:esm-healthy",
+        "FunctionName": "esm-healthy-fn",
+        "State": "Enabled",
+        "Enabled": True,
+        "BatchSize": 10,
+    }
+    _lsvc._esms["esm-broken"] = {
+        "UUID": "esm-broken",
+        "EventSourceArn": "arn:aws:sqs:us-east-1:000000000000:esm-broken",
+        "FunctionName": "esm-broken-fn",
+        "State": "Enabled",
+        "Enabled": True,
+        "BatchSize": 10,
+    }
+
+    invoke_calls = []
+
+    def fake_execute(func, _event):
+        func_name = func["config"]["FunctionName"]
+        invoke_calls.append(func_name)
+        if func_name == "esm-broken-fn":
+            return {"error": True, "body": {"errorType": "Error", "errorMessage": "boom"}}
+        # Refill the healthy queue so every pass keeps finding work, mirroring
+        # the sustained-traffic scenario that starves _poll_loop's idle sleep.
+        _sqs._queues[healthy_queue_url]["messages"].append({
+            "id": f"msg-{len(invoke_calls)}",
+            "body": "payload",
+            "md5_body": "",
+            "receipt_handle": f"rh-{len(invoke_calls)}",
+            "sent_at": time.time(),
+            "visible_at": 0,
+            "receive_count": 0,
+            "first_receive_at": None,
+            "message_attributes": {},
+        })
+        return {"error": False, "body": {}}
+
+    monkeypatch.setattr(_lsvc, "_execute_function", fake_execute)
+
+    assert _lsvc._poll_sqs() is True
+    assert invoke_calls.count("esm-broken-fn") == 1
+
+    # Second pass: the healthy ESM keeps reporting True (so _poll_loop would
+    # never sleep), but the broken ESM must still be skipped — it's within
+    # its own backoff window regardless of what the healthy ESM is doing.
+    assert _lsvc._poll_sqs() is True
+    assert invoke_calls.count("esm-broken-fn") == 1
+    assert len(_sqs._queues[broken_queue_url]["messages"]) == 1
+
+
+def test_poll_sqs_retries_esm_after_backoff_expires(esm_poll_state, monkeypatch):
+    """Once the cooldown elapses, a previously-failing ESM is retried again —
+    the backoff paces retries, it doesn't disable the ESM."""
+    _lsvc, _sqs, _kin, _ddb = esm_poll_state
+
+    queue_name = "esm-drain-signal-recovers"
+    queue_url = f"http://localhost:4566/000000000000/{queue_name}"
+    _sqs._queues[queue_url] = {
+        "name": queue_name,
+        "messages": [{
+            "id": "msg-1",
+            "body": "payload",
+            "md5_body": "",
+            "receipt_handle": "rh-1",
+            "sent_at": time.time(),
+            "visible_at": 0,
+            "receive_count": 0,
+            "first_receive_at": None,
+            "message_attributes": {},
+        }],
+        # VisibilityTimeout=0 so the message is immediately re-receivable —
+        # isolates the assertions below to the backoff mechanism itself
+        # rather than real-world SQS visibility timing.
+        "attributes": {
+            "QueueArn": f"arn:aws:sqs:us-east-1:000000000000:{queue_name}",
+            "VisibilityTimeout": "0",
+        },
+        "is_fifo": False,
+        "dedup_cache": {},
+        "fifo_seq": 0,
+    }
+    _lsvc._functions["esm-drain-signal-recovers-fn"] = {
+        "config": {
+            "FunctionName": "esm-drain-signal-recovers-fn",
+            "FunctionArn": "arn:aws:lambda:us-east-1:000000000000:function:esm-drain-signal-recovers-fn",
+        },
+        "versions": {}, "aliases": {},
+    }
+    _lsvc._esms["esm-drain-signal-recovers"] = {
+        "UUID": "esm-drain-signal-recovers",
+        "EventSourceArn": f"arn:aws:sqs:us-east-1:000000000000:{queue_name}",
+        "FunctionName": "esm-drain-signal-recovers-fn",
+        "State": "Enabled",
+        "Enabled": True,
+        "BatchSize": 10,
+    }
+    invoke_calls = []
+    monkeypatch.setattr(
+        _lsvc, "_execute_function",
+        lambda _func, _event: (invoke_calls.append(1), {"error": True, "body": {"errorType": "Error", "errorMessage": "boom"}})[1],
+    )
+
+    fake_now = [1_000_000.0]
+    monkeypatch.setattr(_lsvc.time, "time", lambda: fake_now[0])
+
+    assert _lsvc._poll_sqs() is False
+    assert len(invoke_calls) == 1
+
+    # Still within the backoff window — skipped before it would even receive.
+    fake_now[0] += _lsvc._ESM_BACKOFF_SECONDS / 2
+    assert _lsvc._poll_sqs() is False
+    assert len(invoke_calls) == 1
+
+    # Backoff has elapsed — the ESM is retried (and fails again).
+    fake_now[0] += _lsvc._ESM_BACKOFF_SECONDS
+    assert _lsvc._poll_sqs() is False
+    assert len(invoke_calls) == 2
+
+
+def test_poll_kinesis_returns_false_when_invoke_fails(esm_poll_state, monkeypatch):
+    """A failed invoke doesn't advance the shard position, so the next pass
+    would refetch the same batch — _poll_loop must not skip its idle sleep
+    for a pass that made no real progress, or it spins retrying forever."""
+    _lsvc, _sqs, _kin, _ddb = esm_poll_state
+
+    stream_name = "esm-kinesis-drain-signal-failure"
+    stream_arn = f"arn:aws:kinesis:us-east-1:000000000000:stream/{stream_name}"
+    function_name = "esm-kinesis-drain-signal-failure-fn"
+
+    _lsvc._functions[function_name] = {
+        "config": {
+            "FunctionName": function_name,
+            "FunctionArn": f"arn:aws:lambda:us-east-1:000000000000:function:{function_name}",
+        },
+        "versions": {},
+        "aliases": {},
+    }
+    _kin._streams[stream_name] = _kinesis_stream_record(stream_name, stream_arn)
+    _lsvc._esms["esm-kinesis-drain-signal-failure"] = {
+        "UUID": "esm-kinesis-drain-signal-failure",
+        "EventSourceArn": stream_arn,
+        "FunctionName": function_name,
+        "State": "Enabled",
+        "Enabled": True,
+        "BatchSize": 10,
+        "StartingPosition": "TRIM_HORIZON",
+    }
+    monkeypatch.setattr(
+        _lsvc, "_execute_function",
+        lambda _func, _event: {"error": True, "body": {"errorType": "Error", "errorMessage": "boom"}},
+    )
+
+    assert _lsvc._poll_kinesis() is False
+    # Position didn't advance, so a second pass sees the exact same batch.
+    assert _lsvc._poll_kinesis() is False
+
+
+def test_poll_dynamodb_streams_returns_false_when_invoke_fails(esm_poll_state, monkeypatch):
+    """A failed invoke doesn't advance the stream position, so the next pass
+    would refetch the same batch — _poll_loop must not skip its idle sleep
+    for a pass that made no real progress, or it spins retrying forever."""
+    _lsvc, _sqs, _kin, _ddb = esm_poll_state
+
+    table_name = "esm-ddb-drain-signal-failure"
+    stream_arn = f"arn:aws:dynamodb:us-east-1:000000000000:table/{table_name}/stream/2024-01-01T00:00:00.000"
+    function_name = "esm-ddb-drain-signal-failure-fn"
+
+    _lsvc._functions[function_name] = {
+        "config": {
+            "FunctionName": function_name,
+            "FunctionArn": f"arn:aws:lambda:us-east-1:000000000000:function:{function_name}",
+        },
+        "versions": {},
+        "aliases": {},
+    }
+    _ddb._tables[table_name] = {"LatestStreamArn": stream_arn}
+    _ddb._stream_records[table_name] = [{
+        "eventID": "1",
+        "eventName": "INSERT",
+        "eventSource": "aws:dynamodb",
+        "dynamodb": {
+            "Keys": {},
+            "SequenceNumber": "1",
+            "SizeBytes": 1,
+            "StreamViewType": "NEW_AND_OLD_IMAGES",
+        },
+        "eventSourceARN": stream_arn,
+    }]
+    _lsvc._esms["esm-ddb-drain-signal-failure"] = {
+        "UUID": "esm-ddb-drain-signal-failure",
+        "EventSourceArn": stream_arn,
+        "FunctionName": function_name,
+        "State": "Enabled",
+        "Enabled": True,
+        "BatchSize": 10,
+        "StartingPosition": "TRIM_HORIZON",
+    }
+    monkeypatch.setattr(
+        _lsvc, "_execute_function",
+        lambda _func, _event: {"error": True, "body": {"errorType": "Error", "errorMessage": "boom"}},
+    )
+
+    assert _lsvc._poll_dynamodb_streams() is False
+    # Position didn't advance, so a second pass sees the exact same batch.
+    assert _lsvc._poll_dynamodb_streams() is False
+
+
+def test_pollers_return_false_when_idle(esm_poll_state):
+    """No enabled ESMs -> every poller's per-pass loop body never runs, so
+    each reports nothing processed."""
+    lsvc, _sqs, _kin, _ddb = esm_poll_state
+    assert lsvc._poll_sqs() is False
+    assert lsvc._poll_kinesis() is False
+    assert lsvc._poll_dynamodb_streams() is False
+
+
+def test_poll_dynamodb_streams_returns_false_when_stream_records_unavailable(monkeypatch):
+    from ministack.services import dynamodb as _ddb
+
+    monkeypatch.delattr(_ddb, "_stream_records")
+
+    assert lsvc._poll_dynamodb_streams() is False
+
+
+class _StopPollLoop(BaseException):
+    """Sentinel used to break out of _poll_loop's `while True` after the
+    iteration under test — raised from a spot _poll_loop doesn't wrap in a
+    bare ``except Exception``, so it isn't swallowed and logged away like a
+    real poller error would be."""
+
+
+def test_poll_loop_skips_sleep_when_a_poller_processed_work(monkeypatch):
+    calls = {"sqs": 0}
+
+    def fake_poll_sqs():
+        calls["sqs"] += 1
+        if calls["sqs"] > 1:
+            raise _StopPollLoop()
+        return True
+
+    sleep_calls = []
+    monkeypatch.setattr(lsvc, "_poll_sqs", fake_poll_sqs)
+    monkeypatch.setattr(lsvc, "_poll_kinesis", lambda: False)
+    monkeypatch.setattr(lsvc, "_poll_dynamodb_streams", lambda: False)
+    monkeypatch.setattr(lsvc.time, "sleep", lambda secs: sleep_calls.append(secs))
+
+    with pytest.raises(_StopPollLoop):
+        lsvc._poll_loop()
+
+    # First pass processed a batch, so it must loop again immediately
+    # instead of sleeping; the second pass is what raises _StopPollLoop.
+    assert sleep_calls == []
+    assert calls["sqs"] == 2
+
+
+def test_poll_loop_sleeps_when_no_poller_processed_work(esm_poll_state, monkeypatch):
+    sleep_calls = []
+
+    def fake_sleep(secs):
+        sleep_calls.append(secs)
+        raise _StopPollLoop()
+
+    # esm_poll_state clears _esms, so has_any() -> False and an idle pass
+    # sleeps 5s (not 1s).
+    monkeypatch.setattr(lsvc, "_poll_sqs", lambda: False)
+    monkeypatch.setattr(lsvc, "_poll_kinesis", lambda: False)
+    monkeypatch.setattr(lsvc, "_poll_dynamodb_streams", lambda: False)
+    monkeypatch.setattr(lsvc.time, "sleep", fake_sleep)
+
+    with pytest.raises(_StopPollLoop):
+        lsvc._poll_loop()
+
+    assert sleep_calls == [5]
+
+
 def test_lambda_create_esm_rejects_unresolved_function_arn():
     original_account = get_account_id()
     original_region = get_region()
@@ -5400,6 +5945,46 @@ def test_invoke_rie_classifies_unhandled_vs_handled():
     if has_header or (isinstance(parsed_error_payload, dict) and parsed_error_payload.get("errorType")):
         classification = "Unhandled" if has_header else "Handled"
     assert classification == "Handled"
+
+
+def _invoke_with_log_output(monkeypatch, headers, log_output):
+    from ministack.services import lambda_svc as lsvc
+
+    name = f"lam-log-result-{_uuid_mod.uuid4().hex}"
+    monkeypatch.setitem(lsvc._functions, name, {"config": {}, "versions": {}})
+    monkeypatch.setattr(
+        lsvc,
+        "_execute_function_with_config_scope",
+        lambda *_: {"body": {"ok": True}, "log": log_output},
+    )
+    monkeypatch.setattr(lsvc, "_emit_lambda_metrics", lambda *args, **kwargs: None)
+    return asyncio.run(lsvc._invoke(name, {}, headers))
+
+
+def test_lambda_invoke_log_result_requires_tail(monkeypatch):
+    import base64
+
+    _, default_headers, _ = _invoke_with_log_output(monkeypatch, {}, "function output")
+    _, tail_headers, _ = _invoke_with_log_output(
+        monkeypatch,
+        {"X-Amz-Log-Type": "Tail"},
+        "function output",
+    )
+
+    assert "X-Amz-Log-Result" not in default_headers
+    assert base64.b64decode(tail_headers["X-Amz-Log-Result"]) == b"function output"
+
+
+def test_lambda_invoke_log_result_is_limited_to_last_4kb(monkeypatch):
+    import base64
+
+    _, headers, _ = _invoke_with_log_output(
+        monkeypatch,
+        {"x-amz-log-type": "tail"},
+        "discarded" + "x" * 4096,
+    )
+
+    assert base64.b64decode(headers["X-Amz-Log-Result"]) == b"x" * 4096
 
 
 def test_lambda_invoke_stderr_captured_in_log_result(lam):

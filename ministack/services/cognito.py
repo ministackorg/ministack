@@ -587,7 +587,7 @@ def _apply_pretoken_trigger(pool_id: str, claims: dict, token_type: str,
             raise RuntimeError(f"PreTokenGeneration error: {result.get('body')}")
         return claims
     payload = result.get("body") if isinstance(result, dict) else result
-    response = _extract_pretoken_response(payload)
+    response = _extract_trigger_response(payload)
     if not response:
         return claims
 
@@ -667,12 +667,13 @@ def _build_pretoken_event(pool_id: str, client_id: str, username: str,
     }
 
 
-def _extract_pretoken_response(payload) -> dict | None:
-    """Pull the ``response`` block from a Lambda invocation result.
+def _extract_trigger_response(payload) -> dict | None:
+    """Pull the ``response`` block from a Lambda trigger invocation result.
 
-    Lambdas return the full event echoed back with their overrides written
-    into ``response.claimsAndScopeOverrideDetails`` (V2/V3) or
-    ``response.claimsOverrideDetails`` (V1). Accept already-parsed dicts,
+    Cognito Lambda triggers return the full event echoed back with their
+    overrides written into the ``response`` block (e.g.
+    ``response.claimsAndScopeOverrideDetails`` for PreTokenGeneration V2/V3,
+    ``response.autoConfirmUser`` for PreSignUp). Accept already-parsed dicts,
     JSON strings, and bytes.
     """
     if payload is None:
@@ -690,6 +691,100 @@ def _extract_pretoken_response(payload) -> dict | None:
     if not isinstance(payload, dict):
         return None
     return payload.get("response") if isinstance(payload.get("response"), dict) else payload
+
+
+class _PreSignUpRejected(Exception):
+    """Raised when a PreSignUp Lambda trigger rejects a federated sign-up."""
+
+
+def _apply_presignup_trigger(pool_id: str, client_id: str, username: str,
+                              user_attrs: dict,
+                              trigger_source: str = "PreSignUp_ExternalProvider") -> dict:
+    """Invoke the user pool's PreSignUp Lambda before persisting a federated user.
+
+    Emulates AWS's ``PreSignUp_ExternalProvider`` trigger, which fires
+    immediately before Cognito persists a user provisioned through IdP
+    federation. Unlike ``_apply_pretoken_trigger``, this is fail-closed: on
+    real AWS a Lambda that throws blocks the sign-up outright
+    (``UserLambdaValidationException``), so any invocation failure or
+    Lambda-reported error raises ``_PreSignUpRejected`` instead of being
+    swallowed.
+
+    Returns the trigger's ``autoConfirmUser``/``autoVerifyEmail``/
+    ``autoVerifyPhone`` overrides (all ``False`` if the pool has no
+    ``LambdaConfig.PreSignUp`` configured, which is a no-op).
+    """
+    defaults = {"autoConfirmUser": False, "autoVerifyEmail": False, "autoVerifyPhone": False}
+    pool = _user_pools.get(pool_id)
+    if not pool:
+        return defaults
+    cfg = pool.get("LambdaConfig") or {}
+    arn = cfg.get("PreSignUp")
+    if not arn:
+        return defaults
+
+    event = _build_presignup_event(
+        pool_id=pool_id, client_id=client_id, username=username,
+        user_attrs=user_attrs, trigger_source=trigger_source,
+    )
+
+    try:
+        # Lazy import to avoid a circular dependency between cognito and lambda_svc.
+        from ministack.services import lambda_svc
+        record, config, _name = lambda_svc._get_func_record_for_ref(arn)
+        if record is None or config is None:
+            raise RuntimeError(f"PreSignUp Lambda not found: {arn}")
+        exec_record = lambda_svc._execution_record_for_config(record, config)
+        result = lambda_svc._execute_function_with_config_scope(exec_record, event)
+    except Exception as e:
+        logger.warning("PreSignUp Lambda invocation failed for pool %s: %s", pool_id, e)
+        raise _PreSignUpRejected(str(e)) from e
+
+    if isinstance(result, dict) and result.get("error"):
+        reason = result.get("body") or "PreSignUp Lambda rejected the request."
+        logger.info("PreSignUp Lambda rejected sign-up for pool %s user %s: %s",
+                    pool_id, username, reason)
+        raise _PreSignUpRejected(str(reason))
+
+    payload = result.get("body") if isinstance(result, dict) else result
+    response = _extract_trigger_response(payload) or {}
+    return {
+        "autoConfirmUser": bool(response.get("autoConfirmUser")),
+        "autoVerifyEmail": bool(response.get("autoVerifyEmail")),
+        "autoVerifyPhone": bool(response.get("autoVerifyPhone")),
+    }
+
+
+def _build_presignup_event(pool_id: str, client_id: str, username: str,
+                            user_attrs: dict, trigger_source: str) -> dict:
+    """Construct the event payload AWS sends to a PreSignUp Lambda.
+
+    Shape from the Cognito Developer Guide
+    (https://docs.aws.amazon.com/cognito/latest/developerguide/user-pool-lambda-pre-sign-up.html).
+    ``validationData`` is always empty for federated sign-in — it only carries
+    data supplied via ``ClientMetadata`` on the native ``SignUp`` API.
+    """
+    return {
+        "version": "1",
+        "triggerSource": trigger_source,
+        "region": _pool_region(pool_id),
+        "userPoolId": pool_id,
+        "userName": username or "",
+        "callerContext": {
+            "awsSdkVersion": "ministack",
+            "clientId": client_id or "",
+        },
+        "request": {
+            "userAttributes": {k: v for k, v in (user_attrs or {}).items()
+                               if isinstance(v, (str, int, float, bool))},
+            "validationData": {},
+        },
+        "response": {
+            "autoConfirmUser": False,
+            "autoVerifyEmail": False,
+            "autoVerifyPhone": False,
+        },
+    }
 
 
 def _user_from_token(token: str, pool: dict):
@@ -3956,16 +4051,26 @@ def _saml2_idp_response(body: bytes, query_params):
         sub = existing_dict.get("sub", new_uuid())
     else:
         sub = new_uuid()
-        user_attrs["sub"] = sub
         if "email" not in user_attrs:
             user_attrs["email"] = name_id if "@" in name_id else ""
+        try:
+            presignup = _apply_presignup_trigger(pool_id, client_id, username, user_attrs)
+        except _PreSignUpRejected as e:
+            logger.info("Cognito: PreSignUp Lambda rejected SAML federation sign-up for %s: %s",
+                        username, e)
+            return error_response_json("UserLambdaValidationException", str(e), 400)
+        if presignup["autoVerifyEmail"] and "email" in user_attrs:
+            user_attrs["email_verified"] = "true"
+        if presignup["autoVerifyPhone"] and "phone_number" in user_attrs:
+            user_attrs["phone_number_verified"] = "true"
+        user_attrs["sub"] = sub
         user = {
             "Username": username,
             "Attributes": _dict_to_attr_list(user_attrs),
             "UserCreateDate": now,
             "UserLastModifiedDate": now,
             "Enabled": True,
-            "UserStatus": "EXTERNAL_PROVIDER",
+            "UserStatus": "CONFIRMED" if presignup["autoConfirmUser"] else "EXTERNAL_PROVIDER",
             "MFAOptions": [],
             "_password": "",
             "_groups": [],
@@ -4175,16 +4280,26 @@ def _oauth2_idp_response(method, body, query_params):
         sub = existing_dict.get("sub", new_uuid())
     else:
         sub = new_uuid()
-        user_attrs["sub"] = sub
         if "email" not in user_attrs and "@" in name_id:
             user_attrs["email"] = name_id
+        try:
+            presignup = _apply_presignup_trigger(pool_id, client_id, username, user_attrs)
+        except _PreSignUpRejected as e:
+            logger.info("Cognito: PreSignUp Lambda rejected OIDC federation sign-up for %s: %s",
+                        username, e)
+            return error_response_json("UserLambdaValidationException", str(e), 400)
+        if presignup["autoVerifyEmail"] and "email" in user_attrs:
+            user_attrs["email_verified"] = "true"
+        if presignup["autoVerifyPhone"] and "phone_number" in user_attrs:
+            user_attrs["phone_number_verified"] = "true"
+        user_attrs["sub"] = sub
         user = {
             "Username": username,
             "Attributes": _dict_to_attr_list(user_attrs),
             "UserCreateDate": now,
             "UserLastModifiedDate": now,
             "Enabled": True,
-            "UserStatus": "EXTERNAL_PROVIDER",
+            "UserStatus": "CONFIRMED" if presignup["autoConfirmUser"] else "EXTERNAL_PROVIDER",
             "MFAOptions": [],
             "_password": "",
             "_groups": [],

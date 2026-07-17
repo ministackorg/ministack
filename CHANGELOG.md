@@ -14,6 +14,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 - **IoT — MQTT publishes are routed through topic rules to Lambda** — an MQTT/`iot-data` publish is now matched against each account's topic rules by the rule's `FROM '<topic filter>'` clause (with `+`/`#` wildcards), and every matching enabled rule's `lambda` actions are invoked asynchronously with the message payload as the event (`SELECT *`). Basic Ingest is supported: a publish to `$aws/rules/<ruleName>` is delivered straight to that rule's actions and bypasses pub/sub. Disabled rules are skipped.
 
 ### Fixed
+- **S3 — a versioned delete with an explicit `VersionId` permanently removes that version** — `DeleteObject` and `DeleteObjects` addressed with a `VersionId` reported success but never touched the version store, so `ListObjectVersions` still returned every version and delete marker (`DeleteObject` even appended a *new* marker, driving the count up). Both paths now purge the exact version/marker and reconcile the current version; a delete *without* a `VersionId` still creates a delete marker as before.
 - **S3 — versioned object reads preserve `Content-Type`** — `GetObject` with a `VersionId` always returned `application/octet-stream`, even when that version was written with an explicit content type. PutObject version records now retain their own content type, and versioned reads return it while preserving the existing fallback for older records. Reported by @aaronsteed (#1083).
 
 ## [1.4.2] — 2026-07-13
