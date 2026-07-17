@@ -7216,7 +7216,7 @@ def handler(event, context):
     }
 """
     zip_b64 = _b64.b64encode(_make_zip(code)).decode()
-    _raw_durable("POST", "/2015-03-31/functions", body={
+    create_code, create_body = _raw_durable("POST", "/2015-03-31/functions", body={
         "FunctionName": fname,
         "Runtime": "python3.12",
         "Role": _LAMBDA_ROLE,
@@ -7224,13 +7224,16 @@ def handler(event, context):
         "Code": {"ZipFile": zip_b64},
         "DurableConfig": {"Enabled": True},
     })
+    assert create_code in (200, 201), create_body
     try:
         resp = lam.invoke(FunctionName=fname, Payload=b"{}")
-        body = _json.loads(resp["Payload"].read())
-        assert body["arn"] and body["arn"].startswith("arn:aws:lambda:")
+        payload = resp["Payload"].read()
+        body = _json.loads(payload)
+        assert "FunctionError" not in resp, body
+        assert body.get("arn") and body["arn"].startswith("arn:aws:lambda:"), body
         assert "/durable-execution/" in body["arn"]
-        assert body["token"]
-        assert body["name"]
+        assert body.get("token"), body
+        assert body.get("name"), body
     finally:
         try:
             lam.delete_function(FunctionName=fname)
