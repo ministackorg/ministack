@@ -616,6 +616,168 @@ def test_s3_bucket_tagging(s3):
         s3.get_bucket_tagging(Bucket=bkt)
     assert exc.value.response["Error"]["Code"] == "NoSuchTagSet"
 
+def test_s3_create_bucket_with_tags(s3):
+    """Tags supplied in the CreateBucket request body must be applied to the
+    bucket, so a follow-up GetBucketTagging returns them.
+    """
+    bkt = "intg-s3-createbkt-tags"
+    s3.create_bucket(
+        Bucket=bkt,
+        CreateBucketConfiguration={
+            "Tags": [
+                {"Key": "project", "Value": "Trinity"},
+                {"Key": "env", "Value": "prod"},
+            ]
+        },
+    )
+    resp = s3.get_bucket_tagging(Bucket=bkt)
+    tags = {t["Key"]: t["Value"] for t in resp["TagSet"]}
+    assert tags == {"project": "Trinity", "env": "prod"}
+
+def test_s3_create_bucket_with_tags_and_location(s3):
+    """Tags and LocationConstraint can be supplied together in the CreateBucket
+    body; both must take effect."""
+    bkt = "intg-s3-createbkt-tags-loc"
+    s3.create_bucket(
+        Bucket=bkt,
+        CreateBucketConfiguration={
+            "LocationConstraint": "us-west-2",
+            "Tags": [{"Key": "project", "Value": "Trinity"}],
+        },
+    )
+    resp = s3.get_bucket_tagging(Bucket=bkt)
+    tags = {t["Key"]: t["Value"] for t in resp["TagSet"]}
+    assert tags == {"project": "Trinity"}
+    loc = s3.get_bucket_location(Bucket=bkt)
+    assert loc["LocationConstraint"] == "us-west-2"
+
+def test_s3_create_bucket_without_tags_has_no_tag_set(s3):
+    """A CreateBucket with no tags must not create an empty tag set — a
+    GetBucketTagging should still return NoSuchTagSet."""
+    bkt = "intg-s3-createbkt-notags"
+    s3.create_bucket(Bucket=bkt)
+    with pytest.raises(ClientError) as exc:
+        s3.get_bucket_tagging(Bucket=bkt)
+    assert exc.value.response["Error"]["Code"] == "NoSuchTagSet"
+
+def test_s3_create_bucket_empty_tag_value_allowed(s3):
+    """Tag values may be empty (minimum length 0); only the key is required."""
+    bkt = "intg-s3-createbkt-emptyval"
+    s3.create_bucket(
+        Bucket=bkt,
+        CreateBucketConfiguration={"Tags": [{"Key": "project", "Value": ""}]},
+    )
+    resp = s3.get_bucket_tagging(Bucket=bkt)
+    assert resp["TagSet"] == [{"Key": "project", "Value": ""}]
+
+def test_s3_create_bucket_rejects_key_too_long(s3):
+    """A tag key longer than 128 characters is rejected with InvalidTag."""
+    bkt = "intg-s3-createbkt-longkey"
+    with pytest.raises(ClientError) as exc:
+        s3.create_bucket(
+            Bucket=bkt,
+            CreateBucketConfiguration={"Tags": [{"Key": "p" * 129, "Value": "Trinity"}]},
+        )
+    err = exc.value.response["Error"]
+    assert err["Code"] == "InvalidTag"
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+    assert err["Message"] == "The TagKey you have provided is invalid"
+    # The bucket must not have been created.
+    with pytest.raises(ClientError):
+        s3.head_bucket(Bucket=bkt)
+
+def test_s3_create_bucket_rejects_value_too_long(s3):
+    """A tag value longer than 256 characters is rejected with InvalidTag."""
+    bkt = "intg-s3-createbkt-longval"
+    with pytest.raises(ClientError) as exc:
+        s3.create_bucket(
+            Bucket=bkt,
+            CreateBucketConfiguration={"Tags": [{"Key": "project", "Value": "T" * 257}]},
+        )
+    err = exc.value.response["Error"]
+    assert err["Code"] == "InvalidTag"
+    assert err["Message"] == "The TagValue you have provided is invalid"
+    # The bucket must not have been created.
+    with pytest.raises(ClientError):
+        s3.head_bucket(Bucket=bkt)
+
+def test_s3_create_bucket_rejects_reserved_aws_prefix(s3):
+    """Tag keys starting with the reserved 'aws:' prefix are rejected."""
+    bkt = "intg-s3-createbkt-awsprefix"
+    with pytest.raises(ClientError) as exc:
+        s3.create_bucket(
+            Bucket=bkt,
+            CreateBucketConfiguration={"Tags": [{"Key": "aws:project", "Value": "Trinity"}]},
+        )
+    err = exc.value.response["Error"]
+    assert err["Code"] == "InvalidTag"
+    assert err["Message"] == (
+        'User-defined tag keys can\'t start with "aws:". This prefix is '
+        'reserved for system tags. Remove "aws:" from your tag keys and '
+        "try again."
+    )
+    # The bucket must not have been created.
+    with pytest.raises(ClientError):
+        s3.head_bucket(Bucket=bkt)
+
+def test_s3_create_bucket_duplicate_keys_internal_error(s3):
+    """A duplicate tag key in a CreateBucket body returns a 500 InternalError."""
+    bkt = "intg-s3-createbkt-dupkey"
+    with pytest.raises(ClientError) as exc:
+        s3.create_bucket(
+            Bucket=bkt,
+            CreateBucketConfiguration={
+                "Tags": [
+                    {"Key": "env", "Value": "prod"},
+                    {"Key": "env", "Value": "staging"},
+                ]
+            },
+        )
+    assert exc.value.response["Error"]["Code"] == "InternalError"
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 500
+    # The bucket must not have been created.
+    with pytest.raises(ClientError):
+        s3.head_bucket(Bucket=bkt)
+
+def test_s3_create_bucket_rejects_too_many_tags(s3):
+    """A bucket accepts at most 50 tags in the CreateBucket body."""
+    bkt = "intg-s3-createbkt-toomany"
+    with pytest.raises(ClientError) as exc:
+        s3.create_bucket(
+            Bucket=bkt,
+            CreateBucketConfiguration={
+                "Tags": [{"Key": f"project{i}", "Value": "Trinity"} for i in range(51)]
+            },
+        )
+    err = exc.value.response["Error"]
+    assert err["Code"] == "BadRequest"
+    assert err["Message"] == "Bucket tag count cannot be greater than 50"
+    # The bucket must not have been created.
+    with pytest.raises(ClientError):
+        s3.head_bucket(Bucket=bkt)
+
+def test_s3_create_bucket_tags_readable_via_s3control(s3):
+    """Tags set in the CreateBucket body must also be visible through the
+    S3 Control ListTagsForResource API, not just GetBucketTagging."""
+    from conftest import make_client
+
+    bkt = "intg-s3control-createbkt-tags"
+    s3.create_bucket(
+        Bucket=bkt,
+        CreateBucketConfiguration={
+            "Tags": [
+                {"Key": "project", "Value": "Trinity"},
+                {"Key": "env", "Value": "prod"},
+            ]
+        },
+    )
+    s3control = make_client("s3control")
+    account_id = "123456789012"
+    arn = f"arn:aws:s3:::{bkt}"
+    resp = s3control.list_tags_for_resource(AccountId=account_id, ResourceArn=arn)
+    tags = {t["Key"]: t["Value"] for t in resp.get("Tags", [])}
+    assert tags == {"project": "Trinity", "env": "prod"}
+
 def test_s3_control_list_tags_for_resource(s3):
     """S3 Control ListTagsForResource must return tags set via PutBucketTagging.
 
