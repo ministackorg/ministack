@@ -2197,6 +2197,68 @@ def test_s3_put_object_content_type_preserved(s3):
     resp = s3.get_object(Bucket="qa-s3-ct", Key="page.html")
     assert "text/html" in resp["ContentType"]
 
+
+def test_s3_versioned_get_object_preserves_content_type(s3):
+    """Content-Type set on PutObject is returned when reading by VersionId."""
+    bucket = "qa-s3-versioned-ct"
+    s3.create_bucket(Bucket=bucket)
+    s3.put_bucket_versioning(
+        Bucket=bucket,
+        VersioningConfiguration={"Status": "Enabled"},
+    )
+
+    put = s3.put_object(
+        Bucket=bucket,
+        Key="page.html",
+        Body=b"<html/>",
+        ContentType="text/html; charset=utf-8",
+    )
+
+    response = s3.get_object(
+        Bucket=bucket,
+        Key="page.html",
+        VersionId=put["VersionId"],
+    )
+    assert response["ContentType"] == "text/html; charset=utf-8"
+
+
+def test_s3_versioned_get_object_preserves_content_type_per_version(s3):
+    """Each object version returns the Content-Type supplied for that version."""
+    bucket = "qa-s3-versioned-ct-history"
+    s3.create_bucket(Bucket=bucket)
+    s3.put_bucket_versioning(
+        Bucket=bucket,
+        VersioningConfiguration={"Status": "Enabled"},
+    )
+
+    text_version = s3.put_object(
+        Bucket=bucket,
+        Key="document",
+        Body=b"plain text",
+        ContentType="text/plain",
+    )["VersionId"]
+    json_version = s3.put_object(
+        Bucket=bucket,
+        Key="document",
+        Body=b'{"value": 1}',
+        ContentType="application/json",
+    )["VersionId"]
+
+    text_response = s3.get_object(
+        Bucket=bucket,
+        Key="document",
+        VersionId=text_version,
+    )
+    json_response = s3.get_object(
+        Bucket=bucket,
+        Key="document",
+        VersionId=json_version,
+    )
+
+    assert text_response["ContentType"] == "text/plain"
+    assert json_response["ContentType"] == "application/json"
+
+
 def test_s3_put_object_storage_class_roundtrip(s3):
     """PutObject with StorageClass is returned by GetObject and HeadObject (#534)."""
     s3.create_bucket(Bucket="qa-s3-sc")

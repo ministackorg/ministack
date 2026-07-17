@@ -2231,6 +2231,7 @@ def _put_object(bucket_name: str, key: str, body: bytes, headers: dict):
             "size": obj["size"],
             "is_latest": True,
             "data": body,
+            "content_type": obj.get("content_type") or "application/octet-stream",
             "storage_class": obj.get("storage_class") or "STANDARD",
             "checksums": obj.get("checksums") or {},
         })
@@ -2534,7 +2535,7 @@ def _get_object(bucket_name: str, key: str, headers: dict, query_params: dict = 
         for v in versions:
             if v["version_id"] == version_id:
                 resp_headers = {
-                    "Content-Type": "application/octet-stream",
+                    "Content-Type": v.get("content_type") or "application/octet-stream",
                     "ETag": v["etag"],
                     "Content-Length": str(v["size"]),
                     "Last-Modified": iso_to_rfc7231(v["last_modified"]),
