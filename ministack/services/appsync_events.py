@@ -864,36 +864,47 @@ async def _fanout_publish(api_id: str, channel: str, events: list) -> tuple[list
     frame handler so both paths return the same ``(successful, failed)`` shape.
     Each outbound frame uses ``"event": [<json-string>]`` per the spec.
     """
+    successful, failed, to_deliver = _plan_publish(events)
+    await _deliver_publish(api_id, channel, to_deliver)
+    return successful, failed
+
+
+def _plan_publish(events: list) -> tuple[list, list, list]:
+    """Validate publish events; return ``(successful, failed, to_deliver)``."""
     successful: list = []
     failed: list = []
+    to_deliver: list = []
+    for idx, ev in enumerate(events):
+        identifier = new_uuid()
+        if not isinstance(ev, str):
+            failed.append({
+                "identifier": identifier,
+                "index": idx,
+                "code": 400,
+                "errorMessage": "event must be a JSON-encoded string",
+            })
+            continue
+        successful.append({"identifier": identifier, "index": idx})
+        to_deliver.append(ev)
+    return successful, failed, to_deliver
+
+
+async def _deliver_publish(api_id: str, channel: str, events: list) -> None:
+    """Enqueue ``data`` frames for subscribers matching ``channel``."""
     async with _get_connections_lock():
         matching_conns = [
             conn for conn in _connections.values()
             if conn["api_id"] == api_id
         ]
-
-    for idx, ev in enumerate(events):
-        identifier = new_uuid()
-        try:
-            if not isinstance(ev, str):
-                raise ValueError("event must be a JSON-encoded string")
-            for conn in matching_conns:
-                for sub_id, pattern in list(conn["subscriptions"].items()):
-                    if _channel_matches(channel, pattern):
-                        await conn["outbox"].put({
-                            "type": "data",
-                            "id": sub_id,
-                            "event": [ev],
-                        })
-            successful.append({"identifier": identifier, "index": idx})
-        except Exception as e:
-            failed.append({
-                "identifier": identifier,
-                "index": idx,
-                "code": 400,
-                "errorMessage": str(e),
-            })
-    return successful, failed
+    for ev in events:
+        for conn in matching_conns:
+            for sub_id, pattern in list(conn["subscriptions"].items()):
+                if _channel_matches(channel, pattern):
+                    await conn["outbox"].put({
+                        "type": "data",
+                        "id": sub_id,
+                        "event": [ev],
+                    })
 
 
 # ---------------------------------------------------------------------------
@@ -1045,7 +1056,10 @@ async def handle_websocket(scope, receive, send, api_id: str):
             try:
                 await send({"type": "websocket.send", "text": json.dumps(item)})
             except Exception:
-                return
+                # A transient send failure must not kill the drain forever —
+                # otherwise publish_success / data / ka never reach the client.
+                logger.exception("AppSync Events outbox send failed; continuing drain")
+                continue
 
     async def _heartbeat():
         """Push ``{"type":"ka"}`` every interval until the connection closes."""
@@ -1219,13 +1233,17 @@ async def _handle_client_frame(api_id: str, connection_id: str, frame: dict, out
                             "message": message or "publish rejected"}],
             })
             return
-        successful, failed = await _fanout_publish(api_id, channel, events)
+        successful, failed, to_deliver = _plan_publish(events)
+        # Ack before peer fan-out so publish_success is not delayed behind
+        # listener drain work under parallel shared-server load.
         await outbox.put({
             "type": "publish_success",
             "id": pub_id,
             "successful": successful,
             "failed": failed,
         })
+        await asyncio.sleep(0)
+        await _deliver_publish(api_id, channel, to_deliver)
         return
 
     if ftype == "unsubscribe":

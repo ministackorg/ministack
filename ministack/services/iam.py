@@ -175,10 +175,28 @@ def _make_aws_managed_record(name: str, document: str, description: str = "") ->
     }
 
 
+def _attached_policy_arn(entry):
+    """Normalize an AttachedPolicies entry to an ARN string.
+
+    IAM APIs store ARN strings. Older CloudFormation writers stored
+    ``{"PolicyName", "PolicyArn"}`` dicts; accept both so shared-server
+    reads (GetAccountAuthorizationDetails, ListAttached*) do not raise
+    ``unhashable type: 'dict'``.
+    """
+    if isinstance(entry, str):
+        return entry
+    if isinstance(entry, dict):
+        return entry.get("PolicyArn") or entry.get("Arn") or ""
+    return ""
+
+
 def _lookup_policy(arn: str):
     """Return the policy record for ``arn`` from either the
     account-scoped customer-managed store or the global AWS-managed
     store, autoviving on the AWS-managed side if enabled."""
+    arn = _attached_policy_arn(arn)
+    if not arn:
+        return None
     if _is_aws_managed_arn(arn):
         record = _aws_managed_policies.get(arn)
         if record is None and _autocreate_aws_managed_enabled():
@@ -1792,7 +1810,8 @@ def _get_account_authorization_details(p):
             )
             # Attached managed policies
             attached_xml = ""
-            for arn in user.get("AttachedPolicies", []):
+            for entry in user.get("AttachedPolicies", []):
+                arn = _attached_policy_arn(entry)
                 pol = _lookup_policy(arn)
                 if pol:
                     attached_xml += (f"<member>"
@@ -1839,7 +1858,8 @@ def _get_account_authorization_details(p):
             )
             # Attached managed policies
             attached_xml = ""
-            for arn in g.get("AttachedPolicies", []):
+            for entry in g.get("AttachedPolicies", []):
+                arn = _attached_policy_arn(entry)
                 pol = _lookup_policy(arn)
                 if pol:
                     attached_xml += (f"<member>"
@@ -1873,7 +1893,8 @@ def _get_account_authorization_details(p):
             )
             # Attached managed policies
             attached_xml = ""
-            for arn in role.get("AttachedPolicies", []):
+            for entry in role.get("AttachedPolicies", []):
+                arn = _attached_policy_arn(entry)
                 pol = _lookup_policy(arn)
                 if pol:
                     attached_xml += (f"<member>"
@@ -1911,13 +1932,17 @@ def _get_account_authorization_details(p):
     if include_all or "LocalManagedPolicy" in filters:
         for arn, pol in _policies.items():
             default_vid = pol.get("DefaultVersionId", "v1")
+            versions = pol.get("Versions", {})
+            version_records = (
+                versions.values() if isinstance(versions, dict) else versions
+            )
             versions_xml = "".join(
                 f"<member>"
                 f"<Document>{_url_quote(v.get('Document') or '{}', safe='')}</Document>"
                 f"<VersionId>{v['VersionId']}</VersionId>"
                 f"<IsDefaultVersion>{'true' if v.get('IsDefaultVersion') else 'false'}</IsDefaultVersion>"
                 f"</member>"
-                for v in pol.get("Versions", {}).values()
+                for v in version_records
             )
             policies_xml += (
                 f"<member>"

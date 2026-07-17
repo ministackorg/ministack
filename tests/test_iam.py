@@ -963,6 +963,41 @@ def test_iam_account_authorization_details_filter(iam):
     finally:
         iam.delete_user(UserName="aad-filter-user")
         iam.delete_role(RoleName="aad-filter-role")
+
+
+def test_iam_account_authorization_details_tolerates_cfn_attached_policy_dicts():
+    """CFN historically stored AttachedPolicies as dicts; auth-details must not crash."""
+    from ministack.core.responses import set_request_account_id, set_request_region
+    from ministack.services import iam as iam_mod
+
+    set_request_account_id("000000000000")
+    set_request_region("us-east-1")
+    role_name = "aad-cfn-shape-role"
+    policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+    assume_doc = json.dumps({"Version": "2012-10-17", "Statement": []})
+    iam_mod._roles[role_name] = {
+        "RoleName": role_name,
+        "Arn": f"arn:aws:iam::000000000000:role/{role_name}",
+        "RoleId": "AROATESTCFNSHAPE0001",
+        "CreateDate": "2026-01-01T00:00:00Z",
+        "Path": "/",
+        "AssumeRolePolicyDocument": assume_doc,
+        "AttachedPolicies": [
+            {"PolicyName": "AWSLambdaBasicExecutionRole", "PolicyArn": policy_arn},
+        ],
+        "InlinePolicies": {},
+        "Tags": [],
+    }
+    try:
+        status, headers, body = iam_mod._get_account_authorization_details(
+            {"Filter.member.1": ["Role"]}
+        )
+        assert status == 200, body
+        assert b"InternalError" not in body
+        assert b"unhashable type" not in body
+        assert role_name.encode() in body
+    finally:
+        iam_mod._roles.pop(role_name, None)
 # ── Virtual MFA devices ───────────────────────────────────────────────
 
 

@@ -606,13 +606,15 @@ def _iam_role_create(logical_id, props, stack_name):
         "Tags": [],
     }
 
-    # ManagedPolicyArns
+    # ManagedPolicyArns — IAM stores ARN strings (same as AttachRolePolicy).
+    # Dict-shaped entries break GetAccountAuthorizationDetails / ListAttached*
+    # via AccountScopedDict lookups (unhashable type: 'dict').
     managed = props.get("ManagedPolicyArns", [])
     for policy_arn in managed:
-        role["AttachedPolicies"].append({
-            "PolicyName": policy_arn.split("/")[-1],
-            "PolicyArn": policy_arn,
-        })
+        if isinstance(policy_arn, dict):
+            policy_arn = policy_arn.get("PolicyArn") or policy_arn.get("Arn") or ""
+        if policy_arn and policy_arn not in role["AttachedPolicies"]:
+            role["AttachedPolicies"].append(policy_arn)
 
     # Inline Policies
     policies = props.get("Policies", [])
@@ -646,6 +648,7 @@ def _iam_policy_create(logical_id, props, stack_name):
     if isinstance(pol_doc, dict):
         pol_doc = json.dumps(pol_doc)
 
+    created = now_iso()
     policy = {
         "PolicyName": name,
         "PolicyId": new_uuid().replace("-", "")[:21].upper(),
@@ -654,15 +657,18 @@ def _iam_policy_create(logical_id, props, stack_name):
         "DefaultVersionId": "v1",
         "AttachmentCount": 0,
         "IsAttachable": True,
-        "CreateDate": now_iso(),
-        "UpdateDate": now_iso(),
+        "CreateDate": created,
+        "UpdateDate": created,
         "Description": props.get("Description", ""),
-        "Versions": [{
-            "VersionId": "v1",
-            "IsDefaultVersion": True,
-            "Document": pol_doc,
-            "CreateDate": now_iso(),
-        }],
+        # Match IAM CreatePolicy: Versions is a version-id → record map.
+        "Versions": {
+            "v1": {
+                "VersionId": "v1",
+                "IsDefaultVersion": True,
+                "Document": pol_doc,
+                "CreateDate": created,
+            }
+        },
         "Tags": [],
     }
     _iam._policies[arn] = policy
@@ -672,10 +678,8 @@ def _iam_policy_create(logical_id, props, stack_name):
     for role_name in roles:
         role = _iam._roles.get(role_name)
         if role:
-            role["AttachedPolicies"].append({
-                "PolicyName": name,
-                "PolicyArn": arn,
-            })
+            if arn not in role["AttachedPolicies"]:
+                role["AttachedPolicies"].append(arn)
             policy["AttachmentCount"] += 1
 
     return arn, {"PolicyArn": arn}

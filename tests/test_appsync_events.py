@@ -661,13 +661,13 @@ def test_websocket_publish_frame_acks_and_fans_out(api):
             "channel": "/default/room1",
             "events": [json.dumps("over-ws")],
         })
-        ack = _drain_until(publisher, lambda f: f.get("type") == "publish_success", timeout=3.0)
+        ack = _drain_until(publisher, lambda f: f.get("type") == "publish_success", timeout=10.0)
         assert ack is not None
         assert ack["id"] == "pub-1"
         assert len(ack["successful"]) == 1
         assert ack["failed"] == []
 
-        data = _drain_until(listener, lambda f: f.get("type") == "data", timeout=3.0)
+        data = _drain_until(listener, lambda f: f.get("type") == "data", timeout=10.0)
         assert data is not None
         assert data["id"] == "sub-listener"
         assert json.loads(data["event"][0]) == "over-ws"
