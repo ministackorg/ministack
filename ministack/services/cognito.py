@@ -4829,7 +4829,11 @@ def _apply_user_filter(users: list, filter_str: str) -> list:
         if attr_name == "username":
             field_val = user.get("Username", "")
         elif attr_name == "status":
-            field_val = user.get("UserStatus", "")
+            # "status" filters on the account's Enabled/Disabled state (toggled by
+            # AdminEnableUser/AdminDisableUser), not the UserStatus confirmation-state enum
+            # (CONFIRMED, FORCE_CHANGE_PASSWORD, etc.). Matches real AWS Cognito's ListUsers
+            # Filter semantics, where "status" = "Enabled" never matches UserStatus values.
+            field_val = "Enabled" if user.get("Enabled", True) else "Disabled"
         elif attr_name == "email_verified":
             field_val = attr_dict.get("email_verified", "")
         if op == "=" and field_val == value:
