@@ -2,13 +2,15 @@ import io
 import json
 import os
 import time
+import urllib.request
 import uuid as _uuid_mod
 import zipfile
 from urllib.parse import urlparse
 
 import pytest
-import urllib.request
 from botocore.exceptions import ClientError
+
+from ministack.services import pipes as _pipes
 
 
 def _wait_stack(cfn, name, timeout=30):
@@ -1700,7 +1702,9 @@ def test_cfn_cdk_bootstrap_resources(cfn, s3, ecr):
         },
     }
     cfn.create_stack(StackName="CDKToolkit-v44", TemplateBody=json.dumps(template))
-    import time as _t; _t.sleep(2)
+    import time as _t
+
+    _t.sleep(2)
     stack = cfn.describe_stacks(StackName="CDKToolkit-v44")["Stacks"][0]
     assert stack["StackStatus"] == "CREATE_COMPLETE"
 
@@ -2347,6 +2351,61 @@ def test_cfn_pipes_dynamodb_stream_to_sns(cfn, ddb, sqs):
 
     cfn.delete_stack(StackName=stack_name)
     _wait_stack(cfn, stack_name)
+
+
+def test_cfn_pipes_rejects_cross_region_target(cfn):
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-pipe-xreg-{uid}"
+
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "DdbToSnsPipe": {
+                "Type": "AWS::Pipes::Pipe",
+                "Properties": {
+                    "Name": f"{stack_name}-pipe",
+                    "RoleArn": "arn:aws:iam::000000000000:role/test-pipe-role",
+                    "Source": (
+                        "arn:aws:dynamodb:us-east-1:000000000000:"
+                        f"table/{stack_name}-table/stream/2026-05-22T00:00:00.000"
+                    ),
+                    "Target": f"arn:aws:sns:us-west-2:000000000000:{stack_name}-topic",
+                    "SourceParameters": {
+                        "DynamoDBStreamParameters": {"StartingPosition": "TRIM_HORIZON"}
+                    },
+                },
+            },
+        },
+    }
+
+    try:
+        cfn.create_stack(
+            StackName=stack_name,
+            TemplateBody=json.dumps(template),
+            DisableRollback=True,
+        )
+        stack = _wait_stack(cfn, stack_name)
+
+        assert stack["StackStatus"] == "CREATE_FAILED"
+        assert _pipes.CROSS_REGION_PIPE_ERROR in stack.get("StackStatusReason", "")
+
+        events = cfn.describe_stack_events(StackName=stack_name)["StackEvents"]
+        pipe_events = [
+            event
+            for event in events
+            if event["LogicalResourceId"] == "DdbToSnsPipe"
+        ]
+        assert any(
+            event["ResourceStatus"] == "CREATE_FAILED"
+            and _pipes.CROSS_REGION_PIPE_ERROR in event.get("ResourceStatusReason", "")
+            for event in pipe_events
+        )
+    finally:
+        try:
+            cfn.delete_stack(StackName=stack_name)
+            _wait_stack(cfn, stack_name)
+        except ClientError:
+            pass
 
 
 def test_cfn_sns_topic_subscription_filter_policy_scope(cfn, sns, sqs):
@@ -3228,6 +3287,87 @@ def test_cfn_apigwv2_route_basic(cfn, apigw):
     cfn.delete_stack(StackName=stack_name)
     _wait_stack(cfn, stack_name)
     assert apigw.get_routes(ApiId=api_id)["Items"] == []
+
+
+def test_cfn_apigwv2_authorizer_jwt(cfn, apigw):
+    """CFN stack with an AWS::ApiGatewayV2::Authorizer deploys successfully and
+    a Route referencing it via AuthorizerId is enforced at request time.
+
+    Regression test: AWS::ApiGatewayV2::Authorizer previously had no CFN
+    provisioner at all ("Unsupported resource type"), even though the
+    control-plane CreateAuthorizer API (and Terraform's
+    aws_apigatewayv2_authorizer) already worked.
+    """
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "HttpApi": {
+                "Type": "AWS::ApiGatewayV2::Api",
+                "Properties": {
+                    "Name": "cfn-apigwv2-authorizer-t01",
+                    "ProtocolType": "HTTP",
+                },
+            },
+            "Integration": {
+                "Type": "AWS::ApiGatewayV2::Integration",
+                "Properties": {
+                    "ApiId": {"Ref": "HttpApi"},
+                    "IntegrationType": "AWS_PROXY",
+                    "IntegrationUri": "arn:aws:lambda:us-east-1:000000000000:function:dummy",
+                    "PayloadFormatVersion": "2.0",
+                },
+            },
+            "JwtAuthorizer": {
+                "Type": "AWS::ApiGatewayV2::Authorizer",
+                "Properties": {
+                    "ApiId": {"Ref": "HttpApi"},
+                    "Name": "cfn-apigwv2-authorizer-t01-jwt",
+                    "AuthorizerType": "JWT",
+                    "IdentitySource": ["$request.header.Authorization"],
+                    "JwtConfiguration": {
+                        "Audience": ["client-id"],
+                        "Issuer": "https://cognito-idp.us-east-1.amazonaws.com/us-east-1_example",
+                    },
+                },
+            },
+            "ProtectedRoute": {
+                "Type": "AWS::ApiGatewayV2::Route",
+                "Properties": {
+                    "ApiId": {"Ref": "HttpApi"},
+                    "RouteKey": "GET /protected",
+                    "Target": {"Fn::Join": ["/", ["integrations", {"Ref": "Integration"}]]},
+                    "AuthorizationType": "JWT",
+                    "AuthorizerId": {"Ref": "JwtAuthorizer"},
+                },
+            },
+        },
+    }
+    stack_name = "cfn-apigwv2-authorizer-t01"
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(template))
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "CREATE_COMPLETE"
+
+    resources = cfn.describe_stack_resources(StackName=stack_name)["StackResources"]
+    api_res = [r for r in resources if r["ResourceType"] == "AWS::ApiGatewayV2::Api"][0]
+    api_id = api_res["PhysicalResourceId"]
+    authorizer_res = [r for r in resources if r["ResourceType"] == "AWS::ApiGatewayV2::Authorizer"][0]
+    authorizer_id = authorizer_res["PhysicalResourceId"]
+
+    authorizers = apigw.get_authorizers(ApiId=api_id)["Items"]
+    assert len(authorizers) == 1
+    assert authorizers[0]["AuthorizerId"] == authorizer_id
+    assert authorizers[0]["AuthorizerType"] == "JWT"
+    assert authorizers[0]["JwtConfiguration"]["Audience"] == ["client-id"]
+    assert authorizers[0]["JwtConfiguration"]["Issuer"] == "https://cognito-idp.us-east-1.amazonaws.com/us-east-1_example"
+
+    routes = apigw.get_routes(ApiId=api_id)["Items"]
+    assert len(routes) == 1
+    assert routes[0]["AuthorizationType"] == "JWT"
+    assert routes[0]["AuthorizerId"] == authorizer_id
+
+    cfn.delete_stack(StackName=stack_name)
+    _wait_stack(cfn, stack_name)
+    assert apigw.get_authorizers(ApiId=api_id)["Items"] == []
 
 
 def test_cfn_apigwv2_integration_getatt(cfn, apigw):
