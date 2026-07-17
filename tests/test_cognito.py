@@ -146,6 +146,20 @@ def test_cognito_list_users_filter_quoted_attribute_name(cognito_idp):
     resp = cognito_idp.list_users(UserPoolId=pid, Filter='"email" = "nonexistent@example.com"')
     assert resp["Users"] == []
 
+def test_cognito_list_users_filter_status(cognito_idp):
+    pid = cognito_idp.create_user_pool(PoolName="StatusFilterUsersPool")["UserPool"]["Id"]
+    cognito_idp.admin_create_user(UserPoolId=pid, Username="active-user")
+    cognito_idp.admin_create_user(UserPoolId=pid, Username="disabled-user")
+    cognito_idp.admin_disable_user(UserPoolId=pid, Username="disabled-user")
+
+    resp = cognito_idp.list_users(UserPoolId=pid, Filter='status = "Enabled"')
+    usernames = [u["Username"] for u in resp["Users"]]
+    assert usernames == ["active-user"]
+
+    resp = cognito_idp.list_users(UserPoolId=pid, Filter='status = "Disabled"')
+    usernames = [u["Username"] for u in resp["Users"]]
+    assert usernames == ["disabled-user"]
+
 def test_cognito_admin_set_user_password(cognito_idp):
     pid = cognito_idp.create_user_pool(PoolName="PwdPool")["UserPool"]["Id"]
     cid = cognito_idp.create_user_pool_client(

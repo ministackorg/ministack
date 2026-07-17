@@ -11,11 +11,14 @@ bridge layer.
 
 from __future__ import annotations
 
+import io as _io
+import json
 import os
 import struct
 import threading
 import time
 import uuid
+import zipfile as _zipfile
 from urllib.parse import quote, urlparse
 
 import pytest
@@ -357,3 +360,110 @@ def test_iot_ws_same_account_publish_delivers(iot_data_client):
     delivered_topic, delivered_payload = received[0]
     assert delivered_topic == topic
     assert delivered_payload == payload
+
+
+# ---------------------------------------------------------------------------
+# Topic-rule routing (publish → rule → Lambda)
+# ---------------------------------------------------------------------------
+
+# Handler forwards the received rule event to the SQS queue named by SINK_URL,
+# so the test can observe that the rule fired and with what payload.
+_RULE_SINK_HANDLER = (
+    "import boto3, json, os\n"
+    "def handler(event, context):\n"
+    "    s = boto3.client('sqs', endpoint_url=os.environ['AWS_ENDPOINT_URL'])\n"
+    "    s.send_message(QueueUrl=os.environ['SINK_URL'], MessageBody=json.dumps(event))\n"
+    "    return {'ok': True}\n"
+)
+
+
+def _make_sink_lambda(lam, sink_url):
+    buf = _io.BytesIO()
+    with _zipfile.ZipFile(buf, "w") as z:
+        z.writestr("index.py", _RULE_SINK_HANDLER)
+    name = _unique("rulefn")
+    lam.create_function(
+        FunctionName=name,
+        Runtime="python3.12",
+        Role="arn:aws:iam::000000000000:role/test-role",
+        Handler="index.handler",
+        Code={"ZipFile": buf.getvalue()},
+        Environment={"Variables": {"SINK_URL": sink_url}},
+    )
+    return lam.get_function(FunctionName=name)["Configuration"]["FunctionArn"]
+
+
+def _poll_sink(sqs, url, timeout=12):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        msgs = sqs.receive_message(QueueUrl=url, MaxNumberOfMessages=1, WaitTimeSeconds=1)
+        if msgs.get("Messages"):
+            return json.loads(msgs["Messages"][0]["Body"])
+    return None
+
+
+def test_iot_topic_rule_routes_publish_to_lambda(iot_client, iot_data_client, lam, sqs):
+    sink = sqs.create_queue(QueueName=_unique("rule-sink"))["QueueUrl"]
+    fn_arn = _make_sink_lambda(lam, sink)
+    rule = _unique("route").replace("-", "_")
+    iot_client.create_topic_rule(
+        ruleName=rule,
+        topicRulePayload={
+            "sql": "SELECT * FROM 'sensors/+/telemetry'",
+            "actions": [{"lambda": {"functionArn": fn_arn}}],
+        },
+    )
+
+    iot_data_client.publish(
+        topic="sensors/a1/telemetry",
+        payload=json.dumps({"temp": 22, "missedReadings": 3}).encode(),
+    )
+    event = _poll_sink(sqs, sink)
+    assert event == {"temp": 22, "missedReadings": 3}
+
+    iot_client.delete_topic_rule(ruleName=rule)
+
+
+def test_iot_basic_ingest_routes_to_lambda(iot_client, iot_data_client, lam, sqs):
+    sink = sqs.create_queue(QueueName=_unique("ingest-sink"))["QueueUrl"]
+    fn_arn = _make_sink_lambda(lam, sink)
+    rule = _unique("ingest").replace("-", "_")
+    iot_client.create_topic_rule(
+        ruleName=rule,
+        topicRulePayload={
+            "sql": "SELECT * FROM 'unused'",
+            "actions": [{"lambda": {"functionArn": fn_arn}}],
+        },
+    )
+
+    # Basic Ingest: publishing to `$aws/rules/<ruleName>` invokes the rule
+    # directly, bypassing the topic filter.
+    iot_data_client.publish(
+        topic=f"$aws/rules/{rule}",
+        payload=json.dumps({"temp": 99, "basic": True}).encode(),
+    )
+    event = _poll_sink(sqs, sink)
+    assert event == {"temp": 99, "basic": True}
+
+    iot_client.delete_topic_rule(ruleName=rule)
+
+
+def test_iot_disabled_rule_does_not_fire(iot_client, iot_data_client, lam, sqs):
+    sink = sqs.create_queue(QueueName=_unique("disabled-sink"))["QueueUrl"]
+    fn_arn = _make_sink_lambda(lam, sink)
+    rule = _unique("disabled").replace("-", "_")
+    iot_client.create_topic_rule(
+        ruleName=rule,
+        topicRulePayload={
+            "sql": "SELECT * FROM 'sensors/+/telemetry'",
+            "ruleDisabled": True,
+            "actions": [{"lambda": {"functionArn": fn_arn}}],
+        },
+    )
+
+    iot_data_client.publish(
+        topic="sensors/a1/telemetry", payload=json.dumps({"temp": 1}).encode()
+    )
+    assert _poll_sink(sqs, sink, timeout=4) is None
+
+    iot_client.delete_topic_rule(ruleName=rule)
