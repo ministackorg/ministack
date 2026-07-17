@@ -2,13 +2,15 @@ import io
 import json
 import os
 import time
+import urllib.request
 import uuid as _uuid_mod
 import zipfile
 from urllib.parse import urlparse
 
 import pytest
-import urllib.request
 from botocore.exceptions import ClientError
+
+from ministack.services import pipes as _pipes
 
 
 def _wait_stack(cfn, name, timeout=30):
@@ -1700,7 +1702,9 @@ def test_cfn_cdk_bootstrap_resources(cfn, s3, ecr):
         },
     }
     cfn.create_stack(StackName="CDKToolkit-v44", TemplateBody=json.dumps(template))
-    import time as _t; _t.sleep(2)
+    import time as _t
+
+    _t.sleep(2)
     stack = cfn.describe_stacks(StackName="CDKToolkit-v44")["Stacks"][0]
     assert stack["StackStatus"] == "CREATE_COMPLETE"
 
@@ -2347,6 +2351,61 @@ def test_cfn_pipes_dynamodb_stream_to_sns(cfn, ddb, sqs):
 
     cfn.delete_stack(StackName=stack_name)
     _wait_stack(cfn, stack_name)
+
+
+def test_cfn_pipes_rejects_cross_region_target(cfn):
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-pipe-xreg-{uid}"
+
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "DdbToSnsPipe": {
+                "Type": "AWS::Pipes::Pipe",
+                "Properties": {
+                    "Name": f"{stack_name}-pipe",
+                    "RoleArn": "arn:aws:iam::000000000000:role/test-pipe-role",
+                    "Source": (
+                        "arn:aws:dynamodb:us-east-1:000000000000:"
+                        f"table/{stack_name}-table/stream/2026-05-22T00:00:00.000"
+                    ),
+                    "Target": f"arn:aws:sns:us-west-2:000000000000:{stack_name}-topic",
+                    "SourceParameters": {
+                        "DynamoDBStreamParameters": {"StartingPosition": "TRIM_HORIZON"}
+                    },
+                },
+            },
+        },
+    }
+
+    try:
+        cfn.create_stack(
+            StackName=stack_name,
+            TemplateBody=json.dumps(template),
+            DisableRollback=True,
+        )
+        stack = _wait_stack(cfn, stack_name)
+
+        assert stack["StackStatus"] == "CREATE_FAILED"
+        assert _pipes.CROSS_REGION_PIPE_ERROR in stack.get("StackStatusReason", "")
+
+        events = cfn.describe_stack_events(StackName=stack_name)["StackEvents"]
+        pipe_events = [
+            event
+            for event in events
+            if event["LogicalResourceId"] == "DdbToSnsPipe"
+        ]
+        assert any(
+            event["ResourceStatus"] == "CREATE_FAILED"
+            and _pipes.CROSS_REGION_PIPE_ERROR in event.get("ResourceStatusReason", "")
+            for event in pipe_events
+        )
+    finally:
+        try:
+            cfn.delete_stack(StackName=stack_name)
+            _wait_stack(cfn, stack_name)
+        except ClientError:
+            pass
 
 
 def test_cfn_sns_topic_subscription_filter_policy_scope(cfn, sns, sqs):

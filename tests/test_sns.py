@@ -166,6 +166,13 @@ def test_sns_subscription_attributes_are_region_scoped(sns):
         SubscriptionArn=west_sub,
     )["Attributes"]["TopicArn"] == west_arn
 
+    east_subs = [sub["SubscriptionArn"] for sub in sns.list_subscriptions()["Subscriptions"]]
+    west_subs = [sub["SubscriptionArn"] for sub in west.list_subscriptions()["Subscriptions"]]
+    assert east_sub in east_subs
+    assert west_sub not in east_subs
+    assert west_sub in west_subs
+    assert east_sub not in west_subs
+
     with pytest.raises(ClientError) as exc:
         sns.get_subscription_attributes(SubscriptionArn=west_sub)
     assert exc.value.response["Error"]["Code"] == "NotFound"
@@ -1560,6 +1567,12 @@ def test_sns_platform_applications_and_endpoints_are_region_scoped(sns):
     with pytest.raises(ClientError) as exc:
         sns.get_endpoint_attributes(EndpointArn=west_endpoint)
     assert exc.value.response["Error"]["Code"] == "NotFound"
+
+    sns.delete_platform_application(PlatformApplicationArn=east_app)
+    with pytest.raises(ClientError) as exc:
+        sns.get_endpoint_attributes(EndpointArn=east_endpoint)
+    assert exc.value.response["Error"]["Code"] == "NotFound"
+    assert west.get_endpoint_attributes(EndpointArn=west_endpoint)["Attributes"]["Token"] == token
 
 
 def test_sns_create_platform_endpoint_stores_token_and_enabled(sns):

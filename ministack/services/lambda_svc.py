@@ -2444,9 +2444,11 @@ async def _invoke(name: str, event: dict, headers: dict, path_qualifier: str | N
     log_output = result.get("log", "")
     if log_output:
         logger.info("Lambda %s output:\n%s", name, log_output)
-        resp_headers["X-Amz-Log-Result"] = base64.b64encode(
-            log_output.encode("utf-8"),
-        ).decode()
+        log_type = headers.get("x-amz-log-type") or headers.get("X-Amz-Log-Type") or "None"
+        if log_type.lower() == "tail":
+            resp_headers["X-Amz-Log-Result"] = base64.b64encode(
+                log_output.encode("utf-8")[-4096:],
+            ).decode()
 
     # Throttling takes a separate status path: HTTP 429 with the error body
     # shaped as a service-level exception, NOT the 200+X-Amz-Function-Error

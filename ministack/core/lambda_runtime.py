@@ -162,10 +162,25 @@ const url = require("url");
 const Module = require("module");
 
 // Redirect stdout to stderr so stdout stays clean for JSON-line protocol
+const fs = require("fs");
 const _realStdoutWrite = process.stdout.write.bind(process.stdout);
 const _stderrWrite = process.stderr.write.bind(process.stderr);
 process.stdout.write = function(chunk, encoding, callback) {
   return _stderrWrite(chunk, encoding, callback);
+};
+const _stdoutFd = process.stdout.fd;
+const _realWriteSync = fs.writeSync.bind(fs);
+const _realWrite = fs.write.bind(fs);
+function _isStdoutFd(fd) {
+  return fd === 1 || fd === _stdoutFd;
+}
+fs.writeSync = function(fd, ...args) {
+  if (_isStdoutFd(fd)) fd = 2;
+  return _realWriteSync(fd, ...args);
+};
+fs.write = function(fd, ...args) {
+  if (_isStdoutFd(fd)) fd = 2;
+  return _realWrite(fd, ...args);
 };
 
 // Synthetic AWS SDK v3 stubs — real AWS Lambda (Node.js 18+) ships these
@@ -924,8 +939,9 @@ class Worker:
                         if response_line.startswith("{"):
                             try:
                                 response = json.loads(response_line)
-                                result_box.append(response)
-                                return
+                                if response.get("status") in ("ok", "error"):
+                                    result_box.append(response)
+                                    return
                             except json.JSONDecodeError:
                                 continue
                     result_box.append({"status": "error", "error": "No JSON response from worker after 200 lines"})
