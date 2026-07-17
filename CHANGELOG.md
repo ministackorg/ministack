@@ -7,6 +7,8 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **Cognito — `ListUsers` `status` filter matched against the wrong field** — `Filter='status = "Enabled"'`/`"Disabled"` was compared against `UserStatus` (the confirmation-state enum: `CONFIRMED`, `FORCE_CHANGE_PASSWORD`, `UNCONFIRMED`, etc.), which never equals the literal string `"Enabled"`/`"Disabled"`. As a result, filtering by `status` always returned an empty list, regardless of how many users existed or their actual enabled/disabled state. `status` now correctly reflects the account's `Enabled` boolean toggled by `AdminEnableUser`/`AdminDisableUser`, matching real AWS Cognito's `ListUsers` Filter semantics. Contributed by @jey-mfv.
 ### Added
 - **IoT — MQTT publishes are routed through topic rules to Lambda** — an MQTT/`iot-data` publish is now matched against each account's topic rules by the rule's `FROM '<topic filter>'` clause (with `+`/`#` wildcards), and every matching enabled rule's `lambda` actions are invoked asynchronously with the message payload as the event (`SELECT *`). Basic Ingest is supported: a publish to `$aws/rules/<ruleName>` is delivered straight to that rule's actions and bypasses pub/sub. Disabled rules are skipped.
 
