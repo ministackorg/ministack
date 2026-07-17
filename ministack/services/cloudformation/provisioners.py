@@ -3756,6 +3756,8 @@ def _apigw_v2_route_create(logical_id, props, stack_name):
         "routeKey": props.get("RouteKey", "$default"),
         "target": props.get("Target", ""),
         "authorizationType": props.get("AuthorizationType", "NONE"),
+        "authorizerId": props.get("AuthorizerId"),
+        "authorizationScopes": props.get("AuthorizationScopes", []),
         "apiKeyRequired": props.get("ApiKeyRequired", False),
         "operationName": props.get("OperationName", ""),
         "requestModels": props.get("RequestModels", {}),
@@ -3772,6 +3774,48 @@ def _apigw_v2_route_delete(physical_id, props):
         api_id, route_id = parts
         routes = _apigw_v2._routes.get(api_id, {})
         routes.pop(route_id, None)
+
+
+# ---------------------------------------------------------------------------
+# ApiGatewayV2 Authorizer
+# ---------------------------------------------------------------------------
+
+def _apigw_v2_authorizer_create(logical_id, props, stack_name):
+    """Maps CFN properties onto the same in-memory authorizer store the
+    control-plane CreateAuthorizer API (and Terraform's aws_apigatewayv2_authorizer)
+    already write to, so a CFN-created authorizer is enforced identically at
+    request time. See _validate_jwt_authorizer / _resolve_jwks_url.
+
+    jwtConfiguration is stored camelCase (the API's actual wire shape, which
+    the JSON response is returned as-is) — CFN's JwtConfiguration.Audience /
+    .Issuer are translated here rather than passed through PascalCase.
+    """
+    api_id = props.get("ApiId", "")
+    auth_id = new_uuid()[:8]
+    jwt_cfg = props.get("JwtConfiguration") or {}
+    authorizer = {
+        "authorizerId": auth_id,
+        "authorizerType": props.get("AuthorizerType", "JWT"),
+        "name": props.get("Name", logical_id),
+        "identitySource": props.get("IdentitySource", ["$request.header.Authorization"]),
+        "jwtConfiguration": {
+            "audience": jwt_cfg.get("Audience", []),
+            "issuer": jwt_cfg.get("Issuer", ""),
+        },
+        "authorizerUri": props.get("AuthorizerUri", ""),
+        "authorizerPayloadFormatVersion": props.get("AuthorizerPayloadFormatVersion", "2.0"),
+        "authorizerResultTtlInSeconds": props.get("AuthorizerResultTtlInSeconds", 300),
+        "enableSimpleResponses": props.get("EnableSimpleResponses", False),
+        "authorizerCredentialsArn": props.get("AuthorizerCredentialsArn", ""),
+    }
+    _apigw_v2._authorizers.setdefault(api_id, {})[auth_id] = authorizer
+    return auth_id, {"AuthorizerId": auth_id}
+
+
+def _apigw_v2_authorizer_delete(physical_id, props):
+    api_id = props.get("ApiId", "")
+    authorizers = _apigw_v2._authorizers.get(api_id, {})
+    authorizers.pop(physical_id, None)
 
 
 # ---------------------------------------------------------------------------
@@ -4374,6 +4418,7 @@ _RESOURCE_HANDLERS = {
     "AWS::ApiGatewayV2::Stage": {"create": _apigw_v2_stage_create, "delete": _apigw_v2_stage_delete},
     "AWS::ApiGatewayV2::Integration": {"create": _apigw_v2_integration_create, "delete": _apigw_v2_integration_delete},
     "AWS::ApiGatewayV2::Route": {"create": _apigw_v2_route_create, "delete": _apigw_v2_route_delete},
+    "AWS::ApiGatewayV2::Authorizer": {"create": _apigw_v2_authorizer_create, "delete": _apigw_v2_authorizer_delete},
     "AWS::SES::EmailIdentity": {"create": _ses_email_identity_create, "delete": _ses_email_identity_delete},
     "AWS::WAFv2::WebACL": {"create": _waf_web_acl_create, "delete": _waf_web_acl_delete},
     "AWS::CloudFront::Distribution": {"create": _cf_distribution_create, "delete": _cf_distribution_delete},
