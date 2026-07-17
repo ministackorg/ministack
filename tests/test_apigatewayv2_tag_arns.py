@@ -71,6 +71,28 @@ def test_apigwv2_tag_arns_accept_existing_local_api_and_stage_resources():
     assert stage_body["tags"] == {"created": "stage", "owner": "team-a"}
 
 
+def test_apigwv2_tag_arns_accept_existing_domain_names():
+    domain_name = "tags.example.com"
+    status, body = _payload(
+        _apigw._create_domain_name(
+            {"domainName": domain_name, "tags": {"created": "domain"}}
+        )
+    )
+    assert status == 201
+    assert body["domainName"] == domain_name
+
+    domain_arn = (
+        f"arn:aws:apigateway:{get_region()}::/domainnames/{domain_name}"
+    )
+    status, _headers, _body = _apigw._tag_resource(
+        domain_arn, {"tags": {"owner": "team-a"}}
+    )
+    assert status == 201
+    status, tags = _payload(_apigw._get_tags(domain_arn))
+    assert status == 200
+    assert tags["tags"] == {"created": "domain", "owner": "team-a"}
+
+
 def test_apigwv2_tag_arns_reject_invalid_or_nonlocal_resources_before_touching_tags():
     api_id = _create_api("tag-reject-api")
     route_status, route = _payload(_apigw._create_route(api_id, {"routeKey": "GET /items"}))
@@ -107,7 +129,10 @@ def test_apigwv2_tag_arns_reject_invalid_or_nonlocal_resources_before_touching_t
         (f"arn:aws:execute-api:us-east-1::/apis/{api_id}", "BadRequestException"),
         (f"arn:aws:apigateway:us-west-2::/apis/{api_id}", "BadRequestException"),
         (f"arn:aws:apigateway:us-east-1:000000000000:/apis/{api_id}", "BadRequestException"),
-        ("arn:aws:apigateway:us-east-1::/domainnames/example.com", "BadRequestException"),
+        (
+            "arn:aws:apigateway:us-east-1::/domainnames/missing.example.com",
+            "NotFoundException",
+        ),
         (f"arn:aws:apigateway:us-east-1::/apis/{api_id}/routes", "BadRequestException"),
         (f"arn:aws:apigateway:us-east-1::/apis/{api_id}/routes/{route['routeId']}", "BadRequestException"),
         (

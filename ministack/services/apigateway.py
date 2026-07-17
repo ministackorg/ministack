@@ -34,10 +34,22 @@ Control plane endpoints implemented:
   GET    /v2/apis/{apiId}/authorizers/{authId}      — GetAuthorizer
   PATCH  /v2/apis/{apiId}/authorizers/{authId}      — UpdateAuthorizer
   DELETE /v2/apis/{apiId}/authorizers/{authId}      — DeleteAuthorizer
+  POST   /v2/domainnames                             — CreateDomainName
+  GET    /v2/domainnames                             — GetDomainNames
+  GET    /v2/domainnames/{domainName}                — GetDomainName
+  PATCH  /v2/domainnames/{domainName}                — UpdateDomainName
+  DELETE /v2/domainnames/{domainName}                — DeleteDomainName
+  POST   /v2/domainnames/{domainName}/apimappings    — CreateApiMapping
+  GET    /v2/domainnames/{domainName}/apimappings    — GetApiMappings
+  GET    /v2/domainnames/{domainName}/apimappings/{id} — GetApiMapping
+  PATCH  /v2/domainnames/{domainName}/apimappings/{id} — UpdateApiMapping
+  DELETE /v2/domainnames/{domainName}/apimappings/{id} — DeleteApiMapping
 
 Data plane:
   Requests to /{apiId}.execute-api.localhost/{stage}/{path} are forwarded to
   Lambda (AWS_PROXY) or HTTP backends (HTTP_PROXY) via handle_execute().
+  Registered custom DomainName hosts are resolved via resolve_custom_domain()
+  and dispatched the same way (#1030).
 """
 
 import asyncio
@@ -100,6 +112,9 @@ _authorizers = AccountScopedDict()   # api_id -> {authorizer_id -> authorizer ob
 _api_tags = AccountScopedDict()      # resource_arn -> {key -> value}
 _route_responses = AccountScopedDict()         # api_id -> {route_id -> {rr_id -> route_response}}
 _integration_responses = AccountScopedDict()   # api_id -> {integration_id -> {ir_id -> int_response}}
+_domain_names = AccountScopedDict()            # domain_name -> DomainName object
+_domain_name_regions = AccountScopedDict()     # domain_name -> owning region
+_api_mappings = AccountScopedDict()            # domain_name -> {api_mapping_id -> ApiMapping}
 # JWKS cache is account-scoped because issuer URLs in MiniStack can resolve
 # to per-account local Cognito user pools — the same URL string may legitimately
 # serve different keys in different accounts.
@@ -177,6 +192,10 @@ def _api_resource_arn(api_id: str, *segments: str) -> str:
     return f"arn:aws:apigateway:{get_region()}::/apis/{api_id}{suffix}"
 
 
+def _domain_name_arn(domain_name: str) -> str:
+    return f"arn:aws:apigateway:{get_region()}::/domainnames/{domain_name}"
+
+
 def _extract_lambda_ref_from_integration_uri(uri: str) -> str:
     """Return the inner Lambda ARN / name from an APIGW integrationUri.
 
@@ -223,6 +242,9 @@ def get_state() -> dict:
         "api_tags": copy.deepcopy(_api_tags),
         "route_responses": copy.deepcopy(_route_responses),
         "integration_responses": copy.deepcopy(_integration_responses),
+        "domain_names": copy.deepcopy(_domain_names),
+        "domain_name_regions": copy.deepcopy(_domain_name_regions),
+        "api_mappings": copy.deepcopy(_api_mappings),
     }
 
 
@@ -238,6 +260,9 @@ def load_persisted_state(data: dict) -> None:
     _api_tags.update(data.get("api_tags", {}))
     _route_responses.update(data.get("route_responses", {}))
     _integration_responses.update(data.get("integration_responses", {}))
+    _domain_names.update(data.get("domain_names", {}))
+    _domain_name_regions.update(data.get("domain_name_regions", {}))
+    _api_mappings.update(data.get("api_mappings", {}))
 
 
 # ---- Control plane router ----
@@ -399,6 +424,38 @@ async def handle_request(method, path, headers, body, query_params):
                     return _update_authorizer(api_id, sub_id, data)
                 if method == "DELETE":
                     return _delete_authorizer(api_id, sub_id)
+
+    # /v2/domainnames[/{domainName}[/apimappings[/{apiMappingId}]]]
+    if resource == "domainnames":
+        domain_name = urllib.parse.unquote(parts[2]) if len(parts) > 2 else None
+        sub = parts[3] if len(parts) > 3 else None
+        sub_id = urllib.parse.unquote(parts[4]) if len(parts) > 4 else None
+
+        if not domain_name:
+            if method == "POST":
+                return _create_domain_name(data)
+            if method == "GET":
+                return _get_domain_names()
+        elif not sub:
+            if method == "GET":
+                return _get_domain_name(domain_name)
+            if method == "PATCH":
+                return _update_domain_name(domain_name, data)
+            if method == "DELETE":
+                return _delete_domain_name(domain_name)
+        elif sub == "apimappings":
+            if not sub_id:
+                if method == "POST":
+                    return _create_api_mapping(domain_name, data)
+                if method == "GET":
+                    return _get_api_mappings(domain_name)
+            else:
+                if method == "GET":
+                    return _get_api_mapping(domain_name, sub_id)
+                if method == "PATCH":
+                    return _update_api_mapping(domain_name, sub_id, data)
+                if method == "DELETE":
+                    return _delete_api_mapping(domain_name, sub_id)
 
     return _apigw_error("NotFoundException", f"Unknown API Gateway path: {path}", 404)
 
@@ -1039,6 +1096,7 @@ async def _invoke_lambda_proxy(
             req_body, req_is_base64 = base64.b64encode(body).decode("ascii"), True
     else:
         req_body, req_is_base64 = None, False
+    domain_name = _request_context_domain_name(api_id, headers)
     event = {
         "version": "2.0",
         "routeKey": route_key,
@@ -1049,7 +1107,8 @@ async def _invoke_lambda_proxy(
         "requestContext": {
             "accountId": get_account_id(),
             "apiId": api_id,
-            "domainName": f"{api_id}.execute-api.{_HOST}",
+            "domainName": domain_name,
+            "domainPrefix": domain_name.split(".", 1)[0],
             "http": {
                 "method": method,
                 "path": path,
@@ -1240,7 +1299,23 @@ def _get_apis():
     return _apigw_response({"items": items})
 
 
+def _find_api_mapping(api_id: str, stage: str | None = None):
+    for mappings in _api_mappings.values():
+        for mapping in mappings.values():
+            if mapping.get("apiId") != api_id:
+                continue
+            if stage is None or mapping.get("stage") == stage:
+                return mapping
+    return None
+
+
 def _delete_api(api_id):
+    if _find_api_mapping(api_id) is not None:
+        return _apigw_error(
+            "ConflictException",
+            f"API {api_id} has custom domain mappings; delete them first",
+            409,
+        )
     _delete_api_tag_resources(api_id)
     _apis.pop(api_id, None)
     _api_regions.pop(api_id, None)
@@ -1465,6 +1540,12 @@ def _update_stage(api_id, stage_name, data):
 
 
 def _delete_stage(api_id, stage_name):
+    if _find_api_mapping(api_id, stage_name) is not None:
+        return _apigw_error(
+            "ConflictException",
+            f"Stage {stage_name} has custom domain mappings; delete them first",
+            409,
+        )
     _stages.get(api_id, {}).pop(stage_name, None)
     _api_tags.pop(_api_resource_arn(api_id, "stages", stage_name), None)
     return 204, {}, b""
@@ -1544,6 +1625,13 @@ def _validate_tag_resource_arn(resource_arn: str) -> tuple[str | None, tuple | N
     segments = spec.resource[1:].split("/")
     if not segments or any(segment == "" for segment in segments):
         return None, _invalid_tag_resource_arn(resource_arn)
+
+    if len(segments) == 2 and segments[0] == "domainnames":
+        domain_name = segments[1]
+        if not _domain_name_exists_in_region(domain_name):
+            return None, _tag_resource_not_found(resource_arn)
+        return _domain_name_arn(domain_name), None
+
     if len(segments) not in (2, 4) or segments[0] != "apis":
         return None, _invalid_tag_resource_arn(resource_arn)
 
@@ -1658,6 +1746,9 @@ def reset():
     _api_tags.clear()
     _route_responses.clear()
     _integration_responses.clear()
+    _domain_names.clear()
+    _domain_name_regions.clear()
+    _api_mappings.clear()
     # Signal any live WS connections to shut down, then drop registry.
     for conn in list(_ws_connections.values()):
         ev = conn.get("close_event")
@@ -1667,6 +1758,306 @@ def reset():
             except Exception:
                 pass
     _ws_connections.clear()
+
+
+# ---- Control plane: Domain names + API mappings (#1030) ----
+
+def _normalize_domain_host(host: str) -> str:
+    return host.split(":", 1)[0].lower()
+
+
+def _find_registered_domain_name(hostname: str) -> str | None:
+    hostname = _normalize_domain_host(hostname)
+    if not hostname:
+        return None
+    for name in _domain_names:
+        if name.lower() == hostname:
+            return name
+    return None
+
+
+def _request_context_domain_name(api_id: str, headers: dict) -> str:
+    """Return the domainName reported in the Lambda proxy requestContext.
+
+    Host-based execute-api and registered custom domains use the inbound Host
+    (without port). Path-based addressing keeps the synthetic
+    ``{apiId}.execute-api.{MINISTACK_HOST}`` form so a gateway Host like
+    ``localhost`` / ``127.0.0.1`` does not leak into the event (#1030).
+    """
+    default = f"{api_id}.execute-api.{_HOST}"
+    host = headers.get("host", "").split(":", 1)[0]
+    if not host:
+        return default
+    host_l = host.lower()
+    execute_api_suffix = f".execute-api.{_HOST.lower()}"
+    if host_l.endswith(execute_api_suffix):
+        return host
+    registered = _find_registered_domain_name(host)
+    if registered is not None:
+        return registered
+    return default
+
+
+def has_custom_domain(host: str) -> bool:
+    """Return whether ``host`` is a registered API Gateway v2 custom domain."""
+    domain_name = _find_registered_domain_name(host)
+    return domain_name is not None and _domain_name_exists_in_region(domain_name)
+
+
+def _normalize_api_mapping_key(key) -> str:
+    if key is None:
+        return ""
+    return str(key).strip("/")
+
+
+def _remaining_path_for_mapping_key(path: str, mapping_key: str) -> str | None:
+    """Match ``mapping_key`` on a path-segment boundary; return the remainder."""
+    key = _normalize_api_mapping_key(mapping_key)
+    if not key:
+        return None
+    prefix = "/" + key
+    if path == prefix or path == prefix + "/":
+        return "/"
+    if path.startswith(prefix + "/"):
+        rest = path[len(prefix) :]
+        return rest if rest else "/"
+    return None
+
+
+def _domain_name_exists_in_region(domain_name: str) -> bool:
+    return (
+        domain_name in _domain_names
+        and _domain_name_regions.get(domain_name, get_region()) == get_region()
+    )
+
+
+def _default_domain_name_configuration(data: dict) -> dict:
+    configs = data.get("domainNameConfigurations") or []
+    if configs:
+        cfg = dict(configs[0])
+    else:
+        cfg = {}
+    cfg.setdefault("endpointType", "REGIONAL")
+    cfg.setdefault("securityPolicy", "TLS_1_2")
+    cfg.setdefault("domainNameStatus", "AVAILABLE")
+    cfg.setdefault("certificateArn", data.get("certificateArn", ""))
+    cfg.setdefault("hostedZoneId", "Z1UJRXOUMOOFQ8")
+    cfg.setdefault("ipAddressType", "ipv4")
+    return cfg
+
+
+def _create_domain_name(data):
+    domain_name = data.get("domainName", "")
+    if not domain_name:
+        return _apigw_error("BadRequestException", "DomainName is required", 400)
+    if domain_name in _domain_names:
+        return _apigw_error(
+            "ConflictException",
+            f"Domain name already exists: {domain_name}",
+            409,
+        )
+    cfg = _default_domain_name_configuration(data)
+    cfg.setdefault(
+        "apiGatewayDomainName",
+        f"d-{new_uuid()[:8]}.execute-api.{_HOST}",
+    )
+    dn = {
+        "domainName": domain_name,
+        "domainNameConfigurations": [cfg],
+        "apiMappingSelectionExpression": data.get(
+            "apiMappingSelectionExpression", "$request.basepath"
+        ),
+        "tags": data.get("tags", {}),
+    }
+    if "mutualTlsAuthentication" in data:
+        dn["mutualTlsAuthentication"] = data["mutualTlsAuthentication"]
+    if "routingMode" in data:
+        dn["routingMode"] = data["routingMode"]
+    _domain_names[domain_name] = dn
+    _domain_name_regions[domain_name] = get_region()
+    _api_mappings[domain_name] = {}
+    if data.get("tags"):
+        _api_tags[_domain_name_arn(domain_name)] = dict(data["tags"])
+    return _apigw_response(dn, 201)
+
+
+def _get_domain_names():
+    items = [
+        dn for name, dn in _domain_names.items()
+        if _domain_name_regions.get(name, get_region()) == get_region()
+    ]
+    return _apigw_response({"items": items})
+
+
+def _get_domain_name(domain_name):
+    if not _domain_name_exists_in_region(domain_name):
+        return _apigw_error("NotFoundException", f"Domain name {domain_name} not found", 404)
+    return _apigw_response(_domain_names[domain_name])
+
+
+def _update_domain_name(domain_name, data):
+    if not _domain_name_exists_in_region(domain_name):
+        return _apigw_error("NotFoundException", f"Domain name {domain_name} not found", 404)
+    dn = _domain_names[domain_name]
+    if "domainNameConfigurations" in data:
+        cfg = _default_domain_name_configuration(data)
+        existing = (dn.get("domainNameConfigurations") or [{}])[0]
+        merged = dict(existing)
+        merged.update(cfg)
+        dn["domainNameConfigurations"] = [merged]
+    for key in ("mutualTlsAuthentication", "routingMode"):
+        if key in data:
+            dn[key] = data[key]
+    return _apigw_response(dn)
+
+
+def _delete_domain_name(domain_name):
+    if not _domain_name_exists_in_region(domain_name):
+        return _apigw_error("NotFoundException", f"Domain name {domain_name} not found", 404)
+    _domain_names.pop(domain_name, None)
+    _domain_name_regions.pop(domain_name, None)
+    _api_mappings.pop(domain_name, None)
+    _api_tags.pop(_domain_name_arn(domain_name), None)
+    return 204, {}, b""
+
+
+def _find_mapping_by_key(domain_name: str, mapping_key: str):
+    key = _normalize_api_mapping_key(mapping_key)
+    for mapping in (_api_mappings.get(domain_name) or {}).values():
+        if _normalize_api_mapping_key(mapping.get("apiMappingKey", "")) == key:
+            return mapping
+    return None
+
+
+def _create_api_mapping(domain_name, data):
+    if not _domain_name_exists_in_region(domain_name):
+        return _apigw_error("NotFoundException", f"Domain name {domain_name} not found", 404)
+    api_id = data.get("apiId", "")
+    stage = data.get("stage", "")
+    if not api_id or not stage:
+        return _apigw_error("BadRequestException", "ApiId and Stage are required", 400)
+    if not _api_exists_in_request_region(api_id):
+        return _apigw_error("NotFoundException", f"API {api_id} not found", 404)
+    if stage not in _stages.get(api_id, {}):
+        return _apigw_error("NotFoundException", f"Stage {stage} not found", 404)
+    mapping_key = _normalize_api_mapping_key(data.get("apiMappingKey", ""))
+    if _find_mapping_by_key(domain_name, mapping_key) is not None:
+        return _apigw_error(
+            "ConflictException",
+            f"ApiMapping key already exists for domain: {mapping_key or '(none)'}",
+            409,
+        )
+    mapping_id = new_uuid()[:10]
+    mapping = {
+        "apiMappingId": mapping_id,
+        "apiMappingKey": mapping_key,
+        "apiId": api_id,
+        "stage": stage,
+    }
+    _api_mappings.setdefault(domain_name, {})[mapping_id] = mapping
+    return _apigw_response(mapping, 201)
+
+
+def _get_api_mappings(domain_name):
+    if not _domain_name_exists_in_region(domain_name):
+        return _apigw_error("NotFoundException", f"Domain name {domain_name} not found", 404)
+    return _apigw_response({"items": list((_api_mappings.get(domain_name) or {}).values())})
+
+
+def _get_api_mapping(domain_name, mapping_id):
+    if not _domain_name_exists_in_region(domain_name):
+        return _apigw_error("NotFoundException", f"Domain name {domain_name} not found", 404)
+    mapping = (_api_mappings.get(domain_name) or {}).get(mapping_id)
+    if not mapping:
+        return _apigw_error("NotFoundException", f"ApiMapping {mapping_id} not found", 404)
+    return _apigw_response(mapping)
+
+
+def _update_api_mapping(domain_name, mapping_id, data):
+    if not _domain_name_exists_in_region(domain_name):
+        return _apigw_error("NotFoundException", f"Domain name {domain_name} not found", 404)
+    mapping = (_api_mappings.get(domain_name) or {}).get(mapping_id)
+    if not mapping:
+        return _apigw_error("NotFoundException", f"ApiMapping {mapping_id} not found", 404)
+    candidate = dict(mapping)
+
+    if "apiMappingKey" in data:
+        new_key = _normalize_api_mapping_key(data["apiMappingKey"])
+        existing = _find_mapping_by_key(domain_name, new_key)
+        if existing is not None and existing.get("apiMappingId") != mapping_id:
+            return _apigw_error(
+                "ConflictException",
+                f"ApiMapping key already exists for domain: {new_key or '(none)'}",
+                409,
+            )
+        candidate["apiMappingKey"] = new_key
+
+    api_id = data.get("apiId", candidate.get("apiId", ""))
+    if not _api_exists_in_request_region(api_id):
+        return _apigw_error("NotFoundException", f"API {api_id} not found", 404)
+    candidate["apiId"] = api_id
+
+    stage = data.get("stage", candidate.get("stage", ""))
+    if stage not in _stages.get(api_id, {}):
+        return _apigw_error("NotFoundException", f"Stage {stage} not found", 404)
+    candidate["stage"] = stage
+
+    mapping.update(candidate)
+    return _apigw_response(mapping)
+
+
+def _delete_api_mapping(domain_name, mapping_id):
+    if not _domain_name_exists_in_region(domain_name):
+        return _apigw_error("NotFoundException", f"Domain name {domain_name} not found", 404)
+    mappings = _api_mappings.get(domain_name) or {}
+    if mapping_id not in mappings:
+        return _apigw_error("NotFoundException", f"ApiMapping {mapping_id} not found", 404)
+    mappings.pop(mapping_id, None)
+    return 204, {}, b""
+
+
+def resolve_custom_domain(host: str, path: str) -> tuple[str, str, str] | None:
+    """Return ``(api_id, stage, path)`` for the best API mapping, if any."""
+    domain_name = _find_registered_domain_name(host)
+    if domain_name is None:
+        return None
+    if not _domain_name_exists_in_region(domain_name):
+        return None
+
+    if not path.startswith("/"):
+        path = "/" + path
+
+    mappings = list((_api_mappings.get(domain_name) or {}).values())
+    best = None
+    best_remaining = None
+    best_len = -1
+    for mapping in mappings:
+        key = _normalize_api_mapping_key(mapping.get("apiMappingKey", ""))
+        if not key:
+            continue
+        remaining = _remaining_path_for_mapping_key(path, key)
+        if remaining is None:
+            continue
+        if len(key) > best_len:
+            best_len = len(key)
+            best = mapping
+            best_remaining = remaining
+
+    if best is not None:
+        return (
+            best.get("apiId", ""),
+            best.get("stage", ""),
+            best_remaining or "/",
+        )
+
+    root = next(
+        (m for m in mappings if _normalize_api_mapping_key(m.get("apiMappingKey", "")) == ""),
+        None,
+    )
+    if root is not None:
+        return root.get("apiId", ""), root.get("stage", ""), path or "/"
+
+    return None
 
 
 # ==========================================================================

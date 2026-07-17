@@ -858,12 +858,11 @@ async def _handle_pre_body_request(method: str, path: str, headers: dict, query_
     # preflight in that case.
     host = headers.get("host", "")
     is_execute_api = _parse_execute_api_url(host, path) is not None
-    is_custom_domain = False
-    if not is_execute_api:
-        try:
-            is_custom_domain = _get_module("apigateway_v1").is_registered_custom_domain(host)
-        except Exception:
-            is_custom_domain = False
+    is_custom_domain = (
+        method == "OPTIONS"
+        and not is_execute_api
+        and _custom_domain_service(host) is not None
+    )
     for response in (
         None if (is_execute_api or is_custom_domain) else _handle_options_request(method, request_id),
         _handle_health_request(path, request_id),
@@ -1300,50 +1299,39 @@ async def _handle_custom_domain_request(
 ):
     """Handle API Gateway custom-domain data plane requests (#1030).
 
-    Resolves Host against registered DomainName + BasePathMapping records, strips
-    the matched base path, and dispatches to the existing execute handlers. A
-    registered domain with no matching mapping returns Forbidden and must not
-    fall through to S3 virtual-host routing.
+    Tries v1 (REST BasePathMapping) then v2 (HTTP ApiMapping). A registered
+    domain with no matching mapping returns Forbidden and must not fall through
+    to S3 virtual-host routing.
     """
-    try:
-        apigw_v1 = _get_module("apigateway_v1")
-        resolved = apigw_v1.resolve_custom_domain(host, path)
-    except Exception as e:
-        logger.exception("Error resolving custom domain: %s", e)
-        return 500, {"Content-Type": "application/json"}, json.dumps({"message": str(e)}).encode()
-
-    if resolved is None:
+    service = _custom_domain_service(host)
+    if service is None:
         return None
-    if resolved.kind != "hit":
+
+    target = service.resolve_custom_domain(host, path)
+    if target is None:
         return (
             403,
             {"Content-Type": "application/json"},
-            json.dumps({"message": "Forbidden"}).encode(),
+            b'{"message": "Forbidden"}',
         )
 
-    try:
-        if resolved.api_id in apigw_v1._rest_apis:
-            return await apigw_v1.handle_execute(
-                resolved.api_id,
-                resolved.stage,
-                method,
-                resolved.execute_path,
-                headers,
-                body,
-                query_params,
-            )
-        return await _get_module("apigateway").handle_execute(
-            resolved.api_id,
-            resolved.stage,
-            resolved.execute_path,
-            method,
-            headers,
-            body,
-            query_params,
+    api_id, stage, execute_path = target
+    if service is _get_module("apigateway_v1"):
+        return await service.handle_execute(
+            api_id, stage, method, execute_path, headers, body, query_params
         )
-    except Exception as e:
-        logger.exception("Error in custom-domain dispatch: %s", e)
-        return 500, {"Content-Type": "application/json"}, json.dumps({"message": str(e)}).encode()
+    return await service.handle_execute(
+        api_id, stage, execute_path, method, headers, body, query_params
+    )
+
+
+def _custom_domain_service(host: str):
+    """Return the API Gateway service that owns ``host``, v1 before v2."""
+    for service_name in ("apigateway_v1", "apigateway"):
+        service = _get_module(service_name)
+        if service.has_custom_domain(host):
+            return service
+    return None
 
 
 def _is_potential_alb_request(host: str, path: str) -> bool:

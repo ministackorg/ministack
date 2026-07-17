@@ -144,49 +144,63 @@ def _seed_domain(v1, domain: str, mappings: dict[str, tuple[str, str]]):
     }
 
 
+def test_app_custom_domain_strategy_prefers_v1(monkeypatch):
+    from ministack import app
+
+    class Service:
+        def __init__(self, owns_host):
+            self.owns_host = owns_host
+
+        def has_custom_domain(self, host):
+            return self.owns_host and host == "api.example.com"
+
+    v1 = Service(True)
+    v2 = Service(True)
+    modules = {"apigateway_v1": v1, "apigateway": v2}
+    monkeypatch.setattr(app, "_get_module", modules.__getitem__)
+
+    assert app._custom_domain_service("api.example.com") is v1
+    assert app._custom_domain_service("unknown.example.com") is None
+
+
 def test_resolve_unknown_host_is_miss(resolve_state):
     v1 = resolve_state
+    assert v1.has_custom_domain("unknown.example.com") is False
     assert v1.resolve_custom_domain("unknown.example.com", "/shop/hello") is None
+    assert v1.has_custom_domain("") is False
+    assert v1._remaining_path_for_base_path("/hello", "(none)") is None
 
 
 def test_resolve_strips_port_and_is_case_insensitive(resolve_state):
     v1 = resolve_state
     _seed_domain(v1, "Shop.Example.COM", {"shop": ("api1", "local")})
-    hit = v1.resolve_custom_domain("shop.example.com:4566", "/shop/hello")
-    assert hit is not None
-    assert hit.kind == "hit"
-    assert hit.api_id == "api1"
-    assert hit.stage == "local"
-    assert hit.execute_path == "/hello"
+    assert v1.has_custom_domain("shop.example.com:4566") is True
+    target = v1.resolve_custom_domain("shop.example.com:4566", "/shop/hello")
+    assert target == ("api1", "local", "/hello")
 
 
 def test_resolve_explicit_base_path_strips_prefix(resolve_state):
     v1 = resolve_state
     _seed_domain(v1, "api.example.com", {"shop": ("api1", "local")})
-    hit = v1.resolve_custom_domain("api.example.com", "/shop/hello")
-    assert hit.kind == "hit"
-    assert hit.execute_path == "/hello"
+    target = v1.resolve_custom_domain("api.example.com", "/shop/hello")
+    assert target == ("api1", "local", "/hello")
+    assert v1.resolve_custom_domain("api.example.com", "shop/hello") == target
 
 
 def test_resolve_exact_base_path_becomes_root(resolve_state):
     v1 = resolve_state
     _seed_domain(v1, "api.example.com", {"shop": ("api1", "local")})
-    hit = v1.resolve_custom_domain("api.example.com", "/shop")
-    assert hit.kind == "hit"
-    assert hit.execute_path == "/"
-    hit_slash = v1.resolve_custom_domain("api.example.com", "/shop/")
-    assert hit_slash.kind == "hit"
-    assert hit_slash.execute_path == "/"
+    target = v1.resolve_custom_domain("api.example.com", "/shop")
+    assert target[2] == "/"
+    target_slash = v1.resolve_custom_domain("api.example.com", "/shop/")
+    assert target_slash[2] == "/"
 
 
 def test_resolve_none_catch_all_preserves_path(resolve_state):
     v1 = resolve_state
     _seed_domain(v1, "api.example.com", {"(none)": ("api1", "prod")})
-    hit = v1.resolve_custom_domain("api.example.com", "/customers/42")
-    assert hit.kind == "hit"
-    assert hit.api_id == "api1"
-    assert hit.stage == "prod"
-    assert hit.execute_path == "/customers/42"
+    target = v1.resolve_custom_domain("api.example.com", "/customers/42")
+    assert target == ("api1", "prod", "/customers/42")
 
 
 def test_resolve_longest_match_wins_over_shorter_and_none(resolve_state):
@@ -200,11 +214,26 @@ def test_resolve_longest_match_wins_over_shorter_and_none(resolve_state):
             "orders/v1": ("api-v1", "c"),
         },
     )
-    hit = v1.resolve_custom_domain("api.example.com", "/orders/v1/items/9")
-    assert hit.kind == "hit"
-    assert hit.api_id == "api-v1"
-    assert hit.stage == "c"
-    assert hit.execute_path == "/items/9"
+    target = v1.resolve_custom_domain("api.example.com", "/orders/v1/items/9")
+    assert target == ("api-v1", "c", "/items/9")
+
+
+def test_resolve_keeps_longest_when_shorter_mapping_is_seen_later(resolve_state):
+    v1 = resolve_state
+    _seed_domain(
+        v1,
+        "api.example.com",
+        {
+            "orders/v1": ("api-v1", "c"),
+            "orders": ("api-orders", "b"),
+            "/": ("ignored", "ignored"),
+        },
+    )
+    assert v1.resolve_custom_domain("api.example.com", "/orders/v1/items") == (
+        "api-v1",
+        "c",
+        "/items",
+    )
 
 
 def test_resolve_requires_path_segment_boundary(resolve_state):
@@ -215,18 +244,15 @@ def test_resolve_requires_path_segment_boundary(resolve_state):
         "api.example.com",
         {"shop": ("api-shop", "local"), "(none)": ("api-none", "prod")},
     )
-    hit = v1.resolve_custom_domain("api.example.com", "/shophello")
-    assert hit.kind == "hit"
-    assert hit.api_id == "api-none"
-    assert hit.execute_path == "/shophello"
+    target = v1.resolve_custom_domain("api.example.com", "/shophello")
+    assert target == ("api-none", "prod", "/shophello")
 
 
 def test_resolve_registered_domain_without_match_is_forbidden(resolve_state):
     v1 = resolve_state
     _seed_domain(v1, "api.example.com", {"shop": ("api1", "local")})
-    miss = v1.resolve_custom_domain("api.example.com", "/other/path")
-    assert miss is not None
-    assert miss.kind == "forbidden"
+    assert v1.has_custom_domain("api.example.com") is True
+    assert v1.resolve_custom_domain("api.example.com", "/other/path") is None
 
 
 def test_resolve_registered_domain_with_no_mappings_is_forbidden(resolve_state):
@@ -234,26 +260,28 @@ def test_resolve_registered_domain_with_no_mappings_is_forbidden(resolve_state):
     v1._domain_names["empty.example.com"] = {"domainName": "empty.example.com"}
     v1._domain_name_regions["empty.example.com"] = "us-east-1"
     v1._base_path_mappings["empty.example.com"] = {}
-    miss = v1.resolve_custom_domain("empty.example.com", "/anything")
-    assert miss is not None
-    assert miss.kind == "forbidden"
+    assert v1.has_custom_domain("empty.example.com") is True
+    assert v1.resolve_custom_domain("empty.example.com", "/anything") is None
 
 
 def test_resolve_stage_comes_from_mapping_not_path(resolve_state):
     v1 = resolve_state
     _seed_domain(v1, "api.example.com", {"shop": ("api1", "staging")})
-    hit = v1.resolve_custom_domain("api.example.com", "/shop/local/hello")
-    assert hit.kind == "hit"
-    assert hit.stage == "staging"
-    # First URL segment after strip is part of the API path, not the stage.
-    assert hit.execute_path == "/local/hello"
+    target = v1.resolve_custom_domain("api.example.com", "/shop/local/hello")
+    assert target == ("api1", "staging", "/local/hello")
 
 
-def test_is_registered_custom_domain_host(resolve_state):
+def test_v1_custom_domains_are_region_isolated(resolve_state):
+    from ministack.core.responses import set_request_region
+
     v1 = resolve_state
-    _seed_domain(v1, "api.example.com", {"(none)": ("api1", "prod")})
-    assert v1.is_registered_custom_domain("API.EXAMPLE.COM:4566") is True
-    assert v1.is_registered_custom_domain("other.example.com") is False
+    _seed_domain(v1, "api.example.com", {"shop": ("api1", "local")})
+    set_request_region("us-west-2")
+    try:
+        assert v1.has_custom_domain("api.example.com") is False
+        assert v1.resolve_custom_domain("api.example.com", "/shop/hello") is None
+    finally:
+        set_request_region("us-east-1")
 
 
 # ---------------------------------------------------------------------------
