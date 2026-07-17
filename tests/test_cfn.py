@@ -3289,6 +3289,87 @@ def test_cfn_apigwv2_route_basic(cfn, apigw):
     assert apigw.get_routes(ApiId=api_id)["Items"] == []
 
 
+def test_cfn_apigwv2_authorizer_jwt(cfn, apigw):
+    """CFN stack with an AWS::ApiGatewayV2::Authorizer deploys successfully and
+    a Route referencing it via AuthorizerId is enforced at request time.
+
+    Regression test: AWS::ApiGatewayV2::Authorizer previously had no CFN
+    provisioner at all ("Unsupported resource type"), even though the
+    control-plane CreateAuthorizer API (and Terraform's
+    aws_apigatewayv2_authorizer) already worked.
+    """
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "HttpApi": {
+                "Type": "AWS::ApiGatewayV2::Api",
+                "Properties": {
+                    "Name": "cfn-apigwv2-authorizer-t01",
+                    "ProtocolType": "HTTP",
+                },
+            },
+            "Integration": {
+                "Type": "AWS::ApiGatewayV2::Integration",
+                "Properties": {
+                    "ApiId": {"Ref": "HttpApi"},
+                    "IntegrationType": "AWS_PROXY",
+                    "IntegrationUri": "arn:aws:lambda:us-east-1:000000000000:function:dummy",
+                    "PayloadFormatVersion": "2.0",
+                },
+            },
+            "JwtAuthorizer": {
+                "Type": "AWS::ApiGatewayV2::Authorizer",
+                "Properties": {
+                    "ApiId": {"Ref": "HttpApi"},
+                    "Name": "cfn-apigwv2-authorizer-t01-jwt",
+                    "AuthorizerType": "JWT",
+                    "IdentitySource": ["$request.header.Authorization"],
+                    "JwtConfiguration": {
+                        "Audience": ["client-id"],
+                        "Issuer": "https://cognito-idp.us-east-1.amazonaws.com/us-east-1_example",
+                    },
+                },
+            },
+            "ProtectedRoute": {
+                "Type": "AWS::ApiGatewayV2::Route",
+                "Properties": {
+                    "ApiId": {"Ref": "HttpApi"},
+                    "RouteKey": "GET /protected",
+                    "Target": {"Fn::Join": ["/", ["integrations", {"Ref": "Integration"}]]},
+                    "AuthorizationType": "JWT",
+                    "AuthorizerId": {"Ref": "JwtAuthorizer"},
+                },
+            },
+        },
+    }
+    stack_name = "cfn-apigwv2-authorizer-t01"
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(template))
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "CREATE_COMPLETE"
+
+    resources = cfn.describe_stack_resources(StackName=stack_name)["StackResources"]
+    api_res = [r for r in resources if r["ResourceType"] == "AWS::ApiGatewayV2::Api"][0]
+    api_id = api_res["PhysicalResourceId"]
+    authorizer_res = [r for r in resources if r["ResourceType"] == "AWS::ApiGatewayV2::Authorizer"][0]
+    authorizer_id = authorizer_res["PhysicalResourceId"]
+
+    authorizers = apigw.get_authorizers(ApiId=api_id)["Items"]
+    assert len(authorizers) == 1
+    assert authorizers[0]["AuthorizerId"] == authorizer_id
+    assert authorizers[0]["AuthorizerType"] == "JWT"
+    assert authorizers[0]["JwtConfiguration"]["Audience"] == ["client-id"]
+    assert authorizers[0]["JwtConfiguration"]["Issuer"] == "https://cognito-idp.us-east-1.amazonaws.com/us-east-1_example"
+
+    routes = apigw.get_routes(ApiId=api_id)["Items"]
+    assert len(routes) == 1
+    assert routes[0]["AuthorizationType"] == "JWT"
+    assert routes[0]["AuthorizerId"] == authorizer_id
+
+    cfn.delete_stack(StackName=stack_name)
+    _wait_stack(cfn, stack_name)
+    assert apigw.get_authorizers(ApiId=api_id)["Items"] == []
+
+
 def test_cfn_apigwv2_integration_getatt(cfn, apigw):
     """Fn::GetAtt on IntegrationId resolves correctly."""
     template = {

@@ -146,6 +146,20 @@ def test_cognito_list_users_filter_quoted_attribute_name(cognito_idp):
     resp = cognito_idp.list_users(UserPoolId=pid, Filter='"email" = "nonexistent@example.com"')
     assert resp["Users"] == []
 
+def test_cognito_list_users_filter_status(cognito_idp):
+    pid = cognito_idp.create_user_pool(PoolName="StatusFilterUsersPool")["UserPool"]["Id"]
+    cognito_idp.admin_create_user(UserPoolId=pid, Username="active-user")
+    cognito_idp.admin_create_user(UserPoolId=pid, Username="disabled-user")
+    cognito_idp.admin_disable_user(UserPoolId=pid, Username="disabled-user")
+
+    resp = cognito_idp.list_users(UserPoolId=pid, Filter='status = "Enabled"')
+    usernames = [u["Username"] for u in resp["Users"]]
+    assert usernames == ["active-user"]
+
+    resp = cognito_idp.list_users(UserPoolId=pid, Filter='status = "Disabled"')
+    usernames = [u["Username"] for u in resp["Users"]]
+    assert usernames == ["disabled-user"]
+
 def test_cognito_admin_set_user_password(cognito_idp):
     pid = cognito_idp.create_user_pool(PoolName="PwdPool")["UserPool"]["Id"]
     cid = cognito_idp.create_user_pool_client(
@@ -1457,9 +1471,11 @@ class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
 _no_redirect_opener = urllib.request.build_opener(_NoRedirectHandler)
 
 
-def _setup_saml_pool(cognito_idp):
+def _setup_saml_pool(cognito_idp, lambda_config=None):
     """Helper: create a pool + client + SAML provider for federated tests."""
-    pid = cognito_idp.create_user_pool(PoolName="FedPool")["UserPool"]["Id"]
+    pid = cognito_idp.create_user_pool(
+        PoolName="FedPool", **({"LambdaConfig": lambda_config} if lambda_config else {}),
+    )["UserPool"]["Id"]
     client = cognito_idp.create_user_pool_client(
         UserPoolId=pid,
         ClientName="FedApp",
@@ -1622,6 +1638,106 @@ def test_cognito_saml_full_flow(cognito_idp):
     assert attrs.get("name") == "John Doe"
 
 
+def test_cognito_saml_presignup_lambda_rejects_unauthorized_user(cognito_idp, lam):
+    """PreSignUp_ExternalProvider trigger fails closed: an uninvited federated
+    user is rejected and never persisted."""
+    handler = "def handler(event, ctx):\n    raise Exception('not invited')\n"
+    fn_name = "ministack-presignup-reject"
+    lam.create_function(
+        FunctionName=fn_name, Runtime="python3.12",
+        Role="arn:aws:iam::000000000000:role/test-role",
+        Handler="index.handler",
+        Code={"ZipFile": _make_pretoken_lambda_zip(handler)},
+    )
+    fn_arn = lam.get_function(FunctionName=fn_name)["Configuration"]["FunctionArn"]
+    pid, cid = _setup_saml_pool(cognito_idp, lambda_config={"PreSignUp": fn_arn})
+
+    url = (
+        f"{ENDPOINT}/oauth2/authorize?"
+        f"response_type=code&client_id={cid}"
+        f"&redirect_uri=http://localhost:3000/callback"
+        f"&identity_provider=TestSAML&state=mystate&scope=openid"
+    )
+    try:
+        _no_redirect_opener.open(url)
+        assert False, "Expected redirect"
+    except urllib.error.HTTPError as e:
+        location = e.headers.get("Location", "")
+    relay_state = _parse_qs(urlparse(location).query).get("RelayState", [""])[0]
+
+    saml_resp = _build_mock_saml_response(name_id="uninvited@example.com")
+    form_data = _urlencode({"SAMLResponse": saml_resp, "RelayState": relay_state}).encode()
+    req = urllib.request.Request(
+        f"{ENDPOINT}/saml2/idpresponse", data=form_data,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+    try:
+        _no_redirect_opener.open(req)
+        assert False, "Expected 400"
+    except urllib.error.HTTPError as e:
+        assert e.code == 400
+        body = json.loads(e.read())
+        assert "UserLambdaValidationException" in body.get("__type", "")
+
+    with pytest.raises(ClientError):
+        cognito_idp.admin_get_user(UserPoolId=pid, Username="TestSAML_uninvited@example.com")
+
+
+def test_cognito_saml_presignup_lambda_autoconfirms_invited_user(cognito_idp, lam):
+    """PreSignUp_ExternalProvider trigger's `autoConfirmUser`/`autoVerifyEmail`
+    overrides are reflected on the persisted federated user."""
+    handler = (
+        "def handler(event, ctx):\n"
+        "    event['response']['autoConfirmUser'] = True\n"
+        "    event['response']['autoVerifyEmail'] = True\n"
+        "    return event\n"
+    )
+    fn_name = "ministack-presignup-autoconfirm"
+    lam.create_function(
+        FunctionName=fn_name, Runtime="python3.12",
+        Role="arn:aws:iam::000000000000:role/test-role",
+        Handler="index.handler",
+        Code={"ZipFile": _make_pretoken_lambda_zip(handler)},
+    )
+    fn_arn = lam.get_function(FunctionName=fn_name)["Configuration"]["FunctionArn"]
+    pid, cid = _setup_saml_pool(cognito_idp, lambda_config={"PreSignUp": fn_arn})
+
+    url = (
+        f"{ENDPOINT}/oauth2/authorize?"
+        f"response_type=code&client_id={cid}"
+        f"&redirect_uri=http://localhost:3000/callback"
+        f"&identity_provider=TestSAML&state=mystate&scope=openid"
+    )
+    try:
+        _no_redirect_opener.open(url)
+        assert False, "Expected redirect"
+    except urllib.error.HTTPError as e:
+        location = e.headers.get("Location", "")
+    relay_state = _parse_qs(urlparse(location).query).get("RelayState", [""])[0]
+
+    saml_resp = _build_mock_saml_response(
+        name_id="invited@example.com",
+        attributes={
+            "http://schemas.xmlsoap.org/ws/2005/05/identity/claims/emailaddress": "invited@example.com",
+        },
+    )
+    form_data = _urlencode({"SAMLResponse": saml_resp, "RelayState": relay_state}).encode()
+    req = urllib.request.Request(
+        f"{ENDPOINT}/saml2/idpresponse", data=form_data,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+    try:
+        _no_redirect_opener.open(req)
+        assert False, "Expected redirect"
+    except urllib.error.HTTPError:
+        pass
+
+    user = cognito_idp.admin_get_user(UserPoolId=pid, Username="TestSAML_invited@example.com")
+    assert user["UserStatus"] == "CONFIRMED"
+    attrs = {a["Name"]: a["Value"] for a in user["UserAttributes"]}
+    assert attrs.get("email_verified") == "true"
+
+
 # ---------------------------------------------------------------------------
 # OIDC federation (external OIDC IdP — e.g. Keycloak in front of Cognito)
 # ---------------------------------------------------------------------------
@@ -1689,8 +1805,10 @@ def _start_fake_oidc_idp(claims):
     return token_url, recorded, stop
 
 
-def _setup_oidc_pool(cognito_idp, token_url):
-    pid = cognito_idp.create_user_pool(PoolName="OIDCFedPool")["UserPool"]["Id"]
+def _setup_oidc_pool(cognito_idp, token_url, lambda_config=None):
+    pid = cognito_idp.create_user_pool(
+        PoolName="OIDCFedPool", **({"LambdaConfig": lambda_config} if lambda_config else {}),
+    )["UserPool"]["Id"]
     client = cognito_idp.create_user_pool_client(
         UserPoolId=pid,
         ClientName="OIDCApp",
@@ -1808,6 +1926,52 @@ def test_cognito_oidc_full_flow(cognito_idp):
         attrs = {a["Name"]: a["Value"] for a in user["UserAttributes"]}
         assert attrs["email"] == "alice@example.com"
         assert attrs["name"] == "Alice External"
+    finally:
+        stop()
+
+
+def test_cognito_oidc_presignup_lambda_rejects_unauthorized_user(cognito_idp, lam):
+    """`/oauth2/idpresponse` also honours the PreSignUp_ExternalProvider
+    trigger: a rejected federated user is never persisted."""
+    handler = "def handler(event, ctx):\n    raise Exception('not invited')\n"
+    fn_name = "ministack-presignup-oidc-reject"
+    lam.create_function(
+        FunctionName=fn_name, Runtime="python3.12",
+        Role="arn:aws:iam::000000000000:role/test-role",
+        Handler="index.handler",
+        Code={"ZipFile": _make_pretoken_lambda_zip(handler)},
+    )
+    fn_arn = lam.get_function(FunctionName=fn_name)["Configuration"]["FunctionArn"]
+
+    claims = {"sub": "user-uninvited", "email": "uninvited@example.com"}
+    token_url, _recorded, stop = _start_fake_oidc_idp(claims)
+    try:
+        pid, cid = _setup_oidc_pool(cognito_idp, token_url, lambda_config={"PreSignUp": fn_arn})
+
+        authorize_url = (
+            f"{ENDPOINT}/oauth2/authorize?"
+            f"response_type=code&client_id={cid}"
+            f"&redirect_uri=http://localhost:3000/callback"
+            f"&identity_provider=TestOIDC&state=appstate&scope=openid"
+        )
+        try:
+            _no_redirect_opener.open(authorize_url)
+            assert False, "Expected 302"
+        except urllib.error.HTTPError as e:
+            idp_redirect = e.headers.get("Location", "")
+        relay_state = _parse_qs(urlparse(idp_redirect).query)["state"][0]
+
+        cb_url = f"{ENDPOINT}/oauth2/idpresponse?code=idp-issued-code&state={relay_state}"
+        try:
+            _no_redirect_opener.open(cb_url)
+            assert False, "Expected 400"
+        except urllib.error.HTTPError as e:
+            assert e.code == 400
+            body = json.loads(e.read())
+            assert "UserLambdaValidationException" in body.get("__type", "")
+
+        with pytest.raises(ClientError):
+            cognito_idp.admin_get_user(UserPoolId=pid, Username="TestOIDC_user-uninvited")
     finally:
         stop()
 
