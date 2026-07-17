@@ -2,7 +2,9 @@ import asyncio
 import io
 import json
 import os
+import sys
 import time
+import types
 import uuid as _uuid_mod
 import zipfile
 from urllib.parse import urlparse
@@ -2153,9 +2155,9 @@ def test_rds_rotate_real_mysql_master_password(monkeypatch):
         connects.append(kwargs)
         return FakeConnection()
 
-    import pymysql
-
-    monkeypatch.setattr(pymysql, "connect", _connect)
+    fake_pymysql = types.ModuleType("pymysql")
+    fake_pymysql.connect = _connect
+    monkeypatch.setitem(sys.modules, "pymysql", fake_pymysql)
     m._instances.clear()
     try:
         m._instances["rotation-member"] = {
@@ -2307,9 +2309,27 @@ def test_rds_rotate_real_postgres_master_password(monkeypatch):
         connects.append(kwargs)
         return FakeConnection()
 
-    import psycopg2
+    class FakeIdentifier:
+        def __init__(self, value):
+            self.value = value
 
-    monkeypatch.setattr(psycopg2, "connect", _connect)
+        def __repr__(self):
+            return f"Identifier({self.value!r})"
+
+    class FakeSQL:
+        def __init__(self, value):
+            self.value = value
+
+        def format(self, **kwargs):
+            return self.value, kwargs
+
+    fake_psycopg2 = types.ModuleType("psycopg2")
+    fake_psycopg2.connect = _connect
+    fake_psycopg2.sql = types.SimpleNamespace(
+        Identifier=FakeIdentifier,
+        SQL=FakeSQL,
+    )
+    monkeypatch.setitem(sys.modules, "psycopg2", fake_psycopg2)
     m._instances.clear()
     try:
         m._instances["rotation-member"] = {

@@ -2895,6 +2895,7 @@ def _rotate_real_password(cluster, old_pass, new_pass):
     for inst in _instances.values():
         if inst.get("DBClusterIdentifier") != cluster_id:
             continue
+        engine = engine or inst.get("Engine", "")
         host = host or inst.get("_internal_address")
         port = port or inst.get("_internal_port")
         if not host or not port:
