@@ -4,6 +4,10 @@ All notable changes to MiniStack will be documented here.
 
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning follows [Semantic Versioning](https://semver.org/).
+## [Unreleased]
+
+### Added
+- **EKS — OIDC Identity Provider Config list support** — adds `ListIdentityProviderConfigs` (`GET /clusters/{name}/identity-provider-configs`) API operation to EKS emulator. Allows listing OIDC identity provider configurations associated with a cluster.
 
 ## [1.4.2] — 2026-07-13
 
