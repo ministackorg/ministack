@@ -78,6 +78,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from dataclasses import dataclass
 
 from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.responses import AccountScopedDict, get_account_id, get_region, new_uuid
@@ -2077,6 +2078,124 @@ def _delete_usage_plan_key(plan_id, key_id):
         return _v1_error("NotFoundException", "Invalid Usage Plan identifier specified", 404)
     _usage_plan_keys.get(plan_id, {}).pop(key_id, None)
     return 202, {}, b""
+
+
+# ---- Data plane: custom domain resolution (#1030) ----
+
+@dataclass(frozen=True)
+class CustomDomainResolution:
+    """Result of resolving a custom-domain Host + path.
+
+    ``kind`` is ``"hit"`` when a mapping was selected, or ``"forbidden"`` when
+    the Host is a registered domain but no mapping matches (including when the
+    domain has no mappings at all). Unknown hosts return ``None`` from
+    ``resolve_custom_domain`` instead of this type.
+    """
+
+    kind: str
+    api_id: str = ""
+    stage: str = ""
+    execute_path: str = "/"
+
+
+def _normalize_custom_domain_host(host: str) -> str:
+    return host.split(":", 1)[0].lower()
+
+
+def _find_registered_domain_name(hostname: str) -> str | None:
+    """Return the stored domain key for ``hostname``, case-insensitively."""
+    hostname = _normalize_custom_domain_host(hostname)
+    if not hostname:
+        return None
+    for name in _domain_names:
+        if name.lower() == hostname:
+            return name
+    return None
+
+
+def is_registered_custom_domain(host: str) -> bool:
+    """True when ``host`` (with optional port) is a registered DomainName."""
+    return _find_registered_domain_name(host) is not None
+
+
+def _remaining_path_for_base_path(path: str, base_path: str) -> str | None:
+    """If ``base_path`` matches ``path`` on a segment boundary, return the rest.
+
+    AWS strips the matched mapping key before resource matching. Single-level
+    and multi-level keys are both matched as full path prefixes bounded by ``/``
+    (so ``/shophello`` does not match ``shop``).
+    """
+    if base_path in ("", "(none)"):
+        return None
+    key = base_path.strip("/")
+    if not key:
+        return None
+    prefix = "/" + key
+    if path == prefix or path == prefix + "/":
+        return "/"
+    if path.startswith(prefix + "/"):
+        rest = path[len(prefix) :]
+        return rest if rest else "/"
+    return None
+
+
+def resolve_custom_domain(host: str, path: str) -> CustomDomainResolution | None:
+    """Resolve a custom-domain request into API id / stage / execute path.
+
+    Returns:
+      - ``None`` if the Host is not a registered custom domain
+      - ``CustomDomainResolution(kind="forbidden")`` if it is registered but
+        no mapping matches (and there is no ``(none)`` catch-all)
+      - ``CustomDomainResolution(kind="hit", ...)`` on a successful mapping
+    """
+    domain_name = _find_registered_domain_name(host)
+    if domain_name is None:
+        return None
+
+    if not path.startswith("/"):
+        path = "/" + path
+
+    mappings = _base_path_mappings.get(domain_name) or {}
+    best_key = None
+    best_remaining = None
+    for base_path, mapping in mappings.items():
+        if base_path in ("", "(none)"):
+            continue
+        remaining = _remaining_path_for_base_path(path, base_path)
+        if remaining is None:
+            continue
+        key = base_path.strip("/")
+        if best_key is None or len(key) > len(best_key):
+            best_key = key
+            best_remaining = remaining
+
+    if best_key is not None:
+        mapping = None
+        for key, candidate in mappings.items():
+            if key in ("", "(none)"):
+                continue
+            if key.strip("/") == best_key:
+                mapping = candidate
+                break
+        if mapping is None:
+            return CustomDomainResolution(kind="forbidden")
+        return CustomDomainResolution(
+            kind="hit",
+            api_id=mapping.get("restApiId", ""),
+            stage=mapping.get("stage", ""),
+            execute_path=best_remaining or "/",
+        )
+
+    none_mapping = mappings.get("(none)") or mappings.get("")
+    if none_mapping is not None:
+        return CustomDomainResolution(
+            kind="hit",
+            api_id=none_mapping.get("restApiId", ""),
+            stage=none_mapping.get("stage", ""),
+            execute_path=path or "/",
+        )
+
+    return CustomDomainResolution(kind="forbidden")
 
 
 # ---- Control plane: Domain Names ----

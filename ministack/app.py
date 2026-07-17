@@ -858,8 +858,14 @@ async def _handle_pre_body_request(method: str, path: str, headers: dict, query_
     # preflight in that case.
     host = headers.get("host", "")
     is_execute_api = _parse_execute_api_url(host, path) is not None
+    is_custom_domain = False
+    if not is_execute_api:
+        try:
+            is_custom_domain = _get_module("apigateway_v1").is_registered_custom_domain(host)
+        except Exception:
+            is_custom_domain = False
     for response in (
-        None if is_execute_api else _handle_options_request(method, request_id),
+        None if (is_execute_api or is_custom_domain) else _handle_options_request(method, request_id),
         _handle_health_request(path, request_id),
         _handle_ready_request(path, request_id),
         _handle_unknown_localstack_request(path, request_id),
@@ -1289,6 +1295,57 @@ async def _handle_execute_api_request(
         return 500, {"Content-Type": "application/json"}, json.dumps({"message": str(e)}).encode()
 
 
+async def _handle_custom_domain_request(
+    host: str, path: str, method: str, headers: dict, body: bytes, query_params: dict
+):
+    """Handle API Gateway custom-domain data plane requests (#1030).
+
+    Resolves Host against registered DomainName + BasePathMapping records, strips
+    the matched base path, and dispatches to the existing execute handlers. A
+    registered domain with no matching mapping returns Forbidden and must not
+    fall through to S3 virtual-host routing.
+    """
+    try:
+        apigw_v1 = _get_module("apigateway_v1")
+        resolved = apigw_v1.resolve_custom_domain(host, path)
+    except Exception as e:
+        logger.exception("Error resolving custom domain: %s", e)
+        return 500, {"Content-Type": "application/json"}, json.dumps({"message": str(e)}).encode()
+
+    if resolved is None:
+        return None
+    if resolved.kind != "hit":
+        return (
+            403,
+            {"Content-Type": "application/json"},
+            json.dumps({"message": "Forbidden"}).encode(),
+        )
+
+    try:
+        if resolved.api_id in apigw_v1._rest_apis:
+            return await apigw_v1.handle_execute(
+                resolved.api_id,
+                resolved.stage,
+                method,
+                resolved.execute_path,
+                headers,
+                body,
+                query_params,
+            )
+        return await _get_module("apigateway").handle_execute(
+            resolved.api_id,
+            resolved.stage,
+            resolved.execute_path,
+            method,
+            headers,
+            body,
+            query_params,
+        )
+    except Exception as e:
+        logger.exception("Error in custom-domain dispatch: %s", e)
+        return 500, {"Content-Type": "application/json"}, json.dumps({"message": str(e)}).encode()
+
+
 def _is_potential_alb_request(host: str, path: str) -> bool:
     """Cheap ALB gate so ordinary requests avoid loading the ALB module."""
     hostname = host.split(":")[0].lower()
@@ -1421,6 +1478,8 @@ async def _handle_special_data_plane_request(
 
     host = headers.get("host", "")
     if response := await _handle_execute_api_request(host, path, method, headers, body, query_params):
+        return _with_data_plane_headers(response, request_id, wildcard_cors=False)
+    if response := await _handle_custom_domain_request(host, path, method, headers, body, query_params):
         return _with_data_plane_headers(response, request_id, wildcard_cors=False)
     if response := await _handle_s3_vhost_request(host, path, method, headers, body, query_params):
         return _with_data_plane_headers(response, request_id, include_s3_id=True)
